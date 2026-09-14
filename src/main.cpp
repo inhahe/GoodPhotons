@@ -150,6 +150,7 @@
 #include "airtight.h"           // -check-airtight: ray-parity audit of the marched isosurface field
 #include "priority_audit.h"     // ahead-of-time nested-dielectric priority ambiguity warning
 #include "camera.h"
+#include "roiboxes.h"           // -roiboxes: per-material ROIs read off the renderer's own primary visibility
 #include "raster.h"             // -raster: fast solid-shaded preview rasterizer (no light transport)
 #include "render.h"
 #include "rainbow.h"            // Airy-theory droplet phase function (rainbows in droplet media)
@@ -222,6 +223,23 @@ static bool endsWithCI(const std::string& s, const char* ext) {
 // (PPM bytes in a .png file) breaks any consumer that trusts the extension.
 // Returns true on success. `label` is the human name printed by the caller.
 static bool writeImage(const std::string& path, int W, int H, const std::vector<uint8_t>& img) {
+    // A FLOAT-FORMAT EXTENSION ON AN 8-BIT WRITE IS ALWAYS A MISTAKE, so say so. `-o out.pfm`
+    // does not produce a PFM -- `.pfm` is not a recognised output extension, so it lands here and
+    // is written as a tone-mapped 8-bit PPM *under a .pfm name*, which every reader that trusts
+    // the extension will happily misread as scene-linear float. REFERENCE.md has documented this
+    // trap for a while; documenting it is not enough, because the failure is silent and the file
+    // looks right. It cost a measurement in this repo: an A/B scored on auto-exposed LDR, where
+    // the exposure normalises away the very mean-radiance difference being measured, so a broken
+    // arm read as a confident ratio near 1. `-hdr` is the only way to get a real PFM.
+    static bool warned = false;
+    if (!warned && (endsWithCI(path, ".pfm") || endsWithCI(path, ".hdr") ||
+                    endsWithCI(path, ".exr"))) {
+        warned = true;
+        std::fprintf(stderr,
+            "[warn] \"%s\" has a float-format extension but is being written as TONE-MAPPED "
+            "8-BIT data -- .pfm/.hdr/.exr are not output formats. Use -hdr, which writes a real "
+            "32-bit float PFM beside -o.\n", path.c_str());
+    }
     if (endsWithCI(path, ".png"))
         return stbi_write_png(path.c_str(), W, H, 3, img.data(), W * 3) != 0;
     if (endsWithCI(path, ".jpg") || endsWithCI(path, ".jpeg"))
@@ -12151,6 +12169,41 @@ static constexpr double kBeamRefreshDevJ = 0.30;
 // -0.57 % -- no resolvable bias -- while cutting the worst pixel from 4350x to 1690x the
 // reference and the mean relative squared error from 1.219 to 0.836. See BeamMap::sinMin.
 static double    g_beamSinMin    = 0.3;
+// 4M since 0.290.0, measured down from 8M. Splitting trades BVH BUILD against TRAVERSAL: build
+// costs ~1.05 us per split entry and rises linearly, while traversal SATURATES above ~4M splits
+// (on _fog_thick: 19.0, 16.4, 15.5, 15.2 s at 2/4/8/16M), so there is an interior optimum and 8M
+// sat past it. Measured across three media spanning 100x in sigma_t and two phase functions --
+// _fog_thick 15.3 %, _fog_g9deep 9.3 %, _fog_st2 6.7 % faster at 4M than at 8M -- with 4M winning
+// all six repeats.
+//
+// The image is unaffected, which is not a hope: photonbeams.h splits a beam into sub-segments that
+// "share the parent's origin and power and only carry their own [s0, s0+len] range, so nothing has
+// to be re-integrated". Checked anyway, paired over three seeds on _fog_thick: -0.12 +- 0.23 %
+// (2M), -0.38 +- 0.17 % (4M), +1.06 +- 1.21 % (16M) against the 8M default, none significant at
+// 2 dof -- against a 5.3 % seed-to-seed spread on the DEFAULT arm against itself, which is what
+// the earlier single-seed "1.2-1.8 % difference" had actually been measuring.
+//
+// REVERTED TO 8M ON 2026-09-13, because the measurement above was taken against a
+// SINGLE-THREADED BVH build and v0.292.x parallelised it. The 4M default existed only to dodge
+// a build cost that has since fallen ~3x (2.92 s -> ~0.98 s on this scene), and dodging it now
+// costs more traversal than it saves in build. Paired, same seed, sub-second timing:
+//
+//   beamcount 1M:  4M 17.78 / 18.10 s   vs  8M 17.36 / 17.51 s   -> 8M faster by 0.42, 0.59 s
+//   beamcount 2M:  4M 34.77 s           vs  8M 30.68 s           -> 8M faster by 4.09 s (11.8%)
+//
+// Consistent in direction at both operating points and growing with beam density, which is what
+// the mechanism predicts: denser beams make the 4M cap bind harder, forcing coarser sub-beams and
+// so more traversal, while the build cost that used to punish 8M is now cheap.
+//
+// Nothing about the accuracy analysis above needs redoing -- it was measured against the 8M arm,
+// so reverting moves TOWARD its reference rather than away, and more splits approximate the
+// kernel more finely rather than less.
+//
+// The general lesson, which is why this is spelled out rather than just changed back: a tuning
+// constant is only valid against the system it was measured on. This one was a real 6.7-15.3%
+// win when it shipped and became a ~3-12% LOSS a few hours later, without its own code changing
+// at all, because a different component got faster. Re-derive tuned constants after optimising
+// anything they trade against.
 static long long g_beamSplitMax  = 8000000;
 static double    g_beamSplitLen  = 0.0;
 
@@ -12215,7 +12268,8 @@ static bool jSkipHostBvh() {
     return g_jDevBeamOk && !g_jHostLight && !envOff;
 }
 
-static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet = false) {
+static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet = false,
+                           const Scene* vcScene = nullptr) {
     // `quiet` exists for mode J's light-side REFRESH (see g_beamFreeze): that rebuilds this
     // map once per progressive epoch, and re-printing the same four-line map description on
     // every rebuild would bury the render's own status lines under a description that has not
@@ -12224,6 +12278,19 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
         if (!quiet) std::printf(fmt, args...);
     };
     auto t0 = std::chrono::steady_clock::now();
+    // VOLCACHE DEPOSIT SPLIT (flag-gated, inert unless FTRACE_VOLCACHE + FTRACE_VOLCACHE_SPLIT).
+    // Before ANY of the expensive per-beam work below: route the order >= 2 chords into the
+    // fluence grid and drop them from the map, so the split, the CIE table, the boxes and the
+    // BVH are all built over the order < 2 remainder only.
+    size_t vcSplitOut = 0;
+    if (vcScene) {
+        const size_t nSplit = vcSplitOut = volCacheSplit(*vcScene, bm);
+        if (nSplit && !quiet)
+            std::printf("%s volcache: %zu order>=2 chords routed to the %d^3 fluence grid, "
+                        "%zu chords left in the map (%.1f%% removed)\n",
+                        tag, nSplit, volCacheRes(), bm.beams.size(),
+                        100.0 * (double)nSplit / (double)(nSplit + bm.beams.size()));
+    }
     const size_t raw = bm.beams.size();
     double r;
     // Say when the budget actually bit. The per-thread banks keep everything until they hit
@@ -12231,9 +12298,12 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
     // exact trim to -beamcount. Printing it turns "why did -beamcount 1e6 give me exactly
     // 1e6?" into an observation, and makes a scene that never reaches its budget (small
     // bounded media in a large scene) visibly different from one that blows through it.
-    if (bm.nDeposited > raw)
+    // `raw + vcSplitOut`, not `raw`: the volcache split has already removed its share above, and
+    // attributing that to -beamcount would report a working feature as a budget overflow.
+    if (bm.nDeposited > raw + vcSplitOut)
         say("%s photon beams: %zu collected, trimmed to %zu by -beamcount "
-                    "(survivors rescaled, unbiased)\n", tag, bm.nDeposited, raw);
+                    "(survivors rescaled, unbiased)\n", tag, bm.nDeposited,
+                    raw + vcSplitOut);
     // SPECTRAL COVERAGE OF THE STORED BEAMS (photonbeams.h): what fraction carry the
     // achromatic fold (`-beamachro`), and what fraction carry a stratified wavelength bundle
     // (`-beamspec`). The two are alternatives, not additions — BeamBank::push prefers the fold
@@ -12430,7 +12500,12 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
     {
         size_t hist[8] = {0}, unknown = 0, known = 0;
         for (const PhotonBeam& b : bm.beams) {
-            if (b.order == kBeamOrderUnknown) { ++unknown; continue; }
+            // `0` is NOT a valid order -- the convention is 1 == single scatter -- so a chord
+            // carrying it did not track its order and belongs with the sentinel. Before
+            // 0.278.1 it counted as KNOWN and was then dropped by the `o = 1` loop below, so
+            // an untracked population sat in the DENOMINATOR while being invisible in the row,
+            // and the "did not track" note never fired. See BEAMORDER-GPU.
+            if (b.order == kBeamOrderUnknown || b.order == 0) { ++unknown; continue; }
             ++known;
             hist[b.order < 7 ? b.order : 7] += 1;
         }
@@ -12573,6 +12648,16 @@ static bool g_heroCSet = false;
 // camera side of the P composite. The forward light tracer (B) and the photon /
 // bidirectional modes (M/S/D) honour maxBounce but ignore directOnly.
 static int  g_maxBounceOverride = -1;
+
+// `-max-bounce` reaches modes A/B/C (renderForward) and R (renderBackward) through
+// `g_maxBounceOverride`, but modes M and S passed a hardcoded literal 32 at all five of their
+// call sites, so the flag was accepted and silently did nothing there. That is worse than an
+// unsupported flag: a sweep over it returns a clean, stable, entirely meaningless null. It was
+// found by a sensitivity check -- `-max-bounce 2` produced an image matching `-max-bounce 32`
+// to 5.3e-09, and a two-bounce render cannot match a thirty-two-bounce one.
+static int effMaxBounce(int dflt = 32) {
+    return (g_maxBounceOverride >= 1) ? g_maxBounceOverride : dflt;
+}
 static bool g_directOnly = false;
 
 // -mode W: the DETERMINISTIC Whitted preview. g_directOnly alone still leaves every
@@ -16576,7 +16661,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 if (first) liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
                 buildBeamMap(bmap, "mode J:",
                              (double)res * (double)resY * (double)(spp > 0 ? spp : 16),
-                             /*quiet*/!first);
+                             /*quiet*/!first, &scene);
             }
             const double buildSec =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
@@ -16922,7 +17007,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 if (first) liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
                 buildBeamMap(bmap, "mode M:",
                              (double)res * (double)resY * (double)(spp > 0 ? spp : 16),
-                             /*quiet*/!first);
+                             /*quiet*/!first, &scene);
             }
         };
         buildLightSide(0);
@@ -16938,7 +17023,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
                     return renderPhotonCamera(scene, cam, res, resY, pm, c, nThreads,
-                                              diffraction, /*maxBounce*/32, off, g_pmFinalGather,
+                                              diffraction, effMaxBounce(), off, g_pmFinalGather,
                                               wantBeams ? &bmap : nullptr,
                                               g_pmCaustics ? &pmC : nullptr);
                 });
@@ -17058,7 +17143,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if ((wantGpu || wantAuto) && !cam.hasLens() &&
                 cudaAvailable() && cudaSppmSupported(scene)) {
                 SppmSession* sess = sppmSessionBegin(scene, cam, res, resY, R0, diffraction,
-                                                     /*maxBounce*/32, g_heroC);
+                                                     effMaxBounce(), g_heroC);
                 if (sess) {
                     std::printf("mode S: SPPM on %s — %lld photons/pass, R0=%.4g, alpha=%.2f "
                                 "at %dx%d (light=%s) ...\n",
@@ -17101,7 +17186,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             Film disp; disp.resX = res; disp.resY = resY; disp.alloc();
             for (long long pass = 0; pass < passTarget; ++pass) {
                 sppmPass(scene, cam, st, N, nThreads, diffraction, g_sppmAlpha,
-                         /*maxBounce*/32, (uint64_t)(pass + 1), g_heroC);
+                         effMaxBounce(), (uint64_t)(pass + 1), g_heroC);
                 disp = sppmResolve(st);
                 for (auto& v : disp.xyz) v = v * (double)st.passes;   // undone by /sppDone
                 if (p->report(disp, st.passes, st.passes >= passTarget)) break;
@@ -18289,6 +18374,20 @@ static int run(int argc, char** argv) {
     bool checkCurvOnly = false;
     bool checkCavityOnly = false;
     bool checkTriNormalOnly = false;
+    bool checkSphereQueryOnly = false;
+    bool checkBvhParallelOnly = false;
+    // -roiboxes and its gates. The defaults are deliberately strict: this tool's whole
+    // point is that an ROI you cannot trust should not be easy to copy out of its output.
+    bool      roiBoxesOnly = false;
+    const char* roiAuditFile = nullptr;
+    const char* roiMaskFile  = nullptr;
+    double gaFootprintR = 0.0;   // -gafootprint <r>
+    double gaFpAreaR = 0.0;      // -gafparea <r>
+    int    gaFpDisc = 64, gaFpCurve = 32;   // gaFpCurve is now the per-ray LAYER CAP
+    int    gaFootprintStride = 4;
+    double    roiMinPurity = 0.60;
+    double    roiMinShare  = 0.50;
+    long long roiMinPx     = 24;
     bool checkMeshFormatsOnly = false;
     bool checkPreferOnly = false;
     bool checkPathsOnly = false;
@@ -18753,11 +18852,66 @@ static int run(int argc, char** argv) {
         // M-GATHERAREA prototype: probe samples for the gather footprint (0 = off, the default).
         // Routed through the environment because gatherCoverage is reached from a header with no
         // access to main.cpp's statics, exactly as -mstats is.
+        // The tangle gate. Routed through the environment for the same two reasons -gatherarea
+        // is: `gatherCoverage` lives in a header with no access to these statics, and the device
+        // upload reads the SAME channel, which is what stops the two backends disagreeing about
+        // whether the gate is on.
+        // The ball-matched probe acceptance. Same plumbing as -tanglegate below.
+        else if (!std::strcmp(argv[i], "-gaball") && i + 1 < argc) {
+#ifdef _WIN32
+            _putenv_s("FTRACE_GABALL", argv[++i]);
+#else
+            setenv("FTRACE_GABALL", argv[++i], 1);
+#endif
+        }
+        // The flat-interior gate's probe count. Same plumbing as -tanglegate below.
+        else if (!std::strcmp(argv[i], "-gagate") && i + 1 < argc) {
+#ifdef _WIN32
+            _putenv_s("FTRACE_GAGATE", argv[++i]);
+#else
+            setenv("FTRACE_GAGATE", argv[++i], 1);
+#endif
+        }
+        // The bias-corrected coverage. Same plumbing and reasons as -tanglegate below.
+        else if (!std::strcmp(argv[i], "-gabias") && i + 1 < argc) {
+#ifdef _WIN32
+            _putenv_s("FTRACE_GABIAS", argv[++i]);
+#else
+            setenv("FTRACE_GABIAS", argv[++i], 1);
+#endif
+        }
+        // The fiber gate. Same plumbing and the same reasons as -tanglegate below.
+        else if ((!std::strcmp(argv[i], "-fibergate") ||
+                  !std::strcmp(argv[i], "-fiber-gate")) && i + 1 < argc) {
+#ifdef _WIN32
+            _putenv_s("FTRACE_GAFIBER", argv[++i]);
+#else
+            setenv("FTRACE_GAFIBER", argv[++i], 1);
+#endif
+        }
+        else if ((!std::strcmp(argv[i], "-tanglegate") ||
+                  !std::strcmp(argv[i], "-tangle-gate")) && i + 1 < argc) {
+#ifdef _WIN32
+            _putenv_s("FTRACE_GAREJECT", argv[++i]);
+#else
+            setenv("FTRACE_GAREJECT", argv[++i], 1);
+#endif
+        }
         else if (!std::strcmp(argv[i], "-gatherarea") && i + 1 < argc) {
 #ifdef _WIN32
             _putenv_s("FTRACE_GATHERAREA", argv[++i]);
 #else
             setenv("FTRACE_GATHERAREA", argv[++i], 1);
+#endif
+        }
+        // Cap the LIGHT path's bounces (host mode M / S). `-max-bounce` caps the CAMERA path,
+        // which in mode M ends at the first diffuse hit -- so it cannot answer any question
+        // about how far light travels before deposit. See photonmap_render.h photonMaxBounce().
+        else if (!std::strcmp(argv[i], "-photon-bounce") && i + 1 < argc) {
+#ifdef _WIN32
+            _putenv_s("FTRACE_PHOTONBOUNCE", argv[++i]);
+#else
+            setenv("FTRACE_PHOTONBOUNCE", argv[++i], 1);
 #endif
         }
         else if (!std::strcmp(argv[i], "-glossy-nee"))    { lt::gGlossyNee = true;  }
@@ -19023,6 +19177,10 @@ static int run(int argc, char** argv) {
             int v = std::atoi(argv[++i]);
             pbeams::gOrderMax = (v < 0) ? 0 : v;
         }
+        else if (!std::strcmp(argv[i], "-beams-minorder") && i + 1 < argc) {
+            const int v = std::atoi(argv[++i]);
+            pbeams::gOrderMin = (v < 0) ? 0 : v;
+        }
         else if (!std::strcmp(argv[i], "-beams-single") || !std::strcmp(argv[i], "-beams-ss"))
             pbeams::gOrderMax = 1;
         else if (!std::strcmp(argv[i], "-beamradius") && i + 1 < argc) g_beamRadiusAbs = std::atof(argv[++i]);
@@ -19169,7 +19327,34 @@ static int run(int argc, char** argv) {
         // valid flag defined further down would be rejected before it is ever tested.
         if (!handled) {
         handled = true;
-        if ((!std::strcmp(argv[i], "-nd") || !std::strcmp(argv[i], "-ndim")) && i + 1 < argc) {
+        // Moved here from the previous segment, which hit MSVC C1061 (blocks nested too
+        // deeply) at ~128 else-if links when -checkspherequery was appended to it. See the
+        // segment note at the top of the option table: append to a segment, and start a new
+        // one once it nears ~100 links.
+        if (!std::strcmp(argv[i], "-checkspherequery")) checkSphereQueryOnly = true;
+        else if (!std::strcmp(argv[i], "-checkbvhparallel")) checkBvhParallelOnly = true;
+        else if (!std::strcmp(argv[i], "-roiboxes")) roiBoxesOnly = true;
+        else if (!std::strcmp(argv[i], "-roi-audit") && i + 1 < argc) roiAuditFile = argv[++i];
+        else if (!std::strcmp(argv[i], "-roi-mask")  && i + 1 < argc) roiMaskFile  = argv[++i];
+        else if (!std::strcmp(argv[i], "-roi-minpurity") && i + 1 < argc) roiMinPurity = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-roi-minshare")  && i + 1 < argc) roiMinShare  = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-roi-minpx")     && i + 1 < argc) roiMinPx     = std::atoll(argv[++i]);
+        else if (!std::strcmp(argv[i], "-gafootprint") && i + 1 < argc) gaFootprintR = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-gafparea") && i + 1 < argc) gaFpAreaR = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-gageom") && i + 1 < argc) {
+#ifdef _WIN32
+            _putenv_s("FTRACE_GAGEOM", argv[++i]);
+#else
+            setenv("FTRACE_GAGEOM", argv[++i], 1);
+#endif
+        }
+        else if (!std::strcmp(argv[i], "-gafp-disc") && i + 1 < argc) gaFpDisc = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "-gafp-curve") && i + 1 < argc) gaFpCurve = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "-gafootprint-stride") && i + 1 < argc) gaFootprintStride = std::atoi(argv[++i]);
+        // Chain continues into this segment's original head: without the `else` the two
+        // chains are independent and the trailing `else handled = false;` below would mark
+        // every flag above as unrecognised.
+        else if ((!std::strcmp(argv[i], "-nd") || !std::strcmp(argv[i], "-ndim")) && i + 1 < argc) {
             const int d = std::atoi(argv[++i]);
             if (d < 3 || d > 12) {
                 std::fprintf(stderr, "[nd] -nd %d: dimensions must be 3..12 "
@@ -19391,6 +19576,8 @@ static int run(int argc, char** argv) {
     if (checkCurvOnly)     return checkCurv();     // ditto (mean-curvature `curv` variable)
     if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
     if (checkTriNormalOnly) return checkTriNormal(); // ditto (intersectTri's side/normal convention)
+    if (checkSphereQueryOnly) return bvhSphereQuerySelfTest() ? 0 : 1;  // ditto (Bvh::traverseSphere)
+    if (checkBvhParallelOnly) return bvhParallelSelfTest() ? 0 : 1;     // parallel build == serial build
     if (checkMeshFormatsOnly) return checkMeshFormats(); // ditto (OBJ/PLY/STL agree on the same cube)
     if (checkPreferOnly)   return checkPrefer();   // ditto (prefer{}/else{} resolution semantics)
     if (checkPathsOnly)    return checkPaths();    // ditto (where a relative asset path is looked for)
@@ -20201,6 +20388,73 @@ static int run(int argc, char** argv) {
             c.setFocus(focusDist);   // thin lens for the finite-aperture modes A/C (0 = camera obscura)
         }
         toRender.push_back({"", c, mode, fresX, fresY, (exposureCli > 0.0 ? exposureCli : 0.0), forceExposureLock ? 0 : -1, cLook, cUp, cFov});
+    }
+
+    // -roiboxes: derive per-material ROIs from primary visibility, print them, exit.
+    // Placed HERE, after `toRender` is final, so the boxes come from exactly the camera
+    // and resolution the render would have used. An ROI derived against a different
+    // camera than the one scored is precisely the mismatch this flag exists to prevent,
+    // so it must not be computed from a camera assembled separately for the purpose.
+    if (roiBoxesOnly) {
+        if (toRender.empty()) {
+            std::fprintf(stderr, "[roiboxes] no camera selected -- nothing to derive ROIs from\n");
+            return 1;
+        }
+        const RenderCam& rc = toRender.front();
+        return roiBoxesReport(scene, rc.cam, rc.res, rc.resY, rc.name.c_str(), inFile,
+                              roiMinPurity, roiMinShare, roiMinPx);
+    }
+    if (roiAuditFile) {
+        if (toRender.empty()) {
+            std::fprintf(stderr, "[roi-audit] no camera selected\n");
+            return 1;
+        }
+        const RenderCam& rc = toRender.front();
+        return roiAuditReport(scene, rc.cam, rc.res, rc.resY, roiAuditFile);
+    }
+    if (gaFootprintR > 0.0) {
+        if (toRender.empty()) { std::fprintf(stderr, "[gafootprint] no camera selected\n"); return 1; }
+        const RenderCam& rc = toRender.front();
+        return gaFootprintReport(scene, rc.cam, rc.res, rc.resY, gaFootprintR, gaFootprintStride);
+    }
+    if (gaFpAreaR > 0.0) {
+        if (toRender.empty()) { std::fprintf(stderr, "[gafparea] no camera selected"); return 1; }
+        const RenderCam& rc = toRender.front();
+        return gaFpAreaReport(scene, rc.cam, rc.res, rc.resY, gaFpAreaR, gaFootprintStride,
+                              gaFpDisc, gaFpCurve);
+    }
+    // -roi-mask: write the per-pixel material id as a .pfm, plus a `<path>.materials.txt`
+    // legend. A rectangle cannot represent a thin material -- fur scores purity 0.44 over
+    // 28 regions on fur_creature, so no box over it is mostly it. The mask is the ROI that
+    // always exists, and scoring it is the only way one statistic applies to every scene.
+    // It is written through the SAME writePfm the renders use, so the row order cannot
+    // drift from the images it will be used to index.
+    if (roiMaskFile) {
+        if (toRender.empty()) {
+            std::fprintf(stderr, "[roi-mask] no camera selected\n");
+            return 1;
+        }
+        const RenderCam& rc = toRender.front();
+        const std::vector<int> mid = roiMaterialImage(scene, rc.cam, rc.res, rc.resY);
+        std::vector<Vec3> px(mid.size());
+        for (size_t k = 0; k < mid.size(); ++k) {
+            const double v = (double)mid[k];      // -1 = escaped (sky / no surface)
+            px[k] = Vec3{v, v, v};
+        }
+        if (!writePfm(roiMaskFile, rc.res, rc.resY, px)) {
+            std::fprintf(stderr, "[roi-mask] could not write %s\n", roiMaskFile);
+            return 1;
+        }
+        const std::string legend = std::string(roiMaskFile) + ".materials.txt";
+        std::ofstream lf(legend);
+        lf << "# material id -> name, for " << roiMaskFile << " (" << rc.res << "x" << rc.resY << ")\n";
+        lf << "-1\t(sky/escaped)\n";
+        long long named = 0;
+        for (int m = 0; m < (int)scene.mats.size(); ++m)
+            if (const char* nm = scene.matNameFor(m)) { lf << m << '\t' << nm << '\n'; ++named; }
+        std::printf("[roi-mask] wrote %s (%dx%d) and %s (%lld named materials)\n",
+                    roiMaskFile, rc.res, rc.resY, legend.c_str(), named);
+        return 0;
     }
 
     // -explore/-fly: seed the interactive raster viewer at the first selected frame
@@ -23144,11 +23398,12 @@ static int run(int argc, char** argv) {
                     // spends less on a BVH build that is about to be discarded.
                     if (meterBeams)
                         buildBeamMap(meterBmap, "[meter]",
-                                     (double)W * (double)H * (double)meterSpp);
+                                     (double)W * (double)H * (double)meterSpp,
+                                     /*quiet*/false, &scene);
                     meterPmapBuilt = true;
                 }
                 mf = renderPhotonCamera(scene, mc.cam, W, H, meterPmap, meterSpp, nThreads,
-                                        diffraction, /*maxBounce*/32, 0, g_pmFinalGather,
+                                        diffraction, effMaxBounce(), 0, g_pmFinalGather,
                                         meterBeams ? &meterBmap : nullptr,
                                         g_pmCaustics ? &meterPmapC : nullptr);
                 filmToRgb8(mf, (double)meterSpp, 1.0, false, nullptr, &eAuto);
@@ -23257,8 +23512,8 @@ static int run(int argc, char** argv) {
                         : 0;
                     const double mWork = (double)cams[0].res * (double)cams[0].resY
                                        * (double)meterSpp;
-                    mBeamPass.build = [mWork](BeamMap& bm) {
-                        buildBeamMap(bm, "[meter]", mWork);
+                    mBeamPass.build = [mWork, &scene](BeamMap& bm) {
+                        buildBeamMap(bm, "[meter]", mWork, /*quiet*/false, &scene);
                     };
                 }
                 renderPhotonMapSharedCuda(scene, mcams, rxs, rys, meterN, radius, e,
@@ -23364,7 +23619,38 @@ static int run(int argc, char** argv) {
     // checkpoint of its own: it writes each frame's image the instant that frame's gather
     // completes, which is the crash-safety a sidecar would have bought.)
     const bool plainRender = !(timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever || preview);
+    // M-TIME-CPU: a wall-clock or indefinite budget no longer costs mode M the device. The shared
+    // path's light-side refresh loop (see "THE LIGHT-SIDE REFRESH, ON THE DEVICE" below) already
+    // averaged independent realizations per epoch; it just could not be told to stop on a clock,
+    // and `plainRender` therefore sent every budgeted render to the CPU-only single-camera driver
+    // -- measured at ~16 s/spp against 0.79 s/spp on the device for the same frame.
+    //
+    // Admitted ONLY when the device route is certain, not merely likely. If a budgeted camera
+    // entered groupM and then failed the GPU gate, it would land on the shared CPU branch, which
+    // gathers a fixed spp and would ignore the budget outright -- a worse bug than the one being
+    // fixed. Every condition the GPU branch itself tests is therefore rechecked here.
+    //
+    // Excluded on purpose:
+    //   * `-noise`, which needs a convergence test this loop does not have yet; it keeps the
+    //     CPU driver and the warning.
+    //   * `-preview`, whose ANSI thumbnail genuinely belongs to the single-camera driver.
+    //   * more than one mode-M camera. A flythrough's shared map is the FEATURE -- amortising one
+    //     forward pass across every frame -- and refreshing it would both destroy that and hand
+    //     consecutive frames different realizations, which is flicker, not convergence.
+    int mModeCams = 0;
+    for (const RenderCam& rc : toRender) if (rc.mode == 'M') ++mModeCams;
+    bool budgetedGpuM = false;
+#ifdef HAVE_CUDA
+    budgetedGpuM = (timeBudgetSec > 0.0 || runForever || noiseTarget > 0.0) &&
+                   mModeCams == 1 && !g_beamFreeze && g_pmapLoad.empty() && g_pmapSave.empty() &&
+                   (!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
+                   cudaAvailable() && cudaPhotonMapSupported(scene);
+    if (budgetedGpuM)
+        for (const RenderCam& rc : toRender)
+            if (rc.mode == 'M' && rc.cam.hasLens()) budgetedGpuM = false;
+#endif
     std::vector<int> groupB, groupA, groupM, restIdx;
+    bool mModeBudgeted = false;   // a mode-M camera dropped from groupM by the budget test
     for (int i = 0; i < (int)toRender.size(); ++i) {
         const RenderCam& rc = toRender[i];
         // Forward A/B sharing no longer requires `plainRender`: the shared pass itself
@@ -23382,8 +23668,57 @@ static int run(int argc, char** argv) {
         // gather is an independent backward pass per camera, so frames don't share noise —
         // only the underlying radiance solution. That makes it safe to share even across
         // exposure-locked camera_path frames, so it isn't gated on `expGroup < 0`.
-        else if (rc.mode == 'M' && plainRender)                               groupM.push_back(i);
-        else                                                                  restIdx.push_back(i);
+        else if (rc.mode == 'M' && (plainRender || budgetedGpuM))            groupM.push_back(i);
+        else {
+            // A mode-M camera reaching here under a budget is the silent-CPU case warned
+            // about below. Lens cameras are excluded because they would never have had the
+            // device anyway, so saying they lost it would be false.
+            if (rc.mode == 'M' && !rc.cam.hasLens()) mModeBudgeted = true;
+            restIdx.push_back(i);
+        }
+    }
+    // SAY SO WHEN THE BUDGET COSTS THE DEVICE. This is the same trap `-checkpoint` fell into
+    // above, with one difference that makes it harder to notice: `-checkpoint` was IGNORED by
+    // mode M, so the fix was simply to stop letting an ignored flag matter. A wall-clock /
+    // noise / indefinite budget is genuinely HONOURED -- the shared path gathers a fixed spp
+    // per frame and cannot do it, so the single-camera progressive driver really is required.
+    // The render is therefore correct, just an order of magnitude slower, which is exactly the
+    // kind of cost that goes unnoticed for a long time.
+    //
+    // Measured on `_fog_thick` at 128^2, `-beams -beamcount 1000000 -beamfreeze`, same seed,
+    // one flag apart: `-spp 64` gathers on the 4090 at 0.79 s/spp; `-time 100` gathers on 12
+    // CPU threads at ~16 s/spp and never uploads the beams at all. Roughly 20x, from two
+    // unreplicated timings -- read it as "more than an order of magnitude", not as 20.00.
+    //
+    // WHAT THAT 20x IS WORTH IS REGIME-DEPENDENT, so this NOTE reports the lost device without
+    // promising -spp is an equal substitute. The ratio is denominated in spp, and an spp is
+    // worth whatever the gather noise is worth relative to the map's own realization error.
+    // Measured by seed-to-seed spread at MATCHED spp (two seeds differenced, so the only term
+    // that can fall is gather noise -- the realization is held fixed by construction):
+    //
+    //   _fog_thick      (thick media, beams)  RMS 44.83 @ spp 8 -> 43.67 @ spp 32  ratio 1.026
+    //   _cornell_diffuse (surfaces, no media) RMS 16.29 @ spp 8 ->  8.39 @ spp 32  ratio 1.940
+    //
+    // Pure gather noise predicts 2.000, a pinned map floor predicts 1.0. So on surfaces spp
+    // converges essentially perfectly and the device's throughput is real image quality; in
+    // thick media the photon realization dominates so completely that quadrupling the samples
+    // moves the picture 2.6%, and only more photons (or more epochs) converge it. Do not
+    // generalise either number to the other regime -- that error was made here twice.
+    //
+    // That matters more than it looks: CLAUDE.md tells the operator to prefer a bounded budget
+    // over a giant `-n`, so the DOCUMENTED default workflow is the slow one. Until the shared
+    // path can honour a budget, the least owed is a word, in the idiom `-radcache` already
+    // uses when it cannot honour a flag on the device.
+    if (mModeBudgeted) {
+#ifdef HAVE_CUDA
+        if ((!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
+            cudaAvailable() && cudaPhotonMapSupported(scene))
+            std::printf("[camera] NOTE: this budgeted mode-M render is on the single-camera "
+                        "progressive driver, which is CPU-only, so it will NOT use %s. "
+                        "-time, -forever and -noise DO run on the device now (0.295.0); "
+                        "-preview still does not, and nor does a multi-camera or lens-camera "
+                        "render, which keeps one shared map by design.\n", cudaDeviceName());
+#endif
     }
     // A single-camera forward group has nothing to share — fold it back into the per-camera
     // path (models A/B still get the GPU there via renderForwardCuda).
@@ -23782,8 +24117,13 @@ static int run(int argc, char** argv) {
                 // Hoisted out of the `if` below because the gather's StageProgress needs it
                 // too, to tone-map the partial-film preview exactly as the live view does.
                 const double liveExp = toRender[idx[0]].exposure;
-                if (g_showWindow) {
-                    // Echo the same caption to stdout on a slow cadence. The window is the
+                // `-preview` DRIVES THIS PATH TOO (0.297.0). The ANSI thumbnail was listed as belonging to
+                // the single-camera driver, which is not true: the shared FORWARD group already draws
+                // one from its own accumulator (see the `preview || wantWin` block in runSharedGroup).
+                // Mode M's shared path simply never called it. Arming the same progress hook for
+                // `-preview` costs nothing when no preview is asked for, because the callback is only
+                // installed when one of the two consumers wants it.
+                if (g_showWindow || preview) {     // Echo the same caption to stdout on a slow cadence. The window is the
                     // only place this text went, so a backgrounded showcase render — the one
                     // that runs for hours and is read from its log — had nothing at all in it
                     // between the map build and the frame-written line, and a gather that
@@ -23795,7 +24135,9 @@ static int run(int argc, char** argv) {
                         const double el = std::chrono::duration<double>(now - gStart).count();
                         const std::string st = pmGatherStatus(f, sppDone, spp, gatherFrame + 1,
                                                               cams.size(), N, el);
-                        liveWindowUpdate(f, (double)sppDone, liveExp, scene.absolute, st.c_str());
+                        if (g_showWindow)
+                            liveWindowUpdate(f, (double)sppDone, liveExp, scene.absolute, st.c_str());
+                        if (preview) ansiPreview(f, (double)sppDone, liveExp, st.c_str());
                         if (lastEcho->time_since_epoch().count() == 0 ||
                             std::chrono::duration<double>(now - *lastEcho).count() >= 30.0) {
                             std::printf("[camera] %s\n", st.c_str());
@@ -23879,10 +24221,10 @@ static int run(int argc, char** argv) {
                     // Name the stage in the title bar: the beam BVH on a big scene is minutes
                     // of silence between the deposit and the first gathered frame, and without
                     // this the window sits on the previous caption looking wedged.
-                    beamPass.build  = [work, tw, th, &lightEpoch](BeamMap& bm) {
+                    beamPass.build  = [work, tw, th, &lightEpoch, &scene](BeamMap& bm) {
                         if (lightEpoch == 0)
                             liveWindowPlaceholder(tw, th, "building beam map\xE2\x80\xA6");
-                        buildBeamMap(bm, "[camera]", work, /*quiet*/lightEpoch != 0);
+                        buildBeamMap(bm, "[camera]", work, /*quiet*/lightEpoch != 0, &scene);
                     };
                 }
                 // Aimed caustic emission (-causticn), the exact twin of the CPU call below.
@@ -23914,6 +24256,18 @@ static int run(int argc, char** argv) {
                 // Left at its zeros by the no-refresh call below, which therefore adapts
                 // exactly as it always did. See PmRadiiPin in render_cuda.h.
                 PmRadiiPin radiiPin;
+                // `-max-bounce` CANNOT reach this path: renderPhotonMapSharedCuda takes no bounce
+                // limit at all, the device tracer's cap living inside render_cuda.cu. Say so out
+                // loud rather than accept the flag and ignore it. A flag that is silently dropped
+                // turns a sweep over it into a clean, stable, entirely meaningless null -- which
+                // is precisely what happened here: `-max-bounce 2`, `32` and `64` produced images
+                // agreeing to 5.3e-09, and a two-bounce render cannot match a thirty-two-bounce
+                // one. The null looked like evidence until a sensitivity check was run on it.
+                if (g_maxBounceOverride >= 1)
+                    std::printf("[warn] -max-bounce %d is NOT honoured by mode M on the GPU: the "
+                                "device photon path has no bounce-limit parameter, so this render "
+                                "uses the built-in cap. Use -device cpu for a bounce-limited "
+                                "mode-M render.\n", g_maxBounceOverride);
                 auto runPass = [&](long long sppWant, const SppProgress* p,
                                    const std::function<bool(int, const Film&, long long)>* onF,
                                    PmRadiiPin* pin) {
@@ -23980,7 +24334,32 @@ static int run(int argc, char** argv) {
                             epochFilm = f; epochSpp = sppDone;
                             return g_stopRequested != 0;
                         };
-                    for (; !stopAll && sppAll < spp && !ft::stopRequested(); ++lightEpoch) {
+                    // A WALL-CLOCK OR INDEFINITE BUDGET DRIVES THIS LOOP TOO (M-TIME-CPU).
+                    // The loop already averaged independent light-side realizations; it simply
+                    // had no way to be told "keep going until the clock runs out" because its
+                    // only stop test was a total-sample target. With the cap lifted, each epoch
+                    // is still bounded by `epochSec` through `inner`, so a huge cap does not
+                    // make one enormous epoch -- it makes many normal ones.
+                    const bool budgeted = (timeBudgetSec > 0.0 || runForever || noiseTarget > 0.0);
+                    // `-noise` NEEDS NO CONVERGENCE TEST. The reported figure is
+                    // `100 / sqrt(spp)` (main.cpp ~15528) -- a pure function of the sample count,
+                    // not a measurement of the image -- so a noise target IS a sample target:
+                    // `-noise X` is exactly `-spp (100/X)^2`. This loop was excluded from `-noise`
+                    // on the assumption it needed a convergence criterion it did not have. It
+                    // needed arithmetic.
+                    const long long sppFromNoise =
+                        (noiseTarget > 0.0)
+                            ? (long long)std::ceil((100.0 / noiseTarget) * (100.0 / noiseTarget))
+                            : 0;
+                    const long long sppCap =
+                        budgeted ? (sppFromNoise > 0 ? sppFromNoise : ((long long)1 << 60)) : spp;
+                    auto budgetSpent = [&]() {
+                        return timeBudgetSec > 0.0 &&
+                               std::chrono::duration<double>(clk::now() - gStart).count()
+                                   >= timeBudgetSec;
+                    };
+                    for (; !stopAll && sppAll < sppCap && !ft::stopRequested() && !budgetSpent();
+                         ++lightEpoch) {
                         RngSaltScope saltScope(lightEpoch);
                         // Everything the device prints about the map's SHAPE — the adaptive
                         // radius it settled on, the caustic-map population, the sub-beam /
@@ -24027,17 +24406,26 @@ static int run(int argc, char** argv) {
                                     stopAll = true; return true;
                                 }
                             }
+                            // END ON THE RENDER'S CLOCK AS WELL AS THE EPOCH'S. `epochSec` is
+                            // derived from the light-side overhead divided by `-beamrefresh`, so
+                            // on a heavy scene it is deliberately LONGER than a short budget --
+                            // measured at ~100 s against a 40 s `-time`, which ran one epoch and
+                            // overshot the budget 2.5x because the only budget test was between
+                            // epochs. A per-epoch stop test cannot bound a render whose epoch is
+                            // longer than the whole budget.
+                            if (budgetSpent()) return true;
                             return std::chrono::duration<double>(clk::now() - tEpoch).count()
                                    >= epochSec;
                         };
-                        runPass(spp - sppAll, &inner, &grabFrame, &radiiPin);
+                        runPass(sppCap - sppAll, &inner, &grabFrame, &radiiPin);
                         if (epochSpp <= 0) break;          // stopped before a complete sample
                         acc.merge(epochFilm);
                         sppAll += epochSpp;
                         epochFilm = Film{};
                         // Crash-safe: write the running average after every epoch, exactly as
                         // the un-refreshed path writes after its one and only gather.
-                        midEpoch = (sppAll < spp) && !stopAll && !ft::stopRequested();
+                        midEpoch = (sppAll < sppCap) && !stopAll && !ft::stopRequested()
+                                   && !budgetSpent();
                         if (writeFrame(0, acc, sppAll)) stopAll = true;
                         midEpoch = false;
                     }
@@ -24143,7 +24531,7 @@ static int run(int argc, char** argv) {
             for (int i : idx)
                 work += (double)toRender[i].res * (double)toRender[i].resY
                       * (double)(spp > 0 ? spp : 16);
-            buildBeamMap(bmap, "[camera]", work);
+            buildBeamMap(bmap, "[camera]", work, /*quiet*/false, &scene);
         }
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("[camera] photon map: %zu photons (+%zu caustic) from %lld emitted in %s, "
@@ -24192,7 +24580,7 @@ static int run(int argc, char** argv) {
             Film f = cpuSppChunks(spp, g_showWindow ? &liveProg : nullptr, rc.res, rc.resY,
                 [&](long long c, unsigned long long off) {
                     return renderPhotonCamera(scene, rc.cam, rc.res, rc.resY, pm, c, nThreads,
-                                              diffraction, /*maxBounce*/32, off,
+                                              diffraction, effMaxBounce(), off,
                                               g_pmFinalGather, wantBeams ? &bmap : nullptr,
                                               g_pmCaustics ? &pmC : nullptr);
                 });
@@ -24205,6 +24593,12 @@ static int run(int argc, char** argv) {
                 sharedWriteFail = true;
         }
         noteFinishReason(g_stopRequested ? "stopped early" : "all frames gathered");
+        // FTRACE_GADIAG=1's per-material miss/reject/accept split. gaDiagReport() had NO CALLER
+        // -- the tally was collected and then silently dropped, so the documented diagnostic was
+        // dead and the reject rates the M-GATHERAREA entry cites were unreproducible. Printed
+        // here, after the gather, because that is when every probe has been counted. No-op (and
+        // no cost) unless the variable is set.
+        gaDiagReport(scene);
     };
     runSharedPhotonMap(groupM);
 

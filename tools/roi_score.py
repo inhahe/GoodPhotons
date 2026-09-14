@@ -1,4 +1,4 @@
-"""Score a render A/B per ROI, with the two traps that have actually bitten this project
+"""Score a render A/B per ROI, with the four traps that have actually bitten this project
 built in as checks rather than as advice.
 
     python tools/roi_score.py <dir> --arms base,other[,other2] --seeds 16 \
@@ -7,9 +7,11 @@ built in as checks rather than as advice.
 
 Files are expected as <dir>/<arm>_s<seed>.pfm.
 
-WHY THIS EXISTS. Both traps below were written down in known-issues.md after they cost an
-investigation, and both were then walked into AGAIN by hand-rolled scorers. A rule you have to
-remember is not a control; a rule the tool applies for you is.
+WHY THIS EXISTS. Every trap below was written down in known-issues.md after it cost an
+investigation, and the first two were then walked into AGAIN by hand-rolled scorers. A rule you
+have to remember is not a control; a rule the tool applies for you is. Traps 3 and 4 live further
+down, beside the code that enforces them: a rectangle is not a population (`maskbands`), and the
+arms may be the same image (`main`).
 
 TRAP 1 -- BIAS TESTED WITH A ROBUST STATISTIC.
 A trimmed mean is not an unbiased estimator of a skewed distribution's mean. Two arms that
@@ -61,6 +63,73 @@ def tmean(v, t=0.05):
     return v[k:len(v) - k].mean() if len(v) - 2 * k > 0 else v.mean()
 
 
+def assert_arms_differ(named):
+    """TRAP 4, callable from a one-off script. `named` is {label: ndarray}.
+
+    Exits if any two arms are byte-identical. Exposed as a function because the trap was
+    first added inside `main()` and then immediately bypassed by a hand-rolled scorer in the
+    very next run -- which is exactly the failure roi_score.py's own header describes for
+    traps 1 and 2. A guard that only protects the tool nobody used protects nothing, so it
+    is one import and one line for a scratch script.
+    """
+    items = list(named.items())
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            (na, va), (nb, vb) = items[i], items[j]
+            if va.shape == vb.shape and np.array_equal(va, vb):
+                sys.exit(f'!! ARMS "{na}" and "{nb}" are BYTE-IDENTICAL -- the same image. '
+                         f'Check the render logs: a flag the renderer declined to honour, or '
+                         f'one silently swallowed by a neighbouring flag that takes a value, '
+                         f'is the usual cause. Refusing to score.')
+
+
+def boxmask(H, W, ys, ye, xs, xe):
+    """A rectangle, as the boolean mask every region is represented by internally."""
+    m = np.zeros((H, W), dtype=bool)
+    m[ys:ye, xs:xe] = True
+    return m
+
+
+def maskbands(path, want, H, W):
+    """Per-material masks from an ftrace `-roi-mask` .pfm plus its .materials.txt legend.
+
+    TRAP 3 -- A RECTANGLE IS NOT A POPULATION, AND FOR SOME MATERIALS NO RECTANGLE IS.
+    Fur, foliage and any thin structure are sub-pixel and interleaved with whatever is
+    behind them, so a box over them is mostly not them. Measured: on `fur_creature` the
+    coat scores purity 0.44 over 28 disjoint regions, and `gallery_rain`'s hand-placed
+    `creature` ROI -- the one every FURDIM number came from, labelled "fur coat" -- is
+    75 % `cr_belly` skin and 25 % `cr_coat`. No amount of care in placing the box fixes
+    that; the material simply is not rectangular.
+    So the honest region for such a material is the set of pixels that actually show it,
+    which `ftrace -roi-mask` writes and this reads. It is also the only ROI definition
+    that transfers across scenes unchanged, which is what makes a cross-scene comparison
+    mean anything: the population is "the pixels showing material X" in both, rather than
+    a box here and the whole frame there.
+    """
+    mid = lum(readpfm(path))
+    if mid.shape != (H, W):
+        sys.exit(f'mask is {mid.shape[1]}x{mid.shape[0]} but the renders are {W}x{H} -- '
+                 f'regenerate it with the same -r as the renders')
+    names = {}
+    try:
+        for line in io.open(path + '.materials.txt', encoding='utf-8'):
+            if line.startswith('#'):
+                continue
+            p = line.rstrip('\n').split('\t')
+            if len(p) == 2:
+                names[int(p[0])] = p[1]
+    except OSError:
+        sys.exit(f'no legend beside {path} -- expected {path}.materials.txt')
+    out = {}
+    for i, nm in sorted(names.items()):
+        if want is not None and nm not in want:
+            continue
+        m = (np.rint(mid) == i)
+        if m.sum() > 0:
+            out[nm] = m
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('dir')
@@ -68,7 +137,9 @@ def main():
     ap.add_argument('--seeds', type=int, default=16)
     ap.add_argument('--bands', default='', help='name=y0:y1:x0:x1,... in [0,1] fractions')
     ap.add_argument('--rois', default='', help='a .rois file (format: name x0 y0 x1 y1)')
-    ap.add_argument('--only', default='', help='comma-separated ROI names to score')
+    ap.add_argument('--only', default='', help='comma-separated ROI/material names to score')
+    ap.add_argument('--mask', default='', help='an ftrace -roi-mask .pfm: score each material '
+                                               'on the pixels that actually show it')
     ap.add_argument('--list', action='store_true', help='print the parsed boxes and exit')
     ap.add_argument('--null', default='', help='band the change provably cannot affect')
     ap.add_argument('--cost', type=float, default=1.0, help='t_other / t_base, interleaved')
@@ -83,16 +154,38 @@ def main():
             sys.exit(f'no renders for arm {arm} in {a.dir}')
         ims[arm] = np.stack([lum(readpfm(f)) for f in fs])
     H, W = ims[arms[0]].shape[1:]
+
+    # TRAP 4 -- THE ARMS ARE THE SAME IMAGE.
+    # A flag that the renderer declined to honour produces a table of identical columns, which
+    # reads as "the change is harmless" and is in fact "there was no change". Measured instance:
+    # a radiance-cache cell-size sweep over a 32x range, plus a validation-off control, every
+    # column identical to the digit -- because ftrace had printed
+    #   [radcache] IGNORED: the GPU backward megakernel has no cache -- pass -device cpu
+    # and the sweep ran on the GPU. The renderer said so plainly and the sweep was still run,
+    # scored and nearly believed. A warning you have to read is not a control; this is.
+    for k in range(1, len(arms)):
+        a0, ak = ims[arms[0]], ims[arms[k]]
+        if a0.shape == ak.shape and np.array_equal(a0, ak):
+            sys.exit(f'!! ARMS "{arms[0]}" and "{arms[k]}" are BYTE-IDENTICAL. They are the same '
+                     f'image, so every column below would be a comparison of a thing with itself. '
+                     f'Check the render logs -- a flag the renderer declined to honour (wrong '
+                     f'-device, an unsupported mode) is the usual cause. Refusing to score.')
+
     ns = {k: v.shape[0] for k, v in ims.items()}
     if len(set(ns.values())) > 1:
         print(f'! arms have different seed counts {ns} -- variance columns are not matched')
 
-    if a.rois:
+    want = set(f for f in a.only.split(',') if f) if a.only else None
+    boxinfo = {}
+    if a.mask:
+        bands = maskbands(a.mask, want, H, W)
+        if not bands:
+            sys.exit(f'no materials from {a.mask} are visible (or --only matched none)')
+    elif a.rois:
         # FIELD ORDER IS `name x0 y0 x1 y1` -- fractions of width/height, x FIRST. Written here
         # once because getting it wrong silently yields one-pixel boxes rather than an error:
         # neighbouring ROIs then report identical numbers and a bad rig looks like a clean result.
         bands = {}
-        want = set(f for f in a.only.split(',') if f) if a.only else None
         for line in io.open(a.rois, encoding='utf-8'):
             m = re.match(r'\s*([A-Za-z_][\w]*)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)', line)
             if not m or line.lstrip().startswith('#'): continue
@@ -105,24 +198,30 @@ def main():
                 print('! ROI "%s" is degenerate at %dx%d (%d x %d px) -- check the field order'
                       % (name, W, H, xe - xs, ye - ys))
                 continue
-            bands[name] = (slice(ys, ye), slice(xs, xe))
+            bands[name] = boxmask(H, W, ys, ye, xs, xe)
+            boxinfo[name] = (ys, ye, xs, xe)
         if a.list:
-            for n, (sy, sx) in bands.items():
+            for n, (ys, ye, xs, xe) in boxinfo.items():
                 print('%-16s rows %4d..%-4d cols %4d..%-4d  (%d x %d px)'
-                      % (n, sy.start, sy.stop, sx.start, sx.stop,
-                         sx.stop - sx.start, sy.stop - sy.start))
+                      % (n, ys, ye, xs, xe, xe - xs, ye - ys))
             return
     elif a.bands:
         bands = {}
         for spec in a.bands.split(','):
             name, box = spec.split('=')
             y0, y1, x0, x1 = (float(v) for v in box.split(':'))
-            bands[name] = (slice(int(y0 * H), int(y1 * H)), slice(int(x0 * W), int(x1 * W)))
+            bands[name] = boxmask(H, W, int(y0 * H), int(y1 * H), int(x0 * W), int(x1 * W))
     else:
-        bands = {'top third': (slice(0, H // 3), slice(None)),
-                 'middle': (slice(H // 3, 2 * H // 3), slice(None)),
-                 'bottom third': (slice(2 * H // 3, H), slice(None))}
-    bands['WHOLE FRAME'] = (slice(None), slice(None))
+        # Thirds of a frame are slabs, not regions: nothing in them corresponds to
+        # anything in the scene, so a difference in one localises to nothing. They are a
+        # last resort for "I have no region at all", and saying so is cheaper than a
+        # reader assuming the rows mean more than they do.
+        print('! no --mask, --rois or --bands: falling back to horizontal thirds, which are\n'
+              '! slabs of the image and not regions of the SCENE. Prefer `ftrace -roi-mask`.')
+        bands = {'top third': boxmask(H, W, 0, H // 3, 0, W),
+                 'middle': boxmask(H, W, H // 3, 2 * H // 3, 0, W),
+                 'bottom third': boxmask(H, W, 2 * H // 3, H, 0, W)}
+    bands['WHOLE FRAME'] = np.ones((H, W), dtype=bool)
 
     base = arms[0]
     print(f'\nbaseline: {base}   seeds: {ns[base]}   cost ratio: {a.cost:.3f}\n')
@@ -134,21 +233,21 @@ def main():
 
     warnings = []
     for name, sl in bands.items():
-        npx = ims[base][(slice(None),) + sl].shape[1] * ims[base][(slice(None),) + sl].shape[2]
+        npx = int(sl.sum())
         # ROI SIZE IS PART OF THE RESULT. gallery_rain's `creature` is 6x6 px at 320x180 and
         # `alice_hair` 9x3 -- a trimmed mean over ~30 pixels is a far weaker number than the
         # column width suggests, and nothing else on the line says so.
         # An ROI with no signal in the BASELINE is a misapplied .rois file (wrong scene, wrong
         # camera) far more often than it is a legitimately black region -- and every ratio below
         # would come out NaN and be read as "no change". Say so instead.
-        if not (ims[base][(slice(None),) + sl].mean() > 0.0):
+        if not (ims[base][:, sl].mean() > 0.0):
             print('%-20s%8d   ! no signal in the baseline -- wrong scene or camera for this .rois?'
                   % (name, npx))
             continue
         row = '%-20s%8d' % (name, npx)
         for arm in arms[1:]:
-            vb = tmean(ims[base][(slice(None),) + sl].var(axis=0, ddof=1))
-            vo = tmean(ims[arm][(slice(None),) + sl].var(axis=0, ddof=1))
+            vb = tmean(ims[base][:, sl].var(axis=0, ddof=1))
+            vo = tmean(ims[arm][:, sl].var(axis=0, ddof=1))
             r = vo / vb if vb > 0 else float('nan')
             # BIAS ON RAW MEANS (trap 1). Per-seed image means, so the standard error comes
             # from the seed spread, which is the only honest error bar available here.
@@ -173,17 +272,37 @@ def main():
         if a.null not in bands:
             print(f'! --null names "{a.null}", which is not one of the bands: {list(bands)}')
         else:
+            # THE NULL HAS TWO HALVES AND THEY FAIL FOR DIFFERENT REASONS. Variance and bias
+            # are separate claims, and which one the null can speak to depends on what the
+            # arms differ BY. A parameter that legitimately changes variance everywhere in
+            # the frame -- sample count, gather radius, filter width -- makes the variance
+            # null inapplicable by construction, not failed: measured instance, a gather
+            # radius sweep read 0.278x / 0.074x / 0.013x / 0.004x on a floor strip 4-8 m from
+            # the only wall, purely because a wider gather averages more photons. Reporting
+            # that as "the rig is measuring something other than its label" is a false alarm
+            # that would discredit a correct rig, so both halves are printed and the variance
+            # half says plainly when it cannot be read.
             sl = bands[a.null]
             for arm in arms[1:]:
-                vb = tmean(ims[base][(slice(None),) + sl].var(axis=0, ddof=1))
-                vo = tmean(ims[arm][(slice(None),) + sl].var(axis=0, ddof=1))
-                r = vo / vb
-                ok = abs(r - 1.0) < 0.05
-                print('%s NULL CONTROL "%s" for %s: %.3fx%s' %
-                      ('  ' if ok else '!!', a.null, arm, r,
-                       '' if ok else '  -- the change cannot affect this band, so the rig is '
-                                     'measuring something other than its label. Check that the '
-                                     'arms are matched on sample count, not just on wall time.'))
+                vb = tmean(ims[base][:, sl].var(axis=0, ddof=1))
+                vo = tmean(ims[arm][:, sl].var(axis=0, ddof=1))
+                r = vo / vb if vb > 0 else float('nan')
+                mb = np.array([im[sl].mean() for im in ims[base]])
+                mo = np.array([im[sl].mean() for im in ims[arm]])
+                d = mo.mean() / mb.mean() - 1
+                se = np.sqrt(mb.var(ddof=1) / len(mb) + mo.var(ddof=1) / len(mo)) / abs(mb.mean())
+                bias_ok = abs(d) <= max(2.0 * se, 0.005)
+                var_ok = abs(r - 1.0) < 0.05
+                print('%s NULL "%s" for %s: bias %+.3f%%+-%.3f%s' %
+                      ('  ' if bias_ok else '!!', a.null, arm, 100 * d, 100 * se,
+                       '' if bias_ok else '  -- this band CANNOT move, so the rig is measuring '
+                                          'something other than its label; every other column '
+                                          'is suspect.'))
+                print('   %s   variance %.3fx%s' % (' ' if var_ok else '?', r,
+                      '' if var_ok else '  -- only meaningful if the arms do NOT differ by '
+                                        'something that changes noise everywhere (sample count, '
+                                        'gather radius, filter width). If they do, read the bias '
+                                        'line and ignore this one.'))
     for w in warnings:
         print('!! ' + w)
     if not warnings and not a.null:

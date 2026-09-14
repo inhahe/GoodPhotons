@@ -513,7 +513,7 @@ material "gridground" {
 # sat 0.167 to 0.228.
 #
 # HOW TO RE-DERIVE THIS after any change to the sun, the exposure or the pieces: render with
-# `-hdr -fireflies 3` and run `python scraps/_capchroma.py <out>.pfm`, which meters each cap in
+# `-hdr -fireflies 3` and run `python tools/_capchroma.py <out>.pfm`, which meters each cap in
 # the finished frame and reports its clipped fraction. Never meter the PNG — it is 8-bit sRGB,
 # a caustic is by definition the brightest thing in frame, and at the clip point all three
 # channels are equal, so the tone map deletes exactly the hue and peak ratio being measured
@@ -1074,7 +1074,7 @@ isosurface "stand_klein_cap" { material capmarble_klein
     uv planar axis=y
     # Widened, but NOT cantilevered, and deliberately so. The bottle is a 2.4 mm-walled
     # shell -- optically a window, not a lens -- and measured over a bare cap it peaks at
-    # only 2.0x the surrounding white with nothing at all above 1.5x (scraps/_gemsweep.py,
+    # only 2.0x the surrounding white with nothing at all above 1.5x (tools/_gemsweep.py,
     # `piece klein`). There is no focus to chase, just a soft brightening, and with barely
     # 0.30 m from the body down to the cap the sun walks it only +0.06 x / -0.29 z, landing
     # at (5.96, 2.31). So this stays centred on its column and simply gets bigger, so that
@@ -1282,7 +1282,7 @@ isosurface "stand_axicon_cap" { material capmarble_axicon
     # The THIRD cantilevered cap, and the shallowest cantilever of the three, because an
     # axicon's caustic barely walks at all. A lens throws its focus a full 0.98 m downwind
     # per metre of drop; this piece's patch measures a core within 0.06 m of its own axis
-    # (scraps/_gemsweep.py `piece vcone1.0 0.65` in SF10), because an axicon has no focal
+    # (tools/_gemsweep.py `piece vcone1.0 0.65` in SF10), because an axicon has no focal
     # POINT to be displaced — it has a focal LINE that starts at the exit face. So the cap is
     # barely pulled at all: 0.06 m in -x and 0.01 m in -z, not most of a metre.
     #
@@ -1535,7 +1535,7 @@ isosurface "gyroid" {
 # --- CRYSTAL GYROID (the second caustic piece) ------------------------------------------
 # This block used to claim it was "the piece that throws COLOUR", on the theory that a
 # gyroid is a pack of small prisms and prisms are what split light. That theory is WRONG and
-# scraps/_gemsweep.py is what disproved it: a stripped top-down rig, one piece at a time
+# tools/_gemsweep.py is what disproved it: a stripped top-down rig, one piece at a time
 # floated over a bare cap in this scene's sun, box-averaged 4x in linear light (mode D
 # renders one hero wavelength per sample, so raw per-pixel colour is speckle, not optics),
 # scoring the fraction of the cap lit above 1.2x the bare level and the excess-weighted
@@ -1908,7 +1908,7 @@ isosurface "chrome_ring" {
 
 # --- CRYSTAL AXICON (front-left; NOT settled — levitated, analytic placement) ----------
 # THE SCENE'S COLOUR SOURCE, and the only piece in it chosen for that job by measurement
-# rather than by eye. `scraps/_gemsweep.py` renders a candidate over a bare cap under this
+# rather than by eye. `tools/_gemsweep.py` renders a candidate over a bare cap under this
 # scene's own sun and meters four things: peak brightness, the fraction of the cap covered
 # above 2x the bare sunlight, `sat` (how far the caustic is from white), and `spread` — the
 # one that actually answers the question, because `sat` cannot tell a uniformly amber patch
@@ -2005,7 +2005,7 @@ isosurface "chrome_ring" {
 #
 # IT HAS A GIRDLE, AND THAT IS THE ONLY GEM CUT IT CAN AFFORD. Asked to shape this "more
 # like a diamond", the honest reply is that a diamond cut is an ANTI-CAUSTIC shape and this
-# was re-measured rather than argued (scraps/_gemsweep.py, `gcone`, SF10, drop 0.65, 480 px /
+# was re-measured rather than argued (tools/_gemsweep.py, `gcone`, SF10, drop 0.65, 480 px /
 # 600 spp, GEMBOX=0.7 so nothing is clipped). Everything above the girdle plane, in order:
 #     nothing (a bare cone)     peak 35.79x  cov 0.12%  sat 0.509  spread 0.282  1.40 x 1.17 m
 #     girdle 0.02               peak 36.41x  cov 0.15%  sat 0.480  spread 0.273  1.46 x 1.20 m

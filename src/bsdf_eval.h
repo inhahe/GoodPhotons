@@ -153,6 +153,35 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
     }
 }
 
+// ADJOINT BSDF, for a PARTICLE (light-subpath) vertex: f*(wo,wi) = f(wi,wo).
+//
+// Call this, not bsdfF, wherever a light-subpath vertex is CONNECTED to something -- the t=1
+// splat to the camera, and the light endpoint of an interior connection. Those are exactly the
+// sites that already carry `shadingAdjointCorr`, which is the shading-normal half of the same
+// Veach rule; this is the BSDF's own half. The two are independent: shadingAdjointCorr is 1 on
+// flat geometry, where this is still required.
+//
+// WHY IT MATTERS HERE. bsdfF pre-divides by cos(wi) (see the CONVENTION note at the top), which
+// is self-consistent on a continuation, where the direction evaluated is the direction sampled.
+// At a connection it is not: the Glossy lobe factor is symmetric under the swap but the
+// denominator is not, so the same physical path got f = r*lobe/cos(camera-side) from the light
+// subpath and f = r*lobe/cos(light-side) from the camera subpath. MIS then mixed two estimators
+// that disagreed by cos(wo)/cos(wcam) -- measured as mode D reading 15 % DIM with the camera near
+// the normal and bright with it grazing, a sign flip no roughness- or solid-angle-scaled error
+// could produce.
+//
+// WHICH FORM IS RIGHT IS SETTLED BY ENERGY. Under uniform illumination L, reflectance r must
+// return r*L. Dividing by the incident cosine gives \int r*lobe/cos * cos dw = r; dividing by the
+// camera-side cosine does not. A white-furnace test measures mode R -- which builds paths
+// camera-side and so lands on the first form -- flat to 0.04 % across roughness 0.2/0.6/0.9.
+//
+// A reciprocal BSDF (Diffuse's rho/PI, DiffuseTransmit) is unchanged by the swap, so switching a
+// site from bsdfF to this is a no-op for them and cannot perturb a diffuse scene.
+inline double bsdfFAdjoint(const Material& m, const Vec3& ns, const Vec3& wo, const Vec3& wi,
+                           double lambda, const Scene& scene, const Hit* hitForTex) {
+    return bsdfF(m, ns, wi, wo, lambda, scene, hitForTex);
+}
+
 // Directional pdf (solid angle) of sampling `wi` at a surface vertex given the
 // subpath arrived along `wo` (incoming ray dir = -wo). Matches render.h's sampling
 // densities. 0 for delta materials (handled separately) or unsupported hemispheres.

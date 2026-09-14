@@ -1,0 +1,66 @@
+# GRADED companion to _ga_null.ftsl, for the gather radius's response near a wall.
+#
+# WHAT PROMPTED IT. Re-scoring the fur sweeps on material masks showed every small enclosed scene
+# brightening +21..25 % as the gather radius grows, INCLUDING its flat wall and floor, while open
+# gallery_rain's ground moved +2 %. _ga_null already names the mechanism -- near a corner "a gather
+# disc genuinely runs off onto a perpendicular wall" -- but nothing has ever measured its SIZE or,
+# more importantly, its SHAPE. A global brightening and a corner effect are indistinguishable when
+# you only have one flat surface and one number for it, which is all any scene here has had.
+#
+# THE DISCRIMINATOR IS DISTANCE. If the disc running off onto the wall is the cause, the effect must
+# be GRADED: a strip of floor at distance d from the wall cannot be touched until the gather radius
+# reaches d, and must then grow. A global cause has no way to produce that ordering. So the floor is
+# split into strips at increasing distance from a single wall, each strip a separate MATERIAL NAME
+# with a byte-identical BSDF, so `ftrace -roi-mask` separates them and the only thing differing
+# between strips is how far they sit from the wall.
+#
+# CONFOUNDS ARE HELD FIXED BY CONSTRUCTION, not hoped to cancel: one scene, one render per radius,
+# so exposure, photon count, light and camera are literally the same numbers for every strip. And
+# the true radiance of each strip does not depend on the gather radius at all -- r is an estimator
+# parameter -- so ANY movement of a strip across the sweep is estimator bias, and no reference
+# render is needed. The wall genuinely does bounce extra light onto the near strips; that is real
+# transport, it is present at every radius, and it divides out of a strip-versus-itself ratio.
+#
+# s40 IS THE BY-CONSTRUCTION NULL. It lies 4..8 m from the wall, so at every radius in the sweep
+# (max 0.8 m) its gather discs are wholly on flat floor with nothing else within reach -- the exact
+# condition _ga_null was built to create. It CANNOT move. If it does, the rig is measuring something
+# other than its label and every other column is void.
+#
+# PREDICTION, REGISTERED BEFORE THE RUN:
+#   s00 (0..0.25 m) rises first and most; each further strip rises later and less; s40 stays flat.
+#   If instead every strip rises by a similar amount, the enclosed-scene brightening is NOT the
+#   corner effect and my explanation for it is wrong.
+scene { units meters  spectral 360 830 1 }
+
+# One BSDF, six names. Any difference between strips is position, never material.
+material "s00" { type diffuse reflect whitewall 0.75 }
+material "s02" { type diffuse reflect whitewall 0.75 }
+material "s05" { type diffuse reflect whitewall 0.75 }
+material "s10" { type diffuse reflect whitewall 0.75 }
+material "s20" { type diffuse reflect whitewall 0.75 }
+material "s40" { type diffuse reflect whitewall 0.75 }
+material "wall" { type diffuse reflect whitewall 0.75 }
+
+# The single wall, in the x = 0 plane, rising 4 m.
+quad { origin 0 0 -6   u 0 4 0   v 0 0 12   material wall }
+
+# Floor strips, all at y = 0, each spanning the full z range, at increasing distance from the wall.
+quad { origin 0.00 0 -6   u 0.25 0 0   v 0 0 12   material s00 }
+quad { origin 0.25 0 -6   u 0.25 0 0   v 0 0 12   material s02 }
+quad { origin 0.50 0 -6   u 0.50 0 0   v 0 0 12   material s05 }
+quad { origin 1.00 0 -6   u 1.00 0 0   v 0 0 12   material s10 }
+quad { origin 2.00 0 -6   u 2.00 0 0   v 0 0 12   material s20 }
+quad { origin 4.00 0 -6   u 4.00 0 0   v 0 0 12   material s40 }
+
+light area {
+    origin 2 5 -1   u 2 0 0   v 0 0 2   normal 0 -1 0
+    spd preset:bb6500
+}
+
+# Looking straight down, so the strips read as bands across the frame and each gets many pixels.
+# The up vector is offset off the view axis because looking exactly down is degenerate.
+camera "cam" {
+    eye 3 9 0.5   look_at 3 0 0   up 0 0 1   fov_y 55
+    mode M
+    film { res 256 256 }
+}

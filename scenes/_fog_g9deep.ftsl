@@ -1,0 +1,67 @@
+# ANISOTROPY TEST (reduced sigma_t' ~= 20.0, reduced albedo ~= 0.952 -- the SIMILARITY MATCH to _fog_thick).
+#
+# Generated from _fog_thick.ftsl with ONLY the medium line changed -- see VOLCACHE.
+# Every thick-medium result in that entry is at g 0.0, so the claim "the order >= 2
+# field is smooth on thick media" carries an unstated ISOTROPIC condition. The
+# similarity relation sigma_s' = sigma_s (1 - g) predicts the smoothness follows the
+# REDUCED optical depth, which would mean the scattering-order histogram is the right
+# predictor precisely because it already folds g in.
+# Optically THICK Cornell box — the scene that can tell mode J (UPBP) apart from mode D.
+#
+# `_fog_cornell.ftsl` is the CORRECTNESS gate: sigma_t 0.6 across a 1 m box is an optical
+# depth of 0.6, which mode D's connections sample perfectly well, so mode J provably agrees
+# with mode D there and provably buys nothing (measured 0.218.0: identical noise for ~25x
+# the time). That is the right outcome for a correctness scene and a useless one for a
+# PERFORMANCE claim — you cannot show an estimator rescuing a technique that was never in
+# trouble.
+#
+# This is the same box with the one variable that matters turned up: sigma_t 20, an optical
+# depth of ~20 across the box, with a high albedo so the light actually survives to scatter
+# many times instead of simply being absorbed. That is the regime UPBP exists for. A BDPT
+# connection needs the CAMERA's free-flight distance sample to land on the scattering point
+# and then needs the shadow ray to survive exp(-tau) back to the light; at tau ~ 20 both are
+# hopeless, so mode D's deep glow is pure noise. A photon beam is a whole LINE of deposited
+# power, so a camera ray that passes anywhere within the kernel radius collects it — the
+# merge reaches where the connection cannot.
+#
+# The medium is BOUNDED to the box on purpose. `_fog_cornell`'s haze is unbounded, which is
+# harmless at sigma_t 0.6 but at sigma_t 20 would put an optical depth of ~44 between the
+# camera (z = 2.7) and the box and render a black frame.
+#
+#   ftrace -in scenes/_fog_thick.ftsl -mode D -device cpu -r 64 -time 300 -hdr -o png/thick_d.png
+#   ftrace -in scenes/_fog_thick.ftsl -mode J -device cpu -r 64 -time 300 -hdr -o png/thick_j.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "white" { type diffuse    reflect whitewall 0.75 }
+material "red"   { type diffuse    reflect redwall }
+material "green" { type diffuse    reflect greenwall }
+material "glass" { type dielectric ior    glass:SF10 }
+
+quad { origin 0 0 0   u 1 0 0   v 0 0 1   material white }   # floor
+quad { origin 0 1 0   u 0 0 1   v 1 0 0   material white }   # ceiling
+quad { origin 0 0 0   u 0 1 0   v 1 0 0   material white }   # back
+quad { origin 0 0 0   u 0 0 1   v 0 1 0   material red   }   # left
+quad { origin 1 0 0   u 0 1 0   v 0 0 1   material green }   # right
+
+sphere { center 0.5 0.32 0.4   radius 0.25   material glass }
+
+# The one difference from _fog_cornell, plus the bounds that make it renderable at all.
+medium {
+    sigma_t 191.0   albedo 0.995   g 0.9
+    bounds { min 0 0 0   max 1 1 1 }
+}
+
+light area {
+    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0
+    spd preset:bb6500
+}
+
+camera "cam" {
+    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40
+    mode B
+    film { res 256 256 }
+}

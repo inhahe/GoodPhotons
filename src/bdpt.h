@@ -2828,7 +2828,9 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             // (flat/analytic, stG==1); skipped for two-sided (transmissive) materials.
             double stG = isTwoSidedMat(*qs.mat) ? 1.0 : shadowTerminatorG(wcam, qs.ns, ngo);
             if (stG <= 0.0) return 0.0;
-            f = bsdfF(*qs.mat, qs.ns, wo, wcam, lambda, scene, &qs.hit);
+            // ADJOINT: qs is a particle vertex, so the BSDF's own Veach correction applies as
+            // well as the shading-normal one below. See bsdfFAdjoint.
+            f = bsdfFAdjoint(*qs.mat, qs.ns, wo, wcam, lambda, scene, &qs.hit);
             // Adjoint shading-normal correction: qs is a LIGHT-subpath (particle) vertex
             // whose f is evaluated toward the camera (wcam = outgoing). 1 when ns==ng.
             // The correction and stG are pure geometry — shared by every wavelength.
@@ -2836,7 +2838,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                                                     : shadingAdjointCorr(wo, wcam, qs.ns, ngo)) * stG;
             f *= adj;
             for (int i = 0; i + 1 < nUp; ++i)
-                fSec[i] = bsdfF(*qs.mat, qs.ns, wo, wcam, hb.lam[i + 1], scene, &qs.hit) * adj;
+                fSec[i] = bsdfFAdjoint(*qs.mat, qs.ns, wo, wcam, hb.lam[i + 1], scene,
+                                       &qs.hit) * adj;
         }
         {   // max over live wavelengths (identical to `f <= 0` when nUp==1)
             double mxF = f;
@@ -3031,7 +3034,9 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                 stGL = shadowTerminatorG(w * -1.0, qs.ns, ngoL);
                 if (stGL <= 0.0) return 0.0;
             }
-            fL = bsdfF(*qs.mat, qs.ns, woL, w * -1.0, lambda, scene, &qs.hit);
+            // ADJOINT: qs is the LIGHT endpoint, a particle vertex (see bsdfFAdjoint). pt, the
+            // eye endpoint above, is a radiance vertex and correctly uses plain bsdfF.
+            fL = bsdfFAdjoint(*qs.mat, qs.ns, woL, w * -1.0, lambda, scene, &qs.hit);
             // Adjoint shading-normal correction on the LIGHT-subpath endpoint qs (particle
             // vertex; outgoing = w*-1 toward the eye vertex). The eye endpoint pt is a
             // Radiance vertex and gets NO correction. 1 when ns==ng (flat/analytic).
@@ -3041,8 +3046,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                                     : shadingAdjointCorr(woL, w * -1.0, qs.ns, ngoL);
             fL *= adjL;
             for (int i = 0; i + 1 < nUp; ++i)
-                fLSec[i] = bsdfF(*qs.mat, qs.ns, woL, w * -1.0, hb.lam[i + 1], scene, &qs.hit)
-                           * adjL;
+                fLSec[i] = bsdfFAdjoint(*qs.mat, qs.ns, woL, w * -1.0, hb.lam[i + 1], scene,
+                                        &qs.hit) * adjL;
         }
         {   // max over live wavelengths (identical to `fE<=0 || fL<=0` when nUp==1)
             double mxE = fE, mxL = fL;

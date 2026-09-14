@@ -862,6 +862,15 @@ struct EmitTri {
 
 struct Emitter {
     Vec3 origin, u, v, normal;
+    // Quad only: the PATCH's own orientation, `normalize(cross(u,v))`, and whether the authored
+    // `normal` differs from it. `normal` is a free override of the emission axis, so the two can
+    // disagree -- and then the solid angle the patch subtends (the `cos` in G and in the
+    // area->solid-angle conversion) belongs to `nGeom`, while the one-sided emission test belongs
+    // to `normal`. See known-issues.md: a 45 deg tilt dims the light by exactly cos(45).
+    // `normalTilted` is false for every well-formed light, and the readers keep their original
+    // float expression in that case, so a well-formed scene is bit-identical.
+    Vec3 nGeom{0, 0, 0};
+    bool normalTilted = false;
     double area = 0.0;
     EmitterShape shape = EmitterShape::Quad;
     // Index into Scene::mats of the emissive material on this light's GEOMETRY
@@ -1614,6 +1623,17 @@ struct Scene {
         Emitter e;
         e.origin = o; e.u = U; e.v = V; e.normal = n; e.area = area;
         e.collimated = collimated; e.beamDir = beamDir; e.matId = matId;
+        // The patch's own orientation, and whether the authored normal left its plane. Computed
+        // here rather than at the reader so the hot path is a bool test, and so every caller --
+        // the FTSL loader and the built-in scenes alike -- gets it.
+        {
+            const Vec3 cx = cross(U, V);
+            const double lc = length(cx), ln = length(n);
+            if (lc > 0.0 && ln > 0.0) {
+                e.nGeom = cx / lc;
+                e.normalTilted = std::fabs(dot(n / ln, e.nGeom)) < 1.0 - 1e-6;
+            }
+        }
         e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
         emitters.push_back(std::move(e));
     }
@@ -2926,6 +2946,19 @@ struct Scene {
     const char* meshNameForMat(int matId) const {
         for (const auto& g : meshGroups) if (g.matId == matId) return g.name.c_str();
         return nullptr;
+    }
+
+    // AUTHORED MATERIAL NAMES, indexed by matId; empty where the loader had none (a material
+    // built by an importer rather than declared in FTSL). Filled once at load from the parser's
+    // name->index map -- a `Material` itself carries no name, which is why this exists.
+    //
+    // `meshNameForMat` above only answers for geometry that came in as a MESH. Everything else --
+    // isosurface, CSG, quad, sphere -- had no name at all, so per-material diagnostics printed
+    // `mat45` for exactly the things worth naming (M-GATHERAREA's `cap_gyroid` is an isosurface).
+    std::vector<std::string> matNames;
+    const char* matNameFor(int matId) const {
+        if (matId < 0 || matId >= (int)matNames.size() || matNames[matId].empty()) return nullptr;
+        return matNames[matId].c_str();
     }
 
     // Linear-scan reference (pre-BVH), kept for the -checkbvh self-test.

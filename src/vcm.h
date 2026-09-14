@@ -87,6 +87,7 @@
 namespace vcm {
 
 using bdpt::bsdfF;
+using bdpt::bsdfFAdjoint;   // particle-vertex connections; see bsdf_eval.h
 using bdpt::bsdfPdf;
 using bdpt::isConnectibleMat;
 using bdpt::isTwoSidedMat;
@@ -733,10 +734,12 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                             // geometric, so the whole bundle shares them; only the BSDF
                             // value is per-λ (hero.h policy 4: absolute, not a ratio).
                             const double geo = shadingAdjointCorr(wo, wcam, h.n, ngo) * stG;
-                            double f = bsdfF(*mp, h.n, wo, wcam, lambda, scene, &h) * geo;
+                            // ADJOINT: particle vertex connected to the camera (bsdfFAdjoint).
+                            double f = bsdfFAdjoint(*mp, h.n, wo, wcam, lambda, scene, &h) * geo;
                             double fSec[hero::kHeroMax - 1] = {0}, mxF = f;
                             for (int i = 0; i + 1 < nUp; ++i) {
-                                fSec[i] = bsdfF(*mp, h.n, wo, wcam, hb.lam[i + 1], scene, &h) * geo;
+                                fSec[i] = bsdfFAdjoint(*mp, h.n, wo, wcam, hb.lam[i + 1],
+                                                       scene, &h) * geo;
                                 if (fSec[i] > mxF) mxF = fSec[i];
                             }
                             const bool isHairV = (mp->type == MatType::Hair);
@@ -1090,7 +1093,10 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                                    ? (cosLit != 0.0) : (cosLit > 0.0 && stGLit > 0.0);
                 if (!camSide || !litSide) continue;
                 double fCam = bsdfF(*mp, h.n, wo, w, lambda, scene, &h) * stGCam;
-                double fLit = bsdfF(*lv.mat, lv.ns, lv.wo, w * -1.0, lambda, scene, &lv.hit);
+                // ADJOINT on the light endpoint lv (particle side); fCam above is the
+                // Radiance side and correctly uses plain bsdfF. See bsdfFAdjoint.
+                double fLit = bsdfFAdjoint(*lv.mat, lv.ns, lv.wo, w * -1.0, lambda, scene,
+                                           &lv.hit);
                 // Adjoint correction on the LIGHT-subpath endpoint lv only (particle side;
                 // outgoing = -w toward the camera vertex). fCam is the Radiance side — none.
                 // Uses lv.ng oriented to lv.ns (ngoLit above); a no-op when the mesh is flat.
@@ -1108,7 +1114,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 for (int i = 0; i + 1 < nUpConn; ++i) {
                     const double li = hb.lam[i + 1];
                     double fc = bsdfF(*mp, h.n, wo, w, li, scene, &h) * stGCam;
-                    double fl = bsdfF(*lv.mat, lv.ns, lv.wo, w * -1.0, li, scene, &lv.hit) * adjLit;
+                    double fl = bsdfFAdjoint(*lv.mat, lv.ns, lv.wo, w * -1.0, li, scene,
+                                             &lv.hit) * adjLit;
                     fProdSec[i] = fc * fl;
                     if (fProdSec[i] > mxProd) mxProd = fProdSec[i];
                 }

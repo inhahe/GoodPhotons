@@ -1929,6 +1929,26 @@ why these historical runs reproduce. See **J-BEAMCOST** in `known-issues.md`.
     to multiply back in — so `f·G` comes out to exactly `hairFCos × cosOther/dist²` and every
     MIS ratio, strategy weight and density conversion stays untouched and provably consistent.
     A `hairCosGuard` floor of 1e-7 keeps the division finite at a grazing endpoint.
+  - *...and that pre-divide is exactly what makes `f` NON-RECIPROCAL, so a particle vertex needs
+    the ADJOINT (0.276.0).* The convention divides by `cos(ns, wi)`, the **newly sampled**
+    direction — self-consistent on a continuation, where the direction evaluated is the direction
+    sampled, but not at a *connection*. `Glossy` is the clearest case: its lobe factor is
+    symmetric under swapping `wo`/`wi` (`dot(wi, reflect(-wo,ns)) == dot(wo, reflect(-wi,ns))`,
+    algebraically) while the denominator is not, so one physical path picked up
+    `r·lobe/cos(camera-side)` when a light subpath built it and `r·lobe/cos(light-side)` when a
+    camera subpath did, and MIS combined two estimators that disagreed by `cos(wo)/cos(wcam)`.
+    Measured on mode `D` as **15 % too dim** with the camera near the normal and too bright with
+    it grazing — a sign flip. `bsdfFAdjoint(m, ns, wo, wi) = bsdfF(m, ns, wi, wo)` (device twin
+    `dBsdfFAdjoint`) is Veach's particle-tracing rule for the BSDF itself; `shadingAdjointCorr`
+    was already the shading-normal half of it, and the two are **independent** — the latter is 1
+    on flat geometry, where this is still required. **The rule for new code: every site that needs
+    `shadingAdjointCorr` needs `bsdfFAdjoint` too, and no other site does.** That criterion is
+    greppable, which is how the scope was bounded to 12 call lines across `bdpt.h`, `vcm.h` and
+    `render_cuda.cu` rather than guessed at. Which direction is correct is settled by energy, not
+    preference: under uniform illumination `∫ r·lobe/cos(w_incident) · cos(w_incident) dω = r`,
+    whereas dividing by the camera-side cosine does not integrate to `r` — and a white-furnace
+    test measures mode `R`, which builds paths camera-side, flat to **0.04 %**. Leave `bsdfPdf`
+    alone: the lobe factor is symmetric, so the densities were always reciprocal.
   - *Modes M / S scatter but never gather.* `struct Photon { Vec3 n; float power; float
     lambda; }` carries **no incident direction**, so a directional BCSDF has nothing to
     evaluate against at a density-estimate gather. `sppm_render.h` and `photonmap_render.h`
@@ -2591,7 +2611,14 @@ as the one at fault.
   direction, weighted by its reflectance, but takes it from a 2-D radical-inverse lattice on
   the power-cosine lobe (`whittedGlossyDir` → `glossyDirUV` in `render.h`) rather than the
   rng — the path is deliberately **not** forked, which would cost N^depth inside a gyroid
-  labyrinth. That lattice is what makes the mode *consistent* on rough specular: collapsing
+  labyrinth. **A glossy vertex also takes the light connection here (0.275.0)**, on the same
+  lattice-vs-rng principle: `neeLight`'s `whitted` branch walks a `lightGrid`² quadrature over the
+  light and the lattice direction supplies the other half of the MIS weight, so mode `W`'s glossy
+  estimator is mode `R`'s with quadrature substituted for sampling rather than a different one.
+  Until 0.275.0 all four glossy sites (host/device × scalar/hero) guarded that connection behind
+  `!whitted` and returned before it, which made a glossy surface **pure black at `-spp 1`** — the
+  mode's headline configuration, since sample 0 of the lattice *is* the mirror direction. See
+  `known-issues.md` → the `type glossy` backward-NEE entry. That lattice is what makes the mode *consistent* on rough specular: collapsing
   every sample onto the mirror direction (pre-0.109.0) meant extra spp bought edge
   antialiasing and nothing else, so a satin metal never converged at any budget (measured:
   6 % better over 256× the samples, versus 19× better now). The polar coordinate is
@@ -3387,6 +3414,19 @@ as the one at fault.
   0.9996 in absolute units, solar disc `1/16` on both — and `cornell.ftsl` mode U is
   **byte-identical** before and after the port, since every new density sits behind
   `dIsDeltaEmitter` and the area path keeps its RNG draw order.
+- **`volcache.h`** (0.299.0; deposit split 0.300.0) — **PROTOTYPE, environment-gated, off by
+  default and not a supported feature.** A volumetric **fluence** cache for the `order >= 2` part of
+  the beam gather: an `res^3` grid of CIE-weighted photon path-length density, built by splatting
+  multiply-scattered chords and marched by the camera in their place
+  (`L += sigma_s * phase * fluence * T * dx`). `FTRACE_VOLCACHE=<res>` marches it; adding
+  `FTRACE_VOLCACHE_SPLIT=1` also **erases** those chords from the `BeamMap` before `BeamMap::build`,
+  via `volCacheSplit` in `beamgather.h`, so the SAH split, the CIE table, the boxes and the BVH are
+  all built over the order-1 remainder only. Measured 64 % faster and energy-correct to 0.2 % on
+  thick isotropic media; the erase, not the query-side skip, is where the whole gain is.
+  **A scalar fluence assumes an isotropic phase function**, so `build()` refuses `g != 0` and
+  heterogeneous media rather than silently averaging. See known-issues, VOLCACHE, for the scope
+  limits and for the cache-ownership bug that made its first measurement meaningless.
+
 - **`surfmerge.h`** (0.258.0) — the **surface photon map mode `J` merges against**, i.e. the
   half folded in from mode `U`. Three things live here and nowhere else:
   **On by default on the CPU since 0.260.0** — all three UPBP-VM gates green (gate 3: switching the
@@ -3556,7 +3596,8 @@ as the one at fault.
   stored, and is the classic two-map bug if you use the caustic map's own count instead: a rare
   caustic would be rescaled to full light-source brightness.
   **THE GATHER FOOTPRINT (`-gatherarea`, on by default at 8 probes since v0.268.0; mode `S`
-  gained it in v0.273.1).** The density estimate above divides by `pi r^2`, the area of a FULL
+  gained it in v0.273.1; the fiber gate v0.277.0, and `-gabias` / `-gagate` / `-gaball` all
+  on by default since v0.278.0).** The density estimate above divides by `pi r^2`, the area of a FULL
   disc, while two things stop the photons it sums from having come from one: the query rejects
   any photon whose normal disagrees with the hit's by more than 60 degrees, and nothing clips the
   disc to the surface, so wherever the disc overhangs a silhouette or a thin feature that part of
@@ -3579,15 +3620,44 @@ as the one at fault.
   method would have missed the case it was built for. One intersector call handles every
   representation, and it is the same intersector the render already trusts.
 
-  **It is not a quality dial, and it is wrong on dense fur.** More probes make hair and cloth
-  *worse*, because the default's apparent accuracy is partly Jensen's upward bias at low `M`
-  (`E[1/cov] > 1/E[cov]`) offsetting a residual dark bias. And where a tangle **overfills** the
-  disc the correction has the sign backwards: `creature`'s fur coat is accurate uncorrected and
-  **+48 %** corrected, because the probe sees only the nearest layer while the query gathers from
-  the whole ball. `-gatherarea 0` restores the pre-0.267 estimator exactly and is the escape
-  hatch for fur-dominated scenes. Counting the hidden layers is NOT the fix and was measured:
-  their area is real and their photons are accepted, but the visible point is on the FRONT layer
-  and dividing its photons by front-plus-back area dilutes the surface being shaded.
+  **It was not a quality dial, and three separate defects were why (all fixed, v0.277.0-v0.278.0).**
+  The estimator had four things wrong with it at once, and because they partly cancelled, fixing
+  any one alone made the numbers *worse* — which is why the entry stalled for so long and why each
+  of these shipped only with the others.
+
+  * **Dense fur had the sign backwards.** A tangle *overfills* the disc, so `creature`'s coat was
+    accurate uncorrected and **+48 %** corrected. Fixed by the **fiber gate** (v0.277.0): skip the
+    correction wherever the gather point is on curve geometry, tested on `Hit::fiberRadius` /
+    `DHit::fiberRadius`. It is a *geometric* test, not a photon statistic — reject-rate and depth
+    heuristics were both tried and cannot separate fur from hair, while the fiber test does it
+    100 % to 0 %. Counting the hidden layers is NOT the fix and was measured: their area is real
+    and their photons are accepted, but the visible point is on the FRONT layer, so dividing its
+    photons by front-plus-back area dilutes the surface being shaded.
+  * **Jensen's bias made the probe count a BIAS knob, not a convergence knob.** The estimate is
+    `1/c-hat` of a noisy `c-hat` and `E[1/c-hat] > 1/E[c-hat]`, so fewer probes read brighter.
+    Fixed by the pseudo-count `(area+1)/(M+1)` (`-gabias`), which is exactly 1.0 at full coverage —
+    so flat ground stays untouched by construction — bounded by `M+1`, and the textbook
+    near-unbiased estimator of `1/p`.
+  * **The flat-interior early-out asked for more evidence when given more probes.** Its threshold
+    was `probe0 = M/4`, i.e. 2-of-2 flat-on probes at `M = 8` but 8-of-8 at `M = 32`, so the same
+    disc passed the same test at different rates purely because the budget changed. `-gagate`
+    holds it at a fixed count, and `-1` (the default) removes the early-out entirely.
+  * **The probe accepted a CYLINDER while the query gathers from a BALL.** Probes start `r` above
+    the tangent plane and accept `h.t <= 2r`; the numerator is `queryR(p, r)`. A point at tangent
+    offset `rr` and height `dz` is at `sqrt(rr^2 + dz^2) >= rr`, so on anything non-flat the probe
+    counted rim surface the query can never reach — divisor too big, estimate too dark. `-gaball`
+    adds the one inequality, and on flat geometry `dz = 0` makes it algebraically inert.
+
+  Together: mean absolute error on `gallery_rain`'s five ROIs **36.8 -> 8.0 points**, and the
+  estimator is now nearly independent of its own probe count (`M = 8` vs `32` disagreement
+  **3.30 -> 1.06**) rather than accurate by cancellation. All three flags restore the previous
+  behaviour when set to 0, and all three read the same environment channel on host and device, so
+  the backends cannot disagree about which estimator is running.
+
+  `-gatherarea 0` still restores the pre-0.267 estimator exactly, but it is now a **speed/accuracy
+  knob rather than a correctness escape hatch**: the correction costs ~1.6x the frame on a
+  surfaces-only mode-`M` render, and is unmeasurable on a beam-heavy one where the volume gather
+  dominates.
 
   The classifier is `photonVertexKind` (`render.h`) with device twin `dPhotonVertexBit`
   (`render_cuda.cu`), three-way: **FOCUS** (dielectric, mirror, thin-film, multilayer, grating,
@@ -4402,6 +4472,34 @@ as the one at fault.
 - **`camera.h` / `lens.h`** — camera models incl. finite thin-lens, fisheye/pano,
   realistic multi-element lens; `scene_film.h` film/EV/auto-exposure (p99),
   exposure-lock anchors.
+- **`bvh.h` sphere queries** — `Aabb::dist2To` (exact point-to-box squared distance) and
+  `Bvh::traverseSphere(c, r, leafFn)`, an unordered no-early-exit traversal reporting every
+  primitive in a node box meeting the ball. Built for M-GATHERAREA's geometric footprint: the
+  gather divides by pi r^2 while collecting only the same-facing surface actually present, and
+  no photon statistic can recover the difference (measured bracket on `fur_creature`'s belly:
+  -33.6 % with the fiber gate, +46.8 % without). Candidates are a deliberate superset — a false
+  candidate costs a test, a missed one costs correctness. `-checkspherequery` brute-force
+  verifies the no-miss invariant.
+- **`gafootprint.h`** — `gatherFootprintArea()`: the same-facing surface area actually inside
+  a gather ball, measured geometrically. Fires `kDisc` stratified rays through the tangent
+  disc and MARCHES each one, resuming past every hit until the ball's chord is exhausted, so
+  every layer is counted rather than only the nearest — which is the whole difference from
+  the probe in `photonmap_render.h`, and the reason that probe fails on a tangle holding
+  ~600 curve segments. Marching also means there is no per-primitive-class code: triangles,
+  spheres, implicits, curve segments and instances all work through the same
+  `Scene::closestHit`, and a class added later needs no change here. An earlier per-class
+  version had exactly two routines and silently returned ~0 area on `gallery_rain`, whose
+  caps are implicit isosurfaces. Consumed by `-gafparea` (diagnostic) and `-gageom` (wires
+  it into `gatherCoverageRaw` as the coverage, host only, off by default).
+  **Validated**: exactly 1.0000 on a flat plane, 0.5986 on floor within 0.25 m of a wall
+  against an analytic half-disc, 1.0079 on `gallery_rain`'s open ground. **Not used on
+  fibers**: a coat's footprint measures ~2.9x pi r^2, so dividing by it would darken fur
+  threefold — the footprint is right there and the DIVISION is the wrong estimator, because
+  the density estimate assumes the ball meets one locally flat surface.
+- **`roiboxes.h`** — `-roiboxes`: per-material measurement ROIs read off a pixel-centre
+  primary-visibility pass, split into connected components and gated on purity/share.
+  Depends on `camera.h` (it asks `genRay` which raster row is the top rather than
+  assuming one), so it is included after it.
 - **`filmToRgb8` auto-exposure cost** — the p99 anchor wants exactly **one** order
   statistic, so it uses `std::nth_element` (O(n), partitions in place) rather than a full
   `std::sort` of every pixel's luminance, and it builds the luminance array **only when
@@ -5782,7 +5880,7 @@ as the one at fault.
     - **A gyroid SHELL is a diffuser, not a bank of prisms — and the plain sphere beats it.**
       The scene long asserted the opposite: its crystal gyroid was a shell (`|G| < 0.55`) on
       the theory that a gyroid is a pack of small prisms and prisms split light.
-      `scraps/_gemsweep.py` disproves it. A shell is a labyrinth of thin *curved sheets*, so a
+      `tools/_gemsweep.py` disproves it. A shell is a labyrinth of thin *curved sheets*, so a
       ray crosses a dozen of them and is deviated a dozen small random ways; what reaches the
       cap is a shadow with a filigree of sub-centimetre threads. The fix is not the lattice
       frequency but the *topology*: dropping the `abs` takes the field to `G < 0`, one of the
@@ -5992,7 +6090,7 @@ as the one at fault.
     - **The axicon has a 4 cm GIRDLE, and that is the only gem cut it can afford.** Asked to
       shape it "more like a diamond", the answer is that a diamond cut is an *anti-caustic*
       shape — but "how much gem silhouette can it carry" is a different question from "should
-      it be a brilliant", and it has its own sweep (`scraps/_gemsweep.py`, piece `gcone`; SF10,
+      it be a brilliant", and it has its own sweep (`tools/_gemsweep.py`, piece `gcone`; SF10,
       drop 0.65, 480 px / 600 spp, and **`GEMBOX=0.7`** — see the box caveat below). Everything
       added *above* the girdle plane, leaving the 45° conical exit face untouched:
 
@@ -6041,13 +6139,13 @@ as the one at fault.
       direction and the reason both are measured. Every other cap is unchanged to three
       decimals (gyroid 2.84 %/0.444→0.445, glass 0.00 % both), i.e. no side effects.
     - **`contained_by` is a hard clip in the gem rig, and its default box was shaving the
-      control.** `scraps/_gemsweep.py` boxed every piece at ±0.5 m while `vcone1.0`'s girdle
+      control.** `tools/_gemsweep.py` boxed every piece at ±0.5 m while `vcone1.0`'s girdle
       radius is 0.56, so every axicon number the rig printed before the girdle sweep was
       measured on a cone with four flats cut into its rim. Harmless for *ranking* shapes that
       all share the box, which is why the default is unchanged — but `GEMBOX=0.7` now exists,
       and any absolute axicon number must say which box it came from. (The rows above are all
       `GEMBOX=0.7`; the rows in the piece-ranking table further up are all ±0.5.)
-    - **Metrics do not replace looking at it: `scraps/_capcrop.py`.** It crops a cap's screen
+    - **Metrics do not replace looking at it: `tools/_capcrop.py`.** It crops a cap's screen
       footprint out of the float buffer and prints it three ways — *as shipped* (exactly the
       PNG), *under-exposed* (gain set so the cap's own 2×2 peak lands just under white), and
       *chromaticity only* (renormalised to equal luminance, saturation stretched). The three
@@ -7915,6 +8013,36 @@ cost a black frame, never the display driver.
 - Rule: any hot-path optimization must be **bit-identical** (CPU sha1) or
   visually/fuzzy identical (GPU) vs. the pre-change exe before committing, one
   commit per optimization so any regression can be reverted alone.
+
+## Measurement ROIs come from the renderer, not from the scene file (`roiboxes.h`, `-roiboxes`, 0.279.0)
+
+Scoring an A/B on the whole frame averages the region under test together with everything that
+cannot respond to it, so this project's standing rule is to score per-ROI. Enforcing that needs an
+ROI per scene, and for a long time exactly one existed (`scraps/gallery_rain.rois`) because building
+one meant hand-projecting primitive coordinates through the camera and then checking each box
+against the projected footprint of every nearer object. The rule was therefore unenforceable
+everywhere else, and cross-scene comparisons silently degraded to whole-frame.
+
+`-roiboxes` removes the hand work by not reimplementing visibility at all. It fires one pixel-centre
+camera ray per pixel — through the same `Scene::closestHit` and the same `RenderCam` the render will
+use, which is why the hook sits *after* `toRender` is final — and records the material each pixel
+actually sees. Occlusion needs no reasoning: it is whatever the intersector returned.
+
+The remaining trap is that a bounding box is not a region. A material used in several places has a
+bbox spanning all of them plus the gaps. So the per-pixel material image is flood-filled into
+connected components in a single pass over the frame (components keyed by material id, 4-connected),
+only the largest component per material is reported, and each box carries **purity** (pixels inside
+it that really show the material) and **share** (the material's pixels inside that component).
+Failing boxes are printed commented out with the reason, so the output cannot be copy-pasted into a
+bad measurement.
+
+**The y origin is derived, not asserted.** `Camera::genRay` maps `py = 0` to `sy = -1` (`-v`), so
+raster row 0 is the image *bottom*, while the `.rois` format and `tools/roi_score.py` measure y
+downward from the top. The first implementation emitted raster rows directly and produced boxes that
+were right in x, landed on real objects, and were vertically mirrored — a failure with no visible
+symptom in the numbers. `roiBoxesReport` now traces the first and last row and compares them against
+the camera's own up vector to decide which end is the top, so the answer survives any future change
+to `genRay`'s film mapping.
 
 ## Scene-authoring tools (`tools/`)
 

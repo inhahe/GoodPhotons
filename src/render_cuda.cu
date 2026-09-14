@@ -878,6 +878,8 @@ struct DEmitTri { DVec3 v0, e1, e2, nrm; double cumArea; DVec3 uv0, uvE1, uvE2; 
 // wavelength CDF slice inside the flattened lightCdfAll buffer.
 struct DEmitter {
     DVec3  origin, u, v, normal, beamDir;
+    DVec3  nGeom;              // quad: normalize(cross(u,v)); see Emitter::nGeom
+    int    normalTilted;       // 1 when the authored normal left the patch's plane
     double area, power;
     int    collimated;
     int    shape;              // 0 quad, 1 sphere, 2 spot, 3 env, 4 cylinder, 5 mesh, 6 sun
@@ -1226,6 +1228,22 @@ struct DScene {
     int              bkGlossyNee;    // 0 = -no-glossy-nee: no connection at a D_GLOSSY vertex
     int              gatherArea;     // -gatherarea <M>: probe samples for the M-GATHERAREA
                                      // footprint (0 = off, the default)
+    int              gatherRejPct;   // FTRACE_GAREJECT <pct>: the tangle gate. Suppress the
+                                     // footprint correction for a gather whose probes REJECT at
+                                     // least this share of their hits on the normal test, which
+                                     // is the dense-fur signature -- there the correction has the
+                                     // wrong SIGN. 0 = off.
+    // 1 = FTRACE_GAFIBER: skip the coverage correction where the gather point is on a FIBER.
+    // Same environment channel as the host's gaFiberSkipOn(), so the backends cannot disagree.
+    int              gaFiberSkip;
+    // 1 = FTRACE_GABIAS: the bias-corrected coverage `(area+1)/(M+1)`. Host twin gaBiasOn().
+    int              gaBias;
+    // FTRACE_GAGATE <n>: hold the flat-interior early-out at n probes, not M/4. Host twin
+    // gaGateProbes(). 0 = the M/4 behaviour, the default.
+    int              gaGate;
+    // 1 = FTRACE_GABALL: accept a probe only inside the BALL the query uses, not the probe's
+    // cylinder. Host twin gaBallOn().
+    int              gaBall;
     double           bkLightSplit;   // -light-split
     int              bkLightSamples; // -light-samples
     const double*    lightCdfAll;   // flattened per-emitter wavelength CDFs
@@ -1524,6 +1542,16 @@ struct DCamera {
 };
 
 // ============================ device helpers ============================
+
+// Device twin of rng.h's mix64 (splitmix64 finaliser). Exists because the FORWARD photon
+// pass needs a seed that avalanches: see kTrace, where seeding per-thread from a raw index
+// leaves neighbouring threads on adjacent PCG32 streams.
+__device__ __forceinline__ unsigned long long dMix64(unsigned long long x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
 
 struct DRng {
     unsigned long long state, inc;
@@ -4842,6 +4870,10 @@ struct DBeamDep {
     // the bundle above, which it supersedes exactly.
     float cieA[3];
     int   achro;
+    // Medium scattering order of this chord, 1 = single scatter; `kBeamOrderUnknown` when the
+    // depositing path does not track it. Host twin: PhotonBeam::order. Absent before 0.278.1,
+    // which left every device-deposited chord reading 0 on the host -- see BEAMORDER-GPU.
+    int   order;
 };
 
 // The photon's LIVE spectral bundle, carried down the path by the forward tracer and handed
@@ -5000,11 +5032,15 @@ struct DGatherPhoton {
 //     correction stops happening. Measured: cap_gyroid -16.9 % stratified against -4.3 %
 //     independent. Do not "improve" this without re-reading the host comment.
 __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const DVec3& n,
-                                         Real r, DRng& rng, int M) {
+                                         Real r, DRng& rng, int M, Real fiberR = (Real)0) {
     if (M <= 0 || !(r > (Real)0)) return 1.0;
     DVec3 t, b; onb(n, t, b);
     double area = 0.0;                       // in units of the full disc; 1.0 == fully covered
-    const int probe0 = (M >= 4) ? ((M / 4 < 2) ? 2 : M / 4) : M;
+    int    nRej = 0;                         // probes that FOUND geometry facing the wrong way
+    // `-gagate n` holds this at n regardless of M, host twin in photonmap_render.h. Clamped to
+    // M-1 so the check index stays inside the loop.
+    int probe0 = (M >= 4) ? ((M / 4 < 2) ? 2 : M / 4) : M;
+    if (sc.gaGate) probe0 = (sc.gaGate < M) ? sc.gaGate : (M > 1 ? M - 1 : M);
     for (int i = 0; i < M; ++i) {
         if (i == probe0 && area >= (double)probe0 * 0.995) return 1.0;
         const double rr = (double)r * sqrt((double)rng.uniform());
@@ -5015,11 +5051,36 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
         const DHit h = closestHit(sc, q + n * r, n * (Real)(-1), RAY_EPS, (Real)2 * r, false);
         if (!h.valid) continue;
         const double c = (double)dot(h.n, n);
-        if (c >= 0.5) area += 1.0 / c;       // same 60-degree acceptance the photon query uses
+        // Only `area` is gated on the ball (see DScene::gaBall), so nRej and therefore the
+        // tangle gate below are held fixed by construction and the arms differ in one quantity.
+        const double dz = (double)r - (double)h.t;   // hit height above the tangent plane
+        const bool inBall = !sc.gaBall || (rr * rr + dz * dz <= (double)r * (double)r);
+        if (c >= 0.5) { if (inBall) area += 1.0 / c; }  // same 60-deg acceptance as the query
+        else          ++nRej;                // geometry IS here, facing the wrong way: a tangle
     }
+    // THE TANGLE GATE, host twin in photonmap_render.h. A high reject share means the disc is
+    // full of geometry pointing every which way rather than hanging over empty space, and there
+    // the correction is not merely weaker -- it points the wrong way, reading dense fur +48 %
+    // bright. Doing nothing is the measured-correct action. Must stay identical to the host
+    // predicate or the two backends diverge on fur.
+    if (sc.gatherRejPct > 0 && nRej * 100 >= sc.gatherRejPct * M) return 1.0;
+    // THE FIBER GATE, host twin in photonmap_render.h. A gather point on a strand has no surface
+    // footprint for a tangent-plane disc to be clipped against, so the ratio measured above is not
+    // the quantity the density estimate divides by. Decided HERE, after the probes have consumed
+    // their rng draws, exactly as the host does -- returning early would desynchronise the two
+    // backends' streams and make a cross-backend comparison meaningless.
+    if (fiberR > (Real)0 && sc.gaFiberSkip) return 1.0;
+    // The pseudo-count, host twin in photonmap_render.h's gaBiasOn(). Applied here and not at the
+    // early returns above, which all mean "do not correct" and must stay exactly 1.0 -- which
+    // this form also gives at `area == M`, so they agree by construction, not by a special case.
+    if (sc.gaBias) return (area + 1.0) / (double)(M + 1);
     return area / (double)M;
 }
-__device__ static inline double dGatherAreaScale(double cov) {
+__device__ static inline double dGatherAreaScale(int gaBias, double cov) {
+    // With the pseudo-count on, `cov` is bounded below by 1/(M+1) and the cliff would only
+    // misfire at large M -- at M = 32 a zero-coverage gather lands at 0.030, under the threshold,
+    // and would lose its correction entirely.
+    if (gaBias) return (cov > 0.0) ? 1.0 / cov : 1.0;
     return (cov >= 0.05) ? 1.0 / cov : 1.0;  // one stray probe must not become a firefly
 }
 
@@ -5892,7 +5953,8 @@ __device__ static void depositPhoton(const DCamSet& cs, const DVec3& p,
 __device__ static void dEmitBeams(const DScene& sc, const DCamSet& cs, const DVec3& o,
                                   const DVec3& dir, Real dLen, Real lambda, Real beta,
                                   Real aGlass, DRng& rng, int offFilt = DMedStraight,
-                                  const DBeamSpec* spec = nullptr) {
+                                  const DBeamSpec* spec = nullptr,
+                                  int order = (int)kBeamOrderUnknown) {
     if (!cs.beamCount || !(beta > 0)) return;
     // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
     // 1e30-long box (host twin: Renderer::kBeamFarScale == 8). Applied PER MEDIUM and only to
@@ -5941,6 +6003,7 @@ __device__ static void dEmitBeams(const DScene& sc, const DCamSet& cs, const DVe
             bd.lambda = (float)lambda;
             bd.absorb = (float)aGlass;
             bd.med    = i;
+            bd.order  = order;          // see DBeamDep::order / BEAMORDER-GPU
             // ACHROMATIC-PATH FOLD, decided per DEPOSITED BEAM rather than per photon,
             // because the two conditions live in different places: the PATH being
             // wavelength-independent is a property of the photon (spec->achro), while the
@@ -8408,8 +8471,13 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         }
         // Mode M: store the crossing itself, so every camera of a flyby can gather from it
         // later without the photon knowing any camera exists.
+        // `beamScat` counts medium scatters already made, so the chord deposited now is order
+        // *beamScat + 1 -- the same convention the host passes as `beamScatters + 1`. A null
+        // counter means this path does not track order, and the SENTINEL says so explicitly
+        // rather than letting a 0 masquerade as a measurement (BEAMORDER-GPU).
         if (doBeamDeposit) dEmitBeams(sc, cs, ro, rd, dChord, lambda, betaPre, aC, *crng,
-                                      beamMS ? DMedAll : DMedStraight, spec);
+                                      beamMS ? DMedAll : DMedStraight, spec,
+                                      beamScat ? *beamScat + 1 : (int)kBeamOrderUnknown);
         if (!beamMS) {
             // SINGLE SCATTER ONLY. Attenuate the photon by the medium extinction over the
             // whole crossing (single-scatter transmission) so surfaces behind the fog are
@@ -8981,7 +9049,7 @@ __device__ static void traceHeroPhoton(const DScene& sc, const DCamSet& cs, int 
 
 __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
                        long long N, int diffraction, unsigned long long seedBase, int maxBounce,
-                       int camMode, int heroC) {
+                       int camMode, int heroC, int perPhotonSeed) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     DRng rng; rng.seed((unsigned long long)(g * 2 + 1), seedBase ^ (unsigned long long)g);
@@ -8989,6 +9057,23 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
     double eEmitted = 0, eAbsorbed = 0, eSensor = 0, eEscaped = 0, eResidual = 0;
 
     for (long long i = g; i < N; i += G) {
+        // PER-PHOTON HASHED SEEDING (GPU-VARIANCE). The default path above seeds ONCE PER
+        // THREAD from a raw index: inc = 4g+3, state seeded from `seedBase ^ g`. Neighbouring
+        // threads therefore sit on ADJACENT PCG32 streams -- and a PCG "stream" is only a
+        // different additive constant in the same LCG, so adjacency is the canonical weak case.
+        // That is harmless wherever one stream feeds one INDEPENDENT estimator (kBackward seeds
+        // identically and mode R measures at exact parity, because correlation BETWEEN pixels
+        // cannot change any single pixel's variance). It is not harmless here: every photon
+        // feeds a SHARED map, and a gather pools ~500 of them drawn from many different threads,
+        // so stream correlation lands directly in the pooled estimate and the average stops
+        // converging like sqrt(N).
+        //
+        // This path instead seeds per PHOTON from the absolute photon index, both words pushed
+        // through dMix64 -- exactly what the host's seedUnit() does, and for the reason its
+        // comment gives. It also makes the deposit independent of the launch geometry.
+        if (perPhotonSeed)
+            rng.seed(dMix64((unsigned long long)i ^ seedBase),
+                     dMix64((unsigned long long)i + seedBase));
         if (heroC > 1) {
             // Hero-wavelength path: one BVH walk carries C stratified wavelengths, halving
             // chromatic noise. De-heros to the single-λ shadeStep at a dispersive interface.
@@ -9843,6 +9928,18 @@ __device__ static void dGenRay(const DCamera& cam, int px, int py, Real jx, Real
 // a few hundred lines down.)
 
 // ---- GLOSSY-NEE on the device ---------------------------------------------------------------
+// ADJOINT BSDF for a PARTICLE (light-subpath) vertex: f*(wo,wi) = f(wi,wo). Device twin of
+// bsdf_eval.h's bsdfFAdjoint, where the full reasoning lives. Call this, not dBsdfF, wherever a
+// light-subpath vertex is CONNECTED to something -- exactly the sites already carrying
+// dShadingAdjointCorr, which is the shading-normal half of the same Veach rule. dBsdfF
+// pre-divides by cos(wi), which is self-consistent on a continuation but not at a connection,
+// where the Glossy lobe factor is symmetric under the swap and the denominator is not.
+// Reciprocal BSDFs are unchanged by it, so switching a site over cannot perturb a diffuse scene.
+__device__ static inline double dBsdfFAdjoint(const DScene& sc, const DVertex& vt,
+                                              const DVec3& wo, const DVec3& wi, Real lambda) {
+    return dBsdfF(sc, vt, wi, wo, lambda);
+}
+
 // `dBsdfF` / `dBsdfPdf` above take a DVertex, which the BDPT path has and the backward shade
 // loop has not; these are the same two expressions on a DHit. Glossy only, because Glossy is the
 // only lobe the hook is ever handed -- a diffuse vertex already goes through `rho/PI`, which is
@@ -10101,12 +10198,20 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     if (cosLight <= 0) return false;
     if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
            : occludedTo(sc, dOffsetAlong(h.p, h.ng, g.wi), h.p + g.wi * g.dist, 2 * RAY_EPS)) return false;
-    g.G = g.cosSurf * cosLight / g.dist2;
+    // Side test above: authored normal. Measure below: the patch's own orientation, since the
+    // solid angle a patch subtends depends on how it is oriented and not on where its emission is
+    // aimed. Host twin backward.h's emitterGeom, where the reasoning lives. Bit-identical unless
+    // the light is actually tilted.
+    const double cosGeo = em.normalTilted
+                              ? fabs((double)ddot(em.nGeom, g.wi * (Real)(-1)))
+                              : (double)cosLight;
+    if (!(cosGeo > 0.0)) return false;
+    g.G = (Real)((double)g.cosSurf * cosGeo / (double)g.dist2);
     if (epat != 1.0) g.G = (Real)((double)g.G * epat);   // no-op without a pattern
     g.fall = (Real)1; g.spot = false; g.sun = false;
     // Uniform over em.area, so pdf_W = pdf_A * dist^2 / cos(light). `epat` is a radiance
     // profile folded into G, not a change of density, so it does not appear here.
-    g.pdfW = (em.area > 0) ? (Real)((double)g.dist2 / ((double)em.area * (double)cosLight))
+    g.pdfW = (em.area > 0) ? (Real)((double)g.dist2 / ((double)em.area * cosGeo))
                            : (Real)0;
     return true;
 }
@@ -10741,18 +10846,6 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
         }
         case D_GLOSSY: {
             Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
-            // Mode W: the lobe off a deterministic lattice rather than the rng, so the
-            // direction is the same for every pixel (noise-free) but varies with the sample
-            // index (so -spp actually resolves the lobe). At -spp 1 this IS the mirror
-            // direction, which is exact for a near-mirror and over-sharpens as roughness
-            // grows; the fix for that is more spp, which now works.
-            if (whitted) {
-                if (!dWhittedAttenuate(thr, (double)r)) return false;
-                DVec3 o = dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h),
-                                            gi.sIdx, gi.bounce);
-                if (dot(o, h.n) <= 0) return false;
-                rd = o; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; return true;
-            }
             // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX (GLOSSY-NEE; host twin backward.h
             // ~1489). Without it the only route to this material's light is a lobe sample
             // landing on the emitter -- ~1/115 against a 0.53-degree sun for a roughness-0.05
@@ -10764,6 +10857,24 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                                       nullptr, &nb);
                 // ...and the SKY, which is a light like any other (host twin: backward.h).
                 L += thr * bkNeeEnv(sc, h, (Real)1, invPdfLambda, lambda, rng, nullptr, &nb);
+            }
+            // WHITTED (mode W): the SAME connection with quadrature instead of the rng, and both
+            // halves of the weight -- the connection's above, and gm->pdf below for the lattice
+            // direction. Host twin backward.h, where the full reasoning lives. This branch used
+            // to return BEFORE the connection, so at -spp 1 (where the lattice IS the mirror
+            // direction) a glossy surface whose mirror ray missed the light rendered PURE BLACK,
+            // in mode W's headline configuration.
+            if (whitted) {
+                if (!dWhittedAttenuate(thr, (double)r)) return false;
+                DVec3 o = dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h),
+                                            gi.sIdx, gi.bounce);
+                if (dot(o, h.n) <= 0) return false;
+                if (gm) {
+                    gm->pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
+                    gm->from = h.p;
+                    gm->n = h.n;
+                }
+                rd = o; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; return true;
             }
             if (rng.uniform() >= r) return false;
             DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
@@ -11347,7 +11458,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 // FINITE value, so it is the one that can be connected to a light; a mirror and
                 // a gel are delta and stay exactly as they were. Before the Russian roulette,
                 // whose coin governs the continuation only.
-                if (sc.bkGlossyNee && !whitted && mp->type == D_GLOSSY) {
+                if (sc.bkGlossyNee && mp->type == D_GLOSSY) {
                     const DNeeBsdf gnb{mp, rd * (Real)(-1)};
                     bkNeeLightHero(sc, h, c, L, thr, lam, invPdf, nUp, rng, gi.depth, &gnb);
                     bkNeeEnvHero(sc, h, c, L, thr, lam, invPdf, nUp, rng, &gnb);   // the sky too
@@ -11375,6 +11486,9 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     DVec3 o = dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h),
                                                 gi.sIdx, b);
                     if (dot(o, h.n) <= 0) return;
+                    if (sc.bkGlossyNee)   // the other half of the weight -- see the scalar twin
+                        { gmis.pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
+                          gmis.from = h.p; gmis.n = h.n; }
                     rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
                 } else {
                     DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
@@ -12900,7 +13014,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
             double stG = twoSided ? 1.0 : (double)dShadowTerminatorG(wcam, qs.ns, ngoQ);
             if (stG <= 0.0) return 0.0;
-            f = dBsdfF(sc, qs, wo, wcam, lambda);
+            f = dBsdfFAdjoint(sc, qs, wo, wcam, lambda);   // ADJOINT: qs is a particle vertex
             // Adjoint correction on the LIGHT-subpath vertex qs (particle side, outgoing
             // toward camera). 1 when ns==ng. wo = toward previous (light-side) vertex.
             // |cos| inside dShadingAdjointCorr makes it lobe-agnostic (serves the transmit lobe).
@@ -12908,7 +13022,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             const double adj = (double)dShadingAdjointCorr(wo, wcam, qs.ns, ngoQ) * stG;
             f *= adj;
             for (int i = 0; i + 1 < nUp; ++i)
-                fSec[i] = dBsdfF(sc, qs, wo, wcam, hb.lam[i + 1]) * adj;
+                fSec[i] = dBsdfFAdjoint(sc, qs, wo, wcam, hb.lam[i + 1]) * adj;
                         o = dOffsetAlong(qs.p, qs.ng, wcam);
         }
         {   // max over live wavelengths (identical to `f <= 0` when nUp == 1)
@@ -13129,7 +13243,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             for (int i = 0; i + 1 < nUp; ++i)
                 fLSec[i] = dMediumScatterF(sc, qs, woL, w * (Real)-1, hb.lam[i + 1]);
         } else {
-            fL = dBsdfF(sc, qs, woL, w * (Real)-1, lambda) * stGL;
+            fL = dBsdfFAdjoint(sc, qs, woL, w * (Real)-1, lambda) * stGL;   // ADJOINT (qs)
             // Adjoint correction on the LIGHT-subpath endpoint qs only (particle side,
             // outgoing = -w toward the eye vertex). fE is the Radiance side — no correction.
             // |cos| inside dShadingAdjointCorr makes it lobe-agnostic (serves the transmit lobe).
@@ -13137,7 +13251,8 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             const double adjL = (double)dShadingAdjointCorr(woL, w * (Real)-1, qs.ns, ngoQ);
             fL *= adjL;
             for (int i = 0; i + 1 < nUp; ++i)
-                fLSec[i] = dBsdfF(sc, qs, woL, w * (Real)-1, hb.lam[i + 1]) * stGL * adjL;
+                fLSec[i] = dBsdfFAdjoint(sc, qs, woL, w * (Real)-1, hb.lam[i + 1])
+                           * stGL * adjL;
         }
         {   // max over live wavelengths on each side (identical to the scalar tests at nUp==1)
             double mxE = fE, mxL = fL;
@@ -13748,7 +13863,8 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 // on that map's rq. One shared coverage would be cheaper and wrong.
                 double cs = 1.0;
                 if (sc.gatherArea)
-                    cs = dGatherAreaScale(dGatherCoverage(sc, h.p, h.n, rq, rng, sc.gatherArea));
+                    cs = dGatherAreaScale(sc.gaBias, dGatherCoverage(sc, h.p, h.n, rq, rng, sc.gatherArea,
+                                                          h.fiberRadius));
                 gx += cx * (float)(aw * cs);
                 gy += cy * (float)(aw * cs);
                 gz += cz * (float)(aw * cs);
@@ -13758,8 +13874,9 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             // per-gather normalisation to scale -- the correction multiplies the accumulated
             // sum instead. Same estimator, different place to put the multiply.
             if (sc.gatherArea) {
-                const double ms = dGatherAreaScale(
-                    dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea));
+                const double ms = dGatherAreaScale(sc.gaBias,
+                    dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea,
+                                    h.fiberRadius));
                 gx = (float)((double)gx * ms);
                 gy = (float)((double)gy * ms);
                 gz = (float)((double)gz * ms);
@@ -14026,7 +14143,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 // on that map's rq. One shared coverage would be cheaper and wrong.
                 double cs = 1.0;
                 if (sc.gatherArea)
-                    cs = dGatherAreaScale(dGatherCoverage(sc, h.p, h.n, rq, rng, sc.gatherArea));
+                    cs = dGatherAreaScale(sc.gaBias, dGatherCoverage(sc, h.p, h.n, rq, rng, sc.gatherArea,
+                                                          h.fiberRadius));
                 gx += cx * (float)(aw * cs);
                 gy += cy * (float)(aw * cs);
                 gz += cz * (float)(aw * cs);
@@ -14036,8 +14154,9 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             // per-gather normalisation to scale -- the correction multiplies the accumulated
             // sum instead. Same estimator, different place to put the multiply.
             if (sc.gatherArea) {
-                const double ms = dGatherAreaScale(
-                    dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea));
+                const double ms = dGatherAreaScale(sc.gaBias,
+                    dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea,
+                                    h.fiberRadius));
                 gx = (float)((double)gx * ms);
                 gy = (float)((double)gy * ms);
                 gz = (float)((double)gz * ms);
@@ -14386,7 +14505,7 @@ __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, i
                                  + (unsigned long long)passIdx * 0xD1B54A32D192ED03ULL
                                  + 0x5851F42D4C957F2DULL;
             DRng grng; grng.seed(s * 2 + 23, seedBase ^ s);
-            const double cs = dGatherAreaScale(
+            const double cs = dGatherAreaScale(sc.gaBias,
                 dGatherCoverage(sc, h.p, h.n, (Real)R, grng, sc.gatherArea));
             gx = (float)((double)gx * cs);
             gy = (float)((double)gy * cs);
@@ -14900,10 +15019,11 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                                     // The adjoint correction and shadow-terminator G are purely
                                     // geometric, so they scale every λ the same way.
                                     double geo = (double)dShadingAdjointCorr(wo, wcam, h.n, ngo) * stG;
-                                    double f = dBsdfF(sc, vt, wo, wcam, lambda) * geo;
+                                    double f = dBsdfFAdjoint(sc, vt, wo, wcam, lambda) * geo;
                                     double fSec[SECN], mxf = f;
                                     for (int k = 0; k + 1 < nUp; ++k) {
-                                        fSec[k] = dBsdfF(sc, vt, wo, wcam, lamAll[k + 1]) * geo;
+                                        fSec[k] = dBsdfFAdjoint(sc, vt, wo, wcam,
+                                                                lamAll[k + 1]) * geo;
                                         if (fSec[k] > mxf) mxf = fSec[k];
                                     }
                                     if (mxf > 0.0) {
@@ -15315,7 +15435,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     DVertex lvt = dVertFromLV(lv);
                     double adjLit = (double)dShadingAdjointCorr(lv.wo, w * (Real)-1, lv.ns, ngoLit) * stGLit;
                     double fCam = dBsdfF(sc, vt, wo, w, lambda) * stGCam;
-                    double fLit = dBsdfF(sc, lvt, lv.wo, w * (Real)-1, lambda);
+                    double fLit = dBsdfFAdjoint(sc, lvt, lv.wo, w * (Real)-1, lambda);
                     fLit *= adjLit;
                     // The camera path and the stored light path share this pass's bundle (same
                     // path index i), so a connection is EXACT per-λ over the wavelengths still
@@ -15326,7 +15446,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     const DVcmSec* lsRow = ((NS > 0) && lvSec) ? (lvSec + (size_t)j * secStride) : nullptr;
                     for (int k = 0; k + 1 < nUpConn; ++k) {
                         double fc = dBsdfF(sc, vt, wo, w, lamAll[k + 1]) * stGCam;
-                        double fl = dBsdfF(sc, lvt, lv.wo, w * (Real)-1, lamAll[k + 1]) * adjLit;
+                        double fl = dBsdfFAdjoint(sc, lvt, lv.wo, w * (Real)-1,
+                                                  lamAll[k + 1]) * adjLit;
                         fProdSec[k] = fc * fl;
                         if (fProdSec[k] > mxProd) mxProd = fProdSec[k];
                     }
@@ -16690,6 +16811,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         de.u       = {e.u.x, e.u.y, e.u.z};
         de.v       = {e.v.x, e.v.y, e.v.z};
         de.normal  = {e.normal.x, e.normal.y, e.normal.z};
+        de.nGeom   = {e.nGeom.x, e.nGeom.y, e.nGeom.z};
+        de.normalTilted = e.normalTilted ? 1 : 0;
         de.beamDir = {e.beamDir.x, e.beamDir.y, e.beamDir.z};
         de.area = e.area; de.power = e.power;
         de.collimated = e.collimated ? 1 : 0;
@@ -16921,6 +17044,18 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         // uses -- the two MUST agree or -device gpu and -device cpu diverge on truncated geometry.
         const char* e = std::getenv("FTRACE_GATHERAREA");
         sc.gatherArea = e ? std::atoi(e) : 8;
+        // The tangle gate rides the same channel for the same reason: read it anywhere else and
+        // the two backends can disagree about whether it is on.
+        const char* g = std::getenv("FTRACE_GAREJECT");
+        sc.gatherRejPct = g ? std::atoi(g) : 30;   // default must match the host's gaRejectPct()
+        const char* gf = std::getenv("FTRACE_GAFIBER");
+        sc.gaFiberSkip = (gf && *gf == '0') ? 0 : 1;   // default must match host gaFiberSkipOn()
+        const char* gb = std::getenv("FTRACE_GABIAS");
+        sc.gaBias = (gb && *gb == '0') ? 0 : 1;        // default must match host gaBiasOn()
+        const char* gg = std::getenv("FTRACE_GAGATE");
+        sc.gaGate = gg ? std::atoi(gg) : -1;            // default must match gaGateProbes()
+        const char* gbl = std::getenv("FTRACE_GABALL");
+        sc.gaBall = (gbl && *gbl == '0') ? 0 : 1;      // default must match gaBallOn()
     }
     sc.bkLightSplit    = lt::gSplit;
     sc.bkLightSamples  = lt::gSamples;
@@ -17336,8 +17471,12 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
     } else {
         int blockSize = 128;
         int numBlocks = 2048;          // ~262k threads, grid-stride over N photons
+        static const int perPhotonSeed = [] {
+            const char* e = std::getenv("FTRACE_GPU_PHOTONSEED");
+            return (e && *e) ? std::atoi(e) : 0;
+        }();
         kTrace<<<numBlocks, blockSize>>>(up.sc, cs, d_energy, N, diffraction ? 1 : 0,
-                                         kseed, 32, camModeInt, effHeroC);
+                                         kseed, 32, camModeInt, effHeroC, perPhotonSeed);
     }
     cudaCheckKernel("forward");
 }
@@ -19866,6 +20005,10 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 // Achromatic-path fold (`-beamachro`): the emitter's mean CIE, used by
                 // BeamMap::build in place of CIE(lambda). Mutually exclusive with the bundle.
                 b.achro = d.achro ? 1 : 0;
+                // Scattering order (BEAMORDER-GPU). Clamped exactly as BeamBank::push does, so
+                // a device-traced map and a host-traced one report the same histogram.
+                b.order = (d.order < 0 || d.order >= (int)kBeamOrderUnknown)
+                              ? kBeamOrderUnknown : (unsigned char)d.order;
                 // `cieA` is the fallback colour for the GATHER-time fold as well as the payload
                 // of the achromatic-path one, so it must survive a beam whose `achro` is about
                 // to become 2 below -- otherwise BeamMap::build would give it a black cieMean.
