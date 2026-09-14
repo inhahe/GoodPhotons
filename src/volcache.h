@@ -53,7 +53,11 @@ struct VolCache {
     // than a cell. A chord contributes `power * segment length` to each cell it crosses, which
     // is the discrete form of the path-length integral the fluence is defined by.
     // `gOK` must be true: the caller checks every medium this map touches has g == 0.
-    void build(const BeamMap& bm, int res, int minOrder, bool gOK) {
+    // `sigmaT` is the medium's extinction; the splat must attenuate along the chord exactly
+    // as the gather does (`mediaTransmittance(b.o, b.d, sBeam)`), or every cached cell is
+    // too bright by the transmittance it skipped. Homogeneous only -- a heterogeneous
+    // medium needs the marched transmittance and the caller gates on that too.
+    void build(const BeamMap& bm, int res, int minOrder, bool gOK, double sigmaT) {
         ready = false;
         if (!gOK) return;                      // anisotropic: a scalar cache cannot serve it
         if (bm.empty() || bm.nEmitted <= 0 || res < 2) return;
@@ -87,7 +91,9 @@ struct VolCache {
                 const int iy = (int)((p.y - lo.y) / ext.y * ny);
                 const int iz = (int)((p.z - lo.z) / ext.z * nz);
                 if (ix < 0 || iy < 0 || iz < 0 || ix >= nx || iy >= ny || iz >= nz) continue;
-                const double wgt = (double)b.power * ds * invN / cellVol;
+                const double sAlong = (double)b.s0 + ds * (k + 0.5);
+                const double atten  = (sigmaT > 0.0) ? std::exp(-sigmaT * sAlong) : 1.0;
+                const double wgt = (double)b.power * atten * ds * invN / cellVol;
                 const size_t o = (size_t)idx(ix, iy, iz) * 3;
                 xyz[o + 0] += (float)(cie.x * wgt);
                 xyz[o + 1] += (float)(cie.y * wgt);

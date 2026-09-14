@@ -1445,6 +1445,45 @@ today.
 2.4 sigma and should be read as "large and negative", not as -3.6. What is solid is the SIGN, shared
 by all four materials, and `red`'s magnitude.
 
+### VOLCACHE — **PROTOTYPE BUILT AND MEASURED (v0.299.0)**: the mechanism works, the realised gain does not reach the ceiling, and the reason is actionable
+
+`FTRACE_VOLCACHE=<res>` builds an `res^3` fluence grid from the `order >= 2` chords and marches it
+in their place. `src/volcache.h` + the gather hook in `beamgather.h`. **Scope, enforced rather than
+assumed:** isotropic (`g == 0`) and homogeneous media only — `build()` refuses anything else, because
+a scalar fluence cache assumes an isotropic phase function (see the correction recorded below).
+
+**Correctness — it is energy-correct.** On `_beams_ms` (`sigma_t 6`), cached against uncached:
+
+| grid | frame-mean ratio | median error on touched pixels | p90 |
+|---|---:|---:|---:|
+| 8 | 1.0153 | 5.9 % | 39.5 % |
+| **48** | **1.0021** | **2.0 %** | 6.6 % |
+| 96 | 1.0019 | 2.5 % | 8.8 % |
+
+The frame mean converges to **0.2 %**, which validates the fluence formulation, the chord attenuation
+and the units. **But score it per-ROI, not per-frame:** the cache touches only the **19.4 %** of pixels
+whose camera ray crosses the medium, and on those the error is **~2 %**, not 0.2 %. The whole-frame
+number is diluted by the 80 % it never touches. The error also stops improving past res 48 — finer
+cells have less bias but fewer samples each, which is the binned-estimator tradeoff and implies an
+optimum resolution rather than "finer is better".
+
+**Speed — ~7 %, far below the 51-58 % ceiling.** Seven paired reps, warm-up discarded, the four
+settled ones reading **+1.20, -0.54, +2.67, +3.10 s** on ~27 s: median **+1.94 s, ~7 %**, three of
+four favouring the cache. (The first reps read +48.4 and +5.95 s and are discarded — the machine was
+still settling, and the collapsing margin is machine state, not signal.)
+
+**Why it falls short, and this is the actionable part.** The prototype skips order >= 2 beams *at
+query time* but they are still **deposited, stored, and built into the BVH**. It therefore buys only
+the traversal-and-shading share, minus the march it adds. **To approach the ceiling the deposit must
+split**: order >= 2 chords should go into the cache *instead of* the beam map, so the map shrinks by
+~83 %, its BVH build shrinks with it, and traversal has less to walk. The machinery for a
+deposit-side order filter already exists (`-beams-minorder`, v0.298.0); what is missing is its
+complement — route order >= 2 to the cache rather than dropping it.
+
+**Verdict.** The mechanism is sound and measured; the current form is a ~7 % gain with a ~2 % local
+error at `sigma_t 6`, on isotropic homogeneous media. Whether it is worth finishing depends on the
+deposit split, which is the next real piece of work and is well-defined.
+
 ### VOLCACHE — BOTTOM LINE FIRST (2026-09-13). A thick-media feature with a measured ceiling, one unmeasured term, and a design that is fully specified.
 
 *The four sections below are the derivations, accumulated over several sittings and partly

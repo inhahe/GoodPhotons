@@ -26,6 +26,7 @@
 // was; `gatherPhotonBeams` below is that instantiation, kept under its old name and
 // signature so every existing call site is untouched.
 #pragma once
+#include <mutex>
 #include <cstdlib>
 #include <vector>
 #include <cmath>
@@ -195,6 +196,29 @@ struct TrRay {
 // the camera ray). For a heterogeneous medium those are ratio-tracking walks, and they are
 // the dominant cost of this estimator; see known-issues.md.
 // Read once; a gather runs millions of times and getenv is not free in a loop.
+// VOLCACHE PROTOTYPE, gather side. One cache per BeamMap, built on first use. The prototype
+// is exact only where a scalar fluence cache can be: an ISOTROPIC (g == 0) and HOMOGENEOUS
+// medium. `volCacheUsable` checks both and the cache stays off otherwise, so a scene it cannot
+// serve renders normally rather than wrongly.
+inline VolCache& volCacheFor(const Scene& sc, const BeamMap& bm) {
+    static VolCache cache;
+    static const BeamMap* built = nullptr;
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lk(mtx);
+    if (built != &bm) {
+        built = &bm;
+        bool ok = !sc.media.empty();
+        double sigmaT = 0.0;
+        for (const auto& m : sc.media) {
+            if (!m.enabled) continue;
+            if (m.g != 0.0 || m.heterogeneous()) { ok = false; break; }
+            sigmaT = m.sigma_a(550.0) + m.sigma_s(550.0);   // extinction = a + s
+        }
+        cache.build(bm, volCacheRes(), 2, ok, sigmaT);
+    }
+    return cache;
+}
+
 inline int volCacheStubSteps() {
     static const int n = [] {
         const char* e = std::getenv("FTRACE_VOLCACHE_STUB");
@@ -210,6 +234,31 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
                                double aGlassCam, Pcg32& rng, const WeightFn& w1) {
     Vec3 acc{0, 0, 0};
     if (bm.empty() || bm.nEmitted <= 0) return acc;
+    // VOLCACHE: replace the order >= 2 beam queries with a march of the cached fluence.
+    // `phase` is the ISOTROPIC 1/(4 pi) -- see volcache.h for why a scalar cache admits no
+    // other, and why the build refuses anisotropic media rather than pretending.
+    const bool vcLive = volCacheRes() > 0 && volCacheFor(scene, bm).ready;
+    if (vcLive) {
+        const VolCache& vc = volCacheFor(scene, bm);
+        const PatTables vcTabs = scene.patTables();
+        const int steps = 64;
+        const double dt = tMax / (double)steps;
+        const double invFourPi = 1.0 / (4.0 * 3.14159265358979323846);
+        for (int i = 0; i < steps; ++i) {
+            const double t = dt * (i + 0.5);
+            const Vec3 p = oc + dc * t;
+            Vec3 fl;
+            if (!vc.lookup(p, fl)) continue;
+            for (size_t mi = 0; mi < scene.media.size(); ++mi) {
+                const auto& md = scene.media[mi];
+                if (!md.enabled) continue;
+                const double ss = md.sigma_s(550.0) * md.densityAt(p, &vcTabs);
+                if (!(ss > 0.0)) continue;
+                const double T = mats.mediaTransmittance(scene, oc, dc, t, 550.0, rng);
+                acc += fl * (ss * invFourPi * T * dt);
+            }
+        }
+    }
     // VOLCACHE COST STUB (FTRACE_VOLCACHE_STUB=<steps>, 0 = off). Marches the camera ray with
     // `steps` uniform samples, each doing one hashed 3D grid read, and throws the result away.
     // It renders nothing and answers one question: what would a cached-field march COST in place
@@ -239,6 +288,7 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
     const PatTables tabs = scene.patTables();
     bm.gather(oc, dc, tMax, [&](const BeamHit& bh) {
         const PhotonBeam& b = bm.beams[bh.idx];
+        if (vcLive && b.order >= 2 && b.order != kBeamOrderUnknown) return;  // in the cache
         beamDiag().bump(beamDiag().pass);
         if (beamDiag().on && b.order >= 2 && b.order != kBeamOrderUnknown)
             beamDiag().passMS.fetch_add(1, std::memory_order_relaxed);
