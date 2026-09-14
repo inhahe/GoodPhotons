@@ -2830,7 +2830,81 @@ phenomenon from the tail and is unexplained by any of the five eliminated candid
 **The rig is reusable:** `scraps/tail.py <prefix> <label>` scores any pair of two-seed PFM arms by
 percentile. Render with `-hdr`, matched `-spp`, seeds 1 and 2, named `png/<prefix>_<dev>_<seed>.png`.
 
-### GPU-VARIANCE — the device CONVERGES MORE SLOWLY in mode M; the gap is spp-dependent and peaks around 1.28x SD, not a constant 1.63x (2026-09-13)
+### GPU-VARIANCE — **ROOT CAUSE FOUND AND PROVEN (v0.300.2): the device does not run the LIGHT-SIDE REFRESH. It is a missing feature, not a noisier deposit.**
+
+**The whole entry below is superseded on causation, and is kept because the eliminations are sound and
+because how it went wrong is the more useful lesson.**
+
+Mode M on the **host** redraws the entire photon map under a fresh salt every ~10 % of the wall clock
+and **averages the realizations** (v0.247.0; `-beamfreeze` opts out). It says so in its own log:
+
+    mode M: light-side refresh - redrawing 2000000 photons under a fresh salt every ~10% of the
+            wall clock and averaging the realizations, so the MAP noise falls with the render too
+    mode M: averaged 2 independent light-side realizations (34 spp total)
+
+The **device prints neither line, because it does neither**: a plain fixed-`-spp` device render uses
+**one** light-side realization. Averaging `k` independent maps divides map-noise variance by `k`, so
+the host was simply running a better estimator.
+
+**Proven causally, not inferred.** `_cornell_diffuse`, `-mode M -spp 34 -n 2000000`, 4 seeds:
+
+| arm | median per-pixel SD | ratio vs GPU |
+|---|---:|---:|
+| GPU (1 realization) | 0.08009 | — |
+| CPU default (**2** realizations) | 0.06153 | **1.302** |
+| **CPU `-beamfreeze` (1 realization)** | **0.08046** | **0.995** |
+
+**Turn the host feature off and the gap vanishes — 0.5 %.** The arithmetic agrees independently: with
+camera noise `c` and per-realization map noise `m`, GPU sees `c^2 + m^2` and CPU `c^2 + m^2/2`, which
+predicts **1.302** against the measured 1.302.
+
+**Every observation this entry spent its length on falls out of that one fact:**
+
+* **spp 8 parity, the gap opening as spp rises, peaking, then narrowing.** The refresh fires on *wall
+  clock*, so a short render completes only one realization on both backends — parity — and longer
+  renders let the host accumulate more. The "spp-dependent convergence-rate defect" was the host
+  acquiring realizations, nothing to do with per-sample quality.
+* **Mode R at exact parity.** No photon map, so nothing to refresh.
+* **`-loadmap` parity 0.998.** A loaded map cannot be refreshed, so that test silently disabled the
+  one thing that differed. It was read as "the gather is fine, so the deposit is guilty"; what it
+  actually showed is that **both backends are identical once the refresh is removed** — the correct
+  answer, misread as localisation.
+* **Every map statistic matching** — count 0.05 %, power CV 0.06 %, occupancy, dispersion, normals,
+  and (measured here) the across-seed per-cell power-sum variance at **0.9967**. Per-realization map
+  quality *is* identical. The host just averages more of them.
+* **"The variance does not average down with samples."** On the device that is literally true, and it
+  is the defect stated plainly: with no refresh, map noise is frozen for the whole render.
+
+**Two more candidates eliminated on the way (16, 17), both pointing the wrong way.** The adaptive
+gather radius fluctuates *less* across seeds on the device (CV 0.28 % against the host's 0.34 %); and
+the stored **normals** match in distribution to ~3e-4, the only difference being `|n|` precision
+(device float, std 1.5e-8, against the host's exact 1.0) — at a 0.5 leak-rejection threshold that
+flips a decision for ~1e-8 of photons.
+
+**WHY FIFTEEN CANDIDATES WERE ELIMINATED AND THE ANSWER WAS STILL MISSED — the part worth keeping.**
+Every one of them asked *"what does the device's deposit do WORSE?"* The premise was wrong: the
+deposits are equivalent, and the host was running an **extra averaging pass** the device does not
+implement. A defect hunt cannot find a missing feature, because it is searching a space that does not
+contain the answer. Three specific habits kept it alive:
+
+1. **A control was read as a localisation.** `-loadmap` equalises the map *and* disables the refresh.
+   Attributing its parity to the map alone is a confound, and it produced the confident and wrong
+   headline "the entire variance deficit is in the map each backend deposits."
+2. **Statistics of one map were used to reason about differences between maps.** Occupancy and
+   dispersion are within-realization; the defect was across-realization. Both were measured, found to
+   disagree, and recorded as a paradox rather than as a sign that the wrong quantity was being
+   measured.
+3. **Nobody read the two logs side by side.** The host announces the refresh in plain language on
+   every run. The finding cost one `diff` of output that was on screen the entire time, after fifteen
+   experiments looking for something subtler.
+
+**Status: the gap is explained and is not a bug in the device.** What remains is a genuine **feature
+gap** — the device should run the light-side refresh for plain fixed-`-spp` renders too. It already
+has the machinery: the budgeted device mode-M path added in v0.295.0 loops over `lightEpoch` under a
+`RngSaltScope`, and is gated to `-time`/`-forever`/`-noise`. Opening that gate to plain renders is the
+fix, and it is tracked as **GPU-REFRESH** below.
+
+### GPU-VARIANCE (ORIGINAL ENTRY, superseded above) — the device CONVERGES MORE SLOWLY in mode M; the gap is spp-dependent and peaks around 1.28x SD, not a constant 1.63x (2026-09-13)
 
 **HEADLINE CORRECTED.** This entry opened claiming a flat "1.63x the variance". That figure was
 measured at one spp and does not hold across the sweep:
@@ -3166,6 +3240,25 @@ where it was measured and where the M-TIME-CPU throughput claims were made.
 **The rig:** four seeds, `np.std(..., ddof=1)` over scene-linear PFMs, median over signal-bearing
 pixels. Cheap, works on any scene, and the four-seed form is what makes it trustworthy — all six
 pairs agreed to ~2 %, which is what ruled out a seed-correlation artifact.
+
+### GPU-REFRESH — the device does not run mode M's light-side refresh on plain fixed-`-spp` renders (OPEN, 2026-09-13)
+
+Split out of GPU-VARIANCE, which it turned out to be the entire cause of. The host redraws the photon
+map under a fresh salt every ~10 % of the wall clock and averages the realizations, so **map noise
+falls with render time**; the device does this only when a budget flag is present
+(`-time`/`-forever`/`-noise`, the `budgetedGpuM` path added in v0.295.0), and not at all for a plain
+`-spp N` render. Measured cost of the gap: **1.302x SD (1.69x variance)** on `_cornell_diffuse` at
+spp 34, which vanishes to 0.995 when the host is forced to one realization with `-beamfreeze`.
+
+**The fix is to open the `budgetedGpuM` gate to plain renders**, since the `lightEpoch` loop and its
+`RngSaltScope` already exist and already work for budgeted device renders. The care needed is in the
+stopping rule: a budgeted render refreshes until its budget runs out, whereas a plain `-spp N` render
+has to decide how to split a fixed sample count between realizations — the host's answer is a wall-clock
+fraction (~10 %), which is not reproducible run to run, and a device port should probably key off spp
+instead so that a fixed-parameter render stays deterministic.
+
+Not started. Anyone picking it up should first re-read GPU-VARIANCE above, which is the worked example
+of how this was misdiagnosed as a deposit defect for fifteen experiments.
 
 ### STALE-LIMITATION AUDIT (2026-09-13) — documented limitations are less re-tested than open bugs
 
