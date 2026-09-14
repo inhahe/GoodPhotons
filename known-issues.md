@@ -3310,6 +3310,29 @@ further off.
    not over-refreshing at all — on a map-noise-dominated scene it is accidentally near optimal, and
    the **stated 10 % policy is the thing that is wrong**. The device follows the policy faithfully
    and is therefore the one leaving variance on the table.
+
+   **The prediction was tested and BEATEN, which is itself the warning.** `-beamrefresh 0.6`, same
+   scene and budget, 4 seeds:
+
+   | arm | realizations | spp | median per-pixel SD |
+   |---|---:|---:|---:|
+   | `-beamfreeze` | 1 | — | 0.07815 |
+   | default `0.10` | 5-6 | ~11 100 | 0.03416 |
+   | **`0.6`** | **35-38** | ~4 700 | **0.01322** |
+
+   **6.7x better variance than the shipped default and 35x better than frozen**, with all three means
+   inside 0.012 %. But the model predicted k = 26 and SD 0.0194; the run delivered k = 37 and 0.0132.
+   **The model is directionally right and quantitatively wrong** — it mispredicts the epoch count by
+   ~40 % — so it is fit to identify a direction and NOT fit to choose a default. The measured optimum
+   has not been bracketed either: `0.6` may simply be on the way up.
+
+   **The default is therefore NOT being changed on this evidence.** Two things are still missing, and
+   both are ways this could be an artifact rather than a win: (i) an upper bracket, to distinguish "0.6
+   is near optimal" from "more is always better on this scene", and (ii) at least one scene with a
+   different noise balance — `_cornell_diffuse` is map-noise dominated 100x, which is the single
+   condition most favourable to refreshing, and `g_beamRefreshFrac` is shared with the host. Tuning a
+   global default on the one scene that most rewards it is exactly the over-fit this file keeps
+   catching elsewhere.
 2. **Why does the host effectively refresh ~6x more aggressively than its own target? — ANSWERED, and
    it is the same defect as the device's, pointing the other way.** Both sites size an epoch from a
    preamble they *estimate* rather than from the one the renderer already measured, and both estimates
