@@ -225,15 +225,30 @@ inline void apply(std::vector<Vec3>& img, int W, int H, const Params& p) {
     // the whole cascade: re-deriving it from the partially filtered luma would let level
     // 0's smoothing decide where level 4 is allowed to smooth, which compounds into
     // blotches.
+    // The pre-smooth is a 3x3 MEDIAN, not a mean, and that distinction is load-bearing.
+    // A mean SPREADS an outlier: one firefly becomes a 3x3 plateau in the guide, which then
+    // inflates `localScale` (a local peak-to-peak) across that whole patch. The edge-stop
+    // tolerance is proportional to that scale, so next to a firefly the tolerance grows
+    // enormous and the a-trous filter ACCEPTS taps it exists to reject -- then the luma
+    // scatter spreads that one pixel across its dilated support and prints the kernel's own
+    // point-spread function into the image, as a lattice of bright pixels at strides 1, 2 and
+    // 4. Measured on gallery_rain frame 0: a pixel of luma 1318 with all eight neighbours at
+    // exactly 0 (frame median 0.0024) produced a visible checkerboard block.
+    //
+    // A median is unmoved by a single outlier, so the tolerance stays at the neighbourhood's
+    // real scale, the far taps are rejected as intended, and the firefly can only scatter to
+    // itself. It fixes the artifact WITHOUT touching energy -- unlike clamping the firefly,
+    // which removed 8.5% of the frame's luminance.
     std::vector<double> guide(N);
     for (int j = 0; j < H; ++j) for (int i = 0; i < W; ++i) {
-        double s = 0; int n = 0;
+        double v[9]; int n = 0;
         for (int dj = -1; dj <= 1; ++dj) for (int di = -1; di <= 1; ++di) {
             int x = i + di, y = j + dj;
             if (x < 0 || x >= W || y < 0 || y >= H) continue;
-            s += Y[(size_t)y * W + x]; ++n;
+            v[n++] = Y[(size_t)y * W + x];
         }
-        guide[(size_t)j * W + i] = n ? s / n : Y[(size_t)j * W + i];
+        std::nth_element(v, v + n / 2, v + n);
+        guide[(size_t)j * W + i] = n ? v[n / 2] : Y[(size_t)j * W + i];
     }
     const std::vector<double> scale = localScale(guide, W, H);
 

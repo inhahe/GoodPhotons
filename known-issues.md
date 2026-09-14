@@ -3623,6 +3623,63 @@ left the other firing the old text. Worth remembering as the same failure mode t
 for MIS weights written in two places: **when a rule is stated twice, a change has to visit both
 or the untouched copy becomes the behaviour.**
 
+### FIXED (2026-09-14, v0.305.0): `-denoise-luma` printed the a-trous kernel's own point-spread function into the image as a "cyan checkerboard block"
+
+**Reported as** *"in the first image i saw beams in the cloud"* plus a visible cyan checkerboard
+square on `gallery_rain` frame 0 whenever `-denoise-luma` was on. Present at both tolerance 1 and
+2, at the same place, which is what said it was structural rather than a tuning problem.
+
+**What it was.** The artifact pixels form a perfect symmetric lattice -- values at offsets 1, 2 and
+4 with near-zero gaps between them -- which is the **dilated a-trous kernel itself**. One pixel's
+energy had been scattered across the entire filter support:
+
+    1.51    6.31    2.51    9.46    2.27    9.46    2.51    6.31
+   0.0129 0.000286  9.46     105     77.6     105     9.46  0.00676
+    0.022  0.0139   2.27    77.6     174      77.6    2.27  0.0162
+
+**The mechanism, and it is a genuine bug.** The luma path is a SCATTER
+(`out_i = sum_k w_ik * in_k / D_k`), so an outlier can only spread if the edge-stop ACCEPTS distant
+taps. It did, because the tolerance is proportional to `localScale`, a local **peak-to-peak** of a
+**3x3 MEAN-smoothed** guide. A mean SPREADS an outlier: one firefly becomes a 3x3 plateau in the
+guide, the peak-to-peak across that patch is then set BY the firefly, and the tolerance meant to
+contain it inflates by orders of magnitude instead. **The outlier defeats the test that exists to
+reject it.** Measured source: a pixel of luma **1318 with all eight neighbours at exactly 0**,
+against a frame median of 0.0024 and a 99.99th percentile of 0.45.
+
+**The fix: the guide is a 3x3 MEDIAN.** A median is unmoved by a single outlier, so the tolerance
+stays at the neighbourhood's real scale, the far taps are rejected as intended, and a firefly can
+only scatter to itself.
+
+| | lattice signature | energy vs raw | GYROID HF |
+|---|---:|---:|---:|
+| mean guide (before) | 14286.5 | 1.00498 | 11.547 |
+| clamp firefly to 0 | 0.0 | **0.91534** | 0.047 |
+| **median guide** | **3.7** | **1.00256** | 0.787 |
+
+**The rejected alternative is the instructive one.** The obvious fix is to clamp the firefly, and
+it works -- and it destroys **8.5 % of the frame's luminance**, which is exactly what this file's
+own energy-conservation note exists to prevent. A fix that removes the artifact by removing the
+energy is not a fix in a renderer whose point is that the numbers mean something.
+
+**No regression on the chroma-only default** (`-denoise` without `-denoise-luma`, which is what
+every normal render uses): energy 0.99872 -> 0.99705, per-region chroma within 1.4 %, mean absolute
+difference 0.9 % of level.
+
+**STILL OPEN, deliberately: `clampFireflies` exempts the worst fireflies.** The guard reads
+`if (c > lim && lim > 0.0)`, and `lim = k * n1` where `n1` is the SECOND-brightest neighbour -- so a
+lone bright pixel whose eight neighbours are all black has `lim == 0`, the test fails, and it is
+never clamped. An all-black neighbourhood is the strongest evidence a pixel can offer that it is a
+single lucky path, and it is treated as an exemption. It also contradicts the flag's documented
+rule ("clamp to k x the 2nd brightest neighbour", which is 0 here). **Not changed**, because the
+measurement above shows removing the guard costs 8.5 % of the frame's energy on a noisy render, and
+choosing between an artifact and a bias needs a decision about what `-fireflies` is FOR, not a
+patch. A middle ground (clamp to a robust local scale rather than to zero) is the obvious next
+design, and is not attempted here.
+
+**Separately: `-denoise-luma` remains unsuitable for `gallery_rain` at any tolerance tested.** With
+the lattice gone it still over-smooths -- the hamster and the glass sphere lose their shape at
+tolerance 2 and are soft at 1. The bug is fixed; the feature is still the wrong tool for this scene.
+
 ### STALE-LIMITATION AUDIT (2026-09-13) — documented limitations are less re-tested than open bugs
 
 Three recorded blockers dissolved in one session, each on a single grep against code that had moved
