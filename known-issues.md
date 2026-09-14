@@ -3326,13 +3326,43 @@ further off.
    ~40 % — so it is fit to identify a direction and NOT fit to choose a default. The measured optimum
    has not been bracketed either: `0.6` may simply be on the way up.
 
-   **The default is therefore NOT being changed on this evidence.** Two things are still missing, and
-   both are ways this could be an artifact rather than a win: (i) an upper bracket, to distinguish "0.6
-   is near optimal" from "more is always better on this scene", and (ii) at least one scene with a
-   different noise balance — `_cornell_diffuse` is map-noise dominated 100x, which is the single
-   condition most favourable to refreshing, and `g_beamRefreshFrac` is shared with the host. Tuning a
-   global default on the one scene that most rewards it is exactly the over-fit this file keeps
-   catching elsewhere.
+   **Both checks are now done, and the default is STILL not being changed. Here is the full curve.**
+
+   `_cornell_diffuse`, `-time 180`, 4 seeds:
+
+   | `-beamrefresh` | realizations | median per-pixel SD | vs previous row |
+   |---|---:|---:|---:|
+   | `-beamfreeze` | 1 | 0.07815 | — |
+   | **0.10 (shipped default)** | 5.5 | 0.03416 | 5.23x |
+   | 0.6 | 37 | 0.01322 | 6.68x |
+   | 2.0 | 57 | 0.01099 | 1.44x |
+
+   `_fur_substrate`, `-time 180`, 2 seeds (a ratio, not an absolute, at this seed count):
+   default `0.10` reaches k = 46 and SD 0.01574; `0.6` reaches k = 160 and SD **0.01005** — **2.45x
+   better variance**, mean shift -0.064 %.
+
+   * **The second scene does improve**, so this is not a `_cornell_diffuse` artifact. Note it also
+     shows how wildly the "self-correcting" rule lands: the same default gives k = 5.5 on one scene and
+     k = 46 on the other.
+   * **The optimum is NOT bracketed.** SD was still falling at `2.0`. Returns are clearly diminishing
+     (6.68x then 1.44x) and the last step is almost exactly the `1/k` of pure map noise, which says
+     camera noise is *still* negligible at k = 57 and the true optimum is higher yet. **A default
+     belongs at an optimum, not at the largest value I happened to try**, so by the rule set before
+     the run: no retune.
+
+   **And the policy is wrong for a third, more concrete reason, found while checking the arithmetic.**
+   At k = 57, fifty-seven deposits at the 4.13 s "preamble" would be 235 s inside a 180 s budget —
+   impossible. The logs resolve it: each refresh pass costs **~1 s** (0.5 s tracing + ~0.3 s upload),
+   not 4.13 s. **The 4.13 s epoch-0 figure is one-time setup — scene upload, BVH, grid build — plus
+   the first gather chunk, none of which a refresh epoch repeats.** So the heuristic sizes every epoch
+   from a measurement ~4x larger than the thing it is meant to amortise, and that is on top of the
+   10 % target itself being far too conservative whenever map noise dominates.
+
+   **Recommendation, not a default change:** on device mode M, `-beamrefresh 0.6` is worth a factor of
+   2.5-6.7 in variance at equal wall clock, free of bias (every mean above agrees to ~0.06 % or
+   better). Fixing it properly means measuring the *incremental* refresh cost rather than the epoch-0
+   preamble, and then re-deriving the target fraction — with the host included, since it shares the
+   knob and has not been tested against any of this.
 2. **Why does the host effectively refresh ~6x more aggressively than its own target? — ANSWERED, and
    it is the same defect as the device's, pointing the other way.** Both sites size an epoch from a
    preamble they *estimate* rather than from the one the renderer already measured, and both estimates
