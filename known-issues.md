@@ -2560,7 +2560,48 @@ ratio of two unreplicated timings and should read as "more than an order of magn
 1 against 0.
 
 
-### GPU-BEAM-TAIL — **NARROWER THAN THE HEADING SAYS**: the device tail gap needs beams *and* extreme optical depth; the universal finding is a ~1.3x MEDIAN gap (2026-09-13)
+### GPU-BEAM-TAIL — **CLOSED (2026-09-14) as a narrow edge case.** The median half was never a device defect; the tail half is real, survives the realization-count control at 2.05x p99, and needs beams *and* extreme optical depth
+
+**RESOLUTION.** This entry described two effects. The **median gap dissolved** — it was the light-side
+realization count (see GPU-VARIANCE), not a device property. The **tail gap is real and survives**,
+but it is bounded, needs `-beams` *and* `sigma_t` between 6 and 20, and one scene in the repo exhibits
+it. Closed as an edge case rather than solved.
+
+**The controlled measurement.** `_fog_thick`, `-mode M -beams -spp 16`, 2 seeds, seed-to-seed
+`|difference|` by percentile relative to level — the entry's own rig, re-run with the realization
+count pinned:
+
+| arm | median | p90 | p99 | max/level |
+|---|---:|---:|---:|---:|
+| GPU, default (turns out to be k=1) | 0.1812 | 1.0464 | 2.9270 | 23.0 |
+| CPU, default (**k=2**) | 0.1132 | 0.4803 | 1.0638 | 2.4 |
+| GPU, `-beamfreeze` (k=1) | 0.1770 | 1.0413 | 3.0019 | 19.9 |
+| CPU, `-beamfreeze` (k=1) | 0.1485 | 0.6744 | 1.4621 | 4.2 |
+
+* **The rig reproduces the recorded effect**: 2.75x p99 at default k against the 2.97x this entry
+  recorded, so the matched-k number below is not a blind null.
+* **At matched k the p99 ratio falls from 2.75x to 2.05x, and the median from 1.60x to 1.19x.** So
+  roughly a third of the apparent tail gap was the host quietly averaging two maps to the device's one;
+  **the rest is a genuine device beam-gather difference.**
+* **Internal consistency check**: the GPU arms barely move between default and pinned (p99 2.93 -> 3.00)
+  because the device was *already* at k=1. Every bit of the change is on the host side, which is what
+  the mechanism predicts and is the reason to believe the comparison.
+
+**Nine candidates eliminated in total**, each by measurement: kernel radius, beam set and split, FP32
+precision, the `1/sin(theta)` singularity, the gather-time spectral fold, optical depth (it is the
+*condition*, not the cause), and — from GPU-VARIANCE, which shares the median half — RNG stream
+correlation, global normalisation and reduced sample independence. What is left standing is the
+conclusion the entry already reached: **the device beam gather computes a different estimator than the
+host, not the same one less accurately** — both unbiased in the mean, differing in variance at the tail.
+
+**A METHOD FAILURE WORTH MORE THAN THE RESULT.** The four arms were first written to
+`scraps/bg_*`, `bc_*`, `bG_*`, `bC_*`. **Windows filesystems are case-insensitive, so `bg_1.pfm` and
+`bG_1.pfm` are the same file** — the `-beamfreeze` arms silently overwrote the default arms, leaving
+two arms wearing four names. Scored as written, both "arms" would have been `-beamfreeze` arms, the
+matched-vs-default comparison would have returned ~1.0, and the conclusion would have been a clean,
+plausible, entirely fabricated *"the tail was realization count all along"*. It was caught only because
+**8 renders had produced 4 files** and the count did not reconcile. Never distinguish output files by
+letter case, and check that a multi-arm run produced as many distinct outputs as it had arms.
 
 **SCOPE CORRECTED AFTER A SECOND BEAM SCENE.** Every measurement below was taken on `_fog_thick`
 (`sigma_t 20`). Running the identical rig on `_beams_ms` (`sigma_t 6`, also beams, also media) shows
@@ -2589,11 +2630,19 @@ repo exhibits it.** That is a real effect, reproduced across seeds, precision bu
 settings, but it is an edge case rather than the general device-beam defect the original heading
 claimed.
 
-**THE FINDING THAT DOES GENERALISE IS THE MEDIAN GAP.** The device runs ~1.3x noisier at the median
-on *every* scene tested, beams or not: `_cornell_diffuse` **1.30x**, `_fog_thick` beams **1.35x**,
-`_beams_ms` **1.37x**, thin fog **2.04x**. That is present in five of five conditions including
-no-beam scenes, which makes it the more valuable target of the two, and none of the eight candidates
-eliminated below touches it — they were all aimed at the tail.
+**THE MEDIAN GAP — SOLVED ELSEWHERE, AND IT WAS NEVER A DEVICE DEFECT.** This entry recorded a
+~1.3x median gap on *every* scene tested, beams or not (`_cornell_diffuse` **1.30x**, `_fog_thick`
+beams **1.35x**, `_beams_ms` **1.37x**, thin fog **2.04x**), and called it the more valuable of the
+two findings because it generalised. It generalised because it had nothing to do with beams, media or
+the device: **it is the light-side realization count.** At matched `-spp` the host completes more
+light-side refresh epochs than the device, and averaging `k` maps divides map-noise variance by `k`.
+See GPU-VARIANCE, where the same 1.30x on `_cornell_diffuse` is closed by forcing the host to one
+realization with `-beamfreeze` — the gap goes to **0.995**.
+
+Note what that means for the numbers above: **matched `-spp` is not a matched comparison** when the
+two backends reach different epoch counts, so every median ratio in this entry is really a statement
+about how long each backend ran. The tail figures below are subject to the same doubt and are
+re-tested at matched `k` at the end of this entry.
 
 
 Found while pricing the M-TIME-CPU fix, which exposed a device-vs-host quality gap to `-time` users
