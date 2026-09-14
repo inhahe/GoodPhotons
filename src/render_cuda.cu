@@ -1543,6 +1543,16 @@ struct DCamera {
 
 // ============================ device helpers ============================
 
+// Device twin of rng.h's mix64 (splitmix64 finaliser). Exists because the FORWARD photon
+// pass needs a seed that avalanches: see kTrace, where seeding per-thread from a raw index
+// leaves neighbouring threads on adjacent PCG32 streams.
+__device__ __forceinline__ unsigned long long dMix64(unsigned long long x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
 struct DRng {
     unsigned long long state, inc;
     __device__ void seed(unsigned long long seq, unsigned long long s) {
@@ -9039,7 +9049,7 @@ __device__ static void traceHeroPhoton(const DScene& sc, const DCamSet& cs, int 
 
 __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
                        long long N, int diffraction, unsigned long long seedBase, int maxBounce,
-                       int camMode, int heroC) {
+                       int camMode, int heroC, int perPhotonSeed) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     DRng rng; rng.seed((unsigned long long)(g * 2 + 1), seedBase ^ (unsigned long long)g);
@@ -9047,6 +9057,23 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
     double eEmitted = 0, eAbsorbed = 0, eSensor = 0, eEscaped = 0, eResidual = 0;
 
     for (long long i = g; i < N; i += G) {
+        // PER-PHOTON HASHED SEEDING (GPU-VARIANCE). The default path above seeds ONCE PER
+        // THREAD from a raw index: inc = 4g+3, state seeded from `seedBase ^ g`. Neighbouring
+        // threads therefore sit on ADJACENT PCG32 streams -- and a PCG "stream" is only a
+        // different additive constant in the same LCG, so adjacency is the canonical weak case.
+        // That is harmless wherever one stream feeds one INDEPENDENT estimator (kBackward seeds
+        // identically and mode R measures at exact parity, because correlation BETWEEN pixels
+        // cannot change any single pixel's variance). It is not harmless here: every photon
+        // feeds a SHARED map, and a gather pools ~500 of them drawn from many different threads,
+        // so stream correlation lands directly in the pooled estimate and the average stops
+        // converging like sqrt(N).
+        //
+        // This path instead seeds per PHOTON from the absolute photon index, both words pushed
+        // through dMix64 -- exactly what the host's seedUnit() does, and for the reason its
+        // comment gives. It also makes the deposit independent of the launch geometry.
+        if (perPhotonSeed)
+            rng.seed(dMix64((unsigned long long)i ^ seedBase),
+                     dMix64((unsigned long long)i + seedBase));
         if (heroC > 1) {
             // Hero-wavelength path: one BVH walk carries C stratified wavelengths, halving
             // chromatic noise. De-heros to the single-λ shadeStep at a dispersive interface.
@@ -17444,8 +17471,12 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
     } else {
         int blockSize = 128;
         int numBlocks = 2048;          // ~262k threads, grid-stride over N photons
+        static const int perPhotonSeed = [] {
+            const char* e = std::getenv("FTRACE_GPU_PHOTONSEED");
+            return (e && *e) ? std::atoi(e) : 0;
+        }();
         kTrace<<<numBlocks, blockSize>>>(up.sc, cs, d_energy, N, diffraction ? 1 : 0,
-                                         kseed, 32, camModeInt, effHeroC);
+                                         kseed, 32, camModeInt, effHeroC, perPhotonSeed);
     }
     cudaCheckKernel("forward");
 }

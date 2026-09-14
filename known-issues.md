@@ -3105,6 +3105,60 @@ confirms the deposit and the *reason* is still unclear.
 * **The deposit.** Both trace 2 000 000 photons, but how many survive into the map, and with what
   power distribution, has not been compared.
 
+**THREE MORE CANDIDATES ELIMINATED BY DIRECT CAUSAL TEST (v0.300.1), and the entry's stated
+contradiction resolved.** Rig: `_cornell_diffuse`, `-mode M -spp 34 -n 2000000`, 4 seeds, per-pixel
+SD relative to level, median over signal-bearing pixels. It reproduces the recorded gap
+(**1.302** against the recorded 1.277), so the rig can see the effect — checked before trusting any
+null, since two nulls in this investigation had already come from rigs that could not.
+
+**12. RNG stream correlation in the deposit — ELIMINATED.** `kTrace` seeds **once per THREAD** from a
+raw index — `rng.seed(g*2+1, seedBase ^ g)`, giving `inc = 4g+3` — so neighbouring threads sit on
+**adjacent PCG32 streams**, and a PCG "stream" is only a different additive constant in the same LCG.
+The host does the opposite and says why: `seedUnit` seeds **per photon** with both words pushed
+through `mix64`, so that a realization depends only on (unit index, salt). This was the best remaining
+mechanism — it predicts the measured stride-32 file-order correlation (file order follows thread
+order), and it predicts that pooling correlated photons into one gather would break sqrt(N)
+convergence. **It is wrong.** `FTRACE_GPU_PHOTONSEED=1` seeds per photon from the absolute photon
+index through `dMix64` — exactly the host's rule — and the SD moves from **0.08009 to 0.08005**, 0.05 %.
+Verified live first (the images differ), so this is a null from a working knob, not from a dead one.
+
+**13. A global normalisation fluctuation — ELIMINATED.** If each realization's overall level moved,
+that would inflate every pixel's across-seed SD without being a local defect. It does not: the
+frame-mean CV across seeds is **0.076 % on the device against 0.246 % on the host** — the host's is
+three times larger — and dividing each realization by its own mean changes the SD by 0.01 %. The
+excess is entirely local.
+
+**14. Reduced effective sample count (correlated deposits) — ELIMINATED.** If device photons were
+less independent, adding photons would help the device less. Sweeping `-n` over 1M/2M/4M:
+
+| N | GPU SD | CPU SD | ratio |
+|---:|---:|---:|---:|
+| 1 000 000 | 0.09612 | 0.07296 | 1.317 |
+| 2 000 000 | 0.08009 | 0.05979 | 1.340 |
+| 4 000 000 | 0.06551 | 0.05080 | 1.290 |
+
+**SD ~ N^-0.277 on the device against N^-0.261 on the host — the same exponent**, with the ratio flat
+across a 4x range. The device is on a *parallel* curve, not a shallower one. (Both exponents are far
+from the -0.5 of independent samples because at spp 34 camera noise, which does not fall with N, is
+mixed in; the comparison between arms is still valid since that term is common.)
+
+**The contradiction this entry flagged is resolved — the three measurements do answer different
+questions.** Within-realization occupancy dispersion (52.6 vs 60.7) is a statistic *of one map*;
+deposit *order* is a property of the file; the defect is a property of *how a backend's maps differ
+from each other*. A single map can be smooth and well-conditioned while its realizations still swing;
+nothing about the first two statistics constrains the third. So there was never a contradiction to
+explain, only three statistics being read as if they measured one thing.
+
+**STATUS: characterised, bounded, mechanism still unknown, and now genuinely expensive to pursue.**
+Fourteen candidates eliminated, every one of them by measurement. What is established: the deposit is
+responsible (`-loadmap` parity 0.998), the maps are marginally equivalent in count, power, occupancy
+and dispersion, the photons are equally independent, the excess is local rather than global, and it is
+not the RNG. **The one deposit-side quantity never compared between the backends is the stored
+NORMAL** — the gather uses it for cross-surface leak rejection, so a small difference there would
+change which photons each query accepts without moving any of the statistics measured so far. That is
+the next test if this is ever picked up again. Practical impact is unchanged and small: mode M only,
+~1.25x variance asymptotically, invisible below spp ~16.
+
 **Also worth noting for how this file reads elsewhere:** the GPU is *not* generally noisier. In mode
 `R` it matches the host exactly. The 1.63x variance correction applies to **mode M only**, which is
 where it was measured and where the M-TIME-CPU throughput claims were made.
