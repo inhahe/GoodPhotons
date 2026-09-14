@@ -1494,6 +1494,24 @@ number needs `-beamcount 0` on both arms.
 `-beams-minorder 2` would halve the image there. The flag is a knob for the regime where the energy
 table says it is safe, not a default.
 
+**A CONSTRAINT THE PROTOTYPE SURFACED IMMEDIATELY: a scalar cache only works for ISOTROPIC media.**
+The natural thing to cache is fluence — photon path-length density — because it is
+direction-independent and the camera can rebuild radiance from it at march time as
+`sigma_s * phase(theta) * fluence * T`. The first version of `src/volcache.h` claimed that this
+keeps the phase function on the camera side, so the only approximation is spatial binning.
+
+**That is wrong, and the correction is the design constraint.** `phase(theta)` is the angle between
+the *incoming* photon direction and the outgoing camera direction; a scalar fluence has averaged the
+incoming directions away, so only the isotropic average survives. **A scalar fluence cache assumes an
+isotropic phase function** — exact for `g == 0`, wrong otherwise.
+
+Every media scene in this repo is `g = 0.0`, which is also the default, so the prototype is exact
+where it can be tested and `build()` now refuses anything else rather than averaging silently. But
+the constraint shapes the feature: **an anisotropic medium needs directional bins per cell**
+(spherical harmonics, or a small discrete direction set), which multiplies the memory by the bin
+count and changes the cost model this entry has been pricing. Whoever revisits the 51-58 % ceiling
+should know it is an isotropic-media number.
+
 **Consequences for the plan, which should be read before any prototype:**
 * The accuracy bar is the *image* quality bar, not a tolerance on a small term. A cached field good
   to 10 % is a 10 % error on the whole render at high depth.

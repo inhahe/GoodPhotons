@@ -14,11 +14,21 @@
 //
 //     L += sigma_s(x) * phase(theta) * fluence(x) * T(x) * dx
 //
-// That keeps the phase function and the transmittance on the CAMERA side, where they are
-// direction-dependent, and puts only the direction-independent part in the grid. The
-// approximation is therefore *spatial binning*, not an isotropy assumption -- which matters,
-// because known-issues.md records that the cached part carries 99.6 % of the energy at
-// sigma_t 20, so an isotropy assumption there would be an assumption about the whole image.
+// The transmittance stays on the camera side, where it is view-dependent and must be.
+//
+// CORRECTION TO THIS FILE'S FIRST VERSION, because the distinction matters. That version
+// claimed the phase function also stays on the camera side, so that "the approximation is
+// spatial binning, not an isotropy assumption". **That is wrong.** `phase(theta)` is the angle
+// between the INCOMING photon direction and the outgoing camera direction, and a scalar fluence
+// has averaged the incoming directions away -- so only the isotropic average is recoverable
+// from it. A scalar fluence cache *does* assume an isotropic phase function.
+//
+// It is therefore EXACT only for `g == 0` media, and `build()` refuses anything else rather
+// than silently averaging. Every media scene in this repo happens to be `g = 0.0` (which is
+// also the default), so the prototype is exact where it can be tested -- but the constraint is
+// real and it shapes the feature: an anisotropic medium would need DIRECTIONAL bins (spherical
+// harmonics, or a small discrete direction set) per cell, which multiplies the memory by the
+// bin count and changes the cost model this entry has been pricing.
 //
 // This is a PROTOTYPE for a go/no-go decision, not the production cache. It has no confidence
 // gate, no validation paths and no adaptive resolution -- the surface cache's machinery exists
@@ -42,8 +52,10 @@ struct VolCache {
     // Splat every chord of order >= minOrder into the grid, by walking it in steps no longer
     // than a cell. A chord contributes `power * segment length` to each cell it crosses, which
     // is the discrete form of the path-length integral the fluence is defined by.
-    void build(const BeamMap& bm, int res, int minOrder) {
+    // `gOK` must be true: the caller checks every medium this map touches has g == 0.
+    void build(const BeamMap& bm, int res, int minOrder, bool gOK) {
         ready = false;
+        if (!gOK) return;                      // anisotropic: a scalar cache cannot serve it
         if (bm.empty() || bm.nEmitted <= 0 || res < 2) return;
         Aabb box;
         for (size_t i = 0; i < bm.beams.size(); ++i) {
