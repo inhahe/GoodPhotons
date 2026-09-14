@@ -3287,12 +3287,29 @@ further off.
 
 **Three things are open, in order of value:**
 
-1. **Is refreshing worth it at equal wall clock?** Unmeasured. `-time 30` cannot answer it — the
-   device's epoch is 41 s, so both arms run one epoch and the comparison returns a 1.06x null from a
-   rig that cannot see the effect. It needs `-time` comfortably above 41 s (say 180 s) with
-   refresh-on against `-beamfreeze`, 4 seeds. Forcing 9 realizations at fixed spp gave a **5.66x**
-   variance reduction for **6x** the wall clock, which is the right order of magnitude to make the
-   equal-time answer genuinely uncertain rather than obvious.
+1. **Is refreshing worth it at equal wall clock? — YES, EMPHATICALLY: 5.2x in variance.** Measured
+   on the device, `_cornell_diffuse`, `-mode M -n 2000000 -time 180`, 4 seeds, rig verified non-blind
+   first (the refresh arm reaches 5-6 realizations and ~11 100 spp):
+
+   | arm | realizations | median per-pixel SD |
+   |---|---:|---:|
+   | refresh ON (default `-beamrefresh 0.10`) | 5-6 | **0.03416** |
+   | refresh OFF (`-beamfreeze`) | 1 | 0.07815 |
+
+   **Variance ratio 5.23 in favour of refreshing**, means agreeing to 0.012 %. (An earlier attempt at
+   `-time 30` returned 1.06x — a null purely because 30 s < the device's 41 s epoch, so both arms ran
+   one epoch. The fix was a longer budget, not a different statistic.)
+
+   **Decomposing the two arms says something sharper than the ratio.** Solving
+   `c^2 + m^2 = 0.07815^2` against `1.07^2 c^2 + m^2/5.5 = 0.03416^2` gives per-realization map noise
+   **m = 0.0778** against camera noise **c = 0.0077** — map noise outweighs camera noise **100x in
+   variance** on this scene. Minimising `c^2/(1 - k*4.13/180) + m^2/k` then puts the optimum near
+   **k = 26** realizations, i.e. **~60 % of wall clock spent re-depositing**, for a further ~3x.
+
+   **Which is almost exactly where the host's `rebuildSec == 0` bug lands it (~59 %).** So the host is
+   not over-refreshing at all — on a map-noise-dominated scene it is accidentally near optimal, and
+   the **stated 10 % policy is the thing that is wrong**. The device follows the policy faithfully
+   and is therefore the one leaving variance on the table.
 2. **Why does the host effectively refresh ~6x more aggressively than its own target? — ANSWERED, and
    it is the same defect as the device's, pointing the other way.** Both sites size an epoch from a
    preamble they *estimate* rather than from the one the renderer already measured, and both estimates
