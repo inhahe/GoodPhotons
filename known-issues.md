@@ -1594,6 +1594,56 @@ medium it is allowed to take**, and on this scene that share is small. Making it
 the rainbow phase cacheable -- its Legendre moments by quadrature per CIE channel -- which is the
 next real piece of work and is not done.
 
+**RAINBOW PHASES NOW CACHEABLE (v0.303.0) — by Legendre moments of the bow kernel, per CIE
+channel.** The last refusal is gone, and it needed a different formulation rather than a bigger
+one. A Henyey-Greenstein medium has a scalar phase, so a beam's CIE triple is a constant that can
+be folded into the coefficients and the kernel is the single number `g^l`. **A rainbow's colour is
+a function of the SCATTERING ANGLE**, so the CIE has to live in the KERNEL and the coefficients
+must stay scalar:
+
+    L_s[c](w) = sum_lm  C_l[c] * a_lm * Y_lm(w),    C_l[c] = 2 pi integral Bow_c(t) P_l(t) dt
+
+That is the structural reason a CIE-weighted cache could never hold a bow, and why this is not the
+same fix as the anisotropy one.
+
+**The moments cost no new tabulation.** `Scene::BowLut` already stores `cie[i] * phaseLum[i]` =
+`Bow(cos)`, the full spectral integral `integral spd(l) CIE(l) p(cos, l) dl`, over 8192 bins
+uniform in cos. The moments are a trapezoid sum over that table.
+
+**The derivation was turned into a test, and it passes exactly.** The l = 0 moment of a normalised
+phase is 1, so `C_0` must reproduce the emitter's SPD-weighted mean CIE -- the very triple an
+achromatic-fold beam already carries as `cieA`. Measured on `gallery_rain`:
+
+    kMom0 (0.24790 0.25539 0.25771)  vs  beam cieA (0.24790 0.25539 0.25771)   ratioY 1.0000
+
+**Scope: only the gather-time-fold beams (`achro == 2`) of one emitter.** Their spectral integral
+is exactly what the LUT tabulates and is decidable only once the scattering angle is known --
+which is what the convolution supplies. A monochromatic or bundled beam carries its own lambda and
+would need its own kernel, so it stays a real beam. One bow LUT is per (emitter, medium), so a
+medium lit by two emitters caches one of them and leaves the rest as beams. **Bow mode always uses
+full SH order**: a bow is a sharp angular feature whose kernel keeps weight well past band 2, so
+unlike the HG case the directional bins are not optional.
+
+**Result on `gallery_rain` (CPU, both media now cached -- HG cloud and bow rain):**
+
+| | value |
+|---|---:|
+| chords routed to grids | **38.3 %** (was 22.7 % with the cloud alone) |
+| ROI mean ratio vs uncached | **1.0081** (median \|d\| 0.00 %, p90 1.66 %) |
+| cloud crop | 1.0659 |
+| bow / rain crop | 1.0446 |
+| speedup, paired, warm-up discarded | **0.942, 0.957, 0.984** |
+
+HG regressions hold: `_bms96` 1.0019 (unchanged), `_bms_aniso` 0.9894 (was 0.9906).
+
+**So it is correct, and it is still only ~4-5 % faster here.** Doubling the cacheable share from
+22.7 % to 38.3 % roughly doubled the gain, from ~2 % to ~4-5 %, which is the consistent story: the
+cache pays in proportion to the share it is allowed to take, and on this scene order-1 chords --
+which are never cacheable, because the anisotropy and the bow both live in the first scattering --
+still dominate the map. The march also now walks TWO grids per ray at 64 steps each. Against the
+**64 %** on a single-medium scene where everything is cacheable, `gallery_rain` is simply not a
+volume-dominated render: its cost is spread across a large surface scene.
+
 **Still open before this could ship as a real feature.** The `res` is fixed by hand and the error
 stops improving past ~48 (finer cells have less bias but fewer samples each). There is no confidence
 gate, no validation path and no adaptive resolution. Anisotropic media need directional bins

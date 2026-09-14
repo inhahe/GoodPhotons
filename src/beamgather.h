@@ -225,6 +225,32 @@ inline bool same(const Key& a, const Key& b) {
 }
 }  // namespace vcstate
 
+// LEGENDRE MOMENTS OF THE BOW KERNEL, by quadrature over `Scene::BowLut`.
+//
+// The LUT already tabulates what is needed: `cie[i] * phaseLum[i]` is `Bow(cos)`, the full
+// spectral integral `integral spd(l) CIE(l) p(cos, l) dl` as a CIE triple, over 8192 bins uniform
+// in cos. So the moments are a trapezoid sum over a table the renderer already built -- no new
+// tabulation, and no sampling of the Airy formula.
+//
+// SELF-CHECK WORTH KNOWING: the l = 0 moment of a NORMALISED phase is 1, so `kMom[0]` here must
+// come out as the emitter's SPD-weighted mean CIE -- the same triple the achromatic fold stores
+// as `cieA`. If it does not, the quadrature or the LUT convention is wrong.
+inline void volBowMoments(const Scene::BowLut& lut, Vec3* mom3) {
+    const int N = Scene::BowLut::kBins;
+    Vec3 m0{0, 0, 0}, m1{0, 0, 0}, m2{0, 0, 0};
+    const double dt = 2.0 / (double)(N - 1);
+    for (int i = 0; i < N; ++i) {
+        const double t = -1.0 + 2.0 * (double)i / (double)(N - 1);
+        const Vec3 B = lut.cie[i] * (double)lut.phaseLum[i];
+        const double w = (i == 0 || i == N - 1) ? 0.5 : 1.0;    // trapezoid endpoints
+        m0 = m0 + B * (w * dt);
+        m1 = m1 + B * (w * dt * t);
+        m2 = m2 + B * (w * dt * 0.5 * (3.0 * t * t - 1.0));
+    }
+    const double twoPi = 6.283185307179586;
+    mom3[0] = m0 * twoPi; mom3[1] = m1 * twoPi; mom3[2] = m2 * twoPi;
+}
+
 // The gate is now PER MEDIUM, which is what lets a scene be partially cached. Anisotropy and
 // heterogeneity are both served (see volcache.h); a RAINBOW phase is not, because it is a
 // wavelength-dependent Airy table whose Legendre moments are neither g^l nor achromatic.
@@ -252,9 +278,44 @@ inline void volCacheBuildAll(const Scene& sc, const BeamMap& bm) {
     std::vector<VolCache>& cs = vcstate::caches();
     cs.assign(sc.media.size(), VolCache{});
     for (size_t mi = 0; mi < sc.media.size(); ++mi) {
-        double g = 0.0;
-        const bool ok = volCacheMedOk(sc, mi, g);
-        cs[mi].build(bm, volCacheRes(), 2, ok, sigmaAt, g, (int)mi);
+        const Medium& m = sc.media[mi];
+        if (!m.enabled) continue;
+        if (m.rainbow()) {
+            // Pick the emitter whose gather-time-fold beams this medium actually carries. One
+            // bow LUT is per (emitter, medium), so a medium lit by two emitters would need two
+            // grids; the eligibility predicate leaves the others as real beams rather than
+            // serving them the wrong kernel.
+            int em = -1;
+            for (size_t i = 0; i < bm.beams.size(); ++i) {
+                const PhotonBeam& pb = bm.beams[i];
+                if (pb.med == (int)mi && pb.achro == 2 && pb.emIdx >= 0 &&
+                    pb.order != kBeamOrderUnknown && (int)pb.order >= 2) { em = pb.emIdx; break; }
+            }
+            const Scene::BowLut* lut = (em >= 0) ? sc.bowLut(em, (int)mi) : nullptr;
+            if (!lut || !lut->valid()) continue;      // no fold to cache: keep every beam
+            Vec3 mom[3];
+            volBowMoments(*lut, mom);
+            if (std::getenv("FTRACE_VOLCACHE_DIAG")) {
+                // The l = 0 moment of a normalised phase is 1, so mom[0] must reproduce the
+                // emitter's SPD-weighted mean CIE -- which is exactly what an achromatic-fold
+                // beam already carries in cieA. Printing both turns the derivation into a test.
+                Vec3 ref{0, 0, 0};
+                for (size_t i = 0; i < bm.beams.size(); ++i) {
+                    const PhotonBeam& pb = bm.beams[i];
+                    if (pb.med == (int)mi && pb.achro == 2 && (int)pb.emIdx == em) {
+                        ref = Vec3(pb.cieA[0], pb.cieA[1], pb.cieA[2]); break;
+                    }
+                }
+                std::fprintf(stderr,
+                    "[vcdiag] bow med %d em %d: kMom0 (%.5g %.5g %.5g) vs beam cieA "
+"(%.5g %.5g %.5g)  ratioY %.4f\n",
+                    (int)mi, em, mom[0].x, mom[0].y, mom[0].z, ref.x, ref.y, ref.z,
+                    ref.y != 0.0 ? mom[0].y / ref.y : 0.0);
+            }
+            cs[mi].build(bm, volCacheRes(), 2, true, sigmaAt, 0.0, (int)mi, mom, em);
+        } else {
+            cs[mi].build(bm, volCacheRes(), 2, true, sigmaAt, m.g, (int)mi);
+        }
     }
 }
 
@@ -293,8 +354,10 @@ inline size_t volCacheSplit(const Scene& sc, BeamMap& bm) {
     size_t w = 0;
     for (size_t i = 0; i < before; ++i) {
         const PhotonBeam& b = bm.beams[i];
+        // Ask the cache itself whether it took this beam. Re-deriving the condition here is how
+        // a beam gets erased that was never splatted, which deletes its energy outright.
         const bool cached = b.med >= 0 && (size_t)b.med < cs.size() && cs[b.med].ready &&
-                            b.order != kBeamOrderUnknown && (int)b.order >= 2;
+                            cs[b.med].eligible(b);
         if (cached) continue;
         bm.beams[w++] = bm.beams[i];
     }
@@ -387,8 +450,8 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
         const PhotonBeam& b = bm.beams[bh.idx];
         // Skip only if THIS beam's own medium has a ready grid -- a partially-cached scene
         // still gathers the uncached media's beams normally.
-        if (vcAny && b.order >= 2 && b.order != kBeamOrderUnknown && b.med >= 0 &&
-            (size_t)b.med < vcs.size() && vcs[b.med].ready) return;
+        if (vcAny && b.med >= 0 && (size_t)b.med < vcs.size() && vcs[b.med].ready &&
+            vcs[b.med].eligible(b)) return;
         beamDiag().bump(beamDiag().pass);
         if (beamDiag().on && b.order >= 2 && b.order != kBeamOrderUnknown)
             beamDiag().passMS.fetch_add(1, std::memory_order_relaxed);

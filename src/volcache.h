@@ -95,10 +95,35 @@ struct VolCache {
     int   nSH = 1;              // 1 (isotropic, l = 0 only) or kVolShN
     double gHG = 0.0;           // the HG anisotropy this grid was built for
     int   med = -1;             // the medium index this grid serves
-    std::vector<float> sh;      // nSH * 3 per cell, CIE XYZ per coefficient
+    // RAINBOW (zonal, per-CIE-channel) MODE. A Henyey-Greenstein medium has one scalar phase, so
+    // the beam's CIE triple is a constant that can be folded into the coefficients and the kernel
+    // is the single number g^l. A RAINBOW does not work that way: its colour is a function of the
+    // SCATTERING ANGLE, so the CIE belongs in the KERNEL and the coefficients must stay scalar.
+    // That is the structural reason the CIE-weighted cache could not represent a bow at all, and
+    // it is what `bowMode` switches.
+    bool  bowMode = false;
+    Vec3  kMom[3];              // Legendre moment of the bow kernel, per band, per CIE channel
+    int   emPick = -1;          // the emitter whose bow LUT kMom came from
+    std::vector<float> sh;      // nSH * nCh per cell
+    int   nCh = 3;              // 3 = CIE per coefficient (HG), 1 = scalar (bow)
     bool  ready = false;
 
     int idx(int ix, int iy, int iz) const { return ((iz * ny) + iy) * nx + ix; }
+
+    // ONE predicate, used by build() AND by the deposit split's erase. They must agree exactly:
+    // erasing a beam the cache did not splat deletes its energy outright, which is how the split
+    // lost 72 % of a cloud once already.
+    bool eligible(const PhotonBeam& b, int medOnly, int minOrder) const {
+        if (b.med != medOnly) return false;
+        if (b.order == kBeamOrderUnknown || (int)b.order < minOrder) return false;
+        // In bow mode only the GATHER-TIME FOLD beams qualify (`achro == 2`): their spectral
+        // integral is precisely what the bow LUT tabulates, and it is decidable only once the
+        // scattering angle is known -- which is exactly what the convolution supplies. A
+        // monochromatic or bundled beam carries its own lambda and would need its own kernel.
+        if (bowMode && !(b.achro == 2 && (int)b.emIdx == emPick)) return false;
+        return true;
+    }
+    bool eligible(const PhotonBeam& b) const { return eligible(b, med, 2); }
 
     // The CIE triple of one chord, duplicating BeamMap::build's rule. Needed because the
     // DEPOSIT SPLIT builds this cache from the RAW pre-split chords, before `bm.cie` exists.
@@ -117,9 +142,12 @@ struct VolCache {
     // has to pick one of each and is then wrong for every other medium present. It is also what
     // lets a scene be PARTIALLY cached: `gallery_rain` can cache its HG cloud while its
     // `phase rainbow` curtain stays as real beams, which a single grid could not express.
+    // `bowMom` non-null selects RAINBOW mode: scalar coefficients convolved with a per-CIE-channel
+    // zonal kernel, restricted to the gather-time-fold beams of emitter `emitter`. Null selects
+    // the Henyey-Greenstein path (CIE-weighted coefficients, g^l kernel).
     template <class SigmaFn>
     void build(const BeamMap& bm, int res, int minOrder, bool ok, const SigmaFn& sigmaAt,
-               double g, int medOnly) {
+               double g, int medOnly, const Vec3* bowMom = nullptr, int emitter = -1) {
         ready = false;
         if (!ok) return;
         if (bm.empty() || bm.nEmitted <= 0 || res < 2) return;
@@ -130,8 +158,7 @@ struct VolCache {
         bool any = false;
         for (size_t i = 0; i < bm.beams.size(); ++i) {
             const PhotonBeam& b = bm.beams[i];
-            if (b.med != medOnly) continue;
-            if (b.order == kBeamOrderUnknown || (int)b.order < minOrder) continue;
+            if (!eligible(b, medOnly, minOrder)) continue;
             box.expand(b.o + b.d * (double)b.s0);
             box.expand(b.o + b.d * ((double)b.s0 + (double)b.len));
             any = true;
@@ -148,11 +175,23 @@ struct VolCache {
             const char* e = std::getenv("FTRACE_VOLCACHE_SH");
             return e && *e && std::atoi(e) != 0;
         }();
-        gHG = useSH ? g : 0.0;
-        nSH = (gHG == 0.0) ? 1 : kVolShN;
+        bowMode = (bowMom != nullptr);
+        emPick  = emitter;
+        if (bowMode) {
+            for (int l = 0; l < 3; ++l) kMom[l] = bowMom[l];
+            // A bow is a SHARP angular feature, so its kernel keeps real weight well past band 2
+            // and the directional bins are not optional here the way they were for HG. Always
+            // full order in this mode.
+            gHG = 0.0;
+            nSH = kVolShN;
+        } else {
+            gHG = useSH ? g : 0.0;
+            nSH = (gHG == 0.0) ? 1 : kVolShN;
+        }
         const Vec3 ext = hi - lo;
         cellVol = (ext.x / nx) * (ext.y / ny) * (ext.z / nz);
-        sh.assign((size_t)nx * ny * nz * nSH * 3, 0.0f);
+        nCh = bowMode ? 1 : 3;
+        sh.assign((size_t)nx * ny * nz * nSH * nCh, 0.0f);
 
         const double step = std::min(ext.x / nx, std::min(ext.y / ny, ext.z / nz)) * 0.5;
         long long nSplat = 0;
@@ -160,8 +199,7 @@ struct VolCache {
         double Y[kVolShN];
         for (size_t i = 0; i < bm.beams.size(); ++i) {
             const PhotonBeam& b = bm.beams[i];
-            if (b.med != medOnly) continue;
-            if (b.order == kBeamOrderUnknown || (int)b.order < minOrder) continue;
+            if (!eligible(b, medOnly, minOrder)) continue;
             ++nSplat;
             const double len = (double)b.len;
             if (!(len > 0.0)) continue;
@@ -200,12 +238,17 @@ struct VolCache {
                 tau += sig * ds;
                 if (!inGrid) continue;   // tau has already advanced: depth accrues outside too
                 const double wgt = (double)b.power * atten * ds * invN / cellVol;
-                float* c = &sh[(size_t)idx(ix, iy, iz) * nSH * 3];
-                for (int k = 0; k < nSH; ++k) {
-                    const double wy = wgt * Y[k];
-                    c[k * 3 + 0] += (float)(cie.x * wy);
-                    c[k * 3 + 1] += (float)(cie.y * wy);
-                    c[k * 3 + 2] += (float)(cie.z * wy);
+                float* c = &sh[(size_t)idx(ix, iy, iz) * nSH * nCh];
+                if (bowMode) {
+                    // SCALAR photon-direction density: the colour is in the kernel, not here.
+                    for (int k = 0; k < nSH; ++k) c[k] += (float)(wgt * Y[k]);
+                } else {
+                    for (int k = 0; k < nSH; ++k) {
+                        const double wy = wgt * Y[k];
+                        c[k * 3 + 0] += (float)(cie.x * wy);
+                        c[k * 3 + 1] += (float)(cie.y * wy);
+                        c[k * 3 + 2] += (float)(cie.z * wy);
+                    }
                 }
             }
         }
@@ -255,17 +298,27 @@ struct VolCache {
         const int iy = (int)((p.y - lo.y) / ext.y * ny);
         const int iz = (int)((p.z - lo.z) / ext.z * nz);
         if (ix < 0 || iy < 0 || iz < 0 || ix >= nx || iy >= ny || iz >= nz) return false;
-        const float* c = &sh[(size_t)idx(ix, iy, iz) * nSH * 3];
+        const float* c = &sh[(size_t)idx(ix, iy, iz) * nSH * nCh];
         double Y[kVolShN];
         volShBasis(wOut, Y);
-        // The per-band Legendre moment of Henyey-Greenstein is exactly g^l (Funk-Hecke).
-        const double gp[3] = {1.0, gHG, gHG * gHG};
         double r[3] = {0.0, 0.0, 0.0};
-        for (int k = 0; k < nSH; ++k) {
-            const double w = gp[volShBand(k)] * Y[k];
-            r[0] += (double)c[k * 3 + 0] * w;
-            r[1] += (double)c[k * 3 + 1] * w;
-            r[2] += (double)c[k * 3 + 2] * w;
+        if (bowMode) {
+            // Same convolution, but the zonal kernel differs PER CIE CHANNEL, so the moment
+            // multiplies on the way out instead of being folded into the coefficients.
+            for (int k = 0; k < nSH; ++k) {
+                const Vec3& m = kMom[volShBand(k)];
+                const double a = (double)c[k] * Y[k];
+                r[0] += m.x * a; r[1] += m.y * a; r[2] += m.z * a;
+            }
+        } else {
+            // The per-band Legendre moment of Henyey-Greenstein is exactly g^l (Funk-Hecke).
+            const double gp[3] = {1.0, gHG, gHG * gHG};
+            for (int k = 0; k < nSH; ++k) {
+                const double w = gp[volShBand(k)] * Y[k];
+                r[0] += (double)c[k * 3 + 0] * w;
+                r[1] += (double)c[k * 3 + 1] * w;
+                r[2] += (double)c[k * 3 + 2] * w;
+            }
         }
         // SH truncation rings, and a NEGATIVE in-scattered radiance is unphysical -- it would
         // subtract energy from the march. Clamp. Windowing the series would remove the ringing
@@ -281,9 +334,13 @@ struct VolCache {
         if (!ready || nSH < 1) return 0.0;
         const double k = 0.2820947917738781 * 4.0 * 3.14159265358979323846;
         double s = 0.0;
-        const size_t stride = (size_t)nSH * 3;
-        for (size_t i = 0; i + stride <= sh.size(); i += stride) s += (double)sh[i + 1];
-        return s * k * cellVol;
+        const size_t stride = (size_t)nSH * nCh;
+        // Bow mode stores a scalar, so its l=0 coefficient IS the density; HG mode stores CIE and
+        // the Y channel is offset 1. Weighted by the kernel's l=0 moment either way.
+        const size_t off = bowMode ? 0 : 1;
+        const double kc = bowMode ? kMom[0].y : 1.0;
+        for (size_t i = 0; i + stride <= sh.size(); i += stride) s += (double)sh[i + off];
+        return s * k * kc * cellVol;
     }
 };
 
