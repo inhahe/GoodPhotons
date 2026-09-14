@@ -3293,9 +3293,28 @@ further off.
    refresh-on against `-beamfreeze`, 4 seeds. Forcing 9 realizations at fixed spp gave a **5.66x**
    variance reduction for **6x** the wall clock, which is the right order of magnitude to make the
    equal-time answer genuinely uncertain rather than obvious.
-2. **Why does the host effectively refresh ~6x more aggressively than its own target?** Its `epochSec`
-   must be deriving a much smaller preamble than the 3.9 s its deposit actually takes. Worth reading
-   the two implementations side by side (device ~main.cpp 24390, host ~16830 and ~17085).
+2. **Why does the host effectively refresh ~6x more aggressively than its own target? — ANSWERED, and
+   it is the same defect as the device's, pointing the other way.** Both sites size an epoch from a
+   preamble they *estimate* rather than from the one the renderer already measured, and both estimates
+   are wrong:
+
+   * **Host** (`main.cpp` ~17043): `double rebuildSec = 0.0; if (epoch > 0) { ... }`. **Epoch 0's
+     rebuild cost is structurally zero**, because epoch 0's light side was built before the loop was
+     entered. So the first epoch is sized as `setupSec / 0.10` with no deposit in it at all, ends
+     early, and triggers a refresh; from epoch 1 the ~3.9 s `rebuildSec` *is* included, epochSec jumps
+     to ~40 s, and that epoch runs to the end. That is exactly the observed **2 epochs in 13.3 s**,
+     and why the host lands at ~59 % of wall clock on deposits instead of 10 %.
+   * **Device** (`main.cpp` ~24390): no `rebuildSec` term at all, and `setupSec` is the time to the
+     first progress report — which on the device arrives ~9 spp into the gather. The preamble is
+     over-counted (4.26 s measured against 4.13 s actual, and against a 0.48 s whole-gather), epochSec
+     comes out 41 s, and the refresh never fires on a short render.
+
+   **So neither backend uses the number it already has.** The initial light-side build is timed and
+   printed at epoch 0 on both paths; feeding *that* in as epoch 0's preamble fixes both directions at
+   once. Which direction is the bug worth fixing depends on (1): if refreshing wins at equal wall
+   clock the device is under-refreshing, and if it loses the host is over-refreshing. **Do not fix
+   either until (1) is measured** — the two candidate fixes move behaviour opposite ways, and picking
+   one first would be choosing the answer before the experiment.
 3. **Should `epochSec` measure the preamble directly rather than as time-to-first-report?** The device
    reports every ~9 spp, so its first report lands well into the gather; extrapolating two reports
    back to the sample axis gives 4.128 s against the naive 4.256 s. **Only a 3 % difference on this
