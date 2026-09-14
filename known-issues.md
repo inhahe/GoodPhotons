@@ -2830,7 +2830,7 @@ phenomenon from the tail and is unexplained by any of the five eliminated candid
 **The rig is reusable:** `scraps/tail.py <prefix> <label>` scores any pair of two-seed PFM arms by
 percentile. Render with `-hdr`, matched `-spp`, seeds 1 and 2, named `png/<prefix>_<dev>_<seed>.png`.
 
-### GPU-VARIANCE — **ROOT CAUSE FOUND AND PROVEN (v0.300.2): the device does not run the LIGHT-SIDE REFRESH. It is a missing feature, not a noisier deposit.**
+### GPU-VARIANCE — **ROOT CAUSE FOUND AND PROVEN (v0.300.2): the two backends AVERAGE A DIFFERENT NUMBER OF LIGHT-SIDE REALIZATIONS at the same spp. Not a noisier deposit.**
 
 **The whole entry below is superseded on causation, and is kept because the eliminations are sound and
 because how it went wrong is the more useful lesson.**
@@ -2842,9 +2842,43 @@ and **averages the realizations** (v0.247.0; `-beamfreeze` opts out). It says so
             wall clock and averaging the realizations, so the MAP noise falls with the render too
     mode M: averaged 2 independent light-side realizations (34 spp total)
 
-The **device prints neither line, because it does neither**: a plain fixed-`-spp` device render uses
-**one** light-side realization. Averaging `k` independent maps divides map-noise variance by `k`, so
-the host was simply running a better estimator.
+The **device prints neither line on a plain `-spp` render, because it runs exactly one epoch.**
+Averaging `k` independent maps divides map-noise variance by `k`, so at the same spp the host was
+simply running a different -- and on this scene a lower-variance -- estimator.
+
+**CORRECTION, same day, to the first version of this heading.** It said the device "does not run the
+light-side refresh" and called it a missing feature. **That is wrong, and the error was mine.** The
+device has the machinery and uses it whenever the policy fires: `-beamrefresh 1.0` on the device
+averages **5** realizations, `2.0` averages **6**. `refreshGpu` requires only a single camera, no
+`-beamfreeze` and no `-savemap`/`-loadmap` -- no budget flag. What differs is not the feature but how
+long an epoch is judged to be worth.
+
+**What actually differs: the epoch length, and it is the HOST that looks mis-tuned.** Both backends
+say an epoch should run `preamble / 0.10`, i.e. spend ~10 % of the time re-depositing. Measured on
+`_cornell_diffuse`, `-spp 34`, `-n 2000000`:
+
+| | preamble | gather rate | render wall | realizations | share of wall spent depositing |
+|---|---:|---:|---:|---:|---:|
+| device | 4.13 s | 0.0142 s/spp (0.48 s for all 34) | 4.6 s | 1 | ~90 % |
+| host | ~3.9 s | — | 13.3 s | 2 | **~59 %** |
+
+The device's `epochSec` comes out **41 s** against a 4.6 s render, so it runs one epoch — refreshing
+would buy 0.48 s of gather for 4.13 s of preamble, and declining is the policy working. The host, with
+a *near-identical* preamble, refreshes twice inside 13.3 s and thereby spends ~59 % of its wall clock
+on the light side — six times its own stated target. **So the backends are not running the same
+policy in practice, and the one deviating from the stated 10 % is the host.**
+
+**Which also means the fixed-spp comparison this whole entry is built on was never fair.** At
+`-spp 34` it timed a 4.6 s device render against a 13.3 s host render and reported the shorter one as
+noisier. That is not a defect; it is the device finishing sooner. The meaningful comparison is at
+equal wall clock, and it is *not yet settled*: at `-time 30` both device arms still complete only one
+epoch (41 s > 30 s), so refresh-on vs `-beamfreeze` measured 0.07703 against 0.07920 — a 1.06x null
+from a rig that cannot see the effect. Settling it needs `-time` well above the device's 41 s epoch.
+
+**One measurement from the attempt is worth keeping, because it is the live risk here.** Forcing the
+device to 9 realizations at `-spp 34` gave SD **0.03366** against the default's 0.08009 -- a 5.66x
+variance reduction with the mean unmoved -- but cost **6x the wall clock** (32 s against 5.4 s). A
+variance number quoted without its time cost would have made that look like a large win.
 
 **Proven causally, not inferred.** `_cornell_diffuse`, `-mode M -spp 34 -n 2000000`, 4 seeds:
 
@@ -2898,11 +2932,10 @@ contain the answer. Three specific habits kept it alive:
    every run. The finding cost one `diff` of output that was on screen the entire time, after fifteen
    experiments looking for something subtler.
 
-**Status: the gap is explained and is not a bug in the device.** What remains is a genuine **feature
-gap** — the device should run the light-side refresh for plain fixed-`-spp` renders too. It already
-has the machinery: the budgeted device mode-M path added in v0.295.0 loops over `lightEpoch` under a
-`RngSaltScope`, and is gated to `-time`/`-forever`/`-noise`. Opening that gate to plain renders is the
-fix, and it is tracked as **GPU-REFRESH** below.
+**Status: the gap is explained, and it is not a bug in the device.** Nothing here needs fixing on the
+device side. What is left is a question about the REFRESH POLICY itself — whether ~10 % is the right
+share, why the host in practice spends ~59 %, and which setting wins at equal wall clock — tracked as
+**GPU-REFRESH** below. The fixed-spp framing should not be used again for backend comparisons.
 
 ### GPU-VARIANCE (ORIGINAL ENTRY, superseded above) — the device CONVERGES MORE SLOWLY in mode M; the gap is spp-dependent and peaks around 1.28x SD, not a constant 1.63x (2026-09-13)
 
@@ -3241,24 +3274,41 @@ where it was measured and where the M-TIME-CPU throughput claims were made.
 pixels. Cheap, works on any scene, and the four-seed form is what makes it trustworthy — all six
 pairs agreed to ~2 %, which is what ruled out a seed-correlation artifact.
 
-### GPU-REFRESH — the device does not run mode M's light-side refresh on plain fixed-`-spp` renders (OPEN, 2026-09-13)
+### GPU-REFRESH — the light-side refresh POLICY is inconsistent between backends, and its equal-wall-clock value is unmeasured (OPEN, 2026-09-13)
 
-Split out of GPU-VARIANCE, which it turned out to be the entire cause of. The host redraws the photon
-map under a fresh salt every ~10 % of the wall clock and averages the realizations, so **map noise
-falls with render time**; the device does this only when a budget flag is present
-(`-time`/`-forever`/`-noise`, the `budgetedGpuM` path added in v0.295.0), and not at all for a plain
-`-spp N` render. Measured cost of the gap: **1.302x SD (1.69x variance)** on `_cornell_diffuse` at
-spp 34, which vanishes to 0.995 when the host is forced to one realization with `-beamfreeze`.
+Split out of GPU-VARIANCE, which it explains. Mode M refreshes the photon map under a fresh salt and
+averages the realizations, with each epoch sized as `preamble / g_beamRefreshFrac` (default 0.10, i.e.
+"spend ~10 % of the time re-depositing"). **Both backends implement that sentence and land in very
+different places.** On `_cornell_diffuse` at `-spp 34 -n 2000000`: the device measures a 4.13 s
+preamble against a 0.0142 s/spp gather, computes `epochSec` = 41 s, runs **one** epoch in 4.6 s and
+spends ~90 % of it on the preamble; the host, with a near-identical preamble, runs **two** epochs in
+13.3 s and spends **~59 %** of its wall clock depositing. Neither is at 10 %, and the host is the
+further off.
 
-**The fix is to open the `budgetedGpuM` gate to plain renders**, since the `lightEpoch` loop and its
-`RngSaltScope` already exist and already work for budgeted device renders. The care needed is in the
-stopping rule: a budgeted render refreshes until its budget runs out, whereas a plain `-spp N` render
-has to decide how to split a fixed sample count between realizations — the host's answer is a wall-clock
-fraction (~10 %), which is not reproducible run to run, and a device port should probably key off spp
-instead so that a fixed-parameter render stays deterministic.
+**Three things are open, in order of value:**
 
-Not started. Anyone picking it up should first re-read GPU-VARIANCE above, which is the worked example
-of how this was misdiagnosed as a deposit defect for fifteen experiments.
+1. **Is refreshing worth it at equal wall clock?** Unmeasured. `-time 30` cannot answer it — the
+   device's epoch is 41 s, so both arms run one epoch and the comparison returns a 1.06x null from a
+   rig that cannot see the effect. It needs `-time` comfortably above 41 s (say 180 s) with
+   refresh-on against `-beamfreeze`, 4 seeds. Forcing 9 realizations at fixed spp gave a **5.66x**
+   variance reduction for **6x** the wall clock, which is the right order of magnitude to make the
+   equal-time answer genuinely uncertain rather than obvious.
+2. **Why does the host effectively refresh ~6x more aggressively than its own target?** Its `epochSec`
+   must be deriving a much smaller preamble than the 3.9 s its deposit actually takes. Worth reading
+   the two implementations side by side (device ~main.cpp 24390, host ~16830 and ~17085).
+3. **Should `epochSec` measure the preamble directly rather than as time-to-first-report?** The device
+   reports every ~9 spp, so its first report lands well into the gather; extrapolating two reports
+   back to the sample axis gives 4.128 s against the naive 4.256 s. **Only a 3 % difference on this
+   scene, so this is a correctness tidy-up and not a fix** — it was implemented, measured, found not
+   to matter, and reverted.
+
+**A caution recorded from the attempt.** The first version of (3) left `epochSec` at 0 until a second
+report arrived, and `elapsed >= 0` is trivially true — so every epoch ended at its first report. That
+produced "9 independent light-side realizations" and a 5.66x variance win that looked like a triumph
+and was really the epoch loop degenerating into one epoch per progress callback. It was caught by
+instrumenting `epochSec` after the 6x slowdown looked disproportionate to the policy it claimed to
+implement. **A variance improvement bought by an unexplained slowdown is a bug until the cost is
+accounted for.**
 
 ### STALE-LIMITATION AUDIT (2026-09-13) — documented limitations are less re-tested than open bugs
 
