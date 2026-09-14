@@ -31,6 +31,7 @@
 #include <cmath>
 #include "render.h"
 #include "photonbeams.h"
+#include "volcache.h"   // VOLCACHE prototype (flag-gated; unused unless FTRACE_VOLCACHE)
 
 // The default weight: every beam hit counts once, in full. This is mode M, where the beam
 // map IS the estimator and there is no second technique to share with.
