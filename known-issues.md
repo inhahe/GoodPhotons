@@ -3665,16 +3665,28 @@ energy is not a fix in a renderer whose point is that the numbers mean something
 every normal render uses): energy 0.99872 -> 0.99705, per-region chroma within 1.4 %, mean absolute
 difference 0.9 % of level.
 
-**STILL OPEN, deliberately: `clampFireflies` exempts the worst fireflies.** The guard reads
-`if (c > lim && lim > 0.0)`, and `lim = k * n1` where `n1` is the SECOND-brightest neighbour -- so a
-lone bright pixel whose eight neighbours are all black has `lim == 0`, the test fails, and it is
-never clamped. An all-black neighbourhood is the strongest evidence a pixel can offer that it is a
-single lucky path, and it is treated as an exemption. It also contradicts the flag's documented
-rule ("clamp to k x the 2nd brightest neighbour", which is 0 here). **Not changed**, because the
-measurement above shows removing the guard costs 8.5 % of the frame's energy on a noisy render, and
-choosing between an artifact and a bias needs a decision about what `-fireflies` is FOR, not a
-patch. A middle ground (clamp to a robust local scale rather than to zero) is the obvious next
-design, and is not attempted here.
+**NOT A DEFECT, MEASURED: `clampFireflies`'s `lim > 0.0` guard is load-bearing.** The guard means
+a lone bright pixel whose eight neighbours are all black (`n1 == 0`, so `lim == 0`) is never
+clamped, which looks exactly like a bug -- the strongest evidence of a firefly treated as an
+exemption, and contrary to the flag's own documented rule. It was tested three ways:
+
+| frame | raw max | guard (shipped) | guard removed | frame-percentile gate |
+|---|---:|---:|---:|---:|
+| spp 8, bc40k | 1318 | **-0.30 %** | -9.13 % | -9.12 % |
+| spp 32, bc40k | 428.8 | **-2.56 %** | -5.15 % | -5.14 % |
+| spp 8, bc200k | 1318 | **-0.26 %** | -9.03 % | -9.02 % |
+
+**Clamping those pixels costs 5-9 % of the frame's luminance, and it does not shrink with spp.**
+The percentile gate was written on the theory that the loss came from clamping many MODERATE
+pixels and that restricting the clamp to frame-level outliers would be nearly free. It is not: it
+reproduces the full loss, which proves the opposite of the theory -- **a handful of extreme
+fireflies genuinely carry ~9 % of a noisy frame's energy.** That is heavy-tailed MC noise behaving
+normally, not a bug to route around.
+
+So the guard preserves the estimator's mean, and removing it would darken a 600-frame sequence by
+5-9 % -- an exposure shift, which is worse than a few bright dots. **It stays.** What made the
+unclamped firefly harmful was the lattice amplification, and that is fixed above: it is now a
+single bright pixel rather than the kernel's point-spread function painted across the image.
 
 **Separately: `-denoise-luma` remains unsuitable for `gallery_rain` at any tolerance tested.** With
 the lattice gone it still over-smooths -- the hamster and the glass sphere lose their shape at
