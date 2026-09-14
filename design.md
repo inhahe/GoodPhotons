@@ -3428,8 +3428,13 @@ as the one at fault.
   bins were built (`FTRACE_VOLCACHE_SH=1`, Legendre moment `g^l` per band). **Measured not to
   help** -- the cached component is order >= 2, which diffusion has already made nearly isotropic
   -- so the default stays the scalar `l = 0` reconstruction, which is as accurate and 9x smaller.
-  `build()` still refuses a **rainbow** phase (a wavelength-dependent Airy table, not HG),
-  **heterogeneous** media, and media that disagree on `sigma_t` or `g`. See known-issues, VOLCACHE, for the scope
+  Since 0.302.0 it serves **heterogeneous** media too (optical depth is integrated along the
+  chord rather than assumed) and keeps **one grid per medium**, so a scene can be partially
+  cached -- `gallery_rain` caches its HG cloud while its `phase rainbow` rain stays as beams.
+  `build()` still refuses a **rainbow** phase (a wavelength-dependent Airy table, not HG).
+  The split is **host-only** and refuses to run when the device will gather, because the march
+  has no device twin; and the march is clipped to each grid's box, not to the camera ray, since
+  a ray that hits nothing is handed `tMax = 1e30`. See known-issues, VOLCACHE, for the scope
   limits and for the cache-ownership bug that made its first measurement meaningless.
 
 - **`surfmerge.h`** (0.258.0) — the **surface photon map mode `J` merges against**, i.e. the

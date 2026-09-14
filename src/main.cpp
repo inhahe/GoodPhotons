@@ -23467,6 +23467,7 @@ static int run(int argc, char** argv) {
         // match is the RENDER, and it does.
         const bool meterBeamsGpu = g_beamGather && !scene.media.empty();
         if (meterGpu && cudaPhotonMapSupported(scene)) {
+                volCacheHostGather() = false;   // device gather has no volcache march
             bool allM = true, allPinhole = true;
             for (const auto& mc : cams) {
                 if (mc.mode != 'M')    allM = false;
@@ -24093,6 +24094,7 @@ static int run(int argc, char** argv) {
             // user is told what is actually happening by warnBeamsGrinMedia() instead.
             if ((wantGpu || wantAuto) && allPinhole &&
                 cudaAvailable() && cudaPhotonMapSupported(scene)) {
+                volCacheHostGather() = false;   // device gather has no volcache march
                 std::vector<Camera> cams; std::vector<int> rxs, rys;
                 for (int i : idx) { cams.push_back(toRender[i].cam); rxs.push_back(toRender[i].res); rys.push_back(toRender[i].resY); }
                 std::printf("[camera] shared photon map (mode M) on %s: %zu cameras, %lld "

@@ -1552,6 +1552,48 @@ DISAGREE on `sigma_t` or `g`: one grid carries one pair of both, and the previou
 took the LAST enabled medium's `sigma_t` and applied it to every beam -- an error that reads as a
 soft bias rather than as a failure.
 
+**HETEROGENEOUS MEDIA AND PER-MEDIUM GRIDS (v0.302.0), plus TWO REAL BUGS THE WORK EXPOSED.**
+Two gates are gone. Optical depth is now INTEGRATED along the chord the splat is already walking
+(midpoint rule, one extinction evaluation per step, with the prefix `[0, s0]` marched but not
+splatted so a sub-beam attenuates from its PARENT origin) instead of assuming `exp(-sigma_t s)`.
+And there is now ONE GRID PER MEDIUM, so a scene can be PARTIALLY cached: `gallery_rain` caches
+its HG cloud while its `phase rainbow` curtain stays as real beams -- which a single shared grid
+could not express at all, and which also retires the "media must agree on sigma_t and g" gate.
+
+**BUG 1, latent since v0.300.0: the deposit split ran on the DEVICE, where nothing marches it.**
+`volCacheSplit` is called from `buildBeamMap`, which is host code that runs whatever backend will
+gather; the march lives in `beamgather.h` and has **no device twin** (zero volcache symbols in
+`render_cuda.cu`). So `FTRACE_VOLCACHE_SPLIT=1 -device gpu` erased the order >= 2 chords and
+nothing ever added them back. Measured on `gallery_rain`: the cloud lost **72 %** of its energy.
+Every earlier validation was `-device cpu`, which is exactly why it survived. Guarded now by
+`volCacheHostGather()`, cleared in the CUDA branches.
+
+**BUG 2, latent since v0.299.0: the march missed the medium entirely on any ray that escaped.**
+`photonmap_render.h` hands the gather `dSeg = h.valid ? h.t : 1e30` -- a ray that hits nothing
+gets `tMax = 1e30`. The march divided *that* into 64 steps, so every sample sat ~1e28 away and
+the cache contributed **nothing** to any pixel seeing sky. That is most of a cloud silhouette.
+It stayed invisible through every earlier test because those scenes are **closed boxes where
+every ray hits a wall**. The march is now clipped to each grid's own box (`VolCache::raySpan`),
+which is both correct and strictly better sampling -- the 64 steps land where the medium is.
+
+Effect of fixing them, `gallery_rain` on the CPU, cloud cached and rain kept as beams:
+
+| | before | after |
+|---|---:|---:|
+| cloud crop vs uncached | 0.2762 | **1.0679** |
+| whole ROI vs uncached | 0.9270 | **1.0088** |
+
+and `_bms96` regression holds at 1.0019 (was 1.0026).
+
+**But it does NOT make `gallery_rain` faster, and that is the honest bottom line.** Paired, warm-up
+discarded: **0.980, 0.982** -- a 2 % gain, against **64 %** on a fully-cacheable single-medium
+scene. The reason is structural: only **22.7 %** of chords are cacheable here, because the rain
+(141 k chords against the cloud's 118 k) carries a `phase rainbow` and is refused, and the march
+costs about what the removed traversal saved. **Caching helps in proportion to the share of the
+medium it is allowed to take**, and on this scene that share is small. Making it pay would need
+the rainbow phase cacheable -- its Legendre moments by quadrature per CIE channel -- which is the
+next real piece of work and is not done.
+
 **Still open before this could ship as a real feature.** The `res` is fixed by hand and the error
 stops improving past ~48 (finer cells have less bias but fewer samples each). There is no confidence
 gate, no validation path and no adaptive resolution. Anisotropic media need directional bins
