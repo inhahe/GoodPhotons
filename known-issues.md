@@ -3665,6 +3665,17 @@ energy is not a fix in a renderer whose point is that the numbers mean something
 every normal render uses): energy 0.99872 -> 0.99705, per-region chroma within 1.4 %, mean absolute
 difference 0.9 % of level.
 
+> **CORRECTION (2026-09-15, v0.306.1): that "no regression" claim was wrong, and wrongly
+> *measured*.** The chroma-only default had the SAME artifact, and this fix is part of why —
+> see the v0.306.1 entry below. The three quantities above are all *aggregates* (energy,
+> region-mean chroma, mean absolute difference), and a lattice is a **spatial pattern at a
+> known spatial frequency**: it moves the mean by almost nothing while being glaring on
+> screen. The check could not have detected what it was claiming the absence of. It was also
+> run on `gallery_rain` frame 0, a front-lit gallery whose worst firefly is ~1300x the median,
+> where the backlit cloud reaches **6878x** — so the one arm most likely to break was tested
+> at a third of the provocation. The lesson is filed under the audit note at the top of this
+> file: *an aggregate cannot falsify a claim about structure.*
+
 **NOT A DEFECT, MEASURED: `clampFireflies`'s `lim > 0.0` guard is load-bearing.** The guard means
 a lone bright pixel whose eight neighbours are all black (`n1 == 0`, so `lim == 0`) is never
 clamped, which looks exactly like a bug -- the strongest evidence of a firefly treated as an
@@ -3727,6 +3738,82 @@ On CPU with the split working (37.9 % of chords routed), the cloud crop moved ch
 0.0918 and HF 0.1150 -> 0.1098 -- nothing. The cloud's visible colour lives in the **order-1**
 beams, which are never cacheable; the cache only ever takes order >= 2. So a device port of the
 march would buy the ~4-5 % speed already measured and no image-quality improvement on that scene.
+
+### FIXED (2026-09-15, v0.306.1): the a-trous CHROMA gather printed the kernel's point-spread function as a lattice of coloured dots — the median-guide fix for the luma path is what let it in
+
+**Reported as** *"there's a grid of dots in the cloud that changes color as the cloud is being
+viewed from behind"*, on the `gallery_rain` behind-the-cloud flyby. Same artifact family as the
+v0.305.0 entry above, in the channel that entry declared clean.
+
+**Isolation.** Four arms on one frame, everything else held:
+
+| arm | lattice |
+|---|---|
+| no post-pass | no |
+| `-fireflies 4 -denoise-chroma 0` (clamp only) | no |
+| `-denoise` (chroma filter only) | **yes** |
+| `-fireflies 4` (implies `-denoise`) | **yes** |
+
+So: not the firefly clamp, not the renderer. The chroma gather alone.
+
+**The mechanism, and it is an interaction between two correct-looking defences.** The gather is
+luma-weighted, which is right and deliberate — `a_out = sum_k w_ik (R-G)_k / sum_k w_ik Y_k`, so a
+near-black pixel with an enormous chroma RATIO contributes nothing instead of dominating. But it
+guards only one tail. **Nothing stops a very BRIGHT tap**, which dominates numerator and
+denominator alike, driving `a_out -> a_bright`. And the weights come from the **3x3-median guide
+added in v0.305.0**, whose whole purpose is to make a lone spike look ordinary to the edge-stop —
+so the spike is accepted at *full* weight, while the sums still reach for the raw `Y[k]`. **The
+defence against the lattice in luma is exactly what opens it in chroma.**
+
+Measured on the backlit cloud, 128 spp:
+
+| patch | brightest px | Y | its 3x3 median | ratio |
+|---|---|---:|---:|---:|
+| upper | (160, 55) | 3448 | 0.50 | **6878x** |
+| lower | (157, 99) | 1417 | 0.17 | **8120x** |
+
+Both isolated (all eight neighbours ~0.4), both with a lattice patch centred on them. **That one
+pixel carries 37.7 % of the entire frame's luminance**; the top ten carry 70.9 %. At ~7000x every
+other tap, `sa/syc` collapses to its hue across the whole kernel support — the a-trous tap pattern,
+printed into the image at strides 1, 2, 4.
+
+**The fix: cap the chroma TRUST weight at `trust` (4.0) x the tap's own 3x3-median luma.** It is a
+no-op for any pixel that is not an outlier (there `Y <= 4*median` already), and it cannot touch
+luma — `fromYcc` reconstructs Y exactly whatever the chroma is (verified: max |dY| 1.7e-5 against a
+frame max of 3448, energy ratio 1.00000000).
+
+**It is not a trade — it is also the accuracy optimum.** Swept against an 8192 spp reference of the
+same frame, developed through the renderer's own tone map. `lattice` is mean |chroma| on a-trous tap
+offsets over the same off-tap quantity, in a window centred on the firefly; ~1 means no preference
+for tap positions (the reference itself scores 0.981, the raw frame 1.015):
+
+| trust | luma RMSE | chroma RMSE | PSNR | lattice |
+|---|---:|---:|---:|---:|
+| no denoise | 11.673 | 36.435 | 23.06 | 1.015 |
+| **0 (old)** | 11.715 | 18.913 | 25.34 | **1.731** |
+| 1 | 11.763 | 17.903 | 25.46 | 1.051 |
+| 2 | 11.750 | 17.453 | 25.57 | 0.985 |
+| **4 (shipped)** | 11.744 | **17.358** | **25.60** | **0.933** |
+| 8 | 11.727 | 17.544 | 25.59 | 0.933 |
+| 16 | 11.712 | 17.838 | 25.54 | 0.969 |
+| 64 | 11.710 | 18.390 | 25.46 | 1.081 |
+
+Chroma error **-8.2 %** and PSNR **+0.26 dB** against the old behaviour, with luma flat across the
+whole sweep. Both ends degrade — too tight (1) still leaves a lattice, too loose (64) returns toward
+the old value — so 4 is a genuine interior optimum rather than a threshold, and the knob is
+insensitive across 2-8. Left unexposed for that reason; `trust = 0` restores the old behaviour.
+
+**No regression on real colour, which was the obvious risk** — a cap on bright-pixel trust could
+desaturate the scene's one genuinely coloured caustic. Tested on the axicon frame: within the raw's
+top-1 % most saturated pixels, chroma retention is **96.7 % both with and without the cap**, and only
+1.33 % of the frame moves by more than 2 levels. The cap finds outliers, not features.
+
+**Method note, since this is twice now.** Both lattices were found by a human looking at the image,
+and both times the aggregate checks in place said nothing was wrong. The metric added here
+(`scraps/dnscore.py`) tests the *pattern* rather than the mean, which is the only kind of check that
+could have caught either one. `scraps/dntest.cpp` — the standalone harness that runs `denoise.h` on a
+PFM with no GPU in the loop — is what made the sweep above cheap enough to do properly; the whole
+investigation after the first render was CPU-only.
 
 ### STALE-LIMITATION AUDIT (2026-09-13) — documented limitations are less re-tested than open bugs
 

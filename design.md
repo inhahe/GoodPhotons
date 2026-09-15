@@ -4617,10 +4617,19 @@ as the one at fault.
   `fromYcc`, since clamping a negative channel to 0 *adds* light). Chroma is *stored* as a
   ratio to luma (scale-free across ~4 decades) but **averaged luma-weighted**, `Σw(R−G) /
   ΣwY` — averaging the ratios instead lets near-black pixels with wild ratios dominate,
-  which turned per-pixel speckle into coherent purple/orange blobs. `levels` and `chroma`
-  were swept against the reference: the optimum is a plateau at **2–3 levels**, not SVGF's
-  5, because with no luma term holding the edges a wide chroma support bleeds colour across
-  material boundaries (by 7 levels it is a net loss).
+  which turned per-pixel speckle into coherent purple/orange blobs. That weight guards only
+  one tail, and **the other one bit** (v0.306.1): nothing stopped a very *bright* tap, which
+  dominates numerator and denominator alike so the result collapses to its hue. The 3×3
+  **median** guide — added to stop the *luma* scatter printing the kernel as a lattice — is
+  what made it fatal, because a median is designed to make a lone spike look ordinary to the
+  edge-stop, so the spike was accepted at full weight while the sums still used the raw `Y`.
+  **Each defence disarmed the other**, and the same lattice reappeared in chroma. The weight
+  is now capped at `trust` (4.0) × the tap's own median luma, which is a no-op for any
+  non-outlier; swept against the 8192 spp reference it is simultaneously the chroma-error
+  minimum (−8.2 %) and the PSNR maximum (+0.26 dB), so it removed a bias rather than trading
+  one off. `levels` and `chroma` were swept against the reference too: the optimum is a
+  plateau at **2–3 levels**, not SVGF's 5, because with no luma term holding the edges a wide
+  chroma support bleeds colour across material boundaries (by 7 levels it is a net loss).
 - **`materials.h` / `pattern.h` / `texture.h` / `layered`** — BSDFs (diffuse,
   mirror, glossy, dielectric w/ nested IOR, diffuse-transmission, filter gels,
   fluorescence, layered), procedural patterns (POV-derived `pov_noise.h` /

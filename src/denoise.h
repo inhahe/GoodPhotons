@@ -91,6 +91,9 @@ struct Params {
     int    levels    = 3;      // a-trous levels; support is 2^levels taps wide
     double fireflies = 0.0;    // >0: clamp isolated outliers to this multiple of the
                                //     neighbourhood's 2nd-brightest luma (0 = off)
+    double trust     = 4.0;    // cap on a tap's chroma TRUST weight, as a multiple of its
+                               //     own 3x3-median luma (0 = uncapped, the old behaviour).
+                               //     See the chroma gather in apply() for what it prevents.
     // fireflies counts: `-denoise-chroma 0 -fireflies 3` is a legitimate ask (clamp the
     // outliers, filter nothing), and without it here that combination would silently no-op.
     bool valid() const { return fireflies > 0.0 || (levels > 0 && (luma > 0.0 || chroma > 0.0)); }
@@ -375,9 +378,35 @@ inline void apply(std::vector<Vec3>& img, int W, int H, const Params& p) {
                 double sy = 0, sa = 0, sb = 0, syc = 0;
                 forEachTap(i, j, [&](size_t k, double wl, double wc) {
                     if (DL[k] > 0) sy += wl * (Y[k] / DL[k]);
-                    sa  += wc * A[k] * Y[k];   // w * (R-G)
-                    sb  += wc * B[k] * Y[k];   // w * (B-G)
-                    syc += wc * Y[k];
+                    // THE TRUST WEIGHT MUST BE ROBUST, AND Y[k] IS NOT.
+                    //
+                    // Weighting by luma is right in principle -- a brighter pixel's hue is
+                    // better determined -- but it assumes brightness means convergence, and
+                    // for a firefly it means the opposite. Worse, the 3x3-MEDIAN guide added
+                    // above to cure the luma-scatter lattice is precisely what makes this
+                    // fatal: the median hides a single-pixel spike from the EDGE-STOP (its
+                    // guide equals its neighbours', so d ~ 0 and the tap is accepted at FULL
+                    // weight) while these sums still reach for the raw Y. The one defence
+                    // cancels the other.
+                    //
+                    // Measured on the backlit cloud of gallery_rain frame 555 (128 spp): one
+                    // pixel at Y = 3448 whose eight neighbours were all ~0.4, i.e. 6878x its
+                    // own 3x3 median and 37.7% of the ENTIRE FRAME's luminance. It outweighed
+                    // every other tap by ~7000x, so `sa/syc` collapsed to that pixel's hue for
+                    // every pixel in the kernel's support -- printing the a-trous tap pattern
+                    // itself into the image as a lattice of coloured dots at strides 1, 2, 4.
+                    // Two such spikes produced two lattice patches. It is the SAME failure the
+                    // median guide fixed for luma, re-entering through the chroma channel.
+                    //
+                    // Capping at `trust` x the pixel's own median is a no-op for every pixel
+                    // that is not an outlier (there Y <= trust*median already), so it disarms
+                    // spikes without touching ordinary structure, and it cannot affect luma at
+                    // all -- fromYcc reconstructs Y exactly whatever the chroma is.
+                    const double yw = (p.trust > 0.0)
+                                    ? std::min(Y[k], p.trust * guide[k]) : Y[k];
+                    sa  += wc * A[k] * yw;   // w * (R-G), at the capped trust weight
+                    sb  += wc * B[k] * yw;   // w * (B-G)
+                    syc += wc * yw;
                 });
                 Yo[idx] = (p.luma > 0.0) ? sy : Y[idx];
                 Ao[idx] = (p.chroma > 0.0 && syc > 1e-12) ? sa / syc : A[idx];
