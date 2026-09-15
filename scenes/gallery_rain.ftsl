@@ -44,6 +44,34 @@
 # Behind the bow is black sky and a ground plane whose lit component is ~5% albedo, which is
 # a darker backdrop than any shaded wall was, so the whole limb now reads.
 #
+# THE SUN IS NOW AT ELEVATION 20, NOT 45, and that is a deliberate revision of the above --
+# the paragraph is kept because its geometry is still how the bow works, but its ANSWER is
+# superseded. Three independent measurements moved it, and the third was a surprise:
+#
+#   * BACKLIT GEOMETRY. A camera that sees the cloud with the sun behind it must sit on the
+#     line `cloud - d*sun`, i.e. at y = 2.82 - d*sin(elev). At 45 deg a 5 m standoff is
+#     y = -0.72 -- underground. At 20 deg it is y = +1.11, a normal eye height. The whole
+#     behind-the-cloud arc of the `fly` curve is only reachable at all at a low sun.
+#   * CAUSTICS. Sweeping elevation and counting photons that actually reach the gather:
+#     45 deg filled 11.9% of the gather target, 30 deg 15.5%, 20 deg 17.5%.
+#   * THE BOW ITSELF GOT BETTER, which is the surprise, since this scene's sun was
+#     originally solved FOR the bow. scraps/bowcheck.py walks all 1147 cameras, samples the
+#     42 deg circle, and counts directions that are simultaneously in frame, on rain, and
+#     on rain the sun can actually reach. Summed over the flyby (frame-equivalents of full
+#     circle): 45 deg -> 53.9, 40 -> 57.3, 35 -> 60.9, 30 -> 63.7, 25 -> 65.8, 20 -> 67.7.
+#     Monotone, +26% at 20 deg, saturating by 15.
+#     The mechanism is that THE CLOUD SHADOWS ITS OWN RAIN. The shaft falls directly out of
+#     a sigma_t 2.78 cloud, so a steep sun has to come down THROUGH the cloud to light the
+#     drops, while a low sun reaches in under its edge from the side. The old solver could
+#     not see this: scraps/bowgeom.py models the sealed-room edition, whose walls and roof
+#     slot no longer exist, and it treated the rain as lit-or-not by the opening alone.
+#   * The cost is small. Dropping 45 -> 20 deg dims the scene to 79%, not the cos-law 48%,
+#     because the 11000 K skylight panel below carries most of the fill.
+#
+# Side effect worth knowing: the bow's top is at 42 - elev, so it rises from -3 deg (below
+# the horizon, i.e. only ever seen against the ground plane) to +22 deg -- above the horizon,
+# against the black sky, which is the darkest backdrop this scene has.
+#
 # --- Why the rain is 300 um at dispersion 0.577 -------------------------------------
 # The first version asked for `droplet_um 500` with the default supernumerary train and the bow
 # came out as a WIDE WHITE ARC with only a thin coloured fringe on its rim. That is the model
@@ -2388,7 +2416,7 @@ mesh "alice" { file "meshes/alice.glb"  material alice_unpainted
 #   intensity = 1000 / sum_360^830 planck(5800 K, lambda) dlambda = 9.2649e-14
 # (`light sun` takes an IRRADIANCE, not a `power` — a distant light's flux depends on the
 # scene's cross-section, so absolute `power` is rejected by the parser.)
-light sun { dir -0.1470 0.7071 0.6916   angle 0.53   spd blackbody 5800   intensity 9.2649e-14 }
+light sun { dir -0.1954 0.3420 0.9192   angle 0.53   spd blackbody 5800   intensity 9.2649e-14 }
 
 # --- (2) SKY (the only fill left) --------------------------------------------------
 # Direct sun alone would leave every -y and -z face of every piece at literally zero, and
@@ -2936,11 +2964,7 @@ prefer {
 # figure eight -- down the centre, right to the orb and the bottle, left and back behind the
 # ring, then forward again up the left-centre -- so it never retraces its own path either.
 camera_curve "fly" {
-    # START — the ESTABLISHING SHOT. See WHERE THE LOOP STARTS above: these two points used
-    # to be the last two on the list, and the loop is a closed centripetal Catmull-Rom, so
-    # moving them to the front rotates the PHASE without moving the curve by a millimetre.
     point 5.32   2.28  8.55     # START — apex of the closure arc: the loop's furthest-back
-                                # (z 8.55), highest-looking-in point, aimed -z down the hall
     point 5.05   2.16  8.15     # turn onto the centre line, already heading -z
     point 5.00   2.10  7.35     # front-high, centre line — LEVEL, then the dive begins
     point 4.98   1.85  7.10     # descend the centre line
@@ -2958,6 +2982,61 @@ camera_curve "fly" {
     point 6.45   1.308 4.40     # THROUGH THE FUR CREATURE — nose to tail
     point 6.946  1.308 4.162    # coat exit, out over the tail brush
     point 7.35   1.45  4.09     # climb out and swing toward the orb
+
+    # ---- BEHIND THE CLOUD ------------------------------------------------------------
+    # A closed circuit out around the rain and back, whose reason for existing is the four
+    # points marked BACKLIT: it is the only part of the flight that sees the cloud with the
+    # sun BEHIND it, which is the one view that shows what all the multiple scattering is
+    # doing. Everywhere else in the loop the cloud is lit from the camera's side and reads
+    # as a white lump.
+    #
+    # Three things about it are load-bearing and easy to undo by accident:
+    #
+    #  1. IT IS GRAFTED HERE, after the run-in to the orb, because this is the one place the
+    #     loop is already heading +x. Hung off a -x,-z tangent instead, Catmull-Rom swerves.
+    #     It departs +x and returns +x, so the orb set-piece below is untouched.
+    #  2. THE BACKLIT POINTS ARE COMPUTED, NOT EYEBALLED. They are `cloud - d*sun` for
+    #     d = 6.5, 5, 4, 3 with cloud = (8, 2.82, 2). Being ON that line is not what aims the
+    #     camera -- a `point` curve looks along its TANGENT, and Catmull-Rom's tangent is
+    #     (p[i+1] - p[i-1])/2, which for evenly-spaced collinear points comes out parallel
+    #     to the sun vector. That is what puts the cloud on the optical axis with the sun
+    #     exactly behind it. Measured over the real frame placement: 219 frames (7.3 s) with
+    #     the cloud in frame and the sun within 25 deg of it, and frame 555 has it 0.1 deg
+    #     off-axis at 4.00 m. MOVING THE SUN INVALIDATES THESE FOUR POINTS.
+    #  3. THE TAIL DESCENDS on purpose. Carried straight on it would pass 1.21 m from the
+    #     cloud's centre, and the cloud's majorant grid is 2.73 x 1.70 x 2.66 m about that
+    #     centre -- i.e. inside sigma_t 2.78 fog, an instant white-out. Dropping to y ~1.3
+    #     puts it ~0.7 m under the cloud's underside and inside the RAIN (sigma_t 0.35),
+    #     which is the medium worth flying through, looking up-sun at it.
+    #
+    # `frames` and every `density_at` below were recomputed when this was inserted: the keys
+    # are in NORMALISED ARC LENGTH, so adding 24.7 m of path slides all of them, and `frames`
+    # is a TOTAL, so leaving it at 600 would have sped the whole flythrough up. See the
+    # density_at note below the points.
+    point 8.55    1.55   4.1       # east, out past the orb
+    point 9.9     1.45   3.6       # curving south around the rain's east face
+    point 10.9    1.32   2.4       # clear of the rain box (x > 9.5)
+    point 11.35   1.15   0.9       # due south; this leg's x sets the turn's radius
+    point 11.3    0.98   -0.85  
+    point 11.05   0.85   -2.45     # open ground south of the rain -- nothing behind but black sky
+    point 10.6    0.7    -3.8      # the sweep west begins
+    point 10.05   0.58   -4.75  
+    point 9.55    0.54   -5.05     # southernmost -- heading west, about to turn north
+    point 9.27    0.6    -3.97     # BACKLIT d=6.5 -- on the line, now pointed straight down it
+    point 8.98    1.11   -2.6      # BACKLIT d=5
+    point 8.78    1.45   -1.68     # BACKLIT d=4
+    point 8.59    1.79   -0.76     # BACKLIT d=3 -- cloud fills the frame, sun dead behind it
+    point 8.5     1.85   -0.3      # peel off, dropping UNDER the cloud rather than into it
+    point 8.3     1.55   0.55      # below the underside, entering the backlit rain
+    point 8       1.3    1.45      # under the cloud, inside the shaft, looking up-sun
+    point 7.55    1.22   2.4       # through the shaft
+    point 7       1.35   3.3       # out the north side
+    point 6.45    1.55   4.15      # swing west
+    point 6.4     1.68   4.85      # turn east
+    point 6.95    1.68   5         # heading east
+    point 7.42    1.6    4.6       # curve back, hand to the orb run-in
+    # ---- end of the cloud circuit; hands back to the orb run-in ----
+
     point 7.62   1.62  4.02     # final approach, dropping onto the orb's centre
     point 7.70   1.70  3.95     # THROUGH THE GLASS ORB
     point 7.62   1.58  3.58     # out the far side, looking down its own caustic
@@ -2985,37 +3064,35 @@ camera_curve "fly" {
     point 4.95   2.62  6.55     # over the gold gyroid (its clip tops out at y=2.11)
     point 5.35   2.55  7.45
     point 5.55   2.42  8.15     # out past the front of the hall — hands back to the START,
-                                # which is the same closure ARC it always was, not a fold
-    up 0 1 0   fov_y 70   mode D   frames 600
-    fps 30                         # 600 frames -> 20 s
-    look tangent
-    spline centripetal
-    # Stops are ARC-LENGTH fractions straight off scraps/_flyplan.py, which is what
-    # `density_at` has taken since 0.155.0 (before that the loader silently read them as
-    # control-point-INDEX fractions -- see CLEARANCE above).
+    up 0 1 0   fov_y 70   mode D   frames 1147
+    fps 30                         # 1147 frames -> 38.2 s
     #
-    # EVERY STOP BELOW IS THE OLD ONE + 0.0555, because the phase rotation moved t=0 back to
-    # what used to be arc-t 0.9445. That shift is not cosmetic and it is not optional: these
-    # numbers name POSITIONS ON THE CURVE, so leaving them alone would have slid every dwell
-    # 5.6% of the loop (1.33 m) off its beat -- the creature pass would start inside the
-    # gyroid channel's exit. tools/flyphase.py --rotate computes the shifted list.
+    # 600 -> 1147 IS NOT A ROUND-UP, IT IS WHAT HOLDS THE FLYTHROUGH'S SPEED. `frames` is a
+    # TOTAL and `density_at` only distributes it, so leaving 600 across a path that grew
+    # 23.9 m -> 48.6 m would have flown the ORIGINAL gallery section at twice its authored
+    # pace. Holding that section's frame spacing exactly requires
+    #     N_new / C_new = N_old / C_old,  where C = INT rho ds
+    # and with the detour's own densities below that gives C 321.1 -> 614.1, hence 1147.
+    # So the number falls out of the pacing; it is not a free parameter. If you change any
+    # rho below, recompute it the same way or the gallery will drift off its beat.
     #
-    # The beats for these 45 points / 23.87 m are now: gyroid channel 0.104..0.170,
-    # CREATURE COAT 0.236..0.282, orb 0.320, klein 0.408, ring 0.663, crystal gyroid 0.778,
-    # gold gyroid overflight 0.907. The creature gets the highest density on the loop (26)
-    # and holds it FLAT across the whole pass rather than peaking at the middle: 53 frames /
-    # 1.8 s at 21 mm per frame, so the coat crosses the lens slowly enough to be read as
-    # individual fibres.
-    #
-    # 6.89 at the ends is the old track's value AT the new start (it interpolated 6 -> 8
-    # across old 0.900..1.000, and 0.9445 lands 44.5% along), so the wrap stays continuous:
-    # the loop's slowest, widest cruise runs straight through frame 0, which is what an
-    # establishing shot wants.
-    density_at 0.000 6.89  density_at 0.055  8  density_at 0.105 20  density_at 0.167 20
-    density_at 0.205 10    density_at 0.235 26  density_at 0.281 26  density_at 0.300 12
-    density_at 0.319 22    density_at 0.355 14  density_at 0.407 24  density_at 0.455 10
-    density_at 0.555  6    density_at 0.662 20  density_at 0.735 10  density_at 0.777 14
-    density_at 0.855  8    density_at 0.955  6  density_at 1.000 6.89
+    # AND THE t VALUES BELOW ARE NORMALISED ARC LENGTH, NOT CONTROL-POINT INDEX (ftsl.h
+    # walks the spline twice for exactly this reason -- see its comment). That is why every
+    # key here was re-solved rather than left alone: inserting the cloud circuit at point 18
+    # slides every downstream key, and a key that no longer sits on its feature is a dwell
+    # spent on empty floor. The detour's own keys run 7 (open ground, nothing to look at)
+    # up to 24 on the backlit leg, which is the slowest motion anywhere in the scene.
+    density_at 0.0000 6.89  density_at 0.0270 8  density_at 0.0515 20  density_at 0.0819 20
+    density_at 0.1006 10  density_at 0.1153 26  density_at 0.1379 26  density_at 0.1473 12
+    density_at 0.1720 8  density_at 0.2019 7  density_at 0.2343 7  density_at 0.2668 7
+    density_at 0.3029 7  density_at 0.3363 8  density_at 0.3657 9  density_at 0.3884 11
+    density_at 0.4017 14  density_at 0.4248 20  density_at 0.4554 24  density_at 0.4760 24
+    density_at 0.4965 22  density_at 0.5063 18  density_at 0.5253 16  density_at 0.5454 15
+    density_at 0.5671 13  density_at 0.5889 9  density_at 0.6101 7  density_at 0.6252 7
+    density_at 0.6375 7  density_at 0.6505 8  density_at 0.6660 22  density_at 0.6836 14
+    density_at 0.7091 24  density_at 0.7326 10  density_at 0.7817 6  density_at 0.8342 20
+    density_at 0.8700 10  density_at 0.8906 14  density_at 0.9289 8  density_at 0.9779 6
+    density_at 1.0000 6.89
     closed
     exposure_lock
     film { res 960 540   exposure 0.25 }
