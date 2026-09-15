@@ -277,8 +277,13 @@ inline void volCacheBuildAll(const Scene& sc, const BeamMap& bm) {
     };
     std::vector<VolCache>& cs = vcstate::caches();
     cs.assign(sc.media.size(), VolCache{});
+    const bool vdiag = std::getenv("FTRACE_VOLCACHE_DIAG") != nullptr;
+    if (vdiag) std::fprintf(stderr, "[vcdiag] buildAll: %zu media, %zu beams\n",
+                            sc.media.size(), bm.beams.size());
     for (size_t mi = 0; mi < sc.media.size(); ++mi) {
         const Medium& m = sc.media[mi];
+        if (vdiag) std::fprintf(stderr, "[vcdiag]   med %zu: enabled=%d rainbow=%d g=%.3f\n",
+                                mi, (int)m.enabled, (int)m.rainbow(), m.g);
         if (!m.enabled) continue;
         if (m.rainbow()) {
             // Pick the emitter whose gather-time-fold beams this medium actually carries. One
@@ -292,7 +297,10 @@ inline void volCacheBuildAll(const Scene& sc, const BeamMap& bm) {
                     pb.order != kBeamOrderUnknown && (int)pb.order >= 2) { em = pb.emIdx; break; }
             }
             const Scene::BowLut* lut = (em >= 0) ? sc.bowLut(em, (int)mi) : nullptr;
-            if (!lut || !lut->valid()) continue;      // no fold to cache: keep every beam
+            if (!lut || !lut->valid()) {
+                if (vdiag) std::fprintf(stderr, "[vcdiag]   med %zu: no bow LUT (em=%d)\n", mi, em);
+                continue;                             // no fold to cache: keep every beam
+            }
             Vec3 mom[3];
             volBowMoments(*lut, mom);
             if (std::getenv("FTRACE_VOLCACHE_DIAG")) {
@@ -340,9 +348,31 @@ inline const std::vector<VolCache>& volCacheAll(const Scene& sc, const BeamMap& 
 // those. Only chords whose OWN medium got a ready grid are erased, so a partially-cacheable
 // scene keeps the rest as real beams. Returns the number of chords routed into the caches.
 inline size_t volCacheSplit(const Scene& sc, BeamMap& bm) {
-    if (volCacheRes() <= 0 || !volCacheSplitEnabled()) return 0;
+    if (volCacheRes() <= 0 || !volCacheSplitEnabled()) {
+        if (std::getenv("FTRACE_VOLCACHE_DIAG"))
+            std::fprintf(stderr, "[vcdiag] split not attempted: res=%d splitEnabled=%d\n",
+                         volCacheRes(), (int)volCacheSplitEnabled());
+        return 0;
+    }
     // Never erase beams the consuming gather cannot replace (see volCacheHostGather).
-    if (!volCacheHostGather()) return 0;
+    // SAY SO. A flag that silently does nothing is indistinguishable from one that ran and had
+    // no effect, and the difference costs real time to establish: this very guard was diagnosed
+    // twice, the second time as a suspected new bug, because the refusal left no trace. The
+    // shared mode-M path sets the same precedent for -checkpoint.
+    if (!volCacheHostGather()) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::fprintf(stderr,
+                "[volcache] FTRACE_VOLCACHE_SPLIT is set but the gather runs on the DEVICE, "
+                "which has no volcache march\n"
+                "           (zero volcache symbols in render_cuda.cu). Splitting there would "
+                "erase the order>=2\n"
+                "           chords with nothing to add them back. Ignoring the split; use "
+                "-device cpu for it.\n");
+        }
+        return 0;
+    }
     std::lock_guard<std::mutex> lk(vcstate::mtx());
     volCacheBuildAll(sc, bm);
     vcstate::builtFor() = vcstate::keyOf(bm);

@@ -3692,38 +3692,41 @@ single bright pixel rather than the kernel's point-spread function painted acros
 the lattice gone it still over-smooths -- the hamster and the glass sphere lose their shape at
 tolerance 2 and are soft at 1. The bug is fixed; the feature is still the wrong tool for this scene.
 
-### VOLCACHE is SILENTLY INERT on the device path (OPEN, 2026-09-14)
+### FIXED (2026-09-14, v0.306.0): VOLCACHE's device refusal was correct but SILENT — and the silence cost a full re-diagnosis of an already-fixed bug
 
-Every correctness measurement for the v0.300.0 deposit split and its v0.301.0/v0.303.0 successors
-was taken on `-device cpu`. On `-device gpu` the split **does not run at all**: with
-`FTRACE_VOLCACHE=48 FTRACE_VOLCACHE_SPLIT=1` set, `gallery_rain` fly150 produced **99 975 stored
-chords in both arms** -- byte-identical beam populations -- and no `volcache:` line, no `vcdiag`
-line, and no per-medium grid. `VolCache::build` never reaches `ready`.
+**RETRACTION.** The previous version of this entry was filed as OPEN, with "cause not yet
+established", claiming the deposit split was mysteriously inert on `-device gpu`. **Both claims
+were wrong, and the entry was written against a guard I had added myself earlier the same day.**
+`d470d24` already found and fixed exactly this: the split erased order >= 2 chords on the device,
+where nothing marches the cache, and the cloud lost 72 % of its energy. That commit added
+`volCacheHostGather()`, cleared in the CUDA branches, and `volCacheSplit` refuses when it is false.
 
-**The good news first, because the opposite would have been serious.** Inert is SAFE. Had the split
-erased the order >= 2 chords while the device gather (which has zero `volcache` references in
-`render_cuda.cu` -- there is no device march) went on without them, the energy would have vanished
-silently. It does not: the 0.74 % frame difference between the two arms is ordinary run-to-run
-beam-realization noise, and the sub-beam counts differ by the same order (825 244 vs 824 809).
+So the device behaviour was already correct. What remained was that the refusal **returned 0
+without a word**, which is what made it look like a new and unexplained bug: an instrumented
+re-investigation printed nothing at every probe point, because the function had returned before
+reaching any of them.
 
-**Cause not yet established.** The device beam record carries `med` (`DBeamRec::med`, an index into
-`DScene::media`), so the obvious theory -- that downloaded device beams lack a medium index and fail
-the `b.med != medOnly` filter -- is not confirmed. Diagnosing it needs a print inside
-`volCacheSplit`, which needs a rebuild, which was blocked by a long user render holding
-`ftrace.exe`.
+**Fixed by making the refusal announce itself** (once per run, to stderr): it names the reason, the
+evidence (zero volcache symbols in `render_cuda.cu`), what would go wrong if it did split, and the
+workaround (`-device cpu`).
 
-**Two things to fix when picked up:**
-1. **Say so.** A flag that does nothing must announce it. `-checkpoint` on the shared mode-M path
-   already sets this precedent; VOLCACHE should match it rather than being quietly ignored.
-2. **Then decide** whether the split should work on the device at all. It needs either a device-side
-   march (a real port) or an explicit refusal when the gather will run on the GPU. Until then the
-   feature is CPU-only in fact, and the documentation implies otherwise.
+**The rule this is the second instance of today.** `-checkpoint` on the shared mode-M path had the
+same shape and the same fix: **a flag that silently does nothing is indistinguishable from one that
+ran and had no effect.** The cost is not hypothetical -- this one was diagnosed twice, the second
+time from scratch and as a suspected regression, because there was no trace to read.
 
-**Method note.** This is the second time today the same hole appeared: validate on one backend,
-assume the other. The v0.300.0 GPU check looked only at the split's *diagnostic line*, never at the
-energy, so "the split fired" was mistaken for "the split is correct". The habit that catches it is
-cheap -- compare the beam POPULATION between arms, which is one grep and would have shown identical
-counts immediately.
+**And a process failure worth recording separately, because the fix does not prevent it.** The
+false entry was written *after* the fix, by re-deriving from symptoms instead of checking whether
+the symptom was already explained. `git log -S volCacheHostGather` would have answered it in one
+command. The habit to keep: **before filing something as OPEN, grep the history for the symptom** --
+a repo that records its own reasoning is only useful if the reasoning is consulted before it is
+duplicated.
+
+**Separately, measured while re-investigating: VOLCACHE does not fix `gallery_rain`'s cloud noise.**
+On CPU with the split working (37.9 % of chords routed), the cloud crop moved chroma 0.0872 ->
+0.0918 and HF 0.1150 -> 0.1098 -- nothing. The cloud's visible colour lives in the **order-1**
+beams, which are never cacheable; the cache only ever takes order >= 2. So a device port of the
+march would buy the ~4-5 % speed already measured and no image-quality improvement on that scene.
 
 ### STALE-LIMITATION AUDIT (2026-09-13) — documented limitations are less re-tested than open bugs
 

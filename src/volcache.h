@@ -149,8 +149,19 @@ struct VolCache {
     void build(const BeamMap& bm, int res, int minOrder, bool ok, const SigmaFn& sigmaAt,
                double g, int medOnly, const Vec3* bowMom = nullptr, int emitter = -1) {
         ready = false;
-        if (!ok) return;
-        if (bm.empty() || bm.nEmitted <= 0 || res < 2) return;
+        // Every early-out says WHY under FTRACE_VOLCACHE_DIAG. A cache that silently declines to
+        // build is indistinguishable from one that built and did nothing, and telling those apart
+        // by bisection costs far more than this does.
+        const bool diag = std::getenv("FTRACE_VOLCACHE_DIAG") != nullptr;
+        if (!ok) {
+            if (diag) std::fprintf(stderr, "[vcdiag] med %d: gate refused\n", medOnly);
+            return;
+        }
+        if (bm.empty() || bm.nEmitted <= 0 || res < 2) {
+            if (diag) std::fprintf(stderr, "[vcdiag] med %d: empty=%d nEmitted=%lld res=%d\n",
+                                   medOnly, (int)bm.empty(), (long long)bm.nEmitted, res);
+            return;
+        }
         med = medOnly;
         // Bound the grid to THIS medium's own cacheable chords, so its cells are not stretched
         // across a scene-sized box by a medium that happens to be far away.
@@ -163,7 +174,23 @@ struct VolCache {
             box.expand(b.o + b.d * ((double)b.s0 + (double)b.len));
             any = true;
         }
-        if (!any) return;
+        if (!any) {
+            if (diag) {
+                long long nMed = 0, nOrd = 0, nAch = 0;
+                for (size_t i = 0; i < bm.beams.size(); ++i) {
+                    const PhotonBeam& q = bm.beams[i];
+                    if (q.med == medOnly) ++nMed;
+                    if (q.med == medOnly && q.order != kBeamOrderUnknown &&
+                        (int)q.order >= minOrder) ++nOrd;
+                    if (q.med == medOnly && q.achro == 2) ++nAch;
+                }
+                std::fprintf(stderr, "[vcdiag] med %d: NO eligible chords of %lld beams "
+                             "(this medium %lld, order>=%d %lld, achro2 %lld, bowMode %d)\n",
+                             medOnly, (long long)bm.beams.size(), nMed, minOrder, nOrd, nAch,
+                             (int)(bowMom != nullptr));
+            }
+            return;
+        }
         if (!(box.hi.x > box.lo.x)) return;
         const Vec3 pad = (box.hi - box.lo) * 0.01 + Vec3{1e-6, 1e-6, 1e-6};
         lo = box.lo - pad; hi = box.hi + pad;
