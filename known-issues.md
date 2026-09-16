@@ -4460,21 +4460,63 @@ rough interfaces. Budget for the MIS question up front -- either accept approxim
 and accept two definitions with a measured statement of how far apart they are. Do not discover
 that choice halfway through.
 
-### OPEN (2026-09-16): mode M renders a Jakob-Hanika `rgb 1 1 1` white ~12 % darker than a flat `1.0`, while mode D sees them as the same
+### OPEN (2026-09-16), ROOT CAUSE FOUND: mode M applies a SPECULAR/GLOSSY bounce's reflectance at the CAMERA's wavelength to photons gathered at their own — any coloured mirror or glossy is mis-coloured, by up to 14 %, in either direction
 
-The surviving half of the retracted entry above, and it **does** reproduce on the Cornell control
-(`scraps/corn_rgbw.ftsl`, 512 spp, GPU, sphere ROI): a `glossy roughness 0.25` sphere written
-`reflect rgb 1 1 1` renders at **0.8735** of the same sphere written `reflect 1.0` in mode M, while
-mode D puts the two at **0.9927**. (The open probe scene said 0.78 / 0.987 -- same sign, inflated
-magnitude, which is the scene's fault.)
+**What it looked like first:** "mode M renders a Jakob-Hanika `rgb 1 1 1` about 12 % darker than a
+flat `1.0`". That was one corner of a much larger problem, and the smaller framing was misleading:
+the error is not about white, not a clamp, and not always dark.
 
-An upsampled white should be flat 1.0 by construction, so a mode that renders it 12 % dark is
-mis-weighting the spectral shape somewhere the other modes do not: mode M's wavelength sampling in
-the photon pass (each photon carries one lambda and the reflectance is applied at deposit AND at
-gather) is the obvious place to look. Not investigated further. Practical note: it makes an
-authored `rgb 1 1 1` and a flat `1.0` different materials in mode M, which is surprising in a scene
-file. Worth checking whether it also affects non-white upsampled colours -- if the error scales
-with how far the spectrum departs from flat, every textured albedo in mode M carries some of it.
+**Measured** on the Cornell control (`scraps/corn_*.ftsl`, centre sphere swapped, 256-512 spp, GPU,
+sphere ROI), mode M against mode D on the SAME sphere:
+
+| sphere material | mode M / mode D |
+|---|---:|
+| `glossy reflect 0.5` (flat spectrum) | **1.005** |
+| `glossy reflect rgb 0.5 0.5 0.5` (JH grey) | 0.985 |
+| `glossy reflect rgb 1 1 1` (JH white) | **0.880** |
+| `glossy reflect rgb 0.8 0.1 0.1` (JH red) | **1.142** |
+| `diffuse reflect rgb 1 1 1` vs `diffuse reflect 1.0` | 0.9930 in BOTH modes — agree exactly |
+
+**The sign flips**, which rules out clamping (that can only darken) and rules out the upsample being
+slightly dark (that would darken everything equally in both modes). It is exact for a flat spectrum
+and wrong in proportion to how structured the spectrum is.
+
+**The cause, in the code.** Mode M's camera walk is MONOCHROMATIC at the camera sample's wavelength
+`lambda`, while the photon map is POLYCHROMATIC — every photon carries its own `ph.lambda`. The
+diffuse density estimate handles this correctly: `photonmap_render.h:1400` evaluates
+`diffuseReflectance(scene, m, h, ph.lambda)` **per photon**. But every bounce the camera ray takes
+on the way to that gather point multiplies a scalar throughput:
+
+    case MatType::Glossy:  double r = clamp01(reflectSlot(scene, m, h, lambda));  thr *= r;
+    case MatType::Mirror:  double r = clamp01(reflectSlot(scene, m, h, lambda));  thr *= r;
+
+— at the CAMERA's `lambda` — and that scalar then multiplies a photon sum spanning every wavelength:
+`L += est(pm, norm, nA) * (nA * thr)`. So the estimator computes
+`r(lambda_c) * sum_p rho(lambda_p) P_p CIE(lambda_p)` where it owes
+`sum_p r(lambda_p) rho(lambda_p) P_p CIE(lambda_p)`. Identical when `r` is flat; biased by the
+correlation between `r` and the photon spectrum otherwise, in whichever direction that correlation
+runs — red reflectance over a warm photon population reads BRIGHT, white-with-structure reads DARK.
+
+**Why it matters here and not only in a test scene:** `gallery_rain` has a chrome ring and a gold
+gyroid, and gold is exactly the case — a strongly coloured glossy reflectance. Their colour in the
+mode-M flyby is wrong relative to modes D and R by something of the order of the 14 % above. Any
+`mirror`, `glossy`, `thinfilm` or `grating` vertex the camera ray passes through before reaching a
+diffuse gather point carries the same error.
+
+**The fix (designed, not yet built).** Keep the walk's spectral factors as a SPECTRUM rather than a
+scalar: carry `thrS[]` over the spectral grid beside the existing scalar `thr`, multiply each
+bounce's reflectance into it per grid wavelength, and in the density estimate weight each photon by
+`thrS[bin(ph.lambda)] / thrS[bin(lambda_c)]`. That ratio is exactly 1 for a flat spectrum, so **every
+existing render with flat/uncoloured speculars stays bit-identical** — which is also the regression
+test. Cost is a few dozen multiplies per bounce (bounces are few) plus one array lookup per photon
+in the inner loop.
+
+**Both backends need it.** `render_cuda.cu`'s `dPhotonGather` has the identical structure and the
+identical bug, and the GPU is the path a flyby actually renders on.
+
+**Validation when built:** the four rows above must all come to ~1.00; the Cornell diffuse control
+must stay at 0.995-1.005; `scenes/_beams_ms.ftsl`'s mode-M-vs-D invariant must not move; and a flat
+spectral scene must be bit-identical to before.
 
 ### OPEN (2026-09-16): `-direct-only` is silently ignored by mode D (and any non-backward mode)
 

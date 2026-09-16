@@ -11,38 +11,33 @@ measuring with it.
 
 ---
 
-## B. Mode M renders a Jakob-Hanika `rgb 1 1 1` ~12 % darker than a flat `1.0` — mode D sees 0.7 %
+## B. Mode M mis-colours coloured speculars (root cause found; fix designed, NOT built)
 
-**Status: not started.**
+**Status: diagnosed, written up in `known-issues.md`. The fix is the remaining work.**
 
-Filed as OPEN in `known-issues.md` (2026-09-16). Reproduced on the project's own control, not on a
-probe scene: `scraps/corn_rgbw.ftsl` vs `scraps/corn_0.25.ftsl` (Cornell, centre sphere swapped,
-512 spp, GPU, sphere ROI) — mode M **0.8735**, mode D **0.9927**.
+Started as "a JH white renders 12 % dark in mode M"; the real fault is bigger and the first framing
+was wrong. Mode M's camera walk is monochromatic at the camera's wavelength while the photon map is
+polychromatic, and a specular/glossy bounce multiplies a scalar reflectance taken at the CAMERA's
+wavelength onto a photon sum spanning all of them. Exact for a flat spectrum; wrong in either
+direction for a coloured one — measured M/D of 0.880 (JH white), 1.142 (JH red), 1.005 (flat).
+`gallery_rain`'s gold gyroid and chrome ring are exactly this case, so the pending flyby renders
+their colour wrong relative to modes D and R.
 
-An upsampled white should be flat 1.0 by construction, so either the upsample is not flat or mode M
-mishandles a spectrum that is not perfectly flat. That distinction is the whole investigation.
+Ruled out on the way, both by measurement: the hero-wavelength stratification added in 0.314.0
+(the ratio is the same at spp 1, where it is disabled, as at spp 512), and clamping (the sign
+flips). The diffuse path is correct and already does the right thing per photon
+(`photonmap_render.h:1400`), which is the model to copy.
 
-**Plan.**
+**The fix.** Carry `thrS[]` over the spectral grid beside the scalar `thr`; multiply each bounce's
+reflectance into it per grid wavelength; weight each photon in the density estimate by
+`thrS[bin(ph.lambda)] / thrS[bin(lambda_c)]`. The ratio is exactly 1 for flat spectra, so flat
+scenes stay bit-identical — that is the regression test as well as the safety property.
 
-1. **Print the spectrum.** Dump `rgbToReflectanceJH(1,1,1)` across 360–830 nm and compare against a
-   flat 1.0. If it is flat to <1 %, the upsample is innocent and mode M is the suspect. If it dips
-   (say to 0.95 in the blue), then the material genuinely is not white and the question inverts:
-   why does mode D *not* see it? A scratch C++ or a tools/ dump — no render needed.
-2. **Is it glossy-specific?** Same Cornell, same two whites, on a **diffuse** sphere. Mode M's
-   glossy path and its diffuse path differ (the gather continues the walk at a glossy vertex and
-   does a density estimate at a diffuse one), so this halves the search.
-3. **Deposit vs gather.** Mode M applies a reflectance at photon-bounce time AND at gather time,
-   at whatever wavelength the photon/camera sample carries. A spectrum that is not flat interacts
-   with the wavelength sampling; mode D evaluates `f/pdf` once per connection. Suspect:
-   `-beamachro`-style folding, the emission sampler's `invPdfLambda` weighting, or a reflectance
-   applied at the hero wavelength where the estimator assumed an average.
-4. **Fix or document.** If it is a bug, fix and re-run 1–3 plus the Cornell invariant. If it is a
-   legitimate estimator difference, say so in `known-issues.md` with the numbers and close it.
-
-**Validation:** the two whites must agree to ~1 % in mode M, the Cornell diffuse control must stay
-at 0.995–1.005 vs modes D and R, and `scenes/_beams_ms.ftsl`'s mode-M-vs-D invariant must not move.
-
----
+1. `photonmap_render.h` — the CPU gather: both estimate sites, and every bounce that multiplies
+   `thr` by a reflectance (Glossy, Mirror, HalfMirror, ThinFilm, Grating, the layered coat).
+2. `render_cuda.cu` `dPhotonGather` — same structure, same bug, and the backend a flyby uses.
+3. Validate: the four Cornell rows -> ~1.00; diffuse control unmoved; `_beams_ms` invariant
+   unmoved; a flat-spectrum scene bit-identical.
 
 ## A. The analytic coated-body model — TIR saturation, coat absorption, Snell
 
