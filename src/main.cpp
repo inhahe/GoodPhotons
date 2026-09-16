@@ -12127,6 +12127,28 @@ static double    g_beamBlur      = 0.01;   // kernel half-width as a fraction of
 // Per-medium overrides of g_beamBlur from the scene's `beam_blur` medium keys, indexed by
 // medium id (<= 0 = use the global). Filled once the scene has loaded; read by buildBeamMap.
 static std::vector<double> g_medBeamBlur;
+#ifdef HAVE_CUDA
+// VOLCACHE on the device (0.310.0): the host builds the SH grids and SPLITS the beam map
+// against them, then hands the grids to uploadBeamMapCuda through this pointer (defined in
+// render_cuda.cu) so the device march can add the erased chords' in-scatter back.
+extern const std::vector<VolCache>* g_volCachesForUpload;
+#endif
+// Publish the caches `buildBeamMap` just built and split against (it calls volCacheSplit
+// itself when handed the scene) so the device upload can carry them. Called from the
+// shared-map build lambdas right after buildBeamMap, i.e. before the map is uploaded. It
+// must NOT split again: volCacheAll returns the caches the split owns (keyed on the map's
+// contents with the `fromSplit` flag), and a second split would find nothing left to route.
+// Returns the number of media with a ready grid; 0 when the cache is off.
+static size_t volCachePrepareForGather(const Scene& scene, BeamMap& bm) {
+    if (volCacheRes() <= 0 || !volCacheHostGather()) return 0;
+    const std::vector<VolCache>& vcs = volCacheAll(scene, bm);
+    size_t ready = 0;
+    for (const VolCache& c : vcs) if (c.ready) ++ready;
+#ifdef HAVE_CUDA
+    g_volCachesForUpload = ready ? &vcs : nullptr;
+#endif
+    return ready;
+}
 static double    g_beamK         = 32.0;   // FLOOR on the gathered count, not a target
 static double    g_beamAreaSlack = 1.0;    // ceiling: allowed box-area growth from the kernel
 // THE LIGHT-SIDE REFRESH — mode J (0.247.0, the UPBP-THICK fix) and mode M (0.252.0, M-FROZEN).
@@ -23609,7 +23631,7 @@ static int run(int argc, char** argv) {
         // match is the RENDER, and it does.
         const bool meterBeamsGpu = g_beamGather && !scene.media.empty();
         if (meterGpu && cudaPhotonMapSupported(scene)) {
-                volCacheHostGather() = false;   // device gather has no volcache march
+                volCacheHostGather() = true;    // 0.310.0: the device gather marches the cache too
             bool allM = true, allPinhole = true;
             for (const auto& mc : cams) {
                 if (mc.mode != 'M')    allM = false;
@@ -23657,6 +23679,7 @@ static int run(int argc, char** argv) {
                                        * (double)meterSpp;
                     mBeamPass.build = [mWork, &scene](BeamMap& bm) {
                         buildBeamMap(bm, "[meter]", mWork, /*quiet*/false, &scene);
+                        volCachePrepareForGather(scene, bm);   // VOLCACHE: split + grids for the device
                     };
                 }
                 renderPhotonMapSharedCuda(scene, mcams, rxs, rys, meterN, radius, e,
@@ -24259,7 +24282,7 @@ static int run(int argc, char** argv) {
             // user is told what is actually happening by warnBeamsGrinMedia() instead.
             if ((wantGpu || wantAuto) && allPinhole &&
                 cudaAvailable() && cudaPhotonMapSupported(scene)) {
-                volCacheHostGather() = false;   // device gather has no volcache march
+                volCacheHostGather() = true;    // 0.310.0: the device gather marches the cache too
                 g_windowBackend = backendLabel(true, nThreads);   // the title names the card
                 std::vector<Camera> cams; std::vector<int> rxs, rys;
                 for (int i : idx) { cams.push_back(toRender[i].cam); rxs.push_back(toRender[i].res); rys.push_back(toRender[i].resY); }
@@ -24393,6 +24416,7 @@ static int run(int argc, char** argv) {
                         if (lightEpoch == 0)
                             liveWindowPlaceholder(tw, th, "building beam map\xE2\x80\xA6");
                         buildBeamMap(bm, "[camera]", work, /*quiet*/lightEpoch != 0, &scene);
+                         volCachePrepareForGather(scene, bm);   // VOLCACHE: split + grids for the device
                     };
                 }
                 // Aimed caustic emission (-causticn), the exact twin of the CPU call below.

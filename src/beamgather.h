@@ -364,12 +364,14 @@ inline size_t volCacheSplit(const Scene& sc, BeamMap& bm) {
         if (!said) {
             said = true;
             std::fprintf(stderr,
-                "[volcache] FTRACE_VOLCACHE_SPLIT is set but the gather runs on the DEVICE, "
-                "which has no volcache march\n"
-                "           (zero volcache symbols in render_cuda.cu). Splitting there would "
-                "erase the order>=2\n"
-                "           chords with nothing to add them back. Ignoring the split; use "
-                "-device cpu for it.\n");
+                "[volcache] FTRACE_VOLCACHE_SPLIT is set but the consuming gather cannot "
+                "march the cache\n"
+                "           (volCacheHostGather() is false: a path with no cache march, e.g. mode J's "
+                "UPBP-conv wavefront queue, kWfBeamEval). Splitting\n"
+                "           there would erase the order>=2 chords with nothing to add them "
+                "back. Ignoring the split.\n"
+                "           (Since 0.310.0 the device kGather path DOES march it -- "
+                "render_cuda.cu dVolCacheMarch.)\n");
         }
         return 0;
     }

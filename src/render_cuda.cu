@@ -87,6 +87,10 @@
 #include "photonmap.h"    // host PhotonMap::build reused for the mode-M grid (GPU gather)
 #include "allocreport.h"  // OOM that names the buffer, its size and the flag that sizes it
 #include "photonmap_io.h" // -savemap / -loadmap, shared with the CPU mode-M path in main.cpp
+#include "volcache.h"     // VolCache: the host SH grids the device march (DVolCache) is uploaded from
+// Set by the host around a device render whose beam map it has SPLIT against these caches
+// (beamgather.h volCacheSplit); read by uploadBeamMapCuda. Null = no cache, march is a no-op.
+const std::vector<VolCache>* g_volCachesForUpload = nullptr;
 #include "raster.h"       // G2 iso preview: shared deriveLight/materialColor/exposeAndEncode (host)
 #include "lighttree.h"    // Conty-Kulla light BVH: the SAME traversal the CPU runs, not a copy
 #include "parallel.h"     // ft::stopRequested — cooperative `-stop` between deposit chunks
@@ -5350,7 +5354,24 @@ struct DBeamMis {
 // The uploaded BeamMap: the host's BVH over kernel-inflated per-sub-beam AABBs (photonbeams.h)
 // plus the records it indexes. `nNodes == 0` means "no volume gather" and every entry point
 // tests for it, so a media-less scene pays nothing.
+// VOLCACHE on the device (0.310.0). One SH fluence/radiance grid per medium, uploaded from
+// the host's VolCache (volcache.h) once the host has SPLIT the beam map -- the order >= 2
+// chords those grids were built from are erased from the uploaded map and this march adds
+// their in-scatter back along every camera segment. Layout is the host's: nSH * nCh floats
+// per cell, HG media carry a CIE triple per coefficient (nCh 3) and the rainbow "bow mode"
+// carries a scalar per coefficient (nCh 1) with the bow kernel's Legendre moments in kMom.
+struct DVolCache {
+    int    ready = 0, nx = 0, ny = 0, nz = 0;
+    int    nSH = 1, nCh = 3, bowMode = 0, pad = 0;
+    DVec3  lo{0, 0, 0}, hi{0, 0, 0};
+    double gHG = 0.0;
+    DVec3  kMom[3];
+    const float* sh = nullptr;
+};
+
 struct DBeamMap {
+    const DVolCache* vc  = nullptr;   // per medium (index = DScene medium id), or null
+    int              nVc = 0;
     const DBeamRec* beams     = nullptr;
     const DNode*    nodes     = nullptr;
     const int*      primIdx   = nullptr;
@@ -5639,6 +5660,103 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
         }
 }
 
+// The real SH basis the host cache was projected onto (volcache.h volShBasis), l <= 2.
+__device__ static void dVolShBasis(const DVec3& d, double* y) {
+    const double x = d.x, u = d.y, z = d.z;
+    y[0] = 0.2820947917738781;
+    y[1] = 0.4886025119029199 * u;
+    y[2] = 0.4886025119029199 * z;
+    y[3] = 0.4886025119029199 * x;
+    y[4] = 1.0925484305920792 * x * u;
+    y[5] = 1.0925484305920792 * u * z;
+    y[6] = 0.3153915652525200 * (3.0 * z * z - 1.0);
+    y[7] = 1.0925484305920792 * x * z;
+    y[8] = 0.5462742152960396 * (x * x - u * u);
+}
+__device__ static int dVolShBand(int k) { return (k == 0) ? 0 : (k <= 3 ? 1 : 2); }
+
+// In-scattered radiance toward `wOut` at `p` from a medium's cache: the phase function is
+// already folded in per band (HG's l-th Legendre moment is g^l; the bow kernel's moments are
+// kMom), so this is the host's VolCache::inScatter to the letter. False outside the grid.
+__device__ static bool dVolCacheInScatter(const DVolCache& c, const DVec3& p, const DVec3& wOut,
+                                          double& rX, double& rY, double& rZ) {
+    if (!c.ready) return false;
+    const double ex = c.hi.x - c.lo.x, ey = c.hi.y - c.lo.y, ez = c.hi.z - c.lo.z;
+    const int ix = (int)((p.x - c.lo.x) / ex * c.nx);
+    const int iy = (int)((p.y - c.lo.y) / ey * c.ny);
+    const int iz = (int)((p.z - c.lo.z) / ez * c.nz);
+    if (ix < 0 || iy < 0 || iz < 0 || ix >= c.nx || iy >= c.ny || iz >= c.nz) return false;
+    const float* cc = c.sh + (size_t)(((iz * c.ny) + iy) * c.nx + ix) * c.nSH * c.nCh;
+    double Y[9];
+    dVolShBasis(wOut, Y);
+    double r0 = 0.0, r1 = 0.0, r2 = 0.0;
+    if (c.bowMode) {
+        for (int k = 0; k < c.nSH; ++k) {
+            const DVec3& m = c.kMom[dVolShBand(k)];
+            const double a = (double)cc[k] * Y[k];
+            r0 += m.x * a; r1 += m.y * a; r2 += m.z * a;
+        }
+    } else {
+        const double gp[3] = {1.0, c.gHG, c.gHG * c.gHG};
+        for (int k = 0; k < c.nSH; ++k) {
+            const double w = gp[dVolShBand(k)] * Y[k];
+            r0 += (double)cc[k * 3 + 0] * w;
+            r1 += (double)cc[k * 3 + 1] * w;
+            r2 += (double)cc[k * 3 + 2] * w;
+        }
+    }
+    rX = r0 > 0.0 ? r0 : 0.0; rY = r1 > 0.0 ? r1 : 0.0; rZ = r2 > 0.0 ? r2 : 0.0;
+    return true;
+}
+
+// The cache MARCH: what the erased order >= 2 chords would have contributed along this
+// camera segment, integrated over the grid's span in 64 steps -- the host's loop in
+// beamgather.h (sigma_s at 550 nm times the density, times the camera transmittance to the
+// step, times the cached in-scatter, which already carries the phase). Added to the beam
+// gather's output, so a map that was split loses nothing.
+__device__ static void dVolCacheMarch(const DScene& sc, const DBeamMap& bm,
+                                      const DVec3& oc, const DVec3& dc, Real tMax, DRng& rng,
+                                      double& oX, double& oY, double& oZ) {
+    if (!bm.vc || bm.nVc <= 0) return;
+    const DPatEnv env = dPatEnvOf(sc);
+    const DVec3 wOut{-dc.x, -dc.y, -dc.z};
+    const int steps = 64;
+    for (int mi = 0; mi < bm.nVc && mi < sc.mediaN; ++mi) {
+        const DVolCache& c = bm.vc[mi];
+        if (!c.ready) continue;
+        // ray/grid span (the host's VolCache::raySpan)
+        double t0 = 0.0, t1 = (double)tMax;
+        const double oa[3] = {oc.x, oc.y, oc.z}, da[3] = {dc.x, dc.y, dc.z};
+        const double la[3] = {c.lo.x, c.lo.y, c.lo.z}, ha[3] = {c.hi.x, c.hi.y, c.hi.z};
+        bool miss = false;
+        for (int a = 0; a < 3 && !miss; ++a) {
+            if (fabs(da[a]) < 1e-12) { if (oa[a] < la[a] || oa[a] > ha[a]) miss = true; continue; }
+            double ta = (la[a] - oa[a]) / da[a], tb = (ha[a] - oa[a]) / da[a];
+            if (ta > tb) { const double tmp = ta; ta = tb; tb = tmp; }
+            if (ta > t0) t0 = ta;
+            if (tb < t1) t1 = tb;
+            if (t0 >= t1) miss = true;
+        }
+        if (miss || !(t1 > t0)) continue;
+        const DMedium& md = sc.media[mi];
+        const double ss550 = fmax((double)0, (double)specLookup(md.sigma_s, (Real)550));
+        if (!(ss550 > 0.0)) continue;
+        const double dt = (t1 - t0) / (double)steps;
+        for (int i = 0; i < steps; ++i) {
+            const double t = t0 + dt * (i + 0.5);
+            const DVec3 p{oc.x + dc.x * (Real)t, oc.y + dc.y * (Real)t, oc.z + dc.z * (Real)t};
+            double fX, fY, fZ;
+            if (!dVolCacheInScatter(c, p, wOut, fX, fY, fZ)) continue;
+            const double dens = md.heterogeneous ? dMedDensityAt(md, p, env) : 1.0;
+            const double ss = ss550 * dens;
+            if (!(ss > 0.0)) continue;
+            const double T = (double)dMediaTransmittance(sc, oc, dc, (Real)t, (Real)550, rng);
+            const double w = ss * T * dt;
+            oX += fX * w; oY += fY * w; oZ += fZ * w;
+        }
+    }
+}
+
 __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                                           const DVec3& oc, const DVec3& dc, Real tMax,
                                           double aGlassCam, DRng& rng,
@@ -5646,6 +5764,9 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                                           const DBeamMergeW* mw = nullptr,
                                           const DTrRay* camTr = nullptr) {
     oX = oY = oZ = 0.0;
+    // The cache's share first: it is additive and independent of the beam traversal, and it
+    // must run even when the split left no beams at all (nNodes == 0).
+    dVolCacheMarch(sc, bm, oc, dc, tMax, rng, oX, oY, oZ);
     if (bm.nNodes == 0) return;
     const DVec3 invD{(Real)1 / dc.x, (Real)1 / dc.y, (Real)1 / dc.z};
     Real tRoot;
@@ -18360,6 +18481,31 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
     dbm.primIdx   = (const int*)up.keep(uploadVec(bmap->bvh.primIdx));
     dbm.radiusMax = (gpu::Real)bmap->radius;
     dbm.nNodes    = (int)bnodes.size();
+    // VOLCACHE grids, if the host built (and split against) them for this map. The host sets
+    // g_volCachesForUpload right before the device render and clears it after; a null means
+    // "no cache", and the march is then a no-op. See DVolCache.
+    dbm.vc = nullptr; dbm.nVc = 0;
+    if (g_volCachesForUpload && !g_volCachesForUpload->empty()) {
+        std::vector<gpu::DVolCache> dv(g_volCachesForUpload->size());
+        size_t nReady = 0;
+        for (size_t m = 0; m < dv.size(); ++m) {
+            const VolCache& h = (*g_volCachesForUpload)[m];
+            gpu::DVolCache& d = dv[m];
+            d.ready = h.ready ? 1 : 0;
+            if (!h.ready) continue;
+            d.nx = h.nx; d.ny = h.ny; d.nz = h.nz; d.nSH = h.nSH; d.nCh = h.nCh;
+            d.bowMode = h.bowMode ? 1 : 0; d.gHG = h.gHG;
+            d.lo = {h.lo.x, h.lo.y, h.lo.z}; d.hi = {h.hi.x, h.hi.y, h.hi.z};
+            for (int k = 0; k < 3; ++k) d.kMom[k] = {h.kMom[k].x, h.kMom[k].y, h.kMom[k].z};
+            d.sh = (const float*)up.keep(uploadVec(h.sh));
+            ++nReady;
+        }
+        if (nReady) {
+            dbm.vc  = (const gpu::DVolCache*)up.keep(uploadVec(dv));
+            dbm.nVc = (int)dv.size();
+            std::printf("[gpu] volcache: %zu medium grid(s) uploaded for the device march\n", nReady);
+        }
+    }
     size_t nMis = 0;
     if (withMis && !bmap->mis.empty()) {
         std::vector<gpu::DBeamMis> dm(bmap->mis.size());

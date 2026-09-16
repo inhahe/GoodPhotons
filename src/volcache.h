@@ -38,26 +38,33 @@
 //     version silently took the LAST enabled medium's sigma_t and applied it to every beam,
 //     which is the kind of error that reads as a soft bias rather than as a failure.
 //
-// WHY THE DIRECTIONAL BINS ARE OFF BY DEFAULT, HAVING BEEN BUILT AND MEASURED. The SH machinery
-// below is correct -- it reduces to the scalar cache exactly at g = 0, and it is energy-correct
-// to 0.8% at g = 0.5 -- and it buys NOTHING, which is the useful result. Measured on
-// `_beams_ms` at 96^2 against the uncached render, per-pixel median error:
+// THE DIRECTIONAL BINS, MEASURED TWICE -- and ON by default for g != 0 since 0.311.0. The SH
+// machinery below reduces to the scalar cache exactly at g = 0 and is energy-correct to 0.8% at
+// g = 0.5. The FIRST measurement said it buys nothing: `_beams_ms` at 96^2 -- a sphere of fog in a
+// closed box under an area light -- against the uncached render, per-pixel median error:
 //
 //     medium          SH order 2      l = 0 only
 //     g = 0.5           3.03 %          1.88 %
 //     g = 0.85          2.31 %          2.13 %
 //
-// The l = 0 reconstruction is as good or BETTER at both, including a strongly forward medium.
-// The reason is that this cache only ever holds the order >= 2 component, and by the second
-// scattering event diffusion has made the radiance field nearly isotropic -- the anisotropy is
-// spent in the FIRST scattering, which stays a real beam and is never cached. So the l >= 1
-// bands carry little signal and a full share of estimator noise, and clamping their ringing to
-// non-negative biases the result bright (+0.8% against the scalar path's -1.0%).
+// There the l = 0 reconstruction is as good or better even at g = 0.85, and the reason given was
+// that this cache only holds the order >= 2 component, whose field diffusion has made nearly
+// isotropic. That is true of an ENCLOSURE lit diffusely from above. It is not true of a
+// collimated backlight. The SECOND measurement, gallery_rain frame 555 (a g = 0.46 cloud with the
+// sun behind it, camera looking into the sun; device march, 320x180 spp 32, the 3 sun-disc pixels
+// masked -- see known-issues "VOLCACHE DEVICE MARCH"), frame ratio cache / uncached:
 //
-// The real fix for anisotropic media was therefore not directional bins at all: it was to STOP
-// REFUSING THEM, because the scalar cache was already adequate. `FTRACE_VOLCACHE_SH=1` keeps
-// the SH path available -- it would matter for a cache that held order 1, where the anisotropy
-// is real -- at 9x the memory.
+//     reconstruction   frame ratio    top-rim tiles
+//     l = 0 only         0.934        0.86  0.87  0.83
+//     SH order 2         0.996        0.985 0.988 0.928
+//
+// A scalar cache is 7% dark on a backlit cloud -- systematic, direction-dependent, and so a
+// brightness that would drift with the camera across a flyby -- while the bins cost nothing
+// measurable (86 s vs 105 s for the frame; a 48^3 grid at 9 bands x 3 channels is 12 MB). The
+// order-2 term of a sun through a thin cloud keeps a g^2 forward lobe; the enclosure measurement
+// was not wrong, it was local. Hence the default: bins whenever g != 0. The enclosure case pays
+// the +0.8% clamp bias for it (ringing clamped non-negative reads bright).
+// FTRACE_VOLCACHE_SH=0 restores the scalar reconstruction; =1 forces the bins.
 //
 // This is a PROTOTYPE for a go/no-go decision, not the production cache: no confidence gate,
 // no validation paths, no adaptive resolution.
@@ -195,12 +202,17 @@ struct VolCache {
         const Vec3 pad = (box.hi - box.lo) * 0.01 + Vec3{1e-6, 1e-6, 1e-6};
         lo = box.lo - pad; hi = box.hi + pad;
         nx = ny = nz = res;
-        // DIRECTIONAL BINS ARE OPT-IN, AND THE MEASUREMENT SAYS THEY ARE NOT WORTH IT.
-        // `FTRACE_VOLCACHE_SH=1` enables them; the default is the l = 0 reconstruction even on
-        // an anisotropic medium. See the header note "WHY THE DIRECTIONAL BINS ARE OFF".
-        static const bool useSH = [] {
+        // DIRECTIONAL BINS ARE ON BY DEFAULT FOR ANISOTROPIC MEDIA (0.311.0). They were opt-in
+        // through 0.310.x on the strength of an enclosure measurement that does not transfer to
+        // a collimated backlight: on gallery_rain's sun-lit cloud the scalar reconstruction is
+        // 7% dark. See the header note "THE DIRECTIONAL BINS, MEASURED TWICE".
+        //   FTRACE_VOLCACHE_SH unset : bins whenever g != 0 (at g = 0 they ARE the scalar cache)
+        //   FTRACE_VOLCACHE_SH=0     : the scalar (l = 0) reconstruction regardless of g
+        //   FTRACE_VOLCACHE_SH=1     : the bins (same as unset; kept for the old spelling)
+        static const int shMode = [] {
             const char* e = std::getenv("FTRACE_VOLCACHE_SH");
-            return e && *e && std::atoi(e) != 0;
+            if (!e || !*e) return -1;
+            return std::atoi(e) != 0 ? 1 : 0;
         }();
         bowMode = (bowMom != nullptr);
         emPick  = emitter;
@@ -212,7 +224,7 @@ struct VolCache {
             gHG = 0.0;
             nSH = kVolShN;
         } else {
-            gHG = useSH ? g : 0.0;
+            gHG = (shMode == 0) ? 0.0 : g;
             nSH = (gHG == 0.0) ? 1 : kVolShN;
         }
         const Vec3 ext = hi - lo;

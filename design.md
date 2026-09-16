@@ -3426,9 +3426,11 @@ as the one at fault.
   thick isotropic media; the erase, not the query-side skip, is where the whole gain is.
   Since 0.301.0 it also serves **anisotropic** media: in-scattering is a convolution of the
   directional radiance with the phase, which is diagonal in spherical harmonics, so directional
-  bins were built (`FTRACE_VOLCACHE_SH=1`, Legendre moment `g^l` per band). **Measured not to
-  help** -- the cached component is order >= 2, which diffusion has already made nearly isotropic
-  -- so the default stays the scalar `l = 0` reconstruction, which is as accurate and 9x smaller.
+  bins were built (`FTRACE_VOLCACHE_SH=1`, Legendre moment `g^l` per band). Measured not to
+  help on the diffusely-lit `_beams_ms` enclosure -- but a collimated backlight is different: on
+  gallery_rain's sun-lit cloud the scalar `l = 0` reconstruction is 7 % dark and the bins recover
+  it at no measurable cost, so since 0.311.0 the bins are the **default whenever `g != 0`**
+  (`FTRACE_VOLCACHE_SH=0` forces the scalar reconstruction, `=1` forces the bins).
   Since 0.302.0 it serves **heterogeneous** media too (optical depth is integrated along the
   chord rather than assumed) and keeps **one grid per medium**, so a scene can be partially
   cached -- `gallery_rain` caches its HG cloud while its `phase rainbow` rain stays as beams.
@@ -3436,10 +3438,20 @@ as the one at fault.
   function of scattering angle, so the CIE lives in the KERNEL (per-channel Legendre moments of
   `Scene::BowLut`, by quadrature) and the stored coefficients are scalar. Restricted to the
   gather-time-fold (`achro == 2`) beams of one emitter; everything else stays a real beam.
-  The split is **host-only** and refuses to run when the device will gather, because the march
-  has no device twin; and the march is clipped to each grid's box, not to the camera ray, since
-  a ray that hits nothing is handed `tMax = 1e30`. See known-issues, VOLCACHE, for the scope
-  limits and for the cache-ownership bug that made its first measurement meaningless.
+  The march is clipped to each grid's box, not to the camera ray, since a ray that hits nothing
+  is handed `tMax = 1e30`. **Since 0.310.0 the march has a device twin** (`render_cuda.cu`
+  `dVolCacheMarch`, called at the top of `dGatherPhotonBeams` so it runs even when the split left
+  no beams): the host builds the grids and splits the map inside the shared-map build lambda
+  (`buildBeamMap` → `volCacheSplit`), `volCachePrepareForGather` publishes the grids through
+  `g_volCachesForUpload`, and `uploadBeamMapCuda` uploads them as `DVolCache` records (the SH
+  coefficients as one float buffer per medium) hung off `DBeamMap`. The device march is the
+  host's loop to the letter — 64 steps over the grid's span, `sigma_s(550 nm) * density * T *
+  inScatter * dt`, with `dVolCacheInScatter` reproducing `VolCache::inScatter` including the
+  bow-mode kernel moments. The split's refusal (`volCacheHostGather() == false`) is now only for
+  gather paths that have no march at all -- mode J's UPBP-conv wavefront queue (`kWfBeamHits` /
+  `kWfBeamEval` run their own per-hit estimator and never enter `dGatherPhotonBeams`); the
+  shared mode-M device path sets it true. See known-issues, VOLCACHE, for the scope limits, the measurements, and for the
+  cache-ownership bug that made its first measurement meaningless.
 
 - **`surfmerge.h`** (0.258.0) — the **surface photon map mode `J` merges against**, i.e. the
   half folded in from mode `U`. Three things live here and nowhere else:

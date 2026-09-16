@@ -1547,6 +1547,59 @@ median 2.56 %, p90 9.35 %**, and is **64 % faster** (paired, warm-up discarded: 
 because it is correct and would matter for a cache that held order 1, where the anisotropy is real;
 it costs 9x the memory and is off by default.
 
+**CORRECTED (0.311.0): the enclosure measurement did not transfer, and the bins are now the default
+for `g != 0`.** `_beams_ms` is a fog sphere in a closed box under an area light -- diffusely lit, so
+its order >= 2 field really is near-isotropic. A collimated backlight is different. On gallery_rain
+frame 555 (the `g 0.46` cloud with the sun behind it, camera looking into the sun; device march at
+320x180 spp 32, `-loadmap scraps/mM.map -beamcount 100000 -beamblur 0.015`, the three sun-disc pixels
+masked -- see the DEVICE MARCH entry below for why), frame ratio cache / uncached:
+
+| reconstruction | frame ratio | top-rim tiles (three 40x30 px tiles) |
+|---|---:|---|
+| `l = 0` only (old default) | 0.934 | 0.86 0.87 0.83 |
+| SH order 2 (nSH = 9) | **0.996** | 0.985 0.988 0.928 |
+
+The two BRIGHT cloud tiles (the 40x30 px tiles under the rim, base luminance 0.81 and 0.26) go from
+0.795 / 0.831 to 0.987 / 0.992. The 0.311.0 default reproduces the explicit `FTRACE_VOLCACHE_SH=1` run
+to four decimals (same seed): 0.9960.
+
+The scalar cache is **7 % dark on a backlit cloud** -- systematic and direction-dependent, i.e. a
+brightness that would drift with the camera across a flyby -- and the bins cost nothing measurable
+(86 s against 105 s for the frame; a 48^3 grid at 9 bands x 3 channels is 12 MB). The order-2 term
+of a sun through a thin cloud keeps a `g^2` forward lobe; the enclosure result was not wrong, it was
+local. Default now: bins whenever `g != 0` (they reduce to the scalar cache exactly at `g = 0`);
+`FTRACE_VOLCACHE_SH=0` restores the scalar reconstruction, `=1` forces the bins. The enclosure case
+pays the +0.8 % clamp bias measured above for it.
+
+**VOLCACHE DEVICE MARCH (0.311.0) -- the CUDA gather marches the cache too, so the split no longer
+needs the CPU.** `dVolCacheMarch` in `render_cuda.cu` is the host loop in `beamgather.h` to the
+letter (64 steps over the grid's ray span, `sigma_s(550) x density x Tr_cam x inScatter x dt`, phase
+folded into the SH bands), run first thing in `dGatherPhotonBeams`; `volCachePrepareForGather`
+(main.cpp) builds the grids after each shared-map `buildBeamMap` and `uploadBeamMapCuda` ships them
+as `DVolCache` records on the `DBeamMap`. Validation: `_beams_ms` (isotropic, 71.1 % of chords
+routed) frame ratio **1.0003** against the uncached device render, 44 s -> 34 s; gallery_rain frame
+555 device march against the HOST march on the same cache, per-tile over the two bright cloud tiles
+**0.795 / 0.831 (device) vs 0.789 / 0.808 (host)** -- the same reconstruction on both sides.
+
+**The lesson that cost the morning: this port read as a 1.50x cloud error for hours, and the error
+was three pixels.** The sun's disc, seen through a gap in the cloud, lands in ONE pixel worth 3365
+luminance units (the frame's other 57,000 pixels sum to 2,700); its value is one stochastic
+transmittance sample of an enormous radiance, and the march consumes RNG draws, so the cache run
+drew a different sample (5614). Any ROI or tile containing that pixel reads +50-60 % for no reason
+connected to the cache. Masking pixels with base luminance > 5 turned "1.50x" into 0.934 -- the
+host's own figure. A directly-viewed delta light through a stochastic medium is a noise-dominated
+feature at any practical spp: exclude it (or compare medians) before reading any ratio, and check
+the base tile-luminance table before believing a ratio table. (The CPU render at 2 spp did not show
+the disc at all -- a sub-pixel disc is simply not hit -- which was the second misleading
+discrepancy of the same morning; the host does carry the term, `sunRadianceMis` in
+`photonmap_render.h`.)
+
+Not done: the wavefront UPBP-conv queue (`kWfBeamHits` / `kWfBeamEval`, mode J with merges) runs
+its own per-hit estimator and never enters `dGatherPhotonBeams`, so a split map there would lose
+its order >= 2 energy. The split is only prepared on the shared mode-M paths (`[meter]`,
+`[camera]`), which never use that queue; the guard in `beamgather.h` still refuses the split
+wherever `volCacheHostGather()` is false.
+
 **The gate also got stricter in one place while loosening in another.** It now refuses media that
 DISAGREE on `sigma_t` or `g`: one grid carries one pair of both, and the previous version silently
 took the LAST enabled medium's `sigma_t` and applied it to every beam -- an error that reads as a
