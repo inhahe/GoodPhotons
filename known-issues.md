@@ -3995,7 +3995,11 @@ levels RMS, so against the two-seed mean mode M's *excess* structure is **13.2**
 and **9.8** at 200M: 5x the photons removed a quarter of it. With the excess falling as
 1/sqrt(beams), reaching ~2 levels would need ~25x more beams again — billions of photons and a
 gather of hours per frame. Mode M does not converge on this shot at any budget that renders a
-flyby.
+flyby. Nor does blur hide it: "fat beams" (the 200M map trimmed to 125k beams at twice the
+kernel radius, 5480 gathered per probe, 1.65x the gather time of the 200M/500k frame) took
+the excess from 9.81 to **9.42** levels and rain saturation from 0.240 to 0.229 — the residual
+is the correlated-beam structure itself, which a wider kernel averages only as slowly as more
+beams do, at the same cost per unit of improvement.
 
 **Three statistics failed to see a fan the eye caught at once, and each failure is the
 instructive part.** (1) Pearson correlation after a 2 px blur read 0.997 — the bright-centre
