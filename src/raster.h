@@ -331,6 +331,16 @@ struct PreviewLight {
     double ambient  = 0.12;      // flat fill so nothing is pure black (kept low for contrast)
     double keyScale = 1.15;      // overall multiplier on the summed weighted N·L
     double fill     = 0.08;      // subtle headlight so back faces aren't crushed to black
+    // The SPECULAR environment (0.317.0). The diffuse half of this preview is still the flat
+    // `ambient` scalar; the specular half reflects this sky/ground pair instead, because a
+    // CONSTANT environment is invisible in a reflection -- a 4 % dielectric coat reflecting
+    // exactly the ambient it is already lit by adds nothing, which is why an imported glTF
+    // dielectric read as chalk here next to the viewers this preview is measured against
+    // (they reflect an HDRI, where the sky is several times the mean and the grazing Fresnel
+    // rise lands on it). The pair's mean is `ambient`, so what changes is the DIRECTIONALITY,
+    // not the exposure.
+    Vec3   envUp{0, 0, 0};       // reflected radiance looking up   (1.65 x ambient)
+    Vec3   envDn{0, 0, 0};       // ...and looking down             (0.35 x ambient)
 };
 
 inline PreviewLight deriveLight(const Scene& sc) {
@@ -386,6 +396,13 @@ inline PreviewLight deriveLight(const Scene& sc) {
         // inverse-square-ish falloff so surfaces shade from each source outward.
         L.ambient = 0.10; L.keyScale = 1.25; L.fill = 0.06;
     }
+    // The specular environment, anchored on whichever ambient the branches above chose. Kept
+    // NEUTRAL in hue: tinting it from the scene's env light would be a second guess layered on
+    // the first, and a preview that quietly recolours every highlight is harder to trust than
+    // one that only says which way is up. 1.65 / 0.35 average to 1, i.e. the same total the
+    // constant environment delivered, redistributed.
+    L.envUp = Vec3{1, 1, 1} * (L.ambient * 1.65);
+    L.envDn = Vec3{1, 1, 1} * (L.ambient * 0.35);
     return L;
 }
 
@@ -557,6 +574,20 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
     for (size_t i = 0; i < sc.mats.size(); ++i) {
         const Material& m = sc.mats[i];
         if (m.mixChildren.empty() || matSh[i].rough >= 0.0) continue;
+        if (m.type == MatType::Layered) {
+            // A layered stack's coat is FIELDS on the parent rather than a child lobe, so
+            // there is nothing for the loop below to find: read it here. F0 comes from the
+            // coat's own index (0.04 at 1.5), or straight from `specular` in manual mode.
+            const double n = m.ior ? m.ior(550.0) : 1.5;
+            const double f0 = (m.coatModel == 2 && m.coatSpecular >= 0.0)
+                                  ? std::min(1.0, std::max(0.0, m.coatSpecular))
+                                  : ((n - 1.0) / (n + 1.0)) * ((n - 1.0) / (n + 1.0));
+            matSh[i].rough    = (m.roughness > 0.0) ? m.roughness : 0.05;
+            matSh[i].f0       = Vec3{f0, f0, f0};
+            matSh[i].roughPat = m.roughnessPat;
+            matSh[i].roughTex = m.roughnessTex;
+            continue;
+        }
         for (size_t k = 0; k < m.mixChildren.size(); ++k) {
             const int c = m.mixChildren[k];
             if (c < 0 || c >= (int)sc.mats.size()) continue;
@@ -2197,8 +2228,18 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                 // shading above already makes.
                 double A = 0.0, B = 0.0;
                 envBrdfApprox(std::max(1e-4, dot(N3, V)), rough, A, B);
-                const double amb = light.ambient;
-                specAcc = specAcc + Vec3{sh->f0.x * A + B, sh->f0.y * A + B, sh->f0.z * A + B} * amb;
+                // `prefiltered(R, roughness)` — a sky/ground gradient looked up along the
+                // REFLECTION of the view about the shading normal, which is the cheapest
+                // environment that still answers "what is this surface pointing at". Roughness
+                // does not blur it: at this contrast the blur is invisible, and a rough surface
+                // already averages the gradient across its normal spread.
+                const Vec3 Rv = N3 * (2.0 * dot(N3, V)) - V;
+                const double tEnv = 0.5 * (Rv.y + 1.0);
+                const double sEnv = tEnv * tEnv * (3.0 - 2.0 * tEnv);
+                const Vec3 env = light.envDn + (light.envUp - light.envDn) * sEnv;
+                specAcc = specAcc + Vec3{(sh->f0.x * A + B) * env.x,
+                                         (sh->f0.y * A + B) * env.y,
+                                         (sh->f0.z * A + B) * env.z};
                 accum[i] = accum[i] + specAcc * light.keyScale;
             }
         }

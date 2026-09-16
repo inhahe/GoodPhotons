@@ -4306,11 +4306,44 @@ not the lobe, is most of what reads as satin there. Giving the raster a directio
 the specular term (even a sky/ground gradient anchored on `ambient`) is the outstanding piece; it is
 preview-only and cannot affect a render.
 
+**FOLLOW-UP DONE (2026-09-16, v0.317.0): the device learned `MatType::Layered`, so the import is a
+real coat now.** The lobe is a Fresnel interface over the body (`-import-specular layered`, the
+default), which adds the angular ramp the constant-weight mix could not express. Measured:
+
+- **The port.** Every layered material gets a synthetic glossy child at upload; `dResolveCompound`
+  returns it with probability R and otherwise picks a body lobe, so the eleven `D_MIX` dispatch
+  sites each took a three-line edit. `cudaForwardSupported` no longer rejects layered scenes:
+  `gallery_rain` with a layered Alice renders **on the GPU** (`shared photon map (mode M) on NVIDIA
+  GeForce RTX 4090`, 93 s for frame 555 at 8 spp), which is what the whole flyby depends on.
+- **Parity.** On `scraps/lay_probe.ftsl` (a 0.6 lacquer coat, a 4 % Fresnel coat, a bare body),
+  CPU and GPU frame means agree to **2 %**; the per-sphere means differ by 7-10 %, and so does the
+  **bare-body control**, so that gap is the pre-existing backend difference logged above, not the
+  coat. Mode R renders the same coats independently.
+- **The CPU gather was wrong and is fixed.** `photonGather` took the body lobe unconditionally
+  ("approximate", since forever), so mode M rendered clearcoats matte: the lacquer coat peaked at
+  **0.254 on the GPU against 0.005 on the CPU** before the fix. Both now take the coat with
+  probability R, as the BDPT walk always has.
+- **Modes `D` / `J` / `U` refuse layered materials** -- `[mode D] camera 'cam' uses layered
+  materials, which that mode can't render` -- which is a pre-existing gate in
+  `sceneModeUnsupported`, not something the device port introduced. It matters here because
+  `gallery_rain`'s header recommends mode D for stills, so **`-import-specular mix`** keeps the
+  0.316.0 form available for exactly that case. Teaching BDPT the layered BSDF (its MIS needs
+  consistent `bsdfF`/`bsdfPdf` for the stack) is the remaining piece.
+
+**AND the preview shows it now (the other half of the report).** Two changes, both preview-only:
+the specular environment is a **sky/ground gradient** looked up along the reflection vector instead
+of the single `ambient` scalar (mean held at `ambient`, so exposure is unchanged -- a constant
+environment is simply invisible in a reflection, which is what Meshy's HDRI is doing that this
+preview was not); and the importer now harvests the roughness map's **mean** as the material's
+constant, because the glTF *factor* (1.0, with the real 0.25 in the map) is what every consumer
+that cannot sample a texture was reading. Together, on Alice: **2,217 px changed at +5 levels ->
+43,677 px at +109**, i.e. from "no visible difference" to satin on the apron folds, sleeves, collar
+and hair (`scraps/_alice_preview_final.png`).
+
 **Still open, both logged here rather than fixed:**
-- **No Fresnel angular ramp in the renderers.** A mix weight is constant, so the imported lobe does
-  not brighten toward grazing incidence. The fix is to port **`MatType::Layered`** to the device
-  (`D_LAYERED` has an enum slot and no branch; `cudaForwardSupported` rejects the scene instead),
-  then import a real Fresnel coat. Until then a dielectric's rim sheen is missing.
+- ~~**No Fresnel angular ramp in the renderers.**~~ **DONE in 0.317.0** -- see the follow-up above.
+  What remains is **mode D / J / U**, which refuse layered materials outright; `-import-specular mix`
+  is the workaround until BDPT learns the stack.
 - **Every glTF asset in the repo changes appearance slightly** (the camrig scenes included): they
   all gain the 4 % lobe they should have had. `-import-specular off` reproduces the old look.
 

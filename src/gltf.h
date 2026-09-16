@@ -37,10 +37,17 @@
 
 #include <chrono>
 
-// `-import-specular off` types an imported glTF DIELECTRIC as a plain `diffuse`, the way the
-// importer did before 0.316.0 -- an A/B control for the change, and an escape hatch for a scene
-// that wants the old flat look. Metals (`metallic >= 0.5`) are unaffected either way.
-namespace gltfimp { inline bool dielectricSpecular = true; }
+// How an imported glTF DIELECTRIC carries the specular lobe glTF gives it:
+//   2 = `layered`  (default) the physical coat -- a Fresnel interface over the diffuse body,
+//                  so the lobe ramps toward grazing incidence as it should. Modes M, R, W and
+//                  A/B/C render it, on BOTH backends since 0.317.0. **Mode D / J / U cannot
+//                  render a layered material at all** (a pre-existing gate, not a device one),
+//                  which is what `mix` below is for.
+//   1 = `mix`      the 0.316.0 stack: an uncoloured glossy lobe at constant weight F0 over the
+//                  body. No angular ramp, but every mode can render it.
+//   0 = `off`      a flat `diffuse`, the pre-0.316.0 import.
+// Metals (`metallic >= 0.5`) are unaffected by all three.
+namespace gltfimp { inline int dielectricSpecular = 2; }
 
 namespace gltfimpl {
 
@@ -524,7 +531,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
     const minijson::Value* texturesArr = doc.root.find("textures");
     const minijson::Value* imagesArr   = doc.root.find("images");
     const minijson::Value* samplersArr = doc.root.find("samplers");
-    struct TexCacheEnt { int gltfTex; int role; double p0, p1, p2; int sceneTex; double meanMetal; };
+    struct TexCacheEnt { int gltfTex; int role; double p0, p1, p2; int sceneTex; double meanMetal, meanRough; };
     std::vector<TexCacheEnt> texCache;
     bool texStopped = false;   // buildReflCoeff refused: `ftrace -stop` during scene load
 
@@ -534,7 +541,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
     // the mean metallic, which is the only thing the single-BSDF material choice below
     // can act on (ftrace has no per-texel metal/dielectric blend).
     auto bindTex = [&](int ti, TexRole role, double p0, double p1, double p2,
-                       double* outMeanMetal) -> int {
+                       double* outMeanMetal, double* outMeanRough = nullptr) -> int {
         if (texStopped) return -1;
         if (!texturesArr || !texturesArr->isArray() || ti < 0 || ti >= (int)texturesArr->arr.size())
             return -1;
@@ -542,6 +549,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
             if (e.gltfTex == ti && e.role == (int)role &&
                 e.p0 == p0 && e.p1 == p1 && e.p2 == p2) {
                 if (outMeanMetal) *outMeanMetal = e.meanMetal;
+                if (outMeanRough) *outMeanRough = e.meanRough;
                 return e.sceneTex;
             }
         const minijson::Value& tj = texturesArr->arr[ti];
@@ -571,7 +579,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                                                               : TexFilter::Bilinear;
         }
 
-        double meanMetal = 0.0;
+        double meanMetal = 0.0, meanRoughOut = p0;
         if (role == TexRole::Roughness) {
             // glTF packs occlusion/roughness/metalness into R/G/B of one image. ftrace's
             // scalarAt averages the three channels, so the G plane has to be broadcast to
@@ -580,10 +588,19 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
             const size_t n = tex.rgb.size();
             for (const Vec3& c : tex.rgb) meanMetal += c.z;
             meanMetal = n ? meanMetal / (double)n : 0.0;
+            double meanR = 0.0;
             for (Vec3& c : tex.rgb) {
                 const double g = std::min(1.0, std::max(0.0, c.y * p0));
+                meanR += g;
                 c = Vec3{g, g, g};
             }
+            // The map's MEAN roughness, harvested like the mean metalness above and used as
+            // the material's constant. The factor alone is the wrong representative: a
+            // Meshy-class export writes `roughnessFactor 1.0` and puts the real value in the
+            // map, so every consumer that cannot sample the texture -- the preview
+            // rasterizers among them -- saw a fully rough surface and drew a lobe so broad
+            // it was invisible. Alice's map means 0.25 (satin); the factor said 1.0.
+            meanRoughOut = n ? meanR / (double)n : p0;
         } else if (role == TexRole::Color) {
             if (p0 != 1.0 || p1 != 1.0 || p2 != 1.0)
                 for (Vec3& c : tex.rgb) c = Vec3{c.x * p0, c.y * p1, c.z * p2};
@@ -601,8 +618,9 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                                            : (role == TexRole::Roughness ? ":rough" : ":normal"));
         const int id = (int)s.textures.size();
         s.textures.push_back(std::move(tex));
-        texCache.push_back(TexCacheEnt{ti, (int)role, p0, p1, p2, id, meanMetal});
+        texCache.push_back(TexCacheEnt{ti, (int)role, p0, p1, p2, id, meanMetal, meanRoughOut});
         if (outMeanMetal) *outMeanMetal = meanMetal;
+        if (outMeanRough) *outMeanRough = meanRoughOut;
         return id;
     };
 
@@ -644,10 +662,19 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                     if (reflectTexId >= 0) { r = g = b = 1.0; }   // factor folded into the texels
                 }
                 if (mrTex.index >= 0) {
-                    double meanMetal = metallic;
+                    double meanMetal = metallic, meanRough = roughness;
                     roughTexId = bindTex(mrTex.index, TexRole::Roughness, roughness, 0.0, 0.0,
-                                         &meanMetal);
-                    if (roughTexId >= 0) metallic *= meanMetal;
+                                         &meanMetal, &meanRough);
+                    if (roughTexId >= 0) {
+                        metallic *= meanMetal;
+                        // The map's mean becomes the material's CONSTANT roughness. The
+                        // factor is the wrong representative when the real value is in the
+                        // map (`roughnessFactor 1.0` + a 0.25 map is the Meshy house style),
+                        // and every consumer that cannot sample the texture reads the
+                        // constant: the preview rasterizers drew a fully-rough lobe, so
+                        // broad it was invisible, on a surface the render showed as satin.
+                        roughness = meanRough;
+                    }
                 }
                 if (nrmTex.index >= 0)
                     normalTexId = bindTex(nrmTex.index, TexRole::Normal, 0.0, 0.0, 0.0, nullptr);
@@ -729,7 +756,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                     // built here exactly as before; the lobe is added over it below, once the
                     // maps are bound, so the two share them.
                     m.type = MatType::Diffuse;
-                    wantCoat = gltfimp::dielectricSpecular;
+                    wantCoat = gltfimp::dielectricSpecular;   // 0 none / 1 mix / 2 layered
                 }
                 // Bind the maps. reflectTex REPLACES the constant `reflect` spectrum at
                 // each hit (the factor is already folded into its texels above), so it is
@@ -752,28 +779,52 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                 // Mix weights are selection probabilities that are NOT reweighted, so the two
                 // lobes partition each photon exactly and energy is conserved by construction.
                 if (wantCoat) {
-                    const double f0 = ((khrIor - 1.0) / (khrIor + 1.0)) *
-                                      ((khrIor - 1.0) / (khrIor + 1.0));
-                    Material coat;
-                    coat.type = MatType::Glossy;
-                    // UNCOLOURED: a dielectric's specular reflection carries no tint (the tint
-                    // is the body's). The 4 % lives in the mix weight, so this slot is white --
-                    // `reflect` is the glossy lobe's normal-incidence reflectance, and folding
-                    // F0 in here as well would square it.
-                    coat.reflect = rgbToReflectanceJH(1.0, 1.0, 1.0);
-                    coat.roughness = std::max(0.02, roughness);
-                    coat.roughnessTex = roughTexId;
-                    if (normalTexId >= 0) {
-                        coat.normalTex = normalTexId;          // the coat follows the same bumps
-                        coat.normalStrength = normalScale;
+                    // The body is the material built above, unchanged; what differs is how the
+                    // lobe is put over it. See gltfimp::dielectricSpecular for the two forms and
+                    // why the default is the physical one.
+                    Material body = m;
+                    const int bodyId = (int)s.mats.size();
+                    s.mats.push_back(body);
+                    if (wantCoat >= 2) {
+                        // A REAL COAT: a Fresnel interface of index `ior`, which gives both the
+                        // 4 % normal-incidence reflectance AND the ramp toward grazing that a
+                        // constant mix weight cannot express.
+                        Material lay;
+                        lay.type = MatType::Layered;
+                        lay.coatModel = 0;                       // Fresnel dielectric interface
+                        lay.ior = iorConstant(khrIor);           // KHR_materials_ior, else 1.5
+                        lay.roughness = std::max(0.02, roughness);
+                        lay.roughnessTex = roughTexId;           // glTF's roughness drives the coat
+                        if (normalTexId >= 0) {
+                            lay.normalTex = normalTexId;         // the coat follows the same bumps
+                            lay.normalStrength = normalScale;
+                        }
+                        lay.mixChildren = {bodyId};
+                        lay.mixWeights  = {1.0};
+                        m = lay;
+                    } else {
+                        // The flat-weight stack, for the modes that refuse `layered`. The 4 % lives
+                        // in the mix weight, so the lobe itself is white -- folding F0 in twice
+                        // would square it.
+                        const double f0 = ((khrIor - 1.0) / (khrIor + 1.0)) *
+                                          ((khrIor - 1.0) / (khrIor + 1.0));
+                        Material coat;
+                        coat.type = MatType::Glossy;
+                        coat.reflect = rgbToReflectanceJH(1.0, 1.0, 1.0);
+                        coat.roughness = std::max(0.02, roughness);
+                        coat.roughnessTex = roughTexId;
+                        if (normalTexId >= 0) {
+                            coat.normalTex = normalTexId;
+                            coat.normalStrength = normalScale;
+                        }
+                        const int coatId = (int)s.mats.size();
+                        s.mats.push_back(coat);
+                        Material mix;
+                        mix.type = MatType::Mix;
+                        mix.mixChildren = {coatId, bodyId};
+                        mix.mixWeights  = {f0, 1.0 - f0};
+                        m = mix;
                     }
-                    const int bodyId = (int)s.mats.size(); s.mats.push_back(m);
-                    const int coatId = (int)s.mats.size(); s.mats.push_back(coat);
-                    Material mix;
-                    mix.type = MatType::Mix;
-                    mix.mixChildren = {coatId, bodyId};
-                    mix.mixWeights  = {f0, 1.0 - f0};
-                    m = mix;
                 }
                 int id = (int)s.mats.size();
                 s.mats.push_back(m);

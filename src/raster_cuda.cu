@@ -922,7 +922,7 @@ __device__ static inline float ggxSpecD(const float3& N, const float3& V, const 
 __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
                        const int* flags, const unsigned long long* vis,
                        const DLight* lights, int nLights,
-                       float ambient, float keyScale, float fill,
+                       float ambient, float keyScale, float fill, float3 envUp, float3 envDn,
                        DCam cam, int W, int H, float3 bg, float emisBoost,
                        const DTex* texMeta, const float3* texels, int nTex,
                        const PatNode* patNodes, const DPattern* patterns, int nPatterns,
@@ -1113,12 +1113,19 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     float k = ambient + keyScale * lit + fill * head;
     accum[i] = col * k;
     if (spec) {
-        // The environment half. This renderer's environment is the single scalar `ambient`,
-        // so prefiltered(R, roughness) collapses to it exactly (host twin explains why that is
-        // split-sum over a uniform environment rather than an approximation of one).
+        // The environment half of the split sum. Since 0.317.0 the environment is a sky/ground
+        // gradient rather than one scalar, so a reflection has something to find in it.
         float A = 0.0f, B = 0.0f;
         envBrdfApproxD(fmaxf(1e-4f, dot3(N3, V)), rough, A, B);
-        specAcc = specAcc + make_float3(shF0.x * A + B, shF0.y * A + B, shF0.z * A + B) * ambient;
+        // Directional environment (host twin: raster.h's `env` block) — a constant one is
+        // invisible in a reflection, see PreviewLight::envUp.
+        const float3 Rv = N3 * (2.0f * dot3(N3, V)) - V;
+        const float  tEnv = 0.5f * (Rv.y + 1.0f);
+        const float  sEnv = tEnv * tEnv * (3.0f - 2.0f * tEnv);
+        const float3 env = envDn + (envUp - envDn) * sEnv;
+        specAcc = specAcc + make_float3((shF0.x * A + B) * env.x,
+                                        (shF0.y * A + B) * env.y,
+                                        (shF0.z * A + B) * env.z);
         accum[i] = accum[i] + specAcc * keyScale;
     }
 }
@@ -1437,6 +1444,8 @@ struct Scene {
     DLight*  dlights = nullptr;
     int      nLights = 0;
     float    ambient = 0.12f, keyScale = 1.15f, fill = 0.08f;
+    // Directional specular environment (host twin: PreviewLight::envUp / envDn).
+    float3   envUp = {0, 0, 0}, envDn = {0, 0, 0};
     // Image-skin textures (flattened): per-texture metadata + one shared texel array.
     DTex*    dtexMeta = nullptr;
     float3*  dtexels  = nullptr;
@@ -1706,6 +1715,8 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
         d.weight = (float)p.weight; d.falloff2 = (float)p.falloff2;
     }
     sc->nLights  = (int)hl.size();
+    sc->envUp    = make_float3((float)light.envUp.x, (float)light.envUp.y, (float)light.envUp.z);
+    sc->envDn    = make_float3((float)light.envDn.x, (float)light.envDn.y, (float)light.envDn.z);
     sc->ambient  = (float)light.ambient;
     sc->keyScale = (float)light.keyScale;
     sc->fill     = (float)light.fill;
@@ -1929,7 +1940,8 @@ static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
     rec(3);
     kShade<<<gPix, TPB>>>(sc->dtris, sc->dgeos, sc->dattrs, sc->dflags, sc->vis,
                           sc->dlights, sc->nLights,
-                          sc->ambient, sc->keyScale, sc->fill, dc, W, H, bg, EMIS_BOOST,
+                          sc->ambient, sc->keyScale, sc->fill, sc->envUp, sc->envDn,
+                          dc, W, H, bg, EMIS_BOOST,
                           sc->dtexMeta, sc->dtexels, sc->nTex,
                           sc->dpatNodes, sc->dpatterns, sc->nPatterns, patEnvOf(*sc),
                           sc->dmixes, sc->nMixes,

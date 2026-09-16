@@ -18774,7 +18774,9 @@ static int run(int argc, char** argv) {
         // (and so `-h` lists it); setting the same bool twice is harmless.
         if (!std::strcmp(argv[i], "-import-specular") && i + 1 < argc) {
             const char* v = argv[i + 1];
-            gltfimp::dielectricSpecular = !(!std::strcmp(v, "off") || !std::strcmp(v, "0"));
+            gltfimp::dielectricSpecular =
+                (!std::strcmp(v, "off") || !std::strcmp(v, "0")) ? 0
+              : (!std::strcmp(v, "mix")) ? 1 : 2;
         }
         if (!std::strcmp(argv[i], "-raster") || !std::strcmp(argv[i], "-raster-gpu") ||
             !std::strcmp(argv[i], "-raster-bench") || !std::strcmp(argv[i], "-explore") ||
@@ -19403,7 +19405,9 @@ static int run(int argc, char** argv) {
         // `diffuse` the way the importer did before 0.316.0. See gltf.h.
         else if (!std::strcmp(argv[i], "-import-specular") && i + 1 < argc) {
             const char* v = argv[++i];
-            gltfimp::dielectricSpecular = !(!std::strcmp(v, "off") || !std::strcmp(v, "0"));
+            gltfimp::dielectricSpecular =
+                (!std::strcmp(v, "off") || !std::strcmp(v, "0")) ? 0
+              : (!std::strcmp(v, "mix")) ? 1 : 2;
         }
         // VOLCACHE (volcache.h): `-volcache [res]` = the per-medium fluence cache at res^3 (default
         // 48) WITH the deposit split; `-volcache off` = off. `-volcache-sh auto|on|off` picks the

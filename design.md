@@ -839,27 +839,66 @@ one Meshy-class material, `metallicFactor 1.0` / `roughnessFactor 1.0` with the 
 metallicRoughness map (mean metalness **0.28** -> dielectric, mean roughness **0.25** -> satin), and
 she imported as chalk in every mode.
 
-**Why a `mix` and not `layered`.** `layered` is the physical model -- a Fresnel coat over a weighted
-body, `coat { roughness ... }` and all -- and it is unusable here: **`MatType::Layered` has no device
-branch at all**, so `cudaForwardSupported`'s `unsupported()` rejects any scene containing one and
-the whole render falls back to the CPU tracer. Typing Alice `layered` would have taken a mode-M
-flyby off the GPU without a word. So the importer builds a two-child **`Mix`**: an *uncoloured*
-glossy lobe (weight F0, `reflect` white -- the 4 % lives in the weight, folding it in twice would
-square it) over the diffuse body (weight 1-F0), sharing the roughness and normal maps. Mix weights
-are selection probabilities that are not reweighted, so the two lobes partition each photon exactly
-and energy is conserved by construction; `D_MIX` is supported on every backend and in every mode.
+**A real coat, once the device could render one (0.317.0).** The import is `layered`: a Fresnel
+interface of index `ior` over the diffuse body, sharing the roughness and normal maps. That gives
+both the 4 % normal-incidence reflectance and the **angular ramp** toward grazing that the
+constant-weight `mix` of 0.316.0 could not express. `-import-specular mix` still builds that mix,
+because **modes `D` / `J` / `U` refuse layered materials outright** -- a mode gate in
+`sceneModeUnsupported`, unrelated to the device -- and a scene whose stills are rendered in mode D
+needs a form those modes accept.
 
-**What that gives up.** The Fresnel **angular ramp**. A mix weight is a constant, so the lobe stays
-at F0 instead of rising toward grazing incidence, and the silhouette rim sheen is missing in the
-path tracers. (The rasterizer's direct lobe applies its own Schlick ramp on top of `f0`, so the
-preview is closer to glTF truth than the renderers are here.) Porting `D_LAYERED` to the device
-would fix it properly and is the logged follow-up.
+**Why it could not be `layered` before.** `MatType::Layered` had an enum slot on the device
+(`D_LAYERED`) and no branch, so `cudaForwardSupported`'s `unsupported()` rejected any scene
+containing one and the whole render fell back to the CPU tracer -- a mode-M flyby would have left
+the GPU without a word. See the port below.
 
 **The preview.** `raster.h`'s pass 1 collapses a mix to its *dominant* child, which for
 specular-over-diffuse is the body -- so the lobe was baked away before it could be drawn. Pass 1.5
 takes the first glossy child's lobe with `f0` scaled by its selection weight, on top of the dominant
 child's colour, and only when pass 1 found no lobe of its own. `PShade` is the host bake both
 rasterizers upload from, so the CUDA preview gets it too.
+
+### `MatType::Layered` on the GPU (0.317.0)
+
+The coat is a set of FIELDS on the parent material, and the device has no way to shade fields --
+which is why the port is not a dozen new branches but one idea: **at upload time, give every
+layered material a synthetic GLOSSY child** (`uploadScene`, appended past the scene's own
+materials; it inherits the parent's roughness/normal/pattern plumbing, is white because a
+dielectric coat's reflection carries no tint, and drops the body lobes and any emission). A layered
+material then resolves exactly like a mix: `dResolveCompound` returns the coat child with
+probability R -- `dLayeredCoatReflectance`, the device twin of `render.h`'s, covering Fresnel,
+thin-film and manual coats -- and otherwise picks a body lobe with `dMixResolveChild`, leftover
+absorption included. The eleven sites that resolved `D_MIX` (shadeStep and its hero twin,
+`bkRadiance` x2, the RGB gather, `dRandomWalk`, the two photon gathers, SPPM, and the two VCM
+subpath walks) each became `dIsCompound(...)` plus a call; `dResolveCompoundDominant` mirrors
+backward.h's Whitted rule (the coat only when it dominates). Nothing indexes the device material
+array by host id past `scene.mats.size()`, and `dEmitterForMat` scans emitters rather than a
+per-material table, so the appended entries are invisible to everything that does not ask for them.
+
+**The CPU gather had to be fixed to match.** `photonGather` / `photonGatherSub` resolved a layered
+material with `mixPickChild(...)  // approximate: gather the body lobe` -- the camera ray always
+entered the stack, so mode M rendered every clearcoat matte while modes R and W showed its sheen.
+Once the device did it properly the two backends disagreed outright (`scraps/lay_probe.ftsl`: a 0.6
+lacquer coat peaked at 0.254 on the GPU against 0.005 on the CPU), so both now take the coat with
+probability R, as the BDPT walk always has.
+
+### A directional environment for the preview's specular (0.317.0)
+
+The split sum's environment half was `PreviewLight::ambient`, one scalar -- and a constant
+environment is invisible in a reflection: a 4 % coat reflecting exactly the ambient it is already
+lit by adds nothing the eye can find, which is why an imported dielectric read as chalk in
+`-explore` next to the viewer it came from (those reflect an HDRI). `deriveLight` now also fills
+`envUp` / `envDn` -- neutral in hue, 1.65x and 0.35x ambient, so the pair's **mean is `ambient`**
+and what changes is directionality, not exposure -- and both rasterizers look the gradient up along
+the reflection of the view about the shading normal. `raster_cuda.cu` carries the twin, since
+`-explore` uses the GPU rasterizer when one is available.
+
+**One more thing was needed before any of it showed on Alice.** Her coat's roughness lives in a
+map, and the material's CONSTANT roughness was the glTF *factor* -- `1.0`, the Meshy house style,
+with the real 0.25 in the map. Every consumer that cannot sample the texture read that constant and
+drew a lobe so broad it was invisible. The importer now harvests the map's **mean** as the constant,
+exactly as it already harvested mean metalness. On the preview that is the difference between 2,217
+pixels changed at +5 levels and **43,677 at +109**.
 
 **A trap worth knowing.** `-import-specular` is read in the **pre-scan** argument loop
 (`main.cpp` ~18770), not the main one: the scene is loaded at ~18907, well before the main loop

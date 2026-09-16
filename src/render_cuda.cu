@@ -469,6 +469,16 @@ struct DMaterial {
     int    mixChild[D_MIXMAX];
     double mixWeight[D_MIXMAX];
     int    mixWeightTex;   // >=0: per-hit blend mask (2-child mix); -1: constant weights
+    // LAYERED (D_LAYERED): the coat INTERFACE over the body lobes held in the mix arrays
+    // above. `coatModel` is 0 fresnel / 1 thin-film / 2 manual, mirroring Material::coatModel;
+    // the Fresnel and thin-film models read the coat index from `ior` and the film from
+    // `filmIor` / `filmThickness`, exactly as the host does. `coatChild` indexes the SYNTHETIC
+    // glossy lobe built for this coat by uploadScene -- the device has no way to shade a set of
+    // fields, so the coat is given a material of its own past the scene's own (see the note
+    // there). -1 on every non-layered material.
+    int    coatModel;
+    double coatSpecular;
+    int    coatChild;
     // Procedural (math-driven) scalar drives (§4): index into DScene::patterns, or -1.
     // roughnessPat / filmThicknessPat override the constant/texture value at the hit;
     // mixWeightPat drives child-0 selection of a 2-child D_MIX. Device twins of
@@ -7582,6 +7592,63 @@ __device__ static int dMixResolveDominant(const DScene& sc, const DMaterial& m, 
     return best;
 }
 
+// --- LAYERED: a coat interface over a weighted body (D_LAYERED) ------------------------------
+// Device twin of render.h layeredCoatReflectance: the coat's reflectance at THIS angle, by the
+// model the material declares. `d` may be the travel direction or the direction back toward the
+// viewer -- only |cos| is used, so either sign is correct, which is what lets the eleven call
+// sites pass whatever they already have in hand.
+__device__ static double dLayeredCoatReflectance(const DScene& sc, const DMaterial& m,
+                                                 const DHit& h, const DVec3& d, Real lambda) {
+    if (m.coatModel == 2) return (double)clamp01((Real)m.coatSpecular);
+    double cosI = fabs((double)dot(h.ng, d));
+    if (cosI > 1.0) cosI = 1.0;
+    if (m.coatModel == 1) {                          // thin-film (Airy) coat
+        const Real th = dMatFilmThickness(sc, m, h);
+        const Real ns = specLookup(m.ior, lambda);
+        return (double)clamp01(thinFilmReflectance((Real)1, (Real)m.filmIor, ns, (Real)0,
+                                                   th, (Real)cosI, lambda));
+    }
+    const double n1 = 1.0, n2 = (double)specLookup(m.ior, lambda);   // Fresnel dielectric
+    const double eta = n1 / n2;
+    const double sin2t = eta * eta * (1.0 - cosI * cosI);
+    if (sin2t >= 1.0) return 1.0;                    // TIR (only ever from inside)
+    const double cosT = sqrt(1.0 - sin2t);
+    const double rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
+    const double rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
+    const double R = 0.5 * (rs * rs + rp * rp);
+    return R < 0.0 ? 0.0 : (R > 1.0 ? 1.0 : R);
+}
+
+// A material whose shading is decided by resolving it to a CHILD: the stochastic lobe pick of a
+// mix, or a layered stack's coat-or-body. Both end at "here is the material to shade with", which
+// is why every dispatch site can treat them identically.
+__device__ static inline bool dIsCompound(int t) { return t == D_MIX || t == D_LAYERED; }
+
+// Resolve a compound material to the child that shades this hit. For D_LAYERED the coat wins with
+// probability R and IS a child -- the synthetic glossy lobe uploadScene built for it -- so the
+// caller needs no coat-specific code. Two independent draws, matching the host's
+// `if (rng.uniform() < R) coat; else mixPickChild(rng.uniform())`, including the leftover
+// absorption a body whose weights sum below 1 still gets.
+__device__ static int dResolveCompound(const DScene& sc, const DMaterial& m, const DHit& h,
+                                       const DVec3& d, Real lambda, DRng& rng) {
+    if (m.type == D_LAYERED) {
+        const double R = dLayeredCoatReflectance(sc, m, h, d, lambda);
+        if ((double)rng.uniform() < R) return m.coatChild;
+    }
+    return dMixResolveChild(sc, m, h, rng.uniform());
+}
+
+// Deterministic twin for mode W, mirroring backward.h's Whitted layered branch: the coat is taken
+// only when it dominates (R >= 0.5), which for an ordinary clearcoat (R ~ 0.04) means the preview
+// shows the BODY and drops the sheen -- the honest trade at one sample per pixel.
+__device__ static int dResolveCompoundDominant(const DScene& sc, const DMaterial& m, const DHit& h,
+                                               const DVec3& d, Real lambda) {
+    if (m.type == D_LAYERED) {
+        if (dLayeredCoatReflectance(sc, m, h, d, lambda) >= 0.5) return m.coatChild;
+    }
+    return dMixResolveDominant(sc, m, h);
+}
+
 // Per-hit reflectance of a baked driven record channel at driver `d` and wavelength
 // `lambda` (device twin of recReflectanceAt): map d -> LUT position over [lo,hi], lerp
 // the neighbouring bins' JH sigmoid coeffs, evaluate the sigmoid. `coeff` points at the
@@ -8719,8 +8786,8 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     const DMaterial* mptr = &sc.mats[h.matId];
     int matIndex = h.matId;
     // Stochastic mix: resolve to a child lobe (or absorb) before dispatch.
-    if (mptr->type == D_MIX) {
-        int child = dMixResolveChild(sc, *mptr, h, rng.uniform());
+    if (dIsCompound(mptr->type)) {
+        int child = dResolveCompound(sc, *mptr, h, rd, lambda, rng);
         if (child < 0) { eAbsorbed += beta; return WF_TERMINATE; }
         mptr = &sc.mats[child]; matIndex = child;
     }
@@ -9019,8 +9086,8 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
 
     const DMaterial* mptr = &sc.mats[h.matId];
     int matIndex = h.matId;
-    if (mptr->type == D_MIX) {
-        int child = dMixResolveChild(sc, *mptr, h, rng.uniform());
+    if (dIsCompound(mptr->type)) {
+        int child = dResolveCompound(sc, *mptr, h, rd, lam[0], rng);
         if (child < 0) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
         mptr = &sc.mats[child]; matIndex = child;
     }
@@ -11337,9 +11404,9 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         }
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
-        if (mp->type == D_MIX) {                       // resolve the mix to a child material
-            int child = whitted ? dMixResolveDominant(sc, *mp, h)
-                                : dMixResolveChild(sc, *mp, h, rng.uniform());
+        if (dIsCompound(mp->type)) {                       // resolve the mix to a child material
+            int child = whitted ? dResolveCompoundDominant(sc, *mp, h, rd, lambda)
+                                : dResolveCompound(sc, *mp, h, rd, lambda, rng);
             if (child < 0) return L;                    // absorbed
             mp = &sc.mats[child]; matId = child;
         }
@@ -11505,9 +11572,9 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
 
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
-        if (mp->type == D_MIX) {                       // resolve the mix to a child material
-            int child = whitted ? dMixResolveDominant(sc, *mp, h)
-                                : dMixResolveChild(sc, *mp, h, rng.uniform());
+        if (dIsCompound(mp->type)) {                       // resolve the mix to a child material
+            int child = whitted ? dResolveCompoundDominant(sc, *mp, h, rd, lam[0])
+                                : dResolveCompound(sc, *mp, h, rd, lam[0], rng);
             if (child < 0) return;                      // absorbed
             mp = &sc.mats[child]; matId = child;
         }
@@ -12139,8 +12206,8 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
         }
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
-        if (mp->type == D_MIX) {
-            int child = dMixResolveChild(sc, *mp, h, rng.uniform());
+        if (dIsCompound(mp->type)) {
+            int child = dResolveCompound(sc, *mp, h, rd, (Real)550, rng);
             if (child < 0) return L;
             mp = &sc.mats[child]; matId = child;
         }
@@ -12596,8 +12663,8 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
 
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
-        if (mp->type == D_MIX) {
-            int child = dMixResolveChild(sc, *mp, h, rng.uniform());   // honours per-hit blend mask
+        if (dIsCompound(mp->type)) {
+            int child = dResolveCompound(sc, *mp, h, rd, lambda, rng);   // honours per-hit blend mask
             if (child < 0) return;
             mp = &sc.mats[child]; matId = child;
         }
@@ -13961,8 +14028,8 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
         }
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
-        if (mp->type == D_MIX) {
-            int child = dMixResolveChild(sc, *mp, h, rng.uniform());
+        if (dIsCompound(mp->type)) {
+            int child = dResolveCompound(sc, *mp, h, rd, lambda, rng);
             if (child < 0) return;
             mp = &sc.mats[child]; matId = child;
         }
@@ -14307,8 +14374,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
 
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
-        if (mp->type == D_MIX) {
-            int child = dMixResolveChild(sc, *mp, h, rng.uniform());
+        if (dIsCompound(mp->type)) {
+            int child = dResolveCompound(sc, *mp, h, rd, lambda, rng);
             if (child < 0) return;                       // absorbed by the mix
             mp = &sc.mats[child]; matId = child;
         }
@@ -14643,8 +14710,8 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         }
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
-        if (mp->type == D_MIX) {
-            int child = dMixResolveChild(sc, *mp, h, rng.uniform());
+        if (dIsCompound(mp->type)) {
+            int child = dResolveCompound(sc, *mp, h, rd, lambda, rng);
             if (child < 0) return;                       // absorbed by the mix
             mp = &sc.mats[child]; matId = child;
         }
@@ -15246,8 +15313,8 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
 
             const DMaterial* mp = &sc.mats[h.matId];
             int matId = h.matId;
-            if (mp->type == D_MIX) {
-                int c = dMixResolveChild(sc, *mp, h, rng.uniform());
+            if (dIsCompound(mp->type)) {
+                int c = dResolveCompound(sc, *mp, h, rdCur, lamAll[0], rng);
                 if (c < 0) break;
                 mp = &sc.mats[c]; matId = c;
             }
@@ -15499,8 +15566,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
 
             const DMaterial* mp = &sc.mats[h.matId];
             int matId = h.matId;
-            if (mp->type == D_MIX) {
-                int c = dMixResolveChild(sc, *mp, h, rng.uniform());
+            if (dIsCompound(mp->type)) {
+                int c = dResolveCompound(sc, *mp, h, rdCur, lamAll[0], rng);
                 if (c < 0) break;
                 mp = &sc.mats[c]; matId = c;
             }
@@ -16516,11 +16583,18 @@ bool cudaForwardSupported(const Scene& scene) {
         if (oversizedMultilayer(matId)) return true;
         if (usesPaletteTex(matId)) return true;
         if (usesRecord(matId)) return true;
-        // The physical layered stack (coat interface over a weighted body) is CPU-only;
-        // the device shadeStep has no Layered branch, so any Layered material forces a
-        // CPU forward/backward fallback (like indexed palettes).
+        // The physical layered stack (coat interface over a weighted body) RUNS ON THE DEVICE
+        // since 0.317.0: uploadScene gives each coat a synthetic glossy lobe and every
+        // dispatch site resolves the stack through dResolveCompound, exactly as it resolves a
+        // mix. Only the body-lobe COUNT is still bounded, by the same D_MIXMAX the mix arrays
+        // impose -- a stack with more lobes than that has nowhere to put them.
         if (matId >= 0 && matId < (int)scene.mats.size() &&
-            scene.mats[matId].type == MatType::Layered) return true;
+            scene.mats[matId].type == MatType::Layered) {
+            const Material& ly = scene.mats[matId];
+            if ((int)ly.mixChildren.size() > D_MIXMAX) return true;
+            for (int c : ly.mixChildren)
+                if (oversizedMultilayer(c) || usesRecord(c) || usesPaletteTex(c)) return true;
+        }
         // The fiber BCSDF (MatType::Hair) runs on the device as of 0.181.0: the dhair
         // namespace ports hair.h's single-fiber Marschner/Chiang + Yan-medulla model, the
         // curve intersector fills DHit::fiberRadius/tangent, and shadeStep / bkRadiance
@@ -16853,6 +16927,10 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     // --- bake materials ---
     // Fluorescent materials append their emission-SPD CDF to one flat buffer
     // (fluoCdfAll), sliced per material by fluoCdfOffset/fluoCdfN (like lightCdfAll).
+    // Sized to the scene's materials, then GROWN by one synthetic lobe per layered material
+    // (see the loop after the bake). Nothing indexes this array by host material id beyond
+    // scene.mats.size(), and dEmitterForMat scans the emitters rather than a per-material
+    // table, so the extra entries are invisible to everything that does not ask for them.
     std::vector<DMaterial> mats(scene.mats.size());
     std::vector<double> fluoCdfAll;
     // Parametric-record reflect pools (§records stage 6a): each per-hit driven reflect
@@ -16931,6 +17009,9 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         if (d.mixCount > D_MIXMAX) d.mixCount = D_MIXMAX;
         for (int k = 0; k < d.mixCount; ++k) { d.mixChild[k] = m.mixChildren[k]; d.mixWeight[k] = m.mixWeights[k]; }
         d.mixWeightTex = m.mixWeightTex;
+        d.coatModel = m.coatModel;          // D_LAYERED coat (filled out below)
+        d.coatSpecular = m.coatSpecular;
+        d.coatChild = -1;
         d.readsCavity = m.readsCavity ? 1 : 0;
         d.roughnessPat = m.roughnessPat;
         d.filmThicknessPat = m.filmThicknessPat;
@@ -17036,6 +17117,29 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         bakeSpec(m.hairMedullaSigmaS, d.hairMedullaSigmaS);
         bakeSpec(m.hairMedullaSigmaA, d.hairMedullaSigmaA);
         d.hairSigmaAFromReflect = m.hairSigmaAFromReflect ? 1 : 0;
+    }
+
+    // A LAYERED material's coat is a set of FIELDS on the parent, not a child material, so the
+    // device would have nothing to shade with once the coat wins its Fresnel draw. Give it
+    // something: one synthetic GLOSSY lobe per layered material, appended past the scene's own
+    // materials. It inherits the parent's spectral and texture plumbing (so the coat's roughness
+    // map, normal map and pattern bindings come along), is made WHITE because a dielectric coat's
+    // reflection carries no tint of its own, and drops the body lobes and any emission. With this
+    // the coat is an ordinary material and dResolveCompound can hand it to any dispatch site.
+    for (size_t i = 0; i < scene.mats.size(); ++i) {
+        if (scene.mats[i].type != MatType::Layered) continue;
+        DMaterial coat = mats[i];
+        coat.type = D_GLOSSY;
+        for (int s2 = 0; s2 < SPEC_N; ++s2) coat.reflect[s2] = 1.0;
+        coat.rgbAlbedo = {1.0, 1.0, 1.0};
+        coat.reflectTex = -1;
+        coat.reflectPat = -1;
+        coat.mixCount = 0;
+        coat.coatChild = -1;
+        coat.matIsLight = 0;
+        coat.emitPat = -1;
+        mats[i].coatChild = (int)mats.size();
+        mats.push_back(coat);
     }
 
     // --- upload geometry/materials ---
