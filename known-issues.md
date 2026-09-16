@@ -3811,7 +3811,18 @@ top-1 % most saturated pixels, chroma retention is **96.7 % both with and withou
 **Method note, since this is twice now.** Both lattices were found by a human looking at the image,
 and both times the aggregate checks in place said nothing was wrong. The metric added here
 (`scraps/dnscore.py`) tests the *pattern* rather than the mean, which is the only kind of check that
-could have caught either one. `scraps/dntest.cpp` — the standalone harness that runs `denoise.h` on a
+could have caught either one.
+
+> **Correction (2026-09-15, later the same day).** The whole-sequence lattice screen
+> (`scraps/latscan.py`) that verified this fix across all 1147 frames read the PNGs through a
+> hand-written decoder that masked each reconstructed byte to 8 bits only at the END of a row, so
+> the Sub/Avg/Paeth predictors were fed un-wrapped sums and the error walked down each row as
+> noise. Re-run with the decoder fixed (now bit-exact against the PFM development on every pixel
+> tested): median ratio **0.970** (was 0.971 — the ratio is robust to that noise, as reasoned), max
+> **1.229** (was 1.430: the frame-912 "false positive" I attributed entirely to an axis-aligned
+> highlight was mostly decoder noise, and no frame now exceeds the 1.25 flag). The conclusion
+> stands; the numbers are these. Found because the same decoder doubled a flicker measurement
+> elsewhere — the third time today a measurement tool, not the renderer, was the thing wrong. `scraps/dntest.cpp` — the standalone harness that runs `denoise.h` on a
 PFM with no GPU in the loop — is what made the sweep above cheap enough to do properly; the whole
 investigation after the first render was CPU-only.
 
