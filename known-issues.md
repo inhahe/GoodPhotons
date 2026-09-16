@@ -3934,6 +3934,37 @@ the useful part: it is the fourth time in two days that the first explanation wa
 measurement-tool or method error, and the check that catches it is always the same — change
 one thing.
 
+### OPEN (2026-09-16): a mode-M GPU gather died with `unspecified launch failure` under concurrent GPU load — and the batch carried on as if it hadn't
+
+During the `gallery_rain` cloud-circuit render (four `-loadmap` prefix runs, ~100 s/frame at
+320x180), run `fly06` stopped at frame 642 of 700:
+
+    [camera] frame 43/100  —  [gather] 21 / 32 spp (66%), 40.0M photons, 3:13:07, ~21.82% noise
+    [cuda] photon-gather kernel failed: unspecified launch failure
+
+The timestamp coincides with a title-bar probe launching a forward-mode GPU render (a 2-billion-
+photon deposit that ran for minutes) on the same card, alongside a mode-D quick preview. The
+gather's slices are long; under that contention one very likely tripped the driver's watchdog
+(a TDR shows up exactly as a launch failure on the next call), and the context was gone. Not
+proven — nothing was instrumented at the time — but the correlation is tight, and the working
+rule until it is: **do not run other GPU jobs alongside a long mode-M gather.** Three things worth
+fixing, in order of value:
+
+1. **The batch did not notice.** The chained runs continued to `fly07`, and the only evidence
+   was `ALL DONE: 193 frames` against an expected 250 — found by counting files afterwards. A
+   run that loses its CUDA context should exit non-zero *and say so on the last line*, so a
+   chain (or a human) can see it without diffing directory listings. Whether it currently
+   exits non-zero at all is unverified; the bash chain ignored exit codes, which is my fault
+   and now fixed in the scratch chain (each group's log is grepped for `kernel failed`).
+2. **Recover rather than die.** A gather losing its context mid-frame could re-create the
+   context, re-upload the banked map and resume from the last completed spp — the checkpoint
+   machinery for that already exists on the CPU side.
+3. **Instrument it.** Log the slice duration before each gather launch, so a watchdog kill
+   can be told from a genuine kernel fault next time.
+
+Frames 642–699 were re-rendered off the same banked map (`-loadmap`), so the delivered
+sequence is complete; the seam is invisible by construction since the map is bit-identical.
+
 ### STALE-LIMITATION AUDIT (2026-09-13) — documented limitations are less re-tested than open bugs
 
 Three recorded blockers dissolved in one session, each on a single grep against code that had moved
