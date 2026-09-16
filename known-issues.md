@@ -4018,6 +4018,16 @@ above), mode M's streaks fall with beams gathered, and gather cost is linear in 
 blur at the same count). Options and costs are in the session notes; the decision belongs to
 the user.
 
+### OPEN (2026-09-16): `-direct-only` is silently ignored by mode D (and any non-backward mode)
+
+`g_directOnly` is consulted by the backward tracer (modes R/W, the explorer's refinement
+sessions, the radiance-cache gate) and by nothing in `bdpt.h`. A `-mode D -direct-only` render
+therefore runs the full transport and says nothing — measured: a seed pair with and without the
+flag gave identical noise (17.91 levels) and identical mean (63.3) to two decimals, which is how
+this was noticed. It should warn ("-direct-only has no effect in mode D") the way the
+radiance-cache gate already warns for its own no-op cases. Until then: do not use it to ask
+mode D where its variance lives.
+
 ### STALE-LIMITATION AUDIT (2026-09-13) — documented limitations are less re-tested than open bugs
 
 Three recorded blockers dissolved in one session, each on a single grep against code that had moved
