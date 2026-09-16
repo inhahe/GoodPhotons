@@ -3965,6 +3965,52 @@ fixing, in order of value:
 Frames 642–699 were re-rendered off the same banked map (`-loadmap`), so the delivered
 sequence is complete; the seam is invisible by construction since the map is bit-identical.
 
+### MEASURED (2026-09-16): mode M's "light shafts" in the backlit rain are BEAM STREAKS — a converged mode D has none — and 5x the photons only fades them
+
+**Correction of the mode-M entry above (rain speckle).** I described mode M's rain there as
+"coherent crepuscular shafts, the thing we actually want". The user asked the obvious question
+— nothing in the scene makes shafts, so shouldn't the rain be uniform? — and one frame in each
+estimator answers it. Frame 555 (`gallery_rain`, sun dead behind the cloud), 320x180:
+
+| | cloud | rain |
+|---|---|---|
+| mode D, 8192 spp (reference) | smooth, evenly lit | soft uniform haze, **no rays** |
+| mode M, 40M photons / 100k beams | lumpy, chromatic speckle, a starburst | a **radial fan of rays** converging on the sun |
+| mode M, 200M photons / 500k beams | smooth, matches the reference | fan fainter and finer, still present |
+
+The rays are stored beams: every beam is a photon chord from the sun, parallel chords converge
+to the sun's vanishing point in perspective, and too few of them under a kernel is *spatially
+correlated* variance that reads as lines — exactly the "STREAKS" the scene header records for
+the cloud, now seen in the rain from the one viewpoint that lines the chords up with the eye.
+The coloured rays are the same thing one step further: the 11–17 % of beams (by power) that
+cannot be folded achromatically are single-wavelength lines, and the chroma denoiser cannot
+touch them because they are coherent, not speckle (rain saturation before/after the filter:
+0.268 → 0.282 at 960x540 — unchanged).
+
+**Numbers.** Signed difference M − D over the cloud-and-rain column, developed: RMS **14.0**
+levels at 40M photons, **10.9** at 200M (mean |M−D| 9.24 → 6.50). Per-probe beams gathered
+521 → 2744 (5.3x); gather time 100 s → 786 s (7.9x) at 320x180, spp 32 — at 960x540 that is
+~2 h per frame. Whether the remaining 10.9 is mostly the *reference's own* per-pixel noise is
+being measured with a second reference seed; if it is, 200M is close to converged and the
+cost is the whole story.
+
+**Three statistics failed to see a fan the eye caught at once, and each failure is the
+instructive part.** (1) Pearson correlation after a 2 px blur read 0.997 — the bright-centre
+gradient carried it. (2) Fine-structure RMS (σ1−σ8) read 24.5 % in both — the reference's own
+incoherent per-pixel noise happens to match the rays' RMS. (3) A "streak band" (σ2−σ8) read
+16.9 % in both even with the floor grid masked out — the exhibits seen *through* the rain
+carry that band in both images. A signed difference image (`scraps/diffimg.py`) has no such
+blind spot: what is in one estimator and not the other is simply there, in its own shape.
+Rule recorded: for "is this structure real", compare against the reference *as an image*
+first and reach for a statistic only to put a number on what the image already shows.
+
+**What it means for the flyby.** The backlit rain is expensive in BOTH estimators, for
+different reasons: mode D's per-frame noise falls as spp^-0.15 (the heavy tail measured
+above), mode M's streaks fall with beams gathered, and gather cost is linear in beams gathered
+— so in mode M, noise^-2 buys nothing for free either (a bigger kernel trades density for
+blur at the same count). Options and costs are in the session notes; the decision belongs to
+the user.
+
 ### STALE-LIMITATION AUDIT (2026-09-13) — documented limitations are less re-tested than open bugs
 
 Three recorded blockers dissolved in one session, each on a single grep against code that had moved
