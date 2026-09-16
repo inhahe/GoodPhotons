@@ -3524,6 +3524,9 @@ as the one at fault.
   gallery_rain's sun-lit cloud the scalar `l = 0` reconstruction is 7 % dark and the bins recover
   it at no measurable cost, so since 0.311.0 the bins are the **default whenever `g != 0`**
   (`FTRACE_VOLCACHE_SH=0` forces the scalar reconstruction, `=1` forces the bins).
+  Since 0.315.0 it is a command-line feature: `-volcache [res|off]` (the split included) and
+  `-volcache-sh auto|on|off` set `vccfg::*` in `volcache.h`, which the accessors consult before
+  the `FTRACE_VOLCACHE*` environment variables the prototype was gated by (still honoured).
   Since 0.302.0 it serves **heterogeneous** media too (optical depth is integrated along the
   chord rather than assumed) and keeps **one grid per medium**, so a scene can be partially
   cached -- `gallery_rain` caches its HG cloud while its `phase rainbow` rain stays as beams.

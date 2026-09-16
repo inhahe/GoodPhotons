@@ -12303,7 +12303,7 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
         if (!quiet) std::printf(fmt, args...);
     };
     auto t0 = std::chrono::steady_clock::now();
-    // VOLCACHE DEPOSIT SPLIT (flag-gated, inert unless FTRACE_VOLCACHE + FTRACE_VOLCACHE_SPLIT).
+    // VOLCACHE DEPOSIT SPLIT (inert unless `-volcache`, or the FTRACE_VOLCACHE* environment).
     // Before ANY of the expensive per-beam work below: route the order >= 2 chords into the
     // fluence grid and drop them from the map, so the split, the CIE table, the boxes and the
     // BVH are all built over the order < 2 remainder only.
@@ -19391,6 +19391,20 @@ static int run(int argc, char** argv) {
         }
         else if (!std::strcmp(argv[i], "-sunnee") || !std::strcmp(argv[i], "-sun-nee"))
             pbeams::gSunNee = true;
+        // VOLCACHE (volcache.h): `-volcache [res]` = the per-medium fluence cache at res^3 (default
+        // 48) WITH the deposit split; `-volcache off` = off. `-volcache-sh auto|on|off` picks the
+        // reconstruction. These set vccfg::* and win over the FTRACE_VOLCACHE* environment.
+        else if (!std::strcmp(argv[i], "-volcache")) {
+            int res = 48;
+            if (i + 1 < argc && (!std::strcmp(argv[i + 1], "off") || !std::strcmp(argv[i + 1], "0"))) { res = 0; ++i; }
+            else if (i + 1 < argc && std::atoi(argv[i + 1]) > 0) { res = std::atoi(argv[++i]); }
+            vccfg::res = res; vccfg::split = res > 0 ? 1 : 0;
+        }
+        else if (!std::strcmp(argv[i], "-volcache-sh") && i + 1 < argc) {
+            const char* v = argv[++i];
+            vccfg::sh = (!std::strcmp(v, "off") || !std::strcmp(v, "0") || !std::strcmp(v, "scalar")) ? 0
+                      : (!std::strcmp(v, "on") || !std::strcmp(v, "1") || !std::strcmp(v, "bins")) ? 1 : -1;
+        }
         else if (!std::strcmp(argv[i], "-beams-minorder") && i + 1 < argc) {
             const int v = std::atoi(argv[++i]);
             pbeams::gOrderMin = (v < 0) ? 0 : v;

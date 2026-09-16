@@ -489,7 +489,7 @@ inline size_t volCacheSplit(const Scene& sc, BeamMap& bm) {
         if (!said) {
             said = true;
             std::fprintf(stderr,
-                "[volcache] FTRACE_VOLCACHE_SPLIT is set but the consuming gather cannot "
+                "[volcache] the deposit split is on (-volcache / FTRACE_VOLCACHE_SPLIT) but the consuming gather cannot "
                 "march the cache\n"
                 "           (volCacheHostGather() is false: a path with no cache march, e.g. mode J's "
                 "UPBP-conv wavefront queue, kWfBeamEval). Splitting\n"

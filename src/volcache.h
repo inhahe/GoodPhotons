@@ -75,6 +75,16 @@
 #include "linalg.h"
 #include "photonbeams.h"
 
+// COMMAND-LINE CONFIGURATION (0.315.0). `-volcache [res]` sets `res` and `split`, `-volcache-sh`
+// sets `sh`; anything left at its "unset" value falls back to the environment variables the
+// prototype was gated by (FTRACE_VOLCACHE, FTRACE_VOLCACHE_SPLIT, FTRACE_VOLCACHE_SH), which
+// stay honoured so older scripts and notes keep working. The flags win when both are given.
+namespace vccfg {
+inline int res   = -1;   // -1 = unset; 0 = off; else the grid resolution per axis
+inline int split = -1;   // -1 = unset; 0/1
+inline int sh    = -2;   // -2 = unset; -1 = auto (bins when g != 0); 0 = scalar; 1 = bins
+}
+
 // Real SH, bands 0..2 (9 coefficients). Order 2 because the series converges geometrically in
 // g: at the g = 0.46 of gallery_rain's cloud the bands carry 1, 0.46, 0.21, 0.097, so band 3
 // is under a tenth of band 0 and bands 0..2 hold ~96% of the weight. Probe-based real-time GI
@@ -209,11 +219,12 @@ struct VolCache {
         //   FTRACE_VOLCACHE_SH unset : bins whenever g != 0 (at g = 0 they ARE the scalar cache)
         //   FTRACE_VOLCACHE_SH=0     : the scalar (l = 0) reconstruction regardless of g
         //   FTRACE_VOLCACHE_SH=1     : the bins (same as unset; kept for the old spelling)
-        static const int shMode = [] {
+        static const int shEnv = [] {
             const char* e = std::getenv("FTRACE_VOLCACHE_SH");
             if (!e || !*e) return -1;
             return std::atoi(e) != 0 ? 1 : 0;
         }();
+        const int shMode = (vccfg::sh >= -1) ? vccfg::sh : shEnv;   // -volcache-sh wins over the env
         bowMode = (bowMom != nullptr);
         emPick  = emitter;
         if (bowMode) {
@@ -421,18 +432,19 @@ struct VolCache {
 // gather branches clear it.
 inline bool& volCacheHostGather() { static bool b = true; return b; }
 
+
 inline bool volCacheSplitEnabled() {
-    static const bool b = [] {
+    static const bool env = [] {
         const char* e = std::getenv("FTRACE_VOLCACHE_SPLIT");
         return e && *e && std::atoi(e) != 0;
     }();
-    return b;
+    return vccfg::split >= 0 ? vccfg::split != 0 : env;
 }
 
 inline int volCacheRes() {
-    static const int n = [] {
+    static const int env = [] {
         const char* e = std::getenv("FTRACE_VOLCACHE");
         return (e && *e) ? std::atoi(e) : 0;
     }();
-    return n;
+    return vccfg::res >= 0 ? vccfg::res : env;
 }

@@ -4155,7 +4155,7 @@ chords, not order >= 2. At **128 spp**: beams 598 s, rain 9.64, cloud 14.00; `-s
 that number is per-pixel noise, is `png/sn/_beams_vs_sunnee_vc_128spp_crop.png`: the shafts that
 fanned from the cloud through the whole rain volume are gone, leaving the soft physical glow, a
 smooth cloud, and fewer coloured specks. **Recommendation for the flyby: mode M with `-beams
--sunnee` and the cache on.**
+-sunnee -volcache` (the cache has a flag since 0.315.0).**
 
 **The measurement lesson, again.** The reference's tail carried half the energy of the region
 being scored, so both the earlier "excess" numbers and the earlier reading of "no shafts in mode
@@ -4229,7 +4229,7 @@ cloud, which is real and small; and a **trilinear** cache read between cell cent
   smooth gradient where 0.312 had patches and squares.
 - At 960x540 with `-denoise` (the frame that was reported): cloud chroma mean 9.40 -> 8.24, p95
   17.1 -> 11.3, and the frame 390 s -> 339 s. **Recommendation for the flyby: `-beamachro all`
-  alongside `-sunnee` and the cache.**
+  alongside `-sunnee` and `-volcache`.**
 
 **The sun's disc through the cloud — physical, and steadied (0.314.0).** The white dot at the
 cloud's centre in frame 555 is the sun (0.53 deg = 4 px at `fov_y 70`), seen through an optical
