@@ -546,6 +546,34 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
     // Pass 1 — every material, previewed through its CONSTANT-weight mix chain.
     for (size_t i = 0; i < sc.mats.size(); ++i)
         matSh[i] = bakeOwn(sc.mats[resolveMix(i)]);
+    // Pass 1.5 — RASTER-PBR through a MIX (0.316.0). Pass 1 collapses a mix to its DOMINANT
+    // child, which for a specular-over-diffuse stack is the body: the lobe is in the light
+    // child and was thrown away, so an imported glTF dielectric (gltf.h builds exactly that
+    // stack: a 4 % uncoloured glossy lobe over the diffuse body) previewed as chalk while the
+    // viewer it came from showed satin -- the reported gallery_rain/Alice case. Take the first
+    // glossy child's lobe, with F0 scaled by its selection weight, on top of the dominant
+    // child's colour. Only when pass 1 found no lobe of its own, so a mix whose dominant child
+    // IS the glossy one keeps its full-strength highlight.
+    for (size_t i = 0; i < sc.mats.size(); ++i) {
+        const Material& m = sc.mats[i];
+        if (m.mixChildren.empty() || matSh[i].rough >= 0.0) continue;
+        for (size_t k = 0; k < m.mixChildren.size(); ++k) {
+            const int c = m.mixChildren[k];
+            if (c < 0 || c >= (int)sc.mats.size()) continue;
+            const Material& cm = sc.mats[c];
+            if (cm.isLight || cm.type != MatType::Glossy) continue;
+            double w = (k < m.mixWeights.size()) ? m.mixWeights[k] : 0.0;
+            w = (w < 0.0) ? 0.0 : (w > 1.0 ? 1.0 : w);
+            if (!(w > 0.0)) continue;
+            bool dummyEm = false;
+            const Vec3 cf0 = materialColor(cm, dummyEm);
+            matSh[i].rough    = (cm.roughness > 0.0) ? cm.roughness : 0.2;
+            matSh[i].f0       = Vec3{cf0.x * w, cf0.y * w, cf0.z * w};
+            matSh[i].roughPat = cm.roughnessPat;
+            matSh[i].roughTex = cm.roughnessTex;
+            break;
+        }
+    }
     // Pass 2 — upgrade the two-child mixes whose blend is driven per hit by `weight_map`.
     // Pass 1 collapsed these to whichever child had the larger CONSTANT weight (usually a
     // 50/50 tie, so always child 0), which is why a weight-mapped mix previewed as one flat

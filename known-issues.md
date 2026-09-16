@@ -4271,6 +4271,49 @@ handling or the direct-env term on the two backends, not the beam code. Not inve
 media-free frame (`-beams` off) to isolate the surface gather, then the two maps' radii and photon
 counts compared.
 
+### FIXED (2026-09-16, v0.316.0): an imported glTF DIELECTRIC lost its specular lobe -- a painted character imported as chalk
+
+**Reported** as "Alice's dress isn't showing up as glossy in `-explore`, and it did in Meshy".
+It was not coded as glossy anywhere: `meshes/alice.glb` has one material, `metallicFactor 1.0` /
+`roughnessFactor 1.0` with a metallicRoughness map whose **mean metalness is 0.28** (so the
+importer's mean-metalness harvest correctly called it a dielectric, not a mirror) and whose **mean
+roughness is 0.25** (satin). glTF gives such a material a 4 % specular lobe carrying that same
+roughness map; `gltf.h` typed it `MatType::Diffuse` and dropped the lobe, so there was no highlight
+in mode D, mode M **or** the preview. Fixed by importing the lobe as a two-child `mix` -- see
+design.md, "Imported glTF dielectrics keep their specular lobe", for why a `mix` and not `layered`.
+
+**Measured** on `scraps/alice_probe.ftsl` (Alice alone, one key + one fill, 480x600), as
+`-import-specular off` -> on, counting pixels that brightened by more than 2 levels out of 255:
+
+| path | px brightened | peak | note |
+|---|---:|---:|---|
+| mode D (GPU, 256 spp) | 8,737 (3.2 % of lit) | **+147** | the reference |
+| mode M (GPU, 64 spp) | 4,166 (1.6 %) | **+71** | the flyby's mode; **stays on the GPU** |
+| `-raster` / `-explore` | 2,217 (0.1 %) | +5 | present but faint -- see below |
+
+Mode M still reports `shared photon map (mode M) on NVIDIA GeForce RTX 4090`, i.e. the `mix` did
+**not** trip the CPU fallback that a `layered` material would have.
+
+**The preview shows it, but faintly, and that is a SEPARATE limitation.** `scraps/gloss_probe.ftsl`
+(three spheres: explicit `glossy` 0.25, a hand-written 4 % glossy-over-diffuse `mix`, a diffuse
+control) confirms the rasterizer draws the mix's lobe -- the middle sphere has exactly the small
+dielectric highlight the left one has at full strength, and the right one none. On Alice the same
+lobe is nearly invisible because of the **environment half of the split sum**: this preview's
+environment is a single scalar (`PreviewLight::ambient`), so `prefiltered(R, roughness)` degenerates
+to a constant and a 4 % lobe has nothing bright to reflect. Meshy reflects an HDRI, where the sky is
+several times the mean scene radiance and the grazing Fresnel rise lands on a bright source -- that,
+not the lobe, is most of what reads as satin there. Giving the raster a directional environment for
+the specular term (even a sky/ground gradient anchored on `ambient`) is the outstanding piece; it is
+preview-only and cannot affect a render.
+
+**Still open, both logged here rather than fixed:**
+- **No Fresnel angular ramp in the renderers.** A mix weight is constant, so the imported lobe does
+  not brighten toward grazing incidence. The fix is to port **`MatType::Layered`** to the device
+  (`D_LAYERED` has an enum slot and no branch; `cudaForwardSupported` rejects the scene instead),
+  then import a real Fresnel coat. Until then a dielectric's rim sheen is missing.
+- **Every glTF asset in the repo changes appearance slightly** (the camrig scenes included): they
+  all gain the 4 % lobe they should have had. `-import-specular off` reproduces the old look.
+
 ### OPEN (2026-09-16): `-direct-only` is silently ignored by mode D (and any non-backward mode)
 
 `g_directOnly` is consulted by the backward tracer (modes R/W, the explorer's refinement

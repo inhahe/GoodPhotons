@@ -18768,6 +18768,14 @@ static int run(int argc, char** argv) {
     bool rasterPrescan = false;
     for (int i = 1; i < argc; ++i) {
         if (parseFurFlag(argc, argv, i)) continue;
+        // Read HERE, not in the main argument loop below: the scene is loaded further down
+        // this function (ftsl::load), so a flag that changes how an ASSET IS IMPORTED has to
+        // be known before that. Parsed in the main loop too, so it is a recognised option
+        // (and so `-h` lists it); setting the same bool twice is harmless.
+        if (!std::strcmp(argv[i], "-import-specular") && i + 1 < argc) {
+            const char* v = argv[i + 1];
+            gltfimp::dielectricSpecular = !(!std::strcmp(v, "off") || !std::strcmp(v, "0"));
+        }
         if (!std::strcmp(argv[i], "-raster") || !std::strcmp(argv[i], "-raster-gpu") ||
             !std::strcmp(argv[i], "-raster-bench") || !std::strcmp(argv[i], "-explore") ||
             !std::strcmp(argv[i], "-fly") || !std::strcmp(argv[i], "-loom") ||
@@ -19391,6 +19399,12 @@ static int run(int argc, char** argv) {
         }
         else if (!std::strcmp(argv[i], "-sunnee") || !std::strcmp(argv[i], "-sun-nee"))
             pbeams::gSunNee = true;
+        // Imported glTF dielectrics: keep glTF's specular lobe (default) or type them flat
+        // `diffuse` the way the importer did before 0.316.0. See gltf.h.
+        else if (!std::strcmp(argv[i], "-import-specular") && i + 1 < argc) {
+            const char* v = argv[++i];
+            gltfimp::dielectricSpecular = !(!std::strcmp(v, "off") || !std::strcmp(v, "0"));
+        }
         // VOLCACHE (volcache.h): `-volcache [res]` = the per-medium fluence cache at res^3 (default
         // 48) WITH the deposit split; `-volcache off` = off. `-volcache-sh auto|on|off` picks the
         // reconstruction. These set vccfg::* and win over the FTRACE_VOLCACHE* environment.

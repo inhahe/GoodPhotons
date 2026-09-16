@@ -828,6 +828,44 @@ with the volcache on as well, 102 beams and 76 s. What the flag cannot remove is
 fan of the rain shadowing itself along the sun direction, nor the lines of the sky-lit order-1
 chords that stay as beams (known-issues, "-sunnee").
 
+### Imported glTF dielectrics keep their specular lobe (0.316.0)
+
+**What was wrong.** `gltf.h` mapped `pbrMetallicRoughness` onto one BSDF per material: transmissive
+-> `Dielectric`, `metallic >= 0.5` -> `Glossy`, **everything else -> `Diffuse`**. But glTF's model
+gives a dielectric a specular lobe as well as an albedo -- F0 = `((n-1)/(n+1))^2`, 4 % at the
+default ior 1.5, modulated by the same roughness map the metal branch reads -- so that last branch
+threw away half of what the asset described. `gallery_rain`'s Alice is the case that surfaced it:
+one Meshy-class material, `metallicFactor 1.0` / `roughnessFactor 1.0` with the real values in a
+metallicRoughness map (mean metalness **0.28** -> dielectric, mean roughness **0.25** -> satin), and
+she imported as chalk in every mode.
+
+**Why a `mix` and not `layered`.** `layered` is the physical model -- a Fresnel coat over a weighted
+body, `coat { roughness ... }` and all -- and it is unusable here: **`MatType::Layered` has no device
+branch at all**, so `cudaForwardSupported`'s `unsupported()` rejects any scene containing one and
+the whole render falls back to the CPU tracer. Typing Alice `layered` would have taken a mode-M
+flyby off the GPU without a word. So the importer builds a two-child **`Mix`**: an *uncoloured*
+glossy lobe (weight F0, `reflect` white -- the 4 % lives in the weight, folding it in twice would
+square it) over the diffuse body (weight 1-F0), sharing the roughness and normal maps. Mix weights
+are selection probabilities that are not reweighted, so the two lobes partition each photon exactly
+and energy is conserved by construction; `D_MIX` is supported on every backend and in every mode.
+
+**What that gives up.** The Fresnel **angular ramp**. A mix weight is a constant, so the lobe stays
+at F0 instead of rising toward grazing incidence, and the silhouette rim sheen is missing in the
+path tracers. (The rasterizer's direct lobe applies its own Schlick ramp on top of `f0`, so the
+preview is closer to glTF truth than the renderers are here.) Porting `D_LAYERED` to the device
+would fix it properly and is the logged follow-up.
+
+**The preview.** `raster.h`'s pass 1 collapses a mix to its *dominant* child, which for
+specular-over-diffuse is the body -- so the lobe was baked away before it could be drawn. Pass 1.5
+takes the first glossy child's lobe with `f0` scaled by its selection weight, on top of the dominant
+child's colour, and only when pass 1 found no lobe of its own. `PShade` is the host bake both
+rasterizers upload from, so the CUDA preview gets it too.
+
+**A trap worth knowing.** `-import-specular` is read in the **pre-scan** argument loop
+(`main.cpp` ~18770), not the main one: the scene is loaded at ~18907, well before the main loop
+runs, so a flag that changes how an asset is *imported* has no effect if it is parsed there. The
+first version of this flag was, and the A/B silently compared two identical renders.
+
 ### The beam budget — sizing the map from the scene's own knee (0.242.0)
 
 `-n` alone was a cliff, not a tuning wart: at the inherited forward-mode default of `-n 2e6`,

@@ -37,6 +37,11 @@
 
 #include <chrono>
 
+// `-import-specular off` types an imported glTF DIELECTRIC as a plain `diffuse`, the way the
+// importer did before 0.316.0 -- an A/B control for the change, and an escape hatch for a scene
+// that wants the old flat look. Metals (`metallic >= 0.5`) are unaffected either way.
+namespace gltfimp { inline bool dielectricSpecular = true; }
+
 namespace gltfimpl {
 
 // Read an entire file into a byte vector. Returns false on open failure.
@@ -674,6 +679,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                     }
                 }
                 Material m;
+                bool wantCoat = false;   // dielectric: add glTF's specular lobe over the body
                 m.reflect = rgbToReflectanceJH(r, g, b);
                 // Heuristic map onto the spectral BSDFs: transmissive -> dielectric,
                 // metals -> glossy tinted by the base color, everything else -> diffuse.
@@ -717,7 +723,13 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                     m.type = MatType::Glossy;
                     m.roughness = std::max(0.02, roughness);
                 } else {
+                    // A DIELECTRIC. glTF gives it a specular lobe as well as an albedo -- F0 =
+                    // ((n-1)/(n+1))^2, 4 % at the default ior 1.5, carrying the SAME roughness
+                    // map -- and dropping it is what imports a satin dress as chalk. The body is
+                    // built here exactly as before; the lobe is added over it below, once the
+                    // maps are bound, so the two share them.
                     m.type = MatType::Diffuse;
+                    wantCoat = gltfimp::dielectricSpecular;
                 }
                 // Bind the maps. reflectTex REPLACES the constant `reflect` spectrum at
                 // each hit (the factor is already folded into its texels above), so it is
@@ -728,6 +740,40 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                 if (normalTexId >= 0) {
                     m.normalTex = normalTexId;
                     m.normalStrength = normalScale;
+                }
+                // THE DIELECTRIC'S SPECULAR LOBE (0.316.0). Expressed as a two-lobe `mix` --
+                // an uncoloured glossy lobe selected with probability F0, the diffuse body with
+                // 1-F0 -- because that is what every backend can already render. `layered`, the
+                // physical coat, would be the better model and is NOT usable here: it has no
+                // device branch, so cudaForwardSupported rejects the whole scene and a mode-M
+                // flyby would silently fall back to the CPU tracer. The price is the Fresnel
+                // ANGULAR RAMP: a mix weight is a constant, so the lobe stays at F0 instead of
+                // rising toward grazing incidence, and the silhouette rim sheen is missing.
+                // Mix weights are selection probabilities that are NOT reweighted, so the two
+                // lobes partition each photon exactly and energy is conserved by construction.
+                if (wantCoat) {
+                    const double f0 = ((khrIor - 1.0) / (khrIor + 1.0)) *
+                                      ((khrIor - 1.0) / (khrIor + 1.0));
+                    Material coat;
+                    coat.type = MatType::Glossy;
+                    // UNCOLOURED: a dielectric's specular reflection carries no tint (the tint
+                    // is the body's). The 4 % lives in the mix weight, so this slot is white --
+                    // `reflect` is the glossy lobe's normal-incidence reflectance, and folding
+                    // F0 in here as well would square it.
+                    coat.reflect = rgbToReflectanceJH(1.0, 1.0, 1.0);
+                    coat.roughness = std::max(0.02, roughness);
+                    coat.roughnessTex = roughTexId;
+                    if (normalTexId >= 0) {
+                        coat.normalTex = normalTexId;          // the coat follows the same bumps
+                        coat.normalStrength = normalScale;
+                    }
+                    const int bodyId = (int)s.mats.size(); s.mats.push_back(m);
+                    const int coatId = (int)s.mats.size(); s.mats.push_back(coat);
+                    Material mix;
+                    mix.type = MatType::Mix;
+                    mix.mixChildren = {coatId, bodyId};
+                    mix.mixWeights  = {f0, 1.0 - f0};
+                    m = mix;
                 }
                 int id = (int)s.mats.size();
                 s.mats.push_back(m);
