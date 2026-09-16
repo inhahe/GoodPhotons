@@ -18,7 +18,9 @@
 //      path, the two flags were silently mutually exclusive — `-savemap -beams` exited 0 and
 //      wrote nothing at all.
 //
-// Format. `FTPMP08\n` = header, surface block, beam block, CAUSTIC block. `FTPMP07\n`,
+// Format. `FTPMP09\n` = header, surface block, beam block, CAUSTIC block; its beam record is the
+// live PhotonBeam with chord PROVENANCE valid (srcEm / surf, 0.312.0). `FTPMP08\n` = the same
+// width with those two fields unset (the loader resets them to "unknown"). `FTPMP07\n`,
 // `FTPMP06\n`, `FTPMP05\n` and `FTPMP04\n` have the same block layout but successively NARROWER
 // beam records (v7 lacks the bundle's per-member weights, v6 lacks those AND the gather-time
 // spectral fold, v5 lacks all that AND the deposit-time achromatic fold, v4 lacks all four —
@@ -139,7 +141,13 @@ struct PhotonBeamV7 {
 static_assert(kBeamSecMax == 3,
               "kBeamSecMax changed: PhotonBeam's on-disk width moved, so FTPMP08 no longer "
               "describes the live record. Freeze the old layout as PhotonBeamV8 and bump the "
-              "magic to FTPMP09 — do NOT edit PhotonBeamV5, V6 or V7.");
+              "magic to FTPMP10 — do NOT edit PhotonBeamV5, V6 or V7.");
+// FTPMP09 (0.312.0) put chord provenance INTO the tail padding, so it reads FTPMP08 files with
+// the same stride and merely resets those two fields. That only holds while the record is
+// exactly 120 bytes; a wider record needs a frozen PhotonBeamV9 and an FTPMP10 magic.
+static_assert(sizeof(PhotonBeam) == 120,
+              "PhotonBeam's on-disk width moved: FTPMP09 and the FTPMP08 files it still reads "
+              "assume a 120-byte record with srcEm/surf in the tail padding.");
 
 // Scene-identity guard: refuses to blend a stale cache into a different scene. Cheap and
 // coarse on purpose — it catches "wrong file", not "same scene, one triangle moved".
@@ -165,7 +173,7 @@ inline bool savePhotonMap(const char* path, const PhotonMap& pm,
                           const PhotonMap* pmCaustic = nullptr) {
     std::FILE* f = std::fopen(path, "wb");
     if (!f) { std::fprintf(stderr, "[savemap] cannot open %s for writing\n", path); return false; }
-    const char magic[8] = {'F','T','P','M','P','0','8','\n'};
+    const char magic[8] = {'F','T','P','M','P','0','9','\n'};
     long long nPh = (long long)pm.photons.size();
     double en[5] = {e.emitted, e.absorbed, e.sensor, e.escaped, e.residual};
     bool ok = true;
@@ -231,7 +239,8 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
     char magic[8] = {0};
     long long nEmitted = 0, nPh = 0; double en[5] = {0,0,0,0,0}; uint64_t g = 0;
     bool ok = std::fread(magic, 1, 8, f) == 8;
-    const bool v8 = ok && std::memcmp(magic, "FTPMP08\n", 8) == 0;
+    const bool v9 = ok && std::memcmp(magic, "FTPMP09\n", 8) == 0;
+    const bool v8 = v9 || (ok && std::memcmp(magic, "FTPMP08\n", 8) == 0);   // v9 = v8 + provenance
     const bool v7 = v8 || (ok && std::memcmp(magic, "FTPMP07\n", 8) == 0);   // v8 ⊃ v7 blocks
     const bool v6 = v7 || (ok && std::memcmp(magic, "FTPMP06\n", 8) == 0);   // v7 ⊃ v6 blocks
     const bool v5 = v6 || (ok && std::memcmp(magic, "FTPMP05\n", 8) == 0);   // v6 ⊃ v5 blocks
@@ -296,6 +305,10 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
             bool rok;
             if (v8) {
                 rok = std::fread(bm->beams.data(), sizeof(PhotonBeam), (size_t)nBm, f) == (size_t)nBm;
+                // An FTPMP08 file has the same width, but its tail bytes predate chord provenance
+                // (0.312.0): say "unknown" rather than trust whatever the old writer left there.
+                if (rok && !v9)
+                    for (auto& b : bm->beams) { b.srcEm = -1; b.surf = 255; b.pad2 = 0; }
             } else {
                 // Widen an older file in place. Read into the frozen old layout a chunk at a
                 // time rather than allocating a second full array: the beam map is routinely
@@ -331,6 +344,8 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
                     // v7 added the GATHER-time fold. Nothing older can name an emitter, and -1
                     // is the right answer: the beam re-gathers exactly as the file was traced.
                     b.emIdx = -1;
+                    // v9 added chord provenance (0.312.0). Nothing older recorded it: unknown.
+                    b.srcEm = -1; b.surf = 255; b.pad2 = 0;
                     // v8 added the bundle's per-member weights. Every pre-v8 bundle was an
                     // EQUAL-weight one by construction, so 1 is exact rather than merely safe.
                     for (int k = 0; k < kBeamSecMax; ++k) b.wS[k] = 1.0f;

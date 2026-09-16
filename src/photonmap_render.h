@@ -1177,6 +1177,9 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                             ? 1.0 / (areaC * (double)pmC->nEmitted) : 0.0;
 
     const bool volOn = (bm != nullptr) && !bm->empty() && !scene.media.empty();
+    // -sunnee: the sun's single scatter is marched, not gathered (beamgather.h sunNeeMarch).
+    // Not gated on the map being non-empty: erasing the direct-sun chords may have emptied it.
+    const bool sunOn = (bm != nullptr) && pbeams::gSunNee && scene.sunCount > 0 && !scene.media.empty();
     // GRADIENT-INDEX: the CAMERA ray has to bend too. Mode M's forward deposit has marched
     // since GRIN landed, but this gather called closestHit directly, so a GRIN lens bent the
     // photons and not the view: the lens rendered dead flat while mode R lensed the same
@@ -1205,9 +1208,10 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
         if (grinAny) {
             grin::marchSegments(scene, ray,
                 [&](const Vec3& so, const Vec3& sd, double slen, double&) -> bool {
-                    if (volOn) {
-                        { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
+                    if (volOn || sunOn) {
+                        if (volOn) { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
                           L += gatherPhotonBeams(scene, mats, *bm, so, sd, slen, aGlass, rng) * thr; }
+                        if (sunOn) L += sunNeeMarch(scene, mats, so, sd, slen, aGlass, lambda, invPdfL, rng) * thr;
                         thr *= mats.mediaTransmittance(scene, so, sd, slen, lambda, rng);
                     }
                     if (aGlass > 0.0) thr *= std::exp(-aGlass * slen);
@@ -1228,12 +1232,13 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
         // --- Participating media along this segment (mode M with -beams) ---------------
         // Done BEFORE `thr` takes the segment's attenuation, because each gathered beam
         // needs the transmittance to ITS OWN closest-approach point, not to the segment end.
-        if (volOn) {
+        if (volOn || sunOn) {
             const double dSeg = h.valid ? h.t : 1e30;
-            { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
+            if (volOn) { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
               L += gatherPhotonBeams(scene, mats, *bm, ray.o, ray.d, dSeg, aGlass, rng)
                    * thr;
               }
+            if (sunOn) L += sunNeeMarch(scene, mats, ray.o, ray.d, dSeg, aGlass, lambda, invPdfL, rng) * thr;
             // Extinction along the camera segment: what is behind the fog gets dimmed.
             thr *= mats.mediaTransmittance(scene, ray.o, ray.d, dSeg, lambda, rng);
             if (thr <= 0.0) return L;

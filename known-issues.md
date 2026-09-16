@@ -4078,6 +4078,91 @@ above), mode M's streaks fall with beams gathered, and gather cost is linear in 
 blur at the same count). Options and costs are in the session notes; the decision belongs to
 the user.
 
+### BUILT (2026-09-16, v0.312.0): `-sunnee` — the sun's single scatter in media by next-event estimation; the direct-sun chords leave the beam map
+
+**What it is.** Mode `M` with `-beams` and `-sunnee` marches every camera segment through every
+medium and estimates the sun's order-1 in-scatter directly — 64 jittered steps per medium span,
+a shadow ray and ratio-tracked transmittance to the sun from each, the sun direction cone-sampled
+exactly as the BDPT volume-vertex sun connection does — and `buildBeamMap` erases the chords that
+term replaces: order 1, born on a `light sun`, no surface interaction before the chord. The
+deposit now records that provenance on every chord (`PhotonBeam::srcEm` / `surf`, in the record's
+tail padding; map files are `FTPMP09`, and an `FTPMP08` file loads with both fields reset to
+unknown). Unknown provenance makes the flag refuse the map, loudly, and clear itself before the
+device map is uploaded (`DBeamMap::sunNee` is stamped after the split), so neither backend can
+double count. Colour is folded the way the beams' would have been (achromatic medium: the sun's
+CIE integral; `phase rainbow`: the bow table), so the rainbow is deterministic in colour. Design:
+design.md, "`-sunnee`". Host `beamgather.h sunNeeSplit` / `sunNeeMarch`, device `dSunNeeMarch`.
+
+**Measured on gallery_rain frame 555, 320x180, spp 32, GPU, one 40M-photon / 100k-chord map
+traced with provenance (`scraps/mM9.map`); scores per ROI after development against the
+8192-spp mode-D reference (`scraps/sunnee_val.py`), the cloud ROI with its sun-disc pixels
+masked:**
+
+| variant | rain energy / lumaRMS / own | cloud energy / lumaRMS / own | grid | exhibits | frame |
+|---|---|---|---|---|---|
+| beams (44.6 % of chords are direct sun) | 100 % / 12.98 / 9.58 | 100 % / 14.05 / 3.06 | 13.75 | 16.20 | 163 s, 528 beams/probe |
+| `-sunnee` | 99.2 % / 12.80 / 9.59 | 100.3 % / 10.50 / 3.64 | 13.75 | 16.26 | 142 s, 243 beams/probe |
+
+- **Energy parity holds** (rain 99.2 %, cloud 100.3 %, the two no-media controls 100.0 / 100.4 %;
+  the 0.8 % in the rain is the size of a map-to-map realization difference). **The frame is
+  faster**: the 44,599 erased chords were the ones every probe ray had to walk, and 64 shadow
+  rays per segment cost less than 285 beams per probe. **CPU and GPU agree** with the flag on
+  (rain 1.008, cloud 1.014 at 160x90 spp 4). **The refusal works**: the old `scraps/mM.map` prints
+  `[sunnee] 55027 chord(s) carry no provenance ... -sunnee is OFF for this map` and renders as
+  beams.
+- **The cloud's structure error drops 14.05 -> 10.50** — its order-1 sun chords were the streaky
+  silver lining. **The rain's barely moves (12.98 -> 12.80) and its seed-to-seed noise is
+  identical (9.6)**, which says that ROI's error is camera-side sampling noise plus a structure
+  the sun chords were not the only source of. What follows is that structure taken apart.
+
+**The fan in the rain is mostly PHYSICAL, and the earlier claim that "a converged mode D has
+none" was a reference-quality error.** A signed difference `sunnee - beams` of the rain shaft
+(`scraps/_sn_diff_strip.png`) shows the beams' thin converging rays removed (blue) and a
+different set of thin converging rays laid down by the march (red). Rays converging on the sun
+are world-space structure parallel to the sun direction, and the march has only one source of
+that: the sun's transmittance through the rain's own density — a two-octave noise stretched in
+`y` (`0.5*y` / `1.8*y` against `2*x` / `9*x`), contrast 0 to 1.3 at `sigma_t 0.35` over a 3 m
+box — i.e. the rain shadowing itself in sun-parallel tubes, seen end-on toward the sun. Evidence,
+all on the fan region (x 140..215, y 92..128, grid pixels masked), high-pass = pixel minus 7x7
+box, linear luma:
+
+- The march's fan is deterministic: **same map, two seeds correlate 0.776**; and it is largely
+  the same fan the beams had (**sunnee ~ beams 0.878**), so the beams were painting the physical
+  tubes too, plus their own random chord lines on top.
+- It is in the mode-D reference — once the reference is made readable. **In that region 0.3 % of
+  the reference's pixels hold 50 % of its linear energy** (the mode-D sun tail: its linear mean
+  there is 0.237 against mode M's 0.113, while its 3x3-median-suppressed mean is **0.116** — mode
+  M matches the reference's body to 2.5 %). Against the median-suppressed reference the high-pass
+  correlates **0.49 with `-sunnee` and 0.44 with the beams**, with a ceiling of ~0.73 set by the
+  two images' residual noise (and a 3x3 median erases one-pixel lines, which biases this against
+  exactly the structure in question). The fan exists in mode D; the reference's speckle hid it,
+  and "excess above the reference" was measured against a mean half made of fireflies.
+- **Not all of it is physical.** A `-sunnee` render on a FRESHLY traced map (seed 3) correlates
+  **0.511** with the seed-1 render where the same map gave 0.776: about a third of the fan's
+  structure variance still comes from the chords that remain — env-lit and bounced order-1, and
+  order >= 2 — which are beams with lines of their own. Those are the next two populations:
+  order >= 2 is what VOLCACHE now replaces on the GPU, and the sky-lit order-1 term could be
+  marched the same way (env NEE per step; more variance, no lines). Measured combination below.
+
+**Measured combination: `-sunnee` + the volcache (`FTRACE_VOLCACHE=48 FTRACE_VOLCACHE_SPLIT=1`),
+same frame, same map.** The erase and the split together leave **19,693 of 99,976 chords** as
+beams (the sky-lit and bounced order-1 population): 102 beams per probe, **76 s** for the frame
+against 163 s for the beams alone. Cloud structure error **14.05 -> 10.50 -> 8.61**; rain
+unchanged (12.82). The fan's map-dependent share did not move (different-map correlation 0.515
+against 0.511 without the cache; same-map 0.968), so what remains of it is the sky-lit order-1
+chords, not order >= 2. At **128 spp**: beams 598 s, rain 9.64, cloud 14.00; `-sunnee` + cache
+**246 s**, rain 9.34, cloud 8.36 — and the picture, which the rain ROI's RMSE cannot show because
+that number is per-pixel noise, is `png/sn/_beams_vs_sunnee_vc_128spp_crop.png`: the shafts that
+fanned from the cloud through the whole rain volume are gone, leaving the soft physical glow, a
+smooth cloud, and fewer coloured specks. **Recommendation for the flyby: mode M with `-beams
+-sunnee` and the cache on.**
+
+**The measurement lesson, again.** The reference's tail carried half the energy of the region
+being scored, so both the earlier "excess" numbers and the earlier reading of "no shafts in mode
+D" were readings of speckle. A tail-dominated reference has to be read by its body (median or
+seed-pair-suppressed) before any structure comparison, and a structure claim needs the
+map-realization control (same seeds, different map) before it is attributed to the estimator.
+
 ### OPEN (2026-09-16): `-direct-only` is silently ignored by mode D (and any non-backward mode)
 
 `g_directOnly` is consulted by the backward tracer (modes R/W, the explorer's refinement

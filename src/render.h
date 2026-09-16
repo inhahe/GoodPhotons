@@ -997,7 +997,7 @@ struct Renderer {
                    MedFilter offFilt = MedStraight,
                    const double* lamS = nullptr, int nSec = 0,
                    const Vec3* achroCie = nullptr, int foldEmIdx = -1,
-                   const double* specW = nullptr) const {
+                   const double* specW = nullptr, int srcEm = -1, int surf = -1) const {
         if (!beamDeposit || !(beta > 0.0)) return;
         // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
         // 1e30-long box (see kBeamFarScale).
@@ -1072,7 +1072,7 @@ struct Renderer {
                     1, std::memory_order_relaxed);
             beamDeposit->push(o + dir * ta, dir, tb - ta, p, lambda, aGlass, i, order,
                               lamS, nSec, (useAchro || bowEm >= 0) ? ca : nullptr, bowEm,
-                              specW);
+                              specW, srcEm, surf);
         }
     }
 
@@ -2502,6 +2502,7 @@ struct Renderer {
         // UNINITIALISED until the first spectral factor actually arrives (foldChroma), so a
         // photon that never hits a surface pays nothing for any of this.
         const Emitter* foldEm = nullptr;
+        int srcEmIdx = -1;   // chord provenance (-sunnee): the emitter this photon is born on; -1 = a volume (fire) birth
         double foldT[kFoldBins];
         bool   foldChroma = false;
         const bool volumeBirth = !scene.emissiveVolumes.empty() &&
@@ -2562,6 +2563,7 @@ struct Renderer {
         if (scene.emitters.empty()) return;
         int ei = scene.selectEmitter(rng);
         const Emitter& em = scene.emitters[ei];
+        srcEmIdx = ei;
         double u1 = rng.uniform(), u2 = rng.uniform();
         Vec3 emitN;
         double spotW = 1.0;                      // spot: p_e/p_u direction reweight (else 1)
@@ -2844,6 +2846,9 @@ struct Renderer {
         // photon has already scattered inside a beam-carried (non-GRIN) medium, so the order
         // cap can send it back to the single-scatter rule once it is spent.
         int beamScatters = 0;
+        // Chord PROVENANCE for `-sunnee` (photonbeams.h PhotonBeam::srcEm / surf): the emitter
+        // this photon was born on and the surface interactions it has made so far.
+        int surfHits = 0;
 
         // CAUSTIC classification state (mode M's two-map split; see photonVertexKind above).
         // A deposit is a caustic iff the path so far reads L·S⁺·D — at least one FOCUS vertex
@@ -3068,7 +3073,8 @@ struct Renderer {
             emitBeams(scene, ray.o, ray.d, dChord, lambda, betaPre, curAbsorb(lambda), rng,
                       beamScatters + 1,
                               beamMS ? MedAll : MedStraight, specLam, specSec,
-                              achroPath ? &cieF : nullptr, foldEmIdx, specW);
+                              achroPath ? &cieF : nullptr, foldEmIdx, specW,
+                              srcEmIdx, surfHits);
                 }
                 if (!beamMS) {
                     // SINGLE SCATTER ONLY. Attenuate the photon by the medium extinction over
@@ -3175,6 +3181,7 @@ struct Renderer {
                 e.sensor += beta;
                 return;
             }
+            ++surfHits;   // a surface interaction follows: chords after it are not direct light
 
             const Material* matp = &scene.mats[h.matId];
             // Layered (coat over body): split the photon at the interface BEFORE the

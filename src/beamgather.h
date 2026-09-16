@@ -347,6 +347,131 @@ inline const std::vector<VolCache>& volCacheAll(const Scene& sc, const BeamMap& 
 // nothing anywhere downstream, whereas the v0.299.0 query-side skip removed only the last of
 // those. Only chords whose OWN medium got a ready grid are erased, so a partially-cacheable
 // scene keeps the rest as real beams. Returns the number of chords routed into the caches.
+// -sunnee (0.312.0): erase the DIRECT-SUN chords -- order 1, born on a Sun, no surface interaction
+// before the chord -- because sunNeeMarch / dSunNeeMarch estimate exactly that term along the
+// camera ray. Everything else stays: an order-1 chord that bounced off the ground first is
+// indirect light the march cannot see, and an env-lit chord is a different emitter. Returns the
+// number erased and, through `powerFracOut`, their share of the map's chord power.
+//
+// REFUSES, loudly, and turns the flag off when any order-1 chord has UNKNOWN provenance: a map
+// traced before 0.312.0 (`-loadmap` of an FTPMP08 file) or a depositor that does not track
+// order. Erasing blind would either drop the bounced light or, by erasing nothing while the
+// march runs, count the sun twice. The flag is cleared HERE, before the device map is uploaded
+// (DBeamMap::sunNee is stamped at upload), so both backends see the same decision.
+inline size_t sunNeeSplit(const Scene& sc, BeamMap& bm, double* powerFracOut = nullptr) {
+    if (!pbeams::gSunNee || bm.beams.empty()) return 0;
+    if (sc.sunCount <= 0) {
+        std::fprintf(stderr, "[sunnee] the scene has no sun light: -sunnee has nothing to replace and is off.\n");
+        pbeams::gSunNee = false;
+        return 0;
+    }
+    const auto isDirectSun = [&](const PhotonBeam& b) {
+        return b.order == 1 && b.surf == 0 && b.srcEm >= 0 &&
+               (size_t)b.srcEm < sc.emitters.size() &&
+               sc.emitters[(size_t)b.srcEm].shape == EmitterShape::Sun;
+    };
+    size_t unknown = 0, direct = 0;
+    double pAll = 0.0, pDirect = 0.0;
+    for (const PhotonBeam& b : bm.beams) {
+        pAll += (double)b.power;
+        // srcEm < 0 with a KNOWN surface count is a volume (fire) birth: not a sun, not unknown.
+        if (b.order == kBeamOrderUnknown || (b.order == 1 && b.surf == 255)) { ++unknown; continue; }
+        if (isDirectSun(b)) { ++direct; pDirect += (double)b.power; }
+    }
+    if (unknown) {
+        std::fprintf(stderr,
+            "[sunnee] %zu chord(s) carry no provenance (a map traced before 0.312.0, or a depositor that\n"
+            "         does not track scattering order). Erasing blind would drop bounced light or count the\n"
+            "         sun twice, so -sunnee is OFF for this map. Retrace it (drop the -loadmap file) to use it.\n",
+            unknown);
+        pbeams::gSunNee = false;
+        return 0;
+    }
+    if (powerFracOut) *powerFracOut = pAll > 0.0 ? pDirect / pAll : 0.0;
+    if (!direct) return 0;
+    bm.beams.erase(std::remove_if(bm.beams.begin(), bm.beams.end(), isDirectSun), bm.beams.end());
+    return direct;
+}
+
+// -sunnee (0.312.0): the sun's SINGLE-scatter term along a camera segment, by next-event
+// estimation instead of stored beams (device twin: render_cuda.cu dSunNeeMarch -- same steps,
+// same fold, same shadow-ray conventions as the volume-vertex sun connection in backward.h's
+// neeVolume: cone-sampled direction, pdf 1/Omega, transmittance out to the scene sphere).
+//
+//   L_1 = integral_0^tMax  Tr_cam(t) * sigma_s(p_t) * phase(cos) * Tr_sun(p_t) * L_sun * Omega  dt
+//
+// evaluated with kSunNeeSteps JITTERED steps per medium span (one offset per segment, so the
+// estimate is unbiased rather than a fixed quadrature), Tr_cam carried incrementally from step
+// to step, Tr_sun by ratio tracking to the scene exit plus a shadow ray. The chords this replaces
+// were erased by sunNeeSplit, so nothing is counted twice. An unbounded medium is cut at the
+// deposit's own far limit (Renderer::kBeamFarScale) so the two estimators integrate one volume.
+//
+// COLOUR. Where the beams would have been folded, this term is folded the same way: a fully
+// achromatic medium (Medium::achro) takes the sun's CIE integral `viewXYZ` outright; a bow
+// medium with a table for this (emitter, medium) pair takes Bow(cos) * (integral SPD). Both are
+// deterministic in colour -- a rainbow with no chromatic grain, which is the point. Anything
+// else evaluates at the hero wavelength and scales by invPdfL like every other spectral term.
+// Transmittances are at the hero wavelength in every branch, exactly as the folded beams' are.
+inline Vec3 sunNeeMarch(const Scene& scene, const Renderer& mats, const Vec3& oc, const Vec3& dc,
+                        double tMax, double aGlassCam, double lambda, double invPdfL, Pcg32& rng) {
+    Vec3 acc{0, 0, 0};
+    if (!pbeams::gSunNee || scene.sunCount <= 0 || scene.media.empty() || !(tMax > 0.0)) return acc;
+    const PatTables tabs = scene.patTables();
+    const Vec3 cie(cieX(lambda), cieY(lambda), cieZ(lambda));
+    const double farLimit = 8.0 * std::max(scene.sceneRadius, 1e-3);
+    for (size_t mi = 0; mi < scene.media.size(); ++mi) {
+        const Medium& md = scene.media[mi];
+        if (!md.enabled) continue;
+        const double ssL = std::max(0.0, md.sigma_s(lambda));
+        if (!(ssL > 0.0)) continue;
+        double ta = 0.0, tb = 0.0;
+        if (!md.clipToBounds(oc, dc, 0.0, tMax, ta, tb) || !(tb > ta)) continue;
+        if (tb - ta > farLimit) tb = ta + farLimit;
+        const int steps = pbeams::kSunNeeSteps;
+        const double dt = (tb - ta) / (double)steps;
+        const double jit = rng.uniform();
+        double Tcam = mats.mediaTransmittance(scene, oc, dc, ta, lambda, rng);
+        if (aGlassCam > 0.0) Tcam *= std::exp(-aGlassCam * ta);
+        double tPrev = ta;
+        for (int i = 0; i < steps && Tcam > 1e-6; ++i) {
+            const double t = ta + dt * ((double)i + jit);
+            const Vec3 p = oc + dc * t;
+            Tcam *= mats.mediaTransmittance(scene, oc + dc * tPrev, dc, t - tPrev, lambda, rng);
+            if (aGlassCam > 0.0) Tcam *= std::exp(-aGlassCam * (t - tPrev));
+            tPrev = t;
+            const double dens = md.densityAt(p, &tabs);
+            if (!(dens > 0.0)) continue;
+            for (size_t k = 0; k < scene.emitters.size(); ++k) {
+                const Emitter& em = scene.emitters[k];
+                if (em.shape != EmitterShape::Sun || !(em.spotOmega > 0.0)) continue;
+                const double s1 = rng.uniform(), s2 = rng.uniform();
+                const Vec3 wi = em.sampleCone(em.beamDir * -1.0, s1, s2);   // toward the sun
+                const double dist = length(scene.sceneCenter - p) + scene.sceneRadius;
+                if (scene.occluded(p + wi * 1e-6, wi, dist)) continue;
+                const double Tsun = mats.mediaTransmittance(scene, p + wi * 1e-6, wi, dist, lambda, rng);
+                if (!(Tsun > 0.0)) continue;
+                // Light travels along -wi and leaves toward the camera along -dc: same argument
+                // the beam gather hands phaseValue (dot(b.d, -dc)).
+                const double cosT = dot(wi, dc);
+                const double w = Tcam * Tsun * ssL * dens * dt * em.spotOmega;
+                if (md.achro) {
+                    acc += em.viewXYZ * (w * md.phaseValue(cosT, lambda));
+                } else if (const Scene::BowLut* lut = scene.bowLut((int)k, (int)mi)) {
+                    // Bow(cos) = cie * phaseLum = integral CIE*SPD*phase / integral SPD, and
+                    // integral SPD = viewXYZ.y / cieMean.y (both per-nm sums, scene.h).
+                    Vec3 c; double ph;
+                    lut->eval(cosT, c, ph);
+                    const double den = (em.cieMean.y > 0.0) ? em.viewXYZ.y / em.cieMean.y : 0.0;
+                    acc += c * (w * ph * den);
+                } else {
+                    acc += cie * (w * md.phaseValue(cosT, lambda) * em.spdFn(lambda) * invPdfL);
+                }
+            }
+        }
+    }
+    return acc;
+}
+
 inline size_t volCacheSplit(const Scene& sc, BeamMap& bm) {
     if (volCacheRes() <= 0 || !volCacheSplitEnabled()) {
         if (std::getenv("FTRACE_VOLCACHE_DIAG"))

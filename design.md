@@ -735,6 +735,64 @@ was the BVH build. The map was sized by `-n` with **no trim** — mode `M`'s dec
 what Phase 3a had to give up — so this was the resource that bit first on a real scene. It is
 now bounded by the beam budget below.
 
+### `-sunnee` — the sun's single scatter by next-event estimation, not beams (0.312.0)
+
+**What it fixes.** A collimated light through a thin medium is, in the beam map, a handful of
+long coherent chords per pixel: every order-1 sun chord in the rain is a line the gather kernel
+paints along its whole length, so the estimate's error is *structure* (streaks, shafts), not
+grain, and it does not average like grain. Measured on gallery_rain's backlit rain: 5x the
+photons (five shared realizations) took the error from 13.2 to 9.8 levels against a converged
+mode-D reference and a fit put the floor near 8.7 -- the kernel's own bias, which no realization
+count touches (known-issues, "BEAM STREAKS"). The order >= 2 population was already replaced by a
+smooth cached field (VOLCACHE); what remained *as beams* was exactly the order-1 sun population.
+
+**The estimator.** With `-sunnee`, mode `M`'s gather adds, per straight camera segment and per
+medium, the single-scatter integral of every `light sun` directly:
+
+    L_1 = integral_0^tMax  Tr_cam(t) * sigma_s(p_t) * phase(cos) * Tr_sun(p_t) * L_sun * Omega  dt
+
+evaluated with `pbeams::kSunNeeSteps` (64) **jittered** steps over the medium's clipped span --
+one random offset per segment, so it is an unbiased estimate rather than a fixed quadrature --
+`Tr_cam` carried incrementally from step to step, and `Tr_sun` by ratio tracking to the scene
+sphere plus a shadow ray, with the sun direction cone-sampled (pdf 1/Omega) exactly as the BDPT
+volume-vertex sun connection does (`backward.h neeVolume`, `render_cuda.cu` line ~10600). An
+unbounded medium is cut at the deposit's own far limit (`kBeamFarScale`), so both estimators
+integrate one volume. Host: `beamgather.h sunNeeMarch`; device: `render_cuda.cu dSunNeeMarch`;
+called from the two segment sites of `photonGather` / `dPhotonGather` next to the beam gather,
+and not gated on the map being non-empty, because the erase below may have emptied it.
+
+**The erase, and why it needs provenance.** `sunNeeSplit` (beamgather.h, run by `buildBeamMap`
+before the VOLCACHE split) erases the chords the march now accounts for: **order 1, born on a
+`Sun`, no surface interaction before the chord**. Order 1 alone is not enough -- a photon that
+bounced off the ground and then crossed the rain is order 1 too, and that bounced light is
+something the march cannot see -- so the deposit now records **provenance** on every chord:
+`PhotonBeam::srcEm` (the emitter the photon was born on; -1 for a volumetric fire birth) and
+`PhotonBeam::surf` (surface interactions so far, counted in `tracePhoton` / `shadeStep` right
+before the material is handled; 255 = unknown). Both live in the record's tail padding, so the
+record is still 120 bytes; the map file magic is `FTPMP09`, and an `FTPMP08` file loads at the
+same stride with the two fields reset to unknown. **Unknown provenance makes `-sunnee` refuse the
+map**, loudly, and clears `pbeams::gSunNee` -- erasing blind would drop bounced light, and erasing
+nothing while the march runs would count the sun twice. The flag travels with the map it was
+decided on: `DBeamMap::sunNee` is stamped at upload, after the split, so both backends see one
+decision. Env-lit and bounced order-1 chords, and every order >= 2 chord, stay as beams.
+
+**Colour.** The term is folded where the beams' would have been, so a rainbow is deterministic
+in colour rather than chromatically grainy: a fully achromatic medium (`Medium::achro`) takes
+the sun's CIE integral `Emitter::viewXYZ` outright; a bow medium with a `Scene::bowLut` for this
+(emitter, medium) pair takes `Bow(cos) * integral SPD` (the table's `cie * phaseLum` times
+`viewXYZ.y / cieMean.y`); anything else evaluates at the hero wavelength times `invPdfL` like
+every other spectral term. Transmittances are at the hero wavelength in every branch, exactly
+as the folded beams' are. `DEmitter::viewXYZ` was added for the device side.
+
+**Cost.** Per camera segment and medium: 64 shadow rays and 64 short ratio-tracking calls, plus
+the incremental camera transmittance -- independent of the beam count, which is the point; the
+beams it removes were the ones every probe ray had to walk. Measured (gallery_rain frame 555,
+320x180, spp 32, GPU): 44.6 % of the map's chords were direct sun; erasing them took a probe
+from 528 to 243 beams and the frame from 163 s to 142 s with energy parity within 1 % per ROI;
+with the volcache on as well, 102 beams and 76 s. What the flag cannot remove is the physical
+fan of the rain shadowing itself along the sun direction, nor the lines of the sky-lit order-1
+chords that stay as beams (known-issues, "-sunnee").
+
 ### The beam budget — sizing the map from the scene's own knee (0.242.0)
 
 `-n` alone was a cliff, not a tuning wart: at the inherited forward-mode default of `-n 2e6`,

@@ -894,6 +894,7 @@ struct DEmitter {
     // exactly the solar cone's solid angle 2*PI*(1-cos theta) — the same field reuse the
     // host Emitter makes, so no extra members are needed on either side.
     double spotCosInner, spotCosOuter, spotOmega;
+    DVec3  viewXYZ;   // integral CIE(lam)*SPD(lam) dlam (host Emitter::viewXYZ): a sun's folded colour
     // Mesh area light (shape==5): device pointer to this emitter's triangle CDF and its
     // count. nullptr/0 for every other shape. area == sum of the triangle areas.
     const DEmitTri* meshTris; int meshTriN;
@@ -4878,6 +4879,10 @@ struct DBeamDep {
     // depositing path does not track it. Host twin: PhotonBeam::order. Absent before 0.278.1,
     // which left every device-deposited chord reading 0 on the host -- see BEAMORDER-GPU.
     int   order;
+    // Chord PROVENANCE (0.312.0; host twin PhotonBeam::srcEm / surf): the emitter the photon was
+    // born on (-1 = unknown) and its surface interactions before this chord (-1 = unknown).
+    int   srcEm;
+    int   surf;
 };
 
 // The photon's LIVE spectral bundle, carried down the path by the forward tracer and handed
@@ -5372,6 +5377,8 @@ struct DVolCache {
 struct DBeamMap {
     const DVolCache* vc  = nullptr;   // per medium (index = DScene medium id), or null
     int              nVc = 0;
+    int              sunNee = 0;   // -sunnee: dPhotonGather marches the sun's single scatter
+                                   // (dSunNeeMarch); stamped at upload, after sunNeeSplit decided
     const DBeamRec* beams     = nullptr;
     const DNode*    nodes     = nullptr;
     const int*      primIdx   = nullptr;
@@ -6075,7 +6082,8 @@ __device__ static void dEmitBeams(const DScene& sc, const DCamSet& cs, const DVe
                                   const DVec3& dir, Real dLen, Real lambda, Real beta,
                                   Real aGlass, DRng& rng, int offFilt = DMedStraight,
                                   const DBeamSpec* spec = nullptr,
-                                  int order = (int)kBeamOrderUnknown) {
+                                  int order = (int)kBeamOrderUnknown,
+                                  int srcEm = -1, int surf = -1) {
     if (!cs.beamCount || !(beta > 0)) return;
     // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
     // 1e30-long box (host twin: Renderer::kBeamFarScale == 8). Applied PER MEDIUM and only to
@@ -6155,6 +6163,7 @@ __device__ static void dEmitBeams(const DScene& sc, const DCamSet& cs, const DVe
             // the record's power is not also divided by nLam (photonbeams.h push()).
             bd.nSec   = (spec && !achro && bowEm < 0) ? spec->n : 0;
             for (int j = 0; j < 3; ++j) bd.lamS[j] = (j < bd.nSec) ? (float)spec->lam[j] : 0.f;
+            bd.srcEm = srcEm; bd.surf = surf;   // chord provenance (0.312.0)
             cs.beamOut[k] = bd;
         }
     }
@@ -7996,7 +8005,9 @@ __device__ static bool dApplyCausticAim(const DScene& sc, const DCamSet& cs,
 __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
                                  int camMode, DRng& rng,
                                  DVec3& ro, DVec3& rd, Real& beta, Real& lambda, double& eEmitted,
-                                 DBeamSpec* spec = nullptr, Real* causticW = nullptr) {
+                                 DBeamSpec* spec = nullptr, Real* causticW = nullptr,
+                                 int* emOut = nullptr) {
+    if (emOut) *emOut = -1;   // chord provenance (-sunnee): the emitter this photon is born on
     if (spec) { spec->n = 0; spec->achro = 0; spec->cie = DVec3{0, 0, 0}; spec->emIdx = -1; }
     if (causticW) *causticW = (Real)1;
     // ROADMAP C3: split birth between surface/point/env emitters and volumetric "fire"
@@ -8058,6 +8069,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     // Power-weighted emitter selection (single emitter draws no randomness).
     int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
     const DEmitter em = sc.emitters[ei];
+    if (emOut) *emOut = ei;
     Real u1 = rng.uniform(), u2 = rng.uniform();
     DVec3 origin, emitN, dir;
     Real spotW = (Real)1;                            // spot direction reweight (else 1)
@@ -8438,7 +8450,8 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
                                 DMediumStack& stk, DRng* crng = nullptr,
                                 int grinMed = -1, Real grinArc = 0,
                                 int* beamScat = nullptr, DPathCaustic* pathC = nullptr,
-                                DBeamSpec* spec = nullptr) {
+                                DBeamSpec* spec = nullptr,
+                                int srcEm = -1, int* nSurf = nullptr) {
     Real dSurf = h.valid ? h.t : BIG;
 
     // Dielectric Beer-Lambert over the marched arc (the block further down only covers the
@@ -8598,7 +8611,8 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // rather than letting a 0 masquerade as a measurement (BEAMORDER-GPU).
         if (doBeamDeposit) dEmitBeams(sc, cs, ro, rd, dChord, lambda, betaPre, aC, *crng,
                                       beamMS ? DMedAll : DMedStraight, spec,
-                                      beamScat ? *beamScat + 1 : (int)kBeamOrderUnknown);
+                                      beamScat ? *beamScat + 1 : (int)kBeamOrderUnknown,
+                                      srcEm, nSurf ? *nSurf : -1);
         if (!beamMS) {
             // SINGLE SCATTER ONLY. Attenuate the photon by the medium extinction over the
             // whole crossing (single-scatter transmission) so surfaces behind the fog are
@@ -8673,6 +8687,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     }
 
     if (!h.valid) { eEscaped += beta; return WF_TERMINATE; }
+    if (nSurf) ++(*nSurf);   // a surface interaction follows: chords after it are not direct light
     if (h.sensorId >= 0) {
         // Legacy contact sensor: no geometry carries a sensorId in the current
         // camera modes, so this is inert (kept for absorption bookkeeping).
@@ -9210,8 +9225,9 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
         // The aimed caustic pass's per-photon MIS weight, fixed at birth and spent at the ONE
         // caustic deposit a path can make (causticaim.h). Exactly 1 without `-causticn`.
         Real bornCausticW = (Real)1;
+        int srcEm = -1;   // chord provenance (-sunnee): the emitter this photon is born on
         if (!genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEmitted, &spec,
-                       &bornCausticW)) continue;
+                       &bornCausticW, &srcEm)) continue;
         bool done = false;
         DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
         // PHOTON-BEAMS: an INDEPENDENT per-photon stream used ONLY by the beam branch —
@@ -9226,6 +9242,7 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
         // -beams-order cap can retire multiple scattering mid-path (host twin: `beamScatters`
         // in Renderer::tracePhoton).
         int beamScat = 0;
+        int nSurf = 0;      // surface interactions so far (chord provenance for -sunnee)
         // Caustic state of the path so far — see dPhotonVertexBit / dPathIsCaustic, plus the
         // aimed pass's MIS weight fixed at birth (causticaim.h).
         DPathCaustic pathC{0, bornCausticW};
@@ -9240,7 +9257,7 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
             if (shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
                           eAbsorbed, eSensor, eEscaped, stk, cs.beamsOn() ? &crng : nullptr,
                           gm.hit ? gm.which : -1, gm.arc, &beamScat,
-                          &pathC, &spec) == WF_TERMINATE) done = true;
+                          &pathC, &spec, srcEm, &nSurf) == WF_TERMINATE) done = true;
         }
         if (!done) eResidual += beta;
     }
@@ -14041,6 +14058,90 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
     }
 }
 
+// -sunnee (0.312.0): the sun's SINGLE-scatter term along a camera segment, by next-event
+// estimation instead of stored beams. Device twin of beamgather.h sunNeeMarch -- same jittered
+// steps, same fold, and the same shadow-ray conventions as the volume-vertex sun connection in
+// the BDPT NEE above (cone-sampled direction, pdf 1/Omega, transmittance out to the scene
+// sphere). The direct-sun chords this replaces were erased from the map by sunNeeSplit, so
+// nothing is counted twice; DBeamMap::sunNee carries that decision with the map it was made on.
+//
+//   L_1 = integral_0^tMax  Tr_cam(t) * sigma_s(p_t) * phase(cos) * Tr_sun(p_t) * L_sun * Omega  dt
+//
+// kSunNeeSteps JITTERED steps per medium span (one offset per segment: an unbiased estimate,
+// not a fixed quadrature), Tr_cam carried incrementally step to step, Tr_sun by ratio tracking
+// to the scene exit plus a shadow ray. An unbounded medium is cut at the deposit's own far limit
+// so the two estimators integrate one volume.
+//
+// COLOUR is folded where the beams' would have been: a fully achromatic medium takes the sun's
+// CIE integral `viewXYZ`; a bow medium with a table for this (emitter, medium) pair takes
+// Bow(cos) * (integral SPD) -- deterministic in colour, a rainbow with no chromatic grain;
+// anything else evaluates at the hero wavelength times invPdfL like every other spectral term.
+// Transmittances are at the hero wavelength in every branch, exactly as the folded beams' are.
+__device__ static void dSunNeeMarch(const DScene& sc, const DVec3& oc, const DVec3& dc, Real tMax,
+                                    double aGlassCam, Real lambda, double invPdfL, DRng& rng,
+                                    double& oX, double& oY, double& oZ) {
+    if (sc.sunCount <= 0 || sc.mediaN <= 0 || !(tMax > (Real)0)) return;
+    const DPatEnv env = dPatEnvOf(sc);
+    const double cX = (double)cieX(lambda), cY = (double)cieY(lambda), cZ = (double)cieZ(lambda);
+    const double farLimit = 8.0 * fmax(sc.sceneRadius, 1e-3);   // dEmitBeams' own far limit
+    for (int mi = 0; mi < sc.mediaN; ++mi) {
+        const DMedium& md = sc.media[mi];
+        if (!md.enabled) continue;
+        const double ssL = fmax(0.0, (double)specLookup(md.sigma_s, lambda));
+        if (!(ssL > 0.0)) continue;
+        double ta = 0.0, tb = 0.0;
+        if (!dMedClip(md, oc, dc, 0.0, (double)tMax, ta, tb) || !(tb > ta)) continue;
+        if (tb - ta > farLimit) tb = ta + farLimit;
+        const int steps = pbeams::kSunNeeSteps;
+        const double dt = (tb - ta) / (double)steps;
+        const double jit = (double)rng.uniform();
+        double Tcam = (double)dMediaTransmittance(sc, oc, dc, (Real)ta, lambda, rng);
+        if (aGlassCam > 0.0) Tcam *= exp(-aGlassCam * ta);
+        double tPrev = ta;
+        for (int i = 0; i < steps && Tcam > 1e-6; ++i) {
+            const double t = ta + dt * ((double)i + jit);
+            const DVec3 p = oc + dc * (Real)t;
+            Tcam *= (double)dMediaTransmittance(sc, oc + dc * (Real)tPrev, dc, (Real)(t - tPrev), lambda, rng);
+            if (aGlassCam > 0.0) Tcam *= exp(-aGlassCam * (t - tPrev));
+            tPrev = t;
+            const double dens = dMedDensityAt(md, p, env);   // 1 when homogeneous; carves the bound
+            if (!(dens > 0.0)) continue;
+            for (int k = 0; k < sc.nEmitters; ++k) {
+                const DEmitter& em = sc.emitters[k];
+                if (em.shape != 6 || !(em.spotOmega > 0.0)) continue;
+                const double s1 = (double)rng.uniform(), s2 = (double)rng.uniform();
+                const DVec3 wi = dSunSampleCone(em, em.beamDir * (Real)(-1), s1, s2);   // toward the sun
+                const Real dist = (Real)((double)length(sc.sceneCenter - p) + sc.sceneRadius);
+                if (occluded(sc, p + wi * RAY_EPS, wi, dist)) continue;
+                const double Tsun = (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
+                if (!(Tsun > 0.0)) continue;
+                // Light travels along -wi and leaves toward the camera along -dc: the same argument
+                // the beam gather hands the phase (dot(b.d, -dc)).
+                const double cosT = (double)dot(wi, dc);
+                const double w = Tcam * Tsun * ssL * dens * dt * em.spotOmega;
+                double fx, fy, fz, ph;
+                if (md.achro) {
+                    const double phase = (double)dMedPhase(md, (Real)cosT, lambda);
+                    oX += w * phase * (double)em.viewXYZ.x;
+                    oY += w * phase * (double)em.viewXYZ.y;
+                    oZ += w * phase * (double)em.viewXYZ.z;
+                } else if (dBowEval(sc.bow, k, mi, cosT, fx, fy, fz, ph)) {
+                    // Bow(cos) = cie * phaseLum = integral CIE*SPD*phase / integral SPD, and
+                    // integral SPD = viewXYZ.y / cieMean.y (both per-nm sums, scene.h).
+                    const double den = ((double)em.cieMean.y > 0.0)
+                                           ? (double)em.viewXYZ.y / (double)em.cieMean.y : 0.0;
+                    const double sF = w * ph * den;
+                    oX += sF * fx; oY += sF * fy; oZ += sF * fz;
+                } else {
+                    const double phase = (double)dMedPhase(md, (Real)cosT, lambda);
+                    const double e = w * phase * (double)specLookup(em.emitSpd, lambda) * invPdfL;
+                    oX += cX * e; oY += cY * e; oZ += cZ * e;
+                }
+            }
+        }
+    }
+}
+
 // ----------------------- photon-map camera gather (mode M) -------------------
 // Device twin of photonGather (photonmap_render.h). Follows a camera ray through specular
 // surfaces (monochromatic at the sampled `lambda`); at the first diffuse / translucent hit it
@@ -14079,6 +14180,9 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
     const Real r2C = (Real)((double)pmC.radius * (double)pmC.radius);
     const int maxBounce = 32;
     const bool volOn = (bm != nullptr) && bm->nNodes > 0 && sc.mediaN > 0;
+    // -sunnee: the sun's single scatter is marched, not gathered. Not gated on nNodes: erasing
+    // the direct-sun chords may have emptied the map.
+    const bool sunOn = (bm != nullptr) && bm->sunNee && sc.sunCount > 0 && sc.mediaN > 0;
 
     for (int b = 0; b < maxBounce; ++b) {
         // Second cancellation point, covering the rays that spend their time BOUNCING rather
@@ -14108,9 +14212,10 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 dGrinMarch(sc, ro, rd, &gm, 1, /*camHide=*/(b == 0));  // — a camera ray's volume answer IS the
                 if (!gm.stepped) break;            //   beam gather below
                 const Real slen = (Real)gm.arc;
-                if (volOn && slen > 0) {
-                    double bX, bY, bZ;
-                    dGatherPhotonBeams(sc, *bm, pro, rd, slen, aGlass, rng, bX, bY, bZ);
+                if ((volOn || sunOn) && slen > 0) {
+                    double bX = 0.0, bY = 0.0, bZ = 0.0;
+                    if (volOn) dGatherPhotonBeams(sc, *bm, pro, rd, slen, aGlass, rng, bX, bY, bZ);
+                    if (sunOn) dSunNeeMarch(sc, pro, rd, slen, aGlass, lambda, invPdfL, rng, bX, bY, bZ);
                     oX += bX * thr; oY += bY * thr; oZ += bZ * thr;
                     thr *= (double)dMediaTransmittance(sc, pro, rd, slen, lambda, rng);
                 }
@@ -14125,10 +14230,11 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         // --- Participating media along this segment (mode M with -beams) ------------------
         // Done BEFORE `thr` takes the segment's attenuation, for the same reason: each
         // gathered beam carries the transmittance to ITS OWN closest approach.
-        if (volOn) {
+        if (volOn || sunOn) {
             const Real dSeg = h.valid ? h.t : (Real)1e30;
-            double bX, bY, bZ;
-            dGatherPhotonBeams(sc, *bm, ro, rd, dSeg, aGlass, rng, bX, bY, bZ);
+            double bX = 0.0, bY = 0.0, bZ = 0.0;
+            if (volOn) dGatherPhotonBeams(sc, *bm, ro, rd, dSeg, aGlass, rng, bX, bY, bZ);
+            if (sunOn) dSunNeeMarch(sc, ro, rd, dSeg, aGlass, lambda, invPdfL, rng, bX, bY, bZ);
             oX += bX * thr; oY += bY * thr; oZ += bZ * thr;
             thr *= (double)dMediaTransmittance(sc, ro, rd, dSeg, lambda, rng);
             if (thr <= 0.0) return;
@@ -16987,6 +17093,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         }
         de.spotCosInner = e.spotCosInner; de.spotCosOuter = e.spotCosOuter;
         de.spotOmega = e.spotOmega;
+        de.viewXYZ = {e.viewXYZ.x, e.viewXYZ.y, e.viewXYZ.z};
         de.cdfOffset = (int)cdfAll.size();
         de.cdfN = (int)e.spd.cdf.size();
         de.cdfStep = e.spd.step;
@@ -18485,6 +18592,7 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
     // g_volCachesForUpload right before the device render and clears it after; a null means
     // "no cache", and the march is then a no-op. See DVolCache.
     dbm.vc = nullptr; dbm.nVc = 0;
+    dbm.sunNee = pbeams::gSunNee ? 1 : 0;   // after sunNeeSplit (buildBeamMap) has had its say
     if (g_volCachesForUpload && !g_volCachesForUpload->empty()) {
         std::vector<gpu::DVolCache> dv(g_volCachesForUpload->size());
         size_t nReady = 0;
@@ -20166,6 +20274,11 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 // path rather than only for a `-loadmap`'d CPU map.
                 if (d.bowEm >= 0) { b.achro = 2; b.emIdx = (short)d.bowEm; }
                 else                b.emIdx = -1;
+                // Chord provenance (0.312.0): clamped exactly as BeamBank::push does.
+                b.srcEm = (d.srcEm >= 0 && d.srcEm <= 32767) ? (short)d.srcEm : (short)-1;
+                b.surf  = (d.surf < 0) ? (unsigned char)255
+                                       : (d.surf > 254 ? (unsigned char)254 : (unsigned char)d.surf);
+                b.pad2  = 0;
             }
         }
         bmap->nEmitted   = pm.nEmitted;      // same pass, same normalisation

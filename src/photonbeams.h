@@ -209,6 +209,18 @@ namespace pbeams { inline int gOrderMax = 0; }
 // change is exactly the energy share those orders carried, with no second-order effects.
 namespace pbeams { inline int gOrderMin = 0; }
 
+// `-sunnee` (0.312.0): mode M estimates the sun's SINGLE-scatter (order-1) contribution in every
+// medium by next-event estimation along the camera ray -- a jittered march that shadow-rays the
+// sun from each step -- and buildBeamMap erases the DIRECT-SUN chords the deposit stored so that
+// nothing is counted twice (beamgather.h: sunNeeSplit / sunNeeMarch; render_cuda.cu:
+// dSunNeeMarch). The chords it replaces are the ones that streak: a collimated light through a
+// thin medium is a handful of long coherent beams per pixel, and no realization count smooths
+// that below the kernel's own bias. The march is a per-pixel integral with no beams in it.
+namespace pbeams {
+inline bool gSunNee = false;
+inline constexpr int kSunNeeSteps = 64;   // jittered steps per medium span per camera segment
+}
+
 // Sentinel for PhotonBeam::order -- "this depositor does not track medium scattering order".
 // See the field's own note for why mode `J` stores this instead of something plausible.
 inline constexpr unsigned char kBeamOrderUnknown = 255;
@@ -385,6 +397,16 @@ struct PhotonBeam {
     // 32767 emitters would have bigger problems; `emitBeams` refuses the fold above that
     // rather than truncating, so the field can never name the wrong light.
     short emIdx;
+    // PROVENANCE (0.312.0), for `-sunnee`'s erase: the emitter this photon was BORN on (-1 =
+    // unknown) and how many SURFACE interactions it had made before this chord (255 = unknown).
+    // A chord is "direct sun" only when order == 1, `srcEm` names a Sun and `surf` == 0: a photon
+    // that bounced off the ground first is order 1 too, and the NEE march cannot replace it.
+    // Both sit in the record's tail padding, so sizeof(PhotonBeam) is unchanged (photonmap_io.h
+    // asserts it) and an FTPMP08 file keeps its width -- its bytes here are garbage, which the
+    // loader resets to "unknown", and unknown provenance makes `-sunnee` refuse the map.
+    short         srcEm;
+    unsigned char surf;
+    unsigned char pad2;
 
     // nSec is 0 for both a classic monochromatic beam and an achromatic-path one, so this is
     // the plain nSec+1 it always was; the achromatic beam carries the full chord power.
@@ -452,7 +474,8 @@ struct BeamBank {
     void push(const Vec3& o, const Vec3& d, double len, double power,
               double lambda, double absorb, int med, int order,
               const double* lamS = nullptr, int nSec = 0, const double* cieA = nullptr,
-              int emIdx = -1, const double* wS = nullptr) {
+              int emIdx = -1, const double* wS = nullptr,
+              int srcEm = -1, int surf = -1) {
         // `-beams-minorder` filter: drop this chord entirely rather than store it.
         if (pbeams::gOrderMin > 0 && order >= 0 &&
             order < pbeams::gOrderMin && order < (int)kBeamOrderUnknown) return;
@@ -472,6 +495,10 @@ struct BeamBank {
         b.lambda = (float)lambda; b.absorb = (float)absorb; b.med = med;
         b.achro = cieA ? (emIdx >= 0 ? 2 : 1) : 0;
         b.emIdx = (b.achro == 2) ? (short)emIdx : (short)-1;
+        // Provenance (0.312.0): out-of-range means "unknown", never the nearest real value.
+        b.srcEm = (srcEm >= 0 && srcEm <= 32767) ? (short)srcEm : (short)-1;
+        b.surf  = (surf < 0) ? (unsigned char)255 : (surf > 254 ? (unsigned char)254 : (unsigned char)surf);
+        b.pad2  = 0;
         for (int i = 0; i < 3; ++i) b.cieA[i] = cieA ? (float)cieA[i] : 0.0f;
         if (nSec > kBeamSecMax) nSec = kBeamSecMax;
         b.nSec = (lamS && nSec > 0 && !cieA) ? nSec : 0;

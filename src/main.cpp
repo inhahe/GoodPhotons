@@ -12307,6 +12307,19 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
     // Before ANY of the expensive per-beam work below: route the order >= 2 chords into the
     // fluence grid and drop them from the map, so the split, the CIE table, the boxes and the
     // BVH are all built over the order < 2 remainder only.
+    // -sunnee (0.312.0): erase the direct-sun chords the camera march estimates itself. Before
+    // the volcache split -- order 1 is not its business -- and before every per-beam build step,
+    // so the diagnostics below describe the map the gather will actually walk.
+    if (vcScene && pbeams::gSunNee) {
+        double pf = 0.0;
+        const size_t before = bm.beams.size();
+        const size_t nSun = sunNeeSplit(*vcScene, bm, &pf);
+        if (nSun && !quiet)
+            std::printf("%s sun-nee: %zu direct-sun chords erased (%.1f%% of chords, %.1f%% of chord power); "
+                        "the gather marches the sun's single scatter instead\n",
+                        tag, nSun, 100.0 * (double)nSun / (double)(before ? before : 1),
+                        100.0 * pf);
+    }
     size_t vcSplitOut = 0;
     if (vcScene) {
         const size_t nSplit = vcSplitOut = volCacheSplit(*vcScene, bm);
@@ -19338,6 +19351,8 @@ static int run(int argc, char** argv) {
             int v = std::atoi(argv[++i]);
             pbeams::gOrderMax = (v < 0) ? 0 : v;
         }
+        else if (!std::strcmp(argv[i], "-sunnee") || !std::strcmp(argv[i], "-sun-nee"))
+            pbeams::gSunNee = true;
         else if (!std::strcmp(argv[i], "-beams-minorder") && i + 1 < argc) {
             const int v = std::atoi(argv[++i]);
             pbeams::gOrderMin = (v < 0) ? 0 : v;
