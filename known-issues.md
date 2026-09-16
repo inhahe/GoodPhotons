@@ -4540,14 +4540,46 @@ claim here — the honest test is that flat scenes agree within that). `scenes/_
 mode-M-vs-D invariant reads **1.058** against the 1.085 its own header records. `gallery_rain`
 frame 555 costs **97 s against 93 s (+4 %)**.
 
-**Not covered, and why.** Media transmittance along the camera segment (`camMediaTr`) is
-wavelength-dependent too and carries the same error — but it is a STOCHASTIC ratio-tracking
-estimate, not a cheap function, so sampling it at 24 wavelengths is not the same kind of change.
-It is inert for `gallery_rain` (both media have flat coefficients — `Medium::achroSigma`), and a
-spectrally-varying `sigma_t` would need the hero-wavelength treatment rather than this one. The
-`Hair` BCSDF is skipped for the same cost reason. `HalfMirror`'s reflect-or-pass and the layered
-coat's coat-or-body are stochastic BINARY choices made at the camera's wavelength: the same class
-of error, not expressible as a smooth ratio, and unmeasured.
+**Not covered — and the media case is MUCH worse than the surfaces were, now that it is measured.**
+Media transmittance along the camera segment (`camMediaTr`) is wavelength-dependent too and carries
+the identical error. I first wrote this paragraph guessing it was minor; that guess was wrong and
+the measurement says so plainly.
+
+Measured on a Cornell box FILLED with fog (`scraps/fog_col.ftsl` vs `scraps/fog_flat.ftsl`, mode M
+`-beams -n 60000000` against mode D 400 spp, GPU), back-wall ROI seen through the fog, mode M / mode
+D **per channel** — a spectral error shows up as the channels disagreeing with each other:
+
+| fog | R | G | B | spread |
+|---|---:|---:|---:|---:|
+| flat `sigma_a 1.05` (control) | 1.0017 | 0.9985 | 1.0007 | **0.3 %** |
+| coloured `sigma_a rgb 0.25 1.0 2.6` | **0.7685** | **0.9020** | **1.6388** | **113 %** |
+
+The flat control agrees to 0.3 %, which is what makes the coloured row attributable to the spectral
+mechanism rather than to the beam estimator's own bias. Blue comes out **64 % too bright** and red
+**23 % too dark**: not a subtle shift, a wrong colour. Any scene with a spectrally-varying
+`sigma_a`/`sigma_s` — coloured smoke, tinted water, an absorbing volume — is mis-rendered in mode M
+today. It is inert for `gallery_rain` only because both of its media have flat coefficients
+(`Medium::achroSigma`), which is a property of that scene and not a general reassurance.
+
+**Why the SPECGATHER trick does not simply extend to it.** A reflectance is a deterministic function
+that can be evaluated at any wavelength, which is what makes the ratio exact. A transmittance is a
+STOCHASTIC ratio-tracking estimate, and `E[A/B] != E[A]/E[B]` — dividing two noisy estimates is
+biased. The walk would instead have to carry a per-wavelength transmittance VECTOR forward and apply
+it per photon. Two tiers make that tractable rather than expensive:
+
+- a **homogeneous** medium needs no estimator at all: `T(lambda) = exp(-sigma_t(lambda) * d)` is
+  analytic, exact and nearly free — and it covers the whole measured case above;
+- a **heterogeneous** one wants ratio tracking with ONE shared collision sequence updating K
+  correlated weights (the hero-wavelength treatment), so the cost is one march with K-wide weight
+  updates rather than K marches.
+
+As with the surface fix, the scalar `thr` must then take its value FROM that vector at the camera's
+wavelength, so the two can never disagree.
+
+**Also not covered:** the `Hair` BCSDF (evaluating it per wavelength is genuinely expensive), and
+`HalfMirror`'s reflect-or-pass and the layered coat's coat-or-body, which are stochastic BINARY
+choices made at the camera's wavelength — the same class of error, not expressible as a smooth
+ratio, and still unmeasured.
 
 ### OPEN (2026-09-16): `-direct-only` is silently ignored by mode D (and any non-backward mode)
 
