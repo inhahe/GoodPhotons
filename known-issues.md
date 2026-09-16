@@ -3914,6 +3914,19 @@ film block where the per-camera path reads the override.
   the eye contradicted; `scraps/seedpair.py`, `scraps/raintail.py` and `scraps/flickerseq.py` are
   the pattern/tail/temporal measurements that actually discriminate.
 
+### OPEN (2026-09-16): `-denoise` on a low-spp `-mode W` frame tints the WHOLE frame one colour
+
+Seen while making a quick trajectory preview of `gallery_rain` (`-mode W -spp 2 -denoise
+-fireflies 4`, 320x180): every frame came out uniformly yellow -- floor grid, pedestals, gyroid,
+all of it -- where the same frame without `-denoise` has a green grid and grey stone and only
+the cloud/rain speckled (single-wavelength media passes). The chroma filter's job is to average
+spectral speckle toward neutral over a neighbourhood; with only TWO deterministic wavelength
+passes in the frame there is no neutral to average toward, and the luma-weighted gather appears
+to spread whichever wavelength dominates the bright pixels across everything. Not investigated
+beyond that (the preview simply ran without the flag). Worth a look before anyone reaches for
+`-denoise` on a mode-W or other very-low-spp spectral frame; the fix may just be a floor on spp
+below which the chroma pass declines to run, with a message.
+
 ### STALE-LIMITATION AUDIT (2026-09-13) — documented limitations are less re-tested than open bugs
 
 Three recorded blockers dissolved in one session, each on a single grep against code that had moved
