@@ -4231,14 +4231,45 @@ cloud, which is real and small; and a **trilinear** cache read between cell cent
   17.1 -> 11.3, and the frame 390 s -> 339 s. **Recommendation for the flyby: `-beamachro all`
   alongside `-sunnee` and the cache.**
 
-**Still open, and physical: the sun's disc through the cloud.** The white dot at the cloud's centre
-in frame 555 is the sun (0.53 deg = 4 px at `fov_y 70`), seen through an optical depth of ~7; the
-mode-D reference has it at the same brightness (window sum 4,228 / 4,318 over two seeds). Mode M's
-estimate of it swings +-25 % between seeds at 32 spp because the cloud's transmittance along that
-one ray is a single ratio-tracking sample per camera sample, so in a flyby the dot would flicker
-as it crosses the cloud. Fix, if wanted: a multi-sample transmittance for the few camera rays that
-land on the disc.
+**The sun's disc through the cloud — physical, and steadied (0.314.0).** The white dot at the
+cloud's centre in frame 555 is the sun (0.53 deg = 4 px at `fov_y 70`), seen through an optical
+depth of ~7; the mode-D reference has it at the same brightness (window sum 4,228 / 4,318 over
+two seeds). Mode M's estimate of it swung 3,100..5,300 between seeds at 32 spp — a one-pixel
+twinkle as it crosses the cloud in a flyby. Taken apart in two steps:
 
+- **The transmittance was not it.** Averaging 64 ratio-tracking samples for camera segments aimed
+  at the disc (`camMediaTr` / `dCamMediaTr`, kept: unbiased, free) left the spread at 51 % while
+  every pixel off the disc stayed bit-identical.
+- **The hero wavelength was most of it.** Each camera sample evaluated the disc's blackbody at one
+  random λ, and CIE-Y under a random λ has ~140 % relative spread — ±25 % at 32 spp on anything
+  bright and chromatic. Mode M's gather now **stratifies λ across a pixel's samples** (kGather:
+  stratum `s` of `sppTotal` on the emission CDF, jittered, under a per-pixel rotation; the CPU per
+  chunk). Disc spread 51 % → **19 %**; the developed ring pixel goes 201..255 → 237..255. And it
+  is a general improvement: rain luma seed-to-seed noise 9.59 → **8.11**, rain chroma seed-pair
+  29.3 → **25.2**, at zero cost and energy parity (cloud 0.9998, rain 1.0007, frame 0.9973).
+- **What remains is geometric.** At 320x180 the disc is 1.4 px, so every disc pixel is an edge
+  pixel whose coverage is a Bernoulli draw per sample (±18 % at 32 spp for half coverage); at
+  960x540 the 4-px disc has stable fully-covered core pixels and its ring's variation mostly clips
+  to white. Stratifying the sub-pixel jitter would take that too; not done, because the pixel
+  jitter feeds every dimension of the sampler and the twinkle is now a sub-pixel edge effect.
+
+**CPU / GPU with the whole flag set** (`-sunnee -beamachro all`, cache on; 160x90, spp 32, seed 1):
+rain 0.9894, cloud 1.0133, whole frame 1.0142 -- the media agree to ~1 %. The floor GRID reads **0.914**
+(CPU darker), a no-media surface region, so it is outside everything this entry touched; pre-existing: the 0.312.0 pair read 0.914 there at 4 spp.
+Logged as OPEN below: a CPU/GPU disagreement on the surface photon-map gather.
+
+
+
+### OPEN (2026-09-16): mode M's CPU and GPU gathers disagree by ~9 % on gallery_rain's floor grid
+
+Seen while checking backend parity of `-sunnee` (which does not touch it): on frame 555 at 160x90,
+spp 32, seed 1, with `-beams -sunnee -beamachro all` and the volcache on, the CPU renders the floor
+wireframe ROI (x 5..55, y 60..88) at **0.914** of the GPU's luma while the two media ROIs agree to
+~1 % (rain 0.9894, cloud 1.0133). Pre-existing: the 0.312.0 pair read 0.914 there at 4 spp. A no-media surface region
+lit by the surface photon map, so the suspects are the density estimate's radius / caustic-map
+handling or the direct-env term on the two backends, not the beam code. Not investigated; needs a
+media-free frame (`-beams` off) to isolate the surface gather, then the two maps' radii and photon
+counts compared.
 
 ### OPEN (2026-09-16): `-direct-only` is silently ignored by mode D (and any non-backward mode)
 

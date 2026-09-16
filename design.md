@@ -799,6 +799,26 @@ one — accepting the covariance of path power with CIE(λ) as bias; and `VolCac
 `dVolCacheFetch` read the fluence grid **trilinearly between cell centres** (edge-clamped)
 instead of nearest-cell, which is what painted a cell's realization noise as a five-pixel square.
 
+**The sun's disc through the cloud (0.313.1).** Correct in brightness — the mode-D reference has
+it at the same value — but mode M's estimate of it swung ±25 % between seeds at 32 spp: the
+disc is ~10⁴ times brighter than the cloud around it, and the cloud's transmittance along that
+one ray was a single ratio-tracking sample per camera sample. `camMediaTr` / `dCamMediaTr`
+(the two extinction sites of `photonGather` / `dPhotonGather`) average
+`pbeams::kSunDiscTrSamples` (64) samples for a camera segment whose direction lies inside a
+sun's disc, and one sample otherwise — unbiased either way, and paid only by the handful of
+pixels on the disc.
+That turned out to be the smaller half. With the transmittance averaged the disc still swung
+3100–5300 between seeds while every other pixel stayed bit-identical: the rest was the **hero
+wavelength** — each camera sample evaluates the disc's blackbody at one λ, and CIE-Y under a
+random λ has ~140 % relative spread, ±25 % at 32 spp. So (0.314.0) the gather **stratifies λ
+across a pixel's samples**: in `kGather` sample `s` of `sppTotal` takes stratum `s` of the
+emission CDF (`dSampleSceneLambdaU`), jittered within the stratum, under a per-pixel random
+rotation (a `DRng` seeded from the pixel) so neighbours do not walk the spectrum in step; the
+jitter draw stands in for the sampler's own uniform, so the sample's remaining stream is
+unchanged. `renderPhotonCamera` does the same per chunk (`photonGather(..., lambdaU)`,
+`EmitSampler::sampleAt`), each chunk being a complete stratification on its own. This is the
+1/√N → ~1/N^1.5 improvement of every bright spectral term in mode M's gather, not just the disc.
+
 **Cost.** Per camera segment and medium: 64 shadow rays and 64 short ratio-tracking calls, plus
 the incremental camera transmittance -- independent of the beam count, which is the point; the
 beams it removes were the ones every probe ray had to walk. Measured (gallery_rain frame 555,

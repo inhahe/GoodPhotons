@@ -219,6 +219,12 @@ namespace pbeams { inline int gOrderMin = 0; }
 namespace pbeams {
 inline bool gSunNee = false;
 inline constexpr int kSunNeeSteps = 64;   // jittered steps per medium span per camera segment
+// Ratio-tracking samples for the media transmittance of a camera segment AIMED AT A SUN'S DISC
+// (0.313.1). The directly-viewed disc is the one place a single sample shows: it is ~10^4 times
+// brighter than the cloud around it, so the +-25 % swing of one sample through tau ~ 7 flickered
+// the dot from frame to frame in a flyby. Those segments are a handful per frame, so averaging
+// this many costs nothing measurable, and a mean of unbiased samples is still unbiased.
+inline constexpr int kSunDiscTrSamples = 64;
 }
 
 // Sentinel for PhotonBeam::order -- "this depositor does not track medium scattering order".

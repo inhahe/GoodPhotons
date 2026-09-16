@@ -1152,13 +1152,30 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
 //
 // `pmC` (optional) is the CAUSTIC map (see tracePhotonPass): a disjoint half of the same
 // deposits, gathered at its own much finer radius and simply added.
+// Media transmittance of one straight CAMERA segment: one ratio-tracking sample, or
+// pbeams::kSunDiscTrSamples of them when the segment points into a sun's disc (see the
+// constant's note). Device twin: dCamMediaTr.
+inline double camMediaTr(const Scene& scene, const Renderer& mats, const Vec3& o, const Vec3& d,
+                         double len, double lambda, Pcg32& rng) {
+    const int n = (scene.sunCount > 0 && scene.sunRadiance(d, lambda) > 0.0)
+                      ? pbeams::kSunDiscTrSamples : 1;
+    if (n == 1) return mats.mediaTransmittance(scene, o, d, len, lambda, rng);
+    double s = 0.0;
+    for (int i = 0; i < n; ++i) s += mats.mediaTransmittance(scene, o, d, len, lambda, rng);
+    return s / (double)n;
+}
+
+// `lambdaU` >= 0 is a stratified uniform for the hero wavelength (renderPhotonCamera); < 0 draws
+// it from `rng` as before.
 inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                          Pcg32& rng, bool diffraction, int maxBounce, int fgRays = 0,
-                         const BeamMap* bm = nullptr, const PhotonMap* pmC = nullptr) {
+                         const BeamMap* bm = nullptr, const PhotonMap* pmC = nullptr,
+                         double lambdaU = -1.0) {
     Vec3 L{0, 0, 0};
     double thr = 1.0;
     double pdfL = 0.0;
-    double lambda = scene.emitSampler.sample(rng, pdfL);
+    double lambda = (lambdaU >= 0.0) ? scene.emitSampler.sampleAt(lambdaU, pdfL)
+                                     : scene.emitSampler.sample(rng, pdfL);
     if (pdfL <= 0.0) return L;
     const double invPdfL = scene.invPdfLambda(lambda);
 
@@ -1212,7 +1229,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                         if (volOn) { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
                           L += gatherPhotonBeams(scene, mats, *bm, so, sd, slen, aGlass, rng) * thr; }
                         if (sunOn) L += sunNeeMarch(scene, mats, so, sd, slen, aGlass, lambda, invPdfL, rng) * thr;
-                        thr *= mats.mediaTransmittance(scene, so, sd, slen, lambda, rng);
+                        thr *= camMediaTr(scene, mats, so, sd, slen, lambda, rng);
                     }
                     if (aGlass > 0.0) thr *= std::exp(-aGlass * slen);
                     return false;   // a camera ray never terminates in the volume here:
@@ -1240,7 +1257,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
               }
             if (sunOn) L += sunNeeMarch(scene, mats, ray.o, ray.d, dSeg, aGlass, lambda, invPdfL, rng) * thr;
             // Extinction along the camera segment: what is behind the fog gets dimmed.
-            thr *= mats.mediaTransmittance(scene, ray.o, ray.d, dSeg, lambda, rng);
+            thr *= camMediaTr(scene, mats, ray.o, ray.d, dSeg, lambda, rng);
             if (thr <= 0.0) return L;
         }
         if (h.valid) {                                   // Beer-Lambert in current medium
@@ -1522,8 +1539,20 @@ inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, 
                     seedUnit(rng, (sampleBase + (uint64_t)s) * nPix + pixIdx,
                              0xA24BAED4963EE407ULL);
                     Ray ray = cam.genRay(px, py, rng.uniform(), rng.uniform());
+                    // STRATIFIED hero wavelength over this chunk's samples (0.314.0; device twin
+                    // and the reasoning: kGather in render_cuda.cu). Per chunk rather than over
+                    // the whole render because the chunk is all this call can see, and a chunk
+                    // stratified over [0,1) is unbiased on its own; the jitter draw stands in for
+                    // the draw photonGather would otherwise have made.
+                    double lambdaU = -1.0;
+                    if (spp > 1) {
+                        Pcg32 rrot; seedUnit(rrot, pixIdx, 0x9E3779B97F4A7C15ULL);
+                        double u = rrot.uniform() + ((double)s + rng.uniform()) / (double)spp;
+                        u -= std::floor(u);
+                        lambdaU = (u < 1.0) ? u : 0.999999999;
+                    }
                     f.add(px, py, photonGather(scene, pm, ray, rng, diffraction, maxBounce,
-                                               fgRays, bm, pmC));
+                                               fgRays, bm, pmC, lambdaU));
                 }
             }
         }

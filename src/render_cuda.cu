@@ -14164,6 +14164,21 @@ __device__ static void dSunNeeMarch(const DScene& sc, const DVec3& oc, const DVe
     }
 }
 
+// Media transmittance of one straight CAMERA segment: one ratio-tracking sample, or
+// pbeams::kSunDiscTrSamples of them when the segment points into a sun's disc (host twin
+// camMediaTr, photonmap_render.h; see the constant's note in photonbeams.h).
+__device__ static double dCamMediaTr(const DScene& sc, const DVec3& o, const DVec3& d, Real len,
+                                     Real lambda, DRng& rng) {
+    int n = 1;
+    if (sc.sunCount > 0)
+        for (int k = 0; k < sc.nEmitters; ++k)
+            if (sc.emitters[k].shape == 6 && dInSunCone(sc.emitters[k], d)) { n = pbeams::kSunDiscTrSamples; break; }
+    if (n == 1) return (double)dMediaTransmittance(sc, o, d, len, lambda, rng);
+    double s = 0.0;
+    for (int i = 0; i < n; ++i) s += (double)dMediaTransmittance(sc, o, d, len, lambda, rng);
+    return s / (double)n;
+}
+
 // ----------------------- photon-map camera gather (mode M) -------------------
 // Device twin of photonGather (photonmap_render.h). Follows a camera ray through specular
 // surfaces (monochromatic at the sampled `lambda`); at the first diffuse / translucent hit it
@@ -14239,7 +14254,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     if (volOn) dGatherPhotonBeams(sc, *bm, pro, rd, slen, aGlass, rng, bX, bY, bZ);
                     if (sunOn) dSunNeeMarch(sc, pro, rd, slen, aGlass, lambda, invPdfL, rng, bX, bY, bZ);
                     oX += bX * thr; oY += bY * thr; oZ += bZ * thr;
-                    thr *= (double)dMediaTransmittance(sc, pro, rd, slen, lambda, rng);
+                    thr *= dCamMediaTr(sc, pro, rd, slen, lambda, rng);
                 }
                 if (aGlass > 0.0) thr *= exp(-aGlass * (double)gm.arc);
             }
@@ -14258,7 +14273,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             if (volOn) dGatherPhotonBeams(sc, *bm, ro, rd, dSeg, aGlass, rng, bX, bY, bZ);
             if (sunOn) dSunNeeMarch(sc, ro, rd, dSeg, aGlass, lambda, invPdfL, rng, bX, bY, bZ);
             oX += bX * thr; oY += bY * thr; oZ += bZ * thr;
-            thr *= (double)dMediaTransmittance(sc, ro, rd, dSeg, lambda, rng);
+            thr *= dCamMediaTr(sc, ro, rd, dSeg, lambda, rng);
             if (thr <= 0.0) return;
         }
         if (h.valid) {                                   // Beer-Lambert in current medium
@@ -14507,7 +14522,28 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, D
         int py = (int)(pix / resX);
 
         double pdf = 0.0;
-        Real lambda = dSampleSceneLambda(sc, rng, pdf);
+        // STRATIFIED hero wavelength (0.314.0): sample s of this pixel's sppTotal takes stratum s
+        // of the emission CDF, jittered within the stratum, under a per-pixel random rotation so
+        // neighbouring pixels do not walk the spectrum in step. One monochromatic sample's CIE
+        // weight varies 0..1 across the band, which at 32 spp was +-25 % of luminance on any
+        // bright spectral term -- the sun's disc through the cloud twinkled frame to frame, and
+        // the rainbow's chroma grain was mostly this. Stratified over N strata the same integral
+        // converges like 1/N^1.5 instead of 1/sqrt(N). The jitter draw stands in for the sampler's
+        // own uniform, so the rest of the sample's stream is unchanged. Host twin:
+        // renderPhotonCamera (photonmap_render.h), which stratifies within its chunk.
+        const long long sIdx = gidx - pix * sppTotal;
+        Real lambda;
+        if (sppTotal > 1 && sIdx >= 0 && sIdx < sppTotal) {
+            DRng rrot;
+            rrot.seed((unsigned long long)(pix * 2 + 1) ^ 0x5851F42D4C957F2DULL,
+                      seedBase ^ ((unsigned long long)pix + 0x9E3779B9ULL));
+            double u = (double)rrot.uniform() + ((double)sIdx + (double)rng.uniform()) / (double)sppTotal;
+            u -= floor(u);
+            if (!(u < 1.0)) u = 0.999999999;
+            lambda = dSampleSceneLambdaU(sc, u, pdf);
+        } else {
+            lambda = dSampleSceneLambda(sc, rng, pdf);
+        }
         // Retire on the reject path too. It is a rare sample, but an undercount here would
         // leave the bar stalled just short of 100% at the end of a launch — which reads as
         // exactly the wedged render this counter exists to rule out.
