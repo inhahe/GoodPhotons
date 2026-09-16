@@ -4398,6 +4398,41 @@ wrong -- the camera sat outside the box, so a 1.0-albedo and a 0.5-albedo sphere
 byte-identical images, which the rig check caught only because it was run. Check that the rig can
 see the effect, in an enclosure, before believing any cross-mode number.
 
+### FIXED (2026-09-16, v0.320.0): the preview multiplied its ENVIRONMENT specular by the KEY-light scale, so an env-only scene had no specular at all -- and the bare-mesh quick-view is exactly such a scene
+
+Reported as "I did `ftrace meshes/alice.glb` and her dress still doesn't show up as glossy", after
+the layered coat (0.317.0) and the directional preview environment (0.317.0) were both in.
+
+**Two independent reasons, both real.**
+
+1. **The preview's specular was multiplied by zero.** The split sum has a direct half (per key
+   light) and an environment half. Both rasterizers ended with `accum += specAcc * keyScale` --
+   and `deriveLight`'s env-only branch sets `keyScale = 0.0` (there are no key lights to scale).
+   The direct half correctly scales with it; the ENVIRONMENT half must not, being the reflection
+   of the surroundings rather than of a key light. In any scene lit only by `light env` the entire
+   specular term therefore vanished. Now split: `accum += specDirect * keyScale + specEnv`.
+2. **The quick-view had nothing to reflect.** `ftrace model.glb` synthesises `light env { spd 0.5 }`
+   and nothing else, and a uniform environment cannot show gloss on principle: a mirror reflecting
+   a constant returns that constant, so a specular surface under one is indistinguishable from a
+   matte one. Fixed by giving the synthesised scene a **studio key** -- `light sun` at `angle 6`
+   (a softbox, not the sun's real 0.53 deg), placed up and to the left of the auto-framed camera,
+   which sits along `(0.55, 0.42, 1.0)`. A soft highlight reads as satin; a hard one reads as glass.
+
+**Measured** (`ftrace meshes/alice.glb -raster`, `-import-specular off` vs on, pixels brightened by
+more than 2 levels of 255): before, **0** -- the two renders were byte-identical. After (1) alone,
+37,096 px at peak +71, but all of it silhouette rim (the grazing Fresnel rise on a uniform
+environment, which is all a uniform environment can produce). After (1)+(2), **22,270 px at peak
++168**, a real highlight on the near shoulder, collar and hair.
+
+**Still not as glossy as the viewer it was exported from, and the reason is worth recording:**
+glTF's metalness is **per texel** and ftrace's material type is **per material**. Alice's
+metallicRoughness map has mean metalness 0.28 but p90 **0.53** -- i.e. parts of that one material
+are properly metallic and the importer, typing the whole thing by the mean, renders them as a 4 %
+dielectric. A 4 % coat is genuinely subtle; a metal is not. The fix is to import a metalness-mapped
+material as a **two-child mix driven by the map** -- `Material::mixWeightTex` already exists and
+does exactly this (a per-hit blend mask on a 2-child mix) -- with a metal glossy child and the
+layered dielectric child. Not built; this is the most likely remaining difference against Meshy.
+
 ### DEFERRED, WITH A TRIGGER (2026-09-16): the EXPLICIT multi-bounce layered BSDF — what would have to be true before it is worth building
 
 **Where the coat model stands.** `MatType::Layered` is a coat interface over body lobes: the coat

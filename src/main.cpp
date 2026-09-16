@@ -18887,6 +18887,18 @@ static int run(int argc, char** argv) {
         src += "material \"clay\" { type diffuse reflect whitewall 0.6 }\n";
         src += "mesh { file \"" + mp + "\"  material clay }\n";
         src += "light env { spd 0.5 }\n";
+        // ...PLUS A KEY. A uniform environment is the flattest light there is, and a SPECULAR
+        // surface under one is indistinguishable from a matte surface: a mirror reflecting a
+        // constant returns that same constant. So an imported model's coat — the 4 % lobe every
+        // glTF dielectric carries — could not be seen here however correctly it was imported,
+        // which is what "the dress still isn't glossy" reported against `ftrace meshes/alice.glb`.
+        // Every model viewer solves this the same way, with a studio key: a source bright and
+        // small enough to make a HIGHLIGHT, which is the thing the eye reads as gloss. Placed up
+        // and to the LEFT of the auto-framed camera (which sits along (0.55, 0.42, 1.0) — see
+        // below), the classic portrait key, so the highlight lands on the near side of the
+        // subject rather than behind it. `angle 6` instead of the sun's real 0.53° makes it a
+        // softbox rather than a pinpoint: a soft highlight reads as satin, a hard one as glass.
+        src += "light sun { dir -0.319 0.785 0.531  angle 6  spd preset:d65  intensity 90 }\n";
         std::string ferr;
         if (!ftsl::loadSource(src, std::string("<mesh-viewer:") + inFile + ">", ftslScene, ferr)) {
             std::fprintf(stderr, "[ftrace] could not load mesh '%s': %s\n", inFile, ferr.c_str());

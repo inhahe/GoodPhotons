@@ -2237,10 +2237,17 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                 const double tEnv = 0.5 * (Rv.y + 1.0);
                 const double sEnv = tEnv * tEnv * (3.0 - 2.0 * tEnv);
                 const Vec3 env = light.envDn + (light.envUp - light.envDn) * sEnv;
-                specAcc = specAcc + Vec3{(sh->f0.x * A + B) * env.x,
-                                         (sh->f0.y * A + B) * env.y,
-                                         (sh->f0.z * A + B) * env.z};
-                accum[i] = accum[i] + specAcc * light.keyScale;
+                const Vec3 specEnv{(sh->f0.x * A + B) * env.x,
+                                   (sh->f0.y * A + B) * env.y,
+                                   (sh->f0.z * A + B) * env.z};
+                // The DIRECT lobe scales with the key-light scale, exactly as the diffuse
+                // `lit` term does. The ENVIRONMENT half must NOT: it is the reflection of the
+                // surroundings, not of a key light. Scaling it by keyScale erased every
+                // highlight in an env-only scene -- which is exactly what the bare-mesh
+                // quick-view synthesises (`light env` and nothing else, so keyScale is 0), so
+                // an imported model's coat could never show there however right the material
+                // was. Reported from `ftrace meshes/alice.glb`.
+                accum[i] = accum[i] + specAcc * light.keyScale + specEnv;
             }
         }
     });

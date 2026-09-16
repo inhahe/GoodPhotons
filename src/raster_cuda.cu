@@ -1123,10 +1123,12 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         const float  tEnv = 0.5f * (Rv.y + 1.0f);
         const float  sEnv = tEnv * tEnv * (3.0f - 2.0f * tEnv);
         const float3 env = envDn + (envUp - envDn) * sEnv;
-        specAcc = specAcc + make_float3((shF0.x * A + B) * env.x,
-                                        (shF0.y * A + B) * env.y,
-                                        (shF0.z * A + B) * env.z);
-        accum[i] = accum[i] + specAcc * keyScale;
+        // The env half is NOT scaled by keyScale (host twin: raster.h) -- an env-only scene
+        // has keyScale 0, which zeroed every highlight in the bare-mesh quick-view.
+        const float3 specEnv = make_float3((shF0.x * A + B) * env.x,
+                                           (shF0.y * A + B) * env.y,
+                                           (shF0.z * A + B) * env.z);
+        accum[i] = accum[i] + specAcc * keyScale + specEnv;
     }
 }
 
