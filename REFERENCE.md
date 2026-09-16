@@ -4653,9 +4653,18 @@ also declares a path, pass `-camera <name>`.
   (RMF), a twist-free moving basis parallel-transported along the path (double-reflection
   method, *not* the flip-prone Frenet frame) so the shot **banks into turns** — and on a
   `closed` loop the residual twist is distributed so the frame closes seamlessly. Forward
-  (2 DOF) comes from `fwd_at <t> <x y z>` direction keyframes, else `look_at`/`look curve`,
-  else the tangent; up (1 DOF) comes from `up_at <t> <x y z>`, else `roll`/`roll_at`, else the
-  reference up. A `fwd_at`/`up_at` vector is read **in its axis's frame**: under `travel` its
+  (2 DOF) comes from `fwd_at <t> <x y z>` direction keyframes, else the **`aim_at` aim-point
+  spline** blended by `aim_weight_at` over the default look (`look_at`/`look curve`, else the
+  tangent); up (1 DOF) comes from `up_at <t> <x y z>`, else `roll`/`roll_at`, else the
+  reference up. **`aim_at` (since 0.308.0) is the curve-based view control**: the eye is a
+  spline, so motion is smooth by construction, but the tangent look is *constant* along a
+  straight leg and swings at each corner — on a path built from straight legs that reads as
+  rotate–stop–rotate — while `fwd_at` keys interpolate linearly and hold outside their range.
+  `aim_at <t> <x y z>` keys (≥ 2) are control points of a Catmull-Rom spline in world space,
+  knotted on their own `t` so it is C¹ in time however unevenly spaced; `aim_weight_at <t>
+  <w>` says how much of it to use, smoothstepped between keys (continuous angular velocity)
+  and held outside, so `0 → 1 → 1 → 0` eases onto the aim and back onto the path and leaves
+  every other frame byte-identical. Grammar and an example in `FTSL.md` §15.3. A `fwd_at`/`up_at` vector is read **in its axis's frame**: under `travel` its
   components are `(right, up, forward)` in the RMF basis, under `world` a plain world
   direction. Authoring none of these keywords reproduces the legacy world-up framing exactly.
 

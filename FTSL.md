@@ -2597,6 +2597,31 @@ The eye rides a **Catmull-Rom spline** that passes through every `point` control
 | `look tangent` (default) | aim along the direction of travel (curve tangent) |
 | `look_at <x y z>` | a fixed target for every frame |
 | `look curve` + `look_point <x y z> …` | aim at a **second** Catmull-Rom spline (≥ 2 `look_point`s), sampled in step with the eye |
+| `aim_at <t> <x y z> …` (+ `aim_weight_at <t> <w> …`) | **aim-point spline over the frame timeline**, blended over whichever of the above is the default look — see below |
+
+**`aim_at` — turning the camera as smoothly as it moves (since 0.308.0).** The eye is a
+spline, so motion is smooth by construction; the view direction had no equivalent. The
+tangent is *constant* along a straight leg and swings at each corner, so a path built from
+straight legs joined by corners reads as rotate–stop–rotate; `look_at` is rigid; `look curve`
+replaces the tangent for the *whole* flight; and `fwd_at` keys interpolate linearly and are
+**held** outside their range, so they cannot hand the view back to the tangent. `aim_at <t>
+<x y z>` keys (≥ 2, repeatable, `t ∈ [0,1]` on the frame timeline like every other `_at`
+track) are the control points of a **Catmull-Rom spline in world space**, knotted on the keys'
+own `t` values so it is C¹ in time however unevenly they are spaced; the camera looks at that
+moving point. `aim_weight_at <t> <w>` (repeatable) says how much: `0` = the default look
+(tangent / `look_at` / `look curve`) untouched, `1` = the aim point, **smoothstepped** between
+keys and held outside them — so a ramp `0 → 1 → 1 → 0` eases the view onto the aim and back
+onto the path with continuous angular velocity, and every frame outside the ramp is
+byte-identical to what it was. Omit the weight track and the aim applies in full wherever
+`aim_at` is keyed. The blend is a great-circle slerp, so a weight moving at a constant rate
+turns the view at a constant rate. `fwd_at`, if present, still overrides the result.
+
+```
+# hold the cloud through the turn, ease back to the path afterwards
+aim_at 0.228 8.0 2.0 2.0    aim_at 0.366 8.0 2.2 2.0    aim_at 0.488 8.0 1.7 2.0
+aim_at 0.558 8.1 1.3 1.9    aim_at 0.610 7.3 1.35 3.2   aim_at 0.663 6.9 1.6 4.3
+aim_weight_at 0.228 0   aim_weight_at 0.262 1   aim_weight_at 0.610 1   aim_weight_at 0.663 0
+```
 
 `closed` loops the curve (wrap-around Catmull-Rom, sampled i/N so frame N == frame 0);
 an open curve spans both endpoints via i/(N−1). All frames share

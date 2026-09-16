@@ -1329,7 +1329,8 @@ why these historical runs reproduce. See **J-BEAMCOST** in `known-issues.md`.
   because reads take a `const Block&` and "I was read" isn't part of a block's logical
   value. The ~17 sites that iterate `b.stmts` directly instead of calling `find` —
   repeated-key gathers (`point`, `density_at`, `look_point`, `roll_at`/`fov_at`,
-  `layer`, `surface`, `key`), exhaustive dispatch loops (group children, isosurface
+  `fwd_at`/`up_at`, `aim_at`/`aim_weight_at`, `layer`, `surface`, `key`), exhaustive
+  dispatch loops (group children, isosurface
   field elements and their nested CSG recursion, record bodies, record-override
   materials), and flat-word bodies (`table`, `palette`, `data`) — mark explicitly via
   `markUsed(b, key)` / `markAllUsed(b)`. After `Builder::build` finishes,

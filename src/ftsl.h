@@ -478,6 +478,23 @@ struct ScalarTrack {
             }
         return keys.back().v;
     }
+    // Same keys, SMOOTHSTEP between them instead of linear. For a track that drives an
+    // orientation blend this is the difference between a pan that eases in and out and one
+    // whose angular velocity jumps at every key: the blend's rate is the track's slope, and
+    // a piecewise-linear track has a step in its slope at each key, i.e. a visible jerk.
+    double sampleSmooth(double t, double fallback) const {
+        if (keys.empty()) return fallback;
+        if (t <= keys.front().t) return keys.front().v;
+        if (t >= keys.back().t)  return keys.back().v;
+        for (size_t j = 0; j + 1 < keys.size(); ++j)
+            if (t >= keys[j].t && t <= keys[j + 1].t) {
+                double sp = keys[j + 1].t - keys[j].t;
+                double f = (sp > 1e-12) ? (t - keys[j].t) / sp : 0.0;
+                f = f * f * (3.0 - 2.0 * f);
+                return keys[j].v + (keys[j + 1].v - keys[j].v) * f;
+            }
+        return keys.back().v;
+    }
 };
 
 // A piecewise-linear 3-vector animation track over t in [0,1] (the Vec3 analogue of
@@ -503,6 +520,56 @@ struct Vec3Track {
         return keys.back().v;
     }
 };
+
+// AIM-POINT SPLINE. A `camera_curve` moves its eye along a Catmull-Rom spline, so the
+// motion is smooth by construction; until 0.308.0 its VIEW direction had no equivalent --
+// the tangent (constant along a straight leg, swinging at each corner), a fixed point, a
+// second `look_point` spline sampled uniformly over the whole flight, or `fwd_at`
+// direction keys that interpolate linearly and HOLD outside their range. None of those can
+// say "look at the cloud through the turn, then ease back to the path", and on a circuit
+// built from straight legs the tangent look reads as rotate-stop-rotate.
+//
+// This is the missing piece: `aim_at <t> <x y z>` keys are control points of a Catmull-Rom
+// spline in WORLD SPACE over the frame timeline, and the camera looks at that moving point
+// blended (below) against whatever the default look is. The spline is knotted on the keys'
+// own t values (Barry-Goldman with those knots) rather than on their index, so it is C1 in
+// TIME however unevenly the keys are spaced -- the index-parameterised form would put a
+// velocity jump at every key whose neighbours differ in spacing. Held at the end points
+// outside the keyed range.
+inline Vec3 aimSplineAt(const Vec3Track& tk, double t) {
+    const auto& k = tk.keys;
+    const int n = (int)k.size();
+    if (n == 0) return Vec3{0, 0, 0};
+    if (n == 1 || t <= k.front().t) return k.front().v;
+    if (t >= k.back().t) return k.back().v;
+    int j = 0;
+    while (j + 1 < n - 1 && t > k[j + 1].t) ++j;          // segment [j, j+1]
+    auto P = [&](int i) { return k[std::max(0, std::min(n - 1, i))].v; };
+    // Knots are the keys' own times; the phantom knots past either end are extrapolated
+    // linearly so the end segments have the same shape they would with a mirrored key.
+    const double t0 = (j == 0) ? 2.0 * k[0].t - k[1].t : k[j - 1].t;
+    const double t1 = k[j].t, t2 = k[j + 1].t;
+    const double t3 = (j + 2 <= n - 1) ? k[j + 2].t : 2.0 * k[n - 1].t - k[n - 2].t;
+    const Vec3 P0 = P(j - 1), P1 = P(j), P2 = P(j + 1), P3 = P(j + 2);
+    auto lerp = [](const Vec3& a, const Vec3& b, double u) { return a * (1.0 - u) + b * u; };
+    auto safe = [](double d) { return std::abs(d) > 1e-12 ? d : 1e-12; };
+    const Vec3 A1 = lerp(P0, P1, (t - t0) / safe(t1 - t0));
+    const Vec3 A2 = lerp(P1, P2, (t - t1) / safe(t2 - t1));
+    const Vec3 A3 = lerp(P2, P3, (t - t2) / safe(t3 - t2));
+    const Vec3 B1 = lerp(A1, A2, (t - t0) / safe(t2 - t0));
+    const Vec3 B2 = lerp(A2, A3, (t - t1) / safe(t3 - t1));
+    return lerp(B1, B2, (t - t1) / safe(t2 - t1));
+}
+
+// Blend two unit directions along the great circle between them, so a weight that moves
+// at a constant rate turns the view at a constant angular rate.
+inline Vec3 slerpDir(const Vec3& a, const Vec3& b, double w) {
+    const double d = std::max(-1.0, std::min(1.0, dot(a, b)));
+    const double th = std::acos(d);
+    if (th < 1e-6 || th > 3.141592653589793 - 1e-6) return normalize(a * (1.0 - w) + b * w);
+    const double s = std::sin(th);
+    return a * (std::sin((1.0 - w) * th) / s) + b * (std::sin(w * th) / s);
+}
 
 // ---------------------------------------------------------------------------
 // Loader
@@ -7855,7 +7922,17 @@ private:
         };
         Vec3Track fwdTrk = readVecTrack("fwd_at");
         Vec3Track upTrk  = readVecTrack("up_at");
-        if (!vecTrkOk) return false;
+        // `aim_at <t> <x y z>`: control points of a world-space aim-point spline over the
+        // frame timeline (see aimSplineAt); `aim_weight_at <t> <w>`: how much of it to use,
+        // 0 = the default look, 1 = the aim, smoothstepped between keys. Omit the weight
+        // track and the aim applies in full wherever aim_at is keyed.
+        Vec3Track   aimTrk  = readVecTrack("aim_at");
+        ScalarTrack aimWTrk = readTrack("aim_weight_at");
+        if (aimTrk.active() && aimTrk.keys.size() < 2) {
+            fail("camera_curve '" + base + "' aim_at needs at least two keys (it is a spline)");
+            return false;
+        }
+        if (!vecTrkOk || !trkOk) return false;
 
         auto parseFrameKw = [&](const char* key, bool def, bool& out) -> bool {
             const Stmt* s = find(b, key);
@@ -8085,6 +8162,17 @@ private:
                 // path" motion. Direction (plus the fold-robust min_reach / look_smooth
                 // treatment) is precomputed in tangentDirs above.
                 cs.look = cs.eye + tangentDirs[(size_t)i];
+            }
+            // Aim-point spline, blended over the default look by its weight track. Applied
+            // BEFORE the `fwd_at` direction override, which stays the last word if present.
+            if (aimTrk.active()) {
+                const double w = std::min(1.0, std::max(0.0, aimWTrk.sampleSmooth(fr, 1.0)));
+                if (w > 0.0) {
+                    const Vec3 d0 = cs.look - cs.eye;
+                    const Vec3 d1 = aimSplineAt(aimTrk, fr) - cs.eye;
+                    if (length(d0) > 1e-12 && length(d1) > 1e-12)
+                        cs.look = cs.eye + slerpDir(normalize(d0), normalize(d1), w);
+                }
             }
             if (fwdTrk.active()) {
                 Vec3 fv = fwdTrk.sample(fr);
