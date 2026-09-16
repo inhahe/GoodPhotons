@@ -4163,6 +4163,83 @@ D" were readings of speckle. A tail-dominated reference has to be read by its bo
 seed-pair-suppressed) before any structure comparison, and a structure claim needs the
 map-realization control (same seeds, different map) before it is attributed to the estimator.
 
+### FIXED (2026-09-16, v0.313.0): colour blotches on the cloud with `-sunnee` + the cache — a fixed per-map chroma from the ~3 % of chords stored at one wavelength, smoothed into patches by the chroma denoiser
+
+**Reported** on the first full-resolution `-sunnee` frame (`png/sn/full555.png`, 960x540, spp 32,
+`-denoise`): soft colour blotches 10-20 px across in the cloud's interior, plus a few small bright
+squares. Chroma-exaggerated crop: `scraps/_cloud_blotch.png`.
+
+**Taken apart, cloud ROI at 320x180, chroma = developed RGB minus luma, per-pixel magnitude:**
+
+| variant (frame 555) | chroma mean | p95 | autocorr @1 / 2 / 4 / 8 px |
+|---|---:|---:|---|
+| beams, 32 spp | 13.54 | 32.2 | 0.55 / 0.20 / 0.10 / 0.02 |
+| `-sunnee`, no cache | 13.76 | 33.2 | 0.51 / 0.18 / 0.09 / 0.08 |
+| `-sunnee` + cache (bins) | 12.74 | 28.2 | 0.65 / 0.32 / 0.13 / 0.07 |
+| `-sunnee` + cache (scalar, `FTRACE_VOLCACHE_SH=0`) | 11.41 | 24.9 | 0.60 / 0.29 / 0.12 / 0.05 |
+| `-sunnee` + cache, 128 spp | 12.72 | 27.8 | 0.68 / 0.34 / 0.13 / 0.06 |
+| `-sunnee` + cache + `-denoise` | 8.70 | 13.2 | 0.93 / 0.93 / 0.84 / 0.53 |
+| mode-D reference, 8192 spp | 11.80 | 22.9 | 0.04 / 0.01 / 0.03 / 0.08 |
+
+- **It is not sampling noise.** 128 spp changes nothing (12.72 vs 12.74), and the seed-pair /
+  map-pair split says why: without the cache the cloud's chroma RMS is **17.6, of which 4.6 is
+  per-seed and 15.8 per-map** (two seeds on one map differ by 4.6; two maps by 15.8). With the
+  cache 15.2 / 12.9. The colour is a property of the MAP — a fixed 3D mottling that a flyby would
+  carry through every frame — not of the camera pass. The reference's chroma (11.8) is per-pixel
+  white noise (autocorrelation 0.04), i.e. the hero-wavelength grain of an unbiased estimator
+  that averages to neutral; mode M's is spatially coherent.
+- **The source is the chords the achromatic fold refuses.** `-beamachro on` folds a chord at its
+  emitter's mean CIE only when its path was provably wavelength-independent; the rest — on this
+  map ~3 % of chords by power, the ones that went through the rain's bow or through glass — are
+  stored at ONE hero wavelength, and a monochromatic chord is a saturated coloured streak (the
+  argument photonbeams.h makes for the bundle, applied to the population the bundle does not
+  reach). The cache inherits the same colours per cell, and its **nearest-cell read** paints a
+  cell's realization as a five-pixel square at 960x540 — the small bright squares. The l <= 2
+  bins add ~10 % (12.74 vs 11.41): eight more noisy coefficients per cell.
+- **The denoiser shapes the blotches.** `-denoise` takes the chroma magnitude from 12.7 to 8.7
+  but stretches its correlation length from 1 px to 8+ (0.53 at 8 px): it smooths the coherent
+  chroma into patches. And because its weights follow the per-seed LUMA, the patches are mostly
+  per-seed (denoised seed pair: RMS 9.2, of which 8.5 per-seed) — they would move from frame to
+  frame. A chroma filter cannot fix a chromatic bias in its input; it can only spread it.
+
+**The fix (0.313.0):** `-beamachro all` — a post-pass in `buildBeamMap` (after the `-sunnee`
+erase, before the volcache split) that folds EVERY unfolded chord at its emitter's mean CIE (a
+bundle's total power; `achro = 2` through the bow table where the pair has one), accepting the
+covariance of path power with CIE(lambda) as bias — the tint of rainbow light re-scattered by the
+cloud, which is real and small; and a **trilinear** cache read between cell centres
+(`VolCache::fetch` / `dVolCacheFetch`) in place of nearest-cell. Measured below.
+
+**Measured (same frame, 320x180, cloud ROI; `png/sn/tri1`, `all1`, `all3`, `all1_dn`, `all2_dn`):**
+
+| variant | chroma mean | p95 | static part (two maps) | denoised seed-pair |
+|---|---:|---:|---:|---:|
+| cache, nearest read (0.312) | 12.74 | 28.2 | 12.92 | 8.52 |
+| cache, trilinear read | 12.20 | 26.8 | — | — |
+| trilinear + `-beamachro all` | **8.49** | **11.5** | **5.13** | **1.98** |
+
+- The fold reached **16,896 chords — 30.5 % of the map after the `-sunnee` erase, 30.6 % of its
+  power** (the "~3 %" above was the cloud medium's own share; the rain's chords, mostly bow
+  scatters, were 26 % chromatic). Energy moved by the bias it accepts: cloud 0.9935, rain 1.0088,
+  frame 0.9967 against the unfolded map; the trilinear read alone is energy-neutral (0.9997).
+- The per-map colour is 2.5x smaller (12.9 -> 5.1) and the denoised patches no longer move
+  between seeds (8.5 -> 2.0): what the denoiser has left to smooth is small and stable. The
+  remaining chroma (RMS 9.3 denoised, nearly all consistent between seeds and maps) is the
+  cloud's REAL colour — a faint blue on the sky-lit shadow side against the warm sun-lit rim —
+  which the chroma-exaggerated before/after crop `scraps/_cloud_blotch_fix.png` shows as a
+  smooth gradient where 0.312 had patches and squares.
+- At 960x540 with `-denoise` (the frame that was reported): cloud chroma mean 9.40 -> 8.24, p95
+  17.1 -> 11.3, and the frame 390 s -> 339 s. **Recommendation for the flyby: `-beamachro all`
+  alongside `-sunnee` and the cache.**
+
+**Still open, and physical: the sun's disc through the cloud.** The white dot at the cloud's centre
+in frame 555 is the sun (0.53 deg = 4 px at `fov_y 70`), seen through an optical depth of ~7; the
+mode-D reference has it at the same brightness (window sum 4,228 / 4,318 over two seeds). Mode M's
+estimate of it swings +-25 % between seeds at 32 spp because the cloud's transmittance along that
+one ray is a single ratio-tracking sample per camera sample, so in a flyby the dot would flicker
+as it crosses the cloud. Fix, if wanted: a multi-sample transmittance for the few camera rays that
+land on the disc.
+
+
 ### OPEN (2026-09-16): `-direct-only` is silently ignored by mode D (and any non-backward mode)
 
 `g_directOnly` is consulted by the backward tracer (modes R/W, the explorer's refinement

@@ -784,6 +784,21 @@ the sun's CIE integral `Emitter::viewXYZ` outright; a bow medium with a `Scene::
 every other spectral term. Transmittances are at the hero wavelength in every branch, exactly
 as the folded beams' are. `DEmitter::viewXYZ` was added for the device side.
 
+**`-beamachro all` and the trilinear cache read (0.313.0) — the colour blotches.** With the sun
+marched and order >= 2 cached, the cloud still showed soft colour blotches at 960x540. Measured:
+the cloud's chroma noise was 17.6 levels of which 4.6 were per-seed and the rest **per-map** — a
+fixed 3D mottling that would ride along through the flyby — from the ~3 % of chords by power
+whose paths were wavelength-dependent (through the rain's bow, or glass) and are therefore
+stored at ONE hero wavelength: each is a saturated streak, or a tinted cache cell. The chroma
+denoiser then smooths that into 10–20 px patches (its correlation length grows from 1 px to 8+),
+and because its weights follow the per-seed luma, the patches move frame to frame. Two changes:
+`-beamachro all` is a post-pass in `buildBeamMap` (after the `-sunnee` erase, before the
+volcache split) that folds every unfolded chord at its emitter's `cieMean` — a bundle's total
+power, `achro = 1`, or `achro = 2` through the bow table where the (emitter, medium) pair has
+one — accepting the covariance of path power with CIE(λ) as bias; and `VolCache::fetch` /
+`dVolCacheFetch` read the fluence grid **trilinearly between cell centres** (edge-clamped)
+instead of nearest-cell, which is what painted a cell's realization noise as a five-pixel square.
+
 **Cost.** Per camera segment and medium: 64 shadow rays and 64 short ratio-tracking calls, plus
 the incremental camera transmittance -- independent of the beam count, which is the point; the
 beams it removes were the ones every probe ray had to walk. Measured (gallery_rain frame 555,

@@ -310,6 +310,10 @@ namespace pbeams { inline int gSpecC = kBeamSpecMax; }
 // The flag defaults ON. It is exact wherever it applies and inert everywhere else, so there is
 // nothing to trade off; `-beamachro off` exists to A/B it, not because there is a case for it.
 namespace pbeams { inline bool gAchro = true; }
+// `-beamachro all` (0.313.0): fold EVERY chord at its emitter's mean CIE response, including the
+// wavelength-dependent paths the default fold refuses. Applied as a post-pass in buildBeamMap
+// (before the volcache split, so the cache is built from folded colours too). See the note there.
+namespace pbeams { inline bool gAchroAll = false; }
 
 // One stored photon beam: (a sub-segment of) the path a photon travelled through one medium.
 //

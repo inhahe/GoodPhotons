@@ -330,14 +330,38 @@ struct VolCache {
     // In-scattered radiance toward `wOut`, WITHOUT sigma_s (the caller applies it with the
     // local density). `wOut` must be the direction the scattered light travels toward the
     // camera, i.e. -dc, matching the gather's phaseValue(dot(b.d, -dc)).
+    // TRILINEAR read between cell centres (0.313.0). A nearest-cell read paints every cell's
+    // realization noise as a visible block -- the "square specks" on gallery_rain's cloud at
+    // 960x540, where a 48^3 cell is five pixels wide. Edge cells clamp (no extrapolation), and
+    // the grid's outer face is still where the march stops reading. Device twin: dVolCacheFetch.
+    void fetch(double ux, double uy, double uz, double* cc) const {
+        const int n = nSH * nCh;
+        for (int k = 0; k < n; ++k) cc[k] = 0.0;
+        const double gx = ux - 0.5, gy = uy - 0.5, gz = uz - 0.5;
+        const int x0 = (int)std::floor(gx), y0 = (int)std::floor(gy), z0 = (int)std::floor(gz);
+        const double fx = gx - x0, fy = gy - y0, fz = gz - z0;
+        for (int dz = 0; dz < 2; ++dz) {
+            const int z = std::min(nz - 1, std::max(0, z0 + dz)); const double wz = dz ? fz : 1.0 - fz;
+            for (int dy = 0; dy < 2; ++dy) {
+                const int y = std::min(ny - 1, std::max(0, y0 + dy)); const double wy = dy ? fy : 1.0 - fy;
+                for (int dx = 0; dx < 2; ++dx) {
+                    const int x = std::min(nx - 1, std::max(0, x0 + dx)); const double w = wz * wy * (dx ? fx : 1.0 - fx);
+                    if (!(w > 0.0)) continue;
+                    const float* c = &sh[(size_t)idx(x, y, z) * n];
+                    for (int k = 0; k < n; ++k) cc[k] += w * (double)c[k];
+                }
+            }
+        }
+    }
     bool inScatter(const Vec3& p, const Vec3& wOut, Vec3& out) const {
         if (!ready) return false;
         const Vec3 ext = hi - lo;
-        const int ix = (int)((p.x - lo.x) / ext.x * nx);
-        const int iy = (int)((p.y - lo.y) / ext.y * ny);
-        const int iz = (int)((p.z - lo.z) / ext.z * nz);
-        if (ix < 0 || iy < 0 || iz < 0 || ix >= nx || iy >= ny || iz >= nz) return false;
-        const float* c = &sh[(size_t)idx(ix, iy, iz) * nSH * nCh];
+        const double ux = (p.x - lo.x) / ext.x * nx, uy = (p.y - lo.y) / ext.y * ny,
+                     uz = (p.z - lo.z) / ext.z * nz;
+        if (!(ux >= 0.0 && uy >= 0.0 && uz >= 0.0 && ux < (double)nx && uy < (double)ny && uz < (double)nz))
+            return false;
+        double c[kVolShN * 3];
+        fetch(ux, uy, uz, c);
         double Y[kVolShN];
         volShBasis(wOut, Y);
         double r[3] = {0.0, 0.0, 0.0};

@@ -12320,6 +12320,44 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
                         tag, nSun, 100.0 * (double)nSun / (double)(before ? before : 1),
                         100.0 * pf);
     }
+    // -beamachro all (0.313.0): fold EVERY unfolded chord at its emitter's mean CIE response.
+    // The default fold refuses a wavelength-DEPENDENT path (a bow scatter, dispersive glass)
+    // because its expected colour is not the emitter's mean -- but such a chord stored at ONE
+    // hero wavelength is a saturated coloured streak, and since the map is fixed for a whole
+    // flyby that is chromatic noise no seed count averages away: on gallery_rain's cloud the
+    // chroma noise measured 17.6 levels of which 4.6 were per-seed and the rest per-map, from
+    // the ~3 % of chords by power that were chromatic (known-issues, "colour blotches").
+    // Folding trades that for a bias: the covariance of a path's power with CIE(lambda), i.e.
+    // the tint those few chords really carried (rainbow light re-scattered by the cloud).
+    // A bow-eligible (emitter, medium) pair folds at GATHER time through its bow table, like
+    // any other achromatic chord in a rainbow medium. Before the volcache split, so the cache
+    // is built from folded colours too, and after the -sunnee erase, which needs the chords'
+    // raw provenance and not their colour.
+    if (vcScene && pbeams::gAchroAll) {
+        size_t nF = 0; double pF = 0.0, pT = 0.0;
+        for (PhotonBeam& b : bm.beams) {
+            pT += (double)b.power;
+            if (b.achro || b.srcEm < 0 || (size_t)b.srcEm >= vcScene->emitters.size()) continue;
+            const Emitter& em = vcScene->emitters[(size_t)b.srcEm];
+            if (!(em.cieMean.x > 0.0 || em.cieMean.y > 0.0 || em.cieMean.z > 0.0)) continue;
+            // A bundle's members carry power/nLam * wS each: fold the bundle's TOTAL.
+            double wsum = 1.0;
+            for (int k = 0; k < b.nSec; ++k) wsum += (double)b.wS[k];
+            b.power = (float)((double)b.power * wsum / (double)b.nLam());
+            b.nSec = 0;
+            for (int k = 0; k < kBeamSecMax; ++k) { b.lamS[k] = 0.0f; b.wS[k] = 0.0f; }
+            b.cieA[0] = (float)em.cieMean.x; b.cieA[1] = (float)em.cieMean.y; b.cieA[2] = (float)em.cieMean.z;
+            const bool bow = vcScene->bowLut((int)b.srcEm, b.med) != nullptr;
+            b.achro = bow ? 2 : 1;
+            b.emIdx = bow ? b.srcEm : (short)-1;
+            ++nF; pF += (double)b.power;
+        }
+        if (nF && !quiet)
+            std::printf("%s photon beams: %zu chords force-folded at their emitter's mean CIE "
+                        "(%.1f%% of chords, %.1f%% of power) -- -beamachro all\n",
+                        tag, nF, 100.0 * (double)nF / (double)(bm.beams.empty() ? 1 : bm.beams.size()),
+                        pT > 0.0 ? 100.0 * pF / pT : 0.0);
+    }
     size_t vcSplitOut = 0;
     if (vcScene) {
         const size_t nSplit = vcSplitOut = volCacheSplit(*vcScene, bm);
@@ -19412,6 +19450,7 @@ static int run(int argc, char** argv) {
                                  !std::strcmp(argv[i + 1], "0"))) { pbeams::gAchro = false; ++i; }
             else if (i + 1 < argc && (!std::strcmp(argv[i + 1], "on") ||
                                       !std::strcmp(argv[i + 1], "1"))) ++i;
+            else if (i + 1 < argc && !std::strcmp(argv[i + 1], "all")) { pbeams::gAchroAll = true; ++i; }
         }
         else if (!std::strcmp(argv[i], "-window")) g_showWindow = true;
         else if (!std::strcmp(argv[i], "-window-min") || !std::strcmp(argv[i], "-minimized")) {

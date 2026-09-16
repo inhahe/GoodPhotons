@@ -5685,15 +5685,37 @@ __device__ static int dVolShBand(int k) { return (k == 0) ? 0 : (k <= 3 ? 1 : 2)
 // In-scattered radiance toward `wOut` at `p` from a medium's cache: the phase function is
 // already folded in per band (HG's l-th Legendre moment is g^l; the bow kernel's moments are
 // kMom), so this is the host's VolCache::inScatter to the letter. False outside the grid.
+// Trilinear read between cell centres, edge-clamped (host twin: VolCache::fetch, 0.313.0).
+__device__ static void dVolCacheFetch(const DVolCache& c, double ux, double uy, double uz, double* cc) {
+    const int n = c.nSH * c.nCh;
+    for (int k = 0; k < n; ++k) cc[k] = 0.0;
+    const double gx = ux - 0.5, gy = uy - 0.5, gz = uz - 0.5;
+    const int x0 = (int)floor(gx), y0 = (int)floor(gy), z0 = (int)floor(gz);
+    const double fx = gx - x0, fy = gy - y0, fz = gz - z0;
+    for (int dz = 0; dz < 2; ++dz) {
+        const int z = min(c.nz - 1, max(0, z0 + dz)); const double wz = dz ? fz : 1.0 - fz;
+        for (int dy = 0; dy < 2; ++dy) {
+            const int y = min(c.ny - 1, max(0, y0 + dy)); const double wy = dy ? fy : 1.0 - fy;
+            for (int dx = 0; dx < 2; ++dx) {
+                const int x = min(c.nx - 1, max(0, x0 + dx)); const double w = wz * wy * (dx ? fx : 1.0 - fx);
+                if (!(w > 0.0)) continue;
+                const float* s = c.sh + (size_t)(((z * c.ny) + y) * c.nx + x) * n;
+                for (int k = 0; k < n; ++k) cc[k] += w * (double)s[k];
+            }
+        }
+    }
+}
 __device__ static bool dVolCacheInScatter(const DVolCache& c, const DVec3& p, const DVec3& wOut,
                                           double& rX, double& rY, double& rZ) {
     if (!c.ready) return false;
     const double ex = c.hi.x - c.lo.x, ey = c.hi.y - c.lo.y, ez = c.hi.z - c.lo.z;
-    const int ix = (int)((p.x - c.lo.x) / ex * c.nx);
-    const int iy = (int)((p.y - c.lo.y) / ey * c.ny);
-    const int iz = (int)((p.z - c.lo.z) / ez * c.nz);
-    if (ix < 0 || iy < 0 || iz < 0 || ix >= c.nx || iy >= c.ny || iz >= c.nz) return false;
-    const float* cc = c.sh + (size_t)(((iz * c.ny) + iy) * c.nx + ix) * c.nSH * c.nCh;
+    const double ux = ((double)p.x - (double)c.lo.x) / ex * c.nx;
+    const double uy = ((double)p.y - (double)c.lo.y) / ey * c.ny;
+    const double uz = ((double)p.z - (double)c.lo.z) / ez * c.nz;
+    if (!(ux >= 0.0 && uy >= 0.0 && uz >= 0.0 && ux < (double)c.nx && uy < (double)c.ny && uz < (double)c.nz))
+        return false;
+    double cc[27];
+    dVolCacheFetch(c, ux, uy, uz, cc);
     double Y[9];
     dVolShBasis(wOut, Y);
     double r0 = 0.0, r1 = 0.0, r2 = 0.0;
