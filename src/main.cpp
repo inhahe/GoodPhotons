@@ -21555,6 +21555,11 @@ static int run(int argc, char** argv) {
             // instead of spinning the view off-screen. (Translation stays feedback-locked
             // per-frame below — that's the collision-safety part; rotating in place can never
             // fling the eye through geometry, so it has no reason to be frame-locked.)
+            // OBJECT VIEW: true when a bare mesh was opened directly (`ftrace model.glb`), which
+            // is the case that wants a turntable rather than a walk. The pivot is the scene's
+            // bounding-sphere centre -- for a synthesized one-mesh scene that IS the model.
+            const bool objectView = positionalMesh;
+            const Vec3 objPivot   = scene.sceneCenter;
             const double kYaw   = 2.6;               // max yaw   rad/sec (~150 deg/s) at full pointer deflection
             const double kPitch = 2.0;               // max pitch rad/sec (~115 deg/s) at full pointer deflection
             // Rodrigues rotation of v about a UNIT axis by `ang` radians.
@@ -22184,6 +22189,14 @@ static int run(int argc, char** argv) {
                 std::printf("[viewer] camera path: %d frames on the timeline"
                             " (Play/scrub/lock via the panel below the image)\n", pathCount);
             autoStep(eye, fwd);   // so the banner quotes the real opening step, not the fallback
+            // A bare mesh gets its own headline: the gesture that matters here is the drag,
+            // and the fly controls printed below remain available rather than being replaced.
+            if (objectView)
+                std::printf(
+                  "[viewer] object view - DRAG to turn the model:\n"
+                  "         rotate: hold the left mouse button and drag - the model turns about\n"
+                  "                 its own centre, staying framed. Dragging never steers, so\n"
+                  "                 you can grab anywhere in the image; everything below still works.\n");
             std::printf(
               "[viewer] interactive fly-camera — fly around, then copy the printed camera block:\n"
               "         move:   Space or +  = fly forward     Shift or -  = fly backward   (you travel where you look)\n"
@@ -23143,6 +23156,33 @@ static int run(int argc, char** argv) {
                     // axis, pitch clamped shy of the poles so the view can't flip over (no roll).
                     // Per-frame (feedback-locked): a heavy scene turns in careful steps you actually
                     // see rather than spinning past.
+                    // OBJECT VIEW: dragging turns the MODEL. Implemented as an orbit of the eye
+                    // about the object's centre rather than a transform of the geometry -- the
+                    // two are indistinguishable on screen, and this one costs nothing (no vertex
+                    // rewrite, no BVH rebuild). Only when a bare mesh was opened directly:
+                    // walking a scene wants the fly camera it already has, and the two gestures
+                    // do not collide anyway -- drag is the button, fly is hover + keys, so all
+                    // three (orbit, throttle, steer) stay live in object view.
+                    if (objectView && (nav.dragDx != 0.0 || nav.dragDy != 0.0)) {
+                        const Vec3 pivot = objPivot;
+                        Vec3 rel = eye - pivot;
+                        if (dot(rel, rel) > 1e-18) {
+                            const double kDrag = 0.006;        // radians per pixel (~a half-turn per 520 px)
+                            rel = rotAxis(rel, worldUp, -nav.dragDx * kDrag);
+                            Vec3 right = cross(norml(rel), worldUp);
+                            double rl = std::sqrt(dot(right, right));
+                            if (rl > 1e-9) {
+                                right = right * (1.0 / rl);
+                                Vec3 cand = rotAxis(rel, right, -nav.dragDy * kDrag);
+                                // Stop shy of the poles so the turntable cannot tip over and
+                                // invert the horizon (same clamp the fly camera's pitch uses).
+                                if (std::fabs(dot(norml(cand), worldUp)) < 0.9995) rel = cand;
+                            }
+                            eye = pivot + rel;
+                            fwd = norml(pivot - eye);   // the object stays centred while it turns
+                            changed = true;
+                        }
+                    }
                     if (nav.lookX != 0.0 || nav.lookY != 0.0) {
                         double yaw   = -nav.lookX * kYaw   * dt;   // pointer right -> turn right (rad/sec x dt)
                         double pitch = -nav.lookY * kPitch * dt;   // pointer down  -> look down  (rad/sec x dt)

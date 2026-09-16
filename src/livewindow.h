@@ -58,6 +58,14 @@
 //     `rateMode` is the switch (true = use camPerSec / wall clock, false = use stride / per
 //     update). These are current values (0 = "unchanged"), not one-shot edges.
 struct NavInput {
+    // LEFT-BUTTON DRAG, in PIXELS since the last drain (an accumulator: read and cleared).
+    // Free to carry a second meaning because the fly camera never used a button -- its
+    // mouse-look is HOVER steering. The object viewer turns this into a turntable orbit; a
+    // scene viewer ignores it. While the button is held the hover-look rate is forced to zero,
+    // so a drag cannot also steer -- which doubles as a way to park the cursor anywhere in the
+    // image without turning the view.
+    double dragDx = 0.0, dragDy = 0.0;
+    bool   dragging = false;             // left button currently held over the image
     double lookX  = 0.0, lookY  = 0.0;   // hover-look turn RATE from cursor offset, dead-zoned, -1..+1 per axis (persistent state)
     double wheel  = 0.0;                  // plain-wheel notches (+ = up = dolly forward)
     double wheelSpeed = 0.0;             // Ctrl+wheel notches (+ = up = bigger step size)

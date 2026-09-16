@@ -888,6 +888,30 @@ Once the device did it properly the two backends disagreed outright (`scraps/lay
 lacquer coat peaked at 0.254 on the GPU against 0.005 on the CPU), so both now take the coat with
 probability R, as the BDPT walk always has.
 
+### Object view navigates differently from scene view (0.319.0)
+
+`ftrace model.glb` and `-explore scene.ftsl` shared one navigation model — a fly camera — which is
+right for walking a scene and wrong for inspecting a model, where the gesture you want is to turn
+the thing round. They are now distinct, and the split is free of conflict because **the fly camera
+never used a mouse button**: its "mouse-look" is HOVER steering (the cursor's dead-zoned offset from
+centre sets a turn RATE). So a drag was unclaimed input, and in object view it means *rotate the
+object* while throttle and steering keep working exactly as before.
+
+**Rotating the object is implemented as orbiting the camera** about the scene's bounding-sphere
+centre, with `fwd` re-aimed at that centre each drag so the model stays framed. The two are
+indistinguishable on screen and the orbit costs nothing — no vertex rewrite, no transform node, no
+BVH rebuild. Pitch is clamped shy of the poles by the same rule the fly camera's pitch uses, so the
+turntable cannot tip over and invert the horizon.
+
+**The window reports the gesture; the render loop decides what it means.** `NavInput` gains
+`dragDx` / `dragDy` (pixels since the last drain, an accumulator — unlike `lookX/lookY`, which are
+persistent state) and `dragging`. `livewindow.cpp` captures the mouse on button-down so a drag that
+leaves the window keeps working until the button comes up, releases on `WM_CAPTURECHANGED` as well
+as button-up, and forces the hover-look rate to zero while a button is held so one gesture cannot
+both orbit and steer. `main.cpp` applies the orbit only when `positionalMesh` — a bare mesh was
+opened directly — and ignores the drag otherwise; a scene viewer therefore behaves exactly as it
+did, except that holding a button now parks the cursor without steering.
+
 ### Layered materials in BDPT and VCM -- modes `D`, `J`, `U` (0.318.0)
 
 Those modes refused layered materials outright (`bdptUnsupportedFeature` -> "layered materials").

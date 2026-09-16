@@ -522,6 +522,11 @@ struct LiveWindow::Impl {
     HANDLE               readyEvent = nullptr;
     // ---- Fly-camera input state (guarded by inMtx unless noted) ----
     std::mutex           inMtx;                     // guards the look/wheel accumulators + one-shots
+    // Left-button drag (object-view turntable): pixels accumulated since the last drain, plus
+    // the button state and the last cursor position the delta is measured against.
+    double               dragDx = 0.0, dragDy = 0.0;
+    bool                 dragging = false;
+    int                  dragLastX = 0, dragLastY = 0;
     double               lookX = 0.0, lookY = 0.0;  // hover-look turn RATE: cursor offset from centre, dead-zoned, -1..+1
     double               wheelAcc = 0.0;            // plain wheel notches since drain (dolly move)
     double               wheelSpeedAcc = 0.0;       // Ctrl+wheel notches since drain (step-size adjust)
@@ -658,6 +663,7 @@ void LiveWindow::Impl::endLook() {
     tracking = false;
     std::lock_guard<std::mutex> lk(inMtx);
     lookX = lookY = 0.0;
+    dragDx = dragDy = 0.0; dragging = false;
 }
 
 // Build the control-panel child windows and grow the window by kPanelH so the image area is
@@ -1366,6 +1372,37 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             }
             InvalidateRect(h, nullptr, FALSE);
             return 0;
+        // Left button = grab the object (see NavInput::dragDx). Captured so a drag that leaves
+        // the window keeps working until the button comes up, the way every model viewer does;
+        // the render loop decides what a drag MEANS (turntable in object view, ignored in a
+        // scene), because the window knows nothing about the scene.
+        case WM_LBUTTONDOWN:
+            if (self) {
+                RECT cr; GetClientRect(h, &cr);
+                const int imgH = (cr.bottom - cr.top) - self->panelH;
+                const int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+                if (my < imgH) {                      // ignore clicks on the control strip
+                    SetCapture(h);
+                    std::lock_guard<std::mutex> lk(self->inMtx);
+                    self->dragging = true;
+                    self->dragLastX = mx; self->dragLastY = my;
+                    self->lookX = self->lookY = 0.0;   // a held button never steers
+                }
+            }
+            return 0;
+        case WM_LBUTTONUP:
+            if (self) {
+                ReleaseCapture();
+                std::lock_guard<std::mutex> lk(self->inMtx);
+                self->dragging = false;
+            }
+            return 0;
+        case WM_CAPTURECHANGED:                        // capture stolen (alt-tab, a dialog)
+            if (self) {
+                std::lock_guard<std::mutex> lk(self->inMtx);
+                self->dragging = false;
+            }
+            return 0;
         case WM_MOUSEMOVE:
             // Hover-look (rate / joystick): while the cursor is over the IMAGE area, its offset
             // from the image centre sets a TURN RATE. A central dead zone reports zero (the view
@@ -1397,6 +1434,15 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                     self->looking.store(true);
                 }
                 std::lock_guard<std::mutex> lk(self->inMtx);
+                // DRAGGING (object-view turntable): accumulate the pixel delta and hold the
+                // hover-look rate at zero, so one gesture cannot both orbit and steer.
+                if (self->dragging) {
+                    self->dragDx += (double)(mx - self->dragLastX);
+                    self->dragDy += (double)(my - self->dragLastY);
+                    self->dragLastX = mx; self->dragLastY = my;
+                    self->lookX = self->lookY = 0.0;
+                    return 0;   // the case's own exit; `break` would fall past it
+                }
                 self->lookX = shape(nx);
                 self->lookY = shape(ny);
             }
@@ -1836,6 +1882,11 @@ NavInput LiveWindow::drainNav() {
     // Hover-look turn rate is PERSISTENT state (the current cursor offset): read but do NOT
     // clear, so the view keeps turning between drains while the pointer is held off-centre.
     n.lookX = impl_->lookX; n.lookY = impl_->lookY;
+    // Drag is an ACCUMULATOR (pixels since the last drain): read and clear, unlike the
+    // hover-look rate above, which is current state.
+    n.dragDx = impl_->dragDx; n.dragDy = impl_->dragDy;
+    n.dragging = impl_->dragging;
+    impl_->dragDx = impl_->dragDy = 0.0;
     // Accumulated wheel notches + one-shot edges: read-and-clear under the lock.
     n.wheel = impl_->wheelAcc; n.wheelSpeed = impl_->wheelSpeedAcc;
     n.reset  = impl_->resetReq; n.print = impl_->printReq;
