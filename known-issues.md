@@ -4398,6 +4398,68 @@ wrong -- the camera sat outside the box, so a 1.0-albedo and a 0.5-albedo sphere
 byte-identical images, which the rig check caught only because it was run. Check that the rig can
 see the effect, in an enclosure, before believing any cross-mode number.
 
+### DEFERRED, WITH A TRIGGER (2026-09-16): the EXPLICIT multi-bounce layered BSDF — what would have to be true before it is worth building
+
+**Where the coat model stands.** `MatType::Layered` is a coat interface over body lobes: the coat
+reflects with probability R (Fresnel / thin-film / manual) and otherwise the ray enters and a body
+lobe shades. **The coat is modelled on the way IN and not on the way OUT** — there is no exit
+interface, so no total internal reflection between body and coat, and no absorption inside the coat
+layer. The planned fix (NOT built as of 0.318.0) is the *analytic* coated-body model: entry and
+exit Fresnel transmission, `1 / (1 - albedo * F_dr)` for the internal multiple reflections
+(`F_dr ~ 0.596` at n = 1.5 is a constant of the index alone, so the constant part can be baked into
+the body's reflectance at scene-build time), and Beer-Lambert along the refracted path for a tinted
+coat. That keeps **one lobe per vertex**, which is the property that lets a layered material render
+in every mode on both backends from a single definition.
+
+**Why the explicit version is not the plan.** Tracing the bounces inside the coat for real is not
+blocked by refactoring effort, and it is not blocked by speed — the expected number of internal
+passes is `1 / (1 - albedo * F_dr)`, about **1.4 at albedo 0.5 and 2.2 at albedo 0.9**, a small
+constant factor paid only by coated materials, and gateable. It is blocked by **MIS**: BDPT and VCM
+(modes `D`, `J`, `U`) need a closed-form `p(wo | wi)` at every vertex to ask "with what density
+would the other strategies have generated this direction?", and a stochastic internal walk yields a
+*sample* of the BSDF, not a formula for it. The alternatives are both bad: stochastic pdfs make the
+balance-heuristic weights approximate (subtle bias, not obvious noise), or the feature is restricted
+to the unidirectional modes, in which case the same material IS a different material depending on
+mode -- the exact class of bug that cost this project a day (mode M vs GPU, CPU vs GPU, mode D
+refusing layered outright).
+
+**And for the common case the two give the same answer.** `1 / (1 - albedo * F_dr)` *is* the
+geometric series of all the internal bounces, summed exactly. Under a SMOOTH coat over a LAMBERTIAN
+body, explicit tracing converges to precisely what the analytic model returns, with added noise and
+no extra information -- a Lambertian scatters `albedo / pi` regardless of the direction the
+refracted ray arrives from, so bending that ray changes nothing except through the transmission
+factors the analytic form already carries.
+
+**THE TRIGGER. Build the explicit version when any of these is actually true of a scene in hand —
+not before:**
+
+1. **A rough coat.** The analytic series assumes a flat interface: `F_dr` is the diffuse Fresnel
+   reflectance of a SMOOTH boundary, and entry/exit are `T(wi) T(wo)`. Once the coat scatters, each
+   internal bounce has a different distribution and the series stops being geometric. Suspect this
+   above **coat roughness ~0.15**; measure before believing it.
+2. **A directional body under the coat** — `glossy`, anisotropic, or another stack. Refraction then
+   genuinely bends and compresses the body's lobe, which the transmission factors cannot express.
+   This is the case with the clearest visual payoff: clearcoat over metallic flake.
+3. **A thick or strongly absorbing coat**, where what matters is the DISTRIBUTION of internal path
+   lengths rather than one refracted path — i.e. where `exp(-sigma d (1/cos_i + 1/cos_o))` visibly
+   disagrees with a reference.
+4. **More than one interface** (a stack of coats). The analytic form is per-interface and does not
+   compose.
+
+**How to know the trigger has fired, rather than guessing.** Build a brute-force reference for the
+stack — a unidirectional path tracer (mode `R` or `A`/`B`/`C`) with the coat traced explicitly,
+which needs no MIS pdf and so is free of the objection above — and compare it against the analytic
+model on the same scene, IN AN ENCLOSURE (see the retraction above: an open probe scene cannot
+measure anything involving reflection). If the two disagree by more than a few percent in the body
+ROI, the analytic model has run out and the explicit one is earned.
+
+**What to build when it fires.** The position-free Monte Carlo layered BSDF (Guo, Hasan, Zhao 2018)
+is the right shape: stochastic evaluation of both `f` and `p`, which handles arbitrary stacks and
+rough interfaces. Budget for the MIS question up front -- either accept approximate weights in
+`D`/`J`/`U` and SAY SO in the docs and here, or keep the analytic model as those modes' definition
+and accept two definitions with a measured statement of how far apart they are. Do not discover
+that choice halfway through.
+
 ### OPEN (2026-09-16): mode M renders a Jakob-Hanika `rgb 1 1 1` white ~12 % darker than a flat `1.0`, while mode D sees them as the same
 
 The surviving half of the retracted entry above, and it **does** reproduce on the Cornell control

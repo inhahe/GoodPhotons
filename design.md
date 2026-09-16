@@ -839,6 +839,12 @@ one Meshy-class material, `metallicFactor 1.0` / `roughnessFactor 1.0` with the 
 metallicRoughness map (mean metalness **0.28** -> dielectric, mean roughness **0.25** -> satin), and
 she imported as chalk in every mode.
 
+**The coat is modelled on the way in and not on the way out** -- no exit interface, so no
+total internal reflection between body and coat and no absorption in the coat layer. The
+planned analytic coated-body model closes that, and the EXPLICIT multi-bounce version is
+deliberately deferred: see known-issues, "the EXPLICIT multi-bounce layered BSDF", which
+records the four conditions that would make it worth building and how to test that they hold.
+
 **A real coat, once the device could render one (0.317.0).** The import is `layered`: a Fresnel
 interface of index `ior` over the diffuse body, sharing the roughness and normal maps. That gives
 both the 4 % normal-incidence reflectance and the **angular ramp** toward grazing that the
