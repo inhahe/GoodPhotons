@@ -6735,8 +6735,24 @@ as the one at fault.
   render, so it isn't done.
 - **The title bar names the compute backend** (`liveTitle()` / `setLiveTitle()` next to
   `g_windowMode` in `main.cpp`). Every window title is assembled in one place —
-  `scene → output  —  <mode>  —  <status>  —  <backend>` — instead of each call site
-  concatenating its own string, so the backend suffix cannot be dropped by one of them.
+  `scene → output  —  <mode>  —  <frame>  —  <progress>  —  <backend>` — instead of each
+  call site concatenating its own string, so no fixed field can be dropped by one of them.
+  **Since 0.307.0 the assembler owns all four fixed fields.** Before, only
+  `liveWindowUpdate()` prepended the mode; the tessellation, exposure-metering, raster and
+  explore stages titled the window directly and so showed *no mode at all*, `mode W` was
+  hand-written into two of its own titles, `modeLabel()` had no `W` entry, the shared
+  multi-camera paths (`runSharedGroup` / `runSharedPhotonMap`) never stamped a device
+  because only `runRender` did, and only the shared mode-M gather ever named the frame.
+  Now `g_windowMode`, `g_windowFrame` and `g_windowBackend` are stamped by whichever loop
+  knows them (the flight loop names `'fly0555' (556/1147)`, the shared gather `frame
+  7/601`, a shared forward group `12 cameras (shared flight)`), and a caller can only
+  supply the progress text. **The progress text is one format for every driver** too:
+  each fills a `LiveStatus` (tag, elapsed, budget, photons, spp, batches, noise, target,
+  reason) and `liveStatusText()` prints the fields in a fixed order with a derived
+  throughput — `[time] 0:58 / 1:00  ·  12.3M / 40.0M photons  ·  8 / 32 spp  ·  245.1k/s  ·
+  ~8.84% noise (target 2%)  ·  (stopping)` — leaving out only what a driver has no value
+  for (a backward mode has no photons) and never anything it does know. The console lines
+  keep their older per-driver wording; the window is the thing that was inconsistent.
   `backendLabel(gpu, nThreads)` renders `GPU (NVIDIA GeForce RTX 4090)` (the real
   `cudaDeviceName()`, so a multi-GPU box says *which*) or `CPU (12 threads)`, and it is
   stamped into `g_windowBackend` **where the device is actually resolved**, i.e. after

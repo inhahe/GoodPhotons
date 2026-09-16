@@ -14398,6 +14398,19 @@ static std::string g_windowRest;
 // one of them (there are a dozen: the placeholder, tessellation, exposure metering, the
 // raster preview, mode W, the path-tracer and the per-camera flight loop). `rest` is the
 // mode/progress part; either half may be empty (the backend is blank until it resolves).
+// Which frame of a multi-camera run is on screen -- "'fly0555' (556/1147)" for a flight
+// rendered one camera at a time, "frame 3/10" for a shared photon-map gather, "12 cameras
+// (shared flight)" for a shared forward group. Stamped by the loop that knows, blank for a
+// single still. Lives here, not in each driver's progress text, for the same reason the
+// mode and the device do: a field owned by the assembler cannot be forgotten by a driver.
+static std::string                 g_windowFrame;
+// The ONE order every window title comes out in, whatever the mode is doing:
+//     [DONE -- why --] subject -- mode -- frame -- progress -- device
+// Before 0.307.0 the mode was prepended by ONE of the paths (liveWindowUpdate) and hand-written
+// by two others, so the tessellation, exposure-metering, raster and explore stages -- and any
+// driver that titled the window directly -- showed no mode at all, and only the shared mode-M
+// gather ever named the frame. Now the assembler owns all four fixed fields and a caller can
+// only supply the progress text.
 static std::string liveTitle(const std::string& rest) {
     std::string t;
     if (g_windowDone) {
@@ -14406,6 +14419,8 @@ static std::string liveTitle(const std::string& rest) {
         t += "  \xE2\x80\x94  ";
     }
     t += g_windowTitle;
+    if (!g_windowMode.empty())    t += "  \xE2\x80\x94  " + g_windowMode;
+    if (!g_windowFrame.empty())   t += "  \xE2\x80\x94  " + g_windowFrame;
     if (!rest.empty())            t += "  \xE2\x80\x94  " + rest;
     if (!g_windowBackend.empty()) t += "  \xE2\x80\x94  " + g_windowBackend;
     return t;
@@ -14447,6 +14462,7 @@ static const char* modeLabel(char m) {
         case 'S': return "mode S (SPPM)";
         case 'U': return "mode U (VCM)";
         case 'J': return "mode J (UPBP)";
+        case 'W': return "mode W (deterministic preview)";
         default:  return "";
     }
 }
@@ -14557,11 +14573,9 @@ static void liveWindowUpdate(const Film& f, double N, double expComp, bool absol
     // image the same way the ANSI preview does.
     std::vector<uint8_t> rgb = filmToRgb8(f, N, expComp, absolute, nullptr);
     g_liveWin->update(f.resX, f.resY, rgb);
-    // Reflect the render subject + mode + live progress + device in the title bar.
-    std::string rest = g_windowMode;
-    if (status && *status)
-        rest += (rest.empty() ? "" : "  \xE2\x80\x94  ") + std::string(status);
-    setLiveTitle(rest);   // caches `rest` so the DONE prefix can be added without losing it
+    // The title's fixed fields (subject, mode, frame, device) are liveTitle()'s; only the
+    // progress text is this caller's to supply.
+    setLiveTitle(status ? std::string(status) : std::string());   // cached for the DONE prefix
     if (g_liveWin->closed()) g_stopRequested = 1;
     g_lastWindowPaint = std::chrono::steady_clock::now();
     const double cost = std::chrono::duration<double>(g_lastWindowPaint - tPaint).count();
@@ -14622,22 +14636,79 @@ static double filmNoisePct(const Film& f) {
 // count down against (the work is fixed: trace N photons, then gather `spp` samples), so
 // the line reports position rather than remaining budget — but it carries all three of the
 // quantities the user asked for: photons, elapsed time, and clarity.
+// ---------------------------------------------------------------------------------------
+// ONE PROGRESS FORMAT FOR EVERY DRIVER'S TITLE BAR. liveTitle() adds the subject, the
+// transport mode, the frame and the device; this is the progress half, and every driver
+// fills the same struct so the fields come out in the same order whatever the estimator is
+// doing -- a forward mode has photons and no spp, a backward mode spp and no photons, mode M
+// both. A field a driver has no value for is left out; nothing a driver DOES know may go
+// missing, which is the point of routing all of them through here. The console lines keep
+// their per-driver wording ("[spp] ...", "[time] ...", "[gather] ..."); only the window is
+// shaped by this.
+//   [tag] elapsed[ / budget] · photons[ / total] · spp[ / total] · batches · ~noise% [(target)] · why
+struct LiveStatus {
+    const char* tag = "live";        // the budget in force: live | spp | time | noise | forever | gather
+    double elapsed = 0.0, budgetSec = 0.0;
+    long long photons = -1, photonsTotal = -1, spp = -1, sppTotal = -1, batches = -1;
+    double noisePct = -1.0, noiseTarget = 0.0;
+    const char* noiseNote = "";      // shown in the noise slot when there is no noise figure
+                                     // ("deterministic" for a whitted preview)
+    const char* why = "";            // "(stopping)", "(noise target met)", ...
+};
+static std::string liveStatusText(const LiveStatus& s) {
+    const std::string sep = "  \xC2\xB7  ";
+    std::string t = "[" + std::string(s.tag) + "] " + humanDur(s.elapsed);
+    if (s.budgetSec > 0.0) t += " / " + humanDur(s.budgetSec);
+    if (s.photons >= 0) {
+        t += sep + humanCount((double)s.photons);
+        if (s.photonsTotal > 0) t += " / " + humanCount((double)s.photonsTotal);
+        t += " photons";
+    }
+    if (s.spp >= 0) {
+        t += sep + std::to_string(s.spp);
+        if (s.sppTotal > 0) t += " / " + std::to_string(s.sppTotal);
+        t += " spp";
+    }
+    if (s.batches >= 0) t += sep + std::to_string(s.batches) + (s.batches == 1 ? " batch" : " batches");
+    // Throughput, derived here so every driver reports it the same way: photons/s for the
+    // forward passes, spp/s for the gathers, whichever the driver counts in.
+    if (s.elapsed > 0.5) {
+        char rb[48];
+        if (s.photons > 0)      { std::snprintf(rb, sizeof rb, "%s/s", humanCount((double)s.photons / s.elapsed).c_str()); t += sep + rb; }
+        else if (s.spp > 0)     { std::snprintf(rb, sizeof rb, "%.3g spp/s", (double)s.spp / s.elapsed); t += sep + rb; }
+    }
+    if (s.noisePct >= 0.0) {
+        char nb[64];
+        std::snprintf(nb, sizeof nb, "~%.2f%% noise", s.noisePct);
+        t += sep + nb;
+        if (s.noiseTarget > 0.0) {
+            std::snprintf(nb, sizeof nb, " (target %.2g%%)", s.noiseTarget);
+            t += nb;
+        }
+    }
+    if (s.noisePct < 0.0 && s.noiseNote && *s.noiseNote) t += sep + s.noiseNote;
+    if (s.why && *s.why) {
+        const char* w = s.why;
+        while (*w == ' ') ++w;       // the drivers' reasons carry a leading space
+        if (*w) t += sep + w;
+    }
+    return t;
+}
+// The shared mode-M gather's progress. The frame-within-flight is a title field of its own
+// now (g_windowFrame), so it is stamped here rather than folded into the progress text.
 static std::string pmGatherStatus(const Film& f, long long sppDone, long long sppTotal,
                                   size_t frame, size_t nFrames, long long photons,
                                   double elapsed) {
-    std::string s;
     if (nFrames > 1) {
         char fb[48];
-        std::snprintf(fb, sizeof fb, "frame %zu/%zu  \xE2\x80\x94  ", frame, nFrames);
-        s = fb;
+        std::snprintf(fb, sizeof fb, "frame %zu/%zu", frame, nFrames);
+        g_windowFrame = fb;
     }
-    char b[220];
-    std::snprintf(b, sizeof b, "[gather] %lld / %lld spp (%.0f%%), %s photons, %s, ~%.2f%% noise",
-                  sppDone, sppTotal,
-                  sppTotal > 0 ? 100.0 * (double)sppDone / (double)sppTotal : 0.0,
-                  humanCount((double)photons).c_str(), humanDur(elapsed).c_str(),
-                  filmNoisePct(f));
-    return s + b;
+    LiveStatus s;
+    s.tag = "gather"; s.elapsed = elapsed;
+    s.photons = photons; s.spp = sppDone; s.sppTotal = sppTotal;
+    s.noisePct = filmNoisePct(f);
+    return liveStatusText(s);
 }
 
 // Wire a renderer's StageProgress (render_progress.h) to the title bar. These are the
@@ -14720,8 +14791,16 @@ static StageProgress makeStageProgress(int w, int h, double expComp = 1.0,
             // Draw the image-so-far when the phase has one. The placeholder stays the answer
             // for a deposit or a BVH build, which genuinely have no pixels to show.
             const bool drewFilm = (partial && divisor > 0.0);
-            if (drewFilm) liveWindowUpdate(*partial, divisor, expComp, absolute, b);
-            else          liveWindowPlaceholder(w, h, b);
+            // The device gather's stage text names its frame ("gathering frame 3/10 -- ...")
+            // because the CONSOLE has no other frame field; the window does (g_windowFrame),
+            // so for the title alone drop the frame from the stage and keep the verb.
+            std::string wb = b;
+            if (wb.rfind("gathering frame ", 0) == 0) {
+                const size_t sp = wb.find(' ', 16);   // past "frame N/M"
+                wb = "gathering" + (sp == std::string::npos ? std::string() : wb.substr(sp));
+            }
+            if (drewFilm) liveWindowUpdate(*partial, divisor, expComp, absolute, wb.c_str());
+            else          liveWindowPlaceholder(w, h, wb);
             const auto painted = clk::now();
             // Cost this paint and set the next gap from it. A film draw is charged from
             // wantFilm()'s yes, so the caller's device->host copy is included — it is part of
@@ -15618,7 +15697,16 @@ static int runSppProgressive(
                 if (preview) ansiPreview(*shown, (double)totalSpp, manualExposure, st);
                 else { std::printf("%s\n", st); std::fflush(stdout); }
             }
-            if (wantWin) liveWindowUpdate(*shown, (double)totalSpp, manualExposure, absolute, st);
+            if (wantWin) {
+                LiveStatus ls;
+                ls.tag = runForever ? "forever" : timeBudgetSec > 0.0 ? "time" : noiseTarget > 0.0 ? "noise" : "spp";
+                ls.elapsed = elapsed; ls.budgetSec = timeBudgetSec;
+                ls.spp = totalSpp; ls.sppTotal = (ls.tag[0] == 's') ? baseSpp + sppReq : -1;
+                ls.noisePct = g_whitted ? -1.0 : noisePct;   // whitted is deterministic: no noise figure,
+                ls.noiseNote = g_whitted ? "deterministic" : "";   // and the title says so in that slot
+                ls.noiseTarget = noiseTarget; ls.why = why;
+                liveWindowUpdate(*shown, (double)totalSpp, manualExposure, absolute, liveStatusText(ls).c_str());
+            }
         }
         return stop;
     };
@@ -15808,7 +15896,15 @@ static int runCompositeProgressive(
                 if (preview) ansiPreview(comp, 1.0, manualExposure, st);
                 else { std::printf("%s\n", st); std::fflush(stdout); }
             }
-            if (wantWin) liveWindowUpdate(comp, 1.0, manualExposure, absolute, st);
+            if (wantWin) {
+                LiveStatus ls;
+                ls.tag = runForever ? "forever" : timeBudgetSec > 0.0 ? "time" : noiseTarget > 0.0 ? "noise" : "spp";
+                ls.elapsed = elapsed; ls.budgetSec = timeBudgetSec;
+                ls.photons = acc.N; ls.photonsTotal = (ls.tag[0] == 's') ? Nreq : -1;
+                ls.spp = acc.spp;   ls.sppTotal     = (ls.tag[0] == 's') ? sppReq : -1;
+                ls.noisePct = noisePct; ls.noiseTarget = noiseTarget; ls.why = why;
+                liveWindowUpdate(comp, 1.0, manualExposure, absolute, liveStatusText(ls).c_str());
+            }
         }
         if (done) break;
     }
@@ -15905,12 +16001,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      double* exposureAnchor = nullptr, bool rgbBackward = false,
                      int maxBounceOverride = -1, bool directOnly = false,
                      JLightCache* jcache = nullptr) {
-    g_windowMode = modeLabel(mode);   // title bar shows the transport mode of this frame
+    // `-mode W` is dispatched as mode R with the whitted flag set, so ask the flag: the
+    // title should say what the user asked for, not how it is plumbed.
+    g_windowMode = modeLabel(g_whitted ? 'W' : mode);   // title bar shows the transport mode of this frame
     // Make sure the window is up (and naming this frame) before the first chunk rather than
     // after it — see liveWindowPlaceholder. Normally a no-op re-title, since run() already
     // created it; this also covers any path that reaches a render without going through
     // that dispatch.
-    liveWindowPlaceholder(res, resY, g_windowMode + " \xE2\x80\x94 starting\xE2\x80\xA6");
+    liveWindowPlaceholder(res, resY, "starting\xE2\x80\xA6");   // the mode is liveTitle()'s field now
     const bool refMode      = (mode == 'R' || mode == 'V');
     const bool useCamera    = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' ||
                                mode == 'D' || mode == 'J' || refMode);
@@ -16186,6 +16284,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // point where `useGpu` stops changing, so stamping here reports the device the frames
     // are really traced on rather than the one `-device` asked for.
     g_windowBackend = backendLabel(useGpu, nThreads);
+    // Re-title at once: the window is still on "starting..." (and will be for the whole
+    // first batch of a CPU forward pass), and until the next progress update that title
+    // carried no device at all.
+    setLiveTitle(g_windowRest);
 
     // Same "the device is now resolved" moment, for -radcache. The cache is read from
     // exactly ONE place -- BackwardRenderer::radianceHeroLoop, on the CPU -- so a
@@ -17490,7 +17592,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         else { std::printf("%s\n", st); std::fflush(stdout); }
                     }
                     if (wantWin) {
-                        liveWindowUpdate(disp, (double)acc.N, manualExposure, scene.absolute, st);
+                        LiveStatus ls;
+                        ls.tag = chunkFixed ? "live" : runForever ? "forever" : timeBudgetSec > 0.0 ? "time" : "noise";
+                        ls.elapsed = elapsed; ls.budgetSec = timeBudgetSec;
+                        ls.photons = acc.N; ls.photonsTotal = chunkFixed ? N : -1;
+                        ls.batches = chunkFixed ? -1 : batches;
+                        ls.noisePct = noisePct; ls.noiseTarget = chunkFixed ? 0.0 : noiseTarget; ls.why = why;
+                        liveWindowUpdate(disp, (double)acc.N, manualExposure, scene.absolute, liveStatusText(ls).c_str());
                         liveWindowNotePaintCost(     // env composite is part of the repaint
                             std::chrono::duration<double>(clk::now() - tPrep).count());
                     }
@@ -20843,6 +20951,7 @@ static int run(int argc, char** argv) {
         // title bar's device tag from ITS decision instead — otherwise a -raster run would
         // be the one live window that never says what it is running on.
         g_windowBackend = backendLabel(useGpuIso, nThreads);
+        g_windowMode    = "raster preview";   // no transport mode drives this window: say so
         // The -explore viewer switches device WITHIN a session — it shows the raster while
         // you move and a traced image once you stop, and those two layers do not run on the
         // same processor (mode W traces on the CPU; the PV_PT session is a CUDA one). So the
@@ -23044,7 +23153,7 @@ static int run(int argc, char** argv) {
                             drawOverlay(c, VW, VH, img);
                             g_liveWin->update(VW, VH, img);
                         }
-                        g_windowBackend = rasterBackend;
+                        g_windowBackend = rasterBackend; g_windowMode = exploreMode ? "explore (raster)" : "raster preview";
                         setLiveTitle("eye(" + fmt3(eye) +
                                             ")  dir(" + fmt3(fwd) + ")  [mode W: stop to render]");
                         traceDirty = true;
@@ -23129,12 +23238,13 @@ static int run(int argc, char** argv) {
                         tracingNow = (wRow > 0);   // keep spinning until the frame is complete
                         const std::string sppTag = wNeedSpp ? " " + std::to_string(wPass + 1) + " spp" : "";
                         g_windowBackend = cpuBackend;   // mode W traces on the CPU tracer
+                        g_windowMode    = modeLabel('W');
                         if (tracingNow)
-                            setLiveTitle("mode W" + sppTag + " " +
+                            setLiveTitle(sppTag + " " +
                                                 std::to_string(100 * (VH - wRow) / std::max(1, VH)) +
                                                 "%  eye(" + fmt3(eye) + ")");
                         else
-                            setLiveTitle("mode W" + sppTag +
+                            setLiveTitle(sppTag +
                                                 "  eye(" + fmt3(eye) + ")  dir(" + fmt3(fwd) + ")");
                     }
                 }
@@ -23169,7 +23279,7 @@ static int run(int argc, char** argv) {
                             drawOverlay(c, VW, VH, img);
                             g_liveWin->update(VW, VH, img);
                         }
-                        g_windowBackend = rasterBackend;
+                        g_windowBackend = rasterBackend; g_windowMode = exploreMode ? "explore (raster)" : "raster preview";
                         setLiveTitle("eye(" + fmt3(eye) +
                                             ")  dir(" + fmt3(fwd) + ")  [trace: move to re-aim]");
                         traceDirty = true;
@@ -23190,6 +23300,7 @@ static int run(int argc, char** argv) {
                             drawOverlay(c, VW, VH, img);
                             g_liveWin->update(VW, VH, img);
                             g_windowBackend = gpuBackend;   // the PV_PT session is a CUDA one
+                            g_windowMode    = exploreMode ? "explore (path-trace)" : "raster preview (path-trace)";
                             setLiveTitle("path-trace " +
                                                 std::to_string(spp) + " spp  eye(" + fmt3(eye) + ")");
                             tracingNow = (spp < kTraceCapSpp);   // more to refine -> keep spinning
@@ -23204,7 +23315,7 @@ static int run(int argc, char** argv) {
                     // repaint, so the zero-copy present (which renders AND shows) is for real
                     // changes only; the warm frame keeps taking the ordinary render path.
                     if (changed && rasterPresent(c, VW, VH, ev, autoExp)) {
-                        g_windowBackend = rasterBackend;
+                        g_windowBackend = rasterBackend; g_windowMode = exploreMode ? "explore (raster)" : "raster preview";
                         setLiveTitle("eye(" + fmt3(eye) +
                                             ")  dir(" + fmt3(fwd) + ")");
                     } else {
@@ -23213,7 +23324,7 @@ static int run(int argc, char** argv) {
                         if (changed) {   // only a real change repaints the window
                             drawOverlay(c, VW, VH, img);   // control-point markers + live spline polyline
                             g_liveWin->update(VW, VH, img);
-                            g_windowBackend = rasterBackend;
+                            g_windowBackend = rasterBackend; g_windowMode = exploreMode ? "explore (raster)" : "raster preview";
                             setLiveTitle("eye(" + fmt3(eye) +
                                                 ")  dir(" + fmt3(fwd) + ")");
                         }
@@ -23835,6 +23946,14 @@ static int run(int argc, char** argv) {
             useGpuForward ? std::string(cudaDeviceName()) :
 #endif
             (std::to_string(nThreads) + " CPU threads");
+        // The shared group never passes through runRender, whose device stamp is the only
+        // other one -- so without this a whole shared flight ran with no device on the title.
+#ifdef HAVE_CUDA
+        g_windowBackend = backendLabel(useGpuForward, nThreads);
+#else
+        g_windowBackend = backendLabel(false, nThreads);
+#endif
+        g_windowFrame = std::to_string(nc) + " cameras (shared flight)";
 
 #ifdef HAVE_CUDA
         // Resident GPU session for the whole group render: the scene and every camera are
@@ -24005,8 +24124,15 @@ static int run(int argc, char** argv) {
                             else { std::printf("%s\n", st); std::fflush(stdout); }
                         }
                         if (wantWin) {
+                            LiveStatus ls;
+                            ls.tag = chunkFixed ? "live" : runForever ? "forever" : timeBudgetSec > 0.0 ? "time" : "noise";
+                            ls.elapsed = elapsed; ls.budgetSec = timeBudgetSec;
+                            ls.photons = accN; ls.photonsTotal = chunkFixed ? N : -1;
+                            ls.batches = chunkFixed ? -1 : batches;   // same fields as the single-camera loop
+                            ls.noisePct = noisePct; ls.noiseTarget = chunkFixed ? 0.0 : noiseTarget; ls.why = why;
+                            g_windowFrame = std::to_string(nc) + " cameras (shared flight)";
                             liveWindowUpdate(disp, (double)accN, toRender[idx[0]].exposure,
-                                             scene.absolute, st);
+                                             scene.absolute, liveStatusText(ls).c_str());
                             // Charge the sync + env composite to the repaint budget too.
                             liveWindowNotePaintCost(
                                 std::chrono::duration<double>(clk::now() - tPrep).count());
@@ -24059,6 +24185,12 @@ static int run(int argc, char** argv) {
     auto runSharedPhotonMap = [&](const std::vector<int>& idx) {
         if (idx.empty() || g_stopRequested) return;
         g_windowMode = modeLabel('M');   // title bar shows the shared photon-map mode
+        // Device: CPU until the GPU branch below claims it. This path never reaches
+        // runRender's stamp either, so it names its own device -- and its own frame: a
+        // single camera also arrives here, and it never passes the flight loop's stamp.
+        g_windowBackend = backendLabel(false, nThreads);
+        g_windowFrame   = (idx.size() == 1 && !toRender[idx[0]].name.empty())
+                        ? "'" + toRender[idx[0]].name + "'" : std::string();   // multi: per gather frame
         double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                               : scene.sceneRadius * g_pmRadiusFactor;
         // Photon beams (the view-independent volume cache). Decided — and warned about —
@@ -24121,6 +24253,7 @@ static int run(int argc, char** argv) {
             if ((wantGpu || wantAuto) && allPinhole &&
                 cudaAvailable() && cudaPhotonMapSupported(scene)) {
                 volCacheHostGather() = false;   // device gather has no volcache march
+                g_windowBackend = backendLabel(true, nThreads);   // the title names the card
                 std::vector<Camera> cams; std::vector<int> rxs, rys;
                 for (int i : idx) { cams.push_back(toRender[i].cam); rxs.push_back(toRender[i].res); rys.push_back(toRender[i].resY); }
                 std::printf("[camera] shared photon map (mode M) on %s: %zu cameras, %lld "
@@ -24655,6 +24788,11 @@ static int run(int argc, char** argv) {
             std::printf("[camera] rendering '%s' (mode %c, %dx%d) -> %s  [%zu/%zu]\n",
                         rc.name.c_str(), rc.mode, rc.res, rc.resY, outFor(rc.name).c_str(),
                         ri + 1, restIdx.size());
+        // Name the frame in the title bar: the camera and its place in the run. runRender
+        // stamps the mode itself; the frame is the flight loop's to know.
+        g_windowFrame = (toRender.size() > 1)
+            ? "'" + rc.name + "' (" + std::to_string(ri + 1) + "/" + std::to_string(restIdx.size()) + ")"
+            : (rc.name.empty() ? std::string() : "'" + rc.name + "'");
         double* anchor = (rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
         int rv = runRender(scene, rc.cam, rc.mode, N, rc.res, rc.resY, spp, nThreads,
                            device, diffraction, lightLabel, outFor(rc.name), rc.exposure,
