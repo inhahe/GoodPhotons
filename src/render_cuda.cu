@@ -14246,6 +14246,66 @@ __device__ static double dCamMediaTr(const DScene& sc, const DVec3& o, const DVe
     return s / (double)n;
 }
 
+// ---- SPECGATHER: the camera walk's spectral throughput (host twin: photonmap_render.h) ------
+// The walk is MONOCHROMATIC at the camera sample's wavelength; the photon map is POLYCHROMATIC.
+// The density estimate below gets this right per photon (`dDiffuseRho(..., ph.lambda)`), but every
+// reflectance collected on the way there used to be folded into the scalar `thr` at the CAMERA's
+// wavelength, and that scalar then multiplied a photon sum spanning all of them. Exact for a flat
+// spectrum, wrong in either direction otherwise -- measured against mode D on one Cornell glossy
+// sphere: JH white 0.880x, JH red 1.142x, both ~1.00 after the fix.
+struct DSpecThr {
+    static const int K = 24;
+    double v[K];
+    // The same product at the camera's wavelength, accumulated from the very scalars that went into
+    // `thr` -- NOT re-sampled from the grid. `thr` already contains this factor, so `thr * ratio`
+    // collapses to (everything else) * v[lambda_p] with no cancellation to get wrong. (The host's
+    // first attempt divided by the nearest bin centre instead; where a spectrum plunges near the
+    // band edge the two disagree by orders of magnitude and the estimate detonates.)
+    double cam;
+    int    any;
+    __device__ void init() { for (int k = 0; k < K; ++k) v[k] = 1.0; cam = 1.0; any = 0; }
+    __device__ static Real lamOf(int k) {
+        return (Real)(DLMIN + (k + 0.5) * (DLMAX - DLMIN) / (double)K);
+    }
+    __device__ static int binOf(Real lam) {
+        int b = (int)(((double)lam - DLMIN) / (DLMAX - DLMIN) * K);
+        return b < 0 ? 0 : (b >= K ? K - 1 : b);
+    }
+    __device__ double ratio(Real lamP) const {
+        if (!any) return 1.0;
+        return (cam > 1e-300) ? v[binOf(lamP)] / cam : 0.0;
+    }
+};
+
+// Fold one spectral factor into the carrier. `atCam` is the value the scalar `thr` just used at
+// the camera's wavelength -- passed in rather than recomputed, so the ratio's denominator is
+// exactly the factor sitting inside `thr`. Probes three wavelengths first: a factor that agrees at
+// all three is folded as a constant (it cancels in the ratio regardless), so every uncoloured
+// material in the scene costs three lookups instead of K.
+__device__ static void dSpecFold(DSpecThr& st, const DScene& sc, const DMaterial& m, const DHit& h,
+                                 double atCam, bool transmit) {
+    st.cam *= atCam;
+    const Real l0 = DSpecThr::lamOf(0), lm = DSpecThr::lamOf(DSpecThr::K / 2),
+               l1 = DSpecThr::lamOf(DSpecThr::K - 1);
+    const double a = transmit ? (double)clamp01(dTransmitSlot(sc, m, h, l0))
+                              : (double)clamp01(dReflectSlot(sc, m, h, l0));
+    const double b = transmit ? (double)clamp01(dTransmitSlot(sc, m, h, lm))
+                              : (double)clamp01(dReflectSlot(sc, m, h, lm));
+    const double c = transmit ? (double)clamp01(dTransmitSlot(sc, m, h, l1))
+                              : (double)clamp01(dReflectSlot(sc, m, h, l1));
+    const double tol = 1e-12 * (1.0 + fabs(a));
+    if (fabs(a - b) <= tol && fabs(a - c) <= tol) {
+        for (int k = 0; k < DSpecThr::K; ++k) st.v[k] *= a;
+        return;
+    }
+    st.any = 1;
+    for (int k = 0; k < DSpecThr::K; ++k) {
+        const Real lk = DSpecThr::lamOf(k);
+        st.v[k] *= transmit ? (double)clamp01(dTransmitSlot(sc, m, h, lk))
+                            : (double)clamp01(dReflectSlot(sc, m, h, lk));
+    }
+}
+
 // ----------------------- photon-map camera gather (mode M) -------------------
 // Device twin of photonGather (photonmap_render.h). Follows a camera ray through specular
 // surfaces (monochromatic at the sampled `lambda`); at the first diffuse / translucent hit it
@@ -14275,6 +14335,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                                      double& oX, double& oY, double& oZ) {
     oX = oY = oZ = 0.0;
     double thr = 1.0;
+    DSpecThr sthr; sthr.init();      // SPECGATHER: the walk's spectral factors (see above)
     DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
     // norm folded into pX/pY/pZ; radius^2 kept in Real — the distance test runs once per
     // VISITED photon (~85% of visits fail it), and on GeForce parts a double compare +
@@ -14446,7 +14507,10 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 DVec3 d = h.p - ph.pos;
                 if (dot(d, d) > r2) return;
                 if (dot(ph.n, h.n) < (Real)0.5) return;   // reject cross-surface leakage
-                float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                // SPECGATHER: the walk's reflectances belong at THIS photon's wavelength,
+                // not the camera's. Exactly 1.0 when every one of them was flat.
+                float rho = (float)(dDiffuseRho(sc, m, h, (Real)ph.lambda)
+                                    * sthr.ratio((Real)ph.lambda));
                 gx += rho * ph.pX;
                 gy += rho * ph.pY;
                 gz += rho * ph.pZ;
@@ -14463,7 +14527,10 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     DVec3 d = h.p - ph.pos;
                     if (dot(d, d) > r2q) return;
                     if (dot(ph.n, h.n) < (Real)0.5) return;
-                    float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                    // SPECGATHER: the walk's reflectances belong at THIS photon's wavelength,
+                    // not the camera's. Exactly 1.0 when every one of them was flat.
+                    float rho = (float)(dDiffuseRho(sc, m, h, (Real)ph.lambda)
+                                        * sthr.ratio((Real)ph.lambda));
                     cx += rho * ph.pX;
                     cy += rho * ph.pY;
                     cz += rho * ph.pZ;
@@ -14498,11 +14565,17 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
 
         switch (m.type) {                                // specular walk (monochromatic)
             case D_MIRROR: {
-                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                {   const double rC = (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                    thr *= rC;
+                    dSpecFold(sthr, sc, m, h, rC, false);   // SPECGATHER
+                }
                 rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_GLOSSY: {
-                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                {   const double rC = (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                    thr *= rC;
+                    dSpecFold(sthr, sc, m, h, rC, false);   // SPECGATHER
+                }
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
                 if (dot(o, h.n) <= 0) return;
                 rd = o; ro = dOffsetAlong(h.p, h.ng, rd); break;
@@ -14518,11 +14591,17 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 break;
             }
             case D_FILTER: {
-                thr *= (double)clamp01(dTransmitSlot(sc, m, h, lambda));
+                {   const double tC = (double)clamp01(dTransmitSlot(sc, m, h, lambda));
+                    thr *= tC;
+                    dSpecFold(sthr, sc, m, h, tC, true);    // SPECGATHER
+                }
                 ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
-                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                {   const double rC = (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                    thr *= rC;
+                    dSpecFold(sthr, sc, m, h, rC, false);   // SPECGATHER
+                }
                 rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
         }

@@ -897,6 +897,71 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
 // When present the density estimate is the SUM of the two maps' estimates — the maps hold
 // disjoint deposits, so this is the same estimator with each population read at the radius
 // that suits it.
+// ---- SPECGATHER: the camera walk's spectral throughput --------------------------------------
+// Mode M's camera walk is MONOCHROMATIC at the camera sample's wavelength while the photon map is
+// POLYCHROMATIC -- every photon carries its own. The density estimate gets this right at the gather
+// point (it evaluates the BRDF at `ph.lambda`, per photon), but every reflectance the ray collected
+// on the way there used to be folded into the SCALAR `thr` at the camera's lambda, and that scalar
+// then multiplied a photon sum spanning every wavelength. So the estimator computed
+//     r(lambda_c) * sum_p rho(lambda_p) P_p CIE(lambda_p)
+// where it owes
+//     sum_p r(lambda_p) rho(lambda_p) P_p CIE(lambda_p).
+// Identical when r is flat; otherwise biased by however r correlates with the photon spectrum, in
+// EITHER direction -- measured against mode D on one Cornell sphere: flat 1.005, JH grey 0.985,
+// JH white 0.880, JH red 1.142 (see known-issues). gallery_rain's gold gyroid and chrome ring are
+// exactly this case.
+//
+// So the walk carries the same product sampled over a coarse wavelength grid beside the scalar, and
+// the estimate reweights each photon by the ratio at ITS wavelength. Two properties make this cheap
+// and safe: the ratio is identically 1 when every factor is flat (so an uncoloured scene renders
+// BIT-IDENTICALLY, which is the regression test), and a factor is probed at three wavelengths first
+// so a flat one costs three evaluations rather than K.
+struct SpecThr {
+    static constexpr int K = 24;                 // bins across [LAMBDA_MIN, LAMBDA_MAX]
+    double v[K];                                 // the product over the grid (the numerator)
+    // The SAME product at the camera's wavelength, accumulated from the very scalars the walk
+    // multiplied into `thr`. It is NOT recomputed from the grid, and that is the whole point:
+    // `thr` already contains this factor, so `thr * ratio` collapses to (everything else) *
+    // v[lambda_p] exactly. The first version divided by the nearest BIN CENTRE instead, which
+    // agrees for a smooth spectrum and does not where one plunges near the band edge -- there
+    // the cancellation failed and the estimate detonated (a JH white measured 6e5 x mode D).
+    double cam = 1.0;
+    bool   any = false;                          // anything non-flat folded in? (else ratio == 1)
+    SpecThr() { for (int k = 0; k < K; ++k) v[k] = 1.0; }
+    static double lamOf(int k) {
+        return LAMBDA_MIN + (k + 0.5) * (LAMBDA_MAX - LAMBDA_MIN) / (double)K;
+    }
+    static int binOf(double lam) {
+        int b = (int)((lam - LAMBDA_MIN) / (LAMBDA_MAX - LAMBDA_MIN) * K);
+        return b < 0 ? 0 : (b >= K ? K - 1 : b);
+    }
+    // Fold in one spectral factor, `f(lambda)`. Probes three wavelengths first: a factor that
+    // agrees at all three is taken as flat and folded as a constant, which cancels in the ratio
+    // anyway -- so even a spectrum that fools the probe can only be mis-taken where it is already
+    // nearly flat, and the common case (every uncoloured material in the scene) pays three calls.
+    // `f` evaluates the factor at a wavelength; `atCam` is the value the scalar throughput just
+    // used at the camera's wavelength, passed in rather than recomputed so the two can never
+    // disagree (see `cam`).
+    template <class F> void mul(const F& f, double atCam) {
+        cam *= atCam;
+        const double a = f(lamOf(0)), b = f(lamOf(K / 2)), c = f(lamOf(K - 1));
+        const double tol = 1e-12 * (1.0 + std::fabs(a));
+        if (std::fabs(a - b) <= tol && std::fabs(a - c) <= tol) {
+            for (int k = 0; k < K; ++k) v[k] *= a;   // flat: cancels in the ratio regardless
+            return;
+        }
+        any = true;
+        for (int k = 0; k < K; ++k) v[k] *= f(lamOf(k));
+    }
+    // The correction a photon of wavelength `lamP` needs. Denominator is `cam`, so this
+    // multiplied by `thr` leaves the walk's spectral factors evaluated at lamP and everything
+    // else untouched. A dead path (cam == 0) contributes nothing either way.
+    double ratio(double lamP) const {
+        if (!any) return 1.0;
+        return (cam > 1e-300) ? v[binOf(lamP)] / cam : 0.0;
+    }
+};
+
 inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pcg32& rng,
                             bool diffraction, int maxBounce, double lambda, double invPdfL,
                             double norm, const Hit& visHit, const Material& visMat,
@@ -1203,6 +1268,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
     const double normC = (causOn && pmC->nEmitted > 0 && areaC > 0.0)
                             ? 1.0 / (areaC * (double)pmC->nEmitted) : 0.0;
 
+    SpecThr sthr;    // SPECGATHER: the walk's spectral factors, beside the scalar `thr`
     const bool volOn = (bm != nullptr) && !bm->empty() && !scene.media.empty();
     // -sunnee: the sun's single scatter is marched, not gathered (beamgather.h sunNeeMarch).
     // Not gated on the map being non-empty: erasing the direct-sun chords may have emptied it.
@@ -1241,7 +1307,12 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                         if (sunOn) L += sunNeeMarch(scene, mats, so, sd, slen, aGlass, lambda, invPdfL, rng) * thr;
                         thr *= camMediaTr(scene, mats, so, sd, slen, lambda, rng);
                     }
-                    if (aGlass > 0.0) thr *= std::exp(-aGlass * slen);
+                    if (aGlass > 0.0) {
+                        thr *= std::exp(-aGlass * slen);
+                        const int cmA = cmIdx; const double sl = slen;
+                        sthr.mul([&](double L) { return std::exp(-scene.mats[cmA].absorb(L) * sl); },
+                                 std::exp(-aGlass * slen));
+                    }
                     return false;   // a camera ray never terminates in the volume here:
                                     // mode M's volume answer IS the beam gather above
                 },
@@ -1271,7 +1342,12 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             if (thr <= 0.0) return L;
         }
         if (h.valid) {                                   // Beer-Lambert in current medium
-            if (aGlass > 0.0) thr *= std::exp(-aGlass * h.t);
+            if (aGlass > 0.0) {
+                thr *= std::exp(-aGlass * h.t);      // coloured glass is spectral: SPECGATHER too
+                const int cmA = cmIdx; const double tt = h.t;
+                sthr.mul([&](double L) { return std::exp(-scene.mats[cmA].absorb(L) * tt); },
+                         std::exp(-aGlass * h.t));
+            }
         }
         if (!h.valid) {                                  // escaped -> environment
             if (scene.envIndex >= 0)
@@ -1399,6 +1475,9 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                         if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
                         double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                         double f = rho * (1.0 / PI);
+                        // SPECGATHER: the walk's reflectances belong at THIS photon's wavelength,
+                        // not the camera's. Exactly 1 when they were all flat.
+                        f *= sthr.ratio((double)ph.lambda);
                         g += M.cie[k] * (f * (double)ph.power);       // == cie(lambda_p), precomputed
                     });
                     return g;
@@ -1411,6 +1490,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             case MatType::Mirror: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 thr *= r;
+                sthr.mul([&](double L) { return clamp01(reflectSlot(scene, m, h, L)); }, r);
                 ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
                 break;
             }
@@ -1426,6 +1506,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                                                  nullptr, BackwardRenderer::GiCtx{}, nullptr, nullptr, &nb));
                 }
                 thr *= r;
+                sthr.mul([&](double Lw) { return clamp01(reflectSlot(scene, m, h, Lw)); }, r);
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0.0) return L;
                 if (gneeOn) {
@@ -1489,6 +1570,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             case MatType::Filter: {
                 double t = clamp01(transmitSlot(scene, m, h, lambda));
                 thr *= t;
+                sthr.mul([&](double L) { return clamp01(transmitSlot(scene, m, h, L)); }, t);
                 ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 break;
             }
@@ -1511,6 +1593,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 thr *= r;
+                sthr.mul([&](double Lw) { return clamp01(reflectSlot(scene, m, h, Lw)); }, r);
                 ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
                 break;
             }

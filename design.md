@@ -912,6 +912,27 @@ both orbit and steer. `main.cpp` applies the orbit only when `positionalMesh` �
 opened directly — and ignores the drag otherwise; a scene viewer therefore behaves exactly as it
 did, except that holding a button now parks the cursor without steering.
 
+### SPECGATHER — mode M's camera walk carries its spectral factors as a spectrum (0.321.0)
+
+Mode M's walk is monochromatic at the camera sample's wavelength; its photon map is polychromatic.
+The density estimate always evaluated the gather point's BRDF per photon at `ph.lambda`, but the
+reflectances the ray collected *on the way there* were folded into a scalar `thr` at the camera's
+wavelength and then multiplied a photon sum spanning every wavelength. Exact for a flat spectrum,
+wrong in either direction for a coloured one (measured up to 14 %).
+
+`SpecThr` (`photonmap_render.h`) and `DSpecThr` / `dSpecFold` (`render_cuda.cu`) carry the same
+product over a 24-bin grid beside the scalar; the estimate reweights each photon by
+`v[bin(ph.lambda)] / cam`. The denominator `cam` is accumulated from **the very scalars that went
+into `thr`**, not re-sampled from the grid — that is what makes `thr * ratio` collapse exactly to
+(everything else) x v[lambda_p]. Folding a factor probes three wavelengths first and treats an
+agreeing one as constant, so uncoloured materials cost three lookups rather than 24 and flat scenes
+are unchanged. Cost measured at +4 % on a gallery_rain frame.
+
+Covered: `Mirror`, `Glossy`, `Filter`, the `ThinFilm`/`Multilayer`/`Grating` arm, and coloured-glass
+absorption. Not covered, with reasons, in known-issues: media transmittance (a stochastic estimator,
+not a function), the `Hair` BCSDF (cost), and the binary stochastic choices in `HalfMirror` and the
+layered coat.
+
 ### Layered materials in BDPT and VCM -- modes `D`, `J`, `U` (0.318.0)
 
 Those modes refused layered materials outright (`bdptUnsupportedFeature` -> "layered materials").

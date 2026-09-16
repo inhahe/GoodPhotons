@@ -4,40 +4,22 @@ Live working plan. Each item says what, why, how it gets validated, and where it
 interruption costs the work in progress and not the plan. Finished items move to `known-issues.md`
 (with their measurements) and come off this list; `design.md` gets the architecture.
 
-Ordering note: **B is first even though A was asked for first.** B is a spectral-handling question
-in mode M, and mode M is one of the backends A has to be validated in — a 12 % error in how a
-material's spectrum is handled would contaminate every number A produces. Measure the ruler before
-measuring with it.
+Ordering note: **B was done first even though A was asked for first**, because mode M is one of the
+backends A has to be validated in and a spectral error there would have contaminated every number A
+produces. Measure the ruler before measuring with it. B is now done; A is next.
 
 ---
 
-## B. Mode M mis-colours coloured speculars (root cause found; fix designed, NOT built)
+## B. Mode M mis-colours coloured speculars — **DONE (v0.321.0)**
 
-**Status: diagnosed, written up in `known-issues.md`. The fix is the remaining work.**
+Fixed on both backends and written up in `known-issues.md` (SPECGATHER). Mode M / mode D on the
+Cornell control went JH white 0.880 -> 1.006 and JH red 1.142 -> 1.007, with flat spectra unmoved;
+the `_beams_ms` invariant reads 1.058 against its recorded 1.085; a gallery_rain frame costs +4 %.
+`gallery_rain`'s gold gyroid and chrome ring now render their true colour in mode M.
 
-Started as "a JH white renders 12 % dark in mode M"; the real fault is bigger and the first framing
-was wrong. Mode M's camera walk is monochromatic at the camera's wavelength while the photon map is
-polychromatic, and a specular/glossy bounce multiplies a scalar reflectance taken at the CAMERA's
-wavelength onto a photon sum spanning all of them. Exact for a flat spectrum; wrong in either
-direction for a coloured one — measured M/D of 0.880 (JH white), 1.142 (JH red), 1.005 (flat).
-`gallery_rain`'s gold gyroid and chrome ring are exactly this case, so the pending flyby renders
-their colour wrong relative to modes D and R.
-
-Ruled out on the way, both by measurement: the hero-wavelength stratification added in 0.314.0
-(the ratio is the same at spp 1, where it is disabled, as at spp 512), and clamping (the sign
-flips). The diffuse path is correct and already does the right thing per photon
-(`photonmap_render.h:1400`), which is the model to copy.
-
-**The fix.** Carry `thrS[]` over the spectral grid beside the scalar `thr`; multiply each bounce's
-reflectance into it per grid wavelength; weight each photon in the density estimate by
-`thrS[bin(ph.lambda)] / thrS[bin(lambda_c)]`. The ratio is exactly 1 for flat spectra, so flat
-scenes stay bit-identical — that is the regression test as well as the safety property.
-
-1. `photonmap_render.h` — the CPU gather: both estimate sites, and every bounce that multiplies
-   `thr` by a reflectance (Glossy, Mirror, HalfMirror, ThinFilm, Grating, the layered coat).
-2. `render_cuda.cu` `dPhotonGather` — same structure, same bug, and the backend a flyby uses.
-3. Validate: the four Cornell rows -> ~1.00; diffuse control unmoved; `_beams_ms` invariant
-   unmoved; a flat-spectrum scene bit-identical.
+Left open deliberately, recorded in the same entry: media transmittance (stochastic, needs the
+hero-wavelength treatment rather than this one; inert for gallery_rain, whose media have flat
+coefficients), the Hair BCSDF, and the binary stochastic choices in HalfMirror and the layered coat.
 
 ## A. The analytic coated-body model — TIR saturation, coat absorption, Snell
 
