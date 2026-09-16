@@ -3815,6 +3815,94 @@ could have caught either one. `scraps/dntest.cpp` — the standalone harness tha
 PFM with no GPU in the loop — is what made the sweep above cheap enough to do properly; the whole
 investigation after the first render was CPU-only.
 
+### MEASURED (2026-09-15): mode D's backlit rain is a HEAVY-TAILED estimator that spp cannot fix — mode M's beam gather is the cure, and a scene-level recipe now carries it
+
+**Reported as** *"can you try to fix the rain speckle in the backlit rain?"* on the `gallery_rain`
+cloud circuit (frames ~413-723 of the 1147-frame `fly` curve), rendered in mode D at 320x180,
+128 spp, `-denoise -fireflies 4`. What follows is why the obvious levers were measured and
+rejected before the actual fix, because every one of them is the thing one reaches for first.
+
+**What the speckle IS.** Magnified, it is not grain: it is isolated single pixels of fully saturated
+spectral colour (out-of-gamut, saturation > 1) on a dim background — single-wavelength paths that
+caught a rare high-value event. Frame-to-frame flicker in the rain ROI is **29.1** levels RMS on a
+mean of ~67, and a seed pair at 128 spp gives a per-frame noise of 19.3: sqrt(2) x 19.3 = 27.4, so
+the flicker is *entirely* estimator noise, no motion component.
+
+**Why spp does not fix it — measured, not assumed.** The 8192 spp "reference" is itself
+tail-dominated (its cloud ROI holds 17 % more energy than a 2048 spp render of the same estimator),
+so error-vs-reference floors at the reference's own noise and cannot show convergence. SEED PAIRS
+can: two renders differing only in seed differ by sqrt(2) x their own noise. Developed luma RMS:
+
+| ROI | 128 spp | 512 spp | exponent (−0.50 = textbook) |
+|---|---:|---:|---:|
+| grid | 6.72 | 3.42 | **−0.49** |
+| cloud | 19.34 | 10.84 | −0.42 |
+| exhibits | 8.48 | 5.35 | −0.33 |
+| **rain** | 18.78 | 15.31 | **−0.15** (−0.19 over 128..2048) |
+
+Halving the rain's noise at that exponent needs ~5000-14000 spp — 40-110x the budget. The cloud,
+a plain HG medium, converges almost normally; the rain does not.
+
+**Not the rainbow phase.** The one thing the rain has that nothing else does is `phase rainbow`,
+whose Airy lobe is a narrow spike over the HG background, and an importance-sampling mismatch
+there would produce exactly this tail. Both samplers are exact (host `RainbowPhase::sample`,
+device `dMedPhaseSample`, each with a per-wavelength CDF, `pdf == phase`) — and the control
+experiment closes it regardless: with the rain's phase replaced by plain HG g=0.55 and everything
+else identical, the exponent is **−0.14**. The tail is structural to mode D's bidirectional
+transport in this configuration (thin backlit medium under a dense cloud, delta sun) and its
+strategy imbalance was NOT identified. Filed as a limitation, not a bug, until someone does.
+
+**Not a filter, either.** Per-ROI against the reference (developed luma RMS, grid ROI is the
+"do not damage" control): `-denoise-luma 0.5` takes the grid 7.7 -> 24.7; a 3-frame temporal median
+7.7 -> 15.6, 5-frame 25.6 — the floor grid is close and low in frame and moves several px/frame,
+so every temporal filter smears it (and a median of a right-skewed sample also darkens the rain
+by 10-16 %). Chroma `-denoise` is already shipped and takes the rain's chroma error 78 -> 55; it
+cannot touch luma by design.
+
+**THE FIX: render the circuit in mode M.** The beam gather is a different estimator for media —
+the sun's photons are stored as beams and the camera ray gathers them as a 1-D density
+estimate, with no per-camera-ray rare event to catch. On the same frame:
+
+| rain ROI, raw | mean Y | top 1 % of pixels hold | isolated saturated fireflies |
+|---|---:|---:|---:|
+| mode D, 128 spp | 0.0698 | 12.6 % of energy | 6 |
+| **mode M, 32 spp, beamblur 0.015** | **0.0692** | **4.5 %** | **0** |
+
+Energy agrees to 1 %, so there is no seam to hide: per-ROI developed brightness against the mode-D
+reference is rain 73.3 vs 72.5, cloud 154.2 vs 155.0, grid 29.8 vs 30.0, exhibits 23.4 vs 22.2 —
+closer than the 128 spp mode-D frames themselves are. Visually the rain becomes coherent
+crepuscular shafts, and between adjacent frames the volume is *identical* (the shared map freezes
+it); the cloud's within-frame speckle drops 19.2 -> 5.1.
+
+**What mode M costs and what it adds.** At the earlier 8 spp / beamblur 0.03 the thin wireframe
+cages come out DOTTED — sub-pixel lines anti-aliased by 8 jittered rays, binomial coverage, nothing
+to do with the map — and re-dotted every frame, which is why the raw flicker RMS (31.2) reads no
+better than mode D's: the metric is wire-dominated. 32 spp fixes the wires; halving `-beamblur` to
+0.015 pays for it (gather cost ~ radius^2: 1037 -> 504 beams/probe), net **~45 s/frame at 320x180**
+against ~9 s for mode D on the same rain-heavy frame. Raw mode-M wires carry chromatic fringing;
+the shipped `-denoise -fireflies 4` removes it completely (verified offline through
+`scraps/dntest.exe` before committing 4 h of GPU). The circuit is rendered as four prefix
+selections (`fly04`..`fly07`) off ONE banked map (`-savemap` once, `-loadmap` three times), and
+spliced into the mode-D loop with a 12-frame linear crossfade in linear light
+(`scraps/assemble_mix.py`).
+
+**Mode M ignores `-r` — OPEN.** `-r 320 180` on a mode-M render produced a 960x540 frame (the film
+block's resolution); mode D honours it. The 320x180 mode-M work above needed a scene variant with
+`film { res 320 180 }`. Cost me one 17-minute probe at 9x the intended pixels before I noticed.
+Not investigated further; almost certainly the shared-GPU mode-M path (`plainRender`) reading the
+film block where the per-camera path reads the override.
+
+**Two harness traps, both hit here, both now avoided in the scratch scripts:**
+
+* **`-hdr` writes its sidecar PROGRESSIVELY, at every `-interval`.** A wait loop on "the .pfm
+  exists" fires on a partial write — I scored a half-finished render and got noise that *rose*
+  with spp (+0.11 exponent), which is impossible and was the tell. Wait on the launching chain's
+  own "done" line, never on sidecar existence.
+* **An 8192 spp render is not a reference for a heavy-tailed region.** See above; use seed pairs.
+  This is the third time in two days that an aggregate or a nominal reference certified something
+  the eye contradicted; `scraps/seedpair.py`, `scraps/raintail.py` and `scraps/flickerseq.py` are
+  the pattern/tail/temporal measurements that actually discriminate.
+
 ### STALE-LIMITATION AUDIT (2026-09-13) — documented limitations are less re-tested than open bugs
 
 Three recorded blockers dissolved in one session, each on a single grep against code that had moved

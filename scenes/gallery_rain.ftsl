@@ -258,6 +258,26 @@
 # deposit. See known-issues.md, "every performance number in scenes/gallery_rain.ftsl's
 # header is stale".
 #
+# THE BACKLIT RAIN ON THE CLOUD CIRCUIT NEEDS MODE M, NOT MORE SPP (measured 2026-09-15).
+# Under mode D the rain seen up-sun (frames ~413-723 of `fly`) is a heavy-tailed estimator:
+# isolated saturated single-wavelength pixels whose per-frame noise falls as spp^-0.15 (seed
+# pairs; the grid beside it falls as spp^-0.49), so halving it would take ~5000-14000 spp. It
+# is not the rainbow phase — swapping the rain to plain HG gives spp^-0.14 — and no filter
+# removes it without smearing the floor grid that runs through it. Mode M's beam gather has
+# no such tail: same frame, top 1% of rain pixels hold 4.5% of the energy against 12.6%,
+# zero isolated fireflies, energy agreeing to 1%, and between adjacent frames the volume is
+# IDENTICAL because the map is shared. It renders the rain as the crepuscular shafts it is.
+# Recipe that measured clean at 320x180 (film block; mode M ignores -r, see known-issues):
+#   -mode M -device gpu -beams -n 40000000 -beamcount 100000 -beamblur 0.015 -spp 32 \
+#       -denoise -fireflies 4 -hdr
+# ~45 s/frame. 32 spp is what keeps the sub-pixel wireframe cages continuous (8 spp dots
+# them: binomial coverage, nothing to do with the map); beamblur 0.015 pays for it, since
+# gather cost goes as radius^2. Raw mode-M wires carry chromatic fringing that -denoise
+# removes completely. Render the circuit as prefix selections (fly04..fly07) off ONE map
+# (-savemap once, -loadmap after) and splice into the mode-D loop with a short crossfade in
+# linear light; the two estimators agree on brightness to 1-5% in every region, so the
+# dissolve only has to hide a change in noise character, not a level step.
+#
 # The GPU flyby command, verified end to end:
 #   ftrace -in scenes/gallery_rain.ftsl -camera fly -mode M -device gpu -beams \
 #          -n 20000000 -spp 6 -window -keepwindow -interval 15 \
