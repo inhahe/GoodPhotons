@@ -4341,11 +4341,61 @@ that cannot sample a texture was reading. Together, on Alice: **2,217 px changed
 and hair (`scraps/_alice_preview_final.png`).
 
 **Still open, both logged here rather than fixed:**
-- ~~**No Fresnel angular ramp in the renderers.**~~ **DONE in 0.317.0** -- see the follow-up above.
-  What remains is **mode D / J / U**, which refuse layered materials outright; `-import-specular mix`
-  is the workaround until BDPT learns the stack.
+- ~~**No Fresnel angular ramp in the renderers.**~~ **DONE in 0.317.0**, and ~~**mode D / J / U
+  refuse layered materials**~~ **DONE in 0.318.0** -- both covered by the entries below.
 - **Every glTF asset in the repo changes appearance slightly** (the camrig scenes included): they
   all gain the 4 % lobe they should have had. `-import-specular off` reproduces the old look.
+
+### DONE (2026-09-16, v0.318.0): modes `D`, `J` and `U` render layered materials
+
+They refused them outright. The fix was not a new BSDF but the same move the device port made: the
+coat becomes a **material** (`Material::coatChild`, built by `Scene::finalizeLayeredCoats()`), and
+the BDPT/VCM walks resolve a layered stack to one lobe per vertex -- coat with probability R, else
+a body lobe -- exactly as they already resolve a `Mix`, so every MIS density downstream sees an
+ordinary material. The device now points at the same host coat instead of synthesising its own, so
+one definition serves BDPT/VCM, mode M's gather and CUDA.
+
+**Validated by identity** (`scraps/ident_*.ftsl`, one sphere, fixed position, only the material
+swapped, 512 spp): a manual coat at `specular 1.0` must equal a plain glossy of the same roughness,
+and at `specular 0.0` must equal the bare body.
+
+| identity | mode D | mode M |
+|---|---:|---:|
+| `layered(coat=1.0)` / `glossy` | **1.0001** | **1.0076** |
+| `layered(coat=0.0)` / `diffuse` | **0.9999** | **1.0002** |
+
+Two false alarms on the way, both worth remembering: the first identity scene put four spheres side
+by side under one small off-centre key, so they were not equally lit and every ratio was wrong; the
+second compared the coat against `reflect rgb 1 1 1`, which is not the same white the coat uses
+(next entry). Mode M's gather also stopped reflecting the coat inline and now resolves to the coat
+child like everything else, so it picks up that case's glossy-NEE and MIS rather than a private
+copy.
+
+### OPEN (2026-09-16): mode M renders GLOSSY materials ~2.7x darker than BDPT, and a JH-upsampled white 22 % darker than a flat one
+
+Found while validating the layered work, on `scraps/ident_*.ftsl` (one sphere, one area light,
+512 spp, GPU), ROI mean of the sphere:
+
+| material | mode M | mode D | D / M |
+|---|---:|---:|---:|
+| `diffuse rgb 0.45 0.16 0.16` | 0.00208 | 0.00214 | **1.03** |
+| `glossy reflect 1.0 roughness 0.25` | 0.00209 | 0.00575 | **2.75** |
+| `glossy reflect rgb 1 1 1 roughness 0.25` | 0.00163 | 0.00567 | **3.48** |
+
+The diffuse control agrees to 3 %, so this is not exposure or light handling: **mode M specifically
+loses most of a glossy lobe's energy** relative to BDPT. The same pattern shows on
+`scraps/gloss_probe.ftsl` (glossy 3.00x, a 4 % glossy-over-diffuse mix 1.17x, diffuse 1.13x), i.e.
+it scales with how much of the material is the glossy lobe. Untouched by the layered work -- the
+layered numbers simply inherit it -- and not investigated. Suspects: the density estimate at a
+glossy vertex, `-gnee`'s MIS weights, or the photon side depositing at glossy vertices differently
+from how the gather reads them.
+
+**Second, smaller, and independent:** the same glossy material reads **22 % darker in mode M** when
+its white is written `reflect rgb 1 1 1` (Jakob-Hanika upsampled) than when it is written
+`reflect 1.0` (flat), while mode D sees only 1.3 % between them. A JH-upsampled white should be
+close to flat, so one of the two paths is mis-weighting the spectral shape; mode M's wavelength
+sampling is the obvious place to look. This is what made the layered coat (flat white by
+construction) look 29 % bright against an `rgb 1 1 1` glossy until the comparison was corrected.
 
 ### OPEN (2026-09-16): `-direct-only` is silently ignored by mode D (and any non-backward mode)
 

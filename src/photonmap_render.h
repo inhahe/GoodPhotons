@@ -948,24 +948,17 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             if (c < 0) return L;
             mp = &scene.mats[c];
         } else if (mp->type == MatType::Layered) {
-            // THE COAT IS A LOBE, NOT A DETAIL TO SKIP (0.317.0). This used to read
-            // `mixPickChild(...)  // approximate: gather the body lobe` -- the camera ray
-            // entered the stack unconditionally, so mode M rendered every clearcoat matte while
-            // modes R and W showed its sheen, and once the device grew a real D_LAYERED branch
-            // the CPU disagreed with its own GPU twin (measured on scraps/lay_probe.ftsl: a 0.6
-            // lacquer coat peaked at 0.254 on the GPU and 0.005 here). Now the same split the
-            // BDPT walk and dResolveCompound make: with probability R the ray reflects off the
-            // coat interface, otherwise it enters and a body lobe shades.
+            // Resolve to a LOBE and let the material switch shade it -- the coat with
+            // probability R (the Fresnel reflectance at this angle), else a body lobe. The
+            // coat is a material of its own (Material::coatChild), so it goes through the
+            // switch's Glossy case and gets that case's glossy-NEE, throughput and MIS. An
+            // earlier version reflected the ray inline here and skipped all three, which
+            // broke the identity that a coat of reflectance 1 IS a glossy material: it
+            // rendered 30 % bright against one (scraps/ident_*.ftsl). Same convention as
+            // bdpt.h's randomWalk and the device's dResolveCompound.
             const double R = layeredCoatReflectance(scene, *mp, h, ray.d, lambda);
-            if (rng.uniform() < R) {
-                const Vec3 o = sampleGlossy(reflect(ray.d, h.n),
-                                            materialRoughness(scene, *mp, h), rng);
-                if (dot(o, h.n) <= 0.0) return L;
-                ray = Ray{h.p + h.n * 1e-6, o};
-                specularSeen = true;
-                continue;
-            }
-            int c = mixPickChild(*mp, rng.uniform());   // the body lobes; leftover absorbs
+            int c = (rng.uniform() < R) ? mp->coatChild
+                                        : mixPickChild(*mp, rng.uniform());
             if (c < 0) return L;
             mp = &scene.mats[c];
         }
@@ -1299,24 +1292,17 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             if (c < 0) return L;
             mp = &scene.mats[c];
         } else if (mp->type == MatType::Layered) {
-            // THE COAT IS A LOBE, NOT A DETAIL TO SKIP (0.317.0). This used to read
-            // `mixPickChild(...)  // approximate: gather the body lobe` -- the camera ray
-            // entered the stack unconditionally, so mode M rendered every clearcoat matte while
-            // modes R and W showed its sheen, and once the device grew a real D_LAYERED branch
-            // the CPU disagreed with its own GPU twin (measured on scraps/lay_probe.ftsl: a 0.6
-            // lacquer coat peaked at 0.254 on the GPU and 0.005 here). Now the same split the
-            // BDPT walk and dResolveCompound make: with probability R the ray reflects off the
-            // coat interface, otherwise it enters and a body lobe shades.
+            // Resolve to a LOBE and let the material switch shade it -- the coat with
+            // probability R (the Fresnel reflectance at this angle), else a body lobe. The
+            // coat is a material of its own (Material::coatChild), so it goes through the
+            // switch's Glossy case and gets that case's glossy-NEE, throughput and MIS. An
+            // earlier version reflected the ray inline here and skipped all three, which
+            // broke the identity that a coat of reflectance 1 IS a glossy material: it
+            // rendered 30 % bright against one (scraps/ident_*.ftsl). Same convention as
+            // bdpt.h's randomWalk and the device's dResolveCompound.
             const double R = layeredCoatReflectance(scene, *mp, h, ray.d, lambda);
-            if (rng.uniform() < R) {
-                const Vec3 o = sampleGlossy(reflect(ray.d, h.n),
-                                            materialRoughness(scene, *mp, h), rng);
-                if (dot(o, h.n) <= 0.0) return L;
-                ray = Ray{h.p + h.n * 1e-6, o};
-                gmis.pdf = 0.0;   // a fresh specular bounce: no stale glossy-NEE weight
-                continue;
-            }
-            int c = mixPickChild(*mp, rng.uniform());   // the body lobes; leftover absorbs
+            int c = (rng.uniform() < R) ? mp->coatChild
+                                        : mixPickChild(*mp, rng.uniform());
             if (c < 0) return L;
             mp = &scene.mats[c];
         }

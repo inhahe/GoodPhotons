@@ -15401,18 +15401,24 @@ static const char* bdptUnsupportedFeature(const Scene& scene) {
     auto markUsed = [&](int id) {
         if (id < 0 || id >= (int)scene.mats.size() || matUsed[id]) return;
         matUsed[id] = 1;
-        if (scene.mats[id].type == MatType::Mix)
+        // A compound material's lobes are reachable at runtime, so they count as used: a mix's
+        // children, and a layered stack's body lobes AND its coat (0.318.0).
+        if (scene.mats[id].type == MatType::Mix || scene.mats[id].type == MatType::Layered) {
             for (int c : scene.mats[id].mixChildren)
                 if (c >= 0 && c < (int)scene.mats.size()) matUsed[c] = 1;
+            const int cc = scene.mats[id].coatChild;
+            if (cc >= 0 && cc < (int)scene.mats.size()) matUsed[cc] = 1;
+        }
     };
     for (const auto& tr : scene.tris) markUsed(tr.matId);
     for (const auto& sp : scene.spheres) markUsed(sp.matId);
     for (size_t i = 0; i < scene.mats.size(); ++i)
         if (matUsed[i] && scene.mats[i].type == MatType::Fluorescent)
             return "fluorescent materials";
-    for (size_t i = 0; i < scene.mats.size(); ++i)
-        if (matUsed[i] && scene.mats[i].type == MatType::Layered)
-            return "layered materials";
+    // LAYERED materials render in BDPT/VCM since 0.318.0: the walks resolve the stack to one
+    // lobe per vertex (coat with probability R, else a body lobe) exactly as they already
+    // resolve a mix, so every MIS density downstream sees an ordinary material. The refusal
+    // that stood here is gone; see bdpt.h's randomWalk.
     // SPOT and SUN lights ARE rendered by BDPT (bdpt.h: deltaLightSubpath emits from them,
     // connectBDPT next-event-estimates them, and misWeight drops the strategies a delta
     // light can't be sampled by). Two emitters remain out of scope:

@@ -861,6 +861,17 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             int c = mixResolveChild(scene, *mp, h, rng.uniform());
             if (c < 0) return;                       // absorbed
             mp = &scene.mats[c];
+        } else if (mp->type == MatType::Layered) {
+            // The same resolve a mix gets, with the coat as the first lobe: it wins with
+            // probability R (the Fresnel reflectance at THIS angle), otherwise the ray enters
+            // and a body lobe shades. The vertex then holds an ordinary material, which is what
+            // every MIS density downstream evaluates -- the same convention a mix already uses,
+            // where the pdf stored is the resolved child's and not the mixture's.
+            const double R = layeredCoatReflectance(scene, *mp, h, ray.d, lambda);
+            int c = (rng.uniform() < R) ? mp->coatChild
+                                        : mixPickChild(*mp, rng.uniform());
+            if (c < 0) return;                       // absorbed on the leftover slice
+            mp = &scene.mats[c];
         }
 
         Vertex v;

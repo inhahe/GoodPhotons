@@ -676,6 +676,13 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
             int c = mixResolveChild(scene, *mp, h, rng.uniform());
             if (c < 0) return;
             mp = &scene.mats[c];
+        } else if (mp->type == MatType::Layered) {
+            // Coat with probability R, else a body lobe (bdpt.h's randomWalk explains the
+            // convention). `rd` is the travel direction, and only |cos| is used.
+            const double R = layeredCoatReflectance(scene, *mp, h, rd, lambda);
+            int c = (rng.uniform() < R) ? mp->coatChild : mixPickChild(*mp, rng.uniform());
+            if (c < 0) return;
+            mp = &scene.mats[c];
         }
         if (mp->isLight) return;                 // light subpath doesn't scatter off emitters
 
@@ -901,6 +908,13 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         const Material* mp = &scene.mats[h.matId];
         if (mp->type == MatType::Mix) {
             int c = mixResolveChild(scene, *mp, h, rng.uniform());
+            if (c < 0) return result;
+            mp = &scene.mats[c];
+        } else if (mp->type == MatType::Layered) {
+            // Coat with probability R, else a body lobe (bdpt.h's randomWalk explains the
+            // convention). `rd` is the travel direction, and only |cos| is used.
+            const double R = layeredCoatReflectance(scene, *mp, h, rd, lambda);
+            int c = (rng.uniform() < R) ? mp->coatChild : mixPickChild(*mp, rng.uniform());
             if (c < 0) return result;
             mp = &scene.mats[c];
         }

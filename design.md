@@ -882,6 +882,38 @@ Once the device did it properly the two backends disagreed outright (`scraps/lay
 lacquer coat peaked at 0.254 on the GPU against 0.005 on the CPU), so both now take the coat with
 probability R, as the BDPT walk always has.
 
+### Layered materials in BDPT and VCM -- modes `D`, `J`, `U` (0.318.0)
+
+Those modes refused layered materials outright (`bdptUnsupportedFeature` -> "layered materials").
+What they needed was what the device needed: a **material** to shade with, since their walks
+resolve each vertex to one and then evaluate `bsdfF` / `bsdfPdf` against it. So the coat is now a
+material -- `Material::coatChild`, built once by `Scene::finalizeLayeredCoats()` (an uncoloured
+glossy lobe carrying the coat's roughness and maps; idempotent, because `build()` runs more than
+once on some paths) -- and the three walk sites (`bdpt.h randomWalk`, `vcm.h` x2) resolve a
+layered stack exactly as they already resolve a mix: coat with probability R, else a body lobe.
+The device dropped its own upload-time synthesis and points `coatChild` at the host's, so there
+is now ONE definition of a coat shared by BDPT/VCM, mode M's gather and the device.
+
+**The MIS convention is the mix's, deliberately.** A resolved vertex stores the CHILD's pdf, not
+the mixture's -- the selection is the sampling. That is what `Mix` has always done here, and
+matching it keeps one rule rather than two.
+
+**Validated by identity, not by eyeball.** A manual coat at `specular 1.0` always wins its draw,
+so that stack must render *exactly* like a plain glossy of the same roughness; at `specular 0.0`
+it must render exactly like the bare body. Holding the sphere and its position fixed and swapping
+only the material (`scraps/ident_*.ftsl`, 512 spp):
+
+| identity | mode D | mode M |
+|---|---:|---:|
+| `layered(coat=1.0)` / `glossy` | **1.0001** | **1.0076** |
+| `layered(coat=0.0)` / `diffuse` | **0.9999** | **1.0002** |
+
+The first version of this test compared four spheres side by side and failed everywhere, because
+a small off-centre key light does not light four positions equally -- the geometry has to be held
+fixed and only the material varied. The second version compared the coat against
+`reflect rgb 1 1 1` and read 1.29 in mode M, which turned out to be a property of the WHITE, not
+of the coat: see the open entry on `rgb 1 1 1` vs `1.0` in known-issues.
+
 ### A directional environment for the preview's specular (0.317.0)
 
 The split sum's environment half was `PreviewLight::ambient`, one scalar -- and a constant

@@ -360,6 +360,13 @@ struct Material {
     // 1-Sum absorbs), which then behaves exactly as that child material. The coat R and
     // the body weights partition each incident photon — energy-consistent by design.
     int    coatModel    = 0;      // 0 fresnel, 1 thinfilm, 2 manual(coatSpecular)
+    // The coat as a MATERIAL (finalizeLayeredCoats, 0.318.0), or -1 on anything not layered.
+    // Every consumer that shades a stack wants a material rather than a set of fields: the
+    // BDPT and VCM walks store one resolved material per vertex and evaluate bsdfF/bsdfPdf
+    // against it, and the device cannot shade fields at all. The coat's SELECTION probability
+    // is not stored here -- it is layeredCoatReflectance at the hit, because it depends on the
+    // viewing angle, which is the whole point of a Fresnel coat.
+    int    coatChild    = -1;
     double coatSpecular = -1.0;   // manual constant reflectance (used iff coatModel==2)
     // Optional per-hit blend mask (spec §9.4): a grayscale texture that drives the
     // selection weight of a 2-child mix. When set (and exactly 2 children), the map
@@ -1465,6 +1472,28 @@ struct Scene {
     // the case the deposit-time fold must refuse and this table can serve.
     static bool bowLutEligible(const Medium& m) { return m.achroSigma != 0 && m.rainbow(); }
 
+    // Give every LAYERED material's coat a material of its own: an uncoloured glossy lobe (a
+    // dielectric coat's reflection carries no tint; the body supplies the colour) carrying the
+    // coat's own roughness and maps. Appended once and idempotent -- build() runs more than
+    // once on some paths, and a second pass must not grow a second coat. See Material::coatChild.
+    void finalizeLayeredCoats() {
+        const size_t n = mats.size();
+        for (size_t i = 0; i < n; ++i) {
+            if (mats[i].type != MatType::Layered || mats[i].coatChild >= 0) continue;
+            Material coat = mats[i];          // inherit roughness / normal / pattern plumbing
+            coat.type = MatType::Glossy;
+            coat.reflect = constantSpectrum(1.0);
+            coat.reflectTex = -1;
+            coat.reflectPat = -1;
+            coat.mixChildren.clear();
+            coat.mixWeights.clear();
+            coat.coatChild = -1;
+            coat.isLight = false;
+            mats[i].coatChild = (int)mats.size();
+            mats.push_back(coat);
+        }
+    }
+
     void finalizeBowLuts() {
         bowLuts.clear();
         if (media.empty() || emitters.empty()) return;
@@ -2385,6 +2414,7 @@ struct Scene {
         finalizeEmitters();
         finalizeEmissiveVolumes();
         finalizeBowLuts();
+        finalizeLayeredCoats();
     }
     void finalizeTris() { build(); }   // kept for existing call sites
 
