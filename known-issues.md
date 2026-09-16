@@ -3990,9 +3990,12 @@ touch them because they are coherent, not speckle (rain saturation before/after 
 **Numbers.** Signed difference M − D over the cloud-and-rain column, developed: RMS **14.0**
 levels at 40M photons, **10.9** at 200M (mean |M−D| 9.24 → 6.50). Per-probe beams gathered
 521 → 2744 (5.3x); gather time 100 s → 786 s (7.9x) at 320x180, spp 32 — at 960x540 that is
-~2 h per frame. Whether the remaining 10.9 is mostly the *reference's own* per-pixel noise is
-being measured with a second reference seed; if it is, 200M is close to converged and the
-cost is the whole story.
+~2 h per frame. A second reference seed puts the reference's own per-pixel noise at **4.85**
+levels RMS, so against the two-seed mean mode M's *excess* structure is **13.2** levels at 40M
+and **9.8** at 200M: 5x the photons removed a quarter of it. With the excess falling as
+1/sqrt(beams), reaching ~2 levels would need ~25x more beams again — billions of photons and a
+gather of hours per frame. Mode M does not converge on this shot at any budget that renders a
+flyby.
 
 **Three statistics failed to see a fan the eye caught at once, and each failure is the
 instructive part.** (1) Pearson correlation after a 2 px blur read 0.997 — the bright-centre
