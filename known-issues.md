@@ -3914,18 +3914,25 @@ film block where the per-camera path reads the override.
   the eye contradicted; `scraps/seedpair.py`, `scraps/raintail.py` and `scraps/flickerseq.py` are
   the pattern/tail/temporal measurements that actually discriminate.
 
-### OPEN (2026-09-16): `-denoise` on a low-spp `-mode W` frame tints the WHOLE frame one colour
+### NOT A BUG, MIS-FILED AND RETRACTED THE SAME HOUR (2026-09-16): a 2-pass `-mode W` frame of a media scene is one colour — and `-denoise` had nothing to do with it
 
-Seen while making a quick trajectory preview of `gallery_rain` (`-mode W -spp 2 -denoise
--fireflies 4`, 320x180): every frame came out uniformly yellow -- floor grid, pedestals, gyroid,
-all of it -- where the same frame without `-denoise` has a green grid and grey stone and only
-the cloud/rain speckled (single-wavelength media passes). The chroma filter's job is to average
-spectral speckle toward neutral over a neighbourhood; with only TWO deterministic wavelength
-passes in the frame there is no neutral to average toward, and the luma-weighted gather appears
-to spread whichever wavelength dominates the bright pixels across everything. Not investigated
-beyond that (the preview simply ran without the flag). Worth a look before anyone reaches for
-`-denoise` on a mode-W or other very-low-spp spectral frame; the fix may just be a floor on spp
-below which the chroma pass declines to run, with a message.
+Filed as "`-denoise` on a low-spp mode-W frame tints the whole frame yellow" after a quick
+trajectory preview of `gallery_rain` (`-mode W -spp 2 -denoise -fireflies 4`, 320x180) came out
+uniformly yellow — floor grid, pedestals, gyroid, everything. Retracted twenty minutes later: the
+same frame **without** `-denoise` is exactly as yellow. The comparison that "showed" the denoiser
+at fault was a denoised **spp 2** frame against an undenoised **spp 4** frame — two variables
+changed at once, and the one that mattered was the pass count.
+
+**What it actually is, and it is documented behaviour.** In a scene with participating media
+(the cloud and rain) mode W's path is de-heroed onto ONE wavelength per pass, so a 2-pass frame
+is painted in two wavelengths and takes their hue everywhere, surfaces included; REFERENCE.md's
+`-explore` entry says such scenes need up to 64 passes to resolve colour. The spp-4 frame was
+merely less wrong. So mode W is not a quick previewer for *this* scene at low spp; mode D at
+8 spp with `-denoise` (hero-wavelength surfaces, correct colour in one pass, cloud visible as
+noise) is, and that is what the preview ran with. Kept as an entry because the mis-filing is
+the useful part: it is the fourth time in two days that the first explanation was a
+measurement-tool or method error, and the check that catches it is always the same — change
+one thing.
 
 ### STALE-LIMITATION AUDIT (2026-09-13) — documented limitations are less re-tested than open bugs
 
