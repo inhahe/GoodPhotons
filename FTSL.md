@@ -2149,6 +2149,13 @@ medium { sigma_a <spec>  sigma_s <spec>  g 0 }     # spectral form
   `sigma_a`/`sigma_s` directly (per authored-unit length; converted to 1/metre).
 - `g` is the Henyey-Greenstein anisotropy; `rayleigh true` gives a λ⁻⁴ scattering
   tilt (blue-sky falloff).
+- `beam_blur <frac>` (since 0.309.0) sets **this medium's** mode-`M` beam-kernel half-width
+  as a fraction of its own measured mean free path, overriding the global `-beamblur` for
+  it alone. A soft haze that cannot show detail can take a kernel several times wider than
+  a cloud whose silhouette must stay crisp, and the gather cost (which grows with the
+  radius) is then paid only where the smoothing is wanted. Omit it (or give a value ≤ 0)
+  to use the global. Applies to mode M's shared beam map; mode J's per-frame map still
+  uses the global.
 
 **Angular scattering model — `phase`.** By default a medium scatters through the
 smooth single-parameter Henyey-Greenstein lobe (`g` above). A `phase` statement swaps

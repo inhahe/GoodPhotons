@@ -3999,7 +3999,14 @@ flyby. Nor does blur hide it: "fat beams" (the 200M map trimmed to 125k beams at
 kernel radius, 5480 gathered per probe, 1.65x the gather time of the 200M/500k frame) took
 the excess from 9.81 to **9.42** levels and rain saturation from 0.240 to 0.229 — the residual
 is the correlated-beam structure itself, which a wider kernel averages only as slowly as more
-beams do, at the same cost per unit of improvement.
+beams do, at the same cost per unit of improvement. Confirmed once more with the per-medium
+kernel (0.309.0's `beam_blur`): the rain alone at 0.1 x mfp (0.17 m, 6.7x the global) gathered
+2421 beams/probe instead of 521 and took ~11 min for the frame instead of ~100 s, for an
+excess of **12.45** against 13.21 and rain saturation 0.232 against 0.295. Fitting
+excess^2 = bias^2 + variance/K to the 1x and 5x maps puts the averaging floor at **~8.7 levels**
+— roughly twice the reference's own noise — so neither more realizations nor a wider kernel
+reaches the reference on this shot; what remains is the beam estimator's bias here, not its
+variance.
 
 **Three statistics failed to see a fan the eye caught at once, and each failure is the
 instructive part.** (1) Pearson correlation after a 2 px blur read 0.997 — the bright-centre

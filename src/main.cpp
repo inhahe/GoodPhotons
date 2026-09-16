@@ -12124,6 +12124,9 @@ static bool      g_beamTargetSet = false;  // was -beamcount given? (mode J repo
 // explicit `-n` beats explicit `-beamcount` beats the scene's own measured knee.
 static bool      g_nFromCli      = false;
 static double    g_beamBlur      = 0.01;   // kernel half-width as a fraction of the mfp
+// Per-medium overrides of g_beamBlur from the scene's `beam_blur` medium keys, indexed by
+// medium id (<= 0 = use the global). Filled once the scene has loaded; read by buildBeamMap.
+static std::vector<double> g_medBeamBlur;
 static double    g_beamK         = 32.0;   // FLOOR on the gathered count, not a target
 static double    g_beamAreaSlack = 1.0;    // ceiling: allowed box-area growth from the kernel
 // THE LIGHT-SIDE REFRESH — mode J (0.247.0, the UPBP-THICK fix) and mode M (0.252.0, M-FROZEN).
@@ -12406,7 +12409,8 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
     } else {
         const BeamMap::AutoInfo ai =
             bm.buildAuto(g_beamBlur, g_beamK, g_beamAreaSlack, splitBudget, g_beamSplitLen, work,
-                         /*skipBvh*/ jSkipHostBvh());
+                         /*skipBvh*/ jSkipHostBvh(),
+                         g_medBeamBlur.empty() ? nullptr : &g_medBeamBlur);   // scene `beam_blur`
         r = bm.radius;
         // One line PER MEDIUM: the radius is per medium now, so a single number would hide
         // exactly the thing that makes a two-medium scene work. mfp is the measured mean stored
@@ -18852,6 +18856,9 @@ static int run(int argc, char** argv) {
         }
         fromFtsl = true;
         std::printf("[ftsl] loaded scene from %s\n", inFile);
+        // The scene's per-medium `beam_blur` overrides, for buildBeamMap (mode M's map).
+        g_medBeamBlur.clear();
+        for (const Medium& m : ftslScene.scene.media) g_medBeamBlur.push_back(m.beamBlur);
         // Ahead-of-time nested-dielectric priority audit: warn where two overlapping
         // dielectric solids can't be disambiguated (missing/equal `priority`), so the
         // exterior IOR in the overlap would be picked arbitrarily. Read-only; renders

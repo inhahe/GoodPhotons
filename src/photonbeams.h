@@ -1246,8 +1246,11 @@ struct BeamMap {
     // `skipBvh` forwards to both `build` calls below -- see BeamMap::build. It is a parameter
     // rather than a member because the decision belongs to the CALLER (is this map going to be
     // gathered on the device?), and a member would let two maps in one render disagree.
+    // `medBlur` (optional): per-medium overrides of `blur`, indexed by medium id; an entry
+    // <= 0 means "use the global". This is the scene's `beam_blur` in a medium block.
     AutoInfo buildAuto(double blur, double targetK, double areaSlack, size_t splitBudget = 0,
-                       double explicitSplitLen = 0.0, double work = 0.0, bool skipBvh = false) {
+                       double explicitSplitLen = 0.0, double work = 0.0, bool skipBvh = false,
+                       const std::vector<double>* medBlur = nullptr) {
         AutoInfo info;
         info.blur     = blur;
         info.targetK  = targetK;
@@ -1261,7 +1264,12 @@ struct BeamMap {
         // --- r_m = blur * mfp_m ------------------------------------------------------
         std::vector<MedStat> st = mediumStats();
         double rSeen = 0.0;
-        for (MedStat& s : st) { s.r = blur * s.mfp; rSeen = std::max(rSeen, s.r); }
+        for (size_t m = 0; m < st.size(); ++m) {
+            MedStat& s = st[m];
+            const double frac = (medBlur && m < medBlur->size() && (*medBlur)[m] > 0.0)
+                              ? (*medBlur)[m] : blur;      // the medium's own `beam_blur`, else global
+            s.r = frac * s.mfp; rSeen = std::max(rSeen, s.r);
+        }
         // A medium with no stored chords has no measured scale. It also has no beams to
         // gather, so the value is unobservable — give it the largest seen radius (or a
         // scene-scale sliver if no medium has any) purely so nothing downstream divides by 0.

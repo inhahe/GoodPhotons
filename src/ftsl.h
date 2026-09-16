@@ -6470,6 +6470,7 @@ private:
         Medium med;
         med.enabled = true;
         med.g = dblOf(b, "g", 0.0);
+        med.beamBlur = dblOf(b, "beam_blur", -1.0);   // per-medium mode-M kernel (see scene.h)
         bool rayleigh = strOf(b, "rayleigh") == "true" || strOf(b, "rayleigh") == "1";
         // Extinction coefficients are per-length (1/authored-unit); divide by L_ to
         // convert to the internal 1/metre so fog reads the same regardless of unit.

@@ -455,6 +455,12 @@ struct Medium {
     Spectrum sigma_a = constantSpectrum(0.0); // absorption coefficient vs lambda
     Spectrum sigma_s = constantSpectrum(0.0); // scattering coefficient vs lambda
     double g = 0.0;                            // HG anisotropy [-1,1] (0 = isotropic)
+    // `beam_blur <frac>`: this medium's mode-M beam kernel half-width as a fraction of ITS
+    // OWN mean free path, overriding the global -beamblur for this medium only. < 0 = use
+    // the global. A soft haze that cannot show detail can take a kernel many times wider
+    // than a cloud whose silhouette must stay crisp, and the gather cost (~ radius^2) is
+    // then paid only where the smoothing is wanted.
+    double beamBlur = -1.0;
 
     // --- Scattering phase model ---------------------------------------------
     // By default a medium scatters via the smooth single-parameter Henyey-Greenstein
