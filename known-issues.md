@@ -4371,31 +4371,48 @@ second compared the coat against `reflect rgb 1 1 1`, which is not the same whit
 child like everything else, so it picks up that case's glossy-NEE and MIS rather than a private
 copy.
 
-### OPEN (2026-09-16): mode M renders GLOSSY materials ~2.7x darker than BDPT, and a JH-upsampled white 22 % darker than a flat one
+### RETRACTED (2026-09-16, same day): "mode M renders glossy materials ~2.7x darker than BDPT" — my probe scene was open, and the modes agree on an enclosed one
 
-Found while validating the layered work, on `scraps/ident_*.ftsl` (one sphere, one area light,
-512 spp, GPU), ROI mean of the sphere:
+**The claim was wrong and is withdrawn.** It came from `scraps/ident_*.ftsl` and
+`scraps/gsweep_*.ftsl`: a sphere, a floor quad, one small area light, and black void everywhere
+else. In an OPEN scene a glossy sphere reflects mostly nothing, so almost all of its appearance is
+the small light plus whatever each mode does with a ray that escapes to no geometry -- which is
+exactly where mode conventions may legitimately differ, and which no amount of spp converges to a
+shared answer. Re-run on the project's own control, `scenes/_cornell_diffuse.ftsl` with the centre
+sphere's material swapped (`scraps/corn_*.ftsl`), 512 spp, GPU, sphere ROI:
 
-| material | mode M | mode D | D / M |
-|---|---:|---:|---:|
-| `diffuse rgb 0.45 0.16 0.16` | 0.00208 | 0.00214 | **1.03** |
-| `glossy reflect 1.0 roughness 0.25` | 0.00209 | 0.00575 | **2.75** |
-| `glossy reflect rgb 1 1 1 roughness 0.25` | 0.00163 | 0.00567 | **3.48** |
+| sphere | mode D / mode M | mode R / mode M |
+|---|---:|---:|
+| diffuse (the untouched control) | 0.995 | 0.999 |
+| `glossy reflect 1.0 roughness 0.02` | 0.969 | 0.978 |
+| `glossy reflect 1.0 roughness 0.25` | **0.995** | **1.001** |
 
-The diffuse control agrees to 3 %, so this is not exposure or light handling: **mode M specifically
-loses most of a glossy lobe's energy** relative to BDPT. The same pattern shows on
-`scraps/gloss_probe.ftsl` (glossy 3.00x, a 4 % glossy-over-diffuse mix 1.17x, diffuse 1.13x), i.e.
-it scales with how much of the material is the glossy lobe. Untouched by the layered work -- the
-layered numbers simply inherit it -- and not investigated. Suspects: the density estimate at a
-glossy vertex, `-gnee`'s MIS weights, or the photon side depositing at glossy vertices differently
-from how the gather reads them.
+**The three modes agree to 0.5 % on the very material the open scene said was 2.7x off.** A mirror
+sphere in the same box also agrees (peak 4.00e13 mode M against 4.03e13 mode D), so a specular
+bounce does see the light -- another thing the open scene got wrong, where mirror read exactly 0 in
+BOTH modes and should have been the tell that the rig, not the renderer, was broken.
 
-**Second, smaller, and independent:** the same glossy material reads **22 % darker in mode M** when
-its white is written `reflect rgb 1 1 1` (Jakob-Hanika upsampled) than when it is written
-`reflect 1.0` (flat), while mode D sees only 1.3 % between them. A JH-upsampled white should be
-close to flat, so one of the two paths is mis-weighting the spectral shape; mode M's wavelength
-sampling is the obvious place to look. This is what made the layered coat (flat white by
-construction) look 29 % bright against an `rgb 1 1 1` glossy until the comparison was corrected.
+**The lesson, which cost an afternoon:** an unenclosed probe scene is not a measurement instrument
+for anything involving reflection. A white furnace was the right instinct and my first one was also
+wrong -- the camera sat outside the box, so a 1.0-albedo and a 0.5-albedo sphere produced
+byte-identical images, which the rig check caught only because it was run. Check that the rig can
+see the effect, in an enclosure, before believing any cross-mode number.
+
+### OPEN (2026-09-16): mode M renders a Jakob-Hanika `rgb 1 1 1` white ~12 % darker than a flat `1.0`, while mode D sees them as the same
+
+The surviving half of the retracted entry above, and it **does** reproduce on the Cornell control
+(`scraps/corn_rgbw.ftsl`, 512 spp, GPU, sphere ROI): a `glossy roughness 0.25` sphere written
+`reflect rgb 1 1 1` renders at **0.8735** of the same sphere written `reflect 1.0` in mode M, while
+mode D puts the two at **0.9927**. (The open probe scene said 0.78 / 0.987 -- same sign, inflated
+magnitude, which is the scene's fault.)
+
+An upsampled white should be flat 1.0 by construction, so a mode that renders it 12 % dark is
+mis-weighting the spectral shape somewhere the other modes do not: mode M's wavelength sampling in
+the photon pass (each photon carries one lambda and the reflectance is applied at deposit AND at
+gather) is the obvious place to look. Not investigated further. Practical note: it makes an
+authored `rgb 1 1 1` and a flat `1.0` different materials in mode M, which is surprising in a scene
+file. Worth checking whether it also affects non-white upsampled colours -- if the error scales
+with how far the spectrum departs from flat, every textured albedo in mode M carries some of it.
 
 ### OPEN (2026-09-16): `-direct-only` is silently ignored by mode D (and any non-backward mode)
 
