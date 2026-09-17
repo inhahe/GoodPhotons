@@ -259,7 +259,7 @@ root is on the skin); drag to move along the surface; a modifier to pull a point
 along the normal (tips hang in the air) or in the screen plane; Del; N for a new leaf curve; radius
 per point; undo. Save writes the hair file (curves + fur) and reload round-trips it exactly.
 
-**Phase 3 -- HIERARCHY:** select curves -> "group into a curve of curves" (a new node with them as
+**Phase 3 -- HIERARCHY -- BUILT 0.331.0 (live preview through `flattenCurveForTool`; `-groom-check` in the rig). Verified by driving the GUI: Ctrl-click two guides, G -> `curve_1 [L1]` with both as children; `+` on count four times -> four blended instances previewed; Ctrl+S -> `curve "curve_1" { count 4 curve "g_0_0" curve "g_0_1" }` appended, `-groom-check` PASS on all 71 curves:** select curves -> "group into a curve of curves" (a new node with them as
 children, next level up, next colour); node parameters: `count` / `density` / `density_at t rho`
 keyframes (drawn as ticks along the node's path), `closed`, `spline`; the node's PATH (through the
 children's roots) drawn in the node's colour; the blended instances previewed live as thin polylines

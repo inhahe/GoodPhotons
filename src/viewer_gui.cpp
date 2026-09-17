@@ -3964,7 +3964,9 @@ struct GroomState {
     bool addOnClick = true;                      // a click on the surface plots a point on the selected strand
     std::vector<groom::Model> undo;
     std::string status;
-    bool stale = false;                          // placed strands / fur shown are from before an edit
+    bool stale = false;                          // the fur shown is from before an edit (placed strands preview live)
+    groom::Preview preview;                      // every named node flattened through the loader's recursion, rebuilt with the lines
+    std::vector<int> multi;                      // the Ctrl-click selection (node ids), for grouping
     // a point being dragged
     bool   dragging = false, dragMoved = false;
     int    dragNode = -1, dragPt = -1;
@@ -3978,6 +3980,12 @@ static bool nodeVisible(const GroomState& g, int id) { auto it = g.nodeOn.find(i
 // A picked or dragged point is kept to the micron: hair needs no more, and the file stays readable.
 static Vec3 snapMicron(const Vec3& v) { return Vec3{ std::round(v.x * 1e6) / 1e6, std::round(v.y * 1e6) / 1e6, std::round(v.z * 1e6) / 1e6 }; }
 static Affine xfOf(const GroomState& g, int id) { auto it = g.xfOf.find(id); return it == g.xfOf.end() ? Affine::identity() : it->second; }
+static void assignXf(GroomState& g, groom::Node& n, const Affine& xf);
+static bool isMulti(const GroomState& g, int id) { return std::find(g.multi.begin(), g.multi.end(), id) != g.multi.end(); }
+static void toggleMulti(GroomState& g, int id) {
+    auto it = std::find(g.multi.begin(), g.multi.end(), id);
+    if (it == g.multi.end()) g.multi.push_back(id); else g.multi.erase(it);
+}
 
 template <class F> static void forEachEntryCurve(std::vector<groom::Entry>& list, F& f) {
     for (groom::Entry& e : list) { if (e.group) forEachEntryCurve(e.items, f); else f(e.curve); }
@@ -4071,27 +4079,42 @@ static void drawNodeLines(GroomState& g, groom::Node& n, int level, std::vector<
         } else {
             std::vector<Vec3> roots;
             for (const groom::Node& k : n.kids) { Vec3 r; if (groom::rootOf(g.model, k, r)) roots.push_back(xf.apply(r)); }
+            std::vector<Vec3> path;                       // the node's path, sampled 16 per segment
             if (roots.size() >= 2) {
                 const bool closed = n.closed();
                 const int nSeg = closed ? (int)roots.size() : (int)roots.size() - 1;
                 const int M = nSeg * 16;
                 const double alpha = n.alpha();
-                Vec3 prev = ftsl::catmullRomAt(roots, closed, 0.0, alpha);
-                for (int k = 1; k <= M; ++k) {
-                    const Vec3 cur = ftsl::catmullRomAt(roots, closed, nSeg * (double)k / M, alpha);
-                    addSegment(b, prev, cur); prev = cur;
-                }
+                path.reserve((size_t)M + 1);
+                for (int k = 0; k <= M; ++k) path.push_back(ftsl::catmullRomAt(roots, closed, nSeg * (double)k / M, alpha));
+                for (size_t k = 1; k < path.size(); ++k) addSegment(b, path[k - 1], path[k]);
             }
             if (g.showPoints) for (const Vec3& r : roots) addCross(b, r, cross * 1.6);
+            // `density_at` keys as ticks on the path at their arc-length fraction, sized by rho
+            const auto keys = groom::densityKeys(n);
+            if (!keys.empty() && path.size() >= 2) {
+                std::vector<double> cum(path.size(), 0.0);
+                for (size_t k = 1; k < path.size(); ++k) cum[k] = cum[k - 1] + length(path[k] - path[k - 1]);
+                double maxRho = 1e-300;
+                for (const auto& kv : keys) maxRho = std::max(maxRho, kv.second);
+                for (const auto& kv : keys) {
+                    const double s = std::min(std::max(kv.first, 0.0), 1.0) * cum.back();
+                    size_t k = 1;
+                    while (k + 1 < path.size() && cum[k] < s) ++k;
+                    const double seg = cum[k] - cum[k - 1], u = (seg > 1e-15) ? (s - cum[k - 1]) / seg : 0.0;
+                    const Vec3 p = path[k - 1] + (path[k] - path[k - 1]) * u;
+                    addCross(b, p, cross * (1.0 + 3.0 * std::max(kv.second, 0.0) / maxRho));
+                }
+            }
             if (n.placed() && !n.name.empty()) {
-                auto it = g.recByName.find(n.name);
-                if (it != g.recByName.end()) {
+                // the instances `count` / density place, from the live preview (the file's frame -> world)
+                auto it = g.preview.byName.find(n.name);
+                if (it != g.preview.byName.end()) {
                     LineBatch inst;
-                    const float f = g.stale ? 0.3f : 0.7f;
-                    for (int k = 0; k < 3; ++k) inst.rgba[k] = b.rgba[k] * f;
+                    for (int k = 0; k < 3; ++k) inst.rgba[k] = b.rgba[k] * 0.7f;
                     inst.rgba[3] = 1.0f;
-                    for (const ftsl::CurveStrand& s : it->second->strands)
-                        for (size_t k = 1; k < s.pts.size(); ++k) addSegment(inst, s.pts[k - 1], s.pts[k]);
+                    for (const ftsl::CurveStrand& s : it->second.strands)
+                        for (size_t k = 1; k < s.pts.size(); ++k) addSegment(inst, xf.apply(s.pts[k - 1]), xf.apply(s.pts[k]));
                     if (!inst.v.empty()) out.push_back(std::move(inst));
                 }
             }
@@ -4103,6 +4126,7 @@ static void drawNodeLines(GroomState& g, groom::Node& n, int level, std::vector<
 
 static void groomBuildLines(GroomState& g, std::vector<LineBatch>& out) {
     out.clear();
+    groom::buildPreview(g.model, g.preview);      // the placed instances, through the loader's own recursion
     const double cross = 0.006 * g.ext;
     if (g.showCurves)
         forEachTopCurve(g.model, [&](groom::Node& n) { drawNodeLines(g, n, groom::levelOf(g.model, n), out, cross); });
@@ -4143,7 +4167,7 @@ static void markEdited(GroomState& g, int nodeId) {
     groom::Where w = groom::whereIs(g.model, nodeId);
     if (w.file) w.file->dirty = true;
     g.lines.dirty = true;
-    if (!g.loaded.furInfos.empty() || !g.recByName.empty()) g.stale = true;
+    if (!g.loaded.furInfos.empty()) g.stale = true;
 }
 static bool isReferenced(groom::Model& m, const std::string& name) {
     if (name.empty()) return false;
@@ -4226,10 +4250,71 @@ static void deleteStrand(GroomState& g) {
     g.lines.dirty = true; g.stale = true;
     g.status = "deleted \"" + name + "\"";
 }
+// The Ctrl-click selection, validated for referencing by name: nodes at file (or group) level,
+// all in ONE file, so `curve "name"` resolves when that file loads.
+static bool multiAsNames(GroomState& g, groom::Where& where, std::vector<int>& unnamed) {
+    unnamed.clear();
+    where = groom::Where();
+    for (int id : g.multi) {
+        groom::Node* n = groom::findNode(g.model, id);
+        if (!n) continue;
+        groom::Where w = groom::whereIs(g.model, id);
+        if (!w.entry || w.entry->curve.id != id) { g.status = "\"" + n->name + "\" is nested inside another curve; only curves at file (or group) level can be referenced by name"; return false; }
+        if (!where.file) where = w;
+        else if (w.file != where.file) { g.status = "the selection spans two files (" + where.file->path + ", " + w.file->path + "); group within one"; return false; }
+        if (n->name.empty()) unnamed.push_back(id);
+    }
+    if (!where.file) { g.status = "Ctrl-click curves in the tree to select what to group"; return false; }
+    if (!where.file->writable) { g.status = where.file->path + " is not writable (" + where.file->why + ")"; return false; }
+    return true;
+}
+static void nameUnnamed(GroomState& g, const std::vector<int>& unnamed) {
+    for (int id : unnamed) { groom::Node* n = groom::findNode(g.model, id); if (n && n->name.empty()) n->name = groom::freshName(g.model, "curve"); }
+}
+static void groupMulti(GroomState& g) {
+    groom::Where w; std::vector<int> unnamed;
+    if (!multiAsNames(g, w, unnamed)) return;
+    pushUndo(g);
+    nameUnnamed(g, unnamed);
+    std::vector<std::string> names;
+    for (int id : g.multi) if (groom::Node* n = groom::findNode(g.model, id)) names.push_back(n->name);
+    const Affine xf = xfOf(g, g.multi.front());
+    groom::Node& grp = groom::newGroupOf(g.model, *w.file, w.container, groom::freshName(g.model, "curve"), names);
+    assignXf(g, grp, xf);
+    const int id = grp.id;
+    g.multi.clear();
+    select(g, id, -1);
+    markEdited(g, id);
+    g.status = "grouped " + std::to_string(names.size()) + " curve(s) into \"" + grp.name + "\" -- give it a count to place instances along its path";
+}
+static void addMultiAsChildren(GroomState& g, int parentId) {
+    groom::Where w; std::vector<int> unnamed;
+    if (!multiAsNames(g, w, unnamed)) return;
+    groom::Where pw = groom::whereIs(g.model, parentId);
+    if (pw.file != w.file) { g.status = "the selection is in another file than the parent"; return; }
+    pushUndo(g);
+    nameUnnamed(g, unnamed);
+    groom::Node* p = groom::findNode(g.model, parentId);
+    if (!p) return;
+    int added = 0;
+    for (int id : g.multi) {
+        groom::Node* n = groom::findNode(g.model, id);
+        if (!n || n == p) continue;
+        groom::Node r; r.id = g.model.nextId++; r.ref = true; r.name = n->name;
+        g.xfOf[r.id] = xfOf(g, parentId);
+        p->kids.push_back(std::move(r));
+        ++added;
+    }
+    if (pw.entry && pw.entry->curve.id == parentId) groom::moveEntryToEnd(g.model, parentId);   // after everything it references
+    g.multi.clear();
+    markEdited(g, parentId);
+    g.status = "added " + std::to_string(added) + " child(ren) to \"" + p->name + "\"";
+}
 static void undoLast(GroomState& g) {
     if (g.undo.empty()) { g.status = "nothing to undo"; return; }
     g.model = std::move(g.undo.back());
     g.undo.pop_back();
+    g.multi.clear();
     for (groom::FileModel& f : g.model.files) if (f.writable) f.dirty = true;   // the disk may hold a later save
     if (g.selNode >= 0 && !groom::findNode(g.model, g.selNode)) g.selNode = g.selPt = -1;
     g.lines.dirty = true;
@@ -4247,19 +4332,8 @@ static void groomSave(GroomState& g) {
 
 // ---- loading: the scene through the renderer's loader, the curve tree through the parser --------
 static bool groomParseModel(GroomState& g) {
-    std::ifstream f(g.scenePath);
-    if (!f) { g.status = "cannot open " + g.scenePath; return false; }
-    std::stringstream ss; ss << f.rdbuf();
-    std::vector<ftsl::Block> blocks;
-    std::string perr;
-    if (!ftsl_gpda::parse(ss.str(), blocks, perr)) { g.status = "parse: " + perr; return false; }
-    for (ftsl::Block& b : blocks) b.file = g.scenePath;
-    std::string dir;
-    { const std::filesystem::path p(g.scenePath); if (p.has_parent_path()) dir = p.parent_path().string(); }
-    assetbytes::ScopedSceneDir sd(dir);
-    std::vector<std::string> chain;
-    if (!ftsl::expandIncludes(blocks, g.scenePath, chain, perr)) { g.status = "include: " + perr; return false; }
-    g.model = groom::modelFromBlocks(blocks);
+    std::string err;
+    if (!groom::parseSceneModel(g.scenePath, g.model, err)) { g.status = err; return false; }
     return true;
 }
 static void assignXf(GroomState& g, groom::Node& n, const Affine& xf) { g.xfOf[n.id] = xf; for (groom::Node& k : n.kids) assignXf(g, k, xf); }
@@ -4279,6 +4353,7 @@ static bool groomLoadScene(GroomState& g) {
     g.loaded = ftsl::Loaded();
     g.meshes.clear(); g.recByName.clear(); g.xfOf.clear(); g.model = groom::Model(); g.undo.clear();
     g.selNode = g.selPt = g.hoverNode = g.hoverPt = -1;
+    g.multi.clear();
     g.stale = false; g.dragging = false;
     ftsl::keepShapeOnlyRef() = true;                      // the scalp must be drawable and pickable
     g.ok = ftsl::load(g.scenePath, g.loaded, g.err);
@@ -4585,14 +4660,79 @@ static void treeNode(GroomState& g, groom::Node& n, int depth) {
                   shown->name.empty() ? "(unnamed)" : shown->name.c_str(), level,
                   shown->count() > 0 ? "  count" : "", (shown->find("density") || shown->find("density_at")) ? "  density" : "",
                   shown->closed() ? "  closed" : "", shown->rendered() ? "" : "  (definition)", extra.c_str());
-    bool open = ImGui::TreeNodeEx("node", fl, "%s", label);
+    bool open = ImGui::TreeNodeEx("node", fl, "%s%s", isMulti(g, shown->id) ? "* " : "", label);
     ImGui::PopStyleColor();
-    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) select(g, (g.selNode == shown->id) ? -1 : shown->id, -1);
+    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+        if (ImGui::GetIO().KeyCtrl) toggleMulti(g, shown->id);
+        else select(g, (g.selNode == shown->id) ? -1 : shown->id, -1);
+    }
     if (open) {
         for (groom::Node& k : shown->kids) treeNode(g, k, depth + 1);
         ImGui::TreePop();
     }
     ImGui::PopID();
+}
+
+// A curve of curves' own parameters: what places instances along its path, and its children.
+static void drawNodeParams(GroomState& g, groom::Node& n) {
+    const float w5 = ImGui::GetFontSize() * 5.0f;
+    int count = n.count();
+    ImGui::SetNextItemWidth(w5);
+    if (ImGui::InputInt("count", &count)) {
+        if (count < 0) count = 0;
+        pushUndo(g);
+        if (count > 0) groom::setStmt(n, "count", { std::to_string(count) }); else groom::removeStmts(n, "count");
+        markEdited(g, n.id);
+    }
+    ImGui::SameLine();
+    bool cl = n.closed();
+    if (ImGui::Checkbox("closed", &cl)) { pushUndo(g); if (cl) groom::setStmt(n, "closed", {}); else groom::removeStmts(n, "closed"); markEdited(g, n.id); }
+    ImGui::SameLine();
+    const char* splines[] = { "uniform", "centripetal", "chordal" };
+    const std::string sw = groom::splineWord(n);
+    int si = (sw == "centripetal") ? 1 : (sw == "chordal") ? 2 : 0;
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8.0f);
+    if (ImGui::Combo("spline", &si, splines, 3)) { pushUndo(g); if (si == 0) groom::removeStmts(n, "spline"); else groom::setStmt(n, "spline", { splines[si] }); markEdited(g, n.id); }
+    double dens = groom::constDensity(n);
+    ImGui::SetNextItemWidth(w5);
+    if (ImGui::InputDouble("density (per m; 0 = none)", &dens, 0, 0, "%.4g")) {
+        pushUndo(g);
+        if (dens > 0.0) groom::setStmt(n, "density", { groom::fmtNum(dens) }); else groom::removeStmts(n, "density");
+        markEdited(g, n.id);
+    }
+    auto keys = groom::densityKeys(n);
+    bool kch = false;
+    ImGui::TextUnformatted("density_at keys (t along the path 0..1, strands per metre):");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+ key")) { keys.push_back({ keys.empty() ? 0.0 : std::min(1.0, keys.back().first + 0.25), 10.0 }); kch = true; }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ImGui::PushID((int)i);
+        ImGui::SetNextItemWidth(w5);
+        if (ImGui::InputDouble("t", &keys[i].first, 0, 0, "%.3g")) kch = true;
+        ImGui::SameLine(); ImGui::SetNextItemWidth(w5);
+        if (ImGui::InputDouble("rho", &keys[i].second, 0, 0, "%.4g")) kch = true;
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x")) { keys.erase(keys.begin() + (std::ptrdiff_t)i); kch = true; ImGui::PopID(); break; }
+        ImGui::PopID();
+    }
+    if (kch) { pushUndo(g); groom::setDensityKeys(n, keys); markEdited(g, n.id); }
+    ImGui::TextUnformatted("children (the path runs through their roots, in this order):");
+    for (size_t i = 0; i < n.kids.size(); ++i) {
+        ImGui::PushID(1000 + (int)i);
+        const groom::Node& k = n.kids[i];
+        ImGui::BulletText("%s%s", k.name.empty() ? "(inline)" : k.name.c_str(), k.ref ? "" : "  (inline)");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("up") && i > 0) { pushUndo(g); std::swap(n.kids[i], n.kids[i - 1]); markEdited(g, n.id); }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("down") && i + 1 < n.kids.size()) { pushUndo(g); std::swap(n.kids[i], n.kids[i + 1]); markEdited(g, n.id); }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("remove")) { pushUndo(g); n.kids.erase(n.kids.begin() + (std::ptrdiff_t)i); markEdited(g, n.id); ImGui::PopID(); break; }
+        ImGui::PopID();
+    }
+    if (!g.multi.empty()) {
+        char bl[80]; std::snprintf(bl, sizeof bl, "add the %zu Ctrl-selected as children", g.multi.size());
+        if (ImGui::Button(bl)) addMultiAsChildren(g, n.id);
+    }
 }
 
 static void drawEditSection(GroomState& g) {
@@ -4604,6 +4744,12 @@ static void drawEditSection(GroomState& g) {
     if (ImGui::Button("save (Ctrl+S)")) groomSave(g);
     ImGui::SameLine();
     if (ImGui::Button("reload")) { g.status = "reloading..."; groomLoadScene(g); if (g.ok) g.status = "reloaded"; }
+    if (!g.multi.empty()) {
+        char gl[96]; std::snprintf(gl, sizeof gl, "group the %zu Ctrl-selected into a curve of curves (G)", g.multi.size());
+        if (ImGui::Button(gl)) groupMulti(g);
+    } else {
+        ImGui::TextDisabled("Ctrl-click curves in the tree to select several; G groups them");
+    }
     ImGui::Checkbox("click plots", &g.addOnClick);
     ImGui::SameLine();
     ImGui::Checkbox("any mesh", &g.pickAny);
@@ -4646,9 +4792,11 @@ static void drawEditSection(GroomState& g) {
             }
             if (ImGui::Button("delete strand")) deleteStrand(g);
         } else {
-            ImGui::TextDisabled("a curve of curves: its path runs through its children's roots (editing its parameters is Phase 3)");
+            drawNodeParams(g, *n);
+            if (ImGui::Button("delete curve")) deleteStrand(g);
         }
     }
+    if (!g.preview.err.empty()) ImGui::TextColored(ImVec4(1, 0.6f, 0.4f, 1), "the loader would refuse this: %s", g.preview.err.c_str());
     if (!g.status.empty()) ImGui::TextWrapped("%s", g.status.c_str());
 }
 
@@ -4712,6 +4860,7 @@ static void groomHotkeys(GroomState& g) {
     if (io.WantTextInput) return;
     if (ImGui::IsKeyPressed(ImGuiKey_Delete)) deletePoint(g);
     if (ImGui::IsKeyPressed(ImGuiKey_N) && !io.KeyCtrl) newStrand(g);
+    if (ImGui::IsKeyPressed(ImGuiKey_G) && !io.KeyCtrl) groupMulti(g);
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) undoLast(g);
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) groomSave(g);
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) { if (g.selPt >= 0) select(g, g.selNode, -1); else select(g, -1, -1); }

@@ -15,13 +15,20 @@
 
 #include "ftsl.h"
 
+#include "assetbytes.h"
+
+#include <algorithm>
 #include <cctype>
 #include <charconv>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <map>
+#include <memory>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace groom {
@@ -459,6 +466,170 @@ inline bool saveModel(Model& m, std::string& err, std::vector<std::string>* writ
         if (written) written->push_back(fm.path);
     }
     return true;
+}
+
+// ---- editing a node's statements (Phase 3) ---------------------------------------------------
+inline void setStmt(Node& n, const std::string& key, const std::vector<std::string>& words) {
+    for (ftsl::Stmt& s : n.other) if (s.key == key) { s.val.words = words; return; }
+    ftsl::Stmt s; s.key = key; s.val.words = words;
+    n.other.push_back(std::move(s));
+}
+inline void removeStmts(Node& n, const std::string& key) {
+    n.other.erase(std::remove_if(n.other.begin(), n.other.end(), [&](const ftsl::Stmt& s) { return s.key == key; }), n.other.end());
+}
+inline std::vector<std::pair<double, double>> densityKeys(const Node& n) {   // (t, rho), as written
+    std::vector<std::pair<double, double>> out;
+    for (const ftsl::Stmt& s : n.other)
+        if (s.key == "density_at" && s.val.words.size() >= 2)
+            out.push_back({ std::atof(s.val.words[0].c_str()), std::atof(s.val.words[1].c_str()) });
+    return out;
+}
+inline void setDensityKeys(Node& n, const std::vector<std::pair<double, double>>& keys) {
+    removeStmts(n, "density_at");
+    for (const auto& k : keys) {
+        ftsl::Stmt s; s.key = "density_at"; s.val.words = { fmtNum(k.first), fmtNum(k.second) };
+        n.other.push_back(std::move(s));
+    }
+}
+inline double constDensity(const Node& n) {
+    const ftsl::Stmt* d = n.find("density");
+    return (d && !d->val.words.empty()) ? std::atof(d->val.words[0].c_str()) : 0.0;
+}
+inline std::string splineWord(const Node& n) {
+    const ftsl::Stmt* s = n.find("spline");
+    return (s && !s->val.words.empty()) ? s->val.words[0] : std::string("uniform");
+}
+// A new curve of curves referencing `childNames` in order, appended to the file (or group) so
+// every child is defined above it.
+inline Node& newGroupOf(Model& m, FileModel& fm, Entry* container, const std::string& name, const std::vector<std::string>& childNames) {
+    Node& n = newCurve(m, fm, container, name);
+    for (const std::string& c : childNames) { Node r; r.id = m.nextId++; r.ref = true; r.name = c; n.kids.push_back(std::move(r)); }
+    return n;
+}
+// Move the entry holding node `id` to the end of its list (so the names it references, all
+// above it, resolve at load).
+inline bool moveEntryToEnd(std::vector<Entry>& list, int id) {
+    for (size_t i = 0; i < list.size(); ++i) {
+        Entry& e = list[i];
+        if (e.group) { if (moveEntryToEnd(e.items, id)) return true; continue; }
+        if (e.curve.id == id) { std::rotate(list.begin() + (std::ptrdiff_t)i, list.begin() + (std::ptrdiff_t)i + 1, list.end()); return true; }
+    }
+    return false;
+}
+inline bool moveEntryToEnd(Model& m, int id) {
+    for (FileModel& f : m.files) if (moveEntryToEnd(f.entries, id)) { f.dirty = true; return true; }
+    return false;
+}
+// The index of the entry holding node `id` within its list, or -1 (nested nodes have none).
+inline int entryIndexOf(const std::vector<Entry>& list, int id) {
+    for (size_t i = 0; i < list.size(); ++i) if (!list[i].group && list[i].curve.id == id) return (int)i;
+    return -1;
+}
+
+// ---- the model -> blocks, and the live preview through the loader's own recursion ---------------
+inline ftsl::Stmt stmtFromPt(const Pt& p) {
+    ftsl::Stmt s; s.key = "point";
+    if (!p.edited && !p.raw.empty()) s.val.words = p.raw;
+    else {
+        s.val.words = { fmtNum(p.p.x), fmtNum(p.p.y), fmtNum(p.p.z) };
+        if (p.haveR) s.val.words.push_back("r=" + fmtNum(p.r));
+        for (const std::string& w : p.extra) s.val.words.push_back(w);
+    }
+    return s;
+}
+inline ftsl::Block blockFromNode(const Node& n) {
+    ftsl::Block b; b.type = "curve"; b.name = n.name;
+    for (const ftsl::Stmt& s : n.other) b.stmts.push_back(s);
+    for (const Pt& p : n.pts) b.stmts.push_back(stmtFromPt(p));
+    for (const Node& k : n.kids) {
+        ftsl::Stmt s; s.key = "curve";
+        if (k.ref) s.val.words = { k.name };
+        else s.val.block = std::make_shared<ftsl::Block>(blockFromNode(k));
+        b.stmts.push_back(std::move(s));
+    }
+    return b;
+}
+template <class F> inline void forEachEntryCurveC(const std::vector<Entry>& list, F& f) {
+    for (const Entry& e : list) { if (e.group) forEachEntryCurveC(e.items, f); else f(e.curve); }
+}
+// Every top-level curve of the model flattened through ftsl::Builder::flattenCurveForTool, in
+// model order (so a reference finds its definition), keyed by node name: what each named node
+// makes (its strands, its child roots) in the file's own coordinates. `err` names the first node
+// the loader would refuse.
+struct Preview { std::map<std::string, ftsl::Loaded::HairCurveInfo> byName; std::string err; };
+inline void buildPreview(const Model& m, Preview& out) {
+    out.byName.clear();
+    out.err.clear();
+    ftsl::Builder bld;
+    auto one = [&](const Node& n) {
+        if (n.pts.empty() && n.kids.empty()) return;            // an empty strand: not written either
+        const ftsl::Block b = blockFromNode(n);
+        std::vector<ftsl::Loaded::HairCurveInfo> recs;
+        std::vector<ftsl::CurveStrand> strands;
+        std::string why;
+        if (!bld.flattenCurveForTool(b, recs, strands, why)) {
+            if (out.err.empty()) out.err = (n.name.empty() ? std::string("(unnamed curve)") : n.name) + ": " + why;
+            return;
+        }
+        for (auto& r : recs) out.byName[r.name] = std::move(r);
+    };
+    for (const FileModel& f : m.files) forEachEntryCurveC(f.entries, one);
+}
+
+// The scene's curve blocks as written: parse the file, tag, expand its includes (each block
+// keeps the file it came from), and model them.
+inline bool parseSceneModel(const std::string& scenePath, Model& m, std::string& err) {
+    std::ifstream f(scenePath);
+    if (!f) { err = "cannot open " + scenePath; return false; }
+    std::stringstream ss; ss << f.rdbuf();
+    std::vector<ftsl::Block> blocks;
+    if (!ftsl_gpda::parse(ss.str(), blocks, err)) return false;
+    for (ftsl::Block& b : blocks) b.file = scenePath;
+    std::string dir;
+    { const std::filesystem::path p(scenePath); if (p.has_parent_path()) dir = p.parent_path().string(); }
+    assetbytes::ScopedSceneDir sd(dir);
+    std::vector<std::string> chain;
+    if (!ftsl::expandIncludes(blocks, scenePath, chain, err)) return false;
+    m = modelFromBlocks(blocks);
+    return true;
+}
+
+// `ftrace -in <scene> -groom-check`: the tool's preview of every named curve against what the
+// loader just built for the same scene (its records, world space, brought back to the file's
+// frame through the inverse of the transform it applied). The two run the same recursion on
+// the same tokens, so they must agree to rounding.
+inline bool checkPreviewAgainstLoaded(const ftsl::Loaded& L, const std::string& scenePath, std::string& report) {
+    Model m;
+    std::string err;
+    if (!parseSceneModel(scenePath, m, err)) { report = "model: " + err; return false; }
+    Preview pv;
+    buildPreview(m, pv);
+    if (!pv.err.empty()) { report = "preview: " + pv.err; return false; }
+    int checked = 0, missing = 0, bad = 0;
+    double worst = 0.0;
+    for (const auto& rec : L.hairCurves) {
+        auto it = pv.byName.find(rec.name);
+        if (it == pv.byName.end()) { ++missing; continue; }
+        const Affine inv = rec.xf.inverse();
+        const auto& a = it->second.strands;
+        const auto& b = rec.strands;
+        bool ok = (a.size() == b.size());
+        for (size_t i = 0; ok && i < a.size(); ++i) {
+            ok = (a[i].pts.size() == b[i].pts.size());
+            for (size_t k = 0; ok && k < a[i].pts.size(); ++k) {
+                const Vec3 q = inv.apply(b[i].pts[k]);
+                const double d = length(q - a[i].pts[k]);
+                worst = std::max(worst, d);
+                if (d > 1e-7 * (1.0 + length(a[i].pts[k]))) ok = false;
+            }
+        }
+        ++checked;
+        if (!ok) ++bad;
+    }
+    char buf[256];
+    std::snprintf(buf, sizeof buf, "%d named curve(s) compared, %d differ, %d not in the model, worst point distance %.3g m", checked, bad, missing, worst);
+    report = buf;
+    return bad == 0 && missing == 0 && checked > 0;
 }
 
 // ---- the headless round trip: `ftrace -groom-rewrite <in> <out>` -----------------------------

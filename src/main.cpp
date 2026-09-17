@@ -12696,6 +12696,10 @@ static std::string g_pmapSave;
 // for grooms and the exact oracle for tools/curve_rig.py -- with `basis linear` and
 // `segments 1` the polyline IS the control polygon.
 static std::string g_dumpCurves;
+// -groom-check: after the scene loads, the groom tool's preview of every named curve (its model
+// flattened through the loader's own recursion) is compared with the loader's records, and the
+// process exits 0 on agreement. tools/groom_rig.py runs it.
+static bool g_groomCheck = false;
 static std::string g_pmapLoad;
 
 // SPPM (mode S) radius-shrink rate alpha (Hachisuka 2008; CLI -sppmalpha). Smaller =
@@ -18115,6 +18119,7 @@ static void printHelp(const char* prog) {
 "  -dumpcurves <f>       after the scene loads, write every strand's polyline (x y z r per point) to <f> and exit\n"
 "  -groom <scene.ftsl>   the hair-authoring tool: the scene's meshes, its curve hierarchy level-coloured, its fur on demand\n"
 "  -groom-rewrite <in> <out>  rewrite a scene file through the groom tool's curve model (its round-trip check) and exit\n"
+"  -groom-check          after the scene loads, compare the groom tool's preview of every named curve with the loader's strands and exit\n"
 "  -time <sec>           wall-clock budget (progressive)\n"
 "  -noise <pct>          stop at target graininess (progressive)\n"
 "  -forever              trace until Ctrl-C (progressive)\n"
@@ -18790,6 +18795,7 @@ static int run(int argc, char** argv) {
         // -dumpcurves has to be known before the load for the same reason: it acts the
         // moment the scene exists, before any render path is chosen.
         if (!std::strcmp(argv[i], "-dumpcurves") && i + 1 < argc) g_dumpCurves = argv[i + 1];
+        if (!std::strcmp(argv[i], "-groom-check")) g_groomCheck = true;
         // -groom-rewrite <in> <out>: the groom model's headless round trip; no scene is loaded.
         if (!std::strcmp(argv[i], "-groom-rewrite") && i + 2 < argc) {
             std::string gerr;
@@ -18968,6 +18974,12 @@ static int run(int argc, char** argv) {
             else
                 std::fprintf(stderr, "[ftsl] %s\n", ferr.c_str());
             return 1;
+        }
+        if (g_groomCheck) {
+            std::string report;
+            const bool ok = groom::checkPreviewAgainstLoaded(ftslScene, inFile, report);
+            std::fprintf(stderr, "[groom-check] %s: %s\n", ok ? "PASS" : "FAIL", report.c_str());
+            return ok ? 0 : 1;
         }
         if (!g_dumpCurves.empty()) {
             std::FILE* df = std::fopen(g_dumpCurves.c_str(), "wb");
@@ -19290,6 +19302,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-pmfg") && i + 1 < argc) { g_pmFinalGather = std::atoi(argv[++i]); if (g_pmFinalGather < 0) g_pmFinalGather = 0; }
         else if (!std::strcmp(argv[i], "-savemap") && i + 1 < argc) g_pmapSave = argv[++i];
         else if (!std::strcmp(argv[i], "-dumpcurves") && i + 1 < argc) g_dumpCurves = argv[++i];
+        else if (!std::strcmp(argv[i], "-groom-check")) g_groomCheck = true;
         else if (!std::strcmp(argv[i], "-loadmap") && i + 1 < argc) g_pmapLoad = argv[++i];
         else if (!std::strcmp(argv[i], "-sppmalpha") && i + 1 < argc) g_sppmAlpha = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-vcmalpha") && i + 1 < argc) g_vcmAlpha = std::atof(argv[++i]);

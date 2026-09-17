@@ -12,6 +12,10 @@ produce the SAME strands, exactly.
   3. ALICE     -- (--alice) scenes/alice_guides.ftsl rewritten and included in place of the
                   original under scenes/alice_hair.ftsl: the 64 guides and the 13 280 fur strands
                   dump byte-identically (loads the doll twice, ~30 s).
+  4. PREVIEW   -- `ftrace -in <scene> -groom-check`: the tool's live preview (its model flattened
+                  through ftsl::Builder::flattenCurveForTool, what the GUI draws while editing)
+                  agrees with the loader's own records for every named curve, per scene and for
+                  Alice.
 
 Cited by REFERENCE.md ("The groom tool") and design.md.
 """
@@ -113,6 +117,11 @@ def main():
         check(name, same, "%d strand(s); dump %s" % (d0.count("strand"), "identical" if same else "DIFFERS"))
         text2 = rewrite(dst, os.path.join(OUT, name + "_rt2.ftsl"))
         check(name + "/idem", text1 == text2, "rewrite of the rewrite is the same text")
+        # 4. PREVIEW -- the tool's in-memory flatten (what the GUI draws while editing) agrees
+        #    with the loader's records for the same scene
+        r = run(["-in", src, "-groom-check"])
+        line = [l for l in (r.stdout + r.stderr).splitlines() if "[groom-check]" in l]
+        check(name + "/prev", r.returncode == 0 and bool(line) and "PASS" in line[0], line[0].split("] ", 1)[1] if line else "no report")
 
     if args.alice:
         # the guides rewritten, and alice_hair.ftsl copied beside them so its `include` finds the rewrite
@@ -123,6 +132,9 @@ def main():
         b = w(os.path.join(OUT, "alice_rt.ftsl"), harness % "alice_hair.ftsl")
         da, db = dump(a), dump(b)
         check("alice", da == db and da.count("strand") > 13000, "%d strand(s) dump %s" % (da.count("strand"), "identical" if da == db else "DIFFERS"))
+        r = run(["-in", a, "-groom-check"])
+        line = [l for l in (r.stdout + r.stderr).splitlines() if "[groom-check]" in l]
+        check("alice/prev", r.returncode == 0 and bool(line) and "PASS" in line[0], line[0].split("] ", 1)[1] if line else "no report")
 
     print("\n-> groom rig %s" % ("PASSED" if ok else "FAILED"))
     if not args.keep and ok:

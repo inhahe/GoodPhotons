@@ -3,7 +3,8 @@
 # rects are logical while the screen is captured in physical pixels (the rect is scaled by the
 # window DPI). How the groom tool is exercised without a hand on the mouse (design.md, 0.330.0):
 #   pwsh -NoProfile -File tools/gui_drive.ps1 -ProcId <pid> -Actions "restore;key:n;click:0.69,0.35;shot:png/x.png;min"
-# actions: restore | min | key:<SendKeys text, e.g. n or ^s> | click:fx,fy | drag:fx0,fy0,fx1,fy1 | move:fx,fy | shot:<png path> | wait:<ms>
+# actions: restore | min | key:<SendKeys text, e.g. n or ^s> | keydown:<vk> | keyup:<vk> (17 = Ctrl, 16 = Shift, 18 = Alt)
+#          | click:fx,fy | drag:fx0,fy0,fx1,fy1 | move:fx,fy | shot:<png path> | wait:<ms>
 param([int]$ProcId, [string]$Actions = "restore")
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
@@ -17,6 +18,7 @@ public class GD {
   [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
   [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint data, UIntPtr extra);
+  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
 }
 '@
@@ -40,6 +42,8 @@ foreach ($a in $Actions.Split(";")) {
         "restore" { [GD]::ShowWindow($h, 9) | Out-Null; [GD]::SetForegroundWindow($h) | Out-Null; Start-Sleep -Milliseconds 1200; "restored" }
         "min"     { [GD]::ShowWindow($h, 6) | Out-Null; "minimized" }
         "wait"    { Start-Sleep -Milliseconds ([int]$arg) }
+        "keydown" { [GD]::keybd_event([byte][int]$arg, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 100; "keydown $arg" }
+        "keyup"   { [GD]::keybd_event([byte][int]$arg, 0, 2, [UIntPtr]::Zero); Start-Sleep -Milliseconds 100; "keyup $arg" }
         "key"     { [System.Windows.Forms.SendKeys]::SendWait($arg); Start-Sleep -Milliseconds 400; "key $arg" }
         "move"    { $f = $arg.Split(","); MoveTo ([double]$f[0]) ([double]$f[1]); "moved $arg" }
         "click"   { $f = $arg.Split(","); MoveTo ([double]$f[0]) ([double]$f[1]); Start-Sleep -Milliseconds 150

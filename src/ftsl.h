@@ -931,6 +931,25 @@ public:
         return assets ? assets->get(file) : nullptr;
     }
 
+    // The groom tool's live preview (0.331.0): flatten one top-level `curve` block through the
+    // same recursion a load runs -- named nodes register for later references exactly as they
+    // do in a load, so blocks handed over in scene order resolve their `curve "name"` children
+    // -- and hand back the records the tool draws from (every named node's strands and child
+    // roots, in the block's own coordinates) plus the block's flattened strands. No material,
+    // transform or Loaded is involved; lengths are metres (a `scene { units }` other than
+    // metres is not applied here).
+    bool flattenCurveForTool(const Block& b, std::vector<Loaded::HairCurveInfo>& recs,
+                             std::vector<CurveStrand>& strands, std::string& why) {
+        err.clear();
+        hairRecs_.clear();
+        strands.clear();
+        const bool ok = flattenCurveNode(b, CurveNodeParams{}, strands, 0);
+        recs = std::move(hairRecs_);
+        hairRecs_.clear();
+        why = err;
+        return ok;
+    }
+
     bool build(std::vector<Block>& blocks, Loaded& L) {
         records_ = &L.scene.records;   // stable handle for record refs at value sites (records added in Pass 1d)
         loadedRef_ = &L;               // ditto for §3.2 material-property refs (which may apply a material)

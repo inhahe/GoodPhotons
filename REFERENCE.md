@@ -4640,9 +4640,25 @@ and the fur are from before the edit and are drawn dimmed ("stale"). `ftrace -gr
 <out>` is the same writer headless: `tools/groom_rig.py` rewrites nine curve scenes and Alice's
 guides and checks `-dumpcurves` is byte-identical each time.
 
+**Hierarchy (0.331.0).** **Ctrl-click** curves in the tree to select several (they show a `*`),
+then **G** (or the button) groups them into a new curve of curves that references them by name
+(`curve "curve_N" { curve "a"  curve "b" ... }`, appended to the file so every child is defined
+above it), one level up, the next colour. With a curve of curves selected, the Edit section
+edits what places instances along its path: `count`, `closed`, `spline`
+(uniform / centripetal / chordal), a constant `density` (strands per metre) and `density_at t rho`
+keys (each key is drawn as a tick on the path at its arc-length fraction, sized by its rho); the
+children are listed in path order with up / down / remove, and the Ctrl-selection can be added as
+children (the parent is then moved after them). The instances a `count` or density places are
+previewed live as thinner polylines in the node's colour -- flattened through the loader's own
+recursion (`ftsl::Builder::flattenCurveForTool`), so what you see is what a load builds; if a
+change is something the loader would refuse (a child not defined above its parent, children with
+different strand counts under a `count`), the Edit section says so in the loader's words. Any
+depth works the same way: a curve of rings of guides is three colours and three levels of `count`.
+`ftrace -in <scene> -groom-check` compares that preview with the loader's records for every named
+curve of a scene (`tools/groom_rig.py` runs it per scene and for Alice).
+
 It is a long-lived ftrace process, so `ftrace -stop <pid>` closes it like a viewer. TODO.md 0.6
-has the remaining phases (grouping into curves of curves with a live preview of `count`, the fur
-panel, an in-tool render).
+has the remaining phase (the fur panel, bald zones, an in-tool render).
 
 ### Including files (`include "file.ftsl"`)
 
@@ -5459,6 +5475,7 @@ survive exactly.
 | `-dumpcurves <f>` | After the scene loads, write every strand — hand-written `curve`s, curves of curves, and every `fur` hair — as a polyline to `<f>` (`strand N mat M name "…" points K`, then one `x y z r` line per point) and **exit without rendering**. The debugging tool for a groom, and the exact oracle for `tools/curve_rig.py`: with `basis linear  segments 1` the polyline *is* the control polygon (0.326.0) |
 | `-groom <scene.ftsl>` | **The hair-authoring tool** (0.329.0, Phase 1: view). Opens the viewer shell on a plain scene and shows, in one orbitable pane, the scene's meshes (solid / wireframe; shape-only scalps are kept, not stripped), every named `curve` in **its level's colour** -- red strands, green curves of strands, blue curves of those, then yellow, magenta, cyan -- with control points as crosses; a group node (no `count` / density) draws its PATH through its children's roots; and, on a toggle because they hide the curves, the strands every `fur` block generated plus their roots. A tree panel lists the hierarchy with each node's `count` / density / `closed`; click a node to highlight it, untick it or its level to hide it. Authoring is the next phases (TODO.md 0.6) |
 | `-groom-rewrite <in> <out>` | Rewrite one scene file through the groom tool's curve model and exit (0.330.0): curve and group blocks through the model (untouched points verbatim), everything else through the general block writer. The round-trip check `tools/groom_rig.py` runs: `-dumpcurves` of the rewrite must match the original byte for byte |
+| `-groom-check` | After the scene loads, compare the groom tool's live preview (its model of every `curve` block flattened through `flattenCurveForTool`) with the loader's own records for every named curve, print `[groom-check] PASS/FAIL ...` and exit 0/1 (0.331.0) |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
 | `-heroc <N>` | Hero-wavelength bundle size on the spectral tracers — **CPU** modes `A`/`B`/`C`, `R`, photon-map `M`/`S`, BDPT `D` and VCM `U`, plus the **GPU megakernel** (forward `A`/`B`/`C`, the `M` deposit, backward `R`, BDPT `D`, and VCM `U`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count for free. In BDPT both subpaths carry the bundle and each connection is evaluated per-λ under one shared MIS weight — on **both** backends, which agree to 0.03%. VCM (`U`) does the same on **both** backends: one bundle per path index feeds both its light and camera subpath, so its *connections* are exact per-λ while its *merges* key off each stored light vertex's own wavelengths — **0.51× noise RMS** at equal passes on a gel + mirror box (CPU), **0.72–0.82× chroma noise** for 1.5–1.7× the time on the GPU, matching the single-λ estimator to 0.02 % and each other to 0.03 %. In modes `R` and `A`/`B`/`C` (and the `M`/`S` deposit) the bundle also rides through mirrors/gels/glossy lobes and every Russian roulette survives on the strongest live λ (no per-λ ratio amplification), worth ~0.42–0.52× noise RMS on coloured interiors in `R` and ~1.1× luma / 1.3–1.8× chroma at equal time in the forward modes. Default `4`; clamped to `1..8`. **Mode `W` defaults to `8` instead** — at 1 spp the bundle *is* the spectral quadrature, and it is nearly free there (measured 2.7 % of frame time versus a single wavelength, because mode `W` is traversal-bound; the same step costs 61 % in mode `R`). `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator) — fine in the sampled modes, but in mode `W` it renders dispersive surfaces flatly **wrong** rather than merely noisy, and a batch mode-`W` render now warns and names the offending material. Ignored (still single-λ) by the GPU **wavefront** backend (`-wavefront`) and by any scene with participating media, a GRIN volume, or a finite-lens camera |
