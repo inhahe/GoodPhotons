@@ -197,12 +197,23 @@ green grid light through the mass, and rare strand-to-strand paths make fireflie
      24 spp, 960x540; ROI = her hair, x 852..879 y 281..307). Over the GRID: strands mean RGB
      (63, 72, 46), hue 79 deg, vs the molded base (95, 76, 60), hue 27 deg -- olive and a third
      darker. Over GREY: strands (111, 113, 88), hue 64 deg, vs base (115, 108, 91), hue 43 deg --
-     the same brightness, a 21 deg residual toward yellow-green. So ~60% of the hue gap and ALL
-     of the darkness is the grid's low green light forward-scattered through the mass (the
-     molded surface reflects it as orange); the residual 21 deg is the fiber material (its
-     transmission is greener than its reflection) and is what a `reflect` / absorption tweak on a
-     fiber ball under neutral light would calibrate (B). The coloured speckle that remains over
-     grey is mode M's few-photon gather at fibers (C), not the material.
+     the same brightness, a 21 deg residual toward yellow-green.
+     **RETRACTED the same day -- this comparison was confounded and its conclusion was wrong.**
+     Every WITH-strands frame ran mode M on the CPU and every WITHOUT frame on the GPU (a hair
+     scene was refused the GPU photon map until 0.335.0), and the two devices disagree on the
+     molded base by as much as the effect being measured (known-issues, "Mode M renders Alice ...
+     far from mode D"). So "the grid's green light" was credited with a gap that was mostly
+     DEVICE, and the darkness was not the floor at all: it was the starved photon map (2 M over a
+     45 m hall) plus the fibers' own direct light, which the walk never took (HAIR-NEE, 0.334.0).
+     What the grey test does still show, device held fixed, is a real residual hue difference
+     between strands and base -- ~11 deg -- which is the fiber material and belongs to B.
+     The lesson is the file's own header: hold the confound fixed BY CONSTRUCTION. Swapping an
+     EMISSIVE floor for a bright diffuse one also changes two things at once (removes a green
+     source, adds a neutral bounce card); a black non-emissive floor would have been the clean
+     single-variable test. The grey-floor scenes (`scraps/_a1/grey_*.ftsl`, frames
+     `png/alicehair/a1_grey_*.png`) are kept only as that diagnostic -- their off-white ground is
+     the substitution, not a render of the gallery; every frame of the REAL scene
+     (`a3_grid_*`, `gallery_still_*`, `png/flyframes/*`) has the green grid.
   2. Fireflies: Russian roulette after N strand-to-strand bounces (continue with probability p,
      weight 1/p). UNBIASED, so no darkening; expected cost falls; variance rises. A hard cap is
      NOT acceptable: light hair IS multiple scattering, and a cap darkens the body of the mass
