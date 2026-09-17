@@ -1886,6 +1886,15 @@ importance-sampled, energy-conserving form used here:
 | **TRT** (p=2) | in, one internal bounce, out the same side | the **secondary** highlight: offset from R, and much more saturated (two crossings) |
 | residual | p ≥ 3, folded into one term | makes the lobe weights sum to exactly 1, so a non-absorbing fiber passes a white furnace test |
 
+**In mode M.** A camera walk through a hair mass scatters strand to strand (up to the bounce
+limit) before it reaches a diffuse surface and gathers there; since 0.333.0 the fiber's
+wavelength-dependent transmission along that walk is carried as a spectrum (SPECGATHER), so the
+hair's multiple-scatter colour is right rather than a flat average. What remains at 24 spp is a
+coloured speckle from the walk's path variance (a blonde mass transmits red far more than blue,
+so a pixel's colour is a few effective spectral samples) -- use `-denoise -fireflies 3`, which
+removes it for ~1 % of the render time with the mean colour untouched (measured on Alice at flyby
+scale: chroma speckle 8.7 -> 1.3 against a 0.9 floor). Fibers are not gathered on directly.
+
 Parameters:
 
 | Key | Default | Meaning |

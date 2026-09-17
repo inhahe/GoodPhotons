@@ -236,6 +236,14 @@ first); the aggregate-medium tier is backward-only today and would need a mode-M
   is steep across wavelength, so a pixel's colour at 24 spp is a few effective spectral samples.
   Levers that address THAT: spp, and the chroma denoiser (`-denoise`, made for single-lambda
   speckle) with `-fireflies k` for the isolated dots. Both being measured on the grey still.
+  **DENOISE: yes.** `-denoise -fireflies 3` at the same 24 spp: chroma-speckle 8.74 -> 1.34
+  (the base's own denoised floor is 0.90), luma high-frequency 13.7 -> 10.3 (base 9.9 -> 8.0),
+  the mean colour untouched (hue 54.7 vs 53.5) -- for ~1 % of the render time. THIS is C's
+  answer for the flyby: the map once, 24 spp, the chroma filter. **96 spp without it**: 6.08
+  (from 8.74 -- 1.4x for 4x the cost; pure variance would have given 2x, so part of the speckle
+  is systematic per pixel and only the filter reaches the floor). Next: A.3, the with/without
+  pair over the real grid floor with the fold and the filter -- the aggregate must match the
+  molded base to within the frame noise before an LOD switch can be invisible.
   **The fold's cost, paired** (harness, hair fills the 960x540 frame, 8 spp, ON/OFF twice,
   first run discarded): camera pass 6.7 s with the fold vs 5.6-5.9 s without, ~+15 % on hair
   pixels; at flyby scale hair is a few % of the frame, so the fold is free there.
