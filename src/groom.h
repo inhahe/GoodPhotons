@@ -162,14 +162,19 @@ struct Node {
     }
 };
 
-// A top-level block of a file: a curve, or a group of them (the group's own statements kept).
+// A top-level block of a file: a curve, a group of them (the group's own statements kept), or a
+// `fur` block -- kept whole and edited statement by statement; in a file the tool does not
+// rewrite it is patched into its own text span on save (Phase 4).
 struct Entry {
     int  id = 0;
     bool group = false;
-    std::string name;                   // the group's name
+    bool fur = false;
+    std::string name;                   // the group's or fur block's name
     std::vector<ftsl::Stmt> other;      // the group's statements: translate / rotate / scale ...
     std::vector<Entry> items;           // the group's members
-    Node curve;                         // when !group
+    Node curve;                         // when neither group nor fur
+    ftsl::Block furBlock;               // when fur
+    bool furDirty = false;              // edited since the last save
 };
 
 struct FileModel {
@@ -240,6 +245,9 @@ inline void groupFromBlock(const ftsl::Block& g, Model& m, FileModel& fm, Entry&
             Entry sub; sub.id = m.nextId++;
             groupFromBlock(*s.val.block, m, fm, sub);
             e.items.push_back(std::move(sub));
+        } else if (s.key == "fur" && s.val.block) {
+            Entry f; f.id = m.nextId++; f.fur = true; f.furBlock = *s.val.block; f.furBlock.type = "fur"; f.name = f.furBlock.name;
+            e.items.push_back(std::move(f));
         } else if (s.val.block) {
             fm.writable = false;
             if (fm.why.empty()) fm.why = "group \"" + g.name + "\" has a `" + s.key + "` block";
@@ -279,6 +287,9 @@ inline Model modelFromBlocks(const std::vector<ftsl::Block>& blocks) {
             Entry e; e.id = m.nextId++;
             groupFromBlock(b, m, *fm, e);
             fm->entries.push_back(std::move(e));
+        } else if (b.type == "fur") {
+            Entry e; e.id = m.nextId++; e.fur = true; e.furBlock = b; e.name = b.name;
+            fm->entries.push_back(std::move(e));
         } else {
             fm->writable = false;
             if (fm->why.empty()) fm->why = "has a `" + b.type + "` block";
@@ -295,6 +306,7 @@ inline Node* findNodeIn(Node& n, int id) {
     return nullptr;
 }
 inline Node* findNodeIn(Entry& e, int id) {
+    if (e.fur) return nullptr;
     if (!e.group) return findNodeIn(e.curve, id);
     for (Entry& it : e.items) if (Node* r = findNodeIn(it, id)) return r;
     return nullptr;
@@ -309,6 +321,7 @@ inline Node* findDefIn(Node& n, const std::string& name) {
     return nullptr;
 }
 inline Node* findDefIn(Entry& e, const std::string& name) {
+    if (e.fur) return nullptr;
     if (!e.group) return findDefIn(e.curve, name);
     for (Entry& it : e.items) if (Node* r = findDefIn(it, name)) return r;
     return nullptr;
@@ -323,6 +336,7 @@ inline Node* findDef(Model& m, const std::string& name) {
 // entry (null at file level).
 struct Where { FileModel* file = nullptr; Entry* entry = nullptr; Entry* container = nullptr; };
 inline bool whereIn(Entry& e, Entry* container, int id, Where& w) {
+    if (e.fur) return false;
     if (!e.group) { if (findNodeIn(e.curve, id)) { w.entry = &e; w.container = container; return true; } return false; }
     for (Entry& it : e.items) if (whereIn(it, &e, id, w)) return true;
     return false;
@@ -354,6 +368,7 @@ inline bool rootOf(Model& m, const Node& n, Vec3& out, int depth = 0) {
 }
 inline void collectNodes(Node& n, std::vector<Node*>& out) { out.push_back(&n); for (Node& k : n.kids) collectNodes(k, out); }
 inline void collectNodes(Entry& e, std::vector<Node*>& out) {
+    if (e.fur) return;
     if (!e.group) { collectNodes(e.curve, out); return; }
     for (Entry& it : e.items) collectNodes(it, out);
 }
@@ -381,6 +396,7 @@ inline bool eraseNodeIn(Node& parent, int id) {
 inline bool eraseNodeIn(std::vector<Entry>& list, int id) {
     for (size_t i = 0; i < list.size(); ++i) {
         Entry& e = list[i];
+        if (e.fur) continue;
         if (e.group) { if (eraseNodeIn(e.items, id)) return true; continue; }
         if (e.curve.id == id) { list.erase(list.begin() + (std::ptrdiff_t)i); return true; }
         if (eraseNodeIn(e.curve, id)) return true;
@@ -426,6 +442,7 @@ inline bool writeNode(std::string& out, const Node& n, int indent, std::string& 
     return true;
 }
 inline bool writeEntry(std::string& out, const Entry& e, int indent, std::string& err) {
+    if (e.fur) return writeBlock(out, e.furBlock, indent, err);
     if (!e.group) return writeNode(out, e.curve, indent, err);
     const std::string pad((size_t)indent * 4, ' ');
     out += pad + "group";
@@ -448,7 +465,81 @@ inline bool fileText(const FileModel& fm, std::string& out, std::string& err) {
     }
     return true;
 }
-// Every dirty file, whole. Nothing is written unless every dirty file is writable.
+// Replace one `type "name" { ... }` block's text in a file, leaving everything else -- the
+// comments around it included -- byte for byte. Braces inside strings and after `#` do not
+// count; the block keeps the indentation of its header line.
+inline bool patchBlockInFile(const std::string& path, const std::string& type, const std::string& name,
+                             const std::string& text, std::string& err) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { err = "cannot open " + path; return false; }
+    std::stringstream ss; ss << f.rdbuf();
+    std::string s = ss.str();
+    const std::string quoted = "\"" + name + "\"";
+    size_t pos = 0, lineStart = std::string::npos, afterName = 0;
+    while (pos < s.size()) {
+        size_t le = s.find('\n', pos);
+        if (le == std::string::npos) le = s.size();
+        size_t i = pos;
+        while (i < le && (s[i] == ' ' || s[i] == '\t')) ++i;
+        if (s.compare(i, type.size(), type) == 0) {
+            size_t j = i + type.size();
+            if (j < le && (s[j] == ' ' || s[j] == '\t')) {
+                while (j < le && (s[j] == ' ' || s[j] == '\t')) ++j;
+                if (s.compare(j, quoted.size(), quoted) == 0) { lineStart = pos; afterName = j + quoted.size(); break; }
+            }
+        }
+        pos = le + 1;
+    }
+    if (lineStart == std::string::npos) { err = type + " " + quoted + " not found in " + path; return false; }
+    const size_t ob = s.find('{', afterName);
+    if (ob == std::string::npos) { err = type + " " + quoted + " in " + path + " has no `{`"; return false; }
+    int depth = 0;
+    bool inStr = false;
+    size_t end = std::string::npos;
+    for (size_t k = ob; k < s.size(); ++k) {
+        const char c = s[k];
+        if (inStr) { if (c == '\\') { ++k; continue; } if (c == '"') inStr = false; continue; }
+        if (c == '"') { inStr = true; continue; }
+        if (c == '#') { while (k < s.size() && s[k] != '\n') ++k; continue; }
+        if (c == '{') ++depth;
+        else if (c == '}') { if (--depth == 0) { end = k + 1; break; } }
+    }
+    if (end == std::string::npos) { err = type + " " + quoted + " in " + path + ": unbalanced braces"; return false; }
+    std::string indent;
+    for (size_t k = lineStart; k < s.size() && (s[k] == ' ' || s[k] == '\t'); ++k) indent += s[k];
+    std::string t = text;
+    while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
+    std::string body;
+    {
+        std::istringstream ls(t);
+        std::string line;
+        bool first = true;
+        while (std::getline(ls, line)) { if (!first) body += "\n" + indent; body += line; first = false; }
+    }
+    s = s.substr(0, lineStart + indent.size()) + body + s.substr(end);
+    std::ofstream o(path, std::ios::binary);
+    if (!o) { err = "cannot write " + path; return false; }
+    o << s;
+    return true;
+}
+inline void clearFurDirty(std::vector<Entry>& list) {
+    for (Entry& e : list) { if (e.fur) e.furDirty = false; else if (e.group) clearFurDirty(e.items); }
+}
+inline bool patchDirtyFur(FileModel& fm, std::vector<Entry>& list, bool& any, std::string& err) {
+    for (Entry& e : list) {
+        if (e.group) { if (!patchDirtyFur(fm, e.items, any, err)) return false; continue; }
+        if (!e.fur || !e.furDirty) continue;
+        if (e.name.empty()) { err = fm.path + ": an unnamed `fur` block cannot be patched in place -- name it"; return false; }
+        std::string text;
+        if (!writeBlock(text, e.furBlock, 0, err)) return false;
+        if (!patchBlockInFile(fm.path, "fur", e.name, text, err)) return false;
+        e.furDirty = false;
+        any = true;
+    }
+    return true;
+}
+// Every dirty file, whole; every edited fur block in a file kept as is, patched into its own
+// span. Nothing is written unless every file with curve edits is writable.
 inline bool saveModel(Model& m, std::string& err, std::vector<std::string>* written = nullptr) {
     for (const FileModel& fm : m.files)
         if (fm.dirty && !fm.writable) {
@@ -456,14 +547,20 @@ inline bool saveModel(Model& m, std::string& err, std::vector<std::string>* writ
             return false;
         }
     for (FileModel& fm : m.files) {
-        if (!fm.dirty) continue;
-        std::string text;
-        if (!fileText(fm, text, err)) { err = fm.path + ": " + err; return false; }
-        std::ofstream f(fm.path, std::ios::binary);
-        if (!f) { err = "cannot write " + fm.path; return false; }
-        f << text;
-        fm.dirty = false;
-        if (written) written->push_back(fm.path);
+        if (fm.dirty) {
+            std::string text;
+            if (!fileText(fm, text, err)) { err = fm.path + ": " + err; return false; }
+            std::ofstream f(fm.path, std::ios::binary);
+            if (!f) { err = "cannot write " + fm.path; return false; }
+            f << text;
+            fm.dirty = false;
+            clearFurDirty(fm.entries);
+            if (written) written->push_back(fm.path);
+        } else {
+            bool any = false;
+            if (!patchDirtyFur(fm, fm.entries, any, err)) return false;
+            if (any && written) written->push_back(fm.path + " (fur block patched)");
+        }
     }
     return true;
 }
@@ -511,6 +608,7 @@ inline Node& newGroupOf(Model& m, FileModel& fm, Entry* container, const std::st
 inline bool moveEntryToEnd(std::vector<Entry>& list, int id) {
     for (size_t i = 0; i < list.size(); ++i) {
         Entry& e = list[i];
+        if (e.fur) continue;
         if (e.group) { if (moveEntryToEnd(e.items, id)) return true; continue; }
         if (e.curve.id == id) { std::rotate(list.begin() + (std::ptrdiff_t)i, list.begin() + (std::ptrdiff_t)i + 1, list.end()); return true; }
     }
@@ -522,9 +620,14 @@ inline bool moveEntryToEnd(Model& m, int id) {
 }
 // The index of the entry holding node `id` within its list, or -1 (nested nodes have none).
 inline int entryIndexOf(const std::vector<Entry>& list, int id) {
-    for (size_t i = 0; i < list.size(); ++i) if (!list[i].group && list[i].curve.id == id) return (int)i;
+    for (size_t i = 0; i < list.size(); ++i) if (!list[i].group && !list[i].fur && list[i].curve.id == id) return (int)i;
     return -1;
 }
+// Every fur entry, with its file.
+template <class F> inline void forEachFurIn(FileModel& fm, std::vector<Entry>& list, F& f) {
+    for (Entry& e : list) { if (e.fur) f(fm, e); else if (e.group) forEachFurIn(fm, e.items, f); }
+}
+template <class F> inline void forEachFur(Model& m, F f) { for (FileModel& fm : m.files) forEachFurIn(fm, fm.entries, f); }
 
 // ---- the model -> blocks, and the live preview through the loader's own recursion ---------------
 inline ftsl::Stmt stmtFromPt(const Pt& p) {
@@ -550,7 +653,7 @@ inline ftsl::Block blockFromNode(const Node& n) {
     return b;
 }
 template <class F> inline void forEachEntryCurveC(const std::vector<Entry>& list, F& f) {
-    for (const Entry& e : list) { if (e.group) forEachEntryCurveC(e.items, f); else f(e.curve); }
+    for (const Entry& e : list) { if (e.fur) continue; if (e.group) forEachEntryCurveC(e.items, f); else f(e.curve); }
 }
 // Every top-level curve of the model flattened through ftsl::Builder::flattenCurveForTool, in
 // model order (so a reference finds its definition), keyed by node name: what each named node
@@ -649,7 +752,7 @@ inline bool rewriteFile(const std::string& in, const std::string& outPath, std::
     size_t ei = 0;
     int curves = 0, others = 0;
     for (const ftsl::Block& b : blocks) {
-        if (b.type == "curve" || b.type == "group") {
+        if (b.type == "curve" || b.type == "group" || b.type == "fur") {
             if (m.files.empty() || ei >= m.files[0].entries.size()) { err = "internal: entry/block mismatch"; return false; }
             if (!writeEntry(out, m.files[0].entries[ei++], 0, err)) return false;
             ++curves;

@@ -4657,8 +4657,23 @@ depth works the same way: a curve of rings of guides is three colours and three 
 `ftrace -in <scene> -groom-check` compares that preview with the loader's records for every named
 curve of a scene (`tools/groom_rig.py` runs it per scene and for Alice).
 
-It is a long-lived ftrace process, so `ftrace -stop <pid>` closes it like a viewer. TODO.md 0.6
-has the remaining phase (the fur panel, bald zones, an in-tool render).
+**Fur and render (0.332.0).** The Fur section lists every `fur` block with the numbers of the
+last load and its statements, each editable as text (`count 15000`, `radius 0.00005`, `guides
+"alice_hair"` ...), removable, and addable (a key and a value); a `bald` zone gets a `pick centre`
+button -- the next click on any surface writes the zone's centre (the face is not the scalp) --
+and `+ bald zone` makes one and asks for its centre; bald zones draw as orange wire spheres.
+Because a fur block lives beside the scalp mesh and its materials (a file the tool never
+rewrites whole), an edited fur block is **patched into its own text span** on save: the block's
+header line and matching `}` are found in the file and only that span is replaced, so the
+comments around it survive (comments inside it do not). The fur itself regenerates on `reload`
+(the Fur section says when it is stale). **save + render** hands the saved scene to a real
+`ftrace -in <scene> -mode <M> -time <s> -view ... -r 640 <h> -window -keepwindow` from the pane's
+framing (eye along the view axis, look-at the frame centre, fov fitted to the extent, the pane's
+aspect at 640 px wide), with the live preview window and a log in `png/groom/`; the note names the
+pid, and `ftrace -stop <pid>` closes it.
+
+It is a long-lived ftrace process, so `ftrace -stop <pid>` closes it like a viewer. The four
+phases of TODO.md 0.6 are built; what remains there is polish.
 
 ### Including files (`include "file.ftsl"`)
 

@@ -266,7 +266,7 @@ children's roots) drawn in the node's colour; the blended instances previewed li
 when `count` is set, so you see the interpolation before any hair exists. Any depth: a curve of
 rings of guides is three colours.
 
-**Phase 4 -- FUR + RENDER:** the `fur` block's parameters in a panel (count, radius, guide_blend,
+**Phase 4 -- FUR + RENDER -- BUILT 0.332.0 (statements edited as text; bald zones picked and drawn; the fur block patched into its span in a mixed file; `save + render` spawns a real ftrace with the live window). Verified by driving the GUI: `count` retyped to 12000 and a bald centre picked on the forehead -> only the fur block's lines changed in the copy of alice_hair.ftsl (its inline comments lost, everything around it byte-identical), the patched scene loads (12 664 strands, 2 336 culled by the moved zone), and `save + render` produced a real mode-M frame from the pane's framing (`png/groom/scene_groom.png`):** the `fur` block's parameters in a panel (count, radius, guide_blend,
 clump, curl, jitter, spline, seed); `bald` zones placed by clicking a centre and dragging a radius,
 drawn as wire spheres; follicles are automatic and area-uniform over the `on` object (existing
 behaviour) with an option to show the root dots; "Render" hands the saved scene to the viewer's
@@ -274,6 +274,11 @@ in-process path tracer so the real hair can be judged without leaving the tool.
 
 **Order and cost:** Phase 1 first (a day: it is display + the tree, no editing), then 2, 3, 4. The
 mode-M / flyby-cost work (0.5) is independent of the tool and can interleave.
+
+**All four phases are built (0.329.0 -- 0.332.0).** Left for polish: a live fur regenerate
+without a reload (needs the parse half of `addFur` split out so a scratch Builder can run it),
+named-sphere `bald "name"` zones drawn, the `on` mesh chosen from a list, per-point radius
+dragging, and a `-groom` on a bare mesh with no scene (auto-scalp).
 ## 1. The `gallery_rain` 960x540 flyby — THE DELIVERABLE, and it has never been launched
 
 1147 frames, `camera_curve "fly"`, mode M. Everything below it (`-sunnee`, VOLCACHE, the spectral

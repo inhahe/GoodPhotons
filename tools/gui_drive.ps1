@@ -4,7 +4,7 @@
 # window DPI). How the groom tool is exercised without a hand on the mouse (design.md, 0.330.0):
 #   pwsh -NoProfile -File tools/gui_drive.ps1 -ProcId <pid> -Actions "restore;key:n;click:0.69,0.35;shot:png/x.png;min"
 # actions: restore | min | key:<SendKeys text, e.g. n or ^s> | keydown:<vk> | keyup:<vk> (17 = Ctrl, 16 = Shift, 18 = Alt)
-#          | click:fx,fy | drag:fx0,fy0,fx1,fy1 | move:fx,fy | shot:<png path> | wait:<ms>
+#          | click:fx,fy | drag:fx0,fy0,fx1,fy1 | move:fx,fy | wheel:<notches, negative = down> | shot:<png path> | wait:<ms>
 param([int]$ProcId, [string]$Actions = "restore")
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
@@ -46,6 +46,9 @@ foreach ($a in $Actions.Split(";")) {
         "keyup"   { [GD]::keybd_event([byte][int]$arg, 0, 2, [UIntPtr]::Zero); Start-Sleep -Milliseconds 100; "keyup $arg" }
         "key"     { [System.Windows.Forms.SendKeys]::SendWait($arg); Start-Sleep -Milliseconds 400; "key $arg" }
         "move"    { $f = $arg.Split(","); MoveTo ([double]$f[0]) ([double]$f[1]); "moved $arg" }
+        "wheel"   { $n = [int]$arg; $step = if ($n -lt 0) { [uint32]4294967176 } else { [uint32]120 }   # -120 as unsigned, or +120
+                    for ($i = 0; $i -lt [Math]::Abs($n); $i++) { [GD]::mouse_event(0x0800, 0, 0, $step, [UIntPtr]::Zero); Start-Sleep -Milliseconds 60 }
+                    Start-Sleep -Milliseconds 300; "wheel $n" }
         "click"   { $f = $arg.Split(","); MoveTo ([double]$f[0]) ([double]$f[1]); Start-Sleep -Milliseconds 150
                     [GD]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 80
                     [GD]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 400; "clicked $arg" }

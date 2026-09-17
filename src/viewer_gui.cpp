@@ -3967,6 +3967,12 @@ struct GroomState {
     bool stale = false;                          // the fur shown is from before an edit (placed strands preview live)
     groom::Preview preview;                      // every named node flattened through the loader's recursion, rebuilt with the lines
     std::vector<int> multi;                      // the Ctrl-click selection (node ids), for grouping
+    // ---- fur (Phase 4)
+    int   pickBald = -1, pickBaldStmt = -1;      // the fur entry / `bald` statement taking the next surface click as its centre
+    bool  showBald = true;                       // bald zones as wire spheres
+    int   renderSeconds = 60;
+    char  renderMode[8] = "M";
+    std::string renderNote;
     // a point being dragged
     bool   dragging = false, dragMoved = false;
     int    dragNode = -1, dragPt = -1;
@@ -3988,7 +3994,7 @@ static void toggleMulti(GroomState& g, int id) {
 }
 
 template <class F> static void forEachEntryCurve(std::vector<groom::Entry>& list, F& f) {
-    for (groom::Entry& e : list) { if (e.group) forEachEntryCurve(e.items, f); else f(e.curve); }
+    for (groom::Entry& e : list) { if (e.fur) continue; if (e.group) forEachEntryCurve(e.items, f); else f(e.curve); }
 }
 template <class F> static void forEachTopCurve(groom::Model& m, F f) { for (groom::FileModel& fm : m.files) forEachEntryCurve(fm.entries, f); }
 
@@ -4152,6 +4158,29 @@ static void groomBuildLines(GroomState& g, std::vector<LineBatch>& out) {
             if (!roots.v.empty()) out.push_back(std::move(roots));
         }
     }
+    if (g.showBald) {
+        // `bald <x> <y> <z> <r>` zones as wire spheres (the named-sphere form is the scene's to draw)
+        LineBatch bz;
+        bz.rgba[0] = 1.0f; bz.rgba[1] = 0.55f; bz.rgba[2] = 0.15f; bz.rgba[3] = 1.0f;
+        groom::forEachFur(g.model, [&](groom::FileModel&, groom::Entry& e) {
+            for (const ftsl::Stmt& s : e.furBlock.stmts) {
+                if (s.key != "bald" || s.val.words.size() < 4 || !groom::isNumberTok(s.val.words[0])) continue;
+                const Vec3 c{ std::atof(s.val.words[0].c_str()), std::atof(s.val.words[1].c_str()), std::atof(s.val.words[2].c_str()) };
+                const double r = std::atof(s.val.words[3].c_str());
+                if (r <= 0.0) continue;
+                for (int axis = 0; axis < 3; ++axis) {
+                    Vec3 prev{0, 0, 0};
+                    for (int k = 0; k <= 48; ++k) {
+                        const double a = 2.0 * 3.14159265358979 * k / 48.0, ca = std::cos(a) * r, sa = std::sin(a) * r;
+                        const Vec3 p = (axis == 0) ? Vec3{ c.x, c.y + ca, c.z + sa } : (axis == 1) ? Vec3{ c.x + ca, c.y, c.z + sa } : Vec3{ c.x + ca, c.y + sa, c.z };
+                        if (k) addSegment(bz, prev, p);
+                        prev = p;
+                    }
+                }
+            }
+        });
+        if (!bz.v.empty()) out.push_back(std::move(bz));
+    }
 }
 
 // ---- editing ----------------------------------------------------------------------------------
@@ -4205,7 +4234,7 @@ static void newStrand(GroomState& g) {
     if (!fm) return;
     Affine xf = Affine::identity();
     const std::vector<groom::Entry>& sib = container ? container->items : fm->entries;
-    for (const groom::Entry& e : sib) if (!e.group) { xf = xfOf(g, e.curve.id); break; }
+    for (const groom::Entry& e : sib) if (!e.group && !e.fur) { xf = xfOf(g, e.curve.id); break; }
     pushUndo(g);
     groom::Node& n = groom::newCurve(g.model, *fm, container, groom::freshName(g.model, "strand"));
     g.xfOf[n.id] = xf;
@@ -4330,6 +4359,145 @@ static void groomSave(GroomState& g) {
     g.status = "saved " + list + (g.stale ? " -- reload to refresh placed strands and fur" : "");
 }
 
+// ---- fur (Phase 4): the block's statements, bald zones placed on the surface, a real render ----
+static std::vector<std::string> splitWords(const char* text) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (const char* p = text; *p; ++p) {
+        if (*p == ' ' || *p == '\t') { if (!cur.empty()) { out.push_back(cur); cur.clear(); } }
+        else cur += *p;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+static void markFur(GroomState& g, groom::Entry& e) { e.furDirty = true; g.lines.dirty = true; g.stale = true; }
+static void placeBald(GroomState& g, const ImVec2& mouse) {
+    groom::Entry* target = nullptr;
+    groom::forEachFur(g.model, [&](groom::FileModel&, groom::Entry& e) { if (e.id == g.pickBald) target = &e; });
+    g.pickBald = -1;
+    if (!target || g.pickBaldStmt < 0 || g.pickBaldStmt >= (int)target->furBlock.stmts.size()) { g.status = "the bald zone being placed is gone"; return; }
+    const bool any = g.pickAny;
+    g.pickAny = true;                                    // a bald zone is usually on the face, not the scalp
+    const Pick pk = pickSurface(g, mouse, true);
+    g.pickAny = any;
+    if (!pk.hit) { g.status = "no surface under the click"; return; }
+    pushUndo(g);
+    ftsl::Stmt& s = target->furBlock.stmts[(size_t)g.pickBaldStmt];
+    const Vec3 c = snapMicron(pk.p);
+    while (s.val.words.size() < 4) s.val.words.push_back("0");
+    s.val.words[0] = groom::fmtNum(c.x); s.val.words[1] = groom::fmtNum(c.y); s.val.words[2] = groom::fmtNum(c.z);
+    markFur(g, *target);
+    char buf[160];
+    std::snprintf(buf, sizeof buf, "bald zone centred at (%.4f %.4f %.4f); its radius is the fourth number", c.x, c.y, c.z);
+    g.status = buf;
+}
+// The saved scene rendered by a real ftrace from the pane's framing, with the live window.
+static void spawnRender(GroomState& g) {
+    groomSave(g);
+    if (g.status.rfind("save failed", 0) == 0) { g.renderNote = g.status; return; }
+    namespace fs = std::filesystem;
+    wchar_t exe[MAX_PATH] = L"";
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    const std::string stem = fs::path(g.scenePath).stem().string();
+    std::error_code ec;
+    fs::create_directories("png/groom", ec);
+    const std::string out = "png/groom/" + stem + "_groom.png", log = "png/groom/" + stem + "_groom.log";
+    const Vec3 mid{ g.frameMid[0], g.frameMid[1], g.frameMid[2] };
+    const double zoom = std::max(g.view.zoom, 0.05f);
+    const double dist = 3.0 * g.frameExt / zoom;
+    const Vec3 eye = mid + g.cam.toward() * dist;
+    const double fov = 2.0 * std::atan(0.6 * g.frameExt / zoom / dist) * 180.0 / 3.14159265358979;
+    char view[256];
+    std::snprintf(view, sizeof view, "%.6g,%.6g,%.6g/%.6g,%.6g,%.6g/%.4g", eye.x, eye.y, eye.z, mid.x, mid.y, mid.z, fov);
+    const int secs = std::max(1, g.renderSeconds);
+    std::string mode = g.renderMode;
+    if (mode.empty()) mode = "M";
+    // the pane's aspect, 640 px wide (the ad-hoc view camera would otherwise default to 256^2)
+    const int rw = 640, rh = std::max(64, (int)std::lround(640.0 * (g.cam.avail.y > 1.0f ? g.cam.avail.y / std::max(g.cam.avail.x, 1.0f) : 1.0f)));
+    const std::string args = " -in \"" + g.scenePath + "\" -mode " + mode + " -time " + std::to_string(secs) + " -view " + view +
+                             " -r " + std::to_string(rw) + " " + std::to_string(rh) +
+                             " -window -keepwindow -interval 10 -o \"" + out + "\"";
+    std::wstring wcmd = L"\"" + std::wstring(exe) + L"\"" + utf8ToWide(args);
+    std::vector<wchar_t> mut(wcmd.begin(), wcmd.end());
+    mut.push_back(L'\0');
+    SECURITY_ATTRIBUTES sa = { sizeof sa, nullptr, TRUE };
+    HANDLE hLog = CreateFileA(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    STARTUPINFOW si = {};
+    si.cb = sizeof si;
+    if (hLog != INVALID_HANDLE_VALUE) { si.dwFlags = STARTF_USESTDHANDLES; si.hStdOutput = hLog; si.hStdError = hLog; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE); }
+    PROCESS_INFORMATION pi = {};
+    const BOOL ok = CreateProcessW(nullptr, mut.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
+    if (!ok) { g.renderNote = "could not start the render (error " + std::to_string(GetLastError()) + ")"; return; }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    const std::string pid = std::to_string(pi.dwProcessId);
+    g.renderNote = "rendering as pid " + pid + " -> " + out + " (log: " + log + "); the live window stays up when it finishes -- close it, or `ftrace -stop " + pid + "`";
+}
+static void drawFurSection(GroomState& g) {
+    if (!ImGui::CollapsingHeader("Fur", ImGuiTreeNodeFlags_DefaultOpen)) return;
+    if (ImGui::Checkbox("show bald zones", &g.showBald)) g.lines.dirty = true;
+    int nfur = 0;
+    groom::forEachFur(g.model, [&](groom::FileModel& fm, groom::Entry& e) {
+        ++nfur;
+        ImGui::PushID(e.id);
+        ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.3f, 1.0f), "fur \"%s\"%s", e.name.c_str(), e.furDirty ? "  *modified*" : "");
+        const ftsl::Loaded::FurInfo* fi = nullptr;
+        for (const auto& f : g.loaded.furInfos) if (f.name == e.name) fi = &f;
+        if (fi) ImGui::TextDisabled("last load: %lld strands on \"%s\"%s", fi->strands, fi->on.c_str(), g.stale ? "  (stale: save + reload regenerates)" : "");
+        ImGui::TextDisabled("in %s%s", fm.path.c_str(), fm.writable ? "" : " (patched in place on save)");
+        for (size_t i = 0; i < e.furBlock.stmts.size(); ++i) {
+            ftsl::Stmt& s = e.furBlock.stmts[i];
+            ImGui::PushID((int)i);
+            std::string joined;
+            for (const std::string& w : s.val.words) joined += (joined.empty() ? "" : " ") + w;
+            char buf[256];
+            std::snprintf(buf, sizeof buf, "%s", joined.c_str());
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 11.0f);
+            const bool changed = ImGui::InputText(s.key.c_str(), buf, sizeof buf);
+            if (ImGui::IsItemActivated()) pushUndo(g);
+            if (changed) { s.val.words = splitWords(buf); markFur(g, e); }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x")) { pushUndo(g); e.furBlock.stmts.erase(e.furBlock.stmts.begin() + (std::ptrdiff_t)i); markFur(g, e); ImGui::PopID(); break; }
+            if (s.key == "bald") {
+                ImGui::SameLine();
+                const bool picking = (g.pickBald == e.id && g.pickBaldStmt == (int)i);
+                if (ImGui::SmallButton(picking ? "click the surface..." : "pick centre")) {
+                    g.pickBald = e.id; g.pickBaldStmt = (int)i;
+                    g.status = "click the surface to place the bald zone's centre (its radius is the 4th number)";
+                }
+            }
+            ImGui::PopID();
+        }
+        static char key[32] = "", val[160] = "";
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6.0f); ImGui::InputText("##k", key, sizeof key); ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0f); ImGui::InputText("##v", val, sizeof val); ImGui::SameLine();
+        if (ImGui::SmallButton("add statement") && key[0]) {
+            pushUndo(g);
+            ftsl::Stmt s; s.key = key; s.val.words = splitWords(val);
+            e.furBlock.stmts.push_back(std::move(s));
+            markFur(g, e);
+            key[0] = 0; val[0] = 0;
+        }
+        if (ImGui::SmallButton("+ bald zone (then click its centre)")) {
+            pushUndo(g);
+            ftsl::Stmt s; s.key = "bald"; s.val.words = { "0", "0", "0", groom::fmtNum(0.15 * g.ext) };
+            e.furBlock.stmts.push_back(std::move(s));
+            g.pickBald = e.id; g.pickBaldStmt = (int)e.furBlock.stmts.size() - 1;
+            markFur(g, e);
+            g.status = "click the surface to place the new bald zone's centre";
+        }
+        ImGui::PopID();
+    });
+    if (!nfur) ImGui::TextDisabled("(no fur blocks in this scene)");
+    ImGui::Separator();
+    ImGui::TextUnformatted("render the saved scene from this view (a real ftrace, live window):");
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.0f); ImGui::InputInt("seconds", &g.renderSeconds); ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 3.0f); ImGui::InputText("mode", g.renderMode, sizeof g.renderMode);
+    if (ImGui::Button("save + render")) spawnRender(g);
+    if (!g.renderNote.empty()) ImGui::TextWrapped("%s", g.renderNote.c_str());
+}
+
 // ---- loading: the scene through the renderer's loader, the curve tree through the parser --------
 static bool groomParseModel(GroomState& g) {
     std::string err;
@@ -4342,8 +4510,9 @@ static void resolveXfList(GroomState& g, std::vector<groom::Entry>& list) {
     // its named siblings' (they share the group).
     Affine known = Affine::identity();
     for (groom::Entry& e : list)
-        if (!e.group && !e.curve.name.empty()) { auto it = g.recByName.find(e.curve.name); if (it != g.recByName.end()) { known = it->second->xf; break; } }
+        if (!e.group && !e.fur && !e.curve.name.empty()) { auto it = g.recByName.find(e.curve.name); if (it != g.recByName.end()) { known = it->second->xf; break; } }
     for (groom::Entry& e : list) {
+        if (e.fur) continue;
         if (e.group) { resolveXfList(g, e.items); continue; }
         auto it = e.curve.name.empty() ? g.recByName.end() : g.recByName.find(e.curve.name);
         assignXf(g, e.curve, it != g.recByName.end() ? it->second->xf : known);
@@ -4405,7 +4574,7 @@ static void groomHandleInput(GroomState& g, bool hovered) {
     g.hoverNode = g.hoverPt = -1;
     groom::Node* selN = (g.selNode >= 0) ? groom::findNode(g.model, g.selNode) : nullptr;
     const bool freshStrand = selN && !selN->ref && selN->kids.empty() && selN->pts.empty();
-    if (hovered && !g.dragging && !io.KeyAlt && !freshStrand && g.showCurves && g.showPoints && g.levelOn[0]) {
+    if (hovered && !g.dragging && !io.KeyAlt && !freshStrand && g.pickBald < 0 && g.showCurves && g.showPoints && g.levelOn[0]) {
         float bestD = pickPx * pickPx;
         const Scene& sc = g.loaded.scene;
         const Vec3 toward = g.cam.toward();
@@ -4483,6 +4652,7 @@ static void groomHandleInput(GroomState& g, bool hovered) {
     if (g.pressedEmpty && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
         g.pressedEmpty = false;
         const float dx = mouse.x - g.pressPos.x, dy = mouse.y - g.pressPos.y;
+        if (hovered && g.pickBald >= 0 && dx * dx + dy * dy < 9.0f) { placeBald(g, mouse); return; }
         if (hovered && g.addOnClick && dx * dx + dy * dy < 9.0f) {
             const Pick pk = pickSurface(g, mouse, true);
             if (pk.hit) addPointAt(g, pk);
@@ -4842,13 +5012,7 @@ static void drawGroomPanel(GroomState& g) {
         });
         if (!shown) ImGui::TextDisabled("(no curves in this scene -- press N to start a strand)");
     }
-    if (ImGui::CollapsingHeader("Fur", ImGuiTreeNodeFlags_DefaultOpen)) {
-        for (const auto& fi : g.loaded.furInfos) {
-            ImGui::BulletText("%s  on \"%s\"  %lld strands  radius %.3g%s", fi.name.c_str(), fi.on.c_str(), fi.strands, fi.radius, g.stale ? "  (stale)" : "");
-            if (!fi.guides.empty()) { std::string gs; for (const auto& n : fi.guides) gs += (gs.empty() ? "" : ", ") + n; ImGui::TextDisabled("    guides: %s", gs.c_str()); }
-        }
-        if (g.loaded.furInfos.empty()) ImGui::TextDisabled("(no fur blocks)");
-    }
+    drawFurSection(g);
     if (ImGui::CollapsingHeader("Files")) {
         for (const groom::FileModel& fm : g.model.files)
             ImGui::BulletText("%s%s%s%s", fm.path.c_str(), fm.dirty ? "  *modified*" : "", fm.writable ? "" : "  (not writable: ", fm.writable ? "" : (fm.why + ")").c_str());

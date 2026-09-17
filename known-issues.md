@@ -29412,6 +29412,10 @@ holding anything other than `curve` / `group`-of-curve blocks is not written at 
 `Files` section names the offending block); hair belongs in its own included file. An empty
 strand (`N` pressed, nothing plotted) is not written at all, since the loader refuses one. The
 strands a `count` node places preview live (0.331.0); the FUR is still from the previous load
-until `reload` (drawn dimmed as "stale") -- regenerating it in the tool is Phase 4 of TODO.md 0.6.
+until `reload` (drawn dimmed as "stale") -- a live regenerate needs the parse half of `addFur`
+split out (TODO.md 0.6, polish). A fur block edited in a file the tool does not rewrite is patched
+into its own text span (0.332.0): the block's inline comments are lost, the rest of the file is
+untouched; an UNNAMED fur block cannot be patched (name it). A `bald "sphere" [margin]` zone is
+not drawn (only the `bald x y z r` form is).
 An unnamed curve of curves nested inline inside another gets no preview of its own (its instances
 are inside its parent's); the tool names what it groups, so this only affects hand-written files.
