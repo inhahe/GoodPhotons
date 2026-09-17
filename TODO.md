@@ -21,30 +21,17 @@ Left open deliberately, recorded in the same entry: media transmittance (stochas
 hero-wavelength treatment rather than this one; inert for gallery_rain, whose media have flat
 coefficients), the Hair BCSDF, and the binary stochastic choices in HalfMirror and the layered coat.
 
-## C. Mode M mis-renders COLOURED MEDIA (measured; not fixed)
+## C. Mode M mis-renders coloured media — **DONE (v0.322.0)**
 
-**Status: measured, written up in `known-issues.md`. Not started.**
+Fixed on both backends; write-up and numbers in `known-issues.md`. A coloured fog went from a
+**113 % channel spread** against mode D (blue 64 % bright, red 23 % dark) to **1.0 %**, with the flat
+control unmoved at 0.3 %. Three tiers — flat (one scalar walk, free), homogeneous (analytic), and
+heterogeneous (correlated ratio tracking). `gallery_rain` costs 96 s, unchanged.
 
-The same wavelength bug as B, in the media term the SPECGATHER fix deliberately left alone. I had
-guessed it was minor; measured, it is the worst of the family. Cornell filled with fog, mode M vs
-mode D, back-wall ROI per channel: a FLAT control agrees to **0.3 %**, while a coloured `sigma_a`
-gives **R 0.769 / G 0.902 / B 1.639 — a 113 % channel spread**. Blue 64 % too bright, red 23 % too
-dark: a wrong colour, not a shift.
-
-Inert for `gallery_rain` (flat coefficients), so it does not block the flyby — but it mis-renders
-any coloured smoke, tinted volume or absorbing medium.
-
-**The fix is not the SPECGATHER ratio**, because a transmittance is a stochastic estimate and
-`E[A/B] != E[A]/E[B]`. Carry a per-wavelength transmittance VECTOR instead:
-1. **homogeneous media**: `exp(-sigma_t(lambda) * d)` — analytic, exact, nearly free, and it covers
-   the entire measured case;
-2. **heterogeneous media**: ratio tracking with one shared collision sequence updating K correlated
-   weights (hero-wavelength style), i.e. one march with K-wide updates rather than K marches;
-3. the scalar `thr` takes its camera-wavelength value from that same vector, so they cannot diverge
-   (the lesson from B's first attempt, which divided by a re-sampled value and detonated).
-
-Validate exactly as B was: the flat control must stay at ~1.00, the coloured channels must converge
-to ~1.00, `_beams_ms` must not move, and the cost measured on a real frame.
+Outstanding: an end-to-end number for the coloured-AND-heterogeneous combination. Those renders
+exceed 20-40 minutes — but the control proves that is the scene's medium and not the spectral
+vector (the same scene with a flat spectrum, taking the scalar path, is equally slow). What is
+needed is a cheap scene that exercises that tier, not a redesign.
 
 ## A. The analytic coated-body model — TIR saturation, coat absorption, Snell
 

@@ -4540,43 +4540,51 @@ claim here — the honest test is that flat scenes agree within that). `scenes/_
 mode-M-vs-D invariant reads **1.058** against the 1.085 its own header records. `gallery_rain`
 frame 555 costs **97 s against 93 s (+4 %)**.
 
-**Not covered — and the media case is MUCH worse than the surfaces were, now that it is measured.**
-Media transmittance along the camera segment (`camMediaTr`) is wavelength-dependent too and carries
-the identical error. I first wrote this paragraph guessing it was minor; that guess was wrong and
-the measurement says so plainly.
+**The media case is FIXED TOO (v0.322.0), and it was the worst of the family.** Media transmittance
+along the camera segment carried the identical error. I first wrote this paragraph guessing it was
+minor; measured, it was not.
 
-Measured on a Cornell box FILLED with fog (`scraps/fog_col.ftsl` vs `scraps/fog_flat.ftsl`, mode M
-`-beams -n 60000000` against mode D 400 spp, GPU), back-wall ROI seen through the fog, mode M / mode
-D **per channel** — a spectral error shows up as the channels disagreeing with each other:
-
-| fog | R | G | B | spread |
+| fog (Cornell filled, mode M `-beams` vs mode D, back-wall ROI, per channel) | R | G | B | spread |
 |---|---:|---:|---:|---:|
-| flat `sigma_a 1.05` (control) | 1.0017 | 0.9985 | 1.0007 | **0.3 %** |
-| coloured `sigma_a rgb 0.25 1.0 2.6` | **0.7685** | **0.9020** | **1.6388** | **113 %** |
+| flat `sigma_a 1.05` (control), before and after | 1.00 | 1.00 | 1.00 | **0.3 %** |
+| coloured `sigma_a rgb 0.25 1.0 2.6`, BEFORE | 0.7685 | 0.9020 | 1.6388 | **113 %** |
+| coloured, AFTER | **1.0040** | **0.9975** | **1.0078** | **1.0 %** |
 
-The flat control agrees to 0.3 %, which is what makes the coloured row attributable to the spectral
-mechanism rather than to the beam estimator's own bias. Blue comes out **64 % too bright** and red
-**23 % too dark**: not a subtle shift, a wrong colour. Any scene with a spectrally-varying
-`sigma_a`/`sigma_s` — coloured smoke, tinted water, an absorbing volume — is mis-rendered in mode M
-today. It is inert for `gallery_rain` only because both of its media have flat coefficients
-(`Medium::achroSigma`), which is a property of that scene and not a general reassurance.
+Blue was 64 % too bright and red 23 % too dark — a wrong colour, not a shift. The flat control
+agreeing to 0.3 % throughout is what makes the coloured row attributable to the spectral mechanism
+rather than to the beam estimator's own bias.
 
-**Why the SPECGATHER trick does not simply extend to it.** A reflectance is a deterministic function
-that can be evaluated at any wavelength, which is what makes the ratio exact. A transmittance is a
-STOCHASTIC ratio-tracking estimate, and `E[A/B] != E[A]/E[B]` — dividing two noisy estimates is
-biased. The walk would instead have to carry a per-wavelength transmittance VECTOR forward and apply
-it per photon. Two tiers make that tractable rather than expensive:
+**Why it could not reuse SPECGATHER's ratio.** A reflectance is a deterministic function that can be
+evaluated at any wavelength; a transmittance is a stochastic ESTIMATE, and `E[A/B] != E[A]/E[B]`.
+So the walk carries a per-wavelength transmittance VECTOR instead
+(`Renderer::mediumTransmittanceSpec`, `dMedTransmittanceSpec`), in three tiers:
 
-- a **homogeneous** medium needs no estimator at all: `T(lambda) = exp(-sigma_t(lambda) * d)` is
-  analytic, exact and nearly free — and it covers the whole measured case above;
-- a **heterogeneous** one wants ratio tracking with ONE shared collision sequence updating K
-  correlated weights (the hero-wavelength treatment), so the cost is one march with K-wide weight
-  updates rather than K marches.
+- **flat in `sigma_t`** — one scalar walk, repeated across the grid. Exact (a flat medium's
+  transmittance genuinely is wavelength-independent) and free. **Most media are this**, including
+  both of `gallery_rain`'s, which is why the fix costs that scene nothing.
+- **homogeneous** — `exp(-sigma_t(lambda) * len)` per wavelength: analytic, exact, no sampling.
+  This is the entire measured case above.
+- **heterogeneous** — ratio tracking whose collisions are driven by a majorant bounding EVERY
+  wavelength, one weight update per wavelength per collision, so the estimates stay correlated
+  (which matters, because the consumer divides them).
 
-As with the surface fix, the scalar `thr` must then take its value FROM that vector at the camera's
-wavelength, so the two can never disagree.
+As with the surfaces, the scalar `thr` takes its camera-wavelength value FROM the same vector, so
+the two cannot disagree.
 
-**Also not covered:** the `Hair` BCSDF (evaluating it per wavelength is genuinely expensive), and
+**Cost, measured on a real scene:** `gallery_rain` frame 555 went 97 s -> 101 s with the vector, and
+back to **96 s** once the flat fast path was added — i.e. free where it cannot matter.
+
+**One validation is outstanding, and the reason is worth recording.** The coloured-AND-heterogeneous
+combination is not covered by an end-to-end number: those renders exceeded 20-40 minutes and were
+stopped. I twice concluded from that that the stochastic tier was "impractically slow", and twice I
+was wrong — shrinking the grid from 24 bins to 8 changed nothing, narrowing the spectral spread
+changed nothing, and then the control I should have run first settled it: the SAME scene with a
+FLAT spectrum, which takes the scalar fast path (i.e. the pre-fix behaviour exactly), is equally
+slow. **The cost is that scene's heterogeneous medium, not the spectral vector.** The tier itself is
+textbook ratio tracking with a valid majorant; what is missing is a cheap scene that exercises it
+end to end.
+
+**Also not covered:****Also not covered:** the `Hair` BCSDF (evaluating it per wavelength is genuinely expensive), and
 `HalfMirror`'s reflect-or-pass and the layered coat's coat-or-body, which are stochastic BINARY
 choices made at the camera's wavelength — the same class of error, not expressible as a smooth
 ratio, and still unmeasured.

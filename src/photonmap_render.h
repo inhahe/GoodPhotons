@@ -953,6 +953,16 @@ struct SpecThr {
         any = true;
         for (int k = 0; k < K; ++k) v[k] *= f(lamOf(k));
     }
+    // Fold in a factor already evaluated ON the grid, plus its value at the camera's wavelength.
+    // The media term comes this way: its per-wavelength values fall out of one shared
+    // ratio-tracking walk rather than from a function that can be called per bin.
+    void mulVec(const double* vk, double atCam) {
+        cam *= atCam;
+        for (int k = 0; k < K; ++k) {
+            if (!any && std::fabs(vk[k] - vk[0]) > 1e-12 * (1.0 + std::fabs(vk[0]))) any = true;
+            v[k] *= vk[k];
+        }
+    }
     // The correction a photon of wavelength `lamP` needs. Denominator is `cam`, so this
     // multiplied by `thr` leaves the walk's spectral factors evaluated at lamP and everything
     // else untouched. A dead path (cam == 0) contributes nothing either way.
@@ -961,6 +971,35 @@ struct SpecThr {
         return (cam > 1e-300) ? v[binOf(lamP)] / cam : 0.0;
     }
 };
+
+// The spectral twin of camMediaTr: the segment's transmittance at every SpecThr grid wavelength
+// plus (in the last slot) the camera's own, all from one shared walk. The camera's slot is what the
+// scalar `thr` takes, so the scalar and the carrier's denominator are the same number by
+// construction -- the lesson from SPECGATHER's first attempt, which recomputed it and detonated.
+inline void camMediaTrSpec(const Scene& scene, const Renderer& mats, const Vec3& o, const Vec3& d,
+                           double len, double lambda, Pcg32& rng, double* Tv) {
+    double lams[SpecThr::K + 1];
+    for (int k = 0; k < SpecThr::K; ++k) lams[k] = SpecThr::lamOf(k);
+    lams[SpecThr::K] = lambda;
+    for (int k = 0; k <= SpecThr::K; ++k) Tv[k] = 1.0;
+    // Same sun-disc multi-sampling the scalar version does (see pbeams::kSunDiscTrSamples): a
+    // directly-viewed disc is 10^4 times its surroundings, so one sample of the cloud in front of it
+    // twinkles. Averaging whole VECTORS keeps the wavelengths correlated within each sample.
+    const int n = (scene.sunCount > 0 && scene.sunRadiance(d, lambda) > 0.0)
+                      ? pbeams::kSunDiscTrSamples : 1;
+    if (n == 1) {
+        mats.mediaTransmittanceSpec(scene, o, d, len, lams, SpecThr::K + 1, Tv, rng);
+        return;
+    }
+    double acc[SpecThr::K + 1] = {0.0};
+    for (int i = 0; i < n; ++i) {
+        double one[SpecThr::K + 1];
+        for (int k = 0; k <= SpecThr::K; ++k) one[k] = 1.0;
+        mats.mediaTransmittanceSpec(scene, o, d, len, lams, SpecThr::K + 1, one, rng);
+        for (int k = 0; k <= SpecThr::K; ++k) acc[k] += one[k];
+    }
+    for (int k = 0; k <= SpecThr::K; ++k) Tv[k] = acc[k] / (double)n;
+}
 
 inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pcg32& rng,
                             bool diffraction, int maxBounce, double lambda, double invPdfL,
@@ -1305,7 +1344,11 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                         if (volOn) { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
                           L += gatherPhotonBeams(scene, mats, *bm, so, sd, slen, aGlass, rng) * thr; }
                         if (sunOn) L += sunNeeMarch(scene, mats, so, sd, slen, aGlass, lambda, invPdfL, rng) * thr;
-                        thr *= camMediaTr(scene, mats, so, sd, slen, lambda, rng);
+                        {   double Tv[SpecThr::K + 1];
+                            camMediaTrSpec(scene, mats, so, sd, slen, lambda, rng, Tv);
+                            thr *= Tv[SpecThr::K];
+                            sthr.mulVec(Tv, Tv[SpecThr::K]);
+                        }
                     }
                     if (aGlass > 0.0) {
                         thr *= std::exp(-aGlass * slen);
@@ -1338,7 +1381,12 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
               }
             if (sunOn) L += sunNeeMarch(scene, mats, ray.o, ray.d, dSeg, aGlass, lambda, invPdfL, rng) * thr;
             // Extinction along the camera segment: what is behind the fog gets dimmed.
-            thr *= camMediaTr(scene, mats, ray.o, ray.d, dSeg, lambda, rng);
+            {   // SPECGATHER: extinction is spectral too, and with a coloured medium badly so.
+                double Tv[SpecThr::K + 1];
+                camMediaTrSpec(scene, mats, ray.o, ray.d, dSeg, lambda, rng, Tv);
+                thr *= Tv[SpecThr::K];
+                sthr.mulVec(Tv, Tv[SpecThr::K]);
+            }
             if (thr <= 0.0) return L;
         }
         if (h.valid) {                                   // Beer-Lambert in current medium

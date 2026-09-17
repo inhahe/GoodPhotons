@@ -849,6 +849,10 @@ struct Renderer {
     // optically thick volume converging and not — see majorant.h for the measured
     // variance reduction (~1100x at tau = 8). Note the factors may exceed 1 (the residual
     // is signed); that is correct and is what keeps the estimator unbiased.
+    // Upper bound on the wavelength count mediumTransmittanceSpec accepts (a stack array in a
+    // hot path, so it is fixed rather than allocated). SpecThr::K + 1 -- the grid plus the
+    // camera's own wavelength, which rides along so the scalar and the vector cannot disagree.
+    static constexpr int kSpecTrMax = 32;
     static double mediumTransmittance(const Medium& med, const Vec3& o, const Vec3& dir,
                                       double dist, double lambda, Pcg32& rng,
                                       const PatTables* tabs) {
@@ -888,6 +892,93 @@ struct Renderer {
         }
         return Tr;
     }
+
+    // Transmittance at SEVERAL wavelengths along one segment through one medium, from a SINGLE
+    // shared walk. Mode M's camera walk is monochromatic while its photon map is not, so the
+    // extinction it applies has to be known at the photons' wavelengths too, not just the camera's
+    // -- with a coloured medium the difference is not subtle (measured: a 113 % channel spread, see
+    // known-issues). SPECGATHER's ratio trick cannot be reused here because a transmittance is a
+    // stochastic ESTIMATE and E[A/B] != E[A]/E[B]; the vector has to be carried.
+    //
+    // The wavelength enters only through one scalar per medium, `sigmaT(lambda)` -- the density
+    // field is achromatic -- which is what makes both tiers cheap:
+    //   * HOMOGENEOUS: exp(-sigma_t(lambda) * len) per wavelength. Analytic, exact, no sampling.
+    //   * HETEROGENEOUS: ratio tracking driven by a majorant that bounds EVERY wavelength (not just
+    //     the hero's), with one weight update per wavelength at each collision. One march, wider
+    //     arithmetic, and the estimates are CORRELATED -- which matters, because the consumer takes
+    //     their ratio and independent estimates would make that ratio noisy as well as biased.
+    // `Tr[i]` is MULTIPLIED into, so a caller can chain media.
+    static void mediumTransmittanceSpec(const Medium& med, const Vec3& o, const Vec3& dir,
+                                        double dist, const double* lams, int K, double* Tr,
+                                        Pcg32& rng, const PatTables* tabs) {
+        double stB[kSpecTrMax];
+        double stMax = 0.0;
+        for (int i = 0; i < K; ++i) {
+            stB[i] = med.sigmaT(lams[i]);
+            if (stB[i] < 0.0) stB[i] = 0.0;
+            if (stB[i] > stMax) stMax = stB[i];
+        }
+        if (stMax <= 0.0) return;                                   // transparent at every lambda
+        // A medium that is FLAT in sigma_t has one transmittance, not K of them -- so take the
+        // ordinary scalar walk once and repeat it, rather than paying K correlated weight
+        // updates at every collision. This is exact, not an approximation: a flat medium's
+        // transmittance genuinely is wavelength-independent. It matters because MOST media are
+        // flat (both of gallery_rain's are), and the stochastic tier is expensive in a thick
+        // noisy density field -- this keeps them paying nothing for a feature they cannot use.
+        bool flatMed = true;
+        for (int i = 1; i < K; ++i)
+            if (std::fabs(stB[i] - stB[0]) > 1e-12 * (1.0 + stB[0])) { flatMed = false; break; }
+        if (flatMed) {
+            const double T = mediumTransmittance(med, o, dir, dist, lams[0], rng, tabs);
+            for (int i = 0; i < K; ++i) Tr[i] *= T;
+            return;
+        }
+        double ta, tb;
+        if (!med.clipToBounds(o, dir, 0.0, dist, ta, tb)) return;   // never enters
+        if (!med.heterogeneous()) {                                  // ---- analytic tier
+            const double len = tb - ta;
+            for (int i = 0; i < K; ++i) Tr[i] *= std::exp(-stB[i] * len);
+            return;
+        }
+        // ---- stochastic tier: one collision sequence, K correlated weights ------------------
+        // The majorant must bound every wavelength, or a wavelength whose sigma_t exceeds it would
+        // get a negative weight update and a biased (indeed, possibly negative) estimate.
+        if (med.majorant && med.majorant->valid()) {
+            const MajorantGrid& g = *med.majorant;
+            majorantWalk(g, o, dir, ta, tb, [&](size_t ci, double t0, double t1) {
+                const double cC = (double)g.ctrl[ci], cR = (double)g.res[ci];
+                for (int i = 0; i < K; ++i)                          // control part: analytic
+                    if (stB[i] * cC > 0.0) Tr[i] *= std::exp(-stB[i] * cC * (t1 - t0));
+                const double sigR = stMax * cR;                      // residual: bounds all lambdas
+                if (sigR <= 0.0) return true;
+                double t = t0;
+                for (;;) {
+                    t += -std::log(1.0 - rng.uniformOpen()) / sigR;
+                    if (t >= t1) return true;
+                    const double dens = med.densityAt(o + dir * t, tabs);
+                    for (int i = 0; i < K; ++i) {
+                        const double sigT = stB[i] * dens, sigC = stB[i] * cC;
+                        Tr[i] *= 1.0 - (sigT - sigC) / sigR;
+                        if (Tr[i] < 0.0) Tr[i] = 0.0;
+                    }
+                }
+            });
+            return;
+        }
+        const double sigMax = stMax * med.densityMax;                // global majorant over all lambdas
+        if (sigMax <= 0.0) return;
+        double t = ta;
+        for (;;) {
+            t += -std::log(1.0 - rng.uniformOpen()) / sigMax;
+            if (t >= tb) break;
+            const double dens = med.densityAt(o + dir * t, tabs);
+            for (int i = 0; i < K; ++i) {
+                Tr[i] *= 1.0 - (stB[i] * dens) / sigMax;
+                if (Tr[i] < 0.0) Tr[i] = 0.0;
+            }
+        }
+    }
+
 
     // --- Multi-medium (superposition) forward helpers ------------------------
     // The scene may hold several independent media (Scene::media) that overlap. Two
@@ -960,6 +1051,17 @@ struct Renderer {
             if (Tr <= 0.0) break;
         }
         return Tr;
+    }
+
+    // Whole-scene version: media superpose, so the transmittances multiply (see the note below).
+    static void mediaTransmittanceSpec(const Scene& scene, const Vec3& o, const Vec3& dir,
+                                       double dist, const double* lams, int K, double* Tr,
+                                       Pcg32& rng, MedFilter filt = MedAll) {
+        const PatTables tabs = scene.patTables();
+        for (const Medium& m : scene.media) {
+            if (!medPasses(m, filt)) continue;
+            mediumTransmittanceSpec(m, o, dir, dist, lams, K, Tr, rng, &tabs);
+        }
     }
 
     // Append the photon beams for one straight crossing of the media, from `o` along `dir`

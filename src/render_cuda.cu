@@ -2208,6 +2208,10 @@ __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, con
 // therefore keep the exact analytic transmittance. See majorant.h for why the residual
 // split is what makes an optically thick volume converge (~1100x variance reduction at
 // tau = 8) and why merely TIGHTENING the majorant would have done nothing.
+// Cap on the wavelength count dMedTransmittanceSpec accepts (a per-thread stack array, so it is
+// fixed): DSpecThr::K + 1 -- the grid plus the camera's own wavelength, which rides along so the
+// scalar throughput and the carrier's denominator cannot disagree.
+#define DSPEC_TRMAX 32
 __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const DVec3& dir,
                                          Real dist, Real lambda, DRng& rng,
                                          const DPatEnv& env) {
@@ -2298,6 +2302,88 @@ __device__ static Real dMediaTransmittance(const DScene& sc, const DVec3& o,
         if (Tr <= (Real)0) break;
     }
     return Tr;
+}
+
+// Transmittance at several wavelengths along one segment through one medium, from a SINGLE
+// shared walk (host twin: Renderer::mediumTransmittanceSpec). The wavelength enters only through
+// `medSigmaT(m, lambda)` -- the density field is achromatic -- so:
+//   * HOMOGENEOUS: exp(-sigma_t(lambda) * len) per wavelength. Analytic, exact, no sampling.
+//   * HETEROGENEOUS: ratio tracking whose collisions are driven by a majorant bounding EVERY
+//     wavelength, one weight update per wavelength per collision. One march, wider arithmetic,
+//     and the estimates stay CORRELATED -- which matters because the consumer divides them.
+// `Tr[i]` is multiplied into, so media chain.
+__device__ static void dMedTransmittanceSpec(const DMedium& m, const DVec3& o, const DVec3& dir,
+                                             Real dist, const Real* lams, int K, double* Tr,
+                                             DRng& rng, const DPatEnv& env) {
+    double stB[DSPEC_TRMAX];
+    double stMax = 0.0;
+    for (int i = 0; i < K; ++i) {
+        stB[i] = (double)medSigmaT(m, lams[i]);
+        if (stB[i] < 0.0) stB[i] = 0.0;
+        if (stB[i] > stMax) stMax = stB[i];
+    }
+    if (stMax <= 0.0) return;
+    // FLAT in sigma_t => one transmittance, not K: take the scalar walk once (host twin
+    // explains why this is exact). Most media are flat, and the stochastic tier is expensive.
+    bool flatMed = true;
+    for (int i = 1; i < K; ++i)
+        if (fabs(stB[i] - stB[0]) > 1e-12 * (1.0 + stB[0])) { flatMed = false; break; }
+    if (flatMed) {
+        const double T = (double)dMedTransmittance(m, o, dir, dist, lams[0], rng, env);
+        for (int i = 0; i < K; ++i) Tr[i] *= T;
+        return;
+    }
+    double ta, tb;
+    if (!dMedClip(m, o, dir, 0.0, (double)dist, ta, tb)) return;
+    if (!m.heterogeneous) {
+        const double len = tb - ta;
+        for (int i = 0; i < K; ++i) Tr[i] *= exp(-stB[i] * len);
+        return;
+    }
+    if (m.majorant.ctrl) {
+        DMajWalk w; w.init(m.majorant, o, dir, ta, tb);
+        size_t ci; double a, b;
+        while (w.next(m.majorant, ci, a, b)) {
+            const double cC = (double)m.majorant.ctrl[ci], cR = (double)m.majorant.res[ci];
+            for (int i = 0; i < K; ++i)
+                if (stB[i] * cC > 0.0) Tr[i] *= exp(-stB[i] * cC * (b - a));
+            const double sigR = stMax * cR;              // bounds every wavelength, not just the hero
+            if (sigR <= 0.0) continue;
+            double t = a;
+            for (;;) {
+                t += -log(1.0 - (double)rng.uniformOpen()) / sigR;
+                if (t >= b) break;
+                const double dens = dMedDensityAt(m, o + dir * (Real)t, env);
+                for (int i = 0; i < K; ++i) {
+                    Tr[i] *= 1.0 - (stB[i] * dens - stB[i] * cC) / sigR;
+                    if (Tr[i] < 0.0) Tr[i] = 0.0;
+                }
+            }
+        }
+        return;
+    }
+    const double sigMax = stMax * m.densityMax;
+    if (sigMax <= 0.0) return;
+    double t = ta;
+    for (;;) {
+        t += -log(1.0 - (double)rng.uniformOpen()) / sigMax;
+        if (t >= tb) break;
+        const double dens = dMedDensityAt(m, o + dir * (Real)t, env);
+        for (int i = 0; i < K; ++i) {
+            Tr[i] *= 1.0 - (stB[i] * dens) / sigMax;
+            if (Tr[i] < 0.0) Tr[i] = 0.0;
+        }
+    }
+}
+
+__device__ static void dMediaTransmittanceSpec(const DScene& sc, const DVec3& o, const DVec3& dir,
+                                               Real dist, const Real* lams, int K, double* Tr,
+                                               DRng& rng, int filt = DMedAll) {
+    const DPatEnv env = dPatEnvOf(sc);
+    for (int i = 0; i < sc.mediaN; ++i) {
+        if (!dMedPasses(sc.media[i], filt)) continue;
+        dMedTransmittanceSpec(sc.media[i], o, dir, dist, lams, K, Tr, rng, env);
+    }
 }
 
 // Minimal device complex (host uses std::complex; not available in device code).
@@ -14246,6 +14332,9 @@ __device__ static double dCamMediaTr(const DScene& sc, const DVec3& o, const DVe
     return s / (double)n;
 }
 
+// The spectral twin of dCamMediaTr: the segment's transmittance at every DSpecThr grid wavelength
+// plus, in the last slot, the camera's own -- all from one shared walk, so the scalar `thr` and the
+// carrier's denominator are the same number by construction.
 // ---- SPECGATHER: the camera walk's spectral throughput (host twin: photonmap_render.h) ------
 // The walk is MONOCHROMATIC at the camera sample's wavelength; the photon map is POLYCHROMATIC.
 // The density estimate below gets this right per photon (`dDiffuseRho(..., ph.lambda)`), but every
@@ -14270,6 +14359,16 @@ struct DSpecThr {
     __device__ static int binOf(Real lam) {
         int b = (int)(((double)lam - DLMIN) / (DLMAX - DLMIN) * K);
         return b < 0 ? 0 : (b >= K ? K - 1 : b);
+    }
+    // Fold in a factor already evaluated ON the grid plus its value at the camera's wavelength --
+    // the media term, whose per-wavelength values come from one shared walk rather than from a
+    // function that can be called per bin.
+    __device__ void mulVec(const double* vk, double atCam) {
+        cam *= atCam;
+        for (int k = 0; k < K; ++k) {
+            if (!any && fabs(vk[k] - vk[0]) > 1e-12 * (1.0 + fabs(vk[0]))) any = 1;
+            v[k] *= vk[k];
+        }
     }
     __device__ double ratio(Real lamP) const {
         if (!any) return 1.0;
@@ -14304,6 +14403,37 @@ __device__ static void dSpecFold(DSpecThr& st, const DScene& sc, const DMaterial
         st.v[k] *= transmit ? (double)clamp01(dTransmitSlot(sc, m, h, lk))
                             : (double)clamp01(dReflectSlot(sc, m, h, lk));
     }
+}
+
+// The spectral twin of dCamMediaTr: the segment's transmittance at every DSpecThr grid wavelength
+// plus, in the last slot, the camera's own -- all from ONE shared walk, so the scalar `thr` and the
+// carrier's denominator are the same number by construction rather than by coincidence.
+__device__ static void dCamMediaTrSpec(const DScene& sc, const DVec3& o, const DVec3& d, Real len,
+                                       Real lambda, DRng& rng, double* Tv) {
+    Real lams[DSpecThr::K + 1];
+    for (int k = 0; k < DSpecThr::K; ++k) lams[k] = DSpecThr::lamOf(k);
+    lams[DSpecThr::K] = lambda;
+    for (int k = 0; k <= DSpecThr::K; ++k) Tv[k] = 1.0;
+    // The same sun-disc multi-sampling the scalar version does: a directly-viewed disc is ~10^4x
+    // its surroundings, so one sample of the medium in front of it twinkles. Averaging whole
+    // VECTORS keeps the wavelengths correlated within each sample.
+    int n = 1;
+    if (sc.sunCount > 0)
+        for (int k = 0; k < sc.nEmitters; ++k)
+            if (sc.emitters[k].shape == 6 && dInSunCone(sc.emitters[k], d)) { n = pbeams::kSunDiscTrSamples; break; }
+    if (n == 1) {
+        dMediaTransmittanceSpec(sc, o, d, len, lams, DSpecThr::K + 1, Tv, rng);
+        return;
+    }
+    double acc[DSpecThr::K + 1];
+    for (int k = 0; k <= DSpecThr::K; ++k) acc[k] = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double one[DSpecThr::K + 1];
+        for (int k = 0; k <= DSpecThr::K; ++k) one[k] = 1.0;
+        dMediaTransmittanceSpec(sc, o, d, len, lams, DSpecThr::K + 1, one, rng);
+        for (int k = 0; k <= DSpecThr::K; ++k) acc[k] += one[k];
+    }
+    for (int k = 0; k <= DSpecThr::K; ++k) Tv[k] = acc[k] / (double)n;
 }
 
 // ----------------------- photon-map camera gather (mode M) -------------------
@@ -14382,7 +14512,12 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     if (volOn) dGatherPhotonBeams(sc, *bm, pro, rd, slen, aGlass, rng, bX, bY, bZ);
                     if (sunOn) dSunNeeMarch(sc, pro, rd, slen, aGlass, lambda, invPdfL, rng, bX, bY, bZ);
                     oX += bX * thr; oY += bY * thr; oZ += bZ * thr;
-                    thr *= dCamMediaTr(sc, pro, rd, slen, lambda, rng);
+                    {   // SPECGATHER: extinction is spectral too (badly so in a coloured medium)
+                        double Tv[DSpecThr::K + 1];
+                        dCamMediaTrSpec(sc, pro, rd, slen, lambda, rng, Tv);
+                        thr *= Tv[DSpecThr::K];
+                        sthr.mulVec(Tv, Tv[DSpecThr::K]);
+                    }
                 }
                 if (aGlass > 0.0) thr *= exp(-aGlass * (double)gm.arc);
             }
@@ -14401,7 +14536,12 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             if (volOn) dGatherPhotonBeams(sc, *bm, ro, rd, dSeg, aGlass, rng, bX, bY, bZ);
             if (sunOn) dSunNeeMarch(sc, ro, rd, dSeg, aGlass, lambda, invPdfL, rng, bX, bY, bZ);
             oX += bX * thr; oY += bY * thr; oZ += bZ * thr;
-            thr *= dCamMediaTr(sc, ro, rd, dSeg, lambda, rng);
+            {   // SPECGATHER: extinction is spectral too (badly so in a coloured medium)
+                double Tv[DSpecThr::K + 1];
+                dCamMediaTrSpec(sc, ro, rd, dSeg, lambda, rng, Tv);
+                thr *= Tv[DSpecThr::K];
+                sthr.mulVec(Tv, Tv[DSpecThr::K]);
+            }
             if (thr <= 0.0) return;
         }
         if (h.valid) {                                   // Beer-Lambert in current medium

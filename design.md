@@ -928,8 +928,17 @@ into `thr`**, not re-sampled from the grid — that is what makes `thr * ratio` 
 agreeing one as constant, so uncoloured materials cost three lookups rather than 24 and flat scenes
 are unchanged. Cost measured at +4 % on a gallery_rain frame.
 
-Covered: `Mirror`, `Glossy`, `Filter`, the `ThinFilm`/`Multilayer`/`Grating` arm, and coloured-glass
-absorption. Not covered, with reasons, in known-issues: media transmittance (a stochastic estimator,
+**The media term joined it in 0.322.0** (`Renderer::mediumTransmittanceSpec`,
+`dMedTransmittanceSpec`). A transmittance is a stochastic estimate, so it cannot use the ratio
+trick (`E[A/B] != E[A]/E[B]`); the walk carries a per-wavelength vector instead, in three tiers —
+**flat in sigma_t** (one scalar walk repeated: exact, free, and what most media are),
+**homogeneous** (`exp(-sigma_t(lambda) * len)`: analytic, exact), and **heterogeneous** (ratio
+tracking with a majorant bounding every wavelength and one weight update per wavelength, so the
+estimates stay correlated). Measured: a coloured fog went from a 113 % channel spread against
+mode D to 1.0 %, and gallery_rain is unaffected in both image and cost (96 s).
+
+Covered: `Mirror`, `Glossy`, `Filter`, the `ThinFilm`/`Multilayer`/`Grating` arm, coloured-glass
+absorption, and media transmittance. Not covered, with reasons, in known-issues: media transmittance (a stochastic estimator,
 not a function), the `Hair` BCSDF (cost), and the binary stochastic choices in `HalfMirror` and the
 layered coat.
 
