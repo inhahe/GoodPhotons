@@ -866,7 +866,7 @@ and `reflectSlot`, and `dReflectSlot` on the device -- *after* texture, record, 
 vertex-colour, so a textured body gets it as surely as a constant one. Entry transmission is already
 carried by the coat/body selection probability, so there is no double count.
 
-Measured in a white furnace (`scraps/furn3_*.ftsl`, camera inside, six single-quad emissive mesh
+Measured in a white furnace (`tools/furnace_rig.py`, camera inside, six single-quad emissive mesh
 blocks). The rig is validated first -- mirror 1.0004, diffuse 1.0 -> 1.0003, diffuse 0.5 -> 0.5001 --
 and `F` is measured from a black-body-under-coat case (0.0401) rather than fitted:
 
@@ -934,7 +934,7 @@ that they hold.
 **Note on the rig, because it cost two wrong measurements.** A furnace built from `light area {}`
 is **blind to specular** -- those emitters have no hittable surface, so a mirror in the box reads
 exactly 0.0000 -- and a furnace built as one emissive mesh is silently flipped outward and reads
-black. Both are recorded in known-issues; `scraps/furn3_*.ftsl` is the version that works, and it
+black. Both are recorded in known-issues; `tools/furnace_rig.py` is the version that works, and it
 carries its three ground-truth controls (mirror, diffuse 1.0, diffuse 0.5) so the rig proves itself
 before any result is read.
 

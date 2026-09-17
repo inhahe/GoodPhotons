@@ -4526,7 +4526,7 @@ lands beyond the critical angle and is trapped by total internal reflection, whi
 form. **The refraction effect and the TIR problem are co-extensive; you cannot take one without the
 other.** Coat roughness never enters the argument, which is why narrowing by it was a mistake.
 
-**Second, the size of the error, measured.** `scraps/a3_snell.py` brute-forces the real layered
+**Second, the size of the error, measured.** `tools/a3_snell.py` brute-forces the real layered
 system (refract in, bounce on a GGX body, escape if inside the critical cone else TIR back down and
 bounce again, to convergence) and compares it with what ftrace renders today. Smooth coat n = 1.5:
 
@@ -27037,7 +27037,7 @@ So the surprise is not confined to closed shells: **any** emissive mesh with tri
 one plane is at risk, which includes the ordinary way one would model a light fixture.
 
 **Workaround: one `mesh` block per planar face.** Each block is measured on its own, so each is
-planar and none is flipped. `scraps/furn3_*.ftsl` (the white-furnace rig) is built this way and says
+planar and none is flipped. `tools/furnace_rig.py` (the white-furnace rig) is built this way and says
 so in its header.
 
 **Fix when it is worth doing:** an explicit opt-out on the mesh block -- `emit_orient keep` alongside

@@ -57,7 +57,7 @@ four albedo funnels (`diffuseReflectance`, `reflectSlot`, and `dReflectSlot` on 
 *after* texture / record / pattern / vertex-colour, so a textured body gets it too. Entry
 transmission stays where it was (the coat/body selection probability), so nothing is double counted.
 
-Validated in a white furnace with the camera inside, `scraps/furn3_*.ftsl`, mode D on GPU, 3000 spp.
+Validated in a white furnace with the camera inside, `tools/furnace_rig.py`, mode D on GPU, 3000 spp -- run it and it reprints the whole table.
 The rig proves itself first -- mirror **1.0004**, diffuse 1.0 -> **1.0003**, diffuse 0.5 -> **0.5001**
 -- and `F` is measured from a black-body-under-coat case (**0.0401**), not fitted:
 
@@ -131,7 +131,7 @@ lands past the critical angle and is trapped by TIR, which has no closed form. T
 and the TIR problem are co-extensive. Coat roughness never enters the argument, which is why
 narrowing by it was wrong.
 
-**2. The error is large and was measured** (`scraps/a3_snell.py`, brute-forcing the real layered
+**2. The error is large and was measured** (`tools/a3_snell.py`, brute-forcing the real layered
 system against what ftrace renders today): up to **-37 % in directional albedo and -34 % in lobe
 width** on a glossy body under a smooth coat. The bar the trigger set was "a few percent".
 
