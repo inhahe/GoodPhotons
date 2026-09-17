@@ -27067,6 +27067,15 @@ available in the very first log line (`auto-exposure=4.48e-16`) and I read it as
 **load-time guard**: the sun parser integrates the authored irradiance over 360-830 nm and warns
 above 1e5 W/m^2, naming the number and the fix. FTSL.md section 11 documents the trap.
 
+**And the fix was wrong the first time (v0.328.0 -> v0.328.1).** I computed the intensity from a
+per-nanometre Planck integral (1.79e7 for 6504 K) and wrote `5.04e-06`; the renderer's
+`blackbody` is per METRE (1.79e16), so that key was still 9e10 W/m^2 -- ninety million suns --
+and auto-exposure would have hidden it again. What caught it was the guard I had just added:
+loading a one-line scene with that intensity printed `integrates to 9e+10 W/m^2 -- 89998408
+times the real sun`. The corrected key is `5.04e-15`, on which the guard is silent, as it is on
+gallery_rain's `9.2649e-14`. The lesson is the guard's own: when two unit systems are in play,
+believe the number the code prints, not the one you derived.
+
 ## OPEN (2026-09-17): an emissive mesh that is not PLANAR is silently re-oriented OUTWARD, so an emissive enclosure renders black
 
 **Repro.** A cube of six inward-facing emissive quads, as one mesh, with the camera inside: the whole

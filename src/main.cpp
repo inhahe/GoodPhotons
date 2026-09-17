@@ -18907,12 +18907,15 @@ static int run(int argc, char** argv) {
         // below), the classic portrait key, so the highlight lands on the near side of the
         // subject rather than behind it. `angle 6` instead of the sun's real 0.53° makes it a
         // softbox rather than a pinpoint: a soft highlight reads as satin, a hard one as glass.
-        // A Planckian is ABSOLUTE radiance (~1e13 W/m^2/sr/nm), and a `light sun` takes its
-        // spd as absolute irradiance, so the intensity is the small number that brings the
-        // band integral to ~90 W/m^2 -- roughly 60:1 against the env fill above. (Through
-        // 0.327.0 this line said `preset:d65 intensity 90`: a sun 1e14 times the real one,
-        // hidden by auto-exposure until fibers made the scale visible. See known-issues.)
-        src += "light sun { dir -0.319 0.785 0.531  angle 6  spd blackbody 6504  intensity 5.04e-06 }\n";
+        // A Planckian is ABSOLUTE radiance (the renderer's `blackbody` is per METRE of
+        // wavelength: `blackbody 6504` integrates to 1.79e16 over 360-830 nm), and a `light sun`
+        // takes its spd as absolute irradiance, so the intensity is the small number that brings
+        // the band integral to ~90 W/m^2 -- roughly 60:1 against the env fill above. (Through
+        // 0.327.0 this line said `preset:d65 intensity 90`: a sun 1e14 times the real one, hidden
+        // by auto-exposure until fibers made the scale visible; 0.328.0's "fix" was 5.04e-06,
+        // a per-nanometre figure a factor 1e9 too large -- the loader's own guard caught it. The
+        // value below is the one the guard is silent on. See known-issues.)
+        src += "light sun { dir -0.319 0.785 0.531  angle 6  spd blackbody 6504  intensity 5.04e-15 }\n";
         std::string ferr;
         if (!ftsl::loadSource(src, std::string("<mesh-viewer:") + inFile + ">", ftslScene, ferr)) {
             std::fprintf(stderr, "[ftrace] could not load mesh '%s': %s\n", inFile, ferr.c_str());
