@@ -207,6 +207,10 @@ green grid light through the mass, and rare strand-to-strand paths make fireflie
      weight 1/p). UNBIASED, so no darkening; expected cost falls; variance rises. A hard cap is
      NOT acceptable: light hair IS multiple scattering, and a cap darkens the body of the mass
      while leaving the sheen, i.e. it changes the character, not the exposure.
+     **SUPERSEDED (2026-09-17):** the "fireflies" were chroma variance of the monochromatic walk
+     and few-sample colour, not rare long chains -- the fold, HAIR-NEE, 20 M photons and the
+     chroma filter removed them (C). Roulette would have added variance to a walk whose cost is
+     now dominated by the GPU gather; not built.
   3. Judge by the same with/without pair at flyby scale: the aggregate must match the base to
      within the frame noise (mean |diff| ~11/255 is the floor) AND look the same to the eye.
      Only then is an LOD switch (hair off at distance) invisible.
@@ -432,6 +436,16 @@ frame currently renders in ~96 s.
 **Before launching:** render a handful of scattered frames (`-camera fly0000`, `fly0400`, `fly0555`,
 `fly1146`) at final settings and look at them. Cheap insurance against discovering a framing or
 exposure problem 900 frames in.
+**DONE 2026-09-17 (`png/flyframes/sheet.png`).** The four frames at the final recipe --
+`-mode M -device gpu -n 20000000 -spp 24 -r 960 540 -denoise -fireflies 3 -denoise-levels 2`
+(with hair on the GPU since 0.335.0) -- render clean: the hall, the gyroid, the compote, the grid
+all as in the stills; Alice is at the frame's right edge in fly0000/fly1146 and a 30-50 px blonde
+figure in fly0400/fly0555. Gathering one frame alone takes ~2 min (5.75 s/spp), so the whole
+flyby is ~40-45 h of GPU time; `-frames A B` resumes a stopped run. **Decisions that are the
+user's:** launching the run (it owns the GPU for two days; other GPU jobs alongside a long
+mode-M gather are what killed the cloud-circuit run), and whether to LOD the hair -- on the GPU
+the strands read luminance 81 / hue 71 deg against the molded base's 86 / 54 deg, so a switch
+would show a small step; without one the cost is as above.
 
 ## 2. glTF per-texel metalness -> a `mixWeightTex`-driven mix — the likely remaining Meshy gap
 
