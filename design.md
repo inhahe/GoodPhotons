@@ -1060,6 +1060,19 @@ wavelength and folded with `mulVec` (SPECGATHER for hair). The deposit pass alre
 (`interactHair`), so the map was never the obstacle. SPPM's gather still has no hair case, so
 `cudaSppmSupported` refuses hair on its own now that it can no longer inherit the refusal.
 
+**The fold in per-lobe form (0.336.0).** A solid fiber's BCSDF is a sum over lobes of
+(angular term) x (attenuation), and only the attenuations depend on wavelength -- through
+T = exp(-sigma_a * chord), with the chord length wavelength-independent (`Chord::len`, now
+recorded by `refractGeom`). `hair::lobeAngular` computes the per-lobe angular products once per
+sample and `hair::fFromLobes` gives f at any absorption for one exp and one `Ap()`; the device
+has the same pair in `dhair`. Both walks' folds use it (a fiber with a medulla keeps the full
+rebuild: its lobes take the absorption through the chord in more than one place). Measured
+bit-identical to the rebuild on the GPU and within rounding on the CPU. The remaining per-bin
+cost was the colour inversion: Chiang's fit has a denominator that depends on `beta_n` alone and
+cost three `pow()` per call (`sigmaADenominator` hoists it), and on the CPU a material whose
+reflectance is a constant spectrum gets its 24-bin sigma_a table cached per thread per material
+(`hairSigmaBins`), so the fold no longer inverts the colour per bounce at all. Finally the angular products come free: `f()` fills a `LobeAngular` on request from the terms it computes anyway (its own sum keeps its product order, so every other hair render is bit-identical), `sample()` passes the request through, and `Ap` is split so the Fresnel term is taken once -- a bin is one exp and the four-lobe recurrence. Measured: the GPU frames bit-identical to the rebuild, the CPU's within rounding; the fold's cost on a hair-filled view fell from +60-85 % to +20-50 % of the camera pass, the spread being the machine's other load during the runs (the OFF runs themselves ranged 1:12-1:28).
+
 **Curves of curves (0.326.0).** `ftsl.h addCurve` is now recursive (`flattenCurveNode`): a
 `curve` node's children are `point`s (a strand, unchanged) or `curve`s (inline or by name), and a
 node of curves flattens to instances placed along the Catmull-Rom through its children's roots

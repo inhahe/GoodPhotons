@@ -4412,6 +4412,13 @@ __device__ static double frDielectric(double cosThetaI, double etaI, double etaT
 
 // Attenuation A_p: Fresnel at each crossing + Beer-Lambert through the interior; the
 // p = kPMax entry is the closed-form geometric tail (energy conservation).
+__device__ static void ApFromF(double f, double T, double ap[kPMax + 1]) {
+    ap[0] = f;                                   // R
+    ap[1] = sqr(1.0 - f) * T;                    // TT
+    for (int p = 2; p < kPMax; ++p) ap[p] = ap[p - 1] * T * f;
+    const double denom = 1.0 - T * f;
+    ap[kPMax] = (denom > 1e-12) ? ap[kPMax - 1] * f * T / denom : 0.0;
+}
 __device__ static void Ap(double cosThetaO, double eta, double h, double T, double ap[kPMax + 1]) {
     const double cosGammaO = safeSqrt(1.0 - h * h);
     const double f = frDielectric(cosThetaO * cosGammaO, 1.0, eta);
@@ -4453,6 +4460,7 @@ struct Chord {
     double albedoM  = 0.0;   // medulla single-scattering albedo
     double Tb       = 1.0;   // Yan eq. 20 post-scatter escape
     double tauP     = 0.0;   // reduced optical depth (1-g) sigma_s chord
+    double len      = 0.0;   // the unscattered path's length across the fiber, in radii
 };
 
 __device__ static Bcsdf make(const Params& pr, double h, double sigmaA) {
@@ -4514,6 +4522,7 @@ __device__ static Chord refractGeom(const Bcsdf& b, double sinThetaO, double cos
     const double sinThetaT = sinThetaO / b.eta;
     const double cosThetaT = safeSqrt(1.0 - sqr(sinThetaT));
     const double invCosT = 1.0 / fmax(cosThetaT, 1e-9);
+    ch.len = 2.0 * cosGammaT * invCosT;
 
     if (!b.hasMedulla) {
         ch.T = exp(-b.sigmaA * (2.0 * cosGammaT * invCosT));
@@ -4580,7 +4589,23 @@ __device__ static inline double scatteredS(const Bcsdf& b, double spread) {
 // ~200k resident threads of VRAM, hair scene or not. As calls, the frames only go
 // live on actual hair evaluations, and MIN_STACK grows by the one deepest hair
 // chain instead of leaking hair bytes into every frame on the path.
-__device__ __noinline__ static double f(const Bcsdf& b, const V3& wo, const V3& wi) {
+// Host twin: hair.h LobeAngular / fFromLobes -- f() fills the angular products it computes
+// anyway on request; the fold then costs one exp and the four-lobe recurrence per bin.
+struct LobeAngular {
+    double G[kPMax + 1];
+    double F, len, invCosI;
+    bool   valid;
+};
+__device__ static double fFromLobes(const LobeAngular& la, double sigmaA) {
+    double ap[kPMax + 1];
+    ApFromF(la.F, exp(-fmax(0.0, sigmaA) * la.len), ap);
+    double sum = 0.0;
+    for (int p = 0; p <= kPMax; ++p) sum += la.G[p] * ap[p];
+    sum *= la.invCosI;
+    return isfinite(sum) ? fmax(0.0, sum) : 0.0;
+}
+
+__device__ __noinline__ static double f(const Bcsdf& b, const V3& wo, const V3& wi, LobeAngular* la = nullptr) {
     const double sinThetaO = clampd(wo.x, -1.0, 1.0), cosThetaO = safeSqrt(1.0 - sqr(sinThetaO));
     const double sinThetaI = clampd(wi.x, -1.0, 1.0), cosThetaI = safeSqrt(1.0 - sqr(sinThetaI));
     const double phiO = atan2(wo.z, wo.y);
@@ -4597,11 +4622,21 @@ __device__ __noinline__ static double f(const Bcsdf& b, const V3& wo, const V3& 
     for (int p = 0; p < kPMax; ++p) {
         double sinThetaOp, cosThetaOp;
         tiltO(b, p, sinThetaO, cosThetaO, sinThetaOp, cosThetaOp);
-        sum += Mp(cosThetaI, cosThetaOp, sinThetaI, sinThetaOp, b.v[p]) * ap[p] *
-               Np(phi, p, b.s, b.gammaO, gammaT);
+        const double mp = Mp(cosThetaI, cosThetaOp, sinThetaI, sinThetaOp, b.v[p]);
+        const double np = Np(phi, p, b.s, b.gammaO, gammaT);
+        sum += mp * ap[p] * np;                    // the same product order as always
+        if (la) la->G[p] = mp * np;
     }
-    sum += Mp(cosThetaI, cosThetaO, sinThetaI, sinThetaO, b.v[kPMax]) * ap[kPMax] *
-           (0.5 / kPi);
+    {   const double mpR = Mp(cosThetaI, cosThetaO, sinThetaI, sinThetaO, b.v[kPMax]);
+        sum += mpR * ap[kPMax] * (0.5 / kPi);
+        if (la) la->G[kPMax] = mpR * (0.5 / kPi);
+    }
+    if (la) {
+        la->F = ap[0]; la->len = ch.len;
+        const double absCosI0 = fabs(cosThetaI);
+        la->invCosI = (absCosI0 > 1e-9) ? 1.0 / absCosI0 : 1.0;
+        la->valid = !b.hasMedulla;
+    }
 
     if (b.hasMedulla) {
         double aps[2];
@@ -4624,6 +4659,9 @@ __device__ __noinline__ static double f(const Bcsdf& b, const V3& wo, const V3& 
     return isfinite(sum) ? fmax(0.0, sum) : 0.0;
 }
 
+// The wavelength-independent half of f() for a solid fiber (host twin: hair.h lobeAngular /
+// fFromLobes): the per-lobe angular products once, then f at any absorption for one exp and
+// one Ap(). What the mode-M spectral fold evaluates 27 times per fiber bounce.
 // Discrete lobe-choice probabilities, proportional to the energy each carries.
 __device__ static void apPdf(const Bcsdf& b, double sinThetaO, double cosThetaO, double pdf[kNLobes]) {
     const Chord ch = refractGeom(b, sinThetaO, cosThetaO);
@@ -4683,7 +4721,7 @@ __device__ __noinline__ static double pdf(const Bcsdf& b, const V3& wo, const V3
 // Importance-sample an outgoing direction; pdfOut/fOut are filled to match, so a
 // caller's weight is fOut * |cos theta_i| / pdfOut (see hair.h::sample).
 __device__ __noinline__ static V3 sample(const Bcsdf& b, const V3& wo, double u0, double u1, double u2,
-                            double u3, double& pdfOut, double& fOut) {   // __noinline__: see f above
+                            double u3, double& pdfOut, double& fOut, LobeAngular* la = nullptr) {   // __noinline__: see f above
     const double sinThetaO = clampd(wo.x, -1.0, 1.0), cosThetaO = safeSqrt(1.0 - sqr(sinThetaO));
     const double phiO = atan2(wo.z, wo.y);
 
@@ -4729,11 +4767,19 @@ __device__ __noinline__ static V3 sample(const Bcsdf& b, const V3& wo, double u0
 
     const V3 wi{sinThetaI, cosThetaI * cos(phiI), cosThetaI * sin(phiI)};
     pdfOut = pdf(b, wo, wi);
-    fOut   = f(b, wo, wi);
+    fOut   = f(b, wo, wi, la);
     return wi;
 }
 
 // Absorption from a target multiply-scattered reflectance (Chiang eq. 9).
+__device__ static double sigmaADenominator(double betaN) {
+    const double bn = clampd(betaN, 1e-4, 1.0);
+    return 5.969 - 0.215 * bn + 2.532 * sqr(bn) - 10.73 * pow(bn, 3.0) + 5.574 * pow(bn, 4.0) + 0.245 * pow(bn, 5.0);
+}
+__device__ static double sigmaAFromReflectanceD(double c, double denom) {
+    c = clampd(c, 1e-4, 1.0 - 1e-6);
+    return sqr(log(c) / denom);
+}
 __device__ static double sigmaAFromReflectance(double c, double betaN) {
     c = clampd(c, 1e-4, 1.0 - 1e-6);
     const double bn = clampd(betaN, 1e-4, 1.0);
@@ -4805,6 +4851,16 @@ __device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const D
 // Build the BCSDF at a hit — device twin of hairShadeAt. `wPrev` points away from the
 // surface, back along the path that got here (toward the light for the forward tracer,
 // toward the eye for the backward one); it is the reference direction h is measured from.
+// The fiber's absorption (per radius) at `lambda` (host twin: hairSigmaAAt).
+__device__ static double dHairSigmaAAt(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
+    if (m.hairSigmaAFromReflect) {
+        double c = (double)dDiffuseRho(sc, m, h, lambda);
+        c = c < 0.0 ? 0.0 : (c > 1.0 ? 1.0 : c);
+        return dhair::sigmaAFromReflectance(c, m.hairBetaN);
+    }
+    return fmax(0.0, (double)specLookup(m.hairSigmaA, lambda));
+}
+
 __device__ __noinline__ static DHairShade dHairShadeAt(const DScene& sc, const DMaterial& m,
                                           const DHit& h,   // __noinline__: see dhair::f
                                           Real lambda, const DVec3& wPrev) {
@@ -4818,16 +4874,9 @@ __device__ __noinline__ static DHairShade dHairShadeAt(const DScene& sc, const D
     pr.mSigmaS = fmax(0.0, (double)specLookup(m.hairMedullaSigmaS, lambda));
     pr.mSigmaA = fmax(0.0, (double)specLookup(m.hairMedullaSigmaA, lambda));
 
-    double sigmaA;
-    if (m.hairSigmaAFromReflect) {
-        // Chiang eq. 9 per-wavelength: invert the authored reflectance (via dDiffuseRho,
-        // so textures/patterns/records tint the fiber) into the absorption producing it.
-        double c = (double)dDiffuseRho(sc, m, h, lambda);
-        c = c < 0.0 ? 0.0 : (c > 1.0 ? 1.0 : c);
-        sigmaA = dhair::sigmaAFromReflectance(c, m.hairBetaN);
-    } else {
-        sigmaA = fmax(0.0, (double)specLookup(m.hairSigmaA, lambda));
-    }
+    // Chiang eq. 9 per-wavelength: the authored reflectance inverted into the absorption
+    // producing it (dHairSigmaAAt; a `sigma_a` spectrum is taken as is).
+    const double sigmaA = dHairSigmaAAt(sc, m, h, lambda);
 
     DHairShade s;
     // h.n is oriented against the arriving ray, so it is the normal on the side the path
@@ -14818,15 +14867,26 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 }
                 const double u0 = rng.uniform(), u1 = rng.uniform(), u2 = rng.uniform(), u3 = rng.uniform();
                 double pdfH = 0.0, fv = 0.0;
-                const dhair::V3 wl = dhair::sample(hsv.b, hsv.woLocal, u0, u1, u2, u3, pdfH, fv);
+                dhair::LobeAngular la;                    // filled by the sample's own f()
+                const dhair::V3 wl = dhair::sample(hsv.b, hsv.woLocal, u0, u1, u2, u3, pdfH, fv, &la);
                 if (!(pdfH > 0.0) || !(fv > 0.0)) return;
                 const double cosLong = dhair::safeSqrt(1.0 - dhair::sqr(dhair::clampd(wl.x, -1.0, 1.0)));
                 double wCam = fv * cosLong / pdfH; wCam = wCam < 0.0 ? 0.0 : (wCam > 1.0 ? 1.0 : wCam);
                 thr *= wCam;
-                {   double vk[DSpecThr::K];
+                {   // per-lobe form (0.336.0): one exp + the four-lobe recurrence per bin
+                    const bool perLobe = la.valid;
+                    const double den = m.hairSigmaAFromReflect ? dhair::sigmaADenominator(m.hairBetaN) : 0.0;   // hoisted: three pow() per bin otherwise
+                    double vk[DSpecThr::K];
                     for (int k = 0; k < DSpecThr::K; ++k) {
-                        const DHairShade hk = dHairShadeAt(sc, m, h, DSpecThr::lamOf(k), wPrev);
-                        double w = dhair::f(hk.b, hk.woLocal, wl) * cosLong / pdfH;
+                        const Real lk = DSpecThr::lamOf(k);
+                        double w;
+                        if (perLobe) {
+                            double sig;
+                            if (m.hairSigmaAFromReflect) { double c = (double)dDiffuseRho(sc, m, h, lk); sig = dhair::sigmaAFromReflectanceD(c, den); }
+                            else sig = fmax(0.0, (double)specLookup(m.hairSigmaA, lk));
+                            w = dhair::fFromLobes(la, sig) * cosLong / pdfH;
+                        }
+                        else { const DHairShade hk = dHairShadeAt(sc, m, h, lk, wPrev); w = dhair::f(hk.b, hk.woLocal, wl) * cosLong / pdfH; }
                         vk[k] = w < 0.0 ? 0.0 : (w > 1.0 ? 1.0 : w);
                     }
                     sthr.mulVec(vk, wCam);

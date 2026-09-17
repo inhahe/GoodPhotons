@@ -335,9 +335,14 @@ diffuse surface. 1147 frames: ~33 h -> ~166 h. Levers, cheapest first, each MEAS
   1.05-1.09, hue within 5-7 deg, per-pixel diff at the frames' noise level -- the device offset the
   base shows too, nothing hair-specific. The gallery still with strands at 20 M photons: 5.75 s per
   spp on the GPU -> ~2.3 min a 24-spp frame -> **~44 h for 1147 frames** (was ~97 h on the CPU).
-  Its hair reads luminance 81, hue 71 deg (CPU+NEE 85 / 55, D 97 / 58). Next cost lever with a
-  measured target: the spectral fold's per-lobe form (+60-85 % of the camera pass on hair pixels
-  today; the angular terms are wavelength-independent, so it should cost a few percent).
+  Its hair reads luminance 81, hue 71 deg (CPU+NEE 85 / 55, D 97 / 58).
+  **The fold's per-lobe form -- BUILT (0.336.0)** in three steps, each proven equal to the last
+  (GPU bit-identical, CPU within rounding): the BCSDF rebuild replaced by one exp + Ap() per bin
+  (no gain -- the rebuild was not the cost), the colour inversion's three pow() hoisted and its
+  24-bin table cached per material (no gain on a busy machine), then the angular products taken
+  from the sample's own f() and the Fresnel term hoisted so a bin is one exp and a four-lobe
+  recurrence: OFF 1:12 / 1:28 vs ON 1:47 / 1:47 on the head view, i.e. +20-50 % against the earlier
+  +60-85 % -- load-limited numbers (the machine was in use); a quiet re-measure is owed.
 
 **E. The hair-authoring GUI tool** (agreed 2026-09-17; design in 0.6 below).
 

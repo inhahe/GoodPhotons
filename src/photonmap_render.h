@@ -1663,8 +1663,9 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     hairArrival = true;
                 }
                 double pdfH = 0.0, fv = 0.0;
+                hair::LobeAngular la;                              // filled by the sample's own f()
                 const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
-                                             rng.uniform(), rng.uniform(), pdfH, fv);
+                                             rng.uniform(), rng.uniform(), pdfH, fv, &la);
                 if (!(pdfH > 0.0) || !(fv > 0.0)) return L;
                 const double cosLong =
                     hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
@@ -1683,11 +1684,22 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 // FTRACE_HAIR_SPECGATHER=0 turns the fold off (the scalar path of 0.332.0), for
                 // paired A/B measurements only -- read once per process.
                 static const bool hairSpecOn = [] { const char* e = std::getenv("FTRACE_HAIR_SPECGATHER"); return !(e && e[0] == '0'); }();
-                if (hairSpecOn)
+                if (hairSpecOn) {
+                    // Per-lobe form (0.336.0): the angular products once, then per grid wavelength
+                    // one absorption inversion, one exp and one Ap() -- a solid fiber's f() at any
+                    // wavelength is exactly that (hair.h lobeAngular / fFromLobes). A fiber with a
+                    // medulla keeps the full rebuild.
+                    const bool perLobe = la.valid;
+                    // the absorption per bin: a per-material table when the colour is constant
+                    // (hairSigmaBins), else inverted at each wavelength
+                    const double* bins = hairSigmaBins<SpecThr::K, &SpecThr::lamOf>(scene, m, h);
                     sthr.mul([&](double lamK) {
+                        if (perLobe)
+                            return clamp01(hair::fFromLobes(la, bins ? bins[SpecThr::binOf(lamK)] : hairSigmaAAt(scene, m, h, lamK)) * cosLong / pdfH);
                         const HairShade hk = hairShadeAt(scene, m, h, lamK, wPrev);
                         return clamp01(hair::f(hk.b, hk.woLocal, wl) * cosLong / pdfH);
                     }, wCam);
+                }
                 const Vec3 wo = hair::toWorld(hs.fr, wl);
                 ray = Ray{h.p + wo * hairExitOffset(hs, h.n, wo), wo};
                 break;

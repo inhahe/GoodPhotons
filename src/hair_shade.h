@@ -29,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <array>
 #include "hair.h"
 #include "scene.h"
 #include "fur_grid.h"   // -dual-grid: Zinke's §4.1.2 voxel density field
@@ -54,6 +55,35 @@ struct HairShade {
 // one. It is the model's reference direction — the impact parameter `h` is measured
 // relative to it (as it is in PBRT, where `h` comes from the ribbon that was turned to
 // face the incident ray), so it must be the arrival direction and not the sampled one.
+// The fiber's absorption (per radius) at `lambda`: the authored reflectance inverted (Chiang
+// eq. 9, per wavelength, through diffuseReflectance so textures / records / patterns tint the
+// fiber) or the `sigma_a` spectrum itself. Shared by hairShadeAt and the spectral fold.
+inline double hairSigmaAAt(const Scene& scene, const Material& m, const Hit& hit, double lambda) {
+    if (m.hairSigmaAFromReflect) {
+        double c = diffuseReflectance(scene, m, hit, lambda);
+        c = c < 0.0 ? 0.0 : (c > 1.0 ? 1.0 : c);
+        return hair::sigmaAFromReflectance(c, m.hairBetaN);
+    }
+    return std::max(0.0, m.hairSigmaA(lambda));
+}
+
+// The absorption at the K wavelengths of the mode-M spectral carrier, per material, when the
+// fiber's colour is a CONSTANT spectrum (no texture, pattern, record or vertex colour on the
+// reflect slot): computed once per thread per material, never per bounce. Null otherwise.
+template <int K, double (*LamOf)(int)>
+inline const double* hairSigmaBins(const Scene& scene, const Material& m, const Hit& hit) {
+    if (m.reflectTex >= 0 || m.reflectPat >= 0 || hit.hasVcol) return nullptr;
+    { double rv; if (recordReflectBound(scene, m, hit, LamOf(0), rv)) return nullptr; }
+    thread_local std::unordered_map<const Material*, std::array<double, K>> cache;
+    auto it = cache.find(&m);
+    if (it == cache.end()) {
+        std::array<double, K> bins;
+        for (int k = 0; k < K; ++k) bins[(size_t)k] = hairSigmaAAt(scene, m, hit, LamOf(k));
+        it = cache.emplace(&m, bins).first;
+    }
+    return it->second.data();
+}
+
 inline HairShade hairShadeAt(const Scene& scene, const Material& m, const Hit& hit,
                              double lambda, const Vec3& wPrev) {
     hair::Params pr;
@@ -68,19 +98,10 @@ inline HairShade hairShadeAt(const Scene& scene, const Material& m, const Hit& h
     pr.mSigmaS = std::max(0.0, m.hairMedullaSigmaS(lambda));
     pr.mSigmaA = std::max(0.0, m.hairMedullaSigmaA(lambda));
 
-    double sigmaA;
-    if (m.hairSigmaAFromReflect) {
-        // Chiang eq. 9 run per-wavelength: the authored `reflect` spectrum is read as the
-        // reflectance curve the fiber should END UP with, and inverted into the absorption
-        // that produces it. Going through diffuseReflectance() (rather than the constant
-        // spectrum) is what lets a groom carry a texture, a record or a pattern on its
-        // colour — root-to-tip darkening is just `reflect [0.1 0.6](u)`.
-        double c = diffuseReflectance(scene, m, hit, lambda);
-        c = c < 0.0 ? 0.0 : (c > 1.0 ? 1.0 : c);
-        sigmaA = hair::sigmaAFromReflectance(c, m.hairBetaN);
-    } else {
-        sigmaA = std::max(0.0, m.hairSigmaA(lambda));
-    }
+    // Chiang eq. 9 run per-wavelength: the authored `reflect` spectrum is read as the
+    // reflectance curve the fiber should END UP with, and inverted into the absorption that
+    // produces it (hairSigmaAAt; a `sigma_a` spectrum is taken as is).
+    const double sigmaA = hairSigmaAAt(scene, m, hit, lambda);
 
     HairShade s;
     // hit.n is oriented against the arriving ray, so it is the normal on the side the path

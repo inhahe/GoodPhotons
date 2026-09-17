@@ -196,6 +196,15 @@ inline double frDielectric(double cosThetaI, double etaI, double etaT) {
     return 0.5 * (rParl * rParl + rPerp * rPerp);
 }
 
+// The lobe attenuations from the cuticle's Fresnel term `f` and one traversal's survival T
+// (split out of Ap: the Fresnel term does not depend on wavelength, T does).
+inline void ApFromF(double f, double T, double ap[kPMax + 1]) {
+    ap[0] = f;                                   // R
+    ap[1] = sqr(1.0 - f) * T;                    // TT
+    for (int p = 2; p < kPMax; ++p) ap[p] = ap[p - 1] * T * f;
+    const double denom = 1.0 - T * f;
+    ap[kPMax] = (denom > 1e-12) ? ap[kPMax - 1] * f * T / denom : 0.0;
+}
 inline void Ap(double cosThetaO, double eta, double h, double T, double ap[kPMax + 1]) {
     const double cosGammaO = safeSqrt(1.0 - h * h);
     // The Fresnel angle is the FULL 3-D incidence on the cylinder wall, which is the
@@ -269,6 +278,7 @@ struct Chord {
     double albedoM  = 0.0;   // medulla single-scattering albedo, sigma_s / (sigma_s + sigma_a)
     double Tb       = 1.0;   // Yan eq. 20's post-scatter escape: kappa of medulla, 1-kappa of cortex
     double tauP     = 0.0;   // REDUCED optical depth (1-g)*sigma_s*chord — see scatteredSpread
+    double len      = 0.0;   // the unscattered path's length across the fiber, in radii (T = exp(-sigmaA * len) for a solid fiber)
 };
 
 // `sigmaA` is per-unit-radius absorption at the wavelength being traced (the chord
@@ -364,6 +374,7 @@ inline Chord refractGeom(const Bcsdf& b, double sinThetaO, double cosThetaO) {
     // sigmaA is per radius, the chord is in radii.
     const double invCosT = 1.0 / std::max(cosThetaT, 1e-9);
 
+    ch.len = 2.0 * cosGammaT * invCosT;
     if (!b.hasMedulla) {
         // Exactly the stage-1 expression, to the last bit.
         ch.T = std::exp(-b.sigmaA * (2.0 * cosGammaT * invCosT));
@@ -475,7 +486,29 @@ inline double scatteredS(const Bcsdf& b, double spread) {
 // special-casing between them. That is a convention, not physics — the underlying fiber
 // scattering function is per unit length — but it is the convention the published tests
 // use, and it keeps the integrators from having to know what a hair is.
-inline double f(const Bcsdf& b, const Vec3& wo, const Vec3& wi) {
+// The wavelength-INDEPENDENT half of f() for a solid fiber: the per-lobe angular products
+// G_p = M_p * N_p (the residual's N is the isotropic 1/2pi), the cuticle's Fresnel term, the
+// chord length and the projection. f() fills one on request from the terms it computes
+// anyway (its own sum is untouched), `sample()` passes the request through, and `fFromLobes`
+// then gives f at ANY absorption for one exp and the four-lobe recurrence -- what the mode-M
+// spectral fold needs 27 times per fiber bounce. `valid` is false for a fiber with a
+// medulla, whose scattered lobes take the absorption through the chord in more than one
+// place; the fold rebuilds those.
+struct LobeAngular {
+    double G[kPMax + 1] = {0, 0, 0, 0};
+    double F = 0.0, len = 0.0, invCosI = 1.0;
+    bool   valid = false;
+};
+inline double fFromLobes(const LobeAngular& la, double sigmaA) {
+    double ap[kPMax + 1];
+    ApFromF(la.F, std::exp(-std::max(0.0, sigmaA) * la.len), ap);
+    double sum = 0.0;
+    for (int p = 0; p <= kPMax; ++p) sum += la.G[p] * ap[p];
+    sum *= la.invCosI;
+    return std::isfinite(sum) ? std::max(0.0, sum) : 0.0;
+}
+
+inline double f(const Bcsdf& b, const Vec3& wo, const Vec3& wi, LobeAngular* la = nullptr) {
     const double sinThetaO = clampd(wo.x, -1.0, 1.0), cosThetaO = safeSqrt(1.0 - sqr(sinThetaO));
     const double sinThetaI = clampd(wi.x, -1.0, 1.0), cosThetaI = safeSqrt(1.0 - sqr(sinThetaI));
     const double phiO = std::atan2(wo.z, wo.y);
@@ -492,13 +525,23 @@ inline double f(const Bcsdf& b, const Vec3& wo, const Vec3& wi) {
     for (int p = 0; p < kPMax; ++p) {
         double sinThetaOp, cosThetaOp;
         tiltO(b, p, sinThetaO, cosThetaO, sinThetaOp, cosThetaOp);
-        sum += Mp(cosThetaI, cosThetaOp, sinThetaI, sinThetaOp, b.v[p]) * ap[p] *
-               Np(phi, p, b.s, b.gammaO, gammaT);
+        const double mp = Mp(cosThetaI, cosThetaOp, sinThetaI, sinThetaOp, b.v[p]);
+        const double np = Np(phi, p, b.s, b.gammaO, gammaT);
+        sum += mp * ap[p] * np;                    // the same product order as always
+        if (la) la->G[p] = mp * np;
     }
     // The residual is isotropic in azimuth by construction — it stands for paths that
     // have forgotten where they entered.
-    sum += Mp(cosThetaI, cosThetaO, sinThetaI, sinThetaO, b.v[kPMax]) * ap[kPMax] *
-           (0.5 / kPi);
+    {   const double mpR = Mp(cosThetaI, cosThetaO, sinThetaI, sinThetaO, b.v[kPMax]);
+        sum += mpR * ap[kPMax] * (0.5 / kPi);
+        if (la) la->G[kPMax] = mpR * (0.5 / kPi);
+    }
+    if (la) {
+        la->F = ap[0]; la->len = ch.len;
+        const double absCosI0 = std::fabs(cosThetaI);
+        la->invCosI = (absCosI0 > 1e-9) ? 1.0 / absCosI0 : 1.0;
+        la->valid = !b.hasMedulla;
+    }
 
     if (b.hasMedulla) {
         double aps[2];
@@ -519,6 +562,19 @@ inline double f(const Bcsdf& b, const Vec3& wo, const Vec3& wi) {
     const double absCosI = std::fabs(cosThetaI);
     if (absCosI > 1e-9) sum /= absCosI;
     return std::isfinite(sum) ? std::max(0.0, sum) : 0.0;
+}
+
+// (Superseded in the same version by the LobeAngular that f() fills as a by-product; kept for
+// callers that have no sample in hand.)
+// The wavelength-INDEPENDENT half of f() for a solid fiber, computed once per (wo, wi): the
+// per-lobe angular products G_p = M_p * N_p (the residual's N is the isotropic 1/2pi), the
+// chord length, the projection, and the cosine the Fresnel terms need. `fFromLobes` then
+// gives f at ANY absorption for one exp and one Ap() -- what the mode-M spectral fold needs
+// 27 times per fiber bounce (photonmap_render.h SPECGATHER, hair). A fiber with a medulla
+// takes its absorption through the chord in more than one place, so it keeps the full f().
+inline bool lobeAngular(const Bcsdf& b, const Vec3& wo, const Vec3& wi, LobeAngular& la) {
+    f(b, wo, wi, &la);
+    return la.valid;
 }
 
 // Discrete probability of picking each lobe, proportional to the energy it carries. Using
@@ -586,7 +642,7 @@ inline double pdf(const Bcsdf& b, const Vec3& wo, const Vec3& wi) {
 // Returns the sampled `wi` (local frame); `pdfOut` and `fOut` are filled to match, so a
 // caller's weight is simply fOut * |cos theta_i| / pdfOut.
 inline Vec3 sample(const Bcsdf& b, const Vec3& wo, double u0, double u1, double u2,
-                   double u3, double& pdfOut, double& fOut) {
+                   double u3, double& pdfOut, double& fOut, LobeAngular* la = nullptr) {
     const double sinThetaO = clampd(wo.x, -1.0, 1.0), cosThetaO = safeSqrt(1.0 - sqr(sinThetaO));
     const double phiO = std::atan2(wo.z, wo.y);
 
@@ -636,7 +692,7 @@ inline Vec3 sample(const Bcsdf& b, const Vec3& wo, double u0, double u1, double 
 
     const Vec3 wi{sinThetaI, cosThetaI * std::cos(phiI), cosThetaI * std::sin(phiI)};
     pdfOut = pdf(b, wo, wi);
-    fOut   = f(b, wo, wi);
+    fOut   = f(b, wo, wi, la);
     return wi;
 }
 
@@ -743,12 +799,19 @@ inline bool findSpecies(const char* want, Species& out) {
 // FULL multiple-scattering response, not Beer-Lambert on one pass, which is why the
 // roughness appears in it at all and why it is worth having rather than asking an author
 // for an absorption coefficient they cannot picture.
-inline double sigmaAFromReflectance(double c, double betaN) {
-    c = clampd(c, 1e-4, 1.0 - 1e-6);
+// The fit's denominator depends on the roughness alone: hoisted, because the mode-M spectral
+// fold inverts the colour at 24 wavelengths per fiber bounce and paid three pow() per call.
+inline double sigmaADenominator(double betaN) {
     const double bn = clampd(betaN, 1e-4, 1.0);
-    const double d = 5.969 - 0.215 * bn + 2.532 * sqr(bn) - 10.73 * std::pow(bn, 3) +
-                     5.574 * std::pow(bn, 4) + 0.245 * std::pow(bn, 5);
-    return sqr(std::log(c) / d);
+    return 5.969 - 0.215 * bn + 2.532 * sqr(bn) - 10.73 * std::pow(bn, 3) +
+           5.574 * std::pow(bn, 4) + 0.245 * std::pow(bn, 5);
+}
+inline double sigmaAFromReflectanceD(double c, double denom) {
+    c = clampd(c, 1e-4, 1.0 - 1e-6);
+    return sqr(std::log(c) / denom);
+}
+inline double sigmaAFromReflectance(double c, double betaN) {
+    return sigmaAFromReflectanceD(c, sigmaADenominator(betaN));
 }
 
 // --- Dual scattering (Zinke et al. 2008) --------------------------------------

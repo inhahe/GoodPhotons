@@ -29477,3 +29477,10 @@ GPU gathers a 24-spp frame in ~2.3 min (5.75 s per spp) against the CPU's 5:04. 
 gather still has no hair case (`cudaSppmSupported` refuses hair on its own now). Also fixed with
 it: the CPU final-gather sub-walk's HAIR-NEE term lacked the visible point's albedo (`rhoV`) that
 every other term of that walk carries (only `-fg` renders were affected).
+
+**The fold's cost on a frame full of hair (0.336.0).** With the angular products taken from the
+sample's own BCSDF evaluation and one exp plus the four-lobe recurrence per bin, the spectral
+fold costs +20-50 % of the camera pass where every pixel is hair (head-filling view of Alice,
+960x540, 24 spp, CPU: fold off 1:12-1:28, on 1:47; the spread is other load on the machine) --
+down from +60-85 % when every bin rebuilt the BCSDF. At flyby scale hair is a few percent of the
+frame and it does not register. `FTRACE_HAIR_SPECGATHER=0` gives the scalar fold for A/B.
