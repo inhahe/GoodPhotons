@@ -63,7 +63,16 @@ def read_glb(path):
     ti = pbr["baseColorTexture"]["index"]; ii = js["textures"][ti]["source"]; img = js["images"][ii]
     v = bv[img["bufferView"]]
     raw = bin_[v.get("byteOffset", 0): v.get("byteOffset", 0) + v["byteLength"]]
-    return P, N, UV, I, raw
+    # The root node's transform (tools/glb_rescale.py stores the doll's true 10-inch size there,
+    # 0.13376 of the raw 1.9 m vertices). Every geometric constant in main() is tuned in the RAW
+    # frame, so the segmentation runs on raw P and the transform is applied at output.
+    node = next(n for n in js.get("nodes", []) if "mesh" in n)
+    M = np.eye(4)
+    if "matrix" in node:
+        M = np.array(node["matrix"], dtype=float).reshape(4, 4).T
+    elif "scale" in node or "translation" in node:
+        M[:3, :3] = np.diag(node.get("scale", [1, 1, 1])); M[:3, 3] = node.get("translation", [0, 0, 0])
+    return P, N, UV, I, raw, M
 
 
 def main():
@@ -74,7 +83,11 @@ def main():
     from PIL import Image
     Image.MAX_IMAGE_PIXELS = None
 
-    P, N, UV, I, raw = read_glb(args.glb)
+    P, N, UV, I, raw, M = read_glb(args.glb)
+    # PW: the vertices in the GLB's WORLD frame (its node transform applied -- the doll's true
+    # size). The segmentation below runs on raw P, whose constants were tuned; the OBJs are
+    # written in PW so a scene sees the scalp exactly where it sees the doll.
+    PW = P @ M[:3, :3].T + M[:3, 3]
     tex = np.asarray(Image.open(io.BytesIO(raw)).convert("RGB"))
     W = tex.shape[0]
 
@@ -127,7 +140,7 @@ def main():
     used = np.unique(I[sel]); remap = -np.ones(len(P), dtype=np.int64); remap[used] = np.arange(len(used))
     L = ["# alice scalp: the hair mass of meshes/alice.glb, segmented by tools/alice_scalp.py",
          "# (warm-coloured, above the dress, outside a nose-tip face ellipsoid, largest welded component)"]
-    L += ["v %.6f %.6f %.6f" % tuple(p) for p in P[used]] + ["vn %.5f %.5f %.5f" % tuple(n) for n in N[used]]
+    L += ["v %.6f %.6f %.6f" % tuple(p) for p in PW[used]] + ["vn %.5f %.5f %.5f" % tuple(n) for n in N[used]]
     for t in sel:
         a, b_, c = remap[I[t]] + 1; L.append("f %d//%d %d//%d %d//%d" % (a, a, b_, b_, c, c))
     io.open(args.out, "w", encoding="utf-8", newline="\n").write("\n".join(L) + "\n")
@@ -145,7 +158,7 @@ def main():
     capArea = 0.5 * np.linalg.norm(np.cross(Tc[:, 1] - Tc[:, 0], Tc[:, 2] - Tc[:, 0]), axis=1).sum()
     usedc = np.unique(I[cap]); remapc = -np.ones(len(P), dtype=np.int64); remapc[usedc] = np.arange(len(usedc))
     Lc = ["# alice scalp CAP: the rooted part of the hair mass (within 0.16 m of the skull centre, above the nape)"]
-    Lc += ["v %.6f %.6f %.6f" % tuple(q) for q in P[usedc]] + ["vn %.5f %.5f %.5f" % tuple(n) for n in N[usedc]]
+    Lc += ["v %.6f %.6f %.6f" % tuple(q) for q in PW[usedc]] + ["vn %.5f %.5f %.5f" % tuple(n) for n in N[usedc]]
     for t in cap:
         a, b_, c = remapc[I[t]] + 1; Lc.append("f %d//%d %d//%d %d//%d" % (a, a, b_, b_, c, c))
     capOut = args.out.replace(".obj", "_cap.obj")

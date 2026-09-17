@@ -1045,6 +1045,22 @@ existing jitter / curl on top and clump / bald downstream unchanged. Random draw
 the closed-form builder's order so a seed is the same hair either way. Roots are untouched —
 guides are a shape field over area-uniform roots, never a root distribution.
 
+**Alice's hair, end to end (0.327.0-0.328.1).** Four files make a groom for one imported doll,
+and each is regenerable: `tools/alice_scalp.py` segments the hair mass out of the single fused
+Meshy mesh (colour and roughness both fail to separate hair from face — measured — so it is a
+nose-tip face ellipsoid, a throat box, and the largest *welded* component; Meshy duplicates every
+vertex along every UV seam) and writes both the whole mass and a **scalp cap** (the mass within
+16 cm of the skull centre, above the nape — a doll roots its hair on the skull, and rooting over
+the whole mass reads as a fuzzy dome). `tools/alice_guides.py` traces **streamlines** down the
+sculpted surface from rings of roots, lifted off the surface along the normal (a blend of
+surface-hugging guides on a convex head lies *inside* it), with a side part and a short swept
+fringe, and writes them as curves of curves; `--place` wraps them in a `group` for a scene that
+shows her transformed. `scenes/alice_hair.ftsl` is the groom at true size (10 in); `scenes/
+alice_hair_gallery.ftsl` the same groom carried into gallery_rain's placement with the fur's
+metres at the hall's 3x. Both tools honour the GLB's node transform, so `tools/glb_rescale.py`
+could put the doll at her real size without touching the raw vertices the segmentation was
+tuned on. Fiber numbers are a rooted doll's: 15 000 strands, 0.05 mm radius, plug-sized locks.
+
 **The media term joined it in 0.322.0** (`Renderer::mediumTransmittanceSpec`,
 `dMedTransmittanceSpec`). A transmittance is a stochastic estimate, so it cannot use the ratio
 trick (`E[A/B] != E[A]/E[B]`); the walk carries a per-wavelength vector instead, in three tiers —

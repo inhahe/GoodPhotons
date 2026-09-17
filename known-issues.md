@@ -27076,6 +27076,25 @@ times the real sun`. The corrected key is `5.04e-15`, on which the guard is sile
 gallery_rain's `9.2649e-14`. The lesson is the guard's own: when two unit systems are in play,
 believe the number the code prints, not the one you derived.
 
+## FIXED (2026-09-17, v0.328.2): a curve referenced by name inside a `group` was transformed once per REFERENCE LEVEL
+
+0.326.0's rule was "a reference inside a transformed group moves with the group": the leaf points
+were transformed by the group as they were flattened, the result registered, and a by-name
+reference applied the group's transform again on top. Right for a top-level definition instanced
+inside a group; wrong for a definition made inside that same group, where the strands were already
+placed. Alice's gallery guides chain three reference levels inside one placed group (guide -> ring
+-> hair), so her hair landed at (122, 20, -24) instead of (9.15, 1.6, 3.55): 9.15 + 3*9.8 + 9*9.3.
+
+Fixed by flattening in the AUTHORED frame throughout (unit conversion only), bringing a reference's
+strands as authored, and applying the rendering node's transform exactly once at the end
+(`curveApplyXf`). A named curve registers both forms: local for later references, world for
+`fur guides`. `tools/curve_rig.py` gained both cases (two reference levels inside one group land
+exactly once; a top-level definition instanced in a group moves with it).
+
+**Also measured on the way:** a positive `rotate 0 20 0` swings +z toward **+x** (probe:
+`group { rotate 0 20 0 }` puts +z at (sin 20, 0, cos 20)); `scenes/gallery_rain.ftsl`'s Alice
+siting note says the opposite, and the hair placement uses the measured sign.
+
 ## OPEN (2026-09-17): an emissive mesh that is not PLANAR is silently re-oriented OUTWARD, so an emissive enclosure renders black
 
 **Repro.** A cube of six inward-facing emissive quads, as one mesh, with the camera inside: the whole

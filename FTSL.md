@@ -1890,8 +1890,16 @@ curve "hair" {                        # a curve of curves of curves: 5 rows, cro
 - A **named curve without a `material` is a definition**: registered for later `curve "name"`
   children and for `fur … guides` (§8.7), not rendered (the load log says so). An *unnamed*
   curve still needs a material.
-- Under a `group`, a referenced curve moves with the group (its stored world-space strands are
-  transformed again by the group), so a definition can be instanced.
+- **Transforms apply once, at the node that renders or registers.** A node flattens in the frame
+  its points were authored in; a `curve "name"` reference brings the referenced curve *as
+  authored*; and the enclosing `group`'s transform is applied exactly once at the end. So a
+  top-level definition instanced inside a `group` moves with the group, and a definition made
+  *inside* that group is not moved twice when the group also references it — a chain of
+  references (guide → ring → hair) inside one placed group lands where the group says, not
+  three transforms away (which is what 0.326.0–0.328.1 did; fixed 0.328.2, `tools/curve_rig.py`
+  checks both cases). The corollary: a reference is a *shape*, so referencing a definition made
+  inside a placed group from *outside* it gives the shape unplaced — place it where you reference
+  it. `fur … guides` always sees the world-space strands.
 
 **Reading the emitted strands back:** `ftrace -in scene.ftsl -dumpcurves out.txt` writes every
 strand's polyline (`x y z r` per point) after the load and exits — the debugging tool for a

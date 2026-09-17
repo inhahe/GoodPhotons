@@ -27,9 +27,15 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 
-CROWN = np.array([0.053, 0.894, -0.018])
-HEAD_CENTRE = np.array([0.0, 0.80, 0.02])       # a rough skull centre, for placing the rings
-HAIR_BOTTOM = 0.45                              # the tips, from the segmentation's y range
+# Every constant below is authored in the RAW 1.9 m vertex frame of alice.glb. The scalp OBJ
+# (tools/alice_scalp.py) carries the GLB's true size instead, so main() measures the frame
+# scale from the OBJ's height and multiplies these through `FS` once. 1.0 in the raw frame.
+FS = 1.0
+CROWN_RAW = np.array([0.053, 0.894, -0.018])
+HEAD_CENTRE_RAW = np.array([0.0, 0.80, 0.02])   # a rough skull centre, for placing the rings
+HAIR_BOTTOM_RAW = 0.45                          # the tips, from the segmentation's y range
+HAIR_SPAN_RAW = 0.4903                          # the mass's y extent in the raw frame (0.41..0.90)
+CROWN = CROWN_RAW.copy(); HEAD_CENTRE = HEAD_CENTRE_RAW.copy(); HAIR_BOTTOM = HAIR_BOTTOM_RAW
 
 
 def load_obj(path):
@@ -107,10 +113,13 @@ class Surface:
         return q[j], self.fn[idx[j]]
 
 
-def trace(surf, root, step=0.02, max_steps=60, bottom=HAIR_BOTTOM, outward_bias=0.15,
-          sweep=0.0, lift0=0.004, lift1=0.006):
+def trace(surf, root, step=0.02, max_steps=60, bottom=None, outward_bias=0.15,
+          sweep=0.0, lift0=0.004, lift1=0.006, part=0.03):
     """Downhill on the surface from `root`: gravity projected onto the tangent plane, with a small
     outward bias so a streamline never dives through the head where the sculpt overhangs."""
+    # metric parameters arrive in the raw frame; scale them into the OBJ's frame
+    step, lift0, lift1, part = step * FS, lift0 * FS, lift1 * FS, part * FS
+    if bottom is None: bottom = HAIR_BOTTOM
     p, n = surf.closest(root)
     if np.dot(n, p - HEAD_CENTRE) < 0: n = -n          # face normals oriented OUTWARD
     pts = [p.copy()]; nrm = [n.copy()]
@@ -123,9 +132,10 @@ def trace(surf, root, step=0.02, max_steps=60, bottom=HAIR_BOTTOM, outward_bias=
         # THE FRINGE: the sculpt sweeps its front hair across the forehead from her right (+x)
         # to her left, not straight down over the face. Downhill-on-the-surface cannot know
         # that, so front roots get a sideways bias that fades out past the temples.
-        front = max(0.0, (p[2] - 0.04) / 0.14)               # 0 at the ears, 1 at the brow
+        front = max(0.0, (p[2] - 0.04 * FS) / (0.14 * FS))   # 0 at the ears, 1 at the brow
         if front > 0.0:
-            d = d + np.array([-1.0, 0.0, 0.0]) * (sweep * front)
+            side = 1.0 if root[0] > part else -1.0            # her right of the part goes right
+            d = d + np.array([side, 0.0, 0.0]) * (sweep * front)
         d = d - n * np.dot(d, n)
         if np.linalg.norm(d) < 1e-6:
             break
@@ -172,11 +182,18 @@ def main():
     ap.add_argument("--out", default="scenes/alice_guides.ftsl")
     ap.add_argument("--rings", type=int, default=4)
     ap.add_argument("--around", type=int, default=10)
+    ap.add_argument("--sweep", type=float, default=2.0, help="fringe sweep strength on the brow ring")
+    ap.add_argument("--place", nargs=5, type=float, metavar=("TX", "TY", "TZ", "RY", "S"),
+                    help="wrap the guides in a group { translate rotate scale } for a scene that shows her transformed")
     args = ap.parse_args()
 
     V, N, F = load_obj(args.scalp)
-    surf = Surface(V, N, F)
-    print("scalp: %d verts %d tris" % (len(V), len(F)))
+    global FS, CROWN, HEAD_CENTRE, HAIR_BOTTOM
+    FS = (V[:, 1].max() - V[:, 1].min()) / HAIR_SPAN_RAW
+    CROWN = CROWN_RAW * FS; HEAD_CENTRE = HEAD_CENTRE_RAW * FS; HAIR_BOTTOM = HAIR_BOTTOM_RAW * FS
+    surf = Surface(V, N, F, cell=0.02 * FS)
+    print("scalp: %d verts %d tris; frame scale %.5f of the raw 1.9 m frame (height %.4f m)"
+          % (len(V), len(F), FS, V[:, 1].max() - V[:, 1].min()))
 
     # roots: HORIZONTAL rings (latitude circles about world +y through the head centre) at
     # increasing polar angle, the last one at the hairline. A root that lands on the face is
@@ -192,12 +209,12 @@ def main():
         for ai in range(around):
             ph = 2 * math.pi * (ai + 0.5 * (ri % 2)) / around       # stagger alternate rings
             dirv = up * math.cos(th) + (t0 * math.cos(ph) + t1 * math.sin(ph)) * math.sin(th)
-            root = HEAD_CENTRE + dirv * 0.17
+            root = HEAD_CENTRE + dirv * (0.17 * FS)
             # the sculpt's fringe is a SHORT swept bang over the brow, not a curtain over the
             # face: a hairline-ring root in front traces only ~7 steps (~0.14 m) before it stops.
-            brow = (ri == args.rings - 1) and (root[2] > 0.06)
+            brow = (ri == args.rings - 1) and (root[2] > 0.06 * FS)
             pts = decimate(trace(surf, root, max_steps=5 if brow else 60,
-                                 sweep=1.2 if (ri == args.rings - 1) else 0.0),
+                                 sweep=args.sweep if (ri == args.rings - 1) else 0.0),
                            k=5 if brow else 7)
             if len(pts) >= 3:
                 row.append(pts)
@@ -231,6 +248,12 @@ def main():
     for ri in range(len(rows)):
         L.append('    curve "ring_%d"' % ri)
     L.append('}')
+    if args.place:
+        tx, ty, tz, ry, sc = args.place
+        # a curve of curves under a group is transformed as its control points (FTSL 8.6), so
+        # the whole definition set rides inside one group and the scene places her once
+        L = L[:6] + ['group "alice_hair_place" { translate %g %g %g  rotate 0 %g 0  scale %g' % (tx, ty, tz, ry, sc)] + \
+            ["    " + l if l else l for l in L[6:]] + ["}"]
     io.open(args.out, "w", encoding="utf-8", newline="\n").write("\n".join(L) + "\n")
     print("wrote %s: %d guides in %d rings" % (args.out, sum(len(r) for r in rows), len(rows)))
     return 0

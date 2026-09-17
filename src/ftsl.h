@@ -1665,7 +1665,14 @@ private:
     // child can reuse one by reference and `fur { guides "name" }` can interpolate it.
     // A named curve registers whether or not it is rendered: without a `material` it is
     // a definition only (0.326.0).
+    // `curveByName_` holds a named curve's strands in the frame they were AUTHORED in (unit-
+    // converted, no group transform): what a later `curve "name"` reference takes, adding its
+    // own node's transform exactly once. `curveWorldByName_` holds the same strands with the
+    // defining node's transform applied: what `fur { guides "name" }` reads, since a groom
+    // lives in world space. (Applying a group's transform at the leaves AND again at each
+    // reference compounded it once per reference level -- 0.328.2.)
     std::unordered_map<std::string, std::vector<CurveStrand>> curveByName_;
+    std::unordered_map<std::string, std::vector<CurveStrand>> curveWorldByName_;
     std::unordered_map<std::string, int>         blasIndex_;      // mesh_asset name -> Scene::blasList index
     // `mesh { shape_only yes }` groups (indices into Scene::meshGroups), removed from
     // Scene::tris by stripShapeOnlyMeshes() once the deferred medium sweep has read them.
@@ -5048,7 +5055,7 @@ private:
     // everything goes to world space through `xf` (an affine map commutes with every
     // basis, so transforming the control points and flattening afterwards is identical
     // to the other order -- which is what lets a `group { rotate ... }` carry a strand).
-    bool curveLeaf(const Block& b, const CurveNodeParams& p, const Affine& xf, CurveStrand& out) {
+    bool curveLeaf(const Block& b, const CurveNodeParams& p, CurveStrand& out) {
         std::vector<Vec3>   pts;
         std::vector<double> radii;
         std::vector<int>    explicitR;
@@ -5068,35 +5075,47 @@ private:
         }
         const int n = (int)pts.size();
         if (n < 2) { fail("curve needs at least 2 `point` statements"); return false; }
-        bool nonUniform = false;
-        const double us = xf.uniformScale(nonUniform);
         for (int i = 0; i < n; ++i) {
             const double rr = explicitR[(size_t)i] ? radii[(size_t)i]
                              : p.rRoot + (p.rTip - p.rRoot) * (n > 1 ? (double)i / (n - 1) : 0.0);
-            radii[(size_t)i] = Len(rr) * us;
-            pts[(size_t)i] = P(xf.apply(pts[(size_t)i]));
-        }
-        if (nonUniform) {
-            const double sx = std::sqrt(xf.m[0]*xf.m[0] + xf.m[3]*xf.m[3] + xf.m[6]*xf.m[6]);
-            const double sy = std::sqrt(xf.m[1]*xf.m[1] + xf.m[4]*xf.m[4] + xf.m[7]*xf.m[7]);
-            const double sz = std::sqrt(xf.m[2]*xf.m[2] + xf.m[5]*xf.m[5] + xf.m[8]*xf.m[8]);
-            const double gm = std::cbrt(std::max(1e-300, sx * sy * sz));
-            for (int i = 0; i < n; ++i) radii[(size_t)i] *= gm / (us > 0.0 ? us : 1.0);
-            std::fprintf(stderr, "[ftsl] warning: curve%s%s%s under a non-uniform group scale -- "
-                                 "the fiber radius uses the volume-preserving geometric mean "
-                                 "(a round fiber cannot become elliptical)\n",
-                         b.name.empty() ? "" : " '", b.name.c_str(), b.name.empty() ? "" : "'");
+            radii[(size_t)i] = Len(rr);
+            pts[(size_t)i] = P(pts[(size_t)i]);
         }
         out.pts = std::move(pts);
         out.radii = std::move(radii);
         return true;
     }
 
+    // Apply a node's transform to flattened strands, ONCE. An affine map commutes with every
+    // basis, so transforming control points and flattening afterwards is identical to the
+    // other order -- which is what lets a `group { rotate ... }` carry a strand for free. A
+    // non-uniform scale cannot be represented by a round cross-section (it would make an
+    // elliptical fiber), so the radius takes the geometric mean of the three axis scales.
+    void curveApplyXf(const Affine& xf, const std::string& name, std::vector<CurveStrand>& strands) {
+        bool nonUniform = false;
+        const double us = xf.uniformScale(nonUniform);
+        double rs = us;
+        if (nonUniform) {
+            const double sx = std::sqrt(xf.m[0]*xf.m[0] + xf.m[3]*xf.m[3] + xf.m[6]*xf.m[6]);
+            const double sy = std::sqrt(xf.m[1]*xf.m[1] + xf.m[4]*xf.m[4] + xf.m[7]*xf.m[7]);
+            const double sz = std::sqrt(xf.m[2]*xf.m[2] + xf.m[5]*xf.m[5] + xf.m[8]*xf.m[8]);
+            rs = std::cbrt(std::max(1e-300, sx * sy * sz));
+            std::fprintf(stderr, "[ftsl] warning: curve%s%s%s under a non-uniform group scale -- "
+                                 "the fiber radius uses the volume-preserving geometric mean "
+                                 "(a round fiber cannot become elliptical)\n",
+                         name.empty() ? "" : " '", name.c_str(), name.empty() ? "" : "'");
+        }
+        for (CurveStrand& st : strands) {
+            for (Vec3& q : st.pts) q = xf.apply(q);
+            for (double& r : st.radii) r *= rs;
+        }
+    }
+
     // Flatten one node of any depth to its strands. Children are `point`s (a leaf) or
     // `curve`s -- inline `curve { }` / `curve "name" { }`, or a bare `curve "name"` that
     // reuses a curve defined EARLIER (top level, in file order; an include makes that
     // natural). A node that mixes the two is refused: the rule is one thing per level.
-    bool flattenCurveNode(const Block& b, const CurveNodeParams& inherit, const Affine& xf,
+    bool flattenCurveNode(const Block& b, const CurveNodeParams& inherit,
                           std::vector<CurveStrand>& out, int depth) {
         if (depth > 16) { fail("curve: nested deeper than 16 levels"); return false; }
         CurveNodeParams p;
@@ -5110,7 +5129,7 @@ private:
             s.used = true;
             std::vector<CurveStrand> ks;
             if (s.val.block) {
-                if (!flattenCurveNode(*s.val.block, p, xf, ks, depth + 1)) return false;
+                if (!flattenCurveNode(*s.val.block, p, ks, depth + 1)) return false;
             } else {
                 if (s.val.words.size() != 1) { fail("curve: a child is `curve \"name\"` (a reference) or `curve { ... }`"); return false; }
                 auto it = curveByName_.find(s.val.words[0]);
@@ -5118,14 +5137,11 @@ private:
                     fail("curve: child references curve \"" + s.val.words[0] + "\", which is not defined above it");
                     return false;
                 }
+                // The referenced curve's strands in the frame they were AUTHORED in. Whatever
+                // node finally renders or registers this one applies its own transform once, so
+                // a definition at top level instanced inside a group moves with the group, and a
+                // definition made inside that same group is not moved twice.
                 ks = it->second;
-                // A reference inside a transformed group moves with the group: the stored
-                // strands are world-space, so apply THIS node's transform on top.
-                bool nu = false; const double us = xf.uniformScale(nu);
-                for (CurveStrand& st : ks) {
-                    for (Vec3& q : st.pts) q = xf.apply(q);
-                    for (double& r : st.radii) r *= us;
-                }
             }
             if (ks.empty()) {
                 fail(std::string("curve: child \"") + (s.val.words.empty() ? std::string() : s.val.words[0]) + "\" produced no strands");
@@ -5141,7 +5157,7 @@ private:
 
         if (kids.empty()) {                                       // ---- leaf
             CurveStrand st;
-            if (!curveLeaf(b, p, xf, st)) return false;
+            if (!curveLeaf(b, p, st)) return false;
             out.push_back(std::move(st));
         } else {                                                  // ---- curve of curves
             bool closed = false;
@@ -5233,7 +5249,7 @@ private:
                 }
             }
         }
-        if (!b.name.empty()) curveByName_[b.name] = out;      // reusable by name from here on
+        if (!b.name.empty()) curveByName_[b.name] = out;      // reusable by name from here on (LOCAL)
         return true;
     }
 
@@ -5250,8 +5266,10 @@ private:
         CurveNodeParams top;
         if (!parseCurveNodeParams(b, CurveNodeParams{}, top)) return false;
         std::vector<CurveStrand> strands;
-        if (!flattenCurveNode(b, CurveNodeParams{}, xf, strands, 0)) return false;
+        if (!flattenCurveNode(b, CurveNodeParams{}, strands, 0)) return false;
         if (strands.empty()) { fail("curve" + (b.name.empty() ? std::string() : " \"" + b.name + "\"") + ": no strands"); return false; }
+        curveApplyXf(xf, b.name, strands);                          // the group's transform, ONCE
+        if (!b.name.empty()) curveWorldByName_[b.name] = strands;   // what `fur guides` reads
 
         if (id < 0) {
             std::fprintf(stderr, "[ftsl] curve \"%s\": no material -- registered as a definition (%zu strand%s), not rendered\n",
@@ -5364,8 +5382,8 @@ private:
                 sp.guideFalloff = Len(dblOf(b, "guide_falloff", 0.0));
                 const int np = std::max(2, (int)dblOf(b, "points", 5.0));
                 for (const std::string& gn : gnames) {
-                    auto it = curveByName_.find(gn);
-                    if (it == curveByName_.end()) {
+                    auto it = curveWorldByName_.find(gn);
+                    if (it == curveWorldByName_.end()) {
                         fail("fur \"" + sp.name + "\": guides \"" + gn + "\" names no curve defined in the scene");
                         return false;
                     }

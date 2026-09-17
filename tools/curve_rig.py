@@ -151,6 +151,23 @@ def main():
     check("group", len(s) == 4 and close(s[1], mean(g1, g2)) and close(s[3], [(3, 0, 0, 0.001), (3, 1, 0, 0.001), (3, 2, 0, 0.001)]),
           "%d strands: a 3-instance child plus a single" % len(s))
 
+    # 9. references and groups: a definition INSIDE a group referenced inside that same group is
+    #    placed once (not compounded per reference level), and a TOP-LEVEL definition referenced
+    #    inside a group moves with the group. Both are read back and compared to the arithmetic.
+    s = dump(w("grpref", 'group "g" { translate 9.15 1.28 3.55  scale 3\n'
+                         '    curve "d" { basis linear  segments 1  point 0 0 0  point 0 0.1 0 }\n'
+                         '    curve "ring" { curve "d" }\n'
+                         '    curve "hair" { material m  basis linear  segments 1  curve "ring" }\n'
+                         '}\n'))
+    check("grpref", len(s) == 1 and close(s[0], [(9.15, 1.28, 3.55, 0.003), (9.15, 1.58, 3.55, 0.003)]),
+          "two reference levels inside one group: placed exactly once -> %s" % (s[0] if s else "?"))
+    s = dump(w("topref", 'curve "d" { basis linear  segments 1  point 0 0 0  point 0 0.1 0 }\n'
+                         'group "g" { translate 9.15 1.28 3.55  scale 3\n'
+                         '    curve "hair" { material m  basis linear  segments 1  curve "d" }\n'
+                         '}\n'))
+    check("topref", len(s) == 1 and close(s[0], [(9.15, 1.28, 3.55, 0.003), (9.15, 1.58, 3.55, 0.003)]),
+          "a top-level definition instanced inside a group moves with it")
+
     # 7. spline knob on a single strand
     base = 'curve "s" { material m  point 0 0 0  point 0 1 0  point 1 1.2 0  point 1 3 0 }\n'
     su = dump(w("sp_uniform", base.replace('{ material m', '{ material m  spline uniform')))

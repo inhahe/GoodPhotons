@@ -138,9 +138,37 @@ unguided path untouched. FTSL §8.7 "Guided grooms".
      the fiber reads silver (white R lobe over a pale `reflect`); 1.2 cm locks invisible.
   9. groom8: face zone lowered to a top of y 0.82 (bangs may cover the forehead, not the eyes),
      `reflect rgb 0.88 0.60 0.25`, 2.5 cm locks, `curl 0.04 curl_freq 1.5`.
-- NEXT: judge groom8, commit the iteration, show the user; then colour/lighting for blonde, the
-  part line / fringe shape, and what the mode-M flyby does with fibers (mode M gathers on
-  strand surfaces -- its noise behaviour is a different question from mode R's).
+  10. TRUE SIZE (2026-09-17, user's numbers): she is a 10-inch doll and the compote's bowl is
+      6 inches. `tools/glb_rescale.py` rewrote both GLBs' root-node transforms (binary untouched,
+      `.orig.glb` backups beside each): alice.glb 1.8988 -> 0.2540 m (x0.13377); compote 0.1697 m
+      bowl -> 0.1524 m (x0.898, both copies -- the redcup original and meshes/ were byte-identical).
+      gallery_rain shows both at the hall's display scale 3.0, so 0.762 m of doll beside 0.457 m
+      of bowl (10:6); Alice's block went from scale 0.85 / 1.614 m to 3.0 / 0.762 m, seated at
+      translate y 1.281363; the compote's thirteen `absorb` sigmas x1.1136 so the authored optical
+      depth survives the 10 % smaller bowl. TRADE-OFF recorded in the scene: her head used to clear
+      every exhibit (the siting notes' reason she was visible at all); at 0.762 m it no longer does.
+  11. The hair follows the frame: alice_scalp.py applies the GLB's node transform at output, the
+      guide tool measures the frame scale from the OBJ and scales its constants, the fur numbers are
+      true size (radius 0.05 mm, 3.3 mm locks), the fiber is the SCULPT'S colour (linear 0.79 0.44
+      0.155), the part is at her right with the fringe swept to her left (like the doll). groom9.
+  12. For the hall: `tools/alice_guides.py --place TX TY TZ RY S` wraps the guides in a group with
+      the doll's placement; `scenes/alice_hair_gallery.ftsl` carries the placed scalp mesh, those
+      guides, and the fur at x3 (face zone transformed into hall coordinates); gallery_rain includes
+      it right after its `mesh "alice"` block.
+  13. MODE M test frame (true size, 30M photons, 720^2): the fibers render, but the photon gather
+      lands on them as violet speckle (few photons per hair, spectral bins), and the frame cost
+      510 s against ~40 s in mode R. For the flyby the hair is a small region of a 960x540 frame
+      under `-denoise`; whether that is acceptable needs a real gallery frame.
+  14. The gallery placement check found a real loader bug (v0.328.2): a by-name curve reference
+      inside a group re-applied the group's transform once per reference level, so the chained
+      guide -> ring -> hair definitions landed at (122, 20, -24). Fixed by flattening in the
+      authored frame and applying a node's transform once (`curveApplyXf`); both reference cases
+      are now in `tools/curve_rig.py` (11 checks). Also measured: `rotate 0 20 0` swings +z toward
+      +x, the opposite of the gallery's siting note; the face zone uses the measured sign. After
+      the fix the gallery culls 1703 strands to the harness's 1720, and the close-up shows the
+      hair on her head, face clear, side part, blonde matching (`gallery_alice_check2.png`).
+- NEXT: the full gallery still in mode M at flyby settings (visibility at 0.762 m; the hair's
+  mode-M noise at that scale); then the user's call on the look.
 
 ---
 

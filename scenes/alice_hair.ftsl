@@ -13,10 +13,10 @@
 # grouped as curves of curves), and the groom itself. The sculpted hair mass stays underneath as
 # the volume, so no bald skull shows through the strands.
 #
-# She stands on y = -0.95 at the origin, faces +z, and is 1.9 m tall. Wrap this file's contents
-# in a `group { translate ... rotate ... }` in the including scene to place her.
-#
-# Hair is 0.41..0.90 in y; the crown / bow is at (0.053, 0.894, -0.018).
+# She is a 10-inch doll: the GLB is 0.254 m tall (tools/glb_rescale.py), base at y = -0.127,
+# centred in x/z, facing +z. Hair spans y 0.055..0.120; the crown / bow is at (0.007, 0.120, -0.002).
+# For a scene that shows her transformed (gallery_rain: translate / rotate / scale 3.0), generate
+# the guides with `tools/alice_guides.py --place TX TY TZ RY S` and scale the fur's metres by S.
 
 # the glb carries its own materials; the block material is only the fallback the loader requires
 material "alice_fallback" { type diffuse reflect 0.5 }
@@ -32,25 +32,27 @@ include "alice_guides.ftsl"
 
 # A blonde fiber: `reflect` is the colour the COAT should read as, inverted into the fiber's
 # interior absorption by the hair BCSDF; `preset human` supplies the measured cuticle / roughness.
-material "alice_hair" { type hair  preset human  reflect rgb 0.88 0.60 0.25  beta_m 0.3  beta_n 0.35 }
+# THE SCULPT'S OWN COLOUR: the hair region of the base-colour texture averages sRGB (231, 177, 109),
+# which is linear (0.79, 0.44, 0.155) -- `reflect` is the colour the coat should read as.
+material "alice_hair" { type hair  preset human  reflect rgb 0.79 0.44 0.155  beta_m 0.3  beta_n 0.35 }
 
-# She is a ~7-inch doll at 10.5x life. Rooted doll fiber is ~0.1 mm, so ~1 mm here (radius 0.5 mm,
-# almost no taper -- synthetic fiber is constant-diameter); a doll head carries a few hundred to a
-# thousand plugs of ~20 fibers, so ~15 000 strands, gathered into plug-sized locks by `clump`.
-# `count` rather than `density`, and metre radii: if she is later put at true size inside a
-# `group { scale 0.094 }`, the radii scale with her and the count stays.
+# A 10-inch doll at true size. Rooted doll fiber is ~0.1 mm (radius 0.05 mm, almost no taper --
+# synthetic fiber is constant-diameter); a doll head carries a few hundred to a thousand plugs of
+# ~20 fibers, so ~15 000 strands, gathered into plug-sized locks by `clump`. `count` rather than
+# `density`, so the count survives any display scale; the metre numbers below are TRUE SIZE and
+# must be multiplied by a scene's display scale (gallery_rain shows her at 3.0).
 fur "alice_hair" {
     on "alice_scalp"   material alice_hair
     count 15000
     guides "alice_hair"             # the rings of streamline guides, blended
     guide_blend 3
     points 8   segments 3   spline centripetal
-    radius 0.0005   radius_tip 0.0004
+    radius 0.00005  radius_tip 0.00004
     length_jitter 0.12
     jitter 0.04
-    clump 0.7   clump_size 0.025    # locks ~2.5 cm across (plug rows gather into these)
+    clump 0.7   clump_size 0.0033   # locks ~3.3 mm across at true size (plug rows gather into these)
     curl 0.04   curl_freq 1.5       # a gentle wave so the tips are not a straight hem
-    root_offset 0.001
-    bald 0 0.71 0.15 0.11           # the FACE below the brow (top at y 0.82): bangs may cover the forehead, not the eyes
+    root_offset 0.00013
+    bald 0 0.0950 0.0201 0.0147     # the FACE below the brow (top at y 0.110): bangs may cover the forehead, not the eyes
     seed 7
 }

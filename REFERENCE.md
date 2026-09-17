@@ -2850,6 +2850,13 @@ colour and transmissive glass; **STL** has no material data in the format at all
 **`.ftmesh`** is deliberately geometry-only, so for those two every face takes the
 `material` the scene assigns.
 
+**Rescaling an asset in place (`tools/glb_rescale.py`).** `python tools/glb_rescale.py <file.glb>
+<factor>` or `--height <metres>` rewrites the GLB's *root node transforms* so the file loads at a
+new size — the buffers are untouched and accessor bounds stay valid, because ftrace's loader bakes
+the node hierarchy anyway. A `<file>.orig.glb` backup is made once. Used to put `meshes/alice.glb`
+at her true 10 inches and the gem compote's bowl at 6 (both had been authored oversize; a scene
+that shows them at a display scale then keeps their real proportion for free).
+
 **Per-vertex colour** is imported from every format that carries it — PLY's
 `red`/`green`/`blue` (or `diffuse_red`/…), OBJ's extended `v x y z r g b`, glTF's
 `COLOR_0`, and an FBX colour layer — and **multiplies** the material's albedo, which is

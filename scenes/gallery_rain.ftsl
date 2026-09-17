@@ -742,6 +742,11 @@ material "oilslick" { preset oil-slick }    # iridescent thin-film (rainbow) —
 # 1/metre applied as exp(-sigma*d). Equating them gives sigma = -ln(attenuationColor)/
 # attenuationDistance, which is the only arithmetic below.
 #
+# ...THEN MULTIPLIED BY 1.1136 (2026-09-17): the asset itself was corrected from a 6.68 in
+# bowl to the 6.00 in it is meant to be (tools/glb_rescale.py, x0.898), which shortens every
+# interior path by that factor; sigma goes up by the inverse so the OPTICAL DEPTH each
+# stone was authored with is unchanged. The display scale below is unchanged at 3.0.
+#
 # ...THEN DIVIDED BY THE DISPLAY SCALE, which is the one place a judgement is made. The raw
 # mesh is 0.146 x 0.179 x 0.159 m — life-size for a compote dish, and 24 px tall in this
 # frame, which is less than the smallest existing exhibit by half. It is shown at scale 3.0
@@ -792,19 +797,19 @@ material "oilslick" { preset oil-slick }    # iridescent thin-film (rainbow) —
 #     of them. Ranking them 2..13 (in the file's own node order) costs nothing, silences all
 #     22, and is the better answer even where it never fires: if two facets ever do touch, a
 #     deterministic winner beats an arbitrary one.
-material "cp_bowl"       { type dielectric  ior glass:crystal  priority  1  absorb rgb  22.3 79.3 70.6 }
-material "cp_onyx"       { type dielectric  ior glass:SF10     priority  2  absorb rgb 121.6 121.6 121.6 }
-material "cp_chartreuse" { type dielectric  ior glass:SF10     priority  3  absorb rgb  21.1   2.8  42.9 }
-material "cp_pink"       { type dielectric  ior glass:SF10     priority  4  absorb rgb   2.8  33.4  16.7 }
-material "cp_azure"      { type dielectric  ior glass:SF10     priority  5  absorb rgb  48.1  22.0   2.8 }
-material "cp_yellow"     { type dielectric  ior glass:SF10     priority  6  absorb rgb   2.8   7.2 121.6 }
-material "cp_amber"      { type dielectric  ior glass:SF10     priority  7  absorb rgb   2.8  46.6 121.6 }
-material "cp_clear"      { type dielectric  ior glass:SF10     priority  8  absorb rgb   0.0   0.0   0.0 }
-material "cp_cobalt"     { type dielectric  ior glass:SF10     priority  9  absorb rgb 121.6 121.6   2.8 }
-material "cp_green"      { type dielectric  ior glass:SF10     priority 10  absorb rgb  69.3   2.8 121.6 }
-material "cp_red"        { type dielectric  ior glass:SF10     priority 11  absorb rgb   2.8 121.6 121.6 }
-material "cp_violet"     { type dielectric  ior glass:SF10     priority 12  absorb rgb   8.7  33.8   2.8 }
-material "cp_turquoise"  { type dielectric  ior glass:SF10     priority 13  absorb rgb  54.8   8.5   2.8 }
+material "cp_bowl"       { type dielectric  ior glass:crystal  priority  1  absorb rgb   24.8   88.3   78.6 }
+material "cp_onyx"       { type dielectric  ior glass:SF10     priority  2  absorb rgb  135.4  135.4  135.4 }
+material "cp_chartreuse" { type dielectric  ior glass:SF10     priority  3  absorb rgb   23.5    3.1   47.8 }
+material "cp_pink"       { type dielectric  ior glass:SF10     priority  4  absorb rgb    3.1   37.2   18.6 }
+material "cp_azure"      { type dielectric  ior glass:SF10     priority  5  absorb rgb   53.6   24.5    3.1 }
+material "cp_yellow"     { type dielectric  ior glass:SF10     priority  6  absorb rgb    3.1    8.0  135.4 }
+material "cp_amber"      { type dielectric  ior glass:SF10     priority  7  absorb rgb    3.1   51.9  135.4 }
+material "cp_clear"      { type dielectric  ior glass:SF10     priority  8  absorb rgb    0.0    0.0    0.0 }
+material "cp_cobalt"     { type dielectric  ior glass:SF10     priority  9  absorb rgb  135.4  135.4    3.1 }
+material "cp_green"      { type dielectric  ior glass:SF10     priority 10  absorb rgb   77.2    3.1  135.4 }
+material "cp_red"        { type dielectric  ior glass:SF10     priority 11  absorb rgb    3.1  135.4  135.4 }
+material "cp_violet"     { type dielectric  ior glass:SF10     priority 12  absorb rgb    9.7   37.6    3.1 }
+material "cp_turquoise"  { type dielectric  ior glass:SF10     priority 13  absorb rgb   61.0    9.5    3.1 }
 
 # --- Fur-creature materials (the eleventh exhibit) ---------------------------------
 # Lifted unchanged from `scenes/fur_creature.ftsl`, prefixed `cr_` so nothing here can
@@ -2402,12 +2407,18 @@ mesh "cp_turquoise" { file "meshes/compote_with_gems.glb"  import_materials no
 # metalness is in the map's blue channel, whose mean is 0.281; the loader now multiplies the
 # two, so she types Diffuse. This is the case that motivated the mean-metalness harvest.
 #
-# SEATING. The GLB is centred on the origin in x/z with its base at y = -0.950291, so unlike
-# the compote there IS a fudge factor and it is exactly that number times the scale: at 0.85,
-# translate y = 0.90 + 0.807747 = 1.707747. Scale 0.85 makes her 1.614 m — read as a figure
-# on a plinth rather than a doll, and her head then reaches 2.514 m, above every other exhibit
-# in the hall, which is the whole reason she is visible at all.
+# SEATING (2026-09-17: SHE IS A DOLL NOW). The GLB was rescaled to her true 10-inch height
+# (tools/glb_rescale.py, x0.13377; base at y = -0.127121) and she is shown at the hall's 3.0,
+# the same display scale as the compote, so the two keep their real proportion: 0.762 m of
+# doll beside 0.457 m of compote bowl (10 in : 6 in). Fudge = 0.127121 * 3.0 = 0.381363, so
+# translate y = 0.90 + 0.381363 = 1.281363. TRADE-OFF, recorded: at 0.85 on the old file she
+# stood 1.614 m and her head cleared every other exhibit, which the siting notes below say was
+# the reason she was visible at all; at 0.762 m her head is at 1.66 m and she may be screened
+# from the still camera by nearer pieces. Re-run scraps/_alicesite.py if she vanishes.
 #
+# (2026-09-17: a `-dumpcurves` probe of a `group { rotate 0 20 0 }` puts +z at (+sin 20, 0, cos 20), i.e.
+# a positive y-rotation swings +z toward +x, not -x as the paragraph below says; the doll's hair
+# placement in scenes/alice_hair_gallery.ftsl uses the measured sign.)
 # `rotate 0 20 0`. The model faces +z out of the box, and +z from this court is 37 deg off the
 # bearing to the still camera at (5.0, 2.95, 9.35) — i.e. she would face out of the frame to
 # the right. A positive y-rotation swings +z toward -x here (scraps/_aliceface.ftsl renders
@@ -2415,7 +2426,11 @@ mesh "cp_turquoise" { file "meshes/compote_with_gems.glb"  import_materials no
 # 17 deg off the camera axis, which is a three-quarter view and not a mugshot, and it points
 # her gaze along the row of exhibits instead of off the edge of the picture.
 mesh "alice" { file "meshes/alice.glb"  material alice_unpainted
-    translate 9.15 1.707747 3.55   rotate 0 20 0   scale 0.85 }
+    translate 9.15 1.281363 3.55   rotate 0 20 0   scale 3.0 }
+
+# Her hair: real strands rooted on a scalp cap, guided by curves traced off the sculpt. Same
+# placement as the block above, carried inside the file; see scenes/alice_hair_gallery.ftsl.
+include "alice_hair_gallery.ftsl"
 
 # ==============================  LIGHTING  ====================================
 # TWO lights now that the roof is gone (the xenon short-arc lamp that used to hang here was
