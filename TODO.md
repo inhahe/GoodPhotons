@@ -180,6 +180,100 @@ unguided path untouched. FTSL §8.7 "Guided grooms".
 
 ---
 
+### 0.5 THE PLAN for hair that looks real AND a flyby that renders in reasonable time
+
+Everything below was measured on the current groom; each step says what it fixes and how it is
+judged. Order matters: the look at DISTANCE is what most flyby frames see, so it comes first.
+
+**A. The distant look (what 1147 frames mostly see).** At the flyby's scale (~45 px of doll) the
+strand version reads OLIVE-GREEN and sparkly while the molded base reads warm blonde
+(`png/alicehair/gallery_alice_with_vs_without.png`): the fiber lobes forward-scatter the hall's
+green grid light through the mass, and rare strand-to-strand paths make fireflies.
+  1. Diagnose the green: render her in the hall over a grey floor; if the cast goes, it is the
+     grid's light through the fibers and the fix is the fiber material (more absorption in the
+     green -- the TT lobe's colour is the `reflect` inverted), not the lighting.
+  2. Fireflies: Russian roulette after N strand-to-strand bounces (continue with probability p,
+     weight 1/p). UNBIASED, so no darkening; expected cost falls; variance rises. A hard cap is
+     NOT acceptable: light hair IS multiple scattering, and a cap darkens the body of the mass
+     while leaving the sheen, i.e. it changes the character, not the exposure.
+  3. Judge by the same with/without pair at flyby scale: the aggregate must match the base to
+     within the frame noise (mean |diff| ~11/255 is the floor) AND look the same to the eye.
+     Only then is an LOD switch (hair off at distance) invisible.
+
+**B. The close-up look (the user's eye, in the live window).** Pending feedback. Levers: guide
+placement (the tool below), lock size, fringe/part, colour calibration on a fiber ball under the
+HALL's light rather than the harness suns, `beta_m`/`beta_n`.
+
+**C. Mode M on fibers.** The photon gather lands on strands as violet speckle (few photons per
+hair, spectral bins); the harness frame cost 510 s vs ~40 s in mode R. Candidates, in order of
+cost: more photons + the denoiser (cheap, may suffice at flyby scale); gather AT the fiber hit
+instead of continuing through it (a change to mode M's rule for hair hits -- read that path
+first); the aggregate-medium tier is backward-only today and would need a mode-M twin.
+
+**D. Flyby cost.** Paired on the still: 522 s with hair vs 112 s without (4.7x); the camera pass
+(~17 s/spp vs ~4) because a path entering the mass bounces strand to strand before it lands on a
+diffuse surface. 1147 frames: ~33 h -> ~166 h. Levers, cheapest first, each MEASURED PAIRED:
+  1. `segments 1  points 5` (a third of the segments) and fewer strands -- geometry only.
+  2. Russian roulette (A.2) -- fewer bounces on average.
+  3. Gather at the fiber (C) -- turns a long path into one gather.
+  4. LOD: hair off beyond a distance, with a CAMERA-SIDE stochastic fade (a per-frame
+     probability that a camera ray ignores a strand hit) so the switch is seamless -- NOT a
+     per-frame `count` ramp, which would force a photon-map rebuild per frame and cost more
+     than the hair (the flyby's whole economy is one map, 1147 gathers). Only valid once A.3
+     holds, or the fade itself is a visible colour shift.
+  5. The flyby's own blockers still stand (item 1 below): COMMIT limit, silent launch failure,
+     no `-frames` range.
+
+**E. The hair-authoring GUI tool** (agreed 2026-09-17; design in 0.6 below).
+
+### 0.6 THE HAIR-AUTHORING GUI (agreed 2026-09-17) -- design, on what already exists
+
+**Why it is feasible.** ftrace already has: an imgui + Direct3D 11 viewer shell (`src/viewer_gui.cpp`,
+`-viewer`) with tabs, orbit/zoom 3-D panes, SOLID and WIREFRAME rasterizer states, mesh vertex
+buffers, a strand -> display-mesh converter (`strandToMesh`), click-to-inspect in its Fields pane,
+and a Render pane that path-traces the loaded scene in-process; a raster preview with a host z-buffer
+(`-explore`, `raster.h`); the fur generator (`generateFur`) and the recursive curve flattener as
+plain functions; a `camera_curve` editor that already round-trips authored control points through
+`Loaded::authoredCurves`. The tool is those pieces pointed at `curve` / `fur` blocks.
+
+**What is NEW:** (a) surface picking -- a ray from the clicked pixel against the target mesh (its
+BVH), so a plotted point lands ON the scalp; (b) a curve-hierarchy editor (curves of curves to any
+level, each level its own colour); (c) an FTSL writer/reader for nested `curve` blocks and the
+`fur` block, keeping the AUTHORED points (the loader flattens them away; retain them the way
+`authoredCurves` does for cameras).
+
+**Entry:** `ftrace -groom <scene.ftsl>` (or a bare mesh: auto-scalp = the whole object) opens the
+viewer shell with a Groom tab. Everything in the scene renders in the 3-D pane; the target of the
+`fur` block is what you pick on.
+
+**Phase 1 -- VIEW (read-only, immediately useful):** load a scene; draw the target object solid or
+wireframe; draw every `curve` as a polyline, LEVEL-COLOURED (leaf guides / rings / the curve of rings
+...), control points as dots; a tree panel of the hierarchy (name, level, count/density, closed,
+spline); a toggle "generate hair" that runs the real `generateFur` on the fur block and shows the
+strands (as tubes, via strandToMesh) -- and hides them again, because the hair hides the curves.
+Judge: open `scenes/alice_hair.ftsl` and see her scalp, the four rings in four colours, and the
+groom on demand.
+
+**Phase 2 -- AUTHOR points:** click the surface to plot a control point (picked on the mesh, so the
+root is on the skin); drag to move along the surface; a modifier to pull a point OFF the surface
+along the normal (tips hang in the air) or in the screen plane; Del; N for a new leaf curve; radius
+per point; undo. Save writes the hair file (curves + fur) and reload round-trips it exactly.
+
+**Phase 3 -- HIERARCHY:** select curves -> "group into a curve of curves" (a new node with them as
+children, next level up, next colour); node parameters: `count` / `density` / `density_at t rho`
+keyframes (drawn as ticks along the node's path), `closed`, `spline`; the node's PATH (through the
+children's roots) drawn in the node's colour; the blended instances previewed live as thin polylines
+when `count` is set, so you see the interpolation before any hair exists. Any depth: a curve of
+rings of guides is three colours.
+
+**Phase 4 -- FUR + RENDER:** the `fur` block's parameters in a panel (count, radius, guide_blend,
+clump, curl, jitter, spline, seed); `bald` zones placed by clicking a centre and dragging a radius,
+drawn as wire spheres; follicles are automatic and area-uniform over the `on` object (existing
+behaviour) with an option to show the root dots; "Render" hands the saved scene to the viewer's
+in-process path tracer so the real hair can be judged without leaving the tool.
+
+**Order and cost:** Phase 1 first (a day: it is display + the tree, no editing), then 2, 3, 4. The
+mode-M / flyby-cost work (0.5) is independent of the tool and can interleave.
 ## 1. The `gallery_rain` 960x540 flyby — THE DELIVERABLE, and it has never been launched
 
 1147 frames, `camera_curve "fly"`, mode M. Everything below it (`-sunnee`, VOLCACHE, the spectral
