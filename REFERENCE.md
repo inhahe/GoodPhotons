@@ -48,7 +48,7 @@ Three neighbouring documents cover what this one only summarises:
   - [Where asset paths are looked for](#where-asset-paths-are-looked-for)
   - [Conditional blocks (`prefer { … } else { … }`)](#conditional-blocks-prefer----else---)
   - [Curves of curves (recursive `curve`, 0.326.0)](#curves-of-curves-recursive-curve-0326-0)
-  - [The groom tool (`-groom`, 0.329.0)](#the-groom-tool--groom-0329-0)
+  - [The groom tool (`-groom`)](#the-groom-tool--groom)
   - [Including files (`include "file.ftsl"`)](#including-files-include-fileftsl)
   - [Camera animation (`camera_path`, `camera_orbit`)](#camera-animation-camera_path-camera_orbit)
   - [Multi-camera shared photon pass (modes `A`, `B`, and `M`)](#multi-camera-shared-photon-pass-modes-a-b-and-m)
@@ -4598,21 +4598,51 @@ inverse-distance blend of its `guide_blend` nearest guides' root-relative offset
 authored curves shape a coat of hundreds of thousands (FTSL.md §8.7, `tools/guide_rig.py`). `spline` is also accepted on `fur` and on a
 plain strand (`uniform` default, bit-identical to before).
 
-### The groom tool (`-groom`, 0.329.0)
+### The groom tool (`-groom`)
 
-`ftrace -groom scenes/alice_hair_test.ftsl` opens an interactive window on the scene: its meshes,
-its curve hierarchy level-coloured (a strand red; a curve *of* strands green; a curve of those
-blue; yellow, magenta, cyan above), control points as crosses, a group node's path through its
-children's roots, and the generated hair on a toggle. The loader keeps `shape_only` meshes for this
-tool -- the scalp a groom roots on is one -- and records every named curve with its level, children
-and world-space strands (`Loaded::hairCurves`) and every fur block's output (`Loaded::furInfos`),
-so the tool draws exactly what the renderer would trace. Left panel: toggles, `frame: groom | all`
-(the orbit centres on the curves and the fur's `on` mesh by default, so a floor or a room in the
-scene does not push the head into a corner; `all` frames every mesh), `reset view`, a checkbox per
-level, the curve tree, the fur blocks. Right pane: drag to orbit, wheel to zoom. The startup log
-lists each mesh's bounds and what is being framed. Phase 1 is view-only;
-TODO.md 0.6 has the authoring phases (plot points on the surface, group into curves of curves,
-save). It is a long-lived ftrace process, so `ftrace -stop <pid>` closes it like a viewer.
+`ftrace -groom scenes/alice_hair_test.ftsl` opens an interactive window on the scene (0.329.0): its
+meshes, its curve hierarchy level-coloured (a strand red; a curve *of* strands green; a curve of
+those blue; yellow, magenta, cyan above), control points as crosses, a group node's path through
+its children's roots, and the generated hair on a toggle. The loader keeps `shape_only` meshes for
+this tool -- the scalp a groom roots on is one -- and records every named curve with its level,
+children, transform and world-space strands (`Loaded::hairCurves`) and every fur block's output
+(`Loaded::furInfos`), so the tool draws exactly what the renderer would trace. Left panel: toggles,
+`frame: groom | all` (the orbit centres on the curves and the fur's `on` mesh by default, so a
+floor or a room does not push the head into a corner), `reset view`, a checkbox per level, the
+**Edit** section, the curve tree (click a node to highlight it; untick it or its level to hide
+it), the fur blocks, the files. Right pane: drag to orbit, wheel to zoom. The startup log lists
+each mesh's bounds, what is being framed, and which mesh picks land on.
+
+**Authoring (0.330.0).** The tool reads the scene's curve blocks a second time through the parser
+and keeps them AS WRITTEN (`src/groom.h`): every `point` with its own tokens, every child in order,
+every other statement verbatim. With a strand selected (click it in the tree, or one of its points
+in the pane), a **click on the surface plots a point**: the pixel's ray is intersected with the
+fur's `on` mesh (tick `any mesh` to pick elsewhere; a click through the face onto the back of the
+scalp is refused), and the point goes after the selected one, or at the end. Hovering only ever
+grabs a point the eye can see (one on the far side of the head that projects onto the same pixel
+is left alone); a freshly made empty strand, or **Alt**, makes a click plot even next to an
+existing point. **Drag a point** to slide it over the surface; **Shift-drag** lifts it along the surface normal (tips hang in the
+air); **Ctrl-drag** moves it in the screen plane. The Edit section shows the selected point's
+authored coordinates and an optional per-point radius (`r=`) for typing; **Del** deletes the
+point, **N** starts a new strand (in the selected curve's file and group, else the first writable
+file, else a new `<scene>_groom.ftsl` that is included from the scene), **Ctrl+Z** undoes,
+**Ctrl+S** saves, `reload` re-runs the loader. Points are authored in the file's own frame: a pick
+is mapped back through the enclosing `group`'s transform, so a groom placed with `translate` /
+`rotate` / `scale` edits correctly.
+
+**What save writes.** Every modified file, whole, in the tool's format: the file's opening
+comment, a marker line, then its blocks -- untouched points character-for-character as authored,
+edited ones as the shortest decimal that reads back to the same double, every other statement
+verbatim. Only files whose every block is a `curve` or a `group` of curves are written (the
+`Files` section says why one is not); keep hair in its own included file, which is what `include`
+is for. Comments inside blocks do not survive. Until `reload`, the strands a `count` node places
+and the fur are from before the edit and are drawn dimmed ("stale"). `ftrace -groom-rewrite <in>
+<out>` is the same writer headless: `tools/groom_rig.py` rewrites nine curve scenes and Alice's
+guides and checks `-dumpcurves` is byte-identical each time.
+
+It is a long-lived ftrace process, so `ftrace -stop <pid>` closes it like a viewer. TODO.md 0.6
+has the remaining phases (grouping into curves of curves with a live preview of `count`, the fur
+panel, an in-tool render).
 
 ### Including files (`include "file.ftsl"`)
 
@@ -5428,6 +5458,7 @@ survive exactly.
 | `-savemap <f>` / `-loadmap <f>` | Mode `M` view-independent photon-map cache, on **CPU and GPU**. `-savemap` writes the trace to `<f>`; `-loadmap` reloads it and **skips the forward pass entirely**, re-gathering any camera / radius for free. **Carries the `-beams` volume cache too**, so a rain / fog / rainbow scene can bank its volume as well as its surfaces — save with `-beams` and the beams go in the file. Only *derived* structures are left out (the photon grid, the beam BVH, the beam split), so **one file serves any later `-pmradius` / `-pmcount` / `-pmccount` / `-beamblur` / `-beamk` / `-beamradius`** — reload the same cache with `-beamblur 0.03` and the kernel is re-solved from scratch. Since 0.199.7 (`FTPMP04`) the file also carries the **caustic map** as its own population, so a reload reproduces the split without re-tracing; since 0.202.0 (`FTPMP05`) each beam additionally carries its spectral bundle (see `-beamspec`); since 0.257.0 (**`FTPMP08`**, the current generation) that bundle carries a per-member weight, and an `FTPMP07` file widens to weight 1 on every member — which is *exact*, since equal weights is precisely what an `FTPMP07` bundle meant. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene; a pre-0.202.0 (`FTPMP04`) file loads with monochromatic beams, a pre-0.199.7 (`FTPMP03`) file loads with every photon in the global map (the pre-split behaviour), a pre-0.195.0 (`FTPMP02`) file additionally reports no beams, and asking for `-beams` against one warns rather than quietly rendering a volumeless image. Like `-o`, a missing parent directory for `-savemap` is created up front rather than discovered after the deposit |
 | `-dumpcurves <f>` | After the scene loads, write every strand — hand-written `curve`s, curves of curves, and every `fur` hair — as a polyline to `<f>` (`strand N mat M name "…" points K`, then one `x y z r` line per point) and **exit without rendering**. The debugging tool for a groom, and the exact oracle for `tools/curve_rig.py`: with `basis linear  segments 1` the polyline *is* the control polygon (0.326.0) |
 | `-groom <scene.ftsl>` | **The hair-authoring tool** (0.329.0, Phase 1: view). Opens the viewer shell on a plain scene and shows, in one orbitable pane, the scene's meshes (solid / wireframe; shape-only scalps are kept, not stripped), every named `curve` in **its level's colour** -- red strands, green curves of strands, blue curves of those, then yellow, magenta, cyan -- with control points as crosses; a group node (no `count` / density) draws its PATH through its children's roots; and, on a toggle because they hide the curves, the strands every `fur` block generated plus their roots. A tree panel lists the hierarchy with each node's `count` / density / `closed`; click a node to highlight it, untick it or its level to hide it. Authoring is the next phases (TODO.md 0.6) |
+| `-groom-rewrite <in> <out>` | Rewrite one scene file through the groom tool's curve model and exit (0.330.0): curve and group blocks through the model (untouched points verbatim), everything else through the general block writer. The round-trip check `tools/groom_rig.py` runs: `-dumpcurves` of the rewrite must match the original byte for byte |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
 | `-heroc <N>` | Hero-wavelength bundle size on the spectral tracers — **CPU** modes `A`/`B`/`C`, `R`, photon-map `M`/`S`, BDPT `D` and VCM `U`, plus the **GPU megakernel** (forward `A`/`B`/`C`, the `M` deposit, backward `R`, BDPT `D`, and VCM `U`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count for free. In BDPT both subpaths carry the bundle and each connection is evaluated per-λ under one shared MIS weight — on **both** backends, which agree to 0.03%. VCM (`U`) does the same on **both** backends: one bundle per path index feeds both its light and camera subpath, so its *connections* are exact per-λ while its *merges* key off each stored light vertex's own wavelengths — **0.51× noise RMS** at equal passes on a gel + mirror box (CPU), **0.72–0.82× chroma noise** for 1.5–1.7× the time on the GPU, matching the single-λ estimator to 0.02 % and each other to 0.03 %. In modes `R` and `A`/`B`/`C` (and the `M`/`S` deposit) the bundle also rides through mirrors/gels/glossy lobes and every Russian roulette survives on the strongest live λ (no per-λ ratio amplification), worth ~0.42–0.52× noise RMS on coloured interiors in `R` and ~1.1× luma / 1.3–1.8× chroma at equal time in the forward modes. Default `4`; clamped to `1..8`. **Mode `W` defaults to `8` instead** — at 1 spp the bundle *is* the spectral quadrature, and it is nearly free there (measured 2.7 % of frame time versus a single wavelength, because mode `W` is traversal-bound; the same step costs 61 % in mode `R`). `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator) — fine in the sampled modes, but in mode `W` it renders dispersive surfaces flatly **wrong** rather than merely noisy, and a batch mode-`W` render now warns and names the offending material. Ignored (still single-λ) by the GPU **wavefront** backend (`-wavefront`) and by any scene with participating media, a GRIN volume, or a finite-lens camera |

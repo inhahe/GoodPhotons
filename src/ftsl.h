@@ -236,6 +236,9 @@ struct Block {
     // Each branch is a list of ordinary top-level blocks; the loader picks the first
     // branch whose spliced scene is fully renderable in its chosen mode. Empty otherwise.
     std::vector<std::vector<Block>> branches;
+    // The file this block was read from (0.330.0): the scene for its own blocks, the included
+    // file for spliced ones. The groom tool writes a curve back to the file it came from.
+    std::string file;
 };
 
 }  // namespace ftsl  (temporarily closed so the GPDA front end can see
@@ -837,6 +840,9 @@ struct Loaded {
         // point), the points `count` / density place instances along. World space. Empty
         // for a strand (a node with only `point`s).
         std::vector<Vec3>        childRoots;
+        // Authored -> world: the enclosing group's transform, applied once. The groom tool
+        // maps a pick on the surface back through its inverse to author in the file's frame.
+        Affine                   xf;
     };
     std::vector<HairCurveInfo> hairCurves;
     // What each `fur` block made, so a tool can show / hide a groom's strands as a unit.
@@ -5345,6 +5351,7 @@ private:
                 rec.childRoots = std::move(one[0].pts);
             }
             rec.rendered = (id >= 0) && (rec.name == b.name);
+            rec.xf = xf;
             L.hairCurves.push_back(std::move(rec));
         }
         hairRecs_.resize(recBefore);
@@ -8836,6 +8843,7 @@ inline bool expandIncludes(std::vector<Block>& blocks, const std::string& fromFi
         std::vector<Block> sub;
         std::string perr;
         if (!ftsl_gpda::parse(ss.str(), sub, perr)) { err = "in included file " + path + ": " + perr; return false; }
+        for (Block& sb : sub) sb.file = path;                        // nested includes retag their own below
         chain.push_back(key);
         if (!expandIncludes(sub, path, chain, err, depth + 1)) return false;
         chain.pop_back();
@@ -8939,6 +8947,7 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
     {   // `include "file.ftsl"` blocks become the included files' blocks, in place.
         std::vector<std::string> chain;
         chain.push_back(detail::includeKey(nameForMsgs));
+        for (Block& b : blocks) b.file = nameForMsgs;
         if (!expandIncludes(blocks, nameForMsgs, chain, err)) return false;
     }
 

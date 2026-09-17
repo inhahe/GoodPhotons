@@ -29400,3 +29400,16 @@ at low spp, and it must pay its own march cost out of that. The hybrid design ke
 the 3.2 s beam BVH build stays regardless. The honest ceiling is therefore *below* half the frame and
 falls as spp falls — while **parallelising the beam BVH build is an unconditional win that needs no
 cache at all**, and is now the better-value half of this entry.
+
+## The groom tool's writer normalises a curve file (0.330.0)
+
+`ftrace -groom` saves a modified curve file WHOLE from its model: the file's opening comment and
+a marker line, then every block. What does not survive: comments inside blocks, blank lines, and
+the original interleaving of `point`s with other statements (the writer puts a node's other
+statements first, then its points, then its children -- the loader reads by key, so the strands
+are identical, which `tools/groom_rig.py` checks byte for byte through `-dumpcurves`). A file
+holding anything other than `curve` / `group`-of-curve blocks is not written at all (the tool's
+`Files` section names the offending block); hair belongs in its own included file. An empty
+strand (`N` pressed, nothing plotted) is not written at all, since the loader refuses one. Until
+`reload`, the strands a `count` node places and the fur are from the previous load (drawn dimmed
+as "stale") -- a live preview of placement is Phase 3 of TODO.md 0.6.

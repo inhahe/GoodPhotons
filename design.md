@@ -1078,6 +1078,22 @@ group's path is drawn from the same numbers `count` would use, not re-derived by
 pane frames the GROOM by default (the curves' points and the fur's `on` mesh; `all` frames every
 mesh) and rebuilds its line buffer only when a toggle or selection changes.
 
+**Authoring (0.330.0).** `src/groom.h` is the tool's model: `Pt` (a point with its raw tokens and
+an `edited` flag), `Node` (points, inline children, references by name, every other statement kept
+as an `ftsl::Stmt`), `Entry` (a top-level curve, or a `group` with its own statements and members),
+`FileModel` (a file's entries, whether it is writable, its leading comment, a dirty flag).
+`modelFromBlocks` builds it from the parser's blocks, which now carry the file they came from
+(`Block::file`, tagged by `loadSource` and `expandIncludes`); the tool parses the scene a second
+time for this, because the loader flattens curves away. The writer emits untouched points verbatim
+and edited ones with `std::to_chars` (the shortest round trip); `rewriteFile` is the headless path
+`-groom-rewrite` and `tools/groom_rig.py` use. Picking is a ray from the orthographic pane
+(`PaneCam`) against the target mesh group's own triangles (Moller-Trumbore over ~10k triangles --
+the scene BVH answers "what" but not "which mesh"), a click also checked against every other mesh
+so nothing nearer is picked through; a pick is mapped into the file's frame through the inverse of
+the transform the loader applied (`HairCurveInfo::xf`, or a named sibling's for a new curve). Undo
+is a stack of model copies. The tree, the lines and the selection are model-driven; the loader's
+records supply only the strands of placed nodes and the fur, dimmed once an edit makes them stale. The tool is exercised without a hand on the mouse by `tools/gui_drive.ps1` (focus, keys, clicks and drags at window fractions, DPI-correct captures): the first drive found hovering grabbing a point on the FAR side of the head that projected onto the pixel, which is why hovering now tests each candidate against the scene BVH (hair skipped) and ignores what the eye cannot see.
+
 **The media term joined it in 0.322.0** (`Renderer::mediumTransmittanceSpec`,
 `dMedTransmittanceSpec`). A transmittance is a stochastic estimate, so it cannot use the ratio
 trick (`E[A/B] != E[A]/E[B]`); the walk carries a per-wavelength vector instead, in three tiers —

@@ -46,6 +46,7 @@ int runViewerGui(const std::string&, const std::string&, bool, bool, int) {
 #include <cwctype>
 #include <memory>                  // shared_ptr: the live channel's in-memory payload
 #include <array>
+#include <filesystem>
 #include "assetbytes.h"            // asset bytes handed to the loader instead of paths
 
 // Bridge to ftrace's own scene loader + GPU field raymarcher (F7 primary path).
@@ -56,6 +57,7 @@ int runViewerGui(const std::string&, const std::string&, bool, bool, int) {
 // sidecar is only a fallback). These headers are plain-C++ (main.cpp includes them
 // under MSVC too); the raymarch itself is guarded by HAVE_CUDA below.
 #include "ftsl.h"
+#include "groom.h"               // the hair-authoring tool's curve model (Phase 2)
 #include "render_cuda.h"
 
 #include <d3dcompiler.h>           // the mesh pane's z-buffered shaders (runtime-compiled)
@@ -3826,7 +3828,7 @@ static std::vector<MeshGeom> meshesFromScene(const Scene& sc) {
 }
 
 // Line geometry: batches of segments, one colour each, in one immutable vertex buffer that is
-// rebuilt only when a toggle or a selection changes (a groom is a quarter-million segments).
+// rebuilt only when a toggle, a selection or a point changes (a groom is a quarter-million segments).
 struct LineBatch { std::vector<MeshPaneVert> v; float rgba[4] = { 1, 1, 1, 1 }; };
 struct LinesGpu {
     ID3D11Buffer* vb = nullptr;
@@ -3865,6 +3867,70 @@ static void addCross(LineBatch& b, const Vec3& p, double h) {
     addSegment(b, p - Vec3{0, 0, h}, p + Vec3{0, 0, h});
 }
 
+// ---- the pane's camera, kept per frame so a pixel can become a ray and a point a pixel --------
+// Orthographic: NDC x = ax * R0.(p - mid), y = ay * R1.(p - mid); R2 points at the viewer.
+struct PaneCam {
+    float R[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+    float mid[3] = { 0, 0, 0 };
+    float ax = 1.0f, ay = 1.0f, s = 1.0f, diag = 1.0f;
+    ImVec2 origin, avail;
+    bool valid = false;
+    Vec3 right()  const { return Vec3{ R[0][0], R[0][1], R[0][2] }; }
+    Vec3 up()     const { return Vec3{ R[1][0], R[1][1], R[1][2] }; }
+    Vec3 toward() const { return Vec3{ R[2][0], R[2][1], R[2][2] }; }   // out of the screen
+    ImVec2 toScreen(const Vec3& p) const {
+        const float d[3] = { (float)p.x - mid[0], (float)p.y - mid[1], (float)p.z - mid[2] };
+        const float X = R[0][0] * d[0] + R[0][1] * d[1] + R[0][2] * d[2];
+        const float Y = R[1][0] * d[0] + R[1][1] * d[1] + R[1][2] * d[2];
+        return ImVec2(origin.x + (ax * X + 1.0f) * 0.5f * avail.x, origin.y + (1.0f - ay * Y) * 0.5f * avail.y);
+    }
+    void ray(const ImVec2& px, Vec3& o, Vec3& d) const {
+        const float nx = (px.x - origin.x) / std::max(avail.x, 1.0f) * 2.0f - 1.0f;
+        const float ny = 1.0f - (px.y - origin.y) / std::max(avail.y, 1.0f) * 2.0f;
+        const Vec3 m{ mid[0], mid[1], mid[2] };
+        o = m + right() * (double)(nx / ax) + up() * (double)(ny / ay) + toward() * (double)(diag * 4.0f);
+        d = toward() * -1.0;
+    }
+    double worldPerPixel() const { return 1.0 / std::max(s, 1e-6f); }
+};
+
+// ---- picking: a pixel ray against a mesh group's own triangles -------------------------------
+// The scene's BVH answers "what is hit" but not "which mesh"; a groom picks on ONE mesh (the
+// fur's `on` target, ~10k triangles), so its triangle range is simply walked.
+static bool rayTri(const Vec3& o, const Vec3& d, const Tri& t, double& tOut) {
+    const Vec3 e1 = t.v1 - t.v0, e2 = t.v2 - t.v0;
+    const Vec3 pv = cross(d, e2);
+    const double det = dot(e1, pv);
+    if (std::fabs(det) < 1e-18) return false;
+    const double inv = 1.0 / det;
+    const Vec3 tv = o - t.v0;
+    const double u = dot(tv, pv) * inv;
+    if (u < 0.0 || u > 1.0) return false;
+    const Vec3 qv = cross(tv, e1);
+    const double v = dot(d, qv) * inv;
+    if (v < 0.0 || u + v > 1.0) return false;
+    const double tt = dot(e2, qv) * inv;
+    if (tt <= 0.0) return false;
+    tOut = tt;
+    return true;
+}
+struct Pick { bool hit = false; Vec3 p{0, 0, 0}, n{0, 1, 0}; double t = 0.0; int group = -1; };
+static Pick pickGroup(const Scene& sc, const MeshGroup& mg, const Vec3& o, const Vec3& d) {
+    Pick best;
+    const size_t end = std::min(mg.triStart + mg.triCount, sc.tris.size());
+    for (size_t i = mg.triStart; i < end; ++i) {
+        double t;
+        if (!rayTri(o, d, sc.tris[i], t) || (best.hit && t >= best.t)) continue;
+        best.hit = true; best.t = t;
+        Vec3 n = sc.tris[i].gn;
+        if (dot(n, n) < 1e-18) { n = cross(sc.tris[i].v1 - sc.tris[i].v0, sc.tris[i].v2 - sc.tris[i].v0); if (dot(n, n) > 1e-30) n = normalize(n); }
+        if (dot(n, d) > 0.0) n = n * -1.0;          // facing the viewer
+        best.n = n;
+    }
+    if (best.hit) best.p = o + d * best.t;
+    return best;
+}
+
 struct GroomState {
     std::string   scenePath;
     ftsl::Loaded  loaded;
@@ -3873,11 +3939,10 @@ struct GroomState {
     std::vector<MeshGeom> meshes;
     MeshView      view;
     LinesGpu      lines;
+    PaneCam       cam;
     // toggles (any change marks the line buffer dirty)
     bool showMesh = true, showCurves = true, showPoints = true, showHair = false, showRoots = false;
     bool levelOn[8] = { true, true, true, true, true, true, true, true };
-    std::vector<char> curveOn;      // parallel to loaded.hairCurves
-    int  selected = -1;             // index into hairCurves, or -1
     int  maxLevel = 0;
     double ext = 1.0;               // extent of what is framed, for cross sizes
     // Framing: what the orbit centres on and scales to. 0 = the GROOM (every curve's points and
@@ -3885,7 +3950,63 @@ struct GroomState {
     // scene would otherwise push the head into a corner of the pane.
     int   frameMode = 0;
     float frameMid[3] = { 0, 0, 0 }, frameExt = 1.0f, frameDiag = 1.0f;
+
+    // ---- authoring (Phase 2): the curve tree as written, and what is being edited
+    groom::Model model;
+    std::unordered_map<int, Affine> xfOf;        // model node id -> authored->world (the loader's transform for its file/group)
+    std::unordered_map<int, char>   nodeOn;      // visibility per node id (absent = shown)
+    std::unordered_map<std::string, const ftsl::Loaded::HairCurveInfo*> recByName;   // the loader's flattened strands, for placed nodes
+    int  selNode = -1, selPt = -1;               // the selected node (model id) and point index
+    int  hoverNode = -1, hoverPt = -1;
+    std::string target;                          // picks land on this mesh (the fur's `on`)
+    int  targetGroup = -1;                       // its index into scene.meshGroups
+    bool pickAny = false;                        // or on any mesh
+    bool addOnClick = true;                      // a click on the surface plots a point on the selected strand
+    std::vector<groom::Model> undo;
+    std::string status;
+    bool stale = false;                          // placed strands / fur shown are from before an edit
+    // a point being dragged
+    bool   dragging = false, dragMoved = false;
+    int    dragNode = -1, dragPt = -1;
+    int    dragMode = 0;                         // 0 slide on the surface, 1 along the normal, 2 in the screen plane
+    Vec3   dragN{0, 1, 0}, dragP0{0, 0, 0};
+    ImVec2 dragMouse0, pressPos;
+    bool   pressedEmpty = false;                 // the press began on nothing (an orbit, or a click that plots)
 };
+
+static bool nodeVisible(const GroomState& g, int id) { auto it = g.nodeOn.find(id); return it == g.nodeOn.end() || it->second != 0; }
+// A picked or dragged point is kept to the micron: hair needs no more, and the file stays readable.
+static Vec3 snapMicron(const Vec3& v) { return Vec3{ std::round(v.x * 1e6) / 1e6, std::round(v.y * 1e6) / 1e6, std::round(v.z * 1e6) / 1e6 }; }
+static Affine xfOf(const GroomState& g, int id) { auto it = g.xfOf.find(id); return it == g.xfOf.end() ? Affine::identity() : it->second; }
+
+template <class F> static void forEachEntryCurve(std::vector<groom::Entry>& list, F& f) {
+    for (groom::Entry& e : list) { if (e.group) forEachEntryCurve(e.items, f); else f(e.curve); }
+}
+template <class F> static void forEachTopCurve(groom::Model& m, F f) { for (groom::FileModel& fm : m.files) forEachEntryCurve(fm.entries, f); }
+
+// The surface under a pixel: the target mesh's own triangles, and -- for a click -- a check that
+// nothing else is nearer (a pick through the face onto the back of the scalp is refused; the
+// doll's own coincident triangles are not "nearer"). During a drag only the target is walked.
+static Pick pickSurface(GroomState& g, const ImVec2& px, bool checkOcclusion) {
+    Vec3 o, d;
+    g.cam.ray(px, o, d);
+    const Scene& sc = g.loaded.scene;
+    Pick best;
+    for (size_t gi = 0; gi < sc.meshGroups.size(); ++gi) {
+        const MeshGroup& mg = sc.meshGroups[gi];
+        if (mg.blasId >= 0 || mg.triCount == 0) continue;
+        const bool isTarget = ((int)gi == g.targetGroup);
+        if (!g.pickAny && !isTarget && !checkOcclusion) continue;
+        Pick p = pickGroup(sc, mg, o, d);
+        if (!p.hit) continue;
+        p.group = (int)gi;
+        const double tol = 1e-6 * (1.0 + std::fabs(p.t));
+        if (!best.hit || p.t < best.t - tol) best = p;
+        else if (isTarget && std::fabs(p.t - best.t) <= tol) best = p;   // coincident with the target: the target wins
+    }
+    if (best.hit && !g.pickAny && best.group != g.targetGroup) best.hit = false;
+    return best;
+}
 
 static void groomComputeFrame(GroomState& g) {
     float alo[3] = { 1e30f, 1e30f, 1e30f }, ahi[3] = { -1e30f, -1e30f, -1e30f };   // everything drawn
@@ -3896,8 +4017,7 @@ static void groomComputeFrame(GroomState& g) {
         lo[2] = std::min(lo[2], z); hi[2] = std::max(hi[2], z);
     };
     for (const MeshGeom& m : g.meshes) {
-        bool on = false;
-        for (const auto& fi : g.loaded.furInfos) if (fi.on == m.name) on = true;
+        const bool on = (m.name == g.target);
         for (int i = 0; i < m.nverts; ++i) {
             const float* v = &m.verts[(size_t)i * 3];
             grow(alo, ahi, v[0], v[1], v[2]);
@@ -3913,7 +4033,7 @@ static void groomComputeFrame(GroomState& g) {
     const bool haveGroom = ghi[0] >= glo[0], haveAll = ahi[0] >= alo[0];
     const float* lo = (g.frameMode == 0 && haveGroom) ? glo : alo;
     const float* hi = (g.frameMode == 0 && haveGroom) ? ghi : ahi;
-    if (!haveAll) { g.frameMid[0] = g.frameMid[1] = g.frameMid[2] = 0.0f; g.frameExt = g.frameDiag = 1.0f; return; }
+    if (!haveAll) { g.frameMid[0] = g.frameMid[1] = g.frameMid[2] = 0.0f; g.frameExt = g.frameDiag = 1.0f; g.ext = 1.0; return; }
     g.frameExt = 1e-3f;
     for (int k = 0; k < 3; ++k) { g.frameExt = std::max(g.frameExt, hi[k] - lo[k]); g.frameMid[k] = 0.5f * (lo[k] + hi[k]); }
     // The depth range still has to cover EVERYTHING drawn, whatever the pane centres on: the
@@ -3927,52 +4047,72 @@ static void groomComputeFrame(GroomState& g) {
     g.ext = g.frameExt;
 }
 
+// ---- the model -> lines ------------------------------------------------------------------------
+// A strand draws its polyline through its authored points (transformed to world) and a cross at
+// each point. A curve of curves draws its PATH -- the Catmull-Rom through its children's roots,
+// what `count` places along -- and, when it places, the loader's flattened instances (from the
+// last load: dimmed once an edit has made them stale). Children draw themselves; a reference
+// draws nothing (its definition does).
+static void drawNodeLines(GroomState& g, groom::Node& n, int level, std::vector<LineBatch>& out, double cross) {
+    if (n.ref || !nodeVisible(g, n.id)) return;
+    const Affine xf = xfOf(g, n.id);
+    const bool leaf = n.kids.empty();
+    if (level >= 0 && level < 8 && g.levelOn[level]) {
+        LineBatch b;
+        const float* col = levelColour(level);
+        const bool dim = (g.selNode >= 0 && n.id != g.selNode);
+        for (int k = 0; k < 4; ++k) b.rgba[k] = col[k];
+        if (dim) { b.rgba[0] *= 0.35f; b.rgba[1] *= 0.35f; b.rgba[2] *= 0.35f; }
+        if (leaf) {
+            std::vector<Vec3> w; w.reserve(n.pts.size());
+            for (const groom::Pt& p : n.pts) w.push_back(xf.apply(p.p));
+            for (size_t k = 1; k < w.size(); ++k) addSegment(b, w[k - 1], w[k]);
+            if (g.showPoints) for (const Vec3& p : w) addCross(b, p, cross);
+        } else {
+            std::vector<Vec3> roots;
+            for (const groom::Node& k : n.kids) { Vec3 r; if (groom::rootOf(g.model, k, r)) roots.push_back(xf.apply(r)); }
+            if (roots.size() >= 2) {
+                const bool closed = n.closed();
+                const int nSeg = closed ? (int)roots.size() : (int)roots.size() - 1;
+                const int M = nSeg * 16;
+                const double alpha = n.alpha();
+                Vec3 prev = ftsl::catmullRomAt(roots, closed, 0.0, alpha);
+                for (int k = 1; k <= M; ++k) {
+                    const Vec3 cur = ftsl::catmullRomAt(roots, closed, nSeg * (double)k / M, alpha);
+                    addSegment(b, prev, cur); prev = cur;
+                }
+            }
+            if (g.showPoints) for (const Vec3& r : roots) addCross(b, r, cross * 1.6);
+            if (n.placed() && !n.name.empty()) {
+                auto it = g.recByName.find(n.name);
+                if (it != g.recByName.end()) {
+                    LineBatch inst;
+                    const float f = g.stale ? 0.3f : 0.7f;
+                    for (int k = 0; k < 3; ++k) inst.rgba[k] = b.rgba[k] * f;
+                    inst.rgba[3] = 1.0f;
+                    for (const ftsl::CurveStrand& s : it->second->strands)
+                        for (size_t k = 1; k < s.pts.size(); ++k) addSegment(inst, s.pts[k - 1], s.pts[k]);
+                    if (!inst.v.empty()) out.push_back(std::move(inst));
+                }
+            }
+        }
+        if (!b.v.empty()) out.push_back(std::move(b));
+    }
+    for (groom::Node& k : n.kids) if (!k.ref) drawNodeLines(g, k, groom::levelOf(g.model, k), out, cross);
+}
+
 static void groomBuildLines(GroomState& g, std::vector<LineBatch>& out) {
     out.clear();
-    const auto& hc = g.loaded.hairCurves;
     const double cross = 0.006 * g.ext;
-    if (g.showCurves) {
-        for (size_t i = 0; i < hc.size(); ++i) {
-            const auto& c = hc[i];
-            if (!g.curveOn[i] || !g.levelOn[std::min(c.level, 7)]) continue;
-            LineBatch b;
-            const float* col = levelColour(c.level);
-            const bool dim = (g.selected >= 0 && (int)i != g.selected);
-            for (int k = 0; k < 4; ++k) b.rgba[k] = col[k];
-            if (dim) { b.rgba[0] *= 0.35f; b.rgba[1] *= 0.35f; b.rgba[2] *= 0.35f; }
-            if (c.level > 0 && c.count <= 0 && !c.density) {
-                // A GROUP (no placement): its strands are its children's, which the children
-                // already draw in their own colour. What is the group's own is its PATH -- the
-                // Catmull-Rom through its CHILDREN'S roots (each child's first strand's first
-                // point, exactly what `count` would place along; the loader records them) --
-                // so that is what it draws, closed if it is closed.
-                const std::vector<Vec3>& roots = c.childRoots;
-                if (roots.size() >= 2) {
-                    const int nSeg = c.closed ? (int)roots.size() : (int)roots.size() - 1;
-                    const int M = nSeg * 16;
-                    Vec3 prev = ftsl::catmullRomAt(roots, c.closed, 0.0, c.alpha);
-                    for (int k = 1; k <= M; ++k) {
-                        const Vec3 cur = ftsl::catmullRomAt(roots, c.closed, nSeg * (double)k / M, c.alpha);
-                        addSegment(b, prev, cur); prev = cur;
-                    }
-                    if (g.showPoints) for (const Vec3& r : roots) addCross(b, r, cross * 1.6);
-                }
-            } else {
-                for (const ftsl::CurveStrand& s : c.strands)
-                    for (size_t k = 1; k < s.pts.size(); ++k) addSegment(b, s.pts[k - 1], s.pts[k]);
-                if (g.showPoints && c.level == 0)
-                    for (const ftsl::CurveStrand& s : c.strands)
-                        for (const Vec3& p : s.pts) addCross(b, p, cross);
-            }
-            if (!b.v.empty()) out.push_back(std::move(b));
-        }
-    }
+    if (g.showCurves)
+        forEachTopCurve(g.model, [&](groom::Node& n) { drawNodeLines(g, n, groom::levelOf(g.model, n), out, cross); });
     const Scene& sc = g.loaded.scene;
     if (g.showHair || g.showRoots) {
         for (const auto& fi : g.loaded.furInfos) {
             LineBatch hair, roots;
-            hair.rgba[0] = 0.86f; hair.rgba[1] = 0.72f; hair.rgba[2] = 0.45f; hair.rgba[3] = 1.0f;
-            roots.rgba[0] = 1.0f; roots.rgba[1] = 1.0f; roots.rgba[2] = 1.0f; roots.rgba[3] = 1.0f;
+            const float f = g.stale ? 0.45f : 1.0f;
+            hair.rgba[0] = 0.86f * f; hair.rgba[1] = 0.72f * f; hair.rgba[2] = 0.45f * f; hair.rgba[3] = 1.0f;
+            roots.rgba[0] = roots.rgba[1] = roots.rgba[2] = f; roots.rgba[3] = 1.0f;
             const int cEnd = std::min((int)sc.curves.size(), fi.firstCurve + (int)fi.strands);
             for (int ci = fi.firstCurve; ci < cEnd; ++ci) {
                 const Curve& c = sc.curves[(size_t)ci];
@@ -3990,18 +4130,302 @@ static void groomBuildLines(GroomState& g, std::vector<LineBatch>& out) {
     }
 }
 
-// The pane: the mesh pane's camera and mesh pass, then the line pass with depth TESTED but not
-// written (so a curve behind the head is hidden by the head, and lines never z-fight each other).
+// ---- editing ----------------------------------------------------------------------------------
+static void pushUndo(GroomState& g) {
+    g.undo.push_back(g.model);
+    if (g.undo.size() > 100) g.undo.erase(g.undo.begin());
+}
+static void select(GroomState& g, int node, int pt) {
+    if (g.selNode != node || g.selPt != pt) g.lines.dirty = true;
+    g.selNode = node; g.selPt = pt;
+}
+static void markEdited(GroomState& g, int nodeId) {
+    groom::Where w = groom::whereIs(g.model, nodeId);
+    if (w.file) w.file->dirty = true;
+    g.lines.dirty = true;
+    if (!g.loaded.furInfos.empty() || !g.recByName.empty()) g.stale = true;
+}
+static bool isReferenced(groom::Model& m, const std::string& name) {
+    if (name.empty()) return false;
+    std::vector<groom::Node*> all; groom::collectNodes(m, all);
+    for (const groom::Node* n : all) if (n->ref && n->name == name) return true;
+    return false;
+}
+// A new hair file beside a scene that has no writable one, included from the scene.
+static groom::FileModel* ensureGroomFile(GroomState& g) {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::path(g.scenePath);
+    const fs::path out = root.parent_path() / (root.stem().string() + "_groom.ftsl");
+    for (groom::FileModel& f : g.model.files) if (f.path == out.string()) return &f;
+    {
+        std::ofstream a(g.scenePath, std::ios::app);
+        if (!a) { g.status = "cannot append an include to " + g.scenePath; return nullptr; }
+        a << "\n# hair authored with ftrace -groom\ninclude \"" << out.filename().string() << "\"\n";
+    }
+    groom::FileModel fm;
+    fm.path = out.string(); fm.writable = true; fm.dirty = true;
+    fm.leading = "# hair authored with ftrace -groom for " + root.filename().string() + "\n";
+    g.model.files.push_back(std::move(fm));
+    g.status = "created " + out.string() + " and included it from " + g.scenePath;
+    return &g.model.files.back();
+}
+static void newStrand(GroomState& g) {
+    groom::FileModel* fm = nullptr;
+    groom::Entry* container = nullptr;
+    if (g.selNode >= 0) {
+        groom::Where w = groom::whereIs(g.model, g.selNode);
+        if (w.file && w.file->writable) { fm = w.file; container = w.container; }
+    }
+    if (!fm) for (groom::FileModel& f : g.model.files) if (f.writable) { fm = &f; break; }
+    if (!fm) fm = ensureGroomFile(g);
+    if (!fm) return;
+    Affine xf = Affine::identity();
+    const std::vector<groom::Entry>& sib = container ? container->items : fm->entries;
+    for (const groom::Entry& e : sib) if (!e.group) { xf = xfOf(g, e.curve.id); break; }
+    pushUndo(g);
+    groom::Node& n = groom::newCurve(g.model, *fm, container, groom::freshName(g.model, "strand"));
+    g.xfOf[n.id] = xf;
+    select(g, n.id, -1);
+    g.status = "new strand \"" + n.name + "\" in " + fm->path + " -- click the surface to plot its points";
+    g.lines.dirty = true;
+}
+static void addPointAt(GroomState& g, const Pick& pk) {
+    groom::Node* n = (g.selNode >= 0) ? groom::findNode(g.model, g.selNode) : nullptr;
+    if (!n || !n->kids.empty() || n->ref) { g.status = "select a strand (or press N for a new one) to plot points on it"; return; }
+    pushUndo(g);
+    groom::Pt p;
+    p.p = snapMicron(xfOf(g, n->id).inverse().apply(pk.p));
+    p.edited = true;
+    const int at = (g.selPt >= 0 && g.selPt < (int)n->pts.size()) ? g.selPt + 1 : (int)n->pts.size();
+    n->pts.insert(n->pts.begin() + at, p);
+    g.selPt = at;
+    markEdited(g, n->id);
+    char buf[160];
+    std::snprintf(buf, sizeof buf, "plotted point %d of \"%s\" at (%.4f %.4f %.4f)", at, n->name.c_str(), pk.p.x, pk.p.y, pk.p.z);
+    g.status = buf;
+}
+static void deletePoint(GroomState& g) {
+    groom::Node* n = (g.selNode >= 0) ? groom::findNode(g.model, g.selNode) : nullptr;
+    if (!n || g.selPt < 0 || g.selPt >= (int)n->pts.size()) return;
+    pushUndo(g);
+    n->pts.erase(n->pts.begin() + g.selPt);
+    if (n->pts.empty()) g.selPt = -1; else g.selPt = std::min(g.selPt, (int)n->pts.size() - 1);
+    markEdited(g, n->id);
+    g.status = "deleted a point of \"" + n->name + "\"";
+}
+static void deleteStrand(GroomState& g) {
+    groom::Node* n = (g.selNode >= 0) ? groom::findNode(g.model, g.selNode) : nullptr;
+    if (!n) return;
+    if (isReferenced(g.model, n->name)) { g.status = "\"" + n->name + "\" is referenced by name by another curve -- remove the reference first"; return; }
+    groom::Where w = groom::whereIs(g.model, n->id);
+    pushUndo(g);
+    const std::string name = n->name;
+    if (!groom::eraseNode(g.model, n->id)) { g.undo.pop_back(); g.status = "could not delete \"" + name + "\""; return; }
+    if (w.file) w.file->dirty = true;
+    g.selNode = g.selPt = -1;
+    g.lines.dirty = true; g.stale = true;
+    g.status = "deleted \"" + name + "\"";
+}
+static void undoLast(GroomState& g) {
+    if (g.undo.empty()) { g.status = "nothing to undo"; return; }
+    g.model = std::move(g.undo.back());
+    g.undo.pop_back();
+    for (groom::FileModel& f : g.model.files) if (f.writable) f.dirty = true;   // the disk may hold a later save
+    if (g.selNode >= 0 && !groom::findNode(g.model, g.selNode)) g.selNode = g.selPt = -1;
+    g.lines.dirty = true;
+    g.status = "undone";
+}
+static void groomSave(GroomState& g) {
+    std::string err;
+    std::vector<std::string> written;
+    if (!groom::saveModel(g.model, err, &written)) { g.status = "save failed: " + err; return; }
+    if (written.empty()) { g.status = "nothing to save"; return; }
+    std::string list;
+    for (const std::string& w : written) list += (list.empty() ? "" : ", ") + w;
+    g.status = "saved " + list + (g.stale ? " -- reload to refresh placed strands and fur" : "");
+}
+
+// ---- loading: the scene through the renderer's loader, the curve tree through the parser --------
+static bool groomParseModel(GroomState& g) {
+    std::ifstream f(g.scenePath);
+    if (!f) { g.status = "cannot open " + g.scenePath; return false; }
+    std::stringstream ss; ss << f.rdbuf();
+    std::vector<ftsl::Block> blocks;
+    std::string perr;
+    if (!ftsl_gpda::parse(ss.str(), blocks, perr)) { g.status = "parse: " + perr; return false; }
+    for (ftsl::Block& b : blocks) b.file = g.scenePath;
+    std::string dir;
+    { const std::filesystem::path p(g.scenePath); if (p.has_parent_path()) dir = p.parent_path().string(); }
+    assetbytes::ScopedSceneDir sd(dir);
+    std::vector<std::string> chain;
+    if (!ftsl::expandIncludes(blocks, g.scenePath, chain, perr)) { g.status = "include: " + perr; return false; }
+    g.model = groom::modelFromBlocks(blocks);
+    return true;
+}
+static void assignXf(GroomState& g, groom::Node& n, const Affine& xf) { g.xfOf[n.id] = xf; for (groom::Node& k : n.kids) assignXf(g, k, xf); }
+static void resolveXfList(GroomState& g, std::vector<groom::Entry>& list) {
+    // A named curve takes the transform the loader applied to it; an unnamed or new one takes
+    // its named siblings' (they share the group).
+    Affine known = Affine::identity();
+    for (groom::Entry& e : list)
+        if (!e.group && !e.curve.name.empty()) { auto it = g.recByName.find(e.curve.name); if (it != g.recByName.end()) { known = it->second->xf; break; } }
+    for (groom::Entry& e : list) {
+        if (e.group) { resolveXfList(g, e.items); continue; }
+        auto it = e.curve.name.empty() ? g.recByName.end() : g.recByName.find(e.curve.name);
+        assignXf(g, e.curve, it != g.recByName.end() ? it->second->xf : known);
+    }
+}
+static bool groomLoadScene(GroomState& g) {
+    g.loaded = ftsl::Loaded();
+    g.meshes.clear(); g.recByName.clear(); g.xfOf.clear(); g.model = groom::Model(); g.undo.clear();
+    g.selNode = g.selPt = g.hoverNode = g.hoverPt = -1;
+    g.stale = false; g.dragging = false;
+    ftsl::keepShapeOnlyRef() = true;                      // the scalp must be drawable and pickable
+    g.ok = ftsl::load(g.scenePath, g.loaded, g.err);
+    ftsl::keepShapeOnlyRef() = false;
+    if (!g.ok) { std::fprintf(stderr, "[groom] could not load '%s': %s\n", g.scenePath.c_str(), g.err.c_str()); return false; }
+    g.meshes = meshesFromScene(g.loaded.scene);
+    for (const auto& r : g.loaded.hairCurves) g.recByName[r.name] = &r;
+    if (!groomParseModel(g)) std::fprintf(stderr, "[groom] the authored curve tree could not be read: %s\n", g.status.c_str());
+    for (groom::FileModel& fm : g.model.files) resolveXfList(g, fm.entries);
+    // the pick target: the fur's `on` mesh, else the first mesh
+    g.target = g.loaded.furInfos.empty() ? std::string() : g.loaded.furInfos[0].on;
+    g.targetGroup = -1;
+    const Scene& sc = g.loaded.scene;
+    for (size_t gi = 0; gi < sc.meshGroups.size(); ++gi)
+        if (sc.meshGroups[gi].blasId < 0 && sc.meshGroups[gi].triCount > 0 && (g.targetGroup < 0 || sc.meshGroups[gi].name == g.target)) {
+            if (g.targetGroup < 0 || sc.meshGroups[gi].name == g.target) g.targetGroup = (int)gi;
+            if (sc.meshGroups[gi].name == g.target) break;
+        }
+    if (g.targetGroup >= 0) g.target = sc.meshGroups[(size_t)g.targetGroup].name;
+    g.maxLevel = 0;
+    forEachTopCurve(g.model, [&](groom::Node& n) { g.maxLevel = std::max(g.maxLevel, groom::levelOf(g.model, n)); });
+    groomComputeFrame(g);
+    g.view.geomGen++;
+    g.lines.dirty = true;
+    std::fprintf(stderr, "[groom] %zu mesh(es), %zu named curve(s) (max level %d), %zu fur block(s); framing %.3g m about (%.3f %.3f %.3f); picks on \"%s\"\n",
+                 g.meshes.size(), g.loaded.hairCurves.size(), g.maxLevel, g.loaded.furInfos.size(),
+                 g.frameExt, g.frameMid[0], g.frameMid[1], g.frameMid[2], g.target.c_str());
+    for (const auto& m : g.meshes) {
+        float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+        for (int i = 0; i < m.nverts; ++i) for (int k = 0; k < 3; ++k) { lo[k] = std::min(lo[k], m.verts[(size_t)i * 3 + k]); hi[k] = std::max(hi[k], m.verts[(size_t)i * 3 + k]); }
+        std::fprintf(stderr, "[groom]   mesh \"%s\": %d tris, x %.3f..%.3f  y %.3f..%.3f  z %.3f..%.3f\n",
+                     m.name.c_str(), m.nfaces, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
+    }
+    for (const groom::FileModel& fm : g.model.files) {
+        std::fprintf(stderr, "[groom]   file %s: %zu top-level block(s)%s%s\n", fm.path.c_str(), fm.entries.size(),
+                     fm.writable ? ", writable" : ", NOT writable: ", fm.writable ? "" : fm.why.c_str());
+    }
+    return true;
+}
+
+// ---- the pane: the scene, the curves, the hair; and the mouse on it -------------------------------
+static void groomHandleInput(GroomState& g, bool hovered) {
+    ImGuiIO& io = ImGui::GetIO();
+    const ImVec2 mouse = io.MousePos;
+    const float pickPx = 8.0f * std::max(io.FontGlobalScale, 1.0f);
+    // hover: the nearest point on screen that the eye can actually see -- a point on the far
+    // side of the head projects onto the near side, and grabbing it would drag the wrong
+    // strand. A fresh (empty) strand, or Alt, turns hovering off so a click plots.
+    g.hoverNode = g.hoverPt = -1;
+    groom::Node* selN = (g.selNode >= 0) ? groom::findNode(g.model, g.selNode) : nullptr;
+    const bool freshStrand = selN && !selN->ref && selN->kids.empty() && selN->pts.empty();
+    if (hovered && !g.dragging && !io.KeyAlt && !freshStrand && g.showCurves && g.showPoints && g.levelOn[0]) {
+        float bestD = pickPx * pickPx;
+        const Scene& sc = g.loaded.scene;
+        const Vec3 toward = g.cam.toward();
+        const double farD = 4.0 * g.cam.diag, tol = 0.02 * g.ext;
+        forEachTopCurve(g.model, [&](groom::Node& top) {
+            std::vector<groom::Node*> all; groom::collectNodes(top, all);
+            for (groom::Node* n : all) {
+                if (n->ref || !n->kids.empty() || !nodeVisible(g, n->id)) continue;
+                const Affine xf = xfOf(g, n->id);
+                for (size_t i = 0; i < n->pts.size(); ++i) {
+                    const Vec3 pw = xf.apply(n->pts[i].p);
+                    const ImVec2 s = g.cam.toScreen(pw);
+                    const float dx = s.x - mouse.x, dy = s.y - mouse.y, d2 = dx * dx + dy * dy;
+                    if (d2 >= bestD) continue;
+                    Ray r; r.o = pw + toward * farD; r.d = toward * -1.0;
+                    const Hit h = sc.closestHit(r, 1e-6, nullptr, /*skipHair=*/true);
+                    if (h.valid && h.t < farD - tol) continue;          // behind the surface
+                    bestD = d2; g.hoverNode = n->id; g.hoverPt = (int)i;
+                }
+            }
+        });
+    }
+    // press
+    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        g.pressPos = mouse;
+        if (g.hoverNode >= 0) {
+            groom::Node* n = groom::findNode(g.model, g.hoverNode);
+            if (n && g.hoverPt < (int)n->pts.size()) {
+                select(g, g.hoverNode, g.hoverPt);
+                g.dragging = true; g.dragMoved = false;
+                g.dragNode = g.hoverNode; g.dragPt = g.hoverPt; g.dragMouse0 = mouse;
+                g.dragP0 = xfOf(g, n->id).apply(n->pts[(size_t)g.hoverPt].p);
+                g.dragMode = io.KeyShift ? 1 : (io.KeyCtrl ? 2 : 0);
+                const Pick pk = pickSurface(g, g.cam.toScreen(g.dragP0), false);
+                g.dragN = pk.hit ? pk.n : g.cam.toward();
+                g.pressedEmpty = false;
+            }
+        } else {
+            g.pressedEmpty = true;
+        }
+    }
+    // drag a point
+    if (g.dragging) {
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            const ImVec2 delta(mouse.x - g.dragMouse0.x, mouse.y - g.dragMouse0.y);
+            groom::Node* n = groom::findNode(g.model, g.dragNode);
+            if (!n || g.dragPt < 0 || g.dragPt >= (int)n->pts.size()) { g.dragging = false; return; }
+            if (!g.dragMoved && delta.x * delta.x + delta.y * delta.y < 9.0f) return;
+            if (!g.dragMoved) { pushUndo(g); g.dragMoved = true; }
+            const double wpp = g.cam.worldPerPixel();
+            Vec3 pw;
+            if (g.dragMode == 0) {
+                const Pick pk = pickSurface(g, mouse, false);
+                if (!pk.hit) return;                         // off the surface: the point stays
+                pw = pk.p;
+            } else if (g.dragMode == 1) {
+                pw = g.dragP0 + g.dragN * (-(double)delta.y * wpp);
+            } else {
+                pw = g.dragP0 + g.cam.right() * ((double)delta.x * wpp) - g.cam.up() * ((double)delta.y * wpp);
+            }
+            groom::Pt& p = n->pts[(size_t)g.dragPt];
+            p.p = snapMicron(xfOf(g, n->id).inverse().apply(pw));
+            p.edited = true;
+            markEdited(g, n->id);
+        } else {
+            g.dragging = false;
+            if (g.dragMoved) {
+                groom::Node* n = groom::findNode(g.model, g.dragNode);
+                g.status = std::string(g.dragMode == 0 ? "slid" : g.dragMode == 1 ? "lifted" : "moved") + " point " + std::to_string(g.dragPt) + " of \"" + (n ? n->name : std::string("?")) + "\"";
+            }
+        }
+        return;
+    }
+    // a click on the surface (a press that did not orbit) plots a point
+    if (g.pressedEmpty && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+        g.pressedEmpty = false;
+        const float dx = mouse.x - g.pressPos.x, dy = mouse.y - g.pressPos.y;
+        if (hovered && g.addOnClick && dx * dx + dy * dy < 9.0f) {
+            const Pick pk = pickSurface(g, mouse, true);
+            if (pk.hit) addPointAt(g, pk);
+            else if (g.selNode >= 0) g.status = "no surface under the click" + std::string(g.pickAny ? "" : " (on \"" + g.target + "\"; tick 'any mesh' to pick elsewhere)");
+        }
+    }
+}
+
 static void drawGroomPane(GroomState& g, ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     MeshView& view = g.view;
-    ImGui::TextUnformatted("drag to orbit, wheel to zoom");
+    ImGui::TextUnformatted("drag: orbit | click a point: select, drag it: slide on the surface (Shift: along the normal, Ctrl: in the screen plane) | click the surface: plot | wheel: zoom");
     ImVec2 avail = ImGui::GetContentRegionAvail();
     avail.y -= ImGui::GetTextLineHeightWithSpacing();
     if (avail.y < 80.0f) avail.y = 80.0f;
     ImVec2 origin = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton("groom_canvas", avail, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
     const bool hovered = ImGui::IsItemHovered();
-    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+    if (!g.dragging && g.pressedEmpty && ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
         ImVec2 d = ImGui::GetIO().MouseDelta;
         view.yaw += d.x * 0.01f; view.pitch += d.y * 0.01f;
     }
@@ -4026,6 +4450,10 @@ static void drawGroomPane(GroomState& g, ID3D11Device* dev, ID3D11DeviceContext*
         float ay = (avail.y > 0.0f) ? 2.0f * s / avail.y : 0.0f;
         float kz = 0.5f / g.frameDiag;
         auto dotMid = [&](int r) { return R[r][0] * g.frameMid[0] + R[r][1] * g.frameMid[1] + R[r][2] * g.frameMid[2]; };
+        // keep the camera for picking
+        for (int r = 0; r < 3; ++r) for (int k = 0; k < 3; ++k) g.cam.R[r][k] = R[r][k];
+        for (int k = 0; k < 3; ++k) g.cam.mid[k] = g.frameMid[k];
+        g.cam.ax = ax; g.cam.ay = ay; g.cam.s = s; g.cam.diag = g.frameDiag; g.cam.origin = origin; g.cam.avail = avail; g.cam.valid = true;
         MeshGpu::CB c = {};
         const float rowScale[3] = { ax, ay, -kz };
         for (int r = 0; r < 3; ++r) for (int k = 0; k < 3; ++k) c.mvp[r * 4 + k] = rowScale[r] * R[r][k];
@@ -4105,40 +4533,123 @@ static void drawGroomPane(GroomState& g, ID3D11Device* dev, ID3D11DeviceContext*
         dl->AddRectFilled(origin, br, IM_COL32(14, 16, 20, 255));
         if (!gpu.err.empty()) dl->AddText(ImVec2(origin.x + 8.0f, origin.y + 8.0f), IM_COL32(240, 140, 110, 255), gpu.err.c_str());
     }
+    if (g.cam.valid) {
+        groomHandleInput(g, hovered);
+        // the selected and hovered points, as overlay marks (no line rebuild on a hover)
+        const float rr = 5.0f * std::max(ImGui::GetIO().FontGlobalScale, 1.0f);
+        dl->PushClipRect(origin, br, true);
+        auto mark = [&](int node, int pt, ImU32 col, bool filled) {
+            groom::Node* n = (node >= 0) ? groom::findNode(g.model, node) : nullptr;
+            if (!n || pt < 0 || pt >= (int)n->pts.size()) return;
+            const ImVec2 s = g.cam.toScreen(xfOf(g, n->id).apply(n->pts[(size_t)pt].p));
+            if (filled) dl->AddCircleFilled(s, rr, col); else dl->AddCircle(s, rr * 1.4f, col, 0, 2.0f);
+        };
+        mark(g.hoverNode, g.hoverPt, IM_COL32(255, 230, 90, 255), false);
+        mark(g.selNode, g.selPt, IM_COL32(255, 255, 255, 230), true);
+        dl->PopClipRect();
+    }
     int totalTris = 0; for (const auto& m : g.meshes) totalTris += m.nfaces;
-    ImGui::Text("%d mesh(es), %d tris  |  %d named curve(s)  |  %zu strand(s) of fur", (int)g.meshes.size(), totalTris,
-                (int)g.loaded.hairCurves.size(), g.loaded.scene.curves.size());
+    ImGui::Text("%d mesh(es), %d tris  |  %zu strand(s) of fur  |  picks on \"%s\"%s%s", (int)g.meshes.size(), totalTris,
+                g.loaded.scene.curves.size(), g.target.c_str(), g.pickAny ? " or any mesh" : "",
+                g.stale ? "  |  placed strands and fur are STALE (save + reload)" : "");
 }
 
-// The tree: every named curve, top level first, its children beneath it -- each in its colour.
-static void groomTreeNode(GroomState& g, int idx, int depthGuard) {
-    if (idx < 0 || depthGuard > 16) return;
-    const auto& c = g.loaded.hairCurves[(size_t)idx];
-    const float* col = levelColour(c.level);
-    ImGui::PushID(idx);
-    bool on = g.curveOn[(size_t)idx] != 0;
-    if (ImGui::Checkbox("##on", &on)) { g.curveOn[(size_t)idx] = on ? 1 : 0; g.lines.dirty = true; }
+// ---- the panel: toggles, the selection being edited, the tree, the fur ----------------------------
+static void treeNode(GroomState& g, groom::Node& n, int depth) {
+    if (depth > 16) return;
+    groom::Node* shown = &n;
+    if (n.ref) {
+        shown = groom::findDef(g.model, n.name);
+        if (!shown) { ImGui::TextDisabled("    curve \"%s\" (no such definition)", n.name.c_str()); return; }
+    }
+    const int level = groom::levelOf(g.model, *shown);
+    const float* col = levelColour(level);
+    ImGui::PushID(n.id);
+    bool on = nodeVisible(g, shown->id);
+    if (ImGui::Checkbox("##on", &on)) { g.nodeOn[shown->id] = on ? 1 : 0; g.lines.dirty = true; }
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(col[0], col[1], col[2], 1.0f));
-    ImGuiTreeNodeFlags fl = ImGuiTreeNodeFlags_OpenOnArrow | (c.children.empty() ? ImGuiTreeNodeFlags_Leaf : 0)
-                          | (g.selected == idx ? ImGuiTreeNodeFlags_Selected : 0) | ImGuiTreeNodeFlags_DefaultOpen;
+    ImGuiTreeNodeFlags fl = ImGuiTreeNodeFlags_OpenOnArrow | (shown->kids.empty() ? ImGuiTreeNodeFlags_Leaf : 0)
+                          | (g.selNode == shown->id ? ImGuiTreeNodeFlags_Selected : 0) | ImGuiTreeNodeFlags_DefaultOpen;
     char label[256];
-    std::snprintf(label, sizeof label, "%s  [L%d]%s%s%s%s  %zu strand%s", c.name.c_str(), c.level,
-                  c.count > 0 ? "  count" : "", c.density ? "  density" : "", c.closed ? "  closed" : "",
-                  c.rendered ? "" : "  (definition)", c.strands.size(), c.strands.size() == 1 ? "" : "s");
+    std::string extra;
+    if (shown->kids.empty()) extra = std::to_string(shown->pts.size()) + (shown->pts.size() == 1 ? " point" : " points");
+    else {
+        extra = std::to_string(shown->kids.size()) + (shown->kids.size() == 1 ? " child" : " children");
+        if (shown->placed()) {
+            auto it = g.recByName.find(shown->name);
+            if (it != g.recByName.end()) extra += ", " + std::to_string(it->second->strands.size()) + " strands" + (g.stale ? " (stale)" : "");
+        }
+    }
+    std::snprintf(label, sizeof label, "%s  [L%d]%s%s%s%s  %s",
+                  shown->name.empty() ? "(unnamed)" : shown->name.c_str(), level,
+                  shown->count() > 0 ? "  count" : "", (shown->find("density") || shown->find("density_at")) ? "  density" : "",
+                  shown->closed() ? "  closed" : "", shown->rendered() ? "" : "  (definition)", extra.c_str());
     bool open = ImGui::TreeNodeEx("node", fl, "%s", label);
     ImGui::PopStyleColor();
-    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) { g.selected = (g.selected == idx) ? -1 : idx; g.lines.dirty = true; }
+    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) select(g, (g.selNode == shown->id) ? -1 : shown->id, -1);
     if (open) {
-        for (const std::string& ch : c.children) {
-            int ci = -1;
-            for (size_t k = 0; k < g.loaded.hairCurves.size(); ++k) if (g.loaded.hairCurves[k].name == ch) { ci = (int)k; break; }
-            if (ci >= 0) groomTreeNode(g, ci, depthGuard + 1);
-            else ImGui::TextDisabled("  %s (inline)", ch.c_str());
-        }
+        for (groom::Node& k : shown->kids) treeNode(g, k, depth + 1);
         ImGui::TreePop();
     }
     ImGui::PopID();
+}
+
+static void drawEditSection(GroomState& g) {
+    if (!ImGui::CollapsingHeader("Edit", ImGuiTreeNodeFlags_DefaultOpen)) return;
+    if (ImGui::Button("new strand (N)")) newStrand(g);
+    ImGui::SameLine();
+    if (ImGui::Button("undo (Ctrl+Z)")) undoLast(g);
+    ImGui::SameLine();
+    if (ImGui::Button("save (Ctrl+S)")) groomSave(g);
+    ImGui::SameLine();
+    if (ImGui::Button("reload")) { g.status = "reloading..."; groomLoadScene(g); if (g.ok) g.status = "reloaded"; }
+    ImGui::Checkbox("click plots", &g.addOnClick);
+    ImGui::SameLine();
+    ImGui::Checkbox("any mesh", &g.pickAny);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(Alt: never grab a point)");
+    const float fieldW = ImGui::GetFontSize() * 7.5f;
+    groom::Node* n = (g.selNode >= 0) ? groom::findNode(g.model, g.selNode) : nullptr;
+    if (!n) {
+        ImGui::TextDisabled("nothing selected: click a curve in the tree or a point in the pane");
+    } else {
+        groom::Where w = groom::whereIs(g.model, n->id);
+        const int level = groom::levelOf(g.model, *n);
+        const float* col = levelColour(level);
+        ImGui::TextColored(ImVec4(col[0], col[1], col[2], 1.0f), "%s  [L%d]  %s", n->name.empty() ? "(unnamed)" : n->name.c_str(), level,
+                           n->kids.empty() ? "strand" : "curve of curves");
+        if (w.file) ImGui::TextDisabled("in %s%s%s", w.file->path.c_str(), w.container ? "  group " : "", w.container ? w.container->name.c_str() : "");
+        if (w.file && !w.file->writable) ImGui::TextColored(ImVec4(1, 0.6f, 0.4f, 1), "not saveable: the file %s", w.file->why.c_str());
+        if (n->kids.empty()) {
+            if (g.selPt >= 0 && g.selPt < (int)n->pts.size()) {
+                groom::Pt& p = n->pts[(size_t)g.selPt];
+                ImGui::Text("point %d of %zu (authored coordinates)", g.selPt, n->pts.size());
+                double v[3] = { p.p.x, p.p.y, p.p.z };
+                bool ch = false;
+                ImGui::SetNextItemWidth(fieldW); ch |= ImGui::InputDouble("x", &v[0], 0, 0, "%.6g"); if (ImGui::IsItemActivated()) pushUndo(g); ImGui::SameLine();
+                ImGui::SetNextItemWidth(fieldW); ch |= ImGui::InputDouble("y", &v[1], 0, 0, "%.6g"); if (ImGui::IsItemActivated()) pushUndo(g); ImGui::SameLine();
+                ImGui::SetNextItemWidth(fieldW); ch |= ImGui::InputDouble("z", &v[2], 0, 0, "%.6g"); if (ImGui::IsItemActivated()) pushUndo(g);
+                if (ch) { p.p = Vec3{ v[0], v[1], v[2] }; p.edited = true; markEdited(g, n->id); }
+                bool hr = p.haveR;
+                if (ImGui::Checkbox("own radius (r=)", &hr)) { pushUndo(g); p.haveR = hr; if (hr && p.r <= 0.0) p.r = 0.001; p.edited = true; markEdited(g, n->id); }
+                if (p.haveR) {
+                    ImGui::SameLine(); ImGui::SetNextItemWidth(fieldW);
+                    double r = p.r;
+                    if (ImGui::InputDouble("r", &r, 0, 0, "%.6g")) { p.r = r; p.edited = true; markEdited(g, n->id); }
+                    if (ImGui::IsItemActivated()) pushUndo(g);
+                }
+                if (ImGui::Button("delete point (Del)")) deletePoint(g);
+                ImGui::SameLine();
+            } else {
+                ImGui::Text("%zu points -- click one in the pane to edit it; a click on the surface appends", n->pts.size());
+            }
+            if (ImGui::Button("delete strand")) deleteStrand(g);
+        } else {
+            ImGui::TextDisabled("a curve of curves: its path runs through its children's roots (editing its parameters is Phase 3)");
+        }
+    }
+    if (!g.status.empty()) ImGui::TextWrapped("%s", g.status.c_str());
 }
 
 static void drawGroomPanel(GroomState& g) {
@@ -4169,23 +4680,41 @@ static void drawGroomPanel(GroomState& g) {
             ImGui::PopStyleColor();
         }
     }
+    if (d) g.lines.dirty = true;
+    drawEditSection(g);
     if (ImGui::CollapsingHeader("Curves", ImGuiTreeNodeFlags_DefaultOpen)) {
-        // roots of the tree: curves that are nobody's child
-        std::vector<char> isChild(g.loaded.hairCurves.size(), 0);
-        for (const auto& c : g.loaded.hairCurves)
-            for (const std::string& ch : c.children)
-                for (size_t k = 0; k < g.loaded.hairCurves.size(); ++k) if (g.loaded.hairCurves[k].name == ch) isChild[k] = 1;
-        for (size_t k = 0; k < g.loaded.hairCurves.size(); ++k) if (!isChild[k]) groomTreeNode(g, (int)k, 0);
-        if (g.loaded.hairCurves.empty()) ImGui::TextDisabled("(no named curves in this scene)");
+        // roots of the tree: curves nobody references by name
+        std::map<std::string, int> referenced;
+        std::vector<groom::Node*> all; groom::collectNodes(g.model, all);
+        for (const groom::Node* n : all) if (n->ref) referenced[n->name] = 1;
+        int shown = 0;
+        forEachTopCurve(g.model, [&](groom::Node& n) {
+            if (!n.name.empty() && referenced.count(n.name)) return;
+            treeNode(g, n, 0); ++shown;
+        });
+        if (!shown) ImGui::TextDisabled("(no curves in this scene -- press N to start a strand)");
     }
     if (ImGui::CollapsingHeader("Fur", ImGuiTreeNodeFlags_DefaultOpen)) {
         for (const auto& fi : g.loaded.furInfos) {
-            ImGui::BulletText("%s  on \"%s\"  %lld strands  radius %.3g", fi.name.c_str(), fi.on.c_str(), fi.strands, fi.radius);
+            ImGui::BulletText("%s  on \"%s\"  %lld strands  radius %.3g%s", fi.name.c_str(), fi.on.c_str(), fi.strands, fi.radius, g.stale ? "  (stale)" : "");
             if (!fi.guides.empty()) { std::string gs; for (const auto& n : fi.guides) gs += (gs.empty() ? "" : ", ") + n; ImGui::TextDisabled("    guides: %s", gs.c_str()); }
         }
         if (g.loaded.furInfos.empty()) ImGui::TextDisabled("(no fur blocks)");
     }
-    if (d) g.lines.dirty = true;
+    if (ImGui::CollapsingHeader("Files")) {
+        for (const groom::FileModel& fm : g.model.files)
+            ImGui::BulletText("%s%s%s%s", fm.path.c_str(), fm.dirty ? "  *modified*" : "", fm.writable ? "" : "  (not writable: ", fm.writable ? "" : (fm.why + ")").c_str());
+    }
+}
+
+static void groomHotkeys(GroomState& g) {
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.WantTextInput) return;
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete)) deletePoint(g);
+    if (ImGui::IsKeyPressed(ImGuiKey_N) && !io.KeyCtrl) newStrand(g);
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) undoLast(g);
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) groomSave(g);
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) { if (g.selPt >= 0) select(g, g.selNode, -1); else select(g, -1, -1); }
 }
 
 }  // namespace groom
@@ -4193,26 +4722,7 @@ static void drawGroomPanel(GroomState& g) {
 int runGroomGui(const std::string& scenePath) {
     groom::GroomState g;
     g.scenePath = scenePath;
-    ftsl::keepShapeOnlyRef() = true;                      // the scalp must be drawable and pickable
-    g.ok = ftsl::load(scenePath, g.loaded, g.err);
-    ftsl::keepShapeOnlyRef() = false;
-    if (!g.ok) std::fprintf(stderr, "[groom] could not load '%s': %s\n", scenePath.c_str(), g.err.c_str());
-    else {
-        g.meshes = groom::meshesFromScene(g.loaded.scene);
-        g.curveOn.assign(g.loaded.hairCurves.size(), 1);
-        for (const auto& c : g.loaded.hairCurves) g.maxLevel = std::max(g.maxLevel, c.level);
-        groom::groomComputeFrame(g);
-        g.view.geomGen = 1;
-        std::fprintf(stderr, "[groom] %zu mesh(es), %zu named curve(s) (max level %d), %zu fur block(s); framing %.3g m about (%.3f %.3f %.3f)\n",
-                     g.meshes.size(), g.loaded.hairCurves.size(), g.maxLevel, g.loaded.furInfos.size(),
-                     g.frameExt, g.frameMid[0], g.frameMid[1], g.frameMid[2]);
-        for (const auto& m : g.meshes) {
-            float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
-            for (int i = 0; i < m.nverts; ++i) for (int k = 0; k < 3; ++k) { lo[k] = std::min(lo[k], m.verts[(size_t)i * 3 + k]); hi[k] = std::max(hi[k], m.verts[(size_t)i * 3 + k]); }
-            std::fprintf(stderr, "[groom]   mesh \"%s\": %d tris, x %.3f..%.3f  y %.3f..%.3f  z %.3f..%.3f\n",
-                         m.name.c_str(), m.nfaces, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
-        }
-    }
+    groom::groomLoadScene(g);
     ImGui_ImplWin32_EnableDpiAwareness();
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"FtraceGroom", nullptr };
     RegisterClassExW(&wc);
@@ -4244,7 +4754,7 @@ int runGroomGui(const std::string& scenePath) {
         const ImGuiViewport* vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->WorkPos); ImGui::SetNextWindowSize(vp->WorkSize);
         ImGui::Begin("groom", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus);
-        float leftW = ImGui::GetContentRegionAvail().x * 0.30f;
+        float leftW = ImGui::GetContentRegionAvail().x * 0.36f;
         ImGui::BeginChild("groom_left", ImVec2(leftW, 0), true);
         groom::drawGroomPanel(g);
         ImGui::EndChild();
@@ -4252,6 +4762,7 @@ int runGroomGui(const std::string& scenePath) {
         ImGui::BeginChild("groom_right", ImVec2(0, 0), true);
         if (g.ok) groom::drawGroomPane(g, g_pd3dDevice, g_pd3dDeviceContext);
         ImGui::EndChild();
+        if (g.ok) groom::groomHotkeys(g);
         ImGui::End();
         ImGui::Render();
         const float clear[4] = { 0.06f, 0.06f, 0.08f, 1.0f };

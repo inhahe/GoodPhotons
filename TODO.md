@@ -254,7 +254,7 @@ strands (as tubes, via strandToMesh) -- and hides them again, because the hair h
 Judge: open `scenes/alice_hair.ftsl` and see her scalp, the four rings in four colours, and the
 groom on demand.
 
-**Phase 2 -- AUTHOR points:** click the surface to plot a control point (picked on the mesh, so the
+**Phase 2 -- AUTHOR points -- BUILT 0.330.0 (`src/groom.h`; the round trip proven by `tools/groom_rig.py`):** Verified by driving the GUI (`tools/gui_drive.ps1`): N, two plotted points on the cap, an off-cap click refused, a surface drag, Ctrl+S -> the guides file rewritten with only the new strand added (rest byte-identical), the scene reloads with 70 curves and the same 13 280 fur strands. click the surface to plot a control point (picked on the mesh, so the
 root is on the skin); drag to move along the surface; a modifier to pull a point OFF the surface
 along the normal (tips hang in the air) or in the screen plane; Del; N for a new leaf curve; radius
 per point; undo. Save writes the hair file (curves + fur) and reload round-trips it exactly.

@@ -164,6 +164,7 @@
 #include "mesh.h"
 #include "ndwarp.h"          // -nd: N-D lift/rotate/project of the loaded model
 #include "ftsl.h"
+#include "groom.h"               // the hair-authoring tool's model: -groom-rewrite
 #include "curvedrive.h"         // -anim: loom CurveDrive JSON sidecar (E2 channel a) read/write
 #include "animlive.h"           // -anim -loom: the live editor<->loom value channel (E2 channel b)
 #include "livewindow.h"         // -window: real OS live-preview window (Win32 GDI)
@@ -18113,6 +18114,7 @@ static void printHelp(const char* prog) {
 "  -r <W> [H]            resolution (square if H omitted)\n"
 "  -dumpcurves <f>       after the scene loads, write every strand's polyline (x y z r per point) to <f> and exit\n"
 "  -groom <scene.ftsl>   the hair-authoring tool: the scene's meshes, its curve hierarchy level-coloured, its fur on demand\n"
+"  -groom-rewrite <in> <out>  rewrite a scene file through the groom tool's curve model (its round-trip check) and exit\n"
 "  -time <sec>           wall-clock budget (progressive)\n"
 "  -noise <pct>          stop at target graininess (progressive)\n"
 "  -forever              trace until Ctrl-C (progressive)\n"
@@ -18788,6 +18790,12 @@ static int run(int argc, char** argv) {
         // -dumpcurves has to be known before the load for the same reason: it acts the
         // moment the scene exists, before any render path is chosen.
         if (!std::strcmp(argv[i], "-dumpcurves") && i + 1 < argc) g_dumpCurves = argv[i + 1];
+        // -groom-rewrite <in> <out>: the groom model's headless round trip; no scene is loaded.
+        if (!std::strcmp(argv[i], "-groom-rewrite") && i + 2 < argc) {
+            std::string gerr;
+            if (!groom::rewriteFile(argv[i + 1], argv[i + 2], gerr)) { std::fprintf(stderr, "error: -groom-rewrite: %s\n", gerr.c_str()); return 1; }
+            return 0;
+        }
         if (!std::strcmp(argv[i], "-import-specular") && i + 1 < argc) {
             const char* v = argv[i + 1];
             gltfimp::dielectricSpecular =
