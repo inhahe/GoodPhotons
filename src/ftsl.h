@@ -542,6 +542,12 @@ inline CurveStrand resampleStrandCR(const CurveStrand& s, int K, double alpha) {
     return o;
 }
 
+// Keep `mesh { shape_only yes }` triangles in the scene instead of stripping them before the
+// BVH. Off for every render (a shape-only mesh is invisible by definition); the groom tool
+// turns it on, because the scalp it roots hair on is exactly such a mesh and the tool has to
+// draw it and pick on it. Process-wide like the other loader switches.
+inline bool& keepShapeOnlyRef() { static bool k = false; return k; }
+
 // Rotate vector `v` about `axis` by `ang` radians (Rodrigues' rotation formula).
 // `axis` is normalized internally; a zero-length axis returns `v` unchanged. Used
 // by `camera_curve` to apply a per-frame `roll` (bank about the view direction).
@@ -814,6 +820,34 @@ struct Loaded {
     // Control points of every authored `camera_curve` (for the in-viewer editor's
     // round-trip load; see AuthoredCurve). Empty for scenes with no curve.
     std::vector<AuthoredCurve> authoredCurves;
+    // The authored `curve` blocks as the GROOM TOOL sees them (0.329.0): every NAMED node at
+    // every level -- 0 a strand, 1 a curve of strands, 2 a curve of those, ... -- with its
+    // children's names, its placement parameters, and its strands in WORLD space. Recorded
+    // whether or not the curve renders: a material-less definition is level information too.
+    struct HairCurveInfo {
+        std::string              name;
+        int                      level = 0;
+        std::vector<std::string> children;      // named children, in order (inline unnamed ones are not listed)
+        int                      count = 0;     // `count` if given
+        bool                     density = false, closed = false;
+        double                   alpha = 0.0;   // `spline`
+        bool                     rendered = false;
+        std::vector<CurveStrand> strands;       // world space, transform applied once
+        // The node's PATH runs through these: one root per child (its first strand's first
+        // point), the points `count` / density place instances along. World space. Empty
+        // for a strand (a node with only `point`s).
+        std::vector<Vec3>        childRoots;
+    };
+    std::vector<HairCurveInfo> hairCurves;
+    // What each `fur` block made, so a tool can show / hide a groom's strands as a unit.
+    struct FurInfo {
+        std::string              name, on;
+        std::vector<std::string> guides;
+        long long                strands = 0;
+        int                      firstCurve = 0;   // index into Scene::curves
+        double                   radius = 0.0;
+    };
+    std::vector<FurInfo> furInfos;
     // Mirror of the FIRST camera (kept so the pre-Phase-3a single-camera code paths
     // and defaults keep working unchanged).
     bool hasCamera = false;
@@ -1237,7 +1271,7 @@ public:
     // referenced per-triangle by id, not by position. Everything else that indexes tris
     // (the BVH, hit records) is built later.
     void stripShapeOnlyMeshes(Loaded& L) {
-        if (shapeOnlyGroups_.empty()) return;
+        if (shapeOnlyGroups_.empty() || keepShapeOnlyRef()) return;
         // Mark the doomed triangles by group so one linear compaction handles any number
         // of ranges, in any authoring order, without repeated erases.
         std::vector<char> drop(L.scene.tris.size(), 0);
@@ -1673,6 +1707,12 @@ private:
     // reference compounded it once per reference level -- 0.328.2.)
     std::unordered_map<std::string, std::vector<CurveStrand>> curveByName_;
     std::unordered_map<std::string, std::vector<CurveStrand>> curveWorldByName_;
+    // For Loaded::hairCurves: the records a flatten pass produced (their strands are LOCAL until
+    // addCurve applies the node's transform), each named node's level, and the level of the
+    // last node flattened (so a parent can take the max over inline, unnamed children too).
+    std::vector<Loaded::HairCurveInfo>   hairRecs_;
+    std::unordered_map<std::string, int> curveLevel_;
+    int                                  lastLevel_ = 0;
     std::unordered_map<std::string, int>         blasIndex_;      // mesh_asset name -> Scene::blasList index
     // `mesh { shape_only yes }` groups (indices into Scene::meshGroups), removed from
     // Scene::tris by stripShapeOnlyMeshes() once the deferred medium sweep has read them.
@@ -5123,6 +5163,9 @@ private:
 
         bool havePoints = false;
         std::vector<std::vector<CurveStrand>> kids;      // one strand list per child, in order
+        std::vector<std::string> childNames;             // for the groom tool's tree
+        std::vector<Vec3>        recChildRoots;          // for the groom tool's path drawing
+        int childLevelMax = -1;
         for (const auto& s : b.stmts) {
             if (s.key == "point") { havePoints = true; continue; }
             if (s.key != "curve") continue;
@@ -5130,6 +5173,8 @@ private:
             std::vector<CurveStrand> ks;
             if (s.val.block) {
                 if (!flattenCurveNode(*s.val.block, p, ks, depth + 1)) return false;
+                if (!s.val.block->name.empty()) childNames.push_back(s.val.block->name);
+                childLevelMax = std::max(childLevelMax, lastLevel_);
             } else {
                 if (s.val.words.size() != 1) { fail("curve: a child is `curve \"name\"` (a reference) or `curve { ... }`"); return false; }
                 auto it = curveByName_.find(s.val.words[0]);
@@ -5142,6 +5187,9 @@ private:
                 // a definition at top level instanced inside a group moves with the group, and a
                 // definition made inside that same group is not moved twice.
                 ks = it->second;
+                childNames.push_back(s.val.words[0]);
+                auto lv = curveLevel_.find(s.val.words[0]);
+                childLevelMax = std::max(childLevelMax, lv == curveLevel_.end() ? 0 : lv->second);
             }
             if (ks.empty()) {
                 fail(std::string("curve: child \"") + (s.val.words.empty() ? std::string() : s.val.words[0]) + "\" produced no strands");
@@ -5189,6 +5237,7 @@ private:
             const double constDensity = find(b, "density") ? dblOf(b, "density", 0.0) / L_ : -1.0;
             const bool haveDensity = !dkeys.empty() || constDensity > 0.0;
             const int countReq = (int)dblOf(b, "count", 0.0);
+            for (const auto& ks : kids) if (!ks.empty() && !ks[0].pts.empty()) recChildRoots.push_back(ks[0].pts[0]);
 
             if (countReq < 1 && !haveDensity) {
                 // No placement asked for: the instances ARE the children, bit-for-bit.
@@ -5249,7 +5298,21 @@ private:
                 }
             }
         }
-        if (!b.name.empty()) curveByName_[b.name] = out;      // reusable by name from here on (LOCAL)
+        lastLevel_ = kids.empty() ? 0 : childLevelMax + 1;
+        if (!b.name.empty()) {
+            curveByName_[b.name] = out;                       // reusable by name from here on (LOCAL)
+            curveLevel_[b.name] = lastLevel_;
+            Loaded::HairCurveInfo rec;
+            rec.name = b.name; rec.level = lastLevel_; rec.children = childNames;
+            rec.count = (int)dblOf(b, "count", 0.0);
+            rec.density = find(b, "density") || find(b, "density_at");
+            if (const Stmt* c = find(b, "closed"))
+                rec.closed = c->val.words.empty() || !(c->val.words[0] == "off" || c->val.words[0] == "false" || c->val.words[0] == "0" || c->val.words[0] == "no");
+            rec.alpha = p.alpha;
+            rec.strands = out;                                // LOCAL for now; addCurve applies the transform
+            rec.childRoots = recChildRoots;                   // likewise
+            hairRecs_.push_back(std::move(rec));
+        }
         return true;
     }
 
@@ -5266,10 +5329,25 @@ private:
         CurveNodeParams top;
         if (!parseCurveNodeParams(b, CurveNodeParams{}, top)) return false;
         std::vector<CurveStrand> strands;
+        const size_t recBefore = hairRecs_.size();
         if (!flattenCurveNode(b, CurveNodeParams{}, strands, 0)) return false;
         if (strands.empty()) { fail("curve" + (b.name.empty() ? std::string() : " \"" + b.name + "\"") + ": no strands"); return false; }
         curveApplyXf(xf, b.name, strands);                          // the group's transform, ONCE
         if (!b.name.empty()) curveWorldByName_[b.name] = strands;   // what `fur guides` reads
+        // The groom tool's records: every named node this call flattened, in world space.
+        for (size_t i = recBefore; i < hairRecs_.size(); ++i) {
+            Loaded::HairCurveInfo rec = std::move(hairRecs_[i]);
+            curveApplyXf(xf, rec.name, rec.strands);
+            if (!rec.childRoots.empty()) {
+                CurveStrand r; r.pts = rec.childRoots; r.radii.assign(r.pts.size(), 0.0);
+                std::vector<CurveStrand> one; one.push_back(std::move(r));
+                curveApplyXf(xf, rec.name, one);
+                rec.childRoots = std::move(one[0].pts);
+            }
+            rec.rendered = (id >= 0) && (rec.name == b.name);
+            L.hairCurves.push_back(std::move(rec));
+        }
+        hairRecs_.resize(recBefore);
 
         if (id < 0) {
             std::fprintf(stderr, "[ftsl] curve \"%s\": no material -- registered as a definition (%zu strand%s), not rendered\n",
@@ -5378,6 +5456,7 @@ private:
                 for (const std::string& w : s.val.words) gnames.push_back(w);
             }
             if (!gnames.empty()) {
+                sp.guideNames   = gnames;
                 sp.guideBlend   = (int)dblOf(b, "guide_blend", 3.0);
                 sp.guideFalloff = Len(dblOf(b, "guide_falloff", 0.0));
                 const int np = std::max(2, (int)dblOf(b, "points", 5.0));
@@ -5474,6 +5553,7 @@ private:
         long long culled = 0;
         if (!surf.isSphere) { surf.tris = L.scene.tris.data() + triFirst; surf.nTris = triCount; }
         const size_t segsBefore = L.scene.curveSegs.size();
+        const size_t curvesBefore = L.scene.curves.size();
         const long long made = generateFur(sp, surf, L.scene.curves, L.scene.curveSegs, &ferr, &culled);
         if (made < 0) {
             // A stop during generation is not a scene error — it is a cancelled load, and
@@ -5489,6 +5569,11 @@ private:
                      sp.name.c_str(), on.c_str(), made,
                      L.scene.curveSegs.size() - segsBefore,
                      surf.isSphere ? "sphere" : "mesh", furTargetArea(surf), baldNote);
+        {   Loaded::FurInfo fi;
+            fi.name = sp.name; fi.on = on; fi.guides = sp.guideNames; fi.strands = made;
+            fi.firstCurve = (int)curvesBefore; fi.radius = sp.radius;
+            L.furInfos.push_back(std::move(fi));
+        }
         return true;
     }
 

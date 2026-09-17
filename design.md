@@ -1061,6 +1061,23 @@ metres at the hall's 3x. Both tools honour the GLB's node transform, so `tools/g
 could put the doll at her real size without touching the raw vertices the segmentation was
 tuned on. Fiber numbers are a rooted doll's: 15 000 strands, 0.05 mm radius, plug-sized locks.
 
+**The groom tool (0.329.0, Phase 1).** `runGroomGui` in `viewer_gui.cpp` reuses the loom
+viewer's shell -- its D3D11 device, `MeshGpu` pipeline (shaders, solid/wire rasterizer states,
+depth states, MSAA target) and orbit camera -- and adds a line pass: curves and strands go through
+the same vertex shader as LINELIST batches, unlit, one batch per colour, depth-tested but not
+written, so a curve behind the head is hidden and lines never fight each other. A group node (no
+placement) is drawn as its path through its children's roots (`catmullRomAt`, closed-aware) rather
+than as its children's strands, which they already draw. The loader was taught to keep what a
+tool needs: `keepShapeOnlyRef()` stops `stripShapeOnlyMeshes`; `flattenCurveNode` records every
+NAMED node into `Loaded::hairCurves` with its LEVEL (a leaf 0, a parent 1 + the max of its
+children, inline unnamed children included through `lastLevel_`), its children's names and its
+placement keys, and `addCurve` applies the node's transform to those records once, like the
+strands; `addFur` records `Loaded::furInfos`. Each record also carries `childRoots` -- each
+child's first strand's first point, the points the node's placement path runs through -- so a
+group's path is drawn from the same numbers `count` would use, not re-derived by the tool. The
+pane frames the GROOM by default (the curves' points and the fur's `on` mesh; `all` frames every
+mesh) and rebuilds its line buffer only when a toggle or selection changes.
+
 **The media term joined it in 0.322.0** (`Renderer::mediumTransmittanceSpec`,
 `dMedTransmittanceSpec`). A transmittance is a stochastic estimate, so it cannot use the ratio
 trick (`E[A/B] != E[A]/E[B]`); the walk carries a per-wavelength vector instead, in three tiers —

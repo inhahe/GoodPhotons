@@ -109,6 +109,7 @@ struct FurSpec {
     // fallen to 1/e^2 of its at-root value; 0 = pure inverse-square distance.
     struct Guide { Vec3 root; std::vector<Vec3> off; std::vector<double> radii; };
     std::vector<Guide> guides;
+    std::vector<std::string> guideNames;   // the `guides` block names, for diagnostics and the groom tool
     int         guideBlend = 3;      // k nearest guides blended (1 = nearest only)
     double      guideFalloff = 0.0;  // Gaussian falloff radius, 0 = inverse-square only
 

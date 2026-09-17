@@ -18112,6 +18112,7 @@ static void printHelp(const char* prog) {
 "  -n <count>            photon/sample count (accepts 2e8, 1.5e9)\n"
 "  -r <W> [H]            resolution (square if H omitted)\n"
 "  -dumpcurves <f>       after the scene loads, write every strand's polyline (x y z r per point) to <f> and exit\n"
+"  -groom <scene.ftsl>   the hair-authoring tool: the scene's meshes, its curve hierarchy level-coloured, its fur on demand\n"
 "  -time <sec>           wall-clock budget (progressive)\n"
 "  -noise <pct>          stop at target graininess (progressive)\n"
 "  -forever              trace until Ctrl-C (progressive)\n"
@@ -25184,6 +25185,7 @@ int main(int argc, char** argv) {
         // back to the sidecar's own `build` provenance key, and without that too it
         // shows the sidecar frozen.
         {
+            const char* groomScene = nullptr;
             const char* viewerSidecar = nullptr;
             const char* viewerLoom    = nullptr;
             bool        viewerPlay    = false;
@@ -25201,6 +25203,12 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                     viewerCapMB = std::atoi(argv[++i]);
+                } else if (!std::strcmp(argv[i], "-groom") || !std::strcmp(argv[i], "--groom")) {
+                    if (i + 1 >= argc) {
+                        std::fprintf(stderr, "error: -groom needs a scene .ftsl path\n");
+                        return 1;
+                    }
+                    groomScene = argv[++i];
                 } else if (!std::strcmp(argv[i], "-viewer") || !std::strcmp(argv[i], "--viewer")) {
                     if (i + 1 >= argc) {
                         std::fprintf(stderr, "error: -viewer needs a sidecar .json path\n");
@@ -25214,6 +25222,14 @@ int main(int argc, char** argv) {
                     }
                     viewerLoom = argv[++i];
                 }
+            }
+            if (groomScene) {
+                // The groom tool is a long-lived GUI holding ftrace.exe open, exactly like the
+                // viewer, so it is published in the stop channel for the same reason.
+                stopChannelStart(std::string(groomScene) + " -> (groom tool)");
+                int grc = runGroomGui(groomScene);
+                stopChannelEnd();
+                return grc;
             }
             if (viewerSidecar) {
                 // Publish the viewer in the stop channel too. It is not a render, but it

@@ -45,6 +45,10 @@
 // `prebakeCapMB` overrides the cache's memory budget (`-prebake-cap`); 0 keeps the
 // panel's default. A walk that hits the cap stops there and the prefix it did fill
 // is still played from memory, with the tail falling back to baking on demand.
+// The hair-authoring tool (0.329.0): opens the viewer shell on a plain .ftsl scene and shows
+// its meshes, its `curve` hierarchy level-coloured, and its `fur` strands on demand.
+int runGroomGui(const std::string& scenePath);
+
 int runViewerGui(const std::string& sidecarPath, const std::string& loomScene = "",
                  bool startPlaying = false, bool startPrebake = false,
                  int prebakeCapMB = 0);

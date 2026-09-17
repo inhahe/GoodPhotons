@@ -3,6 +3,10 @@
 #ifndef _WIN32
 // -------- Non-Windows stub: the native viewer needs Win32 + D3D11 --------------
 #include <cstdio>
+int runGroomGui(const std::string&) {
+    std::fprintf(stderr, "error: -groom is only available on Windows builds.\n");
+    return 1;
+}
 int runViewerGui(const std::string&, const std::string&, bool, bool, int) {
     std::fprintf(stderr, "error: -viewer is only available on Windows builds.\n");
     return 1;
@@ -41,6 +45,7 @@ int runViewerGui(const std::string&, const std::string&, bool, bool, int) {
 #include <cstdlib>                 // strtoul: parsing the pid out of a scratch dir name
 #include <cwctype>
 #include <memory>                  // shared_ptr: the live channel's in-memory payload
+#include <array>
 #include "assetbytes.h"            // asset bytes handed to the loader instead of paths
 
 // Bridge to ftrace's own scene loader + GPU field raymarcher (F7 primary path).
@@ -3768,6 +3773,500 @@ static bool drawLivePanel(LivePanel& lp, LoomBridge& br, PlayCache& pc) {
 // --------------------------------------------------------------------------
 // Entry point
 // --------------------------------------------------------------------------
+
+// =====================================================================================
+// THE GROOM TOOL -- `ftrace -groom <scene.ftsl>`  (0.329.0, Phase 1: view)
+// =====================================================================================
+// Opens the viewer shell on a plain .ftsl scene and shows, in one orbitable pane, the
+// scene's own meshes (solid or wireframe -- the loader is asked to KEEP shape-only meshes,
+// because the scalp a groom roots on is exactly one of those), every named `curve` node as a
+// polyline in ITS LEVEL'S COLOUR (0 a strand, 1 a curve of strands, 2 a curve of those ...),
+// its control points as crosses, and -- on demand, because they hide the curves -- the strands
+// every `fur` block actually generated, read straight from the loaded scene so what you see is
+// what the renderer would trace. Phase 2 adds authoring on top of this view.
+namespace groom {
+
+static const float kLevelColours[6][4] = {
+    { 1.00f, 0.28f, 0.22f, 1.0f },   // level 0: strands (the guides)      red
+    { 0.25f, 0.90f, 0.35f, 1.0f },   // level 1: a curve of strands        green
+    { 0.35f, 0.60f, 1.00f, 1.0f },   // level 2: a curve of those          blue
+    { 1.00f, 0.85f, 0.25f, 1.0f },   // level 3                            yellow
+    { 0.95f, 0.40f, 0.95f, 1.0f },   // level 4                            magenta
+    { 0.35f, 0.95f, 0.95f, 1.0f },   // level 5 and up                     cyan
+};
+static const float* levelColour(int level) { return kLevelColours[std::min(std::max(level, 0), 5)]; }
+
+// The scene's own meshes as pane geometry: one MeshGeom per named mesh group, independent
+// triangles (the scene stores them flat), shading normals where the mesh had them.
+static std::vector<MeshGeom> meshesFromScene(const Scene& sc) {
+    std::vector<MeshGeom> out;
+    for (const MeshGroup& g : sc.meshGroups) {
+        if (g.blasId >= 0 || g.triCount == 0) continue;
+        MeshGeom m; m.name = g.name; m.id = g.name;
+        const size_t end = std::min(g.triStart + g.triCount, sc.tris.size());
+        m.verts.reserve((end - g.triStart) * 9); m.normals.reserve((end - g.triStart) * 9);
+        for (size_t t = g.triStart; t < end; ++t) {
+            const Tri& tr = sc.tris[t];
+            const Vec3* v[3] = { &tr.v0, &tr.v1, &tr.v2 };
+            const Vec3* nn[3] = { &tr.n0, &tr.n1, &tr.n2 };
+            Vec3 gn = tr.gn;
+            if (dot(gn, gn) < 1e-18) { gn = cross(tr.v1 - tr.v0, tr.v2 - tr.v0); if (dot(gn, gn) > 1e-30) gn = normalize(gn); }
+            for (int k = 0; k < 3; ++k) {
+                m.verts.push_back((float)v[k]->x); m.verts.push_back((float)v[k]->y); m.verts.push_back((float)v[k]->z);
+                const Vec3 n = (dot(*nn[k], *nn[k]) > 1e-18) ? *nn[k] : gn;
+                m.normals.push_back((float)n.x); m.normals.push_back((float)n.y); m.normals.push_back((float)n.z);
+                m.faces.push_back((int)m.faces.size());
+            }
+        }
+        m.nverts = (int)m.verts.size() / 3; m.nfaces = (int)m.faces.size() / 3;
+        m.smoothDeg = 0.0;
+        if (m.nfaces > 0) out.push_back(std::move(m));
+    }
+    return out;
+}
+
+// Line geometry: batches of segments, one colour each, in one immutable vertex buffer that is
+// rebuilt only when a toggle or a selection changes (a groom is a quarter-million segments).
+struct LineBatch { std::vector<MeshPaneVert> v; float rgba[4] = { 1, 1, 1, 1 }; };
+struct LinesGpu {
+    ID3D11Buffer* vb = nullptr;
+    UINT count = 0;
+    std::vector<UINT> first, num;
+    std::vector<std::array<float, 4>> colour;
+    bool dirty = true;
+    void release() { if (vb) { vb->Release(); vb = nullptr; } count = 0; first.clear(); num.clear(); colour.clear(); }
+    bool upload(ID3D11Device* dev, const std::vector<LineBatch>& batches) {
+        release();
+        std::vector<MeshPaneVert> all;
+        for (const LineBatch& b : batches) {
+            first.push_back((UINT)all.size()); num.push_back((UINT)b.v.size());
+            colour.push_back({ b.rgba[0], b.rgba[1], b.rgba[2], b.rgba[3] });
+            all.insert(all.end(), b.v.begin(), b.v.end());
+        }
+        dirty = false;
+        if (all.empty()) return true;
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = (UINT)(all.size() * sizeof(MeshPaneVert));
+        bd.Usage = D3D11_USAGE_IMMUTABLE;
+        bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        D3D11_SUBRESOURCE_DATA sd = {}; sd.pSysMem = all.data();
+        if (FAILED(dev->CreateBuffer(&bd, &sd, &vb))) { count = 0; return false; }
+        count = (UINT)all.size();
+        return true;
+    }
+};
+static inline MeshPaneVert lineVert(const Vec3& p) {
+    MeshPaneVert v; v.x = (float)p.x; v.y = (float)p.y; v.z = (float)p.z; v.u = v.v = 0.0f; v.nx = v.ny = 0.0f; v.nz = 1.0f; return v;
+}
+static void addSegment(LineBatch& b, const Vec3& a, const Vec3& c) { b.v.push_back(lineVert(a)); b.v.push_back(lineVert(c)); }
+static void addCross(LineBatch& b, const Vec3& p, double h) {
+    addSegment(b, p - Vec3{h, 0, 0}, p + Vec3{h, 0, 0});
+    addSegment(b, p - Vec3{0, h, 0}, p + Vec3{0, h, 0});
+    addSegment(b, p - Vec3{0, 0, h}, p + Vec3{0, 0, h});
+}
+
+struct GroomState {
+    std::string   scenePath;
+    ftsl::Loaded  loaded;
+    bool          ok = false;
+    std::string   err;
+    std::vector<MeshGeom> meshes;
+    MeshView      view;
+    LinesGpu      lines;
+    // toggles (any change marks the line buffer dirty)
+    bool showMesh = true, showCurves = true, showPoints = true, showHair = false, showRoots = false;
+    bool levelOn[8] = { true, true, true, true, true, true, true, true };
+    std::vector<char> curveOn;      // parallel to loaded.hairCurves
+    int  selected = -1;             // index into hairCurves, or -1
+    int  maxLevel = 0;
+    double ext = 1.0;               // extent of what is framed, for cross sizes
+    // Framing: what the orbit centres on and scales to. 0 = the GROOM (every curve's points and
+    // the fur's `on` mesh -- what one is authoring), 1 = every mesh. A floor or a room in the
+    // scene would otherwise push the head into a corner of the pane.
+    int   frameMode = 0;
+    float frameMid[3] = { 0, 0, 0 }, frameExt = 1.0f, frameDiag = 1.0f;
+};
+
+static void groomComputeFrame(GroomState& g) {
+    float alo[3] = { 1e30f, 1e30f, 1e30f }, ahi[3] = { -1e30f, -1e30f, -1e30f };   // everything drawn
+    float glo[3] = { 1e30f, 1e30f, 1e30f }, ghi[3] = { -1e30f, -1e30f, -1e30f };   // the groom
+    auto grow = [](float* lo, float* hi, float x, float y, float z) {
+        lo[0] = std::min(lo[0], x); hi[0] = std::max(hi[0], x);
+        lo[1] = std::min(lo[1], y); hi[1] = std::max(hi[1], y);
+        lo[2] = std::min(lo[2], z); hi[2] = std::max(hi[2], z);
+    };
+    for (const MeshGeom& m : g.meshes) {
+        bool on = false;
+        for (const auto& fi : g.loaded.furInfos) if (fi.on == m.name) on = true;
+        for (int i = 0; i < m.nverts; ++i) {
+            const float* v = &m.verts[(size_t)i * 3];
+            grow(alo, ahi, v[0], v[1], v[2]);
+            if (on) grow(glo, ghi, v[0], v[1], v[2]);
+        }
+    }
+    for (const auto& c : g.loaded.hairCurves)
+        for (const ftsl::CurveStrand& s : c.strands)
+            for (const Vec3& p : s.pts) {
+                grow(glo, ghi, (float)p.x, (float)p.y, (float)p.z);
+                grow(alo, ahi, (float)p.x, (float)p.y, (float)p.z);
+            }
+    const bool haveGroom = ghi[0] >= glo[0], haveAll = ahi[0] >= alo[0];
+    const float* lo = (g.frameMode == 0 && haveGroom) ? glo : alo;
+    const float* hi = (g.frameMode == 0 && haveGroom) ? ghi : ahi;
+    if (!haveAll) { g.frameMid[0] = g.frameMid[1] = g.frameMid[2] = 0.0f; g.frameExt = g.frameDiag = 1.0f; return; }
+    g.frameExt = 1e-3f;
+    for (int k = 0; k < 3; ++k) { g.frameExt = std::max(g.frameExt, hi[k] - lo[k]); g.frameMid[k] = 0.5f * (lo[k] + hi[k]); }
+    // The depth range still has to cover EVERYTHING drawn, whatever the pane centres on: the
+    // union box's half-diagonal plus the offset of its centre from the frame's.
+    float ad2 = 0.0f, off2 = 0.0f;
+    for (int k = 0; k < 3; ++k) {
+        const float d = ahi[k] - alo[k], o = 0.5f * (alo[k] + ahi[k]) - g.frameMid[k];
+        ad2 += d * d; off2 += o * o;
+    }
+    g.frameDiag = 0.5f * std::sqrt(ad2) + std::sqrt(off2) + 1e-3f;
+    g.ext = g.frameExt;
+}
+
+static void groomBuildLines(GroomState& g, std::vector<LineBatch>& out) {
+    out.clear();
+    const auto& hc = g.loaded.hairCurves;
+    const double cross = 0.006 * g.ext;
+    if (g.showCurves) {
+        for (size_t i = 0; i < hc.size(); ++i) {
+            const auto& c = hc[i];
+            if (!g.curveOn[i] || !g.levelOn[std::min(c.level, 7)]) continue;
+            LineBatch b;
+            const float* col = levelColour(c.level);
+            const bool dim = (g.selected >= 0 && (int)i != g.selected);
+            for (int k = 0; k < 4; ++k) b.rgba[k] = col[k];
+            if (dim) { b.rgba[0] *= 0.35f; b.rgba[1] *= 0.35f; b.rgba[2] *= 0.35f; }
+            if (c.level > 0 && c.count <= 0 && !c.density) {
+                // A GROUP (no placement): its strands are its children's, which the children
+                // already draw in their own colour. What is the group's own is its PATH -- the
+                // Catmull-Rom through its CHILDREN'S roots (each child's first strand's first
+                // point, exactly what `count` would place along; the loader records them) --
+                // so that is what it draws, closed if it is closed.
+                const std::vector<Vec3>& roots = c.childRoots;
+                if (roots.size() >= 2) {
+                    const int nSeg = c.closed ? (int)roots.size() : (int)roots.size() - 1;
+                    const int M = nSeg * 16;
+                    Vec3 prev = ftsl::catmullRomAt(roots, c.closed, 0.0, c.alpha);
+                    for (int k = 1; k <= M; ++k) {
+                        const Vec3 cur = ftsl::catmullRomAt(roots, c.closed, nSeg * (double)k / M, c.alpha);
+                        addSegment(b, prev, cur); prev = cur;
+                    }
+                    if (g.showPoints) for (const Vec3& r : roots) addCross(b, r, cross * 1.6);
+                }
+            } else {
+                for (const ftsl::CurveStrand& s : c.strands)
+                    for (size_t k = 1; k < s.pts.size(); ++k) addSegment(b, s.pts[k - 1], s.pts[k]);
+                if (g.showPoints && c.level == 0)
+                    for (const ftsl::CurveStrand& s : c.strands)
+                        for (const Vec3& p : s.pts) addCross(b, p, cross);
+            }
+            if (!b.v.empty()) out.push_back(std::move(b));
+        }
+    }
+    const Scene& sc = g.loaded.scene;
+    if (g.showHair || g.showRoots) {
+        for (const auto& fi : g.loaded.furInfos) {
+            LineBatch hair, roots;
+            hair.rgba[0] = 0.86f; hair.rgba[1] = 0.72f; hair.rgba[2] = 0.45f; hair.rgba[3] = 1.0f;
+            roots.rgba[0] = 1.0f; roots.rgba[1] = 1.0f; roots.rgba[2] = 1.0f; roots.rgba[3] = 1.0f;
+            const int cEnd = std::min((int)sc.curves.size(), fi.firstCurve + (int)fi.strands);
+            for (int ci = fi.firstCurve; ci < cEnd; ++ci) {
+                const Curve& c = sc.curves[(size_t)ci];
+                if (c.segCount <= 0) continue;
+                if (g.showHair)
+                    for (int k = 0; k < c.segCount; ++k) {
+                        const CurveSeg& s = sc.curveSegs[(size_t)c.firstSeg + (size_t)k];
+                        addSegment(hair, s.p0, s.p1);
+                    }
+                if (g.showRoots) addCross(roots, sc.curveSegs[(size_t)c.firstSeg].p0, cross * 0.5);
+            }
+            if (!hair.v.empty()) out.push_back(std::move(hair));
+            if (!roots.v.empty()) out.push_back(std::move(roots));
+        }
+    }
+}
+
+// The pane: the mesh pane's camera and mesh pass, then the line pass with depth TESTED but not
+// written (so a curve behind the head is hidden by the head, and lines never z-fight each other).
+static void drawGroomPane(GroomState& g, ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+    MeshView& view = g.view;
+    ImGui::TextUnformatted("drag to orbit, wheel to zoom");
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    avail.y -= ImGui::GetTextLineHeightWithSpacing();
+    if (avail.y < 80.0f) avail.y = 80.0f;
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("groom_canvas", avail, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+    const bool hovered = ImGui::IsItemHovered();
+    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        ImVec2 d = ImGui::GetIO().MouseDelta;
+        view.yaw += d.x * 0.01f; view.pitch += d.y * 0.01f;
+    }
+    if (hovered) { float w = ImGui::GetIO().MouseWheel; if (w != 0.0f) view.zoom *= (1.0f + w * 0.1f); }
+    if (view.zoom < 0.05f) view.zoom = 0.05f;
+    MeshGpu& gpu = view.gpu;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 br(origin.x + avail.x, origin.y + avail.y);
+    bool ok = gpu.buildPipeline(dev);
+    if (ok && (!gpu.geomReady || gpu.geomGen != view.geomGen)) ok = gpu.uploadGeometry(dev, g.meshes, view.geomGen);
+    if (ok && g.lines.dirty) { std::vector<LineBatch> batches; groomBuildLines(g, batches); ok = g.lines.upload(dev, batches); }
+    if (ok) ok = gpu.ensureTargets(dev, (int)(avail.x + 0.5f), (int)(avail.y + 0.5f));
+    if (ok) {
+        float cy = std::cos(view.yaw),   sy = std::sin(view.yaw);
+        float cx = std::cos(view.pitch), sx = std::sin(view.pitch);
+        const float R[3][3] = { { cy, 0.0f, sy }, { sx * sy, cx, -sx * cy }, { -cx * sy, sx, cx * cy } };
+        // Orthographic about the FRAME (groomComputeFrame), not the meshes' union box the
+        // upload baked: a scene's floor must not decide where the head sits in the pane.
+        float scale = 0.42f * std::min(avail.x, avail.y) / (0.5f * g.frameExt + 1e-3f);
+        float s  = scale * view.zoom;
+        float ax = (avail.x > 0.0f) ? 2.0f * s / avail.x : 0.0f;
+        float ay = (avail.y > 0.0f) ? 2.0f * s / avail.y : 0.0f;
+        float kz = 0.5f / g.frameDiag;
+        auto dotMid = [&](int r) { return R[r][0] * g.frameMid[0] + R[r][1] * g.frameMid[1] + R[r][2] * g.frameMid[2]; };
+        MeshGpu::CB c = {};
+        const float rowScale[3] = { ax, ay, -kz };
+        for (int r = 0; r < 3; ++r) for (int k = 0; k < 3; ++k) c.mvp[r * 4 + k] = rowScale[r] * R[r][k];
+        c.mvp[0 * 4 + 3] = -ax * dotMid(0);
+        c.mvp[1 * 4 + 3] = -ay * dotMid(1);
+        c.mvp[2 * 4 + 3] =  kz * dotMid(2) + 0.5f;
+        c.mvp[3 * 4 + 3] = 1.0f;
+        for (int r = 0; r < 3; ++r) {
+            float* dst = (r == 0) ? c.rot0 : (r == 1) ? c.rot1 : c.rot2;
+            dst[0] = R[r][0]; dst[1] = R[r][1]; dst[2] = R[r][2]; dst[3] = -dotMid(r);
+        }
+        auto setCB = [&](const float rgba[4], float shadeOn, float mode) {
+            for (int k = 0; k < 4; ++k) c.baseColor[k] = rgba[k];
+            c.opts[0] = shadeOn; c.opts[1] = mode; c.opts[2] = c.opts[3] = 0.0f;
+            D3D11_MAPPED_SUBRESOURCE ms;
+            if (ctx->Map(gpu.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms) == S_OK) { std::memcpy(ms.pData, &c, sizeof(c)); ctx->Unmap(gpu.cb, 0); }
+        };
+        const float clearCol[4] = { 14 / 255.0f, 16 / 255.0f, 20 / 255.0f, 1.0f };
+        ctx->ClearRenderTargetView(gpu.rtv, clearCol);
+        ctx->ClearDepthStencilView(gpu.dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+        ID3D11RenderTargetView* rtvs[1] = { gpu.rtv };
+        ctx->OMSetRenderTargets(1, rtvs, gpu.dsv);
+        D3D11_VIEWPORT vp = {}; vp.Width = (float)gpu.texW; vp.Height = (float)gpu.texH; vp.MaxDepth = 1.0f;
+        ctx->RSSetViewports(1, &vp);
+        UINT stride = sizeof(MeshGpu::Vert), voff = 0;
+        ctx->IASetInputLayout(gpu.layout);
+        ctx->VSSetShader(gpu.vs, nullptr, 0); ctx->PSSetShader(gpu.ps, nullptr, 0);
+        ctx->GSSetShader(nullptr, nullptr, 0); ctx->HSSetShader(nullptr, nullptr, 0); ctx->DSSetShader(nullptr, nullptr, 0);
+        ctx->VSSetConstantBuffers(0, 1, &gpu.cb); ctx->PSSetConstantBuffers(0, 1, &gpu.cb);
+        ctx->PSSetSamplers(0, 1, &gpu.samp);
+        const float bf[4] = { 0, 0, 0, 0 };
+        ctx->OMSetBlendState(gpu.blend, bf, 0xffffffff);
+        ID3D11ShaderResourceView* none[1] = { nullptr };
+        ctx->PSSetShaderResources(0, 1, none);
+        if (g.showMesh && gpu.vb && gpu.ib) {
+            ctx->IASetVertexBuffers(0, 1, &gpu.vb, &stride, &voff);
+            ctx->IASetIndexBuffer(gpu.ib, DXGI_FORMAT_R32_UINT, 0);
+            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx->RSSetState(gpu.rsSolid);
+            ctx->OMSetDepthStencilState(gpu.dsSolid, 0);
+            static const float tints[4][3] = { { 0.62f, 0.66f, 0.72f }, { 0.78f, 0.62f, 0.50f }, { 0.58f, 0.76f, 0.60f }, { 0.76f, 0.58f, 0.72f } };
+            for (size_t mi = 0; mi < gpu.ranges.size(); ++mi) {
+                const MeshGpu::Range& r = gpu.ranges[mi];
+                if (!r.indexCount) continue;
+                float rgba[4] = { tints[mi % 4][0], tints[mi % 4][1], tints[mi % 4][2], 1.0f };
+                setCB(rgba, view.shade ? 1.0f : 0.0f, 0.0f);
+                ctx->DrawIndexed(r.indexCount, r.firstIndex, r.baseVertex);
+            }
+            if (view.wire) {
+                ctx->RSSetState(gpu.rsWire);
+                ctx->OMSetDepthStencilState(gpu.dsWire, 0);
+                const float wireCol[4] = { 30 / 255.0f, 30 / 255.0f, 36 / 255.0f, 120 / 255.0f };
+                setCB(wireCol, 0.0f, 0.0f);
+                for (size_t mi = 0; mi < gpu.ranges.size(); ++mi) {
+                    const MeshGpu::Range& r = gpu.ranges[mi];
+                    if (r.indexCount) ctx->DrawIndexed(r.indexCount, r.firstIndex, r.baseVertex);
+                }
+            }
+        }
+        if (g.lines.vb && g.lines.count) {
+            ctx->IASetVertexBuffers(0, 1, &g.lines.vb, &stride, &voff);
+            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+            ctx->RSSetState(gpu.rsSolid);
+            ctx->OMSetDepthStencilState(gpu.dsWire, 0);          // tested, not written
+            for (size_t bi = 0; bi < g.lines.first.size(); ++bi) {
+                if (!g.lines.num[bi]) continue;
+                setCB(g.lines.colour[bi].data(), 0.0f, 0.0f);   // unlit: the batch colour
+                ctx->Draw(g.lines.num[bi], g.lines.first[bi]);
+            }
+        }
+        ID3D11RenderTargetView* noRtv[1] = { nullptr };
+        ctx->OMSetRenderTargets(1, noRtv, nullptr);
+        if (gpu.msTex && gpu.colorTex) ctx->ResolveSubresource(gpu.colorTex, 0, gpu.msTex, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+    }
+    if (ok && gpu.srv) dl->AddImage((ImTextureID)(intptr_t)gpu.srv, origin, br);
+    else {
+        dl->AddRectFilled(origin, br, IM_COL32(14, 16, 20, 255));
+        if (!gpu.err.empty()) dl->AddText(ImVec2(origin.x + 8.0f, origin.y + 8.0f), IM_COL32(240, 140, 110, 255), gpu.err.c_str());
+    }
+    int totalTris = 0; for (const auto& m : g.meshes) totalTris += m.nfaces;
+    ImGui::Text("%d mesh(es), %d tris  |  %d named curve(s)  |  %zu strand(s) of fur", (int)g.meshes.size(), totalTris,
+                (int)g.loaded.hairCurves.size(), g.loaded.scene.curves.size());
+}
+
+// The tree: every named curve, top level first, its children beneath it -- each in its colour.
+static void groomTreeNode(GroomState& g, int idx, int depthGuard) {
+    if (idx < 0 || depthGuard > 16) return;
+    const auto& c = g.loaded.hairCurves[(size_t)idx];
+    const float* col = levelColour(c.level);
+    ImGui::PushID(idx);
+    bool on = g.curveOn[(size_t)idx] != 0;
+    if (ImGui::Checkbox("##on", &on)) { g.curveOn[(size_t)idx] = on ? 1 : 0; g.lines.dirty = true; }
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(col[0], col[1], col[2], 1.0f));
+    ImGuiTreeNodeFlags fl = ImGuiTreeNodeFlags_OpenOnArrow | (c.children.empty() ? ImGuiTreeNodeFlags_Leaf : 0)
+                          | (g.selected == idx ? ImGuiTreeNodeFlags_Selected : 0) | ImGuiTreeNodeFlags_DefaultOpen;
+    char label[256];
+    std::snprintf(label, sizeof label, "%s  [L%d]%s%s%s%s  %zu strand%s", c.name.c_str(), c.level,
+                  c.count > 0 ? "  count" : "", c.density ? "  density" : "", c.closed ? "  closed" : "",
+                  c.rendered ? "" : "  (definition)", c.strands.size(), c.strands.size() == 1 ? "" : "s");
+    bool open = ImGui::TreeNodeEx("node", fl, "%s", label);
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) { g.selected = (g.selected == idx) ? -1 : idx; g.lines.dirty = true; }
+    if (open) {
+        for (const std::string& ch : c.children) {
+            int ci = -1;
+            for (size_t k = 0; k < g.loaded.hairCurves.size(); ++k) if (g.loaded.hairCurves[k].name == ch) { ci = (int)k; break; }
+            if (ci >= 0) groomTreeNode(g, ci, depthGuard + 1);
+            else ImGui::TextDisabled("  %s (inline)", ch.c_str());
+        }
+        ImGui::TreePop();
+    }
+    ImGui::PopID();
+}
+
+static void drawGroomPanel(GroomState& g) {
+    ImGui::TextWrapped("scene: %s", g.scenePath.c_str());
+    if (!g.ok) { ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "load failed: %s", g.err.c_str()); return; }
+    ImGui::Separator();
+    bool d = false;
+    d |= ImGui::Checkbox("mesh", &g.showMesh);        ImGui::SameLine();
+    d |= ImGui::Checkbox("wireframe", &g.view.wire);  ImGui::SameLine();
+    d |= ImGui::Checkbox("shade", &g.view.shade);
+    d |= ImGui::Checkbox("curves", &g.showCurves);    ImGui::SameLine();
+    d |= ImGui::Checkbox("points", &g.showPoints);    ImGui::SameLine();
+    d |= ImGui::Checkbox("hair", &g.showHair);        ImGui::SameLine();
+    d |= ImGui::Checkbox("roots", &g.showRoots);
+    ImGui::TextUnformatted("frame:"); ImGui::SameLine();
+    bool f = false;
+    f |= ImGui::RadioButton("groom", &g.frameMode, 0); ImGui::SameLine();
+    f |= ImGui::RadioButton("all", &g.frameMode, 1);   ImGui::SameLine();
+    if (ImGui::SmallButton("reset view")) { g.view.yaw = 0.6f; g.view.pitch = 0.4f; g.view.zoom = 1.0f; }
+    if (f) { groomComputeFrame(g); d = true; }           // cross sizes follow the frame
+    if (ImGui::CollapsingHeader("Levels", ImGuiTreeNodeFlags_DefaultOpen)) {
+        for (int L = 0; L <= g.maxLevel && L < 8; ++L) {
+            const float* col = levelColour(L);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(col[0], col[1], col[2], 1.0f));
+            char lab[48]; std::snprintf(lab, sizeof lab, L == 0 ? "level 0: strands" : "level %d: curves of level %d", L, L - 1);
+            bool on = g.levelOn[L];
+            if (ImGui::Checkbox(lab, &on)) { g.levelOn[L] = on; d = true; }
+            ImGui::PopStyleColor();
+        }
+    }
+    if (ImGui::CollapsingHeader("Curves", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // roots of the tree: curves that are nobody's child
+        std::vector<char> isChild(g.loaded.hairCurves.size(), 0);
+        for (const auto& c : g.loaded.hairCurves)
+            for (const std::string& ch : c.children)
+                for (size_t k = 0; k < g.loaded.hairCurves.size(); ++k) if (g.loaded.hairCurves[k].name == ch) isChild[k] = 1;
+        for (size_t k = 0; k < g.loaded.hairCurves.size(); ++k) if (!isChild[k]) groomTreeNode(g, (int)k, 0);
+        if (g.loaded.hairCurves.empty()) ImGui::TextDisabled("(no named curves in this scene)");
+    }
+    if (ImGui::CollapsingHeader("Fur", ImGuiTreeNodeFlags_DefaultOpen)) {
+        for (const auto& fi : g.loaded.furInfos) {
+            ImGui::BulletText("%s  on \"%s\"  %lld strands  radius %.3g", fi.name.c_str(), fi.on.c_str(), fi.strands, fi.radius);
+            if (!fi.guides.empty()) { std::string gs; for (const auto& n : fi.guides) gs += (gs.empty() ? "" : ", ") + n; ImGui::TextDisabled("    guides: %s", gs.c_str()); }
+        }
+        if (g.loaded.furInfos.empty()) ImGui::TextDisabled("(no fur blocks)");
+    }
+    if (d) g.lines.dirty = true;
+}
+
+}  // namespace groom
+
+int runGroomGui(const std::string& scenePath) {
+    groom::GroomState g;
+    g.scenePath = scenePath;
+    ftsl::keepShapeOnlyRef() = true;                      // the scalp must be drawable and pickable
+    g.ok = ftsl::load(scenePath, g.loaded, g.err);
+    ftsl::keepShapeOnlyRef() = false;
+    if (!g.ok) std::fprintf(stderr, "[groom] could not load '%s': %s\n", scenePath.c_str(), g.err.c_str());
+    else {
+        g.meshes = groom::meshesFromScene(g.loaded.scene);
+        g.curveOn.assign(g.loaded.hairCurves.size(), 1);
+        for (const auto& c : g.loaded.hairCurves) g.maxLevel = std::max(g.maxLevel, c.level);
+        groom::groomComputeFrame(g);
+        g.view.geomGen = 1;
+        std::fprintf(stderr, "[groom] %zu mesh(es), %zu named curve(s) (max level %d), %zu fur block(s); framing %.3g m about (%.3f %.3f %.3f)\n",
+                     g.meshes.size(), g.loaded.hairCurves.size(), g.maxLevel, g.loaded.furInfos.size(),
+                     g.frameExt, g.frameMid[0], g.frameMid[1], g.frameMid[2]);
+        for (const auto& m : g.meshes) {
+            float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+            for (int i = 0; i < m.nverts; ++i) for (int k = 0; k < 3; ++k) { lo[k] = std::min(lo[k], m.verts[(size_t)i * 3 + k]); hi[k] = std::max(hi[k], m.verts[(size_t)i * 3 + k]); }
+            std::fprintf(stderr, "[groom]   mesh \"%s\": %d tris, x %.3f..%.3f  y %.3f..%.3f  z %.3f..%.3f\n",
+                         m.name.c_str(), m.nfaces, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
+        }
+    }
+    ImGui_ImplWin32_EnableDpiAwareness();
+    WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"FtraceGroom", nullptr };
+    RegisterClassExW(&wc);
+    std::wstring title = utf8ToWide("ftrace \xF0\x9F\xAA\x9F groom");
+    HWND hwnd = CreateWindowW(wc.lpszClassName, title.c_str(), WS_OVERLAPPEDWINDOW, 80, 80, 1400, 860, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!CreateDeviceD3D(hwnd)) {
+        CleanupDeviceD3D(); UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        std::fprintf(stderr, "error: -groom: failed to create D3D11 device.\n");
+        return 1;
+    }
+    ShowWindow(hwnd, SW_SHOWDEFAULT); UpdateWindow(hwnd);
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::GetIO().IniFilename = nullptr;
+    ImGui::StyleColorsDark();
+    { float dpi = ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd); if (dpi > 1.0f) { ImGui::GetStyle().ScaleAllSizes(dpi); ImGui::GetIO().FontGlobalScale = dpi; } }
+    ImGui_ImplWin32_Init(hwnd);
+    ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+    bool done = false;
+    while (!done) {
+        MSG msg;
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg); DispatchMessage(&msg);
+            if (msg.message == WM_QUIT) done = true;
+        }
+        if (done || ft::stopRequested()) break;
+
+        ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
+        const ImGuiViewport* vp = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(vp->WorkPos); ImGui::SetNextWindowSize(vp->WorkSize);
+        ImGui::Begin("groom", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus);
+        float leftW = ImGui::GetContentRegionAvail().x * 0.30f;
+        ImGui::BeginChild("groom_left", ImVec2(leftW, 0), true);
+        groom::drawGroomPanel(g);
+        ImGui::EndChild();
+        ImGui::SameLine();
+        ImGui::BeginChild("groom_right", ImVec2(0, 0), true);
+        if (g.ok) groom::drawGroomPane(g, g_pd3dDevice, g_pd3dDeviceContext);
+        ImGui::EndChild();
+        ImGui::End();
+        ImGui::Render();
+        const float clear[4] = { 0.06f, 0.06f, 0.08f, 1.0f };
+        g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRTV, nullptr);
+        g_pd3dDeviceContext->ClearRenderTargetView(g_mainRTV, clear);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        g_pSwapChain->Present(1, 0);
+    }
+    g.lines.release();
+    g.view.gpu.release();
+    ImGui_ImplDX11_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
+    CleanupDeviceD3D(); DestroyWindow(hwnd); UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    return 0;
+}
+
 int runViewerGui(const std::string& sidecarPath, const std::string& loomScene,
                  bool startPlaying, bool startPrebake, int prebakeCapMB) {
     Sidecar sc;

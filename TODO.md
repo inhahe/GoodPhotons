@@ -246,7 +246,7 @@ level, each level its own colour); (c) an FTSL writer/reader for nested `curve` 
 viewer shell with a Groom tab. Everything in the scene renders in the 3-D pane; the target of the
 `fur` block is what you pick on.
 
-**Phase 1 -- VIEW (read-only, immediately useful):** load a scene; draw the target object solid or
+**Phase 1 -- VIEW (read-only, immediately useful) -- BUILT 0.329.0, `ftrace -groom <scene>`:** load a scene; draw the target object solid or
 wireframe; draw every `curve` as a polyline, LEVEL-COLOURED (leaf guides / rings / the curve of rings
 ...), control points as dots; a tree panel of the hierarchy (name, level, count/density, closed,
 spline); a toggle "generate hair" that runs the real `generateFur` on the fur block and shows the
