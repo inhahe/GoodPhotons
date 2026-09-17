@@ -23814,6 +23814,23 @@ one host core pegged at ~100 % — that is **not** the beam build. ftrace never 
 Combined with the stale caption of (3) above, that is what made a 23.7 s build look like a
 25-minute single-threaded one.
 
+### OPEN (minor, 2026-09-02, NARROWED 2026-09-17): no CLI flag renders a RANGE of a `camera_curve` — a single frame is selectable after all
+
+**Correction (2026-09-17).** A single frame does NOT need a scratch scene. A `camera_curve`'s frames
+are ordinary named cameras, so `-camera fly0555` selects one and renders just it. The flyby's
+cameras are `cam fly0000 .. fly1146`, and a wrong name prints the whole list, which is how to find
+the spelling. What genuinely does not exist is a **range**.
+
+Three spellings that look plausible and are NOT accepted, recorded because each cost an invocation:
+`-frame 555`, `-camera fly#555` (the `#N` selector indexes the camera list, not the curve), and
+`-res 320 180` — the resolution flag is **`-r W H`**.
+
+The range is what would let a **stopped flyby resume at the frame it died on**, which matters for
+the 1147-frame `gallery_rain` run (see the COMMIT-limit entry, and the silent
+`unspecified launch failure` entry — a batch that loses one frame needs to re-render just that one).
+
+The original entry follows.
+
 ### OPEN (minor, 2026-09-02): no CLI flag renders a single frame (or a range) of a `camera_curve`
 
 There is no `-frame N` / `-frames A B`. To render one frame of a 600-frame flyby — the normal

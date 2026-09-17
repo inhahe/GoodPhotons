@@ -1,161 +1,156 @@
 # TODO — in flight
 
 Live working plan. Each item says what, why, how it gets validated, and where it stands, so an
-interruption costs the work in progress and not the plan. Finished items move to `known-issues.md`
-(with their measurements) and come off this list; `design.md` gets the architecture.
+interruption costs the work in progress and not the plan. Finished items keep one line here and
+their measurements in `known-issues.md`; `design.md` gets the architecture.
 
-Ordering note: **B was done first even though A was asked for first**, because mode M is one of the
-backends A has to be validated in and a spectral error there would have contaminated every number A
-produces. Measure the ruler before measuring with it. B is now done; A is next.
+**Read the "Recently finished" list before starting anything.** On 2026-09-17 I reported VOLCACHE's
+deposit split, GPU-VARIANCE and GPU-BEAM-TAIL as outstanding. **All three were already closed** —
+I had carried them forward from a stale task list without re-reading their entries. Checking status
+costs one `grep`; chasing finished work costs a session.
 
 ---
 
-## B. Mode M mis-colours coloured speculars — **DONE (v0.321.0)**
+## 1. The `gallery_rain` 960x540 flyby — THE DELIVERABLE, and it has never been launched
 
-Fixed on both backends and written up in `known-issues.md` (SPECGATHER). Mode M / mode D on the
-Cornell control went JH white 0.880 -> 1.006 and JH red 1.142 -> 1.007, with flat spectra unmoved;
-the `_beams_ms` invariant reads 1.058 against its recorded 1.085; a gallery_rain frame costs +4 %.
-`gallery_rain`'s gold gyroid and chrome ring now render their true colour in mode M.
+1147 frames, `camera_curve "fly"`, mode M. Everything below it (`-sunnee`, VOLCACHE, the spectral
+fixes, the beam work) exists to make this frame cost and this image quality possible. The single
+frame currently renders in ~96 s.
 
-Left open deliberately, recorded in the same entry: media transmittance (stochastic, needs the
-hero-wavelength treatment rather than this one; inert for gallery_rain, whose media have flat
-coefficients), the Hair BCSDF, and the binary stochastic choices in HalfMirror and the layered coat.
+**Three known blockers, all already logged — read them before launching, not after:**
 
-## C. Mode M mis-renders coloured media — **DONE (v0.322.0)**
+- **The machine's COMMIT limit, not its RAM, is the ceiling** (`known-issues.md`, "the `gallery_rain`
+  600-frame mode-M flyby cannot start"). The verified showcase command died in the film allocation.
+  That entry has the exact command and the diagnosis; the flyby is now *1147* frames rather than
+  600, so the allocation is larger, not smaller.
+- **A mode-M GPU gather can die with `unspecified launch failure` under concurrent GPU load — and
+  the batch carries on as if it had not** (logged 2026-09-16). On a 1147-frame run that silently
+  produces a hole in the sequence. Decide how the run detects this *before* starting it.
+- **There is no `-frames A B`**, so a run that dies cannot be resumed at the frame it died on
+  (item 7).
 
-Fixed on both backends; write-up and numbers in `known-issues.md`. A coloured fog went from a
-**113 % channel spread** against mode D (blue 64 % bright, red 23 % dark) to **1.0 %**, with the flat
-control unmoved at 0.3 %. Three tiers — flat (one scalar walk, free), homogeneous (analytic), and
-heterogeneous (correlated ratio tracking). `gallery_rain` costs 96 s, unchanged.
+**Before launching:** render a handful of scattered frames (`-camera fly0000`, `fly0400`, `fly0555`,
+`fly1146`) at final settings and look at them. Cheap insurance against discovering a framing or
+exposure problem 900 frames in.
 
-Outstanding: an end-to-end number for the coloured-AND-heterogeneous combination. Those renders
-exceed 20-40 minutes — but the control proves that is the scene's medium and not the spectral
-vector (the same scene with a flat spectrum, taking the scalar path, is equally slow). What is
-needed is a cheap scene that exercises that tier, not a redesign.
+## 2. glTF per-texel metalness -> a `mixWeightTex`-driven mix — the likely remaining Meshy gap
 
-## A. The analytic coated-body model — TIR saturation, coat absorption, Snell
+glTF's metalness is **per texel**; ftrace's material type is **per material**. Alice's
+metallicRoughness map has mean metalness 0.28 but **p90 0.53** — parts of that one material are
+properly metallic, and the importer, typing the whole thing by the mean, renders them as a 4 %
+dielectric. A 4 % coat is genuinely subtle; a metal is not.
 
-**Status: A1 DONE (v0.323.0), A2 DONE (v0.324.0). A3 analysed and deliberately NOT built
--- it is inseparable from the deferred explicit multi-bounce BSDF, whose trigger it has
-fired with measured numbers. See below and `known-issues.md`.**
+**The fix is already scoped:** import a metalness-mapped material as a **two-child mix driven by the
+map** — `Material::mixWeightTex` exists and does exactly this (a per-hit blend mask on a 2-child
+mix) — with a metal `glossy` child and the `layered` dielectric child. Not built.
 
-Today `MatType::Layered` models the coat **on the way in and not on the way out**: the coat reflects
-with probability R and otherwise the ray enters and a body lobe shades. There is no exit interface,
-so no total internal reflection, and no absorption in the layer. Everything below is multiplicative
-on the body's contribution, so it preserves **one lobe per vertex** — the property that lets a
-layered material render in every mode on both backends from one definition.
+This is the most likely remaining difference against the viewer the user compares to, and the user
+has asked about Alice's dress looking glossy more than once. Full write-up in `known-issues.md`.
 
-### A1. Exit interface + internal multiple reflection -- **DONE (v0.323.0)**
+## 3. An emissive mesh that is not PLANAR is silently re-oriented outward (logged 2026-09-17)
 
-Implemented as an **effective albedo** on the body rather than as a BSDF term, because that makes it
-a property of the MATERIAL: no interface change, so it works in every mode on both backends at once.
-`Scene::finalizeLayeredCoats` mints a per-stack body COPY and sets `Material::coatFdr` on it; the
-four albedo funnels (`diffuseReflectance`, `reflectSlot`, and `dReflectSlot` on the device) apply
+So an emissive **enclosure** — a furnace, a cove, the inside of a softbox or a lampshade — renders
+black, with no diagnostic. Found while building the coat validation rig, where it cost two wrong
+measurements before it was understood.
 
-    a_eff = a (1 - F_dr) / (1 - a F_dr),     F_dr = internalFresnelDiffuse(n) = 0.5967 at n = 1.5
+Cause: an emissive mesh's signed volume about its centroid is measured and, if negative past
+`-1e-6 * area^1.5`, every triangle's winding is reversed so emission points outward. The intent is
+right (an inward-wound import like `torus.obj` would otherwise glow into its own hollow) but an
+enclosure is indistinguishable from that case. **The real rule is planarity, not closure**: any
+emissive mesh with triangles in more than one plane is at risk.
 
-*after* texture / record / pattern / vertex-colour, so a textured body gets it too. Entry
-transmission stays where it was (the coat/body selection probability), so nothing is double counted.
+**Fix:** an explicit opt-out on the mesh block — `emit_orient keep` alongside the current `auto` —
+**not** a cleverer heuristic, because no geometric test can tell a lampshade interior from a torus
+wound the wrong way. The author knows which they meant; the loader cannot.
+**Workaround meanwhile:** one `mesh` block per planar face (what `tools/furnace_rig.py` does).
 
-Validated in a white furnace with the camera inside, `tools/furnace_rig.py`, mode D on GPU, 3000 spp -- run it and it reprints the whole table.
-The rig proves itself first -- mirror **1.0004**, diffuse 1.0 -> **1.0003**, diffuse 0.5 -> **0.5001**
--- and `F` is measured from a black-body-under-coat case (**0.0401**), not fitted:
+## 4. Mode M's CPU and GPU gathers disagree by ~9 % on `gallery_rain`'s floor grid (2026-09-16)
 
-| coated body | rendered | predicted `F + (1-F) a_eff` | err |
-|---|---:|---:|---:|
-| white 1.0 | 0.9998 | 1.0000 | **-0.02 %** |
-| grey 0.5 | 0.3159 | 0.3159 | **-0.02 %** |
+Open, on the surface photon-map gather. It matters *because of item 1*: the flyby is mode M, and a
+9 % backend disagreement on a large visible surface means one of the two is wrong in the frames
+being shipped. Full entry in `known-issues.md`.
 
-With the coat's own lobe suppressed (`reflectance manual specular 0.0`) so only `a_eff` acts, a deep
-red body deepens from **R/G 9.01 to 21.76** (2.41x) and darkens to **0.540x** -- the varnish effect
-the old model could not produce. Full write-ups in `design.md` and `REFERENCE.md`.
+## 5. A3 / the explicit multi-bounce layered BSDF — trigger FIRED, design named, not built
 
-**Two rigs had to be thrown away first, and both failures were the same mistake.** A furnace built
-from `light area {}` is blind to specular (a MIRROR in it reads exactly 0.0000, because those
-emitters have no hittable surface), and a furnace built as ONE emissive mesh is silently flipped to
-emit outward and renders black -- a real renderer bug, now logged in `known-issues.md` with its
-cause, its true rule (planarity, not closure) and its workaround. In both cases the tell was
-available immediately: a control whose answer is known in advance read something impossible. Run the
-controls before believing the result.
+The analytic coated body is built and validated (A1 0.323.0, A2 0.324.0). What is missing is a
+**directional** body under a coat, and it is no longer a judgement call — the deferred trigger's
+condition 2 has fired with numbers:
 
-### A2. Coat absorption (tinted lacquer) -- **DONE (v0.324.0)**
+- Up to **-37 % in directional albedo and -34 % in lobe width** on a glossy body under a smooth
+  coat, against the "a few percent" bar the trigger itself set. `tools/a3_snell.py`.
+- Both controls pass, so that number means what it says: no coat -> 0.13 %, Lambertian body ->
+  0.23 % (which independently reconfirms A1's derivation).
+- **No cheap fudge exists**: the lobe-width error *changes sign* with roughness, so no roughness
+  rescale fixes both ends.
 
-New FTSL in the coat block: `absorb <spectrum>` (sigma_a in 1/m) + `depth <metres>`. Deliberately
-NOT `film_thickness`, which is the nanometre wave-optics film -- eight orders of magnitude away, and
-a silent unit trap if shared. Both keywords are required for absorption to do anything.
+**An exact result worth keeping in mind:** Snell in-and-out of a *smooth* body is the **identity**
+(`sin t_out = n sin t_t = sin t_i`). So this is not "the coat bends the light" — it is only about the
+body's MICROFACET normal disagreeing with the coat's, which exists only for a rough body, which is
+exactly where TIR traps part of the lobe and no closed form survives. The two are inseparable.
 
-Beer-Lambert composes WITH A1's internal series instead of sitting beside it: light that fails to
-escape crosses the absorbing layer twice more before its next try. The geometry is two
-cosine-weighted mean secants, closed form in the index alone -- escape cone `2n^2(1 - cos tc)` =
-1.1459, trapped leg `2/cos tc` = 2.6833 at n = 1.5 -- giving
+**Why not built:** `f(wi,wo)` and `pdf(wo|wi)` have no closed form; NEE needs the first at every
+shading point and BDPT/VCM need both at every vertex. That is the stochastic-evaluation BSDF
+(Guo/Hasan/Zhao 2018) the trigger already names — real architecture, with an MIS decision to make up
+front rather than halfway through.
 
-    a_eff = a T^2 (1 - F_dr) / (1 - a F_dr T_rt)
+**Next, if picked up:** build the brute-force reference IN THE RENDERER (mode R or A/B/C with the
+coat traced explicitly, which needs no MIS pdf), in an enclosure, and confirm the Python numbers end
+to end before committing to the architecture.
 
-which reduces exactly to A1 at sigma_a = 0. Both path lengths are folded into constants at
-scene-build time, so shading pays two exps and only when the coat absorbs.
+## 6. The heterogeneous spectral-media tier has no end-to-end number
 
-Validated in the white furnace, white body (so the rendered colour IS the coat), mode D, 3000 spp:
+The three-tier spectral media fix (C, v0.322.0) is validated for the flat and homogeneous tiers
+(coloured fog: 113 % channel spread -> 1.0 %). The **coloured-AND-heterogeneous** combination is not
+covered: those renders exceeded 20-40 minutes and were stopped.
 
-| coat | rendered | expected |
-|---|---:|---|
-| no `absorb`, no `depth` | 0.9999 | A1's clear 0.9998 |
-| `absorb 2000`, no `depth` | 0.9999 | clear (both keywords required) |
-| `depth 1e-4`, no `absorb` | 0.9999 | clear |
-| `absorb 2000  depth 1e-4` | **0.3475** | **0.3476** analytic |
-| `absorb rgb 400 2600 5200  depth 1e-4` | R 0.556 G 0.293 B 0.155 | amber lacquer |
+**Do not re-derive the wrong conclusion from that.** I twice called the stochastic tier
+"impractically slow" and was wrong both times — 24 bins vs 8 changed nothing, narrowing the spectral
+spread changed nothing, and the control I should have run first settled it: the same scene with a
+FLAT spectrum, taking the scalar fast path (i.e. pre-fix behaviour exactly), is **equally slow**.
+The cost is that scene's heterogeneous medium, not the spectral vector. What is missing is a **cheap
+scene** that exercises the tier, not a redesign.
 
-CPU/GPU agree to 0.1 %.
+## 7. No CLI flag renders a RANGE of a `camera_curve` (logged 2026-09-02, partly stale)
 
-**It also caught a defect I shipped in 0.323.0**: that version applied the coated-body albedo at
-three of the four albedo sites, missing host `reflectSlot`, so a GLOSSY body under a coat differed
-between backends for one version. All four now go through one `coatedAlbedoAt`; see known-issues.
+**Correction found 2026-09-17:** a single frame *can* be selected — the curve's frames are ordinary
+named cameras, so `-camera fly0555` works. (`-frame N`, `-camera fly#555` and `-res` do not exist;
+the flag is `-r W H`.) The entry should be narrowed to what is genuinely missing: a **range**
+(`-frames A B`), which is what would let a stopped flyby resume at the frame it died on — see item 1.
 
-**The approximation:** both absorption legs are directionally averaged. Snell compresses the whole
-incident hemisphere into the escape cone, so the entry secant only ranges 1.0 .. 1.342 -- at most a
-34 % swing in path length, against a tint that is the entire visual point, and with the coat's real
-silhouette cue (R(theta) -> 1 at grazing) already exact.
+## 8. BLOCKED: the paired-timing rule into `CLAUDE.md`
 
-### A3. Snell into the body -- **ANALYSED; NOT BUILT, and that is the finding**
+"Time paired within a repetition, warm-up discarded" is a standing measurement rule that lives only
+in session context. It belongs in `CLAUDE.md` — which currently carries the user's own uncommitted
+changes and **is not to be touched**. Do this only if that tree becomes clean, and ask first.
 
-A3 asked for Snell refraction into the body, plus a narrowing of the deferred-BSDF trigger from "a
-directional body under the coat" to "a directional body under a ROUGH coat". **The narrowing is
-retracted, the trigger has FIRED instead, and the full write-up with numbers is in
-`known-issues.md`.** In short:
+## 9. Characterised, no action decided: mode D's heavy noise tail
 
-**1. An exact result reframes what A3 is.** Refract in, reflect off a body whose microfacet normal
-IS the coat's normal, refract out: `sin t_out = n sin t_t = sin t_i`. The result is exactly the
-mirror of the incoming direction -- **Snell in-and-out of a SMOOTH body is the identity.** So A3 is
-not "the coat bends the light"; it is about the mismatch between the body's MICROFACET normal and
-the coat's, which exists only for a ROUGH body. That is precisely the case where part of the lobe
-lands past the critical angle and is trapped by TIR, which has no closed form. The refraction effect
-and the TIR problem are co-extensive. Coat roughness never enters the argument, which is why
-narrowing by it was wrong.
+Mode D's per-frame noise falls as roughly `spp^-0.15`. The firefly framing was largely retired
+(2026-09-12) — both modes peak at the same pixel at every seed — leaving a 4 %-energy, 1669x-peaked
+**connection** residual that is shared BDPT machinery rather than anything mode-specific. Recorded
+in `known-issues.md`; no fix proposed, and it is not blocking anything.
 
-**2. The error is large and was measured** (`tools/a3_snell.py`, brute-forcing the real layered
-system against what ftrace renders today): up to **-37 % in directional albedo and -34 % in lobe
-width** on a glossy body under a smooth coat. The bar the trigger set was "a few percent".
+---
 
-**3. Both controls pass**, so that number means what it says: with **n = 1.0** (no coat) truth and
-model agree to **0.13 %**, and for a **Lambertian** body under a real coat they agree to **0.23 %**
--- which independently confirms A1's derivation, and whose 0.5-albedo prediction of 0.3159 is
-exactly what ftrace *renders* in the furnace.
+## Recently finished (one line each; measurements in `known-issues.md`, architecture in `design.md`)
 
-**4. No cheap fudge exists.** "Just scale the body's roughness" cannot work: the lobe-width error
-**changes sign** with roughness (27-34 % too narrow at alpha 0.05, 7-10 % too wide at alpha 0.5),
-because internal bounces spread the lobe while refraction compresses it.
+- **A1 — the coat's exit interface (v0.323.0).** A coated body's albedo becomes
+  `a(1-F_dr)/(1-a F_dr)`, so a coated colour deepens like varnish instead of being washed out.
+  White body 0.9998 vs 1.0000 predicted; grey 0.5 -> 0.3159 vs 0.3159. `tools/furnace_rig.py`.
+- **A2 — absorption in the coat layer (v0.324.0).** New FTSL `coat { absorb <spd> depth <m> }`;
+  Beer-Lambert in, out, and on every internal round trip. Measured 0.3475 vs 0.3476 analytic.
+  Also fixed a host/device disagreement shipped in 0.323.0 (glossy body under a coat, ~1.6x) by
+  giving the coat exactly one funnel.
+- **B — mode M mis-coloured coloured speculars (v0.321.0).**
+- **C — mode M mis-rendered coloured media (v0.322.0).** 113 % channel spread -> 1.0 %.
+- **VOLCACHE deposit split — BUILT AND MEASURED (v0.300.0)**, 64 % faster and energy-correct.
+  *Not outstanding.*
+- **GPU-VARIANCE — ROOT CAUSE FOUND AND PROVEN (v0.300.2):** the two backends average a different
+  number of light-side realizations at the same spp. Not a noisier deposit. *Not outstanding.*
+- **GPU-BEAM-TAIL — CLOSED (2026-09-14)** as a narrow edge case: needs `-beams` *and* `sigma_t`
+  between 6 and 20, one scene in the repo. *Not outstanding.*
 
-**Why it is not built:** sampling could keep one lobe per vertex with a bounded internal loop, but
-`f(wi,wo)` and `pdf(wo|wi)` have no closed form, and NEE needs the first at every shading point
-while BDPT/VCM need both at every vertex. That is the stochastic-evaluation BSDF (Guo/Hasan/Zhao
-2018) already named in the trigger -- real architecture, with an MIS decision to make up front.
-
-This is exactly the outcome this item asked for in that case: *"If the Jacobian cannot be made
-consistent within one-lobe-per-vertex, stop, and record it against the trigger rather than forcing
-it -- that is what the trigger is for."*
-
-**Next, if it is picked up:** build the brute-force reference IN THE RENDERER (mode R or A/B/C with
-the coat traced explicitly, which needs no MIS pdf), in an enclosure, and confirm the Python numbers
-above end to end before committing to the architecture.
+---
 
 ## Standing constraints (so a fresh session does not have to be told)
 
@@ -163,7 +158,24 @@ above end to end before committing to the architecture.
   **never `git push`**.
 - Every render passes `-window-min` (never bare `-window`) and launches with
   `dangerouslyDisableSandbox`. Stop a render with `ftrace -stop <pid>`, **never** `taskkill /F`.
+  Never blanket-kill a shared runtime by image name (python/node/dotnet/java) — only the exact PID.
 - Scratch in `scraps/`, PNGs in `png/`; a flyby series gets its own `png/<setname>/`.
+- **A rig that is cited as evidence does not belong in git-ignored `scraps/`** — promote it to
+  `tools/` and rewrite the references in the same commit, or the table is not re-derivable from a
+  clean clone.
 - `CLAUDE.md` is the user's and is not to be touched.
-- The gallery_rain flyby is still pending and is the reason mode M matters: its command is in
-  `known-issues.md` under the `-sunnee` entry.
+
+## Measurement discipline (each of these cost something to learn)
+
+- **Run the controls first, and let them veto the result.** A rig that cannot see the effect
+  produces confident numbers that are pure artefact: a furnace built from `light area {}` renders a
+  MIRROR as exactly 0.0000, and I nearly reported that blindness as a 4 % energy bug in a material.
+  `tools/furnace_rig.py` prints its three known answers before it prints anything else.
+- **Never measure reflection in an open scene** — use an enclosure. This is what made the
+  "mode M renders glossy 2.7x darker" claim wrong, and it had the same tell (a mirror reading 0).
+- **Run the baseline control before attributing a difference**, especially before concluding that
+  something new is slow (see item 6).
+- Score per-ROI, never whole-frame; separate variance from systematic; hold confounds fixed by
+  construction; time paired within a repetition with the warm-up discarded.
+- When a quantity must be applied at N sites, **N > 1 is the bug** — build the funnel. The 0.323.0
+  host/device slip was a four-site change made at three sites.
