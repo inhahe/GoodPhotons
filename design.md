@@ -1635,7 +1635,15 @@ why these historical runs reproduce. See **J-BEAMCOST** in `known-issues.md`.
   tree, which
   `ftsl_reduce.hpp` reduces to the same `std::vector<ftsl::Block>` the hand-written
   parser produced. `ftsl_frontend.hpp` is the entry point — since 0.79.0 that is just
-  `ftsl_gpda::parse`. loom parses the
+  `ftsl_gpda::parse`. **`include "file.ftsl"` (0.325.0)** is the one brace-less top-level
+  form: a grammar rule `include_decl = 'include' STRING` (no other brace-less header exists,
+  so it could not be a block), reduced to a `Block{type="include", name=path}` that
+  `loadSource` **splices out again** (`expandIncludes`) *after* parsing and *before* the
+  Builder runs — so the Builder never learns the type exists, `prefer` branches get it by
+  recursion, and every name crosses file boundaries as if pasted. Resolution is
+  beside-the-including-file first, then `assetbytes::resolve`; cycles are caught on the
+  normalised absolute path and reported as the whole chain. Adding the rule meant
+  regenerating `ftsl_scene.gen.cpp` with `python -m loom.grammar.emit_cpp`. loom parses the
   *same* grammar in Python via the pinned `tools/loom/loom/grammar/_gpda.py`, so
   ftrace and loom cannot disagree about the language. The flip (0.68) was gated on
   `-validate-grammar` reporting zero structural mismatches across all 2595 `.ftsl`

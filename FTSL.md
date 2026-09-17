@@ -126,6 +126,40 @@ can't render a feature (see the command-line reference).
 
 ---
 
+### 1.5 `include "file.ftsl"` — split a scene across files
+
+```
+include "alice_hair.ftsl"          # this file's top-level blocks are spliced in here
+```
+
+A top-level statement (no braces) naming another `.ftsl` file. Its top-level blocks are
+**spliced in place**, exactly as if the file had been pasted at that line, so names cross the
+boundary in both directions: a `fur` in the main scene can grow `on` a mesh defined in the
+included file, and the included file can use a `material` the main scene declared earlier.
+Includes nest, and one may sit inside a `prefer { … } else { … }` branch.
+
+**Where the path is looked for**, in order: (1) beside the **including** file — so a scene and
+its parts move together, and a part in a subdirectory can say `include "../shared.ftsl"`;
+(2) the scene's ordinary asset search path (cwd, the root scene's directory and its ancestors,
+the exe directory), so a scene can include from wherever its meshes and textures already live.
+
+**Errors name the including file and line.** A missing file:
+`scene.ftsl:5: include "no_such.ftsl": cannot open the file (looked beside scenes and on the
+asset search path)`. A cycle is refused with the whole chain:
+`b.ftsl:1: include cycle: a.ftsl -> b.ftsl -> a.ftsl` (on the resolved, normalised path, so
+`./x.ftsl` and `x.ftsl` are the same file).
+
+> **One thing an included file does NOT get: its own asset directory.** A `mesh { file … }`
+> or `texture { file … }` *inside* an included file resolves through the **root scene's**
+> search path, not relative to the included file. That is fine while parts live beside the
+> scene (this repo's layout — `scenes/x.ftsl` including `scenes/x_hair.ftsl`, both naming
+> `meshes/…`); it is the case to know about if you keep a part in a directory of its own.
+> Recorded in `known-issues.md`.
+
+Validated by `tools/include_rig.py`: a scene split across two files, nested through a
+subdirectory, and included from inside a `prefer` branch all render **byte-identical** to the
+same scene in one file; the cycle and the missing file fail with the messages above.
+
 ## 2. Units and the `scene` block
 
 ```

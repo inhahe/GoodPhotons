@@ -120,7 +120,7 @@ item       = NEWLINE | top_block
 
 # parseOneTopBlock: prefer-construct, `NAME = range …` record, `spectrum … = v`,
 # the unified `NAME = KIND { }` header, or the legacy `KIND ["name"] [sub] { }`.
-top_block  = prefer_block | record_decl | spectrum_decl | assign_header | plain_header
+top_block  = prefer_block | record_decl | spectrum_decl | include_decl | assign_header | plain_header
 
 # ---- prefer { … } else { … } ----------------------------------------
 prefer_block = 'prefer' blank_lines block_list ('else' blank_lines block_list)*
@@ -151,6 +151,7 @@ stop_item    = NEWLINE | stop_word
 # ---- spectrum decl: `spectrum "name" [subtype] = <value>` -----------
 # The one block form with an `=` value instead of a brace body.
 spectrum_decl = 'spectrum' STRING? subtype? '=' value
+include_decl  = 'include' STRING               # splice another .ftsl file's blocks in here
 
 # ---- element headers -------------------------------------------------
 # Unified `NAME = KIND [subtype] { body }` and legacy `KIND ["name"] [sub] { body }`.

@@ -27025,6 +27025,26 @@ each site. The 0.323.0 validation was not weak -- it measured the right things t
 had no diffuse/glossy contrast in it, and a four-site change with a three-site edit is exactly what
 that blind spot looks like.
 
+## OPEN (minor, 2026-09-17, v0.325.0): an `include`d file's own asset paths resolve through the ROOT scene, not beside the included file
+
+`include "file.ftsl"` (FTSL §1.5) resolves the include path itself beside the including file
+first, but the blocks it splices in carry no provenance, and the Builder that later reads a
+`mesh { file … }` or `texture { file … }` inside them runs over the merged list with the root
+scene's `assetbytes` search path active. So a part kept in a directory of its own, naming assets
+relative to *itself*, will not find them; a part beside the scene (this repo's layout) is fine,
+as is any part whose asset paths are relative to the project root.
+
+**Fix when it matters:** a per-Block source directory set at splice time, pushed onto the asset
+search path while that block is built. Not done in v0.325.0 because nothing in the repo needs it
+yet, and a search-path *list* (today it is a single `sceneDirRef()` string) is the honest shape
+of the change rather than a special case.
+
+**Also recorded:** loom's Python reader (`tools/loom/loom/grammar/reader.py`) parses its own typed
+`ftsl.epeg`, not `ftsl_scene.epeg`, so it does not know `include` — `parse_document` on a scene
+that uses one raises `unsupported .ftsl element: 'include_decl'`. loom never *emits* an include,
+so nothing loom writes is affected; it only means a hand-authored scene with an `include` cannot
+be round-tripped through loom's editor until that grammar gains the same rule.
+
 ## OPEN (2026-09-17): an emissive mesh that is not PLANAR is silently re-oriented OUTWARD, so an emissive enclosure renders black
 
 **Repro.** A cube of six inward-facing emissive quads, as one mesh, with the camera inside: the whole

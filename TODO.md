@@ -62,9 +62,13 @@ pieces, built in this order because each is testable on its own and the later on
   regenerating `src/gpda/ftsl_scene.gen.cpp` via `python -m loom.grammar.emit_cpp`, a reducer
   case, and a post-parse splice in `loadSource`.
 
-### 0.1 `include` — NOT STARTED
-Rig: a scene split across two files must render byte-identical to the same scene in one file;
-a cycle must fail with the chain named; a bad path must fail naming the INCLUDING file and line.
+### 0.1 `include` — **DONE (v0.325.0)**
+Grammar rule + reducer case + post-parse splice (`expandIncludes` in `ftsl.h`), regenerated
+`ftsl_scene.gen.cpp`. `tools/include_rig.py`: split, nested-through-a-subdirectory and
+inside-`prefer` all render **byte-identical** to the one-file scene; a cycle fails naming the full
+chain; a missing file fails naming the including file and line. Two limits recorded in
+`known-issues.md` (an included file's own asset paths resolve via the root scene; loom's reader
+does not know the keyword). FTSL §1.5.
 
 ### 0.2 Recursive `curve` + `spline` on strands — NOT STARTED
 Rig: a curve of two straight guides whose blend is analytically known (the midpoint instance of

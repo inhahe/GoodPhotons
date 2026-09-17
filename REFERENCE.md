@@ -47,6 +47,7 @@ Three neighbouring documents cover what this one only summarises:
 - [Scene language (FTSL)](#scene-language-ftsl)
   - [Where asset paths are looked for](#where-asset-paths-are-looked-for)
   - [Conditional blocks (`prefer { … } else { … }`)](#conditional-blocks-prefer----else---)
+  - [Including files (`include "file.ftsl"`)](#including-files-include-fileftsl)
   - [Camera animation (`camera_path`, `camera_orbit`)](#camera-animation-camera_path-camera_orbit)
   - [Multi-camera shared photon pass (modes `A`, `B`, and `M`)](#multi-camera-shared-photon-pass-modes-a-b-and-m)
     - [Mode `M` and participating media — `-beams`](#mode-m-and-participating-media---beams)
@@ -4572,6 +4573,18 @@ keeping a mode-B "full-effects" branch (with the GRIN lamp gas) ready for the fu
 See also `-on-unsupported` under the command-line reference, which controls what
 happens when the *selected* mode still can't render a feature (error / fall back to
 mode R / strip the feature).
+
+### Including files (`include "file.ftsl"`)
+
+Since 0.325.0 a scene can be split across files: a top-level `include "part.ftsl"` statement
+(no braces) splices that file's blocks in at that line, exactly as if pasted, so names cross the
+boundary both ways — a `fur` in the main scene can grow `on` a mesh the part defines. The path is
+looked for **beside the including file** first, then on the ordinary asset search path above.
+Includes nest and may sit inside a `prefer` branch; a cycle is refused naming the whole chain, and
+a missing file is refused naming the *including* file and line. One limit: asset paths *inside* an
+included file resolve through the root scene's search path, not relative to the part (fine while
+parts live beside the scene). Grammar and examples: FTSL.md §1.5; regression rig
+`tools/include_rig.py`.
 
 ### Camera animation (`camera_path`, `camera_orbit`)
 

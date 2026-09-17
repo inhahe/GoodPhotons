@@ -8303,6 +8303,107 @@ inline std::vector<Block> flattenPrefer(const std::vector<Block>& blocks,
 // is used only for diagnostics (grammar-shim path label, error messages). This is the
 // shared core of `load()`; it also backs the synthesized quick-viewer scene (a bare
 // `ftrace foo.glb` builds an auto-lit scene string and loads it through here).
+// ---------------------------------------------------------------------------
+// `include "file.ftsl"` -- splice another file's top-level blocks in place (0.325.0)
+// ---------------------------------------------------------------------------
+// Resolved AFTER parsing and BEFORE building, on the Block list, so the Builder never
+// sees an `include` block and every name crosses file boundaries exactly as if the
+// author had pasted the file in: a `fur` in the main scene can grow on a scalp defined
+// in the included one, and a `prefer` branch can include a file too.
+//
+// Path resolution, in order: (1) relative to the directory of the INCLUDING file --
+// the rule every other language with includes uses, and the one that lets a scene
+// and its parts move together; (2) the scene's asset search path (`assetbytes::resolve`:
+// cwd, the root scene's directory and its ancestors, the exe directory), so a scene
+// can include from wherever its meshes and textures already live.
+//
+// Cycles are an error naming the whole chain (`a.ftsl -> b.ftsl -> a.ftsl`), detected
+// on the resolved, normalised path so `./x.ftsl` and `x.ftsl` are the same file. Depth
+// is also capped, as a belt for the cycle check's braces.
+//
+// KNOWN LIMIT, documented rather than hidden: asset paths INSIDE an included file
+// (`mesh { file ... }`) still resolve through the root scene's search path, not the
+// included file's own directory -- the Builder runs later over the merged list and has
+// no per-block provenance. Fine while parts live beside the scene (this repo's layout);
+// see known-issues for the case it does not cover.
+namespace detail {
+inline std::string includeDirOf(const std::string& file) {
+    std::error_code ec;
+    const std::filesystem::path p = assetbytes::toPath(file);
+    if (!p.has_parent_path()) return std::string();
+    const std::filesystem::path d = p.parent_path();
+    if (d.empty() || !std::filesystem::is_directory(d, ec)) return std::string();
+    return d.string();
+}
+inline std::string includeKey(const std::string& file) {
+    std::error_code ec;
+    std::filesystem::path p = std::filesystem::weakly_canonical(assetbytes::toPath(file), ec);
+    if (ec) p = std::filesystem::absolute(assetbytes::toPath(file), ec);
+    std::string s = p.string();
+    for (char& c : s) { if (c == '\\') c = '/'; c = (char)std::tolower((unsigned char)c); }
+    return s;
+}
+}  // namespace detail
+
+inline bool expandIncludes(std::vector<Block>& blocks, const std::string& fromFile,
+                           std::vector<std::string>& chain, std::string& err, int depth = 0) {
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        Block& b = blocks[i];
+        if (b.type == "prefer") {                                   // includes inside branches
+            for (auto& branch : b.branches)
+                if (!expandIncludes(branch, fromFile, chain, err, depth)) return false;
+            continue;
+        }
+        if (b.type != "include") continue;
+
+        const int line = b.stmts.empty() ? 0 : b.stmts[0].line;
+        const std::string where = fromFile + ":" + std::to_string(line);
+        if (b.name.empty()) { err = where + ": include needs a quoted path: include \"file.ftsl\""; return false; }
+        if (depth >= 32) { err = where + ": include nesting deeper than 32 -- almost certainly a cycle the check missed"; return false; }
+
+        // (1) beside the including file, (2) the scene's asset search path.
+        std::string path;
+        {
+            std::error_code ec;
+            const std::string dir = detail::includeDirOf(fromFile);
+            const std::string beside = dir.empty() ? b.name : assetbytes::joinDir(dir, b.name);
+            if (!dir.empty() && std::filesystem::exists(assetbytes::toPath(beside), ec)) path = beside;
+            else path = assetbytes::resolve(b.name);
+        }
+        std::ifstream f(path);
+        if (!f) {
+            err = where + ": include \"" + b.name + "\": cannot open the file (looked beside " +
+                  (detail::includeDirOf(fromFile).empty() ? std::string("the scene") : detail::includeDirOf(fromFile)) +
+                  " and on the asset search path)";
+            return false;
+        }
+        const std::string key = detail::includeKey(path);
+        for (const std::string& c : chain)
+            if (c == key) {
+                std::string cyc;
+                for (const std::string& c2 : chain) cyc += c2 + " -> ";
+                err = where + ": include cycle: " + cyc + key;
+                return false;
+            }
+        std::stringstream ss; ss << f.rdbuf();
+        std::vector<Block> sub;
+        std::string perr;
+        if (!ftsl_gpda::parse(ss.str(), sub, perr)) { err = "in included file " + path + ": " + perr; return false; }
+        chain.push_back(key);
+        if (!expandIncludes(sub, path, chain, err, depth + 1)) return false;
+        chain.pop_back();
+        // Splice in place: the included blocks take the include's slot, in order.
+        const size_t n = sub.size();
+        blocks.erase(blocks.begin() + (std::ptrdiff_t)i);
+        blocks.insert(blocks.begin() + (std::ptrdiff_t)i,
+                      std::make_move_iterator(sub.begin()), std::make_move_iterator(sub.end()));
+        i += n; --i;                                                // continue AFTER the spliced run
+        std::fprintf(stderr, "[ftsl] include %s -> %zu block(s)\n",
+                     std::filesystem::path(assetbytes::toPath(path)).lexically_normal().string().c_str(), n);
+    }
+    return true;
+}
+
 inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
                        Loaded& L, std::string& err,
                        const SupportFn& supported = {},
@@ -8388,6 +8489,11 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
     bool parsedOk = ftsl_gpda::parse(src, blocks, err);
     if (timing) timing->msParse = phaseLap();
     if (!parsedOk) return false;
+    {   // `include "file.ftsl"` blocks become the included files' blocks, in place.
+        std::vector<std::string> chain;
+        chain.push_back(detail::includeKey(nameForMsgs));
+        if (!expandIncludes(blocks, nameForMsgs, chain, err)) return false;
+    }
 
     // Collect top-level `prefer` nodes. The common case (none) is the original fast path.
     std::vector<size_t> preferIdx;

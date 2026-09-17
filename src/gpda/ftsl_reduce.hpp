@@ -228,6 +228,20 @@ inline ftsl::Block reduce_top_block(const PN* top_block) {
         s.line = (int)sv->first_pos().first;        // ftrace stamps the value's line
         s.val = reduce_value(sv, "=");
         b.stmts.push_back(std::move(s));
+    } else if (k == "include_decl") {               // 'include' STRING
+        // A Block the loader SPLICES rather than builds: loadSource replaces it with the
+        // included file's own top-level blocks before the Builder runs, so the Builder's
+        // "unknown top-level block" check never has to know the type exists. The path
+        // rides in `name`; the STRING's line is kept on a statement so a missing file can
+        // be reported against the INCLUDING file and line.
+        b.type = "include";
+        const PN* s = child(alt, "STRING");
+        b.name = s ? unquote("STRING", s->value) : std::string();
+        ftsl::Stmt st;
+        st.key  = "file";
+        st.line = s ? (int)s->line : 0;
+        st.val.words.push_back(b.name);
+        b.stmts.push_back(std::move(st));
     } else if (k == "record_decl") {                // WORD '=' 'range' range_word* record_body
         b.type = "record";
         b.name = children(alt, "WORD")[0]->value;   // first WORD is the binding NAME
