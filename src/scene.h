@@ -373,6 +373,17 @@ struct Material {
     // through, so a textured or record-driven body gets it as surely as a constant one, with no
     // BSDF signature touched anywhere.
     double coatFdr      = 0.0;
+    // ABSORPTION INSIDE THE COAT LAYER (A2). `coatAbsorb` / `coatDepth` are authored on the
+    // LAYERED parent (`coat { absorb <spectrum> depth <metres> }`); finalizeLayeredCoats copies
+    // the spectrum onto each body copy together with the two PATH LENGTHS below, which fold the
+    // layer's depth and the cone geometry into constants so shading only pays two exps.
+    //   coatPathIo = d * (s_escape_in + s_escape_out)  -- getting in and back out once
+    //   coatPathRt = 2 * d * s_tir                     -- one internal round trip after a TIR
+    // Both zero unless the coat actually absorbs, which is the common case and costs nothing.
+    Spectrum coatAbsorb;          // sigma_a of the coat layer, 1/m (null = clear)
+    double coatDepth    = 0.0;    // layer thickness in METRES (not the nm film_thickness)
+    double coatPathIo   = 0.0;
+    double coatPathRt   = 0.0;
     double coatSpecular = -1.0;   // manual constant reflectance (used iff coatModel==2)
     // Optional per-hit blend mask (spec §9.4): a grayscale texture that drives the
     // selection weight of a 2-child mix. When set (and exactly 2 children), the map
@@ -1290,6 +1301,19 @@ inline double coatedAlbedo(double a, double fdr) {
     return (den > 1e-9) ? a * (1.0 - fdr) / den : a;
 }
 
+// The same series when the LAYER ABSORBS (A2). `tIo` is the transmittance of getting in and back
+// out once, `tRt` that of one internal round trip after a total internal reflection:
+//     a_eff = a tIo (1 - F_dr) / (1 - a F_dr tRt)
+// Reduces exactly to the clear case at tIo = tRt = 1. The trapped light is charged the round trip
+// as well as the escape legs, which is why a tinted lacquer goes so much deeper than one pass
+// through it would suggest -- it is the multiple passes that do the work, not the single crossing.
+inline double coatedAlbedoAbsorb(double a, double fdr, double tIo, double tRt) {
+    if (!(a > 0.0)) return a;
+    if (!(fdr > 0.0)) return a * tIo;
+    const double den = 1.0 - a * fdr * tRt;
+    return (den > 1e-9) ? a * tIo * (1.0 - fdr) / den : a * tIo;
+}
+
 // The INTERNAL diffuse Fresnel reflectance of a dielectric of relative index n, i.e. the share
 // of a cosine-weighted hemisphere INSIDE the denser medium that fails to escape. The standard
 // Egan-Hilgeman polynomial (the same one the BSSRDF literature uses); 0.5967 at n = 1.5, which
@@ -1297,6 +1321,45 @@ inline double coatedAlbedo(double a, double fdr) {
 inline double internalFresnelDiffuse(double n) {
     if (!(n > 1.0)) return 0.0;
     return -1.440 / (n * n) + 0.710 / n + 0.668 + 0.0636 * n;
+}
+
+// Mean secant (1/cos, i.e. how much further than straight down the light travels) through a coat
+// of relative index n, cosine-weighted, for the two populations that matter to an absorbing layer.
+// Both are closed form:
+//
+//   ESCAPE CONE, theta < theta_c -- the light that gets in and the light that gets out.
+//     mean = INT 1/cos * cos sin dtheta / INT cos sin dtheta = (1 - cos tc) / (sin^2 tc / 2)
+//          = 2 n^2 (1 - cos tc)        [sin tc = 1/n]        = 1.1459 at n = 1.5.
+//   BEYOND IT, theta > theta_c -- the light trapped by TIR, per leg.
+//     mean = cos tc / (cos^2 tc / 2) = 2 / cos tc            = 2.6833 at n = 1.5.
+//
+// The trapped light travels more than twice as far, because the light beyond the critical angle is
+// precisely the grazing light. That is what makes a tinted coat's internal series bite.
+// The ONE place a coat's effect on a body albedo is applied. Both host albedo funnels
+// (diffuseReflectance and reflectSlot) call this and nothing else, so a glossy body under a coat
+// and a diffuse one cannot drift apart -- and neither can the host and the device, whose
+// dCoatedAlbedoAt is a line-for-line twin. The clear case keeps its own branch only because it is
+// the common one and skips two exps.
+inline double coatedAlbedoAt(const Material& m, double a, double lambda) {
+    if (!(m.coatFdr > 0.0)) return a;
+    if (m.coatPathIo > 0.0 && m.coatAbsorb) {
+        const double sa = m.coatAbsorb(lambda);
+        if (sa > 0.0)
+            return coatedAlbedoAbsorb(a, m.coatFdr, std::exp(-sa * m.coatPathIo),
+                                      std::exp(-sa * m.coatPathRt));
+    }
+    return coatedAlbedo(a, m.coatFdr);
+}
+
+inline double coatEscapeSecant(double n) {
+    if (!(n > 1.0)) return 1.0;
+    const double ct = std::sqrt(std::max(0.0, 1.0 - 1.0 / (n * n)));   // cos theta_c
+    return 2.0 * n * n * (1.0 - ct);
+}
+inline double coatTirSecant(double n) {
+    if (!(n > 1.0)) return 1.0;
+    const double ct = std::sqrt(std::max(0.0, 1.0 - 1.0 / (n * n)));
+    return (ct > 1e-6) ? 2.0 / ct : 1.0;
 }
 
 struct Scene {
@@ -1523,13 +1586,22 @@ struct Scene {
             // (coatedAlbedo) and the same material may also be used bare elsewhere in the scene.
             // Copying is what keeps `material "paint"` meaning one thing on its own and another
             // under lacquer without the scene author having to author two.
-            const double fdr = internalFresnelDiffuse(mats[i].ior ? mats[i].ior(550.0) : 1.5);
+            const double nCoat = mats[i].ior ? mats[i].ior(550.0) : 1.5;
+            const double fdr = internalFresnelDiffuse(nCoat);
+            // A2: fold the layer's depth and the cone geometry into two path lengths, so shading
+            // pays two exps and no trigonometry. Zero unless the coat was given a depth.
+            const double dep = mats[i].coatDepth;
+            const double pIo = (dep > 0.0 && mats[i].coatAbsorb) ? dep * 2.0 * coatEscapeSecant(nCoat) : 0.0;
+            const double pRt = (dep > 0.0 && mats[i].coatAbsorb) ? dep * 2.0 * coatTirSecant(nCoat) : 0.0;
             for (size_t k = 0; k < mats[i].mixChildren.size(); ++k) {
                 const int cid = mats[i].mixChildren[k];
                 if (cid < 0 || cid >= (int)mats.size()) continue;
                 Material body = mats[(size_t)cid];
                 if (body.coatFdr > 0.0) continue;          // already a body copy (idempotent)
                 body.coatFdr = fdr;
+                body.coatAbsorb = mats[i].coatAbsorb;
+                body.coatPathIo = pIo;
+                body.coatPathRt = pRt;
                 mats[i].mixChildren[k] = (int)mats.size();
                 mats.push_back(body);
             }
@@ -3284,11 +3356,16 @@ inline double reflectPatMul(const Scene& scene, const Material& m, const Hit& h)
 // else the constant `reflect` spectrum — either way scaled by a bound reflect pattern.
 // (These types never bind a reflect texture, so — unlike diffuseReflectance — there is
 // no texture path.)
+inline double coatedAlbedoAt(const Material& m, double a, double lambda);   // defined above
 inline double reflectSlot(const Scene& scene, const Material& m,
                           const Hit& h, double lambda) {
     double v;
     if (!recordReflectBound(scene, m, h, lambda, v)) v = m.reflect(lambda);
-    return m.reflectPat < 0 ? v : v * reflectPatMul(scene, m, h);
+    v = m.reflectPat < 0 ? v : v * reflectPatMul(scene, m, h);
+    // UNDER A COAT, exactly as in diffuseReflectance -- a GLOSSY body sits under the same exit
+    // interface a diffuse one does. The device's dReflectSlot already did this and the host did
+    // not, so the two backends disagreed on a glossy body under a coat until 0.324.0.
+    return coatedAlbedoAt(m, v, lambda);
 }
 
 // Spectral reflectance of a hit's interpolated VERTEX COLOUR, at one wavelength.
@@ -3346,7 +3423,7 @@ inline double diffuseReflectance(const Scene& scene, const Material& m,
     // UNDER A COAT: the albedo the rest of the renderer should see is the one the internal
     // multiple reflections leave, not the pigment's own. Applied last, so it acts on whatever
     // the texture / record / pattern / vertex-colour chain produced.
-    return (m.coatFdr > 0.0) ? coatedAlbedo(rv, m.coatFdr) : rv;
+    return coatedAlbedoAt(m, rv, lambda);
 }
 
 // Transmit-slot value at a hit — the single point of truth for BOTH readings of the

@@ -26909,6 +26909,30 @@ from different data — averaged cells versus raw pixels — so the filter was c
 number it was meant to guard was still completely unguarded. When adding a robustness test,
 check every reported statistic for which array it actually reads.
 
+## FIXED (2026-09-17, v0.324.0): v0.323.0 applied the coated-body albedo on the DEVICE but not on the HOST for a GLOSSY body, so the two backends disagreed for one version
+
+0.323.0 added the coated-body effective albedo `a_eff = a(1-F_dr)/(1-a F_dr)` at three of the four
+albedo sites: host `diffuseReflectance`, device `dDiffuseRho`, device `dReflectSlot` -- but not host
+`reflectSlot`. `reflectSlot` is the slot for the SPECULAR families (mirror / glossy / grating /
+halfmirror), so a **glossy body under a coat** was transformed on the GPU and not on the CPU. A
+diffuse body was fine, which is why the 0.323.0 validation (all diffuse bodies) passed cleanly.
+
+Size of the disagreement: the transform itself. For the `reflect 0.6` body used to check the fix,
+`a_eff(0.6) = 0.377` against the raw `0.6` -- about 1.6x on the body term.
+
+**Fixed by giving the coat exactly one funnel.** All four sites now call `coatedAlbedoAt` /
+`dCoatedAlbedoAt` and nothing else, so a glossy body and a diffuse body cannot drift apart, and
+neither can the two backends. Measured after: glossy body under a coat, mode D, white furnace --
+GPU 0.4021, CPU 0.4021.
+
+**Worth recording as a process point, not just a bug.** This was not a pre-existing defect found by
+testing; it was introduced by the previous commit and found while *unifying the funnel for an
+unrelated feature* (A2, coat absorption). The lesson is the one the fix embodies: when a quantity
+has to be applied at N sites, N > 1 is the bug, and the fix is a funnel rather than more diligence at
+each site. The 0.323.0 validation was not weak -- it measured the right things to 0.02 % -- it just
+had no diffuse/glossy contrast in it, and a four-site change with a three-site edit is exactly what
+that blind spot looks like.
+
 ## OPEN (2026-09-17): an emissive mesh that is not PLANAR is silently re-oriented OUTWARD, so an emissive enclosure renders black
 
 **Repro.** A cube of six inward-facing emissive quads, as one mesh, with the camera inside: the whole

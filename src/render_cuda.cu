@@ -480,6 +480,12 @@ struct DMaterial {
     double coatSpecular;
     int    coatChild;
     double coatFdr;      // internal diffuse Fresnel of the coat above this body, 0 if none
+    // A2: absorption inside the coat LAYER. coatAbsorb is sigma_a (1/m); the two path lengths
+    // fold the layer depth and the cone geometry in at scene-build time, so shading pays two
+    // exps and no trigonometry. Host twins: Material::coatAbsorb / coatPathIo / coatPathRt.
+    double coatAbsorb[SPEC_N];
+    double coatPathIo;   // d * (secant in + secant out) through the escape cone
+    double coatPathRt;   // 2 * d * secant beyond the critical angle: one TIR round trip
     // Procedural (math-driven) scalar drives (§4): index into DScene::patterns, or -1.
     // roughnessPat / filmThicknessPat override the constant/texture value at the hit;
     // mixWeightPat drives child-0 selection of a 2-child D_MIX. Device twins of
@@ -7793,11 +7799,30 @@ __device__ static inline Real dCoatedAlbedo(Real a, double fdr) {
     const double den = 1.0 - (double)a * fdr;
     return (den > 1e-9) ? (Real)((double)a * (1.0 - fdr) / den) : a;
 }
+
+// Device twin of scene.h coatedAlbedoAt -- the ONE place a coat's effect on a body albedo is
+// applied, so dDiffuseRho and dReflectSlot cannot drift apart from each other or from the host.
+// The absorbing branch (A2) charges the trapped light its internal round trip as well as the
+// escape legs, which is what makes a tinted lacquer deepen so much more than a single pass would.
+__device__ static inline Real dCoatedAlbedoAt(const DMaterial& m, Real a, Real lambda) {
+    if (!(m.coatFdr > 0.0)) return a;
+    if (m.coatPathIo > 0.0) {
+        const double sa = (double)specLookup(m.coatAbsorb, lambda);
+        if (sa > 0.0) {
+            const double tIo = exp(-sa * m.coatPathIo), tRt = exp(-sa * m.coatPathRt);
+            if (!((double)a > 0.0)) return a;
+            const double den = 1.0 - (double)a * m.coatFdr * tRt;
+            return (den > 1e-9) ? (Real)((double)a * tIo * (1.0 - m.coatFdr) / den)
+                                : (Real)((double)a * tIo);
+        }
+    }
+    return dCoatedAlbedo(a, m.coatFdr);
+}
 __device__ static Real dReflectSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
     Real v;
     if (!dRecordReflect(sc, m, h, lambda, v)) v = specLookup(m.reflect, lambda);
     v = m.reflectPat < 0 ? v : v * dReflectPatMul(sc, m, h);
-    return (m.coatFdr > 0.0) ? dCoatedAlbedo(v, m.coatFdr) : v;
+    return dCoatedAlbedoAt(m, v, lambda);
 }
 
 // Diffuse reflectance at a hit: a driven parametric record (highest priority), else a
@@ -7833,8 +7858,9 @@ __device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const D
         }
     }
     rv = clamp01(m.reflectPat < 0 ? rv : rv * dReflectPatMul(sc, m, h));
-    // UNDER A COAT (host twin: diffuseReflectance): what the internal multiple reflections leave.
-    return (m.coatFdr > 0.0) ? dCoatedAlbedo(rv, m.coatFdr) : rv;
+    // UNDER A COAT (host twin: diffuseReflectance): what the internal multiple reflections leave,
+    // and what an absorbing layer takes on the way through.
+    return dCoatedAlbedoAt(m, rv, lambda);
 }
 
 // Transmit-slot value at a hit (device twin of host transmitSlot): the constant baked
@@ -17243,6 +17269,9 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.coatSpecular = m.coatSpecular;
         d.coatChild = -1;                   // filled by the coat-synthesis loop after this bake
         d.coatFdr   = m.coatFdr;            // >0 on a body copy under a coat (scene.h coatedAlbedo)
+        bakeSpec(m.coatAbsorb, d.coatAbsorb);   // A2: sigma_a inside the coat layer, 1/m
+        d.coatPathIo = m.coatPathIo;
+        d.coatPathRt = m.coatPathRt;
         d.readsCavity = m.readsCavity ? 1 : 0;
         d.roughnessPat = m.roughnessPat;
         d.filmThicknessPat = m.filmThicknessPat;

@@ -1285,10 +1285,32 @@ material "carpaint" {
         ior glass:BK7             # coat index (fresnel/thinfilm)
         film_ior 1.30  film_thickness 300  film_thickness_map texture:t   # thinfilm coat
         specular 0.05             # flat reflectance (manual model)
+        absorb rgb 400 2600 5200  # TINTED lacquer: sigma_a inside the layer, 1/m
+        depth 0.0001              # layer thickness in METRES (needed by `absorb`)
     }
     layer "base" 1.0              # body lobes, resolved like a mix
 }
 ```
+
+**The body is seen THROUGH the coat, both ways** (0.323.0). Light that leaves the body meets the
+coat from inside and, past the critical angle (~41.8 deg at n = 1.5 -- most of a cosine-weighted
+hemisphere), is thrown back down to scatter again. Summing that series replaces the body's albedo
+`a` with `a (1 - F_dr) / (1 - a F_dr)`, which is exactly 1 at `a = 1` (a white body under a clear
+coat conserves energy) and nonlinear below it. So **a coated colour deepens** the way varnish does,
+instead of being washed out by the white specular laid over it. Nothing to author -- it follows from
+`ior`.
+
+**`absorb` + `depth` make it a TINTED lacquer** (0.324.0). `absorb` is the layer's absorption
+coefficient sigma_a in **1/m** (any spectrum form: a number, `rgb`, a named `spectrum:`), and
+`depth` its thickness in **METRES**. Beer-Lambert applies on the way in, on the way out, *and* on
+every internal round trip the series above takes -- which is why a tinted coat goes far deeper than
+one crossing of it would suggest.
+
+> **`depth` is not `film_thickness`.** `film_thickness` is the **nanometre** wave-optics film of an
+> iridescent (`reflectance thinfilm`) coat -- a different physical quantity, eight orders of
+> magnitude away. They are deliberately separate keywords so the units cannot be confused.
+> **Both `absorb` and `depth` are required** for absorption to do anything: sigma_a with no
+> thickness is not an optical depth, and a thickness with no sigma_a is a clear coat.
 
 ### 7.5 `record` — parametric slot LUTs
 

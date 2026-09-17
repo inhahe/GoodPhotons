@@ -4664,6 +4664,15 @@ private:
             m.filmThickness = dblOf(cb, "film_thickness", 300.0);
             bindScalarTexture(cb, "film_thickness_map", m.filmThicknessTex);
             if (m.coatModel == 2) m.coatSpecular = dblOf(cb, "specular", 0.05);
+            // A2 -- a TINTED lacquer: Beer-Lambert absorption inside the layer itself.
+            // `absorb` is sigma_a in 1/m, `depth` the layer thickness in METRES. Deliberately
+            // NOT `film_thickness`, which is the NANOMETRE wave-optics film of an iridescent
+            // coat -- a different physical quantity on a different scale, and silently sharing
+            // a keyword between them would be a unit trap. Absorption needs both to do
+            // anything: sigma_a alone with no depth is not a thickness, and a depth with no
+            // sigma_a is a clear coat.
+            if (find(cb, "absorb")) m.coatAbsorb = spectrumParam(cb, "absorb", constantSpectrum(0.0));
+            m.coatDepth = dblOf(cb, "depth", 0.0);
         } else {
             fail("unknown material type '" + type + "'");
         }

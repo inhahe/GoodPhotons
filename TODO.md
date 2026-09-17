@@ -35,7 +35,7 @@ needed is a cheap scene that exercises that tier, not a redesign.
 
 ## A. The analytic coated-body model — TIR saturation, coat absorption, Snell
 
-**Status: A1 DONE (v0.323.0). A2 and A3 not started.**
+**Status: A1 DONE (v0.323.0), A2 DONE (v0.324.0). A3 not started.**
 
 Today `MatType::Layered` models the coat **on the way in and not on the way out**: the coat reflects
 with probability R and otherwise the ray enters and a body lobe shades. There is no exit interface,
@@ -76,13 +76,42 @@ cause, its true rule (planarity, not closure) and its workaround. In both cases 
 available immediately: a control whose answer is known in advance read something impossible. Run the
 controls before believing the result.
 
-### A2. Coat absorption (tinted lacquer)
+### A2. Coat absorption (tinted lacquer) -- **DONE (v0.324.0)**
 
-Beer-Lambert through the layer, in and out, with path length set by the refracted angles:
-`exp(-sigma_a * d * (1/cos_t_i + 1/cos_t_o))`. Deepens toward the silhouette, which is the candy-paint
-look. Needs FTSL: `coat { absorb <spectrum>  depth <metres> }`. **Do not reuse `film_thickness`** —
-that is the nanometre wave-optics film for an iridescent coat, a different quantity; a new `depth`
-keyword avoids a silent unit confusion.
+New FTSL in the coat block: `absorb <spectrum>` (sigma_a in 1/m) + `depth <metres>`. Deliberately
+NOT `film_thickness`, which is the nanometre wave-optics film -- eight orders of magnitude away, and
+a silent unit trap if shared. Both keywords are required for absorption to do anything.
+
+Beer-Lambert composes WITH A1's internal series instead of sitting beside it: light that fails to
+escape crosses the absorbing layer twice more before its next try. The geometry is two
+cosine-weighted mean secants, closed form in the index alone -- escape cone `2n^2(1 - cos tc)` =
+1.1459, trapped leg `2/cos tc` = 2.6833 at n = 1.5 -- giving
+
+    a_eff = a T^2 (1 - F_dr) / (1 - a F_dr T_rt)
+
+which reduces exactly to A1 at sigma_a = 0. Both path lengths are folded into constants at
+scene-build time, so shading pays two exps and only when the coat absorbs.
+
+Validated in the white furnace, white body (so the rendered colour IS the coat), mode D, 3000 spp:
+
+| coat | rendered | expected |
+|---|---:|---|
+| no `absorb`, no `depth` | 0.9999 | A1's clear 0.9998 |
+| `absorb 2000`, no `depth` | 0.9999 | clear (both keywords required) |
+| `depth 1e-4`, no `absorb` | 0.9999 | clear |
+| `absorb 2000  depth 1e-4` | **0.3475** | **0.3476** analytic |
+| `absorb rgb 400 2600 5200  depth 1e-4` | R 0.556 G 0.293 B 0.155 | amber lacquer |
+
+CPU/GPU agree to 0.1 %.
+
+**It also caught a defect I shipped in 0.323.0**: that version applied the coated-body albedo at
+three of the four albedo sites, missing host `reflectSlot`, so a GLOSSY body under a coat differed
+between backends for one version. All four now go through one `coatedAlbedoAt`; see known-issues.
+
+**The approximation:** both absorption legs are directionally averaged. Snell compresses the whole
+incident hemisphere into the escape cone, so the entry secant only ranges 1.0 .. 1.342 -- at most a
+34 % swing in path length, against a tint that is the entire visual point, and with the coat's real
+silhouette cue (R(theta) -> 1 at grazing) already exact.
 
 ### A3. Snell into the body (directional bodies)
 

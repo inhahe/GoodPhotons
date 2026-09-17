@@ -881,10 +881,52 @@ per-CHANNEL prediction does *not* hold to 0.02 %, and correctly so: `a_eff` is n
 applied per WAVELENGTH, which does not commute with integrating against the CIE curves. The flat
 white and grey cases are the ones where per-channel arithmetic is exact.
 
-**The approximation it makes:** entry is exact and angular (the coat/body split already uses
-R(theta_i) per hit) while the exit is directionally AVERAGED into `F_dr`. So the grazing darkening
-of the exit transmission is not reproduced; the saturation and the energy are. Still absent:
-absorption in the coat layer (A2) and Snell refraction into a directional body (A3). The EXPLICIT
+**Absorption inside the layer: a tinted lacquer (0.324.0).** The coat had an exit interface but
+was still perfectly clear, so `layered` could not be a tinted varnish or candy paint. `coat { absorb
+<spectrum> depth <metres> }` adds Beer-Lambert through the layer, and it *composes with* the series
+above rather than sitting beside it: light that fails to escape crosses the absorbing layer twice
+more before it gets another try. The geometry enters as two cosine-weighted mean secants, both
+closed form in the index alone --
+
+    escape cone (theta < theta_c), what gets in and out:  2 n^2 (1 - cos theta_c)  = 1.1459 at n=1.5
+    beyond it   (theta > theta_c), one trapped leg:       2 / cos theta_c          = 2.6833
+
+-- so with `T = exp(-sigma_a d s_esc)` per leg and `T_rt = exp(-2 sigma_a d s_tir)` per round trip,
+
+    a_eff = a T^2 (1 - F_dr) / (1 - a F_dr T_rt)
+
+which reduces EXACTLY to the clear case at sigma_a = 0. The trapped light travels more than twice as
+far as the escaping light, because the light beyond the critical angle is precisely the grazing
+light; that is what makes a tinted coat's internal series bite so much harder than a single crossing
+suggests. Both path lengths are folded into constants at scene-build time, so shading pays two
+`exp`s and only when the coat actually absorbs.
+
+Validated in the same furnace, white body (so the rendered colour IS the coat), mode D:
+
+| coat | rendered | expected |
+|---|---:|---|
+| no `absorb`, no `depth` | 0.9999 | the clear result, 0.9998 |
+| `absorb 2000` with no `depth` | 0.9999 | clear -- both keywords are required |
+| `depth 1e-4` with no `absorb` | 0.9999 | clear |
+| `absorb 2000  depth 1e-4` | **0.3475** | **0.3476** analytic |
+| `absorb rgb 400 2600 5200  depth 1e-4` | R 0.556 G 0.293 B 0.155 | an amber lacquer |
+
+CPU and GPU agree to 0.1 % on the absorbing case.
+
+**One funnel, and the defect that proved it was needed.** Both host albedo sites
+(`diffuseReflectance`, `reflectSlot`) and both device sites (`dDiffuseRho`, `dReflectSlot`) now go
+through a single `coatedAlbedoAt` / `dCoatedAlbedoAt`. 0.323.0 did *not*: it applied the transform
+in `dReflectSlot` on the device but not in host `reflectSlot`, so a **glossy** body under a coat
+rendered differently on the two backends for exactly one version. Unifying the funnel for A2 is what
+surfaced it; the two now agree to 0.003 % on that case.
+
+**The approximation A1 makes:** entry is exact and angular (the coat/body split already uses
+R(theta_i) per hit) while the exit is directionally AVERAGED into `F_dr`. **A2 averages both legs**,
+which is a smaller concession than it sounds: Snell compresses the entire incident hemisphere into
+the escape cone, so the entry secant only ranges over 1.0 .. 1/cos(theta_c) = 1.342 -- the angular
+part of coat absorption is at most a 34 % swing in path length, while the tint is the whole visual
+point, and the strong silhouette cue of a coat (R(theta) rising to 1 at grazing) is already exact.
+Still absent: Snell refraction into a directional body (A3). The EXPLICIT
 multi-bounce version remains deliberately deferred: see known-issues, "the EXPLICIT multi-bounce
 layered BSDF", which records the four conditions that would make it worth building and how to test
 that they hold.
