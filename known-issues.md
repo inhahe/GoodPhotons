@@ -26909,6 +26909,60 @@ from different data — averaged cells versus raw pixels — so the filter was c
 number it was meant to guard was still completely unguarded. When adding a robustness test,
 check every reported statistic for which array it actually reads.
 
+## OPEN (2026-09-17): an emissive mesh that is not PLANAR is silently re-oriented OUTWARD, so an emissive enclosure renders black
+
+**Repro.** A cube of six inward-facing emissive quads, as one mesh, with the camera inside: the whole
+frame is exactly 0. Split the same six quads into six `mesh` blocks and it renders correctly.
+
+**Cause** (`src/ftsl.h`, the block that opens "Orient a CLOSED emissive mesh outward"). After an
+emissive mesh loads, its signed volume about its own centroid is measured; if that is negative past
+a threshold of `-1e-6 * area^1.5`, *every* triangle's winding is reversed so its front face -- and
+therefore its one-sided emission -- points outward. The intent is right and worth keeping: an
+imported shell wound inward (`torus.obj`) would otherwise emit into its own hollow and look black
+from outside. But an emissive **enclosure** -- a furnace, a cove, the inside of a softbox or a
+lampshade -- is exactly a closed inward-wound shell that is *supposed* to emit inward, and it is
+indistinguishable from the case the heuristic exists to fix. It flips, and the interior goes dark
+with no diagnostic.
+
+**The rule is planarity, not closure**, because the test is a signed volume:
+
+| one mesh containing | signed volume | result |
+|---|---|---|
+| one quad; 4 coplanar tris; two DISJOINT coplanar quads | 0 | correct |
+| two quads in different planes (even with the SAME normal) | nonzero, can trip the threshold | emits nothing |
+| a closed cube wound inward | large negative | flipped outward: black inside |
+| a closed cube wound outward | large positive | not flipped, but emits away: black inside |
+| the same quads split across several `mesh` blocks | each block planar, 0 | correct |
+
+So the surprise is not confined to closed shells: **any** emissive mesh with triangles in more than
+one plane is at risk, which includes the ordinary way one would model a light fixture.
+
+**Workaround: one `mesh` block per planar face.** Each block is measured on its own, so each is
+planar and none is flipped. `scraps/furn3_*.ftsl` (the white-furnace rig) is built this way and says
+so in its header.
+
+**Fix when it is worth doing:** an explicit opt-out on the mesh block -- `emit_orient keep` alongside
+the current `auto` -- rather than a cleverer heuristic, because no geometric test can distinguish a
+lampshade interior from a torus wound the wrong way. The author knows which one they meant; the
+loader cannot.
+
+**How it was found, and the two rig failures it caused first.** This surfaced while building a white
+furnace to validate the coated-body model, and it cost two wrong measurements before it was
+understood -- both of them the same mistake in different clothes:
+
+1. The first furnace used `light area {}` for the walls. Those are NEE-only emitters with **no
+   hittable surface**, so a BSDF ray passes straight through into the void. A MIRROR in that box
+   rendered as exactly **0.0000**. The rig was blind to precisely the term being measured, and the
+   missing energy looked like a material bug.
+2. The second was this one: real emissive geometry, silently flipped.
+
+The tell in both cases was the same, and was available immediately: **a control whose answer is
+known in advance read something impossible.** A mirror in a uniform enclosure must read 1.000.
+Running that control *before* believing any result is what eventually separated "the coat loses 4 %
+of its energy" (false) from "the rig cannot see specular" (true). It is the same lesson as the
+earlier retracted glossy claim, where a mirror also read exactly 0 in both modes and I walked past
+it.
+
 ## OPEN (2026-08-04): a quad's emission is invisible from the side its winding faces away from
 
 The backward tracer only adds a surface's own emission when the camera/specular ray strikes

@@ -367,6 +367,12 @@ struct Material {
     // is not stored here -- it is layeredCoatReflectance at the hit, because it depends on the
     // viewing angle, which is the whole point of a Fresnel coat.
     int    coatChild    = -1;
+    // INTERNAL diffuse Fresnel reflectance of the coat above this body, or 0 when this material
+    // is not under one. Set by finalizeLayeredCoats on the per-stack BODY COPIES it makes, and
+    // applied in diffuseReflectance / reflectSlot -- the single funnels every albedo passes
+    // through, so a textured or record-driven body gets it as surely as a constant one, with no
+    // BSDF signature touched anywhere.
+    double coatFdr      = 0.0;
     double coatSpecular = -1.0;   // manual constant reflectance (used iff coatModel==2)
     // Optional per-hit blend mask (spec §9.4): a grayscale texture that drives the
     // selection weight of a 2-child mix. When set (and exactly 2 children), the map
@@ -1271,6 +1277,28 @@ struct MeshGroup {
     bool   shapeOnly = false;
 };
 
+// A Lambertian body under a smooth coat does not return its own albedo: light that fails to
+// escape the coat-to-air interface is thrown back onto it and scatters again, so the body is
+// seen through a geometric series of internal passes. Summed:
+//     a_eff = a (1 - F_dr) / (1 - a F_dr)
+// Exactly 1 at a = 1 (a white body under a lossless coat loses nothing), and NONLINEAR in a, so
+// a saturated body deepens -- the low channel makes more passes through the pigment. This is
+// what makes lacquered red read deeper than bare red and varnished wood richer than raw.
+inline double coatedAlbedo(double a, double fdr) {
+    if (!(fdr > 0.0) || !(a > 0.0)) return a;
+    const double den = 1.0 - a * fdr;
+    return (den > 1e-9) ? a * (1.0 - fdr) / den : a;
+}
+
+// The INTERNAL diffuse Fresnel reflectance of a dielectric of relative index n, i.e. the share
+// of a cosine-weighted hemisphere INSIDE the denser medium that fails to escape. The standard
+// Egan-Hilgeman polynomial (the same one the BSSRDF literature uses); 0.5967 at n = 1.5, which
+// is the ~60 % of the hemisphere lying past the critical angle.
+inline double internalFresnelDiffuse(double n) {
+    if (!(n > 1.0)) return 0.0;
+    return -1.440 / (n * n) + 0.710 / n + 0.668 + 0.0636 * n;
+}
+
 struct Scene {
     std::vector<Tri> tris;
     std::vector<Sphere> spheres;
@@ -1491,6 +1519,20 @@ struct Scene {
             coat.isLight = false;
             mats[i].coatChild = (int)mats.size();
             mats.push_back(coat);
+            // THE BODY needs a copy of its own, because being under a coat changes its albedo
+            // (coatedAlbedo) and the same material may also be used bare elsewhere in the scene.
+            // Copying is what keeps `material "paint"` meaning one thing on its own and another
+            // under lacquer without the scene author having to author two.
+            const double fdr = internalFresnelDiffuse(mats[i].ior ? mats[i].ior(550.0) : 1.5);
+            for (size_t k = 0; k < mats[i].mixChildren.size(); ++k) {
+                const int cid = mats[i].mixChildren[k];
+                if (cid < 0 || cid >= (int)mats.size()) continue;
+                Material body = mats[(size_t)cid];
+                if (body.coatFdr > 0.0) continue;          // already a body copy (idempotent)
+                body.coatFdr = fdr;
+                mats[i].mixChildren[k] = (int)mats.size();
+                mats.push_back(body);
+            }
         }
     }
 
@@ -3075,6 +3117,7 @@ struct Scene {
 // know that the answer is cached rather than computed.
 inline bool mediumAchromatic(const Medium& m) { return m.achro != 0; }
 
+
 inline bool beamSpectralOK(const Scene& scene) {
     for (const Medium& m : scene.media) {
         double lo = 1e300, hi = -1e300;
@@ -3299,7 +3342,11 @@ inline double diffuseReflectance(const Scene& scene, const Material& m,
     // colour, and against a tinted one it tints further rather than overriding what the
     // scene asked for.
     if (h.hasVcol) rv *= vertexColorReflectance(h, lambda);
-    return m.reflectPat < 0 ? rv : rv * reflectPatMul(scene, m, h);
+    rv = m.reflectPat < 0 ? rv : rv * reflectPatMul(scene, m, h);
+    // UNDER A COAT: the albedo the rest of the renderer should see is the one the internal
+    // multiple reflections leave, not the pigment's own. Applied last, so it acts on whatever
+    // the texture / record / pattern / vertex-colour chain produced.
+    return (m.coatFdr > 0.0) ? coatedAlbedo(rv, m.coatFdr) : rv;
 }
 
 // Transmit-slot value at a hit — the single point of truth for BOTH readings of the

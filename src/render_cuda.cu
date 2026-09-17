@@ -479,6 +479,7 @@ struct DMaterial {
     int    coatModel;
     double coatSpecular;
     int    coatChild;
+    double coatFdr;      // internal diffuse Fresnel of the coat above this body, 0 if none
     // Procedural (math-driven) scalar drives (§4): index into DScene::patterns, or -1.
     // roughnessPat / filmThicknessPat override the constant/texture value at the hit;
     // mixWeightPat drives child-0 selection of a 2-child D_MIX. Device twins of
@@ -7785,10 +7786,18 @@ __device__ static Real dReflectPatMul(const DScene& sc, const DMaterial& m, cons
 // halfmirror): a driven record if present, else the constant baked reflect spectrum,
 // scaled by a bound reflect pattern (device twin of host reflectSlot; these types never
 // bind a reflect texture).
+// Device twin of scene.h coatedAlbedo: what the internal multiple reflections under a coat leave
+// of a body's albedo. Exactly 1 at a = 1, and nonlinear, so a saturated body deepens.
+__device__ static inline Real dCoatedAlbedo(Real a, double fdr) {
+    if (!(fdr > 0.0) || !(a > (Real)0)) return a;
+    const double den = 1.0 - (double)a * fdr;
+    return (den > 1e-9) ? (Real)((double)a * (1.0 - fdr) / den) : a;
+}
 __device__ static Real dReflectSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
     Real v;
     if (!dRecordReflect(sc, m, h, lambda, v)) v = specLookup(m.reflect, lambda);
-    return m.reflectPat < 0 ? v : v * dReflectPatMul(sc, m, h);
+    v = m.reflectPat < 0 ? v : v * dReflectPatMul(sc, m, h);
+    return (m.coatFdr > 0.0) ? dCoatedAlbedo(v, m.coatFdr) : v;
 }
 
 // Diffuse reflectance at a hit: a driven parametric record (highest priority), else a
@@ -7823,7 +7832,9 @@ __device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const D
             rv *= stochReflAt(c, (double)lambda);   // the host's upsample::reflAt, device side
         }
     }
-    return clamp01(m.reflectPat < 0 ? rv : rv * dReflectPatMul(sc, m, h));
+    rv = clamp01(m.reflectPat < 0 ? rv : rv * dReflectPatMul(sc, m, h));
+    // UNDER A COAT (host twin: diffuseReflectance): what the internal multiple reflections leave.
+    return (m.coatFdr > 0.0) ? dCoatedAlbedo(rv, m.coatFdr) : rv;
 }
 
 // Transmit-slot value at a hit (device twin of host transmitSlot): the constant baked
@@ -17230,7 +17241,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.mixWeightTex = m.mixWeightTex;
         d.coatModel = m.coatModel;          // D_LAYERED coat (filled out below)
         d.coatSpecular = m.coatSpecular;
-        d.coatChild = -1;
+        d.coatChild = -1;                   // filled by the coat-synthesis loop after this bake
+        d.coatFdr   = m.coatFdr;            // >0 on a body copy under a coat (scene.h coatedAlbedo)
         d.readsCavity = m.readsCavity ? 1 : 0;
         d.roughnessPat = m.roughnessPat;
         d.filmThicknessPat = m.filmThicknessPat;

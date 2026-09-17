@@ -35,7 +35,7 @@ needed is a cheap scene that exercises that tier, not a redesign.
 
 ## A. The analytic coated-body model — TIR saturation, coat absorption, Snell
 
-**Status: not started.**
+**Status: A1 DONE (v0.323.0). A2 and A3 not started.**
 
 Today `MatType::Layered` models the coat **on the way in and not on the way out**: the coat reflects
 with probability R and otherwise the ray enters and a body lobe shades. There is no exit interface,
@@ -43,20 +43,38 @@ so no total internal reflection, and no absorption in the layer. Everything belo
 on the body's contribution, so it preserves **one lobe per vertex** — the property that lets a
 layered material render in every mode on both backends from one definition.
 
-### A1. Exit interface + internal multiple reflection (the TIR saturation)
+### A1. Exit interface + internal multiple reflection -- **DONE (v0.323.0)**
 
-The visible one. Light leaving the body meets the coat from inside; past the critical angle (~41.8°
-at n = 1.5, which is most of a cosine-weighted hemisphere) it is thrown back down, scatters again
-and retries. Summed in closed form that is the body's reflectance times
+Implemented as an **effective albedo** on the body rather than as a BSDF term, because that makes it
+a property of the MATERIAL: no interface change, so it works in every mode on both backends at once.
+`Scene::finalizeLayeredCoats` mints a per-stack body COPY and sets `Material::coatFdr` on it; the
+four albedo funnels (`diffuseReflectance`, `reflectSlot`, and `dReflectSlot` on the device) apply
 
-    T(theta_i) * T(theta_o) / (1 - albedo * F_dr)
+    a_eff = a (1 - F_dr) / (1 - a F_dr),     F_dr = internalFresnelDiffuse(n) = 0.5967 at n = 1.5
 
-with `F_dr` the internal diffuse Fresnel reflectance (~0.596 at n = 1.5), a constant of the index
-alone — so the `1/(1 - a*F_dr)` part can be **baked into the body copy at scene-build time** and
-costs nothing at render time. Entry transmission is already carried by the coat/body selection
-probability; **the exit factor is what is missing.** Watch for double counting between the two.
+*after* texture / record / pattern / vertex-colour, so a textured body gets it too. Entry
+transmission stays where it was (the coat/body selection probability), so nothing is double counted.
 
-This is what makes lacquered red read deeper than bare red, and varnished wood richer than raw.
+Validated in a white furnace with the camera inside, `scraps/furn3_*.ftsl`, mode D on GPU, 3000 spp.
+The rig proves itself first -- mirror **1.0004**, diffuse 1.0 -> **1.0003**, diffuse 0.5 -> **0.5001**
+-- and `F` is measured from a black-body-under-coat case (**0.0401**), not fitted:
+
+| coated body | rendered | predicted `F + (1-F) a_eff` | err |
+|---|---:|---:|---:|
+| white 1.0 | 0.9998 | 1.0000 | **-0.02 %** |
+| grey 0.5 | 0.3159 | 0.3159 | **-0.02 %** |
+
+With the coat's own lobe suppressed (`reflectance manual specular 0.0`) so only `a_eff` acts, a deep
+red body deepens from **R/G 9.01 to 21.76** (2.41x) and darkens to **0.540x** -- the varnish effect
+the old model could not produce. Full write-ups in `design.md` and `REFERENCE.md`.
+
+**Two rigs had to be thrown away first, and both failures were the same mistake.** A furnace built
+from `light area {}` is blind to specular (a MIRROR in it reads exactly 0.0000, because those
+emitters have no hittable surface), and a furnace built as ONE emissive mesh is silently flipped to
+emit outward and renders black -- a real renderer bug, now logged in `known-issues.md` with its
+cause, its true rule (planarity, not closure) and its workaround. In both cases the tell was
+available immediately: a control whose answer is known in advance read something impossible. Run the
+controls before believing the result.
 
 ### A2. Coat absorption (tinted lacquer)
 

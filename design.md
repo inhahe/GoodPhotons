@@ -839,11 +839,62 @@ one Meshy-class material, `metallicFactor 1.0` / `roughnessFactor 1.0` with the 
 metallicRoughness map (mean metalness **0.28** -> dielectric, mean roughness **0.25** -> satin), and
 she imported as chalk in every mode.
 
-**The coat is modelled on the way in and not on the way out** -- no exit interface, so no
-total internal reflection between body and coat and no absorption in the coat layer. The
-planned analytic coated-body model closes that, and the EXPLICIT multi-bounce version is
-deliberately deferred: see known-issues, "the EXPLICIT multi-bounce layered BSDF", which
-records the four conditions that would make it worth building and how to test that they hold.
+**The exit interface: a coated body's effective albedo (0.323.0).** The coat used to be modelled
+on the way IN and not on the way out -- it reflected with probability R, and otherwise the ray
+entered and the body shaded with no exit interface at all. So a clearcoat *diluted* colour (a white
+specular laid over an unchanged body) where a real varnish *deepens* it.
+
+What was missing is that light leaving a Lambertian body meets the coat from inside, and past the
+critical angle (~41.8 deg at n = 1.5 -- most of a cosine-weighted hemisphere) it is thrown back
+down, scatters again and retries. Summing that series in closed form turns the body's albedo into
+
+    a_eff(lambda) = a(lambda) (1 - F_dr) / (1 - a(lambda) F_dr)
+
+with `F_dr` the internal diffuse Fresnel reflectance of the interface (Egan-Hilgeman; 0.5967 at
+n = 1.5), a constant of the index alone. Three properties make this the right shape here:
+
+* **a_eff(1) = 1 exactly**, so a white body under a lossless coat conserves energy exactly;
+* it is **nonlinear in a**, so a saturated body deepens -- the low channel makes more passes through
+  the pigment. This is the varnish effect, and it is what the old model could not produce;
+* it is a property of the **material**, not of a direction, so it needs no BSDF interface change and
+  works in every mode on both backends for free.
+
+Implementation: `Scene::finalizeLayeredCoats` mints a per-stack **copy** of each body material and
+sets `Material::coatFdr` on the copy (so a body shared with an uncoated object is unaffected, and
+re-running it is idempotent). The transform is applied in the albedo funnels -- `diffuseReflectance`
+and `reflectSlot`, and `dReflectSlot` on the device -- *after* texture, record, pattern and
+vertex-colour, so a textured body gets it as surely as a constant one. Entry transmission is already
+carried by the coat/body selection probability, so there is no double count.
+
+Measured in a white furnace (`scraps/furn3_*.ftsl`, camera inside, six single-quad emissive mesh
+blocks). The rig is validated first -- mirror 1.0004, diffuse 1.0 -> 1.0003, diffuse 0.5 -> 0.5001 --
+and `F` is measured from a black-body-under-coat case (0.0401) rather than fitted:
+
+| coated body | rendered | predicted `F + (1-F) a_eff` | err |
+|---|---:|---:|---:|
+| white 1.0 | 0.9998 | 1.0000 | **-0.02 %** |
+| grey 0.5 | 0.3159 | 0.3159 | **-0.02 %** |
+
+and with the coat's own lobe suppressed (`reflectance manual specular 0.0`) so only `a_eff` acts, a
+deep red body deepens from **R/G 9.01 to 21.76** (2.41x) and darkens to 0.540x. A coloured body's
+per-CHANNEL prediction does *not* hold to 0.02 %, and correctly so: `a_eff` is nonlinear and is
+applied per WAVELENGTH, which does not commute with integrating against the CIE curves. The flat
+white and grey cases are the ones where per-channel arithmetic is exact.
+
+**The approximation it makes:** entry is exact and angular (the coat/body split already uses
+R(theta_i) per hit) while the exit is directionally AVERAGED into `F_dr`. So the grazing darkening
+of the exit transmission is not reproduced; the saturation and the energy are. Still absent:
+absorption in the coat layer (A2) and Snell refraction into a directional body (A3). The EXPLICIT
+multi-bounce version remains deliberately deferred: see known-issues, "the EXPLICIT multi-bounce
+layered BSDF", which records the four conditions that would make it worth building and how to test
+that they hold.
+
+**Note on the rig, because it cost two wrong measurements.** A furnace built from `light area {}`
+is **blind to specular** -- those emitters have no hittable surface, so a mirror in the box reads
+exactly 0.0000 -- and a furnace built as one emissive mesh is silently flipped outward and reads
+black. Both are recorded in known-issues; `scraps/furn3_*.ftsl` is the version that works, and it
+carries its three ground-truth controls (mirror, diffuse 1.0, diffuse 0.5) so the rig proves itself
+before any result is read.
 
 **A real coat, once the device could render one (0.317.0).** The import is `layered`: a Fresnel
 interface of index `ior` over the diffuse body, sharing the roughness and normal maps. That gives
