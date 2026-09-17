@@ -167,8 +167,16 @@ unguided path untouched. FTSL §8.7 "Guided grooms".
       +x, the opposite of the gallery's siting note; the face zone uses the measured sign. After
       the fix the gallery culls 1703 strands to the harness's 1720, and the close-up shows the
       hair on her head, face clear, side part, blonde matching (`gallery_alice_check2.png`).
-- NEXT: the full gallery still in mode M at flyby settings (visibility at 0.762 m; the hair's
-  mode-M noise at that scale); then the user's call on the look.
+  15. The gallery still in mode M at flyby settings (`gallery_still_modeM.png`): she IS visible at
+      0.762 m -- far right on her plinth, ~45 px tall, a blonde doll with no visible speckle after
+      the denoiser; the compote below her at the right proportion. COST, paired on the same frame:
+      **522 s with the hair vs 112 s without (4.7x)**. Not the photon trace (both ~1 s a chunk):
+      the camera pass runs ~17 s/spp against ~4, because a camera path that enters the hair mass
+      bounces strand to strand (the fiber BCSDF is glossy, so the gather does not land) before it
+      reaches a diffuse surface. On a 1147-frame flyby that is ~33 h -> ~166 h.
+- NEXT (the user's call): accept the cost; or cut it -- `points 5  segments 1` (a third of the
+  segments), fewer strands, a mode-M cap on strand-to-strand bounces (a renderer change), or hair
+  only in the frames that come near her. And the look itself.
 
 ---
 
