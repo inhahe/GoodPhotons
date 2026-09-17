@@ -18098,6 +18098,7 @@ static void printHelp(const char* prog) {
 "  -scene <name>         built-in demo scene (default: cornell)\n"
 "  -light <name>         built-in light preset (default: bb6500)\n"
 "  -camera <sel>         pick FTSL camera(s): <name>|<pathbase>|all|#N|near=X,Y,Z\n"
+"  -frames <A> <B>       with -camera <pathbase>: only the frames numbered A..B (inclusive), to resume or split a run\n"
 "  -view EX,EY,EZ/LX,LY,LZ[/FOV]   ad-hoc eye/look-at[/fovY] camera; renders just it\n"
 "  -exposure|-ev <c>     override every camera's exposure compensation\n"
 "  -exposure-lock        one shared auto-exposure anchor across all rendered cameras\n"
@@ -18637,6 +18638,7 @@ static int run(int argc, char** argv) {
     bool noMedia = false, noEnv = false, noFluoro = false, directOnly = false;
     int  maxBounceOverride = -1;
     const char* cameraSel = nullptr; // -camera <name>|<pathbase>|all|#N|near=X,Y,Z (FTSL multi-camera select)
+    long long framesLo = -1, framesHi = -1;   // -frames A B: with -camera <pathbase>, only frames numbered A..B
     bool   haveView = false;         // -view: an ad-hoc CLI camera (renders/previews just it)
     Vec3   viewEye{0,0,0}, viewLook{0,0,0}, viewUp{0,1,0};
     double viewFov = 40.0;
@@ -19318,6 +19320,10 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-herosplit")) hero::gSplit = true;
         else if ((!std::strcmp(argv[i], "-exposure") || !std::strcmp(argv[i], "-ev")) && i + 1 < argc) exposureCli = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-camera") && i + 1 < argc) cameraSel = argv[++i];
+        else if (!std::strcmp(argv[i], "-frames") && i + 2 < argc) {
+            framesLo = std::atoll(argv[++i]); framesHi = std::atoll(argv[++i]);
+            if (framesLo < 0 || framesHi < framesLo) { std::fprintf(stderr, "error: -frames needs A B with 0 <= A <= B\n"); return 1; }
+        }
         else if (!std::strcmp(argv[i], "-view") && i + 1 < argc) {
             // Ad-hoc preview/render camera: EX,EY,EZ/LX,LY,LZ[/FOV] (',' and '/'
             // are interchangeable separators). Renders and previews just this
@@ -20568,6 +20574,25 @@ static int run(int argc, char** argv) {
                                 if (!std::isdigit((unsigned char)cs.name[k])) { allDigits = false; break; }
                             if (allDigits) sel.push_back(&cs);
                         }
+                    }
+                    // -frames A B: keep only the frames whose number (the digits after the
+                    // base name) lies in A..B -- a stopped run resumes at the frame it died
+                    // on, a long one splits across sessions. The names are the authored
+                    // ones, so `-frames 642 699` of `fly` is fly0642..fly0699 exactly.
+                    if (!sel.empty() && framesLo >= 0) {
+                        std::vector<const ftsl::CamSpec*> kept;
+                        for (const ftsl::CamSpec* cs : sel) {
+                            const long long n = std::atoll(cs->name.c_str() + q.size());
+                            if (n >= framesLo && n <= framesHi) kept.push_back(cs);
+                        }
+                        if (kept.empty()) {
+                            std::fprintf(stderr, "[camera] -frames %lld %lld selects nothing from path '%s' (%zu frames, %s..%s)\n",
+                                         framesLo, framesHi, q.c_str(), sel.size(), sel.front()->name.c_str(), sel.back()->name.c_str());
+                            return 1;
+                        }
+                        std::printf("[camera] -frames %lld %lld -> %zu of the path's %zu frames (%s..%s)\n",
+                                    framesLo, framesHi, kept.size(), sel.size(), kept.front()->name.c_str(), kept.back()->name.c_str());
+                        sel.swap(kept);
                     }
                     if (!sel.empty()) {
                         // Resolve the flyby's playback fps hint (per-camera, else scene

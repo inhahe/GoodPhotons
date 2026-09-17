@@ -333,7 +333,12 @@ diffuse surface. 1147 frames: ~33 h -> ~166 h. Levers, cheapest first, each MEAS
   scene. The device forward tracer already runs hair (the deposit pass), so the sampler exists.
   **BUILT (0.335.0, `scraps/gpu_hair.py`).** GPU vs CPU on a head-filling view: luminance ratio
   1.05-1.09, hue within 5-7 deg, per-pixel diff at the frames' noise level -- the device offset the
-  base shows too, nothing hair-specific. The gallery still with strands at 20 M photons: 5.75 s per
+  base shows too, nothing hair-specific. **The filter for the flyby, measured on the GPU base at
+  20 M** (`scraps/_a1/compare_dn.py`): `-denoise -fireflies 3 -denoise-levels 2` keeps the hue
+  (54.0 -> 53.2 deg), +4 % luminance, chroma speckle 10.4 -> 4.7; `-denoise-levels 1` and
+  `-denoise-chroma 1` shift the hue to 33 deg (worse) -- so the recipe is levels 2, not the default
+  3 (the earlier "bleed to 74 deg" was the 2 M map's own colour as much as the filter). The
+  gallery still with strands at 20 M photons: 5.75 s per
   spp on the GPU -> ~2.3 min a 24-spp frame -> **~44 h for 1147 frames** (was ~97 h on the CPU).
   Its hair reads luminance 81, hue 71 deg (CPU+NEE 85 / 55, D 97 / 58).
   **The fold's per-lobe form -- BUILT (0.336.0)** in three steps, each proven equal to the last
@@ -411,11 +416,18 @@ frame currently renders in ~96 s.
   600-frame mode-M flyby cannot start"). The verified showcase command died in the film allocation.
   That entry has the exact command and the diagnosis; the flyby is now *1147* frames rather than
   600, so the allocation is larger, not smaller.
+  **Re-read 2026-09-17: the film allocation it died in no longer exists on the GPU path** -- the
+  shared mode-M device render hands each frame to the host through `onFrame` and releases it
+  (main.cpp ~24725: "a flythrough runs in one frame of host RAM"), so the run holds one 960x540
+  film plus the photon map (~1 GB at 20 M photons), not 1147 films. The commit charge of other
+  processes on the machine is still what it is; check `commit available` before launching.
 - **A mode-M GPU gather can die with `unspecified launch failure` under concurrent GPU load — and
   the batch carries on as if it had not** (logged 2026-09-16). On a 1147-frame run that silently
   produces a hole in the sequence. Decide how the run detects this *before* starting it.
-- **There is no `-frames A B`**, so a run that dies cannot be resumed at the frame it died on
-  (item 7).
+- ~~There is no `-frames A B`~~ **Built (0.337.0)**: `-camera fly -frames A B` resumes at any frame.
+- The "batch carried on" half of the launch-failure entry is the chain's, not ftrace's: a failed
+  kernel exits 1 with `[cuda] ... kernel failed: ...` as the last line (`cudaCheckKernel`); a
+  chain that checks exit codes and re-runs `-frames N end` recovers the sequence.
 
 **Before launching:** render a handful of scattered frames (`-camera fly0000`, `fly0400`, `fly0555`,
 `fly1146`) at final settings and look at them. Cheap insurance against discovering a framing or
@@ -498,12 +510,13 @@ FLAT spectrum, taking the scalar fast path (i.e. pre-fix behaviour exactly), is 
 The cost is that scene's heterogeneous medium, not the spectral vector. What is missing is a **cheap
 scene** that exercises the tier, not a redesign.
 
-## 7. No CLI flag renders a RANGE of a `camera_curve` (logged 2026-09-02, partly stale)
+## 7. DONE (0.337.0): `-frames A B` renders a RANGE of a `camera_curve`
 
 **Correction found 2026-09-17:** a single frame *can* be selected — the curve's frames are ordinary
 named cameras, so `-camera fly0555` works. (`-frame N`, `-camera fly#555` and `-res` do not exist;
-the flag is `-r W H`.) The entry should be narrowed to what is genuinely missing: a **range**
-(`-frames A B`), which is what would let a stopped flyby resume at the frame it died on — see item 1.
+the flag is `-r W H`.) The range is built: `-camera fly -frames 642 699` keeps only the frames
+whose number lies in 642..699 (an empty selection is an error naming the path's range). Tested on
+gallery_rain's `fly`: frames 5..7 render three files; 2000..2100 refuses.
 
 ## 8. BLOCKED: the paired-timing rule into `CLAUDE.md`
 

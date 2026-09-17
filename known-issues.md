@@ -4009,6 +4009,10 @@ fixing, in order of value:
    chain (or a human) can see it without diffing directory listings. Whether it currently
    exits non-zero at all is unverified; the bash chain ignored exit codes, which is my fault
    and now fixed in the scratch chain (each group's log is grepped for `kernel failed`).
+   **Verified 2026-09-17:** it does -- `cudaCheckKernel` prints `[cuda] <kernel> kernel failed:
+   <reason>` and calls `std::exit(EXIT_FAILURE)`, so the process ends with code 1 and that line
+   last. The batch carried on because the chain ignored exit codes. With `-frames A B` (0.337.0)
+   a chain that checks them re-runs `-camera fly -frames <died> <end>` off the same map.
 2. **Recover rather than die.** A gather losing its context mid-frame could re-create the
    context, re-upload the banked map and resume from the last completed spp — the checkpoint
    machinery for that already exists on the CPU side.
