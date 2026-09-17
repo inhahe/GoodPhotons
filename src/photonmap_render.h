@@ -1633,7 +1633,26 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 if (!(pdfH > 0.0) || !(fv > 0.0)) return L;
                 const double cosLong =
                     hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
-                thr *= clamp01(fv * cosLong / pdfH);       // == T = sum_p A_p
+                const double wCam = clamp01(fv * cosLong / pdfH);   // == T = sum_p A_p
+                thr *= wCam;
+                // SPECGATHER (0.333.0): the fiber's transmission is the most coloured factor a
+                // camera walk meets -- a blonde fiber absorbs blue and green -- and until now the
+                // walk folded it in at the camera's wavelength ALONE, so every photon of every
+                // wavelength was scaled by one wavelength's attenuation: coloured speckle per
+                // sample, and in expectation a flat AVERAGE transmission that greys the hair's
+                // multiple-scatter colour. The sampled direction and its pdf are fixed by the
+                // sample; only the BCSDF value moves with the absorption, so the same sample's
+                // weight is evaluated at every grid wavelength (hairShadeAt inverts the
+                // authored reflectance at that wavelength) and each photon is reweighted at ITS
+                // wavelength, exactly as coloured glass and media already are (see SpecThr).
+                // FTRACE_HAIR_SPECGATHER=0 turns the fold off (the scalar path of 0.332.0), for
+                // paired A/B measurements only -- read once per process.
+                static const bool hairSpecOn = [] { const char* e = std::getenv("FTRACE_HAIR_SPECGATHER"); return !(e && e[0] == '0'); }();
+                if (hairSpecOn)
+                    sthr.mul([&](double lamK) {
+                        const HairShade hk = hairShadeAt(scene, m, h, lamK, wPrev);
+                        return clamp01(hair::f(hk.b, hk.woLocal, wl) * cosLong / pdfH);
+                    }, wCam);
                 const Vec3 wo = hair::toWorld(hs.fr, wl);
                 ray = Ray{h.p + wo * hairExitOffset(hs, h.n, wo), wo};
                 break;

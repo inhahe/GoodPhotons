@@ -4599,6 +4599,17 @@ Two design points carry the safety:
   constant, which cancels in the ratio regardless, so every uncoloured material in a scene costs
   three lookups rather than 24 and flat scenes are unchanged.
 
+**Hair joined the fold in 0.333.0.** The `MatType::Hair` case of `photonGather` had kept the
+scalar path, and a walk through a blonde hair mass is the worst case of the bias above: up to 32
+fiber bounces, each strongly coloured (blonde absorbs blue and green), all applied at the camera's
+wavelength alone. On the gallery still over a grey floor (`scraps/_a1/`, her hair's 28x27 px) the
+strands read hue 64 deg against the molded base's 43 deg; with the fold, 54 deg -- half the gap
+closed, the rest is the fiber material. The coloured speckle did NOT move (chroma-speckle 8.95 ->
+8.74, the base's floor 5.1): that is photon starvation under the mass (see the mode-M hair entry in
+TODO.md 0.5 C). Still scalar: `photonGatherSub`, the Jensen final-gather sub-walk (`-fg`), which
+carries no `SpecThr` at all -- a coloured specular chain seen through a final gather is still
+biased there. `FTRACE_HAIR_SPECGATHER=0` restores the scalar hair fold for paired A/B runs.
+
 **Measured** (Cornell control, centre sphere swapped, mode M / mode D, GPU 256 spp; the CPU agrees):
 
 | glossy sphere | before | after |

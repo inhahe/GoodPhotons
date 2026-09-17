@@ -192,6 +192,17 @@ green grid light through the mass, and rare strand-to-strand paths make fireflie
   1. Diagnose the green: render her in the hall over a grey floor; if the cast goes, it is the
      grid's light through the fibers and the fix is the fiber material (more absorption in the
      green -- the TT lobe's colour is the `reflect` inverted), not the lighting.
+     **MEASURED (2026-09-17, `scraps/_a1/`, `png/alicehair/a1_compare.png`)**: the same still with
+     the grid floor swapped for grey diffuse 0.5 (everything else the same: mode M, 2 M photons,
+     24 spp, 960x540; ROI = her hair, x 852..879 y 281..307). Over the GRID: strands mean RGB
+     (63, 72, 46), hue 79 deg, vs the molded base (95, 76, 60), hue 27 deg -- olive and a third
+     darker. Over GREY: strands (111, 113, 88), hue 64 deg, vs base (115, 108, 91), hue 43 deg --
+     the same brightness, a 21 deg residual toward yellow-green. So ~60% of the hue gap and ALL
+     of the darkness is the grid's low green light forward-scattered through the mass (the
+     molded surface reflects it as orange); the residual 21 deg is the fiber material (its
+     transmission is greener than its reflection) and is what a `reflect` / absorption tweak on a
+     fiber ball under neutral light would calibrate (B). The coloured speckle that remains over
+     grey is mode M's few-photon gather at fibers (C), not the material.
   2. Fireflies: Russian roulette after N strand-to-strand bounces (continue with probability p,
      weight 1/p). UNBIASED, so no darkening; expected cost falls; variance rises. A hard cap is
      NOT acceptable: light hair IS multiple scattering, and a cap darkens the body of the mass
@@ -209,6 +220,25 @@ hair, spectral bins); the harness frame cost 510 s vs ~40 s in mode R. Candidate
 cost: more photons + the denoiser (cheap, may suffice at flyby scale); gather AT the fiber hit
 instead of continuing through it (a change to mode M's rule for hair hits -- read that path
 first); the aggregate-medium tier is backward-only today and would need a mode-M twin.
+  **READ AND MEASURED (2026-09-17).** Mode M never gathers at a fiber: the Hair case of
+  `photonGather` samples the BCSDF and continues (up to 32 bounces) until a diffuse hit gathers.
+  Two things followed. (1) The walk is MONOCHROMATIC and the hair factor was folded into the
+  scalar `thr` only -- the SPECGATHER bias at its worst. Fixed in 0.333.0 (the Hair case folds
+  into `SpecThr`): hue 64 -> 54 deg vs the base's 43 over grey; the speckle did not move (8.95 ->
+  8.74 chroma-speckle, base floor 5.1) so it is not the camera wavelength. (2) The speckle is
+  therefore the density estimate at the surfaces UNDER the mass, which few photons reach: the
+  next test is photons x10 (`-n 20000000`, the photon pass costs ~1 s per 2 M) -- if the speckle
+  falls toward the floor, C's answer is "more photons", and the map is built once per flyby.
+  **x10 photons: no** (8.74 -> 8.10; and the mean shifted +11 % brighter, hue 54 -> 33 deg: the
+  per-query gather sharpens its radius with population, a kernel bias that moves with `-n` --
+  not a speckle lever). What is left is the walk's own path variance: every camera sample exits
+  the mass somewhere else and gathers a different surface, and the multiple-scatter transmission
+  is steep across wavelength, so a pixel's colour at 24 spp is a few effective spectral samples.
+  Levers that address THAT: spp, and the chroma denoiser (`-denoise`, made for single-lambda
+  speckle) with `-fireflies k` for the isolated dots. Both being measured on the grey still.
+  **The fold's cost, paired** (harness, hair fills the 960x540 frame, 8 spp, ON/OFF twice,
+  first run discarded): camera pass 6.7 s with the fold vs 5.6-5.9 s without, ~+15 % on hair
+  pixels; at flyby scale hair is a few % of the frame, so the fold is free there.
 
 **D. Flyby cost.** Paired on the still: 522 s with hair vs 112 s without (4.7x); the camera pass
 (~17 s/spp vs ~4) because a path entering the mass bounces strand to strand before it lands on a

@@ -1021,6 +1021,22 @@ into `thr`**, not re-sampled from the grid — that is what makes `thr * ratio` 
 agreeing one as constant, so uncoloured materials cost three lookups rather than 24 and flat scenes
 are unchanged. Cost measured at +4 % on a gallery_rain frame.
 
+**Hair (0.333.0).** The fiber BCSDF is the most coloured factor a camera walk meets -- a blonde
+fiber absorbs blue and green -- and its case in `photonGather` multiplied only the scalar `thr`,
+so a walk through a hair mass (up to 32 fiber bounces before a diffuse gather) scaled every
+photon of every wavelength by ONE wavelength's attenuation: coloured speckle per sample, and in
+expectation the flat AVERAGE transmission, which greys the hair's multiple-scatter colour. The
+Hair case now folds the same sample's weight into `SpecThr`: the sampled direction and its pdf
+are fixed by the sample, only the BCSDF value moves with the absorption, so the weight is
+re-evaluated at each grid wavelength (`hairShadeAt` inverts the authored reflectance at that
+wavelength, `hair::f` at the same pair of directions) and each photon is reweighted at its own.
+Measured on the gallery still over a grey floor (mode M, 2 M photons, 24 spp, her hair's 28x27 px):
+the strands' hue moved from 64 deg to 54 deg against the molded base's 43 deg (G/R 1.014 ->
+0.972, base 0.941) -- the residual colour gap halved -- while the chroma speckle stayed (8.95 ->
+8.74 against the base's 5.1): the speckle is the gather's photon starvation under the mass, not the
+camera wavelength. `photonGatherSub` (the final-gather sub-walk) carries no `SpecThr` and keeps the
+scalar fold. `FTRACE_HAIR_SPECGATHER=0` disables the fold for paired measurements.
+
 **Curves of curves (0.326.0).** `ftsl.h addCurve` is now recursive (`flattenCurveNode`): a
 `curve` node's children are `point`s (a strand, unchanged) or `curve`s (inline or by name), and a
 node of curves flattens to instances placed along the Catmull-Rom through its children's roots
