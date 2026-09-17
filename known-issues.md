@@ -4435,16 +4435,23 @@ layered dielectric child. Not built; this is the most likely remaining differenc
 
 ### DEFERRED, WITH A TRIGGER (2026-09-16): the EXPLICIT multi-bounce layered BSDF — what would have to be true before it is worth building
 
-**Where the coat model stands.** `MatType::Layered` is a coat interface over body lobes: the coat
-reflects with probability R (Fresnel / thin-film / manual) and otherwise the ray enters and a body
-lobe shades. **The coat is modelled on the way IN and not on the way OUT** — there is no exit
-interface, so no total internal reflection between body and coat, and no absorption inside the coat
-layer. The planned fix (NOT built as of 0.318.0) is the *analytic* coated-body model: entry and
-exit Fresnel transmission, `1 / (1 - albedo * F_dr)` for the internal multiple reflections
-(`F_dr ~ 0.596` at n = 1.5 is a constant of the index alone, so the constant part can be baked into
-the body's reflectance at scene-build time), and Beer-Lambert along the refracted path for a tinted
-coat. That keeps **one lobe per vertex**, which is the property that lets a layered material render
-in every mode on both backends from a single definition.
+**Where the coat model stands (updated 0.324.0 — the analytic model is now BUILT).**
+`MatType::Layered` is a coat interface over body lobes: the coat reflects with probability R
+(Fresnel / thin-film / manual) and otherwise the ray enters and a body lobe shades. The analytic
+coated-body model that this entry described as planned now exists:
+
+* **0.323.0 — the exit interface.** The body's albedo becomes `a (1 - F_dr) / (1 - a F_dr)`, the
+  internal multiple reflections summed in closed form. Exactly 1 at `a = 1`.
+* **0.324.0 — absorption in the layer.** `coat { absorb <spectrum> depth <metres> }`, Beer-Lambert
+  on the way in, on the way out, and on every internal round trip.
+
+Both are baked into a per-stack body copy at scene-build time, so they keep **one lobe per vertex**
+— the property that lets a layered material render in every mode on both backends from a single
+definition. Measured against a white furnace: white body 0.9998 vs 1.0000 predicted, grey 0.5 body
+0.3159 vs 0.3159, absorbing coat 0.3475 vs 0.3476.
+
+**What is still missing is exactly item 2 of the trigger below, and it has now FIRED — with
+numbers.** See "the trigger has fired" at the end of this entry.
 
 **Why the explicit version is not the plan.** Tracing the bounces inside the coat for real is not
 blocked by refactoring effort, and it is not blocked by speed — the expected number of internal
@@ -4475,6 +4482,7 @@ not before:**
 2. **A directional body under the coat** — `glossy`, anisotropic, or another stack. Refraction then
    genuinely bends and compresses the body's lobe, which the transmission factors cannot express.
    This is the case with the clearest visual payoff: clearcoat over metallic flake.
+   **THIS ONE HAS FIRED (2026-09-17). Measured; see the end of this entry.**
 3. **A thick or strongly absorbing coat**, where what matters is the DISTRIBUTION of internal path
    lengths rather than one refracted path — i.e. where `exp(-sigma d (1/cos_i + 1/cos_o))` visibly
    disagrees with a reference.
@@ -4494,6 +4502,73 @@ rough interfaces. Budget for the MIS question up front -- either accept approxim
 `D`/`J`/`U` and SAY SO in the docs and here, or keep the analytic model as those modes' definition
 and accept two definitions with a measured statement of how far apart they are. Do not discover
 that choice halfway through.
+
+---
+
+#### THE TRIGGER HAS FIRED on item 2 (2026-09-17), and a narrowing I had planned is RETRACTED
+
+Item A3 of `TODO.md` was "Snell into the body (directional bodies)", and it carried an instruction to
+*narrow* item 2 above from "a directional body under the coat" to "a directional body under a ROUGH
+coat", on the reasoning that under a smooth coat refraction is a deterministic bijection with an
+analytic Jacobian, so MIS would stay exact. **That narrowing is wrong and is withdrawn.** The
+bijection argument is correct as far as it goes; it simply is not the binding constraint.
+
+**First, an exact result that reframes what A3 even is.** Refract into the coat, reflect off a body
+whose microfacet normal IS the coat's normal, refract back out:
+
+    sin t_t = sin t_i / n  ->  mirror about n (polar angle unchanged)  ->  sin t_out = n sin t_t = sin t_i
+
+The outgoing direction is exactly the mirror of the incoming one — **identical to not refracting at
+all. Snell in-and-out of a SMOOTH body is the identity.** So A3 is not "the coat bends the light".
+It is specifically about the mismatch between the body's MICROFACET normal and the coat's normal,
+which exists only for a ROUGH body — and a rough body is exactly the case where part of its lobe
+lands beyond the critical angle and is trapped by total internal reflection, which has no closed
+form. **The refraction effect and the TIR problem are co-extensive; you cannot take one without the
+other.** Coat roughness never enters the argument, which is why narrowing by it was a mistake.
+
+**Second, the size of the error, measured.** `scraps/a3_snell.py` brute-forces the real layered
+system (refract in, bounce on a GGX body, escape if inside the critical cone else TIR back down and
+bounce again, to convergence) and compares it with what ftrace renders today. Smooth coat n = 1.5:
+
+| body | incident | directional albedo, truth / model | escaping lobe width, truth / model |
+|---|---|---|---|
+| a 0.9, alpha 0.05 | 0 deg | 0.8896 / 0.7906 **-11.1 %** | 0.0889 / 0.0649 **-26.9 %** |
+| a 0.9, alpha 0.05 | 45 deg | 0.8707 / 0.7917 **-9.1 %** | 0.1393 / 0.0919 **-34.0 %** |
+| a 0.9, alpha 0.50 | 0 deg | 0.4429 / 0.5574 **+25.8 %** | 0.2183 / 0.2328 +6.7 % |
+| a 0.5, alpha 0.05 | 0 deg | 0.5023 / 0.3151 **-37.3 %** | 0.0809 / 0.0641 -20.8 % |
+| a 0.5, alpha 0.20 | 0 deg | 0.4147 / 0.3014 **-27.3 %** | 0.1859 / 0.1768 -4.9 % |
+
+Up to **37 % in energy and 35 % in lobe width** — far past the "a few percent" this entry set as the
+bar. Clearcoat over metallic flake is the canonical case, and it is also what a glTF import produces
+from a metallic body under a dielectric coat, so it is not hypothetical.
+
+**Two controls were run first, and both pass**, because the claim is worthless otherwise:
+
+* **n = 1.0, i.e. no coat at all.** Truth and model must then be identical. Worst deviation over the
+  whole grid: **0.13 %**. So the machinery agrees with itself and the differences above are the coat.
+* **A LAMBERTIAN body under a real coat** — the case `a_eff` was derived for. Worst deviation
+  **0.23 %**, independently confirming 0.323.0's derivation. Better still, this pure-Python model
+  predicts **0.3159** for a 0.5-albedo body, which is exactly what ftrace *renders* in the furnace.
+
+So the departure is attributable to DIRECTIONALITY specifically, not to the coat model in general.
+
+**Third, there is no cheap fudge, and the measurement is what rules it out.** The obvious shortcut is
+to leave the directions alone and just widen or narrow the body's roughness. It cannot work: **the
+lobe-width error changes SIGN with roughness** — the model is 27-34 % too NARROW at alpha 0.05 and
+7-10 % too WIDE at alpha 0.5. Multiple internal bounces spread the lobe while refraction compresses
+it, and which wins depends on the roughness. No single roughness scale can fix both ends.
+
+**Why it is still not built here.** A bounded internal loop would preserve one lobe per vertex when
+SAMPLING — that part is fine. What has no closed form is `f(wi, wo)` and `pdf(wo | wi)`, which NEE
+needs at every shading point and which BDPT/VCM need at every vertex. That is the stochastic-
+evaluation BSDF interface described above, and it is a real piece of architecture rather than a
+patch. The trigger's own instruction applies: the choice about MIS weights has to be made up front,
+not halfway through.
+
+**So the state is: trigger fired, size measured, design named, not yet built.** That is the outcome
+TODO.md's A3 explicitly asked for if the Jacobian could not be made consistent — "stop, and record
+it against the trigger rather than forcing it."
+
 
 ### FIXED (2026-09-16, v0.321.0): mode M applied a specular/glossy bounce's reflectance at the CAMERA's wavelength to photons gathered at their own — any coloured mirror or glossy was mis-coloured, by up to 14 %, in either direction
 

@@ -35,7 +35,9 @@ needed is a cheap scene that exercises that tier, not a redesign.
 
 ## A. The analytic coated-body model — TIR saturation, coat absorption, Snell
 
-**Status: A1 DONE (v0.323.0), A2 DONE (v0.324.0). A3 not started.**
+**Status: A1 DONE (v0.323.0), A2 DONE (v0.324.0). A3 analysed and deliberately NOT built
+-- it is inseparable from the deferred explicit multi-bounce BSDF, whose trigger it has
+fired with measured numbers. See below and `known-issues.md`.**
 
 Today `MatType::Layered` models the coat **on the way in and not on the way out**: the coat reflects
 with probability R and otherwise the ray enters and a body lobe shades. There is no exit interface,
@@ -113,37 +115,47 @@ incident hemisphere into the escape cone, so the entry secant only ranges 1.0 ..
 34 % swing in path length, against a tint that is the entire visual point, and with the coat's real
 silhouette cue (R(theta) -> 1 at grazing) already exact.
 
-### A3. Snell into the body (directional bodies)
+### A3. Snell into the body -- **ANALYSED; NOT BUILT, and that is the finding**
 
-For a **Lambertian** body this changes nothing beyond the transmission factors already in A1 — a
-Lambertian scatters `albedo/pi` regardless of the direction the refracted ray arrives from. It
-matters for a **directional** body: glossy or anisotropic under a coat, where refraction bends and
-compresses the lobe.
+A3 asked for Snell refraction into the body, plus a narrowing of the deferred-BSDF trigger from "a
+directional body under the coat" to "a directional body under a ROUGH coat". **The narrowing is
+retracted, the trigger has FIRED instead, and the full write-up with numbers is in
+`known-issues.md`.** In short:
 
-**A correction to make to the trigger entry in `known-issues.md` while doing this:** that entry
-lists "a directional body under the coat" as a trigger for the explicit multi-bounce BSDF. That is
-too broad. Under a **smooth** coat, refraction is a deterministic bijection with an analytic
-Jacobian (`dw_t/dw_o`), so the pdf transforms in closed form and MIS stays exact — a directional
-body is tractable analytically. It is a **rough** coat that breaks the closed form. Narrow the
-trigger to "a directional body under a ROUGH coat" once A3 is proven.
+**1. An exact result reframes what A3 is.** Refract in, reflect off a body whose microfacet normal
+IS the coat's normal, refract out: `sin t_out = n sin t_t = sin t_i`. The result is exactly the
+mirror of the incoming direction -- **Snell in-and-out of a SMOOTH body is the identity.** So A3 is
+not "the coat bends the light"; it is about the mismatch between the body's MICROFACET normal and
+the coat's, which exists only for a ROUGH body. That is precisely the case where part of the lobe
+lands past the critical angle and is trapped by TIR, which has no closed form. The refraction effect
+and the TIR problem are co-extensive. Coat roughness never enters the argument, which is why
+narrowing by it was wrong.
 
-If the Jacobian cannot be made consistent within one-lobe-per-vertex, **stop, and record it against
-the trigger rather than forcing it** — that is what the trigger is for.
+**2. The error is large and was measured** (`scraps/a3_snell.py`, brute-forcing the real layered
+system against what ftrace renders today): up to **-37 % in directional albedo and -34 % in lobe
+width** on a glossy body under a smooth coat. The bar the trigger set was "a few percent".
 
-### Validation for A (all of it)
+**3. Both controls pass**, so that number means what it says: with **n = 1.0** (no coat) truth and
+model agree to **0.13 %**, and for a **Lambertian** body under a real coat they agree to **0.23 %**
+-- which independently confirms A1's derivation, and whose 0.5-albedo prediction of 0.3159 is
+exactly what ftrace *renders* in the furnace.
 
-- **White furnace, enclosed, camera INSIDE the box** (`scraps/furnace.ftsl`; an earlier version put
-  the camera outside and a 1.0-albedo and a 0.5-albedo sphere rendered byte-identical — run the rig
-  check every time). A white body under a lossless coat must read **exactly 1.000** against the
-  walls at every roughness and every index. This is the energy-conservation test A1 lives or dies by.
-- **Identity tests** (`scraps/ident_*.ftsl`, one sphere, fixed position, only the material swapped):
-  a coat at `specular 0.0` must still equal the bare body; a coat at `specular 1.0` must still equal
-  a plain glossy of the same roughness (both currently hold at 1.0001 / 0.9999 in mode D).
-- **Cross-mode**: modes M, D, R agree on the coated sphere in the Cornell box to ~1 %.
-- **Never measure reflection in an open scene.** See the retraction in `known-issues.md`.
-- Docs in the same commit: `FTSL.md` (the `coat` block grammar), `REFERENCE.md`, `design.md`.
+**4. No cheap fudge exists.** "Just scale the body's roughness" cannot work: the lobe-width error
+**changes sign** with roughness (27-34 % too narrow at alpha 0.05, 7-10 % too wide at alpha 0.5),
+because internal bounces spread the lobe while refraction compresses it.
 
----
+**Why it is not built:** sampling could keep one lobe per vertex with a bounded internal loop, but
+`f(wi,wo)` and `pdf(wo|wi)` have no closed form, and NEE needs the first at every shading point
+while BDPT/VCM need both at every vertex. That is the stochastic-evaluation BSDF (Guo/Hasan/Zhao
+2018) already named in the trigger -- real architecture, with an MIS decision to make up front.
+
+This is exactly the outcome this item asked for in that case: *"If the Jacobian cannot be made
+consistent within one-lobe-per-vertex, stop, and record it against the trigger rather than forcing
+it -- that is what the trigger is for."*
+
+**Next, if it is picked up:** build the brute-force reference IN THE RENDERER (mode R or A/B/C with
+the coat traced explicitly, which needs no MIS pdf), in an enclosure, and confirm the Python numbers
+above end to end before committing to the architecture.
 
 ## Standing constraints (so a fresh session does not have to be told)
 
