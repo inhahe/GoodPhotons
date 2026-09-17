@@ -2292,6 +2292,24 @@ hidden flats so you can still see where they are — the usual viewport conventi
 
 ---
 
+### 11.x A sun's `spd` is ABSOLUTE — mind the Planckian presets
+
+A `light sun` takes its `spd` as perpendicular irradiance in W/m²/nm, and `blackbody <K>` /
+`preset:bb<K>` / `preset:d65` (which *is* `blackbody 6504`) are absolute Planck radiance of order
+**10¹³** — so `spd preset:d65 intensity 90` is a sun 10¹⁴ times the real one. Auto-exposure hides a
+uniform scale completely (every render looks normal), which is exactly why it went unnoticed; an
+absolute exposure, a `-hdr` readout, or thin fibers (spectral speckle pinned to the maximum) show
+it at once. Author it the way `scenes/gallery_rain.ftsl` does:
+
+```
+light sun { dir -0.2 0.34 0.92   angle 0.53   spd blackbody 5800   intensity 9.2649e-14 }   # ~1000 W/m²
+```
+
+Since 0.328.0 the loader integrates the irradiance over the band and prints
+`[ftsl] warning: sun light's irradiance integrates to … W/m^2 -- N times the real sun` above
+10⁵ W/m² (a hundred suns), naming the fix. `power`/`lumens` lights are unaffected: their SPD is
+renormalised by the power law.
+
 ## 12. `medium` — participating volume
 
 ```

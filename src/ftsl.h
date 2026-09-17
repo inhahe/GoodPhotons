@@ -6618,6 +6618,22 @@ private:
             double inten = dblOf(b, "intensity", 1.0);
             Spectrum irr = (inten == 1.0) ? spd
                                           : Spectrum([spd, inten](double w) { return spd(w) * inten; });
+            // GUARD. A sun's `spd` is ABSOLUTE perpendicular irradiance, and the Planckian
+            // presets (`preset:d65` is `blackbody 6504`) are absolute spectral radiance of
+            // order 1e13 -- so `spd preset:d65 intensity 90` is a sun 1e14 times the real one.
+            // Auto-exposure hides a uniform scale completely, which is how such a sun sat in
+            // the quick-view scene through 0.327.0; it only showed when thin fibers turned the
+            // scale into visible spectral speckle. Warn at a hundred suns: loud, not fatal.
+            {
+                double E = 0.0;
+                for (double w = 360.0; w <= 830.0; w += 1.0) E += irr(w);
+                if (E > 1.0e5)
+                    std::fprintf(stderr, "[ftsl] warning: sun light's irradiance integrates to %.3g W/m^2 -- "
+                                         "%.0f times the real sun (~1000). A Planckian `spd` (`blackbody`, "
+                                         "`preset:d65`, `preset:bb<K>`) is ABSOLUTE radiance of order 1e13, so it "
+                                         "wants an `intensity` near 1e-13, not %g. Auto-exposure will hide this; "
+                                         "an absolute exposure will not.\n", E, E / 1000.0, inten);
+            }
             L.scene.addSunLight(normalize(xf.applyDir(dir)), halfAng, irr, binWidth_);
             return true;
         }

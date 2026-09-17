@@ -27045,6 +27045,28 @@ that uses one raises `unsupported .ftsl element: 'include_decl'`. loom never *em
 so nothing loom writes is affected; it only means a hand-authored scene with an `include` cannot
 be round-tripped through loom's editor until that grammar gains the same rule.
 
+## FIXED (2026-09-17, v0.328.0): the quick-view key light was a sun 1e14 times the real one, hidden by auto-exposure since it was added
+
+`ftrace <model.glb>`'s generated scene gained a studio key in 0.31x (`light sun { … spd preset:d65
+intensity 90 }`) so an imported coat could show a highlight. `preset:d65` is `spd blackbody 6504`
+-- absolute Planck radiance, ~1e13 W/m^2/sr/nm -- and a `light sun` takes its `spd` as absolute
+irradiance, so that key integrated to ~1e15 W/m^2. Nobody saw it because **auto-exposure removes a
+uniform scale exactly**; every quick view looked right.
+
+**How it surfaced, and what it was mistaken for first.** Alice's first guided groom rendered as
+rainbow speckle with `auto-exposure=4.5e-16`, and I spent five probes proving it was NOT the hair
+BCSDF (a diffuse fiber material blew up too), NOT the guides (unguided fur did too), NOT the
+geometry (no NaNs, no degenerate segments), NOT multi-bounce (`-direct-only` was identical) and
+NOT the backend (CPU agreed) -- before the one probe that mattered: **no fur at all** reads the
+floor at 4.7e14 in mode R *and* in mode D. The renderer was right the whole time; the light was
+absurd, and thin fibers merely turned a hidden scale into visible spectral noise. The tell was
+available in the very first log line (`auto-exposure=4.48e-16`) and I read it as a firefly.
+
+**Fixed** by authoring the key as `blackbody 6504` at the intensity that integrates to ~90 W/m^2
+(~60:1 against the scene's `env { spd 0.5 }` fill, which is what the comment intended), and by a
+**load-time guard**: the sun parser integrates the authored irradiance over 360-830 nm and warns
+above 1e5 W/m^2, naming the number and the fix. FTSL.md section 11 documents the trap.
+
 ## OPEN (2026-09-17): an emissive mesh that is not PLANAR is silently re-oriented OUTWARD, so an emissive enclosure renders black
 
 **Repro.** A cube of six inward-facing emissive quads, as one mesh, with the camera inside: the whole
