@@ -12690,6 +12690,11 @@ static int g_pmFinalGather = 0;
 // -loadmap reloads it and SKIPS the deposit, re-gathering new angles / a new radius without
 // re-tracing a photon. Empty = disabled. GPU shared mode-M only (see renderPhotonMapSharedCuda).
 static std::string g_pmapSave;
+// -dumpcurves <file>: after the scene loads, write every strand as a polyline (one
+// `x y z r` line per point: each segment's p0, then the last p1) and exit. A diagnostic
+// for grooms and the exact oracle for tools/curve_rig.py -- with `basis linear` and
+// `segments 1` the polyline IS the control polygon.
+static std::string g_dumpCurves;
 static std::string g_pmapLoad;
 
 // SPPM (mode S) radius-shrink rate alpha (Hachisuka 2008; CLI -sppmalpha). Smaller =
@@ -18943,6 +18948,25 @@ static int run(int argc, char** argv) {
                 std::fprintf(stderr, "[ftsl] %s\n", ferr.c_str());
             return 1;
         }
+        if (!g_dumpCurves.empty()) {
+            std::FILE* df = std::fopen(g_dumpCurves.c_str(), "wb");
+            if (!df) { std::fprintf(stderr, "[dumpcurves] cannot write %s\n", g_dumpCurves.c_str()); return 1; }
+            const auto& sc = ftslScene.scene;
+            std::fprintf(df, "# ftrace -dumpcurves: %zu strand(s), %zu segment(s)\n", sc.curves.size(), sc.curveSegs.size());
+            for (size_t ci = 0; ci < sc.curves.size(); ++ci) {
+                const Curve& c = sc.curves[ci];
+                std::fprintf(df, "strand %zu mat %d name \"%s\" points %d\n", ci, c.matId, c.name.c_str(),
+                             c.segCount > 0 ? c.segCount + 1 : 0);
+                for (int k = 0; k < c.segCount; ++k) {
+                    const CurveSeg& s = sc.curveSegs[(size_t)c.firstSeg + (size_t)k];
+                    std::fprintf(df, "%.9g %.9g %.9g %.9g\n", s.p0.x, s.p0.y, s.p0.z, s.r0);
+                    if (k == c.segCount - 1) std::fprintf(df, "%.9g %.9g %.9g %.9g\n", s.p1.x, s.p1.y, s.p1.z, s.r1);
+                }
+            }
+            std::fclose(df);
+            std::fprintf(stderr, "[dumpcurves] wrote %zu strand(s) to %s\n", sc.curves.size(), g_dumpCurves.c_str());
+            return 0;
+        }
         if (loadStats) {
             // `other` is what is left after the two measured phases -- fur grooms, isosurface
             // polygonisation, medium voxelisation, pattern/SDF bakes. It is a REMAINDER, not a
@@ -19244,6 +19268,7 @@ static int run(int argc, char** argv) {
         }
         else if (!std::strcmp(argv[i], "-pmfg") && i + 1 < argc) { g_pmFinalGather = std::atoi(argv[++i]); if (g_pmFinalGather < 0) g_pmFinalGather = 0; }
         else if (!std::strcmp(argv[i], "-savemap") && i + 1 < argc) g_pmapSave = argv[++i];
+        else if (!std::strcmp(argv[i], "-dumpcurves") && i + 1 < argc) g_dumpCurves = argv[++i];
         else if (!std::strcmp(argv[i], "-loadmap") && i + 1 < argc) g_pmapLoad = argv[++i];
         else if (!std::strcmp(argv[i], "-sppmalpha") && i + 1 < argc) g_sppmAlpha = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-vcmalpha") && i + 1 < argc) g_vcmAlpha = std::atof(argv[++i]);

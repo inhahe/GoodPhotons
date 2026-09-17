@@ -445,6 +445,103 @@ inline Vec3 catmullRomAt(const std::vector<Vec3>& p, bool closed, double g, doub
     return lerp(B1, B2, (tt - k1) / (k2 - k1));
 }
 
+// ---------------------------------------------------------------------------
+// Curves of curves (0.326.0) -- the pieces shared by `curve` nodes at every level
+// ---------------------------------------------------------------------------
+// One flattened strand: world-space control points (metres) and a radius per point.
+struct CurveStrand { std::vector<Vec3> pts; std::vector<double> radii; };
+
+// `spline uniform|centripetal|chordal|<alpha>` -- the same key `camera_curve` takes.
+// Returns false (with `why`) on a malformed value; absent => alpha 0 (uniform, the
+// bit-identical default).
+inline bool parseSplineAlpha(const Block& b, double& alpha, std::string& why) {
+    alpha = 0.0;
+    const Stmt* sp = find(b, "spline");
+    if (!sp) return true;
+    if (sp->val.words.empty()) { why = "spline needs: uniform|centripetal|chordal|<alpha>"; return false; }
+    const std::string& v = sp->val.words[0];
+    if      (v == "uniform")     alpha = 0.0;
+    else if (v == "centripetal") alpha = 0.5;
+    else if (v == "chordal")     alpha = 1.0;
+    else if (isNumber(v))        alpha = std::atof(v.c_str());
+    else { why = "spline: unknown value '" + v + "' (uniform|centripetal|chordal|<alpha>)"; return false; }
+    if (alpha < 0.0) alpha = 0.0;
+    return true;
+}
+
+// Where along a Catmull-Rom through `pts` do N instances sit? `camera_curve`'s rule,
+// factored out: walk the spline densely for pure ARC LENGTH, integrate `rho` against
+// normalised arc length s/Smax, and invert the cumulative count so instances are
+// evenly spaced in "count" -- which is uniform arc length for a flat rho and a
+// density-driven spacing otherwise. `n <= 0` lets rho decide the count (its integral,
+// rounded). Returns the GLOBAL spline parameters g in [0, nSeg]; an open path spans
+// both ends (i/(N-1)), a closed one i/N so the last instance is not the first again.
+inline std::vector<double> splineArcParams(const std::vector<Vec3>& pts, bool closed, double alpha,
+                                           int n, const std::function<double(double)>& rho) {
+    std::vector<double> out;
+    const int np = (int)pts.size();
+    if (np == 0) return out;
+    if (np == 1) { out.assign((size_t)std::max(n, 1), 0.0); return out; }
+    const int nSeg = closed ? np : np - 1;
+    const int M = std::max(64, 64 * nSeg);
+    std::vector<double> sampG((size_t)M + 1), sampS((size_t)M + 1), sampC((size_t)M + 1);
+    Vec3 prev = catmullRomAt(pts, closed, 0.0, alpha);
+    sampG[0] = 0.0; sampS[0] = 0.0; sampC[0] = 0.0;
+    for (int k = 1; k <= M; ++k) {
+        const double g = nSeg * (double)k / M;
+        const Vec3 cur = catmullRomAt(pts, closed, g, alpha);
+        sampG[(size_t)k] = g;
+        sampS[(size_t)k] = sampS[(size_t)k - 1] + length(cur - prev);
+        prev = cur;
+    }
+    const double invS = (sampS[(size_t)M] > 1e-12) ? 1.0 / sampS[(size_t)M] : 0.0;
+    for (int k = 1; k <= M; ++k) {
+        const double r = rho ? rho(sampS[(size_t)k] * invS) : 1.0;
+        sampC[(size_t)k] = sampC[(size_t)k - 1] + std::max(r, 0.0) * (sampS[(size_t)k] - sampS[(size_t)k - 1]);
+    }
+    const double Cmax = sampC[(size_t)M];
+    if (n <= 0) n = std::max(1, (int)std::llround(Cmax));
+    auto invert = [&](double target) -> double {
+        if (target <= 0.0) return 0.0;
+        if (target >= Cmax) return (double)nSeg;
+        int lo = 0, hi = M;
+        while (lo + 1 < hi) { const int mid = (lo + hi) / 2; (sampC[(size_t)mid] <= target ? lo : hi) = mid; }
+        const double c0 = sampC[(size_t)lo], c1 = sampC[(size_t)lo + 1];
+        const double f = (c1 > c0) ? (target - c0) / (c1 - c0) : 0.0;
+        return sampG[(size_t)lo] + (sampG[(size_t)lo + 1] - sampG[(size_t)lo]) * f;
+    };
+    out.reserve((size_t)n);
+    for (int i = 0; i < n; ++i) {
+        const double f = closed ? (double)i / (double)n
+                                : (n > 1 ? (double)i / (double)(n - 1) : 0.0);
+        out.push_back(invert(f * Cmax));
+    }
+    return out;
+}
+
+// Resample a strand to K points at uniform arc length along its (open) Catmull-Rom, radii
+// interpolated linearly in the spline parameter. The two ends are copied exactly, so a
+// resampled guide still starts where it was rooted and ends where its tip was.
+inline CurveStrand resampleStrandCR(const CurveStrand& s, int K, double alpha) {
+    CurveStrand o;
+    const int n = (int)s.pts.size();
+    if (n == 0 || K <= 0) return o;
+    if (n == 1 || K == 1) { o.pts.assign((size_t)K, s.pts[0]); o.radii.assign((size_t)K, s.radii[0]); return o; }
+    if (n == K) return s;
+    const std::vector<double> g = splineArcParams(s.pts, false, alpha, K, nullptr);
+    o.pts.reserve((size_t)K); o.radii.reserve((size_t)K);
+    for (int i = 0; i < K; ++i) {
+        if (i == 0)          { o.pts.push_back(s.pts.front()); o.radii.push_back(s.radii.front()); continue; }
+        if (i == K - 1)      { o.pts.push_back(s.pts.back());  o.radii.push_back(s.radii.back());  continue; }
+        const double gg = g[(size_t)i];
+        int seg = (int)std::floor(gg); if (seg > n - 2) seg = n - 2; if (seg < 0) seg = 0;
+        const double u = std::min(std::max(gg - seg, 0.0), 1.0);
+        o.pts.push_back(catmullRomAt(s.pts, false, gg, alpha));
+        o.radii.push_back(s.radii[(size_t)seg] * (1.0 - u) + s.radii[(size_t)seg + 1] * u);
+    }
+    return o;
+}
+
 // Rotate vector `v` about `axis` by `ang` radians (Rodrigues' rotation formula).
 // `axis` is normalized internally; a zero-length axis returns `v` unchanged. Used
 // by `camera_curve` to apply a per-frame `roll` (bank about the view direction).
@@ -1564,6 +1661,11 @@ private:
     // sweep, which runs BEFORE stripShapeOnlyMeshes, so a `mesh { shape_only yes }` scalp
     // can grow a coat and then vanish from the render.
     std::unordered_map<std::string, std::pair<size_t, size_t>> triRangeByName_;
+    // Named curves, FLATTENED to their strands (world metres), so a later `curve "name"`
+    // child can reuse one by reference and `fur { guides "name" }` can interpolate it.
+    // A named curve registers whether or not it is rendered: without a `material` it is
+    // a definition only (0.326.0).
+    std::unordered_map<std::string, std::vector<CurveStrand>> curveByName_;
     std::unordered_map<std::string, int>         blasIndex_;      // mesh_asset name -> Scene::blasList index
     // `mesh { shape_only yes }` groups (indices into Scene::meshGroups), removed from
     // Scene::tris by stripShapeOnlyMeshes() once the deferred medium sweep has read them.
@@ -4901,31 +5003,55 @@ private:
     // taper (linear in control-point index, which is what a groom wants), then an
     // explicit per-point `r=`. The taper is expressed in point index rather than arc
     // length on purpose — it must be computable before the curve exists.
-    bool addCurve(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
-        int id = matFieldId(b, L, "curve"); if (id < 0) return false;
+    // ---- curves of curves ---------------------------------------------------------------
+    // The parameters a node carries, inherited by its children unless they override them.
+    // `basis`, `segments` and `spline` are taken from the OUTERMOST node for tessellation
+    // (a strand is flattened once, at the top); a child may set its own radius / radius_tip,
+    // which is what a fringe that thins toward the temples needs.
+    struct CurveNodeParams {
+        CurveBasis  basis = CurveBasis::CatmullRom;
+        std::string basisName = "catmull_rom";
+        double      rRoot = 0.001;
+        double      rTip  = 0.001;
+        bool        rTipSet = false;
+        int         subdiv = 4;
+        double      alpha = 0.0;
+    };
 
-        const std::string bs = strOf(b, "basis", "catmull_rom");
-        CurveBasis basis;
-        if      (bs == "linear")                        basis = CurveBasis::Linear;
-        else if (bs == "catmull_rom" || bs == "catmull-rom" ||
-                 bs == "catmullrom")                    basis = CurveBasis::CatmullRom;
-        else if (bs == "bezier")                        basis = CurveBasis::Bezier;
-        else if (bs == "bspline" || bs == "b-spline")   basis = CurveBasis::BSpline;
-        else { fail("curve: unknown basis '" + bs + "' (linear, catmull_rom, bezier, bspline)"); return false; }
+    bool parseCurveNodeParams(const Block& b, const CurveNodeParams& inherit, CurveNodeParams& p) {
+        p = inherit;
+        if (const Stmt* bs = find(b, "basis")) {
+            const std::string v = bs->val.words.empty() ? "" : bs->val.words[0];
+            if      (v == "linear")                          p.basis = CurveBasis::Linear;
+            else if (v == "catmull_rom" || v == "catmull-rom" || v == "catmullrom") p.basis = CurveBasis::CatmullRom;
+            else if (v == "bezier")                          p.basis = CurveBasis::Bezier;
+            else if (v == "bspline" || v == "b-spline")      p.basis = CurveBasis::BSpline;
+            else { fail("curve: unknown basis '" + v + "' (linear, catmull_rom, bezier, bspline)"); return false; }
+            p.basisName = v;
+        }
+        if (find(b, "radius"))     { p.rRoot = dblOf(b, "radius", p.rRoot); if (!p.rTipSet) p.rTip = p.rRoot; }
+        if (find(b, "radius_tip")) { p.rTip  = dblOf(b, "radius_tip", p.rTip); p.rTipSet = true; }
+        if (find(b, "segments")) {
+            p.subdiv = (int)dblOf(b, "segments", (double)p.subdiv);
+            if (p.subdiv < 1) p.subdiv = 1;
+            if (p.subdiv > 256) p.subdiv = 256;   // a per-span cap; nothing sane needs more
+        }
+        if (find(b, "spline")) {
+            std::string why;
+            if (!parseSplineAlpha(b, p.alpha, why)) { fail("curve: " + why); return false; }
+        }
+        return true;
+    }
 
-        const double rRoot = dblOf(b, "radius", 0.001);
-        const double rTip  = dblOf(b, "radius_tip", rRoot);
-        int subdiv = (int)dblOf(b, "segments", 4.0);
-        if (subdiv < 1) subdiv = 1;
-        if (subdiv > 256) subdiv = 256;   // a per-span cap; nothing sane needs more
-
-        // Gather the repeated `point` statements (in authoring order). A per-point radius
-        // rides as a `key=val` value continuation (`point 0 0.1 0 r=0.002`) because FTSL's
-        // statement splitter would start a NEW statement at a bareword — the same reason
-        // `uv planar axis=x` has to be written with `=`.
+    // One LEAF node (children are `point`s) -> one strand, exactly as a hand-written
+    // `curve` has always been read: per-point `r=` overrides the root->tip taper, and
+    // everything goes to world space through `xf` (an affine map commutes with every
+    // basis, so transforming the control points and flattening afterwards is identical
+    // to the other order -- which is what lets a `group { rotate ... }` carry a strand).
+    bool curveLeaf(const Block& b, const CurveNodeParams& p, const Affine& xf, CurveStrand& out) {
         std::vector<Vec3>   pts;
         std::vector<double> radii;
-        std::vector<int>    explicitR;   // 1 where the author gave an `r=`
+        std::vector<int>    explicitR;
         for (const auto& s : b.stmts) {
             if (s.key != "point") continue;
             s.used = true;
@@ -4942,54 +5068,201 @@ private:
         }
         const int n = (int)pts.size();
         if (n < 2) { fail("curve needs at least 2 `point` statements"); return false; }
-        const int spans = curveSpanCount(basis, n);
-        if (spans <= 0) {
-            fail("curve: " + std::to_string(n) + " control points is not a valid " + bs +
-                 (basis == CurveBasis::Bezier ? " chain (needs 3k+1: 4, 7, 10, ...)"
-                                              : " curve (needs at least 4)"));
-            return false;
-        }
-
-        // Fill the un-authored radii from the root->tip taper, then take everything to
-        // world space. An affine map commutes with every basis, so transforming the
-        // CONTROL points and flattening afterwards is identical to the other order —
-        // which is what lets a `group { rotate ... }` carry a strand for free.
         bool nonUniform = false;
         const double us = xf.uniformScale(nonUniform);
         for (int i = 0; i < n; ++i) {
-            double rr = explicitR[i] ? radii[i]
-                                     : rRoot + (rTip - rRoot) * (n > 1 ? (double)i / (n - 1) : 0.0);
-            // A non-uniform group scale cannot be represented by a round cross-section
-            // (it would make an elliptical fiber), so the radius takes the geometric mean
-            // of the three axis scales — the scale that preserves the swept volume. The
-            // approximation is noted rather than fatal: at fiber widths it is invisible,
-            // and refusing to load would make a strand the one primitive a group cannot
-            // hold. (`uniformScale` returns the max axis scale; for the uniform case,
-            // which is every ordinary scene, that IS the exact scale and nothing changes.)
-            radii[i] = Len(rr) * us;
-            pts[i] = P(xf.apply(pts[i]));
+            const double rr = explicitR[(size_t)i] ? radii[(size_t)i]
+                             : p.rRoot + (p.rTip - p.rRoot) * (n > 1 ? (double)i / (n - 1) : 0.0);
+            radii[(size_t)i] = Len(rr) * us;
+            pts[(size_t)i] = P(xf.apply(pts[(size_t)i]));
         }
         if (nonUniform) {
             const double sx = std::sqrt(xf.m[0]*xf.m[0] + xf.m[3]*xf.m[3] + xf.m[6]*xf.m[6]);
             const double sy = std::sqrt(xf.m[1]*xf.m[1] + xf.m[4]*xf.m[4] + xf.m[7]*xf.m[7]);
             const double sz = std::sqrt(xf.m[2]*xf.m[2] + xf.m[5]*xf.m[5] + xf.m[8]*xf.m[8]);
             const double gm = std::cbrt(std::max(1e-300, sx * sy * sz));
-            for (int i = 0; i < n; ++i) radii[i] *= gm / (us > 0.0 ? us : 1.0);
-            std::fprintf(stderr, "[ftsl] warning: curve%s%s%s under a non-uniform group scale — "
+            for (int i = 0; i < n; ++i) radii[(size_t)i] *= gm / (us > 0.0 ? us : 1.0);
+            std::fprintf(stderr, "[ftsl] warning: curve%s%s%s under a non-uniform group scale -- "
                                  "the fiber radius uses the volume-preserving geometric mean "
                                  "(a round fiber cannot become elliptical)\n",
                          b.name.empty() ? "" : " '", b.name.c_str(), b.name.empty() ? "" : "'");
         }
+        out.pts = std::move(pts);
+        out.radii = std::move(radii);
+        return true;
+    }
 
-        Curve c;
-        c.matId = id;
-        c.basis = basis;
-        c.name  = b.name;
-        c.firstSeg = (int)L.scene.curveSegs.size();
-        c.segCount = tessellateCurve(pts, radii, basis, subdiv, id,
-                                     (int)L.scene.curves.size(), L.scene.curveSegs);
-        if (c.segCount <= 0) { fail("curve: control points are all coincident"); return false; }
-        L.scene.curves.push_back(std::move(c));
+    // Flatten one node of any depth to its strands. Children are `point`s (a leaf) or
+    // `curve`s -- inline `curve { }` / `curve "name" { }`, or a bare `curve "name"` that
+    // reuses a curve defined EARLIER (top level, in file order; an include makes that
+    // natural). A node that mixes the two is refused: the rule is one thing per level.
+    bool flattenCurveNode(const Block& b, const CurveNodeParams& inherit, const Affine& xf,
+                          std::vector<CurveStrand>& out, int depth) {
+        if (depth > 16) { fail("curve: nested deeper than 16 levels"); return false; }
+        CurveNodeParams p;
+        if (!parseCurveNodeParams(b, inherit, p)) return false;
+
+        bool havePoints = false;
+        std::vector<std::vector<CurveStrand>> kids;      // one strand list per child, in order
+        for (const auto& s : b.stmts) {
+            if (s.key == "point") { havePoints = true; continue; }
+            if (s.key != "curve") continue;
+            s.used = true;
+            std::vector<CurveStrand> ks;
+            if (s.val.block) {
+                if (!flattenCurveNode(*s.val.block, p, xf, ks, depth + 1)) return false;
+            } else {
+                if (s.val.words.size() != 1) { fail("curve: a child is `curve \"name\"` (a reference) or `curve { ... }`"); return false; }
+                auto it = curveByName_.find(s.val.words[0]);
+                if (it == curveByName_.end()) {
+                    fail("curve: child references curve \"" + s.val.words[0] + "\", which is not defined above it");
+                    return false;
+                }
+                ks = it->second;
+                // A reference inside a transformed group moves with the group: the stored
+                // strands are world-space, so apply THIS node's transform on top.
+                bool nu = false; const double us = xf.uniformScale(nu);
+                for (CurveStrand& st : ks) {
+                    for (Vec3& q : st.pts) q = xf.apply(q);
+                    for (double& r : st.radii) r *= us;
+                }
+            }
+            if (ks.empty()) {
+                fail(std::string("curve: child \"") + (s.val.words.empty() ? std::string() : s.val.words[0]) + "\" produced no strands");
+                return false;
+            }
+            kids.push_back(std::move(ks));
+        }
+        if (havePoints && !kids.empty()) {
+            fail("curve" + (b.name.empty() ? std::string() : " \"" + b.name + "\"") +
+                 ": a node is EITHER points (a strand) OR curves (a curve of curves), not both");
+            return false;
+        }
+
+        if (kids.empty()) {                                       // ---- leaf
+            CurveStrand st;
+            if (!curveLeaf(b, p, xf, st)) return false;
+            out.push_back(std::move(st));
+        } else {                                                  // ---- curve of curves
+            const size_t C = kids.size();
+            const size_t M = kids[0].size();
+            for (size_t i = 1; i < C; ++i)
+                if (kids[i].size() != M) {
+                    fail("curve" + (b.name.empty() ? std::string() : " \"" + b.name + "\"") +
+                         ": every child must produce the same number of strands to be blended (child 1 makes " +
+                         std::to_string(M) + ", child " + std::to_string(i + 1) + " makes " + std::to_string(kids[i].size()) + ")");
+                    return false;
+                }
+            // Siblings blend point-for-point, so bring every strand to one point count.
+            size_t K = 0;
+            for (const auto& ks : kids) for (const auto& st : ks) K = std::max(K, st.pts.size());
+            for (auto& ks : kids) for (auto& st : ks)
+                if (st.pts.size() != K) st = resampleStrandCR(st, (int)K, p.alpha);
+
+            bool closed = false;
+            if (const Stmt* c = find(b, "closed")) {
+                if (c->val.words.empty()) closed = true;
+                else { const std::string& v = c->val.words[0]; closed = !(v == "off" || v == "false" || v == "0"); }
+            }
+            struct DKey { double t, rho; };
+            std::vector<DKey> dkeys;
+            for (const auto& s : b.stmts) {
+                if (s.key != "density_at") continue;
+                s.used = true;
+                if (s.val.words.size() < 2) { fail("curve: density_at needs: <t> <rho>"); return false; }
+                dkeys.push_back({num(s.val.words[0]), num(s.val.words[1]) / L_});
+            }
+            std::sort(dkeys.begin(), dkeys.end(), [](const DKey& a, const DKey& c2){ return a.t < c2.t; });
+            const double constDensity = find(b, "density") ? dblOf(b, "density", 0.0) / L_ : -1.0;
+            const bool haveDensity = !dkeys.empty() || constDensity > 0.0;
+            const int countReq = (int)dblOf(b, "count", 0.0);
+
+            if (countReq < 1 && !haveDensity) {
+                // No placement asked for: the instances ARE the children, bit-for-bit.
+                for (auto& ks : kids) for (auto& st : ks) out.push_back(std::move(st));
+            } else {
+                std::vector<Vec3> roots; roots.reserve(C);
+                for (const auto& ks : kids) roots.push_back(ks[0].pts[0]);
+                std::function<double(double)> rho;
+                if (haveDensity) rho = [&](double u) -> double {
+                    if (!dkeys.empty()) {
+                        if (u <= dkeys.front().t) return dkeys.front().rho;
+                        if (u >= dkeys.back().t)  return dkeys.back().rho;
+                        for (size_t j = 0; j + 1 < dkeys.size(); ++j)
+                            if (u >= dkeys[j].t && u <= dkeys[j + 1].t) {
+                                const double sp = dkeys[j + 1].t - dkeys[j].t;
+                                const double f = (sp > 1e-12) ? (u - dkeys[j].t) / sp : 0.0;
+                                return dkeys[j].rho + (dkeys[j + 1].rho - dkeys[j].rho) * f;
+                            }
+                        return dkeys.back().rho;
+                    }
+                    return constDensity > 0.0 ? constDensity : 1.0;
+                };
+                const std::vector<double> gs = splineArcParams(roots, closed, p.alpha, countReq, rho);
+                const int nSeg = closed ? (int)C : (int)C - 1;
+                std::vector<Vec3> offs((size_t)C);
+                for (double g : gs) {
+                    const Vec3 root = catmullRomAt(roots, closed, g, p.alpha);
+                    int seg = (int)std::floor(g); if (seg > std::max(nSeg - 1, 0)) seg = std::max(nSeg - 1, 0); if (seg < 0) seg = 0;
+                    const double u = std::min(std::max(g - seg, 0.0), 1.0);
+                    const size_t ia = (size_t)seg % C, ib = (size_t)(seg + 1) % C;
+                    for (size_t j = 0; j < M; ++j) {
+                        CurveStrand st; st.pts.resize(K); st.radii.resize(K);
+                        for (size_t k = 0; k < K; ++k) {
+                            for (size_t i = 0; i < C; ++i) offs[i] = kids[i][j].pts[k] - roots[i];
+                            st.pts[k] = root + catmullRomAt(offs, closed, g, p.alpha);
+                            st.radii[k] = kids[ia][j].radii[k] * (1.0 - u) + kids[ib][j].radii[k] * u;
+                        }
+                        out.push_back(std::move(st));
+                    }
+                }
+            }
+        }
+        if (!b.name.empty()) curveByName_[b.name] = out;      // reusable by name from here on
+        return true;
+    }
+
+    // ---- `curve` --------------------------------------------------------------------------
+    // A strand, or a curve of curves (of curves ...) -- see flattenCurveNode. With a
+    // `material` every flattened strand is tessellated and rendered; a NAMED curve without
+    // one is a definition only, there to be referenced by later curves and by `fur guides`.
+    bool addCurve(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
+        const int id = matFieldId(b, L, "curve", /*optional=*/true);
+        if (id < 0 && b.name.empty()) {
+            fail("curve needs a material (or a name, to be a definition other curves and fur can reference)");
+            return false;
+        }
+        CurveNodeParams top;
+        if (!parseCurveNodeParams(b, CurveNodeParams{}, top)) return false;
+        std::vector<CurveStrand> strands;
+        if (!flattenCurveNode(b, CurveNodeParams{}, xf, strands, 0)) return false;
+        if (strands.empty()) { fail("curve" + (b.name.empty() ? std::string() : " \"" + b.name + "\"") + ": no strands"); return false; }
+
+        if (id < 0) {
+            std::fprintf(stderr, "[ftsl] curve \"%s\": no material -- registered as a definition (%zu strand%s), not rendered\n",
+                         b.name.c_str(), strands.size(), strands.size() == 1 ? "" : "s");
+            return true;
+        }
+        for (size_t i = 0; i < strands.size(); ++i) {
+            const CurveStrand& st = strands[i];
+            const int spans = curveSpanCount(top.basis, (int)st.pts.size());
+            if (spans <= 0) {
+                fail("curve: " + std::to_string(st.pts.size()) + " control points is not a valid " + top.basisName +
+                     (top.basis == CurveBasis::Bezier ? " chain (needs 3k+1: 4, 7, 10, ...)" : " curve (needs at least 4)"));
+                return false;
+            }
+            Curve c;
+            c.matId = id;
+            c.basis = top.basis;
+            c.name  = b.name;
+            c.firstSeg = (int)L.scene.curveSegs.size();
+            c.segCount = tessellateCurve(st.pts, st.radii, top.basis, top.subdiv, id,
+                                         (int)L.scene.curves.size(), L.scene.curveSegs, top.alpha);
+            if (c.segCount <= 0) { fail("curve: control points are all coincident"); return false; }
+            L.scene.curves.push_back(std::move(c));
+        }
+        if (strands.size() > 1)
+            std::fprintf(stderr, "[ftsl] curve \"%s\": %zu strands\n", b.name.c_str(), strands.size());
         return true;
     }
 
@@ -5057,6 +5330,9 @@ private:
         else if (bs == "bspline" || bs == "b-spline")   sp.basis = CurveBasis::BSpline;
         else { fail("fur: unknown basis '" + bs + "' (linear, catmull_rom, bezier, bspline)"); return false; }
 
+        {   std::string why;                                      // `spline`, as on curve / camera_curve
+            if (!parseSplineAlpha(b, sp.alpha, why)) { fail("fur: " + why); return false; }
+        }
         sp.count  = (long long)dblOf(b, "count", 0.0);
         sp.seed   = (uint64_t)std::max(0.0, dblOf(b, "seed", 0.0));
         sp.points = (int)dblOf(b, "points", 5.0);

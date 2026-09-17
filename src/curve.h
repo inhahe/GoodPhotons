@@ -393,7 +393,7 @@ inline bool intersectCurveSeg(const CurveRay& cr, const Ray& r, const CurveSeg& 
 inline int tessellateCurve(const std::vector<Vec3>& pts,
                            const std::vector<double>& radii,
                            CurveBasis basis, int subdiv, int matId, int curveId,
-                           std::vector<CurveSeg>& out) {
+                           std::vector<CurveSeg>& out, double alpha = 0.0) {
     const int n = (int)pts.size();
     const int S = curveSpanCount(basis, n);
     if (S <= 0) return 0;
@@ -428,6 +428,24 @@ inline int tessellateCurve(const std::vector<Vec3>& pts,
             case CurveBasis::Linear:
                 return P1 + (P2 - P1) * u;
             case CurveBasis::CatmullRom:
+                if (alpha > 0.0) {
+                    // Non-uniform Catmull-Rom (Barry-Goldman), knots advancing by chord^alpha:
+                    // the same evaluator `camera_curve` uses (ftsl.h catmullRomAt), so a
+                    // `spline centripetal` strand bends exactly as a centripetal flight path
+                    // does. alpha 0 is the uniform form below, bit-identical to before.
+                    auto knot = [&](double ti, const Vec3& a, const Vec3& b) {
+                        return ti + std::pow(std::max(length(b - a), 1e-9), alpha);
+                    };
+                    const double k0 = 0.0, k1 = knot(k0, P0, P1), k2 = knot(k1, P1, P2), k3 = knot(k2, P2, P3);
+                    const double tt = k1 + u * (k2 - k1);
+                    auto lp = [](const Vec3& a, const Vec3& b, double w) { return a * (1.0 - w) + b * w; };
+                    const Vec3 A1 = lp(P0, P1, (tt - k0) / (k1 - k0));
+                    const Vec3 A2 = lp(P1, P2, (tt - k1) / (k2 - k1));
+                    const Vec3 A3 = lp(P2, P3, (tt - k2) / (k3 - k2));
+                    const Vec3 B1 = lp(A1, A2, (tt - k0) / (k2 - k0));
+                    const Vec3 B2 = lp(A2, A3, (tt - k1) / (k3 - k1));
+                    return lp(B1, B2, (tt - k1) / (k2 - k1));
+                }
                 // Uniform Catmull-Rom (tension 1/2): interpolates P1 at u=0, P2 at u=1.
                 return (P1 * 2.0
                         + (P2 - P0) * u

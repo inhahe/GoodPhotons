@@ -1837,6 +1837,66 @@ uniform scale; a **non-uniform** scale prints a `[ftsl] warning:` and uses the
 volume-preserving geometric mean of the three axis scales, because a round fiber cannot
 become elliptical.
 
+| `spline <s>` | `uniform` (default) \| `centripetal` \| `chordal` \| a raw alpha — the Catmull-Rom knot rule, the same key `camera_curve` takes. `uniform` is bit-identical to before; `centripetal` stops the overshoot uneven control points produce (0.326.0) |
+
+#### Curves of curves — the recursive form (0.326.0)
+
+**One rule, applied at any depth: a `curve` is a sequence of children, and a child is either a
+`point` or a `curve`.** Children that are points make a strand — everything above. Children
+that are curves make a **curve of curves**:
+
+```
+curve "g_temple_l" { point -0.11 0.86 0.12   point -0.14 0.72 0.10   point -0.13 0.52 0.14 }
+
+curve "fringe" {                      # a curve OF curves: 9 strands swept between three guides
+    material hair   spline centripetal   count 9
+    curve "g_temple_l"                # a child by NAME (defined above), or inline:
+    curve { point 0 0.88 0.15   point 0.03 0.78 0.19   point 0.07 0.60 0.20 }
+    curve "g_temple_r"
+}
+
+curve "hair" {                        # a curve of curves of curves: 5 rows, crown -> nape
+    material hair   count 5
+    curve "fringe"   curve "row_2"   curve "row_3"   curve "nape"
+}
+```
+
+- The node's **path** is the Catmull-Rom through its children's **roots** (first points),
+  evaluated by the same `catmullRomAt` as a `camera_curve`, with the same `spline` knot rule
+  and the same `closed`.
+- Its **shape** at a parameter is the point-wise Catmull-Rom blend of the children's control
+  points on **root-relative offsets** — a spline *in the space of curves*. Radii interpolate
+  **linearly** between the two bracketing children (the rule for radii everywhere: a spline
+  radius can overshoot, and a negative radius is a bug, not a taper).
+- **`count N`**, or **`density <ρ>`** / **`density_at <t> <ρ>`**, place N instances along the
+  path by **arc length** — exactly `camera_curve`'s `frames` / `density` rule (`density` is
+  instances per unit length; `density_at` keyframes it over the normalised arc-length position).
+  An open path spans both ends; `closed` spaces `i/N` so the last instance is not the first.
+- **No `count` and no density: the instances *are* the children, bit-for-bit.** A node is then
+  just a group — which is what keeps two levels as simple as one.
+- A level-*k* node blends level-(*k*−1) *objects*: every child must produce the **same number
+  of strands** (an error names the mismatch), and siblings with different point counts are
+  **resampled by arc length** to the largest count first (ends exact). A level-3 node with
+  `count 5` over children with `count 9` emits 45 strands.
+- Children **inherit** `radius` / `radius_tip` / `basis` / `segments` / `spline` from their
+  parent unless they set their own; `basis`, `segments` and `spline` used for tessellation are
+  the **outermost** node's (a strand is flattened once, at the top).
+- A node may hold points **or** curves, not both — refused with a message.
+- A **named curve without a `material` is a definition**: registered for later `curve "name"`
+  children and for `fur … guides` (§8.7), not rendered (the load log says so). An *unnamed*
+  curve still needs a material.
+- Under a `group`, a referenced curve moves with the group (its stored world-space strands are
+  transformed again by the group), so a definition can be instanced.
+
+**Reading the emitted strands back:** `ftrace -in scene.ftsl -dumpcurves out.txt` writes every
+strand's polyline (`x y z r` per point) after the load and exits — the debugging tool for a
+groom, and with `basis linear  segments 1` it is *exact*, which is what `tools/curve_rig.py`
+uses to prove the rule: the middle of `count 3` over two straight guides is their average point
+for point; a `count`-less node emits its children bit-for-bit and renders byte-identical to
+writing them out; a level-3 node's first instances equal its first child's; a name reference
+equals inline; `closed` lands instance 2 of 4 on child 1; `spline uniform` is byte-identical to
+no `spline` and `centripetal` differs.
+
 Worked example: `scenes/curve_basics.ftsl` (all four bases, a taper, an `r=` bulge, a
 `u`-banded pattern, and a strand inside a transformed group). See REFERENCE.md →
 **Curves and fibers** for how it is traced and for the v1 limits (both CPU and CUDA
@@ -1882,6 +1942,7 @@ fur "ball_coat" {
 | `points <n>` | control points per strand. Default `5`, minimum 2 |
 | `segments <n>` | round cones per span. Default `2`, clamped `[1, 256]`; `linear` forces 1 |
 | `basis <b>` | as §8.6. Default `catmull_rom` |
+| `spline <s>` | as §8.6: `uniform` (default) \| `centripetal` \| `chordal` \| alpha — the strands' Catmull-Rom knot rule (0.326.0) |
 | `length <l>` | root→tip length. Default `0.05` |
 | `length_jitter <0..1>` | ± fraction of `length`, uniform. Default `0.2` |
 | `radius <r>` | root radius. Default `0.0008` |

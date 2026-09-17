@@ -47,6 +47,7 @@ Three neighbouring documents cover what this one only summarises:
 - [Scene language (FTSL)](#scene-language-ftsl)
   - [Where asset paths are looked for](#where-asset-paths-are-looked-for)
   - [Conditional blocks (`prefer { … } else { … }`)](#conditional-blocks-prefer----else---)
+  - [Curves of curves (recursive `curve`, 0.326.0)](#curves-of-curves-recursive-curve-0326-0)
   - [Including files (`include "file.ftsl"`)](#including-files-include-fileftsl)
   - [Camera animation (`camera_path`, `camera_orbit`)](#camera-animation-camera_path-camera_orbit)
   - [Multi-camera shared photon pass (modes `A`, `B`, and `M`)](#multi-camera-shared-photon-pass-modes-a-b-and-m)
@@ -4574,6 +4575,18 @@ See also `-on-unsupported` under the command-line reference, which controls what
 happens when the *selected* mode still can't render a feature (error / fall back to
 mode R / strip the feature).
 
+### Curves of curves (recursive `curve`, 0.326.0)
+
+A `curve`'s children may themselves be curves, to any depth: the node's path is the Catmull-Rom
+through the children's roots, its shape at a parameter is the point-wise Catmull-Rom blend of
+the children on root-relative offsets, and `count` / `density` / `density_at` place instances
+along the path by arc length — the camera's evaluator, the camera's placement rule, the
+camera's `spline` and `closed`. No `count`: the instances are the children, bit-for-bit. A named
+curve without a material is a definition for later `curve "name"` children and for `fur guides`.
+`-dumpcurves <file>` writes every emitted strand's polyline after the load. Full rule and the
+exact rig (`tools/curve_rig.py`): FTSL.md §8.6. `spline` is also accepted on `fur` and on a
+plain strand (`uniform` default, bit-identical to before).
+
 ### Including files (`include "file.ftsl"`)
 
 Since 0.325.0 a scene can be split across files: a top-level `include "part.ftsl"` statement
@@ -5386,6 +5399,7 @@ survive exactly.
 | `-causticaimk <k>` | Number of bounding spheres the focusing geometry is clustered into for `-causticn` (default `64`). The clustering minimises Σr², which is exactly the expected fraction of aimed photons that miss. Higher = tighter aim and a slightly longer build; the value only affects efficiency, never correctness |
 | `-pmfg <K>` | Mode `M` final gather: `K` cosine-weighted hemisphere sub-rays per sample, querying the map one bounce away for sharp contact shadows / fine detail (default `0` = off, direct density query). ~`K`× per-sample cost — pair with fewer `-spp` |
 | `-savemap <f>` / `-loadmap <f>` | Mode `M` view-independent photon-map cache, on **CPU and GPU**. `-savemap` writes the trace to `<f>`; `-loadmap` reloads it and **skips the forward pass entirely**, re-gathering any camera / radius for free. **Carries the `-beams` volume cache too**, so a rain / fog / rainbow scene can bank its volume as well as its surfaces — save with `-beams` and the beams go in the file. Only *derived* structures are left out (the photon grid, the beam BVH, the beam split), so **one file serves any later `-pmradius` / `-pmcount` / `-pmccount` / `-beamblur` / `-beamk` / `-beamradius`** — reload the same cache with `-beamblur 0.03` and the kernel is re-solved from scratch. Since 0.199.7 (`FTPMP04`) the file also carries the **caustic map** as its own population, so a reload reproduces the split without re-tracing; since 0.202.0 (`FTPMP05`) each beam additionally carries its spectral bundle (see `-beamspec`); since 0.257.0 (**`FTPMP08`**, the current generation) that bundle carries a per-member weight, and an `FTPMP07` file widens to weight 1 on every member — which is *exact*, since equal weights is precisely what an `FTPMP07` bundle meant. A scene-identity guard falls back to a fresh deposit if the file was built for a different scene; a pre-0.202.0 (`FTPMP04`) file loads with monochromatic beams, a pre-0.199.7 (`FTPMP03`) file loads with every photon in the global map (the pre-split behaviour), a pre-0.195.0 (`FTPMP02`) file additionally reports no beams, and asking for `-beams` against one warns rather than quietly rendering a volumeless image. Like `-o`, a missing parent directory for `-savemap` is created up front rather than discovered after the deposit |
+| `-dumpcurves <f>` | After the scene loads, write every strand — hand-written `curve`s, curves of curves, and every `fur` hair — as a polyline to `<f>` (`strand N mat M name "…" points K`, then one `x y z r` line per point) and **exit without rendering**. The debugging tool for a groom, and the exact oracle for `tools/curve_rig.py`: with `basis linear  segments 1` the polyline *is* the control polygon (0.326.0) |
 | `-sppmalpha <a>` | Mode `S` radius-shrink rate (default `0.7`; smaller shrinks faster) |
 | `-vcmalpha <a>` | Mode `U` (VCM) radius-shrink rate (default `0.75`; smaller shrinks faster) |
 | `-heroc <N>` | Hero-wavelength bundle size on the spectral tracers — **CPU** modes `A`/`B`/`C`, `R`, photon-map `M`/`S`, BDPT `D` and VCM `U`, plus the **GPU megakernel** (forward `A`/`B`/`C`, the `M` deposit, backward `R`, BDPT `D`, and VCM `U`): each path carries `N` wavelengths (a hero + `N-1` stratified secondaries) down one shared BVH walk, cutting colour noise at a given sample count for free. In BDPT both subpaths carry the bundle and each connection is evaluated per-λ under one shared MIS weight — on **both** backends, which agree to 0.03%. VCM (`U`) does the same on **both** backends: one bundle per path index feeds both its light and camera subpath, so its *connections* are exact per-λ while its *merges* key off each stored light vertex's own wavelengths — **0.51× noise RMS** at equal passes on a gel + mirror box (CPU), **0.72–0.82× chroma noise** for 1.5–1.7× the time on the GPU, matching the single-λ estimator to 0.02 % and each other to 0.03 %. In modes `R` and `A`/`B`/`C` (and the `M`/`S` deposit) the bundle also rides through mirrors/gels/glossy lobes and every Russian roulette survives on the strongest live λ (no per-λ ratio amplification), worth ~0.42–0.52× noise RMS on coloured interiors in `R` and ~1.1× luma / 1.3–1.8× chroma at equal time in the forward modes. Default `4`; clamped to `1..8`. **Mode `W` defaults to `8` instead** — at 1 spp the bundle *is* the spectral quadrature, and it is nearly free there (measured 2.7 % of frame time versus a single wavelength, because mode `W` is traversal-bound; the same step costs 61 % in mode `R`). `-heroc 1` turns hero **off** (bit-identical to the classic single-λ estimator) — fine in the sampled modes, but in mode `W` it renders dispersive surfaces flatly **wrong** rather than merely noisy, and a batch mode-`W` render now warns and names the offending material. Ignored (still single-λ) by the GPU **wavefront** backend (`-wavefront`) and by any scene with participating media, a GRIN volume, or a finite-lens camera |

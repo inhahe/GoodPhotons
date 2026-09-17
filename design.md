@@ -1021,6 +1021,20 @@ into `thr`**, not re-sampled from the grid — that is what makes `thr * ratio` 
 agreeing one as constant, so uncoloured materials cost three lookups rather than 24 and flat scenes
 are unchanged. Cost measured at +4 % on a gallery_rain frame.
 
+**Curves of curves (0.326.0).** `ftsl.h addCurve` is now recursive (`flattenCurveNode`): a
+`curve` node's children are `point`s (a strand, unchanged) or `curve`s (inline or by name), and a
+node of curves flattens to instances placed along the Catmull-Rom through its children's roots
+with the shape blended point-wise on root-relative offsets — both through the camera's
+`catmullRomAt`, placement through `splineArcParams` (the `camera_curve` two-pass arc-length /
+density inversion, factored out; `camera_curve` itself is untouched). Siblings are resampled to a
+common point count by arc length (`resampleStrandCR`); every child must yield the same strand
+count. Named curves register flattened in `Builder::curveByName_` whether or not they render —
+a material-less named curve is a definition — which is what `fur … guides` (0.3) reads. The
+strand tessellator gained the same knot rule (`tessellateCurve(..., alpha)`, Barry-Goldman when
+`alpha > 0`, bit-identical at 0) so `spline centripetal` means one thing on a flight path, a
+strand and a groom. `-dumpcurves` writes the emitted polylines; `tools/curve_rig.py` checks the
+rule exactly against them.
+
 **The media term joined it in 0.322.0** (`Renderer::mediumTransmittanceSpec`,
 `dMedTransmittanceSpec`). A transmittance is a stochastic estimate, so it cannot use the ratio
 trick (`E[A/B] != E[A]/E[B]`); the walk carries a per-wavelength vector instead, in three tiers —

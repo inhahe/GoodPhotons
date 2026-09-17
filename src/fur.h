@@ -99,6 +99,7 @@ struct FurSpec {
     double      clumpSize = 0.02;    // tuft radius (one guide per pi*clumpSize^2 of area)
 
     double      rootOffset = 0.0;    // push the root along N (bed the strand into the skin)
+    double      alpha = 0.0;         // `spline`: Catmull-Rom knot exponent (0 uniform, 0.5 centripetal)
 
     // BALD ZONES — spheres no strand may enter.  A coat is grown per BODY PART, but the
     // features that must stay bare (an eye, a nose leather, a scar) are separate little
@@ -524,7 +525,7 @@ inline long long generateFur(const FurSpec& specIn, const FurSurface& surf,
             radii[(size_t)k] = spec.radius + (spec.radiusTip - spec.radius) * t;
         }
         const int added = tessellateCurve(cp, radii, spec.basis, spec.subdiv, spec.matId,
-                                          (int)(curveBase + i), scratch);
+                                          (int)(curveBase + i), scratch, spec.alpha);
         nseg[i] = added;
         if (added > 0)
             std::memcpy(&segs[base + i * (size_t)segsPerStrand], scratch.data(),

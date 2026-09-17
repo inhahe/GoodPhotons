@@ -70,10 +70,13 @@ chain; a missing file fails naming the including file and line. Two limits recor
 `known-issues.md` (an included file's own asset paths resolve via the root scene; loom's reader
 does not know the keyword). FTSL §1.5.
 
-### 0.2 Recursive `curve` + `spline` on strands — NOT STARTED
-Rig: a curve of two straight guides whose blend is analytically known (the midpoint instance of
-two parallel strands is their average, point for point); `count 3` between them must emit exactly
-that. A level-3 curve must reduce to the same strands as writing its level-2 children out by hand.
+### 0.2 Recursive `curve` + `spline` on strands — **DONE (v0.326.0)**
+`flattenCurveNode` in `ftsl.h`; `splineArcParams` / `resampleStrandCR` / `parseSplineAlpha`
+shared helpers; `tessellateCurve` takes the knot alpha; `fur` takes `spline`; named curves
+register in `curveByName_` (material-less = definition). `-dumpcurves <file>` is the exact
+oracle. `tools/curve_rig.py` passes all seven checks: midpoint = average, identity bit-for-bit
+(and render byte-identical), resample ends exact, level-3 product, by-name = inline, closed
+spacing, spline knob wired with `uniform` byte-identical. FTSL §8.6.
 
 ### 0.3 `fur ... guides` — NOT STARTED
 Rig: a strand rooted exactly at a guide's root must reproduce that guide point for point (with
