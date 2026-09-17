@@ -18111,6 +18111,7 @@ static void printHelp(const char* prog) {
 "                        (CPU or GPU). See -whitted-grid / -ambient below\n"
 "  -n <count>            photon/sample count (accepts 2e8, 1.5e9)\n"
 "  -r <W> [H]            resolution (square if H omitted)\n"
+"  -dumpcurves <f>       after the scene loads, write every strand's polyline (x y z r per point) to <f> and exit\n"
 "  -time <sec>           wall-clock budget (progressive)\n"
 "  -noise <pct>          stop at target graininess (progressive)\n"
 "  -forever              trace until Ctrl-C (progressive)\n"
@@ -18783,6 +18784,9 @@ static int run(int argc, char** argv) {
         // this function (ftsl::load), so a flag that changes how an ASSET IS IMPORTED has to
         // be known before that. Parsed in the main loop too, so it is a recognised option
         // (and so `-h` lists it); setting the same bool twice is harmless.
+        // -dumpcurves has to be known before the load for the same reason: it acts the
+        // moment the scene exists, before any render path is chosen.
+        if (!std::strcmp(argv[i], "-dumpcurves") && i + 1 < argc) g_dumpCurves = argv[i + 1];
         if (!std::strcmp(argv[i], "-import-specular") && i + 1 < argc) {
             const char* v = argv[i + 1];
             gltfimp::dielectricSpecular =

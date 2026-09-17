@@ -5161,8 +5161,20 @@ private:
 
             bool closed = false;
             if (const Stmt* c = find(b, "closed")) {
+                // A bareword flag. `closed count 4` on one line would make `count` this flag's
+                // VALUE and silently lose the count (FTSL section 1.1) -- refuse anything but an
+                // on/off word, so the trap is a message rather than two missing strands.
                 if (c->val.words.empty()) closed = true;
-                else { const std::string& v = c->val.words[0]; closed = !(v == "off" || v == "false" || v == "0"); }
+                else {
+                    const std::string& v = c->val.words[0];
+                    if      (v == "on"  || v == "true"  || v == "1" || v == "yes") closed = true;
+                    else if (v == "off" || v == "false" || v == "0" || v == "no")  closed = false;
+                    else {
+                        fail("curve" + (b.name.empty() ? std::string() : " \"" + b.name + "\"") +
+                             ": `closed` takes no value, but found `closed " + v + "` -- put the next key on its own line");
+                        return false;
+                    }
+                }
             }
             struct DKey { double t, rho; };
             std::vector<DKey> dkeys;
@@ -5332,6 +5344,43 @@ private:
 
         {   std::string why;                                      // `spline`, as on curve / camera_curve
             if (!parseSplineAlpha(b, sp.alpha, why)) { fail("fur: " + why); return false; }
+        }
+        // `guides "a" "b" ...` (repeatable): the named curves whose flattened strands shape
+        // this coat. Resolved NOW against curveByName_, which is complete by the deferred fur
+        // sweep because every `curve` block has been built by then. Each guide is resampled
+        // to `points` control points and stored root-relative, so blending is point-wise.
+        {
+            std::vector<std::string> gnames;
+            for (const auto& s : b.stmts) {
+                if (s.key != "guides" && s.key != "guide") continue;
+                s.used = true;
+                for (const std::string& w : s.val.words) gnames.push_back(w);
+            }
+            if (!gnames.empty()) {
+                sp.guideBlend   = (int)dblOf(b, "guide_blend", 3.0);
+                sp.guideFalloff = Len(dblOf(b, "guide_falloff", 0.0));
+                const int np = std::max(2, (int)dblOf(b, "points", 5.0));
+                for (const std::string& gn : gnames) {
+                    auto it = curveByName_.find(gn);
+                    if (it == curveByName_.end()) {
+                        fail("fur \"" + sp.name + "\": guides \"" + gn + "\" names no curve defined in the scene");
+                        return false;
+                    }
+                    for (const CurveStrand& st : it->second) {
+                        const CurveStrand r = resampleStrandCR(st, np, sp.alpha);
+                        FurSpec::Guide g;
+                        g.root = r.pts.empty() ? Vec3{0, 0, 0} : r.pts[0];
+                        g.off.reserve(r.pts.size()); g.radii = r.radii;
+                        for (const Vec3& q : r.pts) g.off.push_back(q - g.root);
+                        sp.guides.push_back(std::move(g));
+                    }
+                }
+                if (find(b, "length") || find(b, "direction") || find(b, "droop") || find(b, "lift"))
+                    std::fprintf(stderr, "[fur] \"%s\": guides given -- `length`, `lift`, `direction`/`comb` and `droop` are ignored (the guides are the shape)\n",
+                                 sp.name.c_str());
+                std::fprintf(stderr, "[fur] \"%s\": %zu guide strand(s) from %zu curve(s), blend %d\n",
+                             sp.name.c_str(), sp.guides.size(), gnames.size(), sp.guideBlend);
+            }
         }
         sp.count  = (long long)dblOf(b, "count", 0.0);
         sp.seed   = (uint64_t)std::max(0.0, dblOf(b, "seed", 0.0));

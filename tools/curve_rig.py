@@ -109,9 +109,10 @@ def main():
     from grade_hdr import read_pfm
     import numpy as np
     a = read_pfm(render(os.path.join(OUT, "ident.ftsl"), "ident"))
+    inner = lambda g: g[len("curve { "):-len(" }")]            # the `point ...` run inside a child
     b = read_pfm(render(w("ident_flat", 'curve "a" { material m  basis linear  segments 1  %s }\n'
                                           'curve "b" { material m  basis linear  segments 1  %s }\n'
-                                          % (G1[6:], G2[6:])), "ident_flat"))
+                                          % (inner(G1), inner(G2))), "ident_flat"))
     check("ident_img", np.array_equal(a, b), "rendered byte-identical to the children written out")
 
     # 3. resample: a 3-point child and a 5-point child (same straight line) -> 5 points, ends exact
@@ -137,7 +138,9 @@ def main():
     check("byname", len(s) == 3 and close(s[1], mean(g1, g2)))
 
     # 6. closed
-    s = dump(w("closed", 'curve "loop" { material m  basis linear  segments 1  closed  count 4\n    %s\n    %s\n}\n' % (G1, G2)))
+    # `closed` on its OWN line: a bareword flag followed by another key on the same line would
+    # take that key as its value (FTSL section 1.1) -- and the curve parser now refuses that.
+    s = dump(w("closed", 'curve "loop" { material m  basis linear  segments 1  count 4\n    closed\n    %s\n    %s\n}\n' % (G1, G2)))
     check("closed", len(s) == 4 and close(s[0], g1) and close(s[2], g2), "instance 2 sits on child 1")
 
     # 7. spline knob on a single strand
