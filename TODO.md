@@ -266,6 +266,24 @@ first); the aggregate-medium tier is backward-only today and would need a mode-M
   fidelity at a small exhibit, which x10 photons may largely fix (the map is built once per
   flyby, and 20 M photons trace in ~10 s) -- measuring now on both devices. A mode-D render WITH
   strands (CPU BDPT, 15 min budget) is the true target for how the hair should look in the hall.
+  **MEASURED (`scraps/_a1/compare_ref.py`, `png/alicehair/a3_photons.png`): 20 M photons is the
+  fix.** M-CPU base at 20 M: hair RGB 111/103/63, hue 50 deg, luminance 92.5 -- against D's
+  112/104/70, 48 deg, 95.4: the mean matches to within the frame noise (at 2 M it was 79/95/51,
+  hue 81, luminance 75). M-GPU at 20 M: hue 54, luminance 86 (closer; still 9 % dark). And mode D
+  WITH strands (97 spp): hair 109/108/75, hue 58 deg, luminance 97 -- the real mass is as bright
+  as the molded base and a little yellower, so the 21 % darkening of the strands in M-CPU-2M was
+  the starved gather, not the hair. Cost: the 20 M map traces in ~10 s and the 24-spp frame took
+  no longer (4:48 vs 5:09 on the grey scene). Decisive check running: strands in M-CPU at 20 M,
+  with and without the chroma filter, against D-with-strands.
+  **Strands at 20 M: hair 79/75/49, hue 51 deg, luminance 68 -- still 30 % under D's strands
+  (97), while the base at 20 M matches D.** So with strands mode M lacks something the base does
+  not need. Diagnosis from the code: mode M's walk collects radiance ONLY at the diffuse surface a
+  chain finally lands on (fibers are never gathered on, and no light is connected at a fiber),
+  whereas mode D's camera paths take direct light at every fiber vertex -- the mass's own lit glow.
+  Mode M already does exactly that for glossy continuations (GLOSSY-NEE: `bwNee.neeLight` at the
+  vertex, the continuation MIS-weighted through `gmis` when it reaches an emitter). The fix is the
+  same at a fiber: NEE with the hair BCSDF at each hair hit, the sampled continuation weighted.
+  Target: D-with-strands, hair luminance 97, hue 58 deg (`png/alicehair/a3_final.png`).
   **The fold's cost, paired** (harness, hair fills the 960x540 frame, 8 spp, ON/OFF twice,
   first run discarded): camera pass 6.7 s with the fold vs 5.6-5.9 s without, ~+15 % on hair
   pixels; at flyby scale hair is a few % of the frame, so the fold is free there.

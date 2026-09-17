@@ -1037,6 +1037,18 @@ the strands' hue moved from 64 deg to 54 deg against the molded base's 43 deg (G
 camera wavelength. `photonGatherSub` (the final-gather sub-walk) carries no `SpecThr` and keeps the
 scalar fold. `FTRACE_HAIR_SPECGATHER=0` disables the fold for paired measurements.
 
+**HAIR-NEE (0.334.0).** Mode M's walk collects radiance only where it finally gathers -- a
+diffuse surface -- so a chain that scatters strand to strand through a hair mass lands on the
+shadowed scalp or dress beneath it, and the mass's own lit glow (direct light scattered by the
+fibers toward the eye) was never counted: with the photon count no longer the limit (20 M),
+Alice's strands rendered 30 % darker than mode D's while the molded base matched D. Mode R's Hair
+case has always connected to the lights at every fiber vertex with the BCSDF (`neeLight` with
+`hs`, rho == 1 because the colour lives in sigma_a) and, having done so, does not count an
+emitter its continuation then hits; both mode-M walks now take the same split (`hairArrival`,
+cleared with `gmis`). The photon map is untouched -- fibers are never deposited on, and light
+that scatters off fibers onto a surface is in the map already -- so nothing is counted twice.
+Environment escapes stay with the continuation. `FTRACE_HAIR_NEE=0` turns it off for A/B.
+
 **Curves of curves (0.326.0).** `ftsl.h addCurve` is now recursive (`flattenCurveNode`): a
 `curve` node's children are `point`s (a strand, unchanged) or `curve`s (inline or by name), and a
 node of curves flattens to instances placed along the Catmull-Rom through its children's roots

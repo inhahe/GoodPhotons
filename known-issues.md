@@ -29446,7 +29446,11 @@ disagrees with D -- two different biases, not noise. Neither is a hair problem: 
 strands. It matters because the flyby is 1147 frames of mode M, and any scene with `type hair`
 is refused by `cudaPhotonMapSupported` and runs the CPU path (`sceneUsesHairMaterial`: the device
 gather shades every query as Lambertian), so Alice with strands always gets the CPU's bias.
-What has been tried: x10 photons on a grey floor moved the CPU mean +11 % brighter and 20 deg
-warmer -- toward D -- so the radius the population buys may be most of it; being measured on the
-grid scene on both devices. Open: which of the two device paths differs from the shared
-estimator's definition (the GPU has no `-max-bounce`, its own `DSpecThr`, and no hair case).
+**Most of it is the photon count.** At 20 M photons (`-n 20000000`; the map traces in ~10 s and
+the 24-spp frame took no longer) the CPU path's hair reads RGB 111/103/63, hue 50 deg, luminance
+92.5 against D's 112/104/70, 48 deg, 95.4 -- the mean within the frame noise; the GPU path's reads
+hue 54 deg, luminance 86 (still 9 % dark). So the bias is the gather radius the population buys
+(0.65 m from 2 M photons over a 45 m hall), and the flyby's recipe is the bigger map. Still open:
+the residual GPU-vs-CPU gap at 20 M (the GPU has no `-max-bounce`, its own `DSpecThr`, and no
+hair case), and whether a smaller radius with fewer photons (the map's `buildAuto` choice) would
+do the same for less memory.
