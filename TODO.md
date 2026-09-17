@@ -291,8 +291,10 @@ first); the aggregate-medium tier is backward-only today and would need a mode-M
   without it, against D-with-strands' 97 / 58 deg (`png/alicehair/a3_nee.png`): 60 % of the
   gap closed, 12 % still under D. Candidates for the rest: the walk's 32-bounce cap on a deep
   chain, and NEE's single light sample per fiber vertex on a hall whose largest emitter is a
-  45 m quad lit only along its gridlines. Cost, paired on the hair-filled harness (960x540, 8
-  spp, on/off twice): camera pass 4.7 / 5.0 s on vs 4.3 / 5.0 s off -- within run-to-run noise. The NEE
+  45 m quad lit only along its gridlines. Cost, paired -- CORRECTED as for the fold: on the
+  head-filling view the camera pass is 1:25 without HAIR-NEE and 1:41-1:58 with it (+20-40 %;
+  two shadow rays per fiber vertex through the mass); the earlier "within noise" was a frame with
+  almost no hair in it. The NEE
   term is monochromatic (camera wavelength), so it adds coloured speckle the chroma filter
   removes; a SPECTRAL NEE at fibers (shared shadow ray, BCSDF x spd at the SpecThr grid) is the
   clean follow-up and would let the flyby drop the filter's chroma bleed at small exhibits.
@@ -300,9 +302,14 @@ first); the aggregate-medium tier is backward-only today and would need a mode-M
   D: -- and a shell older than the install lacks `CUDA_PATH_V13_4`, which the regenerated
   project's `CUDA 13.4.props` needs: "The CUDA Toolkit directory '' does not exist". Set it, or
   open a new shell.)
-  **The fold's cost, paired** (harness, hair fills the 960x540 frame, 8 spp, ON/OFF twice,
-  first run discarded): camera pass 6.7 s with the fold vs 5.6-5.9 s without, ~+15 % on hair
-  pixels; at flyby scale hair is a few % of the frame, so the fold is free there.
+  **The fold's cost, paired -- CORRECTED.** The first measurement ("+15 %") used the harness's
+  default camera, which shows the whole floor with a 60-px doll: barely any hair pixels. On a
+  HEAD-FILLING view (`-view 0.25,0.14,0.30/0,0.09,0/20`, 960x540, 24 spp, 1 M photons, CPU) the
+  camera pass is 1:03 without the fold and 1:41-1:58 with it (+60-85 %): 27 BCSDF builds per
+  fiber bounce is expensive where the frame is all hair. The angular terms of the BCSDF do not
+  depend on wavelength -- only the lobe attenuations do -- so a per-lobe fold (angular terms
+  once, attenuations per bin) should cut that to a few percent. At flyby scale (hair a few % of
+  the frame) it is still negligible.
 
 **D. Flyby cost.** Paired on the still: 522 s with hair vs 112 s without (4.7x); the camera pass
 (~17 s/spp vs ~4) because a path entering the mass bounces strand to strand before it lands on a
@@ -317,6 +324,20 @@ diffuse surface. 1147 frames: ~33 h -> ~166 h. Levers, cheapest first, each MEAS
      holds, or the fade itself is a visible colour shift.
   5. The flyby's own blockers still stand (item 1 below): COMMIT limit, silent launch failure,
      no `-frames` range.
+  **MEASURED 2026-09-17 (after 0.334.0).** The flyby frame with hair is mode M on the CPU
+  (`sceneUsesHairMaterial` refuses the GPU photon map): 960x540, 24 spp, 20 M photons, NEE ->
+  5:04 alone on the machine, i.e. ~97 h for 1147 frames. The SAME frame without hair gathers on
+  the GPU in ~67 s (5.7 M of 12.4 M samples in 31 s), 4.5x faster. So lever 0, ahead of the four
+  above: a device Hair case for mode M's GPU gather (sample the device BCSDF and continue, the
+  DSpecThr fold, NEE at the fiber), then drop the gate for mode M and prove GPU == CPU on a hair
+  scene. The device forward tracer already runs hair (the deposit pass), so the sampler exists.
+  **BUILT (0.335.0, `scraps/gpu_hair.py`).** GPU vs CPU on a head-filling view: luminance ratio
+  1.05-1.09, hue within 5-7 deg, per-pixel diff at the frames' noise level -- the device offset the
+  base shows too, nothing hair-specific. The gallery still with strands at 20 M photons: 5.75 s per
+  spp on the GPU -> ~2.3 min a 24-spp frame -> **~44 h for 1147 frames** (was ~97 h on the CPU).
+  Its hair reads luminance 81, hue 71 deg (CPU+NEE 85 / 55, D 97 / 58). Next cost lever with a
+  measured target: the spectral fold's per-lobe form (+60-85 % of the camera pass on hair pixels
+  today; the angular terms are wavelength-independent, so it should cost a few percent).
 
 **E. The hair-authoring GUI tool** (agreed 2026-09-17; design in 0.6 below).
 

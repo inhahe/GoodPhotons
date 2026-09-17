@@ -14119,6 +14119,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
     oX = oY = oZ = 0.0;
     double thr = 1.0;
     bool specularSeen = false;                           // any specular bounce so far?
+    bool hairArrival = false;                            // HAIR-NEE (see dPhotonGather)
     DMediumStack stk; stk.clear();
     const Real r2 = (Real)((double)pm.radius * (double)pm.radius);
     const bool causOn = (pmC.photons != nullptr);
@@ -14169,7 +14170,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             const double* eSpd = (li >= 0)        ? sc.emitters[li].emitSpd
                                : (m.matIsLight)   ? m.matEmit
                                                   : nullptr;
-            if (eSpd && specularSeen && dot(rd, h.ng) < 0) {
+            if (eSpd && specularSeen && dot(rd, h.ng) < 0 && !hairArrival) {
                 double rhoV = (double)clamp01(dDiffuseRho(sc, visMat, visHit, lambda));
                 double e = (double)specLookup(eSpd, lambda) * thr * rhoV * invPdfL
                          * dEmitPatMul(sc, m.emitPat, h);   // `emit pattern:` at this hit
@@ -14177,6 +14178,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             }
         }
 
+        hairArrival = false;
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
             // Density estimate at y, folding the visible-point reflectance per photon wavelength.
             float gx = 0.f, gy = 0.f, gz = 0.f;
@@ -14259,6 +14261,30 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             case D_FILTER: {
                 thr *= (double)clamp01(dTransmitSlot(sc, m, h, lambda));
                 ro = dOffsetAlong(h.p, h.ng, rd); break;
+            }
+            case D_HAIR: {
+                // HAIR (0.335.0): see dPhotonGather's case. This sub-walk carries no spectral
+                // carrier (host twin: photonGatherSub), so the weight stays scalar; every term it
+                // reports carries the visible point's albedo, the NEE term included.
+                const DVec3 wPrev = rd * (Real)(-1);
+                const DHairShade hsv = dHairShadeAt(sc, m, h, lambda, wPrev);
+                {   const double rhoV = (double)clamp01(dDiffuseRho(sc, visMat, visHit, lambda));
+                    const double direct = bkNeeLight(sc, h, (Real)1, invPdfL, lambda, rng, 1, &hsv);
+                    const double dc = thr * rhoV * direct;
+                    oX += (double)cieX(lambda) * dc; oY += (double)cieY(lambda) * dc; oZ += (double)cieZ(lambda) * dc;
+                    hairArrival = true;
+                }
+                const double u0 = rng.uniform(), u1 = rng.uniform(), u2 = rng.uniform(), u3 = rng.uniform();
+                double pdfH = 0.0, fv = 0.0;
+                const dhair::V3 wl = dhair::sample(hsv.b, hsv.woLocal, u0, u1, u2, u3, pdfH, fv);
+                if (!(pdfH > 0.0) || !(fv > 0.0)) return;
+                const double cosLong = dhair::safeSqrt(1.0 - dhair::sqr(dhair::clampd(wl.x, -1.0, 1.0)));
+                double wCam = fv * cosLong / pdfH; wCam = wCam < 0.0 ? 0.0 : (wCam > 1.0 ? 1.0 : wCam);
+                thr *= wCam;
+                const DVec3 wOut = dhair::toWorld(hsv.fr, wl);
+                ro = h.p + wOut * dHairExitOffset(hsv, h.n, wOut);
+                rd = wOut;
+                break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
@@ -14503,6 +14529,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
     oX = oY = oZ = 0.0;
     double thr = 1.0;
     DSpecThr sthr; sthr.init();      // SPECGATHER: the walk's spectral factors (see above)
+    bool hairArrival = false;        // HAIR-NEE: the previous vertex was a fiber that already took its direct light
     DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
     // norm folded into pX/pY/pZ; radius^2 kept in Real — the distance test runs once per
     // VISITED photon (~85% of visits fail it), and on GeForce parts a double compare +
@@ -14635,7 +14662,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             const double* eSpd = (li >= 0)        ? sc.emitters[li].emitSpd
                                : (m.matIsLight)   ? m.matEmit
                                                   : nullptr;
-            if (eSpd && dot(rd, h.ng) < 0) {
+            if (eSpd && dot(rd, h.ng) < 0 && !hairArrival) {
                 double e = (double)specLookup(eSpd, lambda) * thr * invPdfL
                          * dEmitPatMul(sc, m.emitPat, h);    // `emit pattern:` at this hit
                 oX += (double)cieX(lambda) * e;
@@ -14644,6 +14671,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             }
         }
 
+        hairArrival = false;
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
             if (fgRays > 0 && m.type == D_DIFFUSE) {
                 // Jensen final gather (device twin of photonGather's fgRays branch): decouples
@@ -14773,6 +14801,40 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     dSpecFold(sthr, sc, m, h, tC, true);    // SPECGATHER
                 }
                 ro = dOffsetAlong(h.p, h.ng, rd); break;
+            }
+            case D_HAIR: {
+                // HAIR (0.335.0): the device twin of photonGather's Hair case. Scatter through the
+                // fiber BCSDF and continue -- fibers are never gathered on; direct light at the
+                // fiber by NEE (HAIR-NEE, mode R's split: an emitter the continuation then hits
+                // is not counted again); and the sample's weight folded into the spectral carrier
+                // at every grid wavelength (SPECGATHER for hair: the sampled direction and its pdf
+                // are fixed, only the BCSDF value moves with the absorption).
+                const DVec3 wPrev = rd * (Real)(-1);
+                const DHairShade hsv = dHairShadeAt(sc, m, h, lambda, wPrev);
+                {   const double direct = bkNeeLight(sc, h, (Real)1, invPdfL, lambda, rng, 0, &hsv);
+                    const double dc = thr * direct;
+                    oX += (double)cieX(lambda) * dc; oY += (double)cieY(lambda) * dc; oZ += (double)cieZ(lambda) * dc;
+                    hairArrival = true;
+                }
+                const double u0 = rng.uniform(), u1 = rng.uniform(), u2 = rng.uniform(), u3 = rng.uniform();
+                double pdfH = 0.0, fv = 0.0;
+                const dhair::V3 wl = dhair::sample(hsv.b, hsv.woLocal, u0, u1, u2, u3, pdfH, fv);
+                if (!(pdfH > 0.0) || !(fv > 0.0)) return;
+                const double cosLong = dhair::safeSqrt(1.0 - dhair::sqr(dhair::clampd(wl.x, -1.0, 1.0)));
+                double wCam = fv * cosLong / pdfH; wCam = wCam < 0.0 ? 0.0 : (wCam > 1.0 ? 1.0 : wCam);
+                thr *= wCam;
+                {   double vk[DSpecThr::K];
+                    for (int k = 0; k < DSpecThr::K; ++k) {
+                        const DHairShade hk = dHairShadeAt(sc, m, h, DSpecThr::lamOf(k), wPrev);
+                        double w = dhair::f(hk.b, hk.woLocal, wl) * cosLong / pdfH;
+                        vk[k] = w < 0.0 ? 0.0 : (w > 1.0 ? 1.0 : w);
+                    }
+                    sthr.mulVec(vk, wCam);
+                }
+                const DVec3 wOut = dhair::toWorld(hsv.fr, wl);
+                ro = h.p + wOut * dHairExitOffset(hsv, h.n, wOut);
+                rd = wOut;
+                break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
                 {   const double rC = (double)clamp01(dReflectSlot(sc, m, h, lambda));
@@ -20083,10 +20145,9 @@ bool cudaPhotonMapSupported(const Scene& scene) {
     // point, so the two agree. Participating media (fog) are supported — the forward deposit
     // pass runs the same Woodcock free-flight as the CPU tracePhoton.
     if (!cudaForwardSupported(scene)) return false;
-    // Hair runs on the device forward tracer but the mode-M gather shades every query
-    // point as Lambertian (see sceneUsesHairMaterial) — hair scenes go to the CPU
-    // photon map (and, via the chained gates, CPU SPPM).
-    if (sceneUsesHairMaterial(scene)) return false;
+    // Hair: the device forward tracer deposits through it and, since 0.335.0, the gather
+    // scatters through it too (dPhotonGather's D_HAIR case, the twin of photonGather's), so
+    // a hair scene stays on the GPU. SPPM's gather has no hair case; its gate refuses hair.
     return true;
 }
 
@@ -21234,6 +21295,9 @@ bool cudaSppmSupported(const Scene& scene) {
     // SPPM reuses the mode-M deposit + a per-pixel visible-point/gather pass. Same
     // device-bakeable scope as the photon map (which now includes constant + image env, M2);
     // pinhole cameras only (dGenRay) — the caller gates the camera.
+    // SPPM's gather shades every query point as Lambertian (no hair case) -- a hair scene
+    // goes to the CPU SPPM even though the mode-M gather takes hair since 0.335.0.
+    if (sceneUsesHairMaterial(scene)) return false;
     return cudaPhotonMapSupported(scene);
 }
 

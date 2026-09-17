@@ -1049,6 +1049,17 @@ cleared with `gmis`). The photon map is untouched -- fibers are never deposited 
 that scatters off fibers onto a surface is in the map already -- so nothing is counted twice.
 Environment escapes stay with the continuation. `FTRACE_HAIR_NEE=0` turns it off for A/B.
 
+**Hair on the GPU photon map (0.335.0).** `cudaPhotonMapSupported` used to refuse any scene
+with `type hair` because the device gather shaded every query point as Lambertian, so the flyby's
+frames with Alice's strands ran the CPU walk (5 min a frame where the GPU gathers the same frame in
+about a minute). `dPhotonGather` and `dPhotonGatherSub` (`render_cuda.cu`) now carry a `D_HAIR`
+case that is the device twin of the host's: `dHairShadeAt` + `bkNeeLight` with the fiber shade
+(HAIR-NEE, the same `hairArrival` split), `dhair::sample` for the continuation with
+`dHairExitOffset`, and in the main walk the sample's weight re-evaluated at every `DSpecThr` grid
+wavelength and folded with `mulVec` (SPECGATHER for hair). The deposit pass already ran hair
+(`interactHair`), so the map was never the obstacle. SPPM's gather still has no hair case, so
+`cudaSppmSupported` refuses hair on its own now that it can no longer inherit the refusal.
+
 **Curves of curves (0.326.0).** `ftsl.h addCurve` is now recursive (`flattenCurveNode`): a
 `curve` node's children are `point`s (a strand, unchanged) or `curve`s (inline or by name), and a
 node of curves flattens to instances placed along the Catmull-Rom through its children's roots

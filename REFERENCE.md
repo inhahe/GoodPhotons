@@ -1892,7 +1892,9 @@ wavelength-dependent transmission along that walk is carried as a spectrum (SPEC
 hair's multiple-scatter colour is right rather than a flat average, and since 0.334.0 the walk
 connects to the lights at every fiber it scatters through (HAIR-NEE, the same split mode R uses),
 so the mass's own lit glow is counted rather than only what the shadowed surface beneath it
-gathers. A small exhibit in a large hall also wants a bigger photon map than the hall's default
+gathers. Since 0.335.0 a hair scene stays on the GPU photon map (the device gather scatters
+through fibers exactly as the host walk does; SPPM still falls back to the CPU), which is 2-3x
+the CPU's speed on a frame full of hair. A small exhibit in a large hall also wants a bigger photon map than the hall's default
 (`-n 20000000` brought Alice's molded hair to within noise of mode D where 2 M left it 20 % dark;
 the map is built once and traces in seconds). What remains at 24 spp is a
 coloured speckle from the walk's path variance (a blonde mass transmits red far more than blue,

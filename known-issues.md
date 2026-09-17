@@ -29443,9 +29443,10 @@ other. So (1) the photon-map estimate is biased at an exhibit this small relativ
 radius (0.65 m, chosen by the map's population over the whole hall), M-GATHERAREA
 notwithstanding, and (2) the two mode-M paths disagree with each other by as much as either
 disagrees with D -- two different biases, not noise. Neither is a hair problem: the scene has no
-strands. It matters because the flyby is 1147 frames of mode M, and any scene with `type hair`
-is refused by `cudaPhotonMapSupported` and runs the CPU path (`sceneUsesHairMaterial`: the device
-gather shades every query as Lambertian), so Alice with strands always gets the CPU's bias.
+strands. It matters because the flyby is 1147 frames of mode M. (Until 0.335.0 any scene with
+`type hair` was refused by `cudaPhotonMapSupported` and ran the CPU path -- the device gather had
+no hair case -- so Alice with strands always got the CPU's bias; the GPU gather now scatters
+through fibers, see below.)
 **Most of it is the photon count.** At 20 M photons (`-n 20000000`; the map traces in ~10 s and
 the 24-spp frame took no longer) the CPU path's hair reads RGB 111/103/63, hue 50 deg, luminance
 92.5 against D's 112/104/70, 48 deg, 95.4 -- the mean within the frame noise; the GPU path's reads
@@ -29465,3 +29466,14 @@ fiber vertex in a hall whose largest emitter is a 45 m quad lit only along its g
 term is monochromatic at the camera's wavelength (as every direct term in this walk is), so it
 adds coloured speckle that the chroma filter removes; a spectral NEE (the shadow ray shared, the
 BCSDF and the emitter's spd evaluated at the SpecThr grid) would remove it at the source.
+
+**The GPU gather takes hair since 0.335.0** (`dPhotonGather` / `dPhotonGatherSub` `D_HAIR`: the
+device twin -- NEE with the fiber shade, BCSDF-sampled continuation, the spectral fold on the main
+walk). Agreement with the CPU walk on a head-filling view of Alice (960x540, 24 spp, 1 M photons):
+luminance ratio GPU/CPU 1.05-1.09, hue within 5-7 deg, per-pixel differences at the two frames'
+own noise level (`png/alicehair/pair_head_gpu.png`) -- the same few-percent device offset the
+molded base shows, not a hair-specific one. On the gallery still with strands at 20 M photons the
+GPU gathers a 24-spp frame in ~2.3 min (5.75 s per spp) against the CPU's 5:04. SPPM's device
+gather still has no hair case (`cudaSppmSupported` refuses hair on its own now). Also fixed with
+it: the CPU final-gather sub-walk's HAIR-NEE term lacked the visible point's albedo (`rhoV`) that
+every other term of that walk carries (only `-fg` renders were affected).

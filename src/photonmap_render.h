@@ -1238,8 +1238,10 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 const Vec3 wPrev{-ray.d.x, -ray.d.y, -ray.d.z};
                 const HairShade hs = hairShadeAt(scene, m, h, lambda, wPrev);
                 if (hairNeeOn()) {                          // HAIR-NEE: see photonGather's Hair case
+                    // every term this sub-walk reports carries the visible point's albedo
+                    const double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
                     L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                         * (thr * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng, nullptr,
+                         * (thr * rhoV * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng, nullptr,
                                                  BackwardRenderer::GiCtx{}, &hs, nullptr, nullptr));
                     hairArrival = true;
                 }
