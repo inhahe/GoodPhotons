@@ -244,6 +244,28 @@ first); the aggregate-medium tier is backward-only today and would need a mode-M
   is systematic per pixel and only the filter reaches the floor). Next: A.3, the with/without
   pair over the real grid floor with the fold and the filter -- the aggregate must match the
   molded base to within the frame noise before an LOD switch can be invisible.
+  **A.3 MEASURED, and a confound found (2026-09-17, `scraps/_a1/compare_a3.py`).** A scene with
+  `type hair` is refused by `cudaPhotonMapSupported` (the device gather shades every query as
+  Lambertian), so every WITH-strands frame ran mode M on the CPU while every WITHOUT frame ran
+  on the GPU -- and the two paths DISAGREE on the molded base itself: the same no-strand scene
+  renders her hair ORANGE on the GPU (hue 27 deg, RGB 95/76/60) and YELLOW-GREEN on the CPU (hue
+  81 deg, RGB 79/95/51), mean|diff| 22 in the hair ROI, 16 over the doll. The "olive strands vs
+  orange base" that opened A.1 was mostly device, not hair. On ONE device (CPU, no filter):
+  strands hue 70 deg vs base 81 deg, luminance 0.79 of the base, doll-level mean|diff| 5.9 (the
+  filter's own bias on the base is 10-13, so that floor is an upper bound). A mode-D reference
+  of the base is rendering to say which device is right; the loser gets a known-issues entry.
+  The chroma filter at this scale bleeds the surrounding green into a 45-px doll (the base's hue
+  moved 27 -> 74 deg under it on the GPU frame) -- `-denoise-levels 2` / a lower chroma
+  tolerance need measuring before the filter goes into the flyby recipe.
+  **THE REFERENCE (mode D, 1786 spp, `png/alicehair/a3_reference.png`)** says BOTH mode-M paths
+  are wrong on the doll, hair or no hair: D has her hair warm (hue 48 deg, luminance 95) and the
+  apron white; M-GPU is too orange and 19 % dark, M-CPU too green and 21 % dark, the apron
+  grey-pink / green. Logged in known-issues ("Mode M renders Alice ... far from mode D"). The
+  hair question therefore has two halves: (i) strands vs base WITHIN the flyby's own path
+  (M-CPU): hue within 11 deg, luminance 0.79, doll mean|diff| 5.9 -- close; (ii) mode M's own
+  fidelity at a small exhibit, which x10 photons may largely fix (the map is built once per
+  flyby, and 20 M photons trace in ~10 s) -- measuring now on both devices. A mode-D render WITH
+  strands (CPU BDPT, 15 min budget) is the true target for how the hair should look in the hall.
   **The fold's cost, paired** (harness, hair fills the 960x540 frame, 8 spp, ON/OFF twice,
   first run discarded): camera pass 6.7 s with the fold vs 5.6-5.9 s without, ~+15 % on hair
   pixels; at flyby scale hair is a few % of the frame, so the fold is free there.

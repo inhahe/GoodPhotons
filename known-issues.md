@@ -29430,3 +29430,23 @@ untouched; an UNNAMED fur block cannot be patched (name it). A `bald "sphere" [m
 not drawn (only the `bald x y z r` form is).
 An unnamed curve of curves nested inline inside another gets no preview of its own (its instances
 are inside its parent's); the tool names what it groups, so this only affects hand-written files.
+
+## Mode M renders Alice (a 25 cm doll in a 45 m hall) far from mode D, differently on each device (OPEN, 2026-09-17)
+
+Measured on the gallery still (960x540, `-camera cam`), her hair's 28x27 px and the doll's 51x71 px,
+against a 1786-spp mode-D reference (`png/alicehair/a3_reference.png`, `scraps/_a1/`). Mode D:
+hair RGB 112/104/70, hue 48 deg, luminance 95; the apron white. Mode M, 2 M photons, 24 spp,
+`-gatherarea` at its default 8: on the **GPU** the hair is RGB 95/76/60, hue 27 deg (too
+orange), luminance 77 (-19 %), mean|diff| 35; on the **CPU** it is 79/95/51, hue 81 deg (too
+green), luminance 75 (-21 %), mean|diff| 33; the apron reads grey-pink on one and green on the
+other. So (1) the photon-map estimate is biased at an exhibit this small relative to its gather
+radius (0.65 m, chosen by the map's population over the whole hall), M-GATHERAREA
+notwithstanding, and (2) the two mode-M paths disagree with each other by as much as either
+disagrees with D -- two different biases, not noise. Neither is a hair problem: the scene has no
+strands. It matters because the flyby is 1147 frames of mode M, and any scene with `type hair`
+is refused by `cudaPhotonMapSupported` and runs the CPU path (`sceneUsesHairMaterial`: the device
+gather shades every query as Lambertian), so Alice with strands always gets the CPU's bias.
+What has been tried: x10 photons on a grey floor moved the CPU mean +11 % brighter and 20 deg
+warmer -- toward D -- so the radius the population buys may be most of it; being measured on the
+grid scene on both devices. Open: which of the two device paths differs from the shared
+estimator's definition (the GPU has no `-max-bounce`, its own `DSpecThr`, and no hair case).
