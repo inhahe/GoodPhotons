@@ -1,0 +1,46 @@
+# Alice with real hair -- meant to be INCLUDED by a scene that supplies cameras and lights:
+#
+#     include "alice_hair.ftsl"
+#
+# What it brings: the unchanged doll (meshes/alice.glb, with its own materials), an invisible
+# scalp (meshes/alice_scalp.obj -- the hair mass of that same mesh, segmented by
+# tools/alice_scalp.py; `shape_only`, so it roots the groom and then vanishes), the guide curves
+#
+#   meshes/ is an untracked asset store (*.obj and the .glb files are git-ignored), so on a fresh
+#   clone make the scalp once:   python tools/alice_scalp.py        (~20 s; needs Pillow + numpy)
+#
+# (scenes/alice_guides.ftsl -- streamlines traced down the sculpted hair by tools/alice_guides.py,
+# grouped as curves of curves), and the groom itself. The sculpted hair mass stays underneath as
+# the volume, so no bald skull shows through the strands.
+#
+# She stands on y = -0.95 at the origin, faces +z, and is 1.9 m tall. Wrap this file's contents
+# in a `group { translate ... rotate ... }` in the including scene to place her.
+#
+# Hair is 0.41..0.90 in y; the crown / bow is at (0.053, 0.894, -0.018).
+
+# the glb carries its own materials; the block material is only the fallback the loader requires
+material "alice_fallback" { type diffuse reflect 0.5 }
+mesh "alice" { file "meshes/alice.glb"  material alice_fallback }
+
+material "alice_scalp_mat" { type diffuse reflect 0.5 }
+mesh "alice_scalp" { file "meshes/alice_scalp.obj"  material alice_scalp_mat  shape_only yes }
+
+include "alice_guides.ftsl"
+
+# A blonde fiber: `reflect` is the colour the COAT should read as, inverted into the fiber's
+# interior absorption by the hair BCSDF; `preset human` supplies the measured cuticle / roughness.
+material "alice_hair" { type hair  preset human  reflect rgb 0.86 0.64 0.30 }
+
+fur "alice_hair" {
+    on "alice_scalp"   material alice_hair
+    density 250000                  # strands per m^2 of scalp: ~0.775 m^2 -> ~190 000 strands
+    guides "alice_hair"             # the curve of rings of guides: 30 streamlines, blended
+    guide_blend 3                   # nearest three guides, inverse-square weighted
+    points 8   segments 3   spline centripetal
+    radius 0.00035   radius_tip 0.00010
+    length_jitter 0.15              # +-15 % of the guided length
+    jitter 0.05                     # a little tip scatter
+    clump 0.35   clump_size 0.012   # 1.2 cm tufts
+    root_offset -0.002              # bed the roots 2 mm into the sculpted mass
+    seed 7
+}

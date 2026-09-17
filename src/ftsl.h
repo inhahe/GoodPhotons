@@ -5144,21 +5144,6 @@ private:
             if (!curveLeaf(b, p, xf, st)) return false;
             out.push_back(std::move(st));
         } else {                                                  // ---- curve of curves
-            const size_t C = kids.size();
-            const size_t M = kids[0].size();
-            for (size_t i = 1; i < C; ++i)
-                if (kids[i].size() != M) {
-                    fail("curve" + (b.name.empty() ? std::string() : " \"" + b.name + "\"") +
-                         ": every child must produce the same number of strands to be blended (child 1 makes " +
-                         std::to_string(M) + ", child " + std::to_string(i + 1) + " makes " + std::to_string(kids[i].size()) + ")");
-                    return false;
-                }
-            // Siblings blend point-for-point, so bring every strand to one point count.
-            size_t K = 0;
-            for (const auto& ks : kids) for (const auto& st : ks) K = std::max(K, st.pts.size());
-            for (auto& ks : kids) for (auto& st : ks)
-                if (st.pts.size() != K) st = resampleStrandCR(st, (int)K, p.alpha);
-
             bool closed = false;
             if (const Stmt* c = find(b, "closed")) {
                 // A bareword flag. `closed count 4` on one line would make `count` this flag's
@@ -5193,6 +5178,24 @@ private:
                 // No placement asked for: the instances ARE the children, bit-for-bit.
                 for (auto& ks : kids) for (auto& st : ks) out.push_back(std::move(st));
             } else {
+                // Placement BLENDS siblings, so only here must every child produce the same
+                // number of strands (a count-less node above is just a group and takes any).
+                const size_t C = kids.size();
+                const size_t M = kids[0].size();
+                for (size_t i = 1; i < C; ++i)
+                    if (kids[i].size() != M) {
+                        fail("curve" + (b.name.empty() ? std::string() : " \"" + b.name + "\"") +
+                             ": every child must produce the same number of strands to be blended (child 1 makes " +
+                             std::to_string(M) + ", child " + std::to_string(i + 1) + " makes " + std::to_string(kids[i].size()) +
+                             "); a node with no `count` / `density` is a plain group and accepts any");
+                        return false;
+                    }
+                // Siblings blend point-for-point, so bring every strand to one point count.
+                size_t K = 0;
+                for (const auto& ks : kids) for (const auto& st : ks) K = std::max(K, st.pts.size());
+                for (auto& ks : kids) for (auto& st : ks)
+                    if (st.pts.size() != K) st = resampleStrandCR(st, (int)K, p.alpha);
+
                 std::vector<Vec3> roots; roots.reserve(C);
                 for (const auto& ks : kids) roots.push_back(ks[0].pts[0]);
                 std::function<double(double)> rho;

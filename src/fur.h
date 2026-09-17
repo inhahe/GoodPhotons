@@ -101,6 +101,17 @@ struct FurSpec {
     double      rootOffset = 0.0;    // push the root along N (bed the strand into the skin)
     double      alpha = 0.0;         // `spline`: Catmull-Rom knot exponent (0 uniform, 0.5 centripetal)
 
+    // AUTHORED GUIDES (0.327.0). When non-empty, a strand's shape is the inverse-distance
+    // blend of the `guideBlend` nearest guides' ROOT-RELATIVE offsets, resampled to `points`
+    // control points at load; the closed-form shape (lift / comb / droop / length) is not
+    // used at all. Roots stay area-uniform -- guides say which way a hair goes, never where
+    // it starts. `guideFalloff` (metres) is the distance at which a guide's weight has
+    // fallen to 1/e^2 of its at-root value; 0 = pure inverse-square distance.
+    struct Guide { Vec3 root; std::vector<Vec3> off; std::vector<double> radii; };
+    std::vector<Guide> guides;
+    int         guideBlend = 3;      // k nearest guides blended (1 = nearest only)
+    double      guideFalloff = 0.0;  // Gaussian falloff radius, 0 = inverse-square only
+
     // BALD ZONES — spheres no strand may enter.  A coat is grown per BODY PART, but the
     // features that must stay bare (an eye, a nose leather, a scar) are separate little
     // spheres sitting ON that part, and the part's own fur does not know they are there:
@@ -236,8 +247,82 @@ inline void furSampleRoot(const FurSurface& s, const FurAreaCdf& cdf, Pcg32& rng
 // neighbour queries and no iteration.  Growth is LINEAR in t and every bend is QUADRATIC
 // in t, so the root leaves the skin along the growth direction (a strand that bends at its
 // root reads as broken) while the tip carries the full displacement.
+// GUIDED shape: the k nearest guides' root-relative offsets, blended by inverse distance
+// (optionally Gaussian-tapered), laid down from this strand's root. The random draws are
+// taken in the SAME order as the closed-form builder so a seed means the same hair either
+// way -- and so switching `guides` on does not reshuffle an existing coat's jitter.
+inline void furBuildStrandGuided(const FurSpec& spec, const Vec3& p, const Vec3& n,
+                                 Pcg32& rng, Vec3* out) {
+    Vec3 T, B; onb(n, T, B);
+    const double az = 2.0 * kPi * rng.uniform(); (void)az;        // keep the draw order
+    double jx = 0.0, jy = 0.0;
+    if (spec.jitter > 0.0) {
+        jx = (2.0 * rng.uniform() - 1.0) * spec.jitter;
+        jy = (2.0 * rng.uniform() - 1.0) * spec.jitter;
+    }
+    const double jl = 1.0 + (2.0 * rng.uniform() - 1.0) * spec.lengthJitter;
+    const double lscale = std::max(0.05, jl);
+    const double phase = 2.0 * kPi * rng.uniform();
+
+    // k nearest guide roots. Guides are few (tens to hundreds), strands are many, so a
+    // linear scan per strand is both simpler and, at these counts, faster than a grid.
+    const int G = (int)spec.guides.size();
+    int k = std::max(1, std::min(spec.guideBlend, G));
+    int    bi[8]; double bd[8];
+    if (k > 8) k = 8;
+    for (int i = 0; i < k; ++i) { bi[i] = -1; bd[i] = 1e300; }
+    for (int g = 0; g < G; ++g) {
+        const Vec3 d = spec.guides[(size_t)g].root - p;
+        const double dd = dot(d, d);
+        if (dd >= bd[k - 1]) continue;
+        int j = k - 1;
+        while (j > 0 && bd[j - 1] > dd) { bd[j] = bd[j - 1]; bi[j] = bi[j - 1]; --j; }
+        bd[j] = dd; bi[j] = g;
+    }
+    double w[8], wsum = 0.0;
+    for (int i = 0; i < k; ++i) {
+        if (bi[i] < 0) { w[i] = 0.0; continue; }
+        const double d2 = bd[i];
+        double wi = 1.0 / (d2 + 1e-12);                         // inverse-square distance
+        if (spec.guideFalloff > 0.0) wi *= std::exp(-2.0 * d2 / (spec.guideFalloff * spec.guideFalloff));
+        w[i] = wi; wsum += wi;
+    }
+    if (!(wsum > 0.0)) { w[0] = 1.0; wsum = 1.0; }              // beyond every falloff: nearest
+    for (int i = 0; i < k; ++i) w[i] /= wsum;
+
+    const int N = spec.points;
+    const Vec3 root = p + n * spec.rootOffset;
+    // The blended offsets, and the strand's own length for the jitter / curl scales.
+    double L = 0.0;
+    for (int kk = 0; kk < N; ++kk) {
+        Vec3 o{0, 0, 0};
+        for (int i = 0; i < k; ++i)
+            if (bi[i] >= 0) o = o + spec.guides[(size_t)bi[i]].off[(size_t)kk] * w[i];
+        out[kk] = root + o * lscale;
+        if (kk > 0) L += length(out[kk] - out[kk - 1]);
+    }
+    // Growth direction for the curl frame and the jitter: the blended first leg.
+    Vec3 dir = (N > 1) ? out[1] - out[0] : n;
+    if (dot(dir, dir) < 1e-24) dir = n;
+    dir = normalize(dir);
+    Vec3 U, V; onb(dir, U, V);
+    const double curlR = spec.curl * L;
+    const double c0 = std::cos(phase), s0 = std::sin(phase);
+    for (int kk = 0; kk < N; ++kk) {
+        const double t = (N > 1) ? (double)kk / (double)(N - 1) : 0.0;
+        Vec3 q = out[kk];
+        if (spec.jitter > 0.0) q = q + (T * jx + B * jy) * (L * t * t);
+        if (curlR > 0.0) {
+            const double a = 2.0 * kPi * spec.curlFreq * t + phase;
+            q = q + U * (curlR * (std::cos(a) - c0)) + V * (curlR * (std::sin(a) - s0));
+        }
+        out[kk] = q;
+    }
+}
+
 inline void furBuildStrand(const FurSpec& spec, const Vec3& p, const Vec3& n,
                            Pcg32& rng, Vec3* out) {
+    if (!spec.guides.empty()) { furBuildStrandGuided(spec, p, n, rng, out); return; }
     Vec3 T, B; onb(n, T, B);
 
     // Growth direction: the normal tipped toward a random tangential azimuth by (1-lift),

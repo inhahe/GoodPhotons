@@ -78,15 +78,31 @@ oracle. `tools/curve_rig.py` passes all seven checks: midpoint = average, identi
 (and render byte-identical), resample ends exact, level-3 product, by-name = inline, closed
 spacing, spline knob wired with `uniform` byte-identical. FTSL §8.6.
 
-### 0.3 `fur ... guides` — NOT STARTED
-Rig: a strand rooted exactly at a guide's root must reproduce that guide point for point (with
-jitter 0, clump 0); a root midway between two guides must be their average; `guide_blend 1` must
-equal nearest-guide.
+### 0.3 `fur ... guides` — **DONE (v0.327.0)**
+`FurSpec::Guide` + `furBuildStrandGuided` (fur.h), `guides` / `guide_blend` / `guide_falloff`
+parsed in `addFur` against `curveByName_`. `tools/guide_rig.py` (deterministic roots on a 2-µm
+quad, read back with `-dumpcurves`): reproduce-at-root, midpoint = average, nearest-only, and the
+unguided path untouched. FTSL §8.7 "Guided grooms".
 
-### 0.4 Alice's groom — NOT STARTED
-`scenes/alice_hair.ftsl` (GLB unchanged + `shape_only` scalp + guides + fur), included from
-whatever scene wants her. Iterated against the five head views in `png/alicehair/`. Promote the
-segmentation script and the scalp OBJ to `tools/` / a tracked asset location in the same commit.
+### 0.4 Alice's groom — IN PROGRESS (v0.327.0 lands the inputs; the look is not yet judged)
+- `tools/alice_scalp.py` -> `meshes/alice_scalp.obj` (91 634 tris, 0.775 m^2). `meshes/` is an
+  UNTRACKED asset store (`*.obj` and the `.glb`s are git-ignored — even `alice.glb`), so the OBJ
+  is regenerated, not committed; the scene header says so.
+- `tools/alice_guides.py` -> `scenes/alice_guides.ftsl`: guides are STREAMLINES traced down the
+  sculpted hair surface (gravity on the tangent plane, re-projected onto the scalp each step), from
+  four horizontal rings of roots, the last at the hairline (a root on the face snaps to the scalp's
+  rim, which is the hairline). 63 guides in 4 closed rings, as curves of curves. Visualised over a
+  ghost body in `png/alicehair/guides_*.png`: back and sides hug the sculpt; the first version had
+  almost nothing at the front, which is why the hairline ring exists.
+- `scenes/alice_hair.ftsl`: doll + `shape_only` scalp + `include "alice_guides.ftsl"` +
+  `fur { guides "alice_hair" ... }`, ~190k strands. Harness: `scraps/alice_hair_test.ftsl`.
+- Three real-use catches on the way, all now fixed: the emitter wrote `closed  spline centripetal`
+  on one line (the strict `closed` refused it -- the check paid for itself on its first scene); a
+  count-less curve of rings with 10/14/18/21 guides was refused by the equal-strand-count rule,
+  which only belongs to BLENDING (fixed: a group takes any); the glb mesh block needs a fallback
+  `material` even though the glb carries its own.
+- NEXT: the first look (`png/alicehair/groom1_front.png`), then iterate: guide density at the
+  fringe, `guide_blend`, clump size, strand radius, hair colour, and the five views.
 
 ---
 

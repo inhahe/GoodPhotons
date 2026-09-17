@@ -1035,6 +1035,16 @@ strand tessellator gained the same knot rule (`tessellateCurve(..., alpha)`, Bar
 strand and a groom. `-dumpcurves` writes the emitted polylines; `tools/curve_rig.py` checks the
 rule exactly against them.
 
+**Guided grooms (0.327.0).** `fur { guides "name" … }` resolves named curves from
+`curveByName_` in the deferred fur sweep (complete by then), resamples each strand to `points`
+and stores it root-relative (`FurSpec::Guide`). `furBuildStrandGuided` (fur.h) replaces the
+closed-form builder when guides exist: k nearest guide roots by linear scan (guides are tens to
+hundreds; a grid would cost more than it saves), inverse-square weights with an optional
+Gaussian `guide_falloff`, the blended offsets laid from the strand's own root, then the
+existing jitter / curl on top and clump / bald downstream unchanged. Random draws are taken in
+the closed-form builder's order so a seed is the same hair either way. Roots are untouched —
+guides are a shape field over area-uniform roots, never a root distribution.
+
 **The media term joined it in 0.322.0** (`Renderer::mediumTransmittanceSpec`,
 `dMedTransmittanceSpec`). A transmittance is a stochastic estimate, so it cannot use the ratio
 trick (`E[A/B] != E[A]/E[B]`); the walk carries a per-wavelength vector instead, in three tiers —

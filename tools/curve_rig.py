@@ -143,6 +143,14 @@ def main():
     s = dump(w("closed", 'curve "loop" { material m  basis linear  segments 1  count 4\n    closed\n    %s\n    %s\n}\n' % (G1, G2)))
     check("closed", len(s) == 4 and close(s[0], g1) and close(s[2], g2), "instance 2 sits on child 1")
 
+    # 8. group: a count-less node accepts children with DIFFERENT strand counts (it only blends
+    #    when placing), and emits their concatenation
+    s = dump(w("group", 'curve "grp" { material m  basis linear  segments 1\n'
+                        '    curve { count 3\n        %s\n        %s\n    }\n'
+                        '    curve { point 3 0 0  point 3 1 0  point 3 2 0 }\n}\n' % (G1, G2)))
+    check("group", len(s) == 4 and close(s[1], mean(g1, g2)) and close(s[3], [(3, 0, 0, 0.001), (3, 1, 0, 0.001), (3, 2, 0, 0.001)]),
+          "%d strands: a 3-instance child plus a single" % len(s))
+
     # 7. spline knob on a single strand
     base = 'curve "s" { material m  point 0 0 0  point 0 1 0  point 1 1.2 0  point 1 3 0 }\n'
     su = dump(w("sp_uniform", base.replace('{ material m', '{ material m  spline uniform')))

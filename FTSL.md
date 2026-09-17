@@ -1874,14 +1874,19 @@ curve "hair" {                        # a curve of curves of curves: 5 rows, cro
   An open path spans both ends; `closed` spaces `i/N` so the last instance is not the first.
 - **No `count` and no density: the instances *are* the children, bit-for-bit.** A node is then
   just a group — which is what keeps two levels as simple as one.
-- A level-*k* node blends level-(*k*−1) *objects*: every child must produce the **same number
-  of strands** (an error names the mismatch), and siblings with different point counts are
-  **resampled by arc length** to the largest count first (ends exact). A level-3 node with
-  `count 5` over children with `count 9` emits 45 strands.
+- A level-*k* node blends level-(*k*−1) *objects*: when it **places** (`count` / a density),
+  every child must produce the **same number of strands** (an error names the mismatch), and
+  siblings with different point counts are **resampled by arc length** to the largest count
+  first (ends exact). A level-3 node with `count 5` over children with `count 9` emits 45
+  strands. A node with **no** `count` / density is a plain group and accepts any children —
+  four rings of 10, 14, 18 and 21 guides is a fine group and a wrong blend.
 - Children **inherit** `radius` / `radius_tip` / `basis` / `segments` / `spline` from their
   parent unless they set their own; `basis`, `segments` and `spline` used for tessellation are
   the **outermost** node's (a strand is flattened once, at the top).
 - A node may hold points **or** curves, not both — refused with a message.
+- `closed` is a bareword flag and must stand alone on its line: `closed  count 4` on one line
+  would make `count` its *value* (§1.1) and lose the count, so the curve parser **refuses**
+  `closed <anything but on/off>` naming the line.
 - A **named curve without a `material` is a definition**: registered for later `curve "name"`
   children and for `fur … guides` (§8.7), not rendered (the load log says so). An *unnamed*
   curve still needs a material.
@@ -1958,8 +1963,40 @@ fur "ball_coat" {
 | `curl_freq <n>` | turns over the strand's length. Default `3` |
 | `clump <0..1>` | blend toward the nearest tuft guide. Default `0` (off) |
 | `clump_size <l>` | tuft **radius** — one guide per `π·clump_size²` of surface. Default `0.02` |
+| `guides "<curve>" …` | **shape the coat from authored curves** (0.327.0): the named curves' strands (a `curve`, or a curve of curves — §8.6) become guides, and each hair is the blend of the `guide_blend` nearest guides' root-relative offsets. See *Guided grooms* below |
+| `guide_blend <k>` | how many nearest guides blend into one hair, inverse-square-distance weighted. Default `3`; `1` = nearest guide only |
+| `guide_falloff <l>` | optional Gaussian taper on those weights (metres): a guide's pull falls to 1/e² at this distance. Default `0` = pure inverse-square |
 | `bald "<sphere>" [margin]` | a **named sphere already in the scene** that no strand may enter, optionally grown by `margin`. Repeatable |
 | `bald <x> <y> <z> <r>` | the same as an explicit centre + radius, for a zone that isn't an authored sphere |
+
+**Guided grooms (`guides`).** The closed-form shape above has one comb direction for the whole
+coat, which cannot say "forward at the fringe, down at the sides, back over the crown". With
+`guides`, each hair's shape is instead taken from **authored curves**: name any curves (a hand-
+written strand, or a curve of curves that sweeps a handful of guides along the hairline — §8.6),
+and every root finds its `guide_blend` nearest guide roots, weights them by inverse-square
+distance (optionally Gaussian-tapered by `guide_falloff`), and lays the blended **root-relative**
+offsets down from its own root. Guides are resampled to `points` control points at load, so the
+blend is point-for-point. **Roots stay area-uniform on the surface** — guides say which way a
+hair goes, never where it starts — so a dozen curves shape a coat of hundreds of thousands.
+
+```
+curve "hair" { count 5  curve "fringe"  curve "row_2"  curve "row_3"  curve "nape" }   # a definition
+fur "alice_hair" { on "alice_scalp"  material hair  density 250000  points 6
+                   guides "hair"  guide_blend 3  length_jitter 0.25  jitter 0.08  clump 0.3 }
+```
+
+What still applies on top of a guided shape: `length_jitter` (scales the whole strand), `jitter`
+(a tip displacement, quadratic in `t`), `curl`, `clump`, `bald`, `root_offset`, `radius` and the
+taper, `spline`. What is **ignored, with a load-log line saying so**: `length`, `lift`,
+`direction`/`comb`, `droop` — the guides *are* the shape. The "never grow into the surface" lift
+is skipped too: a guide authored to hug the skin is the author's intent. `seed` means the same
+hair with or without guides (the random draws are taken in the same order).
+
+Proved by `tools/guide_rig.py`, which roots hairs deterministically on a 2-µm quad and reads
+them back with `-dumpcurves`: a hair rooted at a guide's own root with `guide_blend 1` **is** that
+guide point for point; a root midway between two parallel guides with `guide_blend 2` is their
+average; `guide_blend 1` at a root nearer guide B reproduces B; the same block without `guides`
+still builds its closed-form hair.
 
 **`bald` is how features stay bare.** A coat is grown per body *part*, but the things that
 must not be furred — an eye, a nose leather, a scar — are separate little spheres sitting

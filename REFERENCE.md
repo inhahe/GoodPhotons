@@ -4584,7 +4584,10 @@ along the path by arc length — the camera's evaluator, the camera's placement 
 camera's `spline` and `closed`. No `count`: the instances are the children, bit-for-bit. A named
 curve without a material is a definition for later `curve "name"` children and for `fur guides`.
 `-dumpcurves <file>` writes every emitted strand's polyline after the load. Full rule and the
-exact rig (`tools/curve_rig.py`): FTSL.md §8.6. `spline` is also accepted on `fur` and on a
+exact rig (`tools/curve_rig.py`): FTSL.md §8.6. **`fur … guides "<curve>"` (0.327.0)** then
+uses such curves as the *shape field* of a groom: each area-uniform root takes the
+inverse-distance blend of its `guide_blend` nearest guides' root-relative offsets, so a dozen
+authored curves shape a coat of hundreds of thousands (FTSL.md §8.7, `tools/guide_rig.py`). `spline` is also accepted on `fur` and on a
 plain strand (`uniform` default, bit-identical to before).
 
 ### Including files (`include "file.ftsl"`)
