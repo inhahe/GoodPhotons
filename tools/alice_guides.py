@@ -107,17 +107,25 @@ class Surface:
         return q[j], self.fn[idx[j]]
 
 
-def trace(surf, root, step=0.02, max_steps=60, bottom=HAIR_BOTTOM, outward_bias=0.15):
+def trace(surf, root, step=0.02, max_steps=60, bottom=HAIR_BOTTOM, outward_bias=0.15,
+          sweep=0.0, lift0=0.004, lift1=0.006):
     """Downhill on the surface from `root`: gravity projected onto the tangent plane, with a small
     outward bias so a streamline never dives through the head where the sculpt overhangs."""
     p, n = surf.closest(root)
-    pts = [p.copy()]
+    if np.dot(n, p - HEAD_CENTRE) < 0: n = -n          # face normals oriented OUTWARD
+    pts = [p.copy()]; nrm = [n.copy()]
     g = np.array([0.0, -1.0, 0.0])
     for _ in range(max_steps):
         # outward = away from the head centre, projected on the tangent plane too
         out = p - HEAD_CENTRE; out[1] = 0.0
         out = out / max(np.linalg.norm(out), 1e-9)
         d = g - n * np.dot(g, n) + out * outward_bias
+        # THE FRINGE: the sculpt sweeps its front hair across the forehead from her right (+x)
+        # to her left, not straight down over the face. Downhill-on-the-surface cannot know
+        # that, so front roots get a sideways bias that fades out past the temples.
+        front = max(0.0, (p[2] - 0.04) / 0.14)               # 0 at the ears, 1 at the brow
+        if front > 0.0:
+            d = d + np.array([-1.0, 0.0, 0.0]) * (sweep * front)
         d = d - n * np.dot(d, n)
         if np.linalg.norm(d) < 1e-6:
             break
@@ -127,10 +135,20 @@ def trace(surf, root, step=0.02, max_steps=60, bottom=HAIR_BOTTOM, outward_bias=
         if np.linalg.norm(q - p) < 0.25 * step:       # stuck (a pocket): stop
             break
         p, n = q, n2
-        pts.append(p.copy())
+        if np.dot(n, p - HEAD_CENTRE) < 0: n = -n
+        pts.append(p.copy()); nrm.append(n.copy())
         if p[1] < bottom:
             break
-    return np.array(pts)
+    pts, nrm = np.array(pts), np.array(nrm)
+    # FLOAT the guide off the sculpt. A strand blended from surface-hugging guides on a CONVEX
+    # head lies on the chord between them, i.e. INSIDE the surface, and a root pushed under the
+    # skin never emerges -- the first render was bald on the crown for exactly this reason. So
+    # each guide rides a little above the sculpt, more toward the tip where the hair mass is
+    # thickest: h(t) = lift0 + lift1 * t along its own arc length.
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    t = np.concatenate([[0.0], np.cumsum(seg)]); t = t / max(t[-1], 1e-9)
+    pts = pts + nrm * (lift0 + lift1 * t)[:, None]
+    return pts
 
 
 def decimate(pts, k=7):
@@ -175,7 +193,12 @@ def main():
             ph = 2 * math.pi * (ai + 0.5 * (ri % 2)) / around       # stagger alternate rings
             dirv = up * math.cos(th) + (t0 * math.cos(ph) + t1 * math.sin(ph)) * math.sin(th)
             root = HEAD_CENTRE + dirv * 0.17
-            pts = decimate(trace(surf, root))
+            # the sculpt's fringe is a SHORT swept bang over the brow, not a curtain over the
+            # face: a hairline-ring root in front traces only ~7 steps (~0.14 m) before it stops.
+            brow = (ri == args.rings - 1) and (root[2] > 0.06)
+            pts = decimate(trace(surf, root, max_steps=5 if brow else 60,
+                                 sweep=1.2 if (ri == args.rings - 1) else 0.0),
+                           k=5 if brow else 7)
             if len(pts) >= 3:
                 row.append(pts)
         rows.append(row)

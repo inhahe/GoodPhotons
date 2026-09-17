@@ -132,6 +132,27 @@ def main():
         a, b_, c = remap[I[t]] + 1; L.append("f %d//%d %d//%d %d//%d" % (a, a, b_, b_, c, c))
     io.open(args.out, "w", encoding="utf-8", newline="\n").write("\n".join(L) + "\n")
     print("wrote %s (%d verts, %d tris)" % (args.out, len(used), len(sel)))
+
+    # THE SCALP CAP. A doll's hair is rooted on the skull -- the top of the head from the hairline
+    # back and down to the nape -- not over the whole hanging mass. Rooting strands over the entire
+    # mass (0.775 m^2, sides and back included) grows hair out of hair and reads as a fuzzy dome.
+    # The cap is the part of the mass within 16 cm of the skull centre and above the nape; the
+    # rest of the mass stays useful as the surface the guide streamlines follow.
+    centre = np.array([0.0, 0.80, 0.02])
+    cc = P[I[sel]].mean(1)
+    cap = sel[(np.linalg.norm(cc - centre, axis=1) < 0.16) & (cc[:, 1] > 0.70)]
+    Tc = P[I[cap]]
+    capArea = 0.5 * np.linalg.norm(np.cross(Tc[:, 1] - Tc[:, 0], Tc[:, 2] - Tc[:, 0]), axis=1).sum()
+    usedc = np.unique(I[cap]); remapc = -np.ones(len(P), dtype=np.int64); remapc[usedc] = np.arange(len(usedc))
+    Lc = ["# alice scalp CAP: the rooted part of the hair mass (within 0.16 m of the skull centre, above the nape)"]
+    Lc += ["v %.6f %.6f %.6f" % tuple(q) for q in P[usedc]] + ["vn %.5f %.5f %.5f" % tuple(n) for n in N[usedc]]
+    for t in cap:
+        a, b_, c = remapc[I[t]] + 1; Lc.append("f %d//%d %d//%d %d//%d" % (a, a, b_, b_, c, c))
+    capOut = args.out.replace(".obj", "_cap.obj")
+    io.open(capOut, "w", encoding="utf-8", newline="\n").write("\n".join(Lc) + "\n")
+    q = P[usedc]
+    print("wrote %s (%d tris, %.4f m^2; y %.2f..%.2f, |x| %.2f, z %.2f..%.2f)" %
+          (capOut, len(cap), capArea, q[:, 1].min(), q[:, 1].max(), np.abs(q[:, 0]).max(), q[:, 2].min(), q[:, 2].max()))
     return 0
 
 

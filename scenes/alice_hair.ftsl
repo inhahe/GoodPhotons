@@ -23,24 +23,34 @@ material "alice_fallback" { type diffuse reflect 0.5 }
 mesh "alice" { file "meshes/alice.glb"  material alice_fallback }
 
 material "alice_scalp_mat" { type diffuse reflect 0.5 }
-mesh "alice_scalp" { file "meshes/alice_scalp.obj"  material alice_scalp_mat  shape_only yes }
+# the scalp CAP: the rooted part of the hair mass, within 16 cm of the skull centre and above the
+# nape (~0.1 m^2 -- a 7-inch doll's scalp at this scale). The hanging sides and back of the sculpt
+# stay as the volume the strands drape over; hair is not rooted on them.
+mesh "alice_scalp" { file "meshes/alice_scalp_cap.obj"  material alice_scalp_mat  shape_only yes }
 
 include "alice_guides.ftsl"
 
 # A blonde fiber: `reflect` is the colour the COAT should read as, inverted into the fiber's
 # interior absorption by the hair BCSDF; `preset human` supplies the measured cuticle / roughness.
-material "alice_hair" { type hair  preset human  reflect rgb 0.86 0.64 0.30 }
+material "alice_hair" { type hair  preset human  reflect rgb 0.88 0.60 0.25  beta_m 0.3  beta_n 0.35 }
 
+# She is a ~7-inch doll at 10.5x life. Rooted doll fiber is ~0.1 mm, so ~1 mm here (radius 0.5 mm,
+# almost no taper -- synthetic fiber is constant-diameter); a doll head carries a few hundred to a
+# thousand plugs of ~20 fibers, so ~15 000 strands, gathered into plug-sized locks by `clump`.
+# `count` rather than `density`, and metre radii: if she is later put at true size inside a
+# `group { scale 0.094 }`, the radii scale with her and the count stays.
 fur "alice_hair" {
     on "alice_scalp"   material alice_hair
-    density 250000                  # strands per m^2 of scalp: ~0.775 m^2 -> ~190 000 strands
-    guides "alice_hair"             # the curve of rings of guides: 30 streamlines, blended
-    guide_blend 3                   # nearest three guides, inverse-square weighted
+    count 15000
+    guides "alice_hair"             # the rings of streamline guides, blended
+    guide_blend 3
     points 8   segments 3   spline centripetal
-    radius 0.00035   radius_tip 0.00010
-    length_jitter 0.15              # +-15 % of the guided length
-    jitter 0.05                     # a little tip scatter
-    clump 0.35   clump_size 0.012   # 1.2 cm tufts
-    root_offset -0.002              # bed the roots 2 mm into the sculpted mass
+    radius 0.0005   radius_tip 0.0004
+    length_jitter 0.12
+    jitter 0.04
+    clump 0.7   clump_size 0.025    # locks ~2.5 cm across (plug rows gather into these)
+    curl 0.04   curl_freq 1.5       # a gentle wave so the tips are not a straight hem
+    root_offset 0.001
+    bald 0 0.71 0.15 0.11           # the FACE below the brow (top at y 0.82): bangs may cover the forehead, not the eyes
     seed 7
 }

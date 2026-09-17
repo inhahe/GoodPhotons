@@ -101,8 +101,46 @@ unguided path untouched. FTSL §8.7 "Guided grooms".
   count-less curve of rings with 10/14/18/21 guides was refused by the equal-strand-count rule,
   which only belongs to BLENDING (fixed: a group takes any); the glb mesh block needs a fallback
   `material` even though the glb carries its own.
-- NEXT: the first look (`png/alicehair/groom1_front.png`), then iterate: guide density at the
-  fringe, `guide_blend`, clump size, strand radius, hair colour, and the five views.
+- **Iterations so far** (`png/alicehair/groom{1,2,3,4}_*.png`):
+  1. groom1: rainbow speckle pinned to a 1e15 maximum -- NOT the hair, NOT the guides: the
+     harness sun was `preset:d65 intensity 90`, a Planckian 1e14 times the real sun, hidden by
+     auto-exposure in every earlier render. Five probes cleared the fibers before the one that
+     mattered (no fur at all: floor at 4.7e14 in R and D). Fixed in 0.328.0/0.328.1 with a load
+     guard; the quick-view key had the same fault. Written up in known-issues.
+  2. groom2 (sane sun): the strands follow the sculpt's flow and hang like hair -- but the CROWN
+     WAS BALD: `root_offset -0.002` buried roots, and blending surface-hugging guides on a convex
+     head puts the chord INSIDE the surface. Fix: guides floated off the sculpt along the normal
+     (4 mm at the root -> 16 mm at the tip), `root_offset +0.001`.
+  3. groom3: crown covered, radial flow from the bow reads well on the back. Still: the fringe
+     drapes over the face (hairline streamlines run downhill, the sculpt sweeps them sideways);
+     fibers read grey; spectral speckle persists at 96 spp with 0.6 mm fibers (sub-pixel at this
+     framing -- the documented aggregate-LOD gap). `-fur-volume` is smoother but far too coarse
+     for a close-up (128^3 voxels over the head); fine for distance.
+  4. groom4 (rendering): sideways sweep 2.5 on front roots, hairline ring traced as SHORT BANGS
+     (~0.14 m), brighter blonde `reflect rgb 0.96 0.82 0.52  beta_m 0.2`, `-denoise`, 128 spp.
+  5. groom5/6: the sparkle survives mode R's `-rgb` path (byte-identical on a fiber ball), so it is
+     hair-lobe Monte Carlo variance, not spectral noise: 8x spp cuts chroma noise by the expected
+     sqrt(8); softer lobes and the denoiser help; NOT a reason to fatten fibers.
+  6. Machinery verified VISUALLY on toy scenes (`png/curvevis/`): nine strands morph straight ->
+     curled; a level-3 node blends rows; a fur ball rendered puffball / comb-over / whorl from
+     hand-placed guides. Alice's look is the groom's problem, not the tools'.
+  7. The dome diagnosis: roots were spread over the WHOLE sculpted hair mass (0.775 m^2), so hair
+     grew out of hair. Rebuilt (groom7): roots on a SCALP CAP (the mass within 16 cm of the skull
+     centre, above the nape, ~0.1 m^2 -- `tools/alice_scalp.py` now writes
+     `meshes/alice_scalp_cap.obj`); doll numbers, since she is a ~7-inch doll at 10.5x life:
+     15 000 strands, radius 0.5 mm (rooted doll fiber ~0.1 mm at 1:1), rooted rows as locks
+     (`clump 0.7  clump_size 0.012`), `count` not `density` so a later true-size `group { scale }`
+     keeps the groom; wide framing (whole hair to the shoulders).
+  8. groom7 (four wide views, `png/alicehair/groom7_*.png`): the first result that reads as a
+     DOLL -- face clear, hair rooted on the cap and hanging as a fine wig over the molded base, the
+     sculpt's flared curls showing through as the underlayer. 12 683 strands after the face cull,
+     ~40 s a view. Faults left: the face zone reached y 0.87 and ate the bangs (forehead bare);
+     the fiber reads silver (white R lobe over a pale `reflect`); 1.2 cm locks invisible.
+  9. groom8: face zone lowered to a top of y 0.82 (bangs may cover the forehead, not the eyes),
+     `reflect rgb 0.88 0.60 0.25`, 2.5 cm locks, `curl 0.04 curl_freq 1.5`.
+- NEXT: judge groom8, commit the iteration, show the user; then colour/lighting for blonde, the
+  part line / fringe shape, and what the mode-M flyby does with fibers (mode M gathers on
+  strand surfaces -- its noise behaviour is a different question from mode R's).
 
 ---
 
