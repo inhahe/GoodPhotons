@@ -11,6 +11,78 @@ costs one `grep`; chasing finished work costs a session.
 
 ---
 
+## 0. IN PROGRESS — real hair for Alice: `include`, curves of curves, guide-driven fur
+
+Asked 2026-09-17: convert the hair in `meshes/alice.glb` to real strands, matching the sculpted
+flow by eye, without authoring every strand — via a general "curves of curves" structure. Four
+pieces, built in this order because each is testable on its own and the later ones depend on it.
+
+**What was found first (all measured, none guessed):**
+- Alice is ONE fused mesh, one material, 407 792 tris. There is no hair mesh; the hair is sculpted
+  into the same shell as the head. So step one is segmentation.
+- **Colour cannot segment it**: forehead and hair are painted the same (hue 34 vs 36 deg, sat 0.49
+  vs 0.52, val 0.91 vs 0.92). **Surface roughness cannot either**: the sculpted hair is smoother
+  (5.3 deg mean dihedral) than the face (6.7 forehead, 15 cheeks). The roughness map is flat.
+- What worked: warm-coloured triangles above the dress, minus a face ellipsoid placed off the nose
+  tip (0, 0.723, 0.221), minus the throat, then the LARGEST CONNECTED COMPONENT — after **welding
+  vertices by position** (Meshy duplicates every vertex along every UV seam; index connectivity
+  shatters into 53 pieces, welded it is 8 with the hair mass at 91 634 tris). Verified from five
+  angles. `scraps/alice_scalp.obj`, 0.775 m^2; the segmentation lives in session scratch and
+  must be promoted to `tools/` when the groom is committed (see the standing constraint).
+- She faces +z; +x is HER right. Crown / bow at (0.053, 0.894, -0.018). Hair spans y 0.41..0.90.
+- The flow, read off the sculpt: everything radiates from the crown; back falls straight; sides
+  fall down and slightly back over the ears, flaring at the tips; the fringe sweeps across the
+  forehead from her right to her left; ends curl outward. Estimate: 4-5 curves-of-curves, ~15
+  guides, 150-300k strands ~0.48 m long.
+- **glTF has no curve primitive**, so the deliverable is an FTSL scene, not a GLB.
+
+**Design decisions (agreed 2026-09-17):**
+- Curves use the CAMERA's evaluator (`ftsl.h catmullRomAt`: Catmull-Rom, `spline
+  uniform|centripetal|chordal`, `closed`, arc-length placement with `count`/`density`/`density_at`)
+  and `camera_curve`'s syntax. The three curve implementations in the codebase are all
+  Catmull-Rom family (camera: alpha-parameterised; `curve.h` strands and loom: uniform); the
+  camera's is the superset. `spline` is also to be exposed on `curve`/`fur`, defaulting to
+  `uniform` so nothing existing changes.
+- **One recursive rule, any depth:** a `curve` is a sequence of children; a child is a `point` or a
+  `curve` (inline, or by name). Children are points -> a strand (today's `curve`, unchanged).
+  Children are curves -> the path is the Catmull-Rom through the children's ROOTS, the shape at a
+  parameter is the point-wise Catmull-Rom blend of the children's control points on ROOT-RELATIVE
+  offsets, and `count`/`density`/`density_at` place instances along the path by arc length.
+  Children with different point counts are resampled by arc length to a common count at load.
+  Two levels is as simple as one because a leaf is just `point x y z`. The grammar is already
+  generic and recursive, so this costs no grammar change.
+- A recursive `curve` with a `material` renders directly (rows of grass, a braid). Referenced from
+  `fur ... guides "<name>"` it is the SHAPE FIELD that area-uniform roots on the scalp interpolate
+  (k nearest guides, inverse-distance, on root-relative offsets), with the existing
+  jitter/clump/curl/length_jitter applied on top.
+- `include "file.ftsl"`: paths resolve relative to the INCLUDING file, then the root scene's
+  directory, then cwd (the existing asset order); cycles are an error naming the chain; blocks
+  splice in place so names cross files (a `fur` in the main scene can grow on a scalp defined in
+  the included one). Needs one grammar rule (there is no brace-less top-level form today),
+  regenerating `src/gpda/ftsl_scene.gen.cpp` via `python -m loom.grammar.emit_cpp`, a reducer
+  case, and a post-parse splice in `loadSource`.
+
+### 0.1 `include` — NOT STARTED
+Rig: a scene split across two files must render byte-identical to the same scene in one file;
+a cycle must fail with the chain named; a bad path must fail naming the INCLUDING file and line.
+
+### 0.2 Recursive `curve` + `spline` on strands — NOT STARTED
+Rig: a curve of two straight guides whose blend is analytically known (the midpoint instance of
+two parallel strands is their average, point for point); `count 3` between them must emit exactly
+that. A level-3 curve must reduce to the same strands as writing its level-2 children out by hand.
+
+### 0.3 `fur ... guides` — NOT STARTED
+Rig: a strand rooted exactly at a guide's root must reproduce that guide point for point (with
+jitter 0, clump 0); a root midway between two guides must be their average; `guide_blend 1` must
+equal nearest-guide.
+
+### 0.4 Alice's groom — NOT STARTED
+`scenes/alice_hair.ftsl` (GLB unchanged + `shape_only` scalp + guides + fur), included from
+whatever scene wants her. Iterated against the five head views in `png/alicehair/`. Promote the
+segmentation script and the scalp OBJ to `tools/` / a tracked asset location in the same commit.
+
+---
+
 ## 1. The `gallery_rain` 960x540 flyby — THE DELIVERABLE, and it has never been launched
 
 1147 frames, `camera_curve "fly"`, mode M. Everything below it (`-sunnee`, VOLCACHE, the spectral
