@@ -29454,3 +29454,14 @@ hue 54 deg, luminance 86 (still 9 % dark). So the bias is the gather radius the 
 the residual GPU-vs-CPU gap at 20 M (the GPU has no `-max-bounce`, its own `DSpecThr`, and no
 hair case), and whether a smaller radius with fewer photons (the map's `buildAuto` choice) would
 do the same for less memory.
+
+**With strands the walk was missing the fibers' own direct light (fixed in 0.334.0, HAIR-NEE).**
+At 20 M photons the strands still rendered at luminance 68 against mode D's 97 for the same
+scene: mode M's walk only ever collected radiance at the diffuse surface a chain finally lands on,
+and a chain through a hair mass lands on the shadowed scalp or dress. Both walks now connect to
+the lights at every fiber vertex (mode R's split); the strands read 85. The remaining 12 % is
+open: candidates are the walk's 32-bounce cap on a deep chain and the single light sample per
+fiber vertex in a hall whose largest emitter is a 45 m quad lit only along its gridlines. The NEE
+term is monochromatic at the camera's wavelength (as every direct term in this walk is), so it
+adds coloured speckle that the chroma filter removes; a spectral NEE (the shadow ray shared, the
+BCSDF and the emitter's spd evaluated at the SpecThr grid) would remove it at the source.

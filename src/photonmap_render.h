@@ -114,6 +114,13 @@ inline int gaGeomLayers() {
     return n;
 }
 
+// HAIR-NEE (0.334.0): mode M's camera walk connects to the lights at every fiber vertex it
+// scatters through (see the Hair case of photonGather). FTRACE_HAIR_NEE=0 turns it off, for
+// paired measurements only.
+inline bool hairNeeOn() {
+    static const bool on = [] { const char* e = std::getenv("FTRACE_HAIR_NEE"); return !(e && e[0] == '0'); }();
+    return on;
+}
 inline int gatherAreaSamples() {
     static const int m = [] {
         const char* e = std::getenv("FTRACE_GATHERAREA");
@@ -1019,6 +1026,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
     BackwardRenderer bwNee; bwNee.diffraction = diffraction;
     const bool gneeOn = BackwardRenderer::glossyNeeOn();
     BackwardRenderer::GlossyMis gmis;
+    bool hairArrival = false;   // HAIR-NEE: the previous vertex was a fiber that already took its direct light
 
     for (int b = 0; b < maxBounce; ++b) {
         if (grinAny) {
@@ -1075,7 +1083,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
         // This no longer RETURNS: an emissive material still has a BSDF, so a glowing
         // diffuse surface both emits and reflects, and the walk has to go on to the density
         // estimate below. See photonGather for the measurement.
-        if (m.isLight && specularSeen && dot(ray.d, h.ng) < 0.0) {
+        if (m.isLight && specularSeen && dot(ray.d, h.ng) < 0.0 && !hairArrival) {
             double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
             // GLOSSY-NEE's lobe-sampling half; 1 (and bit-identical) unless the last bounce was
             // a glossy one that already connected to this emitter.
@@ -1094,6 +1102,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
         // side, i.e. double counting wherever both strategies reach the same light. See the
         // twin note in backward.h.
         gmis.clear();
+        hairArrival = false;
 
         switch (m.type) {
             case MatType::Diffuse:
@@ -1228,6 +1237,12 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 // known-issues.md). Treated like the glossy/specular cases around it.
                 const Vec3 wPrev{-ray.d.x, -ray.d.y, -ray.d.z};
                 const HairShade hs = hairShadeAt(scene, m, h, lambda, wPrev);
+                if (hairNeeOn()) {                          // HAIR-NEE: see photonGather's Hair case
+                    L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                         * (thr * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng, nullptr,
+                                                 BackwardRenderer::GiCtx{}, &hs, nullptr, nullptr));
+                    hairArrival = true;
+                }
                 double pdfH = 0.0, fv = 0.0;
                 const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
                                              rng.uniform(), rng.uniform(), pdfH, fv);
@@ -1327,6 +1342,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
     BackwardRenderer bwNee; bwNee.diffraction = diffraction;
     const bool gneeOn = BackwardRenderer::glossyNeeOn();
     BackwardRenderer::GlossyMis gmis;
+    bool hairArrival = false;   // HAIR-NEE: the previous vertex was a fiber that already took its direct light
     for (int b = 0; b < maxBounce; ++b) {
         const int    cmIdx  = stk.topMat();
         const double aGlass = (cmIdx >= 0) ? scene.mats[cmIdx].absorb(lambda) : 0.0;
@@ -1443,7 +1459,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
         // GPU (dEmitterForMat missed the unregistered quad, so the emitter branch was never
         // taken and the grid vanished) — two mode-M paths disagreeing with each other and
         // both disagreeing with modes R and D. Measured on scraps/mini_grid.ftsl.
-        if (m.isLight && dot(ray.d, h.ng) < 0.0) {
+        if (m.isLight && dot(ray.d, h.ng) < 0.0 && !hairArrival) {
             const double wMis = (gmis.pdf > 0.0)          // GLOSSY-NEE, as in the sub-walk
                 ? bwNee.glossyHitWeight(scene, gmis,
                         BackwardRenderer::emitterIndexOfResolved(scene, m), ray.d, &h.p, &h.n)
@@ -1459,6 +1475,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
         // side, i.e. double counting wherever both strategies reach the same light. See the
         // twin note in backward.h.
         gmis.clear();
+        hairArrival = false;
 
         switch (m.type) {
             case MatType::Diffuse:
@@ -1627,6 +1644,22 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 // payload has no incident direction; see photonGatherSub's Hair case).
                 const Vec3 wPrev{-ray.d.x, -ray.d.y, -ray.d.z};
                 const HairShade hs = hairShadeAt(scene, m, h, lambda, wPrev);
+                // HAIR-NEE (0.334.0). This walk collects radiance only where it finally gathers
+                // -- a diffuse surface -- and a chain that scatters strand to strand through a
+                // hair mass lands on the shadowed scalp or dress beneath it, so the mass's own
+                // lit glow (direct light scattered by the fibers toward the eye) was never
+                // counted: Alice's strands rendered 30 % darker than mode D's at 20 M photons
+                // while the molded base matched. Mode R's Hair case connects to the lights at
+                // every fiber vertex with the BCSDF (`neeLight` with `hs`, rho == 1: the colour
+                // lives in sigma_a) and does not count an emitter its continuation then hits;
+                // the same split here. The photon map is untouched (fibers are never deposited
+                // on), and light that scatters off fibers onto a surface is in the map already.
+                if (hairNeeOn()) {
+                    L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                         * (thr * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng, nullptr,
+                                                 BackwardRenderer::GiCtx{}, &hs, nullptr, nullptr));
+                    hairArrival = true;
+                }
                 double pdfH = 0.0, fv = 0.0;
                 const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
                                              rng.uniform(), rng.uniform(), pdfH, fv);
