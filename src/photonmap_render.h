@@ -122,11 +122,9 @@ inline bool hairNeeOn() {
     return on;
 }
 // SPECTRAL NEE (0.341.0): evaluate a glossy vertex's light connection over the SpecThr grid
-// rather than at the camera's single wavelength. FTRACE_SPECNEE=0 restores the scalar term.
-inline bool specNeeOn() {
-    static const bool on = [] { const char* e = std::getenv("FTRACE_SPECNEE"); return !(e && e[0] == '0'); }();
-    return on;
-}
+// rather than at the camera's single wavelength. `-no-spec-nee` restores the scalar term;
+// the switch itself lives in lighttree.h so the CUDA upload reads the same object.
+inline bool specNeeOn() { return lt::gSpecNee; }
 inline int gatherAreaSamples() {
     static const int m = [] {
         const char* e = std::getenv("FTRACE_GATHERAREA");

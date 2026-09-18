@@ -17,6 +17,8 @@ in the BSDF coefficient times the emitter spectrum -- and nothing else can expla
                         so at equal spp they differ in VARIANCE, which a mean over a large ROI
                         hides. The accuracy claim is only that the quadrature adds no bias.
   3. LESS COLOUR NOISE -- the chroma residual against a 5x5 mean falls on the sphere.
+  4a. BACKEND PARITY -- the same frame on the GPU agrees with the CPU to 3 %, and its chroma falls
+                        too. The device gather is the backend the gallery_rain flyby runs on.
   4. NEUTRAL CONTROL  -- a WHITE glossy sphere in the same scene. Its BSDF is flat, so the two
                         forms must agree in the MEAN to the noise floor -- that is what this
                         controls for. Note its chroma noise still falls (3.48 -> 1.95 measured):
@@ -57,17 +59,17 @@ def write(path, refl):
     return path
 
 
-def render(scene, tag, mode, extra, spp, spec):
+def render(scene, tag, mode, extra, spp, spec, device="cpu"):
     out = os.path.join(OUT, tag + ".png")
-    env = dict(os.environ)
-    env["FTRACE_SPECNEE"] = "1" if spec else "0"
     cmd = [EXE, "-in", scene, "-mode", mode, "-r", "200", "150", "-o", out,
            "-window-min", "-interval", "60"] + extra
+    if not spec:
+        cmd.append("-no-spec-nee")
     if mode == "M":
-        cmd += ["-device", "cpu", "-n", "4000000", "-spp", str(spp)]
+        cmd += ["-device", device, "-n", "4000000", "-spp", str(spp)]
     else:
         cmd += ["-spp", str(spp)]
-    subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
+    subprocess.run(cmd, capture_output=True, text=True, check=False)
     return out
 
 
@@ -119,6 +121,17 @@ def main():
         O, _ = stats(moff)
         sens = abs(S - O) / max(S, 1e-9)
         if label == "gold":
+            gspec = render(sc, label + "_spec_gpu", "M", [], args.spp, True, device="gpu")
+            gscal = render(sc, label + "_scal_gpu", "M", [], args.spp, False, device="gpu")
+            G, cG = stats(gspec)
+            GC, cGC = stats(gscal)
+            check("gpu == cpu", abs(G - S) / max(S, 1e-9) < 0.03,
+                  "the two backends must agree: GPU %.3f vs CPU %.3f" % (G, S))
+            # GPU against GPU: comparing the device's spectral form with the HOST's scalar one
+            # cannot tell a backend difference from a spectral one, which is how a dead device
+            # path first passed this rig.
+            check("gpu chroma", cG < cGC * 0.97,
+                  "device spectral %.2f vs device scalar %.2f" % (cG, cGC))
             check("rig is live", sens > 0.10,
                   "NEE carries %.1f%% of this sphere -- below ~10%% the other checks would prove little" % (100 * sens))
             check("agrees with D", eS < 0.03, "spectral is %.2f%% from mode D" % (100 * eS))

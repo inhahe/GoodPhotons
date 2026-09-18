@@ -1248,6 +1248,7 @@ struct DScene {
     const int*       lightTreeLeaf;  int nLightTreeLeaf;
     int              bkLightTree;    // 0 = -no-lighttree: exact all-emitters splitting
     int              bkGlossyNee;    // 0 = -no-glossy-nee: no connection at a D_GLOSSY vertex
+    int              specNee;        // FTRACE_SPECNEE=0: the pre-0.342.0 single-wavelength NEE term
     int              gatherArea;     // -gatherarea <M>: probe samples for the M-GATHERAREA
                                      // footprint (0 = off, the default)
     int              gatherRejPct;   // FTRACE_GAREJECT <pct>: the tangle gate. Suppress the
@@ -10768,6 +10769,70 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
 // for all `nUp` live wavelengths, accumulating thr[i]*(rho[i]/PI)*SPD(lam[i])*invPdf[i]*w
 // into L[i]. Only reached on the media-free hero fast path, so there is no shadow-ray
 // transmittance term (bkRadianceHero is gated on mediaN == 0).
+#define DSPECNEE_MAXK 32   // the spectral NEE's per-thread scratch bound; DSpecThr::K is 24
+
+// SPECTRAL glossy NEE for mode M's gather (0.342.0; host twin backward.h neeLightSpecGlossy).
+// Same emitter loop and the same ONE shadow ray per sample as bkNeeLight -- a connection's
+// geometry is wavelength-free, which is the fact bkNeeLightHero above already relies on -- with
+// only the per-wavelength factors evaluated on the caller's grid: the BSDF coefficient, the
+// emitter's spectrum, the shadow leg's media transmittance (one shared walk) and the walk's own
+// throughput (`thrRatio`, DSpecThr's ratio per bin). Accumulates straight into XYZ.
+//
+// `dLam` is the quadrature bin width: the term stops being one MC sample over lambda and becomes
+// a K-bin sum of the same integral, which is where the colour noise goes. The MIS weight is a
+// ratio of DENSITIES, which are geometric, so it is taken once at `lambdaCam` and shared.
+__device__ static void bkNeeLightSpecGlossy(const DScene& sc, const DHit& h, const DNeeBsdf& nb,
+                                            const Real* lam, const double* thrRatio, int K,
+                                            double dLam, Real lambdaCam, double thrScalar,
+                                            DRng& rng, double* xyz) {
+    DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
+    for (int di = 0; di < draw.n; ++di) {
+        const int k = draw.emitter(di);
+        const double selW = draw.weight(di);
+        if (selW <= 0.0) continue;
+        const DEmitter& em = sc.emitters[k];
+        if (em.collimated || em.shape == 3) continue;
+        const double selP = draw.selExact ? draw.selPdf(di) : dLightSelPdf(sc, k, h.p, h.n);
+        if (!(selP > 0.0)) continue;
+        const bool uv = dEmitterNeedsUV(em);
+        Real su1 = (Real)0, su2 = (Real)0;
+        if (uv) { su1 = rng.uniform(); su2 = rng.uniform(); }
+        BkNeeGeom g;
+        if (!bkEmitterGeom(sc, h, ngo0, em, su1, su2, g)) continue;
+        double wMisG = 1.0;
+        if (g.pdfW > (Real)0) {
+            const double pNee = (double)g.pdfW * selP;
+            const double pLobe = dGlossyPdfHit(sc, *nb.m, h, nb.wo, g.wi);
+            const double sum = pNee + pLobe;
+            if (sum > 0.0) wMisG = pNee / sum;
+        }
+        // the geometric part, shared by every wavelength (host twin: `gWeight`)
+        const double geom = g.sun
+            ? (double)g.wSun
+            : g.spot
+            ? (double)g.fall * (double)g.cosSurf / (double)g.dist2 * (double)g.stG
+            : (double)g.G * (double)em.area * (double)g.stG;
+        const double gWeight = geom * selW * wMisG * thrScalar * dLam;
+        if (!(gWeight > 0.0)) continue;
+        double Tr[DSPECNEE_MAXK];
+        const int KK = (K < DSPECNEE_MAXK) ? K : DSPECNEE_MAXK;
+        for (int i = 0; i < KK; ++i) Tr[i] = 1.0;
+        if (sc.mediaN > 0)
+            dMediaTransmittanceSpec(sc, h.p, g.wi, g.dist, lam, KK, Tr, rng);
+        for (int i = 0; i < KK; ++i) {
+            const double f = dGlossyFHit(sc, *nb.m, h, nb.wo, g.wi, lam[i]);
+            if (!(f > 0.0)) continue;
+            const double v = gWeight * thrRatio[i] * f
+                           * (double)specLookup(em.emitSpd, lam[i]) * Tr[i];
+            if (!(v > 0.0)) continue;
+            xyz[0] += (double)cieX(lam[i]) * v;
+            xyz[1] += (double)cieY(lam[i]) * v;
+            xyz[2] += (double)cieZ(lam[i]) * v;
+        }
+    }
+}
+
 __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Real* rho,
                                       double* L, const double* thr, const Real* lam,
                                       const double* invPdf, int nUp, DRng& rng,
@@ -14844,10 +14909,26 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 // to 1 %. Taken BEFORE `thr *= rC`: the connection carries rC inside dBsdfF.
                 if (sc.bkGlossyNee) {
                     const DNeeBsdf nb{&m, rd * (Real)(-1)};
-                    const double dc = thr * bkNeeLight(sc, h, (Real)1, invPdfL, lambda, rng, 0, nullptr, &nb);
-                    oX += (double)cieX(lambda) * dc;
-                    oY += (double)cieY(lambda) * dc;
-                    oZ += (double)cieZ(lambda) * dc;
+                    if (sc.specNee) {
+                        // SPECTRAL (0.342.0, host twin photonmap_render.h): one shadow ray,
+                        // evaluated over the DSpecThr grid, so a gold lobe under a warm light
+                        // stops painting each sample one colour.
+                        Real   lamG[DSpecThr::K];
+                        double ratG[DSpecThr::K], xyz[3] = {0.0, 0.0, 0.0};
+                        for (int i = 0; i < DSpecThr::K; ++i) {
+                            lamG[i] = DSpecThr::lamOf(i);
+                            ratG[i] = sthr.ratio(lamG[i]);
+                        }
+                        const double dLam = (DLMAX - DLMIN) / (double)DSpecThr::K;
+                        bkNeeLightSpecGlossy(sc, h, nb, lamG, ratG, DSpecThr::K, dLam,
+                                             lambda, thr, rng, xyz);
+                        oX += xyz[0]; oY += xyz[1]; oZ += xyz[2];
+                    } else {
+                        const double dc = thr * bkNeeLight(sc, h, (Real)1, invPdfL, lambda, rng, 0, nullptr, &nb);
+                        oX += (double)cieX(lambda) * dc;
+                        oY += (double)cieY(lambda) * dc;
+                        oZ += (double)cieZ(lambda) * dc;
+                    }
                 }
                 {   const double rC = (double)clamp01(dReflectSlot(sc, m, h, lambda));
                     thr *= rC;
@@ -17840,6 +17921,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.nLightTreeLeaf  = (int)scene.lightTreeLeaf.size();
     sc.bkLightTree     = lt::gEnabled ? 1 : 0;
     sc.bkGlossyNee     = lt::gGlossyNee ? 1 : 0;   // GLOSSY-NEE (known-issues.md)
+    sc.specNee         = lt::gSpecNee ? 1 : 0;     // SPECTRAL NEE; the host gather reads the same object
     {   // M-GATHERAREA footprint budget, same environment channel and same default (8) the host
         // uses -- the two MUST agree or -device gpu and -device cpu diverge on truncated geometry.
         const char* e = std::getenv("FTRACE_GATHERAREA");

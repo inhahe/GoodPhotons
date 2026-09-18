@@ -29597,7 +29597,25 @@ between the two at 128 spp is not yet resolved and is recorded here rather than 
 
 Cost, paired on that frame: 8:40 scalar vs 10:05 spectral (+16 %).
 
-**The device half is not done** — `dPhotonGather`'s D_GLOSSY case still adds the scalar term, so the
-GPU keeps the colour noise the host has now lost. The means agree, so this is a variance difference
-rather than the parity bug 0.340.0 fixed, but the flyby runs on the GPU and that is where it
-matters. Same for both backends' HAIR-NEE term, which is still single-wavelength.
+**The device half landed in 0.342.0**, built from pieces the device already had:
+`bkNeeLightHero` for the shape (one `bkEmitterGeom`, i.e. one shadow ray, shared across
+wavelengths, MIS weight taken once), `dMediaTransmittanceSpec` for the shadow leg, `DSpecThr` for
+the walk's own throughput. On gallery_rain's gyroid: GPU 66.07 -> **76.40** (0.790 -> 0.913 of mode
+D) with chroma 19.46 -> 13.82, against the host's 75.94 — so **the two backends agree to 0.6 %**
+with the spectral form on both. Cost: gather 5.73 s -> 7.03 s per frame (+23 %) on the GPU, +16 %
+on the host. The switch is `-no-spec-nee`, and it lives in `lighttree.h` beside `gGlossyNee` for
+the reason the comment there already gives: the host gather and the CUDA upload must read the same
+object, and a policy read from two places is a divergence waiting to happen.
+
+**A rig that passed while the device path was DEAD** — worth recording, because it nearly shipped.
+The first version of `tools/specnee_rig.py` checked the device by comparing **GPU-spectral against
+HOST-scalar**. Those differ for two independent reasons, so the check passed on a build where
+`sc.specNee` was never assigned at upload (the edit that was supposed to add it silently did not
+match) and the device was running the scalar path throughout. What exposed it was the real scene:
+GPU spectral and GPU scalar came out **byte-identical** on gallery_rain. The rig now compares
+GPU against GPU. The general rule: *a cross-backend comparison cannot validate a within-backend
+change* — whatever else it measures will cover for the thing being tested.
+
+Still single-wavelength: both backends' **HAIR-NEE** term (0.334.0), for the same reason and with
+the same fix available; a fiber needs its BCSDF rebuilt per wavelength, which `hair::LobeAngular` /
+`fFromLobes` (0.336.0) already makes cheap.

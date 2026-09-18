@@ -66,6 +66,12 @@ inline int    gSamples = 8;      // cap on emitters connected per shading vertex
 // the same reason: an `inline` variable in a header is one object across the CUDA TU and the
 // host TU, where a `static` in main.cpp would silently be two.
 inline bool   gGlossyNee = true;  // -no-glossy-nee: the pre-0.266 estimator, rng order included
+// SPECTRAL NEE (0.341.0 host, 0.342.0 device): evaluate a glossy vertex's light connection
+// over the SpecThr wavelength grid instead of at the camera's single sampled wavelength --
+// one shadow ray either way, since a connection's geometry is wavelength-free. Lives HERE,
+// beside gGlossyNee, because both the host gather and the CUDA upload have to read the same
+// object: a policy read from two places is a divergence waiting to happen.
+inline bool   gSpecNee   = true;  // -no-spec-nee: the pre-0.341.0 single-wavelength NEE term
 }
 
 // One node of the light BVH. Interior nodes carry two child indices; leaves carry
