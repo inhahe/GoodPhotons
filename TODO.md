@@ -447,12 +447,21 @@ frame currently renders in ~96 s.
 **Before launching:** render a handful of scattered frames (`-camera fly0000`, `fly0400`, `fly0555`,
 `fly1146`) at final settings and look at them. Cheap insurance against discovering a framing or
 exposure problem 900 frames in.
-**DONE 2026-09-17 (`png/flyframes/sheet.png`).** The four frames at the final recipe --
+**DONE 2026-09-17, then REDONE after 0.340.0 (`png/flyframes2/sheet.png`; the first set is stale --
+it predates GLOSSY-NEE, so its gyroid was 44 % dark).** The four frames at the final recipe --
 `-mode M -device gpu -n 20000000 -spp 24 -r 960 540 -denoise -fireflies 3 -denoise-levels 2`
 (with hair on the GPU since 0.335.0) -- render clean: the hall, the gyroid, the compote, the grid
 all as in the stills; Alice is at the frame's right edge in fly0000/fly1146 and a 30-50 px blonde
 figure in fly0400/fly0555. Gathering one frame alone takes ~2 min (5.75 s/spp), so the whole
-flyby is ~40-45 h of GPU time; `-frames A B` resumes a stopped run. **Decisions that are the
+flyby is ~40-45 h of GPU time; `-frames A B` resumes a stopped run. After the GLOSSY-NEE fix the
+two gyroid-facing frames brightened 5.5 % overall (fly0000 33.8 -> 35.7 mean luma, fly1146 33.6 ->
+35.4) and the gyroid reads gold rather than dull; the two distant frames moved 0.3-0.5 %. **One
+honest caveat carried in from the fix:** the glossy NEE term is monochromatic (one wavelength per
+connection, as every direct term in this walk is), so the gyroid now carries visible chroma speckle
+that `-denoise-levels 2` thins but does not remove. The CPU gather has always looked like this --
+the GPU now matches it -- so this is parity achieved, not a new defect. A SPECTRAL glossy NEE
+(the shadow ray shared, the BSDF and the emitter spd evaluated on the `SpecThr` grid) is the clean
+fix, and is the same follow-up already recorded for HAIR-NEE. **Decisions that are the
 user's:** launching the run (it owns the GPU for two days; other GPU jobs alongside a long
 mode-M gather are what killed the cloud-circuit run), and whether to LOD the hair -- on the GPU
 the strands read luminance 81 / hue 71 deg against the molded base's 86 / 54 deg, so a switch
