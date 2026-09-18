@@ -126,7 +126,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             if (c < 0) return;
             mp = &scene.mats[c];
         } else if (mp->type == MatType::Layered) {
-            int c = mixPickChild(*mp, rng.uniform());
+            int c = mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map (device twin: dResolveCompound)
             if (c < 0) return;
             mp = &scene.mats[c];
         }

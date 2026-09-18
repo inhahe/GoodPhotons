@@ -3315,7 +3315,7 @@ struct Renderer {
                     (cr <= kCausticGlossRoughness ? sawFocus : sawScatter) = true;
                     continue;                               // lossless; beta unchanged
                 }
-                int child = mixPickChild(cm, rng.uniform());  // body lobe (leftover absorbs)
+                int child = mixResolveChild(scene, cm, h, rng.uniform());  // body lobe (leftover absorbs; honours a weight map)
                 if (child < 0) { e.absorbed += beta; return; }
                 matp = &scene.mats[child];
             }
@@ -3766,7 +3766,7 @@ struct Renderer {
                     (cr <= kCausticGlossRoughness ? sawFocus : sawScatter) = true;  // see scalar twin
                     continue;
                 }
-                int child = mixPickChild(cm, rng.uniform());
+                int child = mixResolveChild(scene, cm, h, rng.uniform());   // honours a bound weight map
                 if (child < 0) { e.absorbed += activeSum(); return; }
                 matp = &scene.mats[child];
             }

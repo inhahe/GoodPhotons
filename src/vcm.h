@@ -680,7 +680,8 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
             // Coat with probability R, else a body lobe (bdpt.h's randomWalk explains the
             // convention). `rd` is the travel direction, and only |cos| is used.
             const double R = layeredCoatReflectance(scene, *mp, h, rd, lambda);
-            int c = (rng.uniform() < R) ? mp->coatChild : mixPickChild(*mp, rng.uniform());
+            int c = (rng.uniform() < R) ? mp->coatChild
+                                        : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map (device twin: dResolveCompound)
             if (c < 0) return;
             mp = &scene.mats[c];
         }
@@ -914,7 +915,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
             // Coat with probability R, else a body lobe (bdpt.h's randomWalk explains the
             // convention). `rd` is the travel direction, and only |cos| is used.
             const double R = layeredCoatReflectance(scene, *mp, h, rd, lambda);
-            int c = (rng.uniform() < R) ? mp->coatChild : mixPickChild(*mp, rng.uniform());
+            int c = (rng.uniform() < R) ? mp->coatChild
+                                        : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map (device twin: dResolveCompound)
             if (c < 0) return result;
             mp = &scene.mats[c];
         }

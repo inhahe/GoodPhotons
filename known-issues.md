@@ -29495,3 +29495,25 @@ fold costs +20-50 % of the camera pass where every pixel is hair (head-filling v
 960x540, 24 spp, CPU: fold off 1:12-1:28, on 1:47; the spread is other load on the machine) --
 down from +60-85 % when every bin rebuilt the BCSDF. At flyby scale hair is a few percent of the
 frame and it does not register. `FTRACE_HAIR_SPECGATHER=0` gives the scalar fold for A/B.
+
+## The glTF importer types a material by the metalness map's MEAN; `-import-metal mix` honours it per texel (0.339.0)
+
+glTF's metalness is per TEXEL and a material here is one BSDF, so the importer picked metal or
+dielectric from the map's mean. `-import-metal mix` instead gives the `layered` dielectric's body
+TWO lobes -- a glossy metal tinted by the base colour, and the diffuse -- selected per hit by the
+map (`Material::mixWeightTex`). It deliberately lives in the body-lobe list rather than wrapping
+the layered stack: **both resolvers unwrap exactly one level of compound** (host `mixResolveChild`,
+device `dResolveCompound`), so a Mix wrapping a Layered would resolve to the Layered and then shade
+it through the material switch's `default:` branch -- a silent wrong answer. Building it also
+exposed a host/device divergence worth its own line: the device already routed a Layered's
+body-lobe pick through `dMixResolveChild`, which reads a bound weight map, while every host tracer
+called `mixPickChild`, which does not. Nothing built such a material, so it was unexercised; the
+host now matches (bit-identical when no map is bound, since `mixResolveChild` falls through).
+
+**Default OFF, because the premise the work started from was false.** The plan said Alice's map had
+"p90 0.53 -- parts of that one material are properly metallic". Histogramming the channel says
+otherwise: **max 0.612**, mean 0.281, median 0.251; 13.9 % near zero, 45.5 % in 0.2-0.3, 20 % in
+0.3-0.4, 15.5 % in 0.5-0.6. There is no metal in the asset at all -- it is an AI generator emitting
+a mid-grey it never meant physically. Honouring it is legitimate compliance and makes the dress
+visibly metallic, which is an aesthetic change to someone's asset, so it is theirs to choose. The
+loader prints one line when a map is mixed and the flag is off, naming the flag.

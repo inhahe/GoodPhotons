@@ -869,7 +869,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             // where the pdf stored is the resolved child's and not the mixture's.
             const double R = layeredCoatReflectance(scene, *mp, h, ray.d, lambda);
             int c = (rng.uniform() < R) ? mp->coatChild
-                                        : mixPickChild(*mp, rng.uniform());
+                                        : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map (device twin: dResolveCompound)
             if (c < 0) return;                       // absorbed on the leftover slice
             mp = &scene.mats[c];
         }

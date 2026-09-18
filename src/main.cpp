@@ -18804,6 +18804,10 @@ static int run(int argc, char** argv) {
             if (!groom::rewriteFile(argv[i + 1], argv[i + 2], gerr)) { std::fprintf(stderr, "error: -groom-rewrite: %s\n", gerr.c_str()); return 1; }
             return 0;
         }
+        if (!std::strcmp(argv[i], "-import-metal") && i + 1 < argc) {
+            const char* v = argv[i + 1];
+            gltfimp::metalMixImport = !(!std::strcmp(v, "off") || !std::strcmp(v, "0") || !std::strcmp(v, "mean"));
+        }
         if (!std::strcmp(argv[i], "-import-specular") && i + 1 < argc) {
             const char* v = argv[i + 1];
             gltfimp::dielectricSpecular =
@@ -19486,6 +19490,10 @@ static int run(int argc, char** argv) {
             pbeams::gSunNee = true;
         // Imported glTF dielectrics: keep glTF's specular lobe (default) or type them flat
         // `diffuse` the way the importer did before 0.316.0. See gltf.h.
+        else if (!std::strcmp(argv[i], "-import-metal") && i + 1 < argc) {
+            const char* v = argv[++i];
+            gltfimp::metalMixImport = !(!std::strcmp(v, "off") || !std::strcmp(v, "0") || !std::strcmp(v, "mean"));
+        }
         else if (!std::strcmp(argv[i], "-import-specular") && i + 1 < argc) {
             const char* v = argv[++i];
             gltfimp::dielectricSpecular =

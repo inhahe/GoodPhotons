@@ -2290,7 +2290,7 @@ struct BackwardRenderer {
                     specularArrival = true;
                     continue;
                 }
-                int child = mixPickChild(cm, rng.uniform());   // body lobe
+                int child = mixResolveChild(scene, cm, h, rng.uniform());   // body lobe (honours a weight map)
                 if (child < 0) return L;                        // leftover absorbs
                 mp = &scene.mats[child];
                 }
@@ -2620,7 +2620,8 @@ struct BackwardRenderer {
                     for (int i = 0; i < nUp; ++i) thr[i] *= 1.0 - Rl[i];
                     if (hero::maxOf(thr, nUp) <= kWhittedCutoff) { finish(); return; }
                 }
-                int child = whitted ? mixDominantChild(cm) : mixPickChild(cm, rng.uniform());
+                int child = whitted ? mixResolveDominant(scene, cm, h)
+                                    : mixResolveChild(scene, cm, h, rng.uniform());
                 if (child < 0) { finish(); return; }     // leftover slice absorbs
                 mp = &scene.mats[child];
             }

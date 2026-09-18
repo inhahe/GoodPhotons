@@ -458,19 +458,30 @@ mode-M gather are what killed the cloud-circuit run), and whether to LOD the hai
 the strands read luminance 81 / hue 71 deg against the molded base's 86 / 54 deg, so a switch
 would show a small step; without one the cost is as above.
 
-## 2. glTF per-texel metalness -> a `mixWeightTex`-driven mix — the likely remaining Meshy gap
+## 2. BUILT opt-in (0.339.0) — and the premise it was written on was WRONG
 
-glTF's metalness is **per texel**; ftrace's material type is **per material**. Alice's
-metallicRoughness map has mean metalness 0.28 but **p90 0.53** — parts of that one material are
-properly metallic, and the importer, typing the whole thing by the mean, renders them as a 4 %
-dielectric. A 4 % coat is genuinely subtle; a metal is not.
+glTF's metalness is **per texel**; ftrace's material type is **per material**, so the importer
+typed the whole material by the map's mean.
 
-**The fix is already scoped:** import a metalness-mapped material as a **two-child mix driven by the
-map** — `Material::mixWeightTex` exists and does exactly this (a per-hit blend mask on a 2-child
-mix) — with a metal `glossy` child and the `layered` dielectric child. Not built.
+**The mechanism is built** (`-import-metal mix`): the body of the `layered` dielectric becomes TWO
+lobes -- a glossy metal tinted by the base colour, and the diffuse -- chosen per texel by the
+metalness map through `mixWeightTex`. It stays ONE level of compound, which is what both resolvers
+unwrap (host `mixResolveChild`, device `dResolveCompound`), so the scene still renders on the GPU;
+wrapping the layered stack in a mix instead would have nested two compounds and silently shaded the
+dielectric through the `default:` branch.
 
-This is the most likely remaining difference against the viewer the user compares to, and the user
-has asked about Alice's dress looking glossy more than once. Full write-up in `known-issues.md`.
+**But the premise was wrong, and the measurement says so.** This entry claimed "p90 0.53 -- parts of
+that one material are properly metallic". They are not. Alice's metalness channel (the GLB's 4096^2
+metallicRoughness B plane, histogrammed): **max 0.612**, mean 0.281, median 0.251 --
+13.9 % near zero, 45.5 % in 0.2-0.3, 20 % in 0.3-0.4, and a 15.5 % lump at 0.5-0.6. **Nothing in the
+asset is metal.** It is the AI-generator house style: a mid-grey metalness that is not a physical
+statement about anything. Honouring it to the letter is defensible glTF compliance and makes her
+dress visibly metallic (`png/alicehair/mm_dress.png`) -- a change to the look of the user's
+deliverable, decided by an artifact of the generator.
+
+So the flag defaults to `mean` and **the default import is byte-identical** to 0.338.0 (verified:
+mean |diff| 0.00 on a 960x540 mode-M frame). Whether Alice should use `-import-metal mix` is the
+user's call, and the flyby is the thing it would change.
 
 ## 3. DONE (0.338.0): `emit_orient auto|keep|flip` — an emissive enclosure can glow inward
 

@@ -48,6 +48,13 @@
 //   0 = `off`      a flat `diffuse`, the pre-0.316.0 import.
 // Metals (`metallic >= 0.5`) are unaffected by all three.
 namespace gltfimp { inline int dielectricSpecular = 2; }
+// `-import-metal mix`: honour a metallicRoughness map's metalness PER TEXEL, as a two-lobe
+// body chosen by the map, instead of typing the whole material by the map's mean. OFF by
+// default because the assets this would change are AI-generator exports whose metalness is a
+// mid-grey nobody intended physically (Alice's map: max 0.612, i.e. no metal anywhere, yet a
+// 0.281 mean makes the dress visibly metallic when honoured). Turning it on is a look
+// decision about someone's asset, so it is the author's to make.
+namespace gltfimp { inline bool metalMixImport = false; }
 
 namespace gltfimpl {
 
@@ -162,7 +169,12 @@ inline TexRef texRefOf(const minijson::Value* parent, const char* key) {
 // and metallicRoughness has to be split into a single channel before it can drive a
 // scalar parameter -- so the cache below is keyed on (glTF texture index, role), not
 // on the image alone.
-enum class TexRole { Color, Roughness, Normal };
+// Metalness is the B plane of the same metallicRoughness image the Roughness role reads --
+// a separate binding because that role BROADCASTS G over all three channels (scalarAt
+// averages them), destroying B in the process. Only bound when a material actually needs a
+// per-texel metal/dielectric split (see metalFrac below), so the second decode is paid for
+// exactly by the materials it rescues.
+enum class TexRole { Color, Roughness, Normal, Metalness };
 
 // Largest texture dimension kept on import. A Texture stores LINEAR doubles (24 B per
 // texel) and a reflectance map builds a Jakob-Hanika coefficient table beside it (another
@@ -531,7 +543,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
     const minijson::Value* texturesArr = doc.root.find("textures");
     const minijson::Value* imagesArr   = doc.root.find("images");
     const minijson::Value* samplersArr = doc.root.find("samplers");
-    struct TexCacheEnt { int gltfTex; int role; double p0, p1, p2; int sceneTex; double meanMetal, meanRough; };
+    struct TexCacheEnt { int gltfTex; int role; double p0, p1, p2; int sceneTex; double meanMetal, meanRough, metalFrac; };
     std::vector<TexCacheEnt> texCache;
     bool texStopped = false;   // buildReflCoeff refused: `ftrace -stop` during scene load
 
@@ -541,7 +553,8 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
     // the mean metallic, which is the only thing the single-BSDF material choice below
     // can act on (ftrace has no per-texel metal/dielectric blend).
     auto bindTex = [&](int ti, TexRole role, double p0, double p1, double p2,
-                       double* outMeanMetal, double* outMeanRough = nullptr) -> int {
+                       double* outMeanMetal, double* outMeanRough = nullptr,
+                       double* outMetalFrac = nullptr) -> int {
         if (texStopped) return -1;
         if (!texturesArr || !texturesArr->isArray() || ti < 0 || ti >= (int)texturesArr->arr.size())
             return -1;
@@ -550,6 +563,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                 e.p0 == p0 && e.p1 == p1 && e.p2 == p2) {
                 if (outMeanMetal) *outMeanMetal = e.meanMetal;
                 if (outMeanRough) *outMeanRough = e.meanRough;
+                if (outMetalFrac) *outMetalFrac = e.metalFrac;
                 return e.sceneTex;
             }
         const minijson::Value& tj = texturesArr->arr[ti];
@@ -579,15 +593,33 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                                                               : TexFilter::Bilinear;
         }
 
-        double meanMetal = 0.0, meanRoughOut = p0;
-        if (role == TexRole::Roughness) {
+        double meanMetal = 0.0, meanRoughOut = p0, metalFrac = 0.0;
+        if (role == TexRole::Metalness) {
+            // B * metallicFactor, broadcast so scalarAt (which averages RGB) reads metalness.
+            const size_t n = tex.rgb.size();
+            double acc = 0.0, above = 0.0;
+            for (Vec3& c : tex.rgb) {
+                const double mv = std::min(1.0, std::max(0.0, c.z * p0));
+                acc += mv;
+                if (mv >= 0.5) above += 1.0;
+                c = Vec3{mv, mv, mv};
+            }
+            meanMetal = n ? acc / (double)n : 0.0;
+            metalFrac = n ? above / (double)n : 0.0;
+        } else if (role == TexRole::Roughness) {
             // glTF packs occlusion/roughness/metalness into R/G/B of one image. ftrace's
             // scalarAt averages the three channels, so the G plane has to be broadcast to
             // all three or a rough surface would read as (0 + rough + metal)/3. The mean
             // metallic is harvested first, before B is overwritten.
             const size_t n = tex.rgb.size();
-            for (const Vec3& c : tex.rgb) meanMetal += c.z;
+            double aboveHalf = 0.0;
+            for (const Vec3& c : tex.rgb) {
+                const double mv = std::min(1.0, std::max(0.0, c.z * p1));   // p1 carries metallicFactor
+                meanMetal += mv;
+                if (mv >= 0.5) aboveHalf += 1.0;
+            }
             meanMetal = n ? meanMetal / (double)n : 0.0;
+            metalFrac = n ? aboveHalf / (double)n : 0.0;
             double meanR = 0.0;
             for (Vec3& c : tex.rgb) {
                 const double g = std::min(1.0, std::max(0.0, c.y * p0));
@@ -615,12 +647,14 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
 
         tex.name = authored + "#tex" + std::to_string(ti) +
                    (role == TexRole::Color ? ":color"
-                                           : (role == TexRole::Roughness ? ":rough" : ":normal"));
+                    : role == TexRole::Roughness ? ":rough"
+                    : role == TexRole::Metalness ? ":metal" : ":normal");
         const int id = (int)s.textures.size();
         s.textures.push_back(std::move(tex));
-        texCache.push_back(TexCacheEnt{ti, (int)role, p0, p1, p2, id, meanMetal, meanRoughOut});
+        texCache.push_back(TexCacheEnt{ti, (int)role, p0, p1, p2, id, meanMetal, meanRoughOut, metalFrac});
         if (outMeanMetal) *outMeanMetal = meanMetal;
         if (outMeanRough) *outMeanRough = meanRoughOut;
+        if (outMetalFrac) *outMetalFrac = metalFrac;
         return id;
     };
 
@@ -661,12 +695,17 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                     reflectTexId = bindTex(baseTex.index, TexRole::Color, r, g, b, nullptr);
                     if (reflectTexId >= 0) { r = g = b = 1.0; }   // factor folded into the texels
                 }
+                const double metalFactor0 = metallic;   // the raw metallicFactor; the map's mean replaces it below
+                double metalFrac = 0.0;          // fraction of texels that are genuinely metal
                 if (mrTex.index >= 0) {
                     double meanMetal = metallic, meanRough = roughness;
-                    roughTexId = bindTex(mrTex.index, TexRole::Roughness, roughness, 0.0, 0.0,
-                                         &meanMetal, &meanRough);
+                    roughTexId = bindTex(mrTex.index, TexRole::Roughness, roughness, metallic, 0.0,
+                                         &meanMetal, &meanRough, &metalFrac);
                     if (roughTexId >= 0) {
-                        metallic *= meanMetal;
+                        // `meanMetal` already carries metallicFactor (passed as p1), so this is
+                        // an assignment, not a second multiply -- squaring it would read a
+                        // half-metal export as quarter-metal.
+                        metallic = meanMetal;
                         // The map's mean becomes the material's CONSTANT roughness. The
                         // factor is the wrong representative when the real value is in the
                         // map (`roughnessFactor 1.0` + a 0.25 map is the Meshy house style),
@@ -707,6 +746,28 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                 }
                 Material m;
                 bool wantCoat = false;   // dielectric: add glTF's specular lobe over the body
+                // MIXED METALNESS (0.339.0, TODO item 2). glTF's metalness is per TEXEL and a
+                // material here is one BSDF, so typing the surface by the map's mean renders a
+                // genuinely metallic region as a 4 % dielectric (Alice: mean 0.28, p90 0.53).
+                // When the map is neither mostly-metal nor mostly-dielectric, the body becomes
+                // TWO lobes chosen per texel by the map. The window is deliberately wide: a map
+                // that is 99 % one thing is typed as that one thing and imports bit-identically.
+                const bool metalMix = (gltfimp::metalMixImport && mrTex.index >= 0 &&
+                                       khrTransmission < 0.5 &&
+                                       metalFrac > 0.02 && metalFrac < 0.98);
+                int metalTexId = -1;
+                if (!gltfimp::metalMixImport && mrTex.index >= 0 && khrTransmission < 0.5 &&
+                    metalFrac > 0.02 && metalFrac < 0.98)
+                    std::fprintf(stderr, "[gltf] %s: metalness varies across the map (%.1f%% of texels >= 0.5, "
+                                         "mean %.3f) but the material is typed by the mean. `-import-metal mix` "
+                                         "honours it per texel instead.\n", authored.c_str(), 100.0 * metalFrac, metallic);
+                if (metalMix) {
+                    metalTexId = bindTex(mrTex.index, TexRole::Metalness, metalFactor0, 0.0, 0.0, nullptr);
+                    if (metalTexId < 0) {
+                        std::fprintf(stderr, "[gltf] %s: metalness map could not be bound -- "
+                                             "falling back to a single BSDF typed by the mean\n", authored.c_str());
+                    }
+                }
                 m.reflect = rgbToReflectanceJH(r, g, b);
                 // Heuristic map onto the spectral BSDFs: transmissive -> dielectric,
                 // metals -> glossy tinted by the base color, everything else -> diffuse.
@@ -746,6 +807,13 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                             m.absorbRefDist = attDist;   // preview hint; see Material
                         }
                     }
+                } else if (metalMix) {
+                    // MIXED metalness (0.339.0): neither answer is right for the whole
+                    // surface, so the body becomes two lobes picked per texel by the map.
+                    // Built as the dielectric below -- the metal lobe is spliced in after the
+                    // coat, where the body id is known.
+                    m.type = MatType::Diffuse;
+                    wantCoat = gltfimp::dielectricSpecular;
                 } else if (metallic >= 0.5) {
                     m.type = MatType::Glossy;
                     m.roughness = std::max(0.02, roughness);
@@ -825,6 +893,56 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                         mix.mixWeights  = {f0, 1.0 - f0};
                         m = mix;
                     }
+                }
+                // THE METAL LOBE (0.339.0). `m` is now the dielectric as built above -- a
+                // `layered` coat over a one-lobe body, or a flat 2-lobe mix, or the bare body.
+                // The metal goes in BESIDE the diffuse body, chosen per texel by the map.
+                // ONE level of compound is what both resolvers support (host mixResolveChild /
+                // device dResolveCompound resolve a single step), so the mix must live in the
+                // body-lobe list of the layered stack rather than wrapping it -- wrapping would
+                // nest Mix over Layered, which neither backend unwraps, and the dielectric would
+                // silently shade through the `default:` branch.
+                if (metalMix && metalTexId >= 0) {
+                    Material metal;
+                    metal.type = MatType::Glossy;
+                    metal.reflect = rgbToReflectanceJH(r, g, b);   // glTF: base colour IS the metal's tint
+                    metal.reflectTex = reflectTexId;
+                    metal.roughness = std::max(0.02, roughness);
+                    metal.roughnessTex = roughTexId;
+                    if (normalTexId >= 0) { metal.normalTex = normalTexId; metal.normalStrength = normalScale; }
+                    const int metalId = (int)s.mats.size();
+                    s.mats.push_back(metal);
+                    // Constant weights beside the map, for any consumer that cannot sample a
+                    // texture (the preview rasterizers): the map's own mean is the honest one.
+                    const double wm = std::min(1.0, std::max(0.0, metallic));
+                    int bodyId = -1;
+                    if (m.type == MatType::Layered && m.mixChildren.size() == 1) {
+                        bodyId = m.mixChildren[0];                  // the coat stays over both lobes
+                        m.mixChildren = {metalId, bodyId};
+                        m.mixWeights  = {wm, 1.0 - wm};
+                        m.mixWeightTex = metalTexId;
+                    } else if (m.type == MatType::Mix && m.mixChildren.size() == 2) {
+                        // The flat-weight coat form (-gltf-specular mix): its 4 % white lobe is
+                        // the thing that has to go, because a 2-child mix has exactly one weight
+                        // slot and metal-vs-dielectric is the bigger of the two errors by far.
+                        bodyId = m.mixChildren[1];
+                        m.mixChildren = {metalId, bodyId};
+                        m.mixWeights  = {wm, 1.0 - wm};
+                        m.mixWeightTex = metalTexId;
+                    } else {
+                        Material body = m;                          // no coat at all: plain A/B
+                        bodyId = (int)s.mats.size();
+                        s.mats.push_back(body);
+                        Material mx;
+                        mx.type = MatType::Mix;
+                        mx.mixChildren = {metalId, bodyId};
+                        mx.mixWeights  = {wm, 1.0 - wm};
+                        mx.mixWeightTex = metalTexId;
+                        m = mx;
+                    }
+                    std::fprintf(stderr, "[gltf] %s: metalness map is mixed (%.1f%% of texels metal, "
+                                         "mean %.3f) -- body split into a metal lobe and a dielectric one, "
+                                         "chosen per texel\n", authored.c_str(), 100.0 * metalFrac, metallic);
                 }
                 int id = (int)s.mats.size();
                 s.mats.push_back(m);

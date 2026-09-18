@@ -1070,7 +1070,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             // bdpt.h's randomWalk and the device's dResolveCompound.
             const double R = layeredCoatReflectance(scene, *mp, h, ray.d, lambda);
             int c = (rng.uniform() < R) ? mp->coatChild
-                                        : mixPickChild(*mp, rng.uniform());
+                                        : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map (device twin: dResolveCompound)
             if (c < 0) return L;
             mp = &scene.mats[c];
         }
@@ -1444,7 +1444,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             // bdpt.h's randomWalk and the device's dResolveCompound.
             const double R = layeredCoatReflectance(scene, *mp, h, ray.d, lambda);
             int c = (rng.uniform() < R) ? mp->coatChild
-                                        : mixPickChild(*mp, rng.uniform());
+                                        : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map (device twin: dResolveCompound)
             if (c < 0) return L;
             mp = &scene.mats[c];
         }
