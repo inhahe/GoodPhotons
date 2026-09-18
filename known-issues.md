@@ -27142,10 +27142,17 @@ one plane is at risk, which includes the ordinary way one would model a light fi
 planar and none is flipped. `tools/furnace_rig.py` (the white-furnace rig) is built this way and says
 so in its header.
 
-**Fix when it is worth doing:** an explicit opt-out on the mesh block -- `emit_orient keep` alongside
-the current `auto` -- rather than a cleverer heuristic, because no geometric test can distinguish a
-lampshade interior from a torus wound the wrong way. The author knows which one they meant; the
-loader cannot.
+**FIXED (2026-09-17, v0.338.0)**, exactly as scoped: `emit_orient auto|keep|flip` on the mesh
+block -- an explicit opt-out rather than a cleverer heuristic, because no geometric test can
+distinguish a lampshade interior from a torus wound the wrong way. The author knows which one they
+meant; the loader cannot. `keep` leaves the authored winding alone (what an enclosure needs);
+`flip` always reverses, for an inward-wound **open** sheet whose signed volume is ~0 and which the
+test therefore cannot detect at all; `auto` is the old behaviour and **is no longer silent** -- it
+prints the signed volume and area it decided on and names `emit_orient keep`, at the moment it
+takes the decision. `tools/emit_orient_rig.py` holds it (6 checks): an inward-wound emissive cube
+with a probe inside renders BLACK under `auto` and lit under `keep`; `keep` matches the
+six-planar-meshes workaround to **0.64 %**; `flip` on an outward-wound cube reproduces `keep` to
+0.29 %; a misspelled value is refused by name. FTSL §8.4.
 
 **How it was found, and the two rig failures it caused first.** This surfaced while building a white
 furnace to validate the coated-body model, and it cost two wrong measurements before it was

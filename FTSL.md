@@ -1736,6 +1736,37 @@ on an **emissive** material, where it would silently delete a light. `-check-wat
 reports such a mesh as skipped, since its geometry is gone by the time the audit runs —
 drop `shape_only` for one run to check it.
 
+**`emit_orient auto|keep|flip` — which way an emissive mesh radiates** (0.338.0). Emission is
+one-sided: a triangle radiates along its geometric normal only. An imported shell wound *inward* —
+`torus.obj` is the classic — would therefore glow into its own hollow and look black from outside,
+so `auto` (the default) measures the shell's signed volume about its centroid and, if it is
+negative and large enough to be a real enclosed volume, reverses every winding so the emission
+points outward. It prints what it did:
+
+```
+[ftsl] mesh 'shade': emissive shell wound inward (signed volume -8 over 24 m^2) -- reversing it
+       so the emission points OUTWARD. If this is an enclosure meant to glow inward (a furnace, a
+       cove, a lampshade), add `emit_orient keep`.
+```
+
+That message exists because **an enclosure is geometrically indistinguishable from the torus
+case** — both are closed shells whose faces point inward — and the difference is what the author
+meant, which no test can recover. So:
+
+| value | effect |
+|---|---|
+| `auto` (default) | the volume test above, and it says so |
+| `keep` | never reorient: the authored winding **is** the emission side — what a furnace, a cove or a lampshade interior needs |
+| `flip` | always reverse — an inward-wound **open** sheet, which the volume test cannot detect at all (V ≈ 0) |
+
+```ftsl
+mesh "furnace" { file "box.obj"  material glow  emit_orient keep }   # glows INWARD
+```
+
+A **planar** emissive mesh is never touched by `auto` (its signed volume is ~0), which is why
+splitting an enclosure into one `mesh` block per flat face also works — `tools/furnace_rig.py`
+does that — though `emit_orient keep` is now the direct way to say it.
+
 ### 8.5 `mesh_asset` + `mesh_instance` — instancing (two-level BVH)
 
 A `mesh` bakes its triangles into the scene, so ten copies cost ten triangle

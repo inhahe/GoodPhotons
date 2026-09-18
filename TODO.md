@@ -472,7 +472,7 @@ mix) — with a metal `glossy` child and the `layered` dielectric child. Not bui
 This is the most likely remaining difference against the viewer the user compares to, and the user
 has asked about Alice's dress looking glossy more than once. Full write-up in `known-issues.md`.
 
-## 3. An emissive mesh that is not PLANAR is silently re-oriented outward (logged 2026-09-17)
+## 3. DONE (0.338.0): `emit_orient auto|keep|flip` — an emissive enclosure can glow inward
 
 So an emissive **enclosure** — a furnace, a cove, the inside of a softbox or a lampshade — renders
 black, with no diagnostic. Found while building the coat validation rig, where it cost two wrong
@@ -484,10 +484,10 @@ right (an inward-wound import like `torus.obj` would otherwise glow into its own
 enclosure is indistinguishable from that case. **The real rule is planarity, not closure**: any
 emissive mesh with triangles in more than one plane is at risk.
 
-**Fix:** an explicit opt-out on the mesh block — `emit_orient keep` alongside the current `auto` —
-**not** a cleverer heuristic, because no geometric test can tell a lampshade interior from a torus
-wound the wrong way. The author knows which they meant; the loader cannot.
-**Workaround meanwhile:** one `mesh` block per planar face (what `tools/furnace_rig.py` does).
+**Built as scoped:** `emit_orient auto|keep|flip` — an opt-out, not a cleverer heuristic. `auto`
+also stopped being silent: it prints what it decided and names the opt-out. `tools/emit_orient_rig.py`
+(6 checks): inward cube black under `auto`, lit under `keep`, `keep` == the six-planar-mesh
+workaround to 0.64 %, `flip` == `keep` to 0.29 %, a bad value refused by name. FTSL §8.4.
 
 ## 4. Mode M's CPU and GPU gathers disagree by ~9 % on `gallery_rain`'s floor grid (2026-09-16)
 
