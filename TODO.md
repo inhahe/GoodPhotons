@@ -500,11 +500,17 @@ also stopped being silent: it prints what it decided and names the opt-out. `too
 (6 checks): inward cube black under `auto`, lit under `keep`, `keep` == the six-planar-mesh
 workaround to 0.64 %, `flip` == `keep` to 0.29 %, a bad value refused by name. FTSL §8.4.
 
-## 4. Mode M's CPU and GPU gathers disagree by ~9 % on `gallery_rain`'s floor grid (2026-09-16)
+## 4. DONE (0.340.0): the device mode-M gather now does GLOSSY-NEE — the backends agree
 
-Open, on the surface photon-map gather. It matters *because of item 1*: the flyby is mode M, and a
-9 % backend disagreement on a large visible surface means one of the two is wrong in the frames
-being shipped. Full entry in `known-issues.md`.
+Root-caused and fixed. Re-measured media-free with masks from an independent mode-D reference (the
+first attempt masked on one of the two frames under test, which is a selection bias that
+manufactured a result): **the floor grid was never the problem** -- grid lines agree to 0.7 %,
+plinths to 1 %, fur to 0.2 %. The whole gap sat on the **gold gyroid** (CPU/GPU 1.437, GPU dark).
+Four hypotheses eliminated with controls (gather-footprint probe, bounce truncation, caustic map,
+material shading via mode R), then found: the host gather does next-event estimation at a glossy
+vertex and the device gather did not. Fixed; gyroid CPU/GPU **1.437 -> 0.975**, the CPU bit-identical.
+Full chain in `known-issues.md`. **Both backends are still ~21 % under mode D on the gyroid and
+~47 % on glass** -- mode M vs BDPT on specular objects, a different question, now recorded there.
 
 ## 5. A3 / the explicit multi-bounce layered BSDF — trigger FIRED, design named, not built
 

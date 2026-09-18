@@ -14579,6 +14579,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
     double thr = 1.0;
     DSpecThr sthr; sthr.init();      // SPECGATHER: the walk's spectral factors (see above)
     bool hairArrival = false;        // HAIR-NEE: the previous vertex was a fiber that already took its direct light
+    DGlossyMis gmis; gmis.clear();   // GLOSSY-NEE: the lobe density of a glossy continuation, for the MIS weight
     DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
     // norm folded into pX/pY/pZ; radius^2 kept in Real — the distance test runs once per
     // VISITED photon (~85% of visits fail it), and on GeForce parts a double compare +
@@ -14678,7 +14679,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             // is a camera ray or a specular chain — never a diffuse continuation that
             // the map / NEE already credited with the sun. (Host twin: photonmap_render.h.)
             if (sc.sunCount > 0) {
-                double e = thr * dSunRadiance(sc, rd, lambda) * invPdfL;
+                double e = thr * dSunRadianceMis(sc, gmis, rd, lambda) * invPdfL;
                 oX += (double)cieX(lambda) * e;
                 oY += (double)cieY(lambda) * e;
                 oZ += (double)cieZ(lambda) * e;
@@ -14712,7 +14713,12 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                                : (m.matIsLight)   ? m.matEmit
                                                   : nullptr;
             if (eSpd && dot(rd, h.ng) < 0 && !hairArrival) {
-                double e = (double)specLookup(eSpd, lambda) * thr * invPdfL
+                // GLOSSY-NEE's other half: if the previous bounce was a glossy lobe that was
+                // already connected to this light, the two strategies are balance-weighted so
+                // the emitter is not counted twice (host twin: photonGather).
+                const double wMis = (gmis.pdf > 0.0)
+                                  ? dGlossyHitWeight(sc, gmis, li, rd, &h.p, &h.n) : 1.0;
+                double e = (double)specLookup(eSpd, lambda) * thr * invPdfL * wMis
                          * dEmitPatMul(sc, m.emitPat, h);    // `emit pattern:` at this hit
                 oX += (double)cieX(lambda) * e;
                 oY += (double)cieY(lambda) * e;
@@ -14721,6 +14727,11 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         }
 
         hairArrival = false;
+        // Cleared HERE, not at the loop top: `gmis` is written by the PREVIOUS bounce's
+        // glossy branch and read by THIS bounce's emitter/sun sites above, so clearing it
+        // earlier would erase it a few lines before its only reader -- leaving the NEE
+        // connection in place with no compensating weight, i.e. double counting.
+        gmis.clear();
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
             if (fgRays > 0 && m.type == D_DIFFUSE) {
                 // Jensen final gather (device twin of photonGather's fgRays branch): decouples
@@ -14826,12 +14837,29 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_GLOSSY: {
+                // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX (GLOSSY-NEE, 0.340.0). The host
+                // gather has always done this; the device gather did not, so the only route
+                // from a metal to a light was a lobe sample landing on it -- gallery_rain's
+                // gold gyroid rendered 44 % below the host while every diffuse surface agreed
+                // to 1 %. Taken BEFORE `thr *= rC`: the connection carries rC inside dBsdfF.
+                if (sc.bkGlossyNee) {
+                    const DNeeBsdf nb{&m, rd * (Real)(-1)};
+                    const double dc = thr * bkNeeLight(sc, h, (Real)1, invPdfL, lambda, rng, 0, nullptr, &nb);
+                    oX += (double)cieX(lambda) * dc;
+                    oY += (double)cieY(lambda) * dc;
+                    oZ += (double)cieZ(lambda) * dc;
+                }
                 {   const double rC = (double)clamp01(dReflectSlot(sc, m, h, lambda));
                     thr *= rC;
                     dSpecFold(sthr, sc, m, h, rC, false);   // SPECGATHER
                 }
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
                 if (dot(o, h.n) <= 0) return;
+                if (sc.bkGlossyNee) {                       // the lobe's own density, for the weight above
+                    gmis.pdf  = dGlossyPdfHit(sc, m, h, rd * (Real)(-1), o);
+                    gmis.from = h.p;
+                    gmis.n    = h.n;
+                }
                 rd = o; ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_DIELECTRIC: {

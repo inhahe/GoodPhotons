@@ -4264,16 +4264,53 @@ Logged as OPEN below: a CPU/GPU disagreement on the surface photon-map gather.
 
 
 
-### OPEN (2026-09-16): mode M's CPU and GPU gathers disagree by ~9 % on gallery_rain's floor grid
+### FIXED (2026-09-17, v0.340.0): mode M's CPU and GPU gathers disagreed — the DEVICE gather did no next-event estimation at a glossy vertex
 
 Seen while checking backend parity of `-sunnee` (which does not touch it): on frame 555 at 160x90,
 spp 32, seed 1, with `-beams -sunnee -beamachro all` and the volcache on, the CPU renders the floor
 wireframe ROI (x 5..55, y 60..88) at **0.914** of the GPU's luma while the two media ROIs agree to
 ~1 % (rain 0.9894, cloud 1.0133). Pre-existing: the 0.312.0 pair read 0.914 there at 4 spp. A no-media surface region
 lit by the surface photon map, so the suspects are the density estimate's radius / caustic-map
-handling or the direct-env term on the two backends, not the beam code. Not investigated; needs a
-media-free frame (`-beams` off) to isolate the surface gather, then the two maps' radii and photon
-counts compared.
+handling or the direct-env term on the two backends, not the beam code.
+
+**ROOT-CAUSED AND FIXED, 2026-09-17.** Re-measured as the entry asked -- media-free (no `-beams` /
+`-sunnee` / volcache), 960x540, the `cam` still, 20 M photons, 24 spp, one shared ABSOLUTE exposure
+on every frame -- and with the region masks taken from an independent **1786-spp mode-D reference**
+rather than from either frame under test. (Masking on one of the two frames is a selection bias that
+manufactures exactly this kind of result: done that way first, it read "CPU 25 % brighter on the grid
+lines, 17 % darker in the dark", all three of which vanished under an unbiased mask.)
+
+What the unbiased masks actually showed: **the floor grid was never the problem.** Grid lines agree
+CPU/GPU to 0.7 % (both within 4 % of D); marble plinths 1.007; the fur creature 1.002. The whole
+disagreement sat on ONE object -- the **gold gyroid**, CPU/GPU **1.437**, the GPU dark -- plus the
+plinth beside it (1.101) picking up its missing indirect.
+
+Four hypotheses were eliminated, each with a control proving the test could see an effect:
+
+| hypothesis | test | result |
+|---|---|---|
+| the gather-footprint probe (M-GATHERAREA) | `-gatherarea 0` both backends | gap 1.437 -> **1.455** (unchanged); the probe demonstrably moves other objects (centre plinth 0.902 -> 0.756 of D), so the null is real |
+| light-path bounce truncation | `-photon-bounce 2 / 8 / 32` on the host | gyroid moves **0.6 %** across a 16x range while the plinth moves 4.7 % and the fur 3.4 %; and the device's deposit launches with **32**, the same cap as the host default, so the two never differed |
+| the caustic map / aimed pass | `-nocaustics` both backends | gap 1.437 -> **1.439**; the gyroid's own value moves < 0.2 % |
+| material / normal / roughness shading on an implicit | **mode R** (uses no photon map at all) | CPU/GPU agree on the gyroid to **0.2 %**, and on every other object to 0.8 % -- so the shading path is identical and the fault is inside mode M's gather |
+
+**The cause:** `photonGather` (host) connects to the lights at a **glossy** vertex and MIS-weights
+the emitter hits its own lobe makes (GLOSSY-NEE); `dPhotonGather` (device) did neither. A directly
+lit metal could therefore only find a light by a lobe sample landing on it -- ~1/115 against a
+0.53-degree sun for a tight lobe. Every piece needed already existed on the device for the backward
+kernel (`DNeeBsdf`, `DGlossyMis`, `bkNeeLight`, `dGlossyPdfHit`, `dGlossyHitWeight`,
+`dSunRadianceMis`); none of it was wired into the gather. 0.340.0 mirrors the host case line for
+line, including clearing `gmis` **after** the emitter block rather than at the loop top (clearing it
+early would leave the NEE connection with no compensating weight, i.e. double counting).
+
+**Result:** gyroid GPU 44.88 -> **66.12** (CPU 64.50 unchanged), CPU/GPU **1.437 -> 0.975**; the
+neighbouring plinth 1.101 -> 0.979; every other region unmoved (plinth 1.008, fur 1.002, glass
+0.966) and every CPU value bit-identical, confirming the change is device-only. **It matters
+because the flyby is mode M on the GPU** and the gyroid is the scene's hero object.
+
+**Still open, and a different question:** both backends remain ~21 % below mode D on the gyroid
+(0.77 / 0.79 of D) and ~47 % below on the glass sphere. That is mode M vs BDPT on specular objects,
+not a backend parity gap.
 
 ### FIXED (2026-09-16, v0.316.0): an imported glTF DIELECTRIC lost its specular lobe -- a painted character imported as chalk
 

@@ -1049,6 +1049,15 @@ cleared with `gmis`). The photon map is untouched -- fibers are never deposited 
 that scatters off fibers onto a surface is in the map already -- so nothing is counted twice.
 Environment escapes stay with the continuation. `FTRACE_HAIR_NEE=0` turns it off for A/B.
 
+**GLOSSY-NEE in the device gather (0.340.0).** `photonGather` connects to the lights at a glossy
+vertex and balance-weights the emitter hits the lobe itself makes; `dPhotonGather` did neither, so
+on the device a directly lit metal could reach a light only by a lobe sample landing on it. The
+device now mirrors the host case: `bkNeeLight` with a `DNeeBsdf` before the throughput takes the
+reflectance, `dGlossyPdfHit` into a `DGlossyMis` after the lobe is sampled, `dGlossyHitWeight` on a
+directly-seen emitter and `dSunRadianceMis` on escape, with `gmis` cleared after the emitter block
+(not at the loop top -- its only reader is the block above it). Measured on gallery_rain's gold
+gyroid: GPU 44.88 -> 66.12 against an unchanged CPU 64.50.
+
 **Hair on the GPU photon map (0.335.0).** `cudaPhotonMapSupported` used to refuse any scene
 with `type hair` because the device gather shaded every query point as Lambertian, so the flyby's
 frames with Alice's strands ran the CPU walk (5 min a frame where the GPU gathers the same frame in
