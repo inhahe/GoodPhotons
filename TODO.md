@@ -313,6 +313,10 @@ first); the aggregate-medium tier is backward-only today and would need a mode-M
   term is monochromatic (camera wavelength), so it adds coloured speckle the chroma filter
   removes; a SPECTRAL NEE at fibers (shared shadow ray, BCSDF x spd at the SpecThr grid) is the
   clean follow-up and would let the flyby drop the filter's chroma bleed at small exhibits.
+  **The GLOSSY half is built on the host (0.341.0)** -- one shadow ray, evaluated over the SpecThr
+  grid; `tools/specnee_rig.py` shows no bias against mode D and half the chroma noise, and the
+  gyroid's chroma fell 22.4 -> 15.2. Still to do: the DEVICE half (the flyby's backend) and the
+  FIBER half on both.
   (Machine note: CUDA 13.4 was installed on this box at 14:53-15:03 today -- that is what filled
   D: -- and a shell older than the install lacks `CUDA_PATH_V13_4`, which the regenerated
   project's `CUDA 13.4.props` needs: "The CUDA Toolkit directory '' does not exist". Set it, or

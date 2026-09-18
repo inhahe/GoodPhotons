@@ -121,6 +121,12 @@ inline bool hairNeeOn() {
     static const bool on = [] { const char* e = std::getenv("FTRACE_HAIR_NEE"); return !(e && e[0] == '0'); }();
     return on;
 }
+// SPECTRAL NEE (0.341.0): evaluate a glossy vertex's light connection over the SpecThr grid
+// rather than at the camera's single wavelength. FTRACE_SPECNEE=0 restores the scalar term.
+inline bool specNeeOn() {
+    static const bool on = [] { const char* e = std::getenv("FTRACE_SPECNEE"); return !(e && e[0] == '0'); }();
+    return on;
+}
 inline int gatherAreaSamples() {
     static const int m = [] {
         const char* e = std::getenv("FTRACE_GATHERAREA");
@@ -1568,9 +1574,24 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 // walk uses: a glossy lobe can be narrower than the light as easily as wider.
                 if (gneeOn) {
                     const BackwardRenderer::NeeBsdf nb{&m, ray.d * -1.0};
-                    L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                         * (thr * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng,
-                                                 nullptr, BackwardRenderer::GiCtx{}, nullptr, nullptr, &nb));
+                    if (specNeeOn()) {
+                        // SPECTRAL (0.341.0): one shadow ray, evaluated over the SpecThr grid,
+                        // so a gold lobe under a warm light stops painting each sample one
+                        // colour. The walk's own spectral throughput rides in through `ratio`.
+                        double lamG[SpecThr::K], ratG[SpecThr::K], xyz[3] = {0, 0, 0};
+                        for (int k = 0; k < SpecThr::K; ++k) {
+                            lamG[k] = SpecThr::lamOf(k);
+                            ratG[k] = sthr.ratio(lamG[k]);
+                        }
+                        const double dLam = (LAMBDA_MAX - LAMBDA_MIN) / (double)SpecThr::K;
+                        bwNee.neeLightSpecGlossy(scene, h, nb, lamG, ratG, SpecThr::K, dLam,
+                                                 lambda, thr, rng, xyz);
+                        L += Vec3(xyz[0], xyz[1], xyz[2]);
+                    } else {
+                        L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                             * (thr * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng,
+                                                     nullptr, BackwardRenderer::GiCtx{}, nullptr, nullptr, &nb));
+                    }
                 }
                 thr *= r;
                 sthr.mul([&](double Lw) { return clamp01(reflectSlot(scene, m, h, Lw)); }, r);

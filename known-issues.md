@@ -29554,3 +29554,50 @@ otherwise: **max 0.612**, mean 0.281, median 0.251; 13.9 % near zero, 45.5 % in 
 a mid-grey it never meant physically. Honouring it is legitimate compliance and makes the dress
 visibly metallic, which is an aesthetic change to someone's asset, so it is theirs to choose. The
 loader prints one line when a map is mixed and the flag is off, naming the flag.
+
+## SPECTRAL NEE: mode M's direct-light terms were added at ONE wavelength (host fixed 0.341.0)
+
+Mode M's camera walk is monochromatic at the camera's sampled wavelength while the map it gathers
+from is polychromatic. SPECGATHER (`SpecThr`) already carries the walk's own factors as a spectrum
+so the density estimate can reweight each photon at ITS wavelength — but the NEE terms added at a
+**glossy** vertex (0.340.0) and at a **fiber** (0.334.0) are not gathered from the map. They are
+direct contributions, and they went in as `cie(lambda_c) * value`: each sample painted one spectral
+colour. That is the coloured speckle on gallery_rain's gold gyroid and on Alice's hair.
+
+**The geometry of a light connection is wavelength-free**, which is the same fact `neeLightHero`
+already relies on to share one visibility sample across a hero bundle. So `neeLightSpecGlossy`
+(backward.h) keeps neeLight's emitter loop, its rng order and its **one shadow ray**, and evaluates
+only what varies per wavelength: the BSDF coefficient, the emitter's spectrum, the shadow leg's
+media transmittance (one shared ratio-tracking walk, `mediaTransmittanceSpec`) and the walk's own
+throughput via `SpecThr`'s ratio. The MIS weight is a ratio of DENSITIES, which are geometric, so it
+is computed once at the camera wavelength and shared. The estimator changes from one MC sample over
+lambda to a K-bin quadrature of the same integral.
+
+**Validated by `tools/specnee_rig.py`**, whose first check is that the rig can see its own subject:
+a gold glossy sphere under a small distant blackbody sun, at the roughness where NEE carries the
+most (measured share: big near light 0.19 %, sun + roughness 0.05 **2.8 %** — a tight lobe finds a
+small sun unaided — 0.15 11.7 %, **0.25 18.3 %**, 0.40 6.1 %; the rig uses 0.25 and refuses to
+report below 10 %). At 64 spp against a converged mode D:
+
+| | mode D | spectral | scalar |
+|---|---|---|---|
+| gold sphere, mean | 125.16 | 121.42 (**2.99 %** off) | 121.48 (2.94 % off) |
+| gold sphere, chroma residual | — | **2.35** | 4.62 |
+| white control, mean | 132.51 | 129.44 | 128.55 |
+
+So the quadrature introduces **no bias** (same distance from mode D as the scalar form) and halves
+the colour noise. The white control confirms a flat BSDF does not shift the mean; its chroma still
+falls, because the EMITTER's spectrum is coloured whatever the surface does.
+
+**On gallery_rain** (host, 20 M photons): the gyroid's chroma residual fell 22.4 -> 15.2 and the
+24-spp mean went 0.771 -> 0.908 of mode D. A convergence check settles what that means: at 128 spp
+the scalar reaches 0.915 and the spectral 0.987, so the scalar was converging slowly **from below**
+and the spectral form reaches at 24 spp roughly what the scalar needs 128 for. A residual ~8 % gap
+between the two at 128 spp is not yet resolved and is recorded here rather than explained away.
+
+Cost, paired on that frame: 8:40 scalar vs 10:05 spectral (+16 %).
+
+**The device half is not done** — `dPhotonGather`'s D_GLOSSY case still adds the scalar term, so the
+GPU keeps the colour noise the host has now lost. The means agree, so this is a variance difference
+rather than the parity bug 0.340.0 fixed, but the flyby runs on the GPU and that is where it
+matters. Same for both backends' HAIR-NEE term, which is still single-wavelength.

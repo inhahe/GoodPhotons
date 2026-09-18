@@ -1183,6 +1183,72 @@ struct BackwardRenderer {
         return total;
     }
 
+    // SPECTRAL surface NEE for mode M's gather (0.341.0). Same emitter loop, same rng order and
+    // the same ONE shadow ray per emitter sample as neeLight -- a light connection's geometry is
+    // wavelength-free, which is the identical fact neeLightHero below relies on. What varies per
+    // wavelength is evaluated on the caller's grid instead of at one sampled lambda: the BSDF
+    // coefficient, the emitter's spectrum, the shadow leg's media transmittance (ONE shared
+    // ratio-tracking walk), and the walk's own accumulated throughput (`thrRatio`, which is
+    // SpecThr's ratio at each bin). The result is accumulated straight into XYZ.
+    //
+    // The MIS weight against the lobe-sampling strategy is a ratio of DENSITIES, which are
+    // geometric, so it is computed once at `lambdaCam` and shared -- exactly as neeLightHero does
+    // for its bundle. `dLam` is the quadrature bin width: the estimator stops being one MC sample
+    // over lambda and becomes a K-bin sum of the same integral, which is where the colour noise
+    // goes. Glossy vertices only (`nb` is required): a fiber's BCSDF needs its own per-wavelength
+    // rebuild and is not handled here.
+    void neeLightSpecGlossy(const Scene& scene, const Hit& h, const NeeBsdf& nb,
+                            const double* lam, const double* thrRatio, int K, double dLam,
+                            double lambdaCam, double thrScalar, Pcg32& rng,
+                            double* xyz) const {
+        const Vec3 ngo = orientedGeoN(h);
+        const bool med = !scene.media.empty();
+        const EmitterDraw draw = pickEmitters(scene, h.p, &h.n, rng);
+        for (int di = 0; di < draw.n; ++di) {
+            const int e = draw.emitter(di);
+            const double selW = draw.weight(di);
+            if (selW <= 0.0) continue;
+            const double selP = draw.selExact ? draw.selPdf(di) : lightSelPdf(scene, e, h.p, h.n);
+            if (!(selP > 0.0)) continue;
+            const Emitter& em = scene.emitters[e];
+            const bool uv = emitterNeedsUV(em);
+            double u1 = 0.0, u2 = 0.0;
+            if (uv) { u1 = rng.uniform(); u2 = rng.uniform(); }
+            double dist = 0.0, w = 0.0, pdfWLight = 0.0;
+            Vec3 wiConn{0, 0, 0};
+            if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w, wiConn, nullptr, nullptr,
+                             &pdfWLight)) continue;
+            // The balance heuristic, once: both densities are geometric (see neeLightHero).
+            double wMis = 1.0;
+            if (pdfWLight > 0.0) {
+                const double pLobe = bdpt::bsdfPdf(*nb.m, h.n, nb.wo, wiConn, lambdaCam, scene, &h);
+                const double pNee = pdfWLight * selP;
+                const double sum = pNee + pLobe;
+                if (sum > 0.0) wMis = pNee / sum;
+            }
+            // The shadow leg's transmittance at every grid wavelength, from ONE walk (the scalar
+            // twin is the `mediaTr` call in neeLight; this is mediaTransmittanceSpec, the same
+            // routine camMediaTrSpec uses for a camera segment).
+            double Tr[64];
+            const int KK = (K < 64) ? K : 64;
+            for (int k = 0; k < KK; ++k) Tr[k] = 1.0;
+            if (med)
+                Renderer::mediaTransmittanceSpec(scene, h.p + ngo * 1e-6, wiConn, dist,
+                                                 lam, KK, Tr, rng);
+            const double gWeight = w * selW * wMis * thrScalar * dLam;
+            if (!(gWeight > 0.0)) continue;
+            for (int k = 0; k < KK; ++k) {
+                const double f = bdpt::bsdfF(*nb.m, h.n, nb.wo, wiConn, lam[k], scene, &h);
+                if (!(f > 0.0)) continue;
+                const double v = gWeight * thrRatio[k] * f * em.spdFn(lam[k]) * Tr[k];
+                if (!(v > 0.0)) continue;
+                xyz[0] += cieX(lam[k]) * v;
+                xyz[1] += cieY(lam[k]) * v;
+                xyz[2] += cieZ(lam[k]) * v;
+            }
+        }
+    }
+
     // Hero-wavelength surface NEE: one shared visibility sample per emitter (identical
     // rng to neeLight), evaluated for all `nUp` active wavelengths. Accumulates
     // thr[i]·(rho[i]/PI)·SPD(λ_i)·invPdf[i]·w into L[i]. Only called on the fog-free
