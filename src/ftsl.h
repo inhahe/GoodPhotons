@@ -5875,7 +5875,23 @@ private:
             // thus its emission — points OUTWARD. This runs before emitter registration
             // so both the per-Tri geometric normals used by emission-on-hit and the
             // addMeshLight sampler normals come out consistent.
-            {
+            // `emit_orient auto|keep|flip` (0.338.0). The volume test below cannot tell a
+            // lampshade INTERIOR from a torus wound the wrong way -- both are closed shells
+            // whose faces point inward -- and it used to decide silently, which rendered any
+            // emissive enclosure black with no diagnostic (known-issues). No cleverer
+            // heuristic exists: the difference is authorial intent, so this is an opt-out.
+            //   auto (default)  the volume test, exactly as before -- but it now SAYS so
+            //   keep            never reorient: the authored winding IS the emission side
+            //   flip            always reverse (an inward-wound OPEN sheet, which the
+            //                   volume test cannot detect at all)
+            std::string eoStr = strOf(b, "emit_orient", "auto");
+            for (char& c : eoStr) c = (char)std::tolower((unsigned char)c);
+            if (eoStr != "auto" && eoStr != "keep" && eoStr != "flip") {
+                fail("mesh " + (b.name.empty() ? std::string("(unnamed)") : "'" + b.name + "'") +
+                     ": emit_orient must be `auto`, `keep` or `flip` (got '" + eoStr + "')");
+                return false;
+            }
+            if (eoStr != "keep") {
                 size_t n = triEnd - triStart;
                 Vec3 cen{0, 0, 0};
                 for (size_t t = triStart; t < triEnd; ++t) {
@@ -5892,7 +5908,8 @@ private:
                 }
                 vol /= 6.0;
                 double area = 0.5 * area2;
-                if (vol < -1e-6 * std::pow(area, 1.5)) {
+                const bool autoFlip = (vol < -1e-6 * std::pow(area, 1.5));
+                if (eoStr == "flip" || autoFlip) {
                     for (size_t t = triStart; t < triEnd; ++t) {
                         Tri& tr = L.scene.tris[t];
                         std::swap(tr.v1, tr.v2);
@@ -5907,6 +5924,17 @@ private:
                         tr.n2 = tr.n2 * -1.0;
                         tr.finalize();
                     }
+                    // Never silent again: an enclosure the author meant to glow INWARD is
+                    // told how to say so, at the moment the decision is taken.
+                    if (autoFlip && eoStr == "auto")
+                        std::fprintf(stderr, "[ftsl] mesh %s: emissive shell wound inward "
+                                             "(signed volume %.4g over %.4g m^2) -- reversing it so the emission "
+                                             "points OUTWARD. If this is an enclosure meant to glow inward "
+                                             "(a furnace, a cove, a lampshade), add `emit_orient keep`.\n",
+                                     b.name.empty() ? "(unnamed)" : ("'" + b.name + "'").c_str(), vol, area);
+                    else if (eoStr == "flip")
+                        std::fprintf(stderr, "[ftsl] mesh %s: emit_orient flip -- winding reversed.\n",
+                                     b.name.empty() ? "(unnamed)" : ("'" + b.name + "'").c_str());
                 }
             }
             if (find(b, "power") || find(b, "lumens")) {
