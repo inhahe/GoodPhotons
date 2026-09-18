@@ -29,7 +29,42 @@
 //                        root, slackest at the tip — this is what stops a settle turning a
 //                        sculpted groom into a wet mop, and it is the "stiffness" in the ask)
 //   3. separation       (strand-strand, exact segment-segment distance against r_i + r_j)
-//   4. collision        (stay outside named mesh groups)
+//   4. volume           (the COLLECTIVE term -- see below)
+//   5. collision        (stay outside named mesh groups)
+//
+// WHY 4 EXISTS, measured rather than assumed. Separation alone applies the MEAN of a segment's
+// contact directions, and for a fiber overlapped on all sides those vectors cancel to nearly
+// zero however deep the overlaps are. Measured on Alice at 0.346.0: with stiffness AND gravity
+// both at zero -- nothing opposing separation at all -- the share of overlapping segments moved
+// only 72.67 % -> 70.09 %. Local pairwise pushing cannot expand a bundle; only a collective
+// term can. So the fibers are also splatted into a density grid and pushed DOWN its gradient
+// wherever the local volume fraction exceeds `packing`, inflating an over-dense neighbourhood
+// as a whole.
+//
+// IT IS OFF BY DEFAULT, because on Alice it measurably made things WORSE: the binary share of
+// overlapping segments went to 73.97 %, against 70.09 % with separation alone. The reason is
+// scale. A field can only separate structures it RESOLVES, and the overlapping groups here are
+// finer than one 0.35 mm cell, so the gradient translates a whole cluster rather than expanding
+// it. Resolving them would need ~0.1 mm cells, which is 830 M cells on this groom -- a sparse
+// structure, not a dense grid. Kept because it is correct and cheap when a groom genuinely is
+// jammed at a coarser scale; enable with `volume`.
+//
+// What actually limits the de-overlap is the UPDATE, measured after the fact: a penetrating
+// segment has a median of 4 overlapping partners (mean 7.7) and local packing is 0.21 against
+// 0.82 for random close packing, so there is room and four partners is locally resolvable. The
+// old separation divided the summed violation by `hits` and then again by `cw`, i.e. applied
+// ~6 % of it per sweep. That is Jacobi averaging, which crawls on contact problems.
+//
+// The grid cell is ~8 fiber radii (0.35 mm on Alice), NOT the 1-2 mm 'lock scale' the original
+// design named -- because the packing measurement said the clustering is finer than a lock:
+// 7 distinct strands within 0.25 mm at a local volume fraction of only 0.21. A 1.5 mm cell
+// holds barely one segment and would move whole locks apart while leaving the fibers inside
+// them merged. Segments are splatted ALONG their length (a segment is 1.47 mm, four cells),
+// not at their endpoints, or the field aliases into stripes.
+//
+// The accumulation is FIXED-POINT in uint64, not float: integer addition is associative, so the
+// grid is identical however the threads interleave. Float atomics would reintroduce exactly the
+// thread-count dependence the determinism control exists to catch.
 // with roots pinned throughout. The fixed point is where gravity balances stiffness and
 // contact, which is the "equilibrium" asked for, reached without a dt to tune.
 //
@@ -45,6 +80,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <atomic>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -59,6 +96,11 @@ struct Params {
     double sepScale  = 1.0;     // separation target as a multiple of (r_i + r_j); 0 disables
     double margin    = 0.0;     // extra clearance held against colliders
     int    maxNbr    = 32;      // neighbour-list cap per segment (memory bound)
+    int    refresh   = 10;      // rebuild the neighbour list every N sweeps (0 = once only)
+    double volume    = 0.0;     // COLLECTIVE density-gradient push; OFF by default, see below
+    double packing   = 0.30;    // volume fraction above which a neighbourhood expands
+    double cellSize  = 0.0;     // density-grid cell in metres; 0 = auto (8 x mean fiber radius)
+    double maxStep   = 1.0;     // per-sweep separation displacement cap, in fiber radii
     std::vector<std::string> collide;   // mesh-group names to stay outside of
 };
 
@@ -204,8 +246,23 @@ inline bool run(Scene& sc, const Params& p, std::string& report) {
     std::vector<uint32_t> nbrOff, nbrIdx;
     size_t capped = 0;
     const bool doSep = (p.sepScale > 0.0);
+    std::vector<Vec3>     mid;
+    std::vector<uint32_t> flat, nn;
+    std::vector<uint8_t>  over;
+    detail::Grid g;
     if (doSep) {
-        std::vector<Vec3> mid(nSeg);
+        mid.resize(nSeg);
+        flat.assign((size_t)nSeg * (size_t)p.maxNbr, 0u);
+        nn.assign(nSeg, 0u);
+        over.assign(nSeg, 0u);
+        nbrOff.assign(nSeg + 1, 0u);
+    }
+    // Rebuilt DURING the settle, not only before it. Measured: of the contacts surviving a
+    // 60-sweep settle, 51.8 % were never in the shortlist -- as the solver separates its 32
+    // nearest, pairs that ranked 33+ move up and become real contacts it never sees. The cell
+    // stays valid as positions move (~66 um against 1.47 mm); the RANKING does not, which is the
+    // distinction the original "build it once" justification missed.
+    auto buildNbrs = [&]() -> bool {
         for (size_t c = 0; c < nC; ++c) {
             const Curve& cu = sc.curves[c];
             for (int k = 0; k < cu.segCount; ++k) {
@@ -213,56 +270,65 @@ inline bool run(Scene& sc, const Params& p, std::string& report) {
                 mid[(size_t)cu.firstSeg + (size_t)k] = (pos[i] + pos[i + 1]) * 0.5;
             }
         }
-        detail::Grid g;
         detail::buildGrid(g, mid, std::max(meanSeg, 8.0 * (nSeg ? rad[0] : 1e-4)));
-        nbrOff.assign(nSeg + 1, 0);
-        std::vector<uint32_t> flat((size_t)nSeg * (size_t)p.maxNbr);
-        std::vector<uint32_t> nn(nSeg, 0);
-        std::vector<uint8_t>  over(nSeg, 0);   // more candidates in reach than the cap keeps
         const double reach = g.cell;
-        // THE NEAREST neighbours, not the first ones found. Hair is not uniformly dense: inside a
-        // lock a segment has ~1000 others within one cell, so a scan that stops at the cap keeps an
-        // arbitrary 3 % of them and misses the contacts entirely -- measured, the first version of
-        // this capped 1 199 962 of 1 200 000 segments and moved penetration 72.67 % -> 72.02 %.
-        // Candidates are ranked by MIDPOINT distance, which is cheap (6 flops against segSeg's ~30)
-        // and monotone enough for the ranking: two segments in contact necessarily have close
-        // midpoints, because a segment is only 1.4 mm long.
-        if (!ft::parallelFor(nSeg, 256, [&](size_t si) {
-                const Vec3 m = mid[si];
-                const int cx = (int)std::floor(m.x / g.cell), cy = (int)std::floor(m.y / g.cell), cz = (int)std::floor(m.z / g.cell);
+        // RANK BY THE REAL SEGMENT-SEGMENT DISTANCE, not by midpoint distance.
+        //
+        // Midpoint distance is the obvious cheap proxy and it is close to USELESS here, measured:
+        // of a segment's ~2253 candidates in reach and its median 7 actual contacts, a
+        // nearest-32-by-midpoint shortlist contained 3 and missed 4 -- 33.0 % of contacts overall.
+        // A lock is full of near-parallel neighbours whose midpoints nearly coincide but which do
+        // not touch, while two segments crossing at an angle touch with their midpoints a
+        // segment-length apart. The solver was faithfully resolving the wrong pairs, which is why
+        // three separate strengthenings of the push moved nothing.
+        if (!ft::parallelFor(nC, 16, [&](size_t c) {
+                const Curve& cu = sc.curves[c];
                 const int K = p.maxNbr;
-                // a bounded insertion-sorted shortlist; K is small (32) so this beats a heap
                 std::vector<std::pair<double, uint32_t>> best;
                 best.reserve((size_t)K + 1);
-                uint32_t seen = 0;
-                for (int dx = -1; dx <= 1; ++dx)
-                for (int dy = -1; dy <= 1; ++dy)
-                for (int dz = -1; dz <= 1; ++dz) {
-                    size_t a, b;
-                    g.range(detail::Grid::code(cx + dx, cy + dy, cz + dz), a, b);
-                    for (size_t e = a; e < b; ++e) {
-                        const uint32_t j = g.idx[e];
-                        if ((size_t)j == si) continue;
-                        if (sc.curveSegs[j].curveId == sc.curveSegs[si].curveId) continue;  // same strand
-                        const Vec3 d = mid[j] - m;
-                        const double dd = dot(d, d);
-                        if (dd > 4.0 * reach * reach) continue;
-                        ++seen;
-                        if ((int)best.size() == K && dd >= best.back().first) continue;
-                        auto it = std::lower_bound(best.begin(), best.end(), std::make_pair(dd, j));
-                        best.insert(it, std::make_pair(dd, (uint32_t)j));
-                        if ((int)best.size() > K) best.pop_back();
+                for (int k = 0; k < cu.segCount; ++k) {
+                    const size_t si = (size_t)cu.firstSeg + (size_t)k;
+                    const size_t ia = (size_t)first[c] + (size_t)k, ib = ia + 1;
+                    const Vec3 m = mid[si];
+                    const int cx = (int)std::floor(m.x / g.cell), cy = (int)std::floor(m.y / g.cell), cz = (int)std::floor(m.z / g.cell);
+                    best.clear();
+                    uint32_t seen = 0;
+                    for (int dx = -1; dx <= 1; ++dx)
+                    for (int dy = -1; dy <= 1; ++dy)
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        size_t a, b;
+                        g.range(detail::Grid::code(cx + dx, cy + dy, cz + dz), a, b);
+                        for (size_t e = a; e < b; ++e) {
+                            const uint32_t j = g.idx[e];
+                            if ((size_t)j == si) continue;
+                            const int c2 = sc.curveSegs[j].curveId;
+                            if (c2 == (int)c || c2 < 0 || c2 >= (int)nC) continue;   // same strand
+                            const Vec3 dm = mid[j] - m;
+                            if (dot(dm, dm) > 4.0 * reach * reach) continue;
+                            const int k2 = (int)((size_t)j - (size_t)sc.curves[(size_t)c2].firstSeg);
+                            const size_t ja = (size_t)first[c2] + (size_t)k2, jb = ja + 1;
+                            Vec3 x1, x2;
+                            const double dd = detail::segSeg(pos[ia], pos[ib], pos[ja], pos[jb], x1, x2);
+                            ++seen;
+                            if ((int)best.size() == K && dd >= best.back().first) continue;
+                            auto it = std::lower_bound(best.begin(), best.end(), std::make_pair(dd, j));
+                            best.insert(it, std::make_pair(dd, j));
+                            if ((int)best.size() > K) best.pop_back();
+                        }
                     }
+                    for (size_t q = 0; q < best.size(); ++q) flat[si * (size_t)p.maxNbr + q] = best[q].second;
+                    nn[si] = (uint32_t)best.size();
+                    over[si] = (seen > (uint32_t)K) ? 1 : 0;
                 }
-                for (size_t k = 0; k < best.size(); ++k) flat[si * (size_t)p.maxNbr + k] = best[k].second;
-                nn[si] = (uint32_t)best.size();
-                over[si] = (seen > (uint32_t)K) ? 1 : 0;
             })) return false;
+        capped = 0;
         for (size_t i = 0; i < nSeg; ++i) { if (over[i]) ++capped; nbrOff[i + 1] = nbrOff[i] + nn[i]; }
         nbrIdx.resize(nbrOff[nSeg]);
         for (size_t i = 0; i < nSeg; ++i)
             for (uint32_t k = 0; k < nn[i]; ++k) nbrIdx[nbrOff[i] + k] = flat[i * (size_t)p.maxNbr + k];
-    }
+        return true;
+    };
+    if (doSep && !buildNbrs()) return false;
 
     // ---- 3. colliders ----------------------------------------------------------------------
     std::vector<Tri> ctris;
@@ -285,10 +351,72 @@ inline bool run(Scene& sc, const Params& p, std::string& report) {
         detail::buildGrid(cg, ccent, std::max(ext, meanSeg));
     }
 
+    // ---- 3b. the density grid ---------------------------------------------------------------
+    const bool doVol = (p.volume > 0.0 && p.packing > 0.0);
+    double cell = p.cellSize;
+    if (doVol && cell <= 0.0) {
+        double rs = 0.0;
+        for (size_t i = 0; i < nP; ++i) rs += rad[i];
+        cell = 8.0 * (rs / (double)nP);
+    }
+    if (cell <= 0.0) cell = 1.0;
+    const double PI_D = 3.14159265358979323846;
+    const double VSCALE = 1e21;        // m^3 -> fixed point; one fiber-cell ~2e9, uint64 holds 1.8e19
+    Vec3 glo = lo, ghi = hi;
+    int gx = 1, gy = 1, gz = 1;
+    size_t gN = 1;
+    std::unique_ptr<std::atomic<uint64_t>[]> dens;
+    if (doVol) {
+        const double padv = 4.0 * cell + 0.02 * diag;
+        const Vec3 pad{padv, padv, padv};
+        glo = lo - pad; ghi = hi + pad;
+        gx = (int)std::ceil((ghi.x - glo.x) / cell) + 1;
+        gy = (int)std::ceil((ghi.y - glo.y) / cell) + 1;
+        gz = (int)std::ceil((ghi.z - glo.z) / cell) + 1;
+        gN = (size_t)gx * (size_t)gy * (size_t)gz;
+        if (gN > (size_t)400000000) {  // refuse rather than swap the machine
+            report += "volume: grid would need too many cells; raise cell. ";
+            gN = 1; gx = gy = gz = 1;
+        } else {
+            dens.reset(new std::atomic<uint64_t>[gN]);
+        }
+    }
+    const bool volOn = doVol && (dens != nullptr);
+    const double invCell = 1.0 / cell;
+    const double cellVol = cell * cell * cell;
+    auto splat = [&](const Vec3& q, uint64_t w) {
+        const double fx = (q.x - glo.x) * invCell, fy = (q.y - glo.y) * invCell, fz = (q.z - glo.z) * invCell;
+        const int ix = (int)std::floor(fx), iy = (int)std::floor(fy), iz = (int)std::floor(fz);
+        if (ix < 0 || iy < 0 || iz < 0 || ix + 1 >= gx || iy + 1 >= gy || iz + 1 >= gz) return;
+        const double tx = fx - ix, ty = fy - iy, tz = fz - iz;
+        for (int dz = 0; dz < 2; ++dz) for (int dy = 0; dy < 2; ++dy) for (int dx = 0; dx < 2; ++dx) {
+            const double wgt = (dx ? tx : 1.0 - tx) * (dy ? ty : 1.0 - ty) * (dz ? tz : 1.0 - tz);
+            const uint64_t add = (uint64_t)(wgt * (double)w);
+            if (!add) continue;
+            const size_t id = ((size_t)(iz + dz) * (size_t)gy + (size_t)(iy + dy)) * (size_t)gx + (size_t)(ix + dx);
+            dens[id].fetch_add(add, std::memory_order_relaxed);
+        }
+    };
+    auto sampleRho = [&](const Vec3& q) -> double {
+        const double fx = (q.x - glo.x) * invCell, fy = (q.y - glo.y) * invCell, fz = (q.z - glo.z) * invCell;
+        const int ix = (int)std::floor(fx), iy = (int)std::floor(fy), iz = (int)std::floor(fz);
+        if (ix < 0 || iy < 0 || iz < 0 || ix + 1 >= gx || iy + 1 >= gy || iz + 1 >= gz) return 0.0;
+        const double tx = fx - ix, ty = fy - iy, tz = fz - iz;
+        double acc = 0.0;
+        for (int dz = 0; dz < 2; ++dz) for (int dy = 0; dy < 2; ++dy) for (int dx = 0; dx < 2; ++dx) {
+            const double wgt = (dx ? tx : 1.0 - tx) * (dy ? ty : 1.0 - ty) * (dz ? tz : 1.0 - tz);
+            const size_t id = ((size_t)(iz + dz) * (size_t)gy + (size_t)(iy + dy)) * (size_t)gx + (size_t)(ix + dx);
+            acc += wgt * (double)dens[id].load(std::memory_order_relaxed);
+        }
+        return (acc / VSCALE) / cellVol;
+    };
+
     // ---- 4. the sweeps ---------------------------------------------------------------------
     std::vector<Vec3> corr(nP);
     std::vector<float> cw(nP);
     for (int it = 0; it < p.iters; ++it) {
+        if (doSep && p.refresh > 0 && it > 0 && (it % p.refresh) == 0 && !buildNbrs()) return false;
+
         // (a) gravity, into every unpinned particle (k == 0 is the follicle)
         if (!ft::parallelFor(nC, 64, [&](size_t c) {
                 for (int k = 1; k < cnt[c]; ++k) pos[(size_t)first[c] + (size_t)k].y -= gstep;
@@ -350,14 +478,62 @@ inline bool run(Scene& sc, const Params& p, std::string& report) {
                             ++hits;
                         }
                         if (hits) {
-                            const Vec3 half = acc * (0.5 / (double)hits);
+                            // SUM, not mean. Dividing by `hits` is what made this crawl: with four
+                            // partners it applied ~6 % of the violation per sweep. The clamp below
+                            // is what buys back the stability that averaging was providing.
+                            const Vec3 half = acc * 0.5;
                             corr[ia] = corr[ia] + half; cw[ia] += 1.0f;
                             corr[ib] = corr[ib] + half; cw[ib] += 1.0f;
                         }
                     }
                 })) return false;
+            // Apply with a per-sweep CLAMP rather than an average: a summed violation can be
+            // arbitrarily large where many fibers coincide, and an unclamped projection would throw
+            // those strands across the groom. One fiber radius per sweep still allows 60 sweeps to
+            // move a strand 2.6 mm, far more than the ~33 um a typical de-overlap needs.
             if (!ft::parallelFor(nP, 1024, [&](size_t i) {
-                    if (cw[i] > 0.0f) pos[i] = pos[i] + corr[i] * (1.0 / (double)cw[i]);
+                    if (!(cw[i] > 0.0f)) return;
+                    Vec3 d = corr[i] * (1.0 / (double)cw[i]);
+                    const double dl = length(d);
+                    const double cap = p.maxStep * rad[i];
+                    if (dl > cap && dl > 1e-30) d = d * (cap / dl);
+                    pos[i] = pos[i] + d;
+                })) return false;
+        }
+
+        // (d2) THE COLLECTIVE TERM: expand wherever the local volume fraction is too high.
+        if (volOn) {
+            for (size_t i = 0; i < gN; ++i) dens[i].store(0, std::memory_order_relaxed);
+            if (!ft::parallelFor(nC, 32, [&](size_t c) {
+                    const Curve& cu = sc.curves[c];
+                    for (int k = 0; k < cu.segCount; ++k) {
+                        const size_t ia = (size_t)first[c] + (size_t)k, ib = ia + 1;
+                        const Vec3 a = pos[ia], b = pos[ib];
+                        const Vec3 ab = b - a;
+                        const double len = length(ab);
+                        if (len < 1e-12) continue;
+                        const double rr = 0.5 * (rad[ia] + rad[ib]);
+                        const int ns = (int)std::ceil(len * invCell);
+                        const int nsub = (ns < 1) ? 1 : ((ns > 64) ? 64 : ns);
+                        const double vol = PI_D * rr * rr * len / (double)nsub;
+                        const uint64_t q = (uint64_t)(vol * VSCALE);
+                        if (q == 0) continue;
+                        for (int t = 0; t < nsub; ++t)
+                            splat(a + ab * (((double)t + 0.5) / (double)nsub), q);
+                    }
+                })) return false;
+            // one write per particle, so the gather is deterministic by construction
+            if (!ft::parallelFor(nP, 512, [&](size_t i) {
+                    const double r0 = sampleRho(pos[i]);
+                    if (!(r0 > p.packing)) return;
+                    const Vec3 ex{cell, 0, 0}, ey{0, cell, 0}, ez{0, 0, cell};
+                    const Vec3 g{ sampleRho(pos[i] + ex) - sampleRho(pos[i] - ex),
+                                  sampleRho(pos[i] + ey) - sampleRho(pos[i] - ey),
+                                  sampleRho(pos[i] + ez) - sampleRho(pos[i] - ez) };
+                    const double gl = length(g);
+                    if (gl < 1e-30) return;
+                    const double over = (r0 - p.packing) / p.packing;
+                    pos[i] = pos[i] - g * ((p.volume * (over < 1.0 ? over : 1.0) * cell) / gl);
                 })) return false;
         }
 

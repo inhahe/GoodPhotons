@@ -4837,6 +4837,56 @@ consecutive segments of a strand *share* a particle, so adjacent segments race o
 determinism control caught it (two runs disagreed); dispatching by STRAND fixes it by construction,
 since a strand owns its particles outright. A one-sided write is not automatically an exclusive one.
 
+### 0.347.0 — four more hypotheses, three refuted, and the two that were actually right
+
+Continuing the above. Every step below was decided by measurement, and the pattern is worth the
+space: **three of the five things I was confident about were wrong, and the two that worked were
+both found by measuring the solver's own inputs rather than reasoning about its physics.**
+
+| change | binary share | median depth |
+|---|---|---|
+| baseline (0.346.0) | 72.67 → 70.09 % | 66.4 → 51.5 µm |
+| + collective density-gradient term | 72.67 → **73.97 %** (worse) | 51.6 µm |
+| + summed (not averaged) separation | 72.67 → 70.46 % | 52.5 µm |
+| + **contacts ranked by true distance** | 72.67 → 69.52 % | **45.9 µm** |
+| + **neighbour list refreshed every 10 sweeps** | 72.67 → 69.57 % | **43.5 µm** |
+| + **separation target 1.25×(r_i+r_j)** | 72.67 → **61.99 %** | 51.5 µm |
+
+**REFUTED — the collective density term.** Built as designed (fixed-point uint64 splat, trilinear,
+push down ∇ρ) and it made the binary share *worse*. The reason is scale, and the packing measurement
+had already said so: the overlapping groups are finer than one 0.35 mm cell, so the gradient
+translates a whole cluster instead of expanding it. Resolving them needs ~0.1 mm cells = 830 M cells
+on this groom, i.e. a sparse structure. Kept in the code, `volume` defaults to 0.
+
+**REFUTED — that the push was too weak.** It was: summing the violations instead of averaging them
+over `hits` is 4–16× stronger. It changed nothing measurable (70.46 vs 70.09 %).
+
+**RIGHT — the contact set was mostly wrong.** The neighbour shortlist ranked candidates by MIDPOINT
+distance as a cheap proxy. Measured: a segment has ~2253 candidates in reach and a median of 7 real
+contacts, of which the 32-slot shortlist held **3** and missed 4 — **33 % of contacts overall**, with
+6 % of segments missing theirs entirely. A lock is full of near-parallel neighbours whose midpoints
+nearly coincide but which do not touch, while two segments crossing at an angle touch with midpoints
+a segment-length apart; the two quantities are nearly uncorrelated here. *This is why the three
+strengthenings above did nothing — they were all acting on the wrong pairs.* Ranking by true
+segment-segment distance costs ~2.7 G evaluations per build and took the median depth to 45.9 µm.
+
+**RIGHT — the list goes stale.** Of the contacts SURVIVING a settle, 51.8 % were never in the
+shortlist: as the solver separates its 32 nearest, pairs ranked 33+ move up and become real contacts
+it never sees. I had justified building it once with "displacements are ~66 µm against a 1.47 mm
+cell", which is true of the CELL and irrelevant to the RANKING. `refresh` (default 10 sweeps).
+
+**RIGHT, and the one that finally moved the headline — the target needs SLACK.** The push is
+proportional to `(want − d)`, so it decays asymptotically toward the target and never *crosses* it,
+while the check is at exactly `d ≥ want`. Depths shrank on every variant while the count sat frozen
+near 69.5 %, which is the signature. Targeting `1.25 × (r_i + r_j)` gives **61.99 %** — a −14.7 %
+relative move against −4.3 % for everything before it. Note the trade: the depth statistic gets
+*worse* (51.5 µm), because a larger target puts more pairs in violation and spreads the effort.
+
+**Still open.** 61.99 % is progress, not a solution, and the headline check stays FAILING. The slack
+value is untuned — 1.25 was the first number tried, and a sweep (with iterations, which may simply
+need to be larger than 60) is the next step. The sidecar cache is still needed before any flyby uses
+this.
+
 ### OPEN (2026-09-16): `-direct-only` is silently ignored by mode D (and any non-backward mode)
 
 `g_directOnly` is consulted by the backward tracer (modes R/W, the explorer's refinement

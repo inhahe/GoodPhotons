@@ -1204,6 +1204,11 @@ public:
             sp.sepScale  = dblOf(sb, "separation", sp.sepScale);
             sp.margin    = Len(dblOf(sb, "margin", sp.margin));
             sp.maxNbr    = (int)dblOf(sb, "max_neighbours", (double)sp.maxNbr);
+            sp.volume    = dblOf(sb, "volume", sp.volume);
+            sp.packing   = dblOf(sb, "packing", sp.packing);
+            sp.cellSize  = Len(dblOf(sb, "cell", sp.cellSize));
+            sp.maxStep   = dblOf(sb, "max_step", sp.maxStep);
+            sp.refresh   = (int)dblOf(sb, "refresh", (double)sp.refresh);
             if (sp.iters < 0 || sp.iters > 100000) { fail("settle: iterations out of range"); return false; }
             if (sp.maxNbr < 1 || sp.maxNbr > 256)  { fail("settle: max_neighbours must be 1..256"); return false; }
             for (const auto& st : sb.stmts)

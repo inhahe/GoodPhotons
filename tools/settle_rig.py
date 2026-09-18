@@ -103,6 +103,7 @@ def main():
     ap.add_argument("--stiff", type=float, default=0.20)
     ap.add_argument("--stiff-tip", type=float, default=0.04)
     ap.add_argument("--droop", type=float, default=0.5)
+    ap.add_argument("--sep", type=float, default=1.0)
     args = ap.parse_args()
     ok = True
 
@@ -116,8 +117,8 @@ def main():
     os.makedirs(OUT)
     from hair_penetration import measure
 
-    body = ("    iterations %d\n    stiffness %g\n    stiffness_tip %g\n    droop %g\n    separation 1.0"
-            % (args.iters, args.stiff, args.stiff_tip, args.droop))
+    body = ("    iterations %d\n    stiffness %g\n    stiffness_tip %g\n    droop %g\n    separation %g"
+            % (args.iters, args.stiff, args.stiff_tip, args.droop, args.sep))
 
     print("  loading Alice three times (no settle / zero sweeps / %d sweeps) ..." % args.iters)
     sys.stdout.flush()
