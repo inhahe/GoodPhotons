@@ -1,0 +1,82 @@
+BTW, I forgot one thing in the spec to support: Good Photons' isosurface functions that import 78 of POV-Ray's 80 functions available for isusurface functions
+for "A live viewer (cheap: emit frames → your raster preview) — the 80% of GUI value you actually need to tune loops, without the interactive editor.", I guess we'll just re-use ftrace's rasterizer ability? Or can rasterizing be done significantly faster somehow?
+
+Idea: I wonder if this library concepts could be used interestingly to create 2D graphics, too? I'm not sure, but taking on a 2D output generator would be easy peasy.
+
+can we make all of our pov-ray isosurface function functions available as general functions in our dag??
+are some of them functions of x, y, and z? can any of those by generalizable as N-D functions?
+what the heck should we call this? Snakecraft? Snakeskin?
+convert any arbitrarily long string of N-D rotations to a matrix+offset for multiplication
+rotate any 4-d spacetime object into a new spacetime object - I don't think we can modulate anything over time then - but we can if we isolate the 4-d object, e.g., as a transformed video node - except it requires two passes over time/time caching/time freezing?
+
+----
+
+I'm tempted to create tooling for creating 3d animated scenes, like things that can modulate motion, can connect various points in motion in various ways (for example, make a ribbon!), can modulate the things that modulate motion, can modulate the things that modulate the things that modulate motion, and so on. But I don't know if it's worth it because animation (as in real animation rather than just photon-sharing flybys) would take so long in Good Photons. But then, it could be generally useful outside of forward ray tracing, too.
+
+One way to connect things would be with a ribbon, it goes along a multi-x/y/z-point curve but another multi-x/y/z-point curve defines its rotation and another multi-x/y/z-point curve defines its width. Or a single curve with multiple curves that each define a rotation perpendicular to the direction of the first curve, plus a multi-x/y/z-point-curve distance from the first curve, or actually the multiple curves and the distance curves are particularly also suitable for mathematical expressions. The different rotation curves would be connected to each other laterally by straight cross-sections. Or, alternatively, by more curves, so it's more of an elongated blob. And of course all of these curve points can be modulated over time. Another type of 3D curve: Multiple independent multi-x/y/z-point curves that are linked to form a closed structure (curved or polygonal) across a cross-section whose orientation is defined as the perpendicular of another multi-x/y/z-points curve? 
+
+With harmonic loops and loops of loops and loops of loops of loops in both space and time and the various connection objects and properties, you can make a lot of things surprisngly amenable to being seamless looping GIFs. =P A loop only has to be defined by any old set of numbers at all where you just make the last point in the curve point right back to the beginning one. But how do you determine the angle of the line through the last/first curve? I don't know, how do you determine the angle of the line between any of them? Maybe the best way would be in some elastic simulation way. But then, I somehow easily solved it in https://github.com/inhahe/scribbles3.
+
+Another idea: An isosurface function (with 80 functions available, like POV-Rays, or ours) such as, for example, the gyroid whose parameters modulate over time. Also, materials/surfaces/skins can be defined over space by functions - reflectance, color (in 3 dimensions of various color models, rotated by any 3x3 matrix operation), transparency, translucency, iridescence, etc., with variables such as U/V or x/y/z, etc. And inner densities/refractive indices, and maybe even inner colors, translucencies and transparencies can be defined over space by functions, or, alternatively, 3d grids or scatterviews of control points connected by curves.
+
+Grids or scatterviews of control points can even be N-dimensional and freely rotated on any of N(N-1)/2 axes to translate them into and back  out of 3d space and 1d time (where if N is greater than 4, all you're seeing in spacetime-land is a cross-section of them). Actually, you could do the same with Nd functions, too.
+
+Or: Take a gyroid, take all its 3d points, rotate them in N dimensions over time, and playback the result. Only problem: How would we know when/where their points are still contiguous in order to render them properly over time?
+
+"Okay, let's make it! Include DAGs for modulation (include a loop detector so we don't hang or stack overflow), the sweep function, the 4 or so faces of that you mentioned that were my original ideas, matrix multiplication (and creating matrixes plus a constant x, y and z from specifying rotations on any number of axes) for transforming isosurfaces and such, ability to mesh materials with properties that are determined by functions, three types of data structures: sequences of N-dimensional points that define curve paths, n-dimensional values in a grid of arbitrary rarity, n-dimensional values in a scatterview (they can be anywhere), and a function to interpolate curves paths of the first point the way i did in scribbles3 (if it's generalizable to N dimensions), a function to interpolate values in a 3d volume from grid points, and a function to interpolate values in a 3d volume from scatterview points. Any point in any of these data structures can be fed by a modulator, OR a modulator can actually input an n-d value to one of the three functions in order to get values out and serve that value to something else... or in other words it's just another function and you can string modulators together connected by functions if you want... and include the marching cubes to create a mesh from an idea, with configurable fineness (and can we make it adaptive so that with less fine-grained change in an area we emit fewer mesh faces in that area?).. hmm... anything I forgot?"
+
+--
+
+claude:
+
+This is a rich pile of ideas, and buried in it is a single organizing principle that answers most of your hard questions at once. Let me pull that out first, then hit the specifics.
+The one principle: keep everything as functions/fields; discretize last, per frame
+
+Almost every "how do I make this work over time" snag you hit is the same snag: you're trying to transport a discretization (sampled points, a mesh, a frame) through time. Don't. Animate the continuous thing and re-sample it every frame.
+Your gyroid-rotated-in-N-D contiguity problem dissolves completely. Don't rotate the gyroid's points — rotate the domain of the field. A gyroid is F(x,y,z)=0. An N-D rotation is just a coordinate transform p' = R(t)·embed(p); you evaluate F(project(p')) and re-extract the isosurface each frame with your existing marching/root-finder. Contiguity is guaranteed by construction because you re-solve the surface every frame — there are no "points" to keep in order.
+Same answer for N-D control grids and N-D functions: a slice of a smooth field is a smooth field. Mesh the slice, per frame.
+Same answer for modulated isosurface parameters: change the parameter, re-mesh.
+
+So the render-cost worry is real but bounded to exactly one thing — final path-traced frames — and never touches authoring. Which leads to the worth-it question:
+Is it worth it? Yes, but decouple the two layers
+
+The authoring/geometry layer is renderer-independent and the durable, reusable asset. It emits time-parametrized geometry/fields. Good Photons is just one consumer; a raster/GL preview is another (you already have a raster z-buffer path). So:
+Iterate against the cheap preview. 99% of animation work is timing and shape iteration — do that at 60fps in the raster path. Only commit to path-traced frames for finals. The slowness of "real animation in Good Photons" stops being a blocker because it's no longer in the loop.
+The recursion-of-modulators, curves, ribbons, loops — none of that cares what renders it. It's generally useful, exactly as you suspected.
+
+And here's the encouraging part: you're much closer than the scope suggests, because your substrate already exists. You have an expression VM (patternEval, the 78 POV functions, x y z r), an isosurface root-finder + mesher, material-props-by-function over UV/xyz, and camera curves with density/speed sub-curves. The animation layer is mostly two additions:
+Thread a t variable through the VM (you already have x y z r; add t), then re-evaluate/re-mesh per frame.
+One sweep/loft geometry primitive.
+
+That's a small core for a huge expressive range.
+Collapse the ribbon zoo into one primitive
+
+All your ribbon variants — spine + rotation curve + width curve; spine + lateral rotation curves + distance curve; straight cross-links vs. curved "elongated blob"; closed cross-sections along a perpendicular frame — are one operation:
+
+> sweep(spine, profile, frameField, scaleField, twistField) where every argument is an Animatable.
+profile = two points → flat ribbon; profile = closed curve → tube/blob; profile = polygon → faceted.
+straight cross-links vs. curved links = whether you connect corresponding profile samples with lines or splines.
+width/distance/rotation curves are just scaleField / twistField / offsets, and each can be a curve or an expression (as you noted, they're especially amenable to math).
+
+Build the sweep once; the whole zoo is parameter choices.
+The modulate-the-modulators recursion is just a signal DAG
+
+Define one uniform type — call it Animatable<T> — that is either a constant, a keyframed curve, an expression, or another node's output. Every modulator is a node that takes Animatable inputs and produces an Animatable output. Recursion (modulators of modulators of modulators…) falls out for free with zero special-casing — it's a DAG of signal nodes evaluated at time t. This is exactly the Houdini-CHOPs / demoscene / FRP model, and almost certainly the shape of what you did in scribbles3.
+The frame-angle question (you flagged it twice)
+
+You don't want an absolute angle per point — that's the wrong question and it's why it feels unanswerable. You want a consistent frame field along the curve, and the principled choice is a rotation-minimizing frame (RMF): transport an initial frame along the curve introducing zero extra twist. Compute it with the double-reflection method (Wang et al. 2008) — cheap, stable, and it doesn't flip at inflection points or blow up on straight segments the way a Frenet frame does. Now every point has a well-defined orientation without you ever choosing per-point angles.
+
+For a closed loop, RMF around the loop lands back rotated by a residual angle Δ (the holonomy / accumulated twist — physically the writhe). To close seamlessly: distribute −Δ linearly over arclength (or solve a harmonic/energy-min distribution if you want it "elastic," which is likely your scribbles3 approach). Add integer multiples of 2π for intentional twist — a half-turn gives you a Möbius ribbon. That single Δ-compensation is the whole trick to "the angle through the last/first point."
+Seamless time loops: make periodicity structural, not a fix-up
+
+Rather than building a loop and patching the seam, parametrize time as an angle θ ∈ [0,2π) and build every signal from inherently periodic functions of θ — Fourier/epicycle sums Σ aₖcos(kθ)+bₖsin(kθ). Any closed loop is a sum of rotating circles (that's just its Fourier series). If every modulator is periodic with commensurate periods, the entire nested system loops with no seam by construction — no last-point-meets-first-point bookkeeping at all. Your "harmonic loops and loops of loops" is literally epicycles-on-epicycles, and it's seamless for free. This is the time analogue of the RMF principle: choose a representation where the property you want is guaranteed rather than repaired.
+
+My recommendation on scope. The risk here is reinventing Houdini. Resist it. A minimal core captures ~80% of everything above:
+Animatable<T> signal graph (constant / curve / expression / node-ref) with a t variable in the VM.
+Curve primitive + RMF frame field + loop-closure twist compensation.
+One sweep(spine, profile, frame, scale, twist) primitive.
+Field-domain transforms (incl. N-D rotate-and-slice) + per-frame re-mesh via the isosurface machinery you already have.
+
+That's genuinely small given what's already built, it's renderer-agnostic, and it's authored against the fast preview so Good Photons' cost never gates iteration. I'd call it worth it.
+
+----

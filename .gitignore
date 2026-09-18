@@ -147,3 +147,28 @@ tools/meshbench.exe
 
 # MuJoCo writes this next to the cwd whenever a warning fires; pure noise.
 MUJOCO_LOG.TXT
+
+# Local-only. We publish straight from this directory now instead of copying a
+# filtered subset into D:\github (copy_to_github.bat). These were also purged
+# from history where they had been committed.
+CLAUDE.md
+notes/
+todo.txt
+todo2.txt
+todo3.txt
+/*.bat
+*.log
+# Render scratch and working output
+alice/
+png/
+gallery/
+*.pdb
+*.avif
+# Loose scratch notes at the repo root
+/f1.txt
+/loom.txt
+/loomsound.txt
+/physics.txt
+/prev.txt
+/showcase.txt
+/studio.txt

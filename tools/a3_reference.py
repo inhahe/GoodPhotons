@@ -61,19 +61,27 @@ os.chdir(ROOT)
 OUT = os.path.join("scraps", "_a3ref")
 EXE = os.path.join(ROOT, "ftrace.exe")
 
-COMMON = """camera "cam" {{ eye 0 0 6  look_at 0 0 0  up 0 1 0  fov_y 22  mode R  film {{ res 160 160 }} }}
-light sun {{ dir 0.45 0.35 0.82  angle 0.53  spd preset:d65  intensity 2.2e-13 }}
+CAM = """camera "cam" {{ eye 0 0 6  look_at 0 0 0  up 0 1 0  fov_y 22  mode R  film {{ res 160 160 }} }}
+"""
+# The directional scene: one distant sun. Good for the LOBE, useless for energy (see FURNACE).
+COMMON = CAM + """light sun {{ dir 0.45 0.35 0.82  angle 0.53  spd preset:d65  intensity 2.2e-13 }}
+"""
+# THE ENCLOSURE. A uniform env dome is a furnace: every direction carries the same radiance, so
+# there is no delta source and therefore no firefly tail -- which is what broke the disc-mean energy
+# metric. It also makes the measurement exact rather than relative: a surface of directional albedo
+# a(wo) reflects L*a(wo) against a background of L, so sphere/background IS the albedo.
+FURNACE = CAM + """light env {{ spd preset:d65  intensity 1 }}
 """
 
 # The body, identical in both: a rough reflectance lobe, no Fresnel of its own.
 BODY = 'material "body" {{ type glossy  reflect 0.62  roughness {rough} }}\n'
 
-EXPLICIT = COMMON + BODY + """material "coatglass" {{ type dielectric  ior 1.5 }}
+COAT_EXPLICIT = """material "coatglass" {{ type dielectric  ior 1.5 }}
 sphere {{ center 0 0 0  radius 1.0000  material coatglass }}
 sphere {{ center 0 0 0  radius 0.9995  material body }}
 """
 
-ANALYTIC = COMMON + BODY + """material "coated" {{
+COAT_ANALYTIC = """material "coated" {{
     type layered
     ior 1.5
     coat {{ reflectance fresnel  roughness 0.002  ior 1.5 }}
@@ -81,6 +89,11 @@ ANALYTIC = COMMON + BODY + """material "coated" {{
 }}
 sphere {{ center 0 0 0  radius 1.00  material coated }}
 """
+
+EXPLICIT = COMMON + BODY + COAT_EXPLICIT
+ANALYTIC = COMMON + BODY + COAT_ANALYTIC
+FURN_EXPLICIT = FURNACE + BODY + COAT_EXPLICIT
+FURN_ANALYTIC = FURNACE + BODY + COAT_ANALYTIC
 
 
 def render(tag, text, rough, spp):
@@ -124,6 +137,27 @@ def stats(pfm):
     return float(e.mean()), r50
 
 
+def albedo(pfm):
+    """Directional albedo = mean radiance on the disc / mean radiance of the surrounding furnace."""
+    import math
+    import sys
+    import numpy as np
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    from grade_hdr import read_pfm
+    a = np.asarray(read_pfm(pfm)).astype(np.float64)
+    lum = a[..., 0] * 0.2126 + a[..., 1] * 0.7152 + a[..., 2] * 0.0722
+    h, w = lum.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    rr = np.sqrt((yy - (h - 1) * 0.5) ** 2 + (xx - (w - 1) * 0.5) ** 2)
+    R = (1.0 / (6.0 * math.tan(math.radians(11.0)))) * (h * 0.5)
+    disc = rr <= 0.90 * R              # inside the limb
+    back = rr >= 1.20 * R              # clear of it: the furnace wall itself
+    bg = float(lum[back].mean())
+    if not (bg > 0.0):
+        return float("nan")
+    return float(lum[disc].mean()) / bg
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true")
@@ -134,23 +168,29 @@ def main():
         shutil.rmtree(OUT)
     os.makedirs(OUT)
 
-    print("  rough   explicit(energy, r50)      analytic(energy, r50)     energy diff   width diff")
+    print("  rough   explicit(energy, r50)      analytic(energy, r50)     energy diff   width diff"   "   albedoE albedoA  albedo diff")
     rows = []
     for rough in (0.02, 0.10, 0.25, 0.45):
         eE, wE = stats(render("exp_%.2f" % rough, EXPLICIT, rough, args.spp))
         eA, wA = stats(render("ana_%.2f" % rough, ANALYTIC, rough, args.spp))
         de = 100.0 * (eA - eE) / max(eE, 1e-12)
         dw = 100.0 * (wA - wE) / max(wE, 1e-12)
-        rows.append((rough, eE, wE, eA, wA, de, dw))
-        print("  %5.2f   %10.5f  %6.3f      %10.5f  %6.3f     %+7.1f %%    %+7.1f %%"
-              % (rough, eE, wE, eA, wA, de, dw))
+        aE = albedo(render("fexp_%.2f" % rough, FURN_EXPLICIT, rough, args.spp))
+        aA = albedo(render("fana_%.2f" % rough, FURN_ANALYTIC, rough, args.spp))
+        da = 100.0 * (aA - aE) / max(aE, 1e-12)
+        rows.append((rough, eE, wE, eA, wA, de, dw, aE, aA, da))
+        print("  %5.2f   %10.5f  %6.3f      %10.5f  %6.3f     %+7.1f %%    %+7.1f %%   %6.4f  %6.4f  %+7.1f %%"
+              % (rough, eE, wE, eA, wA, de, dw, aE, aA, da))
 
     # The claim under test is that the error GROWS with body roughness -- a smooth body is the
     # identity (a3_snell.py result 1), so a reference that shows a large error at roughness 0.02
     # is measuring something else and must not be believed.
-    smooth = abs(rows[0][5])
-    rough = max(abs(r[5]) for r in rows[1:])
-    print("\n  control: at roughness %.2f the coat should be near the IDENTITY -- error %.1f %%"
+    # The CONTROL is now read off the furnace albedo, not the sun-lit disc mean: a3_snell.py proves
+    # the coat is the exact identity for a smooth body, so a large albedo error at roughness 0.02
+    # means the rig is still measuring the wrong thing and nothing below it may be believed.
+    smooth = abs(rows[0][9])
+    rough = max(abs(r[9]) for r in rows[1:])
+    print("\n  control: at roughness %.2f the coat should be near the IDENTITY -- furnace albedo error %.1f %%"
           % (rows[0][0], smooth))
     print("  claim  : the error must GROW with roughness -- worst rough error %.1f %%" % rough)
     print("\n  (a3_snell.py predicted up to -37 %% energy and -34 %% lobe width in Python;")

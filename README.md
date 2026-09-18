@@ -597,3 +597,9 @@ stop paying by switching tabs.
 Open limitations and technical debt are tracked in `known-issues.md` — including
 the physical-lens camera's remaining gaps (inter-element flare/ghosting,
 shaped-iris bokeh).
+
+
+## License
+
+MIT - see [LICENSE](LICENSE). Free to use, modify and redistribute; provided
+as-is, with no warranty.

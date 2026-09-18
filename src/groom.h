@@ -405,6 +405,25 @@ inline void leafPolyline(const Node& n, const DrawBasis& db, std::vector<Vec3>& 
     for (int k = 0; k < ns; ++k) out.push_back(segs[(size_t)k].p1);
 }
 
+// The same thing for an ALREADY-FLATTENED strand -- what `flattenCurveForTool` hands back for a
+// placed node. Those are the blended CONTROL points, not geometry: the loader tessellates them at
+// the top node's basis exactly like a leaf's, so drawing them straight understated the instances
+// the same way, and on a placed node that is most of the strands in the groom.
+inline void strandPolyline(const ftsl::CurveStrand& s, const DrawBasis& db, std::vector<Vec3>& out) {
+    out.clear();
+    const int np = (int)s.pts.size();
+    if (np < 2) return;
+    if (curveSpanCount(db.basis, np) <= 0) { out = s.pts; return; }
+    std::vector<double> radii = s.radii;
+    if ((int)radii.size() != np) radii.assign((size_t)np, 1e-4);
+    std::vector<CurveSeg> segs;
+    const int ns = tessellateCurve(s.pts, radii, db.basis, db.subdiv, 0, 0, segs, db.alpha);
+    if (ns <= 0) { out = s.pts; return; }
+    out.reserve((size_t)ns + 1);
+    out.push_back(segs[0].p0);
+    for (int k = 0; k < ns; ++k) out.push_back(segs[(size_t)k].p1);
+}
+
 inline int levelOf(Model& m, const Node& n, int depth = 0) {
     if (depth > 32) return 0;
     if (n.ref) { Node* d = findDef(m, n.name); return d ? levelOf(m, *d, depth + 1) : 0; }

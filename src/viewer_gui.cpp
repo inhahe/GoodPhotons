@@ -4142,8 +4142,14 @@ static void drawNodeLines(GroomState& g, groom::Node& n, int level, std::vector<
                     LineBatch inst;
                     for (int k = 0; k < 3; ++k) inst.rgba[k] = b.rgba[k] * 0.7f;
                     inst.rgba[3] = 1.0f;
-                    for (const ftsl::CurveStrand& s : it->second.strands)
-                        for (size_t k = 1; k < s.pts.size(); ++k) addSegment(inst, xf.apply(s.pts[k - 1]), xf.apply(s.pts[k]));
+                    // through the loader's tessellator, like the leaf above: these are the
+                    // BLENDED CONTROL points, and the render splines them at the top basis.
+                    std::vector<Vec3> poly;
+                    for (const ftsl::CurveStrand& s : it->second.strands) {
+                        groom::strandPolyline(s, db, poly);
+                        for (size_t k = 1; k < poly.size(); ++k)
+                            addSegment(inst, xf.apply(poly[k - 1]), xf.apply(poly[k]));
+                    }
                     if (!inst.v.empty()) out.push_back(std::move(inst));
                 }
             }
@@ -4882,15 +4888,28 @@ static void drawNodeParams(GroomState& g, groom::Node& n) {
     // top does not refine the level below, it consumes it -- which is why the tool says so
     // here rather than leaving "one level up, the next colour" to imply otherwise.
     if (!n.kids.empty()) {
-        if (n.placed())
+        // The numbers, not just the words: what this node emits now, and what `count` would
+        // replace it with. `M` (strands per child) is what a placing node multiplies, so a
+        // group of 20 single strands becoming `count 9` really does end at 9, and the panel
+        // says 20 -> 9 rather than leaving the user to discover it in the render.
+        size_t now = 0;
+        if (!n.name.empty()) {
+            auto pit = g.preview.byName.find(n.name);
+            if (pit != g.preview.byName.end()) now = pit->second.strands.size();
+        }
+        const size_t C = n.kids.size();
+        if (n.placed()) {
             ImGui::TextWrapped("PLACES: its %zu child curve(s) are the control cage, NOT output --"
-                               " this node emits the strands, %d of them per child strand, spaced"
-                               " along the path through their roots.", n.kids.size(), n.count());
-        else
+                               " this node emits the %zu strand(s) instead, spaced along the path"
+                               " through their roots by arc length.", C, now);
+        } else {
+            const int cnt = (n.count() > 0) ? n.count() : 1;
             ImGui::TextWrapped("GROUPS: no count/density, so its %zu child curve(s) render as"
-                               " themselves, bit-for-bit. Setting count below REPLACES them with"
-                               " blended instances -- it is not an extra layer of detail.",
-                               n.kids.size());
+                               " themselves -- %zu strand(s), bit-for-bit. Setting count N here"
+                               " REPLACES them with N x %zu; it is not an extra layer of detail.",
+                               C, now, C ? now / C : 0);
+            (void)cnt;
+        }
         ImGui::Separator();
     }
     int count = n.count();
