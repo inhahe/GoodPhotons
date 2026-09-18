@@ -4788,6 +4788,55 @@ generation and before `tessellateCurve` — the one place every authoring route 
 through, which is what makes "no matter how we define our curves" achievable rather than a
 per-feature fix.
 
+### PARTLY ADDRESSED (0.346.0): `settle { }` is built and reduces the overlap ~22–70 %, but does not remove it
+
+`src/settle.h` + FTSL §8.8. It runs on `Scene::curveSegs` (not `CurveStrand` as sketched above —
+after tessellation is *better*, since those segments are what the renderer actually intersects, and
+it still catches every authoring route in one place), last before the BVH. Gravity, inextensibility,
+a stiffness pull back to the authored shape, exact segment-segment separation, optional mesh
+colliders, roots pinned. `tools/settle_rig.py`, on Alice at 60 sweeps:
+
+| | before | after |
+|---|---|---|
+| median overlap depth | 66.4 µm | **51.5 µm** |
+| median clearance | −0.053 mm | **−0.016 mm** |
+| segments with *any* overlap | 72.67 % | **70.09 %** |
+| groom displacement | — | mean 0.11–0.53 mm (segment is 1.47 mm) |
+
+**Two controls pass and they are what make the rest trustworthy.** `settle { iterations 0 }` is
+byte-identical to no block at all, so the numbers are the solver and not the scene reloading; and
+two identical settles agree byte-for-byte, which matters because the CPU and CUDA backends must
+trace the same geometry and a flyby re-loads per frame.
+
+**The headline check FAILS and is left failing.** The binary share barely moves because it is a
+threshold: a pair 1 µm apart scores the same as one fully merged, and the solver leaves almost
+everything *just* overlapping. The depth statistics are reported alongside it, never instead of it.
+
+**Why it stalls — the diagnosis, which cost two wrong guesses.** First guess: the stiffness spring
+pulls toward the AUTHORED position, which is by definition the overlapping one, so it must be
+fighting the separation. Refuted by measurement — with stiffness *and* gravity both at zero,
+nothing opposing separation at all, penetration still only went 72.67 → 70.09 % and the groom moved
+0.110 mm. Second guess: the locks are geometrically jammed. Also refuted — median local packing
+fraction is 0.21 (p90 0.77) against ~0.82 for random close packing of parallel cylinders, so there
+is room.
+
+What is actually left is the term I designed and did not build: the separation pass applies the
+**mean of its contact directions**, and for a fiber overlapped on all sides those vectors cancel to
+nearly zero however deep the overlaps are. Local pairwise pushing cannot expand a bundle; that
+needs the **collective density-gradient (continuum) push at lock scale (~1–2 mm cells)** that the
+original design named, where a too-dense neighbourhood expands as a whole. That is the next step,
+and the rig is already in place to price it.
+
+**Also outstanding:** the settle costs ~2 min for Alice's 1.2 M segments at 60 sweeps, which is
+fine as a bake and *not* fine re-run per frame of a flyby. It needs the sidecar cache keyed on a
+hash of the inputs before any animation uses it.
+
+**A bug worth keeping.** The first separation pass dispatched by SEGMENT and claimed to be race-free
+because it was "one-sided" — each segment writing only its own particles. That reasoning is wrong:
+consecutive segments of a strand *share* a particle, so adjacent segments race on it. The
+determinism control caught it (two runs disagreed); dispatching by STRAND fixes it by construction,
+since a strand owns its particles outright. A one-sided write is not automatically an exclusive one.
+
 ### OPEN (2026-09-16): `-direct-only` is silently ignored by mode D (and any non-backward mode)
 
 `g_directOnly` is consulted by the backward tracer (modes R/W, the explorer's refinement
@@ -29404,10 +29453,18 @@ because the fork path only fires on large uneven subtrees and a uniform cloud wo
 silently deleted `Bvh`'s implicit copy-assignment and broke `scene.h:2508`, so the build state now
 lives in `build()`'s frame and travels by reference — a compile error, which is the good case, but a
 class quietly losing copyability is the kind of thing that usually surfaces far from its cause. And
-the C++ `
-` escapes were mangled for the **seventh** time by putting a literal through a shell
-heredoc; the fix that finally works is to build the backslash from `chr(92)` and never write an
-escape through the shell at all.
+the C++ `\n` escapes were mangled for the **seventh** time by putting a literal through a
+shell heredoc.
+
+**That note was itself corrupted by the bug it describes** — the backticks above held a real
+newline until 2026-09-18, when the same trap ate two more builds (`viewer_gui.cpp`'s groom
+tooltip and `ftsl.h`'s two `[settle]` `fprintf`s, each failing with `C2001: newline in
+constant`). So it is now at least the **ninth** time, and the rule is absolute rather than
+advisory: **never type a backslash escape that has to survive a tool-call encoding, a shell
+heredoc and a Python string literal — three layers, each of which may consume one backslash.**
+Build it in the script: `NL = chr(92) + 'n'`, then concatenate. The failure is cheap to spot
+(`C2001` names the line) and expensive to hit, because on this project each attempt costs a
+10–15 minute rebuild.
 
 **REAL-GEOMETRY VERIFICATION ADDED IN v0.292.1, closing the limit this entry declared.** The
 synthetic-primitive test could not reproduce what actual scenes produce -- degenerate centroids,

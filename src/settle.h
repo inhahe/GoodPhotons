@@ -1,0 +1,427 @@
+#pragma once
+// ============================================================================================
+// HAIR SETTLING — a relaxation over the flattened strands, run once per load (v0.346.0).
+//
+// WHY IT LIVES HERE AND NOT IN THE GROOM TOOL. The `.ftsl` file carries curve *definitions*,
+// and a settled groom cannot be written as one: `count N` spaces its instances by ARC LENGTH
+// along the path through its children's roots, and no arc-length rule can express "except
+// where another strand already is". The settled positions only exist once the definitions have
+// been flattened, so the settle has to be a stage of the LOAD. (Baking the result back as
+// explicit `point`s would work and would also destroy the procedural groom and grow the file by
+// 1.2 M points, which is not a trade worth making.)
+//
+// It runs on `Scene::curveSegs` — after every curve, curve-of-curves and deferred `fur` block
+// has been flattened and tessellated, and before the BVH is built over the result. That single
+// placement is what makes the request "no matter how we define our curves" achievable rather
+// than a per-feature fix: every authoring route in the language funnels through this one pool.
+//
+// WHAT THE MEASUREMENT SAID, and how it shaped the solver (known-issues HAIR-PENETRATION):
+// 72.67 % of Alice's 1.2 M segments lie inside another strand, against 0.97 % for `fur`
+// scattered at the same 20 000 strands — so it is the blend, not density. But the median
+// penetration is only **66 um**, i.e. 4.7 % of one segment length. Removing it is a LOCAL
+// de-overlap of tens of microns, not a dynamics problem, which is why a quasi-static projection
+// scheme converges here in tens of iterations rather than needing a stable time integrator.
+//
+// THE SCHEME is position-based and velocity-free: each iteration injects a small gravity
+// displacement and then projects four constraint sets, in the order they must dominate —
+//   1. inextensibility  (a hair does not stretch; Gauss-Seidel along each strand)
+//   2. global shape     (stiffness: pull back toward the AUTHORED position, stiffest at the
+//                        root, slackest at the tip — this is what stops a settle turning a
+//                        sculpted groom into a wet mop, and it is the "stiffness" in the ask)
+//   3. separation       (strand-strand, exact segment-segment distance against r_i + r_j)
+//   4. collision        (stay outside named mesh groups)
+// with roots pinned throughout. The fixed point is where gravity balances stiffness and
+// contact, which is the "equilibrium" asked for, reached without a dt to tune.
+//
+// DETERMINISM IS A HARD REQUIREMENT, not a nicety: the CPU and CUDA backends must trace
+// byte-identical geometry, and a flyby re-loads the scene per frame. So the separation pass is
+// ONE-SIDED — segment i accumulates only into itself, scanning every neighbour j — which costs
+// each pair twice and buys a result with no atomics, no race and no thread-count dependence.
+// ============================================================================================
+#include "scene.h"
+#include "parallel.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+namespace settle {
+
+struct Params {
+    bool   on        = false;
+    int    iters     = 60;      // projection sweeps
+    double droop     = 0.5;     // gravity injected per sweep, as a fraction of 0.1 % of the groom's diagonal
+    double stiffRoot = 0.60;    // hold to the authored shape at the root ...
+    double stiffTip  = 0.15;    // ... and at the tip
+    double sepScale  = 1.0;     // separation target as a multiple of (r_i + r_j); 0 disables
+    double margin    = 0.0;     // extra clearance held against colliders
+    int    maxNbr    = 32;      // neighbour-list cap per segment (memory bound)
+    std::vector<std::string> collide;   // mesh-group names to stay outside of
+};
+
+namespace detail {
+
+struct Grid {
+    double cell = 1.0;
+    std::vector<uint64_t>  key;     // sorted cell key per entry
+    std::vector<uint32_t>  idx;     // the entry's item index, in key order
+    static uint64_t code(int x, int y, int z) {
+        const uint64_t ux = (uint64_t)(x + 1048576) & 0x1FFFFF;
+        const uint64_t uy = (uint64_t)(y + 1048576) & 0x1FFFFF;
+        const uint64_t uz = (uint64_t)(z + 1048576) & 0x1FFFFF;
+        return (ux << 42) | (uy << 21) | uz;
+    }
+    uint64_t keyOf(const Vec3& p) const {
+        return code((int)std::floor(p.x / cell), (int)std::floor(p.y / cell), (int)std::floor(p.z / cell));
+    }
+    // [lo, hi) of the run with this key
+    void range(uint64_t k, size_t& lo, size_t& hi) const {
+        lo = (size_t)(std::lower_bound(key.begin(), key.end(), k) - key.begin());
+        hi = lo;
+        while (hi < key.size() && key[hi] == k) ++hi;
+    }
+};
+
+inline void buildGrid(Grid& g, const std::vector<Vec3>& mid, double cell) {
+    g.cell = cell;
+    const size_t n = mid.size();
+    std::vector<std::pair<uint64_t, uint32_t>> e(n);
+    for (size_t i = 0; i < n; ++i) e[i] = { g.keyOf(mid[i]), (uint32_t)i };
+    std::sort(e.begin(), e.end());
+    g.key.resize(n); g.idx.resize(n);
+    for (size_t i = 0; i < n; ++i) { g.key[i] = e[i].first; g.idx[i] = e[i].second; }
+}
+
+// Closest points on two segments (Ericson). Returns the squared distance and the two points.
+inline double segSeg(const Vec3& p1, const Vec3& q1, const Vec3& p2, const Vec3& q2,
+                     Vec3& c1, Vec3& c2) {
+    const Vec3 d1 = q1 - p1, d2 = q2 - p2, r = p1 - p2;
+    const double a = dot(d1, d1), e = dot(d2, d2), f = dot(d2, r);
+    double s = 0.0, t = 0.0;
+    if (a <= 1e-30 && e <= 1e-30) { c1 = p1; c2 = p2; const Vec3 d = c1 - c2; return dot(d, d); }
+    if (a <= 1e-30) { s = 0.0; t = std::min(std::max(f / e, 0.0), 1.0); }
+    else {
+        const double c = dot(d1, r);
+        if (e <= 1e-30) { t = 0.0; s = std::min(std::max(-c / a, 0.0), 1.0); }
+        else {
+            const double b = dot(d1, d2), den = a * e - b * b;
+            s = (den > 1e-30) ? std::min(std::max((b * f - c * e) / den, 0.0), 1.0) : 0.0;
+            t = (b * s + f) / e;
+            if (t < 0.0)      { t = 0.0; s = std::min(std::max(-c / a, 0.0), 1.0); }
+            else if (t > 1.0) { t = 1.0; s = std::min(std::max((b - c) / a, 0.0), 1.0); }
+        }
+    }
+    c1 = p1 + d1 * s; c2 = p2 + d2 * t;
+    const Vec3 d = c1 - c2;
+    return dot(d, d);
+}
+
+inline Vec3 closestOnTri(const Vec3& p, const Vec3& a, const Vec3& b, const Vec3& c) {
+    const Vec3 ab = b - a, ac = c - a, ap = p - a;
+    const double d1 = dot(ab, ap), d2 = dot(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0) return a;
+    const Vec3 bp = p - b;
+    const double d3 = dot(ab, bp), d4 = dot(ac, bp);
+    if (d3 >= 0.0 && d4 <= d3) return b;
+    const double vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) return a + ab * (d1 / (d1 - d3));
+    const Vec3 cp = p - c;
+    const double d5 = dot(ab, cp), d6 = dot(ac, cp);
+    if (d6 >= 0.0 && d5 <= d6) return c;
+    const double vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) return a + ac * (d2 / (d2 - d6));
+    const double va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0)
+        return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    const double den = 1.0 / (va + vb + vc);
+    return a + ab * (vb * den) + ac * (vc * den);
+}
+
+} // namespace detail
+
+// Runs the settle in place. Returns false only if `ftrace -stop` cancelled it mid-way (the
+// caller must then abandon the load: a half-relaxed groom is not a scene anyone asked for).
+inline bool run(Scene& sc, const Params& p, std::string& report) {
+    report.clear();
+    if (!p.on || sc.curves.empty() || sc.curveSegs.empty()) return true;
+
+    // ---- 1. strands -> particles ----------------------------------------------------------
+    // Consecutive CurveSegs share an endpoint by construction (tessellateCurve carries `prevP`),
+    // so a strand of N segs is a polyline of N+1 particles.
+    const size_t nC = sc.curves.size();
+    std::vector<int> first((size_t)nC), cnt((size_t)nC);
+    size_t nP = 0;
+    for (size_t c = 0; c < nC; ++c) {
+        const int n = sc.curves[c].segCount;
+        first[c] = (int)nP; cnt[c] = (n > 0) ? n + 1 : 0;
+        nP += (size_t)cnt[c];
+    }
+    if (nP == 0) return true;
+
+    std::vector<Vec3>   pos(nP), rest(nP);
+    std::vector<double> rad(nP), rlen(nP, 0.0);
+    std::vector<float>  stiff(nP, 0.0f);
+    std::vector<int>    owner(nP, -1);
+    for (size_t c = 0; c < nC; ++c) {
+        const Curve& cu = sc.curves[c];
+        if (cu.segCount <= 0) continue;
+        const int b = first[c], n = cu.segCount;
+        for (int k = 0; k < n; ++k) {
+            const CurveSeg& s = sc.curveSegs[(size_t)cu.firstSeg + (size_t)k];
+            if (k == 0) { pos[(size_t)b] = s.p0; rad[(size_t)b] = s.r0; }
+            pos[(size_t)b + (size_t)k + 1] = s.p1;
+            rad[(size_t)b + (size_t)k + 1] = s.r1;
+        }
+        for (int k = 0; k <= n; ++k) {
+            const size_t i = (size_t)b + (size_t)k;
+            owner[i] = (int)c;
+            rest[i]  = pos[i];
+            const double t = (n > 0) ? (double)k / (double)n : 0.0;
+            stiff[i] = (float)(p.stiffRoot + (p.stiffTip - p.stiffRoot) * t);
+            if (k < n) rlen[i] = length(pos[i + 1] - pos[i]);
+        }
+    }
+
+    // groom extent, for the gravity step and the grid cell
+    Vec3 lo = pos[0], hi = pos[0];
+    double lenSum = 0.0;
+    for (size_t i = 0; i < nP; ++i) {
+        lo.x = std::min(lo.x, pos[i].x); lo.y = std::min(lo.y, pos[i].y); lo.z = std::min(lo.z, pos[i].z);
+        hi.x = std::max(hi.x, pos[i].x); hi.y = std::max(hi.y, pos[i].y); hi.z = std::max(hi.z, pos[i].z);
+        lenSum += rlen[i];
+    }
+    const size_t nSeg = sc.curveSegs.size();
+    const double meanSeg = (nSeg > 0) ? lenSum / (double)nSeg : 1e-3;
+    const double diag = length(hi - lo);
+    const double gstep = p.droop * 0.001 * diag;     // injected downward displacement per sweep
+
+    // ---- 2. the neighbour list ------------------------------------------------------------
+    // Built ONCE. The displacements this solver applies are ~66 um against a cell of ~1.4 mm,
+    // so a rebuild per sweep would buy nothing and cost the sort each time.
+    std::vector<uint32_t> nbrOff, nbrIdx;
+    size_t capped = 0;
+    const bool doSep = (p.sepScale > 0.0);
+    if (doSep) {
+        std::vector<Vec3> mid(nSeg);
+        for (size_t c = 0; c < nC; ++c) {
+            const Curve& cu = sc.curves[c];
+            for (int k = 0; k < cu.segCount; ++k) {
+                const size_t i = (size_t)first[c] + (size_t)k;
+                mid[(size_t)cu.firstSeg + (size_t)k] = (pos[i] + pos[i + 1]) * 0.5;
+            }
+        }
+        detail::Grid g;
+        detail::buildGrid(g, mid, std::max(meanSeg, 8.0 * (nSeg ? rad[0] : 1e-4)));
+        nbrOff.assign(nSeg + 1, 0);
+        std::vector<uint32_t> flat((size_t)nSeg * (size_t)p.maxNbr);
+        std::vector<uint32_t> nn(nSeg, 0);
+        std::vector<uint8_t>  over(nSeg, 0);   // more candidates in reach than the cap keeps
+        const double reach = g.cell;
+        // THE NEAREST neighbours, not the first ones found. Hair is not uniformly dense: inside a
+        // lock a segment has ~1000 others within one cell, so a scan that stops at the cap keeps an
+        // arbitrary 3 % of them and misses the contacts entirely -- measured, the first version of
+        // this capped 1 199 962 of 1 200 000 segments and moved penetration 72.67 % -> 72.02 %.
+        // Candidates are ranked by MIDPOINT distance, which is cheap (6 flops against segSeg's ~30)
+        // and monotone enough for the ranking: two segments in contact necessarily have close
+        // midpoints, because a segment is only 1.4 mm long.
+        if (!ft::parallelFor(nSeg, 256, [&](size_t si) {
+                const Vec3 m = mid[si];
+                const int cx = (int)std::floor(m.x / g.cell), cy = (int)std::floor(m.y / g.cell), cz = (int)std::floor(m.z / g.cell);
+                const int K = p.maxNbr;
+                // a bounded insertion-sorted shortlist; K is small (32) so this beats a heap
+                std::vector<std::pair<double, uint32_t>> best;
+                best.reserve((size_t)K + 1);
+                uint32_t seen = 0;
+                for (int dx = -1; dx <= 1; ++dx)
+                for (int dy = -1; dy <= 1; ++dy)
+                for (int dz = -1; dz <= 1; ++dz) {
+                    size_t a, b;
+                    g.range(detail::Grid::code(cx + dx, cy + dy, cz + dz), a, b);
+                    for (size_t e = a; e < b; ++e) {
+                        const uint32_t j = g.idx[e];
+                        if ((size_t)j == si) continue;
+                        if (sc.curveSegs[j].curveId == sc.curveSegs[si].curveId) continue;  // same strand
+                        const Vec3 d = mid[j] - m;
+                        const double dd = dot(d, d);
+                        if (dd > 4.0 * reach * reach) continue;
+                        ++seen;
+                        if ((int)best.size() == K && dd >= best.back().first) continue;
+                        auto it = std::lower_bound(best.begin(), best.end(), std::make_pair(dd, j));
+                        best.insert(it, std::make_pair(dd, (uint32_t)j));
+                        if ((int)best.size() > K) best.pop_back();
+                    }
+                }
+                for (size_t k = 0; k < best.size(); ++k) flat[si * (size_t)p.maxNbr + k] = best[k].second;
+                nn[si] = (uint32_t)best.size();
+                over[si] = (seen > (uint32_t)K) ? 1 : 0;
+            })) return false;
+        for (size_t i = 0; i < nSeg; ++i) { if (over[i]) ++capped; nbrOff[i + 1] = nbrOff[i] + nn[i]; }
+        nbrIdx.resize(nbrOff[nSeg]);
+        for (size_t i = 0; i < nSeg; ++i)
+            for (uint32_t k = 0; k < nn[i]; ++k) nbrIdx[nbrOff[i] + k] = flat[i * (size_t)p.maxNbr + k];
+    }
+
+    // ---- 3. colliders ----------------------------------------------------------------------
+    std::vector<Tri> ctris;
+    for (const std::string& nm : p.collide) {
+        const MeshGroup* g = nullptr;
+        for (const MeshGroup& mg : sc.meshGroups) if (mg.name == nm) { g = &mg; break; }
+        if (!g) { report += "collide \"" + nm + "\": no such mesh group; ignored. "; continue; }
+        if (g->blasId >= 0) { report += "collide \"" + nm + "\": instanced (BLAS) geometry is not yet a collider; ignored. "; continue; }
+        for (size_t t = 0; t < g->triCount; ++t) ctris.push_back(sc.tris[g->triStart + t]);
+    }
+    detail::Grid cg;
+    std::vector<Vec3> ccent;
+    if (!ctris.empty()) {
+        ccent.resize(ctris.size());
+        double ext = 0.0;
+        for (size_t t = 0; t < ctris.size(); ++t) {
+            ccent[t] = (ctris[t].v0 + ctris[t].v1 + ctris[t].v2) * (1.0 / 3.0);
+            ext = std::max(ext, std::max(length(ctris[t].v1 - ctris[t].v0), length(ctris[t].v2 - ctris[t].v0)));
+        }
+        detail::buildGrid(cg, ccent, std::max(ext, meanSeg));
+    }
+
+    // ---- 4. the sweeps ---------------------------------------------------------------------
+    std::vector<Vec3> corr(nP);
+    std::vector<float> cw(nP);
+    for (int it = 0; it < p.iters; ++it) {
+        // (a) gravity, into every unpinned particle (k == 0 is the follicle)
+        if (!ft::parallelFor(nC, 64, [&](size_t c) {
+                for (int k = 1; k < cnt[c]; ++k) pos[(size_t)first[c] + (size_t)k].y -= gstep;
+            })) return false;
+
+        // (b) inextensibility, Gauss-Seidel from the root out (the root is fixed, so each
+        //     correction lands entirely on the outboard particle -- which is what makes a
+        //     single sweep exact for a strand rather than iterative)
+        if (!ft::parallelFor(nC, 64, [&](size_t c) {
+                const int b = first[c];
+                for (int k = 0; k + 1 < cnt[c]; ++k) {
+                    const size_t i = (size_t)b + (size_t)k, j = i + 1;
+                    Vec3 d = pos[j] - pos[i];
+                    const double L = length(d);
+                    if (L < 1e-12) continue;
+                    pos[j] = pos[i] + d * (rlen[i] / L);
+                }
+            })) return false;
+
+        // (c) global shape: back toward the AUTHORED position
+        if (!ft::parallelFor(nP, 1024, [&](size_t i) {
+                if (owner[i] < 0) return;
+                pos[i] = pos[i] + (rest[i] - pos[i]) * (double)stiff[i];
+            })) return false;
+
+        // (d) separation. One-sided by construction: segment `si` reads every neighbour and
+        //     writes only its own two particles, so no two threads touch the same slot.
+        if (doSep) {
+            std::fill(corr.begin(), corr.end(), Vec3{0, 0, 0});
+            std::fill(cw.begin(), cw.end(), 0.0f);
+            // PARALLEL OVER STRANDS, not segments. "One-sided" is not by itself enough to make
+            // this race-free, and the rig caught me assuming it was: consecutive segments of a
+            // strand SHARE a particle (seg k's p1 is seg k+1's p0), so two threads splitting a
+            // strand's segments both write that slot. A strand owns its particles outright, so
+            // dispatching by strand removes the race by construction and keeps the result
+            // independent of the thread count -- which is the requirement, since the CPU and CUDA
+            // backends must trace identical geometry.
+            if (!ft::parallelFor(nC, 32, [&](size_t c) {
+                    const Curve& cu = sc.curves[c];
+                    for (int k = 0; k < cu.segCount; ++k) {
+                        const size_t si = (size_t)cu.firstSeg + (size_t)k;
+                        const size_t ia = (size_t)first[c] + (size_t)k, ib = ia + 1;
+                        Vec3 acc{0, 0, 0};
+                        int hits = 0;
+                        for (uint32_t e = nbrOff[si]; e < nbrOff[si + 1]; ++e) {
+                            const uint32_t sj = nbrIdx[e];
+                            const int c2 = sc.curveSegs[sj].curveId;
+                            if (c2 < 0 || c2 >= (int)nC) continue;
+                            const int k2 = (int)((size_t)sj - (size_t)sc.curves[(size_t)c2].firstSeg);
+                            const size_t ja = (size_t)first[c2] + (size_t)k2, jb = ja + 1;
+                            Vec3 x1, x2;
+                            const double d2 = detail::segSeg(pos[ia], pos[ib], pos[ja], pos[jb], x1, x2);
+                            const double want = p.sepScale * (0.5 * (rad[ia] + rad[ib]) + 0.5 * (rad[ja] + rad[jb]));
+                            if (d2 >= want * want) continue;
+                            const double d = std::sqrt(std::max(d2, 0.0));
+                            Vec3 nrm = (d > 1e-12) ? (x1 - x2) * (1.0 / d)
+                                                   : Vec3{0.0, 1.0, 0.0};   // exactly coincident
+                            acc = acc + nrm * (want - d);
+                            ++hits;
+                        }
+                        if (hits) {
+                            const Vec3 half = acc * (0.5 / (double)hits);
+                            corr[ia] = corr[ia] + half; cw[ia] += 1.0f;
+                            corr[ib] = corr[ib] + half; cw[ib] += 1.0f;
+                        }
+                    }
+                })) return false;
+            if (!ft::parallelFor(nP, 1024, [&](size_t i) {
+                    if (cw[i] > 0.0f) pos[i] = pos[i] + corr[i] * (1.0 / (double)cw[i]);
+                })) return false;
+        }
+
+        // (e) colliders
+        if (!ctris.empty()) {
+            if (!ft::parallelFor(nP, 512, [&](size_t i) {
+                    const Vec3 q = pos[i];
+                    const int cx = (int)std::floor(q.x / cg.cell), cy = (int)std::floor(q.y / cg.cell), cz = (int)std::floor(q.z / cg.cell);
+                    double best = 1e300; Vec3 bp{0, 0, 0}, bn{0, 1, 0};
+                    for (int dx = -1; dx <= 1; ++dx) for (int dy = -1; dy <= 1; ++dy) for (int dz = -1; dz <= 1; ++dz) {
+                        size_t a, b;
+                        cg.range(detail::Grid::code(cx + dx, cy + dy, cz + dz), a, b);
+                        for (size_t e = a; e < b; ++e) {
+                            const Tri& t = ctris[cg.idx[e]];
+                            const Vec3 cp = detail::closestOnTri(q, t.v0, t.v1, t.v2);
+                            const Vec3 dv = q - cp;
+                            const double dd = dot(dv, dv);
+                            // Tri::gn is filled by Scene::finalize(), which runs in scene.build()
+                            // AFTER this pass, so the normal has to be computed here.
+                            if (dd < best) { best = dd; bp = cp; bn = cross(t.v1 - t.v0, t.v2 - t.v0); }
+                        }
+                    }
+                    if (best > 1e299) return;
+                    const double nl = length(bn);
+                    if (nl < 1e-18) return;
+                    bn = bn * (1.0 / nl);
+                    const Vec3 dv = q - bp;
+                    const double sd = dot(dv, bn);
+                    const double want = rad[i] + p.margin;
+                    if (sd < want) pos[i] = bp + bn * want;      // outside, by the fiber radius
+                })) return false;
+        }
+
+        // (f) roots never move
+        if (!ft::parallelFor(nC, 256, [&](size_t c) {
+                if (cnt[c] > 0) pos[(size_t)first[c]] = rest[(size_t)first[c]];
+            })) return false;
+    }
+
+    // ---- 5. write back ---------------------------------------------------------------------
+    double moved = 0.0, movedMax = 0.0;
+    for (size_t c = 0; c < nC; ++c) {
+        const Curve& cu = sc.curves[c];
+        for (int k = 0; k < cu.segCount; ++k) {
+            const size_t i = (size_t)first[c] + (size_t)k;
+            CurveSeg& s = sc.curveSegs[(size_t)cu.firstSeg + (size_t)k];
+            s.p0 = pos[i]; s.p1 = pos[i + 1];
+        }
+    }
+    for (size_t i = 0; i < nP; ++i) {
+        const double d = length(pos[i] - rest[i]);
+        moved += d; movedMax = std::max(movedMax, d);
+    }
+    char buf[320];
+    std::snprintf(buf, sizeof buf,
+                  "%zu strand(s), %zu particle(s), %d sweep(s); moved mean %.3f mm, max %.3f mm%s",
+                  nC, nP, p.iters, 1e3 * moved / (double)nP, 1e3 * movedMax,
+                  capped ? "" : "");
+    report += buf;
+    if (capped)
+        std::snprintf(buf, sizeof buf, "; %.1f %% of segments had more than %d candidates in reach"
+                      " (the nearest %d are kept)", 100.0 * (double)capped / (double)nSeg, p.maxNbr, p.maxNbr);
+    if (capped) report += buf;
+    return true;
+}
+
+} // namespace settle

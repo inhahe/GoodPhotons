@@ -73,6 +73,7 @@
 #include "fbx.h"
 #include "upsample.h"
 #include "fur.h"         // `fur { }` groom generator — scatters `curve` strands (TODO §P1)
+#include "settle.h"      // hair settling — the load-time relaxation over the flattened strands
 #include "hair.h"        // hair::Species — the measured fur presets `material { type hair }` names
 #include "parallel.h"    // ft::stopRequested — cooperative `-stop` during a long load
 #include "reaction.h"    // `texture { reaction { } }` — Gray-Scott bake (TODO §O6)
@@ -1109,6 +1110,7 @@ public:
         // named-object registries no matter where the block sits relative to its target.
         bool haveLight = false;
         std::vector<const Block*> mediaBlocks;
+        std::vector<const Block*> settleBlocks;   // deferred: needs every strand flattened first
         std::vector<const Block*> furBlocks;
         for (const auto& b : blocks) {
             if (stopped()) return false;
@@ -1123,6 +1125,7 @@ public:
             else if (b.type == "light")    { if (!addLight(b, L, b.subtype)) return false; haveLight = true; }
             else if (b.type == "group")    { if (!addGroup(b, L, Affine::identity(), haveLight)) return false; }
             else if (b.type == "medium")   { mediaBlocks.push_back(&b); }
+            else if (b.type == "settle")   { settleBlocks.push_back(&b); }
             else if (b.type == "camera")   { if (!addCamera(b, L)) return false; }
             else if (b.type == "camera_path") { if (!addCameraPath(b, L)) return false; }
             else if (b.type == "camera_orbit") { if (!addCameraOrbit(b, L)) return false; }
@@ -1179,6 +1182,38 @@ public:
         // property put on the wrong block, or an emitter that has drifted from the
         // grammar. Collect them for the caller to report; silently ignoring them is
         // how a misspelt key turns into a wrong image instead of a message.
+        // ---- HAIR SETTLE (0.346.0) -------------------------------------------------------
+        // LAST before the BVH, and deliberately so: every curve, curve-of-curves and deferred
+        // `fur` block has been flattened and tessellated into Scene::curveSegs by now, which is
+        // the single pool every authoring route funnels through -- so one pass here settles a
+        // groom "no matter how we define our curves". It cannot live in the groom GUI or in the
+        // file: `count N` spaces instances by ARC LENGTH, and no arc-length rule can say "except
+        // where another strand already is", so settled positions simply do not exist until the
+        // definitions are flattened. See src/settle.h and known-issues HAIR-PENETRATION.
+        settle::Params sp;
+        if (!settleBlocks.empty()) {
+            const Block& sb = *settleBlocks.back();
+            if (settleBlocks.size() > 1)
+                std::fprintf(stderr, "[settle] %zu settle blocks; the last one wins\n", settleBlocks.size());
+            sp.on        = true;
+            sp.iters     = (int)dblOf(sb, "iterations", (double)sp.iters);
+            sp.droop     = dblOf(sb, "droop", sp.droop);
+            sp.stiffRoot = dblOf(sb, "stiffness", sp.stiffRoot);
+            sp.stiffTip  = find(sb, "stiffness_tip") ? dblOf(sb, "stiffness_tip", sp.stiffTip)
+                                                     : sp.stiffRoot * 0.25;
+            sp.sepScale  = dblOf(sb, "separation", sp.sepScale);
+            sp.margin    = Len(dblOf(sb, "margin", sp.margin));
+            sp.maxNbr    = (int)dblOf(sb, "max_neighbours", (double)sp.maxNbr);
+            if (sp.iters < 0 || sp.iters > 100000) { fail("settle: iterations out of range"); return false; }
+            if (sp.maxNbr < 1 || sp.maxNbr > 256)  { fail("settle: max_neighbours must be 1..256"); return false; }
+            for (const auto& st : sb.stmts)
+                if (st.key == "collide") {
+                    st.used = true;
+                    if (st.val.words.empty()) { fail("settle: `collide` needs a mesh-group name"); return false; }
+                    sp.collide.push_back(st.val.words[0]);
+                }
+        }
+
         for (const auto& b : blocks)
             collectUnusedKeys(b, blockLabel(b), L.unknownKeys);
 
@@ -1189,6 +1224,17 @@ public:
         // has been built over the geometry yet — the one moment at which a client can swap
         // a summary in for the thing it summarises and not pay to accelerate both. See
         // Loaded::beforeBvh.
+        // The settle itself, LAST before the BVH: every curve, curve-of-curves and deferred
+        // `fur` block has been flattened into Scene::curveSegs by now (its parameters were
+        // read above, before the unknown-key sweep, so `find()` could mark them).
+        if (sp.on) {
+            std::string rep;
+            if (!settle::run(L.scene, sp, rep)) {
+                fail("settle: stopped before it finished (nothing was settled)");
+                return false;
+            }
+            std::fprintf(stderr, "[settle] %s\n", rep.c_str());
+        }
         if (L.beforeBvh) L.beforeBvh(L);
         { detail::AccelTimer _ct; L.scene.build(); }
         // build() -> finalizeEmitters() has now adopted each emitter's emitPat from the

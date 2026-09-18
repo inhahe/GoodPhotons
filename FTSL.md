@@ -2127,6 +2127,61 @@ strands from a dozen `fur` blocks, all at one shared `density`). Guarded by
 
 ---
 
+### 8.8 `settle` — relax the groom so strands stop passing through each other
+
+A top-level `settle { }` block runs a **load-time relaxation over every flattened strand** — every
+`curve`, every curve of curves, every `fur` hair, in one pass, because by the time it runs they are
+all the same pool of segments. There is at most one per scene (the last wins).
+
+```
+settle {
+    iterations 60          # projection sweeps (default 60)
+    stiffness  0.20        # hold to the AUTHORED shape, at the root (default 0.60)
+    stiffness_tip 0.04     # ... and at the tip (default: stiffness / 4)
+    droop      0.5         # gravity injected per sweep (default 0.5; 0 = no gravity)
+    separation 1.0         # keep strands (r_i + r_j) x this far apart (default 1; 0 = off)
+    collide    "head"      # optional: a named mesh group to stay outside of, repeatable
+    margin     0.0002      # extra clearance held against colliders (authored units)
+}
+```
+
+**Why this is not a `curve` key and not a groom-tool operation.** The file carries curve
+*definitions*, and a settled groom is not expressible as one: `count N` spaces its instances by
+**arc length** along the path through its children's roots, and no arc-length rule can say "except
+where another strand already is". Settled positions therefore do not exist until the definitions
+have been flattened, which happens at load. Baking them back as explicit `point`s would work and
+would also destroy the procedural groom and add 1.2 M points to the file.
+
+**What it is for, with the measurement that motivated it.** 72.67 % of Alice's 1.2 M hair segments
+lie inside another strand — against 0.97 % for `fur` scattered at the *same* 20 000 strands, so the
+cause is the blend, not density (`tools/hair_penetration.py`, and **HAIR-PENETRATION** in
+`known-issues.md`). The median overlap is only 66 µm, i.e. 4.7 % of one segment, so this is a local
+de-overlap rather than a simulation: each sweep injects a small gravity displacement and then
+projects inextensibility, the **stiffness** pull back toward the authored position, strand-strand
+separation, and any colliders, with the follicles pinned. The fixed point is where gravity balances
+stiffness and contact.
+
+- **`stiffness` is the knob that protects your groom.** It is the pull back toward the shape you
+  authored, strongest at the root. Raise it and the sculpt is preserved but less of the overlap is
+  removed; lower it and the hair relaxes further and drapes more. The equilibrium is
+  `sep/(sep + stiffness)` of each overlap, which is why the root is stiffer than the tip by default.
+- **Determinism is guaranteed, not incidental.** The separation pass is one-sided — a segment reads
+  every neighbour and writes only itself — so there are no atomics and no thread-count dependence.
+  The CPU and CUDA backends must trace identical geometry, and a flyby re-loads the scene once per
+  frame; `tools/settle_rig.py` checks byte-identity of two runs as a standing test.
+- **`settle { iterations 0 }` is byte-identical to no block at all**, which is the control the rig
+  uses to tell the solver's effect from the scene merely reloading.
+- `ftrace -stop` is honoured mid-settle (it aborts the load rather than leaving half a groom).
+
+**Status, measured, so this is not oversold (`tools/settle_rig.py` on Alice, 60 sweeps).** The pass
+*reduces* interpenetration but does not yet eliminate it: median overlap depth 66.4 -> 51.5 µm and
+median clearance -0.053 -> -0.016 mm, while the share of segments with *any* overlap moves only
+72.67 % -> 70.09 % — because that share is a binary threshold and almost everything ends up still
+*just* overlapping. Turning stiffness and gravity off entirely barely changes the result, so the
+limiter is not the shape constraint: a mean-of-contact-directions push cancels for a fiber
+overlapped on all sides, and cannot expand a bundle. The collective (density-gradient) term that
+can is not built yet — see **HAIR-PENETRATION** in `known-issues.md`.
+
 ## 9. UV wraps on native primitives and meshes
 
 Pattern/texture expressions can see surface texture coordinates `u`, `v`. Where they
