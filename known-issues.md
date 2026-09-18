@@ -4957,6 +4957,30 @@ REST shape — which cannot drift by construction and still gives the property t
 `shape local` is kept, documented as drifting, because it is the A/B control that produced this and
 because a correct version would replace it in place.
 
+**`shape rigid` is BUILT (0.351.0) and its A/B is not yet reported.** It is the second of the two
+non-drifting routes named above: one best-fit rotation per strand, obtained from the polar
+decomposition (Higham iteration) of the covariance between the strand's authored offsets and its
+current ones, with the target for particle j being `pos_root + R*(rest_j - rest_root)`. It cannot
+drift the way `local` did, and the reason is structural rather than a matter of tuning: **R is
+refitted against `rest` every sweep, so there is no state for error to accumulate into** — return
+the strand to its authored pose and R returns to identity. Because a rigid motion changes no
+inter-particle distance, the authored curl is preserved *exactly* while the strand stays free to
+swing about its pinned root to clear a neighbour. A rank-deficient covariance (a straight strand,
+whose rotation about its own axis is both underdetermined and irrelevant) is detected by the
+determinant and falls back to the minimal root-to-tip rotation.
+
+It is **not** the default and must not become one until it beats `shape global` on penetration at
+equal or less displacement — a lower number bought with more movement is only the trade the
+`stiffness` knob already offers.
+
+**A tooling fix that this measurement forced (0.351.0).** `tools/hair_penetration.py` parsed a
+65 MB / 1.22 M-line `-dumpcurves` with a per-line Python `split()`, costing ~90 s per file and paid
+twice per comparison, so a four-configuration sweep spent ~12 minutes purely on parsing — which is
+what made several sweeps look hung with no `ftrace` process running. `load()` now filters the
+numeric lines in one pass and hands them to `np.fromstring` as a single buffer: 19.5 s for Alice's
+1.22 M points, and it reproduces the known 72.67 % baseline at 72.40 % with n=8000 (SE ~0.6 pp),
+which is the control that says the rewrite did not change what is being measured.
+
 **Still open:** taking this below 55 % still means changing the constraint set — the convergence
 result (150 sweeps gains 0.2 points over 60) rules out simply running longer — but the specific
 candidate above is now known not to work as implemented.

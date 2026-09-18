@@ -5,26 +5,39 @@ time. Before any of that: is there a problem, and how big? This reports the PENE
 the share of segments that lie closer to a segment of a DIFFERENT strand than the two radii allow
 -- on the real 20 000-strand groom, plus the geometry a solver would have to work at.
 """
+import io
 import sys, numpy as np
 from scipy.spatial import cKDTree
 
+def load(path):
+    """(points, radii, strand_id) from a -dumpcurves file, parsed as one buffer.
+
+    The per-line Python split this replaces cost ~90 s on a 1.22 M-line dump and was paid twice
+    per comparison; four configurations was ~12 minutes of parsing, which is what made the
+    sweeps look hung.
+    """
+    import numpy as np
+    raw = io.open(path, encoding='utf-8').read().split(chr(10))
+    vals, sid, cur = [], [], -1
+    for ln in raw:
+        if not ln:
+            continue
+        c = ln[0]
+        if c == 's':
+            cur += 1
+            continue
+        if c == '#':
+            continue
+        vals.append(ln)
+        sid.append(cur)
+    a = np.fromstring(' '.join(vals), sep=' ').reshape(-1, 4)
+    return a[:, :3], a[:, 3], np.asarray(sid)
+
+
 def measure(path, nsample=40000, verbose=True):
     if verbose: print("== " + path)
-    pts, sid, rad = [], [], []
-    cur = -1
-    with open(path) as f:
-        for ln in f:
-            if ln[0] == '#':
-                continue
-            if ln[0] == 's':
-                cur += 1
-                continue
-            w = ln.split()
-            if len(w) == 4:
-                pts.append((float(w[0]), float(w[1]), float(w[2])))
-                rad.append(float(w[3]))
-                sid.append(cur)
-    P = np.asarray(pts); R = np.asarray(rad); S = np.asarray(sid)
+    pts, rad, sid = load(path)
+    P, R, S = pts, rad, sid
     if verbose: print("strands %d | points %d | radius %.1f..%.1f um" % (S.max() + 1, len(P), 1e6 * R.min(), 1e6 * R.max()))
 
     # segments = consecutive points within one strand

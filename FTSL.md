@@ -2148,7 +2148,7 @@ settle {
     packing    0.30        # ... the volume fraction above which it expands
     cell       0           # ... its grid cell in metres (0 = 8 x mean fiber radius)
     cache      off         # or a path; default is <this file>.settlecache
-    shape      global      # global (default) | local -- see the note below
+    shape      global      # global (default) | local | rigid -- see the note below
 }
 ```
 

@@ -136,7 +136,7 @@ struct Params {
     double margin    = 0.0;     // extra clearance held against colliders
     int    maxNbr    = 32;      // neighbour-list cap per segment (memory bound)
     int    refresh   = 10;      // rebuild the neighbour list every N sweeps (0 = once only)
-    bool   localShape = false;  // `shape local` -- measured to DRIFT, see the note above
+    int    shapeMode = 0;       // 0 = global position spring, 1 = local (DRIFTS), 2 = rigid fit
     double volume    = 0.0;     // COLLECTIVE density-gradient push; OFF by default, see below
     double packing   = 0.30;    // volume fraction above which a neighbourhood expands
     double cellSize  = 0.0;     // density-grid cell in metres; 0 = auto (8 x mean fiber radius)
@@ -271,6 +271,42 @@ inline Vec3 applyR(const double R[9], const Vec3& v) {
                  R[6]*v.x + R[7]*v.y + R[8]*v.z };
 }
 
+// 3x3 helpers for the rigid shape fit. Row-major, R[r*3+c].
+inline void mat3mul(const double* A, const double* B, double* O) {
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            O[r*3+c] = A[r*3+0]*B[0*3+c] + A[r*3+1]*B[1*3+c] + A[r*3+2]*B[2*3+c];
+}
+inline double mat3det(const double* A) {
+    return A[0]*(A[4]*A[8] - A[5]*A[7]) - A[1]*(A[3]*A[8] - A[5]*A[6]) + A[2]*(A[3]*A[7] - A[4]*A[6]);
+}
+// Transpose of the inverse, which is what the polar iteration actually wants.
+inline bool mat3invT(const double* A, double* O) {
+    const double d = mat3det(A);
+    if (std::fabs(d) < 1e-300) return false;
+    const double s = 1.0 / d;
+    O[0] = (A[4]*A[8] - A[5]*A[7]) * s;  O[3] = -(A[1]*A[8] - A[2]*A[7]) * s;  O[6] = (A[1]*A[5] - A[2]*A[4]) * s;
+    O[1] = -(A[3]*A[8] - A[5]*A[6]) * s; O[4] = (A[0]*A[8] - A[2]*A[6]) * s;   O[7] = -(A[0]*A[5] - A[2]*A[3]) * s;
+    O[2] = (A[3]*A[7] - A[4]*A[6]) * s;  O[5] = -(A[0]*A[7] - A[1]*A[6]) * s;  O[8] = (A[0]*A[4] - A[1]*A[3]) * s;
+    return true;
+}
+// The rotation factor of A, by Higham's iteration R <- (R + R^-T)/2. Quadratic, and eight
+// steps is far past convergence for the near-rotations a settle produces. Returns false when
+// A is rank-deficient (a straight strand), which the caller handles rather than papers over.
+inline bool polarRotation(const double* A, double* R) {
+    for (int i = 0; i < 9; ++i) R[i] = A[i];
+    double invT[9], nxt[9];
+    for (int it = 0; it < 8; ++it) {
+        if (!mat3invT(R, invT)) return false;
+        for (int i = 0; i < 9; ++i) nxt[i] = 0.5 * (R[i] + invT[i]);
+        double d = 0.0;
+        for (int i = 0; i < 9; ++i) d += std::fabs(nxt[i] - R[i]);
+        for (int i = 0; i < 9; ++i) R[i] = nxt[i];
+        if (d < 1e-14) break;
+    }
+    return mat3det(R) > 0.0;   // a reflection is not a pose
+}
+
 } // namespace detail
 
 // Runs the settle in place. Returns false only if `ftrace -stop` cancelled it mid-way (the
@@ -321,7 +357,7 @@ inline bool run(Scene& sc, const Params& p, std::string& report) {
     {
         const double pv[] = { (double)p.iters, p.droop, p.stiffRoot, p.stiffTip, p.sepScale,
                               p.margin, (double)p.maxNbr, p.volume, p.packing, p.cellSize,
-                              p.maxStep, (double)p.refresh, p.localShape ? 1.0 : 0.0 };
+                              p.maxStep, (double)p.refresh, (double)p.shapeMode };
         key = detail::fnv(key, pv, sizeof pv);
         for (const std::string& c : p.collide) key = detail::fnv(key, c.data(), c.size());
         key = detail::fnv(key, pos.data(), pos.size() * sizeof(Vec3));   // the AUTHORED geometry
@@ -567,7 +603,7 @@ inline bool run(Scene& sc, const Params& p, std::string& report) {
         // (c) shape. Sequential along each strand (the frame is carried outward from the root),
         //     parallel ACROSS strands -- which is also what keeps it deterministic, since a
         //     strand owns its particles outright.
-        if (p.localShape) {
+        if (p.shapeMode == 1) {
             if (!ft::parallelFor(nC, 32, [&](size_t c) {
                     const int b = first[c], n = cnt[c];
                     if (n < 2) return;
@@ -583,6 +619,43 @@ inline bool run(Scene& sc, const Params& p, std::string& report) {
                         const double lw = length(want), lg = length(got);
                         if (lw > 1e-15 && lg > 1e-15)
                             detail::rotateOnto(want * (1.0 / lw), got * (1.0 / lg), R);
+                    }
+                })) return false;
+        } else if (p.shapeMode == 2) {
+            // RIGID: one best-fit rotation per strand, solved against the REST shape every
+            // sweep, so there is no state for error to accumulate into -- if the strand
+            // returns to its authored pose, R returns to identity. The root is pinned, so
+            // rotation about it is the only rigid freedom, and a rigid motion changes no
+            // inter-particle distance: the authored curl is preserved EXACTLY while the strand
+            // is free to swing aside and clear a neighbour.
+            if (!ft::parallelFor(nC, 32, [&](size_t c) {
+                    const int b = first[c], n = cnt[c];
+                    if (n < 3) return;
+                    const Vec3 p0 = pos[(size_t)b], r0 = rest[(size_t)b];
+                    double A[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+                    for (int k = 1; k < n; ++k) {
+                        const Vec3 q = pos[(size_t)b + (size_t)k] - p0;
+                        const Vec3 w = rest[(size_t)b + (size_t)k] - r0;
+                        A[0] += q.x*w.x; A[1] += q.x*w.y; A[2] += q.x*w.z;
+                        A[3] += q.y*w.x; A[4] += q.y*w.y; A[5] += q.y*w.z;
+                        A[6] += q.z*w.x; A[7] += q.z*w.y; A[8] += q.z*w.z;
+                    }
+                    double R[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+                    if (!detail::polarRotation(A, R)) {
+                        // rank-deficient: a straight strand, whose twist about its own axis is
+                        // undetermined AND irrelevant. The minimal rotation carrying the rest
+                        // root->tip onto the current one is the right answer there.
+                        for (int i = 0; i < 9; ++i) R[i] = (i % 4 == 0) ? 1.0 : 0.0;
+                        const Vec3 wr = rest[(size_t)b + (size_t)n - 1] - r0;
+                        const Vec3 wc = pos[(size_t)b + (size_t)n - 1] - p0;
+                        const double lr = length(wr), lc = length(wc);
+                        if (lr > 1e-15 && lc > 1e-15)
+                            detail::rotateOnto(wr * (1.0 / lr), wc * (1.0 / lc), R);
+                    }
+                    for (int k = 1; k < n; ++k) {
+                        const size_t j = (size_t)b + (size_t)k;
+                        const Vec3 tgt = p0 + detail::applyR(R, rest[j] - r0);
+                        pos[j] = pos[j] + (tgt - pos[j]) * (double)stiff[j];
                     }
                 })) return false;
         } else {
