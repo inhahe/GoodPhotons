@@ -908,6 +908,19 @@ struct Renderer {
     //     arithmetic, and the estimates are CORRELATED -- which matters, because the consumer takes
     //     their ratio and independent estimates would make that ratio noisy as well as biased.
     // `Tr[i]` is MULTIPLIED into, so a caller can chain media.
+    // FTRACE_SPECMEDIA=0 forces the scalar tier even where sigma_t VARIES with wavelength -- i.e.
+    // the pre-0.322.0 behaviour, one wavelength's transmittance applied to all of them. HOST ONLY,
+    // and it exists for exactly one reason: without it there is no way to ask whether a rig can SEE
+    // the error the three-tier fix removes, and a clean "after" number from an instrument that
+    // cannot see the "before" proves nothing. tools/specmedia_rig.py uses it as its control.
+    static bool specMediaOn() {
+        static const bool on = [] {
+            const char* e = std::getenv("FTRACE_SPECMEDIA");
+            return !(e && e[0] == '0');
+        }();
+        return on;
+    }
+
     static void mediumTransmittanceSpec(const Medium& med, const Vec3& o, const Vec3& dir,
                                         double dist, const double* lams, int K, double* Tr,
                                         Pcg32& rng, const PatTables* tabs) {
@@ -928,8 +941,14 @@ struct Renderer {
         bool flatMed = true;
         for (int i = 1; i < K; ++i)
             if (std::fabs(stB[i] - stB[0]) > 1e-12 * (1.0 + stB[0])) { flatMed = false; break; }
-        if (flatMed) {
-            const double T = mediumTransmittance(med, o, dir, dist, lams[0], rng, tabs);
+        const bool forceScalar = !specMediaOn();
+        if (flatMed || forceScalar) {
+            // A genuinely flat medium: any wavelength gives the same answer, so lams[0] keeps this
+            // bit-identical. FORCED: use the LAST entry, which the gather's caller sets to the
+            // camera's own wavelength (camMediaTrSpec appends it after the grid) -- that is the
+            // historical bug being reproduced, not an arbitrary bin.
+            const double lamUse = flatMed ? lams[0] : lams[K - 1];
+            const double T = mediumTransmittance(med, o, dir, dist, lamUse, rng, tabs);
             for (int i = 0; i < K; ++i) Tr[i] *= T;
             return;
         }

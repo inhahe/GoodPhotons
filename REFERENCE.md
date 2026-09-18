@@ -1633,6 +1633,15 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   spectral fold, so a rainbow beam is demoted to its monochromatic `CIE(λ)` record the way it was
   before 0.264.0. The A/B control for that fold; on `gallery_rain` the fold changes 63 % of pixels and
   is ~10 % faster.
+- **`FTRACE_SPECMEDIA=0` (diagnostic, participating media).** Forces the **scalar** transmittance
+  tier on a coloured medium — one walk at one wavelength, applied to every wavelength — which is the
+  pre-0.322.0 behaviour exactly, and so is the A/B control for the three-tier spectral
+  transmittance. On a coloured heterogeneous blob in front of a lit wall it takes the channel spread
+  against a converged mode `D` from 2.0 % to **110 %**. Note what it does *not* move: a directly
+  viewed emitter seen through the same fog is unchanged, because that path samples one wavelength
+  end to end and was never biased. The error is only visible where a camera segment's transmittance
+  scales a sum over photons of many wavelengths, i.e. a surface gathered from the photon map. See
+  `tools/specmedia_rig.py` and **SPECTRAL MEDIA** in `known-issues.md`.
 - **`FTRACE_NOWAVEFRONT=1` (diagnostic, mode `J` on the GPU).** Since 0.261.0 mode `J`'s device
   camera pass runs its beam gather as a *wavefront* — segments are queued, candidates are
   enumerated one thread per segment, and evaluated one thread per candidate — instead of one

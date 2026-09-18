@@ -4701,17 +4701,37 @@ the two cannot disagree.
 **Cost, measured on a real scene:** `gallery_rain` frame 555 went 97 s -> 101 s with the vector, and
 back to **96 s** once the flat fast path was added — i.e. free where it cannot matter.
 
-**One validation is outstanding, and the reason is worth recording.** The coloured-AND-heterogeneous
-combination is not covered by an end-to-end number: those renders exceeded 20-40 minutes and were
-stopped. I twice concluded from that that the stochastic tier was "impractically slow", and twice I
-was wrong — shrinking the grid from 24 bins to 8 changed nothing, narrowing the spectral spread
-changed nothing, and then the control I should have run first settled it: the SAME scene with a
-FLAT spectrum, which takes the scalar fast path (i.e. the pre-fix behaviour exactly), is equally
-slow. **The cost is that scene's heterogeneous medium, not the spectral vector.** The tier itself is
-textbook ratio tracking with a valid majorant; what is missing is a cheap scene that exercises it
-end to end.
+**The heterogeneous tier now has its end-to-end number too (0.344.0): a 110.1 % channel spread
+against mode D becomes 2.0 %.** `tools/specmedia_rig.py` is the cheap scene the entry below used to
+say was missing — one smooth analytic blob (a squared radial falloff, so the majorant is tight and
+ratio tracking terminates fast) in front of a lit diffuse wall, at 120x96 in HDR, three checks.
+`FTRACE_SPECMEDIA=0` forces the scalar tier on a coloured medium, which reproduces the pre-0.322.0
+bug exactly and is what supplies the 110.1 % "before". The flat control on the same scene sits at
+3.3 %, so the residual 2.0 % is the beam estimator's own noise floor, not a spectral error.
 
-**Also not covered:****Also not covered:** the `Hair` BCSDF (evaluating it per wavelength is genuinely expensive), and
+**Two things had to be got right first, and both are the entry's real lesson.**
+
+*The cost was never the tier.* I twice called the stochastic tier "impractically slow" from those
+20-40-minute renders and was wrong both times — 24 bins vs 8 changed nothing, narrowing the spectral
+spread changed nothing, and the control I should have run first settled it: the SAME scene with a
+FLAT spectrum, taking the scalar fast path (i.e. pre-fix behaviour exactly), is equally slow. Nor
+was it that scene's density field, as I then assumed: at shipping defaults mode M builds ~1 M photon
+beams, splits them to 7.9 M, and **a probe ray gathers 4235 of them** — 20 s/spp at 200x160. That is
+a flyby budget being spent on a validation. `-n 150000 -beamcount 40000 -beamsplitmax 60000000`
+leaves 174 beams per probe and scales the volume estimator's noise, not its mean. The engine had
+been printing the answer the whole time: *"lower -beamcount to get there for free"*.
+
+*A glowing panel behind the fog is NOT a test of this bug.* The rig's first scene put an emissive
+panel directly behind the blob, for maximum transmittance signal — and `FTRACE_SPECMEDIA=0` came
+back **identical to the fixed build** (5.1 % vs 5.1 %, ratios matching to three decimals). That is
+correct behaviour, not a broken switch: a directly-viewed emitter samples one wavelength end to end
+— attenuate at λ, emit at λ — so it was never biased. The bug lives only where the camera segment's
+transmittance multiplies a sum over photons of MANY wavelengths, i.e. at a surface **gathered from
+the photon map**. Measuring a lit diffuse wall instead of a panel is the entire difference between
+110.1 % and nothing. Had the rig shipped without check 1, it would have reported a confident 5.1 %
+"after" from an instrument pointed at a path the fix does not touch.
+
+**Also not covered:** the `Hair` BCSDF (evaluating it per wavelength is genuinely expensive), and
 `HalfMirror`'s reflect-or-pass and the layered coat's coat-or-body, which are stochastic BINARY
 choices made at the camera's wavelength — the same class of error, not expressible as a smooth
 ratio, and still unmeasured.

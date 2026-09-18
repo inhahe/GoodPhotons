@@ -558,18 +558,21 @@ front rather than halfway through.
 coat traced explicitly, which needs no MIS pdf), in an enclosure, and confirm the Python numbers end
 to end before committing to the architecture.
 
-## 6. The heterogeneous spectral-media tier has no end-to-end number
+## 6. DONE (0.344.0): the heterogeneous spectral-media tier's end-to-end number
 
-The three-tier spectral media fix (C, v0.322.0) is validated for the flat and homogeneous tiers
-(coloured fog: 113 % channel spread -> 1.0 %). The **coloured-AND-heterogeneous** combination is not
-covered: those renders exceeded 20-40 minutes and were stopped.
+`tools/specmedia_rig.py`: **110.1 % channel spread against mode D -> 2.0 %**, with the flat control
+on the same scene at 3.3 % (so the residual is the beam estimator's noise floor, not a spectral
+error). `FTRACE_SPECMEDIA=0` forces the scalar tier on a coloured medium and is what supplies the
+"before". The tier was never the thing that was slow — the abandoned scene was spending a flyby's
+beam budget (4235 beams per probe) on a validation; cutting `-beamcount` scales that estimator's
+noise, not its mean.
 
-**Do not re-derive the wrong conclusion from that.** I twice called the stochastic tier
-"impractically slow" and was wrong both times — 24 bins vs 8 changed nothing, narrowing the spectral
-spread changed nothing, and the control I should have run first settled it: the same scene with a
-FLAT spectrum, taking the scalar fast path (i.e. pre-fix behaviour exactly), is **equally slow**.
-The cost is that scene's heterogeneous medium, not the spectral vector. What is missing is a **cheap
-scene** that exercises the tier, not a redesign.
+**The lesson worth keeping is check 1.** The rig's first scene measured a glowing panel seen
+directly through the fog, and `FTRACE_SPECMEDIA=0` came back *identical* to the fixed build. That is
+right: a directly-viewed emitter samples one wavelength end to end and was never biased. The bug
+only exists where a camera segment's transmittance multiplies a sum over photons of many
+wavelengths — a surface **gathered from the photon map**. Without the sensitivity control the rig
+would have reported a confident number from an instrument pointed at the wrong path.
 
 ## 7. DONE (0.337.0): `-frames A B` renders a RANGE of a `camera_curve`
 
