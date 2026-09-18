@@ -15,11 +15,29 @@ inseparable from the total internal reflection that traps part of the body's lob
 must therefore have a rough body and must let TIR happen for real.
 
   EXPLICIT  a smooth dielectric sphere (the coat's air interface) with the rough glossy body as a
-            slightly smaller concentric sphere INSIDE it. Light refracts in, scatters off the body
-            in a medium of n = 1.5, and either escapes through the interface or is thrown back down
-            by TIR to scatter again -- the multi-bounce series, traced rather than summed. Note the
-            body is a plain reflectance lobe, so it carries no Fresnel of its own; that matches
-            what the analytic model assumes of it.
+            concentric sphere 0.0005 inside it. THE GAP MUST BE TINY, and the first version of this
+            file got that wrong at 0.03: a coat is a THIN layer, so its entry and exit interfaces
+            share a normal with the body, while a thick shell is a ball LENS that lands the
+            refracted ray on a different part of the body with a different normal -- a different
+            optical system, not a brute force of this one. The control caught it: at roughness 0.02,
+            where a3_snell.py proves the coat is the exact identity, the thick version reported
+            51 % energy error and its energies were non-monotonic in roughness by 7x. With the thin
+            gap, light refracts in, scatters off the body in a medium of n = 1.5, and either escapes
+            through the interface or is thrown back down by TIR to scatter again -- the multi-bounce
+            series, traced rather than summed. The body is a plain reflectance lobe carrying no
+            Fresnel of its own, which is what the analytic model assumes of it.
+
+STATUS: THE ENERGY HALF IS NOT YET TRUSTWORTHY, and the control says so. At roughness 0.02 the
+error should be ~0 and is 71.8 %. The cause is understood: a near-smooth glossy body under a coat
+is a near-delta highlight, so a mean over the disc is dominated by a handful of firefly pixels at
+any practical spp, and the explicit energies stay erratic (1.45 at 0.02 against 0.57 at 0.10). The
+LOBE WIDTH half is well behaved -- -1.0 %, -4.6 %, +1.8 %, +7.3 % across the roughness sweep, i.e.
+small at smooth as the identity result requires, and growing with roughness as the claim predicts
+-- but +7.3 % is nowhere near the -34 % the Python model predicted. So TODO item 5's precondition
+("confirm the Python numbers end to end") is NOT met, and the architecture is not yet justified.
+Next: replace the disc-mean energy metric with something firefly-robust (a furnace enclosure and a
+total-flux measurement, which is what the TODO actually asked for and what this skipped), or drive
+the body with an explicit incident direction sweep instead of reading it off a sphere.
   ANALYTIC  one sphere with `type layered`, the same body as its base and a smooth coat.
 
 Both are lit by one distant sun and viewed head-on. A sphere is the instrument: every pixel of its
@@ -51,8 +69,8 @@ light sun {{ dir 0.45 0.35 0.82  angle 0.53  spd preset:d65  intensity 2.2e-13 }
 BODY = 'material "body" {{ type glossy  reflect 0.62  roughness {rough} }}\n'
 
 EXPLICIT = COMMON + BODY + """material "coatglass" {{ type dielectric  ior 1.5 }}
-sphere {{ center 0 0 0  radius 1.00  material coatglass }}
-sphere {{ center 0 0 0  radius 0.97  material body }}
+sphere {{ center 0 0 0  radius 1.0000  material coatglass }}
+sphere {{ center 0 0 0  radius 0.9995  material body }}
 """
 
 ANALYTIC = COMMON + BODY + """material "coated" {{
@@ -90,13 +108,19 @@ def stats(pfm):
     yy, xx = np.mgrid[0:h, 0:w]
     cy, cx = (h - 1) * 0.5, (w - 1) * 0.5
     rr = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
-    # the sphere's disc: fov 22 deg at 6 units puts r = 1 at ~0.44 of the half-height
-    disc = rr <= (0.44 * h)
+    # The disc, sized from the actual projection rather than by eye: a fov_y of 22 deg at distance
+    # 6 puts the half-height at 6*tan(11 deg) = 1.166 world units, so a unit sphere spans
+    # 1/1.166 = 0.857 of the half-height, i.e. 0.429 * h in pixels. The first version used 0.44*h
+    # -- more than twice the radius -- so most of the "disc" was background, which the glass sphere
+    # refracts into and the analytic one does not. Take 0.95 of it to stay off the limb.
+    import math
+    discR = 0.95 * (1.0 / (6.0 * math.tan(math.radians(11.0)))) * (h * 0.5)
+    disc = rr <= discR
     e = lum[disc]
     order = np.argsort(rr[disc])
     cum = np.cumsum(e[order])
     half = np.searchsorted(cum, cum[-1] * 0.5)
-    r50 = float(np.sort(rr[disc])[min(half, len(e) - 1)]) / (0.44 * h)
+    r50 = float(np.sort(rr[disc])[min(half, len(e) - 1)]) / discR
     return float(e.mean()), r50
 
 

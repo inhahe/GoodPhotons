@@ -558,6 +558,22 @@ front rather than halfway through.
 coat traced explicitly, which needs no MIS pdf), in an enclosure, and confirm the Python numbers end
 to end before committing to the architecture.
 
+**STARTED (0.346.0), precondition NOT met — do not build the architecture yet.**
+`tools/a3_reference.py` traces the coat explicitly: a rough glossy sphere concentric inside a smooth
+dielectric sphere, gap 0.0005, so refraction in/out shares a normal with the body and TIR and the
+multi-bounce series happen for real. Two bugs were found and fixed by its own control (the coat is
+the exact IDENTITY for a smooth body, so a large error at roughness 0.02 means the rig is wrong):
+a 0.03 gap makes a ball LENS rather than a coat, and the disc ROI was sized by eye at more than
+twice the sphere's projected radius, so most of it was background the glass refracts into.
+
+After both fixes the **lobe-width** half behaves — −1.0 %, −4.6 %, +1.8 %, +7.3 % across roughness
+0.02 → 0.45, small at smooth and growing with roughness as the claim requires — but it reaches only
++7.3 %, not the −34 % predicted. The **energy** half still fails its control at 71.8 %, because a
+near-smooth body under a coat is a near-delta highlight whose disc mean is firefly-dominated at any
+practical spp. So the end-to-end confirmation does not exist yet. The fix is the part of the TODO
+this skipped: measure total flux **in an enclosure**, not a disc mean, or sweep incident direction
+explicitly instead of reading the lobe off a sphere.
+
 ## 6. DONE (0.344.0): the heterogeneous spectral-media tier's end-to-end number
 
 `tools/specmedia_rig.py`: **110.1 % channel spread against mode D -> 2.0 %**, with the flat control
