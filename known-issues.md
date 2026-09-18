@@ -4736,6 +4736,58 @@ the photon map**. Measuring a lit diffuse wall instead of a panel is the entire 
 choices made at the camera's wavelength — the same class of error, not expressible as a smooth
 ratio, and still unmeasured.
 
+### HAIR-PENETRATION — OPEN (2026-09-18, measured): **72.7 % of Alice's strand segments lie inside another strand**, and the curve-of-curves blend is what puts them there
+
+Asked for: strands that do not run through each other "no matter how we define our curves", by
+settling them against direction, stiffness and gravity. Before designing a solver, the question
+was whether there is a problem and how big — `tools/hair_penetration.py` measures it on the real
+groom (`-dumpcurves`, then a sampled segment-segment minimum distance against the two radii,
+excluding same-strand pairs).
+
+| groom | strands | fiber | penetrating segments | median clearance |
+|---|---|---|---|---|
+| `fur` scattered on a sphere | 2 000 | 43 µm | **0.09 %** | +0.91 mm |
+| `fur` scattered on a sphere | 20 000 | 43 µm | **0.97 %** | +0.68 mm |
+| **Alice (`alice_real_hair.ftsl`)** | **20 000** | 43 µm | **72.67 %** | **−0.05 mm** |
+
+The control matters more than the headline. Same strand count, same radius, same length, same
+~1.4 mm segments — the only difference is that Alice's strands are *blended* out of a
+curve-of-curves cage and the control's are scattered by `fur`. 0.97 % vs 72.67 % is **75x at equal
+density**, so this is not "20 000 hairs on a head are bound to touch"; it is the blend placing
+interpolated strands closer together than a fiber is thick. Nothing in the pipeline knows a fiber
+has a radius: `count N` spaces instances by ARC LENGTH along the path through its children's
+roots, and arc length has no idea what is already there. That is exactly why the request says
+"no matter how we define our curves" — the authoring structure is the cause.
+
+**Control's known weakness, stated so it is not over-read:** scattered `fur` on a sphere grows
+*radially*, so its strands diverge with distance from the scalp and separate for free, while real
+hair lies along the head. The control therefore understates the natural rate for lying-down hair.
+It cannot plausibly understate it by 75x, and the median clearance (+0.68 mm, eight fiber
+diameters, vs −0.05 mm) is the same story without relying on the threshold.
+
+**The encouraging half, and the thing that decides the solver's design:** the median penetration
+is **66 µm**, p95 89 µm, max 107 µm. That is 4.7 % of one segment length and 0.07 % of the head's
+size. Removing the overlap needs *tens of microns* of movement — so this is a LOCAL DE-OVERLAP,
+not a dynamics problem in which gravity reshapes the groom. The authored look survives almost
+exactly, and a relaxation whose corrections are that small against constraints that long is
+weakly coupled and converges in few iterations.
+
+**Design the measurement implies** (not built; the cost estimate is arithmetic, not a benchmark):
+1 220 000 particles / 1.2 M segments. Per Jacobi iteration: a hash-grid rebuild plus constraint
+projection ≈ 5–15 ms on 12 threads, so tens of iterations is **under a second** and a full
+gravity settle at a few hundred is a few seconds — a bake, cached to a sidecar keyed on a hash of
+the inputs, because a flyby must not re-settle per frame and the CPU and GPU backends must get
+byte-identical geometry. The trap that makes this look impossible is **pairwise** strand-strand
+contact (BVH queries per segment per iteration, 1.2 M segments); the standard answer is a
+density-grid/continuum push at lock scale (~1–2 mm cells), which is O(N) and is what film hair
+actually uses. Repulsion at lock scale plus body collision, with the AUTHORED curve as the rest
+shape for bending, is the shape of it.
+
+Where it would live: on the flattened `std::vector<CurveStrand>` after `flattenCurveNode`/fur
+generation and before `tessellateCurve` — the one place every authoring route already funnels
+through, which is what makes "no matter how we define our curves" achievable rather than a
+per-feature fix.
+
 ### OPEN (2026-09-16): `-direct-only` is silently ignored by mode D (and any non-backward mode)
 
 `g_directOnly` is consulted by the backward tracer (modes R/W, the explorer's refinement

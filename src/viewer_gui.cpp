@@ -4067,7 +4067,8 @@ static void groomComputeFrame(GroomState& g) {
 // what `count` places along -- and, when it places, the loader's flattened instances (from the
 // last load: dimmed once an edit has made them stale). Children draw themselves; a reference
 // draws nothing (its definition does).
-static void drawNodeLines(GroomState& g, groom::Node& n, int level, std::vector<LineBatch>& out, double cross) {
+static void drawNodeLines(GroomState& g, groom::Node& n, int level, std::vector<LineBatch>& out, double cross,
+                          const groom::DrawBasis& db) {
     if (n.ref || !nodeVisible(g, n.id)) return;
     const Affine xf = xfOf(g, n.id);
     const bool leaf = n.kids.empty();
@@ -4078,9 +4079,31 @@ static void drawNodeLines(GroomState& g, groom::Node& n, int level, std::vector<
         for (int k = 0; k < 4; ++k) b.rgba[k] = col[k];
         if (dim) { b.rgba[0] *= 0.35f; b.rgba[1] *= 0.35f; b.rgba[2] *= 0.35f; }
         if (leaf) {
+            // The strand AS THE RENDERER WILL TESSELLATE IT (groom.h leafPolyline), not the
+            // control polygon. The default basis is catmull_rom at 4 cones per span, so the
+            // straight-segment drawing this replaced was showing a shape no render produces.
             std::vector<Vec3> w; w.reserve(n.pts.size());
             for (const groom::Pt& p : n.pts) w.push_back(xf.apply(p.p));
-            for (size_t k = 1; k < w.size(); ++k) addSegment(b, w[k - 1], w[k]);
+            std::vector<Vec3> poly;
+            groom::leafPolyline(n, db, poly);
+            if (poly.size() >= 2) {
+                for (Vec3& q : poly) q = xf.apply(q);
+                for (size_t k = 1; k < poly.size(); ++k) addSegment(b, poly[k - 1], poly[k]);
+                // the control polygon stays, faint, as the editing hint it always was: with
+                // handles off the curve (catmull_rom passes through them, bezier does not)
+                // you cannot grab a point you cannot see.
+                if (g.showPoints && w.size() >= 2) {
+                    LineBatch hull;
+                    for (int k = 0; k < 3; ++k) hull.rgba[k] = b.rgba[k] * 0.30f;
+                    hull.rgba[3] = 1.0f;
+                    for (size_t k = 1; k < w.size(); ++k) addSegment(hull, w[k - 1], w[k]);
+                    if (!hull.v.empty()) out.push_back(std::move(hull));
+                }
+            } else {
+                // not a valid chain in this basis (bezier wants 3k+1, bspline >= 4): show the
+                // polygon, so the point count is visibly the reason rather than a blank pane.
+                for (size_t k = 1; k < w.size(); ++k) addSegment(b, w[k - 1], w[k]);
+            }
             if (g.showPoints) for (const Vec3& p : w) addCross(b, p, cross);
         } else {
             std::vector<Vec3> roots;
@@ -4127,7 +4150,7 @@ static void drawNodeLines(GroomState& g, groom::Node& n, int level, std::vector<
         }
         if (!b.v.empty()) out.push_back(std::move(b));
     }
-    for (groom::Node& k : n.kids) if (!k.ref) drawNodeLines(g, k, groom::levelOf(g.model, k), out, cross);
+    for (groom::Node& k : n.kids) if (!k.ref) drawNodeLines(g, k, groom::levelOf(g.model, k), out, cross, db);
 }
 
 static void groomBuildLines(GroomState& g, std::vector<LineBatch>& out) {
@@ -4135,7 +4158,11 @@ static void groomBuildLines(GroomState& g, std::vector<LineBatch>& out) {
     groom::buildPreview(g.model, g.preview);      // the placed instances, through the loader's own recursion
     const double cross = 0.006 * g.ext;
     if (g.showCurves)
-        forEachTopCurve(g.model, [&](groom::Node& n) { drawNodeLines(g, n, groom::levelOf(g.model, n), out, cross); });
+        // `basis`/`segments`/`spline` come from the OUTERMOST node, so they are resolved here
+        // and handed down -- the same rule the loader tessellates by.
+        forEachTopCurve(g.model, [&](groom::Node& n) {
+            drawNodeLines(g, n, groom::levelOf(g.model, n), out, cross, groom::drawBasisOf(n));
+        });
     const Scene& sc = g.loaded.scene;
     if (g.showHair || g.showRoots) {
         for (const auto& fi : g.loaded.furInfos) {
@@ -4846,6 +4873,26 @@ static void treeNode(GroomState& g, groom::Node& n, int depth) {
 // A curve of curves' own parameters: what places instances along its path, and its children.
 static void drawNodeParams(GroomState& g, groom::Node& n) {
     const float w5 = ImGui::GetFontSize() * 5.0f;
+    // WHAT THIS NODE DOES WITH ITS CHILDREN, stated before `count` is edited -- because
+    // `count` is the field that switches it, and the switch is NOT additive. With no
+    // count/density the node is a plain group and its children pass through bit-for-bit
+    // (ftsl.h flattenCurveNode: "the instances ARE the children"). The moment it places,
+    // the children stop being output and become the control cage: the path is the spline
+    // through their roots and the output is `count` samples along it. So a level added on
+    // top does not refine the level below, it consumes it -- which is why the tool says so
+    // here rather than leaving "one level up, the next colour" to imply otherwise.
+    if (!n.kids.empty()) {
+        if (n.placed())
+            ImGui::TextWrapped("PLACES: its %zu child curve(s) are the control cage, NOT output --"
+                               " this node emits the strands, %d of them per child strand, spaced"
+                               " along the path through their roots.", n.kids.size(), n.count());
+        else
+            ImGui::TextWrapped("GROUPS: no count/density, so its %zu child curve(s) render as"
+                               " themselves, bit-for-bit. Setting count below REPLACES them with"
+                               " blended instances -- it is not an extra layer of detail.",
+                               n.kids.size());
+        ImGui::Separator();
+    }
     int count = n.count();
     ImGui::SetNextItemWidth(w5);
     if (ImGui::InputInt("count", &count)) {
@@ -4989,10 +5036,22 @@ static void drawGroomPanel(GroomState& g) {
     if (ImGui::SmallButton("reset view")) { g.view.yaw = 0.6f; g.view.pitch = 0.4f; g.view.zoom = 1.0f; }
     if (f) { groomComputeFrame(g); d = true; }           // cross sizes follow the frame
     if (ImGui::CollapsingHeader("Levels", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // A level is a node's HEIGHT in the tree (groom.h levelOf, computed bottom-up), not a
+        // refinement pass you add. Saying so here because the colour-per-level display reads
+        // as incremental and the semantics are the opposite: see drawNodeParams.
+        ImGui::TextDisabled("a level is a node's height in the tree, not a refinement pass");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Level N means: the deepest child below this node is level N-1.\n"
+                              "A node with no count/density is a pass-through group -- its children\n"
+                              "still render as themselves. A node that PLACES consumes them: they\n"
+                              "become the control cage its count samples along, so the curves you\n"
+                              "drew below are keys, not hair. Choose the authoring depth before\n"
+                              "drawing -- adding a placing level reinterprets everything under it.");
         for (int L = 0; L <= g.maxLevel && L < 8; ++L) {
             const float* col = levelColour(L);
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(col[0], col[1], col[2], 1.0f));
-            char lab[48]; std::snprintf(lab, sizeof lab, L == 0 ? "level 0: strands" : "level %d: curves of level %d", L, L - 1);
+            char lab[64]; std::snprintf(lab, sizeof lab, L == 0 ? "level 0: strands (control points)"
+                                                               : "level %d: built FROM level %d", L, L - 1);
             bool on = g.levelOn[L];
             if (ImGui::Checkbox(lab, &on)) { g.levelOn[L] = on; d = true; }
             ImGui::PopStyleColor();

@@ -1905,6 +1905,20 @@ curve "hair" {                        # a curve of curves of curves: 5 rows, cro
   An open path spans both ends; `closed` spaces `i/N` so the last instance is not the first.
 - **No `count` and no density: the instances *are* the children, bit-for-bit.** A node is then
   just a group — which is what keeps two levels as simple as one.
+- **A level is not an incremental refinement of the level below it — a placing level REPLACES it.**
+  This is the one thing about the recursive form that does not work the way the word "level"
+  suggests, so it is worth stating flatly. A node with no `count` / density is a pass-through
+  group and adds nothing but organisation. The moment it *places*, its `C` children stop being
+  output at all and become the **control cage**: the path is the spline through their roots, and
+  the output is `count` positions sampled along that path (times `M`, the strands each child
+  makes). Wrap twenty hand-drawn strands in a node with `count 9` and the render has **nine**
+  strands, blended from your twenty — the twenty are keys now, not hair.
+
+  So the authoring depth is a decision to make **before** drawing, not one to add afterwards: the
+  same `curve` block means "a strand" or "a guide" depending only on how many placing nodes end
+  up above it, and adding one retroactively reinterprets everything below. The groom tool's
+  **G**-to-group makes a node with *no* `count`, so grouping alone is always safe; typing a
+  `count` into it is the step that consumes the children, and the tool says so at that moment.
 - A level-*k* node blends level-(*k*−1) *objects*: when it **places** (`count` / a density),
   every child must produce the **same number of strands** (an error names the mismatch), and
   siblings with different point counts are **resampled by arc length** to the largest count

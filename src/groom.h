@@ -349,6 +349,62 @@ inline Where whereIs(Model& m, int id) {
     return w;
 }
 // 0 for a strand, 1 + the deepest child for a curve of curves; a reference has its target's level.
+// ---- what a leaf ACTUALLY renders as -----------------------------------------------------
+// The editor used to draw a leaf curve by joining its `point`s with straight segments -- its
+// control POLYGON, which is the one shape the renderer never produces: `curveLeaf` stores the
+// authored points verbatim and `addCurve` then runs them through `tessellateCurve` at the
+// default basis, catmull_rom with 4 cones per span. A curve of curves, meanwhile, drew its path
+// through `catmullRomAt` and so looked right, which is why the straightness read as a property
+// of the LEVEL. It was a property of the drawing code.
+//
+// These two go through the loader's own tessellator rather than a second evaluator, so the
+// preview cannot drift from the render: whatever `tessellateCurve` does, the pane shows.
+struct DrawBasis {
+    CurveBasis basis = CurveBasis::CatmullRom;
+    int        subdiv = 4;
+    double     alpha = 0.0;
+};
+// `basis`, `segments` and `spline` are taken from the OUTERMOST node (ftsl.h
+// parseCurveNodeParams says so in as many words -- a strand is flattened once, at the top), so
+// this is resolved at the top of a tree and handed down, not read per node.
+inline DrawBasis drawBasisOf(const Node& top) {
+    DrawBasis d;
+    if (const ftsl::Stmt* bs = top.find("basis")) {
+        const std::string v = bs->val.words.empty() ? std::string() : bs->val.words[0];
+        if      (v == "linear")                                                 d.basis = CurveBasis::Linear;
+        else if (v == "bezier")                                                 d.basis = CurveBasis::Bezier;
+        else if (v == "bspline" || v == "b-spline")                             d.basis = CurveBasis::BSpline;
+        else if (v == "catmull_rom" || v == "catmull-rom" || v == "catmullrom") d.basis = CurveBasis::CatmullRom;
+    }
+    if (const ftsl::Stmt* sg = top.find("segments")) {
+        if (!sg->val.words.empty()) {
+            const int k = std::atoi(sg->val.words[0].c_str());
+            d.subdiv = (k < 1) ? 1 : (k > 256 ? 256 : k);
+        }
+    }
+    d.alpha = top.alpha();
+    return d;
+}
+// The polyline the renderer will produce for this leaf, in the node's own coordinates. Empty
+// when the control points cannot form a valid curve in this basis (bezier wants 3k+1, bspline
+// at least 4) -- the caller falls back to the control polygon and the point count is visibly
+// the reason, which is a better diagnosis than a silently missing strand.
+inline void leafPolyline(const Node& n, const DrawBasis& db, std::vector<Vec3>& out) {
+    out.clear();
+    const int np = (int)n.pts.size();
+    if (np < 2) return;
+    std::vector<Vec3> cp; cp.reserve((size_t)np);
+    for (const Pt& p : n.pts) cp.push_back(p.p);
+    if (curveSpanCount(db.basis, np) <= 0) return;
+    std::vector<double> radii((size_t)np, 1e-4);      // positions do not depend on radius
+    std::vector<CurveSeg> segs;
+    const int ns = tessellateCurve(cp, radii, db.basis, db.subdiv, 0, 0, segs, db.alpha);
+    if (ns <= 0) return;
+    out.reserve((size_t)ns + 1);
+    out.push_back(segs[0].p0);
+    for (int k = 0; k < ns; ++k) out.push_back(segs[(size_t)k].p1);
+}
+
 inline int levelOf(Model& m, const Node& n, int depth = 0) {
     if (depth > 32) return 0;
     if (n.ref) { Node* d = findDef(m, n.name); return d ? levelOf(m, *d, depth + 1) : 0; }

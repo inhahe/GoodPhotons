@@ -4668,7 +4668,12 @@ guides and checks `-dumpcurves` is byte-identical each time.
 **Hierarchy (0.331.0).** **Ctrl-click** curves in the tree to select several (they show a `*`),
 then **G** (or the button) groups them into a new curve of curves that references them by name
 (`curve "curve_N" { curve "a"  curve "b" ... }`, appended to the file so every child is defined
-above it), one level up, the next colour. With a curve of curves selected, the Edit section
+above it), one level up, the next colour. **"One level up" is structural, not incremental** — a
+level is a node's height in the tree, and the new node has no `count`, so it is a pass-through
+group and your curves still render as themselves. Typing a `count` into it is what changes that,
+and it is not additive: the children stop being output and become the control cage the count
+samples along (FTSL §8.6). The node panel states which of the two a selected node is doing, in
+those words, above the `count` field — because `count` is the field that switches it. With a curve of curves selected, the Edit section
 edits what places instances along its path: `count`, `closed`, `spline`
 (uniform / centripetal / chordal), a constant `density` (strands per metre) and `density_at t rho`
 keys (each key is drawn as a tick on the path at its arc-length fraction, sized by its rho); the
@@ -4681,6 +4686,16 @@ different strand counts under a `count`), the Edit section says so in the loader
 depth works the same way: a curve of rings of guides is three colours and three levels of `count`.
 `ftrace -in <scene> -groom-check` compares that preview with the loader's records for every named
 curve of a scene (`tools/groom_rig.py` runs it per scene and for Alice).
+
+**Curve shape in the pane (0.345.0).** A leaf curve is drawn as the polyline the renderer will
+actually tessellate — through `tessellateCurve` itself, so the preview cannot drift from the
+render — with its control polygon kept as a faint hint when `points` is on. It used to be drawn as
+that polygon alone, i.e. straight segments between `point`s, which is the one shape no render
+produces: the default basis is `catmull_rom` at `segments 4`, and on a 4-point curve with an
+ordinary bend the rendered strand departs from its control polygon by **3.9 % of the curve's
+span** (measured with `-dumpcurves`, which turns those 4 points into 13). A curve *of* curves drew
+its path through `catmullRomAt` and so always looked right, which is why the straightness read as
+a property of the level rather than of the drawing code.
 
 **Fur and render (0.332.0).** The Fur section lists every `fur` block with the numbers of the
 last load and its statements, each editable as text (`count 15000`, `radius 0.00005`, `guides
