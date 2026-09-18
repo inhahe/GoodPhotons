@@ -68,6 +68,25 @@
 // with roots pinned throughout. The fixed point is where gravity balances stiffness and
 // contact, which is the "equilibrium" asked for, reached without a dt to tune.
 //
+// THE DEFAULTS ARE MEASURED, not guessed (tools/settle_rig.py + scraps/sweep_settle.py on
+// Alice; baseline 72.67 % of segments overlapping, median depth 66.4 um):
+//
+//   stiffness   overlapping   depth     groom moved (mean/max), segment is 1.47 mm
+//      0.40       63.12 %    57.1 um      0.250 / 1.361 mm
+//      0.20       60.04 %    55.4 um      0.518 / 2.774 mm
+//      0.05       55.11 %    51.6 um      1.629 / 6.316 mm   <- default
+//      0.00       52.24 %    50.9 um      3.463 / 9.048 mm   (fails the groom-survives guard)
+//
+// `stiffness` is the whole trade: it buys the authored silhouette back at the cost of leaving
+// overlaps in. 0.05 is the lowest setting whose displacement still passes the rig's
+// groom-survives guard (mean under two segment lengths). Separation slack 1.8 likewise:
+// 1.25 -> 61.99 %, 1.8 -> 60.04 %, 2.5 -> 58.62 %, but the depth statistic gets steadily
+// WORSE as the slack grows (51.5 -> 55.4 -> 63.5 um) because a larger target puts more pairs
+// in violation and spreads the effort, so 2.5 is buying the headline with the other metric.
+//
+// Iterations are NOT the limiter and raising them is wasted: 150 sweeps gains 0.2 points over
+// 60 (59.82 vs 60.04 %). The solver converges; what is left is a genuine constraint conflict.
+//
 // DETERMINISM IS A HARD REQUIREMENT, not a nicety: the CPU and CUDA backends must trace
 // byte-identical geometry, and a flyby re-loads the scene per frame. So the separation pass is
 // ONE-SIDED — segment i accumulates only into itself, scanning every neighbour j — which costs
@@ -91,9 +110,9 @@ struct Params {
     bool   on        = false;
     int    iters     = 60;      // projection sweeps
     double droop     = 0.5;     // gravity injected per sweep, as a fraction of 0.1 % of the groom's diagonal
-    double stiffRoot = 0.60;    // hold to the authored shape at the root ...
-    double stiffTip  = 0.15;    // ... and at the tip
-    double sepScale  = 1.0;     // separation target as a multiple of (r_i + r_j); 0 disables
+    double stiffRoot = 0.05;    // hold to the authored shape at the root ...
+    double stiffTip  = 0.01;    // ... and at the tip  (both MEASURED, see the table below)
+    double sepScale  = 1.8;     // separation target as a multiple of (r_i + r_j); 0 disables
     double margin    = 0.0;     // extra clearance held against colliders
     int    maxNbr    = 32;      // neighbour-list cap per segment (memory bound)
     int    refresh   = 10;      // rebuild the neighbour list every N sweeps (0 = once only)

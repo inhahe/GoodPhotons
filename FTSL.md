@@ -2136,12 +2136,17 @@ all the same pool of segments. There is at most one per scene (the last wins).
 ```
 settle {
     iterations 60          # projection sweeps (default 60)
-    stiffness  0.20        # hold to the AUTHORED shape, at the root (default 0.60)
-    stiffness_tip 0.04     # ... and at the tip (default: stiffness / 4)
+    stiffness  0.05        # hold to the AUTHORED shape, at the root (default 0.05)
+    stiffness_tip 0.01     # ... and at the tip (default: stiffness / 4)
     droop      0.5         # gravity injected per sweep (default 0.5; 0 = no gravity)
-    separation 1.0         # keep strands (r_i + r_j) x this far apart (default 1; 0 = off)
+    separation 1.8         # target (r_i + r_j) x this apart (default 1.8; 0 = off)
+    refresh    10          # rebuild the contact list every N sweeps (default 10; 0 = once)
+    max_step   1.0         # per-sweep separation cap, in fiber radii (default 1)
     collide    "head"      # optional: a named mesh group to stay outside of, repeatable
     margin     0.0002      # extra clearance held against colliders (authored units)
+    volume     0           # collective density push (default 0 = off; see known-issues)
+    packing    0.30        # ... the volume fraction above which it expands
+    cell       0           # ... its grid cell in metres (0 = 8 x mean fiber radius)
 }
 ```
 
@@ -2173,14 +2178,29 @@ stiffness and contact.
   uses to tell the solver's effect from the scene merely reloading.
 - `ftrace -stop` is honoured mid-settle (it aborts the load rather than leaving half a groom).
 
-**Status, measured, so this is not oversold (`tools/settle_rig.py` on Alice, 60 sweeps).** The pass
-*reduces* interpenetration but does not yet eliminate it: median overlap depth 66.4 -> 51.5 µm and
-median clearance -0.053 -> -0.016 mm, while the share of segments with *any* overlap moves only
-72.67 % -> 70.09 % — because that share is a binary threshold and almost everything ends up still
-*just* overlapping. Turning stiffness and gravity off entirely barely changes the result, so the
-limiter is not the shape constraint: a mean-of-contact-directions push cancels for a fiber
-overlapped on all sides, and cannot expand a bundle. The collective (density-gradient) term that
-can is not built yet — see **HAIR-PENETRATION** in `known-issues.md`.
+**Status, measured, so this is not oversold (`tools/settle_rig.py` on Alice, shipped defaults).**
+The pass *reduces* interpenetration substantially but does not eliminate it: the share of segments
+with *any* overlap goes **72.67 % -> 55.33 %**, median overlap depth 66.4 -> 51.8 µm, and median
+clearance -0.053 -> -0.010 mm, for a mean displacement of 1.58 mm against a 1.47 mm segment. The
+rig's headline check is written to demand better than that and is **left failing**.
+
+**`stiffness` is the whole trade, and the defaults sit at the measured knee** (baseline 72.67 %):
+
+| `stiffness` | overlapping | depth | groom moved, mean / max |
+|---|---|---|---|
+| 0.40 | 63.12 % | 57.1 µm | 0.250 / 1.361 mm |
+| 0.20 | 60.04 % | 55.4 µm | 0.518 / 2.774 mm |
+| **0.05** (default) | **55.11 %** | 51.6 µm | 1.629 / 6.316 mm |
+| 0.00 | 52.24 % | 50.9 µm | 3.463 / 9.048 mm |
+
+Raise it to protect a sculpted silhouette and accept more overlap; lower it to relax further. 0.00
+scores best and is *not* the default because its displacement (over two segment lengths) is a
+visibly different groom. Two more things the sweeps settled: **`iterations` is not the limiter** —
+150 sweeps gains 0.2 points over 60, so the solver converges and what remains is a constraint
+conflict, not a budget; and **`separation` slack past ~1.8 is a false economy** — 2.5 reaches
+58.62 % but drives the *depth* statistic from 55.4 to 63.5 µm, because a larger target puts more
+pairs in violation and spreads the effort thinner. See **HAIR-PENETRATION** in `known-issues.md`
+for the four hypotheses this cost, three of which were wrong.
 
 ## 9. UV wraps on native primitives and meshes
 

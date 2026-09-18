@@ -35,7 +35,10 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
-OUT = os.path.join("scraps", "_settlerig")
+# PID-suffixed, because two concurrent runs sharing this directory AND the alice/_rig_*.ftsl
+# scene names silently interleave their dumps into one incoherent set -- which happened, and
+# produced a "result" that was half one configuration and half another.
+OUT = os.path.join("scraps", "_settlerig_%d" % os.getpid())
 EXE = os.path.join(ROOT, "ftrace.exe")
 BASE = "alice/alice_real_hair.ftsl"
 TEMP = []          # scenes written into alice/, removed on the way out
@@ -49,7 +52,7 @@ def scene(tag, settle_body):
     living anywhere else is one path rule away from silently loading a different groom -- and a
     rig that measures a different scene than it thinks is worse than no rig.
     """
-    p = os.path.join("alice", "_rig_" + tag + ".ftsl")
+    p = os.path.join("alice", "_rig_%d_%s.ftsl" % (os.getpid(), tag))
     txt = 'include "alice_real_hair.ftsl"\n'
     if settle_body is not None:
         txt += "settle {\n%s\n}\n" % settle_body
@@ -100,10 +103,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--iters", type=int, default=60)
-    ap.add_argument("--stiff", type=float, default=0.20)
-    ap.add_argument("--stiff-tip", type=float, default=0.04)
-    ap.add_argument("--droop", type=float, default=0.5)
-    ap.add_argument("--sep", type=float, default=1.0)
+    # Default to None so the rig emits ONLY the keys it is asked to override and
+    # otherwise exercises the ENGINE defaults. A rig that repeats the shipped numbers
+    # silently stops testing them the moment one of them changes.
+    ap.add_argument("--stiff", type=float, default=None)
+    ap.add_argument("--stiff-tip", type=float, default=None)
+    ap.add_argument("--droop", type=float, default=None)
+    ap.add_argument("--sep", type=float, default=None)
     args = ap.parse_args()
     ok = True
 
@@ -117,8 +123,11 @@ def main():
     os.makedirs(OUT)
     from hair_penetration import measure
 
-    body = ("    iterations %d\n    stiffness %g\n    stiffness_tip %g\n    droop %g\n    separation %g"
-            % (args.iters, args.stiff, args.stiff_tip, args.droop, args.sep))
+    opt = [("iterations", args.iters), ("stiffness", args.stiff),
+           ("stiffness_tip", args.stiff_tip), ("droop", args.droop),
+           ("separation", args.sep)]
+    body = chr(10).join("    %s %g" % (k, v) for k, v in opt if v is not None)
+
 
     print("  loading Alice three times (no settle / zero sweeps / %d sweeps) ..." % args.iters)
     sys.stdout.flush()

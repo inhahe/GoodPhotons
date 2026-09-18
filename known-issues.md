@@ -4887,6 +4887,46 @@ value is untuned — 1.25 was the first number tried, and a sweep (with iteratio
 need to be larger than 60) is the next step. The sidecar cache is still needed before any flyby uses
 this.
 
+### 0.348.0 — the tuning sweeps, and a null result that expired
+
+Shipped defaults are now `separation 1.8`, `stiffness 0.05` / `stiffness_tip 0.01`, `iterations 60`,
+`refresh 10`. Clean rig run: **72.67 % -> 55.33 %**, depth 66.4 -> 51.8 µm, clearance -0.053 ->
+-0.010 mm, displacement 1.58 mm mean against a 1.47 mm segment. Both controls pass. The headline
+check still FAILS and is still left failing.
+
+**Iterations are not the limiter.** 150 sweeps gains 0.2 points over 60 (59.82 vs 60.04 %). The
+solver reaches its fixed point; what is left is a genuine conflict between inextensibility, root
+pinning, the shape spring and separation, not an insufficient budget. Worth knowing before anyone
+tries to buy quality with time.
+
+**Slack past ~1.8 is a false economy.** 1.25 -> 61.99 %, 1.8 -> 60.04 %, 2.5 -> 58.62 %, but the
+depth statistic goes 51.5 -> 55.4 -> 63.5 µm over the same range: a larger target puts more pairs in
+violation and spreads the effort, so the headline improves while the thing it is a proxy for gets
+worse. A good reminder that two metrics disagreeing is information, not noise.
+
+**The stiffness curve, which is the real trade** (see the table in FTSL §8.8): 0.40 -> 63.12 %,
+0.20 -> 60.04 %, 0.05 -> 55.11 %, 0.00 -> 52.24 %. Displacement runs 0.25 -> 3.46 mm across it.
+0.05 is the lowest setting whose displacement still passes the groom-survives guard.
+
+**A NULL RESULT THAT EXPIRED, and the lesson.** At 0.346.0 I measured zero stiffness and concluded
+the shape spring was not the limiter — the result barely moved. That was true *at the time*, and it
+stopped being true the moment the contact-ranking bug was fixed: with the solver pushing the wrong
+pairs, relaxing the spring freed it to do nothing useful; with the right pairs, the spring is the
+binding constraint (52.24 % at stiffness 0 against 63.12 % at 0.40). **A null is conditional on the
+rest of the system being correct, and it silently expires when something upstream is fixed.** Old
+nulls should be re-run after any real fix rather than cited.
+
+**A self-inflicted measurement error worth recording.** The first validation of these defaults read
+69.57 %, exactly the pre-slack number, and the engine was not at fault: two rig runs were in flight
+at once, both writing `scraps/_settlerig/` and `alice/_rig_*.ftsl`, so their dumps interleaved into
+one incoherent set that was half one configuration and half another. `tools/settle_rig.py` now
+suffixes both with its PID. Concurrent runs sharing an output directory is a way to manufacture a
+confident wrong number from correct code.
+
+**Still open:** the sidecar cache (the settle costs ~2 min on 1.2 M segments and a flyby re-loads
+per frame), and whatever would take this below 55 % — which, given the convergence result, means
+changing the constraint set rather than running it longer.
+
 ### OPEN (2026-09-16): `-direct-only` is silently ignored by mode D (and any non-backward mode)
 
 `g_directOnly` is consulted by the backward tracer (modes R/W, the explorer's refinement
