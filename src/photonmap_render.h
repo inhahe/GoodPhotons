@@ -125,6 +125,9 @@ inline bool hairNeeOn() {
 // rather than at the camera's single wavelength. `-no-spec-nee` restores the scalar term;
 // the switch itself lives in lighttree.h so the CUDA upload reads the same object.
 inline bool specNeeOn() { return lt::gSpecNee; }
+// The fiber half of the same idea, off by default -- see the note in lighttree.h for the
+// measurements that put it there rather than on.
+inline bool specNeeHairOn() { return lt::gSpecNee && lt::gSpecNeeHair; }
 inline int gatherAreaSamples() {
     static const int m = [] {
         const char* e = std::getenv("FTRACE_GATHERAREA");
@@ -1676,9 +1679,25 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 // the same split here. The photon map is untouched (fibers are never deposited
                 // on), and light that scatters off fibers onto a surface is in the map already.
                 if (hairNeeOn()) {
-                    L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                         * (thr * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng, nullptr,
-                                                 BackwardRenderer::GiCtx{}, &hs, nullptr, nullptr));
+                    bool didSpec = false;
+                    if (specNeeHairOn()) {
+                        // SPECTRAL (0.343.0): one shadow ray over the SpecThr grid, so a blonde
+                        // fiber under a warm light stops painting each sample one colour.
+                        double lamG[SpecThr::K], ratG[SpecThr::K], xyz[3] = {0, 0, 0};
+                        for (int k = 0; k < SpecThr::K; ++k) {
+                            lamG[k] = SpecThr::lamOf(k);
+                            ratG[k] = sthr.ratio(lamG[k]);
+                        }
+                        const double dLam = (LAMBDA_MAX - LAMBDA_MIN) / (double)SpecThr::K;
+                        const double* sigB = hairSigmaBins<SpecThr::K, &SpecThr::lamOf>(scene, m, h);
+                        didSpec = bwNee.neeLightSpecHair(scene, h, m, hs, lamG, ratG, SpecThr::K,
+                                                         dLam, lambda, thr, sigB, rng, xyz);
+                        if (didSpec) L += Vec3(xyz[0], xyz[1], xyz[2]);
+                    }
+                    if (!didSpec)
+                        L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                             * (thr * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng, nullptr,
+                                                     BackwardRenderer::GiCtx{}, &hs, nullptr, nullptr));
                     hairArrival = true;
                 }
                 double pdfH = 0.0, fv = 0.0;

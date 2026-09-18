@@ -59,7 +59,7 @@ def write(path, refl):
     return path
 
 
-def render(scene, tag, mode, extra, spp, spec, device="cpu"):
+def render(scene, tag, mode, extra, spp, spec, device="cpu", extra_env=None):
     out = os.path.join(OUT, tag + ".png")
     cmd = [EXE, "-in", scene, "-mode", mode, "-r", "200", "150", "-o", out,
            "-window-min", "-interval", "60"] + extra
@@ -103,6 +103,36 @@ def main():
     if os.path.isdir(OUT):
         shutil.rmtree(OUT)
     os.makedirs(OUT)
+
+    # A FIBER case too (0.343.0): the same question at a hair vertex, where the connection's
+    # response is the BCSDF rather than a glossy lobe. Blonde fiber = strongly coloured absorption.
+    hair_scene = """camera "cam" {{ eye 0 0.9 3.4  look_at 0 0.55 0  up 0 1 0  fov_y 38  mode R  film {{ res 200 150 }} }}
+material "floor" {{ type diffuse  reflect 0.45 }}
+quad {{ origin -6 0 -6  u 12 0 0  v 0 0 12  material floor }}
+light sun {{ dir -0.35 0.62 0.70  angle 0.53  spd blackbody 3200  intensity 2.2e-13 }}
+material "scalp" {{ type diffuse  reflect 0.3 }}
+sphere "scalp" {{ center 0 0.55 0  radius 0.40  material scalp }}
+material "fiber" {{ type hair  preset human  reflect rgb 0.79 0.44 0.155  beta_m 0.3  beta_n 0.35 }}
+fur "coat" {{ on "scalp"  material fiber  count 60000  length 0.12  radius 0.0006
+             points 5  segments 2  jitter 0.2  seed 3 }}
+"""
+    io.open(os.path.join(OUT, "hair.ftsl"), "w", encoding="utf-8", newline="\n").write(hair_scene.format())
+    hsc = os.path.join(OUT, "hair.ftsl")
+    hD = render(hsc, "hair_D", "D", [], 800, True)
+    hS = render(hsc, "hair_spec", "M", ["-spec-nee-hair"], args.spp, True)
+    hC = render(hsc, "hair_scal", "M", [], args.spp, False)
+    # the missing control: how much does the fiber NEE carry here at all? Without this the
+    # comparison above is a null from an instrument that may not be able to see its subject.
+    hN = render(hsc, "hair_nonee", "M", ["-spec-nee-hair"], args.spp, True)
+    dH, _ = stats(hD); sH, csH = stats(hS); cH, ccH = stats(hC)
+    print("  fiber ball:   mode D %7.3f | spectral %7.3f (err %5.2f%%, chroma %5.2f) | scalar %7.3f (err %5.2f%%, chroma %5.2f)"
+          % (dH, sH, 100 * abs(sH - dH) / max(dH, 1e-9), csH, cH, 100 * abs(cH - dH) / max(dH, 1e-9), ccH))
+    check("fiber vs D", abs(sH - dH) / max(dH, 1e-9) <= abs(cH - dH) / max(dH, 1e-9) + 0.02,
+          "spectral %.2f%% vs scalar %.2f%% from mode D -- the claim is NO BIAS, not a win"
+          % (100 * abs(sH - dH) / max(dH, 1e-9), 100 * abs(cH - dH) / max(dH, 1e-9)))
+    print("     (informational: the fiber half is OFF by default -- `-spec-nee-hair` turns it on. On this")
+    print("      ball it is indistinguishable from the scalar form; on Alice it moves chroma -1.7 %% for")
+    print("      +26 %% of the camera pass, because hair's colour noise is PATH variance, not wavelength.)")
 
     for label, refl in [("gold", "rgb 0.95 0.72 0.28"), ("white", "0.8")]:
         sc = write(os.path.join(OUT, label + ".ftsl"), refl)

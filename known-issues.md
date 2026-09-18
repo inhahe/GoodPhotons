@@ -29616,6 +29616,19 @@ GPU spectral and GPU scalar came out **byte-identical** on gallery_rain. The rig
 GPU against GPU. The general rule: *a cross-backend comparison cannot validate a within-backend
 change* — whatever else it measures will cover for the thing being tested.
 
-Still single-wavelength: both backends' **HAIR-NEE** term (0.334.0), for the same reason and with
-the same fix available; a fiber needs its BCSDF rebuilt per wavelength, which `hair::LobeAngular` /
-`fFromLobes` (0.336.0) already makes cheap.
+**The FIBER half is built and DEFAULT OFF (0.343.0, `-spec-nee-hair`)** — the interesting part is
+why. It works the same way, with one extra step: `emitterGeom` folds the fiber's own response into
+the geometric weight using the HairShade it was handed, which was built at the camera's wavelength,
+so that response is divided out and re-applied per wavelength. The ratio is exactly the lobe
+attenuation's, because `hair::lobeAngular` fixes the angular half for this connection's (wo, wi) and
+`fFromLobes` re-evaluates at any absorption — the angular terms cancel identically, and a fiber with
+a medulla (no such factorisation) falls back to the scalar term.
+
+But it does not pay for itself. On Alice's head at 24 spp it moves the hair's chroma residual by
+**-1.7 %** and its mean by +5 %, for **+26 %** of the camera pass; the fiber ball in
+`tools/specnee_rig.py` cannot distinguish it from the scalar form at all (123.99 vs 124.01, chroma
+20.70 vs 20.69). That is consistent with what 0.333.0 already measured: hair's colour noise is the
+walk's **path variance** through the mass — x10 photons did not move it either — not the
+connection's wavelength. A glossy vertex is one directly lit surface where the connection IS the
+answer, which is why that half wins big and this one does not. Left in, behind a flag, rather than
+defaulted on at a 26 % cost for a benefit that could not be demonstrated.

@@ -19154,6 +19154,8 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-no-glossy-nee")) { lt::gGlossyNee = false; }
         else if (!std::strcmp(argv[i], "-no-spec-nee"))   { lt::gSpecNee   = false; }
         else if (!std::strcmp(argv[i], "-spec-nee"))      { lt::gSpecNee   = true;  }
+        else if (!std::strcmp(argv[i], "-spec-nee-hair")) { lt::gSpecNeeHair = true; }
+        else if (!std::strcmp(argv[i], "-no-spec-nee-hair")) { lt::gSpecNeeHair = false; }
         // M-GATHERAREA prototype: probe samples for the gather footprint (0 = off, the default).
         // Routed through the environment because gatherCoverage is reached from a header with no
         // access to main.cpp's statics, exactly as -mstats is.

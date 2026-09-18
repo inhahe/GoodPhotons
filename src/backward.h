@@ -1249,6 +1249,65 @@ struct BackwardRenderer {
         }
     }
 
+    // SPECTRAL surface NEE at a FIBER vertex (0.343.0; the glossy twin is above). Same loop,
+    // same rng order, one shadow ray. `emitterGeom` folds the fiber's own response
+    // (PI*hairFCos) into `w` using the HairShade it is handed, which was built at `lambdaCam`;
+    // that response is divided out here and re-applied per wavelength. The ratio is exactly the
+    // lobe attenuation's, because `lobeAngular` fixes the angular half for this connection's
+    // (wo, wi) and `fFromLobes` re-evaluates at any absorption -- the angular terms cancel
+    // identically. Returns false if the fiber cannot be factorised that way (a medulla) or if the
+    // camera-wavelength response is too small to divide by, and the caller falls back to scalar.
+    // `sigBins` (optional) is the fiber's absorption already tabulated at `lam` -- the caller owns
+    // that cache because the grid type lives above this header. Null means invert per bin.
+    bool neeLightSpecHair(const Scene& scene, const Hit& h, const Material& m, const HairShade& hs,
+                          const double* lam, const double* thrRatio, int K, double dLam,
+                          double lambdaCam, double thrScalar, const double* sigBins,
+                          Pcg32& rng, double* xyz) const {
+        if (hs.b.hasMedulla) return false;
+        const Vec3 ngo = orientedGeoN(h);
+        const bool med = !scene.media.empty();
+        const double sigCam = hairSigmaAAt(scene, m, h, lambdaCam);
+        const EmitterDraw draw = pickEmitters(scene, h.p, &h.n, rng);
+        for (int di = 0; di < draw.n; ++di) {
+            const int e = draw.emitter(di);
+            const double selW = draw.weight(di);
+            if (selW <= 0.0) continue;
+            const Emitter& em = scene.emitters[e];
+            const bool uv = emitterNeedsUV(em);
+            double u1 = 0.0, u2 = 0.0;
+            if (uv) { u1 = rng.uniform(); u2 = rng.uniform(); }
+            double dist = 0.0, w = 0.0;
+            Vec3 wiConn{0, 0, 0};
+            if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w, wiConn, &hs, nullptr, nullptr))
+                continue;
+            if (!(w > 0.0)) continue;
+            // The angular half of the BCSDF for THIS connection, once.
+            hair::LobeAngular la;
+            if (!hair::lobeAngular(hs.b, hs.woLocal, hair::toLocal(hs.fr, wiConn), la)) return false;
+            const double fCam = hair::fFromLobes(la, sigCam);
+            if (!(fCam > 1e-300)) continue;      // nothing to divide out; this sample contributes ~0
+            double Tr[64];
+            const int KK = (K < 64) ? K : 64;
+            for (int k = 0; k < KK; ++k) Tr[k] = 1.0;
+            if (med)
+                Renderer::mediaTransmittanceSpec(scene, h.p + ngo * 1e-6, wiConn, dist,
+                                                 lam, KK, Tr, rng);
+            const double gWeight = w * selW * thrScalar * dLam / PI;   // rho/PI with rho == 1
+            if (!(gWeight > 0.0)) continue;
+            for (int k = 0; k < KK; ++k) {
+                const double sig = sigBins ? sigBins[k] : hairSigmaAAt(scene, m, h, lam[k]);
+                const double resp = hair::fFromLobes(la, sig) / fCam;   // the angular half cancels
+                if (!(resp > 0.0)) continue;
+                const double v = gWeight * thrRatio[k] * resp * em.spdFn(lam[k]) * Tr[k];
+                if (!(v > 0.0)) continue;
+                xyz[0] += cieX(lam[k]) * v;
+                xyz[1] += cieY(lam[k]) * v;
+                xyz[2] += cieZ(lam[k]) * v;
+            }
+        }
+        return true;
+    }
+
     // Hero-wavelength surface NEE: one shared visibility sample per emitter (identical
     // rng to neeLight), evaluated for all `nUp` active wavelengths. Accumulates
     // thr[i]·(rho[i]/PI)·SPD(λ_i)·invPdf[i]·w into L[i]. Only called on the fog-free

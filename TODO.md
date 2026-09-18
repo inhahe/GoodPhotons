@@ -316,8 +316,13 @@ first); the aggregate-medium tier is backward-only today and would need a mode-M
   **The GLOSSY half is built on BOTH backends** (host 0.341.0, device 0.342.0) -- one shadow ray,
   evaluated over the SpecThr grid. `tools/specnee_rig.py`: no bias against mode D, chroma halved,
   GPU and CPU agree. On gallery_rain's gyroid the chroma fell 19.5 -> 13.8 and the mean went 0.79 ->
-  0.91 of mode D, with the two backends 0.6 % apart. Cost +16 % host / +23 % device. Still to do:
-  the FIBER half on both, which `hair::LobeAngular` already makes cheap.
+  0.91 of mode D, with the two backends 0.6 % apart. Cost +16 % host / +23 % device.
+  **The FIBER half is built too (0.343.0) but DEFAULT OFF** (`-spec-nee-hair`): measured -1.7 %
+  chroma and +5 % mean on Alice's hair for +26 % of the camera pass, and indistinguishable from the
+  scalar form on the rig's fiber ball. Hair's colour noise is path variance through the mass (0.333.0
+  measured that: x10 photons did not move it), not the connection's wavelength -- so it is kept
+  behind a flag rather than charged to the flyby. The DEVICE fiber half was not written, for the
+  same reason.
   (Machine note: CUDA 13.4 was installed on this box at 14:53-15:03 today -- that is what filled
   D: -- and a shell older than the install lacks `CUDA_PATH_V13_4`, which the regenerated
   project's `CUDA 13.4.props` needs: "The CUDA Toolkit directory '' does not exist". Set it, or

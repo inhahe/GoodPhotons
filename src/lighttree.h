@@ -72,6 +72,14 @@ inline bool   gGlossyNee = true;  // -no-glossy-nee: the pre-0.266 estimator, rn
 // beside gGlossyNee, because both the host gather and the CUDA upload have to read the same
 // object: a policy read from two places is a divergence waiting to happen.
 inline bool   gSpecNee   = true;  // -no-spec-nee: the pre-0.341.0 single-wavelength NEE term
+// The same treatment at a FIBER vertex (0.343.0). DEFAULT OFF, and the reason is measurement
+// rather than doubt about the code: on Alice's head at 24 spp it moves the hair's chroma
+// residual by -1.7 % and its mean by +5 % for +26 % of the camera pass, and the fiber case in
+// tools/specnee_rig.py cannot separate it from the scalar form at all. Hair's colour noise is
+// dominated by the walk's PATH variance through the mass -- measured back at 0.333.0, where
+// x10 photons did not move it either -- not by the connection's wavelength, which is exactly
+// why the glossy half (a single directly-lit surface) wins big and this one does not.
+inline bool   gSpecNeeHair = false;  // -spec-nee-hair: spectral NEE at fiber vertices too
 }
 
 // One node of the light BVH. Interior nodes carry two child indices; leaves carry
