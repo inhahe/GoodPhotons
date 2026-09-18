@@ -175,3 +175,6 @@ gallery/
 
 # Third-party reference binary; never published from the staging copy
 reference/*.exe
+
+# settle sidecar caches (settled strand positions, regenerated on demand)
+*.settlecache

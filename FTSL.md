@@ -2147,6 +2147,7 @@ settle {
     volume     0           # collective density push (default 0 = off; see known-issues)
     packing    0.30        # ... the volume fraction above which it expands
     cell       0           # ... its grid cell in metres (0 = 8 x mean fiber radius)
+    cache      off         # or a path; default is <this file>.settlecache
 }
 ```
 
@@ -2176,6 +2177,16 @@ stiffness and contact.
   frame; `tools/settle_rig.py` checks byte-identity of two runs as a standing test.
 - **`settle { iterations 0 }` is byte-identical to no block at all**, which is the control the rig
   uses to tell the solver's effect from the scene merely reloading.
+- **It is cached, and has to be.** The settle costs ~2 minutes on Alice's 1.2 M segments, a
+  `camera_curve` flyby re-loads the scene once per frame, and the CPU and CUDA backends each load it
+  too — so without a cache the same deterministic answer would be recomputed hundreds of times. The
+  settled positions are written to `<file>.settlecache` beside the file the `settle` block was
+  written in (so a groom in its own `include` caches next to itself), keyed on a hash of **every
+  solver parameter and the authored geometry**: change a parameter, edit a strand or change the
+  strand count and it re-solves. `cache off` disables it, `cache "<path>"` redirects it. The file is
+  written to a temporary name and renamed, because the key hashes the *inputs* and so could not
+  detect a payload truncated by an interrupted write. Verified: a hit is byte-identical to the solve
+  it replaces, and both a parameter change and a geometry change miss.
 - `ftrace -stop` is honoured mid-settle (it aborts the load rather than leaving half a groom).
 
 **Status, measured, so this is not oversold (`tools/settle_rig.py` on Alice, shipped defaults).**

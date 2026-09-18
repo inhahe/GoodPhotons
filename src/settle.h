@@ -100,6 +100,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <atomic>
+#include <cstdio>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -121,6 +123,7 @@ struct Params {
     double cellSize  = 0.0;     // density-grid cell in metres; 0 = auto (8 x mean fiber radius)
     double maxStep   = 1.0;     // per-sweep separation displacement cap, in fiber radii
     std::vector<std::string> collide;   // mesh-group names to stay outside of
+    std::string cachePath;              // sidecar for the settled positions; empty = no cache
 };
 
 namespace detail {
@@ -201,6 +204,18 @@ inline Vec3 closestOnTri(const Vec3& p, const Vec3& a, const Vec3& b, const Vec3
     return a + ab * (vb * den) + ac * (vc * den);
 }
 
+// ---- the sidecar cache -------------------------------------------------------------------
+// FNV-1a over every input that can change the answer. Not a cryptographic hash and does not need
+// to be: the failure mode is a stale groom, and the payload carries its own particle count and a
+// magic as a second gate.
+inline uint64_t fnv(uint64_t h, const void* data, size_t n) {
+    const unsigned char* b = (const unsigned char*)data;
+    for (size_t i = 0; i < n; ++i) { h ^= (uint64_t)b[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+static const uint64_t kCacheMagic = 0x46545253544c4531ull;   // "FTRSTLE1"
+
 } // namespace detail
 
 // Runs the settle in place. Returns false only if `ftrace -stop` cancelled it mid-way (the
@@ -243,6 +258,45 @@ inline bool run(Scene& sc, const Params& p, std::string& report) {
             const double t = (n > 0) ? (double)k / (double)n : 0.0;
             stiff[i] = (float)(p.stiffRoot + (p.stiffTip - p.stiffRoot) * t);
             if (k < n) rlen[i] = length(pos[i + 1] - pos[i]);
+        }
+    }
+
+    // ---- 1b. the cache key, and a hit short-circuits the whole solve ----------------------
+    uint64_t key = 1469598103934665603ull;
+    {
+        const double pv[] = { (double)p.iters, p.droop, p.stiffRoot, p.stiffTip, p.sepScale,
+                              p.margin, (double)p.maxNbr, p.volume, p.packing, p.cellSize,
+                              p.maxStep, (double)p.refresh };
+        key = detail::fnv(key, pv, sizeof pv);
+        for (const std::string& c : p.collide) key = detail::fnv(key, c.data(), c.size());
+        key = detail::fnv(key, pos.data(), pos.size() * sizeof(Vec3));   // the AUTHORED geometry
+        key = detail::fnv(key, rad.data(), rad.size() * sizeof(double));
+    }
+    if (!p.cachePath.empty()) {
+        std::FILE* f = std::fopen(p.cachePath.c_str(), "rb");
+        if (f) {
+            uint64_t magic = 0, k = 0, n = 0;
+            const bool hdr = std::fread(&magic, sizeof magic, 1, f) == 1 &&
+                             std::fread(&k, sizeof k, 1, f) == 1 &&
+                             std::fread(&n, sizeof n, 1, f) == 1;
+            if (hdr && magic == detail::kCacheMagic && k == key && n == (uint64_t)nP &&
+                std::fread(pos.data(), sizeof(Vec3), nP, f) == nP) {
+                std::fclose(f);
+                for (size_t c = 0; c < nC; ++c) {
+                    const Curve& cu = sc.curves[c];
+                    for (int kk = 0; kk < cu.segCount; ++kk) {
+                        const size_t i = (size_t)first[c] + (size_t)kk;
+                        CurveSeg& sg = sc.curveSegs[(size_t)cu.firstSeg + (size_t)kk];
+                        sg.p0 = pos[i]; sg.p1 = pos[i + 1];
+                    }
+                }
+                char cb[200];
+                std::snprintf(cb, sizeof cb, "%zu strand(s), %zu particle(s) restored from %s",
+                              nC, nP, p.cachePath.c_str());
+                report += cb;
+                return true;
+            }
+            std::fclose(f);
         }
     }
 
@@ -605,6 +659,23 @@ inline bool run(Scene& sc, const Params& p, std::string& report) {
     for (size_t i = 0; i < nP; ++i) {
         const double d = length(pos[i] - rest[i]);
         moved += d; movedMax = std::max(movedMax, d);
+    }
+    if (!p.cachePath.empty()) {
+        // temp-then-rename: an interrupted write must not leave a truncated cache behind, because
+        // the key hashes the INPUTS and so cannot notice a damaged payload.
+        const std::string tmp = p.cachePath + ".tmp";
+        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        if (f) {
+            const uint64_t n = (uint64_t)nP;
+            bool ok = std::fwrite(&detail::kCacheMagic, sizeof(uint64_t), 1, f) == 1 &&
+                      std::fwrite(&key, sizeof key, 1, f) == 1 &&
+                      std::fwrite(&n, sizeof n, 1, f) == 1 &&
+                      std::fwrite(pos.data(), sizeof(Vec3), nP, f) == nP;
+            std::fclose(f);
+            std::error_code ec;
+            if (ok) std::filesystem::rename(tmp, p.cachePath, ec);
+            if (!ok || ec) std::filesystem::remove(tmp, ec);
+        }
     }
     char buf[320];
     std::snprintf(buf, sizeof buf,

@@ -4923,9 +4923,17 @@ one incoherent set that was half one configuration and half another. `tools/sett
 suffixes both with its PID. Concurrent runs sharing an output directory is a way to manufacture a
 confident wrong number from correct code.
 
-**Still open:** the sidecar cache (the settle costs ~2 min on 1.2 M segments and a flyby re-loads
-per frame), and whatever would take this below 55 % — which, given the convergence result, means
-changing the constraint set rather than running it longer.
+**The sidecar cache is DONE (0.349.0).** `<file>.settlecache` beside the settle block's own file,
+keyed on an FNV-1a of every solver parameter plus the authored geometry, written temp-then-renamed
+because the key hashes the inputs and cannot detect a truncated payload. A hit is byte-identical to
+the solve it replaces; a parameter change and a geometry change both miss. `cache off` to disable.
+
+**Still open:** whatever would take this below 55 % — which, given the convergence result (150
+sweeps gains 0.2 points over 60), means changing the constraint set rather than running it longer.
+The most likely candidate is replacing the global position spring with a LOCAL shape constraint
+(per-particle rest offsets in a parallel-transported frame, TressFX-style), so a strand can slide
+sideways to clear a neighbour while keeping its authored curl — the present spring pins it to the
+exact configuration that overlaps.
 
 ### OPEN (2026-09-16): `-direct-only` is silently ignored by mode D (and any non-backward mode)
 

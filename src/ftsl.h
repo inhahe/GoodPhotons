@@ -1209,6 +1209,23 @@ public:
             sp.cellSize  = Len(dblOf(sb, "cell", sp.cellSize));
             sp.maxStep   = dblOf(sb, "max_step", sp.maxStep);
             sp.refresh   = (int)dblOf(sb, "refresh", (double)sp.refresh);
+            // The sidecar defaults to <scene>.settlecache beside the file the settle block was
+            // written in, so a groom that lives in its own include caches next to itself.
+            // `cache off` disables it; `cache "<path>"` overrides.
+            {
+                std::string cp;
+                const Stmt* cst = find(sb, "cache");
+                const bool off = cst && !cst->val.words.empty() &&
+                                 (cst->val.words[0] == "off" || cst->val.words[0] == "no" ||
+                                  cst->val.words[0] == "false" || cst->val.words[0] == "0");
+                if (cst && !cst->val.words.empty() && !off) cp = cst->val.words[0];
+                else if (!off && !sb.file.empty()) {
+                    namespace fs = std::filesystem;
+                    const fs::path f(sb.file);
+                    cp = (f.parent_path() / (f.stem().string() + ".settlecache")).string();
+                }
+                sp.cachePath = cp;
+            }
             if (sp.iters < 0 || sp.iters > 100000) { fail("settle: iterations out of range"); return false; }
             if (sp.maxNbr < 1 || sp.maxNbr > 256)  { fail("settle: max_neighbours must be 1..256"); return false; }
             for (const auto& st : sb.stmts)

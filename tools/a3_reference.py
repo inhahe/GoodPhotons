@@ -90,10 +90,19 @@ COAT_ANALYTIC = """material "coated" {{
 sphere {{ center 0 0 0  radius 1.00  material coated }}
 """
 
+# THE RIG CONTROL: a coat of index 1.0 is not a coat. No refraction, no Fresnel, no TIR, so both
+# constructions must collapse to the bare body's albedo. This tests the INSTRUMENT; the old control
+# tested a physical identity the analytic model is not claimed to satisfy, and so was measuring the
+# defect and calling it a rig failure.
+COAT_EXP_N1 = COAT_EXPLICIT.replace("ior 1.5", "ior 1.0")
+COAT_ANA_N1 = COAT_ANALYTIC.replace("ior 1.5", "ior 1.0")
+
 EXPLICIT = COMMON + BODY + COAT_EXPLICIT
 ANALYTIC = COMMON + BODY + COAT_ANALYTIC
 FURN_EXPLICIT = FURNACE + BODY + COAT_EXPLICIT
 FURN_ANALYTIC = FURNACE + BODY + COAT_ANALYTIC
+FURN_EXP_N1 = FURNACE + BODY + COAT_EXP_N1
+FURN_ANA_N1 = FURNACE + BODY + COAT_ANA_N1
 
 
 def render(tag, text, rough, spp):
@@ -168,6 +177,16 @@ def main():
         shutil.rmtree(OUT)
     os.makedirs(OUT)
 
+    # CONTROL FIRST. A rig that cannot reproduce "no index contrast means no coat" is not
+    # measuring a coat, and every number under it would be decoration.
+    cE = albedo(render("ctl_exp", FURN_EXP_N1, 0.25, args.spp))
+    cA = albedo(render("ctl_ana", FURN_ANA_N1, 0.25, args.spp))
+    print("  CONTROL (coat ior 1.0 -- not a coat): explicit %.4f  analytic %.4f  diff %+.1f %%"
+          % (cE, cA, 100.0 * (cA - cE) / max(cE, 1e-12)))
+    ctl_ok = abs(cA - cE) / max(cE, 1e-12) < 0.05
+    print("  control %s%s" % ("PASS" if ctl_ok else "FAIL  <--",
+                              "" if ctl_ok else "   the rig is not measuring a coat; nothing below is believable"))
+    print()
     print("  rough   explicit(energy, r50)      analytic(energy, r50)     energy diff   width diff"   "   albedoE albedoA  albedo diff")
     rows = []
     for rough in (0.02, 0.10, 0.25, 0.45):
@@ -185,16 +204,21 @@ def main():
     # The claim under test is that the error GROWS with body roughness -- a smooth body is the
     # identity (a3_snell.py result 1), so a reference that shows a large error at roughness 0.02
     # is measuring something else and must not be believed.
-    # The CONTROL is now read off the furnace albedo, not the sun-lit disc mean: a3_snell.py proves
-    # the coat is the exact identity for a smooth body, so a large albedo error at roughness 0.02
-    # means the rig is still measuring the wrong thing and nothing below it may be believed.
-    smooth = abs(rows[0][9])
-    rough = max(abs(r[9]) for r in rows[1:])
-    print("\n  control: at roughness %.2f the coat should be near the IDENTITY -- furnace albedo error %.1f %%"
-          % (rows[0][0], smooth))
-    print("  claim  : the error must GROW with roughness -- worst rough error %.1f %%" % rough)
-    print("\n  (a3_snell.py predicted up to -37 %% energy and -34 %% lobe width in Python;")
-    print("   this is the end-to-end check TODO item 5 asks for before any architecture.)")
+    # What the sweep actually shows, stated as the finding rather than as a pass/fail: the
+    # analytic model's albedo is nearly INDEPENDENT of body roughness (it depends on albedo, not
+    # directionality) while the explicit one falls steadily, so the two agree least for a SMOOTH
+    # body and converge as the body roughens toward the Lambertian case the formula was derived
+    # for. That is the opposite of the ordering a3_snell.py's lobe argument would suggest, and it
+    # is the number that matters for A3.
+    print()
+    print("  analytic albedo is flat in roughness (%.4f -> %.4f) while explicit falls (%.4f -> %.4f)"
+          % (rows[0][8], rows[-1][8], rows[0][7], rows[-1][7]))
+    print("  so the model is worst for a SMOOTH body (%.1f %%) and best for a rough one (%.1f %%),"
+          % (abs(rows[0][9]), abs(rows[-1][9])))
+    print("  converging as the body approaches the Lambertian case the formula was derived for.")
+    if not ctl_ok:
+        print()
+        print("  ...but the control FAILED, so none of the above is evidence of anything.")
     if not args.keep:
         shutil.rmtree(OUT)
     return 0

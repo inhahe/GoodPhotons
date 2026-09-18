@@ -558,21 +558,48 @@ front rather than halfway through.
 coat traced explicitly, which needs no MIS pdf), in an enclosure, and confirm the Python numbers end
 to end before committing to the architecture.
 
-**STARTED (0.346.0), precondition NOT met — do not build the architecture yet.**
-`tools/a3_reference.py` traces the coat explicitly: a rough glossy sphere concentric inside a smooth
-dielectric sphere, gap 0.0005, so refraction in/out shares a normal with the body and TIR and the
-multi-bounce series happen for real. Two bugs were found and fixed by its own control (the coat is
-the exact IDENTITY for a smooth body, so a large error at roughness 0.02 means the rig is wrong):
-a 0.03 gap makes a ball LENS rather than a coat, and the disc ROI was sized by eye at more than
-twice the sphere's projected radius, so most of it was background the glass refracts into.
+**PRECONDITION NOW MET (0.349.0) — the end-to-end number exists, and it is a different SHAPE from
+the prediction.** `tools/a3_reference.py` traces the coat explicitly (a rough glossy sphere
+concentric inside a smooth dielectric sphere, gap 0.0005, so entry and exit share a normal with the
+body and TIR and the multi-bounce series happen for real) and measures directional albedo in a
+**furnace** — a uniform `light env` dome, where there is no delta source and therefore no firefly
+tail, and where sphere radiance / background radiance *is* the directional albedo.
 
-After both fixes the **lobe-width** half behaves — −1.0 %, −4.6 %, +1.8 %, +7.3 % across roughness
-0.02 → 0.45, small at smooth and growing with roughness as the claim requires — but it reaches only
-+7.3 %, not the −34 % predicted. The **energy** half still fails its control at 71.8 %, because a
-near-smooth body under a coat is a near-delta highlight whose disc mean is firefly-dominated at any
-practical spp. So the end-to-end confirmation does not exist yet. The fix is the part of the TODO
-this skipped: measure total flux **in an enclosure**, not a disc mean, or sweep incident direction
-explicitly instead of reading the lobe off a sphere.
+| body roughness | true (explicit) | analytic `layered` | error |
+|---|---|---|---|
+| 0.02 | 0.6288 | 0.4283 | **−31.9 %** |
+| 0.10 | 0.6218 | 0.4283 | −31.1 % |
+| 0.25 | 0.5760 | 0.4283 | −25.6 % |
+| 0.45 | 0.4954 | 0.4236 | −14.5 % |
+
+**The analytic albedo is essentially flat in roughness while the true one falls**, so the model is
+worst for a SMOOTH body and converges as the body roughens. That is the *opposite* ordering to what
+`a3_snell.py`'s lobe/TIR argument implied, and the reason is clear once seen: the model applies the
+Lambertian recycling series `a(1−F_dr)/(1−a·F_dr)` whatever the body's directionality. A smooth body
+has **no** TIR series at all — its light leaves at the mirror angle, inside the critical cone — so
+the correction should not be applied to it; as the body roughens, more of its lobe genuinely lands
+beyond the critical angle and the Lambertian assumption becomes appropriate. Magnitude agrees with
+the Python (−32 % measured against −37 % predicted).
+
+**The control that makes this believable, and the one it replaced.** The rig's first control said
+"the coat is the exact identity for a smooth body, so the two must agree at roughness 0.02" — and it
+failed at 31.9 %. That premise was wrong: the identity is a fact about the *physics*, and the
+model's defect is precisely that it does not reproduce it, so the control was measuring the effect
+under test and calling it a rig failure. The control now sets the coat's index to **1.0**: with no
+index contrast there is no refraction, Fresnel or TIR, so both constructions must collapse to the
+bare body's albedo. They do — 0.6210 vs 0.6197, −0.2 % — which tests the instrument rather than the
+claim. *A control has to be something the rig must satisfy even when the hypothesis is true.*
+
+Two earlier rig bugs, both caught the same way: a 0.03 shell gap is a ball LENS rather than a coat
+(the refracted ray lands on a different part of the body with a different normal), and the disc ROI
+was sized by eye at more than twice the sphere's projected radius, so most of it was background the
+glass refracts into.
+
+**Still indicative rather than confirmed: the LOBE-WIDTH half.** Those numbers (−5.5, −19.0, −21.5,
+−14.5 % across the sweep) come from the directional-sun scene, whose energy column remains
+firefly-dominated, and they have no control of their own. The analytic lobe is consistently
+narrower, which is the predicted direction, but the magnitude is not trustworthy yet. The energy
+claim is the one that is now established.
 
 ## 6. DONE (0.344.0): the heterogeneous spectral-media tier's end-to-end number
 
