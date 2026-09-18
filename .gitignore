@@ -172,3 +172,6 @@ gallery/
 /prev.txt
 /showcase.txt
 /studio.txt
+
+# Third-party reference binary; never published from the staging copy
+reference/*.exe
