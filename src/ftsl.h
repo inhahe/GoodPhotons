@@ -1209,6 +1209,12 @@ public:
             sp.cellSize  = Len(dblOf(sb, "cell", sp.cellSize));
             sp.maxStep   = dblOf(sb, "max_step", sp.maxStep);
             sp.refresh   = (int)dblOf(sb, "refresh", (double)sp.refresh);
+            if (const Stmt* sh = find(sb, "shape")) {
+                const std::string v = sh->val.words.empty() ? "" : sh->val.words[0];
+                if      (v == "local")  sp.localShape = true;
+                else if (v == "global") sp.localShape = false;
+                else { fail("settle: shape takes local|global"); return false; }
+            }
             // The sidecar defaults to <scene>.settlecache beside the file the settle block was
             // written in, so a groom that lives in its own include caches next to itself.
             // `cache off` disables it; `cache "<path>"` overrides.

@@ -4928,12 +4928,38 @@ keyed on an FNV-1a of every solver parameter plus the authored geometry, written
 because the key hashes the inputs and cannot detect a truncated payload. A hit is byte-identical to
 the solve it replaces; a parameter change and a geometry change both miss. `cache off` to disable.
 
-**Still open:** whatever would take this below 55 % — which, given the convergence result (150
-sweeps gains 0.2 points over 60), means changing the constraint set rather than running it longer.
-The most likely candidate is replacing the global position spring with a LOCAL shape constraint
-(per-particle rest offsets in a parallel-transported frame, TressFX-style), so a strand can slide
-sideways to clear a neighbour while keeping its authored curl — the present spring pins it to the
-exact configuration that overlaps.
+### 0.350.0 — the local shape constraint was built and it DRIFTS; `shape global` stays the default
+
+The candidate named above was implemented (`shape local`) and refuted by its own A/B. One word
+different per row, everything else identical:
+
+| `shape` | `stiffness` | overlapping | depth | moved mean / max |
+|---|---|---|---|---|
+| global | 0.05 | **55.11 %** | 51.6 µm | 1.629 / 6.316 mm |
+| local | 0.05 | 52.68 % | 54.7 µm | 3.343 / 10.766 mm |
+| local | 0.20 | 70.41 % | 68.1 µm | 4.749 / 19.148 mm |
+| local | 0.40 | **78.64 %** (worse than doing nothing) | 67.4 µm | 10.667 / 44.067 mm |
+
+**The rows diagnose it, not the reasoning.** `local` at 0.05 reproduces what NO shape constraint
+does (global at 0.00 is 52.24 % at 3.46 mm), so it exerts essentially no restoring force; and
+displacement grows monotonically with stiffness — 3.3, 4.7, 10.7 mm — which a restoring force cannot
+do. At 0.40 it is *worse than the 72.67 % baseline*, having thrown strands up to 44 mm across a
+94 mm groom.
+
+**The defect:** the frame is re-derived each sweep from the BLENDED result, so the rest shape
+follows the current shape. The constraint targets wherever the strand already drifted to, making it
+self-satisfying at low stiffness and an energy pump at high stiffness. A correct version would carry
+a per-particle frame as simulation **state** (a quaternion advanced by the rest transform,
+TressFX-style) rather than re-fitting it to the output, or use a per-strand **rigid** fit against the
+REST shape — which cannot drift by construction and still gives the property that was wanted
+(translate and rotate as a unit, curl preserved exactly). Neither is built.
+
+`shape local` is kept, documented as drifting, because it is the A/B control that produced this and
+because a correct version would replace it in place.
+
+**Still open:** taking this below 55 % still means changing the constraint set — the convergence
+result (150 sweeps gains 0.2 points over 60) rules out simply running longer — but the specific
+candidate above is now known not to work as implemented.
 
 ### OPEN (2026-09-16): `-direct-only` is silently ignored by mode D (and any non-backward mode)
 

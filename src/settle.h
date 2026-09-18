@@ -25,12 +25,30 @@
 // THE SCHEME is position-based and velocity-free: each iteration injects a small gravity
 // displacement and then projects four constraint sets, in the order they must dominate —
 //   1. inextensibility  (a hair does not stretch; Gauss-Seidel along each strand)
-//   2. global shape     (stiffness: pull back toward the AUTHORED position, stiffest at the
+//   2. shape            (stiffness: hold the authored form, stiffest at the
 //                        root, slackest at the tip — this is what stops a settle turning a
 //                        sculpted groom into a wet mop, and it is the "stiffness" in the ask)
 //   3. separation       (strand-strand, exact segment-segment distance against r_i + r_j)
 //   4. volume           (the COLLECTIVE term -- see below)
 //   5. collision        (stay outside named mesh groups)
+//
+// SHAPE: `global` (default) pulls each particle toward its AUTHORED POSITION. That position is
+// by definition the configuration that overlaps, so the spring opposes precisely the motion
+// that would fix the overlap -- stiffness 0.40 leaves 63.12 % of segments overlapping, 0.00
+// leaves 52.24 %, and the only way to weaken it is to let the whole groom sag (3.46 mm mean).
+//
+// `shape local` was built to escape that -- preserve the strand's SHAPE rather than its
+// POSITION, so it can translate and swing to clear a neighbour while keeping its curl -- and
+// IT DRIFTS. Measured: local at stiffness 0.05 gives 52.68 % at 3.34 mm, which is what NO
+// shape constraint does (global at 0.00 gives 52.24 % at 3.46 mm), and local at 0.20 is WORSE
+// at 70.41 % while moving the groom FURTHER (4.75 mm mean, 19 mm max) -- which no restoring
+// force can do. The defect is that the frame R below is re-derived from the BLENDED result
+// each sweep, so the rest shape follows the current shape: the constraint targets wherever the
+// strand already drifted to, and at high stiffness tracks that tightly enough to pump motion
+// in rather than damp it out. A correct version would either carry a per-particle frame as
+// simulation STATE (a quaternion advanced by the rest transform, TressFX-style) or use a
+// per-strand RIGID fit against the REST shape, which cannot drift by construction. Kept
+// because it is the A/B control that produced this measurement.
 //
 // WHY 4 EXISTS, measured rather than assumed. Separation alone applies the MEAN of a segment's
 // contact directions, and for a fiber overlapped on all sides those vectors cancel to nearly
@@ -118,6 +136,7 @@ struct Params {
     double margin    = 0.0;     // extra clearance held against colliders
     int    maxNbr    = 32;      // neighbour-list cap per segment (memory bound)
     int    refresh   = 10;      // rebuild the neighbour list every N sweeps (0 = once only)
+    bool   localShape = false;  // `shape local` -- measured to DRIFT, see the note above
     double volume    = 0.0;     // COLLECTIVE density-gradient push; OFF by default, see below
     double packing   = 0.30;    // volume fraction above which a neighbourhood expands
     double cellSize  = 0.0;     // density-grid cell in metres; 0 = auto (8 x mean fiber radius)
@@ -216,6 +235,42 @@ inline uint64_t fnv(uint64_t h, const void* data, size_t n) {
 
 static const uint64_t kCacheMagic = 0x46545253544c4531ull;   // "FTRSTLE1"
 
+// Minimal rotation taking unit `a` onto unit `b`, composed onto the 3x3 `R` from the left
+// (Rodrigues). The antiparallel case picks an arbitrary perpendicular axis; a single sweep's
+// motion cannot produce it, but a doubled-back authored strand can.
+inline void rotateOnto(const Vec3& a, const Vec3& b, double R[9]) {
+    const Vec3 v = cross(a, b);
+    const double c = dot(a, b);
+    const double s2 = dot(v, v);
+    double D[9];
+    if (s2 < 1e-24) {
+        if (c > 0.0) return;                       // already aligned
+        Vec3 ax = (std::fabs(a.x) < 0.9) ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
+        ax = cross(a, ax);
+        const double l = length(ax);
+        if (l < 1e-18) return;
+        ax = ax * (1.0 / l);
+        D[0] = 2*ax.x*ax.x - 1; D[1] = 2*ax.x*ax.y;     D[2] = 2*ax.x*ax.z;
+        D[3] = 2*ax.y*ax.x;     D[4] = 2*ax.y*ax.y - 1; D[5] = 2*ax.y*ax.z;
+        D[6] = 2*ax.z*ax.x;     D[7] = 2*ax.z*ax.y;     D[8] = 2*ax.z*ax.z - 1;
+    } else {
+        const double k = 1.0 / (1.0 + c);
+        D[0] = 1 - (v.y*v.y + v.z*v.z)*k; D[1] = -v.z + v.x*v.y*k;          D[2] =  v.y + v.x*v.z*k;
+        D[3] =  v.z + v.x*v.y*k;          D[4] = 1 - (v.x*v.x + v.z*v.z)*k; D[5] = -v.x + v.y*v.z*k;
+        D[6] = -v.y + v.x*v.z*k;          D[7] =  v.x + v.y*v.z*k;          D[8] = 1 - (v.x*v.x + v.y*v.y)*k;
+    }
+    double O[9];
+    for (int r = 0; r < 3; ++r)
+        for (int cc = 0; cc < 3; ++cc)
+            O[r*3 + cc] = D[r*3 + 0]*R[0*3 + cc] + D[r*3 + 1]*R[1*3 + cc] + D[r*3 + 2]*R[2*3 + cc];
+    for (int i = 0; i < 9; ++i) R[i] = O[i];
+}
+inline Vec3 applyR(const double R[9], const Vec3& v) {
+    return Vec3{ R[0]*v.x + R[1]*v.y + R[2]*v.z,
+                 R[3]*v.x + R[4]*v.y + R[5]*v.z,
+                 R[6]*v.x + R[7]*v.y + R[8]*v.z };
+}
+
 } // namespace detail
 
 // Runs the settle in place. Returns false only if `ftrace -stop` cancelled it mid-way (the
@@ -266,7 +321,7 @@ inline bool run(Scene& sc, const Params& p, std::string& report) {
     {
         const double pv[] = { (double)p.iters, p.droop, p.stiffRoot, p.stiffTip, p.sepScale,
                               p.margin, (double)p.maxNbr, p.volume, p.packing, p.cellSize,
-                              p.maxStep, (double)p.refresh };
+                              p.maxStep, (double)p.refresh, p.localShape ? 1.0 : 0.0 };
         key = detail::fnv(key, pv, sizeof pv);
         for (const std::string& c : p.collide) key = detail::fnv(key, c.data(), c.size());
         key = detail::fnv(key, pos.data(), pos.size() * sizeof(Vec3));   // the AUTHORED geometry
@@ -509,11 +564,34 @@ inline bool run(Scene& sc, const Params& p, std::string& report) {
                 }
             })) return false;
 
-        // (c) global shape: back toward the AUTHORED position
-        if (!ft::parallelFor(nP, 1024, [&](size_t i) {
-                if (owner[i] < 0) return;
-                pos[i] = pos[i] + (rest[i] - pos[i]) * (double)stiff[i];
-            })) return false;
+        // (c) shape. Sequential along each strand (the frame is carried outward from the root),
+        //     parallel ACROSS strands -- which is also what keeps it deterministic, since a
+        //     strand owns its particles outright.
+        if (p.localShape) {
+            if (!ft::parallelFor(nC, 32, [&](size_t c) {
+                    const int b = first[c], n = cnt[c];
+                    if (n < 2) return;
+                    double R[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+                    for (int k = 0; k + 1 < n; ++k) {
+                        const size_t i = (size_t)b + (size_t)k, j = i + 1;
+                        const Vec3 want = detail::applyR(R, rest[j] - rest[i]);
+                        // toward where the authored offset says it belongs RELATIVE to its
+                        // predecessor, so the strand may translate and swing freely
+                        pos[j] = pos[j] + ((pos[i] + want) - pos[j]) * (double)stiff[j];
+                        // carry the frame by whatever the segment actually ended up doing
+                        const Vec3 got = pos[j] - pos[i];
+                        const double lw = length(want), lg = length(got);
+                        if (lw > 1e-15 && lg > 1e-15)
+                            detail::rotateOnto(want * (1.0 / lw), got * (1.0 / lg), R);
+                    }
+                })) return false;
+        } else {
+            // the A/B control: the old global position spring
+            if (!ft::parallelFor(nP, 1024, [&](size_t i) {
+                    if (owner[i] < 0) return;
+                    pos[i] = pos[i] + (rest[i] - pos[i]) * (double)stiff[i];
+                })) return false;
+        }
 
         // (d) separation. One-sided by construction: segment `si` reads every neighbour and
         //     writes only its own two particles, so no two threads touch the same slot.
