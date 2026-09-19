@@ -1633,6 +1633,16 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   spectral fold, so a rainbow beam is demoted to its monochromatic `CIE(λ)` record the way it was
   before 0.264.0. The A/B control for that fold; on `gallery_rain` the fold changes 63 % of pixels and
   is ~10 % faster.
+- **`-checklayered` (self-test, no scene).** Six unit tests for the stochastic layered BSDF
+  (`src/layered.h`), run as pure math with no scene, camera or film. `eta=1` must reduce to the
+  bare body; a white body under a clear coat must return albedo exactly 1 (light can be delayed by
+  total internal reflection, never destroyed); a MIRROR body has no TIR series at all and must hit
+  the closed form `F + (1-F)^2 a / (1 - F a)`; the `f` estimator integrated against cosine must
+  reproduce the albedo the sampler produces (this is what pins the refraction Jacobian); `f` must
+  be reciprocal; and a LAMBERTIAN body must reproduce the shipped analytic `coatedAlbedo` to
+  within noise, which is the control proving the new model generalises the old rather than
+  replacing it. Measured: 0.000 %, 0.0000, 0.6362 vs 0.6364, 0.5520 vs 0.5511, 0.19911 vs 0.19955,
+  0.3970 vs 0.3968.
 - **`FTRACE_SPECMEDIA=0` (diagnostic, participating media).** Forces the **scalar** transmittance
   tier on a coloured medium — one walk at one wavelength, applied to every wavelength — which is the
   pre-0.322.0 behaviour exactly, and so is the A/B control for the three-tier spectral

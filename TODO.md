@@ -639,6 +639,27 @@ the flag is `-r W H`.) The range is built: `-camera fly -frames 642 699` keeps o
 whose number lies in 642..699 (an empty selection is an error naming the path's range). Tested on
 gallery_rain's `fly`: frames 5..7 render three files; 2000..2100 refuses.
 
+## 10. The A3 LOBE-WIDTH claim is untested — the rig's two sides are not geometrically identical
+
+**The lobe-width claim is untested — its own control fails at +10.2 % with no coat present, so those
+numbers can't be cited. Measuring it needs a rig whose two sides are geometrically identical (a
+direction sweep against a BSDF evaluation, not two renders of different scenes).**
+
+The detail, from `tools/a3_reference.py`. Each A3 claim is gated by its own `coat ior 1.0` control —
+with no index contrast there is no coat, so both constructions must agree. The energy claim passes
+that control at **−0.2 %** (explicit 0.6210 vs analytic 0.6197) and is established. The lobe claim
+fails it at **+10.2 %** (r50 0.322 vs 0.355), which is *larger than several of the differences the
+sweep attributes to the coat* (−5.5 % at roughness 0.02). The cause is structural: the explicit
+scene carries a second sphere that the analytic scene does not, so `r50` measures that geometric
+difference as much as the layered model.
+
+Two renders of different scenes can never settle this. The replacement rig evaluates **one**
+geometry: sweep the incident direction explicitly and compare a brute-force layered simulation with
+the analytic BSDF at the same (wi, wo) pairs, with no scene, no camera and no fireflies.
+
+*(Keeping the failing control is deliberate — deleting it would restore the appearance of a
+measurement. A test that says "this instrument cannot answer this question" is the useful output.)*
+
 ## 8. BLOCKED: the paired-timing rule into `CLAUDE.md`
 
 "Time paired within a repetition, warm-up discarded" is a standing measurement rule that lives only

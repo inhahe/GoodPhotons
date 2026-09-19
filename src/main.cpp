@@ -154,6 +154,7 @@
 #include "raster.h"             // -raster: fast solid-shaded preview rasterizer (no light transport)
 #include "render.h"
 #include "rainbow.h"            // Airy-theory droplet phase function (rainbows in droplet media)
+#include "layered_check.h"      // -checklayered: unit tests for the stochastic layered BSDF (A3)
 #include "backward.h"
 #include "bdpt.h"
 #include "photonmap_render.h"   // mode M: photon-mapped final gather (ROADMAP item 1)
@@ -18558,6 +18559,7 @@ static int run(int argc, char** argv) {
     bool checkImplicitOnly = false;
     bool checkCurveOnly = false;
     bool checkFurOnly = false;
+    bool checkLayeredOnly = false;
     bool checkFurGridOnly = false;
     bool checkPmGridOnly = false;
     bool checkFurVolOnly = false;
@@ -19358,6 +19360,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkimplicit")) checkImplicitOnly = true;
         else if (!std::strcmp(argv[i], "-checkcurve")) checkCurveOnly = true;
         else if (!std::strcmp(argv[i], "-checkfur")) checkFurOnly = true;
+        else if (!std::strcmp(argv[i], "-checklayered")) checkLayeredOnly = true;
         else if (!std::strcmp(argv[i], "-checkfurgrid")) checkFurGridOnly = true;
         else if (!std::strcmp(argv[i], "-checkpmgrid")) checkPmGridOnly = true;
         else if (!std::strcmp(argv[i], "-checkfurvol")) checkFurVolOnly = true;
@@ -19890,6 +19893,7 @@ static int run(int argc, char** argv) {
     if (checkImplicitOnly) return checkImplicit(500'000) == 0 ? 0 : 1; // deterministic, no scene needed
     if (checkCurveOnly)    return checkCurve(200'000) == 0 ? 0 : 1;    // deterministic, no scene needed
     if (checkFurOnly)      return checkFur(50'000) == 0 ? 0 : 1;      // deterministic, no scene needed
+    if (checkLayeredOnly)  return layered::check::run() == 0 ? 0 : 1;  // pure math, no scene needed
     if (checkFurGridOnly)  return checkFurGrid() == 0 ? 0 : 1;        // deterministic, no scene needed
     if (checkPmGridOnly)   return checkPmGrid();   // deterministic, no scene needed
     if (checkFurVolOnly)   return checkFurVol() == 0 ? 0 : 1;         // deterministic, no scene needed
