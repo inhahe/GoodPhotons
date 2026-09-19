@@ -276,4 +276,73 @@ inline double albedoFromMoments(double a, const double* P, int K,
     return acc;
 }
 
+// ---- the two body lobes the material system actually ships ---------------------------------
+// Replicated here because scene.h, where the moments are stamped, sits below render.h and
+// cannot call glossyDirUV. `-checklayered` compares this sampler against that one directly, so
+// the duplication is checked rather than merely intended.
+struct LambertBody {
+    double f(const Vec3&, const Vec3& b) const { return (b.z > 0.0) ? 1.0 / 3.14159265358979323846 : 0.0; }
+    bool sample(const Vec3&, double u1, double u2, Vec3& b, double& weight) const {
+        const double r = std::sqrt(u1), phi = 2.0 * 3.14159265358979323846 * u2;
+        b = Vec3{ r * std::cos(phi), r * std::sin(phi), std::sqrt(1.0 - u1 > 0.0 ? 1.0 - u1 : 0.0) };
+        weight = 1.0;
+        return b.z > 0.0;
+    }
+};
+
+// The engine's glossy lobe is a cosine-power (Phong-style) distribution about the MIRROR
+// direction with exponent e = 2/r^2 - 2 -- not GGX. Using a GGX lobe here would compute the
+// escape statistics of a body the renderer does not have.
+struct PhongBody {
+    double rough = 0.2;
+    double f(const Vec3& a, const Vec3& b) const {
+        if (!(a.z > 0.0) || !(b.z > 0.0)) return 0.0;
+        const double rr = rough < 1e-3 ? 1e-3 : rough;
+        const double e = (2.0 / (rr * rr) - 2.0) > 0.0 ? (2.0 / (rr * rr) - 2.0) : 0.0;
+        const Vec3 m{ -a.x, -a.y, a.z };                       // mirror of a about +Z
+        const double c = dot(m, b);
+        if (!(c > 0.0)) return 0.0;
+        return (e + 2.0) * std::pow(c, e) / (2.0 * 3.14159265358979323846 * (b.z > 1e-9 ? b.z : 1e-9));
+    }
+    bool sample(const Vec3& a, double u1, double u2, Vec3& b, double& weight) const {
+        const double rr = rough < 1e-3 ? 1e-3 : rough;
+        const double e = (2.0 / (rr * rr) - 2.0) > 0.0 ? (2.0 / (rr * rr) - 2.0) : 0.0;
+        const Vec3 m{ -a.x, -a.y, a.z };
+        const double cosT = std::pow(u1, 1.0 / (e + 1.0));
+        const double sinT = std::sqrt(1.0 - cosT * cosT > 0.0 ? 1.0 - cosT * cosT : 0.0);
+        const double phi = 2.0 * 3.14159265358979323846 * u2;
+        Vec3 t{ 1, 0, 0 };
+        if (std::fabs(m.x) > 0.9) t = Vec3{ 0, 1, 0 };
+        Vec3 bt{ m.y * t.z - m.z * t.y, m.z * t.x - m.x * t.z, m.x * t.y - m.y * t.x };
+        const double bl = length(bt);
+        if (!(bl > 0.0)) return false;
+        bt = bt * (1.0 / bl);
+        Vec3 tt{ bt.y * m.z - bt.z * m.y, bt.z * m.x - bt.x * m.z, bt.x * m.y - bt.y * m.x };
+        b = tt * (sinT * std::cos(phi)) + bt * (sinT * std::sin(phi)) + m * cosT;
+        const double l = length(b);
+        if (!(l > 0.0)) return false;
+        b = b * (1.0 / l);
+        weight = 1.0;                 // the engine's lobe is sampled exactly, so f*cos/pdf == 1
+        return b.z > 0.0;
+    }
+};
+
+// Moments averaged over a COSINE-WEIGHTED incidence. That is the right weighting for the place
+// they are consumed -- an albedo accessor with no incident direction available -- and it is
+// also exactly what a furnace measures, which is what the end-to-end check uses.
+template <class Body, class Rng>
+inline void escapeMomentsCosAvg(const Params& P, const Body& body, int K, double* out,
+                                int nWalks, Rng& rng) {
+    for (int k = 0; k < K; ++k) out[k] = 0.0;
+    double tmp[32];
+    const int kk = (K < 32) ? K : 32;
+    const int slices = 16;
+    for (int s = 0; s < slices; ++s) {
+        const double u = (s + 0.5) / (double)slices;
+        const double cosI = std::sqrt(u);              // cosine-weighted incidence
+        escapeMoments(P, body, cosI, kk, tmp, nWalks / slices, rng);
+        for (int k = 0; k < kk; ++k) out[k] += tmp[k] / (double)slices;
+    }
+}
+
 }  // namespace layered

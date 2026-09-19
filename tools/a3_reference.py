@@ -84,7 +84,11 @@ sphere {{ center 0 0 0  radius 0.9995  material body }}
 COAT_ANALYTIC = """material "coated" {{
     type layered
     ior 1.5
-    coat {{ reflectance fresnel  roughness 0.002  ior 1.5 }}
+    coat {{
+        reflectance fresnel
+        roughness 0.002
+        ior 1.5
+    }}
     layer "body" 1.0
 }}
 sphere {{ center 0 0 0  radius 1.00  material coated }}
@@ -105,6 +109,18 @@ SUN_EXP_N1 = COMMON + BODY + COAT_EXP_N1
 SUN_ANA_N1 = COMMON + BODY + COAT_ANA_N1
 FURN_EXP_N1 = FURNACE + BODY + COAT_EXP_N1
 FURN_ANA_N1 = FURNACE + BODY + COAT_ANA_N1
+# A3 (0.354.0): the same analytic material with the stochastic layered model switched on. The
+# ONLY difference from COAT_ANALYTIC is the word `stochastic`, so any change in the column is
+# the model and nothing else.
+# NOTE the newline. FTSL value-continuation (section 1.1) means `reflectance fresnel  scatter
+# stochastic` on ONE line is a single statement whose words are [fresnel, scatter, stochastic],
+# so `scatter` never becomes a key and nothing warns -- strOf still reads "fresnel" and the
+# material silently stays analytic. That is exactly what happened on the first run here: the
+# stochastic column came back byte-identical to the analytic one.
+COAT_STOCH = COAT_ANALYTIC.replace("        reflectance fresnel",
+                                   "        reflectance fresnel" + chr(10) +
+                                   "        scatter stochastic")
+FURN_STOCH = FURNACE + BODY + COAT_STOCH
 
 
 def render(tag, text, rough, spp):
@@ -199,7 +215,7 @@ def main():
     print("  control %s%s" % ("PASS" if ctl_ok else "FAIL  <--",
                               "" if ctl_ok else "   the rig is not measuring a coat; nothing below is believable"))
     print()
-    print("  rough   explicit(energy, r50)      analytic(energy, r50)     energy diff   width diff"   "   albedoE albedoA  albedo diff")
+    print("  rough   TRUE     analytic   error      STOCHASTIC  error")
     rows = []
     for rough in (0.02, 0.10, 0.25, 0.45):
         eE, wE = stats(render("exp_%.2f" % rough, EXPLICIT, rough, args.spp))
@@ -208,10 +224,12 @@ def main():
         dw = 100.0 * (wA - wE) / max(wE, 1e-12)
         aE = albedo(render("fexp_%.2f" % rough, FURN_EXPLICIT, rough, args.spp))
         aA = albedo(render("fana_%.2f" % rough, FURN_ANALYTIC, rough, args.spp))
+        aS = albedo(render("fsto_%.2f" % rough, FURN_STOCH, rough, args.spp))
         da = 100.0 * (aA - aE) / max(aE, 1e-12)
-        rows.append((rough, eE, wE, eA, wA, de, dw, aE, aA, da))
-        print("  %5.2f   %10.5f  %6.3f      %10.5f  %6.3f     %+7.1f %%    %+7.1f %%   %6.4f  %6.4f  %+7.1f %%"
-              % (rough, eE, wE, eA, wA, de, dw, aE, aA, da))
+        ds = 100.0 * (aS - aE) / max(aE, 1e-12)
+        rows.append((rough, eE, wE, eA, wA, de, dw, aE, aA, da, aS, ds))
+        print("  %5.2f   %6.4f   %6.4f  %+7.1f %%   %6.4f  %+7.1f %%"
+              % (rough, aE, aA, da, aS, ds))
 
     # The claim under test is that the error GROWS with body roughness -- a smooth body is the
     # identity (a3_snell.py result 1), so a reference that shows a large error at roughness 0.02
@@ -223,11 +241,12 @@ def main():
     # for. That is the opposite of the ordering a3_snell.py's lobe argument would suggest, and it
     # is the number that matters for A3.
     print()
-    print("  analytic albedo is flat in roughness (%.4f -> %.4f) while explicit falls (%.4f -> %.4f)"
+    print("  analytic is flat in roughness (%.4f -> %.4f) while the truth falls (%.4f -> %.4f):"
           % (rows[0][8], rows[-1][8], rows[0][7], rows[-1][7]))
-    print("  so the model is worst for a SMOOTH body (%.1f %%) and best for a rough one (%.1f %%),"
-          % (abs(rows[0][9]), abs(rows[-1][9])))
-    print("  converging as the body approaches the Lambertian case the formula was derived for.")
+    print("    worst analytic error %.1f %%   worst stochastic error %.1f %%"
+          % (max(abs(r[9]) for r in rows), max(abs(r[11]) for r in rows)))
+    print("  stochastic tracks roughness (%.4f -> %.4f), which is the whole point of A3."
+          % (rows[0][10], rows[-1][10]))
     print()
     print("  energy/albedo claim: %s" % ("BELIEVABLE -- its control passed" if ctl_ok
           else "NOT believable -- its ior-1.0 control failed"))

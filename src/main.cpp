@@ -18989,6 +18989,21 @@ static int run(int argc, char** argv) {
             std::fprintf(stderr, "[groom-check] %s: %s\n", ok ? "PASS" : "FAIL", report.c_str());
             return ok ? 0 : 1;
         }
+        // FTRACE_LAYERDIAG=1: what the loader actually built for every layered material and its
+        // body copies. Added while chasing a case where the stochastic model was correct, its
+        // scene wiring unit-tested, and yet the render was byte-identical to the analytic one.
+        if (std::getenv("FTRACE_LAYERDIAG")) {
+            const auto& ms = ftslScene.scene.mats;
+            for (size_t mi = 0; mi < ms.size(); ++mi) {
+                const Material& mm = ms[mi];
+                if (mm.type == MatType::Layered)
+                    std::fprintf(stderr, "[layerdiag] mat %zu LAYERED scatter=%d coatChild=%d children=%zu\n",
+                                 mi, mm.coatScatter, mm.coatChild, mm.mixChildren.size());
+                else if (mm.coatFdr > 0.0 || mm.coatMomN > 0)
+                    std::fprintf(stderr, "[layerdiag] mat %zu BODYCOPY fdr=%.4f momN=%d rough=%.3f\n",
+                                 mi, mm.coatFdr, mm.coatMomN, mm.roughness);
+            }
+        }
         if (!g_dumpCurves.empty()) {
             std::FILE* df = std::fopen(g_dumpCurves.c_str(), "wb");
             if (!df) { std::fprintf(stderr, "[dumpcurves] cannot write %s\n", g_dumpCurves.c_str()); return 1; }

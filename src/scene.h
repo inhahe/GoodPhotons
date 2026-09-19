@@ -9,7 +9,8 @@
 #include "geometry.h"
 #include "bvh.h"
 #include "implicit.h"
-#include "curve.h"       // curve / fiber primitive (hair, fur, grass, wire) — TODO §P1
+#include "curve.h"
+#include "layered.h"     // A3: the stochastic layered model's escape moments       // curve / fiber primitive (hair, fur, grass, wire) — TODO §P1
 #include "pattern.h"
 #include "spectrum.h"
 #include "scene_film.h"
@@ -367,6 +368,13 @@ struct Material {
     // is not stored here -- it is layeredCoatReflectance at the hit, because it depends on the
     // viewing angle, which is the whole point of a Fresnel coat.
     int    coatChild    = -1;
+    // A3 (0.354.0). `coatScatter` 1 selects the stochastic layered model; `coatMom` is the
+    // measured distribution of body-bounce counts before escape, stamped onto the BODY COPY
+    // beside coatFdr. It depends on the coat index and the body's lobe but NOT on albedo, so
+    // one set serves every wavelength and every albedo.
+    int    coatScatter  = 0;
+    int    coatMomN     = 0;
+    double coatMom[8]   = { 0, 0, 0, 0, 0, 0, 0, 0 };
     // INTERNAL diffuse Fresnel reflectance of the coat above this body, or 0 when this material
     // is not under one. Set by finalizeLayeredCoats on the per-stack BODY COPIES it makes, and
     // applied in diffuseReflectance / reflectSlot -- the single funnels every albedo passes
@@ -1341,6 +1349,17 @@ inline double internalFresnelDiffuse(double n) {
 // dCoatedAlbedoAt is a line-for-line twin. The clear case keeps its own branch only because it is
 // the common one and skips two exps.
 inline double coatedAlbedoAt(const Material& m, double a, double lambda) {
+    // A3: when the stochastic model is on, the body copy carries the MEASURED distribution of
+    // bounce counts and the analytic geometric series is bypassed entirely. Absorption folds in
+    // exactly as before: one in-and-out traversal always, one round trip per extra bounce.
+    if (m.coatMomN > 0) {
+        double tIo = 1.0, tRt = 1.0;
+        if (m.coatPathIo > 0.0 && m.coatAbsorb) {
+            const double sa = m.coatAbsorb(lambda);
+            if (sa > 0.0) { tIo = std::exp(-sa * m.coatPathIo); tRt = std::exp(-sa * m.coatPathRt); }
+        }
+        return layered::albedoFromMoments(a, m.coatMom, m.coatMomN, tIo, tRt);
+    }
     if (!(m.coatFdr > 0.0)) return a;
     if (m.coatPathIo > 0.0 && m.coatAbsorb) {
         const double sa = m.coatAbsorb(lambda);
@@ -1599,6 +1618,25 @@ struct Scene {
                 Material body = mats[(size_t)cid];
                 if (body.coatFdr > 0.0) continue;          // already a body copy (idempotent)
                 body.coatFdr = fdr;
+                if (mats[i].coatScatter == 1) {
+                    layered::Params LP; LP.eta = nCoat;
+                    struct Rg { unsigned long long s;
+                        double operator()() { s = s * 6364136223846793005ull + 1442695040888963407ull;
+                            return (double)((s >> 11) & ((1ull << 53) - 1)) / (double)(1ull << 53); } };
+                    Rg rg{ 0x9E3779B97F4A7C15ull + (unsigned long long)k * 1013904223ull };
+                    if (body.type == MatType::Glossy) {
+                        layered::PhongBody pb; pb.rough = body.roughness;
+                        layered::escapeMomentsCosAvg(LP, pb, 8, body.coatMom, 131072, rg);
+                    } else {
+                        layered::LambertBody lb;
+                        layered::escapeMomentsCosAvg(LP, lb, 8, body.coatMom, 131072, rg);
+                    }
+                    double sum = 0.0;
+                    for (int q = 0; q < 8; ++q) sum += body.coatMom[q];
+                    // condition on having entered: the entry Fresnel belongs to the resolver's
+                    // selection probability, not to the albedo, exactly as for the analytic path
+                    if (sum > 1e-9) { for (int q = 0; q < 8; ++q) body.coatMom[q] /= sum; body.coatMomN = 8; }
+                }
                 body.coatAbsorb = mats[i].coatAbsorb;
                 body.coatPathIo = pIo;
                 body.coatPathRt = pRt;

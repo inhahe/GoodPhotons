@@ -226,6 +226,38 @@ inline int run() {
         report("lambertian reduction", worst < 0.02, "moments %.4f vs analytic %.4f", gm, ga);
     }
 
+    // ---- 7. THE WIRING, not just the math ----------------------------------------------------
+    // Checks 1-6 prove the model. This one proves the model is actually REACHED: build a Scene
+    // with a layered material whose coat asks for the stochastic model, run the same
+    // finalizeLayeredCoats() the loader runs, and read back what shading would see. Added because
+    // the end-to-end furnace came back byte-identical to the analytic column while the model,
+    // computed independently, predicted 0.60 against 0.40 -- so the defect was in the plumbing,
+    // and a unit test that only exercises the math could never have located it.
+    {
+        Scene sc;
+        Material body;
+        body.type = MatType::Glossy;
+        body.roughness = 0.25;
+        body.reflect = constantSpectrum(0.62);
+        sc.mats.push_back(body);
+        Material lay;
+        lay.type = MatType::Layered;
+        lay.ior = iorConstant(1.5);
+        lay.coatScatter = 1;
+        lay.mixChildren.push_back(0);
+        lay.mixWeights.push_back(1.0);
+        sc.mats.push_back(lay);
+        sc.finalizeLayeredCoats();
+        const int cid = sc.mats[1].mixChildren[0];
+        const Material& bc = sc.mats[(size_t)cid];
+        const double aNew = coatedAlbedoAt(bc, 0.62, 550.0);
+        const double aOld = coatedAlbedo(0.62, internalFresnelDiffuse(1.5));
+        const bool ok = (bc.coatMomN > 0) && (std::fabs(aNew - aOld) / aOld > 0.10);
+        std::printf("  %-22s %s  coatMomN=%d  a_eff %.4f (analytic would be %.4f)\n",
+                    "scene wiring", ok ? "PASS" : "FAIL  <--", bc.coatMomN, aNew, aOld);
+        if (!ok) ++fails;
+    }
+
     (void)PI;
     std::printf("  -> layered BSDF: %d failure(s)\n", fails);
     return fails;

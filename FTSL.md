@@ -1315,6 +1315,7 @@ material "carpaint" {
     ior 1.5                       # body / effective index
     coat {
         reflectance fresnel       # fresnel (default) | thinfilm | manual
+        scatter analytic          # analytic (default) | stochastic — see A3 below
         roughness 0.05            # glossy coat lobe; map allowed
         ior glass:BK7             # coat index (fresnel/thinfilm)
         film_ior 1.30  film_thickness 300  film_thickness_map texture:t   # thinfilm coat
@@ -1325,6 +1326,40 @@ material "carpaint" {
     layer "base" 1.0              # body lobes, resolved like a mix
 }
 ```
+
+**`scatter stochastic` — the directional fix (A3, 0.354.0).** Expanding the analytic series shows
+what it assumes:
+
+```
+a (1 - F) / (1 - a F)  ==  SUM_k  a^(k+1) F^k (1 - F)
+```
+
+— the number of body bounces before escape is **geometric**, every bounce escaping with the same
+probability. That is exactly right for a Lambertian body and exactly wrong for a directional one: a
+near-smooth body returns light at the mirror angle, *inside* the critical cone, so it escapes on the
+first attempt and the higher terms vanish. Measured against an explicitly traced coat, the analytic
+albedo is flat in roughness while the truth falls, giving errors up to **−32 %**.
+
+`scatter stochastic` keeps the expansion and drops the assumption: it simulates the layer stack
+position-free (`src/layered.h`) and uses the **measured** distribution of bounce counts. That
+distribution depends on the coat index and the body's lobe shape but **not** on its albedo, so it is
+computed once per body at scene build and then serves every wavelength and every albedo for free —
+which is what makes it affordable. Measured on a furnace:
+
+| body roughness | true | `analytic` | `stochastic` |
+|---|---|---|---|
+| 0.02 | 0.6288 | 0.4283 (−31.9 %) | **0.6191 (−1.5 %)** |
+| 0.10 | 0.6218 | 0.4283 (−31.1 %) | **0.6106 (−1.8 %)** |
+| 0.25 | 0.5760 | 0.4283 (−25.6 %) | 0.5892 (+2.3 %) |
+| 0.45 | 0.4954 | 0.4236 (−14.5 %) | 0.5503 (+11.1 %) |
+
+Worst error 31.9 % → 11.1 %, and near-exact at the smooth end where the analytic model was worst.
+The residual at high roughness is the known limitation: the moments are averaged over a
+cosine-weighted **incidence**, because the albedo accessor they feed has no incident direction, and
+the escape statistics vary with incidence more as the body roughens. It stays off by default so no
+existing scene changes appearance without being asked. Verified by `ftrace -checklayered` (seven
+tests, including that a Lambertian body reproduces the analytic form it generalises) and identical
+on both backends to 0.49 %.
 
 **The body is seen THROUGH the coat, both ways** (0.323.0). Light that leaves the body meets the
 coat from inside and, past the critical angle (~41.8 deg at n = 1.5 -- most of a cosine-weighted

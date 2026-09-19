@@ -4901,6 +4901,15 @@ private:
             else if (cmodel == "thinfilm") m.coatModel = 1;
             else if (cmodel == "manual")   m.coatModel = 2;
             else { fail("layered coat reflectance must be fresnel|thinfilm|manual"); return m; }
+            // A3: `scatter stochastic` replaces the analytic Lambertian recycling series with the
+            // measured bounce distribution (src/layered.h). Default stays `analytic` so no existing
+            // scene changes appearance without being asked to.
+            if (const Stmt* sct = find(cb, "scatter")) {
+                const std::string v = sct->val.words.empty() ? "" : sct->val.words[0];
+                if      (v == "analytic")   m.coatScatter = 0;
+                else if (v == "stochastic") m.coatScatter = 1;
+                else { fail("layered coat: scatter takes analytic|stochastic"); return m; }
+            }
             // Coat interface roughness (glossy lobe on the reflected ray); grayscale
             // roughness_map allowed just like a glossy material.
             if (bindScalarPattern(cb, "roughness", m.roughnessPat)) m.roughness = 0.05;

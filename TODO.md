@@ -531,7 +531,7 @@ vertex and the device gather did not. Fixed; gyroid CPU/GPU **1.437 -> 0.975**, 
 Full chain in `known-issues.md`. **Both backends are still ~21 % under mode D on the gyroid and
 ~47 % on glass** -- mode M vs BDPT on specular objects, a different question, now recorded there.
 
-## 5. A3 / the explicit multi-bounce layered BSDF — trigger FIRED, design named, not built
+## 5. DONE (0.354.0): A3 — the stochastic layered model, `coat { scatter stochastic }`
 
 The analytic coated body is built and validated (A1 0.323.0, A2 0.324.0). What is missing is a
 **directional** body under a coat, and it is no longer a judgement call — the deferred trigger's
@@ -594,6 +594,30 @@ Two earlier rig bugs, both caught the same way: a 0.03 shell gap is a ball LENS 
 (the refracted ray lands on a different part of the body with a different normal), and the disc ROI
 was sized by eye at more than twice the sphere's projected radius, so most of it was background the
 glass refracts into.
+
+**BUILT AND MEASURED (0.354.0).** `src/layered.h` simulates the stack position-free and uses the
+**measured** bounce distribution in place of the analytic model's assumed geometric one. Enabled
+with `coat { scatter stochastic }`, off by default. End to end on the furnace:
+
+| body roughness | true | analytic | stochastic |
+|---|---|---|---|
+| 0.02 | 0.6288 | 0.4283 (−31.9 %) | **0.6191 (−1.5 %)** |
+| 0.10 | 0.6218 | 0.4283 (−31.1 %) | **0.6106 (−1.8 %)** |
+| 0.25 | 0.5760 | 0.4283 (−25.6 %) | 0.5892 (+2.3 %) |
+| 0.45 | 0.4954 | 0.4236 (−14.5 %) | 0.5503 (+11.1 %) |
+
+Worst error 31.9 % → 11.1 %. **It needed none of the architecture this item feared.** The concern
+was that `f` and `pdf` have no closed form and that NEE/BDPT/VCM need both at ~40 call sites. But
+`layered` is not a BSDF in this renderer — it is a *resolver*: every tracer turns it into a child
+material index before the material switch, so no `f`/`pdf` anywhere has a Layered case, and the
+coat survives only as a selection probability plus an albedo remap. The whole −32 % lives in that
+remap. Replacing it touched no MIS call site at all, and the Guo/Hasan/Zhao stochastic-evaluation
+BSDF — with its up-front MIS decision — turned out not to be needed for the defect that was
+actually measured.
+
+Residual: the moments are averaged over a cosine-weighted incidence, since the albedo accessor has
+no incident direction, which is why the error grows with roughness. Fixing that means giving the
+accessor an incidence, not a different model.
 
 **The LOBE-WIDTH half is NOT measurable with this rig, and now has a control saying so.** Each claim
 is gated by its own `ior 1.0` control, and they disagree:

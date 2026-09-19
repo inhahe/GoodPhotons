@@ -486,6 +486,11 @@ struct DMaterial {
     double coatAbsorb[SPEC_N];
     double coatPathIo;   // d * (secant in + secant out) through the escape cone
     double coatPathRt;   // 2 * d * secant beyond the critical angle: one TIR round trip
+    // A3: the MEASURED distribution of body-bounce counts before escape (host twin
+    // Material::coatMom / coatMomN), which replaces the analytic geometric series when the
+    // coat asked for `scatter stochastic`. Zero-length means use the analytic form.
+    int    coatMomN;
+    double coatMom[8];
     // Procedural (math-driven) scalar drives (§4): index into DScene::patterns, or -1.
     // roughnessPat / filmThicknessPat override the constant/texture value at the hit;
     // mixWeightPat drives child-0 selection of a 2-child D_MIX. Device twins of
@@ -7855,6 +7860,20 @@ __device__ static inline Real dCoatedAlbedo(Real a, double fdr) {
 // The absorbing branch (A2) charges the trapped light its internal round trip as well as the
 // escape legs, which is what makes a tinted lacquer deepen so much more than a single pass would.
 __device__ static inline Real dCoatedAlbedoAt(const DMaterial& m, Real a, Real lambda) {
+    // A3: the stochastic model, host twin scene.h coatedAlbedoAt. The moments were measured
+    // on the HOST at scene build and uploaded, so both backends read one set of numbers and
+    // cannot disagree -- which they did on the first attempt at this, when only the host was
+    // wired: the CPU returned 0.5923 and the GPU 0.4281 for the same material.
+    if (m.coatMomN > 0) {
+        double tIo = 1.0, tRt = 1.0;
+        if (m.coatPathIo > 0.0) {
+            const double sa = (double)specLookup(m.coatAbsorb, lambda);
+            if (sa > 0.0) { tIo = exp(-sa * m.coatPathIo); tRt = exp(-sa * m.coatPathRt); }
+        }
+        double acc = 0.0, ak = (double)a * tIo;
+        for (int q = 0; q < m.coatMomN && q < 8; ++q) { acc += ak * m.coatMom[q]; ak *= (double)a * tRt; }
+        return (Real)acc;
+    }
     if (!(m.coatFdr > 0.0)) return a;
     if (m.coatPathIo > 0.0) {
         const double sa = (double)specLookup(m.coatAbsorb, lambda);
@@ -17503,6 +17522,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         bakeSpec(m.coatAbsorb, d.coatAbsorb);   // A2: sigma_a inside the coat layer, 1/m
         d.coatPathIo = m.coatPathIo;
         d.coatPathRt = m.coatPathRt;
+        d.coatMomN = m.coatMomN;                // A3: 0 keeps the analytic series
+        for (int q = 0; q < 8; ++q) d.coatMom[q] = m.coatMom[q];
         d.readsCavity = m.readsCavity ? 1 : 0;
         d.roughnessPat = m.roughnessPat;
         d.filmThicknessPat = m.filmThicknessPat;
