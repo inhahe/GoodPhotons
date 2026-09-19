@@ -101,6 +101,8 @@ EXPLICIT = COMMON + BODY + COAT_EXPLICIT
 ANALYTIC = COMMON + BODY + COAT_ANALYTIC
 FURN_EXPLICIT = FURNACE + BODY + COAT_EXPLICIT
 FURN_ANALYTIC = FURNACE + BODY + COAT_ANALYTIC
+SUN_EXP_N1 = COMMON + BODY + COAT_EXP_N1
+SUN_ANA_N1 = COMMON + BODY + COAT_ANA_N1
 FURN_EXP_N1 = FURNACE + BODY + COAT_EXP_N1
 FURN_ANA_N1 = FURNACE + BODY + COAT_ANA_N1
 
@@ -184,6 +186,16 @@ def main():
     print("  CONTROL (coat ior 1.0 -- not a coat): explicit %.4f  analytic %.4f  diff %+.1f %%"
           % (cE, cA, 100.0 * (cA - cE) / max(cE, 1e-12)))
     ctl_ok = abs(cA - cE) / max(cE, 1e-12) < 0.05
+    # The LOBE half needs its own control, and had none. Same principle, on the sun scene where the
+    # lobe is measured: with the coat's index at 1.0 there is no coat, so the two constructions must
+    # give the same lobe width. Without this the r50 column is an uncontrolled number.
+    _, wE1 = stats(render("ctlw_exp", SUN_EXP_N1, 0.25, args.spp))
+    _, wA1 = stats(render("ctlw_ana", SUN_ANA_N1, 0.25, args.spp))
+    lobe_ok = abs(wA1 - wE1) / max(wE1, 1e-12) < 0.05
+    print("  CONTROL (lobe, coat ior 1.0):         explicit r50 %.3f  analytic r50 %.3f  diff %+.1f %%"
+          % (wE1, wA1, 100.0 * (wA1 - wE1) / max(wE1, 1e-12)))
+    print("  lobe control %s" % ("PASS" if lobe_ok else "FAIL  <--   the r50 column is not measuring a coat"))
+
     print("  control %s%s" % ("PASS" if ctl_ok else "FAIL  <--",
                               "" if ctl_ok else "   the rig is not measuring a coat; nothing below is believable"))
     print()
@@ -216,9 +228,11 @@ def main():
     print("  so the model is worst for a SMOOTH body (%.1f %%) and best for a rough one (%.1f %%),"
           % (abs(rows[0][9]), abs(rows[-1][9])))
     print("  converging as the body approaches the Lambertian case the formula was derived for.")
-    if not ctl_ok:
-        print()
-        print("  ...but the control FAILED, so none of the above is evidence of anything.")
+    print()
+    print("  energy/albedo claim: %s" % ("BELIEVABLE -- its control passed" if ctl_ok
+          else "NOT believable -- its ior-1.0 control failed"))
+    print("  lobe-width claim   : %s" % ("BELIEVABLE -- its control passed" if lobe_ok
+          else "NOT believable -- its ior-1.0 control failed, so r50 is not measuring the coat"))
     if not args.keep:
         shutil.rmtree(OUT)
     return 0

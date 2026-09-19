@@ -595,11 +595,25 @@ Two earlier rig bugs, both caught the same way: a 0.03 shell gap is a ball LENS 
 was sized by eye at more than twice the sphere's projected radius, so most of it was background the
 glass refracts into.
 
-**Still indicative rather than confirmed: the LOBE-WIDTH half.** Those numbers (−5.5, −19.0, −21.5,
-−14.5 % across the sweep) come from the directional-sun scene, whose energy column remains
-firefly-dominated, and they have no control of their own. The analytic lobe is consistently
-narrower, which is the predicted direction, but the magnitude is not trustworthy yet. The energy
-claim is the one that is now established.
+**The LOBE-WIDTH half is NOT measurable with this rig, and now has a control saying so.** Each claim
+is gated by its own `ior 1.0` control, and they disagree:
+
+| control (coat index 1.0, i.e. *no coat*) | explicit | analytic | diff |
+|---|---|---|---|
+| directional albedo (furnace) | 0.6210 | 0.6197 | **−0.2 %** — PASS |
+| lobe width r50 (sun scene) | 0.322 | 0.355 | **+10.2 %** — FAIL |
+
+With no coat present at all the two constructions differ in lobe width by 10.2 %, which is *larger
+than several of the differences the sweep attributes to the coat* (−5.5 % at roughness 0.02). So the
+r50 column is dominated by a systematic difference between the two geometries — the explicit scene
+carries a second sphere the analytic one does not — and cannot be attributed to the layered model.
+**Those numbers must not be cited.** Measuring the lobe claim needs a rig whose two sides are
+geometrically identical: an explicit direction sweep against a BSDF evaluation, not two renders of
+different scenes.
+
+Splitting the gate per claim mattered: a single combined gate would have let the lobe control's
+failure suppress the energy result, whose own control passes on its own terms. **The energy claim is
+established; the lobe claim is untested.**
 
 ## 6. DONE (0.344.0): the heterogeneous spectral-media tier's end-to-end number
 
