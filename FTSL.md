@@ -2187,7 +2187,11 @@ stiffness and contact.
   strand count and it re-solves. `cache off` disables it, `cache "<path>"` redirects it. The file is
   written to a temporary name and renamed, because the key hashes the *inputs* and so could not
   detect a payload truncated by an interrupted write. Verified: a hit is byte-identical to the solve
-  it replaces, and both a parameter change and a geometry change miss.
+  it replaces, and both a parameter change and a geometry change miss. The key covers parameters and
+  geometry but **not the solver's own code**, so a sidecar written by an older `ftrace` is rejected
+  by a version stamp in its header, bumped whenever the solver's behaviour changes — without it, an
+  algorithm change would silently serve the previous implementation's result, which nearly happened
+  when the rigid fit's polar decomposition was replaced.
 - `ftrace -stop` is honoured mid-settle (it aborts the load rather than leaving half a groom).
 
 **Status, measured, so this is not oversold (`tools/settle_rig.py` on Alice, shipped defaults).**

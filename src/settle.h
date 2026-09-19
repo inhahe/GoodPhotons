@@ -233,7 +233,12 @@ inline uint64_t fnv(uint64_t h, const void* data, size_t n) {
     return h;
 }
 
-static const uint64_t kCacheMagic = 0x46545253544c4531ull;   // "FTRSTLE1"
+static const uint64_t kCacheMagic = 0x46545253544c4532ull;   // "FTRSTLE2"
+// BUMP THIS WHENEVER THE SOLVER'S BEHAVIOUR CHANGES. The key hashes every parameter and the
+// authored geometry, which is exactly the set that does NOT include the algorithm itself -- so
+// after a code change a stale sidecar would be served in silence. It nearly was: the polar
+// decomposition was replaced after `shape rigid` diverged, and the caches from the diverged
+// build had identical keys. FTRSTLE1 -> 2 marks that change.
 
 // Minimal rotation taking unit `a` onto unit `b`, composed onto the 3x3 `R` from the left
 // (Rodrigues). The antiparallel case picks an arbitrary perpendicular axis; a single sweep's
@@ -271,42 +276,52 @@ inline Vec3 applyR(const double R[9], const Vec3& v) {
                  R[6]*v.x + R[7]*v.y + R[8]*v.z };
 }
 
-// 3x3 helpers for the rigid shape fit. Row-major, R[r*3+c].
-inline void mat3mul(const double* A, const double* B, double* O) {
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c)
-            O[r*3+c] = A[r*3+0]*B[0*3+c] + A[r*3+1]*B[1*3+c] + A[r*3+2]*B[2*3+c];
-}
-inline double mat3det(const double* A) {
-    return A[0]*(A[4]*A[8] - A[5]*A[7]) - A[1]*(A[3]*A[8] - A[5]*A[6]) + A[2]*(A[3]*A[7] - A[4]*A[6]);
-}
-// Transpose of the inverse, which is what the polar iteration actually wants.
-inline bool mat3invT(const double* A, double* O) {
-    const double d = mat3det(A);
-    if (std::fabs(d) < 1e-300) return false;
-    const double s = 1.0 / d;
-    O[0] = (A[4]*A[8] - A[5]*A[7]) * s;  O[3] = -(A[1]*A[8] - A[2]*A[7]) * s;  O[6] = (A[1]*A[5] - A[2]*A[4]) * s;
-    O[1] = -(A[3]*A[8] - A[5]*A[6]) * s; O[4] = (A[0]*A[8] - A[2]*A[6]) * s;   O[7] = -(A[0]*A[5] - A[2]*A[3]) * s;
-    O[2] = (A[3]*A[7] - A[4]*A[6]) * s;  O[5] = -(A[0]*A[7] - A[1]*A[6]) * s;  O[8] = (A[0]*A[4] - A[1]*A[3]) * s;
-    return true;
-}
-// The rotation factor of A, by Higham's iteration R <- (R + R^-T)/2. Quadratic, and eight
-// steps is far past convergence for the near-rotations a settle produces. Returns false when
-// A is rank-deficient (a straight strand), which the caller handles rather than papers over.
-inline bool polarRotation(const double* A, double* R) {
-    for (int i = 0; i < 9; ++i) R[i] = A[i];
-    double invT[9], nxt[9];
-    for (int it = 0; it < 8; ++it) {
-        if (!mat3invT(R, invT)) return false;
-        for (int i = 0; i < 9; ++i) nxt[i] = 0.5 * (R[i] + invT[i]);
-        double d = 0.0;
-        for (int i = 0; i < 9; ++i) d += std::fabs(nxt[i] - R[i]);
-        for (int i = 0; i < 9; ++i) R[i] = nxt[i];
-        if (d < 1e-14) break;
+// The rotation factor of A, WITHOUT any matrix inverse: Mueller's quaternion iteration
+// (A Robust Method to Extract the Rotational Part of Deformations, 2016). Each step rotates
+// the trial frame toward A's columns by the axis-angle that best aligns them.
+//
+// The obvious alternative, Higham's R <- (R + R^-T)/2, inverts a matrix every step and DIVERGED
+// here: hair curls are nearly planar, so the covariance is effectively rank-2 -- measured over
+// 400 of Alice's strands, the median smallest/largest eigenvalue ratio is 1.98e-03 and the
+// median |det| is 2.67e-08. That produced displacements up to 31 METRES on a 94 mm groom.
+// Widening the degeneracy threshold would not have helped: it would route 392 of those 400
+// strands to the crude root-to-tip fallback and discard the very curl information this fit
+// exists to use.
+inline void polarRotation(const double* A, double* R) {
+    double q[4] = { 0, 0, 0, 1 };            // (x, y, z, w)
+    for (int it = 0; it < 24; ++it) {
+        // current frame's columns
+        const double x = q[0], y = q[1], z = q[2], w = q[3];
+        const double r[9] = {
+            1 - 2*(y*y + z*z), 2*(x*y - z*w),     2*(x*z + y*w),
+            2*(x*y + z*w),     1 - 2*(x*x + z*z), 2*(y*z - x*w),
+            2*(x*z - y*w),     2*(y*z + x*w),     1 - 2*(x*x + y*y) };
+        Vec3 num{0, 0, 0};
+        double den = 1e-18;
+        for (int c = 0; c < 3; ++c) {
+            const Vec3 rc{ r[0*3 + c], r[1*3 + c], r[2*3 + c] };
+            const Vec3 ac{ A[0*3 + c], A[1*3 + c], A[2*3 + c] };
+            num = num + cross(rc, ac);
+            den += std::fabs(dot(rc, ac));
+        }
+        const Vec3 omega = num * (1.0 / den);
+        const double ang = length(omega);
+        if (ang < 1e-12) break;
+        const Vec3 ax = omega * (1.0 / ang);
+        const double h = 0.5 * ang, sh = std::sin(h), ch = std::cos(h);
+        const double dq[4] = { ax.x * sh, ax.y * sh, ax.z * sh, ch };
+        const double nx = dq[3]*q[0] + dq[0]*q[3] + dq[1]*q[2] - dq[2]*q[1];
+        const double ny = dq[3]*q[1] - dq[0]*q[2] + dq[1]*q[3] + dq[2]*q[0];
+        const double nz = dq[3]*q[2] + dq[0]*q[1] - dq[1]*q[0] + dq[2]*q[3];
+        const double nw = dq[3]*q[3] - dq[0]*q[0] - dq[1]*q[1] - dq[2]*q[2];
+        const double inv = 1.0 / std::sqrt(nx*nx + ny*ny + nz*nz + nw*nw + 1e-300);
+        q[0] = nx * inv; q[1] = ny * inv; q[2] = nz * inv; q[3] = nw * inv;
     }
-    return mat3det(R) > 0.0;   // a reflection is not a pose
+    const double x = q[0], y = q[1], z = q[2], w = q[3];
+    R[0] = 1 - 2*(y*y + z*z); R[1] = 2*(x*y - z*w);     R[2] = 2*(x*z + y*w);
+    R[3] = 2*(x*y + z*w);     R[4] = 1 - 2*(x*x + z*z); R[5] = 2*(y*z - x*w);
+    R[6] = 2*(x*z - y*w);     R[7] = 2*(y*z + x*w);     R[8] = 1 - 2*(x*x + y*y);
 }
-
 } // namespace detail
 
 // Runs the settle in place. Returns false only if `ftrace -stop` cancelled it mid-way (the
@@ -640,18 +655,11 @@ inline bool run(Scene& sc, const Params& p, std::string& report) {
                         A[3] += q.y*w.x; A[4] += q.y*w.y; A[5] += q.y*w.z;
                         A[6] += q.z*w.x; A[7] += q.z*w.y; A[8] += q.z*w.z;
                     }
-                    double R[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
-                    if (!detail::polarRotation(A, R)) {
-                        // rank-deficient: a straight strand, whose twist about its own axis is
-                        // undetermined AND irrelevant. The minimal rotation carrying the rest
-                        // root->tip onto the current one is the right answer there.
-                        for (int i = 0; i < 9; ++i) R[i] = (i % 4 == 0) ? 1.0 : 0.0;
-                        const Vec3 wr = rest[(size_t)b + (size_t)n - 1] - r0;
-                        const Vec3 wc = pos[(size_t)b + (size_t)n - 1] - p0;
-                        const double lr = length(wr), lc = length(wc);
-                        if (lr > 1e-15 && lc > 1e-15)
-                            detail::rotateOnto(wr * (1.0 / lr), wc * (1.0 / lc), R);
-                    }
+                    // No degeneracy branch: the quaternion iteration returns a valid rotation
+                    // for singular A too (for a collinear strand it simply converges to one of
+                    // the equally-correct rotations about the strand's own axis).
+                    double R[9];
+                    detail::polarRotation(A, R);
                     for (int k = 1; k < n; ++k) {
                         const size_t j = (size_t)b + (size_t)k;
                         const Vec3 tgt = p0 + detail::applyR(R, rest[j] - r0);

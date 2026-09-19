@@ -4957,7 +4957,10 @@ REST shape — which cannot drift by construction and still gives the property t
 `shape local` is kept, documented as drifting, because it is the A/B control that produced this and
 because a correct version would replace it in place.
 
-**`shape rigid` is BUILT (0.351.0) and its A/B is not yet reported.** It is the second of the two
+**`shape rigid` is BUILT and MEASURED (0.352.0) — it does not beat `global`, and the settle line
+of work closes here.** See the verdict two paragraphs down; the description of the method follows.
+
+**`shape rigid` (built 0.351.0, measured 0.352.0).** It is the second of the two
 non-drifting routes named above: one best-fit rotation per strand, obtained from the polar
 decomposition (Higham iteration) of the covariance between the strand's authored offsets and its
 current ones, with the target for particle j being `pos_root + R*(rest_j - rest_root)`. It cannot
@@ -4969,9 +4972,43 @@ swing about its pinned root to clear a neighbour. A rank-deficient covariance (a
 whose rotation about its own axis is both underdetermined and irrelevant) is detected by the
 determinant and falls back to the minimal root-to-tip rotation.
 
-It is **not** the default and must not become one until it beats `shape global` on penetration at
-equal or less displacement — a lower number bought with more movement is only the trade the
-`stiffness` knob already offers.
+**VERDICT: it does not beat `global`, and the first version of it diverged.**
+
+*v1 diverged* — 62.10 % penetrating, mean displacement 22.4 mm, **max 31 metres** on a 94 mm groom.
+The cause was measured rather than guessed, on the solver's input: over 400 of Alice's strands the
+covariance the fit forms has a median smallest/largest eigenvalue ratio of **1.98e-03** and a median
+|det| of **2.67e-08** — hair curls are nearly planar, so that matrix is effectively rank-2, and
+Higham's iteration inverts a matrix at every step. The degeneracy guard asked for `|det| < 1e-300`
+and fired on **0 of 400** strands. Note that widening the threshold would have been the *wrong* fix:
+a scale-aware test fires on 392 of 400, which would route almost every strand to the crude
+root-to-tip fallback and discard exactly the curl information the rigid fit exists to use. Replaced
+with **Mueller's inverse-free quaternion iteration** (2016), which is stable on singular input and
+needs no degeneracy branch.
+
+*Fixed, it is well behaved* — displacement now falls as stiffness rises (2.095 mm at 0.05,
+1.321 mm at 0.20), which is the signature `local` could never produce. But it does not win:
+
+| `shape` | `stiffness` | overlapping | depth | moved mean / max |
+|---|---|---|---|---|
+| global | 0.05 | 54.79 % | 52.8 µm | 1.629 / 6.316 mm |
+| rigid | 0.05 | **52.62 %** | 51.1 µm | 2.095 / 7.226 mm |
+| rigid | 0.20 | 55.79 % | 52.4 µm | **1.321 / 4.992 mm** |
+
+Rigid **brackets** global rather than dominating it: better penetration at more displacement, or
+less displacement at worse penetration. Interpolating the rigid rows to global's 1.629 mm gives
+≈54.53 % against global's 54.79 % — a 0.26 pp difference, comfortably inside the 0.6 pp standard
+error at n=8000. **Both formulations lie on the same penetration-versus-displacement frontier.**
+
+That is the informative part, and it is why this line of work closes. Three different shape
+constraints — a global position spring, a drifting local frame, and a correct per-strand rigid fit —
+all land on the same frontier. The shape constraint's *form* is therefore not what limits the
+settle; the frontier is set by the contact resolution itself. Anything further has to change how
+contacts are resolved (Gauss-Seidel ordering or graph colouring instead of Jacobi projection,
+or a genuinely sub-fiber-scale collective term), not how the strand's shape is held.
+
+`shape rigid` stays available and is the best single penetration number measured (52.62 %); `global`
+remains the default because it is the better trade at equal displacement and is what every shipped
+number was measured with.
 
 **A tooling fix that this measurement forced (0.351.0).** `tools/hair_penetration.py` parsed a
 65 MB / 1.22 M-line `-dumpcurves` with a per-line Python `split()`, costing ~90 s per file and paid
