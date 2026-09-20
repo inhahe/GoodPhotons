@@ -1903,6 +1903,30 @@ uniform scale; a **non-uniform** scale prints a `[ftsl] warning:` and uses the
 volume-preserving geometric mean of the three axis scales, because a round fiber cannot
 become elliptical.
 
+**`specular <value>` — a coloured cuticle (0.355.0).** Tints the fiber's R lobe, i.e. the light
+reflected off the outside of the cuticle, and *only* that lobe. Default 1 is the plain dielectric
+Fresnel every scene before this got. Takes a scalar, an `rgb`, a spectrum, or `pattern:<name>` to
+vary it over the fiber, and is clamped to [0,1] so it can only absorb.
+
+It exists because **absorption cannot colour a specular**. `reflect` is inverted into the fiber's
+interior absorption (`sigma_a`), so it tints light that went *through* the hair; the cuticle's
+surface reflection stays near-neutral whatever you do to it. A silver, gold or otherwise metallic
+fiber needs the reflection itself tinted, which is what this is.
+
+Deliberately **not** tinted: the transmitted lobes keep the untinted `(1-f)` that physically enters
+the fiber, the internal Fresnel events stay untinted because they are not the outer surface, and
+the medulla-scattered lobes are untouched because they describe light that already got inside. What
+the tint removes is absorbed by the cuticle and simply gone, so the fiber stays energy-conserving
+and `ftrace -checkhair`'s white-furnace identity still closes at 2e-12.
+
+Measured on a dark fiber where R dominates, `specular 0` -> `specular 1` moves the highlight
++12.8 % (CPU) / +10.1 % (GPU), the two backends agreeing to 1.38 %.
+
+**What you did NOT need this for**, checked before it was built: `reflect 0.97` already gives
+unpigmented white/grey hair (measured mean RGB 79/77/73 against brown's 86/79/64); `hair_sigma_a 0`
+with a tight `beta_n` gives near-clear hair; and `eta` has always been authorable, so the cuticle
+could already be made more or less reflective. Only the *colour* of the sheen was missing.
+
 | `spline <s>` | `uniform` (default) \| `centripetal` \| `chordal` \| a raw alpha — the Catmull-Rom knot rule, the same key `camera_curve` takes. `uniform` is bit-identical to before; `centripetal` stops the overshoot uneven control points produce (0.326.0) |
 
 #### Curves of curves — the recursive form (0.326.0)
@@ -2213,6 +2237,14 @@ stiffness and contact.
   frame; `tools/settle_rig.py` checks byte-identity of two runs as a standing test.
 - **`settle { iterations 0 }` is byte-identical to no block at all**, which is the control the rig
   uses to tell the solver's effect from the scene merely reloading.
+- **Gravity is optional, and turning it off is usually the better choice.** `droop 0` disables it
+  entirely while separation still runs. Measured on Alice: with gravity the settle leaves 55.33 % of
+  segments overlapping for a mean displacement of 1.582 mm; **without it, 55.74 % for 0.426 mm** —
+  statistically the same de-overlap for **3.7x less disturbance** to the shape you authored. If the
+  curves *are* the intended look rather than a rest pose to be draped, author with `droop 0`.
+  Note that `droop` is not a gravitational constant and is not in m/s^2: this is a velocity-free
+  quasi-static relaxation with no mass and no time step, so `droop` is a displacement injected per
+  sweep, scaled by the groom's diagonal to stay resolution- and scale-independent.
 - **It is cached, and has to be.** The settle costs ~2 minutes on Alice's 1.2 M segments, a
   `camera_curve` flyby re-loads the scene once per frame, and the CPU and CUDA backends each load it
   too — so without a cache the same deterministic answer would be recomputed hundreds of times. The

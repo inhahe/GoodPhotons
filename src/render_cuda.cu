@@ -572,6 +572,10 @@ struct DMaterial {
     // hairSigmaA[] is the explicit absorption spectrum. Dual scattering and the fur-volume
     // aggregate stay CPU-only (main.cpp gates them off the GPU path).
     double hairEta, hairBetaM, hairBetaN, hairAlpha, hairKappa, hairMedullaG;
+    // Cuticle reflectance tint (host twin Material::hairSpecular). Spectral, because a
+    // coloured sheen is the whole point; 1 everywhere reproduces the plain dielectric Fresnel.
+    double hairSpecular[SPEC_N];
+    int    hairSpecPat;
     double hairSigmaA[SPEC_N];
     double hairMedullaSigmaS[SPEC_N];
     double hairMedullaSigmaA[SPEC_N];
@@ -4306,6 +4310,10 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
 // VERTEX while the BVH traverses hundreds of thousands of curve segments per RAY, so
 // FP64 here is not the bottleneck. Only the frame/impact-parameter geometry (built from
 // Real-precision hit data, which is already float-noisy) stays in Real.
+// Forward declaration: dhair sits far above the pattern helpers in this file, and the
+// cuticle tint needs one. Host twin hair_shade.h calls slotPatMul directly.
+__device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit& h);
+
 namespace dhair {
 
 constexpr double kPi = 3.14159265358979323846;
@@ -4418,17 +4426,18 @@ __device__ static double frDielectric(double cosThetaI, double etaI, double etaT
 
 // Attenuation A_p: Fresnel at each crossing + Beer-Lambert through the interior; the
 // p = kPMax entry is the closed-form geometric tail (energy conservation).
-__device__ static void ApFromF(double f, double T, double ap[kPMax + 1]) {
-    ap[0] = f;                                   // R
+__device__ static void ApFromF(double f, double T, double ap[kPMax + 1], double specR = 1.0) {
+    ap[0] = f * specR;                           // R, tinted by the cuticle reflectance
     ap[1] = sqr(1.0 - f) * T;                    // TT
     for (int p = 2; p < kPMax; ++p) ap[p] = ap[p - 1] * T * f;
     const double denom = 1.0 - T * f;
     ap[kPMax] = (denom > 1e-12) ? ap[kPMax - 1] * f * T / denom : 0.0;
 }
-__device__ static void Ap(double cosThetaO, double eta, double h, double T, double ap[kPMax + 1]) {
+__device__ static void Ap(double cosThetaO, double eta, double h, double T,
+                          double ap[kPMax + 1], double specR = 1.0) {
     const double cosGammaO = safeSqrt(1.0 - h * h);
     const double f = frDielectric(cosThetaO * cosGammaO, 1.0, eta);
-    ap[0] = f;                                   // R
+    ap[0] = f * specR;                           // R, tinted by the cuticle reflectance
     ap[1] = sqr(1.0 - f) * T;                    // TT
     for (int p = 2; p < kPMax; ++p) ap[p] = ap[p - 1] * T * f;
     const double denom = 1.0 - T * f;
@@ -4438,6 +4447,7 @@ __device__ static void Ap(double cosThetaO, double eta, double h, double T, doub
 // Authored parameters (device twin of hair::Params; see hair.h for semantics).
 struct Params {
     double eta   = 1.55;
+    double specR = 1.0;    // cuticle reflectance tint, host twin hair::Params::specR
     double betaM = 0.3;
     double betaN = 0.3;
     double alpha = 2.0;
@@ -4451,6 +4461,7 @@ struct Params {
 struct Bcsdf {
     double h = 0.0, gammaO = 0.0;
     double eta = 1.55, sigmaA = 0.0;
+    double specR = 1.0;
     double v[kPMax + 1] = {0, 0, 0, 0};   // longitudinal variances per lobe
     double s = 0.0;                       // azimuthal logistic scale
     double sin2kAlpha[3] = {0, 0, 0}, cos2kAlpha[3] = {1, 1, 1};
@@ -4474,6 +4485,7 @@ __device__ static Bcsdf make(const Params& pr, double h, double sigmaA) {
     b.h      = clampd(h, -1.0, 1.0);
     b.gammaO = asin(b.h);
     b.eta    = pr.eta;
+    b.specR  = (pr.specR < 0.0) ? 0.0 : (pr.specR > 1.0 ? 1.0 : pr.specR);
     b.sigmaA = fmax(0.0, sigmaA);
     // Chiang's perceptual-roughness fits (hair.h::make).
     const double bm = clampd(pr.betaM, 1e-4, 1.0);
@@ -4600,11 +4612,12 @@ __device__ static inline double scatteredS(const Bcsdf& b, double spread) {
 struct LobeAngular {
     double G[kPMax + 1];
     double F, len, invCosI;
+    double specR;
     bool   valid;
 };
 __device__ static double fFromLobes(const LobeAngular& la, double sigmaA) {
     double ap[kPMax + 1];
-    ApFromF(la.F, exp(-fmax(0.0, sigmaA) * la.len), ap);
+    ApFromF(la.F, exp(-fmax(0.0, sigmaA) * la.len), ap, la.specR);
     double sum = 0.0;
     for (int p = 0; p <= kPMax; ++p) sum += la.G[p] * ap[p];
     sum *= la.invCosI;
@@ -4622,7 +4635,7 @@ __device__ __noinline__ static double f(const Bcsdf& b, const V3& wo, const V3& 
     const double gammaT = ch.gammaT;
 
     double ap[kPMax + 1];
-    Ap(cosThetaO, b.eta, b.h, ch.T, ap);
+    Ap(cosThetaO, b.eta, b.h, ch.T, ap, b.specR);
 
     double sum = 0.0;
     for (int p = 0; p < kPMax; ++p) {
@@ -4672,7 +4685,7 @@ __device__ __noinline__ static double f(const Bcsdf& b, const V3& wo, const V3& 
 __device__ static void apPdf(const Bcsdf& b, double sinThetaO, double cosThetaO, double pdf[kNLobes]) {
     const Chord ch = refractGeom(b, sinThetaO, cosThetaO);
     double ap[kPMax + 1];
-    Ap(cosThetaO, b.eta, b.h, ch.T, ap);
+    Ap(cosThetaO, b.eta, b.h, ch.T, ap, b.specR);
     double aps[2] = {0.0, 0.0};
     if (b.hasMedulla) ApScattered(ch, cosThetaO, b.eta, b.h, aps);
     double total = 0.0;
@@ -4872,6 +4885,11 @@ __device__ __noinline__ static DHairShade dHairShadeAt(const DScene& sc, const D
                                           Real lambda, const DVec3& wPrev) {
     dhair::Params pr;
     pr.eta   = m.hairEta;
+    {   // the cuticle tint; host twin hair_shade.h hairSpecularAt()
+        double sp = (double)specLookup(m.hairSpecular, lambda);
+        if (m.hairSpecPat >= 0) sp *= (double)clamp01(dPatternScalarAt(sc, m.hairSpecPat, h));
+        pr.specR = sp < 0.0 ? 0.0 : (sp > 1.0 ? 1.0 : sp);
+    }
     pr.betaM = m.hairBetaM;
     pr.betaN = m.hairBetaN;
     pr.alpha = m.hairAlpha;
@@ -17620,6 +17638,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         // the hit (texture/pattern-driven), so the device inverts per-hit exactly like
         // the CPU hairShadeAt.
         d.hairEta      = m.hairEta;
+        bakeSpec(m.hairSpecular, d.hairSpecular);
+        d.hairSpecPat  = m.hairSpecPat;
         d.hairBetaM    = m.hairBetaM;
         d.hairBetaN    = m.hairBetaN;
         d.hairAlpha    = m.hairAlpha;

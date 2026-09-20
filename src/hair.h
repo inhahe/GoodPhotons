@@ -198,20 +198,21 @@ inline double frDielectric(double cosThetaI, double etaI, double etaT) {
 
 // The lobe attenuations from the cuticle's Fresnel term `f` and one traversal's survival T
 // (split out of Ap: the Fresnel term does not depend on wavelength, T does).
-inline void ApFromF(double f, double T, double ap[kPMax + 1]) {
-    ap[0] = f;                                   // R
+inline void ApFromF(double f, double T, double ap[kPMax + 1], double specR = 1.0) {
+    ap[0] = f * specR;                           // R, tinted by the cuticle reflectance
     ap[1] = sqr(1.0 - f) * T;                    // TT
     for (int p = 2; p < kPMax; ++p) ap[p] = ap[p - 1] * T * f;
     const double denom = 1.0 - T * f;
     ap[kPMax] = (denom > 1e-12) ? ap[kPMax - 1] * f * T / denom : 0.0;
 }
-inline void Ap(double cosThetaO, double eta, double h, double T, double ap[kPMax + 1]) {
+inline void Ap(double cosThetaO, double eta, double h, double T, double ap[kPMax + 1],
+               double specR = 1.0) {
     const double cosGammaO = safeSqrt(1.0 - h * h);
     // The Fresnel angle is the FULL 3-D incidence on the cylinder wall, which is the
     // longitudinal and azimuthal cosines multiplied — not cosThetaO alone. Getting this
     // wrong is invisible head-on and wrong by tens of percent at grazing.
     const double f = frDielectric(cosThetaO * cosGammaO, 1.0, eta);
-    ap[0] = f;                                   // R
+    ap[0] = f * specR;                           // R, tinted by the cuticle reflectance
     ap[1] = sqr(1.0 - f) * T;                    // TT
     for (int p = 2; p < kPMax; ++p) ap[p] = ap[p - 1] * T * f;
     const double denom = 1.0 - T * f;
@@ -229,6 +230,12 @@ struct Params {
     double betaM = 0.3;    // longitudinal roughness [0, 1]
     double betaN = 0.3;    // azimuthal roughness   [0, 1]
     double alpha = 2.0;    // cuticle scale tilt, degrees
+    // The cuticle's reflectance TINT, [0,1], default 1 = plain dielectric Fresnel. Multiplies
+    // the R lobe only: what it removes is absorbed by the cuticle, so the fiber stays energy-
+    // conserving, and the transmitted lobes keep the untinted (1-f) that physically enters.
+    // This is what makes a SILVER or otherwise metallic fiber possible; no combination of
+    // absorption and index can colour a dielectric specular.
+    double specR = 1.0;
 
     // --- the MEDULLA (P3 stage 3; Yan et al. 2015/2017) ----------------------
     // Animal fur is not a solid rod. It has a hollow, structured core — the medulla —
@@ -265,6 +272,7 @@ struct Bcsdf {
     // branch and executes the exact stage-1 arithmetic.
     bool   hasMedulla = false;
     double kappa = 0.0, mSigmaS = 0.0, mSigmaA = 0.0, mG = 0.0;
+    double specR = 1.0;        // cuticle reflectance tint, copied from Params by make()
 };
 
 // Everything a single interior traversal of the fiber does to a ray: where it comes out
@@ -288,6 +296,7 @@ inline Bcsdf make(const Params& pr, double h, double sigmaA) {
     b.h      = clampd(h, -1.0, 1.0);
     b.gammaO = std::asin(b.h);
     b.eta    = pr.eta;
+    b.specR  = (pr.specR < 0.0) ? 0.0 : (pr.specR > 1.0 ? 1.0 : pr.specR);
     b.sigmaA = std::max(0.0, sigmaA);
 
     // Chiang's roughness fits. The high powers (20, 22) are not curve-fitting noise:
@@ -447,6 +456,9 @@ inline void ApScattered(const Chord& ch, double cosThetaO, double eta, double h,
     aps[0] = aps[1] = 0.0;
     if (ch.albedoM <= 0.0) return;
     double apMed[kPMax + 1], apSolid[kPMax + 1];
+    // NOT tinted: these are the MEDULLA-scattered lobes, i.e. light that already entered the
+    // fiber, so the cuticle's external reflectance tint does not apply to them. Tinting here
+    // would also break the white-furnace identity -checkhair S1 asserts at 1e-12.
     Ap(cosThetaO, eta, h, ch.T, apMed);
     Ap(cosThetaO, eta, h, ch.Tsolid, apSolid);
     double missing = 0.0;
@@ -497,11 +509,12 @@ inline double scatteredS(const Bcsdf& b, double spread) {
 struct LobeAngular {
     double G[kPMax + 1] = {0, 0, 0, 0};
     double F = 0.0, len = 0.0, invCosI = 1.0;
+    double specR = 1.0;        // carried so the spectral fold tints the same lobe f() does
     bool   valid = false;
 };
 inline double fFromLobes(const LobeAngular& la, double sigmaA) {
     double ap[kPMax + 1];
-    ApFromF(la.F, std::exp(-std::max(0.0, sigmaA) * la.len), ap);
+    ApFromF(la.F, std::exp(-std::max(0.0, sigmaA) * la.len), ap, la.specR);
     double sum = 0.0;
     for (int p = 0; p <= kPMax; ++p) sum += la.G[p] * ap[p];
     sum *= la.invCosI;
@@ -519,7 +532,7 @@ inline double f(const Bcsdf& b, const Vec3& wo, const Vec3& wi, LobeAngular* la 
     const double gammaT = ch.gammaT;
 
     double ap[kPMax + 1];
-    Ap(cosThetaO, b.eta, b.h, ch.T, ap);
+    Ap(cosThetaO, b.eta, b.h, ch.T, ap, b.specR);
 
     double sum = 0.0;
     for (int p = 0; p < kPMax; ++p) {
@@ -583,7 +596,7 @@ inline bool lobeAngular(const Bcsdf& b, const Vec3& wo, const Vec3& wi, LobeAngu
 inline void apPdf(const Bcsdf& b, double sinThetaO, double cosThetaO, double pdf[kNLobes]) {
     const Chord ch = refractGeom(b, sinThetaO, cosThetaO);
     double ap[kPMax + 1];
-    Ap(cosThetaO, b.eta, b.h, ch.T, ap);
+    Ap(cosThetaO, b.eta, b.h, ch.T, ap, b.specR);
     double aps[2] = {0.0, 0.0};
     if (b.hasMedulla) ApScattered(ch, cosThetaO, b.eta, b.h, aps);
     double total = 0.0;

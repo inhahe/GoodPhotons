@@ -84,10 +84,20 @@ inline const double* hairSigmaBins(const Scene& scene, const Material& m, const 
     return it->second.data();
 }
 
+// The cuticle reflectance tint at a hit, clamped to [0,1]. Factored out because there are TWO
+// places that build hair::Params -- hairShadeAt and hairDualFor -- and teaching only one of them
+// is exactly the bug this was written to fix: `specular` parsed, stored and did nothing.
+inline double hairSpecularAt(const Scene& scene, const Material& m, const Hit& hit, double lambda) {
+    double sp = m.hairSpecular(lambda);
+    if (m.hairSpecPat >= 0) sp *= slotPatMul(scene, m.hairSpecPat, hit);
+    return sp < 0.0 ? 0.0 : (sp > 1.0 ? 1.0 : sp);
+}
+
 inline HairShade hairShadeAt(const Scene& scene, const Material& m, const Hit& hit,
                              double lambda, const Vec3& wPrev) {
     hair::Params pr;
     pr.eta   = m.hairEta;
+    pr.specR = hairSpecularAt(scene, m, hit, lambda);
     pr.betaM = m.hairBetaM;
     pr.betaN = m.hairBetaN;
     pr.alpha = m.hairAlpha;
@@ -161,6 +171,7 @@ inline const hair::Dual* hairDualFor(const Scene& scene, const Material& m, int 
                                      const Hit& hit, double lambda) {
     hair::Params pr;
     pr.eta = m.hairEta; pr.betaM = m.hairBetaM; pr.betaN = m.hairBetaN; pr.alpha = m.hairAlpha;
+    pr.specR = hairSpecularAt(scene, m, hit, lambda);
     pr.kappa = m.hairKappa; pr.mG = m.hairMedullaG;
     pr.mSigmaS = std::max(0.0, m.hairMedullaSigmaS(lambda));
     pr.mSigmaA = std::max(0.0, m.hairMedullaSigmaA(lambda));

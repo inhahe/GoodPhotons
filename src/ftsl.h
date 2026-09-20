@@ -4821,6 +4821,11 @@ private:
             // inversion needs the final hairBetaN, so it happens at shading time, not here.
             m.reflect   = reflectParam(b, m, constantSpectrum(0.3));
             m.hairEta   = dblParam(b, "eta",    havePreset ? sp.eta      : 1.55);
+            // `specular` tints the cuticle reflection (the R lobe). Default 1 keeps the plain
+            // dielectric Fresnel every existing scene already has. Accepts a spectrum/rgb like
+            // any colour slot, or `pattern:<name>` to vary it over the fiber.
+            if (bindScalarPattern(b, "specular", m.hairSpecPat)) m.hairSpecular = constantSpectrum(1.0);
+            else if (find(b, "specular")) m.hairSpecular = spectrumParam(b, "specular", m.hairSpecular);
             m.hairAlpha = dblParam(b, "alpha",  havePreset ? sp.alphaDeg : 2.0);
             m.hairBetaM = clamp01d(dblParam(b, "beta_m",
                                    havePreset ? hair::betaMFromDegrees(sp.betaMDeg) : 0.3));

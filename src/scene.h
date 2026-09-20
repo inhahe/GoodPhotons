@@ -285,6 +285,12 @@ struct Material {
     // fiber should end up, `reflect`, inverted through Chiang eq. 9 (`sigmaAFromReflectance`)
     // at load time. `hairSigmaAFromReflect` records which spelling was used; the inversion
     // depends on hairBetaN, so it must run after the whole block is parsed.
+    // The cuticle reflectance tint (`specular` on a `type hair` material). 1 = plain
+    // dielectric Fresnel, which is what every scene written before this got. Spectral, so a
+    // fiber can have a COLOURED sheen -- silver, gold, or a dichroic tint -- which absorption
+    // alone cannot express, and pattern-bindable like any other scalar slot.
+    Spectrum hairSpecular = constantSpectrum(1.0);
+    int      hairSpecPat  = -1;
     Spectrum hairSigmaA = constantSpectrum(0.0);
     bool     hairSigmaAFromReflect = true;
     // --- The MEDULLA (Yan et al. 2015/2017) ---------------------------------
