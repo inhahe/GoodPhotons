@@ -1927,10 +1927,30 @@ opaque baseline, on a test whose repetitions scatter by more than that). In prin
 grows with transparency, because a ray crosses more fibers before terminating; in practice it did
 not register here.
 
-**Limitation, not hidden: shadow rays still treat a fiber as fully opaque.** So transparent hair
-can be seen through but still casts a solid shadow. `Scene::occluded` is boolean at 48 call sites
-across six files and both backends, so making shadows agree means occlusion returning a
-transmittance -- a much larger change than this one.
+**Shadows agree (0.357.0).** Transparent hair casts a correspondingly lighter shadow, on both
+backends. Measured on a fur ball over a white floor, mean luminance in its shadow:
+
+| `opacity` | CPU | GPU |
+|---|---|---|
+| 1.0 (and no key at all) | 2.158 | 2.103 |
+| 0.5 | 2.686 | 2.459 |
+| 0.15 | 3.281 | 2.905 |
+
+This needed far less surgery than the 48 boolean `occluded()` call sites suggested, because every
+NEE visibility test funnels through one lambda inside `emitterGeom` -- which is also where the
+geometric weight is computed, so folding the transmittance into that weight reaches the scalar,
+hero, spectral-glossy and fiber connections at once. `occluded()` itself is untouched: its other
+callers (camera visibility, caustic aiming, the dual-grid walk) want a hard yes/no, and a fiber
+that stopped blocking those would be a new bug rather than a fix.
+
+The transmittances MULTIPLY along the ray rather than being sampled stochastically -- a random
+accept/reject per fiber would be equally unbiased but would put noise into every hair shadow,
+which is where noise shows most.
+
+*Residual worth knowing:* the two backends agree on the direction and rough size but not exactly --
+the shadow lightens 1.52x on the CPU against 1.38x on the GPU between opacity 1.0 and 0.15. This
+scene already carries a 2.5 % baseline backend gap, and the GPU runs `Real` as float; the
+difference has not been chased further.
 
 **`specular <value>` — a coloured cuticle (0.355.0).** Tints the fiber's R lobe, i.e. the light
 reflected off the outside of the cuticle, and *only* that lobe. Default 1 is the plain dielectric

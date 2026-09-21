@@ -3724,6 +3724,10 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
 // default) for an NEE / light-connection segment: a hidden flat still shadows, or turning
 // off primary visibility would silently change the lighting. Device twin of
 // Scene::occluded's `camLeg` (scene.h).
+// Forward declaration: both shadowTransmittance below and dhair further down need the
+// pattern evaluator, which is defined ~3800 lines later in this file.
+__device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit& h);
+
 __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& dir,
                                  Real maxDist, Real tmin = RAY_EPS, bool camLeg = false) {
     if (sc.nNodes == 0) return false;
@@ -3775,6 +3779,66 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
         }
     }
     return false;
+}
+
+// Fraction of a shadow ray that SURVIVES to maxDist: 1 clear, 0 blocked, in between when it
+// crosses hair whose `opacity` is below 1. Host twin Scene::shadowTransmittance. Opaque
+// geometry still early-outs, so a scene with no transparent fiber pays one extra branch per
+// fiber hit and nothing else. Deterministic (the coverages multiply) rather than a random
+// accept/reject, because hair shadows are exactly where stochastic noise shows most.
+__device__ static Real shadowTransmittance(const DScene& sc, const DVec3& o, const DVec3& dir,
+                                           Real maxDist, Real lambda, Real tmin = RAY_EPS) {
+    if (sc.nNodes == 0) return (Real)1;
+    DVec3 invD{(Real)1 / dir.x, (Real)1 / dir.y, (Real)1 / dir.z};
+    const DTriShear sh = makeTriShear(dir);
+    const DCurveRay cray = sc.nCurveSegs ? makeCurveRay(dir) : DCurveRay{DVec3{(Real)0,(Real)0,(Real)1}, (Real)1};
+    Real tMax = maxDist - tmin;
+    Real tRoot;
+    if (!boxHit(sc.nodes[0], o, invD, tmin, tMax, tRoot)) return (Real)1;
+    double T = 1.0;
+    int stack[64]; int sp = 0; stack[sp++] = 0;
+    while (sp) {
+        const DNode& n = sc.nodes[stack[--sp]];
+        if (n.count > 0) {
+            for (int i = 0; i < n.count; ++i) {
+                int prim = sc.primIdx[n.first + i];
+                DHit h; h.t = tMax; h.valid = false;
+                bool blocked;
+                if (prim < sc.nTris)                              { blocked = intersectTri(sh, o, dir, sc.tris[prim], tmin, h); }
+                else if (prim < sc.nTris + sc.nSph)               { blocked = intersectSphere(o, dir, sc.sph[prim - sc.nTris], tmin, h); }
+                else if (prim < sc.nTris + sc.nSph + sc.nImplicits) { blocked = intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], o, dir, tmin, h, true); }
+                else if (prim < sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs) {
+                    const DCurveSeg& cs = sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits];
+                    const DMaterial& cm = sc.mats[cs.matId];
+                    const bool soft = (cm.type == D_HAIR) &&
+                                      ((double)specLookup(cm.hairOpacity, lambda) < 1.0 || cm.hairOpacityPat >= 0);
+                    if (!soft) blocked = intersectCurveSeg(cray, o, dir, cs, tmin, h, true);
+                    else {
+                        // transparent fiber: resolve fully (anyHit skips the surface parameters a
+                        // bound opacity pattern needs) and attenuate rather than block
+                        if (!intersectCurveSeg(cray, o, dir, cs, tmin, h, false)) blocked = false;
+                        else {
+                            double op = (double)specLookup(cm.hairOpacity, lambda);
+                            if (cm.hairOpacityPat >= 0) op *= clamp01(dPatternScalarAt(sc, cm.hairOpacityPat, h));
+                            op = op < 0.0 ? 0.0 : (op > 1.0 ? 1.0 : op);
+                            T *= (1.0 - op);
+                            blocked = (T <= 1e-4);
+                        }
+                    }
+                }
+                else {
+                    const DInstance& inst = sc.instances[prim - sc.nTris - sc.nSph - sc.nImplicits - sc.nCurveSegs];
+                    blocked = blasOccluded(sc, inst, affPoint(inst.Lm, inst.Lt, o), affDir(inst.Lm, dir), tmin, tMax);
+                }
+                if (blocked) return (Real)0;
+            }
+        } else {
+            Real tc;
+            if (boxHit(sc.nodes[n.left],  o, invD, tmin, tMax, tc)) stack[sp++] = n.left;
+            if (boxHit(sc.nodes[n.right], o, invD, tmin, tMax, tc)) stack[sp++] = n.right;
+        }
+    }
+    return (Real)T;
 }
 
 // Largest coordinate magnitude of a point: the scale that sets one float ulp of its position.
@@ -4312,10 +4376,6 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
 // VERTEX while the BVH traverses hundreds of thousands of curve segments per RAY, so
 // FP64 here is not the bottleneck. Only the frame/impact-parameter geometry (built from
 // Real-precision hit data, which is already float-noisy) stays in Real.
-// Forward declaration: dhair sits far above the pattern helpers in this file, and the
-// cuticle tint needs one. Host twin hair_shade.h calls slotPatMul directly.
-__device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit& h);
-
 namespace dhair {
 
 constexpr double kPi = 3.14159265358979323846;
@@ -10580,7 +10640,11 @@ __device__ static bool bkHairBlocked(const DScene& sc, const DHit& h, const DHai
 // point sampling, falloff, cosLight, 1/dist^2 — is shared). No rng draw moves either way.
 __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec3& ngo,
                                      const DEmitter& em, Real su1, Real su2, BkNeeGeom& g,
-                                     const DHairShade* hs = nullptr) {
+                                     const DHairShade* hs = nullptr,
+                                     Real lambda = (Real)550) {
+    // Shadow transmittance, not a yes/no: hair with `opacity` below 1 attenuates. Folded into
+    // the geometric weight at each exit, so every device NEE consumer inherits it untouched.
+    Real vis = (Real)1;
     if (em.shape == 2) {
         // Point spot (device twin of emitterGeom's spot branch): deterministic connect
         // to the light point, cone falloff toward the surface, no rng draw. Peak
@@ -10600,7 +10664,8 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         g.fall = (Real)spotFalloff(dot(g.wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
         if (g.fall <= (Real)0) return false;
         if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
-               : occludedTo(sc, dOffsetAlong(h.p, h.ng, g.wi), h.p + g.wi * g.dist, 2 * RAY_EPS)) return false;
+               : !((vis = shadowTransmittance(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, g.dist, lambda)) > (Real)0)) return false;
+        g.fall = (Real)((double)g.fall * (double)vis);
         g.G = (Real)0; g.spot = true; g.sun = false;
         g.pdfW = (Real)0;                                   // delta: no lobe sample can reach it
         return true;
@@ -10623,8 +10688,8 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         g.dist = (Real)((double)length(sc.sceneCenter - h.p) + sc.sceneRadius);
         g.dist2 = g.dist * g.dist;
         if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
-               : occluded(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, g.dist)) return false;
-        g.wSun = (Real)((double)g.cosSurf * em.spotOmega * (double)g.stG);
+               : !((vis = shadowTransmittance(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, g.dist, lambda)) > (Real)0)) return false;
+        g.wSun = (Real)((double)g.cosSurf * em.spotOmega * (double)g.stG * (double)vis);
         g.G = (Real)0; g.fall = (Real)1; g.spot = false; g.sun = true;
         g.pdfW = (em.spotOmega > 0) ? (Real)(1.0 / em.spotOmega) : (Real)0;   // uniform in cone
         return true;
@@ -10656,7 +10721,7 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     Real cosLight = dot(nL, -g.wi);               // light is one-sided
     if (cosLight <= 0) return false;
     if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
-           : occludedTo(sc, dOffsetAlong(h.p, h.ng, g.wi), h.p + g.wi * g.dist, 2 * RAY_EPS)) return false;
+           : !((vis = shadowTransmittance(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, g.dist, lambda)) > (Real)0)) return false;
     // Side test above: authored normal. Measure below: the patch's own orientation, since the
     // solid angle a patch subtends depends on how it is oriented and not on where its emission is
     // aimed. Host twin backward.h's emitterGeom, where the reasoning lives. Bit-identical unless
@@ -10665,7 +10730,7 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
                               ? fabs((double)ddot(em.nGeom, g.wi * (Real)(-1)))
                               : (double)cosLight;
     if (!(cosGeo > 0.0)) return false;
-    g.G = (Real)((double)g.cosSurf * cosGeo / (double)g.dist2);
+    g.G = (Real)((double)g.cosSurf * cosGeo / (double)g.dist2 * (double)vis);
     if (epat != 1.0) g.G = (Real)((double)g.G * epat);   // no-op without a pattern
     g.fall = (Real)1; g.spot = false; g.sun = false;
     // Uniform over em.area, so pdf_W = pdf_A * dist^2 / cos(light). `epat` is a radiance

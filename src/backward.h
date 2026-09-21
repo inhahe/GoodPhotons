@@ -467,7 +467,8 @@ struct BackwardRenderer {
                      Vec3& wiOut,
                      const HairShade* hs = nullptr,
                      const HairDualCtx* dctx = nullptr,
-                     double* pdfWOut = nullptr) const {
+                     double* pdfWOut = nullptr,
+                     double lambda = 550.0) const {
         if (pdfWOut) *pdfWOut = 0.0;                     // delta unless a branch says otherwise
         // Dual scattering (P3 stage 4) makes the shadow ray part of the SHADING: what it
         // counts on the way to the light is the forward-scattering transmittance, so the
@@ -503,12 +504,20 @@ struct BackwardRenderer {
             if (stG <= 0.0) return false;                  // behind true geometry: hard shadow
             return true;
         };
+        // How much of the shadow ray SURVIVES, not merely whether anything was hit: hair with
+        // `opacity` below 1 attenuates rather than blocks. Folded into `w` at each of the four
+        // exits below, so every NEE consumer gets it for free.
+        double vis = 1.0;
         auto blocked = [&](const Vec3& wi, double d, double shorten) -> bool {
+            vis = 1.0;
             if (hs && dctx) return dualBlocked;     // already walked, inside response()
             // GPU-SPHERELIGHT / hostConnMaxT: shorten by a RELATIVE amount with the caller's
             // absolute epsilon as a floor. `shorten == 0` still means "do not shorten at all"
             // (the distant sun's far end is the scene EXIT, not a sampled surface point).
-            if (!hs) return scene.occluded(h.p + ngo * 1e-6, wi, hostConnMaxT(d, shorten));
+            if (!hs) {
+                vis = scene.shadowTransmittance(h.p + ngo * 1e-6, wi, hostConnMaxT(d, shorten), lambda);
+                return !(vis > 0.0);
+            }
             const double off = hairExitOffset(*hs, h.n, wi);
             const double len = d - off - 1e-6;
             if (len <= 0.0) return true;
@@ -517,7 +526,8 @@ struct BackwardRenderer {
             // very strands the far tier is pretending not to have as blockers and make the
             // whole coat self-shadow to black.
             if (hs->aggregate) return scene.occludedSkipHair(h.p + wi * off, wi, len);
-            return scene.occluded(h.p + wi * off, wi, len);
+            vis = scene.shadowTransmittance(h.p + wi * off, wi, len, lambda);
+            return !(vis > 0.0);
         };
         if (em.collimated) return false;                  // beams aren't area-samplable
         if (em.shape == EmitterShape::Spot) {
@@ -532,7 +542,7 @@ struct BackwardRenderer {
             double fall = spotFalloff(dot(-wi, em.beamDir), em.spotCosInner, em.spotCosOuter);
             if (fall <= 0) return false;
             if (blocked(wi, dist, 2e-6)) return false;
-            w = fall * cosSurf / dist2 * stG;                // I(w)/dist^2 (× BRDF & SPD by caller)
+            w = fall * cosSurf / dist2 * stG * vis;          // I(w)/dist^2 (× BRDF & SPD by caller)
             wiOut = wi;
             return true;
         }
@@ -552,7 +562,7 @@ struct BackwardRenderer {
             double cosSurf, stG;
             if (!response(wi, cosSurf, stG)) return false;
             if (blocked(wi, dist, 0.0)) return false;
-            w = cosSurf * em.spotOmega * stG;
+            w = cosSurf * em.spotOmega * stG * vis;
             if (pdfWOut) *pdfWOut = (em.spotOmega > 0.0) ? 1.0 / em.spotOmega : 0.0;
             wiOut = wi;
             return true;
@@ -578,7 +588,7 @@ struct BackwardRenderer {
             double cosSurf, stG;
             if (!response(wi, cosSurf, stG)) return false;
             if (blocked(wi, dist, 2e-6)) return false;
-            w = cosSurf / pdfW * stG;                        // solid-angle measure
+            w = cosSurf / pdfW * stG * vis;                  // solid-angle measure
             if (pdfWOut) *pdfWOut = pdfW;                    // already in solid-angle measure
             wiOut = wi;
             return true;
@@ -608,7 +618,7 @@ struct BackwardRenderer {
         const double cosGeo = em.normalTilted ? std::fabs(dot(em.nGeom, wi * -1.0)) : cosLight;
         if (!(cosGeo > 0.0)) return false;
         double G = cosSurf * cosGeo / dist2;             // geometry term
-        w = G * effArea * stG;                           // pdf_area = 1/effArea (visible area for cylinder)
+        w = G * effArea * stG * vis;                     // pdf_area = 1/effArea (visible area for cylinder)
         if (epat != 1.0) w *= epat;                      // no-op (and bit-identical) without a pattern
         // Area measure -> solid angle: pdf_W = pdf_A * dist^2 / cos(light). `epat` is a
         // RADIANCE profile folded into `w`, not a change of density, so it does not appear.

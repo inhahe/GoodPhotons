@@ -1392,6 +1392,11 @@ inline double coatTirSecant(double n) {
     return (ct > 1e-6) ? 2.0 / ct : 1.0;
 }
 
+// Forward declaration: shadowTransmittance() below needs the pattern evaluator, which is
+// defined far below this class.
+struct Scene;
+inline double slotPatMul(const Scene& scene, int pat, const Hit& h);
+
 struct Scene {
     std::vector<Tri> tris;
     std::vector<Sphere> spheres;
@@ -2949,6 +2954,55 @@ struct Scene {
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
             return blasList[inst.blasId].occludedLocal(lr, tmin, seg, vcolData());  // world seg == local seg
         });
+    }
+
+    // Fraction of a shadow ray that SURVIVES to `maxDist`: 1 clear, 0 blocked, and in between
+    // when it crosses hair whose `opacity` is below 1. Opaque geometry still early-outs, so a
+    // scene with no transparent fiber costs exactly what occluded() costs plus one branch per
+    // fiber hit.
+    //
+    // Deterministic, not stochastic: the coverages MULTIPLY along the ray. A random accept /
+    // reject per fiber would also be unbiased but would put noise into every shadow, and hair
+    // shadows are exactly where noise is most visible.
+    double shadowTransmittance(const Vec3& o, const Vec3& dir, double maxDist, double lambda,
+                               double tmin = 1e-6) const {
+        ++raystats::tls;
+        Ray r{o, dir};
+        const size_t nT = tris.size();
+        const size_t nS = spheres.size();
+        const size_t nI = implicits.size();
+        const size_t nC = curveSegs.size();
+        const double seg = maxDist - tmin;
+        if (!(seg > 0.0)) return 1.0;
+        const TriShear sh = makeTriShear(r.d);
+        const CurveRay cray = nC ? makeCurveRay(r.d) : CurveRay{};
+        const PatTables tabs = patTables();
+        double T = 1.0;
+        const bool hardBlock = bvh.traverseAny(r, tmin, seg, [&](int prim) -> bool {
+            Hit h; h.t = seg;
+            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h, vcolData());
+            if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
+            if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, true);
+            if (prim < (int)(nT + nS + nI + nC)) {
+                const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
+                const Material& cm = mats[(size_t)cs.matId];
+                const bool soft = (cm.type == MatType::Hair) &&
+                                  (cm.hairOpacity(lambda) < 1.0 || cm.hairOpacityPat >= 0);
+                if (!soft) return intersectCurveSeg(cray, r, cs, tmin, h, true);
+                // A transparent fiber: resolve the hit fully (anyHit skips the surface
+                // parameters a bound opacity pattern needs) and attenuate rather than block.
+                if (!intersectCurveSeg(cray, r, cs, tmin, h, false)) return false;
+                double op = cm.hairOpacity(lambda);
+                if (cm.hairOpacityPat >= 0) op *= slotPatMul(*this, cm.hairOpacityPat, h);
+                op = op < 0.0 ? 0.0 : (op > 1.0 ? 1.0 : op);
+                T *= (1.0 - op);
+                return T <= 1e-4;          // effectively opaque: stop walking
+            }
+            const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
+            Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
+            return blasList[inst.blasId].occludedLocal(lr, tmin, seg, vcolData());
+        });
+        return hardBlock ? 0.0 : T;
     }
 
     // Like occluded(), but fibers are INVISIBLE to it: only non-hair geometry blocks.
