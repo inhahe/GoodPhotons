@@ -526,7 +526,7 @@ struct BackwardRenderer {
             // very strands the far tier is pretending not to have as blockers and make the
             // whole coat self-shadow to black.
             if (hs->aggregate) return scene.occludedSkipHair(h.p + wi * off, wi, len);
-            vis = scene.shadowTransmittance(h.p + wi * off, wi, len, lambda);
+            vis = scene.shadowTransmittance(h.p + wi * 1e-6, wi, len, lambda, 1e-6, off);
             return !(vis > 0.0);
         };
         if (em.collimated) return false;                  // beams aren't area-samplable
@@ -1629,7 +1629,7 @@ struct BackwardRenderer {
             } else {
                 // Partial, not yes/no: hair below opacity 1 attenuates the sky rather than
                 // hiding it. Folded into cosSurf, which both callers already multiply by.
-                const double vis = scene.shadowTransmittance(h.p + wi * off, wi, farDist, lambda);
+                const double vis = scene.shadowTransmittance(h.p + wi * 1e-6, wi, farDist, lambda, 1e-6, off);
                 if (!(vis > 0.0)) return false;
                 cosSurf *= vis;
             }
@@ -2157,7 +2157,7 @@ struct BackwardRenderer {
                 // Measured as a +0.5% overshoot when this assigned instead of preserving.
                 if (!passThru) contBsdfPdf = pdfH;     // real pdf -> env-miss MIS is exact
                 // Step clear of the strand's own body: TT/TRT exit the far side.
-                ray = Ray{h.p + wOut * hairExitOffset(hs, h.n, wOut), wOut};
+                ray = Ray{h.p + wOut * 1e-6, wOut, hairExitOffset(hs, h.n, wOut)};
                 if (!passThru) specularArrival = false;   // pass-through: inherit, do not set
                 return true;
             }

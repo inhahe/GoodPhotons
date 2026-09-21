@@ -2885,7 +2885,7 @@ struct Scene {
                 const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
                 if (skipHair && isHairCurve(cs)) return;
                 if (hidden(cs.matId)) return;
-                if (intersectCurveSeg(cray, r, cs, tmin, h)) tm = h.t;
+                if (intersectCurveSeg(cray, r, cs, curveMin(r, tmin), h)) tm = h.t;
             }
             else {
                 // Instanced meshes are NOT covered: their materials live per-BLAS-triangle,
@@ -2922,9 +2922,9 @@ struct Scene {
     // is where `Material::hideCamera` has to apply and the only place it may. Pass it false
     // (the default) for an NEE / light-connection segment: a hidden flat still shadows.
     bool occluded(const Vec3& o, const Vec3& dir, double maxDist, double tmin = 1e-6,
-                  bool camLeg = false) const {
+                  bool camLeg = false, double curveTmin = 0.0) const {
         ++raystats::tls;
-        Ray r{o, dir};
+        Ray r{o, dir, curveTmin};
         const size_t nT = tris.size();
         const size_t nS = spheres.size();
         const size_t nI = implicits.size();
@@ -2948,7 +2948,7 @@ struct Scene {
                                                      intersectImplicit(r, im, tmin, h, &tabs, /*anyHit=*/true); }
             if (prim < (int)(nT + nS + nI + nC)) {
                 const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
-                return !hidden(cs.matId) && intersectCurveSeg(cray, r, cs, tmin, h, /*anyHit=*/true);
+                return !hidden(cs.matId) && intersectCurveSeg(cray, r, cs, curveMin(r, tmin), h, /*anyHit=*/true);
             }
             const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
@@ -2965,9 +2965,9 @@ struct Scene {
     // reject per fiber would also be unbiased but would put noise into every shadow, and hair
     // shadows are exactly where noise is most visible.
     double shadowTransmittance(const Vec3& o, const Vec3& dir, double maxDist, double lambda,
-                               double tmin = 1e-6) const {
+                               double tmin = 1e-6, double curveTmin = 0.0) const {
         ++raystats::tls;
-        Ray r{o, dir};
+        Ray r{o, dir, curveTmin};
         const size_t nT = tris.size();
         const size_t nS = spheres.size();
         const size_t nI = implicits.size();
@@ -2988,10 +2988,10 @@ struct Scene {
                 const Material& cm = mats[(size_t)cs.matId];
                 const bool soft = (cm.type == MatType::Hair) &&
                                   (cm.hairOpacity(lambda) < 1.0 || cm.hairOpacityPat >= 0);
-                if (!soft) return intersectCurveSeg(cray, r, cs, tmin, h, true);
+                if (!soft) return intersectCurveSeg(cray, r, cs, curveMin(r, tmin), h, true);
                 // A transparent fiber: resolve the hit fully (anyHit skips the surface
                 // parameters a bound opacity pattern needs) and attenuate rather than block.
-                if (!intersectCurveSeg(cray, r, cs, tmin, h, false)) return false;
+                if (!intersectCurveSeg(cray, r, cs, curveMin(r, tmin), h, false)) return false;
                 double op = cm.hairOpacity(lambda);
                 if (cm.hairOpacityPat >= 0) op *= slotPatMul(*this, cm.hairOpacityPat, h);
                 op = op < 0.0 ? 0.0 : (op > 1.0 ? 1.0 : op);
@@ -3036,7 +3036,7 @@ struct Scene {
                 // still block. Only the ones the grid summarises are skipped.
                 const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
                 if (isHairCurve(cs)) return false;
-                return intersectCurveSeg(cray, r, cs, tmin, h, /*anyHit=*/true);
+                return intersectCurveSeg(cray, r, cs, curveMin(r, tmin), h, /*anyHit=*/true);
             }
             const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
@@ -3102,7 +3102,7 @@ struct Scene {
             if (prim < (int)(nT + nS + nI + nC)) {
                 // A fiber: full hit data, since the model needs the axis and the impact
                 // parameter, not just "something is there".
-                if (!intersectCurveSeg(cray, r, curveSegs[prim - nT - nS - nI], tmin, h)) return false;
+                if (!intersectCurveSeg(cray, r, curveSegs[prim - nT - nS - nI], curveMin(r, tmin), h)) return false;
                 if (h.matId < 0 || h.matId >= (int)mats.size()) return true;
                 if (mats[h.matId].type != MatType::Hair || h.fiberRadius <= 0.0) return true;
                 if (crossed < maxCrossings) { ++crossed; onFiber(h); }
@@ -3229,7 +3229,7 @@ struct Scene {
         // have been invisible in the noise.
         if (!curveSegs.empty()) {
             const CurveRay cray = makeCurveRay(r.d);
-            for (const auto& cs : curveSegs) intersectCurveSeg(cray, r, cs, tmin, h);
+            for (const auto& cs : curveSegs) intersectCurveSeg(cray, r, cs, curveMin(r, tmin), h);
         }
         for (const auto& inst : instances) {
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};

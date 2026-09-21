@@ -1260,7 +1260,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                     hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
                 thr *= clamp01(fv * cosLong / pdfH);       // == T = sum_p A_p
                 const Vec3 wo = hair::toWorld(hs.fr, wl);
-                ray = Ray{h.p + wo * hairExitOffset(hs, h.n, wo), wo};
+                ray = Ray{h.p + wo * 1e-6, wo, hairExitOffset(hs, h.n, wo)};
                 break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
@@ -1744,7 +1744,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     }, wCam);
                 }
                 const Vec3 wo = hair::toWorld(hs.fr, wl);
-                ray = Ray{h.p + wo * hairExitOffset(hs, h.n, wo), wo};
+                ray = Ray{h.p + wo * 1e-6, wo, hairExitOffset(hs, h.n, wo)};
                 break;
             }
             default: {                                   // ThinFilm/Multilayer/Grating: approx reflect

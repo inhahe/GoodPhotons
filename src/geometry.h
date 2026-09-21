@@ -10,7 +10,18 @@
 
 constexpr double PI = 3.141592653589793;
 
-struct Ray { Vec3 o, d; };
+// `curveTmin`: ignore CURVE primitives closer than this along the ray, and nothing else.
+// A ray leaving a hair fiber on its far side has to clear the strand's own body (the
+// near-field BCSDF places the TT/TRT exit at the entry point), but pushing the ORIGIN
+// forward to do that also hides any non-fiber surface in the gap -- notably the skin the
+// fiber grows out of. Carrying the distance as a curve-only tmin skips exactly the fibers
+// it was meant to skip. Zero on every ordinary ray, and a fresh Ray is built per bounce,
+// so it resets itself.
+struct Ray { Vec3 o, d; double curveTmin = 0.0; };
+
+inline double curveMin(const Ray& r, double tmin) {
+    return tmin > r.curveTmin ? tmin : r.curveTmin;
+}
 
 struct Tri {
     Vec3 v0, v1, v2;

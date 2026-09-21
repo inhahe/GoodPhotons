@@ -3491,9 +3491,14 @@ __device__ static inline void dApplyNormalMap(const DScene& sc, DHit& h);
 // `DMaterial::hideCamera` applies to — device twin of Scene::closestHit's `skipCamHidden`.
 // Callers pass it as `bounce == 0` on a camera path and never on a photon / light-subpath
 // walk. `sc.camHiddenAny` collapses it to nothing for a scene with no hidden material.
+// `curveTmin`: ignore CURVE primitives nearer than this, and nothing else. A ray leaving a
+// hair fiber on its far side has to clear the strand's own body, but pushing the ORIGIN
+// forward to do that also hides any non-fiber surface in the gap -- notably the skin the
+// fiber grows from -- and through a dense coat those skips compound until rays tunnel out.
+// Host twin: Ray::curveTmin in geometry.h.
 __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3& rd,
                                    Real tmin = RAY_EPS, Real tCap = BIG,
-                                   bool camHide = false) {
+                                   bool camHide = false, Real curveTmin = (Real)0) {
     DHit h; h.t = tCap; h.valid = false; h.matId = 0; h.sensorId = -1;
     if (sc.nNodes == 0) return h;
     // One uniform test, hoisted out of the leaf loop. `hidden()` is checked BEFORE the
@@ -3528,7 +3533,7 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits) { const DImplicit& im = sc.implicits[prim - sc.nTris - sc.nSph];
                                                     if (!hidden(im.matId) && intersectImplicit(sc, im, ro, rd, tmin, h)) tMax = h.t; }
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs) { const DCurveSeg& cs = sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits];
-                                                    if (!hidden(cs.matId) && intersectCurveSeg(cray, ro, rd, cs, tmin, h)) tMax = h.t; }
+                                                    if (!hidden(cs.matId) && intersectCurveSeg(cray, ro, rd, cs, fmaxf((float)tmin, (float)curveTmin), h)) tMax = h.t; }
                 else {
                     // Instanced meshes are not covered — see the host twin in scene.h for why
                     // (per-BLAS-triangle materials live below this decode, and nothing that can
@@ -3729,7 +3734,8 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
 __device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit& h);
 
 __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& dir,
-                                 Real maxDist, Real tmin = RAY_EPS, bool camLeg = false) {
+                                 Real maxDist, Real tmin = RAY_EPS, bool camLeg = false,
+                                 Real curveTmin = (Real)0) {
     if (sc.nNodes == 0) return false;
     // One uniform test, hoisted out of the leaf loop; `hidden()` is checked BEFORE the
     // intersection, so a hidden primitive costs a matId load rather than a full ray test.
@@ -3759,7 +3765,7 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits) { const DImplicit& im = sc.implicits[prim - sc.nTris - sc.nSph];
                                                                     blocked = !hidden(im.matId) && intersectImplicit(sc, im, o, dir, tmin, h, /*anyHit=*/true); }
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs) { const DCurveSeg& cs = sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits];
-                                                                    blocked = !hidden(cs.matId) && intersectCurveSeg(cray, o, dir, cs, tmin, h, /*anyHit=*/true); }
+                                                                    blocked = !hidden(cs.matId) && intersectCurveSeg(cray, o, dir, cs, fmaxf((float)tmin, (float)curveTmin), h, /*anyHit=*/true); }
                 else {
                     // Instance leaf: any-hit inside the shared BLAS in local space. NOT covered by
                     // `hidden()`: instanced materials live per-BLAS-triangle, below this decode, and
@@ -3787,7 +3793,8 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
 // fiber hit and nothing else. Deterministic (the coverages multiply) rather than a random
 // accept/reject, because hair shadows are exactly where stochastic noise shows most.
 __device__ static Real shadowTransmittance(const DScene& sc, const DVec3& o, const DVec3& dir,
-                                           Real maxDist, Real lambda, Real tmin = RAY_EPS) {
+                                           Real maxDist, Real lambda, Real tmin = RAY_EPS,
+                                           Real curveTmin = (Real)0) {
     if (sc.nNodes == 0) return (Real)1;
     DVec3 invD{(Real)1 / dir.x, (Real)1 / dir.y, (Real)1 / dir.z};
     const DTriShear sh = makeTriShear(dir);
@@ -3812,11 +3819,11 @@ __device__ static Real shadowTransmittance(const DScene& sc, const DVec3& o, con
                     const DMaterial& cm = sc.mats[cs.matId];
                     const bool soft = (cm.type == D_HAIR) &&
                                       ((double)specLookup(cm.hairOpacity, lambda) < 1.0 || cm.hairOpacityPat >= 0);
-                    if (!soft) blocked = intersectCurveSeg(cray, o, dir, cs, tmin, h, true);
+                    if (!soft) blocked = intersectCurveSeg(cray, o, dir, cs, fmaxf((float)tmin, (float)curveTmin), h, true);
                     else {
                         // transparent fiber: resolve fully (anyHit skips the surface parameters a
                         // bound opacity pattern needs) and attenuate rather than block
-                        if (!intersectCurveSeg(cray, o, dir, cs, tmin, h, false)) blocked = false;
+                        if (!intersectCurveSeg(cray, o, dir, cs, fmaxf((float)tmin, (float)curveTmin), h, false)) blocked = false;
                         else {
                             double op = (double)specLookup(cm.hairOpacity, lambda);
                             if (cm.hairOpacityPat >= 0) op *= clamp01(dPatternScalarAt(sc, cm.hairOpacityPat, h));
@@ -10641,7 +10648,7 @@ __device__ static bool bkHairBlocked(const DScene& sc, const DHit& h, const DHai
     const Real off = dHairExitOffset(hsv, h.n, wi);
     const Real len = connMaxT((double)d - (double)off, RAY_EPS, dMaxAbs(h.p));
     if (len <= (Real)0) return true;
-    return occluded(sc, h.p + wi * off, wi, len);
+    return occluded(sc, h.p + wi * (Real)RAY_EPS, wi, len, RAY_EPS, false, off);
 }
 // `hs` non-null = the shading vertex is a hair fiber: swap the cosine/terminator response
 // and the surface-offset shadow ray for the hair versions above (all remaining geometry —
@@ -11156,8 +11163,8 @@ __device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkE
         const Real off = dHairExitOffset(*hs, h.n, g.wi);
         {   // Partial, not yes/no: hair below opacity 1 attenuates the sky rather than
             // hiding it. Folded into cosSurf, which every caller already multiplies by.
-            const Real vis = shadowTransmittance(sc, h.p + g.wi * off, g.wi,
-                                                 (Real)g.farDist, lambda);
+            const Real vis = shadowTransmittance(sc, h.p + g.wi * (Real)RAY_EPS, g.wi,
+                                                 (Real)g.farDist, lambda, RAY_EPS, off);
             if (!(vis > (Real)0)) return false;
             g.cosSurf *= vis;
         }
@@ -11326,7 +11333,8 @@ __device__ __noinline__ static bool bkInteractHair(const DScene& sc, const DMate
         const DHit& h, bool directOnly, bool whitted,
         DVec3& ro, DVec3& rd, Real lambda, double invPdfLambda,
         double& thr, double& L, bool& specularArrival,
-        double& contBsdfPdf, DRng& rng, int giDepth, bool* nullEvent = nullptr) {
+        double& contBsdfPdf, DRng& rng, int giDepth, bool* nullEvent = nullptr,
+        Real* curveTminOut = nullptr) {
     const DVec3 wPrev = rd * (Real)(-1);
     const DHairShade hsv = dHairShadeAt(sc, m, h, lambda, wPrev);
     L += thr * bkNeeLight(sc, h, (Real)1, invPdfLambda, lambda, rng, giDepth, &hsv);
@@ -11356,7 +11364,11 @@ __device__ __noinline__ static bool bkInteractHair(const DScene& sc, const DMate
                            wl.z == -hsv.woLocal.z);
     if (nullEvent) *nullEvent = passThru;
     if (!passThru) contBsdfPdf = pdfH;        // env-escape MIS vs the hair pdf
-    ro = h.p + wOut * dHairExitOffset(hsv, h.n, wOut);
+    // Clear the strand's own body WITHOUT displacing the ray: the distance becomes a
+    // curve-only tmin, so the skin under the coat is still hit. See closestHit.
+    const Real exitOff = dHairExitOffset(hsv, h.n, wOut);
+    if (curveTminOut) *curveTminOut = exitOff;
+    ro = h.p + wOut * (curveTminOut ? (Real)RAY_EPS : exitOff);
     rd = wOut;
     if (!passThru) specularArrival = false;   // NEE covered direct light here
     return true;
@@ -11383,7 +11395,8 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                                   double& thr, double& L, bool& specularArrival,
                                   double& contBsdfPdf, DMediumStack& stk, DRng& rng,
                                   DGiCtx gi, DGlossyMis* gm = nullptr,
-                                  bool* nullEvent = nullptr) {
+                                  bool* nullEvent = nullptr,
+                                  Real* curveTminOut = nullptr) {
     const bool whitted = (sc.bkWhitted != 0);
     // Cleared here rather than per delta branch, so the invariant is structural: `gm->pdf > 0`
     // can only mean "the LAST bounce was a MIS'd glossy one". A mirror or dielectric leaving a
@@ -11616,7 +11629,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             // on an actual hair hit — see the comment on bkInteractHair.
             return bkInteractHair(sc, *mp, h, directOnly, whitted, ro, rd, lambda,
                                   invPdfLambda, thr, L, specularArrival, contBsdfPdf,
-                                  rng, gi.depth, nullEvent);
+                                  rng, gi.depth, nullEvent, curveTminOut);
         case D_DIFFUSE:
         default: {
             Real rho = clamp01(dDiffuseRho(sc, *mp, h, lambda));
@@ -11679,6 +11692,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                         : sc.bkMaxBounce;
     const bool directOnly = (sc.bkDirectOnly != 0);
     int nullSteps = 0;      // hair coverage pass-throughs, refunded below
+    Real curveTmin = (Real)0;   // fiber exit step, applied to curve prims only
     for (int b = 0; b < maxBounce; ++b) {
         // Publish the bounce index so a deterministic per-vertex choice (mode W's glossy
         // lobe) can pick a decorrelated sequence at each depth. Costs nothing otherwise.
@@ -11707,7 +11721,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         // footprint stamp below uses), so it is also precisely where a `hide_camera` surface
         // must be transparent — and nowhere else on the path. See DMaterial::hideCamera.
         DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG,
-                            /*camHide=*/(b == 0 && gi.depth == 0));
+                            /*camHide=*/(b == 0 && gi.depth == 0), curveTmin);
         // O8 stage 2: stamp the shading footprint on the CAMERA SEGMENT only (host twin:
         // backward.h radiance()). A secondary bounce would need ray differentials /
         // cones to know how much its own footprint spread, so it keeps fw = 0
@@ -11825,9 +11839,10 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         }
 
         bool nullEvt = false;
+        curveTmin = (Real)0;                  // one hop only: cleared before each interaction
         if (!bkInteract<GiDepth == 0>(sc, mp, h, matId, diffraction, directOnly, ro, rd, lambda,
                                       invPdfLambda, thr, L, specularArrival, contBsdfPdf, stk,
-                                      rng, gi, gmp, &nullEvt))
+                                      rng, gi, gmp, &nullEvt, &curveTmin))
             return L;                                   // path terminated in the interaction
         if (nullEvt && nullSteps < 256) { --b; ++nullSteps; }
     }
@@ -11907,13 +11922,14 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
     const bool directOnly = (sc.bkDirectOnly != 0);
 
     int nullStepsH = 0;     // hair coverage pass-throughs, refunded below
+    Real curveTmin = (Real)0;   // fiber exit step, applied to curve prims only
     for (int b = bounce0; b < maxBounce; ++b) {
         int nUp = secAlive ? C : 1;                    // wavelengths still being propagated
         gi.bounce = b;                                 // see the scalar twin: mode W's per-vertex lattice
         // Camera segment only — same test as the footprint stamp below, and for the same
         // reason a heroSplit re-entry (bounce0 > 0) is not one. See DMaterial::hideCamera.
         DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG,
-                            /*camHide=*/(b == 0 && gi.depth == 0));
+                            /*camHide=*/(b == 0 && gi.depth == 0), curveTmin);
         // O8 stage 2 footprint, camera segment only — see the scalar twin. The test is
         // `b == 0`, NOT `b == bounce0`: a heroSplit re-entry resumes at a DEEPER bounce,
         // and that sub-path's first vertex is not a camera vertex.
@@ -12176,9 +12192,10 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     }
                     secAlive = false;    // hero carries on alone, UNBOOSTED
                     bool heroNull = false;
+                    curveTmin = (Real)0;
                     if (!bkInteract<false>(sc, mp, h, matId, diffraction, directOnly, ro, rd,
                                            lam[0], invPdf[0], thr[0], L[0], specularArrival,
-                                           contBsdfPdf, stk, rng, gi, nullptr, &heroNull))
+                                           contBsdfPdf, stk, rng, gi, nullptr, &heroNull, &curveTmin))
                         return;
                     if (heroNull && nullStepsH < 256) { --b; ++nullStepsH; }
                     break;
@@ -12191,9 +12208,10 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 // wavelength.
                 if (secAlive) { thr[0] *= (double)C; secAlive = false; }
                 bool heroNull2 = false;
+                curveTmin = (Real)0;
                 if (!bkInteract<false>(sc, mp, h, matId, diffraction, directOnly, ro, rd, lam[0],
                                        invPdf[0], thr[0], L[0], specularArrival, contBsdfPdf, stk,
-                                       rng, gi, nullptr, &heroNull2))
+                                       rng, gi, nullptr, &heroNull2, &curveTmin))
                     return;
                 if (heroNull2 && nullStepsH < 256) { --b; ++nullStepsH; }
                 break;

@@ -1986,9 +1986,16 @@ first and third defects only bite under an ENV light, which is why the same fur 
 under a sun and 0.983 in a furnace for two versions. See HAIRTRANS-NULL in `known-issues.md` for
 the ~0.2 % that remains on both backends.
 
-*A correction to what this section said in 0.359.0:* it named the fiber EXIT OFFSET as the
-mechanism. That was wrong -- narrowing the offset moved the null by less than noise -- and the
-real causes are the two above.
+**And the exit step itself, after all (0.360.2).** A ray leaving a fiber on its far side resumed
+`2.5r` along to clear the strand's own body, which also skips any NON-fiber surface in the gap --
+the skin the coat grows from. Through a dense coat the skips compound and rays tunnel out. The
+distance is now a CURVE-ONLY tmin (`Ray::curveTmin`): same fibers skipped, nothing else hidden.
+At 50000 strands the `opacity 0` null goes **1.0663 -> 1.0006** at r = 2e-4 and 1.0060 -> 1.0009
+at the default radius; opaque hair moves +0.021 %, inside run-to-run noise.
+
+*An honest note on 0.359.0:* that version named the exit offset as the mechanism, was corrected
+in 0.360.0 for naming it as the ONLY one, and it turns out to have been a real cause after all --
+just the smallest of four, and invisible until the larger three were gone.
 
 *A correction to what this section used to say:* it reported the two backends disagreeing on
 shadow lightening, 1.52x on CPU against 1.38x on GPU, and blamed the GPU running `Real` as

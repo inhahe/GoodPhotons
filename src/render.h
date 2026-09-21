@@ -1234,8 +1234,8 @@ struct Renderer {
             if (!cam.project(p, g.px, g.py, cosCamH, dist2H)) return false;
             const double off = hairExitOffset(*hs, n, g.wdir);
             if (off >= g.dist) return false;
-            if (scene.occluded(p + g.wdir * off, g.wdir, g.dist - off - 1e-6, 1e-6,
-                               /*camLeg=*/true)) return false;
+            if (scene.occluded(p + g.wdir * 1e-6, g.wdir, g.dist - off - 1e-6, 1e-6,
+                               /*camLeg=*/true, off)) return false;
             g.denom = dist2H * cam.pixelSolidAngle(cosCamH);
             return true;
         }
@@ -1371,8 +1371,8 @@ struct Renderer {
         if (!cam.lensImage(A, wdir, px, py)) return;
         const double off = hs ? hairExitOffset(*hs, n, wdir) : 1e-6;
         if (off >= dist) return;
-        if (scene.occluded(p + (hs ? wdir : ng) * off, wdir, dist - off - 1e-6, 1e-6,
-                           /*camLeg=*/true)) return;
+        if (scene.occluded(p + (hs ? wdir : ng) * (hs ? 1e-6 : off), wdir, dist - off - 1e-6, 1e-6,
+                           /*camLeg=*/true, hs ? off : 0.0)) return;
 
         // beta * (rho/pi BRDF) * cosSurf * cosLens / dist^2 * (pi R^2 = 1/pdf_A).
         // cosSurf carries the Veach shading-normal adjoint correction (see connect()).
@@ -2521,7 +2521,7 @@ struct Renderer {
                 // TT and TRT leave through the FAR side of a real solid strand, so step
                 // clear of the tube's own body (hair_shade.h); on the near side this is the
                 // ordinary 1e-6 offset.
-                ray = Ray{h.p + wo * hairExitOffset(hs, h.n, wo), wo};
+                ray = Ray{h.p + wo * 1e-6, wo, hairExitOffset(hs, h.n, wo)};
                 return true;                        // beta unchanged (RR carried the weight)
             }
             default: return true;                   // unreachable (diffuse handled by callers)

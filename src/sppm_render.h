@@ -261,7 +261,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 thr *= clamp01(fv * cosLong / pdfH);
                 const Vec3 wo = hair::toWorld(hs.fr, wl);
                 // TT/TRT leave through the FAR side of a real solid tube.
-                ray = Ray{h.p + wo * hairExitOffset(hs, h.n, wo), wo};
+                ray = Ray{h.p + wo * 1e-6, wo, hairExitOffset(hs, h.n, wo)};
                 break;
             }
             default: {
