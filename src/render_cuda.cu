@@ -11127,7 +11127,8 @@ struct BkEnvGeom {
 // rather than the cosine hemisphere's, exactly as the fiber branch already swaps in the BCSDF's.
 __device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkEnvGeom& g,
                                  const DHairShade* hs = nullptr,
-                                 const DNeeBsdf* nb = nullptr) {
+                                 const DNeeBsdf* nb = nullptr,
+                                 Real lambda = (Real)550) {
     // Sample an incoming env direction: image env importance-samples the luminance CDF
     // (dEnvSample gives dir + solid-angle pdfW), constant env is uniform on the sphere
     // (pdf 1/4pi). Both draw exactly two uniforms in the same order as the CPU
@@ -11153,7 +11154,13 @@ __device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkE
         g.stG = (Real)1;
         g.farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
         const Real off = dHairExitOffset(*hs, h.n, g.wi);
-        if (occluded(sc, h.p + g.wi * off, g.wi, (Real)g.farDist)) return false;
+        {   // Partial, not yes/no: hair below opacity 1 attenuates the sky rather than
+            // hiding it. Folded into cosSurf, which every caller already multiplies by.
+            const Real vis = shadowTransmittance(sc, h.p + g.wi * off, g.wi,
+                                                 (Real)g.farDist, lambda);
+            if (!(vis > (Real)0)) return false;
+            g.cosSurf *= vis;
+        }
         const double pdfBsdf = dhair::pdf(hs->b, hs->woLocal, dhair::toLocal(hs->fr, g.wi));
         g.wMis = g.pdfW / (g.pdfW + pdfBsdf);
         return true;
@@ -11164,7 +11171,13 @@ __device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkE
     g.stG = dShadowTerminatorG(g.wi, h.n, ngo);             // Chiang soft terminator (1 if flat)
     if (g.stG <= (Real)0) return false;                     // behind true geometry: hard shadow
     g.farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
-    if (occluded(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, (Real)g.farDist)) return false;
+    {   // see the fiber branch above: a transparent coat between a surface and the sky
+        // attenuates it instead of blocking it
+        const Real vis = shadowTransmittance(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi,
+                                             (Real)g.farDist, lambda);
+        if (!(vis > (Real)0)) return false;
+        g.cosSurf *= vis;
+    }
     // The density the CONTINUATION would have sampled wi with: the lobe's at a glossy vertex,
     // the cosine hemisphere's otherwise. Same number the env-escape site carries in gmis.pdf.
     double pdfBsdf = nb ? dGlossyPdfHit(sc, *nb->m, h, nb->wo, g.wi)
@@ -11179,7 +11192,7 @@ __device__ static double bkNeeEnv(const DScene& sc, const DHit& h, Real rho,
                                   const DNeeBsdf* nb = nullptr) {
     if (sc.envIndex < 0) return 0.0;
     BkEnvGeom g;
-    if (!bkEnvGeom(sc, h, rng, g, hs, nb)) return 0.0;
+    if (!bkEnvGeom(sc, h, rng, g, hs, nb, lambda)) return 0.0;
     double Lenv = (sc.env.scale != nullptr) ? dEnvRadiance(sc.env, g.wi, lambda)
                                             : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
     if (Lenv <= 0.0) return 0.0;
@@ -11242,13 +11255,14 @@ __device__ static double bkNeeEnvVolume(const DScene& sc, const DVec3& p, const 
         pdfW = 1.0 / (4.0 * DPI);
     }
     double farDist = (double)length(sc.sceneCenter - p) + sc.sceneRadius;
-    if (occluded(sc, p + wi * RAY_EPS, wi, (Real)farDist)) return 0.0;
+    const Real envVis = shadowTransmittance(sc, p + wi * RAY_EPS, wi, (Real)farDist, lambda);
+    if (!(envVis > (Real)0)) return 0.0;
     double Lenv = imageEnv ? dEnvRadiance(sc.env, wi, lambda)
                            : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
     if (Lenv <= 0.0) return 0.0;
     Real phase = dMedPhase(med, dot(wIn, wi), lambda);      // phase == its own pdf (HG or rainbow)
     double wMis = pdfW / (pdfW + (double)phase);            // balance heuristic
-    double contrib = (double)alb * (double)phase * Lenv * invPdfLambda / pdfW * wMis;
+    double contrib = (double)alb * (double)phase * Lenv * invPdfLambda / pdfW * wMis * (double)envVis;
     contrib *= (double)dMediaTransmittance(sc, p, wi, (Real)farDist, lambda, rng);
     return contrib;
 }

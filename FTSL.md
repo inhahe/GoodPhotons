@@ -1975,11 +1975,16 @@ was treating it as an ordinary bounce in two ways:
 * It **spent a path-length bounce**, so invisible fur truncated paths: the null read 0.73 at
   `-max-bounce 2` against 0.98 at 64. GRIN marching in the same loop already follows the rule.
 
-The `opacity 0` null -- fur that must be invisible -- now reads **0.998 on CPU** (from 0.983) and
-**0.991 on GPU** (from 0.976), and is flat across bounce budgets on both (0.9984 at
-`-max-bounce 2`, from 0.726). The first defect only bites under an ENV light, which is why the
-same fur nulled at 0.998 under a sun and 0.983 in a furnace for two versions. See HAIRTRANS-NULL
-in `known-issues.md` for the ~0.2 % that remains and the GPU's remaining ~0.7 % gap.
+A third followed on the device (0.360.1): 0.359.0 taught the HOST's env NEE that hair attenuates
+a sky shadow ray rather than blocking it, and never wrote the device half, so `bkEnvGeom` still
+stopped at the first fiber. Invisible under a sun, total in a furnace.
+
+The `opacity 0` null -- fur that must be invisible -- now reads **0.9981 on CPU** (from 0.9833)
+and **0.9978 on GPU** (from 0.9759), is flat across bounce budgets on both (0.9984 / 0.9983 at
+`-max-bounce 2`, from 0.7255), and the two backends agree to **0.9995** at `opacity 0.15`. The
+first and third defects only bite under an ENV light, which is why the same fur nulled at 0.998
+under a sun and 0.983 in a furnace for two versions. See HAIRTRANS-NULL in `known-issues.md` for
+the ~0.2 % that remains on both backends.
 
 *A correction to what this section said in 0.359.0:* it named the fiber EXIT OFFSET as the
 mechanism. That was wrong -- narrowing the offset moved the null by less than noise -- and the

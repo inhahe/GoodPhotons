@@ -4793,55 +4793,59 @@ hair, the default, is bit-identical.
    light than the no-fur reference, which is impossible for pass-through. The final residual
    (gpu/cpu 0.9865 in a sun-lit shadow ROI) was also fireflies -- a `light env` furnace showed
    the true 1.0003. Every hair measurement here wants a furnace.
-### HAIRTRANS-NULL — MOSTLY FIXED (0.360.0). A coverage pass-through is a NULL interaction, and
-the tracer was treating it as an ordinary bounce in two separate ways
+### HAIRTRANS-NULL — FIXED (0.360.0 / 0.360.1), on both backends, down to a ~0.2 % residual
 
-**Resolved by instrumentation, after three hypotheses inferred from image statistics were each
-wrong.** Env-gated counters on every hair code path gave the ground truth inference could not:
-at `opacity 0`, 100 % of hair vertices take the pass-through branch (2873/2873, 4477/4477); at
-`opacity 1`, 0 % do. The coverage branch was never the problem. What the tracer did with it was.
+Fur at `opacity 0` must be INVISIBLE, so it must reproduce a render with no fur at all. It did
+not, and there were THREE separate causes. All were found by instrumenting the code paths and
+counting, after three hypotheses inferred from image statistics had each been wrong.
 
-1. **The MIS state was overwritten.** The continuation is a delta (exactly `-wo`); NEE cannot
-   sample it and its `f` is 0. Reporting a finite `contBsdfPdf` made the environment seen
-   straight through a transparent fiber balance-heuristic weighted against a strategy that pays
-   nothing back, so that fraction was lost outright. A null interaction must be TRANSPARENT to
-   MIS -- inherit the last real vertex's state, never assign. Assigning the nominally correct
-   delta values instead OVERSHOOTS by +0.5 %, because an earlier vertex may already have claimed
-   that direction's NEE share; that overshoot is how round one was caught.
-2. **The bounce was spent.** A ray that was not intercepted did not scatter, yet each
-   pass-through charged a path-length bounce, so invisible fur truncated paths.
-
-| `opacity 0` null | before | after |
+| `opacity 0` null | start | end |
 |---|---|---|
 | CPU, default budget | 0.9833 | **0.9981** |
 | CPU, `-max-bounce 2` | 0.7255 | **0.9984** |
-| GPU, default budget | 0.9759 | **0.9906** |
-| GPU, `-max-bounce 2` | -- | **0.9910** |
-| CPU sun-lit control | 0.9982 | 0.9982 (unchanged) |
+| GPU, default budget | 0.9759 | **0.9978** |
+| GPU, `-max-bounce 2` | -- | **0.9983** |
+| CPU sun-lit control | 0.9982 | 0.9982 (never moved) |
+| backend agreement @ `opacity 0.15` | 0.9804 | **0.9995** |
 
-Defect 1 only bites under an ENV light, which is why the same fur nulled at 0.998 under a sun
-and 0.983 in a furnace for two versions, and why the single-fiber test (a quad backdrop, no env)
-came out clean at 1.0003. Three measurements collected for unrelated reasons, all consistent,
-none explicable until the counters named the mechanism.
+**1. The MIS state was overwritten at a pass-through (0.360.0).** The continuation is a delta
+(exactly `-wo`); NEE cannot sample it and its `f` is 0. Reporting a finite `contBsdfPdf` made
+the environment seen straight through a transparent fiber balance-heuristic weighted against a
+strategy that pays nothing back, so that fraction was lost. A null interaction must be
+TRANSPARENT to MIS -- inherit the last real vertex's state, never assign. Assigning the
+nominally correct delta values instead OVERSHOOTS by +0.5 %, because an earlier vertex may
+already have claimed that direction's NEE share; that overshoot is what caught round one.
 
-**STILL OPEN, two parts.**
+**2. The bounce was spent (0.360.0).** A ray that was not intercepted did not scatter, yet each
+pass-through charged a path-length bounce, so invisible fur truncated paths (0.73 at
+`-max-bounce 2`). GRIN marching in the same loop already follows this rule.
 
-* A residual **~0.2 %** on CPU, independent of light type and bounce budget. The sun-lit scene
-  has always carried it.
-* The GPU sits **~0.7 % behind the CPU** (0.9906 vs 0.9981), so backend agreement at
-  `opacity 0.15` now reads 0.9804 where 0.358.0 measured 0.9997. That looks like a regression
-  and is not: the old agreement was the two backends sharing one bug. The CPU is now
-  demonstrably closer to a known answer. Finding the rest means pointing the same counters at
-  the device.
+**3. Env NEE hard-blocked on the device (0.360.1).** 0.359.0 taught the HOST `envGeom` that hair
+below opacity 1 attenuates a sky shadow ray rather than blocking it, and never wrote the device
+half. `bkEnvGeom` still stopped at the first fiber -- invisible under a sun, total in a furnace.
+That was the entire remaining GPU deficit, and it is the fourth time a hair feature has been
+landed host-only in this codebase while the GPU is the DEFAULT backend.
 
-**Three hypotheses this cost, all killed by measurement, recorded so they are not retried:**
+Causes 1 and 3 only bite under an ENV light, which is why the same fur nulled at 0.998 under a
+sun and 0.983 in a furnace for two versions, and why the single-fiber test (a quad backdrop, no
+env) came out clean at 1.0003. Three measurements collected for unrelated reasons, all
+consistent, none explicable until the counters named the mechanism.
+
+**STILL OPEN: a ~0.2 % residual**, now common to BOTH backends (0.9981 / 0.9978), independent of
+light type and bounce budget. The sun-lit scene has always carried it. Small enough that the
+next step would be a fresh null rather than more of this one.
+
+**Four hypotheses this cost, all killed by measurement, recorded so they are not retried:**
 
 * *The fiber exit offset.* Narrowing it to hide only curve primitives moved the null by less
   than noise and changed opaque hair by 0.02 %. Reverted.
-* *Per-crossing coverage maths.* A single fiber nulls at 1.0003.
-* *A bounce refund in `photonGather`.* Changed nothing, because mode R is the BACKWARD reference
-  and never calls it. The same correct idea landed in code this scene does not execute twice
-  before instrumentation found the hero walk in `backward.h`.
+* *Per-crossing coverage maths.* A single fiber nulls at 1.0003, and the device counters show
+  100 % of vertices taking the pass-through branch at `opacity 0` and 0 % at `opacity 1`.
+* *A bounce refund in `photonGather`.* Changed nothing: mode R is the BACKWARD reference and
+  never calls it. The same correct idea landed in unexecuted code twice before instrumentation
+  found the hero walk in `backward.h`.
+* *`FTRACE_GPU_FP32` breaking the exact-equality pass-through test.* The device probe for that
+  branch fires, so the detection is sound in float.
 
 **The process lesson, which cost more than any of the above.** For several rounds the probes
 reported hard zeros for paths that were executing thousands of times: the patch scripts had
