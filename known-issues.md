@@ -4736,68 +4736,63 @@ the photon map**. Measuring a lit diffuse wall instead of a panel is the entire 
 choices made at the camera's wavelength — the same class of error, not expressible as a smooth
 ratio, and still unmeasured.
 
-### HAIRTRANS-BACKEND — OPEN, but LOCALISED (2026-09-20): the device behaves as if transparent
-hair were about twice as opaque as asked, and the error scales with fiber radius
+### HAIRTRANS-BACKEND — DONE (0.358.0). Root cause: `opacity` scaled the BCSDF's SAMPLING but
+not its EVALUATION, so NEE lit a see-through fiber as if it were solid. Both backends were
+wrong; the "backend disagreement" was two different wrong answers being compared to each other
 
-**The shadow half is NOT the problem and is now proven correct.** Splitting the two places
-transparency enters, with `-direct-only` so no indirect light contaminates the measurement, the
-shadow path agrees to **0.09 %**:
+**What it looked like**: the GPU rendered transparent hair ~12 % darker than the CPU, and the
+gap grew as the hair was made more transparent (gpu/cpu 0.9745 at `opacity 1` sliding to 0.8852
+at 0.15). That framing survived a long investigation and was wrong. The CPU was the worse of
+the two.
 
-| `opacity` | CPU | GPU | GPU/CPU |
-|---|---|---|---|
-| 1.0 | 1.8840 | 1.8857 | 1.0009 |
-| 0.15 | 2.6475 | 2.6500 | 1.0009 |
+**What found it**: an exact null, after inference from compound scenes had produced three dead
+hypotheses. At `opacity 0` the fur must be INVISIBLE, so each backend must reproduce its own
+no-fur render -- no modelling assumption, no reference implementation, nothing to argue about.
+Instead the fur ADDED energy:
 
-Lightening 1.405x on both. So `Scene::shadowTransmittance` and its device twin are consistent,
-and the whole remaining gap is in the **indirect** light scattered off transparent fur.
+| region | CPU | GPU |
+|---|---|---|
+| fur ball | **1.191** | 1.074 |
+| shadow | **1.247** | 1.117 |
+| lit floor (no fur in the path) | 1.006 | 1.003 |
 
-**It is real, not noise.** At 96 spp the shadow lightens 1.520x (CPU) vs 1.381x (GPU); at
-**1024 spp**, 1.534x vs 1.394x. Ten times the samples moves neither.
+**The mechanism**, visible by absence: `opacity` appeared only in `make()` and `sample()`, on
+both backends. It was added as a coverage branch in SAMPLING and `f()` / `pdf()` never learned
+about it. So NEE evaluated a transparent fiber as solid -- a fiber you can see straight through
+still scattered a full light connection out of nothing -- and the MIS pdf omitted the
+pass-through branch, weighting two strategies against inconsistent densities. That explains
+every symptom, including the ones that killed the earlier hypotheses: it scales with fiber count
+and radius (more fiber vertices, more spurious connections), and it vanishes at `opacity 1`.
 
-**It scales with fiber radius**, which is the sharpest clue found:
+**The fix**: the non-delta part of the BCSDF is `opacity * f_scatter` with density
+`opacity * pdf_scatter`; the pass-through is a delta lobe no `f()` can represent. One factor at
+each of two returns, per backend. `sample()` needs NO change and that is what makes it safe --
+it ends by calling `pdf()` and `f()` to fill its own outputs, so both scale by the same factor
+and the ratio callers use (`f*cos/pdf`) is unchanged. Sampled throughput does not move; only NEE
+and MIS do, which is exactly where the energy was. Two further sites: the spectral gather
+divided `fFromLobes` by a now-scaled pdf, and it was spectrally reweighting pass-throughs at all
+when they are achromatic and must reweight to exactly 1.
 
-| fiber radius | GPU/CPU |
-|---|---|
-| 0.00002 | 0.979 |
-| 0.00009 | 0.894 |
-| 0.00040 | 0.740 |
+**After** (512 spp): the null closes to 0.998 / 0.999 on CPU and 0.998 / 1.000 on GPU, and in a
+furnace the backends agree to **0.03 %** at `opacity 0.15` (from 11.5 %). `opacity 1.0` against
+no `opacity` key at all is identical to **0.000 %** -- the factor is exactly 1.0 there, so opaque
+hair, the default, is bit-identical.
 
-**Quantified**: at the default radius, GPU `opacity 0.15` matches CPU `opacity ~0.31` (CPU 0.25
--> 3.0409, 0.30 -> 2.9538, against GPU 0.15 -> 2.9275). Roughly a factor of two in effective
-opacity. A mechanism that would produce exactly that is the device registering **two hits per
-fiber** (near and far wall) and applying the coverage lobe twice -- invisible at `opacity 1`,
-where the first hit scatters and the second is never reached. Not confirmed.
+**Three lessons worth more than the bug.**
 
-**Eliminated, each by measurement rather than reading:**
-
-* *Bounce budget* -- identical at `-max-bounce` 8 and 64, and the flag was separately verified
-  live in mode R (1 -> 0.1443, 4 -> 0.3032, 64 -> 0.3347) so the null is not a dead control.
-* *The coverage lobe itself* -- the `Params` field, the `make()` copy and the branch in
-  `sample()` are line-for-line identical between `hair.h` and `dhair`.
-* *RNG draw order* -- both draw u0..u3 into named locals in the same order.
-* *The exit-offset formula* -- host `2.5*r + 1e-9` vs device `fmax(RAY_EPS, 2.5*r)`, and the
-  host does populate `fiberRadius` (`curve.h:372` -> `hair_shade.h:129`), so neither degrades to
-  the no-tube case.
-* *Fireflies* -- see below; ruled out by convergence, not by a robust statistic.
-
-**A false lead worth keeping, because it nearly closed this issue wrongly.** Re-analysing the
-same renders with a MEDIAN instead of a mean gave 1.353x vs 1.347x -- 0.4 % agreement -- and the
-per-opacity drift vanished entirely. That looked like proof the whole thing was firefly
-contamination of the mean. It was not: the 1024-spp convergence check showed the mean gap is
-stable, so the median was **discarding a real effect that lives in the tail** rather than
-revealing the truth. A robust statistic answers "is the typical pixel the same", which is a
-different question from "is the energy the same", and only the second one is conservation.
-
-(Fireflies were nonetheless real in the *diagnostic* scenes here: an area-light backdrop made a
-density sweep non-monotone, 0.92 / 0.79 / 0.97 where it had to be flat, and a radius sweep
-report 3.03x more light than the no-fur reference, which is impossible for pure pass-through.
-Switching those probes to a uniform `light env` furnace -- no delta source, no tail -- is what
-made them readable, the same fix A3 needed.)
-
-**Impact**: transparent hair is dimmer on the GPU than the CPU, by ~10 % at a typical fiber
-radius and more for thick fibers. Opaque hair (`opacity 1`, the default) is unaffected -- that
-row is byte-identical to a scene with no `opacity` key. Next step is to confirm or kill the
-double-hit hypothesis, e.g. by counting fiber hits per camera ray on each backend.
+1. *An exact null beats a comparison.* Every earlier measurement compared two things that could
+   both be wrong, and one duly was. The question "do the backends agree" cannot detect a bug
+   they share; "is the invisible thing invisible" can, and needs no reference.
+2. *A robust statistic answered a different question.* A MEDIAN over the same renders showed
+   1.353 vs 1.347 -- 0.4 % agreement, drift gone -- and nearly closed this as firefly
+   contamination of the mean. A 1024-spp convergence check refuted it: the median was discarding
+   a real effect living in the tail. "Is the typical pixel the same" is not "is the energy the
+   same", and only the second is conservation.
+3. *Fireflies still contaminated the diagnostics.* A delta light made a density sweep
+   non-monotone (0.92 / 0.79 / 0.97 where it had to be flat) and a radius sweep report 3.03x more
+   light than the no-fur reference, which is impossible for pass-through. The final residual
+   (gpu/cpu 0.9865 in a sun-lit shadow ROI) was also fireflies -- a `light env` furnace showed
+   the true 1.0003. Every hair measurement here wants a furnace.
 ### HAIR-PENETRATION — OPEN (2026-09-18, measured): **72.7 % of Alice's strand segments lie inside another strand**, and the curve-of-curves blend is what puts them there
 
 Asked for: strands that do not run through each other "no matter how we define our curves", by

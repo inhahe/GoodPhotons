@@ -4740,6 +4740,10 @@ __device__ __noinline__ static double f(const Bcsdf& b, const V3& wo, const V3& 
 
     const double absCosI = fabs(cosThetaI);
     if (absCosI > 1e-9) sum /= absCosI;
+    // COVERAGE: this is the fiber's non-delta BCSDF, so it carries the probability that the
+    // ray was intercepted at all. Without it a see-through fiber scatters a full NEE
+    // connection out of nothing (measured: +7% at `opacity 0`, where fur must be invisible).
+    sum *= b.opacity;
     return isfinite(sum) ? fmax(0.0, sum) : 0.0;
 }
 
@@ -4799,6 +4803,10 @@ __device__ __noinline__ static double pdf(const Bcsdf& b, const V3& wo, const V3
                    trimmedLogistic(wrapAngle(phi - PhiS(p, b.gammaO, gammaT)), ss, -kPi, kPi);
         }
     }
+    // COVERAGE: this is the fiber's non-delta BCSDF, so it carries the probability that the
+    // ray was intercepted at all. Without it a see-through fiber scatters a full NEE
+    // connection out of nothing (measured: +7% at `opacity 0`, where fur must be invisible).
+    sum *= b.opacity;
     return isfinite(sum) ? fmax(0.0, sum) : 0.0;
 }
 
@@ -15104,9 +15112,14 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 const dhair::V3 wl = dhair::sample(hsv.b, hsv.woLocal, u0, u1, u2, u3, pdfH, fv, &la);
                 if (!(pdfH > 0.0) || !(fv > 0.0)) return;
                 const double cosLong = dhair::safeSqrt(1.0 - dhair::sqr(dhair::clampd(wl.x, -1.0, 1.0)));
+                // A coverage pass-through returns EXACTLY -wo (negation is exact in IEEE), carries
+                // weight 1 and is achromatic, so it must not be spectrally reweighted: its pdf is
+                // the branch probability, not a scatter density, and dividing by it is meaningless.
+                const bool passedThru = (hsv.b.opacity < 1.0) && wl.x == -hsv.woLocal.x &&
+                                        wl.y == -hsv.woLocal.y && wl.z == -hsv.woLocal.z;
                 double wCam = fv * cosLong / pdfH; wCam = wCam < 0.0 ? 0.0 : (wCam > 1.0 ? 1.0 : wCam);
                 thr *= wCam;
-                {   // per-lobe form (0.336.0): one exp + the four-lobe recurrence per bin
+                if (!passedThru) {   // per-lobe form (0.336.0): one exp + the four-lobe recurrence per bin
                     const bool perLobe = la.valid;
                     const double den = m.hairSigmaAFromReflect ? dhair::sigmaADenominator(m.hairBetaN) : 0.0;   // hoisted: three pow() per bin otherwise
                     double vk[DSpecThr::K];
@@ -15117,7 +15130,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                             double sig;
                             if (m.hairSigmaAFromReflect) { double c = (double)dDiffuseRho(sc, m, h, lk); sig = dhair::sigmaAFromReflectanceD(c, den); }
                             else sig = fmax(0.0, (double)specLookup(m.hairSigmaA, lk));
-                            w = dhair::fFromLobes(la, sig) * cosLong / pdfH;
+                            w = hsv.b.opacity * dhair::fFromLobes(la, sig) * cosLong / pdfH;
                         }
                         else { const DHairShade hk = dHairShadeAt(sc, m, h, lk, wPrev); w = dhair::f(hk.b, hk.woLocal, wl) * cosLong / pdfH; }
                         vk[k] = w < 0.0 ? 0.0 : (w > 1.0 ? 1.0 : w);

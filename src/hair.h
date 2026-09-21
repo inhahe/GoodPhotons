@@ -581,6 +581,10 @@ inline double f(const Bcsdf& b, const Vec3& wo, const Vec3& wi, LobeAngular* la 
 
     const double absCosI = std::fabs(cosThetaI);
     if (absCosI > 1e-9) sum /= absCosI;
+    // COVERAGE: this is the fiber's non-delta BCSDF, so it carries the probability that the
+    // ray was intercepted at all. Without it a see-through fiber scatters a full NEE
+    // connection out of nothing (measured: +19% at `opacity 0`, where fur must be invisible).
+    sum *= b.opacity;
     return std::isfinite(sum) ? std::max(0.0, sum) : 0.0;
 }
 
@@ -652,6 +656,10 @@ inline double pdf(const Bcsdf& b, const Vec3& wo, const Vec3& wi) {
                    trimmedLogistic(wrapAngle(phi - PhiS(p, b.gammaO, gammaT)), ss, -kPi, kPi);
         }
     }
+    // COVERAGE: this is the fiber's non-delta BCSDF, so it carries the probability that the
+    // ray was intercepted at all. Without it a see-through fiber scatters a full NEE
+    // connection out of nothing (measured: +19% at `opacity 0`, where fur must be invisible).
+    sum *= b.opacity;
     return std::isfinite(sum) ? std::max(0.0, sum) : 0.0;
 }
 
