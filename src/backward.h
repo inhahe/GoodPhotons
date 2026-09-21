@@ -1802,7 +1802,11 @@ struct BackwardRenderer {
                           bool& specularArrival, double& contBsdfPdf, MediumStack& stk,
                           Pcg32& rng, const SpdCache* spdCache = nullptr,
                           GiCtx gi = GiCtx{},
-                          GlossyMis* gm = nullptr) const {
+                          GlossyMis* gm = nullptr,
+                          // Set when the vertex was a NULL interaction (a hair coverage
+                          // pass-through): the ray was not intercepted, so the caller must
+                          // not charge it a path-length bounce.
+                          bool* nullEvent = nullptr) const {
         // Cleared here rather than per delta branch, so the invariant is
         // structural: `gm->pdf > 0` can only mean "the LAST bounce was a MIS'd
         // glossy one". A mirror or dielectric leaving a stale value behind would
@@ -2137,10 +2141,25 @@ struct BackwardRenderer {
                 if (whitted) { if (!whittedAttenuate(thr, T)) return false; }
                 else if (rng.uniform() >= T) return false;
                 const Vec3 wOut = hair::toWorld(hs.fr, wl);
-                contBsdfPdf = pdfH;                 // real pdf -> env-miss MIS is exact here
+                // A coverage PASS-THROUGH returns EXACTLY -wo, i.e. a DELTA continuation. NEE
+                // cannot sample a delta direction and its `f` is 0 here, so the BSDF strategy
+                // must take the whole weight. Reporting a finite pdf instead made the sky seen
+                // straight through a transparent fiber balance-heuristic weighted against a
+                // strategy that pays nothing back, losing that fraction outright -- which is why
+                // the null failed only under an ENV light (0.9833) and not under a sun (0.9982).
+                const bool passThru = (wl.x == -hs.woLocal.x && wl.y == -hs.woLocal.y &&
+                                       wl.z == -hs.woLocal.z);
+                if (nullEvent) *nullEvent = passThru;
+                // A null interaction is TRANSPARENT to MIS. It is not a new sampling event, so
+                // it must leave the last REAL vertex's bookkeeping alone: overwriting it (even
+                // with the nominally correct delta values) lets the escape take the whole
+                // weight for a direction whose NEE share an earlier vertex already claimed.
+                // Measured as a +0.5% overshoot when this assigned instead of preserving.
+                if (!passThru) contBsdfPdf = pdfH;     // real pdf -> env-miss MIS is exact
                 // Step clear of the strand's own body: TT/TRT exit the far side.
                 ray = Ray{h.p + wOut * hairExitOffset(hs, h.n, wOut), wOut};
-                specularArrival = false; return true;
+                if (!passThru) specularArrival = false;   // pass-through: inherit, do not set
+                return true;
             }
             case MatType::DiffuseTransmit: {
                 // Two-lobe Lambertian: NEE the reflect lobe in the front hemisphere and
@@ -2241,6 +2260,7 @@ struct BackwardRenderer {
         // and is shared verbatim by the forward and bidirectional tracers.
         bool grinAny = grin::sceneHasGrin(scene);
 
+        int nullSteps = 0;      // hair coverage pass-throughs, refunded below
         for (int b = 0; b < maxB; ++b) {
             // Publish the bounce index so a deterministic per-vertex choice (mode W's glossy
             // lobe) can pick a decorrelated sequence at each depth. Costs nothing otherwise.
@@ -2475,9 +2495,14 @@ struct BackwardRenderer {
                 L += thr * emitSlot(scene, m, h, lambda) * invPdfLambda * wMis;
             }
 
+            bool nullEvt = false;
             if (!interactMaterial(scene, m, h, mats, ray, lambda, invPdfLambda, thr, L,
-                                  specularArrival, contBsdfPdf, stk, rng, spdCache, gi, gmp))
+                                  specularArrival, contBsdfPdf, stk, rng, spdCache, gi, gmp,
+                                  &nullEvt))
                 return L;                                 // path terminated in the interaction
+            // NULL INTERACTION: refund the bounce. The cap bounds the worst case in fur dense
+            // enough to keep handing back steps; 256 is far above anything real fur produces.
+            if (nullEvt && nullSteps < 256) { --b; ++nullSteps; }
         }
         return L;
     }
@@ -2600,6 +2625,7 @@ struct BackwardRenderer {
             secAlive = false;
         };
 
+        int nullSteps = 0;      // hair coverage pass-throughs, refunded below
         for (int b = bounce0; b < maxB; ++b) {
             int nUp = secAlive ? C : 1;   // wavelengths still being propagated
             gi.bounce = b;                // see the scalar twin: mode W's per-vertex lattice
@@ -3002,16 +3028,21 @@ struct BackwardRenderer {
                             thr[i] = 0.0;    // it is now that sub-path's business, not ours
                         }
                         secAlive = false;    // hero carries on alone, UNBOOSTED
+                        bool heroNull = false;
                         if (!interactMaterial(scene, m, h, mats, ray, lam[0], invPdf[0], thr[0],
                                               L[0], specularArrival, contBsdfPdf, stk, rng,
-                                              spdCache, gi)) { finish(); return; }
+                                              spdCache, gi, nullptr, &heroNull)) { finish(); return; }
+                        if (heroNull && nullSteps < 256) { --b; ++nullSteps; }
                         break;
                     }
                     // Default policy: terminate secondaries, then run the shared scalar
                     // interaction on the (boosted) hero channel.
                     deHero();
+                    bool heroNull2 = false;
                     if (!interactMaterial(scene, m, h, mats, ray, lam[0], invPdf[0], thr[0], L[0],
-                                          specularArrival, contBsdfPdf, stk, rng, spdCache, gi)) { finish(); return; }
+                                          specularArrival, contBsdfPdf, stk, rng, spdCache, gi,
+                                          nullptr, &heroNull2)) { finish(); return; }
+                    if (heroNull2 && nullSteps < 256) { --b; ++nullSteps; }
                     break;
                 }
                 case MatType::Diffuse:

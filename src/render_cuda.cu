@@ -11312,7 +11312,7 @@ __device__ __noinline__ static bool bkInteractHair(const DScene& sc, const DMate
         const DHit& h, bool directOnly, bool whitted,
         DVec3& ro, DVec3& rd, Real lambda, double invPdfLambda,
         double& thr, double& L, bool& specularArrival,
-        double& contBsdfPdf, DRng& rng, int giDepth) {
+        double& contBsdfPdf, DRng& rng, int giDepth, bool* nullEvent = nullptr) {
     const DVec3 wPrev = rd * (Real)(-1);
     const DHairShade hsv = dHairShadeAt(sc, m, h, lambda, wPrev);
     L += thr * bkNeeLight(sc, h, (Real)1, invPdfLambda, lambda, rng, giDepth, &hsv);
@@ -11334,10 +11334,17 @@ __device__ __noinline__ static bool bkInteractHair(const DScene& sc, const DMate
     if (whitted) { if (!dWhittedAttenuate(thr, T)) return false; }
     else if ((double)rng.uniform() >= T) return false;
     const DVec3 wOut = dhair::toWorld(hsv.fr, wl);
-    contBsdfPdf = pdfH;                       // env-escape MIS vs the hair pdf
+    // A coverage pass-through returns EXACTLY -wo. It is a NULL interaction: the ray was
+    // never intercepted, so it is transparent to MIS (inherit the last real vertex's
+    // bookkeeping rather than overwrite it -- assigning here double-counts the escape
+    // against a NEE share an earlier vertex already took) and it must not spend a bounce.
+    const bool passThru = (wl.x == -hsv.woLocal.x && wl.y == -hsv.woLocal.y &&
+                           wl.z == -hsv.woLocal.z);
+    if (nullEvent) *nullEvent = passThru;
+    if (!passThru) contBsdfPdf = pdfH;        // env-escape MIS vs the hair pdf
     ro = h.p + wOut * dHairExitOffset(hsv, h.n, wOut);
     rd = wOut;
-    specularArrival = false;                  // NEE covered direct light here
+    if (!passThru) specularArrival = false;   // NEE covered direct light here
     return true;
 }
 
@@ -11361,7 +11368,8 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                                   DVec3& ro, DVec3& rd, Real& lambda, double& invPdfLambda,
                                   double& thr, double& L, bool& specularArrival,
                                   double& contBsdfPdf, DMediumStack& stk, DRng& rng,
-                                  DGiCtx gi, DGlossyMis* gm = nullptr) {
+                                  DGiCtx gi, DGlossyMis* gm = nullptr,
+                                  bool* nullEvent = nullptr) {
     const bool whitted = (sc.bkWhitted != 0);
     // Cleared here rather than per delta branch, so the invariant is structural: `gm->pdf > 0`
     // can only mean "the LAST bounce was a MIS'd glossy one". A mirror or dielectric leaving a
@@ -11594,7 +11602,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             // on an actual hair hit — see the comment on bkInteractHair.
             return bkInteractHair(sc, *mp, h, directOnly, whitted, ro, rd, lambda,
                                   invPdfLambda, thr, L, specularArrival, contBsdfPdf,
-                                  rng, gi.depth);
+                                  rng, gi.depth, nullEvent);
         case D_DIFFUSE:
         default: {
             Real rho = clamp01(dDiffuseRho(sc, *mp, h, lambda));
@@ -11656,6 +11664,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                         ? (sc.bkGiBounce < sc.bkMaxBounce ? sc.bkGiBounce : sc.bkMaxBounce)
                         : sc.bkMaxBounce;
     const bool directOnly = (sc.bkDirectOnly != 0);
+    int nullSteps = 0;      // hair coverage pass-throughs, refunded below
     for (int b = 0; b < maxBounce; ++b) {
         // Publish the bounce index so a deterministic per-vertex choice (mode W's glossy
         // lobe) can pick a decorrelated sequence at each depth. Costs nothing otherwise.
@@ -11801,10 +11810,12 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             }
         }
 
+        bool nullEvt = false;
         if (!bkInteract<GiDepth == 0>(sc, mp, h, matId, diffraction, directOnly, ro, rd, lambda,
                                       invPdfLambda, thr, L, specularArrival, contBsdfPdf, stk,
-                                      rng, gi, gmp))
+                                      rng, gi, gmp, &nullEvt))
             return L;                                   // path terminated in the interaction
+        if (nullEvt && nullSteps < 256) { --b; ++nullSteps; }
     }
     return L;
 }
@@ -11881,6 +11892,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                         : sc.bkMaxBounce;
     const bool directOnly = (sc.bkDirectOnly != 0);
 
+    int nullStepsH = 0;     // hair coverage pass-throughs, refunded below
     for (int b = bounce0; b < maxBounce; ++b) {
         int nUp = secAlive ? C : 1;                    // wavelengths still being propagated
         gi.bounce = b;                                 // see the scalar twin: mode W's per-vertex lattice
@@ -12149,10 +12161,12 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                         thr[i] = 0.0;    // it is now that sub-path's business, not ours
                     }
                     secAlive = false;    // hero carries on alone, UNBOOSTED
+                    bool heroNull = false;
                     if (!bkInteract<false>(sc, mp, h, matId, diffraction, directOnly, ro, rd,
                                            lam[0], invPdf[0], thr[0], L[0], specularArrival,
-                                           contBsdfPdf, stk, rng, gi))
+                                           contBsdfPdf, stk, rng, gi, nullptr, &heroNull))
                         return;
+                    if (heroNull && nullStepsH < 256) { --b; ++nullStepsH; }
                     break;
                 }
                 }
@@ -12162,10 +12176,12 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 // (a fluorescent Stokes shift) — legal now that index 0 is the only live
                 // wavelength.
                 if (secAlive) { thr[0] *= (double)C; secAlive = false; }
+                bool heroNull2 = false;
                 if (!bkInteract<false>(sc, mp, h, matId, diffraction, directOnly, ro, rd, lam[0],
                                        invPdf[0], thr[0], L[0], specularArrival, contBsdfPdf, stk,
-                                       rng, gi))
+                                       rng, gi, nullptr, &heroNull2))
                     return;
+                if (heroNull2 && nullStepsH < 256) { --b; ++nullStepsH; }
                 break;
             }
             case D_DIFFUSE:

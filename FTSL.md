@@ -1962,10 +1962,28 @@ be invisible, so it must reproduce a render with no fur at all:
   path only when the fiber actually intercepted, and its coat model treats a crossing as an
   interception with probability `opacity` -- exact Poisson thinning under `-dual-grid`.
 
-The null now reads 0.98 against 1.0; the remainder is not the coverage logic but the fiber EXIT
-OFFSET, which steps the continuation `2.5r` forward and can clear nearby geometry near the
-roots. It shrinks with radius (0.994 at r = 2e-5) and is a property of the exit convention that
-predates `opacity`. See HAIRTRANS-NULL in `known-issues.md`.
+**Two more at the pass-through itself (0.360.0), both found by counting rather than guessing.**
+A coverage pass-through is a NULL interaction -- the ray was never intercepted -- and the tracer
+was treating it as an ordinary bounce in two ways:
+
+* It **overwrote the MIS state**. The continuation is a delta (exactly `-wo`), which NEE cannot
+  sample and whose `f` is 0, so reporting a finite pdf made the sky seen straight THROUGH a
+  transparent fiber balance-heuristic weighted against a strategy that pays nothing back. A null
+  interaction has to be *transparent* to MIS: it inherits the last real vertex's bookkeeping.
+  Assigning the nominally-correct delta values instead of inheriting overshoots by +0.5 %,
+  because an earlier vertex may already have claimed that direction's NEE share.
+* It **spent a path-length bounce**, so invisible fur truncated paths: the null read 0.73 at
+  `-max-bounce 2` against 0.98 at 64. GRIN marching in the same loop already follows the rule.
+
+The `opacity 0` null -- fur that must be invisible -- now reads **0.998 on CPU** (from 0.983) and
+**0.991 on GPU** (from 0.976), and is flat across bounce budgets on both (0.9984 at
+`-max-bounce 2`, from 0.726). The first defect only bites under an ENV light, which is why the
+same fur nulled at 0.998 under a sun and 0.983 in a furnace for two versions. See HAIRTRANS-NULL
+in `known-issues.md` for the ~0.2 % that remains and the GPU's remaining ~0.7 % gap.
+
+*A correction to what this section said in 0.359.0:* it named the fiber EXIT OFFSET as the
+mechanism. That was wrong -- narrowing the offset moved the null by less than noise -- and the
+real causes are the two above.
 
 *A correction to what this section used to say:* it reported the two backends disagreeing on
 shadow lightening, 1.52x on CPU against 1.38x on GPU, and blamed the GPU running `Real` as

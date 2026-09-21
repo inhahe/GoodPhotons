@@ -4793,75 +4793,63 @@ hair, the default, is bit-identical.
    light than the no-fur reference, which is impossible for pass-through. The final residual
    (gpu/cpu 0.9865 in a sun-lit shadow ROI) was also fireflies -- a `light env` furnace showed
    the true 1.0003. Every hair measurement here wants a furnace.
-### HAIRTRANS-NULL — OPEN (2026-09-21, measured): fur at `opacity 0`, which must be invisible,
-still changes the image by ~1.7 % -- the fiber exit offset, not the coverage logic
+### HAIRTRANS-NULL — MOSTLY FIXED (0.360.0). A coverage pass-through is a NULL interaction, and
+the tracer was treating it as an ordinary bounce in two separate ways
 
-After 0.358.0 and 0.359.0 closed three coverage bugs, the `opacity 0` null in a furnace reads
-0.9833 (no dual), 0.9837 (`-dual-scatter`), 0.9827 (`+ -dual-grid`) where it must read 1.000.
-Run-to-run noise on this path is ~0.01 %, so the residual is real.
+**Resolved by instrumentation, after three hypotheses inferred from image statistics were each
+wrong.** Env-gated counters on every hair code path gave the ground truth inference could not:
+at `opacity 0`, 100 % of hair vertices take the pass-through branch (2873/2873, 4477/4477); at
+`opacity 1`, 0 % do. The coverage branch was never the problem. What the tracer did with it was.
 
-**It IS visible, and it is not noise.** At `opacity 0` the coat leaves a faint speckled halo
-where there should be nothing. The error is structured -- lag-1 autocorrelation 0.37 / 0.34
-inside the affected region -- and radially organised around the coat centre:
+1. **The MIS state was overwritten.** The continuation is a delta (exactly `-wo`); NEE cannot
+   sample it and its `f` is 0. Reporting a finite `contBsdfPdf` made the environment seen
+   straight through a transparent fiber balance-heuristic weighted against a strategy that pays
+   nothing back, so that fraction was lost outright. A null interaction must be TRANSPARENT to
+   MIS -- inherit the last real vertex's state, never assign. Assigning the nominally correct
+   delta values instead OVERSHOOTS by +0.5 %, because an earlier vertex may already have claimed
+   that direction's NEE share; that overshoot is how round one was caught.
+2. **The bounce was spent.** A ray that was not intercepted did not scatter, yet each
+   pass-through charged a path-length bounce, so invisible fur truncated paths.
 
-| radius from coat centre | signed error |
-|---|---|
-| 0-10 px (on the sphere) | **+5.87 %** |
-| 10-18 px | -2.07 % |
-| 18-26 px | -2.96 % |
-| 26-34 px | -0.41 % |
-| 34-60 px | ~ +0.3 % |
+| `opacity 0` null | before | after |
+|---|---|---|
+| CPU, default budget | 0.9833 | **0.9981** |
+| CPU, `-max-bounce 2` | 0.7255 | **0.9984** |
+| GPU, default budget | 0.9759 | **0.9906** |
+| GPU, `-max-bounce 2` | -- | **0.9910** |
+| CPU sun-lit control | 0.9982 | 0.9982 (unchanged) |
 
-**A too-bright core inside a too-dark ring, with the total roughly conserved: light is being
-MOVED, not lost.** 1.8 % of frame pixels are off by more than 10 %, all of them within about
-two coat radii of the centre.
+Defect 1 only bites under an ENV light, which is why the same fur nulled at 0.998 under a sun
+and 0.983 in a furnace for two versions, and why the single-fiber test (a quad backdrop, no env)
+came out clean at 1.0003. Three measurements collected for unrelated reasons, all consistent,
+none explicable until the counters named the mechanism.
 
-**What is now ruled OUT, each by measurement:**
+**STILL OPEN, two parts.**
 
-* *One crossing is exact.* A SINGLE straight fiber at `opacity 0`, measured on-fiber against
-  off-fiber columns of the SAME image (so no second render and no reference scene), reads
-  **1.0003** with a flat column profile. So the per-crossing coverage maths is right and the
-  error is in what ACCUMULATES over many crossings.
-* *The fiber exit offset.* The story was that a pass-through resumes `2.5r` along and steps
-  over the skin it grows from. Narrowing the offset so it hides only CURVE primitives (a
-  `curveTmin` on the ray, leaving fiber-skipping identical) moved the null by less than noise
-  and changed opaque hair by 0.02 % -- so nothing was being hidden in that gap. Reverted.
-* *Fur tier confusion.* The scene builds 3000 real strands / 36000 segments, not an aggregate.
+* A residual **~0.2 %** on CPU, independent of light type and bounce budget. The sun-lit scene
+  has always carried it.
+* The GPU sits **~0.7 % behind the CPU** (0.9906 vs 0.9981), so backend agreement at
+  `opacity 0.15` now reads 0.9804 where 0.358.0 measured 0.9997. That looks like a regression
+  and is not: the old agreement was the two backends sharing one bug. The CPU is now
+  demonstrably closer to a known answer. Finding the rest means pointing the same counters at
+  the device.
 
-**What it DOES scale with.** Fiber count, with the bounce budget pinned high so the two cannot
-be confounded (`-max-bounce 256 -photon-bounce 256`):
+**Three hypotheses this cost, all killed by measurement, recorded so they are not retried:**
 
-| strands | null |
-|---|---|
-| 500 | 0.9937 |
-| 3000 | 0.9833 |
-| 12000 | 0.9755 |
+* *The fiber exit offset.* Narrowing it to hide only curve primitives moved the null by less
+  than noise and changed opaque hair by 0.02 %. Reverted.
+* *Per-crossing coverage maths.* A single fiber nulls at 1.0003.
+* *A bounce refund in `photonGather`.* Changed nothing, because mode R is the BACKWARD reference
+  and never calls it. The same correct idea landed in code this scene does not execute twice
+  before instrumentation found the hero walk in `backward.h`.
 
-**A SECOND, separate effect: the bounce budget.** Splitting the two walks with `-photon-bounce`
-shows the CAMERA walk is the limiter, not the photon walk:
-
-| camera / photon bounces | null |
-|---|---|
-| 1 / 64 | 0.4996 |
-| 2 / 64 | 0.7255 |
-| 64 / 2 | 0.9833 |
-| 256 / 256 | 0.9833 |
-
-Every fiber a ray passes through appears to spend a path-length bounce, so invisible fur
-truncates camera paths. That is a real defect on its own -- a null interaction is not a
-scattering event, the same rule GRIN marching already follows -- but it is NOT this entry's
-1.7 %, which survives at any budget.
-
-**An attempted fix that did not land, recorded so it is not retried blindly.** Refunding the
-bounce (`--b`) on a detected pass-through in `photonGather` and `photonGatherSub` -- which
-`photonmap_render.h:1830` calls for every camera ray -- changed NOTHING, including at
-`-max-bounce 1`, where it should have been dramatic. So the camera walk that actually spends
-these bounces is somewhere else, or the pass-through is not being recognised there. Finding
-where a mode-R camera ray really spends its bounces is the prerequisite for that half.
-
-Note the offset is a property of the exit convention and predates `opacity`; the same step runs
-after every ordinary scatter, where no null exists to expose it.
-
+**The process lesson, which cost more than any of the above.** For several rounds the probes
+reported hard zeros for paths that were executing thousands of times: the patch scripts had
+failed on bad anchors, and because the build was chained after a NEWLINE rather than `&&`, it
+ran anyway and the tracebacks went to a file that was never read. An absent probe and a
+never-firing probe are indistinguishable in the output. Verify the instrument can speak before
+believing its silence -- the same rule as checking a control is live, applied to the measuring
+apparatus itself.
 ### HAIR-PENETRATION — OPEN (2026-09-18, measured): **72.7 % of Alice's strand segments lie inside another strand**, and the curve-of-curves blend is what puts them there
 
 Asked for: strands that do not run through each other "no matter how we define our curves", by
