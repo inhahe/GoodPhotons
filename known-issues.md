@@ -4877,6 +4877,65 @@ reported hard zeros for paths executing thousands of times: the patch scripts ha
 anchors, and because the build was chained after a NEWLINE rather than `&&`, it ran anyway and
 the tracebacks went to a file that was never read. An absent probe and a never-firing probe are
 indistinguishable. Verify the instrument can speak before believing its silence.
+### HAIR-TEMPORAL — MEASURED, and the obvious fix does NOT work (2026-09-21)
+
+Hair noise is essentially FULLY DECORRELATED between frames of a moving camera, and the
+scene-anchoring trick that makes the `-gi` gather flicker-free does not transplant to it.
+
+Method is `scraps/hair_temporal.py`, the same second-difference score as `scraps/gi_temporal.py`:
+walk the camera through a 10-degree arc and measure |L(t-1) - 2L(t) + L(t+1)| over the coat,
+normalised by the first difference. Independent per-frame noise has an analytic ratio of
+sqrt(6/2) = 1.73.
+
+| variant | second/first | vs control |
+|---|---|---|
+| control, no fur | 1.409 | -- |
+| opaque | 1.701 | 1.21x |
+| specular (tinted cuticle) | 1.706 | 1.21x |
+| transparent (`opacity 0.18`) | 1.695 | 1.20x |
+| dielectric (low sigma_a) | 1.678 | 1.19x |
+
+**No hair feature is worse than any other** -- all four sit within 1 % of each other, on both
+backends. Reflective and transparent hair need no special treatment; the coat as a whole sits at
+the independent-noise limit.
+
+**WHAT DID NOT WORK, and why, so it is not retried.** The `-gi` gather is temporally safe
+because its direction set is "a pure function of (lattice index, sample index) and never of the
+scene". Hair's four BCSDF uniforms instead come off a stream seeded by (sample index, PIXEL
+index), which a moving camera breaks. Seeding them from a hash of the HIT POSITION quantised to
+a lattice cell -- the same property, transplanted -- was implemented and verified live (it
+changes the render substantially), and moved the score by NOTHING:
+
+| anchor cell | second/first |
+|---|---|
+| off | 1.718 |
+| 0.36 mm | 1.708 |
+| 1 mm | 1.710 |
+| 3 mm | 1.709 |
+| 10 mm | 1.709 |
+
+A follow-up hypothesis -- that a LOWER-FREQUENCY anchor would slide smoothly the way GI banding
+does -- is refuted by that same 28x sweep. The reason is that the noise source was
+misidentified: for GI the randomness IS the direction choice, so fixing directions fixes the
+frame-to-frame variation; for hair the dominant variation is WHICH FIBERS land inside a pixel.
+Strands are sub-pixel, so a camera nudge changes the geometry within the pixel no matter what
+numbers the BCSDF is fed. The code was removed rather than shipped as a knob that does nothing.
+
+**WHAT DOES HELP** is reducing noise AMPLITUDE, because the second/first ratio is scale-free --
+it measures whether noise is independent, not how large it is, and visible flicker is driven by
+amplitude:
+
+| config | second/first | spatial noise |
+|---|---|---|
+| strands | 1.718 | 0.0906 |
+| `-fur-volume` | 1.662 | 0.0877 |
+| `-fur-lod` | 1.659 | 0.0883 |
+| strands, 4x spp | 1.677 | **0.0521** |
+
+So: spp is the direct lever (4x samples, 43 % less noise); the aggregate tiers help modestly at
+this framing and should help more where the coat is small on screen, which is exactly what they
+are for. A temporal denoiser with motion vectors would attack it properly, and does not exist.
+
 ### HAIR-PENETRATION — OPEN (2026-09-18, measured): **72.7 % of Alice's strand segments lie inside another strand**, and the curve-of-curves blend is what puts them there
 
 Asked for: strands that do not run through each other "no matter how we define our curves", by
