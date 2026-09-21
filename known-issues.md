@@ -4835,13 +4835,32 @@ default configuration too. The trade was taken deliberately -- the null is groun
 backends moved much closer to it, while `opacity 1` has no reference to check against -- but it
 is a real regression in the most-used configuration and should be closed.
 
-Three attempts on it already failed, recorded so they are not repeated: matching the host's
-epsilon to the device's (no effect, 1.0065 -> 1.0066); giving the device the host's near-side
-`1e-6` curve exclusion instead of its `RAY_EPS` floor (WORSE, 1.0066 -> 1.0091, reverted). The
-asymmetry is real -- host near-side `1e-6` vs device `RAY_EPS` -- but removing it does not help,
-so the mechanism is something else. The approach that actually worked twice today is to
-instrument what differs at an opaque fiber exit rather than to reason about which constant looks
-suspicious.
+**Narrowed by instrumentation (2026-09-21).** Counting what each backend actually does at an
+OPAQUE fiber exit, same scene, 64 spp:
+
+| | vertices | near-side | mean T | mean exit offset |
+|---|---|---|---|---|
+| CPU | 106522 | 29.4 % | 0.873663 | 1.066e-04 |
+| GPU | 50196 | 29.2 % | 0.872520 | 1.389e-04 |
+
+* **The BCSDF is NOT the divergence.** Mean throughput agrees to 0.13 % and the near/far branch
+  split is identical, so both backends evaluate and classify the lobe the same way. That
+  eliminates the whole family of shading explanations.
+* **The offset asymmetry is real and quantified.** `dHairExitOffset` floors at `RAY_EPS`
+  (1e-4f) where the host uses 1e-6 on the near side, and that predicts the measured means
+  exactly: 1.066e-4 + 0.292 x (1e-4 - 1e-6) = 1.36e-4 against the GPU's 1.389e-4. But REMOVING
+  the asymmetry made agreement WORSE (1.0066 -> 1.0091, reverted), so it is a real difference
+  that is not the cause.
+* **Unresolved: the vertex counts differ 2.12x**, which is far too large to yield only 0.66 %.
+  Most likely the two probes count different populations -- the host's `interactMaterial` is
+  reachable from GI gather sub-paths while the device probe sits only in `bkInteractHair` -- but
+  that was NOT confirmed (`-gi-dirs` does not exist; only `-gi-bounce`). Settling it is the next
+  step, and it needs probes placed at matching scopes rather than at the convenient site in each
+  backend.
+
+Failed attempts, recorded so they are not repeated: matching the host's epsilon to the device's
+(no effect, 1.0065 -> 1.0066); giving the device the host's near-side 1e-6 curve exclusion
+instead of its `RAY_EPS` floor (worse, reverted).
 
 **Hypotheses killed by measurement:** per-crossing coverage maths (a single fiber nulls at
 1.0003); a bounce refund in `photonGather` (mode R is the BACKWARD reference and never calls
