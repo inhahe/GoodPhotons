@@ -4736,48 +4736,68 @@ the photon map**. Measuring a lit diffuse wall instead of a panel is the entire 
 choices made at the camera's wavelength — the same class of error, not expressible as a smooth
 ratio, and still unmeasured.
 
-### HAIRTRANS-BACKEND — OPEN (2026-09-20, measured): the two backends disagree by a GROWING
-amount as hair is made more transparent, so it is not a constant offset
+### HAIRTRANS-BACKEND — OPEN, but LOCALISED (2026-09-20): the device behaves as if transparent
+hair were about twice as opaque as asked, and the error scales with fiber radius
 
-`opacity` on a hair material (0.356.0) and its shadow half (0.357.0) both work on CPU and GPU,
-monotone and in the same direction. They do not agree on the magnitude, and the way they
-disagree is the informative part. Mean luminance in a fur ball's shadow on a white floor,
-80x80, 96 spp, mode R:
+**The shadow half is NOT the problem and is now proven correct.** Splitting the two places
+transparency enters, with `-direct-only` so no indirect light contaminates the measurement, the
+shadow path agrees to **0.09 %**:
 
 | `opacity` | CPU | GPU | GPU/CPU |
 |---|---|---|---|
-| 1.0 (and no key at all) | 2.1581 | 2.1031 | 0.9745 |
-| 0.5 | 2.6855 | 2.4588 | 0.9156 |
-| 0.15 | 3.2813 | 2.9046 | **0.8852** |
+| 1.0 | 1.8840 | 1.8857 | 1.0009 |
+| 0.15 | 2.6475 | 2.6500 | 1.0009 |
 
-**The ratio drifts, 0.9745 -> 0.8852.** A constant backend offset would leave it flat, so this
-is not simply the ~2.5 % gap the scene already carries at `opacity 1` (which predates the
-feature: that row is byte-identical to a scene with no `opacity` key). The transparency path
-itself diverges, and it diverges further the more transparent the hair is. Equivalently, the
-shadow lightens 1.52x on the CPU against 1.38x on the GPU over the same range.
+Lightening 1.405x on both. So `Scene::shadowTransmittance` and its device twin are consistent,
+and the whole remaining gap is in the **indirect** light scattered off transparent fur.
 
-**Not investigated.** Recorded because the drift is a real signal and the numbers are cheap to
-reproduce, not because it blocks anything -- the reporter of the feature does not plan to lean
-on transparent hair. Candidates, roughly in order of suspicion:
+**It is real, not noise.** At 96 spp the shadow lightens 1.520x (CPU) vs 1.381x (GPU); at
+**1024 spp**, 1.534x vs 1.394x. Ten times the samples moves neither.
 
-1. **The device runs `Real` as float** (`FTRACE_GPU_FP32=1`). Transmittance is a PRODUCT along
-   the ray, so error compounds with the number of fibers crossed -- and the number crossed grows
-   as opacity falls, which is exactly the observed shape. The cheapest test: a paired run with
-   the device built in double, or accumulate `T` in double on the device (it already is; check
-   that `specLookup` and the intersection are not the float link).
-2. **Two halves, only one of which may be wrong.** Transparency enters twice -- as a coverage
-   lobe in `sample()` (scattering) and as `shadowTransmittance` (shadows). A scene lit only by
-   ambient/env with no NEE, or one where the fiber is seen directly against a backdrop, would
-   isolate which half drifts. The see-through correlation test in the 0.356.0 work already
-   showed cpu 0.698 vs gpu 0.748 at opacity 0.15 -- the GPU is MORE see-through there while
-   being LESS shadow-transmissive here, which suggests the two halves do not drift together.
-3. **The `T <= 1e-4` early-out threshold** is compared in `Real`; in float it fires at a
-   slightly different depth than on the host.
+**It scales with fiber radius**, which is the sharpest clue found:
 
-Point 2 is the one to run first: it is a control that splits the effect in half for the cost of
-one render pair, and its existing numbers already hint the two halves disagree in opposite
-directions -- which no single precision story would explain.
+| fiber radius | GPU/CPU |
+|---|---|
+| 0.00002 | 0.979 |
+| 0.00009 | 0.894 |
+| 0.00040 | 0.740 |
 
+**Quantified**: at the default radius, GPU `opacity 0.15` matches CPU `opacity ~0.31` (CPU 0.25
+-> 3.0409, 0.30 -> 2.9538, against GPU 0.15 -> 2.9275). Roughly a factor of two in effective
+opacity. A mechanism that would produce exactly that is the device registering **two hits per
+fiber** (near and far wall) and applying the coverage lobe twice -- invisible at `opacity 1`,
+where the first hit scatters and the second is never reached. Not confirmed.
+
+**Eliminated, each by measurement rather than reading:**
+
+* *Bounce budget* -- identical at `-max-bounce` 8 and 64, and the flag was separately verified
+  live in mode R (1 -> 0.1443, 4 -> 0.3032, 64 -> 0.3347) so the null is not a dead control.
+* *The coverage lobe itself* -- the `Params` field, the `make()` copy and the branch in
+  `sample()` are line-for-line identical between `hair.h` and `dhair`.
+* *RNG draw order* -- both draw u0..u3 into named locals in the same order.
+* *The exit-offset formula* -- host `2.5*r + 1e-9` vs device `fmax(RAY_EPS, 2.5*r)`, and the
+  host does populate `fiberRadius` (`curve.h:372` -> `hair_shade.h:129`), so neither degrades to
+  the no-tube case.
+* *Fireflies* -- see below; ruled out by convergence, not by a robust statistic.
+
+**A false lead worth keeping, because it nearly closed this issue wrongly.** Re-analysing the
+same renders with a MEDIAN instead of a mean gave 1.353x vs 1.347x -- 0.4 % agreement -- and the
+per-opacity drift vanished entirely. That looked like proof the whole thing was firefly
+contamination of the mean. It was not: the 1024-spp convergence check showed the mean gap is
+stable, so the median was **discarding a real effect that lives in the tail** rather than
+revealing the truth. A robust statistic answers "is the typical pixel the same", which is a
+different question from "is the energy the same", and only the second one is conservation.
+
+(Fireflies were nonetheless real in the *diagnostic* scenes here: an area-light backdrop made a
+density sweep non-monotone, 0.92 / 0.79 / 0.97 where it had to be flat, and a radius sweep
+report 3.03x more light than the no-fur reference, which is impossible for pure pass-through.
+Switching those probes to a uniform `light env` furnace -- no delta source, no tail -- is what
+made them readable, the same fix A3 needed.)
+
+**Impact**: transparent hair is dimmer on the GPU than the CPU, by ~10 % at a typical fiber
+radius and more for thick fibers. Opaque hair (`opacity 1`, the default) is unaffected -- that
+row is byte-identical to a scene with no `opacity` key. Next step is to confirm or kill the
+double-hit hypothesis, e.g. by counting fiber hits per camera ray on each backend.
 ### HAIR-PENETRATION — OPEN (2026-09-18, measured): **72.7 % of Alice's strand segments lie inside another strand**, and the curve-of-curves blend is what puts them there
 
 Asked for: strands that do not run through each other "no matter how we define our curves", by
