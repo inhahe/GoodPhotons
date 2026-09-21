@@ -4800,11 +4800,29 @@ After 0.358.0 and 0.359.0 closed three coverage bugs, the `opacity 0` null in a 
 0.9833 (no dual), 0.9837 (`-dual-scatter`), 0.9827 (`+ -dual-grid`) where it must read 1.000.
 Run-to-run noise on this path is ~0.01 %, so the residual is real.
 
-**It is not an energy-conservation bug in `opacity`.** The deficit is concentrated at the
-fur/sphere silhouette -- individual pixels there run 20-44 % BRIGHT, while the coat's top is 4 %
-dark -- which is the signature of rays changing which geometry they hit, not of light being
-created or destroyed. The suspect is `hairExitOffset`: a pass-through resumes `2.5r` beyond the
-fiber, which near the roots can step over the skin surface the fiber is growing out of.
+**It IS visible, and it is not noise.** At `opacity 0` the coat leaves a faint speckled halo
+where there should be nothing. The error is structured -- lag-1 autocorrelation 0.37 / 0.34
+inside the affected region -- and radially organised around the coat centre:
+
+| radius from coat centre | signed error |
+|---|---|
+| 0-10 px (on the sphere) | **+5.87 %** |
+| 10-18 px | -2.07 % |
+| 18-26 px | -2.96 % |
+| 26-34 px | -0.41 % |
+| 34-60 px | ~ +0.3 % |
+
+**A too-bright core inside a too-dark ring, with the total roughly conserved: light is being
+MOVED, not lost.** That is the signature of rays changing which geometry they hit, and it names
+the mechanism. `hairExitOffset` resumes a pass-through `2.5r` beyond the fiber; over the sphere
+that step can clear the skin the fiber grows from, so the ray misses the dark sphere and sees
+bright sky (+5.9 % core), while just outside the silhouette the same step pushes near-tangent
+rays INTO the sphere they should have missed (the -2 to -3 % ring). Hit/miss flipping at a
+silhouette also explains the saturation with radius that a pure attenuation story could not.
+
+*(An earlier revision of this entry called the error noise-like on an autocorrelation of 0.018.
+That number was measured over a region that mostly EXCLUDED the artifact -- the ROI was in the
+wrong place. Looking at the image is what corrected it.)*
 
 | fiber radius | exit offset | null |
 |---|---|---|
@@ -4816,10 +4834,15 @@ Radius-dependent, which fits -- but it SATURATES between the last two, which doe
 offset story, so the mechanism is not fully identified. A second effect (at large radius nearly
 every ray meets a fiber) may be masking it.
 
+Severity scales with transparency and is ZERO at the default `opacity 1`, where no pass-through
+happens at all. Against the real coat it is small -- an `opacity 1` fur ball has a large halo of
+its own and the residual is a fraction of it -- but at `opacity 0`, 1.8 % of frame pixels are off
+by more than 10 %, so it is not invisible either.
+
 Note this is a property of the exit convention and predates `opacity`: the same offset is
-applied after an ordinary scatter, where no null exists to expose it. Fixing it means making the
-resume robust without re-hitting the fiber it just left -- e.g. excluding that primitive for one
-step instead of stepping past it geometrically.
+applied after an ordinary scatter, where no null exists to expose it. The fix is to stop
+stepping past the fiber geometrically and instead exclude the primitive just left for one step,
+so the resume cannot skip whatever lies within `2.5r`.
 
 ### HAIR-PENETRATION — OPEN (2026-09-18, measured): **72.7 % of Alice's strand segments lie inside another strand**, and the curve-of-curves blend is what puts them there
 
