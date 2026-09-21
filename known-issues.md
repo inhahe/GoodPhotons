@@ -4813,36 +4813,54 @@ inside the affected region -- and radially organised around the coat centre:
 | 34-60 px | ~ +0.3 % |
 
 **A too-bright core inside a too-dark ring, with the total roughly conserved: light is being
-MOVED, not lost.** That is the signature of rays changing which geometry they hit, and it names
-the mechanism. `hairExitOffset` resumes a pass-through `2.5r` beyond the fiber; over the sphere
-that step can clear the skin the fiber grows from, so the ray misses the dark sphere and sees
-bright sky (+5.9 % core), while just outside the silhouette the same step pushes near-tangent
-rays INTO the sphere they should have missed (the -2 to -3 % ring). Hit/miss flipping at a
-silhouette also explains the saturation with radius that a pure attenuation story could not.
+MOVED, not lost.** 1.8 % of frame pixels are off by more than 10 %, all of them within about
+two coat radii of the centre.
 
-*(An earlier revision of this entry called the error noise-like on an autocorrelation of 0.018.
-That number was measured over a region that mostly EXCLUDED the artifact -- the ROI was in the
-wrong place. Looking at the image is what corrected it.)*
+**What is now ruled OUT, each by measurement:**
 
-| fiber radius | exit offset | null |
-|---|---|---|
-| 0.00002 | 5.0e-05 | 0.9940 |
-| 0.00009 | 2.3e-04 | 0.9833 |
-| 0.00040 | 1.0e-03 | 0.9833 |
+* *One crossing is exact.* A SINGLE straight fiber at `opacity 0`, measured on-fiber against
+  off-fiber columns of the SAME image (so no second render and no reference scene), reads
+  **1.0003** with a flat column profile. So the per-crossing coverage maths is right and the
+  error is in what ACCUMULATES over many crossings.
+* *The fiber exit offset.* The story was that a pass-through resumes `2.5r` along and steps
+  over the skin it grows from. Narrowing the offset so it hides only CURVE primitives (a
+  `curveTmin` on the ray, leaving fiber-skipping identical) moved the null by less than noise
+  and changed opaque hair by 0.02 % -- so nothing was being hidden in that gap. Reverted.
+* *Fur tier confusion.* The scene builds 3000 real strands / 36000 segments, not an aggregate.
 
-Radius-dependent, which fits -- but it SATURATES between the last two, which does not fit a pure
-offset story, so the mechanism is not fully identified. A second effect (at large radius nearly
-every ray meets a fiber) may be masking it.
+**What it DOES scale with.** Fiber count, with the bounce budget pinned high so the two cannot
+be confounded (`-max-bounce 256 -photon-bounce 256`):
 
-Severity scales with transparency and is ZERO at the default `opacity 1`, where no pass-through
-happens at all. Against the real coat it is small -- an `opacity 1` fur ball has a large halo of
-its own and the residual is a fraction of it -- but at `opacity 0`, 1.8 % of frame pixels are off
-by more than 10 %, so it is not invisible either.
+| strands | null |
+|---|---|
+| 500 | 0.9937 |
+| 3000 | 0.9833 |
+| 12000 | 0.9755 |
 
-Note this is a property of the exit convention and predates `opacity`: the same offset is
-applied after an ordinary scatter, where no null exists to expose it. The fix is to stop
-stepping past the fiber geometrically and instead exclude the primitive just left for one step,
-so the resume cannot skip whatever lies within `2.5r`.
+**A SECOND, separate effect: the bounce budget.** Splitting the two walks with `-photon-bounce`
+shows the CAMERA walk is the limiter, not the photon walk:
+
+| camera / photon bounces | null |
+|---|---|
+| 1 / 64 | 0.4996 |
+| 2 / 64 | 0.7255 |
+| 64 / 2 | 0.9833 |
+| 256 / 256 | 0.9833 |
+
+Every fiber a ray passes through appears to spend a path-length bounce, so invisible fur
+truncates camera paths. That is a real defect on its own -- a null interaction is not a
+scattering event, the same rule GRIN marching already follows -- but it is NOT this entry's
+1.7 %, which survives at any budget.
+
+**An attempted fix that did not land, recorded so it is not retried blindly.** Refunding the
+bounce (`--b`) on a detected pass-through in `photonGather` and `photonGatherSub` -- which
+`photonmap_render.h:1830` calls for every camera ray -- changed NOTHING, including at
+`-max-bounce 1`, where it should have been dramatic. So the camera walk that actually spends
+these bounces is somewhere else, or the pass-through is not being recognised there. Finding
+where a mode-R camera ray really spends its bounces is the prerequisite for that half.
+
+Note the offset is a property of the exit convention and predates `opacity`; the same step runs
+after every ordinary scatter, where no null exists to expose it.
 
 ### HAIR-PENETRATION — OPEN (2026-09-18, measured): **72.7 % of Alice's strand segments lie inside another strand**, and the curve-of-curves blend is what puts them there
 
