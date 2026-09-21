@@ -4736,6 +4736,48 @@ the photon map**. Measuring a lit diffuse wall instead of a panel is the entire 
 choices made at the camera's wavelength — the same class of error, not expressible as a smooth
 ratio, and still unmeasured.
 
+### HAIRTRANS-BACKEND — OPEN (2026-09-20, measured): the two backends disagree by a GROWING
+amount as hair is made more transparent, so it is not a constant offset
+
+`opacity` on a hair material (0.356.0) and its shadow half (0.357.0) both work on CPU and GPU,
+monotone and in the same direction. They do not agree on the magnitude, and the way they
+disagree is the informative part. Mean luminance in a fur ball's shadow on a white floor,
+80x80, 96 spp, mode R:
+
+| `opacity` | CPU | GPU | GPU/CPU |
+|---|---|---|---|
+| 1.0 (and no key at all) | 2.1581 | 2.1031 | 0.9745 |
+| 0.5 | 2.6855 | 2.4588 | 0.9156 |
+| 0.15 | 3.2813 | 2.9046 | **0.8852** |
+
+**The ratio drifts, 0.9745 -> 0.8852.** A constant backend offset would leave it flat, so this
+is not simply the ~2.5 % gap the scene already carries at `opacity 1` (which predates the
+feature: that row is byte-identical to a scene with no `opacity` key). The transparency path
+itself diverges, and it diverges further the more transparent the hair is. Equivalently, the
+shadow lightens 1.52x on the CPU against 1.38x on the GPU over the same range.
+
+**Not investigated.** Recorded because the drift is a real signal and the numbers are cheap to
+reproduce, not because it blocks anything -- the reporter of the feature does not plan to lean
+on transparent hair. Candidates, roughly in order of suspicion:
+
+1. **The device runs `Real` as float** (`FTRACE_GPU_FP32=1`). Transmittance is a PRODUCT along
+   the ray, so error compounds with the number of fibers crossed -- and the number crossed grows
+   as opacity falls, which is exactly the observed shape. The cheapest test: a paired run with
+   the device built in double, or accumulate `T` in double on the device (it already is; check
+   that `specLookup` and the intersection are not the float link).
+2. **Two halves, only one of which may be wrong.** Transparency enters twice -- as a coverage
+   lobe in `sample()` (scattering) and as `shadowTransmittance` (shadows). A scene lit only by
+   ambient/env with no NEE, or one where the fiber is seen directly against a backdrop, would
+   isolate which half drifts. The see-through correlation test in the 0.356.0 work already
+   showed cpu 0.698 vs gpu 0.748 at opacity 0.15 -- the GPU is MORE see-through there while
+   being LESS shadow-transmissive here, which suggests the two halves do not drift together.
+3. **The `T <= 1e-4` early-out threshold** is compared in `Real`; in float it fires at a
+   slightly different depth than on the host.
+
+Point 2 is the one to run first: it is a control that splits the effect in half for the cost of
+one render pair, and its existing numbers already hint the two halves disagree in opposite
+directions -- which no single precision story would explain.
+
 ### HAIR-PENETRATION — OPEN (2026-09-18, measured): **72.7 % of Alice's strand segments lie inside another strand**, and the curve-of-curves blend is what puts them there
 
 Asked for: strands that do not run through each other "no matter how we define our curves", by
