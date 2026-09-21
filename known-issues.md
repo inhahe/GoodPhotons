@@ -4831,9 +4831,32 @@ sun and 0.983 in a furnace for two versions, and why the single-fiber test (a qu
 env) came out clean at 1.0003. Three measurements collected for unrelated reasons, all
 consistent, none explicable until the counters named the mechanism.
 
-**STILL OPEN: a ~0.2 % residual**, now common to BOTH backends (0.9981 / 0.9978), independent of
-light type and bounce budget. The sun-lit scene has always carried it. Small enough that the
-next step would be a fresh null rather than more of this one.
+**STILL OPEN, and the '~0.2 %' framing UNDERSTATES it -- that number was measured on a 3000-
+strand test coat, which is not a realistic head of hair.** The residual grows with fiber density
+and, at counts a character would actually use, becomes a visible bright RIM at the coat
+silhouette. Measured at `opacity 0` (2048 spp, ratio of ROI means):
+
+| strands | null | pixels off >10 % | lag-1 autocorr |
+|---|---|---|---|
+| 500 | 0.9991 | -- | -- |
+| 3000 | 0.9981 | -- | -- |
+| 12000 | 0.9970 | 0.58 % | 0.299 |
+| 50000 | **1.0060** | **1.06 %** | **0.362** |
+
+For scale, the 1.7 % defect fixed in 0.360.0 had 1.84 % of pixels off by >10 % at autocorr 0.37,
+so at 50k strands this leftover is already more than half that severity and just as structured.
+Its radial profile at 50k is a halo, not noise: +1.85 / +2.07 / +1.61 / +0.89 / -0.01 % in bands
+out from the coat centre.
+
+**The sign FLIPS with density** -- a deficit up to 12k strands, a surplus at 50k -- which survives
+4x the samples (0.9955 -> 0.9970 and 1.0049 -> 1.0060), so it is two competing effects rather
+than one. The dense case is genuine strand geometry (600000 segments), not a silent switch to
+the aggregate tier.
+
+Scope: this is a `opacity < 1` defect. The device counters show 0 % of hair vertices take the
+pass-through branch at `opacity 1`, so ordinary OPAQUE hair -- the default -- has no pass-
+throughs for it to act on. It has not been demonstrated absent there, only that the mechanism
+this entry is about cannot fire.
 
 **Four hypotheses this cost, all killed by measurement, recorded so they are not retried:**
 
