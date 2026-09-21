@@ -1903,6 +1903,35 @@ uniform scale; a **non-uniform** scale prints a `[ftsl] warning:` and uses the
 volume-preserving geometric mean of the three axis scales, because a round fiber cannot
 become elliptical.
 
+**`opacity <value>` — true transparency (0.356.0).** Coverage: the fraction of a ray the fiber
+actually intercepts. Below 1, a ray passes STRAIGHT THROUGH with probability `1 - opacity`,
+unattenuated. Takes a scalar, spectrum or `pattern:<name>`; default 1 is the solid fiber every
+scene before this had, bit-for-bit.
+
+**Absorption cannot do this, and that is why the slot exists.** A fiber's BCSDF has no
+pass-through lobe -- every ray it intercepts is scattered into R/TT/TRT -- so a background is only
+ever seen through the blur of the TT lobe however low `hair_sigma_a` goes. Measured by correlating
+a through-fur render against a no-fur render of the same backdrop: solid hair r = +0.565, and
+low-absorption "glassy" hair only r = +0.655. Index-matching does not rescue it either; `eta 1.0`
+is degenerate and scores r = +0.239, the worst of the three. With `opacity`, r rises monotonically
+-- 0.565 -> 0.613 -> 0.698 at opacity 1.0 / 0.5 / 0.15 (CPU; the GPU agrees, 0.609 / 0.652 /
+0.748).
+
+It is a **coverage mixture**, so it is unbiased by construction rather than an approximation: with
+probability `1 - opacity` the ray continues straight at weight 1, otherwise the fiber scatters
+exactly as it always did. The scatter branch is untouched.
+
+**Cost.** Not used: one comparison per fiber scatter, short-circuited before any random draw. Used:
+measured at **within the noise floor** (+1.5 % and +0.6 % at opacity 0.5 and 0.15 against an
+opaque baseline, on a test whose repetitions scatter by more than that). In principle the cost
+grows with transparency, because a ray crosses more fibers before terminating; in practice it did
+not register here.
+
+**Limitation, not hidden: shadow rays still treat a fiber as fully opaque.** So transparent hair
+can be seen through but still casts a solid shadow. `Scene::occluded` is boolean at 48 call sites
+across six files and both backends, so making shadows agree means occlusion returning a
+transmittance -- a much larger change than this one.
+
 **`specular <value>` — a coloured cuticle (0.355.0).** Tints the fiber's R lobe, i.e. the light
 reflected off the outside of the cuticle, and *only* that lobe. Default 1 is the plain dielectric
 Fresnel every scene before this got. Takes a scalar, an `rgb`, a spectrum, or `pattern:<name>` to

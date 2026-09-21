@@ -236,6 +236,11 @@ struct Params {
     // This is what makes a SILVER or otherwise metallic fiber possible; no combination of
     // absorption and index can colour a dielectric specular.
     double specR = 1.0;
+    // Coverage: the fraction of a ray the fiber actually intercepts. 1 (default) is the solid
+    // fiber every scene before this had. Below 1, a ray passes STRAIGHT THROUGH with
+    // probability (1 - opacity) -- the pass-through the BCSDF otherwise has no lobe for, and
+    // the reason a background cannot be seen through hair however low its absorption is set.
+    double opacity = 1.0;
 
     // --- the MEDULLA (P3 stage 3; Yan et al. 2015/2017) ----------------------
     // Animal fur is not a solid rod. It has a hollow, structured core — the medulla —
@@ -273,6 +278,7 @@ struct Bcsdf {
     bool   hasMedulla = false;
     double kappa = 0.0, mSigmaS = 0.0, mSigmaA = 0.0, mG = 0.0;
     double specR = 1.0;        // cuticle reflectance tint, copied from Params by make()
+    double opacity = 1.0;      // coverage; below 1 a ray may pass straight through
 };
 
 // Everything a single interior traversal of the fiber does to a ray: where it comes out
@@ -297,6 +303,7 @@ inline Bcsdf make(const Params& pr, double h, double sigmaA) {
     b.gammaO = std::asin(b.h);
     b.eta    = pr.eta;
     b.specR  = (pr.specR < 0.0) ? 0.0 : (pr.specR > 1.0 ? 1.0 : pr.specR);
+    b.opacity = (pr.opacity < 0.0) ? 0.0 : (pr.opacity > 1.0 ? 1.0 : pr.opacity);
     b.sigmaA = std::max(0.0, sigmaA);
 
     // Chiang's roughness fits. The high powers (20, 22) are not curve-fitting noise:
@@ -656,6 +663,23 @@ inline double pdf(const Bcsdf& b, const Vec3& wo, const Vec3& wi) {
 // caller's weight is simply fOut * |cos theta_i| / pdfOut.
 inline Vec3 sample(const Bcsdf& b, const Vec3& wo, double u0, double u1, double u2,
                    double u3, double& pdfOut, double& fOut, LobeAngular* la = nullptr) {
+    // COVERAGE (opacity < 1): with probability (1 - opacity) the ray is not intercepted at all
+    // and continues straight through. The caller's throughput is f*cos/pdf, so reporting
+    // pdf = pThru and f = pThru/cos makes that exactly 1 -- an unattenuated pass-through.
+    // Short-circuited before any work (and before touching u0) when opacity is 1, so a solid
+    // fiber pays one comparison and is otherwise bit-for-bit unchanged.
+    if (b.opacity < 1.0) {
+        const double pThru = 1.0 - b.opacity;
+        if (u0 < pThru) {
+            const Vec3 wl{ -wo.x, -wo.y, -wo.z };
+            const double cosLong = safeSqrt(1.0 - sqr(clampd(wl.x, -1.0, 1.0)));
+            pdfOut = pThru;
+            fOut   = (cosLong > 1e-9) ? pThru / cosLong : 0.0;
+            if (la) la->valid = false;
+            return wl;
+        }
+        u0 = (u0 - pThru) / b.opacity;    // reuse the draw for the scatter branch
+    }
     const double sinThetaO = clampd(wo.x, -1.0, 1.0), cosThetaO = safeSqrt(1.0 - sqr(sinThetaO));
     const double phiO = std::atan2(wo.z, wo.y);
 

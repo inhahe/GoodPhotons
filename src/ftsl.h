@@ -4824,6 +4824,10 @@ private:
             // `specular` tints the cuticle reflection (the R lobe). Default 1 keeps the plain
             // dielectric Fresnel every existing scene already has. Accepts a spectrum/rgb like
             // any colour slot, or `pattern:<name>` to vary it over the fiber.
+            // `opacity` is COVERAGE, not absorption: below 1 a ray passes straight through, which
+            // is what lets a background be seen through hair. Default 1 is the solid fiber.
+            if (bindScalarPattern(b, "opacity", m.hairOpacityPat)) m.hairOpacity = constantSpectrum(1.0);
+            else if (find(b, "opacity")) m.hairOpacity = spectrumParam(b, "opacity", m.hairOpacity);
             if (bindScalarPattern(b, "specular", m.hairSpecPat)) m.hairSpecular = constantSpectrum(1.0);
             else if (find(b, "specular")) m.hairSpecular = spectrumParam(b, "specular", m.hairSpecular);
             m.hairAlpha = dblParam(b, "alpha",  havePreset ? sp.alphaDeg : 2.0);

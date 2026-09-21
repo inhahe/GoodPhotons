@@ -289,6 +289,11 @@ struct Material {
     // dielectric Fresnel, which is what every scene written before this got. Spectral, so a
     // fiber can have a COLOURED sheen -- silver, gold, or a dichroic tint -- which absorption
     // alone cannot express, and pattern-bindable like any other scalar slot.
+    // Coverage / `opacity` on a hair material: below 1, a ray passes straight through with
+    // probability (1 - opacity). This is what makes hair see-through; absorption alone cannot,
+    // because the BCSDF scatters every ray it intercepts.
+    Spectrum hairOpacity = constantSpectrum(1.0);
+    int      hairOpacityPat = -1;
     Spectrum hairSpecular = constantSpectrum(1.0);
     int      hairSpecPat  = -1;
     Spectrum hairSigmaA = constantSpectrum(0.0);

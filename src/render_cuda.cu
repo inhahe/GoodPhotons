@@ -576,6 +576,8 @@ struct DMaterial {
     // coloured sheen is the whole point; 1 everywhere reproduces the plain dielectric Fresnel.
     double hairSpecular[SPEC_N];
     int    hairSpecPat;
+    double hairOpacity[SPEC_N];
+    int    hairOpacityPat;
     double hairSigmaA[SPEC_N];
     double hairMedullaSigmaS[SPEC_N];
     double hairMedullaSigmaA[SPEC_N];
@@ -4448,6 +4450,7 @@ __device__ static void Ap(double cosThetaO, double eta, double h, double T,
 struct Params {
     double eta   = 1.55;
     double specR = 1.0;    // cuticle reflectance tint, host twin hair::Params::specR
+    double opacity = 1.0;  // coverage, host twin hair::Params::opacity
     double betaM = 0.3;
     double betaN = 0.3;
     double alpha = 2.0;
@@ -4462,6 +4465,7 @@ struct Bcsdf {
     double h = 0.0, gammaO = 0.0;
     double eta = 1.55, sigmaA = 0.0;
     double specR = 1.0;
+    double opacity = 1.0;
     double v[kPMax + 1] = {0, 0, 0, 0};   // longitudinal variances per lobe
     double s = 0.0;                       // azimuthal logistic scale
     double sin2kAlpha[3] = {0, 0, 0}, cos2kAlpha[3] = {1, 1, 1};
@@ -4486,6 +4490,7 @@ __device__ static Bcsdf make(const Params& pr, double h, double sigmaA) {
     b.gammaO = asin(b.h);
     b.eta    = pr.eta;
     b.specR  = (pr.specR < 0.0) ? 0.0 : (pr.specR > 1.0 ? 1.0 : pr.specR);
+    b.opacity = (pr.opacity < 0.0) ? 0.0 : (pr.opacity > 1.0 ? 1.0 : pr.opacity);
     b.sigmaA = fmax(0.0, sigmaA);
     // Chiang's perceptual-roughness fits (hair.h::make).
     const double bm = clampd(pr.betaM, 1e-4, 1.0);
@@ -4741,6 +4746,20 @@ __device__ __noinline__ static double pdf(const Bcsdf& b, const V3& wo, const V3
 // caller's weight is fOut * |cos theta_i| / pdfOut (see hair.h::sample).
 __device__ __noinline__ static V3 sample(const Bcsdf& b, const V3& wo, double u0, double u1, double u2,
                             double u3, double& pdfOut, double& fOut, LobeAngular* la = nullptr) {   // __noinline__: see f above
+    // COVERAGE, host twin hair.h sample(): with probability (1 - opacity) the ray is not
+    // intercepted and continues straight through, weight 1. Short-circuited at opacity 1.
+    if (b.opacity < 1.0) {
+        const double pThru = 1.0 - b.opacity;
+        if (u0 < pThru) {
+            const V3 wl{ -wo.x, -wo.y, -wo.z };
+            const double cl = safeSqrt(1.0 - sqr(clampd(wl.x, -1.0, 1.0)));
+            pdfOut = pThru;
+            fOut   = (cl > 1e-9) ? pThru / cl : 0.0;
+            if (la) la->valid = false;
+            return wl;
+        }
+        u0 = (u0 - pThru) / b.opacity;
+    }
     const double sinThetaO = clampd(wo.x, -1.0, 1.0), cosThetaO = safeSqrt(1.0 - sqr(sinThetaO));
     const double phiO = atan2(wo.z, wo.y);
 
@@ -4889,6 +4908,9 @@ __device__ __noinline__ static DHairShade dHairShadeAt(const DScene& sc, const D
         double sp = (double)specLookup(m.hairSpecular, lambda);
         if (m.hairSpecPat >= 0) sp *= (double)clamp01(dPatternScalarAt(sc, m.hairSpecPat, h));
         pr.specR = sp < 0.0 ? 0.0 : (sp > 1.0 ? 1.0 : sp);
+        double op = (double)specLookup(m.hairOpacity, lambda);
+        if (m.hairOpacityPat >= 0) op *= (double)clamp01(dPatternScalarAt(sc, m.hairOpacityPat, h));
+        pr.opacity = op < 0.0 ? 0.0 : (op > 1.0 ? 1.0 : op);
     }
     pr.betaM = m.hairBetaM;
     pr.betaN = m.hairBetaN;
@@ -17640,6 +17662,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.hairEta      = m.hairEta;
         bakeSpec(m.hairSpecular, d.hairSpecular);
         d.hairSpecPat  = m.hairSpecPat;
+        bakeSpec(m.hairOpacity, d.hairOpacity);
+        d.hairOpacityPat = m.hairOpacityPat;
         d.hairBetaM    = m.hairBetaM;
         d.hairBetaN    = m.hairBetaN;
         d.hairAlpha    = m.hairAlpha;
