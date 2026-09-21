@@ -4793,6 +4793,34 @@ hair, the default, is bit-identical.
    light than the no-fur reference, which is impossible for pass-through. The final residual
    (gpu/cpu 0.9865 in a sun-lit shadow ROI) was also fireflies -- a `light env` furnace showed
    the true 1.0003. Every hair measurement here wants a furnace.
+### HAIRTRANS-NULL — OPEN (2026-09-21, measured): fur at `opacity 0`, which must be invisible,
+still changes the image by ~1.7 % -- the fiber exit offset, not the coverage logic
+
+After 0.358.0 and 0.359.0 closed three coverage bugs, the `opacity 0` null in a furnace reads
+0.9833 (no dual), 0.9837 (`-dual-scatter`), 0.9827 (`+ -dual-grid`) where it must read 1.000.
+Run-to-run noise on this path is ~0.01 %, so the residual is real.
+
+**It is not an energy-conservation bug in `opacity`.** The deficit is concentrated at the
+fur/sphere silhouette -- individual pixels there run 20-44 % BRIGHT, while the coat's top is 4 %
+dark -- which is the signature of rays changing which geometry they hit, not of light being
+created or destroyed. The suspect is `hairExitOffset`: a pass-through resumes `2.5r` beyond the
+fiber, which near the roots can step over the skin surface the fiber is growing out of.
+
+| fiber radius | exit offset | null |
+|---|---|---|
+| 0.00002 | 5.0e-05 | 0.9940 |
+| 0.00009 | 2.3e-04 | 0.9833 |
+| 0.00040 | 1.0e-03 | 0.9833 |
+
+Radius-dependent, which fits -- but it SATURATES between the last two, which does not fit a pure
+offset story, so the mechanism is not fully identified. A second effect (at large radius nearly
+every ray meets a fiber) may be masking it.
+
+Note this is a property of the exit convention and predates `opacity`: the same offset is
+applied after an ordinary scatter, where no null exists to expose it. Fixing it means making the
+resume robust without re-hitting the fiber it just left -- e.g. excluding that primitive for one
+step instead of stepping past it geometrically.
+
 ### HAIR-PENETRATION — OPEN (2026-09-18, measured): **72.7 % of Alice's strand segments lie inside another strand**, and the curve-of-curves blend is what puts them there
 
 Asked for: strands that do not run through each other "no matter how we define our curves", by

@@ -1594,7 +1594,8 @@ struct BackwardRenderer {
     bool envGeom(const Scene& scene, const Hit& h, Pcg32& rng, Vec3& wi,
                  double& cosSurf, double& stG, double& pdfW, double& wMis,
                  double& farDist, const HairShade* hs = nullptr,
-                 const HairDualCtx* dctx = nullptr, const NeeBsdf* nb = nullptr) const {
+                 const HairDualCtx* dctx = nullptr, const NeeBsdf* nb = nullptr,
+                 double lambda = 550.0) const {
         wi = scene.sampleEnvDir(rng, pdfW);
         if (pdfW <= 0.0) return false;
         if (hs && dctx) {
@@ -1623,8 +1624,15 @@ struct BackwardRenderer {
                 cosSurf *= furVol->transmittance(h.p, wi, farDist);
             if (!(cosSurf > 0.0)) return false;
             const double off = hairExitOffset(*hs, h.n, wi);
-            if (hs->aggregate ? scene.occludedSkipHair(h.p + wi * off, wi, farDist)
-                              : scene.occluded(h.p + wi * off, wi, farDist)) return false;
+            if (hs->aggregate) {
+                if (scene.occludedSkipHair(h.p + wi * off, wi, farDist)) return false;
+            } else {
+                // Partial, not yes/no: hair below opacity 1 attenuates the sky rather than
+                // hiding it. Folded into cosSurf, which both callers already multiply by.
+                const double vis = scene.shadowTransmittance(h.p + wi * off, wi, farDist, lambda);
+                if (!(vis > 0.0)) return false;
+                cosSurf *= vis;
+            }
             const double pdfBsdf = hair::pdf(hs->b, hs->woLocal, hair::toLocal(hs->fr, wi));
             wMis = pdfW / (pdfW + pdfBsdf);
             return true;
@@ -1635,7 +1643,12 @@ struct BackwardRenderer {
         stG = shadowTerminatorG(wi, h.n, ngo);                  // Chiang soft terminator (1 if flat)
         if (stG <= 0.0) return false;                           // behind true geometry: hard shadow
         farDist = length(scene.sceneCenter - h.p) + scene.sceneRadius;
-        if (scene.occluded(h.p + ngo * 1e-6, wi, farDist)) return false;
+        {   // see the fiber branch above: a transparent coat between a surface and the sky
+            // attenuates it instead of blocking it
+            const double vis = scene.shadowTransmittance(h.p + ngo * 1e-6, wi, farDist, lambda);
+            if (!(vis > 0.0)) return false;
+            cosSurf *= vis;
+        }
         // The density the CONTINUATION would have sampled `wi` with: the lobe's at a glossy
         // vertex, the cosine hemisphere's otherwise. This is the quantity the env-escape site
         // carries forward in `gmis.pdf`, so the two halves see one number.
@@ -1661,7 +1674,7 @@ struct BackwardRenderer {
             if (dc.grid) dc.u3 = rng.uniform();
         }
         if (!envGeom(scene, h, rng, wi, cosSurf, stG, pdfW, wMis, farDist, hs,
-                     dctx ? &dc : nullptr, nb)) return 0.0;
+                     dctx ? &dc : nullptr, nb, lambda)) return 0.0;
         double Lenv = scene.envRadiance(wi, lambda);
         if (Lenv <= 0.0) return 0.0;
         // `rho/PI` IS bsdfF at a diffuse vertex; the branch keeps the default path's float
@@ -1706,14 +1719,15 @@ struct BackwardRenderer {
         Vec3 wi = scene.sampleEnvDir(rng, pdfW);
         if (pdfW <= 0.0) return 0.0;
         double farDist = length(scene.sceneCenter - p) + scene.sceneRadius;
-        if (scene.occluded(p + wi * 1e-6, wi, farDist)) return 0.0;
+        const double vis = scene.shadowTransmittance(p + wi * 1e-6, wi, farDist, lambda);
+        if (!(vis > 0.0)) return 0.0;
         double Lenv = scene.envRadiance(wi, lambda);
         if (Lenv <= 0.0) return 0.0;
         double phase  = med.phaseValue(dot(wIn, wi), lambda);   // == BSDF pdf here
         double albedo = med.albedo(lambda);
         double wMis   = pdfW / (pdfW + phase);          // balance heuristic
         double T = mediaTr(scene, p + wi * 1e-6, wi, farDist, lambda, rng);
-        return albedo * phase * Lenv * invPdfLambda / pdfW * wMis * T;
+        return albedo * phase * Lenv * invPdfLambda / pdfW * wMis * T * vis;
     }
 
     // Handle ONE surface material interaction on a single wavelength — the whole
@@ -2098,11 +2112,23 @@ struct BackwardRenderer {
                 if (scene.envIndex >= 0)
                     L += thr * neeEnv(scene, h, 1.0, invPdfLambda, lambda, rng, &hs,
                                       dualScatter ? &dc : nullptr);
-                if (directOnly || dualScatter) return false;
+                if (directOnly) return false;
+                // Dual scattering ends the path because this vertex already carries the coat's
+                // whole multiple-scattering response -- but only for light the fiber actually
+                // INTERCEPTED. Below opacity 1 part of the ray was never intercepted and must
+                // continue, or transparent fur absorbs everything behind it. The opaque
+                // short-circuit keeps today's RNG stream byte-for-byte.
+                if (dualScatter && hs.b.opacity >= 1.0) return false;
                 double pdfH = 0.0, fv = 0.0;
                 const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
                                              rng.uniform(), rng.uniform(), pdfH, fv);
                 if (!(pdfH > 0.0) || !(fv > 0.0)) return false;
+                // A coverage pass-through returns EXACTLY -wo (negation is exact in IEEE).
+                // Anything else was intercepted, and under dual scattering the analytic terms
+                // have already accounted for it -- continuing would count that light twice.
+                if (dualScatter && !(wl.x == -hs.woLocal.x && wl.y == -hs.woLocal.y &&
+                                     wl.z == -hs.woLocal.z))
+                    return false;
                 // Exactly T = sum_p A_p, the total lobe attenuation (see the forward tracer's
                 // Hair case for why the ratio collapses): a deterministic weight, so it is
                 // both the analog-RR survival probability and the Whitted attenuation.

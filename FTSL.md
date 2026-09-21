@@ -1947,10 +1947,31 @@ The transmittances MULTIPLY along the ray rather than being sampled stochastical
 accept/reject per fiber would be equally unbiased but would put noise into every hair shadow,
 which is where noise shows most.
 
-*Residual worth knowing:* the two backends agree on the direction and rough size but not exactly --
-the shadow lightens 1.52x on the CPU against 1.38x on the GPU between opacity 1.0 and 0.15. This
-scene already carries a 2.5 % baseline backend gap, and the GPU runs `Real` as float; the
-difference has not been chased further.
+**Coverage reaches the whole light transport (0.359.0).** 0.356.0 added the pass-through to
+SAMPLING only, so for two versions everything that EVALUATED the fiber still treated it as
+solid. Three paths had to learn about it, each found by the same null -- at `opacity 0` fur must
+be invisible, so it must reproduce a render with no fur at all:
+
+* `f()` and `pdf()` (0.358.0), which NEE and MIS go through. A see-through fiber was scattering
+  a full light connection out of nothing: +19 % on the coat and +25 % in its shadow.
+* Environment NEE, which still hard-blocked on the first fiber -- `emitterGeom` had been taught
+  transmittance in 0.357.0 but `envGeom` had not, so a sun-lit scene was right and a sky-lit one
+  was not.
+* `-dual-scatter`, which ended the path at any fiber vertex before the pass-through could
+  happen, so transparent fur absorbed everything behind it (the null read 0.59). It now ends the
+  path only when the fiber actually intercepted, and its coat model treats a crossing as an
+  interception with probability `opacity` -- exact Poisson thinning under `-dual-grid`.
+
+The null now reads 0.98 against 1.0; the remainder is not the coverage logic but the fiber EXIT
+OFFSET, which steps the continuation `2.5r` forward and can clear nearby geometry near the
+roots. It shrinks with radius (0.994 at r = 2e-5) and is a property of the exit convention that
+predates `opacity`. See HAIRTRANS-NULL in `known-issues.md`.
+
+*A correction to what this section used to say:* it reported the two backends disagreeing on
+shadow lightening, 1.52x on CPU against 1.38x on GPU, and blamed the GPU running `Real` as
+float. That was wrong. BOTH backends were wrong, the CPU by more, and comparing them to each
+other could never have revealed it -- only comparing each against a case with a known answer
+did. They now agree to 0.03 % in a furnace.
 
 **`specular <value>` — a coloured cuticle (0.355.0).** Tints the fiber's R lobe, i.e. the light
 reflected off the outside of the cuticle, and *only* that lobe. Default 1 is the plain dielectric

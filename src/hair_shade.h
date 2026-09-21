@@ -220,6 +220,7 @@ inline const hair::Dual* hairDualFor(const Scene& scene, const Material& m, int 
 struct HairShadow {
     double Tf   = 1.0;      // product of a_f(theta_d) over the fibers crossed
     double varF = 0.0;      // sum of beta_f(theta_d)^2 over the same
+    double P0   = 1.0;      // P(no crossed fiber intercepted) = prod(1 - opacity)
     int    n    = 0;        // fibers crossed; 0 means directly lit
     bool   blocked = false; // an opaque (non-fiber) surface stopped the ray
 };
@@ -228,12 +229,16 @@ struct HairShadow {
 // is already the away-pointing direction at the crossed fiber and its longitudinal
 // component in that fiber's frame is sin(theta_d) directly.
 inline void hairShadowCross(HairShadow& sh, const hair::Dual& d, const Hit& fiberHit,
-                            const Vec3& wLight) {
+                            const Vec3& wLight, double opacity = 1.0) {
     const hair::Frame fr = hair::frameFromHit(fiberHit.n, fiberHit.tangent);
     const double sinT = hair::clampd(hair::toLocal(fr, wLight).x, -1.0, 1.0);
     const double th   = std::asin(sinT);
-    sh.Tf   *= hair::dualLookup(d.af, th);
-    sh.varF += hair::sqr(hair::dualLookup(d.betaF, th));
+    // COVERAGE: a crossed fiber intercepts with probability `opacity` and is otherwise not
+    // there, so the expected per-crossing transfer is a mixture and only the intercepting
+    // fraction contributes spread. At opacity 1 this is `a_f` and `beta_f^2` exactly.
+    sh.Tf   *= (1.0 - opacity) + opacity * hair::dualLookup(d.af, th);
+    sh.P0   *= (1.0 - opacity);
+    sh.varF += opacity * hair::sqr(hair::dualLookup(d.betaF, th));
     ++sh.n;
 }
 
@@ -250,7 +255,8 @@ inline void hairShadowCross(HairShadow& sh, const hair::Dual& d, const Hit& fibe
 //              which is unbiased and needs no second table.
 //   `db`,`df`  the backward / forward density factors (both 0.7 in the paper).
 inline double hairDualFCos(const HairShade& s, const hair::Dual& d, const HairShadow& sh,
-                           const Vec3& wLight, const Vec3& wSpread, double db, double df) {
+                           const Vec3& wLight, const Vec3& wSpread, double db, double df,
+                           bool direct = false) {
     if (sh.blocked) return 0.0;
     // The direction the light ACTUALLY arrives from: the light itself when the point is
     // directly lit, one draw from the forward spread S_f when it is not. EVERYTHING below
@@ -296,8 +302,16 @@ inline double hairDualFCos(const HairShade& s, const hair::Dual& d, const HairSh
     // than something already integrated away, and f_back can be — and has to be — treated
     // as the BCSDF it is.
     const bool back = (s.woLocal.y * wIn.y + s.woLocal.z * wIn.z) > 0.0;
-    const double fs = hair::f(s.b, s.woLocal, wIn) + (back ? db * fb : 0.0);
-    return (sh.n == 0 ? 1.0 : sh.Tf * df) * fs * cosLong;
+    // `hair::f` carries the coverage factor itself; the backscatter term is added raw, so it
+    // needs the same gate -- it is light leaving THIS fiber, which a pass-through never hit.
+    const double fs = hair::f(s.b, s.woLocal, wIn) + (back ? db * fb * s.b.opacity : 0.0);
+    // `direct` is the branch where no crossed fiber intercepted: the light arrives along
+    // wLight itself and the coat contributes no density factor. Its complement carries the
+    // transfer CONDITIONED on at least one interception, (Tf - P0) / (1 - P0), which at
+    // opacity 1 (P0 == 0) is just Tf and reproduces the old `sh.Tf * df` exactly.
+    const double coat = direct ? 1.0
+                               : (sh.P0 < 1.0 ? df * (sh.Tf - sh.P0) / (1.0 - sh.P0) : 0.0);
+    return coat * fs * cosLong;
 }
 
 // One draw from the forward-scattering spread S_f (Zinke eq. 7) about the light
@@ -387,7 +401,10 @@ inline bool hairShadowGrid(HairShadow& sh, const HairDualCtx& ctx, const Scene& 
     if (!(fm.tau > 0.0) || fm.matId < 0 || fm.matId >= (int)sc.mats.size()) return true;
     // `maxCross` keeps its meaning: past this many crossings there is nothing left to carry,
     // and capping the mean also bounds the inversion loop below.
-    const double tau = std::min(fm.tau, (double)ctx.maxCross);
+    // COVERAGE is exact Poisson thinning here: a crossing that does not intercept is simply
+    // not an event, so the rate scales and `n` below counts interceptions directly.
+    const double tau = std::min(fm.tau, (double)ctx.maxCross) *
+                       hairOpacityAt(sc, sc.mats[fm.matId], shadingHit, ctx.lambda);
     // N ~ Poisson(tau) by CDF inversion. `p` is the pmf, stepped by the `tau/n` recurrence;
     // `u < cdf` terminates in `tau + O(sqrt(tau))` iterations on average. The `n` cap is the
     // same safety net as the walk's, and doubles as the guard against a `u` that rounds to 1.
@@ -399,6 +416,7 @@ inline bool hairShadowGrid(HairShadow& sh, const HairDualCtx& ctx, const Scene& 
     }
     sh.n = n;
     if (!n) return true;                                  // directly lit: T_f = 1, no spread
+    sh.P0 = 0.0;                                          // thinned already: these DID intercept
     const hair::Dual* d = hairDualFor(sc, sc.mats[fm.matId], fm.matId, shadingHit, ctx.lambda);
     if (!d) { sh.n = 0; return true; }
     const double th = std::asin(hair::clampd(std::sqrt(fm.sin2), -1.0, 1.0));
@@ -428,11 +446,15 @@ inline double hairDualResponse(const HairDualCtx& ctx, const HairShade& s, const
     } else {
         reached = sc.walkFibers(o, wi, len, [&](const Hit& fh) {
             const hair::Dual* d = hairDualFor(sc, sc.mats[fh.matId], fh.matId, fh, ctx.lambda);
-            hairShadowCross(sh, *d, fh, wi);
+            hairShadowCross(sh, *d, fh, wi,
+                            hairOpacityAt(sc, sc.mats[fh.matId], fh, ctx.lambda));
         }, ctx.maxCross);
     }
     if (!reached) return 0.0;
     blockedOut = false;
-    const Vec3 ws = (sh.n > 0) ? hairSpreadDir(s, sh, wi, ctx.u0, ctx.u1, ctx.u2) : wi;
-    return hairDualFCos(s, *ctx.dual, sh, wi, ws, ctx.db, ctx.df);
+    // Coverage split. `u3` is free on the walk (only the grid's Poisson draw uses it), and on
+    // the grid P0 is 0 or 1 exactly, so reusing it correlates nothing.
+    const bool direct = (sh.n == 0) || (ctx.u3 < sh.P0);
+    const Vec3 ws = direct ? wi : hairSpreadDir(s, sh, wi, ctx.u0, ctx.u1, ctx.u2);
+    return hairDualFCos(s, *ctx.dual, sh, wi, ws, ctx.db, ctx.df, direct);
 }
