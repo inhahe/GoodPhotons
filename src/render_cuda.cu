@@ -11368,7 +11368,11 @@ __device__ __noinline__ static bool bkInteractHair(const DScene& sc, const DMate
     // curve-only tmin, so the skin under the coat is still hit. See closestHit.
     const Real exitOff = dHairExitOffset(hsv, h.n, wOut);
     if (curveTminOut) *curveTminOut = exitOff;
-    ro = h.p + wOut * (curveTminOut ? (Real)RAY_EPS : exitOff);
+    // RAY_EPS is 1e-4f in the FP32 build -- 100x the host's 1e-6 -- so stepping by it at every
+    // crossing leaves a dense coat with millimetres of unsampled ray and lets the skin be
+    // tunnelled through. The ULP-scaled offset is float-safe at any scene scale, and the
+    // strand's own body is already excluded by curveTmin rather than by distance.
+    ro = curveTminOut ? dOffsetPoint(h.p, wOut) : (h.p + wOut * exitOff);
     rd = wOut;
     if (!passThru) specularArrival = false;   // NEE covered direct light here
     return true;
@@ -11720,7 +11724,9 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         // `b == 0 && gi.depth == 0` is precisely the camera segment (the same test the O8
         // footprint stamp below uses), so it is also precisely where a `hide_camera` surface
         // must be transparent — and nowhere else on the path. See DMaterial::hideCamera.
-        DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG,
+        // Leaving a fiber, the origin is already ULP-offset and the strand is excluded by
+        // curveTmin, so RAY_EPS would only re-open the 1e-4 hole it was there to avoid.
+        DHit h = closestHit(sc, ro, rd, curveTmin > (Real)0 ? (Real)0 : RAY_EPS, BIG,
                             /*camHide=*/(b == 0 && gi.depth == 0), curveTmin);
         // O8 stage 2: stamp the shading footprint on the CAMERA SEGMENT only (host twin:
         // backward.h radiance()). A secondary bounce would need ray differentials /
@@ -11928,7 +11934,9 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         gi.bounce = b;                                 // see the scalar twin: mode W's per-vertex lattice
         // Camera segment only — same test as the footprint stamp below, and for the same
         // reason a heroSplit re-entry (bounce0 > 0) is not one. See DMaterial::hideCamera.
-        DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG,
+        // Leaving a fiber, the origin is already ULP-offset and the strand is excluded by
+        // curveTmin, so RAY_EPS would only re-open the 1e-4 hole it was there to avoid.
+        DHit h = closestHit(sc, ro, rd, curveTmin > (Real)0 ? (Real)0 : RAY_EPS, BIG,
                             /*camHide=*/(b == 0 && gi.depth == 0), curveTmin);
         // O8 stage 2 footprint, camera segment only — see the scalar twin. The test is
         // `b == 0`, NOT `b == bounce0`: a heroSplit re-entry resumes at a DEEPER bounce,

@@ -2157,7 +2157,7 @@ struct BackwardRenderer {
                 // Measured as a +0.5% overshoot when this assigned instead of preserving.
                 if (!passThru) contBsdfPdf = pdfH;     // real pdf -> env-miss MIS is exact
                 // Step clear of the strand's own body: TT/TRT exit the far side.
-                ray = Ray{h.p + wOut * 1e-6, wOut, hairExitOffset(hs, h.n, wOut)};
+                ray = Ray{h.p + wOut * 1e-9, wOut, hairExitOffset(hs, h.n, wOut)};
                 if (!passThru) specularArrival = false;   // pass-through: inherit, do not set
                 return true;
             }

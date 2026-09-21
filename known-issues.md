@@ -4793,65 +4793,65 @@ hair, the default, is bit-identical.
    light than the no-fur reference, which is impossible for pass-through. The final residual
    (gpu/cpu 0.9865 in a sun-lit shadow ROI) was also fireflies -- a `light env` furnace showed
    the true 1.0003. Every hair measurement here wants a furnace.
-### HAIRTRANS-NULL — FIXED on CPU (0.360.2), largely fixed on GPU. Four causes, all found by
-instrumenting and counting after inference had failed repeatedly
+### HAIRTRANS-NULL — DONE (0.360.0 / .1 / .2 / .3), on both backends. Five causes, every one
+found by instrumenting and counting after inference had failed repeatedly
 
 Fur at `opacity 0` must be INVISIBLE, so it must reproduce a render with no fur at all.
 
 | `opacity 0` null | start | now |
 |---|---|---|
-| CPU, 3000 strands | 0.9833 | **0.9991** |
-| CPU, 50000 strands, r = 9e-5 | 1.0060 | **1.0009** |
-| CPU, 50000 strands, r = 2e-4 | **1.0663** | **1.0006** |
+| CPU, 3000 strands | 0.9833 | **0.9990** |
+| CPU, 50000 strands, r = 2e-4 | 1.0663 | **1.0010** |
 | CPU, `-max-bounce 2` | 0.7255 | 0.9984 |
-| GPU, 50000 strands, r = 2e-4 | 1.0663 | **1.0084** |
-| backend agreement @ `opacity 0.15` | 0.9804 | 0.9991 |
+| GPU, 3000 strands | 0.9759 | **0.9988** |
+| GPU, 50000 strands, r = 2e-4 | 1.0663 | **1.0010** |
+| backend agreement @ `opacity 0.15` | 0.9804 | 1.0009 |
 
-**1. The MIS state was overwritten at a pass-through (0.360.0).** The continuation is a delta
-(exactly `-wo`); NEE cannot sample it and its `f` is 0. Reporting a finite `contBsdfPdf` made
-the environment seen straight through a transparent fiber balance-heuristic weighted against a
-strategy that pays nothing back. A null interaction must be TRANSPARENT to MIS -- inherit the
-last real vertex's state, never assign; assigning the nominally correct delta values overshoots
-by +0.5 %.
+1. **MIS state overwritten at a pass-through (0.360.0).** The continuation is a delta; NEE
+   cannot sample it and its `f` is 0, so a finite `contBsdfPdf` weighted the sky seen straight
+   through a fiber against a strategy that pays nothing back. A null interaction must INHERIT
+   the last real vertex's MIS state, never assign -- assigning the nominally correct delta
+   values overshoots by +0.5 %.
+2. **The bounce was spent (0.360.0).** A ray that was not intercepted did not scatter.
+3. **Env NEE hard-blocked on the device (0.360.1).** 0.359.0 was written host-only.
+4. **The exit step hid non-fiber geometry (0.360.2).** `2.5r` of origin displacement also skips
+   the skin the coat grows from; through a dense coat the skips compound and rays tunnel out.
+   `Ray::curveTmin` now applies that distance to CURVE primitives only.
+5. **`RAY_EPS` is 100x larger on the device (0.360.3).** It is `1e-4f` in the FP32 build against
+   the host's `1e-6`, so every fiber exit skipped a 1e-4 window of ray -- about 5e-3 of
+   unsampled path through a dense coat, against a 0.018 sphere. The device now leaves a fiber by
+   the ULP-scaled `dOffsetPoint` and drops `tmin` to 0 for that hop, which is safe precisely
+   because the strand is excluded by `curveTmin` rather than by distance. The host does the
+   same. This is why the GPU residual did NOT scale with fiber radius while the host's did:
+   `RAY_EPS` is radius-independent.
 
-**2. The bounce was spent (0.360.0).** A ray that was not intercepted did not scatter, yet each
-pass-through charged a path-length bounce, so invisible fur truncated paths (0.73 at
-`-max-bounce 2`).
+Opaque hair is undisturbed on the host (+0.021 %, inside run-to-run noise); a no-hair mirror
+scene shows no self-intersection acne (gpu/cpu 1.0005, no black pixels); -checkhair, -checkfur,
+-checkfurgrid, -checklayered, -checkbvh (2M rays) and -checkcurve all pass.
 
-**3. Env NEE hard-blocked on the device (0.360.1).** 0.359.0 taught the HOST that hair below
-opacity 1 attenuates a sky shadow ray and never wrote the device half.
+**OPEN, and introduced by this work: backend agreement on OPAQUE hair is 1.0066, from 1.0019 at
+0.360.1.** The exit-offset change touches the TT/TRT exit at every opacity, so it moved the
+default configuration too. The trade was taken deliberately -- the null is ground truth and both
+backends moved much closer to it, while `opacity 1` has no reference to check against -- but it
+is a real regression in the most-used configuration and should be closed.
 
-**4. The fiber exit step hid non-fiber geometry (0.360.2).** A ray leaving a fiber on its far
-side resumed `2.5r` along, to clear the strand's own body -- which also skips any NON-fiber
-surface in the gap, notably the skin the coat grows from. Through a dense coat those skips
-compound and rays tunnel out, so the coat reads too bright. `Ray` now carries a `curveTmin`:
-curve primitives nearer than that are ignored, everything else is not, and the origin advances
-by a plain epsilon. Fiber behaviour is unchanged -- same strand, same neighbours, still skipped.
+Three attempts on it already failed, recorded so they are not repeated: matching the host's
+epsilon to the device's (no effect, 1.0065 -> 1.0066); giving the device the host's near-side
+`1e-6` curve exclusion instead of its `RAY_EPS` floor (WORSE, 1.0066 -> 1.0091, reverted). The
+asymmetry is real -- host near-side `1e-6` vs device `RAY_EPS` -- but removing it does not help,
+so the mechanism is something else. The approach that actually worked twice today is to
+instrument what differs at an opaque fiber exit rather than to reason about which constant looks
+suspicious.
 
-Cause 4 is why the residual SCALED WITH RADIUS (+0.05 % / +0.61 % / +6.63 % at r = 2e-5 / 9e-5 /
-2e-4 on 50000 strands) and flipped sign with density: a bigger step means both a longer skip and
-more crossings to compound it. Opaque hair is undisturbed (+0.021 %, inside run-to-run noise),
-and -checkhair / -checkfur / -checkfurgrid / -checklayered / -checkbvh / -checkcurve all pass.
+**Hypotheses killed by measurement:** per-crossing coverage maths (a single fiber nulls at
+1.0003); a bounce refund in `photonGather` (mode R is the BACKWARD reference and never calls
+it); `FTRACE_GPU_FP32` breaking the exact-equality pass-through test (the device probe fires).
 
-**A fix I reverted and had to bring back.** Cause 4's remedy was written, measured and DISCARDED
-earlier in the same investigation: tested at 3000 strands while cause 1 was still live, it moved
-the null by less than noise, so it looked inert. It was not -- its effect was simply swamped by a
-defect an order of magnitude larger. A null result means nothing until you have checked the
-effect you are looking for is not buried under a bigger one.
-
-**STILL OPEN: the GPU sits ~0.6-0.8 % above the CPU** on the 50000-strand null (1.0057 at
-r = 9e-5, 1.0084 at r = 2e-4, against 1.0009 / 1.0006). The device port covers the same surface
-as the host -- `closestHit`, `occluded`, `shadowTransmittance` and the hair shadow/NEE sites all
-honour `curveTmin` -- and the radius scaling is essentially gone (0.57 % vs 0.84 % across a 2.2x
-step, against 0.61 % vs 6.63 % before), so what remains is a DIFFERENT and smaller mechanism,
-not the exit step. Interestingly the completed shadow-path port changed the GPU numbers by
-nothing at all to four decimals, so the residual is not in those paths either. Candidates not
-yet excluded: the other 16 device `closestHit` call sites, which do not carry `curveTmin`.
-
-**Hypotheses killed by measurement, recorded so they are not retried:** per-crossing coverage
-maths (a single fiber nulls at 1.0003); a bounce refund in `photonGather` (mode R is the
-BACKWARD reference and never calls it); `FTRACE_GPU_FP32` breaking the exact-equality
-pass-through test (the device probe for that branch fires).
+**A fix reverted and brought back.** Cause 4's remedy was written, measured and DISCARDED
+earlier in this investigation: tested at 3000 strands while cause 1 was still live, it moved the
+null by less than noise and looked inert. Its effect was simply an order of magnitude smaller
+than the defect on top of it. A null result means nothing until you have checked the effect you
+are looking for is not buried under a bigger one.
 
 **The process lesson, which cost more than any of the above.** For several rounds the probes
 reported hard zeros for paths executing thousands of times: the patch scripts had failed on bad

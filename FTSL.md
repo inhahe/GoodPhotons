@@ -1990,8 +1990,14 @@ the ~0.2 % that remains on both backends.
 `2.5r` along to clear the strand's own body, which also skips any NON-fiber surface in the gap --
 the skin the coat grows from. Through a dense coat the skips compound and rays tunnel out. The
 distance is now a CURVE-ONLY tmin (`Ray::curveTmin`): same fibers skipped, nothing else hidden.
-At 50000 strands the `opacity 0` null goes **1.0663 -> 1.0006** at r = 2e-4 and 1.0060 -> 1.0009
-at the default radius; opaque hair moves +0.021 %, inside run-to-run noise.
+At 50000 strands the `opacity 0` null goes **1.0663 -> 1.0010** at r = 2e-4; opaque hair moves
++0.021 %, inside run-to-run noise.
+
+**The device needed one more (0.360.3).** `RAY_EPS` is `1e-4f` in the FP32 GPU build against the
+host's `1e-6`, so leaving a fiber by that step skipped a hundred times more ray -- about 5e-3 of
+unsampled path through a dense coat, enough to tunnel through the skin under the fur. The device
+now leaves by the ULP-scaled offset and drops `tmin` for that hop, safe because the strand is
+excluded by `curveTmin` rather than by distance. GPU null 1.0663 -> **1.0010**, matching the CPU.
 
 *An honest note on 0.359.0:* that version named the exit offset as the mechanism, was corrected
 in 0.360.0 for naming it as the ONLY one, and it turns out to have been a real cause after all --

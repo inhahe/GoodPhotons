@@ -2843,6 +2843,11 @@ struct Scene {
     Hit closestHit(const Ray& r, double tmin = 1e-6, TraversalStats* stats = nullptr,
                    bool skipHair = false, bool skipCamHidden = false) const {
         ++raystats::tls;
+        // Leaving a hair fiber the strand's own body is excluded by `curveTmin`, so the blanket
+        // self-intersection tmin has nothing left to protect against and would only re-open the
+        // window it exists to avoid -- through a dense coat those windows compound and the skin
+        // under the fur gets tunnelled through. Device twin: render_cuda.cu bkRadiance.
+        if (r.curveTmin > 0.0) tmin = 0.0;
         Hit h;
         double tMax = DBL_MAX;
         const size_t nT = tris.size();
