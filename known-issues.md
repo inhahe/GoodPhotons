@@ -4877,6 +4877,53 @@ reported hard zeros for paths executing thousands of times: the patch scripts ha
 anchors, and because the build was chained after a NEWLINE rather than `&&`, it ran anyway and
 the tracebacks went to a file that was never read. An absent probe and a never-firing probe are
 indistinguishable. Verify the instrument can speak before believing its silence.
+### HAIR-MODES — OPEN (2026-09-21, measured): the hair TRANSPORT fixes reached mode R and its
+device twin only; D, U and W are badly wrong for transparent hair, M and S mildly so
+
+The hair FEATURES are universal, because they live in shared code: `specular` and `opacity` are
+read by `hairSpecularAt` / `hairOpacityAt` in `hair_shade.h`, which every path reaches through
+`hairShadeAt`, and they are applied inside `hair::make` / `Ap` / `sample` / `f` / `pdf` in
+`hair.h` (and the `dhair` twin). Any mode that shades a fiber at all gets both, on either
+backend.
+
+The TRANSPORT FIXES of 0.358-0.360 are NOT universal. They were written into
+`backward.h::interactMaterial` and `render_cuda.cu::bkInteractHair` -- the backward reference --
+and every other walk still has the original behaviour. Measured with the `opacity 0`
+invisibility null (fur that must be invisible, so the correct answer is exactly 1.000), 128 spp,
+64x64, CPU, on an AREA-lit scene so every mode can render it:
+
+| mode | | null | verdict |
+|---|---|---|---|
+| `R` | backward reference | **0.9990** | correct |
+| `M` | photon map | 1.0504 | ~5 % |
+| `S` | SPPM | 1.0574 | ~6 % |
+| `D` | BDPT | **0.4290** | badly wrong |
+| `U` | VCM/UPS | **0.7084** | wrong |
+| `W` | deterministic preview | **0.5315** | wrong |
+
+Under an ENV-lit furnace instead, `M` and `S` come in at 1.0002 and 1.0085 and `W` at 0.5020,
+so the size of the error is lighting-dependent as well as mode-dependent; `D` and `U` decline
+env/collimated lights altogether and cannot be tested that way.
+
+**What each is missing** (`backward.h` has `passThru` x4 and the null-bounce refund; the others
+have neither):
+
+* the delta-MIS rule -- a coverage pass-through must INHERIT the last real vertex's
+  `contBsdfPdf` / `specularArrival`, never assign them;
+* the null-interaction bounce refund -- a ray that was not intercepted did not scatter;
+* `W` additionally halves the light at `opacity 0`, which is the signature of the path being
+  terminated at the fiber rather than continued (the same shape the `-max-bounce 1` case had).
+
+The exit-step fix (0.360.2) DID reach `photonmap_render.h`, `render.h` and `sppm_render.h` --
+they build the three-argument `Ray` with a curve-only tmin -- which is consistent with `M` and
+`S` being only mildly off while `D`, `U` and `W` (which never call `hairExitOffset` at all) are
+far worse.
+
+Not yet fixed. The work is mechanical -- the same two rules at each walk's hair vertex -- but it
+is four more integrators and each needs its own null run, so it is recorded rather than rushed.
+Anyone using transparent hair should stay on mode `R` until then; OPAQUE hair is unaffected in
+every mode, since none of these paths can fire without a pass-through.
+
 ### HAIR-TEMPORAL — MEASURED, and the obvious fix does NOT work (2026-09-21)
 
 Hair noise is essentially FULLY DECORRELATED between frames of a moving camera, and the
