@@ -178,17 +178,13 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
 //
 // A reciprocal BSDF (Diffuse's rho/PI, DiffuseTransmit) is unchanged by the swap, so switching a
 // site from bsdfF to this is a no-op for them and cannot perturb a diffuse scene.
-// FTRACE_HAIR_ADJSWAP=0: evaluate a fiber's light-end BSDF in arrival->outgoing order instead of
-// the swap below. An A/B, off by default: measured in 0.364.0 the unswapped order read 1.058 of
-// mode R against the swap's 1.037 on a 3 000-strand fur ball (before the exact-chord clearance
-// landed), so the swap is kept; see known-issues BIDIR-HAIR-ADJOINT.
-inline bool hairAdjointSwap() {
-    static const bool s = [] { const char* e = std::getenv("FTRACE_HAIR_ADJSWAP"); return !(e && e[0] == '0'); }();
-    return s;
-}
+// A FIBER is never a light vertex: light subpaths stop at strands (bdpt.h randomWalk, 0.365.0),
+// because no light-side value of this non-reciprocal, camera-offset model agrees pointwise with
+// the camera side's for the same path (known-issues HAIR-RECIPROCITY). 0 keeps a stray light-end
+// evaluation inert.
 inline double bsdfFAdjoint(const Material& m, const Vec3& ns, const Vec3& wo, const Vec3& wi,
                            double lambda, const Scene& scene, const Hit* hitForTex) {
-    if (m.type == MatType::Hair && !hairAdjointSwap()) return bsdfF(m, ns, wo, wi, lambda, scene, hitForTex);
+    if (m.type == MatType::Hair) return 0.0;
     return bsdfF(m, ns, wi, wo, lambda, scene, hitForTex);
 }
 

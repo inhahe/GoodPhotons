@@ -90,6 +90,7 @@ using bdpt::bsdfF;
 using bdpt::bsdfFAdjoint;   // particle-vertex connections; see bsdf_eval.h
 using bdpt::bsdfPdf;
 using bdpt::isConnectibleMat;
+using bdpt::isFiberMat;
 using bdpt::isTwoSidedMat;
 
 // Offset a connection/shadow-ray origin off a surface along the geometric normal, flipped
@@ -109,9 +110,16 @@ inline double fiberStep(const Hit& h, bool isHair, const Vec3& dir) {
     return isHair ? hairChordExit(h.fiberRadius, h.n, h.tangent, dir) : 0.0;   // the exact chord (0.364.0)
 }
 inline Vec3 fiberOrigin(const Hit& h, bool isHair, const Vec3& dir) {
-    const double s = fiberStep(h, isHair, dir);
-    (void)s;   // the far-side clearance is a curve-only tmin now, not an origin move
-    return offsetOrigin(h.p, h.ng, dir);
+    // FAR-SIDE ORIGIN (0.365.0). A fiber connecting out the FAR side starts 1e-6 ALONG the
+    // connection, inside its own tube, so the tube's far wall lies at chord - 1e-6: inside the
+    // curve-only skip the exact chord supplies. Offsetting along the normal instead put the
+    // far wall at chord + 1e-6/cos, BEYOND the skip, for directions more than 45 deg off the
+    // inward normal -- the strand occluded its own grazing far-side connections, which is
+    // where a wide lobe's tail goes: -2 % (beta 0.05) to -5.4 % (beta 0.8) of a strand's
+    // direct light against mode R, compounding to -9 % on dense fur. Mode R's shadow rays
+    // always started along the direction (backward.h emitterGeom).
+    if (isHair && h.fiberRadius > 0.0 && dot(h.n, dir) < 0.0) return h.p + dir * 1e-6;
+    return offsetOrigin(h.p, h.ng, dir);   // the far-side clearance itself is fiberStep's curve-only tmin
 }
 
 // Gather-side shading-normal correction for the VERTEX-MERGE (VM / photon-density) strategy.
@@ -334,7 +342,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
                           MediumStack& stk,
                           const double* lamAll = nullptr, int nUp = 1,
                           double* secF = nullptr, bool* secChromatic = nullptr,
-                          bool* keepBundle = nullptr, bool importance = false) {
+                          bool* keepBundle = nullptr) {
     const Vec3 ns = h.n;
     const Vec3 wo = normalize(rayDir * -1.0);
     wi = Vec3{0, 0, 0}; betaFactor = 0.0; pdfW = 0.0; pdfRevW = 0.0; cosThetaOut = 0.0;
@@ -407,8 +415,8 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             // Fiber BCSDF — the same object bdpt.h's randomWalk samples, with the same
             // conventions (see bdpt::bsdfF for why f is pre-divided by |cos(ns,wi)| and
             // why that makes the geometry term come out right). Not delta: a strand is
-            // connectible and mergeable, which is what lets VCM resolve the multiply-
-            // scattered glow inside a dense groom that a path tracer chews on.
+            // connectible on the CAMERA side; a light walk stops at one (traceLightSubpath,
+            // bdpt.h randomWalk) and nothing merges at one (the merge loop).
             const HairShade hs = hairShadeAt(scene, *mp, h, lambda, wo);
             double pdfH = 0.0, fv = 0.0;
             const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
@@ -428,36 +436,20 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             delta = passThru;
             if (passThru && keepBundle) *keepBundle = true;
             const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
-            // ADJOINT (0.364.0). A LIGHT walk must weight a fiber scatter with the adjoint of the SAME
-            // surface BSDF the connections and splats evaluate -- bsdfFAdjoint(arrival -> new) times the
-            // new direction's surface cosine over the pdf -- not the camera walk's f*cosLong(new)/pdf.
-            // The two are different pointwise functions of this BCSDF that agree only in integral; mode
-            // B is all flux-form and mode R all radiance-form, so each is unbiased alone, but a walk in
-            // one form MIS-combined with connections in the other is biased for the same path (measured:
-            // +4-8 % on isolated fibers, +28-56 % on the fur of a 30 000-strand groom, against R). No
-            // clamp: the ratio of the two conventions legitimately exceeds 1.
-            if (importance && !passThru) {
-                const double cosN = std::fabs(dot(wi, ns));
-                betaFactor = bdpt::bsdfFAdjoint(*mp, ns, wo, wi, lambda, scene, &h) * cosN / pdfH;
-                if (nSec) {
-                    *secChromatic = true;
-                    for (int i = 0; i < nSec; ++i)
-                        secF[i] = bdpt::bsdfFAdjoint(*mp, ns, wo, wi, lamAll[i + 1], scene, &h) * cosN / pdfH;
-                }
-            } else {
-                betaFactor = clamp01(fv * cosLong / pdfH);   // == T = sum_p A_p (hair.h)
-                // sigma_a is per-λ, so each secondary re-evaluates its own fiber along the
-                // hero's sampled direction; the bundle survives a strand rather than de-heroing.
-                if (nSec) {
-                    *secChromatic = true;
-                    for (int i = 0; i < nSec; ++i) {
-                        // Achromatic: the ray missed the fiber, so every wavelength continues at
-                        // 1. Re-evaluating would return the coverage-scaled scatter value -- 0 at
-                        // opacity 0 -- and extinguish the bundle at a fiber never touched.
-                        if (passThru) { secF[i] = 1.0; continue; }
-                        const HairShade hsi = hairShadeAt(scene, *mp, h, lamAll[i + 1], wo);
-                        secF[i] = hairFCos(hsi, wi) / pdfH;
-                    }
+            // The camera walk's factor. A LIGHT walk never uses it: it stops at a strand before
+            // this value matters (traceLightSubpath; the reasoning is at bdpt.h randomWalk's Hair case).
+            betaFactor = clamp01(fv * cosLong / pdfH);   // == T = sum_p A_p (hair.h)
+            // sigma_a is per-λ, so each secondary re-evaluates its own fiber along the
+            // hero's sampled direction; the bundle survives a strand rather than de-heroing.
+            if (nSec) {
+                *secChromatic = true;
+                for (int i = 0; i < nSec; ++i) {
+                    // Achromatic: the ray missed the fiber, so every wavelength continues at
+                    // 1. Re-evaluating would return the coverage-scaled scatter value -- 0 at
+                    // opacity 0 -- and extinguish the bundle at a fiber never touched.
+                    if (passThru) { secF[i] = 1.0; continue; }
+                    const HairShade hsi = hairShadeAt(scene, *mp, h, lamAll[i + 1], wo);
+                    secF[i] = hairFCos(hsi, wi) / pdfH;
                 }
             }
             break;
@@ -736,7 +728,9 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         Vec3 ngo = (dot(h.ng, h.n) >= 0.0) ? h.ng : h.ng * -1.0;
 
         // Store the vertex + connect to camera (only for connectible, non-delta surfaces).
-        bool connectible = isConnectibleMat(*mp);
+        // A strand is never a light vertex (0.365.0): neither stored nor splat, and the walk
+        // ends after its scatter below (bdpt.h randomWalk's Hair case has the reasoning).
+        bool connectible = isConnectibleMat(*mp) && !isFiberMat(*mp);
         if (connectible) {
             LightVertex lv;
             lv.p = h.p; lv.ns = h.n; lv.ng = h.ng; lv.wo = wo;
@@ -832,13 +826,16 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         double secF[hero::kHeroMax - 1]; bool secChromatic = false, keepBundle = false;
         scatterSample(scene, mats, mp, h, rd, lambda, rng, wi, betaFactor, pdfW, pdfRevW,
                       cosThetaOut, delta, terminate, stk,
-                      hb.lam, nUp, secF, &secChromatic, &keepBundle, /*importance=*/true);
+                      hb.lam, nUp, secF, &secChromatic, &keepBundle);
         // Kill the walk only when EVERY live wavelength is dead (hero.h policy 3). With
         // nUp == 1 the loop is empty and mxF == betaFactor: the old scalar test exactly.
         double mxF = betaFactor;
         if (secChromatic) for (int i = 0; i + 1 < nUp; ++i) if (secF[i] > mxF) mxF = secF[i];
         if (terminate || mxF <= 0.0) return;
         if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) return;
+        // LIGHT SUBPATHS STOP AT STRANDS (bdpt.h randomWalk, 0.365.0): unstored, unconnectible,
+        // ended. A coverage pass-through is a delta continuation and rides on.
+        if (isFiberMat(*mp) && !delta) return;
 
         misScatter(delta, cosThetaOut, pdfW, pdfRevW, ctx.misVcWeight, ctx.misVmWeight,
                    dVCM, dVC, dVM, /*mergeable=*/mp->type != MatType::Hair);
@@ -1124,7 +1121,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                                                         : Mis(bsdfDirPdfW / (pdfChoice * directPdfW));
                                 double wCamera = Mis(emissionPdfW * std::fabs(cosToLight) /
                                                      (directPdfW * cosAtLight)) *
-                                                 ((mp->type == MatType::Hair ? 0.0 : ctx.misVmWeight) + dVCM + dVC * Mis(bsdfRevPdfW));
+                                                 (mp->type == MatType::Hair ? 0.0 : (ctx.misVmWeight + dVCM + dVC * Mis(bsdfRevPdfW)));   // no light-side alternative through a strand
                                 double misW = 1.0 / (wLight + 1.0 + wCamera);
                                 double k = misW * std::fabs(cosToLight) / (pdfChoice * directPdfW) * visL;
                                 Vec3 add = cie * (beta * k * Le * f);
@@ -1195,9 +1192,10 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 double camDirPdfA = camDirPdfW * std::fabs(cosLit) / dist2;
                 double litDirPdfA = litDirPdfW * std::fabs(cosCam) / dist2;
                 const double vmLit = (lv.mat && lv.mat->type == MatType::Hair) ? 0.0 : ctx.misVmWeight;   // no merge AT a strand
-                const double vmCam = (mp->type == MatType::Hair) ? 0.0 : ctx.misVmWeight;
                 double wLight = Mis(camDirPdfA) * (vmLit + lv.dVCM + lv.dVC * Mis(litRevPdfW));
-                double wCamera = Mis(litDirPdfA) * (vmCam + dVCM + dVC * Mis(camRevPdfW));
+                // No light-side alternative runs THROUGH a strand (a light walk stops at one).
+                double wCamera = (mp->type == MatType::Hair) ? 0.0
+                                 : Mis(litDirPdfA) * (ctx.misVmWeight + dVCM + dVC * Mis(camRevPdfW));
                 double misW = 1.0 / (wLight + 1.0 + wCamera);
                 double visV = 0.0;
                 {   // Either end may be a strand; clear both tubes (0 for non-fibers).
@@ -1302,6 +1300,10 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
 
         misScatter(delta, cosThetaOut, pdfW, pdfRevW, ctx.misVcWeight, ctx.misVmWeight,
                    dVCM, dVC, dVM, /*mergeable=*/mp->type != MatType::Hair);
+        // A light walk never scatters at a strand (traceLightSubpath, 0.365.0): no alternative
+        // from here inward puts one on the light side. dVCM stays -- the light subpath may
+        // still END at the next vertex and connect back to this one.
+        if (isFiberMat(*mp) && !delta) { dVC = 0.0; dVM = 0.0; }
         beta *= betaFactor;
         for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= secChromatic ? secF[i] : betaFactor;
         if (!delta) camAllDelta = false;        // disqualifies the escaped-sun strategy

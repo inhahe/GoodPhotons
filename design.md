@@ -2400,14 +2400,26 @@ why these historical runs reproduce. See **J-BEAMCOST** in `known-issues.md`.
     by the strand's own body. Strand radii are **microns**, so the ordinary `ng * 1e-6` nudge
     lands *inside* the tube and the ray instantly reports itself blocked by the very hair it
     left — deleting exactly the TT forward glow a pale coat is mostly made of. The offset steps
-    `2.5 × Hit::fiberRadius` (a new field, set by `curve.h`) on the far side and degrades to
-    the ordinary epsilon on the near side. **Every shadow ray that uses it must also shorten
-    its max-t by the same amount**, or it overshoots into the light it is testing.
+    the exact chord through the tube, `2r(−n·w)/(1 − (w·t)²)` with `r = Hit::fiberRadius` (a
+    field set by `curve.h`; `hairChordExit`, 0.364.0 — it had been a `2.5 r` heuristic), on the
+    far side and degrades to the ordinary epsilon on the near side. **Every shadow ray that uses
+    it must also shorten its max-t by the same amount**, or it overshoots into the light it is
+    testing.
+    The clearance travels as the ray's curve-only `curveTmin`, and **a far-side ray must start
+    along its own direction** (`p + w·1e-6`, inside the tube — what `backward.h`'s shadow rays and
+    the photon walks always did): from a normal-offset origin the far wall lies at
+    chord + 1e-6/cos, *beyond* the skip, for directions more than 45° off the inward normal, so
+    the strand occludes its own grazing far-side connections — exactly where a wide lobe's
+    tail goes. The bidirectional connections did that until 0.365.0 (`connOrigin`,
+    `fiberOrigin`, `dFiberConnOrigin`): −2 % (β 0.05) to −5.4 % (β 0.8) of a strand's direct
+    light against mode R, compounding to −9 % on dense fur.
   - *The sampler weight is exactly `T = Σ_p A_p ≤ 1`.* Since `f·cos = Σ_p A_p M_p N_p` and
     `pdf = Σ_p (A_p/T) M_p N_p`, the ratio `fv·cosLong/pdf` is a deterministic per-hit number.
     So it is simultaneously the natural Russian-roulette survival probability (β unchanged —
     the same trick `Mirror` plays with its reflectance, except here the number is the physics
-    rather than an authored albedo) and the Whitted attenuation weight.
+    rather than an authored albedo) and the Whitted attenuation weight. A bidirectional light
+    walk never scatters at a strand at all (0.365.0, below); mode B's photon walk does, with
+    exactly this number.
   - *No Veach shading-normal adjoint, no shadow-terminator softening.* Both are corrections
     for using an *interpolated normal* as a projection axis; a fiber does not project about its
     normal. On curve geometry `h.n == ±h.ng` so both would evaluate to 1 anyway — the explicit
@@ -2447,6 +2459,42 @@ why these historical runs reproduce. See **J-BEAMCOST** in `known-issues.md`.
     whereas dividing by the camera-side cosine does not integrate to `r` — and a white-furnace
     test measures mode `R`, which builds paths camera-side, flat to **0.04 %**. Leave `bsdfPdf`
     alone: the lobe factor is symmetric, so the densities were always reciprocal.
+  - *A LIGHT subpath stops at a strand (0.365.0).* Write every fiber site in terms of the raw lobe
+    kernel `K = f·cos θ_long`: a camera walk contributes `K(c→a)`, NEE at a fiber `K(c→a)`, a
+    light walk `K(a→c)`, the light end of a splat or connection `K(a→c)` — no surface cosine
+    survives anywhere. The bidirectional modes MIS-combine strategies that build the same path
+    from either end, which is unbiased only if every strategy evaluates the same value for the
+    same path — and for a strand none does. The near-field model is **not reciprocal** (21 %
+    energy-weighted: the offset `h` is the traced ray's, the cuticle tilt sits on θ_o alone, the
+    entry Fresnel and internal chord take θ_o), so the light side's natural value, the flux form,
+    differs from the camera side's pointwise. A light-side value that agrees with R *in integral
+    over the strand's width* (the model at the mirrored offset `−h`) still differs *across* the
+    width, and the camera-walk pdf in the MIS weights varies across the width the same way —
+    measured +22 % on isolated fiber rows and up to 2.3× on dense fur. The exact adjoint of R's
+    rule exists but is pathological: R's shadow ray clears its own tube along the light
+    direction, which credits nearly all TT light to the central sixth of the width (light-side
+    albedo 2.5 at `h = 0`, 0.06 at `h = 0.5`; weight ratios of 10³–10⁴ against the model's own
+    sampler), and a physically consistent per-lobe exit geometry has caustic folds in its
+    inverse. So the rule is structural: a light walk that scatters at a strand ends there,
+    unstored and unconnectible (`randomWalk` in Importance mode pops the vertex;
+    `traceLightSubpath` / `kVcmLightT` neither store nor splat it and return after the scatter;
+    a coverage pass-through is a delta continuation, the same from either side, and rides on).
+    Every path through a strand is then built from the camera side alone — literally mode R's
+    family — and the MIS weights drop the light-side alternatives through it: `misWeight`'s eye
+    loop breaks at a non-delta fiber vertex, `misWeightReference` disallows the strategies and
+    merges beyond the first one, mode J's `segSumC/segSumM` zero at one, and VCM zeroes
+    `dVC`/`dVM` after the camera walk scatters at one (`dVCM` stays: the light subpath may still
+    end at the next vertex and connect back) and the camera-side bracket of its NEE and VC
+    weights at one. `bsdfFAdjoint` returns 0 for a fiber so a stray light-end evaluation is
+    inert. Modes D/U/J now equal R on hair in expectation; what they give up is the light-side
+    variance reduction for hair (caustic-like paths onto strands), which the camera side still
+    covers. Mode B keeps the flux form — it has no camera-side technique — and differs from R by
+    the model's non-reciprocity, 5.7 % on the fur of a dense groom (`known-issues.md`
+    HAIR-RECIPROCITY). Mode J also stops treating a strand as a surface-merge site
+    (`surfMergeSite` excludes `isFiberMat`; one predicate gates the store, the gather and the
+    merge's MIS η term, so the exclusion is consistent by construction) — a photon stored on a
+    strand lying on the skin had bled into every skin gather point within the radius, 2–6× too
+    bright on fur.
   - *Modes M / S scatter but never gather.* `struct Photon { Vec3 n; float power; float
     lambda; }` carries **no incident direction**, so a directional BCSDF has nothing to
     evaluate against at a density-estimate gather. `sppm_render.h` and `photonmap_render.h`

@@ -2027,11 +2027,19 @@ Two practical notes:
   its light and camera kernels carry the fiber BCSDF (scatter, connections, splats, NEE,
   the coverage pass-through), the exact tube clearance and the strand merge exclusion,
   exactly as `vcm.h` does; a 30 000-strand opaque groom renders on the GPU in about a
-  fifth of the CPU time. 0.364.0 also brought the bidirectional modes (`D`, `U`) to within
-  about a percent of mode `R` whole-frame on opaque hair — they had been up to 1.7× too
-  bright on dense grooms — and recorded the discrepancy that remains in the hair model
-  itself: modes `R` and `B` disagree by a few percent on the fur of a dense groom, and `D`/`U`
-  read a few percent under `R` there (`known-issues.md`, HAIR-RECIPROCITY).
+  fifth of the CPU time. Since 0.365.0 a bidirectional **light subpath stops at a strand**:
+  the near-field fiber model is not reciprocal and its offset belongs to the camera ray, so no
+  light-side value agrees with the camera side's pointwise for the same path, and MIS-combining
+  the two is biased — up to 2.3× on dense fur even with the light-side value that agrees in
+  integral (`known-issues.md`, HAIR-RECIPROCITY). Every path through a strand is therefore built
+  from the camera side alone, exactly as mode `R` builds it, so `D`/`U`/`J` equal `R` on hair in
+  expectation: on the fur of a 30 000-strand groom they read 0.9910 / 0.9947 / 0.9827 of `R`
+  (whole frame 0.9979 / 0.9996 / 0.9839; `U` on the GPU 1.0437 / 1.0044). What they give up is
+  the light-side variance reduction for hair — caustic-like paths onto strands — which the
+  camera side still covers. Mode `B`, pure light tracing with no camera-side technique, keeps the
+  model's flux form and differs from `R` by the model's non-reciprocity: 1.0572 on that fur,
+  1.0037 whole-frame. Mode `J` renders hair correctly since 0.365.0 as well (a strand is not a
+  surface-merge site; it had been 2–6× too bright).
   Renders that still fall back to the CPU tracer: `-dual-scatter` (the approximation is
   host-side), and hair scenes in the GPU BDPT (`D`) and photon-map (`M`/`S`) backends, whose
   vertex/gather machinery would shade a strand as Lambertian.

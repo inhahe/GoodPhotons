@@ -4988,7 +4988,82 @@ on the sphere, before; 1.0017 / 1.0081 after. Found through the
 HAIR-MODES invisibility null (which amplified it to +25 %), fixed in `vcm.h` and its device twin
 in `render_cuda.cu`. Details under HAIR-MODES.
 
-### HAIR-RECIPROCITY — OPEN (found 0.364.0): modes `R` and `B` disagree on the fur of a dense groom
+### HAIR-RECIPROCITY — RESOLVED for the bidirectional modes (0.365.0): light subpaths stop at strands; mode `B`'s flux form is the documented residual
+
+**Resolution (0.365.0).** Write every fiber site in terms of the raw lobe kernel K = f·cosLong: a
+camera walk contributes K(c→a), NEE at a fiber K(c→a), a light walk K(a→c), the light end of a
+splat or connection K(a→c) — no surface cosine survives anywhere, on either backend, in any mode.
+The bidirectional modes MIS-combine strategies that build the same path from either end, which is
+unbiased only if every strategy evaluates the same value for the same path. For a strand none
+does, and this release established that none can at a reasonable price:
+
+- **The model is not reciprocal: 21 % energy-weighted** (K(h; wo→wi) against K(−h; wi→wo) over
+  24 fibers × 300 direction pairs; three ingredients are one-sided — the offset is the traced
+  ray's, the cuticle tilt sits on θ_o alone, the entry Fresnel and internal chord take θ_o).
+  Symmetrising it costs energy conservation: splitting the tilt half onto each angle biases the
+  model's own furnace ±3 % per inclination (65 % at grazing on a medullated fiber); Marschner's
+  difference-angle Fresnel is reciprocal to 2e-14 but the sampler can no longer follow the kernel
+  (±25 % furnace at grazing, B/R 1.13 on the groom); averaging the two forms lost 16.6 % of unit
+  albedo. All three were built, measured and removed; the model ships as it was.
+- **A light-side value that agrees with R in integral over the strand's width is not enough.**
+  Every lobe of a circular cross-section exits at the mirrored offset, so K(−h_a; c→a) at a light
+  vertex has exactly R's integral across the width for any direction pair, and mode B carrying it
+  matched R on 150 thick, separated fibers (ROI 1.0011). But it differs from R *across* the
+  width, and the camera-walk pdf in the MIS weights varies across the width the same way — the
+  weight is small exactly where R's value is large — so the combination over-counts: D 1.2265 on
+  those same fiber rows (U-cpu 1.2253, U-gpu 1.2114, J 1.2356), 1.317 on the 3 000-strand fur
+  (U-gpu 1.4946), **1.695 on the groom's fur** (U-cpu 1.771, U-gpu 2.309, J 1.593). In dense fur
+  the lines arriving from a neighbouring strand a few radii away are not uniform across the width
+  either, so even mode B drifted: 1.0799 on the sparse fur, 1.1476 on the groom's.
+- **The exact adjoint of R's rule exists and is pathological.** R clears its own tube along the
+  light direction when the light is behind the camera's entry point, so from the light side a
+  photon entering at x feeds R's camera lines through x *and* through x's antipode along the
+  light direction, each at that line's own offset with the surface-cosine ratio as the measure
+  conversion. A standalone probe of that adjoint (`scraps/adjprobe.cpp`) at perpendicular
+  incidence: light-side albedo 2.47 at h = 0 and 0.064 at h = 0.5 for β 0.1 (2.10 / 0.25 at β 0.3)
+  — nearly all of the TT light is credited to the central sixth of the width — with weight ratios
+  against the model's own sampler up to 2·10⁴ (1.5·10³ at β 0.3, the default). A dedicated sampler
+  would still carry a ~6× variance penalty on TT transport, and replacing R's clearance by the
+  physical per-lobe exit points (the refracted chord's far end) makes the inverse geometry fold —
+  the fiber is a lens, and the camera rays' TT exits converge — so that adjoint has caustics.
+
+- **Most of what remained of the D/U/J deficit was geometry, not the model.** With light subpaths stopping at strands,
+  D still read 0.9685 of R for the bare NEE at a spot-lit strand (one bounce, weight 1, no MIS), 0.9801 with β 0.05
+  and 0.9457 with β 0.8, achromatic and independent of the strand radius — while diffuse strands read
+  0.9982. A far-side fiber connection started its shadow ray `1e-6` along the *normal* and skipped
+  curves out to the exact chord (0.364.0); from that origin the tube's far wall lies at chord + 1e-6/cos, beyond the
+  skip, for directions more than 45° off the inward normal, so the strand occluded its own grazing far-side
+  connections — where a wide lobe's white tail goes (hence achromatic, hence worse with β). Mode R's shadow
+  rays always started along the direction; the connections now do too (`connOrigin`, `fiberOrigin`,
+  `dFiberConnOrigin`), and the bare NEE reads 0.9934 / 1.0086 / 0.9954 of R. With both fixes D's
+  second bounce and full depth on the spot-lit dense fur read within the measurement's own scatter
+  (D/R 1.0302 at full depth; mode R itself scatters 0.996–1.030 seed to seed on that ROI at 2048 spp,
+  dense fur being heavy-tailed), and the hero bundle is not the residual: `-heroc 1` moves the ratio by a
+  percent, and a coloured diffuse floor and sphere read 0.9999 of R with the bundle on.
+
+So the rule is structural. **A light walk that scatters at a strand ends there, unstored and
+unconnectible** (`bdpt.h randomWalk` in Importance mode pops the vertex; `vcm.h traceLightSubpath`
+and the device `kVcmLightT` neither store nor splat it and return after the scatter; a coverage
+pass-through is a delta continuation that is the same from either side and rides on). Every path
+through a strand is then built from the camera side alone — literally mode R's family — and the
+MIS weights drop the light-side alternatives through it: `misWeight`'s eye loop breaks at a
+non-delta fiber vertex, `misWeightReference` disallows the strategies and merges beyond the first
+one, mode J's `segSumC/segSumM` zero at one, and VCM zeroes `dVC`/`dVM` after the camera walk
+scatters at one (`dVCM` stays: the light subpath may still end at the next vertex and connect back)
+and the camera-side bracket of its NEE and VC weights at one, on both backends. `bsdfFAdjoint` /
+`dBsdfFAdjoint` return 0 for a fiber so a stray light-end evaluation is inert; the
+`FTRACE_HAIR_ADJSWAP` A/B is gone with the evaluation it switched. Modes R and B are untouched.
+What D/U/J give up is the light-side variance reduction for hair (caustic-like paths onto strands),
+which the camera side still covers; VCM's merges at strands were already off (0.362.0).
+
+Measured on this binary — mode R is bit-identical to its 0.364.0 frame. Against R: thick separated fibers D 0.9990 (1.0018), U-cpu 0.9993 (1.0070), U-gpu 0.9996 (1.0125), J 0.9962 (1.0298) (whole (ROI));
+3 000-strand fur D 1.0011 (1.0008), U-cpu 1.0020 (0.9969), U-gpu 1.0044 (1.0527), J 0.9978 (0.9993); 30 000-strand groom D 0.9979 (0.9910), U-cpu 0.9996 (0.9947), U-gpu 1.0044 (1.0437), J 0.9839 (0.9827) (whole (fur)).
+Opacity-0 nulls (ROI / whole): D 0.9716 / 0.9991, U-cpu 0.9843 / 0.9992, U-gpu 0.9951 / 1.0001, J 0.9415 / 0.9932. Non-hair scenes are bit-identical. U-gpu 7 s vs U-cpu 21 s at 64 spp on the groom (0.364.0: 18 s vs 105 s -- the light pass no longer walks through fur).
+Mode B, the flux family: B/R sparse 1.0007 whole / 1.0306 fur ROI, groom 1.0037 / 1.0572, thick fibers 0.9967 / 0.9915 — the model's
+non-reciprocity, and the one residual this entry still records: B has no camera-side technique to
+hand a strand to.
+
+The record of how it was found, kept because the reasoning is the point:
 
 The fiber BCSDF has two equally natural per-vertex factors: the radiance form (mode `R`'s NEE and
 walk: `hairFCos(arrival, wi)` with the longitudinal cosine of the light direction) and the flux
@@ -5037,12 +5112,15 @@ Three defects, found in order while validating the GPU port (GPU-VCM-HAIR below)
    (isolated fiber rows +4.4 % in the flux form, −4.5 % in this one; the dense groom's fur +72 %
    against −10 %, stable from 64 to 256 spp), which is the model's own non-reciprocity
    (HAIR-RECIPROCITY) showing through — a per-entry-side BCSDF has no side-independent
-   surface form for a bidirectional integrator to agree with mode R on pointwise.
+   surface form for a bidirectional integrator to agree with mode R on pointwise. **Superseded
+   in 0.365.0**: a light walk now stops at a strand, so there is no light-side fiber form at all;
+   see HAIR-RECIPROCITY.
 
 After, against R (whole-frame within ~1 % on all three scenes): thick fibers D 0.9948 / U-cpu 0.9949 / U-gpu 0.9927 (whole; ROI 0.9550 / 0.9603 / 0.9315);
 3 000-strand fur D 0.9922 / U-cpu 0.9923 / U-gpu 0.9990 (whole); 30 000-strand groom fur D 0.8966 / U-cpu 0.9105 / U-gpu 1.0162 (whole 0.9849 / 0.9845 / 1.0001). Opacity-0 nulls: D 0.9716 / 0.9991, U-cpu 0.9843 / 0.9992, U-gpu 0.9951 / 1.0001 (ROI / whole). Non-hair scenes are bit-identical.
-Also measured and kept as is: the `bsdfFAdjoint` argument swap for a fiber (A/B behind
-`FTRACE_HAIR_ADJSWAP=0`: unswapped reads 1.040 vs 1.0245 of R on the 3 000-strand fur).
+Also measured then: the `bsdfFAdjoint` argument swap for a fiber (A/B behind
+`FTRACE_HAIR_ADJSWAP=0`: unswapped read 1.040 vs 1.0245 of R on the 3 000-strand fur). Gone in
+0.365.0 with the light-end fiber evaluation itself.
 
 ### GPU-VCM-HAIR — DONE (0.364.0): mode `U` renders hair on the GPU
 
@@ -5053,7 +5131,7 @@ had the fiber BCSDF (`dhair`), the curve intersector filling `DHit::tangent/fibe
 every hair-specific site of `vcm.h`, now twinned one for one:
 
 - `dVcmScatter` Hair case (sample, pass-through as delta + keepBundle, per-λ secondaries, the
-  adjoint form on the light side);
+  adjoint form on the light side — gone in 0.365.0: `kVcmLightT` stops at a strand);
 - `dBsdfF` / `dBsdfPdf` Hair branches (bsdf_eval.h conventions), which needed the fiber frame at
   a stored vertex — `DVertex` and `DVcmLV` now carry `tangent` + `fiberR` (the light-vertex slab
   grows 136 → 152 B);
@@ -5067,10 +5145,53 @@ every hair-specific site of `vcm.h`, now twinned one for one:
 - the gate split: `cudaBidirCoreSupported` is shared, BDPT still adds `!sceneUsesHairMaterial`
   (mode `D`'s device kernels have no hair case), VCM does not.
 
-Measured: the groom above, GPU 18 s vs CPU 105 s for mode U at 64 spp (mode D 48 s); the opacity-0 null on the GPU 0.9951 / 1.0001; a non-hair scene is bit-identical to the pre-port device binary. Alice's scenes are environment-lit,
+Measured: the groom above, GPU 18 s vs CPU 105 s for mode U at 64 spp (mode D 48 s) — since 0.365.0 the light pass no longer walks through fur, and the same render takes GPU 7 s vs CPU 21 s; the opacity-0 null on the GPU 0.9951 / 1.0001; a non-hair scene is bit-identical to the pre-port device binary. Alice's scenes are environment-lit,
 which mode U does not take on either backend, so the groom is the dense-hair check. Opaque
 fur's sphere ROI scatters ±8–16 % seed to seed at 512 spp (merge fireflies), so parity there is
 read whole-frame.
+
+### MODE-J-HAIR — FIXED (0.365.0): mode `J` merged photons stored on strands, 2–6× too bright on fur
+
+UPBP's surface point merges (`-jsurf`, on by default; the `-nobeams` control leaves them on, which
+is why `-nobeams` was NOT mode D bit-for-bit on a hair scene) admitted strand vertices:
+`surfMergeSite` was `isConnectibleMat`, which includes hair, so a photon that landed on a strand
+lying on the skin bled into every skin gather point within the radius — the defect VCM was cured
+of in 0.362.0. Measured on the 3 000-strand opaque fur: J/R 1.079 whole and **2.27** on the fur,
+1.29 / **6.24** with `-nobeams`; the opacity-0 null 1.06 / 0.96. `surfMergeSite` now excludes
+fibers; that one predicate gates the SurfMap store, the gather and the merge's MIS η term, so the
+exclusion is consistent by construction (and since a light walk no longer stores a strand vertex
+at all — HAIR-RECIPROCITY — the store half is moot; the gather and the η term at a strand camera
+vertex are not). After: J/R 0.9978 whole / 0.9993 fur on the same scene, groom 0.9839 / 0.9827,
+null 0.9415 / 0.9932. Hair was never wired into the beam map itself and needs no wiring: beams
+are medium chords and a fiber is a surface event between them; `-fur-volume` (the coat as a
+medium) remains a backward-renderer feature the beam map does not see.
+
+### GPU-VCM-HAIR-RESIDUAL — OPEN (found 0.365.0): mode `U` on the GPU reads 4–5 % over R on dense fur where its CPU twin reads R
+
+With light subpaths stopping at strands and the far-side origin fixed, U on the CPU reads R on every
+hair scene (fur 1.0070 / 0.9969 / 0.9947 on thick / 3 000-strand / groom), but the device kernel reads
+1.0125 / 1.0527 / 1.0437 (whole frame 1.0044 / 1.0044), consistently high, and it was already the one
+backend on the high side of R before this release (0.364.0: 1.0162 on the groom's fur against the
+CPU's 0.9105). Both backends now run the same strategy set on hair — camera walk, NEE, vertex
+connections to non-strand light vertices, no merges at strands — so the difference is in the
+device's camera-side fiber path: `dVcmScatter`'s Hair case, `dBsdfF` / `dBsdfPdf`'s hair branches,
+the NEE bracket, or the FP32 curve-clearance conventions (`dFiberStep`, `dOffsetPoint`'s ULP
+nudge against the host's absolute 1e-6). Non-hair scenes are bit-identical to the pre-port
+device binary, so it is hair-specific. Not chased here; the CPU twin is the reference for the
+device port to be measured against.
+
+### VCM-THIN-CURVES — OPEN (found 0.365.0): vertex merging on a thin diffuse curve reads 0.80 of R on both backends
+
+Found while isolating the fiber deficit above with the strands given a diffuse material: mode D
+reads 0.994 of R on them (so the curve hits and the camera walk are right), but mode U reads
+**0.803 on the CPU and 0.809 on the GPU** (150 curves of radius 0.6 mm, spot-lit, full depth).
+A merge gathers the photons within a disc of the merge radius and divides by the disc's area,
+which assumes the surface around the camera vertex IS a disc; on a curve a radius wide the
+disc is mostly empty space, and the photons the strand's far side and its neighbours hold are
+counted against an area they never covered. Hair is unaffected — nothing merges at a strand
+since 0.362.0 — and diffuse curves (grass, wire) are rare in the bidirectional modes; the fix,
+when it is wanted, is the same exclusion (`surfMergeSite` / VCM's merge gate for every curve
+primitive, not just fibers) or a merge kernel that knows the local surface area.
 
 ### HAIR-TEMPORAL — MEASURED, and the obvious fix does NOT work (2026-09-21)
 
