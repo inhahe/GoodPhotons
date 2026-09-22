@@ -1075,8 +1075,15 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                                              rng.uniform(), rng.uniform(), pdfH, fv);
                 if (!(pdfH > 0.0) || !(fv > 0.0)) { terminate = true; break; }
                 wi = hair::toWorld(hs.fr, wl);
+                // A coverage pass-through returns EXACTLY -wo: the ray was never intercepted.
+                // That is a DELTA vertex in this file's own sense -- it carries the chain but
+                // cannot be connected to, because its outgoing direction is fixed and its pdf
+                // is a Dirac, not the finite solid-angle density `pdfH` reports.
+                const bool passThru = (wl.x == -hs.woLocal.x && wl.y == -hs.woLocal.y &&
+                                       wl.z == -hs.woLocal.z);
                 pdfW    = pdfH;
-                pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
+                pdfRevW = passThru ? pdfH : bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
+                delta   = passThru;
                 // f*cos/pdf collapses exactly to T = sum_p A_p (see hair.h): the total
                 // Fresnel-and-Beer attenuation of the four lobes.
                 const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
@@ -1088,6 +1095,11 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 // sigma_a is what colours the TT/TRT lobes.
                 secChromatic = true;
                 for (int i = 0; i + 1 < nUp; ++i) {
+                    // A pass-through is ACHROMATIC -- the ray missed the fiber, so every
+                    // wavelength continues at weight 1. Re-evaluating the BCSDF here would
+                    // return the coverage-scaled scatter value (0 at `opacity 0`) and
+                    // extinguish the bundle at a fiber it never touched.
+                    if (passThru) { secF[i] = 1.0; continue; }
                     const HairShade hsi = hairAt(scene, *mp, h, hb.lam[i + 1], wo);
                     secF[i] = hairFCos(hsi, wi) / pdfH;
                 }

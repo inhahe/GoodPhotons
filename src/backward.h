@@ -2116,7 +2116,13 @@ struct BackwardRenderer {
                 if (scene.envIndex >= 0)
                     L += thr * neeEnv(scene, h, 1.0, invPdfLambda, lambda, rng, &hs,
                                       dualScatter ? &dc : nullptr);
-                if (directOnly) return false;
+                // directOnly (mode W's Whitted preview) and dualScatter BOTH end the path at a
+                // fiber -- but only for light the fiber actually INTERCEPTED. A transparent
+                // fiber must still pass the un-intercepted fraction, or invisible fur blocks
+                // everything behind it: mode W measured 0.5215 on the `opacity 0` null, where
+                // the answer is 1.000. Opaque short-circuits first so those paths are
+                // bit-identical and draw no extra uniforms.
+                if (directOnly && hs.b.opacity >= 1.0) return false;
                 // Dual scattering ends the path because this vertex already carries the coat's
                 // whole multiple-scattering response -- but only for light the fiber actually
                 // INTERCEPTED. Below opacity 1 part of the ray was never intercepted and must
@@ -2130,8 +2136,9 @@ struct BackwardRenderer {
                 // A coverage pass-through returns EXACTLY -wo (negation is exact in IEEE).
                 // Anything else was intercepted, and under dual scattering the analytic terms
                 // have already accounted for it -- continuing would count that light twice.
-                if (dualScatter && !(wl.x == -hs.woLocal.x && wl.y == -hs.woLocal.y &&
-                                     wl.z == -hs.woLocal.z))
+                if ((dualScatter || directOnly) &&
+                    !(wl.x == -hs.woLocal.x && wl.y == -hs.woLocal.y &&
+                      wl.z == -hs.woLocal.z))
                     return false;
                 // Exactly T = sum_p A_p, the total lobe attenuation (see the forward tracer's
                 // Hair case for why the ratio collapses): a deterministic weight, so it is
