@@ -424,7 +424,29 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
         // Probe from r ABOVE the tangent plane straight down. `2r` of travel is what lets a
         // curved surface still count: within the disc it deviates from the plane by at most
         // ~r^2/(2R), far inside this window for any radius worth gathering at.
-        const Hit h = scene.closestHit(Ray{q + n * r, n * -1.0});
+        // COVERAGE (hair `opacity` < 1): a strand is present with probability o, so a probe that
+        // lands on one passes straight through with probability (1 - o) -- the coin every walk
+        // tosses at a fiber -- instead of counting a tube the transport itself may never see.
+        // At opacity 0 the probe cannot tell fur from air, which is what the invisibility null
+        // demands (measured before this: mode S +5.6 % / M +2.3 % on skin under opacity-0 fur,
+        // all of it from this divisor, none from transport). The tube is cleared with the
+        // curve-only tmin and the distance carried forward, so `h.t` stays depth from launch.
+        Hit h;
+        {
+            Ray pr{q + n * r, n * -1.0};
+            double tAcc = 0.0;
+            for (int pass = 0; pass < 16; ++pass) {
+                h = scene.closestHit(pr);
+                if (!h.valid) break;
+                h.t += tAcc;
+                const Material* pm = (h.matId >= 0 && h.matId < (int)scene.mats.size()) ? &scene.mats[h.matId] : nullptr;
+                if (!pm || pm->type != MatType::Hair || h.fiberRadius <= 0.0) break;
+                const double o = hairOpacityAt(scene, *pm, h, 550.0);
+                if (o >= 1.0 || rng.uniform() < o) break;            // the strand IS here
+                tAcc = h.t;
+                pr = Ray{h.p + pr.d * 1e-9, pr.d, 2.5 * h.fiberRadius + 1e-9};   // through the tube
+            }
+        }
         if (gaDiagOn() && matId >= 0 && matId < (int)gaDiag().size()) {
             GaDiagMat& g = gaDiag()[matId];
             if (!(h.valid && h.t <= 2.0 * r))          g.miss.fetch_add(1, std::memory_order_relaxed);

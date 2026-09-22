@@ -964,7 +964,15 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     if (em && em->area > 0.0 && scene.totalPower > 0.0 && edges >= 2) {
                         double pdfChoice = em->power / scene.totalPower;
                         double directPdfA = pdfChoice / em->area;         // area pdf of the point
-                        double emissionPdfW = pdfChoice * cosLight / PI;  // directional emission pdf
+                        // JOINT emission density: position x direction x pick -- exactly what
+                        // traceLightSubpath generates every light path with (pdfPos*pdfDirW*
+                        // pdfChoice) and what SmallVCM's AreaLight::GetRadiance reports. The
+                        // directional part alone under-weighted the light-side alternatives
+                        // (splat, merge, connections) by the emitter's AREA, so an eye path
+                        // landing on the light after a bounce kept nearly full weight while the
+                        // splat and the merge kept theirs: +4.4 % over mode R on a bare
+                        // floor+sphere scene, and +24 % on skin whose NEE fur blocks (0.363.0).
+                        double emissionPdfW = pdfChoice * cosLight / (PI * em->area);
                         double wCamera = Mis(directPdfA) * dVCM + Mis(emissionPdfW) * dVC;
                         misW = 1.0 / (1.0 + wCamera);
                     }

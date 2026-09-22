@@ -4877,8 +4877,8 @@ reported hard zeros for paths executing thousands of times: the patch scripts ha
 anchors, and because the build was chained after a NEWLINE rather than `&&`, it ran anyway and
 the tracebacks went to a file that was never read. An absent probe and a never-firing probe are
 indistinguishable. Verify the instrument can speak before believing its silence.
-### HAIR-MODES — PARTLY FIXED (0.361.0 / 0.362.0): W exact, VCM's OPAQUE hair corrected by
-2.7x; D -4 % and U +25 % still open under the delta-vertex scheme, M/S +5 % open
+### HAIR-MODES — FIXED (0.361.0–0.363.0): every mode passes the invisibility null; the two
+"open residuals" were a mode-U MIS defect on ANY area-lit scene and an M/S gather probe blind to opacity
 
 The hair FEATURES are universal (`specular` / `opacity` live in `hairShadeAt` and `hair::make`,
 which every path reaches, on both backends). The TRANSPORT was not: it was validated -- and
@@ -4931,21 +4931,63 @@ step (0.362.0).
 story fitted to a number and is withdrawn -- the de-hero rule and the merge bleed were the
 causes.
 
-**OPEN: D 0.9583 and U 1.2526 under the delta-vertex scheme.** With every mechanism above fixed
-and connections hard-blocking, BDPT is 4 % dark and VCM 25 % bright on transparent fur. These
-are the same two numbers to four decimals across two builds (the attenuation experiment in
-between reproduced them exactly on revert), so they are deterministic. The remaining candidate
-is the MIS treatment of a delta lobe on a CONNECTIBLE (mixed) vertex: SmallVCM's specular rule
-assumes no strategy can connect at the vertex, but a fiber below opacity 1 is stored and
-connectible, so the two sides of the weight recursion may not agree. Six VCM hypotheses have
-been tested by measurement in this pass; the next one should be instrumented (per-strategy
-contribution and weight sums at a pass-through), not reasoned.
+**RESOLVED (0.363.0): D was never wrong; U and M/S were, for reasons that have nothing to do with
+the delta-vertex scheme.** The 0.362.0 table above is 128 spp at ONE fixed seed on a 400-pixel ROI
+of dim skin, and that ROI's seed-to-seed scatter is ±1.5 %. Mode D at 64x64x128 spp takes 0.33 s
+once nothing else shares the CPU, so the same nulls at 8192 spp (±0.2 %) read:
 
-**OPEN: M 1.0232 and S 1.0557.** This is a real bias, not noise and not budget: two seeds scatter by
-only 1.5-2.5 % around a mean of +5-7 %, and `-photon-bounce 256` changes nothing. It is
-common to the photon-map family (S's camera walk has no NEE at fibers and still shows it, so
-it is on the photon side or in the gather) and needs its own instrumentation. Opaque hair is
-unaffected in every mode.
+| mode | null, 0.362.0 (128 spp, one seed) | null, 0.363.0 (8192 spp) | no-fur frame vs mode R |
+|---|---|---|---|
+| `R` | 0.9990 | 1.0026 (4096 spp) | — |
+| `D` | 0.9583 | **0.9954** | 1.0020 |
+| `D`, T=1 `filter` slabs instead of fur: both sides / light side / camera side | — | **0.9965 / 1.0004 / 0.9985** | — |
+| `U` | 1.2526 | **0.9890** (whole frame 0.9993) | 1.0081 (was 1.0800) |
+| `M` | 1.0232 | **0.9994** | — |
+| `S` | 1.0557 | **0.9927** | — |
+
+**D.** The three seeds 1/2/3 read 1.0014 / 1.0061 / 0.9773 at 128 spp; at 8192 spp the fur null is
+0.9954 and a scene where two T=1 `filter` quads (a delta pass-through with exactly the bookkeeping a
+coverage pass-through gets, and no curves, roots or `curveTmin`) replace the fur reads 0.9965 —
+the delta-vertex scheme is sound. `-misaudit` on the fur scene: 38 624 weights, worst relative
+disagreement 3e-15. The whole-frame per-strategy probe put every fiber-crossing strategy where MIS
+says it should be (NEE −15 % of its no-fur share, taken up by s=0 and t=1 through the fibers) and
+the frame at 0.9994. The −4 % was one draw. Lesson recorded: a fixed seed reproduces a number
+bit-for-bit across builds without making it significant; measure the scatter before chasing it.
+
+**U — VCM's emitter-hit MIS weight used the DIRECTIONAL emission pdf alone.** `traceCameraSubpath`
+weighted an eye path that lands on an area light with `emissionPdfW = pdfChoice * cosLight / PI`;
+every light path is generated with the JOINT density `pdfPos * pdfDirW * pdfChoice` (and
+SmallVCM's `AreaLight::GetRadiance` reports the joint one). The light-side alternatives of that
+strategy — the splat, the merge, the connections — were therefore under-weighted by the emitter's
+AREA, 25x for this 0.2 m square, so an eye path that reached the light after a bounce kept nearly
+full weight while the splat and the merge kept theirs: direct light counted about twice on every
+emit-sampled path. This is not a hair bug: on the bare floor+sphere scene with NO fur mode U read
+1.0800 on the sphere and 1.0436 whole-frame against mode R (D: 1.0020 / 1.0000). Transparent fur
+only amplified it, because a blocked NEE hands its share to exactly the over-weighted strategy
+(the whole-frame probe: emit x1.75, merge x1.11, splat x1.04 against NEE x0.89 — gains 2.4x the
+loss). The hero bundle was not involved (`-heroc 1`: 1.2257). Host and device twins fixed. The
+GPU VCM path declines a hair scene (falls back to CPU), so the device twin was validated on the
+bare scene against R: whole 1.0002, sphere 1.0048 (were 1.0436 /
+1.0800). Every area-lit mode-U render gets ~4 % darker than 0.362.0 and now matches R and D.
+
+**M/S — the gather-area probe saw fur at any opacity.** `-pmradius 0.002` took S from 1.0557 to
+1.0145 with photon count and whole frame unchanged, which is a divisor, not transport.
+`gatherCoverageRaw` (M-GATHERAREA, on by default with 8 probes and shared by S) fires plain
+`closestHit` probes, so a fiber tube is geometry to it whatever its `opacity`: sides reject, tops
+count at 1/cos, coverage falls and the estimate is divided by it. A strand below opacity 1 is
+present with probability o, so the probe now passes straight through such a hit with probability
+(1 − o) — the same coin every walk tosses at a fiber — clearing the tube with the curve-only tmin
+and carrying the distance forward. Bit-identical for opaque fur (`o >= 1` breaks at once).
+`FTRACE_GATHERAREA=0` control: M 0.9859, S 0.9924.
+### VCM-EMITMIS — FIXED (0.363.0): mode `U` over-counted direct light on every area-lit scene
+
+The emitter-hit strategy's MIS weight used the directional emission pdf where the joint
+(position x direction x pick) density was required, under-weighting its splat/merge/connection
+alternatives by the emitter's area. Bare floor+sphere+area-light: U/R 1.0436 whole-frame, 1.0800
+on the sphere, before; 1.0017 / 1.0081 after. Found through the
+HAIR-MODES invisibility null (which amplified it to +25 %), fixed in `vcm.h` and its device twin
+in `render_cuda.cu`. Details under HAIR-MODES.
+
 ### HAIR-TEMPORAL — MEASURED, and the obvious fix does NOT work (2026-09-21)
 
 Hair noise is essentially FULLY DECORRELATED between frames of a moving camera, and the
@@ -9230,6 +9272,11 @@ pdf), `src/render_cuda.cu`. Measured by `scraps/sunspike.sh` + `scraps/robust_ro
 `scenes/_spec_repro.ftsl` is the four-sphere isolation rig.
 
 ### M-GATHERAREA — **FIXED in modes `M` and `S`, host and device** (mode `M` v0.267.0–0.268.0, mode `S` v0.273.1, the fur case v0.277.0; filed 2026-09-05, v0.253.0; **reframed 2026-09-10** — it is not a one-directional error). **Remaining: fur (+7.2 against the anchor, a DIFFERENT mechanism — the gather ball reaching across strands) and a ~4–8 point residual on cloth and a cap edge. The dense-fur overfill case is CLOSED (v0.277.0's fiber gate), and v0.278.0 closed the probe/query domain mismatch, taking mean absolute error from 10.8 to 8.0 while making the estimator nearly independent of the probe count.** mode `M`'s direct density estimate divides by the area of a **full disc**, which is wrong in BOTH directions — too dark where the disc is partly empty (cloth, hair, marble), too bright where a tangle **overfills** it (dense fur)
+
+**0.363.0 — opacity.** The probe (`gatherCoverageRaw`) treated a fiber tube as geometry at any
+`opacity`; it now passes through a strand with probability (1 − o), so fur that is invisible to
+the transport is invisible to the divisor too (M +2.3 %, S +5.6 % on `opacity 0` fur -> see
+HAIR-MODES). Opaque fur is bit-identical.
 
 > **Read the reframing before adding an experiment.** This entry was written as "mode `M` is too
 > dark", and that framing selected its own evidence for a year: every ROI anyone chose was one

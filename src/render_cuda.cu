@@ -16277,7 +16277,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                         if (em.area > 0.0 && sc.totalPower > 0.0 && edges >= 2) {
                             double pdfChoice = em.power / sc.totalPower;
                             double directPdfA = pdfChoice / em.area;
-                            double emissionPdfW = pdfChoice * cosLight / DPI;
+                            double emissionPdfW = pdfChoice * cosLight / (DPI * em.area);   // joint density (see vcm.h)
                             double wCamera = directPdfA * dVCM + emissionPdfW * dVC;
                             misW = 1.0 / (1.0 + wCamera);
                         }
