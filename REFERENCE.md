@@ -2023,10 +2023,18 @@ Two practical notes:
   to evaluate against; a strand is treated like a glossy surface there. Hair runs **on the
   GPU** in the forward modes (`A`/`B`/`C`) and the backward tracer (`R`, `W`) — and the
   modes composed from them (`V`, `P`) — since 0.181.0: on `hair_basics`, GPU mode `R` is
-  ~20× the CPU and mode `B` ~6×. Renders that still fall back to the CPU tracer:
-  `-dual-scatter` (the approximation is host-side), and hair scenes in the GPU BDPT (`D`),
-  photon-map (`M`/`S`) and VCM (`U`) backends, whose vertex/gather machinery would shade a
-  strand as Lambertian.
+  ~20× the CPU and mode `B` ~6×. Mode `U` (VCM) runs hair on the GPU too, since 0.364.0:
+  its light and camera kernels carry the fiber BCSDF (scatter, connections, splats, NEE,
+  the coverage pass-through), the exact tube clearance and the strand merge exclusion,
+  exactly as `vcm.h` does; a 30 000-strand opaque groom renders on the GPU in about a
+  fifth of the CPU time. 0.364.0 also brought the bidirectional modes (`D`, `U`) to within
+  about a percent of mode `R` whole-frame on opaque hair — they had been up to 1.7× too
+  bright on dense grooms — and recorded the discrepancy that remains in the hair model
+  itself: modes `R` and `B` disagree by a few percent on the fur of a dense groom, and `D`/`U`
+  read a few percent under `R` there (`known-issues.md`, HAIR-RECIPROCITY).
+  Renders that still fall back to the CPU tracer: `-dual-scatter` (the approximation is
+  host-side), and hair scenes in the GPU BDPT (`D`) and photon-map (`M`/`S`) backends, whose
+  vertex/gather machinery would shade a strand as Lambertian.
 
 See `scenes/hair_basics.ftsl`.
 

@@ -106,8 +106,7 @@ inline Vec3 offsetOrigin(const Vec3& p, const Vec3& ng, const Vec3& dir) {
 // Stepping a couple of diameters clears the tube and displaces nothing visible. Returns 0
 // (and so degrades to offsetOrigin) for every non-fiber vertex and for the near side.
 inline double fiberStep(const Hit& h, bool isHair, const Vec3& dir) {
-    return (isHair && h.fiberRadius > 0.0 && dot(h.n, dir) < 0.0)
-               ? 2.5 * h.fiberRadius + 1e-9 : 0.0;
+    return isHair ? hairChordExit(h.fiberRadius, h.n, h.tangent, dir) : 0.0;   // the exact chord (0.364.0)
 }
 inline Vec3 fiberOrigin(const Hit& h, bool isHair, const Vec3& dir) {
     const double s = fiberStep(h, isHair, dir);
@@ -286,14 +285,19 @@ inline void misArrival(double dist, double cosThetaIn, double& dVCM, double& dVC
 // weight factors. `specular` selects the delta branch (no connection/merge through it).
 inline void misScatter(bool specular, double cosThetaOut, double bsdfDirPdfW, double bsdfRevPdfW,
                        double misVcWeight, double misVmWeight,
-                       double& dVCM, double& dVC, double& dVM) {
+                       double& dVCM, double& dVC, double& dVM, bool mergeable = true) {
     if (specular) {
         dVCM = 0.0;
         dVC *= Mis(cosThetaOut);
         dVM *= Mis(cosThetaOut);
     } else {
-        dVC = Mis(cosThetaOut / bsdfDirPdfW) * (dVC * Mis(bsdfRevPdfW) + dVCM + misVmWeight);
-        dVM = Mis(cosThetaOut / bsdfDirPdfW) * (dVM * Mis(bsdfRevPdfW) + dVCM * misVcWeight + 1.0);
+        // `mergeable == false`: this vertex is not a merge site (a strand -- see the merge
+        // loop), so the merge-at-this-vertex alternative must not enter anyone's weight.
+        // dVM is dVC in units of 1/etaVCM, so the two terms are the same alternative.
+        const double vmHere = mergeable ? misVmWeight : 0.0;
+        const double vmOne  = mergeable ? 1.0 : 0.0;
+        dVC = Mis(cosThetaOut / bsdfDirPdfW) * (dVC * Mis(bsdfRevPdfW) + dVCM + vmHere);
+        dVM = Mis(cosThetaOut / bsdfDirPdfW) * (dVM * Mis(bsdfRevPdfW) + dVCM * misVcWeight + vmOne);
         dVCM = Mis(1.0 / bsdfDirPdfW);
     }
 }
@@ -330,7 +334,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
                           MediumStack& stk,
                           const double* lamAll = nullptr, int nUp = 1,
                           double* secF = nullptr, bool* secChromatic = nullptr,
-                          bool* keepBundle = nullptr) {
+                          bool* keepBundle = nullptr, bool importance = false) {
     const Vec3 ns = h.n;
     const Vec3 wo = normalize(rayDir * -1.0);
     wi = Vec3{0, 0, 0}; betaFactor = 0.0; pdfW = 0.0; pdfRevW = 0.0; cosThetaOut = 0.0;
@@ -424,18 +428,36 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             delta = passThru;
             if (passThru && keepBundle) *keepBundle = true;
             const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
-            betaFactor = clamp01(fv * cosLong / pdfH);   // == T = sum_p A_p (hair.h)
-            // sigma_a is per-λ, so each secondary re-evaluates its own fiber along the
-            // hero's sampled direction; the bundle survives a strand rather than de-heroing.
-            if (nSec) {
-                *secChromatic = true;
-                for (int i = 0; i < nSec; ++i) {
-                    // Achromatic: the ray missed the fiber, so every wavelength continues at
-                    // 1. Re-evaluating would return the coverage-scaled scatter value -- 0 at
-                    // opacity 0 -- and extinguish the bundle at a fiber never touched.
-                    if (passThru) { secF[i] = 1.0; continue; }
-                    const HairShade hsi = hairShadeAt(scene, *mp, h, lamAll[i + 1], wo);
-                    secF[i] = hairFCos(hsi, wi) / pdfH;
+            // ADJOINT (0.364.0). A LIGHT walk must weight a fiber scatter with the adjoint of the SAME
+            // surface BSDF the connections and splats evaluate -- bsdfFAdjoint(arrival -> new) times the
+            // new direction's surface cosine over the pdf -- not the camera walk's f*cosLong(new)/pdf.
+            // The two are different pointwise functions of this BCSDF that agree only in integral; mode
+            // B is all flux-form and mode R all radiance-form, so each is unbiased alone, but a walk in
+            // one form MIS-combined with connections in the other is biased for the same path (measured:
+            // +4-8 % on isolated fibers, +28-56 % on the fur of a 30 000-strand groom, against R). No
+            // clamp: the ratio of the two conventions legitimately exceeds 1.
+            if (importance && !passThru) {
+                const double cosN = std::fabs(dot(wi, ns));
+                betaFactor = bdpt::bsdfFAdjoint(*mp, ns, wo, wi, lambda, scene, &h) * cosN / pdfH;
+                if (nSec) {
+                    *secChromatic = true;
+                    for (int i = 0; i < nSec; ++i)
+                        secF[i] = bdpt::bsdfFAdjoint(*mp, ns, wo, wi, lamAll[i + 1], scene, &h) * cosN / pdfH;
+                }
+            } else {
+                betaFactor = clamp01(fv * cosLong / pdfH);   // == T = sum_p A_p (hair.h)
+                // sigma_a is per-λ, so each secondary re-evaluates its own fiber along the
+                // hero's sampled direction; the bundle survives a strand rather than de-heroing.
+                if (nSec) {
+                    *secChromatic = true;
+                    for (int i = 0; i < nSec; ++i) {
+                        // Achromatic: the ray missed the fiber, so every wavelength continues at
+                        // 1. Re-evaluating would return the coverage-scaled scatter value -- 0 at
+                        // opacity 0 -- and extinguish the bundle at a fiber never touched.
+                        if (passThru) { secF[i] = 1.0; continue; }
+                        const HairShade hsi = hairShadeAt(scene, *mp, h, lamAll[i + 1], wo);
+                        secF[i] = hairFCos(hsi, wi) / pdfH;
+                    }
                 }
             }
             break;
@@ -782,7 +804,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                                 double imgToSolid = imgPtDist * imgPtDist / cosAtCamera;
                                 double imgToSurf = imgToSolid * std::fabs(cosToCamera) / dist2c;
                                 double wLight = Mis(imgToSurf / ctx.nLightPaths) *
-                                                (ctx.misVmWeight + dVCM + dVC * Mis(bsdfRevPdfW));
+                                                ((isHairV ? 0.0 : ctx.misVmWeight) + dVCM + dVC * Mis(bsdfRevPdfW));
                                 double misW = 1.0 / (wLight + 1.0);
                                 // contrib = misW * beta * f * (cameraAreaPdf / nLightPaths).
                                 // The MIS weight and every density above are the HERO's
@@ -810,7 +832,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         double secF[hero::kHeroMax - 1]; bool secChromatic = false, keepBundle = false;
         scatterSample(scene, mats, mp, h, rd, lambda, rng, wi, betaFactor, pdfW, pdfRevW,
                       cosThetaOut, delta, terminate, stk,
-                      hb.lam, nUp, secF, &secChromatic, &keepBundle);
+                      hb.lam, nUp, secF, &secChromatic, &keepBundle, /*importance=*/true);
         // Kill the walk only when EVERY live wavelength is dead (hero.h policy 3). With
         // nUp == 1 the loop is empty and mxF == betaFactor: the old scalar test exactly.
         double mxF = betaFactor;
@@ -819,7 +841,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) return;
 
         misScatter(delta, cosThetaOut, pdfW, pdfRevW, ctx.misVcWeight, ctx.misVmWeight,
-                   dVCM, dVC, dVM);
+                   dVCM, dVC, dVM, /*mergeable=*/mp->type != MatType::Hair);
         beta *= betaFactor;
         for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= secChromatic ? secF[i] : betaFactor;
         if (!delta) {
@@ -1102,7 +1124,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                                                         : Mis(bsdfDirPdfW / (pdfChoice * directPdfW));
                                 double wCamera = Mis(emissionPdfW * std::fabs(cosToLight) /
                                                      (directPdfW * cosAtLight)) *
-                                                 (ctx.misVmWeight + dVCM + dVC * Mis(bsdfRevPdfW));
+                                                 ((mp->type == MatType::Hair ? 0.0 : ctx.misVmWeight) + dVCM + dVC * Mis(bsdfRevPdfW));
                                 double misW = 1.0 / (wLight + 1.0 + wCamera);
                                 double k = misW * std::fabs(cosToLight) / (pdfChoice * directPdfW) * visL;
                                 Vec3 add = cie * (beta * k * Le * f);
@@ -1172,8 +1194,10 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 double litRevPdfW = bsdfPdf(*lv.mat, lv.ns, w * -1.0, lv.wo, lambda, scene, &lv.hit);
                 double camDirPdfA = camDirPdfW * std::fabs(cosLit) / dist2;
                 double litDirPdfA = litDirPdfW * std::fabs(cosCam) / dist2;
-                double wLight = Mis(camDirPdfA) * (ctx.misVmWeight + lv.dVCM + lv.dVC * Mis(litRevPdfW));
-                double wCamera = Mis(litDirPdfA) * (ctx.misVmWeight + dVCM + dVC * Mis(camRevPdfW));
+                const double vmLit = (lv.mat && lv.mat->type == MatType::Hair) ? 0.0 : ctx.misVmWeight;   // no merge AT a strand
+                const double vmCam = (mp->type == MatType::Hair) ? 0.0 : ctx.misVmWeight;
+                double wLight = Mis(camDirPdfA) * (vmLit + lv.dVCM + lv.dVC * Mis(litRevPdfW));
+                double wCamera = Mis(litDirPdfA) * (vmCam + dVCM + dVC * Mis(camRevPdfW));
                 double misW = 1.0 / (wLight + 1.0 + wCamera);
                 double visV = 0.0;
                 {   // Either end may be a strand; clear both tubes (0 for non-fibers).
@@ -1198,7 +1222,12 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
             }
 
             // (d) Vertex merging: gather nearby light vertices from ALL paths (XYZ estimate).
-            if (ctx.vmNorm > 0.0) {
+            // Not AT a strand, in either role: a stored fiber vertex is never merged with (below)
+            // and a fiber camera vertex never gathers -- a skin photon is not light that landed on
+            // the hair. Every MIS weight excludes the merge at a fiber vertex to match (misScatter
+            // `mergeable`, and the NEE / splat / VC terms). Measured before this: a 30 000-strand
+            // groom read 0.40 of modes R and B; 3 000 strands 0.99 (0.364.0).
+            if (ctx.vmNorm > 0.0 && mp->type != MatType::Hair) {
                 Vec3 mergeXYZ{0, 0, 0};
                 grid.query(lightVerts, h.p, ctx.radius, [&](int idx) {
                     const LightVertex& lv = lightVerts[idx];
@@ -1272,7 +1301,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) return result;
 
         misScatter(delta, cosThetaOut, pdfW, pdfRevW, ctx.misVcWeight, ctx.misVmWeight,
-                   dVCM, dVC, dVM);
+                   dVCM, dVC, dVM, /*mergeable=*/mp->type != MatType::Hair);
         beta *= betaFactor;
         for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= secChromatic ? secF[i] : betaFactor;
         if (!delta) camAllDelta = false;        // disqualifies the escaped-sun strategy

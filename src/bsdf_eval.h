@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdlib>
 // ============================================================================================
 //  bsdf_eval.h -- the EVALUABLE half of the material model: f(wo, wi) and its sampling density.
 // ============================================================================================
@@ -177,8 +178,17 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
 //
 // A reciprocal BSDF (Diffuse's rho/PI, DiffuseTransmit) is unchanged by the swap, so switching a
 // site from bsdfF to this is a no-op for them and cannot perturb a diffuse scene.
+// FTRACE_HAIR_ADJSWAP=0: evaluate a fiber's light-end BSDF in arrival->outgoing order instead of
+// the swap below. An A/B, off by default: measured in 0.364.0 the unswapped order read 1.058 of
+// mode R against the swap's 1.037 on a 3 000-strand fur ball (before the exact-chord clearance
+// landed), so the swap is kept; see known-issues BIDIR-HAIR-ADJOINT.
+inline bool hairAdjointSwap() {
+    static const bool s = [] { const char* e = std::getenv("FTRACE_HAIR_ADJSWAP"); return !(e && e[0] == '0'); }();
+    return s;
+}
 inline double bsdfFAdjoint(const Material& m, const Vec3& ns, const Vec3& wo, const Vec3& wi,
                            double lambda, const Scene& scene, const Hit* hitForTex) {
+    if (m.type == MatType::Hair && !hairAdjointSwap()) return bsdfF(m, ns, wo, wi, lambda, scene, hitForTex);
     return bsdfF(m, ns, wi, wo, lambda, scene, hitForTex);
 }
 

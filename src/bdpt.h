@@ -1091,21 +1091,38 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 // f*cos/pdf collapses exactly to T = sum_p A_p (see hair.h): the total
                 // Fresnel-and-Beer attenuation of the four lobes.
                 const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
-                betaFactor = clamp01(fv * cosLong / pdfH);
-                // Per-λ absorption means each secondary gets its OWN fiber evaluated along
-                // the hero's sampled direction: f_i*cos/pdf_hero. Unlike the unidirectional
-                // tracers (which de-hero at a strand), the bundle survives a fiber here —
-                // and a fiber is precisely where the spectral spread is interesting, since
-                // sigma_a is what colours the TT/TRT lobes.
-                secChromatic = true;
-                for (int i = 0; i + 1 < nUp; ++i) {
-                    // A pass-through is ACHROMATIC -- the ray missed the fiber, so every
-                    // wavelength continues at weight 1. Re-evaluating the BCSDF here would
-                    // return the coverage-scaled scatter value (0 at `opacity 0`) and
-                    // extinguish the bundle at a fiber it never touched.
-                    if (passThru) { secF[i] = 1.0; continue; }
-                    const HairShade hsi = hairAt(scene, *mp, h, hb.lam[i + 1], wo);
-                    secF[i] = hairFCos(hsi, wi) / pdfH;
+                // ADJOINT (0.364.0). A LIGHT walk must weight a fiber scatter with the adjoint of the SAME
+                // surface BSDF the connections and splats evaluate -- bsdfFAdjoint(arrival -> new) times the
+                // new direction's surface cosine over the pdf -- not the camera walk's f*cosLong(new)/pdf.
+                // The two are different pointwise functions of this BCSDF that agree only in integral; mode
+                // B is all flux-form and mode R all radiance-form, so each is unbiased alone, but a walk in
+                // one form MIS-combined with connections in the other is biased for the same path (measured:
+                // +4-8 % on isolated fibers, +28-56 % on the fur of a 30 000-strand groom, against R). No
+                // clamp: the ratio of the two conventions legitimately exceeds 1.
+                if (mode == Mode::Importance && !passThru) {
+                    const Vec3 wiN = normalize(wi);
+                    const double cosN = std::fabs(dot(wiN, cur.ns));
+                    betaFactor = bsdfFAdjoint(*mp, cur.ns, wo, wiN, lambda, scene, &h) * cosN / pdfH;
+                    secChromatic = true;
+                    for (int i = 0; i + 1 < nUp; ++i)
+                        secF[i] = bsdfFAdjoint(*mp, cur.ns, wo, wiN, hb.lam[i + 1], scene, &h) * cosN / pdfH;
+                } else {
+                    betaFactor = clamp01(fv * cosLong / pdfH);
+                    // Per-λ absorption means each secondary gets its OWN fiber evaluated along
+                    // the hero's sampled direction: f_i*cos/pdf_hero. Unlike the unidirectional
+                    // tracers (which de-hero at a strand), the bundle survives a fiber here —
+                    // and a fiber is precisely where the spectral spread is interesting, since
+                    // sigma_a is what colours the TT/TRT lobes.
+                    secChromatic = true;
+                    for (int i = 0; i + 1 < nUp; ++i) {
+                        // A pass-through is ACHROMATIC -- the ray missed the fiber, so every
+                        // wavelength continues at weight 1. Re-evaluating the BCSDF here would
+                        // return the coverage-scaled scatter value (0 at `opacity 0`) and
+                        // extinguish the bundle at a fiber it never touched.
+                        if (passThru) { secF[i] = 1.0; continue; }
+                        const HairShade hsi = hairAt(scene, *mp, h, hb.lam[i + 1], wo);
+                        secF[i] = hairFCos(hsi, wi) / pdfH;
+                    }
                 }
                 break;
             }
@@ -1270,7 +1287,8 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                               dot(wi, cur.ns) < 0.0;
         double sgn = dot(wi, cur.ng) >= 0.0 ? 1.0 : -1.0;
         ray = fiberFar
-                  ? Ray{cur.p + normalize(wi) * 1e-9, normalize(wi), 2.5 * h.fiberRadius + 1e-9}
+                  ? Ray{cur.p + normalize(wi) * 1e-9, normalize(wi),
+                        hairChordExit(h.fiberRadius, h.n, h.tangent, normalize(wi))}   // the exact chord (0.364.0)
                   : Ray{cur.p + cur.ng * (sgn * 1e-6), normalize(wi)};
         pdfFwd = delta ? 0.0 : pdfW;
     }
@@ -2745,7 +2763,7 @@ inline Vec3 connOrigin(const Vertex& v, const Vec3& dir) {
 inline double connFiberStep(const Vertex& v, const Vec3& dir) {
     if (v.type != VType::Medium && v.mat && v.mat->type == MatType::Hair &&
         v.hit.fiberRadius > 0.0 && dot(v.ns, dir) < 0.0)
-        return 2.5 * v.hit.fiberRadius + 1e-9;
+        return hairChordExit(v.hit.fiberRadius, v.ns, v.hit.tangent, dir);   // the exact chord (0.364.0)
     return 0.0;
 }
 
@@ -2755,7 +2773,7 @@ inline double connFiberStep(const Vertex& v, const Vec3& dir) {
 inline double connShorten(const Vertex& v, const Vec3& dir, double eps) {
     if (v.type != VType::Medium && v.mat && v.mat->type == MatType::Hair &&
         v.hit.fiberRadius > 0.0 && dot(v.ns, dir) < 0.0)
-        return 2.5 * v.hit.fiberRadius + 1e-9 + eps;
+        return hairChordExit(v.hit.fiberRadius, v.ns, v.hit.tangent, dir) + eps;
     return eps;
 }
 

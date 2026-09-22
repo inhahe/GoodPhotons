@@ -4988,6 +4988,90 @@ on the sphere, before; 1.0017 / 1.0081 after. Found through the
 HAIR-MODES invisibility null (which amplified it to +25 %), fixed in `vcm.h` and its device twin
 in `render_cuda.cu`. Details under HAIR-MODES.
 
+### HAIR-RECIPROCITY — OPEN (found 0.364.0): modes `R` and `B` disagree on the fur of a dense groom
+
+The fiber BCSDF has two equally natural per-vertex factors: the radiance form (mode `R`'s NEE and
+walk: `hairFCos(arrival, wi)` with the longitudinal cosine of the light direction) and the flux
+form (mode `B`'s photon walk and splat: the same expression with the roles reversed). For a
+reciprocal BCSDF these are one function; for this implementation — `h` from the arrival
+direction, Marschner's attenuation from the arrival angle — they are different pointwise
+functions that agree only in integral. Measured with tightened budgets (R 1024 spp, B 1.2 G
+photons): B/R **1.0037 whole, 1.0572 on the fur** of a 30 000-strand groom; 3 000 strands
+1.0007 / 1.0306 (the latter noisy). Neither is wrong by construction — each is unbiased for its own
+integrand — but a physical fiber is reciprocal, so at most one of them is the truth. Not touched
+here: it lives in `hair.h`, and both are within a few percent on anything but dense fur. The
+bidirectional modes below now follow `R`.
+
+### BIDIR-HAIR-MIXED-FORMS — FIXED (0.364.0): modes `D` and `U` combined the two fiber forms and were biased, up to 1.7x on dense hair
+
+Three defects, found in order while validating the GPU port (GPU-VCM-HAIR below) on a
+30 000-strand groom against modes R and B, each isolated by measurement:
+
+1. **A strand was a phantom merge site in mode `U`'s weights.** 0.362.0 stopped merging with
+   light vertices stored on strands but left that merge counted as an available alternative in
+   every other strategy's MIS weight (the `misVmWeight` added to `dVC` per vertex and its `+1`
+   twin in `dVM`, the NEE / splat / VC terms), and still gathered at hair CAMERA vertices.
+   Weight leaked to a technique that never fires; with defect 3 it netted **0.40** of R/B on the
+   groom (3 000 strands read 0.99 — the errors cancelled). `misScatter` takes `mergeable`, the
+   direct weight terms zero at a strand, and the camera walk does not gather at one. CPU and
+   device.
+2. **The 2.5 r far-side clearance skipped neighbouring strands.** Every fiber exit and every
+   fiber-end shadow ray cleared a fixed 2.5 r as a curve-only tmin — a quarter millimetre, a
+   whole strand spacing in a dense groom — and `D`/`U` apply it at BOTH ends of vertex
+   connections a millimetre long, so connections passed through the strands in between; it
+   also under-cleared grazing exits, which re-hit their own far wall. Replaced everywhere (R, B,
+   D, U, M, S, both backends) by the exact chord through the tube, `2 r (−n·w) / (1 − (w·t)²)`
+   (`hairChordExit` / `dHairChordExit`), which clears the strand's own body and nothing else.
+   Groom fur D/B 1.69 → 1.28.
+3. **The light walks used the flux form, the connections the radiance form.** `D`/`U`'s
+   light walks weighted a fiber scatter with `f·cosLong(new)/pdf` (mode B's form) while their
+   splats and connection ends evaluated `bsdfFAdjoint` (the swap: mode R's form). The two are
+   the different pointwise functions of HAIR-RECIPROCITY; each alone is unbiased, but
+   MIS-combining strategies whose integrands differ pointwise for the same path is not. Pinned
+   by a scene of 150 thick, well-separated fibers (no inter-fiber transport): D/R 1.010 whole,
+   +4–8 % on the fiber rows at 4096 spp, unchanged by `-heroc 1`, and worse (ROI 1.22) with the
+   swap removed. The light walks now use the adjoint of the same surface BSDF the connections
+   evaluate — `bsdfFAdjoint(arrival → new)·|cos_n(new)|/pdf`, no clamp — in `bdpt.h`
+   (Importance mode), `vcm.h` (`scatterSample(importance)`) and the device light kernel. This
+   is the consistent choice, not an exact one: the two forms bracket R almost symmetrically
+   (isolated fiber rows +4.4 % in the flux form, −4.5 % in this one; the dense groom's fur +72 %
+   against −10 %, stable from 64 to 256 spp), which is the model's own non-reciprocity
+   (HAIR-RECIPROCITY) showing through — a per-entry-side BCSDF has no side-independent
+   surface form for a bidirectional integrator to agree with mode R on pointwise.
+
+After, against R (whole-frame within ~1 % on all three scenes): thick fibers D 0.9948 / U-cpu 0.9949 / U-gpu 0.9927 (whole; ROI 0.9550 / 0.9603 / 0.9315);
+3 000-strand fur D 0.9922 / U-cpu 0.9923 / U-gpu 0.9990 (whole); 30 000-strand groom fur D 0.8966 / U-cpu 0.9105 / U-gpu 1.0162 (whole 0.9849 / 0.9845 / 1.0001). Opacity-0 nulls: D 0.9716 / 0.9991, U-cpu 0.9843 / 0.9992, U-gpu 0.9951 / 1.0001 (ROI / whole). Non-hair scenes are bit-identical.
+Also measured and kept as is: the `bsdfFAdjoint` argument swap for a fiber (A/B behind
+`FTRACE_HAIR_ADJSWAP=0`: unswapped reads 1.040 vs 1.0245 of R on the 3 000-strand fur).
+
+### GPU-VCM-HAIR — DONE (0.364.0): mode `U` renders hair on the GPU
+
+`cudaVcmSupported` inherited BDPT's `sceneUsesHairMaterial` reject, so every hair scene ran mode
+`U` on the CPU (the fallback was silent but for one `[device]` line). The device side already
+had the fiber BCSDF (`dhair`), the curve intersector filling `DHit::tangent/fiberRadius`, and
+`occluded()`/`closestHit()` with a curve-only tmin; what `kVcmLightT` / `kVcmCameraT` lacked was
+every hair-specific site of `vcm.h`, now twinned one for one:
+
+- `dVcmScatter` Hair case (sample, pass-through as delta + keepBundle, per-λ secondaries, the
+  adjoint form on the light side);
+- `dBsdfF` / `dBsdfPdf` Hair branches (bsdf_eval.h conventions), which needed the fiber frame at
+  a stored vertex — `DVertex` and `DVcmLV` now carry `tangent` + `fiberR` (the light-vertex slab
+  grows 136 → 152 B);
+- `dConnectibleType` / `dTwoSidedType` include `D_HAIR`, so strands are stored, splat and
+  connected to, as on the CPU;
+- the splat, NEE and VC shadow rays clear a strand's own tube through `occludedTo`'s new
+  `curveTmin` (`dFiberStep`, the `fiberStep` twin; the VC also stops short of a far-side light
+  vertex), and both walks' continuation hops use an ULP nudge + curve-only tmin after a far-side
+  exit (RAY_EPS is a whole strand in FP32);
+- the three fixes of BIDIR-HAIR-MIXED-FORMS, on both backends;
+- the gate split: `cudaBidirCoreSupported` is shared, BDPT still adds `!sceneUsesHairMaterial`
+  (mode `D`'s device kernels have no hair case), VCM does not.
+
+Measured: the groom above, GPU 18 s vs CPU 105 s for mode U at 64 spp (mode D 48 s); the opacity-0 null on the GPU 0.9951 / 1.0001; a non-hair scene is bit-identical to the pre-port device binary. Alice's scenes are environment-lit,
+which mode U does not take on either backend, so the groom is the dense-hair check. Opaque
+fur's sphere ROI scatters ±8–16 % seed to seed at 512 spp (merge fireflies), so parity there is
+read whole-frame.
+
 ### HAIR-TEMPORAL — MEASURED, and the obvious fix does NOT work (2026-09-21)
 
 Hair noise is essentially FULLY DECORRELATED between frames of a moving camera, and the

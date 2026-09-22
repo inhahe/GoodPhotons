@@ -147,9 +147,29 @@ inline double hairFCos(const HairShade& s, const Vec3& wWorld) {
 // a light-coloured coat. Stepping a couple of diameters clears the tube (strand radii are
 // microns, so this displaces nothing visible), and on a non-fiber hit — where fiberRadius
 // is 0 — it degrades to the ordinary 1e-6 surface offset.
+// The distance a ray leaving a strand's surface point along `w` travels INSIDE the tube before
+// it exits through the far wall -- the chord of a cylinder of radius r about `axis`, entered at
+// a surface point whose outward radial normal is `n`: 2 r (-n.w) / (1 - (w.axis)^2). This is
+// the clearance a far-side exit (TT / TRT, a coverage pass-through) needs to skip its own tube
+// and NOTHING ELSE. The 2.5 r it replaces (0.364.0) was a heuristic that skipped every
+// neighbouring strand within a quarter millimetre of the exit -- a whole fiber's spacing in a
+// dense groom, and modes D and U apply it at BOTH ends of a vertex connection a millimetre
+// long (measured: 1.7x modes R and B on a 30 000-strand groom) -- and under-cleared a grazing
+// exit, which then re-hit its own far wall and scattered twice. A 5 % margin covers the
+// cone's taper and FP; a cap of 20 r bounds the near-axial case, whose true chord runs the
+// length of the strand. 0 on the near side and off a strand.
+inline double hairChordExit(double r, const Vec3& n, const Vec3& axis, const Vec3& w) {
+    const double c = dot(n, w);
+    if (c >= 0.0 || !(r > 0.0)) return 0.0;
+    const double a = dot(axis, w);
+    double s2 = 1.0 - a * a; if (s2 < 1e-6) s2 = 1e-6;
+    const double chord = 2.0 * r * (-c) / s2 * 1.05 + 1e-9;
+    const double cap = 20.0 * r;
+    return chord < cap ? chord : cap;
+}
 inline double hairExitOffset(const HairShade& s, const Vec3& n, const Vec3& w) {
     if (dot(n, w) >= 0.0) return 1e-6;              // leaving on the arrival side: normal case
-    return (s.radius > 0.0) ? 2.5 * s.radius + 1e-9 : 1e-6;
+    return (s.radius > 0.0) ? hairChordExit(s.radius, n, s.fr.x, w) : 1e-6;
 }
 
 // ---- Dual scattering (P3 stage 4) --------------------------------------------------

@@ -3868,11 +3868,12 @@ __device__ static inline double dMaxAbs(const DVec3& p) {
 // coordinates via connMaxT's coordMag term. Only the occlusion query is re-aimed; the
 // estimator's G, pdfs and directions are untouched.
 __device__ static inline bool occludedTo(const DScene& sc, const DVec3& o, const DVec3& target,
-                                         double absEps, Real tmin = RAY_EPS, bool camLeg = false) {
+                                         double absEps, Real tmin = RAY_EPS, bool camLeg = false,
+                                         Real curveTmin = (Real)0) {
     DVec3 tv = target - o;
     const Real td = length(tv);
     if (!(td > (Real)0)) return false;
-    return occluded(sc, o, tv / td, connMaxT((double)td, absEps, dMaxAbs(target)), tmin, camLeg);
+    return occluded(sc, o, tv / td, connMaxT((double)td, absEps, dMaxAbs(target)), tmin, camLeg, curveTmin);
 }
 
 // ---- `cavity` pattern variable (O3 stage 2) — device twin of scene.h cavityAt ----
@@ -5017,13 +5018,38 @@ __device__ static inline Real dHairFCos(const DHairShade& s, const DVec3& wWorld
     const double cosLong = dhair::safeSqrt(1.0 - dhair::sqr(dhair::clampd(wl.x, -1.0, 1.0)));
     return (Real)(dhair::f(s.b, s.woLocal, wl) * cosLong);
 }
+// bsdf_eval.h hairCosGuard twin: the connection evaluators pre-divide the fiber's f by |cos(ns,wi)|
+// so the caller's cosine yields the longitudinal projection a round strand presents; guard the
+// grazing denominator exactly as the host does.
+__device__ static inline double dHairCosGuard(double c) { return (c < 1e-7) ? 1e-7 : c; }
+// vcm.h fiberStep twin. A fiber's TT / TRT lobes leave through the FAR side of a tube microns
+// across, where the usual normal nudge lands INSIDE the hair and a shadow ray reports itself
+// occluded by the strand it just left. The clearance rides as occluded()/closestHit's curve-only
+// tmin (never an origin move): 0 off a fiber and on the near side.
+// hair_shade.h hairChordExit twin: the distance a ray leaving a strand's surface along `w`
+// travels INSIDE the tube before it exits through the far wall -- the chord of a cylinder of
+// radius r about `axis`, entered at a point with outward radial normal `n`:
+// 2 r (-n.w) / (1 - (w.axis)^2). Clears the strand's own body and NOTHING ELSE. 0 on the near
+// side. 5 % margin for the cone's taper and FP; capped at 20 r for the near-axial case.
+__device__ static inline Real dHairChordExit(Real r, const DVec3& n, const DVec3& axis, const DVec3& w) {
+    const double c = (double)dot(n, w);
+    if (c >= 0.0 || !(r > (Real)0)) return (Real)0;
+    const double a = (double)dot(axis, w);
+    double s2 = 1.0 - a * a; if (s2 < 1e-6) s2 = 1e-6;
+    double chord = 2.0 * (double)r * (-c) / s2 * 1.05 + 1e-9;
+    const double cap = 20.0 * (double)r;
+    return (Real)(chord < cap ? chord : cap);
+}
+__device__ static inline Real dFiberStep(const DHit& h, bool isHair, const DVec3& dir) {
+    return isHair ? dHairChordExit(h.fiberRadius, h.n, h.tangent, dir) : (Real)0;
+}
 
 // How far a connection or scattered ray must step to clear the strand's own body: TT/TRT
 // exit the FAR side of a solid tube, so leaving against the arrival-side normal steps
 // 2.5 radii (or the ordinary RAY_EPS when that is larger — float-safe floor).
 __device__ static inline Real dHairExitOffset(const DHairShade& s, const DVec3& n, const DVec3& w) {
     if (dot(n, w) >= (Real)0) return RAY_EPS;        // leaving on the arrival side
-    return fmax(RAY_EPS, (Real)2.5 * s.radius);
+    return fmax(RAY_EPS, dHairChordExit(s.radius, n, s.fr.x, w));   // the exact chord (0.364.0)
 }
 
 // Fiber (D_HAIR) twin of connect(): mode-B pinhole splat from a hair vertex. Mirrors the
@@ -9866,6 +9892,8 @@ struct DVertex {
     double mediumG;             // HG asymmetry g at a BV_MEDIUM vertex
     int   mediumId;             // sc.media index at a BV_MEDIUM vertex (-1 otherwise)
     Real  u, v;                 // interpolated surface texcoords (per-hit BSDF eval, M9)
+    DVec3 tangent;              // fiber axis at a hair vertex: the BCSDF frame (mode U, 0.364.0)
+    Real  fiberR;               // fiber radius there (far-side shadow-ray clearance); 0 off a strand
     // Mean curvature at this vertex (O3). Carried for the same reason u/v are: the
     // connection BSDF is re-evaluated here from a reconstructed DHit, and a material
     // whose roughness/reflectance is driven by `curv` would otherwise read a DIFFERENT
@@ -9932,6 +9960,7 @@ __device__ static inline DHit dVertHit(const DVertex& vt) {
     h.p = vt.p; h.n = vt.ns; h.ng = vt.ng;
     h.matId = vt.matId; h.sensorId = -1;
     h.u = vt.u; h.v = vt.v; h.curv = vt.curv;
+    h.tangent = vt.tangent; h.fiberRadius = vt.fiberR;
     return h;
 }
 
@@ -9944,7 +9973,8 @@ __device__ static inline bool dOnSurface(const DVertex& v) {
     return v.type == BV_SURFACE || v.type == BV_LIGHT;
 }
 __device__ static inline bool dConnectibleType(int tp) {
-    return tp == D_DIFFUSE || tp == D_GLOSSY || tp == D_FLUORESCENT || tp == D_DIFFUSETRANSMIT;
+    return tp == D_DIFFUSE || tp == D_GLOSSY || tp == D_FLUORESCENT || tp == D_DIFFUSETRANSMIT ||
+           tp == D_HAIR;   // fiber BCSDF: narrow lobes, but finite (bsdf_eval.h isConnectibleMat)
 }
 
 // --- MODE J (UPBP): eta' of the merge technique at a medium vertex ----------------------
@@ -10046,7 +10076,7 @@ __device__ static inline double dGlossyExp(double roughness) {
 // A two-sided (transmissive) connectible material scatters into BOTH hemispheres, so a
 // connection edge on the side opposite the shading normal is legal (transmit lobe). Only
 // DiffuseTransmit qualifies (device twin of bdpt.h isTwoSidedMat).
-__device__ static inline bool dTwoSidedType(int tp) { return tp == D_DIFFUSETRANSMIT; }
+__device__ static inline bool dTwoSidedType(int tp) { return tp == D_DIFFUSETRANSMIT || tp == D_HAIR; }
 // Clamped reflect/transmit albedos of a DiffuseTransmit vertex (energy guard shared by
 // dBsdfF / dBsdfPdf / the scatter switch so MIS densities stay consistent; twin of
 // bdpt.h diffuseTransmitAlbedos). rhoR is the per-hit front lobe (texture-aware).
@@ -10089,6 +10119,12 @@ __device__ static double dBsdfF(const DScene& sc, const DVertex& vt,
         double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
         bool sameSide = (cosWi * cosWo) > 0.0;
         return (sameSide ? rhoR : rhoT) / DPI;
+    } else if (m.type == D_HAIR) {
+        // Fiber BCSDF (bsdf_eval.h bsdfF twin). The frame comes from the strand tangent the
+        // vertex carries; f is pre-divided by |cos(ns,wi)| (see dHairCosGuard).
+        DHit h = dVertHit(vt);
+        const DHairShade hs = dHairShadeAt(sc, m, h, lambda, wo);
+        return (double)dHairFCos(hs, wi) / dHairCosGuard(fabs(cosWi));
     }
     return 0.0;
 }
@@ -10122,6 +10158,12 @@ __device__ static double dBsdfPdf(const DScene& sc, const DVertex& vt,
         bool sameSide = (cosWi * cosWo) > 0.0;
         double pSel = sameSide ? rhoR / tot : rhoT / tot;
         return pSel * fabs(cosWi) / DPI;
+    } else if (m.type == D_HAIR) {
+        // The BCSDF's own sampling density in solid angle -- exactly what dhair::sample draws
+        // from, so MIS is consistent by construction (bsdf_eval.h bsdfPdf twin).
+        DHit h = dVertHit(vt);
+        const DHairShade hs = dHairShadeAt(sc, m, h, lambda, wo);
+        return dhair::pdf(hs.b, hs.woLocal, dhair::toLocal(hs.fr, wi));
     }
     return 0.0;
 }
@@ -15614,6 +15656,8 @@ struct DVcmLV {
                            // alignment (the slab goes 128 -> 136 B), which is the price
                            // of that consistency on the largest allocation in a session.
     int    nUp;            // hero wavelengths still live here (1 == de-hero'd / single-λ)
+    DVec3  tangent;        // fiber axis at a strand vertex (its BCSDF frame for VC / splats, 0.364.0)
+    Real   fiberR;         // fiber radius (far-side clearance of a connection that ends on it); 0 off a strand
 };
 
 // The SECONDARY hero wavelengths of a stored light vertex, one slot per secondary. Kept in a
@@ -15652,13 +15696,15 @@ __device__ static inline DVertex dVertFromHit(const DHit& h, int matId) {
     DVertex v; v.type = BV_SURFACE; v.p = h.p; v.ns = h.n; v.ng = h.ng;
     v.beta = 0; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0; v.matId = matId; v.lightIdx = -1;
     v.emitPatW = (Real)1;   // BSDF-only helper vertex; never read for emission
-    v.mediumG = 0; v.mediumId = -1; v.u = h.u; v.v = h.v; v.curv = h.curv; return v;
+    v.mediumG = 0; v.mediumId = -1; v.u = h.u; v.v = h.v; v.curv = h.curv;
+    v.tangent = h.tangent; v.fiberR = h.fiberRadius; return v;
 }
 __device__ static inline DVertex dVertFromLV(const DVcmLV& lv) {
     DVertex v; v.type = BV_SURFACE; v.p = lv.p; v.ns = lv.ns; v.ng = lv.ng;
     v.beta = 0; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0; v.matId = lv.matId; v.lightIdx = -1;
     v.emitPatW = (Real)1;   // BSDF-only helper vertex; never read for emission
-    v.mediumG = 0; v.mediumId = -1; v.u = lv.u; v.v = lv.v; v.curv = lv.curv; return v;
+    v.mediumG = 0; v.mediumId = -1; v.u = lv.u; v.v = lv.v; v.curv = lv.curv;
+    v.tangent = lv.tangent; v.fiberR = lv.fiberR; return v;
 }
 
 // Sample a scattering continuation at a surface vertex (device twin of vcm.h scatterSample).
@@ -15687,7 +15733,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
                                    double& cosThetaOut, bool& delta, bool& terminate,
                                    const Real* lamAll = nullptr, int nUp = 1,
                                    double* secF = nullptr, bool* secChromatic = nullptr,
-                                   bool* keepBundle = nullptr) {
+                                   bool* keepBundle = nullptr, bool importance = false) {
     DVertex vt = dVertFromHit(h, matId);
     const DVec3& ns = h.n;
     DVec3 wo = normalize(rd * (Real)(-1));
@@ -15751,6 +15797,55 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
                     double num = reflLobe ? rR   : rT;
                     double den = reflLobe ? rhoR : rhoT;
                     secF[i] = (den > 0.0) ? num * tot / den : 0.0;
+                }
+            }
+            break;
+        }
+        case D_HAIR: {
+            // Fiber BCSDF -- device twin of vcm.h scatterSample's Hair case. The lobes are narrow
+            // but finite, so a strand is connectible and mergeable (dConnectibleType); the COVERAGE
+            // pass-through (hair `opacity` < 1) returns EXACTLY -wo and is a delta lobe whose
+            // direction is the same for every λ, so it is flagged like a Mirror: delta AND keepBundle.
+            const DHairShade hs = dHairShadeAt(sc, m, h, lambda, wo);
+            double pdfH = 0.0, fv = 0.0;
+            const double u0 = rng.uniform(), u1 = rng.uniform(), u2 = rng.uniform(), u3 = rng.uniform();
+            const dhair::V3 wl = dhair::sample(hs.b, hs.woLocal, u0, u1, u2, u3, pdfH, fv);
+            if (!(pdfH > 0.0) || !(fv > 0.0)) { terminate = true; break; }
+            wi = dhair::toWorld(hs.fr, wl);
+            const bool passThru = (wl.x == -hs.woLocal.x && wl.y == -hs.woLocal.y &&
+                                   wl.z == -hs.woLocal.z);
+            pdfW    = pdfH;
+            pdfRevW = passThru ? pdfH : dBsdfPdf(sc, vt, wi, wo, lambda);
+            delta   = passThru;
+            if (passThru && keepBundle) *keepBundle = true;
+            // f*cos/pdf collapses to the total lobe attenuation (hair.h); exactly 1 for a pass-through.
+            const double cosLong = dhair::safeSqrt(1.0 - dhair::sqr(dhair::clampd(wl.x, -1.0, 1.0)));
+            // ADJOINT (0.364.0). A LIGHT walk must weight a fiber scatter with the adjoint of the SAME
+            // surface BSDF the connections and splats evaluate -- bsdfFAdjoint(arrival -> new) times the
+            // new direction's surface cosine over the pdf -- not the camera walk's f*cosLong(new)/pdf.
+            // The two are different pointwise functions of this BCSDF that agree only in integral; mode
+            // B is all flux-form and mode R all radiance-form, so each is unbiased alone, but a walk in
+            // one form MIS-combined with connections in the other is biased for the same path (measured:
+            // +4-8 % on isolated fibers, +28-56 % on the fur of a 30 000-strand groom, against R). No
+            // clamp: the ratio of the two conventions legitimately exceeds 1.
+            if (importance && !passThru) {
+                const double cosN = fabs(ddot(wi, ns));
+                betaFactor = dBsdfFAdjoint(sc, vt, wo, wi, lambda) * cosN / pdfH;
+                if (nSec) {
+                    *secChromatic = true;
+                    for (int i = 0; i < nSec; ++i)
+                        secF[i] = dBsdfFAdjoint(sc, vt, wo, wi, lamAll[i + 1]) * cosN / pdfH;
+                }
+            } else {
+                betaFactor = clamp01(fv * cosLong / pdfH);
+                // sigma_a is per-λ: each secondary re-evaluates its own fiber along the hero's direction.
+                if (nSec) {
+                    *secChromatic = true;
+                    for (int i = 0; i < nSec; ++i) {
+                        if (passThru) { secF[i] = 1.0; continue; }   // the ray missed the fiber at every λ
+                        const DHairShade hsi = dHairShadeAt(sc, m, h, lamAll[i + 1], wo);
+                        secF[i] = (double)dHairFCos(hsi, wi) / pdfH;
+                    }
                 }
             }
             break;
@@ -15971,9 +16066,10 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
         DVec3 ro = y + nOut * (Real)1e-6;
         DVec3 rd = dir;
         int stored = 0;
+        Real curveTmin = (Real)0;   // far-side fiber clearance for the NEXT hop (see the continuation)
 
         for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
-            DHit h = closestHit(sc, ro, rd);
+            DHit h = closestHit(sc, ro, rd, (curveTmin > (Real)0) ? (Real)0 : RAY_EPS, BIG, false, curveTmin);
             if (!h.valid) break;                          // escaped (no env in scope)
             {                                             // colored-glass Beer-Lambert (delta chains)
                 int cm = stk.topMat();
@@ -16020,6 +16116,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                     lv.cx = cieLx; lv.cy = cieLy; lv.cz = cieLz;
                     lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
                     lv.matId = matId; lv.edges = edges; lv.u = h.u; lv.v = h.v; lv.curv = h.curv;
+                    lv.tangent = h.tangent; lv.fiberR = h.fiberRadius;
                     lv.nUp = nUp;
                     lvSlab[i * vcmCap + stored] = lv;
                     if (NS > 0 && lvSec) {
@@ -16046,7 +16143,8 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                                 // Shadow ray first, BSDF eval after (bit-identical: no RNG
                                 // in either; skips the eval for occluded splats).
                                                                 DVec3 oo = dOffsetAlong(h.p, h.ng, wcam);
-                                if (!occludedTo(sc, oo, h.p + wcam * (Real)distc, 2e-6, RAY_EPS, /*camLeg=*/true)) {  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+                                if (!occludedTo(sc, oo, h.p + wcam * (Real)distc, 2e-6, RAY_EPS, /*camLeg=*/true,
+                                                dFiberStep(h, mp->type == D_HAIR, wcam))) {  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
                                     DVertex vt = dVertFromHit(h, matId);
                                     // The adjoint correction and shadow-terminator G are purely
                                     // geometric, so they scale every λ the same way.
@@ -16064,7 +16162,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                                         double imgToSolid = imgPtDist * imgPtDist / cosAtCamera;
                                         double imgToSurf = imgToSolid * fabs(cosToCamera) / dist2c;
                                         double wLight = (imgToSurf / ctx.nLightPaths) *
-                                                        (ctx.misVmWeight + dVCM + dVC * bsdfRevPdfW);
+                                                        ((mp->type == D_HAIR ? 0.0 : ctx.misVmWeight) + dVCM + dVC * bsdfRevPdfW);   // no merge AT a strand
                                         double misW = 1.0 / (wLight + 1.0);
                                         double ax = 0, ay = 0, az = 0;
                                         double contrib = misW * beta * f * imgToSurf / ctx.nLightPaths;
@@ -16098,7 +16196,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             double secF[SECN]; bool secChromatic = false, keepBundle = false;
             dVcmScatter(sc, *mp, h, rdCur, lambda, rng, matId, stk, diffraction,
                         wi, betaFactor, pdfW, pdfRevW, cosThetaOut, delta, terminate,
-                        lamAll, nUp, secF, &secChromatic, &keepBundle);
+                        lamAll, nUp, secF, &secChromatic, &keepBundle, /*importance=*/true);
             // Kill the walk only when EVERY live λ is dead (nUp == 1 -> mxF == betaFactor).
             double mxF = betaFactor;
             if (secChromatic) for (int k = 0; k + 1 < nUp; ++k) if (secF[k] > mxF) mxF = secF[k];
@@ -16109,8 +16207,11 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             if (delta) { dVCM = 0.0; dVC *= cosThetaOut; dVM *= cosThetaOut; }
             else {
                 double t = cosThetaOut / pdfW;
-                dVC = t * (dVC * pdfRevW + dVCM + ctx.misVmWeight);
-                dVM = t * (dVM * pdfRevW + dVCM * ctx.misVcWeight + 1.0);
+                // No merge AT a strand (vcm.h misScatter `mergeable`): the merge-at-this-vertex
+                // alternative leaves both accumulators (dVM is dVC in units of 1/etaVCM).
+                const bool mergeable = (mp->type != D_HAIR);
+                dVC = t * (dVC * pdfRevW + dVCM + (mergeable ? ctx.misVmWeight : 0.0));
+                dVM = t * (dVM * pdfRevW + dVCM * ctx.misVcWeight + (mergeable ? 1.0 : 0.0));
                 dVCM = 1.0 / pdfW;
             }
             beta *= betaFactor;
@@ -16125,8 +16226,12 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             // does not consult λ at all, so the secondaries ride on.
             if (delta && !keepBundle) nUp = 1;
             prevP = h.p;
-            ro = dOffsetAlong(h.p, h.ng, wi);
+            // A fiber scattering out its far side steps clear of its own tube (vcm.h fiberStep): the
+            // clearance is closestHit's curve-only tmin and the origin an ULP nudge along the ray --
+            // RAY_EPS is 1e-4 in FP32, a whole strand, and would skip the neighbour too.
+            curveTmin = dFiberStep(h, mp->type == D_HAIR, wi);
             rd = normalize(wi);
+            ro = (curveTmin > (Real)0) ? dOffsetPoint(h.p, rd) : dOffsetAlong(h.p, h.ng, wi);
         }
         lvCount[i] = stored;
     }
@@ -16199,11 +16304,13 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
         // vertices before it.
         bool camAllDelta = true;
         const bool hasSun = sc.sunCount > 0;
+        Real curveTmin = (Real)0;   // far-side fiber clearance for the NEXT hop (see the continuation)
 
         for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
             // edges == 1 is the camera-to-first-vertex edge — the primary ray; see
             // DMaterial::hideCamera. (The light subpath walk never gets this.)
-            DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG, /*camHide=*/(edges == 1));
+            DHit h = closestHit(sc, ro, rd, (curveTmin > (Real)0) ? (Real)0 : RAY_EPS, BIG,
+                                /*camHide=*/(edges == 1), curveTmin);
             if (!h.valid) {
                 // The ray left the scene. No env map in VCM scope, but a `light sun` is a
                 // delta-DIRECTION emitter with no geometry: the s=0 term never fires for it
@@ -16388,7 +16495,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                 double f = 0.0, fSec[SECN];
                                 for (int k = 0; k + 1 < nUp; ++k) fSec[k] = 0.0;
                                 if (mxLe > 0.0 &&
-                                    !occludedTo(sc, oo, h.p + wiL * (Real)distL, occlEps)) {
+                                    !occludedTo(sc, oo, h.p + wiL * (Real)distL, occlEps, RAY_EPS, false,
+                                                dFiberStep(h, mp->type == D_HAIR, wiL))) {
                                     f = dBsdfF(sc, vt, wo, wiL, lambda) * stG;
                                     for (int k = 0; k + 1 < nUp; ++k)
                                         fSec[k] = dBsdfF(sc, vt, wo, wiL, lamAll[k + 1]) * stG;
@@ -16414,7 +16522,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                                              : (bsdfDirPdfW / (pdfChoice * directPdfW));
                                     double wCamera = (emissionPdfW * fabs(cosToLight) /
                                                       (directPdfW * cosAtLight)) *
-                                                     (ctx.misVmWeight + dVCM + dVC * bsdfRevPdfW);
+                                                     ((mp->type == D_HAIR ? 0.0 : ctx.misVmWeight) + dVCM + dVC * bsdfRevPdfW);   // no merge AT a strand
                                     double misW = 1.0 / (wLight + 1.0 + wCamera);
                                     double contrib = misW * fabs(cosToLight) /
                                                      (pdfChoice * directPdfW) * Le * f;
@@ -16463,7 +16571,12 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     // test is bit-identical — it only skips work for connections
                     // that contributed nothing anyway.
                                         DVec3 oo = dOffsetAlong(h.p, h.ng, w);
-                    if (occludedTo(sc, oo, h.p + w * (Real)distc, 2e-6)) continue;
+                    // Either end may be a strand: clear the camera vertex's tube with the curve-only
+                    // tmin and stop short of the light vertex's (vcm.h fiberStep at both ends).
+                    const bool litHair = (sc.mats[lv.matId].type == D_HAIR);
+                    const Real lvStep = litHair ? dHairChordExit(lv.fiberR, lv.ns, lv.tangent, w * (Real)-1) : (Real)0;
+                    if (occludedTo(sc, oo, h.p + w * (Real)(distc - (double)lvStep), 2e-6, RAY_EPS, false,
+                                   dFiberStep(h, mp->type == D_HAIR, w))) continue;
                     DVertex lvt = dVertFromLV(lv);
                     double adjLit = (double)dShadingAdjointCorr(lv.wo, w * (Real)-1, lv.ns, ngoLit) * stGLit;
                     double fCam = dBsdfF(sc, vt, wo, w, lambda) * stGCam;
@@ -16492,8 +16605,10 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     double litRevPdfW = dBsdfPdf(sc, lvt, w * (Real)-1, lv.wo, lambda);
                     double camDirPdfA = camDirPdfW * fabs(cosLit) / dist2;
                     double litDirPdfA = litDirPdfW * fabs(cosCam) / dist2;
-                    double wLight = camDirPdfA * (ctx.misVmWeight + lv.dVCM + lv.dVC * litRevPdfW);
-                    double wCamera = litDirPdfA * (ctx.misVmWeight + dVCM + dVC * camRevPdfW);
+                    const double vmLit = litHair ? 0.0 : ctx.misVmWeight;                 // no merge AT a strand
+                    const double vmCam = (mp->type == D_HAIR) ? 0.0 : ctx.misVmWeight;
+                    double wLight = camDirPdfA * (vmLit + lv.dVCM + lv.dVC * litRevPdfW);
+                    double wCamera = litDirPdfA * (vmCam + dVCM + dVC * camRevPdfW);
                     double misW = 1.0 / (wLight + 1.0 + wCamera);
                     double Gt = fabs(cosCam) * fabs(cosLit) / dist2;
                     double contrib = misW * Gt * fCam * fLit * beta * lv.beta;
@@ -16508,7 +16623,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                 }
 
                 // (d) Vertex merging — gather nearby light vertices from ALL paths (XYZ estimate).
-                if (ctx.vmNorm > 0.0 && grid.nLV > 0) {
+                if (ctx.vmNorm > 0.0 && grid.nLV > 0 && mp->type != D_HAIR) {   // not AT a strand (vcm.h)
                     double mx = 0, my = 0, mz = 0;
                     double r2 = ctx.radius * ctx.radius;
                     int ix = (int)floor(((double)h.p.x - grid.lo.x) / grid.cell);
@@ -16524,6 +16639,10 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                           for (int k = grid.cellStart[c]; k < grid.cellStart[c + 1]; ++k) {
                               int idx = grid.order[k];
                               const DVcmLV& lv = grid.lv[idx];
+                              // Never merge with a vertex stored ON a strand (vcm.h, 0.362.0): the merge
+                              // evaluates the CAMERA BSDF against a photon and never looks at where the
+                              // photon sits, so a strand lying on the skin would bleed into it.
+                              if (sc.mats[lv.matId].type == D_HAIR) continue;
                               DVec3 d = h.p - lv.p;
                               if (ddot(d, d) > r2) continue;
                               if (edges + lv.edges > ctx.maxDepth) continue;
@@ -16586,8 +16705,11 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             if (delta) { dVCM = 0.0; dVC *= cosThetaOut; dVM *= cosThetaOut; }
             else {
                 double t = cosThetaOut / pdfW;
-                dVC = t * (dVC * pdfRevW + dVCM + ctx.misVmWeight);
-                dVM = t * (dVM * pdfRevW + dVCM * ctx.misVcWeight + 1.0);
+                // No merge AT a strand (vcm.h misScatter `mergeable`): the merge-at-this-vertex
+                // alternative leaves both accumulators (dVM is dVC in units of 1/etaVCM).
+                const bool mergeable = (mp->type != D_HAIR);
+                dVC = t * (dVC * pdfRevW + dVCM + (mergeable ? ctx.misVmWeight : 0.0));
+                dVM = t * (dVM * pdfRevW + dVCM * ctx.misVcWeight + (mergeable ? 1.0 : 0.0));
                 dVCM = 1.0 / pdfW;
             }
             beta *= betaFactor;                           // camera side: no adjoint on continuation
@@ -16595,8 +16717,12 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             if (!delta) camAllDelta = false;               // disqualifies the escaped-sun strategy
             if (delta && !keepBundle) nUp = 1;             // λ-dependent direction change
             prevP = h.p;
-            ro = dOffsetAlong(h.p, h.ng, wi);
+            // A fiber scattering out its far side steps clear of its own tube (vcm.h fiberStep): the
+            // clearance is closestHit's curve-only tmin and the origin an ULP nudge along the ray --
+            // RAY_EPS is 1e-4 in FP32, a whole strand, and would skip the neighbour too.
+            curveTmin = dFiberStep(h, mp->type == D_HAIR, wi);
             rd = normalize(wi);
+            ro = (curveTmin > (Real)0) ? dOffsetPoint(h.p, rd) : dOffsetAlong(h.p, h.ng, wi);
         }
 
         accum[i * 3 + 0] += rx + sxl;
@@ -18750,7 +18876,7 @@ std::vector<Film> renderForwardSharedCuda(const Scene& scene,
 
 // ------------------------------ BDPT (mode D) host ---------------------------
 
-bool cudaBdptSupported(const Scene& scene) {
+static bool cudaBidirCoreSupported(const Scene& scene) {
     // BDPT-GPU needs the same POD-bakeable materials as the forward path, PLUS the
     // BDPT scope restrictions (bdpt.h / mode-D guard in main.cpp): participating media
     // — homogeneous AND heterogeneous (density-field / bounded) — are supported (device
@@ -18758,9 +18884,6 @@ bool cudaBdptSupported(const Scene& scene) {
     // ratio-tracking transmittance, matching the CPU BDPT), and only area/sphere/cylinder
     // Lambertian emitters (no spot/env/collimated).
     if (!cudaForwardSupported(scene)) return false;
-    // Hair runs on the device forward/backward tracers but NOT in the BDPT vertex
-    // machinery (see sceneUsesHairMaterial) — a hair scene falls back to the CPU BDPT.
-    if (sceneUsesHairMaterial(scene)) return false;
     // M9: the GPU BDPT kernel now threads the per-hit texcoords (DVertex.u/v -> DHit)
     // through dBsdfF / dBsdfPdf / dRandomWalk / dConnect, so per-hit-driven throughput
     // slots evaluate consistently in the sampler AND the pdf/eval — MIS-safe. Enabled:
@@ -18802,6 +18925,13 @@ bool cudaBdptSupported(const Scene& scene) {
     // the random-walk medium scatter dispatch through dMedPhase / dMedPhaseSample, which
     // read the uploaded (lambda x mu) Airy table for rainbow media. No fallback needed.
     return true;
+}
+// Hair runs on the device forward/backward tracers and, since 0.364.0, in mode U's kernels
+// (kVcmLightT / kVcmCameraT carry the fiber BCSDF, the tube clearance and the strand merge
+// exclusion), but NOT in the BDPT vertex machinery -- a hair scene still falls back to the CPU
+// BDPT. The two gates therefore split here.
+bool cudaBdptSupported(const Scene& scene) {
+    return cudaBidirCoreSupported(scene) && !sceneUsesHairMaterial(scene);
 }
 
 // Drives a chunked samples-per-pixel render for the GPU reference/BDPT paths. Repeatedly
@@ -21936,7 +22066,7 @@ bool cudaVcmSupported(const Scene& scene) {
     // Delta lights (spot / sun) render on-device since 0.127.0 — kVcmLightT emits into the
     // cone with dVC == 0, kVcmCameraT carries the per-shape NEE geometry and the escaped-ray
     // solar disc — so mode U needs no reject of its own beyond BDPT's env/collimated one.
-    return cudaBdptSupported(scene) && scene.media.empty();
+    return cudaBidirCoreSupported(scene) && scene.media.empty();   // hair included (0.364.0)
 }
 
 VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int resY,
