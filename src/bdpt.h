@@ -1084,6 +1084,10 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 pdfW    = pdfH;
                 pdfRevW = passThru ? pdfH : bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
                 delta   = passThru;
+                // The pass-through direction is -wo for EVERY wavelength, so the bundle
+                // rides through exactly as it does off a Mirror. Without this the walk's
+                // de-hero rule (`delta && !keepBundle`) collapses it to the hero alone.
+                if (passThru) keepBundle = true;
                 // f*cos/pdf collapses exactly to T = sum_p A_p (see hair.h): the total
                 // Fresnel-and-Beer attenuation of the four lobes.
                 const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
@@ -1266,7 +1270,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                               dot(wi, cur.ns) < 0.0;
         double sgn = dot(wi, cur.ng) >= 0.0 ? 1.0 : -1.0;
         ray = fiberFar
-                  ? Ray{cur.p + normalize(wi) * (2.5 * h.fiberRadius + 1e-9), normalize(wi)}
+                  ? Ray{cur.p + normalize(wi) * 1e-9, normalize(wi), 2.5 * h.fiberRadius + 1e-9}
                   : Ray{cur.p + cur.ng * (sgn * 1e-6), normalize(wi)};
         pdfFwd = delta ? 0.0 : pdfW;
     }
@@ -2731,10 +2735,18 @@ inline Vec3 connOrigin(const Vertex& v, const Vec3& dir) {
     // A fiber connecting out the FAR side has to clear the strand's own body: strand
     // radii are microns, so ng*1e-6 lands inside the tube and the connection reports
     // itself occluded, deleting exactly the TT glow that makes light hair look lit.
-    if (v.mat && v.mat->type == MatType::Hair && v.hit.fiberRadius > 0.0 &&
-        dot(v.ns, dir) < 0.0)
-        return v.p + dir * (2.5 * v.hit.fiberRadius + 1e-9);
+    // The far-side fiber clearance is no longer a displacement of the origin (which hid
+    // any non-fiber surface within 2.5r -- the 0.360.2 defect); it travels as the
+    // curve-only tmin from connFiberStep() instead.
     return offsetOrigin(v, dir);
+}
+
+// The far-side clearance for a connection leaving a fiber, as a CURVE-ONLY tmin.
+inline double connFiberStep(const Vertex& v, const Vec3& dir) {
+    if (v.type != VType::Medium && v.mat && v.mat->type == MatType::Hair &&
+        v.hit.fiberRadius > 0.0 && dot(v.ns, dir) < 0.0)
+        return 2.5 * v.hit.fiberRadius + 1e-9;
+    return 0.0;
 }
 
 // How much shorter the shadow ray is than the full endpoint distance, given that
@@ -2871,12 +2883,20 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         }
         // The t=1 strategy: this segment runs from a LIGHT-subpath vertex to the camera, so
         // it is the camera leg and `hide_camera` applies to it (see Scene::occluded).
-        if (scene.occluded(connOrigin(qs, wcam), wcam, dist - connShorten(qs, wcam, 2e-6),
-                           1e-6, /*camLeg=*/true)) return 0.0;
+        // Partial, not yes/no: fur below opacity 1 attenuates the connection rather than
+        // killing it. The origin stays put; the strand's own body is excluded by tmin.
+        // HARD block, deliberately: in a bidirectional integrator a coverage pass-through is a
+        // DELTA VERTEX of the sampled path, so a connection that passed THROUGH a fiber would
+        // be the same transport as a sampled path one vertex longer, and MIS cannot pair paths
+        // of different lengths -- letting connections through double-counted it (D 0.9450 ->
+        // 1.4123 on the invisibility null). Fur-crossing transport is carried by sampling.
+        if (scene.occluded(connOrigin(qs, wcam), wcam, dist - 2e-6, 1e-6, /*camLeg=*/true,
+                           connFiberStep(qs, wcam))) return 0.0;
+        const double vis = 1.0;
         // Transmittance of the fog the connection ray crosses (1 in vacuum, no RNG).
         // Evaluated at the hero only: the hero gate disables bundling when the scene has
         // any medium, so Tr is exactly 1 whenever nUp > 1.
-        double Tr = mats.mediaTransmittance(scene, qs.p, wcam, dist, lambda, rng);
+        double Tr = mats.mediaTransmittance(scene, qs.p, wcam, dist, lambda, rng) * vis;
         double G = std::fabs(cosSurf) * cosCam / dist2;
         L = qs.beta * f * G * cameraWe(cam, cosCam) * Tr;
         for (int i = 0; i + 1 < nUp; ++i)
@@ -2982,9 +3002,11 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             }
             if (!(mxLe > 0.0)) return 0.0;
         }
-        if (scene.occluded(connOrigin(pt, wi), wi, dist - connShorten(pt, wi, occlEps))) return 0.0;
+        if (scene.occluded(connOrigin(pt, wi), wi, dist - occlEps, 1e-6, false,
+                           connFiberStep(pt, wi))) return 0.0;   // hard block: see t=1
+        const double vis = 1.0;
         // Hero-only transmittance (exactly 1 whenever nUp > 1; see the t==1 branch).
-        double Tr = mats.mediaTransmittance(scene, pt.p, wi, dist, lambda, rng);
+        double Tr = mats.mediaTransmittance(scene, pt.p, wi, dist, lambda, rng) * vis;
         double G = std::fabs(cosSurf) * Wgeom;
         L = pt.beta * f * Le * G * Tr * stG;
         for (int i = 0; i + 1 < nUp; ++i)
@@ -3086,11 +3108,11 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         // Both ENDS can be fibers here, and a connection arriving at a strand from its far
         // side would clip the tube just short of the vertex, so stop the shadow ray early at
         // that end too. Adds an exact 0.0 for every non-fiber pair.
-        if (scene.occluded(connOrigin(pt, w), w,
-                           dist - connShorten(pt, w, 2e-6) - connShorten(qs, w * -1.0, 0.0)))
-            return 0.0;
+        if (scene.occluded(connOrigin(pt, w), w, dist - 2e-6 - connShorten(qs, w * -1.0, 0.0),
+                           1e-6, false, connFiberStep(pt, w))) return 0.0;   // hard block: see t=1
+        const double vis = 1.0;
         // Hero-only transmittance (exactly 1 whenever nUp > 1; see the t==1 branch).
-        double Tr = mats.mediaTransmittance(scene, pt.p, w, dist, lambda, rng);
+        double Tr = mats.mediaTransmittance(scene, pt.p, w, dist, lambda, rng) * vis;
         double G = std::fabs(cosE) * std::fabs(cosL) / dist2;
         L = pt.beta * fE * fL * qs.beta * G * Tr * stGE * stGL;
         for (int i = 0; i + 1 < nUp; ++i)

@@ -4877,64 +4877,75 @@ reported hard zeros for paths executing thousands of times: the patch scripts ha
 anchors, and because the build was chained after a NEWLINE rather than `&&`, it ran anyway and
 the tracebacks went to a file that was never read. An absent probe and a never-firing probe are
 indistinguishable. Verify the instrument can speak before believing its silence.
-### HAIR-MODES — PARTLY FIXED (0.361.0): W and D done, U backed out, a ~5 % residual band open
+### HAIR-MODES — PARTLY FIXED (0.361.0 / 0.362.0): W exact, VCM's OPAQUE hair corrected by
+2.7x; D -4 % and U +25 % still open under the delta-vertex scheme, M/S +5 % open
 
-The hair FEATURES are universal, because they live in shared code: `specular` and `opacity` are
-read by `hairSpecularAt` / `hairOpacityAt` in `hair_shade.h`, which every path reaches through
-`hairShadeAt`, and applied inside `hair::make` / `Ap` / `sample` / `f` / `pdf` in `hair.h` and
-its `dhair` twin. Any mode that shades a fiber gets both, on either backend.
+The hair FEATURES are universal (`specular` / `opacity` live in `hairShadeAt` and `hair::make`,
+which every path reaches, on both backends). The TRANSPORT was not: it was validated -- and
+applied -- in mode R only. Audited with the `opacity 0` invisibility null (fur that must be
+invisible, so the correct answer is exactly 1.000), 128 spp, 64x64, CPU, area-lit:
 
-The TRANSPORT was not. Audited with the `opacity 0` invisibility null -- fur that must be
-invisible, so the correct answer is exactly 1.000 -- at 128 spp, 64x64, CPU, area-lit so every
-mode can render it:
-
-| mode | | before | after |
+| mode | | 0.361.0 | 0.362.0 |
 |---|---|---|---|
 | `R` | backward reference | 0.9990 | 0.9990 |
-| `W` | deterministic preview | 0.5315 | **1.0000** |
-| `D` | BDPT | 0.4290 | **0.9450** |
-| `M` | photon map | 1.0504 | 1.0244 |
-| `S` | SPPM | 1.0574 | 1.0560 |
-| `U` | VCM/UPS | 0.7084 | 0.7084 (attempt reverted) |
+| `W` | deterministic preview | 1.0000 | 1.0000 |
+| `D` | BDPT | 0.9450 | 0.9583 |
+| `U` | VCM/UPS | 0.7084 | 1.2526 |
+| `M` | photon map | 1.0244 | 1.0232 |
+| `S` | SPPM | 1.0560 | 1.0557 |
 
-**`W` -- `directOnly` ended the path before the coverage decision.** Mode W is `g_whitted` plus
-`directOnly`, and `interactMaterial` read `if (directOnly) return false;` ABOVE the
-`hair::sample` call, so a transparent fiber swallowed everything behind it. This is the exact
-twin of the `dualScatter` bug fixed in 0.360.0, two lines below it, and it was missed then.
-The two are now one predicate -- both end the path only for light the fiber actually
-INTERCEPTED -- with the opaque case short-circuiting first so default renders draw no extra
-uniforms and stay bit-identical.
+**Opaque hair in VCM was 2.79x mode R. It is now 1.029x.** This is the largest finding of the
+pass and it is not a transparent-hair bug at all. VCM's merge treats a stored light vertex
+purely as a photon -- it evaluates the CAMERA vertex's BSDF against `lv.wo` and never looks at
+`lv.mat` -- so a photon stored on a strand lying on the skin bled into every skin gather point
+within the radius as if it had landed there. Mode M forbids exactly this ("fibers are never
+deposited on"); VCM now does too. Found via an env-gated A/B on one binary: the opacity-0 null
+went 1.7177 -> 1.2526 and opaque U/R 2.7920 -> 1.0292 from that one change.
 
-**`D` -- two defects, neither a transplant of the mode-R fix.**
+**Connections through transparent fur MUST hard-block in a bidirectional integrator -- and that
+is a finding, not an omission.** `bdpt.h` and `vcm.h` test every connection with the boolean
+`occluded()`, which looked like the 0.359.0 bug class (mode R's env NEE). It is not. In these
+integrators a coverage pass-through is a DELTA VERTEX of the sampled path, so `[camera, fiber,
+sphere, light]` is a four-vertex path; a shadow ray passing through the same fiber would carry
+the same transport as the three-vertex path `[camera, sphere, light]`, and MIS cannot pair paths
+of different lengths -- both get full weight. Measured: letting connections attenuate through
+fur took D from 0.9450 to **1.4123** and U from 1.2526 to **1.5433**. Mode R is consistent with
+attenuation because it keeps no path-length bookkeeping; D and U are consistent only if
+fur-crossing transport is carried by sampled pass-throughs alone. The hard block is kept, on
+purpose, with a comment saying why. What DID change at those sites: the shadow-ray origin no
+longer moves 2.5r past a far-side fiber (`connOrigin` / `fiberOrigin`, the 0.360.2 defect); the
+clearance rides as `occluded()`'s curve-only tmin. `shadowTransmittance` also gained `camLeg`
+(mirrored guard for guard from `occluded()`), unused by these sites now but correct.
 
-* The pass-through vertex was not marked `delta`. `bdpt.h`'s own scope comment describes
-  specular vertices as "delta pass-through vertices that carry a chain but never connect",
-  which is precisely what a coverage pass-through is (its outgoing direction is fixed at -wo),
-  yet every connection strategy tried to connect through it using a finite solid-angle density
-  that does not exist.
-* The secondary wavelengths were extinguished. `secF[i] = hairFCos(hsi, wi) / pdfH`
-  re-evaluates the BCSDF per secondary, and since 0.358.0 that evaluation carries the coverage
-  factor -- so at `opacity 0` it returned 0 for every secondary, killing the spectral bundle at
-  a fiber the ray never touched. A pass-through is achromatic and must carry 1.
+**W** -- `directOnly` ended the path above the coverage decision, the unnoticed twin of the
+`dualScatter` bug two lines below it; the two are one predicate now (0.361.0).
 
-**`U` -- THE SAME PATCH BREAKS IT, and that is the finding worth keeping.** `vcm.h`'s hair case
-is a near-copy of `bdpt.h`'s, comments included. Applying the identical change moved it from
-0.7084 to **1.4850** -- from 29 % dark to 49 % bright, worse in absolute error, so it was
-reverted rather than shipped. Isolating the parts showed `secF`/`pdfRevW` alone reproduce the
-overshoot EXACTLY (1.4850), so the `delta` flag was not responsible; an earlier note here
-blaming VCM's connect/merge exclusion was a story fitted to a number and is withdrawn. VCM's
-conventions for those two quantities differ from BDPT's in a way the vertex code does not
-advertise, and closing it means reading VCM's MIS weight recursion rather than pattern-matching
-the hair case.
+**D** -- the pass-through vertex was not `delta` (connections were made THROUGH a fiber the ray
+never touched) and `secF[i] = hairFCos(...)/pdfH` extinguished every secondary wavelength
+(0.361.0); it then also needed `keepBundle`, without which the walks' de-hero rule
+`delta && !keepBundle` collapsed the spectral bundle at every strand, and the curve-only exit
+step (0.362.0).
 
-**STILL OPEN: a residual band.** `D` 0.9450, `M` 1.0244, `S` 1.0560 -- all three already carry
-the exit-step fix (0.360.2) and none has a gross path-termination bug, so the ~5 % they share is
-probably ONE mechanism distinct from everything fixed here, and a better starting point than
-treating them one at a time. `U` needs its weight recursion understood first.
+**U** -- the same three plus the merge rule above. An earlier attempt set `delta` without
+`keepBundle` and read 1.4850; a note here blaming VCM's connect/merge exclusion for that was a
+story fitted to a number and is withdrawn -- the de-hero rule and the merge bleed were the
+causes.
 
-OPAQUE hair is unaffected in every mode -- none of these paths can fire without a pass-through,
-verified by the opaque short-circuits and an unchanged `opacity 1` render. `-checkhair`,
-`-checkfur` and `-checklayered` pass.
+**OPEN: D 0.9583 and U 1.2526 under the delta-vertex scheme.** With every mechanism above fixed
+and connections hard-blocking, BDPT is 4 % dark and VCM 25 % bright on transparent fur. These
+are the same two numbers to four decimals across two builds (the attenuation experiment in
+between reproduced them exactly on revert), so they are deterministic. The remaining candidate
+is the MIS treatment of a delta lobe on a CONNECTIBLE (mixed) vertex: SmallVCM's specular rule
+assumes no strategy can connect at the vertex, but a fiber below opacity 1 is stored and
+connectible, so the two sides of the weight recursion may not agree. Six VCM hypotheses have
+been tested by measurement in this pass; the next one should be instrumented (per-strategy
+contribution and weight sums at a pass-through), not reasoned.
+
+**OPEN: M 1.0232 and S 1.0557.** This is a real bias, not noise and not budget: two seeds scatter by
+only 1.5-2.5 % around a mean of +5-7 %, and `-photon-bounce 256` changes nothing. It is
+common to the photon-map family (S's camera walk has no NEE at fibers and still shows it, so
+it is on the photon side or in the gather) and needs its own instrumentation. Opaque hair is
+unaffected in every mode.
 ### HAIR-TEMPORAL — MEASURED, and the obvious fix does NOT work (2026-09-21)
 
 Hair noise is essentially FULLY DECORRELATED between frames of a moving camera, and the

@@ -1999,6 +1999,15 @@ unsampled path through a dense coat, enough to tunnel through the skin under the
 now leaves by the ULP-scaled offset and drops `tmin` for that hop, safe because the strand is
 excluded by `curveTmin` rather than by distance. GPU null 1.0663 -> **1.0010**, matching the CPU.
 
+**And in the bidirectional integrators (0.361.0 / 0.362.0).** Modes D and U (and W) had never
+received any of this: a pass-through was not a delta vertex, the spectral bundle collapsed at
+every strand, and VCM merged photons stored on strands into the skin beneath them -- which
+over-lit OPAQUE hair by 2.79x against mode R, now 1.029x. One thing deliberately does NOT
+change there: connections still hard-block on fibers, because in a bidirectional integrator a
+pass-through is a delta vertex of the sampled path and a connection through the same fiber
+would double-count it (letting them through measured D 0.9450 -> 1.4123). The invisibility
+null now readsW 1.0000, D 0.9583, U 1.2526. See HAIR-MODES in `known-issues.md`.
+
 *An honest note on 0.359.0:* that version named the exit offset as the mechanism, was corrected
 in 0.360.0 for naming it as the ONLY one, and it turns out to have been a real cause after all --
 just the smallest of four, and invisible until the larger three were gone.

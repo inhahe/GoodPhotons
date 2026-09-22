@@ -2970,7 +2970,8 @@ struct Scene {
     // reject per fiber would also be unbiased but would put noise into every shadow, and hair
     // shadows are exactly where noise is most visible.
     double shadowTransmittance(const Vec3& o, const Vec3& dir, double maxDist, double lambda,
-                               double tmin = 1e-6, double curveTmin = 0.0) const {
+                               double tmin = 1e-6, double curveTmin = 0.0,
+                               bool camLeg = false) const {
         ++raystats::tls;
         Ray r{o, dir, curveTmin};
         const size_t nT = tris.size();
@@ -2982,17 +2983,24 @@ struct Scene {
         const TriShear sh = makeTriShear(r.d);
         const CurveRay cray = nC ? makeCurveRay(r.d) : CurveRay{};
         const PatTables tabs = patTables();
+        // `hide_camera` on a camera leg, exactly as occluded(): a hidden primitive is
+        // skipped before it is intersected. Needed by the bidirectional t=1 splats.
+        const bool camHide = camLeg && camHiddenAny;
+        const auto hidden = [&](int matId) {
+            return camHide && matId >= 0 && matId < (int)mats.size() && mats[matId].hideCamera;
+        };
         double T = 1.0;
         const bool hardBlock = bvh.traverseAny(r, tmin, seg, [&](int prim) -> bool {
             Hit h; h.t = seg;
-            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h, vcolData());
-            if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
-            if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, true);
+            if (prim < (int)nT)             return !hidden(tris[prim].matId) && intersectTri(sh, r, tris[prim], tmin, h, vcolData());
+            if (prim < (int)(nT + nS))      return !hidden(spheres[prim - nT].matId) && intersectSphere(r, spheres[prim - nT], tmin, h);
+            if (prim < (int)(nT + nS + nI)) return !hidden(implicits[prim - nT - nS].matId) && intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, true);
             if (prim < (int)(nT + nS + nI + nC)) {
                 const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
                 const Material& cm = mats[(size_t)cs.matId];
                 const bool soft = (cm.type == MatType::Hair) &&
                                   (cm.hairOpacity(lambda) < 1.0 || cm.hairOpacityPat >= 0);
+                if (hidden(cs.matId)) return false;
                 if (!soft) return intersectCurveSeg(cray, r, cs, curveMin(r, tmin), h, true);
                 // A transparent fiber: resolve the hit fully (anyHit skips the surface
                 // parameters a bound opacity pattern needs) and attenuate rather than block.
