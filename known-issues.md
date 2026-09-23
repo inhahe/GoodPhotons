@@ -71,6 +71,27 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-09-23, 0.367.2): GLTF-METAL-TINT — textured glTF metals rendered untinted (the blue sequins came out white)
+
+**Symptom:** with `-import-metal mix`, the edited Alice's blue metallic flakes rendered **white** on the
+blue skirt, in mode R and in the raster preview (`png/alice_tint_compare.png`).
+
+**Cause:** host `reflectSlot` — the tint that glossy / mirror / grating / half-mirror read — took a bound
+record or the constant `reflect`, never `reflectTex` or the vertex colour, "because these types never
+bind one". The glTF importer does: a metal's F0 *is* its base colour, which the importer folds into the
+texture, leaving the constant white. The device's `dReflectSlot` had the same gap, and so did the
+previews' `f0` (constant only).
+
+**Fix:** `reflectSlot` is now `diffuseReflectance`; on the device `dReflectSlot` and `dDiffuseRho` share
+one `dReflectBase` (record | texture | constant, times vertex colour); the previews store `f0 = -1` for a
+textured material with a specular lobe, which the CPU and GPU shaders resolve to the sampled albedo. As a
+side effect, glTF's `COLOR_0` now tints specular materials too, as glTF intends.
+
+**A/B against 0.367.1** (`scraps/ab_0367.py`): untextured specular materials bit-identical in mode R (CPU
+and GPU), B, D, both raster previews and hair; GPU mode M differed by 3e-9 relative, which is that path's
+run-to-run nondeterminism, not the change. The textured flakes take the skirt's blue in the tracer and
+in the preview.
+
 ## DONE (2026-09-22, 0.366.0): LIVE-WINDOW-TINY-BLACK — the renders Claude launched showed only a tiny, pure-black preview window
 
 **Reported:** every ftrace instance launched while Claude was working "shows only a tiny pure black

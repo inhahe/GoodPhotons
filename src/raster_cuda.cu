@@ -1084,6 +1084,9 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     float rough = shRough;
     if (rough >= 0.0f) rough = fminf(1.0f, fmaxf(0.02f, rough));
     const bool spec = (rough >= 0.0f);
+    // The highlight colour: the material's constant f0, or -- for a textured glossy material,
+    // marked by a negative f0 (host twin: raster.h bakeOwn) -- this texel's albedo (0.367.2).
+    const float3 f0 = (shF0.x < 0.0f) ? col : shF0;
     float3 specAcc = make_float3(0.0f, 0.0f, 0.0f);
     float lit = 0.0f;
     for (int li = 0; li < nLights; ++li) {
@@ -1103,9 +1106,9 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
             const float gg = ggxSpecD(N3, V, Ld, rough) * w;
             if (gg > 0.0f) {
                 const float f = powf(1.0f - fmaxf(0.0f, dot3(V, normalize3(V + Ld))), 5.0f);
-                specAcc = specAcc + make_float3(shF0.x + (1.0f - shF0.x) * f,
-                                                shF0.y + (1.0f - shF0.y) * f,
-                                                shF0.z + (1.0f - shF0.z) * f) * gg;
+                specAcc = specAcc + make_float3(f0.x + (1.0f - f0.x) * f,
+                                                f0.y + (1.0f - f0.y) * f,
+                                                f0.z + (1.0f - f0.z) * f) * gg;
             }
         }
     }
@@ -1125,9 +1128,9 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         const float3 env = envDn + (envUp - envDn) * sEnv;
         // The env half is NOT scaled by keyScale (host twin: raster.h) -- an env-only scene
         // has keyScale 0, which zeroed every highlight in the bare-mesh quick-view.
-        const float3 specEnv = make_float3((shF0.x * A + B) * env.x,
-                                           (shF0.y * A + B) * env.y,
-                                           (shF0.z * A + B) * env.z);
+        const float3 specEnv = make_float3((f0.x * A + B) * env.x,
+                                           (f0.y * A + B) * env.y,
+                                           (f0.z * A + B) * env.z);
         accum[i] = accum[i] + specAcc * keyScale + specEnv;
     }
 }

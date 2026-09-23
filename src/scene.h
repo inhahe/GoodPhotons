@@ -3468,20 +3468,22 @@ inline double reflectPatMul(const Scene& scene, const Material& m, const Hit& h)
 }
 
 // Reflect-slot reflectance for the SPECULAR families (Mirror / Glossy / Grating /
-// HalfMirror) whose tint reads the reflect slot directly: a bound record if present,
-// else the constant `reflect` spectrum — either way scaled by a bound reflect pattern.
-// (These types never bind a reflect texture, so — unlike diffuseReflectance — there is
-// no texture path.)
-inline double coatedAlbedoAt(const Material& m, double a, double lambda);   // defined above
+// HalfMirror): the tint their lobe carries. Since 0.367.2 it is EXACTLY the albedo chain the
+// diffuse lobe reads -- a bound record, else a bound texture, else the constant `reflect`
+// spectrum; times the vertex colour and a bound reflect pattern; under a coat.
+//
+// It used to skip the texture and the vertex colour, on the grounds that these types never
+// bind one. The glTF importer does: a metal's tint IS its base colour, texture and COLOR_0
+// included (gltf.h -- a fully metallic material, and the metal lobe of `-import-metal mix`),
+// and the importer folds the colour INTO the texture, leaving the constant white. So every
+// textured glTF metal rendered untinted -- the blue metallic flakes of a glittered dress came
+// out white. With no texture and no vertex colour the chain below does the same arithmetic in
+// the same order the old body did (record|constant, pattern, coat), so an untextured specular
+// material renders bit-identically.
+inline double diffuseReflectance(const Scene& scene, const Material& m, const Hit& h, double lambda);
 inline double reflectSlot(const Scene& scene, const Material& m,
                           const Hit& h, double lambda) {
-    double v;
-    if (!recordReflectBound(scene, m, h, lambda, v)) v = m.reflect(lambda);
-    v = m.reflectPat < 0 ? v : v * reflectPatMul(scene, m, h);
-    // UNDER A COAT, exactly as in diffuseReflectance -- a GLOSSY body sits under the same exit
-    // interface a diffuse one does. The device's dReflectSlot already did this and the host did
-    // not, so the two backends disagreed on a glossy body under a coat until 0.324.0.
-    return coatedAlbedoAt(m, v, lambda);
+    return diffuseReflectance(scene, m, h, lambda);
 }
 
 // Spectral reflectance of a hit's interpolated VERTEX COLOUR, at one wavelength.

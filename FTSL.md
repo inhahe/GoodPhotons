@@ -1711,7 +1711,8 @@ It bakes the glTF node transform hierarchy (matrix or TRS) under the mesh block'
 own `translate/rotate/scale`, reads `POSITION` / `NORMAL` / `TEXCOORD_0` +
 indices, and imports `pbrMetallicRoughness` materials — `baseColorFactor` is
 upsampled to a reflectance spectrum, `metallicFactor ≥ 0.5` → a glossy (metal)
-BSDF tinted by the base color, else diffuse, with `roughnessFactor` as the lobe
+BSDF tinted by the base color (by the base-color *texture*, texel by texel, when
+there is one — since 0.367.2), else diffuse, with `roughnessFactor` as the lobe
 width. Add `import_materials no` to ignore glTF's materials and paint every
 primitive with the block's FTSL `material` instead. The block `material` is always
 the fallback for primitives that carry no material.

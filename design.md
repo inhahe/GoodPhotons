@@ -5235,6 +5235,21 @@ as the one at fault.
   base a lone `reflect pattern:` leaves behind would otherwise render as albedo 1.0 — a
   wrong image rather than a missing effect.
 
+  **One reflect chain for every BSDF (0.367.2).** Host `reflectSlot` — the tint of the
+  specular families (glossy, mirror, grating, half-mirror) — read a bound record or the
+  constant, then the pattern and the coat, but **not** `reflectTex` or the vertex colour,
+  on the grounds that those types never bind one. The glTF importer does: a metal's F0 *is*
+  its base colour, which it folds into the base-colour texture (leaving the constant
+  white), so every textured glTF metal — a whole-metal material, or the metal lobe of
+  `-import-metal mix` — rendered untinted. `reflectSlot` is now literally
+  `diffuseReflectance`, and on the device `dReflectSlot` and `dDiffuseRho` share one
+  `dReflectBase` (record | texture | constant, times vertex colour) before their own pattern
+  and coat tails, so the two reads cannot drift apart again. With no texture and no vertex
+  colour the chain does the old arithmetic in the old order, so untextured specular
+  materials are bit-identical (A/B'd on mode R CPU/GPU, B, D and M, both raster previews,
+  and hair). The previews' `f0` had the same gap: a textured material with a specular lobe
+  now stores `f0 = -1`, which the CPU and GPU shaders resolve to the sampled albedo.
+
   **Pattern-driven transmittance (`Material::transmitPat`).** The same mechanism on the
   `transmit` slot: `transmit pattern:<n>` / `transmit [0 1](u)` alone in the slot, or
   `transmit_map pattern:<n>` modulating an authored spectrum. Reaching it needed a

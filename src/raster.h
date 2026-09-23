@@ -529,6 +529,14 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             s.tex = rt;
             s.triplanarScale = m.triplanarScale;
         }
+        // A TEXTURED glossy material -- an imported glTF metal, whose tint IS its base colour --
+        // takes its highlight colour from the texel, not from the constant `reflect` (which the
+        // importer leaves white once the colour lives in the texture), as the tracer's reflectSlot
+        // does since 0.367.2. Marked by a NEGATIVE f0, which no real reflectance is, so the flag
+        // rides every existing path (the near-clip store, the mix table, the device copy) without
+        // a new field; the shaders resolve it to the sampled albedo. Untextured materials keep
+        // their constant f0 exactly.
+        if (s.rough >= 0.0 && s.tex >= 0) s.f0 = Vec3{-1.0, -1.0, -1.0};
         // Scalar pattern drives. `reflect pattern:` / `reflect_map pattern:` both land in
         // reflectPat and multiply the albedo; `emit pattern:` / `emit_map pattern:` land
         // in emitPat and multiply the emission. Same slots, same clamp, as the tracer.
@@ -2191,6 +2199,9 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                 rough = (rough < 0.02) ? 0.02 : (rough > 1.0 ? 1.0 : rough);
             }
             const bool spec = (rough >= 0.0);
+            // The highlight colour: the material's constant f0, or -- for a textured glossy
+            // material, marked by a negative f0 in bakeOwn -- this texel's albedo (0.367.2).
+            const Vec3 f0 = (sh->f0.x < 0.0) ? col : sh->f0;
             Vec3 specAcc{0, 0, 0};
             double lit = 0.0;
             for (const auto& lp : light.lights) {
@@ -2211,9 +2222,9 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                     const double gg = ggxSpec(N3, V, Ld, rough) * w;
                     if (gg > 0.0) {
                         const double f = std::pow(1.0 - std::max(0.0, dot(V, normalize(V + Ld))), 5.0);
-                        specAcc = specAcc + Vec3{sh->f0.x + (1.0 - sh->f0.x) * f,
-                                                 sh->f0.y + (1.0 - sh->f0.y) * f,
-                                                 sh->f0.z + (1.0 - sh->f0.z) * f} * gg;
+                        specAcc = specAcc + Vec3{f0.x + (1.0 - f0.x) * f,
+                                                 f0.y + (1.0 - f0.y) * f,
+                                                 f0.z + (1.0 - f0.z) * f} * gg;
                     }
                 }
             }
@@ -2237,9 +2248,9 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                 const double tEnv = 0.5 * (Rv.y + 1.0);
                 const double sEnv = tEnv * tEnv * (3.0 - 2.0 * tEnv);
                 const Vec3 env = light.envDn + (light.envUp - light.envDn) * sEnv;
-                const Vec3 specEnv{(sh->f0.x * A + B) * env.x,
-                                   (sh->f0.y * A + B) * env.y,
-                                   (sh->f0.z * A + B) * env.z};
+                const Vec3 specEnv{(f0.x * A + B) * env.x,
+                                   (f0.y * A + B) * env.y,
+                                   (f0.z * A + B) * env.z};
                 // The DIRECT lobe scales with the key-light scale, exactly as the diffuse
                 // `lit` term does. The ENVIRONMENT half must NOT: it is the reflection of the
                 // surroundings, not of a key light. Scaling it by keyScale erased every

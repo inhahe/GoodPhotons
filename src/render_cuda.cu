@@ -8041,17 +8041,13 @@ __device__ static inline Real dCoatedAlbedoAt(const DMaterial& m, Real a, Real l
     }
     return dCoatedAlbedo(a, m.coatFdr);
 }
-__device__ static Real dReflectSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
-    Real v;
-    if (!dRecordReflect(sc, m, h, lambda, v)) v = specLookup(m.reflect, lambda);
-    v = m.reflectPat < 0 ? v : v * dReflectPatMul(sc, m, h);
-    return dCoatedAlbedoAt(m, v, lambda);
-}
-
-// Diffuse reflectance at a hit: a driven parametric record (highest priority), else a
-// bound texture, else the constant baked reflect spectrum — then scaled by a bound
-// reflect pattern (mirrors host diffuseReflectance).
-__device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
+// The base of every reflect-slot read, diffuse or specular (0.367.2): a driven parametric
+// record (highest priority), else a bound texture, else the constant baked reflect spectrum --
+// times the per-vertex colour. The two readers below differ only in what follows (the
+// diffuse one clamps after the pattern, the specular one leaves that to its callers), so each
+// keeps its own tail and neither changes a bit for a material without a texture or a vertex
+// colour (host twin: reflectSlot / diffuseReflectance).
+__device__ static Real dReflectBase(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
     Real rv;
     if (!dRecordReflect(sc, m, h, lambda, rv)) {
         if (m.reflectTex >= 0) {
@@ -8080,6 +8076,22 @@ __device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const D
             rv *= stochReflAt(c, (double)lambda);   // the host's upsample::reflAt, device side
         }
     }
+    return rv;
+}
+
+// Specular tint (mirror / half-mirror / grating / glossy -- and an imported glTF metal, whose
+// tint IS its base colour, texture included): the shared base, the pattern, the coat. Untinted
+// for a textured metal until 0.367.2, when the base gained the texture (host twin: reflectSlot).
+__device__ static Real dReflectSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
+    Real v = dReflectBase(sc, m, h, lambda);
+    v = m.reflectPat < 0 ? v : v * dReflectPatMul(sc, m, h);
+    return dCoatedAlbedoAt(m, v, lambda);
+}
+
+// Diffuse reflectance at a hit: the shared base, then scaled by a bound reflect pattern and
+// clamped (mirrors host diffuseReflectance).
+__device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
+    Real rv = dReflectBase(sc, m, h, lambda);
     rv = clamp01(m.reflectPat < 0 ? rv : rv * dReflectPatMul(sc, m, h));
     // UNDER A COAT (host twin: diffuseReflectance): what the internal multiple reflections leave,
     // and what an absorbing layer takes on the way through.
