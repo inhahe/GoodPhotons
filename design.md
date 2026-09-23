@@ -1218,7 +1218,61 @@ lit by adds nothing the eye can find, which is why an imported dielectric read a
 `envUp` / `envDn` -- neutral in hue, 1.65x and 0.35x ambient, so the pair's **mean is `ambient`**
 and what changes is directionality, not exposure -- and both rasterizers look the gradient up along
 the reflection of the view about the shading normal. `raster_cuda.cu` carries the twin, since
-`-explore` uses the GPU rasterizer when one is available.
+`-explore` uses the GPU rasterizer when one is available. *(Superseded by 0.368.0, below: the pair
+was anchored on a deliberately dim ambient, which is harmless under a 4 % sheen and fatal for a
+surface that reflects nearly everything.)*
+
+### The preview lights with the scene's own lights (0.368.0)
+
+`deriveLight` used to distil a scene into presets -- `ambient`, `keyScale`, a headlight `fill`, and
+every positional emitter as a colourless weight normalised to sum 1 with a made-up `1/(1+d^2/r^2)`
+falloff. That was enough to see shapes and wrong in every way that decides how a metal looks: what a
+metal shows is what it reflects, and the preview had nothing calibrated to reflect. It now builds,
+once per scene load (`raster.h`; the device twin in `raster_cuda.cu`, the diffuse half in
+`render_cuda.cu`'s `kIsoPreview`):
+
+* **`PLight`, calibrated.** Colour and strength from the emitter itself: `xyzToLinearSrgb(cieMean *
+  emitIntegral)` times its geometry -- surface-area/4 for spheres, tubes and meshes (the mean
+  projected area of a convex body), `A cos` one-sided for a quad, on-axis intensity times the cone for
+  a spot, `emitIntegral * spotOmega` (the irradiance) for a sun. Real `1/d^2`, clamped inside the
+  source's radius, and the source's angular size widens its highlight (`widenRough`). Diffuse is
+  `albedo * E / pi` and the lobe `BRDF * E` in the same units -- the old highlight used the diffuse
+  weight without its `1/pi`. Everything is scaled so the brightest side of a white surface at the
+  scene centre reads 1, which keeps absolute-exposure previews and `EMIS_BOOST` where they sat.
+* **An environment map** (`kEnvW x kEnvH` = 64 x 32): the env light (constant, image or sky,
+  box-filtered from the full map so a baked sun keeps its energy) where a direction escapes, and the
+  scene's own surfaces where it does not. Its order-2 SH is the diffuse ambient (`ambientAt`); six
+  levels pre-blurred with a cosine-power lobe per roughness are the specular environment
+  (`envSpecularAt`, Karis' split sum). `envBg` (256 x 128, env only) is drawn behind the scene when
+  there is an env light, stamped with a tiny positive inverse depth so the shared exposure meters it
+  as the tracer meters its background.
+* **Two light probes** (scenes only -- the mesh quick-view's only geometry is the model, and a probe
+  would see its inside). The AMBIENT probe stands where the first camera looks (70 % along its
+  forward ray to the first surface): inside the room, which gives a closed box its level of bounce
+  light; three bounces, re-shading the probed surfaces with the previous pass's SH; its surfaces
+  contribute BRIGHTNESS but not hue (the env keeps its colour), because one probe overweights
+  whatever it stands beside and colour is what that contaminated. The REFLECTION probe stands at the
+  camera's eye, in full colour, and lookups are BOX-PROJECTED against the scene's AABB
+  (`Scene::sceneBoxLo/Hi`, kept since 0.368.0; the lid opened to the sky when there is an env
+  light). Probe surfaces are lit unshadowed, as the preview lights them. `FTRACE_PREVIEW_BOUNCES=N`
+  overrides the bounce count.
+* **Glossy and mirror are all lobe.** bakeOwn's negative-`f0` marker (0.367.2: "tint from the
+  albedo") now also means "no diffuse term"; the tint is the TRUE reflectance, not `materialColor`'s
+  0.7-luminance ghost; `previewRough(r) = sqrt(0.646 r)` maps the tracers' Phong lobe (exponent
+  `2/r^2 - 2`) onto GGX by half-width; mirrors get roughness 0.02. `-flat` turns them back to clay.
+
+Things found on the way, each fixed in the same version: `envBrdfApprox` was not the Karis fit its
+comment named (`A = (1-r)^4`, 0.06 where the DFG integral gives 0.72 at roughness 0.5); the GPU
+shader never read `roughPat`/`roughTex`, so a glTF roughness map was CPU-only; the env lookups' exact
+`acos`/`atan2` were the costliest thing a glossy pixel did (now 7e-5-rad polynomials, both backends).
+
+The mesh quick-view is lit by `light env { kind studio }` (`studio.h`): a cyclorama with key /
+fill / rim / top softboxes, baked like the Preetham sky, so the path tracer, mode W and the preview
+all light with it and all show it in reflections.
+
+What it is not: shadows, refraction, parallax beyond one box projection, or GI beyond one probe --
+the reference comparisons in `known-issues.md` (RASTER-METAL-LOOK) record where it lands against
+mode R and mode D, and where it is off.
 
 **One more thing was needed before any of it showed on Alice.** Her coat's roughness lives in a
 map, and the material's CONSTANT roughness was the glTF *factor* -- `1.0`, the Meshy house style,

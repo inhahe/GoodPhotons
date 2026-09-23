@@ -71,6 +71,86 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-09-23, 0.368.0): RASTER-METAL-LOOK — the preview drew metal as coloured plastic, and its lights were presets rather than the scene's
+
+**The report:** metal in the model viewer (`ftrace model.glb`) did not look like metal. The first
+attempt, dropping the matte term for glossy surfaces, was measured against path-traced renders and
+**reverted**. Gold, copper and chrome came out dark brown and grey. A glossy floor in a bulb-lit
+room went near-black. Two brighter "reflected world" variants were still far off. The cause was
+not the matte term. The preview's lighting was a set of presets (an ambient, a key scale and a
+headlight, with every light colourless and power-normalised), so there was nothing calibrated for
+a metal to reflect. The user then asked for the model viewer to get more lights, and for scene
+previews to use each scene's actual lights, without slowing the preview down.
+
+**What 0.368.0 does** (design.md, "The preview lights with the scene's own lights"):
+- Calibrated `PLight`s: real colour and relative strength, 1/d², a size-widened highlight.
+- A 64×32 environment map. Its order-2 SH gives the ambient; six pre-blurred levels give the
+  reflections.
+- The env is drawn behind the scene and metered with it.
+- Two light probes (for scenes): an ambient probe (3 bounces, brightness only) and a reflection
+  probe (box-projected).
+- Glossy and mirror surfaces are all lobe, tinted by their true reflectance, with the tracer's lobe
+  width.
+- The mesh quick-view is lit by `light env { kind studio }` (studio.h), a cyclorama with key,
+  fill, rim and top softboxes.
+
+**Found and fixed on the way:**
+- **`envBrdfApprox` was not Karis' fit, though its comment said so.** It returned A = (1−r)⁴:
+  0.06 at roughness 0.5, where the DFG integral gives 0.72. Every rough metal previewed several
+  times too dark.
+- **The GPU shader ignored `roughPat`/`roughTex`.** Every GPU struct carried them. On the edited
+  Alice's sequins, GPU-vs-CPU went from 0.57 levels mean (p99 10) to **0.000**.
+- **The preview's highlight was a factor π weak beside its diffuse**, from the shared weight
+  without the diffuse 1/π.
+- **The preview's highlights were ~2× too narrow.** A material roughness was used as GGX
+  perceptual roughness; `previewRough` maps the tracers' Phong lobe onto GGX by half-width.
+- **The model viewer's key light was mis-described.** Its old comment called the sun "roughly
+  60:1 against the env fill"; the env's irradiance was in fact ~8× the sun's.
+
+**Measured against path-traced references** (mode R at 256 spp; the gallery in mode D, because
+mode R cannot find its 8 mm bulb and mode B renders glossy black by construction):
+
+| scene | old preview | 0.368.0 preview | reference |
+|---|---|---|---|
+| metal spheres (`scraps/_metal_preview.ftsl`) | matte + highlight | bright metal with a floor / sky horizon | bright metal, floor horizon, neighbours |
+| model viewer, Two-Part (all metal) | pale matte brass | bright brass with studio reflections, same backdrop | same |
+| model viewer, Vacuum Chamber | — | key-softbox reflection on the bulb in the same place | same |
+| mirror box (`scenes/_mirror_mats_fwd.ftsl`) | flat pale panels | panels reflecting the red / green walls | red / green walls |
+| spot box, back wall / floor pool (linear) | 0.58 | 0.19 | 0.18 |
+| gallery gyroid (gold) | bright matte gold | polished gold, room reflected, a little bright | dark gold |
+
+**Performance:**
+- **GPU preview:** the shade pass +0.06–0.09 ms at 960×540, in frames of 2–5 ms. Unchanged in
+  practice.
+- **CPU fallback:** +7–20 % in glossy-heavy scenes (best frame 11.1 → 13.2–13.5 ms on the metal
+  spheres), unchanged on diffuse ones.
+- **Load:** +0.1–0.3 s for the environment blur and probes; +~0.3 s for the studio map in the
+  model viewer.
+- **Parity:** GPU vs CPU within 0.13 levels mean (p99 0) on every scene checked.
+
+**Residuals (open, not bugs of the change):**
+- **A single probe position cannot be right everywhere.**
+  - The gallery previews a little brighter than mode D.
+  - The closed boxes (spot, curve room) a little darker than mode R.
+  - The spot box's ceiling reads 0.17 of the floor pool against the reference's 0.02: order-2 SH
+    smears a small bright pool over the whole hemisphere. The old preview had it too.
+- **Probe history, for the next person:**
+  - *Multi-bounce with colour* (tried): it fed a near object's hue back into the room. A gold gyroid
+    tinted the gallery orange, and coloured curves tinted a white room pink.
+  - *A near-skip distance* (tried): it looked through a small box's side walls and through the
+    floor under the probe.
+  - Both are gone. Brightness-only ambient plus a separate eye-positioned reflection probe is what
+    held up across all six references.
+- **Fisheye / panoramic cameras keep the slate backdrop.** The env background covers pinhole
+  cameras only, on both backends alike.
+- **A Meshy "glass orb" previews as dark metal.** Its file has metallicFactor 1.0 with a
+  mean-metal map and no KHR_materials_transmission, so ftrace imports it as metal. The tracer does
+  too; the preview now just shows it.
+
+Scratch evidence: `png/368_final_*.png` (model viewer, preview | traced), `png/368_v5.png` (six
+references), `png/rg368_sheet.png` (15-scene regression, old | new); scripts `scraps/rg_0368.py`,
+`scraps/qv_final_0368.py`, `scraps/cmp_0368.py`.
+
 ## DONE (2026-09-23, 0.367.3): GLTF-NORMALMAP-DROPPED — every imported glTF dielectric path-traced without its normal map (0.316.0–0.367.2)
 
 **Found by** the sequins added to the edited Alice (`D:\youtube\philosophy\3d objects\alice2\base_basic_pbr_flat_sparkle.glb`):

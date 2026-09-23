@@ -549,10 +549,12 @@ struct IsoPreviewTiming {
     double msReadback = 0.0;
 };
 
+namespace raster { struct PreviewLight; }   // raster.h (0.368.0: passed in, derived once)
 std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
                                           int W, int H, int nThreads, double exposure = 1.0,
                                           bool autoExpose = true, double* lockAnchor = nullptr,
-                                          IsoPreviewTiming* timing = nullptr);
+                                          IsoPreviewTiming* timing = nullptr,
+                                          const raster::PreviewLight* light = nullptr);
 
 // ---------------------------------------------------------------------------
 // N4a — mode-W deterministic-lattice bit-exactness probe (`-checklattice`).

@@ -50,6 +50,7 @@
 #include <array>
 #include <string>
 #include <cstdio>
+#include <cstdlib>
 #include "parallel.h"
 #include "scene.h"
 #include "camera.h"
@@ -282,28 +283,43 @@ inline Vec3 materialColor(const Material& m, bool& emissive) {
     return albedo;
 }
 
-// One positional/spot source distilled from a scene emitter for preview shading.
+// One source distilled from a scene emitter for preview shading. CALIBRATED since 0.368.0: it
+// carries the emitter's real colour and strength (its XYZ, cieMean * emitIntegral, through the
+// renderer's own XYZ -> linear-sRGB matrix, times the emitter's geometry) and falls off as the
+// real 1/d^2, where it used to be a colourless power-normalised weight with a made-up falloff.
+// Units are "preview units": everything deriveLight() builds is scaled so the brightest side of
+// a white surface at the scene centre reads 1.0, which keeps absolute-exposure previews and the
+// emitter display (EMIS_BOOST) where they always sat.
 struct PLight {
-    Vec3   pos{0, 0, 0};        // world position of the source
-    Vec3   dir{0, 0, 1};        // spot axis (source -> cone centre); unit
-    bool   spot = false;        // apply cone falloff via spotFalloff()
-    double cosInner = 1.0, cosOuter = 1.0;  // spot penumbra cosines
-    double weight = 1.0;        // power-normalised key weight (Σ weights = 1)
-    double falloff2 = 0.0;      // squared reference distance for 1/(1+d²/r²) (0 = none)
+    enum Kind : int { Point = 0, Spot = 1, Area = 2, Sun = 3 };
+    int    kind = Point;
+    Vec3   pos{0, 0, 0};        // Point / Spot / Area: the source's position
+    Vec3   dir{0, 0, 1};        // Spot: the axis light TRAVELS along; Area: its emission normal;
+                                // Sun: the unit direction TOWARD the sun
+    double cosInner = 1.0, cosOuter = 1.0;  // Spot penumbra cosines
+    Vec3   rgb{0, 0, 0};        // Point / Spot / Area: radiant intensity (Area: along its normal);
+                                // Sun: the irradiance on a surface facing it
+    double size = 0.0;          // Point / Spot / Area: the source's radius -- 1/d^2 is clamped
+                                // inside it and it widens the highlight; Sun: angular radius (rad)
 };
 
-// The scene's lights distilled for shading: every positional/spot emitter shades
 // ---- RASTER-PBR: the split-sum specular ------------------------------------------------------
 // Karis' analytic fit to the split-sum DFG term (SIGGRAPH 2013 "Real Shading in Unreal Engine
 // 4"), so the preview needs no LUT texture shipped alongside it. Returns the (A, B) that
 // multiply F0: specular_env = prefiltered * (F0*A + B).
 inline void envBrdfApprox(double NoV, double rough, double& A, double& B) {
-    // c0/c1 are the published constants; the fit is accurate to well under a preview's
-    // 8-bit output over the whole (NoV, roughness) square.
-    const double x = 1.0 - rough;
-    const double bias  = std::exp2(-9.28 * NoV) * x * x * x;
-    const double scale = x * x * x * x;
-    A = scale; B = bias;
+    // Karis, "Physically Based Shading on Mobile" (2014): c0/c1 are the published constants.
+    // Until 0.368.0 this body was NOT that fit -- it returned A = (1-r)^4 and B = 2^(-9.28 NoV)(1-r)^3,
+    // which at roughness 0.5 scales the environment by 0.06 where the DFG integral gives ~0.72. Under
+    // a 4 % dielectric coat that hardly shows; a metal is nothing BUT this term, so every rough
+    // metal previewed several times too dark (known-issues RASTER-METAL-LOOK).
+    const double r0 = rough * -1.0    + 1.0;
+    const double r1 = rough * -0.0275 + 0.0425;
+    const double r2 = rough * -0.572  + 1.04;
+    const double r3 = rough *  0.022  - 0.04;
+    const double a004 = std::min(r0 * r0, std::exp2(-9.28 * NoV)) * r0 + r1;
+    A = -1.04 * a004 + r2;
+    B =  1.04 * a004 + r3;
 }
 // Normalised GGX with Smith height-correlated masking and Schlick Fresnel, evaluated for one
 // key light. This is the half of the split-sum a preview cannot fake: the moving highlight is
@@ -325,85 +341,508 @@ inline double ggxSpec(const Vec3& N, const Vec3& V, const Vec3& L, double rough)
     return D * Vis * NoL;
 }
 
-// from its own real direction, plus flat ambient + a subtle camera-headlight fill.
+// Irradiance ARRIVING at `P` from one preview light, on a surface facing the light: `Ld` is the
+// unit direction toward the light, `E` the irradiance (the caller multiplies by N.L), `srcAng`
+// the source's angular radius as seen from `P` (what widens its highlight). False when the light
+// contributes nothing there (behind an area light, outside a spot's cone, at its own centre).
+inline bool previewLightAt(const PLight& lp, const Vec3& P, Vec3& Ld, Vec3& E, double& srcAng) {
+    if (lp.kind == PLight::Sun) { Ld = lp.dir; E = lp.rgb; srcAng = lp.size; return true; }
+    const Vec3 d = lp.pos - P;
+    const double dist2 = dot(d, d);
+    if (!(dist2 > 1e-24)) return false;
+    Ld = d * (1.0 / std::sqrt(dist2));
+    const double r2 = std::max(dist2, lp.size * lp.size);   // inside the source: stop growing
+    double g = 1.0 / r2;
+    if (lp.kind == PLight::Spot)      g *= spotFalloff(dot(lp.dir, Ld * -1.0), lp.cosInner, lp.cosOuter);
+    else if (lp.kind == PLight::Area) g *= std::max(0.0, -dot(lp.dir, Ld));   // one-sided, Lambertian
+    if (!(g > 0.0)) return false;
+    E = lp.rgb * g;
+    srcAng = lp.size / std::sqrt(r2);
+    return true;
+}
+
+// A source of angular radius `ang` reflected in a lobe of roughness `rough`: the highlight is the
+// lobe convolved with the source, which GGX approximates by widening alpha by half the source's
+// angular radius (a half-vector turns half as fast as the reflection). D stays normalised, so a
+// big softbox gives a big soft highlight carrying the same energy a small one packs into a glint.
+// The tracers' glossy lobe (bsdf_eval.h glossyExponent) is a Phong lobe of exponent 2/r^2 - 2
+// about the mirror direction; this preview's is GGX with alpha = rough^2. Matching the two
+// lobes' half-widths (Phong 0.833 r, GGX 1.29 alpha, both in the reflected direction) gives
+// alpha = 0.646 r -- so a material roughness reaches the preview as sqrt(0.646 r). Used raw, as
+// it was before 0.368.0, every preview highlight came out a factor ~2 narrower than the render's.
+inline double previewRough(double r) { return std::sqrt(0.646 * std::max(0.0, r)); }
+
+inline double widenRough(double rough, double ang) {
+    return std::sqrt(std::min(1.0, rough * rough + 0.5 * ang));
+}
+
+// ---- The preview ENVIRONMENT (0.368.0) --------------------------------------------------------
+// What a surface sees around it, as a small equirectangular radiance map: the scene's env light
+// (constant, image or sky) where a direction escapes, and -- for an FTSL scene -- the preview-lit
+// surroundings where it does not (the light probe, in deriveLight). Two things are read from it:
+//   * the DIFFUSE ambient, as order-2 spherical harmonics of the irradiance (nine RGB numbers,
+//     ~1-3 % from the exact cosine convolution: Ramamoorthi & Hanrahan 2001);
+//   * the SPECULAR environment, pre-blurred at kEnvLevels roughnesses and read along the
+//     reflection vector -- the split sum's other half, which the preview used to fake with a
+//     two-colour gradient anchored on a dim ambient. It is what a metal shows.
+// Row 0 is straight up; phi = atan2(z, x), u = phi/(2pi) + 0.5 -- EnvMap's convention.
+constexpr int    kEnvW = 64, kEnvH = 32, kEnvLevels = 6;
+// The environment drawn BEHIND the scene (PreviewLight::envBg): sharper than the lighting maps,
+// because it is looked at directly rather than integrated.
+constexpr int    kBgW = 256, kBgH = 128;
+// The inverse depth a background pixel showing the environment is stamped with: a surface at
+// (effectively) infinity, so the exposure treats it as the tracer treats its env background --
+// exposed and METERED -- and anything clear in front of it still composites over it.
+constexpr float  kEnvBgInvDepth = 1e-30f;
+constexpr double kEnvRough[kEnvLevels] = {0.0, 0.25, 0.4, 0.55, 0.7, 1.0};
+
+inline Vec3 envTexelDir(int col, int row) {
+    const double theta = (row + 0.5) / kEnvH * PI;
+    const double phi = ((col + 0.5) / kEnvW - 0.5) * 2.0 * PI;
+    const double st = std::sin(theta);
+    return Vec3{st * std::cos(phi), std::cos(theta), st * std::sin(phi)};
+}
+// The real SH basis to order 2.
+inline void shBasis9(const Vec3& d, double Y[9]);
+inline Vec3 shEval9(const Vec3 c[9], const Vec3& N);
+inline void shBasis9(const Vec3& d, double Y[9]) {
+    Y[0] = 0.282095;
+    Y[1] = 0.488603 * d.y; Y[2] = 0.488603 * d.z; Y[3] = 0.488603 * d.x;
+    Y[4] = 1.092548 * d.x * d.y; Y[5] = 1.092548 * d.y * d.z;
+    Y[6] = 0.315392 * (3.0 * d.z * d.z - 1.0);
+    Y[7] = 1.092548 * d.x * d.z; Y[8] = 0.546274 * (d.x * d.x - d.y * d.y);
+}
+
+// Cheap inverse trig for the preview environment lookup (0.368.0). The map's texels are 5.6
+// degrees wide, so exact acos/atan2 -- the costliest thing a glossy pixel did -- buy nothing.
+// acos: Abramowitz & Stegun 4.4.45, |error| <= 6.8e-5 rad. atan: a minimax odd polynomial on
+// [-1, 1], |error| <= 1e-5 rad, folded to the full circle. The device twins are identical.
+inline double previewAcos(double x) {
+    const double ax = std::fabs(x);
+    const double r = std::sqrt(std::max(0.0, 1.0 - ax)) *
+                     (1.5707288 + ax * (-0.2121144 + ax * (0.0742610 + ax * -0.0187293)));
+    return (x >= 0.0) ? r : PI - r;
+}
+inline double previewAtan2(double y, double x) {
+    const double ax = std::fabs(x), ay = std::fabs(y);
+    const double mx = std::max(ax, ay);
+    if (!(mx > 0.0)) return 0.0;
+    const double z = std::min(ax, ay) / mx, z2 = z * z;
+    double a = z * (0.99997726 + z2 * (-0.33262347 + z2 * (0.19354346 + z2 * (-0.11643287 +
+                    z2 * (0.05265332 + z2 * -0.01172120)))));
+    if (ay > ax) a = 0.5 * PI - a;
+    if (x < 0.0) a = PI - a;
+    return (y < 0.0) ? -a : a;
+}
+
+inline Vec3 shEval9(const Vec3 c[9], const Vec3& N) {
+    double Y[9]; shBasis9(N, Y);
+    Vec3 s{0, 0, 0};
+    for (int i = 0; i < 9; ++i) s += c[i] * Y[i];
+    return Vec3{std::max(0.0, s.x), std::max(0.0, s.y), std::max(0.0, s.z)};
+}
+
 struct PreviewLight {
-    std::vector<PLight> lights;  // one entry per positional/spot emitter
-    double ambient  = 0.12;      // flat fill so nothing is pure black (kept low for contrast)
-    double keyScale = 1.15;      // overall multiplier on the summed weighted N·L
-    double fill     = 0.08;      // subtle headlight so back faces aren't crushed to black
-    // The SPECULAR environment (0.317.0). The diffuse half of this preview is still the flat
-    // `ambient` scalar; the specular half reflects this sky/ground pair instead, because a
-    // CONSTANT environment is invisible in a reflection -- a 4 % dielectric coat reflecting
-    // exactly the ambient it is already lit by adds nothing, which is why an imported glTF
-    // dielectric read as chalk here next to the viewers this preview is measured against
-    // (they reflect an HDRI, where the sky is several times the mean and the grazing Fresnel
-    // rise lands on it). The pair's mean is `ambient`, so what changes is the DIRECTIONALITY,
-    // not the exposure.
-    Vec3   envUp{0, 0, 0};       // reflected radiance looking up   (1.65 x ambient)
-    Vec3   envDn{0, 0, 0};       // ...and looking down             (0.35 x ambient)
+    std::vector<PLight> lights;   // every emitter but the env, calibrated (see PLight)
+    // Diffuse ambient: E(N)/pi as order-2 SH -- the radiance a white Lambertian surface facing N
+    // returns from the surroundings. Evaluate with ambientAt().
+    Vec3   sh[9] = {};
+    double fill = 0.03;           // a faint camera headlight, so an unlit side is never pure black
+    // Specular environment: kEnvLevels maps of kEnvW x kEnvH, level k blurred for roughness
+    // kEnvRough[k]. Empty = nothing to reflect. Evaluate with envSpecularAt().
+    std::vector<Vec3> envSpec;
+    // BOX PROJECTION (0.368.0). When the map holds the scene's own surfaces (the light probe)
+    // a reflection must not be looked up along R from the PROBE -- the probe stands elsewhere,
+    // and a mirror by a wall would read the far side of the room. The standard correction:
+    // follow the reflection ray from the shading point to where it leaves the scene's box and
+    // look the probe up toward THAT point. Off for an env-only map, which is infinitely far.
+    // The scene's environment light as the BACKGROUND (kBgW x kBgH, env only -- never the probe's
+    // surfaces), or empty when the scene has none and the preview keeps its slate backdrop. The
+    // tracer shows its env behind the scene and meters it with everything else; so must the
+    // preview, or a model that is all metal meters on its own softbox glints and goes dark.
+    std::vector<Vec3> envBg;
+    Vec3 envBgAt(const Vec3& d) const {
+        const double v = previewAcos(std::min(1.0, std::max(-1.0, d.y))) * (1.0 / PI);
+        double u = previewAtan2(d.z, d.x) * (0.5 / PI) + 0.5;
+        if (u >= 1.0) u -= 1.0;
+        if (u < 0.0) u += 1.0;
+        const double x = u * kBgW - 0.5, y = v * kBgH - 0.5;
+        int x0 = (int)x; if ((double)x0 > x) --x0;
+        int y0 = (int)y; if ((double)y0 > y) --y0;
+        const double fx = x - x0, fy = y - y0;
+        int x1 = x0 + 1, y1 = y0 + 1;
+        if (x0 < 0) x0 += kBgW;
+        if (x1 >= kBgW) x1 -= kBgW;
+        y0 = std::max(0, y0); y1 = std::min(kBgH - 1, y1);
+        const Vec3* m = envBg.data();
+        return m[y0 * kBgW + x0] * ((1.0 - fx) * (1.0 - fy)) + m[y0 * kBgW + x1] * (fx * (1.0 - fy)) +
+               m[y1 * kBgW + x0] * ((1.0 - fx) * fy) + m[y1 * kBgW + x1] * (fx * fy);
+    }
+    bool boxProj = false;
+    Vec3 boxLo{0, 0, 0}, boxHi{0, 0, 0}, probePos{0, 0, 0};
+    Vec3 lookupDir(const Vec3& P, const Vec3& R) const {
+        if (!boxProj) return R;
+        double tExit = 1e300;
+        const double p[3] = {P.x, P.y, P.z}, r[3] = {R.x, R.y, R.z};
+        const double lo[3] = {boxLo.x, boxLo.y, boxLo.z}, hi[3] = {boxHi.x, boxHi.y, boxHi.z};
+        for (int a = 0; a < 3; ++a) {
+            if (p[a] < lo[a] || p[a] > hi[a]) return R;           // outside the box: no proxy
+            if (r[a] > 1e-12)       tExit = std::min(tExit, (hi[a] - p[a]) / r[a]);
+            else if (r[a] < -1e-12) tExit = std::min(tExit, (lo[a] - p[a]) / r[a]);
+        }
+        if (!(tExit < 1e299)) return R;
+        const Vec3 d = (P + R * tExit) - probePos;
+        const double l = std::sqrt(dot(d, d));
+        return (l > 1e-12) ? d * (1.0 / l) : R;
+    }
+    Vec3 ambientAt(const Vec3& N) const {
+        double Y[9]; shBasis9(N, Y);
+        Vec3 c{0, 0, 0};
+        for (int i = 0; i < 9; ++i) c += sh[i] * Y[i];
+        return Vec3{std::max(0.0, c.x), std::max(0.0, c.y), std::max(0.0, c.z)};
+    }
+    // Bilinear in (u, v) -- u wraps, v clamps -- on two adjacent roughness levels, blended by `t`.
+    // The four texel positions and weights are shared by both levels: this is the costliest thing a
+    // glossy pixel does, so it avoids std::floor and the integer modulo (u is in [0,1), so the left
+    // column is at worst -1).
+    Vec3 envSpecularAt(const Vec3& R, double rough) const {
+        if (envSpec.empty()) return Vec3{0, 0, 0};
+        const double v = previewAcos(std::min(1.0, std::max(-1.0, R.y))) * (1.0 / PI);
+        double u = previewAtan2(R.z, R.x) * (0.5 / PI) + 0.5;
+        if (u >= 1.0) u -= 1.0;
+        if (u < 0.0) u += 1.0;
+        int k = 0;
+        while (k + 1 < kEnvLevels - 1 && rough > kEnvRough[k + 1]) ++k;
+        const double t = std::min(1.0, std::max(0.0, (rough - kEnvRough[k]) / (kEnvRough[k + 1] - kEnvRough[k])));
+        const double x = u * kEnvW - 0.5, y = v * kEnvH - 0.5;
+        int x0 = (int)x; if ((double)x0 > x) --x0;
+        int y0 = (int)y; if ((double)y0 > y) --y0;
+        const double fx = x - x0, fy = y - y0;
+        int x1 = x0 + 1, y1 = y0 + 1;
+        if (x0 < 0) x0 += kEnvW;
+        if (x1 >= kEnvW) x1 -= kEnvW;
+        y0 = std::max(0, y0); y1 = std::min(kEnvH - 1, y1);
+        const double w00 = (1.0 - fx) * (1.0 - fy), w10 = fx * (1.0 - fy);
+        const double w01 = (1.0 - fx) * fy,         w11 = fx * fy;
+        const size_t i00 = (size_t)y0 * kEnvW + x0, i10 = (size_t)y0 * kEnvW + x1;
+        const size_t i01 = (size_t)y1 * kEnvW + x0, i11 = (size_t)y1 * kEnvW + x1;
+        const Vec3* a = envSpec.data() + (size_t)k * kEnvW * kEnvH;
+        const Vec3* b = a + (size_t)kEnvW * kEnvH;
+        const Vec3 ca = a[i00] * w00 + a[i10] * w10 + a[i01] * w01 + a[i11] * w11;
+        const Vec3 cb = b[i00] * w00 + b[i10] * w10 + b[i01] * w01 + b[i11] * w11;
+        return ca * (1.0 - t) + cb * t;
+    }
 };
 
-inline PreviewLight deriveLight(const Scene& sc) {
-    PreviewLight L;
-    const double refR = sc.sceneRadius > 0 ? sc.sceneRadius * 0.6 : 0.0;
-    const double fall2 = refR * refR;
-    bool anyEnv = false;
-    double totalPow = 0.0;
+// The albedo a probe ray sees on a surface: the material's preview colour, a mix resolved to
+// its dominant child as everywhere else in this file, an image skin sampled at the hit.
+inline Vec3 probeAlbedo(const Scene& sc, const Hit& h, bool& emissive) {
+    int id = h.matId;
+    for (int guard = 0; guard < 8; ++guard) {
+        if (id < 0 || id >= (int)sc.mats.size()) break;
+        const Material& m = sc.mats[id];
+        if (m.mixChildren.empty()) break;
+        const int pick = mixDominantChild(m);
+        if (pick < 0 || pick == id || pick >= (int)sc.mats.size()) break;
+        id = pick;
+    }
+    emissive = false;
+    if (id < 0 || id >= (int)sc.mats.size()) return Vec3{0.6, 0.6, 0.6};
+    const Material& m = sc.mats[id];
+    bool em = false;
+    Vec3 c = materialColor(m, em);
+    emissive = em || m.isLight;
+    if (!emissive && m.reflectTex >= 0 && m.reflectTex < (int)sc.textures.size() &&
+        sc.textures[m.reflectTex].valid())
+        c = sc.textures[m.reflectTex].sampleRgb(h.u, h.v);
+    return c;
+}
 
-    for (const auto& e : sc.emitters) {
-        if (e.shape == EmitterShape::Env) { anyEnv = true; continue; }
+// Distil the scene's lights for the preview (0.368.0). `probePos` is where the light probe
+// stands -- the first camera's eye, which is in free space by construction -- and
+// `probeGeometry` says whether it looks at the scene's surfaces at all: false for the mesh
+// quick-view, whose only geometry is the model being viewed (a probe would see the model's own
+// inside). Runs once per scene load; every per-pixel cost it adds is two SH/map lookups.
+// `withSpecular` false skips the pre-blurred reflection levels -- for a diffuse-only consumer
+// (the GPU implicit preview) that derives per frame, where the blur is the one costly step.
+// `reflectPos`: where the REFLECTION probe stands (the camera's eye; null = probePos). The ambient
+// probe stands at probePos, where the camera looks.
+inline PreviewLight deriveLight(const Scene& sc, const Vec3& probePos, bool probeGeometry,
+                                bool withSpecular = true, const Vec3* reflectPos = nullptr) {
+    PreviewLight L;
+    const double R = sc.sceneRadius > 0.0 ? sc.sceneRadius : 1.0;
+
+    // ---- 1. The lights, in physical units (normalised at the end). -----------------------
+    for (const Emitter& e : sc.emitters) {
+        if (e.shape == EmitterShape::Env) continue;
+        const Vec3 rgb = xyzToLinearSrgb(e.cieMean * e.emitIntegral);   // radiance (sun: /Omega)
         PLight p;
         switch (e.shape) {
-            case EmitterShape::Quad:     p.pos = e.origin + (e.u + e.v) * 0.5; break;
-            case EmitterShape::Cylinder: p.pos = e.origin + e.v * 0.5;         break;  // tube centre
-            default:                     p.pos = e.origin;                     break;  // sphere / spot
+            case EmitterShape::Sun:
+                p.kind = PLight::Sun;
+                p.dir  = normalize(e.beamDir) * -1.0;
+                p.rgb  = rgb * e.spotOmega;                  // back to irradiance
+                p.size = std::acos(std::min(1.0, std::max(-1.0, e.spotCosOuter)));
+                break;
+            case EmitterShape::Spot:
+                p.kind = PLight::Spot;
+                p.pos = e.origin; p.dir = normalize(e.beamDir);
+                p.cosInner = e.spotCosInner; p.cosOuter = e.spotCosOuter;
+                p.rgb  = rgb;                                // emitIntegral is the on-axis intensity
+                p.size = std::max(e.radius, 1e-3 * R);
+                break;
+            case EmitterShape::Quad:
+                p.kind = PLight::Area;
+                p.pos = e.origin + (e.u + e.v) * 0.5;
+                p.dir = e.collimated ? normalize(e.beamDir) : normalize(e.normal);
+                p.rgb  = rgb * e.area;                       // I(w) = L A cos -- the cos is per point
+                p.size = std::sqrt(std::max(0.0, e.area) / PI);
+                break;
+            case EmitterShape::Cylinder:
+                p.kind = PLight::Point;
+                p.pos = e.origin + e.v * 0.5;
+                p.rgb  = rgb * (e.area * 0.25);              // mean projected area of a convex body: S/4
+                p.size = std::max(e.radius, 0.5 * length(e.v));
+                break;
+            case EmitterShape::Mesh: {
+                p.kind = PLight::Point;
+                Vec3 cen{0, 0, 0}; double wsum = 0.0, prev = 0.0;
+                for (const EmitTri& t : e.meshTris) {
+                    const double a = t.cumArea - prev; prev = t.cumArea;
+                    cen += (t.v0 + (t.e1 + t.e2) * (1.0 / 3.0)) * a; wsum += a;
+                }
+                p.pos = (wsum > 0.0) ? cen * (1.0 / wsum) : e.origin;
+                p.rgb  = rgb * (e.area * 0.25);
+                p.size = std::sqrt(std::max(0.0, e.area) / (4.0 * PI));
+                break;
+            }
+            default:                                         // Sphere
+                p.kind = PLight::Point;
+                p.pos = e.origin;
+                p.rgb  = rgb * (e.area * 0.25);              // == pi r^2 L
+                p.size = e.radius;
+                break;
         }
-        if (e.shape == EmitterShape::Spot) {
-            p.spot = true;
-            p.dir = normalize(e.beamDir);
-            p.cosInner = e.spotCosInner;
-            p.cosOuter = e.spotCosOuter;
-        }
-        p.weight   = std::max(e.power, 0.0);
-        p.falloff2 = fall2;
-        if (e.shape == EmitterShape::Sun) {
-            // A distant sun is directional: fake it as a point source parked far up the
-            // beam with distance falloff disabled, so every surface shades from the same
-            // (to ~1e-4 rad) direction at full strength. No new PLight field, hence no
-            // change needed in the two GPU mirrors of this struct.
-            p.pos = sc.sceneCenter - normalize(e.beamDir) * (sc.sceneRadius * 1e4 + 1e4);
-            p.falloff2 = 0.0;
-        }
-        totalPow  += p.weight;
-        L.lights.push_back(p);
+        if (p.rgb.x > 0.0 || p.rgb.y > 0.0 || p.rgb.z > 0.0) L.lights.push_back(p);
     }
 
-    // Normalise weights so total key intensity is stable regardless of light count.
-    if (totalPow > 0.0)
-        for (auto& p : L.lights) p.weight /= totalPow;
-    else
-        for (auto& p : L.lights) p.weight = 1.0 / (double)L.lights.size();
+    // ---- 2. The environment map: the env light where a direction escapes. -----------------
+    const int NT = kEnvW * kEnvH;
+    std::vector<Vec3> dirs(NT);
+    std::vector<double> dOmega(NT);
+    for (int row = 0; row < kEnvH; ++row)
+        for (int col = 0; col < kEnvW; ++col) {
+            const int t = row * kEnvW + col;
+            dirs[t] = envTexelDir(col, row);
+            const double theta = (row + 0.5) / kEnvH * PI;
+            dOmega[t] = (2.0 * PI / kEnvW) * (PI / kEnvH) * std::sin(theta);
+        }
+    // The env light on a W x H lat-long grid (box-filtered from an image map; constant otherwise).
+    auto bakeEnv = [&](int GW, int GH) {
+        std::vector<Vec3> out((size_t)GW * GH, Vec3{0, 0, 0});
+        if (sc.envIndex < 0) return out;
+        if (sc.envMap) {
+            const EnvMap& m = *sc.envMap;
+            std::vector<int> colMap(m.w), rowMap(m.h);
+            std::vector<double> rowW(m.h);
+            for (int c = 0; c < m.w; ++c) {
+                double u = (c + 0.5) / m.w + m.rotOffset; u -= std::floor(u);
+                colMap[c] = std::min(GW - 1, (int)(u * GW));
+            }
+            for (int r = 0; r < m.h; ++r) {
+                rowMap[r] = std::min(GH - 1, (int)((r + 0.5) / m.h * GH));
+                rowW[r] = std::sin((r + 0.5) / m.h * PI);
+            }
+            std::vector<Vec3> acc(out.size(), Vec3{0, 0, 0});
+            std::vector<double> wsum(out.size(), 0.0);
+            for (int r = 0; r < m.h; ++r) {
+                const int base = rowMap[r] * GW;
+                const double w = rowW[r];
+                const Vec3* src = m.xyzT.data() + (size_t)r * m.w;
+                for (int c = 0; c < m.w; ++c) { acc[base + colMap[c]] += src[c] * w; wsum[base + colMap[c]] += w; }
+            }
+            for (int row = 0; row < GH; ++row)
+                for (int col = 0; col < GW; ++col) {
+                    const size_t t = (size_t)row * GW + col;
+                    if (wsum[t] > 0.0) { out[t] = xyzToLinearSrgb(acc[t] * (1.0 / wsum[t])); continue; }
+                    const double th = (row + 0.5) / GH * PI, ph = ((col + 0.5) / GW - 0.5) * 2.0 * PI;
+                    out[t] = xyzToLinearSrgb(m.xyz(Vec3{std::sin(th) * std::cos(ph), std::cos(th),
+                                                        std::sin(th) * std::sin(ph)}));
+                }
+        } else {
+            const Vec3 c = xyzToLinearSrgb(sc.envXYZ);
+            for (Vec3& v : out) v = c;
+        }
+        for (Vec3& v : out) v = Vec3{std::max(0.0, v.x), std::max(0.0, v.y), std::max(0.0, v.z)};
+        return out;
+    };
+    std::vector<Vec3> envL = bakeEnv(kEnvW, kEnvH);
+    if (withSpecular && sc.envIndex >= 0) L.envBg = bakeEnv(kBgW, kBgH);
+    auto projectSH = [&](const std::vector<Vec3>& Lmap, Vec3 out[9]) {
+        // Irradiance/pi from radiance: band l scaled by A_l/pi = {1, 2/3, 1/4}.
+        static const double kBand[9] = {1.0, 2.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0, 0.25, 0.25, 0.25, 0.25, 0.25};
+        for (int i = 0; i < 9; ++i) out[i] = Vec3{0, 0, 0};
+        double Y[9];
+        for (int t = 0; t < NT; ++t) {
+            shBasis9(dirs[t], Y);
+            for (int i = 0; i < 9; ++i) out[i] += Lmap[t] * (Y[i] * dOmega[t]);
+        }
+        for (int i = 0; i < 9; ++i) out[i] = out[i] * kBand[i];
+    };
 
-    if (L.lights.empty() && anyEnv) {
-        // Env-only: lean on the headlight for shape, higher ambient so the far side
-        // doesn't read flat-black.
-        L.ambient = 0.30; L.keyScale = 0.0; L.fill = 0.75;
-    } else if (anyEnv) {
-        // Positional/spot keys PLUS an environment fill: moderate ambient, softer key.
-        L.ambient = 0.24; L.keyScale = 0.95; L.fill = 0.12;
+    // ---- 3. The light probe: the preview-lit surroundings where a direction is blocked. ----
+    // Stood at the first camera's eye (free space by construction), it takes the first surface
+    // each direction meets, either side -- ftrace shades surfaces two-sided, and a floor quad
+    // authored facing down is still the floor (skipping back faces looked straight through
+    // one) -- and gives an emitter's own surface nothing, because the lights reach every
+    // shading point analytically already. Each surface it finds is lit exactly as the preview
+    // lights it (the calibrated lights, unshadowed, plus the env's ambient), so a metal in a room
+    // reflects that room: the walls and their colours. One bounce from one position -- box
+    // projection (PreviewLight::lookupDir) corrects the parallax of looking it up elsewhere.
+    // TWO PROBES. The AMBIENT probe stands where the camera looks (probePos): inside the room the
+    // camera is looking into, which is what gives a closed box its level of bounce light. The
+    // REFLECTION probe stands at the camera's eye (reflectPos): free space by construction, and
+    // nothing in its view dominates it -- at probePos the object in view filled half the probe's
+    // sky, and a gold gyroid reflected mostly itself. Box projection (lookupDir) keeps the walls
+    // where they are when a reflection is looked up from the eye.
+    std::vector<Vec3> surL = envL;
+    const bool anyGeo = probeGeometry && (!sc.tris.empty() || !sc.spheres.empty() ||
+                                          !sc.implicits.empty() || !sc.instances.empty());
+    Vec3 shEnv[9]; projectSH(envL, shEnv);
+    // Trace one probe: what each direction's first surface is (0 escaped, 1 surface, 2 an emitter's
+    // own), its albedo and normal, and the calibrated lights' irradiance on it -- UNSHADOWED, like the
+    // preview's own lighting (a probe must show a surface as the preview draws it; shadow rays also
+    // treat glass as opaque, which blacked out everything a bulb in a glass envelope lights).
+    struct Probe { std::vector<char> kind; std::vector<Vec3> alb, nrm, E; };
+    const double eps = 1e-5 * R;
+    auto trace = [&](const Vec3& pos) {
+        Probe P;
+        P.kind.assign(NT, 0); P.alb.resize(NT); P.nrm.resize(NT); P.E.resize(NT);
+        (void)ft::parallelFor((size_t)NT, 32, [&](size_t t) {   // a clean stop just ends the probe early
+            const Hit h = sc.closestHit(Ray{pos, dirs[t]}, eps);
+            if (!h.valid) return;                                            // escaped: the env
+            bool emissive = false;
+            const Vec3 alb = probeAlbedo(sc, h, emissive);
+            if (emissive) { P.kind[t] = 2; return; }
+            const Vec3 n = h.n;                                              // faces the probe
+            Vec3 E{0, 0, 0};
+            for (const PLight& lp : L.lights) {
+                Vec3 Ld, Ei; double ang;
+                if (!previewLightAt(lp, h.p, Ld, Ei, ang)) continue;
+                const double ndl = dot(n, Ld);
+                if (ndl > 0.0) E += Ei * ndl;
+            }
+            P.kind[t] = 1; P.alb[t] = alb; P.nrm[t] = n; P.E[t] = E;
+        });
+        return P;
+    };
+    // Shade a traced probe with `amb` as every surface's ambient.
+    auto shade = [&](const Probe& P, const Vec3 amb[9], std::vector<Vec3>& out) {
+        for (int t = 0; t < NT; ++t) {
+            if (P.kind[t] == 0) { out[t] = envL[t]; continue; }
+            if (P.kind[t] == 2) { out[t] = Vec3{0, 0, 0}; continue; }
+            const Vec3 a = shEval9(amb, P.nrm[t]);
+            const Vec3& al = P.alb[t]; const Vec3& E = P.E[t];
+            out[t] = Vec3{al.x * (E.x / PI + a.x), al.y * (E.y / PI + a.y), al.z * (E.z / PI + a.z)};
+        }
+    };
+    if (anyGeo) {
+        // The AMBIENT: the probed surfaces' BRIGHTNESS but not their hue (the env keeps its colour).
+        // One probe overweights whatever it stands beside, and it was the colour that contaminated:
+        // a gold gyroid tinted a whole gallery orange, a few coloured curves tinted a white room pink.
+        // Each pass lights the surfaces with the previous pass's surroundings, so a room is lit by
+        // its own walls: THREE bounces, which the reference renders favour for closed rooms (the
+        // curve room, the spot box) now that the colour cannot feed back.
+        const Probe A = trace(probePos);
+        std::vector<Vec3> shaded(NT), grey(NT);
+        Vec3 shPrev[9];
+        for (int i = 0; i < 9; ++i) shPrev[i] = shEnv[i];
+        int passes = 3;
+        if (const char* ev = std::getenv("FTRACE_PREVIEW_BOUNCES")) passes = std::max(1, std::min(8, std::atoi(ev)));
+        for (int pass = 0; pass < passes; ++pass) {
+            shade(A, shPrev, shaded);
+            for (int t = 0; t < NT; ++t) {
+                if (A.kind[t] != 1) { grey[t] = shaded[t]; continue; }
+                const double y = 0.2126 * shaded[t].x + 0.7152 * shaded[t].y + 0.0722 * shaded[t].z;
+                grey[t] = Vec3{y, y, y};
+            }
+            projectSH(grey, shPrev);
+        }
+        for (int i = 0; i < 9; ++i) L.sh[i] = shPrev[i];
+        // The REFLECTIONS: from the eye, in full colour -- a thing reflected is supposed to show its
+        // colour -- each surface lit by the lights and the ambient just found.
+        if (withSpecular) {
+            const Probe Rp = trace(reflectPos ? *reflectPos : probePos);
+            shade(Rp, L.sh, surL);
+        }
     } else {
-        // Lone bulb / multiple bulbs, no env (the gallery case): low ambient +
-        // inverse-square-ish falloff so surfaces shade from each source outward.
-        L.ambient = 0.10; L.keyScale = 1.25; L.fill = 0.06;
+        for (int i = 0; i < 9; ++i) L.sh[i] = shEnv[i];                         // env only
     }
-    // The specular environment, anchored on whichever ambient the branches above chose. Kept
-    // NEUTRAL in hue: tinting it from the scene's env light would be a second guess layered on
-    // the first, and a preview that quietly recolours every highlight is harder to trust than
-    // one that only says which way is up. 1.65 / 0.35 average to 1, i.e. the same total the
-    // constant environment delivered, redistributed.
-    L.envUp = Vec3{1, 1, 1} * (L.ambient * 1.65);
-    L.envDn = Vec3{1, 1, 1} * (L.ambient * 0.35);
+    if (probeGeometry && sc.sceneBoxLo.x <= sc.sceneBoxHi.x) {
+        // A hair of margin so a surface ON the box face still counts as inside it.
+        const Vec3 m = (sc.sceneBoxHi - sc.sceneBoxLo) * 1e-4 + Vec3{1e-9, 1e-9, 1e-9};
+        L.boxProj = true; L.boxLo = sc.sceneBoxLo - m; L.boxHi = sc.sceneBoxHi + m;
+        // An env light means an open sky: the box has no lid, or an upward reflection would
+        // leave through a ceiling at the top of the tallest object and read the horizon.
+        if (sc.envIndex >= 0) L.boxHi.y = L.boxLo.y + 1e4 * R;
+        L.probePos = reflectPos ? *reflectPos : probePos;
+    }
+
+    // ---- 4. The specular levels: surL blurred by a normalised cosine-power lobe per level. ----
+    if (withSpecular) {
+    L.envSpec.assign((size_t)kEnvLevels * NT, Vec3{0, 0, 0});
+    std::copy(surL.begin(), surL.end(), L.envSpec.begin());
+    for (int k = 1; k < kEnvLevels; ++k) {
+        const double a = kEnvRough[k] * kEnvRough[k];
+        const double nPhong = std::max(1.0, (2.0 / (a * a) - 2.0) * 0.25);   // Blinn exponent / 4
+        Vec3* out = L.envSpec.data() + (size_t)k * NT;
+        (void)ft::parallelFor((size_t)NT, 16, [&](size_t t) {
+            const Vec3 R0 = dirs[t];
+            Vec3 acc{0, 0, 0}; double wsum = 0.0;
+            for (int s2 = 0; s2 < NT; ++s2) {
+                const double c = dot(R0, dirs[s2]);
+                if (c <= 0.0) continue;
+                const double w = std::exp(nPhong * std::log(c)) * dOmega[s2];
+                acc += surL[s2] * w; wsum += w;
+            }
+            out[t] = (wsum > 0.0) ? acc * (1.0 / wsum) : Vec3{0, 0, 0};
+        });
+    }
+    }
+
+    // ---- 5. Preview units: the brightest side of a white surface at the centre reads 1. -----
+    double T = 0.0;
+    static const Vec3 kAxes[6] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+    for (const Vec3& N : kAxes) {
+        Vec3 v = L.ambientAt(N);
+        for (const PLight& lp : L.lights) {
+            Vec3 Ld, E; double ang;
+            if (!previewLightAt(lp, sc.sceneCenter, Ld, E, ang)) continue;
+            const double ndl = dot(N, Ld);
+            if (ndl > 0.0) v += E * (ndl / PI);
+        }
+        T = std::max(T, 0.2126 * v.x + 0.7152 * v.y + 0.0722 * v.z);
+    }
+    if (T > 0.0 && std::isfinite(T)) {
+        const double S = 1.0 / T;
+        for (PLight& lp : L.lights) lp.rgb = lp.rgb * S;
+        for (Vec3& c : L.sh) c = c * S;
+        for (Vec3& c : L.envSpec) c = c * S;
+        for (Vec3& c : L.envBg) c = c * S;
+    } else {
+        // Nothing lights the scene (or it cannot be measured): a flat grey studio, so the preview
+        // still shows the shapes -- the old env-only look.
+        L.lights.clear();
+        for (Vec3& c : L.sh) c = Vec3{0, 0, 0};
+        L.sh[0] = Vec3{1, 1, 1} * (0.35 / 0.282095);
+        for (Vec3& c : L.envSpec) c = Vec3{0.35, 0.35, 0.35};
+        L.fill = 0.5;
+    }
     return L;
+}
+// Scene-centre overload for callers with no camera to stand the probe at (and no probe).
+inline PreviewLight deriveLight(const Scene& sc, bool withSpecular = true) {
+    return deriveLight(sc, sc.sceneCenter, false, withSpecular);
 }
 
 // Deepest `ccap` (rings per spherical cap) any curve LOD may ask for — sizes the
@@ -449,6 +888,11 @@ inline void stripColor(PreviewGeom& g, const Vec3& neutral = Vec3{0.72, 0.72, 0.
         s.reflectPat     = -1;
         s.emitPat        = -1;
         s.normalTex      = -1;
+        // A glossy surface is all lobe (bakeOwn's negative f0), which is right for "what does it
+        // look like" and wrong for "what shape is it": a mirror-like surface shows its
+        // surroundings, not its form. Clay it is -- the neutral albedo as a diffuse body with a
+        // neutral highlight on top, so the lobe's shape still reads.
+        if (s.f0.x < 0.0) s.f0 = neutral;
         // A clear surface never reaches the shade pass at all — see-through hands it to
         // the clear-accumulation pass, which reads ONLY this tint. Leaving it coloured
         // meant "Color off" did nothing whatsoever on an all-glass model: every triangle
@@ -507,12 +951,18 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
         // family is already handled by see-through. `reflect` IS the normal-incidence
         // reflectance for a metal preset, which is why the highlight has to be tinted by it
         // rather than white -- a white highlight on gold is the single most obvious tell.
-        if (!m.isLight && m.type == MatType::Glossy) {
-            s.rough = (m.roughness > 0.0) ? m.roughness : 0.2;
-            bool dummy = false;
-            s.f0 = materialColor(m, dummy);
-            s.roughPat = m.roughnessPat;
-            s.roughTex = m.roughnessTex;
+        // Since 0.368.0 a Mirror is a lobe too: with a real environment to reflect (the light
+        // probe, PreviewLight::envSpec) a near-zero roughness shows what a mirror shows, where
+        // before it could only be a flat bright tint. Both are tinted by their TRUE reflectance:
+        // materialColor lifts every glossy material to luminance 0.7 so it reads as a pale ghost
+        // in a flat-shaded preview, which for a surface that is all reflection would brighten a
+        // 40 % polished floor to 70 %.
+        if (!m.isLight && (m.type == MatType::Glossy || m.type == MatType::Mirror)) {
+            const bool mirror = (m.type == MatType::Mirror);
+            s.rough    = mirror ? 0.02 : previewRough(m.roughness);
+            s.color    = spectrumToLinearRgb(m.reflect);
+            s.roughPat = mirror ? -1 : m.roughnessPat;
+            s.roughTex = mirror ? -1 : m.roughnessTex;
         }
         // An image skin: a diffuse-albedo texture bound via `reflect texture:<name>`.
         // The preview shades from the texture's linear RGB (Texture::sampleRgb), so no
@@ -529,14 +979,18 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             s.tex = rt;
             s.triplanarScale = m.triplanarScale;
         }
-        // A TEXTURED glossy material -- an imported glTF metal, whose tint IS its base colour --
-        // takes its highlight colour from the texel, not from the constant `reflect` (which the
-        // importer leaves white once the colour lives in the texture), as the tracer's reflectSlot
-        // does since 0.367.2. Marked by a NEGATIVE f0, which no real reflectance is, so the flag
-        // rides every existing path (the near-clip store, the mix table, the device copy) without
-        // a new field; the shaders resolve it to the sampled albedo. Untextured materials keep
-        // their constant f0 exactly.
-        if (s.rough >= 0.0 && s.tex >= 0) s.f0 = Vec3{-1.0, -1.0, -1.0};
+        // A GLOSSY (or mirror) material is ALL LOBE: the tracers give it no diffuse term -- a metal's
+        // whole appearance is reflection -- so the preview must not invent one. Its lobe is tinted
+        // by the albedo the pixel shades with, texture, pattern drive and vertex colour included,
+        // which is the tracer's reflectSlot chain since 0.367.2 (a textured glTF metal keeps its
+        // colour in the texture and leaves the constant white). Both facts ride ONE marker, a
+        // NEGATIVE f0, which no real reflectance is, so it travels every existing path (the
+        // near-clip store, the mix table, the device copy) without a new field; the shaders
+        // resolve it to the albedo and drop the diffuse term. 0.367.2 set it for textured glossy
+        // only (the tint). 0.368.0 sets it for every glossy material, now that the preview has a
+        // calibrated environment for such a surface to reflect: 0.368.0's first attempt, against
+        // the old dim sky/ground pair, turned gold and chrome dark brown and grey.
+        if (s.rough >= 0.0) s.f0 = Vec3{-1.0, -1.0, -1.0};
         // Scalar pattern drives. `reflect pattern:` / `reflect_map pattern:` both land in
         // reflectPat and multiply the albedo; `emit pattern:` / `emit_map pattern:` land
         // in emitPat and multiply the emission. Same slots, same clamp, as the tracer.
@@ -590,7 +1044,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             const double f0 = (m.coatModel == 2 && m.coatSpecular >= 0.0)
                                   ? std::min(1.0, std::max(0.0, m.coatSpecular))
                                   : ((n - 1.0) / (n + 1.0)) * ((n - 1.0) / (n + 1.0));
-            matSh[i].rough    = (m.roughness > 0.0) ? m.roughness : 0.05;
+            matSh[i].rough    = previewRough(m.roughness);
             matSh[i].f0       = Vec3{f0, f0, f0};
             matSh[i].roughPat = m.roughnessPat;
             matSh[i].roughTex = m.roughnessTex;
@@ -604,9 +1058,8 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             double w = (k < m.mixWeights.size()) ? m.mixWeights[k] : 0.0;
             w = (w < 0.0) ? 0.0 : (w > 1.0 ? 1.0 : w);
             if (!(w > 0.0)) continue;
-            bool dummyEm = false;
-            const Vec3 cf0 = materialColor(cm, dummyEm);
-            matSh[i].rough    = (cm.roughness > 0.0) ? cm.roughness : 0.2;
+            const Vec3 cf0 = spectrumToLinearRgb(cm.reflect);   // the lobe's true F0 (not the 0.7 ghost)
+            matSh[i].rough    = previewRough(cm.roughness);
             matSh[i].f0       = Vec3{cf0.x * w, cf0.y * w, cf0.z * w};
             matSh[i].roughPat = cm.roughnessPat;
             matSh[i].roughTex = cm.roughnessTex;
@@ -2081,7 +2534,20 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
     accum.resize(N);
     parallelFor(N, [&](size_t a, size_t b) {
         for (size_t i = a; i < b; ++i) {
-            if (g.zbuf[i] <= 0.0f) { accum[i] = bg; continue; }   // background tint
+            if (g.zbuf[i] <= 0.0f) {
+                // The environment behind the scene when there is one (pinhole cameras), stamped
+                // as a surface at infinity so it is exposed and metered as the tracer's is.
+                if (!light.envBg.empty() && cam.projection == CAM_RECTILINEAR) {
+                    const int px = (int)(i % (size_t)W), py = (int)(i / (size_t)W);
+                    const double ndcx = 2.0 * (px + 0.5) / W - 1.0, ndcy = 1.0 - 2.0 * (py + 0.5) / H;
+                    accum[i] = light.envBgAt(normalize(cam.w + cam.u * (ndcx * cam.tanHalfX) +
+                                                       cam.v * (ndcy * cam.tanHalfY)));
+                    g.zbuf[i] = kEnvBgInvDepth;
+                } else {
+                    accum[i] = bg;                           // background tint
+                }
+                continue;
+            }
             const int si = g.tri[i];
             if (si < 0 || si >= (int)tris.size()) { accum[i] = bg; continue; }
             const PTri& pt = tris[si];
@@ -2186,79 +2652,70 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
             Vec3 V = normalize(cam.eye - g.wpos[i]);     // toward camera
             // RASTER-PBR: the surface's own roughness, honouring the maps the header used to
             // say were "ignored by design". `rough < 0` = no lobe, and the whole specular block
-            // below is skipped, so a diffuse scene shades byte-for-byte as it always did.
+            // below is skipped. A map holds the MATERIAL's roughness, so it goes through the same
+            // previewRough mapping bakeOwn applies to the constant.
             double rough = sh ? sh->rough : -1.0;
             if (rough >= 0.0 && sh) {
-                // Honour `roughness pattern:` / `roughness texture:` through the same per-pixel
-                // machinery the albedo patterns already use -- the header's "roughness maps are
-                // ignored by design" is exactly what this entry exists to undo.
                 if (scenePtr && sh->roughPat >= 0 && sh->roughPat < (int)scenePtr->patterns.size())
-                    rough = scenePtr->patterns[sh->roughPat].eval(ctx());
+                    rough = previewRough(scenePtr->patterns[sh->roughPat].eval(ctx()));
                 else if (scenePtr && sh->roughTex >= 0 && sh->roughTex < (int)scenePtr->textures.size())
-                    rough = scenePtr->textures[sh->roughTex].scalarAt(g.uv[i].x, g.uv[i].y);
+                    rough = previewRough(scenePtr->textures[sh->roughTex].scalarAt(g.uv[i].x, g.uv[i].y));
                 rough = (rough < 0.02) ? 0.02 : (rough > 1.0 ? 1.0 : rough);
             }
             const bool spec = (rough >= 0.0);
-            // The highlight colour: the material's constant f0, or -- for a textured glossy
-            // material, marked by a negative f0 in bakeOwn -- this texel's albedo (0.367.2).
+            // The highlight colour: the constant f0 of a lobe laid over a diffuse body, or -- for a
+            // glossy surface, marked by a negative f0 in bakeOwn -- this pixel's albedo. Such a
+            // surface IS its lobe, so it also gets no diffuse term below (0.368.0).
+            const bool allLobe = spec && (sh->f0.x < 0.0);
             const Vec3 f0 = (sh->f0.x < 0.0) ? col : sh->f0;
-            Vec3 specAcc{0, 0, 0};
-            double lit = 0.0;
+            // The calibrated lights (0.368.0): real colour and strength, 1/d^2, and a highlight
+            // widened by each source's angular size. Diffuse radiance is albedo * E / pi and the
+            // lobe's is BRDF * E, in the same units -- before 0.368.0 the highlight used the diffuse
+            // term's weight without its 1/pi, and so came out a factor pi too weak beside it.
+            Vec3 diffE{0, 0, 0}, specAcc{0, 0, 0};
             for (const auto& lp : light.lights) {
-                Vec3 d = lp.pos - g.wpos[i];
-                double dist2 = dot(d, d);
-                Vec3 Ld = (dist2 > 1e-12) ? d / std::sqrt(dist2) : V;
-                double ndl = std::max(0.0, dot(N3, Ld));
+                Vec3 Ld, E; double ang;
+                if (!previewLightAt(lp, g.wpos[i], Ld, E, ang)) continue;
+                const double ndl = dot(N3, Ld);
                 if (ndl <= 0.0) continue;
-                double atten = 1.0;
-                if (lp.falloff2 > 0.0) atten = lp.falloff2 / (lp.falloff2 + dist2);
-                double cone = 1.0;
-                if (lp.spot) cone = spotFalloff(dot(lp.dir, -Ld), lp.cosInner, lp.cosOuter);
-                const double w = lp.weight * atten * cone;
-                lit += w * ndl;
+                diffE += E * ndl;
                 if (spec) {
                     // The direct lobe: this is the half of the split-sum a preview cannot fake,
                     // because the moving highlight is what reads as "satin" rather than "chalk".
-                    const double gg = ggxSpec(N3, V, Ld, rough) * w;
+                    const double gg = ggxSpec(N3, V, Ld, widenRough(rough, ang));
                     if (gg > 0.0) {
-                        const double f = std::pow(1.0 - std::max(0.0, dot(V, normalize(V + Ld))), 5.0);
-                        specAcc = specAcc + Vec3{f0.x + (1.0 - f0.x) * f,
-                                                 f0.y + (1.0 - f0.y) * f,
-                                                 f0.z + (1.0 - f0.z) * f} * gg;
+                        const double m1 = 1.0 - std::max(0.0, dot(V, normalize(V + Ld)));
+                        const double m2 = m1 * m1, f = m2 * m2 * m1;   // Schlick's (1-cos)^5
+                        specAcc += Vec3{(f0.x + (1.0 - f0.x) * f) * E.x,
+                                        (f0.y + (1.0 - f0.y) * f) * E.y,
+                                        (f0.z + (1.0 - f0.z) * f) * E.z} * gg;
                     }
                 }
             }
-            double head = std::max(0.0, dot(N3, V));     // headlight fill
-            double k = light.ambient + light.keyScale * lit + light.fill * head;
-            accum[i] = col * k;
+            if (allLobe) {
+                // A glossy surface has no diffuse term: all of it is the lobe added below -- the
+                // lights as highlights, the surroundings (PreviewLight::envSpec) as the reflection.
+                accum[i] = Vec3{0.0, 0.0, 0.0};
+            } else {
+                // Diffuse: the lights, the surroundings' irradiance (order-2 SH of the environment
+                // map: the env light and, in a scene, the light probe), and a faint headlight.
+                const double head = std::max(0.0, dot(N3, V));
+                const Vec3 amb = light.ambientAt(N3);
+                accum[i] = Vec3{col.x * (diffE.x * (1.0 / PI) + amb.x + light.fill * head),
+                                col.y * (diffE.y * (1.0 / PI) + amb.y + light.fill * head),
+                                col.z * (diffE.z * (1.0 / PI) + amb.z + light.fill * head)};
+            }
             if (spec) {
-                // The ENVIRONMENT half of the split-sum. This renderer's environment is one
-                // scalar (light.ambient) -- there is no directional env anywhere in this file --
-                // so `prefiltered(R, roughness)` degenerates to that constant exactly, and the
-                // DFG factor is all that remains. No approximation beyond the one the diffuse
-                // shading above already makes.
+                // The ENVIRONMENT half of the split sum: the surroundings pre-blurred for this
+                // roughness, read along the reflection of the view -- the part that makes a metal
+                // look like a metal. Before 0.368.0 this was a two-colour sky/ground gradient
+                // anchored on a dim ambient, with nothing in it to reflect.
                 double A = 0.0, B = 0.0;
                 envBrdfApprox(std::max(1e-4, dot(N3, V)), rough, A, B);
-                // `prefiltered(R, roughness)` — a sky/ground gradient looked up along the
-                // REFLECTION of the view about the shading normal, which is the cheapest
-                // environment that still answers "what is this surface pointing at". Roughness
-                // does not blur it: at this contrast the blur is invisible, and a rough surface
-                // already averages the gradient across its normal spread.
                 const Vec3 Rv = N3 * (2.0 * dot(N3, V)) - V;
-                const double tEnv = 0.5 * (Rv.y + 1.0);
-                const double sEnv = tEnv * tEnv * (3.0 - 2.0 * tEnv);
-                const Vec3 env = light.envDn + (light.envUp - light.envDn) * sEnv;
-                const Vec3 specEnv{(f0.x * A + B) * env.x,
-                                   (f0.y * A + B) * env.y,
-                                   (f0.z * A + B) * env.z};
-                // The DIRECT lobe scales with the key-light scale, exactly as the diffuse
-                // `lit` term does. The ENVIRONMENT half must NOT: it is the reflection of the
-                // surroundings, not of a key light. Scaling it by keyScale erased every
-                // highlight in an env-only scene -- which is exactly what the bare-mesh
-                // quick-view synthesises (`light env` and nothing else, so keyScale is 0), so
-                // an imported model's coat could never show there however right the material
-                // was. Reported from `ftrace meshes/alice.glb`.
-                accum[i] = accum[i] + specAcc * light.keyScale + specEnv;
+                const Vec3 env = light.envSpecularAt(light.lookupDir(g.wpos[i], Rv), rough);
+                accum[i] += Vec3{(f0.x * A + B) * env.x, (f0.y * A + B) * env.y, (f0.z * A + B) * env.z}
+                          + specAcc;
             }
         }
     });

@@ -12837,18 +12837,24 @@ __global__ void kBackwardRGB(DScene sc, DCamera cam, double* film, double* hits,
 // deterministic pixel-centre primary ray per pixel through the pinhole/fisheye
 // camera, finds the nearest surface with the shared closestHit (which sphere-traces
 // implicits via intersectImplicit), and shades it once with the SAME preview model
-// the CPU raster uses — flat per-material albedo lit by `ambient + keyScale·Σ(w·N·L·
-// atten·cone) + fill·N·V`. The linear-RGB result + depth/emitter masks are downloaded
+// the CPU raster uses, diffuse half — flat per-material albedo lit by the calibrated
+// lights (Σ E·N·L/π, 1/d², 0.368.0), the surroundings' SH irradiance, and a faint
+// headlight fill. The linear-RGB result + depth/emitter masks are downloaded
 // and run through raster::exposeAndEncode on the host, so the tone map and a
 // camera_path's shared auto-exposure anchor are bit-identical to the CPU preview.
+// Host twin: raster::PLight / PreviewLight (0.368.0: calibrated colour and strength, 1/d^2,
+// and the surroundings' irradiance as order-2 SH -- this preview is diffuse-only).
 struct DPLight {
     DVec3  pos, dir;
-    int    spot;
-    double cosInner, cosOuter, weight, falloff2;
+    int    kind;              // 0 point, 1 spot, 2 one-sided area, 3 sun
+    double cosInner, cosOuter;
+    DVec3  rgb;
+    double size;
 };
 struct DPreviewLight {
     const DPLight* lights; int nLights;
-    double ambient, keyScale, fill;
+    DVec3  sh[9];
+    double fill;
 };
 // Device twin of scene.h spotFalloff (smoothstep penumbra between the cone cosines).
 __device__ static inline double dSpotFalloff(double ct, double cosInner, double cosOuter) {
@@ -12975,23 +12981,37 @@ __global__ void kIsoPreview(DScene sc, DCamera cam, DPreviewLight pl,
         DVec3 V  = normalize(cam.eye - h.p);
         if (dot(N, Ng) < 0) N = -N;        // undo a silhouette-graze flip
         if (dot(Ng, V) < 0) N = -N;        // genuine backface: shade the side we see
-        double lit = 0.0;
+        // Host twin: raster.h's shade pass (previewLightAt + ambientAt), diffuse half only.
+        double Ex = 0.0, Ey = 0.0, Ez = 0.0;
         for (int k = 0; k < pl.nLights; ++k) {
             const DPLight& lp = pl.lights[k];
-            DVec3 d = lp.pos - h.p;
-            double dist2 = dot(d, d);
-            DVec3 Ld = (dist2 > 1e-12) ? d * (Real)(1.0 / sqrt(dist2)) : V;
-            double ndl = fmax(0.0, (double)dot(N, Ld));
-            if (ndl <= 0.0) continue;
-            double atten = 1.0;
-            if (lp.falloff2 > 0.0) atten = lp.falloff2 / (lp.falloff2 + dist2);
-            double cone = 1.0;
-            if (lp.spot) cone = dSpotFalloff((double)dot(lp.dir, -Ld), lp.cosInner, lp.cosOuter);
-            lit += lp.weight * ndl * atten * cone;
+            DVec3 Ld; double g = 1.0;
+            if (lp.kind == 3) {
+                Ld = lp.dir;
+            } else {
+                DVec3 d = lp.pos - h.p;
+                double dist2 = dot(d, d);
+                if (!(dist2 > 1e-24)) continue;
+                Ld = d * (Real)(1.0 / sqrt(dist2));
+                g = 1.0 / fmax(dist2, lp.size * lp.size);
+                if (lp.kind == 1)      g *= dSpotFalloff((double)dot(lp.dir, -Ld), lp.cosInner, lp.cosOuter);
+                else if (lp.kind == 2) g *= fmax(0.0, -(double)dot(lp.dir, Ld));
+            }
+            double ndl = (double)dot(N, Ld);
+            if (ndl <= 0.0 || !(g > 0.0)) continue;
+            Ex += (double)lp.rgb.x * g * ndl; Ey += (double)lp.rgb.y * g * ndl; Ez += (double)lp.rgb.z * g * ndl;
         }
+        const double nx = (double)N.x, ny = (double)N.y, nz = (double)N.z;
+        const double Y[9] = {0.282095, 0.488603 * ny, 0.488603 * nz, 0.488603 * nx,
+                             1.092548 * nx * ny, 1.092548 * ny * nz, 0.315392 * (3.0 * nz * nz - 1.0),
+                             1.092548 * nx * nz, 0.546274 * (nx * nx - ny * ny)};
+        double ax = 0.0, ay = 0.0, az = 0.0;
+        for (int k = 0; k < 9; ++k) { ax += (double)pl.sh[k].x * Y[k]; ay += (double)pl.sh[k].y * Y[k]; az += (double)pl.sh[k].z * Y[k]; }
         double head = fmax(0.0, (double)dot(N, V));           // camera headlight fill
-        double kk = pl.ambient + pl.keyScale * lit + pl.fill * head;
-        accum[o + 0] = col.x * kk; accum[o + 1] = col.y * kk; accum[o + 2] = col.z * kk;
+        const double kInvPi = 0.31830988618379067;
+        accum[o + 0] = col.x * (Ex * kInvPi + fmax(0.0, ax) + pl.fill * head);
+        accum[o + 1] = col.y * (Ey * kInvPi + fmax(0.0, ay) + pl.fill * head);
+        accum[o + 2] = col.z * (Ez * kInvPi + fmax(0.0, az) + pl.fill * head);
     }
 }
 
@@ -20516,7 +20536,8 @@ bool cudaIsoPreviewSupported(const Scene& scene, const Camera& cam) {
 std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
                                           int W, int H, int nThreads, double exposure,
                                           bool autoExpose, double* lockAnchor,
-                                          IsoPreviewTiming* timing) {
+                                          IsoPreviewTiming* timing,
+                                          const raster::PreviewLight* light) {
     using namespace gpu;
     if (!cudaIsoPreviewSupported(scene, cam)) return {};   // caller falls back to CPU raster
     if (W <= 0 || H <= 0) return {};
@@ -20538,23 +20559,28 @@ std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
     DUpload up;
     buildUpload(scene, cam, W, H, up);
 
-    // Distil the scene's lights into preview keys (host deriveLight) and upload them.
-    raster::PreviewLight plHost = raster::deriveLight(scene);
+    // The scene's lights distilled for the preview. The caller passes the one it derived once
+    // (deriveLight bakes an environment map, and in a scene a light probe -- far too much work
+    // for a function called per frame); without one, derive a probe-less one here.
+    raster::PreviewLight plLocal;
+    if (!light) plLocal = raster::deriveLight(scene, /*withSpecular*/ false);
+    const raster::PreviewLight& plHost = light ? *light : plLocal;
     std::vector<DPLight> hLights(plHost.lights.size());
     for (size_t i = 0; i < plHost.lights.size(); ++i) {
         const raster::PLight& s = plHost.lights[i];
         DPLight d;
         d.pos = DVec3(s.pos.x, s.pos.y, s.pos.z);
         d.dir = DVec3(s.dir.x, s.dir.y, s.dir.z);
-        d.spot = s.spot ? 1 : 0;
+        d.kind = s.kind;
         d.cosInner = s.cosInner; d.cosOuter = s.cosOuter;
-        d.weight = s.weight; d.falloff2 = s.falloff2;
+        d.rgb = DVec3(s.rgb.x, s.rgb.y, s.rgb.z); d.size = s.size;
         hLights[i] = d;
     }
     DPreviewLight dpl;
     dpl.nLights = (int)hLights.size();
     dpl.lights  = hLights.empty() ? nullptr : (const DPLight*)up.keep(uploadVec(hLights));
-    dpl.ambient = plHost.ambient; dpl.keyScale = plHost.keyScale; dpl.fill = plHost.fill;
+    for (int k = 0; k < 9; ++k) dpl.sh[k] = DVec3(plHost.sh[k].x, plHost.sh[k].y, plHost.sh[k].z);
+    dpl.fill = plHost.fill;
 
     // One solid preview colour + emissive flag per material (host materialColor).
     std::vector<DVec3> hCol(scene.mats.size());

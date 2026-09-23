@@ -1764,6 +1764,9 @@ struct Scene {
     int envIndex = -1;
     Vec3 sceneCenter{0, 0, 0};
     double sceneRadius = 0.0;
+    // The same box the sphere is the circumsphere of (lo > hi until build()). Kept since
+    // 0.368.0 for the raster preview's box-projected reflections (raster::deriveLight).
+    Vec3 sceneBoxLo{1, 1, 1}, sceneBoxHi{-1, -1, -1};
     Vec3 envXYZ{0, 0, 0};
     std::shared_ptr<EnvMap> envMap;   // image-based env (null => constant env)
     // Number of EmitterShape::Sun emitters, recounted by finalizeEmitters(). Every
@@ -2550,6 +2553,7 @@ struct Scene {
             if (b.lo.x <= b.hi.x) {
                 sceneCenter = b.center();
                 sceneRadius = length(b.hi - b.lo) * 0.5 * 1.0001; // tiny margin
+                sceneBoxLo = b.lo; sceneBoxHi = b.hi;
             }
         }
         // Distant suns are sized by the same bounding sphere: a photon is born on a

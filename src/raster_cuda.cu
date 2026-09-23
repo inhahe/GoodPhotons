@@ -222,10 +222,25 @@ struct DTex {
     __device__ double patScalarAt(double u, double v) const;
 };
 
+// Host twin: raster::PLight (0.368.0: calibrated -- colour, strength, 1/d^2, source size).
 struct DLight {
     float3 pos, dir;
-    int    spot;
-    float  cosInner, cosOuter, weight, falloff2;
+    int    kind;              // raster::PLight::Kind: 0 point, 1 spot, 2 one-sided area, 3 sun
+    float  cosInner, cosOuter;
+    float3 rgb;               // intensity (area: along its normal) / sun: irradiance
+    float  size;              // source radius / sun: angular radius (rad)
+};
+// Host twin: raster::PreviewLight's environment (kEnvW / kEnvH / kEnvLevels, sh, fill, envSpec).
+constexpr int kPrevEnvW = 64, kPrevEnvH = 32, kPrevEnvLevels = 6;
+constexpr int kPrevBgW = 256, kPrevBgH = 128;       // host twin: raster::kBgW / kBgH
+struct DPrevEnv {
+    float3 sh[9];             // E(N)/pi as order-2 SH
+    float  fill;              // faint headlight
+    float  lvRough[kPrevEnvLevels];
+    const float3* spec;       // kPrevEnvLevels pre-blurred maps, or null
+    const float3* bg;         // host twin: PreviewLight::envBg (kPrevBgW x kPrevBgH), or null
+    int    boxProj;           // box-projected lookups (host twin: PreviewLight::lookupDir)
+    float3 boxLo, boxHi, probePos;
 };
 
 struct DCam {
@@ -898,9 +913,14 @@ __device__ inline double dRasterFw(const DCam& cam, float3 wpos, float3 wn) {
 // RASTER-PBR, device twins of raster.h's envBrdfApprox / ggxSpec. Kept numerically identical to
 // the host so the two previews agree: same Karis fit, same Smith height-correlated visibility.
 __device__ static inline void envBrdfApproxD(float NoV, float rough, float& A, float& B) {
-    const float x = 1.0f - rough;
-    B = exp2f(-9.28f * NoV) * x * x * x;
-    A = x * x * x * x;
+    // Host twin: raster::envBrdfApprox -- Karis' mobile fit (0.368.0; the old body was not it).
+    const float r0 = rough * -1.0f    + 1.0f;
+    const float r1 = rough * -0.0275f + 0.0425f;
+    const float r2 = rough * -0.572f  + 1.04f;
+    const float r3 = rough *  0.022f  - 0.04f;
+    const float a004 = fminf(r0 * r0, exp2f(-9.28f * NoV)) * r0 + r1;
+    A = -1.04f * a004 + r2;
+    B =  1.04f * a004 + r3;
 }
 __device__ static inline float ggxSpecD(const float3& N, const float3& V, const float3& L,
                                         float rough) {
@@ -919,10 +939,123 @@ __device__ static inline float ggxSpecD(const float3& N, const float3& V, const 
     return D * Vis * NoL;
 }
 
+// ---- 0.368.0: the calibrated preview lights and environment (host twins: raster.h) ----------
+__device__ static inline float previewRoughD(float r) { return sqrtf(0.646f * fmaxf(0.0f, r)); }
+__device__ static inline float widenRoughD(float rough, float ang) {
+    return sqrtf(fminf(1.0f, rough * rough + 0.5f * ang));
+}
+// Host twin: raster::previewLightAt. kind 0 point, 1 spot, 2 one-sided area, 3 sun.
+__device__ static inline bool previewLightAtD(const DLight& lp, float3 P, float3& Ld, float3& E,
+                                              float& ang) {
+    if (lp.kind == 3) { Ld = lp.dir; E = lp.rgb; ang = lp.size; return true; }
+    const float3 d = lp.pos - P;
+    const float dist2 = dot3(d, d);
+    if (!(dist2 > 1e-30f)) return false;
+    Ld = d * (1.0f / sqrtf(dist2));
+    const float r2 = fmaxf(dist2, lp.size * lp.size);
+    float g = 1.0f / r2;
+    if (lp.kind == 1)      g *= spotFalloffD(dot3(lp.dir, Ld * -1.0f), lp.cosInner, lp.cosOuter);
+    else if (lp.kind == 2) g *= fmaxf(0.0f, -dot3(lp.dir, Ld));
+    if (!(g > 0.0f)) return false;
+    E = lp.rgb * g;
+    ang = lp.size / sqrtf(r2);
+    return true;
+}
+// Host twin: raster::PreviewLight::ambientAt (order-2 SH of E(N)/pi).
+__device__ static inline float3 ambientAtD(const DPrevEnv& e, float3 N) {
+    const float Y[9] = {0.282095f, 0.488603f * N.y, 0.488603f * N.z, 0.488603f * N.x,
+                        1.092548f * N.x * N.y, 1.092548f * N.y * N.z,
+                        0.315392f * (3.0f * N.z * N.z - 1.0f),
+                        1.092548f * N.x * N.z, 0.546274f * (N.x * N.x - N.y * N.y)};
+    float3 c = make_float3(0.0f, 0.0f, 0.0f);
+    for (int k = 0; k < 9; ++k) c = c + e.sh[k] * Y[k];
+    return make_float3(fmaxf(0.0f, c.x), fmaxf(0.0f, c.y), fmaxf(0.0f, c.z));
+}
+// Host twin: raster::PreviewLight::lookupDir.
+__device__ static inline float3 lookupDirD(const DPrevEnv& e, float3 P, float3 R) {
+    if (!e.boxProj) return R;
+    float tExit = 3.0e38f;
+    const float p[3] = {P.x, P.y, P.z}, r[3] = {R.x, R.y, R.z};
+    const float lo[3] = {e.boxLo.x, e.boxLo.y, e.boxLo.z}, hi[3] = {e.boxHi.x, e.boxHi.y, e.boxHi.z};
+    for (int a = 0; a < 3; ++a) {
+        if (p[a] < lo[a] || p[a] > hi[a]) return R;
+        if (r[a] > 1e-12f)       tExit = fminf(tExit, (hi[a] - p[a]) / r[a]);
+        else if (r[a] < -1e-12f) tExit = fminf(tExit, (lo[a] - p[a]) / r[a]);
+    }
+    if (!(tExit < 1.0e38f)) return R;
+    const float3 d = (P + R * tExit) - e.probePos;
+    const float l = sqrtf(dot3(d, d));
+    return (l > 1e-12f) ? d * (1.0f / l) : R;
+}
+// Host twins: raster::previewAcos / previewAtan2 (same polynomials, so the backends agree).
+__device__ static inline float previewAcosD(float x) {
+    const float ax = fabsf(x);
+    const float r = sqrtf(fmaxf(0.0f, 1.0f - ax)) *
+                    (1.5707288f + ax * (-0.2121144f + ax * (0.0742610f + ax * -0.0187293f)));
+    return (x >= 0.0f) ? r : 3.14159265358979f - r;
+}
+__device__ static inline float previewAtan2D(float y, float x) {
+    const float ax = fabsf(x), ay = fabsf(y);
+    const float mx = fmaxf(ax, ay);
+    if (!(mx > 0.0f)) return 0.0f;
+    const float z = fminf(ax, ay) / mx, z2 = z * z;
+    float a = z * (0.99997726f + z2 * (-0.33262347f + z2 * (0.19354346f + z2 * (-0.11643287f +
+                   z2 * (0.05265332f + z2 * -0.01172120f)))));
+    if (ay > ax) a = 1.5707963267949f - a;
+    if (x < 0.0f) a = 3.14159265358979f - a;
+    return (y < 0.0f) ? -a : a;
+}
+// Host twin: raster::PreviewLight::envBgAt.
+__device__ static inline float3 envBgAtD(const DPrevEnv& e, float3 d) {
+    const float v = previewAcosD(fminf(1.0f, fmaxf(-1.0f, d.y))) * (1.0f / 3.14159265358979f);
+    float u = previewAtan2D(d.z, d.x) * (0.5f / 3.14159265358979f) + 0.5f;
+    if (u >= 1.0f) u -= 1.0f;
+    if (u < 0.0f) u += 1.0f;
+    const float x = u * kPrevBgW - 0.5f, y = v * kPrevBgH - 0.5f;
+    int x0 = (int)x; if ((float)x0 > x) --x0;
+    int y0 = (int)y; if ((float)y0 > y) --y0;
+    const float fx = x - x0, fy = y - y0;
+    int x1 = x0 + 1, y1 = y0 + 1;
+    if (x0 < 0) x0 += kPrevBgW;
+    if (x1 >= kPrevBgW) x1 -= kPrevBgW;
+    y0 = max(0, y0); y1 = min(kPrevBgH - 1, y1);
+    const float3* m = e.bg;
+    return m[y0 * kPrevBgW + x0] * ((1.0f - fx) * (1.0f - fy)) + m[y0 * kPrevBgW + x1] * (fx * (1.0f - fy)) +
+           m[y1 * kPrevBgW + x0] * ((1.0f - fx) * fy) + m[y1 * kPrevBgW + x1] * (fx * fy);
+}
+// Host twin: raster::PreviewLight::envSpecularAt.
+__device__ static inline float3 envSpecularAtD(const DPrevEnv& e, float3 R, float rough) {
+    if (!e.spec) return make_float3(0.0f, 0.0f, 0.0f);
+    const float v = previewAcosD(fminf(1.0f, fmaxf(-1.0f, R.y))) * (1.0f / 3.14159265358979f);
+    float u = previewAtan2D(R.z, R.x) * (0.5f / 3.14159265358979f) + 0.5f;
+    if (u >= 1.0f) u -= 1.0f;
+    if (u < 0.0f) u += 1.0f;
+    int k = 0;
+    while (k + 1 < kPrevEnvLevels - 1 && rough > e.lvRough[k + 1]) ++k;
+    const float t = fminf(1.0f, fmaxf(0.0f, (rough - e.lvRough[k]) / (e.lvRough[k + 1] - e.lvRough[k])));
+    const float x = u * kPrevEnvW - 0.5f, y = v * kPrevEnvH - 0.5f;
+    int x0 = (int)x; if ((float)x0 > x) --x0;
+    int y0 = (int)y; if ((float)y0 > y) --y0;
+    const float fx = x - x0, fy = y - y0;
+    int x1 = x0 + 1, y1 = y0 + 1;
+    if (x0 < 0) x0 += kPrevEnvW;
+    if (x1 >= kPrevEnvW) x1 -= kPrevEnvW;
+    y0 = max(0, y0); y1 = min(kPrevEnvH - 1, y1);
+    const float w00 = (1.0f - fx) * (1.0f - fy), w10 = fx * (1.0f - fy);
+    const float w01 = (1.0f - fx) * fy,          w11 = fx * fy;
+    const int i00 = y0 * kPrevEnvW + x0, i10 = y0 * kPrevEnvW + x1;
+    const int i01 = y1 * kPrevEnvW + x0, i11 = y1 * kPrevEnvW + x1;
+    const float3* a = e.spec + k * kPrevEnvW * kPrevEnvH;
+    const float3* b = a + kPrevEnvW * kPrevEnvH;
+    const float3 ca = a[i00] * w00 + a[i10] * w10 + a[i01] * w01 + a[i11] * w11;
+    const float3 cb = b[i00] * w00 + b[i10] * w10 + b[i01] * w01 + b[i11] * w11;
+    return ca * (1.0f - t) + cb * t;
+}
+
 __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
                        const int* flags, const unsigned long long* vis,
                        const DLight* lights, int nLights,
-                       float ambient, float keyScale, float fill, float3 envUp, float3 envDn,
+                       DPrevEnv penv,
                        DCam cam, int W, int H, float3 bg, float emisBoost,
                        const DTex* texMeta, const float3* texels, int nTex,
                        const PatNode* patNodes, const DPattern* patterns, int nPatterns,
@@ -931,7 +1064,20 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (unsigned long long)W * H) return;
     unsigned long long v = vis[i];
-    if (v == 0ULL) { accum[i] = bg; zbuf[i] = 0.0f; emis[i] = 0; return; }
+    if (v == 0ULL) {
+        // Host twin: raster.h's shade pass -- the env behind the scene, a surface at infinity.
+        if (penv.bg && cam.projection == 0) {
+            const int px = i % W, py = i / W;
+            const float ndcx = 2.0f * (px + 0.5f) / W - 1.0f, ndcy = 1.0f - 2.0f * (py + 0.5f) / H;
+            accum[i] = envBgAtD(penv, normalize3(cam.w + cam.u * (ndcx * cam.tanHalfX) +
+                                                  cam.v * (ndcy * cam.tanHalfY)));
+            zbuf[i] = 1e-30f;             // host twin: raster::kEnvBgInvDepth
+        } else {
+            accum[i] = bg; zbuf[i] = 0.0f;
+        }
+        emis[i] = 0;
+        return;
+    }
     int slot = (int)(unsigned int)(v & 0xffffffffULL);
     const DGeo& t = geos[slot];
 
@@ -955,6 +1101,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     float2 uv0, uv1, uv2;
     int tex, emissive, nrmTex, rPat, ePat; float tps, nrmS;
     float shRough; float3 shF0;    // RASTER-PBR: the lobe, carried down every unpack path
+    int shRPat, shRTex;            // ...and its roughness map (0.368.0: now honoured here too)
     // Vertex colour comes from the SOURCE triangle either way: a near-clipped slot lerps
     // position/normal/UV into DAttr, but a clipped triangle's colours are still the
     // original three, and the barycentrics below are expressed against them.
@@ -967,7 +1114,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         color = a.color; tex = a.tex; tps = a.triplanarScale; emissive = a.emissive;
         nrmTex = a.normalTex; nrmS = a.normalStrength;
         rPat = a.reflectPat; ePat = a.emitPat;
-        shRough = a.rough; shF0 = a.f0;
+        shRough = a.rough; shF0 = a.f0; shRPat = a.roughPat; shRTex = a.roughTex;
     } else {
         const DPTri& s = tris[slot >> 1];
         wp0 = s.p0; wn0 = s.n0; uv0 = s.uv0;
@@ -976,7 +1123,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         color = s.color; tex = s.tex; tps = s.triplanarScale; emissive = s.emissive;
         nrmTex = s.normalTex; nrmS = s.normalStrength;
         rPat = s.reflectPat; ePat = s.emitPat;
-        shRough = s.rough; shF0 = s.f0;
+        shRough = s.rough; shF0 = s.f0; shRPat = s.roughPat; shRTex = s.roughTex;
     }
     if (flags[slot] & kSlotBack) {           // two-sided: the whole triangle faces away
         wn0 = wn0 * -1.0f; wn1 = wn1 * -1.0f; wn2 = wn2 * -1.0f;
@@ -1024,6 +1171,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
             nrmTex = mx.normalTex; nrmS = mx.normalStrength;
             rPat = mx.reflectPat; ePat = mx.emitPat;
             shRough = mx.rough; shF0 = mx.f0;   // a mix child brings its own lobe
+            shRPat = mx.roughPat; shRTex = mx.roughTex;
         }
     }
 
@@ -1079,59 +1227,68 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         }
     }
     float3 V  = normalize3(cam.eye - wpos);
-    // RASTER-PBR: the surface's own lobe. `rough < 0` skips the whole specular block, so a
-    // diffuse scene shades exactly as it did.
+    // RASTER-PBR: the surface's own lobe. `rough < 0` skips the whole specular block. A roughness
+    // MAP (pattern or texture) is honoured per pixel, through the same previewRough mapping the
+    // host applies to the constant -- the device used to read only the constant, so a glTF
+    // roughness map (a glittered dress's 0.1 flakes on 0.4 fabric) showed on the CPU preview only.
     float rough = shRough;
-    if (rough >= 0.0f) rough = fminf(1.0f, fmaxf(0.02f, rough));
+    if (rough >= 0.0f) {
+        if (shRPat >= 0 && shRPat < nPatterns && patNodes) {
+            const DPattern& rp = patterns[shRPat];
+            float3 pn = normalize3(wn);
+            double qx = wpos.x, qy = wpos.y, qz = wpos.z;
+            double qr = sqrt(qx * qx + qy * qy + qz * qz);
+            rough = previewRoughD((float)dPatternEval(patNodes + rp.off, rp.n, qx, qy, qz, 0.0,
+                                                      pn.x, pn.y, pn.z, qr, (double)uu, (double)vv,
+                                                      0.0, 0.0, dRasterFw(cam, wpos, wn), patEnv));
+        } else if (shRTex >= 0 && shRTex < nTex) {
+            rough = previewRoughD((float)texMeta[shRTex].patScalarAt((double)uu, (double)vv));
+        }
+        rough = fminf(1.0f, fmaxf(0.02f, rough));
+    }
     const bool spec = (rough >= 0.0f);
-    // The highlight colour: the material's constant f0, or -- for a textured glossy material,
-    // marked by a negative f0 (host twin: raster.h bakeOwn) -- this texel's albedo (0.367.2).
+    // The highlight colour: the constant f0 of a lobe over a diffuse body, or -- for a glossy
+    // surface, marked by a negative f0 (host twin: raster.h bakeOwn) -- this pixel's albedo. Such
+    // a surface IS its lobe, so it also gets no diffuse term below (0.368.0).
+    const bool allLobe = spec && (shF0.x < 0.0f);
     const float3 f0 = (shF0.x < 0.0f) ? col : shF0;
-    float3 specAcc = make_float3(0.0f, 0.0f, 0.0f);
-    float lit = 0.0f;
+    // The calibrated lights (host twin: raster.h's shade pass, previewLightAt).
+    float3 diffE = make_float3(0.0f, 0.0f, 0.0f), specAcc = make_float3(0.0f, 0.0f, 0.0f);
     for (int li = 0; li < nLights; ++li) {
-        const DLight& lp = lights[li];
-        float3 dd = lp.pos - wpos;
-        float dist2 = dot3(dd, dd);
-        float3 Ld = (dist2 > 1e-12f) ? dd * (1.0f / sqrtf(dist2)) : V;
-        float ndl = fmaxf(0.0f, dot3(N3, Ld));
+        float3 Ld, E; float ang;
+        if (!previewLightAtD(lights[li], wpos, Ld, E, ang)) continue;
+        const float ndl = dot3(N3, Ld);
         if (ndl <= 0.0f) continue;
-        float atten = 1.0f;
-        if (lp.falloff2 > 0.0f) atten = lp.falloff2 / (lp.falloff2 + dist2);
-        float cone = 1.0f;
-        if (lp.spot) cone = spotFalloffD(dot3(lp.dir, Ld * -1.0f), lp.cosInner, lp.cosOuter);
-        const float w = lp.weight * atten * cone;
-        lit += w * ndl;
+        diffE = diffE + E * ndl;
         if (spec) {
-            const float gg = ggxSpecD(N3, V, Ld, rough) * w;
+            const float gg = ggxSpecD(N3, V, Ld, widenRoughD(rough, ang));
             if (gg > 0.0f) {
-                const float f = powf(1.0f - fmaxf(0.0f, dot3(V, normalize3(V + Ld))), 5.0f);
-                specAcc = specAcc + make_float3(f0.x + (1.0f - f0.x) * f,
-                                                f0.y + (1.0f - f0.y) * f,
-                                                f0.z + (1.0f - f0.z) * f) * gg;
+                const float m1 = 1.0f - fmaxf(0.0f, dot3(V, normalize3(V + Ld)));
+                const float m2 = m1 * m1, f = m2 * m2 * m1;   // host twin: Schlick's (1-cos)^5
+                specAcc = specAcc + make_float3((f0.x + (1.0f - f0.x) * f) * E.x,
+                                                (f0.y + (1.0f - f0.y) * f) * E.y,
+                                                (f0.z + (1.0f - f0.z) * f) * E.z) * gg;
             }
         }
     }
-    float head = fmaxf(0.0f, dot3(N3, V));
-    float k = ambient + keyScale * lit + fill * head;
-    accum[i] = col * k;
+    if (allLobe) {
+        accum[i] = make_float3(0.0f, 0.0f, 0.0f);
+    } else {
+        const float head = fmaxf(0.0f, dot3(N3, V));
+        const float3 amb = ambientAtD(penv, N3);
+        const float kPi = 1.0f / 3.14159265358979f;
+        accum[i] = make_float3(col.x * (diffE.x * kPi + amb.x + penv.fill * head),
+                               col.y * (diffE.y * kPi + amb.y + penv.fill * head),
+                               col.z * (diffE.z * kPi + amb.z + penv.fill * head));
+    }
     if (spec) {
-        // The environment half of the split sum. Since 0.317.0 the environment is a sky/ground
-        // gradient rather than one scalar, so a reflection has something to find in it.
+        // The environment half of the split sum: the pre-blurred surroundings along the reflection.
         float A = 0.0f, B = 0.0f;
         envBrdfApproxD(fmaxf(1e-4f, dot3(N3, V)), rough, A, B);
-        // Directional environment (host twin: raster.h's `env` block) — a constant one is
-        // invisible in a reflection, see PreviewLight::envUp.
         const float3 Rv = N3 * (2.0f * dot3(N3, V)) - V;
-        const float  tEnv = 0.5f * (Rv.y + 1.0f);
-        const float  sEnv = tEnv * tEnv * (3.0f - 2.0f * tEnv);
-        const float3 env = envDn + (envUp - envDn) * sEnv;
-        // The env half is NOT scaled by keyScale (host twin: raster.h) -- an env-only scene
-        // has keyScale 0, which zeroed every highlight in the bare-mesh quick-view.
-        const float3 specEnv = make_float3((f0.x * A + B) * env.x,
-                                           (f0.y * A + B) * env.y,
-                                           (f0.z * A + B) * env.z);
-        accum[i] = accum[i] + specAcc * keyScale + specEnv;
+        const float3 env = envSpecularAtD(penv, lookupDirD(penv, wpos, Rv), rough);
+        accum[i] = accum[i] + make_float3((f0.x * A + B) * env.x, (f0.y * A + B) * env.y,
+                                          (f0.z * A + B) * env.z) + specAcc;
     }
 }
 
@@ -1448,9 +1605,9 @@ struct Scene {
     int*     dflags  = nullptr;   // per-slot kSlotValid|kSlotClear|kSlotClipped bits (dense probe)
     DLight*  dlights = nullptr;
     int      nLights = 0;
-    float    ambient = 0.12f, keyScale = 1.15f, fill = 0.08f;
-    // Directional specular environment (host twin: PreviewLight::envUp / envDn).
-    float3   envUp = {0, 0, 0}, envDn = {0, 0, 0};
+    DPrevEnv penv{};                // the calibrated environment (host twin: PreviewLight)
+    float3*  denvSpec = nullptr;    // penv.spec's storage
+    float3*  denvBg   = nullptr;    // penv.bg's storage
     // Image-skin textures (flattened): per-texture metadata + one shared texel array.
     DTex*    dtexMeta = nullptr;
     float3*  dtexels  = nullptr;
@@ -1550,6 +1707,8 @@ void destroy(Scene* sc) {
     if (sc->dattrs)   cudaFree(sc->dattrs);
     if (sc->dflags)   cudaFree(sc->dflags);
     if (sc->dlights)  cudaFree(sc->dlights);
+    if (sc->denvSpec) cudaFree(sc->denvSpec);
+    if (sc->denvBg)   cudaFree(sc->denvBg);
     if (sc->dtexMeta) cudaFree(sc->dtexMeta);
     if (sc->dtexels)  cudaFree(sc->dtexels);
     if (sc->dstoch)   cudaFree(sc->dstoch);
@@ -1715,16 +1874,24 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
     for (size_t i = 0; i < light.lights.size(); ++i) {
         const raster::PLight& p = light.lights[i];
         DLight& d = hl[i];
-        d.pos = toF3(p.pos); d.dir = toF3(p.dir); d.spot = p.spot ? 1 : 0;
+        d.pos = toF3(p.pos); d.dir = toF3(p.dir); d.kind = p.kind;
         d.cosInner = (float)p.cosInner; d.cosOuter = (float)p.cosOuter;
-        d.weight = (float)p.weight; d.falloff2 = (float)p.falloff2;
+        d.rgb = toF3(p.rgb); d.size = (float)p.size;
     }
     sc->nLights  = (int)hl.size();
-    sc->envUp    = make_float3((float)light.envUp.x, (float)light.envUp.y, (float)light.envUp.z);
-    sc->envDn    = make_float3((float)light.envDn.x, (float)light.envDn.y, (float)light.envDn.z);
-    sc->ambient  = (float)light.ambient;
-    sc->keyScale = (float)light.keyScale;
-    sc->fill     = (float)light.fill;
+    static_assert(kPrevEnvW == raster::kEnvW && kPrevEnvH == raster::kEnvH &&
+                  kPrevEnvLevels == raster::kEnvLevels, "device/host preview env layout");
+    for (int k = 0; k < 9; ++k) sc->penv.sh[k] = toF3(light.sh[k]);
+    sc->penv.fill = (float)light.fill;
+    sc->penv.boxProj = light.boxProj ? 1 : 0;
+    sc->penv.boxLo = toF3(light.boxLo); sc->penv.boxHi = toF3(light.boxHi);
+    sc->penv.probePos = toF3(light.probePos);
+    for (int k = 0; k < kPrevEnvLevels; ++k) sc->penv.lvRough[k] = (float)raster::kEnvRough[k];
+    std::vector<float3> henv(light.envSpec.size());
+    for (size_t k = 0; k < henv.size(); ++k) henv[k] = toF3(light.envSpec[k]);
+    static_assert(kPrevBgW == raster::kBgW && kPrevBgH == raster::kBgH, "device/host preview bg layout");
+    std::vector<float3> hbg(light.envBg.size());
+    for (size_t k = 0; k < hbg.size(); ++k) hbg[k] = toF3(light.envBg[k]);
 
     bool ok = tryMalloc((void**)&sc->dtris,  sizeof(DPTri) * tris.size())
            && tryMalloc((void**)&sc->dgeos,  sizeof(DGeo)  * 2 * tris.size())
@@ -1741,6 +1908,10 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
         ok = (cudaEventCreate(&sc->ev[i]) == cudaSuccess);
     if (ok && !hl.empty())
         ok = tryMalloc((void**)&sc->dlights, sizeof(DLight) * hl.size());
+    if (ok && !henv.empty())
+        ok = tryMalloc((void**)&sc->denvSpec, sizeof(float3) * henv.size());
+    if (ok && !hbg.empty())
+        ok = tryMalloc((void**)&sc->denvBg, sizeof(float3) * hbg.size());
     if (ok && !htexMeta.empty())
         ok = tryMalloc((void**)&sc->dtexMeta, sizeof(DTex) * htexMeta.size());
     if (ok && !htexels.empty())
@@ -1771,6 +1942,14 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
     if (!hl.empty() &&
         cudaMemcpy(sc->dlights, hl.data(), sizeof(DLight) * hl.size(),
                    cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
+    if (!henv.empty() &&
+        cudaMemcpy(sc->denvSpec, henv.data(), sizeof(float3) * henv.size(),
+                   cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
+    sc->penv.spec = sc->denvSpec;
+    if (!hbg.empty() &&
+        cudaMemcpy(sc->denvBg, hbg.data(), sizeof(float3) * hbg.size(),
+                   cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
+    sc->penv.bg = sc->denvBg;
     if (!htexMeta.empty() &&
         cudaMemcpy(sc->dtexMeta, htexMeta.data(), sizeof(DTex) * htexMeta.size(),
                    cudaMemcpyHostToDevice) != cudaSuccess) { destroy(sc); return nullptr; }
@@ -1945,7 +2124,7 @@ static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
     rec(3);
     kShade<<<gPix, TPB>>>(sc->dtris, sc->dgeos, sc->dattrs, sc->dflags, sc->vis,
                           sc->dlights, sc->nLights,
-                          sc->ambient, sc->keyScale, sc->fill, sc->envUp, sc->envDn,
+                          sc->penv,
                           dc, W, H, bg, EMIS_BOOST,
                           sc->dtexMeta, sc->dtexels, sc->nTex,
                           sc->dpatNodes, sc->dpatterns, sc->nPatterns, patEnvOf(*sc),

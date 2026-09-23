@@ -378,10 +378,13 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > transport entirely: it tessellates the whole scene once (analytic spheres →
 > UV spheres, isosurfaces/CSG → marching-tetrahedra mesh, `curve` strands → a
 > round-cone mesh per segment, instanced meshes baked
-> to world space) and z-buffers each camera as solid, flat diffuse+headlight
-> triangles — roughly **1 fps at 1280×720**. There is **no** transparency,
-> reflection, refraction, shadow, caustic or GI: a dielectric shows as a solid
-> ghost and a mirror as a flat tint. (Opt in to **see-through clear objects** with
+> to world space) and z-buffers each camera as solid shaded triangles — roughly
+> **1 fps at 1280×720**. Since 0.368.0 it lights them with the scene's **own** lights —
+> their real colours and relative strengths, falling off as 1/d² — plus the scene's
+> environment and a one-time light probe of the surroundings, so a metal or a mirror
+> reflects something (see **Preview specular** below). There is still **no**
+> transparency, refraction, shadow or caustic, and GI is an approximation from one
+> probe: a dielectric shows as a solid ghost. (Opt in to **see-through clear objects** with
 > `-see-through` — see below — which drops the ghost for a dim + milky-haze pass
 > that still refracts nothing.) But everything that gives a surface its look **at a
 > single point** *is* shown, on both the CPU and GPU preview alike:
@@ -492,9 +495,10 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > frame. `-raster-gpu` skips tessellation entirely: it casts **one primary ray per
 > pixel** on the device and finds the nearest surface with the shared `closestHit`,
 > which **sphere-traces implicit isosurfaces directly** (no mesh). It shades with the
-> same preview model (per-material albedo — or a sampled **image/procedural skin**, at
-> the hit UV or by world triplanar — plus ambient + weighted N·L keys +
-> a headlight fill) and runs the **same** shared auto-exposure + sRGB tone map on the
+> same preview model's diffuse half (per-material albedo — or a sampled **image/procedural
+> skin**, at the hit UV or by world triplanar — lit by the scene's calibrated lights, the
+> surroundings' ambient and a faint headlight fill) and runs the **same** shared
+> auto-exposure + sRGB tone map on the
 > host, so the image matches `-raster` (surfaces are actually *cleaner* — no marching-
 > cubes faceting) and an exposure-locked flyby still shares one anchor. It falls back
 > to the CPU rasterizer automatically when the GPU can't handle the config (no CUDA
@@ -2828,6 +2832,18 @@ sun had barely been hit at all), while **`separate`** hit the 4% target in **5.5
 noise, and a qualitatively correct picture instead of a skylight-only one. `off` drops
 the disk entirely (skylight only). The `separate` split is energy-matched to the baked
 profile (measured agreement 0.12% once the map resolves the disc).
+
+**Photo studio (`kind studio`, 0.368.0).** `light env { kind studio }` bakes a procedural
+product-photography studio into the same `EnvMap` pipeline: a cyclorama (a dark floor rising to
+a mid-grey horizon and a lighter ceiling) with four softboxes — a large, slightly warm **key**
+high on the camera's left, a broad dim **fill** low on the right, a **rim** strip high behind
+the subject and a soft **top** panel. It is what the mesh quick-view (`ftrace model.glb`) lights
+a model with, because a metal is what it reflects: under a uniform environment a metal showed
+nothing but a single highlight, in the path tracer as much as in the preview. The layout assumes
+the quick-view's camera (up and to the right of the model, looking back at it); `rotate <deg>`
+turns the studio about the vertical, `intensity <s>` scales it, `res <px>` sets the map width
+(default 1024 — the map is read nearest-texel, so a sharp metal reflecting a softbox shows its
+grain below that).
 
 **Absolute power.** Any non-env light may author a real physical output —
 `power <watts>` (radiometric radiant flux) or `lumens <lm>` (photometric luminous
@@ -5817,14 +5833,43 @@ maps are ignored by design", so an asset whose look depends on its specular lobe
 fabric, any metal — previewed flat, and a browser glTF viewer showed it better than we did.
 
 Since 0.269.1 `glossy` materials shade through the **split-sum** approximation that real-time
-viewers use: a normalised GGX lobe with Smith masking and Schlick Fresnel for each key light,
-plus the environment term with Karis' analytic BRDF fit (no lookup texture ships). `roughness
-pattern:` and `roughness texture:` are honoured. The highlight is tinted by the material's own
-normal-incidence reflectance, so gold looks like gold rather than white-hot.
+viewers use: a normalised GGX lobe with Smith masking and Schlick Fresnel for each light, plus
+the environment term with Karis' analytic BRDF fit (no lookup texture ships — though until
+0.368.0 the function in that slot was not Karis' fit, and dimmed a rough reflection by up to
+10×). `roughness pattern:` and `roughness texture:` are honoured (by the GPU rasterizer too
+since 0.368.0; before, only the CPU one read them). The highlight is tinted by the material's
+own normal-incidence reflectance, so gold looks like gold rather than white-hot.
 
-Both rasterizer backends agree exactly, and a scene with no glossy material is untouched. It is
-a *preview*: there is still no reflection, refraction, shadow or global illumination here — see
-the mode table for what renders those.
+**Preview lighting (0.368.0) — the scene's own lights.** The preview used fixed presets: an
+ambient level, a key scale and a camera headlight, with every light power-normalised and
+colourless. It now lights with what the scene actually contains:
+
+* **Calibrated lights.** Each emitter keeps its colour and relative strength (its XYZ through
+  the renderer's own XYZ→sRGB matrix) and falls off as 1/d²; an area light emits one-sided
+  with a cosine, a spot keeps its cone, a sun its irradiance, and a light's size widens its
+  highlight, so a softbox makes a soft one. Diffuse and specular share physical units (the
+  highlight used to be a factor π too weak beside the diffuse), normalised so the brightest
+  side of a white surface at the scene centre reads 1.
+* **The environment.** An `env` light (constant, image or sky) becomes a small pre-blurred
+  map: its order-2 spherical harmonics are the diffuse ambient and its roughness levels the
+  reflections. It is also drawn **behind the scene** and metered with it, exactly as the path
+  tracer does — otherwise a model that is all metal meters on its own highlights and goes
+  dark. With no `env` light the preview keeps its slate backdrop.
+* **Light probes** (scenes, not the mesh quick-view): once at load, ~2,000 rays from where the
+  camera looks find the scene's surfaces, lit as the preview lights them over three bounces,
+  for the ambient (its brightness; the colour stays the env's, since one probe overweights
+  whatever it stands beside); and ~2,000 from the camera's eye, in full colour, for the
+  reflections, which are box-projected against the scene's bounds (the standard parallax
+  correction) so a mirror by a wall shows that wall.
+* **Glossy and mirror surfaces are all reflection.** No diffuse term (the tracers give them
+  none), tinted by their true reflectance, with roughness mapped to the tracers' glossy lobe
+  width (the preview's highlights were ~2× too narrow).
+
+All of it is built once per scene load (about 0.1–0.3 s); per pixel it is two small lookups,
+and the GPU preview's frame time is unchanged (+<0.1 ms at 960×540). The CPU fallback costs up to
+~20 % more in a glossy-heavy scene. Both rasterizer backends agree to within ~0.1 of a level.
+It is still a *preview*: no shadows, no refraction, and one probe position — see the mode
+table for what renders those.
 
 **Gather footprint (mode `M`)** — photon mapping's density estimate divides the photons it finds
 by the area of the gather disc, `πr²`. On a flat wall that is exactly right. On anything the disc

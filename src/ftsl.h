@@ -79,6 +79,7 @@
 #include "reaction.h"    // `texture { reaction { } }` — Gray-Scott bake (TODO §O6)
 #include "color.h"
 #include "sky.h"
+#include "studio.h"
 #include "record_ladder.h"   // generalized record-stop delimiter ladder (J3b item 2)
 
 namespace ftsl {
@@ -6904,6 +6905,25 @@ private:
             // an equirectangular Preetham daylight sky (with a spectrally attenuated
             // solar disk) into an EnvMap, so it lights the scene exactly like an HDRI.
             std::string kind = strOf(b, "kind"); if (kind.empty()) kind = strOf(b, "sky");
+            // A procedural photo studio (studio.h, 0.368.0): a cyclorama plus key / fill / rim /
+            // top softboxes, baked like the Preetham sky. It is what the mesh quick-view lights
+            // an object with, because a metal is what it reflects and a uniform env shows none.
+            if (kind == "studio") {
+                // 1024 x 512 by default: EnvMap looks texels up nearest, so a sharp metal reflecting a
+                // softbox shows the map's grain at its edge; 0.35-degree texels keep that below a pixel.
+                int res = (int)dblOf(b, "res", 1024.0);
+                if (res < 16) res = 16; if (res > 8192) res = 8192;
+                const int sw = res, sh = res / 2;
+                std::vector<Vec3> img = studio::generate(sw, sh);
+                auto map = std::make_shared<EnvMap>();
+                std::string eerr;
+                if (!map->buildFromRgb(img, sw, sh, dblOf(b, "rotate", 0.0),
+                                       dblOf(b, "intensity", 1.0), eerr)) {
+                    fail("env studio: " + eerr); return false;
+                }
+                L.scene.addEnvLight(std::move(map), binWidth_);
+                return true;
+            }
             bool isSky = (kind == "preetham" || kind == "sky") ||
                          find(b, "turbidity") || find(b, "sun_dir") || find(b, "sun_elevation");
             if (isSky) {

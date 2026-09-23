@@ -18974,8 +18974,9 @@ static int run(int argc, char** argv) {
         // bare mesh in a synthesized, auto-lit FTSL scene and renders it with an
         // auto-framed camera. The mesh keeps its own materials when the format carries
         // them (glTF/GLB import materials by default); a neutral clay fallback covers
-        // primitives/faces with none. Lit by a soft uniform environment so any mesh reads
-        // with shape. Bare invocation then defaults to the fast raster preview in a live
+        // primitives/faces with none. Lit by a procedural photo studio (see below) so any
+        // mesh reads with shape, and a metal has something to reflect. Bare invocation then
+        // defaults to the fast raster preview in a live
         // window (see the positional-preview block below); pass -mode/-n/etc. to force a
         // real light-transport render of the same auto-lit scene.
         std::string mp = inFile;
@@ -18984,27 +18985,17 @@ static int run(int argc, char** argv) {
         src += "scene { units meters spectral 360 830 1 }\n";
         src += "material \"clay\" { type diffuse reflect whitewall 0.6 }\n";
         src += "mesh { file \"" + mp + "\"  material clay }\n";
-        src += "light env { spd 0.5 }\n";
-        // ...PLUS A KEY. A uniform environment is the flattest light there is, and a SPECULAR
-        // surface under one is indistinguishable from a matte surface: a mirror reflecting a
-        // constant returns that same constant. So an imported model's coat — the 4 % lobe every
-        // glTF dielectric carries — could not be seen here however correctly it was imported,
-        // which is what "the dress still isn't glossy" reported against `ftrace meshes/alice.glb`.
-        // Every model viewer solves this the same way, with a studio key: a source bright and
-        // small enough to make a HIGHLIGHT, which is the thing the eye reads as gloss. Placed up
-        // and to the LEFT of the auto-framed camera (which sits along (0.55, 0.42, 1.0) — see
-        // below), the classic portrait key, so the highlight lands on the near side of the
-        // subject rather than behind it. `angle 6` instead of the sun's real 0.53° makes it a
-        // softbox rather than a pinpoint: a soft highlight reads as satin, a hard one as glass.
-        // A Planckian is ABSOLUTE radiance (the renderer's `blackbody` is per METRE of
-        // wavelength: `blackbody 6504` integrates to 1.79e16 over 360-830 nm), and a `light sun`
-        // takes its spd as absolute irradiance, so the intensity is the small number that brings
-        // the band integral to ~90 W/m^2 -- roughly 60:1 against the env fill above. (Through
-        // 0.327.0 this line said `preset:d65 intensity 90`: a sun 1e14 times the real one, hidden
-        // by auto-exposure until fibers made the scale visible; 0.328.0's "fix" was 5.04e-06,
-        // a per-nanometre figure a factor 1e9 too large -- the loader's own guard caught it. The
-        // value below is the one the guard is silent on. See known-issues.)
-        src += "light sun { dir -0.319 0.785 0.531  angle 6  spd blackbody 6504  intensity 5.04e-15 }\n";
+        // A PHOTO STUDIO (0.368.0; studio.h): a cyclorama with a large warm KEY softbox up and to
+        // the left of the auto-framed camera (which sits along (0.55, 0.42, 1.0) -- see below; the
+        // key sits where the old quick-view sun did, so a model keeps the modelling it had), a
+        // broad dim FILL low on the right, a RIM strip behind and a soft TOP panel. It replaces a
+        // uniform env plus one 6-degree "softbox" sun. That lit a matte model well enough, but a
+        // uniform environment is invisible in a reflection, so a METAL showed nothing but the
+        // sun's one highlight, in the path tracer as much as in the preview. A metal is what it
+        // reflects; a product photographer lights one with softboxes for exactly that reason.
+        // It is a baked env map, so every renderer lights with it and shows it in reflections,
+        // and the preview reads the same map (raster::deriveLight).
+        src += "light env { kind studio }\n";
         std::string ferr;
         if (!ftsl::loadSource(src, std::string("<mesh-viewer:") + inFile + ">", ftslScene, ferr)) {
             std::fprintf(stderr, "[ftrace] could not load mesh '%s': %s\n", inFile, ferr.c_str());
@@ -21301,7 +21292,26 @@ static int run(int argc, char** argv) {
                                                     : std::string("\xE2\x80\xA6")));
         }
 
-        raster::PreviewLight plight = raster::deriveLight(scene);
+        // The calibrated preview lights (0.368.0). The light probe stands where the first camera
+        // is LOOKING, 70 % of the way along its forward ray to the first surface: free space by
+        // construction, but among the things in view -- at the eye itself it sat outside the
+        // very floor its metals should reflect (scraps/_metal_preview.ftsl: the camera is past
+        // the floor's edge, so the spheres' lower halves showed sky). The mesh quick-view gives
+        // it no geometry, since its only geometry is the model being viewed.
+        Vec3 previewProbePos = scene.sceneCenter;
+        Vec3 previewReflectPos = scene.sceneCenter;   // the REFLECTION probe: the camera's eye
+        if (!toRender.empty()) {
+            const Camera& pc = toRender.front().cam;
+            const Hit ph = scene.closestHit(Ray{pc.eye, pc.w}, 1e-6);
+            const double pt = ph.valid ? ph.t : length(scene.sceneCenter - pc.eye);
+            previewProbePos = pc.eye + pc.w * (0.7 * pt);
+            previewReflectPos = pc.eye;
+        }
+        const bool previewProbeGeo = !positionalMesh;
+        auto derivePreviewLight = [&]() {
+            return raster::deriveLight(scene, previewProbePos, previewProbeGeo, true, &previewReflectPos);
+        };
+        raster::PreviewLight plight = derivePreviewLight();
         raster::PreviewGeom prims;         // tessellated lazily (empty in pure GPU-iso mode)
         bool tessellated = false;
         // Tessellate on demand: the CPU / GPU-triangle path calls this immediately; the GPU
@@ -21388,7 +21398,8 @@ static int run(int argc, char** argv) {
             // falls through to the tessellated path (built lazily on first need).
             if (useGpuIso && !cam.hasLens()) {
                 std::vector<uint8_t> img =
-                    renderIsoPreviewCuda(scene, cam, W, H, nThreads, ev, autoExp, lock);
+                    renderIsoPreviewCuda(scene, cam, W, H, nThreads, ev, autoExp, lock,
+                                         nullptr, &plight);
                 if (!img.empty()) return img;
             }
             if (gpuRaster) {
@@ -22862,7 +22873,9 @@ static int run(int argc, char** argv) {
                 ndHostStale = false;
                 const double msWarp = msSince(tA);
                 ndBvhStale = true;
-                plight = raster::deriveLight(scene);
+                // Re-derive only when the probe looks at geometry: an env-only preview light does
+                // not depend on the warped mesh, and this runs on every N-D slider move.
+                if (previewProbeGeo) plight = derivePreviewLight();
                 prims.clear();
                 tessellated = false;
                 double msTess = 0, msUp = 0;
@@ -22945,7 +22958,7 @@ static int run(int argc, char** argv) {
                 ftsl::Loaded nl;
                 if (!ftsl::load(path, nl, aerr, supportFn)) return false;
                 scene = std::move(nl.scene);
-                plight = raster::deriveLight(scene);
+                plight = derivePreviewLight();
                 prims.clear();
                 tessellated = false;
 #ifdef HAVE_CUDA

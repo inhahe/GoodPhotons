@@ -374,8 +374,10 @@ quietly produce a **wrong image** instead of a complaint. See FTSL.md §1.3.
 
 > **Quick mesh viewer.** A bare positional **mesh** path — `ftrace model.glb`
 > (also `.obj` / `.gltf` / `.fbx` / `.stl` / `.ply`) — wraps the mesh in a
-> synthesized, auto-lit scene (a neutral clay fallback material under a soft uniform
-> environment; glTF/GLB primitives keep their own imported materials) and opens it in
+> synthesized scene lit by a procedural **photo studio** — key, fill, rim and top
+> softboxes over a cyclorama (`light env { kind studio }`), so a metal has something to
+> reflect; a neutral clay fallback covers primitives with no material, and glTF/GLB
+> primitives keep their own imported materials — and opens it in
 > an **auto-framed live raster preview window** — the same interactive fly-camera as a
 > double-clicked `.ftsl`. The camera is aimed at the mesh's bounding sphere from a
 > three-quarter front-high angle and pulled back so the whole model fits the frame, so

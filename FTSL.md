@@ -2567,7 +2567,7 @@ scene to fixed-exposure output (`power` wins if both given). Env lights reject
 | `cylinder` | `center` `axis`(0,1,0) `length`(0.5) `radius`(0.05) `segments`(48) `caps`(off) `spd` — a tube/fluorescent |
 | `spot` | `origin`(0.5,0.99,0.5) `dir`(0,-1,0) `inner_angle`(20°) `outer_angle`(30°) `spd` |
 | `sun` | `elevation`(45°) `azimuth`(0°) *or* `dir`(toward the sun) `angle`(0.53°) `spd` `intensity`(1) |
-| `env` | constant: `spd`. Image-based: `file "sky.hdr"` `rotate`(0°) `intensity`(1) |
+| `env` | constant: `spd`. Image-based: `file "sky.hdr"` `rotate`(0°) `intensity`(1). Analytic sky: `sky preetham` (see the command-line reference). Photo studio: `kind studio` `rotate`(0°) `intensity`(1) `res`(1024) — a cyclorama with key / fill / rim / top softboxes, what the mesh quick-view lights a model with (0.368.0) |
 
 `caps on`/`true`/`yes` closes the cylinder (emissive end discs). `spot` angles are
 half-angles in degrees with a smoothstep penumbra between inner and outer.
