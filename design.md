@@ -7453,12 +7453,24 @@ as the one at fault.
   window has a monitor, before it is shown. `frameRect` and `WM_GETMINMAXINFO` use
   `AdjustWindowRectExForDpi`; `WM_DPICHANGED` keeps the client size in physical pixels and
   takes only the suggested position (accepting the suggested size would rescale the image to
-  keep its apparent size — the opposite of the point). `LiveWindow::setPixelExact(false)`
-  opts a window out and leaves it exactly as before: `-explore` and `-review` do, because
-  their control strips are laid out in 96-dpi constants (`kRowH`, `kPanelH`, the N-D cell
-  widths, the 700-px row minimum, `DEFAULT_GUI_FONT`) and would come out two-thirds size;
-  making them aware means scaling those and choosing a DPI font (known-issues
-  LIVE-WINDOW-PANEL-DPI). Verified by capturing the windows through DWM and comparing the
+  keep its apparent size — the opposite of the point). **Every window is aware since
+  0.367.0, `-explore` and `-review` included.** The control strip's lengths are 96-dpi
+  constants run through `Impl::px()` (`MulDiv(v, dpiNow, 96)` — the identity when unaware,
+  so an unaware window lays out exactly as before); its font is `DEFAULT_GUI_FONT`'s face at
+  8 pt for the window's DPI (`makePanelFont` — the stock font answers an aware thread with
+  the SYSTEM dpi's size, right on one monitor, wrong on a second scaled differently); and
+  `onDpiChanged` re-makes both on a monitor change while keeping the image area's size.
+  Three things outside the strip had to follow. `clientSize()` is called by the DPI-UNAWARE
+  render thread, which Windows answers in virtualized 96-dpi units while `panelH` is in the
+  window's pixels — `-explore` rendered 685×274 for a 1028×480 image area and stretched it
+  1.5× — so the call borrows the window's awareness (`SetThreadDpiAwarenessContext` around
+  `GetClientRect`). Drag deltas reach `NavInput` in 96-dpi units, since main.cpp's `kDrag` is
+  radians per such pixel. And `-explore`'s render cap is a pixel budget, the authored W×H
+  × `LiveWindow::scale()`², rather than the long edge: the strip needs a window wider than
+  a 640-wide film, and the budget covers that opening image area (1028×480 at 150 %) where
+  the long edge cap stretched it 7 %. The editor's control-point markers scale with it.
+  `FTRACE_LIVE_SCALED=1` (`setPixelExact(false)`) is the escape hatch back to DPI-virtualized
+  windows. Verified by capturing the windows through DWM and comparing the
   client area with the PNG the same render wrote: 0 of 307 200 pixels differ at 640×480, and
   0 of 589 824 at 64×64 magnified 12×.
   **`renderShared(w, h, fn)` is the zero-copy entry point** (0.98.0): instead of handing

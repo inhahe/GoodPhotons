@@ -1,12 +1,18 @@
 #include "viewerhelp.h"
 #include "livewindow.h"
+#include <cstdlib>             // std::getenv (FTRACE_LIVE_SCALED), before the platform split
 
 // Shared by both builds: on a headless build there is no window to minimize, but the
 // setter must still link so callers need no platform guard.
 static bool g_lwStartMinimized = false;
 void LiveWindow::setStartMinimized(bool on) { g_lwStartMinimized = on; }
 bool LiveWindow::startMinimized() { return g_lwStartMinimized; }
-static bool g_lwPixelExact = true;
+// FTRACE_LIVE_SCALED=1: every window DPI-virtualized again, as before 0.366.0 -- an escape
+// hatch for a display setup where per-monitor awareness misbehaves (cf. FTRACE_LIVE_GDI).
+static bool g_lwPixelExact = [] {
+    const char* e = std::getenv("FTRACE_LIVE_SCALED");
+    return !(e && e[0] && !(e[0] == '0' && e[1] == 0));
+}();
 void LiveWindow::setPixelExact(bool on) { g_lwPixelExact = on; }
 bool LiveWindow::pixelExact() { return g_lwPixelExact; }
 
@@ -21,6 +27,7 @@ void LiveWindow::setTitle(const std::string&) {}
 bool LiveWindow::closed() const { return false; }
 NavInput LiveWindow::drainNav() { return {}; }
 bool LiveWindow::clientSize(int&, int&) const { return false; }
+double LiveWindow::scale() const { return 1.0; }
 void LiveWindow::enablePanel(int, double, const char*) {}
 void LiveWindow::setPanelState(int, bool, bool, const char*) {}
 void LiveWindow::setPathCount(int) {}
@@ -490,13 +497,15 @@ static const int kNdCellW = 168;            // one slider cell: caption (56) + t
 // One FILL cell: axis caption + a what-fills-it pick-list + an amount slider. Wider than a
 // plane cell because the pick-list has to show "emboss curvature" without eliding it.
 static const int kNdFillCellW = 250;
-static size_t ndFillPerRow(int clientW) {
-    const int per = (clientW - 10) / kNdFillCellW;
+// `margin` and `cellW` arrive already scaled to the window's DPI (Impl::px), and from the SAME
+// expressions layoutPanel positions with, so the rows counted here are the rows laid out there.
+static size_t ndFillPerRow(int clientW, int margin, int cellW) {
+    const int per = (clientW - margin) / cellW;
     return (size_t)(per < 1 ? 1 : per);
 }
-static int ndBankRows(int clientW, int planes) {
+static int ndBankRows(int clientW, int planes, int margin, int cellW) {
     if (planes <= 0) return 0;
-    const int perRow = std::max(1, (clientW - 10) / kNdCellW);
+    const int perRow = std::max(1, (clientW - margin) / cellW);
     return (planes + perRow - 1) / perRow;
 }
 static const int kPanelH = 92;              // control-strip height (px) WITHOUT the bind row: buttons + timeline + editor rows
@@ -533,6 +542,12 @@ struct LiveWindow::Impl {
     int                  initW = 0, initH = 0;     // the client size it opens at (sizeFor)
     int                  minW = 640, minH = 300;   // readable floor so the title bar stays legible
     bool                 dpiAware = false;         // pixel for pixel (threadMain); UI thread sets once
+    // The window's DPI (96 when unaware). Written by the UI thread (creation, WM_DPICHANGED),
+    // read by it for every panel length and by the render thread through LiveWindow::scale().
+    std::atomic<int>     dpiNow{96};
+    // A 96-dpi length in this window's pixels. The identity for an unaware window, so its
+    // layout is exactly what it always was.
+    int px(int v) const { return MulDiv(v, dpiNow.load(std::memory_order_relaxed), 96); }
     std::wstring         title;
     HANDLE               readyEvent = nullptr;
     // ---- Fly-camera input state (guarded by inMtx unless noted) ----
@@ -590,6 +605,7 @@ struct LiveWindow::Impl {
     // int would otherwise be a plain cross-thread read/write.
     std::atomic<int>     bindDims{0};
     HFONT panelFont = nullptr;
+    HFONT ownFont   = nullptr;   // panelFont when WE made it (DPI-aware); deleted at WM_NCDESTROY
     // Staged enablePanel() params (set under inMtx before WM_MKPANEL is sent).
     int                  reqPathCount = 0; double reqDefFps = 0.0; std::string reqCollide;
     // Panel outputs (guarded by inMtx): one-shot button edges + current input values.
@@ -653,6 +669,8 @@ struct LiveWindow::Impl {
     static LRESULT CALLBACK ViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
     void threadMain();
     void sizeFor(UINT dpi, HWND hw);                // initW/initH/minW/minH at a DPI (UI thread)
+    void makePanelFont();                           // panelFont at dpiNow (UI thread)
+    void onDpiChanged(HWND h, int newDpi, const RECT* suggested);   // WM_DPICHANGED (UI thread)
     void frameRect(RECT& r, HWND h) const;          // client rect -> window rect at h's DPI
     void makeView(HWND parent);                     // create the image child + init D3D (UI thread)
     void layoutView(HWND parent);                   // fit the child to the image area (UI thread)
@@ -694,9 +712,9 @@ void LiveWindow::Impl::buildPanel(HWND h) {
     int pc; double defFps; std::string collide;
     { std::lock_guard<std::mutex> lk(inMtx); pc = reqPathCount; defFps = reqDefFps; collide = reqCollide; }
     pathCount  = pc;
-    panelBaseH = kPanelH;
-    panelH     = kPanelH;
-    panelFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    panelBaseH = px(kPanelH);
+    panelH     = px(kPanelH);
+    makePanelFont();
     HINSTANCE hi = (HINSTANCE)GetWindowLongPtrW(h, GWLP_HINSTANCE);
     auto mk = [&](const wchar_t* cls, const wchar_t* txt, DWORD style, int id) -> HWND {
         HWND c = CreateWindowExW(0, cls, txt, WS_CHILD | WS_VISIBLE | style,
@@ -828,8 +846,8 @@ void LiveWindow::Impl::buildBindRow(HWND h) {
     setChannelCombo(dims);
     { std::lock_guard<std::mutex> lk(inMtx); bindDimsVal = dims; }
     // Grow by one row so the image area is unchanged (same contract as buildPanel).
-    panelBaseH += kRowH;
-    panelH     += kRowH;
+    panelBaseH += px(kRowH);
+    panelH     += px(kRowH);
     // Publish BEFORE laying out: layoutPanel skips row 4 unless hasBindRow is set, so storing it
     // afterwards (the order buildPanel uses for hasPanel) would leave every bind-row control
     // parked at its 10x10 creation rect in the window's top-left corner. Safe here for the same
@@ -837,7 +855,7 @@ void LiveWindow::Impl::buildBindRow(HWND h) {
     // are still pending, and nothing outside this thread can observe them before we return.
     hasBindRow.store(true);
     RECT wr; GetWindowRect(h, &wr);
-    SetWindowPos(h, nullptr, 0, 0, wr.right - wr.left, (wr.bottom - wr.top) + kRowH,
+    SetWindowPos(h, nullptr, 0, 0, wr.right - wr.left, (wr.bottom - wr.top) + px(kRowH),
                  SWP_NOMOVE | SWP_NOZORDER);
     layoutPanel(h);
     layoutView(h);          // see the note in buildPanel: a clamped grow fires no WM_SIZE
@@ -851,9 +869,11 @@ int LiveWindow::Impl::ndStripH(int clientW) const {
     if (!hasNdPanel.load() || hNdSlider.empty()) return 0;
     // One controls row, then the fill cells, then the plane sliders — each group wrapped
     // to whatever the current width allows.
+    const int margin = 2 * px(5);                  // layoutPanel's 2 * pad, to the pixel
+    const size_t perFill = ndFillPerRow(clientW, margin, px(kNdFillCellW));
     const int fillRows = hNdFill.empty()
-        ? 0 : (int)((hNdFill.size() + ndFillPerRow(clientW) - 1) / ndFillPerRow(clientW));
-    return (1 + fillRows + ndBankRows(clientW, (int)hNdSlider.size())) * kRowH;
+        ? 0 : (int)((hNdFill.size() + perFill - 1) / perFill);
+    return (1 + fillRows + ndBankRows(clientW, (int)hNdSlider.size(), margin, px(kNdCellW))) * px(kRowH);
 }
 
 // One slider's caption: the plane it turns and the angle it is at ("xw  +30"). Rewritten
@@ -1070,8 +1090,11 @@ void LiveWindow::Impl::layoutPanel(HWND h) {
     // shorter — no window resize from inside a WM_SIZE, which would re-enter this path.
     if (hasNdPanel.load()) panelH = panelBaseH + ndStripH(W);
     int top = H - panelH;
-    const int pad = 5, bh = 24;
-    int row1 = top + 5, row2 = top + 5 + (bh + 4), row3 = top + 5 + 2 * (bh + 4);
+    // Every length below is a 96-dpi length run through px() (0.367.0): a DPI-aware window
+    // measures in screen pixels, so a literal 24 would be a two-thirds-height button at 150 %.
+    // At 96 dpi px() is the identity, so an unaware window lays out exactly as it always did.
+    const int pad = px(5), bh = px(24), step = bh + px(4);
+    const int row1 = top + pad, row2 = row1 + step, row3 = row1 + 2 * step;
     int x = pad;
     auto place = [&](HWND c, int w, int y, int height) {
         if (c) MoveWindow(c, x, y, w, height, TRUE);
@@ -1079,21 +1102,21 @@ void LiveWindow::Impl::layoutPanel(HWND h) {
     };
     // Row 1: collision/reset + the path (timeline) group. The group is positioned even when
     // hidden, so revealing it later (setPathCount) needs no relayout.
-    place(hClip, 84, row1, bh);
-    place(hReset, 56, row1, bh);
-    place(hHelp, 48, row1, bh);
-    place(hColor, 52, row1, bh);
-    place(hSeeThru, 88, row1, bh);
-    place(hPath, 66, row1, bh);
-    place(hPlay, 56, row1, bh);
-    place(hStrideLbl, 58, row1, bh);
-    place(hStride, 40, row1, bh);
-    place(hRateLbl, 50, row1, bh);
-    place(hRate, 48, row1, bh);
-    place(hSwUpdate, 66, row1, bh);
-    place(hSwSec, 62, row1, bh);
+    place(hClip,      px(84), row1, bh);
+    place(hReset,     px(56), row1, bh);
+    place(hHelp,      px(48), row1, bh);
+    place(hColor,     px(52), row1, bh);
+    place(hSeeThru,   px(88), row1, bh);
+    place(hPath,      px(66), row1, bh);
+    place(hPlay,      px(56), row1, bh);
+    place(hStrideLbl, px(58), row1, bh);
+    place(hStride,    px(40), row1, bh);
+    place(hRateLbl,   px(50), row1, bh);
+    place(hRate,      px(48), row1, bh);
+    place(hSwUpdate,  px(66), row1, bh);
+    place(hSwSec,     px(62), row1, bh);
     // Row 2: the timeline, with the paint controls docked at the right end.
-    const int paintW = 52, flatW = 44, spdW = 52;
+    const int paintW = px(52), flatW = px(44), spdW = px(52);
     int rightBlock = paintW + flatW + spdW + 3 * pad;   // reserved on the right for paint tools
     int tlW = std::max(1, W - 2 * pad - rightBlock);
     if (hTimeline) MoveWindow(hTimeline, pad, row2, tlW, bh, TRUE);
@@ -1103,71 +1126,125 @@ void LiveWindow::Impl::layoutPanel(HWND h) {
     place(hSpdLbl, spdW,  row2, bh);
     // Row 3: the curve-editor toolset.
     x = pad;
-    place(hRec,   56, row3, bh);
-    place(hAddPt, 48, row3, bh);
-    place(hInsPt, 48, row3, bh);
-    place(hDelPt, 48, row3, bh);
-    place(hPtLbl, 60, row3, bh);
-    place(hRaw,   52, row3, bh);
-    place(hTolLbl,34, row3, bh);
-    place(hTol,   56, row3, bh);
-    place(hSave,  56, row3, bh);
+    place(hRec,    px(56), row3, bh);
+    place(hAddPt,  px(48), row3, bh);
+    place(hInsPt,  px(48), row3, bh);
+    place(hDelPt,  px(48), row3, bh);
+    place(hPtLbl,  px(60), row3, bh);
+    place(hRaw,    px(52), row3, bh);
+    place(hTolLbl, px(34), row3, bh);
+    place(hTol,    px(56), row3, bh);
+    place(hSave,   px(56), row3, bh);
     // Row 4 (only when the loom live channel exists): channel -> slot binding + a status line.
     if (hasBindRow.load()) {
-        int row4 = top + 5 + 3 * (bh + 4);
+        const int row4 = row1 + 3 * step;
         x = pad;
-        place(hBLbl,    38, row4, bh);
+        place(hBLbl,     px(38), row4, bh);
         // A combo's height is its DROPPED height; the closed box is one line tall regardless.
-        place(hBCh,     70, row4, bh + 120);
-        place(hBArrow,  16, row4, bh);
-        place(hBSlot,  130, row4, bh + 120);
-        place(hBind,    50, row4, bh);
-        place(hBClear,  62, row4, bh);
-        place(hBDimsLbl,44, row4, bh);
-        place(hBDims,   40, row4, bh);
+        place(hBCh,      px(70), row4, bh + px(120));
+        place(hBArrow,   px(16), row4, bh);
+        place(hBSlot,   px(130), row4, bh + px(120));
+        place(hBind,     px(50), row4, bh);
+        place(hBClear,   px(62), row4, bh);
+        place(hBDimsLbl, px(44), row4, bh);
+        place(hBDims,    px(40), row4, bh);
         // The status readout takes whatever width is left (it is SS_ENDELLIPSIS, so a long
         // loom error truncates cleanly instead of overrunning the strip).
-        if (hBStat) MoveWindow(hBStat, x, row4, std::max(40, W - pad - x), bh, TRUE);
+        if (hBStat) MoveWindow(hBStat, x, row4, std::max(px(40), W - pad - x), bh, TRUE);
     }
     // N-D rotation bank: a controls row, then the sliders wrapped into a grid. Laid out
     // last because it sits at the bottom of the strip and its height is what grew the
     // window; re-deriving the row count here (rather than trusting the stored one) is what
     // makes a window RESIZE reflow the bank to the new width.
     if (hasNdPanel.load()) {
-        const int base = top + 5 + (3 + (hasBindRow.load() ? 1 : 0)) * (bh + 4);
+        const int base = row1 + (3 + (hasBindRow.load() ? 1 : 0)) * step;
         x = pad;
-        place(hNdDimsLbl, 62, base, bh);
-        place(hNdDims,    40, base, bh);
-        place(hNdReset,   56, base, bh);
-        place(hNdSave,    88, base, bh);
-        if (hNdStat) MoveWindow(hNdStat, x, base, std::max(40, W - pad - x), bh, TRUE);
+        place(hNdDimsLbl, px(62), base, bh);
+        place(hNdDims,    px(40), base, bh);
+        place(hNdReset,   px(56), base, bh);
+        place(hNdSave,    px(88), base, bh);
+        if (hNdStat) MoveWindow(hNdStat, x, base, std::max(px(40), W - pad - x), bh, TRUE);
         // Fill cells first: they say what the space CONTAINS, and the plane sliders below
-        // rotate within it.
-        const int fillPerRow = (int)ndFillPerRow(W);
+        // rotate within it. Row counts come from the same helpers ndStripH sizes the strip with.
+        const int fillCellW = px(kNdFillCellW), planeCellW = px(kNdCellW);
+        const int fillPerRow = (int)ndFillPerRow(W, 2 * pad, fillCellW);
         int fillRows = 0;
         for (int k = 0; k < (int)hNdFill.size(); ++k) {
             const int r = k / fillPerRow, c = k % fillPerRow;
             fillRows = r + 1;
-            const int cx = pad + c * kNdFillCellW;
-            const int cy = base + (bh + 4) * (1 + r);
-            if (hNdDimLbl[(size_t)k]) MoveWindow(hNdDimLbl[(size_t)k], cx, cy, 20, bh, TRUE);
+            const int cx = pad + c * fillCellW;
+            const int cy = base + step * (1 + r);
+            if (hNdDimLbl[(size_t)k]) MoveWindow(hNdDimLbl[(size_t)k], cx, cy, px(20), bh, TRUE);
             // A combo's creation/move height is its DROPPED height; the closed box is one
             // line regardless, so the extra 160 px is the list, not the control.
-            if (hNdFill[(size_t)k])   MoveWindow(hNdFill[(size_t)k], cx + 22, cy, 122, bh + 160, TRUE);
-            if (hNdAmt[(size_t)k])    MoveWindow(hNdAmt[(size_t)k], cx + 148, cy, 66, bh, TRUE);
-            if (hNdAmtLbl[(size_t)k]) MoveWindow(hNdAmtLbl[(size_t)k], cx + 216, cy, 30, bh, TRUE);
+            if (hNdFill[(size_t)k])   MoveWindow(hNdFill[(size_t)k], cx + px(22), cy, px(122), bh + px(160), TRUE);
+            if (hNdAmt[(size_t)k])    MoveWindow(hNdAmt[(size_t)k], cx + px(148), cy, px(66), bh, TRUE);
+            if (hNdAmtLbl[(size_t)k]) MoveWindow(hNdAmtLbl[(size_t)k], cx + px(216), cy, px(30), bh, TRUE);
         }
         const int planes = (int)hNdSlider.size();
-        const int perRow = std::max(1, (W - 2 * pad) / kNdCellW);
+        const int perRow = std::max(1, (W - 2 * pad) / planeCellW);
         for (int k = 0; k < planes; ++k) {
             const int r = k / perRow, c = k % perRow;
-            const int cx = pad + c * kNdCellW;
-            const int cy = base + (bh + 4) * (1 + fillRows + r);
-            if (hNdLabel[(size_t)k])  MoveWindow(hNdLabel[(size_t)k], cx, cy, 54, bh, TRUE);
-            if (hNdSlider[(size_t)k]) MoveWindow(hNdSlider[(size_t)k], cx + 56, cy,
-                                                 kNdCellW - 62, bh, TRUE);
+            const int cx = pad + c * planeCellW;
+            const int cy = base + step * (1 + fillRows + r);
+            if (hNdLabel[(size_t)k])  MoveWindow(hNdLabel[(size_t)k], cx, cy, px(54), bh, TRUE);
+            if (hNdSlider[(size_t)k]) MoveWindow(hNdSlider[(size_t)k], cx + px(56), cy,
+                                                 px(kNdCellW - 62), bh, TRUE);
         }
     }
+}
+
+// The strip's font at the window's DPI (0.367.0). An unaware window keeps the stock
+// DEFAULT_GUI_FONT it always had (Windows scales it with the rest of the window). An aware one
+// gets that face at 8 pt for ITS dpi: the stock font answers an aware thread with the SYSTEM
+// dpi's size (-16 at 144 against -11 unaware), which is right on one monitor and wrong on a
+// second one scaled differently. The previous font, if we made one, is the caller's to free
+// once no control uses it (onDpiChanged).
+void LiveWindow::Impl::makePanelFont() {
+    HFONT stock = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    panelFont = stock;
+    if (!dpiAware) return;
+    LOGFONTW lf{};
+    if (!GetObjectW(stock, sizeof(lf), &lf)) return;
+    lf.lfHeight = -MulDiv(8, dpiNow.load(), 72);
+    HFONT f = CreateFontIndirectW(&lf);
+    if (!f) return;
+    ownFont = f;
+    panelFont = f;
+}
+
+static BOOL CALLBACK setFontProc(HWND c, LPARAM f) {
+    SendMessageW(c, WM_SETFONT, (WPARAM)f, TRUE);
+    return TRUE;
+}
+
+// WM_DPICHANGED (0.367.0): the window moved to a monitor with another scale. The IMAGE area
+// keeps its size in screen pixels -- that is what keeps it pixel for pixel -- so the window
+// takes the suggested position but not the suggested size (which would rescale the image to
+// keep its apparent size, the opposite of the point); the control strip, whose job is to stay
+// readable, is re-made at the new DPI: font, row heights, cell widths, then laid out again.
+void LiveWindow::Impl::onDpiChanged(HWND h, int newDpi, const RECT* sug) {
+    RECT cr; GetClientRect(h, &cr);
+    const int cw = cr.right - cr.left, imgH = (cr.bottom - cr.top) - panelH;
+    dpiNow.store(newDpi);
+    if (hasPanel.load()) {
+        HFONT old = ownFont;
+        ownFont = nullptr;
+        makePanelFont();
+        EnumChildWindows(h, setFontProc, (LPARAM)panelFont);
+        if (old) DeleteObject(old);                 // no control holds it any more
+        panelBaseH = px(kPanelH) + (hasBindRow.load() ? px(kRowH) : 0);
+        panelH     = panelBaseH + ndStripH(cw);
+    }
+    if (!IsIconic(h) && sug && imgH > 0) {
+        RECT r{0, 0, cw, imgH + panelH};
+        AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, (UINT)newDpi);
+        SetWindowPos(h, nullptr, sug->left, sug->top, r.right - r.left, r.bottom - r.top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    layoutPanel(h);                                 // a same-size move fires no WM_SIZE
+    layoutView(h);
+    InvalidateRect(h, nullptr, TRUE);
 }
 
 // Show/hide the path (timeline) controls as a group — the timeline only makes sense once a
@@ -1455,8 +1532,12 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                 // DRAGGING (object-view turntable): accumulate the pixel delta and hold the
                 // hover-look rate at zero, so one gesture cannot both orbit and steer.
                 if (self->dragging) {
-                    self->dragDx += (double)(mx - self->dragLastX);
-                    self->dragDy += (double)(my - self->dragLastY);
+                    // In 96-dpi pixels, so the same hand movement turns the model as far at
+                    // any display scale (main.cpp's kDrag is radians per such pixel). Exactly
+                    // the raw delta for an unaware window (x 1.0).
+                    const double k = 96.0 / self->dpiNow.load(std::memory_order_relaxed);
+                    self->dragDx += (double)(mx - self->dragLastX) * k;
+                    self->dragDy += (double)(my - self->dragLastY) * k;
                     self->dragLastX = mx; self->dragLastY = my;
                     self->lookX = self->lookY = 0.0;
                     return 0;   // the case's own exit; `break` would fall past it
@@ -1717,7 +1798,7 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                 int minWpx = r.right - r.left, minHpx = r.bottom - r.top;
                 if (self->panelH > 0) {
                     minHpx += self->panelH;             // room for the control strip below the image
-                    const int rowW = self->dpiAware ? MulDiv(700, (int)GetDpiForWindow(h), 96) : 700;
+                    const int rowW = self->px(700);
                     if (minWpx < rowW) minWpx = rowW;   // wide enough for the button row not to clip
                 }
                 mmi->ptMinTrackSize.x = minWpx;
@@ -1726,18 +1807,7 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             return 0;
         case WM_DPICHANGED:
             // Only a DPI-aware window gets this: it moved to a monitor with another scale.
-            // Keep the CLIENT size -- in physical pixels that is what keeps the image pixel
-            // for pixel -- take the suggested position, and re-derive the frame for the new
-            // DPI. (Accepting the suggested SIZE would rescale the image to keep its apparent
-            // size, which is the opposite of the point.)
-            if (!IsIconic(h)) {
-                const RECT* sug = reinterpret_cast<const RECT*>(lp);
-                RECT cr; GetClientRect(h, &cr);
-                RECT r{0, 0, cr.right - cr.left, cr.bottom - cr.top};
-                AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, HIWORD(wp));
-                SetWindowPos(h, nullptr, sug->left, sug->top, r.right - r.left, r.bottom - r.top,
-                             SWP_NOZORDER | SWP_NOACTIVATE);
-            }
+            if (self) self->onDpiChanged(h, (int)HIWORD(wp), reinterpret_cast<const RECT*>(lp));
             return 0;
         case WM_CLOSE:
             if (self) {
@@ -1753,6 +1823,11 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             }
             DestroyWindow(h);
             return 0;
+        case WM_NCDESTROY:
+            // The last message, after every child is destroyed: nothing can draw with the
+            // strip's font any more.
+            if (self && self->ownFont) { DeleteObject(self->ownFont); self->ownFont = nullptr; }
+            break;
         case WM_DESTROY:
             // The handle is now invalid: publish null so no cross-thread caller (or the dtor)
             // marshals to this — or a recycled — HWND after we return.
@@ -1866,6 +1941,7 @@ void LiveWindow::Impl::threadMain() {
                              SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
         }
+        dpiNow.store(dpiAware ? (int)GetDpiForWindow(hw) : 96);   // before any panel is laid out
         makeView(hw);                              // D3D child over the image area (may fail -> GDI)
         // SW_SHOWMINNOACTIVE, not SW_MINIMIZE: the latter would still activate the window
         // first (stealing focus for an instant, and dropping whatever the user was typing
@@ -2034,11 +2110,25 @@ NavInput LiveWindow::drainNav() {
     return n;
 }
 
+double LiveWindow::scale() const {
+    return impl_ ? impl_->dpiNow.load(std::memory_order_relaxed) / 96.0 : 1.0;
+}
+
 bool LiveWindow::clientSize(int& w, int& h) const {
     HWND hw = impl_ ? impl_->hwnd.load() : nullptr;
     if (!hw) return false;
+    // In the WINDOW's pixels, whoever asks (0.367.0). The caller is the render thread, which is
+    // DPI-UNAWARE, and Windows answers an unaware thread's GetClientRect on a per-monitor-aware
+    // window in virtualized 96-dpi units -- while panelH below is in the window's own pixels.
+    // Measured before this: -explore rendered 685x274 for a 1028x480 image area at 150 %
+    // (1028x618 / 1.5, less the 138-px strip) and stretched it 1.5x. So the query borrows
+    // the window's awareness for the one call.
+    DPI_AWARENESS_CONTEXT prev = impl_->dpiAware
+        ? SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) : nullptr;
     RECT cr;
-    if (!GetClientRect(hw, &cr)) return false;
+    const BOOL got = GetClientRect(hw, &cr);
+    if (prev) SetThreadDpiAwarenessContext(prev);
+    if (!got) return false;
     int cw = cr.right - cr.left, ch = (cr.bottom - cr.top) - impl_->panelH;  // image area only
     if (cw <= 0 || ch <= 0) return false;
     w = cw; h = ch;

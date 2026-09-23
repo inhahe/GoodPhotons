@@ -25058,16 +25058,43 @@ allocation to attack, not `-n`.
 
 ## Tech debt
 
-### OPEN (2026-09-22): LIVE-WINDOW-PANEL-DPI — `-explore` and `-review` windows are still stretched by display scaling
+### DONE (2026-09-22, 0.367.0): LIVE-WINDOW-PANEL-DPI — `-explore` and `-review` windows were still stretched by display scaling
 
-Since 0.366.0 the render and raster previews are per-monitor DPI-aware and show the image pixel for
-pixel. The two windows with a control strip opt out (`LiveWindow::setPixelExact(false)`), because the
-strip is laid out in 96-dpi constants — `kRowH` 28, `kPanelH` 92, the N-D cells' 168 / 250, the
-700-px row minimum, the fixed x offsets in `layoutPanel`, and `DEFAULT_GUI_FONT` — and an aware
-window would draw it two-thirds size at 150 %. So those two are still bitmap-stretched: the image is
-1.5× and smoothed there, and the controls are slightly soft. Fixing it means scaling every panel
-metric by `GetDpiForWindow / 96`, a DPI-sized font (`SystemParametersInfoForDpi` → `lfMessageFont`),
-and re-laying the strip on `WM_DPICHANGED`; then the opt-out can go.
+0.366.0 made the render and raster previews per-monitor DPI-aware but opted the two windows with
+a control strip out, because the strip was laid out in 96-dpi constants — `kRowH` 28, `kPanelH` 92,
+the N-D cells' 168 / 250, the 700-px row minimum, the fixed offsets in `layoutPanel`, and
+`DEFAULT_GUI_FONT` — and would have drawn two-thirds size at 150 %. Now every length goes through
+`Impl::px()`, the font is the stock face at 8 pt for the window's DPI, `WM_DPICHANGED` re-makes
+both, and the opt-out is gone (`FTRACE_LIVE_SCALED=1` remains as an escape hatch for all windows).
+Two consequences outside the strip were found by looking, not by reading:
+
+- **`clientSize()` mixed units.** It runs on the render thread, which is DPI-unaware, and Windows
+  answers an unaware thread's `GetClientRect` on an aware window in virtualized 96-dpi units — so
+  `-explore` subtracted the strip's 138 real pixels from a client height of 412 virtual ones and
+  rendered 685×274 for a 1028×480 image area, stretched 1.5× with bars. The call now borrows the
+  window's awareness.
+- **`-explore`'s cap.** It rendered up to the authored film's longest edge, and the strip needs a
+  window wider than a 640-wide film, so even at 100 % the opening window stretched its render ~7 %.
+  The cap is now a pixel budget, authored W×H × scale² — the old cap at the window's old apparent
+  size — which covers the opening image area.
+
+Verified by capturing the windows through DWM: an `-explore` window at 144 dpi (per-monitor) with its
+strip at full resolution, rendering exactly its 1028×480 image area; the timeline row of a camera-path
+scene (`scenes/crystalloop.ftsl`, 1028×360 rendered for a 1028×360 area) and the N-D bank of
+`torus.obj -nd 5` (dims row, two fill cells, ten plane sliders five to a row; 1350×1044 rendered for
+1350×1044) laid out in the same proportions as before; `FTRACE_LIVE_SCALED=1` giving back the old
+96-dpi window; `-window-min` still minimized either way; the previews still 0 of 307 200 / 589 824
+pixels different from their PNGs; the renders byte-identical to 0.365.0. `-review` shares the strip
+code but ignores `-window-min` (it returns before the flags are parsed), so it was not opened here, to
+keep a focused window off the desktop.
+
+### OPEN (2026-09-22): EXPLORE-ROW1-CLIP — with a camera path, the strip's first row runs past the window's minimum width
+
+Found while checking the above, and older than it: `WM_GETMINMAXINFO` holds a strip window to 700
+96-dpi pixels, which fits rows 3 and 4 but not row 1 once the path group is showing (Path lock, Play,
+cams/upd, cams/s and the per-update / per-second pair need about 844). At the window's opening size
+the cams/s box is cut off and the two radios are off the edge, identically at 96 dpi and at 144.
+Widening the window shows them. The fix is a minimum computed from the visible rows' widths.
 
 ### The 12 render modes are 5 estimators wearing 12 letters — and one of the splits costs a real capability — 2026-09-05
 

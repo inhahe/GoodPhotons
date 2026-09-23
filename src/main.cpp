@@ -17899,7 +17899,6 @@ static int reviewMode(const std::string& base) {
         return 2;
     }
     std::string title = "ftrace review — " + prefix;
-    LiveWindow::setPixelExact(false);   // its timeline strip is fixed-pixel (see -explore)
     LiveWindow win(fw, fh, title.c_str());
     const double defFps = 30.0;
     win.enablePanel(nFrames, defFps, "n/a");
@@ -20020,9 +20019,6 @@ static int run(int argc, char** argv) {
     // -window-min: applied once here rather than at each of the four LiveWindow
     // construction sites, so any future one inherits it automatically.
     LiveWindow::setStartMinimized(g_minWindow);
-    // Pixel for pixel on a scaled display (0.366.0) -- except -explore, whose control strip is
-    // laid out in fixed 96-dpi pixels and would come out two-thirds size at 150 % (livewindow.h).
-    LiveWindow::setPixelExact(!exploreMode);
 
     // --- every output directory must exist BEFORE a single photon is traced ----------
     // Otherwise a mistyped/not-yet-created output directory used to be discovered only
@@ -21826,23 +21822,33 @@ static int run(int argc, char** argv) {
             // camera's horizontal FOV follows the window aspect while fov_y stays fixed
             // (lookAt derives tanHalfX = tanHalfY * VW/VH), exactly like a game viewport:
             // a wider window simply reveals more to the sides, with square pixels (no stretch).
-            // Two guards: never render past the authored longest edge (growing the window
-            // beyond the film res would only supersample the preview, not add real detail),
-            // and never shrink the long edge below kMinLong. The eye/look_at readout and the
-            // world-scaled crosshair stay resolution-independent. Recomputed every loop so a
-            // live resize retunes it.
+            // Two guards: never render more PIXELS than the authored film has at this display's
+            // scale (growing the window beyond that would only supersample the preview, not add
+            // real detail), and never shrink the long edge below kMinLong. The eye/look_at
+            // readout and the world-scaled crosshair stay resolution-independent. Recomputed every
+            // loop so a live resize retunes it.
+            //
+            // PIXEL FOR PIXEL (0.367.0). The window is DPI-aware, so clientSize() is in screen
+            // pixels, and the cap is the authored W x H times scale() squared: the old cap at the
+            // window's old apparent size, now rendered at full resolution. A pixel COUNT rather
+            // than the long edge, because the control strip needs a window wider than a
+            // 640-wide film: at 150 % the opening image area is 1026 x 480 -- more than 960 on its
+            // long edge but fewer pixels than 960 x 720 -- so the window as it opens renders one
+            // pixel per screen pixel instead of being stretched 7 %.
             auto fitRes = [&](int& outW, int& outH) {
                 int cw = 0, ch = 0;
                 if (!g_liveWin->clientSize(cw, ch)) { outW = W; outH = H; return; }
                 int vw = std::max(1, cw), vh = std::max(1, ch);   // fill the window (its aspect)
-                const int kMaxLong = std::max(W, H);   // cap at authored detail (no supersampling)
-                int lo = std::max(vw, vh);
-                if (lo > kMaxLong) {
-                    double s = (double)kMaxLong / lo;
+                const double sc = g_liveWin->scale();
+                const double budget = (double)W * H * sc * sc;   // authored detail at this scale
+                const double area = (double)vw * vh;
+                if (area > budget) {
+                    double s = std::sqrt(budget / area);
                     vw = std::max(1, (int)std::lround(vw * s));
                     vh = std::max(1, (int)std::lround(vh * s));
                 }
-                const int kMinLong = 160;   // guard against an absurdly tiny render
+                int lo = std::max(vw, vh);
+                const int kMinLong = (int)std::lround(160 * sc);   // guard against an absurdly tiny render
                 lo = std::max(vw, vh);
                 if (lo < kMinLong) {
                     double up = (double)kMinLong / lo;
@@ -22281,9 +22287,12 @@ static int run(int argc, char** argv) {
                     for (;;) { putpx(x0, y0, r, g, bl); if (x0 == x1 && y0 == y1) break;
                         int e2 = 2 * err; if (e2 >= dy) { err += dy; x0 += sx; } if (e2 <= dx) { err += dx; y0 += sy; } }
                 };
+                // Half-width 2 in 96-dpi pixels: the render is at screen resolution (0.367.0),
+                // so at 150 % a literal 2 would draw a two-thirds-size marker.
+                const int mr = std::max(2, (int)std::lround(2.0 * (g_liveWin ? g_liveWin->scale() : 1.0)));
                 auto marker = [&](const Vec3& p, uint8_t r, uint8_t g, uint8_t b) {
                     int sx, sy; if (!proj(p, sx, sy)) return;
-                    for (int yy = -2; yy <= 2; ++yy) for (int xx = -2; xx <= 2; ++xx) putpx(sx + xx, sy + yy, r, g, b);
+                    for (int yy = -mr; yy <= mr; ++yy) for (int xx = -mr; xx <= mr; ++xx) putpx(sx + xx, sy + yy, r, g, b);
                 };
                 for (size_t i = 1; i < explorePath.size(); ++i)
                     line(explorePath[i - 1].eye, explorePath[i].eye, 40, 220, 90);   // green spline

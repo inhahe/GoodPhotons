@@ -160,11 +160,11 @@ public:
     // constructing; affects windows created afterwards.
     static void setStartMinimized(bool on);
     static bool startMinimized();
-    // Pixel for pixel (0.366.0): a window created while this is on is per-monitor DPI
-    // aware, so one image pixel is one screen pixel instead of being bitmap-stretched by
-    // Windows' display scaling (by 1.5x, smoothed, at 150 %). On by default; the interactive
-    // tools whose control strip is laid out in fixed pixels (-explore, -review) turn it off,
-    // since that strip would come out two-thirds size. Set before constructing.
+    // Pixel for pixel (0.366.0; every window since 0.367.0): a window created while this is
+    // on is per-monitor DPI aware, so one image pixel is one screen pixel instead of being
+    // bitmap-stretched by Windows' display scaling (by 1.5x, smoothed, at 150 %); its control
+    // strip, if any, is laid out at the window's own DPI. On unless FTRACE_LIVE_SCALED=1 is
+    // set -- an escape hatch back to the old DPI-virtualized windows. Set before constructing.
     static void setPixelExact(bool on);
     static bool pixelExact();
 
@@ -312,6 +312,11 @@ public:
     // Returns false (and leaves w/h untouched) on headless/stub builds or before the
     // window exists. Thread-safe.
     bool clientSize(int& w, int& h) const;
+
+    // Screen pixels per 96-dpi pixel for this window: 1.5 at 150 % display scaling, 1 for a
+    // DPI-virtualized window (FTRACE_LIVE_SCALED) or a headless build. clientSize() is in
+    // screen pixels, so a caller sizing something by how big it LOOKS multiplies by this.
+    double scale() const;
 
     LiveWindow(const LiveWindow&) = delete;
     LiveWindow& operator=(const LiveWindow&) = delete;
