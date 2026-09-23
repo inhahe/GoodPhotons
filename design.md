@@ -7473,6 +7473,15 @@ as the one at fault.
   windows. Verified by capturing the windows through DWM and comparing the
   client area with the PNG the same render wrote: 0 of 307 200 pixels differ at 640×480, and
   0 of 589 824 at 64×64 magnified 12×.
+  **The strip's minimum width is its widest VISIBLE row** (0.367.1). The row widths are one
+  set of constants (`kRow1W`, `kRow1PathW`, `kRow3W`, `kRow4W`, `kNdRowW`) that `layoutPanel`
+  places with and `panelMinClientW()` sums, so the minimum cannot drift from the layout;
+  `WM_GETMINMAXINFO` holds the window to it, never below the old 700. With the path group
+  showing, row 1 needs 844 at 96 dpi, and the fixed 700-wide window had cut off cams/s and
+  the speed radios. Windows applies the minimum on every size change (it is how the window
+  widens when the strip is built, through that `SetWindowPos`, and when a minimized window
+  is restored); the one case that is not a size change — a path authored in an open window —
+  is covered by `fitStripWidth()`, called from `WM_SETPATHCOUNT`.
   **`renderShared(w, h, fn)` is the zero-copy entry point** (0.98.0): instead of handing
   the presenter finished host bytes, the caller is handed the presenter's own D3D11 device
   and RGBA8 image texture (both as `void*`, so the header stays API-agnostic) and fills the

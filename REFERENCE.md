@@ -661,7 +661,9 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > mouse-look always works again afterwards — handy if you accidentally locked onto the
 > path by clicking the timeline).
 > When you entered via `-explore` / `-fly` on a **multi-frame flyby**, the panel also
-> gains the flyby's **camera-path timeline** and its controls:
+> gains the flyby's **camera-path timeline** and its controls (the window is held wide
+> enough for all of them — since 0.367.1; before, the cams/s box and the speed switch were
+> cut off until you widened it — and grows if you author a path in a window already open):
 >
 > | control | does |
 > |---|---|

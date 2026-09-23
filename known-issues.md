@@ -25088,13 +25088,22 @@ pixels different from their PNGs; the renders byte-identical to 0.365.0. `-revie
 code but ignores `-window-min` (it returns before the flags are parsed), so it was not opened here, to
 keep a focused window off the desktop.
 
-### OPEN (2026-09-22): EXPLORE-ROW1-CLIP — with a camera path, the strip's first row runs past the window's minimum width
+### DONE (2026-09-22, 0.367.1): EXPLORE-ROW1-CLIP — with a camera path, the strip's first row ran past the window's minimum width
 
-Found while checking the above, and older than it: `WM_GETMINMAXINFO` holds a strip window to 700
-96-dpi pixels, which fits rows 3 and 4 but not row 1 once the path group is showing (Path lock, Play,
-cams/upd, cams/s and the per-update / per-second pair need about 844). At the window's opening size
-the cams/s box is cut off and the two radios are off the edge, identically at 96 dpi and at 144.
-Widening the window shows them. The fix is a minimum computed from the visible rows' widths.
+`WM_GETMINMAXINFO` held a strip window to a fixed 700 96-dpi pixels, which fits rows 3 and 4 but not
+row 1 once the path group shows (Path lock, Play, cams/upd, cams/s and the per-update / per-second
+pair need 844), so at the window's opening size the cams/s box was cut off and both radios were off the
+edge — at 96 dpi and at 144 alike. The minimum is now the widest VISIBLE row: the row widths became
+one set of constants that `layoutPanel` places with and `panelMinClientW()` sums (so they cannot
+drift apart), never below the old 700. Windows applies that minimum on every size change — the strip's
+own growth when it is built, a restore from the taskbar — and a path authored in a window already open,
+which is not a size change, calls `fitStripWidth()` from `WM_SETPATHCOUNT`.
+
+Verified at 150 % by capturing the windows: `scenes/crystalloop.ftsl` now opens with a 1273-px client
+(844 × 1.5 with per-control rounding; it was 1028) and every row-1 control visible, rendered 1:1 at
+1273×360; `FTRACE_LIVE_SCALED=1` gives 844 at 96 dpi; a window without a path keeps its 1028; and two
++Pt clicks in an open 1028-wide `-explore` window widened it to 1273, the render following to
+1273×480, without the foreground window changing (`scraps/inject_pt.ps1`).
 
 ### The 12 render modes are 5 estimators wearing 12 letters — and one of the splits costs a real capability — 2026-09-05
 

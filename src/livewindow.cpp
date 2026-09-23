@@ -508,6 +508,15 @@ static int ndBankRows(int clientW, int planes, int margin, int cellW) {
     const int perRow = std::max(1, (clientW - margin) / cellW);
     return (planes + perRow - 1) / perRow;
 }
+// The fixed-width rows of the strip, in 96-dpi pixels and in placement order -- ONE list read by
+// both layoutPanel (to place the controls) and panelMinClientW (to size the window's minimum), so
+// the minimum cannot drift from the layout it protects.
+static constexpr int kRow1W[]     = {84, 56, 48, 52, 88};              // Clip Reset Help Color See-through
+static constexpr int kRow1PathW[] = {66, 56, 58, 40, 50, 48, 66, 62};  // Path-lock Play cams/upd: [n] cams/s: [n] per-upd per-sec
+static constexpr int kRow3W[]     = {56, 48, 48, 48, 60, 52, 34, 56, 56};  // Rec +Pt Ins Del pts: raw tol: [n] Save
+static constexpr int kRow4W[]     = {38, 70, 16, 130, 50, 62, 44, 40};    // loom: [ch] -> [slot] Bind Unbind chans: [n]
+static constexpr int kNdRowW[]    = {62, 40, 56, 88};                  // N-D dims: [n] Reset Save-model
+template <class T, size_t N> static constexpr size_t countOf(const T (&)[N]) { return N; }
 static const int kPanelH = 92;              // control-strip height (px) WITHOUT the bind row: buttons + timeline + editor rows
 // Marshal cross-thread panel ops onto the window's own message-pump thread.
 #define WM_MKPANEL      (WM_APP + 1)        // build the control panel (params staged in Impl)
@@ -680,6 +689,9 @@ struct LiveWindow::Impl {
     void buildPanel(HWND h);                        // create child controls + grow window (UI thread)
     void layoutPanel(HWND h);                       // position child controls in the strip (UI thread)
     void applyPathCount(int pc);                    // retune/show/hide the timeline group (UI thread)
+    int  panelMinClientW() const;                   // narrowest client the visible strip rows fit (UI thread)
+    void fitStripWidth(HWND h);                     // widen the window to it if needed (UI thread)
+    bool pathShown = false;                         // the path (timeline) group is visible (UI thread)
     void showPathGroup(bool vis);                   // toggle visibility of the path (timeline) controls
     void buildBindRow(HWND h);                      // create the loom bind row + grow window (UI thread)
     void buildNdPanel(HWND h);                      // create/rebuild the N-D slider bank (UI thread)
@@ -1102,19 +1114,13 @@ void LiveWindow::Impl::layoutPanel(HWND h) {
     };
     // Row 1: collision/reset + the path (timeline) group. The group is positioned even when
     // hidden, so revealing it later (setPathCount) needs no relayout.
-    place(hClip,      px(84), row1, bh);
-    place(hReset,     px(56), row1, bh);
-    place(hHelp,      px(48), row1, bh);
-    place(hColor,     px(52), row1, bh);
-    place(hSeeThru,   px(88), row1, bh);
-    place(hPath,      px(66), row1, bh);
-    place(hPlay,      px(56), row1, bh);
-    place(hStrideLbl, px(58), row1, bh);
-    place(hStride,    px(40), row1, bh);
-    place(hRateLbl,   px(50), row1, bh);
-    place(hRate,      px(48), row1, bh);
-    place(hSwUpdate,  px(66), row1, bh);
-    place(hSwSec,     px(62), row1, bh);
+    {   // the widths are kRow1W / kRow1PathW, which panelMinClientW also sums
+        const HWND fixed[] = {hClip, hReset, hHelp, hColor, hSeeThru};
+        const HWND path[]  = {hPath, hPlay, hStrideLbl, hStride, hRateLbl, hRate, hSwUpdate, hSwSec};
+        static_assert(sizeof(fixed) / sizeof(fixed[0]) == countOf(kRow1W) && sizeof(path) / sizeof(path[0]) == countOf(kRow1PathW), "row 1");
+        for (size_t i = 0; i < countOf(fixed); ++i) place(fixed[i], px(kRow1W[i]), row1, bh);
+        for (size_t i = 0; i < countOf(path); ++i)  place(path[i],  px(kRow1PathW[i]), row1, bh);
+    }
     // Row 2: the timeline, with the paint controls docked at the right end.
     const int paintW = px(52), flatW = px(44), spdW = px(52);
     int rightBlock = paintW + flatW + spdW + 3 * pad;   // reserved on the right for paint tools
@@ -1126,28 +1132,20 @@ void LiveWindow::Impl::layoutPanel(HWND h) {
     place(hSpdLbl, spdW,  row2, bh);
     // Row 3: the curve-editor toolset.
     x = pad;
-    place(hRec,    px(56), row3, bh);
-    place(hAddPt,  px(48), row3, bh);
-    place(hInsPt,  px(48), row3, bh);
-    place(hDelPt,  px(48), row3, bh);
-    place(hPtLbl,  px(60), row3, bh);
-    place(hRaw,    px(52), row3, bh);
-    place(hTolLbl, px(34), row3, bh);
-    place(hTol,    px(56), row3, bh);
-    place(hSave,   px(56), row3, bh);
+    {
+        const HWND r3[] = {hRec, hAddPt, hInsPt, hDelPt, hPtLbl, hRaw, hTolLbl, hTol, hSave};
+        static_assert(sizeof(r3) / sizeof(r3[0]) == countOf(kRow3W), "row 3");
+        for (size_t i = 0; i < countOf(r3); ++i) place(r3[i], px(kRow3W[i]), row3, bh);
+    }
     // Row 4 (only when the loom live channel exists): channel -> slot binding + a status line.
     if (hasBindRow.load()) {
         const int row4 = row1 + 3 * step;
         x = pad;
-        place(hBLbl,     px(38), row4, bh);
+        const HWND r4[] = {hBLbl, hBCh, hBArrow, hBSlot, hBind, hBClear, hBDimsLbl, hBDims};
+        static_assert(sizeof(r4) / sizeof(r4[0]) == countOf(kRow4W), "row 4");
         // A combo's height is its DROPPED height; the closed box is one line tall regardless.
-        place(hBCh,      px(70), row4, bh + px(120));
-        place(hBArrow,   px(16), row4, bh);
-        place(hBSlot,   px(130), row4, bh + px(120));
-        place(hBind,     px(50), row4, bh);
-        place(hBClear,   px(62), row4, bh);
-        place(hBDimsLbl, px(44), row4, bh);
-        place(hBDims,    px(40), row4, bh);
+        for (size_t i = 0; i < countOf(r4); ++i)
+            place(r4[i], px(kRow4W[i]), row4, (i == 1 || i == 3) ? bh + px(120) : bh);
         // The status readout takes whatever width is left (it is SS_ENDELLIPSIS, so a long
         // loom error truncates cleanly instead of overrunning the strip).
         if (hBStat) MoveWindow(hBStat, x, row4, std::max(px(40), W - pad - x), bh, TRUE);
@@ -1159,10 +1157,9 @@ void LiveWindow::Impl::layoutPanel(HWND h) {
     if (hasNdPanel.load()) {
         const int base = row1 + (3 + (hasBindRow.load() ? 1 : 0)) * step;
         x = pad;
-        place(hNdDimsLbl, px(62), base, bh);
-        place(hNdDims,    px(40), base, bh);
-        place(hNdReset,   px(56), base, bh);
-        place(hNdSave,    px(88), base, bh);
+        const HWND nd[] = {hNdDimsLbl, hNdDims, hNdReset, hNdSave};
+        static_assert(sizeof(nd) / sizeof(nd[0]) == countOf(kNdRowW), "N-D row");
+        for (size_t i = 0; i < countOf(nd); ++i) place(nd[i], px(kNdRowW[i]), base, bh);
         if (hNdStat) MoveWindow(hNdStat, x, base, std::max(px(40), W - pad - x), bh, TRUE);
         // Fill cells first: they say what the space CONTAINS, and the plane sliders below
         // rotate within it. Row counts come from the same helpers ndStripH sizes the strip with.
@@ -1250,10 +1247,46 @@ void LiveWindow::Impl::onDpiChanged(HWND h, int newDpi, const RECT* sug) {
 // Show/hide the path (timeline) controls as a group — the timeline only makes sense once a
 // curve with >= 2 cameras exists (loaded or authored). Called on build and from applyPathCount.
 void LiveWindow::Impl::showPathGroup(bool vis) {
+    pathShown = vis;                               // row 1's width depends on it (panelMinClientW)
     int sw = vis ? SW_SHOW : SW_HIDE;
     HWND grp[] = { hPath, hPlay, hStrideLbl, hStride, hRateLbl, hRate, hSwUpdate, hSwSec, hTimeline,
                    hPaint, hFlat, hSpdLbl };
     for (HWND c : grp) if (c) ShowWindow(c, sw);
+}
+
+// The narrowest client width the strip's VISIBLE rows fit in, in this window's pixels (0.367.1,
+// EXPLORE-ROW1-CLIP). Each row costs what layoutPanel spends on it -- a leading pad, then every
+// control and the pad after it; a stretching status readout at its 40-px floor. The binding row
+// is row 1 once the path group shows: 844 at 96 dpi, where the old fixed minimum was a 700-wide
+// WINDOW, so cams/s was cut off and the two speed radios sat past the edge. Row 2 (the timeline)
+// and the N-D cells stretch or wrap to whatever width there is.
+int LiveWindow::Impl::panelMinClientW() const {
+    const int pad = px(5);
+    auto row = [&](const int* ws, size_t n, int stretch) {
+        int w = pad;
+        for (size_t i = 0; i < n; ++i) w += px(ws[i]) + pad;
+        return w + stretch;
+    };
+    int need = row(kRow1W, countOf(kRow1W), 0);
+    if (pathShown) for (int v : kRow1PathW) need += px(v) + pad;
+    need = std::max(need, row(kRow3W, countOf(kRow3W), 0));
+    if (hasBindRow.load()) need = std::max(need, row(kRow4W, countOf(kRow4W), px(40) + pad));
+    if (hasNdPanel.load()) need = std::max(need, row(kNdRowW, countOf(kNdRowW), px(40) + pad));
+    return need;
+}
+
+// Widen the window when the strip's rows no longer fit -- the path group just appeared because a
+// path was authored in a window already open. WM_GETMINMAXINFO's minimum only binds on the NEXT
+// size change (it is also what widens the window when the strip is first built, through that
+// SetWindowPos, and when a minimized window is restored), so this case needs the explicit grow.
+void LiveWindow::Impl::fitStripWidth(HWND h) {
+    if (!hasPanel.load() || IsIconic(h)) return;
+    RECT cr; GetClientRect(h, &cr);
+    const int need = panelMinClientW(), have = cr.right - cr.left;
+    if (have >= need) return;
+    RECT wr; GetWindowRect(h, &wr);
+    SetWindowPos(h, nullptr, 0, 0, (wr.right - wr.left) + (need - have), wr.bottom - wr.top,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 // Retune the timeline to a new camera count and show/hide the path group accordingly. Runs on
@@ -1449,7 +1482,11 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             if (self) self->buildPanel(h);           // build controls + grow window (UI thread)
             return 0;
         case WM_SETPATHCOUNT:
-            if (self && self->hasPanel.load()) { self->applyPathCount((int)wp); InvalidateRect(h, nullptr, FALSE); }
+            if (self && self->hasPanel.load()) {
+                self->applyPathCount((int)wp);
+                self->fitStripWidth(h);               // the path group may have made row 1 wider
+                InvalidateRect(h, nullptr, FALSE);
+            }
             return 0;
         case WM_MKBINDROW:
             if (self) self->buildBindRow(h);          // build the loom bind row + grow window (UI thread)
@@ -1798,8 +1835,13 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
                 int minWpx = r.right - r.left, minHpx = r.bottom - r.top;
                 if (self->panelH > 0) {
                     minHpx += self->panelH;             // room for the control strip below the image
-                    const int rowW = self->px(700);
-                    if (minWpx < rowW) minWpx = rowW;   // wide enough for the button row not to clip
+                    // Wide enough for every VISIBLE row of the strip (panelMinClientW, 0.367.1), and
+                    // never below the 700-wide window it always was, so a strip without the path
+                    // group keeps its old minimum.
+                    RECT sr{0, 0, self->panelMinClientW(), 0};
+                    self->frameRect(sr, h);
+                    const int rowW = std::max(self->px(700), (int)(sr.right - sr.left));
+                    if (minWpx < rowW) minWpx = rowW;
                 }
                 mmi->ptMinTrackSize.x = minWpx;
                 mmi->ptMinTrackSize.y = minHpx;
