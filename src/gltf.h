@@ -548,7 +548,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
     const minijson::Value* texturesArr = doc.root.find("textures");
     const minijson::Value* imagesArr   = doc.root.find("images");
     const minijson::Value* samplersArr = doc.root.find("samplers");
-    struct TexCacheEnt { int gltfTex; int role; double p0, p1, p2; int sceneTex; double meanMetal, meanRough, metalFrac; };
+    struct TexCacheEnt { int gltfTex; int role; double p0, p1, p2; int sceneTex; double meanMetal, meanRough, metalFrac, murkyFrac; };
     std::vector<TexCacheEnt> texCache;
     bool texStopped = false;   // buildReflCoeff refused: `ftrace -stop` during scene load
 
@@ -559,7 +559,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
     // can act on (ftrace has no per-texel metal/dielectric blend).
     auto bindTex = [&](int ti, TexRole role, double p0, double p1, double p2,
                        double* outMeanMetal, double* outMeanRough = nullptr,
-                       double* outMetalFrac = nullptr) -> int {
+                       double* outMetalFrac = nullptr, double* outMurkyFrac = nullptr) -> int {
         if (texStopped) return -1;
         if (!texturesArr || !texturesArr->isArray() || ti < 0 || ti >= (int)texturesArr->arr.size())
             return -1;
@@ -569,6 +569,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                 if (outMeanMetal) *outMeanMetal = e.meanMetal;
                 if (outMeanRough) *outMeanRough = e.meanRough;
                 if (outMetalFrac) *outMetalFrac = e.metalFrac;
+                if (outMurkyFrac) *outMurkyFrac = e.murkyFrac;
                 return e.sceneTex;
             }
         const minijson::Value& tj = texturesArr->arr[ti];
@@ -598,33 +599,39 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                                                               : TexFilter::Bilinear;
         }
 
-        double meanMetal = 0.0, meanRoughOut = p0, metalFrac = 0.0;
+        // `murkyFrac`: the share of texels whose metalness is neither clearly metal nor clearly not
+        // (strictly between 0.15 and 0.85) -- the -import-metal hint's heuristic, below.
+        double meanMetal = 0.0, meanRoughOut = p0, metalFrac = 0.0, murkyFrac = 0.0;
         if (role == TexRole::Metalness) {
             // B * metallicFactor, broadcast so scalarAt (which averages RGB) reads metalness.
             const size_t n = tex.rgb.size();
-            double acc = 0.0, above = 0.0;
+            double acc = 0.0, above = 0.0, murky = 0.0;
             for (Vec3& c : tex.rgb) {
                 const double mv = std::min(1.0, std::max(0.0, c.z * p0));
                 acc += mv;
                 if (mv >= 0.5) above += 1.0;
+                if (mv > 0.15 && mv < 0.85) murky += 1.0;
                 c = Vec3{mv, mv, mv};
             }
             meanMetal = n ? acc / (double)n : 0.0;
             metalFrac = n ? above / (double)n : 0.0;
+            murkyFrac = n ? murky / (double)n : 0.0;
         } else if (role == TexRole::Roughness) {
             // glTF packs occlusion/roughness/metalness into R/G/B of one image. ftrace's
             // scalarAt averages the three channels, so the G plane has to be broadcast to
             // all three or a rough surface would read as (0 + rough + metal)/3. The mean
             // metallic is harvested first, before B is overwritten.
             const size_t n = tex.rgb.size();
-            double aboveHalf = 0.0;
+            double aboveHalf = 0.0, murky = 0.0;
             for (const Vec3& c : tex.rgb) {
                 const double mv = std::min(1.0, std::max(0.0, c.z * p1));   // p1 carries metallicFactor
                 meanMetal += mv;
                 if (mv >= 0.5) aboveHalf += 1.0;
+                if (mv > 0.15 && mv < 0.85) murky += 1.0;
             }
             meanMetal = n ? meanMetal / (double)n : 0.0;
             metalFrac = n ? aboveHalf / (double)n : 0.0;
+            murkyFrac = n ? murky / (double)n : 0.0;
             double meanR = 0.0;
             for (Vec3& c : tex.rgb) {
                 const double g = std::min(1.0, std::max(0.0, c.y * p0));
@@ -656,11 +663,61 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                     : role == TexRole::Metalness ? ":metal" : ":normal");
         const int id = (int)s.textures.size();
         s.textures.push_back(std::move(tex));
-        texCache.push_back(TexCacheEnt{ti, (int)role, p0, p1, p2, id, meanMetal, meanRoughOut, metalFrac});
+        texCache.push_back(TexCacheEnt{ti, (int)role, p0, p1, p2, id, meanMetal, meanRoughOut, metalFrac, murkyFrac});
         if (outMeanMetal) *outMeanMetal = meanMetal;
         if (outMeanRough) *outMeanRough = meanRoughOut;
         if (outMetalFrac) *outMetalFrac = metalFrac;
+        if (outMurkyFrac) *outMurkyFrac = murkyFrac;
         return id;
+    };
+
+    // --- the -import-metal hint (0.368.1) ---------------------------------------------
+    // A material whose metalness map is part metal is typed by the map's MEAN unless
+    // `-import-metal mix` is given, and that default is defensive: AI-generated assets often
+    // carry a murky mid-grey metalness nobody meant physically (the Meshy Alice: 86 % of texels
+    // between 0.15 and 0.85), which per-texel import turns into metallic-looking paint and fabric.
+    // A CLEAN map -- nearly every texel clearly metal or clearly not -- is the opposite case, an
+    // intentional mask (sequins, trim, inlay), and there the mean is exactly wrong. So the
+    // loader measures the murky share and says which case it is looking at, once per distinct
+    // map; it does not act on it. Thresholds from the assets on hand: the sequinned Alice 0 %,
+    // then nothing below 39 % (the Meshy vacuum chamber).
+    // `mixOn`: the flag is already given, so the verdict confirms it or warns against it.
+    auto metalVerdict = [](double murky, bool mixOn) -> std::string {
+        char b[512];
+        if (mixOn) {
+            if (murky < 0.10)
+                std::snprintf(b, sizeof b, "the map is CLEAN (only %.1f%% of its texels are between 0.15 and "
+                              "0.85), an intentional metal mask -- per-texel is the right reading", 100.0 * murky);
+            else if (murky >= 0.30)
+                std::snprintf(b, sizeof b, "the map is MURKY (%.1f%% of its texels are between 0.15 and 0.85), "
+                              "which reads as generator noise -- if paint or fabric now looks metallic, "
+                              "drop -import-metal mix", 100.0 * murky);
+            else
+                std::snprintf(b, sizeof b, "the map is PARTLY MURKY (%.1f%% of its texels are between 0.15 "
+                              "and 0.85) -- compare with a render without -import-metal mix", 100.0 * murky);
+            return b;
+        }
+        if (murky < 0.10)
+            std::snprintf(b, sizeof b, "the map is CLEAN (only %.1f%% of its texels are between 0.15 and "
+                          "0.85; the rest are clearly metal or clearly not), which reads as an "
+                          "intentional metal mask -- you probably WANT -import-metal mix", 100.0 * murky);
+        else if (murky >= 0.30)
+            std::snprintf(b, sizeof b, "the map is MURKY (%.1f%% of its texels are between 0.15 and 0.85, "
+                          "neither metal nor not), which reads as generator noise -- the default "
+                          "(the mean) is probably RIGHT", 100.0 * murky);
+        else
+            std::snprintf(b, sizeof b, "the map is PARTLY MURKY (%.1f%% of its texels are between 0.15 "
+                          "and 0.85) -- it could go either way; compare a render with and without "
+                          "-import-metal mix", 100.0 * murky);
+        return b;
+    };
+    std::vector<std::pair<int, double>> metalHinted;   // (image source, metallicFactor) already reported
+    auto firstHint = [&](int ti, double factor) {
+        const int src = (texturesArr && texturesArr->isArray() && ti >= 0 &&
+                         ti < (int)texturesArr->arr.size()) ? texturesArr->arr[ti].intAt("source", -1) : ti;
+        for (const auto& h : metalHinted) if (h.first == src && h.second == factor) return false;
+        metalHinted.push_back({src, factor});
+        return true;
     };
 
     // --- materials: map each glTF material index -> a scene material id ------------
@@ -702,10 +759,11 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                 }
                 const double metalFactor0 = metallic;   // the raw metallicFactor; the map's mean replaces it below
                 double metalFrac = 0.0;          // fraction of texels that are genuinely metal
+                double murkyFrac = 0.0;          // fraction neither clearly metal nor clearly not
                 if (mrTex.index >= 0) {
                     double meanMetal = metallic, meanRough = roughness;
                     roughTexId = bindTex(mrTex.index, TexRole::Roughness, roughness, metallic, 0.0,
-                                         &meanMetal, &meanRough, &metalFrac);
+                                         &meanMetal, &meanRough, &metalFrac, &murkyFrac);
                     if (roughTexId >= 0) {
                         // `meanMetal` already carries metallicFactor (passed as p1), so this is
                         // an assignment, not a second multiply -- squaring it would read a
@@ -765,11 +823,21 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                                        khrTransmission < 0.5 &&
                                        metalFrac > 0.02 && metalFrac < 0.98);
                 int metalTexId = -1;
+                const minijson::Value* matNameV = mj.find("name");
+                const std::string matName = (matNameV && matNameV->isString()) ? matNameV->str
+                                                                            : "#" + std::to_string(i);
                 if (!gltfimp::metalMixImport && mrTex.index >= 0 && khrTransmission < 0.5 &&
-                    metalFrac > 0.02 && metalFrac < 0.98)
-                    std::fprintf(stderr, "[gltf] %s: metalness varies across the map (%.1f%% of texels >= 0.5, "
-                                         "mean %.3f) but the material is typed by the mean. `-import-metal mix` "
-                                         "honours it per texel instead.\n", authored.c_str(), 100.0 * metalFrac, metallic);
+                    metalFrac > 0.02 && metalFrac < 0.98 && firstHint(mrTex.index, metalFactor0))
+                    std::fprintf(stderr,
+                        "[gltf] %s: material \"%s\" is part metal (%.1f%% of its texels have metalness >= 0.5; "
+                        "mean %.3f), so it is imported as %s -- the whole material typed by the map's mean.\n"
+                        "       `-import-metal mix` would honour the map texel by texel instead: metal where it "
+                        "says metal, the dielectric elsewhere. The mean is the default because AI-generated "
+                        "maps are often a murky mid-grey nobody meant physically, which per-texel import turns "
+                        "into metallic-looking paint and fabric.\n"
+                        "       For this model: %s.\n",
+                        authored.c_str(), matName.c_str(), 100.0 * metalFrac, metallic,
+                        metallic >= 0.5 ? "METAL" : "NON-METAL", metalVerdict(murkyFrac, false).c_str());
                 if (metalMix) {
                     metalTexId = bindTex(mrTex.index, TexRole::Metalness, metalFactor0, 0.0, 0.0, nullptr);
                     if (metalTexId < 0) {
@@ -960,9 +1028,13 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                         if (normalTexId >= 0) { mx.normalTex = normalTexId; mx.normalStrength = normalScale; }
                         m = mx;
                     }
-                    std::fprintf(stderr, "[gltf] %s: metalness map is mixed (%.1f%% of texels metal, "
-                                         "mean %.3f) -- body split into a metal lobe and a dielectric one, "
-                                         "chosen per texel\n", authored.c_str(), 100.0 * metalFrac, metallic);
+                    if (firstHint(mrTex.index, metalFactor0))
+                        std::fprintf(stderr, "[gltf] %s: material \"%s\": metalness map is mixed (%.1f%% of texels "
+                                             "metal, mean %.3f) -- -import-metal mix splits the body into a metal "
+                                             "lobe and a dielectric one, chosen per texel.\n"
+                                             "       For this model: %s.\n",
+                                     authored.c_str(), matName.c_str(), 100.0 * metalFrac, metallic,
+                                     metalVerdict(murkyFrac, true).c_str());
                 }
                 int id = (int)s.mats.size();
                 s.mats.push_back(m);

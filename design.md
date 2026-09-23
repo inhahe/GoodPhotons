@@ -1286,6 +1286,17 @@ pixels changed at +5 levels and **43,677 at +109**.
 runs, so a flag that changes how an asset is *imported* has no effect if it is parsed there. The
 first version of this flag was, and the A/B silently compared two identical renders.
 
+**The `-import-metal` hint (0.368.1).** A glTF material whose metalness map is part metal (2-98 %
+of texels at 0.5 or above) is typed by the map's mean unless `-import-metal mix` asks for it per
+texel. The default is defensive -- generator exports carry murky mid-grey metalness nobody meant
+(the Meshy Alice: 86 % of texels between 0.15 and 0.85) -- and exactly wrong for a clean mask (the
+sequinned Alice: 0 %). `bindTex` measures that murky share beside the mean and the metal fraction,
+and the loader prints, once per distinct map (a 7-material atlas used to repeat the old line seven
+times), what `mix` would do, why the mean is the default, and a verdict: under 10 % murky reads as
+an intentional mask (probably use `mix`), 30 % or more as noise (the mean is probably right). It
+only advises -- the user chose not to let it switch the default -- and with `mix` on it confirms or
+warns instead. The thresholds come from the assets on hand: nothing between 0 % and 39 %.
+
 ### The beam budget — sizing the map from the scene's own knee (0.242.0)
 
 `-n` alone was a cliff, not a tuning wart: at the inherited forward-mode default of `-n 2e6`,
