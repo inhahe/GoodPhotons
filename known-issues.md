@@ -71,6 +71,56 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-09-23, 0.367.3): GLTF-NORMALMAP-DROPPED — every imported glTF dielectric path-traced without its normal map (0.316.0–0.367.2)
+
+**Found by** the sequins added to the edited Alice (`D:\youtube\philosophy\3d objects\alice2\base_basic_pbr_flat_sparkle.glb`):
+91,534 metallic flakes, each tilted 10–40° in the normal map, that never glinted. A close-up lit by a
+small sun (`scraps/alice/_closeup_sun.ftsl`, ~7 px per texel) showed why: every flake inside one patch
+lit up together — the highlight of a single smooth metal — and the rest were dark.
+
+**Proof it was the normal map, and only in the tracers:**
+- the same GLB with the flakes' tilts taken out of the map rendered **bit-identically** (mean |diff|
+  2e-23, GPU mode R; the CPU looked the same), and so did one with a **flat** normal map under the
+  default `-import-metal mean` — the map did nothing at all;
+- an FTSL quad with `normal_map texture:bump` changed its render by 71 % with the line against without
+  — the C6 path itself was fine;
+- a debug print in `Scene::applyNormalMap` showed the hit's material as `type 8 (Mix), normalTex -1`.
+
+**Two defects:**
+1. `Scene::applyNormalMap` / `dApplyNormalMap` read `normalTex` off the material the ray HIT, once, at
+   closestHit — never off a child. 0.316.0 wrapped every imported dielectric in a `mix` (the 4 % glossy
+   lobe + the body) and 0.339.0 wrapped `-import-metal mix`'s pair in another, both with the map on the
+   children only. So from 0.316.0 every glTF dielectric path-traced flat; metals typed `glossy` (not
+   wrapped) kept theirs. The raster previews resolve a mix to its children and read *their* maps,
+   which is why nothing looked wrong there.
+2. The one form that did put the map on the wrapper, `layered`, never ran: `wantCoat` was a `bool`, so
+   `-import-specular layered` — the documented default since 0.317.0 — was folded into `mix`. See
+   GLTF-LAYERED-DEFAULT below.
+
+**Fix:** the importer puts the normal map on both wrappers (the children keep theirs, for the
+previews), and `wantCoat` is an `int`. The default is now spelled `mix`, which is what every render
+since 0.316.0 has actually used.
+
+**A/B against 0.367.2** (`scraps/ab_0373.py`). Bit-identical wherever there is no normal map:
+`meshes/alice.glb` (GPU and CPU mode R, and with `-import-metal mix`), the Meshy glass orb (with and
+without `-import-metal mix`), two FTSL scenes, the raster preview of Alice2 (with and without
+`-import-metal mix`), and Alice2 under `-import-specular off`. Changed, as intended: the path-traced
+Alice2 (with and without `-import-metal mix`). `-import-specular layered` against `mix`: identical on
+0.367.2 (the bug), different on 0.367.3. None of the glTFs in `meshes/` carries a `normalTexture`, which
+is why no repo render moves.
+
+**Result:** in the close-up, the tilted and untilted maps now differ (mean |diff| 0.0126 at means 0.015
+and 0.022); the single patch is replaced by per-flake glints scattered over the frame. At viewing
+distance the skirt reads as sequinned — bright flakes where the tilt catches the key, dark ones where the
+reflection lands on the doll herself (`png/alice_full_0372_vs_0373.png`).
+
+**Residual (not a regression):** bilinear filtering of a sharp normal discontinuity bevels each flake's
+edge — between the flake's tilt and the fabric's normal, the interpolated normal sweeps through the half
+vector — so magnified to ~7 px per texel a flake shows a thin glinting rim. It is sub-pixel at viewing
+distance. Filtering the *BSDF* rather than its parameters (stochastic texture filtering: one texel per
+sample, chosen with the bilinear weights) would remove it, and is the principled fix for any per-texel
+roughness / normal / metalness microstructure. Not done.
+
 ## DONE (2026-09-23, 0.367.2): GLTF-METAL-TINT — textured glTF metals rendered untinted (the blue sequins came out white)
 
 **Symptom:** with `-import-metal mix`, the edited Alice's blue metallic flakes rendered **white** on the
@@ -91,6 +141,31 @@ side effect, glTF's `COLOR_0` now tints specular materials too, as glTF intends.
 and GPU), B, D, both raster previews and hair; GPU mode M differed by 3e-9 relative, which is that path's
 run-to-run nondeterminism, not the change. The textured flakes take the skirt's blue in the tracer and
 in the preview.
+
+## OPEN: GLTF-LAYERED-DEFAULT — `layered` was never the glTF import (0.317.0–0.367.2); before it becomes the default, find out why it renders the Alice2 GLB a third darker
+
+0.317.0 documented `-import-specular layered` as the default, and design.md described imports as a real
+Fresnel coat, but the `bool wantCoat` (GLTF-NORMALMAP-DROPPED, defect 2) meant not one import was ever
+built that way. 0.317.0 validated the coat on FTSL-authored materials (`scraps/lay_probe.ftsl`) and ran an
+`off`-against-"on" A/B on the glTF, which differs either way, so nothing caught it. 0.367.3 made the flag
+real and the default `mix`. Flipping the default back is a separate, visible change to every imported
+asset, and it should be made on evidence:
+
+| asset (mode R, GPU) | frame mean, `layered` / `mix` |
+|---|---|
+| `meshes/alice.glb` (`scenes/_gltf_layered_vs_mix.ftsl`, 64 spp) | **0.971** — about what a 4 % coat should cost |
+| the Alice2 sparkle GLB, skirt view (`scenes/_gltf_layered_vs_mix_alice2.ftsl`, 32 spp, 240²) | **0.668** (blue skirt 0.593, white apron 0.654) |
+| the same, with a **flat** normal map | 0.668 — so not the normal map |
+
+Both are double-sided dielectrics with factors of 1.0 and a metalness map (means 0.28 and 0.11). The gap
+is not explained yet. Candidates: the 0.323.0 exit-interface body term `a(1-F_dr)/(1-a*F_dr)`. That is
+varnish, and glTF's own dielectric BRDF (`F*spec + (1-F)*diffuse`) has no internal bounce, so even
+where the term is right for lacquer it is not what a glTF means. Other candidates: the Alice2 fabric's
+rougher coat (~0.4 against 0.25), and its 7 materials on thin double-sided shells. First step: render
+the Alice2 view with the body copies' `coatFdr` forced to 0. If the gap closes to a few percent, give
+imports a glTF-flavoured `layered` (no exit term) and decide the default from that. The large-gap asset
+is the user's file outside the repo (the path is in the scene's header); `meshes/alice.glb` is the
+in-repo control.
 
 ## DONE (2026-09-22, 0.366.0): LIVE-WINDOW-TINY-BLACK — the renders Claude launched showed only a tiny, pure-black preview window
 
@@ -4410,7 +4485,10 @@ preview-only and cannot affect a render.
 
 **FOLLOW-UP DONE (2026-09-16, v0.317.0): the device learned `MatType::Layered`, so the import is a
 real coat now.** The lobe is a Fresnel interface over the body (`-import-specular layered`, the
-default), which adds the angular ramp the constant-weight mix could not express. Measured:
+default), which adds the angular ramp the constant-weight mix could not express. *(CORRECTION,
+2026-09-23: the device half is true; the import half never was. The importer's `bool wantCoat` folded
+`layered` into `mix`, so every glTF kept the 0.316.0 stack until 0.367.3, which made the flag real and
+the default `mix` — see GLTF-LAYERED-DEFAULT near the top of this file.)* Measured:
 
 - **The port.** Every layered material gets a synthetic glossy child at upload; `dResolveCompound`
   returns it with probability R and otherwise picks a body lobe, so the eleven `D_MIX` dispatch

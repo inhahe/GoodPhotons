@@ -1710,10 +1710,13 @@ buffers) or a `.glb` (binary container); the loader dispatches on the extension.
 It bakes the glTF node transform hierarchy (matrix or TRS) under the mesh block's
 own `translate/rotate/scale`, reads `POSITION` / `NORMAL` / `TEXCOORD_0` +
 indices, and imports `pbrMetallicRoughness` materials — `baseColorFactor` is
-upsampled to a reflectance spectrum, `metallicFactor ≥ 0.5` → a glossy (metal)
-BSDF tinted by the base color (by the base-color *texture*, texel by texel, when
-there is one — since 0.367.2), else diffuse, with `roughnessFactor` as the lobe
-width. Add `import_materials no` to ignore glTF's materials and paint every
+upsampled to a reflectance spectrum, a metal (metalness ≥ 0.5) → a glossy BSDF
+tinted by the base color (by the base-color *texture*, texel by texel, when there
+is one — since 0.367.2), else diffuse under glTF's 4 % specular lobe
+(`-import-specular`), with the roughness map or `roughnessFactor` as the lobe
+width and the normal map bending the shading normal. The command-line reference
+(`REFERENCE.md`, the glTF import notes and `-import-metal` / `-import-specular`)
+has the details. Add `import_materials no` to ignore glTF's materials and paint every
 primitive with the block's FTSL `material` instead. The block `material` is always
 the fallback for primitives that carry no material.
 

@@ -1,0 +1,11 @@
+# Repro for known-issues GLTF-LAYERED-DEFAULT: the repo's Alice doll (meshes/alice.glb -- untracked asset
+# store; 0.254 m tall, base at y = -0.127, facing +z) under a dim env and a softbox key. Render it twice,
+#   ftrace -in scenes/_gltf_layered_vs_mix.ftsl -mode R -spp 64 -import-specular mix     -o png/lvm_mix.png -hdr
+#   ftrace -in scenes/_gltf_layered_vs_mix.ftsl -mode R -spp 64 -import-specular layered -o png/lvm_lay.png -hdr
+# and compare the frame / per-region means. A 4 % coat should move them by a few percent; `layered`
+# moves them by tens (0.367.3).
+camera "cam" { eye 0.10 0.02 0.70  look_at 0 0 0  up 0 1 0  fov_y 25  film { res 240 240 } }
+material "fb" { type diffuse reflect 0.5 }
+mesh { file "meshes/alice.glb"  material fb }
+light env { spd 0.5 }
+light sun { dir -0.319 0.785 0.531  angle 6  spd blackbody 6504  intensity 5.04e-15 }

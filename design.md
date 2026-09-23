@@ -938,8 +938,16 @@ black. Both are recorded in known-issues; `tools/furnace_rig.py` is the version 
 carries its three ground-truth controls (mirror, diffuse 1.0, diffuse 0.5) so the rig proves itself
 before any result is read.
 
-**A real coat, once the device could render one (0.317.0).** The import is `layered`: a Fresnel
-interface of index `ior` over the diffuse body, sharing the roughness and normal maps. That gives
+**A real coat, once the device could render one (0.317.0) -- in intent.** *The importer held the
+0/1/2 choice in a `bool`, which folded `layered` into `mix`, so the branch below never ran: every glTF
+render from 0.316.0 to 0.367.2 used the `mix` stack whatever `-import-specular` said, and the A/Bs
+that validated this section compared `off` against "on", which differ either way. 0.367.3 made the
+flag work and spelled the default `mix`, the form every render has actually used; `layered` on an
+import renders the Alice view 33 % darker than `mix` (the body seen through the coat's exit
+interface, presumably -- varnish, where glTF's own dielectric has no internal bounce), so it stays
+opt-in until that is settled (`known-issues.md`, GLTF-LAYERED-DEFAULT).* As designed: the import is
+`layered`: a Fresnel interface of index `ior` over the diffuse body, sharing the roughness and
+normal maps. That gives
 both the 4 % normal-incidence reflectance and the **angular ramp** toward grazing that the
 constant-weight `mix` of 0.316.0 could not express. `-import-specular mix` still builds that mix,
 because **modes `D` / `J` / `U` refuse layered materials outright** -- a mode gate in
@@ -5214,7 +5222,14 @@ as the one at fault.
   the single intersection choke point (`closestHit`/`closestHitLinear` on the CPU,
   `dApplyNormalMap` in the device `closestHit`) so every renderer and both devices
   perturb shading identically; tangents transform with instances (`instanceHitToWorld`,
-  the device uploading a per-instance `Wm` = toWorld linear).
+  the device uploading a per-instance `Wm` = toWorld linear). The choke point reads the
+  map off the material the ray HIT (`h.matId`), once, before any compound is resolved, so
+  **a `mix` / `layered` material must carry the normal map itself** -- the tracers never
+  consult a child's `normalTex`. (The raster previews do: they resolve a mix to its
+  children and shade with the children's maps, which is why a map carried only by the
+  children still showed there and nowhere else.) The glTF importer puts the map on its
+  wrappers since 0.367.3; from 0.316.0 it had not, and every imported dielectric
+  path-traced without its normal map (`known-issues.md`, GLTF-NORMALMAP-DROPPED).
 
   **Pattern-driven reflectance (`Material::reflectPat`).** Patterns originally drove only
   *scalar* slots (`roughness`, `film_thickness_map`, `weight_map`), because `reflect` is

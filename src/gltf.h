@@ -38,16 +38,21 @@
 #include <chrono>
 
 // How an imported glTF DIELECTRIC carries the specular lobe glTF gives it:
-//   2 = `layered`  (default) the physical coat -- a Fresnel interface over the diffuse body,
-//                  so the lobe ramps toward grazing incidence as it should. Modes M, R, W and
-//                  A/B/C render it, on BOTH backends since 0.317.0. **Mode D / J / U cannot
-//                  render a layered material at all** (a pre-existing gate, not a device one),
-//                  which is what `mix` below is for.
-//   1 = `mix`      the 0.316.0 stack: an uncoloured glossy lobe at constant weight F0 over the
-//                  body. No angular ramp, but every mode can render it.
+//   1 = `mix`      (default) the 0.316.0 stack: an uncoloured glossy lobe at constant weight F0
+//                  over the body. No angular ramp, but every mode can render it.
+//   2 = `layered`  the physical coat -- a Fresnel interface over the diffuse body, so the lobe
+//                  ramps toward grazing incidence as it should. Rendered by the device tracers
+//                  since 0.317.0 and by BDPT/VCM (modes D, J, U) since 0.318.0.
 //   0 = `off`      a flat `diffuse`, the pre-0.316.0 import.
 // Metals (`metallic >= 0.5`) are unaffected by all three.
-namespace gltfimp { inline int dielectricSpecular = 2; }
+//
+// The default is `mix` because that is what every glTF render since 0.316.0 has ACTUALLY used.
+// 0.317.0 documented `layered` as the default, but the importer held the mode in a `bool`, which
+// folded 2 into 1 -- so the layered branch never ran, and `-import-specular layered` built the
+// mix too. Since 0.367.3 the flag works. Making `layered` the default again changes the look of
+// every imported asset through a branch that has never run on one, so it waits on its own
+// validation (known-issues GLTF-LAYERED-DEFAULT).
+namespace gltfimp { inline int dielectricSpecular = 1; }
 // `-import-metal mix`: honour a metallicRoughness map's metalness PER TEXEL, as a two-lobe
 // body chosen by the map, instead of typing the whole material by the map's mean. OFF by
 // default because the assets this would change are AI-generator exports whose metalness is a
@@ -745,7 +750,11 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                     }
                 }
                 Material m;
-                bool wantCoat = false;   // dielectric: add glTF's specular lobe over the body
+                // Dielectric: add glTF's specular lobe over the body -- 0 none / 1 mix / 2 layered.
+                // An INT: from 0.317.0 to 0.367.2 this was a `bool`, which folded 2 into 1, so the
+                // `wantCoat >= 2` branch below was unreachable and `-import-specular layered`
+                // silently built the `mix` stack.
+                int wantCoat = 0;
                 // MIXED METALNESS (0.339.0, TODO item 2). glTF's metalness is per TEXEL and a
                 // material here is one BSDF, so typing the surface by the map's mean renders a
                 // genuinely metallic region as a 4 % dielectric (Alice: mean 0.28, p90 0.53).
@@ -836,12 +845,11 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                     m.normalTex = normalTexId;
                     m.normalStrength = normalScale;
                 }
-                // THE DIELECTRIC'S SPECULAR LOBE (0.316.0). Expressed as a two-lobe `mix` --
-                // an uncoloured glossy lobe selected with probability F0, the diffuse body with
-                // 1-F0 -- because that is what every backend can already render. `layered`, the
-                // physical coat, would be the better model and is NOT usable here: it has no
-                // device branch, so cudaForwardSupported rejects the whole scene and a mode-M
-                // flyby would silently fall back to the CPU tracer. The price is the Fresnel
+                // THE DIELECTRIC'S SPECULAR LOBE (0.316.0). By default a two-lobe `mix` -- an
+                // uncoloured glossy lobe selected with probability F0, the diffuse body with
+                // 1-F0 -- because that is what every mode can render. `-import-specular layered`
+                // builds the physical coat instead (a device branch since 0.317.0; reachable from
+                // here only since 0.367.3 -- see wantCoat). The price of the mix is the Fresnel
                 // ANGULAR RAMP: a mix weight is a constant, so the lobe stays at F0 instead of
                 // rising toward grazing incidence, and the silhouette rim sheen is missing.
                 // Mix weights are selection probabilities that are NOT reweighted, so the two
@@ -849,7 +857,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                 if (wantCoat) {
                     // The body is the material built above, unchanged; what differs is how the
                     // lobe is put over it. See gltfimp::dielectricSpecular for the two forms and
-                    // why the default is the physical one.
+                    // why `mix` is the default.
                     Material body = m;
                     const int bodyId = (int)s.mats.size();
                     s.mats.push_back(body);
@@ -891,6 +899,16 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                         mix.type = MatType::Mix;
                         mix.mixChildren = {coatId, bodyId};
                         mix.mixWeights  = {f0, 1.0 - f0};
+                        // The normal map goes on the WRAPPER too. The tracers perturb the shading
+                        // normal once, at closestHit, from the HIT's material -- this mix -- and never
+                        // consult a child's normalTex, so a map carried only by the lobes below is
+                        // silently dropped. It was, from 0.316.0 to 0.367.2: every imported
+                        // dielectric path-traced flat. (The preview rasterizers resolve a mix to its
+                        // children and read THEIR maps, so the children keep theirs.)
+                        if (normalTexId >= 0) {
+                            mix.normalTex = normalTexId;
+                            mix.normalStrength = normalScale;
+                        }
                         m = mix;
                     }
                 }
@@ -922,7 +940,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                         m.mixWeights  = {wm, 1.0 - wm};
                         m.mixWeightTex = metalTexId;
                     } else if (m.type == MatType::Mix && m.mixChildren.size() == 2) {
-                        // The flat-weight coat form (-gltf-specular mix): its 4 % white lobe is
+                        // The flat-weight coat form (`-import-specular mix`, the default): its 4 % white lobe is
                         // the thing that has to go, because a 2-child mix has exactly one weight
                         // slot and metal-vs-dielectric is the bigger of the two errors by far.
                         bodyId = m.mixChildren[1];
@@ -938,6 +956,8 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                         mx.mixChildren = {metalId, bodyId};
                         mx.mixWeights  = {wm, 1.0 - wm};
                         mx.mixWeightTex = metalTexId;
+                        // On the wrapper, where the tracers read it (see the flat coat above).
+                        if (normalTexId >= 0) { mx.normalTex = normalTexId; mx.normalStrength = normalScale; }
                         m = mx;
                     }
                     std::fprintf(stderr, "[gltf] %s: metalness map is mixed (%.1f%% of texels metal, "

@@ -1,0 +1,8 @@
+# Repro for known-issues GLTF-LAYERED-DEFAULT, the asset that shows the large gap: the edited Alice at
+# D:/youtube/philosophy/3d objects/alice2/ (EXTERNAL -- the user's file, not in the repo), camera on the
+# blue skirt and apron, the quick-view's own lights. Render with -import-specular mix and layered.
+camera "cam" { eye 0.30 0.92 0.95  look_at 0 0.80 0  up 0 1 0  fov_y 26  film { res 640 640 } }
+material "clay" { type diffuse reflect whitewall 0.6 }
+mesh { file "D:/youtube/philosophy/3d objects/alice2/base_basic_pbr_flat_sparkle.glb"  material clay }
+light env { spd 0.5 }
+light sun { dir -0.319 0.785 0.531  angle 6  spd blackbody 6504  intensity 5.04e-15 }
