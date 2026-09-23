@@ -5085,6 +5085,18 @@ as the one at fault.
   *and* the live window, and once the window got its own repaint cadence it began running
   several times a second: at 480² the sort alone was the bulk of a ~40 ms repaint, now
   ~25 ms.
+- **An absolute-exposure frame that comes out black (`AbsDark`, 0.366.0).** Absolute mode applies
+  a fixed gain to a film whose scale comes from the lights' `power`/`lumens`, so a rating that is
+  orders of magnitude off quantises every pixel to 0: the PNG and the live preview go black while
+  the pre-exposure `-hdr` PFM looks fine, and nothing says why. `filmToRgb8` takes an optional
+  `AbsDark*`: after quantising, one scan finds the brightest byte, and only if it is at or below
+  `kAbsDarkByte` (8) does it compute the p99 anchor (the peak, when under 1 % of the frame is
+  lit) and report how many stops the frame sits below the auto-exposure level; with `reexpose`
+  set it re-quantises at that level. `writeFilm` keeps the absolute exposure and calls
+  `warnAbsDark` (once per process — a flythrough would say it per frame); `liveWindowUpdate`
+  re-exposes and appends `preview AUTO-EXPOSED: …` to the title. The p99 is `p99Luminance`,
+  shared with the auto-exposure branch, and every frame that is not black is byte-identical to
+  0.365.0's (A/B over modes R/U/B, CPU and GPU, auto and absolute scenes).
 - **`-exposure-anchor <value|file>` — an exposure anchor that survives process exit.**
   The pre-existing lock machinery (`expAnchors`, `RenderCam.expGroup`, the `meterPlan`
   pre-pass, `-exposure-lock`) shares an anchor only among frames rendered by **one**
@@ -7421,6 +7433,34 @@ as the one at fault.
   memory. `LivePresenter` serialises its own device context with a mutex, because both
   the render thread (upload + present) and the UI thread (re-present after a resize or
   expose) drive it.
+  **A small render opens magnified** (0.366.0). `LiveWindow`'s constructor fits the render
+  into 1600×900 as before, but when its long side is 256 px or less it opens at the whole-
+  number multiple that reaches 512 px, and `present()` binds a point sampler (`sampPoint`)
+  from 2× magnification up — the GDI fallback swaps `HALFTONE` for `COLORONCOLOR` at the same
+  threshold — so the enlarged pixels stay square, equal and unblurred (a bilinear blur reads
+  as more converged than the render is). At its own size a 64-px render left a window
+  narrower than Windows' own minimum, with the image a postage stamp inside it.
+  **Pixel for pixel** (0.366.0). ftrace is a DPI-unaware process, so display scaling
+  bitmap-stretched every window it made — at 150 % each image pixel covered 1.5 screen
+  pixels, smoothed by DWM. `threadMain` now puts the window's own UI thread in the per-
+  monitor-v2 DPI context (`SetThreadDpiAwarenessContext`) before creating it; the image child
+  and swap chain are created on that thread too, so they share the awareness, and nothing
+  else in the process changes (the ImGui viewer has its own arrangement). Sizes are then
+  physical pixels, so `Impl::sizeFor(dpi, hw)` scales the three sizes that are about how big
+  things LOOK — the 1600×900 box, the 512 floor, the 320 minimum — by dpi/96 and holds the
+  box inside the monitor's work area; it runs on the UI thread (an unaware thread is told 96
+  whatever the display is), first at the system DPI and again at `GetDpiForWindow` once the
+  window has a monitor, before it is shown. `frameRect` and `WM_GETMINMAXINFO` use
+  `AdjustWindowRectExForDpi`; `WM_DPICHANGED` keeps the client size in physical pixels and
+  takes only the suggested position (accepting the suggested size would rescale the image to
+  keep its apparent size — the opposite of the point). `LiveWindow::setPixelExact(false)`
+  opts a window out and leaves it exactly as before: `-explore` and `-review` do, because
+  their control strips are laid out in 96-dpi constants (`kRowH`, `kPanelH`, the N-D cell
+  widths, the 700-px row minimum, `DEFAULT_GUI_FONT`) and would come out two-thirds size;
+  making them aware means scaling those and choosing a DPI font (known-issues
+  LIVE-WINDOW-PANEL-DPI). Verified by capturing the windows through DWM and comparing the
+  client area with the PNG the same render wrote: 0 of 307 200 pixels differ at 640×480, and
+  0 of 589 824 at 64×64 magnified 12×.
   **`renderShared(w, h, fn)` is the zero-copy entry point** (0.98.0): instead of handing
   the presenter finished host bytes, the caller is handed the presenter's own D3D11 device
   and RGBA8 image texture (both as `void*`, so the header stays API-agnostic) and fills the

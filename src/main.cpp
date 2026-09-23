@@ -11653,10 +11653,37 @@ static std::vector<Vec3> filmToLinear(const Film& f, double N) {
     return lin;
 }
 
+// The auto-exposure anchor: the 99th percentile of each pixel's brightest channel. One order
+// statistic, so nth_element (O(n), bit-identical to a full sort's pick -- see below).
+static double p99Luminance(const std::vector<Vec3>& lin) {
+    std::vector<double> lum(lin.size());
+    for (size_t i = 0; i < lin.size(); ++i)
+        lum[i] = std::max({lin[i].x, lin[i].y, lin[i].z, 0.0});
+    const size_t k = (size_t)(0.99 * (lum.size() - 1));
+    std::nth_element(lum.begin(), lum.begin() + k, lum.end());
+    return lum[k];
+}
+// An ABSOLUTE-exposure frame that comes out black (0.366.0). Absolute mode trusts the scene's
+// `power` / `lumens` ratings, so a rating off by orders of magnitude -- picowatts where watts
+// were meant -- quantises every pixel to 0 with nothing to say why: the PNG is black and so is
+// the live preview, while a -hdr PFM (written before exposure) looks perfectly healthy. That is
+// how a whole series of validation renders went out as black windows without anyone noticing.
+// "Black" is the brightest output byte at or below kAbsDarkByte (~3 % of full scale after the
+// sRGB curve -- black to the eye); only then is the p99 computed, so an ordinary absolute
+// render pays one byte scan. With `reexpose` (the live preview) the frame is re-quantised at
+// the auto-exposure level instead, since a black preview shows nothing converging; writeFilm
+// keeps the exposure the scene asked for and warns once.
+struct AbsDark {
+    bool   reexpose = false;   // in:  show the frame auto-exposed instead
+    bool   dark     = false;   // out: the absolute exposure left the frame black
+    double evUnder  = 0.0;     // out: stops below the auto-exposure level
+};
+static constexpr int kAbsDarkByte = 8;
 static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
                                        bool absolute, double* lockAnchor,
                                        double* outEAuto = nullptr,
-                                       double* outExposure = nullptr) {
+                                       double* outExposure = nullptr,
+                                       AbsDark* dark = nullptr) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin = filmToLinear(f, N);
     double eAuto;
@@ -11683,25 +11710,36 @@ static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
         // Worth doing because this runs on every image write AND (now that the live window
         // has its own repaint cadence) several times a second during a render: at 480x480
         // the sort alone was the bulk of a ~40 ms repaint.
-        std::vector<double> lum((size_t)W * H);
-        for (size_t i = 0; i < lin.size(); ++i)
-            lum[i] = std::max({lin[i].x, lin[i].y, lin[i].z, 0.0});
-        const size_t k = (size_t)(0.99 * (lum.size() - 1));
-        std::nth_element(lum.begin(), lum.begin() + k, lum.end());
-        double p99 = lum[k];
+        double p99 = p99Luminance(lin);
         eAuto = (p99 > 0) ? 0.9 / p99 : 1.0;
         if (lockAnchor) *lockAnchor = eAuto;       // first frame sets the anchor
     }
     exposure = eAuto * (expComp > 0.0 ? expComp : 1.0);
     }
 
-    std::vector<uint8_t> img((size_t)W * H * 3);
-    for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x) {
-        size_t src = (size_t)(H - 1 - y) * W + x;       // flip so +y is image-top
-        size_t dst = ((size_t)y * W + x) * 3;
-        for (int c = 0; c < 3; ++c) {
-            double v = (&lin[src].x)[c] * exposure;
-            img[dst + c] = (uint8_t)std::clamp(srgbGamma(v) * 255.0 + 0.5, 0.0, 255.0);
+    auto quantise = [&](double e) {
+        std::vector<uint8_t> out((size_t)W * H * 3);
+        for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x) {
+            size_t src = (size_t)(H - 1 - y) * W + x;       // flip so +y is image-top
+            size_t dst = ((size_t)y * W + x) * 3;
+            for (int c = 0; c < 3; ++c) {
+                double v = (&lin[src].x)[c] * e;
+                out[dst + c] = (uint8_t)std::clamp(srgbGamma(v) * 255.0 + 0.5, 0.0, 255.0);
+            }
+        }
+        return out;
+    };
+    std::vector<uint8_t> img = quantise(exposure);
+    if (absolute && dark && !img.empty() &&
+        *std::max_element(img.begin(), img.end()) <= kAbsDarkByte) {
+        double anchor = p99Luminance(lin);
+        if (!(anchor > 0.0))                         // under 1 % of the frame lit: use its peak
+            for (const Vec3& c : lin) anchor = std::max({anchor, c.x, c.y, c.z});
+        if (anchor > 0.0) {                          // an EMPTY film is not an exposure problem
+            dark->dark = true;
+            const double eWould = 0.9 / anchor;      // the auto-exposure branch's own formula
+            dark->evUnder = std::log2(eWould / exposure);
+            if (dark->reexpose) { exposure = eWould; img = quantise(exposure); }
         }
     }
     if (outEAuto)    *outEAuto = eAuto;
@@ -11762,17 +11800,33 @@ static std::string pfmPathFor(const std::string& path) {
 // source: every CUDA call in render_cuda.cu is checked via CUDA_CHECK/cudaCheckKernel,
 // which fails loudly with a non-zero exit before any framebuffer is downloaded, so an
 // all-zero/black film never reaches this function.)
+// Once per process: a flythrough would otherwise say it for every frame.
+static void warnAbsDark(const char* path, double evUnder) {
+    static std::atomic<bool> said{false};
+    if (said.exchange(true)) return;
+    std::fprintf(stderr,
+        "[exposure] warning: %s came out BLACK. The scene rates its lights with `power`/`lumens`,\n"
+        "           which fixes the exposure (absolute mode: sensor gain %g, no auto-exposure), and at\n"
+        "           those ratings the image sits %.1f stops (x%.3g) below the auto-exposure level.\n"
+        "           `power` is watts: a 100 W area light in a room-sized box exposes to mid-grey. Raise\n"
+        "           the rating (or exposure/iso/shutter), or drop power/lumens to auto-expose. A live\n"
+        "           preview shows this frame auto-exposed instead; a -hdr PFM is unaffected.\n",
+        path, ABS_EXPOSURE_GAIN, evUnder, std::pow(2.0, evUnder));
+    std::fflush(stderr);
+}
 static bool writeFilm(const char* path, const Film& f, double N, double expComp = 0.0,
                       bool quiet = false, double* lockAnchor = nullptr,
                       bool absolute = false) {
     const int W = f.resX, H = f.resY;
     double eAuto = 0.0, exposure = 0.0;
+    AbsDark dk;
     std::vector<uint8_t> img = filmToRgb8(f, N, expComp, absolute, lockAnchor,
-                                          &eAuto, &exposure);
+                                          &eAuto, &exposure, absolute ? &dk : nullptr);
     if (!writeImage(path, W, H, img)) {
         std::fprintf(stderr, "error: could not write %s\n", path);
         return false;
     }
+    if (dk.dark) warnAbsDark(path, dk.evUnder);
     // The HDR sidecar is written from the same linear buffer the tone map just consumed,
     // so it always matches the PNG that was written a line ago -- including on the
     // periodic in-progress writes, which is what makes it usable for metering a render
@@ -14659,11 +14713,23 @@ static void liveWindowUpdate(const Film& f, double N, double expComp, bool absol
     const auto tPaint = std::chrono::steady_clock::now();
     // Per-frame auto-expose (nullptr anchor) so the live view tracks the converging
     // image the same way the ANSI preview does.
-    std::vector<uint8_t> rgb = filmToRgb8(f, N, expComp, absolute, nullptr);
+    // An absolute-exposure frame that would show as black is shown auto-exposed instead, and
+    // the title says so (AbsDark, 0.366.0): the PNG keeps the scene's exposure, the window's
+    // job is to show the render converging.
+    AbsDark dk; dk.reexpose = true;
+    std::vector<uint8_t> rgb = filmToRgb8(f, N, expComp, absolute, nullptr, nullptr, nullptr,
+                                          absolute ? &dk : nullptr);
     g_liveWin->update(f.resX, f.resY, rgb);
     // The title's fixed fields (subject, mode, frame, device) are liveTitle()'s; only the
     // progress text is this caller's to supply.
-    setLiveTitle(status ? std::string(status) : std::string());   // cached for the DONE prefix
+    std::string st = status ? std::string(status) : std::string();
+    if (dk.dark) {
+        char note[128];
+        std::snprintf(note, sizeof note, "preview AUTO-EXPOSED: the absolute exposure is black (%.0f stops under)",
+                      dk.evUnder);
+        st = st.empty() ? std::string(note) : st + "  \xC2\xB7  " + note;
+    }
+    setLiveTitle(st);   // cached for the DONE prefix
     if (g_liveWin->closed()) g_stopRequested = 1;
     g_lastWindowPaint = std::chrono::steady_clock::now();
     const double cost = std::chrono::duration<double>(g_lastWindowPaint - tPaint).count();
@@ -17833,6 +17899,7 @@ static int reviewMode(const std::string& base) {
         return 2;
     }
     std::string title = "ftrace review — " + prefix;
+    LiveWindow::setPixelExact(false);   // its timeline strip is fixed-pixel (see -explore)
     LiveWindow win(fw, fh, title.c_str());
     const double defFps = 30.0;
     win.enablePanel(nFrames, defFps, "n/a");
@@ -19953,6 +20020,9 @@ static int run(int argc, char** argv) {
     // -window-min: applied once here rather than at each of the four LiveWindow
     // construction sites, so any future one inherits it automatically.
     LiveWindow::setStartMinimized(g_minWindow);
+    // Pixel for pixel on a scaled display (0.366.0) -- except -explore, whose control strip is
+    // laid out in fixed 96-dpi pixels and would come out two-thirds size at 150 % (livewindow.h).
+    LiveWindow::setPixelExact(!exploreMode);
 
     // --- every output directory must exist BEFORE a single photon is traced ----------
     // Otherwise a mistyped/not-yet-created output directory used to be discovered only

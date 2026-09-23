@@ -6,6 +6,9 @@
 static bool g_lwStartMinimized = false;
 void LiveWindow::setStartMinimized(bool on) { g_lwStartMinimized = on; }
 bool LiveWindow::startMinimized() { return g_lwStartMinimized; }
+static bool g_lwPixelExact = true;
+void LiveWindow::setPixelExact(bool on) { g_lwPixelExact = on; }
+bool LiveWindow::pixelExact() { return g_lwPixelExact; }
 
 #ifndef _WIN32
 // -------- Non-Windows stub: -window is a no-op (headless builds unaffected) --------
@@ -172,6 +175,7 @@ struct LivePresenter {
     ID3D11VertexShader*      vs = nullptr;
     ID3D11PixelShader*       psDeswizzle = nullptr, *psBlit = nullptr;
     ID3D11SamplerState*      samp = nullptr;
+    ID3D11SamplerState*      sampPoint = nullptr; // magnification by 2x or more: whole pixels, not a blur
     ID3D11RasterizerState*   rsNoCull = nullptr;
     // Upload staging: the renderer's RGB8 rows, as an R8 texture 3x as wide.
     ID3D11Texture2D*         packTex = nullptr;
@@ -192,7 +196,8 @@ struct LivePresenter {
     bool ensureSwap(int w, int h);
     void fullScreenPass(ID3D11PixelShader* ps, ID3D11ShaderResourceView* srv,
                         ID3D11RenderTargetView* rtv,
-                        float vx, float vy, float vw, float vh, bool clear);
+                        float vx, float vy, float vw, float vh, bool clear,
+                        ID3D11SamplerState* sampler = nullptr);
     bool uploadHost(int w, int h, const uint8_t* rgb);
     bool present(int viewW, int viewH);
     bool readbackBgra(std::vector<uint8_t>& bgra, int& w, int& h);
@@ -263,6 +268,12 @@ bool LivePresenter::init(HWND hview) {
     sda.AddressU = sda.AddressV = sda.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sda.MaxLOD   = D3D11_FLOAT32_MAX;
     if (FAILED(dev->CreateSamplerState(&sda, &samp))) { release(); return false; }
+    // A small render shown magnified (a 64x64 test render opens 8x, see the LiveWindow ctor)
+    // should read as its own pixels. Bilinear smears them into a blur that looks converged
+    // when it is not, so present() switches to point sampling from 2x magnification up.
+    D3D11_SAMPLER_DESC sdp = sda;
+    sdp.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    if (FAILED(dev->CreateSamplerState(&sdp, &sampPoint))) { release(); return false; }
 
     // The full-screen triangle's winding depends on nothing but SV_VertexID, so rather
     // than reason about it, disable culling.
@@ -281,7 +292,7 @@ void LivePresenter::release() {
     relCom(readTex);
     relCom(imgSRV); relCom(imgRTV); relCom(imgTex); imgW = imgH = 0;
     relCom(packSRV); relCom(packTex); packW = packH = 0;
-    relCom(rsNoCull); relCom(samp);
+    relCom(rsNoCull); relCom(sampPoint); relCom(samp);
     relCom(psBlit); relCom(psDeswizzle); relCom(vs);
     relCom(backRTV); swapW = swapH = 0;
     relCom(swap);
@@ -352,7 +363,8 @@ bool LivePresenter::ensureSwap(int w, int h) {
 // One full-screen-triangle pass. `clear` blacks the target first (the letterbox bars).
 void LivePresenter::fullScreenPass(ID3D11PixelShader* ps, ID3D11ShaderResourceView* srv,
                                    ID3D11RenderTargetView* rtv,
-                                   float vx, float vy, float vw, float vh, bool clear) {
+                                   float vx, float vy, float vw, float vh, bool clear,
+                                   ID3D11SamplerState* sampler) {
     ID3D11ShaderResourceView* noSrv = nullptr;
     ctx->OMSetRenderTargets(1, &rtv, nullptr);
     if (clear) { const float black[4] = {0, 0, 0, 1}; ctx->ClearRenderTargetView(rtv, black); }
@@ -364,7 +376,8 @@ void LivePresenter::fullScreenPass(ID3D11PixelShader* ps, ID3D11ShaderResourceVi
     ctx->VSSetShader(vs, nullptr, 0);
     ctx->PSSetShader(ps, nullptr, 0);
     ctx->PSSetShaderResources(0, 1, &srv);
-    ctx->PSSetSamplers(0, 1, &samp);
+    ID3D11SamplerState* sp = sampler ? sampler : samp;
+    ctx->PSSetSamplers(0, 1, &sp);
     ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
     ctx->OMSetDepthStencilState(nullptr, 0);
     ctx->Draw(3, 0);
@@ -399,7 +412,7 @@ bool LivePresenter::present(int viewW, int viewH) {
         int dw = std::max(1, (int)(imgW * s)), dh = std::max(1, (int)(imgH * s));
         fullScreenPass(psBlit, imgSRV, backRTV,
                        (float)((viewW - dw) / 2), (float)((viewH - dh) / 2),
-                       (float)dw, (float)dh, true);
+                       (float)dw, (float)dh, true, s >= 2.0 ? sampPoint : samp);
     } else {
         const float black[4] = {0, 0, 0, 1};
         ctx->ClearRenderTargetView(backRTV, black);
@@ -516,8 +529,10 @@ struct LiveWindow::Impl {
     LivePresenter        pres;
     std::atomic<bool>    d3dOk{false};             // presenter live => GDI image path is skipped
     std::atomic<int>     viewW{0}, viewH{0};       // child client size (UI thread writes, presenter reads)
-    int                  initW = 0, initH = 0;
+    int                  reqW = 0, reqH = 0;       // the image size the window was asked for
+    int                  initW = 0, initH = 0;     // the client size it opens at (sizeFor)
     int                  minW = 640, minH = 300;   // readable floor so the title bar stays legible
+    bool                 dpiAware = false;         // pixel for pixel (threadMain); UI thread sets once
     std::wstring         title;
     HANDLE               readyEvent = nullptr;
     // ---- Fly-camera input state (guarded by inMtx unless noted) ----
@@ -637,6 +652,8 @@ struct LiveWindow::Impl {
     static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
     static LRESULT CALLBACK ViewProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
     void threadMain();
+    void sizeFor(UINT dpi, HWND hw);                // initW/initH/minW/minH at a DPI (UI thread)
+    void frameRect(RECT& r, HWND h) const;          // client rect -> window rect at h's DPI
     void makeView(HWND parent);                     // create the image child + init D3D (UI thread)
     void layoutView(HWND parent);                   // fit the child to the image area (UI thread)
     void presentNow();                              // re-present the last frame (any thread)
@@ -1307,7 +1324,8 @@ void LiveWindow::Impl::paint(HDC hdc, const RECT& client, bool forCapture) {
         bi.bmiHeader.biPlanes      = 1;
         bi.bmiHeader.biBitCount    = 32;           // BGRA: scanlines are DWORD-aligned
         bi.bmiHeader.biCompression = BI_RGB;
-        SetStretchBltMode(mem, HALFTONE);
+        // Whole pixels from 2x magnification up, as the D3D path does (LivePresenter::init).
+        SetStretchBltMode(mem, s >= 2.0 ? COLORONCOLOR : HALFTONE);
         SetBrushOrgEx(mem, 0, 0, nullptr);
         StretchDIBits(mem, dx, dy, dw, dh, 0, 0, imgW, imgH,
                       bgra.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
@@ -1695,14 +1713,30 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             if (self) {
                 auto mmi = reinterpret_cast<MINMAXINFO*>(lp);
                 RECT r{0, 0, self->minW, self->minH};
-                AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+                self->frameRect(r, h);
                 int minWpx = r.right - r.left, minHpx = r.bottom - r.top;
                 if (self->panelH > 0) {
                     minHpx += self->panelH;             // room for the control strip below the image
-                    if (minWpx < 700) minWpx = 700;     // wide enough for the button row not to clip
+                    const int rowW = self->dpiAware ? MulDiv(700, (int)GetDpiForWindow(h), 96) : 700;
+                    if (minWpx < rowW) minWpx = rowW;   // wide enough for the button row not to clip
                 }
                 mmi->ptMinTrackSize.x = minWpx;
                 mmi->ptMinTrackSize.y = minHpx;
+            }
+            return 0;
+        case WM_DPICHANGED:
+            // Only a DPI-aware window gets this: it moved to a monitor with another scale.
+            // Keep the CLIENT size -- in physical pixels that is what keeps the image pixel
+            // for pixel -- take the suggested position, and re-derive the frame for the new
+            // DPI. (Accepting the suggested SIZE would rescale the image to keep its apparent
+            // size, which is the opposite of the point.)
+            if (!IsIconic(h)) {
+                const RECT* sug = reinterpret_cast<const RECT*>(lp);
+                RECT cr; GetClientRect(h, &cr);
+                RECT r{0, 0, cr.right - cr.left, cr.bottom - cr.top};
+                AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, HIWORD(wp));
+                SetWindowPos(h, nullptr, sug->left, sug->top, r.right - r.left, r.bottom - r.top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
             }
             return 0;
         case WM_CLOSE:
@@ -1729,7 +1763,70 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
     return DefWindowProcW(h, msg, wp, lp);
 }
 
+// The client size a (reqW x reqH) render opens at, for a window at `dpi`. `hw` is the window
+// once it exists (its own monitor's work area), else null (the primary's). UI thread.
+//
+// Open at the render's OWN resolution/aspect (clamped to fit on-screen), so the client area
+// matches the image exactly -- no letterbox bars on any side. The old code forced a fixed
+// 720-wide floor, which pillarboxed anything narrower (e.g. a 640px render opened in a 720px
+// window with 40px black bars each side).
+//
+// ...but a SMALL render opens magnified by a whole number, to at least kMinLong pixels on its
+// long side (0.366.0): a 64x64 test render opens 8x at 100 % display scaling, 12x at 150 %.
+// At its own size a 64-pixel image left a window narrower than Windows' own minimum -- a
+// black postage stamp with no room for the title -- which is not a preview anyone can watch.
+// A whole number keeps the magnified pixels square and equal (the presenter point-samples
+// from 2x up) and the aspect exact, so still no letterbox bars.
+//
+// PIXEL FOR PIXEL (0.366.0). A DPI-aware window measures in PHYSICAL pixels, so the three
+// sizes here that are about how big things LOOK -- the 1600x900 box, the 512 floor, the 320
+// minimum -- are scaled by dpi/96 to keep their apparent size, and the box is held inside
+// the monitor's work area. The 1:1 case and the whole-number magnifications are exact; a
+// render too big for the box is still scaled down (a window can't outgrow the screen). An
+// UNAWARE window (-explore, -review) gets exactly the sizes it always did.
+void LiveWindow::Impl::sizeFor(UINT dpi, HWND hw) {
+    const double sc = dpiAware ? dpi / 96.0 : 1.0;
+    double boxW = 1600.0 * sc, boxH = 900.0 * sc;
+    if (dpiAware) {
+        HMONITOR mon = hw ? MonitorFromWindow(hw, MONITOR_DEFAULTTONEAREST)
+                          : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFO mi{}; mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(mon, &mi)) {                // the frame's share comes off first
+            RECT fr{0, 0, 0, 0};
+            AdjustWindowRectExForDpi(&fr, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi);
+            boxW = std::min(boxW, (double)((mi.rcWork.right - mi.rcWork.left) - (fr.right - fr.left)));
+            boxH = std::min(boxH, (double)((mi.rcWork.bottom - mi.rcWork.top) - (fr.bottom - fr.top)));
+        }
+    }
+    const int w = reqW, h = reqH;
+    double s = std::min(1.0, std::min(boxW / std::max(1, w), boxH / std::max(1, h)));
+    const int kMinLong = (int)(512.0 * sc + 0.5), longSide = std::max(w, h);
+    if (longSide > 0 && 2 * longSide <= kMinLong) s = (double)(kMinLong / longSide);
+    initW = std::max(1, (int)(w * s));
+    initH = std::max(1, (int)(h * s));
+    // Minimum drag size: a readable floor (~320px tall) scaled to KEEP the image's own
+    // aspect, so shrinking the window never re-introduces letterbox bars and never
+    // exceeds the initial image-sized window. The title bar stays legible.
+    double fs = std::min(1.0, 320.0 * sc / std::max(1, initH));
+    minW = std::max(1, (int)(initW * fs));
+    minH = std::max(1, (int)(initH * fs));
+}
+
+void LiveWindow::Impl::frameRect(RECT& r, HWND h) const {
+    if (dpiAware) AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, GetDpiForWindow(h));
+    else          AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+}
+
 void LiveWindow::Impl::threadMain() {
+    // PIXEL FOR PIXEL (0.366.0). Windows' display scaling bitmap-stretches every window of a
+    // DPI-UNAWARE process, so the preview was never shown pixel for pixel: at 150 % each image
+    // pixel covered 1.5 screen pixels, smoothed by DWM. A window created by a thread whose DPI
+    // context is per-monitor-aware (v2) is exempt, and this window has its own UI thread, so
+    // that thread alone opts in -- nothing else in the process changes (the ImGui viewer makes
+    // its own arrangement, viewer_gui.cpp). The image child and its swap chain are created on
+    // this thread too, so they share the awareness and their sizes are physical pixels.
+    if (g_lwPixelExact && SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+        dpiAware = true;
     WNDCLASSEXW wc{};
     wc.cbSize        = sizeof(wc);
     wc.lpfnWndProc   = WndProc;
@@ -1739,11 +1836,15 @@ void LiveWindow::Impl::threadMain() {
     wc.lpszClassName = L"FtraceLiveWindow";
     RegisterClassExW(&wc);                          // benign if already registered
 
+    // Provisional size at the system DPI; redone below for the monitor it actually lands on.
+    UINT dpi = dpiAware ? GetDpiForSystem() : 96;
+    sizeFor(dpi, nullptr);
     RECT  r{0, 0, initW, initH};
     // WS_CLIPCHILDREN: the image area is a child window hosting the swap chain, so the
     // parent must never paint through it (that would fight the presenter and flicker).
     DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    if (dpiAware) AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi);
+    else          AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     int ww = r.right - r.left, wh = r.bottom - r.top;
 
     HWND hw = CreateWindowExW(0, wc.lpszClassName, title.c_str(), style,
@@ -1751,6 +1852,20 @@ void LiveWindow::Impl::threadMain() {
                               nullptr, nullptr, wc.hInstance, this);
     hwnd.store(hw);
     if (hw) {
+        if (dpiAware) {
+            // Now that it has a monitor: that monitor's DPI and work area (a no-op unless the
+            // window landed on a monitor scaled differently from the primary), before it is
+            // ever shown. layoutView ignores the WM_SIZE this sends: there is no view yet.
+            const UINT d = GetDpiForWindow(hw);
+            if (d != dpi) {
+                dpi = d;
+                sizeFor(dpi, hw);
+                RECT r2{0, 0, initW, initH};
+                AdjustWindowRectExForDpi(&r2, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi);
+                SetWindowPos(hw, nullptr, 0, 0, r2.right - r2.left, r2.bottom - r2.top,
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
         makeView(hw);                              // D3D child over the image area (may fail -> GDI)
         // SW_SHOWMINNOACTIVE, not SW_MINIMIZE: the latter would still activate the window
         // first (stealing focus for an instant, and dropping whatever the user was typing
@@ -1773,21 +1888,11 @@ void LiveWindow::Impl::threadMain() {
 
 LiveWindow::LiveWindow(int w, int h, const char* title) {
     impl_ = new Impl();
-    // Open the window at the render's OWN resolution/aspect (clamped to fit on-screen),
-    // so the client area matches the image exactly — no letterbox bars on any side. The
-    // old code forced a fixed 720-wide floor, which pillarboxed anything narrower (e.g.
-    // a 640px render opened in a 720px window with 40px black bars each side).
-    const int mw = 1600, mh = 900;
-    double s = std::min(1.0, std::min((double)mw / std::max(1, w),
-                                      (double)mh / std::max(1, h)));
-    impl_->initW = std::max(1, (int)(w * s));
-    impl_->initH = std::max(1, (int)(h * s));
-    // Minimum drag size: a readable floor (~320px tall) scaled to KEEP the image's own
-    // aspect, so shrinking the window never re-introduces letterbox bars and never
-    // exceeds the initial image-sized window. The title bar stays legible.
-    double fs = std::min(1.0, 320.0 / std::max(1, impl_->initH));
-    impl_->minW = std::max(1, (int)(impl_->initW * fs));
-    impl_->minH = std::max(1, (int)(impl_->initH * fs));
+    // The window's size is worked out on its own UI thread (Impl::sizeFor), because in pixel-
+    // for-pixel mode it depends on the DPI of the monitor the window lands on, which only a
+    // DPI-aware thread can see (an unaware one is told 96 whatever the display is).
+    impl_->reqW = w;
+    impl_->reqH = h;
     std::string t = title ? title : "ftrace";
     impl_->title = utf8ToWide(t);                  // proper UTF-8 -> UTF-16
     impl_->readyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);

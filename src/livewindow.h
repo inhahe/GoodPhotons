@@ -160,8 +160,16 @@ public:
     // constructing; affects windows created afterwards.
     static void setStartMinimized(bool on);
     static bool startMinimized();
+    // Pixel for pixel (0.366.0): a window created while this is on is per-monitor DPI
+    // aware, so one image pixel is one screen pixel instead of being bitmap-stretched by
+    // Windows' display scaling (by 1.5x, smoothed, at 150 %). On by default; the interactive
+    // tools whose control strip is laid out in fixed pixels (-explore, -review) turn it off,
+    // since that strip would come out two-thirds size. Set before constructing.
+    static void setPixelExact(bool on);
+    static bool pixelExact();
 
-    // Create and show a window sized to (w,h) (clamped to the screen, aspect kept).
+    // Create and show a window sized to (w,h): aspect kept, clamped to the screen, a small
+    // render magnified by a whole number, pixel for pixel on a scaled display (setPixelExact).
     LiveWindow(int w, int h, const char* title);
     ~LiveWindow();
 

@@ -71,6 +71,46 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-09-22, 0.366.0): LIVE-WINDOW-TINY-BLACK — the renders Claude launched showed only a tiny, pure-black preview window
+
+**Reported:** every ftrace instance launched while Claude was working "shows only a tiny pure black
+window". Measured on the 0.365.0 binary by restoring the window without activating it and capturing
+it through DWM (`scraps/wininspect.ps1`, which never takes focus): a 64×64 render restored to a 120×64
+client — Windows' minimum window width, the image letterboxed inside it, the title unreadable — and
+every pixel of the image area was black. Two causes, neither of them new code:
+
+1. **Tiny.** The window opened at the render's own resolution and was only ever scaled *down* (to fit
+   1600×900), although REFERENCE promised a readable minimum. The hair validation of 0.360–0.365
+   rendered at 64×64 and 128×128 for speed. Fixed: a render whose long side is 256 px or less opens
+   magnified by the whole number that reaches 512 px, point-sampled from 2× up so the pixels stay
+   square and crisp (D3D and GDI paths alike); at 150 % display scaling the floor is 768 screen
+   pixels, so the same render now opens 12× larger at 768×768 (the next paragraph).
+2. **Black.** The scratch scenes of that validation rated their light `power 3e-12` — three
+   picowatts. Any `power`/`lumens` puts a scene in absolute mode (fixed sensor gain, no auto-exposure),
+   and at that rating the frame sat about 44 stops below the auto-exposure level, so every pixel
+   quantised to 0 — the saved PNGs were all-zero too. The measurements were unaffected because they
+   read the `-hdr` PFMs, which are written before exposure — which is also why it went unnoticed. Fixed
+   on both sides: the 30 scratch scenes no longer carry the rating, and ftrace now warns once when an
+   absolute-exposure image comes out black (`[exposure] warning: … came out BLACK … sits 43.5 stops
+   (x1.27e+13) below the auto-exposure level`), while the live preview shows such frames auto-exposed
+   with `preview AUTO-EXPOSED: the absolute exposure is black (44 stops under)` on its title bar. The
+   written image keeps the scene's own exposure.
+
+Verified: every frame that is not black is byte-identical to 0.365.0's, PNG and PFM, across modes
+R / U / B on CPU and GPU for an auto-exposed scene and `scenes/absolute.ftsl` (`scraps/ab_0366.py`); the
+picowatt scene's PNG is still all-black, with exactly one warning; the three inspected windows
+(`scraps/verify_window_0366.py`) were restored and re-minimized without the foreground window changing.
+
+**Then pixel for pixel, on request.** ftrace was DPI-unaware, so at this machine's 150 % scaling
+Windows drew every preview 1.5× larger and smoothed it — the same size a browser shows an image at
+100 % zoom, but never the render's own pixels. The preview window's UI thread now opts into
+per-monitor-v2 DPI awareness, its sizes are worked out per monitor, and a DPI change keeps its size
+in screen pixels (design.md, `livewindow.*`). Verified by capturing each window through DWM and
+comparing its client area with the PNG the same render wrote: a 640×480 render opens at exactly
+640×480 screen pixels with **0 of 307 200** differing, and a 64×64 render at 768×768 — 12× — with
+**0 of 589 824** differing, every image pixel an exact 12×12 block. The outputs are unchanged
+(the same A/B, rerun on the final binary).
+
 ## DONE (2026-09-13): ROIBOX — "score per-ROI, never whole-frame" was unenforceable on every scene but one; `-roiboxes` derives ROIs from the renderer's own visibility
 
 The rule this project keeps re-learning is *score per-ROI, not whole-frame*. It was written into
@@ -25017,6 +25057,17 @@ hand re-traces the forward pass per chunk, which is the entire point of mode M. 
 allocation to attack, not `-n`.
 
 ## Tech debt
+
+### OPEN (2026-09-22): LIVE-WINDOW-PANEL-DPI — `-explore` and `-review` windows are still stretched by display scaling
+
+Since 0.366.0 the render and raster previews are per-monitor DPI-aware and show the image pixel for
+pixel. The two windows with a control strip opt out (`LiveWindow::setPixelExact(false)`), because the
+strip is laid out in 96-dpi constants — `kRowH` 28, `kPanelH` 92, the N-D cells' 168 / 250, the
+700-px row minimum, the fixed x offsets in `layoutPanel`, and `DEFAULT_GUI_FONT` — and an aware
+window would draw it two-thirds size at 150 %. So those two are still bitmap-stretched: the image is
+1.5× and smoothed there, and the controls are slightly soft. Fixing it means scaling every panel
+metric by `GetDpiForWindow / 96`, a DPI-sized font (`SystemParametersInfoForDpi` → `lfMessageFont`),
+and re-laying the strip on `WM_DPICHANGED`; then the opt-out can go.
 
 ### The 12 render modes are 5 estimators wearing 12 letters — and one of the splits costs a real capability — 2026-09-05
 
