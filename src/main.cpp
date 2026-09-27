@@ -18465,6 +18465,8 @@ static void printHelp(const char* prog) {
 "  -raster-iso <n>       marching-cubes resolution for isosurfaces (0 = skip)\n"
 "  -raster-curve-budget <n>  max preview triangles spent on curve/fur strands (default 12000000;\n"
 "                        over it the tubes coarsen, then whole strands thin out)\n"
+"  -raster-hidden        also draw `hide_camera` light panels (left out by default, as the render\n"
+"                        leaves them out) -- to see where the studio flats are\n"
 "  -explore | -fly       interactive fly-camera viewer (implies -keepwindow -no-meter); press T to cycle\n"
 "                        the lit preview: raster -> mode W (deterministic, CPU, any scene) -> path-traced (GPU)\n"
 "  -noclip|-nocollide    start the fly viewer with wall collision off\n"
@@ -18736,6 +18738,7 @@ static int run(int argc, char** argv) {
     bool rasterGpu   = false;     // -raster-gpu: GPU deterministic primary-ray iso preview (G2; NO tessellation)
     int  rasterBench = 0;         // -raster-bench <n>: render the first camera n times, report steady-state ms/frame (explorer metric)
     bool rasterSeeThrough = false; // -see-through/-glass: render clear (dielectric) objects as see-through (dim + milky haze, no refraction)
+    bool rasterShowHidden = false; // -raster-hidden: also draw `hide_camera` light flats in the preview (0.368.2: left out by default, as the render leaves them out)
     bool rasterColor = true;      // -flat: re-shade the preview as neutral clay (viewer "Color" toggle)
     double rasterClarity  = 0.85; // -glass-clarity <0..1>: per-surface transmittance for see-through mode (higher = clearer)
     // -glass-haze <0..1>: cap on the fraction of a pixel the see-through frost may take,
@@ -19768,6 +19771,8 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-gafp-disc") && i + 1 < argc) gaFpDisc = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-gafp-curve") && i + 1 < argc) gaFpCurve = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-gafootprint-stride") && i + 1 < argc) gaFootprintStride = std::atoi(argv[++i]);
+        // (the raster flags' own segment is full -- 126 links -- so this one lives here)
+        else if (!std::strcmp(argv[i], "-raster-hidden")) rasterShowHidden = true;
         // Chain continues into this segment's original head: without the `else` the two
         // chains are independent and the trailing `else handled = false;` below would mark
         // every flag above as unrecognised.
@@ -21337,7 +21342,10 @@ static int run(int argc, char** argv) {
                     lastTick = now;
                 }
             };
-            prims = raster::tessellate(scene, rasterIso, tessProgress, rasterCurveBudget);
+            prims = raster::tessellate(scene, rasterIso, tessProgress, rasterCurveBudget, rasterShowHidden);
+            if (prims.hiddenSkipped)
+                std::printf("[raster] %zu hide_camera light-panel triangle(s) left out, as the render leaves "
+                            "them out (-raster-hidden draws them)\n", prims.hiddenSkipped);
             // "Color" off: re-shade to neutral clay. Done to the baked geometry, so the
             // CPU and GPU rasterizers both get it without knowing the mode exists — which
             // is also why toggling it has to re-tessellate rather than just re-render.
@@ -21399,7 +21407,7 @@ static int run(int argc, char** argv) {
             if (useGpuIso && !cam.hasLens()) {
                 std::vector<uint8_t> img =
                     renderIsoPreviewCuda(scene, cam, W, H, nThreads, ev, autoExp, lock,
-                                         nullptr, &plight);
+                                         nullptr, &plight, rasterShowHidden);
                 if (!img.empty()) return img;
             }
             if (gpuRaster) {

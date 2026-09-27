@@ -12923,7 +12923,7 @@ __global__ void kIsoPreview(DScene sc, DCamera cam, DPreviewLight pl,
                             const DPTex* texMeta, const DVec3* texels,
                             const int* matTex, const double* matTri,
                             double* accum, float* zbuf, unsigned char* emis,
-                            int W, int H, DVec3 bg, double emisBoost) {
+                            int W, int H, DVec3 bg, double emisBoost, int camHide) {
     int total = W * H;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
          idx += gridDim.x * blockDim.x) {
@@ -12933,7 +12933,9 @@ __global__ void kIsoPreview(DScene sc, DCamera cam, DPreviewLight pl,
         int camPy = H - 1 - py;
         DVec3 ro, rd;
         dGenRay(cam, px, camPy, (Real)0.5, (Real)0.5, ro, rd);   // pixel-centre primary ray
-        DHit h = closestHit(sc, ro, rd);
+        // A camera ray, so a `hide_camera` flat is skipped exactly as the render skips it
+        // (0.368.2) -- unless -raster-hidden asked to see where the flats are.
+        DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG, camHide != 0);
         size_t o = (size_t)idx * 3;
         if (!h.valid) {
             accum[o + 0] = bg.x; accum[o + 1] = bg.y; accum[o + 2] = bg.z;
@@ -20537,7 +20539,7 @@ std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
                                           int W, int H, int nThreads, double exposure,
                                           bool autoExpose, double* lockAnchor,
                                           IsoPreviewTiming* timing,
-                                          const raster::PreviewLight* light) {
+                                          const raster::PreviewLight* light, bool showHidden) {
     using namespace gpu;
     if (!cudaIsoPreviewSupported(scene, cam)) return {};   // caller falls back to CPU raster
     if (W <= 0 || H <= 0) return {};
@@ -20643,7 +20645,7 @@ std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
 
     kIsoPreview<<<grid, block>>>(up.sc, up.dc, dpl, dCol, dEmit, (int)scene.mats.size(),
                                  dTexMeta, dTexels, dMatTex, dMatTri,
-                                 d_accum, d_z, d_emis, W, H, bg, EMIS_BOOST);
+                                 d_accum, d_z, d_emis, W, H, bg, EMIS_BOOST, showHidden ? 0 : 1);
     cudaCheckKernel("iso-preview");                  // ends with cudaDeviceSynchronize
     if (timing) timing->msKernel = phaseLap();
 

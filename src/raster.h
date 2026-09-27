@@ -142,7 +142,10 @@ struct PreviewGeom {
     // means the CPU and GPU backends cannot disagree about it (a Scene pointer is optional
     // on the render entry points; this is not) and a 2 cm ring behaves like a 40 m building.
     double radius = 1.0;
-    void clear() { tris.clear(); mixes.clear(); radius = 1.0; }
+    // World triangles left out because their material is `hide_camera` (a studio flat the
+    // render never shows the camera) -- reported so the omission is not silent.
+    size_t hiddenSkipped = 0;
+    void clear() { tris.clear(); mixes.clear(); radius = 1.0; hiddenSkipped = 0; }
     bool empty() const { return tris.empty(); }
     size_t size() const { return tris.size(); }
 };
@@ -915,9 +918,13 @@ inline void stripColor(PreviewGeom& g, const Vec3& neutral = Vec3{0.72, 0.72, 0.
     }
 }
 
+// `showHidden`: also draw `hide_camera` surfaces (a `light area` flagged primary-invisible).
+// Off by default since 0.368.2 -- the preview previews the RENDER, which never shows them to
+// the camera; before, every hidden fill flat previewed as a solid white panel, often filling
+// the frame behind the subject. `-raster-hidden` turns them back on to see where they are.
 inline PreviewGeom tessellate(const Scene& sc, int isoRes,
                               const std::function<void(int, int)>& progress = {},
-                              size_t curveBudget = 0) {
+                              size_t curveBudget = 0, bool showHidden = false) {
     PreviewGeom geom;
     std::vector<PTri>& out = geom.tris;
     // One baked shading payload per material (was a fistful of parallel arrays; a single
@@ -1123,6 +1130,12 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
     // was meant to save. Left serial deliberately; if this is ever worth revisiting it needs
     // uninitialised storage, not a resize.
     for (const auto& t : sc.tris) {
+        // Only world triangles can carry hide_camera today (a `light area`'s two), which is why
+        // this is the one loop that checks it -- see Material::hideCamera.
+        if (!showHidden && t.matId >= 0 && t.matId < (int)sc.mats.size() && sc.mats[t.matId].hideCamera) {
+            ++geom.hiddenSkipped;
+            continue;
+        }
         PTri p;
         p.p0 = t.v0; p.p1 = t.v1; p.p2 = t.v2;
         p.n0 = t.n0; p.n1 = t.n1; p.n2 = t.n2;

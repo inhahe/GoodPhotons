@@ -71,6 +71,19 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-09-26, 0.368.2): RASTER-HIDDEN-FLATS — the preview drew every `hide_camera` light as a giant white square
+
+Reported on Astra's Alice2 scene (`ftrace alice2_photo_hair.ftsl`, the bare-invocation preview):
+its `studio.ftsl` has two `hide_camera on` area lights, and the back one — 1.0 × 1.2 m, just
+behind her head — filled a quarter of the front view as a solid white panel. Not a bug in the
+narrow sense: FTSL.md §11.1 said the preview "keeps showing hidden flats so you can still see where
+they are — the usual viewport convention". But a viewport shows a light as an outline, not as an
+emissive slab over the subject, and a *preview* that shows what the render never will is wrong on
+its own terms. Now the preview's camera skips them as the render's does (`raster::tessellate`, and
+the GPU isosurface preview's primary ray), says how many triangles it left out, and
+`-raster-hidden` draws them again. Lighting and reflections are unchanged; `-import-metal mix`
+(which the report also used) had nothing to do with it.
+
 ## OPEN: ENV-BACKDROP-TEXELS — an image environment seen directly shows its texels at close framing
 
 `EnvMap::radiance` / `xyz` (`src/envmap.h`) are **nearest-texel** by design: evaluation then

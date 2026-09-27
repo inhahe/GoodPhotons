@@ -2616,9 +2616,12 @@ The flag costs nothing when unused: a scene with no `hide_camera` anywhere takes
 uniform compare per camera ray, and a hidden primitive is rejected *before* it is
 intersected, so it is strictly cheaper than a visible one.
 
-Supported on every render mode and on both the CPU and CUDA backends. Not applied by
-the raster preview (`-raster` / the positional-scene viewport), which keeps showing
-hidden flats so you can still see where they are — the usual viewport convention.
+Supported on every render mode and on both the CPU and CUDA backends, and — since
+0.368.2 — by the raster preview too (`-raster`, the positional-scene viewport, the GPU
+isosurface preview), which previews what the render will show. Before, the preview drew
+every hidden flat as a solid white panel, which in a studio scene put a giant white square
+behind the subject that no render ever shows. Add `-raster-hidden` to draw them anyway,
+to see where the flats are; the preview's lighting is unaffected either way.
 
 ---
 

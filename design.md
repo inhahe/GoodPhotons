@@ -1320,6 +1320,16 @@ an intentional mask (probably use `mix`), 30 % or more as noise (the mean is pro
 only advises -- the user chose not to let it switch the default -- and with `mix` on it confirms or
 warns instead. The thresholds come from the assets on hand: nothing between 0 % and 39 %.
 
+**The preview honours `hide_camera` (0.368.2).** It used to draw every hidden fill flat as a solid
+white panel, on the theory that a viewport should show where its lights are -- which in a studio
+scene meant a giant white square behind the subject that no render ever shows (reported on Astra's
+Alice2 scene, whose back light sits right behind her head in the front view). The preview previews
+the render, so its camera now skips them the same way: `tessellate()` leaves `hide_camera`
+triangles out of the world-triangle loop (only a `light area`'s two can carry the flag) and counts
+them for a log line, and `kIsoPreview`'s primary ray passes `camHide`. Lighting is untouched --
+`deriveLight` enumerates emitters, not preview triangles, and the probes' rays are not camera rays.
+`-raster-hidden` restores the old drawing.
+
 ### The beam budget — sizing the map from the scene's own knee (0.242.0)
 
 `-n` alone was a cliff, not a tuning wart: at the inherited forward-mode default of `-n 2e6`,
