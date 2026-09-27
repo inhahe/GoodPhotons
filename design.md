@@ -1130,6 +1130,29 @@ metres at the hall's 3x. Both tools honour the GLB's node transform, so `tools/g
 could put the doll at her real size without touching the raw vertices the segmentation was
 tuned on. Fiber numbers are a rooted doll's: 15 000 strands, 0.05 mm radius, plug-sized locks.
 
+**Alice2: the sculpted hair replaced, not covered (`tools/alice2_hair.py`, tooling only).** The
+second doll ships in parts, so the hair is its own primitive (`root.1`, a closed 231k-triangle
+shell 6-10 cm thick over the crown, headband and bow modelled into it) and the scene simply
+`skip_material`s it; nothing of the sculpt renders. The groom is fitted to the sculpt's
+*silhouette* and to photographs of the physical doll, not to its surface: tracing streamlines
+over the sculpt (its min-curvature lock direction is clean on the hanging hair) was tried first
+and abandoned — its crown is a fold of headband, bow and lumps whose streamlines zig-zag, and
+pushing it down to a plausible thickness only crumples it. So each guide has two phases. On the
+head it follows a *designed* flow over a Taubin-smoothed head (part → sideways and down over the
+forehead corners → back behind the ears → down), at the height of the hair stacked beneath it —
+the stack field `lam` (0 at the part, 1 at the lower hairline, from geodesic distances) orders
+the layers, `CAP·(phi − lam)^0.6` sets the height. Where the skull turns under it hands over to
+a **curtain** in cylindrical coordinates about the body: radius eased to
+`R_in + (1 − lam)·KAPPA·(R_out − R_in)` with `R_out` the sculpt's outer radius tabulated per
+height and azimuth and `R_in` the body and head, azimuth drifting with the sculpt's own flow
+(side hair behind the shoulders, its outer layer forward over them), then per-lock waves and an
+end curl. The headband is a swept ribbon along the sculpt band's centreline but seated on the
+generated guides' outer surface. `tools/hairgeo.py` is the numba kit it needs (grid closest
+point / ray cast, a z-parity inside test for closed meshes, a least-squares shape operator,
+surface streamlines, a GLB reader). No renderer code changed. Residuals against the photos: the
+back reads as a fuller, straighter curtain with a blunter hem than the doll's separated wavy
+locks, and the ear is always covered where one photo shows it bare.
+
 **The groom tool (0.329.0, Phase 1).** `runGroomGui` in `viewer_gui.cpp` reuses the loom
 viewer's shell -- its D3D11 device, `MeshGpu` pipeline (shaders, solid/wire rasterizer states,
 depth states, MSAA target) and orbit camera -- and adds a line pass: curves and strands go through

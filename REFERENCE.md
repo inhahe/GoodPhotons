@@ -3320,6 +3320,32 @@ is the payoff — an animal built from overlapping analytic spheres wearing ~300
 from a dozen `fur` blocks at one shared `density`, which is also a demonstration that fur
 hides the seams of the geometry underneath it.
 
+**Replacing a sculpted hairdo with strands: `tools/alice2_hair.py`.** A doll model whose hair
+is a sculpted shell (the Alice2 GLB's `root.1` primitive) gets a real groom: the tool writes
+`alice2_real_hair.ftsl` into a `hair_opus5.5` folder beside the model's `model` folder (finding the
+GLB by a relative path) — the doll loaded with `skip_material root.1`, ~1000
+guide curves, three guided `fur` blocks on an invisible scalp (90 000 strands of 0.24 mm), stray
+flyaway `curve`s, a satin headband mesh and an indoor-room `.hdr` — following the sculpt's
+silhouette and, more closely, photographs of the actual doll. `python tools/alice2_hair.py`
+regenerates everything in about a minute (numpy, scipy, numba, Pillow; its geometry kit is
+`tools/hairgeo.py`). What it found, which applies to any guided groom:
+
+- **A part needs separate `fur` blocks.** A strand rooted beside a centre part blends guides
+  from both sides of it; left- and right-going offsets average to a strand that crosses the
+  part, and the part vanishes. Grow each side from its own scalp piece and its own guides —
+  and only as far back as the part runs: split the back too and the halves open a parting all
+  the way down.
+- **Lock definition needs few-guide blending.** Per-lock variation (a wave phase, an end curl,
+  a length) authored into the guides survives `guide_blend 1`–`2`; at `3`–`4` the
+  inverse-square blend averages it away and the coat reads as one felted curtain.
+- **Calibrate a pale `reflect` against a reference under the scene's own light.** `reflect` is
+  the colour the coat reads as under *uniform* light; under a window the white cuticle highlight
+  and the deep scattering pull a pale coat toward neutral-green. Measured on fur balls in the
+  room: `reflect rgb 0.97 0.78 0.42` reads (1 : 0.99 : 0.66) of white, `0.98 0.60 0.28` reads
+  (1 : 0.82 : 0.43) — the photographed doll's (1 : 0.82 : 0.46).
+- **Light a pale coat with something large.** A small bright panel sparkles spectrally in every
+  fibre and noise dominates; a large soft environment (the generated room) converges.
+
 ### Implicit surfaces (`isosurface`)
 
 Besides the explicit primitives above, geometry can be defined *implicitly* as the

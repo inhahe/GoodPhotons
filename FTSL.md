@@ -2643,6 +2643,14 @@ Since 0.328.0 the loader integrates the irradiance over the band and prints
 10⁵ W/m² (a hundred suns), naming the fix. `power`/`lumens` lights are unaffected: their SPD is
 renormalised by the power law.
 
+**The same scale applies to every light, not just a sun.** An `area` (or `env`, `sphere`, …)
+light whose `spd` is `blackbody <K>` / `preset:bb<K>` is also ~10¹⁶ in these units, so beside a
+light with a *flat* spd — `light env { spd 0.3 }` — the flat one is ~10⁻¹⁶ of the scene and
+simply vanishes under auto-exposure: a black sky, no error. Give lights you mean to balance
+against each other the same kind of spd (flat values, or Planckians with a matching scale), or
+set `power` on the surface lights — which switches the whole scene to fixed exposure, so an
+environment beside them must then be authored in absolute units too.
+
 ## 12. `medium` — participating volume
 
 ```

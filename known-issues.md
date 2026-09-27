@@ -71,6 +71,25 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN: ENV-BACKDROP-TEXELS — an image environment seen directly shows its texels at close framing
+
+`EnvMap::radiance` / `xyz` (`src/envmap.h`) are **nearest-texel** by design: evaluation then
+matches the piecewise-constant importance sampler exactly, so `pdf(d)` and `sample()` agree and
+MIS stays unbiased. The cost shows only where the map is *looked at*: once a texel spans more than
+a pixel, a soft edge in the map renders as a staircase of flat bands. Seen on the Alice2 hair
+scene (`tools/alice2_hair.py`'s room, found 2026-09-23): a window edge that the map ramps over 4°
+came out as ~23 visible steps at 1024 px / 360° under a 36° camera, and stayed faintly banded at
+2048 px — each texel 4-9 screen pixels wide. Any `light env { file … }` reproduces it through a
+narrow camera; `scenes/_env_bgonly.ftsl` (a background-only image env) at `-r 1024` with its
+`fov_y` cut to ~15° is the simplest.
+
+Workaround: a map with texels under a pixel for the framing in use (the tool now writes its room
+at 2048×1024), or depth of field to blur the backdrop. A fix would filter the camera-ray lookup
+only (the background a primary ray misses into) while NEE and the MIS weights keep the
+piecewise-constant pdf. That is unbiased only because a primary miss contributes to no MIS sum:
+check it against the bidirectional modes, whose camera subpaths *do* weight env hits, before
+assuming so.
+
 ## DONE (2026-09-23, 0.368.0): RASTER-METAL-LOOK — the preview drew metal as coloured plastic, and its lights were presets rather than the scene's
 
 **The report:** metal in the model viewer (`ftrace model.glb`) did not look like metal. The first
@@ -153,7 +172,7 @@ references), `png/rg368_sheet.png` (15-scene regression, old | new); scripts `sc
 
 ## DONE (2026-09-23, 0.367.3): GLTF-NORMALMAP-DROPPED — every imported glTF dielectric path-traced without its normal map (0.316.0–0.367.2)
 
-**Found by** the sequins added to the edited Alice (`D:\youtube\philosophy\3d objects\alice2\base_basic_pbr_flat_sparkle.glb`):
+**Found by** the sequins added to the edited Alice (`D:\youtube\philosophy\3d objects\alice2\alice2_hyper3d\model\base_basic_pbr_flat_sparkle.glb`):
 91,534 metallic flakes, each tilted 10–40° in the normal map, that never glinted. A close-up lit by a
 small sun (`scraps/alice/_closeup_sun.ftsl`, ~7 px per texel) showed why: every flake inside one patch
 lit up together — the highlight of a single smooth metal — and the rest were dark.
