@@ -4939,7 +4939,10 @@ private:
                 const std::string v = sct->val.words.empty() ? "" : sct->val.words[0];
                 if      (v == "analytic")   m.coatScatter = 0;
                 else if (v == "stochastic") m.coatScatter = 1;
-                else { fail("layered coat: scatter takes analytic|stochastic"); return m; }
+                // `none` (0.371.0): no internal bounce -- the body's light all leaves through the
+                // coat, as in glTF's fresnel_mix, which is what a glTF import's `layered` uses
+                else if (v == "none" || v == "gltf") m.coatScatter = 2;
+                else { fail("layered coat: scatter takes analytic|stochastic|none"); return m; }
             }
             // Coat interface roughness (glossy lobe on the reflected ray); grayscale
             // roughness_map allowed just like a glossy material.

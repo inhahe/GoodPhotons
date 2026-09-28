@@ -1322,7 +1322,7 @@ material "carpaint" {
     ior 1.5                       # body / effective index
     coat {
         reflectance fresnel       # fresnel (default) | thinfilm | manual
-        scatter analytic          # analytic (default) | stochastic — see A3 below
+        scatter analytic          # analytic (default) | stochastic — see A3 below | none (glTF's model)
         roughness 0.05            # glossy coat lobe; map allowed
         ior glass:BK7             # coat index (fresnel/thinfilm)
         film_ior 1.30  film_thickness 300  film_thickness_map texture:t   # thinfilm coat
@@ -1333,6 +1333,15 @@ material "carpaint" {
     layer "base" 1.0              # body lobes, resolved like a mix
 }
 ```
+
+**`scatter none` — glTF's coat (0.371.0; alias `gltf`).** No internal bounce at all: every bit of
+light the body sends back up leaves through the coat, and none of it is reflected back down. The body
+keeps the albedo it was given, and the surface's albedo is `F + (1 - F) a`, the coat's Fresnel
+reflectance plus the rest of the body. That is glTF's dielectric exactly (`fresnel_mix`: the base
+colour is the diffuse lobe's albedo, weighted by `1 - F`). It is what a glTF import's
+`-import-specular layered` uses, because an asset's base colour was authored for that model; the
+varnish series below would darken it. A `scatter none` body under a tinted coat (`absorb` + `depth`)
+still takes one pass through the tint, in and out.
 
 **`scatter stochastic` — the directional fix (A3, 0.354.0).** Expanding the analytic series shows
 what it assumes:

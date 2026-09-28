@@ -340,30 +340,68 @@ and GPU), B, D, both raster previews and hair; GPU mode M differed by 3e-9 relat
 run-to-run nondeterminism, not the change. The textured flakes take the skirt's blue in the tracer and
 in the preview.
 
-## OPEN: GLTF-LAYERED-DEFAULT — `layered` was never the glTF import (0.317.0–0.367.2); before it becomes the default, find out why it renders the Alice2 GLB a third darker
+## OPEN (2026-09-28): GLTF-ROUGHNESS-MAP — a glTF roughness is fed to the tracers' Phong lobe raw, so imports render rougher than glTF means
 
-0.317.0 documented `-import-specular layered` as the default, and design.md described imports as a real
-Fresnel coat, but the `bool wantCoat` (GLTF-NORMALMAP-DROPPED, defect 2) meant not one import was ever
-built that way. 0.317.0 validated the coat on FTSL-authored materials (`scraps/lay_probe.ftsl`) and ran an
-`off`-against-"on" A/B on the glTF, which differs either way, so nothing caught it. 0.367.3 made the flag
-real and the default `mix`. Flipping the default back is a separate, visible change to every imported
-asset, and it should be made on evidence:
+Found while explaining GLTF-LAYERED-DEFAULT (it does not affect that ratio: both import forms share
+the lobe). glTF's `roughness` is *perceptual*: its GGX α is `r²`. The importer copies `r` straight
+into `Material::roughness`, which the tracers read as a Phong lobe of exponent `2/r² - 2`
+(render.h, bsdf_eval.h). By half-width that lobe is GGX α ≈ `0.646 r`, the same equivalence the
+preview's `previewRough(r) = sqrt(0.646 r)` uses. At r 0.25 that is α 0.16 against glTF's 0.0625, and
+at r 0.5, 0.32 against 0.25. Every imported glossy material, dielectric coat and metal alike, is
+blurrier than its author saw in a glTF viewer. Only for r near 1 do the two agree. Proposed fix:
+import `r_t = min(1, r² / 0.646)` (1.55 r²), applied to the constant and to the roughness map
+per texel, validated against a GGX reference at a few r. It changes the look of every glTF, so it
+waits for its own A/B rather than riding along with another change.
 
-| asset (mode R, GPU) | frame mean, `layered` / `mix` |
-|---|---|
-| `meshes/alice.glb` (`scenes/_gltf_layered_vs_mix.ftsl`, 64 spp) | **0.971** — about what a 4 % coat should cost |
-| the Alice2 sparkle GLB, skirt view (`scenes/_gltf_layered_vs_mix_alice2.ftsl`, 32 spp, 240²) | **0.668** (blue skirt 0.593, white apron 0.654) |
-| the same, with a **flat** normal map | 0.668 — so not the normal map |
+## DONE (2026-09-28, 0.371.0): GLTF-LAYERED-DEFAULT — `layered` was never the glTF import (0.317.0–0.367.2), then rendered the Alice2 GLB a third darker; explained, fixed, and the default again
 
-Both are double-sided dielectrics with factors of 1.0 and a metalness map (means 0.28 and 0.11). The gap
-is not explained yet. Candidates: the 0.323.0 exit-interface body term `a(1-F_dr)/(1-a*F_dr)`. That is
-varnish, and glTF's own dielectric BRDF (`F*spec + (1-F)*diffuse`) has no internal bounce, so even
-where the term is right for lacquer it is not what a glTF means. Other candidates: the Alice2 fabric's
-rougher coat (~0.4 against 0.25), and its 7 materials on thin double-sided shells. First step: render
-the Alice2 view with the body copies' `coatFdr` forced to 0. If the gap closes to a few percent, give
-imports a glTF-flavoured `layered` (no exit term) and decide the default from that. The large-gap asset
-is the user's file outside the repo (the path is in the scene's header); `meshes/alice.glb` is the
-in-repo control.
+**History.** 0.317.0 documented `-import-specular layered` as the default, but a `bool wantCoat`
+(GLTF-NORMALMAP-DROPPED, defect 2) folded it into `mix`, so no import was built that way until 0.367.3,
+which made the flag real and spelled the default `mix`. Then `layered` / `mix` measured 0.668 on
+the Alice2 skirt view (blue skirt 0.593, white apron 0.654) and 0.971 on `meshes/alice.glb`.
+
+**Why it was darker.** `finalizeLayeredCoats` stamps every body under a coat with the 0.323.0
+*exit* term. Light the body sends back up is partly reflected back down by the coat's underside
+(`F_dr` = 0.597 at n 1.5, past the critical angle) and re-absorbed, so the body's albedo `a` becomes
+`a (1 - F_dr) / (1 - a F_dr)`. That is right for varnish, which is what it was built for. It is not
+glTF's dielectric: glTF defines `fresnel_mix`, in which the base colour *is* the diffuse lobe's
+albedo, weighted by `1 - F`, with no internal bounce. The term's fingerprint was all over the old
+renders:
+- Lower albedos darken more (a_eff/a = 0.43 at a 0.1, 0.575 at 0.5, 0.87 at 0.9).
+- On the blue skirt the dark channels fell to 0.56, while red, carried by the coat's white
+  specular, stayed at 0.855.
+- The neutral apron sat at 0.67.
+
+Achromatic suspects (coat roughness, normal map, thin shells) cannot make the ratio depend on channel
+that way. The coat/body split never reads roughness at all. The "0.971 control" was not one either:
+~80 % of that frame is directly-seen environment, identical in both renders; doll-only it is
+0.75-0.78.
+
+**Fix (0.371.0).** A third coat model, FTSL `coat { scatter none }` (alias `gltf`, `coatScatter` 2):
+no internal bounce. The body copy keeps `coatFdr = 0`, so `coatedAlbedoAt` / `dCoatedAlbedoAt` return
+the authored albedo. Under a tinted coat (`absorb` + `depth`) it still takes one pass through the
+tint; both early-outs now test `coatPathIo` too. Every glTF `layered` import uses it.
+
+**Measured.**
+- Furnace, uniform env, normal incidence (`scraps/layered/furnace.py`): `scatter none` gives
+  F0 + (1-F0)ρ = 0.2323 / 0.5195 / 0.8084 against 0.232 / 0.520 / 0.808 at ρ 0.2 / 0.5 / 0.8, equal
+  to the 4 %/96 % mix. `analytic` still gives the varnish values, 0.1282 / 0.3159 / 0.6317 (design.md's
+  0.3159 reproduced).
+- Alice2 skirt view (`scraps/layered/alice2_ab.py`, mode R, GPU): layered / mix = **1.005** over the
+  frame, neutral ROI 0.984, blue skirt G 1.014, B 1.015. Red 1.127: the skirt's red is tiny
+  (0.027), and it gains relatively most from the coat's Fresnel ramp toward grazing across the folds,
+  which is exactly what glTF's model has and `mix` lacks.
+- The 0.370.0 binary reproduces the entry's 0.668 / 0.855 / 0.557 / 0.575 on the same run.
+- Render time, paired and interleaved with the warm-up dropped: layered / mix median 1.024.
+
+**So `layered` is the default again** (`gltfimp::dielectricSpecular = 2`); `-import-specular mix`
+keeps the old form.
+
+One remaining difference from glTF, by construction rather than oversight: with `-import-metal mix`
+the metal lobe sits *inside* the coat, because both compound resolvers unwrap one level only, and
+Mix-over-Layered would need two. So a metal texel also wears the coat's 4 % white film, which glTF's
+metal does not have: a few percent of saturation at normal incidence, nothing at grazing, where
+both go white. Fine to live with, and noted in REFERENCE.
 
 ## DONE (2026-09-22, 0.366.0): LIVE-WINDOW-TINY-BLACK — the renders Claude launched showed only a tiny, pure-black preview window
 

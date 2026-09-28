@@ -382,7 +382,11 @@ struct Material {
     // A3 (0.354.0). `coatScatter` 1 selects the stochastic layered model; `coatMom` is the
     // measured distribution of body-bounce counts before escape, stamped onto the BODY COPY
     // beside coatFdr. It depends on the coat index and the body's lobe but NOT on albedo, so
-    // one set serves every wavelength and every albedo.
+    // one set serves every wavelength and every albedo. 2 (0.371.0, FTSL `scatter none`) is NO
+    // internal bounce at all: light the body sends back up leaves through the coat, none of it is
+    // reflected back down. That is glTF's dielectric (`fresnel_mix`: the base colour is the
+    // diffuse lobe's albedo, weighted by 1-F), so every glTF `layered` import uses it; the body
+    // copy gets coatFdr = 0 and keeps the albedo it was authored with.
     int    coatScatter  = 0;
     int    coatMomN     = 0;
     double coatMom[8]   = { 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -1371,7 +1375,9 @@ inline double coatedAlbedoAt(const Material& m, double a, double lambda) {
         }
         return layered::albedoFromMoments(a, m.coatMom, m.coatMomN, tIo, tRt);
     }
-    if (!(m.coatFdr > 0.0)) return a;
+    // bare (no coat above it), or a `scatter none` body under a clear coat: albedo as authored.
+    // A `scatter none` body under a TINTED coat (coatPathIo > 0) still takes one pass through it.
+    if (!(m.coatFdr > 0.0) && !(m.coatPathIo > 0.0)) return a;
     if (m.coatPathIo > 0.0 && m.coatAbsorb) {
         const double sa = m.coatAbsorb(lambda);
         if (sa > 0.0)
@@ -1633,7 +1639,9 @@ struct Scene {
                 if (cid < 0 || cid >= (int)mats.size()) continue;
                 Material body = mats[(size_t)cid];
                 if (body.coatFdr > 0.0) continue;          // already a body copy (idempotent)
-                body.coatFdr = fdr;
+                // `scatter none` (glTF's model): no internal bounce, so no exit series -- the
+                // body keeps its authored albedo under the coat (coatedAlbedoAt returns it as is)
+                body.coatFdr = (mats[i].coatScatter == 2) ? 0.0 : fdr;
                 if (mats[i].coatScatter == 1) {
                     layered::Params LP; LP.eta = nCoat;
                     struct Rg { unsigned long long s;

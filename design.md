@@ -943,9 +943,11 @@ before any result is read.
 render from 0.316.0 to 0.367.2 used the `mix` stack whatever `-import-specular` said, and the A/Bs
 that validated this section compared `off` against "on", which differ either way. 0.367.3 made the
 flag work and spelled the default `mix`, the form every render has actually used; `layered` on an
-import renders the Alice view 33 % darker than `mix` (the body seen through the coat's exit
-interface, presumably -- varnish, where glTF's own dielectric has no internal bounce), so it stays
-opt-in until that is settled (`known-issues.md`, GLTF-LAYERED-DEFAULT).* As designed: the import is
+import then rendered the Alice view 33 % darker than `mix`: the varnish exit term, where glTF's own
+dielectric has no internal bounce. 0.371.0 gives imports `scatter none` (coatScatter 2: the body copy
+keeps coatFdr = 0, so coatedAlbedoAt returns the authored albedo), which closes the gap to 1.005 at
+the same render time, and `layered` is the default again (`known-issues.md`, GLTF-LAYERED-DEFAULT).*
+As designed: the import is
 `layered`: a Fresnel interface of index `ior` over the diffuse body, sharing the roughness and
 normal maps. That gives
 both the 4 % normal-incidence reflectance and the **angular ramp** toward grazing that the

@@ -38,21 +38,23 @@
 #include <chrono>
 
 // How an imported glTF DIELECTRIC carries the specular lobe glTF gives it:
-//   1 = `mix`      (default) the 0.316.0 stack: an uncoloured glossy lobe at constant weight F0
-//                  over the body. No angular ramp, but every mode can render it.
-//   2 = `layered`  the physical coat -- a Fresnel interface over the diffuse body, so the lobe
-//                  ramps toward grazing incidence as it should. Rendered by the device tracers
-//                  since 0.317.0 and by BDPT/VCM (modes D, J, U) since 0.318.0.
+//   2 = `layered`  (default since 0.371.0) glTF's own dielectric: a Fresnel interface over the
+//                  diffuse body, so the lobe ramps toward grazing incidence as fresnel_mix does,
+//                  with NO internal bounce under it (`scatter none`: the body keeps its authored
+//                  albedo). Rendered by the device tracers since 0.317.0 and by BDPT/VCM (modes D,
+//                  J, U) since 0.318.0.
+//   1 = `mix`      the 0.316.0 stack: an uncoloured glossy lobe at constant weight F0 over the
+//                  body. The same energy at normal incidence, no angular ramp.
 //   0 = `off`      a flat `diffuse`, the pre-0.316.0 import.
 // Metals (`metallic >= 0.5`) are unaffected by all three.
 //
-// The default is `mix` because that is what every glTF render since 0.316.0 has ACTUALLY used.
-// 0.317.0 documented `layered` as the default, but the importer held the mode in a `bool`, which
-// folded 2 into 1 -- so the layered branch never ran, and `-import-specular layered` built the
-// mix too. Since 0.367.3 the flag works. Making `layered` the default again changes the look of
-// every imported asset through a branch that has never run on one, so it waits on its own
-// validation (known-issues GLTF-LAYERED-DEFAULT).
-namespace gltfimp { inline int dielectricSpecular = 1; }
+// History. 0.317.0 documented `layered` as the default, but the importer held the mode in a
+// `bool`, which folded 2 into 1, so every render until 0.367.3 used `mix`; 0.367.3 made the flag
+// real and spelled the default `mix`. `layered` then rendered the Alice2 GLB a third darker, from
+// the varnish exit term a(1-F_dr)/(1-a F_dr) that glTF's model does not have. 0.371.0 gives
+// imports `scatter none` (known-issues GLTF-LAYERED-DEFAULT): layered / mix = 1.005 over that frame,
+// the same render time, and the default is layered again.
+namespace gltfimp { inline int dielectricSpecular = 2; }
 // `-import-metal mix`: honour a metallicRoughness map's metalness PER TEXEL, as a two-lobe
 // body chosen by the map, instead of typing the whole material by the map's mean. OFF by
 // default because the assets this would change are AI-generator exports whose metalness is a
@@ -913,13 +915,13 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                     m.normalTex = normalTexId;
                     m.normalStrength = normalScale;
                 }
-                // THE DIELECTRIC'S SPECULAR LOBE (0.316.0). By default a two-lobe `mix` -- an
-                // uncoloured glossy lobe selected with probability F0, the diffuse body with
-                // 1-F0 -- because that is what every mode can render. `-import-specular layered`
-                // builds the physical coat instead (a device branch since 0.317.0; reachable from
-                // here only since 0.367.3 -- see wantCoat). The price of the mix is the Fresnel
-                // ANGULAR RAMP: a mix weight is a constant, so the lobe stays at F0 instead of
-                // rising toward grazing incidence, and the silhouette rim sheen is missing.
+                // THE DIELECTRIC'S SPECULAR LOBE (0.316.0). By default (0.371.0) the physical
+                // coat, `layered` with glTF's no-bounce body (see gltfimp::dielectricSpecular).
+                // `-import-specular mix` builds the older two-lobe form instead -- an uncoloured
+                // glossy lobe selected with probability F0, the diffuse body with 1-F0. The price
+                // of the mix is the Fresnel ANGULAR RAMP: a mix weight is a constant, so the lobe
+                // stays at F0 instead of rising toward grazing incidence, and the silhouette rim
+                // sheen is missing.
                 // Mix weights are selection probabilities that are NOT reweighted, so the two
                 // lobes partition each photon exactly and energy is conserved by construction.
                 if (wantCoat) {
@@ -936,6 +938,13 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                         Material lay;
                         lay.type = MatType::Layered;
                         lay.coatModel = 0;                       // Fresnel dielectric interface
+                        // glTF's dielectric is fresnel_mix: the base colour IS the diffuse lobe's
+                        // albedo, weighted by 1-F, with no light bouncing back down off the coat's
+                        // underside. The varnish model (`scatter analytic`) adds exactly that
+                        // bounce, a(1-F_dr)/(1-a F_dr), F_dr = 0.597 at n 1.5 -- a third darker on
+                        // the Alice2 GLB, and more so in saturated colours (known-issues
+                        // GLTF-LAYERED-DEFAULT). An import means what the asset was authored for.
+                        lay.coatScatter = 2;
                         lay.ior = iorConstant(khrIor);           // KHR_materials_ior, else 1.5
                         lay.roughness = std::max(0.02, roughness);
                         lay.roughnessTex = roughTexId;           // glTF's roughness drives the coat
@@ -1008,7 +1017,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                         m.mixWeights  = {wm, 1.0 - wm};
                         m.mixWeightTex = metalTexId;
                     } else if (m.type == MatType::Mix && m.mixChildren.size() == 2) {
-                        // The flat-weight coat form (`-import-specular mix`, the default): its 4 % white lobe is
+                        // The flat-weight coat form (`-import-specular mix`): its 4 % white lobe is
                         // the thing that has to go, because a 2-child mix has exactly one weight
                         // slot and metal-vs-dielectric is the bigger of the two errors by far.
                         bodyId = m.mixChildren[1];

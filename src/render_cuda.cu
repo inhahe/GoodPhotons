@@ -8028,7 +8028,7 @@ __device__ static inline Real dCoatedAlbedoAt(const DMaterial& m, Real a, Real l
         for (int q = 0; q < m.coatMomN && q < 8; ++q) { acc += ak * m.coatMom[q]; ak *= (double)a * tRt; }
         return (Real)acc;
     }
-    if (!(m.coatFdr > 0.0)) return a;
+    if (!(m.coatFdr > 0.0) && !(m.coatPathIo > 0.0)) return a;   // host twin: coatedAlbedoAt
     if (m.coatPathIo > 0.0) {
         const double sa = (double)specLookup(m.coatAbsorb, lambda);
         if (sa > 0.0) {
