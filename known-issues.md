@@ -71,6 +71,23 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-09-27, 0.369.0): FRAGMENT-NO-LIGHT — a scene written to be `include`d would not open in the viewer
+
+Reported on Claude Fable 5.1's Alice groom (`alice1_meshy/hair_fable5.1/scenes/alice_hair.ftsl` in the
+user's asset folder, `scenes/alice_hair.ftsl` here): `ftrace alice_hair.ftsl` spent 31 s growing the
+fur and then failed with `scene has no light`. The file's first line says it is meant to be included
+by a scene that supplies cameras and lights, so the loader was right that it could not be *rendered*
+on its own. But the bare invocation is a preview, which needs no light, and a bare mesh already
+opens studio-lit. Now a preview lights a lightless scene with the mesh quick-view's photo studio, and
+frames a scene with no camera the way it frames a mesh. Without that framing the camera fell back to
+the built-in Cornell box's (eye 0.5 0.5 2.7), which sees nothing of a 25 cm doll at the origin.
+Light-transport renders and `-parseonly` keep the error, which now names the preview as the way to
+look at such a file.
+
+Left as it was: a *render* of a scene that has lights but no camera still uses that Cornell camera
+unless `-view` is given. The only scenes here without a camera are the four Alice fragments, none of
+which has a light either, so it has not been worth changing what a render does.
+
 ## DONE (2026-09-26, 0.368.2): RASTER-HIDDEN-FLATS — the preview drew every `hide_camera` light as a giant white square
 
 Reported on Astra's Alice2 scene (`ftrace alice2_photo_hair.ftsl`, the bare-invocation preview):

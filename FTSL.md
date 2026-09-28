@@ -156,6 +156,13 @@ asset search path)`. A cycle is refused with the whole chain:
 > `meshes/…`); it is the case to know about if you keep a part in a directory of its own.
 > Recorded in `known-issues.md`.
 
+**Opening a part on its own.** A file written to be included usually has no light and no
+camera, because the including scene supplies both. Since 0.369.0 the preview opens it anyway
+(`ftrace alice_hair.ftsl`, or `-raster` / `-explore`): it lights the part with the model
+viewer's photo studio (`light env { kind studio }`) and frames it the way it frames a bare
+mesh, and says it did both. A render of the part on its own still fails with `scene has no
+light` (§11); include it from a scene that has lights for that.
+
 Validated by `tools/include_rig.py`: a scene split across two files, nested through a
 subdirectory, and included from inside a `prefer` branch all render **byte-identical** to the
 same scene in one file; the cycle and the missing file fail with the messages above.
@@ -2553,7 +2560,13 @@ See README → **Exporting an isosurface to a mesh** for details; the code is `s
 
 ## 11. `light` — emitters
 
-Every scene needs at least one `light`. All lights take `spd <spectrum-expr>`
+Every scene needs at least one `light` (an emissive mesh or an emissive volume counts). The
+one exception is the preview (0.369.0): a scene opened with nothing to render — `ftrace
+part.ftsl`, `-raster`, `-explore` — that has no light is lit by the model viewer's photo
+studio instead of being refused, so a part written to be `include`d can be looked at on its
+own (§1.5). A light-transport render and `-parseonly` still refuse it.
+
+All lights take `spd <spectrum-expr>`
 (default `blackbody 6500`). Surface/tube/spot emitters can be given an absolute flux
 with `power <watts>` (radiant) or `lumens <lm>` (photometric) — this flips the whole
 scene to fixed-exposure output (`power` wins if both given). Env lights reject
@@ -3251,7 +3264,7 @@ bakes** → `Scene::build()`. (`sdf` is split across two of those: it reserves i
 before patterns compile — so `grid:<name>(…)` resolves and type-checks — and fills in the
 measured samples after the geometry it measures exists.) Notable hard errors: unknown
 block/material/type/preset, a scene
-with **no light**, a `mix` with nested children or weights summing > 1, a `function`
+with **no light** (outside the preview, which stands the photo studio in for one — §11), a `mix` with nested children or weights summing > 1, a `function`
 isosurface without `contained_by`, an isosurface without exactly one root element, and
 any unknown spectrum/preset/identifier.
 

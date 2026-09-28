@@ -905,6 +905,17 @@ struct Loaded {
     //
     // Not serialised, not part of the scene: set it on the Loaded you pass to load().
     std::function<void(Loaded&)> beforeBvh;
+
+    // Light a scene that has NO light with the mesh quick-view's photo studio (`light env {
+    // kind studio }`) instead of failing the load (0.369.0). main.cpp sets it for PREVIEW runs
+    // only -- the bare `ftrace scene.ftsl` viewer and the -raster / -explore family -- so a
+    // fragment written to be `include`d (a groom, a prop: no light, usually no camera) opens
+    // in the viewer the way `ftrace model.glb` does. A light-transport render still refuses a
+    // lightless scene, which could only render black, and so does -parseonly, whose job is to
+    // make every diagnostic fire. Set it on the Loaded you pass to load(), like beforeBvh;
+    // `studioAdded` comes back true when the stand-in was used.
+    bool studioIfUnlit = false;
+    bool studioAdded   = false;
 };
 
 // Normalise an authored mode letter: `W` is mode R plus the deterministic Whitted
@@ -1168,9 +1179,19 @@ public:
         for (const Medium& m : L.scene.media)
             if (m.emissive()) { haveVolumeEmission = true; break; }
         if (!haveLight && L.scene.emitters.empty() && !haveVolumeEmission) {
-            fail("scene has no light: add a 'light' block, an emissive ('emit') mesh, "
-                 "or an emissive volume ('temperature' + 'emission blackbody')");
-            return false;
+            if (!L.studioIfUnlit) {
+                fail("scene has no light: add a 'light' block, an emissive ('emit') mesh, "
+                     "or an emissive volume ('temperature' + 'emission blackbody'). To just "
+                     "look at it -- a groom or prop written to be `include`d, say -- open it in "
+                     "the preview (`ftrace <scene.ftsl>` with no render flags, or -raster), "
+                     "which lights an unlit scene with the model viewer's photo studio");
+                return false;
+            }
+            // A preview run (Loaded::studioIfUnlit, 0.369.0): light it the way the mesh
+            // quick-view lights a bare model. main.cpp says so, and frames the scene if it has
+            // no camera either -- a fragment made to be included usually has neither.
+            if (!addStudioEnv(L, 1024, 0.0, 1.0)) return false;
+            L.studioAdded = true;
         }
         // Catch errors recorded via fail() inside add* helpers that returned true
         // without re-checking `err` (e.g. an unknown `spd preset:`/`spectrum:` name
@@ -6708,6 +6729,24 @@ private:
         return scaledSpectrum(spd, k);
     }
 
+    // The procedural photo studio (studio.h) as the scene's env light. Shared by `light env
+    // { kind studio }` and by a preview's stand-in for a scene that has no light at all
+    // (Loaded::studioIfUnlit), so the two can never light a model differently.
+    bool addStudioEnv(Loaded& L, int res, double rotateDeg, double intensity) {
+        // 1024 x 512 by default: EnvMap looks texels up nearest, so a sharp metal reflecting a
+        // softbox shows the map's grain at its edge; 0.35-degree texels keep that below a pixel.
+        if (res < 16) res = 16; if (res > 8192) res = 8192;
+        const int sw = res, sh = res / 2;
+        std::vector<Vec3> img = studio::generate(sw, sh);
+        auto map = std::make_shared<EnvMap>();
+        std::string eerr;
+        if (!map->buildFromRgb(img, sw, sh, rotateDeg, intensity, eerr)) {
+            fail("env studio: " + eerr); return false;
+        }
+        L.scene.addEnvLight(std::move(map), binWidth_);
+        return true;
+    }
+
     // Each `light` block registers one Emitter. Multiple light blocks accumulate;
     // the forward tracer selects among them power-weighted and the backward
     // reference sums over them (see scene.h / render.h / backward.h).
@@ -6908,22 +6947,9 @@ private:
             // A procedural photo studio (studio.h, 0.368.0): a cyclorama plus key / fill / rim /
             // top softboxes, baked like the Preetham sky. It is what the mesh quick-view lights
             // an object with, because a metal is what it reflects and a uniform env shows none.
-            if (kind == "studio") {
-                // 1024 x 512 by default: EnvMap looks texels up nearest, so a sharp metal reflecting a
-                // softbox shows the map's grain at its edge; 0.35-degree texels keep that below a pixel.
-                int res = (int)dblOf(b, "res", 1024.0);
-                if (res < 16) res = 16; if (res > 8192) res = 8192;
-                const int sw = res, sh = res / 2;
-                std::vector<Vec3> img = studio::generate(sw, sh);
-                auto map = std::make_shared<EnvMap>();
-                std::string eerr;
-                if (!map->buildFromRgb(img, sw, sh, dblOf(b, "rotate", 0.0),
-                                       dblOf(b, "intensity", 1.0), eerr)) {
-                    fail("env studio: " + eerr); return false;
-                }
-                L.scene.addEnvLight(std::move(map), binWidth_);
-                return true;
-            }
+            if (kind == "studio")
+                return addStudioEnv(L, (int)dblOf(b, "res", 1024.0), dblOf(b, "rotate", 0.0),
+                                    dblOf(b, "intensity", 1.0));
             bool isSky = (kind == "preetham" || kind == "sky") ||
                          find(b, "turbidity") || find(b, "sun_dir") || find(b, "sun_elevation");
             if (isSky) {
@@ -9200,6 +9226,7 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
             for (int c = 0; c < nb; ++c) {
                 choice[j] = c;
                 Loaded trial;
+                trial.studioIfUnlit = L.studioIfUnlit;   // a candidate is judged as the caller's run would load it
                 Trial t = tryBuild(choice, trial);
                 // A clean stop is NOT a branch failure. Without this, an interrupted branch
                 // looks "rejected", `prefer` moves on to the next one, and the stop gets

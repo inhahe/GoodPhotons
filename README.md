@@ -384,7 +384,9 @@ quietly produce a **wrong image** instead of a complaint. See FTSL.md §1.3.
 > you never have to hand-place a camera just to look at a model. Presentation flags
 > (`-window`, `-o`, `-r`, `-camera`, `-view`) keep it a preview; to render the same
 > auto-lit scene with real light transport instead, pass a transport flag —
-> `ftrace model.glb -mode D -n 100000000 -o png/model.png`.
+> `ftrace model.glb -mode D -n 100000000 -o png/model.png`. A **scene** file with no light
+> or no camera of its own — a groom or prop written to be `include`d — previews the same
+> way (0.369.0): studio-lit and auto-framed.
 >
 > **N-dimensional rotation.** Add `-nd <n>` and the same viewer lifts the model into
 > `n`-dimensional space, giving you one slider per rotation **plane** (`n(n-1)/2` of them)

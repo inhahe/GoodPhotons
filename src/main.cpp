@@ -18153,7 +18153,8 @@ static void printHelp(const char* prog) {
 "\n"
 "Usage:\n"
 "  %s -in <scene.ftsl> [options]         render a scene file\n"
-"  %s <scene.ftsl>                       quick raster preview in a live window\n"
+"  %s <scene.ftsl>                       quick raster preview in a live window (a scene\n"
+"                                        with no light or no camera is studio-lit / auto-framed)\n"
 "  %s <model.glb|.obj|.gltf|.fbx>        quick-view a bare mesh (auto-lit, auto-framed)\n"
 "  %s [options]                          render the built-in demo scene\n"
 "  %s -topng <in.ppm|in.ftbuf> <out.png> convert an artifact to PNG (no render)\n"
@@ -18970,6 +18971,45 @@ static int run(int argc, char** argv) {
         };
     }
 
+    // The render-control flags that make a positional SCENE a real render rather than the
+    // bare-invocation preview. One table, read twice: by the preview pre-scan just below and by
+    // the bare-invocation block after the flag loop, which is where the choice is made for real.
+    static const char* const kSceneRenderFlags[] = {
+        "-mode","-n","-time","-noise","-forever","-preview","-spp","-device",
+        "-camera","-view","-savemap","-loadmap","-wavefront","-o","-r","-window"
+    };
+    const size_t kSceneRenderFlagCount = sizeof(kSceneRenderFlags) / sizeof(*kSceneRenderFlags);
+    // Will this run be a PREVIEW (no light transport)? Decided for real further down, but the
+    // loader has to know first (0.369.0): a preview lights a scene that has no light with the
+    // mesh quick-view's photo studio instead of refusing it (Loaded::studioIfUnlit), and frames
+    // one that has no camera. So a fragment written to be `include`d -- a groom, a prop -- opens
+    // in the viewer the way a bare model does. -parseonly stays strict: it exists to make every
+    // diagnostic fire, and a sweep of a scene directory runs it on positional paths.
+    const bool previewPrescan = !parseOnly && (rasterPrescan ||
+        (positionalScene && !positionalMesh && [&] {
+            for (int i = 1; i < argc; ++i)
+                for (size_t k = 0; k < kSceneRenderFlagCount; ++k)
+                    if (!std::strcmp(argv[i], kSceneRenderFlags[k])) return false;
+            return true;
+        }()));
+    // Frame the scene's bounding sphere from the quick-view's 3/4 front-high angle, far enough
+    // that it fits a 40-degree vertical FOV with a little margin. The mesh quick-view does this
+    // for every model; a scene preview does it when the scene has no camera of its own. The
+    // photo studio's key is placed relative to this same direction (studio.h), so a model is lit
+    // the same way whichever route opened it. A -view later in the flag loop overrides it.
+    auto autoFrameView = [&](const Scene& sc) {
+        Vec3 ctr = sc.sceneCenter;
+        double rad = (sc.sceneRadius > 0.0) ? sc.sceneRadius : 1.0;
+        const double fovDeg = 40.0, half = fovDeg * 0.5 * PI / 180.0;
+        double dist = (rad / std::sin(half)) * 1.15;
+        Vec3 dir = {0.55, 0.42, 1.0};
+        { double L = std::sqrt(dot(dir, dir)); dir = dir * (1.0 / L); }
+        viewEye = ctr + dir * dist; viewLook = ctr; viewUp = {0, 1, 0}; viewFov = fovDeg;
+        haveView = true;
+        std::printf("[viewer] auto-framed: center (%.3f,%.3f,%.3f) radius %.3f -> eye (%.3f,%.3f,%.3f)\n",
+                    ctr.x, ctr.y, ctr.z, rad, viewEye.x, viewEye.y, viewEye.z);
+    };
+
     bool fromFtsl = false;
     if (positionalMesh) {
         // ---- Quick mesh viewer -------------------------------------------------------
@@ -19007,21 +19047,9 @@ static int run(int argc, char** argv) {
         fromFtsl = true;
         std::printf("[viewer] quick-view scene for mesh %s (%zu triangles)\n",
                     inFile, ftslScene.scene.tris.size());
-        // Auto-frame the camera on the scene bounding sphere from a 3/4 front-high angle,
-        // far enough that the sphere fits the vertical FOV (with a little margin). Skip if
+        // Auto-frame the camera on the scene bounding sphere (autoFrameView, above). Skip if
         // the user pinned their own -view.
-        if (!haveView) {
-            Vec3 ctr = ftslScene.scene.sceneCenter;
-            double rad = (ftslScene.scene.sceneRadius > 0.0) ? ftslScene.scene.sceneRadius : 1.0;
-            const double fovDeg = 40.0, half = fovDeg * 0.5 * PI / 180.0;
-            double dist = (rad / std::sin(half)) * 1.15;
-            Vec3 dir = {0.55, 0.42, 1.0};
-            { double L = std::sqrt(dot(dir, dir)); dir = dir * (1.0 / L); }
-            viewEye = ctr + dir * dist; viewLook = ctr; viewUp = {0, 1, 0}; viewFov = fovDeg;
-            haveView = true;
-            std::printf("[viewer] auto-framed: center (%.3f,%.3f,%.3f) radius %.3f -> eye (%.3f,%.3f,%.3f)\n",
-                        ctr.x, ctr.y, ctr.z, rad, viewEye.x, viewEye.y, viewEye.z);
-        }
+        if (!haveView) autoFrameView(ftslScene.scene);
     } else if (inFile) {
         std::string ferr;
         // FTRACE_LOADSTATS=1 prints the per-phase load breakdown. The numbers were always
@@ -19032,6 +19060,7 @@ static int run(int argc, char** argv) {
             return e && std::atoi(e) != 0;
         }();
         ftsl::LoadTiming ltim;
+        ftslScene.studioIfUnlit = previewPrescan;   // a preview lights a lightless scene (see above)
         if (!ftsl::load(inFile, ftslScene, ferr, supportFn, loadStats ? &ltim : nullptr)) {
             // A clean stop that landed mid-load is not a scene error. Say so plainly
             // rather than printing a diagnostic that points the finger at the .ftsl —
@@ -19097,6 +19126,18 @@ static int run(int argc, char** argv) {
         }
         fromFtsl = true;
         std::printf("[ftsl] loaded scene from %s\n", inFile);
+        // A preview of a fragment written to be `include`d (0.369.0): say what stood in for
+        // the light the file does not have, and frame it if it has no camera either -- without
+        // that it would fall through to the BUILT-IN Cornell box's camera (eye 0.5 0.5 2.7),
+        // which sees nothing of a scene that was not built in that unit box.
+        if (ftslScene.studioAdded)
+            std::printf("[viewer] %s has no light, so the preview lights it with the model "
+                        "viewer's photo studio (a render needs a light of its own: add one, or "
+                        "include this file from a scene that has one)\n", inFile);
+        if (previewPrescan && ftslScene.cameras.empty() && !haveView) {
+            std::printf("[viewer] %s has no camera; framing the whole scene\n", inFile);
+            autoFrameView(ftslScene.scene);
+        }
         // The scene's per-medium `beam_blur` overrides, for buildBeamMap (mode M's map).
         g_medBeamBlur.clear();
         for (const Medium& m : ftslScene.scene.media) g_medBeamBlur.push_back(m.beamBlur);
@@ -19870,11 +19911,8 @@ static int run(int argc, char** argv) {
         // flags (-window/-o/-r/-camera/-view) and only yields to a genuine light-transport
         // request (-mode and the budget/device/map flags). So `ftrace model.glb -window`
         // shows a raster preview in a window, while `ftrace model.glb -mode D -n 1e8`
-        // renders it for real.
-        static const char* kSceneRenderFlags[] = {
-            "-mode","-n","-time","-noise","-forever","-preview","-spp","-device",
-            "-camera","-view","-savemap","-loadmap","-wavefront","-o","-r","-window"
-        };
+        // renders it for real. (kSceneRenderFlags is defined before the scene load: the
+        // loader's preview pre-scan reads the same table.)
         static const char* kMeshRenderFlags[] = {
             "-mode","-n","-time","-noise","-forever","-preview","-spp","-device",
             "-savemap","-loadmap","-wavefront"
@@ -19889,7 +19927,7 @@ static int run(int argc, char** argv) {
                     }
         };
         if (positionalMesh) scan(kMeshRenderFlags, sizeof(kMeshRenderFlags)/sizeof(*kMeshRenderFlags));
-        else                scan(kSceneRenderFlags, sizeof(kSceneRenderFlags)/sizeof(*kSceneRenderFlags));
+        else                scan(kSceneRenderFlags, kSceneRenderFlagCount);
         if (!explicitControl) {
             doRaster = true;
             g_showWindow = true;

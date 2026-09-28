@@ -1293,6 +1293,19 @@ The mesh quick-view is lit by `light env { kind studio }` (`studio.h`): a cyclor
 fill / rim / top softboxes, baked like the Preetham sky, so the path tracer, mode W and the preview
 all light with it and all show it in reflections.
 
+**A lightless scene previews with the same studio (0.369.0).** The loader's `scene has no light`
+check was unconditional, so a fragment written to be `include`d -- `scenes/alice_hair.ftsl`: the
+doll, a scalp and a groom, for a scene that supplies cameras and lights -- could not be opened on its
+own at all, and failed only at the end of a 31 s load. `Loaded::studioIfUnlit` turns that failure
+into `addStudioEnv` (the helper `light env { kind studio }` itself now calls, so the two cannot
+drift) and `studioAdded` reports it. main.cpp sets the flag before the load for a preview run -- the
+-raster family, or a positional scene with none of the render-control flags -- by pre-scanning the
+same `kSceneRenderFlags` table the bare-invocation block reads after the flag loop. After the load it
+prints what stood in and, when the scene has no camera either, frames it with `autoFrameView`, the
+quick-view's own framing (without it a cameraless scene falls through to the built-in Cornell box's
+camera, eye 0.5 0.5 2.7). A light-transport render and `-parseonly` keep the error, which now points
+at the preview. `prefer` candidates are built into fresh `Loaded`s, so each copies the flag.
+
 What it is not: shadows, refraction, parallax beyond one box projection, or GI beyond one probe --
 the reference comparisons in `known-issues.md` (RASTER-METAL-LOOK) record where it lands against
 mode R and mode D, and where it is off.

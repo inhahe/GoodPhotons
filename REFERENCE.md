@@ -821,6 +821,16 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > `-view`, an explicit `-o`/`-r`, etc.) opts out of the auto-preview and renders
 > normally; `-in <path>` is likewise always an explicit render, never a preview.
 >
+> **A scene with no light or no camera still previews (0.369.0).** A file written to be
+> `include`d — a groom, a prop — usually has neither; the scene that includes it supplies
+> them. The preview (the bare invocation, or `-raster` / `-explore` / `-raster-gpu`) lights a
+> scene that has no light with the mesh quick-view's photo studio (`light env { kind studio }`)
+> and frames a scene that has no camera the way it frames a bare mesh, printing a `[viewer]`
+> line for each; `-view` still wins. A light-transport render of the same file still refuses
+> it — it could only render black — with `scene has no light`, which now names the preview as
+> the way to look at such a file; so does `-parseonly`, which is there to make every
+> diagnostic fire.
+>
 > **A bare *mesh* (`ftrace model.glb`) does the same thing, but yields less
 > readily.** The mesh quick-viewer is *fundamentally* a preview — there is no
 > authored scene to render "properly" — so presentation flags do **not** opt it
@@ -5685,7 +5695,7 @@ survive exactly.
 | `-roi-audit <file.rois>` | Audit an **existing** `.rois` file against the same primary-visibility pass, then exit (no render). For each box, prints its pixel count, its dominant material and that material's share, plus the next three contributors — i.e. what the box is *actually* looking at, as opposed to what it is named after. A box whose dominant material holds under half its pixels is flagged. Use it before trusting any per-ROI campaign, and note two blind spots it has by construction: it classifies by first **surface** hit, so an ROI over participating media reports 100 % "sky/escaped" and is simply not assessed, and materials with no name in the scene report `(unnamed)`. |
 | `-roi-mask <out.pfm>` | Write the per-pixel **material id** for the selected camera as a `.pfm`, plus an `<out.pfm>.materials.txt` legend mapping id to name, then exit (no render). Written through the same PFM writer the renders use, so its row order cannot drift from the images it indexes. This is the ROI that always exists: a rectangle cannot represent fur, foliage or any thin structure (measured: a fur coat scores purity 0.44 over 28 disjoint regions), and a mask is also the only region definition that transfers between scenes unchanged. Consume it with `python tools/roi_score.py <dir> --arms ... --mask <out.pfm>`, which then scores every material on the pixels that actually show it. Generate it with the same `-r` and `-camera` as the renders being scored. |
 | `-roi-minpurity <f>` / `-roi-minshare <f>` / `-roi-minpx <N>` | Gates for `-roiboxes` (defaults 0.60 / 0.50 / 24). Note a sphere inscribed in its own bounding box has purity π/4 ≈ 0.785, so 0.60 already admits fairly round objects; raise it to demand near-rectangular ones. |
-| `-parseonly` | Load the scene, print a one-line contents summary (materials / records / emitters / spheres / tris / implicits / textures / patterns / cameras), then exit without rendering. A fast syntax + semantic check — every `.ftsl` diagnostic still fires, so it's the cheap way to sweep a whole scene directory for load errors. |
+| `-parseonly` | Load the scene, print a one-line contents summary (materials / records / emitters / spheres / tris / implicits / textures / patterns / cameras), then exit without rendering. A fast syntax + semantic check — every `.ftsl` diagnostic still fires, so it's the cheap way to sweep a whole scene directory for load errors. It checks the scene as a render would load it, so a part written to be `include`d fails here with `scene has no light` even though the preview opens it (0.369.0). |
 | `-fog <σt>` / `-fogalbedo <a>` / `-fogg <g>` / `-fograyleigh` | Fog controls |
 | `-filmthickness <nm>` / `-filmior <n>` | Thin-film iridescence demo params |
 | `-diffraction <mode>` / `-nodiffraction` | Enable/disable grating & thin-film diffraction |
