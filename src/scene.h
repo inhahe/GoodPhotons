@@ -2573,6 +2573,14 @@ struct Scene {
                 sceneCenter = b.center();
                 sceneRadius = length(b.hi - b.lo) * 0.5 * 1.0001; // tiny margin
                 sceneBoxLo = b.lo; sceneBoxHi = b.hi;
+            } else {
+                // NOTHING to bound -- an environment (or a sun) and a camera, e.g. an HDR opened to
+                // look at. R = 0 gave the env (and a sun) zero phase-space weight, hence zero power,
+                // and modes R and W rendered the whole sky black with no warning (0.371.1). A
+                // nominal 1 m sphere at the origin: nothing can be hit, so its size only has to
+                // be positive for the emitters' power and the wavelength CDF built from it.
+                sceneCenter = Vec3{0, 0, 0};
+                sceneRadius = 1.0;
             }
         }
         // Distant suns are sized by the same bounding sphere: a photon is born on a

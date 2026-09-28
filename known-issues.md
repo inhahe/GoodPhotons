@@ -175,19 +175,22 @@ Two things found on the way:
   film, which already holds the caught sky; the render itself gates that pass on `!forwardCatch`.
   Fixed in the same version.
 - **Test-rig gotchas.** An env-only scene with no geometry at all renders **black** in modes R and
-  W (both binaries); `scraps/envband/*.ftsl` carry one out-of-frame sphere for bounds (see the OPEN
-  entry). Mode C's `focus 0` is a camera obscura, not focus-at-infinity, so a wide pupil blurs a
+  W (both binaries); `scraps/envband/*.ftsl` carry one out-of-frame sphere for bounds (fixed
+  since: ENV-NO-GEOMETRY-BLACK, 0.371.1). Mode C's `focus 0` is a camera obscura, not focus-at-infinity, so a wide pupil blurs a
   distant sky flat; focus far away instead.
 
-## OPEN (minor, 2026-09-28): an image-env scene with NO geometry renders black in modes R and W
+## DONE (2026-09-28, 0.371.1): ENV-NO-GEOMETRY-BLACK — an image-env scene with no geometry rendered black in modes R and W
 
-`scraps/envband/coarse.ftsl` without its out-of-frame sphere: a 10° camera looking into an image
-env, nothing else in the scene. Modes B and P draw the sky (camera-ray background pass), but R and
-W wrote an all-zero frame, from 0.369.0 and 0.370.0 alike, with no warning. The likely cause is the
-env's scale coming from the scene bounds (`Scene::build`), which are empty. The whole frame is
-sky, but a user who opens an HDR on its own to look at it gets nothing, and
-`scenes/_env_bgonly.ftsl` (whose comment says it isolates the env radiance "for GPU-vs-CPU backward
-comparison") presumably renders black in R too. Workaround: any geometry at all, even out of frame.
+Found building the ENV-BACKDROP-TEXELS test rig: a 10° camera looking into an image env, nothing else
+in the scene. Modes B and P drew the sky, through their camera-ray background pass. R and W wrote an
+all-zero frame with no warning, in 0.369.0 and 0.370.0 alike. **Cause:** `Scene::build` sizes the
+env's phase-space weight from the bounding sphere, `envGeom = 4 pi^2 R^2`, and with no geometry the
+box stays empty and R stays 0. The env's power went to zero, and so did the weight the backward
+tracer's spectral sampling gave it. A distant sun had the same zero. **Fix:** an empty scene gets a
+nominal 1 m bounding sphere at the origin. Nothing can be hit, so its size only has to be positive.
+Afterwards the geometry-free scene renders its sky in R (GPU 0.009841, CPU 0.009843) and W (0.00960
+at 2 spp, its deterministic spectral quadrature), against B's 0.009847. `scenes/_env_bgonly.ftsl`, whose
+comment says it isolates the env radiance for a backward comparison, now works in R as intended.
 
 ## DONE (2026-09-23, 0.368.0): RASTER-METAL-LOOK — the preview drew metal as coloured plastic, and its lights were presets rather than the scene's
 
