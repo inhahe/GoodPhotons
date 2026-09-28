@@ -101,24 +101,93 @@ the GPU isosurface preview's primary ray), says how many triangles it left out, 
 `-raster-hidden` draws them again. Lighting and reflections are unchanged; `-import-metal mix`
 (which the report also used) had nothing to do with it.
 
-## OPEN: ENV-BACKDROP-TEXELS — an image environment seen directly shows its texels at close framing
+## DONE (2026-09-28, 0.370.0): FORWARD-ENV-MIRRORED — every forward mode lit the scene with the image environment point-mirrored (2026-07-10 – 0.369.0)
 
-`EnvMap::radiance` / `xyz` (`src/envmap.h`) are **nearest-texel** by design: evaluation then
-matches the piecewise-constant importance sampler exactly, so `pdf(d)` and `sample()` agree and
-MIS stays unbiased. The cost shows only where the map is *looked at*: once a texel spans more than
-a pixel, a soft edge in the map renders as a staircase of flat bands. Seen on the Alice2 hair
-scene (`tools/alice2_hair.py`'s room, found 2026-09-23): a window edge that the map ramps over 4°
-came out as ~23 visible steps at 1024 px / 360° under a 36° camera, and stayed faintly banded at
-2048 px — each texel 4-9 screen pixels wide. Any `light env { file … }` reproduces it through a
-narrow camera; `scenes/_env_bgonly.ftsl` (a background-only image env) at `-r 1024` with its
-`fov_y` cut to ~15° is the simplest.
+**Found** while fixing ENV-BACKDROP-TEXELS below, whose mode-C half needed to know which way an env
+photon travels. `genPhoton` drew a direction `d` from the env's luminance sampler -- the *sky*
+direction light comes from -- then started the photon at `sceneCenter - d·R` and sent it along
+`+d`, *toward* the texel it was drawn from, and weighted it with `radiance(d)`. So the photon that
+should have come from the bright window arrived from the opposite side of the sky. **Measured**
+(`scraps/envdir/`): a map bright only toward +x, a white sphere, camera on +z. Mode R lit its +x
+half (153 vs 32), mode B its -x half (161 vs 34). Every forward path had it: A, B, C, M's and S's
+photon passes, on CPU and GPU, scalar and hero-wavelength (`render.h` `tracePhoton` /
+`tracePhotonHero`, `render_cuda.cu` `genPhoton` / `genPhotonHero`). The backdrop never showed it:
+the forward modes draw what the camera sees with a separate camera-ray pass, which looks the map up
+the right way. So an env-lit forward render showed the window on one side and took its light from
+the other. Constant environments are symmetric and were unaffected, which is presumably why nobody
+noticed. It dates from the first image-env commit for the forward tracer (b7e39a43), before VERSION
+existed.
 
-Workaround: a map with texels under a pixel for the framing in use (the tool now writes its room
-at 2048×1024), or depth of field to blur the backdrop. A fix would filter the camera-ray lookup
-only (the background a primary ray misses into) while NEE and the MIS weights keep the
-piecewise-constant pdf. That is unbiased only because a primary miss contributes to no MIS sum:
-check it against the bidirectional modes, whose camera subpaths *do* weight env hits, before
-assuming so.
+**Fix:** the photon travels `-d`, and the birth weight is taken toward the sky it came from
+(`radiance(-dir)` / `dEnvTexel(sc.env, -dir)`). Afterwards all of R, B, M and S light the +x half
+on both devices (B/M/S 160-162 against R's 153 in the tone-mapped check), with `-heroc 1` and hero
+wavelengths alike. Mode C's directly caught sky moved too: the old C showed the half of the sky
+*behind* the camera, 3.8x darker than the half in front on the test map.
+
+## DONE (2026-09-28, 0.370.0): ENV-BACKDROP-TEXELS — an image environment seen directly showed its texels at close framing
+
+`EnvMap::radiance` / `xyz` are **nearest-texel**, so evaluation matches the piecewise-constant
+importance sampler exactly and MIS stays unbiased. The cost showed wherever the map was *looked
+at*: once a texel spanned more than a pixel, a soft edge rendered as a staircase of flat bands.
+Seen on the Alice2 hair scene's room: a window edge the map ramps over 4° came out as ~23 steps at
+1024 px / 360° under a 36° camera.
+
+**Fix:** where the env is only SEEN it takes a bilinear lookup between texel centres
+(`EnvMap::taps` / `radianceSeen` / `xyzSeen`; `dEnvTaps` / `dEnvRadianceSeen` on the device). That
+means a camera ray, or a delta chain from one (mirror, clear glass), that escapes. It blends the four
+texels' *radiance*, not their fitted coefficients: each texel has its own scale. Everything that
+LIGHTS a surface keeps the nearest texel. The sites are:
+- the weight-1 branch of the miss in R / W (`backward.h` scalar and hero, `bkRadiance` /
+  `bkRadianceHeroLoop`), where the hero loops take the four taps once per ray;
+- M's and S's camera-walk escapes (`photonmap_render.h`, `sppm_render.h`, `dPhotonGather`,
+  `dSppmVisiblePoint`);
+- `Scene::envXYZForDir`, whose only callers are the forward modes' camera-ray background pass and
+  mode P's sky pixels;
+- mode C, whose sky is env photons physically caught by the pupil. There the deposit of an env
+  photon on its first flight is weighted by `radianceSeen / radiance` at its sky direction: a
+  `bounce == 0` test on the host, and a new `PV_BIT_ENVFIRST` path bit on the device, set at birth
+  and cleared by the first `shadeStep` that doesn't catch it. That is unbiased wherever the sampler
+  can land; a zero-luminance texel is never drawn, so the ramp *into* one from a lit neighbour is
+  missing, an edge that is dark either way.
+
+**The MIS question the entry asked** has a clean answer. In every tracer a primary (or delta-chain)
+miss has weight exactly 1: R/W take it only on `specularArrival && !(gmis.pdf > 0)`, and M/S's
+camera walks have no env NEE at all. The bidirectional modes (D, J, U) refuse env scenes outright
+(`bdptUnsupportedFeature`, `vcmUnsupportedFeature`, `cudaBidirCoreSupported`), no light subpath
+starts on an env, and s=1,t=1 is never evaluated. So no strategy has to agree with the smooth lookup.
+
+**Measured** (`scraps/envband/`). The test is a 128×64 map with a soft disc under a 10° camera,
+each texel ~40 px, against a reference: the same map pre-upsampled 8× by exactly the
+bilinear-between-centres rule and rendered by the OLD binary. On that 8× map nearest ≈ bilinear of
+the coarse one.
+- R (GPU and CPU), W, B, M, S and P: 2.1-2.3 % from the reference, against 18 % for the old
+  binary, and the mean within 0.05 %. The residual is the reference's own 14-px texel blocks.
+- Flat plateaus along the centre row: 0 % of neighbouring pixels, against 99 % before
+  (deterministic modes).
+- Mode C at 8e10 photons, 32² and a 0.3 m pupil: 1.2 % from R's smooth image (hero), 1.6 %
+  (`-heroc 1`), against 17 % from the blocky one.
+- Lighting is untouched: on a sphere lit by the env, every sphere pixel of a mode R render is
+  byte-identical to the old binary's, on GPU and CPU.
+- The raster preview needed nothing; its env backdrop was already a bilinear bake.
+
+Two things found on the way:
+- **The exposure meter counted mode C's sky twice.** It ran the camera-ray background pass over C's
+  film, which already holds the caught sky; the render itself gates that pass on `!forwardCatch`.
+  Fixed in the same version.
+- **Test-rig gotchas.** An env-only scene with no geometry at all renders **black** in modes R and
+  W (both binaries); `scraps/envband/*.ftsl` carry one out-of-frame sphere for bounds (see the OPEN
+  entry). Mode C's `focus 0` is a camera obscura, not focus-at-infinity, so a wide pupil blurs a
+  distant sky flat; focus far away instead.
+
+## OPEN (minor, 2026-09-28): an image-env scene with NO geometry renders black in modes R and W
+
+`scraps/envband/coarse.ftsl` without its out-of-frame sphere: a 10° camera looking into an image
+env, nothing else in the scene. Modes B and P draw the sky (camera-ray background pass), but R and
+W wrote an all-zero frame, from 0.369.0 and 0.370.0 alike, with no warning. The likely cause is the
+env's scale coming from the scene bounds (`Scene::build`), which are empty. The whole frame is
+sky, but a user who opens an HDR on its own to look at it gets nothing, and
+`scenes/_env_bgonly.ftsl` (whose comment says it isolates the env radiance "for GPU-vs-CPU backward
+comparison") presumably renders black in R too. Workaround: any geometry at all, even out of frame.
 
 ## DONE (2026-09-23, 0.368.0): RASTER-METAL-LOOK — the preview drew metal as coloured plastic, and its lights were presets rather than the scene's
 

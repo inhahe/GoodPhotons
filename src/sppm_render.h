@@ -110,9 +110,10 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             if (a > 0.0) thr *= std::exp(-a * h.t);
         }
         if (!h.valid) {
+            // camera / specular escape: the env as SEEN, bilinear (Scene::envRadianceSeen)
             if (scene.envIndex >= 0)
                 directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                           * (thr * scene.envRadiance(ray.d, lambda) * invPdfL);
+                           * (thr * scene.envRadianceSeen(ray.d, lambda) * invPdfL);
             // Directly-viewed solar disc (camera / specular escapes only — a diffuse
             // vertex stores a hit point and returns before it can reach here).
             if (scene.sunCount > 0)

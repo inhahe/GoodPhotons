@@ -1445,9 +1445,11 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             }
         }
         if (!h.valid) {                                  // escaped -> environment
+            // The env as SEEN (a camera ray or a specular chain -- see the sun note below; the
+            // walk has no env NEE, so weight 1): the bilinear lookup, Scene::envRadianceSeen.
             if (scene.envIndex >= 0)
                 L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                     * (thr * scene.envRadiance(ray.d, lambda) * invPdfL);
+                     * (thr * scene.envRadianceSeen(ray.d, lambda) * invPdfL);
             // Directly-viewed solar disc. This walk terminates at the first diffuse
             // vertex (the density estimate returns there), so any escape reaching here
             // is a camera ray or a specular chain — never a diffuse continuation that

@@ -1786,10 +1786,21 @@ struct Scene {
         if (envIndex < 0) return 0.0;
         return envMap ? envMap->radiance(d, lambda) : emitters[envIndex].spdFn(lambda);
     }
-    // Directly-viewed background XYZ in direction `d` (integral of CIE*L dlambda).
+    // The environment as SEEN -- by a camera ray, or a delta chain from one (mirror, clear
+    // glass), that escapes: the map's bilinear lookup (EnvMap::radianceSeen, 0.370.0), so a
+    // texel wider than a pixel is not a flat block. Only on the weight-1 branch of a miss;
+    // anything that LIGHTS a surface keeps envRadiance above, whose nearest texel matches the
+    // sampler. A constant env is the same either way.
+    double envRadianceSeen(const Vec3& d, double lambda) const {
+        if (envIndex < 0) return 0.0;
+        return envMap ? envMap->radianceSeen(d, lambda) : emitters[envIndex].spdFn(lambda);
+    }
+    // Directly-viewed background XYZ in direction `d` (integral of CIE*L dlambda). Its only
+    // callers are the forward modes' camera-ray background pass and mode P's sky pixels, both
+    // pure viewing, so it is the bilinear lookup (0.370.0).
     Vec3 envXYZForDir(const Vec3& d) const {
         if (envIndex < 0) return Vec3{0, 0, 0};
-        return envMap ? envMap->xyz(d) : envXYZ;
+        return envMap ? envMap->xyzSeen(d) : envXYZ;
     }
     // Radiance of every distant sun whose disc contains direction `d` (0 when the ray
     // escapes into empty sky). Added ONLY on a camera / specular arrival: at a diffuse

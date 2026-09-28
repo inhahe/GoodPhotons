@@ -6329,6 +6329,21 @@ as the one at fault.
   the entire env pipeline, including the GPU `DEnvMap` upload, for free. Magnitudes are
   physical (the sun is ~10⁵× the sky) then normalised to a mean sky luminance of
   `intensity`. (Efficient-directional-sun forward sampling is a logged follow-up.)
+  **Two lookups, seen and lit (0.370.0).** `radiance` / `xyz` are nearest-texel, so evaluation
+  is the sampler's own piecewise-constant density: every place the env LIGHTS a surface (NEE, the
+  MIS'd miss, photon births, final-gather escapes) uses them, and MIS stays exact. `taps` →
+  `radianceAt` / `radianceSeen` / `xyzSeen` (device: `dEnvTaps` / `dEnvRadianceAt` /
+  `dEnvRadianceSeen`) are bilinear between texel centres, wrapping in longitude and clamping at
+  the poles, and blend the four texels' radiance rather than their coefficients. They are used
+  only where the env is SEEN: a miss on the weight-1 branch, i.e. a camera ray or a delta chain from
+  one. That is `specularArrival && !(gmis.pdf > 0)` in R/W, the camera walks of M and S (no env
+  NEE there), `Scene::envXYZForDir` (only the forward background pass and P's sky call it), and
+  mode C's first-flight catches (`bounce == 0` on the host, `PV_BIT_ENVFIRST` on the device). No
+  second strategy produces those paths -- the bidirectional modes refuse env scenes -- so a smooth
+  lookup there needs no sampler to agree with it. **Photon direction:** the sampler returns the
+  SKY direction; an env photon travels the opposite way (`dir = -sample()`) and is weighted by
+  `radiance(-dir)`. Before 0.370.0 it flew toward its texel, mirroring the environment's lighting
+  in every forward mode (known-issues FORWARD-ENV-MIRRORED).
 - **`medium_stack.h` / `phase.h` / `grin.h` / `rainbow.h` / `vdbgrid.*` / `vdb_openvdb.cpp`** —
   participating media (bounded, density fields, superposition), HG + water-droplet
   (rainbow) phase functions, gradient-index bending, NanoVDB (`.nvdb`) + native OpenVDB

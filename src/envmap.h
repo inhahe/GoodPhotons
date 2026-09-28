@@ -256,6 +256,47 @@ struct EnvMap {
     }
     Vec3 xyz(const Vec3& d) const { return xyzT[texelOf(d)]; }
 
+    // ---- the env AS SEEN: bilinear between texel centres (0.370.0) -------------
+    // Everything above is nearest-texel, and must stay so wherever the env LIGHTS something:
+    // evaluation then equals the piecewise-constant sampler's own density, so pdf(d) and
+    // sample() agree and MIS stays unbiased. Where the env is only LOOKED AT -- a camera ray,
+    // or a delta chain from one (a mirror, a clear pane), that escapes -- no second strategy
+    // produces the same path: the MIS weight there is exactly 1 in every tracer, and the
+    // bidirectional modes refuse env scenes outright. So that lookup is free to be smooth.
+    // Nearest there showed each texel as a flat block once it spanned more than a pixel, and a
+    // soft window edge read as a staircase of bands (known-issues ENV-BACKDROP-TEXELS).
+    // It blends RADIANCE -- four texels' spectra -- not the fitted coefficients: each texel has
+    // its own scale, and a blend of sigmoid coefficients is not the blend of the spectra.
+    struct Taps { size_t i[4]; double w[4]; };
+    Taps taps(const Vec3& d) const {
+        double u, v; dirToUV(d, u, v);
+        const double x = u * w - 0.5, y = v * h - 0.5;           // texel centres sit at +0.5
+        const int x0 = (int)std::floor(x), y0 = (int)std::floor(y);
+        const double fx = x - x0, fy = y - y0;
+        const int xa = ((x0 % w) + w) % w, xb = (xa + 1) % w;          // wraps in longitude
+        const int ya = std::clamp(y0, 0, h - 1), yb = std::clamp(y0 + 1, 0, h - 1);   // clamps at the poles
+        Taps t;
+        t.i[0] = (size_t)ya * w + xa; t.w[0] = (1.0 - fx) * (1.0 - fy);
+        t.i[1] = (size_t)ya * w + xb; t.w[1] = fx * (1.0 - fy);
+        t.i[2] = (size_t)yb * w + xa; t.w[2] = (1.0 - fx) * fy;
+        t.i[3] = (size_t)yb * w + xb; t.w[3] = fx * fy;
+        return t;
+    }
+    // One direction, many wavelengths (the hero loops): take the taps once, evaluate per lambda.
+    double radianceAt(const Taps& t, double lambda) const {
+        double s = 0.0;
+        for (int k = 0; k < 4; ++k)
+            if (t.w[k] > 0.0) s += t.w[k] * scaleT[t.i[k]] * upsample::reflAt(coeff[t.i[k]], lambda);
+        return s * illumAt(lambda);
+    }
+    double radianceSeen(const Vec3& d, double lambda) const { return radianceAt(taps(d), lambda); }
+    Vec3 xyzSeen(const Vec3& d) const {
+        const Taps t = taps(d);
+        Vec3 s{0, 0, 0};
+        for (int k = 0; k < 4; ++k) s += xyzT[t.i[k]] * t.w[k];
+        return s;
+    }
+
     double avgSpd(double lambda) const {
         return avgScale * upsample::reflAt(avgCoeff, lambda) * illumAt(lambda);
     }

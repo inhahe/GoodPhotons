@@ -23891,7 +23891,10 @@ static int run(int argc, char** argv) {
                 mf = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
                                    /*forwardCatch*/mode == 'C', /*lensMode*/mode == 'A',
                                    /*useCamera*/true, e, diffraction, /*useGpu*/meterGpu);
-                addEnvBackground(mf, scene, mc.cam, meterN);
+                // Mode C's film already holds the sky: its env photons thread the pupil and are
+                // caught. The render gates this pass on !forwardCatch; the meter did not, and so
+                // metered C's sky twice (0.370.0).
+                if (mode != 'C') addEnvBackground(mf, scene, mc.cam, meterN);
                 filmToRgb8(mf, (double)meterN, 1.0, false, nullptr, &eAuto);
                 break;
             }

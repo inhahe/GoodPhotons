@@ -2406,11 +2406,14 @@ struct BackwardRenderer {
             }
 
             if (!h.valid) {
-                if (scene.envIndex >= 0) {
+                if (scene.envIndex >= 0 && specularArrival && !(gmis.pdf > 0.0)) {
+                    // Delta chain (the camera ray itself, or through mirrors / clear glass):
+                    // nothing connected for it, weight 1 -- so this is the env as SEEN, and
+                    // takes the bilinear lookup (Scene::envRadianceSeen, 0.370.0).
+                    L += thr * scene.envRadianceSeen(ray.d, lambda) * invPdfLambda;
+                } else if (scene.envIndex >= 0) {
                     double Lenv = scene.envRadiance(ray.d, lambda) * invPdfLambda;
-                    if (specularArrival && !(gmis.pdf > 0.0)) {
-                        L += thr * Lenv;               // delta chain: nothing connected for it
-                    } else if (gmis.pdf > 0.0) {
+                    if (gmis.pdf > 0.0) {
                         // GLOSSY-NEE: the lobe-sampling half of the env weight. The connection
                         // above used `pdfW / (pdfW + pdfLobe)`; this is its complement, and both
                         // are gated on the SAME `gmis.pdf > 0` so a case cannot appear in one
@@ -2687,8 +2690,15 @@ struct BackwardRenderer {
             if (!h.valid) {              // env-miss (full weight on specular arrival, else MIS)
                 if (scene.envIndex >= 0) {
                     if (specularArrival && !(gmis.pdf > 0.0)) {
-                        for (int i = 0; i < nUp; ++i)
-                            L[i] += thr[i] * scene.envRadiance(ray.d, lam[i]) * invPdf[i];
+                        // the env as SEEN (weight 1): bilinear, taps taken once for all lambdas
+                        if (scene.envMap) {
+                            const EnvMap::Taps tp = scene.envMap->taps(ray.d);
+                            for (int i = 0; i < nUp; ++i)
+                                L[i] += thr[i] * scene.envMap->radianceAt(tp, lam[i]) * invPdf[i];
+                        } else {
+                            for (int i = 0; i < nUp; ++i)
+                                L[i] += thr[i] * scene.envRadiance(ray.d, lam[i]) * invPdf[i];
+                        }
                     } else if (gmis.pdf > 0.0) {       // GLOSSY-NEE — see the scalar twin
                         const double pdfEnv = scene.envPdfDir(ray.d);
                         const double sum = gmis.pdf + pdfEnv;

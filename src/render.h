@@ -2715,7 +2715,12 @@ struct Renderer {
             // L(dir,lambda)/(4pi*envPdfW*avgSpd(lambda)) — which is 1 in the constant
             // case, keeping constant-env scenes bit-identical.
             if (scene.envMap) {
-                dir = scene.envMap->sample(u1, u2, envPdfW);
+                // The sampler draws the SKY direction the light comes FROM; the photon travels
+                // the other way. Until 0.370.0 it flew TOWARD the texel it was drawn from, so
+                // every forward mode (and M's / S's photon passes) lit the scene with the
+                // environment point-mirrored -- a map bright toward +x lit a sphere's -x side --
+                // while the backdrop, a camera-ray lookup, showed it the right way round.
+                dir = -scene.envMap->sample(u1, u2, envPdfW);
             } else {
                 double z = 1.0 - 2.0 * u1;
                 double sr = std::sqrt(std::max(0.0, 1.0 - z * z));
@@ -2775,7 +2780,7 @@ struct Renderer {
         // for a constant env, so those scenes stay bit-identical.)
         if (em.shape == EmitterShape::Env && scene.envMap) {
             double denom = 4.0 * PI * envPdfW * em.spdFn(lambda);
-            beta = (denom > 0.0) ? beta * (scene.envMap->radiance(dir, lambda) / denom) : 0.0;
+            beta = (denom > 0.0) ? beta * (scene.envMap->radiance(-dir, lambda) / denom) : 0.0;   // -dir: the sky it came from
         }
         // An emission pattern is a pure post-multiplier on the photon's carried power:
         // the emitter is still SELECTED by its unpatterned power and the point still
@@ -3078,8 +3083,21 @@ struct Renderer {
                     // and both now match B's radiance*camEq in absolute EV.
                     const Camera& cc = *cams[0].cam;
                     double cCell = 1.0 / (cc.pixelPlaneArea() * cc.filmDist * cc.filmDist);
-                    cams[0].film->add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (beta * cCell));
-                    e.sensor += beta;
+                    // An env photon caught on its FIRST flight is the environment SEEN, so it
+                    // carries the bilinear lookup every other mode's camera ray now shows
+                    // (EnvMap::radianceSeen, 0.370.0) instead of the nearest texel its birth
+                    // weight took from the sampler. Unbiased wherever the sampler can land; a
+                    // zero-luminance texel is never drawn, so the ramp INTO one from a lit
+                    // neighbour is missing -- an edge that is dark either way.
+                    double seen = 1.0;
+                    if (bounce == 0 && srcEmIdx >= 0 && scene.envMap &&
+                        scene.emitters[srcEmIdx].shape == EmitterShape::Env) {
+                        const Vec3 sky = -ray.d;
+                        const double Ln = scene.envMap->radiance(sky, lambda);
+                        seen = (Ln > 0.0) ? scene.envMap->radianceSeen(sky, lambda) / Ln : 0.0;
+                    }
+                    cams[0].film->add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (beta * seen * cCell));
+                    e.sensor += beta * seen;
                     return;
                 }
             }
@@ -3612,7 +3630,12 @@ struct Renderer {
             spotW = spotFalloff(ct, em.spotCosInner, em.spotCosOuter) * omegaOuter / em.spotOmega;
         } else if (em.shape == EmitterShape::Env) {
             if (scene.envMap) {
-                dir = scene.envMap->sample(u1, u2, envPdfW);
+                // The sampler draws the SKY direction the light comes FROM; the photon travels
+                // the other way. Until 0.370.0 it flew TOWARD the texel it was drawn from, so
+                // every forward mode (and M's / S's photon passes) lit the scene with the
+                // environment point-mirrored -- a map bright toward +x lit a sphere's -x side --
+                // while the backdrop, a camera-ray lookup, showed it the right way round.
+                dir = -scene.envMap->sample(u1, u2, envPdfW);
             } else {
                 double z = 1.0 - 2.0 * u1;
                 double sr = std::sqrt(std::max(0.0, 1.0 - z * z));
@@ -3656,7 +3679,7 @@ struct Renderer {
         if (em.shape == EmitterShape::Env && scene.envMap) {
             for (int i = 0; i < C; ++i) {
                 double denom = 4.0 * PI * envPdfW * em.spdFn(lam[i]);
-                beta[i] = (denom > 0.0) ? beta[i] * (scene.envMap->radiance(dir, lam[i]) / denom) : 0.0;
+                beta[i] = (denom > 0.0) ? beta[i] * (scene.envMap->radiance(-dir, lam[i]) / denom) : 0.0;   // -dir: the sky
             }
         }
         // Achromatic post-multiplier — see the scalar tracer above for why this changes
@@ -3680,7 +3703,8 @@ struct Renderer {
         Ray ray{origin + dir * 1e-6, dir};
         MediumStack stk;                 // dielectric priority (Beer-Lambert uses hero λ)
         tracePhotonHeroLoop(scene, cams, nCam, sensorFilm, ray, stk, lam, beta,
-                            secAlive, /*bounce0=*/0, rng, e);
+                            secAlive, /*bounce0=*/0, rng, e, false, false,
+                            /*envBorn=*/em.shape == EmitterShape::Env && scene.envMap != nullptr);
     }
 
     // Bounce loop for a hero bundle that is already sitting at (`ray`, `stk`) with
@@ -3700,7 +3724,8 @@ struct Renderer {
                              Film* sensorFilm, Ray ray, MediumStack stk,
                              const double* lamIn, const double* betaIn, bool secAlive,
                              int bounce0, Pcg32& rng, EnergyReport& e,
-                             bool sawFocus = false, bool sawScatter = false) const {
+                             bool sawFocus = false, bool sawScatter = false,
+                             bool envBorn = false) const {   // envBorn: mode C's direct env catch
         const int C = heroC;
         double lam[hero::kHeroMax], beta[hero::kHeroMax];
         // Copy only the LIVE entries: a monochromatic sub-path spawned by -herosplit only
@@ -3724,10 +3749,22 @@ struct Renderer {
                 if (cams[0].cam->catchPhoton(ray, dEvent, px, py)) {
                     const Camera& cc = *cams[0].cam;
                     double cCell = 1.0 / (cc.pixelPlaneArea() * cc.filmDist * cc.filmDist);
-                    for (int i = 0; i < nUp; ++i)
+                    // first flight of an env photon: the env SEEN, bilinear (scalar twin above)
+                    const bool envSeen = (bounce == 0 && envBorn);
+                    EnvMap::Taps tp{};
+                    if (envSeen) tp = scene.envMap->taps(-ray.d);
+                    double sensorAdd = 0.0;
+                    for (int i = 0; i < nUp; ++i) {
+                        double seen = 1.0;
+                        if (envSeen) {
+                            const double Ln = scene.envMap->radiance(-ray.d, lam[i]);
+                            seen = (Ln > 0.0) ? scene.envMap->radianceAt(tp, lam[i]) / Ln : 0.0;
+                        }
                         cams[0].film->add(px, py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i]))
-                                                  * (beta[i] * cCell));
-                    e.sensor += activeSum();
+                                                  * (beta[i] * seen * cCell));
+                        sensorAdd += beta[i] * seen;
+                    }
+                    e.sensor += envSeen ? sensorAdd : activeSum();
                     return;
                 }
             }

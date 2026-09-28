@@ -8220,6 +8220,42 @@ __device__ static double dEnvRadiance(const DEnvMap& e, const DVec3& d, Real lam
     return refl * (double)specLookup(e.illum, lambda);
 }
 
+// The env AS SEEN (mirrors EnvMap::taps / radianceAt, 0.370.0): bilinear between texel
+// centres, wrapping in longitude and clamping at the poles. Only on the weight-1 branch of a
+// miss -- a camera ray, or a delta chain from one -- where no sampler has to agree with it;
+// everything that LIGHTS keeps dEnvRadiance's nearest texel. Blends the four texels'
+// radiance, not their coefficients (each texel has its own scale). Image env only.
+struct DEnvTaps { int i[4]; double w[4]; };
+__device__ static DEnvTaps dEnvTaps(const DEnvMap& e, const DVec3& d) {
+    const double PI = 3.14159265358979323846;
+    double y = fmin(fmax((double)d.y, -1.0), 1.0);
+    double theta = acos(y);
+    double phi = atan2((double)d.z, (double)d.x);
+    double v = theta / PI;
+    double u = phi / (2.0 * PI) + 0.5 - e.rot;
+    u -= floor(u);
+    const double x = u * e.w - 0.5, yy = v * e.h - 0.5;   // texel centres sit at +0.5
+    const int x0 = (int)floor(x), y0 = (int)floor(yy);
+    const double fx = x - x0, fy = yy - y0;
+    const int xa = ((x0 % e.w) + e.w) % e.w, xb = (xa + 1) % e.w;
+    const int ya = min(max(y0, 0), e.h - 1), yb = min(max(y0 + 1, 0), e.h - 1);
+    DEnvTaps t;
+    t.i[0] = ya * e.w + xa; t.w[0] = (1.0 - fx) * (1.0 - fy);
+    t.i[1] = ya * e.w + xb; t.w[1] = fx * (1.0 - fy);
+    t.i[2] = yb * e.w + xa; t.w[2] = (1.0 - fx) * fy;
+    t.i[3] = yb * e.w + xb; t.w[3] = fx * fy;
+    return t;
+}
+__device__ static double dEnvRadianceAt(const DEnvMap& e, const DEnvTaps& t, Real lambda) {
+    double s = 0.0;
+    for (int k = 0; k < 4; ++k)
+        if (t.w[k] > 0.0) s += t.w[k] * (double)dReflAt(&e.coeff[3 * t.i[k]], lambda) * e.scale[t.i[k]];
+    return s * (double)specLookup(e.illum, lambda);
+}
+__device__ static double dEnvRadianceSeen(const DEnvMap& e, const DVec3& d, Real lambda) {
+    return dEnvRadianceAt(e, dEnvTaps(e, d), lambda);
+}
+
 // Solid-angle pdf of the env importance sampler for a direction (mirrors EnvMap::pdf /
 // Distribution2D::pdf): condFunc[iv*w+iu]/margFuncInt divided by the lat-long Jacobian
 // 2*PI^2*sin(theta). Image env only.
@@ -8545,6 +8581,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         // case reweights beta below by L(dir,lambda)/(4pi*envPdfW*avgSpd(lambda)).
         if (sc.env.scale != nullptr) {
             dEnvSample(sc.env, (double)u1, (double)u2, dir, envPdfW);
+            dir = -dir;   // travel AWAY from the sampled sky direction (0.370.0; host render.h)
             envImage = true;
         } else {
             double z = 1.0 - 2.0 * (double)u1;
@@ -8605,7 +8642,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     // from `dir`, = L(dir,lambda)/(4pi*envPdfW*avgSpd(lambda)). The shared
     // illuminant in L and avgSpd cancels, leaving the per-texel JH ratio.
     if (envImage) {
-        int ti = dEnvTexel(sc.env, dir);
+        int ti = dEnvTexel(sc.env, -dir);   // the sky it came from (dir is the travel direction)
         double rad = sc.env.scale[ti] * (double)dReflAt(&sc.env.coeff[3 * ti], lambda);
         double avg = sc.env.avgScale * (double)dReflAt(sc.env.avgCoeff, lambda);
         double denom = 4.0 * 3.14159265358979323846 * envPdfW * avg;
@@ -8827,6 +8864,11 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
 // differently and disagree on the image.
 #define PV_BIT_FOCUS   1
 #define PV_BIT_SCATTER 2
+// Not a caustic bit (dPathIsCaustic reads only the two above): an ENV photon on its first
+// flight. Mode C's aperture catch weights such a photon from the nearest texel its birth
+// took to the bilinear env every camera ray now sees (0.370.0; host render.h checks
+// `bounce == 0` directly). Set at birth, cleared by the first shadeStep that does not catch it.
+#define PV_BIT_ENVFIRST 4
 // The per-path caustic state, carried from emission to the deposit. `bits` is the pair above;
 // `w` is the balance-heuristic MIS weight the aimed caustic pass gives this photon at BIRTH
 // (causticaim.h; host twin Renderer::causticW), which scales the caustic deposit and nothing
@@ -8981,10 +9023,17 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
             // on the SAME absolute scale as A/B (per-camera constant; auto-exposed
             // scenes unaffected).
             Real cCell = (Real)1 / (Real)(cs.cams[0].pixelPlaneArea() * cs.cams[0].filmDist * cs.cams[0].filmDist);
-            filmAdd(cs.films[0], cs.hits[0], cs.cams[0].resX, px, py, lambda, beta * cCell);
-            eSensor += beta; return WF_TERMINATE;
+            // an env photon's first flight is the env SEEN: bilinear (PV_BIT_ENVFIRST)
+            Real seen = (Real)1;
+            if (pathC && (pathC->bits & PV_BIT_ENVFIRST)) {
+                const double Ln = dEnvRadiance(sc.env, -rd, lambda);
+                seen = (Ln > 0.0) ? (Real)(dEnvRadianceSeen(sc.env, -rd, lambda) / Ln) : (Real)0;
+            }
+            filmAdd(cs.films[0], cs.hits[0], cs.cams[0].resX, px, py, lambda, beta * seen * cCell);
+            eSensor += beta * seen; return WF_TERMINATE;
         }
     }
+    if (pathC) pathC->bits &= ~PV_BIT_ENVFIRST;   // past its first flight
 
     // Beer-Lambert attenuation over the free path just travelled inside a dielectric
     // (colored/attenuating glass), applied before the event is processed (matches the
@@ -9304,8 +9353,9 @@ __device__ static void camSpecularSplatAllHero(const DScene& sc, const DCamSet& 
 // byte-identical to genPhoton (λ-independent); only the wavelength/throughput bundle differs.
 __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int camMode, int C,
         DRng& rng, DVec3& ro, DVec3& rd, Real* lam, Real* beta, bool& secAlive, double& eEmitted,
-        Real* causticW = nullptr) {
+        Real* causticW = nullptr, int* emOut = nullptr) {
     if (causticW) *causticW = (Real)1;
+    if (emOut) *emOut = -1;
     // A scene with no emitters arrives here with sc.emitters == nullptr (the host uploads a
     // null pointer for an empty emitter list), so the indexing below would fault the device.
     // genPhoton has the equivalent prologue (grandTotal <= 0) and dGenLightSubpath the
@@ -9314,6 +9364,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
     // draws no randomness, so every scene that does have emitters stays bit-identical.
     if (sc.nEmitters <= 0 || sc.totalPower <= 0.0) return false;
     int ei = (sc.nEmitters > 1) ? selectEmitter(sc, (double)rng.uniform()) : 0;
+    if (emOut) *emOut = ei;
     const DEmitter em = sc.emitters[ei];
     Real u1 = rng.uniform(), u2 = rng.uniform();
     DVec3 origin, emitN, dir;
@@ -9333,6 +9384,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
     } else if (em.shape == 3) {
         if (sc.env.scale != nullptr) {
             dEnvSample(sc.env, (double)u1, (double)u2, dir, envPdfW);
+            dir = -dir;   // travel AWAY from the sampled sky direction (0.370.0; host render.h)
             envImage = true;
         } else {
             double z = 1.0 - 2.0 * (double)u1;
@@ -9382,7 +9434,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
     base *= spotW;
     for (int i = 0; i < C; ++i) beta[i] = base / (Real)C;
     if (envImage) {
-        int ti = dEnvTexel(sc.env, dir);
+        int ti = dEnvTexel(sc.env, -dir);   // the sky it came from (dir is the travel direction)
         for (int i = 0; i < C; ++i) {
             double rad = sc.env.scale[ti] * (double)dReflAt(&sc.env.coeff[3 * ti], lam[i]);
             double avg = sc.env.avgScale * (double)dReflAt(sc.env.avgCoeff, lam[i]);
@@ -9430,13 +9482,22 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         int px, py;
         if (cs.cams[0].catchPhoton(ro, rd, dEvent, px, py)) {
             Real cCell = (Real)1 / (Real)(cs.cams[0].pixelPlaneArea() * cs.cams[0].filmDist * cs.cams[0].filmDist);
+            const bool envSeen = pathC && (pathC->bits & PV_BIT_ENVFIRST);   // the env SEEN: bilinear
+            DEnvTaps tp;
+            if (envSeen) tp = dEnvTaps(sc.env, -rd);
             for (int i = 0; i < nUp; ++i) {
-                filmAdd(cs.films[0], cs.hits[0], cs.cams[0].resX, px, py, lam[i], beta[i] * cCell);
-                eSensor += (double)beta[i];
+                Real seen = (Real)1;
+                if (envSeen) {
+                    const double Ln = dEnvRadiance(sc.env, -rd, lam[i]);
+                    seen = (Ln > 0.0) ? (Real)(dEnvRadianceAt(sc.env, tp, lam[i]) / Ln) : (Real)0;
+                }
+                filmAdd(cs.films[0], cs.hits[0], cs.cams[0].resX, px, py, lam[i], beta[i] * seen * cCell);
+                eSensor += (double)(beta[i] * seen);
             }
             return WF_TERMINATE;
         }
     }
+    if (pathC) pathC->bits &= ~PV_BIT_ENVFIRST;   // past its first flight
     // (No Beer-Lambert while secAlive: entering a dielectric de-heros, so the stack is empty
     // here and topMat() would be -1.)
     if (!h.valid) { for (int i = 0; i < nUp; ++i) eEscaped += (double)beta[i]; return WF_TERMINATE; }
@@ -9603,15 +9664,17 @@ __device__ static void traceHeroPhoton(const DScene& sc, const DCamSet& cs, int 
     // `causticW` rides on the path state below: the aimed caustic pass fixes it at birth and
     // it is spent at the ONE caustic deposit the path can make.
     Real bornCausticW = (Real)1;
+    int emH = -1;
     if (!genPhotonHero(sc, cs, camMode, C, rng, ro, rd, lam, beta, secAlive, eEmitted,
-                       &bornCausticW)) return;
+                       &bornCausticW, &emH)) return;
     DMediumStack stk; stk.clear();
     bool done = false;
     // Caustic classification of the path so far (host twin: sawFocus/sawScatter in
     // Renderer::tracePhotonHero). It survives the de-hero handoff below because the two step
     // functions share it — a bundle that de-heros at a gem must carry that FOCUS onward, or
     // every dispersive caustic would be filed as ordinary indirect light.
-    DPathCaustic pathC{0, bornCausticW};
+    DPathCaustic pathC{(emH >= 0 && emH == sc.envIndex && sc.env.scale != nullptr) ? PV_BIT_ENVFIRST : 0,
+                       bornCausticW};
     for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
         if (sc.hasGrin) dGrinMarch(sc, ro, rd);   // gate excludes GRIN; kept for symmetry
         DHit h = closestHit(sc, ro, rd);
@@ -9692,7 +9755,8 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
         int nSurf = 0;      // surface interactions so far (chord provenance for -sunnee)
         // Caustic state of the path so far — see dPhotonVertexBit / dPathIsCaustic, plus the
         // aimed pass's MIS weight fixed at birth (causticaim.h).
-        DPathCaustic pathC{0, bornCausticW};
+        DPathCaustic pathC{(srcEm >= 0 && srcEm == sc.envIndex && sc.env.scale != nullptr) ? PV_BIT_ENVFIRST : 0,
+                           bornCausticW};
         for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
             // Bend through any GRIN region first, INTEGRATING THE MEDIA ALONG THE CURVE
             // (see dGrinMarch): every medium is transported analog on the curved span,
@@ -9781,13 +9845,15 @@ __device__ static bool wfSpawn(const DScene& sc, const DCamSet& cs,
         if (idx >= (unsigned long long)N) return false;
         DVec3 ro, rd; Real beta, lambda; double eEm = 0;
         Real bornCausticW = (Real)1;
-        if (genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEm, nullptr, &bornCausticW)) {
+        int emW = -1;
+        if (genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEm, nullptr, &bornCausticW, &emW)) {
             st.ro[slot] = ro; st.rd[slot] = rd;
             st.beta[slot] = beta; st.lambda[slot] = lambda;
             st.bounce[slot] = 0; st.alive[slot] = 1; st.stkN[slot] = 0;
             // Fresh photon: no vertex seen yet, so neither bit is set; the aimed pass's
             // weight is whatever emission just assigned it (1 without `-causticn`).
-            st.pathC[slot] = DPathCaustic{0, bornCausticW};
+            st.pathC[slot] = DPathCaustic{(emW >= 0 && emW == sc.envIndex && sc.env.scale != nullptr)
+                                              ? PV_BIT_ENVFIRST : 0, bornCausticW};
             atomicAdd(&energy[0], eEm);
             return true;
         }
@@ -11845,10 +11911,14 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             // env-NEE already done at the previous vertex, to avoid double-counting.
             if (sc.envIndex >= 0) {
                 const bool imageEnv = (sc.env.scale != nullptr);
-                double Lenv = (imageEnv ? dEnvRadiance(sc.env, rd, lambda)
+                // a delta chain (weight 1: nothing connected for it) sees the env; it takes the
+                // bilinear lookup. Every MIS'd arrival lights with the sampler's nearest texel.
+                const bool seen = specularArrival && !(gmis.pdf > 0.0);
+                double Lenv = (imageEnv ? (seen ? dEnvRadianceSeen(sc.env, rd, lambda)
+                                                : dEnvRadiance(sc.env, rd, lambda))
                                         : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda))
                               * invPdfLambda;
-                if (specularArrival && !(gmis.pdf > 0.0)) {
+                if (seen) {
                     L += thr * Lenv;                 // delta chain: nothing connected for it
                 } else if (gmis.pdf > 0.0) {
                     // GLOSSY-NEE: complement of the weight the connection above used. Gated on
@@ -12041,8 +12111,13 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     double pdfEnv = imageEnv ? dEnvPdf(sc.env, rd) : 1.0 / (4.0 * DPI);
                     wMis = (contBsdfPdf + pdfEnv > 0.0) ? contBsdfPdf / (contBsdfPdf + pdfEnv) : 0.0;
                 }
+                // wMis stayed 1 exactly on a delta chain: the env as SEEN, bilinear, taps once
+                const bool seen = imageEnv && !(gmis.pdf > 0.0) && specularArrival;
+                DEnvTaps tp;
+                if (seen) tp = dEnvTaps(sc.env, rd);
                 for (int i = 0; i < nUp; ++i) {
-                    double Lenv = (imageEnv ? dEnvRadiance(sc.env, rd, lam[i])
+                    double Lenv = (imageEnv ? (seen ? dEnvRadianceAt(sc.env, tp, lam[i])
+                                                    : dEnvRadiance(sc.env, rd, lam[i]))
                                             : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lam[i]))
                                   * invPdf[i];
                     L[i] += thr[i] * Lenv * wMis;
@@ -15010,8 +15085,9 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             // map already carries env's INDIRECT bounces (the deposit emits env photons);
             // this adds env's DIRECT contribution, monochromatic at the sampled lambda.
             if (sc.envIndex >= 0) {
+                // camera / specular escape, weight 1: the env as SEEN (bilinear), host photonGather
                 double envRad = (sc.env.scale != nullptr)
-                                    ? dEnvRadiance(sc.env, rd, lambda)
+                                    ? dEnvRadianceSeen(sc.env, rd, lambda)
                                     : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
                 double e = thr * envRad * invPdfL;
                 oX += (double)cieX(lambda) * e;
@@ -15460,8 +15536,9 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         }
         if (!h.valid) {                                  // escaped -> environment (direct)
             if (sc.envIndex >= 0) {
+                // camera / specular escape, weight 1: the env as SEEN (bilinear), host sppm_render.h
                 double envRad = (sc.env.scale != nullptr)
-                                    ? dEnvRadiance(sc.env, rd, lambda)
+                                    ? dEnvRadianceSeen(sc.env, rd, lambda)
                                     : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
                 double e = thr * envRad * invPdfL;
                 dX += (double)cieX(lambda) * e;

@@ -2769,6 +2769,18 @@ per-path carrier is left unqualified here.
 | `sun` | Distant directional sun (parallel beam over the whole scene, soft-edged disc) | `elevation` + `azimuth` (or `dir`), `angle`, `spd`, `intensity` |
 | `env` | Environment / IBL light | `file` (lat-long HDR) or `spd`, `rotate`, `intensity`, **or `sky`** (analytic sky, below) |
 
+**An image environment, seen and lit (0.370.0).** Where the environment is only *looked at*, it
+is filtered bilinearly between texel centres: the backdrop behind everything, and the sky in a
+mirror or through clear glass. So a low-resolution map under a narrow camera reads as a smooth sky
+rather than a staircase of flat texel blocks. Where it *lights* something it keeps the nearest
+texel, which is what the importance sampler draws from, so the lighting is unchanged (verified
+pixel-for-pixel on the lit surfaces). This holds in every mode, CPU and GPU. Mode C, whose sky is
+photons physically caught by the lens, weights its directly-caught env photons to match. Also
+fixed in 0.370.0: **the forward modes (A, B, C, and M's / S's photon passes) lit the scene with an
+image environment point-mirrored** -- a window on one side of the sky lit the scene from the other
+-- while showing the backdrop the right way round. Forward and backward modes now agree on which
+side an environment lights. Constant (uniform) environments were never affected.
+
 **Invisible fill flats — `hide_camera`.** A rectangular `area` light is real,
 opaque geometry (two triangles in the BVH), so it renders as a visible slab whenever
 it falls in frame. `hide_camera on` inside an `area` block turns off **primary
