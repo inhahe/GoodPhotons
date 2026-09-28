@@ -3358,9 +3358,23 @@ regenerates everything in about a minute (numpy, scipy, numba, Pillow; its geome
   part, and the part vanishes. Grow each side from its own scalp piece and its own guides —
   and only as far back as the part runs: split the back too and the halves open a parting all
   the way down.
-- **Lock definition needs few-guide blending.** Per-lock variation (a wave phase, an end curl,
-  a length) authored into the guides survives `guide_blend 1`–`2`; at `3`–`4` the
-  inverse-square blend averages it away and the coat reads as one felted curtain.
+- **Separate locks need lock-level guides and ONE-guide strands.** Per-lock variation (a wave
+  phase, an end curl, a length) survives `guide_blend 1`–`2`; at `3`–`4` the inverse-square
+  blend averages it away and the coat reads as one felted curtain. The tool's second version
+  goes further: guides are grouped into locks (10–17° sectors by where they leave the head)
+  that share their wave, length and curl exactly and gather toward their own centre line by
+  the tip, and each strand follows its ONE nearest guide (`guide_blend 1`). Any blend across
+  a lock boundary averages two locks into a strand that fills the gap, and any per-guide
+  jitter inside a lock shows as short crossing tufts.
+- **Waves read at twice their frequency.** An S-wave shows a highlight band on each slope, so
+  10–15 cm crests (at this 1.9 m model scale) read as crimping; the photos' two or three loose
+  bends down a lock needed 22–32 cm.
+- **Bare ears and a framed face at once.** Both profile photos show the ears bare. Sweeping
+  the side hair behind them (an order-preserving remap of its azimuth onto the band just behind
+  the ear, while level with it) is not enough on its own: from the front the face then looked
+  bald, because the tucked hair hugged the head. On the doll it stands well out to the side,
+  far enough to frame the face from the front and still clear the ear in profile, so the sides
+  keep all of the sculpt's volume and ease out fast.
 - **Calibrate a pale `reflect` against a reference under the scene's own light.** `reflect` is
   the colour the coat reads as under *uniform* light; under a window the white cuticle highlight
   and the deep scattering pull a pale coat toward neutral-green. Measured on fur balls in the

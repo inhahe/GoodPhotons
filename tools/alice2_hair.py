@@ -35,11 +35,24 @@ HOW (each step's numbers come from the model and were checked by rendering):
   * HANG PHASE, a 'curtain' in cylindrical coordinates about the body: the strand falls with its
     radius eased to R_in + (1 - lam) KAPPA (R_out - R_in) -- R_out the sculpt's silhouette at
     that height and azimuth, R_in the body and head -- its azimuth drifting with the sculpt's own
-    flow (the side hair goes behind the shoulders, its outer layer forward over them), then soft
-    waves and a curled end, each with a per-lock phase / amplitude / tightness.
+    flow (the side hair goes behind the shoulders, its outer layer forward over them). The sides
+    keep all of the sculpt's volume and ease out fast (the hair tucked behind the ears must stand
+    far enough out to frame the face from the front); the centre back eases out slowly and keeps
+    less level with the ears (a smooth crown from behind); below the shoulders the curtain gives up
+    60 % of the sculpt's flare (the photos' back narrows to shoulder width).
+  * THE EARS ARE BARE (both profile photos): a strand level with an ear is swept behind it --
+    from 4 cm above the ear to its lobe, released over 7 cm below -- an order-preserving remap of
+    its azimuth onto the 18 degrees behind the ear's back edge (a single line piled up into a ridge).
+    The head phase hands a strand over to the hang where it comes level with an ear.
+  * LOCKS: the guides are grouped by where they leave the head into 10-17 degree sectors; a lock's
+    guides share its S-wave (22-32 cm crest to crest: a wave shows two highlight bands, so shorter
+    ones read as crimping), its length, and its curl -- UNDER at the centre back, more often OUT at
+    the sides and for the face-framing front layer -- and gather 55 % toward the lock's own centre
+    line by the tip, so gaps open between locks. The centre back hangs 2.5 cm lower than the sides.
   * The groom is three `fur` blocks (front-right / front-left of the part, and the back), so no
-    strand near the part blends a guide from across it, each strand following its 2 nearest
-    guides. Per-lock variation needs few-guide blending: at 3-4 it averages the locks away.
+    strand near the part blends a guide from across it, each strand following its ONE nearest
+    guide (guide_blend 1): any blend across a lock boundary averages two locks into a strand that
+    fills the gap between them.
   * The fibre colour was calibrated against the photos: rendered fur relative to a white
     reference reads (1 : 0.82 : 0.43) at `reflect rgb 0.98 0.60 0.28`, the photos' hair against
     the apron (1 : 0.82 : 0.46). A paler reflect reads greenish: the white cuticle highlight and
@@ -76,12 +89,32 @@ AX = np.array([0.012, 0.0, 0.020])               # the body's vertical axis (x, 
 HEAD_C = np.array([0.012, 1.62, 0.02])           # centre the headband is seated from
 
 # ---- the style ------------------------------------------------------------------------------------
-CAP_HEAD = 0.025      # hair thickness over the scalp at the lower hairline (photos ~2-2.5 cm here)
-KAPPA = 0.80          # share of the sculpt's extra volume (beyond the body) the groom keeps
+CAP_HEAD = 0.038      # hair thickness over the scalp at the lower hairline (the photos' rounded dome, and
+                      # from behind a crown wide enough to flow into the side hair without a step)
+KAPPA = 0.80          # share of the sculpt's extra volume (beyond the body) the groom keeps at the nape
+KAPPA_SIDE = 1.0     # ... and at the sides, all of it: the hair tucked behind the ears must stand far enough
+                     # out to frame the face from the front (the photos: ~1.9x the face's half-width)
+TAPER = (1.56, 1.38, 0.60)   # ... and gives up on the way down: from y 1.56 to 1.38 the curtain loses 60%
+                      # of that extra volume. The sculpt flares past the shoulders; the photos' back narrows
+                      # to about shoulder width.
 CLEAR = 0.012         # clearance kept over the body and head
-WAVE_LEN = 0.16       # soft waves, crest to crest
-WAVE_AMP = 0.009
-NPTS = 32             # control points per guide
+LOCK_DEG = (10.0, 17.0)      # lock widths round the body (azimuth). A lock's guides share its waves, its
+                             # length and its curl, so the back reads as locks rather than one sheet.
+WAVE_LEN = (0.22, 0.32)      # S-waves, crest to crest -- per lock. Loose: a wave shows TWO highlight bands
+                             # (one per slope), so 10-15 cm crests read as crimping, and even 16-24 cm read
+                             # tighter than the photos' two or three bends down a lock
+WAVE_AMP = (0.011, 0.019)    # ... and their amplitude
+CONVERGE = 0.55       # how far a lock gathers toward its own centre line by its tip: gaps open between locks
+HEM_BACK = 0.025      # the centre back hangs this much lower than the sides (the photos' rounded hem)
+EAR_ABOVE, EAR_RELEASE, EAR_MARGIN, EAR_SPREAD = 0.04, 0.07, 5.0, 18.0
+                      # the hair passes BEHIND the ears (both profile photos show them bare): swept back
+                      # from 4 cm above an ear down to its lobe, released over 7 cm below it (so the
+                      # face-framing layer can still come forward under the jaw), spread over the 18
+                      # degrees starting 5 degrees behind the ear's back edge
+UPPER = (1.66, 1.54, 0.35)  # level with the ears the centre back keeps 65% of its extra volume, all of it
+                            # by the nape: from behind, the crown then flows into the curtain instead of
+                            # stepping out to it (at full volume the back stood 12 cm off the head there)
+NPTS = 44             # control points per guide (waves every ~12 cm and a curl need more than 32)
 HAIR_MAT = ('material "alice2_hair" { type hair  eta 1.55  alpha 0  reflect rgb 0.98 0.60 0.28  '
             'beta_m 0.11  beta_n 0.28 }')
 REGIONS = ("fr", "fl", "bk")
@@ -264,10 +297,19 @@ class Groom:
         d, i = _kd.query(V4, k=1)
         self.PHI4 = np.where(d < 0.05, sc.lam[i], 1.0)
         self._profiles()
-        rng = np.random.default_rng(11)
-        self.WAVE_PH = np.pi * self._smooth_rand(360, 6, rng)
-        self.CURL_K = self._smooth_rand(360, 5, rng)
-        self.CURL_T = self._smooth_rand(360, 8, rng)
+        # the ears: what the Taubin smoothing flattened (moved > 2.5 mm) near each ear centre, as
+        # (lowest y, highest y, front and back azimuth in degrees) keyed by side (sign of the azimuth).
+        # They are big at this 1.9 m scale -- ~9 cm tall, ~40 degrees round -- and not level: the
+        # head is tilted, her left ear sits 4 cm higher than her right.
+        disp = np.linalg.norm(V4 - X, axis=1)
+        self.ears = {}
+        for e in EARS:
+            m = (np.linalg.norm(V4 - e, axis=1) < 0.05) & (disp > 0.0025)
+            _, pe, ye = cyl(V4[m])
+            self.ears[1 if pe.mean() >= 0 else -1] = (ye.min(), ye.max(),
+                                                      np.degrees(np.abs(pe)).min(), np.degrees(np.abs(pe)).max())
+        log("ears: " + "; ".join("%s y %.3f..%.3f az %.0f..%.0f" % ("her left" if s > 0 else "her right", *v)
+                                 for s, v in sorted(self.ears.items())))
 
     @staticmethod
     def prior(P, N):
@@ -312,10 +354,23 @@ class Groom:
         Gp = gaussian_filter(np.concatenate([G[:, -n // 2:], G, G[:, :n // 2]], 1), (sy, sp_), mode="nearest")
         return Gp[:, n // 2:n // 2 + n]
 
+    @staticmethod
+    def _fill_rows(G):
+        """Rows with no data at all (below the sculpt's hem, above its crown) take the nearest row that
+        has some: a strand that hangs a little past the sculpt keeps the curtain it was on instead of
+        collapsing onto the body in one step."""
+        G = G.copy()
+        ok = np.nonzero(np.isfinite(G).any(1))[0]
+        if len(ok) == 0: return G
+        for j in range(G.shape[0]):
+            if not np.isfinite(G[j]).any():
+                G[j] = G[ok[np.argmin(np.abs(ok - j))]]
+        return G
+
     def _profiles(self):
         sc = self.sc
         r_, p_, y_ = cyl(sc.cO)
-        self.Rout = self._smooth_circ(self._fill_circ(self._grid_max(r_, p_, y_)), 2.0, 2.0)
+        self.Rout = self._smooth_circ(self._fill_rows(self._fill_circ(self._grid_max(r_, p_, y_))), 2.0, 2.0)
         rb, pb, yb = cyl(np.concatenate([sc.body[0][0], sc.body[1][0]]))
         rh, ph, yh = cyl(sc.V4)
         Rin = np.fmax(self._grid_max(rb, pb, yb), self._grid_max(rh, ph, yh))
@@ -354,31 +409,66 @@ class Groom:
         k0 = int(np.floor(f)) % len(tab); k1 = (k0 + 1) % len(tab); b = f - np.floor(f)
         return (1 - b) * tab[k0] + b * tab[k1]
 
-    @staticmethod
-    def _smooth_rand(n, corr, rng):
-        x = gaussian_filter(np.tile(rng.normal(size=n), 3), corr)[n:2 * n]
-        return x / max(1e-9, x.std())
+    # ---- the ears: the hair passes behind them
+    def ear_weight(self, ph, y):
+        """How strongly a point at (azimuth ph, height y) is held behind the ear on its side: 1 level
+        with the ear, ramping in over EAR_ABOVE above it and out over EAR_RELEASE below its lobe. 0 for
+        anything already behind the ear or well forward of it (the face)."""
+        ear = self.ears.get(1 if ph >= 0 else -1)
+        if ear is None: return 0.0, ph
+        ylo, yhi, alo, ahi = ear
+        back = np.radians(ahi + EAR_MARGIN)
+        if abs(ph) >= back or abs(ph) < np.radians(40): return 0.0, back
+        return float(smoothstep(yhi + EAR_ABOVE, yhi, y) * smoothstep(ylo - EAR_RELEASE, ylo, y)), back
 
-    # ---- one strand's fall from the head
-    def hang(self, xh, lamv, rng, dy=0.003, blend=0.07):
+    def ear_push(self, ph, y):
+        """Order-preserving: azimuths from 40 degrees to EAR_SPREAD past the ear's back edge are remapped
+        onto just that band behind the ear, so the hair tucked behind it spreads over 25 degrees instead
+        of piling onto one line (from behind, that line read as a ridge across her back)."""
+        ear = self.ears.get(1 if ph >= 0 else -1)
+        if ear is None: return ph
+        ylo, yhi, alo, ahi = ear
+        a = abs(ph)
+        back = np.radians(ahi + EAR_MARGIN); b2 = back + np.radians(EAR_SPREAD); a0 = np.radians(40)
+        if a >= b2 or a < a0: return ph
+        w = float(smoothstep(yhi + EAR_ABOVE, yhi, y) * smoothstep(ylo - EAR_RELEASE, ylo, y))
+        if w <= 0: return ph
+        f = back + (a - a0) / (b2 - a0) * (b2 - back)
+        return np.sign(ph) * (a + w * (f - a))
+
+    def in_ear_zone(self, P):
+        """For clipping the head phase: the first point that comes level with an ear in front of its
+        back edge hands the strand over to the hang, which takes it round behind."""
+        _, pp, yy = cyl(P)
+        return np.array([self.ear_weight(a, b)[0] > 0 for a, b in zip(pp, yy)])
+
+    # ---- one strand's fall from the head, before its lock's waves and curl
+    def hang_base(self, xh, lamv, lk, dy=0.003, blend=(0.10, 0.16)):
         r0, p0, y0 = [v[0] for v in cyl(xh)]
         ph, y = p0, y0
         # the side hair must not drape over the shoulder top: its outer layer comes FORWARD in front
-        # of the shoulder (the photos' face-framing locks), the rest slides BACK behind it; both turn
-        # 6-22 cm below the hand-over, under the jaw
+        # of the shoulder (the photos' face-framing locks), the rest slides BACK behind it (136 degrees:
+        # at 128 it still rode the shoulder, and from behind the hair flared past her arms); both turn
+        # 6-22 cm below the hand-over, under the jaw -- and while level with an ear, all of it is held
+        # behind the ear (ear_push, applied on top so the turn's own state is not disturbed)
         dg = abs(np.degrees(p0))
         turn = np.clip(1 - abs(dg - 100) / 28, 0, 1)
         front = turn * np.clip((0.28 - lamv) / 0.15, 0, 1)
-        target = front * np.sign(p0) * np.radians(55) + (1 - front) * np.sign(p0) * np.radians(max(dg, 128))
-        ck = self._circ(self.CURL_K, p0)
-        roll_out = (ck > 0.35) or (front > 0.5 and ck > -0.2) or (rng.random() < 0.18)
-        lock_ph = rng.normal(0, 0.9); lock_amp = rng.uniform(0.6, 1.4); lock_curl = rng.uniform(0.75, 1.3)
-        rho = (0.030 + 0.012 * self._circ(self.CURL_T, p0)) * rng.uniform(0.8, 1.2)
-        th_max = ((2.2 + 1.0 * abs(ck)) + 2.2 * front) * lock_curl
-        L_c = rho * th_max
+        target = front * np.sign(p0) * np.radians(55) + (1 - front) * np.sign(p0) * np.radians(max(dg, 136))
+        out = lk["out_front"] if front > 0.5 else lk["out"]
+        # the SIDES flare out behind the ears fast -- from the front the photos' face is framed by
+        # hair that is tucked behind the ears but stands well out to the side -- while the centre
+        # back eases out slowly and keeps less volume level with the ears (a smooth crown from behind)
+        sidew = 1.0 - smoothstep(140, 165, dg)
+        bl = blend[0] * sidew + blend[1] * (1 - sidew)
+        # the turn starts no higher than the lobe of the ear on this side: above it the hair is held
+        # behind the ear, and a turn already done by then would snap forward in one step on release
+        ear = self.ears.get(1 if p0 >= 0 else -1)
+        y_turn = min(y0 - 0.06, ear[0]) if ear is not None else y0 - 0.06
         yend = self._circ(self.yend, p0)
-        y_stop = yend + rng.uniform(-0.025, 0.035) + 0.03 * lamv + rho * (1.0 if not roll_out else 0.6)
-        pts = [xh.copy()]; ss = [0.0]
+        y_stop = (yend + lk["dL"] - HEM_BACK * smoothstep(115, 170, dg) + 0.03 * lamv
+                  + lk["rho"] * (0.6 if out else 1.0))
+        pts = [xh.copy()]
         k = 0
         while y > y_stop and k < 500:
             k += 1
@@ -386,30 +476,58 @@ class Groom:
             dd = np.clip((y0 - y) / 0.04, 0, 1)
             ph += 0.5 * (1 - turn) * self._lookup(self.DRIFT, y, ph) * dy * dd
             if turn > 0:
-                a = smoothstep(0, 1, (y0 - y - 0.06) / 0.16)
+                a = smoothstep(0, 1, (y_turn - y) / 0.13)
                 ph = (1 - turn) * ph + turn * ((1 - a) * p0 + a * target)
-            rin = self._lookup(self.Rin, y, ph); rout = self._lookup(self.Rout, y, ph)
-            rt = rin + (1 - lamv) * KAPPA * max(0.004, rout - rin)
-            a = smoothstep(0, 1, (y0 - y) / blend)
+            phe = self.ear_push(ph, y)
+            rin = self._lookup(self.Rin, y, phe); rout = self._lookup(self.Rout, y, phe)
+            if not np.isfinite(rout): rout = rin                     # below the sculpt's hem
+            kap = ((KAPPA_SIDE * sidew + KAPPA * (1 - sidew)) * (1 - TAPER[2] * smoothstep(TAPER[0], TAPER[1], y))
+                   * (1 - UPPER[2] * (1 - sidew) * (1 - smoothstep(UPPER[0], UPPER[1], y))))
+            rt = rin + (1 - lamv) * kap * max(0.004, rout - rin)
+            a = smoothstep(0, 1, (y0 - y) / bl)
             r = max((1 - a) * r0 + a * rt, rin)
-            P = np.array([AX[0] + r * np.sin(ph), y, AX[2] + r * np.cos(ph)])
-            ss.append(ss[-1] + np.linalg.norm(P - pts[-1])); pts.append(P)
-        pts = np.array(pts); ss = np.array(ss)
-        if len(pts) > 3:                                   # soft waves, ramping in below the head
-            rr, pp, _ = cyl(pts)
+            pts.append(np.array([AX[0] + r * np.sin(phe), y, AX[2] + r * np.cos(phe)]))
+        return np.array(pts), out, front
+
+    def finish(self, base, centre, lk, out, front, rng):
+        """A lock's shape on one of its guides: gather toward the lock's centre line (azimuth as a
+        function of height) by the tip, the lock's S-waves, then its curl."""
+        pts = base
+        if len(pts) > 3:
+            rr, pp, yy = cyl(pts)
+            frac = np.clip((yy[0] - yy) / max(1e-6, yy[0] - yy[-1]), 0, 1)
+            c = CONVERGE * smoothstep(0.2, 1.0, frac)
+            tgt = centre(yy)
+            ok = np.isfinite(tgt)
+            dphi = np.where(ok, np.angle(np.exp(1j * (np.where(ok, tgt, 0) - pp))), 0)
+            pp = pp + c * dphi
+            pp = np.array([self.ear_push(a, b) for a, b in zip(pp, yy)])
+            pts = np.stack([AX[0] + rr * np.sin(pp), yy, AX[2] + rr * np.cos(pp)], 1)
+            ss = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))])
             er = np.stack([np.sin(pp), np.zeros_like(pp), np.cos(pp)], 1)
             ephi = np.stack([np.cos(pp), np.zeros_like(pp), -np.sin(pp)], 1)
-            amp = lock_amp * WAVE_AMP * np.clip(ss / 0.10, 0, 1)
-            w = 2 * np.pi * ss / WAVE_LEN + self._circ(self.WAVE_PH, p0) + lock_ph
-            pts = pts + (amp * np.sin(w))[:, None] * ephi + (0.6 * amp * np.cos(w))[:, None] * er
+            # exactly the lock's wave (no per-guide jitter): a strand follows ONE guide, so neighbouring
+            # guides that differ show as cell boundaries -- short crossing tufts, a crimped look
+            amp = lk["amp"] * np.clip(ss / 0.10, 0, 1)
+            w = 2 * np.pi * ss / lk["wlen"] + lk["wph"]
+            pts = pts + (amp * np.sin(w))[:, None] * ephi + (0.45 * amp * np.cos(w))[:, None] * er
             rr, pp, yy = cyl(pts)
+            pp = np.array([self.ear_push(a, b) for a, b in zip(pp, yy)])
             rr = np.maximum(rr, [self._lookup(self.Rin, a_, b_) for a_, b_ in zip(yy, pp)])
             pts = np.stack([AX[0] + rr * np.sin(pp), yy, AX[2] + rr * np.cos(pp)], 1)
-        if len(pts) >= 3:                                  # the curl: the heading rolls about the tangent
-            d = pts[-1] - pts[-3]; d /= max(1e-9, np.linalg.norm(d))
+        if len(pts) >= 3:
+            # the curl, a barrel roll UNDER (toward the body) or OUT, in the vertical plane through the
+            # body axis: about the horizontal tangent, starting from a mostly-downward heading. Taking the
+            # axis from the strand's own end heading let a wave that left it near horizontal lay the
+            # loop flat -- tails jutting 15 cm out in front of her at the hem.
+            rho = lk["rho"]
+            th_max = lk["th"] + 0.8 * front
+            L_c = rho * th_max
             _, pl, _ = cyl(pts[-1])
-            er = np.array([np.sin(pl[0]), 0, np.cos(pl[0])])
-            axis = np.cross(d, er if roll_out else -er); axis /= max(1e-9, np.linalg.norm(axis))
+            ephi = np.array([np.cos(pl[0]), 0, -np.sin(pl[0])])
+            axis = -ephi if out else ephi
+            d = pts[-1] - pts[-3]; d = d - (d @ axis) * axis; d /= max(1e-9, np.linalg.norm(d))
+            d = 0.35 * d + 0.65 * np.array([0.0, -1.0, 0.0]); d = d - (d @ axis) * axis; d /= np.linalg.norm(d)
             n_c = max(4, int(L_c / 0.004))
             P = pts[-1].copy(); extra = []
             for j in range(1, n_c + 1):
@@ -418,6 +536,17 @@ class Groom:
             pts = np.concatenate([pts, np.array(extra)])
         return pts
 
+    @staticmethod
+    def lock_params(seed, lid, centre_deg):
+        """One lock's shared shape. Its curl rolls UNDER at the centre back (the photos' hem turns in),
+        more often OUT at the sides and over the shoulders, and out for the face-framing front layer."""
+        g = np.random.default_rng(seed * 1000 + lid)
+        dgc = abs(centre_deg)
+        side = smoothstep(95, 120, dgc) * (1 - smoothstep(140, 160, dgc))
+        return dict(wph=g.uniform(0, 2 * np.pi), amp=g.uniform(*WAVE_AMP), wlen=g.uniform(*WAVE_LEN),
+                    dL=g.uniform(-0.03, 0.03), rho=g.uniform(0.022, 0.034), th=g.uniform(2.4, 4.0),
+                    out=bool(g.random() < 0.15 + 0.25 * side), out_front=bool(g.random() < 0.75))
+
     def build(self, spacing, seed=1, h=0.003, sigma=0.010):
         sc = self.sc
         rng = np.random.default_rng(seed)
@@ -425,7 +554,10 @@ class Groom:
         lr = hg.interp_vert(sc.lam, sc.FS, rt, R, sc.VS)
         cp, ct, _ = self.GH.closest(R)
         out, tri, cnt, why = hg.trace_surface(self.GH, self.flowH, cp, ct, h=h, maxlen=0.6, maxpts=300)
-        guides = []
+        # 1) every guide's head phase, handed over where the skull turns under -- or earlier, where it
+        #    comes level with an ear in front of the ear's back edge (the hang takes it round behind)
+        heads = []
+        n_ear = 0
         for i in range(len(R)):
             k = cnt[i]
             pts = out[i, :k]; tt = tri[i, :k]
@@ -441,11 +573,57 @@ class Groom:
             height = np.maximum.accumulate(CAP_HEAD * np.clip(phi - lr[i], 0, 1) ** 0.6 + 0.0012)
             q = pts + nn * height[:, None]
             q[0] = R[i]
+            ez = np.nonzero(self.in_ear_zone(q))[0]
+            if len(ez) and ez[0] < len(q) - 1:
+                q = q[:max(ez[0] + 1, 2)]; n_ear += 1
             if q[-1][2] > 0.045 and q[-1][1] > 1.60:
                 continue                                   # it would hang in front of the face
-            full = hg.smooth_polyline(np.concatenate([q, self.hang(q[-1], lr[i], rng)[1:]]), sigma)
-            guides.append((full, lr[i]))
-        log("guides: %d (from %d roots at %.1f mm)" % (len(guides), len(R), 1000 * spacing))
+            heads.append((q, lr[i]))
+        # 2) locks: sectors of LOCK_DEG round the body, by where each guide leaves the head
+        g = np.random.default_rng(seed + 101)
+        edges = [0.0]
+        while edges[-1] < 360.0 - LOCK_DEG[1]:
+            edges.append(edges[-1] + g.uniform(*LOCK_DEG))
+        edges = np.array(edges); off = g.uniform(0, 360)
+        p_hand = np.degrees(np.array([cyl(q[-1])[1][0] for q, _ in heads]))
+        lock_of = np.searchsorted(edges, (p_hand - off) % 360.0, side="right") - 1
+        centre_deg = {lid: ((edges[lid] + (edges[lid + 1] if lid + 1 < len(edges) else 360.0)) / 2 + off + 180) % 360 - 180
+                      for lid in np.unique(lock_of)}
+        LK = {lid: self.lock_params(seed, int(lid), centre_deg[lid]) for lid in centre_deg}
+        # 3) each guide's fall, then every lock's centre line (its mean azimuth by height)
+        bases = [self.hang_base(q[-1], l, LK[lock_of[j]]) for j, (q, l) in enumerate(heads)]
+        yg = np.arange(1.10, 1.90, 0.004)
+        centres = {}
+        for lid in LK:
+            S = np.zeros(len(yg)); C = np.zeros(len(yg)); Nn = np.zeros(len(yg))
+            for j in np.nonzero(lock_of == lid)[0]:
+                b = bases[j][0]
+                if len(b) < 3: continue
+                _, pp, yy = cyl(b)
+                ok = (yg <= yy[0]) & (yg >= yy[-1])
+                pu = np.interp(yg[ok], yy[::-1], np.unwrap(pp)[::-1])
+                S[ok] += np.sin(pu); C[ok] += np.cos(pu); Nn[ok] += 1
+            ang = np.where(Nn > 0, np.arctan2(S, C), np.nan)
+            v = np.nonzero(np.isfinite(ang))[0]
+            if len(v) == 0:
+                centres[lid] = lambda y: np.full(np.shape(y), np.nan); continue
+            a_v = np.unwrap(ang[v])                        # a back lock straddles +-180 degrees
+            # a smooth centre line: members start and stop at different heights, and each one joining
+            # or leaving the mean would otherwise put a kink into every strand pulled toward it
+            full = np.interp(np.arange(len(yg)), v, a_v)   # held constant past its first / last member
+            full = gaussian_filter1d(full, 0.03 / 0.004, mode="nearest")
+            full[:v[0]] = np.nan; full[v[-1] + 1:] = np.nan
+            centres[lid] = (lambda a_: (lambda y: np.interp(y, yg, a_, left=np.nan, right=np.nan)))(full)
+        # 4) each guide takes its lock's shape
+        guides = []
+        for j, (q, l) in enumerate(heads):
+            base, out, front = bases[j]
+            lid = lock_of[j]
+            hang = self.finish(base, centres[lid], LK[lid], out, front, rng)
+            full = hg.smooth_polyline(np.concatenate([q, hang[1:]]), sigma)
+            guides.append((full, l))
+        log("guides: %d (from %d roots at %.1f mm; %d handed over at an ear) in %d locks"
+            % (len(guides), len(R), 1000 * spacing, n_ear, len(LK)))
         return guides
 
 
@@ -533,11 +711,13 @@ def write_groom(path, guides, areas, count, radius, seed=7):
             f.write('\nfur "alice2_hair_%s" {\n' % REGIONS[reg])
             f.write('    on "alice2_scalp_%s"   material alice2_hair\n' % REGIONS[reg])
             f.write('    count %d\n' % int(round(count * areas[reg] / tot)))
-            f.write('    guides "alice2_guides_%s"   guide_blend 2\n' % REGIONS[reg])
+            # guide_blend 1: a strand is its nearest guide's shape, so neighbouring locks stay apart (any
+            # blend across a lock boundary averages two locks' offsets into a strand that fills the gap)
+            f.write('    guides "alice2_guides_%s"   guide_blend 1\n' % REGIONS[reg])
             f.write('    points %d   segments 2   spline centripetal\n' % NPTS)
             f.write('    radius %.6f  radius_tip %.6f\n' % (radius, radius * 0.8))
             f.write('    length_jitter 0.02   jitter 0.004\n')
-            f.write('    clump 0.35   clump_size 0.016\n')
+            f.write('    clump 0.25   clump_size 0.020\n')
             f.write('    root_offset 0.0005\n')
             f.write('    seed %d\n}\n' % (seed + reg))
         write_flyaways(f, guides)

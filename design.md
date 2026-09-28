@@ -1151,9 +1151,29 @@ height and azimuth and `R_in` the body and head, azimuth drifting with the sculp
 end curl. The headband is a swept ribbon along the sculpt band's centreline but seated on the
 generated guides' outer surface. `tools/hairgeo.py` is the numba kit it needs (grid closest
 point / ray cast, a z-parity inside test for closed meshes, a least-squares shape operator,
-surface streamlines, a GLB reader). No renderer code changed. Residuals against the photos: the
-back reads as a fuller, straighter curtain with a blunter hem than the doll's separated wavy
-locks, and the ear is always covered where one photo shows it bare.
+surface streamlines, a GLB reader). No renderer code changed.
+
+**The second version (2026-09-28)** fixed the two residuals the first left against the photos. The
+back read as a fuller, straighter curtain with a blunter hem than the doll's separated wavy locks,
+and the ear was always covered, where both profile photos show it bare.
+- **Ears.** Measured from what the Taubin smoothing flattened near each ear centre: ~9 cm tall,
+  ~40° round, her left 4 cm higher. A strand level with an ear is swept behind it by an
+  order-preserving azimuth remap (`ear_push`), and the head phase hands over where a strand comes
+  level with one.
+- **Locks.** Azimuth sectors by hand-over point share a wave, length and curl exactly, and gather
+  toward a Gaussian-smoothed per-height centre line. Unsmoothed, members joining and leaving the
+  mean kinked every strand. The fur follows one guide per strand.
+- **Curtain volume by region.** Sides full and fast, so the face is framed; centre back slow and
+  reduced at ear height, for a smooth crown; tapered below the shoulders.
+- **Curls in a fixed frame.** Under at the centre back, rolled about the horizontal tangent from a
+  mostly downward heading. Taking the axis from the strand's own end heading laid some loops flat,
+  15 cm tails jutting forward.
+- **The silhouette table is held below the sculpt's hem**, where it had been NaN and collapsed the
+  curtain onto the body in one step.
+
+Iterated on raster previews against the four photo viewpoints, then path-traced. Residual: from
+behind, a step in the silhouette at ear height on both sides (more on her right, whose ear sits
+lower), where the tucked side hair flares out below a crown that lies closer to the head.
 
 **The groom tool (0.329.0, Phase 1).** `runGroomGui` in `viewer_gui.cpp` reuses the loom
 viewer's shell -- its D3D11 device, `MeshGpu` pipeline (shaders, solid/wire rasterizer states,
