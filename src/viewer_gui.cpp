@@ -3,8 +3,12 @@
 #ifndef _WIN32
 // -------- Non-Windows stub: the native viewer needs Win32 + D3D11 --------------
 #include <cstdio>
-int runGroomGui(const std::string&) {
+int runGroomGui(const std::string&, bool) {
     std::fprintf(stderr, "error: -groom is only available on Windows builds.\n");
+    return 1;
+}
+int groomSectionsReport(const std::string&) {
+    std::fprintf(stderr, "error: -groom-sections is only available on Windows builds.\n");
     return 1;
 }
 int runViewerGui(const std::string&, const std::string&, bool, bool, int) {
@@ -1730,9 +1734,15 @@ struct MeshGpu {
     ID3D11Buffer*            cb      = nullptr;
     ID3D11RasterizerState*   rsSolid = nullptr;
     ID3D11RasterizerState*   rsWire  = nullptr;
+    ID3D11RasterizerState*   rsBack  = nullptr;   // solid, depth pushed a hair AWAY: lines lying on the
+                                                  // surface still pass the depth test (groom grid outlines)
+    ID3D11RasterizerState*   rsFront = nullptr;   // solid, depth pulled a hair TOWARD the eye: a surface lying on
+                                                  // another (a groom's scalp on the skin) wins instead of flickering
     ID3D11DepthStencilState* dsSolid = nullptr;   // LESS, writes depth
     ID3D11DepthStencilState* dsWire  = nullptr;   // LESS_EQUAL, no depth write
     ID3D11BlendState*        blend   = nullptr;
+    ID3D11BlendState*        blendNoColor = nullptr;   // colour writes off: a depth-only pre-pass (the groom
+                                                       // tool's hidden-line grid outlines, 0.373.0)
     ID3D11SamplerState*      samp    = nullptr;
     bool                     pipeReady = false;
 
@@ -1762,12 +1772,15 @@ struct MeshGpu {
     std::string err;                // non-empty => the pane says so instead of drawing
 
     using Vert = MeshPaneVert;   // position + uv + shading normal
-    // Must match the cbuffer in the shader below (144 B, a multiple of 16).
+    // Must match the cbuffer in the shader below (176 B, a multiple of 16). Zero-initialised it
+    // draws exactly as before 0.374.0: no slab, no rims, no hue mode.
     struct CB {
         float mvp[16];
         float rot0[4], rot1[4], rot2[4];   // xyz = view-basis row, w = -(row . mid)
         float baseColor[4];
-        float opts[4];                     // x = shade on, y = colour mode
+        float opts[4];                     // x = shade on, y = colour mode, z = hue flags (mode 4), w = lines per hue cycle
+        float slab[4];                     // xyz = a plane's normal (world), w = n.p at its centre (groom slice, 0.374.0)
+        float extra[4];                    // x = slab half-thickness (0: none), y = rim strength, z/w = depth range for hue
     };
 
     void releaseGeom() {
@@ -1791,9 +1804,12 @@ struct MeshGpu {
         releaseTargets();
         if (samp)    { samp->Release();    samp = nullptr; }
         if (blend)   { blend->Release();   blend = nullptr; }
+        if (blendNoColor) { blendNoColor->Release(); blendNoColor = nullptr; }
         if (dsWire)  { dsWire->Release();  dsWire = nullptr; }
         if (dsSolid) { dsSolid->Release(); dsSolid = nullptr; }
         if (rsWire)  { rsWire->Release();  rsWire = nullptr; }
+        if (rsBack)  { rsBack->Release();  rsBack = nullptr; }
+        if (rsFront) { rsFront->Release(); rsFront = nullptr; }
         if (rsSolid) { rsSolid->Release(); rsSolid = nullptr; }
         if (cb)      { cb->Release();      cb = nullptr; }
         if (layout)  { layout->Release();  layout = nullptr; }
@@ -1812,9 +1828,11 @@ cbuffer CB : register(b0) {
     float4 rot0, rot1, rot2;
     float4 baseColor;
     float4 opts;
+    float4 slab;
+    float4 extra;
 };
 struct VSIn  { float3 p : POSITION; float2 uv : TEXCOORD0; float3 n : NORMAL; };
-struct VSOut { float4 pos : SV_Position; float3 vn : TEXCOORD1; float2 uv : TEXCOORD0; };
+struct VSOut { float4 pos : SV_Position; float3 vn : TEXCOORD1; float2 uv : TEXCOORD0; float3 wp : TEXCOORD2; };
 VSOut main(VSIn i) {
     VSOut o;
     o.pos = mul(mvp, float4(i.p, 1.0));
@@ -1823,6 +1841,7 @@ VSOut main(VSIn i) {
     // minus the translation (rot*.w, which positions do carry, is dropped here).
     o.vn  = float3(dot(rot0.xyz, i.n), dot(rot1.xyz, i.n), dot(rot2.xyz, i.n));
     o.uv  = i.uv;
+    o.wp  = i.p;            // world position, for the groom tool's slab (the geometry is in world space)
     return o;
 }
 )HLSL";
@@ -1833,14 +1852,45 @@ cbuffer CB : register(b0) {
     float4 rot0, rot1, rot2;
     float4 baseColor;
     float4 opts;
+    float4 slab;
+    float4 extra;
 };
 Texture2D    tex0  : register(t0);
 SamplerState samp0 : register(s0);
-struct VSOut { float4 pos : SV_Position; float3 vn : TEXCOORD1; float2 uv : TEXCOORD0; };
+struct VSOut { float4 pos : SV_Position; float3 vn : TEXCOORD1; float2 uv : TEXCOORD0; float3 wp : TEXCOORD2; };
+// The groom tool's colours (0.374.0). None is red: red is the guides' own colour.
+// Per contour line: six colours in turn, far apart, so neighbouring lines never match.
+static const float3 kLineCol[6] = { float3(1.00, 0.55, 0.10), float3(1.00, 0.95, 0.25), float3(0.30, 0.95, 0.35),
+                                    float3(0.20, 0.85, 1.00), float3(0.40, 0.50, 1.00), float3(0.95, 0.40, 1.00) };
+// By depth: bright yellow near, through green, teal and blue, to a dim purple far -- the hue and
+// the brightness both say how far away a thing is.
+float3 depthRamp(float t) {
+    const float3 c0 = float3(1.00, 0.92, 0.30), c1 = float3(0.55, 0.92, 0.30), c2 = float3(0.20, 0.78, 0.62),
+                 c3 = float3(0.25, 0.48, 0.95), c4 = float3(0.42, 0.24, 0.66);
+    float s = saturate(t) * 4.0;
+    if (s < 1.0) return lerp(c0, c1, s);
+    if (s < 2.0) return lerp(c1, c2, s - 1.0);
+    if (s < 3.0) return lerp(c2, c3, s - 2.0);
+    return lerp(c3, c4, s - 3.0);
+}
 float4 main(VSOut i) : SV_Target {
+    // the groom tool's SLAB: only what lies within extra.x of the plane is drawn
+    if (extra.x > 0.0 && abs(dot(slab.xyz, i.wp) - slab.w) > extra.x) discard;
     float3 base = baseColor.rgb;
     int mode = (int)opts.y;
-    if (mode == 2) {
+    if (mode == 4) {
+        // flag 1: a colour per contour line (uv.x = the line's plane index); flag 2: by depth, over
+        // the depth range extra.z..extra.w; both: the line's colour, dimmer with depth
+        int flags = (int)opts.z;
+        float t = saturate((i.pos.z - extra.z) / max(extra.w - extra.z, 1e-6));
+        if ((flags & 1) != 0) {
+            int k = (int)floor(i.uv.x + 0.5);
+            base = kLineCol[((k % 6) + 6) % 6];
+            if ((flags & 2) != 0) base *= lerp(1.0, 0.32, t);
+        } else if ((flags & 2) != 0) {
+            base = depthRamp(t);
+        }
+    } else if (mode == 2) {
         // UV checker, per-pixel (8 cells across the unit square)
         float2 c = floor(i.uv * 8.0);
         float  s = frac((c.x + c.y) * 0.5);
@@ -1852,11 +1902,21 @@ float4 main(VSOut i) : SV_Target {
         base *= tex0.Sample(samp0, float2(i.uv.x, 1.0 - i.uv.y)).rgb;
     }
     float sh = 1.0;
+    float a = baseColor.a;
     if (opts.x > 0.5) {
         float3 n = normalize(i.vn);
         sh = 0.30 + 0.70 * abs(n.z);          // two-sided lambert, headlight along z
     }
-    return float4(base * sh, baseColor.a);
+    if (extra.y > 0.0) {
+        // BRIGHT EDGES (the groom tool's see-through parts, 0.374.0): opaque and lit where the
+        // surface is seen edge-on, clear where it faces you -- every fold, curl and lock edge
+        // becomes an outline, and what is inside stays visible (an x-ray / Fresnel look)
+        float3 n = normalize(i.vn);
+        float rim = pow(saturate(1.0 - abs(n.z)), 2.5) * extra.y;
+        a  = lerp(a, 1.0, rim);
+        sh = lerp(sh, 1.2, rim);
+    }
+    return float4(base * sh, a);
 }
 )HLSL";
 
@@ -1901,6 +1961,15 @@ float4 main(VSOut i) : SV_Target {
         rd.DepthClipEnable = TRUE;
         rd.MultisampleEnable = TRUE;            // ignored when the target is 1x
         if (FAILED(dev->CreateRasterizerState(&rd, &rsSolid))) return fail("rasterizer(solid) failed", nullptr);
+        // the same, biased AWAY from the eye (constant + slope-scaled, like a polygon offset): a
+        // surface drawn with it lets the lines lying exactly on it through a LESS_EQUAL test
+        // (biasing the surface, a triangle, is surer than biasing the lines)
+        rd.DepthBias = 2000;
+        rd.SlopeScaledDepthBias = 2.0f;
+        if (FAILED(dev->CreateRasterizerState(&rd, &rsBack))) return fail("rasterizer(back) failed", nullptr);
+        rd.DepthBias = -2000;
+        rd.SlopeScaledDepthBias = -2.0f;
+        if (FAILED(dev->CreateRasterizerState(&rd, &rsFront))) return fail("rasterizer(front) failed", nullptr);
         rd.FillMode = D3D11_FILL_WIREFRAME;
         // The wire pass draws the SAME triangles, so pull it a hair toward the eye;
         // LESS_EQUAL alone would still lose to rasterization rounding on the edges.
@@ -1927,6 +1996,9 @@ float4 main(VSOut i) : SV_Target {
         bl.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
         bl.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
         if (FAILED(dev->CreateBlendState(&bl, &blend))) return fail("CreateBlendState failed", nullptr);
+        bl.RenderTarget[0].BlendEnable = FALSE;
+        bl.RenderTarget[0].RenderTargetWriteMask = 0;      // depth only
+        if (FAILED(dev->CreateBlendState(&bl, &blendNoColor))) return fail("CreateBlendState(no colour) failed", nullptr);
 
         D3D11_SAMPLER_DESC sd = {};
         sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -3798,51 +3870,78 @@ static const float kLevelColours[6][4] = {
 };
 static const float* levelColour(int level) { return kLevelColours[std::min(std::max(level, 0), 5)]; }
 
-// The scene's own meshes as pane geometry: one MeshGeom per named mesh group, independent
-// triangles (the scene stores them flat), shading normals where the mesh had them.
-static std::vector<MeshGeom> meshesFromScene(const Scene& sc) {
+// A SECTION (0.372.0): what the Sections panel lists and the pane draws one at a time -- one
+// material's triangles within a mesh block (a glTF part: "root.4"), a whole block from a format
+// with no parts, or a part the scene SKIPS (`skip_material`), which the loader keeps out of the
+// render and hands the tool as reference geometry (ftsl::keepSectionsRef) so a groom can be shaped
+// inside it -- Alice2's sculpted hair, root.1. Any section can be hidden or made see-through; a
+// see-through one is drawn blended, and picks and hovering pass through it to what is behind.
+struct Section {
+    std::string label;             // "alice2 / root.4"
+    int   group = -1;              // its Scene::meshGroups index; -1 for a reference section
+    bool  reference = false;       // not in the scene: `ref` holds its triangles
+    std::vector<uint32_t> tris;    // its triangles in Scene::tris (an in-scene section)
+    std::vector<Tri> ref;          // or its own (a reference section)
+    bool  visible = true;
+    float opacity = 1.0f;          // < 1: drawn blended; picked and hovered THROUGH
+    bool  grid = false;            // drawn as a GRID OUTLINE (0.373.0): contour lines of the surface
+    bool  roots = false;           // roots of new strands land here (default: the fur blocks' `on` meshes)
+    Vec3  lo{0, 0, 0}, hi{0, 0, 0};   // its bounds (depth ranges for the hues, the slice's travel)
+    bool  seeThrough() const { return !visible || opacity < 0.999f; }
+    size_t triCount() const { return reference ? ref.size() : tris.size(); }
+    const Tri& tri(const Scene& sc, size_t i) const { return reference ? ref[i] : sc.tris[tris[i]]; }
+};
+
+// The sections as pane geometry, one MeshGeom each and in the same order (so the GPU's draw
+// ranges line up with them): independent triangles (the scene stores them flat), shading normals
+// where the mesh had them.
+static std::vector<MeshGeom> meshesFromSections(const Scene& sc, const std::vector<Section>& secs) {
     std::vector<MeshGeom> out;
-    for (const MeshGroup& g : sc.meshGroups) {
-        if (g.blasId >= 0 || g.triCount == 0) continue;
-        MeshGeom m; m.name = g.name; m.id = g.name;
-        const size_t end = std::min(g.triStart + g.triCount, sc.tris.size());
-        m.verts.reserve((end - g.triStart) * 9); m.normals.reserve((end - g.triStart) * 9);
-        for (size_t t = g.triStart; t < end; ++t) {
-            const Tri& tr = sc.tris[t];
+    out.reserve(secs.size());
+    for (const Section& s : secs) {
+        MeshGeom m; m.name = s.label; m.id = s.label;
+        const size_t n = s.triCount();
+        m.verts.reserve(n * 9); m.normals.reserve(n * 9); m.faces.reserve(n * 3);
+        for (size_t i = 0; i < n; ++i) {
+            const Tri& tr = s.tri(sc, i);
             const Vec3* v[3] = { &tr.v0, &tr.v1, &tr.v2 };
             const Vec3* nn[3] = { &tr.n0, &tr.n1, &tr.n2 };
             Vec3 gn = tr.gn;
             if (dot(gn, gn) < 1e-18) { gn = cross(tr.v1 - tr.v0, tr.v2 - tr.v0); if (dot(gn, gn) > 1e-30) gn = normalize(gn); }
             for (int k = 0; k < 3; ++k) {
                 m.verts.push_back((float)v[k]->x); m.verts.push_back((float)v[k]->y); m.verts.push_back((float)v[k]->z);
-                const Vec3 n = (dot(*nn[k], *nn[k]) > 1e-18) ? *nn[k] : gn;
-                m.normals.push_back((float)n.x); m.normals.push_back((float)n.y); m.normals.push_back((float)n.z);
+                const Vec3 nv = (dot(*nn[k], *nn[k]) > 1e-18) ? *nn[k] : gn;
+                m.normals.push_back((float)nv.x); m.normals.push_back((float)nv.y); m.normals.push_back((float)nv.z);
                 m.faces.push_back((int)m.faces.size());
             }
         }
         m.nverts = (int)m.verts.size() / 3; m.nfaces = (int)m.faces.size() / 3;
         m.smoothDeg = 0.0;
-        if (m.nfaces > 0) out.push_back(std::move(m));
+        out.push_back(std::move(m));               // even if empty: indices stay parallel to `secs`
     }
     return out;
 }
 
 // Line geometry: batches of segments, one colour each, in one immutable vertex buffer that is
 // rebuilt only when a toggle, a selection or a point changes (a groom is a quarter-million segments).
-struct LineBatch { std::vector<MeshPaneVert> v; float rgba[4] = { 1, 1, 1, 1 }; };
+// `slab`: the batch is cut by the groom tool's slab when the guides are (0.374.0) -- not the
+// selected strand, which stays whole, nor the bald zones.
+struct LineBatch { std::vector<MeshPaneVert> v; float rgba[4] = { 1, 1, 1, 1 }; bool slab = true; };
 struct LinesGpu {
     ID3D11Buffer* vb = nullptr;
     UINT count = 0;
     std::vector<UINT> first, num;
     std::vector<std::array<float, 4>> colour;
+    std::vector<char> slab;
     bool dirty = true;
-    void release() { if (vb) { vb->Release(); vb = nullptr; } count = 0; first.clear(); num.clear(); colour.clear(); }
+    void release() { if (vb) { vb->Release(); vb = nullptr; } count = 0; first.clear(); num.clear(); colour.clear(); slab.clear(); }
     bool upload(ID3D11Device* dev, const std::vector<LineBatch>& batches) {
         release();
         std::vector<MeshPaneVert> all;
         for (const LineBatch& b : batches) {
             first.push_back((UINT)all.size()); num.push_back((UINT)b.v.size());
             colour.push_back({ b.rgba[0], b.rgba[1], b.rgba[2], b.rgba[3] });
+            slab.push_back(b.slab ? 1 : 0);
             all.insert(all.end(), b.v.begin(), b.v.end());
         }
         dirty = false;
@@ -3914,18 +4013,23 @@ static bool rayTri(const Vec3& o, const Vec3& d, const Tri& t, double& tOut) {
     tOut = tt;
     return true;
 }
-struct Pick { bool hit = false; Vec3 p{0, 0, 0}, n{0, 1, 0}; double t = 0.0; int group = -1; };
-static Pick pickGroup(const Scene& sc, const MeshGroup& mg, const Vec3& o, const Vec3& d) {
+struct Pick { bool hit = false; Vec3 p{0, 0, 0}, n{0, 1, 0}; double t = 0.0; int group = -1; int sec = -1; };
+// The nearest hit of a ray on one section's triangles (the normal turned to face the viewer).
+// With a slab (0.374.0), only hits inside it: what the slab cuts away cannot be clicked.
+static Pick pickSection(const Scene& sc, const Section& s, const Vec3& o, const Vec3& d,
+                        const Vec3* slabN = nullptr, double slabD = 0.0, double slabHalf = 0.0) {
     Pick best;
-    const size_t end = std::min(mg.triStart + mg.triCount, sc.tris.size());
-    for (size_t i = mg.triStart; i < end; ++i) {
+    const size_t n = s.triCount();
+    for (size_t i = 0; i < n; ++i) {
+        const Tri& tr = s.tri(sc, i);
         double t;
-        if (!rayTri(o, d, sc.tris[i], t) || (best.hit && t >= best.t)) continue;
+        if (!rayTri(o, d, tr, t) || (best.hit && t >= best.t)) continue;
+        if (slabN && std::fabs(dot(*slabN, o + d * t) - slabD) > slabHalf) continue;
         best.hit = true; best.t = t;
-        Vec3 n = sc.tris[i].gn;
-        if (dot(n, n) < 1e-18) { n = cross(sc.tris[i].v1 - sc.tris[i].v0, sc.tris[i].v2 - sc.tris[i].v0); if (dot(n, n) > 1e-30) n = normalize(n); }
-        if (dot(n, d) > 0.0) n = n * -1.0;          // facing the viewer
-        best.n = n;
+        Vec3 nv = tr.gn;
+        if (dot(nv, nv) < 1e-18) { nv = cross(tr.v1 - tr.v0, tr.v2 - tr.v0); if (dot(nv, nv) > 1e-30) nv = normalize(nv); }
+        if (dot(nv, d) > 0.0) nv = nv * -1.0;       // facing the viewer
+        best.n = nv;
     }
     if (best.hit) best.p = o + d * best.t;
     return best;
@@ -3958,9 +4062,50 @@ struct GroomState {
     std::unordered_map<std::string, const ftsl::Loaded::HairCurveInfo*> recByName;   // the loader's flattened strands, for placed nodes
     int  selNode = -1, selPt = -1;               // the selected node (model id) and point index
     int  hoverNode = -1, hoverPt = -1;
-    std::string target;                          // picks land on this mesh (the fur's `on`)
-    int  targetGroup = -1;                       // its index into scene.meshGroups
+    std::string target;                          // the roots sections' labels, joined by ", " (for the status line)
     bool pickAny = false;                        // or on any mesh
+    // ---- sections (0.372.0): parts of the meshes, each hideable and see-through
+    std::vector<Section> sections;               // parallel to `meshes` (one MeshGeom each) and the GPU ranges
+    std::vector<char>    triPass;                // per Scene::tris: 1 = its section is hidden or see-through
+    bool  sectionsDirty = true;                  // triPass is out of date (a visibility / opacity changed)
+    // Where a strand's NEXT point goes (its root always goes on a roots section): 0 on surfaces
+    // (the roots sections, or any with "any mesh"), 1 IN THE AIR at the view depth of the point it
+    // follows, 2 INSIDE section `insideSec`, `insideDepth` of the way from where the pixel's ray
+    // meets it to the next surface behind (0.373.0 made this a choice; 0.372.0 had only 2)
+    int   placeMode = 1;
+    int   insideSec = -1;
+    float insideDepth = 0.5f;
+    double dragFrac = 0.5;                       // a point dragged inside keeps its fraction of that interval
+    // grid outlines (0.373.0): sections with `grid` drawn as contour lines -- the surface sliced by
+    // planes `frameExt / gridLines` apart along the ticked axes; hidden-line unless `gridXray`
+    float gridLines = 40.0f;
+    bool  gridAxis[3] = { true, true, true };
+    bool  gridXray = false;
+    LinesGpu gridGpu;                            // one batch per gridded section
+    std::vector<int> gridSecOf;                  // batch -> section
+    bool  gridDirty = true;
+    // reading a see-through part (0.374.0): hues, bright edges, and a movable slab
+    bool  gridHueLine = false;                   // a colour per contour line, six in turn (none red: the guides are red)
+    bool  hueDepth = false;                      // colour by depth, bright yellow near .. dim purple far: grid lines and see-through fills
+    bool  rims = true;                           // see-through parts opaque and bright where seen edge-on
+    bool  sliceOn = false;                       // show only a SLAB of the see-through and gridded parts
+    int   sliceAxis = 1;                         // across 0 x, 1 y (height), 2 z, 3 the view direction
+    float slicePos = 0.5f, sliceThick = 0.06f;   // its centre across the parts' extent (0..1); its thickness (fraction)
+    bool  sliceGuides = true;                    // slab the guides too (the selected strand is always drawn whole)
+    bool  sliceSolids = false;                   // and the solid parts: a scan-like slice (clicks and hovering see only the slab of them)
+    Vec3  slabN{0, 1, 0};                        // this frame's slab: |n.p - slabD| <= slabHalf (slabHalf 0: none)
+    double slabD = 0.0, slabHalf = 0.0;
+    LinesGpu sliceGpu;                           // the parts' cross-section at the slab's centre
+    std::string sliceKey;                        // the plane sliceGpu was built for
+    // sketching (0.373.0): drag from a roots section to draw a new strand along the drag
+    bool   sketchMode = false, sketching = false;
+    ImVec2 sketchLast;
+    float  sketchStep = 30.0f;                   // pixels of drag per sketched point
+    // box selection of points (0.373.0): Shift-drag on empty space
+    bool   boxing = false;
+    ImVec2 boxA, boxB;
+    std::vector<std::pair<int, int>> selPts;     // (node id, point index), the box-selected points
+    bool   showHelp = false;
     bool addOnClick = true;                      // a click on the surface plots a point on the selected strand
     std::vector<groom::Model> undo;
     std::string status;
@@ -3976,7 +4121,8 @@ struct GroomState {
     // a point being dragged
     bool   dragging = false, dragMoved = false;
     int    dragNode = -1, dragPt = -1;
-    int    dragMode = 0;                         // 0 slide on the surface, 1 along the normal, 2 in the screen plane
+    int    dragMode = 0;                         // 0 slide on the surface, 1 along the normal, 2 in the screen plane,
+                                                 // 3 inside the "grow inside" section, at its depth fraction
     Vec3   dragN{0, 1, 0}, dragP0{0, 0, 0};
     ImVec2 dragMouse0, pressPos;
     bool   pressedEmpty = false;                 // the press began on nothing (an orbit, or a click that plots)
@@ -3998,28 +4144,251 @@ template <class F> static void forEachEntryCurve(std::vector<groom::Entry>& list
 }
 template <class F> static void forEachTopCurve(groom::Model& m, F f) { for (groom::FileModel& fm : m.files) forEachEntryCurve(fm.entries, f); }
 
-// The surface under a pixel: the target mesh's own triangles, and -- for a click -- a check that
+// Is section `s` cut by the SLAB (0.374.0)? The see-through and gridded parts are (the ones you
+// look into), and with "solid parts too" every part -- a scan-like slice of the whole scene. What
+// a slab cuts away is gone for clicks and hovering too: only hits inside the slab count.
+static bool slabbed(const GroomState& g, const Section& s) {
+    return g.slabHalf > 0.0 && s.visible && (g.sliceSolids || s.grid || s.opacity < 0.999f);
+}
+static bool inSlab(const GroomState& g, const Vec3& p) { return g.slabHalf <= 0.0 || std::fabs(dot(g.slabN, p) - g.slabD) <= g.slabHalf; }
+
+// The status line's name for where roots go: the labels of the sections ticked `roots`.
+static void updateRootsLabel(GroomState& g) {
+    g.target.clear();
+    for (const Section& s : g.sections) if (s.roots) g.target += (g.target.empty() ? "" : ", ") + s.label;
+    if (g.target.empty()) g.target = "no roots section -- tick 'roots' on one in Sections, or 'any mesh'";
+}
+
+// The surface under a pixel: a ROOTS section's own triangles, and -- for a click -- a check that
 // nothing else is nearer (a pick through the face onto the back of the scalp is refused; the
-// doll's own coincident triangles are not "nearer"). During a drag only the target is walked.
+// doll's own coincident triangles are not "nearer"). During a drag only the roots are walked.
+// Walked per SECTION: a hidden or see-through one is looked through -- never picked, never in
+// the way -- which is what lets a root be placed on the scalp under a translucent hair shell. A
+// roots section is picked even when see-through (the scalp you root on may be made faint too). A
+// reference section (not in the scene) takes no surface points; "inside a section" places into it.
+static Pick pickSurfaceRay(GroomState& g, const Vec3& o, const Vec3& d, bool checkOcclusion) {
+    const Scene& sc = g.loaded.scene;
+    Pick best;
+    for (size_t si = 0; si < g.sections.size(); ++si) {
+        const Section& s = g.sections[si];
+        if (s.reference || !s.visible || (s.opacity < 0.999f && !s.roots)) continue;
+        const bool isTarget = s.roots;
+        if (!g.pickAny && !isTarget && !checkOcclusion) continue;
+        Pick p = pickSection(sc, s, o, d, slabbed(g, s) ? &g.slabN : nullptr, g.slabD, g.slabHalf);
+        if (!p.hit) continue;
+        p.group = s.group; p.sec = (int)si;
+        const double tol = 1e-6 * (1.0 + std::fabs(p.t));
+        if (!best.hit || p.t < best.t - tol) best = p;
+        else if (isTarget && std::fabs(p.t - best.t) <= tol) best = p;   // coincident with a roots part: it wins
+    }
+    if (best.hit && !g.pickAny && (best.sec < 0 || !g.sections[(size_t)best.sec].roots)) best.hit = false;
+    return best;
+}
 static Pick pickSurface(GroomState& g, const ImVec2& px, bool checkOcclusion) {
     Vec3 o, d;
     g.cam.ray(px, o, d);
+    return pickSurfaceRay(g, o, d, checkOcclusion);
+}
+
+// Which scene triangles the eye looks THROUGH: those of a hidden or see-through section (1) --
+// and (2) those of a solid one a slab cuts ("solid parts too"), which block only inside the slab.
+static void updateTriPass(GroomState& g) {
+    g.triPass.assign(g.loaded.scene.tris.size(), 0);
+    for (const Section& s : g.sections) {
+        if (s.reference) continue;
+        const char v = s.seeThrough() ? 1 : (g.sliceOn && g.sliceSolids) ? 2 : 0;
+        if (v) for (uint32_t t : s.tris) if (t < g.triPass.size()) g.triPass[t] = v;
+    }
+    g.sectionsDirty = false;
+}
+
+// Is anything the eye would SEE between `o` and `o + dir*maxDist`? The scene BVH as in
+// Scene::occludedSkipHair (hair never blocks), except that a triangle of a hidden or see-through
+// section does not block either -- so a point inside a translucent hair shell stays grabbable.
+static bool occludedForHover(const GroomState& g, const Vec3& o, const Vec3& dir, double maxDist) {
     const Scene& sc = g.loaded.scene;
-    Pick best;
+    const double tmin = 1e-6;
+    const double seg = maxDist - tmin;
+    if (!(seg > 0.0)) return false;
+    Ray r{o, dir};
+    const size_t nT = sc.tris.size(), nS = sc.spheres.size(), nI = sc.implicits.size(), nC = sc.curveSegs.size();
+    const TriShear sh = makeTriShear(r.d);
+    const CurveRay cray = nC ? makeCurveRay(r.d) : CurveRay{};
+    const PatTables tabs = sc.patTables();
+    const auto leaf = [&](int prim) {
+        Hit h; h.t = seg;
+        if (prim < (int)nT) {
+            const char tp = (size_t)prim < g.triPass.size() ? g.triPass[(size_t)prim] : 0;
+            if (tp == 1) return false;                                                          // see-through
+            if (!intersectTri(sh, r, sc.tris[prim], tmin, h, sc.vcolData())) return false;
+            return tp != 2 || inSlab(g, r.o + r.d * h.t);                                       // cut by the slab
+        }
+        if (prim < (int)(nT + nS))      return intersectSphere(r, sc.spheres[prim - nT], tmin, h);
+        if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, sc.implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
+        if (prim < (int)(nT + nS + nI + nC)) {
+            const CurveSeg& cs = sc.curveSegs[prim - nT - nS - nI];
+            if (sc.isHairCurve(cs)) return false;
+            return intersectCurveSeg(cray, r, cs, curveMin(r, tmin), h, /*anyHit=*/true);
+        }
+        const MeshInstance& inst = sc.instances[prim - nT - nS - nI - nC];
+        Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
+        return sc.blasList[inst.blasId].occludedLocal(lr, tmin, seg);
+    };
+    return sc.bvh.traverseAny(r, tmin, seg, leaf);
+}
+
+// GROW INSIDE: the depth interval a ray spends inside section `si`. Its hits, in order, pair up
+// into RUNS inside it (in at one, out at the next; an odd last hit is an open sheet, its surface
+// alone). The interval is the first run, ended early by anything solid inside it (the scalp under
+// a hair shell) -- and refused when something solid is in front of it: a sculpted shell runs on
+// inside the head behind the face, and a click on the face must not put a point in there.
+// With a SLAB cutting the section (0.374.0) it is the first run that crosses the slab, clipped to
+// it: the part of the section the eye actually sees there. False when there is none.
+static bool insideInterval(const GroomState& g, const Vec3& o, const Vec3& d, int si, double& t0, double& t1) {
+    if (si < 0 || si >= (int)g.sections.size()) return false;
+    const Scene& sc = g.loaded.scene;
+    const Section& S = g.sections[(size_t)si];
+    std::vector<double> raw;
+    const size_t n = S.triCount();
+    for (size_t i = 0; i < n; ++i) { double t; if (rayTri(o, d, S.tri(sc, i), t)) raw.push_back(t); }
+    if (raw.empty()) return false;
+    std::sort(raw.begin(), raw.end());
+    const double eps = 1e-7 * (1.0 + std::fabs(raw[0])) + 1e-5 * g.ext;   // a face's own duplicates
+    std::vector<double> hits;
+    for (double t : raw) if (hits.empty() || t > hits.back() + eps) hits.push_back(t);
+    // the nearest solid surface on the ray (inside the slab, for a solid part the slab cuts)
+    double solid = 1e300;
+    for (size_t k = 0; k < g.sections.size(); ++k) {
+        const Section& s = g.sections[k];
+        if ((int)k == si || s.reference || s.seeThrough()) continue;
+        const bool cut = slabbed(g, s);
+        const size_t m = s.triCount();
+        for (size_t i = 0; i < m; ++i) {
+            double t;
+            if (rayTri(o, d, s.tri(sc, i), t) && t < solid && (!cut || inSlab(g, o + d * t))) solid = t;
+        }
+    }
+    // the stretch of the ray inside the slab
+    double sa = -1e300, sb = 1e300;
+    if (slabbed(g, S)) {
+        const double nd = dot(g.slabN, d), no = dot(g.slabN, o);
+        if (std::fabs(nd) < 1e-12) { if (std::fabs(no - g.slabD) > g.slabHalf) return false; }
+        else {
+            const double ta = (g.slabD - g.slabHalf - no) / nd, tb = (g.slabD + g.slabHalf - no) / nd;
+            sa = std::min(ta, tb); sb = std::max(ta, tb);
+        }
+    }
+    for (size_t k = 0; k < hits.size(); k += 2) {
+        const double a = hits[k];
+        double b = (k + 1 < hits.size()) ? hits[k + 1] : a;
+        if (solid < a - eps) return false;                      // this run and all behind it are hidden
+        if (solid > a + eps && solid < b) b = solid;
+        const double ca = std::max(a, sa), cb = std::min(b, sb);
+        if (ca <= cb) { t0 = ca; t1 = cb; return true; }
+    }
+    return false;
+}
+static bool insidePoint(const GroomState& g, const Vec3& o, const Vec3& d, double frac, Vec3& p) {
+    double t0, t1;
+    if (!insideInterval(g, o, d, g.insideSec, t0, t1)) return false;
+    p = o + d * (t0 + std::clamp(frac, 0.0, 1.0) * (t1 - t0));
+    return true;
+}
+
+// The sections of a freshly loaded scene: each mesh group split by the glTF material names the
+// loader recorded (Loaded::toolSections), the rest of a group as one section, then the parts the
+// scene skips as reference sections. Nothing here knows any particular model; the defaults come
+// from the scene itself:
+//   * roots: the sections of the meshes the scene's `fur` blocks grow on (`fur { on "scalp" }`),
+//     else the first mesh;
+//   * a part the scene SKIPS (`skip_material`) starts faint (see-through, its folds drawn by the
+//     bright edges; 0.373.0 gave it a grid outline, which proved harder to read) -- the reason to
+//     show a part the render leaves out is to groom inside it -- and, on a first load, is what
+//     new points are placed inside.
+// A reload keeps every section's settings (matched by label) and the placement choice.
+static void buildSections(GroomState& g) {
+    struct Kept { bool visible; float opacity; bool grid, roots; };
+    std::map<std::string, Kept> kept;
+    for (const Section& s : g.sections) kept[s.label] = { s.visible, s.opacity, s.grid, s.roots };
+    const bool firstBuild = g.sections.empty();
+    const std::string insideLabel = (g.insideSec >= 0 && g.insideSec < (int)g.sections.size()) ? g.sections[(size_t)g.insideSec].label : std::string();
+    const Scene& sc = g.loaded.scene;
+    g.sections.clear();
     for (size_t gi = 0; gi < sc.meshGroups.size(); ++gi) {
         const MeshGroup& mg = sc.meshGroups[gi];
         if (mg.blasId >= 0 || mg.triCount == 0) continue;
-        const bool isTarget = ((int)gi == g.targetGroup);
-        if (!g.pickAny && !isTarget && !checkOcclusion) continue;
-        Pick p = pickGroup(sc, mg, o, d);
-        if (!p.hit) continue;
-        p.group = (int)gi;
-        const double tol = 1e-6 * (1.0 + std::fabs(p.t));
-        if (!best.hit || p.t < best.t - tol) best = p;
-        else if (isTarget && std::fabs(p.t - best.t) <= tol) best = p;   // coincident with the target: the target wins
+        const size_t end = std::min(mg.triStart + mg.triCount, sc.tris.size());
+        std::vector<char> covered(end - mg.triStart, 0);
+        std::map<std::string, size_t> byName;
+        for (const ftsl::Loaded::ToolSection& ts : g.loaded.toolSections) {
+            if (ts.skipped || ts.group != (int)gi) continue;
+            auto it = byName.find(ts.material);
+            if (it == byName.end()) {
+                Section s; s.group = (int)gi;
+                s.label = mg.name + " / " + (ts.material.empty() ? std::string("(unnamed material)") : ts.material);
+                it = byName.emplace(ts.material, g.sections.size()).first;
+                g.sections.push_back(std::move(s));
+            }
+            Section& s = g.sections[it->second];
+            for (size_t t = std::max(ts.triStart, mg.triStart); t < ts.triStart + ts.triCount && t < end; ++t) {
+                s.tris.push_back((uint32_t)t); covered[t - mg.triStart] = 1;
+            }
+        }
+        Section rest; rest.group = (int)gi;
+        rest.label = byName.empty() ? mg.name : mg.name + " / (rest)";
+        for (size_t t = mg.triStart; t < end; ++t) if (!covered[t - mg.triStart]) rest.tris.push_back((uint32_t)t);
+        if (!rest.tris.empty()) g.sections.push_back(std::move(rest));
     }
-    if (best.hit && !g.pickAny && best.group != g.targetGroup) best.hit = false;
-    return best;
+    std::map<std::string, size_t> refByName;
+    for (const ftsl::Loaded::ToolSection& ts : g.loaded.toolSections) {
+        if (!ts.skipped || ts.ref.empty()) continue;
+        const std::string label = (ts.mesh.empty() ? std::string("mesh") : ts.mesh) + " / " +
+                                  (ts.material.empty() ? std::string("(unnamed material)") : ts.material) + "  [skipped by the scene]";
+        auto it = refByName.find(label);
+        if (it == refByName.end()) {
+            Section s; s.reference = true; s.label = label; s.opacity = 0.12f;   // faint; with bright edges (0.374.0)
+            it = refByName.emplace(label, g.sections.size()).first;
+            g.sections.push_back(std::move(s));
+        }
+        Section& s = g.sections[it->second];
+        s.ref.insert(s.ref.end(), ts.ref.begin(), ts.ref.end());
+    }
+    for (Section& s : g.sections) {
+        s.lo = Vec3{ 1e30, 1e30, 1e30 }; s.hi = Vec3{ -1e30, -1e30, -1e30 };
+        for (size_t i = 0; i < s.triCount(); ++i) {
+            const Tri& t = s.tri(sc, i);
+            for (const Vec3* v : { &t.v0, &t.v1, &t.v2 }) {
+                s.lo.x = std::min(s.lo.x, v->x); s.lo.y = std::min(s.lo.y, v->y); s.lo.z = std::min(s.lo.z, v->z);
+                s.hi.x = std::max(s.hi.x, v->x); s.hi.y = std::max(s.hi.y, v->y); s.hi.z = std::max(s.hi.z, v->z);
+            }
+        }
+        if (s.hi.x < s.lo.x) s.lo = s.hi = Vec3{ 0, 0, 0 };
+    }
+    // default roots: the fur blocks' `on` meshes, else the first mesh
+    for (Section& s : g.sections) {
+        if (s.reference || s.group < 0) continue;
+        for (const auto& fi : g.loaded.furInfos)
+            if (sc.meshGroups[(size_t)s.group].name == fi.on) { s.roots = true; break; }
+    }
+    if (std::none_of(g.sections.begin(), g.sections.end(), [](const Section& s) { return s.roots; }))
+        for (Section& s : g.sections) if (!s.reference) { s.roots = true; break; }
+    g.insideSec = -1;
+    for (size_t i = 0; i < g.sections.size(); ++i) {
+        auto it = kept.find(g.sections[i].label);
+        if (it != kept.end()) {
+            g.sections[i].visible = it->second.visible; g.sections[i].opacity = it->second.opacity;
+            g.sections[i].grid = it->second.grid;       g.sections[i].roots = it->second.roots;
+        }
+        if (!insideLabel.empty() && g.sections[i].label == insideLabel) g.insideSec = (int)i;
+    }
+    // first load of a scene that skips a part: new points go inside it
+    if (firstBuild && g.insideSec < 0)
+        for (size_t i = 0; i < g.sections.size(); ++i)
+            if (g.sections[i].reference) { g.insideSec = (int)i; g.placeMode = 2; break; }
+    if (g.placeMode == 2 && g.insideSec < 0) g.placeMode = 1;
+    updateRootsLabel(g);
+    g.sectionsDirty = true;
+    g.gridDirty = true;
 }
 
 static void groomComputeFrame(GroomState& g) {
@@ -4030,8 +4399,9 @@ static void groomComputeFrame(GroomState& g) {
         lo[1] = std::min(lo[1], y); hi[1] = std::max(hi[1], y);
         lo[2] = std::min(lo[2], z); hi[2] = std::max(hi[2], z);
     };
-    for (const MeshGeom& m : g.meshes) {
-        const bool on = (m.name == g.target);
+    for (size_t mi = 0; mi < g.meshes.size(); ++mi) {
+        const MeshGeom& m = g.meshes[mi];
+        const bool on = mi < g.sections.size() && g.sections[mi].roots;   // a roots section
         for (int i = 0; i < m.nverts; ++i) {
             const float* v = &m.verts[(size_t)i * 3];
             grow(alo, ahi, v[0], v[1], v[2]);
@@ -4076,6 +4446,7 @@ static void drawNodeLines(GroomState& g, groom::Node& n, int level, std::vector<
         LineBatch b;
         const float* col = levelColour(level);
         const bool dim = (g.selNode >= 0 && n.id != g.selNode);
+        b.slab = (n.id != g.selNode);                  // the strand being edited is never cut by the slab
         for (int k = 0; k < 4; ++k) b.rgba[k] = col[k];
         if (dim) { b.rgba[0] *= 0.35f; b.rgba[1] *= 0.35f; b.rgba[2] *= 0.35f; }
         if (leaf) {
@@ -4094,6 +4465,7 @@ static void drawNodeLines(GroomState& g, groom::Node& n, int level, std::vector<
                 // you cannot grab a point you cannot see.
                 if (g.showPoints && w.size() >= 2) {
                     LineBatch hull;
+                    hull.slab = b.slab;
                     for (int k = 0; k < 3; ++k) hull.rgba[k] = b.rgba[k] * 0.30f;
                     hull.rgba[3] = 1.0f;
                     for (size_t k = 1; k < w.size(); ++k) addSegment(hull, w[k - 1], w[k]);
@@ -4140,6 +4512,7 @@ static void drawNodeLines(GroomState& g, groom::Node& n, int level, std::vector<
                 auto it = g.preview.byName.find(n.name);
                 if (it != g.preview.byName.end()) {
                     LineBatch inst;
+                    inst.slab = b.slab;
                     for (int k = 0; k < 3; ++k) inst.rgba[k] = b.rgba[k] * 0.7f;
                     inst.rgba[3] = 1.0f;
                     // through the loader's tessellator, like the leaf above: these are the
@@ -4194,6 +4567,7 @@ static void groomBuildLines(GroomState& g, std::vector<LineBatch>& out) {
     if (g.showBald) {
         // `bald <x> <y> <z> <r>` zones as wire spheres (the named-sphere form is the scene's to draw)
         LineBatch bz;
+        bz.slab = false;
         bz.rgba[0] = 1.0f; bz.rgba[1] = 0.55f; bz.rgba[2] = 0.15f; bz.rgba[3] = 1.0f;
         groom::forEachFur(g.model, [&](groom::FileModel&, groom::Entry& e) {
             for (const ftsl::Stmt& s : e.furBlock.stmts) {
@@ -4299,18 +4673,20 @@ static void deletePoint(GroomState& g) {
     markEdited(g, n->id);
     g.status = "deleted a point of \"" + n->name + "\"";
 }
+static int eraseCurveAndRefs(GroomState& g, int id);
 static void deleteStrand(GroomState& g) {
     groom::Node* n = (g.selNode >= 0) ? groom::findNode(g.model, g.selNode) : nullptr;
     if (!n) return;
-    if (isReferenced(g.model, n->name)) { g.status = "\"" + n->name + "\" is referenced by name by another curve -- remove the reference first"; return; }
-    groom::Where w = groom::whereIs(g.model, n->id);
-    pushUndo(g);
     const std::string name = n->name;
-    if (!groom::eraseNode(g.model, n->id)) { g.undo.pop_back(); g.status = "could not delete \"" + name + "\""; return; }
-    if (w.file) w.file->dirty = true;
+    const int id = n->id;
+    const bool referenced = isReferenced(g.model, name);
+    pushUndo(g);
+    if (!eraseCurveAndRefs(g, id)) { g.undo.pop_back(); g.status = "could not delete \"" + name + "\""; return; }
     g.selNode = g.selPt = -1;
+    g.multi.erase(std::remove(g.multi.begin(), g.multi.end(), id), g.multi.end());
+    g.selPts.erase(std::remove_if(g.selPts.begin(), g.selPts.end(), [id](const std::pair<int, int>& pr) { return pr.first == id; }), g.selPts.end());
     g.lines.dirty = true; g.stale = true;
-    g.status = "deleted \"" + name + "\"";
+    g.status = "deleted \"" + name + "\"" + (referenced ? " (and took it out of the curves that listed it)" : "");
 }
 // The Ctrl-click selection, validated for referencing by name: nodes at file (or group) level,
 // all in ONE file, so `curve "name"` resolves when that file loads.
@@ -4376,7 +4752,7 @@ static void undoLast(GroomState& g) {
     if (g.undo.empty()) { g.status = "nothing to undo"; return; }
     g.model = std::move(g.undo.back());
     g.undo.pop_back();
-    g.multi.clear();
+    g.multi.clear(); g.selPts.clear();
     for (groom::FileModel& f : g.model.files) if (f.writable) f.dirty = true;   // the disk may hold a later save
     if (g.selNode >= 0 && !groom::findNode(g.model, g.selNode)) g.selNode = g.selPt = -1;
     g.lines.dirty = true;
@@ -4555,38 +4931,34 @@ static bool groomLoadScene(GroomState& g) {
     g.loaded = ftsl::Loaded();
     g.meshes.clear(); g.recByName.clear(); g.xfOf.clear(); g.model = groom::Model(); g.undo.clear();
     g.selNode = g.selPt = g.hoverNode = g.hoverPt = -1;
-    g.multi.clear();
-    g.stale = false; g.dragging = false;
+    g.multi.clear(); g.selPts.clear();
+    g.stale = false; g.dragging = false; g.sketching = false; g.boxing = false;
+    g.sliceKey = "(reload)";                              // the parts' cross-section is rebuilt from the new geometry
     ftsl::keepShapeOnlyRef() = true;                      // the scalp must be drawable and pickable
+    ftsl::keepSectionsRef() = true;                       // the parts by name, and the parts the scene skips
     g.ok = ftsl::load(g.scenePath, g.loaded, g.err);
+    ftsl::keepSectionsRef() = false;
     ftsl::keepShapeOnlyRef() = false;
     if (!g.ok) { std::fprintf(stderr, "[groom] could not load '%s': %s\n", g.scenePath.c_str(), g.err.c_str()); return false; }
-    g.meshes = meshesFromScene(g.loaded.scene);
+    buildSections(g);
+    g.meshes = meshesFromSections(g.loaded.scene, g.sections);
     for (const auto& r : g.loaded.hairCurves) g.recByName[r.name] = &r;
     if (!groomParseModel(g)) std::fprintf(stderr, "[groom] the authored curve tree could not be read: %s\n", g.status.c_str());
     for (groom::FileModel& fm : g.model.files) resolveXfList(g, fm.entries);
-    // the pick target: the fur's `on` mesh, else the first mesh
-    g.target = g.loaded.furInfos.empty() ? std::string() : g.loaded.furInfos[0].on;
-    g.targetGroup = -1;
-    const Scene& sc = g.loaded.scene;
-    for (size_t gi = 0; gi < sc.meshGroups.size(); ++gi)
-        if (sc.meshGroups[gi].blasId < 0 && sc.meshGroups[gi].triCount > 0 && (g.targetGroup < 0 || sc.meshGroups[gi].name == g.target)) {
-            if (g.targetGroup < 0 || sc.meshGroups[gi].name == g.target) g.targetGroup = (int)gi;
-            if (sc.meshGroups[gi].name == g.target) break;
-        }
-    if (g.targetGroup >= 0) g.target = sc.meshGroups[(size_t)g.targetGroup].name;
+    // (the roots -- where a strand's first point lands -- are per section: buildSections ticks the
+    // fur blocks' `on` meshes by default, and the Sections panel lets any part be ticked instead)
     g.maxLevel = 0;
     forEachTopCurve(g.model, [&](groom::Node& n) { g.maxLevel = std::max(g.maxLevel, groom::levelOf(g.model, n)); });
     groomComputeFrame(g);
     g.view.geomGen++;
     g.lines.dirty = true;
-    std::fprintf(stderr, "[groom] %zu mesh(es), %zu named curve(s) (max level %d), %zu fur block(s); framing %.3g m about (%.3f %.3f %.3f); picks on \"%s\"\n",
+    std::fprintf(stderr, "[groom] %zu section(s), %zu named curve(s) (max level %d), %zu fur block(s); framing %.3g m about (%.3f %.3f %.3f); picks on \"%s\"\n",
                  g.meshes.size(), g.loaded.hairCurves.size(), g.maxLevel, g.loaded.furInfos.size(),
                  g.frameExt, g.frameMid[0], g.frameMid[1], g.frameMid[2], g.target.c_str());
     for (const auto& m : g.meshes) {
         float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
         for (int i = 0; i < m.nverts; ++i) for (int k = 0; k < 3; ++k) { lo[k] = std::min(lo[k], m.verts[(size_t)i * 3 + k]); hi[k] = std::max(hi[k], m.verts[(size_t)i * 3 + k]); }
-        std::fprintf(stderr, "[groom]   mesh \"%s\": %d tris, x %.3f..%.3f  y %.3f..%.3f  z %.3f..%.3f\n",
+        std::fprintf(stderr, "[groom]   section \"%s\": %d tris, x %.3f..%.3f  y %.3f..%.3f  z %.3f..%.3f\n",
                      m.name.c_str(), m.nfaces, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
     }
     for (const groom::FileModel& fm : g.model.files) {
@@ -4594,6 +4966,273 @@ static bool groomLoadScene(GroomState& g) {
                      fm.writable ? ", writable" : ", NOT writable: ", fm.writable ? "" : fm.why.c_str());
     }
     return true;
+}
+
+// ---- sections drawn as GRID OUTLINES (0.373.0) ---------------------------------------------------
+static const float kSectionTints[4][3] = { { 0.62f, 0.66f, 0.72f }, { 0.78f, 0.62f, 0.50f }, { 0.58f, 0.76f, 0.60f }, { 0.76f, 0.58f, 0.72f } };
+static void sectionTint(const GroomState& g, size_t si, float alpha, float out[4]) {
+    const bool refSec = si < g.sections.size() && g.sections[si].reference;
+    const float* t = kSectionTints[si % 4];
+    out[0] = refSec ? 0.95f : t[0]; out[1] = refSec ? 0.80f : t[1]; out[2] = refSec ? 0.42f : t[2]; out[3] = alpha;
+}
+static double axisOf(const Vec3& v, int ax) { return ax == 0 ? v.x : (ax == 1 ? v.y : v.z); }
+// Every gridded section sliced by the planes x = k s, y = k s, z = k s (the ticked axes), s = the
+// framed extent / `gridLines`: the CONTOUR LINES of its surface. A folded shape reads from its
+// contours where a see-through fill shows only a haze. One batch per section (`gridSecOf`); the
+// colour is chosen when drawing, from the section's tint and opacity.
+static void buildGridLines(GroomState& g, std::vector<LineBatch>& out) {
+    out.clear(); g.gridSecOf.clear();
+    const Scene& sc = g.loaded.scene;
+    const double s = (double)g.frameExt / std::max(4.0, (double)g.gridLines);
+    for (size_t si = 0; si < g.sections.size(); ++si) {
+        const Section& S = g.sections[si];
+        if (!S.grid) continue;                            // (hidden ones are skipped when drawing, so a
+        LineBatch b;                                      //  show/hide or a colour needs no rebuild)
+        const size_t n = S.triCount();
+        for (size_t i = 0; i < n; ++i) {
+            const Tri& t = S.tri(sc, i);
+            const Vec3 v[3] = { t.v0, t.v1, t.v2 };
+            for (int ax = 0; ax < 3; ++ax) {
+                if (!g.gridAxis[ax]) continue;
+                const double c0 = axisOf(v[0], ax), c1 = axisOf(v[1], ax), c2 = axisOf(v[2], ax);
+                const long long k0 = (long long)std::ceil(std::min({ c0, c1, c2 }) / s);
+                const long long k1 = (long long)std::floor(std::max({ c0, c1, c2 }) / s);
+                for (long long k = k0; k <= k1; ++k) {
+                    const double c = (double)k * s;
+                    double dd[3] = { c0 - c, c1 - c, c2 - c };
+                    for (double& x : dd) if (x == 0.0) x = 1e-12;      // a vertex ON the plane counts as above it
+                    Vec3 p[2]; int np = 0;
+                    for (int e = 0; e < 3 && np < 2; ++e) {
+                        const int a = e, bb = (e + 1) % 3;
+                        if ((dd[a] < 0.0) != (dd[bb] < 0.0)) p[np++] = v[a] + (v[bb] - v[a]) * (dd[a] / (dd[a] - dd[bb]));
+                    }
+                    if (np == 2) {
+                        // uv = (the line's plane index, its axis): what "a hue per line" colours by
+                        MeshPaneVert q0 = lineVert(p[0]), q1 = lineVert(p[1]);
+                        q0.u = q1.u = (float)k; q0.v = q1.v = (float)ax;
+                        b.v.push_back(q0); b.v.push_back(q1);
+                    }
+                }
+            }
+        }
+        if (!b.v.empty()) { out.push_back(std::move(b)); g.gridSecOf.push_back((int)si); }
+    }
+}
+
+// ---- the SLAB (0.374.0): only a slice of the see-through and gridded parts is drawn ------------
+// Across x, y, z or the view direction; its centre travels over those parts' extent along that
+// direction (slicePos 0..1) and its thickness is a fraction of it. Recomputed every frame: a slab
+// across the view turns with the orbit.
+static void updateSlab(GroomState& g) {
+    g.slabHalf = 0.0;
+    if (!g.sliceOn) return;
+    const Vec3 n = g.sliceAxis == 0 ? Vec3{ 1, 0, 0 } : g.sliceAxis == 1 ? Vec3{ 0, 1, 0 } : g.sliceAxis == 2 ? Vec3{ 0, 0, 1 } : g.cam.toward();
+    // it travels across the parts you look into (see-through or gridded); with none of those and
+    // "solid parts too", across every shown part
+    double lo = 1e300, hi = -1e300;
+    for (int pass = 0; pass < 2 && !(hi > lo); ++pass) {
+        if (pass == 1 && !g.sliceSolids) break;
+        for (const Section& s : g.sections) {
+            if (!s.visible || (pass == 0 && !(s.grid || s.opacity < 0.999f))) continue;
+            for (int c = 0; c < 8; ++c) {
+                const Vec3 p{ (c & 1) ? s.hi.x : s.lo.x, (c & 2) ? s.hi.y : s.lo.y, (c & 4) ? s.hi.z : s.lo.z };
+                const double t = dot(n, p);
+                lo = std::min(lo, t); hi = std::max(hi, t);
+            }
+        }
+    }
+    if (!(hi > lo)) return;
+    g.slabN = n;
+    g.slabD = lo + (double)std::clamp(g.slicePos, 0.0f, 1.0f) * (hi - lo);
+    g.slabHalf = 0.5 * (double)std::clamp(g.sliceThick, 0.002f, 1.0f) * (hi - lo);
+}
+// The cut the slab's centre plane makes through the parts it slices: their CROSS-SECTION, drawn
+// bright -- in a horizontal slab through a hairdo, the outline of every lock at that height.
+static void buildSliceLines(GroomState& g, std::vector<LineBatch>& out) {
+    out.clear();
+    if (g.slabHalf <= 0.0) return;
+    const Scene& sc = g.loaded.scene;
+    LineBatch b;
+    b.slab = false;
+    b.rgba[0] = 1.0f; b.rgba[1] = 1.0f; b.rgba[2] = 1.0f; b.rgba[3] = 1.0f;
+    for (const Section& S : g.sections) {
+        if (!slabbed(g, S)) continue;
+        const size_t n = S.triCount();
+        for (size_t i = 0; i < n; ++i) {
+            const Tri& t = S.tri(sc, i);
+            const Vec3 v[3] = { t.v0, t.v1, t.v2 };
+            double dd[3];
+            for (int k = 0; k < 3; ++k) { dd[k] = dot(g.slabN, v[k]) - g.slabD; if (dd[k] == 0.0) dd[k] = 1e-12; }
+            if ((dd[0] < 0.0) == (dd[1] < 0.0) && (dd[1] < 0.0) == (dd[2] < 0.0)) continue;
+            Vec3 p[2]; int np = 0;
+            for (int e = 0; e < 3 && np < 2; ++e) {
+                const int a = e, c = (e + 1) % 3;
+                if ((dd[a] < 0.0) != (dd[c] < 0.0)) p[np++] = v[a] + (v[c] - v[a]) * (dd[a] / (dd[a] - dd[c]));
+            }
+            if (np == 2) addSegment(b, p[0], p[1]);
+        }
+    }
+    if (!b.v.empty()) out.push_back(std::move(b));
+}
+
+// ---- placing points (0.373.0): where a click puts the selected strand's next point ---------------
+// Its ROOT (first point) always goes on a roots section, through anything see-through. After that,
+// by `placeMode`: 0 on surfaces (the roots, or any with "any mesh"), 1 IN THE AIR -- on the plane
+// facing the viewer through the point it follows, so a strand is drawn where it is clicked and
+// then shaped by orbiting and dragging -- or 2 INSIDE `insideSec`, `insideDepth` of the way in.
+static bool placeNextPoint(GroomState& g, const ImVec2& mouse, groom::Node* n, Vec3& out, std::string& why) {
+    if (!n || !n->kids.empty() || n->ref) { why = "select a strand first (click one of its points, or its name in the Curves tree), or press N for a new one"; return false; }
+    const bool root = n->pts.empty();
+    Vec3 o, d; g.cam.ray(mouse, o, d);
+    if (root || g.placeMode == 0) {
+        const Pick pk = pickSurfaceRay(g, o, d, true);
+        if (!pk.hit) {
+            why = root ? "a strand's ROOT goes on a roots section (" + g.target + ") -- click on it"
+                       : "no surface under the click (on " + g.target + "; tick 'any mesh' to use any)";
+            return false;
+        }
+        out = pk.p; return true;
+    }
+    if (g.placeMode == 2) {
+        if (insidePoint(g, o, d, g.insideDepth, out)) return true;
+        why = "no \"" + ((g.insideSec >= 0 && g.insideSec < (int)g.sections.size()) ? g.sections[(size_t)g.insideSec].label : std::string("?")) +
+              "\" under the click (or something solid is in front of it)";
+        return false;
+    }
+    const int after = (g.selNode == n->id && g.selPt >= 0 && g.selPt < (int)n->pts.size()) ? g.selPt : (int)n->pts.size() - 1;
+    const Vec3 ref = xfOf(g, n->id).apply(n->pts[(size_t)after].p);
+    out = o + d * dot(ref - o, d);
+    return true;
+}
+
+// ---- sketching (0.373.0): a drag from a roots section draws a new strand along the drag ----------
+static void beginSketch(GroomState& g, const Pick& root, const ImVec2& mouse) {
+    const int before = g.selNode;
+    newStrand(g);                                        // selects it; one undo covers the whole sketch
+    groom::Node* n = (g.selNode >= 0 && g.selNode != before) ? groom::findNode(g.model, g.selNode) : nullptr;
+    if (!n || !n->pts.empty()) return;                   // newStrand could not make one (it has said why)
+    groom::Pt p; p.p = snapMicron(xfOf(g, n->id).inverse().apply(root.p)); p.edited = true;
+    n->pts.push_back(p); g.selPt = 0;
+    markEdited(g, n->id);
+    g.sketching = true; g.sketchLast = mouse;
+    g.status = "sketching \"" + n->name + "\" -- release the button to finish";
+}
+static void sketchAppend(GroomState& g, const ImVec2& mouse) {
+    groom::Node* n = (g.selNode >= 0) ? groom::findNode(g.model, g.selNode) : nullptr;
+    if (!n) { g.sketching = false; return; }
+    Vec3 p; std::string why;
+    if (!placeNextPoint(g, mouse, n, p, why)) return;    // e.g. the drag left the section: skip this sample
+    groom::Pt q; q.p = snapMicron(xfOf(g, n->id).inverse().apply(p)); q.edited = true;
+    n->pts.push_back(q); g.selPt = (int)n->pts.size() - 1;
+    markEdited(g, n->id);
+}
+
+// ---- selecting several, and deleting (0.373.0) ------------------------------------------------------
+// Shift-drag on empty space: the VISIBLE points inside the box (a point behind a solid surface is
+// not taken); Ctrl held as well adds to what is already selected.
+static void finishBoxSelect(GroomState& g, bool add) {
+    const float x0 = std::min(g.boxA.x, g.boxB.x), x1 = std::max(g.boxA.x, g.boxB.x);
+    const float y0 = std::min(g.boxA.y, g.boxB.y), y1 = std::max(g.boxA.y, g.boxB.y);
+    if (!add) g.selPts.clear();
+    if (!(g.showCurves && g.showPoints && g.levelOn[0])) { g.status = "points are hidden -- tick 'curves', 'points' and level 0 to box-select them"; return; }
+    if (g.sectionsDirty) updateTriPass(g);
+    const Vec3 toward = g.cam.toward();
+    const double farD = 4.0 * g.cam.diag, tol = 0.02 * g.ext;
+    forEachTopCurve(g.model, [&](groom::Node& top) {
+        std::vector<groom::Node*> all; groom::collectNodes(top, all);
+        for (groom::Node* n : all) {
+            if (n->ref || !n->kids.empty() || !nodeVisible(g, n->id)) continue;
+            const Affine xf = xfOf(g, n->id);
+            const bool cut = g.sliceGuides && g.slabHalf > 0.0 && n->id != g.selNode;   // the slab hides it
+            for (size_t i = 0; i < n->pts.size(); ++i) {
+                const Vec3 pw = xf.apply(n->pts[i].p);
+                if (cut && !inSlab(g, pw)) continue;
+                const ImVec2 s = g.cam.toScreen(pw);
+                if (s.x < x0 || s.x > x1 || s.y < y0 || s.y > y1) continue;
+                if (occludedForHover(g, pw + toward * farD, toward * -1.0, farD - tol)) continue;
+                const std::pair<int, int> key{ n->id, (int)i };
+                if (std::find(g.selPts.begin(), g.selPts.end(), key) == g.selPts.end()) g.selPts.push_back(key);
+            }
+        }
+    });
+    g.status = "selected " + std::to_string(g.selPts.size()) + " point(s) -- Del deletes them, Esc clears";
+}
+// A curve and every reference to it by name (a guide listed in a `curve "group" { curve "g" }`):
+// deleting a guide takes it out of its group too, rather than refusing because it is referenced.
+static int eraseCurveAndRefs(GroomState& g, int id) {
+    groom::Node* n = groom::findNode(g.model, id);
+    if (!n) return 0;
+    const std::string name = n->name;
+    if (!name.empty()) {
+        std::vector<groom::Node*> all; groom::collectNodes(g.model, all);
+        std::vector<int> refs;
+        for (groom::Node* r : all) if (r->ref && r->name == name) refs.push_back(r->id);
+        for (int rid : refs) {
+            groom::Where rw = groom::whereIs(g.model, rid);
+            if (groom::eraseNode(g.model, rid) && rw.file) rw.file->dirty = true;
+        }
+    }
+    groom::Where w = groom::whereIs(g.model, id);
+    if (!groom::eraseNode(g.model, id)) return 0;
+    if (w.file) w.file->dirty = true;
+    return 1;
+}
+// Del: the box-selected points if any, else the Ctrl-selected curves, else the selected point.
+// A strand left with fewer than 2 points is removed with them: the loader refuses a 1-point curve.
+static void deleteSelected(GroomState& g) {
+    if (!g.selPts.empty()) {
+        pushUndo(g);
+        std::map<int, std::vector<int>> byNode;
+        for (const auto& pr : g.selPts) byNode[pr.first].push_back(pr.second);
+        int count = 0, removed = 0;
+        std::vector<int> emptied;
+        for (auto& kv : byNode) {
+            groom::Node* node = groom::findNode(g.model, kv.first);
+            if (!node) continue;
+            std::sort(kv.second.rbegin(), kv.second.rend());
+            kv.second.erase(std::unique(kv.second.begin(), kv.second.end()), kv.second.end());
+            for (int i : kv.second) if (i >= 0 && i < (int)node->pts.size()) { node->pts.erase(node->pts.begin() + i); ++count; }
+            markEdited(g, node->id);
+            if (node->pts.size() < 2) emptied.push_back(node->id);
+        }
+        for (int id : emptied) removed += eraseCurveAndRefs(g, id);
+        g.selPts.clear(); g.selPt = -1;
+        if (g.selNode >= 0 && !groom::findNode(g.model, g.selNode)) g.selNode = -1;
+        g.lines.dirty = true;
+        g.status = "deleted " + std::to_string(count) + " point(s)" +
+                   (removed ? "; " + std::to_string(removed) + " strand(s) left with under 2 points were removed" : std::string());
+        return;
+    }
+    if (!g.multi.empty()) {
+        pushUndo(g);
+        int count = 0;
+        const std::vector<int> ids = g.multi;
+        for (int id : ids) count += eraseCurveAndRefs(g, id);
+        g.multi.clear(); g.selNode = g.selPt = -1;
+        g.lines.dirty = true; g.stale = true;
+        g.status = "deleted " + std::to_string(count) + " curve(s) (and their references in groups)";
+        return;
+    }
+    deletePoint(g);
+}
+// every strand (a curve with points, not a curve of curves) that is shown
+static void selectAllStrands(GroomState& g) {
+    g.multi.clear(); g.selPts.clear();
+    std::vector<groom::Node*> all; groom::collectNodes(g.model, all);
+    for (groom::Node* n : all) if (!n->ref && n->kids.empty() && nodeVisible(g, n->id)) g.multi.push_back(n->id);
+    g.status = "selected " + std::to_string(g.multi.size()) + " strand(s) -- Del deletes them, G groups them, Esc clears";
+}
+// the box-selected points -> the strands they belong to (to delete or group whole strands)
+static void selectStrandsOfPoints(GroomState& g) {
+    std::vector<int> ids;
+    for (const auto& pr : g.selPts) if (std::find(ids.begin(), ids.end(), pr.first) == ids.end()) ids.push_back(pr.first);
+    g.selPts.clear();
+    g.multi = ids;
+    g.status = "selected the " + std::to_string(ids.size()) + " strand(s) those points belong to -- Del deletes them, G groups them, Esc clears";
+}
+static void clearSelection(GroomState& g) {
+    g.selPts.clear(); g.multi.clear(); g.boxing = false;
+    g.status = "selection cleared";
 }
 
 // ---- the pane: the scene, the curves, the hair; and the mouse on it -------------------------------
@@ -4605,11 +5244,38 @@ static void groomHandleInput(GroomState& g, bool hovered) {
     // side of the head projects onto the near side, and grabbing it would drag the wrong
     // strand. A fresh (empty) strand, or Alt, turns hovering off so a click plots.
     g.hoverNode = g.hoverPt = -1;
+    if (g.sectionsDirty) updateTriPass(g);                 // which triangles the eye looks through
     groom::Node* selN = (g.selNode >= 0) ? groom::findNode(g.model, g.selNode) : nullptr;
     const bool freshStrand = selN && !selN->ref && selN->kids.empty() && selN->pts.empty();
+    // a box being dragged out (Shift-drag on empty space): the points inside it on release
+    if (g.boxing) {
+        g.boxB = mouse;
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) { g.boxing = false; finishBoxSelect(g, io.KeyCtrl); }
+        return;
+    }
+    // a strand being sketched: a point every `sketchStep` pixels of the drag, until release
+    if (g.sketching) {
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            const float dx = mouse.x - g.sketchLast.x, dy = mouse.y - g.sketchLast.y;
+            const float step = g.sketchStep * std::max(io.FontGlobalScale, 1.0f);
+            if (dx * dx + dy * dy >= step * step) { sketchAppend(g, mouse); g.sketchLast = mouse; }
+        } else {
+            g.sketching = false;
+            groom::Node* n = (g.selNode >= 0) ? groom::findNode(g.model, g.selNode) : nullptr;
+            const float dx = mouse.x - g.pressPos.x, dy = mouse.y - g.pressPos.y;
+            if (n && n->pts.size() < 2 && dx * dx + dy * dy >= 16.0f) {   // a short drag still ends where released
+                sketchAppend(g, mouse);
+                n = (g.selNode >= 0) ? groom::findNode(g.model, g.selNode) : nullptr;
+            }
+            if (n && n->pts.size() < 2)
+                g.status = "planted the root of \"" + n->name + "\" -- drag further to sketch, or click to add its next points";
+            else if (n)
+                g.status = "sketched \"" + n->name + "\": " + std::to_string(n->pts.size()) + " points -- drag them to adjust, or click to extend it";
+        }
+        return;
+    }
     if (hovered && !g.dragging && !io.KeyAlt && !freshStrand && g.pickBald < 0 && g.showCurves && g.showPoints && g.levelOn[0]) {
         float bestD = pickPx * pickPx;
-        const Scene& sc = g.loaded.scene;
         const Vec3 toward = g.cam.toward();
         const double farD = 4.0 * g.cam.diag, tol = 0.02 * g.ext;
         forEachTopCurve(g.model, [&](groom::Node& top) {
@@ -4617,14 +5283,15 @@ static void groomHandleInput(GroomState& g, bool hovered) {
             for (groom::Node* n : all) {
                 if (n->ref || !n->kids.empty() || !nodeVisible(g, n->id)) continue;
                 const Affine xf = xfOf(g, n->id);
+                const bool cut = g.sliceGuides && g.slabHalf > 0.0 && n->id != g.selNode;   // the slab hides it
                 for (size_t i = 0; i < n->pts.size(); ++i) {
                     const Vec3 pw = xf.apply(n->pts[i].p);
+                    if (cut && !inSlab(g, pw)) continue;
                     const ImVec2 s = g.cam.toScreen(pw);
                     const float dx = s.x - mouse.x, dy = s.y - mouse.y, d2 = dx * dx + dy * dy;
                     if (d2 >= bestD) continue;
-                    Ray r; r.o = pw + toward * farD; r.d = toward * -1.0;
-                    const Hit h = sc.closestHit(r, 1e-6, nullptr, /*skipHair=*/true);
-                    if (h.valid && h.t < farD - tol) continue;          // behind the surface
+                    // behind a surface the eye sees (not a hidden or see-through section)
+                    if (occludedForHover(g, pw + toward * farD, toward * -1.0, farD - tol)) continue;
                     bestD = d2; g.hoverNode = n->id; g.hoverPt = (int)i;
                 }
             }
@@ -4636,15 +5303,42 @@ static void groomHandleInput(GroomState& g, bool hovered) {
         if (g.hoverNode >= 0) {
             groom::Node* n = groom::findNode(g.model, g.hoverNode);
             if (n && g.hoverPt < (int)n->pts.size()) {
+                // a point outside the box selection starts over (Del must not take points you forgot)
+                if (!g.selPts.empty() && std::find(g.selPts.begin(), g.selPts.end(), std::make_pair(g.hoverNode, g.hoverPt)) == g.selPts.end())
+                    g.selPts.clear();
                 select(g, g.hoverNode, g.hoverPt);
                 g.dragging = true; g.dragMoved = false;
                 g.dragNode = g.hoverNode; g.dragPt = g.hoverPt; g.dragMouse0 = mouse;
                 g.dragP0 = xfOf(g, n->id).apply(n->pts[(size_t)g.hoverPt].p);
-                g.dragMode = io.KeyShift ? 1 : (io.KeyCtrl ? 2 : 0);
                 const Pick pk = pickSurface(g, g.cam.toScreen(g.dragP0), false);
                 g.dragN = pk.hit ? pk.n : g.cam.toward();
+                // How it moves: Shift along the surface normal, Ctrl in the screen plane; otherwise a
+                // ROOT slides on its roots section and a later point moves the way new points are
+                // placed -- on surfaces, in the screen plane (in the air), or through the "inside"
+                // section keeping the depth it has now (its fraction of the interval under the cursor)
+                if (io.KeyShift)      g.dragMode = 1;
+                else if (io.KeyCtrl)  g.dragMode = 2;
+                else if (g.hoverPt == 0 || g.placeMode == 0) g.dragMode = 0;
+                else if (g.placeMode == 2 && g.insideSec >= 0) {
+                    Vec3 o, dd; g.cam.ray(g.cam.toScreen(g.dragP0), o, dd);
+                    double t0, t1;
+                    g.dragFrac = (insideInterval(g, o, dd, g.insideSec, t0, t1) && t1 > t0)
+                                     ? std::clamp((dot(g.dragP0 - o, dd) - t0) / (t1 - t0), 0.0, 1.0)
+                                     : (double)g.insideDepth;
+                    g.dragMode = 3;
+                } else g.dragMode = 2;
                 g.pressedEmpty = false;
             }
+        } else if (io.KeyShift) {
+            // Shift-drag on empty space: box-select points (Ctrl as well: add to the selection)
+            g.boxing = true; g.boxA = g.boxB = mouse;
+            g.pressedEmpty = false;
+            return;
+        } else if (g.sketchMode && g.pickBald < 0) {
+            // SKETCH: a press on a roots section starts a new strand there, drawn along the drag
+            const Pick pk = pickSurface(g, mouse, true);
+            if (pk.hit) { beginSketch(g, pk, mouse); g.pressedEmpty = false; return; }
+            g.pressedEmpty = true;                                // off the roots: an orbit, as usual
         } else {
             g.pressedEmpty = true;
         }
@@ -4665,8 +5359,11 @@ static void groomHandleInput(GroomState& g, bool hovered) {
                 pw = pk.p;
             } else if (g.dragMode == 1) {
                 pw = g.dragP0 + g.dragN * (-(double)delta.y * wpp);
-            } else {
+            } else if (g.dragMode == 2) {
                 pw = g.dragP0 + g.cam.right() * ((double)delta.x * wpp) - g.cam.up() * ((double)delta.y * wpp);
+            } else {
+                Vec3 o, dd; g.cam.ray(mouse, o, dd);
+                if (!insidePoint(g, o, dd, g.dragFrac, pw)) return;   // off the section: the point stays
             }
             groom::Pt& p = n->pts[(size_t)g.dragPt];
             p.p = snapMicron(xfOf(g, n->id).inverse().apply(pw));
@@ -4676,7 +5373,7 @@ static void groomHandleInput(GroomState& g, bool hovered) {
             g.dragging = false;
             if (g.dragMoved) {
                 groom::Node* n = groom::findNode(g.model, g.dragNode);
-                g.status = std::string(g.dragMode == 0 ? "slid" : g.dragMode == 1 ? "lifted" : "moved") + " point " + std::to_string(g.dragPt) + " of \"" + (n ? n->name : std::string("?")) + "\"";
+                g.status = std::string(g.dragMode == 0 ? "slid" : g.dragMode == 1 ? "lifted" : g.dragMode == 2 ? "moved" : "moved (inside)") + " point " + std::to_string(g.dragPt) + " of \"" + (n ? n->name : std::string("?")) + "\"";
             }
         }
         return;
@@ -4687,18 +5384,54 @@ static void groomHandleInput(GroomState& g, bool hovered) {
         const float dx = mouse.x - g.pressPos.x, dy = mouse.y - g.pressPos.y;
         if (hovered && g.pickBald >= 0 && dx * dx + dy * dy < 9.0f) { placeBald(g, mouse); return; }
         if (hovered && g.addOnClick && dx * dx + dy * dy < 9.0f) {
-            const Pick pk = pickSurface(g, mouse, true);
-            if (pk.hit) addPointAt(g, pk);
-            else if (g.selNode >= 0) g.status = "no surface under the click" + std::string(g.pickAny ? "" : " (on \"" + g.target + "\"; tick 'any mesh' to pick elsewhere)");
+            // the selected strand's next point: its root on a roots section, then by "place new points"
+            groom::Node* sn = (g.selNode >= 0) ? groom::findNode(g.model, g.selNode) : nullptr;
+            Pick pk; std::string why;
+            if (placeNextPoint(g, mouse, sn, pk.p, why)) { pk.hit = true; addPointAt(g, pk); }
+            else g.status = why;
         }
     }
 }
 
+// What the next click / drag in the pane will do, in words, above the pane (0.373.0).
+static std::string paneHint(GroomState& g) {
+    const char* nav = g.sliceOn ? "  |  drag empty space or right-drag: orbit, wheel: zoom, Ctrl+wheel: move the slice, F1: help"
+                                : "  |  drag empty space or right-drag: orbit, wheel: zoom, F1: help";
+    if (g.pickBald >= 0) return std::string("click the surface to place the bald zone's centre") + nav;
+    if (g.sketchMode)
+        return "SKETCH: press on a roots section (" + g.target + ") and drag -- a new strand follows the drag, its points placed " +
+               (g.placeMode == 0 ? "on surfaces" : g.placeMode == 1 ? "in the air" : "inside the chosen section") + nav;
+    groom::Node* n = (g.selNode >= 0) ? groom::findNode(g.model, g.selNode) : nullptr;
+    if (!n || n->ref || !n->kids.empty())
+        return std::string("press N for a new strand, or click a point to select its strand; Shift-drag: box-select points") + nav;
+    if (n->pts.empty()) return "click on a roots section (" + g.target + ") to plant the ROOT of \"" + n->name + "\"" + nav;
+    const std::string after = (g.selPt >= 0 && g.selPt < (int)n->pts.size()) ? "after point " + std::to_string(g.selPt) : "at the end";
+    std::string where;
+    if (g.placeMode == 0) where = "ON the surface you click";
+    else if (g.placeMode == 1) where = "IN THE AIR where you click (at the depth of the point it follows; orbit to see it, then drag it)";
+    else where = "INSIDE \"" + ((g.insideSec >= 0 && g.insideSec < (int)g.sections.size()) ? g.sections[(size_t)g.insideSec].label : std::string("?")) + "\" where you click";
+    return "\"" + n->name + "\": a click adds a point " + after + ", " + where + "; drag a point to move it" + nav;
+}
+
 static void drawGroomPane(GroomState& g, ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     MeshView& view = g.view;
-    ImGui::TextUnformatted("drag: orbit | click a point: select, drag it: slide on the surface (Shift: along the normal, Ctrl: in the screen plane) | click the surface: plot | wheel: zoom");
+    ImGui::TextWrapped("%s", paneHint(g).c_str());
+    // the status line under the view, measured first so the view leaves it the room it wraps to
+    std::string statusLine;
+    {
+        int totalTris = 0; for (const auto& m : g.meshes) totalTris += m.nfaces;
+        const char* placeWords[] = { "on surfaces", "in the air", "inside " };
+        const bool insideOk = g.insideSec >= 0 && g.insideSec < (int)g.sections.size();
+        statusLine = "roots on " + g.target + (g.pickAny ? " or any mesh" : "") + "  |  new points " + placeWords[std::clamp(g.placeMode, 0, 2)] +
+                     ((g.placeMode == 2 && insideOk) ? g.sections[(size_t)g.insideSec].label : std::string());
+        if (!g.selPts.empty()) statusLine += "  |  " + std::to_string(g.selPts.size()) + " point(s) selected";
+        else if (!g.multi.empty()) statusLine += "  |  " + std::to_string(g.multi.size()) + " curve(s) selected";
+        if (g.stale) statusLine += "  |  placed strands and fur are STALE (save + reload)";
+        statusLine += "  |  " + std::to_string(g.meshes.size()) + " section(s), " + std::to_string(totalTris) + " tris, " +
+                      std::to_string(g.loaded.scene.curves.size()) + " strand(s) of fur";
+    }
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    avail.y -= ImGui::GetTextLineHeightWithSpacing();
+    avail.y -= ImGui::CalcTextSize(statusLine.c_str(), nullptr, false, avail.x).y + ImGui::GetStyle().ItemSpacing.y;
     if (avail.y < 80.0f) avail.y = 80.0f;
     ImVec2 origin = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton("groom_canvas", avail, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
@@ -4707,7 +5440,18 @@ static void drawGroomPane(GroomState& g, ID3D11Device* dev, ID3D11DeviceContext*
         ImVec2 d = ImGui::GetIO().MouseDelta;
         view.yaw += d.x * 0.01f; view.pitch += d.y * 0.01f;
     }
-    if (hovered) { float w = ImGui::GetIO().MouseWheel; if (w != 0.0f) view.zoom *= (1.0f + w * 0.1f); }
+    // the right button always orbits (what a left drag does is taken by sketching and box selection)
+    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
+        ImVec2 d = ImGui::GetIO().MouseDelta;
+        view.yaw += d.x * 0.01f; view.pitch += d.y * 0.01f;
+    }
+    if (hovered) {
+        const float w = ImGui::GetIO().MouseWheel;
+        if (w != 0.0f) {
+            if (g.sliceOn && ImGui::GetIO().KeyCtrl) g.slicePos = std::clamp(g.slicePos + w * 0.02f, 0.0f, 1.0f);   // Ctrl+wheel: the slab
+            else view.zoom *= (1.0f + w * 0.1f);
+        }
+    }
     if (view.zoom < 0.05f) view.zoom = 0.05f;
     MeshGpu& gpu = view.gpu;
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -4715,6 +5459,7 @@ static void drawGroomPane(GroomState& g, ID3D11Device* dev, ID3D11DeviceContext*
     bool ok = gpu.buildPipeline(dev);
     if (ok && (!gpu.geomReady || gpu.geomGen != view.geomGen)) ok = gpu.uploadGeometry(dev, g.meshes, view.geomGen);
     if (ok && g.lines.dirty) { std::vector<LineBatch> batches; groomBuildLines(g, batches); ok = g.lines.upload(dev, batches); }
+    if (ok && g.gridDirty) { std::vector<LineBatch> batches; buildGridLines(g, batches); ok = g.gridGpu.upload(dev, batches); g.gridDirty = false; }
     if (ok) ok = gpu.ensureTargets(dev, (int)(avail.x + 0.5f), (int)(avail.y + 0.5f));
     if (ok) {
         float cy = std::cos(view.yaw),   sy = std::sin(view.yaw);
@@ -4743,12 +5488,47 @@ static void drawGroomPane(GroomState& g, ID3D11Device* dev, ID3D11DeviceContext*
             float* dst = (r == 0) ? c.rot0 : (r == 1) ? c.rot1 : c.rot2;
             dst[0] = R[r][0]; dst[1] = R[r][1]; dst[2] = R[r][2]; dst[3] = -dotMid(r);
         }
-        auto setCB = [&](const float rgba[4], float shadeOn, float mode) {
+        // this frame's slab (a slab across the view turns with the orbit), and the cross-section
+        // at its centre, rebuilt when the plane or the parts it cuts change
+        updateSlab(g);
+        {
+            std::string key;
+            if (g.slabHalf > 0.0) {
+                char kb[160];
+                std::snprintf(kb, sizeof kb, "%.9g %.9g %.9g %.9g ", g.slabN.x, g.slabN.y, g.slabN.z, g.slabD);
+                key = kb;
+                for (const Section& sec : g.sections) key += slabbed(g, sec) ? '1' : '0';
+            }
+            if (key != g.sliceKey) {
+                std::vector<LineBatch> batches; buildSliceLines(g, batches);
+                g.sliceGpu.upload(dev, batches);
+                g.sliceKey = key;
+            }
+        }
+        // setCB: a plain draw -- the colour, shading on/off, a colour mode. setCBx: the groom tool's
+        // extras (0.374.0) -- the slab (cut to it), bright edges, and the hue modes (mode 4, flags
+        // 1 per line / 2 by depth over z0..z1)
+        auto setCBx = [&](const float rgba[4], float shadeOn, float mode, bool slab, float rim, int hueFlags, float z0, float z1) {
             for (int k = 0; k < 4; ++k) c.baseColor[k] = rgba[k];
-            c.opts[0] = shadeOn; c.opts[1] = mode; c.opts[2] = c.opts[3] = 0.0f;
+            c.opts[0] = shadeOn; c.opts[1] = mode; c.opts[2] = (float)hueFlags; c.opts[3] = 0.0f;
+            const bool cut = slab && g.slabHalf > 0.0;
+            c.slab[0] = (float)g.slabN.x; c.slab[1] = (float)g.slabN.y; c.slab[2] = (float)g.slabN.z; c.slab[3] = (float)g.slabD;
+            c.extra[0] = cut ? (float)g.slabHalf : 0.0f; c.extra[1] = rim; c.extra[2] = z0; c.extra[3] = z1;
             D3D11_MAPPED_SUBRESOURCE ms;
             if (ctx->Map(gpu.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms) == S_OK) { std::memcpy(ms.pData, &c, sizeof(c)); ctx->Unmap(gpu.cb, 0); }
         };
+        auto setCB = [&](const float rgba[4], float shadeOn, float mode) { setCBx(rgba, shadeOn, mode, false, 0.0f, 0, 0.0f, 1.0f); };
+        // a section's depth range in the pane's depth units (its bounds' corners), for hue by depth
+        auto depthRange = [&](size_t si, float& z0, float& z1) {
+            z0 = 1e30f; z1 = -1e30f;
+            const Section& s = g.sections[si];
+            for (int k = 0; k < 8; ++k) {
+                const float px = (float)((k & 1) ? s.hi.x : s.lo.x), py = (float)((k & 2) ? s.hi.y : s.lo.y), pz = (float)((k & 4) ? s.hi.z : s.lo.z);
+                const float z = c.mvp[8] * px + c.mvp[9] * py + c.mvp[10] * pz + c.mvp[11];
+                z0 = std::min(z0, z); z1 = std::max(z1, z);
+            }
+        };
+        auto secSlab = [&](size_t mi) { return mi < g.sections.size() && slabbed(g, g.sections[mi]); };
         const float clearCol[4] = { 14 / 255.0f, 16 / 255.0f, 20 / 255.0f, 1.0f };
         ctx->ClearRenderTargetView(gpu.rtv, clearCol);
         ctx->ClearDepthStencilView(gpu.dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
@@ -4766,29 +5546,57 @@ static void drawGroomPane(GroomState& g, ID3D11Device* dev, ID3D11DeviceContext*
         ctx->OMSetBlendState(gpu.blend, bf, 0xffffffff);
         ID3D11ShaderResourceView* none[1] = { nullptr };
         ctx->PSSetShaderResources(0, 1, none);
+        // a section's colour: the tint cycle, and a hair gold for a reference part (a sculpted
+        // hairdo the scene skips is the usual one) -- sectionTint
+        auto secVisible = [&](size_t mi) { return mi >= g.sections.size() || g.sections[mi].visible; };
+        auto secOpacity = [&](size_t mi) { return mi < g.sections.size() ? g.sections[mi].opacity : 1.0f; };
+        auto secGrid    = [&](size_t mi) { return mi < g.sections.size() && g.sections[mi].grid; };
         if (g.showMesh && gpu.vb && gpu.ib) {
             ctx->IASetVertexBuffers(0, 1, &gpu.vb, &stride, &voff);
             ctx->IASetIndexBuffer(gpu.ib, DXGI_FORMAT_R32_UINT, 0);
             ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            ctx->RSSetState(gpu.rsSolid);
             ctx->OMSetDepthStencilState(gpu.dsSolid, 0);
-            static const float tints[4][3] = { { 0.62f, 0.66f, 0.72f }, { 0.78f, 0.62f, 0.50f }, { 0.58f, 0.76f, 0.60f }, { 0.76f, 0.58f, 0.72f } };
+            // 1. the solid sections (written to depth, so they hide what is behind them); a gridded
+            // one a hair farther than it is, so its own outline lines (drawn last) are not hidden by it
             for (size_t mi = 0; mi < gpu.ranges.size(); ++mi) {
                 const MeshGpu::Range& r = gpu.ranges[mi];
-                if (!r.indexCount) continue;
-                float rgba[4] = { tints[mi % 4][0], tints[mi % 4][1], tints[mi % 4][2], 1.0f };
-                setCB(rgba, view.shade ? 1.0f : 0.0f, 0.0f);
+                if (!r.indexCount || !secVisible(mi) || secOpacity(mi) < 0.999f) continue;
+                // a roots section (a scalp lying on the skin) is pulled a hair forward so it shows
+                // whole instead of flickering through the surface it lies on (0.374.0)
+                const bool rootsSec = mi < g.sections.size() && g.sections[mi].roots;
+                ctx->RSSetState(secGrid(mi) ? gpu.rsBack : rootsSec ? gpu.rsFront : gpu.rsSolid);
+                float rgba[4]; sectionTint(g, mi, 1.0f, rgba);
+                setCBx(rgba, view.shade ? 1.0f : 0.0f, 0.0f, secSlab(mi), 0.0f, 0, 0.0f, 1.0f);
                 ctx->DrawIndexed(r.indexCount, r.firstIndex, r.baseVertex);
             }
             if (view.wire) {
                 ctx->RSSetState(gpu.rsWire);
                 ctx->OMSetDepthStencilState(gpu.dsWire, 0);
                 const float wireCol[4] = { 30 / 255.0f, 30 / 255.0f, 36 / 255.0f, 120 / 255.0f };
-                setCB(wireCol, 0.0f, 0.0f);
                 for (size_t mi = 0; mi < gpu.ranges.size(); ++mi) {
                     const MeshGpu::Range& r = gpu.ranges[mi];
-                    if (r.indexCount) ctx->DrawIndexed(r.indexCount, r.firstIndex, r.baseVertex);
+                    if (!r.indexCount || !secVisible(mi)) continue;
+                    setCBx(wireCol, 0.0f, 0.0f, secSlab(mi), 0.0f, 0, 0.0f, 1.0f);
+                    ctx->DrawIndexed(r.indexCount, r.firstIndex, r.baseVertex);
                 }
+            }
+            // 2. the see-through sections (0.372.0): blended over what is solid, depth-tested but NOT
+            // written -- so the curves drawn next are not hidden by a shell they sit inside, and a
+            // strand grown inside a translucent hairdo stays in plain view. With bright edges
+            // (0.374.0) opaque where seen edge-on; with hue by depth, bright yellow near .. dim purple far.
+            ctx->RSSetState(gpu.rsSolid);
+            ctx->OMSetDepthStencilState(gpu.dsWire, 0);
+            for (size_t mi = 0; mi < gpu.ranges.size(); ++mi) {
+                const MeshGpu::Range& r = gpu.ranges[mi];
+                const float op = secOpacity(mi);
+                if (!r.indexCount || !secVisible(mi) || op >= 0.999f) continue;
+                if (op <= 0.001f && !g.rims) continue;              // wholly clear: nothing to draw
+                float rgba[4]; sectionTint(g, mi, op, rgba);
+                float z0 = 0.0f, z1 = 1.0f;
+                if (g.hueDepth) depthRange(mi, z0, z1);
+                setCBx(rgba, view.shade ? 1.0f : 0.0f, g.hueDepth ? 4.0f : 0.0f, secSlab(mi), g.rims ? 1.0f : 0.0f,
+                       g.hueDepth ? 2 : 0, z0, z1);
+                ctx->DrawIndexed(r.indexCount, r.firstIndex, r.baseVertex);
             }
         }
         if (g.lines.vb && g.lines.count) {
@@ -4798,8 +5606,70 @@ static void drawGroomPane(GroomState& g, ID3D11Device* dev, ID3D11DeviceContext*
             ctx->OMSetDepthStencilState(gpu.dsWire, 0);          // tested, not written
             for (size_t bi = 0; bi < g.lines.first.size(); ++bi) {
                 if (!g.lines.num[bi]) continue;
-                setCB(g.lines.colour[bi].data(), 0.0f, 0.0f);   // unlit: the batch colour
+                // unlit: the batch colour; cut by the slab when the guides are (never the selected strand)
+                setCBx(g.lines.colour[bi].data(), 0.0f, 0.0f, g.sliceGuides && bi < g.lines.slab.size() && g.lines.slab[bi], 0.0f, 0, 0.0f, 1.0f);
                 ctx->Draw(g.lines.num[bi], g.lines.first[bi]);
+            }
+        }
+        // the slab's centre cut (0.374.0): the parts' cross-section there, in white, over the rest --
+        // three pixels wide (a D3D11 line is one): drawn five times, shifted a pixel each way
+        if (g.showMesh && g.slabHalf > 0.0 && g.sliceGpu.vb && g.sliceGpu.count) {
+            ctx->IASetVertexBuffers(0, 1, &g.sliceGpu.vb, &stride, &voff);
+            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+            ctx->RSSetState(gpu.rsSolid);
+            ctx->OMSetDepthStencilState(gpu.dsWire, 0);
+            const float m3 = c.mvp[3], m7 = c.mvp[7];
+            const float px = 2.0f / (float)std::max(gpu.texW, 1), py = 2.0f / (float)std::max(gpu.texH, 1);
+            static const float offs[5][2] = { { 0, 0 }, { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+            for (const auto& o : offs) {
+                c.mvp[3] = m3 + o[0] * px; c.mvp[7] = m7 + o[1] * py;
+                for (size_t bi = 0; bi < g.sliceGpu.first.size(); ++bi) {
+                    if (!g.sliceGpu.num[bi]) continue;
+                    setCB(g.sliceGpu.colour[bi].data(), 0.0f, 0.0f);
+                    ctx->Draw(g.sliceGpu.num[bi], g.sliceGpu.first[bi]);
+                }
+            }
+            c.mvp[3] = m3; c.mvp[7] = m7;
+        }
+        // 3. GRID OUTLINES (0.373.0), last: the contour lines of the gridded sections. Hidden-line
+        // unless x-ray -- a depth-only pass of the see-through gridded sections first (pushed a hair
+        // back, so a line on the surface passes where one behind it does not), so each shape shows
+        // only its near side's contours. After the curves, so that depth does not hide the strands
+        // grown inside a shell; a front contour is drawn over them, as it should be.
+        if (g.showMesh && g.gridGpu.vb && g.gridGpu.count) {
+            if (!g.gridXray && gpu.vb && gpu.ib) {
+                ctx->IASetVertexBuffers(0, 1, &gpu.vb, &stride, &voff);
+                ctx->IASetIndexBuffer(gpu.ib, DXGI_FORMAT_R32_UINT, 0);
+                ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ctx->RSSetState(gpu.rsBack);
+                ctx->OMSetDepthStencilState(gpu.dsSolid, 0);
+                ctx->OMSetBlendState(gpu.blendNoColor, bf, 0xffffffff);
+                const float none4[4] = { 0, 0, 0, 0 };
+                for (size_t mi = 0; mi < gpu.ranges.size(); ++mi) {
+                    const MeshGpu::Range& r = gpu.ranges[mi];
+                    if (!r.indexCount || !secVisible(mi) || !secGrid(mi) || secOpacity(mi) >= 0.999f) continue;
+                    setCBx(none4, 0.0f, 0.0f, secSlab(mi), 0.0f, 0, 0.0f, 1.0f);   // the slab cuts the depth too
+                    ctx->DrawIndexed(r.indexCount, r.firstIndex, r.baseVertex);
+                }
+                ctx->OMSetBlendState(gpu.blend, bf, 0xffffffff);
+            }
+            ctx->IASetVertexBuffers(0, 1, &g.gridGpu.vb, &stride, &voff);
+            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+            ctx->RSSetState(gpu.rsSolid);
+            ctx->OMSetDepthStencilState(gpu.dsWire, 0);
+            for (size_t bi = 0; bi < g.gridGpu.first.size() && bi < g.gridSecOf.size(); ++bi) {
+                const size_t si = (size_t)g.gridSecOf[bi];
+                if (!g.gridGpu.num[bi] || si >= g.sections.size() || !g.sections[si].visible || !g.sections[si].grid) continue;
+                // the section's own colour: darkened over an opaque fill, brightened over a faint one --
+                // or (0.374.0) a hue per line and / or a hue by depth
+                float rgba[4]; sectionTint(g, si, 0.85f, rgba);
+                const bool overFill = g.sections[si].opacity >= 0.5f;
+                for (int k = 0; k < 3; ++k) rgba[k] = overFill ? rgba[k] * 0.30f : std::min(1.0f, rgba[k] * 1.1f + 0.05f);
+                const int flags = (g.gridHueLine ? 1 : 0) | (g.hueDepth ? 2 : 0);
+                float z0 = 0.0f, z1 = 1.0f;
+                if (g.hueDepth) depthRange(si, z0, z1);
+                setCBx(rgba, 0.0f, flags ? 4.0f : 0.0f, secSlab(si), 0.0f, flags, z0, z1);
+                ctx->Draw(g.gridGpu.num[bi], g.gridGpu.first[bi]);
             }
         }
         ID3D11RenderTargetView* noRtv[1] = { nullptr };
@@ -4822,14 +5692,18 @@ static void drawGroomPane(GroomState& g, ID3D11Device* dev, ID3D11DeviceContext*
             const ImVec2 s = g.cam.toScreen(xfOf(g, n->id).apply(n->pts[(size_t)pt].p));
             if (filled) dl->AddCircleFilled(s, rr, col); else dl->AddCircle(s, rr * 1.4f, col, 0, 2.0f);
         };
+        // the box-selected points (0.373.0), and the box being dragged out
+        for (const auto& pr : g.selPts) mark(pr.first, pr.second, IM_COL32(90, 220, 255, 235), true);
+        if (g.boxing) {
+            const ImVec2 a(std::min(g.boxA.x, g.boxB.x), std::min(g.boxA.y, g.boxB.y)), b(std::max(g.boxA.x, g.boxB.x), std::max(g.boxA.y, g.boxB.y));
+            dl->AddRectFilled(a, b, IM_COL32(90, 220, 255, 40));
+            dl->AddRect(a, b, IM_COL32(90, 220, 255, 200), 0.0f, 0, 1.5f);
+        }
         mark(g.hoverNode, g.hoverPt, IM_COL32(255, 230, 90, 255), false);
         mark(g.selNode, g.selPt, IM_COL32(255, 255, 255, 230), true);
         dl->PopClipRect();
     }
-    int totalTris = 0; for (const auto& m : g.meshes) totalTris += m.nfaces;
-    ImGui::Text("%d mesh(es), %d tris  |  %zu strand(s) of fur  |  picks on \"%s\"%s%s", (int)g.meshes.size(), totalTris,
-                g.loaded.scene.curves.size(), g.target.c_str(), g.pickAny ? " or any mesh" : "",
-                g.stale ? "  |  placed strands and fur are STALE (save + reload)" : "");
+    ImGui::TextWrapped("%s", statusLine.c_str());
 }
 
 // ---- the panel: toggles, the selection being edited, the tree, the fur ----------------------------
@@ -4845,10 +5719,14 @@ static void treeNode(GroomState& g, groom::Node& n, int depth) {
     ImGui::PushID(n.id);
     bool on = nodeVisible(g, shown->id);
     if (ImGui::Checkbox("##on", &on)) { g.nodeOn[shown->id] = on ? 1 : 0; g.lines.dirty = true; }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("show / hide this curve in the pane -- NOT a selection.\n"
+                          "To select several curves, Ctrl-click their NAMES (they turn highlighted, marked *);\n"
+                          "then Del deletes them and G groups them. Shift-drag in the pane selects points.");
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(col[0], col[1], col[2], 1.0f));
     ImGuiTreeNodeFlags fl = ImGuiTreeNodeFlags_OpenOnArrow | (shown->kids.empty() ? ImGuiTreeNodeFlags_Leaf : 0)
-                          | (g.selNode == shown->id ? ImGuiTreeNodeFlags_Selected : 0) | ImGuiTreeNodeFlags_DefaultOpen;
+                          | ((g.selNode == shown->id || isMulti(g, shown->id)) ? ImGuiTreeNodeFlags_Selected : 0) | ImGuiTreeNodeFlags_DefaultOpen;
     char label[256];
     std::string extra;
     if (shown->kids.empty()) extra = std::to_string(shown->pts.size()) + (shown->pts.size() == 1 ? " point" : " points");
@@ -4866,7 +5744,7 @@ static void treeNode(GroomState& g, groom::Node& n, int depth) {
     bool open = ImGui::TreeNodeEx("node", fl, "%s%s", isMulti(g, shown->id) ? "* " : "", label);
     ImGui::PopStyleColor();
     if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
-        if (ImGui::GetIO().KeyCtrl) toggleMulti(g, shown->id);
+        if (ImGui::GetIO().KeyCtrl) { toggleMulti(g, shown->id); g.selPts.clear(); }
         else select(g, (g.selNode == shown->id) ? -1 : shown->id, -1);
     }
     if (open) {
@@ -4971,30 +5849,255 @@ static void drawNodeParams(GroomState& g, groom::Node& n) {
     }
 }
 
+// Narrow-panel layout (0.373.0): the next item goes on this line if it fits, else on the next --
+// the panel is a third of the window, and at 150 % scaling a row of buttons ran off its edge.
+static void flowNext(float w) { ImGui::SameLine(); if (ImGui::GetContentRegionAvail().x < w) ImGui::NewLine(); }
+static float btnW(const char* s) { return ImGui::CalcTextSize(s, nullptr, true).x + 2.0f * ImGui::GetStyle().FramePadding.x; }
+static float chkW(const char* s) { return ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize(s, nullptr, true).x; }
+static void disabledWrapped(const char* s) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("%s", s);
+    ImGui::PopStyleColor();
+}
+
+// The Sections panel (0.372.0): every part of every mesh, each hideable and see-through. A part
+// the scene SKIPS is listed too (drawn, never rendered): that is how a sculpted hairdo the render
+// replaces with strands shows up here as the shape to groom inside.
+static void drawSectionsSection(GroomState& g) {
+    if (!ImGui::CollapsingHeader("Sections", ImGuiTreeNodeFlags_DefaultOpen)) return;
+    disabledWrapped("the meshes' parts, read from the scene file (hover here for more)");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Each row is one part: a glTF material within a mesh (\"alice2 / root.4\"), or a whole mesh\n"
+                          "(an OBJ, a primitive). The list and every default come from the scene file:\n"
+                          "  * a part the scene SKIPS (`skip_material`) is loaded for reference only -- never\n"
+                          "    rendered -- and starts faint, its folds shown by bright edges: the shape to groom inside;\n"
+                          "  * 'roots' starts ticked on the meshes the fur blocks grow on (`fur { on \"...\" }`).\n"
+                          "Any of it can be changed here, for any part.");
+    const float sliderW = ImGui::GetFontSize() * 3.2f;
+    bool changed = false, gridChanged = false, rootsChanged = false;
+    if (g.sections.empty()) ImGui::TextDisabled("(no meshes)");
+    else if (ImGui::BeginTable("sections", 5, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("show");
+        ImGui::TableSetupColumn("opacity");
+        ImGui::TableSetupColumn("grid");
+        ImGui::TableSetupColumn("roots");
+        ImGui::TableSetupColumn("part", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < g.sections.size(); ++i) {
+            Section& s = g.sections[i];
+            ImGui::PushID((int)i);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            changed |= ImGui::Checkbox("##vis", &s.visible);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("show / hide (a hidden part is looked through)");
+            ImGui::TableSetColumnIndex(1);
+            ImGui::SetNextItemWidth(sliderW);
+            changed |= ImGui::SliderFloat("##op", &s.opacity, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("opacity: below 1 the part is see-through, and clicks and hovering pass through it\n(0 with 'grid' ticked: the outline alone)");
+            ImGui::TableSetColumnIndex(2);
+            gridChanged |= ImGui::Checkbox("##grid", &s.grid);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("grid: draw the part as an OUTLINE -- its surface's contour lines, cut by evenly spaced\nplanes -- so a folded shape reads clearly even when see-through (settings below)");
+            ImGui::TableSetColumnIndex(3);
+            rootsChanged |= ImGui::Checkbox("##roots", &s.roots);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("roots: a new strand's FIRST point (its root) is planted on the parts ticked here\n(by default the meshes the scene's fur blocks grow on)");
+            ImGui::TableSetColumnIndex(4);
+            if (s.reference) ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.42f, 1.0f), "%s", s.label.c_str());
+            else ImGui::TextUnformatted(s.label.c_str());
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s\n%zu triangles%s%s", s.label.c_str(), s.triCount(),
+                                  s.reference ? "\nskipped by the scene (`skip_material`): shown here for reference, never rendered" : "",
+                                  s.roots ? "\na roots section: new strands are rooted here" : "");
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    // READING A SEE-THROUGH PART (0.374.0): edges, hues, and a slab
+    ImGui::Checkbox("bright edges", &g.rims);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("See-through parts turn opaque and bright where the surface is seen EDGE-ON, and stay clear\n"
+                          "where it faces you: every fold, curl and lock edge becomes an outline, and what is inside\n"
+                          "stays visible. With a part's opacity at 0, the edges alone.");
+    flowNext(chkW("hue by depth"));
+    ImGui::Checkbox("hue by depth", &g.hueDepth);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Colour see-through parts and grid lines by their DISTANCE from you: bright yellow near, then\n"
+                          "green, teal and blue, to a dim purple far. A line that dives behind a lock changes colour on the\n"
+                          "way, and stacked layers separate. The colours follow the view as you orbit.");
+    if (std::any_of(g.sections.begin(), g.sections.end(), [](const Section& s) { return s.grid; })) {
+        ImGui::TextUnformatted("grid:"); ImGui::SameLine();
+        ImGui::SetNextItemWidth(sliderW * 1.4f);
+        if (ImGui::SliderFloat("lines", &g.gridLines, 8.0f, 200.0f, "%.0f", ImGuiSliderFlags_Logarithmic)) gridChanged = true;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("how many contour lines fit across the framed extent (their spacing: extent / lines)");
+        static const char* axisNames[3] = { "x", "y", "z" };
+        for (int k = 0; k < 3; ++k) {
+            flowNext(chkW(axisNames[k]));
+            if (ImGui::Checkbox(axisNames[k], &g.gridAxis[k])) gridChanged = true;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("lines where the planes %s = constant cut the surface", axisNames[k]);
+        }
+        flowNext(chkW("hue per line"));
+        ImGui::Checkbox("hue per line", &g.gridHueLine);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Each contour line its own colour -- six in turn (orange, yellow, green, cyan, blue, violet;\n"
+                              "never red, the guides' colour) -- so neighbouring lines never match and one line can be\n"
+                              "followed through a tangle. With 'hue by depth' as well, each line dims with distance.\n"
+                              "Clearest with one direction of lines only (untick two of x / y / z).");
+        flowNext(chkW("far side too"));
+        ImGui::Checkbox("far side too", &g.gridXray);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("off: only the lines on the near side of each part (hidden-line); on: the far side's too");
+    }
+    if (ImGui::Checkbox("slice", &g.sliceOn)) g.sectionsDirty = true;   // what blocks hovering changes
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Show only a SLAB of the see-through and gridded parts, with their cross-section at its centre\n"
+                          "in white: in a horizontal slab through a hairdo, the outline of every lock at that height.\n"
+                          "Ctrl+wheel in the view moves it through the part. A point placed 'inside a section' goes\n"
+                          "inside the slab -- the part you can see.");
+    if (g.sliceOn) {
+        static const char* across[4] = { "x", "y (height)", "z", "your view (depth)" };
+        flowNext(ImGui::GetFontSize() * 7.0f);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 7.0f);
+        ImGui::Combo("across", &g.sliceAxis, across, 4);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("the direction the slab is thin in; 'your view' is a slab of depth, turning as you orbit");
+        ImGui::SetNextItemWidth(sliderW * 2.0f);
+        ImGui::SliderFloat("at", &g.slicePos, 0.0f, 1.0f, "%.3f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("where the slab's centre is, across the parts it cuts (Ctrl+wheel in the view)");
+        flowNext(sliderW * 1.6f + chkW("thick"));
+        ImGui::SetNextItemWidth(sliderW * 1.6f);
+        ImGui::SliderFloat("thick", &g.sliceThick, 0.005f, 0.5f, "%.3f", ImGuiSliderFlags_Logarithmic);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("the slab's thickness, as a fraction of the parts' extent across it");
+        flowNext(chkW("guides too"));
+        ImGui::Checkbox("guides too", &g.sliceGuides);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("cut the guide curves by the slab as well (the selected strand is always drawn whole)");
+        flowNext(chkW("solid parts too"));
+        if (ImGui::Checkbox("solid parts too", &g.sliceSolids)) g.sectionsDirty = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("cut every part by the slab, the head and body too -- a slice of the whole scene, like a scan;\n"
+                              "with 'look along it', the head's outline and every lock's around it. What is cut away\n"
+                              "cannot be clicked or hovered.");
+        if (g.sliceAxis < 3) {
+            flowNext(btnW("look along it"));
+            if (ImGui::Button("look along it")) {
+                // turn the view to face the slab: its cross-section then reads as a flat outline
+                // (toward = (-cos p sin y, sin p, cos p cos y): +y from above, +x from the side, +z from the front)
+                if (g.sliceAxis == 1)      { g.view.pitch = 1.5707963f; }
+                else if (g.sliceAxis == 0) { g.view.pitch = 0.0f; g.view.yaw = -1.5707963f; }
+                else                       { g.view.pitch = 0.0f; g.view.yaw = 0.0f; }
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("turn the view to look straight through the slab: for a slab across y, from above --\nthe cross-section of every lock around the head, like a scan");
+        }
+    }
+    if (changed) g.sectionsDirty = true;
+    if (gridChanged) g.gridDirty = true;
+    if (rootsChanged) updateRootsLabel(g);
+}
+
 static void drawEditSection(GroomState& g) {
     if (!ImGui::CollapsingHeader("Edit", ImGuiTreeNodeFlags_DefaultOpen)) return;
     if (ImGui::Button("new strand (N)")) newStrand(g);
-    ImGui::SameLine();
+    flowNext(btnW("undo (Ctrl+Z)"));
     if (ImGui::Button("undo (Ctrl+Z)")) undoLast(g);
-    ImGui::SameLine();
+    flowNext(btnW("save (Ctrl+S)"));
     if (ImGui::Button("save (Ctrl+S)")) groomSave(g);
-    ImGui::SameLine();
+    flowNext(btnW("reload"));
     if (ImGui::Button("reload")) { g.status = "reloading..."; groomLoadScene(g); if (g.ok) g.status = "reloaded"; }
-    if (!g.multi.empty()) {
-        char gl[96]; std::snprintf(gl, sizeof gl, "group the %zu Ctrl-selected into a curve of curves (G)", g.multi.size());
-        if (ImGui::Button(gl)) groupMulti(g);
-    } else {
-        ImGui::TextDisabled("Ctrl-click curves in the tree to select several; G groups them");
+    const float fieldW = ImGui::GetFontSize() * 6.0f;
+    // WHERE NEW POINTS GO (0.373.0). A strand is a chain of points from its root to its tip: the
+    // root on a roots section (the scalp), every later point off it -- in the air, or inside a part.
+    ImGui::TextUnformatted("place new points (after the root):");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("A strand is a chain of points from ROOT to TIP. Its first click (after N) plants the root on a\n"
+                          "roots section (the scalp; tick 'roots' in Sections for others). Every later click adds the next\n"
+                          "point -- after the selected one -- placed as chosen here. Dragging a point moves it the same way.");
+    ImGui::Indent();
+    ImGui::RadioButton("in the air", &g.placeMode, 1);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Where you click, at the same depth (distance from you) as the point it follows: draw the\n"
+                          "strand's shape as seen from here, then orbit and drag points to move them in depth.\n"
+                          "A dragged point moves in the screen plane.");
+    flowNext(chkW("on surfaces"));
+    ImGui::RadioButton("on surfaces", &g.placeMode, 0);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("On the roots sections under the click (any visible mesh with 'any mesh' ticked):\n"
+                          "for strands that lie ON a surface. A dragged point slides on it.");
+    flowNext(chkW("inside a section"));
+    // a part one places INSIDE has to be seen (and clicked) through: made so when it is chosen
+    auto seeThrough = [&](int i) {
+        if (i < 0 || i >= (int)g.sections.size()) return;
+        Section& s = g.sections[(size_t)i];
+        if (!s.visible || s.opacity >= 0.999f) { s.visible = true; s.opacity = 0.35f; g.sectionsDirty = true; }
+    };
+    {
+        const bool haveInside = g.insideSec >= 0 && g.insideSec < (int)g.sections.size();
+        if (ImGui::RadioButton("inside a section", g.placeMode == 2)) {
+            if (!haveInside)                      // choose one: the first see-through part, else the first part
+                for (size_t i = 0; i < g.sections.size(); ++i)
+                    if (g.sections[i].reference || g.sections[i].opacity < 0.999f) { g.insideSec = (int)i; break; }
+            if (g.insideSec < 0 && !g.sections.empty()) g.insideSec = 0;
+            if (g.insideSec >= 0) { g.placeMode = 2; seeThrough(g.insideSec); }
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Inside the part chosen below -- e.g. a sculpted hairdo the render skips: 'depth' of the way\n"
+                              "from where the pixel's ray enters it (0) to the next surface behind (1: its far side, or the\n"
+                              "scalp under it). A dragged point keeps its depth. The part is made see-through when chosen.");
     }
+    if (g.placeMode == 2) {
+        const bool on = g.insideSec >= 0 && g.insideSec < (int)g.sections.size();
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::BeginCombo("##inside", on ? g.sections[(size_t)g.insideSec].label.c_str() : "(choose a section)")) {
+            for (size_t i = 0; i < g.sections.size(); ++i) {
+                ImGui::PushID((int)i);
+                if (ImGui::Selectable(g.sections[i].label.c_str(), g.insideSec == (int)i)) { g.insideSec = (int)i; seeThrough((int)i); }
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("the part new points are placed inside");
+        ImGui::SetNextItemWidth(fieldW);
+        ImGui::SliderFloat("depth", &g.insideDepth, 0.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("0 = where the ray enters the part, 1 = at the next surface behind it");
+    }
+    ImGui::Unindent();
+    ImGui::Checkbox("sketch", &g.sketchMode);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Sketch strands: press on a roots section and drag -- a new strand is drawn along the drag,\n"
+                          "a point every 'spacing' pixels, placed as chosen above (so 'inside a section' sketches a\n"
+                          "strand through the inside of the part). Right-drag orbits while sketching.");
+    if (g.sketchMode) {
+        flowNext(fieldW + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize("spacing (px)").x);
+        ImGui::SetNextItemWidth(fieldW);
+        ImGui::SliderFloat("spacing (px)", &g.sketchStep, 8.0f, 120.0f, "%.0f");
+    }
+    flowNext(chkW("click plots"));
     ImGui::Checkbox("click plots", &g.addOnClick);
-    ImGui::SameLine();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("a click in the view adds a point to the selected strand (untick to only select and drag)");
+    flowNext(chkW("any mesh"));
     ImGui::Checkbox("any mesh", &g.pickAny);
-    ImGui::SameLine();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("roots, and 'on surfaces' points, may land on any visible mesh, not only the roots sections");
+    flowNext(ImGui::CalcTextSize("(Alt: never grab a point)").x);
     ImGui::TextDisabled("(Alt: never grab a point)");
-    const float fieldW = ImGui::GetFontSize() * 7.5f;
+    // SELECTING SEVERAL, AND DELETING (0.373.0)
+    if (!g.selPts.empty()) {
+        char b1[64]; std::snprintf(b1, sizeof b1, "delete the %zu selected points (Del)", g.selPts.size());
+        if (ImGui::Button(b1)) deleteSelected(g);
+        flowNext(btnW("select their strands"));
+        if (ImGui::Button("select their strands")) selectStrandsOfPoints(g);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("select the whole strands these points belong to (to delete or group them)");
+        flowNext(btnW("clear (Esc)"));
+        if (ImGui::Button("clear (Esc)")) clearSelection(g);
+    } else if (!g.multi.empty()) {
+        char b1[64]; std::snprintf(b1, sizeof b1, "delete the %zu selected curves (Del)", g.multi.size());
+        if (ImGui::Button(b1)) deleteSelected(g);
+        flowNext(btnW("group them (G)"));
+        if (ImGui::Button("group them (G)")) groupMulti(g);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("group the selected curves into a curve of curves");
+        flowNext(btnW("clear (Esc)"));
+        if (ImGui::Button("clear (Esc)")) clearSelection(g);
+    } else {
+        if (ImGui::Button("select all strands (Ctrl+A)")) selectAllStrands(g);
+        disabledWrapped("or Ctrl-click curve names in Curves; Shift-drag in the view selects points");
+    }
     groom::Node* n = (g.selNode >= 0) ? groom::findNode(g.model, g.selNode) : nullptr;
     if (!n) {
-        ImGui::TextDisabled("nothing selected: click a curve in the tree or a point in the pane");
+        disabledWrapped("nothing selected: press N for a new strand, or click a curve in the tree or a point in the view");
     } else {
         groom::Where w = groom::whereIs(g.model, n->id);
         const int level = groom::levelOf(g.model, *n);
@@ -5009,8 +6112,9 @@ static void drawEditSection(GroomState& g) {
                 ImGui::Text("point %d of %zu (authored coordinates)", g.selPt, n->pts.size());
                 double v[3] = { p.p.x, p.p.y, p.p.z };
                 bool ch = false;
-                ImGui::SetNextItemWidth(fieldW); ch |= ImGui::InputDouble("x", &v[0], 0, 0, "%.6g"); if (ImGui::IsItemActivated()) pushUndo(g); ImGui::SameLine();
-                ImGui::SetNextItemWidth(fieldW); ch |= ImGui::InputDouble("y", &v[1], 0, 0, "%.6g"); if (ImGui::IsItemActivated()) pushUndo(g); ImGui::SameLine();
+                const float coordW = fieldW + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize("x").x;
+                ImGui::SetNextItemWidth(fieldW); ch |= ImGui::InputDouble("x", &v[0], 0, 0, "%.6g"); if (ImGui::IsItemActivated()) pushUndo(g); flowNext(coordW);
+                ImGui::SetNextItemWidth(fieldW); ch |= ImGui::InputDouble("y", &v[1], 0, 0, "%.6g"); if (ImGui::IsItemActivated()) pushUndo(g); flowNext(coordW);
                 ImGui::SetNextItemWidth(fieldW); ch |= ImGui::InputDouble("z", &v[2], 0, 0, "%.6g"); if (ImGui::IsItemActivated()) pushUndo(g);
                 if (ch) { p.p = Vec3{ v[0], v[1], v[2] }; p.edited = true; markEdited(g, n->id); }
                 bool hr = p.haveR;
@@ -5022,9 +6126,10 @@ static void drawEditSection(GroomState& g) {
                     if (ImGui::IsItemActivated()) pushUndo(g);
                 }
                 if (ImGui::Button("delete point (Del)")) deletePoint(g);
-                ImGui::SameLine();
+                flowNext(btnW("delete strand"));
             } else {
-                ImGui::Text("%zu points -- click one in the pane to edit it; a click on the surface appends", n->pts.size());
+                ImGui::TextWrapped("%zu point(s) -- %s; click one in the pane to edit it", n->pts.size(),
+                                   n->pts.empty() ? "click a roots section in the pane to plant its root" : "a click in the pane adds the next point at the end");
             }
             if (ImGui::Button("delete strand")) deleteStrand(g);
         } else {
@@ -5037,23 +6142,31 @@ static void drawEditSection(GroomState& g) {
 }
 
 static void drawGroomPanel(GroomState& g) {
-    ImGui::TextWrapped("scene: %s", g.scenePath.c_str());
+    if (ImGui::Button("Help (F1)")) g.showHelp = true;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("how everything here works: strands, placing points, sections, grids, selecting, saving");
+    ImGui::SameLine();
+    ImGui::TextWrapped("scene: %s", std::filesystem::path(g.scenePath).filename().string().c_str());
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", g.scenePath.c_str());
     if (!g.ok) { ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "load failed: %s", g.err.c_str()); return; }
     ImGui::Separator();
     bool d = false;
-    d |= ImGui::Checkbox("mesh", &g.showMesh);        ImGui::SameLine();
-    d |= ImGui::Checkbox("wireframe", &g.view.wire);  ImGui::SameLine();
+    d |= ImGui::Checkbox("mesh", &g.showMesh);        flowNext(chkW("wireframe"));
+    d |= ImGui::Checkbox("wireframe", &g.view.wire);  flowNext(chkW("shade"));
     d |= ImGui::Checkbox("shade", &g.view.shade);
-    d |= ImGui::Checkbox("curves", &g.showCurves);    ImGui::SameLine();
-    d |= ImGui::Checkbox("points", &g.showPoints);    ImGui::SameLine();
-    d |= ImGui::Checkbox("hair", &g.showHair);        ImGui::SameLine();
+    d |= ImGui::Checkbox("curves", &g.showCurves);    flowNext(chkW("points"));
+    d |= ImGui::Checkbox("points", &g.showPoints);    flowNext(chkW("hair"));
+    d |= ImGui::Checkbox("hair", &g.showHair);        flowNext(chkW("roots"));
     d |= ImGui::Checkbox("roots", &g.showRoots);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("the grown fur's roots, as small crosses ('hair' draws the fur itself)");
     ImGui::TextUnformatted("frame:"); ImGui::SameLine();
     bool f = false;
     f |= ImGui::RadioButton("groom", &g.frameMode, 0); ImGui::SameLine();
     f |= ImGui::RadioButton("all", &g.frameMode, 1);   ImGui::SameLine();
     if (ImGui::SmallButton("reset view")) { g.view.yaw = 0.6f; g.view.pitch = 0.4f; g.view.zoom = 1.0f; }
-    if (f) { groomComputeFrame(g); d = true; }           // cross sizes follow the frame
+    if (f) { groomComputeFrame(g); d = true; g.gridDirty = true; }   // cross sizes and grid spacing follow the frame
+    // Edit first (0.373.0): it is used on every click; the parts and levels are set once
+    drawEditSection(g);
+    drawSectionsSection(g);
     if (ImGui::CollapsingHeader("Levels", ImGuiTreeNodeFlags_DefaultOpen)) {
         // A level is a node's HEIGHT in the tree (groom.h levelOf, computed bottom-up), not a
         // refinement pass you add. Saying so here because the colour-per-level display reads
@@ -5077,7 +6190,6 @@ static void drawGroomPanel(GroomState& g) {
         }
     }
     if (d) g.lines.dirty = true;
-    drawEditSection(g);
     if (ImGui::CollapsingHeader("Curves", ImGuiTreeNodeFlags_DefaultOpen)) {
         // roots of the tree: curves nobody references by name
         std::map<std::string, int> referenced;
@@ -5099,21 +6211,366 @@ static void drawGroomPanel(GroomState& g) {
 
 static void groomHotkeys(GroomState& g) {
     ImGuiIO& io = ImGui::GetIO();
+    if (ImGui::IsKeyPressed(ImGuiKey_F1)) g.showHelp = !g.showHelp;
     if (io.WantTextInput) return;
-    if (ImGui::IsKeyPressed(ImGuiKey_Delete)) deletePoint(g);
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete)) deleteSelected(g);
     if (ImGui::IsKeyPressed(ImGuiKey_N) && !io.KeyCtrl) newStrand(g);
     if (ImGui::IsKeyPressed(ImGuiKey_G) && !io.KeyCtrl) groupMulti(g);
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) undoLast(g);
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) groomSave(g);
-    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) { if (g.selPt >= 0) select(g, g.selNode, -1); else select(g, -1, -1); }
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A)) selectAllStrands(g);
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        // one thing at a time: the box being dragged, the selection, then the point, then the strand
+        if (g.boxing) g.boxing = false;
+        else if (!g.selPts.empty() || !g.multi.empty()) clearSelection(g);
+        else if (g.selPt >= 0) select(g, g.selNode, -1);
+        else select(g, -1, -1);
+    }
+}
+
+// ---- the Help window (0.373.0): F1, or the Help button ---------------------------------------------
+static void helpPara(const char* text) { ImGui::TextWrapped("%s", text); ImGui::Spacing(); }
+static void helpBullet(const char* text) { ImGui::Bullet(); ImGui::SameLine(); ImGui::TextWrapped("%s", text); }
+static void drawGroomHelp(GroomState& g) {
+    const float fs = std::max(ImGui::GetIO().FontGlobalScale, 1.0f);
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowBgAlpha(1.0f);                   // opaque: it is read, not glanced through
+    ImGui::SetNextWindowSize(ImVec2(std::min(820.0f * fs, vp->WorkSize.x * 0.9f), std::min(700.0f * fs, vp->WorkSize.y * 0.9f)), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+    if (!ImGui::Begin("ftrace -groom: help (F1 opens and closes it)", &g.showHelp, ImGuiWindowFlags_NoCollapse)) { ImGui::End(); return; }
+    const ImGuiTreeNodeFlags open = ImGuiTreeNodeFlags_DefaultOpen;
+    if (ImGui::CollapsingHeader("What this tool does", open)) {
+        helpPara("ftrace -groom edits the hair of an FTSL scene. The rendered hair is grown by the scene's `fur` blocks from "
+                 "GUIDE CURVES: each guide is a STRAND -- a chain of points from its ROOT on the scalp to its TIP -- and the fur "
+                 "fills in thousands of hairs between the guides. This tool shows the scene's meshes and its guides; you add, "
+                 "move and delete guide points, and Ctrl+S saves them back into the scene's curve files. 'reload' (Edit panel) "
+                 "regrows the fur from what was saved.");
+        helpPara("Nothing here is specific to one model: the parts listed, which one is the scalp and which one is shown "
+                 "see-through all come from the scene file (see Sections), and every one of them can be changed.");
+    }
+    if (ImGui::CollapsingHeader("The view", open)) {
+        helpBullet("Drag empty space, or right-drag anywhere: orbit.   Mouse wheel: zoom.");
+        helpBullet("The line above the view always says what a click will do next.");
+        helpBullet("The line below it: the roots sections, where new points go, what is selected, and whether the fur is stale.");
+        helpBullet("frame: 'groom' centres on the scalp and the guides, 'all' on everything; 'reset view' straightens it.");
+        helpBullet("Guides are coloured by level: strands red, curves of strands green, then blue, yellow ...");
+        helpBullet("Selected point: white dot. Point under the mouse: yellow ring. Box-selected points: cyan dots.");
+        helpBullet("Top checkboxes: mesh, wireframe, shading, curves, their points, the grown hair ('hair') and its roots.");
+        ImGui::Spacing();
+    }
+    if (ImGui::CollapsingHeader("Making a strand (a guide)", open)) {
+        helpPara("1. Press N (or 'new strand'). A new, empty strand is selected.");
+        helpPara("2. Click on a ROOTS section -- normally the scalp -- to plant its root, the point the hair grows from. "
+                 "Only roots sections take a root (see Sections; 'any mesh' lifts that). A see-through part in front, "
+                 "such as a sculpted hairdo, is clicked through.");
+        helpPara("3. Click again for each next point, from root to tip. Where each goes is set by 'place new points' (Edit):");
+        ImGui::Indent();
+        helpPara("in the air -- where you click, at the same depth (distance from you) as the point it follows. Draw the "
+                 "strand's shape as you see it, then orbit to look from the side and drag points to set their depth.");
+        helpPara("on surfaces -- on the roots sections under the click (any visible mesh with 'any mesh'): for hair lying on a surface.");
+        helpPara("inside a section -- inside the part chosen beside it (for instance a sculpted hairdo the render skips), "
+                 "'depth' of the way from where the click's ray enters the part (0) to the next surface behind (1). "
+                 "The part is made see-through when chosen.");
+        ImGui::Unindent();
+        helpPara("A new point goes AFTER the selected point: select a point in the middle and click to insert one there. "
+                 "The renderer needs at least 2 points in a strand.");
+        helpPara("SKETCH instead: tick 'sketch', press on the scalp and drag. A new strand follows the drag, a point every "
+                 "'spacing' pixels, each placed as 'place new points' says -- so with 'inside a section' the strand runs "
+                 "through the inside of the part. Right-drag still orbits.");
+    }
+    if (ImGui::CollapsingHeader("Moving points", open)) {
+        helpBullet("Click a point to select it and its strand; drag it to move it.");
+        helpBullet("A root slides on its roots section. A later point moves the way new points are placed:");
+        ImGui::Indent(); ImGui::TextWrapped("in the screen plane (in the air), through the section's inside keeping its depth (inside), or sliding on surfaces."); ImGui::Unindent();
+        helpBullet("Shift-drag a point: along the surface normal (lift it off or push it in). Ctrl-drag: in the screen plane.");
+        helpBullet("Hold Alt to click through the points (to add a point where one is drawn).");
+        helpBullet("Edit shows the selected point's coordinates to type in, and 'own radius' for its thickness.");
+        ImGui::Spacing();
+    }
+    if (ImGui::CollapsingHeader("Selecting several, and deleting", open)) {
+        helpBullet("Shift-drag on empty space: select the points in the box (cyan). Ctrl+Shift-drag adds to them.");
+        ImGui::Indent(); ImGui::TextWrapped("Only points you can see are taken; a point behind a solid surface is not."); ImGui::Unindent();
+        helpBullet("In the Curves tree, Ctrl-click curve NAMES to select several curves (highlighted, marked *).");
+        ImGui::Indent(); ImGui::TextWrapped("The checkbox beside a name only shows or hides that curve in the view -- it is not a selection."); ImGui::Unindent();
+        helpBullet("'select all strands' (Ctrl+A): every strand that is shown.");
+        helpBullet("Del deletes the selected points if there are any; otherwise the selected curves; otherwise the one selected point.");
+        ImGui::Indent(); ImGui::TextWrapped("A strand left with fewer than 2 points is removed with them. Deleting a guide also takes it out of "
+                                            "any curve of curves that lists it."); ImGui::Unindent();
+        helpBullet("'select their strands' turns selected points into their whole strands (to delete or group whole guides).");
+        helpBullet("Esc clears the selection. Ctrl+Z undoes, up to 100 steps.");
+        ImGui::Spacing();
+    }
+    if (ImGui::CollapsingHeader("Sections: parts, see-through, scalp", open)) {
+        helpPara("The Sections panel lists the parts of the scene's meshes: each glTF material within a mesh (\"alice2 / root.4\"), "
+                 "or a whole mesh when its format has no parts (an OBJ). Each row: show | opacity | grid | roots | name.");
+        helpBullet("opacity below 1 makes a part see-through; clicks and the mouse pass through it to what is behind.");
+        helpBullet("grid draws the part as an outline (below).");
+        helpBullet("roots: a new strand's root is planted on the parts ticked here.");
+        helpPara("Where the defaults come from -- the scene file, nothing built in:");
+        ImGui::Indent();
+        helpPara("A part the scene SKIPS (`skip_material \"...\"` in its mesh block) is left out of the render, but the tool "
+                 "loads it for reference: it is listed in gold as '[skipped by the scene]', starts faint (its folds shown by "
+                 "bright edges), "
+                 "and new points are placed inside it. That is how a sculpted hairdo, replaced in the render by real hair, "
+                 "becomes the shape to groom inside.");
+        helpPara("'roots' starts ticked on the meshes the scene's fur blocks grow on (`fur { on \"scalp\" ... }`); with no fur "
+                 "block, on the first mesh.");
+        ImGui::Unindent();
+    }
+    if (ImGui::CollapsingHeader("Seeing the shape of a see-through part", open)) {
+        helpPara("A folded, see-through surface such as a sculpted hairdo is hard to read: every layer shows at once. "
+                 "Four tools, under the Sections list, each on its own or together:");
+        helpBullet("bright edges (on by default): the part turns opaque and bright where its surface is seen EDGE-ON and "
+                   "stays clear where it faces you, so every fold, curl and lock edge becomes an outline while what is "
+                   "inside stays visible. With the part's opacity at 0 you see the edges alone.");
+        helpBullet("hue by depth: see-through parts and grid lines are coloured by their distance from you -- bright yellow "
+                   "near, then green, teal and blue, to a dim purple far. Stacked layers separate by colour, and a line that "
+                   "dives behind a lock changes colour on the way. The colours follow the view as you orbit.");
+        helpBullet("grid: tick it on a part to draw its contour lines -- where evenly spaced planes (x, y, z = constant) cut "
+                   "its surface. 'lines' sets how many fit across the framed extent, x / y / z choose the plane families. "
+                   "'hue per line' gives each line its own colour, six in turn (none red: red is the guides' colour), so "
+                   "neighbours never match and one line can be followed through a tangle -- clearest with one direction of "
+                   "lines only; with 'hue by depth' too, each line dims with distance. 'far side too' also draws the lines "
+                   "behind the part's near surface.");
+        helpBullet("slice: shows only a SLAB of the see-through and gridded parts, with their cross-section at its centre in "
+                   "white -- in a horizontal slab through a hairdo, the outline of every lock at that height. Choose what it "
+                   "cuts across (x, y, z, or your view: a slab of depth), where it is ('at', or Ctrl+wheel in the view) and "
+                   "how thick. 'guides too' cuts the guides as well (the selected strand is always drawn whole); 'solid "
+                   "parts too' cuts the head and body as well, a slice of the whole scene like a scan. 'look along it' turns "
+                   "the view to look straight through the slab -- for a slab across y, from above. What a slab cuts away "
+                   "cannot be clicked or hovered, and a point placed 'inside a section' goes inside the slab: the part you "
+                   "can see.");
+        ImGui::Spacing();
+        helpPara("A way to work: slice across y, tick 'solid parts too', press 'look along it', and Ctrl+wheel down through "
+                 "the hair -- the head is an outline and every lock a white outline around it, like a scan. Follow a lock "
+                 "down, placing a strand's points inside it at each height (the view can be turned back to the side at "
+                 "any time; the slab stays where it is).");
+    }
+    if (ImGui::CollapsingHeader("Curves tree and levels")) {
+        helpPara("Every curve in the scene's files. A strand (level 0) is a chain of points. A curve of curves (level 1 and up) "
+                 "either GROUPS its children (they render as themselves) or, with count or density, PLACES copies along the "
+                 "path through its children's roots -- its children then become the control cage, not hair. G groups the "
+                 "selected curves into a new curve of curves. The Levels panel shows or hides each level. Click a name to "
+                 "select that curve; the arrow opens it.");
+    }
+    if (ImGui::CollapsingHeader("Fur, and rendering")) {
+        helpPara("The scene's fur blocks, statement by statement: edit a value, remove it (x), or add one. A bald zone is a "
+                 "sphere where no hair grows: 'pick centre', then click the surface. 'save + render' saves and starts a real "
+                 "ftrace render from this view, in its own window.");
+    }
+    if (ImGui::CollapsingHeader("Saving", open)) {
+        helpPara("Ctrl+S (or 'save') writes the guides back to the files they came from. A scene with no curve file gets one, "
+                 "<scene>_groom.ftsl, included from the scene. The fur shown is from the last load: after an edit it is marked "
+                 "STALE -- save, then 'reload', to regrow it.");
+    }
+    if (ImGui::CollapsingHeader("Keys and mouse", open)) {
+        static const char* keys[][2] = {
+            { "N", "new strand" },
+            { "click", "the selected strand's next point (its root, first)" },
+            { "drag a point", "move it  (Shift: along the normal, Ctrl: in the screen plane)" },
+            { "Shift-drag", "box-select points  (Ctrl+Shift: add to them)" },
+            { "drag empty / right-drag", "orbit;  wheel: zoom" },
+            { "Ctrl+wheel", "move the slice (with 'slice' ticked)" },
+            { "Alt", "click through the points" },
+            { "Del", "delete the selected points, else the selected curves, else the selected point" },
+            { "Esc", "clear the selection, then the point, then the strand" },
+            { "Ctrl+A", "select all strands" },
+            { "G", "group the selected curves into a curve of curves" },
+            { "Ctrl+Z / Ctrl+S", "undo / save" },
+            { "F1", "this help" },
+        };
+        if (ImGui::BeginTable("keys", 2, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
+            for (const auto& k : keys) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(k[0]);
+                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(k[1]);
+            }
+            ImGui::EndTable();
+        }
+    }
+    ImGui::End();
 }
 
 }  // namespace groom
 
-int runGroomGui(const std::string& scenePath) {
+int groomSectionsReport(const std::string& scenePath) {
+    groom::GroomState g;
+    g.scenePath = scenePath;
+    if (!groom::groomLoadScene(g)) return 1;        // prints the sections with their bounds
+    groom::updateTriPass(g);
+    for (const groom::Section& S : g.sections)
+        std::printf("[groom-sections] %-48s %8zu tris  opacity %.2f%s%s%s\n", S.label.c_str(), S.triCount(), S.opacity,
+                    S.reference ? "  reference (skipped by the scene)" : "", S.grid ? "  [grid]" : "", S.roots ? "  [roots]" : "");
+    const int defMode = g.placeMode, defInside = g.insideSec;
+    static const char* modeNames[] = { "on surfaces", "in the air", "inside a section" };
+    std::printf("[groom-sections] new points go %s%s%s; roots on: %s\n", modeNames[std::clamp(defMode, 0, 2)],
+                defMode == 2 ? " -- " : "", defMode == 2 ? g.sections[(size_t)defInside].label.c_str() : "", g.target.c_str());
+    // the grid outlines (0.373.0) -- of the gridded sections, and of each skipped part, which since
+    // 0.374.0 starts without one (bright edges instead) but is what a grid is for
+    {
+        std::vector<char> hadGrid;
+        for (groom::Section& S : g.sections) { hadGrid.push_back(S.grid ? 1 : 0); if (S.reference) S.grid = true; }
+        std::vector<groom::LineBatch> gb;
+        double ms = 0.0;
+        { MsTimer t(&ms); groom::buildGridLines(g, gb); }
+        for (size_t i = 0; i < g.sections.size(); ++i) g.sections[i].grid = hadGrid[i] != 0;
+        for (size_t b = 0; b < gb.size() && b < g.gridSecOf.size(); ++b)
+            std::printf("[groom-sections] grid outline of \"%s\": %zu segments, planes %.4g m apart (built in %.1f ms)\n",
+                        g.sections[(size_t)g.gridSecOf[b]].label.c_str(), gb[b].v.size() / 2,
+                        (double)g.frameExt / std::max(4.0, (double)g.gridLines), ms);
+    }
+    // For each part the scene skips, probe rays through its middle along the axes: the interval
+    // "grow inside" finds, where depth 0 / 0.5 / 1 puts a point, and where the same pixel's click
+    // would put a ROOT (on the roots mesh, through the see-through part) -- or what blocks it.
+    for (size_t si = 0; si < g.sections.size(); ++si) {
+        const groom::Section& S = g.sections[si];
+        if (!S.reference || S.ref.empty()) continue;
+        Vec3 lo{1e30, 1e30, 1e30}, hi{-1e30, -1e30, -1e30};
+        for (const Tri& t : S.ref)
+            for (const Vec3* v : { &t.v0, &t.v1, &t.v2 }) {
+                lo.x = std::min(lo.x, v->x); lo.y = std::min(lo.y, v->y); lo.z = std::min(lo.z, v->z);
+                hi.x = std::max(hi.x, v->x); hi.y = std::max(hi.y, v->y); hi.z = std::max(hi.z, v->z);
+            }
+        const Vec3 c = (lo + hi) * 0.5;
+        const double R = std::sqrt(dot(hi - lo, hi - lo));
+        g.insideSec = (int)si;
+        static const Vec3 dirs[] = { {0, 0, -1}, {0, 0, 1}, {-1, 0, 0}, {1, 0, 0}, {0, -1, 0} };
+        static const char* names[] = { "from the front (+z)", "from behind (-z)", "from her left (+x)", "from her right (-x)", "from above (+y)" };
+        for (int k = 0; k < 5; ++k) {
+            const Vec3 d = dirs[k];
+            const Vec3 o = c - d * (2.0 * R);
+            double t0, t1;
+            if (!groom::insideInterval(g, o, d, (int)si, t0, t1)) {
+                std::printf("[groom-sections]   probe %s: no interval (the ray misses \"%s\", or something solid is in front of it)\n",
+                            names[k], S.label.c_str());
+                continue;
+            }
+            const Vec3 p0 = o + d * t0, pm = o + d * (t0 + 0.5 * (t1 - t0)), p1 = o + d * t1;
+            const groom::Pick root = groom::pickSurfaceRay(g, o, d, true);
+            std::printf("[groom-sections]   probe %s: enters at (%.4f %.4f %.4f), next surface at (%.4f %.4f %.4f), "
+                        "%.4f m inside; depth 0.5 -> (%.4f %.4f %.4f); a root click there %s",
+                        names[k], p0.x, p0.y, p0.z, p1.x, p1.y, p1.z, t1 - t0, pm.x, pm.y, pm.z,
+                        root.hit ? "lands on the roots mesh" : "finds no roots mesh (something solid is in front, or the ray misses it)");
+            if (root.hit) std::printf(" at (%.4f %.4f %.4f)", root.p.x, root.p.y, root.p.z);
+            std::printf("\n");
+        }
+    }
+    // A strand placed the way the pane's clicks place one (0.373.0): a camera looking straight
+    // down on the groom (a 1000-px pane across the frame), the root clicked at the pixel nearest
+    // the centre whose click reaches a roots section, then the next point 20 px to the side in
+    // each of the three modes -- through placeNextPoint, the code a click runs.
+    {
+        groom::PaneCam& cam = g.cam;
+        const float R[3][3] = { { 1, 0, 0 }, { 0, 0, -1 }, { 0, 1, 0 } };      // right, up, toward (+y: from above)
+        for (int r = 0; r < 3; ++r) for (int k = 0; k < 3; ++k) cam.R[r][k] = R[r][k];
+        for (int k = 0; k < 3; ++k) cam.mid[k] = g.frameMid[k];
+        cam.origin = ImVec2(0.0f, 0.0f); cam.avail = ImVec2(1000.0f, 1000.0f);
+        cam.ax = cam.ay = 2.0f / std::max(g.frameExt, 1e-3f); cam.s = 1000.0f / std::max(g.frameExt, 1e-3f);
+        cam.diag = g.frameDiag; cam.valid = true;
+        groom::Node n; n.id = -12345;                                     // a scratch strand, not in the model
+        Vec3 p; std::string why = "no pixel of the middle half reaches a roots section";
+        ImVec2 rootPx(-1.0f, -1.0f);
+        float bestD2 = 1e30f;
+        for (int iy = 0; iy <= 20; ++iy)
+            for (int ix = 0; ix <= 20; ++ix) {
+                const ImVec2 px(250.0f + 25.0f * ix, 250.0f + 25.0f * iy);
+                const float d2 = (px.x - 500.0f) * (px.x - 500.0f) + (px.y - 500.0f) * (px.y - 500.0f);
+                if (d2 >= bestD2) continue;
+                Vec3 q; std::string w;
+                if (groom::placeNextPoint(g, px, &n, q, w)) { bestD2 = d2; rootPx = px; p = q; }
+                else if (rootPx.x < 0.0f && px.x == 500.0f && px.y == 500.0f) why = w;
+            }
+        if (rootPx.x < 0.0f) {
+            std::printf("[groom-sections] placement from above: no root click lands (%s)\n", why.c_str());
+        } else {
+            groom::Pt rp; rp.p = p; n.pts.push_back(rp);
+            std::printf("[groom-sections] placement from above: root clicked at pixel (%.0f, %.0f) of 1000x1000 -> (%.4f %.4f %.4f)\n",
+                        rootPx.x, rootPx.y, p.x, p.y, p.z);
+            g.insideSec = defInside;
+            for (int mode = 0; mode < 3; ++mode) {
+                if (mode == 2 && (defInside < 0 || defInside >= (int)g.sections.size())) continue;
+                g.placeMode = mode;
+                Vec3 q; std::string w2;
+                const bool ok = groom::placeNextPoint(g, ImVec2(rootPx.x + 20.0f, rootPx.y), &n, q, w2);
+                if (ok) std::printf("[groom-sections]   next point %-16s -> (%.4f %.4f %.4f)%s\n", modeNames[mode], q.x, q.y, q.z,
+                                    mode == 1 ? (std::fabs(q.y - p.y) < 1e-9 ? "  (the root's depth: ok)" : "  (NOT the root's depth)") : "");
+                else std::printf("[groom-sections]   next point %-16s -> refused: %s\n", modeNames[mode], w2.c_str());
+            }
+        }
+        // A SLAB (0.374.0): one across y through the middle of the part points go inside; every
+        // "inside" click from above that lands must land INSIDE the slab (the part the eye sees)
+        if (defInside >= 0 && defInside < (int)g.sections.size()) {
+            g.placeMode = 2; g.insideSec = defInside;
+            g.sliceOn = true; g.sliceAxis = 1; g.slicePos = 0.5f; g.sliceThick = 0.06f;
+            groom::updateSlab(g);
+            groom::Node m; m.id = -12346;
+            groom::Pt any; m.pts.push_back(any);                         // a strand with a root: clicks go inside
+            int landed = 0, within = 0;
+            for (int iy = 0; iy <= 20; ++iy)
+                for (int ix = 0; ix <= 20; ++ix) {
+                    Vec3 q; std::string w;
+                    if (!groom::placeNextPoint(g, ImVec2(50.0f * ix, 50.0f * iy), &m, q, w)) continue;
+                    ++landed;
+                    if (std::fabs(dot(g.slabN, q) - g.slabD) <= g.slabHalf * (1.0 + 1e-9)) ++within;
+                }
+            std::printf("[groom-sections] with a slab across y at 0.5 (y %.4f +- %.4f): %d of 441 clicks from above land inside \"%s\", "
+                        "%d of them inside the slab%s\n", g.slabD, g.slabHalf, landed, g.sections[(size_t)defInside].label.c_str(), within,
+                        (landed > 0 && within == landed) ? " (ok)" : (landed ? " (NOT ALL)" : ""));
+            std::vector<groom::LineBatch> sb;
+            groom::buildSliceLines(g, sb);
+            std::printf("[groom-sections] its cross-section at y %.4f: %zu segments\n", g.slabD, sb.empty() ? (size_t)0 : sb[0].v.size() / 2);
+            g.sliceOn = false; g.slabHalf = 0.0;
+        }
+        g.placeMode = defMode; g.insideSec = defInside;
+    }
+    return 0;
+}
+
+// A TEST HOOK (0.374.0), not a user feature: FTRACE_GROOM_VIEW="key=value;..." presets view
+// options at startup, so the pane can be captured in each mode (tools/gui_peek.ps1) without
+// clicking -- synthetic mouse input cannot reach a window that does not have the focus.
+static void groomPresetView(groom::GroomState& g) {
+    const char* env = std::getenv("FTRACE_GROOM_VIEW");
+    if (!env || !*env) return;
+    std::string s = env;
+    size_t pos = 0;
+    while (pos <= s.size()) {
+        const size_t end = std::min(s.find(';', pos), s.size());
+        const std::string item = s.substr(pos, end - pos);
+        pos = end + 1;
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string k = item.substr(0, eq);
+        const double v = std::atof(item.c_str() + eq + 1);
+        if      (k == "rims")        g.rims = v != 0.0;
+        else if (k == "hueDepth")    g.hueDepth = v != 0.0;
+        else if (k == "hueLine")     g.gridHueLine = v != 0.0;
+        else if (k == "farSide")     g.gridXray = v != 0.0;
+        else if (k == "slice")       { g.sliceOn = v != 0.0; g.sectionsDirty = true; }
+        else if (k == "sliceAxis")   g.sliceAxis = std::clamp((int)v, 0, 3);
+        else if (k == "slicePos")    g.slicePos = (float)v;
+        else if (k == "sliceThick")  g.sliceThick = (float)v;
+        else if (k == "sliceGuides") g.sliceGuides = v != 0.0;
+        else if (k == "sliceSolids") { g.sliceSolids = v != 0.0; g.sectionsDirty = true; }
+        else if (k == "curves")      g.showCurves = v != 0.0;
+        else if (k == "yaw")         g.view.yaw = (float)v;
+        else if (k == "pitch")       g.view.pitch = (float)v;
+        else if (k == "zoom")        g.view.zoom = (float)v;
+        else if (k == "grid" || k == "opacity") {           // for every reference (skipped) part
+            for (groom::Section& sec : g.sections)
+                if (sec.reference) { if (k == "grid") sec.grid = v != 0.0; else sec.opacity = (float)v; }
+            g.gridDirty = true; g.sectionsDirty = true;
+        }
+    }
+    g.lines.dirty = true;
+    std::fprintf(stderr, "[groom] FTRACE_GROOM_VIEW: %s\n", env);
+}
+
+int runGroomGui(const std::string& scenePath, bool minimized) {
     groom::GroomState g;
     g.scenePath = scenePath;
     groom::groomLoadScene(g);
+    groomPresetView(g);
     ImGui_ImplWin32_EnableDpiAwareness();
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"FtraceGroom", nullptr };
     RegisterClassExW(&wc);
@@ -5124,7 +6581,7 @@ int runGroomGui(const std::string& scenePath) {
         std::fprintf(stderr, "error: -groom: failed to create D3D11 device.\n");
         return 1;
     }
-    ShowWindow(hwnd, SW_SHOWDEFAULT); UpdateWindow(hwnd);
+    ShowWindow(hwnd, minimized ? SW_SHOWMINNOACTIVE : SW_SHOWDEFAULT); UpdateWindow(hwnd);
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::GetIO().IniFilename = nullptr;
@@ -5140,6 +6597,9 @@ int runGroomGui(const std::string& scenePath) {
             if (msg.message == WM_QUIT) done = true;
         }
         if (done || ft::stopRequested()) break;
+        // minimized: nothing to draw, and Present would not wait for a vsync -- idle instead of
+        // spinning a core and the GPU on a window nobody can see
+        if (IsIconic(hwnd)) { Sleep(50); continue; }
 
         ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
         const ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -5155,6 +6615,7 @@ int runGroomGui(const std::string& scenePath) {
         ImGui::EndChild();
         if (g.ok) groom::groomHotkeys(g);
         ImGui::End();
+        if (g.showHelp) groom::drawGroomHelp(g);
         ImGui::Render();
         const float clear[4] = { 0.06f, 0.06f, 0.08f, 1.0f };
         g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRTV, nullptr);
@@ -5163,6 +6624,8 @@ int runGroomGui(const std::string& scenePath) {
         g_pSwapChain->Present(1, 0);
     }
     g.lines.release();
+    g.gridGpu.release();
+    g.sliceGpu.release();
     g.view.gpu.release();
     ImGui_ImplDX11_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
     CleanupDeviceD3D(); DestroyWindow(hwnd); UnregisterClassW(wc.lpszClassName, wc.hInstance);

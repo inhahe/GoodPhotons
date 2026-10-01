@@ -47,7 +47,12 @@
 // is still played from memory, with the tail falling back to baking on demand.
 // The hair-authoring tool (0.329.0): opens the viewer shell on a plain .ftsl scene and shows
 // its meshes, its `curve` hierarchy level-coloured, and its `fur` strands on demand.
-int runGroomGui(const std::string& scenePath);
+// `minimized` (-window-min, 0.373.0): the window opens minimized without taking the focus.
+int runGroomGui(const std::string& scenePath, bool minimized = false);
+// `-groom-sections <scene>` (0.372.0): the groom tool's SECTIONS and its "grow inside" geometry,
+// headless -- the load the tool does, every section, and probe rays through each part the scene
+// skips, printing the depth interval inside it and where depth 0 / 0.5 / 1 would put a point.
+int groomSectionsReport(const std::string& scenePath);
 
 int runViewerGui(const std::string& sidecarPath, const std::string& loomScene = "",
                  bool startPlaying = false, bool startPrebake = false,

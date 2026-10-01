@@ -139,6 +139,12 @@ argument for standing a groom in a hall of polished objects.*
   records, so a groom needs no new code anywhere downstream and inherits the GPU path
   for free; the build is a deterministic, lock-free pure function of
   `(surface, parameters, seed)`.
+- **Groom editor (`ftrace -groom <scene>`)** — an interactive window for the guide curves
+  a fur block grows from. Plant a strand's root on the scalp, then place its points in
+  the air, on surfaces, or inside a reference shape — for example a sculpted hairdo the
+  render skips, drawn as a see-through grid outline. You can also sketch whole strands
+  with a drag, box-select and delete, and save back into the scene's files. Its Help
+  button (F1) explains everything; see [REFERENCE.md](REFERENCE.md#the-groom-tool--groom).
 - **Fiber BCSDF (`material { type hair }`)** — a strand shaded as what it is, a
   translucent dielectric *cylinder*, not a surface: Marschner's R / TT / TRT lobes in
   Chiang's energy-conserving form, so a backlit coat has the forward glow and the

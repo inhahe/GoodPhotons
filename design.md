@@ -1206,7 +1206,115 @@ the scene BVH answers "what" but not "which mesh"), a click also checked against
 so nothing nearer is picked through; a pick is mapped into the file's frame through the inverse of
 the transform the loader applied (`HairCurveInfo::xf`, or a named sibling's for a new curve). Undo
 is a stack of model copies. The tree, the lines and the selection are model-driven; the loader's
-records supply the fur (dimmed once an edit makes it stale) and the transforms; the strands a `count` node places come from the LIVE PREVIEW (0.331.0): every top-level curve of the model is turned back into a `Block` (`blockFromNode`) and flattened by a scratch `ftsl::Builder` through `flattenCurveForTool` -- the loader's own recursion, named nodes registering for later references exactly as in a load -- so the tool draws the loader's arithmetic, never a re-derivation, and reports the loader's own error when an edit is something a load would refuse. `-groom-check` runs that preview against the records of a real load. Grouping makes a new node that references the Ctrl-selection by name (only nodes at file or group level, in one file, appended so every child is defined above it); `density_at` keys are drawn as ticks at their arc-length fraction along the path, which is how `splineArcParams` reads them. Fur (0.332.0): a `fur` block is a third kind of `Entry` (its `ftsl::Block` kept whole); its file is usually one the tool does not rewrite, so `saveModel` patches an edited block into its own span (`patchBlockInFile`: the header line, then brace matching that skips strings and `#` comments, the header's indentation kept), and a writable file simply re-emits it. Bald zones are the block's `bald x y z r` statements, drawn as wire spheres and placed with a pick on any mesh. `spawnRender` runs the saved scene through a child ftrace (`CreateProcessW`, stdout/stderr to a log, `-view` from the pane's orbit, `-window -keepwindow`) -- the real renderer, not a preview. The tool is exercised without a hand on the mouse by `tools/gui_drive.ps1` (focus, keys, clicks and drags at window fractions, DPI-correct captures): the first drive found hovering grabbing a point on the FAR side of the head that projected onto the pixel, which is why hovering now tests each candidate against the scene BVH (hair skipped) and ignores what the eye cannot see.
+records supply the fur (dimmed once an edit makes it stale) and the transforms; the strands a `count` node places come from the LIVE PREVIEW (0.331.0): every top-level curve of the model is turned back into a `Block` (`blockFromNode`) and flattened by a scratch `ftsl::Builder` through `flattenCurveForTool` -- the loader's own recursion, named nodes registering for later references exactly as in a load -- so the tool draws the loader's arithmetic, never a re-derivation, and reports the loader's own error when an edit is something a load would refuse. `-groom-check` runs that preview against the records of a real load. Grouping makes a new node that references the Ctrl-selection by name (only nodes at file or group level, in one file, appended so every child is defined above it); `density_at` keys are drawn as ticks at their arc-length fraction along the path, which is how `splineArcParams` reads them. Fur (0.332.0): a `fur` block is a third kind of `Entry` (its `ftsl::Block` kept whole); its file is usually one the tool does not rewrite, so `saveModel` patches an edited block into its own span (`patchBlockInFile`: the header line, then brace matching that skips strings and `#` comments, the header's indentation kept), and a writable file simply re-emits it. Bald zones are the block's `bald x y z r` statements, drawn as wire spheres and placed with a pick on any mesh. `spawnRender` runs the saved scene through a child ftrace (`CreateProcessW`, stdout/stderr to a log, `-view` from the pane's orbit, `-window -keepwindow`) -- the real renderer, not a preview. The tool is exercised without a hand on the mouse by `tools/gui_drive.ps1` (focus, keys, clicks and drags at window fractions, DPI-correct captures): the first drive found hovering grabbing a point on the FAR side of the head that projected onto the pixel, which is why hovering now tests each candidate against the scene BVH (hair skipped) and ignores what the eye cannot see. Since 0.373.0 that driver refuses to send anything unless the window really is in the foreground: Windows denies a background process the focus while the user works in another app, and the keys then went to the user's browser. `tools/gui_peek.ps1` looks at the window without the focus -- restored at the bottom of the z-order, captured with `PrintWindow`, keys posted to its own queue -- and `-groom -window-min` opens the tool without taking the focus. Posted mouse clicks cannot stand in for real ones: the backend's `TrackMouseEvent` answers a posted move with an immediate `WM_MOUSELEAVE`, which races the button message.
+
+**Sections and "grow inside" (0.372.0).** Made so a strand groom can be shaped to match a
+*sculpted* hairdo that the scene skips.
+
+The loader half:
+- Under `keepSectionsRef()` (set by the tool around its load, like `keepShapeOnlyRef`), `loadGltf`
+  records every primitive as a `GltfSection`: its glTF material name, `matId` and `Scene::tris`
+  range. A primitive `skip_material` drops is emitted exactly like the rest and then *cut off the
+  end* of `Scene::tris` into the record, so no earlier triangle moves and the render's scene is
+  identical.
+- `addMesh` moves the records to `Loaded::toolSections`, tagged with the mesh group it pushed. The
+  names had to be captured there: the importer never kept a material name, and
+  `Scene::matNames` is wiped at the end of the build.
+
+The tool half:
+- **Sections.** The tool's `Section` is one (mesh group, material name), the rest of a group, or
+  a reference part (`ref` triangles, not in the scene). One `MeshGeom` per section keeps the GPU
+  draw ranges parallel to them.
+- **Drawing.** Solid sections draw first (depth written); see-through ones draw after the
+  wireframe, blended (the pane's blend state was already bound) and depth-tested but not written,
+  so the curve lines drawn next show inside a shell.
+- **Picking** walks sections, skipping reference and see-through ones.
+- **Hovering** uses the scene BVH through `occludedForHover`, a copy of `occludedSkipHair`'s leaf
+  plus one rule: a triangle whose section is hidden or see-through (`triPass`, rebuilt when a
+  slider moves) does not block.
+- **Grow inside.** `insideInterval` gathers every hit of the chosen section along the ray: `t0` the
+  entry, `t1` the next of its own hits or of any solid section. A click places at
+  `t0 + depth (t1 - t0)` once the strand has a root. The root itself is still a surface pick,
+  through the see-through part onto the scalp. A drag of a later point (`dragMode 3`) keeps the
+  fraction it had at the press.
+- **Roots meshes.** Picks target every fur block's `on` mesh (`targetGroups`), not only the first.
+- **Headless check.** `-groom-sections` prints the sections and probe rays, headless.
+
+**Placement, grid outlines, multi-select (0.373.0).** Made after the first use of 0.372.0: clicks
+only ever landed on the scalp, the translucent shell was unreadable, and nothing deleted more than
+one thing.
+- **Roots are per section.** `Section::roots` replaces `targetGroups`. `buildSections` ticks the
+  fur blocks' `on` meshes by default (else the first mesh) and keeps every section's settings
+  across a reload, by label. `pickSurfaceRay` takes a root from any roots section, even a
+  see-through one.
+- **`placeNextPoint`** is the one rule a click, a sketch sample and the headless check all use:
+  - the root on a roots section;
+  - then by `placeMode`: 0 on surfaces; 1 in the air, on the ray at the view depth of the point it
+    follows (the orthographic ray is `o + d t`, so `t = d . (ref - o)`); or 2 inside `insideSec`,
+    as above.
+  - A first load of a scene with a skipped part starts in mode 2 inside it, and otherwise in mode
+    1.
+  - A drag moves a later point the matching way: slide, screen plane, or `dragMode 3`.
+- **Sketch.** `beginSketch` makes a new strand (one undo entry) rooted at the press, and
+  `sketchAppend` adds a `placeNextPoint` sample every `sketchStep` pixels until the release.
+- **Grid outlines.** `buildGridLines` slices each gridded section's triangles by the planes
+  `axis = k * frameExt / gridLines`. Per triangle and plane it takes the two edge crossings; a
+  vertex exactly on a plane counts as above it, so neighbouring triangles classify it the same way
+  and a contour has no gaps or zero-length pieces. One `LineBatch`
+  per section goes into its own `LinesGpu`, with `gridSecOf` mapping batch to section; the colour
+  is chosen at draw time (dark over an opaque fill, bright over a faint one), so show / hide and
+  opacity need no rebuild.
+- **Drawing the grid.** The lines draw after the curves (so the pre-pass's depth cannot hide a
+  guide inside a shell). Unless `gridXray`, a colour-less pre-pass (`blendNoColor`, `dsSolid`)
+  first writes the see-through gridded sections' depth with `rsBack`, a solid state with a positive
+  constant + slope depth bias. Lines lying on a surface then pass `LESS_EQUAL` and lines behind it
+  fail: hidden-line. A solid gridded section is drawn with `rsBack` in the solid pass for the same
+  reason.
+- **Selection.**
+  - Box selection (Shift-drag) collects `selPts` (node id, point index), keeping only points
+    `occludedForHover` lets the eye see.
+  - `deleteSelected` takes `selPts`, else the Ctrl-selection `multi`, else the selected point. It
+    removes strands left under 2 points.
+  - `eraseCurveAndRefs` deletes a curve and every by-name reference to it, so deleting a guide
+    that a curve of curves lists no longer refuses.
+- **Help.** A separate ImGui window (`drawGroomHelp`, F1) holds the full explanation. `paneHint`
+  puts the next click's meaning above the pane.
+
+**Reading a see-through part (0.374.0).** The grid outline alone did not make the hair shell
+readable in use. Everything added here lives in the pane's one shader, whose constant buffer
+grew from 144 to 176 bytes (`slab`, `extra`); the mesh viewer zero-fills it and draws as before.
+- **Slab.**
+  - The vertex shader passes the world position through; the pixel shader discards what lies
+    farther than `extra.x` from the plane `slab`.
+  - `updateSlab` sets the plane each frame (a slab across the view turns with it), across the
+    extent of the see-through and gridded parts.
+  - `slabbed()` decides which parts it cuts: those, or every part with `sliceSolids`.
+  - Each draw sets it per section (`setCBx`): solid, wire, see-through, grid pre-pass, grid
+    lines. Guide batches carry `LineBatch::slab`, false for the selected strand and the bald
+    zones.
+  - Cut-away parts are gone for interaction too. `pickSection` takes the slab, and `triPass`
+    gains a state 2 (blocks only inside the slab) for `occludedForHover`.
+  - `insideInterval` became run-based: section hits pair into in/out runs, and the first run is
+    clipped by the nearest solid. With a slab it is the first run that crosses the slab, clipped
+    to it, so an "inside" click lands in the visible slice. Without a slab it returns what
+    0.373.0 did (the `-groom-sections` probes are identical).
+- **Cross-section.** `buildSliceLines` slices the cut parts' triangles with the centre plane,
+  rebuilt when a key of the plane and the cut set changes. It is drawn five times, shifted one
+  pixel each way through the mvp's translation, so it is three pixels wide.
+- **Bright edges.** The see-through pass sets `extra.y`. The shader raises alpha and brightness by
+  `(1 - |n.z|)^2.5` of the view-space shading normal: a Fresnel / x-ray outline of every fold.
+- **Colour mode 4.**
+  - Flag 1 takes a colour per contour line from a six-entry palette with no red (red is the
+    guides' level colour), indexed by the plane index `buildGridLines` stores in the vertex `u`
+    (the axis in `v`).
+  - Flag 2 is a depth ramp, bright yellow to dim purple, over the section's bounds projected into
+    the pane's depth (`depthRange`); both flags together dim the line's colour with depth.
+- **Roots sections** draw with `rsFront`, a negative depth bias, so a scalp lying on the skin
+  stops z-fighting with it.
+- **Test hook.** `FTRACE_GROOM_VIEW="key=value;..."` presets these view options at startup so the
+  pane can be captured in each mode with `tools/gui_peek.ps1`. Synthetic mouse input cannot reach
+  an unfocused ImGui window: the backend's `SetCapture` / `TrackMouseEvent` traffic replaces the
+  posted position with the real cursor's, even with the UI thread suspended while posting.
 
 **The media term joined it in 0.322.0** (`Renderer::mediumTransmittanceSpec`,
 `dMedTransmittanceSpec`). A transmittance is a stochastic estimate, so it cannot use the ratio

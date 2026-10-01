@@ -553,6 +553,13 @@ inline CurveStrand resampleStrandCR(const CurveStrand& s, int K, double alpha) {
 // draw it and pick on it. Process-wide like the other loader switches.
 inline bool& keepShapeOnlyRef() { static bool k = false; return k; }
 
+// Record the scene's mesh SECTIONS for a tool (Loaded::toolSections): the name a glTF file gives
+// each part's material, where its triangles are, and the parts `skip_material` drops -- kept as
+// reference geometry OUTSIDE the scene. Off for every render; the groom tool turns it on so its
+// Sections panel can make any part see-through, and show the part a scene skips (Alice2's
+// sculpted hair) as the shape to groom inside.
+inline bool& keepSectionsRef() { static bool k = false; return k; }
+
 // Rotate vector `v` about `axis` by `ang` radians (Rodrigues' rotation formula).
 // `axis` is normalized internally; a zero-length axis returns `v` unchanged. Used
 // by `camera_curve` to apply a per-frame `roll` (bank about the view direction).
@@ -856,6 +863,20 @@ struct Loaded {
         double                   radius = 0.0;
     };
     std::vector<FurInfo> furInfos;
+    // The scene's mesh SECTIONS, for a tool; filled only under keepSectionsRef(). One per glTF
+    // primitive of a mesh block (several may share a material name), including the ones
+    // `skip_material` dropped, whose triangles are here in `ref` and NOT in the scene. Meshes of
+    // other formats add none: to a tool each is one section, its whole Scene::meshGroups range.
+    struct ToolSection {
+        std::string      mesh;            // the mesh block's name ("" if unnamed)
+        int              group = -1;      // its Scene::meshGroups index; -1 if it added no triangles
+        std::string      material;        // the glTF material's name ("root.4")
+        int              matId = -1;
+        size_t           triStart = 0, triCount = 0;   // in Scene::tris (0 count when skipped)
+        bool             skipped = false; // dropped by `skip_material`: reference only, never rendered
+        std::vector<Tri> ref;             // a skipped part's triangles, world space
+    };
+    std::vector<ToolSection> toolSections;
     // Mirror of the FIRST camera (kept so the pre-Phase-3a single-camera code paths
     // and defaults keep working unchanged).
     bool hasCamera = false;
@@ -5819,6 +5840,7 @@ private:
             return false;
         }
         size_t triStart = L.scene.tris.size();
+        std::vector<GltfSection> gltfSecs;   // this block's glTF parts, for a tool (keepSectionsRef)
         // Dispatch by file extension: .gltf/.glb use the glTF loader (which imports
         // its own pbrMetallicRoughness materials by default; `import_materials no`
         // forces the FTSL-assigned `material` on every primitive). Everything else
@@ -5841,7 +5863,8 @@ private:
             std::string gerr;
             {
                 detail::AssetTimer _at;
-                if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr, skipMats) == 0
+                if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr, skipMats,
+                             keepSectionsRef() ? &gltfSecs : nullptr) == 0
                     && !gerr.empty()) {
                     fail("mesh: " + gerr); return false;
                 }
@@ -5967,6 +5990,18 @@ private:
             // triangles have to survive until the deferred medium sweep has read them,
             // so the actual removal happens later, in stripShapeOnlyMeshes().
             if (shapeOnly) shapeOnlyGroups_.push_back(L.scene.meshGroups.size() - 1);
+        }
+        // A tool's sections (keepSectionsRef): the glTF parts this block added -- and the ones it
+        // skipped, whose triangles travel in the record, never in the scene.
+        if (!gltfSecs.empty()) {
+            const int grp = (L.scene.tris.size() > triStart) ? (int)L.scene.meshGroups.size() - 1 : -1;
+            for (GltfSection& gs : gltfSecs) {
+                Loaded::ToolSection ts;
+                ts.mesh = b.name; ts.group = grp; ts.material = gs.material; ts.matId = gs.matId;
+                ts.triStart = gs.triStart; ts.triCount = gs.triCount; ts.skipped = gs.skipped;
+                ts.ref = std::move(gs.ref);
+                L.toolSections.push_back(std::move(ts));
+            }
         }
         // Emissive mesh → register a Mesh area light (§ mesh area lights). When the
         // bound material carries an `emit` spectrum, the triangles just appended form

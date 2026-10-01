@@ -429,6 +429,33 @@ mode-M / flyby-cost work (0.5) is independent of the tool and can interleave.
 without a reload (needs the parse half of `addFur` split out so a scratch Builder can run it),
 named-sphere `bald "name"` zones drawn, the `on` mesh chosen from a list, per-point radius
 dragging, and a `-groom` on a bare mesh with no scene (auto-scalp).
+
+**Phase 5 -- SECTIONS + GROW INSIDE -- BUILT 0.372.0.** Every mesh part (a glTF material by name,
+or a whole mesh) is listed with show/hide and an opacity slider; see-through parts are drawn
+blended and clicked / hovered through; the parts a scene skips (`skip_material`) are loaded as
+reference geometry, so a sculpted hairdo can be groomed inside; "grow inside" puts a strand's root
+on the scalp and its later points inside the part at a chosen depth, and drags keep a point's
+depth. Picks root on every fur block's `on` mesh. Headless check: `-groom-sections`.
+
+**Phase 6 -- PLACEMENT + GRID + MULTI-SELECT + HELP -- BUILT 0.373.0** (asked for after the first
+real use of Phase 5: points only ever landed on the scalp, the see-through shell was unreadable,
+the tree's checkboxes looked like a selection that nothing could delete, and nothing explained the
+tool). `roots` is a per-section tick (default: the fur blocks' `on` meshes); "place new points" is
+on surfaces / in the air (at the view depth of the point followed) / inside a section; `sketch`
+draws a strand along a drag; `grid` draws a part as hidden-line contour lines; Shift-drag
+box-selects points, Del deletes points / Ctrl-selected curves / the point (a deleted guide leaves
+the groups that list it); a Help window (F1) explains everything, and the line above the pane says
+what the next click does. Still to do: a depth pre-pass so a closed see-through shell does not
+blend twice, snapping a whole existing strand inside a part, and moving a box selection together.
+
+**Phase 7 -- READING THE SHELL -- BUILT 0.374.0** (the grid did not make the hair readable in use):
+bright edges (a Fresnel / x-ray alpha on see-through parts, now the default look of a skipped
+part instead of the grid), hue by depth and a colour per grid line (no red: the guides' colour),
+and a SLICE -- a slab across x / y / z / the view, moved with Ctrl+wheel, its cross-section drawn
+in white, optionally cutting the guides and the solid parts ("look along it" turns the view to
+face it: from above it reads like a scan). What a slab cuts away is gone for clicks and hovering,
+and "inside a section" places inside the slab. Still to do: the drags (sketch, box select, point
+drags) have no automated test (known-issues GROOM-DRAG-UNTESTED).
 ## 1. The `gallery_rain` 960x540 flyby — THE DELIVERABLE, and it has never been launched
 
 1147 frames, `camera_curve "fly"`, mode M. Everything below it (`-sunnee`, VOLCACHE, the spectral

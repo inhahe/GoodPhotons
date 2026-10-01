@@ -71,6 +71,47 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-09-29, 0.373.0): GUI-DRIVE-WRONG-WINDOW — the GUI driver sent its keys and its screen capture to the wrong window
+
+**What happened.** While the user was working in a browser, `tools/gui_drive.ps1` was run against the
+groom tool. `SetForegroundWindow` silently fails for a background process while the user is active in
+another app. The script did not check, so:
+- both `F1` presses went to the browser;
+- the `shot` captured the browser instead of the tool (deleted at once).
+
+**Fixed.** The driver now refuses every key, click, wheel, move and capture unless the target window
+really is the foreground window; it exits 2 with `ABORTED ... Nothing was sent`. Checked: run
+against a background groom window, it aborted and wrote no file.
+
+**The safe alternative, `tools/gui_peek.ps1`.** It never takes the focus:
+- restores the window at the bottom of the z-order, not activated;
+- captures it with `PrintWindow(PW_RENDERFULLCONTENT)`, which gets the D3D content even when covered;
+- posts keys to the window's own queue;
+- minimizes it again, not activated.
+
+`-groom -window-min` opens the tool without taking the focus in the first place.
+
+## OPEN (2026-09-29): GROOM-DRAG-UNTESTED — the groom tool's drags have no automated test
+
+**Tested headlessly.**
+- The click path (`placeNextPoint`: the root, then on surfaces / in the air / inside a section) is
+  driven by `-groom-sections`, through the same function a click calls.
+- The grid outlines' segment counts are printed there too.
+- Rendering and layout were checked with `tools/gui_peek.ps1`.
+
+**Not tested.** Everything that needs a DRAG: sketching, Shift-drag box selection, point drags in
+each `dragMode`. With the real mouse unavailable (the user is working), there is no way in:
+- **Posted mouse messages fail.** A posted `WM_MOUSEMOVE` makes the ImGui Win32 backend call
+  `TrackMouseEvent`. With the real cursor elsewhere, Windows answers with an immediate
+  `WM_MOUSELEAVE`, which races the posted button message. A click lands at "nowhere" more often
+  than not — a radio button and a checkbox never toggled — and a drag's moves are each cancelled
+  by the leave that follows them.
+- **Possible fix:** an input-replay hook in the tool itself. A script of pane-relative mouse events
+  fed straight to `io.AddMousePosEvent` / `AddMouseButtonEvent` each frame would make every
+  interaction testable without the mouse or the focus.
+
+Until then these paths are covered by code review only.
+
 ## DONE (2026-09-27, 0.369.0): FRAGMENT-NO-LIGHT — a scene written to be `include`d would not open in the viewer
 
 Reported on Claude Fable 5.1's Alice groom (`alice1_meshy/hair_fable5.1/scenes/alice_hair.ftsl` in the

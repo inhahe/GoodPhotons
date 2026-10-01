@@ -18187,6 +18187,8 @@ static void printHelp(const char* prog) {
 "  -r <W> [H]            resolution (square if H omitted)\n"
 "  -dumpcurves <f>       after the scene loads, write every strand's polyline (x y z r per point) to <f> and exit\n"
 "  -groom <scene.ftsl>   the hair-authoring tool: the scene's meshes, its curve hierarchy level-coloured, its fur on demand\n"
+"                        (with -window-min it opens minimized, without taking the focus; F1 in it explains everything)\n"
+"  -groom-sections <scene.ftsl>  the groom tool's sections headless: each part, its defaults, probe rays and placement checks\n"
 "  -groom-rewrite <in> <out>  rewrite a scene file through the groom tool's curve model (its round-trip check) and exit\n"
 "  -groom-check          after the scene loads, compare the groom tool's preview of every named curve with the loader's strands and exit\n"
 "  -time <sec>           wall-clock budget (progressive)\n"
@@ -25404,6 +25406,8 @@ int main(int argc, char** argv) {
         // shows the sidecar frozen.
         {
             const char* groomScene = nullptr;
+            const char* groomSections = nullptr;   // -groom-sections: the tool's sections, headless
+            bool        guiMinimized = false;      // -window-min: the groom tool opens minimized, unfocused (0.373.0)
             const char* viewerSidecar = nullptr;
             const char* viewerLoom    = nullptr;
             bool        viewerPlay    = false;
@@ -25412,6 +25416,8 @@ int main(int argc, char** argv) {
             for (int i = 1; i < argc; ++i) {
                 if (!std::strcmp(argv[i], "-play") || !std::strcmp(argv[i], "--play")) {
                     viewerPlay = true;
+                } else if (!std::strcmp(argv[i], "-window-min") || !std::strcmp(argv[i], "-minimized")) {
+                    guiMinimized = true;
                 } else if (!std::strcmp(argv[i], "-prebake") || !std::strcmp(argv[i], "--prebake")) {
                     viewerPrebake = true;
                 } else if (!std::strcmp(argv[i], "-prebake-cap") ||
@@ -25427,6 +25433,12 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                     groomScene = argv[++i];
+                } else if (!std::strcmp(argv[i], "-groom-sections")) {
+                    if (i + 1 >= argc) {
+                        std::fprintf(stderr, "error: -groom-sections needs a scene .ftsl path\n");
+                        return 1;
+                    }
+                    groomSections = argv[++i];
                 } else if (!std::strcmp(argv[i], "-viewer") || !std::strcmp(argv[i], "--viewer")) {
                     if (i + 1 >= argc) {
                         std::fprintf(stderr, "error: -viewer needs a sidecar .json path\n");
@@ -25441,11 +25453,12 @@ int main(int argc, char** argv) {
                     viewerLoom = argv[++i];
                 }
             }
+            if (groomSections) return groomSectionsReport(groomSections);   // headless, exits
             if (groomScene) {
                 // The groom tool is a long-lived GUI holding ftrace.exe open, exactly like the
                 // viewer, so it is published in the stop channel for the same reason.
                 stopChannelStart(std::string(groomScene) + " -> (groom tool)");
-                int grc = runGroomGui(groomScene);
+                int grc = runGroomGui(groomScene, guiMinimized);
                 stopChannelEnd();
                 return grc;
             }

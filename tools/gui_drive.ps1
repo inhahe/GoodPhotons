@@ -14,6 +14,7 @@ public class GD {
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
   [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
@@ -35,9 +36,21 @@ function MoveTo($fx, $fy) {
     [GD]::mouse_event(0x8001, $nx, $ny, 0, [UIntPtr]::Zero)      # MOVE | ABSOLUTE
     Start-Sleep -Milliseconds 120
 }
+# Input (keys, clicks, the wheel) goes to whatever window is in the FOREGROUND, and a screen capture
+# shows whatever is on top. Windows refuses SetForegroundWindow to a background process while the
+# user is working in another app -- and then every key and click this script sends lands in THAT
+# app (it once typed F1 into the user's browser and captured it instead). So nothing that sends
+# input or captures the screen runs unless the target window really is in front.
+function EnsureFront {
+    if ([GD]::GetForegroundWindow() -eq $h) { return }
+    "ABORTED: the window (pid $ProcId) is not in the foreground -- the user is probably working in another app,"
+    "so keys, clicks and captures would go to it. Nothing was sent. (tools/gui_peek.ps1 captures without focus.)"
+    exit 2
+}
 foreach ($a in $Actions.Split(";")) {
     $a = $a.Trim(); if ($a -eq "") { continue }
     $kv = $a.Split(":", 2); $op = $kv[0]; $arg = if ($kv.Length -gt 1) { $kv[1] } else { "" }
+    if ($op -in @("keydown", "keyup", "key", "move", "wheel", "click", "drag", "shot")) { EnsureFront }
     switch ($op) {
         "restore" { [GD]::ShowWindow($h, 9) | Out-Null; [GD]::SetForegroundWindow($h) | Out-Null; Start-Sleep -Milliseconds 1200; "restored" }
         "min"     { [GD]::ShowWindow($h, 6) | Out-Null; "minimized" }

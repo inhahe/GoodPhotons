@@ -410,9 +410,22 @@ inline bool gltfLoadStatsOn() {
     return on;
 }
 
+// One glTF primitive as a TOOL sees it (the groom tool's Sections panel): the name its file gives
+// its material ("root.4"), where its triangles went -- or, for a primitive `skip_material` drops,
+// the triangles themselves, kept OUT of the scene. Filled only when a caller passes `sections`;
+// a render never does, so nothing about a load changes for it.
+struct GltfSection {
+    std::string      material;        // the glTF material's name, "" if it has none
+    int              matId = -1;      // the scene material its triangles carry
+    size_t           triStart = 0, triCount = 0;   // its range in Scene::tris (count 0 if skipped)
+    bool             skipped = false; // dropped by `skip_material`: `ref` holds it, the scene does not
+    std::vector<Tri> ref;             // a skipped primitive's triangles, world space
+};
+
 inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& xf,
                     bool importMaterials, std::string& err,
-                    const std::vector<std::string>& skipMaterials = {}) {
+                    const std::vector<std::string>& skipMaterials = {},
+                    std::vector<GltfSection>* sections = nullptr) {
     using namespace gltfimpl;
     const auto _gltfT0 = std::chrono::steady_clock::now();
     const double _gltfTex0 = gltfimpl::g_texDecodeMs;   // running total; differenced at the end
@@ -1093,10 +1106,37 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
             bool hasVC = (colAcc >= 0) && readAccessorFloat(doc, colAcc, vcol, cc) && cc >= 3;
             size_t vcount = pos.size() / pc;
             int gltfMat = prim.intAt("material", -1);
-            if (gltfMat >= 0 && gltfMat < (int)matSkip.size() && matSkip[gltfMat]) {
-                ++skippedByMat; continue;   // `skip_material` -- bundled backdrop, not the subject
+            const bool skipThis = gltfMat >= 0 && gltfMat < (int)matSkip.size() && matSkip[gltfMat];
+            if (skipThis) {
+                ++skippedByMat;             // `skip_material` -- bundled backdrop, not the subject
+                if (!sections) continue;    // ...unless a tool wants it as reference (cut out below)
             }
             int matId = resolveMat(gltfMat);
+            // For a tool: this primitive's triangles are the ones appended from here on. A
+            // skipped one is emitted exactly like the rest (same transform, same normals) and
+            // then cut off the end of Scene::tris into its record, so no earlier triangle moves.
+            const size_t primTri0 = s.tris.size(), primVcol0 = s.vertColors.size();
+            auto recordSection = [&]() {
+                if (!sections) return;
+                GltfSection sec;
+                if (const minijson::Value* mats = doc.root.find("materials");
+                    mats && mats->isArray() && gltfMat >= 0 && gltfMat < (int)mats->arr.size())
+                    if (const minijson::Value* nm = mats->arr[(size_t)gltfMat].find("name"); nm && nm->isString())
+                        sec.material = nm->str;
+                sec.matId = matId;
+                if (skipThis) {
+                    sec.skipped = true;
+                    sec.ref.assign(s.tris.begin() + (std::ptrdiff_t)primTri0, s.tris.end());
+                    for (Tri& t : sec.ref) t.vcol = -1;          // its vertex colours go with the cut
+                    added -= (int)(s.tris.size() - primTri0);
+                    s.tris.resize(primTri0);
+                    s.vertColors.resize(primVcol0);
+                } else {
+                    sec.triStart = primTri0;
+                    sec.triCount = s.tris.size() - primTri0;
+                }
+                if (sec.skipped ? !sec.ref.empty() : sec.triCount > 0) sections->push_back(std::move(sec));
+            };
 
             auto vertPos = [&](uint32_t vi) {
                 return world.apply(Vec3{pos[vi*pc+0], pos[vi*pc+1], pos[vi*pc+2]});
@@ -1144,6 +1184,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                 for (uint32_t i = 0; i + 2 < (uint32_t)vcount; i += 3)
                     emitTri(i, i+1, i+2);
             }
+            recordSection();
         }
     };
 
