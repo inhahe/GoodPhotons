@@ -3383,6 +3383,32 @@ regenerates everything in about a minute (numpy, scipy, numba, Pillow; its geome
 - **Light a pale coat with something large.** A small bright panel sparkles spectrally in every
   fibre and noise dominates; a large soft environment (the generated room) converges.
 
+**Filling the sculpted hairdo instead: `tools/alice2_hair3.py` (v3).** The same kind of scene, written
+to `hair_opus5.5_v3` beside the model folder. Instead of a designed hairstyle fitted to the sculpt's
+silhouette, the guides fill the sculpt's own hair VOLUME:
+- **The flow.** The volume is voxelized, the lock tips are found where the distance through it from
+  the part peaks, and hair is treated as an incompressible flow from the scalp to those tips
+  (Laplace's equation).
+- **Where the photos overrule the sculpt.** The hair over and in front of the ears is cut away, and
+  so is the scalp there: the sculpt covers the ears, but the photos show them bare, with the hair
+  tucked behind. The ledge the sculpt leaves over the forehead is cut away too. The headband is
+  wider than v2's, as in the photos, sits on the hair, and ends at the tops of the ears.
+- **The guides.** Its streamlines from evenly spaced scalp roots are the guides: ~4200 of them, 99%
+  of their points inside the sculpt.
+- **Running it.** `D:/python314/python.exe -u tools/alice2_hair3.py [--cache <dir>]` takes about 10
+  minutes, or 4 with the volume and flow cached. design.md has the method.
+
+What it adds to the list above:
+- **A guided coat follows guides only as closely as the guides follow each other.** A strand is its
+  nearest guide translated to its own root, so a volume is filled only if the guides are a few mm
+  apart through all of it (v3: 3.2 mm at the roots) — and `clump` must be off where neighbouring
+  guides diverge: a clump guide is itself a copy of one guide, and pulling tips toward it drags
+  strands across between locks (strays over the face, a stringy texture).
+- **No short guides.** A guide that ends near its root grows a fringe of short wisps.
+- **End guides before they converge.** Streamlines that run on into a lock's tip converge on it from
+  the whole lock, and render as a broom. v3 trims a random 0.8–3 cm off each such guide's end, so
+  the lock tapers out.
+
 ### Implicit surfaces (`isosurface`)
 
 Besides the explicit primitives above, geometry can be defined *implicitly* as the

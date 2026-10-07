@@ -6528,11 +6528,10 @@ int groomSectionsReport(const std::string& scenePath) {
 
 // A TEST HOOK (0.374.0), not a user feature: FTRACE_GROOM_VIEW="key=value;..." presets view
 // options at startup, so the pane can be captured in each mode (tools/gui_peek.ps1) without
-// clicking -- synthetic mouse input cannot reach a window that does not have the focus.
-static void groomPresetView(groom::GroomState& g) {
-    const char* env = std::getenv("FTRACE_GROOM_VIEW");
-    if (!env || !*env) return;
-    std::string s = env;
+// clicking -- synthetic mouse input cannot reach a window that does not have the focus. Since
+// 0.374.1 FTRACE_GROOM_VIEW_FILE names a file of the same "key=value;..." text that is re-read
+// whenever it changes, so one running tool can be put through many views (a load takes minutes).
+static void groomApplyView(groom::GroomState& g, const std::string& s, const char* from) {
     size_t pos = 0;
     while (pos <= s.size()) {
         const size_t end = std::min(s.find(';', pos), s.size());
@@ -6553,6 +6552,12 @@ static void groomPresetView(groom::GroomState& g) {
         else if (k == "sliceGuides") g.sliceGuides = v != 0.0;
         else if (k == "sliceSolids") { g.sliceSolids = v != 0.0; g.sectionsDirty = true; }
         else if (k == "curves")      g.showCurves = v != 0.0;
+        else if (k == "points")      g.showPoints = v != 0.0;
+        else if (k == "hair")        g.showHair = v != 0.0;
+        else if (k == "mesh")        g.showMesh = v != 0.0;
+        else if (k == "frame")       { g.frameMode = std::clamp((int)v, 0, 1); groom::groomComputeFrame(g); g.gridDirty = true; }
+        else if (k.size() == 6 && k.compare(0, 5, "level") == 0 && k[5] >= '0' && k[5] <= '7')
+            g.levelOn[k[5] - '0'] = v != 0.0;                 // level0=1;level1=0 ...
         else if (k == "yaw")         g.view.yaw = (float)v;
         else if (k == "pitch")       g.view.pitch = (float)v;
         else if (k == "zoom")        g.view.zoom = (float)v;
@@ -6563,7 +6568,27 @@ static void groomPresetView(groom::GroomState& g) {
         }
     }
     g.lines.dirty = true;
-    std::fprintf(stderr, "[groom] FTRACE_GROOM_VIEW: %s\n", env);
+    std::fprintf(stderr, "[groom] %s: %s\n", from, s.c_str());
+}
+static void groomPresetView(groom::GroomState& g) {
+    const char* env = std::getenv("FTRACE_GROOM_VIEW");
+    if (env && *env) groomApplyView(g, env, "FTRACE_GROOM_VIEW");
+}
+// FTRACE_GROOM_VIEW_FILE: applied again whenever the file's write time changes (checked every frame:
+// a heavy groom draws a few frames a second, and a capture must not wait on a poll interval)
+static void groomPollViewFile(groom::GroomState& g, int frame) {
+    static const char* path = std::getenv("FTRACE_GROOM_VIEW_FILE");
+    static std::filesystem::file_time_type seen{};
+    (void)frame;
+    if (!path || !*path) return;
+    std::error_code ec;
+    const auto t = std::filesystem::last_write_time(path, ec);
+    if (ec || t == seen) return;
+    seen = t;
+    std::ifstream f(path);
+    std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
+    if (!s.empty()) groomApplyView(g, s, "FTRACE_GROOM_VIEW_FILE");
 }
 
 int runGroomGui(const std::string& scenePath, bool minimized) {
@@ -6600,6 +6625,7 @@ int runGroomGui(const std::string& scenePath, bool minimized) {
         // minimized: nothing to draw, and Present would not wait for a vsync -- idle instead of
         // spinning a core and the GPU on a window nobody can see
         if (IsIconic(hwnd)) { Sleep(50); continue; }
+        { static int frame = 0; groomPollViewFile(g, frame++); }
 
         ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
         const ImGuiViewport* vp = ImGui::GetMainViewport();

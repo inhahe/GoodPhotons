@@ -781,12 +781,14 @@ def _sweep(path, wdir, w, t, closed=False, taper=None):
     return V, N, np.array(F)
 
 
-def write_headband(gr, guides, out_path, width=0.022, thick=0.0028):
+def write_headband(gr, guides, out_path, width=0.022, thick=0.0028, lift=0.0015, dip=0.010, stop=None):
     """The band follows the sculpt's band (its dark triangles, by angle about the head centre) but
-    sits on the GENERATED hair: along each ray from the head centre, just over the outermost guide
-    (the fur is a blend of its nearest guides, so its surface is theirs); the ends dip into the hair.
+    sits on the GENERATED hair: along each ray from the head centre, `lift` over the outermost guide
+    (the fur is a blend of its nearest guides, so its surface is theirs); the ends dip `dip` into the
+    hair over their last 3 cm.
     The bow -- two loops and a knot -- is sized from the photos (the sculpt's is twice as wide) and
-    sits on her right of the part, as in the photos."""
+    sits on her right of the part, as in the photos. `stop(points) -> bool mask`, if given, ends the
+    band on each side before the first point of its path over the head that it marks (v3: an ear)."""
     sc = gr.sc
     B = sc.band_pts
     th = np.degrees(np.arctan2(B[:, 0] - HEAD_C[0], B[:, 1] - HEAD_C[1]))
@@ -802,16 +804,28 @@ def write_headband(gr, guides, out_path, width=0.022, thick=0.0028):
     t, tri = GHs.raycast(np.tile(HEAD_C, (len(u), 1)), u, tmin=0.0, tmax=0.5)
     assert np.isfinite(t).all(), "a headband ray missed the head"
     foot = HEAD_C + u * t[:, None]
-    nf = hg.interp_vert(gr.n4s, sc.F4, tri, foot, gr.V4s); nf /= np.linalg.norm(nf, axis=1)[:, None]
     kdg = cKDTree(np.concatenate([resample(q, NPTS) for q, l in guides]))
     top = t.copy()
     for i in range(len(u)):
         for r_ in np.arange(t[i], t[i] + 0.06, 0.001):
             if kdg.query_ball_point(HEAD_C + u[i] * r_, 0.006, return_length=True) > 0: top[i] = r_
     top = gaussian_filter1d(top, 2, mode="nearest")
+    if stop is not None:
+        # tested on the band itself, over the hair -- not its foot on the skull: the rays climb as
+        # they leave the head, so the hair's thickness lifts the band well above its foot
+        bad = np.asarray(stop(HEAD_C + u * (top + lift + thick / 2)[:, None]), bool)
+        k0 = int(np.argmin(np.abs(A)))
+        assert not bad[k0], "the headband is stopped at the top of the head"
+        i0, i1 = k0, k0
+        while i0 > 0 and not bad[i0 - 1]: i0 -= 1
+        while i1 < len(A) - 1 and not bad[i1 + 1]: i1 += 1
+        A, u, t, tri, foot, top = (v[i0:i1 + 1] for v in (A, u, t, tri, foot, top))
+        log("headband: runs from %.0f to %.0f degrees round the head (%d of %d steps stopped)"
+            % (A[0], A[-1], len(bad) - len(A), len(bad)))
+    nf = hg.interp_vert(gr.n4s, sc.F4, tri, foot, gr.V4s); nf /= np.linalg.norm(nf, axis=1)[:, None]
     s = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(foot, axis=0), axis=1))])
     e = np.minimum(s, s[-1] - s)
-    path = HEAD_C + u * (top + 0.0015 + thick / 2 - 0.010 * np.clip(1 - e / 0.03, 0, 1) ** 2)[:, None]
+    path = HEAD_C + u * (top + lift + thick / 2 - dip * np.clip(1 - e / 0.03, 0, 1) ** 2)[:, None]
     path = gaussian_filter1d(path, 1.5, axis=0, mode="nearest")
     tang = np.gradient(path, axis=0); tang /= np.linalg.norm(tang, axis=1)[:, None]
     parts = [_sweep(path, np.cross(nf, tang), width, thick, taper=np.clip(e / 0.012, 0.35, 1.0))]

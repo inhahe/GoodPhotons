@@ -1175,6 +1175,86 @@ Iterated on raster previews against the four photo viewpoints, then path-traced.
 behind, a step in the silhouette at ear height on both sides (more on her right, whose ear sits
 lower), where the tucked side hair flares out below a crown that lies closer to the head.
 
+**The third version (2026-10-07, `tools/alice2_hair3.py`, tooling only): the sculpt's VOLUME is the
+groom's.** v2 designed a hairstyle and borrowed only the sculpt's silhouette, and from behind the
+two drifted apart. v3 fills the sculpt instead, using v2's sculpt analysis, scalp, headband, room,
+writers and fibre.
+- **The volume.** The closed hair shell is voxelized at 2.5 mm by column parity (100% agreement
+  with `hairgeo.ZParity` at random points), minus the head and body (dilated one voxel), the bow
+  (its near-black texels) and the ledge the sculpt leaves overhanging the forehead. ~2.9 M voxels.
+- **The ears.** The sculpt covers them; the photos show them bare, the hair tucked behind. So on
+  each ear's side nothing stays forward of the ear's back edge (less 4 mm), from 7 cm under the
+  lobe to 3 mm over the top (`EAR_CUT`). The scalp triangles there go too, so no fur roots on the
+  bare skin. Hair the cut leaves disconnected from the scalp goes as well, since no streamline
+  could reach it. The cache is tagged with the cut, so a different cut rebuilds the volume.
+  - **Measured by hand** (`EARS`), from a z-buffered side view of the bare head
+    (`scraps/alice3/ear_view.py`). v2 finds an ear as what Taubin smoothing moves more than
+    2.5 mm, but on this coarse head mesh that reaches 2.5 cm behind and above the ear: cut there,
+    the side of the head above and behind each ear went bald, and the band ended 5 cm above it.
+- **The headband** is v2's writer with three new arguments. `stop` ends it where it would come
+  down over an ear: the photos have it end at the ear's top. The test runs on the band's path
+  over the hair, not its foot on the skull: the rays from the head centre climb as they leave
+  the head, so the hair's thickness lifts the band above its foot, and a foot test ended it
+  2.5 cm above the ear. `lift` (5 mm over the outermost
+  guide, against v2's 1.5) keeps the fur, which stands a few mm proud of the guides, from covering
+  its edges. `dip` (4 mm, against 1 cm) lets it visibly reach the ear. It is also 3.4 cm wide
+  against 2.2: in the profile photo the band is a third of the eye-to-ear distance.
+- **The tips.** G, the distance through the volume from the centre part (fast sweeping), peaks at
+  the end of every lock: the voxels within 8 mm of the peak over a 3 cm window, on hair longer
+  than 22 cm. ~180 tips.
+- **The flow.** Laplace's equation on the voxels: P = 0 on the scalp, P = 1 at the tips, Neumann
+  elsewhere (CG with a Jacobi preconditioner, ~1000 iterations, ~5 minutes). Its gradient is
+  divergence-free from the scalp to the tips.
+- **Why a potential flow.** Three approaches failed first:
+  - **Surface tracing.** Streamlines over the sculpt are v2's abandoned idea.
+  - **Structure-tensor tracing.** Tracing a structure-tensor "rope axis" field with a
+    layer-height rule kept strands on the skull: they ran into the hollow under the back mass,
+    which stands off the head.
+  - **Geodesic-gradient tracing.** Following G's gradient makes geodesics hug obstacles.
+  
+  Streamlines of the potential from evenly spaced roots never cross, enter every lock in
+  proportion to its flux, and layer by themselves: roots near the part feed the outer
+  streamlines, because the inner ones are taken.
+- **The guides.** RK2 on the gradient, computed on the grid and trilinearly interpolated. Taking
+  the gradient of the interpolated P instead put a kink at every voxel face. Near a wall the
+  outward part of a step is dropped, so a strand slides rather than leaving. A guide stops at a
+  tip or where P stalls (< 0.003 rise over 8 cm).
+  - **Trimmed ends.** A guide that reached a tip loses a random 0.8–3 cm off its end. Run into the
+    tip, a lock's guides converge on its small blob from the whole lock: a fan, which rendered as a
+    broom-like end. Trimmed, the lock tapers.
+  - **Not by an end zone.** Stopping each guide at a random depth into a lock's last 3 cm (by G,
+    over the voxels nearest its tip) was tried first. Those zones also took in hair that
+    streamlines only pass through on the way to other tips, beside a lock's smaller bumps, so the
+    median guide halved (49 → 26 cm) and 5 mm coverage fell from 79% to 53%.
+  
+  A guide's first stretch (to 8 mm off the scalp or 2.5 cm along) is replaced by a Hermite curve
+  leaving at a shallow angle, since the potential leaves the scalp perpendicular. The guide is
+  smoothed (7 mm) and resampled to 56 points. Guides under 8 cm are dropped: they ended in the
+  thin front layer and grew a fringe of wisps.
+- **Tried and dropped: a balanced flow.** Low down, the face-framing locks were 26–36% empty
+  (voxels more than 6 mm from every guide). With the scalp at 0 and every tip at 1, a long thin
+  lock draws little flux. The alternative was to prescribe the flux: the scalp gives it out
+  evenly, and each lock takes a share by its cross-section. That needs every voxel assigned to a
+  lock, and two ways were tried:
+  - **Steepest ascent of G** stalls at the grid's small local maxima: 58% of the voxels reached
+    no tip.
+  - **Nearest tip by Dijkstra** assigns every voxel, but the shares came out dominated by a few
+    masses at the back: one lock 7.8%, the median 0.03%.
+  
+  Besides, the hair's cross-section grows about 3.5× from the scalp to the lock ends, so the
+  guides spread apart low down whatever the shares. Denser roots (3.2 mm) and more strands were
+  the cheaper fix.
+- **Measured.** 99% of guide points inside the volume; 86% of it within 5 mm of a guide, 94%
+  within 8 mm (4170 guides from roots 3.2 mm apart, median 44 cm; the first version's 2800 at
+  4 mm gave 81% / 94%). Hair to apron in the front view reads (1 : 0.63 : 0.27) against the
+  photo's (1 : 0.61 : 0.28).
+- **Fur.** Each strand follows its one nearest guide (`guide_blend 1`), with no `clump`. A clump
+  guide is itself a copy of the nearest authored guide, and where guides diverge (the front
+  hairline, a lock split) clumping pulled tips across between them: strays over the face, a
+  stringy texture. Off, the locks read as coherent bands.
+- **Checked in the groom tool** through `FTRACE_GROOM_VIEW_FILE`: bright edges, hue by depth, and
+  slices across y (from above, solid parts cut), x and z show the guides inside the outlines.
+
 **The groom tool (0.329.0, Phase 1).** `runGroomGui` in `viewer_gui.cpp` reuses the loom
 viewer's shell -- its D3D11 device, `MeshGpu` pipeline (shaders, solid/wire rasterizer states,
 depth states, MSAA target) and orbit camera -- and adds a line pass: curves and strands go through
@@ -1312,7 +1392,11 @@ grew from 144 to 176 bytes (`slab`, `extra`); the mesh viewer zero-fills it and 
 - **Roots sections** draw with `rsFront`, a negative depth bias, so a scalp lying on the skin
   stops z-fighting with it.
 - **Test hook.** `FTRACE_GROOM_VIEW="key=value;..."` presets these view options at startup so the
-  pane can be captured in each mode with `tools/gui_peek.ps1`. Synthetic mouse input cannot reach
+  pane can be captured in each mode with `tools/gui_peek.ps1`. Since 0.374.1
+  `FTRACE_GROOM_VIEW_FILE` names a file of the same text, re-read whenever its write time changes
+  (checked every frame), so one running tool -- a load takes minutes -- goes through any number of
+  views. Keys: `rims hueDepth hueLine farSide slice sliceAxis slicePos sliceThick sliceGuides
+  sliceSolids curves points hair mesh frame yaw pitch zoom grid opacity level0..level7`. Synthetic mouse input cannot reach
   an unfocused ImGui window: the backend's `SetCapture` / `TrackMouseEvent` traffic replaces the
   posted position with the real cursor's, even with the UI thread suspended while posting.
 

@@ -71,6 +71,23 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-10-07): GROOM-SILENT-OOM — the groom tool can exit without a word when memory is short
+
+**Seen** while the Alice2 v3 final renders ran. A second ftrace, `-groom` on the same 110,000-strand
+scene, logged its last fur block and then exited; bash reported 127, and no error was printed. At
+that moment the system had 7.1 GB of commit left of 127 GB, with the render holding 13.5 GB
+private. This is the same commit ceiling as the `gallery_rain` flyby entry below.
+
+**Probably** an allocation failing past the fur generation (the scene's BVH, or the tool's sections
+and pane geometry) and the process dying without reaching a handler that prints.
+
+**Workaround:** don't load a heavy groom in the tool while a big render of it is running. Earlier
+the same day, the tool had loaded this scene fine alongside a 700 x 700 render.
+
+**Fix candidates:**
+- catch `std::bad_alloc` around the tool's load and say what failed;
+- let `-groom` skip generating the fur it only draws on request (the "hair" toggle).
+
 ## DONE (2026-09-29, 0.373.0): GUI-DRIVE-WRONG-WINDOW — the GUI driver sent its keys and its screen capture to the wrong window
 
 **What happened.** While the user was working in a browser, `tools/gui_drive.ps1` was run against the
