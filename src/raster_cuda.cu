@@ -872,16 +872,20 @@ __global__ void kRasterLarge(const DGeo* geos, const int* flags, const int* list
 // against the shading normal.
 // Degenerate UVs (a zero-area triangle in texture space) fall back to any perpendicular,
 // which is what a normal map with no usable frame deserves — a stable, if arbitrary, basis
-// rather than a NaN.
+// rather than a NaN. `sign` gets the frame's handedness (raster::triTangentSign, geometry.h's
+// bitangentSign): the bitangent is cross(N, T) * sign, -1 where the UVs are mirrored.
 __device__ inline float3 dTriTangent(float3 p0, float3 p1, float3 p2,
-                                     float2 t0, float2 t1, float2 t2, float3 N) {
+                                     float2 t0, float2 t1, float2 t2, float3 N, float& sign) {
     float3 e1 = p1 - p0, e2 = p2 - p0;
     float d1x = t1.x - t0.x, d1y = t1.y - t0.y;
     float d2x = t2.x - t0.x, d2y = t2.y - t0.y;
     float det = d1x * d2y - d2x * d1y;
     float3 T;
+    sign = 1.0f;
     if (fabsf(det) > 1e-18f) {
         T = (e1 * d2y - e2 * d1y) * (1.0f / det);
+        float3 B = (e2 * d1x - e1 * d2x) * (1.0f / det);
+        if (dot3(cross3(cross3(e1, e2), T), B) < 0.0f) sign = -1.0f;
     } else {
         float3 ax = (fabsf(N.x) < 0.9f) ? mk(1, 0, 0) : mk(0, 1, 0);
         T = cross3(ax, N);
@@ -1217,9 +1221,10 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     // The tangent comes from the SOURCE triangle's UV parameterisation, so a clipped slot
     // (whose stored verts are lerped) still gets the same frame as its unclipped siblings.
     if (nrmTex >= 0 && nrmTex < nTex) {
-        float3 T = dTriTangent(wp0, wp1, wp2, uv0, uv1, uv2, N3);
+        float tsign;
+        float3 T = dTriTangent(wp0, wp1, wp2, uv0, uv1, uv2, N3, tsign);
         if (dot3(T, T) > 1e-18f) {
-            float3 B3 = cross3(N3, T);
+            float3 B3 = cross3(N3, T) * tsign;          // mirrored UVs: -1
             float3 tn = dSampleNormalTS(texMeta, texels, nrmTex, uu, vv);
             float3 pert = T * (tn.x * nrmS) + B3 * (tn.y * nrmS) + N3 * tn.z;
             float pl = sqrtf(dot3(pert, pert));

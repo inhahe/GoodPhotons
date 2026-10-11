@@ -71,6 +71,22 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-10-11, 0.374.2): RASTER-MIRRORED-UV — the raster preview inverted normal maps on mirrored UVs
+
+**Seen** on the symmetric Alice2 head (`tools/alice2_symmetrize.py`, whose left half reuses its right
+half's texture coordinates, mirrored): `ftrace model.glb` showed a dark line down the middle of
+the forehead, nose and chin, which the path-traced renders did not show.
+
+**Cause:** both preview rasterizers (CPU `raster.h`, GPU `raster_cuda.cu`) built the normal map's
+frame as `B = cross(N, T)`, ignoring the UV frame's handedness that `geometry.h` records as
+`bitangentSign` for the tracers. On a mirrored-UV triangle the green channel decoded inverted,
+so the mirrored half shaded as if lit from the other side.
+
+**Fix:** the handedness is baked with the tangent (`PTri::tanSign` / `dTriTangent`'s `sign`) and
+applied to B. Checked: the Hyper3D model as downloaded, which has no mirrored UVs, previews
+pixel-identical before and after; the symmetric head's seam is gone. Any mirrored-UV asset
+(common in game models) previewed wrongly before this.
+
 ## OPEN (2026-10-11): ALICE2-CHEEK-DOT — a pinprick dark dot on the Alice2 face, in front of each ear
 
 **Seen** in the front renders of `base_basic_pbr_flat_sparkle_sym_eyes.glb`

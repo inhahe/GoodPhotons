@@ -8802,6 +8802,12 @@ in 0.136.1 (2.4–3.5× at 1280×960; every optimization below is **byte-identic
   per triangle at tessellation (`PTri::tanRaw`, zero when UVs degenerate ⇒ per-pixel
   fallback basis) leaving only the per-pixel Gram-Schmidt. The GPU twin deliberately keeps
   recomputing the raw tangent per pixel — its whole shade pass is 0.19 ms.
+  - **The frame's handedness** is baked with it (`PTri::tanSign`, `triTangentSign`; the GPU's
+    `dTriTangent` returns it), and the bitangent is `cross(N, T) * sign`, as `geometry.h`'s
+    `bitangentSign` makes it for the tracers. Until 0.374.2 the preview used `cross(N, T)`
+    alone, so wherever a model's UVs are mirrored (a symmetric model whose two halves share one
+    texture) the preview decoded the normal map with its green channel inverted, while the path
+    tracer was right. It showed as a seam down the middle of the symmetric Alice2 face.
 - **What was measured, not guessed** (`scenes/_raster_bench.ftsl` + its `_plain` twin,
   1280×960, 12 threads): features-heavy
   86 → ~36 ms median, all-plain 69 → ~20 ms; remaining with-anchor cost over absolute-EV

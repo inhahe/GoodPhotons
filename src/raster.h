@@ -122,6 +122,11 @@ struct PTri : PShade {
     // UV parameterisation is degenerate/absent — the shade pass then falls back to a
     // stable frame about the shading normal, exactly as the old per-pixel path did.
     Vec3 tanRaw{0, 0, 0};
+    // The UV frame's handedness (+1 / -1): the bitangent is cross(N, T) * tanSign, as
+    // geometry.h's Tri::bitangentSign makes it for the tracers. -1 where the UVs are mirrored
+    // (a symmetric model whose two halves share one texture), whose normal map would
+    // otherwise decode with its green channel inverted -- a seam down the middle.
+    double tanSign = 1.0;
     // Per-vertex COLOUR (linear RGB), or hasVcol=false. The rasterizer is an RGB pipeline,
     // so it consumes the mesh's vertex colours directly — no Jakob-Hanika lift, which is
     // the whole reason Scene::vertColors stores RGB rather than fitted coefficients: the
@@ -160,6 +165,19 @@ inline Vec3 triTangentRaw(const PTri& t) {
     double det = d1.x * d2.y - d2.x * d1.y;
     if (std::fabs(det) > 1e-18) return (e1 * d2.y - e2 * d1.y) * (1.0 / det);
     return Vec3{0, 0, 0};
+}
+
+// The handedness of a triangle's UV frame, exactly as geometry.h's Tri::finalize derives
+// bitangentSign: the sign of dot(cross(gn, T), B), with T and B the raw dP/dU and dP/dV.
+// +1 for degenerate UVs (the fallback frame has no handedness to keep).
+inline double triTangentSign(const PTri& t) {
+    Vec3 e1 = t.p1 - t.p0, e2 = t.p2 - t.p0;
+    Vec3 d1 = t.uv1 - t.uv0, d2 = t.uv2 - t.uv0;
+    double det = d1.x * d2.y - d2.x * d1.y;
+    if (!(std::fabs(det) > 1e-18)) return 1.0;
+    Vec3 T = (e1 * d2.y - e2 * d1.y) * (1.0 / det);
+    Vec3 B = (e2 * d1.x - e1 * d2.x) * (1.0 / det);
+    return dot(cross(cross(e1, e2), T), B) < 0.0 ? -1.0 : 1.0;
 }
 
 // A "clear" preview surface for the optional see-through rasterizer: a transmissive
@@ -1469,7 +1487,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
         const bool wantTan = p.normalTex >= 0 ||
             (p.mix >= 0 && p.mix < (int)geom.mixes.size() &&
              geom.mixes[p.mix].b.normalTex >= 0);
-        if (wantTan) p.tanRaw = triTangentRaw(p);
+        if (wantTan) { p.tanRaw = triTangentRaw(p); p.tanSign = triTangentSign(p); }
     }
     // Length scale for the see-through path integral, from the geometry actually built.
     {
@@ -2653,7 +2671,7 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                     double tl = std::sqrt(dot(T, T));
                     if (tl > 1e-12) {
                         T = T * (1.0 / tl);
-                        Vec3 B3 = cross(N3, T);
+                        Vec3 B3 = cross(N3, T) * pt.tanSign;   // mirrored UVs: -1
                         Vec3 tn = nx.sampleNormalTS(g.uv[i].x, g.uv[i].y);
                         double s3 = sh->normalStrength;
                         Vec3 pert = T * (tn.x * s3) + B3 * (tn.y * s3) + N3 * tn.z;
