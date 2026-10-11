@@ -1285,8 +1285,12 @@ The steps, in order:
 1. **Re-centre the midline** (`centre_midline`). In each 2 mm horizontal slice of the front, a
    parabola is fitted to the heights within 22 mm of the plane. Where it is clearly convex, its crest
    is the feature's centre. The curve is interpolated and smoothed, held to 0 between the eyes and
-   down the neck, and the face is shifted across by it, whole within 10 mm of the plane and gone by
-   35 mm. Normals turn with the surface.
+   down the neck, and the face is shifted across by it. The shift is whole within 30 mm of each
+   feature's own centre, so the nose and lips move as one piece, and gone by 60 mm. It applies only
+   on the front of the head (the head is one closed mesh, and the nape lies behind the mouth).
+   Normals turn with the surface.
+   - **Measured from the plane at first, it stretched the features:** a nose 10 mm off-centre had
+     its far wing barely moved, and mirrored it came out ~45% wider.
    - **Why:** mirroring (or averaging) a feature that is off the plane makes it two-lobed: a groove
      down the nose, a double bow in the lip.
 2. **Average the two sides** (`average_shape`): her right side moved halfway toward her left side's
@@ -1295,16 +1299,24 @@ The steps, in order:
      square-on; mirrored as it is, the skewed face meets it at an angle, a crease down the middle.
    - **The chin:** her right side mirrored gives a cleft chin (two low points 25 mm out), her left
      a pointed one; the average cancels the tilt and gives one round low point.
-3. **Narrow the mouth** (`narrow_mouth`): her right half squeezed across to 0.66 within an ellipse
-   round the lips, fading out by 1.6 times its size, so the mouth is 0.47 of the pupils' spacing.
-   Each moved vertex keeps its height over a smooth copy of the face (8 mm Gaussian), so the lips'
-   relief moves with them. The texture coordinates stay, so the paint moves too.
+3. **Narrow the mouth** (`narrow_mouth`): her right half squeezed across within an ellipse round
+   the lips, fading out by 1.6 times its size, so that the mouth is 0.47 of the pupils' spacing.
+   Both are measured on the head: the painted lips' outermost point on her right (37 mm out once
+   re-centred) and the painted eyes (121 mm apart), so the squeeze is 0.76. The front of the head
+   only.
+   - **The lips' relief moves with them:** each moved vertex keeps its height over a smooth copy of
+     the face (8 mm Gaussian). That copy is made from her right side and its mirror image, so it
+     meets the plane square-on as the averaged face does; made from both sides as they were, the
+     skew's slope came back as a crease down the lips.
+   - **The paint moves too:** the texture coordinates stay.
 4. **Mirror** (`mirror_right`). The head is cut along the plane: vertices within 0.05 mm snapped onto
    it, triangles across it clipped (Sutherland–Hodgman), new vertices interpolated. Her left half is
    dropped, and her right half is mirrored into its place: positions and normals reflected, winding
    reversed, the same UVs.
    - **The seam:** the halves share their vertices on the plane, so it is watertight (separate
      copies differ in the last bit once stored as float32), and the normals there lie in the plane.
+     A cut point is always interpolated from the edge's end on her right, so a UV seam's two copies
+     of the edge give the same numbers.
    - **The normal map needs no conversion.** The renderer builds each triangle's tangent from the
      UV gradient and records the bitangent's handedness (`geometry.h`), so a mirrored triangle with
      the same UVs decodes to the mirrored normal.
@@ -1320,7 +1332,9 @@ The steps, in order:
    - **At the plane** the world normal is laid into the plane (fading out by 4 mm), then re-expressed
      in the FINAL triangle's tangent frame and vertex normals.
    - **The texels round the seam that nothing reads any more** take their rebaked neighbours'
-     values: the dropped left parts of the cut triangles, and the islands' padding.
+     values: the dropped left parts of the cut triangles, and the islands' padding. "Read" means
+     covered by the final triangles under the same texel-centre rule the rebake uses (a polygon fill
+     counted texels on the far edges that were never written).
    - **Checked:** the decoded normals 0.5 mm either side of the plane have a component across it of
      0.002 (median); the halves agree to 0.00°.
    - **Tried first, and wrong, each leaving a seam down the face under the room's one-sided light:**
@@ -1331,14 +1345,15 @@ The steps, in order:
 Plane fitting: `alice2_eyes.mirror_plane` (the ICP) can settle on a wrong plane on an exactly
 symmetric head, 7° off, or even diverge. It now refines by minimising the reflected vertices'
 distance to the head directly (Nelder–Mead, from the ICP's answer and from the x axis). It takes the
-refined plane only when it finds the head exactly symmetric: on the lopsided source, that minimum
+refined plane only when it finds the head exactly symmetric (residual under 0.02 mm; a mirrored head
+gives ~1e-6 m, float32): on the lopsided source, that minimum
 follows the skull (3.6° off), while the ICP's plane follows the features (the eyes are level about
 it).
 
 The rest of the pipeline on the symmetric head:
 - `alice2_eyes.py --glb <sym>` finds the plane exactly, and both eyes come out identical from the
-  start. The shared eye is her right eye's size, 43 × 29 mm: 0.36 of the pupils' spacing, against
-  the front photo's 0.34.
+  start. The shared eye is her right eye's, 45 × 31 mm: 0.37 of the pupils' spacing, against the
+  front photo's 0.34.
 - `alice2_hair3.py --glb <sym> --mirror-ears` grows the v3 hair on it.
 
 Not fixed: a pinprick-sized dark dot in front of each ear, on the cheek, from the source. It is not

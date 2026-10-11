@@ -109,7 +109,7 @@ def mirror_plane(V, iters=40):
     # (from the iteration's answer and from its start: on such a head it can also diverge outright)
     best = min((refine_plane(V, n0, d0) for n0, d0 in ((n, d), (np.array([1.0, 0.0, 0.0]), XMID))),
                key=lambda r: r[2])
-    if best[2] < 2e-4:
+    if best[2] < 2e-5:              # (exactly mirrored: ~1e-6 m, float32; the lopsided source: ~3 mm)
         return best[0], best[1]
     return n, d
 
@@ -262,6 +262,40 @@ def tangent_frames(Pt, UVt):
     return gn, Tg, sign
 
 
+def frame_at(Nn, Tg, sg):
+    """The renderer's tangent frame at points of a triangle (scene.h applyNormalMap): its tangent `Tg`
+    laid off the interpolated vertex normal `Nn` (unit, n x 3), and B = cross(N, T) * sign `sg`."""
+    Ta = Tg - Nn * np.einsum("ij,ij->i", Nn, np.broadcast_to(Tg, Nn.shape))[:, None]
+    Ta /= np.maximum(1e-12, np.linalg.norm(Ta, axis=1))[:, None]
+    return Ta, np.cross(Nn, Ta) * np.asarray(sg)[..., None]
+
+
+def decode_normal(c, Nn, Tg, sg):
+    """The world normals the renderer reads from normal-map texels `c` (0-1, n x 3): n = 2c - 1,
+    unit, in frame_at's frame."""
+    t = c * 2 - 1
+    t /= np.maximum(1e-12, np.linalg.norm(t, axis=1))[:, None]
+    Ta, Ba = frame_at(Nn, Tg, sg)
+    return Ta * t[:, :1] + Ba * t[:, 1:2] + Nn * t[:, 2:]
+
+
+def encode_normal(n, Nn, Tg, sg):
+    """Normal-map texels (0-1) that the renderer reads back as the world normals `n`."""
+    Tb, Bb = frame_at(Nn, Tg, sg)
+    tn = np.c_[(n * Tb).sum(1), (n * Bb).sum(1), (n * Nn).sum(1)]
+    tn /= np.maximum(1e-12, np.linalg.norm(tn, axis=1))[:, None]
+    return 0.5 * (tn + 1.0)
+
+
+def welded_normals(P, N, T):
+    """The mesh welded across its UV seams (hairgeo.weld) and each welded vertex's normal (the mean of
+    its copies'): (V, Tw, winv, Nw)."""
+    V, Tw, winv = hg.weld(P, T)
+    Nw = np.zeros_like(V); np.add.at(Nw, winv, N)
+    Nw /= np.maximum(1e-12, np.linalg.norm(Nw, axis=1))[:, None]
+    return V, Tw, winv, Nw
+
+
 def bake(Tri_new, Tp, P, N, UV, uvn, atlas, mr, nmap, W, H):
     """Into a W x H image, through each patch triangle: the atlas colour and metal/roughness at the old
     UVs, and the old normal map re-expressed in the new UVs' tangent frames (decoded and re-encoded
@@ -278,16 +312,8 @@ def bake(Tri_new, Tp, P, N, UV, uvn, atlas, mr, nmap, W, H):
         col[yy, xx] = bilinear(atlas, uo[:, 0], uo[:, 1])
         mro[yy, xx] = bilinear(mr, uo[:, 0], uo[:, 1])
         Nn = l @ N[Tp[i]]; Nn /= np.maximum(1e-12, np.linalg.norm(Nn, axis=1))[:, None]
-        t = bilinear(nmap, uo[:, 0], uo[:, 1]) * 2 - 1
-        t /= np.maximum(1e-12, np.linalg.norm(t, axis=1))[:, None]
-        Ta = To[i] - Nn * (Nn @ To[i])[:, None]; Ta /= np.maximum(1e-12, np.linalg.norm(Ta, axis=1))[:, None]
-        Ba = np.cross(Nn, Ta) * so[i]
-        nw = Ta * t[:, :1] + Ba * t[:, 1:2] + Nn * t[:, 2:]
-        Tb = Tn[i] - Nn * (Nn @ Tn[i])[:, None]; Tb /= np.maximum(1e-12, np.linalg.norm(Tb, axis=1))[:, None]
-        Bb = np.cross(Nn, Tb) * sn[i]
-        tn = np.c_[(nw * Tb).sum(1), (nw * Bb).sum(1), (nw * Nn).sum(1)]
-        tn /= np.maximum(1e-12, np.linalg.norm(tn, axis=1))[:, None]
-        nrm[yy, xx] = 0.5 * (tn + 1.0)
+        nw = decode_normal(bilinear(nmap, uo[:, 0], uo[:, 1]), Nn, To[i], so[i])
+        nrm[yy, xx] = encode_normal(nw, Nn, Tn[i], sn[i])
         cov[yy, xx] = True
     # uncovered texels take their nearest covered neighbour's value (nothing dark bleeds in)
     _, ind = ndimage.distance_transform_edt(~cov, return_indices=True)
@@ -958,9 +984,7 @@ def main():
     atlas = img_of(pbr["baseColorTexture"]["index"])
     mr = img_of(pbr["metallicRoughnessTexture"]["index"])
     nmap = img_of(mat["normalTexture"]["index"])
-    V, Tw, winv = hg.weld(P, T)                      # the face welded across its UV seams
-    Nw = np.zeros_like(V); np.add.at(Nw, winv, N)
-    Nw /= np.maximum(1e-12, np.linalg.norm(Nw, axis=1))[:, None]
+    V, Tw, winv, Nw = welded_normals(P, N, T)        # the face welded across its UV seams
     nm, dm = mirror_plane(V)
     log("the face's mirror plane: normal %s (%.1f degrees off the model's x axis)"
         % (np.round(nm, 3), np.degrees(np.arccos(abs(nm[0])))))

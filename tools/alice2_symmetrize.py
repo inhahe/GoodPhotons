@@ -64,15 +64,19 @@ CHIN = ((0.0, -0.098), (0.070, 0.022))    # the chin: an ellipse in the plane's 
 ZONE_FADE = 1.5                           # ... its weight fades to 0 at this many times its size
 # The mouth: her right half of it, narrowed toward the middle (shape and paint together):
 MOUTH = ((0.0, -0.050), (0.050, 0.016))   # the ellipse round her lips (both halves' corners inside)
-MOUTH_K = 0.66                            # ... squeezed across to this: her right corner, 42 mm out,
-                                          # comes to 28 mm -- the mouth 0.47 of the pupils' spacing,
-                                          # the photos' 0.42-0.50 (her right half as it is: 0.72)
+MOUTH_WIDTH = 0.47                        # ... squeezed until the mouth is this much of the pupils'
+                                          # spacing: the photos show 0.42 (front) to 0.50 (3/4)
 MOUTH_FADE = 1.6                          # ... the squeeze fading out by this many times its size
 CENTRE_TOP, CENTRE_BOTTOM = 0.035, -0.130  # the midline features re-centred between these heights (m,
                                           # from REF_Y): from between the eyes down past the chin,
                                           # tapering to nothing over the top 1 cm and the bottom 2 cm
 CENTRE_FIT = 0.022                        # ... each slice's crest fitted within this of the plane (m)
-CENTRE_FLAT, CENTRE_REACH = 0.010, 0.035  # ... the shift whole within the first, gone by the second (m)
+CENTRE_FLAT, CENTRE_REACH = 0.030, 0.060  # ... the shift whole within the first of the feature's own
+                                          # centre (the nose and lips move as one piece), gone by the
+                                          # second (m)
+FRONT = (0.02, 0.05)                      # the front of the head: height out of the face (m, from the
+                                          # plane's origin) where the shape steps start to apply, and
+                                          # where in full -- the back of the head and the nape stay
 REF_Y = 1.62                              # the frame's origin: the point of the plane at this height
 SNAP = 5e-5                               # vertices this close to the plane (m) are put on it
 PLANE_FLAT = 0.004                        # the normal map's normals are laid into the plane within this
@@ -106,7 +110,7 @@ def left_weight(X, nm, dm, c0, up):
 
 def midline_offsets(V, Tw, nm, dm):
     """Where the face's midline features actually are, height by height: in each horizontal slice
-    of the front of the face (2 mm apart, within CENTRE_REACH of the plane), the across position
+    of the front of the face (2 mm apart, within CENTRE_FIT of the plane), the across position
     of the profile's crest -- a parabola fitted to the slice's heights out of the face, where it is
     clearly convex (the nose, the lips, the chin). Gaps are interpolated, the curve smoothed, and
     it is held to 0 above CENTRE_TOP (between the eyes the plane is right). Returns (heights up
@@ -141,14 +145,15 @@ def centre_midline(P, N, T, nm, dm):
     mirroring her right half (or averaging the two) of a feature that is off the plane makes it
     two-lobed: a groove down the nose, a double bow in the lip. Returns new P, N."""
     c0, up, fwd = plane_frame(nm, dm)
-    V, Tw, winv = hg.weld(P, T)
+    V, Tw, winv, Nw = E.welded_normals(P, N, T)
     us, cs = midline_offsets(V, Tw, nm, dm)
     a, u = (V @ nm) - dm, (V - c0) @ up
     c = np.interp(u, us, cs, left=0.0, right=0.0)
-    fade = E.smooth01((CENTRE_REACH - np.abs(a)) / (CENTRE_REACH - CENTRE_FLAT))
+    # whole round each feature's own centre (so it moves as one piece), fading out beyond it; and
+    # only on the front of the head (it is closed: the nape behind the mouth must stay)
+    fade = E.smooth01((CENTRE_REACH - np.abs(a - c)) / (CENTRE_REACH - CENTRE_FLAT)) * front_weight(V, c0, fwd)
     Vn = V - (c * fade)[:, None] * nm
     Nr0, Nr1 = hg.vertex_normals(V, Tw), hg.vertex_normals(Vn, Tw)
-    Nw = np.zeros_like(V); np.add.at(Nw, winv, N); Nw /= np.linalg.norm(Nw, axis=1)[:, None]
     # the normals turn as the surface did (the shift shears it a little)
     rot = Nw + (Nr1 - Nr0)
     rot /= np.linalg.norm(rot, axis=1)[:, None]
@@ -162,50 +167,71 @@ def centre_midline(P, N, T, nm, dm):
     return P2, N2
 
 
-def narrow_mouth(P, N, T, nm, dm):
-    """Her right half's mouth squeezed toward the middle (MOUTH_K), the squeeze fading out round it.
-    The lips' relief is carried with them: each moved vertex keeps its height over a smooth copy of
-    the face (Gaussian, 8 mm) -- so the lips stay lips and the cheek it moves over stays the cheek.
-    The paint moves with the vertices (their texture coordinates are kept). Returns new P, N."""
+def front_weight(X, c0, fwd):
+    """1 on the front of the head, 0 behind it (by height out of the face, FRONT): the head is one
+    closed mesh, and the nape lies behind the mouth's footprint."""
+    return E.smooth01(((X - c0) @ fwd - FRONT[0]) / (FRONT[1] - FRONT[0]))
+
+
+def narrow_mouth(P, N, UV, T, atlas, nm, dm):
+    """Her right half's mouth squeezed toward the middle, the squeeze fading out round it, so that
+    the mouth is MOUTH_WIDTH of the pupils' spacing: her right corner (the painted lips' outermost
+    point there) is measured, and so are the pupils (the painted eyes, eye_frames). The lips'
+    relief is carried with them: each moved vertex keeps its height over a smooth copy of the face
+    (Gaussian, 8 mm; made from her right side and its mirror image, so it meets the plane square-on,
+    as the averaged face does). The paint moves with the vertices (their texture coordinates are
+    kept). Returns new P, N."""
     c0, up, fwd = plane_frame(nm, dm)
-    V, Tw, winv = hg.weld(P, T)
+    V, Tw, winv, Nw = E.welded_normals(P, N, T)
     a, u, h = (V @ nm) - dm, (V - c0) @ up, (V - c0) @ fwd
-    g = E.smooth01((MOUTH_FADE - ellipse_r(V, nm, dm, c0, up, MOUTH)) / (MOUTH_FADE - 1.0)) * (a < 0)
+    # where the right corner and the pupils are
+    H, W, _ = atlas.shape
+    uvc = UV[T].mean(1)
+    col = atlas[np.clip((uvc[:, 1] * H).astype(int), 0, H - 1), np.clip((uvc[:, 0] * W).astype(int), 0, W - 1)]
+    lips = (col[:, 0] > col[:, 1] + 0.25) & (col[:, 0] > col[:, 2] + 0.12) & (col[:, 0] > 0.45)
+    lips &= (ellipse_r(V[Tw].mean(1), nm, dm, c0, up, MOUTH) < 1.0) & (front_weight(V[Tw].mean(1), c0, fwd) > 0.5)
+    corner = -float(a[Tw[lips & ((a[Tw].mean(1)) < 0)]].min())
+    left, _ = E.eye_frames(P, T, UV, atlas, nm, dm)
+    pupils = 2.0 * abs(float(left["c"] @ nm) - dm)
+    k = MOUTH_WIDTH * pupils / 2.0 / corner
+    g = E.smooth01((MOUTH_FADE - ellipse_r(V, nm, dm, c0, up, MOUTH)) / (MOUTH_FADE - 1.0)) * (a < 0) \
+        * front_weight(V, c0, fwd)
     mv = np.nonzero(g > 0)[0]
-    # the face's height over the plane's frame round the mouth, and a smooth copy of it
+    # the face's height over the plane's frame round the mouth, made symmetric, and a smooth copy
     PX = 2.5e-4
-    a0, a1, u0, u1 = -0.12, 0.02, -0.11, 0.0
-    W_, H_ = int((a1 - a0) / PX), int((u1 - u0) / PX)
-    px, py = (a - a0) / PX, (u1 - u) / PX
+    a0, u0, u1 = 0.12, -0.11, 0.0
+    W_, H_ = int(2 * a0 / PX), int((u1 - u0) / PX)
+    px, py = (a + a0) / PX, (u1 - u) / PX
     fn = np.cross(V[Tw[:, 1]] - V[Tw[:, 0]], V[Tw[:, 2]] - V[Tw[:, 0]])
-    front = (fn @ fwd) > 0
+    Tf = Tw[(fn @ fwd) > 0]
     hz = np.full((H_, W_), -np.inf)
-    for i, yy, xx, l in E.raster(np.stack([px[Tw[front]], py[Tw[front]]], -1), W_, H_):
-        hv = l @ h[Tw[front][i]]
+    for i, yy, xx, l in E.raster(np.stack([px[Tf], py[Tf]], -1), W_, H_):
+        hv = l @ h[Tf[i]]
         b = hv > hz[yy, xx]
         hz[yy[b], xx[b]] = hv[b]
+    hz[:, W_ // 2:] = hz[:, :W_ // 2][:, ::-1]                # her right side and its mirror image
     m = np.isfinite(hz)
     sig = 0.008 / PX
     base = ndimage.gaussian_filter(np.where(m, hz, 0.0), sig) / np.maximum(ndimage.gaussian_filter(m * 1.0, sig), 1e-9)
 
     def base_at(aa, uu):
-        q = np.c_[(aa - a0) / PX / W_, (u1 - uu) / PX / H_]
+        q = np.c_[(aa + a0) / PX / W_, (u1 - uu) / PX / H_]
         return E.bilinear(base[..., None], q[:, 0], q[:, 1])[:, 0]
-    an = a[mv] * (1.0 - (1.0 - MOUTH_K) * g[mv])
+    an = a[mv] * (1.0 - (1.0 - k) * g[mv])
     hn = base_at(an, u[mv]) + (h[mv] - base_at(a[mv], u[mv]))
     Vn = V.copy()
     Vn[mv] = c0 + an[:, None] * nm + u[mv, None] * up + hn[:, None] * fwd
     # normals: the new surface's, blended in by the squeeze's weight
     Nr = hg.vertex_normals(Vn, Tw)
-    Nw = np.zeros_like(V); np.add.at(Nw, winv, N); Nw /= np.linalg.norm(Nw, axis=1)[:, None]
     Nn = Nw.copy()
     Nn[mv] = (1 - g[mv, None]) * Nw[mv] + g[mv, None] * Nr[mv]
-    Nn[mv] /= np.linalg.norm(Nn[mv], axis=1)[:, None]
+    Nn[mv] /= np.maximum(1e-12, np.linalg.norm(Nn[mv], axis=1))[:, None]
     moved = np.isin(winv, mv)
     P2, N2 = P.copy(), N.copy()
     P2[moved] = Vn[winv[moved]]; N2[moved] = Nn[winv[moved]]
-    log("mouth: her right half squeezed across to %.2f round the lips (%d vertices moved, up to %.1f mm)"
-        % (MOUTH_K, len(mv), 1e3 * np.linalg.norm(Vn[mv] - V[mv], axis=1).max()))
+    log("mouth: her right corner %.1f mm out, the pupils %.1f mm apart: squeezed across to %.2f, so the mouth "
+        "is %.2f of their spacing (%d vertices moved, up to %.1f mm)"
+        % (1e3 * corner, 1e3 * pupils, k, MOUTH_WIDTH, len(mv), 1e3 * np.linalg.norm(Vn[mv] - V[mv], axis=1).max()))
     return P2, N2
 
 
@@ -235,8 +261,7 @@ def average_shape(P, N, T, nm, dm):
     vertex moved that far toward her left half's mirror image, its normal blended the same way.
     Returns new P, N."""
     c0, up, fwd = plane_frame(nm, dm)
-    V, Tw, winv = hg.weld(P, T)
-    Nw = np.zeros_like(V); np.add.at(Nw, winv, N); Nw /= np.linalg.norm(Nw, axis=1)[:, None]
+    V, Tw, winv, Nw = E.welded_normals(P, N, T)
     sideT = (V[Tw].mean(1) @ nm) - dm
     left = Surface(V, Tw[sideT > 0])
     w = left_weight(V, nm, dm, c0, up) * ((V @ nm) - dm < 0)
@@ -245,26 +270,15 @@ def average_shape(P, N, T, nm, dm):
     Vn, Nn = V.copy(), Nw.copy()
     Vn[mv] += w[mv, None] * (E.reflect_p(cp, nm, dm) - V[mv])
     nl = np.einsum("ij,ijk->ik", bary, Nw[left.F[tid]])
-    nl = E.reflect_v(nl / np.linalg.norm(nl, axis=1)[:, None], nm)
+    nl = E.reflect_v(nl / np.maximum(1e-12, np.linalg.norm(nl, axis=1))[:, None], nm)
     Nn[mv] = (1 - w[mv, None]) * Nw[mv] + w[mv, None] * nl
-    Nn[mv] /= np.linalg.norm(Nn[mv], axis=1)[:, None]
+    Nn[mv] /= np.maximum(1e-12, np.linalg.norm(Nn[mv], axis=1))[:, None]
     log("averaging: %d of her right side's vertices moved toward her left side's mirror image (up to %.1f mm)"
         % (len(mv), 1e3 * np.linalg.norm(Vn[mv] - V[mv], axis=1).max()))
     Pn, Nu = P.copy(), N.copy()
     moved = np.isin(winv, mv)
     Pn[moved] = Vn[winv[moved]]; Nu[moved] = Nn[winv[moved]]
     return Pn, Nu
-
-
-def decode_normal(nmap, uv, Nv, Tg, sg):
-    """The world normal the renderer reads from a tangent-space map at `uv` (scene.h applyNormalMap):
-    n = 2c - 1, T the triangle's UV tangent laid off the vertex normal, B = cross(N, T) * sign."""
-    t = E.bilinear(nmap, uv[:, 0], uv[:, 1]) * 2 - 1
-    t /= np.linalg.norm(t, axis=1)[:, None]
-    Ta = Tg - Nv * (Nv * Tg).sum(1)[:, None]; Ta /= np.linalg.norm(Ta, axis=1)[:, None]
-    Ba = np.cross(Nv, Ta) * sg[:, None]
-    n = Ta * t[:, :1] + Ba * t[:, 1:2] + Nv * t[:, 2:]
-    return n / np.linalg.norm(n, axis=1)[:, None]
 
 
 def rebake_averaged(g, mi, P0, N0, UV0, T0, Pf, Nf, UVf, Tr, atlas, mr, nmap, nm, dm):
@@ -277,8 +291,7 @@ def rebake_averaged(g, mi, P0, N0, UV0, T0, Pf, Nf, UVf, Tr, atlas, mr, nmap, nm
     c0, up, fwd = plane_frame(nm, dm)
     S = atlas.shape[0]
     flipv = np.array([1.0, -1.0])
-    V0, Tw0, winv0 = hg.weld(P0, T0)
-    Nw0 = np.zeros_like(V0); np.add.at(Nw0, winv0, N0); Nw0 /= np.linalg.norm(Nw0, axis=1)[:, None]
+    V0, Tw0, winv0, Nw0 = E.welded_normals(P0, N0, T0)
     sideT = (V0[Tw0].mean(1) @ nm) - dm
     lsel = sideT > 0
     left = Surface(V0, Tw0[lsel])
@@ -307,14 +320,14 @@ def rebake_averaged(g, mi, P0, N0, UV0, T0, Pf, Nf, UVf, Tr, atlas, mr, nmap, nm
             continue
         ry, rx, l, oj, ob, po, wp = ry[keep], rx[keep], l[keep], oj[keep], ob[keep], po[keep], wp[keep]
         # the original right side there ...
-        No = np.einsum("ij,ijk->ik", ob, N0[T0[osel[oj]]]); No /= np.linalg.norm(No, axis=1)[:, None]
+        No = np.einsum("ij,ijk->ik", ob, N0[T0[osel[oj]]]); No /= np.maximum(1e-12, np.linalg.norm(No, axis=1))[:, None]
         uvo = np.einsum("ij,ijk->ik", ob, UV0[T0[osel[oj]]])
-        n0 = decode_normal(nmap, uvo, No, To[oj], so[oj])
+        n0 = E.decode_normal(E.bilinear(nmap, uvo[:, 0], uvo[:, 1]), No, To[oj], so[oj])
         # ... and the original left side at the mirror point, reflected
         _, tl_, bl = left.closest(E.reflect_p(po, nm, dm))
         uvl = np.einsum("ij,ijk->ik", bl, UVl[tl_])
-        Nl = np.einsum("ij,ijk->ik", bl, Nw0[left.F[tl_]]); Nl /= np.linalg.norm(Nl, axis=1)[:, None]
-        n_l = E.reflect_v(decode_normal(nmap, uvl, Nl, Tl[tl_], sl[tl_]), nm)
+        Nl = np.einsum("ij,ijk->ik", bl, Nw0[left.F[tl_]]); Nl /= np.maximum(1e-12, np.linalg.norm(Nl, axis=1))[:, None]
+        n_l = E.reflect_v(E.decode_normal(E.bilinear(nmap, uvl[:, 0], uvl[:, 1]), Nl, Tl[tl_], sl[tl_]), nm)
         wq = wp[:, None]
         nb = (1 - wq) * n0 + wq * n_l
         # on a symmetric face the normal lies in the plane AT the plane; the old map does not agree
@@ -323,19 +336,17 @@ def rebake_averaged(g, mi, P0, N0, UV0, T0, Pf, Nf, UVf, Tr, atlas, mr, nmap, nm
         beta = E.smooth01((PLANE_FLAT - np.abs((pf @ nm) - dm)) / PLANE_FLAT)[:, None]
         nb = nb - beta * (nb @ nm)[:, None] * nm
         # re-expressed in the final frame, as the renderer will read it
-        Nv = l @ Nf[Tr[j]]; Nv /= np.linalg.norm(Nv, axis=1)[:, None]
-        Tb = Tf[j] - Nv * (Nv @ Tf[j])[:, None]; Tb /= np.linalg.norm(Tb, axis=1)[:, None]
-        Bb = np.cross(Nv, Tb) * sf[j]
-        tn = np.c_[(nb * Tb).sum(1), (nb * Bb).sum(1), (nb * Nv).sum(1)]
-        tn /= np.linalg.norm(tn, axis=1)[:, None]
+        Nv = l @ Nf[Tr[j]]; Nv /= np.maximum(1e-12, np.linalg.norm(Nv, axis=1))[:, None]
         atl[ry, rx] = (1 - wq) * atlas[ry, rx] + wq * E.bilinear(atlas, uvl[:, 0], uvl[:, 1])
         mrt[ry, rx] = (1 - wq) * mr[ry, rx] + wq * E.bilinear(mr, uvl[:, 0], uvl[:, 1])
-        nmt[ry, rx] = 0.5 * (tn + 1)
+        nmt[ry, rx] = E.encode_normal(nb, Nv, Tf[j], sf[j])
         written[ry, rx] = True
     # the texels round what was written follow it, where nothing reads them any more -- the islands'
     # padding, and the dropped left parts of the triangles cut at the plane, which sit right against
     # the seam: bilinear filtering reads them there
-    used = texel_coverage(UVf[Tr], S)
+    used = np.zeros((S, S), bool)
+    for _, ry, rx, _ in E.raster(UVf[Tr] * S, S, S):      # the same texel rule as `written`
+        used[ry, rx] = True
     for mj in range(len(g.json["meshes"])):
         if mj != mi:
             _, _, UVj, Tj = g.mesh(mj)
@@ -357,10 +368,10 @@ def renormal(P, N, T, nm, dm):
     c0, up, fwd = plane_frame(nm, dm)
     V, Tw, winv = hg.weld(P, T)
     Nr = hg.vertex_normals(V, Tw)[winv]
-    mouth = E.smooth01((MOUTH_FADE - ellipse_r(P * 1.0, nm, dm, c0, up, MOUTH)) / (MOUTH_FADE - 1.0))
+    mouth = E.smooth01((MOUTH_FADE - ellipse_r(P, nm, dm, c0, up, MOUTH)) / (MOUTH_FADE - 1.0)) * front_weight(P, c0, fwd)
     k = np.clip(np.maximum(2.0 * left_weight(P, nm, dm, c0, up), mouth), 0.0, 1.0)[:, None]
     N2 = (1 - k) * N + k * Nr
-    N2 /= np.linalg.norm(N2, axis=1)[:, None]
+    N2 /= np.maximum(1e-12, np.linalg.norm(N2, axis=1))[:, None]
     ang = np.degrees(np.arccos(np.clip((N2 * Nr).sum(1), -1, 1)))
     log("normals: %d vertices take the new surface's (95th percentile off it now %.1f degrees)"
         % (int((k[:, 0] > 0).sum()), np.percentile(ang, 95)))
@@ -381,6 +392,8 @@ def mirror_right(P, N, UV, T, nm, dm):
     def cutv(i, j):
         k = (min(i, j), max(i, j))
         if k not in cut:
+            if s[i] > 0:                     # always from her right end: a UV seam's two copies of the
+                i, j = j, i                  # edge then give bit-identical cut points
             t = s[i] / (s[i] - s[j])
             n = (1 - t) * N[i] + t * N[j]
             Pl.append((1 - t) * P[i] + t * P[j]); Nl.append(n / np.linalg.norm(n)); Ul.append((1 - t) * UV[i] + t * UV[j])
@@ -437,15 +450,24 @@ def main():
     out = a.out or os.path.splitext(a.glb)[0] + "_sym.glb"
     g = hg.Glb(a.glb)
     mi = g.mesh_by_material(FACE)
-    prim = g.json["meshes"][mi]["primitives"][0]
-    if set(prim["attributes"]) - {"POSITION", "NORMAL", "TEXCOORD_0"}:
-        raise RuntimeError("root.4 has attributes this tool would drop: %s" % sorted(prim["attributes"]))
+    prims = g.json["meshes"][mi]["primitives"]
+    prim = prims[0]
+    if set(prim["attributes"]) - {"POSITION", "NORMAL", "TEXCOORD_0"} or "targets" in prim:
+        raise RuntimeError("root.4 has attributes or morph targets this tool would drop: %s" % sorted(prim))
+    if len(prims) > 1:
+        raise RuntimeError("root.4 has %d primitives (an eyes copy? run this before tools/alice2_eyes.py, "
+                           "on the plain model)" % len(prims))
     mat = g.json["materials"][prim["material"]]
     P, N, UV, T = g.mesh(mi)
     pbr = mat["pbrMetallicRoughness"]
     src = {k: g.json["textures"][ti]["source"] for k, ti in (("color", pbr["baseColorTexture"]["index"]),
                                                              ("mr", pbr["metallicRoughnessTexture"]["index"]),
                                                              ("normal", mat["normalTexture"]["index"]))}
+    for k, v in src.items():                         # (they are rewritten as RGB)
+        bv = g.json["bufferViews"][g.json["images"][v]["bufferView"]]
+        o = bv.get("byteOffset", 0)
+        if "A" in Image.open(io.BytesIO(bytes(g.bin[o:o + bv["byteLength"]]))).mode:
+            raise RuntimeError("the %s atlas has an alpha channel, which rewriting it would drop" % k)
     img = {k: g.image(v).astype(np.float32) / 255.0 for k, v in src.items()}
     V, _, _ = hg.weld(P, T)
     nm, dm = E.mirror_plane(V)
@@ -453,7 +475,7 @@ def main():
     P, N = centre_midline(P, N, T, nm, dm)
     P0, N0, UV0, T0 = P, N, UV, T          # the re-centred head: what the paint is paired up on
     P, N = average_shape(P, N, T, nm, dm)
-    P, N = narrow_mouth(P, N, T, nm, dm)
+    P, N = narrow_mouth(P, N, UV, T, img["color"], nm, dm)
     P, N, UV, T, n_right = mirror_right(P, N, UV, T, nm, dm)
     N = renormal(P, N, T, nm, dm)
     ac, am, an = rebake_averaged(g, mi, P0, N0, UV0, T0, P, N, UV, T[:n_right],

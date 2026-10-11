@@ -73,9 +73,15 @@ EARS = {-1: (-0.013, 1.598, 1.683),   # her right ear: back edge z, lobe y, top 
 EAR_CUT = (0.004, 0.07, 0.003)  # the EARS are bare in the photos, the sculpt covers them: on each ear's side,
                                # nothing may grow or pass forward of the ear's back edge (less 4 mm), from
                                # 7 cm under its lobe (the jaw stays bare to the collar) to 3 mm over its top
-def cache_tag():
-    """What the cached volume and flow depend on (else they are rebuilt)."""
-    return "ears %s cut %.3f %.3f %.3f tips %.3f" % (sorted(EARS.items()), *EAR_CUT, TIP_TOL)
+def cache_tag(g):
+    """What the cached volume and flow depend on (else they are rebuilt): the ears, the cut, the tip
+    tolerance -- and the head and hair they were built from (a hash of their meshes' positions)."""
+    import hashlib
+    h = hashlib.sha1()
+    for name in ("root.1", "root.4"):
+        h.update(np.ascontiguousarray(g.mesh(g.mesh_by_material(name))[0], np.float32).tobytes())
+    return "ears %s cut %.3f %.3f %.3f tips %.3f meshes %s" % (sorted(EARS.items()), *EAR_CUT, TIP_TOL,
+                                                             h.hexdigest()[:16])
 
 
 def mirror_ears(g):
@@ -671,7 +677,8 @@ def main():
     cut_scalp(sc, zones)
     cfile = os.path.join(a.cache, "alice2_hair3_cache.npz") if a.cache else None
     z = np.load(cfile) if cfile and os.path.exists(cfile) else None
-    if z is not None and "tag" in z.files and str(z["tag"]) == cache_tag():
+    tag = cache_tag(g)
+    if z is not None and "tag" in z.files and str(z["tag"]) == tag:
         vol = dict(lo=z["lo"], H=z["H"], d_body=z["d_body"], G=z["G"]); P = z["P"]
         log("volume and flow from the cache " + cfile)
     else:
@@ -679,7 +686,7 @@ def main():
         P = solve_flow(vol, sc)
         if cfile:
             os.makedirs(a.cache, exist_ok=True)
-            np.savez_compressed(cfile, P=P, tag=np.array(cache_tag()), **vol)
+            np.savez_compressed(cfile, P=P, tag=np.array(tag), **vol)
     guides, dH = build_guides(vol, P, sc, a.spacing, a.seed)
     coverage(guides, vol, dH)
     areas = [a2.write_scalp(sc, os.path.join(out, "alice2_scalp_%s.obj" % a2.REGIONS[r]), r) for r in range(3)]

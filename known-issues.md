@@ -71,6 +71,26 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-10-11): ALICE2-CHEEK-DOT — a pinprick dark dot on the Alice2 face, in front of each ear
+
+**Seen** in the front renders of `base_basic_pbr_flat_sparkle_sym_eyes.glb`
+(`tools/alice2_symmetrize.py`'s output): a dot a few texels across on the cheek, just in front of
+the ear, about 107 mm from the mirror plane and 10 mm above the plane frame's origin. It is in the
+source model on her right cheek (`orig_trueface` shows it too), so mirroring put it on both cheeks.
+It shows only where the room light grazes that spot.
+
+**Not found:**
+- the colour atlas and the normal map are plain there (a 7×7 texel window of uniform luma, a
+  near-flat normal map);
+- no fold or flipped triangle shows within 8 mm of the ray hit (face normals agree with the vertex
+  normals);
+- the speck finder (dark components of at most 60 texels ringed by skin) caught only specks under
+  the eye patches.
+
+**Next:** render the spot with a camera aimed by the ray hit itself (`scraps/face/spot.ftsl` missed
+by a few mm), then look at the mesh there (a sliver? a tiny hole into the inside?). If it is
+geometry, smooth or remove it on her right side before mirroring.
+
 ## OPEN (2026-10-07): GROOM-SILENT-OOM — the groom tool can exit without a word when memory is short
 
 **Seen** while the Alice2 v3 final renders ran. A second ftrace, `-groom` on the same 110,000-strand
