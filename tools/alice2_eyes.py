@@ -101,7 +101,38 @@ def mirror_plane(V, iters=40):
         n, d = n2, d2
         if done:
             break
+    # On an exactly symmetric head (alice2_symmetrize's output) the iteration above can settle on a
+    # wrong plane (measured: 7 degrees off, 3 mm of residual). Refine by minimising the reflected
+    # vertices' distance to the head directly -- and use that only when it finds the head exactly
+    # symmetric: on a lopsided head that minimum follows the skull, while the plane above follows
+    # the features (the eyes come out level about it).
+    # (from the iteration's answer and from its start: on such a head it can also diverge outright)
+    best = min((refine_plane(V, n0, d0) for n0, d0 in ((n, d), (np.array([1.0, 0.0, 0.0]), XMID))),
+               key=lambda r: r[2])
+    if best[2] < 2e-4:
+        return best[0], best[1]
     return n, d
+
+
+def plane_residual(V, kd, n, d):
+    """The mean distance (m) from the reflected vertices to the nearest vertex, over the best 80%."""
+    dist, _ = kd.query(V - 2.0 * ((V @ n) - d)[:, None] * n)
+    return float(np.mean(np.sort(dist)[: int(0.8 * len(dist))]))
+
+
+def refine_plane(V, n, d):
+    """The plane minimising plane_residual, from (n, d): (n, d, residual)."""
+    from scipy.optimize import minimize
+    kd = cKDTree(V)
+
+    def unit(th, ph):
+        return np.array([np.cos(th) * np.cos(ph), np.sin(ph), np.sin(th) * np.cos(ph)])
+    th0, ph0 = np.arctan2(n[2], n[0]), np.arcsin(np.clip(n[1], -1, 1))
+    x0 = np.array([th0, ph0, d])
+    r = minimize(lambda x: plane_residual(V, kd, unit(x[0], x[1]), x[2]), x0, method="Nelder-Mead",
+                 options=dict(xatol=1e-7, fatol=1e-9, maxiter=3000,
+                              initial_simplex=[x0, x0 + [0.03, 0, 0], x0 + [0, 0.03, 0], x0 + [0, 0, 0.003]]))
+    return unit(r.x[0], r.x[1]), float(r.x[2]), float(r.fun)
 
 
 def reflect_p(X, nm, dm):

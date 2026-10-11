@@ -3395,8 +3395,10 @@ silhouette, the guides fill the sculpt's own hair VOLUME:
   wider than v2's, as in the photos, sits on the hair, and ends at the tops of the ears.
 - **The guides.** Its streamlines from evenly spaced scalp roots are the guides: ~4200 of them, 99%
   of their points inside the sculpt.
-- **Running it.** `D:/python314/python.exe -u tools/alice2_hair3.py [--cache <dir>]` takes about 10
-  minutes, or 4 with the volume and flow cached. design.md has the method.
+- **Running it.** `D:/python314/python.exe -u tools/alice2_hair3.py [--glb <alice2.glb>] [--cache <dir>]
+  [--mirror-ears]` takes about 10 minutes, or 4 with the volume and flow cached. `--mirror-ears` is for
+  the symmetric head below: her left ear is placed as her right one's mirror image. design.md has
+  the method.
 
 What it adds to the list above:
 - **A guided coat follows guides only as closely as the guides follow each other.** A strand is its
@@ -3408,6 +3410,20 @@ What it adds to the list above:
 - **End guides before they converge.** Streamlines that run on into a lock's tip converge on it from
   the whole lock, and render as a broom. v3 trims a random 0.8–3 cm off each such guide's end, so
   the lock tapers out.
+
+**A symmetric face: `tools/alice2_symmetrize.py`.** It writes a new copy of the Alice2 GLB,
+`<glb>_sym.glb` beside the original. The Hyper3D head is skewed: her right cheek and jaw fuller
+than her left, her left temple fuller than her right, the nose, mouth and chin up to 10 mm off to
+her right, the jaw tilted.
+- **What it does.** It re-centres the midline features, averages the two sides along the midline
+  and in the chin, narrows the mouth to the photos' proportions, then cuts the head along its mirror
+  plane and mirrors her right half (shape and paint) into her left half's place. Her right side was
+  chosen against the photos (cameras fitted to landmarks): it fits the profile and three-quarter
+  photos better, and its outline follows the profile's.
+- **Running it.** `D:/python314/python.exe -u tools/alice2_symmetrize.py [--glb <in.glb>] [--out
+  <out.glb>]` takes about half a minute. Then `tools/alice2_eyes.py --glb <glb>_sym.glb` for the eyes,
+  and `tools/alice2_hair3.py --glb <glb>_sym.glb --mirror-ears` for hair that fits the new head.
+  design.md has the method.
 
 **Crisp, matching eyes: `tools/alice2_eyes.py`.** It writes a new copy of the Alice2 GLB,
 `<glb>_eyes.glb` beside the original. The model's eyes were 8–30 texels across in its shared atlas,
@@ -3424,7 +3440,8 @@ than her right, each in a trenched socket with a ridge and a corner flap.
 - **Running it.** `D:/python314/python.exe -u tools/alice2_eyes.py [--glb <in.glb>] [--out <out.glb>]
   [--check] [--debug <dir>]` takes about a minute. `--check` makes a copy with only the texture move,
   which renders exactly like the original. design.md has the method.
-- **Using it.** `hair_opus5.5_v3/alice2_real_hair_eyes.ftsl` is the v3 hair scene on the new copy.
+- **Using it.** `hair_opus5.5_v3/alice2_real_hair_eyes.ftsl` is the v3 hair scene on the symmetric
+  doll with these eyes (`base_basic_pbr_flat_sparkle_sym_eyes.glb`).
 
 ### Implicit surfaces (`isosurface`)
 

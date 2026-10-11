@@ -73,7 +73,26 @@ EARS = {-1: (-0.013, 1.598, 1.683),   # her right ear: back edge z, lobe y, top 
 EAR_CUT = (0.004, 0.07, 0.003)  # the EARS are bare in the photos, the sculpt covers them: on each ear's side,
                                # nothing may grow or pass forward of the ear's back edge (less 4 mm), from
                                # 7 cm under its lobe (the jaw stays bare to the collar) to 3 mm over its top
-CACHE_TAG = "ears %s cut %.3f %.3f %.3f tips %.3f" % (sorted(EARS.items()), *EAR_CUT, TIP_TOL)  # else rebuilt
+def cache_tag():
+    """What the cached volume and flow depend on (else they are rebuilt)."""
+    return "ears %s cut %.3f %.3f %.3f tips %.3f" % (sorted(EARS.items()), *EAR_CUT, TIP_TOL)
+
+
+def mirror_ears(g):
+    """On a symmetric head (tools/alice2_symmetrize.py's), her left ear is her right one's mirror
+    image: EARS[1] from EARS[-1], reflected through the face's mirror plane. The right ear's back
+    edge, lobe and top are taken at the ear's own distance from the plane (its vertices there)."""
+    import alice2_eyes as E
+    P, N, UV, T = g.mesh(g.mesh_by_material("root.4"))
+    V, _, _ = hg.weld(P, T)
+    nm, dm = E.mirror_plane(V)
+    zb, ylo, yhi = EARS[-1]
+    ear = (V[:, 1] > ylo) & (V[:, 1] < yhi) & (V[:, 2] > zb) & (V[:, 2] < zb + 0.04) & ((V @ nm) - dm < -0.07)
+    x = float(np.median(V[ear, 0]))
+    q = np.array([[x, 0.5 * (ylo + yhi), zb], [x, ylo, zb], [x, yhi, zb]])
+    r = E.reflect_p(q, nm, dm)
+    EARS[1] = (float(r[0, 2]), float(r[1, 1]), float(r[2, 1]))
+    log("ears: her left one mirrored from her right (back edge z %.3f, lobe y %.3f, top y %.3f)" % EARS[1])
 PREFIX = "a3g_"
 T0 = time.time()
 
@@ -633,6 +652,8 @@ def main():
     ap.add_argument("--clump-size", type=float, default=0.008)
     ap.add_argument("--cache", default=None, help="keep the volume and the flow here between runs")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--mirror-ears", action="store_true",
+                    help="the head is symmetric (tools/alice2_symmetrize.py): her left ear is her right one mirrored")
     a = ap.parse_args()
     glb_dir = os.path.dirname(os.path.abspath(a.glb))
     out = os.path.abspath(a.out) if a.out else os.path.join(os.path.dirname(glb_dir), "hair_opus5.5_v3")
@@ -642,13 +663,15 @@ def main():
     except ValueError:
         glb_rel = os.path.abspath(a.glb).replace("\\", "/")
     g = hg.Glb(a.glb)
+    if a.mirror_ears:
+        mirror_ears(g)
     sc = a2.Sculpt(a.glb)
     gr = a2.Groom(sc)            # (v2's head analysis: the headband's seat)
     zones = ear_zones()
     cut_scalp(sc, zones)
     cfile = os.path.join(a.cache, "alice2_hair3_cache.npz") if a.cache else None
     z = np.load(cfile) if cfile and os.path.exists(cfile) else None
-    if z is not None and "tag" in z.files and str(z["tag"]) == CACHE_TAG:
+    if z is not None and "tag" in z.files and str(z["tag"]) == cache_tag():
         vol = dict(lo=z["lo"], H=z["H"], d_body=z["d_body"], G=z["G"]); P = z["P"]
         log("volume and flow from the cache " + cfile)
     else:
@@ -656,7 +679,7 @@ def main():
         P = solve_flow(vol, sc)
         if cfile:
             os.makedirs(a.cache, exist_ok=True)
-            np.savez_compressed(cfile, P=P, tag=np.array(CACHE_TAG), **vol)
+            np.savez_compressed(cfile, P=P, tag=np.array(cache_tag()), **vol)
     guides, dH = build_guides(vol, P, sc, a.spacing, a.seed)
     coverage(guides, vol, dH)
     areas = [a2.write_scalp(sc, os.path.join(out, "alice2_scalp_%s.obj" % a2.REGIONS[r]), r) for r in range(3)]
