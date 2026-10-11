@@ -152,6 +152,7 @@ struct DPTri {
     int    reflectPat;      // scalar `pattern` scaling the albedo, or -1
     int    emitPat;         // scalar `pattern` masking the emission, or -1
     int    mix;             // index into the DMix table for a per-hit mix, else -1
+    float  tanSign;         // the normal map's frame handedness (host: PTri::tanSign)
     // RASTER-PBR (host twin: raster.h PShade). `rough < 0` = no specular lobe, which shades
     // byte-for-byte as before, so every diffuse scene is untouched. `f0` is normal-incidence
     // reflectance -- for a metal preset that IS its measured reflectance, which is why a gold
@@ -872,20 +873,16 @@ __global__ void kRasterLarge(const DGeo* geos, const int* flags, const int* list
 // against the shading normal.
 // Degenerate UVs (a zero-area triangle in texture space) fall back to any perpendicular,
 // which is what a normal map with no usable frame deserves — a stable, if arbitrary, basis
-// rather than a NaN. `sign` gets the frame's handedness (raster::triTangentSign, geometry.h's
-// bitangentSign): the bitangent is cross(N, T) * sign, -1 where the UVs are mirrored.
+// rather than a NaN. (The frame's handedness is the triangle's tanSign.)
 __device__ inline float3 dTriTangent(float3 p0, float3 p1, float3 p2,
-                                     float2 t0, float2 t1, float2 t2, float3 N, float& sign) {
+                                     float2 t0, float2 t1, float2 t2, float3 N) {
     float3 e1 = p1 - p0, e2 = p2 - p0;
     float d1x = t1.x - t0.x, d1y = t1.y - t0.y;
     float d2x = t2.x - t0.x, d2y = t2.y - t0.y;
     float det = d1x * d2y - d2x * d1y;
     float3 T;
-    sign = 1.0f;
     if (fabsf(det) > 1e-18f) {
         T = (e1 * d2y - e2 * d1y) * (1.0f / det);
-        float3 B = (e2 * d1x - e1 * d2x) * (1.0f / det);
-        if (dot3(cross3(cross3(e1, e2), T), B) < 0.0f) sign = -1.0f;
     } else {
         float3 ax = (fabsf(N.x) < 0.9f) ? mk(1, 0, 0) : mk(0, 1, 0);
         T = cross3(ax, N);
@@ -1221,10 +1218,9 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     // The tangent comes from the SOURCE triangle's UV parameterisation, so a clipped slot
     // (whose stored verts are lerped) still gets the same frame as its unclipped siblings.
     if (nrmTex >= 0 && nrmTex < nTex) {
-        float tsign;
-        float3 T = dTriTangent(wp0, wp1, wp2, uv0, uv1, uv2, N3, tsign);
+        float3 T = dTriTangent(wp0, wp1, wp2, uv0, uv1, uv2, N3);
         if (dot3(T, T) > 1e-18f) {
-            float3 B3 = cross3(N3, T) * tsign;          // mirrored UVs: -1
+            float3 B3 = cross3(N3, T) * vsrc.tanSign;   // mirrored UVs: -1 (the source triangle's)
             float3 tn = dSampleNormalTS(texMeta, texels, nrmTex, uu, vv);
             float3 pert = T * (tn.x * nrmS) + B3 * (tn.y * nrmS) + N3 * tn.z;
             float pl = sqrtf(dot3(pert, pert));
@@ -1778,6 +1774,7 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
         d.vc1 = make_float3((float)t.vc1.x, (float)t.vc1.y, (float)t.vc1.z);
         d.vc2 = make_float3((float)t.vc2.x, (float)t.vc2.y, (float)t.vc2.z);
         d.normalTex = t.normalTex;
+        d.tanSign = t.tanSign;
         d.normalStrength = (float)t.normalStrength;
         d.reflectPat = t.reflectPat;
         d.rough = (float)t.rough;                // RASTER-PBR (host twin: raster.h PShade)

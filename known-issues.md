@@ -71,7 +71,7 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
-## DONE (2026-10-11, 0.374.2): RASTER-MIRRORED-UV — the raster preview inverted normal maps on mirrored UVs
+## DONE (2026-10-11, 0.374.3): RASTER-MIRRORED-UV — the raster preview inverted normal maps on mirrored UVs
 
 **Seen** on the symmetric Alice2 head (`tools/alice2_symmetrize.py`, whose left half reuses its right
 half's texture coordinates, mirrored): `ftrace model.glb` showed a dark line down the middle of
@@ -82,10 +82,25 @@ frame as `B = cross(N, T)`, ignoring the UV frame's handedness that `geometry.h`
 `bitangentSign` for the tracers. On a mirrored-UV triangle the green channel decoded inverted,
 so the mirrored half shaded as if lit from the other side.
 
-**Fix:** the handedness is baked with the tangent (`PTri::tanSign` / `dTriTangent`'s `sign`) and
-applied to B. Checked: the Hyper3D model as downloaded, which has no mirrored UVs, previews
-pixel-identical before and after; the symmetric head's seam is gone. Any mirrored-UV asset
-(common in game models) previewed wrongly before this.
+**Fix:** the tracers' own handedness, applied to B: `PTri::tanSign` copies a mesh triangle's
+`Tri::bitangentSign`; the preview's own tessellations (spheres, curves, isosurfaces) keep +1, as
+the tracers do; the GPU reads it from the source triangle. Any mirrored-UV asset (common in game
+models) previewed wrongly before this.
+
+**0.374.2's first fix derived the sign from each triangle's winding instead, and was wrong for
+spheres** (found by the code review): the preview tessellates a sphere wound inward with outward
+vertex normals, so every normal-mapped sphere previewed inverted. 0.374.3 copies the tracers' sign.
+
+**Regression check:** `tools/check_normalmap_frame.py` renders mirrored-UV quads (CPU and GPU
+preview: both must shade alike) and a normal-mapped sphere (the preview must darken or brighten it
+the way the path tracer does). It fails on 0.374.1 (the quads: 1.22 against 0.19 of a plain
+reference) and on 0.374.2 (the sphere: 1.23 in the preview, 0.25 in the tracer), and passes on
+0.374.3. Also checked: the Hyper3D model as downloaded (no mirrored UVs) previews pixel-identical.
+
+**Fixed with it:** the preview sphere's texture seam. Its u = 0.5 + atan2(z,x)/2pi wraps at the
+column crossing -x, but the wrap was patched on the last column. One column showed the texture
+backwards and another squeezed a whole turn of it, on the -z side near the silhouettes. The wrap
+is now patched wherever a quad's u span wraps.
 
 ## OPEN (2026-10-11): ALICE2-CHEEK-DOT — a pinprick dark dot on the Alice2 face, in front of each ear
 

@@ -972,7 +972,7 @@ def main():
     ap.add_argument("--out", default=None, help="default: <glb>_eyes.glb beside it")
     ap.add_argument("--scale", type=float, default=1.0,
                     help="enlarge the eye about its middle; on the symmetric head (alice2_symmetrize.py) 1.3 "
-                         "makes it the real doll's size in the three-quarter photo (scraps/face/eye_size.py)")
+                         "makes it the real doll's size in the three-quarter photo (tools/alice2_photo_check.py)")
     ap.add_argument("--check", action="store_true",
                     help="only move the eyes into the new texture, unchanged (it must render as the original)")
     ap.add_argument("--debug", default=None, help="write the textures, the regions and the face (OBJ) here")
@@ -1021,8 +1021,13 @@ def main():
     if n > 1:
         opening = lab == 1 + int(np.argmax(ndimage.sum(opening, lab, np.arange(1, n + 1))))
     al = Almond(opening)
+    if not a.scale > 0:
+        raise SystemExit("--scale must be positive (got %g)" % a.scale)
     if a.scale != 1.0:
         al.scale(a.scale)
+    em = al.mask(R)
+    if not em.any() or em[0].any() or em[-1].any() or em[:, 0].any() or em[:, -1].any():
+        raise SystemExit("--scale %g puts the eye outside its %d mm texture square" % (a.scale, int(2e3 * HALF)))
     iris_c = 0.5 * (np.array(an[0]["circle"][:2]) + np.array(an[1]["circle"][:2]))
     w_, h_ = extent_mm(al.mask(R), R)
     log("the eye both get: %.1f x %.1f mm, tilted %.1f degrees" % (w_, h_, np.degrees(np.arctan2(-al.ax[1], al.ax[0]))))

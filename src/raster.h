@@ -115,6 +115,13 @@ struct PTri : PShade {
     // Per-vertex texture coordinates (u in .x, v in .y). Only meaningful when tex >= 0.
     Vec3 uv0{0, 0, 0}, uv1{0, 0, 0}, uv2{0, 0, 0};
     int  mix = -1;           // index into PreviewGeom::mixes for a per-hit mix, else -1
+    // The normal map's frame handedness: the bitangent is cross(N, T) * tanSign, exactly as the
+    // tracers make it (scene.h applyNormalMap with Hit::bitangentSign). A mesh triangle copies
+    // its Tri::bitangentSign -- -1 where its UVs are mirrored (a symmetric model whose halves
+    // share one texture), whose normal map would otherwise decode with its green channel
+    // inverted. Everything the preview tessellates itself (spheres, curves, isosurfaces) keeps
+    // +1, which is what the tracers use for those primitives. (In the hole after `mix`.)
+    float tanSign = 1.0f;
     // Raw (unnormalized, un-orthogonalized) dP/dU tangent for normal mapping. Constant
     // over the triangle, so tessellate() precomputes it once for every triangle that can
     // shade a normal map (its own material's, or its mix child's) instead of the shade
@@ -122,11 +129,6 @@ struct PTri : PShade {
     // UV parameterisation is degenerate/absent — the shade pass then falls back to a
     // stable frame about the shading normal, exactly as the old per-pixel path did.
     Vec3 tanRaw{0, 0, 0};
-    // The UV frame's handedness (+1 / -1): the bitangent is cross(N, T) * tanSign, as
-    // geometry.h's Tri::bitangentSign makes it for the tracers. -1 where the UVs are mirrored
-    // (a symmetric model whose two halves share one texture), whose normal map would
-    // otherwise decode with its green channel inverted -- a seam down the middle.
-    double tanSign = 1.0;
     // Per-vertex COLOUR (linear RGB), or hasVcol=false. The rasterizer is an RGB pipeline,
     // so it consumes the mesh's vertex colours directly — no Jakob-Hanika lift, which is
     // the whole reason Scene::vertColors stores RGB rather than fitted coefficients: the
@@ -167,18 +169,6 @@ inline Vec3 triTangentRaw(const PTri& t) {
     return Vec3{0, 0, 0};
 }
 
-// The handedness of a triangle's UV frame, exactly as geometry.h's Tri::finalize derives
-// bitangentSign: the sign of dot(cross(gn, T), B), with T and B the raw dP/dU and dP/dV.
-// +1 for degenerate UVs (the fallback frame has no handedness to keep).
-inline double triTangentSign(const PTri& t) {
-    Vec3 e1 = t.p1 - t.p0, e2 = t.p2 - t.p0;
-    Vec3 d1 = t.uv1 - t.uv0, d2 = t.uv2 - t.uv0;
-    double det = d1.x * d2.y - d2.x * d1.y;
-    if (!(std::fabs(det) > 1e-18)) return 1.0;
-    Vec3 T = (e1 * d2.y - e2 * d1.y) * (1.0 / det);
-    Vec3 B = (e2 * d1.x - e1 * d2.x) * (1.0 / det);
-    return dot(cross(cross(e1, e2), T), B) < 0.0 ? -1.0 : 1.0;
-}
 
 // A "clear" preview surface for the optional see-through rasterizer: a transmissive
 // dielectric-family material. In see-through mode these aren't drawn as solid ghosts;
@@ -1159,6 +1149,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
         p.n0 = t.n0; p.n1 = t.n1; p.n2 = t.n2;
         applyMat(p, t.matId);
         p.uv0 = t.uv0; p.uv1 = t.uv1; p.uv2 = t.uv2;
+        p.tanSign = (float)t.bitangentSign;            // the tracers' own handedness
         copyVcol(p, t);
         out.push_back(p);
     }
@@ -1186,10 +1177,14 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
                 Vec3 d01 = sp(iu, iv+1), d11 = sp(iu + 1, iv + 1);
                 Vec3 v00 = s.c + d00 * s.r, v10 = s.c + d10 * s.r;
                 Vec3 v01 = s.c + d01 * s.r, v11 = s.c + d11 * s.r;
-                // Seam fix: atan2 wraps at u=1->0 across the last column; add 1 turn to the
-                // higher-index column's u so the interpolated span stays monotonic.
+                // Seam fix: u = 0.5 + atan2(z,x)/2pi wraps from 1 to 0 at phi = pi (the column
+                // that crosses -x, not the last one). Where a quad's u span wraps, add a turn to
+                // its low side so the interpolated span stays monotonic (the texture repeats).
                 Vec3 uv00 = uvOf(d00), uv01 = uvOf(d01), uv10 = uvOf(d10), uv11 = uvOf(d11);
-                if (iu == SU - 1) { uv10.x += 1.0; uv11.x += 1.0; }
+                const double umax = std::max({uv00.x, uv01.x, uv10.x, uv11.x});
+                if (umax - std::min({uv00.x, uv01.x, uv10.x, uv11.x}) > 0.5)
+                    for (Vec3* q : {&uv00, &uv01, &uv10, &uv11})
+                        if (umax - q->x > 0.5) q->x += 1.0;
                 PTri a; a.p0 = v00; a.p1 = v01; a.p2 = v11; a.n0 = d00; a.n1 = d01; a.n2 = d11;
                 applyMat(a, s.matId);
                 a.uv0 = uv00; a.uv1 = uv01; a.uv2 = uv11;
@@ -1473,6 +1468,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             p.n2 = normalize(inst.toWorld.applyNormal(t.n2));
             applyMat(p, matId);
             p.uv0 = t.uv0; p.uv1 = t.uv1; p.uv2 = t.uv2;   // UVs are instance-invariant
+            p.tanSign = (float)t.bitangentSign;            // as the tracers keep it per instance
             copyVcol(p, t);                                // so are vertex colours
             out.push_back(p);
         }
@@ -1487,7 +1483,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
         const bool wantTan = p.normalTex >= 0 ||
             (p.mix >= 0 && p.mix < (int)geom.mixes.size() &&
              geom.mixes[p.mix].b.normalTex >= 0);
-        if (wantTan) { p.tanRaw = triTangentRaw(p); p.tanSign = triTangentSign(p); }
+        if (wantTan) p.tanRaw = triTangentRaw(p);
     }
     // Length scale for the see-through path integral, from the geometry actually built.
     {
@@ -2671,7 +2667,7 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                     double tl = std::sqrt(dot(T, T));
                     if (tl > 1e-12) {
                         T = T * (1.0 / tl);
-                        Vec3 B3 = cross(N3, T) * pt.tanSign;   // mirrored UVs: -1
+                        Vec3 B3 = cross(N3, T) * (double)pt.tanSign;   // mirrored UVs: -1
                         Vec3 tn = nx.sampleNormalTS(g.uv[i].x, g.uv[i].y);
                         double s3 = sh->normalStrength;
                         Vec3 pert = T * (tn.x * s3) + B3 * (tn.y * s3) + N3 * tn.z;

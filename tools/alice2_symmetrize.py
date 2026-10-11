@@ -66,10 +66,11 @@ CHIN = ((0.0, -0.098), (0.070, 0.022))    # the chin: an ellipse in the plane's 
 ZONE_FADE = 1.5                           # ... its weight fades to 0 at this many times its size
 # The mouth: her right half of it, narrowed toward the middle (shape and paint together):
 MOUTH = ((0.0, -0.050), (0.050, 0.016))   # the ellipse round her lips (both halves' corners inside)
-MOUTH_WIDTH = 0.50                        # ... squeezed until the mouth is this much of the pupils'
-                                          # spacing. Projected through cameras fitted to the photos,
-                                          # 0.45 matched the blurry front photo and was 0.81 of the sharp
-                                          # three-quarter one, where the model as made (0.52) matched it
+MOUTH_WIDTH = 0.50                        # ... squeezed until the mouth is this much of the distance
+                                          # between the painted eyes' centres. Projected through cameras
+                                          # fitted to the photos, 0.45 matched the blurry front photo and
+                                          # was 0.81 of the sharp three-quarter one, where the model as
+                                          # made (0.52) matched it
 MOUTH_FADE = 1.6                          # ... the squeeze fading out by this many times its size
 CENTRE_TOP, CENTRE_BOTTOM = 0.035, -0.130  # the midline features re-centred between these heights (m,
                                           # from REF_Y): from between the eyes down past the chin,
@@ -84,7 +85,7 @@ FRONT = (0.02, 0.05)                      # the front of the head: height out of
 REF_Y = 1.62                              # the frame's origin: the point of the plane at this height
 SNAP = 5e-5                               # vertices this close to the plane (m) are put on it
 PLANE_FLAT = 0.004                        # the normal map's normals are laid into the plane within this
-BROWS = (0.060, 0.130, 0.080)             # the painted eyebrows: from/to this high over REF_Y and within
+BROWS = (0.060, 0.130, 0.110)             # the painted eyebrows: from/to this high over REF_Y and within
                                           # this of the plane (m). The model's normal map carves them in
                                           # (tilt ~0.22 against ~0.06 on the skin, leaning inward at their
                                           # edges); the doll's are flat paint, so it is flattened there
@@ -108,11 +109,16 @@ def ellipse_r(X, nm, dm, c0, up, ell):
     return np.hypot(((X @ nm) - dm - ca) / ra, ((X - c0) @ up - cu) / ru)
 
 
+def ellipse_fade(X, nm, dm, c0, up, ell, inner, outer):
+    """1 within `inner` times the ellipse `ell`, fading smoothly to 0 at `outer` times it."""
+    return E.smooth01((outer - ellipse_r(X, nm, dm, c0, up, ell)) / (outer - inner))
+
+
 def left_weight(X, nm, dm, c0, up):
     """How much of her left side (mirrored) to use at X: half in the midline band and the chin,
     fading smoothly to nothing outside them."""
     band = E.smooth01((MID_BAND - np.abs((X @ nm) - dm)) / MID_BAND)
-    chin = E.smooth01((ZONE_FADE - ellipse_r(X, nm, dm, c0, up, CHIN)) / (ZONE_FADE - 1.0))
+    chin = ellipse_fade(X, nm, dm, c0, up, CHIN, 1.0, ZONE_FADE)
     return 0.5 * np.maximum(band, chin)
 
 
@@ -177,25 +183,29 @@ def centre_midline(P, N, T, nm, dm):
 
 def lips_weight(X, nm, dm, c0, up, fwd):
     """1 on the lips (the MOUTH ellipse, on the front of the head), fading out just round them."""
-    return E.smooth01((1.25 - ellipse_r(X, nm, dm, c0, up, MOUTH)) / 0.25) * front_weight(X, c0, fwd)
+    return ellipse_fade(X, nm, dm, c0, up, MOUTH, 1.0, 1.25) * front_weight(X, c0, fwd)
 
 
 def flatten_brows(color, nmap, UVf, Tr, Pf, nm, dm):
-    """The normal map flat (the vertex normals as they are) under the painted eyebrows: texels of the
-    final head's triangles inside BROWS whose paint is dark and warm, grown 2 texels and feathered.
-    Returns the normal atlas (a modified copy)."""
+    """The normal map flat (the vertex normals as they are) under the painted eyebrows: the final
+    head's texels whose own position is inside BROWS and whose paint is dark and warm, grown 2 texels
+    and feathered -- on the head's own texels only (the atlas is shared by every part). Returns the
+    normal atlas (a modified copy)."""
     c0, up, fwd = plane_frame(nm, dm)
     S = color.shape[0]
-    zone = np.zeros((S, S), bool)
-    u, a = (Pf - c0) @ up, np.abs((Pf @ nm) - dm)
+    pos = np.zeros((S, S, 3))
+    face = np.zeros((S, S), bool)
+    for i, ry, rx, l in E.raster(UVf[Tr] * S, S, S):
+        pos[ry, rx] = l @ Pf[Tr[i]]
+        face[ry, rx] = True
+    u, a = (pos - c0) @ up, np.abs((pos @ nm) - dm)
     lo, hi, reach = BROWS
-    sel = ((u[Tr] > lo) & (u[Tr] < hi) & (a[Tr] < reach) & (front_weight(Pf[Tr].reshape(-1, 3), c0, fwd).reshape(-1, 3) > 0.5)).all(1)
-    for _, ry, rx, _ in E.raster(UVf[Tr[sel]] * S, S, S):
-        zone[ry, rx] = True
+    zone = face & (u > lo) & (u < hi) & (a < reach) & (front_weight(pos, c0, fwd) > 0.5)
     lum = color @ np.array([0.2126, 0.7152, 0.0722])
     brow = zone & (lum < 0.45) & (color[..., 0] > color[..., 2] + 0.08)
     brow = ndimage.binary_opening(brow, iterations=1)
-    w = ndimage.gaussian_filter(ndimage.binary_dilation(brow, iterations=2).astype(np.float32), 1.0)[..., None]
+    w = ndimage.gaussian_filter(ndimage.binary_dilation(brow, iterations=2).astype(np.float32), 1.0)
+    w = (w * face)[..., None]
     out = nmap * (1 - w) + np.array([0.5, 0.5, 1.0]) * w
     log("eyebrows: the normal map flattened under them (%d texels)" % int(brow.sum()))
     return out
@@ -209,8 +219,9 @@ def front_weight(X, c0, fwd):
 
 def narrow_mouth(P, N, UV, T, atlas, nm, dm):
     """Her right half's mouth squeezed toward the middle, the squeeze fading out round it, so that
-    the mouth is MOUTH_WIDTH of the pupils' spacing: her right corner (the painted lips' outermost
-    point there) is measured, and so are the pupils (the painted eyes, eye_frames). The lips'
+    the mouth is MOUTH_WIDTH of the distance between the eyes' centres: her right corner (the painted
+    lips' outermost point there) is measured, and so are the eyes (the painted eyes' area-weighted
+    centres, eye_frames). The lips'
     relief is carried with them: each moved vertex keeps its height over a smooth copy of the face
     (Gaussian, 8 mm; made from her right side and its mirror image, so it meets the plane square-on,
     as the averaged face does). The paint moves with the vertices (their texture coordinates are
@@ -218,7 +229,7 @@ def narrow_mouth(P, N, UV, T, atlas, nm, dm):
     c0, up, fwd = plane_frame(nm, dm)
     V, Tw, winv, Nw = E.welded_normals(P, N, T)
     a, u, h = (V @ nm) - dm, (V - c0) @ up, (V - c0) @ fwd
-    # where the right corner and the pupils are
+    # where the right corner and the eyes are
     H, W, _ = atlas.shape
     uvc = UV[T].mean(1)
     col = atlas[np.clip((uvc[:, 1] * H).astype(int), 0, H - 1), np.clip((uvc[:, 0] * W).astype(int), 0, W - 1)]
@@ -226,10 +237,9 @@ def narrow_mouth(P, N, UV, T, atlas, nm, dm):
     lips &= (ellipse_r(V[Tw].mean(1), nm, dm, c0, up, MOUTH) < 1.0) & (front_weight(V[Tw].mean(1), c0, fwd) > 0.5)
     corner = -float(a[Tw[lips & ((a[Tw].mean(1)) < 0)]].min())
     left, _ = E.eye_frames(P, T, UV, atlas, nm, dm)
-    pupils = 2.0 * abs(float(left["c"] @ nm) - dm)
-    k = MOUTH_WIDTH * pupils / 2.0 / corner
-    g = E.smooth01((MOUTH_FADE - ellipse_r(V, nm, dm, c0, up, MOUTH)) / (MOUTH_FADE - 1.0)) * (a < 0) \
-        * front_weight(V, c0, fwd)
+    eyes = 2.0 * abs(float(left["c"] @ nm) - dm)
+    k = MOUTH_WIDTH * eyes / 2.0 / corner
+    g = ellipse_fade(V, nm, dm, c0, up, MOUTH, 1.0, MOUTH_FADE) * (a < 0) * front_weight(V, c0, fwd)
     mv = np.nonzero(g > 0)[0]
     # the face's height over the plane's frame round the mouth, made symmetric, and a smooth copy
     PX = 2.5e-4
@@ -263,9 +273,9 @@ def narrow_mouth(P, N, UV, T, atlas, nm, dm):
     moved = np.isin(winv, mv)
     P2, N2 = P.copy(), N.copy()
     P2[moved] = Vn[winv[moved]]; N2[moved] = Nn[winv[moved]]
-    log("mouth: her right corner %.1f mm out, the pupils %.1f mm apart: squeezed across to %.2f, so the mouth "
+    log("mouth: her right corner %.1f mm out, the eyes' centres %.1f mm apart: squeezed across to %.2f, so the mouth "
         "is %.2f of their spacing (%d vertices moved, up to %.1f mm)"
-        % (1e3 * corner, 1e3 * pupils, k, MOUTH_WIDTH, len(mv), 1e3 * np.linalg.norm(Vn[mv] - V[mv], axis=1).max()))
+        % (1e3 * corner, 1e3 * eyes, k, MOUTH_WIDTH, len(mv), 1e3 * np.linalg.norm(Vn[mv] - V[mv], axis=1).max()))
     return P2, N2
 
 
@@ -318,7 +328,8 @@ def average_shape(P, N, T, nm, dm):
 def rebake_averaged(g, mi, P0, N0, UV0, T0, Pf, Nf, UVf, Tr, atlas, mr, nmap, nm, dm):
     """The paint where the sides are averaged, rebaked on the FINAL head: every texel of its right
     half (`Tr`, which shares its texels with its mirror image) gets the blend of the original right
-    side there and the original left side at the mirror point -- colour, metal/roughness, and the
+    side there and the original left side at the mirror point (except on the lips, which keep her
+    right side's paint: lips_weight) -- colour, metal/roughness, and the
     normal map's world normal, laid into the plane near the plane (PLANE_FLAT) and re-expressed in
     the final triangle's tangent frame and vertex normals, as the renderer will read it.
     Returns the three atlases (modified copies)."""
@@ -404,7 +415,7 @@ def renormal(P, N, T, nm, dm):
     c0, up, fwd = plane_frame(nm, dm)
     V, Tw, winv = hg.weld(P, T)
     Nr = hg.vertex_normals(V, Tw)[winv]
-    mouth = E.smooth01((MOUTH_FADE - ellipse_r(P, nm, dm, c0, up, MOUTH)) / (MOUTH_FADE - 1.0)) * front_weight(P, c0, fwd)
+    mouth = ellipse_fade(P, nm, dm, c0, up, MOUTH, 1.0, MOUTH_FADE) * front_weight(P, c0, fwd)
     k = np.clip(np.maximum(2.0 * left_weight(P, nm, dm, c0, up), mouth), 0.0, 1.0)[:, None]
     N2 = (1 - k) * N + k * Nr
     N2 /= np.maximum(1e-12, np.linalg.norm(N2, axis=1))[:, None]

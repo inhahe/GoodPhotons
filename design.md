@@ -1280,8 +1280,9 @@ Which side, against the photos:
   consistently.
 - **The exception is the mouth.** Mirrored, her right half would make it 0.61 of the distance
   between the eyes' centres, wider than the photos'.
-- **How sizes are checked against the photos** (`scraps/face/eye_size.py`, `mouth_size.py`): a
-  feature's corners on the head are projected through the photo camera fitted to that head and
+- **How sizes are checked against the photos** (`tools/alice2_photo_check.py`): each photo's
+  camera is fitted once to landmarks on the head as made (every version shares its coordinates, so
+  one camera per photo is a fixed ruler); a feature's corners on a head are projected through it and
   compared with the same corners read off the photo. A ratio between the two features in a photo
   (mouth to pupil spacing, say) is not used: the three-quarter photo foreshortens them differently.
 
@@ -8823,12 +8824,18 @@ in 0.136.1 (2.4–3.5× at 1280×960; every optimization below is **byte-identic
   per triangle at tessellation (`PTri::tanRaw`, zero when UVs degenerate ⇒ per-pixel
   fallback basis) leaving only the per-pixel Gram-Schmidt. The GPU twin deliberately keeps
   recomputing the raw tangent per pixel — its whole shade pass is 0.19 ms.
-  - **The frame's handedness** is baked with it (`PTri::tanSign`, `triTangentSign`; the GPU's
-    `dTriTangent` returns it), and the bitangent is `cross(N, T) * sign`, as `geometry.h`'s
-    `bitangentSign` makes it for the tracers. Until 0.374.2 the preview used `cross(N, T)`
-    alone, so wherever a model's UVs are mirrored (a symmetric model whose two halves share one
-    texture) the preview decoded the normal map with its green channel inverted, while the path
-    tracer was right. It showed as a seam down the middle of the symmetric Alice2 face.
+  - **The frame's handedness** is the tracers' own: `PTri::tanSign` copies a mesh triangle's
+    `Tri::bitangentSign` (world and BLAS triangles), and the preview's own tessellations
+    (spheres, curves, isosurfaces) keep +1, which is what the tracers use for those primitives.
+    The bitangent is `cross(N, T) * tanSign` on the CPU, and the GPU reads the source
+    triangle's `DPTri::tanSign`. `tools/check_normalmap_frame.py` checks it against the tracer.
+    - **Until 0.374.2** the preview used `cross(N, T)` alone. Wherever a model's UVs are mirrored
+      (a symmetric model whose two halves share one texture) it decoded the normal map with its
+      green channel inverted, while the path tracer was right. It showed as a seam down the
+      middle of the symmetric Alice2 face.
+    - **0.374.2 derived the sign from each triangle's winding.** That is wrong for the preview's
+      spheres, which are wound inward with outward vertex normals: every normal-mapped sphere
+      inverted. 0.374.3 copies the tracers' sign instead.
 - **What was measured, not guessed** (`scenes/_raster_bench.ftsl` + its `_plain` twin,
   1280×960, 12 threads): features-heavy
   86 → ~36 ms median, all-plain 69 → ~20 ms; remaining with-anchor cost over absolute-EV
