@@ -1255,6 +1255,79 @@ writers and fibre.
 - **Checked in the groom tool** through `FTRACE_GROOM_VIEW_FILE`: bright edges, hue by depth, and
   slices across y (from above, solid parts cut), x and z show the guides inside the outlines.
 
+**Alice2's eyes (2026-10-07..11, `tools/alice2_eyes.py`, tooling only): a new copy of the GLB with
+crisp, matching eyes; the face round them unchanged.** Problems in the source:
+- **Resolution.** All seven parts share one 2048² colour atlas, and the face's share is scattered
+  over a dozen UV islands, so an iris gets 8-30 texels: a blurry dark-navy blob, ringed by a blurry
+  brown band (the doll's thin eye outline, smeared).
+- **Unequal eyes, in shape as well as paint.** Each eye is sculpted: an eyeball sunk in a
+  sharp-edged trench, under a lid ridge and a fine crease, with a little flap past the outer corner.
+  Mirrored onto each other, her left eyeball is much wider and more tilted than her right (painted
+  54×39 against 43×36 mm). Their height maps in mirrored frames differ by up to 10 mm. So no one eye
+  fits both sockets: matching eyes need matching sockets.
+
+The fix:
+- **Symmetry by construction.** The face's mirror plane is fitted (ICP of the face against its own
+  reflection, 4.7° off the model's x axis: her head is rolled and turned a little). Her right eye's
+  frame is her left eye's, reflected, so a point and its mirror image get the same texel in their
+  halves of a new 2048×1024 texture (~12× the atlas's texels).
+- **One eye for both.** The outline is the two painted eyes averaged as shapes: the mean of their
+  signed distance fields, her right one reflected. It is fitted with two lid curves between two
+  corners, no taller than 1/1.42 of its width (the photos' aspect): 47×34 mm. One procedural
+  painting goes into both halves: iris gradient with fibres and a dark rim, pupil, whites, a lash
+  line thickening to an upturned wing, faint lower line, crease. The catch-light is the one
+  difference: it moves across the pupil in the mirrored half, so it sits up and to the viewer's left
+  in both eyes, as in the photos.
+- **One socket region for both.** The features are the face's relief (height minus a 5 mm Gaussian
+  smooth) in both frames: grooves deeper than 0.6 mm, ridges higher than 1 mm. Those near the
+  painted eyes and within 4 mm of one another count. They are morphologically closed (so the lid
+  ridge between the trench and the crease goes too), filled, grown by 7 mm (the flap's skirt) and
+  made convex: one region, 96×78 mm, the same in both frames.
+  - **Tried: an iterated relief** that refits the smooth surface without the features. It ran away:
+    with the trench left out, the smooth surface over the eye became an extrapolation, the whole
+    concave eye area read as sunken, and the region grew each pass.
+  - **Tried: the single-pass relief at an 8 mm smooth.** A deep trench drags the smooth surface
+    down, so the cheek below it read as a raised feature (a halo), and the region spread onto the
+    cheek.
+- **The refill.** On each side, every welded triangle wholly inside the region (and anything its
+  boundary encloses) is cut out. The hole is triangulated by a constrained Delaunay: its own boundary
+  edges plus a 1.2 mm hexagonal grid inside. Delaunay, then any boundary edge it left out (where the
+  boundary is concave) is recovered by edge flips (Sloan 1993), then the outside triangles are
+  dropped. The tool checks that the boundary is exactly the hole's and that nothing folds.
+  - **Heights.** A thin-plate spline through the face within 12 mm round the hole, using only
+    vertices more than 8 mm clear of the features (a feature's skirt reaches past its outline), plus
+    a fixed 2 mm dome under the painted opening (zero slope at the lids). The same on both sides,
+    from each side's own surroundings: the refilled sockets differ only by the face's own asymmetry
+    round them, 1.7 mm (90th percentile) once its overall tilt is removed, against 3.7 mm (max 10 mm)
+    for the sculpted ones.
+  - **Tried: v1's rings,** the loop inset step by step, zipped and Tutte-embedded. It left a folded
+    sliver where the rings were resampled.
+  - **Tried: an 8 mm smooth fitted with the boundary vertices only.** The spline passed through the
+    flap's skirt and the lid ridge between features, leaving a dimple and a bump.
+- **The model's look carried across.** The triangles round the region (grown 10 mm) get planar UVs
+  and form a second primitive of the face mesh, material `root.4.eyes`. Colour and metal/roughness
+  are baked through the old UVs. The normal map is converted texel by texel into the new UVs'
+  tangent frames, built as `geometry.h` builds them: tangent from the UV gradient (Lengyel),
+  `B = cross(N, T) * sign`, on UVs taken as `(u, 1 - v)` as `gltf.h` loads them.
+  - **The check.** A copy built this way and nothing else (`--check`) renders like the original:
+    mean difference 0.38/255, the rest thin resampling lines on the old eye's edges.
+  - **Without the v flip** the eye regions shaded visibly wrong: the bitangent's sign differs.
+- **Inside the region:**
+  - The colour is the surrounding skin (the recoloured model's skin is one flat colour).
+  - The normal map is flat. It also fades flat outside the region, within 10 mm, wherever the old
+    map tilts more than 0.15. That catches the old lid line, which ran along the region's edge on
+    kept triangles and would have rendered as a leftover line.
+  - Metal/roughness is the skin's, and the old eye's (glossier) under the new opening.
+
+**Tried and dropped:**
+- **v1 (the first delivery).** The same procedural eye, but each eye's frame, outline and refill
+  were fitted independently. Her left eye came out ~30% wider (55 against 43 mm), and the refills differed per side.
+- **v2: her left eye from the three-quarter photo**, affine-warped onto the unchanged sockets and
+  mirrored. Layered on the photo's own lid shading and the sculpt's ridges, it read as several
+  membranes over the eye.
+- **Keeping the sockets.** Any one eye painted on them mismatches one of them: the two sculpted eyes
+  differ by ~11 mm in width.
+
 **The groom tool (0.329.0, Phase 1).** `runGroomGui` in `viewer_gui.cpp` reuses the loom
 viewer's shell -- its D3D11 device, `MeshGpu` pipeline (shaders, solid/wire rasterizer states,
 depth states, MSAA target) and orbit camera -- and adds a line pass: curves and strands go through

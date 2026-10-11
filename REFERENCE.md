@@ -3409,6 +3409,23 @@ What it adds to the list above:
   the whole lock, and render as a broom. v3 trims a random 0.8–3 cm off each such guide's end, so
   the lock tapers out.
 
+**Crisp, matching eyes: `tools/alice2_eyes.py`.** It writes a new copy of the Alice2 GLB,
+`<glb>_eyes.glb` beside the original. The model's eyes were 8–30 texels across in its shared atlas,
+blurry, ringed by a brown smear, and sculpted unequal: her left eyeball much wider and more tilted
+than her right, each in a trenched socket with a ridge and a corner flap.
+- **What it does.** One eye, the model's two outlines averaged, is painted crisp after the photos
+  (blue iris, pupil, catch-light, whites, lash line with a wing, crease) into a fine texture of its
+  own. The same painting goes on both sides, mirrored through the face's fitted mirror plane, with
+  the catch-light kept on the same side. Both sculpted sockets are reshaped over one region, the
+  same on both sides: a smooth surface through the face round them, with a gentle 2 mm dome. Outside
+  that region the face is unchanged, vertex for vertex.
+- **The model's look is carried across.** The colour, roughness and normal map round the eyes are
+  moved into the new texture, so the face round them shades as before.
+- **Running it.** `D:/python314/python.exe -u tools/alice2_eyes.py [--glb <in.glb>] [--out <out.glb>]
+  [--check] [--debug <dir>]` takes about a minute. `--check` makes a copy with only the texture move,
+  which renders exactly like the original. design.md has the method.
+- **Using it.** `hair_opus5.5_v3/alice2_real_hair_eyes.ftsl` is the v3 hair scene on the new copy.
+
 ### Implicit surfaces (`isosurface`)
 
 Besides the explicit primitives above, geometry can be defined *implicitly* as the
