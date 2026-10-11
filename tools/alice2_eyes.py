@@ -1,7 +1,6 @@
 """Alice2's eyes, repainted crisp and made symmetric, in a NEW COPY of the doll's GLB.
 
-    D:/python314/python.exe -u tools/alice2_eyes.py [--glb <in.glb>] [--out <out.glb>] [--res 1024]
-                                                    [--check] [--debug <dir>]
+    D:/python314/python.exe -u tools/alice2_eyes.py [--glb <in.glb>] [--out <out.glb>] [--check] [--debug <dir>]
 
 WHY. All seven parts of the Hyper3D model share one 2048 x 2048 colour atlas, and the face's share of
 it is scattered over a dozen UV islands: an iris gets 8-30 texels across, so it renders as a blurry
@@ -57,6 +56,8 @@ DEFAULT_GLB = "D:/youtube/philosophy/3d objects/alice2/alice2_hyper3d/model/base
 FACE = "root.4"
 XMID = 0.016                    # roughly the face's mid-plane (the fitted mirror plane replaces it)
 HALF = 0.060                    # half the side of the square each eye's texture covers (m)
+RES = 1024                      # texels per eye, each way: the 2 x 1 texture is at the glTF loader's
+                                # 2048 cap (gltf.h), and the painting's line widths are tuned to it
 EYES0 = (np.array([0.0794, 1.6481, 0.1093]), np.array([-0.0406, 1.6468, 0.1220]))   # her left, her right
 PATCH0 = (0.052, 0.040)         # the first patch round an eye, to find its painted eye in (half-axes, m)
 SEARCH = ((0.005, 0.0), (0.050, 0.038))   # where a socket's features may be: ellipse centre, half-axes (m)
@@ -69,7 +70,8 @@ ZONE_GROW = 0.007               # the refilled region: the two sockets' features
                                 # (the corner flap's skirt reaches ~6 mm past its outline)
 KEEP_OUT = 0.008                # the refill follows the face's own heights only this far (m) from the features
 PATCH_GROW = 0.010              # the retextured region: that, grown by this (m)
-CLEAN_REACH = 0.010             # the old eye paint's traces are cleaned this far (m) round the region
+CLEAN_REACH = 0.006             # the old eye paint's traces are cleaned this far (m) round the region --
+                                # with its spread (3 texels + 2 mm), well inside PATCH_GROW: no seam
 NMAP_TILT = 0.15                # ... and so is the old normal map's detail where it tilts more than this (sin)
 DOME = 0.002                    # the eyeball's gentle dome under the painted opening (m, at the model's 1.9 m
                                 # scale; the sculpted eyeballs stood ~5 mm over the refilled surface)
@@ -110,15 +112,24 @@ def reflect_v(X, nm):
     return X - 2.0 * (X @ nm)[..., None] * nm
 
 
-def painted_eye(P, T, UV, atlas):
-    """Per face triangle: is its atlas colour (floats, 0-1) the painted eye's (iris dark/blue, or white)?"""
+def is_iris(col):
+    """The model's painted iris (colours as floats 0-1, last axis RGB): dark (its top is near-black under
+    the lid) or blue -- but not the warm brown band over the lid, which is as dark."""
+    luma = col @ np.array([0.2126, 0.7152, 0.0722])
+    return ((luma < 0.40) & (col[..., 0] - col[..., 2] < 0.06)) | ((col[..., 2] > col[..., 0] + 0.03) & (luma < 0.62))
+
+
+def is_white(col):
+    """The model's painted eye white: pale and greyish."""
+    return (col.min(-1) > 0.66) & (col.max(-1) - col.min(-1) < 0.24)
+
+
+def painted_eye(T, UV, atlas):
+    """Per face triangle: is its atlas colour the painted eye's (iris or white)?"""
     H, W, _ = atlas.shape
     uvc = UV[T].mean(1)
     col = atlas[np.clip((uvc[:, 1] * H).astype(int), 0, H - 1), np.clip((uvc[:, 0] * W).astype(int), 0, W - 1)]
-    luma = col @ np.array([0.2126, 0.7152, 0.0722])
-    iris = ((luma < 0.40) & (col[:, 0] - col[:, 2] < 0.06)) | ((col[:, 2] > col[:, 0] + 0.03) & (luma < 0.62))
-    white = (col.min(1) > 0.66) & (col.max(1) - col.min(1) < 0.24)
-    return iris | white
+    return is_iris(col) | is_white(col)
 
 
 def eye_frames(P, T, UV, atlas, nm, dm):
@@ -128,7 +139,7 @@ def eye_frames(P, T, UV, atlas, nm, dm):
     fn = np.cross(P[T[:, 1]] - P[T[:, 0]], P[T[:, 2]] - P[T[:, 0]])
     area = 0.5 * np.linalg.norm(fn, axis=1)
     fn /= np.maximum(1e-12, 2 * area)[:, None]
-    eye = painted_eye(P, T, UV, atlas)
+    eye = painted_eye(T, UV, atlas)
     side = cen @ nm - dm
     cs, ns = [], []
     for s, c0 in ((1, EYES0[0]), (-1, EYES0[1])):
@@ -253,15 +264,17 @@ def bake(Tri_new, Tp, P, N, UV, uvn, atlas, mr, nmap, W, H):
 
 
 def patch_tris(P, T, f, k, R, region, taken):
-    """The face triangles of eye k's patch: facing out, near its plane, their centroids in `region`
-    (a texel mask). Returns (mask over T, the eye's planar UVs per vertex)."""
+    """The face triangles of eye k's patch: facing out, near its plane, wholly inside the eye's
+    texture square (so no UV strays into the other eye's half), their centroids in `region` (a texel
+    mask). Returns (mask over T, the eye's planar UVs per vertex)."""
+    av, bv, _ = frame_coords(P, f)
+    square = ((np.abs(av) < HALF) & (np.abs(bv) < HALF))[T].all(1)
     a, b, h = frame_coords(P[T].mean(1), f)
     fn = np.cross(P[T[:, 1]] - P[T[:, 0]], P[T[:, 2]] - P[T[:, 0]])
     fn /= np.maximum(1e-12, np.linalg.norm(fn, axis=1))[:, None]
     tx = np.clip(((a / (2 * HALF) + 0.5) * R).astype(int), 0, R - 1)
     ty = np.clip(((0.5 - b / (2 * HALF)) * R).astype(int), 0, R - 1)
-    sel = (np.abs(a) < HALF) & (np.abs(b) < HALF) & (np.abs(h) < 0.03) & (fn @ f["n"] > 0.25) \
-        & region[ty, tx] & ~taken
+    sel = square & (np.abs(h) < 0.03) & (fn @ f["n"] > 0.25) & region[ty, tx] & ~taken
     return sel, plane_uv(P, f, k)
 
 
@@ -271,14 +284,11 @@ def texel_tris(uvn, Tp, k, R):
 
 # ============================================================================ reading a bake
 def analyse(img, cov):
-    """Find, in one eye's bake (float RGB, its own front view), the skin colour, the eye OPENING
-    (iris + white, holes filled, smoothed) and the IRIS (its visible part, and a circle fitted to its
-    edge where that edge is not the lid's)."""
+    """Find, in one eye's bake (float RGB, its own front view), the eye OPENING (iris + white, holes
+    filled, smoothed) and a circle fitted to the iris's edge where that edge is not the lid's."""
     S = img.shape[0]
     yy, xx = np.mgrid[0:S, 0:S]
     c = np.array([S / 2.0, S / 2.0])
-    r_, g_, b_ = img[..., 0], img[..., 1], img[..., 2]
-    luma = 0.2126 * r_ + 0.7152 * g_ + 0.0722 * b_
     far = cov & (np.hypot(xx - c[0], yy - c[1]) > 0.33 * S)
     skin = np.median(img[far], axis=0)
     dskin = np.linalg.norm(img - skin, axis=2)
@@ -291,13 +301,11 @@ def analyse(img, cov):
         sizes = ndimage.sum(np.ones_like(lab), lab, index=np.arange(1, n + 1))
         return lab == 1 + int(np.argmax(sizes))
 
-    # the IRIS: dark (its top is near-black under the lid) or blue, with the highlights it encloses --
-    # but not the warm brown band over the lid, which is as dark
-    dark = (((luma < 0.40) & (r_ - b_ < 0.06)) | ((b_ > r_ + 0.03) & (luma < 0.62))) & core
-    irism = biggest(ndimage.binary_opening(dark, iterations=2))
+    # the IRIS, with the highlights it encloses
+    irism = biggest(ndimage.binary_opening(is_iris(img) & core, iterations=2))
     irism = ndimage.binary_fill_holes(ndimage.binary_closing(irism, iterations=4))
-    # the WHITE: pale and greyish, unlike skin, touching the iris
-    white = (img.min(2) > 0.66) & (img.max(2) - img.min(2) < 0.24) & (dskin > 0.10) & core
+    # the WHITE: unlike skin, touching the iris
+    white = is_white(img) & (dskin > 0.10) & core
     white &= ndimage.binary_dilation(irism, iterations=40)
     opening = ndimage.binary_fill_holes(ndimage.binary_closing(irism | white, iterations=8))
     opening = ndimage.gaussian_filter(opening.astype(np.float32), 5) > 0.5
@@ -311,7 +319,7 @@ def analyse(img, cov):
     r = 0.5 * (xr.max() - xr.min())
     cx = 0.5 * (xr.max() + xr.min())
     cy = ys.max() - r
-    return dict(skin=skin, opening=opening, iris=irism, circle=(float(cx), float(cy), float(r)))
+    return dict(opening=opening, circle=(float(cx), float(cy), float(r)))
 
 
 def sdf(mask):
@@ -515,9 +523,17 @@ def paint_eye(base, al, iris_c, catch_left, seed=1):
     stroke(crease, pts, 2.6 * smooth01((f - 0.12) / 0.15) * smooth01((1.0 - f) / 0.12))
     creaseA = (0.5 * crease)[..., None]
     out = out * (1 - creaseA) + np.array(CREASE) * creaseA
-    info = dict(width=Wd, Hmax=Hmax, r=r, centre=al.xy(np.array([sc]), np.array([tc]))[0],
-                inside=ins[..., 0], ink=np.maximum.reduce([lash, lower * 0.62, crease * 0.5]))
+    info = dict(r=r, inside=ins[..., 0])
     return np.clip(out, 0, 1), info
+
+
+def broad_blur(x, sigma, q=8):
+    """A Gaussian blur this wide (texels; x: H x W x C), done at 1/q resolution -- the same field,
+    without a thousand-tap kernel over every texel."""
+    H, W, C = x.shape
+    lo = x.reshape(H // q, q, W // q, q, C).mean((1, 3))
+    lo = ndimage.gaussian_filter(lo, (sigma / q, sigma / q, 0))
+    return ndimage.zoom(lo, (q, q, 1), order=1, grid_mode=True, mode="nearest")
 
 
 def skin_fill(img, cov, zone, R):
@@ -532,8 +548,8 @@ def skin_fill(img, cov, zone, R):
     skin = np.median(img[ring], axis=0)
     good = cov & (dist > 0.0015 * px_per_m) & (np.linalg.norm(img - skin, axis=2) < 0.035)
     sig = 0.015 * px_per_m                                     # only the skin's broad shading, no streaks
-    num = ndimage.gaussian_filter(img * good[..., None], (sig, sig, 0))
-    den = ndimage.gaussian_filter(good.astype(np.float32), sig)[..., None]
+    num = broad_blur(img * good[..., None], sig)
+    den = broad_blur(good[..., None].astype(np.float32), sig)
     wl = np.clip(den / 0.05, 0, 1)
     fill = wl * num / np.maximum(den, 1e-6) + (1 - wl) * skin
     w = np.clip(1 - dist / (0.002 * px_per_m), 0, 1)
@@ -623,14 +639,6 @@ def socket_zone(hzs, opening, R):
     return zone, core
 
 
-def vertex_normals(P, T):
-    fn = np.cross(P[T[:, 1]] - P[T[:, 0]], P[T[:, 2]] - P[T[:, 0]])      # area-weighted
-    Nv = np.zeros_like(P)
-    for k in range(3):
-        np.add.at(Nv, T[:, k], fn)
-    return Nv / np.maximum(1e-12, np.linalg.norm(Nv, axis=1))[:, None]
-
-
 def boundary_edges(Tr):
     e = np.concatenate([Tr[:, [0, 1]], Tr[:, [1, 2]], Tr[:, [2, 0]]])
     key = np.sort(e, 1)
@@ -661,6 +669,8 @@ def boundary_loop(Tr):
             if w == s0:
                 break
             loop.append(w); seen.add(w); cur = w
+        if s0 not in nxt.get(cur, []):
+            raise RuntimeError("a boundary chain of the cut does not close (a bowtie vertex or mixed winding)")
         loops.append(loop)
     return np.array(max(loops, key=len)), len(bset)
 
@@ -771,10 +781,10 @@ def fill_polygon(P2, step, seed=7):
 
 def socket_refill(V, Tw, f, zone, core, R, al, step=0.0012, ring=0.012):
     """Cut the face out of `zone` (every welded triangle wholly inside it, and anything its outer
-    boundary encloses) and fill the hole with fresh, fold-free rings joined to its exact boundary.
-    Heights: a thin-plate spline through the face round the hole (so the fill meets it in place and
-    slope) and through the face's own vertices inside the hole that are clear of the sculpted
-    features (`core`, by KEEP_OUT), so only those change shape. Returns the cut, the loop, the new
+    boundary encloses) and fill the hole (`fill_polygon`: its exact boundary, a fine grid inside).
+    Heights: a thin-plate spline through the hole's boundary, the face within `ring` round it and
+    the face's own vertices inside it -- of those last two, only the ones clear of the sculpted
+    features (`core`) by KEEP_OUT, whose skirts reach past their outlines. Returns the cut, the loop, the new
     points (frame a, b), their triangles (indexing [loop vertex ids as -1-id | new points]), their
     spline heights, the dome's shape over them, and how far the old eyeball stood above the spline
     under the painted opening."""
@@ -790,7 +800,8 @@ def socket_refill(V, Tw, f, zone, core, R, al, step=0.0012, ring=0.012):
     rem |= poly.contains_points(np.c_[a, b][Tw].mean(1)) & inside_img[Tw].all(1)
     loop, nbe = boundary_loop(Tw[rem])
     if nbe != len(loop):
-        log("  WARNING: the cut has %d boundary edges, its outer loop %d -- a hole is left" % (nbe, len(loop)))
+        raise RuntimeError("the cut has %d boundary edges but its outer loop only %d: refilling that loop "
+                           "would leave a hole" % (nbe, len(loop)))
     if np.sum(a[loop] * np.roll(b[loop], -1) - np.roll(a[loop], -1) * b[loop]) < 0:
         loop = loop[::-1]                                    # counter-clockwise, seen from in front
     la, lb = a[loop], b[loop]
@@ -894,13 +905,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--glb", default=DEFAULT_GLB)
     ap.add_argument("--out", default=None, help="default: <glb>_eyes.glb beside it")
-    ap.add_argument("--res", type=int, default=1024, help="texels per eye, each way")
     ap.add_argument("--check", action="store_true",
                     help="only move the eyes into the new texture, unchanged (it must render as the original)")
     ap.add_argument("--debug", default=None, help="write the textures, the regions and the face (OBJ) here")
     a = ap.parse_args()
     out = a.out or os.path.splitext(a.glb)[0] + "_eyes.glb"
-    R = a.res
+    R = RES
     px_per_m = R / (2 * HALF)
     mm = lambda texels: 1e3 * texels / px_per_m        # noqa: E731
     change = not a.check                             # (--check: the eyes moved across, unchanged)
@@ -929,7 +939,7 @@ def main():
     # 1) each eye as the model has it: a first bake round it, read for its painted opening and iris
     seen = np.zeros(len(T), bool)
     an = []
-    xx, yy, ga, gb = texel_grid(R)
+    _, _, ga, gb = texel_grid(R)
     ell0 = (ga / PATCH0[0]) ** 2 + (gb / PATCH0[1]) ** 2 < 1
     for k, f in enumerate(frames):
         sel, uvn = patch_tris(P, T, f, k, R, ell0, seen)
@@ -967,31 +977,40 @@ def main():
         bulge = DOME
         log("the dome under both eyes: %.1f mm" % (1e3 * bulge))
 
-    # 4) per eye: the patch (the region grown), its bake, the new look, the eye primitive's pieces
+    # 4) per eye: the patch (the region grown) and its bake -- the same patch for --check, so the check
+    #    covers every triangle the real run moves
     patch_region = ndimage.distance_transform_edt(~zone) <= PATCH_GROW * px_per_m
+    if change and (fills[0]["rem"] & fills[1]["rem"]).any():
+        raise RuntimeError("the two eyes' cuts overlap")
+    taken = np.zeros(len(T), bool)
+    baked = []
+    for k, f in enumerate(frames):
+        sel, uvn = patch_tris(P, T, f, k, R, patch_region, taken)
+        rem = fills[k]["rem"] if change else np.zeros(len(T), bool)
+        if (rem & taken).any():        # the refill is stitched to the whole cut's boundary
+            raise RuntimeError("her %s eye's cut reaches into the other eye's patch" % names[k])
+        sel |= rem
+        taken |= sel
+        baked.append((sel, rem, uvn) + bake(texel_tris(uvn, T[sel], k, R), T[sel], P, N, UV, uvn, atlas, mr, nmap, R, R))
+    # metal/roughness: the skin's over the refilled region, the old painted eyes' under the new one --
+    # each the median over both sides, so the two eyes shine alike
+    mr_skin = np.median(np.concatenate([b_[4][b_[6] & ~zone & patch_region] for b_ in baked]), axis=0)
+    mr_eye = np.median(np.concatenate([b_[4][an[k]["opening"]] for k, b_ in enumerate(baked)]), axis=0)
+
+    # 5) per eye: the new look, and the eye primitive's pieces
     col = np.zeros((R, 2 * R, 3), np.float32)
     mrt = np.zeros((R, 2 * R, 3), np.float32)
     nrt = np.zeros((R, 2 * R, 3), np.float32)
-    taken = np.zeros(len(T), bool)
     removed = np.zeros(len(T), bool)
     Pe, Ne, Ue, Ie = [], [], [], []
     nbase = 0
     eye_in = al.mask(R)
     for k, f in enumerate(frames):
-        sel, uvn = patch_tris(P, T, f, k, R, patch_region if change else ell0, taken)
-        rem = fills[k]["rem"] if change else np.zeros(len(T), bool)
-        # the refill is stitched to the whole cut's boundary: none of it may be the other eye's
-        assert not (rem & taken).any(), "the two eyes' regions overlap"
-        sel |= rem
-        c_img, m_img, n_img, cov = bake(texel_tris(uvn, T[sel], k, R), T[sel], P, N, UV, uvn, atlas, mr, nmap, R, R)
+        sel, rem, uvn, c_img, m_img, n_img, cov = baked[k]
         before = c_img.copy()
         if change:
             n_img = flatten_nmap(n_img, zone, R)
             c_img, wfill = skin_fill(c_img, cov, zone, R)
-            # metal/roughness: the skin's over the refilled region, the old painted eye's under the new one
-            ring = cov & ~zone & patch_region
-            mr_skin = np.median(m_img[ring], axis=0)
-            mr_eye = np.median(m_img[an[k]["opening"]], axis=0)
             m_img = m_img * (1 - wfill[..., None]) + mr_skin * wfill[..., None]
             c_img, info = paint_eye(c_img, al, iris_c, catch_left=(k == 0))
             ein = info["inside"][..., None]
@@ -1016,7 +1035,7 @@ def main():
             nf = np.cross(Pf[tl[:, 1]] - Pf[tl[:, 0]], Pf[tl[:, 2]] - Pf[tl[:, 0]])
             if (nf @ f["n"]).sum() < 0:                  # facing out of the face, like the rest
                 tl = tl[:, ::-1]
-            Nf = vertex_normals(Pf, tl)
+            Nf = hg.vertex_normals(Pf, tl)
             Nf[:len(loop)] = Nw[loop]                    # the seam shades like the face round it
             uf = plane_uv(Pf, f, k)
             Pe.append(Pf); Ne.append(Nf); Ue.append(uf); Ie.append(tl + nbase)
@@ -1027,7 +1046,6 @@ def main():
                 flat[ry, rx] = True
             n_img[flat] = (0.5, 0.5, 1.0)
             removed |= rem
-        taken |= sel
         col[:, k * R:(k + 1) * R] = c_img
         mrt[:, k * R:(k + 1) * R] = m_img
         nrt[:, k * R:(k + 1) * R] = n_img
@@ -1055,12 +1073,19 @@ def main():
     keep = T[~taken].astype(np.uint32).ravel()
     prim0 = go.j["meshes"][mi]["primitives"][0]
     prim0["indices"] = go.accessor(keep, "SCALAR", 34963)
-    # ... which become a second primitive: root.4's material with the new maps
+    # ... which become a second primitive: root.4's material with the new maps. Any other map would
+    # sample the atlas at the new UVs, so none is carried over; the new textures clamp at their edges
+    # (each half's border must not filter into the other half).
     m2 = copy.deepcopy(mat)
     m2["name"] = FACE + ".eyes"
-    m2["pbrMetallicRoughness"]["baseColorTexture"] = {"index": go.texture(to8(col))}
-    m2["pbrMetallicRoughness"]["metallicRoughnessTexture"] = {"index": go.texture(to8(mrt))}
-    m2["normalTexture"] = dict(mat["normalTexture"], index=go.texture(to8(nrt)))
+    for slot in ("occlusionTexture", "emissiveTexture", "extensions"):
+        if m2.pop(slot, None) is not None:
+            log("%s's %s left off the eye material (it would read the atlas at the eye UVs)" % (FACE, slot))
+    go.j.setdefault("samplers", []).append({"magFilter": 9729, "minFilter": 9987, "wrapS": 33071, "wrapT": 33071})
+    smp = len(go.j["samplers"]) - 1
+    m2["pbrMetallicRoughness"]["baseColorTexture"] = {"index": go.texture(to8(col), smp)}
+    m2["pbrMetallicRoughness"]["metallicRoughnessTexture"] = {"index": go.texture(to8(mrt), smp)}
+    m2["normalTexture"] = dict(mat["normalTexture"], index=go.texture(to8(nrt), smp))
     m2["normalTexture"].pop("texCoord", None)
     go.j["materials"].append(m2)
     prim1 = {"attributes": {"POSITION": go.accessor(np.concatenate(Pe).astype(np.float32), "VEC3", 34962),

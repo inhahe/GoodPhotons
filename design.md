@@ -1294,8 +1294,9 @@ The fix:
   edges plus a 1.2 mm hexagonal grid inside. Delaunay, then any boundary edge it left out (where the
   boundary is concave) is recovered by edge flips (Sloan 1993), then the outside triangles are
   dropped. The tool checks that the boundary is exactly the hole's and that nothing folds.
-  - **Heights.** A thin-plate spline through the face within 12 mm round the hole, using only
-    vertices more than 8 mm clear of the features (a feature's skirt reaches past its outline), plus
+  - **Heights.** A thin-plate spline through the hole's boundary and the face within 12 mm round
+    it; of the latter, only vertices more than 8 mm clear of the features (a feature's skirt reaches
+    past its outline; the boundary itself, ~7 mm out, always counts, for continuity), plus
     a fixed 2 mm dome under the painted opening (zero slope at the lids). The same on both sides,
     from each side's own surroundings: the refilled sockets differ only by the face's own asymmetry
     round them, 1.7 mm (90th percentile) once its overall tilt is removed, against 3.7 mm (max 10 mm)
@@ -1304,7 +1305,8 @@ The fix:
     sliver where the rings were resampled.
   - **Tried: an 8 mm smooth fitted with the boundary vertices only.** The spline passed through the
     flap's skirt and the lid ridge between features, leaving a dimple and a bump.
-- **The model's look carried across.** The triangles round the region (grown 10 mm) get planar UVs
+- **The model's look carried across.** The triangles round the region (grown 10 mm, each wholly
+  inside its eye's texture square, so no UV strays into the other half) get planar UVs
   and form a second primitive of the face mesh, material `root.4.eyes`. Colour and metal/roughness
   are baked through the old UVs. The normal map is converted texel by texel into the new UVs'
   tangent frames, built as `geometry.h` builds them: tangent from the UV gradient (Lengyel),
@@ -1314,10 +1316,13 @@ The fix:
   - **Without the v flip** the eye regions shaded visibly wrong: the bitangent's sign differs.
 - **Inside the region:**
   - The colour is the surrounding skin (the recoloured model's skin is one flat colour).
-  - The normal map is flat. It also fades flat outside the region, within 10 mm, wherever the old
+  - The normal map is flat. It also fades flat outside the region, within 6 mm, wherever the old
     map tilts more than 0.15. That catches the old lid line, which ran along the region's edge on
     kept triangles and would have rendered as a leftover line.
-  - Metal/roughness is the skin's, and the old eye's (glossier) under the new opening.
+  - Metal/roughness is the skin's, and the old eyes' (glossier) under the new opening: each the
+    median over both sides, so the two eyes shine alike.
+  - The off-skin cleaning and the normal-map fade stop well inside the retextured patch (6 mm plus
+    their spread, against its 10 mm), so nothing changes abruptly at the patch's outline.
 
 **Tried and dropped:**
 - **v1 (the first delivery).** The same procedural eye, but each eye's frame, outline and refill
