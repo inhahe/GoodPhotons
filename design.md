@@ -1278,8 +1278,12 @@ Which side, against the photos:
   22.2 and 24.8 for her left. Projected through its fitted camera, its outline follows the profile
   photo's forehead, nose, lips and chin; her left side's cannot be fitted to the profile
   consistently.
-- **The exception is the mouth.** Mirrored, her right half would make it 0.72 of the pupils'
-  spacing; the photos show 0.42 (front) to 0.50 (three-quarter).
+- **The exception is the mouth.** Mirrored, her right half would make it 0.61 of the distance
+  between the eyes' centres, wider than the photos'.
+- **How sizes are checked against the photos** (`scraps/face/eye_size.py`, `mouth_size.py`): a
+  feature's corners on the head are projected through the photo camera fitted to that head and
+  compared with the same corners read off the photo. A ratio between the two features in a photo
+  (mouth to pupil spacing, say) is not used: the three-quarter photo foreshortens them differently.
 
 The steps, in order:
 1. **Re-centre the midline** (`centre_midline`). In each 2 mm horizontal slice of the front, a
@@ -1300,10 +1304,16 @@ The steps, in order:
    - **The chin:** her right side mirrored gives a cleft chin (two low points 25 mm out), her left
      a pointed one; the average cancels the tilt and gives one round low point.
 3. **Narrow the mouth** (`narrow_mouth`): her right half squeezed across within an ellipse round
-   the lips, fading out by 1.6 times its size, so that the mouth is 0.47 of the pupils' spacing.
-   Both are measured on the head: the painted lips' outermost point on her right (37 mm out once
-   re-centred) and the painted eyes (121 mm apart), so the squeeze is 0.76. The front of the head
-   only.
+   the lips, fading out by 1.6 times its size, so that the mouth is 0.50 of the distance between
+   the eyes' centres. Both are measured on the head: the painted lips' outermost point on her right
+   (37 mm out once re-centred) and the painted eyes (121 mm apart), so the squeeze is 0.81. The
+   front of the head only.
+   - **Why 0.50:** projected into the photos, 0.45 matched the blurry front photo exactly but was
+     0.81 of the mouth in the sharp three-quarter photo, where the model as made (0.52) matched.
+     0.50 sits between, nearer the sharper photo.
+   - **The lips keep her right half's paint** (no blend inside the lips in step 6): closed, as in
+     the photos. Her left half's lips are parted, showing teeth, and the band blended them into
+     the middle of the mouth.
    - **The lips' relief moves with them:** each moved vertex keeps its height over a smooth copy of
      the face (8 mm Gaussian). That copy is made from her right side and its mirror image, so it
      meets the plane square-on as the averaged face does; made from both sides as they were, the
@@ -1341,6 +1351,12 @@ The steps, in order:
      - baking only triangles whose centre is on her right (the straddlers keep their right parts);
      - decoding the right texel against the already-moved normals;
      - encoding before the cut (the clipped triangles' new vertices have different normals).
+   - **The raster preview showed a seam anyway** until 0.374.2: it ignored the UV handedness of the
+     mirrored half (known-issues `RASTER-MIRRORED-UV`), not a fault in the head.
+7. **Flatten the eyebrows' normal map** (`flatten_brows`). The model's normal map carves the painted
+   brows in (tilt ~0.22 under them against ~0.06 on the skin, leaning inward at their edges), and
+   in the preview they look indented. The doll's brows are flat paint: the map is set flat under
+   them (the dark warm texels in the brow zone, grown 2 texels and feathered).
 
 Plane fitting: `alice2_eyes.mirror_plane` (the ICP) can settle on a wrong plane on an exactly
 symmetric head, 7° off, or even diverge. It now refines by minimising the reflected vertices'
@@ -1351,9 +1367,12 @@ follows the skull (3.6° off), while the ICP's plane follows the features (the e
 it).
 
 The rest of the pipeline on the symmetric head:
-- `alice2_eyes.py --glb <sym>` finds the plane exactly, and both eyes come out identical from the
-  start. The shared eye is her right eye's, 45 × 31 mm: 0.37 of the pupils' spacing, against the
-  front photo's 0.34.
+- `alice2_eyes.py --glb <sym> --scale 1.3` finds the plane exactly, and both eyes come out
+  identical from the start.
+  - **Unscaled, the shared eye is her right eye's**, 45 × 31 mm. Projected into the three-quarter
+    photo it is 0.77 × 0.76 of the doll's real eye, while the model's left eye (55 × 40 mm, which
+    the mirroring discarded) is 1.02 × 0.93 of it.
+  - **`--scale 1.3` makes it the real eye's size:** 58 × 41 mm.
 - `alice2_hair3.py --glb <sym> --mirror-ears` grows the v3 hair on it.
 
 Not fixed: a pinprick-sized dark dot in front of each ear, on the cheek, from the source. It is not
@@ -1382,6 +1401,8 @@ The fix:
   line thickening to an upturned wing, faint lower line, crease. The catch-light is the one
   difference: it moves across the pupil in the mirrored half, so it sits up and to the viewer's left
   in both eyes, as in the photos.
+  `--scale k` enlarges it about its middle (1.3 on the symmetric head: see the symmetric face's
+  section, where the size is checked against the photo).
 - **One socket region for both.** The features are the face's relief (height minus a 5 mm Gaussian
   smooth) in both frames: grooves deeper than 0.6 mm, ridges higher than 1 mm. Those near the
   painted eyes and within 4 mm of one another count. They are morphologically closed (so the lid

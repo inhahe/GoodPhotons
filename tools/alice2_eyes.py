@@ -1,6 +1,7 @@
 """Alice2's eyes, repainted crisp and made symmetric, in a NEW COPY of the doll's GLB.
 
-    D:/python314/python.exe -u tools/alice2_eyes.py [--glb <in.glb>] [--out <out.glb>] [--check] [--debug <dir>]
+    D:/python314/python.exe -u tools/alice2_eyes.py [--glb <in.glb>] [--out <out.glb>] [--scale k] [--check]
+                                                    [--debug <dir>]
 
 WHY. All seven parts of the Hyper3D model share one 2048 x 2048 colour atlas, and the face's share of
 it is scattered over a dozen UV islands: an iris gets 8-30 texels across, so it renders as a blurry
@@ -460,6 +461,13 @@ class Almond:
         inner = (s > self.s0) & (s < self.s1)
         d = np.minimum(self.top(s) - t, t - self.bot(s))
         return np.where(inner, smooth01(d / 1.5 + 0.5), 0.0)
+
+    def scale(self, k):
+        """Enlarge the opening by k about its middle (corners, lid heights)."""
+        sm, tm = 0.5 * (self.s0 + self.s1), 0.5 * (self.t0 + self.t1)
+        self.s0, self.s1 = sm + k * (self.s0 - sm), sm + k * (self.s1 - sm)
+        self.t0, self.t1 = tm + k * (self.t0 - tm), tm + k * (self.t1 - tm)
+        self.Ht *= k; self.Hb *= k
 
     def mask(self, R):
         xx, yy, _, _ = texel_grid(R)
@@ -962,6 +970,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--glb", default=DEFAULT_GLB)
     ap.add_argument("--out", default=None, help="default: <glb>_eyes.glb beside it")
+    ap.add_argument("--scale", type=float, default=1.0,
+                    help="enlarge the eye about its middle; on the symmetric head (alice2_symmetrize.py) 1.3 "
+                         "makes it the real doll's size in the three-quarter photo (scraps/face/eye_size.py)")
     ap.add_argument("--check", action="store_true",
                     help="only move the eyes into the new texture, unchanged (it must render as the original)")
     ap.add_argument("--debug", default=None, help="write the textures, the regions and the face (OBJ) here")
@@ -1010,6 +1021,8 @@ def main():
     if n > 1:
         opening = lab == 1 + int(np.argmax(ndimage.sum(opening, lab, np.arange(1, n + 1))))
     al = Almond(opening)
+    if a.scale != 1.0:
+        al.scale(a.scale)
     iris_c = 0.5 * (np.array(an[0]["circle"][:2]) + np.array(an[1]["circle"][:2]))
     w_, h_ = extent_mm(al.mask(R), R)
     log("the eye both get: %.1f x %.1f mm, tilted %.1f degrees" % (w_, h_, np.degrees(np.arctan2(-al.ax[1], al.ax[0]))))

@@ -3416,12 +3416,14 @@ What it adds to the list above:
 than her left, her left temple fuller than her right, the nose, mouth and chin up to 10 mm off to
 her right, the jaw tilted.
 - **What it does.** It re-centres the midline features, averages the two sides along the midline
-  and in the chin, narrows the mouth to the photos' proportions, then cuts the head along its mirror
-  plane and mirrors her right half (shape and paint) into her left half's place. Her right side was
+  and in the chin, narrows the mouth to the photos' proportions (keeping its closed lips), then cuts
+  the head along its mirror plane and mirrors her right half (shape and paint) into her left half's
+  place, and flattens the normal map that carved the painted eyebrows in. Her right side was
   chosen against the photos (cameras fitted to landmarks): it fits the profile and three-quarter
   photos better, and its outline follows the profile's.
 - **Running it.** `D:/python314/python.exe -u tools/alice2_symmetrize.py [--glb <in.glb>] [--out
-  <out.glb>]` takes about half a minute. Then `tools/alice2_eyes.py --glb <glb>_sym.glb` for the eyes,
+  <out.glb>]` takes about half a minute. Then `tools/alice2_eyes.py --glb <glb>_sym.glb --scale 1.3`
+  for the eyes (at the real doll's size; unscaled they would be her smaller right eye's),
   and `tools/alice2_hair3.py --glb <glb>_sym.glb --mirror-ears` for hair that fits the new head.
   design.md has the method.
 
@@ -3438,7 +3440,8 @@ than her right, each in a trenched socket with a ridge and a corner flap.
 - **The model's look is carried across.** The colour, roughness and normal map round the eyes are
   moved into the new texture, so the face round them shades as before.
 - **Running it.** `D:/python314/python.exe -u tools/alice2_eyes.py [--glb <in.glb>] [--out <out.glb>]
-  [--check] [--debug <dir>]` takes about a minute. `--check` makes a copy with only the texture move,
+  [--scale k] [--check] [--debug <dir>]` takes about a minute. `--scale` enlarges the eye about its
+  middle. `--check` makes a copy with only the texture move,
   which renders exactly like the original. design.md has the method.
 - **Using it.** `hair_opus5.5_v3/alice2_real_hair_eyes.ftsl` is the v3 hair scene on the symmetric
   doll with these eyes (`base_basic_pbr_flat_sparkle_sym_eyes.glb`).

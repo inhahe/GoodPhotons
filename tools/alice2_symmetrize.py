@@ -12,8 +12,8 @@ photo's camera was fitted (solvePnP, the phone's own focal length) to landmarks 
 symmetric from either side: her right side fits the profile and three-quarter photos far better
 (landmark RMS 13.9 and 19.5 px, against 22.2 and 24.8 for her left), and its outline follows the
 profile photo's forehead, nose, lips and chin. Except the MOUTH: her right half of it is wide --
-mirrored, the mouth would be 0.72 of the distance between the pupils, where the photos show
-0.42-0.50 -- so it is narrowed.
+mirrored, the mouth would be 0.61 of the distance between the eyes' centres -- so it is narrowed,
+to the width the photos show (MOUTH_WIDTH).
 
 HOW (the plane is the face's fitted mirror plane, alice2_eyes.mirror_plane):
   1. RE-CENTRE THE MIDLINE. The nose, philtrum, lips and chin drift toward her right as they go
@@ -26,7 +26,8 @@ HOW (the plane is the face's fitted mirror plane, alice2_eyes.mirror_plane):
      leaving a crease down the middle. And the jaw is tilted, lower on her right: mirrored, her
      right side gives a cleft chin, her left a pointed one, and their average a round one.
   3. NARROW THE MOUTH. Her right half of it is squeezed toward the middle, the lips' relief carried
-     over a smooth copy of the face, the paint moving with the vertices (narrow_mouth).
+     over a smooth copy of the face, the paint moving with the vertices (narrow_mouth). The lips
+     keep her right half's paint: closed, as in the photos (her left half's shows teeth).
   4. MIRROR. The head is cut along the plane (triangles across it clipped, new vertices on it), her
      left half dropped, and her right half mirrored into its place: positions and normals
      reflected, winding reversed, the SAME texture coordinates, so the paint is mirrored with the
@@ -35,6 +36,7 @@ HOW (the plane is the face's fitted mirror plane, alice2_eyes.mirror_plane):
   6. REBAKE the paint where the sides were averaged, on the final head: colour, metal/roughness,
      and the normal map's world normal -- laid into the plane at the plane, then re-expressed in
      the final tangent frames, as the renderer reads it (rebake_averaged).
+  7. FLATTEN the normal map under the painted eyebrows, which the model carves in (flatten_brows).
 Everything else in the GLB is unchanged. The eyes come after: tools/alice2_eyes.py --glb <out>.
 """
 import argparse
@@ -64,8 +66,10 @@ CHIN = ((0.0, -0.098), (0.070, 0.022))    # the chin: an ellipse in the plane's 
 ZONE_FADE = 1.5                           # ... its weight fades to 0 at this many times its size
 # The mouth: her right half of it, narrowed toward the middle (shape and paint together):
 MOUTH = ((0.0, -0.050), (0.050, 0.016))   # the ellipse round her lips (both halves' corners inside)
-MOUTH_WIDTH = 0.47                        # ... squeezed until the mouth is this much of the pupils'
-                                          # spacing: the photos show 0.42 (front) to 0.50 (3/4)
+MOUTH_WIDTH = 0.50                        # ... squeezed until the mouth is this much of the pupils'
+                                          # spacing. Projected through cameras fitted to the photos,
+                                          # 0.45 matched the blurry front photo and was 0.81 of the sharp
+                                          # three-quarter one, where the model as made (0.52) matched it
 MOUTH_FADE = 1.6                          # ... the squeeze fading out by this many times its size
 CENTRE_TOP, CENTRE_BOTTOM = 0.035, -0.130  # the midline features re-centred between these heights (m,
                                           # from REF_Y): from between the eyes down past the chin,
@@ -80,6 +84,10 @@ FRONT = (0.02, 0.05)                      # the front of the head: height out of
 REF_Y = 1.62                              # the frame's origin: the point of the plane at this height
 SNAP = 5e-5                               # vertices this close to the plane (m) are put on it
 PLANE_FLAT = 0.004                        # the normal map's normals are laid into the plane within this
+BROWS = (0.060, 0.130, 0.080)             # the painted eyebrows: from/to this high over REF_Y and within
+                                          # this of the plane (m). The model's normal map carves them in
+                                          # (tilt ~0.22 against ~0.06 on the skin, leaning inward at their
+                                          # edges); the doll's are flat paint, so it is flattened there
 
 
 def log(m):
@@ -165,6 +173,32 @@ def centre_midline(P, N, T, nm, dm):
     log("midline: features re-centred onto the plane (the nose tip was %+.1f mm off it, the lips %+.1f mm, "
         "largest shift %.1f mm)" % (1e3 * cs[k], 1e3 * cs[j], 1e3 * np.abs(cs).max()))
     return P2, N2
+
+
+def lips_weight(X, nm, dm, c0, up, fwd):
+    """1 on the lips (the MOUTH ellipse, on the front of the head), fading out just round them."""
+    return E.smooth01((1.25 - ellipse_r(X, nm, dm, c0, up, MOUTH)) / 0.25) * front_weight(X, c0, fwd)
+
+
+def flatten_brows(color, nmap, UVf, Tr, Pf, nm, dm):
+    """The normal map flat (the vertex normals as they are) under the painted eyebrows: texels of the
+    final head's triangles inside BROWS whose paint is dark and warm, grown 2 texels and feathered.
+    Returns the normal atlas (a modified copy)."""
+    c0, up, fwd = plane_frame(nm, dm)
+    S = color.shape[0]
+    zone = np.zeros((S, S), bool)
+    u, a = (Pf - c0) @ up, np.abs((Pf @ nm) - dm)
+    lo, hi, reach = BROWS
+    sel = ((u[Tr] > lo) & (u[Tr] < hi) & (a[Tr] < reach) & (front_weight(Pf[Tr].reshape(-1, 3), c0, fwd).reshape(-1, 3) > 0.5)).all(1)
+    for _, ry, rx, _ in E.raster(UVf[Tr[sel]] * S, S, S):
+        zone[ry, rx] = True
+    lum = color @ np.array([0.2126, 0.7152, 0.0722])
+    brow = zone & (lum < 0.45) & (color[..., 0] > color[..., 2] + 0.08)
+    brow = ndimage.binary_opening(brow, iterations=1)
+    w = ndimage.gaussian_filter(ndimage.binary_dilation(brow, iterations=2).astype(np.float32), 1.0)[..., None]
+    out = nmap * (1 - w) + np.array([0.5, 0.5, 1.0]) * w
+    log("eyebrows: the normal map flattened under them (%d texels)" % int(brow.sum()))
+    return out
 
 
 def front_weight(X, c0, fwd):
@@ -328,7 +362,9 @@ def rebake_averaged(g, mi, P0, N0, UV0, T0, Pf, Nf, UVf, Tr, atlas, mr, nmap, nm
         uvl = np.einsum("ij,ijk->ik", bl, UVl[tl_])
         Nl = np.einsum("ij,ijk->ik", bl, Nw0[left.F[tl_]]); Nl /= np.maximum(1e-12, np.linalg.norm(Nl, axis=1))[:, None]
         n_l = E.reflect_v(E.decode_normal(E.bilinear(nmap, uvl[:, 0], uvl[:, 1]), Nl, Tl[tl_], sl[tl_]), nm)
-        wq = wp[:, None]
+        # the lips keep her right half's paint (closed lips, as in the photos; her left half's shows
+        # teeth, which the band would blend into the middle of the mouth)
+        wq = (wp * (1.0 - lips_weight(po, nm, dm, c0, up, fwd)))[:, None]
         nb = (1 - wq) * n0 + wq * n_l
         # on a symmetric face the normal lies in the plane AT the plane; the old map does not agree
         # across it (its islands meet there), so neither need the average: made to, near the plane
@@ -480,6 +516,7 @@ def main():
     N = renormal(P, N, T, nm, dm)
     ac, am, an = rebake_averaged(g, mi, P0, N0, UV0, T0, P, N, UV, T[:n_right],
                                  img["color"], img["mr"], img["normal"], nm, dm)
+    an = flatten_brows(ac, an, UV, T[:n_right], P, nm, dm)
     go = E.GlbOut(g)
     prim = go.j["meshes"][mi]["primitives"][0]
     prim["attributes"] = {"POSITION": go.accessor(P.astype(np.float32), "VEC3", 34962),
