@@ -826,20 +826,44 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             Vertex v;
             v.type = VType::Medium;
             v.p = mpos; v.beta = beta;
-            // Hero is gated off for scenes with media, so nUp is 1 here in practice.
+            // The bundle reaches a medium only when its extinction is flat in λ (the hero
+            // gate in renderRows), so the free flight that brought every wavelength here was
+            // one and the same.
             v.nUp = nUp;
             for (int i = 0; i + 1 < nUp; ++i) v.betaSec[i] = betaSec[i];
             v.mediumG = sm.g; v.mediumId = scatterMed;
             v.pdfFwd = convertDensity(pdfFwd, path[prevIdx], v);
             path.push_back(v);
             if (++bounces >= maxDepth) return;
-            if (rng.uniform() >= sm.albedo(lambda)) return;   // absorbed (vertex retained)
+            // Absorption, policy 3 over the per-λ albedo (flat under the gate, but the rule
+            // costs nothing to keep general): survive on the strongest, reweight by
+            // albedo_i / q <= 1. At nUp == 1, q is the hero's albedo and the weight is 1 --
+            // the scalar roulette verbatim.
+            {
+                double q = sm.albedo(lambda), albSec[hero::kHeroMax - 1];
+                const double alb0 = q;
+                for (int i = 0; i + 1 < nUp; ++i) {
+                    albSec[i] = sm.albedo(hb.lam[i + 1]);
+                    if (albSec[i] > q) q = albSec[i];
+                }
+                if (rng.uniform() >= q) return;                 // absorbed (vertex retained)
+                beta *= alb0 / q;
+                for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= albSec[i] / q;
+            }
             Vertex& cur = path.back();
             double pdfW;
             // phaseSample takes the INCOMING direction (ray.d) directly, so there is no
             // need to reconstruct `wo` from the two vertex positions here — and doing so
             // would be the one place in this walk that could produce a NaN direction.
             Vec3 wi = sm.phaseSample(ray.d, lambda, rng, pdfW); // scattered dir (HG or rainbow)
+            // A rainbow's lobes move with λ: the hero sampled `wi`, and each secondary takes
+            // its own phase over the hero's density there (f_i / pdf_hero; the MIS stays
+            // hero-driven, as it is at a fiber). An HG lobe is the same at every λ.
+            if (nUp > 1 && sm.rainbow() && pdfW > 0.0) {
+                const double c = dot(ray.d, wi);
+                for (int i = 0; i + 1 < nUp; ++i)
+                    betaSec[i] *= sm.phaseValue(c, hb.lam[i + 1]) / pdfW;
+            }
             double pdfRevW = pdfW;                             // phase symmetric in (wo,wi)
             path[prevIdx].pdfRev = convertDensity(pdfRevW, cur, path[prevIdx]);
             ray = Ray{mpos, wi};
@@ -2940,8 +2964,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                            connFiberStep(qs, wcam))) return 0.0;
         const double vis = 1.0;
         // Transmittance of the fog the connection ray crosses (1 in vacuum, no RNG).
-        // Evaluated at the hero only: the hero gate disables bundling when the scene has
-        // any medium, so Tr is exactly 1 whenever nUp > 1.
+        // Evaluated at the hero and shared by the bundle: the hero gate admits a bundle into
+        // a medium only when its extinction is flat in λ, where Tr is the same at every λ.
         double Tr = mats.mediaTransmittance(scene, qs.p, wcam, dist, lambda, rng) * vis;
         double G = std::fabs(cosSurf) * cosCam / dist2;
         L = qs.beta * f * G * cameraWe(cam, cosCam) * Tr;
@@ -3051,7 +3075,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         if (scene.occluded(connOrigin(pt, wi), wi, dist - occlEps, 1e-6, false,
                            connFiberStep(pt, wi))) return 0.0;   // hard block: see t=1
         const double vis = 1.0;
-        // Hero-only transmittance (exactly 1 whenever nUp > 1; see the t==1 branch).
+        // Hero transmittance, shared by the bundle (flat extinction; see the t==1 branch).
         double Tr = mats.mediaTransmittance(scene, pt.p, wi, dist, lambda, rng) * vis;
         double G = std::fabs(cosSurf) * Wgeom;
         L = pt.beta * f * Le * G * Tr * stG;
@@ -3157,7 +3181,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         if (scene.occluded(connOrigin(pt, w), w, dist - 2e-6 - connShorten(qs, w * -1.0, 0.0),
                            1e-6, false, connFiberStep(pt, w))) return 0.0;   // hard block: see t=1
         const double vis = 1.0;
-        // Hero-only transmittance (exactly 1 whenever nUp > 1; see the t==1 branch).
+        // Hero transmittance, shared by the bundle (flat extinction; see the t==1 branch).
         double Tr = mats.mediaTransmittance(scene, pt.p, w, dist, lambda, rng) * vis;
         double G = std::fabs(cosE) * std::fabs(cosL) / dist2;
         L = pt.beta * fE * fL * qs.beta * G * Tr * stGE * stGL;
@@ -3453,11 +3477,19 @@ struct BdptRenderer {
         std::vector<double> segSumC, segSumM;
         const uint64_t nPix = (uint64_t)camFilm.resX * (uint64_t)camFilm.resY;
         // Hero gate, matching BackwardRenderer: bundling needs a wavelength-independent
-        // ray path, so any participating medium (per-λ free flight), a GRIN field
-        // (per-λ curvature) or a dispersive finite lens (per-λ refraction at the
-        // elements) forces the scalar single-λ path.
+        // ray path, so a GRIN field (per-λ curvature), a dispersive finite lens (per-λ
+        // refraction at the elements) or a medium whose EXTINCTION varies with λ (per-λ
+        // free flight) forces the scalar single-λ path. A medium flat in its coefficients
+        // (Medium::achroSigma, the common grey fog, cloud or rain) shares its free flights,
+        // transmittance and albedo across the bundle; a rainbow phase in it is the one
+        // λ-dependent direction left, and the walk carries it per λ (see the medium event).
         const int C = (heroC > hero::kHeroMax) ? hero::kHeroMax : heroC;
-        const bool useHero = (C > 1) && scene.media.empty() &&
+        bool mediaFlat = true;
+        for (const Medium& md : scene.media) if (!md.achroSigma) { mediaFlat = false; break; }
+        // Mode J's beam merges in a medium were written for one wavelength per path, so a
+        // mode-J render with media stays there until they are taught the bundle.
+        const bool useHero = (C > 1) && mediaFlat &&
+                             (scene.media.empty() || beams == nullptr) &&
                              !grin::sceneHasGrin(scene) && !cam.hasLens();
         // Only pay for escape tracking when the scene actually has a distant sun.
         const bool hasSun = scene.sunCount > 0;

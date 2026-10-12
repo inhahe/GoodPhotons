@@ -109,12 +109,18 @@ fur x0.9995 whole-frame, chroma noise 3.65x lower; grey fog x0.9998, 4.31x; rain
 4.03x; every tile within 4 sigma / 3 %. On gallery_rain fly0248 at 64 spp the hair goes from
 rainbow speckle to golden grain, for 1.35x the time per sample.
 
+**Mode D, CPU, 0.375.2:** the media gate admits flat-extinction media, a medium vertex takes policy-3
+survival on the per-λ albedo and, at a rainbow scatter, a per-λ phase_i/pdf_hero; the connections
+already evaluated medium vertices per λ and share the (flat) transmittance. BDPT's camera walk
+already kept the bundle through a fiber (per-λ f/pdf_hero). Measured (mode D, 256 spp): fur
+x1.0017, 3.01x less chroma noise; fog x1.0000, 4.25x; rainbow rain x1.0001, 3.96x. Mode J keeps
+its single wavelength in media: its beam merges were written for one.
+
 **Still open:**
-- **mode D**: the media gate (`bdpt.h` useHero) -- the gallery's reference mode -- and spectral MIS
-  at fiber and rainbow vertices, which in BDPT has to be ONE balance heuristic over every (strategy
-  x hero wavelength) pair: n / sum_j R_j(s) D_j(s), with D_j the usual BDPT denominator at
-  wavelength j and R_j its path-pdf ratio to the hero's. A product of two separate heuristics is
-  not a partition of unity;
+- **spectral MIS in mode D** at fiber and rainbow vertices, which in BDPT has to be ONE balance
+  heuristic over every (strategy x hero wavelength) pair: n / sum_j R_j(s) D_j(s), with D_j the
+  usual BDPT denominator at wavelength j and R_j its path-pdf ratio to the hero's. A product of two
+  separate heuristics is not a partition of unity;
 - the GPU twin of mode R (`bkRadianceHero`), and the other modes' media gates;
 - a fiber with a DISPERSIVE index: `hair.h` takes one `eta` for all wavelengths. The MIS above
   already handles per-λ lobes; only the material parameter is missing;
