@@ -57,6 +57,11 @@ FUR_KEPT = {"on", "material", "count", "guides", "guide_blend", "points", "segme
             "length_jitter", "jitter", "clump", "seed"}
 FUR_LENGTH = {"radius", "radius_tip", "clump_size", "root_offset", "guide_falloff", "length"}
 FUR_AREA = {"density"}          # per unit area: / s^2
+# The fur loader's DEFAULTS for the lengths it does not set to 0 (ftsl.h addFur). A block that
+# leaves one out would get the absolute default in the hall, unscaled, so the tool writes it in,
+# scaled. (radius_tip left out is derived from radius, so it scales with it.)
+FUR_LENGTH_DEFAULTS = {"radius": 0.0008, "clump_size": 0.02, "length": 0.05}
+STAND_BASE_TOL = 1e-3           # model units: the stand's base must sit at y 0
 
 
 def glb_json(path):
@@ -70,24 +75,34 @@ def glb_json(path):
 
 
 def doll_extent(glb):
-    """(y min, y max) of every primitive but the stand's, from the accessors' own bounds.
+    """(y min, y max, primitive count) of every primitive but the stand's, from the accessors' own
+    bounds.
 
-    Refuses node transforms: ftrace's loader would apply them and this measurement would not."""
+    Refuses node transforms (ftrace's loader would apply them and this measurement would not), and
+    a stand whose base is not at y 0 (the placement puts the model's y 0 on the cap's top)."""
     j = glb_json(glb)
     for n in j.get("nodes", []):
         if any(k in n for k in ("matrix", "translation", "rotation", "scale")):
             raise SystemExit("%s: node %r carries a transform; this tool measures raw positions"
                              % (glb, n.get("name")))
     mats = [m.get("name", "") for m in j.get("materials", [])]
-    lo, hi, parts = [], [], 0
+    lo, hi, parts, stand = [], [], 0, []
     for mesh in j["meshes"]:
         for p in mesh["primitives"]:
-            if "material" in p and mats[p["material"]] == STAND:
-                continue
             acc = j["accessors"][p["attributes"]["POSITION"]]
+            if "material" in p and mats[p["material"]] == STAND:
+                stand.append(acc["min"][1])
+                continue
             lo.append(acc["min"][1]); hi.append(acc["max"][1]); parts += 1
     if not parts:
         raise SystemExit("%s: no primitives besides the stand" % glb)
+    if not stand:
+        raise SystemExit("%s: no %s primitive (the stand), so nothing says where the cap's top is"
+                         % (glb, STAND))
+    if abs(min(stand)) > STAND_BASE_TOL:
+        raise SystemExit("%s: the stand's base is at model y %.4f, not 0; the placement puts y 0 on "
+                         "the cap's top, so she would %s it" % (glb, min(stand),
+                                                               "sink into" if min(stand) < 0 else "float above"))
     return min(lo), max(hi), parts
 
 
@@ -105,7 +120,10 @@ def scale_fur(block, s):
     """A fur block with every length times s and every area density over s^2; refuses settings it
     cannot classify (a `bald` zone or a direction would need the placement, not a factor)."""
     lines = block.split(NL)
+    if not re.match(r'^fur "[^"]+" \{\s*$', lines[0]):
+        raise SystemExit("fur block: settings on its opening line are not classified: %r" % lines[0])
     out = [lines[0]]
+    seen = set()
     for line in lines[1:-1]:
         body, _, comment = line.partition("#")
         tk = tokens(body)
@@ -116,6 +134,7 @@ def scale_fur(block, s):
             if i + 1 >= len(tk):
                 raise SystemExit("fur block: %r has no value in %r" % (key, line.strip()))
             val = tk[i + 1]
+            seen.add(key)
             if key in FUR_KEPT:
                 new += [key, val]
             elif key in FUR_LENGTH:
@@ -129,6 +148,10 @@ def scale_fur(block, s):
         indent = re.match(r"\s*", line).group(0)
         out.append(indent + "   ".join(" ".join(new[k:k + 2]) for k in range(0, len(new), 2))
                    + (("   #" + comment) if comment else ""))
+    missing = [k for k in sorted(FUR_LENGTH_DEFAULTS) if k not in seen]
+    if missing:
+        out.append("    " + "   ".join("%s %s" % (k, num(FUR_LENGTH_DEFAULTS[k] * s)) for k in missing)
+                   + "   # the loader's defaults, scaled")
     out.append(lines[-1])
     return NL.join(out)
 
@@ -194,18 +217,29 @@ def main():
            "    " + xf + " }",
            ""]
 
-    # The groom, part by part, in its own order.
+    # The groom, part by part, in its own order -- less its own header comment, which names the
+    # tool that generated the RIG and would send a reader of this file to the wrong one.
     flyat = groom.find("# flyaways")
     if flyat < 0:
         raise SystemExit("%s: no '# flyaways' section" % GROOM)
     head, fly = groom[:flyat], groom[flyat:]
+    hl = head.split(NL)
+    k = 0
+    while k < len(hl) and (not hl[k].strip() or hl[k].lstrip().startswith("#")):
+        k += 1
+    head = NL.join(hl[k:])
     pos = 0
+    included = False
     for m in re.finditer(r'(?ms)^fur "[^"]+" \{.*?^\}', head):
         for line in head[pos:m.start()].split(NL):
             st = line.strip()
             if not st or st.startswith("#"):
                 out.append(line)
             elif st.startswith("include "):
+                if included:
+                    raise SystemExit("%s: a second include (%r); the tool places one guides file"
+                                     % (GROOM, st))
+                included = True
                 inc = re.match(r'include "([^"]+)"', st).group(1)
                 text = open(os.path.join(a.hair, inc), encoding="utf-8").read()
                 with open(os.path.join(meshes, "alice2_gallery_guides.ftsl"), "w", encoding="utf-8", newline="") as f:
@@ -233,7 +267,13 @@ def main():
         raise SystemExit("%s: no headband section" % RIG_SCENE)
     hbtext = rename(hb.group(0), re.findall(r'^material "([^"]+)"', hb.group(0), re.M))
     for line in hbtext.split(NL):
-        out.append(place_mesh(line, s, a.hair, meshes, copied) if line.startswith("mesh ") else line)
+        st = line.strip()
+        if not st or st.startswith("#") or st.startswith("material "):
+            out.append(line)
+        elif st.startswith("mesh "):
+            out.append(place_mesh(st, s, a.hair, meshes, copied))
+        else:       # any other geometry would land in the hall unplaced
+            raise SystemExit("%s: no rule for %r in the headband section" % (RIG_SCENE, st))
     out.append("")
 
     with open(os.path.join(ROOT, "scenes", "alice2_gallery.ftsl"), "w", encoding="utf-8", newline="") as f:
