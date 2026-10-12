@@ -15589,10 +15589,26 @@ static const char* vcmUnsupportedFeature(const Scene& scene, const Camera& cam) 
 enum class OnUnsupported { Error, Fallback, Strip };
 static OnUnsupported g_onUnsupported = OnUnsupported::Error;
 
+// VOLUMETRIC EMISSION ("fire": a medium with a `temperature` field) is born only by the forward
+// tracer (render.h's volume births), so only the forward-measuring modes see it. Every other
+// estimator would render the scene as if the fire were cold smoke (known-issues
+// EMISSIVE-VOLUME-SILENT), so they refuse it below, and the fallback goes to mode B.
+static bool sceneHasEmissiveMedium(const Scene& scene) {
+    for (const Medium& m : scene.media) if (m.emissive()) return true;
+    return false;
+}
+static bool modeRendersVolumeEmission(char mode) {
+    return mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P';
+}
+
 // Core capability check: return a reason string if `mode` cannot render `scene` with a
-// camera of the given `projection`, else nullptr. Only modes with real restrictions (D
-// BDPT, J UPBP, U VCM) gate anything; the general modes (A/B/C/R/M/S/P) render everything.
+// camera of the given `projection`, else nullptr. Volumetric emission restricts every mode
+// but the forward ones; otherwise only the modes with real restrictions (D BDPT, J UPBP,
+// U VCM) gate anything, and the general modes (A/B/C/R/M/S/P) render everything.
 static const char* modeFeatureUnsupported(const Scene& scene, char mode, int projection) {
+    if (!modeRendersVolumeEmission(mode) && sceneHasEmissiveMedium(scene))
+        return "volumetric emission (a medium with a `temperature` field, which only the "
+               "forward modes A/B/C/P render)";
     // Mode J (UPBP) is mode D's transport plus beam merging, so it inherits D's scope
     // EXACTLY — same connections, same MIS densities, same refusals. The beam half adds
     // no capability of its own: a beam map is built by the same forward photon pass mode M
@@ -15633,17 +15649,20 @@ static const char* sceneModeUnsupported(const ftsl::Loaded& L, char cliMode) {
     return nullptr;
 }
 
-// Best-effort feature stripping for `-on-unsupported strip`. Today only GRIN is
-// strippable (clear the index field -> the medium is treated as homogeneous/clear).
-// Mutates `scene` only if that fully resolves the conflict; otherwise restores it and
-// returns false (so the caller falls back to a supported mode instead). Returns true iff
-// the scene now renders in `mode`.
+// Best-effort feature stripping for `-on-unsupported strip`. Two features are strippable:
+// GRIN (clear the index field -> the medium is treated as homogeneous/clear) and volumetric
+// emission (drop the temperature field -> the fire renders as the cold smoke it would have
+// been anyway, now on purpose). Mutates `scene` only if that fully resolves the conflict;
+// otherwise restores it and returns false (so the caller falls back to a supported mode
+// instead). Returns true iff the scene now renders in `mode`.
 static bool stripUnsupportedFeature(Scene& scene, char mode, int projection) {
     if (modeFeatureUnsupported(scene, mode, projection) == nullptr) return true;
     std::vector<Medium> saved = scene.media;
-    bool anyGrin = false;
-    for (auto& m : scene.media) if (m.grin()) { m.ior.clear(); m.iorStep = 0.0; anyGrin = true; }
-    if (anyGrin && modeFeatureUnsupported(scene, mode, projection) == nullptr) return true;
+    bool any = false;
+    for (auto& m : scene.media) if (m.grin()) { m.ior.clear(); m.iorStep = 0.0; any = true; }
+    if (!modeRendersVolumeEmission(mode))
+        for (auto& m : scene.media) if (m.emissive()) { m.temperature.reset(); any = true; }
+    if (any && modeFeatureUnsupported(scene, mode, projection) == nullptr) return true;
     scene.media = saved;   // couldn't fully strip -> leave the scene intact
     return false;
 }
@@ -15656,10 +15675,16 @@ static char applyUnsupportedPolicy(Scene& scene, char mode, int projection,
     proceed = true;
     const char* why = modeFeatureUnsupported(scene, mode, projection);
     if (!why) return mode;
+    // The fallback: the backward reference (R) renders every feature BDPT/VCM refuse (GRIN,
+    // media, fisheye, fluorescence, ...) -- except volumetric emission, which only a forward
+    // mode sees, so a fire goes to mode B.
+    const bool fire = sceneHasEmissiveMedium(scene) && !modeRendersVolumeEmission(mode);
+    const char fallback = fire ? 'B' : 'R';
     if (g_onUnsupported == OnUnsupported::Error) {
         std::fprintf(stderr, "[mode %c] camera '%s' uses %s, which that mode can't render; "
-                             "use mode A/B/C/R, add a prefer{}/else{} fallback, or pass "
-                             "-on-unsupported fallback|strip.\n", mode, camName, why);
+                             "use mode %s, add a prefer{}/else{} fallback, or pass "
+                             "-on-unsupported fallback|strip.\n", mode, camName, why,
+                     fire ? "A/B/C/P" : "A/B/C/R");
         proceed = false;
         return mode;
     }
@@ -15669,11 +15694,10 @@ static char applyUnsupportedPolicy(Scene& scene, char mode, int projection,
                     "anyway.\n", camName, why, mode);
         return mode;
     }
-    // Fallback (or strip couldn't resolve it): the backward reference (R) renders every
-    // feature BDPT/VCM refuse (GRIN, media, fisheye, fluorescence, ...).
-    std::printf("[on-unsupported=fallback] camera '%s': %s unsupported in mode %c -> mode R "
-                "(backward reference).\n", camName, why, mode);
-    return 'R';
+    std::printf("[on-unsupported=fallback] camera '%s': %s unsupported in mode %c -> mode %c "
+                "(%s).\n", camName, why, mode, fallback,
+                fire ? "forward light tracer" : "backward reference");
+    return fallback;
 }
 
 // CPU counterpart of the GPU gpuSppChunks helper: render `sppTarget` samples-per-pixel

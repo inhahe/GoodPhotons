@@ -143,6 +143,29 @@ loader refuses the nesting -- so no mix coin needs carrying.) With media in the 
 the free flights of the segment it re-traces -- measured 33 % too dark in a pure-absorber fog before
 `firstSegSampled`. `tools/check_hero_spectral.py`'s coatfog scene covers both.
 
+## OPEN (2026-10-12; the silence fixed in 0.375.1): EMISSIVE-VOLUME-SILENT — most modes rendered a fire-lit scene black without a word
+
+Volumetric emission (`temperature` + `emission blackbody`, "fire") is born only by the forward
+tracer (`render.h`'s volume births), so only the forward-measuring modes A, B, C and P render it,
+CPU and GPU. On `scraps/vdb_fire.ftsl` (the fire is the only light) modes R, D, W, S and V's
+backward half produced an all-zero image and exited 0 with no warning; M and J warned only that no
+photons/beams were deposited; U refused, because it refuses media at all. (Mode C also looked
+black, but it is only inefficient here: A and C record what passes through a real aperture, ~1000x
+below B's absolute scale on any scene, and C's physical catch found one pixel in 200 M photons from
+a small, distant fire.)
+
+**0.375.1:** every mode but A/B/C/P refuses a scene with an emissive medium through the usual
+unsupported-feature route (`modeFeatureUnsupported`): an error naming the feature by default,
+`-on-unsupported fallback` to mode **B** (not R, which cannot see it either), and
+`-on-unsupported strip`, which drops the temperature field and renders the fire as the cold smoke
+it was silently rendered as before. FTSL.md's mode-support note, stale twice over (the GPU fallback
+it described ended in 0.49.0; mode R stopped flattening media in 0.254.0), now says this.
+
+**Still open, the proper fix:** mode R renders it (emission at each medium collision,
+sigma_a/sigma_t * Le, plus NEE of the emissive volume, which `Scene::emissiveVolumes` already
+describes: AABB, power, Planck-λ CDF), and mode D after it (volume-born light subpaths, emission at
+medium vertices inside the MIS).
+
 ## DONE (2026-10-12, 0.374.5-0.374.7): IMAGE-WRITE-LOCKED — an image write failed when something held the file
 
 **Seen** on renders running side by side, each on its own output, nothing of ours reading

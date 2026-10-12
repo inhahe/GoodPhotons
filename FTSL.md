@@ -2966,15 +2966,16 @@ medium {
 }
 ```
 
-> **Mode support:** volumetric emission is a **forward-CPU** feature (modes **A/B/C** and the
-> forward layers of V/P). Each emissive medium becomes an isotropic volume emitter: photons are
-> born inside it (position-sampled over the temperature grid's AABB, wavelength-sampled across
-> the band) carrying the local Planck radiance, so the fire both shows directly *and lights the
+> **Mode support:** volumetric emission is a **forward** feature: modes **A/B/C/P**, on the CPU
+> and the GPU. Each emissive medium becomes an isotropic volume emitter: photons are born inside
+> it (position-sampled over the temperature grid's AABB, wavelength-sampled from the grid's
+> blackbody) carrying the local Planck radiance, so the fire both shows directly *and lights the
 > rest of the scene* (soot self-scatter, nearby walls). An emissive volume counts as the scene's
-> light, so a fire needs no separate `light` block. The **GPU** forward tracer does not yet carry
-> the volume-birth branch, so `-device gpu`/`auto` **falls back to the CPU** for any scene with an
-> emissive volume (see `known-issues.md`). The backward reference (R/V) treats media as a single
-> homogeneous haze and never sees the grid, so render fire with a forward mode.
+> light, so a fire needs no separate `light` block. The other modes (R, W, V, D, U, J, M, S) do
+> not render volumetric emission and **refuse** a scene with a fire, like any other feature a
+> mode can't render: `-on-unsupported fallback` switches such a camera to mode **B**, and
+> `-on-unsupported strip` renders the fire as cold smoke. (Before 0.375.1 they rendered it as
+> cold smoke silently -- black, when the fire was the only light.)
 
 ---
 
