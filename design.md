@@ -1126,9 +1126,9 @@ the whole mass reads as a fuzzy dome). `tools/alice_guides.py` traces **streamli
 sculpted surface from rings of roots, lifted off the surface along the normal (a blend of
 surface-hugging guides on a convex head lies *inside* it), with a side part and a short swept
 fringe, and writes them as curves of curves; `--place` wraps them in a `group` for a scene that
-shows her transformed. `scenes/alice_hair.ftsl` is the groom at true size (10 in); `scenes/
-alice_hair_gallery.ftsl` the same groom carried into gallery_rain's placement with the fur's
-metres at the hall's 3x. Both tools honour the GLB's node transform, so `tools/glb_rescale.py`
+shows her transformed. `scenes/alice_hair.ftsl` is the groom at true size (10 in). (Its gallery
+copy, `scenes/alice_hair_gallery.ftsl`, went when Alice2 replaced this doll in gallery_rain; see
+*Alice2 in gallery_rain*.) Both tools honour the GLB's node transform, so `tools/glb_rescale.py`
 could put the doll at her real size without touching the raw vertices the segmentation was
 tuned on. Fiber numbers are a rooted doll's: 15 000 strands, 0.05 mm radius, plug-sized locks.
 
@@ -1383,6 +1383,20 @@ The rest of the pipeline on the symmetric head:
 
 Not fixed: a pinprick-sized dark dot in front of each ear, on the cheek, from the source. It is not
 in the colour or normal maps, and no fold shows in the mesh there.
+
+**Alice2 in gallery_rain (2026-10-12, `tools/alice2_gallery.py`).** The finished doll
+(`base_basic_pbr_flat_sparkle_sym_eyes.glb`) and her v3 hair replace the Meshy doll and its groom
+on the far-right court's cap, at the same spot and turn. The tool copies the doll, the scalps and
+the headband into `meshes/` and writes the hair for the hall:
+- **Size:** the doll, feet to the top of her hair and without her stand (`root.2`), is 10 in at
+  the hall's display scale 3, so the mesh scale is 0.464458. Her stand stands on the cap.
+- **Why the tool moves the curves itself:** a `group` transform bakes meshes, primitives and
+  lights but not curves or a fur block's metric settings. So the guides' and flyaways' points are
+  moved into the hall (`meshes/alice2_hair_gallery_curves.ftsl`, 9 MB, gitignored), and every
+  length a fur block carries (fibre radius, clump size, root offset) is multiplied by the scale.
+  The scalps and the headband are meshes and take the transform in their own blocks
+  (`scenes/alice2_hair_gallery.ftsl`, checked in).
+- **Rerun it** whenever the doll or the hair is regenerated: the placement lives in its constants.
 
 **Alice2's eyes (2026-10-07..11, `tools/alice2_eyes.py`, tooling only): a new copy of the GLB with
 crisp, matching eyes; the face round them unchanged.** Problems in the source:

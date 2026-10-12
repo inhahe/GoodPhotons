@@ -17,6 +17,10 @@ Asked 2026-09-17: convert the hair in `meshes/alice.glb` to real strands, matchi
 flow by eye, without authoring every strand — via a general "curves of curves" structure. Four
 pieces, built in this order because each is testable on its own and the later ones depend on it.
 
+(2026-10-12: gallery_rain now shows Alice2, the Hyper3D doll, with her v3 hair
+(`tools/alice2_gallery.py`), and `scenes/alice_hair_gallery.ftsl` (item 12) is gone. This groom
+lives on in `scenes/alice_hair.ftsl` only.)
+
 **What was found first (all measured, none guessed):**
 - Alice is ONE fused mesh, one material, 407 792 tris. There is no hair mesh; the hair is sculpted
   into the same shell as the head. So step one is segmentation.
