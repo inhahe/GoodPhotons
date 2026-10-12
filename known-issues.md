@@ -71,6 +71,58 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-10-12, 0.375.3): REVIEW-0375 — what the Opus and Fable reviews of 0.375.0-0.375.1 found
+
+Each checked against the code before it was fixed; the checks that hold them are named.
+- **MODE-W-FIBER-DEHERO.** 0.375.0 took `Hair` out of the dispersive group, whose `heroSplit` branch
+  (always on in mode W) split the bundle per λ, and de-heroed instead for mode W, `-direct-only`
+  and dual scattering. Mode W's wavelength lattice is shared by every pixel of a pass, so every
+  fiber came out ONE saturated colour per pass. Those cases fall through to the dispersive group
+  again (`backward.h`, the bundle Hair case).
+- **GLOSSY-NEE-COAT.** A clearcoat sheen `continue`s past the material code, which is what clears
+  the glossy MIS record: a light or the sky seen glossy -> sheen -> emitter took the floor's weight,
+  too dark. Both loops now clear it at the sheen.
+- **GLOSSY-NEE-PASSTHROUGH.** A fiber's coverage pass-through is no vertex, but the record was
+  cleared there (`interactMaterial`, and the bundle loop before its switch): a light seen glossy ->
+  through see-through fur was counted at full weight on top of the glossy vertex's NEE share, too
+  bright. The pass-through now restores it -- in the GPU twins too (`bkInteract`, the bundle
+  loop), which measured the same x1.09 (glossy NEE on / off, GPU, the `fiber` scene). The GPU never
+  had the coat half: it builds the coat as a glossy child that does its own NEE.
+  (`tools/check_glossy_nee_media.py` `coat` and `fiber`, tile by tile; `--device gpu`.)
+- **GLOSSY-NEE-PASSTHROUGH, mode M** (the same class, found by testing it there): both camera walks
+  (`photonGather`, `photonGatherSub`, and their GPU twins) kept `hairArrival` -- "the fiber's own
+  NEE took the light" -- across a pass-through, and the gather sub-walk set `specularSeen`, so light
+  seen straight through see-through fur was dropped (or, from a gather point, counted twice), and
+  the glossy record was cleared. Glossy NEE on / off measured x1.08 on the `fiber` scene. A
+  pass-through now inherits all three (`--mode M`).
+- **VOLUME-NEE-OPACITY.** Light sampling from a medium vertex (`neeVolume`, and its bundle copy)
+  tested visibility with binary `occluded`, so fog behind `opacity 0` fur was lit as if the fur were
+  solid. It shares `volumeEmitterGeom` now, with `shadowTransmittance` as every other NEE leg; the
+  GPU twin `bkNeeVolume` takes `shadowTransmittanceTo` likewise (`tools/check_fur_null.py`).
+- **FOG-ACHRO.** The built-in `-fog` medium is pushed after `Scene::build()` baked `achro` /
+  `achroSigma`, so it read as chromatic: no hero bundle through it, classic beams in mode M.
+  `Medium::bakeAchromatic` is now called there too.
+- **SPEC-MIS-NAN.** The spectral-MIS rescale `sumOld / sumNew` was 0/0 when no live wavelength
+  could be the hero (a dead hero, zero-mass λ bin): NaN into the film. Such a path now ends.
+- **HAIR-FOLD-TINT** (older, found on the way). `LobeAngular::F` stored the Fresnel term already
+  multiplied by the cuticle tint, and `fFromLobes` tinted it again with a `specR` nothing ever set
+  -- 1 on the CPU, uninitialised on the GPU (mode M's spectral fold) -- so with `specular` below 1
+  the TT lobe got (1 - F*tint)^2, and a spectral tint was one value for every bin. F is untinted now
+  and the fold takes each wavelength's tint (`-checkhair` S12). GPU mode M on fur moved +3.5 % with
+  it (the garbage tint); it still sits 1.7 % above the CPU on `hairsun` (5.7 sigma on the worst
+  tile, from seed pairs that a photon map's correlated pixels make optimistic) -- not chased here.
+- **FIRE-POLICY.** Mode P counted as rendering a fire, but its composite fits the forward layer
+  against a fire-blind mode-R film; the strip cleared GRIN whenever anything was unsupported, and
+  stripped the one shared Scene for every camera of the run; the fallback sent a lens camera to B,
+  which drops the lens; and the exposure meter metered the authored mode, not the fallback (a
+  fire-lit path found no anchor). One set of capability predicates now drives refusal, fallback,
+  strip, advice and meter (`tools/check_fire_modes.py`, seven cases).
+
+Dismissed: the chromatic-coat split re-entering its vertex (Fable): resolving it in place instead
+trades the per-segment skip list for a per-vertex one -- emission at the resolved body, its glossy
+weight, the radiance-cache marks -- so the tested design stays, with the constraint stated where a
+future per-segment event would be added.
+
 ## OPEN (2026-10-12; mode R done in 0.375.0): SPECTRAL-BUNDLE — media and fibers rendered at one wavelength per path
 
 **Seen** on gallery_rain's flyby frame `fly0248`, Alice2's hair large in frame: rainbow speckle
@@ -116,16 +168,26 @@ already kept the bundle through a fiber (per-λ f/pdf_hero). Measured (mode D, 2
 x1.0017, 3.01x less chroma noise; fog x1.0000, 4.25x; rainbow rain x1.0001, 3.96x. Mode J keeps
 its single wavelength in media: its beam merges were written for one.
 
+**Spectral MIS inside mode D's own MIS: built, measured, not kept (0.375.3).** BDPT needs ONE
+balance heuristic over every (strategy x hero wavelength) pair, `n / sum_j R_j D_j` (D_j the usual
+denominator at λ_j, R_j the strategy's path pdf at λ_j over the hero's; two separate heuristics
+multiplied are not a partition of unity). Implemented with per-λ forward/reverse densities recorded
+at fiber and rainbow vertices and misWeight re-run per λ; unbiased on every check scene, including
+a new one built to favour it (`hairback`: strongly coloured fur rim-lit by a large area light).
+Measured against the hero weight, paired: **fur, no change** (chroma noise 0.0562 -> 0.0561 on the
+fiber pixels; a fiber's strongest strategies -- the light connection at it, and the eye path
+hitting the light off its lobe, whose spike the hero weight already bounds by the light density --
+carry no per-λ ratio); **rainbow rain, ~5 % less variance**; **~17 % more time** on fur (1.00-1.40x
+over four paired runs). And the check could not tell it from a deliberately broken weight (R_j
+dropped): it changes too little to verify. So mode D keeps the hero's strategy weights.
+
 **Still open:**
-- **spectral MIS in mode D** at fiber and rainbow vertices, which in BDPT has to be ONE balance
-  heuristic over every (strategy x hero wavelength) pair: n / sum_j R_j(s) D_j(s), with D_j the
-  usual BDPT denominator at wavelength j and R_j its path-pdf ratio to the hero's. A product of two
-  separate heuristics is not a partition of unity;
 - the GPU twin of mode R (`bkRadianceHero`), and the other modes' media gates;
 - a fiber with a DISPERSIVE index: `hair.h` takes one `eta` for all wavelengths. The MIS above
-  already handles per-λ lobes; only the material parameter is missing;
-- shadow transmittance through a fiber of SPECTRAL `opacity` is evaluated at the hero's λ in every
-  bundle NEE (it was at 550 nm before 0.375.0) -- exact for the constant opacity every scene uses.
+  already handles per-λ lobes; only the material parameter is missing.
+
+(Spectral fiber `opacity`, which every bundle NEE evaluated at one wavelength, is gone: coverage is
+geometry, one number at every wavelength, and a colour there is refused at load -- 0.375.3.)
 
 ## DONE (2026-10-12, 0.375.0): GLOSSY-NEE-MEDIA — a glossy bounce's MIS state outlived a medium scatter (mode R)
 
@@ -152,15 +214,16 @@ the free flights of the segment it re-traces -- measured 33 % too dark in a pure
 ## OPEN (2026-10-12; the silence fixed in 0.375.1): EMISSIVE-VOLUME-SILENT — most modes rendered a fire-lit scene black without a word
 
 Volumetric emission (`temperature` + `emission blackbody`, "fire") is born only by the forward
-tracer (`render.h`'s volume births), so only the forward-measuring modes A, B, C and P render it,
-CPU and GPU. On `scraps/vdb_fire.ftsl` (the fire is the only light) modes R, D, W, S and V's
+tracer (`render.h`'s volume births), so only the forward modes A, B and C render it, CPU and GPU.
+(P was thought to as well, but its composite calibrates the forward layer against a fire-blind
+mode-R film; it refuses a fire since 0.375.3 -- REVIEW-0375.) On `scraps/vdb_fire.ftsl` (the fire is the only light) modes R, D, W, S and V's
 backward half produced an all-zero image and exited 0 with no warning; M and J warned only that no
 photons/beams were deposited; U refused, because it refuses media at all. (Mode C also looked
 black, but it is only inefficient here: A and C record what passes through a real aperture, ~1000x
 below B's absolute scale on any scene, and C's physical catch found one pixel in 200 M photons from
 a small, distant fire.)
 
-**0.375.1:** every mode but A/B/C/P refuses a scene with an emissive medium through the usual
+**0.375.1:** every mode but A/B/C (and P, until 0.375.3) refuses a scene with an emissive medium through the usual
 unsupported-feature route (`modeFeatureUnsupported`): an error naming the feature by default,
 `-on-unsupported fallback` to mode **B** (not R, which cannot see it either), and
 `-on-unsupported strip`, which drops the temperature field and renders the fire as the cold smoke

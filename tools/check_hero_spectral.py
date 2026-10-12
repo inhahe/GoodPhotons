@@ -11,15 +11,21 @@ through a medium needs the medium's extinction to be the same at every wavelengt
 changes only the NOISE: every scene here must render the same image with the bundle as without.
 
 For each scene and each mode it runs in (mode R; mode D where the scene has no sky, which BDPT
-refuses), the CPU renders linear PFMs (`-hdr`) at `-heroc 1` and `-heroc 4`, two seeds each. The frame is cut into tiles; in every tile the bundle's mean must match the single-
-wavelength mean within 4 standard errors (estimated from the seed pairs) and within 3 %. The
-chroma noise (the spread of R/G and B/G between the seed pairs) is reported, which is what the
-bundle exists to lower. Scenes:
+refuses), the CPU renders linear PFMs (`-hdr`) at `-heroc 1` and `-heroc 4`, two seeds each. The
+frame is cut into tiles; a tile fails when the bundle's mean is off the single-wavelength mean by
+more than 5 standard errors (estimated from the seed pairs, tile- and pixel-wise, the larger kept)
+AND by more than 1 %. The chroma noise (the spread of R/G and B/G between the seed pairs) is
+reported, which is what the bundle exists to lower. A scene whose `-heroc 4` render is bit-identical
+to its `-heroc 1` render also fails: its bundle was switched off. Scenes:
   hair  -- two fur balls (pale: long multiple-scattering chains; dark), a glass sphere the fur
            sees through (a fiber vertex followed by a single-wavelength fallback), sun + area
            light + sky.
   hairsun -- the same without the sky, for mode D too.
+  hairback -- red and pale fur rim-lit by a large area light behind them: built to favour a joint
+           (strategy x hero wavelength) MIS weight in mode D, measured and not kept (known-issues
+           SPECTRAL-BUNDLE); fibers seen by both camera and light strategies.
   fog   -- diffuse spheres in a bounded grey Henyey-Greenstein fog, sun + area light.
+  fogcli -- the same lit by the command line's global `-fog`, added after the scene is built.
   coatfog -- an iridescent coat (which splits the bundle per wavelength, re-tracing the segment
            that reached it) on a sphere inside the fog.
   rain  -- a box of rainbow-phase droplets lit by a sun behind the camera, the bow in frame.
@@ -71,6 +77,23 @@ SCENES = {
         'fur "b2_coat" { on "b2"  material dark  count 25000  length 0.05  length_jitter 0.3  radius 0.0006  droop 0.5  jitter 0.25  seed 2 }',
         'sphere { center 0.43 0.07 0.25  radius 0.07  material glass }',
     ],
+    "hairback": [
+        # Strongly coloured fur RIM-LIT by a large area light behind it: the fibers' TT/TRT
+        # weights differ by orders of magnitude across the band, and the light is big enough that
+        # sampling it and hitting it off the fiber lobe are both live strategies.
+        'scene { units meters }',
+        'camera "c" { eye 0 0.22 -0.8  look_at 0 0.16 0.3  up 0 1 0  fov_y 30  film { res 160 120 } }',
+        'material "ground" { type diffuse  reflect 0.2 }',
+        'material "skin"   { type diffuse  reflect rgb 0.30 0.20 0.18 }',
+        'material "red"    { type hair  reflect rgb 0.70 0.10 0.04  beta_m 0.15  beta_n 0.30 }',
+        'material "pale"   { type hair  reflect rgb 0.85 0.75 0.50  beta_m 0.20  beta_n 0.30 }',
+        'quad { origin -2 0 -2   u 0 0 5   v 5 0 0   material ground }',
+        'light area { origin -0.5 0.8 1.0  u 0 0.45 -0.5  v 1.0 0 0  normal 0 -0.743 -0.669  power 300  spd preset:d65 }',
+        'sphere "b1" { center -0.13 0.13 0.3  radius 0.09  material skin }',
+        'fur "b1_coat" { on "b1"  material red  count 25000  length 0.06  length_jitter 0.3  radius 0.0006  droop 0.4  jitter 0.25  seed 3 }',
+        'sphere "b2" { center 0.13 0.13 0.35  radius 0.09  material skin }',
+        'fur "b2_coat" { on "b2"  material pale  count 25000  length 0.06  length_jitter 0.3  radius 0.0006  droop 0.4  jitter 0.25  seed 4 }',
+    ],
     "fog": [
         'scene { units meters }',
         'camera "c" { eye 0.5 0.4 -1.2  look_at 0.5 0.25 0.6  up 0 1 0  fov_y 36  film { res 160 120 } }',
@@ -83,6 +106,20 @@ SCENES = {
         'light sun { dir 0.5 0.7 -0.4  angle 0.53  spd blackbody 5800  intensity 1e-13 }',
         'light area { origin 0.0 1.2 0.0  u 1.0 0 0  v 0 0 1.0  normal 0 -1 0  power 200  spd preset:d65 }',
         'medium { sigma_t 2.0  albedo 0.85  g 0.5  bounds { min -0.2 0 0.0  max 1.2 0.8 1.2 } }',
+    ],
+    "fogcli": [
+        # The fog scene's geometry with the CLI's `-fog` instead of a medium block (EXTRA): a
+        # medium added after the scene is built, which must still be baked as grey.
+        'scene { units meters }',
+        'camera "c" { eye 0.5 0.4 -1.2  look_at 0.5 0.25 0.6  up 0 1 0  fov_y 36  film { res 160 120 } }',
+        'material "ground" { type diffuse  reflect 0.5 }',
+        'material "red"    { type diffuse  reflect rgb 0.7 0.15 0.1 }',
+        'material "blue"   { type diffuse  reflect rgb 0.1 0.2 0.7 }',
+        'quad { origin -2 0 -2   u 0 0 5   v 5 0 0   material ground }',
+        'sphere { center 0.3 0.15 0.5  radius 0.15  material red }',
+        'sphere { center 0.75 0.15 0.7  radius 0.15  material blue }',
+        'light sun { dir 0.5 0.7 -0.4  angle 0.53  spd blackbody 5800  intensity 1e-13 }',
+        'light area { origin 0.0 1.2 0.0  u 1.0 0 0  v 0 0 1.0  normal 0 -1 0  power 200  spd preset:d65 }',
     ],
     "coatfog": [
         # An iridescent coat -- a high-index film, its reflectance swinging across the band --
@@ -111,8 +148,16 @@ SCENES = {
 }
 
 
+# A tile fails when its bundle mean is off the single-wavelength mean by more than Z_MAX standard
+# errors (a real difference, not noise) AND by more than REL_MAX (one big enough to matter).
+Z_MAX = 5.0
+REL_MAX = 0.01
+
 # The modes each scene runs in: BDPT (mode D) refuses an environment light.
-MODES = {"hair": "R", "hairsun": "RD", "fog": "RD", "coatfog": "R", "rain": "RD"}
+MODES = {"hair": "R", "hairsun": "RD", "hairback": "RD", "fog": "RD", "fogcli": "R", "coatfog": "R",
+         "rain": "RD"}
+# Command-line arguments a scene renders with.
+EXTRA = {"fogcli": ["-fog", "1.5"]}
 
 
 def read_pfm(path):
@@ -125,14 +170,15 @@ def read_pfm(path):
 
 
 def render(exe, scene, out, mode, heroc, seed, spp):
-    png = os.path.join(out, "%s_%s_c%d_s%d.png" % (os.path.splitext(os.path.basename(scene))[0], mode,
-                                                   heroc, seed))
+    png = os.path.join(out, "%s_%s_c%d_s%d_n%d.png" % (os.path.splitext(os.path.basename(scene))[0],
+                                                       mode, heroc, seed, spp))
     pfm = png[:-4] + ".pfm"
     if os.path.exists(pfm) and os.path.getmtime(pfm) > os.path.getmtime(scene) and \
             os.path.getmtime(pfm) > os.path.getmtime(exe):
         return read_pfm(pfm)
     cmd = [exe, "-in", scene, "-mode", mode, "-device", "cpu", "-spp", str(spp), "-heroc", str(heroc),
            "-seed", str(seed), "-hdr", "-no-meter", "-o", png]
+    cmd += EXTRA.get(os.path.splitext(os.path.basename(scene))[0], [])
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0 or not os.path.exists(pfm):
         print(r.stdout[-2000:], r.stderr[-2000:])
@@ -144,6 +190,22 @@ def tiles(img, n=4):
     h, w, _ = img.shape
     return np.array([[img[h * i // n:h * (i + 1) // n, w * j // n:w * (j + 1) // n].mean(axis=(0, 1))
                       for j in range(n)] for i in range(n)])          # n x n x 3
+
+
+def tile_se(a, b, n=4):
+    """Standard error of each tile's luminance in the mean of two seeds, (a + b) / 2: from the
+    per-pixel seed differences, whose variance is twice a pixel's, summed over the tile -- far
+    more degrees of freedom than the one the two tile means give. Pixels are taken as
+    independent, which a light-tracing splat (mode D's t = 1) breaks a little; the caller also
+    keeps the tile-mean estimate and uses the larger."""
+    d2 = ((a - b).sum(-1)) ** 2
+    h, w = d2.shape
+    out = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            blk = d2[h * i // n:h * (i + 1) // n, w * j // n:w * (j + 1) // n]
+            out[i, j] = np.sqrt(blk.sum()) / (2.0 * blk.size)
+    return out
 
 
 def chroma_noise(a, b):
@@ -182,29 +244,38 @@ def main():
             if mode not in a.modes:
                 continue
             r = {(c, sd): render(a.exe, scene, out, mode, c, sd, a.spp) for c in (1, 4) for sd in (1, 2)}
-            t1 = (tiles(r[(1, 1)]) + tiles(r[(1, 2)])) / 2
-            t4 = (tiles(r[(4, 1)]) + tiles(r[(4, 2)])) / 2
-            # standard error of each mean from its seed pair; the difference of the two means
-            se = np.sqrt(((tiles(r[(1, 1)]) - tiles(r[(1, 2)])) / 2) ** 2 +
-                         ((tiles(r[(4, 1)]) - tiles(r[(4, 2)])) / 2) ** 2)
-            lum1 = t1.sum(-1); lum4 = t4.sum(-1); selum = np.sqrt((se ** 2).sum(-1))
+            lum1 = ((tiles(r[(1, 1)]) + tiles(r[(1, 2)])) / 2).sum(-1)
+            lum4 = ((tiles(r[(4, 1)]) + tiles(r[(4, 2)])) / 2).sum(-1)
+            # The standard error of lum4 - lum1, two ways, and the larger kept: from each seed
+            # pair's tile means (one degree of freedom: can come out small by luck) and from
+            # their pixels (many, but blind to correlation between pixels).
+            se_pair = np.sqrt(((tiles(r[(1, 1)]) - tiles(r[(1, 2)])).sum(-1) / 2) ** 2 +
+                              ((tiles(r[(4, 1)]) - tiles(r[(4, 2)])).sum(-1) / 2) ** 2)
+            se_pix = np.sqrt(tile_se(r[(1, 1)], r[(1, 2)]) ** 2 + tile_se(r[(4, 1)], r[(4, 2)]) ** 2)
+            selum = np.maximum(se_pair, se_pix)
             floor = 0.02 * lum1.max()                      # tiles this dark carry no information
             bad = []
+            worst = (0.0, 1.0)
             for i in range(lum1.shape[0]):
                 for j in range(lum1.shape[1]):
                     if lum1[i, j] < floor:
                         continue
                     ratio = lum4[i, j] / lum1[i, j]
                     z = abs(lum4[i, j] - lum1[i, j]) / max(selum[i, j], 1e-30)
-                    if z > 4.0 and abs(ratio - 1.0) > 0.03:
+                    if z > worst[0]:
+                        worst = (z, ratio)
+                    if z > Z_MAX and abs(ratio - 1.0) > REL_MAX:
                         bad.append("tile (%d,%d): x%.3f, %.1f sigma" % (i, j, ratio, z))
             whole = lum4.sum() / lum1.sum()
             cn1 = chroma_noise(r[(1, 1)], r[(1, 2)]); cn4 = chroma_noise(r[(4, 1)], r[(4, 2)])
+            if np.array_equal(r[(1, 1)], r[(4, 1)]):
+                bad.append("-heroc 4 rendered bit-identically to -heroc 1: the bundle is off")
             good = not bad
             ok &= good
-            print("%s: %s mode %s  whole frame x%.4f; chroma noise %.3f -> %.3f (x%.2f)%s" % (
-                "ok" if good else "FAIL", name, mode, whole, cn1, cn4, cn1 / max(cn4, 1e-30),
-                ("" if good else "; " + "; ".join(bad))), flush=True)
+            print("%s: %s mode %s  whole frame x%.4f; worst tile %.1f sigma (x%.3f); chroma noise "
+                  "%.3f -> %.3f (x%.2f)%s" % (
+                      "ok" if good else "FAIL", name, mode, whole, worst[0], worst[1], cn1, cn4,
+                      cn1 / max(cn4, 1e-30), ("" if good else "; " + "; ".join(bad))), flush=True)
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

@@ -7215,6 +7215,36 @@ static int checkHair() {
                     worstDeltaPaper, worstDeltaFixed, worstSigma);
     }
 
+    // --- S12 the per-lobe fold reproduces f() and pdf() ------------------------
+    // fFromLobes / pdfFromLobes re-evaluate a solid fiber at another absorption and cuticle
+    // tint from the angular products f() fills (mode M's spectral fold, mode R's bundle at a
+    // fiber). At the fiber's OWN absorption and tint they must give f() and pdf() back, coverage
+    // aside -- for a tinted cuticle too, which is what the Fresnel term LobeAngular carries has
+    // to be UNtinted for: the tint enters R once and TT/TRT not at all.
+    {
+        double worstF = 0.0, worstP = 0.0;
+        for (double specR : {1.0, 0.6, 0.0})
+        for (double sigA : {0.0, 0.4, 2.5})
+        for (int t = 0; t < 300; ++t) {
+            hair::Params pr;
+            pr.specR = specR; pr.opacity = 0.7;
+            pr.betaM = 0.1 + 0.6 * frand(); pr.betaN = 0.1 + 0.6 * frand();
+            const hair::Bcsdf b = hair::make(pr, 2.0 * frand() - 1.0, sigA);
+            const Vec3 wo = sphereDir(frand(), frand()), wi = sphereDir(frand(), frand());
+            hair::LobeAngular la;
+            const double fv = hair::f(b, wo, wi, &la), pv = hair::pdf(b, wo, wi);
+            if (!want("S12 a solid fiber's LobeAngular is not valid", la.valid)) break;
+            const double fl = b.opacity * hair::fFromLobes(la, sigA, specR);
+            const double pl = b.opacity * hair::pdfFromLobes(la, sigA, specR);
+            worstF = std::max(worstF, std::fabs(fv - fl) / std::max(fv, 1e-12));
+            worstP = std::max(worstP, std::fabs(pv - pl) / std::max(pv, 1e-12));
+        }
+        std::printf("[checkhair] S12 the lobe fold vs f() / pdf(), worst relative gap = %.3g / "
+                    "%.3g\n", worstF, worstP);
+        ok &= chk("S12 fFromLobes does not reproduce f()", worstF, 0.0, 1e-12);
+        ok &= chk("S12 pdfFromLobes does not reproduce pdf()", worstP, 0.0, 1e-12);
+    }
+
     std::printf("[checkhair] worst absolute error (exact checks) = %.3g\n", worst);
     std::printf("[checkhair] %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
@@ -15589,17 +15619,27 @@ static const char* vcmUnsupportedFeature(const Scene& scene, const Camera& cam) 
 enum class OnUnsupported { Error, Fallback, Strip };
 static OnUnsupported g_onUnsupported = OnUnsupported::Error;
 
+// WHAT EACH MODE RENDERS, for the features not every mode does. The refusal, the fallback, the
+// strip and the error message all read these, so they cannot disagree about it.
+//
 // VOLUMETRIC EMISSION ("fire": a medium with a `temperature` field) is born only by the forward
-// tracer (render.h's volume births), so only the forward-measuring modes see it. Every other
-// estimator would render the scene as if the fire were cold smoke (known-issues
-// EMISSIVE-VOLUME-SILENT), so they refuse it below, and the fallback goes to mode B.
+// tracer (render.h's volume births), so only the forward modes see it; any other estimator would
+// render the fire as cold smoke (known-issues EMISSIVE-VOLUME-SILENT). Mode P is not one of them:
+// its composite fits the forward layer's scale against a mode-R film and fills the specular-first
+// pixels from R, which does not see the fire.
 static bool sceneHasEmissiveMedium(const Scene& scene) {
     for (const Medium& m : scene.media) if (m.emissive()) return true;
     return false;
 }
 static bool modeRendersVolumeEmission(char mode) {
-    return mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P';
+    return mode == 'A' || mode == 'B' || mode == 'C';
 }
+// GRIN media: BDPT and the modes built on its transport (D, J, U) refuse them.
+static bool modeRendersGrin(char mode) { return mode != 'D' && mode != 'J' && mode != 'U'; }
+// A physical multi-element lens forms its image in R (traced backward) and in D and J (kept on
+// the camera subpath, Plan B). The run loop routes every other mode to one of those
+// (lensRoutedMode).
+static bool modeFormsLensImage(char mode) { return mode == 'R' || mode == 'D' || mode == 'J'; }
 
 // Core capability check: return a reason string if `mode` cannot render `scene` with a
 // camera of the given `projection`, else nullptr. Volumetric emission restricts every mode
@@ -15608,7 +15648,7 @@ static bool modeRendersVolumeEmission(char mode) {
 static const char* modeFeatureUnsupported(const Scene& scene, char mode, int projection) {
     if (!modeRendersVolumeEmission(mode) && sceneHasEmissiveMedium(scene))
         return "volumetric emission (a medium with a `temperature` field, which only the "
-               "forward modes A/B/C/P render)";
+               "forward modes A/B/C render)";
     // Mode J (UPBP) is mode D's transport plus beam merging, so it inherits D's scope
     // EXACTLY — same connections, same MIS densities, same refusals. The beam half adds
     // no capability of its own: a beam map is built by the same forward photon pass mode M
@@ -15649,54 +15689,112 @@ static const char* sceneModeUnsupported(const ftsl::Loaded& L, char cliMode) {
     return nullptr;
 }
 
-// Best-effort feature stripping for `-on-unsupported strip`. Two features are strippable:
-// GRIN (clear the index field -> the medium is treated as homogeneous/clear) and volumetric
-// emission (drop the temperature field -> the fire renders as the cold smoke it would have
-// been anyway, now on purpose). Mutates `scene` only if that fully resolves the conflict;
-// otherwise restores it and returns false (so the caller falls back to a supported mode
-// instead). Returns true iff the scene now renders in `mode`.
-static bool stripUnsupportedFeature(Scene& scene, char mode, int projection) {
+// The mode a camera with a physical lens renders in: D and J keep the lens on their camera
+// subpath (Plan B); P, whose forward pass splats to a pinhole, goes to that lens-aware BDPT when
+// the scene is within its scope and to R otherwise; everything else goes to R.
+static char lensRoutedMode(const Scene& scene, char mode) {
+    if (modeFormsLensImage(mode)) return mode;
+    if (mode == 'P') return bdptUnsupportedFeature(scene) ? 'R' : 'D';
+    return 'R';
+}
+
+// The -on-unsupported fallback: the first of R (the backward reference, which renders all that
+// BDPT and VCM refuse) and B (the forward tracer, which renders a fire) that renders everything
+// the camera needs, a lens included. 0 when neither does -- a fire seen through a physical lens.
+static char fallbackModeFor(const Scene& scene, int projection, bool lens) {
+    for (char m : {'R', 'B'})
+        if ((!lens || modeFormsLensImage(m)) && !modeFeatureUnsupported(scene, m, projection))
+            return m;
+    return 0;
+}
+
+// Every mode that renders what the camera needs, "A/B/C" style, for the refusal's advice.
+static std::string modesThatRender(const Scene& scene, int projection, bool lens) {
+    std::string s;
+    for (char m : std::string("ABCPRDJUMSV"))
+        if ((!lens || modeFormsLensImage(m)) && !modeFeatureUnsupported(scene, m, projection)) {
+            if (!s.empty()) s += '/';
+            s += m;
+        }
+    return s;
+}
+
+// The mode a camera ends up rendering in, for code that must agree with the run loop without
+// re-running its policy (the exposure meter): lens routing, then the fallback if the mode still
+// cannot render the scene. Called after the run loop applied the policy, so a strip has already
+// happened and the mode it kept now renders the scene.
+static char renderedMode(const Scene& scene, char mode, int projection, bool lens) {
+    if (lens) mode = lensRoutedMode(scene, mode);
+    if (!modeFeatureUnsupported(scene, mode, projection)) return mode;
+    const char f = fallbackModeFor(scene, projection, lens);
+    return f ? f : mode;
+}
+
+// Best-effort feature stripping for `-on-unsupported strip`. Two features are strippable: GRIN
+// (clear the index field: the medium renders as a plain one) and volumetric emission (drop the
+// temperature field: the fire renders as the cold smoke it is made of). Only what `mode` cannot
+// render is stripped, and only if no camera in the run renders it -- the scene is shared by all
+// of them (`keepFire`, `keepGrin`). Mutates `scene` only if that resolves the conflict; otherwise
+// restores it and returns false, and the caller falls back instead.
+static bool stripUnsupportedFeature(Scene& scene, char mode, int projection,
+                                    bool keepFire, bool keepGrin) {
     if (modeFeatureUnsupported(scene, mode, projection) == nullptr) return true;
     std::vector<Medium> saved = scene.media;
-    bool any = false;
-    for (auto& m : scene.media) if (m.grin()) { m.ior.clear(); m.iorStep = 0.0; any = true; }
-    if (!modeRendersVolumeEmission(mode))
-        for (auto& m : scene.media) if (m.emissive()) { m.temperature.reset(); any = true; }
-    if (any && modeFeatureUnsupported(scene, mode, projection) == nullptr) return true;
+    bool any = false, fire = false;
+    if (!modeRendersGrin(mode) && !keepGrin)
+        for (auto& m : scene.media) if (m.grin()) { m.ior.clear(); m.iorStep = 0.0; any = true; }
+    if (!modeRendersVolumeEmission(mode) && !keepFire)
+        for (auto& m : scene.media) if (m.emissive()) { m.temperature.reset(); any = fire = true; }
+    if (any && modeFeatureUnsupported(scene, mode, projection) == nullptr) {
+        if (fire) scene.finalizeEmissiveVolumes();   // no photon births from a fire now gone
+        return true;
+    }
     scene.media = saved;   // couldn't fully strip -> leave the scene intact
     return false;
 }
 
-// Apply the `-on-unsupported` policy for one camera. Returns the (possibly changed) mode;
-// may mutate `scene` (strip). `proceed` is set false only when Error policy should abort
-// this camera's render. Prints a notice describing what happened.
-static char applyUnsupportedPolicy(Scene& scene, char mode, int projection,
-                                   const char* camName, bool& proceed) {
+// Apply the `-on-unsupported` policy for one camera. Returns the (possibly changed) mode; may
+// mutate `scene` (strip). `lens`: the camera has a physical lens (its mode is already routed by
+// lensRoutedMode). `keepFire` / `keepGrin`: some camera of the run renders that feature, so a
+// strip must not remove it. `proceed` is set false when the camera must not render: the Error
+// policy, or no mode renders what it needs. Prints a notice describing what happened.
+static char applyUnsupportedPolicy(Scene& scene, char mode, int projection, bool lens,
+                                   bool keepFire, bool keepGrin, const char* camName,
+                                   bool& proceed) {
     proceed = true;
     const char* why = modeFeatureUnsupported(scene, mode, projection);
     if (!why) return mode;
-    // The fallback: the backward reference (R) renders every feature BDPT/VCM refuse (GRIN,
-    // media, fisheye, fluorescence, ...) -- except volumetric emission, which only a forward
-    // mode sees, so a fire goes to mode B.
-    const bool fire = sceneHasEmissiveMedium(scene) && !modeRendersVolumeEmission(mode);
-    const char fallback = fire ? 'B' : 'R';
-    if (g_onUnsupported == OnUnsupported::Error) {
-        std::fprintf(stderr, "[mode %c] camera '%s' uses %s, which that mode can't render; "
-                             "use mode %s, add a prefer{}/else{} fallback, or pass "
-                             "-on-unsupported fallback|strip.\n", mode, camName, why,
-                     fire ? "A/B/C/P" : "A/B/C/R");
-        proceed = false;
-        return mode;
-    }
+    const std::string ok = modesThatRender(scene, projection, lens);
     if (g_onUnsupported == OnUnsupported::Strip &&
-        stripUnsupportedFeature(scene, mode, projection)) {
+        stripUnsupportedFeature(scene, mode, projection, keepFire, keepGrin)) {
         std::printf("[on-unsupported=strip] camera '%s': stripped %s; rendering in mode %c "
                     "anyway.\n", camName, why, mode);
         return mode;
     }
-    std::printf("[on-unsupported=fallback] camera '%s': %s unsupported in mode %c -> mode %c "
-                "(%s).\n", camName, why, mode, fallback,
-                fire ? "forward light tracer" : "backward reference");
+    const char fallback = fallbackModeFor(scene, projection, lens);
+    if (g_onUnsupported == OnUnsupported::Error || !fallback) {
+        if (ok.empty())
+            std::fprintf(stderr, "[mode %c] camera '%s' uses %s, and no mode renders that "
+                                 "through a physical lens; drop the lens%s.\n", mode, camName,
+                         why, g_onUnsupported == OnUnsupported::Strip
+                                  ? " (strip could not remove it: another camera renders it)"
+                                  : ", or pass -on-unsupported strip");
+        else
+            std::fprintf(stderr, "[mode %c] camera '%s' uses %s, which that mode can't render; "
+                                 "use mode %s, add a prefer{}/else{} fallback, or pass "
+                                 "-on-unsupported fallback|strip.\n", mode, camName, why,
+                         ok.c_str());
+        proceed = false;
+        return mode;
+    }
+    const char* kind = fallback == 'B' ? "forward light tracer" : "backward reference";
+    if (g_onUnsupported == OnUnsupported::Strip)
+        std::printf("[on-unsupported=strip] camera '%s': cannot strip %s for mode %c (another "
+                    "camera renders it, or the mode lacks more than a strip removes) -> mode %c "
+                    "(%s).\n", camName, why, mode, fallback, kind);
+    else
+        std::printf("[on-unsupported=fallback] camera '%s': %s unsupported in mode %c -> mode %c "
+                    "(%s).\n", camName, why, mode, fallback, kind);
     return fallback;
 }
 
@@ -20222,6 +20320,7 @@ static int run(int argc, char** argv) {
             fog.sigma_s = constantSpectrum(ss);
             fog.sigma_a = constantSpectrum(sa);
         }
+        fog.bakeAchromatic();             // build() has already run
         scene.media.push_back(std::move(fog));
     }
 
@@ -20822,6 +20921,14 @@ static int run(int argc, char** argv) {
         } else {
             for (const auto& cs : ftslScene.cameras) sel.push_back(&cs);
         }
+        // Which strippable features some camera of this run renders: a strip for one camera
+        // must not take them from another, since every camera renders the same Scene.
+        bool keepFire = false, keepGrin = false;
+        for (const ftsl::CamSpec* cs : sel) {
+            const char m = cs->lens ? lensRoutedMode(scene, effMode(cs->mode)) : effMode(cs->mode);
+            keepFire |= modeRendersVolumeEmission(m);
+            keepGrin |= modeRendersGrin(m);
+        }
         for (const ftsl::CamSpec* cs : sel) {
             int cresX = resFromCli ? res : (cs->res  > 0 ? cs->res  : res);
             int cresY = resFromCli ? (resYCli > 0 ? resYCli : res)
@@ -20847,39 +20954,31 @@ static int run(int argc, char** argv) {
                 c.lens = cs->lens;
                 double flmm = cs->lens->focalLengthMM();
                 double fw = cs->lens->filmW_mm, fh = cs->lens->filmH_mm;
+                const char routed = lensRoutedMode(scene, cmode);
                 if (cmode == 'D' || cmode == 'J') {
                     std::printf("[camera] '%s' has a physical lens -> mode %c (%s) with "
                                 "the lens on the camera subpath (Plan B; light-image splat "
                                 "disabled); f=%.1fmm, sensor %.1fx%.1fmm\n",
                                 cs->name.c_str(), cmode, cmode == 'J' ? "UPBP" : "BDPT",
                                 flmm, fw, fh);
+                } else if (cmode == 'P' && routed == 'R') {
+                    std::printf("[camera] '%s' has a physical lens -> mode P falls back "
+                                "to mode R (backward realistic camera): the composite "
+                                "can't route its pinhole splat through the lens, and the "
+                                "scene uses %s (outside lens-aware BDPT scope); "
+                                "f=%.1fmm, sensor %.1fx%.1fmm\n",
+                                cs->name.c_str(), bdptUnsupportedFeature(scene), flmm, fw, fh);
                 } else if (cmode == 'P') {
-                    // The composite's forward pass splats to a pinhole and can't be
-                    // pushed through the lens, so route to the lens-aware BDPT (mode D)
-                    // when the scene is within BDPT scope; otherwise (fog/fluorescence/
-                    // spot-env/layered) fall back to the backward realistic camera (R),
-                    // which supports those — matching the pre-Plan-B behavior.
-                    if (const char* why = bdptUnsupportedFeature(scene)) {
-                        std::printf("[camera] '%s' has a physical lens -> mode P falls back "
-                                    "to mode R (backward realistic camera): the composite "
-                                    "can't route its pinhole splat through the lens, and the "
-                                    "scene uses %s (outside lens-aware BDPT scope); "
-                                    "f=%.1fmm, sensor %.1fx%.1fmm\n",
-                                    cs->name.c_str(), why, flmm, fw, fh);
-                        cmode = 'R';
-                    } else {
-                        std::printf("[camera] '%s' has a physical lens -> mode P routes to "
-                                    "the lens-aware BDPT (mode D): the composite's pinhole-"
-                                    "splat forward pass can't form the lens image; f=%.1fmm, "
-                                    "sensor %.1fx%.1fmm\n", cs->name.c_str(), flmm, fw, fh);
-                        cmode = 'D';
-                    }
+                    std::printf("[camera] '%s' has a physical lens -> mode P routes to "
+                                "the lens-aware BDPT (mode D): the composite's pinhole-"
+                                "splat forward pass can't form the lens image; f=%.1fmm, "
+                                "sensor %.1fx%.1fmm\n", cs->name.c_str(), flmm, fw, fh);
                 } else if (cmode != 'R') {
                     std::printf("[camera] '%s' has a physical lens -> rendering in mode R "
                                 "(backward realistic camera); f=%.1fmm, sensor %.1fx%.1fmm\n",
                                 cs->name.c_str(), flmm, fw, fh);
-                    cmode = 'R';
                 }
+                cmode = routed;
             }
             // Exposure-lock group: a global -exposure-lock forces one shared anchor
             // (group 0) across every camera; otherwise a per-path `exposure_lock`
@@ -20908,11 +21007,12 @@ static int run(int argc, char** argv) {
             }
             // Unsupported-feature policy (-on-unsupported): if this camera's mode still
             // can't render the scene (e.g. GRIN media in mode D and no prefer{}/else{}
-            // branch selected one), apply the policy — error (abort), fall back to mode R,
-            // or strip the offending feature and render anyway.
+            // branch selected one), apply the policy — error (abort), fall back to a mode
+            // that renders it, or strip the offending feature and render anyway.
             {
                 bool proceed = true;
-                cmode = applyUnsupportedPolicy(scene, cmode, cs->projection, cs->name.c_str(), proceed);
+                cmode = applyUnsupportedPolicy(scene, cmode, cs->projection, cs->lens != nullptr,
+                                               keepFire, keepGrin, cs->name.c_str(), proceed);
                 if (!proceed) return 1;
             }
             toRender.push_back({cs->name, c, cmode, cresX, cresY, cexp, eg, cs->look, cs->up, cs->fov,
@@ -21262,12 +21362,10 @@ static int run(int argc, char** argv) {
             m.cam.apertureR = cs.aperture;
             if (cs.filmDist_m > 0.0) { m.cam.filmDist = cs.filmDist_m; m.cam.lensF = cs.lensF_m; }
             else                     { m.cam.setFocus(cs.focus); }
-            m.mode = effMode(cs.mode);
-            // Mode J's camera subpath IS mode D's, lens included (Plan B), so it keeps the lens.
-            if (cs.lens) {
-                m.cam.lens = cs.lens;
-                if (m.mode != 'D' && m.mode != 'J' && m.mode != 'P') m.mode = 'R';
-            }
+            // The mode the render itself uses: lens routing and the -on-unsupported fallback
+            // (a fire metered in a fire-blind mode would anchor a different picture).
+            m.mode = renderedMode(scene, effMode(cs.mode), cs.projection, cs.lens != nullptr);
+            if (cs.lens) m.cam.lens = cs.lens;
             m.name = cs.name;
             return m;
         };
@@ -23949,10 +24047,7 @@ static int run(int argc, char** argv) {
         // Reduced budgets: enough coverage for a clean p99 without paying for a full render.
         const long long meterN   = std::clamp((long long)W * H * 40LL, 500000LL, 4000000LL);
         const long long meterSpp = 16;
-        char mode = mc.mode;
-        // A scene outside BDPT's transport scope can't meter in mode D (the real render
-        // will itself refuse it later, loudly) — meter it with the general forward pass.
-        if ((mode == 'D' || mode == 'J') && bdptUnsupportedFeature(scene)) mode = 'B';
+        const char mode = mc.mode;      // already the rendered mode (renderedMode)
         Film mf; double eAuto = 0.0;
         switch (mode) {
             case 'A': case 'B': case 'C': {
@@ -24074,7 +24169,11 @@ static int run(int argc, char** argv) {
                 break;
             }
         }
-        return eAuto;
+        // A frame nothing reached is no anchor. filmToRgb8 reports its no-signal fallback, 1,
+        // which MeterConverge would average in as a reading; 0 is what it skips, so a black
+        // meter ends in the "no valid anchor" notice instead of a silent lock at 1.
+        for (const Vec3& c : mf.xyz) if (c.y > 0.0) return eAuto;
+        return 0.0;
     };
     // The RENDER's photon budget, named before the loop shadows `N` with the camera count —
     // the GPU meter's beam budget scales against it (see meterBeamTarget below).

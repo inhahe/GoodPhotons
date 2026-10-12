@@ -1094,8 +1094,9 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 // walk stops at one instead (below).
                 const HairShade hs = hairAt(scene, *mp, h, lambda, wo);
                 double pdfH = 0.0, fv = 0.0;
+                hair::LobeAngular la;                // the angular half of fv, for the secondaries
                 const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
-                                             rng.uniform(), rng.uniform(), pdfH, fv);
+                                             rng.uniform(), rng.uniform(), pdfH, fv, &la);
                 if (!(pdfH > 0.0) || !(fv > 0.0)) { terminate = true; break; }
                 wi = hair::toWorld(hs.fr, wl);
                 // A coverage pass-through returns EXACTLY -wo: the ray was never intercepted.
@@ -1129,10 +1130,10 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
                 betaFactor = clamp01(fv * cosLong / pdfH);
                 // Per-λ absorption means each secondary gets its OWN fiber evaluated along
-                // the hero's sampled direction: f_i*cos/pdf_hero. Unlike the unidirectional
-                // tracers (which de-hero at a strand), the bundle survives a fiber here —
-                // and a fiber is precisely where the spectral spread is interesting, since
-                // sigma_a is what colours the TT/TRT lobes.
+                // the hero's sampled direction: f_i*cos/pdf_hero, from the hero's lobes for one
+                // exp each (hair::fFromLobes) unless a medulla needs the full BCSDF. The bundle
+                // survives a fiber here, as in mode R -- and a fiber is precisely where the
+                // spectral spread is interesting, since sigma_a is what colours the TT/TRT lobes.
                 secChromatic = true;
                 for (int i = 0; i + 1 < nUp; ++i) {
                     // A pass-through is ACHROMATIC -- the ray missed the fiber, so every
@@ -1140,8 +1141,13 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                     // return the coverage-scaled scatter value (0 at `opacity 0`) and
                     // extinguish the bundle at a fiber it never touched.
                     if (passThru) { secF[i] = 1.0; continue; }
-                    const HairShade hsi = hairAt(scene, *mp, h, hb.lam[i + 1], wo);
-                    secF[i] = hairFCos(hsi, wi) / pdfH;
+                    const double li = hb.lam[i + 1];
+                    if (la.valid)
+                        secF[i] = hs.b.opacity * hair::fFromLobes(la, hairSigmaAAt(scene, *mp, h, li),
+                                                                  hairSpecularAt(scene, *mp, h, li)) *
+                                  cosLong / pdfH;
+                    else
+                        secF[i] = hairFCos(hairAt(scene, *mp, h, li, wo), wi) / pdfH;
                 }
                 break;
             }

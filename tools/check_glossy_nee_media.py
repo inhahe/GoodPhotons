@@ -1,19 +1,27 @@
-"""Regression check: a glossy bounce's MIS state does not leak past a medium scatter (mode R).
+"""Regression check: a glossy bounce's MIS record lasts exactly as long as it should (mode R).
 
     D:/python314/python.exe -u tools/check_glossy_nee_media.py [--out <dir>] [--exe ftrace.exe]
-                                                               [--spp N]
+                                                               [--spp N] [--device cpu|gpu] [--mode R|M]
+                                                               [--only name,...]
 
 Glossy NEE (on by default; `-no-glossy-nee` turns it off) connects a glossy vertex to the lights
 and records the lobe's density, so that the next vertex can weigh a light the continuation hits
-against that connection. The record is cleared by the next material interaction -- but a medium
-scatter (and an aggregate-fur collision) is a vertex the material code never sees, and before
-0.375.0 it left the record standing: a path glossy -> fog scatter -> sky had its sky escape
-weighted by the GLOSSY lobe's density instead of the phase function's, which the fog vertex's own
-sky NEE had used. Both estimators are unbiased, so the image must not depend on the flag.
-
-A glossy floor under a grey fog, lit by the sky alone, rendered in mode R with glossy NEE on and
-off, two seeds each, at one wavelength per path (-heroc 1) and with the bundle (-heroc 4). The
-frame means must agree within 4 standard errors and 1 %. Exits 1 on any failure.
+against that connection. Both estimators are unbiased, so the image must not depend on the flag
+-- which holds only if the record is cleared at the next real vertex and kept across a vertex
+that is not one. Scenes, each a way to get that wrong:
+  fog   -- glossy floor -> fog scatter -> sky: a medium scatter is a vertex the material code never
+           sees, so it must clear the record itself (else the sky escape is weighted by the floor's
+           lobe instead of the phase function the fog vertex's own sky NEE used: too bright).
+  coat  -- glossy floor -> clearcoat sheen -> area light: the sheen does no NEE of its own and
+           skips the material code too, so it must clear the record (else too dark).
+  fiber -- glossy floor -> straight through see-through fur -> area light: a coverage pass-through
+           is no vertex at all, so it must KEEP the record (the floor's NEE already counted the
+           light through the fur's transmittance; else too bright).
+Each is rendered in mode R (or `--mode M`, whose camera walks keep the same record) with glossy NEE
+on and off, two seeds each, at one wavelength per path (-heroc 1) and with the bundle (-heroc 4),
+and compared tile by tile: the paths at fault light only part of the frame. A tile fails when the
+two differ by more than 5 standard errors (from the seed pairs, tile- and pixel-wise, the larger
+kept) AND by more than 1 %. Exits 1 on any failure.
 """
 import argparse
 import os
@@ -24,16 +32,45 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
-SCENE = [
-    'scene { units meters }',
-    'camera "c" { eye 0 0.6 -2.0  look_at 0 0.1 0.6  up 0 1 0  fov_y 45  film { res 96 64 } }',
-    'material "floor" { type glossy  reflect 0.9  roughness 0.15 }',
-    'material "wall"  { type diffuse  reflect 0.5 }',
-    'quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material floor }',
-    'quad { origin -3 0 2.5  u 6 0 0   v 0 3 0   material wall }',
-    'light env { spd 1.0 }',
-    'medium { sigma_t 0.9  albedo 0.95  g 0.3  bounds { min -3 0 -3  max 3 1.2 2.5 } }',
-]
+SCENES = {
+    "fog": [
+        'scene { units meters }',
+        'camera "c" { eye 0 0.6 -2.0  look_at 0 0.1 0.6  up 0 1 0  fov_y 45  film { res 96 64 } }',
+        'material "floor" { type glossy  reflect 0.9  roughness 0.15 }',
+        'material "wall"  { type diffuse  reflect 0.5 }',
+        'quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material floor }',
+        'quad { origin -3 0 2.5  u 6 0 0   v 0 3 0   material wall }',
+        'light env { spd 1.0 }',
+        'medium { sigma_t 0.9  albedo 0.95  g 0.3  bounds { min -3 0 -3  max 3 1.2 2.5 } }',
+    ],
+    "coat": [
+        # The floor seen at a grazing angle mirrors the sphere's upper front, where the coat's
+        # normal leans 45 degrees up and turns that near-horizontal ray straight up into a light
+        # overhead. From the floor that light is a small target, so its light-sampling density is
+        # well above the lobe's, and a stale floor weight darkens the reflected sheen.
+        'scene { units meters }',
+        'camera "c" { eye 0 0.25 -2.5  look_at 0 0.15 0.6  up 0 1 0  fov_y 30  film { res 96 64 } }',
+        'material "floor" { type glossy  reflect 0.9  roughness 0.2 }',
+        'material "paint" { type diffuse  reflect 0.05 }',
+        'material "clear" { type layered  ior 2.5  coat { roughness 0.05 }  layer "paint" 1.0 }',
+        'quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material floor }',
+        'sphere { center 0 0.35 1.0  radius 0.35  material clear }',
+        'light area { origin -0.4 2.0 0.6  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  power 200  spd preset:d65 }',
+    ],
+    "fiber": [
+        # The floor at the frame centre mirrors into an area light tilted to face it, through a
+        # ball of see-through fur sitting on that mirror ray; light out of frame.
+        'scene { units meters }',
+        'camera "c" { eye 0 1.0 -2.0  look_at 0 0 0  up 0 1 0  fov_y 36  film { res 96 64 } }',
+        'material "floor" { type glossy  reflect 0.9  roughness 0.35 }',
+        'material "core"  { type diffuse  reflect 0.3 }',
+        'material "fur"   { type hair  reflect rgb 0.8 0.6 0.4  beta_m 0.3  beta_n 0.3  opacity 0.3 }',
+        'quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material floor }',
+        'sphere "ball" { center 0 0.5 1.0  radius 0.06  material core }',
+        'fur "coat" { on "ball"  material fur  count 20000  length 0.18  length_jitter 0.3  radius 0.001  droop 0.2  jitter 0.25  seed 5 }',
+        'light area { origin -0.5 1.468 2.266  u 1.0 0 0  v 0 -0.536 0.268  normal 0 -0.447 -0.894  power 300  spd preset:d65 }',
+    ],
+}
 
 
 def read_pfm(path):
@@ -45,41 +82,75 @@ def read_pfm(path):
     return data.astype(np.float64)
 
 
+def tile_stats(a, b, n=4):
+    """Per-tile mean of (a + b) / 2 and its standard error, the larger of two estimates: from
+    the two tile means (one degree of freedom) and from the per-pixel seed differences (many,
+    blind to correlation between pixels)."""
+    h, w = a.shape
+    m = np.zeros((n, n)); e = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            ta = a[h * i // n:h * (i + 1) // n, w * j // n:w * (j + 1) // n]
+            tb = b[h * i // n:h * (i + 1) // n, w * j // n:w * (j + 1) // n]
+            d = ta - tb
+            m[i, j] = (ta.mean() + tb.mean()) / 2
+            e[i, j] = max(abs(ta.mean() - tb.mean()) / 2, np.sqrt((d * d).sum()) / (2.0 * d.size))
+    return m, e
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split(NL)[0])
     ap.add_argument("--out", default=os.path.join(ROOT, "png", "check_glossy_nee_media"))
     ap.add_argument("--exe", default=os.path.join(ROOT, "ftrace.exe"))
+    ap.add_argument("--device", default="cpu", choices=("cpu", "gpu"))
+    ap.add_argument("--mode", default="R", choices=("R", "M"),
+                    help="mode M's camera walks keep the same record (and a photon map)")
     ap.add_argument("--spp", type=int, default=512)
+    ap.add_argument("--only", default="")
     a = ap.parse_args()
     a.exe = os.path.abspath(a.exe)
     out = os.path.abspath(a.out)
     os.makedirs(out, exist_ok=True)
-    scene = os.path.join(out, "s.ftsl")
-    with open(scene, "w", encoding="utf-8", newline="") as f:
-        f.write(NL.join(SCENE) + NL)
     ok = True
-    for heroc in (1, 4):
-        means = {}
-        for flag in ("on", "off"):
-            vals = []
-            for seed in (1, 2):
-                png = os.path.join(out, "c%d_%s_s%d.png" % (heroc, flag, seed))
-                cmd = [a.exe, "-in", scene, "-mode", "R", "-device", "cpu", "-spp", str(a.spp),
-                       "-heroc", str(heroc), "-seed", str(seed), "-hdr", "-no-meter", "-o", png]
-                if flag == "off":
-                    cmd.append("-no-glossy-nee")
-                r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-                pfm = png[:-4] + ".pfm"
-                if r.returncode != 0 or not os.path.exists(pfm):
-                    print(r.stdout[-1500:], r.stderr[-1500:]); raise SystemExit("render failed")
-                vals.append(read_pfm(pfm).mean())
-            means[flag] = (np.mean(vals), abs(vals[0] - vals[1]) / 2)
-        (m1, e1), (m0, e0) = means["on"], means["off"]
-        z = abs(m1 - m0) / max(np.hypot(e1, e0), 1e-30)
-        ratio = m1 / m0
-        good = not (z > 4.0 and abs(ratio - 1.0) > 0.01)
-        ok &= good
-        print("%s: heroc %d: glossy NEE on / off = x%.4f (%.1f sigma)" % ("ok" if good else "FAIL", heroc, ratio, z))
+    for name in SCENES:
+        if a.only and name not in a.only.split(","):
+            continue
+        scene = os.path.join(out, name + ".ftsl")
+        with open(scene, "w", encoding="utf-8", newline="") as f:
+            f.write(NL.join(SCENES[name]) + NL)
+        for heroc in (1, 4):
+            stats = {}
+            for flag in ("on", "off"):
+                imgs = []
+                for seed in (1, 2):
+                    png = os.path.join(out, "%s_%s_c%d_%s_s%d_n%d.png" % (name, a.mode, heroc, flag, seed,
+                                                                          a.spp))
+                    cmd = [a.exe, "-in", scene, "-mode", a.mode, "-device", a.device, "-spp", str(a.spp),
+                           "-heroc", str(heroc), "-seed", str(seed), "-hdr", "-no-meter", "-o", png]
+                    if flag == "off":
+                        cmd.append("-no-glossy-nee")
+                    if a.mode == "M":
+                        cmd += ["-n", "5000000"]
+                    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                                       errors="replace")
+                    pfm = png[:-4] + ".pfm"
+                    if r.returncode != 0 or not os.path.exists(pfm):
+                        print(r.stdout[-1500:], r.stderr[-1500:])
+                        raise SystemExit("render failed: " + " ".join(cmd))
+                    imgs.append(read_pfm(pfm).sum(-1))
+                stats[flag] = tile_stats(imgs[0], imgs[1])
+            (m1, e1), (m0, e0) = stats["on"], stats["off"]
+            z = np.abs(m1 - m0) / np.maximum(np.hypot(e1, e0), 1e-30)
+            ratio = m1 / np.maximum(m0, 1e-30)
+            live = m0 > 0.02 * m0.max()          # tiles this dark carry no information
+            bad = live & (z > 5.0) & (np.abs(ratio - 1.0) > 0.01)
+            good = not bad.any()
+            ok &= good
+            zl = np.where(live, z, 0.0)
+            i, j = np.unravel_index(int(np.argmax(zl)), zl.shape)
+            print("%s: %s heroc %d: glossy NEE on / off, frame x%.4f; worst tile x%.4f (%.1f sigma)"
+                  % ("ok" if good else "FAIL", name, heroc, m1.sum() / m0.sum(), ratio[i, j],
+                     zl[i, j]), flush=True)
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

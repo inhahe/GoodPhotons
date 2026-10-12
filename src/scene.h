@@ -291,8 +291,9 @@ struct Material {
     // alone cannot express, and pattern-bindable like any other scalar slot.
     // Coverage / `opacity` on a hair material: below 1, a ray passes straight through with
     // probability (1 - opacity). This is what makes hair see-through; absorption alone cannot,
-    // because the BCSDF scatters every ray it intercepts.
-    Spectrum hairOpacity = constantSpectrum(1.0);
+    // because the BCSDF scatters every ray it intercepts. A fraction of the rays intercepted, so
+    // the same at every wavelength: one shadow ray's transmittance serves a whole hero bundle.
+    double   hairOpacity = 1.0;
     int      hairOpacityPat = -1;
     Spectrum hairSpecular = constantSpectrum(1.0);
     int      hairSpecPat  = -1;
@@ -561,6 +562,13 @@ struct Medium {
         if (sHi > 0.0 && (sHi - sLo) > 1e-4 * sHi) return false;
         if (tHi > 0.0 && (tHi - tLo) > 1e-4 * tHi) return false;
         return true;
+    }
+    // Fill `achro` and `achroSigma`. Scene::build() does it for every medium it holds; anything
+    // that adds a medium after build() (the built-in `-fog`) must call it, or the medium reads as
+    // chromatic: classic monochromatic beams, and no hero bundle through it.
+    void bakeAchromatic() {
+        achroSigma = computeAchromaticSigma() ? 1 : 0;
+        achro      = computeAchromatic()      ? 1 : 0;
     }
 
     // Phase value p(cos) at wavelength lambda (nm) — equals the solid-angle pdf when
@@ -2606,10 +2614,7 @@ struct Scene {
         // scan of two Spectrum objects. Done for DISABLED media too: `enabled` is a render
         // flag that can be flipped by applyIgnoreFlags after build(), and a stale -1 would be
         // worse than a computed answer nobody reads.
-        for (auto& m : media) {
-            m.achroSigma = m.computeAchromaticSigma() ? 1 : 0;
-            m.achro      = m.computeAchromatic()      ? 1 : 0;
-        }
+        for (auto& m : media) m.bakeAchromatic();
         finalizeEmitters();
         finalizeEmissiveVolumes();
         finalizeBowLuts();
@@ -3000,7 +3005,7 @@ struct Scene {
     // Deterministic, not stochastic: the coverages MULTIPLY along the ray. A random accept /
     // reject per fiber would also be unbiased but would put noise into every shadow, and hair
     // shadows are exactly where noise is most visible.
-    double shadowTransmittance(const Vec3& o, const Vec3& dir, double maxDist, double lambda,
+    double shadowTransmittance(const Vec3& o, const Vec3& dir, double maxDist,
                                double tmin = 1e-6, double curveTmin = 0.0,
                                bool camLeg = false) const {
         ++raystats::tls;
@@ -3030,13 +3035,13 @@ struct Scene {
                 const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
                 const Material& cm = mats[(size_t)cs.matId];
                 const bool soft = (cm.type == MatType::Hair) &&
-                                  (cm.hairOpacity(lambda) < 1.0 || cm.hairOpacityPat >= 0);
+                                  (cm.hairOpacity < 1.0 || cm.hairOpacityPat >= 0);
                 if (hidden(cs.matId)) return false;
                 if (!soft) return intersectCurveSeg(cray, r, cs, curveMin(r, tmin), h, true);
                 // A transparent fiber: resolve the hit fully (anyHit skips the surface
                 // parameters a bound opacity pattern needs) and attenuate rather than block.
                 if (!intersectCurveSeg(cray, r, cs, curveMin(r, tmin), h, false)) return false;
-                double op = cm.hairOpacity(lambda);
+                double op = cm.hairOpacity;
                 if (cm.hairOpacityPat >= 0) op *= slotPatMul(*this, cm.hairOpacityPat, h);
                 op = op < 0.0 ? 0.0 : (op > 1.0 ? 1.0 : op);
                 T *= (1.0 - op);

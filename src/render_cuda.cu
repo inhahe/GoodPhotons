@@ -576,7 +576,7 @@ struct DMaterial {
     // coloured sheen is the whole point; 1 everywhere reproduces the plain dielectric Fresnel.
     double hairSpecular[SPEC_N];
     int    hairSpecPat;
-    double hairOpacity[SPEC_N];
+    double hairOpacity;          // coverage: the same at every wavelength
     int    hairOpacityPat;
     double hairSigmaA[SPEC_N];
     double hairMedullaSigmaS[SPEC_N];
@@ -3793,7 +3793,7 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
 // fiber hit and nothing else. Deterministic (the coverages multiply) rather than a random
 // accept/reject, because hair shadows are exactly where stochastic noise shows most.
 __device__ static Real shadowTransmittance(const DScene& sc, const DVec3& o, const DVec3& dir,
-                                           Real maxDist, Real lambda, Real tmin = RAY_EPS,
+                                           Real maxDist, Real tmin = RAY_EPS,
                                            Real curveTmin = (Real)0) {
     if (sc.nNodes == 0) return (Real)1;
     DVec3 invD{(Real)1 / dir.x, (Real)1 / dir.y, (Real)1 / dir.z};
@@ -3818,14 +3818,14 @@ __device__ static Real shadowTransmittance(const DScene& sc, const DVec3& o, con
                     const DCurveSeg& cs = sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits];
                     const DMaterial& cm = sc.mats[cs.matId];
                     const bool soft = (cm.type == D_HAIR) &&
-                                      ((double)specLookup(cm.hairOpacity, lambda) < 1.0 || cm.hairOpacityPat >= 0);
+                                      (cm.hairOpacity < 1.0 || cm.hairOpacityPat >= 0);
                     if (!soft) blocked = intersectCurveSeg(cray, o, dir, cs, fmaxf((float)tmin, (float)curveTmin), h, true);
                     else {
                         // transparent fiber: resolve fully (anyHit skips the surface parameters a
                         // bound opacity pattern needs) and attenuate rather than block
                         if (!intersectCurveSeg(cray, o, dir, cs, fmaxf((float)tmin, (float)curveTmin), h, false)) blocked = false;
                         else {
-                            double op = (double)specLookup(cm.hairOpacity, lambda);
+                            double op = cm.hairOpacity;
                             if (cm.hairOpacityPat >= 0) op *= clamp01(dPatternScalarAt(sc, cm.hairOpacityPat, h));
                             op = op < 0.0 ? 0.0 : (op > 1.0 ? 1.0 : op);
                             T *= (1.0 - op);
@@ -3874,6 +3874,14 @@ __device__ static inline bool occludedTo(const DScene& sc, const DVec3& o, const
     const Real td = length(tv);
     if (!(td > (Real)0)) return false;
     return occluded(sc, o, tv / td, connMaxT((double)td, absEps, dMaxAbs(target)), tmin, camLeg, curveTmin);
+}
+// shadowTransmittance to a sampled point, shortened as occludedTo shortens (connMaxT).
+__device__ static inline Real shadowTransmittanceTo(const DScene& sc, const DVec3& o,
+                                                    const DVec3& target, double absEps) {
+    DVec3 tv = target - o;
+    const Real td = length(tv);
+    if (!(td > (Real)0)) return (Real)1;
+    return shadowTransmittance(sc, o, tv / td, connMaxT((double)td, absEps, dMaxAbs(target)));
 }
 
 // ---- `cavity` pattern variable (O3 stage 2) — device twin of scene.h cavityAt ----
@@ -4503,15 +4511,13 @@ __device__ static void ApFromF(double f, double T, double ap[kPMax + 1], double 
     const double denom = 1.0 - T * f;
     ap[kPMax] = (denom > 1e-12) ? ap[kPMax - 1] * f * T / denom : 0.0;
 }
+// The cuticle's untinted Fresnel term (host twin hair::cuticleFresnel).
+__device__ static double cuticleFresnel(double cosThetaO, double eta, double h) {
+    return frDielectric(cosThetaO * safeSqrt(1.0 - h * h), 1.0, eta);
+}
 __device__ static void Ap(double cosThetaO, double eta, double h, double T,
                           double ap[kPMax + 1], double specR = 1.0) {
-    const double cosGammaO = safeSqrt(1.0 - h * h);
-    const double f = frDielectric(cosThetaO * cosGammaO, 1.0, eta);
-    ap[0] = f * specR;                           // R, tinted by the cuticle reflectance
-    ap[1] = sqr(1.0 - f) * T;                    // TT
-    for (int p = 2; p < kPMax; ++p) ap[p] = ap[p - 1] * T * f;
-    const double denom = 1.0 - T * f;
-    ap[kPMax] = (denom > 1e-12) ? ap[kPMax - 1] * f * T / denom : 0.0;
+    ApFromF(cuticleFresnel(cosThetaO, eta, h), T, ap, specR);
 }
 
 // Authored parameters (device twin of hair::Params; see hair.h for semantics).
@@ -4682,18 +4688,28 @@ __device__ static inline double scatteredS(const Bcsdf& b, double spread) {
 // chain instead of leaking hair bytes into every frame on the path.
 // Host twin: hair.h LobeAngular / fFromLobes -- f() fills the angular products it computes
 // anyway on request; the fold then costs one exp and the four-lobe recurrence per bin.
+// `F` is the UNTINTED Fresnel term; the tint comes with the wavelength (see hair.h).
 struct LobeAngular {
     double G[kPMax + 1];
     double F, len, invCosI;
-    double specR;
     bool   valid;
 };
-__device__ static double fFromLobes(const LobeAngular& la, double sigmaA) {
+__device__ static double fFromLobes(const LobeAngular& la, double sigmaA, double specR) {
     double ap[kPMax + 1];
-    ApFromF(la.F, exp(-fmax(0.0, sigmaA) * la.len), ap, la.specR);
+    ApFromF(la.F, exp(-fmax(0.0, sigmaA) * la.len), ap, specR);
     double sum = 0.0;
     for (int p = 0; p <= kPMax; ++p) sum += la.G[p] * ap[p];
     sum *= la.invCosI;
+    return isfinite(sum) ? fmax(0.0, sum) : 0.0;
+}
+__device__ static double pdfFromLobes(const LobeAngular& la, double sigmaA, double specR) {
+    double ap[kPMax + 1];
+    ApFromF(la.F, exp(-fmax(0.0, sigmaA) * la.len), ap, specR);
+    double total = 0.0;
+    for (int p = 0; p <= kPMax; ++p) total += ap[p];
+    double sum = 0.0;
+    for (int p = 0; p <= kPMax; ++p)
+        sum += la.G[p] * ((total <= 1e-12) ? 1.0 / double(kPMax + 1) : ap[p] / total);
     return isfinite(sum) ? fmax(0.0, sum) : 0.0;
 }
 
@@ -4708,7 +4724,8 @@ __device__ __noinline__ static double f(const Bcsdf& b, const V3& wo, const V3& 
     const double gammaT = ch.gammaT;
 
     double ap[kPMax + 1];
-    Ap(cosThetaO, b.eta, b.h, ch.T, ap, b.specR);
+    const double F = cuticleFresnel(cosThetaO, b.eta, b.h);
+    ApFromF(F, ch.T, ap, b.specR);
 
     double sum = 0.0;
     for (int p = 0; p < kPMax; ++p) {
@@ -4724,7 +4741,7 @@ __device__ __noinline__ static double f(const Bcsdf& b, const V3& wo, const V3& 
         if (la) la->G[kPMax] = mpR * (0.5 / kPi);
     }
     if (la) {
-        la->F = ap[0]; la->len = ch.len;
+        la->F = F; la->len = ch.len;
         const double absCosI0 = fabs(cosThetaI);
         la->invCosI = (absCosI0 > 1e-9) ? 1.0 / absCosI0 : 1.0;
         la->valid = !b.hasMedulla;
@@ -4974,17 +4991,20 @@ __device__ static double dHairSigmaAAt(const DScene& sc, const DMaterial& m, con
     }
     return fmax(0.0, (double)specLookup(m.hairSigmaA, lambda));
 }
+// The cuticle tint at `lambda`, clamped to [0,1] (host twin hairSpecularAt).
+__device__ static double dHairSpecularAt(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
+    double sp = (double)specLookup(m.hairSpecular, lambda);
+    if (m.hairSpecPat >= 0) sp *= (double)clamp01(dPatternScalarAt(sc, m.hairSpecPat, h));
+    return sp < 0.0 ? 0.0 : (sp > 1.0 ? 1.0 : sp);
+}
 
 __device__ __noinline__ static DHairShade dHairShadeAt(const DScene& sc, const DMaterial& m,
                                           const DHit& h,   // __noinline__: see dhair::f
                                           Real lambda, const DVec3& wPrev) {
     dhair::Params pr;
     pr.eta   = m.hairEta;
-    {   // the cuticle tint; host twin hair_shade.h hairSpecularAt()
-        double sp = (double)specLookup(m.hairSpecular, lambda);
-        if (m.hairSpecPat >= 0) sp *= (double)clamp01(dPatternScalarAt(sc, m.hairSpecPat, h));
-        pr.specR = sp < 0.0 ? 0.0 : (sp > 1.0 ? 1.0 : sp);
-        double op = (double)specLookup(m.hairOpacity, lambda);
+    {   pr.specR = dHairSpecularAt(sc, m, h, lambda);
+        double op = m.hairOpacity;
         if (m.hairOpacityPat >= 0) op *= (double)clamp01(dPatternScalarAt(sc, m.hairOpacityPat, h));
         pr.opacity = op < 0.0 ? 0.0 : (op > 1.0 ? 1.0 : op);
     }
@@ -10790,8 +10810,7 @@ __device__ static bool bkHairBlocked(const DScene& sc, const DHit& h, const DHai
 // point sampling, falloff, cosLight, 1/dist^2 — is shared). No rng draw moves either way.
 __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec3& ngo,
                                      const DEmitter& em, Real su1, Real su2, BkNeeGeom& g,
-                                     const DHairShade* hs = nullptr,
-                                     Real lambda = (Real)550) {
+                                     const DHairShade* hs = nullptr) {
     // Shadow transmittance, not a yes/no: hair with `opacity` below 1 attenuates. Folded into
     // the geometric weight at each exit, so every device NEE consumer inherits it untouched.
     Real vis = (Real)1;
@@ -10814,7 +10833,7 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         g.fall = (Real)spotFalloff(dot(g.wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
         if (g.fall <= (Real)0) return false;
         if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
-               : !((vis = shadowTransmittance(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, g.dist, lambda)) > (Real)0)) return false;
+               : !((vis = shadowTransmittance(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, g.dist)) > (Real)0)) return false;
         g.fall = (Real)((double)g.fall * (double)vis);
         g.G = (Real)0; g.spot = true; g.sun = false;
         g.pdfW = (Real)0;                                   // delta: no lobe sample can reach it
@@ -10838,7 +10857,7 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         g.dist = (Real)((double)length(sc.sceneCenter - h.p) + sc.sceneRadius);
         g.dist2 = g.dist * g.dist;
         if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
-               : !((vis = shadowTransmittance(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, g.dist, lambda)) > (Real)0)) return false;
+               : !((vis = shadowTransmittance(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, g.dist)) > (Real)0)) return false;
         g.wSun = (Real)((double)g.cosSurf * em.spotOmega * (double)g.stG * (double)vis);
         g.G = (Real)0; g.fall = (Real)1; g.spot = false; g.sun = true;
         g.pdfW = (em.spotOmega > 0) ? (Real)(1.0 / em.spotOmega) : (Real)0;   // uniform in cone
@@ -10871,7 +10890,7 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     Real cosLight = dot(nL, -g.wi);               // light is one-sided
     if (cosLight <= 0) return false;
     if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
-           : !((vis = shadowTransmittance(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, g.dist, lambda)) > (Real)0)) return false;
+           : !((vis = shadowTransmittance(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, g.dist)) > (Real)0)) return false;
     // Side test above: authored normal. Measure below: the patch's own orientation, since the
     // solid angle a patch subtends depends on how it is oriented and not on where its emission is
     // aimed. Host twin backward.h's emitterGeom, where the reasoning lives. Bit-identical unless
@@ -11203,10 +11222,12 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
             DVec3 wi = toL / dist;
             Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
             if (fall <= (Real)0) continue;
-            if (occludedTo(sc, p + wi * RAY_EPS, p + wi * dist, 2 * RAY_EPS)) continue;
+            // A fiber of `opacity` below 1 attenuates the shadow ray (host twin volumeEmitterGeom).
+            const Real vis = shadowTransmittanceTo(sc, p + wi * RAY_EPS, p + wi * dist, 2 * RAY_EPS);
+            if (!(vis > (Real)0)) continue;
             Real phase = dMedPhase(med, dot(wIn, wi), lambda);
             double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
-            double contrib = (double)(alb * phase * fall / dist2) * emitW;
+            double contrib = (double)(alb * phase * fall / dist2) * emitW * (double)vis;
             contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
             total += contrib * selW;
             continue;
@@ -11218,10 +11239,11 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
             double s1 = (double)rng.uniform(), s2 = (double)rng.uniform();
             DVec3 wi = dSunSampleCone(em, em.beamDir * (Real)(-1), s1, s2);
             Real dist = (Real)((double)length(sc.sceneCenter - p) + sc.sceneRadius);
-            if (occluded(sc, p + wi * RAY_EPS, wi, dist)) continue;
+            const Real vis = shadowTransmittance(sc, p + wi * RAY_EPS, wi, dist);
+            if (!(vis > (Real)0)) continue;
             Real phase = dMedPhase(med, dot(wIn, wi), lambda);
             double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
-            double contrib = (double)(alb * phase) * emitW * em.spotOmega;
+            double contrib = (double)(alb * phase) * emitW * em.spotOmega * (double)vis;
             contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
             total += contrib * selW;
             continue;
@@ -11236,11 +11258,12 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
         DVec3 wi = toL / dist;
         Real cosLight = dot(nL, wi * (Real)(-1));         // light is one-sided
         if (cosLight <= 0) continue;
-        if (occludedTo(sc, p + wi * RAY_EPS, p + wi * dist, 2 * RAY_EPS)) continue;
+        const Real vis = shadowTransmittanceTo(sc, p + wi * RAY_EPS, p + wi * dist, 2 * RAY_EPS);
+        if (!(vis > (Real)0)) continue;
         Real phase = dMedPhase(med, dot(wIn, wi), lambda); // phase == its own pdf (HG or rainbow)
         Real G = cosLight / dist2;                        // no surface cosine at a volume vertex
         double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
-        double contrib = (double)(alb * phase * G) * emitW * (double)em.area;
+        double contrib = (double)(alb * phase * G) * emitW * (double)em.area * (double)vis;
         if (epat != 1.0) contrib *= epat;                 // no-op without a pattern
         contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
         total += contrib * selW;
@@ -11269,8 +11292,7 @@ struct BkEnvGeom {
 // rather than the cosine hemisphere's, exactly as the fiber branch already swaps in the BCSDF's.
 __device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkEnvGeom& g,
                                  const DHairShade* hs = nullptr,
-                                 const DNeeBsdf* nb = nullptr,
-                                 Real lambda = (Real)550) {
+                                 const DNeeBsdf* nb = nullptr) {
     // Sample an incoming env direction: image env importance-samples the luminance CDF
     // (dEnvSample gives dir + solid-angle pdfW), constant env is uniform on the sphere
     // (pdf 1/4pi). Both draw exactly two uniforms in the same order as the CPU
@@ -11299,7 +11321,7 @@ __device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkE
         {   // Partial, not yes/no: hair below opacity 1 attenuates the sky rather than
             // hiding it. Folded into cosSurf, which every caller already multiplies by.
             const Real vis = shadowTransmittance(sc, h.p + g.wi * (Real)RAY_EPS, g.wi,
-                                                 (Real)g.farDist, lambda, RAY_EPS, off);
+                                                 (Real)g.farDist, RAY_EPS, off);
             if (!(vis > (Real)0)) return false;
             g.cosSurf *= vis;
         }
@@ -11316,7 +11338,7 @@ __device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkE
     {   // see the fiber branch above: a transparent coat between a surface and the sky
         // attenuates it instead of blocking it
         const Real vis = shadowTransmittance(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi,
-                                             (Real)g.farDist, lambda);
+                                             (Real)g.farDist);
         if (!(vis > (Real)0)) return false;
         g.cosSurf *= vis;
     }
@@ -11334,7 +11356,7 @@ __device__ static double bkNeeEnv(const DScene& sc, const DHit& h, Real rho,
                                   const DNeeBsdf* nb = nullptr) {
     if (sc.envIndex < 0) return 0.0;
     BkEnvGeom g;
-    if (!bkEnvGeom(sc, h, rng, g, hs, nb, lambda)) return 0.0;
+    if (!bkEnvGeom(sc, h, rng, g, hs, nb)) return 0.0;
     double Lenv = (sc.env.scale != nullptr) ? dEnvRadiance(sc.env, g.wi, lambda)
                                             : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
     if (Lenv <= 0.0) return 0.0;
@@ -11397,7 +11419,7 @@ __device__ static double bkNeeEnvVolume(const DScene& sc, const DVec3& p, const 
         pdfW = 1.0 / (4.0 * DPI);
     }
     double farDist = (double)length(sc.sceneCenter - p) + sc.sceneRadius;
-    const Real envVis = shadowTransmittance(sc, p + wi * RAY_EPS, wi, (Real)farDist, lambda);
+    const Real envVis = shadowTransmittance(sc, p + wi * RAY_EPS, wi, (Real)farDist);
     if (!(envVis > (Real)0)) return 0.0;
     double Lenv = imageEnv ? dEnvRadiance(sc.env, wi, lambda)
                            : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
@@ -11539,8 +11561,10 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
     const bool whitted = (sc.bkWhitted != 0);
     // Cleared here rather than per delta branch, so the invariant is structural: `gm->pdf > 0`
     // can only mean "the LAST bounce was a MIS'd glossy one". A mirror or dielectric leaving a
-    // stale value behind would silently halve the emission on the far side of the chain.
-    if (gm) gm->clear();
+    // stale value behind would silently halve the emission on the far side of the chain. A null
+    // interaction (the hair pass-through) puts it back: it is not a bounce (host twin).
+    DGlossyMis gmIn; gmIn.clear();
+    if (gm) { gmIn = *gm; gm->clear(); }
     switch (mp->type) {
         case D_DIELECTRIC: {
             // Mode W: dominant Fresnel branch weighted into the throughput instead of a coin
@@ -11763,12 +11787,17 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             }
             return false;                                                     // absorbed / terminated
         }
-        case D_HAIR:
+        case D_HAIR: {
             // Split out (__noinline__) so its fat double-precision frame is only paid
             // on an actual hair hit — see the comment on bkInteractHair.
-            return bkInteractHair(sc, *mp, h, directOnly, whitted, ro, rd, lambda,
-                                  invPdfLambda, thr, L, specularArrival, contBsdfPdf,
-                                  rng, gi.depth, nullEvent, curveTminOut);
+            bool nul = false;
+            const bool alive = bkInteractHair(sc, *mp, h, directOnly, whitted, ro, rd, lambda,
+                                              invPdfLambda, thr, L, specularArrival, contBsdfPdf,
+                                              rng, gi.depth, &nul, curveTminOut);
+            if (nullEvent) *nullEvent = nul;
+            if (nul && gm) *gm = gmIn;   // the glossy predecessor's NEE already counted its share
+            return alive;
+        }
         case D_DIFFUSE:
         default: {
             Real rho = clamp01(dDiffuseRho(sc, *mp, h, lambda));
@@ -12163,6 +12192,8 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         // a clear at the loop top erases it a few lines before its only consumer -- leaving the
         // connection in place with the compensating weight silently pinned at 1, i.e. double
         // counting. Invisible on a small light and worth ~1 % on a big one; see the host twin.
+        // ...and put back after a hair pass-through, which is no bounce (host twin).
+        const DGlossyMis gmisIn = gmis;
         gmis.clear();
 
         switch (mp->type) {
@@ -12349,6 +12380,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                            lam[0], invPdf[0], thr[0], L[0], specularArrival,
                                            contBsdfPdf, stk, rng, gi, nullptr, &heroNull, &curveTmin))
                         return;
+                    if (heroNull) gmis = gmisIn;
                     if (heroNull && nullStepsH < 256) { --b; ++nullStepsH; }
                     break;
                 }
@@ -12365,6 +12397,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                        invPdf[0], thr[0], L[0], specularArrival, contBsdfPdf, stk,
                                        rng, gi, nullptr, &heroNull2, &curveTmin))
                     return;
+                if (heroNull2) gmis = gmisIn;
                 if (heroNull2 && nullStepsH < 256) { --b; ++nullStepsH; }
                 break;
             }
@@ -14646,6 +14679,8 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             }
         }
 
+        const bool hairArrivalIn = hairArrival, specularSeenIn = specularSeen;   // a hair pass-through puts these back
+        bool nullHere = false;
         hairArrival = false;
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
             // Density estimate at y, folding the visible-point reflectance per photon wavelength.
@@ -14749,6 +14784,10 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 const double cosLong = dhair::safeSqrt(1.0 - dhair::sqr(dhair::clampd(wl.x, -1.0, 1.0)));
                 double wCam = fv * cosLong / pdfH; wCam = wCam < 0.0 ? 0.0 : (wCam > 1.0 ? 1.0 : wCam);
                 thr *= wCam;
+                // A coverage pass-through (exactly -wo) is no vertex: the last real one's
+                // emitter-hit bookkeeping stands (host twin photonGatherSub).
+                if (hsv.b.opacity < 1.0 && wl.x == -hsv.woLocal.x && wl.y == -hsv.woLocal.y &&
+                    wl.z == -hsv.woLocal.z) { nullHere = true; hairArrival = hairArrivalIn; }
                 const DVec3 wOut = dhair::toWorld(hsv.fr, wl);
                 ro = h.p + wOut * dHairExitOffset(hsv, h.n, wOut);
                 rd = wOut;
@@ -14759,7 +14798,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
         }
-        specularSeen = true;                             // only specular cases reach here
+        specularSeen = nullHere ? specularSeenIn : true;   // only specular cases reach here; a pass-through inherits
         if (thr <= 0.0) return;
     }
 }
@@ -15146,11 +15185,13 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             }
         }
 
+        const bool hairArrivalIn = hairArrival;   // ...and this (host twin)
         hairArrival = false;
         // Cleared HERE, not at the loop top: `gmis` is written by the PREVIOUS bounce's
         // glossy branch and read by THIS bounce's emitter/sun sites above, so clearing it
         // earlier would erase it a few lines before its only reader -- leaving the NEE
         // connection in place with no compensating weight, i.e. double counting.
+        const DGlossyMis gmisIn = gmis;   // a hair pass-through puts it back
         gmis.clear();
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
             if (fgRays > 0 && m.type == D_DIFFUSE) {
@@ -15342,6 +15383,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                                         wl.y == -hsv.woLocal.y && wl.z == -hsv.woLocal.z;
                 double wCam = fv * cosLong / pdfH; wCam = wCam < 0.0 ? 0.0 : (wCam > 1.0 ? 1.0 : wCam);
                 thr *= wCam;
+                // ...and no vertex: the last real one's emitter-hit bookkeeping stands (host twin).
+                if (passedThru) { hairArrival = hairArrivalIn; gmis = gmisIn; }
                 if (!passedThru) {   // per-lobe form (0.336.0): one exp + the four-lobe recurrence per bin
                     const bool perLobe = la.valid;
                     const double den = m.hairSigmaAFromReflect ? dhair::sigmaADenominator(m.hairBetaN) : 0.0;   // hoisted: three pow() per bin otherwise
@@ -15353,7 +15396,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                             double sig;
                             if (m.hairSigmaAFromReflect) { double c = (double)dDiffuseRho(sc, m, h, lk); sig = dhair::sigmaAFromReflectanceD(c, den); }
                             else sig = fmax(0.0, (double)specLookup(m.hairSigmaA, lk));
-                            w = hsv.b.opacity * dhair::fFromLobes(la, sig) * cosLong / pdfH;
+                            w = hsv.b.opacity * dhair::fFromLobes(la, sig, dHairSpecularAt(sc, m, h, lk)) * cosLong / pdfH;
                         }
                         else { const DHairShade hk = dHairShadeAt(sc, m, h, lk, wPrev); w = dhair::f(hk.b, hk.woLocal, wl) * cosLong / pdfH; }
                         vk[k] = w < 0.0 ? 0.0 : (w > 1.0 ? 1.0 : w);
@@ -18042,7 +18085,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.hairEta      = m.hairEta;
         bakeSpec(m.hairSpecular, d.hairSpecular);
         d.hairSpecPat  = m.hairSpecPat;
-        bakeSpec(m.hairOpacity, d.hairOpacity);
+        d.hairOpacity  = m.hairOpacity;
         d.hairOpacityPat = m.hairOpacityPat;
         d.hairBetaM    = m.hairBetaM;
         d.hairBetaN    = m.hairBetaN;

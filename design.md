@@ -1055,7 +1055,9 @@ Alice's strands rendered 30 % darker than mode D's while the molded base matched
 case has always connected to the lights at every fiber vertex with the BCSDF (`neeLight` with
 `hs`, rho == 1 because the colour lives in sigma_a) and, having done so, does not count an
 emitter its continuation then hits; both mode-M walks now take the same split (`hairArrival`,
-cleared with `gmis`). The photon map is untouched -- fibers are never deposited on, and light
+cleared with `gmis`). A coverage pass-through is no vertex, so it restores `hairArrival`, `gmis`
+and (in the gather sub-walk) `specularSeen` to what the last real vertex left -- the split covers
+light the fiber SCATTERED, not light seen straight through it. The photon map is untouched -- fibers are never deposited on, and light
 that scatters off fibers onto a surface is in the map already -- so nothing is counted twice.
 Environment escapes stay with the continuation. `FTRACE_HAIR_NEE=0` turns it off for A/B.
 
@@ -1091,6 +1093,15 @@ cost was the colour inversion: Chiang's fit has a denominator that depends on `b
 cost three `pow()` per call (`sigmaADenominator` hoists it), and on the CPU a material whose
 reflectance is a constant spectrum gets its 24-bin sigma_a table cached per thread per material
 (`hairSigmaBins`), so the fold no longer inverts the colour per bounce at all. Finally the angular products come free: `f()` fills a `LobeAngular` on request from the terms it computes anyway (its own sum keeps its product order, so every other hair render is bit-identical), `sample()` passes the request through, and `Ap` is split so the Fresnel term is taken once -- a bin is one exp and the four-lobe recurrence. Measured: the GPU frames bit-identical to the rebuild, the CPU's within rounding; the fold's cost on a hair-filled view fell from +60-85 % to +20-50 % of the camera pass, the spread being the machine's other load during the runs (the OFF runs themselves ranged 1:12-1:28).
+`LobeAngular::F` is the cuticle's **untinted** Fresnel term (`hair::cuticleFresnel`), and the
+fold takes each wavelength's cuticle tint (`specular`, a spectrum) with its absorption:
+`fFromLobes(la, sigmaA, specR)`, and `pdfFromLobes` for the sampling density, which mode R's and
+mode D's hero bundles use at a fiber. `-checkhair` S12 holds both to `f()`/`pdf()` at the fiber's
+own absorption and tint. A bundle's per-wavelength fiber is a copy of the hero's with only the
+wavelength-dependent coefficients redone (`hair::makeSpectral`, `hairShadeRetint`), the frame,
+impact parameter, roughness and tilt being the same at every wavelength (with the fold, -19 % time
+per sample on the fur check scene in mode R at `-heroc 4`, paired). `opacity` (coverage) is one
+number at every wavelength, so one shadow ray's transmittance serves a whole bundle.
 
 **Curves of curves (0.326.0).** `ftsl.h addCurve` is now recursive (`flattenCurveNode`): a
 `curve` node's children are `point`s (a strand, unchanged) or `curve`s (inline or by name), and a
@@ -2999,13 +3010,16 @@ why these historical runs reproduce. See **J-BEAMCOST** in `known-issues.md`.
     normal. On curve geometry `h.n == ±h.ng` so both would evaluate to 1 anyway — the explicit
     `isFiberMat` guards are what keep `hair` honest if it is ever put on a smooth-shaded
     triangle mesh.
-  - *Unidirectional tracers de-hero at a strand; bidirectional ones do not.* σa is per-λ (and
+  - *The forward tracer de-heros at a strand; mode R, BDPT and VCM do not.* σa is per-λ (and
     an authored `reflect` is inverted into one per-λ), so a hero packet cannot share one fiber
-    interaction across C wavelengths — forward (`render.h`) and backward (`backward.h`) put
-    `Hair` in their dispersive/de-hero group beside `Fluorescent`. BDPT/VCM by contrast already
-    re-evaluate each secondary's `f` along the hero's sampled direction (`secF[i]`), so the
-    bundle survives a strand there — which is fortunate, since a fiber is precisely where the
-    spectral spread is interesting.
+    interaction across C wavelengths outright — forward (`render.h`) puts `Hair` in its
+    dispersive/de-hero group beside `Fluorescent`. BDPT/VCM re-evaluate each secondary's `f`
+    along the hero's sampled direction (`secF[i]`), and mode R does the same under spectral MIS
+    (0.375.0, the bundle Hair case of `radianceHeroLoop`), so the bundle survives a strand there
+    — which is fortunate, since a fiber is precisely where the spectral spread is interesting.
+    What mode R's case does not cover (a lone hero, mode W, `-direct-only`, dual scattering)
+    falls through to its dispersive group: split per λ under `heroSplit` (always on in mode W,
+    whose wavelength lattice is shared by every pixel), de-hero otherwise.
   - *BDPT/VCM get the projection through a PRE-DIVIDE, not a special case.* Those integrators
     speak only "f, its pdf, and a geometry term carrying cos(ns, w)", and that term is formed
     in roughly a dozen places. Rather than teach all of them about fibers, `bdpt::bsdfF`
@@ -3313,8 +3327,9 @@ why these historical runs reproduce. See **J-BEAMCOST** in `known-issues.md`.
   outright: `BackwardRenderer::furVol` non-null makes `Scene::closestHit` skip every
   `MatType::Hair` curve (a new `skipHair` flag mirroring `occludedSkipHair`) and the tracer
   free-flights against `σ_t(d)` instead. Both the scalar and the hero loop; the hero loop
-  de-heros at a collision, exactly as it already does at a `Hair` surface, because a fiber's
-  response is wavelength-dependent through `σ_a`.
+  de-heros at a collision (a strand surface keeps the bundle by spectral MIS since 0.375.0; an
+  aggregate collision does not), because a fiber's response is wavelength-dependent through
+  `σ_a` -- so no aggregate fiber ever reaches a bundle NEE.
   - *Composition with fog is a **minimum**, not a special case.* The fur flight is sampled
     before the fog block and shortens `dSurf`. That is exact rather than convenient: the first
     collision in a union of independent media is the minimum of their independent free flights,
@@ -3705,7 +3720,21 @@ as the one at fault.
   A chromatic-coat split re-enters its vertex, so it passes the parent's coat coin
   (`reentryCoatU`) and skips the first segment's free flights (`firstSegSampled`) -- each a
   measured bias without it (COAT-SPLIT-COIN). `tools/check_hero_spectral.py` holds all
-  of it to the single-λ estimator.
+  of it to the single-λ estimator, in mode D too (`--modes`).
+  **Mode D (0.375.2)** takes the same gate in `BdptRenderer::renderRows` -- except mode J, whose
+  beam merges are single-λ -- and its walk's medium event takes policy-3 survival on per-λ albedo
+  and a per-λ `phase_i/pdf_hero` at a rainbow scatter; its connections already evaluated medium
+  vertices per λ and share the flat transmittance. There the MIS stays hero-driven (BDPT's camera
+  walk already carried a fiber that way), which is unbiased. The joint heuristic over every
+  (strategy x hero wavelength) pair -- `n / sum_j R_j D_j`, R_j the strategy's path pdf at λ_j
+  over the hero's, D_j BDPT's usual denominator at λ_j -- was built and measured instead of being
+  kept: no change in noise on fur (a fiber's strongest strategies, the light connection at it and
+  hitting the light off its lobe, carry no per-λ pdf ratio, and the second is already bounded by
+  the light density in the hero's weight), ~5 % less variance in rainbow rain, for ~17 % more
+  time from the per-λ densities recorded at every fiber and the n-fold weight
+  (known-issues SPECTRAL-BUNDLE).
+  At a fiber the secondaries' values come from the hero's lobes (`hair::LobeAngular`, one exp each)
+  for a solid fiber, as in mode R's Hair case and mode M's spectral fold.
 
   **Split-at-dispersion (`heroSplit`)** mirrors the forward tracer's policy: the bounce
   loop is factored out as **`radianceHeroLoop`** (`radianceHero` is now a thin wrapper
@@ -7622,10 +7651,24 @@ as the one at fault.
   gains a `tempGrid` + emission params, `DScene` gains a `DEmissiveVolume[]` (+ per-volume Planck-λ CDF)
   and `totalEmissionPower`, and `genPhoton` has the same power-split volume-birth branch +
   `connectEmissionVolume`/`camSplatEmissionAll` device splat (validated GPU-vs-CPU on `scraps/vdb_fire.ftsl`).
-  The **CPU** backward reference (modes R/W/V) does not sample the *emission* grid — volumetric
-  blackbody emission stays forward-only — but since 0.254.0 it samples the media themselves
-  correctly, superposing the whole vector with each region's `bounds` and `density` field,
-  exactly as the GPU backward megakernel does.
+  Only these forward modes (A/B/C) render it. Every other mode -- the composites V/P too, whose
+  forward layer is calibrated against a fire-blind mode-R film -- **refuses** a scene with an
+  emissive medium through the `-on-unsupported` policy (`main.cpp`: `modeRendersVolumeEmission`,
+  read by `modeFeatureUnsupported`): `error` aborts naming the modes that would render it,
+  `fallback` picks mode B (`fallbackModeFor`), `strip` resets the `temperature` grids and rebuilds
+  `emissiveVolumes`. The backward reference (modes R/W/V) samples the media themselves correctly
+  (since 0.254.0, superposing the whole vector with each region's `bounds` and `density` field,
+  exactly as the GPU backward megakernel does) but not the emission grid.
+- **The `-on-unsupported` policy** (`main.cpp`) reads one set of capability predicates --
+  `modeRendersVolumeEmission`, `modeRendersGrin`, `modeFormsLensImage`, and the per-mode scope
+  checks in `modeFeatureUnsupported` -- so the refusal, the fallback, the strip and the error's
+  advice cannot disagree. A physical-lens camera is first routed to a lens-forming mode
+  (`lensRoutedMode`: R, or D/J); the fallback is the first of R and B that renders everything the
+  camera needs, lens included (`fallbackModeFor`; none for a fire through a lens, which then
+  errors). A strip removes only what the camera's mode lacks and only what no camera of the run
+  renders (`keepFire`/`keepGrin`, computed over the selected cameras), because every camera
+  renders the one shared `Scene`. The exposure meter resolves each camera's mode with the same
+  functions (`renderedMode`), after the run loop applied the policy.
 - **`rng.h`** — Pcg32 + `seedUnit(rng, unitIndex, salt)` splitmix64 mixing:
   **every work unit (photon or pixel-sample) seeds its own stream**, so results are
   independent of chunk splits / thread count / banding / `-resume` boundaries.

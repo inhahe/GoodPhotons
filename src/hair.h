@@ -205,18 +205,15 @@ inline void ApFromF(double f, double T, double ap[kPMax + 1], double specR = 1.0
     const double denom = 1.0 - T * f;
     ap[kPMax] = (denom > 1e-12) ? ap[kPMax - 1] * f * T / denom : 0.0;
 }
+// The cuticle's (untinted) Fresnel reflectance. The angle is the FULL 3-D incidence on the
+// cylinder wall, which is the longitudinal and azimuthal cosines multiplied — not cosThetaO
+// alone. Getting this wrong is invisible head-on and wrong by tens of percent at grazing.
+inline double cuticleFresnel(double cosThetaO, double eta, double h) {
+    return frDielectric(cosThetaO * safeSqrt(1.0 - h * h), 1.0, eta);
+}
 inline void Ap(double cosThetaO, double eta, double h, double T, double ap[kPMax + 1],
                double specR = 1.0) {
-    const double cosGammaO = safeSqrt(1.0 - h * h);
-    // The Fresnel angle is the FULL 3-D incidence on the cylinder wall, which is the
-    // longitudinal and azimuthal cosines multiplied — not cosThetaO alone. Getting this
-    // wrong is invisible head-on and wrong by tens of percent at grazing.
-    const double f = frDielectric(cosThetaO * cosGammaO, 1.0, eta);
-    ap[0] = f * specR;                           // R, tinted by the cuticle reflectance
-    ap[1] = sqr(1.0 - f) * T;                    // TT
-    for (int p = 2; p < kPMax; ++p) ap[p] = ap[p - 1] * T * f;
-    const double denom = 1.0 - T * f;
-    ap[kPMax] = (denom > 1e-12) ? ap[kPMax - 1] * f * T / denom : 0.0;
+    ApFromF(cuticleFresnel(cosThetaO, eta, h), T, ap, specR);
 }
 
 // --- The BCSDF ---------------------------------------------------------------
@@ -295,6 +292,18 @@ struct Chord {
     double len      = 0.0;   // the unscattered path's length across the fiber, in radii (T = exp(-sigmaA * len) for a solid fiber)
 };
 
+// The wavelength-dependent part of make(): the cuticle tint, the absorption and the medulla's
+// coefficients. Everything else in a Bcsdf is the same at every wavelength, so the BCSDF of a
+// second wavelength at the same hit is a copy of the first with this re-run (hair_shade.h
+// hairShadeRetint). Needs `kappa` already set.
+inline void makeSpectral(Bcsdf& b, double specR, double sigmaA, double mSigmaS, double mSigmaA) {
+    b.specR   = (specR < 0.0) ? 0.0 : (specR > 1.0 ? 1.0 : specR);
+    b.sigmaA  = std::max(0.0, sigmaA);
+    b.mSigmaS = std::max(0.0, mSigmaS);
+    b.mSigmaA = std::max(0.0, mSigmaA);
+    b.hasMedulla = (b.kappa > 0.0) && (b.mSigmaS + b.mSigmaA > 0.0);
+}
+
 // `sigmaA` is per-unit-radius absorption at the wavelength being traced (the chord
 // lengths below are in units of the fiber radius, so sigmaA is dimensionless).
 inline Bcsdf make(const Params& pr, double h, double sigmaA) {
@@ -302,9 +311,7 @@ inline Bcsdf make(const Params& pr, double h, double sigmaA) {
     b.h      = clampd(h, -1.0, 1.0);
     b.gammaO = std::asin(b.h);
     b.eta    = pr.eta;
-    b.specR  = (pr.specR < 0.0) ? 0.0 : (pr.specR > 1.0 ? 1.0 : pr.specR);
     b.opacity = (pr.opacity < 0.0) ? 0.0 : (pr.opacity > 1.0 ? 1.0 : pr.opacity);
-    b.sigmaA = std::max(0.0, sigmaA);
 
     // Chiang's roughness fits. The high powers (20, 22) are not curve-fitting noise:
     // they are what makes the mapping flat over most of the range and then blow up right
@@ -332,10 +339,8 @@ inline Bcsdf make(const Params& pr, double h, double sigmaA) {
     // either case the extra lobes carry exactly zero and the flag stays false, so the
     // whole of stage 3 costs nothing and changes nothing on a human-hair fiber.
     b.kappa   = clampd(pr.kappa, 0.0, 0.999);
-    b.mSigmaS = std::max(0.0, pr.mSigmaS);
-    b.mSigmaA = std::max(0.0, pr.mSigmaA);
     b.mG      = clampd(pr.mG, -0.999, 0.999);
-    b.hasMedulla = (b.kappa > 0.0) && (b.mSigmaS + b.mSigmaA > 0.0);
+    makeSpectral(b, pr.specR, sigmaA, pr.mSigmaS, pr.mSigmaA);
     return b;
 }
 
@@ -513,18 +518,33 @@ inline double scatteredS(const Bcsdf& b, double spread) {
 // spectral fold needs 27 times per fiber bounce. `valid` is false for a fiber with a
 // medulla, whose scattered lobes take the absorption through the chord in more than one
 // place; the fold rebuilds those.
+// `F` is the cuticle's UNTINTED Fresnel term: the tint (`specular`, a spectrum) belongs to the
+// wavelength being evaluated, so the caller passes it with the absorption. Neither function
+// includes the coverage (`opacity`), which the caller applies.
 struct LobeAngular {
     double G[kPMax + 1] = {0, 0, 0, 0};
     double F = 0.0, len = 0.0, invCosI = 1.0;
-    double specR = 1.0;        // carried so the spectral fold tints the same lobe f() does
     bool   valid = false;
 };
-inline double fFromLobes(const LobeAngular& la, double sigmaA) {
+// f() at another wavelength: its absorption `sigmaA` and cuticle tint `specR`.
+inline double fFromLobes(const LobeAngular& la, double sigmaA, double specR) {
     double ap[kPMax + 1];
-    ApFromF(la.F, std::exp(-std::max(0.0, sigmaA) * la.len), ap, la.specR);
+    ApFromF(la.F, std::exp(-std::max(0.0, sigmaA) * la.len), ap, specR);
     double sum = 0.0;
     for (int p = 0; p <= kPMax; ++p) sum += la.G[p] * ap[p];
     sum *= la.invCosI;
+    return std::isfinite(sum) ? std::max(0.0, sum) : 0.0;
+}
+// pdf() at another wavelength, likewise: the same angular products, weighted by apPdf's lobe
+// probabilities A_p / sum A instead of A_p (and no projection).
+inline double pdfFromLobes(const LobeAngular& la, double sigmaA, double specR) {
+    double ap[kPMax + 1];
+    ApFromF(la.F, std::exp(-std::max(0.0, sigmaA) * la.len), ap, specR);
+    double total = 0.0;
+    for (int p = 0; p <= kPMax; ++p) total += ap[p];
+    double sum = 0.0;
+    for (int p = 0; p <= kPMax; ++p)                  // apPdf's uniform fallback when degenerate
+        sum += la.G[p] * ((total <= 1e-12) ? 1.0 / double(kPMax + 1) : ap[p] / total);
     return std::isfinite(sum) ? std::max(0.0, sum) : 0.0;
 }
 
@@ -539,7 +559,8 @@ inline double f(const Bcsdf& b, const Vec3& wo, const Vec3& wi, LobeAngular* la 
     const double gammaT = ch.gammaT;
 
     double ap[kPMax + 1];
-    Ap(cosThetaO, b.eta, b.h, ch.T, ap, b.specR);
+    const double F = cuticleFresnel(cosThetaO, b.eta, b.h);
+    ApFromF(F, ch.T, ap, b.specR);
 
     double sum = 0.0;
     for (int p = 0; p < kPMax; ++p) {
@@ -557,7 +578,7 @@ inline double f(const Bcsdf& b, const Vec3& wo, const Vec3& wi, LobeAngular* la 
         if (la) la->G[kPMax] = mpR * (0.5 / kPi);
     }
     if (la) {
-        la->F = ap[0]; la->len = ch.len;
+        la->F = F; la->len = ch.len;
         const double absCosI0 = std::fabs(cosThetaI);
         la->invCosI = (absCosI0 > 1e-9) ? 1.0 / absCosI0 : 1.0;
         la->valid = !b.hasMedulla;

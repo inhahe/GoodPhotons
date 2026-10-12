@@ -84,15 +84,16 @@ inline const double* hairSigmaBins(const Scene& scene, const Material& m, const 
     return it->second.data();
 }
 
-// The cuticle reflectance tint at a hit, clamped to [0,1]. Factored out because there are TWO
-// places that build hair::Params -- hairShadeAt and hairDualFor -- and teaching only one of them
-// is exactly the bug this was written to fix: `specular` parsed, stored and did nothing.
-inline double hairOpacityAt(const Scene& scene, const Material& m, const Hit& hit, double lambda) {
-    double o = m.hairOpacity(lambda);
+// The coverage (`opacity`) at a hit, clamped to [0,1]: the same at every wavelength.
+inline double hairOpacityAt(const Scene& scene, const Material& m, const Hit& hit) {
+    double o = m.hairOpacity;
     if (m.hairOpacityPat >= 0) o *= slotPatMul(scene, m.hairOpacityPat, hit);
     return o < 0.0 ? 0.0 : (o > 1.0 ? 1.0 : o);
 }
 
+// The cuticle reflectance tint at a hit, clamped to [0,1]. Factored out because there are TWO
+// places that build hair::Params -- hairShadeAt and hairDualFor -- and teaching only one of them
+// is exactly the bug this was written to fix: `specular` parsed, stored and did nothing.
 inline double hairSpecularAt(const Scene& scene, const Material& m, const Hit& hit, double lambda) {
     double sp = m.hairSpecular(lambda);
     if (m.hairSpecPat >= 0) sp *= slotPatMul(scene, m.hairSpecPat, hit);
@@ -104,7 +105,7 @@ inline HairShade hairShadeAt(const Scene& scene, const Material& m, const Hit& h
     hair::Params pr;
     pr.eta   = m.hairEta;
     pr.specR = hairSpecularAt(scene, m, hit, lambda);
-    pr.opacity = hairOpacityAt(scene, m, hit, lambda);
+    pr.opacity = hairOpacityAt(scene, m, hit);
     pr.betaM = m.hairBetaM;
     pr.betaN = m.hairBetaN;
     pr.alpha = m.hairAlpha;
@@ -130,6 +131,18 @@ inline HairShade hairShadeAt(const Scene& scene, const Material& m, const Hit& h
     return s;
 }
 
+// hairShadeAt at another wavelength, for the same hit and arrival direction: a copy of `base`
+// with only the wavelength-dependent coefficients re-read (hair::makeSpectral). The frame, the
+// impact parameter, the roughness and the tilt are the same at every wavelength, so a hero
+// bundle builds them once.
+inline HairShade hairShadeRetint(const Scene& scene, const Material& m, const Hit& hit,
+                                 double lambda, const HairShade& base) {
+    HairShade s = base;
+    hair::makeSpectral(s.b, hairSpecularAt(scene, m, hit, lambda), hairSigmaAAt(scene, m, hit, lambda),
+                       m.hairMedullaSigmaS(lambda), m.hairMedullaSigmaA(lambda));
+    return s;
+}
+
 // The complete "BCSDF times projection" factor toward a world direction — see the header
 // comment. This is what multiplies the throughput in a connection, in place of the
 // surface path's `f * dot(n, w)`.
@@ -137,6 +150,28 @@ inline double hairFCos(const HairShade& s, const Vec3& wWorld) {
     const Vec3 wl = hair::toLocal(s.fr, wWorld);
     const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
     return hair::f(s.b, s.woLocal, wl) * cosLong;
+}
+
+// hairFCos and hair::pdf for every shade of a bundle (`hs[0..n)`, sharing hit and arrival:
+// hairShadeRetint) toward one LOCAL direction `wl` with its longitudinal cosine. The angular
+// half of f() is computed once, at hs[0]; each other wavelength then costs one exp
+// (fFromLobes / pdfFromLobes). A medullated fiber, which that fold cannot factor, is evaluated
+// in full per wavelength. `pdf` may be null.
+inline void hairBundleAt(const HairShade* hs, int n, const Vec3& wl, double cosLong,
+                         double* fcos, double* pdf) {
+    hair::LobeAngular la;
+    fcos[0] = hair::f(hs[0].b, hs[0].woLocal, wl, &la) * cosLong;
+    if (pdf) pdf[0] = hair::pdf(hs[0].b, hs[0].woLocal, wl);
+    for (int i = 1; i < n; ++i) {
+        const hair::Bcsdf& b = hs[i].b;
+        if (la.valid) {
+            fcos[i] = b.opacity * hair::fFromLobes(la, b.sigmaA, b.specR) * cosLong;
+            if (pdf) pdf[i] = b.opacity * hair::pdfFromLobes(la, b.sigmaA, b.specR);
+        } else {
+            fcos[i] = hair::f(b, hs[i].woLocal, wl) * cosLong;
+            if (pdf) pdf[i] = hair::pdf(b, hs[i].woLocal, wl);
+        }
+    }
 }
 
 // How far a connection or a scattered ray must step to clear the strand's own body.
@@ -199,7 +234,7 @@ inline const hair::Dual* hairDualFor(const Scene& scene, const Material& m, int 
     hair::Params pr;
     pr.eta = m.hairEta; pr.betaM = m.hairBetaM; pr.betaN = m.hairBetaN; pr.alpha = m.hairAlpha;
     pr.specR = hairSpecularAt(scene, m, hit, lambda);
-    pr.opacity = hairOpacityAt(scene, m, hit, lambda);
+    pr.opacity = hairOpacityAt(scene, m, hit);
     pr.kappa = m.hairKappa; pr.mG = m.hairMedullaG;
     pr.mSigmaS = std::max(0.0, m.hairMedullaSigmaS(lambda));
     pr.mSigmaA = std::max(0.0, m.hairMedullaSigmaA(lambda));
@@ -424,7 +459,7 @@ inline bool hairShadowGrid(HairShadow& sh, const HairDualCtx& ctx, const Scene& 
     // COVERAGE is exact Poisson thinning here: a crossing that does not intercept is simply
     // not an event, so the rate scales and `n` below counts interceptions directly.
     const double tau = std::min(fm.tau, (double)ctx.maxCross) *
-                       hairOpacityAt(sc, sc.mats[fm.matId], shadingHit, ctx.lambda);
+                       hairOpacityAt(sc, sc.mats[fm.matId], shadingHit);
     // N ~ Poisson(tau) by CDF inversion. `p` is the pmf, stepped by the `tau/n` recurrence;
     // `u < cdf` terminates in `tau + O(sqrt(tau))` iterations on average. The `n` cap is the
     // same safety net as the walk's, and doubles as the guard against a `u` that rounds to 1.
@@ -467,7 +502,7 @@ inline double hairDualResponse(const HairDualCtx& ctx, const HairShade& s, const
         reached = sc.walkFibers(o, wi, len, [&](const Hit& fh) {
             const hair::Dual* d = hairDualFor(sc, sc.mats[fh.matId], fh.matId, fh, ctx.lambda);
             hairShadowCross(sh, *d, fh, wi,
-                            hairOpacityAt(sc, sc.mats[fh.matId], fh, ctx.lambda));
+                            hairOpacityAt(sc, sc.mats[fh.matId], fh));
         }, ctx.maxCross);
     }
     if (!reached) return 0.0;

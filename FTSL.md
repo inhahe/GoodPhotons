@@ -1925,8 +1925,9 @@ become elliptical.
 
 **`opacity <value>` — true transparency (0.356.0).** Coverage: the fraction of a ray the fiber
 actually intercepts. Below 1, a ray passes STRAIGHT THROUGH with probability `1 - opacity`,
-unattenuated. Takes a scalar, spectrum or `pattern:<name>`; default 1 is the solid fiber every
-scene before this had, bit-for-bit.
+unattenuated. Takes a number or `pattern:<name>` -- not a colour: the fraction of rays a fiber
+intercepts is geometry, the same at every wavelength, so tint a fiber with `reflect` (a colour
+here is refused). Default 1 is the solid fiber every scene before this had, bit-for-bit.
 
 **Absorption cannot do this, and that is why the slot exists.** A fiber's BCSDF has no
 pass-through lobe -- every ray it intercepts is scattered into R/TT/TRT -- so a background is only
@@ -2966,16 +2967,18 @@ medium {
 }
 ```
 
-> **Mode support:** volumetric emission is a **forward** feature: modes **A/B/C/P**, on the CPU
+> **Mode support:** volumetric emission is a **forward** feature: modes **A/B/C**, on the CPU
 > and the GPU. Each emissive medium becomes an isotropic volume emitter: photons are born inside
 > it (position-sampled over the temperature grid's AABB, wavelength-sampled from the grid's
 > blackbody) carrying the local Planck radiance, so the fire both shows directly *and lights the
 > rest of the scene* (soot self-scatter, nearby walls). An emissive volume counts as the scene's
-> light, so a fire needs no separate `light` block. The other modes (R, W, V, D, U, J, M, S) do
-> not render volumetric emission and **refuse** a scene with a fire, like any other feature a
-> mode can't render: `-on-unsupported fallback` switches such a camera to mode **B**, and
-> `-on-unsupported strip` renders the fire as cold smoke. (Before 0.375.1 they rendered it as
-> cold smoke silently -- black, when the fire was the only light.)
+> light, so a fire needs no separate `light` block. The other modes (R, W, V, P, D, U, J, M, S)
+> do not render volumetric emission and **refuse** a scene with a fire, like any other feature a
+> mode can't render -- P too, because its composite is calibrated against a mode-R film, which
+> does not see the fire. `-on-unsupported fallback` switches such a camera to mode **B**, and
+> `-on-unsupported strip` renders the fire as cold smoke unless another camera of the same run
+> renders it (then that camera falls back instead). A camera with a physical `lens` cannot show
+> a fire at all -- only R, D and J form a lens image -- so it refuses even under `fallback`.
 
 ---
 

@@ -441,7 +441,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 h.t += tAcc;
                 const Material* pm = (h.matId >= 0 && h.matId < (int)scene.mats.size()) ? &scene.mats[h.matId] : nullptr;
                 if (!pm || pm->type != MatType::Hair || h.fiberRadius <= 0.0) break;
-                const double o = hairOpacityAt(scene, *pm, h, 550.0);
+                const double o = hairOpacityAt(scene, *pm, h);
                 if (o >= 1.0 || rng.uniform() < o) break;            // the strand IS here
                 tAcc = h.t;
                 pr = Ray{h.p + pr.d * 1e-9, pr.d, 2.5 * h.fiberRadius + 1e-9};   // through the tube
@@ -1129,7 +1129,10 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
         // a clear at the loop top erases it a few lines before the only code that wants it --
         // which leaves the connection in place with no compensating weight on the lobe-sampling
         // side, i.e. double counting wherever both strategies reach the same light. See the
-        // twin note in backward.h.
+        // twin note in backward.h. A hair pass-through is no vertex and puts all three back.
+        const BackwardRenderer::GlossyMis gmisIn = gmis;
+        const bool hairArrivalIn = hairArrival, specularSeenIn = specularSeen;
+        bool nullHere = false;
         gmis.clear();
         hairArrival = false;
 
@@ -1281,6 +1284,13 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 const double cosLong =
                     hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
                 thr *= clamp01(fv * cosLong / pdfH);       // == T = sum_p A_p
+                // A coverage pass-through (exactly -wo) is no vertex: what the last real one
+                // decided about counting an emitter hit stands, so light seen straight through
+                // the fiber is weighed as that vertex would weigh it.
+                if (hs.b.opacity < 1.0 && wl.x == -hs.woLocal.x && wl.y == -hs.woLocal.y &&
+                    wl.z == -hs.woLocal.z) {
+                    nullHere = true; hairArrival = hairArrivalIn; gmis = gmisIn;
+                }
                 const Vec3 wo = hair::toWorld(hs.fr, wl);
                 ray = Ray{h.p + wo * 1e-6, wo, hairExitOffset(hs, h.n, wo)};
                 break;
@@ -1291,7 +1301,8 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 break;
             }
         }
-        specularSeen = true;   // only specular cases reach here (diffuse/light returned above)
+        // only specular cases reach here (diffuse/light returned above); a pass-through inherits
+        specularSeen = nullHere ? specularSeenIn : true;
         if (thr <= 0.0) return L;
     }
     return L;
@@ -1506,7 +1517,9 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
         // a clear at the loop top erases it a few lines before the only code that wants it --
         // which leaves the connection in place with no compensating weight on the lobe-sampling
         // side, i.e. double counting wherever both strategies reach the same light. See the
-        // twin note in backward.h.
+        // twin note in backward.h. A hair pass-through is no vertex and puts both back.
+        const BackwardRenderer::GlossyMis gmisIn = gmis;
+        const bool hairArrivalIn = hairArrival;
         gmis.clear();
         hairArrival = false;
 
@@ -1738,6 +1751,10 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                                         wl.y == -hs.woLocal.y && wl.z == -hs.woLocal.z;
                 const double wCam = clamp01(fv * cosLong / pdfH);   // == T = sum_p A_p
                 thr *= wCam;
+                // ...and no vertex: the last real one's emitter-hit bookkeeping stands (as in the
+                // gather sub-walk), so light seen straight through the fiber is counted as it
+                // would weigh it.
+                if (passedThru) { hairArrival = hairArrivalIn; gmis = gmisIn; }
                 // SPECGATHER (0.333.0): the fiber's transmission is the most coloured factor a
                 // camera walk meets -- a blonde fiber absorbs blue and green -- and until now the
                 // walk folded it in at the camera's wavelength ALONE, so every photon of every
@@ -1762,7 +1779,8 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     const double* bins = hairSigmaBins<SpecThr::K, &SpecThr::lamOf>(scene, m, h);
                     sthr.mul([&](double lamK) {
                         if (perLobe)
-                            return clamp01(hs.b.opacity * hair::fFromLobes(la, bins ? bins[SpecThr::binOf(lamK)] : hairSigmaAAt(scene, m, h, lamK)) * cosLong / pdfH);
+                            return clamp01(hs.b.opacity * hair::fFromLobes(la, bins ? bins[SpecThr::binOf(lamK)] : hairSigmaAAt(scene, m, h, lamK),
+                                                                           hairSpecularAt(scene, m, h, lamK)) * cosLong / pdfH);
                         const HairShade hk = hairShadeAt(scene, m, h, lamK, wPrev);
                         return clamp01(hair::f(hk.b, hk.woLocal, wl) * cosLong / pdfH);
                     }, wCam);

@@ -4868,9 +4868,20 @@ private:
             // dielectric Fresnel every existing scene already has. Accepts a spectrum/rgb like
             // any colour slot, or `pattern:<name>` to vary it over the fiber.
             // `opacity` is COVERAGE, not absorption: below 1 a ray passes straight through, which
-            // is what lets a background be seen through hair. Default 1 is the solid fiber.
-            if (bindScalarPattern(b, "opacity", m.hairOpacityPat)) m.hairOpacity = constantSpectrum(1.0);
-            else if (find(b, "opacity")) m.hairOpacity = spectrumParam(b, "opacity", m.hairOpacity);
+            // is what lets a background be seen through hair. Default 1 is the solid fiber. The
+            // fraction of rays a fiber intercepts is geometry, the same at every wavelength, so
+            // the slot takes a number (or a pattern), never a colour -- refused rather than read
+            // as `num("rgb") == 0`, which would make the fur silently invisible.
+            if (bindScalarPattern(b, "opacity", m.hairOpacityPat)) m.hairOpacity = 1.0;
+            else if (const Stmt* so = find(b, "opacity")) {
+                const auto& w = so->val.words;
+                if (w.size() != 1 || (!isNumber(w[0]) && w[0].find('.') == std::string::npos))
+                    fail("material '" + b.name + "': `opacity` is coverage -- the fraction of "
+                         "rays the fiber intercepts, the same at every wavelength -- so it takes "
+                         "a number or a pattern, not a colour; tint a fiber with `reflect`");
+                else
+                    m.hairOpacity = clamp01d(dblParam(b, "opacity", 1.0));
+            }
             if (bindScalarPattern(b, "specular", m.hairSpecPat)) m.hairSpecular = constantSpectrum(1.0);
             else if (find(b, "specular")) m.hairSpecular = spectrumParam(b, "specular", m.hairSpecular);
             m.hairAlpha = dblParam(b, "alpha",  havePreset ? sp.alphaDeg : 2.0);
