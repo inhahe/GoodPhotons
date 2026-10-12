@@ -37,10 +37,15 @@ def two_frames(exe, scene, out, extra):
                     break
             else:
                 raise RuntimeError("ftrace -serve ended before frame %d" % k)
+            # `[serve] done` is printed whatever the frame's outcome, so the frame must have
+            # written the file anew: it is deleted before the next frame is asked for.
+            if not os.path.exists(out):
+                raise RuntimeError("frame %d wrote no image" % k)
             first = out + ".frame%d.png" % k
             shutil.copyfile(out, first)
             frames.append(np.asarray(Image.open(first).convert("RGB"), np.int16))
             if k == 0:
+                os.remove(out)
                 p.stdin.write(scene + NL); p.stdin.flush()
         p.stdin.write("quit" + NL); p.stdin.flush()
         p.wait(timeout=120)

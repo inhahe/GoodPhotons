@@ -65,6 +65,7 @@
 #include "photonmap.h"
 #include "photonbeams.h"
 #include "scene.h"
+#include "file_replace.h"
 
 // The FTPMP04 beam record, frozen. The beam block is a raw fwrite of the live `PhotonBeam`,
 // so widening that struct for the spectral bundle (0.202.0) changed its size and would have
@@ -171,49 +172,48 @@ inline bool savePhotonMap(const char* path, const PhotonMap& pm,
                           const EnergyReport& e, uint64_t guard,
                           const BeamMap* bm = nullptr,
                           const PhotonMap* pmCaustic = nullptr) {
-    std::FILE* f = std::fopen(path, "wb");
-    if (!f) { std::fprintf(stderr, "[savemap] cannot open %s for writing\n", path); return false; }
-    const char magic[8] = {'F','T','P','M','P','0','9','\n'};
-    long long nPh = (long long)pm.photons.size();
-    double en[5] = {e.emitted, e.absorbed, e.sensor, e.escaped, e.residual};
-    bool ok = true;
-    ok = ok && std::fwrite(magic, 1, 8, f) == 8;
-    ok = ok && std::fwrite(&guard, sizeof guard, 1, f) == 1;
-    ok = ok && std::fwrite(&pm.nEmitted, sizeof pm.nEmitted, 1, f) == 1;
-    ok = ok && std::fwrite(en, sizeof en, 1, f) == 1;
-    ok = ok && std::fwrite(&nPh, sizeof nPh, 1, f) == 1;
-    if (ok && nPh > 0) {
-        ok = std::fwrite(pm.pos.data(), sizeof(Vec3), (size_t)nPh, f) == (size_t)nPh;
-        ok = ok && std::fwrite(pm.photons.data(), sizeof(Photon), (size_t)nPh, f) == (size_t)nPh;
-    }
-    // --- beam block ---------------------------------------------------------------------
-    // nEmitted is stored separately from the surface map's because a beam map normalises by
-    // the emitted count of ITS pass; they are equal today but the field is the estimator's,
-    // not the file's, and tying them would be a landmine if the passes ever split.
-    long long nBm  = (bm && !bm->empty()) ? (long long)bm->beams.size() : 0;
-    long long bEm  = bm ? bm->nEmitted : 0;
-    long long bDep = bm ? (long long)bm->nDeposited : 0;
-    ok = ok && std::fwrite(&nBm,  sizeof nBm,  1, f) == 1;
-    ok = ok && std::fwrite(&bEm,  sizeof bEm,  1, f) == 1;
-    ok = ok && std::fwrite(&bDep, sizeof bDep, 1, f) == 1;
-    if (ok && nBm > 0)
-        ok = std::fwrite(bm->beams.data(), sizeof(PhotonBeam), (size_t)nBm, f) == (size_t)nBm;
-    // --- caustic block (FTPMP04) ----------------------------------------------------------
-    // Its own nEmitted for the same reason the beam block has one: the normalisation belongs
-    // to the estimator, not to the file. Today it equals the surface map's (one pass fills
-    // both), and a future dedicated caustic emission pass would make it differ — at which
-    // point a file that had tied them would be silently wrong.
-    long long nCa = (pmCaustic ? (long long)pmCaustic->photons.size() : 0);
-    long long cEm = (pmCaustic ? pmCaustic->nEmitted : 0);
-    ok = ok && std::fwrite(&nCa, sizeof nCa, 1, f) == 1;
-    ok = ok && std::fwrite(&cEm, sizeof cEm, 1, f) == 1;
-    if (ok && nCa > 0) {
-        ok = std::fwrite(pmCaustic->pos.data(), sizeof(Vec3), (size_t)nCa, f) == (size_t)nCa;
-        ok = ok && std::fwrite(pmCaustic->photons.data(), sizeof(Photon), (size_t)nCa, f)
-                   == (size_t)nCa;
-    }
-    std::fclose(f);
-    if (!ok) std::fprintf(stderr, "[savemap] write to %s failed\n", path);
+    // Through the replace-beside write (file_replace.h): the map is the expensive result of a
+    // photon trace, so a crash or a full disk mid-write must leave the previous one whole.
+    const bool ok = filereplace::writeReplacing(path, [&](std::ostream& o) -> bool {
+        auto put = [&](const void* p, std::size_t n) { o.write((const char*)p, (std::streamsize)n); };
+        const char magic[8] = {'F','T','P','M','P','0','9','\n'};
+        long long nPh = (long long)pm.photons.size();
+        double en[5] = {e.emitted, e.absorbed, e.sensor, e.escaped, e.residual};
+        put(magic, 8);
+        put(&guard, sizeof guard);
+        put(&pm.nEmitted, sizeof pm.nEmitted);
+        put(en, sizeof en);
+        put(&nPh, sizeof nPh);
+        if (nPh > 0) {
+            put(pm.pos.data(), sizeof(Vec3) * (size_t)nPh);
+            put(pm.photons.data(), sizeof(Photon) * (size_t)nPh);
+        }
+        // --- beam block -----------------------------------------------------------------
+        // nEmitted is stored separately from the surface map's because a beam map normalises
+        // by the emitted count of ITS pass; they are equal today but the field is the
+        // estimator's, not the file's, and tying them would be a landmine if the passes split.
+        long long nBm  = (bm && !bm->empty()) ? (long long)bm->beams.size() : 0;
+        long long bEm  = bm ? bm->nEmitted : 0;
+        long long bDep = bm ? (long long)bm->nDeposited : 0;
+        put(&nBm, sizeof nBm);
+        put(&bEm, sizeof bEm);
+        put(&bDep, sizeof bDep);
+        if (nBm > 0) put(bm->beams.data(), sizeof(PhotonBeam) * (size_t)nBm);
+        // --- caustic block (FTPMP04) ------------------------------------------------------
+        // Its own nEmitted for the same reason the beam block has one: the normalisation
+        // belongs to the estimator, not to the file. Today it equals the surface map's (one
+        // pass fills both), and a future dedicated caustic emission pass would make it differ.
+        long long nCa = (pmCaustic ? (long long)pmCaustic->photons.size() : 0);
+        long long cEm = (pmCaustic ? pmCaustic->nEmitted : 0);
+        put(&nCa, sizeof nCa);
+        put(&cEm, sizeof cEm);
+        if (nCa > 0) {
+            put(pmCaustic->pos.data(), sizeof(Vec3) * (size_t)nCa);
+            put(pmCaustic->photons.data(), sizeof(Photon) * (size_t)nCa);
+        }
+        return (bool)o;
+    });
+    if (!ok) std::fprintf(stderr, "[savemap] could not write %s\n", path);
     return ok;
 }
 

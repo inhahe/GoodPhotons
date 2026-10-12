@@ -6369,12 +6369,13 @@ Images are written as **PNG** (24-bit RGB, 8 bits/channel — no alpha), **JPEG*
 the internal linear spectral film to 8-bit sRGB. Long renders can checkpoint to
 `<out>.ftbuf` and resume deterministically.
 
-Every file a render writes, the periodic writes included (the image, the `-hdr` PFM, the
-`.ftbuf` checkpoint), goes to `<file>.tmp` first and is then moved over `<file>`: a viewer or a
-script polling the output never reads a half-written file, and a crash or a full disk mid-write
-leaves the last good one. If something holds the file (a backup program or virus scanner on a
-just-written image), the move is retried for up to 10 s; if the holder is a viewer that shares
-writing, the file is written in place at once.
+The files a render writes and rewrites -- the image (the periodic writes included), the `-hdr`
+PFM, the `.ftbuf` checkpoint, the `-savemap` photon map and the `-exposure-anchor` file -- go to
+`<file>.tmp` first and are then moved over `<file>`: a viewer or a script polling the output never
+reads a half-written file, and a crash or a full disk mid-write leaves the last good one. If
+something holds the file (a backup program or virus scanner on a just-written image), the move is
+retried for up to 10 s; a viewer that keeps the file open while sharing writes gets it rewritten
+in place after 2.5 s. A read-only target fails at once.
 
 **Converting existing artifacts to PNG** — `ftrace -topng <in> <out.png>` re-encodes
 an artifact to a 24-bit PNG *without re-rendering*:

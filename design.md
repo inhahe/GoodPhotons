@@ -2310,14 +2310,18 @@ why these historical runs reproduce. See **J-BEAMCOST** in `known-issues.md`.
   allow, CPU fallback otherwise; all-M pinhole groups meter in one batched
   `renderPhotonMapSharedCuda` pass with `MeterConverge` early-stop via `onFrame`),
   PNG/PPM output.
-  **Every file a render writes goes through `writeReplacing`** -- the image (PNG/JPG/PPM,
-  encoded to memory first, since stb's own file writer ignores a short write), the `-hdr`
-  PFM, and both checkpoint formats: written to `<path>.tmp`, then renamed over the target,
-  so a reader never sees a half-written file and a crash or full disk mid-write leaves the
-  last good one. A held target (IDrive's image handler holds a fresh PNG ~2.5 s on this
-  machine) gets the move retried for 10 s; a holder that shares writing (a viewer) gets an
-  in-place write at once, through a stream that shares (std::ofstream; stb's `fopen_s` does
-  not). `tools/check_write_locked.py` holds the target three ways.
+  **What a render writes and rewrites goes through `filereplace::writeReplacing`**
+  (`file_replace.h`): the image (PNG/JPG/PPM, encoded to memory first, since stb's own file
+  writer ignores a short write), the `-hdr` PFM, both checkpoint formats, the `-savemap`
+  photon map and the `-exposure-anchor` file. Written to `<path>.tmp`, then renamed over the
+  target, so a reader never sees a half-written file and a crash or full disk mid-write
+  leaves the last good one. A held target (IDrive's image handler holds a fresh PNG ~2.4 s on
+  this machine) gets the rename retried for 10 s; from 2.5 s a holder that shares writing (a
+  viewer) gets a NON-truncating in-place rewrite, cut to length only once every byte is down,
+  through a stream that shares (std::fstream; stb's `fopen_s` does not). A read-only target
+  is not waited on; a held stale `.tmp` is stepped around under the next name.
+  `tools/check_write_locked.py` covers five holds. (The ROI legend and the editor's curve
+  save still write in place.)
   **Output-directory precheck:** an `ensureOutDir` lambda runs once after the `-check*`
   self-test early-returns — the earliest point where `out` is final, since the
   bare-invocation preview path can still rewrite it to a `$TEMP` name — and creates

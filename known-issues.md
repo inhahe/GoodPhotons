@@ -71,7 +71,7 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
-## DONE (2026-10-12, 0.374.5-0.374.6): IMAGE-WRITE-LOCKED — an image write failed when something held the file
+## DONE (2026-10-12, 0.374.5-0.374.7): IMAGE-WRITE-LOCKED — an image write failed when something held the file
 
 **Seen** on renders running side by side, each on its own output, nothing of ours reading
 either: now and then a periodic write printed `error: could not write png/....png`, and the next
@@ -101,11 +101,20 @@ freshly written 1 MB PNG for ~2.4 s, and `id_img.exe` appeared too. It touched P
 - where nothing can be created beside the target, it is written in place as before;
 - images are encoded to memory first, so every write is checked.
 
-**Regression check:** `tools/check_write_locked.py` holds the target three ways while `-topng`
+**0.374.7, after a second review (Fable):** the helper moved to `src/file_replace.h` and took
+in the `-savemap` photon map and the `-exposure-anchor` file. Its order changed: an immediate
+in-place write after a failed rename was wrong when the thing held is the new `.tmp` (a scanner
+on it), and the in-place write truncated first, so a full disk mid-write destroyed the old file.
+Now the rename is retried, an in-place rewrite is tried only from 2.5 s on (past the measured
+scanner hold) and once a second after, NON-truncating (cut to length after every byte is down);
+a held stale `.tmp` is stepped around; a read-only target is not waited on.
+
+**Regression check:** `tools/check_write_locked.py` holds the target five ways while `-topng`
 writes to it: a scanner (no sharing) for 3 s (the write must wait for the release and succeed),
-a viewer (sharing reads and writes) for 15 s (it must succeed at once), a scanner for 15 s (it must
-fail cleanly, the old file kept, no `.tmp` left). 0.374.3 and 0.374.5 fail all three; 0.374.6
-passes.
+a viewer (sharing reads and writes) for 15 s (it must succeed in under 5 s), a scanner for 15 s
+(it must fail cleanly, the old file kept, no `.tmp` left), a read-only target (fail in under
+2 s), and a stale `.tmp` held by a scanner (step around it, succeed). 0.374.3 and 0.374.5 fail
+the first three.
 
 ## DONE (2026-10-12, 0.374.4): TOPNG-SILENT-FLAGS — `-topng` dropped `-denoise` (and any other flag) without a word
 
