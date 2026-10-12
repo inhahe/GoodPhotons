@@ -21,7 +21,7 @@ from loom import (  # noqa: E402
     Scene, Camera, Sphere, phase_drift, emit_frames, assemble_gif,
     assemble_gif_ffmpeg, assemble_mp4,
 )
-from loom.drive import _stage_frames  # noqa: E402
+from loom.drive import _develop_args, _stage_frames  # noqa: E402
 
 HAVE_FFMPEG = shutil.which("ffmpeg") is not None
 try:
@@ -82,6 +82,23 @@ def test_emit_frames_open_timeline_has_distinct_endpoints(tmp_path):
 
 def test_emit_frames_pads_index_width_to_the_frame_count(tmp_path):
     assert emit_frames(_scene(), 1200, tmp_path, "big")[0].name == "big0000.ftsl"
+
+
+# --- the develop flags a re-develop must repeat -------------------------------
+
+def test_develop_args_keeps_denoise_and_exposure_and_drops_the_rest():
+    args = ["-spp", "64", "-denoise", "-denoise-luma", "0.4", "-window",
+            "-ev", "1.5", "-fireflies", "3", "-mode", "R"]
+    assert _develop_args(args) == ["-denoise", "-denoise-luma", "0.4", "-ev", "1.5",
+                                   "-fireflies", "3"]
+
+
+def test_develop_args_reads_an_optional_denoise_amount_only_when_it_is_a_number():
+    assert _develop_args(["-denoise", "2"]) == ["-denoise", "2"]
+    assert _develop_args(["-denoise", "-o", "x.png"]) == ["-denoise"]
+    assert _develop_args(["--denoise", "0.5", "--exposure", "2"]) == ["-denoise", "0.5",
+                                                                     "-exposure", "2"]
+    assert _develop_args(["-denoise-chroma"]) == []          # no value: not a flag pair
 
 
 # --- the concat script ------------------------------------------------------

@@ -120,6 +120,40 @@ def _target_spp(extra_args: Sequence[str]) -> Optional[int]:
         return None
 
 
+# The render flags that shape how a finished film is DEVELOPED into its PNG, and that a
+# re-develop (``-topng``) must therefore repeat: the denoiser's and the exposure
+# compensation. Each takes one value, except ``-denoise``, whose amount is optional.
+_DEVELOP_FLAGS = {"-denoise-chroma", "-denoise-luma", "-denoise-levels", "-fireflies",
+                  "-ev", "-exposure"}
+
+
+def _develop_args(extra_args: Sequence[str]) -> List[str]:
+    """The develop flags (see ``_DEVELOP_FLAGS``) out of a render's own arguments, in order.
+
+    ``stabilize_exposure`` re-develops every frame from its checkpoint; without these a
+    sequence rendered with ``-denoise`` would be overwritten by undenoised frames.
+    """
+    a = list(extra_args)
+    out: List[str] = []
+    i = 0
+    while i < len(a):
+        t = a[i][1:] if a[i].startswith("--") and len(a[i]) > 2 else a[i]   # ftrace takes both
+        if t == "-denoise":
+            out.append(t)
+            if i + 1 < len(a) and not a[i + 1].startswith("-"):
+                try:
+                    float(a[i + 1])
+                    out.append(a[i + 1])
+                    i += 1
+                except ValueError:
+                    pass
+        elif t in _DEVELOP_FLAGS and i + 1 < len(a):
+            out += [t, a[i + 1]]
+            i += 1
+        i += 1
+    return out
+
+
 def emit_frames(scene: Scene, frames: int, outdir: os.PathLike, name: str,
                 *, fps: float = 30.0, loop: bool = True) -> List[Path]:
     """Emit ``frames`` ``.ftsl`` files; return their paths.
@@ -242,7 +276,8 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
             print(f"{tag}: exit {r.returncode}, retrying", flush=True)
         pngs.append(png)
     if stabilize:
-        stabilize_exposure(pngs, anchor_file=outdir / f"{name}_exposure_anchor.txt")
+        stabilize_exposure(pngs, anchor_file=outdir / f"{name}_exposure_anchor.txt",
+                           develop_args=_develop_args(extra_args))
     return pngs
 
 
@@ -251,9 +286,10 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
 _ANCHOR_RE = re.compile(r"auto-exposure=([0-9.eE+-]+)")
 
 
-def _frame_anchor(ftrace: Path, ftbuf: Path, png: Path) -> Optional[float]:
+def _frame_anchor(ftrace: Path, ftbuf: Path, png: Path,
+                  develop_args: Sequence[str] = ()) -> Optional[float]:
     """Develop one checkpoint with its OWN auto-exposure and report the gain chosen."""
-    r = subprocess.run([str(ftrace), "-topng", str(ftbuf), str(png)],
+    r = subprocess.run([str(ftrace), "-topng", str(ftbuf), str(png), *develop_args],
                        capture_output=True, text=True, cwd=str(repo_root()))
     if r.returncode != 0:
         return None
@@ -263,7 +299,8 @@ def _frame_anchor(ftrace: Path, ftbuf: Path, png: Path) -> Optional[float]:
 
 def stabilize_exposure(pngs: Sequence[os.PathLike], *,
                        anchor_file: Optional[os.PathLike] = None,
-                       quiet: bool = False) -> Optional[float]:
+                       quiet: bool = False,
+                       develop_args: Sequence[str] = ()) -> Optional[float]:
     """Re-develop a rendered sequence through ONE shared auto-exposure anchor.
 
     A loom sequence is rendered one ftrace process per frame, so every frame picks its
@@ -289,6 +326,10 @@ def stabilize_exposure(pngs: Sequence[os.PathLike], *,
     dark.  The median leaves the typical frame's exposure exactly where it already was
     and pulls only the outliers into line.
 
+    ``develop_args`` are the render's develop flags (``_develop_args`` of its own
+    arguments: ``-denoise`` and its knobs, ``-ev``), passed to every re-develop so a
+    frame is developed the way it was rendered.
+
     Returns the chosen anchor, or ``None`` if no checkpoint was usable (a sequence
     rendered without ``-checkpoint`` cannot be re-developed, and is left alone).
     """
@@ -309,7 +350,7 @@ def stabilize_exposure(pngs: Sequence[os.PathLike], *,
         print(f"[loom] exposure: metering {len(usable)} frames…", flush=True)
     anchors = []
     for png, ftbuf in usable:
-        a = _frame_anchor(ftrace, ftbuf, png)
+        a = _frame_anchor(ftrace, ftbuf, png, develop_args)
         if a is not None and a > 0.0:
             anchors.append((png, ftbuf, a))
     if not anchors:
@@ -333,7 +374,7 @@ def stabilize_exposure(pngs: Sequence[os.PathLike], *,
         if own == shared:
             continue          # the meter pass already developed it at exactly this gain
         r = subprocess.run([str(ftrace), "-topng", str(ftbuf), str(png),
-                            "-exposure-anchor", repr(shared)],
+                            "-exposure-anchor", repr(shared), *develop_args],
                            capture_output=True, text=True, cwd=str(repo_root()))
         if r.returncode != 0:
             print(f"[loom] exposure: WARNING re-develop failed for {png.name} "
