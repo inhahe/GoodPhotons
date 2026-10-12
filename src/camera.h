@@ -305,6 +305,11 @@ struct Camera {
                       + w * ((outLocal.o.z - L.T) * 1e-3);
         Vec3 dW = u * outLocal.d.x + v * outLocal.d.y + w * outLocal.d.z;
         worldRay = Ray{oW, normalize(dW)};
+        // A degenerate prescription must not hand the tracer a NaN ray as a success: treat it
+        // as vignetted.
+        if (!(std::isfinite(worldRay.o.x) && std::isfinite(worldRay.o.y) && std::isfinite(worldRay.o.z) &&
+              std::isfinite(worldRay.d.x) && std::isfinite(worldRay.d.y) && std::isfinite(worldRay.d.z) &&
+              std::isfinite(weight))) { weight = 0.0; return false; }
         return true;
     }
 

@@ -97,8 +97,10 @@ struct VdbGrid {
         toLattice(p, fi, fj, fk);
         // Reject clearly-outside points (half a voxel margin); the medium bound
         // already clips rays to the AABB, so this only guards interpolation edges.
-        if (fi < -0.5 || fj < -0.5 || fk < -0.5 ||
-            fi > nx - 0.5 || fj > ny - 0.5 || fk > nz - 0.5) return 0.0;
+        // Written so a NaN coordinate FAILS it: a NaN point is outside every grid, and passed on it
+        // would reach the index arithmetic as INT_MIN.
+        if (!(fi >= -0.5 && fj >= -0.5 && fk >= -0.5 &&
+              fi <= nx - 0.5 && fj <= ny - 0.5 && fk <= nz - 0.5)) return 0.0;
         // Clamp the sample COORDINATE to the lattice, then interpolate. Clamping
         // only the stencil indices (as this used to) leaves the fraction near 1
         // in the outer half-voxel shell below index 0, so the sample would be

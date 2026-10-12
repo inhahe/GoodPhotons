@@ -5669,7 +5669,11 @@ as the one at fault.
   `UserSpec` (`grammar/spectrum.py`) and `is_colour_space` (`record.py`).
 - **`camera.h` / `lens.h`** — camera models incl. finite thin-lens, fisheye/pano,
   realistic multi-element lens; `scene_film.h` film/EV/auto-exposure (p99),
-  exposure-lock anchors.
+  exposure-lock anchors. The lens presets' crown and flint, and the dielectric's default ior,
+  come from `defaultGlass` (`spectral_library.h`): the `data/glass` file, else the same Schott
+  Sellmeier fit built in, so a binary away from its data renders the same glass. An achromat is
+  designed from its glasses' dispersion, and `makeAchromat` refuses two glasses without a
+  difference in it (the loader reports it) rather than design a NaN camera.
 - **`bvh.h` sphere queries** — `Aabb::dist2To` (exact point-to-box squared distance) and
   `Bvh::traverseSphere(c, r, leafFn)`, an unordered no-early-exit traversal reporting every
   primitive in a node box meeting the ball. Built for M-GATHERAREA's geometric footprint: the

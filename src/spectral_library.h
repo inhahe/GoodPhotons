@@ -298,3 +298,17 @@ inline bool resolveMetalReflectance(const std::string& name, Spectrum& out)  { r
 inline bool resolveNaturalReflectance(const std::string& name, Spectrum& out){ return speclib::loadCurve("reflectance", name, out); }
 inline bool resolveTabulatedIlluminant(const std::string& name, Spectrum& out){ return speclib::loadCurve("illuminant", name, out); }
 inline bool resolveFilterTransmittance(const std::string& name, Spectrum& out){ return speclib::loadCurve("filter", name, out); }
+
+// The crown or flint a default is made of: `name` is "BK7" or "SF10". The library glass when
+// data/glass can be read, else the same Schott catalog Sellmeier fit built in, so a binary run
+// away from its data renders the same glass, dispersion included. The defaults that need a glass
+// (the dielectric's ior, the lens presets) take it from here: an achromat is designed from its
+// glasses' dispersion and has no solution for a constant-index stand-in.
+inline Spectrum defaultGlass(const std::string& name) {
+    Spectrum s;
+    if (resolveGlassIor(name, s)) return s;
+    if (name == "SF10")
+        return sellmeier(1.62153902, 0.256287842, 1.64447552, 0.0122241457, 0.0595736775, 147.468793);
+    if (name != "BK7") throw std::logic_error("defaultGlass: no built-in glass '" + name + "'");
+    return sellmeier(1.03961212, 0.231792344, 1.01046945, 0.00600069867, 0.0200179144, 103.560653);
+}

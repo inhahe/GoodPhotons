@@ -33,8 +33,8 @@
 #include <cmath>
 #include "linalg.h"
 #include "geometry.h"   // Ray, PI
-#include "spectrum.h"           // Spectrum, iorConstant, sellmeier/cauchy evaluators
-#include "spectral_library.h"   // resolveGlassIor (loads BK7/SF10 dispersion from data/glass)
+#include "spectrum.h"           // Spectrum, iorConstant
+#include "spectral_library.h"   // defaultGlass (BK7/SF10 dispersion)
 
 // One refracting interface of the lens (a spherical cap, or a plane when radius==0).
 struct LensSurface {
@@ -253,7 +253,11 @@ inline LensSystem makeAchromat(double focalMM, double fstop,
     double V1 = abbeNumber(crown), V2 = abbeNumber(flint);
     double f  = focalMM;
     double phi = 1.0 / f;
-    double denom = (std::fabs(V1 - V2) < 1e-6) ? 1e-6 : (V1 - V2);
+    // The achromat condition phi1/V1 + phi2/V2 = 0 has no solution for two glasses of the same
+    // dispersion, or of none (a constant index has an infinite Abbe number): refuse with an empty
+    // system, which the callers report, rather than design infinite radii and a NaN camera.
+    if (!(std::isfinite(V1) && std::isfinite(V2) && std::fabs(V1 - V2) >= 1e-6)) return LensSystem{};
+    double denom = V1 - V2;
     double phi1 =  phi * V1 / denom;                      // crown power (>0)
     double phi2 = -phi * V2 / denom;                      // flint power (<0)
     double R1 =  2.0 * (n1 - 1.0) / phi1;                 // crown equiconvex
@@ -291,12 +295,7 @@ inline bool resolveLensPreset(const std::string& name, double focalMM, double fs
     for (char c : name) { if (c == ' ' || c == '_' || c == '-') continue; k += (char)std::tolower((unsigned char)c); }
     if (focalMM <= 0.0) focalMM = 50.0;
     if (fstop   <= 0.0) fstop   = 2.8;
-    // Crown/flint glasses for the singlet/doublet elements, loaded from the spectral
-    // library (data/glass/BK7.glass, SF10.glass). Constant-index fallbacks keep the
-    // preset usable if the data files are missing.
-    Spectrum bk7, sf10;
-    if (!resolveGlassIor("BK7",  bk7))  bk7  = iorConstant(1.5168);
-    if (!resolveGlassIor("SF10", sf10)) sf10 = iorConstant(1.7283);
+    const Spectrum bk7 = defaultGlass("BK7"), sf10 = defaultGlass("SF10");
     if (k == "singlet" || k == "biconvex" || k == "simple") {
         out = makeSinglet(focalMM, fstop, bk7); out.name = "singlet"; return true;
     }
