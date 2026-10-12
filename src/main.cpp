@@ -11630,6 +11630,40 @@ constexpr double ABS_EXPOSURE_GAIN = 6.0;
 static bool           g_denoise = false;
 static denoise::Params g_denoiseParams;
 
+// The denoiser's flags, shared by the main argument loop and `-topng` (which runs before it):
+// `-denoise [amount]`, `-denoise-chroma <x>`, `-denoise-luma <x>`, `-denoise-levels <n>`,
+// `-fireflies <k>`. `i` indexes the flag; returns false if argv[i] is not one of them, else sets
+// g_denoise / g_denoiseParams and leaves `i` on the last token it consumed.
+static bool parseDenoiseFlag(int argc, char** argv, int& i) {
+    const char* a = argv[i];
+    // The amount is optional, so only consume the next token if it parses as a number --
+    // otherwise `-denoise -o out.png` would silently eat the output path. It scales the
+    // tolerance that is actually ON by default, which is chroma; luma stays off unless
+    // -denoise-luma asks.
+    if (!std::strcmp(a, "-denoise")) {
+        g_denoise = true;
+        if (i + 1 < argc && argv[i + 1][0] != '-') {
+            char* end = nullptr;
+            double amt = std::strtod(argv[i + 1], &end);
+            if (end && *end == '\0' && amt > 0.0) { ++i; g_denoiseParams.chroma *= amt; }
+        }
+        return true;
+    }
+    if (i + 1 >= argc) return false;
+    if (!std::strcmp(a, "-denoise-chroma"))
+        g_denoiseParams.chroma = std::max(0.0, std::atof(argv[++i]));
+    else if (!std::strcmp(a, "-denoise-luma"))
+        g_denoiseParams.luma = std::max(0.0, std::atof(argv[++i]));
+    else if (!std::strcmp(a, "-denoise-levels"))
+        g_denoiseParams.levels = std::clamp(std::atoi(argv[++i]), 1, 8);
+    else if (!std::strcmp(a, "-fireflies"))
+        g_denoiseParams.fireflies = std::max(0.0, std::atof(argv[++i]));
+    else
+        return false;
+    g_denoise = true;
+    return true;
+}
+
 // Tone-map a film into an 8-bit RGB buffer (W*H*3, row 0 = image top; +y flipped to
 // image-top to match writeImage). Shared by writeFilm (PNG/PPM output) and the live
 // preview window so both see identical pixels. Auto-exposure mirrors writeFilm:
@@ -18510,7 +18544,8 @@ static void printHelp(const char* prog) {
 "  -topng|-convert <in> <out.png> [-ev <c>]   convert .ppm/.ftbuf to PNG\n"
 "                        (-ev re-develops a .ftbuf brighter/darker, no re-render;\n"
 "                         -exposure-anchor <v|file> re-develops a whole flickering\n"
-"                         sequence through one shared anchor, also no re-render)\n"
+"                         sequence through one shared anchor, also no re-render;\n"
+"                         -denoise and its knobs filter a .ftbuf's chroma first)\n"
 "  -review <base>        play a rendered frame sequence on the live window\n"
 "  -export-mesh <o.obj> [-mesh-res N] [-mesh-adaptive]   isosurface -> mesh\n"
 "  -serve                resident loop: re-render scene paths streamed on stdin\n"
@@ -18569,8 +18604,8 @@ static int run(int argc, char** argv) {
     // checkpoint). Kept before all scene/CLI setup so it is a pure utility path.
     if (argc >= 2 && (!std::strcmp(argv[1], "-topng") || !std::strcmp(argv[1], "-convert"))) {
         if (argc < 4) {
-            std::fprintf(stderr, "usage: %s -topng <input.ppm|input.ftbuf> [-ev <c>] "
-                                 "[-exposure-anchor <val|file>] <output.png>\n", argv[0]);
+            std::fprintf(stderr, "usage: %s -topng <input.ppm|input.ftbuf> <output.png> [-ev <c>] "
+                                 "[-exposure-anchor <val|file>] [-denoise [amount] ...]\n", argv[0]);
             return 2;
         }
         // This branch runs before the main parse loop, so -exposure/-ev has to be picked
@@ -18579,15 +18614,26 @@ static int run(int argc, char** argv) {
         // is already 8-bit sRGB and is copied through untouched. Same for
         // -exposure-anchor, which is what lets a whole directory of .ftbuf checkpoints be
         // re-developed through ONE anchor (see ExposureAnchorFile).
+        // The denoiser's flags work here too: it runs in filmToLinear, which a .ftbuf is
+        // developed through. Anything else is refused rather than dropped.
         double convExp = 0.0;   // <=0 = plain p99 auto-exposure
         std::string convAnchorArg;
-        for (int i = 4; i + 1 < argc; ++i) {
-            if (!std::strcmp(argv[i], "-exposure") || !std::strcmp(argv[i], "-ev"))
+        for (int i = 4; i < argc; ++i) {
+            if ((!std::strcmp(argv[i], "-exposure") || !std::strcmp(argv[i], "-ev")) && i + 1 < argc)
                 convExp = std::atof(argv[++i]);
-            else if (!std::strcmp(argv[i], "-exposure-anchor"))
+            else if (!std::strcmp(argv[i], "-exposure-anchor") && i + 1 < argc)
                 convAnchorArg = argv[++i];
+            else if (!parseDenoiseFlag(argc, argv, i)) {
+                std::fprintf(stderr, "error: -topng: '%s' is not one of its flags, or its value is "
+                                     "missing (it takes -ev <c>, -exposure-anchor <v|file> and the "
+                                     "-denoise flags)\n", argv[i]);
+                return 2;
+            }
         }
         const bool isPpm = endsWithCI(argv[2], ".ppm");
+        if (g_denoise && isPpm)
+            std::fprintf(stderr, "warning: -denoise ignored for a .ppm input (already 8-bit sRGB); "
+                                 "it only applies to a .ftbuf's linear film\n");
         if (convExp > 0.0 && isPpm)
             std::fprintf(stderr, "warning: -ev ignored for a .ppm input (already 8-bit sRGB); "
                                  "it only applies to a .ftbuf's linear film\n");
@@ -19365,37 +19411,8 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-dual-max-cross") && i + 1 < argc) {
             g_dualMaxCross = std::max(1, std::atoi(argv[++i]));
         }
-        // -denoise [amount]: the optional amount scales BOTH tolerances, so `-denoise 2`
-        // is twice as aggressive and `-denoise 0.5` half. The argument is optional, so
-        // only consume the next token if it actually parses as a number — otherwise
-        // `-denoise -o out.png` would silently eat the output path.
-        else if (!std::strcmp(argv[i], "-denoise")) {
-            g_denoise = true;
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
-                char* end = nullptr;
-                double a = std::strtod(argv[i + 1], &end);
-                // The optional multiplier scales the tolerance that is actually ON by
-                // default, which is chroma; luma stays off unless -denoise-luma asks.
-                if (end && *end == '\0' && a > 0.0) { ++i; g_denoiseParams.chroma *= a; }
-            }
-        }
+        else if (parseDenoiseFlag(argc, argv, i)) {}
         else if (!std::strcmp(argv[i], "-hdr")) g_writeHdr = true;
-        else if (!std::strcmp(argv[i], "-denoise-chroma") && i + 1 < argc) {
-            g_denoise = true;
-            g_denoiseParams.chroma = std::max(0.0, std::atof(argv[++i]));
-        }
-        else if (!std::strcmp(argv[i], "-denoise-luma") && i + 1 < argc) {
-            g_denoise = true;
-            g_denoiseParams.luma = std::max(0.0, std::atof(argv[++i]));
-        }
-        else if (!std::strcmp(argv[i], "-denoise-levels") && i + 1 < argc) {
-            g_denoise = true;
-            g_denoiseParams.levels = std::clamp(std::atoi(argv[++i]), 1, 8);
-        }
-        else if (!std::strcmp(argv[i], "-fireflies") && i + 1 < argc) {
-            g_denoise = true;
-            g_denoiseParams.fireflies = std::max(0.0, std::atof(argv[++i]));
-        }
         else if (!std::strcmp(argv[i], "-on-unsupported") && i + 1 < argc) { ++i; /* pre-scanned into g_onUnsupported */ }
         // An explicit absolute radius pins the radius: don't then adapt it out from under
         // the user (this was the documented workaround for mode M's scaling problem).

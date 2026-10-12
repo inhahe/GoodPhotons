@@ -71,6 +71,25 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-10-12, 0.374.4): TOPNG-SILENT-FLAGS — `-topng` dropped `-denoise` (and any other flag) without a word
+
+**Seen** developing a finished gallery_rain frame's checkpoint through the chroma filter:
+`ftrace -topng f.ftbuf out.png -denoise` wrote a file byte-identical to the one without it.
+
+**Cause:** `-topng` is dispatched before the main argument loop, and its own loop knew only `-ev`
+and `-exposure-anchor` and skipped everything else. The denoiser runs in `filmToLinear`, which a
+`.ftbuf` is developed through, so nothing but the parsing stood in the way. (`-ev` was dropped the
+same way until 0.102.1.)
+
+**Fix:** the denoiser's five flags are parsed by one helper, `parseDenoiseFlag`, which both loops
+call, and `-topng` now refuses any flag it does not take, with an error naming it. Its usage line
+also showed the flags before `<output.png>`, where they are not read; it shows them after now.
+
+**Also fixed in the docs:** REFERENCE.md described three drag-and-drop helpers
+(`ppm_to_png.bat`, `ftbuf_to_png.bat`, `ftsl_to_png.bat`) in the repo root. Root `.bat` files are
+local-only (gitignored, purged from history), and these no longer exist even locally; the
+paragraph is gone.
+
 ## DONE (2026-10-11, 0.374.3): RASTER-MIRRORED-UV — the raster preview inverted normal maps on mirrored UVs
 
 **Seen** on the symmetric Alice2 head (`tools/alice2_symmetrize.py`, whose left half reuses its right

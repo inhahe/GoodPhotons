@@ -5820,7 +5820,7 @@ survive exactly.
 | `-n <photons>` | Trace exactly this many photons/samples |
 | `-r <res>` / `-r <W> <H>` | Output resolution (overrides scene default); one value = square, two = non-square film |
 | `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension). Missing parent directories are created before the render starts (reported as `[out] created output directory …`), so a render aimed at a fresh `png/<series>/` subdir can't be traced to completion and then lost at write time. Mode `V` produces a *pair* of images (the two independent estimates it cross-checks) and writes them as `<out>_forward` / `<out>_backward` beside the given path |
-| `-topng <in> <out.png> [-ev <c>] [-exposure-anchor <v\|file>]` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); `-ev` re-develops a `.ftbuf` brighter/darker, `-exposure-anchor` develops it at a **shared** gain so a whole sequence of checkpoints can be re-developed flicker-free. See **Output** |
+| `-topng <in> <out.png> [-ev <c>] [-exposure-anchor <v\|file>] [-denoise …]` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); `-ev` re-develops a `.ftbuf` brighter/darker, `-exposure-anchor` develops it at a **shared** gain so a whole sequence of checkpoints can be re-developed flicker-free, and the `-denoise` flags filter its chroma first. Any other flag is an error. See **Output** |
 | `-review <base>` | Play a directory of already-rendered frames (`<base><digits>.<ext>`, e.g. `png/swoop/swoop`) on the live window/timeline — scrub/Play, re-time by painting speed, and Save a re-paced copy (no rendering); see the fly-viewer section |
 | `-serve` | **Resident preview server.** With `-serve -in <scene.ftsl> [flags…]`, ftrace does *not* exit after one render: it keeps the process — and with it the live window, CUDA context, and spectral/spectral-upsampling tables — resident, and re-renders whenever a new scene path arrives on **stdin** (one path per line), reusing all the other flags (`-mode`/`-n`/`-r`/`-window`/`-o`/…) with only `-in` swapped per frame. Line protocol: prints `[serve] ready` once, then `[serve] done <path>` after each frame; `quit`/`exit`/EOF ends the loop (`[serve] shutdown`). This skips the per-frame cost of process spawn + window/CUDA/table init — the dominant fixed overhead for cheap preview frames — so an external driver (e.g. loom's `PreviewServer`) can stream an animation into a single window that updates in place. Scope: resident-process reuse only; each frame is still a full independent render (no delta/geometry caching yet) and the window keeps the first frame's resolution for the session. |
 | `-mode <A..D,J,M,S,U,P,R,V>` | Render mode (default `B`) |
@@ -6407,6 +6407,21 @@ load-if-present / meter-and-save otherwise. `-exposure-anchor` also applies only
 for loom's `stabilize_exposure()`, which drives this automatically over a whole
 directory of checkpoints.
 
+The **denoiser's flags** (`-denoise [amount]` and its knobs, see **Denoising** below) work
+on this path too, so a finished render can be developed through the chroma filter without
+rendering it again:
+
+```
+ftrace -topng out.png.ftbuf out_denoised.png -denoise
+```
+
+Like `-ev`, they apply only to a `.ftbuf`. Any other flag is refused with an error.
+*(Before 0.374.4 `-topng` ignored every flag but `-ev` and `-exposure-anchor` without a
+word.)*
+
+A `.ftsl` is a *scene*, not an image, and `-topng` refuses it: render it with
+`-in scene.ftsl -o out.png`.
+
 ### Elapsed times and ETAs
 
 Every duration ftrace prints — elapsed time, time remaining, a `-time` budget, a build
@@ -6467,8 +6482,3 @@ luma).
 | `-denoise-levels <n>` | à-trous levels, support 2ⁿ wide (default 3). Swept against the reference, the optimum is a plateau at 2–3, *not* SVGF's 5: with no luma term holding the edges a very wide chroma support bleeds gold into white and caustic into floor, and by 7 levels it is a net loss |
 | `-denoise-luma <x>` | **also** filter luma (default 0 = off). Measured, this makes the image *worse* — −2.4 dB at `0.45`, because the filter cannot tell a wire or a caustic rim from a noise spike. Available for stills you want *smoothed*, not *truer* |
 | `-fireflies <k>` | clamp isolated outliers to `k`× the 2nd-brightest neighbour, hue preserved. Deliberately not energy-preserving. Implies `-denoise`; try 2–4 |
-
-A `.ftsl` is a *scene*, not an image — render it with `-in scene.ftsl -o out.png`.
-Three drag-and-drop Windows helpers in the repo root wrap this: **`ppm_to_png.bat`**,
-**`ftbuf_to_png.bat`** (both call `-topng`), and **`ftsl_to_png.bat`** (renders the
-scene). Drop a file on one, or run `ppm_to_png.bat input.ppm [output.png]`.
