@@ -2310,6 +2310,14 @@ why these historical runs reproduce. See **J-BEAMCOST** in `known-issues.md`.
   allow, CPU fallback otherwise; all-M pinhole groups meter in one batched
   `renderPhotonMapSharedCuda` pass with `MeterConverge` early-stop via `onFrame`),
   PNG/PPM output.
+  **Every file a render writes goes through `writeReplacing`** -- the image (PNG/JPG/PPM,
+  encoded to memory first, since stb's own file writer ignores a short write), the `-hdr`
+  PFM, and both checkpoint formats: written to `<path>.tmp`, then renamed over the target,
+  so a reader never sees a half-written file and a crash or full disk mid-write leaves the
+  last good one. A held target (IDrive's image handler holds a fresh PNG ~2.5 s on this
+  machine) gets the move retried for 10 s; a holder that shares writing (a viewer) gets an
+  in-place write at once, through a stream that shares (std::ofstream; stb's `fopen_s` does
+  not). `tools/check_write_locked.py` holds the target three ways.
   **Output-directory precheck:** an `ensureOutDir` lambda runs once after the `-check*`
   self-test early-returns — the earliest point where `out` is final, since the
   bare-invocation preview path can still rewrite it to a `$TEMP` name — and creates
@@ -5678,7 +5686,10 @@ as the one at fault.
   render dispatch has a dozen early `return`s and a save at any one of them would have
   been missed at the others. `-topng` accepts the same flag — it runs before the main
   argument loop, so it parses it itself and passes a `double*` down through
-  `convertToPng` → `writeFilm`'s `lockAnchor`.
+  `convertToPng` → `writeFilm`'s `lockAnchor`. Its loop takes `-ev`, `-exposure-anchor` and
+  the denoiser's flags (through `parseDenoiseFlag`, shared with the main loop) and refuses
+  anything else; `run()` resets the denoiser's settings first, since `-serve` re-runs it
+  per frame with the same argv and `-denoise <amount>` multiplies.
   **Why it was needed** (measured on `png/pastel_jack_ring`, 432 frames, static camera —
   only the ring rotates, so any global brightness change is by construction an artifact):
   the p99 anchor stepped **36.2%** between adjacent frames while the static background
@@ -5709,7 +5720,9 @@ as the one at fault.
   frame 0's anchor sat at the **93rd percentile** — 0.502× the median, a full stop — so
   the obvious rule would have darkened the whole movie. It is a pure post-pass over
   checkpoints (milliseconds a frame, no photons re-flown), and `render_range(...,
-  stabilize=True)` (the default) runs it after the last frame.
+  stabilize=True)` (the default) runs it after the last frame. Every re-develop passes the
+  render's own develop flags (`_develop_args`: `-denoise` and its knobs, `-ev`), so a
+  denoised sequence is not overwritten by undenoised frames.
 - **`-hdr` (a 32-bit float PFM beside `-o`)** — the escape hatch from the tone map, added
   because *measuring* off a PNG had quietly been wrong all along. An 8-bit sRGB image clamps
   at white, and a caustic is by definition the brightest thing in frame, so its core prints

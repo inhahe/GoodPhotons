@@ -192,10 +192,15 @@
 #endif
 
 // stb_image_write encoders (implementation compiled once in stb_image_impl.cpp).
-// Only the two we use for 8-bit RGB output; see writeImage().
+// The two we use for 8-bit RGB output; see writeImage().
 extern "C" {
-    int stbi_write_png(const char* filename, int w, int h, int comp, const void* data, int stride_bytes);
-    int stbi_write_jpg(const char* filename, int w, int h, int comp, const void* data, int quality);
+    // The encoders that hand their bytes to a callback instead of a file: writeImage encodes
+    // once, to memory, and does its own checked writes (see writeReplacing for why).
+    typedef void stbi_write_func(void* context, void* data, int size);
+    int stbi_write_png_to_func(stbi_write_func* func, void* context, int w, int h, int comp,
+                               const void* data, int stride_bytes);
+    int stbi_write_jpg_to_func(stbi_write_func* func, void* context, int w, int h, int comp,
+                               const void* data, int quality);
 }
 
 // stb_image decoder (implementation compiled once in stb_image_impl.cpp). Used by
@@ -216,6 +221,50 @@ static bool endsWithCI(const std::string& s, const char* ext) {
         if (std::tolower((unsigned char)s[s.size() - n + i]) != std::tolower((unsigned char)ext[i]))
             return false;
     return true;
+}
+
+// Write the file `path` with `write(dest)`, which writes the whole file to `dest` and returns
+// whether every byte of it was written. Returns whether `path` now holds the new file.
+//
+// THE FILE IS WRITTEN BESIDE, AS `<path>.tmp`, AND MOVED OVER `path`: a reader (a viewer, loom, a
+// script polling a render's output) never sees a half-written file, and a crash or a full disk
+// mid-write leaves the previous file whole -- which is the point of a checkpoint. A backup or virus
+// scanner can hold a just-written file for seconds (IDrive's image handler: ~2.5 s on a 1 MB PNG,
+// measured), which blocks the move. Then the file is written in place at once if the holder shares
+// writing (a viewer that keeps it open), and otherwise the move is retried for up to 10 s. Where no
+// file can be made beside the target at all (permissions, a read-only stale `.tmp`, a path at
+// MAX_PATH), it is written in place, as a plain write would be. Otherwise a failure leaves the old
+// file as it was, and no `.tmp` behind.
+//
+// `write` must open `dest` SHARING reads and writes (std::ofstream does; stb's own file writer and
+// fopen_s do not), or the in-place fallback fails against exactly the viewer it exists for.
+template <class Write>
+static bool writeReplacing(const std::string& path, Write&& write) {
+    const std::string tmp = path + ".tmp";
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);                           // a stale one, left by a crash
+    if (std::filesystem::exists(tmp, ec)) return write(path);   // ... that cannot be removed
+    if (!write(tmp)) {
+        if (!std::filesystem::exists(tmp, ec)) return write(path);   // nothing can be made beside it
+        std::filesystem::remove(tmp, ec);   // made, then failed: the disk is full or failing, so
+        return false;                       // the target is left alone
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (!ec) return true;
+    if (write(path)) { std::filesystem::remove(tmp, ec); return true; }
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::filesystem::rename(tmp, path, ec);
+        if (!ec) return true;
+    }
+    std::filesystem::remove(tmp, ec);
+    return false;
+}
+
+// stbi_write_*_to_func's sink: append the encoder's bytes to the std::vector<uint8_t> `ctx`.
+static void appendEncodedBytes(void* ctx, void* data, int size) {
+    auto* out = static_cast<std::vector<uint8_t>*>(ctx);
+    out->insert(out->end(), static_cast<uint8_t*>(data), static_cast<uint8_t*>(data) + size);
 }
 
 // Write an 8-bit RGB buffer (row-major, top row first) to `path`, choosing the
@@ -242,35 +291,27 @@ static bool writeImage(const std::string& path, int W, int H, const std::vector<
             "8-BIT data -- .pfm/.hdr/.exr are not output formats. Use -hdr, which writes a real "
             "32-bit float PFM beside -o.\n", path.c_str());
     }
-    // The format follows `path`'s extension whatever file `dest` is.
-    auto encode = [&](const std::string& dest) -> bool {
-        if (endsWithCI(path, ".png"))
-            return stbi_write_png(dest.c_str(), W, H, 3, img.data(), W * 3) != 0;
-        if (endsWithCI(path, ".jpg") || endsWithCI(path, ".jpeg"))
-            return stbi_write_jpg(dest.c_str(), W, H, 3, img.data(), 95) != 0;
+    // Encoded once, to memory, and written by a checked, sharing stream (see writeReplacing):
+    // stb's file writer ignores a short fwrite and would report a truncated file as written.
+    std::vector<uint8_t> bytes;
+    if (endsWithCI(path, ".png")) {
+        if (!stbi_write_png_to_func(appendEncodedBytes, &bytes, W, H, 3, img.data(), W * 3))
+            return false;
+    } else if (endsWithCI(path, ".jpg") || endsWithCI(path, ".jpeg")) {
+        if (!stbi_write_jpg_to_func(appendEncodedBytes, &bytes, W, H, 3, img.data(), 95))
+            return false;
+    } else {
+        const std::string head = "P6\n" + std::to_string(W) + ' ' + std::to_string(H) + "\n255\n";
+        bytes.assign(head.begin(), head.end());
+        bytes.insert(bytes.end(), img.begin(), img.end());
+    }
+    return writeReplacing(path, [&](const std::string& dest) -> bool {
         std::ofstream fo(dest, std::ios::binary);
         if (!fo) return false;
-        fo << "P6\n" << W << ' ' << H << "\n255\n";
-        fo.write((const char*)img.data(), (std::streamsize)img.size());
+        fo.write((const char*)bytes.data(), (std::streamsize)bytes.size());
         fo.close();
         return !fo.fail();
-    };
-    // WRITTEN BESIDE, THEN MOVED INTO PLACE, so a reader (a viewer, loom, a script polling a
-    // render's periodic output) never sees a half-written image. On Windows a virus scanner or
-    // the indexer can hold a freshly written image open for a moment, which blocks the move: it is
-    // retried for up to 2 s. A target held longer -- a viewer that keeps it open but shares
-    // writing -- is then written in place, as an ordinary write would; only when that fails too is
-    // the write reported failed, with the old file left as it was.
-    const std::string tmp = path + ".tmp";
-    std::error_code ec;
-    if (!encode(tmp)) { std::filesystem::remove(tmp, ec); return false; }
-    for (int attempt = 0; attempt < 20; ++attempt) {
-        std::filesystem::rename(tmp, path, ec);
-        if (!ec) return true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    std::filesystem::remove(tmp, ec);
-    return encode(path);
+    });
 }
 
 // Resolve a -light name to an emission SPD. Delegates to the shared resolver in
@@ -11822,20 +11863,23 @@ static bool g_writeHdr = false;
 // are all exposure-invariant, so leaving the gain out keeps two renders comparable even
 // when they were shot at different stops.
 static bool writePfm(const std::string& path, int W, int H, const std::vector<Vec3>& lin) {
-    std::ofstream fo(path, std::ios::binary);
-    if (!fo) return false;
-    fo << "PF\n" << W << ' ' << H << "\n-1.0\n";   // negative scale = little-endian
-    std::vector<float> row((size_t)W * 3);
-    for (int y = 0; y < H; ++y) {
-        for (int x = 0; x < W; ++x) {
-            const Vec3& c = lin[(size_t)y * W + x];
-            row[(size_t)x * 3 + 0] = (float)c.x;
-            row[(size_t)x * 3 + 1] = (float)c.y;
-            row[(size_t)x * 3 + 2] = (float)c.z;
+    return writeReplacing(path, [&](const std::string& dest) -> bool {
+        std::ofstream fo(dest, std::ios::binary);
+        if (!fo) return false;
+        fo << "PF\n" << W << ' ' << H << "\n-1.0\n";   // negative scale = little-endian
+        std::vector<float> row((size_t)W * 3);
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                const Vec3& c = lin[(size_t)y * W + x];
+                row[(size_t)x * 3 + 0] = (float)c.x;
+                row[(size_t)x * 3 + 1] = (float)c.y;
+                row[(size_t)x * 3 + 2] = (float)c.z;
+            }
+            fo.write((const char*)row.data(), (std::streamsize)(row.size() * sizeof(float)));
         }
-        fo.write((const char*)row.data(), (std::streamsize)(row.size() * sizeof(float)));
-    }
-    return (bool)fo;
+        fo.close();
+        return !fo.fail();
+    });
 }
 
 // `<path>` with its extension replaced by `.pfm` (appended if it has none), so the sidecar
@@ -15266,21 +15310,24 @@ static std::string pathWithSuffix(const std::string& path, const char* suffix) {
 
 static bool writeCheckpoint(const std::string& outPath, const Checkpoint& c,
                             uint64_t guard, char mode) {
-    std::ofstream o(checkpointPath(outPath), std::ios::binary);
-    if (!o) return false;
-    const char magic[8] = {'F','T','B','U','F','0','1','\n'};
-    int32_t rx = c.film.resX, ry = c.film.resY, m = (int32_t)(unsigned char)mode;
-    o.write(magic, 8);
-    o.write((const char*)&rx, 4); o.write((const char*)&ry, 4); o.write((const char*)&m, 4);
-    o.write((const char*)&c.N, 8);
-    double en[5] = {c.energy.emitted, c.energy.absorbed, c.energy.sensor,
-                    c.energy.escaped, c.energy.residual};
-    o.write((const char*)en, sizeof en);
-    o.write((const char*)&guard, 8);
-    o.write((const char*)c.film.xyz.data(), c.film.xyz.size() * sizeof(Vec3));
-    o.write((const char*)c.film.hits.data(), c.film.hits.size() * sizeof(double));
-    if (!writeRadCacheSection(o)) return false;
-    return (bool)o;
+    return writeReplacing(checkpointPath(outPath), [&](const std::string& dest) -> bool {
+        std::ofstream o(dest, std::ios::binary);
+        if (!o) return false;
+        const char magic[8] = {'F','T','B','U','F','0','1','\n'};
+        int32_t rx = c.film.resX, ry = c.film.resY, m = (int32_t)(unsigned char)mode;
+        o.write(magic, 8);
+        o.write((const char*)&rx, 4); o.write((const char*)&ry, 4); o.write((const char*)&m, 4);
+        o.write((const char*)&c.N, 8);
+        double en[5] = {c.energy.emitted, c.energy.absorbed, c.energy.sensor,
+                        c.energy.escaped, c.energy.residual};
+        o.write((const char*)en, sizeof en);
+        o.write((const char*)&guard, 8);
+        o.write((const char*)c.film.xyz.data(), c.film.xyz.size() * sizeof(Vec3));
+        o.write((const char*)c.film.hits.data(), c.film.hits.size() * sizeof(double));
+        if (!writeRadCacheSection(o)) return false;
+        o.close();
+        return !o.fail();
+    });
 }
 
 // Load a checkpoint for resume. Returns false (leaving `c` untouched) if the sidecar
@@ -15337,23 +15384,26 @@ struct CompositeCheckpoint {
 
 static bool writeCompositeCheckpoint(const std::string& outPath, const CompositeCheckpoint& c,
                                      uint64_t guard) {
-    std::ofstream o(checkpointPath(outPath), std::ios::binary);
-    if (!o) return false;
-    const char magic[8] = {'F','T','P','C','M','0','2','\n'};
-    int32_t rx = c.fwd.resX, ry = c.fwd.resY;
-    o.write(magic, 8);
-    o.write((const char*)&rx, 4); o.write((const char*)&ry, 4);
-    o.write((const char*)&c.N, 8); o.write((const char*)&c.spp, 8);
-    double en[5] = {c.energy.emitted, c.energy.absorbed, c.energy.sensor,
-                    c.energy.escaped, c.energy.residual};
-    o.write((const char*)en, sizeof en);
-    o.write((const char*)&guard, 8);
-    o.write((const char*)c.fwd.xyz.data(), c.fwd.xyz.size() * sizeof(Vec3));
-    o.write((const char*)c.fwd.hits.data(), c.fwd.hits.size() * sizeof(double));
-    o.write((const char*)c.ref.xyz.data(), c.ref.xyz.size() * sizeof(Vec3));
-    o.write((const char*)c.ref.hits.data(), c.ref.hits.size() * sizeof(double));
-    if (!writeRadCacheSection(o)) return false;   // mode P's backward layer reads the cache too
-    return (bool)o;
+    return writeReplacing(checkpointPath(outPath), [&](const std::string& dest) -> bool {
+        std::ofstream o(dest, std::ios::binary);
+        if (!o) return false;
+        const char magic[8] = {'F','T','P','C','M','0','2','\n'};
+        int32_t rx = c.fwd.resX, ry = c.fwd.resY;
+        o.write(magic, 8);
+        o.write((const char*)&rx, 4); o.write((const char*)&ry, 4);
+        o.write((const char*)&c.N, 8); o.write((const char*)&c.spp, 8);
+        double en[5] = {c.energy.emitted, c.energy.absorbed, c.energy.sensor,
+                        c.energy.escaped, c.energy.residual};
+        o.write((const char*)en, sizeof en);
+        o.write((const char*)&guard, 8);
+        o.write((const char*)c.fwd.xyz.data(), c.fwd.xyz.size() * sizeof(Vec3));
+        o.write((const char*)c.fwd.hits.data(), c.fwd.hits.size() * sizeof(double));
+        o.write((const char*)c.ref.xyz.data(), c.ref.xyz.size() * sizeof(Vec3));
+        o.write((const char*)c.ref.hits.data(), c.ref.hits.size() * sizeof(double));
+        if (!writeRadCacheSection(o)) return false;   // mode P's backward layer reads the cache too
+        o.close();
+        return !o.fail();
+    });
 }
 
 static bool readCompositeCheckpoint(const std::string& outPath, int res, int resY,
@@ -18586,6 +18636,11 @@ static void printHelp(const char* prog) {
 }
 
 static int run(int argc, char** argv) {
+    // `-serve` calls run() once per frame with the same argv, so state a flag ADJUSTS rather
+    // than sets must start from its default each time: `-denoise 2` multiplies the chroma
+    // tolerance, and would otherwise compound frame after frame.
+    g_denoise = false;
+    g_denoiseParams = denoise::Params{};
     // Normalize GNU-style double-dash options to the single-dash spellings the parser
     // uses, so EVERY flag accepts either form (`--window` == `-window`, `--beams` ==
     // `-beams`, etc.). We simply advance the pointer past one leading dash for any token

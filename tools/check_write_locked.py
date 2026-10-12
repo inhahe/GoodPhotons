@@ -1,17 +1,20 @@
-"""Regression check: an image write survives the output file being locked for a moment.
+"""Regression check: an image write survives the output file being held by another process.
 
     D:/python314/python.exe -u tools/check_write_locked.py [--out <dir>] [--exe ftrace.exe]
 
-On Windows a virus scanner or a viewer can hold a just-written image open for a moment, and a
-render's next write to it (the periodic one, or the final one) used to fail outright:
-`error: could not write <path>`. ftrace now writes a temporary file beside the target and moves it
-into place, retrying while the target is held. Checked here through `-topng`, which writes through
-the same function a render does:
-  1. the target is opened with NO sharing (as a scanner may) and released after 1 s, while
-     `-topng` writes to it: the write must succeed, and the file must be the new image;
-  2. the target is held for longer than the retry window: the write must fail cleanly (exit 1, the
-     old file untouched, no temporary file left behind).
-Windows only (the lock is a Win32 share mode). Exits 1 on any failure.
+On Windows a backup program or virus scanner can hold a just-written image for seconds, and a
+viewer can keep one open; a render's next write to it (a periodic one, or the final one) used to
+fail outright: `error: could not write <path>`. ftrace writes a temporary file beside the target and
+moves it into place: written in place at once when the holder shares writing, the move retried for
+up to 10 s when it does not. Checked through `-topng`, which writes through the same function a
+render does, with the target held three ways:
+  1. SCANNER, 3 s: opened with NO sharing (as a scanner may). The write must WAIT for the release
+     (it finishes after the release) and then succeed.
+  2. VIEWER, 15 s: opened sharing reads and writes but not deletion, so the move cannot replace
+     it. The write must succeed in place without waiting out the hold.
+  3. SCANNER, 15 s: longer than the retry window. The write must fail cleanly: exit 1, the old
+     file untouched, no temporary file left behind.
+Windows only (the holds are Win32 share modes). Exits 1 on any failure.
 """
 import argparse
 import ctypes
@@ -28,6 +31,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
 GENERIC_READ = 0x80000000
 OPEN_EXISTING = 3
+SHARE_NONE, SHARE_READ_WRITE = 0, 0x1 | 0x2
 INVALID = ctypes.c_void_p(-1).value
 
 k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -35,15 +39,17 @@ k32.CreateFileW.restype = wt.HANDLE
 k32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.c_void_p, wt.DWORD, wt.DWORD, wt.HANDLE]
 
 
-def hold(path, seconds, ready):
-    """Open `path` with no sharing at all, signal `ready`, keep it `seconds`, close it."""
-    h = k32.CreateFileW(path, GENERIC_READ, 0, None, OPEN_EXISTING, 0, None)
+def hold(path, share, seconds, ready, released):
+    """Open `path` with share mode `share`, signal `ready`, keep it `seconds`, close it, and
+    record in `released` when."""
+    h = k32.CreateFileW(path, GENERIC_READ, share, None, OPEN_EXISTING, 0, None)
     if h in (None, INVALID):
         ready.set()
         raise OSError("CreateFileW failed: %d" % ctypes.get_last_error())
     ready.set()
     time.sleep(seconds)
     k32.CloseHandle(h)
+    released.append(time.perf_counter())
 
 
 def main():
@@ -54,6 +60,9 @@ def main():
     a.exe = os.path.abspath(a.exe)          # CreateProcess wants a full path for a relative one
     d = os.path.abspath(a.out)
     os.makedirs(d, exist_ok=True)
+    for f in os.listdir(d):                 # a previous run's files must not pass for this run's
+        if f.startswith("locked_"):
+            os.remove(os.path.join(d, f))
     scene = os.path.join(d, "s.ftsl")
     with open(scene, "w", encoding="utf-8", newline="") as f:
         f.write(NL.join([
@@ -70,29 +79,38 @@ def main():
         print(r.stdout[-1500:], r.stderr[-1500:]); print("FAIL: no checkpoint to develop"); return 1
 
     ok = True
-    for name, secs, expect_ok in (("short", 1.0, True), ("long", 12.0, False)):
+    for name, share, secs in (("scanner_3s", SHARE_NONE, 3.0), ("viewer_15s", SHARE_READ_WRITE, 15.0),
+                              ("scanner_15s", SHARE_NONE, 15.0)):
         target = os.path.join(d, "locked_%s.png" % name)
         Image.new("RGB", (8, 8), (255, 0, 255)).save(target)            # the "old" file: 8x8 magenta
         before = os.path.getmtime(target)
-        ready = threading.Event()
-        t = threading.Thread(target=hold, args=(target, secs, ready)); t.start(); ready.wait()
-        t0 = time.time()
+        ready, released = threading.Event(), []
+        t = threading.Thread(target=hold, args=(target, share, secs, ready, released)); t.start(); ready.wait()
+        t0 = time.perf_counter()
         r = subprocess.run([a.exe, "-topng", ftbuf, target], capture_output=True, text=True,
                            encoding="utf-8", errors="replace")
-        took = time.time() - t0
+        t1 = time.perf_counter()
         t.join()
         img = Image.open(target); size = img.size; img.close()
         leftovers = [f for f in os.listdir(d) if f.startswith("locked_%s.png." % name)]
-        if expect_ok:
-            good = r.returncode == 0 and size == (64, 48) and not leftovers
-            print("%s: held 1 s -> exit %d after %.1f s, file is %dx%d%s" % (
-                "ok" if good else "FAIL", r.returncode, took, size[0], size[1],
-                (", leftovers %s" % leftovers) if leftovers else ""))
+        new = size == (64, 48)
+        if name == "scanner_3s":
+            # Finishing AFTER the release proves the write waited for the lock, rather than the
+            # lock happening to be gone before ftrace got to the file.
+            waited = t1 >= released[0]
+            good = r.returncode == 0 and new and not leftovers and waited
+            what = "exit %d after %.1f s, %s, finished %s the release" % (
+                r.returncode, t1 - t0, "new image" if new else "OLD image", "after" if waited else "BEFORE")
+        elif name == "viewer_15s":
+            good = r.returncode == 0 and new and not leftovers and (t1 - t0) < 5.0
+            what = "exit %d after %.1f s, %s" % (r.returncode, t1 - t0, "new image" if new else "OLD image")
         else:
-            good = r.returncode == 1 and size == (8, 8) and os.path.getmtime(target) == before and not leftovers
-            print("%s: held 12 s -> exit %d after %.1f s, the old file %s%s" % (
-                "ok" if good else "FAIL", r.returncode, took, "kept" if size == (8, 8) else "REPLACED",
-                (", leftovers %s" % leftovers) if leftovers else ""))
+            good = (r.returncode == 1 and not new and os.path.getmtime(target) == before
+                    and not leftovers and (t1 - t0) >= 9.5)
+            what = "exit %d after %.1f s, the old file %s" % (
+                r.returncode, t1 - t0, "kept" if not new else "REPLACED")
+        print("%s: %s -> %s%s" % ("ok" if good else "FAIL", name, what,
+                                  (", leftovers %s" % leftovers) if leftovers else ""))
         ok &= good
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1

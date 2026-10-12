@@ -71,26 +71,41 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
-## DONE (2026-10-12, 0.374.5): IMAGE-WRITE-LOCKED — an image write failed when something held the file for a moment
+## DONE (2026-10-12, 0.374.5-0.374.6): IMAGE-WRITE-LOCKED — an image write failed when something held the file
 
-**Seen** on two GPU renders running side by side, each on its own output, nothing of ours reading
-either: one periodic write in each printed `error: could not write png/....png`, and the next
-write 15 s later succeeded. Something on the machine (a virus scanner or the indexer, on a file
-just written) held the file for a moment. A periodic write losing a refresh is harmless; the
-FINAL write failing the same way loses the render, unless `-checkpoint` kept its film.
+**Seen** on renders running side by side, each on its own output, nothing of ours reading
+either: now and then a periodic write printed `error: could not write png/....png`, and the next
+one succeeded. A lost periodic write is harmless; a FINAL write lost the same way loses the
+render, unless `-checkpoint` kept its film.
 
-**Cause:** `writeImage` encoded straight onto the output path, so any moment the target was held
-without write sharing failed the write. Writing in place also let a reader polling the output (a
-viewer, loom, a script) catch a half-written image.
+**Who holds the file:** a Restart Manager probe (`scraps/face/lockprobe.py`, which asks Windows
+which processes have a file open) caught **IDrive**, the backup program: `idwutil_600.exe` held a
+freshly written 1 MB PNG for ~2.4 s, and `id_img.exe` appeared too. It touched PNGs, not the
+`.ftbuf` checkpoints.
 
-**Fix:** the image is encoded to `<path>.tmp` beside the target and moved into place, the move
-retried for up to 2 s while the target is held. A target held longer is then written in place as
-before (a viewer that keeps a file open while sharing writes still gets its update), and only if
-that fails too is the write reported failed, the old file untouched and no `.tmp` left behind.
+**Causes, three of them:**
+- `writeImage` encoded straight onto the target with stb's file writer, which opens through
+  `fopen_s` with NO sharing: it fails against ANY open handle on the file, a viewer's or a
+  scanner's.
+- stb ignores a short `fwrite`, so a full disk wrote a truncated image and reported success.
+- The checkpoints and the `-hdr` PFM were truncated and rewritten in place: a crash mid-write
+  destroyed the very sidecar meant to survive a crash.
 
-**Regression check:** `tools/check_write_locked.py` holds the target open with no sharing while
-`-topng` writes to it: for 1 s (the write must succeed: 0.374.4 and earlier exit 1 at once), and
-for 12 s (the write must fail cleanly, the old file kept).
+**Fix:** one helper, `writeReplacing`, for the image, the PFM and both checkpoint formats:
+- the file is written to `<path>.tmp` and renamed over the target, so a reader never sees a
+  half-written file and a crash or a full disk leaves the last good one;
+- a held target gets an in-place write at once when the holder shares writing (a viewer),
+  through a stream that shares (std::ofstream);
+- otherwise the rename is retried for 10 s (0.374.5 retried for 2 s, which IDrive's 2.4 s holds
+  outlasted, and its in-place fallback went through stb's `fopen_s` and could never succeed);
+- where nothing can be created beside the target, it is written in place as before;
+- images are encoded to memory first, so every write is checked.
+
+**Regression check:** `tools/check_write_locked.py` holds the target three ways while `-topng`
+writes to it: a scanner (no sharing) for 3 s (the write must wait for the release and succeed),
+a viewer (sharing reads and writes) for 15 s (it must succeed at once), a scanner for 15 s (it must
+fail cleanly, the old file kept, no `.tmp` left). 0.374.3 and 0.374.5 fail all three; 0.374.6
+passes.
 
 ## DONE (2026-10-12, 0.374.4): TOPNG-SILENT-FLAGS — `-topng` dropped `-denoise` (and any other flag) without a word
 
@@ -105,6 +120,13 @@ same way until 0.102.1.)
 **Fix:** the denoiser's five flags are parsed by one helper, `parseDenoiseFlag`, which both loops
 call, and `-topng` now refuses any flag it does not take, with an error naming it. Its usage line
 also showed the flags before `<output.png>`, where they are not read; it shows them after now.
+
+**Also fixed with it (0.374.6):** `-serve` re-runs the argument parse for every frame, and
+`-denoise <amount>` multiplies the chroma tolerance, so each frame filtered harder than the last
+(x4, x16, ...). `run()` now resets the denoiser's settings first. `tools/check_serve_denoise.py`
+renders one scene twice in one `-serve` process and requires identical frames. And loom's
+`stabilize_exposure` re-developed frames without the render's `-denoise`/`-ev`, overwriting a
+denoised sequence with undenoised frames; it passes them on now.
 
 **Also fixed in the docs:** REFERENCE.md described three drag-and-drop helpers
 (`ppm_to_png.bat`, `ftbuf_to_png.bat`, `ftsl_to_png.bat`) in the repo root. Root `.bat` files are
