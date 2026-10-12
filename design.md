@@ -1385,18 +1385,24 @@ Not fixed: a pinprick-sized dark dot in front of each ear, on the cheek, from th
 in the colour or normal maps, and no fold shows in the mesh there.
 
 **Alice2 in gallery_rain (2026-10-12, `tools/alice2_gallery.py`).** The finished doll
-(`base_basic_pbr_flat_sparkle_sym_eyes.glb`) and her v3 hair replace the Meshy doll and its groom
-on the far-right court's cap, at the same spot and turn. The tool copies the doll, the scalps and
-the headband into `meshes/` and writes the hair for the hall:
+(`base_basic_pbr_flat_sparkle_sym_eyes.glb`) and her v3 hair stand on the far-right court's cap.
+The tool owns the placement and the scale, and writes one include, `scenes/alice2_gallery.ftsl`,
+that gallery_rain pulls in whole -- the doll's own mesh block among it, so the doll and her hair
+cannot be placed at two different scales:
 - **Size:** the doll, feet to the top of her hair and without her stand (`root.2`), is 10 in at
-  the hall's display scale 3, so the mesh scale is 0.464458. Her stand stands on the cap.
-- **Why the tool moves the curves itself:** a `group` transform bakes meshes, primitives and
-  lights but not curves or a fur block's metric settings. So the guides' and flyaways' points are
-  moved into the hall (`meshes/alice2_hair_gallery_curves.ftsl`, 9 MB, gitignored), and every
-  length a fur block carries (fibre radius, clump size, root offset) is multiplied by the scale.
-  The scalps and the headband are meshes and take the transform in their own blocks
-  (`scenes/alice2_hair_gallery.ftsl`, checked in).
-- **Rerun it** whenever the doll or the hair is regenerated: the placement lives in its constants.
+  the hall's display scale 3; the height comes from the GLB's POSITION accessor bounds, and a GLB
+  with node transforms is refused (the loader would apply them and the measurement would not).
+- **Each part takes the placement its own way.** Meshes (the doll, the scalps, the headband)
+  carry it as their mesh block's transform. The guides and the flyaways go in verbatim inside a
+  `group` (`meshes/alice2_gallery_{guides,flyaways}.ftsl`, gitignored): a group transforms a
+  curve's points and scales its radii once, and a by-name reference reads the untransformed
+  definition, so the placement is exact. Fur blocks are the one thing no transform reaches, so
+  the tool multiplies their lengths (`radius`, `clump_size`, `root_offset`, ...) and divides an
+  area `density`, and stops on any setting it has no rule for. A `-dumpcurves` of the result
+  matches the earlier point-by-point placement strand for strand.
+- **The rig is read, not retyped:** the groom file part by part in its own order, and the
+  headband's section of the rig's scene, its material names prefixed `alice2_`.
+- **Rerun it** whenever the doll or the hair is regenerated.
 
 **Alice2's eyes (2026-10-07..11, `tools/alice2_eyes.py`, tooling only): a new copy of the GLB with
 crisp, matching eyes; the face round them unchanged.** Problems in the source:

@@ -1504,27 +1504,21 @@ isosurface "stand_compote_cap" { material capmarble_compote
 #     everything behind it — the compote comment above learned the same thing — and here it is
 #     worse: the gold gyroid spans z 5.00..7.10 across the middle of the aisle, so the whole
 #     aisle behind it is its shadow and the whole aisle in front of it is below the frame.
-# ELEVATION is what breaks the deadlock. On a 0.90 m cap her head reaches y=2.51, which is
-# ABOVE every other exhibit in the hall (the tallest, the gold gyroid's clip, tops out at
-# 2.13), so the top two thirds of her stand in empty sky that nothing can screen. That is the
-# whole argument for making her the thirteenth EXHIBIT rather than the first visitor.
+# ELEVATION is what breaks the deadlock: on a 0.90 m cap she stands above the silhouettes of
+# the near row, which every floor site was behind. That is the argument for making her the
+# thirteenth EXHIBIT rather than the first visitor.
 #
-# The far-right court then wins on four measurements, all from `_alicesite.py`:
-#   * IN FRAME AND LARGE. Alice projects to x 1070..1258, y 266..481 — 188 x 215 px, taller
-#     than anything else in the still and second only to the gyroid in area, with 22 px still
-#     to the right edge. The cap clears it by 27 px. The frame's right margin was the last
+# The far-right court then wins on three measurements:
+#   * IN FRAME, AND CLEAR. Alice projects to x 1123..1169, y 361..473 (46 x 111 px), and in the
+#     preview of `cam` no nearer silhouette overlaps her. The frame's right margin was the last
 #     empty band left after the compote took the bottom-right corner.
-#   * ALMOST NOTHING IN FRONT OF HER. The only nearer silhouette her box touches is the glass
-#     orb's, and only a 47 px strip of its right edge — which is a BALL OF CRYSTAL, so that
-#     strip refracts her rather than hiding her. (The compote's box grazes her by 6 px.)
-#   * SHE STANDS IN FRONT OF THE BOW, not on top of it. The bow lives at x 772..1188,
-#     y 228..388 and its crown is at x≈950; her left edge at 1070 cuts only its right limb.
-#     A figure with the arc terminating behind her is the whole reason to put her on this side
-#     of the hall instead of the empty left one, where she would have had the axicon in front
-#     of her and black sky behind.
-#   * OFF THE FLIGHT PATH, as it was sited. The flyby's furthest-right control point was then
-#     x=7.70 (through the glass orb). The behind-the-cloud circuit added since passes within
-#     0.5 m of her hair (frames 242-257 of `fly`) — see ALICE and FLYBY.
+#   * THE BOW ENDS BEHIND HER, not on top of her. The bow lives at x 772..1188, y 228..388 and
+#     its crown is at x≈950, so only the end of its right limb reaches her box. A figure with the
+#     arc terminating behind her is the whole reason to put her on this side of the hall instead
+#     of the empty left one, where she would have had the axicon in front of her and black sky
+#     behind.
+#   * NEAR THE FLIGHT PATH. The flyby's behind-the-cloud circuit passes within 0.5 m of her
+#     (frames 225-260 of `fly`) — see ALICE.
 # THE CAP DIPS 0.35 m INTO THE RAIN. Its far edge is at z=3.05 against the rain shaft's near
 # face at z=3.40. That is deliberate and it is cheap: 0.35 m at sigma_t 0.35 is optical depth
 # 0.12, a 12% attenuation smoothly ramped across the slab's far corner and invisible at this
@@ -1553,11 +1547,10 @@ isosurface "stand_alice_cap" { material capmarble_alice
     # is no downwind for the slab to lean toward and `_gemsweep.py` has nothing to sweep. The
     # only thing this tabletop has to hold is her own footprint.
     #
-    # 1.00 x 1.00, sized for the first doll (a 0.669 x 0.498 m footprint, 0.799 x 0.697 m
-    # axis-aligned after `rotate 0 20 0`). The Hyper3D doll on her own stand needs far less:
+    # 1.00 x 1.00, a plinth's proportion rather than a fit: the doll on her own stand covers
     # 0.345 x 0.341 m axis-aligned, hair included, leaving 0.32 m or more on every side. The
-    # slab stays at 1.00 as a plinth's proportion rather than a fit; the nearest cap is
-    # stand_glass_cap, 0.40 m away in x, and the slab still clears the frame edge by 27 px.
+    # nearest cap is stand_glass_cap, 0.40 m away in x, and the slab clears the frame edge by
+    # 27 px.
     box { center 9.15 0.81 3.55  size 1.00 0.18 1.00  round 0.02 } }
 
 # ==============================  HERO PIECES  =================================
@@ -2388,47 +2381,40 @@ mesh "cp_turquoise" { file "meshes/compote_with_gems.glb"  import_materials no
 # On stand_alice_cap (top y=0.90) at the near edge of the rain shaft — see the stand block
 # above for why the far-right court is the only place in this room a figure can stand.
 #
-# 2026-10-12: THE HYPER3D DOLL (alice2) with her strand hair, replacing the Meshy doll and its
-# scalp-cap groom. `meshes/alice2_doll.glb` is alice2_hyper3d/model/
-# base_basic_pbr_flat_sparkle_sym_eyes.glb: the model's PBR atlases with the sequinned blue dress
-# recolour, her face made symmetric (tools/alice2_symmetrize.py) and crisp painted eyes
-# (tools/alice2_eyes.py). Her sculpted hair (glTF material root.1, with its moulded headband and
-# bow) is skipped: the v3 strand groom (tools/alice2_hair3.py) replaces it, carried into the hall
-# by tools/alice2_gallery.py, which writes this block's numbers and alice2_hair_gallery.ftsl.
+# THE DOLL is the Hyper3D Alice as finished: alice2_hyper3d/model/
+# base_basic_pbr_flat_sparkle_sym_eyes.glb, the sequinned blue dress recolour with her face made
+# symmetric (tools/alice2_symmetrize.py) and crisp painted eyes (tools/alice2_eyes.py). Her
+# sculpted hair (glTF material root.1, headband and bow moulded in) is skipped for the v3 strand
+# groom (tools/alice2_hair3.py): 130,000 strands on 4061 guides, and the satin headband and bow.
+# `alice2_gallery.ftsl` holds all of it, placed: GENERATED by tools/alice2_gallery.py, which
+# holds the placement and the scale, and which has to be rerun when the doll or her hair is.
 #
 # THE ONLY IMPORTED PAINT IN THE SCENE, and that is the point of her being here. Every other
 # surface in this gallery is authored: a measured n/k metal, a named optical glass, a
-# Jakob-Hanika reflectance, a marble slab rescaled to a target albedo. She is painted straight
-# from the GLB's 2048^2 baseColor, normal and metallic-roughness atlases: the scene's
-# demonstration that a spectral forward renderer can eat an off-the-shelf textured asset.
+# Jakob-Hanika reflectance, a marble slab rescaled to a target albedo. She is painted from the
+# GLB's 2048^2 baseColor, normal and metallic-roughness atlases: the scene's demonstration that a
+# spectral forward renderer can eat an off-the-shelf textured asset. Her dress's sequins are a
+# clean metal mask in that map, and the loader types the dress by the map's mean (non-metal)
+# unless the render passes `-import-metal mix`.
 #
 # THE FALLBACK MATERIAL IS NOT DECORATION. FTSL requires one on every `mesh` and it is what
 # the primitives get if the glTF material fails to import, so it has to be a value that would
 # be VISIBLY WRONG rather than plausibly right: `alice_unpainted` is flat 0.5 grey, so a
 # silent texture-import regression shows up as a grey statuette instead of quietly shipping.
 #
-# SEATING. The doll herself, feet to the top of her hair, is a 10-inch doll (the size the Meshy
-# doll was given) at the hall's display scale 3.0: 0.762 m, so the model's 1.640 m of doll scales
-# by 0.464458. Her own stand (root.2: a base and a rod up to her waist) stands on the cap, the
-# model's y 0 at the cap top, so her feet are 0.118 m up and her hair tops out at 1.78 m.
-# That is below the gyroid's 2.13, so the siting argument above (her head clearing every
-# other exhibit, from when she stood 1.61 m tall) no longer holds: re-run scraps/_alicesite.py
-# if nearer pieces screen her in the still.
+# SEATING. The doll herself, feet to the top of her hair, is her real 10 inches at the hall's
+# display scale 3.0: 0.762 m. Her own stand (root.2: a base and a rod up to her waist) stands on
+# the cap, so her feet are 0.118 m up and her hair tops out at 1.78 m, below the gold gyroid's
+# 2.13. In the still she projects to x 1123..1169, y 361..473: 46 x 111 px at the right edge.
 #
-# `rotate 0 20 0`, as the Meshy doll had it. The model faces +z out of the box, and +z from this
-# court is 37 deg off the bearing to the still camera at (5.0, 2.95, 9.35). A positive y-rotation
-# swings +z toward +x (measured with a `-dumpcurves` probe of a rotated group), and the 20 deg
-# was chosen by rendering it (scraps/_aliceface.ftsl): a three-quarter view, her gaze along the
-# row of exhibits instead of off the edge of the picture.
+# `rotate 0 20 0`. The model faces +z, and a positive y-rotation swings +z toward +x, so she
+# faces 20 deg toward the frame's right edge: the still camera sits 56 deg to her right.
+# (`rotate 0 -20 0` would put it 16 deg to her right, a three-quarter view into the hall.)
 #
-# THE FLYBY PASSES HER. The behind-the-cloud circuit added since the siting notes above comes
-# within 0.5 m of her hair around frames 242-257 of `fly` (not "1.45 m from this cap").
-mesh "alice2" { file "meshes/alice2_doll.glb"  material alice_unpainted  skip_material root.1
-    translate 9.150000 0.900000 3.550000   rotate 0 20 0   scale 0.464458 }
-
-# Her hair: 130,000 strands following 4061 guides traced through her sculpted hair's volume,
-# her headband and bow, all at the same placement; see scenes/alice2_hair_gallery.ftsl.
-include "alice2_hair_gallery.ftsl"
+# THE FLYBY PASSES HER: frames 225-255 of `fly` approach from her right, the hair growing from a
+# fifth of the frame's height to three quarters, and the camera passes within 0.5 m of her face
+# at frames 256-260, looking away from her.
+include "alice2_gallery.ftsl"
 
 # ==============================  LIGHTING  ====================================
 # TWO lights now that the roof is gone (the xenon short-arc lamp that used to hang here was
