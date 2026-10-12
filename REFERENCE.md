@@ -6369,6 +6369,11 @@ Images are written as **PNG** (24-bit RGB, 8 bits/channel — no alpha), **JPEG*
 the internal linear spectral film to 8-bit sRGB. Long renders can checkpoint to
 `<out>.ftbuf` and resume deterministically.
 
+Every image write, the periodic ones included, goes to `<out>.tmp` first and is then moved over
+`<out>`, so a viewer or a script polling the output never reads a half-written file. If something
+holds the file for a moment (a virus scanner on a just-written image), the move is retried for up
+to 2 s.
+
 **Converting existing artifacts to PNG** — `ftrace -topng <in> <out.png>` re-encodes
 an artifact to a 24-bit PNG *without re-rendering*:
 

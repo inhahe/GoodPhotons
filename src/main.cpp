@@ -242,15 +242,35 @@ static bool writeImage(const std::string& path, int W, int H, const std::vector<
             "8-BIT data -- .pfm/.hdr/.exr are not output formats. Use -hdr, which writes a real "
             "32-bit float PFM beside -o.\n", path.c_str());
     }
-    if (endsWithCI(path, ".png"))
-        return stbi_write_png(path.c_str(), W, H, 3, img.data(), W * 3) != 0;
-    if (endsWithCI(path, ".jpg") || endsWithCI(path, ".jpeg"))
-        return stbi_write_jpg(path.c_str(), W, H, 3, img.data(), 95) != 0;
-    std::ofstream fo(path, std::ios::binary);
-    if (!fo) return false;
-    fo << "P6\n" << W << ' ' << H << "\n255\n";
-    fo.write((const char*)img.data(), (std::streamsize)img.size());
-    return (bool)fo;
+    // The format follows `path`'s extension whatever file `dest` is.
+    auto encode = [&](const std::string& dest) -> bool {
+        if (endsWithCI(path, ".png"))
+            return stbi_write_png(dest.c_str(), W, H, 3, img.data(), W * 3) != 0;
+        if (endsWithCI(path, ".jpg") || endsWithCI(path, ".jpeg"))
+            return stbi_write_jpg(dest.c_str(), W, H, 3, img.data(), 95) != 0;
+        std::ofstream fo(dest, std::ios::binary);
+        if (!fo) return false;
+        fo << "P6\n" << W << ' ' << H << "\n255\n";
+        fo.write((const char*)img.data(), (std::streamsize)img.size());
+        fo.close();
+        return !fo.fail();
+    };
+    // WRITTEN BESIDE, THEN MOVED INTO PLACE, so a reader (a viewer, loom, a script polling a
+    // render's periodic output) never sees a half-written image. On Windows a virus scanner or
+    // the indexer can hold a freshly written image open for a moment, which blocks the move: it is
+    // retried for up to 2 s. A target held longer -- a viewer that keeps it open but shares
+    // writing -- is then written in place, as an ordinary write would; only when that fails too is
+    // the write reported failed, with the old file left as it was.
+    const std::string tmp = path + ".tmp";
+    std::error_code ec;
+    if (!encode(tmp)) { std::filesystem::remove(tmp, ec); return false; }
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        std::filesystem::rename(tmp, path, ec);
+        if (!ec) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    std::filesystem::remove(tmp, ec);
+    return encode(path);
 }
 
 // Resolve a -light name to an emission SPD. Delegates to the shared resolver in

@@ -71,6 +71,27 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-10-12, 0.374.5): IMAGE-WRITE-LOCKED — an image write failed when something held the file for a moment
+
+**Seen** on two GPU renders running side by side, each on its own output, nothing of ours reading
+either: one periodic write in each printed `error: could not write png/....png`, and the next
+write 15 s later succeeded. Something on the machine (a virus scanner or the indexer, on a file
+just written) held the file for a moment. A periodic write losing a refresh is harmless; the
+FINAL write failing the same way loses the render, unless `-checkpoint` kept its film.
+
+**Cause:** `writeImage` encoded straight onto the output path, so any moment the target was held
+without write sharing failed the write. Writing in place also let a reader polling the output (a
+viewer, loom, a script) catch a half-written image.
+
+**Fix:** the image is encoded to `<path>.tmp` beside the target and moved into place, the move
+retried for up to 2 s while the target is held. A target held longer is then written in place as
+before (a viewer that keeps a file open while sharing writes still gets its update), and only if
+that fails too is the write reported failed, the old file untouched and no `.tmp` left behind.
+
+**Regression check:** `tools/check_write_locked.py` holds the target open with no sharing while
+`-topng` writes to it: for 1 s (the write must succeed: 0.374.4 and earlier exit 1 at once), and
+for 12 s (the write must fail cleanly, the old file kept).
+
 ## DONE (2026-10-12, 0.374.4): TOPNG-SILENT-FLAGS — `-topng` dropped `-denoise` (and any other flag) without a word
 
 **Seen** developing a finished gallery_rain frame's checkpoint through the chroma filter:
