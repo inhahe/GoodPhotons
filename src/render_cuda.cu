@@ -10833,7 +10833,8 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         g.fall = (Real)spotFalloff(dot(g.wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
         if (g.fall <= (Real)0) return false;
         if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
-               : !((vis = shadowTransmittance(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, g.dist)) > (Real)0)) return false;
+               : !((vis = shadowTransmittanceTo(sc, dOffsetAlong(h.p, h.ng, g.wi), h.p + g.wi * g.dist,
+                                                 2 * RAY_EPS)) > (Real)0)) return false;
         g.fall = (Real)((double)g.fall * (double)vis);
         g.G = (Real)0; g.spot = true; g.sun = false;
         g.pdfW = (Real)0;                                   // delta: no lobe sample can reach it
@@ -10889,8 +10890,13 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     }
     Real cosLight = dot(nL, -g.wi);               // light is one-sided
     if (cosLight <= 0) return false;
+    // To the sampled POINT (shadowTransmittanceTo): re-aimed from the moved origin and stopped
+    // short of the light's own surface. The bare (origin, wi, dist) form ends on or inside the
+    // emitter, where a sphere light shadows its own sample on the float32 device
+    // (tools/check_distant_light.py).
     if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
-           : !((vis = shadowTransmittance(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, g.dist)) > (Real)0)) return false;
+           : !((vis = shadowTransmittanceTo(sc, dOffsetAlong(h.p, h.ng, g.wi), h.p + g.wi * g.dist,
+                                             2 * RAY_EPS)) > (Real)0)) return false;
     // Side test above: authored normal. Measure below: the patch's own orientation, since the
     // solid angle a patch subtends depends on how it is oriented and not on where its emission is
     // aimed. Host twin backward.h's emitterGeom, where the reasoning lives. Bit-identical unless

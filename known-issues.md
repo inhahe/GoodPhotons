@@ -249,6 +249,29 @@ emission, so most births carry almost nothing (the light comes from a core far s
 box); drawing them from mode R's per-fire emission grid (EmissiveVolume::cellW) would make beta
 nearly constant.
 
+## DONE (2026-10-12, 0.376.1): GPU-SPHERE-NEE-SHADOW — the device's mode R lost 84-97 % of a sphere light's direct light
+
+**What.** `tools/check_distant_light.py` (GPU against CPU, mode R, a sphere light 632 and
+6325 units from a quad) failed every scene: the device rendered 0.16x, 0.027x and 0.026x of the
+host. Area lights were exact (a probe of the same scene with a quad light: 1.0000). The
+failure was identical on 0.375.0, 0.375.3 and 0.376.0.
+
+**Cause.** 0.357.0 (transparent hair casts a lighter shadow) turned the device's emitter NEE
+shadow ray in `bkEmitterGeom` from `occludedTo(sc, origin, target, 2 * RAY_EPS)` into
+`shadowTransmittance(sc, origin, wi, dist)`. That undid two fixes at once: GPU-ORIGIN-EPS
+(re-aim the ray from the moved origin to the target, PBRT's SpawnRayTo) and GPU-NEE-EPS (stop the
+ray short of the target by `connMaxT`'s margin, which scales with the coordinates). The bare form
+ends on or inside the emitter, and a sphere light then occludes its own sampled point on the
+float32 device (the same scene lit by a quad light measured exact). The spot branch had the
+same form. The volume NEE paths already used `shadowTransmittanceTo`, which does both.
+
+**Fix.** The spot and area/sphere branches call `shadowTransmittanceTo` with the sampled point as
+the target. After: -0.00 %, -0.01 % and -0.01 %.
+
+**Why it went unnoticed for 0.357.0 to 0.376.0.** The gate exists for exactly this, and was not
+run: nothing that changed hit the device's emitter NEE in an obvious way. When a change touches a
+device shadow ray, `check_distant_light.py` is the gate that sees float32 end-point trouble.
+
 ## DONE (2026-10-12, 0.376.0): ENV-NEE-SEE-THROUGH-WEIGHT — sky seen through see-through fur was over-weighted
 
 Mode R's sky light sampling at a diffuse surface weighs itself against the cosine-hemisphere
