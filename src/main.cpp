@@ -20790,7 +20790,8 @@ static int run(int argc, char** argv) {
     // built-in scene has exactly one. Each render camera carries its own effective
     // mode and film resolution (per-camera FTSL values, unless a CLI -mode/-r forces
     // them globally). All cameras share the single already-built scene.
-    const char* lightLabel = (prism || grating) ? "beam" : lightName;
+    // -light names a built-in scene's light; an FTSL scene brings its own.
+    const char* lightLabel = fromFtsl ? "scene" : (prism || grating) ? "beam" : lightName;
     auto effMode = [&](char camMode) -> char {
         if (modeFromCli) return mode;         // CLI -mode forces every camera
         return camMode ? camMode : mode;      // else per-camera, else the global default
