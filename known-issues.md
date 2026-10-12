@@ -71,6 +71,78 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-10-12; mode R done in 0.375.0): SPECTRAL-BUNDLE — media and fibers rendered at one wavelength per path
+
+**Seen** on gallery_rain's flyby frame `fly0248`, Alice2's hair large in frame: rainbow speckle
+over the hair that 5x the samples barely moved (mode `D`, 140 vs 700 spp: a speckle measure fell
+1.24x on the hair where plain noise falls 2.24x), and the same in mode `R`. `-topng -denoise`
+(chroma only) on the 700-spp checkpoint collapsed it to golden grain: the speckle was CHROMA.
+
+**Causes, two of them, in this order of weight:**
+- **Participating media switched the bundle off.** Every mode gated the hero-wavelength bundle on
+  `scene.media.empty()`, so gallery_rain -- rain shaft and cloud -- traced ONE wavelength per path
+  everywhere; the hair merely shows it most, its colour being built over many λ-dependent passes
+  through fibers.
+- **A fiber collapsed the bundle** in the unidirectional tracers (`backward.h` sent `Hair` down
+  the dispersive branch: de-hero to the hero x C), so even a media-free scene rendered every
+  fiber one saturated wavelength per path. (BDPT's camera walk already kept the bundle through a
+  fiber, with per-λ f/pdf_hero and no spectral MIS.)
+
+**Fixed in mode R (CPU), 0.375.0:**
+- the bundle is admitted wherever every medium's extinction is flat in λ (`Medium::achroSigma`):
+  the free flight, its transmittance and the albedo coin are then shared, and the bundle carries
+  per-λ albedo, phase and emitter spectrum at a scatter (`neeVolumeHero`, `neeEnvVolumeHero`) and
+  the shared transmittance on every shadow leg;
+- a fiber and a RAINBOW phase -- lobes that move with λ, but smoothly -- keep the bundle by
+  SPECTRAL MIS (Wilkie et al. 2014): the hero samples the direction, every wavelength carries its
+  own f/pdf_hero, and the path takes the balance heuristic over which wavelength could have been
+  the hero (`specR`/`specW` in `radianceHeroLoop`, folded into the throughput). The sky NEE at such
+  a vertex and the continuation's escape weigh against the bundle's mixture density
+  `sum r_j pdf_j / sum r_j`, which makes the pair exactly the balance heuristic over every (hero x
+  strategy) pair;
+- a de-hero (glass, a grating, ...) after such a vertex first divides the MIS weight back out: the
+  survivor is always the hero that sampled the prefix, so a MIS-weighted prefix carried past it is
+  biased (worked through for two wavelengths); the plain hero estimate x C is not.
+
+**Measured** (`tools/check_hero_spectral.py`, mode R CPU, 256 spp, -heroc 4 against -heroc 1):
+fur x0.9995 whole-frame, chroma noise 3.65x lower; grey fog x0.9998, 4.31x; rainbow rain x1.0004,
+4.03x; every tile within 4 sigma / 3 %. On gallery_rain fly0248 at 64 spp the hair goes from
+rainbow speckle to golden grain, for 1.35x the time per sample.
+
+**Still open:**
+- **mode D**: the media gate (`bdpt.h` useHero) -- the gallery's reference mode -- and spectral MIS
+  at fiber and rainbow vertices, which in BDPT has to be ONE balance heuristic over every (strategy
+  x hero wavelength) pair: n / sum_j R_j(s) D_j(s), with D_j the usual BDPT denominator at
+  wavelength j and R_j its path-pdf ratio to the hero's. A product of two separate heuristics is
+  not a partition of unity;
+- the GPU twin of mode R (`bkRadianceHero`), and the other modes' media gates;
+- a fiber with a DISPERSIVE index: `hair.h` takes one `eta` for all wavelengths. The MIS above
+  already handles per-λ lobes; only the material parameter is missing;
+- shadow transmittance through a fiber of SPECTRAL `opacity` is evaluated at the hero's λ in every
+  bundle NEE (it was at 550 nm before 0.375.0) -- exact for the constant opacity every scene uses.
+
+## DONE (2026-10-12, 0.375.0): GLOSSY-NEE-MEDIA — a glossy bounce's MIS state outlived a medium scatter (mode R)
+
+Glossy NEE (on by default) records the lobe density at a glossy vertex for the next vertex's
+emitter/sky weight; `interactMaterial` clears the record, but a medium scatter (and an aggregate-
+fur collision) never reaches it. So a path glossy -> fog scatter -> sky had its sky escape weighted
+by the GLOSSY lobe's density instead of the phase function's -- the density the fog vertex's own
+sky NEE used. **Measured 12 % too bright** (glossy floor under a grey fog, sky light: glossy NEE on
+/ off = x1.1201, 337 sigma). Both loops now clear the record at those vertices; on / off agree to
+0.02 % (`tools/check_glossy_nee_media.py`, which fails on 0.374.7).
+
+## DONE (2026-10-12, 0.375.0): COAT-SPLIT-COIN — mode R's bundle split at an iridescent coat re-drew its coins
+
+A chromatic `layered` coat (a thin film) can send some wavelengths into the sheen and others into
+the body on one shared coin u (u < R_i). When they disagree, each secondary RE-ENTERS the vertex as
+its own sub-path -- and drew a FRESH coin there, on exactly the paths with u in [min R, max R), so
+wavelength i reflected with probability min R + (max R - min R) R_i instead of R_i. **Measured 21 %
+too dark** on a high-index thin-film sphere (-heroc 4 against -heroc 1), a bias since the split was
+added. The re-entry now carries the parent's coat coin. (A coat is never a mix's child -- the
+loader refuses the nesting -- so no mix coin needs carrying.) With media in the bundle (SPECTRAL-BUNDLE) the re-entry also must not redraw
+the free flights of the segment it re-traces -- measured 33 % too dark in a pure-absorber fog before
+`firstSegSampled`. `tools/check_hero_spectral.py`'s coatfog scene covers both.
+
 ## DONE (2026-10-12, 0.374.5-0.374.7): IMAGE-WRITE-LOCKED — an image write failed when something held the file
 
 **Seen** on renders running side by side, each on its own output, nothing of ours reading

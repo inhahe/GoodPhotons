@@ -462,13 +462,20 @@ struct BackwardRenderer {
     // (GLOSSY-NEE). Every branch already knows it; until now nothing needed `w` split back
     // into cos/pdfW. **0 means delta**: a Spot is a point, so no BSDF sample can ever hit it,
     // its NEE weight is 1 and there is nothing to weigh it against.
+    //
+    // `hairUnit` (with `hs`): leave the fiber's response OUT of `w` -- the connection's geometry,
+    // visibility and the aggregate coat's transmittance only, which are the same at every
+    // wavelength -- for a caller that applies hairFCos per wavelength itself (the hero bundle at
+    // a fiber, neeLightHeroHair). The shadow ray is cast even where one wavelength's response
+    // would have been zero, since another's may not be.
     bool emitterGeom(const Scene& scene, const Hit& h, const Vec3& ngo,
                      const Emitter& em, double u1, double u2, double& dist, double& w,
                      Vec3& wiOut,
                      const HairShade* hs = nullptr,
                      const HairDualCtx* dctx = nullptr,
                      double* pdfWOut = nullptr,
-                     double lambda = 550.0) const {
+                     double lambda = 550.0,
+                     bool hairUnit = false) const {
         if (pdfWOut) *pdfWOut = 0.0;                     // delta unless a branch says otherwise
         // Dual scattering (P3 stage 4) makes the shadow ray part of the SHADING: what it
         // counts on the way to the light is the forward-scattering transmittance, so the
@@ -488,7 +495,7 @@ struct BackwardRenderer {
                 stG = 1.0; return !dualBlocked && cosSurf > 0.0;
             }
             if (hs) {
-                cosSurf = PI * hairFCos(*hs, wi);
+                cosSurf = hairUnit ? 1.0 : PI * hairFCos(*hs, wi);
                 // An AGGREGATE fiber sits inside a medium, so the connection also carries the
                 // coat's transmittance — `exp(-tau)`, the probability of crossing no fiber on
                 // the way out. That is the same quantity the strand walk estimates by finding
@@ -1320,8 +1327,9 @@ struct BackwardRenderer {
 
     // Hero-wavelength surface NEE: one shared visibility sample per emitter (identical
     // rng to neeLight), evaluated for all `nUp` active wavelengths. Accumulates
-    // thr[i]·(rho[i]/PI)·SPD(λ_i)·invPdf[i]·w into L[i]. Only called on the fog-free
-    // hero fast path, so there is no medium transmittance term.
+    // thr[i]·(rho[i]/PI)·SPD(λ_i)·invPdf[i]·w into L[i], times the media transmittance of
+    // the shadow leg, shared by the bundle (it is in media only where their extinction is
+    // flat in λ).
     void neeLightHero(const Scene& scene, const Hit& h, const double* rho, double* L,
                       const double* thr, const double* lam, const double* invPdf,
                       int nUp, Pcg32& rng, const SpdCache* spdCache,
@@ -1348,12 +1356,16 @@ struct BackwardRenderer {
                 if (whitted) { if (uv) gridUV(s, G, u1, u2); }
                 else if (uv) { u1 = rng.uniform(); u2 = rng.uniform(); }
                 double dist = 0.0, w = 0.0, pdfWLight = 0.0;
-                Vec3 wiConn{0, 0, 0};   // the glossy hook needs it; otherwise unused, since the
-                                        // hero path is gated on a vacuum scene
+                Vec3 wiConn{0, 0, 0};
                 if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w, wiConn, nullptr, nullptr,
                                  nb ? &pdfWLight : nullptr)) continue;
                 double ws = (nS > 1) ? w * invS : w;
                 ws *= selW;                       // no-op (bit-exact) on the exact path
+                // The bundle is in media only where their extinction is flat in λ (renderRows'
+                // gate), so one transmittance estimate serves every wavelength. A vacuum scene
+                // skips it without touching the rng.
+                if (!scene.media.empty())
+                    ws *= mediaTr(scene, h.p + ngo * 1e-6, wiConn, dist, lam[0], rng);
                 // GLOSSY-NEE. The lobe's GEOMETRY is wavelength-free -- which is the same fact
                 // that lets the bundle survive a glossy vertex at all -- so the balance-heuristic
                 // weight is computed once and shared, and only the coefficient inside bsdfF
@@ -1689,13 +1701,16 @@ struct BackwardRenderer {
     }
 
     // Hero-wavelength environment NEE: one shared env-direction sample, evaluated for
-    // all `nUp` active wavelengths (fog-free hero fast path, no transmittance term).
+    // all `nUp` active wavelengths, with one shared media transmittance (see neeLightHero).
     void neeEnvHero(const Scene& scene, const Hit& h, const double* rho, double* L,
                     const double* thr, const double* lam, const double* invPdf,
                     int nUp, Pcg32& rng, const NeeBsdf* nb = nullptr) const {
         Vec3 wi; double cosSurf, stG, pdfW, wMis, farDist;
         if (!envGeom(scene, h, rng, wi, cosSurf, stG, pdfW, wMis, farDist,
                      nullptr, nullptr, nb)) return;
+        // Flat-extinction media only (renderRows' gate): one estimate for the whole bundle.
+        if (!scene.media.empty())
+            cosSurf *= mediaTr(scene, h.p + orientedGeoN(h) * 1e-6, wi, farDist, lam[0], rng);
         for (int i = 0; i < nUp; ++i) {
             double Lenv = scene.envRadiance(wi, lam[i]);
             if (Lenv <= 0.0) continue;
@@ -1705,6 +1720,91 @@ struct BackwardRenderer {
                                    : (rho[i] / PI);
             if (!(fVal > 0.0)) continue;
             L[i] += thr[i] * fVal * Lenv * cosSurf * invPdf[i] / pdfW * wMis * stG;
+        }
+    }
+
+    // Hero-bundle NEE at a FIBER vertex (HAIR-CHROMA). One emitter draw and one shadow ray per
+    // sample, as neeLight's; the fiber's response is applied per wavelength from that
+    // wavelength's own BCSDF `hs[i]`, since a fiber's colour -- and with a dispersive index, its
+    // lobes -- differ across the bundle. An area light or the sun is reached from a fiber by this
+    // connection alone (a continuation after a fiber does not count an emitter it hits), so
+    // there is no MIS weight here, as in the scalar twin.
+    void neeLightHeroHair(const Scene& scene, const Hit& h, const HairShade* hs, double* L,
+                          const double* thr, const double* lam, const double* invPdf, int nUp,
+                          Pcg32& rng, const SpdCache* spdCache) const {
+        const Vec3 ngo = orientedGeoN(h);
+        const bool cached = spdCache && spdCache->matches(lam, nUp);
+        const bool med = !scene.media.empty();
+        const EmitterDraw draw = pickEmitters(scene, h.p, &h.n, rng);
+        for (int di = 0; di < draw.n; ++di) {
+            const int e = draw.emitter(di);
+            const double selW = draw.weight(di);
+            if (selW <= 0.0) continue;
+            const Emitter& em = scene.emitters[e];
+            double u1 = 0.0, u2 = 0.0;
+            if (emitterNeedsUV(em)) { u1 = rng.uniform(); u2 = rng.uniform(); }
+            double dist = 0.0, w = 0.0;
+            Vec3 wiConn{0, 0, 0};
+            if (!emitterGeom(scene, h, ngo, em, u1, u2, dist, w, wiConn, &hs[0], nullptr, nullptr,
+                             lam[0], /*hairUnit=*/true)) continue;
+            // The bundle rides only through media whose extinction is the same at every
+            // wavelength (renderRows' gate), so one transmittance estimate serves all of it.
+            if (med) w *= mediaTr(scene, h.p + ngo * 1e-6, wiConn, dist, lam[0], rng);
+            w *= selW;
+            if (!(w > 0.0)) continue;
+            for (int i = 0; i < nUp; ++i) {
+                if (!(thr[i] > 0.0)) continue;
+                const double resp = hairFCos(hs[i], wiConn);
+                if (!(resp > 0.0)) continue;
+                const double spd = cached ? spdCache->at(e, i) : em.spdFn(lam[i]);
+                L[i] += thr[i] * resp * (spd * invPdf[i]) * w;
+            }
+        }
+    }
+
+    // The environment twin of neeLightHeroHair: one sky direction and one shadow ray, the
+    // fiber's response per wavelength, and the balance heuristic against the continuation. That
+    // continuation samples the HERO's lobes, but under spectral MIS the density to weigh against
+    // is the bundle's mixture `pbar = sum_j r_j pdf_j / sum_j r_j` over the wavelengths `tech`
+    // that could have been the hero, `r_j` being each one's path-pdf ratio to the hero's so far.
+    // With that pbar on both sides (the Hair case in radianceHeroLoop carries the same mixture
+    // forward as contBsdfPdf), the two weights are exactly the balance heuristic over every
+    // (hero wavelength x strategy) pair.
+    void neeEnvHeroHair(const Scene& scene, const Hit& h, const HairShade* hs, double* L,
+                        const double* thr, const double* lam, const double* invPdf, int nUp,
+                        const double* specR, const bool* tech, Pcg32& rng) const {
+        double pdfW = 0.0;
+        const Vec3 wi = scene.sampleEnvDir(rng, pdfW);
+        if (!(pdfW > 0.0)) return;
+        const double farDist = length(scene.sceneCenter - h.p) + scene.sceneRadius;
+        double vis = 1.0;
+        // Aggregate fiber: coat transmittance instead of strand geometry, and only walls occlude
+        // -- as in envGeom's fiber branch, whose shadow ray this is.
+        if (hs[0].aggregate && furVol) vis *= furVol->transmittance(h.p, wi, farDist);
+        if (!(vis > 0.0)) return;
+        const double off = hairExitOffset(hs[0], h.n, wi);
+        if (hs[0].aggregate) {
+            if (scene.occludedSkipHair(h.p + wi * off, wi, farDist)) return;
+        } else {
+            vis *= scene.shadowTransmittance(h.p + wi * 1e-6, wi, farDist, lam[0], 1e-6, off);
+            if (!(vis > 0.0)) return;
+        }
+        if (!scene.media.empty())
+            vis *= mediaTr(scene, h.p + orientedGeoN(h) * 1e-6, wi, farDist, lam[0], rng);
+        if (!(vis > 0.0)) return;
+        const Vec3 wl = hair::toLocal(hs[0].fr, wi);
+        double num = 0.0, den = 0.0;
+        for (int j = 0; j < nUp; ++j)
+            if (tech[j]) { num += specR[j] * hair::pdf(hs[j].b, hs[j].woLocal, wl); den += specR[j]; }
+        const double pbar = (den > 0.0) ? num / den : 0.0;
+        const double wMis = pdfW / (pdfW + pbar);
+        for (int i = 0; i < nUp; ++i) {
+            if (!(thr[i] > 0.0)) continue;
+            const double Lenv = scene.envRadiance(wi, lam[i]);
+            if (!(Lenv > 0.0)) continue;
+            const double resp = hairFCos(hs[i], wi);
+            if (!(resp > 0.0)) continue;
+            L[i] += thr[i] * resp * Lenv * invPdf[i] / pdfW * wMis * vis;
         }
     }
 
@@ -1728,6 +1828,115 @@ struct BackwardRenderer {
         double wMis   = pdfW / (pdfW + phase);          // balance heuristic
         double T = mediaTr(scene, p + wi * 1e-6, wi, farDist, lambda, rng);
         return albedo * phase * Lenv * invPdfLambda / pdfW * wMis * T * vis;
+    }
+
+    // Hero-bundle NEE at a medium scattering vertex (SPECTRAL-BUNDLE): neeVolume's emitter loop,
+    // rng order and geometry, one shadow ray and ONE transmittance estimate per sample -- the
+    // bundle is only in media whose extinction is flat in λ (renderRows' gate), so that estimate
+    // serves every wavelength -- and the albedo, phase value and emitter spectrum per wavelength.
+    // The phase is a rainbow's, whose lobes move with λ, or an HG lobe, whose do not; either way
+    // `phaseValue` at each λ is that wavelength's own response.
+    void neeVolumeHero(const Scene& scene, const Medium& med, const Vec3& p, const Vec3& wIn,
+                       double* L, const double* thr, const double* lam, const double* invPdf,
+                       int nUp, Pcg32& rng, const SpdCache* spdCache) const {
+        const bool cached = spdCache && spdCache->matches(lam, nUp);
+        double alb[hero::kHeroMax];
+        for (int i = 0; i < nUp; ++i) alb[i] = med.albedo(lam[i]);
+        const EmitterDraw draw = pickEmitters(scene, p, nullptr, rng);
+        for (int di = 0; di < draw.n; ++di) {
+            const int e = draw.emitter(di);
+            const double selW = draw.weight(di);
+            if (selW <= 0.0) continue;
+            const Emitter& em = scene.emitters[e];
+            if (em.collimated) continue;
+            Vec3 wi;
+            double dist = 0.0, geom = 0.0;          // everything but albedo * phase * spd
+            if (em.shape == EmitterShape::Spot) {
+                const Vec3 toL = em.origin - p;
+                const double dist2 = dot(toL, toL);
+                dist = std::sqrt(dist2);
+                wi = toL / dist;
+                const double fall = spotFalloff(dot(-wi, em.beamDir), em.spotCosInner, em.spotCosOuter);
+                if (fall <= 0) continue;
+                if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
+                geom = fall / dist2;
+            } else if (em.shape == EmitterShape::Sun) {
+                const double s1 = rng.uniform(), s2 = rng.uniform();
+                wi = em.sampleCone(-em.beamDir, s1, s2);
+                dist = length(scene.sceneCenter - p) + scene.sceneRadius;
+                if (scene.occluded(p + wi * 1e-6, wi, dist)) continue;
+                geom = em.spotOmega;
+            } else {
+                const double u1 = rng.uniform(), u2 = rng.uniform();
+                Vec3 y, nLight;
+                double pdfW = 0.0;
+                const bool coneSampled = (em.shape == EmitterShape::Sphere) &&
+                                         em.sampleSphereCone(p, u1, u2, y, nLight, wi, dist, pdfW);
+                double effArea = em.area, pdfAreaCyl = 0.0;
+                const bool cylVisible = !coneSampled && em.shape == EmitterShape::Cylinder &&
+                                        !em.caps &&
+                                        em.sampleCylinderVisible(p, u1, u2, y, nLight, pdfAreaCyl);
+                if (cylVisible) effArea = 1.0 / pdfAreaCyl;
+                if (coneSampled) {
+                    if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
+                    geom = 1.0 / pdfW;
+                } else {
+                    double epat = 1.0;
+                    if (!cylVisible) epat = emitterSamplePoint(scene, em, u1, u2, y, nLight);
+                    const Vec3 toL = y - p;
+                    const double dist2 = dot(toL, toL);
+                    dist = std::sqrt(dist2);
+                    wi = toL / dist;
+                    const double cosLight = dot(nLight, -wi);
+                    if (cosLight <= 0) continue;
+                    if (scene.occluded(p + wi * 1e-6, wi, dist - 2e-6)) continue;
+                    const double cosGeoV = em.normalTilted ? std::fabs(dot(em.nGeom, wi * -1.0))
+                                                           : cosLight;
+                    if (!(cosGeoV > 0.0)) continue;
+                    geom = cosGeoV / dist2 * effArea;
+                    if (epat != 1.0) geom *= epat;
+                }
+            }
+            geom *= mediaTr(scene, p + wi * 1e-6, wi, dist, lam[0], rng) * selW;
+            if (!(geom > 0.0)) continue;
+            const double cosT = dot(wIn, wi);
+            for (int i = 0; i < nUp; ++i) {
+                if (!(thr[i] > 0.0)) continue;
+                const double spd = cached ? spdCache->at(e, i) : em.spdFn(lam[i]);
+                L[i] += thr[i] * alb[i] * med.phaseValue(cosT, lam[i]) * spd * invPdf[i] * geom;
+            }
+        }
+    }
+
+    // The environment twin of neeVolumeHero, with neeEnvVolume's balance heuristic against the
+    // phase-sampled continuation. That continuation draws from the HERO's phase, so -- as at a
+    // fiber (neeEnvHeroHair) -- the density it is weighed against is the bundle's mixture
+    // `sum_j r_j phase_j / sum_j r_j`, which for a flat (HG) phase is just the phase itself.
+    void neeEnvVolumeHero(const Scene& scene, const Medium& med, const Vec3& p, const Vec3& wIn,
+                          double* L, const double* thr, const double* lam, const double* invPdf,
+                          int nUp, const double* specR, const bool* tech, Pcg32& rng) const {
+        double pdfW = 0.0;
+        const Vec3 wi = scene.sampleEnvDir(rng, pdfW);
+        if (!(pdfW > 0.0)) return;
+        const double farDist = length(scene.sceneCenter - p) + scene.sceneRadius;
+        const double vis = scene.shadowTransmittance(p + wi * 1e-6, wi, farDist, lam[0]);
+        if (!(vis > 0.0)) return;
+        const double T = mediaTr(scene, p + wi * 1e-6, wi, farDist, lam[0], rng);
+        if (!(T > 0.0)) return;
+        const double cosT = dot(wIn, wi);
+        double ph[hero::kHeroMax], num = 0.0, den = 0.0;
+        for (int j = 0; j < nUp; ++j) {
+            ph[j] = med.phaseValue(cosT, lam[j]);
+            if (tech[j]) { num += specR[j] * ph[j]; den += specR[j]; }
+        }
+        const double pbar = (den > 0.0) ? num / den : ph[0];
+        const double wMis = pdfW / (pdfW + pbar);
+        for (int i = 0; i < nUp; ++i) {
+            if (!(thr[i] > 0.0)) continue;
+            const double Lenv = scene.envRadiance(wi, lam[i]);
+            if (!(Lenv > 0.0)) continue;
+            L[i] += thr[i] * med.albedo(lam[i]) * ph[i] * Lenv * invPdf[i] / pdfW * wMis * T * vis;
+        }
     }
 
     // Handle ONE surface material interaction on a single wavelength — the whole
@@ -2363,6 +2572,10 @@ struct BackwardRenderer {
                 if (hitMed) {
                     const Medium& med = scene.media[which];
                     Vec3 p = ray.o + ray.d * tMed;
+                    // A scatter never reaches interactMaterial, which is where the glossy MIS
+                    // state of an earlier glossy bounce is cleared: left set, it would weight
+                    // this vertex's sky escape with the glossy lobe's density, not the phase's.
+                    gmis.clear();
                     // Beer-Lambert attenuation over the in-glass free-flight leg.
                     {
                         double a = curAbsorb(lambda);
@@ -2384,6 +2597,7 @@ struct BackwardRenderer {
             // rather than found. Beer-Lambert over the leg first, as the fog branch does.
             if (fl.hit) {
                 { double a = curAbsorb(lambda); if (a > 0.0) thr *= std::exp(-a * fl.t); }
+                gmis.clear();          // a vertex interactMaterial never sees (see the fog branch)
                 if (!furInteract(scene, fl, ray, lambda, invPdfLambda, thr, L,
                                  specularArrival, contBsdfPdf, rng, spdCache, gi)) return L;
                 continue;
@@ -2521,11 +2735,12 @@ struct BackwardRenderer {
     // stratified secondaries) down ONE camera path. Index 0 is the hero; it drives
     // every sampling decision with the same rng stream a single-wavelength path would,
     // while the secondaries ride along and are reweighted per-λ. At a dispersive /
-    // wavelength-switching material (anything but Diffuse/DiffuseTransmit) the
+    // wavelength-switching interface (glass, a grating, a fluorophore, ...) the
     // secondaries de-hero (terminate) and the hero is boosted ×C so it alone carries an
-    // unbiased single-λ estimate onward (PBRT-v4's TerminateSecondary convention). The
-    // caller restricts this to scenes WITHOUT participating media / GRIN / a physical
-    // lens, so those branches are absent here. Fills Lout[0..C).
+    // unbiased single-λ estimate onward (PBRT-v4's TerminateSecondary convention); a
+    // fiber or a rainbow phase, whose lobes move with λ but smoothly, keeps the bundle by
+    // spectral MIS instead. The caller restricts this to scenes without GRIN or a physical
+    // lens, and whose media all have extinction flat in λ. Fills Lout[0..C).
     void radianceHero(const Scene& scene, Ray ray, const double* lamIn,
                       const double* invPdfIn, int C, double* Lout, Pcg32& rng,
                       const SpdCache* spdCache = nullptr, GiCtx gi = GiCtx{}) const {
@@ -2566,7 +2781,18 @@ struct BackwardRenderer {
                           const double* invPdfIn, const double* thrIn, int C, bool secAlive,
                           bool specularArrival, double contBsdfPdf, int bounce0,
                           double* Lout, Pcg32& rng, const SpdCache* spdCache,
-                          GiCtx gi, bool rcTrain = false) const {
+                          GiCtx gi, bool rcTrain = false,
+                          bool firstSegSampled = false, double reentryCoatU = -1.0) const {
+        // `firstSegSampled`: this call RE-ENTERS a vertex its parent already reached (the
+        // chromatic-coat split re-traces the segment that hit the coat), so the free flights
+        // along that first segment -- the media collision and the aggregate-fur flight -- were
+        // already drawn by the parent and survived; drawing them again would apply their
+        // transmittance twice. Cleared after the first segment.
+        bool skipFlights = firstSegSampled;
+        // `reentryCoatU` (>= 0 on such a re-entry): the parent's coat coin, which this
+        // wavelength must decide that coat with -- see the chromatic-coat split. (A coat is never
+        // a mix's child -- the loader refuses the nesting -- so no mix coin needs carrying.)
+        double coatU = reentryCoatU;
         double lam[hero::kHeroMax], invPdf[hero::kHeroMax], thr[hero::kHeroMax], L[hero::kHeroMax];
         // Copy only the LIVE entries: a monochromatic sub-path spawned by the split fills
         // only slot 0 of its lamIn/invPdfIn/thrIn, so reading all C would read
@@ -2576,6 +2802,19 @@ struct BackwardRenderer {
             lam[i] = lamIn[i]; invPdf[i] = invPdfIn[i]; thr[i] = thrIn[i]; L[i] = 0.0;
         }
         for (int i = nLive; i < C; ++i) { lam[i] = 0.0; invPdf[i] = 0.0; thr[i] = 0.0; L[i] = 0.0; }
+        // SPECTRAL MIS (HAIR-CHROMA; Wilkie et al. 2014). Where a vertex samples its direction
+        // from a wavelength-DEPENDENT but smooth density -- a fiber's lobes -- the bundle keeps
+        // riding: every wavelength carries its own f/pdf_hero, and the path takes the balance
+        // heuristic over which wavelength could have been the hero (the bundle is one stratified
+        // draw, so each live one could, with equal probability). `specR[j]` is wavelength j's
+        // path pdf over the hero's so far (1 until such a vertex), `specTech[j]` whether j could
+        // have been the hero at all, and `specW = n / sum_j specR[j]` the weight in force, which
+        // is FOLDED INTO thr[] so every contribution picks it up. specW is exactly 1 on a path
+        // that met no such vertex, so nothing else changes.
+        double specR[hero::kHeroMax];
+        bool   specTech[hero::kHeroMax];
+        for (int i = 0; i < C; ++i) { specR[i] = 1.0; specTech[i] = (i < nLive) && invPdf[i] > 0.0; }
+        double specW = 1.0;
         // GLOSSY-NEE, the hero twin of radiance()'s carrier. Cleared at the top of every bounce
         // and set only by the Glossy branch, so a stale lobe density can never survive a
         // mirror, a dielectric or a de-hero'd interaction and halve the emission behind it.
@@ -2629,10 +2868,16 @@ struct BackwardRenderer {
                 }
             }
         };
-        auto deHero = [&]() {            // terminate secondaries, boost hero ×C
+        // Terminate the secondaries and boost the hero xC. The spectral-MIS weight comes back OUT
+        // first: the survivor is always the hero, the very wavelength that sampled the path so
+        // far, so a MIS-weighted prefix carried past this point would be biased (worked through
+        // in known-issues HAIR-CHROMA); the plain hero estimate times C is not.
+        auto deHero = [&]() {
             if (!secAlive) return;
-            thr[0] *= (double)C;
+            thr[0] *= (double)C / specW;
             secAlive = false;
+            specW = 1.0;
+            for (int j = 0; j < C; ++j) specR[j] = 1.0;
         };
 
         int nullSteps = 0;      // hair coverage pass-throughs, refunded below
@@ -2656,10 +2901,80 @@ struct BackwardRenderer {
 
             // Aggregate fur: the same free flight the scalar twin samples, shortening `dSurf`
             // so the in-glass absorption below is integrated to the collision and not past it.
+            // A re-entered first segment's flights were drawn by the parent (see skipFlights).
+            const bool drawFlights = !skipFlights;
+            skipFlights = false;
             furvol::FurVolume::Flight fl;
-            if (useVol && furVol->valid()) {
+            if (drawFlights && useVol && furVol->valid()) {
                 fl = furVol->sampleFlight(ray.o, ray.d, dSurf, rng.uniform());
                 if (fl.hit) dSurf = fl.t;
+            }
+
+            // PARTICIPATING MEDIA (SPECTRAL-BUNDLE). The bundle is here only when every medium's
+            // extinction is the same at every wavelength (renderRows' gate), so the free flight,
+            // its transmittance and the albedo coin serve the whole bundle, exactly as the scalar
+            // twin's serve its one wavelength. The scattered direction is shared too unless the
+            // phase is a rainbow, whose lobes move with λ: then the hero samples it and the bundle
+            // takes the spectral-MIS weight, as at a fiber.
+            if (drawFlights && !scene.media.empty()) {
+                double tMed = 0.0; int which = -1;
+                if (Renderer::sampleMediaCollision(scene, ray.o, ray.d, dSurf, lam[0], rng,
+                                                   tMed, which)) {
+                    const Medium& med = scene.media[which];
+                    const Vec3 p = ray.o + ray.d * tMed;
+                    {   const int mi = stk.topMat();          // Beer-Lambert over a leg in glass
+                        if (mi >= 0)
+                            for (int i = 0; i < nUp; ++i) {
+                                const double a = scene.mats[mi].absorb(lam[i]);
+                                if (a > 0.0) thr[i] *= std::exp(-a * tMed);
+                            }
+                    }
+                    // A scatter is a vertex the material switch never sees, so the glossy MIS
+                    // state of an earlier glossy bounce must not outlive it (see gmis.clear()).
+                    gmis.clear();
+                    neeVolumeHero(scene, med, p, ray.d, L, thr, lam, invPdf, nUp, rng, spdCache);
+                    if (scene.envIndex >= 0)
+                        neeEnvVolumeHero(scene, med, p, ray.d, L, thr, lam, invPdf, nUp,
+                                         specR, specTech, rng);
+                    if (directOnly) { finish(); return; }
+                    // Absorption: policy 3 over the per-λ albedo.
+                    double alb[hero::kHeroMax];
+                    for (int i = 0; i < nUp; ++i) alb[i] = med.albedo(lam[i]);
+                    const double qa = hero::maxOf(alb, nUp);
+                    if (rng.uniform() >= qa) { finish(); return; }
+                    for (int i = 0; i < nUp; ++i) thr[i] *= alb[i] / qa;
+                    double pdf0 = 0.0;
+                    const Vec3 wOut = med.phaseSample(ray.d, lam[0], rng, pdf0);
+                    if (!(pdf0 > 0.0)) { finish(); return; }
+                    if (med.rainbow() && nUp > 1) {
+                        // The phase value IS the sampling density at every λ, so each
+                        // wavelength's f/pdf_hero and its pdf ratio are the same number.
+                        const double cosT = dot(ray.d, wOut);
+                        double ratio[hero::kHeroMax];
+                        double sumOld = 0.0, sumNew = 0.0;
+                        for (int j = 0; j < nUp; ++j) {
+                            ratio[j] = (j == 0) ? 1.0 : med.phaseValue(cosT, lam[j]) / pdf0;
+                            if (specTech[j]) { sumOld += specR[j]; sumNew += specR[j] * ratio[j]; }
+                        }
+                        const double rescale = sumOld / sumNew;
+                        for (int j = 0; j < nUp; ++j) specR[j] *= ratio[j];
+                        specW *= rescale;
+                        double fac[hero::kHeroMax], q = 0.0;
+                        for (int i = 0; i < nUp; ++i) {
+                            fac[i] = ratio[i] * rescale;
+                            if (thr[i] > 0.0 && fac[i] > q) q = fac[i];
+                        }
+                        if (q > 1.0) q = 1.0;
+                        if (!(q > 0.0) || rng.uniform() >= q) { finish(); return; }
+                        for (int i = 0; i < nUp; ++i) thr[i] *= fac[i] / q;
+                        contBsdfPdf = pdf0 * sumNew / sumOld;   // the bundle's mixture density
+                    } else {
+                        contBsdfPdf = pdf0;
+                    }
+                    ray = Ray{p, wOut};
+                    specularArrival = false;
+                    continue;
+                }
             }
 
             // Beer-Lambert over the in-glass segment. A non-empty stack implies we've
@@ -2680,6 +2995,7 @@ struct BackwardRenderer {
             // boost the hero, and run the shared scalar interaction on it.
             if (fl.hit) {
                 deHero();
+                gmis.clear();          // a vertex the material switch never sees (see above)
                 if (!furInteract(scene, fl, ray, lam[0], invPdf[0], thr[0], L[0],
                                  specularArrival, contBsdfPdf, rng, spdCache, gi)) {
                     finish(); return;
@@ -2734,6 +3050,8 @@ struct BackwardRenderer {
                 if (child < 0) { finish(); return; }
                 mp = &scene.mats[child];
             }
+            const double coatUHere = coatU;     // the re-entered vertex only
+            coatU = -1.0;
             if (mp->type == MatType::Layered) {
                 // Physical layered stack (specular coat over a weighted body). The coat
                 // interface is NOT dispersive in DIRECTION -- the sheen is a glossy lobe
@@ -2756,7 +3074,9 @@ struct BackwardRenderer {
                 // weight, as in the scalar twin). At nUp == 1 that is the scalar code
                 // verbatim: same single draw, same order, throughput untouched.
                 // Whitted: no coin at all, just the dominant branch weighted per λ.
-                const double uCoat = whitted ? 0.0 : rng.uniform();
+                // A wavelength re-entering this vertex from a split (below) decides with the
+                // coin its parent drew, not a fresh one: see the split.
+                const double uCoat = whitted ? 0.0 : (coatUHere >= 0.0 ? coatUHere : rng.uniform());
                 const bool refl0 = whitted ? (Rl[0] >= 0.5) : (uCoat < Rl[0]);
                 bool agree = true;
                 for (int i = 1; i < nUp; ++i)
@@ -2767,14 +3087,22 @@ struct BackwardRenderer {
                     // take the sheen while the rest enter the body, so one shared continuation
                     // cannot serve them all. Fan out exactly like the split-at-dispersion case
                     // below: each secondary re-enters THIS vertex as its own monochromatic
-                    // sub-path, makes its own coat decision, and lands in its own L[i] slot.
+                    // sub-path and lands in its own L[i] slot.
                     //
-                    // Re-entering at bounce `b` (not b + 1) is safe because nUp > 1 implies an
-                    // EMPTY medium stack -- every dielectric entry de-heros or splits, so a
-                    // bundle wider than 1 is never inside glass -- which makes the
-                    // Beer-Lambert step at the top of the loop a no-op that cannot be
-                    // double-applied. closestHit is deterministic, so the sub-path lands on
-                    // this same vertex; the cost is one redundant trace on a rare path.
+                    // It decides its side with THE SAME coin `uCoat`, passed in. A fresh coin
+                    // would be drawn only on the paths that already disagreed, i.e. with u in
+                    // [min R, max R), and would make wavelength i reflect with probability
+                    // min R + (max R - min R) R_i instead of R_i: measured 21 % too dark on a
+                    // thin-film sphere (tools/check_hero_spectral.py, coatfog).
+                    //
+                    // Re-entering at bounce `b` (not b + 1) re-traces the segment that hit the
+                    // coat. Its glass absorption cannot be double-applied: nUp > 1 implies an
+                    // EMPTY dielectric stack -- every dielectric entry de-heros or splits -- so
+                    // that step is a no-op. Its free flights (a participating medium's
+                    // collision, the aggregate fur's) WERE drawn by this path and survived, so
+                    // the sub-path is told not to draw them again (`firstSegSampled`).
+                    // closestHit is deterministic, so the sub-path lands on this same vertex;
+                    // the cost is one redundant trace on a rare path.
                     for (int i = 1; i < nUp; ++i) {
                         if (invPdf[i] == 0.0) continue;      // dead secondary (zero-mass λ bin)
                         double sLam = lam[i], sInv = invPdf[i], sThr = thr[i];
@@ -2796,7 +3124,8 @@ struct BackwardRenderer {
                         radianceHeroLoop(scene, ray, stk, &sLam, &sInv, &sThr,
                                          /*C=*/1, /*secAlive=*/false, specularArrival,
                                          contBsdfPdf, b, sub, rng, sCp, gi,
-                                         /*rcTrain=*/true);
+                                         /*rcTrain=*/true, /*firstSegSampled=*/true,
+                                         /*reentryCoatU=*/uCoat);
                         L[i] += sub[0];      // this wavelength's own estimate, own slot
                         thr[i] = 0.0;        // now that sub-path's business, not ours
                     }
@@ -2981,18 +3310,98 @@ struct BackwardRenderer {
                     specularArrival = true;
                     break;
                 }
+                case MatType::Hair: {
+                    // A FIBER KEEPS THE BUNDLE (HAIR-CHROMA). Its lobes depend on λ -- through
+                    // the absorption, and with a dispersive index through their angles -- but
+                    // they are smooth: every wavelength has SOME density wherever the hero
+                    // samples. So each wavelength carries its own f/pdf_hero and the path takes
+                    // the spectral-MIS weight (specR/specW above), instead of collapsing to the
+                    // hero and rendering every fiber as one saturated wavelength per path. The
+                    // single-wavelength route stays for what this does not cover: a lone hero,
+                    // the deterministic preview, and dual scattering, whose connections are
+                    // themselves λ-dependent walks.
+                    if (!secAlive || nUp < 2 || whitted || directOnly || dualScatter) {
+                        deHero();
+                        bool heroNullH = false;
+                        if (!interactMaterial(scene, m, h, mats, ray, lam[0], invPdf[0], thr[0],
+                                              L[0], specularArrival, contBsdfPdf, stk, rng,
+                                              spdCache, gi, nullptr, &heroNullH)) { finish(); return; }
+                        if (heroNullH && nullSteps < 256) { --b; ++nullSteps; }
+                        break;
+                    }
+                    // `wPrev` points back toward the eye: the model's reference direction, as in
+                    // the scalar Hair case. One BCSDF per wavelength, sharing frame and h.
+                    const Vec3 wPrev{-ray.d.x, -ray.d.y, -ray.d.z};
+                    HairShade hsB[hero::kHeroMax];
+                    for (int i = 0; i < nUp; ++i) hsB[i] = hairShadeAt(scene, m, h, lam[i], wPrev);
+                    neeLightHeroHair(scene, h, hsB, L, thr, lam, invPdf, nUp, rng, spdCache);
+                    if (scene.envIndex >= 0)
+                        neeEnvHeroHair(scene, h, hsB, L, thr, lam, invPdf, nUp, specR, specTech, rng);
+                    double pdf0 = 0.0, f0 = 0.0;
+                    const Vec3 wl = hair::sample(hsB[0].b, hsB[0].woLocal, rng.uniform(),
+                                                 rng.uniform(), rng.uniform(), rng.uniform(),
+                                                 pdf0, f0);
+                    if (!(pdf0 > 0.0)) { finish(); return; }
+                    // A coverage pass-through returns exactly -wo: a DISCRETE event, of mass
+                    // (1 - opacity) for each wavelength, where a scatter is a direction density.
+                    const bool passThru = (wl.x == -hsB[0].woLocal.x && wl.y == -hsB[0].woLocal.y &&
+                                           wl.z == -hsB[0].woLocal.z);
+                    const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
+                    // Per wavelength: its density for this event over the hero's (ratio) and its
+                    // f*cos over the hero's density (g). The hero's g is exactly its lobe
+                    // attenuation T, the scalar twin's survival probability.
+                    double ratio[hero::kHeroMax], g[hero::kHeroMax];
+                    for (int j = 0; j < nUp; ++j) {
+                        double pj, fcj;
+                        if (passThru)    { pj = 1.0 - hsB[j].b.opacity; fcj = pj; }
+                        else if (j == 0) { pj = pdf0; fcj = f0 * cosLong; }
+                        else {
+                            pj  = hair::pdf(hsB[j].b, hsB[j].woLocal, wl);
+                            fcj = hair::f(hsB[j].b, hsB[j].woLocal, wl) * cosLong;
+                        }
+                        ratio[j] = pj / pdf0;
+                        g[j]     = fcj / pdf0;
+                    }
+                    double sumOld = 0.0, sumNew = 0.0;
+                    for (int j = 0; j < nUp; ++j)
+                        if (specTech[j]) { sumOld += specR[j]; sumNew += specR[j] * ratio[j]; }
+                    // The hero's own ratio is 1 and its specR stays 1, so sumNew >= 1.
+                    const double rescale = sumOld / sumNew;          // specW: new over old
+                    for (int j = 0; j < nUp; ++j) specR[j] *= ratio[j];
+                    specW *= rescale;
+                    // Survival (policy 3) on the whole factor each wavelength's throughput takes
+                    // here. It can exceed 1 for a secondary the hero under-samples, hence the cap.
+                    double fac[hero::kHeroMax], q = 0.0;
+                    for (int i = 0; i < nUp; ++i) {
+                        fac[i] = g[i] * rescale;
+                        if (thr[i] > 0.0 && fac[i] > q) q = fac[i];
+                    }
+                    if (q > 1.0) q = 1.0;
+                    if (!(q > 0.0) || rng.uniform() >= q) { finish(); return; }
+                    for (int i = 0; i < nUp; ++i) thr[i] *= fac[i] / q;
+                    const Vec3 wOut = hair::toWorld(hsB[0].fr, wl);
+                    ray = Ray{h.p + wOut * 1e-9, wOut, hairExitOffset(hsB[0], h.n, wOut)};
+                    if (passThru) {
+                        // A null interaction: transparent to the MIS of the last REAL vertex,
+                        // and it refunds its bounce (see the scalar Hair case).
+                        if (nullSteps < 256) { --b; ++nullSteps; }
+                    } else {
+                        // The env-escape MIS partner: the bundle's mixture density for wOut, the
+                        // same pbar neeEnvHeroHair weighed against (sum r_old p_j / sum r_old).
+                        contBsdfPdf = pdf0 * sumNew / sumOld;
+                        specularArrival = false;
+                    }
+                    break;
+                }
                 case MatType::Dielectric:
                 case MatType::ThinFilm:
                 case MatType::Multilayer:
                 case MatType::Grating:
                 case MatType::HalfMirror:
-                case MatType::Hair:
                 case MatType::Fluorescent: {
                     // Dispersive / wavelength-switching: the outgoing direction (and, for a
                     // grating/fluorophore, the wavelength itself) depends on λ, so the bundle
-                    // cannot keep riding one shared direction past this interface. A fiber is
-                    // here for the same reason: its absorption is per-λ, so both the sampled
-                    // lobe and the survival probability differ across the bundle.
+                    // cannot keep riding one shared direction past this interface.
                     if (heroSplit && secAlive && nUp > 1) {
                         // SPLIT-AT-DISPERSION: fan out instead of de-hero'ing. Each secondary
                         // runs the SAME interaction with its OWN λ -- refracting along its own
@@ -3304,7 +3713,14 @@ struct BackwardRenderer {
     void renderRows(const Scene& scene, const Camera& cam, Film& film,
                     int y0, int y1, long long spp, unsigned long long sampleBase) const {
         const int C = heroC;
-        const bool useHero = (C > 1) && scene.media.empty() &&
+        // Media admit the bundle when every medium's extinction is flat in λ (Medium::
+        // achroSigma): the free flight, its transmittance and the albedo coin are then the
+        // same for every wavelength, and only a rainbow phase still varies -- which the bundle
+        // carries by spectral MIS (radianceHeroLoop). A chromatic extinction would need
+        // per-wavelength free flights, so such a scene stays on one wavelength per path.
+        bool mediaFlat = true;
+        for (const Medium& md : scene.media) if (!md.achroSigma) { mediaFlat = false; break; }
+        const bool useHero = (C > 1) && mediaFlat &&
                              !grin::sceneHasGrin(scene) && !cam.hasLens();
         const uint64_t nPix = (uint64_t)film.resX * (uint64_t)film.resY;
         // Per-sample SPD table (see SpdCache): nBase×C (nBase×1 on the scalar path),

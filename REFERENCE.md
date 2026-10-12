@@ -2670,8 +2670,16 @@ second:**
   single-λ estimator to 0.02 %; on the GPU it is **0.72–0.82× chroma noise** for 1.5–1.7× the
   time across four stress scenes, and the two backends agree to 0.03 %. Still single-λ **by
   design or pending work**: the **GPU wavefront** backend (`-wavefront` — hero forces the
-  megakernel). Scenes with
-  participating media, a GRIN volume, or a finite-lens camera also stay single-λ everywhere.
+  megakernel). Scenes with a GRIN volume or a finite-lens camera stay single-λ everywhere.
+  **Participating media** keep the bundle in **CPU mode `R`** (0.375.0) when every medium's
+  extinction is flat in λ — the common grey fog, cloud or rain, whose free flights are then the
+  same for every wavelength; in every other mode, and for a medium whose extinction varies with
+  λ, a scene with media is still single-λ. In mode `R` a **hair fiber** and a **`phase rainbow`**
+  scatter keep the bundle too, by *spectral MIS* (Wilkie et al. 2014): their lobes move with λ but
+  smoothly, so the hero samples the direction, every wavelength carries its own value, and the
+  path is weighted by the balance heuristic over which wavelength could have been the hero. On
+  `gallery_rain` that turns the hair's rainbow speckle into ordinary grain: 3.65–4.31× less
+  chroma noise on fur, fog and rain test scenes, for ~1.35× the time per sample.
   The bundle size is runtime-configurable with **`-heroc N`** (default 4, range 1–8);
   `-heroc 1` turns hero off, reducing every hero tracer (CPU and the GPU megakernel)
   bit-identically to the classic single-λ estimator. **Do not do that in mode `W`.** Mode

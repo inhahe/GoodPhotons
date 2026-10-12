@@ -3686,6 +3686,27 @@ as the one at fault.
   `keepBundle` do **not** de-hero (their outgoing direction ignores λ). At
   `nUp == 1` every one of these is the scalar code verbatim.
 
+  **Spectral MIS and media (0.375.0, known-issues SPECTRAL-BUNDLE).** Two vertices sample a
+  direction whose density depends on λ but smoothly -- a `Hair` fiber and a `phase rainbow`
+  scatter -- and keep the bundle instead of de-heroing: the hero samples, every live λ carries its
+  own `f/pdf_hero`, and the path takes the balance heuristic over which bundle member could have
+  been the hero (the bundle is one stratified draw, so each live one could, equally). The loop
+  carries `specR[j]` (λ_j's path pdf over the hero's) and `specW = n / Σ specR`, FOLDED into
+  `thr[]`; `specW` is 1 on any path without such a vertex. Three consequences:
+  (1) the sky NEE at such a vertex (`neeEnvHeroHair`, `neeEnvVolumeHero`) and the continuation's
+  `contBsdfPdf` both use the bundle's mixture density `Σ r_j p_j / Σ r_j`, which makes the light/
+  BSDF pair exactly the balance heuristic over every (hero × strategy) pair;
+  (2) `deHero()` divides `specW` back out before the ×C boost -- the survivor is the very λ that
+  sampled the prefix, so a MIS-weighted prefix would be biased past it;
+  (3) the survival test on the vertex factor caps q at 1 (a secondary the hero under-samples can
+  gain weight). Participating media enter the bundle when every medium's extinction is flat in λ
+  (`Medium::achroSigma`, renderRows' gate): free flight, transmittance and albedo coin are shared,
+  and the medium block in `radianceHeroLoop` mirrors the scalar one with per-λ albedo/phase/SPD.
+  A chromatic-coat split re-enters its vertex, so it passes the parent's coat coin
+  (`reentryCoatU`) and skips the first segment's free flights (`firstSegSampled`) -- each a
+  measured bias without it (COAT-SPLIT-COIN). `tools/check_hero_spectral.py` holds all
+  of it to the single-λ estimator.
+
   **Split-at-dispersion (`heroSplit`)** mirrors the forward tracer's policy: the bounce
   loop is factored out as **`radianceHeroLoop`** (`radianceHero` is now a thin wrapper
   that seeds `thr[i] = 1`), so at a Dielectric / ThinFilm / Multilayer / Grating /
