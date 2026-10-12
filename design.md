@@ -1278,8 +1278,9 @@ Which side, against the photos:
   22.2 and 24.8 for her left. Projected through its fitted camera, its outline follows the profile
   photo's forehead, nose, lips and chin; her left side's cannot be fitted to the profile
   consistently.
-- **The exception is the mouth.** Mirrored, her right half would make it 0.61 of the distance
-  between the eyes' centres, wider than the photos'.
+- **The exception is the mouth.** Her right half is the wider and more rounded half of the
+  model's mouth. Mirrored, it would make the mouth 68.5 mm wide (the model's own is 60.9) and
+  U-shaped, dropping from both corners.
 - **How sizes are checked against the photos** (`tools/alice2_photo_check.py`): each photo's
   camera is fitted once to landmarks on the head as made (every version shares its coordinates, so
   one camera per photo is a fixed ruler); a feature's corners on a head are projected through it and
@@ -1304,17 +1305,21 @@ The steps, in order:
      square-on; mirrored as it is, the skewed face meets it at an angle, a crease down the middle.
    - **The chin:** her right side mirrored gives a cleft chin (two low points 25 mm out), her left
      a pointed one; the average cancels the tilt and gives one round low point.
-3. **Narrow the mouth** (`narrow_mouth`): her right half squeezed across within an ellipse round
-   the lips, fading out by 1.6 times its size, so that the mouth is 0.50 of the distance between
-   the eyes' centres. Both are measured on the head: the painted lips' outermost point on her right
-   (37 mm out once re-centred) and the painted eyes (121 mm apart), so the squeeze is 0.81. The
-   front of the head only.
-   - **Why 0.50:** projected into the photos, 0.45 matched the blurry front photo exactly but was
-     0.81 of the mouth in the sharp three-quarter photo, where the model as made (0.52) matched.
-     0.50 sits between, nearer the sharper photo.
-   - **The lips keep her right half's paint** (no blend inside the lips in step 6): closed, as in
-     the photos. Her left half's lips are parted, showing teeth, and the band blended them into
-     the middle of the mouth.
+3. **Narrow the mouth** (`narrow_mouth`), within an ellipse round the lips, fading out by 1.6
+   times its size, on the front of the head only. Two moves:
+   - **Scaled about its middle, across and up together** (0.89), so that mirrored it is the model's
+     own width: the painted lips' extremes on the input head, 60.9 mm. Projected into the photos,
+     that width matches the sharp three-quarter photo (1.01) and is 1.27 of the blurry front one.
+   - **Unbent:** each column moved up or down by half the lips' centre-line height there over the
+     middle's (`MOUTH_CURVE`, `MOUTH_LINE`); the corner sat 6.5 mm over the middle. The smile is
+     shallower and the lips keep their thickness.
+   - **Tried and dropped:**
+     - **Squeezed across alone,** to 0.50 of the eyes' spacing. Its corners kept their height, so
+       the smile turned U-shaped and narrow, and the user preferred the model's own mouth.
+     - **Unbent along the lips' lower edge** instead of their centre-line. It flattened the lower
+       lip's point in the middle, but brought the corners down into thick, drooping ends.
+   - **The lips keep her right half's paint** (no blend inside the lips in step 6). Her left half's
+     lips are parted wider, showing teeth, and the band blended them into the middle of the mouth.
    - **The lips' relief moves with them:** each moved vertex keeps its height over a smooth copy of
      the face (8 mm Gaussian). That copy is made from her right side and its mirror image, so it
      meets the plane square-on as the averaged face does; made from both sides as they were, the

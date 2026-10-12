@@ -3416,7 +3416,7 @@ What it adds to the list above:
 than her left, her left temple fuller than her right, the nose, mouth and chin up to 10 mm off to
 her right, the jaw tilted.
 - **What it does.** It re-centres the midline features, averages the two sides along the midline
-  and in the chin, narrows the mouth to the photos' proportions (keeping its closed lips), then cuts
+  and in the chin, brings the mouth to the model's own width with a shallower smile, then cuts
   the head along its mirror plane and mirrors her right half (shape and paint) into her left half's
   place, and flattens the normal map that carved the painted eyebrows in. Her right side was
   chosen against the photos (cameras fitted to landmarks): it fits the profile and three-quarter

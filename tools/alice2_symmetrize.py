@@ -12,8 +12,8 @@ photo's camera was fitted (solvePnP, the phone's own focal length) to landmarks 
 symmetric from either side: her right side fits the profile and three-quarter photos far better
 (landmark RMS 13.9 and 19.5 px, against 22.2 and 24.8 for her left), and its outline follows the
 profile photo's forehead, nose, lips and chin. Except the MOUTH: her right half of it is wide --
-mirrored, the mouth would be 0.61 of the distance between the eyes' centres -- so it is narrowed,
-to the width the photos show (MOUTH_WIDTH).
+mirrored, the mouth would be wider than the model's own, which is the width the sharp
+three-quarter photo shows -- so it is scaled down to that.
 
 HOW (the plane is the face's fitted mirror plane, alice2_eyes.mirror_plane):
   1. RE-CENTRE THE MIDLINE. The nose, philtrum, lips and chin drift toward her right as they go
@@ -25,9 +25,10 @@ HOW (the plane is the face's fitted mirror plane, alice2_eyes.mirror_plane):
      plane square-on (average_shape). Without it the skewed face meets the plane at an angle,
      leaving a crease down the middle. And the jaw is tilted, lower on her right: mirrored, her
      right side gives a cleft chin, her left a pointed one, and their average a round one.
-  3. NARROW THE MOUTH. Her right half of it is squeezed toward the middle, the lips' relief carried
+  3. NARROW THE MOUTH. Her right half of it is scaled down about its middle, across and up
+     together (so it keeps its shape), to the model's own mouth width, the lips' relief carried
      over a smooth copy of the face, the paint moving with the vertices (narrow_mouth). The lips
-     keep her right half's paint: closed, as in the photos (her left half's shows teeth).
+     keep her right half's paint (her left half's shows more teeth).
   4. MIRROR. The head is cut along the plane (triangles across it clipped, new vertices on it), her
      left half dropped, and her right half mirrored into its place: positions and normals
      reflected, winding reversed, the SAME texture coordinates, so the paint is mirrored with the
@@ -64,14 +65,14 @@ CHIN = ((0.0, -0.098), (0.070, 0.022))    # the chin: an ellipse in the plane's 
                                           # right: mirrored, her right side gives a cleft chin, her left
                                           # a pointed one; the average cancels the tilt
 ZONE_FADE = 1.5                           # ... its weight fades to 0 at this many times its size
-# The mouth: her right half of it, narrowed toward the middle (shape and paint together):
+# The mouth: her right half of it, scaled down to the model's own mouth width (shape and paint
+# together). Projected through cameras fitted to the photos, that width matches the sharp
+# three-quarter photo (and is 1.27 of the blurry front one); her right half mirrored is wider.
 MOUTH = ((0.0, -0.050), (0.050, 0.016))   # the ellipse round her lips (both halves' corners inside)
-MOUTH_WIDTH = 0.50                        # ... squeezed until the mouth is this much of the distance
-                                          # between the painted eyes' centres. Projected through cameras
-                                          # fitted to the photos, 0.45 matched the blurry front photo and
-                                          # was 0.81 of the sharp three-quarter one, where the model as
-                                          # made (0.52) matched it
-MOUTH_FADE = 1.6                          # ... the squeeze fading out by this many times its size
+MOUTH_FADE = 1.6                          # ... the scaling fading out by this many times its size
+MOUTH_CURVE = 0.5                         # ... and this much of the smile's curve kept (narrow_mouth),
+MOUTH_LINE = 0.5                          # ... the curve measured this far up the lips (0: their lower
+                                          # edge, 0.5: their centre-line, 1: their upper edge)
 CENTRE_TOP, CENTRE_BOTTOM = 0.035, -0.130  # the midline features re-centred between these heights (m,
                                           # from REF_Y): from between the eyes down past the chin,
                                           # tapering to nothing over the top 1 cm and the bottom 2 cm
@@ -217,28 +218,56 @@ def front_weight(X, c0, fwd):
     return E.smooth01(((X - c0) @ fwd - FRONT[0]) / (FRONT[1] - FRONT[0]))
 
 
-def narrow_mouth(P, N, UV, T, atlas, nm, dm):
-    """Her right half's mouth squeezed toward the middle, the squeeze fading out round it, so that
-    the mouth is MOUTH_WIDTH of the distance between the eyes' centres: her right corner (the painted
-    lips' outermost point there) is measured, and so are the eyes (the painted eyes' area-weighted
-    centres, eye_frames). The lips'
-    relief is carried with them: each moved vertex keeps its height over a smooth copy of the face
-    (Gaussian, 8 mm; made from her right side and its mirror image, so it meets the plane square-on,
-    as the averaged face does). The paint moves with the vertices (their texture coordinates are
-    kept). Returns new P, N."""
+def mouth_extent(P, UV, T, atlas, nm, dm):
+    """The painted lips on the front of the head, inside MOUTH: (her right corner, her left corner)
+    as signed distances across the plane (m), and the lips' mean height up the plane's frame."""
+    a, u = lips_points(P, UV, T, atlas, nm, dm)
+    return float(a.min()), float(a.max()), float(u.mean())
+
+
+def lips_points(P, UV, T, atlas, nm, dm):
+    """The painted lip triangles on the front of the head, inside MOUTH: their centroids' distance
+    across the plane and height up the plane's frame (m)."""
     c0, up, fwd = plane_frame(nm, dm)
-    V, Tw, winv, Nw = E.welded_normals(P, N, T)
-    a, u, h = (V @ nm) - dm, (V - c0) @ up, (V - c0) @ fwd
-    # where the right corner and the eyes are
     H, W, _ = atlas.shape
     uvc = UV[T].mean(1)
     col = atlas[np.clip((uvc[:, 1] * H).astype(int), 0, H - 1), np.clip((uvc[:, 0] * W).astype(int), 0, W - 1)]
+    cen = P[T].mean(1)
     lips = (col[:, 0] > col[:, 1] + 0.25) & (col[:, 0] > col[:, 2] + 0.12) & (col[:, 0] > 0.45)
-    lips &= (ellipse_r(V[Tw].mean(1), nm, dm, c0, up, MOUTH) < 1.0) & (front_weight(V[Tw].mean(1), c0, fwd) > 0.5)
-    corner = -float(a[Tw[lips & ((a[Tw].mean(1)) < 0)]].min())
-    left, _ = E.eye_frames(P, T, UV, atlas, nm, dm)
-    eyes = 2.0 * abs(float(left["c"] @ nm) - dm)
-    k = MOUTH_WIDTH * eyes / 2.0 / corner
+    lips &= (ellipse_r(cen, nm, dm, c0, up, MOUTH) < 1.0) & (front_weight(cen, c0, fwd) > 0.5)
+    if lips.sum() < 20:
+        raise RuntimeError("found only %d painted lip triangles" % int(lips.sum()))
+    return cen[lips] @ nm - dm, (cen[lips] - c0) @ up
+
+
+def narrow_mouth(P, N, UV, T, atlas, nm, dm, width):
+    """Her right half's mouth scaled down about its middle -- across and up together, so it keeps
+    its shape (squeezed across alone, its corners keep their height and the smile turns U-shaped) --
+    so that, mirrored, the mouth is `width` wide; and unbent: each column of it moved up or down by
+    (1 - MOUTH_CURVE) of the lips' centre-line height there over the middle's, so the smile is
+    shallower (her right half is the rounded, sagging half of the model's mouth; mirrored, it drops
+    from both corners) while the lips keep their thickness. Both fade out round the mouth
+    (MOUTH_FADE). The lips' relief is carried with them: each moved vertex keeps its height over a smooth copy of the
+    face (Gaussian, 8 mm; made from her right side and its mirror image, so it meets the plane
+    square-on, as the averaged face does). The paint moves with the vertices (their texture
+    coordinates are kept). Returns new P, N."""
+    c0, up, fwd = plane_frame(nm, dm)
+    V, Tw, winv, Nw = E.welded_normals(P, N, T)
+    a, u, h = (V @ nm) - dm, (V - c0) @ up, (V - c0) @ fwd
+    la, lu = lips_points(P, UV, T, atlas, nm, dm)
+    right, um = float(la.min()), float(lu.mean())
+    corner = -right
+    k = min(1.0, width / 2.0 / corner)
+    # the lips' centre-line on her right half: their mid-height in bins across, smoothed
+    edges = np.linspace(right, 0.0, 13)
+    mids, cl = 0.5 * (edges[1:] + edges[:-1]), []
+    for b0, b1 in zip(edges[:-1], edges[1:]):
+        sel = (la >= b0) & (la <= b1)
+        cl.append(lu[sel].min() + MOUTH_LINE * (lu[sel].max() - lu[sel].min()) if sel.sum() >= 2 else np.nan)
+    cl = np.array(cl)
+    ok = np.isfinite(cl)
+    cl = ndimage.gaussian_filter1d(np.interp(mids, mids[ok], cl[ok]), 1.0, mode="nearest")
+    centre = lambda aa: np.interp(aa, mids, cl)          # noqa: E731  (held at the ends)
     g = ellipse_fade(V, nm, dm, c0, up, MOUTH, 1.0, MOUTH_FADE) * (a < 0) * front_weight(V, c0, fwd)
     mv = np.nonzero(g > 0)[0]
     # the face's height over the plane's frame round the mouth, made symmetric, and a smooth copy
@@ -261,10 +290,12 @@ def narrow_mouth(P, N, UV, T, atlas, nm, dm):
     def base_at(aa, uu):
         q = np.c_[(aa + a0) / PX / W_, (u1 - uu) / PX / H_]
         return E.bilinear(base[..., None], q[:, 0], q[:, 1])[:, 0]
-    an = a[mv] * (1.0 - (1.0 - k) * g[mv])
-    hn = base_at(an, u[mv]) + (h[mv] - base_at(a[mv], u[mv]))
+    f = 1.0 - (1.0 - k) * g[mv]
+    an, un = a[mv] * f, um + (u[mv] - um) * f
+    un -= (1.0 - MOUTH_CURVE) * g[mv] * f * (centre(a[mv]) - cl[-1])
+    hn = base_at(an, un) + (h[mv] - base_at(a[mv], u[mv]))
     Vn = V.copy()
-    Vn[mv] = c0 + an[:, None] * nm + u[mv, None] * up + hn[:, None] * fwd
+    Vn[mv] = c0 + an[:, None] * nm + un[:, None] * up + hn[:, None] * fwd
     # normals: the new surface's, blended in by the squeeze's weight
     Nr = hg.vertex_normals(Vn, Tw)
     Nn = Nw.copy()
@@ -273,9 +304,11 @@ def narrow_mouth(P, N, UV, T, atlas, nm, dm):
     moved = np.isin(winv, mv)
     P2, N2 = P.copy(), N.copy()
     P2[moved] = Vn[winv[moved]]; N2[moved] = Nn[winv[moved]]
-    log("mouth: her right corner %.1f mm out, the eyes' centres %.1f mm apart: squeezed across to %.2f, so the mouth "
-        "is %.2f of their spacing (%d vertices moved, up to %.1f mm)"
-        % (1e3 * corner, 1e3 * eyes, k, MOUTH_WIDTH, len(mv), 1e3 * np.linalg.norm(Vn[mv] - V[mv], axis=1).max()))
+    log("mouth: her right half mirrored would be %.1f mm wide; scaled by %.2f about its middle (across and up) "
+        "to the model's own %.1f mm, and its curve (the corner %.1f mm over the middle) unbent to %.0f%% "
+        "(%d vertices moved, up to %.1f mm)"
+        % (2e3 * corner, k, 1e3 * width, 1e3 * (cl[0] - cl[-1]), 100 * MOUTH_CURVE, len(mv),
+           1e3 * np.linalg.norm(Vn[mv] - V[mv], axis=1).max()))
     return P2, N2
 
 
@@ -519,10 +552,11 @@ def main():
     V, _, _ = hg.weld(P, T)
     nm, dm = E.mirror_plane(V)
     log("mirror plane: normal %s, offset %.4f m" % (np.round(nm, 4), dm))
+    r0, l0, _ = mouth_extent(P, UV, T, img["color"], nm, dm)   # the model's own mouth, as made
     P, N = centre_midline(P, N, T, nm, dm)
     P0, N0, UV0, T0 = P, N, UV, T          # the re-centred head: what the paint is paired up on
     P, N = average_shape(P, N, T, nm, dm)
-    P, N = narrow_mouth(P, N, UV, T, img["color"], nm, dm)
+    P, N = narrow_mouth(P, N, UV, T, img["color"], nm, dm, l0 - r0)
     P, N, UV, T, n_right = mirror_right(P, N, UV, T, nm, dm)
     N = renormal(P, N, T, nm, dm)
     ac, am, an = rebake_averaged(g, mi, P0, N0, UV0, T0, P, N, UV, T[:n_right],
