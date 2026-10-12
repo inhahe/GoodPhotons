@@ -423,8 +423,8 @@ struct BackwardRenderer {
     };
 
     // Next-event estimation: connect a surface vertex to each area emitter (the
-    // integral splits by light, summed unbiasedly). `invPdfLambda` = emitG/g(lambda)
-    // is the reciprocal of the sampled-wavelength pdf; multiplied by an emitter's
+    // integral splits by light, summed unbiasedly). `invPdfLambda` = camG/g(lambda)
+    // is the reciprocal of the sampled-wavelength pdf (Scene::camSampler); multiplied by an emitter's
     // SPD(lambda) it yields that emitter's Le/pdf weight (= its SPD integral for a
     // single light, matching the forward tracer's photon-weight convention).
     //
@@ -1196,7 +1196,33 @@ struct BackwardRenderer {
             // `nS > 1` branch keeps its original float ordering).
             total += ((nS > 1) ? acc / (double)nS : acc) * selW;
         }
+        // The fire, as one more light (fireNee). Not under dual scattering, whose fiber response
+        // comes bundled with its own visibility: mode R refuses a fire alongside it.
+        if (!dctx && !scene.emissiveVolumes.empty()) {
+            const bool agg = hs && hs->aggregate;
+            const double one = 1.0;
+            fireNee(scene, h.p, &lambda, 1, &one, &invPdfLambda, &total, nb != nullptr, agg,
+                    agg ? FireVis::SkipHair : FireVis::Strands, rng,
+                    [&](const Vec3& wi, double* f, double& pdfB, Ray& r) {
+                        double cosSurf = 0.0, stG = 0.0;
+                        if (!dirResponse(scene, h, wi, hs, nb, cosSurf, stG, pdfB)) return false;
+                        f[0] = (nb ? bdpt::bsdfF(*nb->m, h.n, nb->wo, wi, lambda, scene, &h)
+                                   : rho / PI) * cosSurf * stG;
+                        r = fireRay(h, ngo, hs, wi);
+                        return true;
+                    });
+        }
         return total;
+    }
+
+    // The ray a fire light-sampling integral runs along from a surface or fiber vertex: offset
+    // as that vertex's shadow rays are (envGeom) -- along the oriented geometric normal off a
+    // surface, by the hair exit offset off a fiber (as the curve tmin of a strand's ray, as a
+    // plain step out of an aggregate coat's).
+    static Ray fireRay(const Hit& h, const Vec3& ngo, const HairShade* hs, const Vec3& wi) {
+        if (!hs) return Ray{h.p + ngo * 1e-6, wi};
+        const double off = hairExitOffset(*hs, h.n, wi);
+        return hs->aggregate ? Ray{h.p + wi * off, wi} : Ray{h.p + wi * 1e-6, wi, off};
     }
 
     // SPECTRAL surface NEE for mode M's gather (0.341.0). Same emitter loop, same rng order and
@@ -1396,6 +1422,20 @@ struct BackwardRenderer {
                 }
             }
         }
+        // The fire, as one more light (fireNee): the bundle's per-wavelength response along one
+        // sampled direction, as for an emitter above.
+        if (!scene.emissiveVolumes.empty())
+            fireNee(scene, h.p, lam, nUp, thr, invPdf, L, nb != nullptr, /*coat=*/false,
+                    FireVis::Strands, rng,
+                    [&](const Vec3& wi, double* f, double& pdfB, Ray& r) {
+                        double cosSurf = 0.0, stG = 0.0;
+                        if (!dirResponse(scene, h, wi, nullptr, nb, cosSurf, stG, pdfB)) return false;
+                        for (int i = 0; i < nUp; ++i)
+                            f[i] = (nb ? bdpt::bsdfF(*nb->m, h.n, nb->wo, wi, lam[i], scene, &h)
+                                       : rho[i] / PI) * cosSurf * stG;
+                        r = fireRay(h, ngo, nullptr, wi);
+                        return true;
+                    });
     }
 
     // ---- deterministic one-bounce gather ---------------------------------------------
@@ -1584,6 +1624,18 @@ struct BackwardRenderer {
             // selW == 1 on the exact all-emitters path
             total += albedo * med.phaseValue(dot(wIn, wi), lambda) * emitW * geom * selW;
         }
+        // The fire, as one more light (fireNee) -- the vertex may sit inside it.
+        if (!scene.emissiveVolumes.empty()) {
+            const double one = 1.0;
+            fireNee(scene, p, &lambda, 1, &one, &invPdfLambda, &total, /*mis=*/false,
+                    /*coat=*/false, FireVis::Strands, rng,
+                    [&](const Vec3& wi, double* f, double& pdfB, Ray& r) {
+                        f[0] = albedo * med.phaseValue(dot(wIn, wi), lambda);
+                        pdfB = 0.0;
+                        r = Ray{p + wi * 1e-6, wi};
+                        return true;
+                    });
+        }
         return total;
     }
 
@@ -1624,13 +1676,10 @@ struct BackwardRenderer {
             stG = 1.0; wMis = 1.0;
             return !dualBlocked && cosSurf > 0.0;
         }
+        double pdfBsdf = 0.0;
+        if (!dirResponse(scene, h, wi, hs, nb, cosSurf, stG, pdfBsdf)) return false;
+        farDist = length(scene.sceneCenter - h.p) + scene.sceneRadius;
         if (hs) {
-            // Fiber: `cosSurf` carries PI*hairFCos so the caller's rho/PI (rho == 1) leaves
-            // the BCSDF-times-projection, and the MIS partner is the BCSDF's own pdf rather
-            // than the cosine-hemisphere one — the continuation below samples hair::sample.
-            cosSurf = PI * hairFCos(*hs, wi);
-            stG = 1.0;
-            farDist = length(scene.sceneCenter - h.p) + scene.sceneRadius;
             // Aggregate fiber: coat transmittance instead of strand geometry, and only walls
             // occlude. Same substitution as emitterGeom — see the comments there.
             if (hs->aggregate && furVol)
@@ -1646,34 +1695,47 @@ struct BackwardRenderer {
                 if (!(vis > 0.0)) return false;
                 cosSurf *= vis;
             }
-            const double pdfBsdf = hair::pdf(hs->b, hs->woLocal, hair::toLocal(hs->fr, wi));
-            wMis = pdfW / (pdfW + pdfBsdf);
-            return true;
-        }
-        cosSurf = dot(h.n, wi);
-        const Vec3 ngo = orientedGeoN(h);
-        if (cosSurf <= 0.0) return false;                       // below the shading horizon
-        stG = shadowTerminatorG(wi, h.n, ngo);                  // Chiang soft terminator (1 if flat)
-        if (stG <= 0.0) return false;                           // behind true geometry: hard shadow
-        farDist = length(scene.sceneCenter - h.p) + scene.sceneRadius;
-        {   // see the fiber branch above: a transparent coat between a surface and the sky
-            // attenuates it instead of blocking it
-            const double vis = scene.shadowTransmittance(h.p + ngo * 1e-6, wi, farDist);
+        } else {
+            // As at a fiber: a transparent coat between a surface and the sky attenuates it
+            // instead of blocking it.
+            const double vis = scene.shadowTransmittance(h.p + orientedGeoN(h) * 1e-6, wi, farDist);
             if (!(vis > 0.0)) return false;
             cosSurf *= vis;
         }
-        // The density the CONTINUATION would have sampled `wi` with: the lobe's at a glossy
-        // vertex, the cosine hemisphere's otherwise. This is the quantity the env-escape site
-        // carries forward in `gmis.pdf`, so the two halves see one number.
-        double pdfBsdf = nb ? bdpt::bsdfPdf(*nb->m, h.n, nb->wo, wi, /*lambda*/0.0, scene, &h)
-                            : cosSurf / PI;
         wMis = (pdfW + pdfBsdf > 0.0) ? pdfW / (pdfW + pdfBsdf) : 1.0;   // balance heuristic
+        return true;
+    }
+
+    // The vertex's response toward a direction it did not sample, and the density its own
+    // continuation would have sampled that direction with: the shading half of envGeom, shared
+    // with the fire's light sampling (fireNee), whose visibility is a line integral instead of a
+    // shadow ray to the scene exit. `cosSurf` carries the cosine -- PI * hairFCos at a fiber, so
+    // a caller's rho/PI with rho == 1 leaves the BCSDF times projection -- and `stG` the shadow
+    // terminator. `pdfBsdf` is the lobe's density at a glossy vertex (`nb`), the BCSDF's at a
+    // fiber, the cosine hemisphere's otherwise: the quantity the env escape carries forward in
+    // `gmis.pdf` / contBsdfPdf, so the two halves of a MIS pair see one number. False below the
+    // horizon.
+    bool dirResponse(const Scene& scene, const Hit& h, const Vec3& wi, const HairShade* hs,
+                     const NeeBsdf* nb, double& cosSurf, double& stG, double& pdfBsdf) const {
+        if (hs) {
+            cosSurf = PI * hairFCos(*hs, wi);
+            stG = 1.0;
+            pdfBsdf = hair::pdf(hs->b, hs->woLocal, hair::toLocal(hs->fr, wi));
+            return cosSurf > 0.0;
+        }
+        cosSurf = dot(h.n, wi);
+        if (cosSurf <= 0.0) return false;                       // below the shading horizon
+        stG = shadowTerminatorG(wi, h.n, orientedGeoN(h));      // Chiang soft terminator (1 if flat)
+        if (stG <= 0.0) return false;                           // behind true geometry: hard shadow
+        pdfBsdf = nb ? bdpt::bsdfPdf(*nb->m, h.n, nb->wo, wi, /*lambda*/0.0, scene, &h)
+                     : cosSurf / PI;
         return true;
     }
 
     double neeEnv(const Scene& scene, const Hit& h, double rho, double invPdfLambda,
                   double lambda, Pcg32& rng, const HairShade* hs = nullptr,
                   const HairDualCtx* dctx = nullptr, const NeeBsdf* nb = nullptr) const {
+        if (!envNeeOn()) return 0.0;        // FTRACE_ENV_NEE=0: the escape alone
         Vec3 wi; double cosSurf, stG, pdfW, wMis, farDist;
         // As in neeLight: the one forward-spread draw is taken unconditionally, so the rng
         // stream does not depend on how many strands this particular shadow ray crossed.
@@ -1706,6 +1768,7 @@ struct BackwardRenderer {
     void neeEnvHero(const Scene& scene, const Hit& h, const double* rho, double* L,
                     const double* thr, const double* lam, const double* invPdf,
                     int nUp, Pcg32& rng, const NeeBsdf* nb = nullptr) const {
+        if (!envNeeOn()) return;        // FTRACE_ENV_NEE=0: the escape alone
         Vec3 wi; double cosSurf, stG, pdfW, wMis, farDist;
         if (!envGeom(scene, h, rng, wi, cosSurf, stG, pdfW, wMis, farDist,
                      nullptr, nullptr, nb)) return;
@@ -1763,6 +1826,20 @@ struct BackwardRenderer {
                 L[i] += thr[i] * resp[i] * (spd * invPdf[i]) * w;
             }
         }
+        // The fire, as one more light (fireNee), with the fiber's response per wavelength. No
+        // MIS: as for the emitters above, a continuation after a fiber does not count it.
+        if (!scene.emissiveVolumes.empty())
+            fireNee(scene, h.p, lam, nUp, thr, invPdf, L, /*mis=*/false, /*coat=*/false,
+                    FireVis::Strands, rng,
+                    [&](const Vec3& wi, double* f, double& pdfB, Ray& r) {
+                        const Vec3 wl = hair::toLocal(hs[0].fr, wi);
+                        hairBundleAt(hs, nUp, wl,
+                                     hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0))),
+                                     f, nullptr);
+                        pdfB = 0.0;
+                        r = fireRay(h, ngo, &hs[0], wi);
+                        return true;
+                    });
     }
 
     // The environment twin of neeLightHeroHair: one sky direction and one shadow ray, the
@@ -1776,6 +1853,7 @@ struct BackwardRenderer {
     void neeEnvHeroHair(const Scene& scene, const Hit& h, const HairShade* hs, double* L,
                         const double* thr, const double* lam, const double* invPdf, int nUp,
                         const double* specR, const bool* tech, Pcg32& rng) const {
+        if (!envNeeOn()) return;        // FTRACE_ENV_NEE=0: the escape alone
         double pdfW = 0.0;
         const Vec3 wi = scene.sampleEnvDir(rng, pdfW);
         if (!(pdfW > 0.0)) return;
@@ -1812,6 +1890,7 @@ struct BackwardRenderer {
     // `med` is the scattering medium (see neeVolume); the transmittance is over all.
     double neeEnvVolume(const Scene& scene, const Medium& med, const Vec3& p, const Vec3& wIn,
                         double lambda, double invPdfLambda, Pcg32& rng) const {
+        if (!envNeeOn()) return 0.0;        // FTRACE_ENV_NEE=0: the escape alone
         double pdfW;
         Vec3 wi = scene.sampleEnvDir(rng, pdfW);
         if (pdfW <= 0.0) return 0.0;
@@ -1825,6 +1904,271 @@ struct BackwardRenderer {
         double wMis   = pdfW / (pdfW + phase);          // balance heuristic
         double T = mediaTr(scene, p + wi * 1e-6, wi, farDist, lambda, rng);
         return albedo * phase * Lenv * invPdfLambda / pdfW * wMis * T * vis;
+    }
+
+    // ---- VOLUMETRIC EMISSION ("fire") -----------------------------------------------------------
+    // A medium with a `temperature` grid emits j(x, λ) = Medium::emissionAt per unit length,
+    // isotropically: the density the forward tracer births fire photons at, so modes B and R
+    // agree by construction. Mode R reaches it the way it reaches an area light:
+    //  * LIGHT SAMPLING at every vertex that samples lights (fireNee, called from the NEE
+    //    functions): one fire v (probability by power), one direction -- toward a point drawn in
+    //    proportion to its emission (firePoint), or, as a defensive quarter of the draws, in the
+    //    cone the box it emits in subtends (uniform over all directions from inside it) -- and the
+    //    emission line integral along that direction to the first opaque surface, through
+    //    see-through fibers by their transmittance -- the domain a shadow ray to a light has;
+    //  * every SEGMENT the path traces collects the emission along it (fireSegment), at the
+    //    weight an emitter hit gets there: whole on a camera or specular arrival, which nothing
+    //    sampled a light for; nothing after a diffuse, fiber or medium vertex, whose light
+    //    sampling took it; the balance heuristic after a glossy one (gmis), as glossyHitWeight.
+    // A point-sampled light would carry a 1/r^2 whose variance diverges for a vertex INSIDE the
+    // fire -- soot scattering its own glow -- which is why a point drawn here only sets the
+    // DIRECTION (the integral along it is the estimate) and the cone stays in the mixture.
+
+    // Slab clip of o + t d, t in [t0, t1], to the box [lo, hi]; false when they miss.
+    static bool clipBox(const Vec3& lo, const Vec3& hi, const Vec3& o, const Vec3& d,
+                        double t0, double t1, double& ta, double& tb) {
+        for (int a = 0; a < 3; ++a) {
+            const double oa = (&o.x)[a], da = (&d.x)[a];
+            if (std::fabs(da) < 1e-12) {
+                if (oa < (&lo.x)[a] || oa > (&hi.x)[a]) return false;
+                continue;
+            }
+            double s0 = ((&lo.x)[a] - oa) / da, s1 = ((&hi.x)[a] - oa) / da;
+            if (s0 > s1) std::swap(s0, s1);
+            t0 = std::max(t0, s0); t1 = std::min(t1, s1);
+            if (t0 >= t1) return false;
+        }
+        ta = t0; tb = t1;
+        return true;
+    }
+
+    // FTRACE_ENV_NEE=0 does the same for the sky: no light sampling of it (neeEnv and its bundle,
+    // fiber and volume twins), and every escape takes its whole radiance -- the BSDF-sampled
+    // strategy alone, which must render the same image (not under -dual-scatter, whose fibers
+    // end the path). For paired A/B checks only; read once per process.
+    static bool envNeeOn() {
+        static const bool on = [] {
+            const char* e = std::getenv("FTRACE_ENV_NEE");
+            return !(e && e[0] == '0');
+        }();
+        return on;
+    }
+
+    // FTRACE_FIRE_NEE=0 turns the fire's light sampling off and gives every segment its whole
+    // emission: the BSDF-sampled strategy alone, which must render the same image. For paired
+    // A/B checks only (tools/check_fire_r.py); read once per process.
+    static bool fireNeeOn() {
+        static const bool on = [] {
+            const char* e = std::getenv("FTRACE_FIRE_NEE");
+            return !(e && e[0] == '0');
+        }();
+        return on;
+    }
+
+    // The probability fireNee picks fire `vi`: its share of the fires' power.
+    static double fireSel(const Scene& scene, int vi) {
+        return scene.totalEmissionPower > 0.0
+                   ? scene.emissiveVolumes[(size_t)vi].power / scene.totalEmissionPower : 0.0;
+    }
+
+    // The solid-angle density with which fireNee samples direction `d` (unit) from `x` for fire
+    // `v`, and the sampler itself. `oneMinusCos` is 1 - cos(theta_max) written stably, so a small
+    // distant fire keeps its digits.
+    static double fireConePdf(const Scene::EmissiveVolume& v, const Vec3& x, const Vec3& d) {
+        const Vec3 tc = (v.bmin + v.bmax) * 0.5 - x;
+        const double R2 = dot(v.bmax - v.bmin, v.bmax - v.bmin) * 0.25, d2 = dot(tc, tc);
+        if (d2 <= R2) return 1.0 / (4.0 * PI);
+        const double s2 = R2 / d2, cosMax = std::sqrt(1.0 - s2);
+        if (dot(d, tc) < cosMax * std::sqrt(d2)) return 0.0;
+        return 1.0 / (2.0 * PI * (s2 / (1.0 + cosMax)));
+    }
+    static Vec3 fireConeSample(const Scene::EmissiveVolume& v, const Vec3& x, double u1, double u2,
+                               double& pdf) {
+        const Vec3 tc = (v.bmin + v.bmax) * 0.5 - x;
+        const double R2 = dot(v.bmax - v.bmin, v.bmax - v.bmin) * 0.25, d2 = dot(tc, tc);
+        const double phi = 2.0 * PI * u2;
+        if (d2 <= R2) {
+            const double z = 1.0 - 2.0 * u1, r = std::sqrt(std::max(0.0, 1.0 - z * z));
+            pdf = 1.0 / (4.0 * PI);
+            return Vec3(r * std::cos(phi), r * std::sin(phi), z);
+        }
+        const double s2 = R2 / d2, oneMinusCos = s2 / (1.0 + std::sqrt(1.0 - s2));
+        const double om = u1 * oneMinusCos;                       // 1 - cos(theta), uniform
+        const double cosT = 1.0 - om, sinT = std::sqrt(std::max(0.0, om * (2.0 - om)));
+        const Vec3 a = tc / std::sqrt(d2);
+        Vec3 t, b; onb(a, t, b);
+        pdf = 1.0 / (2.0 * PI * oneMinusCos);
+        return a * cosT + t * (sinT * std::cos(phi)) + b * (sinT * std::sin(phi));
+    }
+
+    // POINT sampling, the strategy that finds a small hot core: a cell of the fire's coarse
+    // emission grid in proportion to its power (EmissiveVolume::cellW), a uniform point in it,
+    // and the direction to that point. The direction's solid-angle density is the line integral
+    // along it of the point density (piecewise constant) times t^2, which firePointPdf computes
+    // exactly by stepping through the grid's cells (Amanatides-Woo).
+    static Vec3 firePoint(const Scene::EmissiveVolume& v, double u0, double u1, double u2, double u3) {
+        const size_t n = v.cellCdf.size();
+        size_t ci = (size_t)(std::lower_bound(v.cellCdf.begin(), v.cellCdf.end(), u0) - v.cellCdf.begin());
+        if (ci >= n) ci = n - 1;
+        const int i = (int)(ci % (size_t)v.gres[0]);
+        const int j = (int)((ci / (size_t)v.gres[0]) % (size_t)v.gres[1]);
+        const int k = (int)(ci / ((size_t)v.gres[0] * (size_t)v.gres[1]));
+        const Vec3 ext = v.bmax - v.bmin;
+        return Vec3(v.bmin.x + ext.x * (i + u1) / v.gres[0], v.bmin.y + ext.y * (j + u2) / v.gres[1],
+                    v.bmin.z + ext.z * (k + u3) / v.gres[2]);
+    }
+    static double firePointPdf(const Scene::EmissiveVolume& v, const Vec3& x, const Vec3& d) {
+        if (!(v.cellSum > 0.0)) return 0.0;
+        double t0, t1;
+        if (!clipBox(v.bmin, v.bmax, x, d, 0.0, 1e300, t0, t1)) return 0.0;
+        const Vec3 ext = v.bmax - v.bmin;
+        const double cellVol = (ext.x / v.gres[0]) * (ext.y / v.gres[1]) * (ext.z / v.gres[2]);
+        const double norm = 1.0 / (v.cellSum * cellVol);    // point density = cellW * norm
+        int c[3], step[3];
+        double tNext[3], tDelta[3];
+        for (int a = 0; a < 3; ++a) {
+            const double lo = (&v.bmin.x)[a], w = (&ext.x)[a] / v.gres[a], da = (&d.x)[a];
+            const double pa = (&x.x)[a] + da * t0;               // the entry point
+            c[a] = std::clamp((int)std::floor((pa - lo) / w), 0, v.gres[a] - 1);
+            if (da > 0.0)      { step[a] = 1;  tNext[a] = t0 + (lo + (c[a] + 1) * w - pa) / da; tDelta[a] = w / da; }
+            else if (da < 0.0) { step[a] = -1; tNext[a] = t0 + (lo + c[a] * w - pa) / da;       tDelta[a] = -w / da; }
+            else               { step[a] = 0;  tNext[a] = 1e300;                                tDelta[a] = 1e300; }
+        }
+        double t = t0, pdf = 0.0;
+        while (t < t1) {
+            const int a = (tNext[0] < tNext[1]) ? (tNext[0] < tNext[2] ? 0 : 2) : (tNext[1] < tNext[2] ? 1 : 2);
+            const double tOut = std::min(tNext[a], t1);
+            const double w = v.cellW[((size_t)c[2] * v.gres[1] + c[1]) * v.gres[0] + c[0]];
+            if (w > 0.0) pdf += w * norm * (tOut * tOut * tOut - t * t * t) / 3.0;
+            t = tOut;
+            c[a] += step[a];
+            if (c[a] < 0 || c[a] >= v.gres[a]) break;
+            tNext[a] += tDelta[a];
+        }
+        return pdf;
+    }
+    // The density of fireNee's direction for fire `v` from `x`: the defensive mixture of the cone
+    // (kFireCone of the draws; it bounds the estimate for a vertex inside the fire, where point
+    // sampling's density goes to 0 along a chord through emitting cells) and point sampling.
+    static constexpr double kFireCone = 0.25;
+    static double fireDirPdf(const Scene::EmissiveVolume& v, const Vec3& x, const Vec3& d) {
+        const double pc = fireConePdf(v, x, d);
+        if (!(v.cellSum > 0.0)) return pc;
+        return kFireCone * pc + (1.0 - kFireCone) * firePointPdf(v, x, d);
+    }
+
+    // How a fire light-sampling ray sees occluders: not at all (a path segment, already cut at
+    // the surface it reached), through see-through strands by their transmittance (a shadow
+    // ray), or with the strands skipped, an aggregate coat being optical depth instead.
+    enum class FireVis { None, Strands, SkipHair };
+
+    // The emission a straight segment o + s d, s in [0, len], collects: sum over fires v of
+    // w(v) * integral of T(0, s) j_v(o + s d, lam[i]) ds, added into E[i] for i < n (`only` >= 0
+    // restricts it to one fire). Per fire, K jittered stratified points over the segment's
+    // overlap with the box it emits in, about one per voxel of its temperature grid (4 to 32: the
+    // emission rises steeply with temperature, so a coarser rule leaves the hot core to luck);
+    // the transmittance to each is the product of independent estimates
+    // over consecutive sub-segments -- the media's (mediaTr at lam[0]: a bundle rides only grey
+    // media), the aggregate coat's when `coat`, the strands' per `vis` (which also ends the
+    // integral at an opaque surface) -- so the estimate is unbiased. `curveTmin0`: the hair exit
+    // offset of a ray leaving a fiber, for its first sub-segment. `absorb`: the Beer-Lambert
+    // coefficient of the dielectric the segment runs inside (0 outside one; a bundle is never
+    // inside one, every dielectric entry splitting or de-heroing it).
+    template <class W>
+    void fireSegment(const Scene& scene, const Vec3& o, const Vec3& d, double len,
+                     const double* lam, int n, bool coat, FireVis vis, double curveTmin0,
+                     double absorb, Pcg32& rng, double* E, W&& w, int only = -1) const {
+        for (int vi = 0; vi < (int)scene.emissiveVolumes.size(); ++vi) {
+            if (only >= 0 && vi != only) continue;
+            const Scene::EmissiveVolume& v = scene.emissiveVolumes[(size_t)vi];
+            double ta, tb;
+            if (!clipBox(v.bmin, v.bmax, o, d, 0.0, len, ta, tb)) continue;
+            const double wv = w(vi);
+            if (!(wv > 0.0)) continue;
+            const Medium& med = scene.media[(size_t)v.mediumIndex];
+            const int K = (v.voxel > 0.0)
+                              ? std::clamp((int)std::ceil((tb - ta) / v.voxel), 4, 32) : 4;
+            const double dt = (tb - ta) / K;
+            double T = 1.0, sPrev = 0.0;
+            for (int k = 0; k < K; ++k) {
+                const double s = ta + (k + rng.uniform()) * dt;
+                const Vec3 a = o + d * sPrev;
+                const double seg = s - sPrev;
+                T *= mediaTr(scene, a, d, seg, lam[0], rng);
+                if (coat && furVol && furVol->valid()) T *= furVol->transmittance(a, d, seg);
+                if (vis == FireVis::Strands && T > 0.0)
+                    T *= scene.shadowTransmittance(a, d, seg, 1e-6, k == 0 ? curveTmin0 : 0.0);
+                else if (vis == FireVis::SkipHair && T > 0.0 && scene.occludedSkipHair(a, d, seg))
+                    T = 0.0;
+                if (!(T > 0.0)) break;
+                sPrev = s;
+                const double kelvin = med.temperatureAt(o + d * s);
+                if (!(kelvin > 0.0)) continue;
+                const double Ts = (absorb > 0.0) ? T * std::exp(-absorb * s) : T;
+                for (int i = 0; i < n; ++i) E[i] += wv * dt * Ts * med.emissionAtKelvin(kelvin, lam[i]);
+            }
+        }
+    }
+
+    // fireSegment's weight for a path segment leaving `from` along `d`, per fire: the glossy
+    // vertex's balance heuristic (`gm.pdf > 0`), else 1 on a camera or specular arrival and 0
+    // after any other vertex.
+    double fireSegmentWeight(const Scene& scene, int vi, const GlossyMis& gm, bool specularArrival,
+                             const Vec3& d) const {
+        if (!fireNeeOn()) return 1.0;
+        if (gm.pdf > 0.0) {
+            const double pn = fireSel(scene, vi) * fireDirPdf(scene.emissiveVolumes[(size_t)vi], gm.from, d);
+            return gm.pdf / (gm.pdf + pn);
+        }
+        return specularArrival ? 1.0 : 0.0;
+    }
+
+    // Light sampling of the fire from a vertex at `x`. `resp(wi, f, pdfB, r)` fills f[0..n) --
+    // the vertex's BSDF times cosine (or albedo times phase) toward wi, per wavelength -- the
+    // density pdfB its continuation would sample wi with, and the ray r the integral runs along
+    // (offset off the vertex as its shadow rays are); false when wi is out of reach. `mis`: the
+    // vertex is a glossy one whose continuation also counts the fire (gmis), so the estimate takes
+    // the balance heuristic sel*p / (sel*p + pdfB); otherwise it is the only strategy. Adds
+    // thr[i] * invPdf[i] times the estimate into L[i].
+    template <class Resp>
+    void fireNee(const Scene& scene, const Vec3& x, const double* lam, int n, const double* thr,
+                 const double* invPdf, double* L, bool mis, bool coat, FireVis vis, Pcg32& rng,
+                 Resp&& resp) const {
+        const int nV = (int)scene.emissiveVolumes.size();
+        if (nV == 0 || !(scene.totalEmissionPower > 0.0) || !fireNeeOn()) return;
+        int vi = 0;
+        {   const double u = rng.uniform();
+            double acc = 0.0;
+            for (; vi < nV - 1; ++vi) { acc += fireSel(scene, vi); if (u < acc) break; }
+        }
+        const double sel = fireSel(scene, vi);
+        if (!(sel > 0.0)) return;
+        const Scene::EmissiveVolume& v = scene.emissiveVolumes[(size_t)vi];
+        Vec3 wi;
+        if (v.cellSum > 0.0 && rng.uniform() >= kFireCone) {
+            const double u0 = rng.uniform(), u1 = rng.uniform(), u2 = rng.uniform(),
+                         u3 = rng.uniform();
+            const Vec3 dv = firePoint(v, u0, u1, u2, u3) - x;
+            const double dl = length(dv);
+            if (!(dl > 0.0)) return;
+            wi = dv / dl;
+        } else {
+            const double u1 = rng.uniform(), u2 = rng.uniform();
+            double pc = 0.0;
+            wi = fireConeSample(v, x, u1, u2, pc);
+        }
+        const double pdfDir = fireDirPdf(v, x, wi);
+        if (!(pdfDir > 0.0)) return;
+        double f[hero::kHeroMax] = {0}, pdfB = 0.0;
+        Ray r;
+        if (!resp(wi, f, pdfB, r)) return;
+        double E[hero::kHeroMax] = {0};
+        fireSegment(scene, r.o, r.d, length(scene.sceneCenter - x) + scene.sceneRadius, lam, n,
+                    coat, vis, r.curveTmin, /*absorb=*/0.0, rng, E, [](int) { return 1.0; }, vi);
+        const double den = sel * pdfDir + (mis ? pdfB : 0.0);
+        if (!(den > 0.0)) return;
+        for (int i = 0; i < n; ++i)
+            if (thr[i] > 0.0 && f[i] > 0.0 && E[i] > 0.0) L[i] += thr[i] * invPdf[i] * f[i] * E[i] / den;
     }
 
     // Hero-bundle NEE at a medium scattering vertex (SPECTRAL-BUNDLE): neeVolume's emitter loop
@@ -1856,6 +2200,17 @@ struct BackwardRenderer {
                 L[i] += thr[i] * alb[i] * med.phaseValue(cosT, lam[i]) * spd * invPdf[i] * geom;
             }
         }
+        // The fire, as one more light (fireNee), as in neeVolume.
+        if (!scene.emissiveVolumes.empty())
+            fireNee(scene, p, lam, nUp, thr, invPdf, L, /*mis=*/false, /*coat=*/false,
+                    FireVis::Strands, rng,
+                    [&](const Vec3& wi, double* f, double& pdfB, Ray& r) {
+                        const double cosT = dot(wIn, wi);
+                        for (int i = 0; i < nUp; ++i) f[i] = alb[i] * med.phaseValue(cosT, lam[i]);
+                        pdfB = 0.0;
+                        r = Ray{p + wi * 1e-6, wi};
+                        return true;
+                    });
     }
 
     // The environment twin of neeVolumeHero, with neeEnvVolume's balance heuristic against the
@@ -1865,6 +2220,7 @@ struct BackwardRenderer {
     void neeEnvVolumeHero(const Scene& scene, const Medium& med, const Vec3& p, const Vec3& wIn,
                           double* L, const double* thr, const double* lam, const double* invPdf,
                           int nUp, const double* specR, const bool* tech, Pcg32& rng) const {
+        if (!envNeeOn()) return;        // FTRACE_ENV_NEE=0: the escape alone
         double pdfW = 0.0;
         const Vec3 wi = scene.sampleEnvDir(rng, pdfW);
         if (!(pdfW > 0.0)) return;
@@ -2202,7 +2558,7 @@ struct BackwardRenderer {
                     // this illuminant have an empty sampler; fall back to the illuminant so
                     // the branch still terminates (rhoFluo will be 0 anyway).
                     const EmissionSampler& inS = (m.fluoInSampler.integral > 0.0)
-                                                     ? m.fluoInSampler : scene.emitSampler;
+                                                     ? m.fluoInSampler : scene.camSampler;
                     lambdaIn = whitted
                         ? inS.sampleAt(whittedFluoroU(gi.sIdx, gi.bounce), pin)
                         : inS.sample(rng, pin);
@@ -2394,8 +2750,8 @@ struct BackwardRenderer {
     }
 
     // Estimate spectral-weighted radiance for a single wavelength along `ray`.
-    // `invPdfLambda` = emitG/g(lambda), the reciprocal of the sampled-wavelength
-    // pdf; an emitter's Le/pdf weight is its SPD(lambda) * invPdfLambda.
+    // `invPdfLambda` = camG/g(lambda), the reciprocal of the sampled-wavelength
+    // pdf (Scene::camSampler); an emitter's Le/pdf weight is its SPD(lambda) * invPdfLambda.
     double radiance(const Scene& scene, Ray ray, double lambda, double invPdfLambda,
                     Pcg32& rng, const SpdCache* spdCache = nullptr,
                     GiCtx gi = GiCtx{}) const {
@@ -2497,6 +2853,17 @@ struct BackwardRenderer {
                 h.fw = patShadingFootprint(fwPerDist, h.t, dot(ray.d, h.n));
             double dSurf = h.valid ? h.t : 1e30;
 
+            // FIRE: the emission along this whole segment, to the surface it reached -- the RTE's
+            // emission term, whatever the free flight below then samples (fireSegment).
+            if (!scene.emissiveVolumes.empty()) {
+                double Ef = 0.0;
+                fireSegment(scene, ray.o, ray.d, dSurf, &lambda, 1, useVol, FireVis::None, 0.0,
+                            curAbsorb(lambda), rng, &Ef, [&](int vi) {
+                                return fireSegmentWeight(scene, vi, gmis, specularArrival, ray.d);
+                            });
+                L += thr * Ef * invPdfLambda;
+            }
+
             // AGGREGATE FUR (the far LOD tier): sample a free flight against the coat's own
             // density field. Sampled BEFORE the fog block and allowed to shorten `dSurf`,
             // which is not a fudge but exactly the right composition: the first collision in
@@ -2589,10 +2956,11 @@ struct BackwardRenderer {
                         // and not the other (the cylinder bug of 0.266.2 was exactly that).
                         const double pdfEnv = scene.envPdfDir(ray.d);
                         const double sum = gmis.pdf + pdfEnv;
-                        L += thr * Lenv * ((sum > 0.0) ? gmis.pdf / sum : 1.0);
+                        L += thr * Lenv * ((sum > 0.0 && envNeeOn()) ? gmis.pdf / sum : 1.0);
                     } else {
                         double pdfEnv = scene.envPdfDir(ray.d);
-                        double wMis = (contBsdfPdf + pdfEnv > 0.0)
+                        double wMis = !envNeeOn() ? 1.0
+                                    : (contBsdfPdf + pdfEnv > 0.0)
                                           ? contBsdfPdf / (contBsdfPdf + pdfEnv) : 0.0;
                         L += thr * Lenv * wMis;
                     }
@@ -2867,6 +3235,20 @@ struct BackwardRenderer {
             // A re-entered first segment's flights were drawn by the parent (see skipFlights).
             const bool drawFlights = !skipFlights;
             skipFlights = false;
+
+            // FIRE: the emission along this whole segment, as in the scalar twin -- except on a
+            // re-entered first segment, whose emission the parent bundle already collected.
+            if (drawFlights && !scene.emissiveVolumes.empty()) {
+                double Ef[hero::kHeroMax] = {0};
+                const int mi = stk.topMat();      // only ever set for a lone wavelength
+                fireSegment(scene, ray.o, ray.d, dSurf, lam, nUp, useVol, FireVis::None, 0.0,
+                            (mi >= 0) ? scene.mats[mi].absorb(lam[0]) : 0.0, rng, Ef,
+                            [&](int vi) {
+                                return fireSegmentWeight(scene, vi, gmis, specularArrival, ray.d);
+                            });
+                for (int i = 0; i < nUp; ++i) L[i] += thr[i] * Ef[i] * invPdf[i];
+            }
+
             furvol::FurVolume::Flight fl;
             if (drawFlights && useVol && furVol->valid()) {
                 fl = furVol->sampleFlight(ray.o, ray.d, dSurf, rng.uniform());
@@ -2985,12 +3367,13 @@ struct BackwardRenderer {
                     } else if (gmis.pdf > 0.0) {       // GLOSSY-NEE — see the scalar twin
                         const double pdfEnv = scene.envPdfDir(ray.d);
                         const double sum = gmis.pdf + pdfEnv;
-                        const double w = (sum > 0.0) ? gmis.pdf / sum : 1.0;
+                        const double w = (sum > 0.0 && envNeeOn()) ? gmis.pdf / sum : 1.0;
                         for (int i = 0; i < nUp; ++i)
                             L[i] += thr[i] * scene.envRadiance(ray.d, lam[i]) * invPdf[i] * w;
                     } else {
                         double pdfEnv = scene.envPdfDir(ray.d);
-                        double wMis = (contBsdfPdf + pdfEnv > 0.0)
+                        double wMis = !envNeeOn() ? 1.0
+                                    : (contBsdfPdf + pdfEnv > 0.0)
                                           ? contBsdfPdf / (contBsdfPdf + pdfEnv) : 0.0;
                         for (int i = 0; i < nUp; ++i)
                             L[i] += thr[i] * scene.envRadiance(ray.d, lam[i]) * invPdf[i] * wMis;
@@ -3727,10 +4110,13 @@ struct BackwardRenderer {
         const int*    baseIdx  = haveBases ? scene.spdBaseIdx.data() : fbIdx.data();
         const double* baseScl  = haveBases ? scene.spdScale.data()   : fbScale.data();
         // Per-base geomWeight*scale sums (Scene::spdBaseGeom): lets the per-sample
-        // invPdfLambda = emitG / sum_e geomWeight_e*SPD_e(lambda) be evaluated over
+        // invPdfLambda = camG / (sum_e geomWeight_e*SPD_e(lambda) + fireG) be evaluated over
         // BASES instead of emitters, which is what removes the last O(N_lights) term
         // from the backward CPU sample loop.
         const double* baseGeom = haveBases ? scene.spdBaseGeom.data() : fbGeom.data();
+        // A fire is part of what the camera's wavelengths are drawn from (Scene::camSampler):
+        // its emitted power per nm joins g, the emitters' (finalizeCameraSpectrum).
+        const bool fire = !scene.emissiveVolumes.empty();
         std::vector<double> baseBuf((size_t)nBase * (size_t)(useHero ? C : 1));
         for (int py = y0; py < y1; ++py) {
             for (int px = 0; px < film.resX; ++px) {
@@ -3752,7 +4138,7 @@ struct BackwardRenderer {
                         // mode would still be noise-free in geometry and shading and yet
                         // visibly speckled in COLOUR, because λ was the last random draw.
                         double uLam = whitted ? whittedLambdaU(sIdx) : rng.uniform();
-                        if (!hero::sampleBundle(scene.emitSampler, uLam, C,
+                        if (!hero::sampleBundle(scene.camSampler, uLam, C,
                                                 lamA, pdfA)) continue;
                         // Fill the per-sample SPD table (one evaluation per DISTINCT
                         // curve), then derive invA from it — Scene::invPdfLambda
@@ -3767,10 +4153,10 @@ struct BackwardRenderer {
                         SpdCache spdCache{lamA, baseBuf.data(), baseIdx, baseScl, C, 0};
                         for (int i = 0; i < C; ++i) {
                             if (i > 0 && pdfA[i] <= 0.0) { invA[i] = 0.0; continue; }
-                            double g = 0.0;
+                            double g = fire ? scene.fireG(lamA[i]) : 0.0;
                             for (int b = 0; b < nBase; ++b)
                                 g += baseGeom[(size_t)b] * baseBuf[(size_t)b * C + i];
-                            invA[i] = (g > 0.0) ? scene.emitG / g : 0.0;
+                            invA[i] = (g > 0.0) ? scene.camG / g : 0.0;
                         }
                         double jx, jy;
                         if (whitted) whittedSample(sIdx, jx, jy);
@@ -3795,20 +4181,20 @@ struct BackwardRenderer {
                     // preview here needs spp raised to cover the spectrum (the hero path,
                     // which is the usual one, gets C=heroC of them per sample for free).
                     double lambda = whitted
-                        ? scene.emitSampler.sampleAt(whittedLambdaU(sIdx), pdf)
-                        : scene.emitSampler.sample(rng, pdf);
+                        ? scene.camSampler.sampleAt(whittedLambdaU(sIdx), pdf)
+                        : scene.camSampler.sample(rng, pdf);
                     if (pdf <= 0) continue;
                     // Fill the per-sample SPD table (C=1) and derive invPdfLambda from
                     // it — Scene::invPdfLambda regrouped over bases, same zero guard,
-                    // = emitG/g(λ).
+                    // = camG/g(λ).
                     for (int g = 0; g < nBase; ++g)
                         baseBuf[(size_t)g] = haveBases ? scene.spdBase[g](lambda)
                                                        : scene.emitters[g].spdFn(lambda);
                     SpdCache spdCache{&lambda, baseBuf.data(), baseIdx, baseScl, 1, 0};
-                    double gSum = 0.0;
+                    double gSum = fire ? scene.fireG(lambda) : 0.0;
                     for (int b = 0; b < nBase; ++b)
                         gSum += baseGeom[(size_t)b] * baseBuf[(size_t)b];
-                    double invPdfLambda = (gSum > 0.0) ? scene.emitG / gSum : 0.0;
+                    double invPdfLambda = (gSum > 0.0) ? scene.camG / gSum : 0.0;
                     if (cam.hasLens()) {
                         // Physical multi-element lens: trace the camera ray from the
                         // film out through the real glass interfaces at this wavelength

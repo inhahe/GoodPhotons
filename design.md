@@ -7644,25 +7644,59 @@ as the one at fault.
   each grid's mean emission `meanKe` + selection `power`=4π·V·meanKe·Δλ into `Scene::emissiveVolumes`
   (+`totalEmissionPower`). Forward `tracePhoton` (`render.h`) splits birth emitter-vs-fire by power
   (`grandTotal=totalPower+totalEmissionPower`; no extra RNG when there are no emissive volumes, so
-  non-fire scenes stay bit-identical); a fire photon is born uniform-in-AABB, isotropic-dir, with λ
+  non-fire scenes stay bit-identical); a fire photon is born uniform in the box its temperature is positive in (`Scene::vdbPositiveBox`, 0.376.0; the whole grid box before), isotropic-dir, with λ
   **importance-sampled from `blackbody(emitKelvin)`** via a per-volume `EmissionSampler lamSampler` (built
   in `finalizeEmissiveVolumes`), carrying **β=grandTotal·κ_e/(meanKe·Δλ·p(λ))** — for a voxel at emitKelvin
   β is constant across λ, collapsing the colour-magnitude speckle (uniform p=1/Δλ recovers the plain
   β=grandTotal·κ_e/meanKe). The isotropic `1/(4π)/(dist²·Ω)` splat
   (`connectEmissionVolume`/`connectEmissionLensVolume`/`camSplatEmissionAll`) reproduces the emission
-  line-integral. **Forward CPU AND GPU** (A/B/C, V/P forward layers): the GPU mirror lives in
+  line-integral. **Forward CPU AND GPU** (A/B/C): the GPU mirror lives in
   `render_cuda.cu` — the VDB brick sampler is factored into a reusable `DVdbGrid`/`dVdbSample`, `DMedium`
   gains a `tempGrid` + emission params, `DScene` gains a `DEmissiveVolume[]` (+ per-volume Planck-λ CDF)
   and `totalEmissionPower`, and `genPhoton` has the same power-split volume-birth branch +
   `connectEmissionVolume`/`camSplatEmissionAll` device splat (validated GPU-vs-CPU on `scraps/vdb_fire.ftsl`).
-  Only these forward modes (A/B/C) render it. Every other mode -- the composites V/P too, whose
-  forward layer is calibrated against a fire-blind mode-R film -- **refuses** a scene with an
-  emissive medium through the `-on-unsupported` policy (`main.cpp`: `modeRendersVolumeEmission`,
-  read by `modeFeatureUnsupported`): `error` aborts naming the modes that would render it,
-  `fallback` picks mode B (`fallbackModeFor`), `strip` resets the `temperature` grids and rebuilds
-  `emissiveVolumes`. The backward reference (modes R/W/V) samples the media themselves correctly
-  (since 0.254.0, superposing the whole vector with each region's `bounds` and `density` field,
-  exactly as the GPU backward megakernel does) but not the emission grid.
+  **Mode R (CPU, 0.376.0)** reaches it as it reaches an area light (`backward.h`, the
+  VOLUMETRIC EMISSION block). Light sampling: every NEE function (`neeLight`, `neeLightHero`,
+  `neeLightHeroHair`, `neeVolume`, `neeVolumeHero`) also calls `fireNee`, which picks one fire by
+  power and a direction, and integrates the emission along it to the first opaque surface,
+  through see-through fibers by their transmittance -- the domain a shadow ray to a light has.
+  The direction comes from a defensive mixture: three quarters of the draws aim at a point drawn
+  in proportion to the emission (`firePoint`, from a coarse per-fire grid of cell powers built at
+  load, `Scene::buildFireCells`), a quarter are uniform in the cone the emitting box's bounding
+  sphere subtends (over all directions from inside it). The point only sets the direction; its
+  density is the line integral of the piecewise-constant point density times t^2 along it,
+  computed exactly through the grid (`firePointPdf`), and the cone share keeps the estimate
+  bounded for a vertex inside the fire. Visible blackbody output collapses with temperature, so
+  a fire's light comes from a core much smaller than its grid: the cone alone hit it on about one
+  draw in thirty on the check scene.
+  The response along that direction is `dirResponse`, the shading half of `envGeom`, which takes
+  the continuation's cosine density from the bare cosine (it once took it from a cosine already
+  multiplied by the shadow transmittance, over-weighting sky seen through see-through fur;
+  `FTRACE_ENV_NEE=0` turns the sky's light sampling off for the A/B in
+  `tools/check_env_nee.py`). Segments:
+  every segment either loop traces collects the emission along it to the surface it reached
+  (`fireSegment`), weighted as an emitter hit there would be (`fireSegmentWeight`): 1 on a camera
+  or specular arrival, 0 after a vertex whose light sampling took it, the balance heuristic after
+  a glossy-NEE vertex (`gmis`). Both integrals take jittered stratified points over the overlap
+  with the box the fire emits in (`Scene::vdbPositiveBox`: the positive voxels grown by one), about
+  one per voxel (4 to 32), with transmittance as a product of independent ratio-tracking
+  estimates over the sub-segments (unbiased; the dielectric's Beer-Lambert and the aggregate coat
+  included).
+  Point sampling alone, a point drawn as the forward tracer births photons and weighted by its
+  area-measure density, was rejected: its 1/r^2 diverges for a vertex inside the fire. The
+  mixture's direction density and cone share are what make the point draws safe. The camera's wavelengths come from `Scene::camSampler`, the
+  emitters' g(lambda) plus the fires' power on their Planck shapes (`finalizeCameraSpectrum`), so
+  a fire is reached at every wavelength it emits even where no emitter does.
+  `FTRACE_FIRE_NEE=0` turns the light sampling off (segments take full weight) for A/B checks
+  (`tools/check_fire_r.py`). The device walk does not see a fire yet, so a GPU mode-R render of
+  one falls back to the CPU (`cudaBackwardSupported`).
+  Every other mode -- the composites V/P too -- **refuses** a scene with an emissive medium
+  through the `-on-unsupported` policy (`main.cpp`: `modeRendersVolumeEmission`, read by
+  `modeFeatureUnsupported`), as does mode R alongside `-dual-scatter` fur (whose fiber response
+  comes bundled with its own visibility) or a GRIN medium (whose march ends at its first medium
+  collision, before the rest of the curve's emission): `error` aborts naming the modes that
+  would render it, `fallback` picks mode R or B (`fallbackModeFor`), `strip` resets the
+  `temperature` grids and rebuilds `emissiveVolumes`.
 - **The `-on-unsupported` policy** (`main.cpp`) reads one set of capability predicates --
   `modeRendersVolumeEmission`, `modeRendersGrin`, `modeFormsLensImage`, and the per-mode scope
   checks in `modeFeatureUnsupported` -- so the refusal, the fallback, the strip and the error's

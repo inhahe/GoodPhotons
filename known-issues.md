@@ -211,7 +211,7 @@ loader refuses the nesting -- so no mix coin needs carrying.) With media in the 
 the free flights of the segment it re-traces -- measured 33 % too dark in a pure-absorber fog before
 `firstSegSampled`. `tools/check_hero_spectral.py`'s coatfog scene covers both.
 
-## OPEN (2026-10-12; the silence fixed in 0.375.1): EMISSIVE-VOLUME-SILENT — most modes rendered a fire-lit scene black without a word
+## OPEN (2026-10-12; the silence fixed in 0.375.1, mode R in 0.376.0): EMISSIVE-VOLUME-SILENT — most modes rendered a fire-lit scene black without a word
 
 Volumetric emission (`temperature` + `emission blackbody`, "fire") is born only by the forward
 tracer (`render.h`'s volume births), so only the forward modes A, B and C render it, CPU and GPU.
@@ -230,10 +230,37 @@ unsupported-feature route (`modeFeatureUnsupported`): an error naming the featur
 it was silently rendered as before. FTSL.md's mode-support note, stale twice over (the GPU fallback
 it described ended in 0.49.0; mode R stopped flattening media in 0.254.0), now says this.
 
-**Still open, the proper fix:** mode R renders it (emission at each medium collision,
-sigma_a/sigma_t * Le, plus NEE of the emissive volume, which `Scene::emissiveVolumes` already
-describes: AABB, power, Planck-λ CDF), and mode D after it (volume-born light subpaths, emission at
-medium vertices inside the MIS).
+**Mode R renders it (CPU, 0.376.0)**, as it renders an area light: light sampling of the fire at
+every vertex (a direction toward a point drawn in proportion to the emission, mixed with the cone
+the emitting box subtends, and the emission integrated along it)
+and the emission each segment collects, weighted as an emitter hit there would be (design.md, the
+fire bullet). It needed the camera's wavelengths drawn from a distribution that includes the
+fires (`Scene::camSampler`): drawn from the emitters' alone, a fire-only scene had no wavelengths
+and rendered black, and a fire beside narrow-band lights would have lost the wavelengths they do
+not emit. Mode R refuses a fire alongside `-dual-scatter` fur or a GRIN medium (fallback B).
+`tools/check_fire_r.py` holds it to mode B and to itself with the light sampling off.
+
+**Still open:** mode D (volume-born light subpaths, emission at medium vertices inside the MIS,
+and the same fire-inclusive wavelength sampling); the GPU twin of mode R's (a GPU mode-R render of
+a fire falls back to the CPU); mode P, refused until its composite -- the forward layer fitted
+against a mode-R film -- is checked with a fire in both. And an efficiency debt: the forward
+tracer births fire photons uniformly over the emitting box with beta proportional to the local
+emission, so most births carry almost nothing (the light comes from a core far smaller than the
+box); drawing them from mode R's per-fire emission grid (EmissiveVolume::cellW) would make beta
+nearly constant.
+
+## DONE (2026-10-12, 0.376.0): ENV-NEE-SEE-THROUGH-WEIGHT — sky seen through see-through fur was over-weighted
+
+Mode R's sky light sampling at a diffuse surface weighs itself against the cosine-hemisphere
+continuation with the balance heuristic. `envGeom` multiplied the cosine by the shadow ray's
+transmittance (partial when it crosses hair below `opacity 1`) and only then took the cosine
+density from it, so the light-sampling weight saw a continuation density too small by the
+transmittance while the escape's own weight used the true one: the two summed above one wherever
+the sky was partly hidden. On a floor under a sparse burst of `opacity 0.6` fur, 1.5 % too bright
+over the frame and 2 % under the fur. The shading half of `envGeom` is now `dirResponse`, which
+computes the density from the bare cosine. `FTRACE_ENV_NEE=0` turns the sky's light sampling off
+(every escape takes its whole radiance), the internal A/B `tools/check_env_nee.py` compares
+against.
 
 ## DONE (2026-10-12, 0.374.5-0.374.7): IMAGE-WRITE-LOCKED — an image write failed when something held the file
 

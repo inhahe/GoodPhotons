@@ -2967,18 +2967,21 @@ medium {
 }
 ```
 
-> **Mode support:** volumetric emission is a **forward** feature: modes **A/B/C**, on the CPU
-> and the GPU. Each emissive medium becomes an isotropic volume emitter: photons are born inside
-> it (position-sampled over the temperature grid's AABB, wavelength-sampled from the grid's
-> blackbody) carrying the local Planck radiance, so the fire both shows directly *and lights the
-> rest of the scene* (soot self-scatter, nearby walls). An emissive volume counts as the scene's
-> light, so a fire needs no separate `light` block. The other modes (R, W, V, P, D, U, J, M, S)
-> do not render volumetric emission and **refuse** a scene with a fire, like any other feature a
-> mode can't render -- P too, because its composite is calibrated against a mode-R film, which
-> does not see the fire. `-on-unsupported fallback` switches such a camera to mode **B**, and
+> **Mode support:** volumetric emission renders in the **forward** modes **A/B/C** (CPU and GPU)
+> and in mode **R** (and **W**, which runs on it) on the CPU. Each emissive medium emits its
+> local Planck radiance, `emission_scale` times blackbody(T), per unit length of a ray and in
+> every direction alike, so the fire both shows directly *and lights the rest of the scene*
+> (soot self-scatter, nearby walls). The forward modes birth photons inside it (position-sampled
+> over the temperature grid's box, wavelength-sampled from its blackbody); mode R samples it as a
+> light from every vertex -- a direction toward the grid's box, and the emission integrated along
+> it -- and collects the emission along every ray it traces, so a fire seen through glass or in a
+> mirror shows too. An emissive volume counts as the scene's light, so a fire needs no separate
+> `light` block. A GPU mode-R render of a fire falls back to the CPU. The other modes (V, P, D, U,
+> J, M, S) do not render volumetric emission and **refuse** a scene with a fire, like any other
+> feature a mode can't render; so does mode R alongside `-dual-scatter` fur or a GRIN medium.
+> `-on-unsupported fallback` switches such a camera to mode **R** (or **B** where R refuses), and
 > `-on-unsupported strip` renders the fire as cold smoke unless another camera of the same run
-> renders it (then that camera falls back instead). A camera with a physical `lens` cannot show
-> a fire at all -- only R, D and J form a lens image -- so it refuses even under `fallback`.
+> renders it (then that camera falls back instead).
 
 ---
 

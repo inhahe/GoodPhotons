@@ -20370,6 +20370,8 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     }
     // A physical lens deeper than the device cap falls back to the CPU tracer.
     if (cam.hasLens() && (int)cam.lens->surf.size() > D_MAXLENS) return false;
+    // A fire: the CPU walk reaches it (backward.h fireNee / fireSegment); the device's does not.
+    for (const Medium& m : scene.media) if (m.emissive()) return false;
     return true;
 }
 

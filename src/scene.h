@@ -680,13 +680,18 @@ struct Medium {
         if (raw <= 0.0) return 0.0;
         return emitKelvin * (raw / (tempPeak > 0.0 ? tempPeak : 1.0));
     }
-    // Volumetric emission SOURCE radiance L_e(x,λ) (>= 0). This is the emitted
-    // radiance BEFORE the σ_a weighting of the RTE emission term; callers that
-    // want the full emission coefficient multiply by the local σ_a(x,λ).
+    // Volumetric emission at a point (>= 0): the radiance a fire adds per unit length of a
+    // ray, in every direction alike -- the RTE's emission coefficient as THIS renderer defines
+    // it, with no sigma_a factor and no density: the forward tracer births fire photons at
+    // exactly this density (render.h), and mode R's fireSegment integrates exactly this, so the
+    // two agree by construction. `emission_scale` sets the brightness.
     double emissionAt(const Vec3& p, double lambda) const {
-        double T = temperatureAt(p);
-        if (T <= 0.0) return 0.0;
-        double Le = emissionScale * blackbodyEmissionRadiance(T, lambda);
+        return emissionAtKelvin(temperatureAt(p), lambda);
+    }
+    // ...from a temperature already looked up, so a bundle reads the grid once per point.
+    double emissionAtKelvin(double kelvin, double lambda) const {
+        if (kelvin <= 0.0) return 0.0;
+        double Le = emissionScale * blackbodyEmissionRadiance(kelvin, lambda);
         return Le > 0.0 ? Le : 0.0;
     }
 
@@ -1513,12 +1518,16 @@ struct Scene {
     // per-lambda weight the backward reference needs (see backward.h).
     EmissionSampler emitSampler;
     double emitG = 0.0;
+    // ...and the same with the fires' emission added (finalizeCameraSpectrum): what a backward
+    // camera path samples its wavelengths from, invPdf = camG / (g(lambda) + fireG(lambda)).
+    EmissionSampler camSampler;
+    double camG = 0.0;
 
     // --- Volumetric blackbody emitters (fire) --------------------------------
     // Any medium carrying a `temperature` grid is ALSO a self-illuminating
     // isotropic volume emitter. Forward tracing treats each as a pseudo-emitter:
     // with probability totalEmissionPower/(totalPower+totalEmissionPower) a photon
-    // is born inside the volume (uniform position in the grid's world AABB, uniform
+    // is born inside the volume (uniform position in the box it emits in, uniform
     // wavelength, isotropic direction) carrying beta = grandTotal·κ_e(x,λ)/meanKe,
     // where κ_e = the medium's emissionAt(). The `power`/`meanKe` are estimated at
     // build() by Monte-Carlo sampling the emission field; `power` only tunes the
@@ -1526,7 +1535,8 @@ struct Scene {
     // brightness is set purely by emissionAt (i.e. by `emission_scale`).
     struct EmissiveVolume {
         int    mediumIndex = -1;
-        Vec3   bmin{0,0,0}, bmax{0,0,0};   // uniform-sampling AABB (temperature grid)
+        Vec3   bmin{0,0,0}, bmax{0,0,0};   // the box it emits in (Scene::vdbPositiveBox)
+        double voxel = 0.0;                // its temperature grid's shortest voxel edge
         double meanKe = 0.0;               // mean emissionAt over bbox×band (β normaliser)
         double power  = 0.0;               // 4π·V·meanKe·Δλ (selection weight)
         // Blackbody wavelength importance sampler (at the medium's peak temperature,
@@ -1534,6 +1544,14 @@ struct Scene {
         // per-photon β nearly constant across λ — collapsing the spectral colour
         // speckle a uniform draw leaves in the hot core (variance-only; unbiased).
         EmissionSampler lamSampler;
+        Spectrum planck;                   // the curve lamSampler tabulates (Scene::fireG)
+        // A coarse grid over [bmin, bmax] of the emitted power per volume, for drawing a point in
+        // proportion to it (mode R's fire light sampling; Scene::buildFireCells). Cells of equal
+        // volume, x fastest; cellCdf is the normalised running sum of cellW. Empty when nothing
+        // in the box emits in the band.
+        int gres[3] = {0, 0, 0};
+        std::vector<double> cellW, cellCdf;
+        double cellSum = 0.0;
     };
     std::vector<EmissiveVolume> emissiveVolumes;
     double totalEmissionPower = 0.0;
@@ -1731,7 +1749,98 @@ struct Scene {
     }
 
     // Estimate each emissive medium's mean emission and selection power. Called by
-    // build() after finalizeEmitters(). Cheap Monte-Carlo over the grid AABB × band.
+    // The world box outside which VdbGrid::sample of `g` is exactly 0 -- the positive voxels'
+    // lattice box grown by one voxel, since the field is trilinear -- and the shortest world edge
+    // of a voxel. False when no voxel is positive.
+    static bool vdbPositiveBox(const VdbGrid& g, Vec3& lo, Vec3& hi, double& voxelMin) {
+        int i0 = g.nx, j0 = g.ny, k0 = g.nz, i1 = -1, j1 = -1, k1 = -1;
+        for (int k = 0; k < g.nz; ++k)
+            for (int j = 0; j < g.ny; ++j)
+                for (int i = 0; i < g.nx; ++i) {
+                    if (!(halfBitsToFloat(g.data[(size_t(k) * g.ny + j) * g.nx + i]) > 0.0f)) continue;
+                    i0 = std::min(i0, i); i1 = std::max(i1, i);
+                    j0 = std::min(j0, j); j1 = std::max(j1, j);
+                    k0 = std::min(k0, k); k1 = std::max(k1, k);
+                }
+        if (i1 < 0) return false;
+        // The lattice -> world map, the inverse of g.ainv (world = w0 + A (lattice + imin)).
+        const double* m = g.ainv;
+        const double det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) +
+                           m[2] * (m[3] * m[7] - m[4] * m[6]);
+        if (!(std::fabs(det) > 0.0)) return false;
+        const double A[9] = {(m[4] * m[8] - m[5] * m[7]) / det, (m[2] * m[7] - m[1] * m[8]) / det,
+                             (m[1] * m[5] - m[2] * m[4]) / det, (m[5] * m[6] - m[3] * m[8]) / det,
+                             (m[0] * m[8] - m[2] * m[6]) / det, (m[2] * m[3] - m[0] * m[5]) / det,
+                             (m[3] * m[7] - m[4] * m[6]) / det, (m[1] * m[6] - m[0] * m[7]) / det,
+                             (m[0] * m[4] - m[1] * m[3]) / det};
+        const double a[3] = {std::max(i0 - 1.0, -0.5), std::max(j0 - 1.0, -0.5), std::max(k0 - 1.0, -0.5)};
+        const double b[3] = {std::min(i1 + 1.0, g.nx - 0.5), std::min(j1 + 1.0, g.ny - 0.5),
+                             std::min(k1 + 1.0, g.nz - 0.5)};
+        lo = Vec3(1e300, 1e300, 1e300); hi = Vec3(-1e300, -1e300, -1e300);
+        for (int c = 0; c < 8; ++c) {
+            const double l[3] = {((c & 1) ? b[0] : a[0]) + g.imin.x, ((c & 2) ? b[1] : a[1]) + g.imin.y,
+                                 ((c & 4) ? b[2] : a[2]) + g.imin.z};
+            const Vec3 w(g.w0.x + A[0] * l[0] + A[1] * l[1] + A[2] * l[2],
+                         g.w0.y + A[3] * l[0] + A[4] * l[1] + A[5] * l[2],
+                         g.w0.z + A[6] * l[0] + A[7] * l[1] + A[8] * l[2]);
+            lo = Vec3(std::min(lo.x, w.x), std::min(lo.y, w.y), std::min(lo.z, w.z));
+            hi = Vec3(std::max(hi.x, w.x), std::max(hi.y, w.y), std::max(hi.z, w.z));
+        }
+        voxelMin = 1e300;
+        for (int col = 0; col < 3; ++col)
+            voxelMin = std::min(voxelMin, std::sqrt(A[col] * A[col] + A[3 + col] * A[3 + col] +
+                                                    A[6 + col] * A[6 + col]));
+        return true;
+    }
+
+    // The coarse emission grid of a fire (EmissiveVolume::cellW): cells about two voxels wide (at
+    // most 16 a side), each weighted by the mean, over a 3x3x3 lattice of points in it, of the
+    // emission integrated over the band -- a function of temperature alone, tabulated once.
+    static void buildFireCells(const Medium& m, EmissiveVolume& ev) {
+        constexpr int NT = 128;
+        double powerT[NT + 1];
+        for (int t = 0; t <= NT; ++t) {
+            const double kelvin = m.emitKelvin * t / NT;
+            double s = 0.0;
+            for (double lam = LAMBDA_MIN + 2.5; lam < LAMBDA_MAX; lam += 5.0)
+                s += m.emissionAtKelvin(kelvin, lam) * 5.0;
+            powerT[t] = s;
+        }
+        auto power = [&](double kelvin) {
+            if (!(kelvin > 0.0) || !(m.emitKelvin > 0.0)) return 0.0;
+            const double f = std::min(kelvin / m.emitKelvin, 1.0) * NT;
+            const int t = std::min((int)f, NT - 1);
+            return powerT[t] + (powerT[t + 1] - powerT[t]) * (f - t);
+        };
+        const Vec3 ext = ev.bmax - ev.bmin;
+        const double cellTarget = (ev.voxel > 0.0) ? 2.0 * ev.voxel : 1e300;
+        for (int a = 0; a < 3; ++a)
+            ev.gres[a] = std::clamp((int)std::ceil((&ext.x)[a] / cellTarget), 1, 16);
+        const int n = ev.gres[0] * ev.gres[1] * ev.gres[2];
+        ev.cellW.assign((size_t)n, 0.0);
+        ev.cellCdf.assign((size_t)n, 0.0);
+        double acc = 0.0;
+        for (int k = 0; k < ev.gres[2]; ++k)
+            for (int j = 0; j < ev.gres[1]; ++j)
+                for (int i = 0; i < ev.gres[0]; ++i) {
+                    double w = 0.0;
+                    for (int c = 0; c < 27; ++c) {
+                        const Vec3 p(ev.bmin.x + ext.x * (i + (c % 3 + 0.5) / 3.0) / ev.gres[0],
+                                     ev.bmin.y + ext.y * (j + (c / 3 % 3 + 0.5) / 3.0) / ev.gres[1],
+                                     ev.bmin.z + ext.z * (k + (c / 9 + 0.5) / 3.0) / ev.gres[2]);
+                        w += power(m.temperatureAt(p));
+                    }
+                    const size_t ci = ((size_t)k * ev.gres[1] + j) * ev.gres[0] + i;
+                    ev.cellW[ci] = w / 27.0;
+                    acc += ev.cellW[ci];
+                    ev.cellCdf[ci] = acc;
+                }
+        ev.cellSum = acc;
+        if (acc > 0.0) for (double& c : ev.cellCdf) c /= acc;
+        else { ev.cellW.clear(); ev.cellCdf.clear(); }
+    }
+
+    // build() after finalizeEmitters(). Cheap Monte-Carlo over the emitting box × band.
     void finalizeEmissiveVolumes() {
         emissiveVolumes.clear();
         totalEmissionPower = 0.0;
@@ -1740,7 +1849,12 @@ struct Scene {
             const Medium& m = media[mi];
             if (!m.emissive() || !m.temperature) continue;
             const VdbGrid& g = *m.temperature;
-            Vec3 lo = g.wmin, hi = g.wmax;
+            // The box the fire can emit in: outside it the temperature, and so the emission, is
+            // exactly 0. Births, the mean below, and mode R's light sampling all use it, so none
+            // spends its samples on the grid's cold margins.
+            Vec3 lo, hi;
+            double voxel = 0.0;
+            if (!vdbPositiveBox(g, lo, hi, voxel)) continue;   // nothing above 0: no emission
             double V = (hi.x-lo.x) * (hi.y-lo.y) * (hi.z-lo.z);
             if (V <= 0.0) continue;
             // Stratified-ish MC of emissionAt over the AABB × spectral band.
@@ -1759,15 +1873,19 @@ struct Scene {
             EmissiveVolume ev;
             ev.mediumIndex = (int)mi;
             ev.bmin = lo; ev.bmax = hi;
+            ev.voxel = voxel;
             ev.meanKe = meanKe;
             ev.power = 4.0 * PI * V * meanKe * dLam;
             // Build the λ importance sampler from a representative blackbody at the
             // medium's peak temperature. Sampling λ ~ Planck(emitKelvin) makes the
             // per-photon β nearly constant across the band (collapses colour speckle).
-            ev.lamSampler.build(blackbody(m.emitKelvin), 1.0);
+            ev.planck = blackbody(m.emitKelvin);
+            ev.lamSampler.build(ev.planck, 1.0);
+            buildFireCells(m, ev);
             totalEmissionPower += ev.power;
             emissiveVolumes.push_back(ev);
         }
+        finalizeCameraSpectrum();
     }
 
     // Environment lighting. envIndex is the index into `emitters` of the single Env
@@ -2144,11 +2262,35 @@ struct Scene {
         };
         emitSampler.build(g, stepNm);
         emitG = emitSampler.integral;
-        // Per-material excitation samplers: absorb(lambda) * g(lambda). Built here
-        // rather than at parse time because it needs the finished illuminant, and
-        // rebuilt on every finalizeEmitters() so -ignoreenv (which drops an emitter
-        // and re-finalizes) keeps host and sampler consistent. See
-        // Material::fluoInSampler for why the product and not g alone.
+        finalizeCameraSpectrum();
+        // Emitter powers are now final, so the light BVH can be built off them. Last,
+        // and inside finalizeEmitters, so every path that rebuilds the emitter list
+        // (-ignoreenv, applyIgnoreFlags, the built-in scenes) gets a matching tree
+        // rather than a stale one pointing at emitters that no longer exist.
+        buildLightTree();
+    }
+
+    // The wavelength distribution a BACKWARD camera path draws from (backward.h renderRows), and
+    // the fluorescent dyes' excitation samplers: the emitters' g(lambda) = sum geomWeight * SPD,
+    // plus each fire's power spread over its Planck spectrum (fireG) -- so a fire is reached at
+    // every wavelength it emits, even where no emitter emits, and a scene lit by a fire alone has
+    // wavelengths at all. Without a fire, camSampler IS emitSampler. Run at the end of both
+    // finalizeEmitters and finalizeEmissiveVolumes, so it follows whichever changed last.
+    //
+    // The excitation samplers: absorb(lambda) * g(lambda), built here rather than at parse time
+    // because they need the finished illuminant, and rebuilt with it so -ignoreenv (which drops an
+    // emitter and re-finalizes) keeps host and sampler consistent. See Material::fluoInSampler for
+    // why the product and not g alone.
+    void finalizeCameraSpectrum() {
+        std::vector<std::pair<double, Spectrum>> parts;
+        for (const auto& e : emitters) parts.push_back({e.geomWeight(), e.spdFn});
+        const bool fire = !emissiveVolumes.empty();
+        Spectrum g = [this, parts, fire](double w) {
+            double s = 0.0; for (const auto& p : parts) s += p.first * p.second(w);
+            return fire ? s + fireG(w) : s;
+        };
+        if (fire) { camSampler.build(g, emitSampler.step); camG = camSampler.integral; }
+        else      { camSampler = emitSampler; camG = emitG; }
         for (auto& mm : mats) {
             if (mm.type != MatType::Fluorescent) continue;
             Spectrum prod = [&mm, g](double w) {
@@ -2156,13 +2298,17 @@ struct Scene {
                 e = (e < 0.0) ? 0.0 : (e > 1.0 ? 1.0 : e);
                 return e * g(w);
             };
-            mm.fluoInSampler.build(prod, stepNm);
+            mm.fluoInSampler.build(prod, emitSampler.step);
         }
-        // Emitter powers are now final, so the light BVH can be built off them. Last,
-        // and inside finalizeEmitters, so every path that rebuilds the emitter list
-        // (-ignoreenv, applyIgnoreFlags, the built-in scenes) gets a matching tree
-        // rather than a stale one pointing at emitters that no longer exist.
-        buildLightTree();
+    }
+
+    // The fires' emitted power per nm at `lambda`: each fire's power over its Planck shape
+    // (the forward tracer's own wavelength sampler for its photons), in g(lambda)'s units.
+    double fireG(double lambda) const {
+        double s = 0.0;
+        for (const auto& v : emissiveVolumes)
+            if (v.lamSampler.integral > 0.0) s += v.power * v.planck(lambda) / v.lamSampler.integral;
+        return s;
     }
 
     // ---- shared-SPD factorisation -------------------------------------------

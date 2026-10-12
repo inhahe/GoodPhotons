@@ -15622,17 +15622,18 @@ static OnUnsupported g_onUnsupported = OnUnsupported::Error;
 // WHAT EACH MODE RENDERS, for the features not every mode does. The refusal, the fallback, the
 // strip and the error message all read these, so they cannot disagree about it.
 //
-// VOLUMETRIC EMISSION ("fire": a medium with a `temperature` field) is born only by the forward
-// tracer (render.h's volume births), so only the forward modes see it; any other estimator would
-// render the fire as cold smoke (known-issues EMISSIVE-VOLUME-SILENT). Mode P is not one of them:
-// its composite fits the forward layer's scale against a mode-R film and fills the specular-first
-// pixels from R, which does not see the fire.
+// VOLUMETRIC EMISSION ("fire": a medium with a `temperature` field) is born by the forward tracer
+// (render.h's volume births) and reached by mode R's light sampling and segment integrals
+// (backward.h fireNee / fireSegment; mode W runs on mode R). Every other estimator would render
+// the fire as cold smoke (known-issues EMISSIVE-VOLUME-SILENT), so it refuses. Mode P stays
+// refused until its composite -- the forward layer fitted against a mode-R film -- is checked
+// with a fire in both.
 static bool sceneHasEmissiveMedium(const Scene& scene) {
     for (const Medium& m : scene.media) if (m.emissive()) return true;
     return false;
 }
 static bool modeRendersVolumeEmission(char mode) {
-    return mode == 'A' || mode == 'B' || mode == 'C';
+    return mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R';
 }
 // GRIN media: BDPT and the modes built on its transport (D, J, U) refuse them.
 static bool modeRendersGrin(char mode) { return mode != 'D' && mode != 'J' && mode != 'U'; }
@@ -15643,12 +15644,23 @@ static bool modeFormsLensImage(char mode) { return mode == 'R' || mode == 'D' ||
 
 // Core capability check: return a reason string if `mode` cannot render `scene` with a
 // camera of the given `projection`, else nullptr. Volumetric emission restricts every mode
-// but the forward ones; otherwise only the modes with real restrictions (D BDPT, J UPBP,
-// U VCM) gate anything, and the general modes (A/B/C/R/M/S/P) render everything.
+// but A/B/C/R (modeRendersVolumeEmission); otherwise only the modes with real restrictions (D
+// BDPT, J UPBP, U VCM) gate anything, and the general modes (A/B/C/R/M/S/P) render everything.
 static const char* modeFeatureUnsupported(const Scene& scene, char mode, int projection) {
-    if (!modeRendersVolumeEmission(mode) && sceneHasEmissiveMedium(scene))
-        return "volumetric emission (a medium with a `temperature` field, which only the "
-               "forward modes A/B/C render)";
+    if (sceneHasEmissiveMedium(scene)) {
+        if (!modeRendersVolumeEmission(mode))
+            return "volumetric emission (a medium with a `temperature` field)";
+        // Mode R's fire sampling takes a fiber's single-scattering response along a sampled
+        // direction; dual scattering's comes bundled with its own visibility, so the two do
+        // not compose. And a GRIN march ends at its first medium collision, before the curve's
+        // emission past it.
+        if (mode == 'R' && g_dualScatter)
+            for (const Material& m : scene.mats)
+                if (m.type == MatType::Hair)
+                    return "volumetric emission with -dual-scatter fur in mode R";
+        if (mode == 'R' && grin::sceneHasGrin(scene))
+            return "volumetric emission with gradient-index (GRIN) media in mode R";
+    }
     // Mode J (UPBP) is mode D's transport plus beam merging, so it inherits D's scope
     // EXACTLY — same connections, same MIS densities, same refusals. The beam half adds
     // no capability of its own: a beam map is built by the same forward photon pass mode M
@@ -16511,7 +16523,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                       "backward-GPU-unsupported feature)"
                     : "scene has a backward-GPU-unsupported feature "
                       "(collimated light, an `emit pattern:` emission "
-                      "profile, or a lens deeper than the device cap)";
+                      "profile, a fire, or a lens deeper than the device cap)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
