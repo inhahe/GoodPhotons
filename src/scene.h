@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <memory>
 #include <climits>
+#include <cstdlib>
 #include <atomic>
 #include <unordered_map>
 #include "geometry.h"
@@ -1522,6 +1523,23 @@ struct Scene {
     // camera path samples its wavelengths from, invPdf = camG / (g(lambda) + fireG(lambda)).
     EmissionSampler camSampler;
     double camG = 0.0;
+    // What a backward camera path actually DRAWS its wavelengths from: camSampler's g(lambda)
+    // times a window over the visible band, so no draw is spent where the eye sees nothing --
+    // for a 1500 K fire most of g lies in the near infrared. The radiance estimate keeps the
+    // per-lambda weight camG / g; the film multiplies a draw by camFilmWeight, the ratio of the
+    // two densities, so every caller below the camera sees the numbers it saw when the draw
+    // came from camSampler (backward.h renderRows).
+    EmissionSampler camVisSampler;   // mode R
+    EmissionSampler camWSampler;     // mode W (`whitted`)
+    const EmissionSampler& camDraw(bool whitted) const { return whitted ? camWSampler : camVisSampler; }
+    // The film's weight for a camera wavelength drawn from camDraw(whitted): the illuminant's
+    // density over the drawn one, both as the samplers' own binned densities on the same bin, so
+    // the estimate's expectation is exactly what a draw from camSampler gave -- and the weight is
+    // exactly 1 wherever the two samplers coincide (FTRACE_CAM_VIS=0).
+    double camFilmWeight(double lambda, bool whitted) const {
+        const double pv = camDraw(whitted).pdfAt(lambda);
+        return (pv > 0.0) ? camSampler.pdfAt(lambda) / pv : 0.0;
+    }
 
     // --- Volumetric blackbody emitters (fire) --------------------------------
     // Any medium carrying a `temperature` grid is ALSO a self-illuminating
@@ -2270,12 +2288,13 @@ struct Scene {
         buildLightTree();
     }
 
-    // The wavelength distribution a BACKWARD camera path draws from (backward.h renderRows), and
-    // the fluorescent dyes' excitation samplers: the emitters' g(lambda) = sum geomWeight * SPD,
-    // plus each fire's power spread over its Planck spectrum (fireG) -- so a fire is reached at
-    // every wavelength it emits, even where no emitter emits, and a scene lit by a fire alone has
-    // wavelengths at all. Without a fire, camSampler IS emitSampler. Run at the end of both
-    // finalizeEmitters and finalizeEmissiveVolumes, so it follows whichever changed last.
+    // The wavelength densities of a BACKWARD camera path (backward.h renderRows) and the
+    // fluorescent dyes' excitation samplers. camSampler: the emitters' g(lambda) = sum
+    // geomWeight * SPD, plus each fire's power spread over its Planck spectrum (fireG) -- so a
+    // fire is reached at every wavelength it emits, even where no emitter emits, and a scene lit
+    // by a fire alone has wavelengths at all; without a fire it IS emitSampler. camVisSampler /
+    // camWSampler: the same times a visible-band window, what modes R / W draw from. Run at the end of
+    // both finalizeEmitters and finalizeEmissiveVolumes, so it follows whichever changed last.
     //
     // The excitation samplers: absorb(lambda) * g(lambda), built here rather than at parse time
     // because they need the finished illuminant, and rebuilt with it so -ignoreenv (which drops an
@@ -2291,6 +2310,29 @@ struct Scene {
         };
         if (fire) { camSampler.build(g, emitSampler.step); camG = camSampler.integral; }
         else      { camSampler = emitSampler; camG = emitG; }
+        // The camera's draws: the illuminant times a window over the visible band (design.md, mode
+        // R's camera wavelengths). Mode R: pbrt-v4's visible-wavelength density
+        // 1/cosh^2(0.0072 (lambda - 538)). Mode W, whose fixed lattice is a colour quadrature: flat
+        // over 400..700 nm with Gaussian shoulders (sigma 25 nm) and a 1 % floor, so inside the
+        // band the illuminant alone spaces the wavelengths. FTRACE_CAM_VIS=0 draws both from the
+        // illuminant alone, the A/B tools/check_cam_vis.py compares against.
+        static const bool camVisOn = [] {
+            const char* e = std::getenv("FTRACE_CAM_VIS");
+            return !(e && e[0] == '0');
+        }();
+        if (!camVisOn) {
+            camVisSampler = camSampler;
+            camWSampler = camSampler;
+        } else {
+            camVisSampler.build([g](double w) {
+                const double c = std::cosh(0.0072 * (w - 538.0));
+                return g(w) / (c * c);
+            }, emitSampler.step);
+            camWSampler.build([g](double w) {
+                const double d = (w < 400.0) ? (400.0 - w) : (w > 700.0 ? w - 700.0 : 0.0);
+                return g(w) * std::max(0.01, std::exp(-0.5 * (d / 25.0) * (d / 25.0)));
+            }, emitSampler.step);
+        }
         for (auto& mm : mats) {
             if (mm.type != MatType::Fluorescent) continue;
             Spectrum prod = [&mm, g](double w) {

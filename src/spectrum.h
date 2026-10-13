@@ -281,4 +281,15 @@ struct EmissionSampler {
     double sample(Pcg32& rng, double& pdf) const {
         return sampleAt(rng.uniform(), pdf);
     }
+
+    // The density (per nm) sample() draws `lambda` with: its bin's probability mass over the
+    // bin width. 0 outside the range.
+    double pdfAt(double lambda) const {
+        const int n = static_cast<int>(cdf.size()) - 1;
+        if (n <= 0) return 0.0;
+        const double t = (lambda - LAMBDA_MIN) / step;
+        if (!(t >= 0.0)) return 0.0;
+        const int b = (t < (double)n) ? static_cast<int>(t) : n - 1;
+        return (cdf[b + 1] - cdf[b]) / step;
+    }
 };

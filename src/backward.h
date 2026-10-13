@@ -424,7 +424,8 @@ struct BackwardRenderer {
 
     // Next-event estimation: connect a surface vertex to each area emitter (the
     // integral splits by light, summed unbiasedly). `invPdfLambda` = camG/g(lambda)
-    // is the reciprocal of the sampled-wavelength pdf (Scene::camSampler); multiplied by an emitter's
+    // is the reciprocal of the illuminant's wavelength density (Scene::camSampler; the film
+    // corrects for the camera drawing from Scene::camDraw instead); multiplied by an emitter's
     // SPD(lambda) it yields that emitter's Le/pdf weight (= its SPD integral for a
     // single light, matching the forward tracer's photon-weight convention).
     //
@@ -2750,8 +2751,8 @@ struct BackwardRenderer {
     }
 
     // Estimate spectral-weighted radiance for a single wavelength along `ray`.
-    // `invPdfLambda` = camG/g(lambda), the reciprocal of the sampled-wavelength
-    // pdf (Scene::camSampler); an emitter's Le/pdf weight is its SPD(lambda) * invPdfLambda.
+    // `invPdfLambda` = camG/g(lambda), the reciprocal of the illuminant's wavelength
+    // density (Scene::camSampler); an emitter's Le/pdf weight is its SPD(lambda) * invPdfLambda.
     double radiance(const Scene& scene, Ray ray, double lambda, double invPdfLambda,
                     Pcg32& rng, const SpdCache* spdCache = nullptr,
                     GiCtx gi = GiCtx{}) const {
@@ -4114,8 +4115,8 @@ struct BackwardRenderer {
         // BASES instead of emitters, which is what removes the last O(N_lights) term
         // from the backward CPU sample loop.
         const double* baseGeom = haveBases ? scene.spdBaseGeom.data() : fbGeom.data();
-        // A fire is part of what the camera's wavelengths are drawn from (Scene::camSampler):
-        // its emitted power per nm joins g, the emitters' (finalizeCameraSpectrum).
+        // A fire is part of the illuminant's wavelength density (Scene::camSampler): its
+        // emitted power per nm joins g, the emitters' (finalizeCameraSpectrum).
         const bool fire = !scene.emissiveVolumes.empty();
         std::vector<double> baseBuf((size_t)nBase * (size_t)(useHero ? C : 1));
         for (int py = y0; py < y1; ++py) {
@@ -4127,18 +4128,21 @@ struct BackwardRenderer {
                     seedUnit(rng, sIdx * nPix + pixIdx, 0xD1B54A32D192ED03ULL);
                     if (useHero) {
                         // One stratified base draw → hero + C-1 secondary wavelengths,
-                        // all from the emission CDF (hero.h policy 1). The hero (index 0)
-                        // must have a valid pdf; dead secondaries (pdf 0) carry invPdf 0
-                        // and splat 0.
+                        // all from one CDF (hero.h policy 1): Scene::camDraw's, the
+                        // illuminant times a visible-band window. The hero (index 0) must have
+                        // a valid pdf; dead secondaries (pdf 0) carry invPdf 0 and splat 0.
+                        // The path weighs wavelength i by the illuminant's density alone
+                        // (invA = camG / g) and the film by filmA = Scene::camFilmWeight, the
+                        // ratio of the illuminant's density to the one drawn from.
                         double lamA[hero::kHeroMax], invA[hero::kHeroMax];
-                        double pdfA[hero::kHeroMax];
+                        double pdfA[hero::kHeroMax], filmA[hero::kHeroMax];
                         // Whitted: the bundle's base coordinate comes off the progressive
                         // deterministic sequence instead of the rng, so the C wavelengths
                         // land on a FIXED lattice of the emission CDF. Without this the
                         // mode would still be noise-free in geometry and shading and yet
                         // visibly speckled in COLOUR, because λ was the last random draw.
                         double uLam = whitted ? whittedLambdaU(sIdx) : rng.uniform();
-                        if (!hero::sampleBundle(scene.camSampler, uLam, C,
+                        if (!hero::sampleBundle(scene.camDraw(whitted), uLam, C,
                                                 lamA, pdfA)) continue;
                         // Fill the per-sample SPD table (one evaluation per DISTINCT
                         // curve), then derive invA from it — Scene::invPdfLambda
@@ -4152,11 +4156,12 @@ struct BackwardRenderer {
                         }
                         SpdCache spdCache{lamA, baseBuf.data(), baseIdx, baseScl, C, 0};
                         for (int i = 0; i < C; ++i) {
-                            if (i > 0 && pdfA[i] <= 0.0) { invA[i] = 0.0; continue; }
+                            if (i > 0 && pdfA[i] <= 0.0) { invA[i] = 0.0; filmA[i] = 0.0; continue; }
                             double g = fire ? scene.fireG(lamA[i]) : 0.0;
                             for (int b = 0; b < nBase; ++b)
                                 g += baseGeom[(size_t)b] * baseBuf[(size_t)b * C + i];
                             invA[i] = (g > 0.0) ? scene.camG / g : 0.0;
+                            filmA[i] = scene.camFilmWeight(lamA[i], whitted);
                         }
                         double jx, jy;
                         if (whitted) whittedSample(sIdx, jx, jy);
@@ -4171,18 +4176,19 @@ struct BackwardRenderer {
                                      GiCtx{0, sIdx});
                         for (int i = 0; i < C; ++i)
                             film.add(px, py, Vec3(cieX(lamA[i]), cieY(lamA[i]), cieZ(lamA[i]))
-                                             * (Lh[i] / C));
+                                             * (Lh[i] * filmA[i] / C));
                         continue;
                     }
-                    // Sample lambda from the combined emission distribution g(lambda).
+                    // Sample lambda from the illuminant times a visible-band window, as the
+                    // bundle above does.
                     double pdf = 0.0;
                     // Whitted: stratified λ, as in the hero path above. Note this scalar
                     // path carries ONE wavelength per sample, so a deterministic spectral
                     // preview here needs spp raised to cover the spectrum (the hero path,
                     // which is the usual one, gets C=heroC of them per sample for free).
                     double lambda = whitted
-                        ? scene.camSampler.sampleAt(whittedLambdaU(sIdx), pdf)
-                        : scene.camSampler.sample(rng, pdf);
+                        ? scene.camDraw(whitted).sampleAt(whittedLambdaU(sIdx), pdf)
+                        : scene.camDraw(whitted).sample(rng, pdf);
                     if (pdf <= 0) continue;
                     // Fill the per-sample SPD table (C=1) and derive invPdfLambda from
                     // it — Scene::invPdfLambda regrouped over bases, same zero guard,
@@ -4195,6 +4201,7 @@ struct BackwardRenderer {
                     for (int b = 0; b < nBase; ++b)
                         gSum += baseGeom[(size_t)b] * baseBuf[(size_t)b];
                     double invPdfLambda = (gSum > 0.0) ? scene.camG / gSum : 0.0;
+                    const double filmW = scene.camFilmWeight(lambda, whitted);
                     if (cam.hasLens()) {
                         // Physical multi-element lens: trace the camera ray from the
                         // film out through the real glass interfaces at this wavelength
@@ -4207,7 +4214,7 @@ struct BackwardRenderer {
                             continue;                       // clipped by an element / the stop
                         double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache,
                                             GiCtx{0, sIdx});
-                        film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens));
+                        film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens * filmW));
                         continue;
                     }
                     double sjx, sjy;
@@ -4216,7 +4223,7 @@ struct BackwardRenderer {
                     Ray ray = cam.genRay(px, py, sjx, sjy);
                     double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache,
                                         GiCtx{0, sIdx});
-                    film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * L);
+                    film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * filmW));
                 }
             }
         }

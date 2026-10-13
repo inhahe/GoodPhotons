@@ -52,6 +52,23 @@ SCENE = [
 ]
 
 
+def write_fire(d):
+    """Write the check's fire (fire.vdb) and its two scenes into directory `d`: fire.ftsl, with
+    the glossy sphere, and fire_diffuse.ftsl, with it made diffuse."""
+    n = 24
+    g = (np.arange(n) + 0.5) / n * 2.0 - 1.0
+    x, y, z = np.meshgrid(g, g, g, indexing="ij")
+    r = np.sqrt(x * x + y * y + z * z)
+    write_vdb(os.path.join(d, "fire.vdb").replace(chr(92), "/"),
+              [VolumeGrid("density", np.clip(1.0 - r, 0.0, None), (-0.5, 0.0, -0.5, 0.5, 1.0, 0.5)),
+               VolumeGrid("temperature", np.clip(1.0 - 1.6 * r, 0.0, None),
+                          (-0.5, 0.0, -0.5, 0.5, 1.0, 0.5))])
+    with open(os.path.join(d, "fire.ftsl"), "w", encoding="utf-8", newline="") as f:
+        f.write(NL.join(SCENE) + NL)
+    with open(os.path.join(d, "fire_diffuse.ftsl"), "w", encoding="utf-8", newline="") as f:
+        f.write(NL.join(l.replace("material gloss }", "material floor }") for l in SCENE) + NL)
+
+
 def compare(a, b, tol):
     (m1, e1), (m0, e0) = a, b
     z = np.abs(m1 - m0) / np.maximum(np.hypot(e1, e0), 1e-30)
@@ -73,18 +90,7 @@ def main():
     a.exe = os.path.abspath(a.exe)
     d = os.path.abspath(a.out)
     os.makedirs(d, exist_ok=True)
-    n = 24
-    g = (np.arange(n) + 0.5) / n * 2.0 - 1.0
-    x, y, z = np.meshgrid(g, g, g, indexing="ij")
-    r = np.sqrt(x * x + y * y + z * z)
-    write_vdb(os.path.join(d, "fire.vdb").replace(chr(92), "/"),
-              [VolumeGrid("density", np.clip(1.0 - r, 0.0, None), (-0.5, 0.0, -0.5, 0.5, 1.0, 0.5)),
-               VolumeGrid("temperature", np.clip(1.0 - 1.6 * r, 0.0, None),
-                          (-0.5, 0.0, -0.5, 0.5, 1.0, 0.5))])
-    with open(os.path.join(d, "fire.ftsl"), "w", encoding="utf-8", newline="") as f:
-        f.write(NL.join(SCENE) + NL)
-    with open(os.path.join(d, "fire_diffuse.ftsl"), "w", encoding="utf-8", newline="") as f:
-        f.write(NL.join(l.replace("material gloss }", "material floor }") for l in SCENE) + NL)
+    write_fire(d)
 
     def render(tag, args, env=None, scene="fire.ftsl"):
         imgs = []

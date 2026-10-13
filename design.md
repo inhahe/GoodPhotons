@@ -3701,6 +3701,32 @@ as the one at fault.
   `keepBundle` do **not** de-hero (their outgoing direction ignores λ). At
   `nUp == 1` every one of these is the scalar code verbatim.
 
+  **Camera wavelengths (0.377.0, CPU `renderRows` and GPU `kBackward`, so modes R and W).** The
+  draw density is `Scene::camDraw(whitted)`, the illuminant's g(λ) times a window over the
+  visible band; the path keeps the illuminant's weight `camG / g(λ)` (`invPdfLambda`) and the
+  film multiplies each wavelength by `Scene::camFilmWeight`, the illuminant sampler's binned
+  density over the drawn sampler's on the same bin (the device reads both CDFs at the bin it
+  drew). Everything below the camera -- emitter weights, the Whitted ambient and `-gi-clamp` in
+  "one light's worth" units, the radiance cache (which stores physical radiance and is fed its
+  own stratified wavelengths), the hero bundle's spectral MIS (symmetric in the bundle's
+  wavelengths) and de-hero's ×C -- therefore sees the numbers it saw when the draw followed g,
+  the expectation is exactly the old draw's, and the weight is exactly 1 where the samplers
+  coincide.
+  The windows were chosen by measurement (seed-pair luminance and chroma variance in mode R,
+  1-spp chromaticity error against 256 spp in mode W, on a Cornell SF10 box under 6500 K, the
+  same box under a triphosphor lamp and a narrow blue band, and the fire of
+  `tools/check_fire_r.py`). Mode R (`camVisSampler`): pbrt-v4's 1/cosh²(0.0072 (λ − 538)), at
+  `-heroc 4` 0.61× / 0.73× the old luminance / chroma variance on the SF10 box, 0.89× / 1.09×
+  under the triphosphor lamp, 0.07× / 0.11× on the fire. Mode W (`camWSampler`): flat over
+  400–700 nm with Gaussian shoulders (σ 25 nm) and a 1 % floor, because its 8 wavelengths on a
+  fixed lattice are a colour quadrature, and spacing them by the light (as the old draw did) is
+  what makes that quadrature good: 1-spp error 0.042 against the old 0.041, while x̄ + ȳ + z̄,
+  which gives every wavelength a fully saturated spectral colour of equal weight, measured 0.20.
+  x̄ + ȳ + z̄ was also the best mode-R window on the fire (0.06×) but 1.21× the chroma variance
+  under the triphosphor lamp. `FTRACE_CAM_VIS=0` makes both camera samplers copies of
+  `camSampler` (`tools/check_cam_vis.py`). The other spectral modes (D, J, M, S) still draw by
+  `emitSampler` alone; the same film-side reweighting would serve them.
+
   **Spectral MIS and media (0.375.0, known-issues SPECTRAL-BUNDLE).** Two vertices sample a
   direction whose density depends on λ but smoothly -- a `Hair` fiber and a `phase rainbow`
   scatter -- and keep the bundle instead of de-heroing: the hero samples, every live λ carries its
@@ -7684,9 +7710,11 @@ as the one at fault.
   included).
   Point sampling alone, a point drawn as the forward tracer births photons and weighted by its
   area-measure density, was rejected: its 1/r^2 diverges for a vertex inside the fire. The
-  mixture's direction density and cone share are what make the point draws safe. The camera's wavelengths come from `Scene::camSampler`, the
-  emitters' g(lambda) plus the fires' power on their Planck shapes (`finalizeCameraSpectrum`), so
-  a fire is reached at every wavelength it emits even where no emitter does.
+  mixture's direction density and cone share are what make the point draws safe. The
+  illuminant's wavelength density is `Scene::camSampler`, the emitters' g(lambda) plus the
+  fires' power on their Planck shapes (`finalizeCameraSpectrum`), so a fire is reached at every
+  wavelength it emits even where no emitter does; the camera draws from it times a window over
+  the visible band (`Scene::camDraw`, the `backward.h` bullet on camera wavelengths).
   `FTRACE_FIRE_NEE=0` turns the light sampling off (segments take full weight) for A/B checks
   (`tools/check_fire_r.py`). The device walk does not see a fire yet, so a GPU mode-R render of
   one falls back to the CPU (`cudaBackwardSupported`).

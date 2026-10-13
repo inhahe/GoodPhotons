@@ -1297,6 +1297,10 @@ struct DScene {
     // BDPT samples one shared lambda per sample from this and sets invPdfLambda=1/pdf.
     const double*    emitSamplerCdf; int emitSamplerN; double emitSamplerStep;
     double           emitG;
+    // The camera's draws (mirror Scene::camDraw): the same g(lambda) times a visible-band window,
+    // camVisCdf for mode R and camWCdf for mode W, on emitSampler's bins (emitSamplerN + 1
+    // entries each). A device mode-R scene has no fire, so its g is emitSampler's.
+    const double*    camVisCdf; const double* camWCdf;
     const DMedium*   media;    // participating media array (superposed); null if none
     DBowTab bow;   // gather-time spectral fold tables (FOLD-GPU (2)); bow.tab null = none
     int              mediaN;   // number of media (0 => vacuum)
@@ -10428,14 +10432,31 @@ __device__ static int dEmitterForMat(const DScene& sc, int matId) {
 // Inverse-CDF core, split out so the hero-wavelength bundle can push its own stratified
 // u values (base draw + C-1 wrapped strata) through the same sampler the scalar path
 // uses — the device twin of EmissionSampler::sampleAt.
-__device__ static Real dSampleSceneLambdaU(const DScene& sc, double u, double& pdf) {
-    const double* cdf = sc.emitSamplerCdf;
-    int lo = 0, hi = sc.emitSamplerN;
+__device__ static Real dSampleCdfLambdaU(const double* cdf, int n, double step, double u,
+                                         double& pdf, int& bin) {
+    int lo = 0, hi = n;
     while (lo + 1 < hi) { int m = (lo + hi) / 2; if (cdf[m] <= u) lo = m; else hi = m; }
     double c0 = cdf[lo], c1 = cdf[lo + 1];
     double frac = (c1 > c0) ? (u - c0) / (c1 - c0) : 0.5;
-    pdf = (c1 - c0) / sc.emitSamplerStep;
-    return (Real)(DLMIN + (lo + frac) * sc.emitSamplerStep);
+    pdf = (c1 - c0) / step;
+    bin = lo;
+    return (Real)(DLMIN + (lo + frac) * step);
+}
+__device__ static Real dSampleSceneLambdaU(const DScene& sc, double u, double& pdf) {
+    int bin;
+    return dSampleCdfLambdaU(sc.emitSamplerCdf, sc.emitSamplerN, sc.emitSamplerStep, u, pdf, bin);
+}
+// The camera's draw (Scene::camDraw: camVisCdf for mode R, camWCdf for mode W). `filmW` is the
+// film's weight for it (Scene::camFilmWeight): the illuminant's binned density over the drawn
+// one, on the bin the draw landed in -- the CDFs share a step and range -- so the expectation is
+// exactly a draw from the illuminant's, and the weight exactly 1 where the two coincide.
+__device__ static Real dSampleCamLambdaU(const DScene& sc, double u, double& pdf, double& filmW) {
+    int b;
+    const double* cdf = sc.bkWhitted ? sc.camWCdf : sc.camVisCdf;
+    const Real lam = dSampleCdfLambdaU(cdf, sc.emitSamplerN, sc.emitSamplerStep, u, pdf, b);
+    const double mv = cdf[b + 1] - cdf[b];
+    filmW = (mv > 0.0) ? (sc.emitSamplerCdf[b + 1] - sc.emitSamplerCdf[b]) / mv : 0.0;
+    return lam;
 }
 __device__ static Real dSampleSceneLambda(const DScene& sc, DRng& rng, double& pdf) {
     return dSampleSceneLambdaU(sc, (double)rng.uniform(), pdf);
@@ -12585,25 +12606,26 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
 
         if (heroC > 1) {
             // One stratified base draw -> hero + C-1 secondary wavelengths, all from the
-            // scene emission CDF (device twin of BackwardRenderer::renderRows). The hero
-            // (index 0) must have a valid pdf; a dead secondary carries invPdf 0 and
-            // splats nothing. Hero is gated off for a physical lens, so no lens weight.
+            // camera's CDF, illuminant times a visible-band window (device twin of
+            // BackwardRenderer::renderRows). The hero (index 0) must have a valid pdf; a dead
+            // secondary carries invPdf 0 and splats nothing. Hero is gated off for a physical
+            // lens, so no lens weight.
             Real   lam[hero::kHeroMax];
-            double invPdf[hero::kHeroMax];
+            double invPdf[hero::kHeroMax], filmW[hero::kHeroMax];
             // Mode W: the bundle's base coordinate comes off the progressive deterministic
             // sequence instead of the rng, so the C wavelengths land on a FIXED lattice of the
             // emission CDF. Without this the mode would still be noise-free in geometry and
             // shading and yet visibly speckled in COLOUR, because λ was the last random draw.
             double u = whitted ? dWhittedLambdaU(sIdx) : (double)rng.uniform();
             double pdf0 = 0.0;
-            lam[0] = dSampleSceneLambdaU(sc, u, pdf0);
+            lam[0] = dSampleCamLambdaU(sc, u, pdf0, filmW[0]);
             if (pdf0 <= 0.0) continue;
             invPdf[0] = dInvPdfLambda(sc, lam[0]);
             for (int i = 1; i < heroC; ++i) {
                 double uu = u + (double)i / heroC;
                 if (uu >= 1.0) uu -= 1.0;              // wrap into [0,1)
                 double pdfi = 0.0;
-                lam[i] = dSampleSceneLambdaU(sc, uu, pdfi);
+                lam[i] = dSampleCamLambdaU(sc, uu, pdfi, filmW[i]);
                 invPdf[i] = (pdfi > 0.0) ? dInvPdfLambda(sc, lam[i]) : 0.0;
             }
             DVec3 hro, hrd;
@@ -12618,7 +12640,7 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
             bkRadianceHero<0>(sc, diffraction, hro, hrd, lam, invPdf, heroC, Lh, rng,
                               DGiCtx{0, sIdx, 0});
             for (int i = 0; i < heroC; ++i) {
-                double w = Lh[i] / (double)heroC;
+                double w = Lh[i] * filmW[i] / (double)heroC;
                 atomicAdd(&film[o + 0], (double)cieX(lam[i]) * w);
                 atomicAdd(&film[o + 1], (double)cieY(lam[i]) * w);
                 atomicAdd(&film[o + 2], (double)cieZ(lam[i]) * w);
@@ -12631,8 +12653,9 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
         // Mode W: stratified λ, as in the hero path above. Note this scalar path carries ONE
         // wavelength per sample, so a deterministic spectral preview here needs spp raised to
         // cover the spectrum (the hero path, which is the usual one, gets heroC per sample).
-        Real lambda = whitted ? dSampleSceneLambdaU(sc, dWhittedLambdaU(sIdx), pdf)
-                              : dSampleSceneLambda(sc, rng, pdf);
+        double filmWl = 0.0;
+        Real lambda = dSampleCamLambdaU(sc, whitted ? dWhittedLambdaU(sIdx)
+                                                    : (double)rng.uniform(), pdf, filmWl);
         if (pdf <= 0.0) continue;
         double invPdfLambda = dInvPdfLambda(sc, lambda);
 
@@ -12654,7 +12677,7 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
         }
         double Lval = bkRadiance<0>(sc, diffraction, ro, rd, lambda, invPdfLambda, rng,
                                     DGiCtx{0, sIdx, 0});
-        double w = Lval * wLens;
+        double w = Lval * wLens * filmWl;
         atomicAdd(&film[o + 0], (double)cieX(lambda) * w);
         atomicAdd(&film[o + 1], (double)cieY(lambda) * w);
         atomicAdd(&film[o + 2], (double)cieZ(lambda) * w);
@@ -18258,6 +18281,10 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     double*   d_cdfAll  = cdfAll.empty()     ? nullptr : (double*)keep(uploadVec(cdfAll));
     double*   d_emitCdf = emitCdf.empty()    ? nullptr : (double*)keep(uploadVec(emitCdf));
     double*   d_emitSamp = emitSampCdf.empty() ? nullptr : (double*)keep(uploadVec(emitSampCdf));
+    std::vector<double> camVisCdf = scene.camVisSampler.cdf;   // mode R's camera lambda CDF
+    std::vector<double> camWCdf = scene.camWSampler.cdf;       // mode W's
+    double*   d_camVis = camVisCdf.empty() ? nullptr : (double*)keep(uploadVec(camVisCdf));
+    double*   d_camW = camWCdf.empty() ? nullptr : (double*)keep(uploadVec(camWCdf));
 
     // --- image environment tables (lat-long map) ---
     DEnvMap denv;
@@ -18452,6 +18479,21 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.emitSamplerN = (int)(emitSampCdf.empty() ? 0 : emitSampCdf.size() - 1);
     sc.emitSamplerStep = scene.emitSampler.step;
     sc.emitG = scene.emitG;
+    sc.camVisCdf = d_camVis;
+    sc.camWCdf = d_camW;
+    // dSampleCamLambdaU reads a camera CDF and the emission CDF at the one bin it drew: they must
+    // share their bins (finalizeCameraSpectrum builds them so). If one ever does not, say so and
+    // draw from the illuminant itself, whose film weight is then exactly 1.
+    auto sameBins = [&](const EmissionSampler& s) {
+        return s.cdf.size() == emitSampCdf.size() && s.step == scene.emitSampler.step;
+    };
+    if (!sameBins(scene.camVisSampler) || !sameBins(scene.camWSampler)) {
+        std::fprintf(stderr,
+            "[cuda] INTERNAL: a camera wavelength sampler and the emission sampler differ in "
+            "bins; drawing camera wavelengths from the emission sampler\n");
+        sc.camVisCdf = sc.emitSamplerCdf;
+        sc.camWCdf = sc.emitSamplerCdf;
+    }
     // Participating media array (superposed). Each medium's density program is uploaded
     // separately; then the flat DMedium array is uploaded once. Empty => media=null, mediaN=0.
     {

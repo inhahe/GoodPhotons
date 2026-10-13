@@ -86,7 +86,7 @@ paths they can capture at all**.
 | `B` | Pinhole splat *(default)* | Light-tracing splat to a pinhole camera; independent photons | CPU + **GPU** |
 | `C` | Finite-aperture catch | Forward photon catch through a thin lens (real depth of field) | CPU + GPU |
 | `R` | Backward reference | Backward path-traced reference image; drives the physical-lens camera | CPU + **GPU** |
-| `W` | Deterministic preview | Mode `R` with **every estimator replaced by a fixed quadrature** — a POV-Ray-style Whitted render that is noise-free at `-spp 1` and ~2 orders of magnitude faster than converging `R`. Trades multi-bounce GI (see `-ambient` for a flat fill, `-gi` for a real deterministic one-bounce gather) and unbiasedness for speed. **Caveat — media/GRIN need spp.** "Noise-free at 1 spp" holds only while the path stays in the hero *bundle*; participating media, a GRIN volume, or `-heroc 1` drop it onto a scalar path carrying **one wavelength per sample**, and mode `W`'s wavelength lattice depends on the sample index *alone* (shared by every pixel), so an N-spp frame is the whole image rendered at N shared wavelengths. The error is a **uniform colour cast**, not noise — it does not average down per pixel. Measured on `gallery_rain` (rain volume), frame-mean B/G vs. the converged answer 0.705: `1 spp → 0.000` (no blue at all), `8 → 1.243` (magenta), `16 → 0.691`, `64 → 0.694`. Use `-spp 64` or more; ftrace prints a `[mode W] WARNING` below that. This is also why a live `-window` on such a render **changes hue between repaints** while it climbs through the first few dozen spp. Also drives the interactive viewer's live lit preview (`-explore`, `T`) | CPU + **GPU** (see below) |
+| `W` | Deterministic preview | Mode `R` with **every estimator replaced by a fixed quadrature** — a POV-Ray-style Whitted render that is noise-free at `-spp 1` and ~2 orders of magnitude faster than converging `R`. Trades multi-bounce GI (see `-ambient` for a flat fill, `-gi` for a real deterministic one-bounce gather) and unbiasedness for speed. **Caveat — media/GRIN need spp.** "Noise-free at 1 spp" holds only while the path stays in the hero *bundle*; participating media, a GRIN volume, or `-heroc 1` drop it onto a scalar path carrying **one wavelength per sample**, and mode `W`'s wavelength lattice depends on the sample index *alone* (shared by every pixel), so an N-spp frame is the whole image rendered at N shared wavelengths. The error is a **uniform colour cast**, not noise — it does not average down per pixel. Measured on `gallery_rain` (rain volume) in 0.199, frame-mean B/G vs. the converged answer 0.705: `1 spp → 0.000` (no blue at all), `8 → 1.243` (magenta), `16 → 0.691`, `64 → 0.694` (the scene, and which wavelengths the lattice visits, have changed since; the cast has not gone away). Use `-spp 64` or more; ftrace prints a `[mode W] WARNING` below that. This is also why a live `-window` on such a render **changes hue between repaints** while it climbs through the first few dozen spp. Also drives the interactive viewer's live lit preview (`-explore`, `T`) | CPU + **GPU** (see below) |
 | `V` | Validate | Runs `B` and `R` and reports the best-fit residual between them | CPU (+GPU forward pass) |
 | `P` | Composite | Forward `B` for diffuse/caustic pixels + a backward camera ray for specular/coated surfaces | CPU + **GPU** |
 | `D` | BDPT | Bidirectional path tracing with MIS over every light×camera connection | CPU + **GPU** |
@@ -2687,6 +2687,20 @@ second:**
   was measured to remove no noise on fur and ~5 % of the variance in rain, for ~17 % more time,
   so it is not done. Mode `W` splits the bundle at a fiber, one sub-path per wavelength, as it
   does at glass. The built-in `-fog` keeps the bundle like any grey medium.
+  **Modes `R` and `W` draw a camera path's wavelengths through a window over the visible band**
+  (0.377.0, CPU and GPU): the density is the scene's emission spectrum (its lights, plus a fire's
+  Planck spectrum) times a window, and the film divides out the difference, so the image is the
+  same and only the noise moves. Drawn by the emission alone, as before, samples went wherever
+  the lights put power, seen or not: a 1500 K fire puts most of its power in the near infrared.
+  Mode `R`'s window is pbrt-v4's visible-wavelength density 1/cosh²(0.0072 (λ − 538)); against
+  the old draw, at `-heroc 4`, it measured 0.61× the luminance and 0.73× the chroma variance on a
+  Cornell box, about even under a spiky triphosphor lamp, and 0.07× / 0.11× on a fire-lit
+  scene. Mode `W`'s is flat over 400–700 nm, so inside the band its fixed wavelengths stay
+  spaced by the light as before (its 1-spp colour is unchanged under ordinary lights), and
+  stop going to waste in the infrared. Weighting by the eye's response x̄ + ȳ + z̄ instead was
+  measured and rejected: it costs chroma noise under spiky lights, and multiplied mode `W`'s
+  1-spp colour error by five. `FTRACE_CAM_VIS=0` restores the old draw for comparison
+  (`tools/check_cam_vis.py`).
   The bundle size is runtime-configurable with **`-heroc N`** (default 4, range 1–8);
   `-heroc 1` turns hero off, reducing every hero tracer (CPU and the GPU megakernel)
   bit-identically to the classic single-λ estimator. **Do not do that in mode `W`.** Mode
@@ -2694,7 +2708,7 @@ second:**
   the whole spectral quadrature — there are no further samples to average a collapse away,
   so `-heroc 1` there does not make a dispersive surface noisier, it makes it **wrong**
   (a Cornell `glass:SF10` sphere renders a flat green ball: 46.85 pp of chroma error against
-  0.82 pp at the default). It also buys almost nothing: mode `W` is traversal-bound, so its
+  0.82 pp at the default, measured in 0.138.0). It also buys almost nothing: mode `W` is traversal-bound, so its
   full 8-wavelength bundle measures at **2.7 %** of frame time over a single wavelength
   (versus 61 % in mode `R`). Passing `-heroc 1` to a batch mode-`W` render on a scene with a
   dispersive dielectric, thin film, grating, multilayer, layered coat or fluorescence now
