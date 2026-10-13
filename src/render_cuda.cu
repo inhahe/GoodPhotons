@@ -19226,8 +19226,10 @@ static bool cudaBidirCoreSupported(const Scene& scene) {
 // Hair runs on the device forward/backward tracers and, since 0.364.0, in mode U's kernels
 // (kVcmLightT / kVcmCameraT carry the fiber BCSDF, the tube clearance and the strand merge
 // exclusion), but NOT in the BDPT vertex machinery -- a hair scene still falls back to the CPU
-// BDPT. The two gates therefore split here.
+// BDPT. The two gates therefore split here. A fire likewise: the CPU BDPT reaches it (bdpt.h, the
+// fires note); the device's does not.
 bool cudaBdptSupported(const Scene& scene) {
+    for (const Medium& m : scene.media) if (m.emissive()) return false;
     return cudaBidirCoreSupported(scene) && !sceneUsesHairMaterial(scene);
 }
 

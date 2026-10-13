@@ -1573,6 +1573,67 @@ struct Scene {
         int gres[3] = {0, 0, 0};
         std::vector<double> cellW, cellCdf;
         double cellSum = 0.0;
+
+        // A point drawn in proportion to the cell powers (a cell by cellCdf from u0, uniform inside
+        // it from u1..u3), and the volume density of that draw at `x` (0 outside the box).
+        // cellPoint requires cellSum > 0.
+        Vec3 cellPoint(double u0, double u1, double u2, double u3) const {
+            const size_t n = cellCdf.size();
+            size_t ci = (size_t)(std::lower_bound(cellCdf.begin(), cellCdf.end(), u0) - cellCdf.begin());
+            if (ci >= n) ci = n - 1;
+            const int i = (int)(ci % (size_t)gres[0]);
+            const int j = (int)((ci / (size_t)gres[0]) % (size_t)gres[1]);
+            const int k = (int)(ci / ((size_t)gres[0] * (size_t)gres[1]));
+            const Vec3 ext = bmax - bmin;
+            return Vec3(bmin.x + ext.x * (i + u1) / gres[0], bmin.y + ext.y * (j + u2) / gres[1],
+                        bmin.z + ext.z * (k + u3) / gres[2]);
+        }
+        double cellPdf(const Vec3& x) const {
+            if (!(cellSum > 0.0)) return 0.0;
+            const Vec3 ext = bmax - bmin;
+            int c[3];
+            for (int a = 0; a < 3; ++a) {
+                const double t = ((&x.x)[a] - (&bmin.x)[a]) / (&ext.x)[a];
+                if (!(t >= 0.0 && t <= 1.0)) return 0.0;
+                c[a] = std::min((int)(t * gres[a]), gres[a] - 1);
+            }
+            const double cellVol = (ext.x / gres[0]) * (ext.y / gres[1]) * (ext.z / gres[2]);
+            return cellW[((size_t)c[2] * gres[1] + c[1]) * gres[0] + c[0]] / (cellSum * cellVol);
+        }
+
+        // How many points a ray's stretch [ta, tb] through the box gets when its emission is
+        // integrated (segmentPoints): about one per voxel of the temperature grid, 4 to 32 -- the
+        // emission rises steeply with temperature, so a coarser rule leaves the hot core to luck.
+        int strata(double ta, double tb) const {
+            return (voxel > 0.0) ? std::clamp((int)std::ceil((tb - ta) / voxel), 4, 32) : 4;
+        }
+
+        // Jittered stratified points s, one per stratum of the stretch o + s d, s in [ta, tb]
+        // (from clipRayBox), stopping at `tEnd` (the surface the ray reaches): visit(s, T, kelvin,
+        // dt) at each point where the fire is hot, with `dt` the stratum length -- so the sum of
+        // dt * T * j over the points estimates the integral of T j along the stretch -- and T an
+        // unbiased estimate of the transmittance from o to the point: the product of the factors
+        // step(T, a, len, s0) multiplies into it for the consecutive sub-segments a + d [0, len],
+        // a = o + d s0, each an independent unbiased estimate (a 0 ends the walk), times the
+        // Beer-Lambert exp(-absorb s) of a dielectric the ray runs inside (absorb 0 outside one).
+        template <class Step, class Visit>
+        void segmentPoints(const Medium& med, const Vec3& o, const Vec3& d, double ta, double tb,
+                           double tEnd, double absorb, Pcg32& rng, Step&& step,
+                           Visit&& visit) const {
+            const int K = strata(ta, tb);
+            const double dt = (tb - ta) / K;
+            double T = 1.0, sPrev = 0.0;
+            for (int k = 0; k < K; ++k) {
+                const double s = ta + (k + rng.uniform()) * dt;
+                if (s >= tEnd) break;
+                step(T, o + d * sPrev, s - sPrev, sPrev);
+                if (!(T > 0.0)) break;
+                sPrev = s;
+                const double kelvin = med.temperatureAt(o + d * s);
+                if (!(kelvin > 0.0)) continue;
+                visit(s, (absorb > 0.0) ? T * std::exp(-absorb * s) : T, kelvin, dt);
+            }
+        }
     };
     std::vector<EmissiveVolume> emissiveVolumes;
     double totalEmissionPower = 0.0;
@@ -2724,6 +2785,15 @@ struct Scene {
         double g = 0.0;
         for (const auto& e : emitters) g += e.geomWeight() * e.spdFn(lambda);
         return (g > 0.0) ? emitG / g : 0.0;
+    }
+    // The same for a draw from camSampler, the illuminant with the fires: camG / (g(lambda) +
+    // fireG(lambda)). Without a fire it is invPdfLambda.
+    double camInvPdfLambda(double lambda) const {
+        if (emissiveVolumes.empty()) return invPdfLambda(lambda);
+        double g = 0.0;
+        for (const auto& e : emitters) g += e.geomWeight() * e.spdFn(lambda);
+        g += fireG(lambda);
+        return (g > 0.0) ? camG / g : 0.0;
     }
 
     Bvh bvh;   // acceleration structure over tris (0..nTris) then spheres.

@@ -192,6 +192,28 @@ fails to load, rather than rendering as smoke, is the loader's choice and was le
 
 Deferred, as their own entries: FIRE-NEE-STRATA-COST and SLAB-DDA-COPIES.
 
+## OPEN (2026-10-13): RADIANCE-ETA2 — camera-side transport leaves out the n^2 radiance scale at a refraction
+
+Radiance over n^2 is what is conserved along a ray through a refraction (times the Fresnel
+transmittance), so radiance coming out of glass into air is (1/1.5)^2 = 0.44 of what it was
+inside. A camera-side estimator therefore has to scale its throughput by (n_from / n_to)^2 at each
+refraction (pbrt's TransportMode::Radiance factor on the BTDF); a light-side one, which carries
+flux, does not. No camera-side walk here applies it -- modes R and W (`interactMaterial` /
+`radianceHeroLoop` and the device's `bkInteract`), mode D's eye walk (`randomWalk` in
+Mode::Radiance), and the camera passes of M, S, P and U -- while the forward tracer and the BDPT
+light walk are right without it. For the usual scene it cancels: a ray goes into a glass object
+and out again, and (1/n^2)(n^2) = 1. It does not cancel when a path crosses an odd number of
+interfaces between the camera and the light: an emitter (or a fire) embedded in solid glass or
+water, or a camera inside one.
+
+Found with a fire inside a solid glass ball (check_fire_d's first lantern): on the floor and wall
+lit through the ball, mode R read x2.2-2.5 of mode B (n^2 = 2.25), and mode D -- whose light
+tracing is flux and right, mixed by MIS with its camera-side s=0 points, which are not -- landed
+in between (x0.43-0.60 of R; x1.0 of B where the light tracing dominates). Fix: the factor at
+every camera-side refraction (and thin-film / multilayer / grating interfaces that change the
+medium), CPU and GPU, with a check of an emitter inside a solid dielectric in modes R, D and W
+against mode B. check_fire_d uses a glass pane, crossed in and out, until then.
+
 ## OPEN (2026-10-13, to investigate): STUBBLE-DEVICE-UNDERSIDE — mode W on a stubble coat, device vs host, 9.6 % apart in its dark underside
 
 `tools/check_modew_fiber.py`'s fur ball with the coat cut to stubble (count 60000, length 0.006,
@@ -334,7 +356,7 @@ loader refuses the nesting -- so no mix coin needs carrying.) With media in the 
 the free flights of the segment it re-traces -- measured 33 % too dark in a pure-absorber fog before
 `firstSegSampled`. `tools/check_hero_spectral.py`'s coatfog scene covers both.
 
-## OPEN (2026-10-12; the silence fixed in 0.375.1, mode R in 0.376.0): EMISSIVE-VOLUME-SILENT — most modes rendered a fire-lit scene black without a word
+## OPEN (2026-10-12; the silence fixed in 0.375.1, mode R in 0.376.0, mode D in 0.378.0): EMISSIVE-VOLUME-SILENT — most modes rendered a fire-lit scene black without a word
 
 Volumetric emission (`temperature` + `emission blackbody`, "fire") is born only by the forward
 tracer (`render.h`'s volume births), so only the forward modes A, B and C render it, CPU and GPU.
@@ -363,10 +385,20 @@ and rendered black, and a fire beside narrow-band lights would have lost the wav
 not emit. Mode R refuses a fire alongside `-dual-scatter` fur or a GRIN medium (fallback B).
 `tools/check_fire_r.py` holds it to mode B and to itself with the light sampling off.
 
-**Still open:** mode D (volume-born light subpaths, emission at medium vertices inside the MIS,
-and the same fire-inclusive wavelength sampling); the GPU twin of mode R's (a GPU mode-R render of
-a fire falls back to the CPU); mode P, refused until its composite -- the forward layer fitted
-against a mode-R film -- is checked with a fire in both. And an efficiency debt: the forward
+**Mode D renders it (CPU, 0.378.0)**, as one more light with all three of an area light's
+strategies: light subpaths born at points of the fire, the s=1 connection to a point of it, and,
+for s=0 -- which a walk cannot do by stopping on a fire -- the emission every camera-walk segment
+gathers at stratified points, each weighted against the connections (design.md, the fire bullet).
+The same fire-inclusive wavelength sampling. `tools/check_fire_d.py` holds it to mode R: directly,
+in a mirror, behind a lens, and inside a glass ball seen through a lens and a pinhole. On the way it
+exposed BDPT-S1-SKIP (0.377.4): a fire's light subpaths start empty whenever their origin lands on
+a cold point.
+
+**Still open:** the GPU twins of modes R and D (a GPU render of a fire in either falls back to the
+CPU); modes J and U, which share mode D's transport but still refuse a fire (their light passes
+would need fire-born light subpaths, and J's beams their own fire births); mode P, refused until
+its composite -- the forward layer fitted against a mode-R film -- is checked with a fire in both.
+And an efficiency debt: the forward
 tracer births fire photons uniformly over the emitting box with beta proportional to the local
 emission, so most births carry almost nothing (the light comes from a core far smaller than the
 box); drawing them from mode R's per-fire emission grid (EmissiveVolume::cellW) would make beta

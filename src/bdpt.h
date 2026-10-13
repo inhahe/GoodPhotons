@@ -180,6 +180,97 @@ inline bool isInfiniteEmitter(const Emitter& em) {
 // except a collimated beam, whose emitted direction is a Dirac delta about beamDir.
 inline bool isNeeEmitter(const Emitter& em) { return !em.collimated; }
 
+// --- Fires (volumetric emission) as light sources ------------------------------------------
+//
+// A fire emits j(x, lambda) per unit length in every direction (Medium::emissionAt). It is one
+// more light, picked by power together with the emitters (bdptPickLight), with all three of an
+// area light's strategies:
+//   * s >= 2: light subpaths born at a point of it (fireLightSubpath);
+//   * s = 1: the eye vertex connected to a point of it, drawn as a light subpath's origin is;
+//   * s = 0: the eye walk cannot STOP on a fire -- it emits where no free flight need stop -- so
+//     instead every segment of it gathers the emission along it at stratified points
+//     (EmissiveVolume::segmentPoints; BdptRenderer::renderRows), each one an s = 0 sample of the
+//     path ending there, weighted against the connections like any other. Its density, per unit
+//     volume, is the walk's direction density over d^2 times the points' density along the ray,
+//     1 / stratum length (fireLineDensity): vertexPdf and the light walk put that same factor on
+//     every density of reaching a fire point from the eye side, so the weights agree.
+// The s = 0 samples are what cover the paths with nothing but delta vertices on the eye side (a
+// fire seen directly, or through glass and mirrors), which no connection reaches; and their
+// density grows as 1/r^2 at an eye vertex inside the fire, where a connection to a point drawn
+// without regard to it would carry a 1/r^2 of diverging variance.
+//
+// A fire's origin point is drawn from a defensive mixture: kFireBoxShare of the draws uniform
+// over the box the fire emits in, the rest in proportion to its cell powers
+// (EmissiveVolume::cellPoint). The cells' powers are 27-point estimates, so a cell can read 0
+// where the fire does emit; the uniform share keeps the density positive wherever it can.
+constexpr double kFireBoxShare = 0.25;
+inline double fireOriginPdf(const Scene::EmissiveVolume& v, const Vec3& x) {
+    const Vec3 ext = v.bmax - v.bmin;
+    const double vol = ext.x * ext.y * ext.z;
+    if (!(vol > 0.0)) return 0.0;
+    if (x.x < v.bmin.x || x.y < v.bmin.y || x.z < v.bmin.z ||
+        x.x > v.bmax.x || x.y > v.bmax.y || x.z > v.bmax.z) return 0.0;
+    if (!(v.cellSum > 0.0)) return 1.0 / vol;
+    return kFireBoxShare / vol + (1.0 - kFireBoxShare) * v.cellPdf(x);
+}
+inline Vec3 fireOriginSample(const Scene::EmissiveVolume& v, Pcg32& rng) {
+    const double u0 = rng.uniform(), u1 = rng.uniform(), u2 = rng.uniform(), u3 = rng.uniform();
+    if (!(v.cellSum > 0.0) || rng.uniform() < kFireBoxShare) {
+        const Vec3 ext = v.bmax - v.bmin;
+        return Vec3(v.bmin.x + ext.x * u1, v.bmin.y + ext.y * u2, v.bmin.z + ext.z * u3);
+    }
+    return v.cellPoint(u0, u1, u2, u3);
+}
+// The density per unit length with which the s = 0 points fall at `x` on the ray from `from`
+// through it: 1 / the stratum length of that ray's stretch through the fire's box (strata are
+// laid on the whole stretch from `from`, however far the segment actually runs). 0 when the ray
+// misses the box.
+inline double fireLineDensity(const Scene& scene, const Vec3& from, const Vec3& x, int fire) {
+    const Scene::EmissiveVolume& v = scene.emissiveVolumes[(size_t)fire];
+    Vec3 d = x - from;
+    const double l2 = dot(d, d);
+    if (!(l2 > 0.0)) return 0.0;
+    d = d / std::sqrt(l2);
+    double ta, tb;
+    if (!clipRayBox(v.bmin, v.bmax, from, d, 0.0, 1e300, ta, tb)) return 0.0;
+    return v.strata(ta, tb) / (tb - ta);
+}
+
+// A light for a light subpath or an s=1 connection: an emitter (`emitter`) or a fire (`fire`),
+// with the probability `pdf` of having picked it. Without a fire this is selectEmitter exactly,
+// the same draws included.
+struct BdptLightPick { int emitter = -1; int fire = -1; double pdf = 0.0; };
+inline BdptLightPick bdptPickLight(const Scene& scene, Pcg32& rng) {
+    BdptLightPick pk;
+    const double fires = scene.emissiveVolumes.empty() ? 0.0 : scene.totalEmissionPower;
+    const double all = scene.totalPower + fires;
+    if (!(all > 0.0)) return pk;
+    if (fires > 0.0) {
+        double u = rng.uniform() * all;
+        if (u >= scene.totalPower) {
+            u -= scene.totalPower;
+            const int nV = (int)scene.emissiveVolumes.size();
+            int f = 0;
+            for (; f < nV - 1; ++f) { u -= scene.emissiveVolumes[(size_t)f].power; if (u < 0.0) break; }
+            pk.fire = f;
+            pk.pdf = scene.emissiveVolumes[(size_t)f].power / all;
+            return pk;
+        }
+    }
+    if (scene.emitters.empty() || !(scene.totalPower > 0.0)) return pk;
+    pk.emitter = scene.selectEmitter(rng);
+    pk.pdf = scene.emitters[(size_t)pk.emitter].power / all;
+    return pk;
+}
+// The probability of picking a given emitter / fire (bdptPickLight's `pdf`), for MIS.
+inline double bdptPickPdf(const Scene& scene, const Emitter* em, int fire) {
+    const double all = scene.totalPower +
+                       (scene.emissiveVolumes.empty() ? 0.0 : scene.totalEmissionPower);
+    if (!(all > 0.0)) return 0.0;
+    if (fire >= 0) return scene.emissiveVolumes[(size_t)fire].power / all;
+    return em ? em->power / all : 0.0;
+}
+
 struct Vertex {
     VType type = VType::Surface;
     Vec3 p{0, 0, 0};      // world position
@@ -227,11 +318,14 @@ struct Vertex {
     // medium that scattered here (for the phase function value and pdf).
     double mediumG = 0.0;
     int mediumId = -1;
+    // A point of a fire (type == Light): the index in scene.emissiveVolumes. It emits alike in
+    // every direction and has no surface.
+    int fire = -1;
 
-    bool onSurface() const { return type == VType::Surface || type == VType::Light; }
+    bool onSurface() const { return type == VType::Surface || (type == VType::Light && fire < 0); }
     bool isConnectible() const {
         if (type == VType::Camera) return true;      // pinhole connects (delta pos handled)
-        if (type == VType::Light)  return light && !light->collimated;
+        if (type == VType::Light)  return (light && !light->collimated) || fire >= 0;
         if (type == VType::Medium) return true;      // volume in-scatter always connects
         return mat && !delta && isConnectibleMat(*mat);
     }
@@ -355,7 +449,9 @@ inline double vertexPdfLight(const Scene& scene, const Vertex& cur, const Vertex
     double invD2 = 1.0 / d2;
     w = w * std::sqrt(invD2);
     double pdf;
-    if (cur.light && isInfiniteEmitter(*cur.light)) {
+    if (cur.fire >= 0) {
+        pdf = invD2 / (4.0 * PI);                    // a fire emits alike in every direction
+    } else if (cur.light && isInfiniteEmitter(*cur.light)) {
         double R = scene.sceneRadius;
         if (R <= 0.0) return 0.0;
         pdf = 1.0 / (PI * R * R);                    // planar density over the sun disc
@@ -395,6 +491,9 @@ inline double vertexPdf(const Scene& scene, const Camera& cam,
         wp = normalize(wp);
         pdfW = bsdfPdf(*cur.mat, cur.ns, wp, wn, lambda, scene, &cur.hit);
     }
+    // Reaching a fire point from the eye side is the s = 0 line sample (see the fires note).
+    if (next.fire >= 0)
+        return convertDensity(pdfW, cur, next) * fireLineDensity(scene, cur.p, next.p, next.fire);
     return convertDensity(pdfW, cur, next);
 }
 
@@ -404,12 +503,16 @@ inline double vertexPdf(const Scene& scene, const Camera& cam,
 // PBRT returns 0 for exactly these (SpotLight/DistantLight::Pdf_Le set pdfPos = 0, and
 // InfiniteLightDensity is 0 for a delta-direction light). The 0 is consistent on BOTH
 // sides of every MIS ratio (the light subpath stores the same 0 in path[0].pdfFwd), and
-// misWeight's remap0 turns both into 1, so the ratios stay finite and unbiased.
+// misWeight's remap0 turns both into 1, so the ratios stay finite and unbiased. A FIRE's is a
+// volume density: the pick times the origin draw's (fireOriginPdf).
 inline double vertexPdfLightOrigin(const Scene& scene, const Vertex& cur) {
+    if (cur.fire >= 0)
+        return bdptPickPdf(scene, nullptr, cur.fire) *
+               fireOriginPdf(scene.emissiveVolumes[(size_t)cur.fire], cur.p);
     if (!cur.light || scene.totalPower <= 0.0) return 0.0;
     if (isDeltaEmitter(*cur.light)) return 0.0;      // delta position / direction
     if (cur.light->area <= 0.0) return 0.0;
-    double pdfChoice = cur.light->power / scene.totalPower;
+    double pdfChoice = bdptPickPdf(scene, cur.light, -1);
     return pdfChoice / cur.light->area;
 }
 
@@ -866,6 +969,9 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             }
             double pdfRevW = pdfW;                             // phase symmetric in (wo,wi)
             path[prevIdx].pdfRev = convertDensity(pdfRevW, cur, path[prevIdx]);
+            if (path[prevIdx].fire >= 0)             // the eye side reaches a fire by s = 0 points
+                path[prevIdx].pdfRev *= fireLineDensity(scene, cur.p, path[prevIdx].p,
+                                                        path[prevIdx].fire);
             ray = Ray{mpos, wi};
             pdfFwd = pdfW;
             continue;
@@ -1284,6 +1390,9 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
 
         // The reverse density flows back to the previous vertex (area measure).
         path[prevSurfIdx].pdfRev = convertDensity(pdfRevW, cur, path[prevSurfIdx]);
+        if (path[prevSurfIdx].fire >= 0)             // the eye side reaches a fire by s = 0 points
+            path[prevSurfIdx].pdfRev *= fireLineDensity(scene, cur.p, path[prevSurfIdx].p,
+                                                        path[prevSurfIdx].fire);
 
         beta *= betaFactor;
         for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= secChromatic ? secF[i] : betaFactor;
@@ -1498,12 +1607,49 @@ inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Render
     return (int)path.size();
 }
 
+// A light subpath born in a fire (see the fires note): a point of it from fireOriginSample, a
+// direction uniform over the sphere -- the emission is isotropic -- and the emitted radiance per
+// unit length j(x, lambda) where a surface light has L_e. No beam claim: mode J refuses a fire.
+// Empty when the point is cold at every wavelength of the bundle.
+inline int fireLightSubpath(const Scene& scene, const Camera& cam, const Renderer& mats,
+                            const BdptLightPick& pick, const HeroBundle& hb, int maxDepth,
+                            Pcg32& rng, std::vector<Vertex>& path) {
+    const Scene::EmissiveVolume& fv = scene.emissiveVolumes[(size_t)pick.fire];
+    const Medium& med = scene.media[(size_t)fv.mediumIndex];
+    const Vec3 x = fireOriginSample(fv, rng);
+    const double pdfPos = fireOriginPdf(fv, x);
+    if (!(pdfPos > 0.0)) return 0;
+    const double kelvin = med.temperatureAt(x);
+    Vertex L0;
+    L0.type = VType::Light; L0.p = x; L0.fire = pick.fire;
+    L0.beta = med.emissionAtKelvin(kelvin, hb.lam[0]) * hb.invPdf[0];
+    L0.pdfFwd = pick.pdf * pdfPos;                   // a volume density (vertexPdfLightOrigin)
+    L0.nUp = hb.C;
+    double mx = L0.beta;
+    for (int i = 0; i + 1 < hb.C; ++i) {
+        L0.betaSec[i] = med.emissionAtKelvin(kelvin, hb.lam[i + 1]) * hb.invPdf[i + 1];
+        if (L0.betaSec[i] > mx) mx = L0.betaSec[i];
+    }
+    if (!(mx > 0.0)) return 0;
+    path.push_back(L0);
+    const double z = 1.0 - 2.0 * rng.uniform(), phi = 2.0 * PI * rng.uniform();
+    const double r = std::sqrt(std::max(0.0, 1.0 - z * z));
+    const Vec3 dir(r * std::cos(phi), r * std::sin(phi), z);
+    const double pdfDir = 1.0 / (4.0 * PI);
+    const double k = 1.0 / (pick.pdf * pdfPos * pdfDir);
+    double betaWalkSec[hero::kHeroMax - 1];
+    for (int i = 0; i + 1 < hb.C; ++i) betaWalkSec[i] = L0.betaSec[i] * k;
+    randomWalk(scene, cam, mats, Ray{x, dir}, L0.beta * k, pdfDir, hb, maxDepth - 1,
+               Mode::Importance, rng, path, betaWalkSec, hb.C);
+    return (int)path.size();
+}
+
 // Sample a light subpath: choose an emitter (power-weighted), a surface point and a
 // cosine-distributed emission direction, at the shared wavelength `lambda`
 // (invPdfLambda folds the wavelength importance so Le is radiance, as in backward.h).
 // path[0] is the light endpoint (beta = Le, its pdfFwd the positional area density).
-// Spot and sun lights route to deltaLightSubpath above; env/collimated are out of scope
-// (the mode-D guard refuses those scenes before any of this runs).
+// Spot and sun lights route to deltaLightSubpath above, a fire to fireLightSubpath; env /
+// collimated are out of scope (the mode-D guard refuses those scenes before any of this runs).
 inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Renderer& mats,
                                 const HeroBundle& hb, int maxDepth,
                                 Pcg32& rng, std::vector<Vertex>& path,
@@ -1514,11 +1660,11 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     // `BeamSpectral` across subpaths must not see the previous subpath's claim on a path
     // that took one of the early returns.
     if (bs) *bs = BeamSpectral{};
-    if (scene.emitters.empty() || scene.totalPower <= 0.0) return 0;
-    int ei = scene.selectEmitter(rng);
-    const Emitter& em = scene.emitters[ei];
-    double pdfChoiceSel = em.power / scene.totalPower;
-    if (pdfChoiceSel <= 0.0) return 0;
+    const BdptLightPick pick = bdptPickLight(scene, rng);
+    if (!(pick.pdf > 0.0)) return 0;
+    if (pick.fire >= 0) return fireLightSubpath(scene, cam, mats, pick, hb, maxDepth, rng, path);
+    const Emitter& em = scene.emitters[(size_t)pick.emitter];
+    const double pdfChoiceSel = pick.pdf;
     if (em.shape == EmitterShape::Spot || em.shape == EmitterShape::Sun)
         return deltaLightSubpath(scene, cam, mats, em, pdfChoiceSel, hb, maxDepth, rng, path,
                                 segs, bs);
@@ -1544,7 +1690,7 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     }
     if (!(mxLe > 0.0)) return 0;
 
-    double pdfChoice = em.power / scene.totalPower;
+    double pdfChoice = pick.pdf;
     double pdfPos = (em.area > 0.0) ? 1.0 / em.area : 0.0;
     if (pdfPos <= 0.0) return 0;
 
@@ -3006,66 +3152,111 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         sampled.beta = 1.0; sampled.delta = false;
         outPx = px; outPy = py; isSplat = true;
     } else if (s == 1) {
-        // NEE: connect the eye vertex to a freshly sampled point on a light.
+        // NEE: connect the eye vertex to a freshly sampled point on a light, or of a fire.
         const Vertex& pt = eye[t - 1];
         if (!pt.isConnectible()) return 0.0;
-        int ei = scene.selectEmitter(rng);
-        const Emitter& em = scene.emitters[ei];
-        if (em.shape == EmitterShape::Env || em.collimated)
-            return 0.0;                                // out of BDPT scope (mode-D guard)
-        double pdfChoice = em.power / scene.totalPower;
-        if (pdfChoice <= 0.0) return 0.0;
-        double u1 = rng.uniform(), u2 = rng.uniform();
-        // Per-shape connection geometry. `Wgeom` is the whole lambda-independent weight
+        const BdptLightPick pick = bdptPickLight(scene, rng);
+        const double pdfChoice = pick.pdf;
+        if (!(pdfChoice > 0.0)) return 0.0;
+        // Per-light connection geometry. `Wgeom` is the whole lambda-independent weight
         // that multiplies |cosSurf| in the estimator, i.e.
         //     L = beta * f * Le * |cosSurf| * Wgeom * Tr * stG
         // which for an area light is the familiar cosLight/(dist^2 * pdfA). Collecting it
-        // into one scalar is what lets the three emission models (Lambertian area, spot
-        // cone, distant sun) share the BSDF / occlusion / transmittance code below.
+        // into one scalar is what lets the emission models (Lambertian area, spot cone,
+        // distant sun, fire) share the BSDF / occlusion / transmittance code below. `Le` /
+        // `LeSec` are the emitted radiance Le(λ)/p(λ) per wavelength of the bundle (a fire's
+        // per unit length).
         Vec3 y, nOut, wi;
-        double dist, Wgeom, emitPatW = 1.0;
-        const bool deltaLight = isDeltaEmitter(em);
+        double dist, Wgeom, Le, LeSec[hero::kHeroMax - 1] = {0};
+        nUp = pt.nUp;
         // A distant sun has no finite light point: the shadow ray runs all the way to the
         // scene exit, so it must NOT be shortened by the usual endpoint epsilon.
         double occlEps = 2e-6;
-        if (em.shape == EmitterShape::Spot) {
-            // Point spot: the connection point is deterministic (delta position); the
-            // smoothstep penumbra weights the intensity toward this receiver.
-            Vec3 toL = em.origin - pt.p; double dist2 = dot(toL, toL);
-            if (dist2 <= 0.0) return 0.0;
-            dist = std::sqrt(dist2); wi = toL / dist;
-            double fall = spotFalloff(dot(wi * -1.0, em.beamDir),
-                                      em.spotCosInner, em.spotCosOuter);
-            if (fall <= 0.0) return 0.0;               // outside the cone
-            y = em.origin; nOut = wi * -1.0;
-            Wgeom = fall / (dist2 * pdfChoice);        // spdFn is an INTENSITY (W/sr)
-        } else if (em.shape == EmitterShape::Sun) {
-            // Distant sun: sample a direction inside the solar cone (pdfW = 1/Omega) and
-            // shadow-ray it out of the scene. No 1/dist^2 and no cosLight — the source is
-            // at infinity — so Wgeom is just Omega/pdfChoice and spdFn is a radiance.
-            wi = em.sampleCone(em.beamDir * -1.0, u1, u2);
-            dist = length(scene.sceneCenter - pt.p) + scene.sceneRadius;
-            occlEps = 0.0;
-            y = pt.p + wi * dist; nOut = wi * -1.0;
-            Wgeom = em.spotOmega / pdfChoice;
-        } else {
-            // Pattern factor at the sampled point (1.0 without a pattern). It scales Le
-            // below, never pdfA — see generateLightSubpath for why that stays unbiased.
-            emitPatW = emitterSamplePoint(scene, em, u1, u2, y, nOut);
+        if (pick.fire >= 0) {
+            // A point of the fire, drawn as a light subpath's origin is (fireOriginSample), so
+            // its density is the one every MIS ratio already carries; it emits j(x, λ) alike in
+            // every direction: Wgeom = 1 / (dist^2 * pdfChoice * pdfV), no cosine at the light.
+            const Scene::EmissiveVolume& fv = scene.emissiveVolumes[(size_t)pick.fire];
+            const Medium& med = scene.media[(size_t)fv.mediumIndex];
+            y = fireOriginSample(fv, rng);
+            const double pdfV = fireOriginPdf(fv, y);
             Vec3 toL = y - pt.p; double dist2 = dot(toL, toL);
-            if (dist2 <= 0.0) return 0.0;
+            if (!(dist2 > 0.0) || !(pdfV > 0.0)) return 0.0;
             dist = std::sqrt(dist2); wi = toL / dist;
-            double cosLight = dot(nOut, wi * -1.0);
-            if (cosLight <= 0.0) return 0.0;           // emitter stays one-sided
-            if (em.area <= 0.0) return 0.0;
-            Wgeom = cosLight * em.area / (dist2 * pdfChoice);   // == cosLight/(d^2 * pdfA)
+            nOut = Vec3(0, 0, 0);
+            Wgeom = 1.0 / (dist2 * pdfChoice * pdfV);
+            const double kelvin = med.temperatureAt(y);
+            Le = med.emissionAtKelvin(kelvin, lambda) * invPdfLambda;
+            for (int i = 0; i + 1 < nUp; ++i)
+                LeSec[i] = med.emissionAtKelvin(kelvin, hb.lam[i + 1]) * hb.invPdf[i + 1];
+            sampled.type = VType::Light; sampled.p = y; sampled.fire = pick.fire;
+            sampled.beta = Le / (pdfChoice * pdfV);
+            sampled.delta = false;
+            sampled.pdfFwd = pdfChoice * pdfV;
+        } else {
+            const Emitter& em = scene.emitters[(size_t)pick.emitter];
+            if (em.shape == EmitterShape::Env || em.collimated)
+                return 0.0;                            // out of BDPT scope (mode-D guard)
+            double u1 = rng.uniform(), u2 = rng.uniform();
+            double emitPatW = 1.0;
+            const bool deltaLight = isDeltaEmitter(em);
+            if (em.shape == EmitterShape::Spot) {
+                // Point spot: the connection point is deterministic (delta position); the
+                // smoothstep penumbra weights the intensity toward this receiver.
+                Vec3 toL = em.origin - pt.p; double dist2 = dot(toL, toL);
+                if (dist2 <= 0.0) return 0.0;
+                dist = std::sqrt(dist2); wi = toL / dist;
+                double fall = spotFalloff(dot(wi * -1.0, em.beamDir),
+                                          em.spotCosInner, em.spotCosOuter);
+                if (fall <= 0.0) return 0.0;           // outside the cone
+                y = em.origin; nOut = wi * -1.0;
+                Wgeom = fall / (dist2 * pdfChoice);    // spdFn is an INTENSITY (W/sr)
+            } else if (em.shape == EmitterShape::Sun) {
+                // Distant sun: sample a direction inside the solar cone (pdfW = 1/Omega) and
+                // shadow-ray it out of the scene. No 1/dist^2 and no cosLight — the source is
+                // at infinity — so Wgeom is just Omega/pdfChoice and spdFn is a radiance.
+                wi = em.sampleCone(em.beamDir * -1.0, u1, u2);
+                dist = length(scene.sceneCenter - pt.p) + scene.sceneRadius;
+                occlEps = 0.0;
+                y = pt.p + wi * dist; nOut = wi * -1.0;
+                Wgeom = em.spotOmega / pdfChoice;
+            } else {
+                // Pattern factor at the sampled point (1.0 without a pattern). It scales Le
+                // below, never pdfA — see generateLightSubpath for why that stays unbiased.
+                emitPatW = emitterSamplePoint(scene, em, u1, u2, y, nOut);
+                Vec3 toL = y - pt.p; double dist2 = dot(toL, toL);
+                if (dist2 <= 0.0) return 0.0;
+                dist = std::sqrt(dist2); wi = toL / dist;
+                double cosLight = dot(nOut, wi * -1.0);
+                if (cosLight <= 0.0) return 0.0;       // emitter stays one-sided
+                if (em.area <= 0.0) return 0.0;
+                Wgeom = cosLight * em.area / (dist2 * pdfChoice);   // == cosLight/(d^2 * pdfA)
+            }
+            // The emitter was CHOSEN at the hero wavelength; only its emitted radiance is
+            // re-evaluated per-λ (the pdf stays hero-driven, as everywhere else).
+            Le = em.spdFn(lambda) * invPdfLambda * emitPatW;
+            for (int i = 0; i + 1 < nUp; ++i)
+                LeSec[i] = em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1] * emitPatW;
+            sampled.type = VType::Light; sampled.p = y; sampled.ns = nOut; sampled.ng = nOut;
+            sampled.light = &em; sampled.matId = deltaLight ? -1 : em.matId;
+            sampled.mat = (sampled.matId >= 0) ? &scene.mats[sampled.matId] : nullptr;
+            sampled.emitPatW = emitPatW;
+            // A delta light has no area density: pdfFwd is 0 on BOTH sides of every MIS ratio
+            // (the light subpath stores the same 0), matching PBRT — see vertexPdfLightOrigin.
+            sampled.beta = deltaLight ? Le * Wgeom : Le * em.area / pdfChoice;   // == Le/pdfA
+            sampled.delta = false;
+            sampled.pdfFwd = deltaLight ? 0.0 : (pdfChoice / em.area);
+        }
+        {   // max over live wavelengths (identical to `Le <= 0` when nUp==1)
+            double mxLe = Le;
+            for (int i = 0; i + 1 < nUp; ++i) if (LeSec[i] > mxLe) mxLe = LeSec[i];
+            if (!(mxLe > 0.0)) return 0.0;
         }
         Vec3 dwo = eye[t - 2].p - pt.p;          // degeneracy guard: normalize(0) is NaN
         if (dot(dwo, dwo) == 0.0) return 0.0;
         Vec3 wo = normalize(dwo);
         // Scattering value f and endpoint cosine (phase / cos=1 at a medium vertex).
         double cosSurf, f, stG = 1.0, fSec[hero::kHeroMax - 1] = {0};
-        nUp = pt.nUp;
         if (pt.type == VType::Medium) {
             cosSurf = 1.0;
             f = mediumScatterF(pt, wo, wi, lambda, scene);
@@ -3091,18 +3282,6 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             for (int i = 0; i + 1 < nUp; ++i) if (fSec[i] > mxF) mxF = fSec[i];
             if (!(mxF > 0.0)) return 0.0;
         }
-        // The emitter was CHOSEN at the hero wavelength; only its emitted radiance is
-        // re-evaluated per-λ (the pdf stays hero-driven, as everywhere else).
-        double Le = em.spdFn(lambda) * invPdfLambda * emitPatW;
-        double LeSec[hero::kHeroMax - 1] = {0};
-        {
-            double mxLe = Le;
-            for (int i = 0; i + 1 < nUp; ++i) {
-                LeSec[i] = em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1] * emitPatW;
-                if (LeSec[i] > mxLe) mxLe = LeSec[i];
-            }
-            if (!(mxLe > 0.0)) return 0.0;
-        }
         if (scene.occluded(connOrigin(pt, wi), wi, dist - occlEps, 1e-6, false,
                            connFiberStep(pt, wi))) return 0.0;   // hard block: see t=1
         const double vis = 1.0;
@@ -3112,15 +3291,6 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         L = pt.beta * f * Le * G * Tr * stG;
         for (int i = 0; i + 1 < nUp; ++i)
             Lsec[i] = pt.betaSec[i] * fSec[i] * LeSec[i] * G * Tr * stG;
-        sampled.type = VType::Light; sampled.p = y; sampled.ns = nOut; sampled.ng = nOut;
-        sampled.light = &em; sampled.matId = deltaLight ? -1 : em.matId;
-        sampled.mat = (sampled.matId >= 0) ? &scene.mats[sampled.matId] : nullptr;
-        sampled.emitPatW = emitPatW;
-        // A delta light has no area density: pdfFwd is 0 on BOTH sides of every MIS ratio
-        // (the light subpath stores the same 0), matching PBRT — see vertexPdfLightOrigin.
-        sampled.beta = deltaLight ? Le * Wgeom : Le * em.area / pdfChoice;   // == Le/pdfA
-        sampled.delta = false;
-        sampled.pdfFwd = deltaLight ? 0.0 : (pdfChoice / em.area);
     } else {
         // Interior connection light[s-1] <-> eye[t-1].
         const Vertex& qs = light[s - 1];
@@ -3524,6 +3694,9 @@ struct BdptRenderer {
                              !grin::sceneHasGrin(scene) && !cam.hasLens();
         // Only pay for escape tracking when the scene actually has a distant sun.
         const bool hasSun = scene.sunCount > 0;
+        // ...and for the camera walk's segments, which the fires' s = 0 points lie on, when there
+        // is a fire.
+        const bool hasFire = !scene.emissiveVolumes.empty();
         // Mode J. `beams` is null in mode D, and an empty map is passed as null by the
         // dispatcher rather than as an empty map, so this single test is the whole gate:
         // when it is false the camera walk is not even asked to record its segments and the
@@ -3579,30 +3752,34 @@ struct BdptRenderer {
                     seedUnit(rng, (sampleBase + (uint64_t)si) * nPix + pixIdx,
                              0x8CB92BA72F3D8DD7ULL);
                     HeroBundle hb;
+                    // The wavelengths come from the illuminant's density, the fires' emission
+                    // included (Scene::camSampler; without a fire it is emitSampler), so a fire
+                    // is reached at every wavelength it emits.
                     if (useHero) {
                         // One stratified base draw -> hero + C-1 secondaries, all from
                         // the emission CDF (hero.h policy 1). The hero (index 0) must have
                         // a valid pdf; a dead secondary carries invPdf 0 and contributes 0.
                         double pdfA[hero::kHeroMax];
-                        if (!hero::sampleBundle(scene.emitSampler, rng.uniform(), C,
+                        if (!hero::sampleBundle(scene.camSampler, rng.uniform(), C,
                                                 hb.lam, pdfA)) continue;
                         hb.C = C;
-                        hb.invPdf[0] = scene.invPdfLambda(hb.lam[0]);
+                        hb.invPdf[0] = scene.camInvPdfLambda(hb.lam[0]);
                         for (int i = 1; i < C; ++i)
-                            hb.invPdf[i] = (pdfA[i] > 0.0) ? scene.invPdfLambda(hb.lam[i]) : 0.0;
+                            hb.invPdf[i] = (pdfA[i] > 0.0) ? scene.camInvPdfLambda(hb.lam[i]) : 0.0;
                     } else {
                         double pdfLam = 0.0;
-                        hb.lam[0] = scene.emitSampler.sample(rng, pdfLam);
+                        hb.lam[0] = scene.camSampler.sample(rng, pdfLam);
                         if (pdfLam <= 0.0) continue;
-                        hb.invPdf[0] = scene.invPdfLambda(hb.lam[0]);
+                        hb.invPdf[0] = scene.camInvPdfLambda(hb.lam[0]);
                         hb.C = 1;
                     }
                     Escape esc;
-                    if (mergeOn) segs.clear();
+                    const bool wantSegs = mergeOn || hasFire;
+                    if (wantSegs) segs.clear();
                     int nE = generateCameraSubpath(scene, cam, mats, px, py, hb,
                                                    maxDepth + 1, rng, eye,
                                                    hasSun ? &esc : nullptr,
-                                                   mergeOn ? &segs : nullptr);
+                                                   wantSegs ? &segs : nullptr);
                     int nL = generateLightSubpath(scene, cam, mats, hb,
                                                   maxDepth + 1, rng, light);
                     // The s=1 strategy draws a light point of its own (connectBDPT), so it runs
@@ -3673,6 +3850,63 @@ struct BdptRenderer {
                             if (isSplat) splatFilm.add(spx, spy, contrib);
                             else         camFilm.add(px, py, contrib);
                         }
+
+                    // ---- FIRES, s = 0 (see the fires note) --------------------------------
+                    // Every segment of the camera walk gathers each fire's emission along it at
+                    // stratified points (EmissiveVolume::segmentPoints), each an s = 0 sample of
+                    // the path made of the eye vertices up to the segment's start and that point,
+                    // weighted by misWeight with the point installed as the eye subpath's last
+                    // vertex. So the emission is taken whole where no connection reaches -- along
+                    // the camera ray, and after delta vertices only -- and shared with the
+                    // connections everywhere else.
+                    if (hasFire) {
+                        Vec3 fireXYZ(0, 0, 0);
+                        Vertex unused;
+                        for (const PathSeg& sg : segs) {
+                            const int k = sg.vert;              // the eye vertex it leaves from
+                            if (k < 0 || k >= nE || k > maxDepth) continue;
+                            const double perUp = 1.0 / sg.nUp;
+                            for (int f = 0; f < (int)scene.emissiveVolumes.size(); ++f) {
+                                const Scene::EmissiveVolume& fv = scene.emissiveVolumes[(size_t)f];
+                                double ta, tb;
+                                if (!clipRayBox(fv.bmin, fv.bmax, sg.o, sg.d, 0.0, 1e300, ta, tb) ||
+                                    ta >= sg.tMax) continue;
+                                const Medium& med = scene.media[(size_t)fv.mediumIndex];
+                                fv.segmentPoints(med, sg.o, sg.d, ta, tb, sg.tMax, sg.aGlass, rng,
+                                    [&](double& T, const Vec3& a, double len, double) {
+                                        T *= mats.mediaTransmittance(scene, a, sg.d, len, hb.lam[0], rng);
+                                    },
+                                    [&](double s, double T, double kelvin, double dt) {
+                                        double w = 1.0;              // the camera ray: s + t == 2
+                                        if (k >= 1) {
+                                            Vertex X;
+                                            X.type = VType::Light; X.fire = f; X.p = sg.o + sg.d * s;
+                                            X.pdfFwd = convertDensity(sg.pdfDir, eye[(size_t)k], X) *
+                                                       fireLineDensity(scene, eye[(size_t)k].p, X.p, f);
+                                            const size_t slot = (size_t)k + 1;
+                                            if (slot < eye.size()) {
+                                                ScopedAssign<Vertex> put(&eye[slot], X);
+                                                w = misWeight(scene, cam, light, eye, unused, 0, k + 2,
+                                                              hb.lam[0], mk);
+                                            } else {
+                                                eye.push_back(X);
+                                                w = misWeight(scene, cam, light, eye, unused, 0, k + 2,
+                                                              hb.lam[0], mk);
+                                                eye.pop_back();
+                                            }
+                                        }
+                                        Vec3 c = cie[0] * (sg.beta * med.emissionAtKelvin(kelvin, hb.lam[0]) *
+                                                           hb.invPdf[0]);
+                                        for (int i = 0; i + 1 < sg.nUp; ++i)
+                                            c = c + cie[i + 1] * (sg.betaSec[i] *
+                                                                  med.emissionAtKelvin(kelvin, hb.lam[i + 1]) *
+                                                                  hb.invPdf[i + 1]);
+                                        fireXYZ = fireXYZ + c * (w * dt * T * perUp);
+                                    });
+                            }
+                        }
+                        camFilm.add(px, py, fireXYZ);
+                    }
 
                     // ---- MERGES (mode J / UPBP) ---------------------------------------
                     // The other half of the estimator: every photon beam whose kernel this

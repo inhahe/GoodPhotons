@@ -3730,8 +3730,9 @@ as the one at fault.
   `camSampler` (`tools/check_cam_vis.py`). Every sampler `finalizeCameraSpectrum` builds (and the
   fluorescent dyes' excitation samplers) reads g off `Scene::emitGTab`, the emitters' g at the
   bin centres that `finalizeEmitters` tabulates once, plus the fires' `fireG`: no emitter's
-  spectrum is evaluated per sampler. The other spectral modes (D, J, M, S) still draw by
-  `emitSampler` alone; the same film-side reweighting would serve them.
+  spectrum is evaluated per sampler. Mode D draws from `camSampler` itself (0.378.0, so a fire
+  has wavelengths), without a window; J, M and S still draw by `emitSampler` alone. The same
+  film-side reweighting would serve all four.
 
   **Spectral MIS and media (0.375.0, known-issues SPECTRAL-BUNDLE).** Two vertices sample a
   direction whose density depends on λ but smoothly -- a `Hair` fiber and a `phase rainbow`
@@ -7704,9 +7705,9 @@ as the one at fault.
   power and a direction, and integrates the emission along it to the first opaque surface,
   through see-through fibers by their transmittance -- the domain a shadow ray to a light has.
   The direction comes from a defensive mixture: three quarters of the draws aim at a point drawn
-  in proportion to the emission (`firePoint`, from a coarse per-fire grid of cell powers built at
-  load, `Scene::buildFireCells`), a quarter are uniform in the cone the emitting box's bounding
-  sphere subtends (over all directions from inside it). The point only sets the direction; its
+  in proportion to the emission (`EmissiveVolume::cellPoint`, from a coarse per-fire grid of cell
+  powers built at load, `Scene::buildFireCells`), a quarter are uniform in the cone the emitting
+  box's bounding sphere subtends (over all directions from inside it). The point only sets the direction; its
   density is the line integral of the piecewise-constant point density times t^2 along it,
   computed exactly through the grid (`firePointPdf`), and the cone share keeps the estimate
   bounded for a vertex inside the fire. Visible blackbody output collapses with temperature, so
@@ -7724,7 +7725,8 @@ as the one at fault.
   with the box the fire emits in (`Scene::vdbPositiveBox`: the positive voxels grown by one), about
   one per voxel (4 to 32), with transmittance as a product of independent ratio-tracking
   estimates over the sub-segments (unbiased; the dielectric's Beer-Lambert and the aggregate coat
-  included).
+  included): `EmissiveVolume::segmentPoints`, which mode D's s = 0 strategy shares, the caller
+  supplying each sub-segment's transmittance.
   Point sampling alone, a point drawn as the forward tracer births photons and weighted by its
   area-measure density, was rejected: its 1/r^2 diverges for a vertex inside the fire. The
   mixture's direction density and cone share are what make the point draws safe. The
@@ -7735,6 +7737,32 @@ as the one at fault.
   `FTRACE_FIRE_NEE=0` turns the light sampling off (segments take full weight) for A/B checks
   (`tools/check_fire_r.py`). The device walk does not see a fire yet, so a GPU mode-R render of
   one falls back to the CPU (`cudaBackwardSupported`).
+  **Mode D (CPU, 0.378.0)** (`bdpt.h`, the fires note) takes a fire as one more light, picked by
+  power together with the emitters (`bdptPickLight`), with all three of an area light's
+  strategies. s >= 2: light subpaths born at a point of it (`fireLightSubpath`: the point from
+  `fireOriginSample` -- a quarter uniform in the emitting box, the rest by the cell powers -- and an
+  isotropic direction). s = 1: the eye vertex connected to a point drawn the same way, so its
+  density is the one every MIS ratio already carries. s = 0: the eye walk cannot stop on a fire
+  (it emits where no free flight need stop), so instead every segment of the camera walk gathers
+  the emission along it at the stratified points of `segmentPoints` (`renderRows`, the FIRES
+  block), each one an s = 0 sample of the path ending there, weighted by `misWeight` with the point
+  installed as the eye subpath's last vertex. Its density per unit volume is the walk's direction
+  density over d^2 times the points' density along the ray, 1 / stratum length
+  (`fireLineDensity`, the strata laid on the ray's whole stretch through the box, so the density
+  needs no ray cast); `vertexPdf` and the light walk's reverse densities put the same factor on
+  every density of reaching a fire point from the eye side, so the weights agree. The s = 0
+  samples take the whole weight where no connection reaches -- a fire seen directly, or after
+  delta vertices only (glass and mirrors), and, behind a lens, a surface lit through glass -- and
+  their density grows as 1/r^2 at an eye vertex inside the fire, which keeps the connections to
+  points drawn regardless of it (a 1/r^2 of diverging variance) safe there. The camera's
+  wavelengths come from `Scene::camSampler` (`camInvPdfLambda`), without mode R's visible-band
+  window. The device BDPT does not see a fire, so a GPU mode-D render of one falls back to the
+  CPU (`cudaBdptSupported`); modes J and U, which share its transport but whose merges have no
+  fire-born light subpaths, still refuse one. `tools/check_fire_d.py` compares D with R.
+  An earlier version of mode D's fire took the camera-side emission only while every eye vertex
+  was delta, at weight 1, and gave the s = 1 connection a point mixture of its own (a cone toward
+  the box, for the 1/r^2): correct, but it could not reach a surface lit through glass behind a
+  lens, and needed a density correction in every MIS ratio. The line strategy does both jobs.
   Every other mode -- the composites V/P too -- **refuses** a scene with an emissive medium
   through the `-on-unsupported` policy (`main.cpp`: `modeRendersVolumeEmission`, read by
   `modeFeatureUnsupported`), as does mode R alongside `-dual-scatter` fur (whose fiber response
@@ -7747,8 +7775,8 @@ as the one at fault.
   checks in `modeFeatureUnsupported` -- so the refusal, the fallback, the strip and the error's
   advice cannot disagree. A physical-lens camera is first routed to a lens-forming mode
   (`lensRoutedMode`: R, or D/J); the fallback is the first of R and B that renders everything the
-  camera needs, lens included (`fallbackModeFor`; none for a fire through a lens, which then
-  errors). A strip removes only what the camera's mode lacks and only what no camera of the run
+  camera needs, lens included (`fallbackModeFor`; none for a fire beside a GRIN medium seen
+  through a lens, which then errors). A strip removes only what the camera's mode lacks and only what no camera of the run
   renders (`keepFire`/`keepGrin`, computed over the selected cameras), because every camera
   renders the one shared `Scene`. The exposure meter resolves each camera's mode with the same
   functions (`renderedMode`), after the run loop applied the policy.

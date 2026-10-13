@@ -1881,8 +1881,9 @@ struct BackwardRenderer {
     // agree by construction. Mode R reaches it the way it reaches an area light:
     //  * LIGHT SAMPLING at every vertex that samples lights (fireNee, called from the NEE
     //    functions): one fire v (probability by power), one direction -- toward a point drawn in
-    //    proportion to its emission (firePoint), or, as a defensive quarter of the draws, in the
-    //    cone the box it emits in subtends (uniform over all directions from inside it) -- and the
+    //    proportion to its emission (EmissiveVolume::cellPoint), or, as a defensive quarter of
+    //    the draws, in the cone the box it emits in subtends (uniform over all directions from
+    //    inside it) -- and the
     //    emission line integral along that direction to the first opaque surface, through
     //    see-through fibers by their transmittance -- the domain a shadow ray to a light has;
     //  * every SEGMENT the path traces collects the emission along it (fireSegment), at the
@@ -1950,21 +1951,10 @@ struct BackwardRenderer {
     }
 
     // POINT sampling, the strategy that finds a small hot core: a cell of the fire's coarse
-    // emission grid in proportion to its power (EmissiveVolume::cellW), a uniform point in it,
+    // emission grid in proportion to its power, a uniform point in it (EmissiveVolume::cellPoint),
     // and the direction to that point. The direction's solid-angle density is the line integral
     // along it of the point density (piecewise constant) times t^2, which firePointPdf computes
     // exactly by stepping through the grid's cells (Amanatides-Woo).
-    static Vec3 firePoint(const Scene::EmissiveVolume& v, double u0, double u1, double u2, double u3) {
-        const size_t n = v.cellCdf.size();
-        size_t ci = (size_t)(std::lower_bound(v.cellCdf.begin(), v.cellCdf.end(), u0) - v.cellCdf.begin());
-        if (ci >= n) ci = n - 1;
-        const int i = (int)(ci % (size_t)v.gres[0]);
-        const int j = (int)((ci / (size_t)v.gres[0]) % (size_t)v.gres[1]);
-        const int k = (int)(ci / ((size_t)v.gres[0] * (size_t)v.gres[1]));
-        const Vec3 ext = v.bmax - v.bmin;
-        return Vec3(v.bmin.x + ext.x * (i + u1) / v.gres[0], v.bmin.y + ext.y * (j + u2) / v.gres[1],
-                    v.bmin.z + ext.z * (k + u3) / v.gres[2]);
-    }
     static double firePointPdf(const Scene::EmissiveVolume& v, const Vec3& x, const Vec3& d) {
         if (!(v.cellSum > 0.0)) return 0.0;
         double t0, t1;
@@ -2012,13 +2002,12 @@ struct BackwardRenderer {
 
     // The emission a straight segment o + s d, s in [0, len], collects: sum over fires v of
     // w(v) * integral of T(0, s) j_v(o + s d, lam[i]) ds, added into E[i] for i < n (`only` >= 0
-    // restricts it to one fire). Per fire, K jittered stratified points over the segment's
-    // overlap with the box it emits in, about one per voxel of its temperature grid (4 to 32: the
-    // emission rises steeply with temperature, so a coarser rule leaves the hot core to luck);
-    // the transmittance to each is the product of independent estimates
-    // over consecutive sub-segments -- the media's (mediaTr at lam[0]: a bundle rides only grey
-    // media), the aggregate coat's when `coat`, the strands' per `vis` (which also ends the
-    // integral at an opaque surface) -- so the estimate is unbiased. `curveTmin0`: the hair exit
+    // restricts it to one fire). Per fire, the stratified points of EmissiveVolume::segmentPoints
+    // over the segment's overlap with the box it emits in; the transmittance to each is the
+    // product of independent estimates over consecutive sub-segments -- the media's (mediaTr at
+    // lam[0]: a bundle rides only grey media), the aggregate coat's when `coat`, the strands' per
+    // `vis` (which also ends the integral at an opaque surface) -- so the estimate is unbiased.
+    // `curveTmin0`: the hair exit
     // offset of a ray leaving a fiber, measured from `o`. `absorb`: the Beer-Lambert
     // coefficient of the dielectric the segment runs inside (0 outside one; a bundle is never
     // inside one, every dielectric entry splitting or de-heroing it).
@@ -2034,30 +2023,22 @@ struct BackwardRenderer {
             const double wv = w(vi);
             if (!(wv > 0.0)) continue;
             const Medium& med = scene.media[(size_t)v.mediumIndex];
-            const int K = (v.voxel > 0.0)
-                              ? std::clamp((int)std::ceil((tb - ta) / v.voxel), 4, 32) : 4;
-            const double dt = (tb - ta) / K;
-            double T = 1.0, sPrev = 0.0;
-            for (int k = 0; k < K; ++k) {
-                const double s = ta + (k + rng.uniform()) * dt;
-                const Vec3 a = o + d * sPrev;
-                const double seg = s - sPrev;
-                T *= mediaTr(scene, a, d, seg, lam[0], rng);
-                if (coat && furVol && furVol->valid()) T *= furVol->transmittance(a, d, seg);
-                // The fiber's exit clearance runs from the segment's origin, so a sub-segment
-                // that starts inside it still skips the strand it leaves.
-                if (vis == FireVis::Strands && T > 0.0)
-                    T *= scene.shadowTransmittance(a, d, seg, 1e-6,
-                                                   curveTmin0 > sPrev ? curveTmin0 - sPrev : 0.0);
-                else if (vis == FireVis::SkipHair && T > 0.0 && scene.occludedSkipHair(a, d, seg))
-                    T = 0.0;
-                if (!(T > 0.0)) break;
-                sPrev = s;
-                const double kelvin = med.temperatureAt(o + d * s);
-                if (!(kelvin > 0.0)) continue;
-                const double Ts = (absorb > 0.0) ? T * std::exp(-absorb * s) : T;
-                for (int i = 0; i < n; ++i) E[i] += wv * dt * Ts * med.emissionAtKelvin(kelvin, lam[i]);
-            }
+            v.segmentPoints(med, o, d, ta, tb, tb, absorb, rng,
+                [&](double& T, const Vec3& a, double seg, double s0) {
+                    T *= mediaTr(scene, a, d, seg, lam[0], rng);
+                    if (coat && furVol && furVol->valid()) T *= furVol->transmittance(a, d, seg);
+                    // The fiber's exit clearance runs from the segment's origin, so a
+                    // sub-segment that starts inside it still skips the strand it leaves.
+                    if (vis == FireVis::Strands && T > 0.0)
+                        T *= scene.shadowTransmittance(a, d, seg, 1e-6,
+                                                       curveTmin0 > s0 ? curveTmin0 - s0 : 0.0);
+                    else if (vis == FireVis::SkipHair && T > 0.0 && scene.occludedSkipHair(a, d, seg))
+                        T = 0.0;
+                },
+                [&](double, double Ts, double kelvin, double dt) {
+                    for (int i = 0; i < n; ++i)
+                        E[i] += wv * dt * Ts * med.emissionAtKelvin(kelvin, lam[i]);
+                });
         }
     }
 
@@ -2099,7 +2080,7 @@ struct BackwardRenderer {
         if (v.cellSum > 0.0 && rng.uniform() >= kFireCone) {
             const double u0 = rng.uniform(), u1 = rng.uniform(), u2 = rng.uniform(),
                          u3 = rng.uniform();
-            const Vec3 dv = firePoint(v, u0, u1, u2, u3) - x;
+            const Vec3 dv = v.cellPoint(u0, u1, u2, u3) - x;
             const double dl = length(dv);
             if (!(dl > 0.0)) return;
             wi = dv / dl;

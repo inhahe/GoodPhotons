@@ -112,7 +112,7 @@ Rules:
 - Only **cameras** and **media** carry mode-support constraints today: GRIN media
   (`medium … { ior … }`), which the bidirectional modes (`D`, `J`, `U`) refuse;
   non-rectilinear cameras (`projection fisheye/…`), which `A`, `C`, `D`, `J` and `U` refuse;
-  and volumetric emission (a `temperature` medium, "fire"), which only `A`, `B`, `C` and `R`
+  and volumetric emission (a `temperature` medium, "fire"), which only `A`, `B`, `C`, `R` and `D`
   render (REFERENCE.md, `-on-unsupported`, has the whole table). A camera with a physical
   `lens` is judged in the mode it will render in -- `R`, `D` or `J`, as the run routes it.
   Everything else always builds.
@@ -2973,19 +2973,20 @@ medium {
 }
 ```
 
-> **Mode support:** volumetric emission renders in the **forward** modes **A/B/C** (CPU and GPU)
-> and in mode **R** (and **W**, which runs on it) on the CPU. Each emissive medium emits its
-> local Planck radiance, `emission_scale` times blackbody(T), per unit length of a ray and in
+> **Mode support:** volumetric emission renders in the **forward** modes **A/B/C** (CPU and GPU),
+> and in modes **R** (and **W**, which runs on it) and **D** on the CPU. Each emissive medium emits
+> its local Planck radiance, `emission_scale` times blackbody(T), per unit length of a ray and in
 > every direction alike, so the fire both shows directly *and lights the rest of the scene*
 > (soot self-scatter, nearby walls). The forward modes birth photons inside it (position-sampled
 > over the temperature grid's box, wavelength-sampled from its blackbody); mode R samples it as a
 > light from every vertex -- a direction toward the grid's box, and the emission integrated along
 > it -- and collects the emission along every ray it traces, so a fire seen through glass or in a
-> mirror shows too. An emissive volume counts as the scene's light, so a fire needs no separate
-> `light` block. A `temperature` grid with no voxel above 0 (a cold frame of an animated fire)
-> emits nothing: the loader says so and the medium is plain smoke, which every mode renders. A GPU
-> mode-R render of a fire falls back to the CPU. The other modes (V, P, D, U,
-> J, M, S) do not render volumetric emission and **refuse** a scene with a fire, like any other
+> mirror shows too. Mode D (BDPT) treats it as one more light: light subpaths start at points
+> inside it, eye vertices connect to points of it, and every camera ray collects the emission
+> along it, weighted against those connections. An emissive volume counts as the scene's light,
+> so a fire needs no separate `light` block. A `temperature` grid with no voxel above 0 is refused
+> at load ("empty grid"). A GPU mode-R or mode-D render of a fire falls back to the CPU. The other
+> modes (V, P, U, J, M, S) do not render volumetric emission and **refuse** a scene with a fire, like any other
 > feature a mode can't render; so does mode R alongside `-dual-scatter` fur or a GRIN medium.
 > `-on-unsupported fallback` switches such a camera to mode **R** (or **B** where R refuses), and
 > `-on-unsupported strip` renders the fire as cold smoke unless another camera of the same run

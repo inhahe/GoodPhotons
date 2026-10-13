@@ -15634,17 +15634,18 @@ static OnUnsupported g_onUnsupported = OnUnsupported::Error;
 // strip and the error message all read these, so they cannot disagree about it.
 //
 // VOLUMETRIC EMISSION ("fire": a medium with a `temperature` field) is born by the forward tracer
-// (render.h's volume births) and reached by mode R's light sampling and segment integrals
-// (backward.h fireNee / fireSegment; mode W runs on mode R). Every other estimator would render
-// the fire as cold smoke (known-issues EMISSIVE-VOLUME-SILENT), so it refuses. Mode P stays
-// refused until its composite -- the forward layer fitted against a mode-R film -- is checked
-// with a fire in both.
+// (render.h's volume births), reached by mode R's light sampling and segment integrals
+// (backward.h fireNee / fireSegment; mode W runs on mode R), and by mode D as one more light with
+// all three of an area light's strategies (bdpt.h, the fires note). Every other estimator would
+// render the fire as cold smoke (known-issues EMISSIVE-VOLUME-SILENT), so it refuses -- modes J
+// and U too, whose merges have no fire-born light subpaths yet. Mode P stays refused until its
+// composite -- the forward layer fitted against a mode-R film -- is checked with a fire in both.
 static bool sceneHasEmissiveMedium(const Scene& scene) {
     for (const Medium& m : scene.media) if (m.emissive()) return true;
     return false;
 }
 static bool modeRendersVolumeEmission(char mode) {
-    return mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R';
+    return mode == 'A' || mode == 'B' || mode == 'C' || mode == 'R' || mode == 'D';
 }
 // GRIN media: BDPT and the modes built on its transport (D, J, U) refuse them.
 static bool modeRendersGrin(char mode) { return mode != 'D' && mode != 'J' && mode != 'U'; }
@@ -15655,7 +15656,7 @@ static bool modeFormsLensImage(char mode) { return mode == 'R' || mode == 'D' ||
 
 // Core capability check: return a reason string if `mode` cannot render `scene` with a
 // camera of the given `projection`, else nullptr. Volumetric emission restricts every mode
-// but A/B/C/R (modeRendersVolumeEmission); A and C image through one rectilinear thin lens;
+// but A/B/C/R/D (modeRendersVolumeEmission); A and C image through one rectilinear thin lens;
 // otherwise only the modes with real restrictions (D BDPT, J UPBP, U VCM) gate anything, and
 // the general modes (B/R/M/S/P) render everything.
 static const char* modeFeatureUnsupported(const Scene& scene, char mode, int projection) {
@@ -15731,7 +15732,8 @@ static const char* sceneModeUnsupported(const ftsl::Loaded& L, char cliMode) {
 
 // The -on-unsupported fallback: the first of R (the backward reference, which renders all that
 // BDPT and VCM refuse) and B (the forward tracer, which renders a fire) that renders everything
-// the camera needs, a lens included. 0 when neither does -- a fire seen through a physical lens.
+// the camera needs, a lens included. 0 when neither does -- a fire beside a GRIN medium, seen
+// through a physical lens.
 static char fallbackModeFor(const Scene& scene, int projection, bool lens) {
     for (char m : {'R', 'B'})
         if ((!lens || modeFormsLensImage(m)) && !modeFeatureUnsupported(scene, m, projection))
