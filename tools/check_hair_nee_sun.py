@@ -29,7 +29,7 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
-from check_glossy_nee_media import read_pfm, tile_stats  # noqa: E402
+from check_glossy_nee_media import read_pfm, tile_stats, tile_verdict  # noqa: E402
 
 NL = chr(10)
 SCENE = [
@@ -42,15 +42,6 @@ SCENE = [
     'fur "coat" { on "ball"  material fur  count 20000  length 0.12  length_jitter 0.3  radius 0.0015  droop 0.1  jitter 0.25  seed 7 }',
     'light sun { dir 0.3 0.8 -0.5  angle 20  spd blackbody 5800  intensity 9.2649e-14 }',
 ]
-
-
-def cells(on, off, rel):
-    """Ratio, z-scores and failing cells of two tile_stats (mean, standard error) pairs."""
-    (m1, e1), (m0, e0) = on, off
-    z = np.abs(m1 - m0) / np.maximum(np.hypot(e1, e0), 1e-30)
-    ratio = m1 / np.maximum(m0, 1e-30)
-    live = m0 > 0.02 * m0.max()
-    return ratio, np.where(live, z, 0.0), live & (z > 5.0) & (np.abs(ratio - 1.0) > rel)
 
 
 def main():
@@ -92,8 +83,8 @@ def main():
         pairs.append(("GPU / CPU", render("gpu_on", "gpu", True), on, 0.03))
     ok = True
     for name, x1, x0, rel in pairs:
-        ratio, z, bad = cells(tile_stats(*x1), tile_stats(*x0), rel)
-        fr, fz, fbad = cells(tile_stats(*x1, 1), tile_stats(*x0, 1), 0.01)
+        ratio, z, bad = tile_verdict(tile_stats(*x1), tile_stats(*x0), rel)
+        fr, fz, fbad = tile_verdict(tile_stats(*x1, 1), tile_stats(*x0, 1), 0.01)
         good = not bad.any() and not fbad.any()
         ok &= good
         i, j = np.unravel_index(int(np.argmax(z)), z.shape)

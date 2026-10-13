@@ -288,8 +288,8 @@ struct EmissionSampler {
         const int n = static_cast<int>(cdf.size()) - 1;
         if (n <= 0) return 0.0;
         const double t = (lambda - LAMBDA_MIN) / step;
-        if (!(t >= 0.0)) return 0.0;
-        const int b = (t < (double)n) ? static_cast<int>(t) : n - 1;
+        if (!(t >= 0.0) || t >= (double)n) return 0.0;
+        const int b = static_cast<int>(t);
         return (cdf[b + 1] - cdf[b]) / step;
     }
 };

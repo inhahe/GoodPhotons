@@ -31,7 +31,7 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
-from check_glossy_nee_media import read_pfm, tile_stats  # noqa: E402
+from check_glossy_nee_media import read_pfm, tile_stats, tile_verdict  # noqa: E402
 
 NL = chr(10)
 SCENE = [
@@ -44,17 +44,6 @@ SCENE = [
     'fur "coat" { on "ball"  material fur  count 5000  length 1.0  length_jitter 0.1  radius 0.002  droop 0.0  jitter 0.25  seed 9 }',
     'light env { spd 1.0 }',
 ]
-
-
-def verdict(on, off, z_max, rel_min):
-    """Mean ratio on / off, z-scores, and which cells fail: both differ by more than `z_max`
-    standard errors and by more than `rel_min` of the off image. `on` and `off` are
-    (mean, standard error) array pairs from tile_stats."""
-    (m1, e1), (m0, e0) = on, off
-    z = np.abs(m1 - m0) / np.maximum(np.hypot(e1, e0), 1e-30)
-    ratio = m1 / np.maximum(m0, 1e-30)
-    live = m0 > 0.02 * m0.max()
-    return ratio, np.where(live, z, 0.0), live & (z > z_max) & (np.abs(ratio - 1.0) > rel_min)
 
 
 def main():
@@ -87,8 +76,8 @@ def main():
                     raise SystemExit("render failed: " + " ".join(cmd))
                 imgs[flag, seed] = read_pfm(pfm).sum(-1)
         stats = {n: [tile_stats(imgs[f, 1], imgs[f, 2], n) for f in ("on", "off")] for n in (4, 1)}
-        ratio, z, bad = verdict(*stats[4], 5.0, 0.005)
-        fr, fz, fbad = verdict(*stats[1], 5.0, 0.002)
+        ratio, z, bad = tile_verdict(*stats[4], 0.005)
+        fr, fz, fbad = tile_verdict(*stats[1], 0.002)
         good = not bad.any() and not fbad.any()
         ok &= good
         i, j = np.unravel_index(int(np.argmax(z)), z.shape)

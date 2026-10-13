@@ -829,18 +829,7 @@ struct Medium {
             if (lo > hi) return false;
             ta = lo; tb = hi; return tb > ta;
         }
-        double lo = t0, hi = t1;
-        for (int a = 0; a < 3; ++a) {
-            double oa = (&o.x)[a], da = (&d.x)[a];
-            double mn = (&bmin.x)[a], mx = (&bmax.x)[a];
-            if (std::fabs(da) < 1e-12) { if (oa < mn || oa > mx) return false; continue; }
-            double inv = 1.0 / da;
-            double s0 = (mn - oa) * inv, s1 = (mx - oa) * inv;
-            if (s0 > s1) std::swap(s0, s1);
-            lo = std::max(lo, s0); hi = std::min(hi, s1);
-            if (lo > hi) return false;
-        }
-        ta = lo; tb = hi; return tb > ta;
+        return clipRayBox(bmin, bmax, o, d, t0, t1, ta, tb);
     }
 };
 
@@ -1519,6 +1508,20 @@ struct Scene {
     // per-lambda weight the backward reference needs (see backward.h).
     EmissionSampler emitSampler;
     double emitG = 0.0;
+    // g(lambda) at emitSampler's bin centres, tabulated once by finalizeEmitters, so the samplers
+    // finalizeCameraSpectrum builds on the same bins read it rather than every emitter's spectrum.
+    std::vector<double> emitGTab;
+    // A Spectrum reading `tab` -- a function tabulated at the bin centres LAMBDA_MIN + (i + 0.5) *
+    // step -- back at those centres, the points EmissionSampler::build evaluates. `tab` must
+    // outlive it.
+    static Spectrum binTable(const std::vector<double>& tab, double step) {
+        return [&tab, step](double w) {
+            const double t = (w - LAMBDA_MIN) / step;
+            size_t i = (t > 0.0) ? (size_t)t : 0;
+            if (i >= tab.size()) i = tab.size() - 1;
+            return tab[i];
+        };
+    }
     // ...and the same with the fires' emission added (finalizeCameraSpectrum): what a backward
     // camera path samples its wavelengths from, invPdf = camG / (g(lambda) + fireG(lambda)).
     EmissionSampler camSampler;
@@ -2272,13 +2275,16 @@ struct Scene {
         }
         if (totalPower > 0) for (auto& c : emitterCdf) c /= totalPower;
         buildSpdBases();
-        // Combined g(lambda) = sum_k geomWeight_k*SPD_k(lambda); by value capture.
-        std::vector<std::pair<double, Spectrum>> parts;
-        for (const auto& e : emitters) parts.push_back({e.geomWeight(), e.spdFn});
-        Spectrum g = [parts](double w) {
-            double s = 0.0; for (const auto& p : parts) s += p.first * p.second(w); return s;
-        };
-        emitSampler.build(g, stepNm);
+        // Combined g(lambda) = sum_k geomWeight_k*SPD_k(lambda), at the sampler's bin centres.
+        const int nb = static_cast<int>((LAMBDA_MAX - LAMBDA_MIN) / stepNm);
+        emitGTab.assign((size_t)std::max(nb, 0), 0.0);
+        for (int i = 0; i < nb; ++i) {
+            const double w = LAMBDA_MIN + (i + 0.5) * stepNm;
+            double s = 0.0;
+            for (const auto& e : emitters) s += e.geomWeight() * e.spdFn(w);
+            emitGTab[(size_t)i] = s;
+        }
+        emitSampler.build(binTable(emitGTab, stepNm), stepNm);
         emitG = emitSampler.integral;
         finalizeCameraSpectrum();
         // Emitter powers are now final, so the light BVH can be built off them. Last,
@@ -2301,13 +2307,14 @@ struct Scene {
     // emitter and re-finalizes) keeps host and sampler consistent. See Material::fluoInSampler for
     // why the product and not g alone.
     void finalizeCameraSpectrum() {
-        std::vector<std::pair<double, Spectrum>> parts;
-        for (const auto& e : emitters) parts.push_back({e.geomWeight(), e.spdFn});
+        if (emitGTab.empty()) return;                 // the emitters are not finalized yet
+        const double step = emitSampler.step;
         const bool fire = !emissiveVolumes.empty();
-        Spectrum g = [this, parts, fire](double w) {
-            double s = 0.0; for (const auto& p : parts) s += p.first * p.second(w);
-            return fire ? s + fireG(w) : s;
-        };
+        // g at the bin centres every sampler below is built on: the emitters' and the fires'.
+        std::vector<double> gTab = emitGTab;
+        if (fire)
+            for (size_t i = 0; i < gTab.size(); ++i) gTab[i] += fireG(LAMBDA_MIN + (i + 0.5) * step);
+        const Spectrum g = binTable(gTab, step);
         if (fire) { camSampler.build(g, emitSampler.step); camG = camSampler.integral; }
         else      { camSampler = emitSampler; camG = emitG; }
         // The camera's draws: the illuminant times a window over the visible band (design.md, mode
@@ -2324,18 +2331,18 @@ struct Scene {
             camVisSampler = camSampler;
             camWSampler = camSampler;
         } else {
-            camVisSampler.build([g](double w) {
+            camVisSampler.build([&g](double w) {
                 const double c = std::cosh(0.0072 * (w - 538.0));
                 return g(w) / (c * c);
             }, emitSampler.step);
-            camWSampler.build([g](double w) {
+            camWSampler.build([&g](double w) {
                 const double d = (w < 400.0) ? (400.0 - w) : (w > 700.0 ? w - 700.0 : 0.0);
                 return g(w) * std::max(0.01, std::exp(-0.5 * (d / 25.0) * (d / 25.0)));
             }, emitSampler.step);
         }
         for (auto& mm : mats) {
             if (mm.type != MatType::Fluorescent) continue;
-            Spectrum prod = [&mm, g](double w) {
+            Spectrum prod = [&mm, &g](double w) {
                 double e = mm.fluoAbsorb(w);            // clamp01 lives in render.h
                 e = (e < 0.0) ? 0.0 : (e > 1.0 ? 1.0 : e);
                 return e * g(w);
@@ -2693,10 +2700,19 @@ struct Scene {
     // "fill the scene uniformly with a tenth of a light's own radiance" in ANY
     // scene. A key light usually subtends well under a steradian as seen from the
     // surfaces it lights, so useful values live in roughly 0.01 .. 0.3.
+    //
+    // A fire counts as a light of geometric weight 4 pi V^(2/3), V the box it emits in: its share of
+    // camG (the camera's wavelength density, which includes the fires) is its power, 4 pi V meanKe
+    // dLambda, so alone it gives meanKe dLambda V^(1/3) -- its glow seen across one chord of the box.
     double ambientRef() const {
         double wSum = 0.0;
         for (const auto& e : emitters) wSum += e.geomWeight();
-        return (wSum > 0.0) ? emitG / wSum : 0.0;
+        for (const auto& v : emissiveVolumes) {
+            const Vec3 ext = v.bmax - v.bmin;
+            const double s = std::cbrt(ext.x * ext.y * ext.z);
+            wSum += 4.0 * PI * s * s;
+        }
+        return (wSum > 0.0) ? camG / wSum : 0.0;
     }
 
     // Per-lambda weight for the backward reference: emitG / g(lambda), i.e. the
@@ -2830,6 +2846,8 @@ struct Scene {
         if (noMedia && !media.empty()) {
             note(std::to_string(media.size()) + " medium/media");
             media.clear();
+            // The fires index `media`, and the camera's wavelength density counts them.
+            finalizeEmissiveVolumes();
         }
         if (noEnv && envIndex >= 0) {
             note("environment light");

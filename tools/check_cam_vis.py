@@ -31,7 +31,7 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
-from check_glossy_nee_media import read_pfm, tile_stats  # noqa: E402
+from check_glossy_nee_media import read_pfm, tile_stats, tile_verdict  # noqa: E402
 from check_fire_r import write_fire  # noqa: E402
 
 NL = chr(10)
@@ -60,16 +60,6 @@ CORNELL_GPU = [l.replace("material glass }", "material white }")
                 .replace("spd preset:f11 }", "spd preset:f11  lumens 2000 }")
                 .replace("amp=4 }", "amp=4  lumens 200 }")
                for l in CORNELL]
-
-
-def verdict(on, off, z_max, rel_min):
-    """Ratio on / off, z-scores and failing cells (both z above `z_max` and the relative
-    difference above `rel_min`), from tile_stats (mean, standard error) pairs."""
-    (m1, e1), (m0, e0) = on, off
-    z = np.abs(m1 - m0) / np.maximum(np.hypot(e1, e0), 1e-30)
-    ratio = m1 / np.maximum(m0, 1e-30)
-    live = m0 > 0.02 * m0.max()
-    return ratio, np.where(live, z, 0.0), live & (z > z_max) & (np.abs(ratio - 1.0) > rel_min)
 
 
 def main():
@@ -106,8 +96,8 @@ def main():
         return imgs
 
     def compare(name, x1, x0, tile_tol, frame_tol, stochastic):
-        ratio, z, bad = verdict(tile_stats(*x1), tile_stats(*x0), 5.0, tile_tol)
-        fr, fz, fbad = verdict(tile_stats(*x1, 1), tile_stats(*x0, 1), 5.0, frame_tol)
+        ratio, z, bad = tile_verdict(tile_stats(*x1), tile_stats(*x0), tile_tol)
+        fr, fz, fbad = tile_verdict(tile_stats(*x1, 1), tile_stats(*x0, 1), frame_tol)
         good = not bad.any() and not fbad.any()
         i, j = np.unravel_index(int(np.argmax(np.abs(ratio - 1.0) * (z > 0))), z.shape)
         var = lambda im: float(((im[0] - im[1]) ** 2).sum())   # noqa: E731

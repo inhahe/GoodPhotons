@@ -23,6 +23,25 @@ inline double curveMin(const Ray& r, double tmin) {
     return tmin > r.curveTmin ? tmin : r.curveTmin;
 }
 
+// Slab clip of the ray o + t d, t in [t0, t1], to the box [lo, hi]: the overlap [ta, tb], or
+// false when it is empty or a single point. An axis the ray runs parallel to (|d| < 1e-12)
+// either contains the origin or misses.
+inline bool clipRayBox(const Vec3& lo, const Vec3& hi, const Vec3& o, const Vec3& d,
+                       double t0, double t1, double& ta, double& tb) {
+    for (int a = 0; a < 3; ++a) {
+        const double oa = (&o.x)[a], da = (&d.x)[a];
+        const double mn = (&lo.x)[a], mx = (&hi.x)[a];
+        if (std::fabs(da) < 1e-12) { if (oa < mn || oa > mx) return false; continue; }
+        const double inv = 1.0 / da;
+        double s0 = (mn - oa) * inv, s1 = (mx - oa) * inv;
+        if (s0 > s1) std::swap(s0, s1);
+        t0 = std::max(t0, s0); t1 = std::min(t1, s1);
+        if (t0 > t1) return false;
+    }
+    ta = t0; tb = t1;
+    return tb > ta;
+}
+
 struct Tri {
     Vec3 v0, v1, v2;
     int matId = 0;

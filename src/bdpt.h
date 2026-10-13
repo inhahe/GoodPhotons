@@ -1161,6 +1161,9 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                     // return the coverage-scaled scatter value (0 at `opacity 0`) and
                     // extinguish the bundle at a fiber it never touched.
                     if (passThru) { secF[i] = 1.0; continue; }
+                    // Collapsed: the hero goes on alone (nUp = 1 below), so a secondary's factor is
+                    // worth nothing -- 0 keeps it out of the max test without the retint.
+                    if (collapse) { secF[i] = 0.0; continue; }
                     const HairShade hsi = hairShadeRetint(scene, *mp, h, hb.lam[i + 1], hs);
                     secF[i] = hairFoldFCos(la, hsi, wl, cosLong, nullptr) / pdfH;
                 }

@@ -11273,7 +11273,7 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;   // collimated beams / env (env: bkNeeEnvVolume)
         if (em.shape == 2) {
-            // Point spot at a volume vertex (device twin of neeVolume's spot branch): no
+            // Point spot at a volume vertex (device twin of volumeEmitterGeom's spot branch): no
             // surface cosine, cone falloff only; HG phase toward the light supplies the pdf.
             DVec3 toL = em.origin - p;
             Real dist2 = dot(toL, toL);
@@ -11292,7 +11292,7 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
             continue;
         }
         if (em.shape == 6) {
-            // Distant sun at a volume vertex (device twin of neeVolume's Sun branch):
+            // Distant sun at a volume vertex (device twin of volumeEmitterGeom's Sun branch):
             // cone-sampled direction (pdf 1/Omega, so 1/pdfW = Omega), no surface cosine,
             // transmittance out to the scene exit.
             double s1 = (double)rng.uniform(), s2 = (double)rng.uniform();
@@ -11957,6 +11957,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         // curveTmin, so RAY_EPS would only re-open the 1e-4 hole it was there to avoid.
         DHit h = closestHit(sc, ro, rd, curveTmin > (Real)0 ? (Real)0 : RAY_EPS, BIG,
                             /*camHide=*/(b == 0 && gi.depth == 0), curveTmin);
+        curveTmin = (Real)0;    // spent: only a fiber interaction below sets it again
         // O8 stage 2: stamp the shading footprint on the CAMERA SEGMENT only (host twin:
         // backward.h radiance()). A secondary bounce would need ray differentials /
         // cones to know how much its own footprint spread, so it keeps fw = 0
@@ -12082,7 +12083,6 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         }
 
         bool nullEvt = false;
-        curveTmin = (Real)0;                  // one hop only: cleared before each interaction
         if (!bkInteract<GiDepth == 0>(sc, mp, h, matId, diffraction, directOnly, ro, rd, lambda,
                                       invPdfLambda, thr, L, specularArrival, contBsdfPdf, stk,
                                       rng, gi, gmp, &nullEvt, &curveTmin))
@@ -12143,7 +12143,8 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                           const double* thrIn, int C, bool secAlive,
                                           bool specularArrival, double contBsdfPdf,
                                           int bounce0, double* Lout, DRng& rng, DGiCtx gi,
-                                          const DGlossyMis* gmis0 = nullptr) {
+                                          const DGlossyMis* gmis0 = nullptr,
+                                          Real curveTmin0 = (Real)0) {
     Real   lam[hero::kHeroMax];
     double invPdf[hero::kHeroMax], thr[hero::kHeroMax];
     // GLOSSY-NEE: the hero twin of bkRadiance's carrier. Cleared just before the material
@@ -12168,7 +12169,9 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
     const bool directOnly = (sc.bkDirectOnly != 0);
 
     int nullStepsH = 0;     // hair coverage pass-throughs, refunded below
-    Real curveTmin = (Real)0;   // fiber exit step, applied to curve prims only
+    // Fiber exit step for the next trace, applied to curve prims only: `curveTmin0` when a split
+    // sub-path starts at a fiber, then whatever each fiber interaction leaves; one hop only.
+    Real curveTmin = curveTmin0;
     for (int b = bounce0; b < maxBounce; ++b) {
         int nUp = secAlive ? C : 1;                    // wavelengths still being propagated
         gi.bounce = b;                                 // see the scalar twin: mode W's per-vertex lattice
@@ -12178,6 +12181,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         // curveTmin, so RAY_EPS would only re-open the 1e-4 hole it was there to avoid.
         DHit h = closestHit(sc, ro, rd, curveTmin > (Real)0 ? (Real)0 : RAY_EPS, BIG,
                             /*camHide=*/(b == 0 && gi.depth == 0), curveTmin);
+        curveTmin = (Real)0;    // spent: only a fiber interaction below sets it again
         // O8 stage 2 footprint, camera segment only — see the scalar twin. The test is
         // `b == 0`, NOT `b == bounce0`: a heroSplit re-entry resumes at a DEEPER bounce,
         // and that sub-path's first vertex is not a camera vertex.
@@ -12429,10 +12433,14 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                         // <false>: the hero tracer handles its own diffuse vertices inline, so
                         // the shared scalar interaction never needs the -gi gather (see the
                         // bkInteract declaration).
+                        // `sTmin`: the sub-path's own fiber exit clearance, as the hero's below --
+                        // without it a fiber would move the origin by the whole exit distance,
+                        // past a skin the strand grows from.
                         bool sNull = false;
+                        Real sTmin = (Real)0;
                         if (bkInteract<false>(sc, mp, h, matId, diffraction, directOnly, sRo, sRd,
                                               sLam, sInv, sThr, sL, sSpec, sPdf, sStk, rng, gi,
-                                              nullptr, &sNull)) {
+                                              nullptr, &sNull, &sTmin)) {
                             double sub[hero::kHeroMax];
                             // A coverage pass-through is no vertex, for a sub-path as for the
                             // hero below: it keeps the record the hero restores (gmisIn) and is
@@ -12446,7 +12454,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                                                &sLam, &sInv, &sThr, /*C=*/1,
                                                                /*secAlive=*/false, sSpec, sPdf,
                                                                refund ? b : b + 1, sub, rng, gi,
-                                                               sNull ? &gmisIn : nullptr);
+                                                               sNull ? &gmisIn : nullptr, sTmin);
                             sL += sub[0];
                         }
                         L[i] += sL;      // this wavelength's own estimate, own slot
@@ -12454,7 +12462,6 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     }
                     secAlive = false;    // hero carries on alone, UNBOOSTED
                     bool heroNull = false;
-                    curveTmin = (Real)0;
                     if (!bkInteract<false>(sc, mp, h, matId, diffraction, directOnly, ro, rd,
                                            lam[0], invPdf[0], thr[0], L[0], specularArrival,
                                            contBsdfPdf, stk, rng, gi, nullptr, &heroNull, &curveTmin))
@@ -12471,7 +12478,6 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 // wavelength.
                 if (secAlive) { thr[0] *= (double)C; secAlive = false; }
                 bool heroNull2 = false;
-                curveTmin = (Real)0;
                 if (!bkInteract<false>(sc, mp, h, matId, diffraction, directOnly, ro, rd, lam[0],
                                        invPdf[0], thr[0], L[0], specularArrival, contBsdfPdf, stk,
                                        rng, gi, nullptr, &heroNull2, &curveTmin))
@@ -18045,7 +18051,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         }
         // Excitation CDF (absorb x illuminant), appended to the SAME flat buffer with
         // its own slice. N == 0 makes the device sampler fall back to the illuminant,
-        // matching the host's `fluoInSampler.integral > 0 ? ... : scene.emitSampler`.
+        // matching the host's `fluoInSampler.integral > 0 ? ... : scene.camSampler` (the same
+        // density as emitSampler on the device, which renders no fire).
         if (m.type == MatType::Fluorescent && !m.fluoInSampler.cdf.empty() &&
             m.fluoInSampler.integral > 0.0) {
             d.fluoInCdfOffset = (int)fluoCdfAll.size();

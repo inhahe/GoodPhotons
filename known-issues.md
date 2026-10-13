@@ -123,6 +123,106 @@ trades the per-segment skip list for a per-vertex one -- emission at the resolve
 weight, the radiance-cache marks -- so the tested design stays, with the constraint stated where a
 future per-segment event would be added.
 
+## DONE (2026-10-13, 0.377.3): REVIEW-0377 — what the Opus and Fable reviews of 0.375.4-0.377.2 found
+
+Each checked against the code before it was fixed. Opus (max) found those down to the dead code;
+Fable (xhigh) found the fire's fiber clearance and the sampler cost as well, and the rest.
+- **NO-MEDIA-FIRE.** `-no-media` (`Scene::applyIgnoreFlags`) emptied `media` but left
+  `emissiveVolumes`, which index it: mode R's fire sampling, and mode B's births, read a destroyed
+  Medium (undefined behaviour). The fires are rebuilt with the media now
+  (`tools/check_fire_modes.py`, case 11).
+- **FIRE-NEE-SPHERE.** Mode R's fire light sampling integrated only to the scene's bounding sphere,
+  which a `temperature` grid wider than the medium's `density` bound reaches past; vertices whose
+  only strategy that is (diffuse, fiber, medium) lost the rest of the fire. It runs to the box exit
+  now (`tools/check_fire_r.py`, case 4).
+- **FIRE-NEE-FIBER-TMIN.** The fire integral from a fiber gave the strand's exit clearance to the
+  first stratum's shadow query only, so a later stratum starting inside the tube hit the strand's
+  own far wall. Each sub-segment gets what is left of the clearance.
+- **GPU-SPLIT-FIBER-TMIN.** On the device, a split's sub-paths at a fiber (mode W, `-herosplit`)
+  left the strand without the clearance the hero gets: the origin moved by the whole exit distance
+  (the GPU-FUR-TUNNEL form) and the sub-path traced with tmin 0. **GPU-STALE-TMIN.** Both device
+  mode-R loops cleared the clearance only before a material interaction, so after a fiber the next
+  hops that left by another branch (an inline diffuse, a mirror, a medium scatter) reused it: tmin 0
+  and strands skipped. It is spent at the trace that uses it now.
+- **LOCK-DARK-FRAME.** The image writer stored its no-signal fallback (exposure 1) as a path's
+  locked anchor -- the rule the meter lost in 0.377.1 -- so a `-no-meter` path whose first frame was
+  nearly black locked every frame at 1 (`tools/check_meter_dark.py`, second case).
+- **CAM-SPECTRUM-COST.** `finalizeCameraSpectrum` evaluated every emitter's spectrum per bin for
+  each sampler it built (two or three, plus one per fluorescent dye), twice per load. g is tabulated
+  once by `finalizeEmitters` now, and the samplers read the table (bit-identical).
+- Dead code and stale comments: `fireConeSample`'s pdf output, `neeVolume` (removed in 0.377.1)
+  named as a sharer, the fluorescence fallback named as `emitSampler`.
+- **STRIP-OTHER.** Under `-on-unsupported strip`, a camera with no fallback (a lens camera in mode R,
+  a fire beside a GRIN medium) whose feature another camera's strip removed was judged on the scene
+  before the strips: it said it could not strip and "fell back" to its own mode. It is re-judged
+  after them (`tools/check_fire_modes.py`, case 12).
+- **AMBIENT-FIRE.** Mode W's `-ambient` (and `-gi-clamp`) scale, `Scene::ambientRef`, counted the
+  emitters alone, so in a fire-lit scene it was zero (nothing added, without a word) or
+  mis-scaled. A fire counts as a light of geometric weight 4 pi V^(2/3), normalised by `camG`
+  (`tools/check_fire_modes.py`, case 13).
+- `EmissionSampler::pdfAt` returned the last bin's density above the range, against its contract.
+- The fiber medulla's bundle collapse (mode D) still retinted every secondary it then discarded.
+- `clipBox` repeated `Medium::clipToBounds`' box clip: both use `clipRayBox` (`geometry.h`).
+- Seven copies of the tile verdict in the check scripts are `tile_verdict` / `tile_summary`
+  beside `tile_stats` in `tools/check_glossy_nee_media.py`.
+
+Dismissed: `stripFixes` copying `Scene::media` per camera (Fable) -- a Medium's grids, majorant and
+rainbow table are shared pointers and GRIN's `ior` is a compiled pattern program, so the copy is a
+few small vectors; the hand-kept glossy MIS record at the split (Fable), which is
+GMIS-NULL-BY-HAND, already tracked; and a medium counting as a fire with no fire registered, for a
+`temperature` grid with no voxel above 0 (Fable) -- the loader already refuses such a grid
+(`loadVdbGrid`: "empty grid"), so that state needs a positive voxel whose emission the 20000-point
+estimate in `finalizeEmissiveVolumes` missed entirely. (That a cold frame of an animated fire
+fails to load, rather than rendering as smoke, is the loader's choice and was left alone.)
+
+Deferred, as their own entries: FIRE-NEE-STRATA-COST and SLAB-DDA-COPIES.
+
+## OPEN (2026-10-13, to investigate): STUBBLE-DEVICE-UNDERSIDE — mode W on a stubble coat, device vs host, 9.6 % apart in its dark underside
+
+`tools/check_modew_fiber.py`'s fur ball with the coat cut to stubble (count 60000, length 0.006,
+radius 0.0012) and the camera moved in to 0.2 m, mode W at 16 spp (deterministic on both): the
+frame agrees (x1.0030), but the bottom tiles -- the coat's shadowed underside, a sixth as bright
+as its top -- read x1.034 and x1.096 on the device, 348 of 6912 pixels more than 20 % apart. The
+same with 0.377.2 and 0.377.3, so not the 0.377.3 fiber-clearance fixes. Could be no more than
+FP32 strand hits on thin, close geometry amplified in a dark tile, or a real difference in how the
+device treats the strands' roots in shadow. Reproduce: `STUBBLE=1 python
+scraps/face/furball_dev.py <exe> <tag>` (scratch, git-ignored; the edit is two replacements in
+the SCENE list).
+
+## OPEN (2026-10-13): BDPT-LAST-DEPTH — mode D under-weights every path of exactly the maximum depth
+
+`BdptRenderer::renderRows` (and the device's `kBdptT`) generate the camera subpath with
+`maxDepth + 1` vertices -- the camera and `maxDepth` scene vertices -- where PBRT, whose structure
+this follows, generates `maxDepth + 2`. The light subpath's `maxDepth + 1` matches. So a path of
+depth exactly `maxDepth` can be made by every strategy but s = 0 (the eye walk landing on the light
+needs `maxDepth + 2` eye vertices), while `misWeight` still counts s = 0 in every such path's
+denominator: those paths lose the s = 0 share of their weight. Only the last bounce is affected,
+so a render with a generous `maxDepth` barely shows it, but it is a bias, and it is an asymmetry
+between what is sampled and what is weighted. Fix: `maxDepth + 2` for the camera subpath on both
+backends (the device's `BDPT_MAXV` already has slack for it), with a check that renders a scene
+at a small `maxDepth` (2 or 3) in mode D against mode R at the same depth.
+
+## OPEN (2026-10-13, performance): FIRE-NEE-STRATA-COST — one fire light sample costs up to 32 traversals
+
+Mode R's `fireNee` integrates the fire along its direction at up to 32 stratified points
+(`fireSegment`), and takes the transmittance to each as a product of per-sub-segment estimates:
+one `scene.shadowTransmittance` BVH traversal (`FireVis::Strands`) and one restarted ratio-tracking
+walk through every medium per stratum. An area light's sample costs one shadow ray. The same
+unbiased estimate needs one traversal to the box exit that records the first opaque hit and the
+strand crossings (each with its distance), and one ratio-tracking walk that reports T as it passes
+each stratum point (`mediumTransmittance` would gain a "T at these sorted distances" form). Not yet
+measured how much of a fire scene's render time this is.
+
+## OPEN (2026-10-13, tech debt): SLAB-DDA-COPIES — the box clip and the grid walk are written out several times
+
+`clipRayBox` (`geometry.h`, 0.377.3) is the ray-box slab clip of a medium's box bound and of the
+fires; three more copies remain in the fur code -- `FurVolume::entryDist` and
+`FurVolume::sampleFlight` (`fur_volume.h`) and `FurGrid`'s march (`fur_grid.h`) -- with a 1e-15
+parallel-axis epsilon where `clipRayBox` has 1e-12. The Amanatides-Woo cell walk exists three times
+(`firePointPdf`, `sampleFlight`, the march), each with its own per-cell action; one cell-walk
+template taking the per-cell action would serve all three. The fur renders should be checked
+bit-for-bit when the epsilons are unified.
+
 ## OPEN (2026-10-12; mode R done in 0.375.0): SPECTRAL-BUNDLE — media and fibers rendered at one wavelength per path
 
 **Seen** on gallery_rain's flyby frame `fly0248`, Alice2's hair large in frame: rainbow speckle

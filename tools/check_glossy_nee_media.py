@@ -98,6 +98,26 @@ def tile_stats(a, b, n=4):
     return m, e
 
 
+def tile_verdict(x1, x0, rel, z_max=5.0):
+    """Compare two tile_stats (mean, standard error) pairs: the ratio x1 / x0 per tile, the
+    z-scores (0 on a tile under 2 % of x0's brightest, too dark to carry information), and the
+    failing tiles -- those that differ by more than `z_max` standard errors AND by more than
+    `rel` of x0."""
+    (m1, e1), (m0, e0) = x1, x0
+    z = np.abs(m1 - m0) / np.maximum(np.hypot(e1, e0), 1e-30)
+    ratio = m1 / np.maximum(m0, 1e-30)
+    live = m0 > 0.02 * m0.max()
+    return ratio, np.where(live, z, 0.0), live & (z > z_max) & (np.abs(ratio - 1.0) > rel)
+
+
+def tile_summary(x1, x0, rel, z_max=5.0):
+    """tile_verdict as one line's worth: whether no tile fails, the frame ratio x1 / x0, and the
+    worst tile's ratio and z-score."""
+    ratio, z, bad = tile_verdict(x1, x0, rel, z_max)
+    i, j = np.unravel_index(int(np.argmax(z)), z.shape)
+    return (not bad.any()), x1[0].sum() / x0[0].sum(), ratio[i, j], z[i, j]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split(NL)[0])
     ap.add_argument("--out", default=os.path.join(ROOT, "png", "check_glossy_nee_media"))
@@ -139,18 +159,10 @@ def main():
                         raise SystemExit("render failed: " + " ".join(cmd))
                     imgs.append(read_pfm(pfm).sum(-1))
                 stats[flag] = tile_stats(imgs[0], imgs[1])
-            (m1, e1), (m0, e0) = stats["on"], stats["off"]
-            z = np.abs(m1 - m0) / np.maximum(np.hypot(e1, e0), 1e-30)
-            ratio = m1 / np.maximum(m0, 1e-30)
-            live = m0 > 0.02 * m0.max()          # tiles this dark carry no information
-            bad = live & (z > 5.0) & (np.abs(ratio - 1.0) > 0.01)
-            good = not bad.any()
+            good, frame, worst, zw = tile_summary(stats["on"], stats["off"], 0.01)
             ok &= good
-            zl = np.where(live, z, 0.0)
-            i, j = np.unravel_index(int(np.argmax(zl)), zl.shape)
             print("%s: %s heroc %d: glossy NEE on / off, frame x%.4f; worst tile x%.4f (%.1f sigma)"
-                  % ("ok" if good else "FAIL", name, heroc, m1.sum() / m0.sum(), ratio[i, j],
-                     zl[i, j]), flush=True)
+                  % ("ok" if good else "FAIL", name, heroc, frame, worst, zw), flush=True)
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

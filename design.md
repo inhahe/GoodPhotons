@@ -3727,7 +3727,10 @@ as the one at fault.
   which gives every wavelength a fully saturated spectral colour of equal weight, measured 0.20.
   x̄ + ȳ + z̄ was also the best mode-R window on the fire (0.06×) but 1.21× the chroma variance
   under the triphosphor lamp. `FTRACE_CAM_VIS=0` makes both camera samplers copies of
-  `camSampler` (`tools/check_cam_vis.py`). The other spectral modes (D, J, M, S) still draw by
+  `camSampler` (`tools/check_cam_vis.py`). Every sampler `finalizeCameraSpectrum` builds (and the
+  fluorescent dyes' excitation samplers) reads g off `Scene::emitGTab`, the emitters' g at the
+  bin centres that `finalizeEmitters` tabulates once, plus the fires' `fireG`: no emitter's
+  spectrum is evaluated per sampler. The other spectral modes (D, J, M, S) still draw by
   `emitSampler` alone; the same film-side reweighting would serve them.
 
   **Spectral MIS and media (0.375.0, known-issues SPECTRAL-BUNDLE).** Two vertices sample a

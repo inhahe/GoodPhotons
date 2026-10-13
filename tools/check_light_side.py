@@ -27,7 +27,7 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
-from check_glossy_nee_media import read_pfm, tile_stats  # noqa: E402
+from check_glossy_nee_media import read_pfm, tile_stats, tile_verdict  # noqa: E402
 
 NL = chr(10)
 BASE = [
@@ -40,15 +40,6 @@ LAMPS = {
     "against": 'light area { origin -0.8 0.3 2.8  u 1.6 0 0  v 0 0.8 0  normal 0 0 -1  power 400  spd preset:d65 }',
     "with":    'light area { origin -0.8 0.3 2.8  u 0 0.8 0  v 1.6 0 0  normal 0 0 -1  power 400  spd preset:d65 }',
 }
-
-
-def cells(x1, x0, rel):
-    """Ratio, z-scores and failing cells of two tile_stats (mean, standard error) pairs."""
-    (m1, e1), (m0, e0) = x1, x0
-    z = np.abs(m1 - m0) / np.maximum(np.hypot(e1, e0), 1e-30)
-    ratio = m1 / np.maximum(m0, 1e-30)
-    live = m0 > 0.02 * m0.max()
-    return ratio, np.where(live, z, 0.0), live & (z > 5.0) & (np.abs(ratio - 1.0) > rel)
 
 
 def main():
@@ -87,8 +78,8 @@ def main():
     ok = True
     for label, tag, args in cases:
         x1, x0 = render("against", tag, args), render("with", tag, args)
-        ratio, z, bad = cells(tile_stats(*x1), tile_stats(*x0), 0.02)
-        fr, fz, fbad = cells(tile_stats(*x1, 1), tile_stats(*x0, 1), 0.01)
+        ratio, z, bad = tile_verdict(tile_stats(*x1), tile_stats(*x0), 0.02)
+        fr, fz, fbad = tile_verdict(tile_stats(*x1, 1), tile_stats(*x0, 1), 0.01)
         good = not bad.any() and not fbad.any()
         ok &= good
         i, j = np.unravel_index(int(np.argmax(z)), z.shape)

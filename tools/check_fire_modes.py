@@ -24,7 +24,15 @@ scene as if the fire were cold smoke, without a word -- black, when the fire was
   9. a fisheye camera in mode A (one rectilinear thin lens) falls back under `fallback`, and the
      refusal's advice names only the modes that render it, B and R;
  10. a prefer{} branch whose lens camera cannot render -- routed to R, which refuses a fire
-     beside a GRIN medium -- yields to the else{} branch, rather than being kept and aborting.
+     beside a GRIN medium -- yields to the else{} branch, rather than being kept and aborting;
+ 11. `-no-media` drops the fire with the medium it is made of: mode R renders the scene black
+     (its only light gone), where until 0.377.3 the fire's sampling still indexed the dropped
+     medium (undefined behaviour: a crash, or the fire drawn from freed memory);
+ 12. under `strip`, a lens camera in mode R that cannot render a fire beside a GRIN medium, and
+     has no fallback, renders in mode R once a mode-M camera's strip has removed the fire -- and
+     says so; until 0.377.3 it reported that it could not strip, and fell back to R;
+ 13. mode W's `-ambient` fills a floor the fire alone lights (its scale counts the fire as a
+     light); until 0.377.3 it was zero there, so `-ambient 0.3` changed nothing.
 (Mode C is left out: its physical catch through the aperture almost never sees a fire this
 small at a test budget.) Exits 1 on any failure.
 """
@@ -99,6 +107,16 @@ def main():
                           '}',
                           'medium { bounds { center 3 0.5 3  radius 0.2 }  sigma_t 0.1  albedo 0.5  '
                           'ior "1.0" }'],
+        # The fire over a diffuse floor.
+        "firefloor.ftsl": ['camera "cam" { %s }' % view,
+                           'material "floor" { type diffuse  reflect 0.6 }',
+                           'quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material floor }'],
+        # The same GRIN medium; the lens camera has no fallback, the mode-M one strips the fire.
+        "firestrip.ftsl": ['camera "a" { %s  mode R  lens { preset achromat  focal 50  fstop 2.8 } }'
+                           % view,
+                           'camera "m" { %s  mode M }' % view,
+                           'medium { bounds { center 3 0.5 3  radius 0.2 }  sigma_t 0.1  albedo 0.5  '
+                           'ior "1.0" }'],
     }
     for name, cams in scenes.items():
         with open(os.path.join(d, name), "w", encoding="utf-8", newline="") as f:
@@ -128,6 +146,11 @@ def main():
         ok &= good
         print("%s: mode %s refuses it (exit %d%s)" % ("ok" if good else "FAIL", m, rc,
               "" if good else ("; image mean %s" % mean)))
+    rc, log, mean = run("nomedia", ["-mode", "R", "-no-media"])
+    good = rc == 0 and mean is not None and mean == 0.0
+    ok &= good
+    print("%s: -no-media drops the fire with its medium (exit %d, mean %s)" % (
+        "ok" if good else "FAIL", rc, mean))
     rc, log, mean = run("fallback", ["-mode", "D", "-on-unsupported", "fallback"])
     good = rc == 0 and "-> mode R" in log and mean is not None and mean > 0.0
     ok &= good
@@ -183,6 +206,21 @@ def main():
     ok &= good
     print("%s: a prefer branch whose lens camera cannot render yields to else (exit %d, mean %s)"
           % ("ok" if good else "FAIL", rc, mean))
+    rc, log, _ = run("stripother", ["-on-unsupported", "strip"], scene="firestrip.ftsl",
+                     out="stripother_a")
+    good = (rc == 0 and "camera 'a': volumetric emission" in log and
+            "stripped for the other cameras; rendering in mode R" in log and "cannot strip" not in log)
+    ok &= good
+    print("%s: a camera the other cameras' strips made renderable says so (exit %d)" % (
+        "ok" if good else "FAIL", rc))
+    if not good:
+        print(log[-1200:])
+    rc0, _, m0 = run("amb0", ["-mode", "W"], scene="firefloor.ftsl")
+    rc1, _, m1 = run("amb3", ["-mode", "W", "-ambient", "0.3"], scene="firefloor.ftsl")
+    good = rc0 == 0 and rc1 == 0 and m0 and m1 and m1 > 1.05 * m0
+    ok &= good
+    print("%s: -ambient fills a fire-lit floor in mode W (means %s -> %s)" % (
+        "ok" if good else "FAIL", m0, m1))
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

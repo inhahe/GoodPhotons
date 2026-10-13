@@ -1542,8 +1542,8 @@ struct BackwardRenderer {
     // albedo * phase * emitted spectrum -- the measure (solid angle, or area over distance
     // squared), a spot's falloff, an emission pattern, and the shadow ray's survival through
     // transparent fibers and through the media (mediaTr at `lambda`: a bundle passes its hero,
-    // its media being flat in λ). Shared by neeVolume and neeVolumeHero, so the two keep one rng
-    // order and one geometry.
+    // its media being flat in λ). neeVolumeHero's, for the bundle and (at nUp == 1) the scalar path
+    // alike.
     bool volumeEmitterGeom(const Scene& scene, const Emitter& em, const Vec3& p, double lambda,
                            Pcg32& rng, Vec3& wi, double& geom) const {
         if (em.collimated) return false;                  // beams aren't area-samplable
@@ -1893,24 +1893,6 @@ struct BackwardRenderer {
     // fire -- soot scattering its own glow -- which is why a point drawn here only sets the
     // DIRECTION (the integral along it is the estimate) and the cone stays in the mixture.
 
-    // Slab clip of o + t d, t in [t0, t1], to the box [lo, hi]; false when they miss.
-    static bool clipBox(const Vec3& lo, const Vec3& hi, const Vec3& o, const Vec3& d,
-                        double t0, double t1, double& ta, double& tb) {
-        for (int a = 0; a < 3; ++a) {
-            const double oa = (&o.x)[a], da = (&d.x)[a];
-            if (std::fabs(da) < 1e-12) {
-                if (oa < (&lo.x)[a] || oa > (&hi.x)[a]) return false;
-                continue;
-            }
-            double s0 = ((&lo.x)[a] - oa) / da, s1 = ((&hi.x)[a] - oa) / da;
-            if (s0 > s1) std::swap(s0, s1);
-            t0 = std::max(t0, s0); t1 = std::min(t1, s1);
-            if (t0 >= t1) return false;
-        }
-        ta = t0; tb = t1;
-        return true;
-    }
-
     // FTRACE_ENV_NEE=0 does the same for the sky: no light sampling of it (neeEnv and its bundle,
     // fiber and volume twins), and every escape takes its whole radiance -- the BSDF-sampled
     // strategy alone, which must render the same image (not under -dual-scatter, whose fibers
@@ -1940,9 +1922,9 @@ struct BackwardRenderer {
                    ? scene.emissiveVolumes[(size_t)vi].power / scene.totalEmissionPower : 0.0;
     }
 
-    // The solid-angle density with which fireNee samples direction `d` (unit) from `x` for fire
-    // `v`, and the sampler itself. `oneMinusCos` is 1 - cos(theta_max) written stably, so a small
-    // distant fire keeps its digits.
+    // The solid-angle density with which the cone half of fireNee's mixture samples direction `d`
+    // (unit) from `x` for fire `v`, and the sampler itself (fireDirPdf has the mixture's density).
+    // `oneMinusCos` is 1 - cos(theta_max) written stably, so a small distant fire keeps its digits.
     static double fireConePdf(const Scene::EmissiveVolume& v, const Vec3& x, const Vec3& d) {
         const Vec3 tc = (v.bmin + v.bmax) * 0.5 - x;
         const double R2 = dot(v.bmax - v.bmin, v.bmax - v.bmin) * 0.25, d2 = dot(tc, tc);
@@ -1951,14 +1933,12 @@ struct BackwardRenderer {
         if (dot(d, tc) < cosMax * std::sqrt(d2)) return 0.0;
         return 1.0 / (2.0 * PI * (s2 / (1.0 + cosMax)));
     }
-    static Vec3 fireConeSample(const Scene::EmissiveVolume& v, const Vec3& x, double u1, double u2,
-                               double& pdf) {
+    static Vec3 fireConeSample(const Scene::EmissiveVolume& v, const Vec3& x, double u1, double u2) {
         const Vec3 tc = (v.bmin + v.bmax) * 0.5 - x;
         const double R2 = dot(v.bmax - v.bmin, v.bmax - v.bmin) * 0.25, d2 = dot(tc, tc);
         const double phi = 2.0 * PI * u2;
         if (d2 <= R2) {
             const double z = 1.0 - 2.0 * u1, r = std::sqrt(std::max(0.0, 1.0 - z * z));
-            pdf = 1.0 / (4.0 * PI);
             return Vec3(r * std::cos(phi), r * std::sin(phi), z);
         }
         const double s2 = R2 / d2, oneMinusCos = s2 / (1.0 + std::sqrt(1.0 - s2));
@@ -1966,7 +1946,6 @@ struct BackwardRenderer {
         const double cosT = 1.0 - om, sinT = std::sqrt(std::max(0.0, om * (2.0 - om)));
         const Vec3 a = tc / std::sqrt(d2);
         Vec3 t, b; onb(a, t, b);
-        pdf = 1.0 / (2.0 * PI * oneMinusCos);
         return a * cosT + t * (sinT * std::cos(phi)) + b * (sinT * std::sin(phi));
     }
 
@@ -1989,7 +1968,7 @@ struct BackwardRenderer {
     static double firePointPdf(const Scene::EmissiveVolume& v, const Vec3& x, const Vec3& d) {
         if (!(v.cellSum > 0.0)) return 0.0;
         double t0, t1;
-        if (!clipBox(v.bmin, v.bmax, x, d, 0.0, 1e300, t0, t1)) return 0.0;
+        if (!clipRayBox(v.bmin, v.bmax, x, d, 0.0, 1e300, t0, t1)) return 0.0;
         const Vec3 ext = v.bmax - v.bmin;
         const double cellVol = (ext.x / v.gres[0]) * (ext.y / v.gres[1]) * (ext.z / v.gres[2]);
         const double norm = 1.0 / (v.cellSum * cellVol);    // point density = cellW * norm
@@ -2040,7 +2019,7 @@ struct BackwardRenderer {
     // over consecutive sub-segments -- the media's (mediaTr at lam[0]: a bundle rides only grey
     // media), the aggregate coat's when `coat`, the strands' per `vis` (which also ends the
     // integral at an opaque surface) -- so the estimate is unbiased. `curveTmin0`: the hair exit
-    // offset of a ray leaving a fiber, for its first sub-segment. `absorb`: the Beer-Lambert
+    // offset of a ray leaving a fiber, measured from `o`. `absorb`: the Beer-Lambert
     // coefficient of the dielectric the segment runs inside (0 outside one; a bundle is never
     // inside one, every dielectric entry splitting or de-heroing it).
     template <class W>
@@ -2051,7 +2030,7 @@ struct BackwardRenderer {
             if (only >= 0 && vi != only) continue;
             const Scene::EmissiveVolume& v = scene.emissiveVolumes[(size_t)vi];
             double ta, tb;
-            if (!clipBox(v.bmin, v.bmax, o, d, 0.0, len, ta, tb)) continue;
+            if (!clipRayBox(v.bmin, v.bmax, o, d, 0.0, len, ta, tb)) continue;
             const double wv = w(vi);
             if (!(wv > 0.0)) continue;
             const Medium& med = scene.media[(size_t)v.mediumIndex];
@@ -2065,8 +2044,11 @@ struct BackwardRenderer {
                 const double seg = s - sPrev;
                 T *= mediaTr(scene, a, d, seg, lam[0], rng);
                 if (coat && furVol && furVol->valid()) T *= furVol->transmittance(a, d, seg);
+                // The fiber's exit clearance runs from the segment's origin, so a sub-segment
+                // that starts inside it still skips the strand it leaves.
                 if (vis == FireVis::Strands && T > 0.0)
-                    T *= scene.shadowTransmittance(a, d, seg, 1e-6, k == 0 ? curveTmin0 : 0.0);
+                    T *= scene.shadowTransmittance(a, d, seg, 1e-6,
+                                                   curveTmin0 > sPrev ? curveTmin0 - sPrev : 0.0);
                 else if (vis == FireVis::SkipHair && T > 0.0 && scene.occludedSkipHair(a, d, seg))
                     T = 0.0;
                 if (!(T > 0.0)) break;
@@ -2123,8 +2105,7 @@ struct BackwardRenderer {
             wi = dv / dl;
         } else {
             const double u1 = rng.uniform(), u2 = rng.uniform();
-            double pc = 0.0;
-            wi = fireConeSample(v, x, u1, u2, pc);
+            wi = fireConeSample(v, x, u1, u2);
         }
         const double pdfDir = fireDirPdf(v, x, wi);
         if (!(pdfDir > 0.0)) return;
@@ -2132,8 +2113,10 @@ struct BackwardRenderer {
         Ray r;
         if (!resp(wi, f, pdfB, r)) return;
         double E[hero::kHeroMax] = {0};
-        fireSegment(scene, r.o, r.d, length(scene.sceneCenter - x) + scene.sceneRadius, lam, n,
-                    coat, vis, r.curveTmin, /*absorb=*/0.0, rng, E, [](int) { return 1.0; }, vi);
+        // Unbounded: the clip to the box the fire emits in ends it, and that box can reach past the
+        // scene sphere (a `temperature` grid wider than the medium's `density` bound).
+        fireSegment(scene, r.o, r.d, 1e30, lam, n, coat, vis, r.curveTmin, /*absorb=*/0.0, rng, E,
+                    [](int) { return 1.0; }, vi);
         const double den = sel * pdfDir + (mis ? pdfB : 0.0);
         if (!(den > 0.0)) return;
         for (int i = 0; i < n; ++i)

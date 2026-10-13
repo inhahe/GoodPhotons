@@ -11804,9 +11804,11 @@ static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
         // Worth doing because this runs on every image write AND (now that the live window
         // has its own repaint cadence) several times a second during a render: at 480x480
         // the sort alone was the bulk of a ~40 ms repaint.
-        eAuto = autoExposureOf(lin);
-        if (!(eAuto > 0.0)) eAuto = 1.0;
-        if (lockAnchor) *lockAnchor = eAuto;       // first frame sets the anchor
+        // The first frame with signal sets the anchor; a near-black one (autoExposureOf 0)
+        // shows at exposure 1 but leaves the anchor unset, as the meter does.
+        const double anchor = autoExposureOf(lin);
+        eAuto = (anchor > 0.0) ? anchor : 1.0;
+        if (lockAnchor && anchor > 0.0) *lockAnchor = anchor;
     }
     exposure = eAuto * (expComp > 0.0 ? expComp : 1.0);
     }
@@ -15804,6 +15806,7 @@ static bool resolveCameraModes(Scene& scene, const std::vector<CamRequest>& cams
     for (size_t i = 0; i < n; ++i)
         why[i] = modeFeatureUnsupported(scene, cams[i].mode, cams[i].projection);
     std::vector<char> strip(n, 0);
+    int removed = 0;
     if (g_onUnsupported == OnUnsupported::Strip) {
         bool keepFire = false, keepGrin = false;
         for (;;) {
@@ -15822,7 +15825,6 @@ static bool resolveCameraModes(Scene& scene, const std::vector<CamRequest>& cams
             if (kf == keepFire && kg == keepGrin) break;
             keepFire = kf; keepGrin = kg;
         }
-        int removed = 0;
         for (size_t i = 0; i < n; ++i)
             if (strip[i]) removed |= stripFor(scene, cams[i].mode, keepFire, keepGrin);
         if (removed & STRIP_FIRE) scene.finalizeEmissiveVolumes();   // no births from a fire now gone
@@ -15834,6 +15836,13 @@ static bool resolveCameraModes(Scene& scene, const std::vector<CamRequest>& cams
         if (strip[i]) {
             std::printf("[on-unsupported=strip] camera '%s': stripped %s; rendering in mode %c "
                         "anyway.\n", c.name, why[i], c.mode);
+            continue;
+        }
+        // The strips the other cameras needed can leave this camera's scene renderable in its own
+        // mode (one that had no fallback, so kept nothing): `why` was judged before them.
+        if (removed && !modeFeatureUnsupported(scene, c.mode, c.projection)) {
+            std::printf("[on-unsupported=strip] camera '%s': %s, stripped for the other cameras; "
+                        "rendering in mode %c.\n", c.name, why[i], c.mode);
             continue;
         }
         const char fallback = fallbackModeFor(scene, c.projection, c.lens);

@@ -2982,7 +2982,9 @@ medium {
 > light from every vertex -- a direction toward the grid's box, and the emission integrated along
 > it -- and collects the emission along every ray it traces, so a fire seen through glass or in a
 > mirror shows too. An emissive volume counts as the scene's light, so a fire needs no separate
-> `light` block. A GPU mode-R render of a fire falls back to the CPU. The other modes (V, P, D, U,
+> `light` block. A `temperature` grid with no voxel above 0 (a cold frame of an animated fire)
+> emits nothing: the loader says so and the medium is plain smoke, which every mode renders. A GPU
+> mode-R render of a fire falls back to the CPU. The other modes (V, P, D, U,
 > J, M, S) do not render volumetric emission and **refuse** a scene with a fire, like any other
 > feature a mode can't render; so does mode R alongside `-dual-scatter` fur or a GRIN medium.
 > `-on-unsupported fallback` switches such a camera to mode **R** (or **B** where R refuses), and
