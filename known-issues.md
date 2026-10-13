@@ -183,8 +183,13 @@ dropped): it changes too little to verify. So mode D keeps the hero's strategy w
 
 **Still open:**
 - the GPU twin of mode R (`bkRadianceHero`), and the other modes' media gates;
-- a fiber with a DISPERSIVE index: `hair.h` takes one `eta` for all wavelengths. The MIS above
-  already handles per-λ lobes; only the material parameter is missing.
+- a fiber with a DISPERSIVE index: `hair.h` takes one `eta` for all wavelengths. The spectral MIS
+  above takes per-λ densities, but everything that builds them now assumes one index: a bundle's
+  shades share the hero's refraction geometry (`hairShadeRetint` copies `eta`, `gammaO` and the
+  roughness), and the per-lobe fold (`hairFoldFCos`, mode M's per-bin fold) re-weights the hero's
+  angular products, which a different index would change. A per-λ `eta` therefore needs
+  `makeSpectral` to take it and the fold to be gated on it (folding only where the index matches
+  the hero's), not just the material parameter.
 
 (Spectral fiber `opacity`, which every bundle NEE evaluated at one wavelength, is gone: coverage is
 geometry, one number at every wavelength, and a colour there is refused at load -- 0.375.3.)
@@ -198,6 +203,9 @@ by the GLOSSY lobe's density instead of the phase function's -- the density the 
 sky NEE used. **Measured 12 % too bright** (glossy floor under a grey fog, sky light: glossy NEE on
 / off = x1.1201, 337 sigma). Both loops now clear the record at those vertices; on / off agree to
 0.02 % (`tools/check_glossy_nee_media.py`, which fails on 0.374.7).
+**The device kept the bug until 0.377.1**: its mode-R loop (bkRadiance) never cleared the record at
+a medium scatter either -- x1.1199, 59 sigma, the host's figure exactly -- and the check was run on
+the host alone. It is cleared there now; run the check with `--device gpu` as well.
 
 ## DONE (2026-10-12, 0.375.0): COAT-SPLIT-COIN — mode R's bundle split at an iridescent coat re-drew its coins
 
@@ -248,6 +256,45 @@ tracer births fire photons uniformly over the emitting box with beta proportiona
 emission, so most births carry almost nothing (the light comes from a core far smaller than the
 box); drawing them from mode R's per-fire emission grid (EmissiveVolume::cellW) would make beta
 nearly constant.
+
+## DONE (2026-10-12, 0.377.1): GPU-FUR-TUNNEL — the device's photons and mode-M walks stepped through the skin under a coat
+
+**What.** GPU against CPU on a fur ball under a sun, mode M: the fur came out 10-20 % dark on the
+device (8-9 standard errors per tile), with a real 0.53-degree sun as with a wide one, and less
+so under an area light. Mode R agreed (the BCSDF and its light sampling are the same on both);
+mode M with the core sphere made black agreed (so the camera walk was not it); mode B disagreed
+too, up to 0.92x in tiles at 27 standard errors -- the device's FORWARD transport through fur.
+Hidden until 0.377.1 behind mode M's sun double count (HAIR-NEE), which inflated both sides.
+
+**Cause.** A fiber's continuation must clear the strand's own tube. The host (and the device's
+mode R and VCM) skip CURVE primitives within that exit distance on the next trace, from an origin
+moved off the strand by one step (`Ray::curveTmin`). The device's forward tracer
+(`interactHair`, for kTrace, traceHeroPhoton and the wavefront kernels) and its mode-M camera
+walks (dPhotonGather, dPhotonGatherSub) instead moved the ORIGIN out by the whole exit distance,
+a couple of fiber diameters -- which carries a ray leaving a strand near its root straight
+through the skin the fur grows from: it never sees the core, and fewer photons land on it.
+
+**Fix.** Those paths now carry `curveTmin` like the others (the wavefront pool gains a per-slot
+array for it). After: mode M fur 0.95-1.03x of the host within 1.1 standard errors, with and
+without the floor; mode B within 1.5; `tools/check_hair_nee_sun.py`'s device/host comparison
+passes.
+
+## OPEN (2026-10-12, tech debt): GMIS-NULL-BY-HAND — every caller keeps the glossy MIS record across a pass-through by hand
+
+A coverage pass-through (see-through fur) is no vertex, so the glossy MIS record (`GlossyMis`,
+GLOSSY-NEE) of the last real vertex must survive it. Today every caller does that itself: save
+the record, clear it before an interaction that may turn out to be a null event, and restore it
+afterwards (`gmisIn`). That triple is copied at about eleven sites: `interactMaterial`'s callers,
+three branches of `radianceHeroLoop`, `bkInteract`, two branches of `bkRadianceHeroLoop` and the
+four mode-M walks (CPU and GPU). The split-at-dispersion sub-paths were a site that missed it
+(0.377.1 fixed them by handing the record into the sub-path, `gmis0`). Any new branch that runs
+an interaction can bring the glossy -> pass-through double count back unless it remembers.
+
+**Proper fix.** Make the invariant structural: the interaction functions take the record by
+reference and clear it themselves when, and only when, they produce a real vertex (a glossy one
+then sets it), so a null event leaves it untouched with nothing for the caller to restore.
+`tools/check_glossy_nee_media.py`, `check_fur_null.py` and `check_modew_fiber.py` cover the
+behaviour to hold it to, on both devices.
 
 ## DONE (2026-10-12, 0.376.1): GPU-SPHERE-NEE-SHADOW — the device's mode R lost 84-97 % of a sphere light's direct light
 

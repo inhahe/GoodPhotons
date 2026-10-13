@@ -17,7 +17,14 @@ scene as if the fire were cold smoke, without a word -- black, when the fire was
   6. a camera with a physical lens (routed to mode R) renders the fire;
   7. an exposure-locked mode-D path under `fallback` meters in mode R, the mode it renders in:
      its anchor equals a mode-R run's (a mode that cannot see the fire meters black frames, which
-     the meter must not take for an anchor).
+     the meter must not take for an anchor);
+  8. strips are decided for the whole run: a fisheye and a rectilinear camera, both mode D, under
+     `strip`, in either order -- the fisheye one cannot be fixed by a strip and falls back to R,
+     which renders the fire, so the other must not strip it either (both images keep their fire);
+  9. a fisheye camera in mode A (one rectilinear thin lens) falls back under `fallback`, and the
+     refusal's advice names only the modes that render it, B and R;
+ 10. a prefer{} branch whose lens camera cannot render -- routed to R, which refuses a fire
+     beside a GRIN medium -- yields to the else{} branch, rather than being kept and aborting.
 (Mode C is left out: its physical catch through the aperture almost never sees a fire this
 small at a test budget.) Exits 1 on any failure.
 """
@@ -78,6 +85,20 @@ def main():
                           % view],
         "firepath.ftsl": ['camera_path "fly" { look_at 0 0.5 0  up 0 1 0  fov_y 35  mode D  frames 2',
                           '    film { res 64 48 }  key 0 0 0.5 -3  key 1 0.3 0.5 -3  exposure_lock }'],
+        "fireorder.ftsl": ['camera "f" { %s  projection fisheye  mode D }' % view,
+                           'camera "d" { %s  mode D }' % view],
+        "fireorder2.ftsl": ['camera "d" { %s  mode D }' % view,
+                            'camera "f" { %s  projection fisheye  mode D }' % view],
+        "firefish.ftsl": ['camera "cam" { %s  projection fisheye  mode A }' % view],
+        # A GRIN medium away from the view: mode R then refuses the fire beside it.
+        "firepref.ftsl": ['prefer {',
+                          '    camera "cam" { %s  mode B  lens { preset achromat  focal 50  fstop 2.8 } }'
+                          % view,
+                          '} else {',
+                          '    camera "cam" { %s  mode B }' % view,
+                          '}',
+                          'medium { bounds { center 3 0.5 3  radius 0.2 }  sigma_t 0.1  albedo 0.5  '
+                          'ior "1.0" }'],
     }
     for name, cams in scenes.items():
         with open(os.path.join(d, name), "w", encoding="utf-8", newline="") as f:
@@ -136,6 +157,32 @@ def main():
     ok &= good
     print("%s: an exposure-locked fallback path meters in mode R (anchor %s, mode R's %s)" % (
         "ok" if good else "FAIL", aF, aB))
+    for scene, tag in (("fireorder.ftsl", "order1"), ("fireorder2.ftsl", "order2")):
+        stale = os.path.join(d, tag + "_d.pfm")   # run() clears only the `out` camera's image
+        if os.path.exists(stale):
+            os.remove(stale)
+        rc, log, _ = run(tag, ["-on-unsupported", "strip"], scene=scene, out=tag + "_f")
+        mf = read_pfm_mean(os.path.join(d, tag + "_f.pfm")) if rc == 0 else None
+        md = read_pfm_mean(os.path.join(d, tag + "_d.pfm")) if rc == 0 else None
+        good = (rc == 0 and "stripped" not in log and mf is not None and md is not None and
+                mf > 0.0 and md > 0.0)
+        ok &= good
+        print("%s: strip decided for the run (%s): neither camera strips the fire the other "
+              "renders (exit %d, means f %s, d %s)" % ("ok" if good else "FAIL", tag, rc, mf, md))
+    rc, log, mean = run("fish_fb", ["-on-unsupported", "fallback"], scene="firefish.ftsl")
+    good = rc == 0 and "-> mode R" in log and mean is not None and mean > 0.0
+    ok &= good
+    print("%s: a fisheye camera in mode A falls back to R (exit %d, mean %s)" % (
+        "ok" if good else "FAIL", rc, mean))
+    rc, log, _ = run("fish_err", [], scene="firefish.ftsl")
+    good = rc != 0 and "use mode B/R," in log
+    ok &= good
+    print("%s: ...and the refusal's advice is mode B/R (exit %d)" % ("ok" if good else "FAIL", rc))
+    rc, log, mean = run("pref", [], scene="firepref.ftsl")
+    good = rc == 0 and "using branch 2 of 2" in log and mean is not None and mean > 0.0
+    ok &= good
+    print("%s: a prefer branch whose lens camera cannot render yields to else (exit %d, mean %s)"
+          % ("ok" if good else "FAIL", rc, mean))
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

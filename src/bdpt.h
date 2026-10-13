@@ -946,6 +946,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // past them; only their per-λ reflectance/transmittance differs. Those set
         // `keepBundle` to opt out of the `if (delta) nUp = 1` collapse below.
         bool delta = false, terminate = false, keepBundle = false;
+        bool collapse = false;   // a connectible vertex whose continuation goes on with the hero alone
         // THE SPECTRAL-CLAIM RULE, surface half (see the medium half above, and render.h's
         // foldWorthIt / foldApply — ONE rule, because both tracers fill the same beam bank).
         // A case that can express its wavelength dependence as a scalar ratio per bin fills
@@ -1130,24 +1131,38 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
                 betaFactor = clamp01(fv * cosLong / pdfH);
                 // Per-λ absorption means each secondary gets its OWN fiber evaluated along
-                // the hero's sampled direction: f_i*cos/pdf_hero, from the hero's lobes for one
-                // exp each (hair::fFromLobes) unless a medulla needs the full BCSDF. The bundle
+                // the hero's sampled direction: f_i*cos/pdf_hero, folded from the hero's lobes
+                // for one exp each where both fibers are solid (hairFoldFCos). The bundle
                 // survives a fiber here, as in mode R -- and a fiber is precisely where the
                 // spectral spread is interesting, since sigma_a is what colours the TT/TRT lobes.
                 secChromatic = true;
+                // A bundle that MIXES solid fibers with fibers whose medulla is live: a
+                // medulla's scattered lobes (TT^s, TRT^s) spread wide where a solid fiber's
+                // density is nearly nothing, so a wavelength carried on f_i / p_hero across
+                // that divide is heavy-tailed, and at any affordable spp reads biased (mode R
+                // weighs it with spectral MIS; this mode keeps the hero's weights). So the hero
+                // goes on alone from HERE. Two conditions keep that unbiased: the decision
+                // must not depend on WHICH member is the hero -- only on the set, so the lone
+                // hero stands in for every member alike, as at a dielectric -- and it must
+                // cover this vertex, not just its continuation: a strategy that connects at the
+                // fiber must carry the same bundle as one that continues past it, or the
+                // hero's strategy weights stop summing to one at each wavelength. (A dielectric
+                // collapses only its continuation because nothing connects to a delta vertex; a
+                // fiber is only ever on the eye side, as light subpaths stop at strands.)
+                if (!passThru && nUp > 1) {
+                    bool anySolid = !hs.b.hasMedulla, anyMedulla = hs.b.hasMedulla;
+                    for (int i = 0; i + 1 < nUp; ++i)
+                        (hairMedullaLiveAt(hs.b, *mp, hb.lam[i + 1]) ? anyMedulla : anySolid) = true;
+                    if (anySolid && anyMedulla) { collapse = true; cur.nUp = 1; }
+                }
                 for (int i = 0; i + 1 < nUp; ++i) {
                     // A pass-through is ACHROMATIC -- the ray missed the fiber, so every
                     // wavelength continues at weight 1. Re-evaluating the BCSDF here would
                     // return the coverage-scaled scatter value (0 at `opacity 0`) and
                     // extinguish the bundle at a fiber it never touched.
                     if (passThru) { secF[i] = 1.0; continue; }
-                    const double li = hb.lam[i + 1];
-                    if (la.valid)
-                        secF[i] = hs.b.opacity * hair::fFromLobes(la, hairSigmaAAt(scene, *mp, h, li),
-                                                                  hairSpecularAt(scene, *mp, h, li)) *
-                                  cosLong / pdfH;
-                    else
-                        secF[i] = hairFCos(hairAt(scene, *mp, h, li, wo), wi) / pdfH;
+                    const HairShade hsi = hairShadeRetint(scene, *mp, h, hb.lam[i + 1], hs);
+                    secF[i] = hairFoldFCos(la, hsi, wl, cosLong, nullptr) / pdfH;
                 }
                 break;
             }
@@ -1304,7 +1319,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // meaningful nUp. EXCEPTION: Mirror and Filter are delta but pick their
         // continuation without consulting λ, so they set `keepBundle` and carry the
         // secondaries through on a per-λ `secF` instead (see those cases above).
-        if (delta && !keepBundle) nUp = 1;
+        if ((delta && !keepBundle) || collapse) nUp = 1;
         // Spawn the continuation from the correct side of the geometric normal. A fiber
         // leaving on the far side has to clear the strand's own tube instead, or its TT
         // and TRT lobes immediately re-hit the hair they just left (hair_shade.h).

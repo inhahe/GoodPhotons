@@ -46,6 +46,10 @@ Consequences you must know:
   reads a key called `y`, so the unknown-key check (§1.3) reports it.
 - A `{` after a value opens a nested block whose *type* is the preceding word (or the
   statement key if none): `film { … }`, `table { … }`, `coat { … }`, `lens { … }`.
+- A slot that takes ONE number (`eta`, `opacity`, `beta_m`, …) refuses anything else that is
+  not a record or material property it can read (`gold.roughness`, §7): until 0.377.1 a stray
+  word read as 0 there, or as its leading digits (`3x` as 3), and 0 is a quiet, plausible
+  value -- `opacity` made the fur vanish.
 
 ### 1.2 Top-level block syntax
 
@@ -105,11 +109,13 @@ Rules:
 - `else` chains **flat**: `prefer { A } else { B } else { C }`. A branch may **not**
   contain a nested `prefer` (the parser errors).
 - Each branch must have at least one block.
-- Only **cameras** and **media** carry mode-support constraints today — GRIN media
-  (`medium … { ior … }`) and non-rectilinear cameras (`projection fisheye/…`) are the
-  features rejected by the bidirectional modes (`D` BDPT, `U` VCM). The support test
-  wraps `bdptUnsupportedFeature` / the fisheye/media checks; everything else always
-  builds.
+- Only **cameras** and **media** carry mode-support constraints today: GRIN media
+  (`medium … { ior … }`), which the bidirectional modes (`D`, `J`, `U`) refuse;
+  non-rectilinear cameras (`projection fisheye/…`), which `A`, `C`, `D`, `J` and `U` refuse;
+  and volumetric emission (a `temperature` medium, "fire"), which only `A`, `B`, `C` and `R`
+  render (REFERENCE.md, `-on-unsupported`, has the whole table). A camera with a physical
+  `lens` is judged in the mode it will render in -- `R`, `D` or `J`, as the run routes it.
+  Everything else always builds.
 - Resolution distinguishes a branch that **builds but can't be rendered** by the active
   mode from one that **fails to build** (an authoring error — unknown material, missing
   texture, mistyped glass). Only the former is a usable fallback: when no branch is

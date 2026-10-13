@@ -2928,6 +2928,14 @@ private:
                 return mp.scalar;
             }
         }
+        // Anything else must BE a number: strtod would read a stray word as 0 (or as its numeric
+        // prefix), and 0 is a silent, plausible value in most slots -- `opacity` would make the
+        // fur vanish.
+        if (!isNumber(w0)) {
+            fail(std::string("`") + key + " " + w0 + "`: '" + key + "' takes a number, and '" + w0 +
+                 "' is neither a number nor a record or material property this slot can read");
+            return dflt;
+        }
         return num(w0);
     }
 

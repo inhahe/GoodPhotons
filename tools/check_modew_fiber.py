@@ -11,7 +11,14 @@ saturated hue per pass.
 
 Renders a close-up of a fur ball (pale fur filling most of the frame) in mode W at 1 spp and at 64
 spp and requires the frame's mean chromaticity (r and b over r+g+b) to agree within 0.05 (a
-de-heroed fiber is off by 0.25; eight wavelengths at 1 spp leave ~0.02). Exits 1 on failure.
+de-heroed fiber is off by 0.25; eight wavelengths at 1 spp leave ~0.02).
+
+Then the device against the host, both deterministic: a lamp seen in a glossy floor through a cloud
+of `opacity 0.3` fur, mode W on the GPU and the CPU, the frame within 1 % and every tile of a 4 x 4
+grid within 3 %. Mode W runs direct-only, which ends a path at a fiber -- but only for light the
+fiber intercepted; the device ended it at every fiber, so the light behind see-through fur went
+black there (0.78x and, without glossy light sampling, 0.22x of the host before 0.377.1).
+`--no-gpu` skips it. Exits 1 on failure.
 """
 import argparse
 import os
@@ -36,6 +43,20 @@ SCENE = [
 ]
 
 
+# A lamp seen in a glossy floor through see-through fur (the device/host comparison).
+SEE_THROUGH = [
+    'scene { units meters }',
+    'camera "c" { eye 0 0.3 -1  look_at 0 0.05 0.6  up 0 1 0  fov_y 40  film { res 96 72 } }',
+    'material "floor" { type glossy  reflect 0.8  roughness 0.08 }',
+    'material "core"  { type diffuse  reflect 0.3 }',
+    'material "fur"   { type hair  reflect rgb 0.8 0.6 0.4  beta_m 0.3  beta_n 0.3  opacity 0.3 }',
+    'quad { origin -3 0 -3   u 0 0 8   v 6 0 0   material floor }',
+    'light area { origin -0.8 0.3 2.8  u 0 0.8 0  v 1.6 0 0  normal 0 0 -1  power 400  spd preset:d65 }',
+    'sphere "ball" { center 0 0.28 1.5  radius 0.02  material core }',
+    'fur "coat" { on "ball"  material fur  count 6000  length 0.25  length_jitter 0.2  radius 0.0015  droop 0.0  jitter 0.25  seed 3 }',
+]
+
+
 def read_pfm(path):
     with open(path, "rb") as f:
         assert f.readline().strip() == b"PF"
@@ -49,6 +70,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split(NL)[0])
     ap.add_argument("--out", default=os.path.join(ROOT, "png", "check_modew_fiber"))
     ap.add_argument("--exe", default=os.path.join(ROOT, "ftrace.exe"))
+    ap.add_argument("--no-gpu", action="store_true")
     a = ap.parse_args()
     a.exe = os.path.abspath(a.exe)
     out = os.path.abspath(a.out)
@@ -72,6 +94,31 @@ def main():
     ok = d < 0.05
     print("%s: mode W fur chromaticity, 1 spp (r %.3f b %.3f) vs 64 spp (r %.3f b %.3f): off by %.3f"
           % ("ok" if ok else "FAIL", chroma[1][0], chroma[1][2], chroma[64][0], chroma[64][2], d))
+    if not a.no_gpu:
+        see = os.path.join(out, "seethrough.ftsl")
+        with open(see, "w", encoding="utf-8", newline="") as f:
+            f.write(NL.join(SEE_THROUGH) + NL)
+        img = {}
+        for dev in ("cpu", "gpu"):
+            png = os.path.join(out, "see_%s.png" % dev)
+            cmd = [a.exe, "-in", see, "-mode", "W", "-device", dev, "-spp", "16", "-hdr",
+                   "-no-meter", "-o", png]
+            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            pfm = png[:-4] + ".pfm"
+            if r.returncode != 0 or not os.path.exists(pfm):
+                print(r.stdout[-1500:], r.stderr[-1500:])
+                raise SystemExit("render failed: " + " ".join(cmd))
+            img[dev] = read_pfm(pfm).sum(-1)
+        h, w = img["cpu"].shape
+        t = {k: np.array([[v[h * i // 4:h * (i + 1) // 4, w * j // 4:w * (j + 1) // 4].mean()
+                           for j in range(4)] for i in range(4)]) for k, v in img.items()}
+        live = t["cpu"] > 0.02 * t["cpu"].max()
+        worst = float(np.max(np.where(live, np.abs(t["gpu"] / np.maximum(t["cpu"], 1e-30) - 1.0), 0.0)))
+        frame = float(img["gpu"].mean() / max(img["cpu"].mean(), 1e-30))
+        good = abs(frame - 1.0) <= 0.01 and worst <= 0.03
+        ok &= good
+        print("%s: mode W through see-through fur, device / host: frame x%.4f, worst tile off by "
+              "%.2f %%" % ("ok" if good else "FAIL", frame, 100.0 * worst))
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

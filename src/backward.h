@@ -31,7 +31,7 @@
 // WHOLE `scene.media` vector is superposed exactly as the forward tracer does it —
 // bounds, heterogeneous density fields and per-medium phase functions included (see
 // BackwardRenderer::mediaTr). Camera and scattered rays sample the volume free flight,
-// and volume vertices do phase-function NEE to the light (neeVolume). So -fog CAN be
+// and volume vertices do phase-function NEE to the light (neeVolumeHero). So -fog CAN be
 // combined with modes R/V, which is how the forward fog transport is cross-validated.
 // Emission is added only when a light is reached via the camera ray or a
 // specular/near-specular bounce; diffuse arrivals are covered by NEE (no double
@@ -1298,15 +1298,17 @@ struct BackwardRenderer {
     // that response is divided out here and re-applied per wavelength. The ratio is exactly the
     // lobe attenuation's, because `lobeAngular` fixes the angular half for this connection's
     // (wo, wi) and `fFromLobes` re-evaluates at any absorption -- the angular terms cancel
-    // identically. Returns false if the fiber cannot be factorised that way (a medulla) or if the
-    // camera-wavelength response is too small to divide by, and the caller falls back to scalar.
+    // identically. Returns false if the fiber cannot be factorised that way -- it has a medulla
+    // (kappa > 0), whose liveness varies with the wavelength -- and the caller falls back to
+    // scalar. The test is the material's, not the camera wavelength's: choosing between two
+    // estimators by a property of the random wavelength would weight them unevenly across it.
     // `sigBins` (optional) is the fiber's absorption already tabulated at `lam` -- the caller owns
     // that cache because the grid type lives above this header. Null means invert per bin.
     bool neeLightSpecHair(const Scene& scene, const Hit& h, const Material& m, const HairShade& hs,
                           const double* lam, const double* thrRatio, int K, double dLam,
                           double lambdaCam, double thrScalar, const double* sigBins,
                           Pcg32& rng, double* xyz) const {
-        if (hs.b.hasMedulla) return false;
+        if (hs.b.kappa > 0.0) return false;
         const Vec3 ngo = orientedGeoN(h);
         const bool med = !scene.media.empty();
         const double sigCam = hairSigmaAAt(scene, m, h, lambdaCam);
@@ -1327,7 +1329,7 @@ struct BackwardRenderer {
             // The angular half of the BCSDF for THIS connection, once.
             hair::LobeAngular la;
             if (!hair::lobeAngular(hs.b, hs.woLocal, hair::toLocal(hs.fr, wiConn), la)) return false;
-            const double fCam = hair::fFromLobes(la, sigCam, hairSpecularAt(scene, m, h, lambdaCam));
+            const double fCam = hair::fFromLobes(la, sigCam, hairSpecularFrom(m, lambdaCam, hs.specPat));
             if (!(fCam > 1e-300)) continue;      // nothing to divide out; this sample contributes ~0
             double Tr[64];
             const int KK = (K < 64) ? K : 64;
@@ -1339,7 +1341,7 @@ struct BackwardRenderer {
             if (!(gWeight > 0.0)) continue;
             for (int k = 0; k < KK; ++k) {
                 const double sig = sigBins ? sigBins[k] : hairSigmaAAt(scene, m, h, lam[k]);
-                const double resp = hair::fFromLobes(la, sig, hairSpecularAt(scene, m, h, lam[k]))
+                const double resp = hair::fFromLobes(la, sig, hairSpecularFrom(m, lam[k], hs.specPat))
                                     / fCam;                     // the angular half cancels
                 if (!(resp > 0.0)) continue;
                 const double v = gWeight * thrRatio[k] * resp * em.spdFn(lam[k]) * Tr[k];
@@ -1605,41 +1607,6 @@ struct BackwardRenderer {
         return geom > 0.0;
     }
 
-    double neeVolume(const Scene& scene, const Medium& med, const Vec3& p, const Vec3& wIn,
-                     double lambda, double invPdfLambda, Pcg32& rng,
-                     const SpdCache* spdCache = nullptr) const {
-        double total = 0.0;
-        const bool cached = spdCache && spdCache->matches(&lambda, 1);
-        const double albedo = med.albedo(lambda);
-        // A fog vertex has no normal, so the tree's receiver-cosine bound is skipped.
-        const EmitterDraw draw = pickEmitters(scene, p, nullptr, rng);
-        for (int di = 0; di < draw.n; ++di) {
-            const int e = draw.emitter(di);
-            const double selW = draw.weight(di);
-            if (selW <= 0.0) continue;
-            const Emitter& em = scene.emitters[e];
-            Vec3 wi;
-            double geom = 0.0;
-            if (!volumeEmitterGeom(scene, em, p, lambda, rng, wi, geom)) continue;
-            const double emitW = (cached ? spdCache->at(e, 0) : em.spdFn(lambda)) * invPdfLambda;
-            // selW == 1 on the exact all-emitters path
-            total += albedo * med.phaseValue(dot(wIn, wi), lambda) * emitW * geom * selW;
-        }
-        // The fire, as one more light (fireNee) -- the vertex may sit inside it.
-        if (!scene.emissiveVolumes.empty()) {
-            const double one = 1.0;
-            fireNee(scene, p, &lambda, 1, &one, &invPdfLambda, &total, /*mis=*/false,
-                    /*coat=*/false, FireVis::Strands, rng,
-                    [&](const Vec3& wi, double* f, double& pdfB, Ray& r) {
-                        f[0] = albedo * med.phaseValue(dot(wIn, wi), lambda);
-                        pdfB = 0.0;
-                        r = Ray{p + wi * 1e-6, wi};
-                        return true;
-                    });
-        }
-        return total;
-    }
-
     // Environment next-event estimation at a diffuse surface vertex. Importance-
     // samples a direction from the env map's luminance CDF (a uniform sphere
     // direction for a constant env), connects with a shadow ray out past the scene
@@ -1790,10 +1757,11 @@ struct BackwardRenderer {
 
     // Hero-bundle NEE at a FIBER vertex (SPECTRAL-BUNDLE). One emitter draw and one shadow ray per
     // sample, as neeLight's; the fiber's response is applied per wavelength from that
-    // wavelength's own BCSDF `hs[i]`, since a fiber's colour -- and with a dispersive index, its
-    // lobes -- differ across the bundle. An area light or the sun is reached from a fiber by this
-    // connection alone (a continuation after a fiber does not count an emitter it hits), so
-    // there is no MIS weight here, as in the scalar twin.
+    // wavelength's own BCSDF `hs[i]`, since a fiber's colour differs across the bundle. Its
+    // refraction does not: the bundle's shades share the hero's (one `eta`), which the per-lobe
+    // fold relies on (known-issues, the dispersive-index item). An area light or the sun is
+    // reached from a fiber by this connection alone (a continuation after a fiber does not count
+    // an emitter it hits), so there is no MIS weight here, as in the scalar twin.
     void neeLightHeroHair(const Scene& scene, const Hit& h, const HairShade* hs, double* L,
                           const double* thr, const double* lam, const double* invPdf, int nUp,
                           Pcg32& rng, const SpdCache* spdCache) const {
@@ -1888,7 +1856,7 @@ struct BackwardRenderer {
     // BRDF/cosine is replaced by the single-scattering albedo and the phase
     // function (which is also the pdf used for the MIS weight against the phase-
     // sampled continuation). Only invoked when the scene has an env light.
-    // `med` is the scattering medium (see neeVolume); the transmittance is over all.
+    // `med` is the scattering medium (see neeVolumeHero); the transmittance is over all.
     double neeEnvVolume(const Scene& scene, const Medium& med, const Vec3& p, const Vec3& wIn,
                         double lambda, double invPdfLambda, Pcg32& rng) const {
         if (!envNeeOn()) return 0.0;        // FTRACE_ENV_NEE=0: the escape alone
@@ -2172,8 +2140,9 @@ struct BackwardRenderer {
             if (thr[i] > 0.0 && f[i] > 0.0 && E[i] > 0.0) L[i] += thr[i] * invPdf[i] * f[i] * E[i] / den;
     }
 
-    // Hero-bundle NEE at a medium scattering vertex (SPECTRAL-BUNDLE): neeVolume's emitter loop
-    // and geometry (volumeEmitterGeom), one shadow ray and ONE transmittance estimate per sample
+    // NEE at a medium scattering vertex, for a hero bundle (SPECTRAL-BUNDLE) or, at nUp == 1, the
+    // scalar path's one wavelength: the emitter draw and geometry (volumeEmitterGeom), one shadow
+    // ray and ONE transmittance estimate per sample
     // -- the bundle is only in media whose extinction is flat in λ (renderRows' gate), so that
     // estimate serves every wavelength -- and the albedo, phase value and emitter spectrum per
     // wavelength. The phase is a rainbow's, whose lobes move with λ, or an HG lobe, whose do not;
@@ -2201,7 +2170,7 @@ struct BackwardRenderer {
                 L[i] += thr[i] * alb[i] * med.phaseValue(cosT, lam[i]) * spd * invPdf[i] * geom;
             }
         }
-        // The fire, as one more light (fireNee), as in neeVolume.
+        // The fire, as one more light (fireNee); the vertex may sit inside it.
         if (!scene.emissiveVolumes.empty())
             fireNee(scene, p, lam, nUp, thr, invPdf, L, /*mis=*/false, /*coat=*/false,
                     FireVis::Strands, rng,
@@ -2904,7 +2873,8 @@ struct BackwardRenderer {
                         double a = curAbsorb(lambda);
                         if (a > 0.0) thr *= std::exp(-a * tMed);
                     }
-                    L += thr * neeVolume(scene, med, p, ray.d, lambda, invPdfLambda, rng, spdCache);
+                    neeVolumeHero(scene, med, p, ray.d, &L, &thr, &lambda, &invPdfLambda, 1, rng,
+                                  spdCache);   // its one-wavelength case
                     if (scene.envIndex >= 0)   // env-NEE at the volume vertex
                         L += thr * neeEnvVolume(scene, med, p, ray.d, lambda, invPdfLambda, rng);
                     if (directOnly) return L;  // Whitted: single-scatter only, no indirect
@@ -2968,7 +2938,7 @@ struct BackwardRenderer {
                 }
                 // Directly-viewed solar disc: camera / specular arrivals only. A diffuse
                 // or volume vertex already spent its one estimator on the sun via
-                // NEE (emitterGeom / neeVolume) and sets specularArrival = false, so
+                // NEE (emitterGeom / neeVolumeHero) and sets specularArrival = false, so
                 // this is a clean single-strategy split, not a missing MIS weight.
                 if (scene.sunCount > 0 && specularArrival)
                     L += thr * sunRadianceMis(scene, gmis, ray.d, lambda) * invPdfLambda;
@@ -3111,7 +3081,8 @@ struct BackwardRenderer {
                           bool specularArrival, double contBsdfPdf, int bounce0,
                           double* Lout, Pcg32& rng, const SpdCache* spdCache,
                           GiCtx gi, bool rcTrain = false,
-                          bool firstSegSampled = false, double reentryCoatU = -1.0) const {
+                          bool firstSegSampled = false, double reentryCoatU = -1.0,
+                          const GlossyMis* gmis0 = nullptr) const {
         // `firstSegSampled`: this call RE-ENTERS a vertex its parent already reached (the
         // chromatic-coat split re-traces the segment that hit the coat), so the free flights
         // along that first segment -- the media collision and the aggregate-fur flight -- were
@@ -3147,7 +3118,9 @@ struct BackwardRenderer {
         // GLOSSY-NEE, the hero twin of radiance()'s carrier. Cleared at the top of every bounce
         // and set only by the Glossy branch, so a stale lobe density can never survive a
         // mirror, a dielectric or a de-hero'd interaction and halve the emission behind it.
-        GlossyMis gmis;
+        // `gmis0`: a split sub-path that starts past a pass-through (no vertex) carries its
+        // parent's record across it, as the parent does (gmisIn).
+        GlossyMis gmis = gmis0 ? *gmis0 : GlossyMis{};
         // Gather rays are bounce-capped (see giBounce) so a highly reflective lattice
         // cannot turn one gather direction into a 60-deep ricochet.
         const int maxB = gi.depth ? std::min(maxBounce, giBounce) : maxBounce;
@@ -3707,14 +3680,7 @@ struct BackwardRenderer {
                             double pj, fcj;
                             if (passThru)    { pj = 1.0 - hsB[j].b.opacity; fcj = pj; }
                             else if (j == 0) { pj = pdf0; fcj = f0 * cosLong; }
-                            else if (la.valid) {     // one exp per wavelength (hairBundleAt)
-                                const hair::Bcsdf& bj = hsB[j].b;
-                                pj  = bj.opacity * hair::pdfFromLobes(la, bj.sigmaA, bj.specR);
-                                fcj = bj.opacity * hair::fFromLobes(la, bj.sigmaA, bj.specR) * cosLong;
-                            } else {                 // a medulla: the full BCSDF
-                                pj  = hair::pdf(hsB[j].b, hsB[j].woLocal, wl);
-                                fcj = hair::f(hsB[j].b, hsB[j].woLocal, wl) * cosLong;
-                            }
+                            else fcj = hairFoldFCos(la, hsB[j], wl, cosLong, &pj);   // one exp, or full
                             ratio[j] = pj / pdf0;
                             g[j]     = fcj / pdf0;
                         }
@@ -3798,16 +3764,24 @@ struct BackwardRenderer {
                                 sCache.iOff = spdCache->iOff + i;
                                 sCp = &sCache;
                             }
+                            bool sNull = false;
                             if (interactMaterial(scene, m, h, mats, sRay, sLam, sInv, sThr, sL,
-                                                 sSpec, sPdf, sStk, rng, sCp, gi)) {
+                                                 sSpec, sPdf, sStk, rng, sCp, gi, nullptr,
+                                                 &sNull)) {
                                 double sub[hero::kHeroMax];
+                                // A coverage pass-through is no vertex, for a sub-path as for
+                                // the hero below: it keeps the record the hero restores
+                                // (gmisIn) and is refunded its bounce.
+                                const bool refund = sNull && nullSteps < 256;
                                 // rcTrain=true: see the sibling split above -- a sub-path
                                 // whose radiance lands in the parent's L[i] must never read
                                 // the cache, or the parent's deposits would train on it.
                                 radianceHeroLoop(scene, sRay, sStk, &sLam, &sInv, &sThr,
                                                  /*C=*/1, /*secAlive=*/false, sSpec, sPdf,
-                                                 b + 1, sub, rng, sCp, gi,
-                                                 /*rcTrain=*/true);
+                                                 refund ? b : b + 1, sub, rng, sCp, gi,
+                                                 /*rcTrain=*/true, /*firstSegSampled=*/false,
+                                                 /*reentryCoatU=*/-1.0,
+                                                 sNull ? &gmisIn : nullptr);
                                 sL += sub[0];
                             }
                             L[i] += sL;      // this wavelength's own estimate, own slot

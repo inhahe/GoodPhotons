@@ -7233,7 +7233,9 @@ static int checkHair() {
             const Vec3 wo = sphereDir(frand(), frand()), wi = sphereDir(frand(), frand());
             hair::LobeAngular la;
             const double fv = hair::f(b, wo, wi, &la), pv = hair::pdf(b, wo, wi);
-            if (!want("S12 a solid fiber's LobeAngular is not valid", la.valid)) break;
+            const bool valid = want("S12 a solid fiber's LobeAngular is not valid", la.valid);
+            ok &= valid;
+            if (!valid) break;
             const double fl = b.opacity * hair::fFromLobes(la, sigA, specR);
             const double pl = b.opacity * hair::pdfFromLobes(la, sigA, specR);
             worstF = std::max(worstF, std::fabs(fv - fl) / std::max(fv, 1e-12));
@@ -11748,6 +11750,13 @@ static double p99Luminance(const std::vector<Vec3>& lin) {
     std::nth_element(lum.begin(), lum.begin() + k, lum.end());
     return lum[k];
 }
+// The auto-exposure level a linear frame asks for: 0.9 over its p99 luminance, or 0 when it asks
+// for none (under ~1 % of the frame lit). filmToRgb8 shows such a frame at exposure 1; the meter
+// must skip it (MeterConverge drops 0) rather than lock a path at 1.
+static double autoExposureOf(const std::vector<Vec3>& lin) {
+    const double p99 = p99Luminance(lin);
+    return (p99 > 0) ? 0.9 / p99 : 0.0;
+}
 // An ABSOLUTE-exposure frame that comes out black (0.366.0). Absolute mode trusts the scene's
 // `power` / `lumens` ratings, so a rating off by orders of magnitude -- picowatts where watts
 // were meant -- quantises every pixel to 0 with nothing to say why: the PNG is black and so is
@@ -11795,8 +11804,8 @@ static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
         // Worth doing because this runs on every image write AND (now that the live window
         // has its own repaint cadence) several times a second during a render: at 480x480
         // the sort alone was the bulk of a ~40 ms repaint.
-        double p99 = p99Luminance(lin);
-        eAuto = (p99 > 0) ? 0.9 / p99 : 1.0;
+        eAuto = autoExposureOf(lin);
+        if (!(eAuto > 0.0)) eAuto = 1.0;
         if (lockAnchor) *lockAnchor = eAuto;       // first frame sets the anchor
     }
     exposure = eAuto * (expComp > 0.0 ? expComp : 1.0);
@@ -15644,8 +15653,9 @@ static bool modeFormsLensImage(char mode) { return mode == 'R' || mode == 'D' ||
 
 // Core capability check: return a reason string if `mode` cannot render `scene` with a
 // camera of the given `projection`, else nullptr. Volumetric emission restricts every mode
-// but A/B/C/R (modeRendersVolumeEmission); otherwise only the modes with real restrictions (D
-// BDPT, J UPBP, U VCM) gate anything, and the general modes (A/B/C/R/M/S/P) render everything.
+// but A/B/C/R (modeRendersVolumeEmission); A and C image through one rectilinear thin lens;
+// otherwise only the modes with real restrictions (D BDPT, J UPBP, U VCM) gate anything, and
+// the general modes (B/R/M/S/P) render everything.
 static const char* modeFeatureUnsupported(const Scene& scene, char mode, int projection) {
     if (sceneHasEmissiveMedium(scene)) {
         if (!modeRendersVolumeEmission(mode))
@@ -15661,6 +15671,11 @@ static const char* modeFeatureUnsupported(const Scene& scene, char mode, int pro
         if (mode == 'R' && grin::sceneHasGrin(scene))
             return "volumetric emission with gradient-index (GRIN) media in mode R";
     }
+    // Modes A and C form their image through one rectilinear thin lens (lensImage): a fisheye
+    // or panorama needs B's pinhole splat or R. The render path refuses it too, as a guard.
+    if ((mode == 'A' || mode == 'C') && projection != CAM_RECTILINEAR)
+        return (mode == 'A') ? "a non-rectilinear (fisheye/panoramic) camera in mode A"
+                             : "a non-rectilinear (fisheye/panoramic) camera in mode C";
     // Mode J (UPBP) is mode D's transport plus beam merging, so it inherits D's scope
     // EXACTLY — same connections, same MIS densities, same refusals. The beam half adds
     // no capability of its own: a beam map is built by the same forward photon pass mode M
@@ -15681,26 +15696,6 @@ static const char* modeFeatureUnsupported(const Scene& scene, char mode, int pro
     return nullptr;
 }
 
-// `prefer{}/else{}` predicate handed to ftsl::load: a branch is renderable iff EVERY
-// camera it declares can render the scene in its effective mode. `cliMode` (0 = none)
-// is a `-mode` override that forces the mode for all cameras.
-static const char* sceneModeUnsupported(const ftsl::Loaded& L, char cliMode) {
-    auto effOf = [&](char camMode) -> char {
-        if (cliMode) return cliMode;
-        if (camMode) return camMode;
-        return L.mode ? L.mode : 'B';
-    };
-    if (!L.cameras.empty()) {
-        for (const auto& cs : L.cameras)
-            if (const char* r = modeFeatureUnsupported(L.scene, effOf(cs.mode), cs.projection))
-                return r;
-    } else {
-        if (const char* r = modeFeatureUnsupported(L.scene, effOf(0), CAM_RECTILINEAR))
-            return r;
-    }
-    return nullptr;
-}
-
 // The mode a camera with a physical lens renders in: D and J keep the lens on their camera
 // subpath (Plan B); P, whose forward pass splats to a pinhole, goes to that lens-aware BDPT when
 // the scene is within its scope and to R otherwise; everything else goes to R.
@@ -15708,6 +15703,28 @@ static char lensRoutedMode(const Scene& scene, char mode) {
     if (modeFormsLensImage(mode)) return mode;
     if (mode == 'P') return bdptUnsupportedFeature(scene) ? 'R' : 'D';
     return 'R';
+}
+
+// `prefer{}/else{}` predicate handed to ftsl::load: a branch is renderable iff EVERY
+// camera it declares can render the scene in the mode it will render in -- its effective mode,
+// routed for a physical lens as the run loop routes it. `cliMode` (0 = none) is a `-mode`
+// override that forces the mode for all cameras.
+static const char* sceneModeUnsupported(const ftsl::Loaded& L, char cliMode) {
+    auto effOf = [&](char camMode) -> char {
+        if (cliMode) return cliMode;
+        if (camMode) return camMode;
+        return L.mode ? L.mode : 'B';
+    };
+    if (!L.cameras.empty()) {
+        for (const auto& cs : L.cameras) {
+            const char m = cs.lens ? lensRoutedMode(L.scene, effOf(cs.mode)) : effOf(cs.mode);
+            if (const char* r = modeFeatureUnsupported(L.scene, m, cs.projection)) return r;
+        }
+    } else {
+        if (const char* r = modeFeatureUnsupported(L.scene, effOf(0), CAM_RECTILINEAR))
+            return r;
+    }
+    return nullptr;
 }
 
 // The -on-unsupported fallback: the first of R (the backward reference, which renders all that
@@ -15731,10 +15748,9 @@ static std::string modesThatRender(const Scene& scene, int projection, bool lens
     return s;
 }
 
-// The mode a camera ends up rendering in, for code that must agree with the run loop without
-// re-running its policy (the exposure meter): lens routing, then the fallback if the mode still
-// cannot render the scene. Called after the run loop applied the policy, so a strip has already
-// happened and the mode it kept now renders the scene.
+// The mode a camera the run does NOT render would render in, for the exposure meter's frames
+// outside the run (a camera the run renders has resolveCameraModes' verdict): lens routing, then
+// the fallback if the mode cannot render the scene as the run's strips left it.
 static char renderedMode(const Scene& scene, char mode, int projection, bool lens) {
     if (lens) mode = lensRoutedMode(scene, mode);
     if (!modeFeatureUnsupported(scene, mode, projection)) return mode;
@@ -15744,70 +15760,109 @@ static char renderedMode(const Scene& scene, char mode, int projection, bool len
 
 // Best-effort feature stripping for `-on-unsupported strip`. Two features are strippable: GRIN
 // (clear the index field: the medium renders as a plain one) and volumetric emission (drop the
-// temperature field: the fire renders as the cold smoke it is made of). Only what `mode` cannot
-// render is stripped, and only if no camera in the run renders it -- the scene is shared by all
-// of them (`keepFire`, `keepGrin`). Mutates `scene` only if that resolves the conflict; otherwise
-// restores it and returns false, and the caller falls back instead.
-static bool stripUnsupportedFeature(Scene& scene, char mode, int projection,
-                                    bool keepFire, bool keepGrin) {
-    if (modeFeatureUnsupported(scene, mode, projection) == nullptr) return true;
-    std::vector<Medium> saved = scene.media;
-    bool any = false, fire = false;
+// temperature field: the fire renders as the cold smoke it is made of). Removes from `scene`
+// whichever of them `mode` cannot render and the run does not keep (`keepFire`, `keepGrin`).
+// Returns STRIP_GRIN / STRIP_FIRE for what it removed.
+enum { STRIP_GRIN = 1, STRIP_FIRE = 2 };
+static int stripFor(Scene& scene, char mode, bool keepFire, bool keepGrin) {
+    int removed = 0;
     if (!modeRendersGrin(mode) && !keepGrin)
-        for (auto& m : scene.media) if (m.grin()) { m.ior.clear(); m.iorStep = 0.0; any = true; }
+        for (auto& m : scene.media)
+            if (m.grin()) { m.ior.clear(); m.iorStep = 0.0; removed |= STRIP_GRIN; }
     if (!modeRendersVolumeEmission(mode) && !keepFire)
-        for (auto& m : scene.media) if (m.emissive()) { m.temperature.reset(); any = fire = true; }
-    if (any && modeFeatureUnsupported(scene, mode, projection) == nullptr) {
-        if (fire) scene.finalizeEmissiveVolumes();   // no photon births from a fire now gone
-        return true;
-    }
-    scene.media = saved;   // couldn't fully strip -> leave the scene intact
-    return false;
+        for (auto& m : scene.media)
+            if (m.emissive()) { m.temperature.reset(); removed |= STRIP_FIRE; }
+    return removed;
+}
+// Would that strip let `mode` render the scene for this camera? Tried on the media and undone.
+static bool stripFixes(Scene& scene, char mode, int projection, bool keepFire, bool keepGrin) {
+    std::vector<Medium> saved = scene.media;
+    const bool fixed = stripFor(scene, mode, keepFire, keepGrin) != 0 &&
+                       modeFeatureUnsupported(scene, mode, projection) == nullptr;
+    scene.media = std::move(saved);
+    return fixed;
 }
 
-// Apply the `-on-unsupported` policy for one camera. Returns the (possibly changed) mode; may
-// mutate `scene` (strip). `lens`: the camera has a physical lens (its mode is already routed by
-// lensRoutedMode). `keepFire` / `keepGrin`: some camera of the run renders that feature, so a
-// strip must not remove it. `proceed` is set false when the camera must not render: the Error
-// policy, or no mode renders what it needs. Prints a notice describing what happened.
-static char applyUnsupportedPolicy(Scene& scene, char mode, int projection, bool lens,
-                                   bool keepFire, bool keepGrin, const char* camName,
-                                   bool& proceed) {
-    proceed = true;
-    const char* why = modeFeatureUnsupported(scene, mode, projection);
-    if (!why) return mode;
-    const std::string ok = modesThatRender(scene, projection, lens);
-    if (g_onUnsupported == OnUnsupported::Strip &&
-        stripUnsupportedFeature(scene, mode, projection, keepFire, keepGrin)) {
-        std::printf("[on-unsupported=strip] camera '%s': stripped %s; rendering in mode %c "
-                    "anyway.\n", camName, why, mode);
-        return mode;
+// One camera of a run, for resolveCameraModes: the mode it asks for (already routed for a
+// physical lens, lensRoutedMode), its projection, whether it has such a lens, and its name.
+struct CamRequest { char mode; int projection; bool lens; const char* name; };
+
+// The `-on-unsupported` policy for every camera of a run at once. Fills `out` with the mode each
+// renders in, may strip features from `scene`, and prints what it did. False when some camera must
+// not render: the error policy, or no mode renders what it needs.
+//
+// A strip removes a feature from the one Scene every camera renders, so it is decided for all of
+// them together. A feature is kept when some camera ends in a mode that renders it: its own mode
+// when that renders the scene, or the mode it falls back to when no strip fixes it. A fallback can
+// add a keep and a keep can stop another camera's strip; keeps only grow, so the iteration
+// settles, and the outcome does not depend on the order of the cameras.
+static bool resolveCameraModes(Scene& scene, const std::vector<CamRequest>& cams,
+                               std::vector<char>& out) {
+    const size_t n = cams.size();
+    out.assign(n, 0);
+    std::vector<const char*> why(n);
+    for (size_t i = 0; i < n; ++i)
+        why[i] = modeFeatureUnsupported(scene, cams[i].mode, cams[i].projection);
+    std::vector<char> strip(n, 0);
+    if (g_onUnsupported == OnUnsupported::Strip) {
+        bool keepFire = false, keepGrin = false;
+        for (;;) {
+            bool kf = false, kg = false;
+            for (size_t i = 0; i < n; ++i) {
+                const CamRequest& c = cams[i];
+                char m = c.mode;
+                strip[i] = why[i] && stripFixes(scene, m, c.projection, keepFire, keepGrin);
+                if (why[i] && !strip[i]) {
+                    m = fallbackModeFor(scene, c.projection, c.lens);
+                    if (!m) continue;               // this camera fails; it renders nothing
+                }
+                kf |= modeRendersVolumeEmission(m);
+                kg |= modeRendersGrin(m);
+            }
+            if (kf == keepFire && kg == keepGrin) break;
+            keepFire = kf; keepGrin = kg;
+        }
+        int removed = 0;
+        for (size_t i = 0; i < n; ++i)
+            if (strip[i]) removed |= stripFor(scene, cams[i].mode, keepFire, keepGrin);
+        if (removed & STRIP_FIRE) scene.finalizeEmissiveVolumes();   // no births from a fire now gone
     }
-    const char fallback = fallbackModeFor(scene, projection, lens);
-    if (g_onUnsupported == OnUnsupported::Error || !fallback) {
-        if (ok.empty())
-            std::fprintf(stderr, "[mode %c] camera '%s' uses %s, and no mode renders that "
-                                 "through a physical lens; drop the lens%s.\n", mode, camName,
-                         why, g_onUnsupported == OnUnsupported::Strip
-                                  ? " (strip could not remove it: another camera renders it)"
-                                  : ", or pass -on-unsupported strip");
+    for (size_t i = 0; i < n; ++i) {
+        const CamRequest& c = cams[i];
+        out[i] = c.mode;
+        if (!why[i]) continue;
+        if (strip[i]) {
+            std::printf("[on-unsupported=strip] camera '%s': stripped %s; rendering in mode %c "
+                        "anyway.\n", c.name, why[i], c.mode);
+            continue;
+        }
+        const char fallback = fallbackModeFor(scene, c.projection, c.lens);
+        if (g_onUnsupported == OnUnsupported::Error || !fallback) {
+            const std::string ok = modesThatRender(scene, c.projection, c.lens);
+            if (ok.empty())
+                std::fprintf(stderr, "[mode %c] camera '%s' uses %s, and no mode renders that "
+                                     "through a physical lens; drop the lens%s.\n", c.mode, c.name,
+                             why[i], g_onUnsupported == OnUnsupported::Strip
+                                      ? " (strip could not remove it: another camera renders it)"
+                                      : ", or pass -on-unsupported strip");
+            else
+                std::fprintf(stderr, "[mode %c] camera '%s' uses %s, which that mode can't "
+                                     "render; use mode %s, add a prefer{}/else{} fallback, or "
+                                     "pass -on-unsupported fallback|strip.\n", c.mode, c.name,
+                             why[i], ok.c_str());
+            return false;
+        }
+        const char* kind = fallback == 'B' ? "forward light tracer" : "backward reference";
+        if (g_onUnsupported == OnUnsupported::Strip)
+            std::printf("[on-unsupported=strip] camera '%s': cannot strip %s for mode %c (another "
+                        "camera renders it, or the mode lacks more than a strip removes) -> mode "
+                        "%c (%s).\n", c.name, why[i], c.mode, fallback, kind);
         else
-            std::fprintf(stderr, "[mode %c] camera '%s' uses %s, which that mode can't render; "
-                                 "use mode %s, add a prefer{}/else{} fallback, or pass "
-                                 "-on-unsupported fallback|strip.\n", mode, camName, why,
-                         ok.c_str());
-        proceed = false;
-        return mode;
+            std::printf("[on-unsupported=fallback] camera '%s': %s unsupported in mode %c -> mode "
+                        "%c (%s).\n", c.name, why[i], c.mode, fallback, kind);
+        out[i] = fallback;
     }
-    const char* kind = fallback == 'B' ? "forward light tracer" : "backward reference";
-    if (g_onUnsupported == OnUnsupported::Strip)
-        std::printf("[on-unsupported=strip] camera '%s': cannot strip %s for mode %c (another "
-                    "camera renders it, or the mode lacks more than a strip removes) -> mode %c "
-                    "(%s).\n", camName, why, mode, fallback, kind);
-    else
-        std::printf("[on-unsupported=fallback] camera '%s': %s unsupported in mode %c -> mode %c "
-                    "(%s).\n", camName, why, mode, fallback, kind);
-    return fallback;
+    return true;
 }
 
 // CPU counterpart of the GPU gpuSppChunks helper: render `sppTarget` samples-per-pixel
@@ -20800,6 +20855,9 @@ static int run(int argc, char** argv) {
                        Vec3 lookAt{0,0,0}; Vec3 up{0,1,0}; double fovY = 40.0;   // lookAt/up/fovY: for the interactive raster viewer
                        std::string pathBase; };  // owning camera_path/orbit/curve base name ("" = standalone camera)
     std::vector<RenderCam> toRender;
+    // The mode each FTSL camera of this run renders in, by its index in ftslScene.cameras (0 for
+    // one the run does not render): what resolveCameraModes decided, read by the exposure meter.
+    std::vector<char> renderedOf;
 
     // Raster previews are cheap to compute, so unless the user pinned a size with -r,
     // scale each preview camera UP so its long edge is at least kRasterPreviewLong px
@@ -20934,15 +20992,20 @@ static int run(int argc, char** argv) {
         } else {
             for (const auto& cs : ftslScene.cameras) sel.push_back(&cs);
         }
-        // Which strippable features some camera of this run renders: a strip for one camera
-        // must not take them from another, since every camera renders the same Scene.
-        bool keepFire = false, keepGrin = false;
+        // Every camera's rendered mode, the -on-unsupported policy decided for the run at once
+        // (resolveCameraModes): lens routing first, then whatever that mode cannot render.
+        std::vector<CamRequest> reqs;
         for (const ftsl::CamSpec* cs : sel) {
             const char m = cs->lens ? lensRoutedMode(scene, effMode(cs->mode)) : effMode(cs->mode);
-            keepFire |= modeRendersVolumeEmission(m);
-            keepGrin |= modeRendersGrin(m);
+            reqs.push_back({m, cs->projection, cs->lens != nullptr, cs->name.c_str()});
         }
-        for (const ftsl::CamSpec* cs : sel) {
+        std::vector<char> resolved;
+        if (!resolveCameraModes(scene, reqs, resolved)) return 1;
+        renderedOf.assign(ftslScene.cameras.size(), 0);
+        for (size_t si = 0; si < sel.size(); ++si)
+            renderedOf[(size_t)(sel[si] - ftslScene.cameras.data())] = resolved[si];
+        for (size_t si = 0; si < sel.size(); ++si) {
+            const ftsl::CamSpec* cs = sel[si];
             int cresX = resFromCli ? res : (cs->res  > 0 ? cs->res  : res);
             int cresY = resFromCli ? (resYCli > 0 ? resYCli : res)
                                    : (cs->resY > 0 ? cs->resY : cresX);
@@ -20993,6 +21056,10 @@ static int run(int argc, char** argv) {
                 }
                 cmode = routed;
             }
+            // The unsupported-feature policy's verdict for this camera (resolveCameraModes,
+            // above): its routed mode, or the mode it falls back to -- before anything below
+            // reads the mode (the aperture term is mode B's).
+            cmode = resolved[si];
             // Exposure-lock group: a global -exposure-lock forces one shared anchor
             // (group 0) across every camera; otherwise a per-path `exposure_lock`
             // locks only that path's frames (group = its pathGroup); -1 = per-frame.
@@ -21017,16 +21084,6 @@ static int run(int argc, char** argv) {
                     double camEq = (PI / 4.0) / (N * N);            // (π/4)/N² image-side irradiance factor
                     cexp = (cexp > 0.0 ? cexp : 1.0) * camEq;
                 }
-            }
-            // Unsupported-feature policy (-on-unsupported): if this camera's mode still
-            // can't render the scene (e.g. GRIN media in mode D and no prefer{}/else{}
-            // branch selected one), apply the policy — error (abort), fall back to a mode
-            // that renders it, or strip the offending feature and render anyway.
-            {
-                bool proceed = true;
-                cmode = applyUnsupportedPolicy(scene, cmode, cs->projection, cs->lens != nullptr,
-                                               keepFire, keepGrin, cs->name.c_str(), proceed);
-                if (!proceed) return 1;
             }
             toRender.push_back({cs->name, c, cmode, cresX, cresY, cexp, eg, cs->look, cs->up, cs->fov,
                                 cs->pathBase});
@@ -21375,9 +21432,14 @@ static int run(int argc, char** argv) {
             m.cam.apertureR = cs.aperture;
             if (cs.filmDist_m > 0.0) { m.cam.filmDist = cs.filmDist_m; m.cam.lensF = cs.lensF_m; }
             else                     { m.cam.setFocus(cs.focus); }
-            // The mode the render itself uses: lens routing and the -on-unsupported fallback
-            // (a fire metered in a fire-blind mode would anchor a different picture).
-            m.mode = renderedMode(scene, effMode(cs.mode), cs.projection, cs.lens != nullptr);
+            // The mode the render itself uses (a fire metered in a fire-blind mode would anchor
+            // a different picture): the run's own verdict for a camera it renders, and for a
+            // frame of the path it does not render, the same routing and fallback on the scene
+            // as the run left it.
+            const size_t ci = (size_t)(&cs - ftslScene.cameras.data());
+            m.mode = (ci < renderedOf.size() && renderedOf[ci])
+                         ? renderedOf[ci]
+                         : renderedMode(scene, effMode(cs.mode), cs.projection, cs.lens != nullptr);
             if (cs.lens) m.cam.lens = cs.lens;
             m.name = cs.name;
             return m;
@@ -24073,7 +24135,7 @@ static int run(int argc, char** argv) {
                 // caught. The render gates this pass on !forwardCatch; the meter did not, and so
                 // metered C's sky twice (0.370.0).
                 if (mode != 'C') addEnvBackground(mf, scene, mc.cam, meterN);
-                filmToRgb8(mf, (double)meterN, 1.0, false, nullptr, &eAuto);
+                eAuto = autoExposureOf(filmToLinear(mf, (double)meterN));
                 break;
             }
             case 'R': {
@@ -24087,7 +24149,7 @@ static int run(int argc, char** argv) {
 #endif
                 if (!onGpu)
                     mf = renderBackward(scene, mc.cam, W, H, meterSpp, nThreads, diffraction);
-                filmToRgb8(mf, (double)meterSpp, 1.0, false, nullptr, &eAuto);
+                eAuto = autoExposureOf(filmToLinear(mf, (double)meterSpp));
                 break;
             }
             // Mode J meters as mode D on purpose. The meter only needs an EXPOSURE ANCHOR,
@@ -24105,7 +24167,7 @@ static int run(int argc, char** argv) {
 #endif
                 if (!onGpu)
                     mf = renderBdpt(scene, mc.cam, W, H, meterSpp, nThreads, /*maxDepth*/8, diffraction);
-                filmToRgb8(mf, (double)meterSpp, 1.0, false, nullptr, &eAuto);
+                eAuto = autoExposureOf(filmToLinear(mf, (double)meterSpp));
                 break;
             }
             case 'M': {
@@ -24148,7 +24210,7 @@ static int run(int argc, char** argv) {
                                         diffraction, effMaxBounce(), 0, g_pmFinalGather,
                                         meterBeams ? &meterBmap : nullptr,
                                         g_pmCaustics ? &meterPmapC : nullptr);
-                filmToRgb8(mf, (double)meterSpp, 1.0, false, nullptr, &eAuto);
+                eAuto = autoExposureOf(filmToLinear(mf, (double)meterSpp));
                 break;
             }
             case 'P': {
@@ -24170,7 +24232,7 @@ static int run(int argc, char** argv) {
                     ref = renderBackward(scene, mc.cam, W, H, meterSpp, nThreads, diffraction);
                 mf = compositeFromFilms(fwd, meterN, ref, meterSpp, cc,
                                         scene.envIndex >= 0, /*verbose*/false);
-                filmToRgb8(mf, 1.0, 1.0, false, nullptr, &eAuto);
+                eAuto = autoExposureOf(filmToLinear(mf, 1.0));
                 break;
             }
             default: {   // S/U/V and any future mode: general forward mode-B light-trace
@@ -24178,15 +24240,13 @@ static int run(int argc, char** argv) {
                 mf = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
                                    false, false, true, e, diffraction, meterGpu);
                 addEnvBackground(mf, scene, mc.cam, meterN);
-                filmToRgb8(mf, (double)meterN, 1.0, false, nullptr, &eAuto);
+                eAuto = autoExposureOf(filmToLinear(mf, (double)meterN));
                 break;
             }
         }
-        // A frame nothing reached is no anchor. filmToRgb8 reports its no-signal fallback, 1,
-        // which MeterConverge would average in as a reading; 0 is what it skips, so a black
-        // meter ends in the "no valid anchor" notice instead of a silent lock at 1.
-        for (const Vec3& c : mf.xyz) if (c.y > 0.0) return eAuto;
-        return 0.0;
+        // 0 for a frame that asks for no exposure (autoExposureOf): MeterConverge skips it, so a
+        // black meter ends in the "no valid anchor" notice instead of a silent lock at 1.
+        return eAuto;
     };
     // The RENDER's photon budget, named before the loop shadows `N` with the camera count —
     // the GPU meter's beam budget scales against it (see meterBeamTarget below).
@@ -24237,13 +24297,13 @@ static int run(int argc, char** argv) {
                 EnergyReport e;
                 std::function<bool(int, const Film&, long long)> onFrame =
                     [&](int, const Film& f, long long sppDone) -> bool {
-                        double eAuto = 0.0;
                         // Normalise by what LANDED, not by what was asked for: a metering
                         // frame cut short by a stop would otherwise read darker than it is
-                        // and anchor the whole group's exposure too hot.
-                        filmToRgb8(f, (double)(sppDone > 0 ? sppDone : meterSpp), 1.0, false,
-                                   nullptr, &eAuto);
-                        return conv.add(eAuto) || g_stopRequested != 0;
+                        // and anchor the whole group's exposure too hot. A frame that asks
+                        // for no exposure reads 0, which conv skips.
+                        const double landed = (double)(sppDone > 0 ? sppDone : meterSpp);
+                        return conv.add(autoExposureOf(filmToLinear(f, landed))) ||
+                               g_stopRequested != 0;
                     };
                 // Same beam pass the real render gets, at a budget scaled down with the
                 // reduced photon count so the meter keeps the render's beams-per-photon

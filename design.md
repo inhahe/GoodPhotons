@@ -755,7 +755,7 @@ evaluated with `pbeams::kSunNeeSteps` (64) **jittered** steps over the medium's 
 one random offset per segment, so it is an unbiased estimate rather than a fixed quadrature --
 `Tr_cam` carried incrementally from step to step, and `Tr_sun` by ratio tracking to the scene
 sphere plus a shadow ray, with the sun direction cone-sampled (pdf 1/Omega) exactly as the BDPT
-volume-vertex sun connection does (`backward.h neeVolume`, `render_cuda.cu` line ~10600). An
+volume-vertex sun connection does (`backward.h neeVolumeHero`, `render_cuda.cu` line ~10600). An
 unbounded medium is cut at the deposit's own far limit (`kBeamFarScale`), so both estimators
 integrate one volume. Host: `beamgather.h sunNeeMarch`; device: `render_cuda.cu dSunNeeMarch`;
 called from the two segment sites of `photonGather` / `dPhotonGather` next to the beam gather,
@@ -1087,7 +1087,10 @@ T = exp(-sigma_a * chord), with the chord length wavelength-independent (`Chord:
 recorded by `refractGeom`). `hair::lobeAngular` computes the per-lobe angular products once per
 sample and `hair::fFromLobes` gives f at any absorption for one exp and one `Ap()`; the device
 has the same pair in `dhair`. Both walks' folds use it (a fiber with a medulla keeps the full
-rebuild: its lobes take the absorption through the chord in more than one place). Measured
+rebuild: its lobes take the absorption through the chord in more than one place). Whether the
+medulla is live is decided per WAVELENGTH (`hairMedullaLiveAt`: its coefficients may vanish over
+part of the band), so the fold serves a wavelength only where both its fiber and the one `la`
+came from are solid (`hairFoldFCos`, shared with the bundle and BDPT since 0.377.1). Measured
 bit-identical to the rebuild on the GPU and within rounding on the CPU. The remaining per-bin
 cost was the colour inversion: Chiang's fit has a denominator that depends on `beta_n` alone and
 cost three `pow()` per call (`sigmaADenominator` hoists it), and on the CPU a material whose
@@ -7683,7 +7686,7 @@ as the one at fault.
   `connectEmissionVolume`/`camSplatEmissionAll` device splat (validated GPU-vs-CPU on `scraps/vdb_fire.ftsl`).
   **Mode R (CPU, 0.376.0)** reaches it as it reaches an area light (`backward.h`, the
   VOLUMETRIC EMISSION block). Light sampling: every NEE function (`neeLight`, `neeLightHero`,
-  `neeLightHeroHair`, `neeVolume`, `neeVolumeHero`) also calls `fireNee`, which picks one fire by
+  `neeLightHeroHair`, `neeVolumeHero`) also calls `fireNee`, which picks one fire by
   power and a direction, and integrates the emission along it to the first opaque surface,
   through see-through fibers by their transmittance -- the domain a shadow ray to a light has.
   The direction comes from a defensive mixture: three quarters of the draws aim at a point drawn

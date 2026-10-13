@@ -1462,10 +1462,12 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                      * (thr * scene.envRadianceSeen(ray.d, lambda) * invPdfL);
             // Directly-viewed solar disc. This walk terminates at the first diffuse
-            // vertex (the density estimate returns there), so any escape reaching here
-            // is a camera ray or a specular chain — never a diffuse continuation that
-            // the map / NEE already credited with the sun.
-            if (scene.sunCount > 0)
+            // vertex (the density estimate returns there), so an escape reaching here is a
+            // camera ray, a specular chain, or a fiber's continuation -- and a fiber's own
+            // light sampling (HAIR-NEE) already took the sun, as it took every emitter the
+            // emitter-hit site above skips after it (`hairArrival`). The sky is not among them:
+            // the walk has no sky light sampling, so the escape is the sky's only estimate.
+            if (scene.sunCount > 0 && !hairArrival)
                 L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                      * (thr * bwNee.sunRadianceMis(scene, gmis, ray.d, lambda) * invPdfL);
             return L;
@@ -1771,16 +1773,21 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 if (hairSpecOn && !passedThru) {
                     // Per-lobe form (0.336.0): the angular products once, then per grid wavelength
                     // one absorption inversion, one exp and one Ap() -- a solid fiber's f() at any
-                    // wavelength is exactly that (hair.h lobeAngular / fFromLobes). A fiber with a
-                    // medulla keeps the full rebuild.
+                    // wavelength is exactly that (hair.h lobeAngular / fFromLobes). A bin whose own
+                    // medulla is live (or a hero whose was) keeps the full rebuild: whether the
+                    // medulla is live depends on the wavelength.
                     const bool perLobe = la.valid;
                     // the absorption per bin: a per-material table when the colour is constant
                     // (hairSigmaBins), else inverted at each wavelength
                     const double* bins = hairSigmaBins<SpecThr::K, &SpecThr::lamOf>(scene, m, h);
                     sthr.mul([&](double lamK) {
-                        if (perLobe)
-                            return clamp01(hs.b.opacity * hair::fFromLobes(la, bins ? bins[SpecThr::binOf(lamK)] : hairSigmaAAt(scene, m, h, lamK),
-                                                                           hairSpecularAt(scene, m, h, lamK)) * cosLong / pdfH);
+                        if (perLobe && !hairMedullaLiveAt(hs.b, m, lamK)) {
+                            const double sig = bins ? bins[SpecThr::binOf(lamK)]
+                                                    : hairSigmaAAt(scene, m, h, lamK);
+                            return clamp01(hs.b.opacity *
+                                           hair::fFromLobes(la, sig, hairSpecularFrom(m, lamK, hs.specPat)) *
+                                           cosLong / pdfH);
+                        }
                         const HairShade hk = hairShadeAt(scene, m, h, lamK, wPrev);
                         return clamp01(hair::f(hk.b, hk.woLocal, wl) * cosLong / pdfH);
                     }, wCam);

@@ -48,6 +48,10 @@ struct HairShade {
     // connection therefore has to know which kind of fiber it is standing on — see
     // backward.h's emitterGeom/envGeom.
     bool   aggregate = false;
+    // The `specular` pattern's multiplier at this hit (1 without one): it does not depend on the
+    // wavelength, so it is evaluated once, here, and every wavelength of the hit reuses it
+    // (hairSpecularFrom).
+    double specPat = 1.0;
 };
 
 // Build the BCSDF at a hit. `wPrev` points away from the surface, back along the path
@@ -94,17 +98,26 @@ inline double hairOpacityAt(const Scene& scene, const Material& m, const Hit& hi
 // The cuticle reflectance tint at a hit, clamped to [0,1]. Factored out because there are TWO
 // places that build hair::Params -- hairShadeAt and hairDualFor -- and teaching only one of them
 // is exactly the bug this was written to fix: `specular` parsed, stored and did nothing.
-inline double hairSpecularAt(const Scene& scene, const Material& m, const Hit& hit, double lambda) {
-    double sp = m.hairSpecular(lambda);
-    if (m.hairSpecPat >= 0) sp *= slotPatMul(scene, m.hairSpecPat, hit);
+// Split in two for the loops over a hit's wavelengths: the pattern multiplier, once per hit
+// (hairSpecPatAt, carried as HairShade::specPat), and the tint at one wavelength from it
+// (hairSpecularFrom).
+inline double hairSpecPatAt(const Scene& scene, const Material& m, const Hit& hit) {
+    return (m.hairSpecPat >= 0) ? slotPatMul(scene, m.hairSpecPat, hit) : 1.0;
+}
+inline double hairSpecularFrom(const Material& m, double lambda, double specPat) {
+    const double sp = m.hairSpecular(lambda) * specPat;
     return sp < 0.0 ? 0.0 : (sp > 1.0 ? 1.0 : sp);
+}
+inline double hairSpecularAt(const Scene& scene, const Material& m, const Hit& hit, double lambda) {
+    return hairSpecularFrom(m, lambda, hairSpecPatAt(scene, m, hit));
 }
 
 inline HairShade hairShadeAt(const Scene& scene, const Material& m, const Hit& hit,
                              double lambda, const Vec3& wPrev) {
     hair::Params pr;
+    const double specPat = hairSpecPatAt(scene, m, hit);
     pr.eta   = m.hairEta;
-    pr.specR = hairSpecularAt(scene, m, hit, lambda);
+    pr.specR = hairSpecularFrom(m, lambda, specPat);
     pr.opacity = hairOpacityAt(scene, m, hit);
     pr.betaM = m.hairBetaM;
     pr.betaN = m.hairBetaN;
@@ -128,6 +141,7 @@ inline HairShade hairShadeAt(const Scene& scene, const Material& m, const Hit& h
     s.woLocal = hair::toLocal(s.fr, wPrev);
     s.b       = hair::make(pr, hair::hFromHit(hit.n, hit.tangent, wPrev), sigmaA);
     s.radius  = hit.fiberRadius;
+    s.specPat = specPat;
     return s;
 }
 
@@ -138,7 +152,8 @@ inline HairShade hairShadeAt(const Scene& scene, const Material& m, const Hit& h
 inline HairShade hairShadeRetint(const Scene& scene, const Material& m, const Hit& hit,
                                  double lambda, const HairShade& base) {
     HairShade s = base;
-    hair::makeSpectral(s.b, hairSpecularAt(scene, m, hit, lambda), hairSigmaAAt(scene, m, hit, lambda),
+    hair::makeSpectral(s.b, hairSpecularFrom(m, lambda, base.specPat),
+                       hairSigmaAAt(scene, m, hit, lambda),
                        m.hairMedullaSigmaS(lambda), m.hairMedullaSigmaA(lambda));
     return s;
 }
@@ -152,26 +167,42 @@ inline double hairFCos(const HairShade& s, const Vec3& wWorld) {
     return hair::f(s.b, s.woLocal, wl) * cosLong;
 }
 
+// Whether the fiber's medulla is live at `lambda`: hair::makeSpectral's hasMedulla, for a loop
+// over wavelengths that does not build each one's Bcsdf. `b` is the Bcsdf of any wavelength at
+// the hit (kappa is the same at all of them).
+inline bool hairMedullaLiveAt(const hair::Bcsdf& b, const Material& m, double lambda) {
+    return b.kappa > 0.0 && std::max(0.0, m.hairMedullaSigmaS(lambda)) +
+                            std::max(0.0, m.hairMedullaSigmaA(lambda)) > 0.0;
+}
+
+// One wavelength's hairFCos (and hair::pdf) toward the LOCAL direction `wl`, given the angular
+// products `la` hair::f filled toward `wl` at another wavelength of the same hit and arrival.
+// `s` is this wavelength's shade (hairShadeRetint), `cosLong` the longitudinal cosine of `wl`.
+// The fold (fFromLobes / pdfFromLobes, one exp) factors only a solid fiber, and whether the
+// medulla is live is a property of each wavelength (its scattering and absorption may vanish at
+// one and not another): so it serves only when both `la`'s wavelength (la.valid) and this one
+// are solid, and the BCSDF is evaluated in full otherwise. `pdf` may be null.
+inline double hairFoldFCos(const hair::LobeAngular& la, const HairShade& s, const Vec3& wl,
+                           double cosLong, double* pdf) {
+    const hair::Bcsdf& b = s.b;
+    if (la.valid && !b.hasMedulla) {
+        if (pdf) *pdf = b.opacity * hair::pdfFromLobes(la, b.sigmaA, b.specR);
+        return b.opacity * hair::fFromLobes(la, b.sigmaA, b.specR) * cosLong;
+    }
+    if (pdf) *pdf = hair::pdf(b, s.woLocal, wl);
+    return hair::f(b, s.woLocal, wl) * cosLong;
+}
+
 // hairFCos and hair::pdf for every shade of a bundle (`hs[0..n)`, sharing hit and arrival:
 // hairShadeRetint) toward one LOCAL direction `wl` with its longitudinal cosine. The angular
-// half of f() is computed once, at hs[0]; each other wavelength then costs one exp
-// (fFromLobes / pdfFromLobes). A medullated fiber, which that fold cannot factor, is evaluated
-// in full per wavelength. `pdf` may be null.
+// half of f() is computed once, at hs[0]; every wavelength's value, the hero's pdf included,
+// then folds from it (hairFoldFCos). `pdf` may be null.
 inline void hairBundleAt(const HairShade* hs, int n, const Vec3& wl, double cosLong,
                          double* fcos, double* pdf) {
     hair::LobeAngular la;
     fcos[0] = hair::f(hs[0].b, hs[0].woLocal, wl, &la) * cosLong;
-    if (pdf) pdf[0] = hair::pdf(hs[0].b, hs[0].woLocal, wl);
-    for (int i = 1; i < n; ++i) {
-        const hair::Bcsdf& b = hs[i].b;
-        if (la.valid) {
-            fcos[i] = b.opacity * hair::fFromLobes(la, b.sigmaA, b.specR) * cosLong;
-            if (pdf) pdf[i] = b.opacity * hair::pdfFromLobes(la, b.sigmaA, b.specR);
-        } else {
-            fcos[i] = hair::f(b, hs[i].woLocal, wl) * cosLong;
-            if (pdf) pdf[i] = hair::pdf(b, hs[i].woLocal, wl);
-        }
-    }
+    if (pdf) hairFoldFCos(la, hs[0], wl, cosLong, &pdf[0]);
+    for (int i = 1; i < n; ++i) fcos[i] = hairFoldFCos(la, hs[i], wl, cosLong, pdf ? &pdf[i] : nullptr);
 }
 
 // How far a connection or a scattered ray must step to clear the strand's own body.

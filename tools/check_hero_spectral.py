@@ -24,6 +24,9 @@ to its `-heroc 1` render also fails: its bundle was switched off. Scenes:
   hairback -- red and pale fur rim-lit by a large area light behind them: built to favour a joint
            (strategy x hero wavelength) MIS weight in mode D, measured and not kept (known-issues
            SPECTRAL-BUNDLE); fibers seen by both camera and light strategies.
+  hairmed -- fur whose medulla scatters only above 550 nm, so a bundle's wavelengths differ in
+           whether their fiber is solid: the per-lobe fold of a solid fiber must not be applied
+           to a wavelength whose own medulla is live (it once took the hero's word for it).
   fog   -- diffuse spheres in a bounded grey Henyey-Greenstein fog, sun + area light.
   fogcli -- the same lit by the command line's global `-fog`, added after the scene is built.
   coatfog -- an iridescent coat (which splits the bundle per wavelength, re-tracing the segment
@@ -94,6 +97,20 @@ SCENES = {
         'sphere "b2" { center 0.13 0.13 0.35  radius 0.09  material skin }',
         'fur "b2_coat" { on "b2"  material pale  count 25000  length 0.06  length_jitter 0.3  radius 0.0006  droop 0.4  jitter 0.25  seed 4 }',
     ],
+    "hairmed": [
+        'scene { units meters }',
+        'camera "c" { eye 0 0.22 -0.6  look_at 0 0.14 0.3  up 0 1 0  fov_y 30  film { res 160 120 } }',
+        'material "ground" { type diffuse  reflect 0.45 }',
+        'material "skin"   { type diffuse  reflect rgb 0.35 0.26 0.22 }',
+        'material "furm"   { type hair  reflect rgb 0.80 0.65 0.45  beta_m 0.25  beta_n 0.30  medulla 0.6'
+        '  medulla_sigma_s table { 360:0 549:0 551:4 830:4 }  medulla_sigma_a table { 360:0 549:0 551:0.5 830:0.5 }'
+        '  medulla_g 0.3 }',
+        'quad { origin -2 0 -2   u 0 0 5   v 5 0 0   material ground }',
+        'light sun { dir -0.4 0.6 -0.7  angle 0.53  spd blackbody 5800  intensity 1e-13 }',
+        'light area { origin -0.4 0.9 0.0  u 0.8 0 0  v 0 0 0.6  normal 0 -1 0  power 120  spd preset:d65 }',
+        'sphere "b1" { center 0 0.13 0.3  radius 0.10  material skin }',
+        'fur "b1_coat" { on "b1"  material furm  count 25000  length 0.05  length_jitter 0.3  radius 0.0006  droop 0.5  jitter 0.25  seed 5 }',
+    ],
     "fog": [
         'scene { units meters }',
         'camera "c" { eye 0.5 0.4 -1.2  look_at 0.5 0.25 0.6  up 0 1 0  fov_y 36  film { res 160 120 } }',
@@ -154,8 +171,8 @@ Z_MAX = 5.0
 REL_MAX = 0.01
 
 # The modes each scene runs in: BDPT (mode D) refuses an environment light.
-MODES = {"hair": "R", "hairsun": "RD", "hairback": "RD", "fog": "RD", "fogcli": "R", "coatfog": "R",
-         "rain": "RD"}
+MODES = {"hair": "R", "hairsun": "RD", "hairback": "RD", "hairmed": "RD", "fog": "RD", "fogcli": "R",
+         "coatfog": "R", "rain": "RD"}
 # Command-line arguments a scene renders with.
 EXTRA = {"fogcli": ["-fog", "1.5"]}
 

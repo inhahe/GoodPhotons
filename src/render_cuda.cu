@@ -4706,16 +4706,6 @@ __device__ static double fFromLobes(const LobeAngular& la, double sigmaA, double
     sum *= la.invCosI;
     return isfinite(sum) ? fmax(0.0, sum) : 0.0;
 }
-__device__ static double pdfFromLobes(const LobeAngular& la, double sigmaA, double specR) {
-    double ap[kPMax + 1];
-    ApFromF(la.F, exp(-fmax(0.0, sigmaA) * la.len), ap, specR);
-    double total = 0.0;
-    for (int p = 0; p <= kPMax; ++p) total += ap[p];
-    double sum = 0.0;
-    for (int p = 0; p <= kPMax; ++p)
-        sum += la.G[p] * ((total <= 1e-12) ? 1.0 / double(kPMax + 1) : ap[p] / total);
-    return isfinite(sum) ? fmax(0.0, sum) : 0.0;
-}
 
 __device__ __noinline__ static double f(const Bcsdf& b, const V3& wo, const V3& wi, LobeAngular* la = nullptr) {
     const double sinThetaO = clampd(wo.x, -1.0, 1.0), cosThetaO = safeSqrt(1.0 - sqr(sinThetaO));
@@ -4995,11 +4985,24 @@ __device__ static double dHairSigmaAAt(const DScene& sc, const DMaterial& m, con
     }
     return fmax(0.0, (double)specLookup(m.hairSigmaA, lambda));
 }
-// The cuticle tint at `lambda`, clamped to [0,1] (host twin hairSpecularAt).
-__device__ static double dHairSpecularAt(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
-    double sp = (double)specLookup(m.hairSpecular, lambda);
-    if (m.hairSpecPat >= 0) sp *= (double)clamp01(dPatternScalarAt(sc, m.hairSpecPat, h));
+// The cuticle tint at `lambda`, clamped to [0,1] (host twin hairSpecularAt), split as the host
+// splits it for the loops over a hit's wavelengths: the pattern multiplier once per hit
+// (dHairSpecPatAt), the tint at one wavelength from it (dHairSpecularFrom).
+__device__ static double dHairSpecPatAt(const DScene& sc, const DMaterial& m, const DHit& h) {
+    return (m.hairSpecPat >= 0) ? (double)clamp01(dPatternScalarAt(sc, m.hairSpecPat, h)) : 1.0;
+}
+__device__ static double dHairSpecularFrom(const DMaterial& m, Real lambda, double specPat) {
+    const double sp = (double)specLookup(m.hairSpecular, lambda) * specPat;
     return sp < 0.0 ? 0.0 : (sp > 1.0 ? 1.0 : sp);
+}
+__device__ static double dHairSpecularAt(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
+    return dHairSpecularFrom(m, lambda, dHairSpecPatAt(sc, m, h));
+}
+// Whether the fiber's medulla is live at `lambda` (host twin hairMedullaLiveAt): whether it is
+// depends on the wavelength, so a per-wavelength fold of a solid fiber must ask at each one.
+__device__ static bool dHairMedullaLiveAt(const dhair::Bcsdf& b, const DMaterial& m, Real lambda) {
+    return b.kappa > 0.0 && fmax(0.0, (double)specLookup(m.hairMedullaSigmaS, lambda)) +
+                            fmax(0.0, (double)specLookup(m.hairMedullaSigmaA, lambda)) > 0.0;
 }
 
 __device__ __noinline__ static DHairShade dHairShadeAt(const DScene& sc, const DMaterial& m,
@@ -8758,7 +8761,8 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
 // Device twin of the CPU MatType::Hair case (render.h).
 __device__ __noinline__ static int interactHair(const DScene& sc, const DCamSet& cs,
         int camMode, const DMaterial& m, const DHit& h,
-        DVec3& ro, DVec3& rd, Real beta, Real lambda, DRng& rng, double& eAbsorbed) {
+        DVec3& ro, DVec3& rd, Real beta, Real lambda, DRng& rng, double& eAbsorbed,
+        Real* curveTminOut = nullptr) {
     const DVec3 wPrev = -rd;                       // toward the light-side vertex
     const DHairShade hs = dHairShadeAt(sc, m, h, lambda, wPrev);
     if (camMode == CAM_A || camMode == CAM_B)
@@ -8776,9 +8780,16 @@ __device__ __noinline__ static int interactHair(const DScene& sc, const DCamSet&
     double T = fv * cosLong / pdf; T = T < 0.0 ? 0.0 : (T > 1.0 ? 1.0 : T);
     if ((double)rng.uniform() >= T) { eAbsorbed += beta; return WF_TERMINATE; }
     const DVec3 wo = dhair::toWorld(hs.fr, wl);
-    // TT and TRT leave through the FAR side of a real solid strand, so step clear
-    // of the tube's own body (dHairExitOffset); near side is the ordinary RAY_EPS.
-    ro = h.p + wo * dHairExitOffset(hs, h.n, wo); rd = wo;
+    // TT and TRT leave through the FAR side of a real solid strand, so the strand's own body
+    // must be cleared (dHairExitOffset). With `curveTminOut` the caller's next trace skips
+    // CURVE primitives within that distance and nothing else, from an origin moved off the
+    // strand by a ULP-scaled step (host twin: render.h's Ray::curveTmin): moving the ORIGIN out
+    // by the whole exit distance instead carries a ray that leaves a strand near its root
+    // through the skin the fur grows from, which then never sees it.
+    const Real exitOff = dHairExitOffset(hs, h.n, wo);
+    if (curveTminOut) { *curveTminOut = exitOff; ro = dOffsetPoint(h.p, wo); }
+    else              ro = h.p + wo * exitOff;
+    rd = wo;
     return WF_CONTINUE;   // beta unchanged (RR carried the weight)
 }
 
@@ -8792,7 +8803,7 @@ __device__ __noinline__ static int interactHair(const DScene& sc, const DCamSet&
 __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int camMode,
         int diffraction, const DMaterial& m, int matIndex, const DHit& h,
         DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng, double& eAbsorbed,
-        DMediumStack& stk) {
+        DMediumStack& stk, Real* curveTminOut = nullptr) {
     if (m.type == D_DIELECTRIC) {
         DVec3 nro, nrd; dDielectricStep(sc, m, h, rd, lambda, rng, matIndex, stk, nro, nrd);
         ro = nro; rd = nrd; return WF_CONTINUE;
@@ -8874,7 +8885,8 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
     } else if (m.type == D_HAIR) {
         // Split out (__noinline__) so its fat double-precision frame is only paid on an
         // actual hair hit — see the comment on interactHair.
-        return interactHair(sc, cs, camMode, m, h, ro, rd, beta, lambda, rng, eAbsorbed);
+        return interactHair(sc, cs, camMode, m, h, ro, rd, beta, lambda, rng, eAbsorbed,
+                            curveTminOut);
     }
     return WF_CONTINUE;   // unreachable: caller dispatches only the specular types
 }
@@ -8964,7 +8976,8 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
                                 int grinMed = -1, Real grinArc = 0,
                                 int* beamScat = nullptr, DPathCaustic* pathC = nullptr,
                                 DBeamSpec* spec = nullptr,
-                                int srcEm = -1, int* nSurf = nullptr) {
+                                int srcEm = -1, int* nSurf = nullptr,
+                                Real* curveTminOut = nullptr) {
     Real dSurf = h.valid ? h.t : BIG;
 
     // Dielectric Beer-Lambert over the marched arc (the block further down only covers the
@@ -9234,7 +9247,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // the hero tracer also calls) leaves exactly one definition of the rule.
         if (pathC) pathC->bits |= dPhotonVertexBit(sc, m, h);
         return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
-                                ro, rd, beta, lambda, rng, eAbsorbed, stk);
+                                ro, rd, beta, lambda, rng, eAbsorbed, stk, curveTminOut);
     } else if (m.type == D_DIFFUSETRANSMIT) {
         // Two-lobe Lambertian (device twin of render.h DiffuseTransmit): `reflect` into
         // the front (+n) hemisphere, `transmit` into the back (-n) hemisphere. Splat BOTH
@@ -9497,7 +9510,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
 __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int camMode,
         int diffraction, int C, const DHit& h, DVec3& ro, DVec3& rd, Real* lam, Real* beta,
         bool& secAlive, DRng& rng, double& eAbsorbed, double& eSensor, double& eEscaped,
-        DMediumStack& stk, DPathCaustic* pathC = nullptr) {
+        DMediumStack& stk, DPathCaustic* pathC = nullptr, Real* curveTminOut = nullptr) {
     const int nUp = C;
     Real dEvent = h.valid ? h.t : BIG;
 
@@ -9642,7 +9655,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         if (pathC) pathC->bits |= dPhotonVertexBit(sc, m, h);   // caustic split
         beta[0] *= (Real)C; secAlive = false;
         return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
-                                ro, rd, beta[0], lam[0], rng, eAbsorbed, stk);
+                                ro, rd, beta[0], lam[0], rng, eAbsorbed, stk, curveTminOut);
     }
 
     // Diffuse (texture-sampled reflectance when the material binds a texture).
@@ -9699,16 +9712,20 @@ __device__ static void traceHeroPhoton(const DScene& sc, const DCamSet& cs, int 
     // every dispersive caustic would be filed as ordinary indirect light.
     DPathCaustic pathC{(emH >= 0 && emH == sc.envIndex && sc.env.scale != nullptr) ? PV_BIT_ENVFIRST : 0,
                        bornCausticW};
+    Real curveTmin = (Real)0;   // a fiber's exit clearance for the next hop, curve prims only
     for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
         if (sc.hasGrin) dGrinMarch(sc, ro, rd);   // gate excludes GRIN; kept for symmetry
-        DHit h = closestHit(sc, ro, rd);
+        DHit h = closestHit(sc, ro, rd, curveTmin > (Real)0 ? (Real)0 : RAY_EPS, BIG, false,
+                            curveTmin);
+        curveTmin = (Real)0;
         int r;
         if (secAlive)
             r = shadeStepHero(sc, cs, camMode, diffraction, C, h, ro, rd, lam, beta, secAlive, rng,
-                              eAbsorbed, eSensor, eEscaped, stk, &pathC);
+                              eAbsorbed, eSensor, eEscaped, stk, &pathC, &curveTmin);
         else
             r = shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta[0], lam[0], rng,
-                          eAbsorbed, eSensor, eEscaped, stk, nullptr, -1, 0, nullptr, &pathC);
+                          eAbsorbed, eSensor, eEscaped, stk, nullptr, -1, 0, nullptr, &pathC,
+                          nullptr, -1, nullptr, &curveTmin);
         if (r == WF_TERMINATE) done = true;
     }
     if (!done) {
@@ -9781,6 +9798,7 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
         // aimed pass's MIS weight fixed at birth (causticaim.h).
         DPathCaustic pathC{(srcEm >= 0 && srcEm == sc.envIndex && sc.env.scale != nullptr) ? PV_BIT_ENVFIRST : 0,
                            bornCausticW};
+        Real curveTmin = (Real)0;   // a fiber's exit clearance for the next hop, curve prims only
         for (int bounce = 0; bounce < maxBounce && !done; ++bounce) {
             // Bend through any GRIN region first, INTEGRATING THE MEDIA ALONG THE CURVE
             // (see dGrinMarch): every medium is transported analog on the curved span,
@@ -9788,11 +9806,13 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
             // beam and analog sampling gives the same answer a beam would have paid back.
             DGrinMedia gm; gm.rng = &rng; gm.lambda = lambda;
             if (sc.hasGrin) dGrinMarch(sc, ro, rd, &gm);
-            DHit h = closestHit(sc, ro, rd);
+            DHit h = closestHit(sc, ro, rd, curveTmin > (Real)0 ? (Real)0 : RAY_EPS, BIG, false,
+                                curveTmin);
+            curveTmin = (Real)0;
             if (shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
                           eAbsorbed, eSensor, eEscaped, stk, cs.beamsOn() ? &crng : nullptr,
                           gm.hit ? gm.which : -1, gm.arc, &beamScat,
-                          &pathC, &spec, srcEm, &nSurf) == WF_TERMINATE) done = true;
+                          &pathC, &spec, srcEm, &nSurf, &curveTmin) == WF_TERMINATE) done = true;
         }
         if (!done) eResidual += beta;
     }
@@ -9853,6 +9873,9 @@ struct WFState {
     // (causticaim.h) rides in the same record for the same reason: it is fixed at BIRTH, in
     // wfSpawn, and spent bounces later at the deposit.
     DPathCaustic* pathC;
+    // A fiber's exit clearance for the next hop, for CURVE primitives only (interactHair):
+    // produced by kWfShade, consumed by the next kWfExtend.
+    Real* curveTmin;
 };
 
 // Claim photon budget and emit fresh photons into `slot` until one is successfully
@@ -9874,6 +9897,7 @@ __device__ static bool wfSpawn(const DScene& sc, const DCamSet& cs,
             st.ro[slot] = ro; st.rd[slot] = rd;
             st.beta[slot] = beta; st.lambda[slot] = lambda;
             st.bounce[slot] = 0; st.alive[slot] = 1; st.stkN[slot] = 0;
+            st.curveTmin[slot] = (Real)0;
             // Fresh photon: no vertex seen yet, so neither bit is set; the aimed pass's
             // weight is whatever emission just assigned it (1 without `-causticn`).
             st.pathC[slot] = DPathCaustic{(emW >= 0 && emW == sc.envIndex && sc.env.scale != nullptr)
@@ -9917,7 +9941,9 @@ __global__ void kWfExtend(DScene sc, WFState st, int W) {
         st.gmMed[slot] = gm.hit ? gm.which : -1;
         st.gmArc[slot] = gm.arc;
     }
-    st.hit[slot] = closestHit(sc, st.ro[slot], st.rd[slot]);
+    const Real ct = st.curveTmin[slot];
+    st.hit[slot] = closestHit(sc, st.ro[slot], st.rd[slot], ct > (Real)0 ? (Real)0 : RAY_EPS, BIG,
+                              false, ct);
 }
 
 // Shade: advance each live slot by one bounce; regenerate on termination / bounce cap.
@@ -9938,10 +9964,11 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
     }
     double eAbs = 0, eSen = 0, eEsc = 0;
     DPathCaustic pathC = st.pathC[slot];   // caustic history + MIS weight, from earlier bounces
+    Real curveTmin = (Real)0;
     int res = shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
                         eAbs, eSen, eEsc, stk, nullptr,
                         st.gmMed[slot], st.gmArc[slot],   // GRIN pre-pass, from kWfExtend
-                        nullptr, &pathC);
+                        nullptr, &pathC, nullptr, -1, nullptr, &curveTmin);
     int bounce = st.bounce[slot] + 1;
     bool pathDone = (res == WF_TERMINATE);
     // Bounce cap: the photon survived maxBounce shadeStep calls without terminating —
@@ -9952,7 +9979,7 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
     if (eEsc != 0.0) atomicAdd(&energy[3], eEsc);
     if (!pathDone) {
         st.ro[slot] = ro; st.rd[slot] = rd; st.beta[slot] = beta;
-        st.bounce[slot] = bounce; st.rng[slot] = rng;
+        st.bounce[slot] = bounce; st.rng[slot] = rng; st.curveTmin[slot] = curveTmin;
         st.lambda[slot] = lambda;   // fluorescence may Stokes-shift lambda mid-path
         // Store the medium stack back to SoA (carry to the next segment).
         st.stkN[slot] = stk.n;
@@ -10819,12 +10846,14 @@ __device__ static bool bkHairResponse(const DHairShade& hsv, const DVec3& wi,
     stG = (Real)1;
     return cosSurf > (Real)0;
 }
-__device__ static bool bkHairBlocked(const DScene& sc, const DHit& h, const DHairShade& hsv,
-                                     const DVec3& wi, Real d) {
+// The fraction of a fiber's shadow ray that reaches `d`: 0 blocked, and between 0 and 1 through
+// other strands of `opacity` below 1, as on the host (emitterGeom) and in bkEnvGeom's fiber case.
+__device__ static Real bkHairTransmittance(const DScene& sc, const DHit& h, const DHairShade& hsv,
+                                           const DVec3& wi, Real d) {
     const Real off = dHairExitOffset(hsv, h.n, wi);
     const Real len = connMaxT((double)d - (double)off, RAY_EPS, dMaxAbs(h.p));
-    if (len <= (Real)0) return true;
-    return occluded(sc, h.p + wi * (Real)RAY_EPS, wi, len, RAY_EPS, false, off);
+    if (len <= (Real)0) return (Real)0;
+    return shadowTransmittance(sc, h.p + wi * (Real)RAY_EPS, wi, len, RAY_EPS, off);
 }
 // `hs` non-null = the shading vertex is a hair fiber: swap the cosine/terminator response
 // and the surface-offset shadow ray for the hair versions above (all remaining geometry —
@@ -10853,9 +10882,10 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         }
         g.fall = (Real)spotFalloff(dot(g.wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
         if (g.fall <= (Real)0) return false;
-        if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
-               : !((vis = shadowTransmittanceTo(sc, dOffsetAlong(h.p, h.ng, g.wi), h.p + g.wi * g.dist,
-                                                 2 * RAY_EPS)) > (Real)0)) return false;
+        vis = hs ? bkHairTransmittance(sc, h, *hs, g.wi, g.dist)
+                 : shadowTransmittanceTo(sc, dOffsetAlong(h.p, h.ng, g.wi), h.p + g.wi * g.dist,
+                                         2 * RAY_EPS);
+        if (!(vis > (Real)0)) return false;
         g.fall = (Real)((double)g.fall * (double)vis);
         g.G = (Real)0; g.spot = true; g.sun = false;
         g.pdfW = (Real)0;                                   // delta: no lobe sample can reach it
@@ -10878,8 +10908,9 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         }
         g.dist = (Real)((double)length(sc.sceneCenter - h.p) + sc.sceneRadius);
         g.dist2 = g.dist * g.dist;
-        if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
-               : !((vis = shadowTransmittance(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, g.dist)) > (Real)0)) return false;
+        vis = hs ? bkHairTransmittance(sc, h, *hs, g.wi, g.dist)
+                 : shadowTransmittance(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, g.dist);
+        if (!(vis > (Real)0)) return false;
         g.wSun = (Real)((double)g.cosSurf * em.spotOmega * (double)g.stG * (double)vis);
         g.G = (Real)0; g.fall = (Real)1; g.spot = false; g.sun = true;
         g.pdfW = (em.spotOmega > 0) ? (Real)(1.0 / em.spotOmega) : (Real)0;   // uniform in cone
@@ -10915,9 +10946,10 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     // short of the light's own surface. The bare (origin, wi, dist) form ends on or inside the
     // emitter, where a sphere light shadows its own sample on the float32 device
     // (tools/check_distant_light.py).
-    if (hs ? bkHairBlocked(sc, h, *hs, g.wi, g.dist)
-           : !((vis = shadowTransmittanceTo(sc, dOffsetAlong(h.p, h.ng, g.wi), h.p + g.wi * g.dist,
-                                             2 * RAY_EPS)) > (Real)0)) return false;
+    vis = hs ? bkHairTransmittance(sc, h, *hs, g.wi, g.dist)
+             : shadowTransmittanceTo(sc, dOffsetAlong(h.p, h.ng, g.wi), h.p + g.wi * g.dist,
+                                     2 * RAY_EPS);
+    if (!(vis > (Real)0)) return false;
     // Side test above: authored normal. Measure below: the patch's own orientation, since the
     // solid angle a patch subtends depends on how it is oriented and not on where its emission is
     // aimed. Host twin backward.h's emitterGeom, where the reasoning lives. Bit-identical unless
@@ -11524,7 +11556,10 @@ __device__ __noinline__ static bool bkInteractHair(const DScene& sc, const DMate
     L += thr * bkNeeLight(sc, h, (Real)1, invPdfLambda, lambda, rng, giDepth, &hsv);
     if (sc.envIndex >= 0)
         L += thr * bkNeeEnv(sc, h, (Real)1, invPdfLambda, lambda, rng, &hsv);
-    if (directOnly) return false;             // mode W -direct: direct fiber light only
+    // Direct-only (mode W) ends the path at a fiber -- but only for light the fiber INTERCEPTED:
+    // the un-intercepted fraction of a see-through fiber passes on, or invisible fur blocks
+    // everything behind it. An opaque fiber ends first, drawing nothing (host twin).
+    if (directOnly && hsv.b.opacity >= 1.0) return false;
     // Continuation: importance-sample the BCSDF. Named u's — C++ leaves argument
     // evaluation order unspecified, and these four MUST come off the stream in order.
     const double u0 = rng.uniform(), u1 = rng.uniform(),
@@ -11532,6 +11567,9 @@ __device__ __noinline__ static bool bkInteractHair(const DScene& sc, const DMate
     double pdfH = 0.0, fv = 0.0;
     const dhair::V3 wl = dhair::sample(hsv.b, hsv.woLocal, u0, u1, u2, u3, pdfH, fv);
     if (!(pdfH > 0.0) || !(fv > 0.0)) return false;
+    if (directOnly && !(wl.x == -hsv.woLocal.x && wl.y == -hsv.woLocal.y &&
+                        wl.z == -hsv.woLocal.z))
+        return false;                          // intercepted: its direct light is all it gives
     // Survive with T = f*cosLong/pdf (= sum of lobe albedos when the sample is
     // exact), throughput otherwise unchanged — the same analog RR as the CPU and
     // the forward tracer. Mode W carries T as weight instead of flipping the coin.
@@ -11943,6 +11981,10 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             Real tMed = 0; int whichMed = gmed.which;
             if (gmed.hit || dMediaSampleCollision(sc, ro, rd, dSurf, lambda, rng, tMed, whichMed)) {
                 DVec3 p = ro + rd * tMed;
+                // A scatter is a real vertex that never reaches bkInteract, where the glossy MIS
+                // record is cleared: left set, it would weigh this vertex's sky escape with the
+                // glossy lobe's density instead of the phase function's (host twin: radiance()).
+                gmis.clear();
                 int cm = stk.topMat();     // Beer-Lambert over the in-glass free-flight leg
                 Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
                 if (a > 0) thr *= exp(-(double)a * (double)tMed);
@@ -12100,12 +12142,15 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                           const Real* lamIn, const double* invPdfIn,
                                           const double* thrIn, int C, bool secAlive,
                                           bool specularArrival, double contBsdfPdf,
-                                          int bounce0, double* Lout, DRng& rng, DGiCtx gi) {
+                                          int bounce0, double* Lout, DRng& rng, DGiCtx gi,
+                                          const DGlossyMis* gmis0 = nullptr) {
     Real   lam[hero::kHeroMax];
     double invPdf[hero::kHeroMax], thr[hero::kHeroMax];
     // GLOSSY-NEE: the hero twin of bkRadiance's carrier. Cleared just before the material
-    // switch (see the note there), never at the top of the loop.
+    // switch (see the note there), never at the top of the loop. `gmis0`: a split sub-path that
+    // starts past a pass-through (no vertex) carries its parent's record across it.
     DGlossyMis gmis; gmis.clear();
+    if (gmis0) gmis = *gmis0;
     // Copy only the LIVE entries: a monochromatic sub-path spawned by the split fills only
     // slot 0 of its lamIn/invPdfIn/thrIn, so reading all C would read indeterminate values
     // (harmless while nUp == 1 ignores them, but still UB).
@@ -12384,9 +12429,15 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                         // <false>: the hero tracer handles its own diffuse vertices inline, so
                         // the shared scalar interaction never needs the -gi gather (see the
                         // bkInteract declaration).
+                        bool sNull = false;
                         if (bkInteract<false>(sc, mp, h, matId, diffraction, directOnly, sRo, sRd,
-                                              sLam, sInv, sThr, sL, sSpec, sPdf, sStk, rng, gi)) {
+                                              sLam, sInv, sThr, sL, sSpec, sPdf, sStk, rng, gi,
+                                              nullptr, &sNull)) {
                             double sub[hero::kHeroMax];
+                            // A coverage pass-through is no vertex, for a sub-path as for the
+                            // hero below: it keeps the record the hero restores (gmisIn) and is
+                            // refunded its bounce.
+                            const bool refund = sNull && nullStepsH < 256;
                             // <false, ...>: a sub-path can never split again, which is what
                             // bounds the split re-entry at one level (see the header comment).
                             // GiDepth is INHERITED, so a sub-path of a camera path still
@@ -12394,7 +12445,8 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                             bkRadianceHeroLoop<false, GiDepth>(sc, diffraction, sRo, sRd, sStk,
                                                                &sLam, &sInv, &sThr, /*C=*/1,
                                                                /*secAlive=*/false, sSpec, sPdf,
-                                                               b + 1, sub, rng, gi);
+                                                               refund ? b : b + 1, sub, rng, gi,
+                                                               sNull ? &gmisIn : nullptr);
                             sL += sub[0];
                         }
                         L[i] += sL;      // this wavelength's own estimate, own slot
@@ -14655,6 +14707,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
     const bool causOn = (pmC.photons != nullptr);
     const Real r2C = (Real)((double)pmC.radius * (double)pmC.radius);
     const int maxBounce = 32;
+    Real curveTmin = (Real)0;   // a fiber's exit clearance for the next hop, curve prims only
     for (int b = 0; b < maxBounce; ++b) {
         if (sc.hasGrin) {                                // final-gather rays bend too
             DGrinMedia gm;                               // rng == nullptr: bend only
@@ -14663,7 +14716,9 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             Real a = (cm >= 0) ? specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
             if (a > 0 && gm.arc > 0) thr *= exp(-(double)a * (double)gm.arc);
         }
-        DHit h = closestHit(sc, ro, rd);
+        DHit h = closestHit(sc, ro, rd, curveTmin > (Real)0 ? (Real)0 : RAY_EPS, BIG, false,
+                            curveTmin);
+        curveTmin = (Real)0;
         if (h.valid) {                                   // Beer-Lambert in current medium
             int cm = stk.topMat();
             Real a = (cm >= 0) ? specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
@@ -14818,7 +14873,11 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 if (hsv.b.opacity < 1.0 && wl.x == -hsv.woLocal.x && wl.y == -hsv.woLocal.y &&
                     wl.z == -hsv.woLocal.z) { nullHere = true; hairArrival = hairArrivalIn; }
                 const DVec3 wOut = dhair::toWorld(hsv.fr, wl);
-                ro = h.p + wOut * dHairExitOffset(hsv, h.n, wOut);
+                // Clear the strand by skipping curves within its exit distance on the next
+                // trace, from a ULP-moved origin (see interactHair): moving the origin out by
+                // that distance carries a ray leaving near a root through the skin below.
+                curveTmin = dHairExitOffset(hsv, h.n, wOut);
+                ro = dOffsetPoint(h.p, wOut);
                 rd = wOut;
                 break;
             }
@@ -15080,6 +15139,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
     // the direct-sun chords may have emptied the map.
     const bool sunOn = (bm != nullptr) && bm->sunNee && sc.sunCount > 0 && sc.mediaN > 0;
 
+    Real curveTmin = (Real)0;   // a fiber's exit clearance for the next hop, curve prims only
     for (int b = 0; b < maxBounce; ++b) {
         // Second cancellation point, covering the rays that spend their time BOUNCING rather
         // than in one big beam walk (a scene with no media never enters dGatherPhotonBeams).
@@ -15127,7 +15187,9 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         // b == 0 is the camera ray dPhotonGather was handed (mode M's eye pass); see
         // DMaterial::hideCamera. dPhotonGatherSub's walk is NOT given this: a final-gather
         // sub-ray leaves a visible point, so it is an indirect ray and must see the flat.
-        DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG, /*camHide=*/(b == 0));
+        DHit h = closestHit(sc, ro, rd, curveTmin > (Real)0 ? (Real)0 : RAY_EPS, BIG,
+                            /*camHide=*/(b == 0), curveTmin);
+        curveTmin = (Real)0;
         // --- Participating media along this segment (mode M with -beams) ------------------
         // Done BEFORE `thr` takes the segment's attenuation, for the same reason: each
         // gathered beam carries the transmittance to ITS OWN closest approach.
@@ -15162,11 +15224,11 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 oY += (double)cieY(lambda) * e;
                 oZ += (double)cieZ(lambda) * e;
             }
-            // Directly-viewed solar disc. This walk terminates at the first diffuse
-            // vertex (the density estimate returns there), so any escape reaching here
-            // is a camera ray or a specular chain — never a diffuse continuation that
-            // the map / NEE already credited with the sun. (Host twin: photonmap_render.h.)
-            if (sc.sunCount > 0) {
+            // Directly-viewed solar disc. This walk terminates at the first diffuse vertex, so an
+            // escape reaching here is a camera ray, a specular chain, or a fiber's continuation --
+            // and a fiber's own light sampling (HAIR-NEE) already took the sun (`hairArrival`).
+            // The sky is not among what it took. (Host twin: photonmap_render.h.)
+            if (sc.sunCount > 0 && !hairArrival) {
                 double e = thr * dSunRadianceMis(sc, gmis, rd, lambda) * invPdfL;
                 oX += (double)cieX(lambda) * e;
                 oY += (double)cieY(lambda) * e;
@@ -15417,15 +15479,16 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 if (!passedThru) {   // per-lobe form (0.336.0): one exp + the four-lobe recurrence per bin
                     const bool perLobe = la.valid;
                     const double den = m.hairSigmaAFromReflect ? dhair::sigmaADenominator(m.hairBetaN) : 0.0;   // hoisted: three pow() per bin otherwise
+                    const double specPat = dHairSpecPatAt(sc, m, h);   // hoisted: the pattern is the same at every bin
                     double vk[DSpecThr::K];
                     for (int k = 0; k < DSpecThr::K; ++k) {
                         const Real lk = DSpecThr::lamOf(k);
                         double w;
-                        if (perLobe) {
+                        if (perLobe && !dHairMedullaLiveAt(hsv.b, m, lk)) {   // both fibers solid: fold
                             double sig;
                             if (m.hairSigmaAFromReflect) { double c = (double)dDiffuseRho(sc, m, h, lk); sig = dhair::sigmaAFromReflectanceD(c, den); }
                             else sig = fmax(0.0, (double)specLookup(m.hairSigmaA, lk));
-                            w = hsv.b.opacity * dhair::fFromLobes(la, sig, dHairSpecularAt(sc, m, h, lk)) * cosLong / pdfH;
+                            w = hsv.b.opacity * dhair::fFromLobes(la, sig, dHairSpecularFrom(m, lk, specPat)) * cosLong / pdfH;
                         }
                         else { const DHairShade hk = dHairShadeAt(sc, m, h, lk, wPrev); w = dhair::f(hk.b, hk.woLocal, wl) * cosLong / pdfH; }
                         vk[k] = w < 0.0 ? 0.0 : (w > 1.0 ? 1.0 : w);
@@ -15433,7 +15496,11 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     sthr.mulVec(vk, wCam);
                 }
                 const DVec3 wOut = dhair::toWorld(hsv.fr, wl);
-                ro = h.p + wOut * dHairExitOffset(hsv, h.n, wOut);
+                // Clear the strand by skipping curves within its exit distance on the next
+                // trace, from a ULP-moved origin (see interactHair): moving the origin out by
+                // that distance carries a ray leaving near a root through the skin below.
+                curveTmin = dHairExitOffset(hsv, h.n, wOut);
+                ro = dOffsetPoint(h.p, wOut);
                 rd = wOut;
                 break;
             }
@@ -18824,6 +18891,7 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     CUDA_CHECK(cudaMalloc(&st.gmMed,  (size_t)W * sizeof(int)));    // GRIN pre-pass results,
     CUDA_CHECK(cudaMalloc(&st.gmArc,  (size_t)W * sizeof(Real)));   // extend -> shade
     CUDA_CHECK(cudaMalloc(&st.pathC, (size_t)W * sizeof(DPathCaustic)));  // caustic path state
+    CUDA_CHECK(cudaMalloc(&st.curveTmin, (size_t)W * sizeof(Real)));     // fiber exit, shade -> extend
     CUDA_CHECK(cudaMemset(st.alive, 0, (size_t)W * sizeof(int)));
 
     unsigned long long* d_dispatched = nullptr;
@@ -18858,7 +18926,7 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     cudaFree(st.ro); cudaFree(st.rd); cudaFree(st.beta); cudaFree(st.lambda);
     cudaFree(st.rng); cudaFree(st.bounce); cudaFree(st.alive);
     cudaFree(st.stkMat); cudaFree(st.stkPri); cudaFree(st.stkN); cudaFree(st.hit);
-    cudaFree(st.gmMed); cudaFree(st.gmArc); cudaFree(st.pathC);
+    cudaFree(st.gmMed); cudaFree(st.gmArc); cudaFree(st.pathC); cudaFree(st.curveTmin);
     cudaFree(d_dispatched); cudaFree(d_live);
 }
 
