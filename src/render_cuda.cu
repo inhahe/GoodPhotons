@@ -13718,7 +13718,15 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     // with, exactly as the emission-on-hit side scales the s=0 strategy's radiance.
     double emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, y, nOut);
     double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * emitPatW;
-    if (Le <= 0.0) return 0;
+    // The bundle's other wavelengths: a subpath dark at the hero alone still carries them (the
+    // walk goes on while any wavelength lives), as the spot / sun branch's does. Host twin:
+    // bdpt.h generateLightSubpath.
+    double mxLe = Le;
+    for (int i = 0; i + 1 < hb.C; ++i) {
+        pathSec[i] = (double)specLookup(em.emitSpd, hb.lam[i + 1]) * hb.invPdf[i + 1] * emitPatW;
+        if (pathSec[i] > mxLe) mxLe = pathSec[i];
+    }
+    if (!(mxLe > 0.0)) return 0;
     double pdfChoice = em.power / sc.totalPower;
     double pdfPos = (em.area > 0.0) ? 1.0 / em.area : 0.0;
     if (pdfPos <= 0.0) return 0;
@@ -13728,10 +13736,9 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     L0.matId = em.matId; L0.lightIdx = ei;
     L0.emitPatW = (Real)emitPatW;
     L0.mediumG = 0.0; L0.mediumId = -1;
-    // The light endpoint carries each wavelength's own emitted radiance Le(λ)/pdf(λ).
+    // The light endpoint carries each wavelength's own emitted radiance Le(λ)/pdf(λ) (pathSec,
+    // filled above).
     L0.nUp = hb.C;
-    for (int i = 0; i + 1 < hb.C; ++i)
-        pathSec[i] = (double)specLookup(em.emitSpd, hb.lam[i + 1]) * hb.invPdf[i + 1] * emitPatW;
     path[0] = L0; int n = 1;
     DVec3 dir = cosineHemisphere(nOut, rng);
     double cosLight = ddot(nOut, dir);
@@ -14443,8 +14450,12 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                 }
             }
         }
+        // s = 1 draws a light point of its own (dConnectBDPT reads no light[] for it), so it runs
+        // whatever the light subpath drew: an empty one must not take the s = 1 sample with it.
+        // Host twin: BdptRenderer::renderRows.
+        const int sMax = (nL > 0) ? nL : 1;
         for (int t = 1; t <= nE; ++t)
-            for (int s = 0; s <= nL; ++s) {
+            for (int s = 0; s <= sMax; ++s) {
                 int depth = t + s - 2;
                 if ((s == 1 && t == 1) || depth < 0 || depth > maxDepth) continue;
                 int spx = 0, spy = 0, isSplat = 0, nUpConn = 0;

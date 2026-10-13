@@ -1534,7 +1534,15 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     // radiance itself. Vertex::emitPatW carries the same factor for those MIS terms.
     double emitPatW = emitterSamplePoint(scene, em, u1, u2, y, nOut);
     double Le = em.spdFn(lambda) * invPdfLambda * emitPatW;   // emitted radiance at lambda
-    if (Le <= 0.0) return 0;
+    // The bundle's other wavelengths: a subpath dark at the hero alone still carries them (the
+    // walk goes on while any wavelength lives), as deltaLightSubpath's does.
+    double LeSec[hero::kHeroMax - 1] = {0};
+    double mxLe = Le;
+    for (int i = 0; i + 1 < hb.C; ++i) {
+        LeSec[i] = em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1] * emitPatW;
+        if (LeSec[i] > mxLe) mxLe = LeSec[i];
+    }
+    if (!(mxLe > 0.0)) return 0;
 
     double pdfChoice = em.power / scene.totalPower;
     double pdfPos = (em.area > 0.0) ? 1.0 / em.area : 0.0;
@@ -1552,8 +1560,7 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     // both sides of every connection speak about the same C wavelengths.
     L0.nUp = hb.C;
     L0.emitPatW = emitPatW;
-    for (int i = 0; i + 1 < hb.C; ++i)
-        L0.betaSec[i] = em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1] * emitPatW;
+    for (int i = 0; i + 1 < hb.C; ++i) L0.betaSec[i] = LeSec[i];
     path.push_back(L0);
 
     Vec3 dir = cosineHemisphere(nOut, rng);
@@ -3598,6 +3605,14 @@ struct BdptRenderer {
                                                    mergeOn ? &segs : nullptr);
                     int nL = generateLightSubpath(scene, cam, mats, hb,
                                                   maxDepth + 1, rng, light);
+                    // The s=1 strategy draws a light point of its own (connectBDPT), so it runs
+                    // whatever the light subpath drew. A subpath that came back empty -- its
+                    // emitter dark where it started, at every wavelength of the bundle -- must
+                    // not take the s=1 sample with it: every path that strategy reaches is
+                    // weighted for one sample of it per frame. light[0] is then only the slot
+                    // misWeight installs the resampled point in.
+                    if (nL == 0) { light.assign(1, Vertex{}); light[0].type = VType::Light; }
+                    const int sMax = (nL > 0) ? nL : 1;
                     Vec3 cie[hero::kHeroMax];
                     for (int i = 0; i < hb.C; ++i)
                         cie[i] = Vec3(cieX(hb.lam[i]), cieY(hb.lam[i]), cieZ(hb.lam[i]));
@@ -3630,7 +3645,7 @@ struct BdptRenderer {
                         }
                     }
                     for (int t = 1; t <= nE; ++t)
-                        for (int s = 0; s <= nL; ++s) {
+                        for (int s = 0; s <= sMax; ++s) {
                             int depth = t + s - 2;
                             if ((s == 1 && t == 1) || depth < 0 || depth > maxDepth) continue;
                             int spx = 0, spy = 0; bool isSplat = false;

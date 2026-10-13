@@ -123,6 +123,21 @@ trades the per-segment skip list for a per-vertex one -- emission at the resolve
 weight, the radiance-cache marks -- so the tested design stays, with the constraint stated where a
 future per-segment event would be added.
 
+## DONE (2026-10-13, 0.377.4): BDPT-S1-SKIP — mode D lost its light sampling whenever its light subpath came back empty
+
+BDPT's s = 1 strategy draws a light point of its own, yet `renderRows` (and the device's
+`kBdptT`) looped the strategies only up to the light subpath's length, so a frame whose light
+subpath came back empty took its s = 1 sample down with it -- while every MIS weight still counted
+one. A light subpath comes back empty where its emitter is dark at the point it drew (an
+`spd_map` zero) and, at the area-light start, where it was dark at the HERO wavelength alone
+(the rest of the bundle dropped with it; the spot / sun start already tested the whole bundle).
+On two narrow-band lamps and a half-dark patterned one, mode D read x0.726 of mode R at
+`-heroc 4` (138 sigma; the worst tile x0.43) and x0.925 at `-heroc 1`, the device the same. Found
+while checking fire in mode D, whose light subpaths start empty whenever their origin lands on a
+cold point: x0.967 of mode R behind a physical lens, where s = 1 is the only strategy for the
+glow the soot scatters. Now s = 1 runs every frame, and a light subpath stops only when the whole
+bundle is dark where it starts (`tools/check_bdpt_s1.py`).
+
 ## DONE (2026-10-13, 0.377.3): REVIEW-0377 — what the Opus and Fable reviews of 0.375.4-0.377.2 found
 
 Each checked against the code before it was fixed. Opus (max) found those down to the dead code;

@@ -4558,6 +4558,17 @@ as the one at fault.
   `BdptRenderer::renderRows` adds `beta·Le` for every Sun whose cone contains that direction
   — with **MIS weight exactly 1**, valid only because the block is gated on *every* eye
   vertex being delta, which is precisely when no other strategy can reach the sun.
+
+  **The s = 1 strategy runs every sample** (0.377.4). It draws a light point of its own, so it
+  does not depend on the light subpath -- and every MIS weight counts one s = 1 sample per
+  frame. A light subpath comes back empty where its emitter is dark at the point it drew (an
+  `spd_map` zero) or at every wavelength of the bundle (a narrow-band lamp), and the strategy
+  loop used to stop at the subpath's length, taking the s = 1 sample with it: mode D read
+  x0.73 of mode R at `-heroc 4` on two narrow-band lamps and a half-dark patterned one
+  (`tools/check_bdpt_s1.py`). `renderRows` now runs s = 1 whatever `nL` is (light[0] only the
+  slot `misWeight` installs the resampled point in), as does the device's `kBdptT`. A light
+  subpath also gives up only when the WHOLE bundle is dark where it starts, not the hero alone,
+  as the spot / sun start already did.
   Gated by `Scene::sunCount` so sun-free scenes pay nothing.
   `scenes/_deltalight_mix.ftsl` is the regression scene (area + spot + sun + a mirror
   sphere); mode `D` vs mode `R` agrees to 0.33 % of mean luminance.
