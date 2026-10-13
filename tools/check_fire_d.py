@@ -21,10 +21,13 @@ checked against the forward tracer by check_fire_r), two seeds each:
      where no light subpath lands -- the s=0 points the eye walk gathers past the pane are the
      only strategy left;
   6. the pane through a pinhole: there light subpaths through the pane reach the film too, and
-     share those paths with the s=0 points.
-(A pane, crossed in and out, not a solid ball around the fire: a path crossing a single
-interface needs the radiance scale n^2 that no camera-side estimator applies yet -- known-issues
-RADIANCE-ETA2.)
+     share those paths with the s=0 points;
+  7. the fire inside a solid glass ball: every path from it crosses one interface, the camera
+     side carrying radiance across it at (n_from / n_to)^2 and the light side flux
+     (known-issues RADIANCE-ETA2);
+  8. an area lamp beside the fire, about as bright on the frame: the one configuration in which
+     mode D picks between a fire and an emitter, so the fire's share of the light pick
+     (bdptPickLight, bdptPickPdf) enters every weight.
 A tile fails when the two differ by more than 5 standard errors (from the seed pairs) AND by more
 than 2 % (3 % behind the lens); the frame, by more than 5 standard errors AND 1 %. Exits 1 on any
 failure.
@@ -54,8 +57,17 @@ PANE = ['material "glass" { type dielectric  ior 1.5 }'] + [
         ("-2 1.5 -1.0", "0 0 0.1", "4 0 0"))]          # top, +y
 
 
+# The fire's box is x, z -0.5..0.5, y 0..1; its soot fills the ball inscribed in it.
+BALL = ['material "glass" { type dielectric  ior 1.5 }',
+        'sphere { center 0 0.5 0  radius 0.5  material glass }']
+# An area lamp off to the side, about as bright on the frame as the fire (its glow is faint).
+LAMP = ('light area { origin 0.9 1.6 -1.2  u 0.4 0 0  v 0 0 0.4  normal 0 -1 0  power 6e-5  '
+        'spd preset:d65 }')
+
+
 def variants():
-    """The mirror, lens and glass-pane variants of check_fire_r's scene (name -> lines)."""
+    """The mirror, lens, glass-pane, glass-ball and lamp variants of check_fire_r's scene
+    (name -> lines)."""
     mirror = [l.replace('material "wall"  { type diffuse  reflect rgb 0.55 0.6 0.7 }',
                         'material "wall"  { type mirror  reflect 0.9 }') for l in SCENE]
     lens = [l.replace("film { res 96 72 } }", "film { res 96 72 }  %s }" % LENS) for l in SCENE]
@@ -64,7 +76,8 @@ def variants():
     for v in (mirror, lens):
         assert v != SCENE
     return {"fire_mirror.ftsl": mirror, "fire_lens.ftsl": lens, "fire_pane.ftsl": pane,
-            "fire_pane_lens.ftsl": pane_lens}
+            "fire_pane_lens.ftsl": pane_lens, "fire_ball.ftsl": SCENE + BALL,
+            "fire_lamp.ftsl": SCENE + [LAMP]}
 
 
 def main():
@@ -102,7 +115,9 @@ def main():
     for scene, label, tol in (("fire_mirror.ftsl", "a mirror wall", 0.02),
                               ("fire_lens.ftsl", "a physical lens", 0.03),
                               ("fire_pane_lens.ftsl", "a glass pane, through the lens", 0.03),
-                              ("fire_pane.ftsl", "a glass pane, through a pinhole", 0.02)):
+                              ("fire_pane.ftsl", "a glass pane, through a pinhole", 0.02),
+                              ("fire_ball.ftsl", "inside a glass ball", 0.02),
+                              ("fire_lamp.ftsl", "with an area lamp", 0.02)):
         tag = scene[:-5]
         pairs.append(("mode D / mode R, " + label, render("d_" + tag, ["-mode", "D"], scene),
                       render("r_" + tag, ["-mode", "R"], scene), tol))

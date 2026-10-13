@@ -60,6 +60,7 @@ def main():
         f.write(NL.join(SCENE) + NL)
 
     def render(tag, args):
+        """Two seeds of one configuration; a `-device gpu` render must say it ran there."""
         imgs = []
         for seed in (1, 2):
             png = "%s_s%d.png" % (tag, seed)
@@ -71,18 +72,19 @@ def main():
             if p.returncode != 0 or not os.path.exists(pfm):
                 print(p.stdout[-1500:], p.stderr[-1500:])
                 raise SystemExit("render failed: " + " ".join(cmd))
+            if "gpu" in args and "-> GPU" not in p.stdout + p.stderr:
+                raise SystemExit("did not run on the GPU: " + " ".join(cmd))
             imgs.append(read_pfm(pfm).sum(-1))
         return imgs
 
-    pairs = []
+    pairs, host = [], {}
     for c in ("4", "1"):
-        dd = render("d_c" + c, ["-mode", "D", "-device", "cpu", "-heroc", c])
+        host[c] = render("d_c" + c, ["-mode", "D", "-device", "cpu", "-heroc", c])
         rr = render("r_c" + c, ["-mode", "R", "-device", "cpu", "-heroc", c])
-        pairs.append(("mode D / mode R, -heroc " + c, dd, rr))
+        pairs.append(("mode D / mode R, -heroc " + c, host[c], rr))
     if not a.no_gpu:
         dg = render("d_gpu", ["-mode", "D", "-device", "gpu", "-heroc", "4"])
-        pairs.append(("mode D device / host, -heroc 4", dg, render("d_c4", ["-mode", "D", "-device",
-                                                                            "cpu", "-heroc", "4"])))
+        pairs.append(("mode D device / host, -heroc 4", dg, host["4"]))
     ok = True
     for name, x1, x0 in pairs:
         ratio, z, bad = tile_verdict(tile_stats(*x1), tile_stats(*x0), 0.02)

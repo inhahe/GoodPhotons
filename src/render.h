@@ -2630,14 +2630,9 @@ struct Renderer {
                                  (rng.uniform() * grandTotal < scene.totalEmissionPower);
         if (volumeBirth) {
             // --- Volumetric blackbody birth (fire) ---
-            // Select an emissive volume proportional to its power (linear CDF walk).
-            double r = rng.uniform() * scene.totalEmissionPower;
-            int vi = 0;
-            for (; vi + 1 < (int)scene.emissiveVolumes.size(); ++vi) {
-                r -= scene.emissiveVolumes[vi].power;
-                if (r <= 0.0) break;
-            }
-            const Scene::EmissiveVolume& ev = scene.emissiveVolumes[vi];
+            // Select an emissive volume proportional to its power.
+            const int vi = scene.pickFire(rng.uniform());
+            const Scene::EmissiveVolume& ev = scene.emissiveVolumes[(size_t)vi];
             const Medium& fm = scene.media[ev.mediumIndex];
             // Uniform position in the grid AABB; wavelength importance-sampled from a
             // representative blackbody (Planck at emitKelvin) via ev.lamSampler.
@@ -2658,10 +2653,8 @@ struct Renderer {
             e.emitted += beta;
             if (beta <= 0.0) return;             // cold voxel: nothing to emit or transport
             // Isotropic emission direction.
-            double z = 1.0 - 2.0 * rng.uniform();
-            double sr = std::sqrt(std::max(0.0, 1.0 - z * z));
-            double phi = 2.0 * PI * rng.uniform();
-            dir = Vec3{ sr * std::cos(phi), sr * std::sin(phi), z };
+            {   const double u1 = rng.uniform(), u2 = rng.uniform();
+                dir = uniformSphere(u1, u2); }
             // Aimed caustic emission (causticaim.h). A fire birth point is already fixed, so
             // it is the DIRECTION that gets aimed; p_u for an isotropic birth is 1/(4pi),
             // which is the `em == nullptr` case. No-op (and no RNG draw) unless an aim map
@@ -2722,10 +2715,7 @@ struct Renderer {
                 // while the backdrop, a camera-ray lookup, showed it the right way round.
                 dir = -scene.envMap->sample(u1, u2, envPdfW);
             } else {
-                double z = 1.0 - 2.0 * u1;
-                double sr = std::sqrt(std::max(0.0, 1.0 - z * z));
-                double phi = 2.0 * PI * u2;
-                dir = Vec3{sr * std::cos(phi), sr * std::sin(phi), z};
+                dir = uniformSphere(u1, u2);
             }
             Vec3 t, b; onb(dir, t, b);
             double rd = scene.sceneRadius * std::sqrt(rng.uniform());
@@ -3637,10 +3627,7 @@ struct Renderer {
                 // while the backdrop, a camera-ray lookup, showed it the right way round.
                 dir = -scene.envMap->sample(u1, u2, envPdfW);
             } else {
-                double z = 1.0 - 2.0 * u1;
-                double sr = std::sqrt(std::max(0.0, 1.0 - z * z));
-                double phi = 2.0 * PI * u2;
-                dir = Vec3{sr * std::cos(phi), sr * std::sin(phi), z};
+                dir = uniformSphere(u1, u2);
             }
             Vec3 t, b; onb(dir, t, b);
             double rd = scene.sceneRadius * std::sqrt(rng.uniform());

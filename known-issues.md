@@ -241,6 +241,26 @@ every camera-side refraction (and thin-film / multilayer / grating interfaces th
 medium), CPU and GPU, with a check of an emitter inside a solid dielectric in modes R, D and W
 against mode B. check_fire_d uses a glass pane, crossed in and out, until then.
 
+## OPEN (2026-10-13): BIRTH-EMPTY-STACK — a light walk born inside a dielectric does not know it is inside
+
+Every light walk starts with an empty dielectric stack (`MediumStack`): the forward tracer's
+births (`render.h`, emitters and fires alike), BDPT's light subpaths (`generateLightSubpath`,
+`fireLightSubpath`), and the photon passes of M, S and U. For an emitter or a fire inside a CLEAR
+dielectric in air that costs nothing: the walk's first interface is an exit, which the geometry
+tells it, and the stack's empty top reads as air, which is right. It goes wrong in two cases:
+  * coloured glass: `curAbsorb` reads no enclosing material, so the walk carries no Beer-Lambert
+    absorption from its birth to the glass wall, while every camera-side estimator, which entered
+    the glass and has it on its stack, does -- in mode D the s = 0 points and the connections then
+    disagree, and the forward tracer reads too bright. (Found by the Fable review of 0.378.0,
+    on fireLightSubpath.)
+  * a dielectric inside another one (glass in water): the exit refracts into "air" (index 1)
+    instead of the enclosing medium.
+Fix: seed the stack at birth from the closed dielectrics that contain the birth point (an
+inside test per closed dielectric shape -- spheres and closed meshes, ordered by priority), for
+emitters once per emitter and for fires per point. Until then, a lamp or fire inside glass must
+be clear glass in air for the light walks to be right; check_radiance_eta2 and check_fire_d use
+exactly that.
+
 ## OPEN (2026-10-13, to investigate): GPU-M-FLOOR — the device's mode M reads the floor in front of a water tank 2.4x too bright
 
 `tools/check_radiance_eta2.py`'s water tank (a closed box of water, n 1.333, on a diffuse floor,
@@ -434,7 +454,9 @@ strategies: light subpaths born at points of the fire, the s=1 connection to a p
 for s=0 -- which a walk cannot do by stopping on a fire -- the emission every camera-walk segment
 gathers at stratified points, each weighted against the connections (design.md, the fire bullet).
 The same fire-inclusive wavelength sampling. `tools/check_fire_d.py` holds it to mode R: directly,
-in a mirror, behind a lens, and inside a glass ball seen through a lens and a pinhole. On the way it
+in a mirror, behind a lens, and behind a glass pane seen through a lens and a pinhole. (A pane, not
+the glass ball first tried: inside a ball, mode R itself was off by n^2 until RADIANCE-ETA2 was
+fixed in 0.378.1.) On the way it
 exposed BDPT-S1-SKIP (0.377.4): a fire's light subpaths start empty whenever their origin lands on
 a cold point.
 

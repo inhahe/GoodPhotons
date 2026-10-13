@@ -7492,6 +7492,13 @@ private:
             if (!loadVdbGrid(path, *tgrid, verr, "temperature")) {
                 fail("medium temperature: " + verr); return false;
             }
+            // A grid that is cold everywhere would make the medium emissive() while no fire
+            // registers (Scene::vdbPositiveBox finds no voxel above 0): every mode that refuses
+            // a fire would then refuse a scene that emits nothing. The OpenVDB reader already
+            // refuses one; a NanoVDB grid's active voxels may all be 0.
+            if (!(tgrid->maxVal > 0.0f)) {
+                fail("medium temperature: no voxel above 0 K in '" + path + "'"); return false;
+            }
             med.temperature = tgrid;
             med.tempPeak = std::max(1e-6, (double)tgrid->maxVal);
             std::fprintf(stderr,

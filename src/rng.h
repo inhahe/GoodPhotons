@@ -133,6 +133,15 @@ inline void seedUnit(Pcg32& rng, uint64_t k, uint64_t salt) {
     rng.seed(mix64(k ^ salt), mix64(k + salt));
 }
 
+// A unit direction uniform over the sphere, from two uniforms: u1 sets z, u2 the azimuth.
+// pdf = 1/(4 pi).
+inline Vec3 uniformSphere(double u1, double u2) {
+    const double z = 1.0 - 2.0 * u1;
+    const double r = std::sqrt(1.0 - z * z > 0.0 ? 1.0 - z * z : 0.0);
+    const double phi = 6.283185307179586 * u2;
+    return Vec3(r * std::cos(phi), r * std::sin(phi), z);
+}
+
 // Cosine-weighted hemisphere direction around unit normal n. pdf = cos/pi.
 inline Vec3 cosineHemisphere(const Vec3& n, Pcg32& rng) {
     double u1 = rng.uniform(), u2 = rng.uniform();

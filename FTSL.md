@@ -2985,7 +2985,7 @@ medium {
 > inside it, eye vertices connect to points of it, and every camera ray collects the emission
 > along it, weighted against those connections. An emissive volume counts as the scene's light,
 > so a fire needs no separate `light` block. A `temperature` grid with no voxel above 0 is refused
-> at load ("empty grid"). A GPU mode-R or mode-D render of a fire falls back to the CPU. The other
+> at load, whichever file format it comes in. A GPU mode-R or mode-D render of a fire falls back to the CPU. The other
 > modes (V, P, U, J, M, S) do not render volumetric emission and **refuse** a scene with a fire, like any other
 > feature a mode can't render; so does mode R alongside `-dual-scatter` fur or a GRIN medium.
 > `-on-unsupported fallback` switches such a camera to mode **R** (or **B** where R refuses), and

@@ -5,6 +5,7 @@
 #include <memory>
 #include <climits>
 #include <cstdlib>
+#include <stdexcept>
 #include <atomic>
 #include <unordered_map>
 #include "geometry.h"
@@ -1567,18 +1568,18 @@ struct Scene {
         EmissionSampler lamSampler;
         Spectrum planck;                   // the curve lamSampler tabulates (Scene::fireG)
         // A coarse grid over [bmin, bmax] of the emitted power per volume, for drawing a point in
-        // proportion to it (mode R's fire light sampling; Scene::buildFireCells). Cells of equal
-        // volume, x fastest; cellCdf is the normalised running sum of cellW. Empty when nothing
-        // in the box emits in the band.
+        // proportion to it (mode R's and mode D's fire light sampling; Scene::buildFireCells).
+        // Cells of equal volume, x fastest; cellCdf is the normalised running sum of cellW. Never
+        // empty once built: one uniform cell when the estimate found no power anywhere.
         int gres[3] = {0, 0, 0};
         std::vector<double> cellW, cellCdf;
         double cellSum = 0.0;
 
         // A point drawn in proportion to the cell powers (a cell by cellCdf from u0, uniform inside
         // it from u1..u3), and the volume density of that draw at `x` (0 outside the box).
-        // cellPoint requires cellSum > 0.
         Vec3 cellPoint(double u0, double u1, double u2, double u3) const {
             const size_t n = cellCdf.size();
+            if (n == 0) throw std::logic_error("EmissiveVolume::cellPoint before buildFireCells");
             size_t ci = (size_t)(std::lower_bound(cellCdf.begin(), cellCdf.end(), u0) - cellCdf.begin());
             if (ci >= n) ci = n - 1;
             const int i = (int)(ci % (size_t)gres[0]);
@@ -1917,9 +1918,18 @@ struct Scene {
                     acc += ev.cellW[ci];
                     ev.cellCdf[ci] = acc;
                 }
-        ev.cellSum = acc;
-        if (acc > 0.0) for (double& c : ev.cellCdf) c /= acc;
-        else { ev.cellW.clear(); ev.cellCdf.clear(); }
+        if (acc > 0.0) {
+            ev.cellSum = acc;
+            for (double& c : ev.cellCdf) c /= acc;
+        } else {
+            // Every lattice point missed the hot voxels (a thin flame between them): one cell
+            // over the whole box, drawn uniformly. The grid is never empty, so cellPoint,
+            // cellPdf and their callers need no case for it.
+            ev.gres[0] = ev.gres[1] = ev.gres[2] = 1;
+            ev.cellW.assign(1, 1.0);
+            ev.cellCdf.assign(1, 1.0);
+            ev.cellSum = 1.0;
+        }
     }
 
     // build() after finalizeEmitters(). Cheap Monte-Carlo over the emitting box × band.
@@ -2412,6 +2422,21 @@ struct Scene {
         }
     }
 
+    // Fire `f`'s share of the fires' power, and the fire a uniform u in [0, 1) picks in proportion
+    // to it (the first whose running share exceeds u). Every draw of a fire by power goes through
+    // these: the forward tracer's births, mode R's fire light sampling, mode D's light pick.
+    double fireShare(int f) const {
+        return totalEmissionPower > 0.0
+                   ? emissiveVolumes[(size_t)f].power / totalEmissionPower : 0.0;
+    }
+    int pickFire(double u) const {
+        const int n = (int)emissiveVolumes.size();
+        int f = 0;
+        double acc = 0.0;
+        for (; f < n - 1; ++f) { acc += fireShare(f); if (u < acc) break; }
+        return f;
+    }
+
     // The fires' emitted power per nm at `lambda`: each fire's power over its Planck shape
     // (the forward tracer's own wavelength sampler for its photons), in g(lambda)'s units.
     double fireG(double lambda) const {
@@ -2780,20 +2805,21 @@ struct Scene {
     // reciprocal of the sampled wavelength pdf. Reduces to a single light's
     // emitIntegral once multiplied by that light's SPD(lambda).
     double invPdfLambda(double lambda) const {
-        // reconstruct g(lambda) = emitG * pdf; but we stored the sampler, so
-        // recompute g directly from emitters (cheap: few evaluations).
-        double g = 0.0;
-        for (const auto& e : emitters) g += e.geomWeight() * e.spdFn(lambda);
+        const double g = emitterG(lambda);
         return (g > 0.0) ? emitG / g : 0.0;
     }
     // The same for a draw from camSampler, the illuminant with the fires: camG / (g(lambda) +
-    // fireG(lambda)). Without a fire it is invPdfLambda.
+    // fireG(lambda)). Without a fire it is invPdfLambda (camG is emitG, fireG 0).
     double camInvPdfLambda(double lambda) const {
-        if (emissiveVolumes.empty()) return invPdfLambda(lambda);
+        const double g = emitterG(lambda) + fireG(lambda);
+        return (g > 0.0) ? camG / g : 0.0;
+    }
+    // The emitters' g(lambda) = sum geomWeight * SPD, the density emitSampler tabulates, evaluated
+    // directly (cheap: a few SPD evaluations).
+    double emitterG(double lambda) const {
         double g = 0.0;
         for (const auto& e : emitters) g += e.geomWeight() * e.spdFn(lambda);
-        g += fireG(lambda);
-        return (g > 0.0) ? camG / g : 0.0;
+        return g;
     }
 
     Bvh bvh;   // acceleration structure over tris (0..nTris) then spheres.

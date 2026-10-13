@@ -14072,6 +14072,11 @@ static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY
                        long long spp, int nThreads, int maxDepth, bool diffraction = true,
                        unsigned long long sampleBase = 0, const BeamMap* beams = nullptr,
                        const bdpt::SurfMap* photons = nullptr) {
+    // A fire's s = 0 weight (BdptRenderer::renderRows) has no merge terms, and no beam pass emits
+    // from a fire: modeRendersVolumeEmission keeps fire scenes out of mode J, and this is where
+    // it would show if that stopped holding.
+    if (!scene.emissiveVolumes.empty() && (beams || photons))
+        throw std::logic_error("mode J reached a scene with a fire, which it cannot render");
     std::vector<Film> camBands(nThreads), splatBands(nThreads);
     auto worker = [&](int tid) {
         bdpt::BdptRenderer br; br.maxDepth = maxDepth; br.diffraction = diffraction;

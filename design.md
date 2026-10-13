@@ -4586,6 +4586,9 @@ as the one at fault.
   `BdptRenderer::renderRows` adds `beta·Le` for every Sun whose cone contains that direction
   — with **MIS weight exactly 1**, valid only because the block is gated on *every* eye
   vertex being delta, which is precisely when no other strategy can reach the sun.
+  Gated by `Scene::sunCount` so sun-free scenes pay nothing.
+  `scenes/_deltalight_mix.ftsl` is the regression scene (area + spot + sun + a mirror
+  sphere); mode `D` vs mode `R` agrees to 0.33 % of mean luminance.
 
   **The s = 1 strategy runs every sample** (0.377.4). It draws a light point of its own, so it
   does not depend on the light subpath -- and every MIS weight counts one s = 1 sample per
@@ -4593,13 +4596,11 @@ as the one at fault.
   `spd_map` zero) or at every wavelength of the bundle (a narrow-band lamp), and the strategy
   loop used to stop at the subpath's length, taking the s = 1 sample with it: mode D read
   x0.73 of mode R at `-heroc 4` on two narrow-band lamps and a half-dark patterned one
-  (`tools/check_bdpt_s1.py`). `renderRows` now runs s = 1 whatever `nL` is (light[0] only the
-  slot `misWeight` installs the resampled point in), as does the device's `kBdptT`. A light
-  subpath also gives up only when the WHOLE bundle is dark where it starts, not the hero alone,
-  as the spot / sun start already did.
-  Gated by `Scene::sunCount` so sun-free scenes pay nothing.
-  `scenes/_deltalight_mix.ftsl` is the regression scene (area + spot + sun + a mirror
-  sphere); mode `D` vs mode `R` agrees to 0.33 % of mean luminance.
+  (`tools/check_bdpt_s1.py`). `renderRows` now runs s = 1 whatever `nL` is -- with an empty
+  subpath its s = 1 connection gets a one-vertex light list of its own (`s1Slot`), the slot
+  `misWeight` installs the resampled point in, so `light` itself stays as long as the walk
+  made it -- as does the device's `kBdptT`. A light subpath also gives up only when the WHOLE
+  bundle is dark where it starts, not the hero alone, as the spot / sun start already did.
 
   Since **0.126.0 the same treatment runs on the GPU**, so a spot/sun scene no longer falls
   back to the CPU in mode `D`. `render_cuda.cu` mirrors every piece one-for-one:

@@ -1917,12 +1917,6 @@ struct BackwardRenderer {
         return on;
     }
 
-    // The probability fireNee picks fire `vi`: its share of the fires' power.
-    static double fireSel(const Scene& scene, int vi) {
-        return scene.totalEmissionPower > 0.0
-                   ? scene.emissiveVolumes[(size_t)vi].power / scene.totalEmissionPower : 0.0;
-    }
-
     // The solid-angle density with which the cone half of fireNee's mixture samples direction `d`
     // (unit) from `x` for fire `v`, and the sampler itself (fireDirPdf has the mixture's density).
     // `oneMinusCos` is 1 - cos(theta_max) written stably, so a small distant fire keeps its digits.
@@ -1938,10 +1932,7 @@ struct BackwardRenderer {
         const Vec3 tc = (v.bmin + v.bmax) * 0.5 - x;
         const double R2 = dot(v.bmax - v.bmin, v.bmax - v.bmin) * 0.25, d2 = dot(tc, tc);
         const double phi = 2.0 * PI * u2;
-        if (d2 <= R2) {
-            const double z = 1.0 - 2.0 * u1, r = std::sqrt(std::max(0.0, 1.0 - z * z));
-            return Vec3(r * std::cos(phi), r * std::sin(phi), z);
-        }
+        if (d2 <= R2) return uniformSphere(u1, u2);
         const double s2 = R2 / d2, oneMinusCos = s2 / (1.0 + std::sqrt(1.0 - s2));
         const double om = u1 * oneMinusCos;                       // 1 - cos(theta), uniform
         const double cosT = 1.0 - om, sinT = std::sqrt(std::max(0.0, om * (2.0 - om)));
@@ -1956,7 +1947,6 @@ struct BackwardRenderer {
     // along it of the point density (piecewise constant) times t^2, which firePointPdf computes
     // exactly by stepping through the grid's cells (Amanatides-Woo).
     static double firePointPdf(const Scene::EmissiveVolume& v, const Vec3& x, const Vec3& d) {
-        if (!(v.cellSum > 0.0)) return 0.0;
         double t0, t1;
         if (!clipRayBox(v.bmin, v.bmax, x, d, 0.0, 1e300, t0, t1)) return 0.0;
         const Vec3 ext = v.bmax - v.bmin;
@@ -1990,9 +1980,7 @@ struct BackwardRenderer {
     // sampling's density goes to 0 along a chord through emitting cells) and point sampling.
     static constexpr double kFireCone = 0.25;
     static double fireDirPdf(const Scene::EmissiveVolume& v, const Vec3& x, const Vec3& d) {
-        const double pc = fireConePdf(v, x, d);
-        if (!(v.cellSum > 0.0)) return pc;
-        return kFireCone * pc + (1.0 - kFireCone) * firePointPdf(v, x, d);
+        return kFireCone * fireConePdf(v, x, d) + (1.0 - kFireCone) * firePointPdf(v, x, d);
     }
 
     // How a fire light-sampling ray sees occluders: not at all (a path segment, already cut at
@@ -2049,7 +2037,7 @@ struct BackwardRenderer {
                              const Vec3& d) const {
         if (!fireNeeOn()) return 1.0;
         if (gm.pdf > 0.0) {
-            const double pn = fireSel(scene, vi) * fireDirPdf(scene.emissiveVolumes[(size_t)vi], gm.from, d);
+            const double pn = scene.fireShare(vi) * fireDirPdf(scene.emissiveVolumes[(size_t)vi], gm.from, d);
             return gm.pdf / (gm.pdf + pn);
         }
         return specularArrival ? 1.0 : 0.0;
@@ -2068,16 +2056,12 @@ struct BackwardRenderer {
                  Resp&& resp) const {
         const int nV = (int)scene.emissiveVolumes.size();
         if (nV == 0 || !(scene.totalEmissionPower > 0.0) || !fireNeeOn()) return;
-        int vi = 0;
-        {   const double u = rng.uniform();
-            double acc = 0.0;
-            for (; vi < nV - 1; ++vi) { acc += fireSel(scene, vi); if (u < acc) break; }
-        }
-        const double sel = fireSel(scene, vi);
+        const int vi = scene.pickFire(rng.uniform());
+        const double sel = scene.fireShare(vi);
         if (!(sel > 0.0)) return;
         const Scene::EmissiveVolume& v = scene.emissiveVolumes[(size_t)vi];
         Vec3 wi;
-        if (v.cellSum > 0.0 && rng.uniform() >= kFireCone) {
+        if (rng.uniform() >= kFireCone) {
             const double u0 = rng.uniform(), u1 = rng.uniform(), u2 = rng.uniform(),
                          u3 = rng.uniform();
             const Vec3 dv = v.cellPoint(u0, u1, u2, u3) - x;

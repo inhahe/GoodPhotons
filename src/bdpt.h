@@ -202,7 +202,7 @@ inline bool isNeeEmitter(const Emitter& em) { return !em.collimated; }
 // A fire's origin point is drawn from a defensive mixture: kFireBoxShare of the draws uniform
 // over the box the fire emits in, the rest in proportion to its cell powers
 // (EmissiveVolume::cellPoint). The cells' powers are 27-point estimates, so a cell can read 0
-// where the fire does emit; the uniform share keeps the density positive wherever it can.
+// where the fire does emit; the uniform share keeps the density positive wherever it does.
 constexpr double kFireBoxShare = 0.25;
 inline double fireOriginPdf(const Scene::EmissiveVolume& v, const Vec3& x) {
     const Vec3 ext = v.bmax - v.bmin;
@@ -210,12 +210,11 @@ inline double fireOriginPdf(const Scene::EmissiveVolume& v, const Vec3& x) {
     if (!(vol > 0.0)) return 0.0;
     if (x.x < v.bmin.x || x.y < v.bmin.y || x.z < v.bmin.z ||
         x.x > v.bmax.x || x.y > v.bmax.y || x.z > v.bmax.z) return 0.0;
-    if (!(v.cellSum > 0.0)) return 1.0 / vol;
     return kFireBoxShare / vol + (1.0 - kFireBoxShare) * v.cellPdf(x);
 }
 inline Vec3 fireOriginSample(const Scene::EmissiveVolume& v, Pcg32& rng) {
     const double u0 = rng.uniform(), u1 = rng.uniform(), u2 = rng.uniform(), u3 = rng.uniform();
-    if (!(v.cellSum > 0.0) || rng.uniform() < kFireBoxShare) {
+    if (rng.uniform() < kFireBoxShare) {
         const Vec3 ext = v.bmax - v.bmin;
         return Vec3(v.bmin.x + ext.x * u1, v.bmin.y + ext.y * u2, v.bmin.z + ext.z * u3);
     }
@@ -237,23 +236,19 @@ inline double fireLineDensity(const Scene& scene, const Vec3& from, const Vec3& 
 }
 
 // A light for a light subpath or an s=1 connection: an emitter (`emitter`) or a fire (`fire`),
-// with the probability `pdf` of having picked it. Without a fire this is selectEmitter exactly,
-// the same draws included.
+// with the probability `pdf` of having picked it. Lights are picked by power, the fires' with the
+// emitters' (totalEmissionPower is 0 without a fire). Without a fire this is selectEmitter
+// exactly, the same draws included.
 struct BdptLightPick { int emitter = -1; int fire = -1; double pdf = 0.0; };
 inline BdptLightPick bdptPickLight(const Scene& scene, Pcg32& rng) {
     BdptLightPick pk;
-    const double fires = scene.emissiveVolumes.empty() ? 0.0 : scene.totalEmissionPower;
-    const double all = scene.totalPower + fires;
+    const double all = scene.totalPower + scene.totalEmissionPower;
     if (!(all > 0.0)) return pk;
-    if (fires > 0.0) {
-        double u = rng.uniform() * all;
+    if (scene.totalEmissionPower > 0.0) {
+        const double u = rng.uniform() * all;
         if (u >= scene.totalPower) {
-            u -= scene.totalPower;
-            const int nV = (int)scene.emissiveVolumes.size();
-            int f = 0;
-            for (; f < nV - 1; ++f) { u -= scene.emissiveVolumes[(size_t)f].power; if (u < 0.0) break; }
-            pk.fire = f;
-            pk.pdf = scene.emissiveVolumes[(size_t)f].power / all;
+            pk.fire = scene.pickFire((u - scene.totalPower) / scene.totalEmissionPower);
+            pk.pdf = scene.emissiveVolumes[(size_t)pk.fire].power / all;
             return pk;
         }
     }
@@ -264,8 +259,7 @@ inline BdptLightPick bdptPickLight(const Scene& scene, Pcg32& rng) {
 }
 // The probability of picking a given emitter / fire (bdptPickLight's `pdf`), for MIS.
 inline double bdptPickPdf(const Scene& scene, const Emitter* em, int fire) {
-    const double all = scene.totalPower +
-                       (scene.emissiveVolumes.empty() ? 0.0 : scene.totalEmissionPower);
+    const double all = scene.totalPower + scene.totalEmissionPower;
     if (!(all > 0.0)) return 0.0;
     if (fire >= 0) return scene.emissiveVolumes[(size_t)fire].power / all;
     return em ? em->power / all : 0.0;
@@ -1638,9 +1632,8 @@ inline int fireLightSubpath(const Scene& scene, const Camera& cam, const Rendere
     }
     if (!(mx > 0.0)) return 0;
     path.push_back(L0);
-    const double z = 1.0 - 2.0 * rng.uniform(), phi = 2.0 * PI * rng.uniform();
-    const double r = std::sqrt(std::max(0.0, 1.0 - z * z));
-    const Vec3 dir(r * std::cos(phi), r * std::sin(phi), z);
+    const double u1 = rng.uniform(), u2 = rng.uniform();
+    const Vec3 dir = uniformSphere(u1, u2);
     const double pdfDir = 1.0 / (4.0 * PI);
     const double k = 1.0 / (pick.pdf * pdfPos * pdfDir);
     double betaWalkSec[hero::kHeroMax - 1];
@@ -3642,6 +3635,45 @@ struct SurfMergeWeight {
     }
 };
 
+// The camera half of the weight of a strategy that puts a point after eye[k] -- a merge on the
+// segment leaving eye[k], or a fire's s = 0 point on it: misWeight's camera loop, telescoped
+// inward from eye[k], which is the same wherever along the segment the point falls. segSumC[k]
+// sums the connection strategies from eye[k] inward, segSumM[k] the merges (both kinds, scaled
+// by their kappas; all 0 unless `mk` has any). Both are resized to nE; entry 0 is 0. The
+// recurrences mirror the light-side ones in traceLightBeamPass.
+inline void cameraSideSums(const Scene& scene, const std::vector<Vertex>& eye, int nE,
+                           const MergeK& mk, double lamCam,
+                           std::vector<double>& segSumC, std::vector<double>& segSumM) {
+    const bool merges = mk.any();
+    segSumC.assign((size_t)nE, 0.0);
+    segSumM.assign((size_t)nE, 0.0);
+    for (int k = 1; k < nE; ++k) {
+        const double gate = (!eye[(size_t)k].delta && !eye[(size_t)k - 1].delta) ? 1.0 : 0.0;
+        // eta' of the merge AT eye[k-1]; needs both its neighbours, so it starts at k = 2. Its
+        // pdfRev is the RECORDED one: moving the light-side neighbour of eye[k] along the same
+        // ray does not change the direction arriving at eye[k-1].
+        const double eK = (merges && k >= 2)
+            ? mergeEtaPrime(scene, eye[(size_t)k].p, eye[(size_t)k - 1], eye[(size_t)k - 2].p,
+                            eye[(size_t)k - 1].pdfRev, lamCam).scale(mk)
+            : 0.0;
+        double carry = 0.0, carryM = 0.0;
+        if (k >= 2) {
+            // No ratio exists at the camera vertex itself, which is why the recurrence starts
+            // one step in.
+            const double rC = misRemap0(eye[(size_t)k - 1].pdfRev) /
+                              misRemap0(eye[(size_t)k - 1].pdfFwd);
+            carry  = rC * segSumC[(size_t)k - 1];
+            carryM = rC * segSumM[(size_t)k - 1];
+        }
+        // A strand is never a light vertex (randomWalk, 0.365.0): every camera-side alternative
+        // from eye[k] inward puts it there.
+        const bool fiberK = !eye[(size_t)k].delta && eye[(size_t)k].mat &&
+                            isFiberMat(*eye[(size_t)k].mat);
+        segSumC[(size_t)k] = fiberK ? 0.0 : gate + carry;
+        segSumM[(size_t)k] = fiberK ? 0.0 : eK + carryM;
+    }
+}
+
 // --- Renderer --------------------------------------------------------------------
 // Renders pixel rows [y0,y1). t>=2 (camera-image) contributions land on the current
 // pixel in `camFilm`; t==1 (light-image) splats land on `splatFilm` at the projected
@@ -3677,6 +3709,10 @@ struct BdptRenderer {
                     int y0, int y1, long long spp, unsigned long long sampleBase) const {
         Renderer mats; mats.diffraction = diffraction;
         std::vector<Vertex> eye, light;
+        // The light list an s = 1 connection gets when the light subpath came back empty (see
+        // the strategy loop): one Light vertex, misWeight's slot for the resampled point.
+        std::vector<Vertex> s1Slot(1);
+        s1Slot[0].type = VType::Light;
         // Mode J (UPBP) only. Hoisted out of the pixel loop so its capacity is reached once
         // per thread rather than reallocated per sample, exactly like `eye`/`light`.
         PathSegs segs;
@@ -3792,9 +3828,10 @@ struct BdptRenderer {
                     // whatever the light subpath drew. A subpath that came back empty -- its
                     // emitter dark where it started, at every wavelength of the bundle -- must
                     // not take the s=1 sample with it: every path that strategy reaches is
-                    // weighted for one sample of it per frame. light[0] is then only the slot
-                    // misWeight installs the resampled point in.
-                    if (nL == 0) { light.assign(1, Vertex{}); light[0].type = VType::Light; }
+                    // weighted for one sample of it per frame. Its connection then gets a
+                    // one-vertex light list of its own, the slot misWeight installs the resampled
+                    // point in, so `light` stays exactly what the walk made.
+                    std::vector<Vertex>& lightS = (nL > 0) ? light : s1Slot;
                     const int sMax = (nL > 0) ? nL : 1;
                     Vec3 cie[hero::kHeroMax];
                     for (int i = 0; i < hb.C; ++i)
@@ -3834,7 +3871,7 @@ struct BdptRenderer {
                             int spx = 0, spy = 0; bool isSplat = false;
                             double Lsec[hero::kHeroMax - 1] = {0};
                             int nUpConn = 0;
-                            double c = connectBDPT(scene, cam, mats, light, eye, s, t, hb,
+                            double c = connectBDPT(scene, cam, mats, lightS, eye, s, t, hb,
                                                    rng, spx, spy, isSplat, Lsec, nUpConn,
                                                    mk);
                             if (nUpConn <= 0) continue;
@@ -3860,24 +3897,39 @@ struct BdptRenderer {
                     // ---- FIRES, s = 0 (see the fires note) --------------------------------
                     // Every segment of the camera walk gathers each fire's emission along it at
                     // stratified points (EmissiveVolume::segmentPoints), each an s = 0 sample of
-                    // the path made of the eye vertices up to the segment's start and that point,
-                    // weighted by misWeight with the point installed as the eye subpath's last
-                    // vertex. So the emission is taken whole where no connection reaches -- along
-                    // the camera ray, and after delta vertices only -- and shared with the
+                    // the path made of the eye vertices up to the segment's start and that point.
+                    // So the emission is taken whole where no connection reaches -- along the
+                    // camera ray, and after delta vertices only -- and shared with the
                     // connections everywhere else.
+                    //
+                    // The weight is misWeight(s = 0, t = k + 2) with the point X as the eye
+                    // subpath's last vertex, in O(1) per point: its camera loop's first ratio is
+                    // X's own (its density as a fire's light origin over its density here), its
+                    // second eye[k]'s (its reverse density becomes the fire's isotropic emission
+                    // toward it), and everything further in is cameraSideSums' segSumC[k], the
+                    // same for every point of the segment. Mode J's merges would add terms, but a
+                    // fire never reaches mode J (renderBdpt refuses the pair).
                     if (hasFire) {
+                        cameraSideSums(scene, eye, nE, mk, hb.lam[0], segSumC, segSumM);
                         Vec3 fireXYZ(0, 0, 0);
-                        Vertex unused;
                         for (const PathSeg& sg : segs) {
                             const int k = sg.vert;              // the eye vertex it leaves from
                             if (k < 0 || k >= nE || k > maxDepth) continue;
                             const double perUp = 1.0 / sg.nUp;
+                            const Vertex& vk = eye[(size_t)k];
+                            const double gateK = vk.delta ? 0.0 : 1.0;  // connecting X to eye[k]
+                            const double invFwdK = 1.0 / misRemap0(vk.pdfFwd);
+                            const double sumK = segSumC[(size_t)k];
                             for (int f = 0; f < (int)scene.emissiveVolumes.size(); ++f) {
                                 const Scene::EmissiveVolume& fv = scene.emissiveVolumes[(size_t)f];
                                 double ta, tb;
                                 if (!clipRayBox(fv.bmin, fv.bmax, sg.o, sg.d, 0.0, 1e300, ta, tb) ||
                                     ta >= sg.tMax) continue;
                                 const Medium& med = scene.media[(size_t)fv.mediumIndex];
+                                const double pickF = bdptPickPdf(scene, nullptr, f);
+                                // The points' density along the ray (fireLineDensity's, read off
+                                // the clip already in hand).
+                                const double lineDens = fv.strata(ta, tb) / (tb - ta);
                                 fv.segmentPoints(med, sg.o, sg.d, ta, tb, sg.tMax, sg.aGlass, rng,
                                     [&](double& T, const Vec3& a, double len, double) {
                                         T *= mats.mediaTransmittance(scene, a, sg.d, len, hb.lam[0], rng);
@@ -3885,29 +3937,29 @@ struct BdptRenderer {
                                     [&](double s, double T, double kelvin, double dt) {
                                         double w = 1.0;              // the camera ray: s + t == 2
                                         if (k >= 1) {
-                                            Vertex X;
-                                            X.type = VType::Light; X.fire = f; X.p = sg.o + sg.d * s;
-                                            X.pdfFwd = convertDensity(sg.pdfDir, eye[(size_t)k], X) *
-                                                       fireLineDensity(scene, eye[(size_t)k].p, X.p, f);
-                                            const size_t slot = (size_t)k + 1;
-                                            if (slot < eye.size()) {
-                                                ScopedAssign<Vertex> put(&eye[slot], X);
-                                                w = misWeight(scene, cam, light, eye, unused, 0, k + 2,
-                                                              hb.lam[0], mk);
-                                            } else {
-                                                eye.push_back(X);
-                                                w = misWeight(scene, cam, light, eye, unused, 0, k + 2,
-                                                              hb.lam[0], mk);
-                                                eye.pop_back();
-                                            }
+                                            const Vec3 x = sg.o + sg.d * s;
+                                            const Vec3 e = x - vk.p;
+                                            const double d2 = dot(e, e);
+                                            const double invD2 = (d2 > 0.0) ? 1.0 / d2 : 0.0;
+                                            const double rX = misRemap0(pickF * fireOriginPdf(fv, x)) /
+                                                              misRemap0(sg.pdfDir * invD2 * lineDens);
+                                            const double cosK = vk.onSurface()
+                                                ? std::fabs(dot(vk.ns, e)) * std::sqrt(invD2) : 1.0;
+                                            const double rK = misRemap0(invD2 / (4.0 * PI) * cosK) * invFwdK;
+                                            w = 1.0 / (1.0 + rX * (gateK + rK * sumK));
                                         }
+                                        // A non-finite weight or transmittance would poison the
+                                        // pixel for the rest of the render; the connections drop
+                                        // theirs the same way.
+                                        const double sc = w * dt * T * perUp;
+                                        if (!(sc > 0.0) || !std::isfinite(sc)) return;
                                         Vec3 c = cie[0] * (sg.beta * med.emissionAtKelvin(kelvin, hb.lam[0]) *
                                                            hb.invPdf[0]);
                                         for (int i = 0; i + 1 < sg.nUp; ++i)
                                             c = c + cie[i + 1] * (sg.betaSec[i] *
                                                                   med.emissionAtKelvin(kelvin, hb.lam[i + 1]) *
                                                                   hb.invPdf[i + 1]);
-                                        fireXYZ = fireXYZ + c * (w * dt * T * perUp);
+                                        fireXYZ = fireXYZ + c * sc;
                                     });
                             }
                         }
@@ -3940,11 +3992,8 @@ struct BdptRenderer {
                     // though the two halves share a generator.
                     if ((mergeOn || surfOn) && jHalf != 1) {
                         // The camera half of every merge weight, replayed ONCE for the whole
-                        // subpath. misWeight's camera loop telescopes inward from the merge
-                        // point; everything it accumulates strictly camera-side of eye[k] is
-                        // independent of where along the segment a beam is hit, so it is
-                        // summed here and read off per segment. (The recurrences mirror the
-                        // light-side ones in traceLightBeamPass; see BeamMergeWeight.)
+                        // subpath (cameraSideSums) and read off per segment: it is independent
+                        // of where along the segment a beam is hit.
                         //
                         // ONE pair of accumulators serves BOTH merge kinds, and must: a beam
                         // merge and a point merge on the same camera subpath compete for the
@@ -3955,38 +4004,7 @@ struct BdptRenderer {
                         // knows neither.
                         const double lamCam = hb.lam[0];
                         const PatTables tabs = scene.patTables();
-                        if (mk.any()) {
-                            segSumC.assign((size_t)nE, 0.0);
-                            segSumM.assign((size_t)nE, 0.0);
-                            for (int k = 1; k < nE; ++k) {
-                                const double gate = (!eye[(size_t)k].delta &&
-                                                     !eye[(size_t)k - 1].delta) ? 1.0 : 0.0;
-                                // eta' of the merge AT eye[k-1]; needs both its neighbours,
-                                // so it starts at k = 2. Its pdfRev is the RECORDED one:
-                                // moving the light-side neighbour of eye[k] along the same
-                                // ray does not change the direction arriving at eye[k-1].
-                                const double eK = (k >= 2)
-                                    ? mergeEtaPrime(scene, eye[(size_t)k].p, eye[(size_t)k - 1],
-                                                    eye[(size_t)k - 2].p,
-                                                    eye[(size_t)k - 1].pdfRev, lamCam).scale(mk)
-                                    : 0.0;
-                                double carry = 0.0, carryM = 0.0;
-                                if (k >= 2) {
-                                    // No ratio exists at the camera vertex itself, which is
-                                    // why the recurrence starts one step in.
-                                    const double rC = misRemap0(eye[(size_t)k - 1].pdfRev) /
-                                                      misRemap0(eye[(size_t)k - 1].pdfFwd);
-                                    carry  = rC * segSumC[(size_t)k - 1];
-                                    carryM = rC * segSumM[(size_t)k - 1];
-                                }
-                                // A strand is never a light vertex (randomWalk, 0.365.0): every
-                                // camera-side alternative from eye[k] inward puts it there.
-                                const bool fiberK = !eye[(size_t)k].delta && eye[(size_t)k].mat &&
-                                                    isFiberMat(*eye[(size_t)k].mat);
-                                segSumC[(size_t)k] = fiberK ? 0.0 : gate + carry;
-                                segSumM[(size_t)k] = fiberK ? 0.0 : eK + carryM;
-                            }
-                        }
+                        if (mk.any()) cameraSideSums(scene, eye, nE, mk, lamCam, segSumC, segSumM);
                         TrRay camTr;
                         for (const PathSeg& sg : segs) {
                             if (!mergeOn) break;
