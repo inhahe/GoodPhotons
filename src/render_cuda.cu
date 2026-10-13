@@ -3973,10 +3973,13 @@ __device__ static Real dMatRoughness(const DScene& sc, const DMaterial& m, const
 // the throughput — same expected value, zero variance. It also suppresses the frosting
 // perturbation, the other rng draw at this interface: at 1 spp a coin flip per pixel is not
 // noise but salt-and-pepper, and glass rendered as a speckled blob. TIR reports weight 1.
+// `radianceScale`: (n_from / n_to)^2 on a refraction, 1 on a reflection -- what a camera-side walk
+// multiplies its throughput by (host twin: Renderer::refractOrReflect).
 __device__ static void refractOrReflect(const DScene& sc, const DMaterial& m, const DHit& h,
                                          const DVec3& d, Real lambda, DRng& rng,
                                          DVec3& ro, DVec3& rd, bool* transmitted = nullptr,
-                                         Real extIor = (Real)1, double* whittedWeight = nullptr) {
+                                         Real extIor = (Real)1, double* whittedWeight = nullptr,
+                                         double* radianceScale = nullptr) {
     Real ng = specLookup(m.ior, lambda);
     bool entering = dot(d, h.ng) < 0;
     DVec3 nl = entering ? h.ng : -h.ng;
@@ -4007,6 +4010,7 @@ __device__ static void refractOrReflect(const DScene& sc, const DMaterial& m, co
         if (ok) outDir = pert;
     }
     if (transmitted) *transmitted = refracted;
+    if (radianceScale) *radianceScale = refracted ? (double)(eta * eta) : 1.0;
     rd = outDir; ro = dOffsetAlong(h.p, h.ng, rd);
 }
 
@@ -4020,10 +4024,13 @@ __device__ static void refractOrReflect(const DScene& sc, const DMaterial& m, co
 __device__ static void dDielectricStep(const DScene& sc, const DMaterial& m, const DHit& h,
                                         const DVec3& d, Real lambda, DRng& rng,
                                         int mi, DMediumStack& stk, DVec3& outO, DVec3& outD,
-                                        double* whittedWeight = nullptr) {
+                                        double* whittedWeight = nullptr,
+                                        double* radianceScale = nullptr) {
     // Mode W: the suppressed-boundary pass-throughs below take no Fresnel branch, so their
-    // weight is 1; the two real interfaces overwrite this from refractOrReflect.
+    // weight is 1; the two real interfaces overwrite this from refractOrReflect. Likewise the
+    // radiance scale (refractOrReflect), which a pass-through leaves at 1.
     if (whittedWeight) *whittedWeight = 1.0;
+    if (radianceScale) *radianceScale = 1.0;
     bool entering = dot(d, h.ng) < 0;
     int pr = m.priority;
     if (entering) {
@@ -4037,7 +4044,8 @@ __device__ static void dDielectricStep(const DScene& sc, const DMaterial& m, con
         }
         Real extIor = (ranked && outMat >= 0) ? specLookup(sc.mats[outMat].ior, lambda) : (Real)1;
         bool transmitted = false; DVec3 nro, nrd;
-        refractOrReflect(sc, m, h, d, lambda, rng, nro, nrd, &transmitted, extIor, whittedWeight);
+        refractOrReflect(sc, m, h, d, lambda, rng, nro, nrd, &transmitted, extIor, whittedWeight,
+                         radianceScale);
         if (transmitted) stk.push(mi, pr);
         outO = nro; outD = nrd;
     } else {
@@ -4052,7 +4060,8 @@ __device__ static void dDielectricStep(const DScene& sc, const DMaterial& m, con
         }
         Real extIor = (ranked && newMat >= 0) ? specLookup(sc.mats[newMat].ior, lambda) : (Real)1;
         bool transmitted = false; DVec3 nro, nrd;
-        refractOrReflect(sc, m, h, d, lambda, rng, nro, nrd, &transmitted, extIor, whittedWeight);
+        refractOrReflect(sc, m, h, d, lambda, rng, nro, nrd, &transmitted, extIor, whittedWeight,
+                         radianceScale);
         if (transmitted) stk.popMat(mi);                // TIR stays inside mi
         outO = nro; outD = nrd;
     }
@@ -4070,7 +4079,9 @@ __device__ static Real dMatFilmThickness(const DScene& sc, const DMaterial& m, c
 __device__ static bool thinFilmInterface(const DScene& sc, const DMaterial& m, const DHit& h,
                                           const DVec3& d,
                                           Real lambda, DRng& rng, DVec3& ro, DVec3& rd,
-                                          double* whittedWeight = nullptr) {
+                                          double* whittedWeight = nullptr,
+                                          double* radianceScale = nullptr) {
+    if (radianceScale) *radianceScale = 1.0;     // see refractOrReflect; set on refraction
     Real ns = specLookup(m.ior, lambda), nf = (Real)m.filmIor;
     Real ks = specLookup(m.substrateK, lambda);
     Real thickness = dMatFilmThickness(sc, m, h);   // per-hit (map or constant)
@@ -4097,7 +4108,10 @@ __device__ static bool thinFilmInterface(const DScene& sc, const DMaterial& m, c
         const bool doReflect = whittedWeight ? (R >= (Real)0.5) : (rng.uniform() < R);
         if (whittedWeight) *whittedWeight = doReflect ? (double)R : 1.0 - (double)R;
         if (doReflect) outDir = reflectv(d, nl);
-        else outDir = d * eta + nl * (eta * cosI - cosT);
+        else {
+            outDir = d * eta + nl * (eta * cosI - cosT);
+            if (radianceScale) *radianceScale = (double)(eta * eta);
+        }
     }
     outDir = normalize(outDir);
     rd = outDir; ro = dOffsetAlong(h.p, h.ng, rd);
@@ -4108,7 +4122,9 @@ __device__ static bool thinFilmInterface(const DScene& sc, const DMaterial& m, c
 // `whittedWeight`: same deterministic dominant-branch contract as thinFilmInterface.
 __device__ static bool multilayerInterface(const DMaterial& m, const DHit& h, const DVec3& d,
                                             Real lambda, DRng& rng, DVec3& ro, DVec3& rd,
-                                            double* whittedWeight = nullptr) {
+                                            double* whittedWeight = nullptr,
+                                            double* radianceScale = nullptr) {
+    if (radianceScale) *radianceScale = 1.0;     // see refractOrReflect; set on refraction
     Real ns = specLookup(m.ior, lambda);
     Real ks = specLookup(m.substrateK, lambda);
     int nL = m.layerCount;
@@ -4141,7 +4157,10 @@ __device__ static bool multilayerInterface(const DMaterial& m, const DHit& h, co
         const bool doReflect = whittedWeight ? (R >= (Real)0.5) : (rng.uniform() < R);
         if (whittedWeight) *whittedWeight = doReflect ? (double)R : 1.0 - (double)R;
         if (doReflect) outDir = reflectv(d, nl);
-        else outDir = d * eta + nl * (eta * cosI - cosT);
+        else {
+            outDir = d * eta + nl * (eta * cosI - cosT);
+            if (radianceScale) *radianceScale = (double)(eta * eta);
+        }
     }
     outDir = normalize(outDir); rd = outDir; ro = dOffsetAlong(h.p, h.ng, rd); return true;
 }
@@ -11636,27 +11655,30 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             // flip (see refractOrReflect's whittedWeight). Attenuating AFTER the call is safe
             // because the ray has not been traced yet — returning false here just ends the
             // path at this vertex, as elsewhere in mode W.
-            double wW = 1.0;
+            double wW = 1.0, rs = 1.0;
             DVec3 nro, nrd;
             dDielectricStep(sc, *mp, h, rd, lambda, rng, matId, stk, nro, nrd,
-                            whitted ? &wW : nullptr);
+                            whitted ? &wW : nullptr, &rs);
             if (whitted && !dWhittedAttenuate(thr, wW)) return false;
+            thr *= rs;                                   // radiance across the interface
             ro = nro; rd = nrd; specularArrival = true; return true;
         }
         case D_THINFILM: {
             // Mode W: dominant interference branch weighted in, exactly as D_DIELECTRIC above
             // (see thinFilmInterface's whittedWeight).
-            DVec3 nro, nrd; double wW = 1.0;
+            DVec3 nro, nrd; double wW = 1.0, rs = 1.0;
             if (!thinFilmInterface(sc, *mp, h, rd, lambda, rng, nro, nrd,
-                                   whitted ? &wW : nullptr)) return false;
+                                   whitted ? &wW : nullptr, &rs)) return false;
             if (whitted && !dWhittedAttenuate(thr, wW)) return false;
+            thr *= rs;                                   // radiance across the interface
             ro = nro; rd = nrd; specularArrival = true; return true;
         }
         case D_MULTILAYER: {
-            DVec3 nro, nrd; double wW = 1.0;          // mode W: see D_THINFILM above
+            DVec3 nro, nrd; double wW = 1.0, rs = 1.0; // mode W: see D_THINFILM above
             if (!multilayerInterface(*mp, h, rd, lambda, rng, nro, nrd,
-                                     whitted ? &wW : nullptr)) return false;
+                                     whitted ? &wW : nullptr, &rs)) return false;
             if (whitted && !dWhittedAttenuate(thr, wW)) return false;
+            thr *= rs;                                   // radiance across the interface
             ro = nro; rd = nrd; specularArrival = true; return true;
         }
         case D_MIRROR: {
@@ -12912,7 +12934,9 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
 
         switch (mp->type) {
             case D_DIELECTRIC: {
-                DVec3 nro, nrd; dDielectricStep(sc, *mp, h, rd, LREP_RGB, rng, matId, stk, nro, nrd);
+                DVec3 nro, nrd; double rs = 1.0;
+                dDielectricStep(sc, *mp, h, rd, LREP_RGB, rng, matId, stk, nro, nrd, nullptr, &rs);
+                beta = beta * (Real)rs;                  // radiance across the interface
                 ro = nro; rd = nrd; specularArrival = true; break;
             }
             case D_MIRROR: {
@@ -13484,8 +13508,9 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             case D_DIELECTRIC: {
                 // Nested-dielectric priority: exterior IOR from the medium stack; overlapping
                 // dielectrics ranked by priority (SAFE FALLBACK to flat air<->glass otherwise).
-                DVec3 nro, nrd; dDielectricStep(sc, *mp, h, rd, lambda, rng, matId, stk, nro, nrd);
-                wi = nrd; betaFactor = 1.0; delta = 1;
+                DVec3 nro, nrd; double rs = 1.0;
+                dDielectricStep(sc, *mp, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr, &rs);
+                wi = nrd; betaFactor = importance ? 1.0 : rs; delta = 1;   // radiance, not flux
                 break;
             }
             case D_HALFMIRROR: {
@@ -13508,14 +13533,16 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             }
             case D_THINFILM: {
                 DVec3 nro, nrd;
-                if (!thinFilmInterface(sc, *mp, h, rd, lambda, rng, nro, nrd)) { terminate = true; break; }
-                wi = nrd; betaFactor = 1.0; delta = 1;
+                double rs = 1.0;
+                if (!thinFilmInterface(sc, *mp, h, rd, lambda, rng, nro, nrd, nullptr, &rs)) { terminate = true; break; }
+                wi = nrd; betaFactor = importance ? 1.0 : rs; delta = 1;
                 break;
             }
             case D_MULTILAYER: {
                 DVec3 nro, nrd;
-                if (!multilayerInterface(*mp, h, rd, lambda, rng, nro, nrd)) { terminate = true; break; }
-                wi = nrd; betaFactor = 1.0; delta = 1;
+                double rs = 1.0;
+                if (!multilayerInterface(*mp, h, rd, lambda, rng, nro, nrd, nullptr, &rs)) { terminate = true; break; }
+                wi = nrd; betaFactor = importance ? 1.0 : rs; delta = 1;
                 break;
             }
             case D_GRATING: {
@@ -14853,7 +14880,9 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 rd = o; ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_DIELECTRIC: {
-                DVec3 nro, nrd; dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd);
+                DVec3 nro, nrd; double rs = 1.0;
+                dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr, &rs);
+                thr *= rs;                               // radiance across the interface
                 ro = nro; rd = nrd; break;
             }
             case D_HALFMIRROR: {
@@ -15448,7 +15477,9 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 rd = o; ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_DIELECTRIC: {
-                DVec3 nro, nrd; dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd);
+                DVec3 nro, nrd; double rs = 1.0;
+                dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr, &rs);
+                thr *= rs;                               // radiance across the interface
                 ro = nro; rd = nrd; break;
             }
             case D_HALFMIRROR: {
@@ -15748,7 +15779,9 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                 rd = o; ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_DIELECTRIC: {
-                DVec3 nro, nrd; dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd);
+                DVec3 nro, nrd; double rs = 1.0;
+                dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr, &rs);
+                thr *= rs;                               // radiance across the interface
                 ro = nro; rd = nrd; break;
             }
             case D_HALFMIRROR: {
@@ -16015,7 +16048,10 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
                                    double& cosThetaOut, bool& delta, bool& terminate,
                                    const Real* lamAll = nullptr, int nUp = 1,
                                    double* secF = nullptr, bool* secChromatic = nullptr,
-                                   bool* keepBundle = nullptr) {
+                                   bool* keepBundle = nullptr, double* radianceScale = nullptr) {
+    // (n_from / n_to)^2 at a refraction, 1 otherwise: the camera walk multiplies its throughput
+    // by it, the light walk does not (host twin: vcm.h scatterSample).
+    if (radianceScale) *radianceScale = 1.0;
     DVertex vt = dVertFromHit(h, matId);
     const DVec3& ns = h.n;
     DVec3 wo = normalize(rd * (Real)(-1));
@@ -16129,7 +16165,8 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             break;
         }
         case D_DIELECTRIC: {
-            DVec3 nro, nrd; dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd);
+            DVec3 nro, nrd;
+            dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr, radianceScale);
             wi = nrd; betaFactor = 1.0; delta = true;
             break;
         }
@@ -16156,13 +16193,13 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
         }
         case D_THINFILM: {
             DVec3 nro, nrd;
-            if (!thinFilmInterface(sc, m, h, rd, lambda, rng, nro, nrd)) { terminate = true; break; }
+            if (!thinFilmInterface(sc, m, h, rd, lambda, rng, nro, nrd, nullptr, radianceScale)) { terminate = true; break; }
             wi = nrd; betaFactor = 1.0; delta = true;
             break;
         }
         case D_MULTILAYER: {
             DVec3 nro, nrd;
-            if (!multilayerInterface(m, h, rd, lambda, rng, nro, nrd)) { terminate = true; break; }
+            if (!multilayerInterface(m, h, rd, lambda, rng, nro, nrd, nullptr, radianceScale)) { terminate = true; break; }
             wi = nrd; betaFactor = 1.0; delta = true;
             break;
         }
@@ -16966,9 +17003,11 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
 
             DVec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
             double secF[SECN]; bool secChromatic = false, keepBundle = false;
+            double radianceScale = 1.0;
             dVcmScatter(sc, *mp, h, rdCur, lambda, rng, matId, stk, diffraction,
                         wi, betaFactor, pdfW, pdfRevW, cosThetaOut, delta, terminate,
-                        lamAll, nUp, secF, &secChromatic, &keepBundle);
+                        lamAll, nUp, secF, &secChromatic, &keepBundle, &radianceScale);
+            betaFactor *= radianceScale;   // the camera walk carries radiance across a refraction
             double mxF = betaFactor;
             if (secChromatic) for (int k = 0; k + 1 < nUp; ++k) if (secF[k] > mxF) mxF = secF[k];
             if (terminate || !(mxF > 0.0)) break;

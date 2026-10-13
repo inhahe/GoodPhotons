@@ -1308,8 +1308,11 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                         const double extIor = (ranked && outMat >= 0)
                             ? scene.mats[outMat].ior(lambda) : 1.0;
                         bool transmitted = false;
-                        Ray nr = mats.refractOrReflect(scene, *mp, h, ray.d, lambda, rng, &transmitted, extIor);
+                        double rs = 1.0;
+                        Ray nr = mats.refractOrReflect(scene, *mp, h, ray.d, lambda, rng, &transmitted,
+                                                       extIor, nullptr, &rs);
                         wi = nr.d;
+                        if (mode == Mode::Radiance) betaFactor = rs;   // radiance, not flux
                         if (transmitted) stk.push(mi, pr);
                     }
                 } else {
@@ -1324,8 +1327,11 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                         const double extIor = (ranked && newMat >= 0)
                             ? scene.mats[newMat].ior(lambda) : 1.0;
                         bool transmitted = false;
-                        Ray nr = mats.refractOrReflect(scene, *mp, h, ray.d, lambda, rng, &transmitted, extIor);
+                        double rs = 1.0;
+                        Ray nr = mats.refractOrReflect(scene, *mp, h, ray.d, lambda, rng, &transmitted,
+                                                       extIor, nullptr, &rs);
                         wi = nr.d;
+                        if (mode == Mode::Radiance) betaFactor = rs;   // radiance, not flux
                         if (transmitted) stk.popMat(mi);            // TIR stays inside mi
                     }
                 }
@@ -1353,15 +1359,15 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 break;
             }
             case MatType::ThinFilm: {
-                Ray nr;
-                if (!mats.thinFilmInterface(scene, *mp, h, ray.d, lambda, rng, nr)) { terminate = true; break; }
-                wi = nr.d; betaFactor = 1.0; delta = true;
+                Ray nr; double rs = 1.0;
+                if (!mats.thinFilmInterface(scene, *mp, h, ray.d, lambda, rng, nr, nullptr, &rs)) { terminate = true; break; }
+                wi = nr.d; betaFactor = (mode == Mode::Radiance) ? rs : 1.0; delta = true;
                 break;
             }
             case MatType::Multilayer: {
-                Ray nr;
-                if (!mats.multilayerInterface(*mp, h, ray.d, lambda, rng, nr)) { terminate = true; break; }
-                wi = nr.d; betaFactor = 1.0; delta = true;
+                Ray nr; double rs = 1.0;
+                if (!mats.multilayerInterface(*mp, h, ray.d, lambda, rng, nr, nullptr, &rs)) { terminate = true; break; }
+                wi = nr.d; betaFactor = (mode == Mode::Radiance) ? rs : 1.0; delta = true;
                 break;
             }
             case MatType::Grating: {

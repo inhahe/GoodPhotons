@@ -192,7 +192,23 @@ fails to load, rather than rendering as smoke, is the loader's choice and was le
 
 Deferred, as their own entries: FIRE-NEE-STRATA-COST and SLAB-DDA-COPIES.
 
-## OPEN (2026-10-13): RADIANCE-ETA2 — camera-side transport leaves out the n^2 radiance scale at a refraction
+## DONE (2026-10-13, 0.378.1): RADIANCE-ETA2 — camera-side transport left out the n^2 radiance scale at a refraction
+
+**Fixed in 0.378.1.** `Renderer::refractOrReflect`, `thinFilmInterface` and `multilayerInterface`
+(and their device twins, with `dDielectricStep`) report (n_from / n_to)^2 for a refraction, 1 for
+a reflection, through a `radianceScale` out-parameter; every camera-side walk multiplies its
+throughput by it -- modes R/W (`interactMaterial`, `bkInteract`, the `-rgb` walk), BDPT's eye walk
+(`randomWalk` in Mode::Radiance, `dRandomWalk`), M's two gather walks, S's visible point, U's
+camera walk, host and device -- and the light-side walks ignore it. `tools/check_radiance_eta2.py`
+holds R and D to mode B with a lamp inside a glass block; M, S, U and D to R in a water tank lit
+from above (R is right there with or without the factor -- D moves too little there to test, its
+connections inside the water sharing their paths with s = 0 ones that need no factor); D and U to
+R with the lamp under the water; and the device to the host. On 0.378.0 it fails R/B x2.20, M/R x1.78, S/R x1.80, U/R x1.64;
+the D and U device / host pairs and the submerged-lamp pairs fail on a scratch build with only that
+part of the fix removed (figures in the 0.378.1 commit). Measured on the tank, four seeds: M/R x1.013
++- 0.013 on the ball (it read x1.77), S x1.015, the device's M x1.014; with a lid over the ball, so
+that it is lit only through the water, D x0.984 +- 0.014, U x0.993, M x1.011 at 1024 spp. The rest
+of this entry is the report as it was filed.
 
 Radiance over n^2 is what is conserved along a ray through a refraction (times the Fresnel
 transmittance), so radiance coming out of glass into air is (1/1.5)^2 = 0.44 of what it was
@@ -204,7 +220,18 @@ Mode::Radiance), and the camera passes of M, S, P and U -- while the forward tra
 light walk are right without it. For the usual scene it cancels: a ray goes into a glass object
 and out again, and (1/n^2)(n^2) = 1. It does not cancel when a path crosses an odd number of
 interfaces between the camera and the light: an emitter (or a fire) embedded in solid glass or
-water, or a camera inside one.
+water, or a camera inside one -- and, far more often, wherever a camera-side walk that went into a
+dielectric meets something the LIGHT side computed: mode M's and S's photon density (and U's and
+J's merges, and mode D's connections) at a surface inside water or glass -- a pool floor, an
+aquarium, an object in a glass block -- seen from outside. Mode R is right there, because its
+shadow rays stop at a dielectric, so its light comes back out the way it went in.
+
+Measured on a diffuse ball inside a closed water tank (n = 1.333, n^2 = 1.78), lit and seen from
+outside (scraps/face/eta2_tank.py): mode M read x1.42-1.80 of mode R on the tiles that see the ball
+through the water (12-22 sigma), x1.35 over the frame. Mode D read x0.945 of R (3.4 sigma, two
+seeds): every path to that ball crosses in and out, so D should match R there, and R's light in
+that scene arrives only by its continuation finding a small lamp through a refraction -- heavy
+tailed; to be measured again with more samples once the factor is in.
 
 Found with a fire inside a solid glass ball (check_fire_d's first lantern): on the floor and wall
 lit through the ball, mode R read x2.2-2.5 of mode B (n^2 = 2.25), and mode D -- whose light
@@ -213,6 +240,23 @@ in between (x0.43-0.60 of R; x1.0 of B where the light tracing dominates). Fix: 
 every camera-side refraction (and thin-film / multilayer / grating interfaces that change the
 medium), CPU and GPU, with a check of an emitter inside a solid dielectric in modes R, D and W
 against mode B. check_fire_d uses a glass pane, crossed in and out, until then.
+
+## OPEN (2026-10-13, to investigate): GPU-M-FLOOR — the device's mode M reads the floor in front of a water tank 2.4x too bright
+
+`tools/check_radiance_eta2.py`'s water tank (a closed box of water, n 1.333, on a diffuse floor,
+lit by an area lamp above it and seen from outside), mode M, 64x48, 64 spp, 50 M photons, four
+seeds each (scraps/face/tank_stats.py): the device reads x1.437 +- 0.008 of mode R over the frame
+while the host reads x1.015 +- 0.005. Over the ball inside the tank they agree (device x1.014 +-
+0.013, host x1.013 +- 0.013). The whole excess sits in the bottom tile row, the outer floor just in
+front of the tank, which the device reads x2.4 of the host. Not the photon maps: stored flux over
+emitted flux is 60.41 on the host and 60.46 on the device. So the device's camera side -- its gather
+or its walk to the floor -- differs there. Not RADIANCE-ETA2 either: 0.378.0 read the same x1.43.
+That floor strip is lit partly straight from the lamp and partly through the tank's front face, so
+a caustic, or a shadow-ray / gather difference at the water's edge, is the place to start.
+Reproduce: `python scraps/face/tank_stats.py <exe> <tag>` (scratch, git-ignored) with the pool
+floor quad dropped from the check's TANK -- the measurement predates it, and with it in place the
+floor strip lies in a dark corner of the frame. The check compares the device with the host over
+the ball only, until this is fixed.
 
 ## OPEN (2026-10-13, to investigate): STUBBLE-DEVICE-UNDERSIDE — mode W on a stubble coat, device vs host, 9.6 % apart in its dark underside
 

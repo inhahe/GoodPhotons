@@ -2295,10 +2295,11 @@ struct BackwardRenderer {
                     // a coin flip (see refractOrReflect's whittedWeight). Attenuating AFTER
                     // the call is safe because the ray has not been traced yet -- returning
                     // false here just ends the path at this vertex, as elsewhere in mode W.
-                    double wW = 1.0;
+                    double wW = 1.0, rs = 1.0;
                     ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted,
-                                                extIor, whitted ? &wW : nullptr);
+                                                extIor, whitted ? &wW : nullptr, &rs);
                     if (whitted && !whittedAttenuate(thr, wW)) return false;
+                    thr *= rs;                            // radiance across the interface
                     if (transmitted) stk.push(mi, pr);
                     return true;
                 } else {
@@ -2316,10 +2317,11 @@ struct BackwardRenderer {
                     const double extIor = (ranked && newMat >= 0)
                         ? scene.mats[newMat].ior(lambda) : 1.0;
                     bool transmitted = false;
-                    double wW = 1.0;                      // mode W: see the entering branch
+                    double wW = 1.0, rs = 1.0;            // mode W: see the entering branch
                     ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted,
-                                                extIor, whitted ? &wW : nullptr);
+                                                extIor, whitted ? &wW : nullptr, &rs);
                     if (whitted && !whittedAttenuate(thr, wW)) return false;
+                    thr *= rs;                            // radiance across the interface
                     if (transmitted) stk.popMat(mi);      // TIR stays inside mi
                     return true;
                 }
@@ -2329,17 +2331,19 @@ struct BackwardRenderer {
                 // of a coin flip, exactly as Dielectric does above (see thinFilmInterface's
                 // whittedWeight). Attenuating AFTER the call is safe -- the ray has not been
                 // traced yet, so returning false just ends the path at this vertex.
-                Ray nr; double wW = 1.0;
+                Ray nr; double wW = 1.0, rs = 1.0;
                 if (!mats.thinFilmInterface(scene, m, h, ray.d, lambda, rng, nr,
-                                            whitted ? &wW : nullptr)) return false;
+                                            whitted ? &wW : nullptr, &rs)) return false;
                 if (whitted && !whittedAttenuate(thr, wW)) return false;
+                thr *= rs;                                // radiance across the interface
                 ray = nr; specularArrival = true; return true;
             }
             case MatType::Multilayer: {
-                Ray nr; double wW = 1.0;                  // mode W: see ThinFilm above
+                Ray nr; double wW = 1.0, rs = 1.0;        // mode W: see ThinFilm above
                 if (!mats.multilayerInterface(m, h, ray.d, lambda, rng, nr,
-                                              whitted ? &wW : nullptr)) return false;
+                                              whitted ? &wW : nullptr, &rs)) return false;
                 if (whitted && !whittedAttenuate(thr, wW)) return false;
+                thr *= rs;                                // radiance across the interface
                 ray = nr; specularArrival = true; return true;
             }
             case MatType::Mirror: {

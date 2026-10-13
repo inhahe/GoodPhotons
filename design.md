@@ -2301,6 +2301,33 @@ alone is 7.7 M beams and mode `J` cannot finish a single spp inside a two-minute
 from the scene's `-beamk` knee. Passing `-n` explicitly still turns the budget off, which is
 why these historical runs reproduce. See **J-BEAMCOST** in `known-issues.md`.
 
+## Radiance across a refraction (0.378.1)
+
+Radiance over n^2 is what a ray conserves through a refraction (times the Fresnel
+transmittance): radiance leaving glass for air is (1/1.5)^2 of what it was inside. So the two
+directions of transport treat an interface differently. A walk that carries FLUX -- the forward
+tracer (`interactPhotonSpecular`, the device's `interactSpecular`), BDPT's and VCM's light walks
+-- needs nothing. A walk that carries RADIANCE -- the camera side of every mode: mode R/W's
+`interactMaterial` and `bkInteract` (and the `-rgb` walk), BDPT's eye walk (`randomWalk` in
+Mode::Radiance, `dRandomWalk` with `importance` false), mode M's two gather walks, mode S's visible
+point, mode U's camera walk -- multiplies its throughput by (n_from / n_to)^2 at every refraction
+(pbrt's TransportMode::Radiance factor on the BTDF). `Renderer::refractOrReflect`,
+`thinFilmInterface` and `multilayerInterface`, and their device twins (with `dDielectricStep`),
+report that factor through a `radianceScale` out-parameter, 1 on a reflection or a suppressed
+nested-dielectric boundary; the camera-side callers apply it, the light-side ones ignore it, and
+the MIS densities do not see it (it is throughput).
+
+It cancels for the usual glass object, crossed in and out, which is why its absence went unseen
+until 0.378.1: it matters only when a camera path ends inside a dielectric and meets something the
+light side computed there -- photon density (modes M, S), merges (U, J), BDPT connections, an
+embedded emitter or fire, a camera inside one. Mode M read x1.8 (water's n^2) on a ball in a water
+tank, and mode R x2.25 (glass's) on the floor lit by a lamp inside a glass block.
+`tools/check_radiance_eta2.py` holds R to the forward tracer there (mode B needs no factor), the
+photon modes M, S and U to R in the tank lit from above (R's paths there cross in and out, so it is
+right either way), and D and U to R with the lamp under the water, where every strategy of theirs
+crosses in once. In the tank lit from above BDPT moves too little to test: its connections inside
+the water share their paths with s = 0 ones that cross out to the lamp and need no factor.
+
 ## Module map (src/)
 
 - **`main.cpp`** (~6200) — CLI parsing (the option table is a chain of `else if`s split

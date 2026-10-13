@@ -4059,9 +4059,17 @@ struct Renderer {
     // visible: a glass sphere came out as an opaque salt-and-pepper blob. The frosting
     // perturbation is skipped in this mode for the same reason (mode W takes the mirror
     // direction for glossy lobes rather than sampling them).
+    //
+    // `radianceScale` reports (n_from / n_to)^2 for a refraction from the medium the ray was in
+    // into the one it enters, 1 for a reflection: radiance over n^2 is what a ray conserves
+    // across the interface, so a CAMERA-side walk (which carries radiance) multiplies its
+    // throughput by it, and a light-side one (which carries flux) does not. It cancels for a ray
+    // that goes into a body and out again; it does not for a camera path that ends inside one,
+    // where photons, light subpaths, an embedded emitter or a fire meet it (RADIANCE-ETA2).
     Ray refractOrReflect(const Scene& scene, const Material& m, const Hit& h, const Vec3& d,
                          double lambda, Pcg32& rng, bool* transmitted = nullptr,
-                         double extIor = 1.0, double* whittedWeight = nullptr) const {
+                         double extIor = 1.0, double* whittedWeight = nullptr,
+                         double* radianceScale = nullptr) const {
         double ng = m.ior(lambda);
         bool entering = dot(d, h.ng) < 0.0;
         Vec3 nl = entering ? h.ng : -h.ng;      // normal on the incidence side
@@ -4095,6 +4103,7 @@ struct Renderer {
             if (ok) outDir = pert;
         }
         if (transmitted) *transmitted = refracted;
+        if (radianceScale) *radianceScale = refracted ? (eta * eta) : 1.0;
         return Ray{h.p + outDir * 1e-6, outDir};
     }
 
@@ -4122,7 +4131,9 @@ struct Renderer {
     // material that stayed NOISY in the noise-free preview.
     bool thinFilmInterface(const Scene& scene, const Material& m, const Hit& h, const Vec3& d,
                            double lambda, Pcg32& rng, Ray& out,
-                           double* whittedWeight = nullptr) const {
+                           double* whittedWeight = nullptr,
+                           double* radianceScale = nullptr) const {
+        if (radianceScale) *radianceScale = 1.0;      // see refractOrReflect; set on refraction
         double ns = m.ior(lambda);              // substrate index (spectral -> dispersion)
         double nf = m.filmIor;                  // coating film index
         double ks = m.substrateK(lambda);       // substrate extinction (0 = transparent)
@@ -4158,7 +4169,10 @@ struct Renderer {
             const bool doReflect = whittedWeight ? (R >= 0.5) : (rng.uniform() < R);
             if (whittedWeight) *whittedWeight = doReflect ? R : 1.0 - R;
             if (doReflect) outDir = reflect(d, nl);
-            else outDir = eta * d + nl * (eta * cosI - cosT); // Snell refraction
+            else {
+                outDir = eta * d + nl * (eta * cosI - cosT); // Snell refraction
+                if (radianceScale) *radianceScale = eta * eta;
+            }
         }
         outDir = normalize(outDir);
         out = Ray{h.p + outDir * 1e-6, outDir};
@@ -4177,7 +4191,9 @@ struct Renderer {
     // `whittedWeight`: same deterministic dominant-branch contract as thinFilmInterface.
     bool multilayerInterface(const Material& m, const Hit& h, const Vec3& d,
                              double lambda, Pcg32& rng, Ray& out,
-                             double* whittedWeight = nullptr) const {
+                             double* whittedWeight = nullptr,
+                             double* radianceScale = nullptr) const {
+        if (radianceScale) *radianceScale = 1.0;      // see refractOrReflect; set on refraction
         double ns = m.ior(lambda);              // substrate index
         double ks = m.substrateK(lambda);       // substrate extinction
         int nL = (int)m.layerN.size();
@@ -4230,7 +4246,10 @@ struct Renderer {
             const bool doReflect = whittedWeight ? (R >= 0.5) : (rng.uniform() < R);
             if (whittedWeight) *whittedWeight = doReflect ? R : 1.0 - R;
             if (doReflect) outDir = reflect(d, nl);
-            else outDir = eta * d + nl * (eta * cosI - cosT); // Snell refraction
+            else {
+                outDir = eta * d + nl * (eta * cosI - cosT); // Snell refraction
+                if (radianceScale) *radianceScale = eta * eta;
+            }
         }
         outDir = normalize(outDir);
         out = Ray{h.p + outDir * 1e-6, outDir};

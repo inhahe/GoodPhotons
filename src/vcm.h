@@ -342,8 +342,11 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
                           MediumStack& stk,
                           const double* lamAll = nullptr, int nUp = 1,
                           double* secF = nullptr, bool* secChromatic = nullptr,
-                          bool* keepBundle = nullptr) {
+                          bool* keepBundle = nullptr, double* radianceScale = nullptr) {
     const Vec3 ns = h.n;
+    // (n_from / n_to)^2 at a refraction, 1 otherwise (Renderer::refractOrReflect): the camera
+    // walk, which carries radiance, multiplies its throughput by it; the light walk does not.
+    if (radianceScale) *radianceScale = 1.0;
     const Vec3 wo = normalize(rayDir * -1.0);
     wi = Vec3{0, 0, 0}; betaFactor = 0.0; pdfW = 0.0; pdfRevW = 0.0; cosThetaOut = 0.0;
     delta = false; terminate = false;
@@ -487,7 +490,8 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
                     const double extIor = (ranked && outMat >= 0)
                         ? scene.mats[outMat].ior(lambda) : 1.0;
                     bool transmitted = false;
-                    Ray nr = mats.refractOrReflect(scene, *mp, h, rayDir, lambda, rng, &transmitted, extIor);
+                    Ray nr = mats.refractOrReflect(scene, *mp, h, rayDir, lambda, rng, &transmitted, extIor,
+                                                   nullptr, radianceScale);
                     wi = nr.d;
                     if (transmitted) stk.push(mi, pr);
                 }
@@ -503,7 +507,8 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
                     const double extIor = (ranked && newMat >= 0)
                         ? scene.mats[newMat].ior(lambda) : 1.0;
                     bool transmitted = false;
-                    Ray nr = mats.refractOrReflect(scene, *mp, h, rayDir, lambda, rng, &transmitted, extIor);
+                    Ray nr = mats.refractOrReflect(scene, *mp, h, rayDir, lambda, rng, &transmitted, extIor,
+                                                   nullptr, radianceScale);
                     wi = nr.d;
                     if (transmitted) stk.popMat(mi);            // TIR stays inside mi
                 }
@@ -534,13 +539,13 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
         }
         case MatType::ThinFilm: {
             Ray nr;
-            if (!mats.thinFilmInterface(scene, *mp, h, rayDir, lambda, rng, nr)) { terminate = true; break; }
+            if (!mats.thinFilmInterface(scene, *mp, h, rayDir, lambda, rng, nr, nullptr, radianceScale)) { terminate = true; break; }
             wi = nr.d; betaFactor = 1.0; delta = true;
             break;
         }
         case MatType::Multilayer: {
             Ray nr;
-            if (!mats.multilayerInterface(*mp, h, rayDir, lambda, rng, nr)) { terminate = true; break; }
+            if (!mats.multilayerInterface(*mp, h, rayDir, lambda, rng, nr, nullptr, radianceScale)) { terminate = true; break; }
             wi = nr.d; betaFactor = 1.0; delta = true;
             break;
         }
@@ -1290,9 +1295,11 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         // Sample a continuation direction.
         Vec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
         double secF[hero::kHeroMax - 1]; bool secChromatic = false, keepBundle = false;
+        double radianceScale = 1.0;
         scatterSample(scene, mats, mp, h, rd, lambda, rng, wi, betaFactor, pdfW, pdfRevW,
                       cosThetaOut, delta, terminate, stk,
-                      hb.lam, nUp, secF, &secChromatic, &keepBundle);
+                      hb.lam, nUp, secF, &secChromatic, &keepBundle, &radianceScale);
+        betaFactor *= radianceScale;  // the camera walk carries radiance across a refraction
         double mxF = betaFactor;      // max over live λ, never the hero alone (policy 3)
         if (secChromatic) for (int i = 0; i + 1 < nUp; ++i) if (secF[i] > mxF) mxF = secF[i];
         if (terminate || mxF <= 0.0) return result;

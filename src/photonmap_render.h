@@ -1229,7 +1229,10 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                         const double extIor = (ranked && outMat >= 0)
                             ? scene.mats[outMat].ior(lambda) : 1.0;
                         bool transmitted = false;
-                        ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                        double rs = 1.0;                  // radiance across the interface
+                        ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor,
+                                                    nullptr, &rs);
+                        thr *= rs;
                         if (transmitted) stk.push(mi, pr);
                     }
                 } else {
@@ -1245,7 +1248,10 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                         const double extIor = (ranked && newMat >= 0)
                             ? scene.mats[newMat].ior(lambda) : 1.0;
                         bool transmitted = false;
-                        ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                        double rs = 1.0;                  // radiance across the interface
+                        ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor,
+                                                    nullptr, &rs);
+                        thr *= rs;
                         if (transmitted) stk.popMat(mi);            // TIR stays inside mi
                     }
                 }
@@ -1667,7 +1673,10 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                         const double extIor = (ranked && outMat >= 0)
                             ? scene.mats[outMat].ior(lambda) : 1.0;
                         bool transmitted = false;
-                        ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                        double rs = 1.0;                  // radiance across the interface
+                        ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor,
+                                                    nullptr, &rs);
+                        thr *= rs;
                         if (transmitted) stk.push(mi, pr);
                     }
                 } else {
@@ -1683,7 +1692,10 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                         const double extIor = (ranked && newMat >= 0)
                             ? scene.mats[newMat].ior(lambda) : 1.0;
                         bool transmitted = false;
-                        ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
+                        double rs = 1.0;                  // radiance across the interface
+                        ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor,
+                                                    nullptr, &rs);
+                        thr *= rs;
                         if (transmitted) stk.popMat(mi);            // TIR stays inside mi
                     }
                 }
