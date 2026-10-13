@@ -279,6 +279,24 @@ array for it). After: mode M fur 0.95-1.03x of the host within 1.1 standard erro
 without the floor; mode B within 1.5; `tools/check_hair_nee_sun.py`'s device/host comparison
 passes.
 
+## DONE (2026-10-12, 0.377.2): AREA-LIGHT-SIDE — a light whose `normal` opposed u×v was black to everything that hit it
+
+`light area { ... normal ... }`: the normal picks the side that emits (FTSL.md). Light sampling
+honoured it (emitterGeom's side test reads the authored normal), but the quad's two triangles were
+always wound by u×v, and every strategy that HITS a light -- a camera ray, a reflection, a BSDF
+continuation, CPU and GPU -- tests the side by the triangle's geometric normal. Such a light was
+therefore lit for light sampling and black to the rest: the lamp itself and its reflections
+rendered black, and each MIS pair disagreed (mode R's glossy light sampling on / off: 2.6x on a
+lamp seen in a glossy floor). Mode B, which emits by the authored normal and splats the panel
+from it, was unaffected. Eight lights in seven scenes are written that way (`_array_formal`,
+`_material_bind`, `_material_prop`, `fur_creature`, `mirror_selfie` (two), `realcam`,
+`stochtile`); their lamps, and what the lamps show in mirrors, now render.
+
+**Fix.** The loader winds the triangles to face the authored side (against u×v when the normal
+points the other way), each corner keeping its UV, so every hit-side test agrees with light
+sampling. `tools/check_light_side.py` renders one lamp written both ways: 0.13x before, on the
+host and the device.
+
 ## OPEN (2026-10-12, tech debt): GMIS-NULL-BY-HAND — every caller keeps the glossy MIS record across a pass-through by hand
 
 A coverage pass-through (see-through fur) is no vertex, so the glossy MIS record (`GlossyMis`,

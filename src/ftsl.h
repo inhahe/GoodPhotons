@@ -7149,9 +7149,19 @@ private:
         // that; the second's did NOT (it inherited (0,0),(1,0),(1,1) for corners a,cc,dd),
         // which put a seam down the diagonal of any UV-driven emission pattern — and,
         // before this change, of any texture applied to an area light's quad.
-        L.scene.tris.push_back(Tri{a, bb, cc, id, -1, {}});
-        L.scene.tris.push_back(Tri{a, cc, dd, id, -1, {},
-                                   Vec3{0, 0, 0}, Vec3{1, 1, 0}, Vec3{0, 1, 0}});
+        // `normal` picks the side that emits, and every hit-side test reads the triangles' own
+        // winding (their geometric normal), so they are wound to face that side: against u×v
+        // when the authored normal points the other way. Each corner keeps its UV.
+        if (dot(nw, cross(us, vs)) >= 0.0) {
+            L.scene.tris.push_back(Tri{a, bb, cc, id, -1, {}});
+            L.scene.tris.push_back(Tri{a, cc, dd, id, -1, {},
+                                       Vec3{0, 0, 0}, Vec3{1, 1, 0}, Vec3{0, 1, 0}});
+        } else {
+            L.scene.tris.push_back(Tri{a, cc, bb, id, -1, {},
+                                       Vec3{0, 0, 0}, Vec3{1, 1, 0}, Vec3{1, 0, 0}});
+            L.scene.tris.push_back(Tri{a, dd, cc, id, -1, {},
+                                       Vec3{0, 0, 0}, Vec3{0, 1, 0}, Vec3{1, 1, 0}});
+        }
         L.scene.addAreaLight(os, us, vs, nw, length(cross(us, vs)), spd, binWidth_,
                              /*collimated*/false, /*beamDir*/{1, 0, 0}, /*matId*/id);
         return true;
