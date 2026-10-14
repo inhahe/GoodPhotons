@@ -385,11 +385,12 @@ inline double layeredCoatReflectance(const Scene& scene, const Material& m, cons
 // with phase thickness d_j = (2 pi / lambda) q_j t_j and transverse admittance
 // q_j = sqrt(n_j^2 - n0^2 sin^2 theta0); eta = q (s-pol) or n^2/q (p-pol). The
 // stack product M, closed with the substrate admittance, gives r = (eta0 B - C) /
-// (eta0 B + C) and R = |r|^2, averaged over the two polarisations.
+// (eta0 B + C) and R = |r|^2, averaged over the two polarisations. `reversed` reads the layers
+// last to first, for a ray meeting the stack from its substrate side.
 inline double multilayerReflectance(double n0, double cosI, double lambda,
                                     const double* nL, const double* kL,
                                     const double* dL, int nLayers,
-                                    double ns, double ks) {
+                                    double ns, double ks, bool reversed = false) {
     using cd = std::complex<double>;
     cosI = clamp01(std::fabs(cosI));
     double sin0_2 = std::max(0.0, 1.0 - cosI * cosI);
@@ -398,7 +399,8 @@ inline double multilayerReflectance(double n0, double cosI, double lambda,
     auto admit = [](cd nsq, cd q, bool pPol) { return pPol ? nsq / q : q; };
     auto solve = [&](bool pPol) {
         cd M00(1, 0), M01(0, 0), M10(0, 0), M11(1, 0);   // identity
-        for (int j = 0; j < nLayers; ++j) {
+        for (int jj = 0; jj < nLayers; ++jj) {
+            const int j = reversed ? nLayers - 1 - jj : jj;
             cd nj(nL[j], kL[j]);
             cd qj = std::sqrt(nj * nj - cd(n0s, 0.0));
             if (qj.imag() < 0.0) qj = -qj;
@@ -2342,71 +2344,21 @@ struct Renderer {
                                 EnergyReport& e) const {
         switch (m.type) {
             case MatType::Dielectric: {
-                // Nested-dielectric PRIORITY resolution (Schmidt & Budge 2002): the
-                // exterior IOR is the medium the photon is currently inside (the
-                // highest-priority stack entry), not a hardcoded 1.0, so glass inside
-                // water refracts 1.33<->1.52. Where dielectrics overlap the higher
-                // `priority` wins and the lower one's boundary is suppressed (the
-                // photon passes straight through). SAFE FALLBACK: the priority rule
-                // applies only when BOTH sides carry an explicit priority (air always
-                // counts, IOR 1.0); otherwise this degrades to the old flat
-                // air<->glass model so priority-free scenes are bit-identical.
-                bool entering = dot(ray.d, h.ng) < 0.0;
-                const int mi = (int)(&m - scene.mats.data());   // true index (Mix/Layered aware)
-                const int pr = m.priority;               // INT_MIN if unset
-
-                if (entering) {
-                    const int outMat = stk.topMat();     // -1 == air
-                    const int outPri = stk.topPri();     // INT_MIN == air
-                    const bool ranked = m.hasPriority() &&
-                        (stk.empty() || (outMat >= 0 && scene.mats[outMat].hasPriority()));
-                    if (ranked && !stk.empty() && pr <= outPri) {   // suppressed inner surface
-                        stk.push(mi, pr);
-                        ray = Ray{h.p + ray.d * 1e-6, ray.d};
-                        return true;
-                    }
-                    const double extIor = (ranked && outMat >= 0)
-                        ? scene.mats[outMat].ior(lambda) : 1.0;
-                    bool transmitted = false;
-                    ray = refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
-                    if (transmitted) stk.push(mi, pr);
-                    return true;                 // lossless (absorption applied per-segment)
-                } else {
-                    MediumStack after = stk;
-                    after.popMat(mi);
-                    const int newMat = after.topMat();   // -1 == air underneath
-                    const int newPri = after.topPri();
-                    const bool ranked = m.hasPriority() &&
-                        (after.empty() || (newMat >= 0 && scene.mats[newMat].hasPriority()));
-                    if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed: still enclosed
-                        stk.popMat(mi);
-                        ray = Ray{h.p + ray.d * 1e-6, ray.d};
-                        return true;
-                    }
-                    const double extIor = (ranked && newMat >= 0)
-                        ? scene.mats[newMat].ior(lambda) : 1.0;
-                    bool transmitted = false;
-                    ray = refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor);
-                    if (transmitted) stk.popMat(mi);      // TIR stays inside mi
-                    return true;                 // lossless (absorption applied per-segment)
-                }
+                // Nested dielectrics by priority (dielectricStep). A photon carries flux:
+                // a refraction does not rescale it. Lossless (absorption applied per segment).
+                ray = dielectricStep(scene, m, (int)(&m - scene.mats.data()), h, ray.d, lambda,
+                                     rng, stk, Transport::Flux).ray;
+                return true;
             }
-            case MatType::ThinFilm: {
-                // Iridescent coated interface: specular reflect-or-refract with a
-                // thin-film interference reflectance (structural colour). With an
-                // absorbing substrate the transmitted fraction is absorbed here.
-                Ray nr;
-                if (!thinFilmInterface(scene, m, h, ray.d, lambda, rng, nr)) { e.absorbed += beta; return false; }
-                ray = nr;
-                return true;                     // lossless on survival; beta unchanged
-            }
+            case MatType::ThinFilm:
             case MatType::Multilayer: {
-                // Multilayer (Bragg / dichroic) stack: specular reflect-or-
-                // refract with the Abeles full-stack reflectance. Absorbing
-                // stacks/substrates absorb the transmitted fraction here.
-                Ray nr;
-                if (!multilayerInterface(m, h, ray.d, lambda, rng, nr)) { e.absorbed += beta; return false; }
-                ray = nr;
+                // Iridescent coating or a multilayer (Bragg / dichroic) stack: specular
+                // reflect-or-refract with the interference reflectance (structural colour).
+                // An absorbing substrate or stack absorbs the transmitted fraction here.
+                const InterfaceStep st = coatStep(scene, m, h, ray.d, lambda, rng, stk,
+                                                  Transport::Flux);
+                if (st.absorbed) { e.absorbed += beta; return false; }
+                ray = st.ray;
                 return true;                     // lossless on survival; beta unchanged
             }
             case MatType::Mirror: {
@@ -2963,7 +2915,7 @@ struct Renderer {
         // cap can send it back to the single-scatter rule once it is spent.
         int beamScatters = 0;
         // Chord PROVENANCE for `-sunnee` (photonbeams.h PhotonBeam::srcEm / surf): the emitter
-        // this photon was born on and the surface interactions it has made so far.
+        // this photon was born on and the surface interactions it has made so outer.
         int surfHits = 0;
 
         // CAUSTIC classification state (mode M's two-map split; see photonVertexKind above).
@@ -4116,11 +4068,16 @@ struct Renderer {
     // survival probability, exactly as Mirror/Filter already do in mode W. Lossless
     // substrate: reflect iff R >= 0.5, weight R or 1-R. Without this, thin film was a
     // material that stayed NOISY in the noise-free preview.
+    //
+    // `extIor` is the index of the medium on the far side of the coating (coatStep's
+    // exteriorIor; 1 in air), and `transmitted` / `radianceScale` report a refraction as
+    // refractOrReflect does. Called through coatStep.
     bool thinFilmInterface(const Scene& scene, const Material& m, const Hit& h, const Vec3& d,
-                           double lambda, Pcg32& rng, Ray& out,
-                           double* whittedWeight = nullptr,
-                           double* radianceScale = nullptr) const {
-        if (radianceScale) *radianceScale = 1.0;      // see refractOrReflect; set on refraction
+                           double lambda, Pcg32& rng, Ray& out, double extIor,
+                           bool* transmitted, double* whittedWeight,
+                           double* radianceScale) const {
+        *transmitted = false;
+        *radianceScale = 1.0;                   // see refractOrReflect; set on refraction
         double ns = m.ior(lambda);              // substrate index (spectral -> dispersion)
         double nf = m.filmIor;                  // coating film index
         double ks = m.substrateK(lambda);       // substrate extinction (0 = transparent)
@@ -4131,7 +4088,7 @@ struct Renderer {
 
         if (ks > 0.0) {                         // opaque metal-backed film
             if (!entering) return false;        // inside the absorbing substrate: absorbed
-            double R = thinFilmReflectance(1.0, nf, ns, ks, thickness, cosI, lambda);
+            double R = thinFilmReflectance(extIor, nf, ns, ks, thickness, cosI, lambda);
             if (whittedWeight) *whittedWeight = R;              // weight, not a survival roll
             else if (rng.uniform() >= R) return false;          // transmitted -> absorbed
             Vec3 o = normalize(reflect(d, nl));
@@ -4139,8 +4096,8 @@ struct Renderer {
             return true;
         }
 
-        double nA = entering ? 1.0 : ns;        // incidence-side medium
-        double nB = entering ? ns : 1.0;        // transmission-side medium
+        double nA = entering ? extIor : ns;     // incidence-side medium
+        double nB = entering ? ns : extIor;     // transmission-side medium
         double eta = nA / nB;
         double sin2t = eta * eta * (1.0 - cosI * cosI);
         Vec3 outDir;
@@ -4158,7 +4115,8 @@ struct Renderer {
             if (doReflect) outDir = reflect(d, nl);
             else {
                 outDir = eta * d + nl * (eta * cosI - cosT); // Snell refraction
-                if (radianceScale) *radianceScale = eta * eta;
+                *transmitted = true;
+                *radianceScale = eta * eta;
             }
         }
         outDir = normalize(outDir);
@@ -4175,12 +4133,14 @@ struct Renderer {
     //     prob R, else the transmitted light is absorbed -> the photon terminates
     //     (opaque structural colour: beetle/Morpho on an absorbing base).
     // Returns false when the photon is absorbed (caller terminates the path).
-    // `whittedWeight`: same deterministic dominant-branch contract as thinFilmInterface.
+    // `whittedWeight`, `extIor`, `transmitted`, `radianceScale`: as thinFilmInterface. Called
+    // through coatStep.
     bool multilayerInterface(const Material& m, const Hit& h, const Vec3& d,
-                             double lambda, Pcg32& rng, Ray& out,
-                             double* whittedWeight = nullptr,
-                             double* radianceScale = nullptr) const {
-        if (radianceScale) *radianceScale = 1.0;      // see refractOrReflect; set on refraction
+                             double lambda, Pcg32& rng, Ray& out, double extIor,
+                             bool* transmitted, double* whittedWeight,
+                             double* radianceScale) const {
+        *transmitted = false;
+        *radianceScale = 1.0;                   // see refractOrReflect; set on refraction
         double ns = m.ior(lambda);              // substrate index
         double ks = m.substrateK(lambda);       // substrate extinction
         int nL = (int)m.layerN.size();
@@ -4196,7 +4156,7 @@ struct Renderer {
         // the ray is actually in (air outside, substrate inside for a clear stack).
         if (opaque) {                           // one-sided: reflect-or-absorb
             if (!entering) return false;        // inside the absorbing body: absorbed
-            double R = multilayerReflectance(1.0, cosI, lambda,
+            double R = multilayerReflectance(extIor, cosI, lambda,
                                              m.layerN.data(), m.layerK.data(),
                                              m.layerThick.data(), nL, ns, ks);
             if (whittedWeight) *whittedWeight = R;              // weight, not a survival roll
@@ -4207,8 +4167,8 @@ struct Renderer {
         }
 
         // Lossless: reflect-or-refract into/out of the transparent substrate.
-        double nA = entering ? 1.0 : ns;
-        double nB = entering ? ns : 1.0;
+        double nA = entering ? extIor : ns;
+        double nB = entering ? ns : extIor;
         double eta = nA / nB;
         double sin2t = eta * eta * (1.0 - cosI * cosI);
         Vec3 outDir;
@@ -4217,30 +4177,135 @@ struct Renderer {
             if (whittedWeight) *whittedWeight = 1.0;    // lossless, one branch only
         } else {
             double cosT = std::sqrt(1.0 - sin2t);
-            // Evaluate the stack from the incidence side. When exiting (ray inside
-            // the substrate) the stack is traversed in reverse and the incident
-            // medium is ns; build reversed layer arrays for that case.
-            double R;
-            if (entering) {
-                R = multilayerReflectance(1.0, cosI, lambda,
-                                          m.layerN.data(), m.layerK.data(),
-                                          m.layerThick.data(), nL, ns, 0.0);
-            } else {
-                std::vector<double> rn(nL), rk(nL), rd(nL);
-                for (int j = 0; j < nL; ++j) { rn[j] = m.layerN[nL-1-j]; rk[j] = m.layerK[nL-1-j]; rd[j] = m.layerThick[nL-1-j]; }
-                R = multilayerReflectance(ns, cosI, lambda, rn.data(), rk.data(), rd.data(), nL, 1.0, 0.0);
-            }
+            // Evaluate the stack from the incidence side: exiting (the ray inside the
+            // substrate), the layers in reverse and the incident medium ns.
+            const double R = entering
+                ? multilayerReflectance(extIor, cosI, lambda, m.layerN.data(), m.layerK.data(),
+                                        m.layerThick.data(), nL, ns, 0.0)
+                : multilayerReflectance(ns, cosI, lambda, m.layerN.data(), m.layerK.data(),
+                                        m.layerThick.data(), nL, extIor, 0.0, /*reversed=*/true);
             const bool doReflect = whittedWeight ? (R >= 0.5) : (rng.uniform() < R);
             if (whittedWeight) *whittedWeight = doReflect ? R : 1.0 - R;
             if (doReflect) outDir = reflect(d, nl);
             else {
                 outDir = eta * d + nl * (eta * cosI - cosT); // Snell refraction
-                if (radianceScale) *radianceScale = eta * eta;
+                *transmitted = true;
+                *radianceScale = eta * eta;
             }
         }
         outDir = normalize(outDir);
         out = Ray{h.p + outDir * 1e-6, outDir};
         return true;
+    }
+
+    // --- Interface steps: every host walk's way through a dielectric or a coated surface ------
+    // Which quantity a walk carries across an interface: a camera-side walk carries RADIANCE,
+    // which a refraction scales by (n_from / n_to)^2 -- radiance over n^2 is what a ray conserves
+    // there -- and a light-side walk carries FLUX, which it does not (RADIANCE-ETA2). Both steps
+    // below take one, so a walk cannot leave the factor out by omission.
+    enum class Transport { Radiance, Flux };
+
+    // What a step did. `ray` continues the walk (the incoming direction, straight on, at a
+    // suppressed boundary); `scale` is the throughput factor -- (n_from / n_to)^2 for a Radiance
+    // walk that refracted, 1 otherwise; `whittedWeight` mode W's Fresnel weight for the branch it
+    // took (1 at a pass-through and at total internal reflection); `extMat` the material whose
+    // index the far side had (-1: air, or the flat model -- index 1).
+    struct InterfaceStep {
+        Ray ray;
+        double scale = 1.0;
+        double whittedWeight = 1.0;
+        bool entering = false;      // met the surface from outside the material
+        bool refracted = false;     // crossed into the other medium
+        bool absorbed = false;      // an opaque coating took the ray (coatStep only)
+        int extMat = -1;
+    };
+
+    // The far-side index for a surface of material `m` whose far side is the top of `outer` (the
+    // stack without m): the enclosing medium's index when both carry an explicit `priority` (air
+    // always counts), else 1 -- the flat air<->glass model, so priority-free scenes render as they
+    // always did. `extMat` receives that medium (-1 for index 1); `ranked` whether the rule held.
+    static double exteriorIor(const Scene& scene, const Material& m, const MediumStack& outer,
+                              double lambda, int& extMat, bool* ranked = nullptr) {
+        const int top = outer.topMat();
+        const bool rk = m.hasPriority() &&
+            (outer.empty() || (top >= 0 && scene.mats[(size_t)top].hasPriority()));
+        if (ranked) *ranked = rk;
+        extMat = (rk && top >= 0) ? top : -1;
+        return (extMat >= 0) ? scene.mats[(size_t)extMat].ior(lambda) : 1.0;
+    }
+
+    // One dielectric interface for every host walk, the twin of the device's dDielectricStep:
+    // the nested-dielectric PRIORITY rule (Schmidt & Budge 2002) -- the far side's index from the
+    // enclosing medium (exteriorIor), a boundary of no higher priority than the medium it lies in
+    // suppressed (straight on), `stk` kept -- then refractOrReflect. `mi` is m's index in
+    // scene.mats (Mix/Layered aware); `whitted` asks for mode W's deterministic branch.
+    InterfaceStep dielectricStep(const Scene& scene, const Material& m, int mi, const Hit& h,
+                                 const Vec3& d, double lambda, Pcg32& rng, MediumStack& stk,
+                                 Transport tr, bool whitted = false) const {
+        InterfaceStep st;
+        st.entering = dot(d, h.ng) < 0.0;
+        // The far side: the medium the ray comes from when it enters, the one it returns to when
+        // it leaves (the stack without mi).
+        MediumStack after;
+        if (!st.entering) { after = stk; after.popMat(mi); }
+        const MediumStack& outer = st.entering ? stk : after;
+        bool ranked = false;
+        const double extIor = exteriorIor(scene, m, outer, lambda, st.extMat, &ranked);
+        if (ranked && outer.topMat() >= 0 && m.priority <= outer.topPri()) {   // suppressed
+            if (st.entering) stk.push(mi, m.priority); else stk.popMat(mi);
+            st.ray = Ray{h.p + d * 1e-6, d};
+            st.extMat = -1;
+            return st;
+        }
+        bool transmitted = false;
+        double rs = 1.0;
+        st.ray = refractOrReflect(scene, m, h, d, lambda, rng, &transmitted, extIor,
+                                  whitted ? &st.whittedWeight : nullptr, &rs);
+        st.refracted = transmitted;
+        if (tr == Transport::Radiance) st.scale = rs;
+        if (transmitted) { if (st.entering) stk.push(mi, m.priority); else stk.popMat(mi); }
+        return st;
+    }
+
+    // A thin-film or multilayer surface, the same way: its far side is the top of `stk` (a
+    // coated body is not on the stack), by exteriorIor's rule. `absorbed` when an opaque coating
+    // or substrate took the ray (the walk ends).
+    InterfaceStep coatStep(const Scene& scene, const Material& m, const Hit& h, const Vec3& d,
+                           double lambda, Pcg32& rng, const MediumStack& stk, Transport tr,
+                           bool whitted = false) const {
+        InterfaceStep st;
+        st.entering = dot(d, h.ng) < 0.0;
+        const double extIor = exteriorIor(scene, m, stk, lambda, st.extMat);
+        bool transmitted = false;
+        double rs = 1.0;
+        double* wW = whitted ? &st.whittedWeight : nullptr;
+        st.absorbed = (m.type == MatType::ThinFilm)
+            ? !thinFilmInterface(scene, m, h, d, lambda, rng, st.ray, extIor, &transmitted, wW, &rs)
+            : !multilayerInterface(m, h, d, lambda, rng, st.ray, extIor, &transmitted, wW, &rs);
+        st.refracted = transmitted;
+        if (tr == Transport::Radiance) st.scale = rs;
+        return st;
+    }
+
+    // A step's radiance factor at another wavelength `L` -- what mode M's spectral gather folds
+    // per photon (SpecThr): (n_from / n_to)^2 with both indices at L, 1 unless it refracted.
+    static double stepScaleAt(const Scene& scene, const Material& m, const InterfaceStep& st,
+                              double L) {
+        if (!st.refracted) return 1.0;
+        const double nm = m.ior(L);
+        const double ne = (st.extMat >= 0) ? scene.mats[(size_t)st.extMat].ior(L) : 1.0;
+        const double eta = st.entering ? ne / nm : nm / ne;
+        return eta * eta;
+    }
+
+    // The square of the index of the medium a path is in (the top of its stack; 1 in air): what
+    // turns a camera walk's throughput, which carries radiance, back into air units -- for mode
+    // W's cutoff, and for its ambient fill, which is radiance in air and so n^2 brighter inside.
+    static double localN2(const Scene& scene, const MediumStack& stk, double lambda) {
+        const int top = stk.topMat();
+        if (top < 0) return 1.0;
+        const double n = scene.mats[(size_t)top].ior(lambda);
+        return n * n;
     }
 
     // Reflective diffraction grating. The exact vector grating equation preserves

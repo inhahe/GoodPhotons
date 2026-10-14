@@ -64,6 +64,9 @@ def main():
         imgs = []
         for seed in (1, 2):
             png = "%s_s%d.png" % (tag, seed)
+            for f in (png, png[:-4] + ".pfm"):     # never score an earlier run's image
+                if os.path.exists(os.path.join(d, f)):
+                    os.remove(os.path.join(d, f))
             cmd = [a.exe, "-in", "box.ftsl", "-seed", str(seed), "-hdr", "-no-meter",
                    "-spp", str(a.spp), "-o", png] + args
             p = subprocess.run(cmd, cwd=d, capture_output=True, text=True, encoding="utf-8",

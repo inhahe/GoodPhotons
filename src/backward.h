@@ -808,11 +808,14 @@ struct BackwardRenderer {
     // Same expected value, zero variance. Returns false once the path is too dim to
     // matter -- POV-Ray's `adc_bailout` (default 1/255), which is what stops a
     // mirror-lined box from recursing to maxBounce on literally every pixel.
+    // `n2` is the square of the index of the medium the path is in (Renderer::localN2): a camera
+    // walk's throughput carries radiance, 1/n^2 of its air-equivalent inside a dielectric, and the
+    // cutoff is an air-unit threshold.
     static constexpr double kWhittedCutoff = 1.0 / 512.0;
-    static bool whittedAttenuate(double& thr, double w) {
+    static bool whittedAttenuate(double& thr, double w, double n2) {
         if (w <= 0.0) return false;
         thr *= w;
-        return thr > kWhittedCutoff;
+        return thr * n2 > kWhittedCutoff;
     }
 
     // Does this emitter consume its two sample coordinates?  A collimated beam and a
@@ -2222,7 +2225,7 @@ struct BackwardRenderer {
         if (!(pdfH > 0.0) || !(fv > 0.0)) return false;
         const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
         const double Tlobe = clamp01(fv * cosLong / pdfH);      // == sum_p A_p
-        if (whitted) { if (!whittedAttenuate(thr, Tlobe)) return false; }
+        if (whitted) { if (!whittedAttenuate(thr, Tlobe, /*n2: a coat in air*/ 1.0)) return false; }
         else if (rng.uniform() >= Tlobe) return false;          // analog absorption
         ray = Ray{vh.p, hair::toWorld(hs.fr, wl)};
         contBsdfPdf = pdfH;
@@ -2247,95 +2250,44 @@ struct BackwardRenderer {
         // Hair pass-through) puts it back: it is not a bounce.
         const GlossyMis gmIn = gm ? *gm : GlossyMis{};
         if (gm) gm->clear();
+        // Mode W's weight-and-cutoff, in the units of the medium the path is in now.
+        auto wAtt = [&](double w) {
+            return whittedAttenuate(thr, w, Renderer::localN2(scene, stk, lambda));
+        };
         switch (m.type) {
             case MatType::Dielectric: {
-                // Nested-dielectric PRIORITY resolution (Schmidt & Budge 2002). The
-                // exterior IOR at this interface is the medium the ray is currently
-                // travelling through (the highest-priority stack entry), not a hardcoded
-                // 1.0 -- so a glass surface inside water refracts 1.33<->1.52. Where two
-                // dielectrics overlap, the higher priority wins and the lower one's
-                // boundary is suppressed (the ray passes straight through, unrefracted).
-                // SAFE FALLBACK: the priority rule applies only when BOTH sides carry an
-                // explicit priority; otherwise the interface degrades to the flat
-                // air<->glass model (extIor 1.0), so priority-free scenes are unchanged.
-                bool entering = dot(ray.d, h.ng) < 0.0;
-                const int mi = (int)(&m - scene.mats.data());   // true index (Mix/Layered aware)
-                const int pr = m.priority;               // INT_MIN if unset
+                // Nested dielectrics by priority (Renderer::dielectricStep). Mode W takes the
+                // dominant Fresnel branch and weights it into the throughput instead of a coin
+                // flip (see refractOrReflect's whittedWeight); attenuating after the step is safe,
+                // the ray not yet traced, so returning false just ends the path at this vertex.
                 specularArrival = true;
-                if (entering) {
-                    const int outMat = stk.topMat();     // -1 == air
-                    const int outPri = stk.topPri();     // INT_MIN == air
-                    const bool ranked = m.hasPriority() &&
-                        (stk.empty() || (outMat >= 0 && scene.mats[outMat].hasPriority()));
-                    if (ranked && !stk.empty() && pr <= outPri) {   // suppressed entry
-                        stk.push(mi, pr);
-                        ray = Ray{h.p + ray.d * 1e-6, ray.d};
-                        return true;
-                    }
-                    const double extIor = (ranked && outMat >= 0)
-                        ? scene.mats[outMat].ior(lambda) : 1.0;
-                    bool transmitted = false;
-                    // Mode W: dominant Fresnel branch weighted into the throughput instead of
-                    // a coin flip (see refractOrReflect's whittedWeight). Attenuating AFTER
-                    // the call is safe because the ray has not been traced yet -- returning
-                    // false here just ends the path at this vertex, as elsewhere in mode W.
-                    double wW = 1.0, rs = 1.0;
-                    ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted,
-                                                extIor, whitted ? &wW : nullptr, &rs);
-                    if (whitted && !whittedAttenuate(thr, wW)) return false;
-                    thr *= rs;                            // radiance across the interface
-                    if (transmitted) stk.push(mi, pr);
-                    return true;
-                } else {
-                    MediumStack after = stk;             // exiting solid mi
-                    after.popMat(mi);
-                    const int newMat = after.topMat();   // -1 == air underneath
-                    const int newPri = after.topPri();
-                    const bool ranked = m.hasPriority() &&
-                        (after.empty() || (newMat >= 0 && scene.mats[newMat].hasPriority()));
-                    if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed exit
-                        stk.popMat(mi);
-                        ray = Ray{h.p + ray.d * 1e-6, ray.d};
-                        return true;
-                    }
-                    const double extIor = (ranked && newMat >= 0)
-                        ? scene.mats[newMat].ior(lambda) : 1.0;
-                    bool transmitted = false;
-                    double wW = 1.0, rs = 1.0;            // mode W: see the entering branch
-                    ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted,
-                                                extIor, whitted ? &wW : nullptr, &rs);
-                    if (whitted && !whittedAttenuate(thr, wW)) return false;
-                    thr *= rs;                            // radiance across the interface
-                    if (transmitted) stk.popMat(mi);      // TIR stays inside mi
-                    return true;
-                }
+                const Renderer::InterfaceStep st =
+                    mats.dielectricStep(scene, m, (int)(&m - scene.mats.data()), h, ray.d, lambda,
+                                        rng, stk, Renderer::Transport::Radiance, whitted);
+                ray = st.ray;
+                thr *= st.scale;                          // radiance across the interface
+                if (whitted && !wAtt(st.whittedWeight)) return false;
+                return true;
             }
-            case MatType::ThinFilm: {
-                // Mode W: dominant interference branch weighted into the throughput instead
-                // of a coin flip, exactly as Dielectric does above (see thinFilmInterface's
-                // whittedWeight). Attenuating AFTER the call is safe -- the ray has not been
-                // traced yet, so returning false just ends the path at this vertex.
-                Ray nr; double wW = 1.0, rs = 1.0;
-                if (!mats.thinFilmInterface(scene, m, h, ray.d, lambda, rng, nr,
-                                            whitted ? &wW : nullptr, &rs)) return false;
-                if (whitted && !whittedAttenuate(thr, wW)) return false;
-                thr *= rs;                                // radiance across the interface
-                ray = nr; specularArrival = true; return true;
-            }
+            case MatType::ThinFilm:
             case MatType::Multilayer: {
-                Ray nr; double wW = 1.0, rs = 1.0;        // mode W: see ThinFilm above
-                if (!mats.multilayerInterface(m, h, ray.d, lambda, rng, nr,
-                                              whitted ? &wW : nullptr, &rs)) return false;
-                if (whitted && !whittedAttenuate(thr, wW)) return false;
-                thr *= rs;                                // radiance across the interface
-                ray = nr; specularArrival = true; return true;
+                // Mode W: the dominant interference branch, weighted, as Dielectric does above.
+                const Renderer::InterfaceStep st =
+                    mats.coatStep(scene, m, h, ray.d, lambda, rng, stk,
+                                  Renderer::Transport::Radiance, whitted);
+                if (st.absorbed) return false;
+                ray = st.ray;
+                thr *= st.scale;                          // radiance across the interface
+                if (whitted && !wAtt(st.whittedWeight)) return false;
+                specularArrival = true;
+                return true;
             }
             case MatType::Mirror: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 // Whitted: carry the reflectance as WEIGHT instead of rolling for
                 // survival. Same expected value, zero variance -- the whole reason a
                 // deterministic preview converges at 1 spp where RR needs tens.
-                if (whitted) { if (!whittedAttenuate(thr, r)) return false; }
+                if (whitted) { if (!wAtt(r)) return false; }
                 else if (rng.uniform() >= r) return false;      // RR absorb
                 ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
                 specularArrival = true; return true;
@@ -2344,7 +2296,7 @@ struct BackwardRenderer {
                 // The grating equation is reciprocal, so backward tracing reuses the
                 // same diffraction (m <-> -m symmetric). Specular per order.
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
-                if (whitted) { if (!whittedAttenuate(thr, r)) return false; }
+                if (whitted) { if (!wAtt(r)) return false; }
                 else if (rng.uniform() >= r) return false;      // RR absorb
                 bool absorbedG;
                 // Mode W: the diffraction ORDER comes off the (sIdx, bounce) lattice instead of
@@ -2365,7 +2317,7 @@ struct BackwardRenderer {
                 // as whichever of reflection/transmission is stronger.)
                 if (whitted) {
                     const bool refl = (r >= 0.5);
-                    if (!whittedAttenuate(thr, refl ? r : 1.0 - r)) return false;
+                    if (!wAtt(refl ? r : 1.0 - r)) return false;
                     ray = refl ? Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)}
                                : Ray{h.p + ray.d * 1e-6, ray.d};
                 } else if (rng.uniform() < r) ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
@@ -2375,7 +2327,7 @@ struct BackwardRenderer {
             case MatType::Filter: {
                 // Colored gel filter: pass straight through, survive with prob T(lambda).
                 double t = clamp01(transmitSlot(scene, m, h, lambda));
-                if (whitted) { if (!whittedAttenuate(thr, t)) return false; }
+                if (whitted) { if (!wAtt(t)) return false; }
                 else if (rng.uniform() >= t) return false;      // absorbed
                 ray = Ray{h.p + ray.d * 1e-6, ray.d};      // direction unchanged
                 specularArrival = true; return true;
@@ -2424,7 +2376,7 @@ struct BackwardRenderer {
                 // drop the BSDF half and bias low. Hence gm->pdf for the lattice direction too,
                 // exactly as the rng path sets it below.
                 if (whitted) {
-                    if (!whittedAttenuate(thr, r)) return false;
+                    if (!wAtt(r)) return false;
                     Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
                                               materialRoughness(scene, m, h), gi.sIdx, gi.bounce);
                     if (dot(o, h.n) <= 0) return false;
@@ -2584,7 +2536,7 @@ struct BackwardRenderer {
                 // both the analog-RR survival probability and the Whitted attenuation.
                 const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
                 const double T = clamp01(fv * cosLong / pdfH);
-                if (whitted) { if (!whittedAttenuate(thr, T)) return false; }
+                if (whitted) { if (!wAtt(T)) return false; }
                 else if (rng.uniform() >= T) return false;
                 const Vec3 wOut = hair::toWorld(hs.fr, wl);
                 // A coverage PASS-THROUGH returns EXACTLY -wo, i.e. a DELTA continuation. NEE
@@ -2629,7 +2581,7 @@ struct BackwardRenderer {
                         L += thr * giGather(scene, h,  rhoR, lambda, invPdfLambda, rng, spdCache, gi);
                         L += thr * giGather(scene, hb, rhoT, lambda, invPdfLambda, rng, spdCache, gi);
                     } else if (ambient > 0.0) {
-                        L += thr * (rhoR + rhoT) * ambient;
+                        L += thr * (rhoR + rhoT) * ambient * Renderer::localN2(scene, stk, lambda);
                     }
                 }
                 if (directOnly) return false;            // Whitted: no diffuse indirect
@@ -2656,8 +2608,8 @@ struct BackwardRenderer {
                 if (whitted) {             // indirect diffuse: real gather, or the flat stand-in
                     if (giUseGather(gi))
                         L += thr * giGather(scene, h, rho, lambda, invPdfLambda, rng, spdCache, gi);
-                    else if (ambient > 0.0)
-                        L += thr * rho * ambient;
+                    else if (ambient > 0.0)   // radiance in air: n^2 of it inside a dielectric
+                        L += thr * rho * ambient * Renderer::localN2(scene, stk, lambda);
                 }
                 if (directOnly) return false;   // Whitted: no diffuse indirect
                 // Russian roulette on the albedo (throughput unchanged on survival).
@@ -2921,7 +2873,7 @@ struct BackwardRenderer {
                 // sheen is the part you can least see at 1 spp anyway.
                 if (whitted) {
                     if (R >= 0.5) {
-                        if (!whittedAttenuate(thr, R)) return L;
+                        if (!whittedAttenuate(thr, R, Renderer::localN2(scene, stk, lambda))) return L;
                         Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
                                                   materialRoughness(scene, cm, h), gi.sIdx, b);
                         if (dot(o, h.n) <= 0) return L;
@@ -2930,7 +2882,7 @@ struct BackwardRenderer {
                         gmis.clear();      // the sheen does no NEE: its arrival is unweighted
                         continue;
                     }
-                    if (!whittedAttenuate(thr, 1.0 - R)) return L;
+                    if (!whittedAttenuate(thr, 1.0 - R, Renderer::localN2(scene, stk, lambda))) return L;
                     int child = mixDominantChild(cm);
                     if (child < 0) return L;
                     mp = &scene.mats[child];
@@ -3489,7 +3441,8 @@ struct BackwardRenderer {
                             giGatherHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
                         } else if (ambient > 0.0) {
                             for (int i = 0; i < nUp; ++i)
-                                L[i] += thr[i] * (rhoR[i] + rhoT[i]) * ambient;
+                                L[i] += thr[i] * (rhoR[i] + rhoT[i]) * ambient *
+                                        Renderer::localN2(scene, stk, lam[i]);
                         }
                     }
                     if (directOnly) { finish(); return; }        // Whitted: no diffuse indirect
@@ -3776,7 +3729,8 @@ struct BackwardRenderer {
                         if (giUseGather(gi))
                             giGatherHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
                         else if (ambient > 0.0)
-                            for (int i = 0; i < nUp; ++i) L[i] += thr[i] * rho[i] * ambient;
+                            for (int i = 0; i < nUp; ++i)    // radiance in air: n^2 inside
+                                L[i] += thr[i] * rho[i] * ambient * Renderer::localN2(scene, stk, lam[i]);
                     }
                     if (directOnly) { finish(); return; }         // Whitted: no diffuse indirect
                     // ---- -radcache: read the tail out of the cache and stop ---------------

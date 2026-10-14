@@ -203,9 +203,15 @@ camera walk, host and device -- and the light-side walks ignore it. `tools/check
 holds R and D to mode B with a lamp inside a glass block; M, S, U and D to R in a water tank lit
 from above (R is right there with or without the factor -- D moves too little there to test, its
 connections inside the water sharing their paths with s = 0 ones that need no factor); D and U to
-R with the lamp under the water; and the device to the host. On 0.378.0 it fails R/B x2.20, M/R x1.78, S/R x1.80, U/R x1.64;
-the D and U device / host pairs and the submerged-lamp pairs fail on a scratch build with only that
-part of the fix removed (figures in the 0.378.1 commit). Measured on the tank, four seeds: M/R x1.013
+R with the lamp under the water; and the device to the host. On 0.378.0 it fails R/B x2.20, M/R
+x1.78, S/R x1.80, U/R x1.54; the D and U device / host pairs and the submerged-lamp pairs fail on a
+scratch build with only that part of the fix removed (figures in the 0.378.1 commit). 0.378.3, after
+the reviews of 0.378.1, routed every host walk through two shared interface steps
+(`Renderer::dielectricStep` / `coatStep`, which take the transport as a required argument), gave
+the thin-film and multilayer interfaces the enclosing medium's index, folded the factor per photon
+wavelength into mode M's spectral gather, kept mode W's cutoff and ambient fill in air units, and
+extended the check to thin-film and multilayer blocks, mode W, `-rgb`, mode M's final gather, the
+device's mode S and nested (`priority`) dielectrics. Measured on the tank, four seeds: M/R x1.013
 +- 0.013 on the ball (it read x1.77), S x1.015, the device's M x1.014; with a lid over the ball, so
 that it is lit only through the water, D x0.984 +- 0.014, U x0.993, M x1.011 at 1024 spp. The rest
 of this entry is the report as it was filed.
@@ -273,10 +279,27 @@ emitted flux is 60.41 on the host and 60.46 on the device. So the device's camer
 or its walk to the floor -- differs there. Not RADIANCE-ETA2 either: 0.378.0 read the same x1.43.
 That floor strip is lit partly straight from the lamp and partly through the tank's front face, so
 a caustic, or a shadow-ray / gather difference at the water's edge, is the place to start.
-Reproduce: `python scraps/face/tank_stats.py <exe> <tag>` (scratch, git-ignored) with the pool
-floor quad dropped from the check's TANK -- the measurement predates it, and with it in place the
-floor strip lies in a dark corner of the frame. The check compares the device with the host over
-the ball only, until this is fixed.
+Reproduce: write the check's TANK without its pool-floor quad (`quad { origin -0.69 0.05 -0.69
+...}` -- the measurement predates it, and with it in place the strip lies in a dark corner of the
+frame) to tank.ftsl, then for seeds 1-4 and devices cpu and gpu run
+`ftrace -in tank.ftsl -mode M -spp 64 -n 50000000 -device <dev> -seed <s> -hdr -no-meter -o
+M_<dev>_s<s>.png` and compare the PFMs' bottom row of 8 x 8-pixel tiles (the host is right: it
+agrees with mode R, `-mode R -spp 2048`). The check compares the device with the host over the
+ball only, until this is fixed.
+
+## OPEN (2026-10-13, scope): GRIN-RADIANCE-SCALE — a camera path ending inside a GRIN region misses the n^2 radiance scale
+
+RADIANCE-ETA2's factor is applied at discrete interfaces only. In a GRIN medium (an `ior` field)
+the index changes continuously along the camera's march, and radiance over n^2 is conserved along
+it just the same, so a camera path that ends inside a GRIN region where n differs from where it
+entered owes (n_entry / n(x))^2 -- and neither the backward march (backward.h, `grin::marchSegments`)
+nor mode M's gather march (photonmap_render.h) applies it. Today it touches nothing: no scene puts
+geometry, a camera or a light inside a GRIN region (and mode R refuses a fire with GRIN; D, J and U
+refuse GRIN). Where it would show: a diffuse object inside the GRIN sphere of `_grin_lin.ftsl`,
+seen from air in mode M, read about n(x)^2 too bright against mode B. Fix: the march multiplies its
+throughput by (n(start) / n(end))^2 per march; but mode R's light sampling from a vertex inside GRIN
+uses straight shadow rays through the field, an approximation that would then also need the
+local n^2 on its light, so the two have to change together, with a check against mode B.
 
 ## OPEN (2026-10-13, to investigate): STUBBLE-DEVICE-UNDERSIDE — mode W on a stubble coat, device vs host, 9.6 % apart in its dark underside
 

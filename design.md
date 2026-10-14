@@ -2311,11 +2311,22 @@ tracer (`interactPhotonSpecular`, the device's `interactSpecular`), BDPT's and V
 `interactMaterial` and `bkInteract` (and the `-rgb` walk), BDPT's eye walk (`randomWalk` in
 Mode::Radiance, `dRandomWalk` with `importance` false), mode M's two gather walks, mode S's visible
 point, mode U's camera walk -- multiplies its throughput by (n_from / n_to)^2 at every refraction
-(pbrt's TransportMode::Radiance factor on the BTDF). `Renderer::refractOrReflect`,
-`thinFilmInterface` and `multilayerInterface`, and their device twins (with `dDielectricStep`),
-report that factor through a `radianceScale` out-parameter, 1 on a reflection or a suppressed
-nested-dielectric boundary; the camera-side callers apply it, the light-side ones ignore it, and
-the MIS densities do not see it (it is throughput).
+(pbrt's TransportMode::Radiance factor on the BTDF). The MIS densities do not see it (it is
+throughput).
+
+Every host walk crosses an interface through one of two shared steps (0.378.3), which take the
+transport as a required argument (`Renderer::Transport`), so no walk can leave the factor out by
+omission: `Renderer::dielectricStep` -- the nested-dielectric priority rule (the far side's index
+from the enclosing medium, `exteriorIor`; a boundary of no higher priority than the medium it lies
+in suppressed; the stack kept), then `refractOrReflect` -- and `Renderer::coatStep` for thin film
+and multilayer, whose far side is the top of the stack (a coated body is not on it) by the same
+rule. Both return an `InterfaceStep`: the continuation ray, the throughput factor, mode W's branch
+weight, and what mode M's spectral gather needs to fold the factor per photon wavelength
+(`stepScaleAt`; a dispersive index makes it spectral). The device's twins are `dDielectricStep` and
+`dCoatStep`, whose `radianceScale` argument -- non-null on a camera-side walk -- every caller states.
+Mode W's two air-unit quantities, its 1/512 throughput cutoff and its flat `-ambient` fill, are
+taken in the units of the medium the path is in (`localN2`: the stack top's n^2), so a path inside
+glass is cut, and filled, as its air-equivalent would be.
 
 It cancels for the usual glass object, crossed in and out, which is why its absence went unseen
 until 0.378.1: it matters only when a camera path ends inside a dielectric and meets something the
@@ -2326,7 +2337,10 @@ tank, and mode R x2.25 (glass's) on the floor lit by a lamp inside a glass block
 photon modes M, S and U to R in the tank lit from above (R's paths there cross in and out, so it is
 right either way), and D and U to R with the lamp under the water, where every strategy of theirs
 crosses in once. In the tank lit from above BDPT moves too little to test: its connections inside
-the water share their paths with s = 0 ones that cross out to the lamp and need no factor.
+the water share their paths with s = 0 ones that cross out to the lamp and need no factor. It also
+covers the coats (a lamp in a thin-film block and in a multilayer one, R against B), mode W (a lamp
+seen through glass, against R), mode M's final gather, nested ranked dielectrics (M and S in water
+holding a glass ball), and on the device `-rgb`, mode S and every one of those.
 
 ## Module map (src/)
 
@@ -3859,7 +3873,8 @@ as the one at fault.
   Russian roulette on Mirror / Filter /
   Grating / specular-bundle survival becomes `whittedAttenuate` (multiply the
   throughput by the weight, stop under `kWhittedCutoff` = 1/512 — POV-Ray's
-  `adc_bailout`); HalfMirror / Layered take the dominant branch weighted (Layered per-λ, see
+  `adc_bailout`, compared in air units: inside a dielectric the throughput, which carries
+  radiance, times the medium's n^2, see "Radiance across a refraction"); HalfMirror / Layered take the dominant branch weighted (Layered per-λ, see
   above, so the bundle survives a clearcoat), and a Mix
   hard-thresholds via `mixResolveDominant` (`scene.h`); **Dielectric** likewise takes the
   dominant Fresnel branch (reflect iff R ≥ 0.5) with that branch's weight folded into the
@@ -4504,7 +4519,10 @@ as the one at fault.
   `.ftbuf` sidecar as a trailing section after the film blobs (`writeRadCacheSection` /
   `readRadCacheSection`, `main.cpp`), which needs no magic bump because both film readers
   consume a fixed number of fixed-size records and never demand the stream end there — the
-  format is extended, not reinterpreted. Three details carry the design. **Sparse**, because
+  format is extended, not reinterpreted. (The same reasoning puts the writing build's version at
+  the very end, 0.378.3: `<version><u32 length>FTVERSN1`, read by seeking from the end
+  (`sidecarVersion`), so resume can warn when it continues a render another build started —
+  `checkpointGuard` knows nothing of estimators.) Three details carry the design. **Sparse**, because
   the default table is 262 144 cells (~82 MB) and would otherwise be rewritten every
   `-interval`; occupancy is a tiny fraction of that (36 cells on a Cornell box, 8.7 k on
   `fur_creature`) since cells tile the visible *surface*. **Its own guard**

@@ -185,53 +185,13 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 break;
             }
             case MatType::Dielectric: {
-                // Nested-dielectric PRIORITY resolution (Schmidt & Budge 2002): exterior
-                // IOR = the medium the photon is currently inside (highest-priority stack
-                // entry). Overlapping dielectrics ranked by `priority` (higher wins; lower
-                // suppressed -> straight pass-through). SAFE FALLBACK to flat air<->glass
-                // unless BOTH sides carry an explicit priority (priority-free scenes stay
-                // bit-identical).
-                bool entering = dot(ray.d, h.ng) < 0.0;
-                const int mi = (int)(&m - scene.mats.data());   // true index (Mix/Layered aware)
-                const int pr = m.priority;
-                if (entering) {
-                    const int outMat = stk.topMat();
-                    const int outPri = stk.topPri();
-                    const bool ranked = m.hasPriority() &&
-                        (stk.empty() || (outMat >= 0 && scene.mats[outMat].hasPriority()));
-                    if (ranked && !stk.empty() && pr <= outPri) {   // suppressed inner surface
-                        stk.push(mi, pr);
-                        ray = Ray{h.p + ray.d * 1e-6, ray.d};
-                    } else {
-                        const double extIor = (ranked && outMat >= 0)
-                            ? scene.mats[outMat].ior(lambda) : 1.0;
-                        bool transmitted = false;
-                        double rs = 1.0;                  // radiance across the interface
-                        ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor,
-                                                    nullptr, &rs);
-                        thr *= rs;
-                        if (transmitted) stk.push(mi, pr);
-                    }
-                } else {
-                    MediumStack after = stk; after.popMat(mi);
-                    const int newMat = after.topMat();
-                    const int newPri = after.topPri();
-                    const bool ranked = m.hasPriority() &&
-                        (after.empty() || (newMat >= 0 && scene.mats[newMat].hasPriority()));
-                    if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed: still enclosed
-                        stk.popMat(mi);
-                        ray = Ray{h.p + ray.d * 1e-6, ray.d};
-                    } else {
-                        const double extIor = (ranked && newMat >= 0)
-                            ? scene.mats[newMat].ior(lambda) : 1.0;
-                        bool transmitted = false;
-                        double rs = 1.0;                  // radiance across the interface
-                        ray = mats.refractOrReflect(scene, m, h, ray.d, lambda, rng, &transmitted, extIor,
-                                                    nullptr, &rs);
-                        thr *= rs;
-                        if (transmitted) stk.popMat(mi);            // TIR stays inside mi
-                    }
-                }
+                // Nested dielectrics by priority (Renderer::dielectricStep); this camera-side
+                // walk carries radiance across a refraction.
+                const Renderer::InterfaceStep st =
+                    mats.dielectricStep(scene, m, (int)(&m - scene.mats.data()), h, ray.d, lambda,
+                                        rng, stk, Renderer::Transport::Radiance);
+                ray = st.ray;
+                thr *= st.scale;
                 break;
             }
             case MatType::HalfMirror: {

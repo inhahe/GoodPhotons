@@ -335,18 +335,18 @@ inline void misScatter(bool specular, double cosThetaOut, double bsdfDirPdfW, do
 // reflectance/transmittance are GONE: with a bundle the hero can be dark while a secondary
 // is not, so killing the walk on the hero alone biases low. The caller applies the
 // max-over-live-λ test instead, which for nUp == 1 is exactly the old scalar test.
+//
+// `transport`: Radiance for the camera walk, Flux for the light walk -- a refraction scales
+// the first's betaFactor by (n_from / n_to)^2 and not the second's (Renderer::Transport).
 inline void scatterSample(const Scene& scene, const Renderer& mats, const Material* mp,
                           const Hit& h, const Vec3& rayDir, double lambda, Pcg32& rng,
                           Vec3& wi, double& betaFactor, double& pdfW, double& pdfRevW,
                           double& cosThetaOut, bool& delta, bool& terminate,
-                          MediumStack& stk,
+                          MediumStack& stk, Renderer::Transport transport,
                           const double* lamAll = nullptr, int nUp = 1,
                           double* secF = nullptr, bool* secChromatic = nullptr,
-                          bool* keepBundle = nullptr, double* radianceScale = nullptr) {
+                          bool* keepBundle = nullptr) {
     const Vec3 ns = h.n;
-    // (n_from / n_to)^2 at a refraction, 1 otherwise (Renderer::refractOrReflect): the camera
-    // walk, which carries radiance, multiplies its throughput by it; the light walk does not.
-    if (radianceScale) *radianceScale = 1.0;
     const Vec3 wo = normalize(rayDir * -1.0);
     wi = Vec3{0, 0, 0}; betaFactor = 0.0; pdfW = 0.0; pdfRevW = 0.0; cosThetaOut = 0.0;
     delta = false; terminate = false;
@@ -470,49 +470,12 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             break;
         }
         case MatType::Dielectric: {
-            // Nested-dielectric PRIORITY resolution: exterior IOR = the medium the path is
-            // currently inside (highest-priority stack entry). Overlapping dielectrics are
-            // ranked by `priority` (higher wins; lower is suppressed -> straight pass-
-            // through). SAFE FALLBACK to flat air<->glass (extIor 1.0) unless BOTH sides
-            // carry an explicit priority, keeping priority-free scenes bit-identical.
-            bool entering = dot(rayDir, h.ng) < 0.0;
-            const int mi = (int)(mp - scene.mats.data());   // true index (Mix/Layered aware)
-            const int pr = mp->priority;
-            delta = true; betaFactor = 1.0;
-            if (entering) {
-                const int outMat = stk.topMat();
-                const int outPri = stk.topPri();
-                const bool ranked = mp->hasPriority() &&
-                    (stk.empty() || (outMat >= 0 && scene.mats[outMat].hasPriority()));
-                if (ranked && !stk.empty() && pr <= outPri) {   // suppressed inner surface
-                    wi = rayDir; stk.push(mi, pr);
-                } else {
-                    const double extIor = (ranked && outMat >= 0)
-                        ? scene.mats[outMat].ior(lambda) : 1.0;
-                    bool transmitted = false;
-                    Ray nr = mats.refractOrReflect(scene, *mp, h, rayDir, lambda, rng, &transmitted, extIor,
-                                                   nullptr, radianceScale);
-                    wi = nr.d;
-                    if (transmitted) stk.push(mi, pr);
-                }
-            } else {
-                MediumStack after = stk; after.popMat(mi);
-                const int newMat = after.topMat();
-                const int newPri = after.topPri();
-                const bool ranked = mp->hasPriority() &&
-                    (after.empty() || (newMat >= 0 && scene.mats[newMat].hasPriority()));
-                if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed: still enclosed
-                    wi = rayDir; stk.popMat(mi);
-                } else {
-                    const double extIor = (ranked && newMat >= 0)
-                        ? scene.mats[newMat].ior(lambda) : 1.0;
-                    bool transmitted = false;
-                    Ray nr = mats.refractOrReflect(scene, *mp, h, rayDir, lambda, rng, &transmitted, extIor,
-                                                   nullptr, radianceScale);
-                    wi = nr.d;
-                    if (transmitted) stk.popMat(mi);            // TIR stays inside mi
-                }
-            }
+            // Nested dielectrics by priority (Renderer::dielectricStep); `transport` says
+            // whether the walk carries radiance (the camera's) or flux (the light's).
+            const Renderer::InterfaceStep st =
+                mats.dielectricStep(scene, *mp, (int)(mp - scene.mats.data()), h, rayDir, lambda,
+                                    rng, stk, transport);
+            wi = st.ray.d; betaFactor = st.scale; delta = true;
             break;
         }
         case MatType::HalfMirror: {
@@ -537,16 +500,12 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             }
             break;
         }
-        case MatType::ThinFilm: {
-            Ray nr;
-            if (!mats.thinFilmInterface(scene, *mp, h, rayDir, lambda, rng, nr, nullptr, radianceScale)) { terminate = true; break; }
-            wi = nr.d; betaFactor = 1.0; delta = true;
-            break;
-        }
+        case MatType::ThinFilm:
         case MatType::Multilayer: {
-            Ray nr;
-            if (!mats.multilayerInterface(*mp, h, rayDir, lambda, rng, nr, nullptr, radianceScale)) { terminate = true; break; }
-            wi = nr.d; betaFactor = 1.0; delta = true;
+            const Renderer::InterfaceStep st =
+                mats.coatStep(scene, *mp, h, rayDir, lambda, rng, stk, transport);
+            if (st.absorbed) { terminate = true; break; }
+            wi = st.ray.d; betaFactor = st.scale; delta = true;
             break;
         }
         case MatType::Grating: {
@@ -830,7 +789,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         Vec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
         double secF[hero::kHeroMax - 1]; bool secChromatic = false, keepBundle = false;
         scatterSample(scene, mats, mp, h, rd, lambda, rng, wi, betaFactor, pdfW, pdfRevW,
-                      cosThetaOut, delta, terminate, stk,
+                      cosThetaOut, delta, terminate, stk, Renderer::Transport::Flux,
                       hb.lam, nUp, secF, &secChromatic, &keepBundle);
         // Kill the walk only when EVERY live wavelength is dead (hero.h policy 3). With
         // nUp == 1 the loop is empty and mxF == betaFactor: the old scalar test exactly.
@@ -1295,11 +1254,9 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         // Sample a continuation direction.
         Vec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
         double secF[hero::kHeroMax - 1]; bool secChromatic = false, keepBundle = false;
-        double radianceScale = 1.0;
         scatterSample(scene, mats, mp, h, rd, lambda, rng, wi, betaFactor, pdfW, pdfRevW,
-                      cosThetaOut, delta, terminate, stk,
-                      hb.lam, nUp, secF, &secChromatic, &keepBundle, &radianceScale);
-        betaFactor *= radianceScale;  // the camera walk carries radiance across a refraction
+                      cosThetaOut, delta, terminate, stk, Renderer::Transport::Radiance,
+                      hb.lam, nUp, secF, &secChromatic, &keepBundle);
         double mxF = betaFactor;      // max over live λ, never the hero alone (policy 3)
         if (secChromatic) for (int i = 0; i + 1 < nUp; ++i) if (secF[i] > mxF) mxF = secF[i];
         if (terminate || mxF <= 0.0) return result;

@@ -15214,6 +15214,51 @@ static uint64_t checkpointGuard(const Scene& scene, char mode, int res, int resY
 
 static std::string checkpointPath(const std::string& outPath) { return outPath + ".ftbuf"; }
 
+// The build that wrote a sidecar, as a trailer at its very end -- "<version><u32 length>FTVERSN1"
+// -- where the sequential readers, older builds' included, never look (they read fixed records and
+// an optional tagged section, then stop). Resume uses it to say when it is continuing a render
+// another ftrace started: the two builds' samples are averaged, and if a fix between them changed
+// how this render is estimated, the image converges to neither (a mode-M render of a scene with
+// water, started before 0.378.1 and resumed after, would). Warned rather than refused: most
+// version bumps do not touch a given render's transport, and the user can delete the .ftbuf.
+static constexpr char kVersionTag[8] = {'F','T','V','E','R','S','N','1'};
+static void writeVersionTrailer(std::ostream& o) {
+    const char* v = ftraceVersion();
+    const uint32_t n = (uint32_t)std::strlen(v);
+    o.write(v, n);
+    o.write((const char*)&n, 4);
+    o.write(kVersionTag, 8);
+}
+// The version in a sidecar's trailer, or "" when it has none (written before 0.378.3).
+static std::string sidecarVersion(const std::string& path) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) return "";
+    const std::streamoff size = in.tellg();
+    if (size < 12) return "";
+    char tag[8];
+    in.seekg(size - 8);
+    in.read(tag, 8);
+    if (!in || std::memcmp(tag, kVersionTag, 8) != 0) return "";
+    uint32_t n = 0;
+    in.seekg(size - 12);
+    in.read((char*)&n, 4);
+    if (!in || n == 0 || n > 64 || (std::streamoff)n + 12 > size) return "";
+    std::string v(n, '\0');
+    in.seekg(size - 12 - (std::streamoff)n);
+    in.read(&v[0], n);
+    return in ? v : std::string();
+}
+static void warnIfOtherBuild(const std::string& path) {
+    const std::string v = sidecarVersion(path);
+    if (v == ftraceVersion()) return;
+    const std::string who = v.empty() ? std::string("an ftrace older than 0.378.3")
+                                      : "ftrace " + v;
+    std::fprintf(stderr, "[resume] WARNING: %s was written by %s; this is ftrace %s. The two "
+                         "builds' samples are averaged -- if a fix between them changed how this "
+                         "render is estimated, the image converges to neither. Delete the .ftbuf "
+                         "to start fresh.\n", path.c_str(), who.c_str(), ftraceVersion());
+}
+
 // ---- the radiance-cache section of a .ftbuf sidecar ---------------------------------------
 //
 // Appended AFTER the film blobs, under its own tag and its own guard. Appending works because
@@ -15327,6 +15372,7 @@ static bool writeCheckpoint(const std::string& outPath, const Checkpoint& c,
         o.write((const char*)c.film.xyz.data(), c.film.xyz.size() * sizeof(Vec3));
         o.write((const char*)c.film.hits.data(), c.film.hits.size() * sizeof(double));
         if (!writeRadCacheSection(o)) return false;
+        writeVersionTrailer(o);
         return (bool)o;
     });
 }
@@ -15366,6 +15412,7 @@ static bool readCheckpoint(const std::string& outPath, int res, int resY, uint64
     if (!in) { std::fprintf(stderr, "[resume] checkpoint %s truncated; starting fresh\n",
                             checkpointPath(outPath).c_str()); return false; }
     readRadCacheSection(in);          // optional trailing section; absent in older sidecars
+    warnIfOtherBuild(checkpointPath(outPath));
     return true;
 }
 
@@ -15400,6 +15447,7 @@ static bool writeCompositeCheckpoint(const std::string& outPath, const Composite
         o.write((const char*)c.ref.xyz.data(), c.ref.xyz.size() * sizeof(Vec3));
         o.write((const char*)c.ref.hits.data(), c.ref.hits.size() * sizeof(double));
         if (!writeRadCacheSection(o)) return false;   // mode P's backward layer reads the cache too
+        writeVersionTrailer(o);
         return (bool)o;
     });
 }
@@ -15438,6 +15486,7 @@ static bool readCompositeCheckpoint(const std::string& outPath, int res, int res
     if (!in) { std::fprintf(stderr, "[resume] composite checkpoint %s truncated; starting fresh\n",
                             checkpointPath(outPath).c_str()); return false; }
     readRadCacheSection(in);          // optional trailing section; absent in older sidecars
+    warnIfOtherBuild(checkpointPath(outPath));
     return true;
 }
 

@@ -727,6 +727,9 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
     (void)cam;   // cam reserved for future NEE-to-camera use; mode now drives adjoint corr
     const double lambda = hb.lam[0];   // the hero drives geometry, sampling and every pdf
     if (maxDepth == 0) return;
+    // What the walk carries across an interface: the eye walk radiance, the light walk flux.
+    const Renderer::Transport transport = (mode == Mode::Radiance)
+        ? Renderer::Transport::Radiance : Renderer::Transport::Flux;
 
     // ---- THE SPECTRAL CLAIM (see PathSeg::achro / BeamSpectral / render.h's foldWorthIt) --
     //
@@ -1281,54 +1284,12 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 break;
             }
             case MatType::Dielectric: {
-                // Nested-dielectric PRIORITY resolution: exterior IOR = the medium the
-                // subpath is currently inside (highest-priority stack entry). Overlapping
-                // dielectrics are ranked by `priority` (higher wins; lower is suppressed
-                // -> straight pass-through). SAFE FALLBACK to flat air<->glass (extIor 1.0)
-                // unless BOTH sides carry an explicit priority, keeping priority-free
-                // scenes bit-identical.
-                bool entering = dot(ray.d, h.ng) < 0.0;
-                const int mi = (int)(mp - scene.mats.data());   // true index (Mix/Layered aware)
-                const int pr = mp->priority;
-                delta = true; betaFactor = 1.0;
-                if (entering) {
-                    const int outMat = stk.topMat();
-                    const int outPri = stk.topPri();
-                    const bool ranked = mp->hasPriority() &&
-                        (stk.empty() || (outMat >= 0 && scene.mats[outMat].hasPriority()));
-                    if (ranked && !stk.empty() && pr <= outPri) {   // suppressed inner surface
-                        wi = ray.d; stk.push(mi, pr);
-                    } else {
-                        const double extIor = (ranked && outMat >= 0)
-                            ? scene.mats[outMat].ior(lambda) : 1.0;
-                        bool transmitted = false;
-                        double rs = 1.0;
-                        Ray nr = mats.refractOrReflect(scene, *mp, h, ray.d, lambda, rng, &transmitted,
-                                                       extIor, nullptr, &rs);
-                        wi = nr.d;
-                        if (mode == Mode::Radiance) betaFactor = rs;   // radiance, not flux
-                        if (transmitted) stk.push(mi, pr);
-                    }
-                } else {
-                    MediumStack after = stk; after.popMat(mi);
-                    const int newMat = after.topMat();
-                    const int newPri = after.topPri();
-                    const bool ranked = mp->hasPriority() &&
-                        (after.empty() || (newMat >= 0 && scene.mats[newMat].hasPriority()));
-                    if (ranked && newMat >= 0 && pr <= newPri) {    // suppressed: still enclosed
-                        wi = ray.d; stk.popMat(mi);
-                    } else {
-                        const double extIor = (ranked && newMat >= 0)
-                            ? scene.mats[newMat].ior(lambda) : 1.0;
-                        bool transmitted = false;
-                        double rs = 1.0;
-                        Ray nr = mats.refractOrReflect(scene, *mp, h, ray.d, lambda, rng, &transmitted,
-                                                       extIor, nullptr, &rs);
-                        wi = nr.d;
-                        if (mode == Mode::Radiance) betaFactor = rs;   // radiance, not flux
-                        if (transmitted) stk.popMat(mi);            // TIR stays inside mi
-                    }
-                }
+                // Nested dielectrics by priority (Renderer::dielectricStep). The eye walk carries
+                // radiance across a refraction, the light walk flux (`transport`).
+                const Renderer::InterfaceStep st =
+                    mats.dielectricStep(scene, *mp, (int)(mp - scene.mats.data()), h, ray.d,
+                                        lambda, rng, stk, transport);
+                wi = st.ray.d; betaFactor = st.scale; delta = true;
                 break;
             }
             case MatType::HalfMirror: {
@@ -1352,16 +1313,12 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                     secF[i] = clamp01(transmitSlot(scene, *mp, h, hb.lam[i + 1]));
                 break;
             }
-            case MatType::ThinFilm: {
-                Ray nr; double rs = 1.0;
-                if (!mats.thinFilmInterface(scene, *mp, h, ray.d, lambda, rng, nr, nullptr, &rs)) { terminate = true; break; }
-                wi = nr.d; betaFactor = (mode == Mode::Radiance) ? rs : 1.0; delta = true;
-                break;
-            }
+            case MatType::ThinFilm:
             case MatType::Multilayer: {
-                Ray nr; double rs = 1.0;
-                if (!mats.multilayerInterface(*mp, h, ray.d, lambda, rng, nr, nullptr, &rs)) { terminate = true; break; }
-                wi = nr.d; betaFactor = (mode == Mode::Radiance) ? rs : 1.0; delta = true;
+                const Renderer::InterfaceStep st =
+                    mats.coatStep(scene, *mp, h, ray.d, lambda, rng, stk, transport);
+                if (st.absorbed) { terminate = true; break; }
+                wi = st.ray.d; betaFactor = st.scale; delta = true;
                 break;
             }
             case MatType::Grating: {
