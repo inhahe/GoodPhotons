@@ -184,9 +184,9 @@ argument for standing a groom in a hall of polished objects.*
   and lights the rest of the scene with **no external light**. Multi-grid `.vdb`
   files (the official OpenVDB *fire* sample's `density` + `temperature` grids) are
   selected **by grid name**; `emission_kelvin`/`emission_scale` tune the colour
-  temperature and glow. Runs on both the **CPU and GPU** forward tracers (modes
-  A/B/C, V/P forward layers); the per-photon wavelength is importance-sampled from a
-  Planck blackbody so the flame colour converges cleanly.
+  temperature and glow. Rendered by the forward modes A/B/C and the backward reference
+  R on the **CPU and GPU**, and by BDPT (mode D) on the CPU; the wavelengths are
+  importance-sampled from a Planck blackbody so the flame colour converges cleanly.
 - **Gradient-index (GRIN) media** — a bounded region carrying an `ior "n(x,y,z)"`
   field bends rays continuously along the Eikonal ray equation (mirages, gradient
   lenses, hot-air shimmer) via a shared symplectic marcher. Works on the forward

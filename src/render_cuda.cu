@@ -1129,6 +1129,22 @@ struct DEmissiveVolume {
     const double* lamCdf;   // lamN+1 normalised CDF over [LAMBDA_MIN,LAMBDA_MAX]
     int           lamN;     // number of bins
     double        lamStep;  // bin width in nm
+    // Mode R's light sampling of the fire (host twin: Scene::EmissiveVolume; dFireNee): its share
+    // of the fires' power, the coarse grid of emitted power over [bmin, bmax] that a point is
+    // drawn in proportion to (cells of equal volume, x fastest; cellCdf the normalised running
+    // sum of cellW), and the temperature grid's shortest voxel edge, which sets how many points
+    // a segment's emission integral takes.
+    double        share;
+    double        voxel;
+    int           gres[3];
+    const double* cellW;
+    const double* cellCdf;
+    int           nCells;
+    double        cellSum;
+    // Its term in the camera's illuminant (host twin Scene::fireG): gW * Planck(kelvin, lambda),
+    // gW the fire's power over its Planck curve's integral.
+    double        kelvin;
+    double        gW;
 };
 
 // ---- GATHER-TIME SPECTRAL FOLD on the device (FOLD-GPU (2)) ---------------------------------
@@ -1257,6 +1273,8 @@ struct DScene {
     const int*       lightTreeLeaf;  int nLightTreeLeaf;
     int              bkLightTree;    // 0 = -no-lighttree: exact all-emitters splitting
     int              bkGlossyNee;    // 0 = -no-glossy-nee: no connection at a D_GLOSSY vertex
+    int              bkFireNee;      // 0 = FTRACE_FIRE_NEE=0: no fire light sampling, every
+                                     // segment takes its whole emission (paired A/B checks)
     int              specNee;        // FTRACE_SPECNEE=0: the pre-0.342.0 single-wavelength NEE term
     int              gatherArea;     // -gatherarea <M>: probe samples for the M-GATHERAREA
                                      // footprint (0 = off, the default)
@@ -1295,10 +1313,12 @@ struct DScene {
     // BDPT samples one shared lambda per sample from this and sets invPdfLambda=1/pdf.
     const double*    emitSamplerCdf; int emitSamplerN; double emitSamplerStep;
     double           emitG;
-    // The camera's draws (mirror Scene::camDraw): the same g(lambda) times a visible-band window,
-    // camVisCdf for mode R and camWCdf for mode W, on emitSampler's bins (emitSamplerN + 1
-    // entries each). A device mode-R scene has no fire, so its g is emitSampler's.
-    const double*    camVisCdf; const double* camWCdf;
+    // The camera's illuminant (mirror Scene::camSampler / camG): emitSampler's g(lambda) plus the
+    // fires' (dFireG), so a fire is reached at every wavelength it emits, and its integral. Its
+    // draws (Scene::camDraw): the same times a visible-band window, camVisCdf for mode R and
+    // camWCdf for mode W. All three CDFs are on emitSampler's bins (emitSamplerN + 1 entries).
+    const double*    camCdf; const double* camVisCdf; const double* camWCdf;
+    double           camG;
     const DMedium*   media;    // participating media array (superposed); null if none
     DBowTab bow;   // gather-time spectral fold tables (FOLD-GPU (2)); bow.tab null = none
     int              mediaN;   // number of media (0 => vacuum)
@@ -10583,15 +10603,16 @@ __device__ static Real dSampleSceneLambdaU(const DScene& sc, double u, double& p
     return dSampleCdfLambdaU(sc.emitSamplerCdf, sc.emitSamplerN, sc.emitSamplerStep, u, pdf, bin);
 }
 // The camera's draw (Scene::camDraw: camVisCdf for mode R, camWCdf for mode W). `filmW` is the
-// film's weight for it (Scene::camFilmWeight): the illuminant's binned density over the drawn
-// one, on the bin the draw landed in -- the CDFs share a step and range -- so the expectation is
-// exactly a draw from the illuminant's, and the weight exactly 1 where the two coincide.
+// film's weight for it (Scene::camFilmWeight): the camera illuminant's binned density (camCdf)
+// over the drawn one, on the bin the draw landed in -- the CDFs share a step and range -- so the
+// expectation is exactly a draw from the illuminant's, and the weight exactly 1 where the two
+// coincide.
 __device__ static Real dSampleCamLambdaU(const DScene& sc, double u, double& pdf, double& filmW) {
     int b;
     const double* cdf = sc.bkWhitted ? sc.camWCdf : sc.camVisCdf;
     const Real lam = dSampleCdfLambdaU(cdf, sc.emitSamplerN, sc.emitSamplerStep, u, pdf, b);
     const double mv = cdf[b + 1] - cdf[b];
-    filmW = (mv > 0.0) ? (sc.emitSamplerCdf[b + 1] - sc.emitSamplerCdf[b]) / mv : 0.0;
+    filmW = (mv > 0.0) ? (sc.camCdf[b + 1] - sc.camCdf[b]) / mv : 0.0;
     return lam;
 }
 __device__ static Real dSampleSceneLambda(const DScene& sc, DRng& rng, double& pdf) {
@@ -10613,9 +10634,9 @@ __device__ static Real dSampleFluoInU(const DScene& sc, const DMaterial& m,
     pdf = (c1 - c0) / m.fluoInCdfStep;
     return (Real)(DLMIN + (lo + frac) * m.fluoInCdfStep);
 }
-// invPdfLambda(lambda) = emitG / g(lambda), g(lambda) = sum_k geomWeight_k*SPD_k.
-// In BDPT scope every emitter is an area/sphere light, so geomWeight = area*PI.
-__device__ static double dInvPdfLambda(const DScene& sc, Real lambda) {
+// The emitters' g(lambda) = sum_k geomWeight_k * SPD_k (host twin Scene::emitterG), the density
+// emitSampler tabulates.
+__device__ static double dEmitterG(const DScene& sc, Real lambda) {
     double g = 0.0;
     for (int k = 0; k < sc.nEmitters; ++k) {
         const DEmitter& e = sc.emitters[k];
@@ -10629,7 +10650,29 @@ __device__ static double dInvPdfLambda(const DScene& sc, Real lambda) {
                                    : ((double)e.area * DPI);
         g += gw * (double)specLookup(e.emitSpd, lambda);
     }
+    return g;
+}
+// invPdfLambda(lambda) = emitG / g(lambda): the weight of a wavelength drawn from emitSampler.
+__device__ static double dInvPdfLambda(const DScene& sc, Real lambda) {
+    const double g = dEmitterG(sc, lambda);
     return (g > 0.0) ? sc.emitG / g : 0.0;
+}
+// The fires' term of the camera's illuminant (host twin Scene::fireG): each fire's power spread
+// over its Planck curve at the medium's peak temperature.
+__device__ static double dFireG(const DScene& sc, Real lambda) {
+    double s = 0.0;
+    for (int v = 0; v < sc.emissiveVolN; ++v) {
+        const DEmissiveVolume& f = sc.emissiveVolumes[v];
+        if (f.gW > 0.0) s += f.gW * dBlackbodyRadiance(f.kelvin, (double)lambda);
+    }
+    return s;
+}
+// The weight of a camera wavelength (host twin Scene::camInvPdfLambda): camG over the illuminant
+// with the fires. Without a fire it is dInvPdfLambda (camG is emitG).
+__device__ static double dCamInvPdfLambda(const DScene& sc, Real lambda) {
+    if (sc.emissiveVolN == 0) return dInvPdfLambda(sc, lambda);
+    const double g = dEmitterG(sc, lambda) + dFireG(sc, lambda);
+    return (g > 0.0) ? sc.camG / g : 0.0;
 }
 
 // ======================= backward reference (GPU mode R) =====================
@@ -10824,6 +10867,238 @@ struct DGlossyMis {
     DVec3  n;        // the glossy vertex's shading normal -- dLightSelPdf re-walks from there
     __device__ void clear() { pdf = 0.0; }
 };
+
+// ---- VOLUMETRIC EMISSION ("fire") in the backward walk (host twin: backward.h's fire block) ---
+// A fire emits j(x, lambda) per unit length, isotropically (dMedEmissionAt): the density the
+// forward tracer births fire photons at. Mode R reaches it as it reaches an area light -- light
+// sampling at every vertex that samples lights (dFireNee), and the emission every path segment
+// collects (dFireSegment), weighted there as an emitter hit is (dFireSegmentWeight). The reasoning
+// is the host's; these are its device copies, in double where the host is.
+
+// The ray o + t d, t in [t0, t1], clipped to the box [lo, hi]: false when the overlap is empty or a
+// point (host twin: clipRayBox).
+__device__ static bool dClipRayBox(const DVec3& lo, const DVec3& hi, const DVec3& o, const DVec3& d,
+                                   double t0, double t1, double& ta, double& tb) {
+    for (int a = 0; a < 3; ++a) {
+        const double oa = (double)(&o.x)[a], da = (double)(&d.x)[a];
+        const double mn = (double)(&lo.x)[a], mx = (double)(&hi.x)[a];
+        if (fabs(da) < 1e-12) { if (oa < mn || oa > mx) return false; continue; }
+        const double inv = 1.0 / da;
+        double s0 = (mn - oa) * inv, s1 = (mx - oa) * inv;
+        if (s0 > s1) { const double t = s0; s0 = s1; s1 = t; }
+        t0 = fmax(t0, s0); t1 = fmin(t1, s1);
+        if (t0 > t1) return false;
+    }
+    ta = t0; tb = t1;
+    return tb > ta;
+}
+
+// The fire `u` picks in proportion to power (host twin: Scene::pickFire).
+__device__ static int dPickFire(const DScene& sc, double u) {
+    int f = 0;
+    double acc = 0.0;
+    for (; f < sc.emissiveVolN - 1; ++f) { acc += sc.emissiveVolumes[f].share; if (u < acc) break; }
+    return f;
+}
+
+// A point drawn in proportion to the cell powers (host twin: EmissiveVolume::cellPoint).
+__device__ static DVec3 dFireCellPoint(const DEmissiveVolume& v, double u0, double u1, double u2,
+                                       double u3) {
+    int lo = 0, hi = v.nCells - 1;                       // the first cell whose cdf >= u0
+    while (lo < hi) { const int m = (lo + hi) >> 1; if (v.cellCdf[m] < u0) lo = m + 1; else hi = m; }
+    const int i = lo % v.gres[0];
+    const int j = (lo / v.gres[0]) % v.gres[1];
+    const int k = lo / (v.gres[0] * v.gres[1]);
+    const double ex = (double)v.bmax.x - v.bmin.x, ey = (double)v.bmax.y - v.bmin.y,
+                 ez = (double)v.bmax.z - v.bmin.z;
+    return DVec3((Real)(v.bmin.x + ex * (i + u1) / v.gres[0]),
+                 (Real)(v.bmin.y + ey * (j + u2) / v.gres[1]),
+                 (Real)(v.bmin.z + ez * (k + u3) / v.gres[2]));
+}
+
+// The cone half of the light-sampling mixture: its solid-angle density for direction `d` from `x`,
+// and the sampler (host twins: fireConePdf, fireConeSample).
+__device__ static double dFireConePdf(const DEmissiveVolume& v, const DVec3& x, const DVec3& d) {
+    const double cx = 0.5 * ((double)v.bmin.x + v.bmax.x) - x.x, cy = 0.5 * ((double)v.bmin.y + v.bmax.y) - x.y,
+                 cz = 0.5 * ((double)v.bmin.z + v.bmax.z) - x.z;
+    const double ex = (double)v.bmax.x - v.bmin.x, ey = (double)v.bmax.y - v.bmin.y,
+                 ez = (double)v.bmax.z - v.bmin.z;
+    const double R2 = (ex * ex + ey * ey + ez * ez) * 0.25, d2 = cx * cx + cy * cy + cz * cz;
+    if (d2 <= R2) return 1.0 / (4.0 * DPI);
+    const double s2 = R2 / d2, cosMax = sqrt(1.0 - s2);
+    if (d.x * cx + d.y * cy + d.z * cz < cosMax * sqrt(d2)) return 0.0;
+    return 1.0 / (2.0 * DPI * (s2 / (1.0 + cosMax)));
+}
+__device__ static DVec3 dFireConeSample(const DEmissiveVolume& v, const DVec3& x, double u1,
+                                        double u2) {
+    const double cx = 0.5 * ((double)v.bmin.x + v.bmax.x) - x.x, cy = 0.5 * ((double)v.bmin.y + v.bmax.y) - x.y,
+                 cz = 0.5 * ((double)v.bmin.z + v.bmax.z) - x.z;
+    const double ex = (double)v.bmax.x - v.bmin.x, ey = (double)v.bmax.y - v.bmin.y,
+                 ez = (double)v.bmax.z - v.bmin.z;
+    const double R2 = (ex * ex + ey * ey + ez * ez) * 0.25, d2 = cx * cx + cy * cy + cz * cz;
+    const double phi = 2.0 * DPI * u2;
+    if (d2 <= R2) {                                      // inside: uniform over the sphere
+        const double z = 1.0 - 2.0 * u1, r = sqrt(fmax(0.0, 1.0 - z * z));
+        return DVec3((Real)(r * cos(phi)), (Real)(r * sin(phi)), (Real)z);
+    }
+    const double s2 = R2 / d2, oneMinusCos = s2 / (1.0 + sqrt(1.0 - s2));
+    const double om = u1 * oneMinusCos;                  // 1 - cos(theta), uniform
+    const double cosT = 1.0 - om, sinT = sqrt(fmax(0.0, om * (2.0 - om)));
+    const double il = 1.0 / sqrt(d2);
+    const DVec3 a((Real)(cx * il), (Real)(cy * il), (Real)(cz * il));
+    DVec3 t, b; onb(a, t, b);
+    return normalize(a * (Real)cosT + t * (Real)(sinT * cos(phi)) + b * (Real)(sinT * sin(phi)));
+}
+
+// The point half: the direction's solid-angle density, the line integral of the point density
+// times t^2 through the grid's cells (host twin: firePointPdf, Amanatides-Woo).
+__device__ static double dFirePointPdf(const DEmissiveVolume& v, const DVec3& x, const DVec3& d) {
+    double t0, t1;
+    if (v.nCells == 0 || !dClipRayBox(v.bmin, v.bmax, x, d, 0.0, 1e300, t0, t1)) return 0.0;
+    const double ext[3] = {(double)v.bmax.x - v.bmin.x, (double)v.bmax.y - v.bmin.y,
+                           (double)v.bmax.z - v.bmin.z};
+    const double lo3[3] = {(double)v.bmin.x, (double)v.bmin.y, (double)v.bmin.z};
+    const double xo[3] = {(double)x.x, (double)x.y, (double)x.z};
+    const double dd[3] = {(double)d.x, (double)d.y, (double)d.z};
+    const double cellVol = (ext[0] / v.gres[0]) * (ext[1] / v.gres[1]) * (ext[2] / v.gres[2]);
+    const double norm = 1.0 / (v.cellSum * cellVol);       // point density = cellW * norm
+    int c[3], step[3];
+    double tNext[3], tDelta[3];
+    for (int a = 0; a < 3; ++a) {
+        const double w = ext[a] / v.gres[a], da = dd[a];
+        const double pa = xo[a] + da * t0;                 // the entry point
+        int ci = (int)floor((pa - lo3[a]) / w);
+        c[a] = ci < 0 ? 0 : (ci > v.gres[a] - 1 ? v.gres[a] - 1 : ci);
+        if (da > 0.0)      { step[a] = 1;  tNext[a] = t0 + (lo3[a] + (c[a] + 1) * w - pa) / da; tDelta[a] = w / da; }
+        else if (da < 0.0) { step[a] = -1; tNext[a] = t0 + (lo3[a] + c[a] * w - pa) / da;       tDelta[a] = -w / da; }
+        else               { step[a] = 0;  tNext[a] = 1e300;                                    tDelta[a] = 1e300; }
+    }
+    double t = t0, pdf = 0.0;
+    while (t < t1) {
+        const int a = (tNext[0] < tNext[1]) ? (tNext[0] < tNext[2] ? 0 : 2) : (tNext[1] < tNext[2] ? 1 : 2);
+        const double tOut = fmin(tNext[a], t1);
+        const double w = v.cellW[((size_t)c[2] * v.gres[1] + c[1]) * v.gres[0] + c[0]];
+        if (w > 0.0) pdf += w * norm * (tOut * tOut * tOut - t * t * t) / 3.0;
+        t = tOut;
+        c[a] += step[a];
+        if (c[a] < 0 || c[a] >= v.gres[a]) break;
+        tNext[a] += tDelta[a];
+    }
+    return pdf;
+}
+
+// The light-sampling direction's density: a quarter cone (it bounds the estimate for a vertex
+// inside the fire), three quarters point (host twin: fireDirPdf, kFireCone).
+#define D_FIRE_CONE 0.25
+__device__ static double dFireDirPdf(const DEmissiveVolume& v, const DVec3& x, const DVec3& d) {
+    return D_FIRE_CONE * dFireConePdf(v, x, d) + (1.0 - D_FIRE_CONE) * dFirePointPdf(v, x, d);
+}
+
+// The emission a straight segment o + s d, s in [0, len], collects into E[0..n): per fire (or only
+// fire `only`), w(fire) times the integral of T(0, s) j(o + s d, lam[i]) ds, estimated at jittered
+// stratified points about one per voxel (4..32) of the stretch through the box it emits in, the
+// transmittance to each a product of independent estimates over the sub-segments between them --
+// the media's at lam[0] (a bundle rides only grey media) and, when `strands`, the hair's by its
+// coverage, as a shadow ray -- times the Beer-Lambert exp(-absorb s) of a dielectric the segment
+// runs inside. `curveTmin0`: the hair exit clearance of a ray leaving a fiber, from `o`.
+// Host twins: fireSegment and EmissiveVolume::segmentPoints.
+template <class W>
+__device__ static void dFireSegment(const DScene& sc, const DVec3& o, const DVec3& d, double len,
+                                    const Real* lam, int n, bool strands, double curveTmin0,
+                                    double absorb, DRng& rng, double* E, W&& w, int only = -1) {
+    for (int vi = 0; vi < sc.emissiveVolN; ++vi) {
+        if (only >= 0 && vi != only) continue;
+        const DEmissiveVolume& v = sc.emissiveVolumes[vi];
+        double ta, tb;
+        if (!dClipRayBox(v.bmin, v.bmax, o, d, 0.0, len, ta, tb)) continue;
+        const double wv = w(vi);
+        if (!(wv > 0.0)) continue;
+        const DMedium& med = sc.media[v.mediumIndex];
+        int K = 4;
+        if (v.voxel > 0.0) {
+            const double k = ceil((tb - ta) / v.voxel);
+            K = (k < 4.0) ? 4 : (k > 32.0 ? 32 : (int)k);
+        }
+        const double dt = (tb - ta) / K;
+        double T = 1.0, sPrev = 0.0;
+        for (int k = 0; k < K; ++k) {
+            const double sk = ta + (k + (double)rng.uniform()) * dt;
+            if (sk >= tb) break;
+            const DVec3 a = o + d * (Real)sPrev;
+            const double seg = sk - sPrev;
+            if (sc.mediaN > 0) T *= (double)dMediaTransmittance(sc, a, d, (Real)seg, lam[0], rng);
+            if (strands && T > 0.0)
+                T *= (double)shadowTransmittance(sc, a, d, (Real)seg, RAY_EPS,
+                                                 (Real)(curveTmin0 > sPrev ? curveTmin0 - sPrev : 0.0));
+            if (!(T > 0.0)) break;
+            sPrev = sk;
+            const double kelvin = dMedTemperatureAt(med, o + d * (Real)sk);
+            if (!(kelvin > 0.0)) continue;
+            const double Ts = (absorb > 0.0) ? T * exp(-absorb * sk) : T;
+            for (int i = 0; i < n; ++i) {
+                const double Le = med.emissionScale * dBlackbodyEmissionRadiance(kelvin, (double)lam[i]);
+                if (Le > 0.0) E[i] += wv * dt * Ts * Le;
+            }
+        }
+    }
+}
+
+// dFireSegment's weight for a path segment leaving `gm.from` along `d`: the glossy vertex's balance
+// heuristic (gm.pdf > 0), else 1 on a camera or specular arrival and 0 after any other vertex,
+// whose light sampling took the fire (host twin: fireSegmentWeight).
+__device__ static double dFireSegmentWeight(const DScene& sc, int vi, const DGlossyMis& gm,
+                                            bool specularArrival, const DVec3& d) {
+    if (!sc.bkFireNee) return 1.0;
+    if (gm.pdf > 0.0) {
+        const DEmissiveVolume& v = sc.emissiveVolumes[vi];
+        const double pn = v.share * dFireDirPdf(v, gm.from, d);
+        return gm.pdf / (gm.pdf + pn);
+    }
+    return specularArrival ? 1.0 : 0.0;
+}
+
+// Light sampling of the fire from a vertex at `x` (host twin: fireNee): one fire by power, one
+// direction from the cone / point mixture, and the emission integral along it through see-through
+// strands. `resp(wi, f, pdfB, ro, curveTmin)` fills f[0..n) -- the vertex's BSDF times cosine (or
+// albedo times phase) toward wi per wavelength -- the density pdfB its continuation would sample
+// wi with, and the integral's origin and fiber clearance; false when wi is out of reach. `mis`:
+// a glossy vertex, whose continuation also counts the fire, so the balance heuristic
+// sel p / (sel p + pdfB). Adds thr[i] invPdf[i] times the estimate into L[i].
+template <class Resp>
+__device__ static void dFireNee(const DScene& sc, const DVec3& x, const Real* lam, int n,
+                                const double* thr, const double* invPdf, double* L, bool mis,
+                                DRng& rng, Resp&& resp) {
+    if (sc.emissiveVolN == 0 || !(sc.totalEmissionPower > 0.0) || !sc.bkFireNee) return;
+    const int vi = dPickFire(sc, (double)rng.uniform());
+    const DEmissiveVolume& v = sc.emissiveVolumes[vi];
+    const double sel = v.share;
+    if (!(sel > 0.0) || v.nCells == 0) return;
+    DVec3 wi;
+    if ((double)rng.uniform() >= D_FIRE_CONE) {
+        const double u0 = rng.uniform(), u1 = rng.uniform(), u2 = rng.uniform(), u3 = rng.uniform();
+        const DVec3 dv = dFireCellPoint(v, u0, u1, u2, u3) - x;
+        const Real dl = length(dv);
+        if (!(dl > (Real)0)) return;
+        wi = dv / dl;
+    } else {
+        const double u1 = rng.uniform(), u2 = rng.uniform();
+        wi = dFireConeSample(v, x, u1, u2);
+    }
+    const double pdfDir = dFireDirPdf(v, x, wi);
+    if (!(pdfDir > 0.0)) return;
+    double f[hero::kHeroMax], E[hero::kHeroMax];
+    for (int i = 0; i < n; ++i) { f[i] = 0.0; E[i] = 0.0; }
+    double pdfB = 0.0, curveTmin = 0.0;
+    DVec3 ro;
+    if (!resp(wi, f, pdfB, ro, curveTmin)) return;
+    // Unbounded: the clip to the box the fire emits in ends it.
+    dFireSegment(sc, ro, wi, 1e30, lam, n, /*strands=*/true, curveTmin, /*absorb=*/0.0, rng, E,
+                 [](int) { return 1.0; }, vi);
+    const double den = sel * pdfDir + (mis ? pdfB : 0.0);
+    if (!(den > 0.0)) return;
+    for (int i = 0; i < n; ++i)
+        if (thr[i] > 0.0 && f[i] > 0.0 && E[i] > 0.0) L[i] += thr[i] * invPdf[i] * f[i] * E[i] / den;
+}
 
 // Host twin: BackwardRenderer::lightSelPdf -- the probability dPickEmitters SELECTS emitter `e`
 // at vertex (p, n). Both halves of the glossy MIS weight call this, so they cannot disagree; the
@@ -11227,6 +11502,34 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
         }
         total += ((nS > 1) ? acc / (double)nS : acc) * selW;
     }
+    // The fire, as one more light (dFireNee; host twin: neeLight's): a surface's response and its
+    // shadow-ray offset, or -- `hs` -- a fiber's, from its exit clearance.
+    if (sc.emissiveVolN > 0) {
+        const double one = 1.0;
+        double Lf = 0.0;
+        dFireNee(sc, h.p, &lambda, 1, &one, &invPdfLambda, &Lf, nb != nullptr, rng,
+                 [&](const DVec3& wi, double* fo, double& pdfB, DVec3& ro, double& ctmin) {
+                     Real cosSurf, stG;
+                     if (hs) {
+                         if (!bkHairResponse(*hs, wi, cosSurf, stG)) return false;
+                         pdfB = dhair::pdf(hs->b, hs->woLocal, dhair::toLocal(hs->fr, wi));
+                         ro = dOffsetPoint(h.p, wi);
+                         ctmin = (double)dHairExitOffset(*hs, h.n, wi);
+                     } else {
+                         cosSurf = dot(h.n, wi);
+                         if (cosSurf <= (Real)0) return false;
+                         stG = dShadowTerminatorG(wi, h.n, ngo0);
+                         if (stG <= (Real)0) return false;
+                         pdfB = nb ? dGlossyPdfHit(sc, *nb->m, h, nb->wo, wi) : (double)cosSurf / DPI;
+                         ro = dOffsetAlong(h.p, h.ng, wi);
+                         ctmin = 0.0;
+                     }
+                     fo[0] = (nb ? dGlossyFHit(sc, *nb->m, h, nb->wo, wi, lambda)
+                                 : (double)rho / DPI) * (double)cosSurf * (double)stG;
+                     return true;
+                 });
+        total += Lf;
+    }
     return total;
 }
 
@@ -11371,6 +11674,23 @@ __device__ __noinline__ static void bkNeeLightHero(const DScene& sc, const DHit&
             }
         }
     }
+    // The fire, as one more light (dFireNee; host twin: neeLightHero's): the bundle's response
+    // along one sampled direction.
+    if (sc.emissiveVolN > 0)
+        dFireNee(sc, h.p, lam, nUp, thr, invPdf, L, nb != nullptr, rng,
+                 [&](const DVec3& wi, double* fo, double& pdfB, DVec3& ro, double& ctmin) {
+                     const Real cosSurf = dot(h.n, wi);
+                     if (cosSurf <= (Real)0) return false;
+                     const Real stG = dShadowTerminatorG(wi, h.n, ngo0);
+                     if (stG <= (Real)0) return false;
+                     pdfB = nb ? dGlossyPdfHit(sc, *nb->m, h, nb->wo, wi) : (double)cosSurf / DPI;
+                     for (int i = 0; i < nUp; ++i)
+                         fo[i] = (nb ? dGlossyFHit(sc, *nb->m, h, nb->wo, wi, lam[i])
+                                     : (double)rho[i] / DPI) * (double)cosSurf * (double)stG;
+                     ro = dOffsetAlong(h.p, h.ng, wi);
+                     ctmin = 0.0;
+                     return true;
+                 });
 }
 
 // Volume next-event estimation at a medium scattering vertex, for a hero bundle (SPECTRAL-BUNDLE)
@@ -11453,6 +11773,17 @@ __device__ __noinline__ static void bkNeeVolumeHero(const DScene& sc, const DMed
                   * (double)specLookup(em.emitSpd, lam[i]) * invPdf[i] * geom;
         }
     }
+    // The fire, as one more light; the vertex may sit inside it (host twin: neeVolumeHero's).
+    if (sc.emissiveVolN > 0)
+        dFireNee(sc, p, lam, nUp, thr, invPdf, L, /*mis=*/false, rng,
+                 [&](const DVec3& wi, double* fo, double& pdfB, DVec3& ro, double& ctmin) {
+                     const Real cosT = dot(wIn, wi);
+                     for (int i = 0; i < nUp; ++i) fo[i] = alb[i] * (double)dMedPhase(med, cosT, lam[i]);
+                     pdfB = 0.0;
+                     ro = p + wi * RAY_EPS;
+                     ctmin = 0.0;
+                     return true;
+                 });
 }
 
 // Environment next-event estimation at a surface vertex (device twin of backward.h
@@ -11747,6 +12078,20 @@ __device__ static void bkNeeLightHeroHair(const DScene& sc, const DHit& h, const
             L[i] += thr[i] * resp[i] * ((double)specLookup(em.emitSpd, lam[i]) * invPdf[i]) * w;
         }
     }
+    // The fire, as one more light, with the fiber's response per wavelength (host twin:
+    // neeLightHeroHair's). No MIS: a continuation after a fiber does not count it.
+    if (sc.emissiveVolN > 0)
+        dFireNee(sc, h.p, lam, nUp, thr, invPdf, L, /*mis=*/false, rng,
+                 [&](const DVec3& wi, double* fo, double& pdfB, DVec3& ro, double& ctmin) {
+                     const dhair::V3 wl = dhair::toLocal(hs0.fr, wi);
+                     dHairBundleAt(hs0, sp, nUp, wl,
+                                   dhair::safeSqrt(1.0 - dhair::sqr(dhair::clampd(wl.x, -1.0, 1.0))),
+                                   fo, nullptr);
+                     pdfB = 0.0;
+                     ro = dOffsetPoint(h.p, wi);
+                     ctmin = (double)dHairExitOffset(hs0, h.n, wi);
+                     return true;
+                 });
 }
 
 // The environment twin of bkNeeLightHeroHair (host twin backward.h neeEnvHeroHair): one sky
@@ -12341,6 +12686,18 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         if (b == 0 && gi.depth == 0 && h.valid)
             h.fw = (Real)patShadingFootprint(sc.bkFwPerDist, (double)h.t, (double)dot(rd, h.n));
         Real dSurf = h.valid ? h.t : (Real)1e30;
+        // FIRE: the emission along this whole segment, to the surface it reached -- the RTE's
+        // emission term, whatever the free flight below then samples (host twin: radiance()).
+        if (sc.emissiveVolN > 0) {
+            double Ef = 0.0;
+            const int cm = stk.topMat();
+            const double ab = (cm >= 0) ? (double)specLookup(sc.mats[cm].absorb, lambda) : 0.0;
+            dFireSegment(sc, ro, rd, (double)dSurf, &lambda, 1, /*strands=*/false, 0.0, ab, rng,
+                         &Ef, [&](int vi) {
+                             return dFireSegmentWeight(sc, vi, gmis, specularArrival, rd);
+                         });
+            L += thr * Ef * invPdfLambda;
+        }
         // Participating media: sample a free-flight collision (superposition over all
         // media — homogeneous = exact free-flight, heterogeneous = Woodcock/delta
         // tracking) that competes with the surface hit. On a volume collision, add
@@ -12578,6 +12935,21 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         // and that sub-path's first vertex is not a camera vertex.
         if (b == 0 && gi.depth == 0 && h.valid)
             h.fw = (Real)patShadingFootprint(sc.bkFwPerDist, (double)h.t, (double)dot(rd, h.n));
+
+        // FIRE: the emission along this whole segment, per wavelength (host twin:
+        // radianceHeroLoop). A bundle is never inside a dielectric, so the Beer-Lambert term is
+        // the hero's.
+        if (sc.emissiveVolN > 0) {
+            double Ef[hero::kHeroMax];
+            for (int i = 0; i < nUp; ++i) Ef[i] = 0.0;
+            const int cm = stk.topMat();
+            const double ab = (cm >= 0) ? (double)specLookup(sc.mats[cm].absorb, lam[0]) : 0.0;
+            dFireSegment(sc, ro, rd, h.valid ? (double)h.t : 1e30, lam, nUp, /*strands=*/false, 0.0,
+                         ab, rng, Ef, [&](int vi) {
+                             return dFireSegmentWeight(sc, vi, gmis, specularArrival, rd);
+                         });
+            for (int i = 0; i < nUp; ++i) L[i] += thr[i] * Ef[i] * invPdf[i];
+        }
 
         // PARTICIPATING MEDIA (SPECTRAL-BUNDLE; host twin: radianceHeroLoop). The bundle is here
         // only when every medium's extinction is the same at every wavelength (the caller's
@@ -13119,13 +13491,13 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
             double pdf0 = 0.0;
             lam[0] = dSampleCamLambdaU(sc, u, pdf0, filmW[0]);
             if (pdf0 <= 0.0) continue;
-            invPdf[0] = dInvPdfLambda(sc, lam[0]);
+            invPdf[0] = dCamInvPdfLambda(sc, lam[0]);
             for (int i = 1; i < heroC; ++i) {
                 double uu = u + (double)i / heroC;
                 if (uu >= 1.0) uu -= 1.0;              // wrap into [0,1)
                 double pdfi = 0.0;
                 lam[i] = dSampleCamLambdaU(sc, uu, pdfi, filmW[i]);
-                invPdf[i] = (pdfi > 0.0) ? dInvPdfLambda(sc, lam[i]) : 0.0;
+                invPdf[i] = (pdfi > 0.0) ? dCamInvPdfLambda(sc, lam[i]) : 0.0;
             }
             DVec3 hro, hrd;
             Real jx, jy;
@@ -13156,7 +13528,7 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
         Real lambda = dSampleCamLambdaU(sc, whitted ? dWhittedLambdaU(sIdx)
                                                     : (double)rng.uniform(), pdf, filmWl);
         if (pdf <= 0.0) continue;
-        double invPdfLambda = dInvPdfLambda(sc, lambda);
+        double invPdfLambda = dCamInvPdfLambda(sc, lambda);
 
         DVec3 ro, rd;
         double wLens = 1.0;
@@ -18556,9 +18928,10 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             d.fluoMint = 0.0;
         }
         // Excitation CDF (absorb x illuminant), appended to the SAME flat buffer with
-        // its own slice. N == 0 makes the device sampler fall back to the illuminant,
-        // matching the host's `fluoInSampler.integral > 0 ? ... : scene.camSampler` (the same
-        // density as emitSampler on the device, which renders no fire).
+        // its own slice. N == 0 makes the device sampler fall back to the emitters' density
+        // where the host's `fluoInSampler.integral > 0 ? ... : scene.camSampler` takes the
+        // camera's: the product is then 0 everywhere, so the dye absorbs at no wavelength the
+        // scene emits and either draw only ends the branch.
         if (m.type == MatType::Fluorescent && !m.fluoInSampler.cdf.empty() &&
             m.fluoInSampler.integral > 0.0) {
             d.fluoInCdfOffset = (int)fluoCdfAll.size();
@@ -18861,8 +19234,10 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     double*   d_cdfAll  = cdfAll.empty()     ? nullptr : (double*)keep(uploadVec(cdfAll));
     double*   d_emitCdf = emitCdf.empty()    ? nullptr : (double*)keep(uploadVec(emitCdf));
     double*   d_emitSamp = emitSampCdf.empty() ? nullptr : (double*)keep(uploadVec(emitSampCdf));
+    std::vector<double> camCdf = scene.camSampler.cdf;         // the camera's illuminant
     std::vector<double> camVisCdf = scene.camVisSampler.cdf;   // mode R's camera lambda CDF
     std::vector<double> camWCdf = scene.camWSampler.cdf;       // mode W's
+    double*   d_cam = camCdf.empty() ? nullptr : (double*)keep(uploadVec(camCdf));
     double*   d_camVis = camVisCdf.empty() ? nullptr : (double*)keep(uploadVec(camVisCdf));
     double*   d_camW = camWCdf.empty() ? nullptr : (double*)keep(uploadVec(camWCdf));
 
@@ -19022,6 +19397,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.nLightTreeLeaf  = (int)scene.lightTreeLeaf.size();
     sc.bkLightTree     = lt::gEnabled ? 1 : 0;
     sc.bkGlossyNee     = lt::gGlossyNee ? 1 : 0;   // GLOSSY-NEE (known-issues.md)
+    {   const char* e = std::getenv("FTRACE_FIRE_NEE");          // host twin: fireNeeOn()
+        sc.bkFireNee = (e && e[0] == '0') ? 0 : 1; }
     sc.specNee         = lt::gSpecNee ? 1 : 0;     // SPECTRAL NEE; the host gather reads the same object
     {   // M-GATHERAREA footprint budget, same environment channel and same default (8) the host
         // uses -- the two MUST agree or -device gpu and -device cpu diverge on truncated geometry.
@@ -19059,20 +19436,32 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.emitSamplerN = (int)(emitSampCdf.empty() ? 0 : emitSampCdf.size() - 1);
     sc.emitSamplerStep = scene.emitSampler.step;
     sc.emitG = scene.emitG;
+    sc.camCdf = d_cam;
     sc.camVisCdf = d_camVis;
     sc.camWCdf = d_camW;
-    // dSampleCamLambdaU reads a camera CDF and the emission CDF at the one bin it drew: they must
-    // share their bins (finalizeCameraSpectrum builds them so). If one ever does not, say so and
-    // draw from the illuminant itself, whose film weight is then exactly 1.
+    sc.camG = scene.camG;
+    // dSampleCamLambdaU reads a camera draw's CDF and the camera illuminant's at the one bin it
+    // drew, on the emission sampler's bins: they must share them (finalizeCameraSpectrum builds
+    // them so). If one ever does not, say so and draw from the illuminant itself, whose film
+    // weight is then exactly 1.
     auto sameBins = [&](const EmissionSampler& s) {
         return s.cdf.size() == emitSampCdf.size() && s.step == scene.emitSampler.step;
     };
-    if (!sameBins(scene.camVisSampler) || !sameBins(scene.camWSampler)) {
+    bool camFires = true;              // the fires' term in the camera's illuminant (dFireG)
+    if (!sameBins(scene.camSampler) || !sameBins(scene.camVisSampler) ||
+        !sameBins(scene.camWSampler)) {
         std::fprintf(stderr,
             "[cuda] INTERNAL: a camera wavelength sampler and the emission sampler differ in "
-            "bins; drawing camera wavelengths from the emission sampler\n");
-        sc.camVisCdf = sc.emitSamplerCdf;
-        sc.camWCdf = sc.emitSamplerCdf;
+            "bins; drawing camera wavelengths from the camera illuminant\n");
+        if (sameBins(scene.camSampler)) {
+            sc.camVisCdf = sc.camCdf;
+            sc.camWCdf = sc.camCdf;
+        } else {   // the emission sampler, and weights to match: a fire is then reached only
+                   // at the emitters' wavelengths
+            sc.camCdf = sc.camVisCdf = sc.camWCdf = sc.emitSamplerCdf;
+            sc.camG = scene.emitG;
+            camFires = false;
+        }
     }
     // Participating media array (superposed). Each medium's density program is uploaded
     // separately; then the flat DMedium array is uploaded once. Empty => media=null, mediaN=0.
@@ -19255,6 +19644,17 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             d.lamCdf  = (const double*)keep(uploadVec(ev.lamSampler.cdf));
             d.lamN    = (int)ev.lamSampler.cdf.size() - 1;   // cdf has N+1 entries
             d.lamStep = ev.lamSampler.step;
+            // Mode R's light sampling (dFireNee). buildFireCells leaves at least one cell.
+            d.share   = scene.fireShare((int)v);
+            d.voxel   = ev.voxel;
+            for (int a = 0; a < 3; ++a) d.gres[a] = ev.gres[a];
+            d.cellW   = ev.cellW.empty() ? nullptr : (const double*)keep(uploadVec(ev.cellW));
+            d.cellCdf = ev.cellCdf.empty() ? nullptr : (const double*)keep(uploadVec(ev.cellCdf));
+            d.nCells  = (int)ev.cellCdf.size();
+            d.cellSum = ev.cellSum;
+            d.kelvin  = scene.media[(size_t)ev.mediumIndex].emitKelvin;
+            d.gW      = (camFires && ev.lamSampler.integral > 0.0)
+                            ? ev.power / ev.lamSampler.integral : 0.0;
         }
         sc.emissiveVolumes    = devs.empty() ? nullptr : (const DEmissiveVolume*)keep(uploadVec(devs));
         sc.emissiveVolN       = (int)devs.size();
@@ -21001,8 +21401,6 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     }
     // A physical lens deeper than the device cap falls back to the CPU tracer.
     if (cam.hasLens() && (int)cam.lens->surf.size() > D_MAXLENS) return false;
-    // A fire: the CPU walk reaches it (backward.h fireNee / fireSegment); the device's does not.
-    for (const Medium& m : scene.media) if (m.emissive()) return false;
     return true;
 }
 

@@ -1,7 +1,7 @@
 """Regression check: mode R renders a fire as the forward tracer does.
 
     D:/python314/python.exe -u tools/check_fire_r.py [--out <dir>] [--exe ftrace.exe] [--spp N]
-                                                     [--photons N]
+                                                     [--photons N] [--device cpu|gpu]
 
 A medium with a `temperature` grid emits j(x, lambda) = Medium::emissionAt per unit length; the
 forward tracer births photons at that density, and mode R reaches it two ways -- light sampling of
@@ -19,8 +19,11 @@ sphere, the fire the only light, and compares tile by tile, two seeds each:
      grid that bounds the medium, over a small floor -- light sampling on against off: until
      0.377.3 the light sampling's integral stopped at the scene's bounding sphere, which the
      density grid and the floor alone set, and the floor lost most of the fire's light.
+With `--device gpu` every mode-R render is the device's (one that fell back to the CPU fails the
+check), mode B stays the host's, and a fifth pair holds the device's mode R to the host's:
+  5. mode R on the device against mode R on the host (1 %).
 A tile fails when two renders differ by more than 5 standard errors (from the seed pairs, tile-
-and pixel-wise, the larger kept) AND by more than the pair's tolerance (1 %, 1 %, 3 %, 1 %).
+and pixel-wise, the larger kept) AND by more than the pair's tolerance (1 %, 1 %, 3 %, 1 %, 1 %).
 Exits 1 on any failure.
 """
 import argparse
@@ -33,7 +36,7 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 sys.path.insert(0, os.path.join(ROOT, "tools", "loom"))
-from check_glossy_nee_media import read_pfm, tile_stats, tile_summary  # noqa: E402
+from check_glossy_nee_media import GPU_TOKENS, read_pfm, tile_stats, tile_summary  # noqa: E402
 from loom.vdbio import VolumeGrid, write_vdb  # noqa: E402
 
 NL = chr(10)
@@ -104,6 +107,7 @@ def main():
     ap.add_argument("--exe", default=os.path.join(ROOT, "ftrace.exe"))
     ap.add_argument("--spp", type=int, default=256)
     ap.add_argument("--photons", type=int, default=100000000)
+    ap.add_argument("--device", default="cpu", choices=("cpu", "gpu"))
     a = ap.parse_args()
     a.exe = os.path.abspath(a.exe)
     d = os.path.abspath(a.out)
@@ -111,38 +115,52 @@ def main():
     write_fire(d)
     write_wide_fire(d)
 
-    def render(tag, args, env=None, scene="fire.ftsl"):
+    def render(tag, args, env=None, scene="fire.ftsl", device="cpu"):
         imgs = []
         for seed in (1, 2):
-            png = "%s_s%d.png" % (tag, seed)
-            cmd = [a.exe, "-in", scene, "-device", "cpu", "-seed", str(seed), "-hdr",
+            png = "%s%s_s%d.png" % (tag, "_g" if device == "gpu" else "", seed)
+            pfm = os.path.join(d, png[:-4] + ".pfm")
+            for f in (os.path.join(d, png), pfm):        # never score an earlier run's image
+                if os.path.exists(f):
+                    os.remove(f)
+            cmd = [a.exe, "-in", scene, "-device", device, "-seed", str(seed), "-hdr",
                    "-no-meter", "-o", png] + args
             e = dict(os.environ)
             e.update(env or {})
             p = subprocess.run(cmd, cwd=d, env=e, capture_output=True, text=True, encoding="utf-8",
                                errors="replace")
-            pfm = os.path.join(d, png[:-4] + ".pfm")
             if p.returncode != 0 or not os.path.exists(pfm):
                 print(p.stdout[-1500:], p.stderr[-1500:])
                 raise SystemExit("render failed: " + " ".join(cmd))
-            imgs.append(read_pfm(pfm).sum(-1))
+            if device == "gpu" and not any(t in p.stdout + p.stderr for t in GPU_TOKENS):
+                raise SystemExit("did not run on the GPU: " + " ".join(cmd))
+            img = read_pfm(pfm).sum(-1)
+            if not img.sum() > 0.0:                   # two black images would "agree"
+                raise SystemExit("rendered black: " + " ".join(cmd))
+            imgs.append(img)
         return tile_stats(imgs[0], imgs[1])
 
     spp = ["-spp", str(a.spp)]
-    r4 = render("r_c4", ["-mode", "R", "-heroc", "4"] + spp)
-    r4off = render("r_c4_noneed", ["-mode", "R", "-heroc", "4"] + spp, {"FTRACE_FIRE_NEE": "0"})
-    r1 = render("r_c1", ["-mode", "R", "-heroc", "1"] + spp)
-    rd = render("rd_c4", ["-mode", "R", "-heroc", "4"] + spp, scene="fire_diffuse.ftsl")
+    dv = a.device
+    r4 = render("r_c4", ["-mode", "R", "-heroc", "4"] + spp, device=dv)
+    r4off = render("r_c4_noneed", ["-mode", "R", "-heroc", "4"] + spp, {"FTRACE_FIRE_NEE": "0"},
+                   device=dv)
+    r1 = render("r_c1", ["-mode", "R", "-heroc", "1"] + spp, device=dv)
+    rd = render("rd_c4", ["-mode", "R", "-heroc", "4"] + spp, scene="fire_diffuse.ftsl", device=dv)
     bd = render("bd", ["-mode", "B", "-n", str(a.photons)], scene="fire_diffuse.ftsl")
-    w4 = render("w_c4", ["-mode", "R", "-heroc", "4"] + spp, scene="fire_wide.ftsl")
+    w4 = render("w_c4", ["-mode", "R", "-heroc", "4"] + spp, scene="fire_wide.ftsl", device=dv)
     w4off = render("w_c4_noneed", ["-mode", "R", "-heroc", "4"] + spp, {"FTRACE_FIRE_NEE": "0"},
-                   scene="fire_wide.ftsl")
+                   scene="fire_wide.ftsl", device=dv)
+    where = " (device)" if dv == "gpu" else ""
+    pairs = [("light sampling on / off" + where, r4, r4off, 0.01),
+             ("-heroc 4 / -heroc 1" + where, r4, r1, 0.01),
+             ("mode R%s / mode B (diffuse sphere)" % where, rd, bd, 0.03),
+             ("a fire wider than the scene, light sampling on / off" + where, w4, w4off, 0.01)]
+    if dv == "gpu":
+        pairs.append(("mode R, device / host", r4,
+                      render("r_c4", ["-mode", "R", "-heroc", "4"] + spp), 0.01))
     ok = True
-    for name, x1, x0, tol in (("light sampling on / off", r4, r4off, 0.01),
-                              ("-heroc 4 / -heroc 1", r4, r1, 0.01),
-                              ("mode R / mode B (diffuse sphere)", rd, bd, 0.03),
-                              ("a fire wider than the scene, light sampling on / off", w4, w4off,
-                               0.01)):
+    for name, x1, x0, tol in pairs:
         good, frame, worst, zw = tile_summary(x1, x0, tol)
         ok &= good
         print("%s: %s, frame x%.4f; worst tile x%.4f (%.1f sigma)" % (

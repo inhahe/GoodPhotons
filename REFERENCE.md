@@ -921,7 +921,11 @@ that converges to the same physical image.
   importance-sampled on-device from its luminance CDF; **spectral rainbow-phase media**
   and **gradient-index (GRIN) media** — the same Eikonal marcher as the CPU — also run
   on-device now); scenes using collimated beams still fall back to the CPU tracer
-  automatically. Add **`-rgb`** for a **fast RGB preview** (GPU only): instead of
+  automatically. It renders **volumetric emission** (a `temperature` "fire" medium) as a
+  light — sampled from every vertex, and the glow collected along every ray — on the CPU
+  (since 0.376.0) and the GPU (since 0.381.0), with the camera's wavelengths drawn from the
+  lights' spectra *and* the fire's, so a fire-lit scene is reached at every wavelength the
+  fire emits. Add **`-rgb`** for a **fast RGB preview** (GPU only): instead of
   sampling one wavelength per sample it carries an RGB throughput triple and does one
   intersection walk per full-colour sample, so a clean colour image converges much
   faster. Materials bake to a per-material linear-RGB albedo and emitters/env to a

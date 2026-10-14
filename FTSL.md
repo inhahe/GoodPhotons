@@ -2987,8 +2987,9 @@ medium {
 > so a fire needs no separate `light` block. A `temperature` grid with no voxel above 0 is refused
 > at load, whichever file format it comes in; one that emits nothing for another reason
 > (`emission_scale 0`, `emission_kelvin 0`) is reported at load and rendered as the smoke it is
-> made of, in every mode. A GPU mode-R or mode-D render of a fire falls back to the CPU. The other
-> modes (V, P, U, J, M, S) do not render volumetric emission and **refuse** a scene with a fire, like any other
+> made of, in every mode. Mode R renders a fire on the GPU too; a GPU mode-D render of one falls
+> back to the CPU. The other
+> modes (W, V, P, U, J, M, S) do not render volumetric emission and **refuse** a scene with a fire, like any other
 > feature a mode can't render; so does mode R alongside `-dual-scatter` fur or a GRIN medium.
 > `-on-unsupported fallback` switches such a camera to mode **R** (or **B** where R refuses), and
 > `-on-unsupported strip` renders the fire as cold smoke unless another camera of the same run

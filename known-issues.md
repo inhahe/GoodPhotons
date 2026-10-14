@@ -652,8 +652,14 @@ fixed in 0.378.1.) On the way it
 exposed BDPT-S1-SKIP (0.377.4): a fire's light subpaths start empty whenever their origin lands on
 a cold point.
 
-**Still open:** the GPU twins of modes R and D (a GPU render of a fire in either falls back to the
-CPU); modes J and U, which share mode D's transport but still refuse a fire (their light passes
+**GPU mode R renders it (0.381.0)**: the device walk's twin of mode R's fire, and the camera's
+wavelengths from the camera illuminant, fires included (design.md, the fire bullet).
+`tools/check_fire_r.py --device gpu` holds it to itself, to mode B and to the host; its first run
+caught the device drawing the camera's wavelengths from the emitters alone, which renders a
+fire-only scene black.
+
+**Still open:** the GPU twin of mode D (a GPU render of a fire in it falls back to the CPU);
+modes J and U, which share mode D's transport but still refuse a fire (their light passes
 would need fire-born light subpaths, and J's beams their own fire births); mode P, refused until
 its composite -- the forward layer fitted against a mode-R film -- is checked with a fire in both.
 And an efficiency debt: the forward

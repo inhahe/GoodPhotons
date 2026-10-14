@@ -7830,8 +7830,14 @@ as the one at fault.
   wavelength it emits even where no emitter does; the camera draws from it times a window over
   the visible band (`Scene::camDraw`, the `backward.h` bullet on camera wavelengths).
   `FTRACE_FIRE_NEE=0` turns the light sampling off (segments take full weight) for A/B checks
-  (`tools/check_fire_r.py`). The device walk does not see a fire yet, so a GPU mode-R render of
-  one falls back to the CPU (`cudaBackwardSupported`).
+  (`tools/check_fire_r.py`). The device walk is its twin (0.381.0): `dFireNee` (the same mixture
+  over `DEmissiveVolume`'s cell grid) at every surface, fiber, glossy and fog vertex of the scalar
+  walk and the hero bundle, and `dFireSegment` along every segment, weighted by
+  `dFireSegmentWeight`. Its camera draws on `DScene::camCdf` / `camG`, the uploaded
+  `Scene::camSampler`, with `dCamInvPdfLambda` adding each fire's Planck term (`dFireG`) to the
+  emitters', as the host's `camInvPdfLambda` does -- drawn from the emitters alone, a fire-only
+  scene has no wavelengths and renders black. `check_fire_r.py --device gpu` holds the device to
+  itself (light sampling on/off, -heroc 4/1), to mode B and to the host.
   **Mode D (CPU, 0.378.0)** (`bdpt.h`, the fires note) takes a fire as one more light, picked by
   power together with the emitters (`bdptPickLight`), with all three of an area light's
   strategies. s >= 2: light subpaths born at a point of it (`fireLightSubpath`: the point from
