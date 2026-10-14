@@ -207,7 +207,8 @@ R with the lamp under the water; and the device to the host. On 0.378.0 it fails
 x1.78, S/R x1.80, U/R x1.54; the D and U device / host pairs and the submerged-lamp pairs fail on a
 scratch build with only that part of the fix removed (figures in the 0.378.1 commit). 0.378.3, after
 the reviews of 0.378.1, routed every host walk through two shared interface steps
-(`Renderer::dielectricStep` / `coatStep`, which take the transport as a required argument), gave
+(`Renderer::dielectricStep` / `coatStep`, which take the transport as a required argument; one
+`Renderer::interfaceStep` for plain and coated bodies since 0.378.5), gave
 the thin-film and multilayer interfaces the enclosing medium's index, folded the factor per photon
 wavelength into mode M's spectral gather, kept mode W's cutoff and ambient fill in air units, and
 extended the check to thin-film and multilayer blocks, mode W, `-rgb`, mode M's final gather, the

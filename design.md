@@ -2314,19 +2314,24 @@ point, mode U's camera walk -- multiplies its throughput by (n_from / n_to)^2 at
 (pbrt's TransportMode::Radiance factor on the BTDF). The MIS densities do not see it (it is
 throughput).
 
-Every host walk crosses an interface through one of two shared steps (0.378.3), which take the
-transport as a required argument (`Renderer::Transport`), so no walk can leave the factor out by
-omission: `Renderer::dielectricStep` -- the nested-dielectric priority rule (the far side's index
-from the enclosing medium, `exteriorIor`; a boundary of no higher priority than the medium it lies
-in suppressed; the stack kept), then `refractOrReflect` -- and `Renderer::coatStep` for thin film
-and multilayer, whose far side is the top of the stack (a coated body is not on it) by the same
-rule. Both return an `InterfaceStep`: the continuation ray, the throughput factor, mode W's branch
-weight, and what mode M's spectral gather needs to fold the factor per photon wavelength
-(`stepScaleAt`; a dispersive index makes it spectral). The device's twins are `dDielectricStep` and
-`dCoatStep`, whose `radianceScale` argument -- non-null on a camera-side walk -- every caller states.
+Every host walk crosses the surface of a dielectric body -- plain, or coated with a thin film or a
+multilayer stack -- through one shared step, `Renderer::interfaceStep` (0.378.3; one step for all
+three since 0.378.5), which takes the transport as a required argument (`Renderer::Transport`),
+so no walk can leave the factor out by omission. It applies the nested-dielectric priority rule
+(the far side's index from the enclosing medium, `exteriorIor`; a boundary of no higher priority
+than the medium it lies in suppressed, the ray going straight on), then the material's own
+interface -- `refractOrReflect`, or the coating's interference reflectance -- and keeps the stack:
+a body the ray enters goes on it, a coated one as a glass one does, so a walk inside a coated body
+knows its index and a body inside it ranks against it. It returns an `InterfaceStep`: the
+continuation ray, the throughput factor, mode W's branch weight, whether an opaque coating absorbed
+the ray, and what mode M's spectral gather needs to fold the factor per photon wavelength
+(`stepScaleAt`; a dispersive index makes it spectral). The device's twin is `dDielectricStep`
+(with `dExteriorIor` and `dEta2At`, folded through `DSpecThr::mul`), whose `radianceScale`
+argument -- non-null on a camera-side walk -- every caller states, as `dVcmScatter`'s callers do.
 Mode W's two air-unit quantities, its 1/512 throughput cutoff and its flat `-ambient` fill, are
-taken in the units of the medium the path is in (`localN2`: the stack top's n^2), so a path inside
-glass is cut, and filled, as its air-equivalent would be.
+taken in the units of the medium the path is in (`localN2`: the stack top's n^2) -- on the scalar
+walk, in the bundle loops, at a fur coat and at a strand -- so a path inside glass is cut, and
+filled, as its air-equivalent would be.
 
 It cancels for the usual glass object, crossed in and out, which is why its absence went unseen
 until 0.378.1: it matters only when a camera path ends inside a dielectric and meets something the

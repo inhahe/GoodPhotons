@@ -1950,6 +1950,7 @@ struct BackwardRenderer {
     // along it of the point density (piecewise constant) times t^2, which firePointPdf computes
     // exactly by stepping through the grid's cells (Amanatides-Woo).
     static double firePointPdf(const Scene::EmissiveVolume& v, const Vec3& x, const Vec3& d) {
+        if (v.cellCdf.empty()) throw std::logic_error("firePointPdf before buildFireCells");
         double t0, t1;
         if (!clipRayBox(v.bmin, v.bmax, x, d, 0.0, 1e300, t0, t1)) return 0.0;
         const Vec3 ext = v.bmax - v.bmin;
@@ -2199,7 +2200,9 @@ struct BackwardRenderer {
     bool furInteract(const Scene& scene, const furvol::FurVolume::Flight& fl, Ray& ray,
                      double lambda, double invPdfLambda, double& thr, double& L,
                      bool& specularArrival, double& contBsdfPdf, Pcg32& rng,
-                     const SpdCache* spdCache, GiCtx gi) const {
+                     const SpdCache* spdCache, GiCtx gi, double n2Local) const {
+        // `n2Local`: the square of the index of the medium the coat is in (Renderer::localN2),
+        // for mode W's cutoff in air units.
         const FurCell& fc = furVol->grid->cells[fl.ci];
         if (fc.matId < 0 || fc.matId >= (int)scene.mats.size()) return false;
         const Material& fmat = scene.mats[fc.matId];
@@ -2225,7 +2228,7 @@ struct BackwardRenderer {
         if (!(pdfH > 0.0) || !(fv > 0.0)) return false;
         const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
         const double Tlobe = clamp01(fv * cosLong / pdfH);      // == sum_p A_p
-        if (whitted) { if (!whittedAttenuate(thr, Tlobe, /*n2: a coat in air*/ 1.0)) return false; }
+        if (whitted) { if (!whittedAttenuate(thr, Tlobe, n2Local)) return false; }
         else if (rng.uniform() >= Tlobe) return false;          // analog absorption
         ray = Ray{vh.p, hair::toWorld(hs.fr, wl)};
         contBsdfPdf = pdfH;
@@ -2255,31 +2258,21 @@ struct BackwardRenderer {
             return whittedAttenuate(thr, w, Renderer::localN2(scene, stk, lambda));
         };
         switch (m.type) {
-            case MatType::Dielectric: {
-                // Nested dielectrics by priority (Renderer::dielectricStep). Mode W takes the
-                // dominant Fresnel branch and weights it into the throughput instead of a coin
-                // flip (see refractOrReflect's whittedWeight); attenuating after the step is safe,
-                // the ray not yet traced, so returning false just ends the path at this vertex.
-                specularArrival = true;
-                const Renderer::InterfaceStep st =
-                    mats.dielectricStep(scene, m, (int)(&m - scene.mats.data()), h, ray.d, lambda,
-                                        rng, stk, Renderer::Transport::Radiance, whitted);
-                ray = st.ray;
-                thr *= st.scale;                          // radiance across the interface
-                if (whitted && !wAtt(st.whittedWeight)) return false;
-                return true;
-            }
+            case MatType::Dielectric:
             case MatType::ThinFilm:
             case MatType::Multilayer: {
-                // Mode W: the dominant interference branch, weighted, as Dielectric does above.
+                // A dielectric body's surface, plain or coated (Renderer::interfaceStep). Mode W
+                // takes the dominant Fresnel / interference branch and weights it into the
+                // throughput instead of a coin flip; attenuating after the step is safe, the ray
+                // not yet traced, so returning false just ends the path at this vertex.
                 const Renderer::InterfaceStep st =
-                    mats.coatStep(scene, m, h, ray.d, lambda, rng, stk,
-                                  Renderer::Transport::Radiance, whitted);
+                    mats.interfaceStep(scene, m, h, ray.d, lambda, rng, stk,
+                                       Renderer::Transport::Radiance, whitted);
                 if (st.absorbed) return false;
+                specularArrival = true;
                 ray = st.ray;
                 thr *= st.scale;                          // radiance across the interface
                 if (whitted && !wAtt(st.whittedWeight)) return false;
-                specularArrival = true;
                 return true;
             }
             case MatType::Mirror: {
@@ -2796,7 +2789,8 @@ struct BackwardRenderer {
                 { double a = curAbsorb(lambda); if (a > 0.0) thr *= std::exp(-a * fl.t); }
                 gmis.clear();          // a vertex interactMaterial never sees (see the fog branch)
                 if (!furInteract(scene, fl, ray, lambda, invPdfLambda, thr, L,
-                                 specularArrival, contBsdfPdf, rng, spdCache, gi)) return L;
+                                 specularArrival, contBsdfPdf, rng, spdCache, gi,
+                                 Renderer::localN2(scene, stk, lambda))) return L;
                 continue;
             }
 
@@ -3224,7 +3218,8 @@ struct BackwardRenderer {
                 deHero();
                 gmis.clear();          // a vertex the material switch never sees (see above)
                 if (!furInteract(scene, fl, ray, lam[0], invPdf[0], thr[0], L[0],
-                                 specularArrival, contBsdfPdf, rng, spdCache, gi)) {
+                                 specularArrival, contBsdfPdf, rng, spdCache, gi,
+                                 Renderer::localN2(scene, stk, lam[0]))) {
                     finish(); return;
                 }
                 continue;
@@ -3365,7 +3360,7 @@ struct BackwardRenderer {
                     // WHOLE bundle is under the bailout, as in the Glossy case below.
                     if (whitted) {
                         for (int i = 0; i < nUp; ++i) thr[i] *= Rl[i];
-                        if (hero::maxOf(thr, nUp) <= kWhittedCutoff) { finish(); return; }
+                        if (hero::maxOf(thr, nUp) * Renderer::localN2(scene, stk, lam[0]) <= kWhittedCutoff) { finish(); return; }
                     }
                     Vec3 o = whitted
                                  ? whittedGlossyDir(reflect(ray.d, h.n),
@@ -3380,7 +3375,7 @@ struct BackwardRenderer {
                 }
                 if (whitted) {                   // body: every live λ enters the stack
                     for (int i = 0; i < nUp; ++i) thr[i] *= 1.0 - Rl[i];
-                    if (hero::maxOf(thr, nUp) <= kWhittedCutoff) { finish(); return; }
+                    if (hero::maxOf(thr, nUp) * Renderer::localN2(scene, stk, lam[0]) <= kWhittedCutoff) { finish(); return; }
                 }
                 int child = whitted ? mixResolveDominant(scene, cm, h)
                                     : mixResolveChild(scene, cm, h, rng.uniform());
@@ -3510,7 +3505,7 @@ struct BackwardRenderer {
                         // coin, no c_i/q reweight) and stop only when the whole bundle
                         // has fallen under the bailout.
                         for (int i = 0; i < nUp; ++i) thr[i] *= c[i];
-                        if (hero::maxOf(thr, nUp) <= kWhittedCutoff) { finish(); return; }
+                        if (hero::maxOf(thr, nUp) * Renderer::localN2(scene, stk, lam[0]) <= kWhittedCutoff) { finish(); return; }
                     } else {
                         if (rng.uniform() >= q) { finish(); return; }   // RR absorb (q == 0 always absorbs)
                         for (int i = 0; i < nUp; ++i) thr[i] *= c[i] / q;

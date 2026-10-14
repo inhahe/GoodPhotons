@@ -1208,11 +1208,11 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 break;
             }
             case MatType::Dielectric: {
-                // Nested dielectrics by priority (Renderer::dielectricStep); this camera-side
+                // Nested dielectrics by priority (Renderer::interfaceStep); this camera-side
                 // walk carries radiance across a refraction.
                 const Renderer::InterfaceStep st =
-                    mats.dielectricStep(scene, m, (int)(&m - scene.mats.data()), h, ray.d, lambda,
-                                        rng, stk, Renderer::Transport::Radiance);
+                    mats.interfaceStep(scene, m, h, ray.d, lambda, rng, stk,
+                                       Renderer::Transport::Radiance);
                 ray = st.ray;
                 thr *= st.scale;
                 break;
@@ -1612,13 +1612,13 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 break;
             }
             case MatType::Dielectric: {
-                // Nested dielectrics by priority (Renderer::dielectricStep); this camera-side
+                // Nested dielectrics by priority (Renderer::interfaceStep); this camera-side
                 // walk carries radiance across a refraction -- and SPECGATHER takes the factor at
                 // each photon's own wavelength, as it does every spectral factor of the walk (a
                 // dispersive index makes it one).
                 const Renderer::InterfaceStep st =
-                    mats.dielectricStep(scene, m, (int)(&m - scene.mats.data()), h, ray.d, lambda,
-                                        rng, stk, Renderer::Transport::Radiance);
+                    mats.interfaceStep(scene, m, h, ray.d, lambda, rng, stk,
+                                       Renderer::Transport::Radiance);
                 ray = st.ray;
                 thr *= st.scale;
                 if (st.refracted)

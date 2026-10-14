@@ -32,7 +32,13 @@ and requires:
      has no fallback, renders in mode R once a mode-M camera's strip has removed the fire -- and
      says so; until 0.377.3 it reported that it could not strip, and fell back to R;
  13. mode W's `-ambient` fills a floor the fire alone lights (its scale counts the fire as a
-     light); until 0.377.3 it was zero there, so `-ambient 0.3` changed nothing.
+     light); until 0.377.3 it was zero there, so `-ambient 0.3` changed nothing;
+ 14. a fire that emits nothing (`emission_scale 0`) is smoke, said so at load: mode M renders it
+     (until 0.378.5 it refused "volumetric emission" for a scene with no fire in it);
+ 15. a fire whose only hot voxels are two pinpoints at opposite corners of a 128^3 grid -- too
+     small for the 20000 random points that estimate a fire's mean emission -- is still a fire:
+     mode B, whose photons are born in it, renders its glow (until 0.378.5 the estimate read 0
+     and the fire was dropped: the image was exactly black).
 (Mode C is left out: its physical catch through the aperture almost never sees a fire this
 small at a test budget.) Exits 1 on any failure.
 """
@@ -121,13 +127,29 @@ def main():
     for name, cams in scenes.items():
         with open(os.path.join(d, name), "w", encoding="utf-8", newline="") as f:
             f.write(NL.join(cams + medium) + NL)
+    # 14: the fire made cold by its scale.
+    with open(os.path.join(d, "firecold.ftsl"), "w", encoding="utf-8", newline="") as f:
+        f.write(NL.join(scenes["fire.ftsl"] + [ln.replace("emission_scale 4", "emission_scale 0")
+                                                for ln in medium]) + NL)
+    # 15: two single hot voxels at opposite corners of a 128^3 temperature grid, in thin fog.
+    spots = np.zeros((128, 128, 128))
+    spots[3, 3, 3] = spots[124, 124, 124] = 1.0
+    write_vdb(os.path.join(d, "spots.vdb").replace(chr(92), "/"),
+              [VolumeGrid("temperature", spots, box)])
+    with open(os.path.join(d, "firespots.ftsl"), "w", encoding="utf-8", newline="") as f:
+        f.write(NL.join(scenes["fire.ftsl"] + [
+            'medium {',
+            '    sigma_t 0.1   albedo 0.5',
+            '    temperature vdb:spots.vdb',
+            '    emission blackbody   emission_kelvin 1500   emission_scale 4',
+            '}']) + NL)
 
-    def run(tag, args, scene="fire.ftsl", meter=False, out=None):
+    def run(tag, args, scene="fire.ftsl", meter=False, out=None, n=2000000):
         png = os.path.join(d, (out or tag) + ".png")
         for p in (png, png[:-4] + ".pfm"):
             if os.path.exists(p):
                 os.remove(p)
-        r = subprocess.run([a.exe, "-in", scene, "-device", "cpu", "-spp", "4", "-n", "2000000",
+        r = subprocess.run([a.exe, "-in", scene, "-device", "cpu", "-spp", "4", "-n", str(n),
                             "-hdr", "-o", tag + ".png"] + ([] if meter else ["-no-meter"]) + args,
                            cwd=d, capture_output=True, text=True, encoding="utf-8", errors="replace")
         pfm = png[:-4] + ".pfm"
@@ -226,6 +248,20 @@ def main():
     ok &= good
     print("%s: -ambient fills a fire-lit floor in mode W (means %s -> %s)" % (
         "ok" if good else "FAIL", m0, m1))
+    rc, log, mean = run("cold_M", ["-mode", "M"], scene="firecold.ftsl")
+    good = rc == 0 and "rendering it as smoke" in log and "volumetric emission" not in log
+    ok &= good
+    print("%s: a fire with emission_scale 0 is smoke, and mode M renders it (exit %d)" % (
+        "ok" if good else "FAIL", rc))
+    if not good:
+        print(log[-1200:])
+    rc, log, mean = run("spots_B", ["-mode", "B"], scene="firespots.ftsl", n=20000000)
+    good = rc == 0 and mean is not None and mean > 0.0 and "rendering it as smoke" not in log
+    ok &= good
+    print("%s: a fire of two pinpoint hot voxels is a fire, and mode B renders its glow "
+          "(exit %d, mean %s)" % ("ok" if good else "FAIL", rc, mean))
+    if not good:
+        print(log[-1200:])
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

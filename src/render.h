@@ -2343,23 +2343,19 @@ struct Renderer {
                                 double& lambda, MediumStack& stk, Pcg32& rng,
                                 EnergyReport& e) const {
         switch (m.type) {
-            case MatType::Dielectric: {
-                // Nested dielectrics by priority (dielectricStep). A photon carries flux:
-                // a refraction does not rescale it. Lossless (absorption applied per segment).
-                ray = dielectricStep(scene, m, (int)(&m - scene.mats.data()), h, ray.d, lambda,
-                                     rng, stk, Transport::Flux).ray;
-                return true;
-            }
+            case MatType::Dielectric:
             case MatType::ThinFilm:
             case MatType::Multilayer: {
-                // Iridescent coating or a multilayer (Bragg / dichroic) stack: specular
-                // reflect-or-refract with the interference reflectance (structural colour).
-                // An absorbing substrate or stack absorbs the transmitted fraction here.
-                const InterfaceStep st = coatStep(scene, m, h, ray.d, lambda, rng, stk,
-                                                  Transport::Flux);
+                // A dielectric body's surface, plain or coated (interfaceStep): nested bodies by
+                // priority; a coating reflects with its interference reflectance (structural
+                // colour), and an absorbing substrate or stack absorbs what it transmits. A
+                // photon carries flux: a refraction does not rescale it. Lossless on survival
+                // (absorption inside is applied per segment).
+                const InterfaceStep st = interfaceStep(scene, m, h, ray.d, lambda, rng, stk,
+                                                       Transport::Flux);
                 if (st.absorbed) { e.absorbed += beta; return false; }
                 ray = st.ray;
-                return true;                     // lossless on survival; beta unchanged
+                return true;
             }
             case MatType::Mirror: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
@@ -2915,7 +2911,7 @@ struct Renderer {
         // cap can send it back to the single-scatter rule once it is spent.
         int beamScatters = 0;
         // Chord PROVENANCE for `-sunnee` (photonbeams.h PhotonBeam::srcEm / surf): the emitter
-        // this photon was born on and the surface interactions it has made so outer.
+        // this photon was born on and the surface interactions it has made so far.
         int surfHits = 0;
 
         // CAUSTIC classification state (mode M's two-map split; see photonVertexKind above).
@@ -4069,9 +4065,9 @@ struct Renderer {
     // substrate: reflect iff R >= 0.5, weight R or 1-R. Without this, thin film was a
     // material that stayed NOISY in the noise-free preview.
     //
-    // `extIor` is the index of the medium on the far side of the coating (coatStep's
+    // `extIor` is the index of the medium on the far side of the coating (interfaceStep's
     // exteriorIor; 1 in air), and `transmitted` / `radianceScale` report a refraction as
-    // refractOrReflect does. Called through coatStep.
+    // refractOrReflect does. Called through interfaceStep.
     bool thinFilmInterface(const Scene& scene, const Material& m, const Hit& h, const Vec3& d,
                            double lambda, Pcg32& rng, Ray& out, double extIor,
                            bool* transmitted, double* whittedWeight,
@@ -4134,7 +4130,7 @@ struct Renderer {
     //     (opaque structural colour: beetle/Morpho on an absorbing base).
     // Returns false when the photon is absorbed (caller terminates the path).
     // `whittedWeight`, `extIor`, `transmitted`, `radianceScale`: as thinFilmInterface. Called
-    // through coatStep.
+    // through interfaceStep.
     bool multilayerInterface(const Material& m, const Hit& h, const Vec3& d,
                              double lambda, Pcg32& rng, Ray& out, double extIor,
                              bool* transmitted, double* whittedWeight,
@@ -4198,25 +4194,26 @@ struct Renderer {
         return true;
     }
 
-    // --- Interface steps: every host walk's way through a dielectric or a coated surface ------
+    // --- The interface step: every host walk's way through a dielectric body's surface --------
     // Which quantity a walk carries across an interface: a camera-side walk carries RADIANCE,
     // which a refraction scales by (n_from / n_to)^2 -- radiance over n^2 is what a ray conserves
-    // there -- and a light-side walk carries FLUX, which it does not (RADIANCE-ETA2). Both steps
-    // below take one, so a walk cannot leave the factor out by omission.
+    // there -- and a light-side walk carries FLUX, which it does not (RADIANCE-ETA2). The step
+    // takes one, so a walk cannot leave the factor out by omission.
     enum class Transport { Radiance, Flux };
 
     // What a step did. `ray` continues the walk (the incoming direction, straight on, at a
     // suppressed boundary); `scale` is the throughput factor -- (n_from / n_to)^2 for a Radiance
-    // walk that refracted, 1 otherwise; `whittedWeight` mode W's Fresnel weight for the branch it
-    // took (1 at a pass-through and at total internal reflection); `extMat` the material whose
-    // index the far side had (-1: air, or the flat model -- index 1).
+    // walk that refracted, 1 otherwise; `whittedWeight` mode W's branch weight (1 at a
+    // pass-through and at total internal reflection); `extMat` the material whose index the far
+    // side had (-1: air, or the flat model -- index 1); `absorbed` when an opaque coating or
+    // substrate took the ray (the walk ends there).
     struct InterfaceStep {
         Ray ray;
         double scale = 1.0;
         double whittedWeight = 1.0;
         bool entering = false;      // met the surface from outside the material
         bool refracted = false;     // crossed into the other medium
-        bool absorbed = false;      // an opaque coating took the ray (coatStep only)
+        bool absorbed = false;
         int extMat = -1;
     };
 
@@ -4234,56 +4231,52 @@ struct Renderer {
         return (extMat >= 0) ? scene.mats[(size_t)extMat].ior(lambda) : 1.0;
     }
 
-    // One dielectric interface for every host walk, the twin of the device's dDielectricStep:
-    // the nested-dielectric PRIORITY rule (Schmidt & Budge 2002) -- the far side's index from the
-    // enclosing medium (exteriorIor), a boundary of no higher priority than the medium it lies in
-    // suppressed (straight on), `stk` kept -- then refractOrReflect. `mi` is m's index in
-    // scene.mats (Mix/Layered aware); `whitted` asks for mode W's deterministic branch.
-    InterfaceStep dielectricStep(const Scene& scene, const Material& m, int mi, const Hit& h,
-                                 const Vec3& d, double lambda, Pcg32& rng, MediumStack& stk,
-                                 Transport tr, bool whitted = false) const {
+    // One surface of a dielectric body -- plain (Dielectric), or coated with a thin film
+    // (ThinFilm) or a multilayer stack (Multilayer) -- for every host walk; the twin of the
+    // device's dDielectricStep. First the nested-dielectric PRIORITY rule (Schmidt & Budge 2002):
+    // the far side's index from the enclosing medium (exteriorIor), and a boundary of no higher
+    // priority than the medium it lies in suppressed -- the ray goes straight on. Then the
+    // material's own interface: refractOrReflect, or the coating's interference reflectance
+    // (thinFilmInterface, multilayerInterface). A body the ray enters goes on `stk` and comes off
+    // when it leaves, a coated one as a glass one does -- so the walk inside knows its index (mode
+    // W's localN2), and a body inside it ranks against it. `m` must be an element of scene.mats
+    // (a Mix/Layered leaf is); `whitted` asks for mode W's deterministic branch.
+    InterfaceStep interfaceStep(const Scene& scene, const Material& m, const Hit& h, const Vec3& d,
+                                double lambda, Pcg32& rng, MediumStack& stk, Transport tr,
+                                bool whitted = false) const {
+        const long long mi = &m - scene.mats.data();
+        if (mi < 0 || mi >= (long long)scene.mats.size())
+            throw std::logic_error("Renderer::interfaceStep: material not in scene.mats");
         InterfaceStep st;
         st.entering = dot(d, h.ng) < 0.0;
         // The far side: the medium the ray comes from when it enters, the one it returns to when
-        // it leaves (the stack without mi).
+        // it leaves (the stack without m).
         MediumStack after;
-        if (!st.entering) { after = stk; after.popMat(mi); }
+        if (!st.entering) { after = stk; after.popMat((int)mi); }
         const MediumStack& outer = st.entering ? stk : after;
         bool ranked = false;
         const double extIor = exteriorIor(scene, m, outer, lambda, st.extMat, &ranked);
         if (ranked && outer.topMat() >= 0 && m.priority <= outer.topPri()) {   // suppressed
-            if (st.entering) stk.push(mi, m.priority); else stk.popMat(mi);
+            if (st.entering) stk.push((int)mi, m.priority); else stk.popMat((int)mi);
             st.ray = Ray{h.p + d * 1e-6, d};
             st.extMat = -1;
             return st;
         }
         bool transmitted = false;
         double rs = 1.0;
-        st.ray = refractOrReflect(scene, m, h, d, lambda, rng, &transmitted, extIor,
-                                  whitted ? &st.whittedWeight : nullptr, &rs);
-        st.refracted = transmitted;
-        if (tr == Transport::Radiance) st.scale = rs;
-        if (transmitted) { if (st.entering) stk.push(mi, m.priority); else stk.popMat(mi); }
-        return st;
-    }
-
-    // A thin-film or multilayer surface, the same way: its far side is the top of `stk` (a
-    // coated body is not on the stack), by exteriorIor's rule. `absorbed` when an opaque coating
-    // or substrate took the ray (the walk ends).
-    InterfaceStep coatStep(const Scene& scene, const Material& m, const Hit& h, const Vec3& d,
-                           double lambda, Pcg32& rng, const MediumStack& stk, Transport tr,
-                           bool whitted = false) const {
-        InterfaceStep st;
-        st.entering = dot(d, h.ng) < 0.0;
-        const double extIor = exteriorIor(scene, m, stk, lambda, st.extMat);
-        bool transmitted = false;
-        double rs = 1.0;
         double* wW = whitted ? &st.whittedWeight : nullptr;
-        st.absorbed = (m.type == MatType::ThinFilm)
-            ? !thinFilmInterface(scene, m, h, d, lambda, rng, st.ray, extIor, &transmitted, wW, &rs)
-            : !multilayerInterface(m, h, d, lambda, rng, st.ray, extIor, &transmitted, wW, &rs);
+        if (m.type == MatType::ThinFilm)
+            st.absorbed = !thinFilmInterface(scene, m, h, d, lambda, rng, st.ray, extIor,
+                                             &transmitted, wW, &rs);
+        else if (m.type == MatType::Multilayer)
+            st.absorbed = !multilayerInterface(m, h, d, lambda, rng, st.ray, extIor,
+                                               &transmitted, wW, &rs);
+        else
+            st.ray = refractOrReflect(scene, m, h, d, lambda, rng, &transmitted, extIor, wW, &rs);
+        if (st.absorbed) return st;
         st.refracted = transmitted;
         if (tr == Transport::Radiance) st.scale = rs;
+        if (transmitted) { if (st.entering) stk.push((int)mi, m.priority); else stk.popMat((int)mi); }
         return st;
     }
 

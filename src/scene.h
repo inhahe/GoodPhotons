@@ -5,6 +5,7 @@
 #include <memory>
 #include <climits>
 #include <cstdlib>
+#include <cstdio>
 #include <stdexcept>
 #include <atomic>
 #include <unordered_map>
@@ -1030,10 +1031,7 @@ struct Emitter {
         if (uuOut) *uuOut = 0.0;
         if (vvOut) *vvOut = 0.0;
         if (shape == EmitterShape::Sphere) {
-            double z = 1.0 - 2.0 * u1;                 // cos(theta) uniform in [-1,1]
-            double r = std::sqrt(std::max(0.0, 1.0 - z * z));
-            double phi = 2.0 * PI * u2;
-            Vec3 d{r * std::cos(phi), r * std::sin(phi), z};
+            const Vec3 d = uniformSphere(u1, u2);
             nOut = d;                                  // unit outward normal
             y = origin + d * radius;
         } else if (shape == EmitterShape::Cylinder) {
@@ -1590,7 +1588,7 @@ struct Scene {
                         bmin.z + ext.z * (k + u3) / gres[2]);
         }
         double cellPdf(const Vec3& x) const {
-            if (!(cellSum > 0.0)) return 0.0;
+            if (cellCdf.empty()) throw std::logic_error("EmissiveVolume::cellPdf before buildFireCells");
             const Vec3 ext = bmax - bmin;
             int c[3];
             for (int a = 0; a < 3; ++a) {
@@ -1835,7 +1833,9 @@ struct Scene {
     // The world box outside which VdbGrid::sample of `g` is exactly 0 -- the positive voxels'
     // lattice box grown by one voxel, since the field is trilinear -- and the shortest world edge
     // of a voxel. False when no voxel is positive.
-    static bool vdbPositiveBox(const VdbGrid& g, Vec3& lo, Vec3& hi, double& voxelMin) {
+    // `idxLo` / `idxHi`, when given, receive the inclusive voxel index range of the positive voxels.
+    static bool vdbPositiveBox(const VdbGrid& g, Vec3& lo, Vec3& hi, double& voxelMin,
+                               int* idxLo = nullptr, int* idxHi = nullptr) {
         int i0 = g.nx, j0 = g.ny, k0 = g.nz, i1 = -1, j1 = -1, k1 = -1;
         for (int k = 0; k < g.nz; ++k)
             for (int j = 0; j < g.ny; ++j)
@@ -1846,6 +1846,8 @@ struct Scene {
                     k0 = std::min(k0, k); k1 = std::max(k1, k);
                 }
         if (i1 < 0) return false;
+        if (idxLo) { idxLo[0] = i0; idxLo[1] = j0; idxLo[2] = k0; }
+        if (idxHi) { idxHi[0] = i1; idxHi[1] = j1; idxHi[2] = k1; }
         // The lattice -> world map, the inverse of g.ainv (world = w0 + A (lattice + imin)).
         const double* m = g.ainv;
         const double det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) +
@@ -1876,25 +1878,59 @@ struct Scene {
         return true;
     }
 
+    // A fire medium's emission integrated over the band, as a function of temperature (it is a
+    // function of temperature alone): tabulated once at 129 temperatures up to emitKelvin, linear
+    // between them.
+    struct BandPower {
+        static constexpr int NT = 128;
+        double emitKelvin = 0.0;
+        double tab[NT + 1] = {};
+        explicit BandPower(const Medium& m) : emitKelvin(m.emitKelvin) {
+            for (int t = 0; t <= NT; ++t) {
+                const double kelvin = m.emitKelvin * t / NT;
+                double s = 0.0;
+                for (double lam = LAMBDA_MIN + 2.5; lam < LAMBDA_MAX; lam += 5.0)
+                    s += m.emissionAtKelvin(kelvin, lam) * 5.0;
+                tab[t] = s;
+            }
+        }
+        double operator()(double kelvin) const {
+            if (!(kelvin > 0.0) || !(emitKelvin > 0.0)) return 0.0;
+            const double f = std::min(kelvin / emitKelvin, 1.0) * NT;
+            const int t = std::min((int)f, NT - 1);
+            return tab[t] + (tab[t + 1] - tab[t]) * (f - t);
+        }
+    };
+
+    // The band-averaged emission of a fire medium, averaged over its grid's voxels in the index
+    // range [idxLo - 1, idxHi + 1] the positive box covers (vdbPositiveBox) -- the deterministic
+    // stand-in for finalizeEmissiveVolumes' random estimate when a hot core too small for its
+    // points leaves that at 0. A voxel's temperature is its value scaled as temperatureAt scales
+    // it (the grid's trilinear lookup reads exactly that at a voxel centre).
+    static double meanKeByVoxels(const Medium& m, const int idxLo[3], const int idxHi[3]) {
+        const VdbGrid& g = *m.temperature;
+        const BandPower power(m);
+        const double peak = (m.tempPeak > 0.0) ? m.tempPeak : 1.0;
+        const int n[3] = {g.nx, g.ny, g.nz};
+        int a[3], z[3];
+        for (int c = 0; c < 3; ++c) { a[c] = std::max(idxLo[c] - 1, 0); z[c] = std::min(idxHi[c] + 1, n[c] - 1); }
+        double sum = 0.0;
+        long long cnt = 0;
+        for (int k = a[2]; k <= z[2]; ++k)
+            for (int j = a[1]; j <= z[1]; ++j)
+                for (int i = a[0]; i <= z[0]; ++i) {
+                    const double raw = halfBitsToFloat(g.data[((size_t)k * g.ny + j) * g.nx + i]);
+                    sum += power(m.emitKelvin * (raw > 0.0 ? raw : 0.0) / peak);
+                    ++cnt;
+                }
+        return cnt ? sum / (double)cnt / (LAMBDA_MAX - LAMBDA_MIN) : 0.0;
+    }
+
     // The coarse emission grid of a fire (EmissiveVolume::cellW): cells about two voxels wide (at
     // most 16 a side), each weighted by the mean, over a 3x3x3 lattice of points in it, of the
-    // emission integrated over the band -- a function of temperature alone, tabulated once.
+    // emission integrated over the band (BandPower).
     static void buildFireCells(const Medium& m, EmissiveVolume& ev) {
-        constexpr int NT = 128;
-        double powerT[NT + 1];
-        for (int t = 0; t <= NT; ++t) {
-            const double kelvin = m.emitKelvin * t / NT;
-            double s = 0.0;
-            for (double lam = LAMBDA_MIN + 2.5; lam < LAMBDA_MAX; lam += 5.0)
-                s += m.emissionAtKelvin(kelvin, lam) * 5.0;
-            powerT[t] = s;
-        }
-        auto power = [&](double kelvin) {
-            if (!(kelvin > 0.0) || !(m.emitKelvin > 0.0)) return 0.0;
-            const double f = std::min(kelvin / m.emitKelvin, 1.0) * NT;
-            const int t = std::min((int)f, NT - 1);
-            return powerT[t] + (powerT[t + 1] - powerT[t]) * (f - t);
-        };
+        const BandPower power(m);
         const Vec3 ext = ev.bmax - ev.bmin;
         const double cellTarget = (ev.voxel > 0.0) ? 2.0 * ev.voxel : 1e300;
         for (int a = 0; a < 3; ++a)
@@ -1938,17 +1974,27 @@ struct Scene {
         totalEmissionPower = 0.0;
         const double lamMin = LAMBDA_MIN, lamMax = LAMBDA_MAX, dLam = lamMax - lamMin;
         for (size_t mi = 0; mi < media.size(); ++mi) {
-            const Medium& m = media[mi];
+            Medium& m = media[mi];
             if (!m.emissive() || !m.temperature) continue;
             const VdbGrid& g = *m.temperature;
+            // A medium whose grid emits nothing in the band (emission_scale 0, emission_kelvin 0,
+            // no voxel above 0) stops claiming to be a fire: its temperature goes, so emissive()
+            // -- which every mode's refusal and the device gates read -- agrees with the fires
+            // registered here, and it renders as the smoke it is made of.
+            auto cold = [&](const char* why) {
+                std::fprintf(stderr, "[fire] medium %zu has a temperature grid but emits nothing "
+                                     "(%s); rendering it as smoke\n", mi, why);
+                m.temperature.reset();
+            };
             // The box the fire can emit in: outside it the temperature, and so the emission, is
             // exactly 0. Births, the mean below, and mode R's light sampling all use it, so none
             // spends its samples on the grid's cold margins.
             Vec3 lo, hi;
             double voxel = 0.0;
-            if (!vdbPositiveBox(g, lo, hi, voxel)) continue;   // nothing above 0: no emission
+            int idxLo[3], idxHi[3];
+            if (!vdbPositiveBox(g, lo, hi, voxel, idxLo, idxHi)) { cold("no voxel above 0"); continue; }
             double V = (hi.x-lo.x) * (hi.y-lo.y) * (hi.z-lo.z);
-            if (V <= 0.0) continue;
+            if (V <= 0.0) { cold("its hot voxels span no volume"); continue; }
             // Stratified-ish MC of emissionAt over the AABB × spectral band.
             Pcg32 rng(0x1234abcdu ^ (uint32_t)mi, 0x9e3779b9u);
             const int NS = 20000;
@@ -1961,7 +2007,9 @@ struct Scene {
                 sum += m.emissionAt(p, lam);
             }
             double meanKe = sum / NS;
-            if (meanKe <= 0.0) continue;   // grid is entirely cold → no emission
+            // A hot core too small for the random points: every voxel instead.
+            if (!(meanKe > 0.0)) meanKe = meanKeByVoxels(m, idxLo, idxHi);
+            if (!(meanKe > 0.0)) { cold("zero emission at every voxel -- emission_scale or emission_kelvin 0?"); continue; }
             EmissiveVolume ev;
             ev.mediumIndex = (int)mi;
             ev.bmin = lo; ev.bmax = hi;
@@ -2242,12 +2290,9 @@ struct Scene {
     // it is a uniform sphere direction (pdfW = 1/4pi).
     Vec3 sampleEnvDir(Pcg32& rng, double& pdfW) const {
         if (envMap) return envMap->sample(rng.uniform(), rng.uniform(), pdfW);
-        double u1 = rng.uniform(), u2 = rng.uniform();
-        double z = 1.0 - 2.0 * u1;
-        double r = std::sqrt(std::max(0.0, 1.0 - z * z));
-        double phi = 2.0 * PI * u2;
+        const double u1 = rng.uniform(), u2 = rng.uniform();
         pdfW = 1.0 / (4.0 * PI);
-        return Vec3{r * std::cos(phi), r * std::sin(phi), z};
+        return uniformSphere(u1, u2);
     }
     double envPdfDir(const Vec3& d) const {
         return envMap ? envMap->pdf(d) : 1.0 / (4.0 * PI);

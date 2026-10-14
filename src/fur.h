@@ -210,11 +210,9 @@ inline double furTargetArea(const FurSurface& s) {
 inline void furSampleRoot(const FurSurface& s, const FurAreaCdf& cdf, Pcg32& rng,
                           Vec3& p, Vec3& n) {
     if (s.isSphere) {
-        // Uniform on the sphere: z uniform in [-1,1], azimuth uniform (Archimedes).
-        const double z = 1.0 - 2.0 * rng.uniform();
-        const double r = std::sqrt(std::max(0.0, 1.0 - z * z));
-        const double ph = 2.0 * kPi * rng.uniform();
-        n = Vec3(r * std::cos(ph), r * std::sin(ph), z);
+        // Uniform on the sphere (Archimedes).
+        const double u1 = rng.uniform(), u2 = rng.uniform();
+        n = uniformSphere(u1, u2);
         p = s.center + n * s.radius;
         return;
     }

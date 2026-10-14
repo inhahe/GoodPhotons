@@ -469,12 +469,14 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             }
             break;
         }
-        case MatType::Dielectric: {
-            // Nested dielectrics by priority (Renderer::dielectricStep); `transport` says
-            // whether the walk carries radiance (the camera's) or flux (the light's).
+        case MatType::Dielectric:
+        case MatType::ThinFilm:
+        case MatType::Multilayer: {
+            // A dielectric body's surface, plain or coated (Renderer::interfaceStep); `transport`
+            // says whether the walk carries radiance (the camera's) or flux (the light's).
             const Renderer::InterfaceStep st =
-                mats.dielectricStep(scene, *mp, (int)(mp - scene.mats.data()), h, rayDir, lambda,
-                                    rng, stk, transport);
+                mats.interfaceStep(scene, *mp, h, rayDir, lambda, rng, stk, transport);
+            if (st.absorbed) { terminate = true; break; }
             wi = st.ray.d; betaFactor = st.scale; delta = true;
             break;
         }
@@ -498,14 +500,6 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
                 for (int i = 0; i < nSec; ++i)
                     secF[i] = clamp01(transmitSlot(scene, *mp, h, lamAll[i + 1]));
             }
-            break;
-        }
-        case MatType::ThinFilm:
-        case MatType::Multilayer: {
-            const Renderer::InterfaceStep st =
-                mats.coatStep(scene, *mp, h, rayDir, lambda, rng, stk, transport);
-            if (st.absorbed) { terminate = true; break; }
-            wi = st.ray.d; betaFactor = st.scale; delta = true;
             break;
         }
         case MatType::Grating: {

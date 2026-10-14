@@ -30,7 +30,8 @@ RADIANCE-ETA2). Going into a body and out again it cancels; ending inside one, i
      (`priority 2`) around a smaller diffuse one, so the camera's second interface refracts
      water to glass, (1.333 / 1.5)^2 by the priority rule: modes M and S against mode R -- a
      factor that ignored the exterior index (refracting by it all the same) would put M and S
-     x0.56 off on the inner ball, while R, crossing out again, would not notice.
+     x0.56 off on the inner ball, while R, crossing out again, would not notice; and the same
+     with the glass ball thin-film-coated (4b), whose interface takes the water's index too.
 In the tank mode M also runs with its final gather (-pmfg 4), a walk of its own. (Not in the nested
 scene: there the gather sees the glass ball's caustic, too heavy-tailed for two seeds.)
 Modes D and U run at mode R's depth (-max-bounce 32): light trapped in the water by total internal
@@ -116,13 +117,16 @@ SUBMERGED = [ln for ln in TANK if ln != TANK_LAMP] + [
     'light area { origin -0.15 0.8 -0.15  u 0.3 0 0  v 0 0 0.3  normal 0 -1 0  power 50  '
     'spd preset:d65 }']
 
-# 4. The tank with ranked dielectrics: the water holds a glass ball around a smaller diffuse one.
+# 4. The tank with ranked dielectrics: the water holds a glass ball around a smaller diffuse one --
+#    and (4b) the same with the ball a thin-film-coated one, ranked the same way.
 NESTED = [{'material "water" { type dielectric  ior 1.333 }':
            'material "water" { type dielectric  ior 1.333  priority 1 }',
            'sphere { center 0 0.4 0  radius 0.25  material white }':
            'sphere { center 0 0.4 0  radius 0.2  material white }'}.get(ln, ln) for ln in TANK] + [
     'material "glass" { type dielectric  ior 1.5  priority 2 }',
     'sphere { center 0 0.4 0  radius 0.3  material glass }']
+NESTED_COAT = [('material "glass" { type thinfilm  ior 1.5  film_ior 1.3  film_thickness 300  '
+                'priority 2 }') if ln.startswith('material "glass"') else ln for ln in NESTED]
 
 
 def main():
@@ -138,11 +142,11 @@ def main():
     for name, lines in (("lamp_in_glass.ftsl", LAMP_IN_GLASS), ("lamp_in_film.ftsl", LAMP_IN_FILM),
                         ("lamp_in_stack.ftsl", LAMP_IN_STACK), ("glass_seen.ftsl", GLASS_SEEN),
                         ("tank.ftsl", TANK), ("submerged.ftsl", SUBMERGED),
-                        ("nested.ftsl", NESTED)):
+                        ("nested.ftsl", NESTED), ("nested_coat.ftsl", NESTED_COAT)):
         with open(os.path.join(d, name), "w", encoding="utf-8", newline="") as f:
             f.write(NL.join(lines) + NL)
 
-    def render(tag, scene, args, device="cpu"):
+    def render(tag, scene, args, device="cpu", spp=None):
         """Two seeds of one configuration; a device render must say it ran on the GPU (mode M
         logs `[gpu]` lines, modes U and S name the device they run on -- `VCM/UPS on`, `SPPM
         on` -- and the others print a `-> GPU` device line)."""
@@ -154,7 +158,7 @@ def main():
                 if os.path.exists(f):
                     os.remove(f)
             cmd = [a.exe, "-in", scene, "-device", device, "-seed", str(seed), "-hdr", "-no-meter",
-                   "-spp", str(a.spp), "-o", png] + args
+                   "-spp", str(spp or a.spp), "-o", png] + args
             p = subprocess.run(cmd, cwd=d, capture_output=True, text=True, encoding="utf-8",
                                errors="replace")
             if p.returncode != 0 or not os.path.exists(pfm):
@@ -181,7 +185,8 @@ def main():
     modeD = ["-mode", "D"] + deep
     modeU = ["-mode", "U", "-pmradiusfrac", "0.005"] + deep
     modeM = ["-mode", "M", "-n", "20000000"]
-    modeMfg = ["-mode", "M", "-n", "20000000", "-pmfg", "4", "-spp", str(max(a.spp // 4, 1))]
+    modeMfg = ["-mode", "M", "-n", "20000000", "-pmfg", "4"]     # at a quarter of the spp
+    sppFg = max(a.spp // 4, 1)
     modeS = ["-mode", "S", "-n", "2000000"]
 
     lamp = "lamp_in_glass.ftsl"
@@ -203,7 +208,7 @@ def main():
     tank = "tank.ftsl"
     rt = render("tank_R", tank, ["-mode", "R"])
     mt = render("tank_M", tank, modeM)
-    mft = render("tank_Mfg", tank, modeMfg)
+    mft = render("tank_Mfg", tank, modeMfg, spp=sppFg)
     st = render("tank_S", tank, modeS)
     pairs += [("tank: mode M / mode R", mt, rt, 0.05),
               ("tank: mode M -pmfg 4 / mode R", mft, rt, 0.05),
@@ -214,6 +219,10 @@ def main():
     rn = render("nest_R", nest, ["-mode", "R"])
     pairs += [("nested: mode M / mode R", render("nest_M", nest, modeM), rn, 0.05),
               ("nested: mode S / mode R", render("nest_S", nest, modeS), rn, 0.05)]
+    coat = "nested_coat.ftsl"
+    rc = render("ncoat_R", coat, ["-mode", "R"])
+    pairs += [("nested coat: mode M / mode R", render("ncoat_M", coat, modeM), rc, 0.05),
+              ("nested coat: mode S / mode R", render("ncoat_S", coat, modeS), rc, 0.05)]
     sub = "submerged.ftsl"
     rs = render("sub_R", sub, ["-mode", "R"])
     ds = render("sub_D", sub, modeD)
@@ -235,7 +244,7 @@ def main():
         pairs += [("tank: mode M on the ball, device / host",
                    ball(render("tank_Mg", tank, modeM, "gpu")), ball(mt), 0.05),
                   ("tank: mode M -pmfg 4 on the ball, device / host",
-                   ball(render("tank_Mfgg", tank, modeMfg, "gpu")), ball(mft), 0.05),
+                   ball(render("tank_Mfgg", tank, modeMfg, "gpu", spp=sppFg)), ball(mft), 0.05),
                   ("tank: mode S, device / host", render("tank_Sg", tank, modeS, "gpu"), st, 0.05),
                   ("submerged lamp: mode D, device / host",
                    render("sub_Dg", sub, modeD, "gpu"), ds, 0.05),

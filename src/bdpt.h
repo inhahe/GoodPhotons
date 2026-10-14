@@ -1283,12 +1283,14 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                     secF[i] = clamp01(reflectSlot(scene, *mp, h, hb.lam[i + 1]));
                 break;
             }
-            case MatType::Dielectric: {
-                // Nested dielectrics by priority (Renderer::dielectricStep). The eye walk carries
-                // radiance across a refraction, the light walk flux (`transport`).
+            case MatType::Dielectric:
+            case MatType::ThinFilm:
+            case MatType::Multilayer: {
+                // A dielectric body's surface, plain or coated (Renderer::interfaceStep). The eye
+                // walk carries radiance across a refraction, the light walk flux (`transport`).
                 const Renderer::InterfaceStep st =
-                    mats.dielectricStep(scene, *mp, (int)(mp - scene.mats.data()), h, ray.d,
-                                        lambda, rng, stk, transport);
+                    mats.interfaceStep(scene, *mp, h, ray.d, lambda, rng, stk, transport);
+                if (st.absorbed) { terminate = true; break; }
                 wi = st.ray.d; betaFactor = st.scale; delta = true;
                 break;
             }
@@ -1311,14 +1313,6 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 keepBundle = true; secChromatic = true;
                 for (int i = 0; i + 1 < nUp; ++i)
                     secF[i] = clamp01(transmitSlot(scene, *mp, h, hb.lam[i + 1]));
-                break;
-            }
-            case MatType::ThinFilm:
-            case MatType::Multilayer: {
-                const Renderer::InterfaceStep st =
-                    mats.coatStep(scene, *mp, h, ray.d, lambda, rng, stk, transport);
-                if (st.absorbed) { terminate = true; break; }
-                wi = st.ray.d; betaFactor = st.scale; delta = true;
                 break;
             }
             case MatType::Grating: {
@@ -3879,9 +3873,11 @@ struct BdptRenderer {
                             const int k = sg.vert;              // the eye vertex it leaves from
                             if (k < 0 || k >= nE || k > maxDepth) continue;
                             const double perUp = 1.0 / sg.nUp;
-                            const Vertex& vk = eye[(size_t)k];
-                            const double gateK = vk.delta ? 0.0 : 1.0;  // connecting X to eye[k]
-                            const double invFwdK = 1.0 / misRemap0(vk.pdfFwd);
+                            // eye[k]'s part, copied: the -misaudit gate below may grow `eye`.
+                            const Vec3 pK = eye[(size_t)k].p, nsK = eye[(size_t)k].ns;
+                            const bool surfK = eye[(size_t)k].onSurface();
+                            const double gateK = eye[(size_t)k].delta ? 0.0 : 1.0;  // X to eye[k]
+                            const double invFwdK = 1.0 / misRemap0(eye[(size_t)k].pdfFwd);
                             const double sumK = segSumC[(size_t)k];
                             for (int f = 0; f < (int)scene.emissiveVolumes.size(); ++f) {
                                 const Scene::EmissiveVolume& fv = scene.emissiveVolumes[(size_t)f];
@@ -3901,28 +3897,56 @@ struct BdptRenderer {
                                         double w = 1.0;              // the camera ray: s + t == 2
                                         if (k >= 1) {
                                             const Vec3 x = sg.o + sg.d * s;
-                                            const Vec3 e = x - vk.p;
+                                            const Vec3 e = x - pK;
                                             const double d2 = dot(e, e);
                                             const double invD2 = (d2 > 0.0) ? 1.0 / d2 : 0.0;
+                                            const double pdfFwdX = sg.pdfDir * invD2 * lineDens;
                                             const double rX = misRemap0(pickF * fireOriginPdf(fv, x)) /
-                                                              misRemap0(sg.pdfDir * invD2 * lineDens);
-                                            const double cosK = vk.onSurface()
-                                                ? std::fabs(dot(vk.ns, e)) * std::sqrt(invD2) : 1.0;
+                                                              misRemap0(pdfFwdX);
+                                            const double cosK = surfK
+                                                ? std::fabs(dot(nsK, e)) * std::sqrt(invD2) : 1.0;
                                             const double rK = misRemap0(invD2 / (4.0 * PI) * cosK) * invFwdK;
                                             w = 1.0 / (1.0 + rX * (gateK + rK * sumK));
+                                            // Gate (2), off unless `-misaudit`: this O(1) form against
+                                            // misWeight itself, with X installed as the eye subpath's
+                                            // last vertex (misWeight audits its own relative form too).
+                                            if (misaudit::enabled.load(std::memory_order_relaxed)) {
+                                                Vertex X, unused;
+                                                X.type = VType::Light; X.fire = f; X.p = x;
+                                                X.pdfFwd = pdfFwdX;
+                                                const size_t slot = (size_t)k + 1;
+                                                double wRef;
+                                                if (slot < eye.size()) {
+                                                    ScopedAssign<Vertex> put(&eye[slot], X);
+                                                    wRef = misWeight(scene, cam, light, eye, unused, 0,
+                                                                     k + 2, hb.lam[0], mk);
+                                                } else {
+                                                    eye.push_back(X);
+                                                    wRef = misWeight(scene, cam, light, eye, unused, 0,
+                                                                     k + 2, hb.lam[0], mk);
+                                                    eye.pop_back();
+                                                }
+                                                const double den = std::max(std::fabs(w), std::fabs(wRef));
+                                                misaudit::nChecked.fetch_add(1, std::memory_order_relaxed);
+                                                misaudit::note(den > 0.0 ? std::fabs(w - wRef) / den : 0.0,
+                                                               0, k + 2);
+                                            }
                                         }
-                                        // A non-finite weight or transmittance would poison the
-                                        // pixel for the rest of the render; the connections drop
-                                        // theirs the same way.
                                         const double sc = w * dt * T * perUp;
-                                        if (!(sc > 0.0) || !std::isfinite(sc)) return;
+                                        if (!(sc > 0.0)) return;
                                         Vec3 c = cie[0] * (sg.beta * med.emissionAtKelvin(kelvin, hb.lam[0]) *
                                                            hb.invPdf[0]);
                                         for (int i = 0; i + 1 < sg.nUp; ++i)
                                             c = c + cie[i + 1] * (sg.betaSec[i] *
                                                                   med.emissionAtKelvin(kelvin, hb.lam[i + 1]) *
                                                                   hb.invPdf[i + 1]);
-                                        fireXYZ = fireXYZ + c * sc;
+                                        // A non-finite point -- weight, transmittance or the eye's
+                                        // throughput -- would poison the pixel for the rest of the
+                                        // render; the connections drop theirs the same way.
+                                        const Vec3 add = c * sc;
+                                        const double tot = add.x + add.y + add.z;
+                                        if (!(tot > 0.0) || !std::isfinite(tot)) return;
+                                        fireXYZ = fireXYZ + add;
                                     });
                             }
                         }
