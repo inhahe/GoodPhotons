@@ -292,4 +292,16 @@ struct EmissionSampler {
         const int b = static_cast<int>(t);
         return (cdf[b + 1] - cdf[b]) / step;
     }
+
+    // The probability that sample() draws below `lambda`: the CDF, linear within a bin as the
+    // draw is. 0 below the range, 1 above it.
+    double cdfAt(double lambda) const {
+        const int n = static_cast<int>(cdf.size()) - 1;
+        if (n <= 0) return 0.0;
+        const double t = (lambda - LAMBDA_MIN) / step;
+        if (!(t > 0.0)) return 0.0;
+        if (t >= (double)n) return 1.0;
+        const int b = static_cast<int>(t);
+        return cdf[b] + (t - b) * (cdf[b + 1] - cdf[b]);
+    }
 };

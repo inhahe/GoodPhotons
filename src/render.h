@@ -4044,9 +4044,13 @@ struct Renderer {
     // factor (n_from / n_to)^2 if it refracted -- what mode M's spectral gather folds per photon
     // (stepFactorAt, InterfaceStep::factor). A refraction that cannot happen at that wavelength --
     // past its critical angle, or into a substrate that absorbs there -- has probability 0.
-    static double branchFactor(const InterfaceOptics& o, bool refracted) {
+    static double branchProb(const InterfaceOptics& o, bool refracted) {
         if (!refracted) return o.R;
-        return (o.opaque || o.tir) ? 0.0 : (1.0 - o.R) * o.eta * o.eta;
+        return (o.opaque || o.tir) ? 0.0 : 1.0 - o.R;
+    }
+    static double branchFactor(const InterfaceOptics& o, bool refracted) {
+        const double p = branchProb(o, refracted);
+        return refracted ? p * o.eta * o.eta : p;
     }
 
     // --- The interface step: every host walk's way through a dielectric body's surface --------
@@ -4061,7 +4065,8 @@ struct Renderer {
     // walk that refracted, 1 otherwise; `whittedWeight` mode W's branch weight (1 at a
     // pass-through and at total internal reflection); `factor` the branch's probability times
     // (n_from / n_to)^2 if it refracted, at the walk's own wavelength (branchFactor: 1 at a
-    // pass-through) -- what stepFactorAt gives at any other; `extMat` the material whose index
+    // pass-through) -- what stepFactorAt gives at any other, and `prob` the branch's probability
+    // alone (the same, short of the radiance factor); `extMat` the material whose index
     // the far side had (-1: air, or the flat model -- index 1); `absorbed` when an opaque coating
     // or substrate took the ray (the walk ends there).
     struct InterfaceStep {
@@ -4069,6 +4074,7 @@ struct Renderer {
         double scale = 1.0;
         double whittedWeight = 1.0;
         double factor = 1.0;
+        double prob = 1.0;
         bool entering = false;      // met the surface from outside the material
         bool refracted = false;     // crossed into the other medium
         bool suppressible = false;  // the priority rule suppresses it wherever its coat is clear
@@ -4135,7 +4141,7 @@ struct Renderer {
             else if (rng.uniform() >= o.R) { st.absorbed = true; return st; }
             const Vec3 out = normalize(reflect(d, o.nl));
             st.ray = Ray{h.p + out * 1e-6, out};
-            st.factor = o.R;
+            st.factor = st.prob = o.R;
             return st;
         }
         Vec3 out;
@@ -4159,6 +4165,7 @@ struct Renderer {
         }
         st.ray = Ray{h.p + out * 1e-6, out};
         st.factor = branchFactor(o, st.refracted);
+        st.prob = branchProb(o, st.refracted);
         // Radiance over n^2 is what a ray conserves across a refraction, so a camera-side walk,
         // which carries radiance, takes (n_from / n_to)^2 there, and a light-side one, which
         // carries flux, does not (RADIANCE-ETA2). It cancels for a ray that goes into a body and
@@ -4177,13 +4184,21 @@ struct Renderer {
     // there (a coat opaque at one wavelength and clear at another is a medium only at the
     // second). Folded against st.factor, its value at the walk's own
     // wavelength, it re-expresses the step's coin at each photon's: a coat's interference colour
-    // lives entirely in that coin, a dispersive index's partly.
+    // lives entirely in that coin, a dispersive index's partly. `prob`, if given, receives the
+    // branch's probability alone at L (SpecThr::mulCoin; st.prob at the walk's wavelength).
     double stepFactorAt(const Scene& scene, const Material& m, const InterfaceStep& st,
-                        const Hit& h, const Vec3& d, double L) const {
-        if (st.suppressible && !m.coatOpaque(L)) return st.passThrough ? 1.0 : 0.0;
-        if (st.passThrough) return 0.0;
-        const double ne = (st.extMat >= 0) ? scene.mats[(size_t)st.extMat].ior(L) : 1.0;
-        return branchFactor(interfaceOptics(scene, m, h, d, ne, L), st.refracted);
+                        const Hit& h, const Vec3& d, double L, double* prob = nullptr) const {
+        double f;
+        if (st.suppressible && !m.coatOpaque(L)) f = st.passThrough ? 1.0 : 0.0;
+        else if (st.passThrough) f = 0.0;
+        else {
+            const double ne = (st.extMat >= 0) ? scene.mats[(size_t)st.extMat].ior(L) : 1.0;
+            const InterfaceOptics o = interfaceOptics(scene, m, h, d, ne, L);
+            if (prob) *prob = branchProb(o, st.refracted);
+            return branchFactor(o, st.refracted);
+        }
+        if (prob) *prob = f;                             // a pass-through's factor is its probability
+        return f;
     }
 
     // The square of the index of the medium a path is in (the top of its stack; 1 in air): what

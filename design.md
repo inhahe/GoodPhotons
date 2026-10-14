@@ -1047,6 +1047,24 @@ the strands' hue moved from 64 deg to 54 deg against the molded base's 43 deg (G
 camera wavelength. `photonGatherSub` (the final-gather sub-walk) carries no `SpecThr` and keeps the
 scalar fold. `FTRACE_HAIR_SPECGATHER=0` disables the fold for paired measurements.
 
+**Coins (0.381.2, MODE-M-FOLD-SUPPORT).** A branch the walk chose by a coin -- reflect or refract at
+a dielectric or coated surface (`Renderer::stepFactorAt`), reflect or transmit at a half mirror --
+folds as `mulCoin`: its factor at each bin (probability times any weight) into `v`, and its
+probability alone into a second per-bin product `p` (and `pcam` at the walk's wavelength). Folding
+p_L / p_walk re-expresses the walk at L only where L allows every branch the walk took and so does
+the walk's own wavelength; a walk cannot sample a branch its wavelength forbids. Where some bin
+cannot take the walk's branches (`partial`: a coat opaque at some wavelengths, total internal
+reflection at some), `ratio()` divides instead by the branches' probability averaged over the
+density the walk's wavelength was drawn from (the emission sampler: sum_k Q_k p[k], Q_k its mass in
+bin k): every walk wavelength shares that denominator, so the walks that can take the branches
+stand in for those that cannot. Whether a walk is partial depends on its branches alone, never on
+its wavelength, so the exact importance ratio (where the support is whole) and the averaged one
+(where it is not) combine without bias; the average is taken at bin centres, the carrier's own
+resolution. A half mirror folds its coin since then too (a coloured one reflected every photon
+wavelength by the walk's reflectance). A layered coat's coin (its Fresnel reflectance) is still
+taken at the walk's wavelength: it varies only with the coat's dispersion, a few tenths of a
+percent. `tools/check_coat_modes.py` holds both to mode R.
+
 **HAIR-NEE (0.334.0).** Mode M's walk collects radiance only where it finally gathers -- a
 diffuse surface -- so a chain that scatters strand to strand through a hair mass lands on the
 shadowed scalp or dress beneath it, and the mass's own lit glow (direct light scattered by the
@@ -2334,11 +2352,11 @@ whole interference colour, a dispersive Fresnel term) times the radiance factor.
 wavelengths and opaque at others (a `substrate_k` that is zero over part of the band) is a medium
 only where it is clear, so the priority rule suppresses it only there: the step records whether
 the rule applies (`suppressible`), and at a wavelength whose clarity differs from the walk's, the
-branch the walk took has probability 0. (The fold is still biased there, as wherever the branches a
-step can take depend on the wavelength: known-issues MODE-M-FOLD-SUPPORT.)
+branch the walk took has probability 0; the carrier then averages the branches' probability over
+the walk's wavelengths (SPECGATHER, coins).
 Modes M and S send coated bodies through it too (until 0.378.5 their camera walks bounced off a
 coat as off a half mirror). The device's twin is `dDielectricStep` (with `dExteriorIor`,
-`dInterfaceOptics`, the `DStepRecord` it fills and `dStepFactorAt`, folded through `DSpecThr::mul`), whose `radianceScale` argument -- non-null on a
+`dInterfaceOptics`, the `DStepRecord` it fills and `dStepFactorAt`, folded through `DSpecThr::mulCoin`), whose `radianceScale` argument -- non-null on a
 camera-side walk -- every caller states, as `dVcmScatter`'s callers do. Like a glass body, a
 coated one must be closed: a ray that refracts in through an open surface stays "inside" it.
 Mode W's two air-unit quantities, its 1/512 throughput cutoff and its flat `-ambient` fill, are

@@ -963,7 +963,25 @@ struct SpecThr {
     // the cancellation failed and the estimate detonated (a JH white measured 6e5 x mode D).
     double cam = 1.0;
     bool   any = false;                          // anything non-flat folded in? (else ratio == 1)
-    SpecThr() { for (int k = 0; k < K; ++k) v[k] = 1.0; }
+    // The coins the walk tossed (mulCoin), apart from their weights: per bin, the product of the
+    // probabilities of the branches taken (`p`), and the same at the walk's own wavelength
+    // (`pcam`). Folding p_L / p_walk per coin, as `v` / `cam` do, re-expresses the walk at L only
+    // where every branch it took is possible at L and at the walk's wavelength alike -- a walk
+    // cannot sample a branch its own wavelength forbids. Where some bin cannot take the walk's
+    // branches (`partial`: a coat opaque at some wavelengths, total internal reflection at some),
+    // ratio() divides instead by the probability of the branches averaged over the density the
+    // walk's wavelength is drawn from (`walkDensity`: sum_k Q_k p[k]), which every walk wavelength
+    // shares, so the walks that can take them stand in for the ones that cannot
+    // (MODE-M-FOLD-SUPPORT). Whether a walk is partial depends only on its branches, never on its
+    // wavelength, so the two rules combine without bias.
+    double p[K];
+    double pcam = 1.0;
+    bool   partial = false;
+    double pscale = 1.0;                         // pcam / sum_k Q_k p[k] once partial
+    const EmissionSampler* walkDensity = nullptr;
+    explicit SpecThr(const EmissionSampler* walk = nullptr) : walkDensity(walk) {
+        for (int k = 0; k < K; ++k) { v[k] = 1.0; p[k] = 1.0; }
+    }
     static double lamOf(int k) {
         return LAMBDA_MIN + (k + 0.5) * (LAMBDA_MAX - LAMBDA_MIN) / (double)K;
     }
@@ -999,12 +1017,59 @@ struct SpecThr {
             v[k] *= vk[k];
         }
     }
+    // Fold in a coin the walk tossed: f(lambda, prob) returns the branch's factor at lambda (its
+    // probability times any weight -- Renderer::stepFactorAt) and sets `prob` to its probability
+    // alone; factorAtCam / probAtCam are the same at the walk's wavelength. Without `exhaustive`,
+    // mul's three-point probe: a factor flat there is folded as the constant it is (it cancels).
+    // `exhaustive` asks every bin first, where a branch impossible in a narrow band could slip past
+    // the probe (a coated surface, a half mirror), and skips a coin flat in all of them -- it
+    // cancels, and a coin no fold took before must leave the carrier as it was.
+    template <class F> void mulCoin(const F& f, double factorAtCam, double probAtCam,
+                                    bool exhaustive) {
+        double pr;
+        if (!exhaustive) {
+            const double a = f(lamOf(0), pr), b = f(lamOf(K / 2), pr), c = f(lamOf(K - 1), pr);
+            const double tol = 1e-12 * (1.0 + std::fabs(a));
+            if (std::fabs(a - b) <= tol && std::fabs(a - c) <= tol) {
+                cam *= factorAtCam;
+                for (int k = 0; k < K; ++k) v[k] *= a;
+                return;
+            }
+        } else {
+            const double a = f(lamOf(0), pr);
+            const double tol = 1e-12 * (1.0 + std::fabs(a));
+            int k = 1;
+            while (k < K && std::fabs(f(lamOf(k), pr) - a) <= tol) ++k;
+            if (k == K) return;
+        }
+        cam *= factorAtCam;
+        pcam *= probAtCam;
+        any = true;
+        for (int k = 0; k < K; ++k) {
+            v[k] *= f(lamOf(k), pr);
+            p[k] *= pr;
+            if (!(pr > 0.0)) partial = true;
+        }
+        if (partial && walkDensity) {
+            // sum_k Q_k p[k], Q_k the walk density's mass in bin k. Zero only if no bin centre
+            // the walk could be drawn at takes these branches, which the walk itself just did:
+            // then the bins cannot resolve the support, and the walk's own probability serves.
+            double D = 0.0;
+            for (int k = 0; k < K; ++k) {
+                const double lo = LAMBDA_MIN + k * (LAMBDA_MAX - LAMBDA_MIN) / (double)K;
+                const double hi = LAMBDA_MIN + (k + 1) * (LAMBDA_MAX - LAMBDA_MIN) / (double)K;
+                D += (walkDensity->cdfAt(hi) - walkDensity->cdfAt(lo)) * p[k];
+            }
+            pscale = (D > 0.0) ? pcam / D : 1.0;
+        }
+    }
     // The correction a photon of wavelength `lamP` needs. Denominator is `cam`, so this
     // multiplied by `thr` leaves the walk's spectral factors evaluated at lamP and everything
-    // else untouched. A dead path (cam == 0) contributes nothing either way.
+    // else untouched; past a partial coin, times pscale (see `p`). A dead path (cam == 0)
+    // contributes nothing either way.
     double ratio(double lamP) const {
         if (!any) return 1.0;
-        return (cam > 1e-300) ? v[binOf(lamP)] / cam : 0.0;
+        return (cam > 1e-300) ? v[binOf(lamP)] / cam * pscale : 0.0;
     }
 };
 
@@ -1322,7 +1387,9 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
     const double normC = (causOn && pmC->nEmitted > 0 && areaC > 0.0)
                             ? 1.0 / (areaC * (double)pmC->nEmitted) : 0.0;
 
-    SpecThr sthr;    // SPECGATHER: the walk's spectral factors, beside the scalar `thr`
+    // SPECGATHER: the walk's spectral factors, beside the scalar `thr`; its wavelength came from
+    // the emission sampler (above).
+    SpecThr sthr(&scene.emitSampler);
     const bool volOn = (bm != nullptr) && !bm->empty() && !scene.media.empty();
     // -sunnee: the sun's single scatter is marched, not gathered (beamgather.h sunNeeMarch).
     // Not gated on the map being non-empty: erasing the direct-sun chords may have emptied it.
@@ -1618,14 +1685,23 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 if (st.absorbed) return L;
                 ray = st.ray;
                 thr *= st.scale;
-                sthr.mul([&](double Lw) { return mats.stepFactorAt(scene, m, st, h, d0, Lw); },
-                         st.factor);
+                sthr.mulCoin([&](double Lw, double& pr) {
+                    return mats.stepFactorAt(scene, m, st, h, d0, Lw, &pr);
+                }, st.factor, st.prob, m.type != MatType::Dielectric);
                 break;
             }
             case MatType::HalfMirror: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
-                if (rng.uniform() < r) ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
-                else                   ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                const bool refl = rng.uniform() < r;
+                if (refl) ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                else      ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                // SPECGATHER: the coin at each photon's wavelength -- a coloured half mirror
+                // reflects each wavelength by its own reflectance.
+                const double pc = refl ? r : 1.0 - r;
+                sthr.mulCoin([&](double Lw, double& pr) {
+                    const double rL = clamp01(reflectSlot(scene, m, h, Lw));
+                    return pr = refl ? rL : 1.0 - rL;
+                }, pc, pc, true);
                 break;
             }
             case MatType::Filter: {

@@ -20,6 +20,22 @@ And an OPAQUE coated ball -- a stack with an absorbing layer -- in a water tank 
 Mode R (host, and device unless --no-gpu) and mode D (host) must render it the same ranked below
 the water as above it. (Until 0.379.1 the priority rule suppressed it when it ranked no higher than
 the water, and the ball vanished.)
+And two scenes where a coin's branches, or their weights, depend on the wavelength, mode M (host,
+and device unless --no-gpu) against mode R per colour channel -- mode M's gather re-expresses its
+walk at every photon's wavelength, which a walk can do only for branches its own wavelength allows
+(SpecThr::mulCoin, known-issues MODE-M-FOLD-SUPPORT):
+  * that tank, framed close on a thin-film ball ranked as the water whose substrate absorbs above
+    595 nm: where it is clear a ray passes straight through, where it absorbs the coat reflects.
+    Mode R's tank is noisy (no light sampling reaches the lamp from under the water), so its
+    reference is the device's at 8192 spp (the host's at 1024 with --no-gpu). Until 0.381.2 mode
+    M read x0.50 in blue over the ball;
+  * a half mirror at 45 degrees that reflects red and passes cyan, reflecting a lit white wall
+    and, above the horizon, passing nothing but the dark: until 0.381.2 mode M took its coin at the
+    walk's wavelength for every photon, so the reflection came out in the mirror's average colour.
+  Both scenes put their spectral edge on a boundary of mode M's 24 carrier bins (595 nm: 360 +
+  12 x 470 / 24). The carrier takes each factor at its bin's centre for every photon in the bin
+  (known-issues SPECGATHER-BIN-RESOLUTION); an edge inside a bin is another error, and this check
+  is about the coins.
 A tile fails when the two differ by more than 5 standard errors (two seeds each) AND by more
 than 5 %. Exits 1 on any failure.
 """
@@ -66,6 +82,38 @@ def opaque_tank(priority):
     return out
 
 
+def partial_tank():
+    """The water tank framed close on its ball, a thin-film body ranked as the water is, on a
+    substrate that absorbs above 595 nm only: where it is clear the priority rule suppresses the
+    surface (inside the water it is no boundary at all), and where it absorbs the coat is opaque,
+    reflecting its interference colour."""
+    out = []
+    for ln in TANK:
+        if ln.startswith('camera'):
+            out.append('camera "c" { eye 0 0.45 -1.5  look_at 0 0.4 0  up 0 1 0  fov_y 26  '
+                       'film { res 64 48 } }')
+        elif ln.startswith('material "water"'):
+            out += ['material "water" { type dielectric  ior 1.333  priority 1 }',
+                    'material "redcoat" { type thinfilm  ior 1.5  film_ior 1.38  film_thickness 300'
+                    '  substrate_k table { 380:0 594.99:0 595.01:2 780:2 }  priority 1 }']
+        else:
+            out.append(ln.replace("radius 0.25  material white", "radius 0.25  material redcoat"))
+    return out
+
+
+HALF_MIRROR = [
+    'camera "c" { eye 0 0.6 -2.5  look_at 0 0.6 0  up 0 1 0  fov_y 30  film { res 64 48 } }',
+    'material "white" { type diffuse  reflect 0.7 }',
+    'material "redmirror" { type halfmirror  reflect table { 380:0.05 594.99:0.05 595.01:0.9 '
+    '780:0.9 } }',
+    'quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material white }',
+    'quad { origin 1.5 0 -3  u 0 3 0   v 0 0 6   material white }',
+    'quad { origin -0.6 0.05 -0.6  u 1.2 0 1.2  v 0 1.2 0  material redmirror }',
+    'light area { origin -0.5 2.4 -0.5  u 1 0 0  v 0 0 1  normal 0 -1 0  power 150  '
+    'spd preset:d65 }',
+]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split(NL)[0])
     ap.add_argument("--out", default=os.path.join(ROOT, "png", "check_coat_modes"))
@@ -81,6 +129,9 @@ def main():
     for pri in (1, 2):
         with open(os.path.join(d, "opaque_p%d.ftsl" % pri), "w", encoding="utf-8", newline="") as f:
             f.write(NL.join(opaque_tank(pri)) + NL)
+    for name, lines in (("partial", partial_tank()), ("halfmirror", HALF_MIRROR)):
+        with open(os.path.join(d, name + ".ftsl"), "w", encoding="utf-8", newline="") as f:
+            f.write(NL.join(lines) + NL)
 
     def render(tag, args, device="cpu"):
         """Two seeds of one configuration, as RGB images (render_seeds)."""
@@ -108,6 +159,17 @@ def main():
                                ["-mode", mode], dev, a.spp) for pri in (1, 2)]
         pairs.append(("opaque coat in water, mode %s%s: ranked below / above the water" % (
             mode, " (device)" if dev == "gpu" else ""), lo, hi))
+    for name, what, ref in (
+            ("partial", "coat opaque in the red only, in water",
+             (["-mode", "R"], "cpu", 1024) if a.no_gpu else (["-mode", "R"], "gpu", 8192)),
+            ("halfmirror", "half mirror reflecting red", (["-mode", "R"], "cpu", a.spp))):
+        rr = render_seeds(a.exe, d, name + ".ftsl", name + "_R", ref[0], ref[1], ref[2], rgb=True)
+        for dev in devs:
+            mm = render_seeds(a.exe, d, name + ".ftsl", name + "_M" + ("g" if dev == "gpu" else ""),
+                              modeM, dev, a.spp, rgb=True)
+            pairs += [("%s, mode M%s / mode R, channel %d" % (
+                what, " (device)" if dev == "gpu" else "", c), [x[..., c] for x in mm],
+                [x[..., c] for x in rr]) for c in range(3)]
     ok = True
     for name, x1, x0 in pairs:
         ratio, z, bad = tile_verdict(tile_stats(*x1), tile_stats(*x0), 0.05)

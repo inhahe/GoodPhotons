@@ -71,7 +71,7 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
-## OPEN (2026-10-14, next): MODE-M-FOLD-SUPPORT — mode M's spectral fold is biased where the branches a step can take depend on the wavelength
+## DONE (2026-10-14, 0.381.2): MODE-M-FOLD-SUPPORT — mode M's spectral fold was biased where the branches a step can take depend on the wavelength
 
 Mode M's camera walk runs at one wavelength and estimates every photon wavelength L from it: the
 spectral carrier (`SpecThr` / `DSpecThr`) folds each coin the walk tossed as p_L(branch) /
@@ -97,11 +97,47 @@ loss remains. Every scene whose coins keep the same branches at every wavelength
 and interference coin short of total internal reflection, every clear or opaque coat) is
 unaffected.
 
-**Fix:** divide not by the walk's own branch probability but by the branch sequence's probability
-averaged over the wavelengths the walk could have been drawn at -- a spectral MIS over the
-carrier's bins (one more per-bin product, of the coins' probabilities alone, beside the fold's
-`v`), on host and device. The test is in `scraps/face/check_coat_modes_partial.py`: mode M against
-mode R on that tank, which must pass once the fold is unbiased there.
+**Fixed in 0.381.2** (design.md, SPECGATHER, coins). A coin folds as `SpecThr::mulCoin` /
+`DSpecThr::mulCoin`: its factor into `v` as before, and its probability alone into a second per-bin
+product `p`. While every bin can take the walk's branches the ratio is the exact importance one, as
+before; once some bin cannot (`partial`), it divides by the branches' probability averaged over the
+emission sampler the walk's wavelength came from (sum_k Q_k p[k]). Which rule applies depends on the
+branches alone, so the two combine without bias, and nothing else moves: mode M on a Cornell box, a
+thin-film scene and fur is byte-identical on the host, and on dispersive glass 336 pixels of 256000
+change (x1.00009 over the frame) -- the walks near the critical angle. The same change folds the half
+mirror's coin, which mode M had never folded: a coloured half mirror reflected every photon
+wavelength by the walk's own reflectance, so its reflection came out in its average colour.
+
+`tools/check_coat_modes.py` now renders the tank with the coat's edge at 595 nm and a half mirror
+reflecting red above 595 nm, mode M host and device against mode R per channel. 0.381.1 fails all
+twelve pairs (the coat x0.42-0.62 at 34-50 sigma, the half mirror x0.47 in red and x14 in green);
+0.381.2 passes them. The edges sit on a carrier bin boundary: an edge inside a bin is the carrier's
+own resolution, SPECGATHER-BIN-RESOLUTION, found here. A layered coat's coin (its Fresnel
+reflectance) is still taken at the walk's wavelength; it varies only with the coat's dispersion.
+
+## OPEN (2026-10-14): SPECGATHER-BIN-RESOLUTION — mode M's spectral carrier takes every factor at its bin's centre, so a sharp spectral edge inside a bin biases the colour
+
+Mode M's camera walk re-expresses its spectral factors at each photon's wavelength through a 24-bin
+carrier (`SpecThr` / `DSpecThr`, 19.6 nm bins over 360-830 nm): a photon in bin k gets the factors
+evaluated at bin k's centre. Where a factor changes within a bin, the photons on the far side of the
+change get the wrong value, and because the colour-matching weights change across the bin too, the
+error does not average out within the bin: it lands on a channel.
+
+Measured with `check_coat_modes`' close-framed tank (a thin-film ball whose substrate absorbs above
+an edge; MODE-M-FOLD-SUPPORT's scene) at 0.381.2, mode M host against mode R, the ball's two upper
+tiles: the edge as a ramp from 555 to 585 nm, green **x1.063** (4.6 sigma); a sharp edge on a bin
+boundary (555.83 nm), green x1.012 / x1.027 (within noise); a sharp edge on a bin CENTRE (546.04 nm),
+green **x0.77** (16.8 sigma), blue x1.18. A half mirror whose reflectance ramps from 560 to 600 nm
+reads green x1.065 (3.8 sigma). Any spectral factor does it -- a filter or coloured glass with a
+sharp edge, an interference coat's fast oscillation, a step in `substrate_k` -- not only coins; a
+smooth factor (most reflectances, a Fresnel term) is not affected at this resolution.
+`check_coat_modes` puts its spectral edges on a bin boundary (595 nm) so it tests the coins and not
+this.
+
+**Possible fixes:** more bins (cost: K factor evaluations per spectral event, and the carrier's
+size on the device stack); interpolating `v` between bin centres at the photon's wavelength (halves
+the error at a step, removes it for a linear ramp, costs nothing); or bins placed per scene at the
+spectral edges the materials actually have.
 
 ## DONE (2026-10-14, 0.381.1): REVIEW-0380 — what the Opus and Fable reviews of 0.379.0-0.380.0 found
 

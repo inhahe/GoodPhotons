@@ -4124,21 +4124,28 @@ __device__ static DInterfaceOptics dInterfaceOptics(const DScene& sc, const DMat
     return o;
 }
 
-// The probability of the branch a step took at the wavelength `o` describes, times the radiance
-// factor (n_from / n_to)^2 if it refracted (host twin: Renderer::branchFactor).
-__device__ static double dBranchFactor(const DInterfaceOptics& o, bool refracted) {
+// The probability of the branch a step took at the wavelength `o` describes (dBranchProb), and
+// that times the radiance factor (n_from / n_to)^2 if it refracted (dBranchFactor; host twins:
+// Renderer::branchProb / branchFactor).
+__device__ static double dBranchProb(const DInterfaceOptics& o, bool refracted) {
     if (!refracted) return (double)o.R;
-    return (o.opaque || o.tir) ? 0.0 : (1.0 - (double)o.R) * (double)(o.eta * o.eta);
+    return (o.opaque || o.tir) ? 0.0 : 1.0 - (double)o.R;
+}
+__device__ static double dBranchFactor(const DInterfaceOptics& o, bool refracted) {
+    const double p = dBranchProb(o, refracted);
+    return refracted ? p * (double)(o.eta * o.eta) : p;
 }
 
 // What a dielectric step did (host twin Renderer::InterfaceStep): whether the ray crossed into
 // the other medium, whether the priority rule suppresses this boundary wherever its coat is clear
-// and whether the ray passed straight through it, the far side's material (-1: index 1), and the
-// branch's probability times the radiance factor (dBranchFactor; 1 at a pass-through).
+// and whether the ray passed straight through it, the far side's material (-1: index 1), the
+// branch's probability times the radiance factor (dBranchFactor; 1 at a pass-through), and the
+// probability alone (dBranchProb).
 struct DStepRecord {
     bool refracted = false, suppressible = false, pass = false;
     int farMat = -1;
     double factor = 1.0;
+    double prob = 1.0;
 };
 
 // One surface of a dielectric body -- plain, or coated with a thin film or a multilayer stack --
@@ -4184,7 +4191,7 @@ __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, con
         if (whittedWeight) *whittedWeight = (double)o.R;
         else if (rng.uniform() >= o.R) return false;
         outD = normalize(reflectv(d, o.nl)); outO = dOffsetAlong(h.p, h.ng, outD);
-        if (rec) rec->factor = (double)o.R;
+        if (rec) rec->factor = rec->prob = (double)o.R;
         return true;
     }
     DVec3 out;
@@ -4208,7 +4215,11 @@ __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, con
         }
     }
     if (radianceScale && refracted) *radianceScale = (double)(o.eta * o.eta);
-    if (rec) { rec->refracted = refracted; rec->factor = dBranchFactor(o, refracted); }
+    if (rec) {
+        rec->refracted = refracted;
+        rec->factor = dBranchFactor(o, refracted);
+        rec->prob = dBranchProb(o, refracted);
+    }
     if (refracted) { if (entering) stk.push(mi, m.priority); else stk.popMat(mi); }
     outD = out; outO = dOffsetAlong(h.p, h.ng, outD);
     return true;
@@ -15808,6 +15819,18 @@ __device__ static void dSunNeeMarch(const DScene& sc, const DVec3& oc, const DVe
 // wavelength, and that scalar then multiplied a photon sum spanning all of them. Exact for a flat
 // spectrum, wrong in either direction otherwise -- measured against mode D on one Cornell glossy
 // sphere: JH white 0.880x, JH red 1.142x, both ~1.00 after the fix.
+// The emission sampler's CDF at `lam` (host twin EmissionSampler::cdfAt): the probability that a
+// wavelength drawn by dSampleSceneLambda falls below it.
+__device__ static double dEmitCdfAt(const DScene& sc, double lam) {
+    const int n = sc.emitSamplerN;
+    if (n <= 0 || !sc.emitSamplerCdf) return 0.0;
+    const double t = (lam - DLMIN) / sc.emitSamplerStep;
+    if (!(t > 0.0)) return 0.0;
+    if (t >= (double)n) return 1.0;
+    const int b = (int)t;
+    return sc.emitSamplerCdf[b] + (t - b) * (sc.emitSamplerCdf[b + 1] - sc.emitSamplerCdf[b]);
+}
+
 struct DSpecThr {
     static const int K = 24;
     double v[K];
@@ -15818,7 +15841,19 @@ struct DSpecThr {
     // band edge the two disagree by orders of magnitude and the estimate detonates.)
     double cam;
     int    any;
-    __device__ void init() { for (int k = 0; k < K; ++k) v[k] = 1.0; cam = 1.0; any = 0; }
+    // The coins the walk tossed, apart from their weights (host twin SpecThr::p, where the reasoning
+    // lives): per bin the product of the branch probabilities, the same at the walk's wavelength,
+    // whether some bin cannot take the branches, and then pcam over the probability averaged over
+    // the emission sampler the walk's wavelength came from (MODE-M-FOLD-SUPPORT). Probabilities, so
+    // float: they enter only that average.
+    float  p[K];
+    double pcam;
+    int    partial;
+    double pscale;
+    __device__ void init() {
+        for (int k = 0; k < K; ++k) { v[k] = 1.0; p[k] = 1.0f; }
+        cam = 1.0; any = 0; pcam = 1.0; partial = 0; pscale = 1.0;
+    }
     __device__ static Real lamOf(int k) {
         return (Real)(DLMIN + (k + 0.5) * (DLMAX - DLMIN) / (double)K);
     }
@@ -15852,9 +15887,49 @@ struct DSpecThr {
         any = 1;
         for (int k = 0; k < K; ++k) v[k] *= f(lamOf(k));
     }
+    // Fold in a coin (host twin SpecThr::mulCoin): f(L, prob) the branch's factor at L, its
+    // probability alone in `prob`; the same at the walk's wavelength passed in. Without
+    // `exhaustive`, mul's probe; with it every bin is asked first and a coin flat in all of them
+    // is skipped.
+    template <class F> __device__ void mulCoin(const DScene& sc, const F& f, double factorAtCam,
+                                               double probAtCam, bool exhaustive) {
+        double pr;
+        if (!exhaustive) {
+            const double a = f(lamOf(0), pr), b = f(lamOf(K / 2), pr), c = f(lamOf(K - 1), pr);
+            const double tol = 1e-12 * (1.0 + fabs(a));
+            if (fabs(a - b) <= tol && fabs(a - c) <= tol) {
+                cam *= factorAtCam;
+                for (int k = 0; k < K; ++k) v[k] *= a;
+                return;
+            }
+        } else {
+            const double a = f(lamOf(0), pr);
+            const double tol = 1e-12 * (1.0 + fabs(a));
+            int k = 1;
+            while (k < K && fabs(f(lamOf(k), pr) - a) <= tol) ++k;
+            if (k == K) return;
+        }
+        cam *= factorAtCam;
+        pcam *= probAtCam;
+        any = 1;
+        for (int k = 0; k < K; ++k) {
+            v[k] *= f(lamOf(k), pr);
+            p[k] *= (float)pr;
+            if (!(pr > 0.0)) partial = 1;
+        }
+        if (partial) {
+            double D = 0.0;
+            for (int k = 0; k < K; ++k) {
+                const double lo = DLMIN + k * (DLMAX - DLMIN) / (double)K;
+                const double hi = DLMIN + (k + 1) * (DLMAX - DLMIN) / (double)K;
+                D += (dEmitCdfAt(sc, hi) - dEmitCdfAt(sc, lo)) * (double)p[k];
+            }
+            pscale = (D > 0.0) ? pcam / D : 1.0;
+        }
+    }
     __device__ double ratio(Real lamP) const {
         if (!any) return 1.0;
-        return (cam > 1e-300) ? v[binOf(lamP)] / cam : 0.0;
+        return (cam > 1e-300) ? v[binOf(lamP)] / cam * pscale : 0.0;
     }
 };
 
@@ -15873,13 +15948,22 @@ __device__ static void dSpecFold(DSpecThr& st, const DScene& sc, const DMaterial
 // times the radiance factor (n_from / n_to)^2 if it refracted. At a boundary the priority rule
 // suppresses wherever the coat is clear, 1 for a pass-through where it is clear at L and 0 for
 // any branch the walk could not have taken there. `st` is what the step recorded; folded against
-// its own `st.factor`.
+// its own `st.factor`. `prob`, if given, receives the branch's probability alone at L
+// (DSpecThr::mulCoin; st.prob at the walk's wavelength).
 __device__ static double dStepFactorAt(const DScene& sc, const DMaterial& m, const DHit& h,
-                                       const DVec3& d, const DStepRecord& st, Real L) {
-    if (st.suppressible && !dCoatOpaque(m, L)) return st.pass ? 1.0 : 0.0;
-    if (st.pass) return 0.0;
-    const Real ne = (st.farMat >= 0) ? specLookup(sc.mats[st.farMat].ior, L) : (Real)1;
-    return dBranchFactor(dInterfaceOptics(sc, m, h, d, ne, L), st.refracted);
+                                       const DVec3& d, const DStepRecord& st, Real L,
+                                       double* prob = nullptr) {
+    double f;
+    if (st.suppressible && !dCoatOpaque(m, L)) f = st.pass ? 1.0 : 0.0;
+    else if (st.pass) f = 0.0;
+    else {
+        const Real ne = (st.farMat >= 0) ? specLookup(sc.mats[st.farMat].ior, L) : (Real)1;
+        const DInterfaceOptics o = dInterfaceOptics(sc, m, h, d, ne, L);
+        if (prob) *prob = dBranchProb(o, st.refracted);
+        return dBranchFactor(o, st.refracted);
+    }
+    if (prob) *prob = f;                                 // a pass-through's factor is its probability
+    return f;
 }
 
 // The device twin of camMediaTrSpec (photonmap_render.h): one straight camera segment's media
@@ -16262,13 +16346,22 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 if (!dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr, &rs,
                                      &st)) return;
                 thr *= rs;                               // radiance across the interface
-                sthr.mul([&](Real L) { return dStepFactorAt(sc, m, h, d0, st, L); }, st.factor);
+                sthr.mulCoin(sc, [&](Real L, double& pr) {
+                    return dStepFactorAt(sc, m, h, d0, st, L, &pr);
+                }, st.factor, st.prob, m.type != D_DIELECTRIC);
                 ro = nro; rd = nrd; break;
             }
             case D_HALFMIRROR: {
                 Real r = clamp01(dReflectSlot(sc, m, h, lambda));
-                if (rng.uniform() < r) { rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); }
-                else                   { ro = dOffsetAlong(h.p, h.ng, rd); }
+                const bool refl = rng.uniform() < r;
+                if (refl) { rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); }
+                else      { ro = dOffsetAlong(h.p, h.ng, rd); }
+                // SPECGATHER: the coin at each photon's wavelength (host twin).
+                const double pc = refl ? (double)r : 1.0 - (double)r;
+                sthr.mulCoin(sc, [&](Real L, double& pr) {
+                    const double rL = (double)clamp01(dReflectSlot(sc, m, h, L));
+                    return pr = refl ? rL : 1.0 - rL;
+                }, pc, pc, true);
                 break;
             }
             case D_FILTER: {
