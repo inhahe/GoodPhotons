@@ -16478,8 +16478,11 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
         DVec3 rd = dir;
         int stored = 0;
         Real curveTmin = (Real)0;   // far-side fiber clearance for the NEXT hop (see the continuation)
+        // A light vertex reached over more than maxDepth - 1 edges joins no path short enough
+        // (host twin: traceLightSubpath).
+        const int lastEdge = ctx.maxDepth - 1;
 
-        for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
+        for (int edges = 1; edges <= lastEdge; ++edges) {
             DHit h = closestHit(sc, ro, rd, (curveTmin > (Real)0) ? (Real)0 : RAY_EPS, BIG, false, curveTmin);
             if (!h.valid) break;                          // escaped (no env in scope)
             {                                             // colored-glass Beer-Lambert (delta chains)
@@ -16603,7 +16606,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 }
             }
 
-            if (edges == ctx.maxDepth) break;
+            if (edges == lastEdge) break;
 
             DVec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
             double secF[SECN]; bool secChromatic = false, keepBundle = false;
@@ -22490,7 +22493,7 @@ struct VcmSession {
     size_t npix = 0;
     int  diffraction = 0;
     int  maxDepth = 8;
-    int  vcmCap = 8;              // max stored connectible vertices per light subpath (== maxDepth)
+    int  vcmCap = 8;              // max stored connectible vertices per light subpath (maxDepth - 1)
     int  heroC = 1;               // hero bundle width (1 == classic single-λ session)
     int  secStride = 0;           // heroC-1 secondary slots per stored vertex (0 when heroC==1)
     long long passes = 0;
@@ -22532,9 +22535,10 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
     VcmSession* s = new VcmSession();
     s->resX = resX; s->resY = resY; s->npix = (size_t)resX * resY;
     s->diffraction = diffraction ? 1 : 0;
-    s->maxDepth = (maxDepth > 0) ? maxDepth : 8;
-    // The light-vertex slab is npix * vcmCap * sizeof(DVcmLV) (~128 B) of DEVICE memory, so
-    // vcmCap == maxDepth would ask for 6.6 GB at 1100x733 and -max-bounce 64. Bound the slab
+    s->maxDepth = (maxDepth > 1) ? maxDepth : 9;     // EDGES: -max-bounce + 1
+    // A light subpath stores at most one vertex per edge up to maxDepth - 1 (kVcmLightT's
+    // lastEdge). The light-vertex slab is npix * vcmCap * sizeof(DVcmLV) (~128 B) of DEVICE
+    // memory, so that would ask for 6.6 GB at 1100x733 and -max-bounce 64. Bound the slab
     // by a byte budget instead and say so: a smaller cap only means the deepest light-subpath
     // vertices are not STORED for merging (paths still walk to maxDepth and still connect),
     // so the estimator stays unbiased, it just loses some of the merge strategies down there.
@@ -22542,11 +22546,12 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
         const size_t kSlabBudget = (size_t)768 << 20;   // 768 MB
         int capByMem = (int)(kSlabBudget / (s->npix * sizeof(gpu::DVcmLV)));
         if (capByMem < 4) capByMem = 4;
-        s->vcmCap = (s->maxDepth < capByMem) ? s->maxDepth : capByMem;
-        if (s->vcmCap < s->maxDepth)
+        const int maxStored = s->maxDepth - 1;
+        s->vcmCap = (maxStored < capByMem) ? maxStored : capByMem;
+        if (s->vcmCap < maxStored)
             std::printf("[mode U] light-vertex store capped at %d of %d vertices/subpath "
                         "(slab budget %zu MB at %dx%d)\n",
-                        s->vcmCap, s->maxDepth, kSlabBudget >> 20, resX, resY);
+                        s->vcmCap, maxStored, kSlabBudget >> 20, resX, resY);
     }
     // Hero bundle width. The kernels are templated on the SECONDARY slot count, so a C==1
     // session instantiates kVcm*T<0>: no sec slab, no per-λ arrays, no extra registers.

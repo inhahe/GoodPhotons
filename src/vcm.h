@@ -523,7 +523,7 @@ struct PassCtx {
     double misVmWeight = 0.0;   // etaVCM = pi r^2 nLightPaths
     double vmNorm = 0.0;        // 1 / etaVCM (merge density normaliser)
     double imagePlaneDist = 0.0;// resX / (2 tanHalfX), for camera importance
-    int    maxDepth = 8;        // max path length in edges
+    int    maxDepth = 9;        // max path length in EDGES: -max-bounce + 1
     bool   diffraction = true;
 };
 
@@ -636,7 +636,10 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
     Vec3 prevP = y;
     Ray ray{y + nOut * 1e-6, dir};
 
-    for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
+    // A light vertex reached over more than maxDepth - 1 edges joins no path short enough: a merge
+    // adds at least one camera edge to it, the camera splat (t = 1) exactly one.
+    const int lastEdge = ctx.maxDepth - 1;
+    for (int edges = 1; edges <= lastEdge; ++edges) {
         Hit h = scene.closestHit(ray);
         if (!h.valid) return;                    // escaped (no env in scope)
         {
@@ -777,7 +780,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
             }
         }
 
-        if (edges == ctx.maxDepth) return;       // no room to continue
+        if (edges == lastEdge) return;           // no room to continue
 
         // Sample a continuation direction.
         Vec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;

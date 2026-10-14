@@ -17808,7 +17808,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                  "or D (BDPT) instead.\n", unsupported);
             return 1;
         }
-        int maxDepth = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;  // full path length in edges
+        // VCM counts a path's length in EDGES; -max-bounce counts its scattering vertices, as in
+        // every other mode, and a path of N of them has N + 1 edges.
+        const int maxBounce = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
+        const int maxEdges = maxBounce + 1;
         double R0 = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                           : scene.sceneRadius * g_pmRadiusFactor;
         // Hero-wavelength bundle (Wilkie 2014). Mode U's scene scope already excludes
@@ -17828,12 +17831,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             const bool wantAuto = !std::strcmp(device, "auto");
             if ((wantGpu || wantAuto) && !cam.hasLens() &&
                 cudaAvailable() && cudaVcmSupported(scene)) {
-                VcmSession* sess = vcmSessionBegin(scene, cam, res, resY, diffraction, maxDepth,
+                VcmSession* sess = vcmSessionBegin(scene, cam, res, resY, diffraction, maxEdges,
                                                    vcmHeroC);
                 if (sess) {
                     std::printf("mode U: VCM/UPS on %s — connections + merging, R0=%.4g, "
-                                "alpha=%.2f at %dx%d (maxDepth=%d, light=%s, %s) ...\n",
-                                cudaDeviceName(), R0, g_vcmAlpha, res, resY, maxDepth, lightLabel,
+                                "alpha=%.2f at %dx%d (max-bounce %d, light=%s, %s) ...\n",
+                                cudaDeviceName(), R0, g_vcmAlpha, res, resY, maxBounce, lightLabel,
                                 vcmHeroC > 1
                                     ? (std::string("hero C=") + std::to_string(vcmHeroC)).c_str()
                                     : "single-lambda");
@@ -17868,8 +17871,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         }
 #endif
         std::printf("mode U: VCM/UPS — connections + merging, R0=%.4g, alpha=%.2f at %dx%d on "
-                    "%d CPU threads (maxDepth=%d, light=%s, %s) ...\n",
-                    R0, g_vcmAlpha, res, resY, nThreads, maxDepth, lightLabel,
+                    "%d CPU threads (max-bounce %d, light=%s, %s) ...\n",
+                    R0, g_vcmAlpha, res, resY, nThreads, maxBounce, lightLabel,
                     vcmHeroC > 1 ? (std::string("hero C=") + std::to_string(vcmHeroC)).c_str()
                                  : "single-lambda");
         vcm::VcmState st; st.init(res, resY);
@@ -17880,7 +17883,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 double it = (double)(st.passes + 1);
                 double radius = R0 * std::pow(it, 0.5 * (g_vcmAlpha - 1.0));
                 if (radius <= 0.0) radius = R0;
-                vcm::vcmPass(scene, cam, st, radius, nThreads, diffraction, maxDepth,
+                vcm::vcmPass(scene, cam, st, radius, nThreads, diffraction, maxEdges,
                              (uint64_t)(st.passes + 1), vcmHeroC);
                 disp = vcm::vcmResolve(st);
                 for (auto& v : disp.xyz) v = v * (double)st.passes;   // undone by /sppDone

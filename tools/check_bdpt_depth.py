@@ -1,4 +1,4 @@
-"""Regression check: modes D and J's paths of exactly the maximum depth carry their full weight.
+"""Regression check: modes D, J and U render every path up to -max-bounce, at its full weight.
 
     D:/python314/python.exe -u tools/check_bdpt_depth.py [--out <dir>] [--exe ftrace.exe]
                                                          [--spp N] [--no-gpu]
@@ -17,6 +17,8 @@ host and, unless --no-gpu, the device. Mode D read x0.936 and x0.987 of R; mode 
 x0.94 at the default merge radius. Mode J merges at a quarter of it here -- at the default, its
 point merges' own density-estimation bias reads ~1 % bright near the corners, which is not what
 this checks -- where it read x0.984 and x0.995 (14 and 6 sigma), their share being smaller.
+Mode U (VCM, merging at the same quarter radius) is held to the same: its -max-bounce counted
+path edges, one bounce fewer than every other mode's (x0.41 of R at -max-bounce 1).
 A tile fails when the two differ by more than 5 standard errors (two seeds each) AND by more
 than 2 %; the frame, by more than 5 standard errors AND 0.5 %. Exits 1 on any failure.
 """
@@ -68,7 +70,7 @@ def main():
     pairs = []
     for depth in ("1", "2"):
         r = render("r_" + depth, ["-mode", "R", "-max-bounce", depth])
-        for mode in ("D", "J"):
+        for mode in ("D", "J", "U"):
             # Mode J's point merges (and mode U's) at a quarter of the default radius: at the
             # default, their O(r^2) density-estimation bias reads ~1 % bright near the corners,
             # up to x1.03 on a tile, which this check is not about.

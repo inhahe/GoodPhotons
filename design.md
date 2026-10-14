@@ -8057,8 +8057,12 @@ as the one at fault.
   instantiated — `BDPT_MAXDEPTH` (8, bit-for-bit the old kernel, still the default launch)
   and `BDPT_DEEPDEPTH` (64), the deep one launched only when `-max-bounce > 8`. GPU mode U
   additionally bounds its light-vertex slab (`npix * vcmCap * sizeof(DVcmLV)`) by a 768 MB
-  budget and reports when `vcmCap < maxDepth`; that only drops merge candidates at the
-  deepest vertices, leaving the estimator unbiased. Why it matters: a specular cavity has a
+  budget and reports when that cap is under the light walk's own (`maxDepth - 1` edges); the
+  unstored deepest vertices then lose their merges and connections while every strategy's MIS
+  weight still counts them, so a capped render reads dark at those depths (known-issues
+  VCM-SLAB-CAP). Mode U counts a path's length in EDGES internally, so `-max-bounce N` is
+  `N + 1` of them there (0.379.2; it was `N`, one bounce fewer than every other mode). Why it
+  matters: a specular cavity has a
   photon mean free path of `1/(1-R)` bounces — ~33 for silver — so truncating at 8 does not
   dim such a scene, it deletes it (`scenes/mirror_sphere_interior.ftsl` goes from 97% pure
   black at depth 8 to 29% at depth 64).

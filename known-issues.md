@@ -98,15 +98,31 @@ Opus (max) reviewed the batch first (its follow-ups are 0.378.6); Fable (xhigh) 
 * Dismissed: an open coated surface leaves a stack entry behind (as Opus had raised) -- FTSL.md
   now says a clear coated surface is a body's and should be closed; a free film is `ior 1`.
 
-## OPEN (2026-10-14): VCM-DEPTH-EDGES — mode U's `-max-bounce` counted path edges, one more than every other mode
+## DONE (2026-10-14, 0.379.2): VCM-DEPTH-EDGES — mode U's `-max-bounce` counted path edges, one more than every other mode
 
 `vcm.h` and the device VCM take `maxDepth` as the longest path in EDGES (SmallVCM's
 convention), consistently across every strategy, so mode U at `-max-bounce N` rendered paths of at
 most N - 1 scattering vertices where modes R, D and J render N. Measured in
 `check_bdpt_depth.py`'s box: U at `-max-bounce 1` read x0.407 of R at 1 (only the lamp seen
 directly survives), and U at N + 1 matched R at N (x1.0007 at N = 1, x1.0008 at 2). Found while
-measuring J-SURF-DEPTH above. Fix: pass `-max-bounce + 1` edges, and stop the light walk one edge
-earlier, where its vertices can make no path at all.
+measuring J-SURF-DEPTH above. **Fixed in 0.379.2:** main.cpp passes `-max-bounce + 1` edges to
+both backends, and the light walk stops one edge short of that (`lastEdge`), where its vertices
+could join no path at all -- it used to trace and store one such vertex per subpath.
+`check_bdpt_depth.py` holds mode U to mode R as it does D and J.
+
+## OPEN (2026-10-14): VCM-SLAB-CAP — GPU mode U's capped light-vertex store under-weights the deepest paths
+
+`vcmSessionBegin` bounds the light-vertex slab by a 768 MB budget (`vcmCap`), and says so, when
+`npix * (maxDepth - 1) * sizeof(DVcmLV)` would exceed it -- a large frame at a deep
+`-max-bounce`. The vertices past the cap are not stored, so they can be neither merged with nor
+connected to from the camera side, but every strategy's MIS weight (the dVCM / dVC / dVM
+recurrences) still counts those techniques, so the paths through them are under-weighted: a dark
+bias at those depths, not the "fewer candidates, still unbiased" design.md used to claim.
+**Measured** (`scraps/face/vcm_slabcap_probe.py`: `check_bdpt_depth.py`'s box at `-max-bounce 8`,
+the frame mean at 1600x1600 -- capped at 4 of 8 vertices -- against the same view at 160x160):
+**x0.9893, 70 sigma** -- and the 768 MB budget caps a frame past roughly 0.8 Mpx at that depth, so
+this is every large GPU mode-U render, not a corner case. Fix options: a weight that knows the cap (the recurrences stop crediting merges and
+connections at light depths past it, as BDPT's do past `maxDepth`), or a slab paged per tile.
 
 ## OPEN (2026-10-14, tech debt): GPU-STACK-DRIFT — every kernel's stack reservation moves when unrelated device code changes
 
