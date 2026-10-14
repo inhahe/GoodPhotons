@@ -4146,17 +4146,20 @@ __device__ static bool multilayerInterface(const DMaterial& m, const DHit& h, co
 // branch and receives its weight (1 at a pass-through); `radianceScale` is non-null on a
 // camera-side walk, which carries radiance, and null on a light-side one, which carries flux --
 // every caller says which. `refractedOut` / `farMatOut`: whether the ray crossed into the other
-// medium and the far side's material (-1: index 1), for mode M's spectral gather (dEta2At).
+// medium, the far side's material (-1: index 1) and whether the boundary was suppressed, for mode
+// M's spectral gather (dStepFactorAt).
 // False when an opaque coating or substrate absorbed the ray.
 __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, const DHit& h,
                                        const DVec3& d, Real lambda, DRng& rng,
                                        int mi, DMediumStack& stk, DVec3& outO, DVec3& outD,
                                        double* whittedWeight, double* radianceScale,
-                                       bool* refractedOut = nullptr, int* farMatOut = nullptr) {
+                                       bool* refractedOut = nullptr, int* farMatOut = nullptr,
+                                       bool* passOut = nullptr) {
     if (whittedWeight) *whittedWeight = 1.0;
     if (radianceScale) *radianceScale = 1.0;
     if (refractedOut) *refractedOut = false;
     if (farMatOut) *farMatOut = -1;
+    if (passOut) *passOut = false;
     const bool entering = dot(d, h.ng) < 0;
     // The far side: the medium the ray comes from when it enters, the one it returns to when it
     // leaves (the stack without mi).
@@ -4167,6 +4170,7 @@ __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, con
     const Real extIor = dExteriorIor(sc, m, outer, lambda, extMat, ranked);
     if (ranked && outer.topMat() >= 0 && m.priority <= outer.topPri()) {   // suppressed
         if (entering) stk.push(mi, m.priority); else stk.popMat(mi);
+        if (passOut) *passOut = true;
         outD = d; outO = dOffsetAlong(h.p, h.ng, outD); return true;
     }
     bool transmitted = false; DVec3 nro, nrd;
@@ -14584,6 +14588,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
             for (int i = 0; mergeOn && i < nSegs; ++i) {
                 const DPathSeg& sg = segs[i];
                 if (!(sg.beta > 0.0)) continue;
+                if (sg.vert >= maxDepth) continue;   // every merge past the depth cap (host twin)
                 // Hoisted out of the per-hit weight: the ray/bounds clip and the spectral
                 // sigma_t lookup are constants of the SEGMENT, and a dense medium hands one
                 // segment hundreds of hits. Built unconditionally so the gather's `camTr` is
@@ -14665,7 +14670,8 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
             // "merges off == mode D bit-for-bit" survives this for free.
             if (kappaSurf > 0.0 && sm.nPts > 0) {
                 const double vmNorm = 1.0 / kappaSurf;
-                for (int k = 1; k < nE; ++k) {
+                const int kEnd = (nE < maxDepth) ? nE : maxDepth;   // past it every merge is capped
+                for (int k = 1; k < kEnd; ++k) {
                     const DVertex& vk = eye[k];
                     if (!dSurfMergeSite(sc, vk) || !(vk.beta > 0.0)) continue;
                     const DVertex& vp = eye[k - 1];
@@ -14875,9 +14881,12 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 if (dot(o, h.n) <= 0) return;
                 rd = o; ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
-            case D_DIELECTRIC: {
+            case D_DIELECTRIC:
+            case D_THINFILM:
+            case D_MULTILAYER: {                         // a dielectric body, plain or coated
                 DVec3 nro, nrd; double rs = 1.0;
-                dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr, &rs);
+                if (!dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr, &rs))
+                    return;
                 thr *= rs;                               // radiance across the interface
                 ro = nro; rd = nrd; break;
             }
@@ -14923,7 +14932,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 rd = wOut;
                 break;
             }
-            default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
+            default: {                                   // Grating: approx reflect
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
@@ -15083,18 +15092,61 @@ __device__ static void dSpecFold(DSpecThr& st, const DScene& sc, const DMaterial
     }, atCam);
 }
 
-// A refraction's radiance factor (n_from / n_to)^2 at wavelength L, for the carrier: a dispersive
-// index makes it spectral. `farMat` is the far side's material (-1: index 1), `entering` whether the
-// ray went into m (host twin: Renderer::stepScaleAt).
-__device__ static double dEta2At(const DScene& sc, const DMaterial& m, int farMat, bool entering,
-                                 Real L) {
+// What mode M's spectral gather folds per photon wavelength for a dDielectricStep the ray `d` made
+// at the hit `h` (host twin: Renderer::stepFactorAt): at wavelength L, the probability of the branch
+// it took -- the Fresnel or interference reflectance for the same incidence, or one minus it --
+// times the radiance factor (n_from / n_to)^2 if it refracted; 1 at a pass-through. `farMat` is the
+// far side's material (-1: index 1).
+__device__ static double dStepFactorAt(const DScene& sc, const DMaterial& m, const DHit& h,
+                                       const DVec3& d, bool entering, bool refracted, bool pass,
+                                       int farMat, Real L) {
+    if (pass) return 1.0;
     const double nm = (double)specLookup(m.ior, L);
     const double ne = (farMat >= 0) ? (double)specLookup(sc.mats[farMat].ior, L) : 1.0;
-    const double e = entering ? ne / nm : nm / ne;
-    return e * e;
+    const double n1 = entering ? ne : nm, n2 = entering ? nm : ne;
+    const DVec3 nl = entering ? h.ng : h.ng * (Real)(-1);
+    const double cosI = -(double)dot(d, nl);
+    const double eta = n1 / n2;
+    const double sin2t = eta * eta * (1.0 - cosI * cosI);
+    double Rf;
+    if (m.type == D_THINFILM) {
+        const double ks = (double)specLookup(m.substrateK, L);
+        const Real th = dMatFilmThickness(sc, m, h);
+        Rf = (ks > 0.0)
+            ? (double)thinFilmReflectance((Real)ne, (Real)m.filmIor, (Real)nm, (Real)ks, th, (Real)cosI, L)
+            : (sin2t > 1.0) ? 1.0
+            : (double)thinFilmReflectance((Real)n1, (Real)m.filmIor, (Real)n2, (Real)0, th, (Real)cosI, L);
+    } else if (m.type == D_MULTILAYER) {
+        const int nL = m.layerCount;
+        const double ks = (double)specLookup(m.substrateK, L);
+        bool opaque = ks > 0.0;
+        for (int j = 0; j < nL && !opaque; ++j) opaque = (m.layerK[j] != 0.0);
+        if (opaque)
+            Rf = (double)multilayerReflectance((Real)ne, (Real)cosI, L, m.layerN, m.layerK,
+                                               m.layerThick, nL, (Real)nm, (Real)ks);
+        else if (sin2t > 1.0) Rf = 1.0;
+        else if (entering)
+            Rf = (double)multilayerReflectance((Real)ne, (Real)cosI, L, m.layerN, m.layerK,
+                                               m.layerThick, nL, (Real)nm, (Real)0);
+        else {
+            double rn[D_MAXLAYERS], rk[D_MAXLAYERS], rt[D_MAXLAYERS];
+            for (int j = 0; j < nL; ++j) {
+                rn[j] = m.layerN[nL - 1 - j]; rk[j] = m.layerK[nL - 1 - j]; rt[j] = m.layerThick[nL - 1 - j];
+            }
+            Rf = (double)multilayerReflectance((Real)nm, (Real)cosI, L, rn, rk, rt, nL, (Real)ne, (Real)0);
+        }
+    } else if (sin2t > 1.0) {
+        Rf = 1.0;                                       // total internal reflection
+    } else {
+        const double cosT = sqrt(1.0 - sin2t);
+        const double rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
+        const double rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
+        Rf = 0.5 * (rs * rs + rp * rp);
+    }
+    return refracted ? (1.0 - Rf) * eta * eta : Rf;
 }
 
-// The device's camMediaTr (photonmap_render.h), spectral: one straight camera segment's media
+// The device twin of camMediaTrSpec (photonmap_render.h): one straight camera segment's media
 // transmittance -- one ratio-tracking sample, or pbeams::kSunDiscTrSamples of them when the
 // segment points into a sun's disc -- at every DSpecThr grid wavelength plus, in the last slot,
 // the camera's own, all from ONE shared walk, so the scalar `thr` and the
@@ -15463,14 +15515,20 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 }
                 rd = o; ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
-            case D_DIELECTRIC: {
-                DVec3 nro, nrd; double rs = 1.0; bool refr = false; int farMat = -1;
+            case D_DIELECTRIC:
+            case D_THINFILM:
+            case D_MULTILAYER: {
+                // A dielectric body's surface, plain or coated: radiance across a refraction, and
+                // SPECGATHER re-expresses the step at each photon's wavelength (dStepFactorAt).
+                DVec3 nro, nrd; double rs = 1.0; bool refr = false, pass = false; int farMat = -1;
+                const DVec3 d0 = rd;
                 const bool entering = dot(rd, h.ng) < 0;
-                dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr, &rs,
-                                &refr, &farMat);
+                if (!dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr, &rs,
+                                     &refr, &farMat, &pass)) return;
                 thr *= rs;                               // radiance across the interface
-                if (refr)                                // SPECGATHER
-                    sthr.mul([&](Real L) { return dEta2At(sc, m, farMat, entering, L); }, rs);
+                sthr.mul([&](Real L) {
+                    return dStepFactorAt(sc, m, h, d0, entering, refr, pass, farMat, L);
+                }, dStepFactorAt(sc, m, h, d0, entering, refr, pass, farMat, lambda));
                 ro = nro; rd = nrd; break;
             }
             case D_HALFMIRROR: {
@@ -15543,7 +15601,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 rd = wOut;
                 break;
             }
-            default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
+            default: {                                   // Grating: approx reflect
                 {   const double rC = (double)clamp01(dReflectSlot(sc, m, h, lambda));
                     thr *= rC;
                     dSpecFold(sthr, sc, m, h, rC, false);   // SPECGATHER
@@ -15769,9 +15827,12 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                 if (dot(o, h.n) <= 0) return;
                 rd = o; ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
-            case D_DIELECTRIC: {
+            case D_DIELECTRIC:
+            case D_THINFILM:
+            case D_MULTILAYER: {                         // a dielectric body, plain or coated
                 DVec3 nro, nrd; double rs = 1.0;
-                dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr, &rs);
+                if (!dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr, &rs))
+                    return;
                 thr *= rs;                               // radiance across the interface
                 ro = nro; rd = nrd; break;
             }
@@ -15785,7 +15846,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                 thr *= (double)clamp01(dTransmitSlot(sc, m, h, lambda));
                 ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
-            default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
+            default: {                                   // Grating: approx reflect
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
             }

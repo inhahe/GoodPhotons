@@ -248,6 +248,22 @@ every camera-side refraction (and thin-film / multilayer / grating interfaces th
 medium), CPU and GPU, with a check of an emitter inside a solid dielectric in modes R, D and W
 against mode B. check_fire_d uses a glass pane, crossed in and out, until then.
 
+## OPEN (2026-10-14): SPPM-SPECTRAL — mode S applies a camera path's spectral factors at the camera's wavelength to every photon
+
+Mode S's visible point is reached by a camera walk at one wavelength (the camera sample's), and its
+throughput carries every spectral factor met on the way -- a coloured mirror's reflectance, a gel's
+transmittance, a dispersive Fresnel term, a coat's interference coin -- at that wavelength. The
+photons it gathers come in every wavelength, and each is weighted by those camera-wavelength
+factors instead of its own: the estimate is r(lambda_c) * sum_p rho(lambda_p) P_p CIE(lambda_p)
+where it owes sum_p r(lambda_p) rho(lambda_p) P_p CIE(lambda_p). Exact when r is flat; otherwise a
+colour bias, in either direction. It is the bias mode M had until SPECGATHER (photonmap_render.h,
+SpecThr), which carries those factors on a coarse wavelength grid beside the scalar and reweights
+each photon at its own wavelength. Most visible on a coated body seen in mode S (its interference
+colour washes toward grey) and on anything seen in a coloured mirror. `tools/check_coat_modes.py`
+therefore holds mode S to mode R in brightness only. Fix: give sppmVisiblePoint (and the device's
+dSppmVisiblePoint) a SpecThr, store it with the visible point, and multiply each gathered photon
+by its ratio at the photon's wavelength, as photonGather does.
+
 ## OPEN (2026-10-13): BIRTH-EMPTY-STACK — a light walk born inside a dielectric does not know it is inside
 
 Every light walk starts with an empty dielectric stack (`MediumStack`): the forward tracer's

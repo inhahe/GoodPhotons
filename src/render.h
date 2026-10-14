@@ -4213,6 +4213,7 @@ struct Renderer {
         double whittedWeight = 1.0;
         bool entering = false;      // met the surface from outside the material
         bool refracted = false;     // crossed into the other medium
+        bool passThrough = false;   // a boundary the priority rule suppressed
         bool absorbed = false;
         int extMat = -1;
     };
@@ -4259,6 +4260,7 @@ struct Renderer {
         if (ranked && outer.topMat() >= 0 && m.priority <= outer.topPri()) {   // suppressed
             if (st.entering) stk.push((int)mi, m.priority); else stk.popMat((int)mi);
             st.ray = Ray{h.p + d * 1e-6, d};
+            st.passThrough = true;
             st.extMat = -1;
             return st;
         }
@@ -4280,15 +4282,50 @@ struct Renderer {
         return st;
     }
 
-    // A step's radiance factor at another wavelength `L` -- what mode M's spectral gather folds
-    // per photon (SpecThr): (n_from / n_to)^2 with both indices at L, 1 unless it refracted.
-    static double stepScaleAt(const Scene& scene, const Material& m, const InterfaceStep& st,
-                              double L) {
-        if (!st.refracted) return 1.0;
+    // What mode M's spectral gather folds per photon wavelength (SpecThr) for the interface step
+    // `st` that the ray `d` made at the hit `h`, at wavelength L: the probability of the branch it
+    // took, had the walk been at L -- the Fresnel or interference reflectance for the same
+    // incidence, or one minus it -- times the radiance factor (n_from / n_to)^2 at L if it
+    // refracted; 1 at a pass-through. Folded against its value at the walk's own wavelength, it
+    // re-expresses the step's coin, tossed at that wavelength, at each photon's: a coat's
+    // interference colour lives entirely in that coin, a dispersive index's partly.
+    double stepFactorAt(const Scene& scene, const Material& m, const InterfaceStep& st,
+                        const Hit& h, const Vec3& d, double L) const {
+        if (st.passThrough) return 1.0;
         const double nm = m.ior(L);
         const double ne = (st.extMat >= 0) ? scene.mats[(size_t)st.extMat].ior(L) : 1.0;
-        const double eta = st.entering ? ne / nm : nm / ne;
-        return eta * eta;
+        const double n1 = st.entering ? ne : nm, n2 = st.entering ? nm : ne;
+        const Vec3 nl = st.entering ? h.ng : -h.ng;
+        const double cosI = -dot(d, nl);
+        const double eta = n1 / n2;
+        const double sin2t = eta * eta * (1.0 - cosI * cosI);
+        double Rf;
+        if (m.type == MatType::ThinFilm) {
+            const double ks = m.substrateK(L), th = materialFilmThickness(scene, m, h);
+            Rf = (ks > 0.0) ? thinFilmReflectance(ne, m.filmIor, nm, ks, th, cosI, L)
+               : (sin2t > 1.0) ? 1.0
+               : thinFilmReflectance(n1, m.filmIor, n2, 0.0, th, cosI, L);
+        } else if (m.type == MatType::Multilayer) {
+            const int nL = (int)m.layerN.size();
+            const double ks = m.substrateK(L);
+            bool opaque = ks > 0.0;
+            for (int j = 0; j < nL && !opaque; ++j) opaque = (m.layerK[j] != 0.0);
+            Rf = opaque ? multilayerReflectance(ne, cosI, L, m.layerN.data(), m.layerK.data(),
+                                                m.layerThick.data(), nL, nm, ks)
+               : (sin2t > 1.0) ? 1.0
+               : st.entering ? multilayerReflectance(ne, cosI, L, m.layerN.data(), m.layerK.data(),
+                                                     m.layerThick.data(), nL, nm, 0.0)
+                             : multilayerReflectance(nm, cosI, L, m.layerN.data(), m.layerK.data(),
+                                                     m.layerThick.data(), nL, ne, 0.0, true);
+        } else if (sin2t > 1.0) {
+            Rf = 1.0;                                   // total internal reflection
+        } else {
+            const double cosT = std::sqrt(1.0 - sin2t);
+            const double rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
+            const double rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
+            Rf = 0.5 * (rs * rs + rp * rp);
+        }
+        return st.refracted ? (1.0 - Rf) * eta * eta : Rf;
     }
 
     // The square of the index of the medium a path is in (the top of its stack; 1 in air): what

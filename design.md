@@ -802,8 +802,8 @@ instead of nearest-cell, which is what painted a cell's realization noise as a f
 **The sun's disc through the cloud (0.313.1).** Correct in brightness — the mode-D reference has
 it at the same value — but mode M's estimate of it swung ±25 % between seeds at 32 spp: the
 disc is ~10⁴ times brighter than the cloud around it, and the cloud's transmittance along that
-one ray was a single ratio-tracking sample per camera sample. `camMediaTr` / `dCamMediaTr`
-(the two extinction sites of `photonGather` / `dPhotonGather`) average
+one ray was a single ratio-tracking sample per camera sample. `camMediaTrSpec` / `dCamMediaTrSpec`
+(the extinction sites of `photonGather` / `dPhotonGather`, spectral since SPECGATHER) average
 `pbeams::kSunDiscTrSamples` (64) samples for a camera segment whose direction lies inside a
 sun's disc, and one sample otherwise — unbiased either way, and paid only by the handful of
 pixels on the disc.
@@ -2324,10 +2324,14 @@ interface -- `refractOrReflect`, or the coating's interference reflectance -- an
 a body the ray enters goes on it, a coated one as a glass one does, so a walk inside a coated body
 knows its index and a body inside it ranks against it. It returns an `InterfaceStep`: the
 continuation ray, the throughput factor, mode W's branch weight, whether an opaque coating absorbed
-the ray, and what mode M's spectral gather needs to fold the factor per photon wavelength
-(`stepScaleAt`; a dispersive index makes it spectral). The device's twin is `dDielectricStep`
-(with `dExteriorIor` and `dEta2At`, folded through `DSpecThr::mul`), whose `radianceScale`
-argument -- non-null on a camera-side walk -- every caller states, as `dVcmScatter`'s callers do.
+the ray, and what mode M's spectral gather needs to re-express the step at each photon's
+wavelength: `stepFactorAt`, the probability of the branch the coin took at that wavelength -- a
+coat's whole interference colour, a dispersive Fresnel term -- times the radiance factor there.
+Modes M and S send coated bodies through it too (until 0.378.5 their camera walks bounced off a
+coat as off a half mirror). The device's twin is `dDielectricStep` (with `dExteriorIor` and
+`dStepFactorAt`, folded through `DSpecThr::mul`), whose `radianceScale` argument -- non-null on a
+camera-side walk -- every caller states, as `dVcmScatter`'s callers do. Like a glass body, a
+coated one must be closed: a ray that refracts in through an open surface stays "inside" it.
 Mode W's two air-unit quantities, its 1/512 throughput cutoff and its flat `-ambient` fill, are
 taken in the units of the medium the path is in (`localN2`: the stack top's n^2) -- on the scalar
 walk, in the bundle loops, at a fur coat and at a strand -- so a path inside glass is cut, and
@@ -7745,7 +7749,15 @@ as the one at fault.
   reference — physical T⁴ + Wien hue, tame magnitudes); temperature is peak-normalised
   (T=emitKelvin·raw/tempPeak). `Scene::finalizeEmissiveVolumes()` (called from `build()`) MC-estimates
   each grid's mean emission `meanKe` + selection `power`=4π·V·meanKe·Δλ into `Scene::emissiveVolumes`
-  (+`totalEmissionPower`). Forward `tracePhoton` (`render.h`) splits birth emitter-vs-fire by power
+  (+`totalEmissionPower`). meanKe only steers the photon split (the birth weight divides it back
+  out), so its one failure is reading exactly 0: a hot core too small for the 20 000 random points
+  falls back to a scan of the grid's voxels (`meanKeByVoxels`, 0.378.5), and a grid that emits
+  nothing at all (`emission_scale 0`, `emission_kelvin 0`) is reported and its `temperature`
+  DROPPED from the medium -- so `emissive()`, which every mode's refusal and the device gates
+  read, agrees with the fires registered, and the medium renders as smoke. Before 0.378.5 such a
+  medium registered no fire yet stayed emissive(): the photon modes refused a scene with no fire,
+  and a missed core dropped the fire silently. `BandPower` tabulates the band-integrated emission
+  per temperature for that scan and for the fire's cell grid. Forward `tracePhoton` (`render.h`) splits birth emitter-vs-fire by power
   (`grandTotal=totalPower+totalEmissionPower`; no extra RNG when there are no emissive volumes, so
   non-fire scenes stay bit-identical); a fire photon is born uniform in the box its temperature is positive in (`Scene::vdbPositiveBox`, 0.376.0; the whole grid box before), isotropic-dir, with λ
   **importance-sampled from `blackbody(emitKelvin)`** via a per-volume `EmissionSampler lamSampler` (built

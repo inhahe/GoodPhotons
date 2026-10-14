@@ -41,10 +41,18 @@ inline bool aabbOverlap(const Aabb& a, const Aabb& b) {
 
 // Collect every dielectric solid with a clean per-object world AABB, then pairwise-test
 // for overlapping DIFFERENT-material solids that lack a disambiguating priority. Returns
-// one warning string per offending pair (empty => nothing to warn about).
+// one warning string per offending pair (empty => nothing to warn about). A thin-film or
+// multilayer body with a clear substrate is a coated dielectric one (Renderer::interfaceStep
+// puts it on the stack); an opaque coat is never entered, so it is no medium.
 inline std::vector<std::string> audit(const Scene& sc) {
     auto isDiel = [&](int m) {
-        return m >= 0 && m < (int)sc.mats.size() && sc.mats[m].type == MatType::Dielectric;
+        if (m < 0 || m >= (int)sc.mats.size()) return false;
+        const Material& mt = sc.mats[m];
+        if (mt.type == MatType::Dielectric) return true;
+        if (mt.type != MatType::ThinFilm && mt.type != MatType::Multilayer) return false;
+        if (mt.substrateK(550.0) > 0.0) return false;
+        for (double k : mt.layerK) if (k != 0.0) return false;
+        return true;
     };
     auto matName = [&](int m) { return std::string("material #") + std::to_string(m); };
 

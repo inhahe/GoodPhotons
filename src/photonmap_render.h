@@ -1008,8 +1008,10 @@ struct SpecThr {
     }
 };
 
-// The spectral twin of camMediaTr: the segment's transmittance at every SpecThr grid wavelength
-// plus (in the last slot) the camera's own, all from one shared walk. The camera's slot is what the
+// The media transmittance of one straight CAMERA segment -- one ratio-tracking sample, or
+// pbeams::kSunDiscTrSamples of them when the segment points into a sun's disc (see the constant's
+// note) -- at every SpecThr grid wavelength plus (in the last slot) the camera's own, all from one
+// shared walk (device twin: dCamMediaTrSpec). The camera's slot is what the
 // scalar `thr` takes, so the scalar and the carrier's denominator are the same number by
 // construction -- the lesson from SPECGATHER's first attempt, which recomputed it and detonated.
 inline void camMediaTrSpec(const Scene& scene, const Renderer& mats, const Vec3& o, const Vec3& d,
@@ -1207,12 +1209,15 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 ray = Ray{h.p + h.n * 1e-6, o};
                 break;
             }
-            case MatType::Dielectric: {
-                // Nested dielectrics by priority (Renderer::interfaceStep); this camera-side
-                // walk carries radiance across a refraction.
+            case MatType::Dielectric:
+            case MatType::ThinFilm:
+            case MatType::Multilayer: {
+                // A dielectric body's surface, plain or coated (Renderer::interfaceStep); this
+                // camera-side walk carries radiance across a refraction.
                 const Renderer::InterfaceStep st =
                     mats.interfaceStep(scene, m, h, ray.d, lambda, rng, stk,
                                        Renderer::Transport::Radiance);
+                if (st.absorbed) return L;
                 ray = st.ray;
                 thr *= st.scale;
                 break;
@@ -1261,7 +1266,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 ray = Ray{h.p + wo * 1e-6, wo, hairExitOffset(hs, h.n, wo)};
                 break;
             }
-            default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
+            default: {                                   // Grating: approx reflect
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
                 ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
                 break;
@@ -1289,19 +1294,6 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
 //
 // `pmC` (optional) is the CAUSTIC map (see tracePhotonPass): a disjoint half of the same
 // deposits, gathered at its own much finer radius and simply added.
-// Media transmittance of one straight CAMERA segment: one ratio-tracking sample, or
-// pbeams::kSunDiscTrSamples of them when the segment points into a sun's disc (see the
-// constant's note). Device twin: dCamMediaTr.
-inline double camMediaTr(const Scene& scene, const Renderer& mats, const Vec3& o, const Vec3& d,
-                         double len, double lambda, Pcg32& rng) {
-    const int n = (scene.sunCount > 0 && scene.sunRadiance(d, lambda) > 0.0)
-                      ? pbeams::kSunDiscTrSamples : 1;
-    if (n == 1) return mats.mediaTransmittance(scene, o, d, len, lambda, rng);
-    double s = 0.0;
-    for (int i = 0; i < n; ++i) s += mats.mediaTransmittance(scene, o, d, len, lambda, rng);
-    return s / (double)n;
-}
-
 // `lambdaU` >= 0 is a stratified uniform for the hero wavelength (renderPhotonCamera); < 0 draws
 // it from `rng` as before.
 inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
@@ -1611,19 +1603,22 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 ray = Ray{h.p + h.n * 1e-6, o};
                 break;
             }
-            case MatType::Dielectric: {
-                // Nested dielectrics by priority (Renderer::interfaceStep); this camera-side
-                // walk carries radiance across a refraction -- and SPECGATHER takes the factor at
-                // each photon's own wavelength, as it does every spectral factor of the walk (a
-                // dispersive index makes it one).
+            case MatType::Dielectric:
+            case MatType::ThinFilm:
+            case MatType::Multilayer: {
+                // A dielectric body's surface, plain or coated (Renderer::interfaceStep); this
+                // camera-side walk carries radiance across a refraction. SPECGATHER re-expresses
+                // the step at each photon's wavelength (stepFactorAt): the branch the coin took,
+                // whose probability is a coat's whole interference colour, and the radiance factor.
+                const Vec3 d0 = ray.d;
                 const Renderer::InterfaceStep st =
-                    mats.interfaceStep(scene, m, h, ray.d, lambda, rng, stk,
+                    mats.interfaceStep(scene, m, h, d0, lambda, rng, stk,
                                        Renderer::Transport::Radiance);
+                if (st.absorbed) return L;
                 ray = st.ray;
                 thr *= st.scale;
-                if (st.refracted)
-                    sthr.mul([&](double L) { return Renderer::stepScaleAt(scene, m, st, L); },
-                             st.scale);
+                sthr.mul([&](double Lw) { return mats.stepFactorAt(scene, m, st, h, d0, Lw); },
+                         mats.stepFactorAt(scene, m, st, h, d0, lambda));
                 break;
             }
             case MatType::HalfMirror: {
@@ -1733,7 +1728,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 ray = Ray{h.p + wo * 1e-6, wo, hairExitOffset(hs, h.n, wo)};
                 break;
             }
-            default: {                                   // ThinFilm/Multilayer/Grating: approx reflect
+            default: {                                   // Grating: approx reflect
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 thr *= r;
                 sthr.mul([&](double Lw) { return clamp01(reflectSlot(scene, m, h, Lw)); }, r);

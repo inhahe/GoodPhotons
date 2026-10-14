@@ -1893,7 +1893,10 @@ surface refracts; the losing (lower-priority) surface inside it is *suppressed* 
 ray passes straight through it — and the exterior IOR at each real interface is taken
 from the medium actually enclosing the ray (so glass-in-water refracts 1.33↔1.52, not
 1.0↔1.52). Every render mode honours it (CPU forward/backward/BDPT/VCM/photon/SPPM and
-the GPU forward/backward/BDPT/photon backends).
+the GPU forward/backward/BDPT/photon backends). A `thinfilm` or `multilayer` body with a clear
+substrate is a dielectric body too, coated: it takes `priority` the same way, and its coating
+interferes against the index of the medium around it (since 0.378.5). Like any refracting body
+it should be closed -- a ray that refracts in through an open surface stays "inside" it.
 
 Priorities are **opt-in and safe to omit**: a scene that never writes `priority` renders
 exactly as before (each dielectric treated against air). Because that flat model is

@@ -184,12 +184,15 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 ray = Ray{h.p + h.n * 1e-6, o};
                 break;
             }
-            case MatType::Dielectric: {
-                // Nested dielectrics by priority (Renderer::interfaceStep); this camera-side
-                // walk carries radiance across a refraction.
+            case MatType::Dielectric:
+            case MatType::ThinFilm:
+            case MatType::Multilayer: {
+                // A dielectric body's surface, plain or coated (Renderer::interfaceStep); this
+                // camera-side walk carries radiance across a refraction.
                 const Renderer::InterfaceStep st =
                     mats.interfaceStep(scene, m, h, ray.d, lambda, rng, stk,
                                        Renderer::Transport::Radiance);
+                if (st.absorbed) return;
                 ray = st.ray;
                 thr *= st.scale;
                 break;

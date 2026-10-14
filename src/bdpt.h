@@ -3996,6 +3996,11 @@ struct BdptRenderer {
                         for (const PathSeg& sg : segs) {
                             if (!mergeOn) break;
                             if (!(sg.beta > 0.0)) continue;
+                            // Past the depth cap: a merge on the segment leaving eye[k] makes a
+                            // path of depth j + k + 1 > maxDepth once k >= maxDepth, which the
+                            // weight would refuse after the gather; skip the gather. (These are
+                            // the walk's last segments, so no other gather's draws move.)
+                            if (sg.vert >= maxDepth) continue;
                             BeamMergeWeight w1;
                             w1.scene = &scene; w1.bm = beams; w1.sg = &sg;
                             w1.lamCam = lamCam; w1.kappa = mergeKappa;
@@ -4078,7 +4083,11 @@ struct BdptRenderer {
                         // for free.
                         if (surfOn) {
                             const double vmNorm = 1.0 / mk.surf;
-                            for (int k = 1; k < nE; ++k) {
+                            // A point merge at eye[k] makes depth j + k with j >= 1 (photons are
+                            // stored past the light's own vertex), so past k = maxDepth - 1 the
+                            // weight refuses every one: no query.
+                            const int kEnd = std::min(nE, maxDepth);
+                            for (int k = 1; k < kEnd; ++k) {
                                 const Vertex& vk = eye[(size_t)k];
                                 // The site predicate is `surfMergeSite` and MUST be, because
                                 // the light pass stored photons by exactly it: a site gathered

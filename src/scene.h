@@ -100,7 +100,9 @@ struct Material {
     // Interior absorption coefficient sigma_a(lambda) in units of 1/metre, applied
     // Beer-Lambert along the path a photon travels INSIDE a dielectric (colored /
     // attenuating glass; also the `absorb` target a field_material can drive). 0 =
-    // colorless (default, bit-identical to before). Only consulted for Dielectric.
+    // colorless (default, bit-identical to before). Consulted inside a dielectric body: a
+    // Dielectric's, and a thin-film or multilayer body's substrate (all three join the medium
+    // stack -- Renderer::interfaceStep).
     Spectrum absorb  = constantSpectrum(0.0);
     // The characteristic THICKNESS `absorb` was authored against, in scene units, or 0
     // when nobody said. Beer-Lambert absorption is a coefficient per unit length, so on
