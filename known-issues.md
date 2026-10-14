@@ -71,6 +71,34 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-10-14, tech debt): GPU-STACK-DRIFT — every kernel's stack reservation moves when unrelated device code changes
+
+Each megakernel reserves its per-thread stack (`cudaFuncAttributes::localSizeBytes`, the
+`[vram] mode-X kernel wants N GB local` line) times ~262 k resident threads of VRAM, and that
+number is the device linker's sum of the kernel's own frame and its deepest callee chain. 0.379.0
+changed only mode R's hero walk and its NEE helpers, yet in the three builds tried (`cuobjdump
+-res-usage`, bytes per thread):
+
+| kernel | 0.378.6 | 0.379.0 inlined | medium step out of line | NEE helpers out of line (kept) |
+|---|---|---|---|---|
+| `kBackward` (mode R) | 24360 | 26888 | 27024 | 25720 |
+| `kTrace` (forward) | 13504 | 14576 | 14576 | 15584 |
+| `kGather` (mode M) | 16816 | 18216 | 17368 | 19224 |
+| `kBackwardRGB` | 10584 | 11984 | 12824 | 12992 |
+| `kSppmVisiblePoint` | 9792 | 11192 | 11192 | 12200 |
+| `kBdptT<0,8,1,0>` (mode D) | 20432 | | | 23496 |
+
+The forward tracer, mode M's gather and SPPM call none of that code, and `ptxas -v` on a
+standalone compile shows every kernel's OWN frame unchanged (`kTrace` 3840, `kBackward` 2664,
+`kBdptT` 8176) and every shared helper's frame unchanged too; the hero loop's own frames even
+shrank (2952 -> 2360 bytes). So what moves is the linked callee chain. The likeliest cause is
+`--split-compile=0` (CMakeLists' CUDA flags): it partitions the module across threads, a call
+inlined within a partition is a real call across two, and adding functions moves the partition
+boundaries. Not confirmed: `cuobjdump -elf` lists `.nv.callgraph` but does not decode it.
+To settle it: build once without `--split-compile` and compare the table; if that is the cause,
+either drop the flag (slower builds) or pin the hot shared helpers' inlining (`__forceinline__`
+/ `__noinline__`) so partitioning cannot move them.
+
 ## DONE (2026-10-12, 0.375.3): REVIEW-0375 — what the Opus and Fable reviews of 0.375.0-0.375.1 found
 
 Each checked against the code before it was fixed; the checks that hold them are named.
@@ -434,8 +462,20 @@ carry no per-λ ratio); **rainbow rain, ~5 % less variance**; **~17 % more time*
 over four paired runs). And the check could not tell it from a deliberately broken weight (R_j
 dropped): it changes too little to verify. So mode D keeps the hero's strategy weights.
 
+**GPU mode R, 0.379.0:** the device takes the same gate (`renderBackwardCuda`), and
+`bkRadianceHeroLoop` the same medium block: shared free flight, policy-3 survival on the per-λ
+albedo, the rainbow's spectral MIS, a de-hero dividing `specW` back out, and the shared (hero-λ)
+transmittance on every bundle shadow leg (`bkNeeVolumeHero`, `bkNeeEnvVolumeHero`, and in
+`bkNeeLightHero` / `bkNeeEnvHero`). The scalar walk's volume NEE is the bundle's at one wavelength,
+as on the host. Measured (`check_hero_spectral.py --device gpu`, 256 spp): fog x0.9996, 5.38x less
+chroma noise; `-fog` x1.0021, 5.21x; coated fog x0.9977, 5.98x; rainbow rain x1.0001, 4.96x; the
+device's `-heroc 1` against the host's within 3 % / 3 sigma per tile; media-free scenes
+byte-identical to 0.378.6.
+
 **Still open:**
-- the GPU twin of mode R (`bkRadianceHero`), and the other modes' media gates;
+- the GPU twin's fiber: it still de-heros there, so device fur keeps most of its chroma noise;
+- the other modes' media gates, the device's mode D among them (the host's admits flat media
+  since 0.375.2);
 - a fiber with a DISPERSIVE index: `hair.h` takes one `eta` for all wavelengths. The spectral MIS
   above takes per-λ densities, but everything that builds them now assumes one index: a bundle's
   shades share the hero's refraction geometry (`hairShadeRetint` copies `eta`, `gammaO` and the

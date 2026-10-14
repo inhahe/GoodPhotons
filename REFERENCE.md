@@ -2678,12 +2678,13 @@ second:**
   time across four stress scenes, and the two backends agree to 0.03 %. Still single-λ **by
   design or pending work**: the **GPU wavefront** backend (`-wavefront` — hero forces the
   megakernel). Scenes with a GRIN volume or a finite-lens camera stay single-λ everywhere.
-  **Participating media** keep the bundle in **CPU modes `R` (0.375.0) and `D` (0.375.2)** when
+  **Participating media** keep the bundle in **CPU modes `R` (0.375.0) and `D` (0.375.2)** and
+  **GPU mode `R` (0.379.0)** when
   every medium's extinction is flat in λ — the common grey fog, cloud or rain, whose free flights
   are then the same for every wavelength (measured in mode `D`: 4.25× less chroma noise in fog,
-  3.96× in rainbow rain, unbiased); in every other mode (mode `J` included, whose beam merges are
-  single-λ), and for a medium whose extinction varies with λ, a scene with media is still
-  single-λ. In mode `R` a **hair fiber** and a **`phase rainbow`**
+  3.96× in rainbow rain, unbiased; on the GPU in mode `R`, 5.4× in fog and 5.0× in rain); in every
+  other mode (mode `J` included, whose beam merges are single-λ, and GPU mode `D`), and for a
+  medium whose extinction varies with λ, a scene with media is still single-λ. In mode `R` a **hair fiber** and a **`phase rainbow`**
   scatter keep the bundle too, by *spectral MIS* (Wilkie et al. 2014): their lobes move with λ but
   smoothly, so the hero samples the direction, every wavelength carries its own value, and the
   path is weighted by the balance heuristic over which wavelength could have been the hero. On

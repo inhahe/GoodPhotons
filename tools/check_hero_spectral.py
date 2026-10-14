@@ -2,6 +2,7 @@
 
     D:/python314/python.exe -u tools/check_hero_spectral.py [--out <dir>] [--exe ftrace.exe]
                                                             [--spp N] [--only name,...] [--modes RD]
+                                                            [--device cpu|gpu]
 
 A path carries a BUNDLE of wavelengths (`-heroc 4`) wherever the light it follows does not depend
 on wavelength in DIRECTION, and falls back to one wavelength (`-heroc 1` everywhere) otherwise.
@@ -16,7 +17,9 @@ frame is cut into tiles; a tile fails when the bundle's mean is off the single-w
 more than 5 standard errors (estimated from the seed pairs, tile- and pixel-wise, the larger kept)
 AND by more than 1 %. The chroma noise (the spread of R/G and B/G between the seed pairs) is
 reported, which is what the bundle exists to lower. A scene whose `-heroc 4` render is bit-identical
-to its `-heroc 1` render also fails: its bundle was switched off. Scenes:
+to its `-heroc 1` render also fails: its bundle was switched off. With `--device gpu` the renders
+are mode R's on the device (a render that fell back to the CPU fails), and the device's `-heroc 1`
+render is also held against the host's, by the same test. Scenes:
   hair  -- two fur balls (pale: long multiple-scattering chains; dark), a glass sphere the fur
            sees through (a fiber vertex followed by a single-wavelength fallback), sun + area
            light + sky.
@@ -186,21 +189,54 @@ def read_pfm(path):
     return data[::-1].astype(np.float64)     # PFM rows run bottom to top
 
 
-def render(exe, scene, out, mode, heroc, seed, spp):
-    png = os.path.join(out, "%s_%s_c%d_s%d_n%d.png" % (os.path.splitext(os.path.basename(scene))[0],
-                                                       mode, heroc, seed, spp))
+def render(exe, scene, out, mode, heroc, seed, spp, device="cpu"):
+    png = os.path.join(out, "%s_%s%s_c%d_s%d_n%d.png" % (
+        os.path.splitext(os.path.basename(scene))[0], mode, "g" if device == "gpu" else "", heroc,
+        seed, spp))
     pfm = png[:-4] + ".pfm"
     if os.path.exists(pfm) and os.path.getmtime(pfm) > os.path.getmtime(scene) and \
             os.path.getmtime(pfm) > os.path.getmtime(exe):
         return read_pfm(pfm)
-    cmd = [exe, "-in", scene, "-mode", mode, "-device", "cpu", "-spp", str(spp), "-heroc", str(heroc),
+    if os.path.exists(pfm):
+        os.remove(pfm)                       # never score an earlier run's image
+    cmd = [exe, "-in", scene, "-mode", mode, "-device", device, "-spp", str(spp), "-heroc", str(heroc),
            "-seed", str(seed), "-hdr", "-no-meter", "-o", png]
     cmd += EXTRA.get(os.path.splitext(os.path.basename(scene))[0], [])
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0 or not os.path.exists(pfm):
         print(r.stdout[-2000:], r.stderr[-2000:])
         raise SystemExit("render failed: " + " ".join(cmd))
+    if device == "gpu" and "-> GPU" not in r.stdout + r.stderr:
+        raise SystemExit("did not run on the GPU: " + " ".join(cmd))
     return read_pfm(pfm)
+
+
+def compare(x1, x2, y1, y2):
+    """Tile verdict of the mean of renders x1, x2 (two seeds) against the mean of y1, y2: the
+    failing tiles, the whole-frame luminance ratio and the worst tile as (sigma, ratio). The
+    standard error of the difference is taken two ways and the larger kept: from each seed
+    pair's tile means (one degree of freedom: can come out small by luck) and from their pixels
+    (many, but blind to correlation between pixels)."""
+    lumx = ((tiles(x1) + tiles(x2)) / 2).sum(-1)
+    lumy = ((tiles(y1) + tiles(y2)) / 2).sum(-1)
+    se_pair = np.sqrt(((tiles(y1) - tiles(y2)).sum(-1) / 2) ** 2 +
+                      ((tiles(x1) - tiles(x2)).sum(-1) / 2) ** 2)
+    se_pix = np.sqrt(tile_se(y1, y2) ** 2 + tile_se(x1, x2) ** 2)
+    selum = np.maximum(se_pair, se_pix)
+    floor = 0.02 * lumy.max()                      # tiles this dark carry no information
+    bad = []
+    worst = (0.0, 1.0)
+    for i in range(lumy.shape[0]):
+        for j in range(lumy.shape[1]):
+            if lumy[i, j] < floor:
+                continue
+            ratio = lumx[i, j] / lumy[i, j]
+            z = abs(lumx[i, j] - lumy[i, j]) / max(selum[i, j], 1e-30)
+            if z > worst[0]:
+                worst = (z, ratio)
+            if z > Z_MAX and abs(ratio - 1.0) > REL_MAX:
+                bad.append("tile (%d,%d): x%.3f, %.1f sigma" % (i, j, ratio, z))
+    return bad, lumx.sum() / lumy.sum(), worst
 
 
 def tiles(img, n=4):
@@ -245,6 +281,9 @@ def main():
     ap.add_argument("--spp", type=int, default=256)
     ap.add_argument("--only", default="")
     ap.add_argument("--modes", default="RD", help="the modes to run, of those each scene allows")
+    ap.add_argument("--device", default="cpu", choices=("cpu", "gpu"),
+                    help="gpu: render mode R on the device, and also hold its -heroc 1 render "
+                         "against the host's")
     a = ap.parse_args()
     a.exe = os.path.abspath(a.exe)
     out = os.path.abspath(a.out)
@@ -258,41 +297,33 @@ def main():
             with open(scene, "w", encoding="utf-8", newline="") as f:
                 f.write(text)
         for mode in MODES[name]:
-            if mode not in a.modes:
+            # The device runs mode R's bundle; its mode D still keeps media to one wavelength.
+            if mode not in a.modes or (a.device == "gpu" and mode != "R"):
                 continue
-            r = {(c, sd): render(a.exe, scene, out, mode, c, sd, a.spp) for c in (1, 4) for sd in (1, 2)}
-            lum1 = ((tiles(r[(1, 1)]) + tiles(r[(1, 2)])) / 2).sum(-1)
-            lum4 = ((tiles(r[(4, 1)]) + tiles(r[(4, 2)])) / 2).sum(-1)
-            # The standard error of lum4 - lum1, two ways, and the larger kept: from each seed
-            # pair's tile means (one degree of freedom: can come out small by luck) and from
-            # their pixels (many, but blind to correlation between pixels).
-            se_pair = np.sqrt(((tiles(r[(1, 1)]) - tiles(r[(1, 2)])).sum(-1) / 2) ** 2 +
-                              ((tiles(r[(4, 1)]) - tiles(r[(4, 2)])).sum(-1) / 2) ** 2)
-            se_pix = np.sqrt(tile_se(r[(1, 1)], r[(1, 2)]) ** 2 + tile_se(r[(4, 1)], r[(4, 2)]) ** 2)
-            selum = np.maximum(se_pair, se_pix)
-            floor = 0.02 * lum1.max()                      # tiles this dark carry no information
-            bad = []
-            worst = (0.0, 1.0)
-            for i in range(lum1.shape[0]):
-                for j in range(lum1.shape[1]):
-                    if lum1[i, j] < floor:
-                        continue
-                    ratio = lum4[i, j] / lum1[i, j]
-                    z = abs(lum4[i, j] - lum1[i, j]) / max(selum[i, j], 1e-30)
-                    if z > worst[0]:
-                        worst = (z, ratio)
-                    if z > Z_MAX and abs(ratio - 1.0) > REL_MAX:
-                        bad.append("tile (%d,%d): x%.3f, %.1f sigma" % (i, j, ratio, z))
-            whole = lum4.sum() / lum1.sum()
+            r = {(c, sd): render(a.exe, scene, out, mode, c, sd, a.spp, a.device)
+                 for c in (1, 4) for sd in (1, 2)}
+            bad, whole, worst = compare(r[(4, 1)], r[(4, 2)], r[(1, 1)], r[(1, 2)])
             cn1 = chroma_noise(r[(1, 1)], r[(1, 2)]); cn4 = chroma_noise(r[(4, 1)], r[(4, 2)])
             if np.array_equal(r[(1, 1)], r[(4, 1)]):
                 bad.append("-heroc 4 rendered bit-identically to -heroc 1: the bundle is off")
             good = not bad
             ok &= good
-            print("%s: %s mode %s  whole frame x%.4f; worst tile %.1f sigma (x%.3f); chroma noise "
+            print("%s: %s mode %s%s  whole frame x%.4f; worst tile %.1f sigma (x%.3f); chroma noise "
                   "%.3f -> %.3f (x%.2f)%s" % (
-                      "ok" if good else "FAIL", name, mode, whole, worst[0], worst[1], cn1, cn4,
+                      "ok" if good else "FAIL", name, mode, " (device)" if a.device == "gpu" else "",
+                      whole, worst[0], worst[1], cn1, cn4,
                       cn1 / max(cn4, 1e-30), ("" if good else "; " + "; ".join(bad))), flush=True)
+            if a.device == "gpu":
+                # The device's single-wavelength walk against the host's: the two share the
+                # volume NEE with the bundle, so a fault there would pass the comparison above.
+                h = {sd: render(a.exe, scene, out, mode, 1, sd, a.spp) for sd in (1, 2)}
+                bad, whole, worst = compare(r[(1, 1)], r[(1, 2)], h[1], h[2])
+                good = not bad
+                ok &= good
+                print("%s: %s mode %s  device / host at -heroc 1: whole frame x%.4f; worst tile "
+                      "%.1f sigma (x%.3f)%s" % (
+                          "ok" if good else "FAIL", name, mode, whole, worst[0], worst[1],
+                          ("" if good else "; " + "; ".join(bad))), flush=True)
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

@@ -2314,6 +2314,14 @@ __device__ static bool dMediaSampleCollision(const DScene& sc, const DVec3& o,
     tHit = best; whichMed = which; return true;
 }
 
+// dMediaSampleCollision as a call rather than inlined, for a caller whose frame is VRAM times
+// every resident thread (the hero loop): the tracking code's locals then exist only while it runs.
+__device__ __noinline__ static bool dMediaSampleCollisionOutOfLine(const DScene& sc,
+        const DVec3& o, const DVec3& dir, Real dMax, Real lambda, DRng& rng, Real& tHit,
+        int& whichMed) {
+    return dMediaSampleCollision(sc, o, dir, dMax, lambda, rng, tHit, whichMed);
+}
+
 __device__ static Real dMediaTransmittance(const DScene& sc, const DVec3& o,
                                            const DVec3& dir, Real dist, Real lambda, DRng& rng,
                                            int filt = DMedAll) {
@@ -11155,11 +11163,6 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
     return total;
 }
 
-// Hero-wavelength surface NEE (device twin of backward.h neeLightHero): ONE shared
-// visibility sample per emitter — the very rng stream bkNeeLight would draw — evaluated
-// for all `nUp` live wavelengths, accumulating thr[i]*(rho[i]/PI)*SPD(lam[i])*invPdf[i]*w
-// into L[i]. Only reached on the media-free hero fast path, so there is no shadow-ray
-// transmittance term (bkRadianceHero is gated on mediaN == 0).
 #define DSPECNEE_MAXK 32   // the spectral NEE's per-thread scratch bound; DSpecThr::K is 24
 
 // SPECTRAL glossy NEE for mode M's gather (0.342.0; host twin backward.h neeLightSpecGlossy).
@@ -11224,7 +11227,13 @@ __device__ static void bkNeeLightSpecGlossy(const DScene& sc, const DHit& h, con
     }
 }
 
-__device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Real* rho,
+// Hero-wavelength surface NEE (device twin of backward.h neeLightHero): ONE shared
+// visibility sample per emitter — the very rng stream bkNeeLight would draw — evaluated
+// for all `nUp` live wavelengths, accumulating thr[i]*(rho[i]/PI)*SPD(lam[i])*invPdf[i]*w
+// into L[i]. The bundle is in media only where their extinction is flat in lambda
+// (renderBackwardCuda's gate), so the shadow ray's one transmittance estimate, taken at the
+// hero's wavelength, serves every member.
+__device__ __noinline__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Real* rho,
                                       double* L, const double* thr, const Real* lam,
                                       const double* invPdf, int nUp, DRng& rng,
                                       int giDepth = 0, const DNeeBsdf* nb = nullptr) {
@@ -11254,6 +11263,13 @@ __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Rea
             else if (uv) { su1 = rng.uniform(); su2 = rng.uniform(); }
             BkNeeGeom g;
             if (!bkEmitterGeom(sc, h, ngo0, em, su1, su2, g)) continue;
+            // The shadow ray's transmittance (see the header). A vacuum scene skips it without
+            // touching the rng, and its factor of exactly 1 below changes no bit.
+            double tm = 1.0;
+            if (sc.mediaN > 0) {
+                tm = (double)dMediaTransmittance(sc, h.p, g.wi, g.dist, lam[0], rng);
+                if (!(tm > 0.0)) continue;
+            }
             // GLOSSY-NEE: the lobe geometry -- and therefore the balance-heuristic weight -- is
             // wavelength-free, which is the same fact that lets the bundle survive a glossy
             // vertex at all. Computed once, shared by every member.
@@ -11284,25 +11300,33 @@ __device__ static void bkNeeLightHero(const DScene& sc, const DHit& h, const Rea
                         ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
                         : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
                 }
-                L[i] += thr[i] * contrib * invS;
+                L[i] += thr[i] * contrib * invS * tm;
             }
         }
     }
 }
 
-// Volume next-event estimation (device twin of backward.h neeVolume): connect a fog
-// scattering vertex `p` (photon arriving along `wIn`) to each area/sphere/cylinder
-// emitter. The surface BRDF+cosine are replaced by the single-scattering albedo and the
-// HG phase function; the shadow ray carries media transmittance (superposition over all
-// media). Spot/env/collimated emitters are gated to the CPU, so they're skipped here.
-// Uniform area sampling (an independent noise realization vs the CPU's cone/arc
-// importance sampling, same expectation) — matches bkNeeLight's convention.
-__device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVec3& wIn,
-                                     const DMedium& med, double invPdfLambda, Real lambda,
-                                     DRng& rng) {
-    double total = 0.0;
-    Real alb = medAlbedo(med, lambda);
-    if (alb <= (Real)0) return 0.0;
+// Volume next-event estimation at a medium scattering vertex, for a hero bundle (SPECTRAL-BUNDLE)
+// or, at nUp == 1, the scalar path's one wavelength (device twin of backward.h neeVolumeHero).
+// Connects `p` (light leaving along -wIn) to each emitter the draw picks: the emitter sample, the
+// shadow ray and ONE transmittance estimate per sample, at the hero's wavelength -- the bundle is
+// only in media whose extinction is flat in lambda (renderBackwardCuda's gate), so that estimate
+// serves every member -- and the albedo, phase value and emitter spectrum per wavelength. The
+// surface BRDF and cosine are replaced by the albedo and the phase (HG or rainbow), which is its
+// own pdf. Collimated beams cannot be hit, and the env is bkNeeEnvVolumeHero's. Uniform area
+// sampling: an independent realization of the CPU's cone/arc importance sampling, same
+// expectation, as in bkNeeLight.
+__device__ __noinline__ static void bkNeeVolumeHero(const DScene& sc, const DMedium& med, const DVec3& p,
+                                       const DVec3& wIn, double* L, const double* thr,
+                                       const Real* lam, const double* invPdf, int nUp,
+                                       DRng& rng) {
+    double alb[hero::kHeroMax];
+    bool any = false;
+    for (int i = 0; i < nUp; ++i) {
+        alb[i] = (double)medAlbedo(med, lam[i]);
+        if (alb[i] > 0.0) any = true;
+    }
+    if (!any) return;
     // No shading normal at a fog vertex, so the tree bounds on the receiver side only.
     DEmitterDraw draw; dPickEmitters(sc, p, nullptr, rng, draw);
     for (int di = 0; di < draw.n; ++di) {
@@ -11310,63 +11334,58 @@ __device__ static double bkNeeVolume(const DScene& sc, const DVec3& p, const DVe
         const double selW = draw.weight(di);            // 1/p(e); exactly 1 on the all path
         if (selW <= 0.0) continue;
         const DEmitter& em = sc.emitters[k];
-        if (em.collimated || em.shape == 3) continue;   // collimated beams / env (env: bkNeeEnvVolume)
+        if (em.collimated || em.shape == 3) continue;   // collimated beams / env (see above)
+        DVec3 wi;
+        Real dist;
+        double geom;    // all but the albedo, phase and spectrum: shared by the bundle
         if (em.shape == 2) {
-            // Point spot at a volume vertex (device twin of volumeEmitterGeom's spot branch): no
-            // surface cosine, cone falloff only; HG phase toward the light supplies the pdf.
-            DVec3 toL = em.origin - p;
-            Real dist2 = dot(toL, toL);
-            Real dist  = sqrt(dist2);
-            DVec3 wi = toL / dist;
-            Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
+            // Point spot (device twin of volumeEmitterGeom's spot branch): no surface cosine,
+            // cone falloff only.
+            const DVec3 toL = em.origin - p;
+            const Real dist2 = dot(toL, toL);
+            dist = sqrt(dist2);
+            wi = toL / dist;
+            const Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), em.beamDir),
+                                                em.spotCosInner, em.spotCosOuter);
             if (fall <= (Real)0) continue;
             // A fiber of `opacity` below 1 attenuates the shadow ray (host twin volumeEmitterGeom).
             const Real vis = shadowTransmittanceTo(sc, p + wi * RAY_EPS, p + wi * dist, 2 * RAY_EPS);
             if (!(vis > (Real)0)) continue;
-            Real phase = dMedPhase(med, dot(wIn, wi), lambda);
-            double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
-            double contrib = (double)(alb * phase * fall / dist2) * emitW * (double)vis;
-            contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
-            total += contrib * selW;
-            continue;
-        }
-        if (em.shape == 6) {
-            // Distant sun at a volume vertex (device twin of volumeEmitterGeom's Sun branch):
-            // cone-sampled direction (pdf 1/Omega, so 1/pdfW = Omega), no surface cosine,
-            // transmittance out to the scene exit.
-            double s1 = (double)rng.uniform(), s2 = (double)rng.uniform();
-            DVec3 wi = dSunSampleCone(em, em.beamDir * (Real)(-1), s1, s2);
-            Real dist = (Real)((double)length(sc.sceneCenter - p) + sc.sceneRadius);
+            geom = (double)fall / (double)dist2 * (double)vis;
+        } else if (em.shape == 6) {
+            // Distant sun (volumeEmitterGeom's Sun branch): cone-sampled direction (pdf 1/Omega,
+            // so 1/pdfW = Omega), no surface cosine, transmittance out to the scene exit.
+            const double s1 = (double)rng.uniform(), s2 = (double)rng.uniform();
+            wi = dSunSampleCone(em, em.beamDir * (Real)(-1), s1, s2);
+            dist = (Real)((double)length(sc.sceneCenter - p) + sc.sceneRadius);
             const Real vis = shadowTransmittance(sc, p + wi * RAY_EPS, wi, dist);
             if (!(vis > (Real)0)) continue;
-            Real phase = dMedPhase(med, dot(wIn, wi), lambda);
-            double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
-            double contrib = (double)(alb * phase) * emitW * em.spotOmega * (double)vis;
-            contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
-            total += contrib * selW;
-            continue;
+            geom = em.spotOmega * (double)vis;
+        } else {
+            const Real u1 = rng.uniform(), u2 = rng.uniform();
+            DVec3 y, nL;
+            // Also returns the sampled point's emission-pattern factor (1.0 when unpatterned).
+            const double epat = dEmitterSamplePointPat(sc, em, (double)u1, (double)u2, y, nL);
+            const DVec3 toL = y - p;
+            const Real dist2 = dot(toL, toL);
+            dist = sqrt(dist2);
+            wi = toL / dist;
+            const Real cosLight = dot(nL, wi * (Real)(-1));     // light is one-sided
+            if (cosLight <= 0) continue;
+            const Real vis = shadowTransmittanceTo(sc, p + wi * RAY_EPS, p + wi * dist, 2 * RAY_EPS);
+            if (!(vis > (Real)0)) continue;
+            // No surface cosine at a volume vertex.
+            geom = (double)cosLight / (double)dist2 * (double)em.area * (double)vis * epat;
         }
-        Real u1 = rng.uniform(), u2 = rng.uniform();
-        DVec3 y, nL;
-        // Also returns the sampled point's emission-pattern factor (1.0 when unpatterned).
-        double epat = dEmitterSamplePointPat(sc, em, (double)u1, (double)u2, y, nL);
-        DVec3 toL = y - p;
-        Real dist2 = dot(toL, toL);
-        Real dist  = sqrt(dist2);
-        DVec3 wi = toL / dist;
-        Real cosLight = dot(nL, wi * (Real)(-1));         // light is one-sided
-        if (cosLight <= 0) continue;
-        const Real vis = shadowTransmittanceTo(sc, p + wi * RAY_EPS, p + wi * dist, 2 * RAY_EPS);
-        if (!(vis > (Real)0)) continue;
-        Real phase = dMedPhase(med, dot(wIn, wi), lambda); // phase == its own pdf (HG or rainbow)
-        Real G = cosLight / dist2;                        // no surface cosine at a volume vertex
-        double emitW = (double)specLookup(em.emitSpd, lambda) * invPdfLambda;
-        double contrib = (double)(alb * phase * G) * emitW * (double)em.area * (double)vis;
-        if (epat != 1.0) contrib *= epat;                 // no-op without a pattern
-        contrib *= (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
-        total += contrib * selW;
+        geom *= (double)dMediaTransmittance(sc, p, wi, dist, lam[0], rng) * selW;
+        if (!(geom > 0.0)) continue;
+        const Real cosT = dot(wIn, wi);
+        for (int i = 0; i < nUp; ++i) {
+            if (!(thr[i] > 0.0) || !(alb[i] > 0.0)) continue;
+            L[i] += thr[i] * alb[i] * (double)dMedPhase(med, cosT, lam[i])
+                  * (double)specLookup(em.emitSpd, lam[i]) * invPdf[i] * geom;
+        }
     }
-    return total;
 }
 
 // Environment next-event estimation at a surface vertex (device twin of backward.h
@@ -11471,16 +11490,21 @@ __device__ static double bkNeeEnv(const DScene& sc, const DHit& h, Real rho,
     return contrib;
 }
 
-// Hero-wavelength environment NEE (device twin of backward.h neeEnvHero): one shared env
-// direction + shadow ray, evaluated for all `nUp` live wavelengths. Media-free hero fast
-// path, so no transmittance term.
-__device__ static void bkNeeEnvHero(const DScene& sc, const DHit& h, const Real* rho,
+// Hero-wavelength environment NEE (device twin of backward.h neeEnvHero): one shared
+// env direction + shadow ray, evaluated for all `nUp` live wavelengths, with one
+// transmittance estimate at the hero's wavelength (see bkNeeLightHero).
+__device__ __noinline__ static void bkNeeEnvHero(const DScene& sc, const DHit& h, const Real* rho,
                                     double* L, const double* thr, const Real* lam,
                                     const double* invPdf, int nUp, DRng& rng,
                                     const DNeeBsdf* nb = nullptr) {
     if (sc.envIndex < 0) return;
     BkEnvGeom g;
     if (!bkEnvGeom(sc, h, rng, g, nullptr, nb)) return;
+    double tm = 1.0;                  // a vacuum scene: no rng draw, and a factor of exactly 1
+    if (sc.mediaN > 0) {
+        tm = (double)dMediaTransmittance(sc, h.p, g.wi, (Real)g.farDist, lam[0], rng);
+        if (!(tm > 0.0)) return;
+    }
     const bool imageEnv = (sc.env.scale != nullptr);
     for (int i = 0; i < nUp; ++i) {
         double Lenv = imageEnv ? dEnvRadiance(sc.env, g.wi, lam[i])
@@ -11490,43 +11514,130 @@ __device__ static void bkNeeEnvHero(const DScene& sc, const DHit& h, const Real*
                                : ((double)rho[i] / DPI);
         if (!(fVal > 0.0)) continue;
         L[i] += thr[i] * (fVal * Lenv * (double)g.cosSurf * invPdf[i]
-                          / g.pdfW * g.wMis * (double)g.stG);
+                          / g.pdfW * g.wMis * (double)g.stG) * tm;
     }
 }
 
-// Environment NEE at a fog scattering vertex (device twin of backward.h neeEnvVolume,
-// constant-env scope). The surface BRDF/cosine is replaced by the single-scattering
-// albedo and the HG phase (which is also the pdf for the MIS weight against the phase-
-// sampled continuation). Only invoked when the scene has an env light.
-__device__ static double bkNeeEnvVolume(const DScene& sc, const DVec3& p, const DVec3& wIn,
-                                        const DMedium& med, double invPdfLambda, Real lambda,
-                                        DRng& rng) {
-    if (sc.envIndex < 0) return 0.0;
-    Real alb = medAlbedo(med, lambda);
-    if (alb <= (Real)0) return 0.0;
+// The environment twin of bkNeeVolumeHero (device twin of backward.h neeEnvVolumeHero), with the
+// balance heuristic against the phase-sampled continuation. That continuation draws from the
+// HERO's phase, so the density it is weighed against is the bundle's mixture
+// `sum_j r_j phase_j / sum_j r_j` (`specR`, `tech`: bkRadianceHeroLoop's spectral-MIS state),
+// which for an HG phase -- flat in lambda -- is the phase itself. At nUp == 1 it is the scalar
+// path's env NEE at a volume vertex.
+__device__ __noinline__ static void bkNeeEnvVolumeHero(const DScene& sc, const DMedium& med, const DVec3& p,
+                                          const DVec3& wIn, double* L, const double* thr,
+                                          const Real* lam, const double* invPdf, int nUp,
+                                          const double* specR, const bool* tech, DRng& rng) {
+    if (sc.envIndex < 0) return;
+    double alb[hero::kHeroMax];
+    bool any = false;
+    for (int i = 0; i < nUp; ++i) {
+        alb[i] = (double)medAlbedo(med, lam[i]);
+        if (alb[i] > 0.0) any = true;
+    }
+    if (!any) return;
     DVec3 wi; double pdfW;
     const bool imageEnv = (sc.env.scale != nullptr);
     if (imageEnv) {
         dEnvSample(sc.env, (double)rng.uniform(), (double)rng.uniform(), wi, pdfW);
-        if (pdfW <= 0.0) return 0.0;
+        if (pdfW <= 0.0) return;
     } else {
-        double z = 1.0 - 2.0 * (double)rng.uniform();
-        double sr = sqrt(fmax(0.0, 1.0 - z * z));
-        double phi = 2.0 * DPI * (double)rng.uniform();
+        const double z = 1.0 - 2.0 * (double)rng.uniform();
+        const double sr = sqrt(fmax(0.0, 1.0 - z * z));
+        const double phi = 2.0 * DPI * (double)rng.uniform();
         wi = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
         pdfW = 1.0 / (4.0 * DPI);
     }
-    double farDist = (double)length(sc.sceneCenter - p) + sc.sceneRadius;
+    const double farDist = (double)length(sc.sceneCenter - p) + sc.sceneRadius;
     const Real envVis = shadowTransmittance(sc, p + wi * RAY_EPS, wi, (Real)farDist);
-    if (!(envVis > (Real)0)) return 0.0;
-    double Lenv = imageEnv ? dEnvRadiance(sc.env, wi, lambda)
-                           : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
-    if (Lenv <= 0.0) return 0.0;
-    Real phase = dMedPhase(med, dot(wIn, wi), lambda);      // phase == its own pdf (HG or rainbow)
-    double wMis = pdfW / (pdfW + (double)phase);            // balance heuristic
-    double contrib = (double)alb * (double)phase * Lenv * invPdfLambda / pdfW * wMis * (double)envVis;
-    contrib *= (double)dMediaTransmittance(sc, p, wi, (Real)farDist, lambda, rng);
-    return contrib;
+    if (!(envVis > (Real)0)) return;
+    const double T = (double)dMediaTransmittance(sc, p, wi, (Real)farDist, lam[0], rng);
+    if (!(T > 0.0)) return;
+    const Real cosT = dot(wIn, wi);
+    double ph[hero::kHeroMax], num = 0.0, den = 0.0;
+    for (int j = 0; j < nUp; ++j) {
+        ph[j] = (double)dMedPhase(med, cosT, lam[j]);
+        if (tech[j]) { num += specR[j] * ph[j]; den += specR[j]; }
+    }
+    const double pbar = (den > 0.0) ? num / den : ph[0];
+    const double wMis = pdfW / (pdfW + pbar);                    // balance heuristic
+    for (int i = 0; i < nUp; ++i) {
+        if (!(thr[i] > 0.0) || !(alb[i] > 0.0)) continue;
+        const double Lenv = imageEnv ? dEnvRadiance(sc.env, wi, lam[i])
+                                     : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lam[i]);
+        if (!(Lenv > 0.0)) continue;
+        L[i] += thr[i] * alb[i] * ph[i] * Lenv * invPdf[i] / pdfW * wMis * (double)envVis * T;
+    }
+}
+
+// The bundle's medium vertex (SPECTRAL-BUNDLE; host twin: radianceHeroLoop's medium block), at
+// `tMed` along (ro, rd) in medium `med`: Beer-Lambert over the leg if it runs in glass, the
+// volume NEE, policy-3 survival on the per-lambda albedo, and the scattered direction -- shared
+// unless the phase is a rainbow, whose lobes move with lambda: then the hero samples it and the
+// bundle takes the spectral-MIS weight (`specR`/`specW`, bkRadianceHeroLoop). On return true,
+// (ro, rd) is the scattered ray and contBsdfPdf its density; false = the path ended. Split out
+// and __noinline__ for the reason bkInteractHair gives: its arrays are live only at a medium
+// vertex, instead of in the hero loop's frame -- VRAM times every resident thread, scene with
+// media or not.
+__device__ __noinline__ static bool bkMediumHeroStep(const DScene& sc, const DMedium& med,
+        Real tMed, const DMediumStack& stk, bool directOnly, DVec3& ro, DVec3& rd, double* L,
+        double* thr, const Real* lam, const double* invPdf, int nUp, double* specR,
+        const bool* specTech, double& specW, double& contBsdfPdf, DRng& rng) {
+    const DVec3 p = ro + rd * tMed;
+    {   const int cm = stk.topMat();                    // Beer-Lambert over a leg in glass
+        if (cm >= 0)
+            for (int i = 0; i < nUp; ++i) {
+                const Real a = (Real)specLookup(sc.mats[cm].absorb, lam[i]);
+                if (a > 0) thr[i] *= exp(-(double)a * (double)tMed);
+            }
+    }
+    bkNeeVolumeHero(sc, med, p, rd, L, thr, lam, invPdf, nUp, rng);
+    if (sc.envIndex >= 0)
+        bkNeeEnvVolumeHero(sc, med, p, rd, L, thr, lam, invPdf, nUp, specR, specTech, rng);
+    if (directOnly) return false;                       // Whitted: single-scatter only
+    // Absorption: policy 3 over the per-lambda albedo (max over the bundle, so no member is
+    // ever amplified).
+    double alb[hero::kHeroMax], qa = 0.0;
+    for (int i = 0; i < nUp; ++i) {
+        alb[i] = (double)medAlbedo(med, lam[i]);
+        if (alb[i] > qa) qa = alb[i];
+    }
+    if ((double)rng.uniform() >= qa) return false;
+    for (int i = 0; i < nUp; ++i) thr[i] *= alb[i] / qa;
+    Real phPdf = 0;
+    const DVec3 wOut = dMedPhaseSample(med, rd, lam[0], rng, phPdf);
+    const double pdf0 = (double)phPdf;
+    if (!(pdf0 > 0.0)) return false;
+    if (med.rbPdf != nullptr && nUp > 1) {
+        // The phase value IS the sampling density at every lambda, so each wavelength's
+        // f/pdf_hero and its pdf ratio are the same number.
+        const Real cosT = dot(rd, wOut);
+        double ratio[hero::kHeroMax];
+        double sumOld = 0.0, sumNew = 0.0;
+        for (int j = 0; j < nUp; ++j) {
+            ratio[j] = (j == 0) ? 1.0 : (double)dMedPhase(med, cosT, lam[j]) / pdf0;
+            if (specTech[j]) { sumOld += specR[j]; sumNew += specR[j] * ratio[j]; }
+        }
+        // No live wavelength could have drawn this direction (or none is live): the path
+        // carries nothing, and ending it is exact.
+        if (!(sumNew > 0.0)) return false;
+        const double rescale = sumOld / sumNew;
+        for (int j = 0; j < nUp; ++j) specR[j] *= ratio[j];
+        specW *= rescale;
+        double fac[hero::kHeroMax], q = 0.0;
+        for (int i = 0; i < nUp; ++i) {
+            fac[i] = ratio[i] * rescale;
+            if (thr[i] > 0.0 && fac[i] > q) q = fac[i];
+        }
+        if (q > 1.0) q = 1.0;
+        if (!(q > 0.0) || (double)rng.uniform() >= q) return false;
+        for (int i = 0; i < nUp; ++i) thr[i] *= fac[i] / q;
+        contBsdfPdf = pdf0 * sumNew / sumOld;           // the bundle's mixture density
+    } else {
+        contBsdfPdf = pdf0;
+    }
+    ro = p; rd = wOut;
+    return true;
 }
 
 // Mode W path context (device twin of BackwardRenderer::GiCtx). `depth == 0` is the primary
@@ -12020,9 +12131,13 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
                 if (a > 0) thr *= exp(-(double)a * (double)tMed);
                 const DMedium& med = sc.media[whichMed];
-                L += thr * bkNeeVolume(sc, p, rd, med, invPdfLambda, lambda, rng);
-                if (sc.envIndex >= 0)                              // env-NEE at the volume vertex
-                    L += thr * bkNeeEnvVolume(sc, p, rd, med, invPdfLambda, lambda, rng);
+                // The bundle's volume NEE at its one-wavelength case (host twin: radiance()).
+                bkNeeVolumeHero(sc, med, p, rd, &L, &thr, &lambda, &invPdfLambda, 1, rng);
+                if (sc.envIndex >= 0) {                            // env-NEE at the volume vertex
+                    const double one = 1.0; const bool tech = true;
+                    bkNeeEnvVolumeHero(sc, med, p, rd, &L, &thr, &lambda, &invPdfLambda, 1,
+                                       &one, &tech, rng);
+                }
                 if (directOnly) return L;                          // Whitted: single-scatter only
                 Real alb = medAlbedo(med, lambda);
                 if (rng.uniform() >= (double)alb) return L;        // absorbed
@@ -12125,8 +12240,9 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
 // Carries C wavelengths (hero + C-1 stratified secondaries) down ONE camera path: index 0
 // is the hero and drives every sampling decision off the same rng stream a single-λ path
 // would, while the secondaries ride the identical vertices and are reweighted per-λ. The
-// caller gates this to scenes WITHOUT participating media / GRIN / a physical lens, so those
-// branches are absent here. Fills Lout[0..C).
+// caller gates this to scenes whose media are all flat in extinction (Medium::achroSigma), with
+// no GRIN and no physical lens, so GRIN and lens branches are absent here; the media branch
+// carries the bundle through such media, as the host's does. Fills Lout[0..C).
 //
 // At a dispersive / wavelength-switching material (anything but Diffuse/DiffuseTransmit) the
 // bundle cannot keep riding one shared direction, and there are two policies:
@@ -12189,6 +12305,17 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
     for (int i = nLive; i < C; ++i) { lam[i] = 0;        invPdf[i] = 0.0;         thr[i] = 0.0; }
     for (int i = 0; i < C; ++i) Lout[i] = 0.0;
     double* L = Lout;                                  // accumulate straight into the output
+    // SPECTRAL MIS (SPECTRAL-BUNDLE; Wilkie et al. 2014), the host twin's state. Where a vertex
+    // samples its direction from a wavelength-dependent density -- a rainbow phase -- the bundle
+    // keeps riding: every wavelength carries its own f/pdf_hero, and the path takes the balance
+    // heuristic over which wavelength could have been the hero. `specR[j]` is wavelength j's
+    // path pdf over the hero's so far, `specTech[j]` whether j could have been the hero at all,
+    // and `specW = n / sum_j specR[j]` the weight in force, FOLDED INTO thr[]. Exactly 1 on a
+    // path that met no such vertex.
+    double specR[hero::kHeroMax];
+    bool   specTech[hero::kHeroMax];
+    for (int i = 0; i < C; ++i) { specR[i] = 1.0; specTech[i] = (i < nLive) && invPdf[i] > 0.0; }
+    double specW = 1.0;
     const bool whitted = (sc.bkWhitted != 0);
     // Gather rays are bounce-capped (see bkGiBounce) so a highly reflective lattice cannot
     // turn one gather direction into a 60-deep ricochet.
@@ -12216,6 +12343,27 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         // and that sub-path's first vertex is not a camera vertex.
         if (b == 0 && gi.depth == 0 && h.valid)
             h.fw = (Real)patShadingFootprint(sc.bkFwPerDist, (double)h.t, (double)dot(rd, h.n));
+
+        // PARTICIPATING MEDIA (SPECTRAL-BUNDLE; host twin: radianceHeroLoop). The bundle is here
+        // only when every medium's extinction is the same at every wavelength (the caller's
+        // gate), so the free flight, its transmittance and the albedo coin serve the whole
+        // bundle, exactly as the scalar twin's serve its one wavelength. The scattered direction
+        // is shared too unless the phase is a rainbow, whose lobes move with lambda: then the
+        // hero samples it and the bundle takes the spectral-MIS weight.
+        if (sc.mediaN > 0) {
+            Real tMed = 0; int whichMed = -1;
+            if (dMediaSampleCollisionOutOfLine(sc, ro, rd, h.valid ? h.t : (Real)1e30, lam[0],
+                                               rng, tMed, whichMed)) {
+                // A scatter is a vertex the material switch never sees, so the glossy MIS state of
+                // an earlier glossy bounce must not outlive it (see the scalar twin).
+                gmis.clear();
+                if (!bkMediumHeroStep(sc, sc.media[whichMed], tMed, stk, directOnly, ro, rd, L, thr,
+                                      lam, invPdf, nUp, specR, specTech, specW, contBsdfPdf, rng))
+                    return;
+                specularArrival = false;
+                continue;
+            }
+        }
 
         // Beer-Lambert over the in-glass segment. A non-empty stack implies the bundle already
         // collapsed to one λ here (a dielectric entry either de-heros or splits, and the split
@@ -12505,8 +12653,17 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 // estimate stays unbiased), then run the shared scalar interaction on the
                 // hero channel alone. Note bkInteract may itself switch lam[0]/invPdf[0]
                 // (a fluorescent Stokes shift) — legal now that index 0 is the only live
-                // wavelength.
-                if (secAlive) { thr[0] *= (double)C; secAlive = false; }
+                // wavelength. The spectral-MIS weight comes back OUT first (host twin:
+                // deHero): the balance heuristic needs every "wavelength j was the hero"
+                // technique to deliver its share, and past here only the hero's own does, so
+                // the weights in force would sum to less than 1. Unweighted, the survivor is
+                // the plain hero estimate times C, unbiased on its own.
+                if (secAlive) {
+                    thr[0] *= (double)C / specW;
+                    secAlive = false;
+                    specW = 1.0;
+                    for (int j = 0; j < C; ++j) specR[j] = 1.0;
+                }
                 bool heroNull2 = false;
                 if (!bkInteract<false>(sc, mp, h, matId, diffraction, directOnly, ro, rd, lam[0],
                                        invPdf[0], thr[0], L[0], specularArrival, contBsdfPdf, stk,
@@ -12670,7 +12827,8 @@ __device__ static double bkGiGather(const DScene& sc, int diffraction, const DHi
 // `heroC` > 1 selects the hero-wavelength bundle (bkRadianceHero): one stratified base
 // draw yields C wavelengths that share a single BVH walk, each splatting L/C. heroC == 1
 // runs the classic single-λ estimator bit-for-bit (the host gates heroC to 1 whenever the
-// scene has media / GRIN / a physical lens, which bkRadianceHero does not cover).
+// scene has a medium whose extinction varies with λ, GRIN or a physical lens, which
+// bkRadianceHero does not cover).
 __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
                           long long totalSamples, long long chunkSpp, long long sppTotal,
                           long long sampleBase, int resX,
@@ -20639,12 +20797,15 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
         up.sc.bkAmbient   = whitted->ambient;
         up.sc.bkFwPerDist = whitted->fwPerDist;   // O8 stage 2 (mode W only — see DScene)
     }
-    // Hero-wavelength bundle (`-heroc N`). bkRadianceHero covers the plain surface walk
-    // only, so fall back to the single-λ estimator when the scene needs a branch it does
-    // not carry: participating media, gradient-index bending, or a physical lens (whose
+    // Hero-wavelength bundle (`-heroc N`). Fall back to the single-λ estimator when the scene
+    // needs a branch bkRadianceHero does not carry: a medium whose extinction varies with λ
+    // (per-λ free flights; a flat one, Medium::achroSigma, shares its flights, transmittance
+    // and albedo coin across the bundle), gradient-index bending, or a physical lens (whose
     // per-λ refraction would give each wavelength its own camera ray). Same gate as the
     // CPU BackwardRenderer::renderRows, so CPU and GPU mode R agree on when hero applies.
-    const int effHeroC = (heroC > 1 && up.sc.mediaN == 0 && !up.sc.hasGrin && !cam.hasLens())
+    bool mediaFlat = true;
+    for (const Medium& md : scene.media) if (!md.achroSigma) { mediaFlat = false; break; }
+    const int effHeroC = (heroC > 1 && mediaFlat && !up.sc.hasGrin && !cam.hasLens())
                              ? ((heroC > hero::kHeroMax) ? hero::kHeroMax : heroC) : 1;
 
     const size_t npix = (size_t)resX * resY;

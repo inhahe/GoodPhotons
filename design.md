@@ -3818,6 +3818,13 @@ as the one at fault.
   (known-issues SPECTRAL-BUNDLE).
   At a fiber the secondaries' values come from the hero's lobes (`hair::LobeAngular`, one exp each)
   for a solid fiber, as in mode R's Hair case and mode M's spectral fold.
+  **GPU mode R (0.379.0)** takes the host's gate (`renderBackwardCuda`: every medium
+  `achroSigma`), and `bkRadianceHeroLoop` the host's medium block, spectral-MIS state and
+  `specW`-dividing de-hero. Every bundle shadow leg on the device draws one transmittance at the
+  hero's wavelength (`bkNeeLightHero`, `bkNeeEnvHero`, `bkNeeVolumeHero`, `bkNeeEnvVolumeHero`; a
+  vacuum scene draws none and multiplies by exactly 1, so media-free renders are unchanged), and
+  the scalar walk's volume NEE is `bkNeeVolumeHero` / `bkNeeEnvVolumeHero` at one wavelength, as
+  the host's is.
 
   **Split-at-dispersion (`heroSplit`)** mirrors the forward tracer's policy: the bounce
   loop is factored out as **`radianceHeroLoop`** (`radianceHero` is now a thin wrapper
