@@ -18945,6 +18945,16 @@ static int run(int argc, char** argv) {
     // Descartes angles across the spectrum + Airy/normalisation checks, then exits.
     if (argc >= 2 && !std::strcmp(argv[1], "-rainbow-selftest")) {
         rainbow::RainbowPhase::selfTest();
+#ifdef HAVE_CUDA
+        // The device's twin of the sampler, against the same tables (samplerFit).
+        if (cudaAvailable()) {
+            rainbow::RainbowPhase rp;
+            rp.build(rainbow::Params{});
+            rp.samplerFit("device", [&](double lam, long long n, std::vector<double>& counts) {
+                return cudaRainbowSampleHist(rp, lam, n, counts);
+            });
+        }
+#endif
         return 0;
     }
     long long N = 2'000'000;

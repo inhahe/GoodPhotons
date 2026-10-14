@@ -1847,12 +1847,18 @@ __device__ static DVec3 sampleHG(const DVec3& wi, Real g, DRng& rng) {
 // analytic lobe. dMedPhase returns the solid-angle phase value p(cos) at wavelength
 // lambda, which equals the sampling pdf of dMedPhaseSample for BOTH models. Table math is
 // done in double to track the CPU tracer bit-closely.
-__device__ static Real dRbEval(const DMedium& m, Real cosTheta, Real lambda) {
-    double fl = ((double)lambda - m.rbLam0) / m.rbDLam;
-    int li = (int)floor(fl); double tl = fl - li;
+// The two wavelength rows bracketing `lambda` and the weight of the upper one: row li with weight
+// 1 - tl, row li + 1 with tl; outside the table, the end row (host twin: RainbowPhase::rows).
+__device__ static void dRbRows(const DMedium& m, Real lambda, int& li, double& tl) {
+    const double fl = ((double)lambda - m.rbLam0) / m.rbDLam;
+    li = (int)floor(fl); tl = fl - li;
     if (li < 0) { li = 0; tl = 0.0; }
     if (li > m.rbNLam - 2) { li = m.rbNLam - 2; tl = 1.0; }
     if (tl < 0.0) tl = 0.0; else if (tl > 1.0) tl = 1.0;
+}
+__device__ static Real dRbEval(const DMedium& m, Real cosTheta, Real lambda) {
+    int li; double tl;
+    dRbRows(m, lambda, li, tl);
     double dMu = 2.0 / (m.rbNMu - 1);
     double fm = ((double)cosTheta + 1.0) / dMu;
     int mi = (int)floor(fm); double tm = fm - mi;
@@ -1869,20 +1875,33 @@ __device__ static Real dMedPhase(const DMedium& m, Real cosTheta, Real lambda) {
     return hgPhase(cosTheta, (Real)m.g);
 }
 // Importance-sample a scattered direction about propagation `wi` at wavelength lambda;
-// sets pdfOut = p(cos) of the chosen direction. Mirrors host Medium::phaseSample.
+// sets pdfOut = p(cos) of the chosen direction -- for a rainbow, the density the direction was drawn
+// from exactly: dRbEval's mixture of two rows' piecewise-linear densities, sampled as one (host
+// twin: RainbowPhase::sample, where the derivation is). Mirrors host Medium::phaseSample.
 __device__ static DVec3 dMedPhaseSample(const DMedium& m, const DVec3& wi, Real lambda, DRng& rng, Real& pdfOut) {
     if (m.rbPdf) {
-        int li = (int)lround(((double)lambda - m.rbLam0) / m.rbDLam);
-        if (li < 0) li = 0;
-        if (li > m.rbNLam - 1) li = m.rbNLam - 1;
-        const double* cdf = &m.rbCdf[(size_t)li * m.rbNMu];
+        int li; double tl;
+        dRbRows(m, lambda, li, tl);
         double u = (double)rng.uniform();
+        int row = li;                              // the row, u rescaled to [0, 1) for its CDF
+        if (u < 1.0 - tl) u /= (1.0 - tl);
+        else { row = li + 1; u = (tl > 0.0) ? (u - (1.0 - tl)) / tl : 0.0; }
+        if (!(u < 1.0)) u = 0.99999999999999989;
+        const double* cdf = &m.rbCdf[(size_t)row * m.rbNMu];
+        const double* pdf = &m.rbPdf[(size_t)row * m.rbNMu];
         int lo = 0, hi = m.rbNMu - 1;
         while (lo + 1 < hi) { int mid = (lo + hi) >> 1; if (cdf[mid] < u) lo = mid; else hi = mid; }
         double c0 = cdf[lo], c1 = cdf[hi];
-        double t = (c1 > c0) ? (u - c0) / (c1 - c0) : 0.0;
+        double s = 0.0;                            // the linear density's CDF inverted in the cell
+        if (c1 > c0) {
+            const double t = fmin(1.0, fmax(0.0, (u - c0) / (c1 - c0)));
+            const double a = pdf[lo], b = pdf[hi];
+            const double den = a + sqrt(fmax(0.0, a * a + t * (b * b - a * a)));
+            s = (den > 0.0) ? t * (a + b) / den : t;
+            s = fmin(1.0, fmax(0.0, s));
+        }
         double dMu = 2.0 / (m.rbNMu - 1);
-        double mu = -1.0 + (lo + t) * dMu;
+        double mu = -1.0 + (lo + s) * dMu;
         if (mu < -1.0) mu = -1.0; else if (mu > 1.0) mu = 1.0;
         Real sinT = sqrt(fmax((Real)0, (Real)1 - (Real)(mu * mu)));
         Real phi = (Real)2 * (Real)DPI * rng.uniform();
@@ -1894,6 +1913,30 @@ __device__ static DVec3 dMedPhaseSample(const DMedium& m, const DVec3& wi, Real 
     DVec3 d = sampleHG(wi, (Real)m.g, rng);
     pdfOut = hgPhase(dot(wi, d), (Real)m.g);
     return d;
+}
+
+// The rainbow sampler's own test (cudaRainbowSampleHist, `-rainbow-selftest`): `n` draws of
+// dMedPhaseSample about +z at `lambda`, mu histogrammed one bin per table cell.
+__global__ void kRainbowSampleHist(DMedium m, Real lambda, long long n, unsigned long long seed,
+                                   double* hist) {
+    const long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long G = (long long)gridDim.x * blockDim.x;
+    const double dMu = 2.0 / (m.rbNMu - 1);
+    for (long long i = g; i < n; i += G) {
+        // Both words through dMix64, as the host's seedUnit does. Raw consecutive indices (the
+        // render kernels' `seed(i*2+1, base^i)`) put draws on adjacent PCG streams, whose first
+        // outputs are measurably non-uniform at this histogram's resolution (chi^2/dof 1.33 at
+        // 650 nm with an exact sampler: known-issues DEVICE-SEED-ADJACENT) -- a property of the
+        // seeding, not of what this tests.
+        const unsigned long long k = (unsigned long long)i;
+        DRng rng; rng.seed(dMix64(k ^ seed), dMix64(k + seed));
+        Real pdf = 0;
+        const DVec3 d = dMedPhaseSample(m, DVec3((Real)0, (Real)0, (Real)1), lambda, rng, pdf);
+        int b = (int)(((double)d.z + 1.0) / dMu);
+        if (b < 0) b = 0;
+        if (b > m.rbNMu - 2) b = m.rbNMu - 2;
+        atomicAdd(&hist[b], 1.0);
+    }
 }
 
 // CIE 1931 CMF (analytic multi-Gaussian fit — same as color.h).
@@ -17926,6 +17969,40 @@ bool cudaPatOpProbe(const PatNode* prog, const int* off, const int* len, int nPr
     }
     cudaFree(dP); cudaFree(dPF); cudaFree(dO); cudaFree(dL); cudaFree(d64); cudaFree(d32);
     cudaFree(dIn);
+    return ok;
+}
+
+bool cudaRainbowSampleHist(const rainbow::RainbowPhase& rp, double lambda, long long n,
+                           std::vector<double>& counts) {
+    if (!cudaAvailable() || !rp.built() || n <= 0) return false;
+    const std::vector<double>& pdf = rp.pdfTable();
+    const std::vector<double>& cdf = rp.cdfTable();
+    const size_t nb = (size_t)rp.nMu() - 1;
+    double *dPdf = nullptr, *dCdf = nullptr, *dHist = nullptr;
+    bool ok = cudaMalloc(&dPdf, pdf.size() * sizeof(double)) == cudaSuccess &&
+              cudaMalloc(&dCdf, cdf.size() * sizeof(double)) == cudaSuccess &&
+              cudaMalloc(&dHist, nb * sizeof(double)) == cudaSuccess;
+    if (ok) ok = cudaMemcpy(dPdf, pdf.data(), pdf.size() * sizeof(double),
+                            cudaMemcpyHostToDevice) == cudaSuccess &&
+                 cudaMemcpy(dCdf, cdf.data(), cdf.size() * sizeof(double),
+                            cudaMemcpyHostToDevice) == cudaSuccess &&
+                 cudaMemset(dHist, 0, nb * sizeof(double)) == cudaSuccess;
+    if (ok) {
+        gpu::DMedium m{};
+        m.rbPdf = dPdf; m.rbCdf = dCdf;
+        m.rbNLam = rp.nLam(); m.rbNMu = rp.nMu();
+        m.rbLam0 = rp.lam0(); m.rbDLam = rp.dLam();
+        gpu::kRainbowSampleHist<<<2048, 128>>>(m, (gpu::Real)lambda, n, 0x5EEDF00DULL, dHist);
+        ok = cudaDeviceSynchronize() == cudaSuccess && cudaGetLastError() == cudaSuccess;
+    }
+    if (ok) {
+        counts.assign(nb, 0.0);
+        ok = cudaMemcpy(counts.data(), dHist, nb * sizeof(double),
+                        cudaMemcpyDeviceToHost) == cudaSuccess;
+    }
+    if (dPdf)  cudaFree(dPdf);
+    if (dCdf)  cudaFree(dCdf);
+    if (dHist) cudaFree(dHist);
     return ok;
 }
 

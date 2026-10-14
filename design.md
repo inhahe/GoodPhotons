@@ -7061,6 +7061,14 @@ as the one at fault.
   (`on → dispersion 0`, `off → 0.577`) with a one-time note. Same change fixed `airyAi(x)`
   returning **0** below `x = -30` (the RK4 table's floor), which hard-clipped the bow interior
   where the `Ai²` envelope is still at 35% of peak; it now falls through to the exact asymptotic.
+  **Sampling draws exactly the density `eval` reports (0.380.1).** `eval` is bilinear in
+  (λ, µ): two wavelength rows' piecewise-linear densities mixed by `rows()`'s weights. `sample`
+  picks the row by those weights and inverts that row's linear density within the chosen cell (a
+  quadratic), so `pdfOut` is the sampling density -- which every analog walk assumes and the
+  spectral MIS at a rainbow scatter weighs by. It used to invert the NEAREST row's CDF linearly:
+  up to 11 sigma off in a 40 M-sample histogram halfway between rows. The device's
+  `dMedPhaseSample` is the same code; `ftrace -rainbow-selftest` histograms both
+  (`samplerFit`, `cudaRainbowSampleHist`; `tools/check_rainbow_sampler.py`).
 - **`meshvoxel.h` — mesh containment for fog bounds.** `medium { bounds { object "<mesh>" } }`
   used to degrade to the mesh's AABB; `meshvox::voxelizeSolid` now **solid-voxelizes** the
   named mesh into an occupancy `VdbGrid` (`MediumBound::Mesh`, `Medium::boundGrid`,

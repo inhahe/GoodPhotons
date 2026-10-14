@@ -571,6 +571,11 @@ std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
 // fails; the caller then reports the device half as SKIPPED rather than failed.
 #include "lattice_probe.h"
 bool cudaLatticeProbe(const unsigned long long* idx, int n, double* out);
+// `-rainbow-selftest`'s device half (rainbow::RainbowPhase::samplerFit): `n` draws of the device's
+// rainbow phase sampler (dMedPhaseSample) about +z at `lambda`, mu = cos theta histogrammed one bin
+// per table cell into `counts`. False if there is no device, or it failed.
+bool cudaRainbowSampleHist(const rainbow::RainbowPhase& rp, double lambda, long long n,
+                           std::vector<double>& counts);
 
 // Run a batch of pattern programs through BOTH device VMs and hand the results back for
 // the host to compare against its own `patternEval` — the parity check behind `-checkpatops`.

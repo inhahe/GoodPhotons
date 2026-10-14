@@ -128,6 +128,42 @@ the camera splat, so nothing they count goes missing -- only the variance moves.
 now an eighth of the card (at least 768 MB), so it binds later. `tools/check_vcm_store.py`
 holds the 1600x1600 frame to the 160x160 one; 0.379.2 fails it.
 
+## DONE (2026-10-14, 0.380.1): RAINBOW-SAMPLE — the rainbow phase sampler drew from a density other than the one it reported
+
+`RainbowPhase::sample` (and the device's `dMedPhaseSample`) inverted the NEAREST wavelength row's
+CDF, piecewise-linearly, while reporting as the direction's density `eval()`'s bilinear value --
+a mix of the two bracketing rows. Every analog walk takes that value for the sampling density, and
+so does the spectral MIS at a rainbow scatter (0.375.0 host, 0.379.0 device), which weighs each
+wavelength by its density over the hero's. Measured (40 M draws a wavelength, one histogram bin
+per table cell, against `eval`'s mass per cell): halfway between two rows **chi^2/dof 1.54, worst
+bin 10.8 sigma** on the bows; a quarter of the way 1.26; on a row 0.98. Found while porting the
+spectral MIS to the device. Fixed: `sample` picks the row by the bilinear weights and inverts the
+row's linear density within the cell exactly (1.04 / 1.01 / 0.98 after); the device is the same
+code, and the host's `eval` takes the device's edge clamping (`rows()`), so both read one table
+the same way. `ftrace -rainbow-selftest` runs the histogram on host and device
+(`tools/check_rainbow_sampler.py`). The images change only at the table's resolution (rows 5 nm
+apart, cells 0.001 in cos theta), so no render measurably moved; the point is that the density the
+weights use is the one the walk sampled.
+
+## OPEN (2026-10-14, to measure): DEVICE-SEED-ADJACENT — raw-index seeding puts device samples on adjacent PCG streams, whose first draws are not uniform at fine scale
+
+The device kernels seed one generator per sample from the raw index -- `kBackward`
+`rng.seed(gidx*2+1, seedBase^gidx)`, `kTrace` the same per thread -- so consecutive samples sit on
+ADJACENT PCG32 streams (increments 4i+3), which differ only by an additive constant in one LCG.
+The host never does this: `seedUnit` pushes both words through `mix64`. GPU-VARIANCE's item 12
+measured the forward deposit with per-photon hashed seeding and found its variance unchanged
+(0.05 %), so it was dismissed there. New evidence, from RAINBOW-SAMPLE's histogram test: the
+FIRST draws of such generators are measurably non-uniform at fine scale. 40 M draws of the (exact)
+rainbow sampler through a 2047-cell inverse CDF, each from its own generator: raw consecutive
+seeding **chi^2/dof 1.27 and 1.33** at 501.25 and 650 nm (reproduced bit-for-bit on the host's
+Pcg32 seeded the same way); one long stream 1.01 / 0.98; hashed seeding (`mix64` on both words)
+0.97 / 1.07. So any device inverse-CDF draw made FIRST off a fresh generator, from a table with
+cells of ~1e-6 probability, takes slightly wrong probabilities: the camera's wavelength (its own
+CDF), a light-tree or emitter choice among many lights, an image environment's texel. Not yet seen
+in an image. To do: seed every device kernel as `seedUnit` does (`dMix64` on both words -- the
+rainbow sampler's test kernel already does), and measure what moves; until then, a test that
+histograms a device sampler at this resolution must seed that way itself.
+
 ## OPEN (2026-10-14, tech debt): GPU-STACK-DRIFT — every kernel's stack reservation moves when unrelated device code changes
 
 Each megakernel reserves its per-thread stack (`cudaFuncAttributes::localSizeBytes`, the

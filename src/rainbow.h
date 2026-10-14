@@ -31,7 +31,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <functional>
-#include "linalg.h"     // Vec3, onb, PI
+#include "geometry.h"   // Vec3, onb (linalg.h), PI
 #include "rng.h"        // Pcg32
 #include "color.h"      // LAMBDA_MIN / LAMBDA_MAX
 
@@ -332,11 +332,21 @@ public:
     const std::vector<double>& pdfTable() const { return pdf_; }
     const std::vector<double>& cdfTable() const { return cdf_; }
 
-    // Phase value p(mu) at wavelength lambda (nm). Bilinear in (lambda, mu).
+    // The two wavelength rows bracketing `lambda` and the weight of the upper one: row li with
+    // weight 1 - tl, row li + 1 with tl. Outside the table, the end row (the device's dRbRows too).
+    void rows(double lambda, int& li, double& tl) const {
+        const double fl = (lambda - lam0_) / dLam_;
+        li = (int)std::floor(fl); tl = fl - li;
+        if (li < 0) { li = 0; tl = 0.0; }
+        if (li > nLam_ - 2) { li = nLam_ - 2; tl = 1.0; }
+        tl = std::max(0.0, std::min(1.0, tl));
+    }
+
+    // Phase value p(mu) at wavelength lambda (nm). Bilinear in (lambda, mu): the rows'
+    // piecewise-linear densities, mixed by rows()'s weights.
     double eval(double cosTheta, double lambda) const {
-        double fl = (lambda - lam0_) / dLam_;
-        int li = (int)std::floor(fl); double tl = fl - li;
-        li = std::max(0, std::min(nLam_ - 2, li)); tl = std::max(0.0, std::min(1.0, tl));
+        int li; double tl;
+        rows(lambda, li, tl);
         double fm = (cosTheta + 1.0) / (2.0 / (nMu_ - 1));
         int mi = (int)std::floor(fm); double tm = fm - mi;
         mi = std::max(0, std::min(nMu_ - 2, mi)); tm = std::max(0.0, std::min(1.0, tm));
@@ -347,19 +357,43 @@ public:
     }
 
     // Importance-sample a scattered direction about propagation `wi` at wavelength
-    // lambda; returns the direction and sets pdfOut = p(mu) = pdf over solid angle.
+    // lambda; returns the direction and sets pdfOut = p(mu) = pdf over solid angle -- the density
+    // the direction was drawn from, exactly: eval()'s mixture of two rows' piecewise-linear
+    // densities is sampled as one, the row by rows()'s weights and then mu within its cell by
+    // inverting the linear density's CDF there (a quadratic). An analog walk and the spectral MIS
+    // at a rainbow scatter both take pdfOut for that density. (Until 0.380.1 the nearest row's
+    // CDF was inverted linearly: pdfOut was eval's value but the draw a different density, up to
+    // 11 sigma apart in a 40 M-sample histogram halfway between rows, on the bows.)
     Vec3 sample(const Vec3& wi, double lambda, Pcg32& rng, double& pdfOut) const {
-        int li = (int)std::lround((lambda - lam0_) / dLam_);
-        li = std::max(0, std::min(nLam_ - 1, li));
-        const double* cdf = &cdf_[(size_t)li * nMu_];
+        int li; double tl;
+        rows(lambda, li, tl);
         double u = rng.uniform();
-        // Binary search the CDF for mu.
+        // The row, with u rescaled to [0, 1) for its own CDF.
+        int row = li;
+        if (u < 1.0 - tl) u /= (1.0 - tl);
+        else { row = li + 1; u = (tl > 0.0) ? (u - (1.0 - tl)) / tl : 0.0; }
+        if (!(u < 1.0)) u = std::nextafter(1.0, 0.0);
+        const double* cdf = &cdf_[(size_t)row * nMu_];
+        const double* pdf = &pdf_[(size_t)row * nMu_];
+        // Binary search the CDF for the cell.
         int lo = 0, hi = nMu_ - 1;
         while (lo + 1 < hi) { int m = (lo + hi) >> 1; if (cdf[m] < u) lo = m; else hi = m; }
-        double c0 = cdf[lo], c1 = cdf[hi];
-        double t = (c1 > c0) ? (u - c0) / (c1 - c0) : 0.0;
-        double dMu = 2.0 / (nMu_ - 1);
-        double mu = -1.0 + (lo + t) * dMu;
+        const double c0 = cdf[lo], c1 = cdf[hi];
+        // Within the cell the density is linear, a at its start and b at its end; the fraction t
+        // of the cell's mass lies below s (0..1 across the cell) where
+        // (a s + (b - a) s^2 / 2) / ((a + b) / 2) = t, solved in the form that stays exact as
+        // a -> b.
+        double s = 0.0;
+        if (c1 > c0) {
+            const double t = std::max(0.0, std::min(1.0, (u - c0) / (c1 - c0)));
+            const double a = pdf[lo], b = pdf[hi];
+            const double disc = a * a + t * (b * b - a * a);
+            const double den = a + std::sqrt(std::max(0.0, disc));
+            s = (den > 0.0) ? t * (a + b) / den : t;
+            s = std::max(0.0, std::min(1.0, s));
+        }
+        const double dMu = 2.0 / (nMu_ - 1);
+        double mu = -1.0 + (lo + s) * dMu;
         mu = std::max(-1.0, std::min(1.0, mu));
         double sinT = std::sqrt(std::max(0.0, 1.0 - mu * mu));
         double phi = 2.0 * PI * rng.uniform();
@@ -372,6 +406,15 @@ public:
     // Console self-test: print the primary/secondary Descartes angles across the
     // spectrum and a couple of sanity checks on the Airy function + normalisation.
     static void selfTest();
+
+    // Does a sampler draw from the density eval() reports? `draw(lambda, n, counts)` fills `counts`
+    // (nMu() - 1 bins, one per table cell, over mu = cos theta about the propagation direction)
+    // with n draws at `lambda`, or returns false if it cannot run. For each test wavelength --
+    // halfway between two rows, a quarter of the way, on one -- this prints chi^2 per degree of
+    // freedom of the histogram against eval()'s mass per cell, and the worst bin; ~1 means they
+    // agree. `who` names the sampler: selfTest() runs sample(), main.cpp the device's twin.
+    void samplerFit(const char* who,
+                    const std::function<bool(double, long long, std::vector<double>&)>& draw) const;
 
 private:
     // Build the droplet-size quadrature from p_.dispersion. See the long note above.
@@ -507,6 +550,46 @@ inline void RainbowPhase::selfTest() {
         }
         std::printf("[rainbow selftest] lambda=%.0fnm  2*pi*integral p dmu = %.4f (expect ~1.0)\n",
                     lam, 2.0 * PI * integ);
+    }
+    // sample() against the density it reports.
+    Pcg32 rng(12345u, 777u);
+    rp.samplerFit("host", [&](double lam, long long n, std::vector<double>& counts) {
+        const double dMu = 2.0 / (rp.nMu() - 1);
+        for (long long i = 0; i < n; ++i) {
+            double pdf = 0.0;
+            const Vec3 d = rp.sample(Vec3{0, 0, 1}, lam, rng, pdf);
+            const int b = (int)((d.z + 1.0) / dMu);
+            counts[(size_t)std::max(0, std::min(rp.nMu() - 2, b))] += 1.0;
+        }
+        return true;
+    });
+}
+
+inline void RainbowPhase::samplerFit(
+        const char* who,
+        const std::function<bool(double, long long, std::vector<double>&)>& draw) const {
+    const double dMu = 2.0 / (nMu_ - 1);
+    const long long n = 40000000;
+    for (double lam : {552.5, 501.25, 650.0}) {
+        std::vector<double> counts((size_t)nMu_ - 1, 0.0);
+        if (!draw(lam, n, counts)) {
+            std::printf("[rainbow selftest] sampler (%s): could not run\n", who);
+            return;
+        }
+        double chi2 = 0.0, worst = 0.0;
+        int dof = 0;
+        for (int b = 0; b + 1 < nMu_; ++b) {
+            const double mu0 = -1.0 + b * dMu, mu1 = mu0 + dMu;
+            // eval() is linear within a cell at a fixed wavelength, so the trapezoid is exact.
+            const double E = 2.0 * PI * 0.5 * (eval(mu0, lam) + eval(mu1, lam)) * dMu * (double)n;
+            if (E < 20.0) continue;
+            const double z = (counts[(size_t)b] - E) / std::sqrt(E);
+            chi2 += z * z;
+            ++dof;
+            worst = std::max(worst, std::fabs(z));
+        }
+        std::printf("[rainbow selftest] sampler (%s) at %.2f nm: chi2/dof %.3f over %d bins, worst "
+                    "bin %.1f sigma (expect ~1)\n", who, lam, dof ? chi2 / dof : 0.0, dof, worst);
     }
 }
 
