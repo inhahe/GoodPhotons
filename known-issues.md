@@ -115,29 +115,40 @@ twelve pairs (the coat x0.42-0.62 at 34-50 sigma, the half mirror x0.47 in red a
 own resolution, SPECGATHER-BIN-RESOLUTION, found here. A layered coat's coin (its Fresnel
 reflectance) is still taken at the walk's wavelength; it varies only with the coat's dispersion.
 
-## OPEN (2026-10-14): SPECGATHER-BIN-RESOLUTION — mode M's spectral carrier takes every factor at its bin's centre, so a sharp spectral edge inside a bin biases the colour
+## OPEN (2026-10-14): SPECGATHER-BIN-RESOLUTION — mode M's carrier resolves a spectral edge inside one of its bins badly where the edge changes which branches a coin can take
 
 Mode M's camera walk re-expresses its spectral factors at each photon's wavelength through a 24-bin
-carrier (`SpecThr` / `DSpecThr`, 19.6 nm bins over 360-830 nm): a photon in bin k gets the factors
-evaluated at bin k's centre. Where a factor changes within a bin, the photons on the far side of the
-change get the wrong value, and because the colour-matching weights change across the bin too, the
-error does not average out within the bin: it lands on a channel.
+carrier (`SpecThr` / `DSpecThr`, 19.6 nm bins over 360-830 nm), and since 0.381.2, where a coin's
+branches are not possible at every wavelength, divides by their probability averaged over the walk
+density, also over those bins (MODE-M-FOLD-SUPPORT). Both read each bin at its centre.
 
-Measured with `check_coat_modes`' close-framed tank (a thin-film ball whose substrate absorbs above
-an edge; MODE-M-FOLD-SUPPORT's scene) at 0.381.2, mode M host against mode R, the ball's two upper
-tiles: the edge as a ramp from 555 to 585 nm, green **x1.063** (4.6 sigma); a sharp edge on a bin
-boundary (555.83 nm), green x1.012 / x1.027 (within noise); a sharp edge on a bin CENTRE (546.04 nm),
-green **x0.77** (16.8 sigma), blue x1.18. A half mirror whose reflectance ramps from 560 to 600 nm
-reads green x1.065 (3.8 sigma). Any spectral factor does it -- a filter or coloured glass with a
-sharp edge, an interference coat's fast oscillation, a step in `substrate_k` -- not only coins; a
-smooth factor (most reflectances, a Fresnel term) is not affected at this resolution.
-`check_coat_modes` puts its spectral edges on a bin boundary (595 nm) so it tests the coins and not
-this.
+Measured with `check_coat_modes`' close-framed tank (a thin-film ball ranked as the water, its
+substrate absorbing above an edge -- pass-through below it, reflection above), mode M host against
+device mode R at 8192 spp, the ball's two upper tiles, 0.381.3:
 
-**Possible fixes:** more bins (cost: K factor evaluations per spectral event, and the carrier's
-size on the device stack); interpolating `v` between bin centres at the photon's wavelength (halves
-the error at a step, removes it for a linear ramp, costs nothing); or bins placed per scene at the
-spectral edges the materials actually have.
+| the substrate's edge | red | green | blue |
+|---|---|---|---|
+| step on a bin boundary (555.83 nm) | x1.005 / x1.002 | x1.013 / x1.004 | x0.983 / x0.990 |
+| wide ramp, k 0 at 480 to 2 at 680 nm | x1.001 / x0.997 | x0.970 / x1.047 (1.3 sigma) | x1.015 / x1.001 |
+| ramp, k 0 at 555 to 2 at 585 nm | x0.994 / x1.022 | **x1.064 / x1.100** (6 sigma) | x0.979 / x0.977 |
+| step at a bin CENTRE (546.04 nm) | x1.045 / x1.057 | **x0.762 / x0.756** (17 sigma) | **x1.154 / x1.155** (10 sigma) |
+
+A half mirror whose reflectance ramps from 560 to 600 nm reads green x1.065 (3.8 sigma). (Before
+0.381.2 every one of these was x0.5 or worse.)
+
+**Not the photon side's reading.** Reading the carrier linearly interpolated between bin centres at
+the photon's wavelength, instead of at the nearest centre, changed none of these (measured: A green
+x1.080 / x1.108, C x0.779 / x0.758) and was not kept. **The denominator's support is the
+step's error:** with the edge at bin 9's centre the whole bin counts as opaque, so the pass-through
+branch's averaged probability misses the clear half of bin 9's walk density (blue seen through the
+ball reads high, x1.15) and the reflection's counts it (the coat's reflection, green here, reads
+low, x0.76). The 555-585 nm ramp's green excess is not yet explained.
+`check_coat_modes` puts its edges on a bin boundary (595 nm) so it tests the coins and not this.
+
+**Proposed fix:** take the denominator's walk density per bin only over the part of the bin that
+can take the branches, resolved finer than the bin -- the support is cheap to test at sub-bin
+wavelengths (a coat's opacity is a spectrum lookup, total internal reflection one comparison of
+indices), while the probabilities themselves can stay at the centres. Then explain the ramp.
 
 ## DONE (2026-10-14, 0.381.1): REVIEW-0380 — what the Opus and Fable reviews of 0.379.0-0.380.0 found
 
