@@ -4620,6 +4620,14 @@ as the one at fault.
   made it -- as does the device's `kBdptT`. A light subpath also gives up only when the WHOLE
   bundle is dark where it starts, not the hero alone, as the spot / sun start already did.
 
+  **The eye walk makes `maxDepth + 2` vertices, the light walk `maxDepth + 1`** (0.378.4, pbrt's
+  convention). A path of depth d (d scattering vertices) made by s = 0 has d + 2 eye vertices, and
+  every weight counts s = 0 among a path's strategies -- so with `maxDepth + 1` eye vertices the
+  paths of depth exactly `maxDepth` were weighted for a strategy that could not make them and lost
+  its share: mode D read x0.936 of mode R at `-max-bounce 1` under a ceiling-sized lamp, x0.987 at 2
+  (`tools/check_bdpt_depth.py`). The connection loop's depth test refuses the longer strategies the
+  extra vertex would otherwise allow.
+
   Since **0.126.0 the same treatment runs on the GPU**, so a spot/sun scene no longer falls
   back to the CPU in mode `D`. `render_cuda.cu` mirrors every piece one-for-one:
   `dIsDeltaEmitter`/`dIsInfiniteEmitter`/`dIsDeltaLightVertex` classify a `DEmitter` (the

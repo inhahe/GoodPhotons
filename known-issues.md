@@ -313,7 +313,14 @@ device treats the strands' roots in shadow. Reproduce: `STUBBLE=1 python
 scraps/face/furball_dev.py <exe> <tag>` (scratch, git-ignored; the edit is two replacements in
 the SCENE list).
 
-## OPEN (2026-10-13): BDPT-LAST-DEPTH — mode D under-weights every path of exactly the maximum depth
+## DONE (2026-10-14, 0.378.4): BDPT-LAST-DEPTH — mode D under-weights every path of exactly the maximum depth
+
+**Fixed in 0.378.4:** the eye walk makes `maxDepth + 2` vertices on both backends.
+`tools/check_bdpt_depth.py` renders a closed box under a ceiling-sized lamp, where s = 0 carries a
+large share of the weight, at `-max-bounce 1` and 2: mode D read x0.935 and x0.987 of mode R (70
+and 12 sigma; the device alike), and now x0.9997 and x0.9999 (the device x1.0002, x1.0005). At the
+default depth of 8 the missing share was too small to see; every mode but D renders bit-identically.
+The report as filed:
 
 `BdptRenderer::renderRows` (and the device's `kBdptT`) generate the camera subpath with
 `maxDepth + 1` vertices -- the camera and `maxDepth` scene vertices -- where PBRT, whose structure

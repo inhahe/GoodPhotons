@@ -14463,7 +14463,9 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
         int nSegs = 0;
         // Only pay for escape tracking when the scene actually has a distant sun.
         DEscape esc; esc.escaped = 0; esc.beta = 0.0; esc.nUp = 1;
-        int nE = dGenCameraSubpath(sc, cam, diffraction, px, py, hb, maxDepth + 1, rng, eye, eyeSec, NS, MAXV,
+        // maxDepth + 2 eye vertices, so s = 0 can make a path of every depth it is weighted for
+        // (host twin: BdptRenderer::renderRows).
+        int nE = dGenCameraSubpath(sc, cam, diffraction, px, py, hb, maxDepth + 2, rng, eye, eyeSec, NS, MAXV,
                                    (sc.sunCount > 0) ? &esc : nullptr,
                                    mergeOn ? segs : nullptr, mergeOn ? &nSegs : nullptr,
                                    mergeOn ? (int)SEGN : 0);

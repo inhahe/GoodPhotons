@@ -3775,8 +3775,14 @@ struct BdptRenderer {
                     Escape esc;
                     const bool wantSegs = mergeOn || hasFire;
                     if (wantSegs) segs.clear();
+                    // maxDepth + 2 eye vertices, one more than the light subpath gets: a path of
+                    // depth d (d scattering vertices) made by s = 0 -- the eye walk landing on the
+                    // light -- has d + 2 of them, and every weight counts s = 0 among a path's
+                    // strategies, so the walk must be able to make each path up to maxDepth
+                    // (pbrt's convention; known-issues BDPT-LAST-DEPTH). Longer strategies are
+                    // refused by the depth test below.
                     int nE = generateCameraSubpath(scene, cam, mats, px, py, hb,
-                                                   maxDepth + 1, rng, eye,
+                                                   maxDepth + 2, rng, eye,
                                                    hasSun ? &esc : nullptr,
                                                    wantSegs ? &segs : nullptr);
                     int nL = generateLightSubpath(scene, cam, mats, hb,
