@@ -278,7 +278,7 @@ the same way. `ftrace -rainbow-selftest` runs the histogram on host and device
 apart, cells 0.001 in cos theta), so no render measurably moved; the point is that the density the
 weights use is the one the walk sampled.
 
-## OPEN (2026-10-14, to measure): DEVICE-SEED-ADJACENT — raw-index seeding puts device samples on adjacent PCG streams, whose first draws are not uniform at fine scale
+## DONE (2026-10-14, 0.381.3): DEVICE-SEED-ADJACENT — raw-index seeding put device samples on adjacent PCG streams, whose first draws are not uniform at fine scale
 
 The device kernels seed one generator per sample from the raw index -- `kBackward`
 `rng.seed(gidx*2+1, seedBase^gidx)`, `kTrace` the same per thread -- so consecutive samples sit on
@@ -296,6 +296,17 @@ CDF), a light-tree or emitter choice among many lights, an image environment's t
 in an image. To do: seed every device kernel as `seedUnit` does (`dMix64` on both words -- the
 rainbow sampler's test kernel already does), and measure what moves; until then, a test that
 histograms a device sampler at this resolution must seed that way itself.
+
+**Done in 0.381.3:** every device kernel seeds through `DRng::seedUnit` (both words through
+`dMix64`, the salt keeping two kernels that share an index apart) -- `kBackward`, the RGB backward,
+BDPT, mode M's gather and its wavelength rotation, SPPM, VCM's two passes, the forward trace (per
+thread, and per photon under `FTRACE_GPU_PHOTONSEED`), the wavefront pool, the beam gather. What
+moved, GPU, 0.381.2 against 0.381.3, four seeds each at 128 px: frame means x0.990-x1.010, none
+past 2 sigma (R on a Cornell box, an image sky, 48 lights and fog; D; U; M; B; S); worst tiles
+within 3.5 sigma of 16; noise x0.96-x1.025. Nothing in an image, as expected: the non-uniformity is
+in the first draws off a fresh generator, at the resolution of a 2000-cell table. The rainbow
+self-test's kernel seeds the same way, so `check_rainbow_sampler.py` guards it: a build whose
+`seedUnit` seeds from the raw index fails at 501.25 and 650 nm (chi^2/dof 1.270, 1.327).
 
 ## OPEN (2026-10-14, tech debt): GPU-STACK-DRIFT — every kernel's stack reservation moves when unrelated device code changes
 

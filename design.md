@@ -7908,7 +7908,10 @@ as the one at fault.
   functions (`renderedMode`), after the run loop applied the policy.
 - **`rng.h`** — Pcg32 + `seedUnit(rng, unitIndex, salt)` splitmix64 mixing:
   **every work unit (photon or pixel-sample) seeds its own stream**, so results are
-  independent of chunk splits / thread count / banding / `-resume` boundaries.
+  independent of chunk splits / thread count / banding / `-resume` boundaries. The device's
+  generators seed the same way (`DRng::seedUnit`, 0.381.3): seeded from raw consecutive indices
+  they sat on adjacent PCG32 streams, whose first draws are non-uniform at fine scale
+  (known-issues DEVICE-SEED-ADJACENT; `check_rainbow_sampler.py` histograms such first draws).
   `uniform()` is the ordinary `[0,1)` draw on the 24-bit grid `{k/2^24}`;
   **`uniformOpen()` (0.199.1)** is the `(0,1)` variant that every *exponential* draw must
   use. `uniform()` returns exactly 0 once in 2^24 draws, and the inverse-CDF free flight

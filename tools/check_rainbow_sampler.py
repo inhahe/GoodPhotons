@@ -14,6 +14,11 @@ rows, a quarter of the way, on a row -- one bin per table cell, against the repo
 in each, for the host's sampler and (when there is a GPU) the device's. This requires every chi^2
 per degree of freedom under 1.15 (about 5 standard deviations over ~2000 bins), and the device's
 lines to be there unless --no-gpu. Exits 1 on failure.
+
+Each device draw comes first off a generator of its own, seeded as every render kernel seeds one
+(DRng::seedUnit), so the device's lines also guard that seeding: seeded from raw consecutive
+indices, as the kernels were until 0.381.3, the exact sampler reads chi^2/dof 1.27 and 1.33
+(known-issues DEVICE-SEED-ADJACENT).
 """
 import argparse
 import os

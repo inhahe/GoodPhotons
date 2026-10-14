@@ -1599,9 +1599,8 @@ struct DCamera {
 
 // ============================ device helpers ============================
 
-// Device twin of rng.h's mix64 (splitmix64 finaliser). Exists because the FORWARD photon
-// pass needs a seed that avalanches: see kTrace, where seeding per-thread from a raw index
-// leaves neighbouring threads on adjacent PCG32 streams.
+// Device twin of rng.h's mix64 (splitmix64 finaliser): what DRng::seedUnit pushes both seed
+// words through.
 __device__ __forceinline__ unsigned long long dMix64(unsigned long long x) {
     x += 0x9E3779B97F4A7C15ULL;
     x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
@@ -1614,6 +1613,15 @@ struct DRng {
     __device__ void seed(unsigned long long seq, unsigned long long s) {
         state = 0; inc = (seq << 1u) | 1u;
         next(); state += s; next();
+    }
+    // One generator per sample from its index `k` and a `salt`, as the host's seedUnit (rng.h):
+    // both words through dMix64. Seeded from raw consecutive indices -- seed(k*2+1, salt^k) --
+    // neighbouring generators sit on ADJACENT PCG32 streams, which differ only by an additive
+    // constant in one LCG, and their first draws are measurably non-uniform at fine scale: an
+    // inverse CDF of ~2000 cells read chi^2/dof 1.3 (known-issues DEVICE-SEED-ADJACENT). Every
+    // kernel seeds this way; the salt keeps two kernels that share an index on different streams.
+    __device__ void seedUnit(unsigned long long k, unsigned long long salt) {
+        seed(dMix64(k ^ salt), dMix64(k + salt));
     }
     __device__ unsigned int next() {
         unsigned long long old = state;
@@ -1943,13 +1951,9 @@ __global__ void kRainbowSampleHist(DMedium m, Real lambda, long long n, unsigned
     const long long G = (long long)gridDim.x * blockDim.x;
     const double dMu = 2.0 / (m.rbNMu - 1);
     for (long long i = g; i < n; i += G) {
-        // Both words through dMix64, as the host's seedUnit does. Raw consecutive indices (the
-        // render kernels' `seed(i*2+1, base^i)`) put draws on adjacent PCG streams, whose first
-        // outputs are measurably non-uniform at this histogram's resolution (chi^2/dof 1.33 at
-        // 650 nm with an exact sampler: known-issues DEVICE-SEED-ADJACENT) -- a property of the
-        // seeding, not of what this tests.
-        const unsigned long long k = (unsigned long long)i;
-        DRng rng; rng.seed(dMix64(k ^ seed), dMix64(k + seed));
+        // One generator per draw, as the render kernels seed theirs (DRng::seedUnit): what this
+        // histograms is the draws a render makes first off a fresh generator.
+        DRng rng; rng.seedUnit((unsigned long long)i, seed);
         Real pdf = 0;
         const DVec3 d = dMedPhaseSample(m, DVec3((Real)0, (Real)0, (Real)1), lambda, rng, pdf);
         int b = (int)(((double)d.z + 1.0) / dMu);
@@ -6441,7 +6445,7 @@ __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm,
         if (!boxHit(bm.nodes[0], oc, invD, (Real)0, tMax, tRoot)) continue;
         int stack[64]; int sp = 0; stack[sp++] = 0;
         int stopPoll = 0;
-        DRng rng; rng.seed(sg.seed * 2 + 1, sg.seed ^ 0x9E3779B97F4A7C15ull);   // on-the-spot fallback only
+        DRng rng; rng.seedUnit(sg.seed, 0x9E3779B97F4A7C15ull);   // on-the-spot fallback only
         double fX = 0.0, fY = 0.0, fZ = 0.0;
         while (sp) {
             if ((++stopPoll & 63) == 0 && dGatherStopped()) break;
@@ -6506,8 +6510,7 @@ __global__ void kWfBeamEval(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm,
         double x2 = (double)d2 * (double)b.invRad * (double)b.invRad;
         if (x2 >= 1.0) x2 = 0.999999;   // the candidate passed x2 < 1 in kWfBeamHits; keep it
         DRng rng;
-        rng.seed((sg.seed ^ ((unsigned long long)h.beam * 0x9E3779B97F4A7C15ull)) * 2 + 1,
-                 sg.seed + (unsigned long long)hi);
+        rng.seedUnit(((unsigned long long)h.beam << 32) ^ (unsigned long long)(unsigned)hi, sg.seed);
         double oX = 0.0, oY = 0.0, oZ = 0.0;
         dBeamHitEval(sc, bm, b, h.beam, oc, dc, t, s, cosT, den, x2, sg.aGlass, rng,
                      &sg.mw, &sg.tr, env, oX, oY, oZ);
@@ -9885,28 +9888,17 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
                        int camMode, int heroC, int perPhotonSeed) {
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
-    DRng rng; rng.seed((unsigned long long)(g * 2 + 1), seedBase ^ (unsigned long long)g);
+    DRng rng; rng.seedUnit((unsigned long long)g, seedBase);
 
     double eEmitted = 0, eAbsorbed = 0, eSensor = 0, eEscaped = 0, eResidual = 0;
 
     for (long long i = g; i < N; i += G) {
-        // PER-PHOTON HASHED SEEDING (GPU-VARIANCE). The default path above seeds ONCE PER
-        // THREAD from a raw index: inc = 4g+3, state seeded from `seedBase ^ g`. Neighbouring
-        // threads therefore sit on ADJACENT PCG32 streams -- and a PCG "stream" is only a
-        // different additive constant in the same LCG, so adjacency is the canonical weak case.
-        // That is harmless wherever one stream feeds one INDEPENDENT estimator (kBackward seeds
-        // identically and mode R measures at exact parity, because correlation BETWEEN pixels
-        // cannot change any single pixel's variance). It is not harmless here: every photon
-        // feeds a SHARED map, and a gather pools ~500 of them drawn from many different threads,
-        // so stream correlation lands directly in the pooled estimate and the average stops
-        // converging like sqrt(N).
-        //
-        // This path instead seeds per PHOTON from the absolute photon index, both words pushed
-        // through dMix64 -- exactly what the host's seedUnit() does, and for the reason its
-        // comment gives. It also makes the deposit independent of the launch geometry.
+        // PER-PHOTON SEEDING (FTRACE_GPU_PHOTONSEED=1, a GPU-VARIANCE experiment). The default
+        // above seeds once per THREAD and runs that thread's photons along one stream; this
+        // seeds each photon from its absolute index instead, which makes the deposit independent
+        // of the launch geometry. GPU-VARIANCE measured the two at the same variance.
         if (perPhotonSeed)
-            rng.seed(dMix64((unsigned long long)i ^ seedBase),
-                     dMix64((unsigned long long)i + seedBase));
+            rng.seedUnit((unsigned long long)i, seedBase);
         if (heroC > 1) {
             // Hero-wavelength path: one BVH walk carries C stratified wavelengths, halving
             // chromatic noise. De-heros to the single-λ shadeStep at a dispersive interface.
@@ -10061,7 +10053,7 @@ __global__ void kWfInit(DScene sc, DCamSet cs, double* energy,
                         int* liveCount, unsigned long long seedBase, int camMode) {
     int slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= W) return;
-    DRng rng; rng.seed((unsigned long long)(slot * 2 + 1), seedBase ^ (unsigned long long)slot);
+    DRng rng; rng.seedUnit((unsigned long long)slot, seedBase);
     bool live = wfSpawn(sc, cs, energy, camMode, N, dispatched, st, slot, rng);
     st.rng[slot] = rng;
     if (live) atomicAdd(liveCount, 1);
@@ -13464,7 +13456,7 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
     for (long long idx = g; idx < totalSamples; idx += G) {
         long long pix = idx / chunkSpp;
         long long gidx = pix * sppTotal + sampleBase + (idx - pix * chunkSpp);
-        DRng rng; rng.seed((unsigned long long)(gidx * 2 + 1), seedBase ^ (unsigned long long)gidx);
+        DRng rng; rng.seedUnit((unsigned long long)gidx, seedBase);
         int px = (int)(pix % resX);
         int py = (int)(pix / resX);
         size_t o = ((size_t)py * resX + px) * 3;
@@ -13819,7 +13811,7 @@ __global__ void kBackwardRGB(DScene sc, DCamera cam, double* film, double* hits,
     for (long long idx = g; idx < totalSamples; idx += G) {
         long long pix = idx / chunkSpp;
         long long gidx = pix * sppTotal + sampleBase + (idx - pix * chunkSpp);
-        DRng rng; rng.seed((unsigned long long)(gidx * 2 + 1), seedBase ^ (unsigned long long)gidx);
+        DRng rng; rng.seedUnit((unsigned long long)gidx, seedBase);
         int px = (int)(pix % resX);
         int py = (int)(pix / resX);
 
@@ -15184,7 +15176,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
             pix = (long long)row * (long long)resX + px0;
         }
         long long gidx = pix * sppTotal + sampleBase + (idx - slot * chunkSpp);
-        DRng rng; rng.seed((unsigned long long)(gidx * 2 + 1), seedBase ^ (unsigned long long)gidx);
+        DRng rng; rng.seedUnit((unsigned long long)gidx, seedBase);
         int px = (int)(pix % resX);
         int py = (int)(pix / resX);
 
@@ -16487,7 +16479,7 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, D
         if ((poll++ & 3) == 0 && dGatherStopped()) return;
         long long pix  = idx / chunkSpp;
         long long gidx = pix * sppTotal + sampleBase + (idx - pix * chunkSpp);
-        DRng rng; rng.seed((unsigned long long)(gidx * 2 + 1), seedBase ^ (unsigned long long)gidx);
+        DRng rng; rng.seedUnit((unsigned long long)gidx, seedBase);
         int px = (int)(pix % resX);
         int py = (int)(pix / resX);
 
@@ -16505,8 +16497,7 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, D
         Real lambda;
         if (sppTotal > 1 && sIdx >= 0 && sIdx < sppTotal) {
             DRng rrot;
-            rrot.seed((unsigned long long)(pix * 2 + 1) ^ 0x5851F42D4C957F2DULL,
-                      seedBase ^ ((unsigned long long)pix + 0x9E3779B9ULL));
+            rrot.seedUnit((unsigned long long)pix, seedBase ^ 0x5851F42D4C957F2DULL);
             double u = (double)rrot.uniform() + ((double)sIdx + (double)rng.uniform()) / (double)sppTotal;
             u -= floor(u);
             if (!(u < 1.0)) u = 0.999999999;
@@ -16698,7 +16689,7 @@ __global__ void kSppmVisiblePoint(DScene sc, DCamera cam, DSppmState st, int res
         // Distinct stream per (pixel, pass).
         unsigned long long s = (unsigned long long)(pix) * 0x9E3779B97F4A7C15ULL
                              + (unsigned long long)passIdx * 0xD1B54A32D192ED03ULL;
-        DRng rng; rng.seed(s * 2 + 23, seedBase ^ s);
+        DRng rng; rng.seedUnit(s, seedBase + 23);
 
         double pdf = 0.0;
         Real lambda = dSampleSceneLambda(sc, rng, pdf);
@@ -16765,7 +16756,7 @@ __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, i
             unsigned long long s = (unsigned long long)(pix) * 0x9E3779B97F4A7C15ULL
                                  + (unsigned long long)passIdx * 0xD1B54A32D192ED03ULL
                                  + 0x5851F42D4C957F2DULL;
-            DRng grng; grng.seed(s * 2 + 23, seedBase ^ s);
+            DRng grng; grng.seedUnit(s, seedBase + 23);
             const double cs = dGatherAreaScale(sc.gaBias,
                 dGatherCoverage(sc, h.p, h.n, (Real)R, grng, sc.gatherArea));
             gx = (float)((double)gx * cs);
@@ -17104,7 +17095,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
         lvCount[i] = 0;
         unsigned long long s = (unsigned long long)i * 0x9E3779B97F4A7C15ULL
                              + (unsigned long long)passIdx * 0xD1B54A32D192ED03ULL;
-        DRng rng; rng.seed(s * 2 + 55, seedBase ^ s);
+        DRng rng; rng.seedUnit(s, seedBase + 55);
 
         // Hero + C-1 stratified secondaries from ONE base uniform (u + k/C wrapped into [0,1)),
         // pushed through the same inverse CDF as the scalar draw — so C == 1 consumes the
@@ -17453,7 +17444,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
         int px = (int)(i % resX), py = (int)(i / resX);
         unsigned long long s = (unsigned long long)i * 0xC2B2AE3D27D4EB4FULL
                              + (unsigned long long)passIdx * 0xA24BAED4963EE407ULL;
-        DRng rng; rng.seed(s * 2 + 77, seedBase ^ s);
+        DRng rng; rng.seedUnit(s, seedBase + 77);
 
         double rx = 0, ry = 0, rz = 0;
         double cieCx = (double)cieX(lambda), cieCy = (double)cieY(lambda), cieCz = (double)cieZ(lambda);
@@ -18280,7 +18271,7 @@ kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
         // Seeded by ABSOLUTE subpath index, exactly as the host pass is ("so the map is
         // identical for any thread count"), so the realization depends on (index, salt) and
         // not on the launch geometry.
-        DRng rng; rng.seed((unsigned long long)(i * 2 + 1), seedBase ^ (unsigned long long)i);
+        DRng rng; rng.seedUnit((unsigned long long)i, seedBase);
         DHeroBundle hb;
         double pdfLam = 0.0;
         hb.lam[0] = dSampleSceneLambda(sc, rng, pdfLam);
