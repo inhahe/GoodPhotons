@@ -361,9 +361,8 @@ public:
     // the direction was drawn from, exactly: eval()'s mixture of two rows' piecewise-linear
     // densities is sampled as one, the row by rows()'s weights and then mu within its cell by
     // inverting the linear density's CDF there (a quadratic). An analog walk and the spectral MIS
-    // at a rainbow scatter both take pdfOut for that density. (Until 0.380.1 the nearest row's
-    // CDF was inverted linearly: pdfOut was eval's value but the draw a different density, up to
-    // 11 sigma apart in a 40 M-sample histogram halfway between rows, on the bows.)
+    // at a rainbow scatter both take pdfOut for that density, so the draw must follow it exactly
+    // (`ftrace -rainbow-selftest` histograms both backends' draws against it).
     Vec3 sample(const Vec3& wi, double lambda, Pcg32& rng, double& pdfOut) const {
         int li; double tl;
         rows(lambda, li, tl);

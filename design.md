@@ -2330,10 +2330,15 @@ the ray, and what mode M's spectral gather needs to re-express the step at each 
 wavelength: its own branch factor (`factor`, from `branchFactor`) and `stepFactorAt`, the same
 quantity at any other wavelength -- the probability of the branch the coin took there (a coat's
 whole interference colour, a dispersive Fresnel term) times the radiance factor. Both come from
-`interfaceOptics`, so the coin and the gather's ratio agree by construction.
+`interfaceOptics`, so the coin and the gather's ratio agree by construction. A coat clear at some
+wavelengths and opaque at others (a `substrate_k` that is zero over part of the band) is a medium
+only where it is clear, so the priority rule suppresses it only there: the step records whether
+the rule applies (`suppressible`), and at a wavelength whose clarity differs from the walk's, the
+branch the walk took has probability 0. (The fold is still biased there, as wherever the branches a
+step can take depend on the wavelength: known-issues MODE-M-FOLD-SUPPORT.)
 Modes M and S send coated bodies through it too (until 0.378.5 their camera walks bounced off a
 coat as off a half mirror). The device's twin is `dDielectricStep` (with `dExteriorIor`,
-`dInterfaceOptics` and `dStepFactorAt`, folded through `DSpecThr::mul`), whose `radianceScale` argument -- non-null on a
+`dInterfaceOptics`, the `DStepRecord` it fills and `dStepFactorAt`, folded through `DSpecThr::mul`), whose `radianceScale` argument -- non-null on a
 camera-side walk -- every caller states, as `dVcmScatter`'s callers do. Like a glass body, a
 coated one must be closed: a ray that refracts in through an open surface stays "inside" it.
 Mode W's two air-unit quantities, its 1/512 throughput cutoff and its flat `-ambient` fill, are
@@ -3802,7 +3807,8 @@ as the one at fault.
   sampled the prefix, so a MIS-weighted prefix would be biased past it;
   (3) the survival test on the vertex factor caps q at 1 (a secondary the hero under-samples can
   gain weight). Participating media enter the bundle when every medium's extinction is flat in λ
-  (`Medium::achroSigma`, renderRows' gate): free flight, transmittance and albedo coin are shared,
+  (`Scene::mediaKeepBundle`, every `Medium::achroSigma`; renderRows' gate): free flight,
+  transmittance and albedo coin are shared,
   and the medium block in `radianceHeroLoop` mirrors the scalar one with per-λ albedo/phase/SPD.
   A chromatic-coat split re-enters its vertex, so it passes the parent's coat coin
   (`reentryCoatU`) and skips the first segment's free flights (`firstSegSampled`) -- each a
@@ -3822,8 +3828,8 @@ as the one at fault.
   (known-issues SPECTRAL-BUNDLE).
   At a fiber the secondaries' values come from the hero's lobes (`hair::LobeAngular`, one exp each)
   for a solid fiber, as in mode R's Hair case and mode M's spectral fold.
-  **GPU mode R (0.379.0)** takes the host's gate (`renderBackwardCuda`: every medium
-  `achroSigma`), and `bkRadianceHeroLoop` the host's medium block, spectral-MIS state and
+  **GPU mode R (0.379.0)** takes the host's gate (`renderBackwardCuda`:
+  `Scene::mediaKeepBundle`), and `bkRadianceHeroLoop` the host's medium block, spectral-MIS state and
   `specW`-dividing de-hero. Every bundle shadow leg on the device draws one transmittance at the
   hero's wavelength (`bkNeeLightHero`, `bkNeeEnvHero`, `bkNeeVolumeHero`, `bkNeeEnvVolumeHero`; a
   vacuum scene draws none and multiplies by exactly 1, so media-free renders are unchanged), and
@@ -4160,7 +4166,7 @@ as the one at fault.
   `double` off integer inputs, so the *quadrature points themselves* are bit-exact against
   the CPU even though the trace around them is not. `render.h`'s `glossyDirUV` /
   `sampleGlossy` factoring is mirrored on the device so the deterministic and stochastic
-  lobe samplers share one body, and `refractOrReflect` / `dDielectricStep` gained the same
+  lobe samplers share one body, and `interfaceStep` / `dDielectricStep` gained the same
   `whittedWeight` out-param contract.
 
   Two details of the port are load-bearing. (1) **`sIdx` is not `gidx`.** The device seeds
@@ -5932,8 +5938,9 @@ as the one at fault.
   `filmToRgb8` is the single choke point for both `writeFilm` and the live window, the
   preview shows exactly what the file gets. **It filters CHROMA ONLY and leaves luma
   bit-identical** — a deliberate design choice, not a weak default: spectral paths carry
-  one wavelength, so wherever the hero-wavelength bundle is unavailable (participating
-  media, dispersive refraction) the variance is overwhelmingly chromatic, while luma is
+  one wavelength, so wherever the hero-wavelength bundle is unavailable (a medium whose
+  extinction varies with wavelength, dispersive refraction) the variance is overwhelmingly
+  chromatic, while luma is
   already converging at 1/spp. Measured against an 8000 spp reference of `gallery_rain`,
   filtering luma made the image *worse* (−2.4 dB; it cannot distinguish a wire or caustic
   rim from a noise spike), so `-denoise-luma` exists but defaults off. Three invariants are
@@ -7901,7 +7908,7 @@ as the one at fault.
   forward paths, GPU R and BDPT, M deposit/gather, device twins of hero sampling.
   GPU backward (`bkRadiance`) supports **participating media** natively since
   0.23.0 (free-flight `dMediaSampleCollision` competing with the surface hit,
-  volume NEE `bkNeeVolume`, Beer–Lambert `dMediaTransmittance` on NEE + throughput,
+  volume NEE `bkNeeVolumeHero`, Beer–Lambert `dMediaTransmittance` on NEE + throughput,
   HG scatter + albedo Russian roulette) — homogeneous *and* heterogeneous, and over the
   **whole** `scene.media` vector by Poisson superposition (bounds regions and density
   fields honoured). This was strictly ahead of the CPU twin until **0.254.0**, which closed
@@ -7932,11 +7939,11 @@ as the one at fault.
   excitation-wavelength NEE, `gOut = M(lambda)/Mint * invPdf`, stochastic
   elastic/reemit/absorb continuation — baked `fluoEmitSpec`/`fluoMint` on the
   device material). Since 0.25.0 it does a **constant environment light**
-  (`bkNeeEnv` surface-vertex + `bkNeeEnvVolume` fog-vertex env-NEE, uniform-sphere
+  (`bkNeeEnv` surface-vertex + `bkNeeEnvVolumeHero` fog-vertex env-NEE, uniform-sphere
   sample, balance-heuristic MIS against a tracked `contBsdfPdf`, MIS'd env-miss on
   ray escape; `envIndex` + env geomWeight added to `DScene`/`dInvPdfLambda`). Since
   0.30.0 (M1) it also handles an **IMAGE-based (lat-long HDR) env** on the GPU
-  backward: `bkNeeEnv`/`bkNeeEnvVolume` branch on `sc.env.scale != nullptr` and
+  backward: `dSampleEnvDir` branches on `sc.env.scale != nullptr` and
   importance-sample the map on-device via `dEnvSample` (the forward path's luminance
   2-D CDF), with `dEnvRadiance` (per-texel JH `coeff`·`scale`·`illum`) and `dEnvPdf`
   for MIS-consistent env-miss; the previously-canceled illuminant table is uploaded
@@ -8007,8 +8014,8 @@ as the one at fault.
   `transmit`, energy-clamped) plus the two-sided back-hemisphere connection (allow back hemisphere,
   skip the shadow-terminator softening, `|cos|` in G); `lambda` is threaded through
   `dBsdfPdf`/`dVertexPdfF`/`dMisWeight` because the lobe-selection pdf is wavelength-dependent.
-  Since 0.36.0 **frosted (rough) dielectric** also renders on-device: `refractOrReflect`/
-  `dDielectricStep` already jitter the chosen reflect/refract lobe by the per-hit roughness, so a
+  Since 0.36.0 **frosted (rough) dielectric** also renders on-device: `interfaceStep`/
+  `dDielectricStep` jitter the chosen reflect/refract lobe by the per-hit roughness, so a
   rough dielectric is the same non-connectable **stochastic-delta** vertex on GPU as in `bdpt.h`
   (only the gate needed relaxing). With that, **all genuine per-hit-BSDF GPU-vs-CPU parity gaps in
   mode D are closed** (M9 complete): `cudaBdptSupported` carries no per-material reject. The things
@@ -8026,7 +8033,7 @@ as the one at fault.
   and `scraps/frosted.ftsl` (mean B/A=0.9991 at 512 spp, per-pixel diff halving 10.86%→5.73%). Since
   0.26.0 it also does
   **point-spot lights** (deterministic connect + `spotFalloff` cone weight in
-  `bkNeeLight`/`bkNeeVolume`, `spotOmega` geomWeight in `dInvPdfLambda`); only
+  `bkNeeLight`/`bkNeeVolumeHero`, `spotOmega` geomWeight in `dInvPdfLambda`); only
   collimated beams (not NEE-samplable) still force the CPU backward tracer.
   Since 0.27.0 there is a separate **fast RGB backward** path
   (`renderBackwardRGBCuda`/`kBackwardRGB`/`bkRadianceRGB`, selected by `-rgb` on mode R
@@ -8077,8 +8084,9 @@ as the one at fault.
   instantiated — `BDPT_MAXDEPTH` (8, bit-for-bit the old kernel, still the default launch)
   and `BDPT_DEEPDEPTH` (64), the deep one launched only when `-max-bounce > 8`. GPU mode U
   additionally bounds its light-vertex store -- the per-path slab and its compact copy, every
-  subpath's `maxDepth - 1` vertices, with their secondary-λ rows -- by a budget (an eighth of the
-  card, at least 768 MB). A pass that would not fit traces FEWER light subpaths (`nLight`, said
+  subpath's `maxDepth - 1` vertices, with their secondary-λ rows and grid keys -- by a budget (an
+  eighth of the card, at least 768 MB, at most half the memory free once the scene is up; an
+  allocation that still fails halves the count). A pass that would not fit traces FEWER light subpaths (`nLight`, said
   on stdout) and pairs camera path i with light subpath `i % nLight` for its bundle and its
   connections; the weights already carry the light-path count (`ctx.nLightPaths`, which merges
   and the camera splat are normalised by), so the estimator is unchanged and only its variance

@@ -4,7 +4,7 @@
 //  bsdf_eval.h -- the EVALUABLE half of the material model: f(wo, wi) and its sampling density.
 // ============================================================================================
 //
-// `render.h` knows how to SAMPLE every material (sampleGlossy, refractOrReflect, the
+// `render.h` knows how to SAMPLE every material (sampleGlossy, interfaceStep, the
 // cosine hemisphere). That is all a plain unidirectional tracer needs, and for a long time
 // only BDPT needed the other half -- given two directions chosen by someone else, what is the
 // BSDF worth and how likely was that direction? -- so `bsdfF` / `bsdfPdf` lived in `bdpt.h`.

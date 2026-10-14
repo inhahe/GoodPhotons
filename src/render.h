@@ -4071,6 +4071,7 @@ struct Renderer {
         double factor = 1.0;
         bool entering = false;      // met the surface from outside the material
         bool refracted = false;     // crossed into the other medium
+        bool suppressible = false;  // the priority rule suppresses it wherever its coat is clear
         bool passThrough = false;   // a boundary the priority rule suppressed
         bool absorbed = false;
         int extMat = -1;
@@ -4119,8 +4120,8 @@ struct Renderer {
         const MediumStack& outer = st.entering ? stk : after;
         bool ranked = false;
         const double extIor = exteriorIor(scene, m, outer, lambda, st.extMat, &ranked);
-        if (ranked && outer.topMat() >= 0 && m.priority <= outer.topPri() &&
-            !m.coatOpaque(lambda)) {                                         // suppressed
+        st.suppressible = ranked && outer.topMat() >= 0 && m.priority <= outer.topPri();
+        if (st.suppressible && !m.coatOpaque(lambda)) {                      // suppressed
             if (st.entering) stk.push((int)mi, m.priority); else stk.popMat((int)mi);
             st.ray = Ray{h.p + d * 1e-6, d};
             st.passThrough = true;
@@ -4171,12 +4172,16 @@ struct Renderer {
     // `st` that the ray `d` made at the hit `h`, at wavelength L: the probability of the branch it
     // took, had the walk been at L -- the Fresnel or interference reflectance for the same
     // incidence, or one minus it -- times the radiance factor (n_from / n_to)^2 at L if it
-    // refracted; 1 at a pass-through. Folded against st.factor, its value at the walk's own
+    // refracted; at a boundary the priority rule suppresses wherever the coat is clear, 1 for a
+    // pass-through where it is clear at L and 0 for any branch the walk could not have taken
+    // there (a coat opaque at one wavelength and clear at another is a medium only at the
+    // second). Folded against st.factor, its value at the walk's own
     // wavelength, it re-expresses the step's coin at each photon's: a coat's interference colour
     // lives entirely in that coin, a dispersive index's partly.
     double stepFactorAt(const Scene& scene, const Material& m, const InterfaceStep& st,
                         const Hit& h, const Vec3& d, double L) const {
-        if (st.passThrough) return 1.0;
+        if (st.suppressible && !m.coatOpaque(L)) return st.passThrough ? 1.0 : 0.0;
+        if (st.passThrough) return 0.0;
         const double ne = (st.extMat >= 0) ? scene.mats[(size_t)st.extMat].ior(L) : 1.0;
         return branchFactor(interfaceOptics(scene, m, h, d, ne, L), st.refracted);
     }

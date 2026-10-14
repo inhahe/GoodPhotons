@@ -4131,6 +4131,16 @@ __device__ static double dBranchFactor(const DInterfaceOptics& o, bool refracted
     return (o.opaque || o.tir) ? 0.0 : (1.0 - (double)o.R) * (double)(o.eta * o.eta);
 }
 
+// What a dielectric step did (host twin Renderer::InterfaceStep): whether the ray crossed into
+// the other medium, whether the priority rule suppresses this boundary wherever its coat is clear
+// and whether the ray passed straight through it, the far side's material (-1: index 1), and the
+// branch's probability times the radiance factor (dBranchFactor; 1 at a pass-through).
+struct DStepRecord {
+    bool refracted = false, suppressible = false, pass = false;
+    int farMat = -1;
+    double factor = 1.0;
+};
+
 // One surface of a dielectric body -- plain, or coated with a thin film or a multilayer stack --
 // for every device walk (host twin: Renderer::interfaceStep). First the nested-dielectric PRIORITY
 // rule (Schmidt & Budge 2002): the far side's index from the enclosing medium (dExteriorIor), and a
@@ -4142,23 +4152,16 @@ __device__ static double dBranchFactor(const DInterfaceOptics& o, bool refracted
 // with its probability as weight, no frosting; an opaque coat always reflects and carries R -- and
 // receives that weight (1 at a pass-through and at TIR). `radianceScale` is non-null on a
 // camera-side walk, which carries radiance, and null on a light-side one, which carries flux --
-// every caller says which. `refractedOut` / `farMatOut` / `passOut` / `factorOut`: whether the ray
-// crossed into the other medium, the far side's material (-1: index 1), whether the boundary was
-// suppressed, and the branch's probability times the radiance factor (dBranchFactor; 1 at a
-// pass-through) -- for mode M's spectral gather (dStepFactorAt).
-// False when an opaque coating or substrate absorbed the ray.
+// every caller says which. `rec`, for mode M's spectral gather (dStepFactorAt), receives what
+// the step did (DStepRecord). False when an opaque coating or substrate absorbed the ray.
 __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, const DHit& h,
                                        const DVec3& d, Real lambda, DRng& rng,
                                        int mi, DMediumStack& stk, DVec3& outO, DVec3& outD,
                                        double* whittedWeight, double* radianceScale,
-                                       bool* refractedOut = nullptr, int* farMatOut = nullptr,
-                                       bool* passOut = nullptr, double* factorOut = nullptr) {
+                                       DStepRecord* rec = nullptr) {
     if (whittedWeight) *whittedWeight = 1.0;
     if (radianceScale) *radianceScale = 1.0;
-    if (refractedOut) *refractedOut = false;
-    if (farMatOut) *farMatOut = -1;
-    if (passOut) *passOut = false;
-    if (factorOut) *factorOut = 1.0;
+    if (rec) *rec = DStepRecord{};
     const bool entering = dot(d, h.ng) < 0;
     // The far side: the medium the ray comes from when it enters, the one it returns to when it
     // leaves (the stack without mi).
@@ -4167,20 +4170,21 @@ __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, con
     const DMediumStack& outer = entering ? stk : after;
     int extMat = -1; bool ranked = false;
     const Real extIor = dExteriorIor(sc, m, outer, lambda, extMat, ranked);
-    if (ranked && outer.topMat() >= 0 && m.priority <= outer.topPri() &&
-        !dCoatOpaque(m, lambda)) {                                          // suppressed
+    const bool suppressible = ranked && outer.topMat() >= 0 && m.priority <= outer.topPri();
+    if (rec) rec->suppressible = suppressible;
+    if (suppressible && !dCoatOpaque(m, lambda)) {                          // suppressed
         if (entering) stk.push(mi, m.priority); else stk.popMat(mi);
-        if (passOut) *passOut = true;
+        if (rec) rec->pass = true;
         outD = d; outO = dOffsetAlong(h.p, h.ng, outD); return true;
     }
-    if (farMatOut) *farMatOut = extMat;
+    if (rec) rec->farMat = extMat;
     const DInterfaceOptics o = dInterfaceOptics(sc, m, h, d, extIor, lambda);
     if (o.opaque) {                                      // reflect with R, else absorbed
         if (!o.entering) return false;
         if (whittedWeight) *whittedWeight = (double)o.R;
         else if (rng.uniform() >= o.R) return false;
         outD = normalize(reflectv(d, o.nl)); outO = dOffsetAlong(h.p, h.ng, outD);
-        if (factorOut) *factorOut = (double)o.R;
+        if (rec) rec->factor = (double)o.R;
         return true;
     }
     DVec3 out;
@@ -4204,8 +4208,7 @@ __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, con
         }
     }
     if (radianceScale && refracted) *radianceScale = (double)(o.eta * o.eta);
-    if (refractedOut) *refractedOut = refracted;
-    if (factorOut) *factorOut = dBranchFactor(o, refracted);
+    if (rec) { rec->refracted = refracted; rec->factor = dBranchFactor(o, refracted); }
     if (refracted) { if (entering) stk.push(mi, m.priority); else stk.popMat(mi); }
     outD = out; outO = dOffsetAlong(h.p, h.ng, outD);
     return true;
@@ -5063,11 +5066,15 @@ __device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const D
 // surface, back along the path that got here (toward the light for the forward tracer,
 // toward the eye for the backward one); it is the reference direction h is measured from.
 // The fiber's absorption (per radius) at `lambda` (host twin: hairSigmaAAt).
-__device__ static double dHairSigmaAAt(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
+// `denom` (dhair::sigmaADenominator(m.hairBetaN)) may be passed in by a loop over wavelengths,
+// which would otherwise take its three pow() at each one; negative = compute it here.
+__device__ static double dHairSigmaAAt(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda,
+                                       double denom = -1.0) {
     if (m.hairSigmaAFromReflect) {
         double c = (double)dDiffuseRho(sc, m, h, lambda);
         c = c < 0.0 ? 0.0 : (c > 1.0 ? 1.0 : c);
-        return dhair::sigmaAFromReflectance(c, m.hairBetaN);
+        return (denom >= 0.0) ? dhair::sigmaAFromReflectanceD(c, denom)
+                              : dhair::sigmaAFromReflectance(c, m.hairBetaN);
     }
     return fmax(0.0, (double)specLookup(m.hairSigmaA, lambda));
 }
@@ -5084,19 +5091,15 @@ __device__ static double dHairSpecularFrom(const DMaterial& m, Real lambda, doub
 __device__ static double dHairSpecularAt(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
     return dHairSpecularFrom(m, lambda, dHairSpecPatAt(sc, m, h));
 }
-// Whether the fiber's medulla is live at `lambda` (host twin hairMedullaLiveAt): whether it is
-// depends on the wavelength, so a per-wavelength fold of a solid fiber must ask at each one.
-__device__ static bool dHairMedullaLiveAt(const dhair::Bcsdf& b, const DMaterial& m, Real lambda) {
-    return b.kappa > 0.0 && fmax(0.0, (double)specLookup(m.hairMedullaSigmaS, lambda)) +
-                            fmax(0.0, (double)specLookup(m.hairMedullaSigmaA, lambda)) > 0.0;
-}
 
+// `specPat`: the hit's dHairSpecPatAt when the caller has it already; negative = evaluate it.
 __device__ __noinline__ static DHairShade dHairShadeAt(const DScene& sc, const DMaterial& m,
                                           const DHit& h,   // __noinline__: see dhair::f
-                                          Real lambda, const DVec3& wPrev) {
+                                          Real lambda, const DVec3& wPrev,
+                                          double specPat = -1.0) {
     dhair::Params pr;
     pr.eta   = m.hairEta;
-    {   pr.specR = dHairSpecularAt(sc, m, h, lambda);
+    {   pr.specR = dHairSpecularFrom(m, lambda, (specPat >= 0.0) ? specPat : dHairSpecPatAt(sc, m, h));
         double op = m.hairOpacity;
         if (m.hairOpacityPat >= 0) op *= (double)clamp01(dPatternScalarAt(sc, m.hairOpacityPat, h));
         pr.opacity = op < 0.0 ? 0.0 : (op > 1.0 ? 1.0 : op);
@@ -5141,12 +5144,14 @@ struct DHairSpec { double specR, sigmaA, mSigmaS, mSigmaA; bool hasMedulla; };
 __device__ static DHairSpec dHairSpecOf(const dhair::Bcsdf& b) {
     return DHairSpec{b.specR, b.sigmaA, b.mSigmaS, b.mSigmaA, b.hasMedulla};
 }
-// `specPat` (dHairSpecPatAt) and `kappa` are the hit's, as in the hero's shade.
+// `specPat` (dHairSpecPatAt) and `kappa` are the hit's, as in the hero's shade; `denom` as in
+// dHairSigmaAAt.
 __device__ static DHairSpec dHairSpecAt(const DScene& sc, const DMaterial& m, const DHit& h,
-                                        Real lambda, double specPat, double kappa) {
+                                        Real lambda, double specPat, double kappa,
+                                        double denom = -1.0) {
     dhair::Bcsdf b;
     b.kappa = kappa;
-    dhair::makeSpectral(b, dHairSpecularFrom(m, lambda, specPat), dHairSigmaAAt(sc, m, h, lambda),
+    dhair::makeSpectral(b, dHairSpecularFrom(m, lambda, specPat), dHairSigmaAAt(sc, m, h, lambda, denom),
                         (double)specLookup(m.hairMedullaSigmaS, lambda),
                         (double)specLookup(m.hairMedullaSigmaA, lambda));
     return dHairSpecOf(b);
@@ -5171,13 +5176,14 @@ __device__ static double dHairFoldFCos(const dhair::LobeAngular& la, const DHair
 }
 // f * cosLong and pdf toward `wl` for every member of a bundle (`sp[0..n)`, sp[0] the hero's)
 // at the hero's shade `base` (host twin hairBundleAt): the angular half once, every value -- the
-// hero's pdf included -- folded from it. `pdf` may be null.
+// hero's pdf included, unless its medulla is live -- folded from it. `pdf` may be null.
 __device__ static void dHairBundleAt(const DHairShade& base, const DHairSpec* sp, int n,
                                      const dhair::V3& wl, double cosLong, double* fcos,
                                      double* pdf) {
     dhair::LobeAngular la;
     fcos[0] = dhair::f(base.b, base.woLocal, wl, &la) * cosLong;
-    if (pdf) dHairFoldFCos(la, base, sp[0], wl, cosLong, &pdf[0]);
+    if (pdf) pdf[0] = la.valid ? base.b.opacity * dhair::pdfFromLobes(la, sp[0].sigmaA, sp[0].specR)
+                               : dhair::pdf(base.b, base.woLocal, wl);
     for (int i = 1; i < n; ++i)
         fcos[i] = dHairFoldFCos(la, base, sp[i], wl, cosLong, pdf ? &pdf[i] : nullptr);
 }
@@ -10676,14 +10682,11 @@ __device__ static double dCamInvPdfLambda(const DScene& sc, Real lambda) {
 }
 
 // ======================= backward reference (GPU mode R) =====================
-// Device port of backward.h — the unidirectional reference tracer, now with the
-// physical (mesh-lens) camera as a ray-generation front-end. Reuses the shared BVH
-// (closestHit/occluded), the specular BSDFs (refractOrReflect / thinFilmInterface /
-// multilayerInterface / gratingDiffract), the diffuse reflectance (dDiffuseRho) and
-// the emitter sampler exactly, so materials agree with the CPU path by construction.
-// v1 scope (gated by cudaBackwardSupported): area/sphere/cylinder Lambertian lights
-// only, no fog/env/fluorescence/spot — which makes dInvPdfLambda exact and matches
-// the CPU reference up to Monte-Carlo noise (independent RNG realization).
+// Device port of backward.h — the unidirectional reference tracer, with the physical
+// (mesh-lens) camera as a ray-generation front-end. Reuses the shared BVH
+// (closestHit/occluded), the interface optics (dDielectricStep / dInterfaceOptics,
+// gratingDiffract), the diffuse reflectance (dDiffuseRho) and the emitter sampler, so
+// materials agree with the CPU path by construction. Scope: cudaBackwardSupported.
 
 // Sensor-side index of surface j (air baked as 1); scene-side = sensor side of j-1.
 __device__ static Real dLensIorSensor(const DLensSystem& L, int j, Real lambda) {
@@ -11761,8 +11764,11 @@ __device__ __noinline__ static void bkNeeVolumeHero(const DScene& sc, const DMed
             if (cosLight <= 0) continue;
             const Real vis = shadowTransmittanceTo(sc, p + wi * RAY_EPS, p + wi * dist, 2 * RAY_EPS);
             if (!(vis > (Real)0)) continue;
-            // No surface cosine at a volume vertex.
-            geom = (double)cosLight / (double)dist2 * (double)em.area * (double)vis * epat;
+            // The side test takes the authored normal, the measure the patch's own orientation
+            // (bkEmitterGeom; host twin volumeEmitterGeom). No surface cosine at a volume vertex.
+            const double cosGeo = em.normalTilted ? fabs((double)ddot(em.nGeom, wi * (Real)(-1)))
+                                                  : (double)cosLight;
+            geom = cosGeo / (double)dist2 * (double)em.area * (double)vis * epat;
         }
         geom *= (double)dMediaTransmittance(sc, p, wi, dist, lam[0], rng) * selW;
         if (!(geom > 0.0)) continue;
@@ -11803,25 +11809,28 @@ struct BkEnvGeom {
     double wMis;      // balance heuristic vs. the cosine-sampled continuation
     double farDist;   // shadow-ray length to the scene exit
 };
+// An incoming sky direction for NEE (device twin of Scene::sampleEnvDir): an image sky draws
+// from its luminance CDF (dEnvSample), a constant one uniformly over the sphere (pdf 1/4pi).
+// Two uniforms, in the host's order. False when the image has no density there.
+__device__ static bool dSampleEnvDir(const DScene& sc, DRng& rng, DVec3& wi, double& pdfW) {
+    const double u1 = (double)rng.uniform(), u2 = (double)rng.uniform();
+    if (sc.env.scale != nullptr) {
+        dEnvSample(sc.env, u1, u2, wi, pdfW);
+        return pdfW > 0.0;
+    }
+    const double z = 1.0 - 2.0 * u1;
+    const double sr = sqrt(fmax(0.0, 1.0 - z * z));
+    const double phi = 2.0 * DPI * u2;
+    wi = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
+    pdfW = 1.0 / (4.0 * DPI);
+    return true;
+}
 // `nb` non-null = a GLOSSY vertex (GLOSSY-NEE): the MIS partner is then the lobe's density
 // rather than the cosine hemisphere's, exactly as the fiber branch already swaps in the BCSDF's.
 __device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkEnvGeom& g,
                                  const DHairShade* hs = nullptr,
                                  const DNeeBsdf* nb = nullptr) {
-    // Sample an incoming env direction: image env importance-samples the luminance CDF
-    // (dEnvSample gives dir + solid-angle pdfW), constant env is uniform on the sphere
-    // (pdf 1/4pi). Both draw exactly two uniforms in the same order as the CPU
-    // scene.sampleEnvDir, so the estimator matches.
-    if (sc.env.scale != nullptr) {
-        dEnvSample(sc.env, (double)rng.uniform(), (double)rng.uniform(), g.wi, g.pdfW);
-        if (g.pdfW <= 0.0) return false;
-    } else {
-        double z = 1.0 - 2.0 * (double)rng.uniform();
-        double sr = sqrt(fmax(0.0, 1.0 - z * z));
-        double phi = 2.0 * DPI * (double)rng.uniform();
-        g.wi = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
-        g.pdfW = 1.0 / (4.0 * DPI);
-    }
+    if (!dSampleEnvDir(sc, rng, g.wi, g.pdfW)) return false;
     if (hs) {
         // Hair fiber (device twin of backward.h envGeom's hs branch): full-sphere response
         // PI*hairFCos with stG = 1 (a fiber has no hemisphere or terminator), shadow ray
@@ -11936,16 +11945,7 @@ __device__ __noinline__ static void bkNeeEnvVolumeHero(const DScene& sc, const D
     if (!any) return;
     DVec3 wi; double pdfW;
     const bool imageEnv = (sc.env.scale != nullptr);
-    if (imageEnv) {
-        dEnvSample(sc.env, (double)rng.uniform(), (double)rng.uniform(), wi, pdfW);
-        if (pdfW <= 0.0) return;
-    } else {
-        const double z = 1.0 - 2.0 * (double)rng.uniform();
-        const double sr = sqrt(fmax(0.0, 1.0 - z * z));
-        const double phi = 2.0 * DPI * (double)rng.uniform();
-        wi = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
-        pdfW = 1.0 / (4.0 * DPI);
-    }
+    if (!dSampleEnvDir(sc, rng, wi, pdfW)) return;
     const double farDist = (double)length(sc.sceneCenter - p) + sc.sceneRadius;
     const Real envVis = shadowTransmittance(sc, p + wi * RAY_EPS, wi, (Real)farDist);
     if (!(envVis > (Real)0)) return;
@@ -12109,16 +12109,7 @@ __device__ static void bkNeeEnvHeroHair(const DScene& sc, const DHit& h, const D
     if (sc.envIndex < 0) return;
     DVec3 wi; double pdfW;
     const bool imageEnv = (sc.env.scale != nullptr);
-    if (imageEnv) {                                   // the same two draws as bkEnvGeom
-        dEnvSample(sc.env, (double)rng.uniform(), (double)rng.uniform(), wi, pdfW);
-        if (pdfW <= 0.0) return;
-    } else {
-        const double z = 1.0 - 2.0 * (double)rng.uniform();
-        const double sr = sqrt(fmax(0.0, 1.0 - z * z));
-        const double phi = 2.0 * DPI * (double)rng.uniform();
-        wi = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
-        pdfW = 1.0 / (4.0 * DPI);
-    }
+    if (!dSampleEnvDir(sc, rng, wi, pdfW)) return;
     const double farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
     // bkEnvGeom's fiber shadow ray: past the strand's own body, through strands of opacity below 1.
     double vis = (double)shadowTransmittance(sc, h.p + wi * (Real)RAY_EPS, wi, (Real)farDist,
@@ -12160,8 +12151,8 @@ __device__ __noinline__ static int bkHairHeroStep(const DScene& sc, const DMater
         const double* invPdf, int nUp, double* specR, const bool* specTech, double& specW,
         double& contBsdfPdf, bool& specularArrival, Real& curveTmin, DRng& rng) {
     // `wPrev` points back toward the eye: the model's reference direction, as in the scalar case.
-    const DHairShade hs0 = dHairShadeAt(sc, m, h, lam[0], rd * (Real)(-1));
     const double specPat = dHairSpecPatAt(sc, m, h);
+    const DHairShade hs0 = dHairShadeAt(sc, m, h, lam[0], rd * (Real)(-1), specPat);
     DHairSpec sp[hero::kHeroMax];
     sp[0] = dHairSpecOf(hs0.b);
     for (int i = 1; i < nUp; ++i) sp[i] = dHairSpecAt(sc, m, h, lam[i], specPat, hs0.b.kappa);
@@ -12770,7 +12761,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             }
             // Directly-viewed solar disc: camera / specular arrivals only. A diffuse or
             // volume vertex already spent its one estimator on the sun via NEE
-            // (bkEmitterGeom / bkNeeVolume) and sets specularArrival = false, so this is
+            // (bkEmitterGeom / bkNeeVolumeHero) and sets specularArrival = false, so this is
             // a clean single-strategy split, not a missing MIS weight (host twin: backward.h).
             if (sc.sunCount > 0 && specularArrival)
                 L += thr * dSunRadianceMis(sc, gmis, rd, lambda) * invPdfLambda;
@@ -13627,6 +13618,8 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         Real cosLight = dot(nL, -wi);
         if (cosLight <= 0) continue;
         if (occludedTo(sc, dOffsetAlong(h.p, h.ng, wi), h.p + wi * dist, 2 * RAY_EPS)) continue;
+        // Side test: the authored normal; measure: the patch's own orientation (bkEmitterGeom).
+        if (em.normalTilted) cosLight = (Real)fabs((double)ddot(em.nGeom, wi * (Real)(-1)));
         Real G = cosSurf * cosLight / dist2;
         if (epat != 1.0) G = (Real)((double)G * epat);   // no-op without a pattern
         total = total + hadamard(f * (G * em.area * stG * selWr), em.rgbEmit);
@@ -15877,14 +15870,16 @@ __device__ static void dSpecFold(DSpecThr& st, const DScene& sc, const DMaterial
 // What mode M's spectral gather folds per photon wavelength for a dDielectricStep the ray `d` made
 // at the hit `h` (host twin: Renderer::stepFactorAt): at wavelength L, the probability of the branch
 // it took -- the Fresnel or interference reflectance for the same incidence, or one minus it --
-// times the radiance factor (n_from / n_to)^2 if it refracted; 1 at a pass-through. `farMat` is the
-// far side's material (-1: index 1). Folded against the step's own factorOut.
+// times the radiance factor (n_from / n_to)^2 if it refracted. At a boundary the priority rule
+// suppresses wherever the coat is clear, 1 for a pass-through where it is clear at L and 0 for
+// any branch the walk could not have taken there. `st` is what the step recorded; folded against
+// its own `st.factor`.
 __device__ static double dStepFactorAt(const DScene& sc, const DMaterial& m, const DHit& h,
-                                       const DVec3& d, bool refracted, bool pass, int farMat,
-                                       Real L) {
-    if (pass) return 1.0;
-    const Real ne = (farMat >= 0) ? specLookup(sc.mats[farMat].ior, L) : (Real)1;
-    return dBranchFactor(dInterfaceOptics(sc, m, h, d, ne, L), refracted);
+                                       const DVec3& d, const DStepRecord& st, Real L) {
+    if (st.suppressible && !dCoatOpaque(m, L)) return st.pass ? 1.0 : 0.0;
+    if (st.pass) return 0.0;
+    const Real ne = (st.farMat >= 0) ? specLookup(sc.mats[st.farMat].ior, L) : (Real)1;
+    return dBranchFactor(dInterfaceOptics(sc, m, h, d, ne, L), st.refracted);
 }
 
 // The device twin of camMediaTrSpec (photonmap_render.h): one straight camera segment's media
@@ -16261,15 +16256,13 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             case D_MULTILAYER: {
                 // A dielectric body's surface, plain or coated: radiance across a refraction, and
                 // SPECGATHER re-expresses the step at each photon's wavelength (dStepFactorAt).
-                DVec3 nro, nrd; double rs = 1.0, fac = 1.0; bool refr = false, pass = false;
-                int farMat = -1;
+                DVec3 nro, nrd; double rs = 1.0;
+                DStepRecord st;
                 const DVec3 d0 = rd;
                 if (!dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr, &rs,
-                                     &refr, &farMat, &pass, &fac)) return;
+                                     &st)) return;
                 thr *= rs;                               // radiance across the interface
-                sthr.mul([&](Real L) {
-                    return dStepFactorAt(sc, m, h, d0, refr, pass, farMat, L);
-                }, fac);
+                sthr.mul([&](Real L) { return dStepFactorAt(sc, m, h, d0, st, L); }, st.factor);
                 ro = nro; rd = nrd; break;
             }
             case D_HALFMIRROR: {
@@ -16314,21 +16307,14 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 thr *= wCam;
                 // ...and no vertex: the last real one's emitter-hit bookkeeping stands (host twin).
                 if (passedThru) { hairArrival = hairArrivalIn; gmis = gmisIn; }
-                if (!passedThru) {   // per-lobe form (0.336.0): one exp + the four-lobe recurrence per bin
-                    const bool perLobe = la.valid;
-                    const double den = m.hairSigmaAFromReflect ? dhair::sigmaADenominator(m.hairBetaN) : 0.0;   // hoisted: three pow() per bin otherwise
+                if (!passedThru) {   // each bin folded from the sample's angular half (dHairFoldFCos)
+                    const double den = m.hairSigmaAFromReflect ? dhair::sigmaADenominator(m.hairBetaN) : -1.0;   // hoisted: three pow() per bin otherwise
                     const double specPat = dHairSpecPatAt(sc, m, h);   // hoisted: the pattern is the same at every bin
                     double vk[DSpecThr::K];
                     for (int k = 0; k < DSpecThr::K; ++k) {
-                        const Real lk = DSpecThr::lamOf(k);
-                        double w;
-                        if (perLobe && !dHairMedullaLiveAt(hsv.b, m, lk)) {   // both fibers solid: fold
-                            double sig;
-                            if (m.hairSigmaAFromReflect) { double c = (double)dDiffuseRho(sc, m, h, lk); sig = dhair::sigmaAFromReflectanceD(c, den); }
-                            else sig = fmax(0.0, (double)specLookup(m.hairSigmaA, lk));
-                            w = hsv.b.opacity * dhair::fFromLobes(la, sig, dHairSpecularFrom(m, lk, specPat)) * cosLong / pdfH;
-                        }
-                        else { const DHairShade hk = dHairShadeAt(sc, m, h, lk, wPrev); w = dhair::f(hk.b, hk.woLocal, wl) * cosLong / pdfH; }
+                        const DHairSpec spk = dHairSpecAt(sc, m, h, DSpecThr::lamOf(k), specPat,
+                                                          hsv.b.kappa, den);
+                        const double w = dHairFoldFCos(la, hsv, spk, wl, cosLong, nullptr) / pdfH;
                         vk[k] = w < 0.0 ? 0.0 : (w > 1.0 ? 1.0 : w);
                     }
                     sthr.mulVec(vk, wCam);
@@ -16734,12 +16720,13 @@ __global__ void kSppmResolve(DSppmState st, double* film, int resX, int resY,
 
 // ============================ device: VCM / UPS (mode U) ============================
 // Device twin of vcm.h. VCM combines BDPT vertex CONNECTIONS with photon-map vertex
-// MERGING under one balance-heuristic MIS. Per pass: (1) kVcmLight traces one light
-// subpath per pixel, stores its connectible vertices into a per-path slab and splats its
-// connect-to-camera (t=1) contributions; the host compacts the slab in path order and
-// builds a uniform hash grid over ALL light vertices (cell = merge radius). (2) kVcmCamera
-// traces one camera subpath per pixel doing emission (s=0), NEE (s=1), vertex connection to
-// the PAIRED light subpath, and merging from the grid; it accumulates the pass image into
+// MERGING under one balance-heuristic MIS. Per pass: (1) kVcmLight traces nLight light
+// subpaths (one per pixel unless the store would not fit, vcmSessionBegin), stores their
+// connectible vertices into a per-path slab and splats their connect-to-camera (t=1)
+// contributions; the slab is compacted in path order on the device and a uniform hash grid
+// built over ALL light vertices (cell = merge radius). (2) kVcmCamera traces one camera
+// subpath per pixel doing emission (s=0), NEE (s=1), vertex connection to the PAIRED light
+// subpath (pixel % nLight), and merging from the grid; it accumulates the pass image into
 // the persistent `accum` sum. The resolve divides by the pass count. Mirrors SmallVCM's
 // dVCM/dVC/dVM bookkeeping (misArrival / misScatter inlined; Mis(x)=x, so the wrappers are
 // dropped). Scope (gated in cudaVcmSupported): surfaces only, area/sphere/tube/mesh Lambertian
@@ -16770,7 +16757,7 @@ struct DVcmLV {
 
 // The SECONDARY hero wavelengths of a stored light vertex, one slot per secondary. Kept in a
 // PARALLEL slab (`lvSec[(i*vcmCap + k)*secStride + j]`, secStride == C-1) rather than inline in
-// DVcmLV, exactly like GPU BDPT's `pathSec`: the light-vertex slab is `npix * vcmCap * 128 B`
+// DVcmLV, exactly like GPU BDPT's `pathSec`: the light-vertex slab is `nLight * vcmCap * 128 B`
 // and is by far the largest allocation in a VCM session, so a single-λ run (`-heroc 1`) must
 // allocate the sec slab at zero and pay nothing. Only `beta` and `lam` are stored — cie(λ) is
 // recomputed at gather time, which is bit-identical to caching it (DVcmLV::cx is likewise just
@@ -17000,7 +16987,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
     if (!terminate) cosThetaOut = fabs(ddot(wi, ns));
 }
 
-// Phase 1: one light subpath per pixel. Stores connectible vertices into the per-path slab
+// Phase 1: `nPaths` light subpaths. Stores connectible vertices into the per-path slab
 // `lvSlab[i*vcmCap + k]` (count in `lvCount[i]`), splats connect-to-camera contributions into
 // `splat` (atomic, W*H*3 XYZ), and records this path index's wavelength BUNDLE (shared with the
 // camera paths it is paired with) into lamBuf/invLamBuf at stride C. `nPaths` light subpaths a
@@ -17333,7 +17320,8 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
 }
 
 // Phase 3: one camera subpath per pixel. Does emission (s=0), NEE (s=1), vertex connection to
-// the PAIRED light subpath [pathBegin[i],pathEnd[i]) and merging over the grid, then adds this
+// the PAIRED light subpath lp = i % nLight, [pathBegin[lp],pathEnd[lp]), and merging over the
+// grid, then adds this
 // pass's per-pixel radiance (camera result + the light splat) into the persistent `accum` sum.
 // Device twin of vcm.h traceCameraSubpath. `grid.lv` is the compact light-vertex array.
 template <int NS>
@@ -17354,19 +17342,19 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
         // share one. Each still connects to an independent draw of the light subpath, and the
         // weights count nLight light subpaths for merging and the camera splat (ctx.nLightPaths),
         // so the estimator is the same; only its variance changes.
-        const long long j = i % nLight;
+        const long long lp = i % nLight;
         double sxl = splat[i * 3 + 0], syl = splat[i * 3 + 1], szl = splat[i * 3 + 2];
-        double invPdfLambda = invLamBuf[j * C];
+        double invPdfLambda = invLamBuf[lp * C];
         if (invPdfLambda <= 0.0) {                         // no valid wavelength: only the splat
             accum[i * 3 + 0] += sxl; accum[i * 3 + 1] += syl; accum[i * 3 + 2] += szl;
             continue;
         }
-        // THE bundle of the paired light subpath j — the SAME C wavelengths the light kernel
+        // THE bundle of the paired light subpath lp — the SAME C wavelengths the light kernel
         // walked. That pairing is what makes strategy (c) (connection to the paired light
         // subpath) exact per-λ rather than an approximation: both ends share the λ set.
         Real lamAll[SECN + 1];
         double invAll[SECN + 1];
-        for (int k = 0; k < C; ++k) { lamAll[k] = lamBuf[j * C + k]; invAll[k] = invLamBuf[j * C + k]; }
+        for (int k = 0; k < C; ++k) { lamAll[k] = lamBuf[lp * C + k]; invAll[k] = invLamBuf[lp * C + k]; }
         Real lambda = lamAll[0];
         int nUp = C;
         int px = (int)(i % resX), py = (int)(i / resX);
@@ -17650,7 +17638,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                 }
 
                 // (c) Vertex connection to the PAIRED light subpath's stored vertices.
-                int pb = pathBegin[j], pe = pathEnd[j];
+                int pb = pathBegin[lp], pe = pathEnd[lp];
                 for (int j = pb; j < pe; ++j) {
                     const DVcmLV& lv = grid.lv[j];
                     if (edges + lv.edges + 1 > ctx.maxDepth) continue;
@@ -18590,7 +18578,7 @@ bool cudaForwardSupported(const Scene& scene) {
     // sc.emitters because volumeBirth is always true when totalPower==0.
     // A distant `sun` emitter (shape==6) is supported too: genPhoton/genPhotonHero have a
     // parallel-beam birth branch over the scene cross-section, bkEmitterGeom/bkNeeLight/
-    // bkNeeVolume/bkNeeLightRGB do the cone NEE, and the ray-miss paths add the directly-
+    // bkNeeVolumeHero/bkNeeLightRGB do the cone NEE, and the ray-miss paths add the directly-
     // viewed solar disc under the same `specularArrival` gate as the CPU tracer.
     // Emitter shapes: a shape the device kernels have no branch for must send the scene to
     // the CPU tracer rather than be coerced into a different shape at upload time. Handing
@@ -20083,12 +20071,12 @@ static bool cudaBidirCoreSupported(const Scene& scene) {
     // and thin-film thickness maps, mix blend masks, and Beer-Lambert colored-glass
     // interior absorption (delta vertex — throughput only).
     //
-    // FROSTED (rough) dielectric is now on-device too (M9): the device refractOrReflect
-    // jitters the chosen reflect/refract lobe by the per-hit roughness (dMatRoughness,
-    // texture/pattern/constant), keeping it on the intended side — bit-for-bit the same
-    // "stochastic-delta" model as the CPU bdpt.h (a rough dielectric stays a non-connectable
-    // delta vertex; only its scattered direction is jittered). dDielectricStep in the BDPT
-    // random walk already routes through it, so no separate gate is needed.
+    // FROSTED (rough) dielectric is on-device too (M9): dDielectricStep jitters the chosen
+    // reflect/refract lobe by the per-hit roughness (dMatRoughness, texture/pattern/constant),
+    // keeping it on the intended side — bit-for-bit the same "stochastic-delta" model as the
+    // CPU bdpt.h (a rough dielectric stays a non-connectable delta vertex; only its scattered
+    // direction is jittered). The BDPT random walk routes through it, so no separate gate is
+    // needed.
     // Diffuse-transmission (two-sided Lambertian) is likewise on-device (M9): dRandomWalk
     // samples the two lobes, dBsdfF/dBsdfPdf evaluate them, and dConnectBDPT allows
     // back-hemisphere connections (|cos| G, shadow-terminator skip).
@@ -21370,34 +21358,19 @@ size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
 // --------------------- backward reference (mode R) host ----------------------
 
 bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
-    // GPU mode R needs the same POD-bakeable materials as the forward path, plus the
-    // current backward scope: participating media, fluorescence AND a constant
-    // environment light ARE supported (media: homogeneous + heterogeneous + spectral-
-    // rainbow phase, minus GRIN; fluorescence: the bispectral Stokes-shift adjoint; env: bkNeeEnv /
-    // bkNeeEnvVolume + MIS'd env-miss, constant only — an IMAGE env stays on the CPU).
-    // Emitters: area/sphere/cylinder Lambertian AND point-spot lights (bkNeeLight /
-    // bkNeeVolume spot branch); only collimated beams (not NEE-samplable) fall back to
-    // the CPU. Textured albedo IS supported (dDiffuseRho ports it). dInvPdfLambda is
-    // exact (geomWeight = area*PI for area emitters, 4pi^2 R^2 for the env emitter).
+    // GPU mode R renders what the forward path can bake (cudaForwardSupported) with the
+    // backward walk's own scope on top: participating media (homogeneous and heterogeneous,
+    // a rainbow phase, GRIN through dGrinMarch, fires through dFireNee and the emission along
+    // every segment), fluorescence (the bispectral adjoint), a constant or image environment
+    // (bkNeeEnv / bkNeeEnvVolumeHero and the MIS'd escape), and every emitter NEE can sample:
+    // area, sphere, cylinder, mesh, spot and sun. Collimated beams, which NEE cannot sample,
+    // keep a scene on the CPU, as does a lens deeper than D_MAXLENS.
     if (!cudaForwardSupported(scene)) return false;
-    // Participating media now run on the device backward walk (dMediaSampleCollision /
-    // dMediaTransmittance — homogeneous AND heterogeneous), INCLUDING spectral-rainbow
-    // phase (M10: bkNeeVolume / bkNeeEnvVolume / the volume scatter dispatch through
-    // dMedPhase / dMedPhaseSample read the uploaded Airy table) AND gradient-index (GRIN)
-    // media (M11: bkRadiance runs the shared Eikonal marcher dGrinMarch as a per-bounce
-    // pre-closestHit pass — the exact device twin of grin::march, so CPU and GPU mode R
-    // bend rays identically). Mode-D BDPT still keeps GRIN on the CPU (area-measure MIS
-    // assumes straight segments), gated separately in cudaBdptSupported.
-    // Environment light IS supported on the device backward walk: a CONSTANT env
-    // (bkNeeEnv / bkNeeEnvVolume / env-miss with MIS) and now an IMAGE env (lat-long
-    // map — importance-sampled via dEnvSample, evaluated via dEnvRadiance/dEnvPdf, with
-    // the baked illuminant table). Neither forces a CPU fallback (M1).
     for (size_t i = 0; i < scene.emitters.size(); ++i) {
         if ((int)i == scene.envIndex) continue;    // constant env: handled by bkNeeEnv, not area NEE
         const auto& em = scene.emitters[i];
         if (em.collimated) return false;                    // collimated beams: not NEE-samplable, CPU only
         if (em.shape == EmitterShape::Env) return false;    // stray (non-env) env-shape emitter: CPU
-        // Spot lights ARE supported now (bkNeeLight / bkNeeVolume point-spot branch).
     }
     // A physical lens deeper than the device cap falls back to the CPU tracer.
     if (cam.hasLens() && (int)cam.lens->surf.size() > D_MAXLENS) return false;
@@ -21452,13 +21425,10 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     }
     // Hero-wavelength bundle (`-heroc N`). Fall back to the single-λ estimator when the scene
     // needs a branch bkRadianceHero does not carry: a medium whose extinction varies with λ
-    // (per-λ free flights; a flat one, Medium::achroSigma, shares its flights, transmittance
-    // and albedo coin across the bundle), gradient-index bending, or a physical lens (whose
-    // per-λ refraction would give each wavelength its own camera ray). Same gate as the
-    // CPU BackwardRenderer::renderRows, so CPU and GPU mode R agree on when hero applies.
-    bool mediaFlat = true;
-    for (const Medium& md : scene.media) if (!md.achroSigma) { mediaFlat = false; break; }
-    const int effHeroC = (heroC > 1 && mediaFlat && !up.sc.hasGrin && !cam.hasLens())
+    // (Scene::mediaKeepBundle), gradient-index bending, or a physical lens (whose per-λ
+    // refraction would give each wavelength its own camera ray). Same gate as the CPU
+    // BackwardRenderer::renderRows, so CPU and GPU mode R agree on when hero applies.
+    const int effHeroC = (heroC > 1 && scene.mediaKeepBundle() && !up.sc.hasGrin && !cam.hasLens())
                              ? ((heroC > hero::kHeroMax) ? hero::kHeroMax : heroC) : 1;
 
     const size_t npix = (size_t)resX * resY;
@@ -23216,19 +23186,18 @@ void sppmSessionEnd(SppmSession* s) {
 
 // ============================ host: VCM / UPS session (mode U) ============================
 // Resident device VCM session mirroring vcm.h's vcmPass orchestration. Each pass: (1) launch
-// kVcmLight — one light subpath per pixel stores its connectible vertices into a per-path slab
-// (avoids cross-thread atomics) and splats connect-to-camera contributions; (2) compact the
-// slab ON DEVICE into contiguous per-path ranges (exclusive-scan the counts -> pathBegin/End,
-// scatter — so strategy (c)'s same-lambda vertex connection reads its PAIRED light path);
-// (3) build the uniform hash grid over the compacted vertices ON DEVICE (bbox reduce + cell
-// keys + STABLE sort by cell id + vectorized lower_bound — arithmetic-exact twin of the vcm.h
-// VcmGrid::build counting sort, including its output order); (4) launch kVcmCamera — one
-// camera subpath per pixel does emission/NEE/connection/merge and adds this pass's radiance
-// (camera result + light splat) into the persistent `accum` sum. Resolve divides accum by the
-// pass count. Only ~30 bytes (vertex total + bbox) cross the PCIe bus per pass — the original
-// host round trip moved the whole slab down and the compacted grid back up every pass.
-// Validated statistically against the CPU (independent MC) and byte-identically against the
-// host-build implementation it replaced.
+// kVcmLight — nLight light subpaths (one per pixel, or fewer when the store would not fit:
+// vcmSessionBegin) store their connectible vertices into a per-path slab (avoids cross-thread
+// atomics) and splat connect-to-camera contributions; (2) compact the slab ON DEVICE into
+// contiguous per-path ranges (exclusive-scan the counts -> pathBegin/End, scatter — so strategy
+// (c)'s same-lambda vertex connection reads its PAIRED light path); (3) build the uniform hash
+// grid over the compacted vertices ON DEVICE (bbox reduce + cell keys + STABLE sort by cell id +
+// vectorized lower_bound — arithmetic-exact twin of the vcm.h VcmGrid::build counting sort,
+// including its output order); (4) launch kVcmCamera — one camera subpath per pixel does
+// emission/NEE/connection/merge and adds this pass's radiance (camera result + light splat) into
+// the persistent `accum` sum. Resolve divides accum by the pass count. Only ~30 bytes (vertex
+// total + bbox) cross the PCIe bus per pass. Validated statistically against the CPU
+// (independent MC).
 struct VcmSession {
     DUpload up;
     gpu::DCamera cam{};
@@ -23238,19 +23207,20 @@ struct VcmSession {
     int  maxDepth = 8;
     int  vcmCap = 8;              // max stored connectible vertices per light subpath (maxDepth - 1)
     size_t nLight = 0;            // light subpaths a pass: npix, or fewer if the store would not fit
+                                  // (the arrays marked nLight below are indexed by light subpath)
     int  heroC = 1;               // hero bundle width (1 == classic single-λ session)
     int  secStride = 0;           // heroC-1 secondary slots per stored vertex (0 when heroC==1)
     long long passes = 0;
     // Persistent (allocated once in Begin):
-    gpu::DVcmLV* d_lvSlab = nullptr;   // npix * vcmCap
-    gpu::DVcmSec* d_lvSecSlab = nullptr;  // npix*vcmCap*secStride (NULL unless heroC>1)
-    int*    d_lvCount = nullptr;       // npix
+    gpu::DVcmLV* d_lvSlab = nullptr;   // nLight * vcmCap
+    gpu::DVcmSec* d_lvSecSlab = nullptr;  // nLight*vcmCap*secStride (NULL unless heroC>1)
+    int*    d_lvCount = nullptr;       // nLight
     double* d_splat   = nullptr;       // npix*3 (this pass's connect-to-camera XYZ)
     double* d_accum   = nullptr;       // npix*3 (running SUM over passes)
-    gpu::Real* d_lamBuf = nullptr;     // npix*heroC (per-path BUNDLE, shared light<->camera)
-    double* d_invLam  = nullptr;       // npix*heroC (invPdfLambda; [i*C]<=0 marks "no wavelength")
-    int*    d_pathBegin = nullptr;     // npix (device-scanned per-pass)
-    int*    d_pathEnd   = nullptr;     // npix
+    gpu::Real* d_lamBuf = nullptr;     // nLight*heroC (per-path BUNDLE, shared light<->camera)
+    double* d_invLam  = nullptr;       // nLight*heroC (invPdfLambda; [i*C]<=0 marks "no wavelength")
+    int*    d_pathBegin = nullptr;     // nLight (device-scanned per-pass)
+    int*    d_pathEnd   = nullptr;     // nLight
     // Grow-only device scratch for the on-device compaction + grid build (no per-pass malloc):
     gpu::DVcmLV* d_lvCompact = nullptr; size_t lvCompactCap = 0;
     gpu::DVcmSec* d_lvSecCompact = nullptr; size_t lvSecCompactCap = 0;
@@ -23288,43 +23258,71 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
     s->secStride = C - 1;
     // A light subpath stores at most one vertex per edge up to maxDepth - 1 (kVcmLightT's
     // lastEdge), and a pass holds every stored vertex twice -- the per-path slab and its compact
-    // copy -- with the secondary-λ rows beside each. One light subpath per pixel would ask for
-    // 6.6 GB at 1100x733 and -max-bounce 64, so the store gets a budget -- an eighth of the card,
-    // and never under 768 MB -- and a pass that would not fit traces FEWER light subpaths, each
-    // shared by several camera paths (kVcmCameraT's pairing). Every vertex of every subpath is
-    // stored, so no strategy the weights count goes missing: only the variance moves. (Storing
-    // fewer vertices per subpath instead, as before 0.379.3, dropped the deepest ones' merges and
-    // connections while the weights still counted them: x0.989 at 1600x1600, VCM-SLAB-CAP.)
+    // copy -- with the secondary-λ rows beside each, plus a cell key and an order index for the
+    // grid. One light subpath per pixel can ask for gigabytes (6.6 GB at 1100x733 and
+    // -max-bounce 64), so the store gets a budget: an eighth of the card, at least 768 MB, and
+    // never more than half the memory free once the scene is up (the kernels' stacks are
+    // reserved at their first launch, after this). A pass that would not fit traces FEWER light
+    // subpaths, each shared by several camera paths (kVcmCameraT's pairing). Every vertex of
+    // every subpath is stored, so no strategy the weights count goes missing: only the variance
+    // moves.
     s->vcmCap = s->maxDepth - 1;
-    {
-        size_t freeB = 0, totalB = 0;
-        cudaMemGetInfo(&freeB, &totalB);
-        size_t budget = totalB / 8;
-        if (budget < ((size_t)768 << 20)) budget = (size_t)768 << 20;
-        const size_t perPath = (size_t)s->vcmCap *
-            (2 * sizeof(gpu::DVcmLV) + 2 * (size_t)s->secStride * sizeof(gpu::DVcmSec));
-        size_t nLight = budget / (perPath > 0 ? perPath : 1);
-        if (nLight < 1) nLight = 1;
-        s->nLight = (nLight < s->npix) ? nLight : s->npix;
-        if (s->nLight < s->npix)
-            std::printf("[mode U] %zu light subpaths a pass for %zu pixels (light-vertex store "
-                        "budget %zu MB at %dx%d, %d vertices a subpath)\n",
-                        s->nLight, s->npix, budget >> 20, resX, resY, s->vcmCap);
-    }
     buildUploadScene(scene, s->up);
     s->cam = bakeCamera(scene, cam, resX, resY, s->up);
-    const size_t np = s->npix, nl = s->nLight;
-    CUDA_CHECK(cudaMalloc(&s->d_lvSlab,  nl * (size_t)s->vcmCap * sizeof(gpu::DVcmLV)));
-    if (s->secStride > 0)
-        CUDA_CHECK(cudaMalloc(&s->d_lvSecSlab,
-                              nl * (size_t)s->vcmCap * (size_t)s->secStride * sizeof(gpu::DVcmSec)));
-    CUDA_CHECK(cudaMalloc(&s->d_lvCount, nl * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&s->d_splat,   np * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&s->d_accum,   np * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&s->d_lamBuf,  nl * (size_t)C * sizeof(gpu::Real)));
-    CUDA_CHECK(cudaMalloc(&s->d_invLam,  nl * (size_t)C * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&s->d_pathBegin, nl * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&s->d_pathEnd,   nl * sizeof(int)));
+    const size_t np = s->npix;
+    size_t budget = (size_t)768 << 20;
+    {
+        size_t freeB = 0, totalB = 0;
+        if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess)
+            budget = std::min(std::max(totalB / 8, budget), freeB / 2);
+        else
+            cudaGetLastError();
+    }
+    const size_t perPath = (size_t)s->vcmCap *
+        (2 * sizeof(gpu::DVcmLV) + 2 * (size_t)s->secStride * sizeof(gpu::DVcmSec) + 2 * sizeof(int));
+    size_t nl = std::max<size_t>(1, std::min(np, budget / perPath));
+    // Allocation failures cost light subpaths (variance), not the run: the budget is an estimate.
+    auto tryAlloc = [](auto** p, size_t bytes) {
+        if (cudaMalloc((void**)p, bytes) == cudaSuccess) return true;
+        *p = nullptr;
+        cudaGetLastError();
+        return false;
+    };
+    if (!tryAlloc(&s->d_splat, np * 3 * sizeof(double)) ||
+        !tryAlloc(&s->d_accum, np * 3 * sizeof(double))) {
+        std::fprintf(stderr, "[mode U] no room on the GPU for a %dx%d film\n", resX, resY);
+        vcmSessionEnd(s);
+        return nullptr;
+    }
+    for (;;) {
+        const size_t lv = nl * (size_t)s->vcmCap;
+        if (tryAlloc(&s->d_lvSlab, lv * sizeof(gpu::DVcmLV)) &&
+            (s->secStride == 0 ||
+             tryAlloc(&s->d_lvSecSlab, lv * (size_t)s->secStride * sizeof(gpu::DVcmSec))) &&
+            tryAlloc(&s->d_lvCount, nl * sizeof(int)) &&
+            tryAlloc(&s->d_lamBuf, nl * (size_t)C * sizeof(gpu::Real)) &&
+            tryAlloc(&s->d_invLam, nl * (size_t)C * sizeof(double)) &&
+            tryAlloc(&s->d_pathBegin, nl * sizeof(int)) &&
+            tryAlloc(&s->d_pathEnd, nl * sizeof(int)))
+            break;
+        for (void* q : {(void*)s->d_lvSlab, (void*)s->d_lvSecSlab, (void*)s->d_lvCount,
+                        (void*)s->d_lamBuf, (void*)s->d_invLam, (void*)s->d_pathBegin,
+                        (void*)s->d_pathEnd})
+            cudaFree(q);
+        s->d_lvSlab = nullptr; s->d_lvSecSlab = nullptr; s->d_lvCount = nullptr;
+        s->d_lamBuf = nullptr; s->d_invLam = nullptr; s->d_pathBegin = nullptr; s->d_pathEnd = nullptr;
+        if (nl == 1) {
+            std::fprintf(stderr, "[mode U] no room on the GPU for the light-vertex store\n");
+            vcmSessionEnd(s);
+            return nullptr;
+        }
+        nl /= 2;
+    }
+    s->nLight = nl;
+    if (nl < np)
+        std::printf("[mode U] %zu light subpaths a pass for %zu pixels (light-vertex store "
+                    "budget %zu MB at %dx%d, %d vertices a subpath)\n",
+                    nl, np, budget >> 20, resX, resY, s->vcmCap);
     CUDA_CHECK(cudaMemset(s->d_accum, 0, np * 3 * sizeof(double)));
     return s;
 }

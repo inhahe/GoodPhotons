@@ -235,6 +235,7 @@ def render(exe, scene, out, mode, heroc, seed, spp, device="cpu"):
         print(r.stdout[-2000:], r.stderr[-2000:])
         raise SystemExit("render failed: " + " ".join(cmd))
     if device == "gpu" and "-> GPU" not in r.stdout + r.stderr:
+        os.remove(pfm)                       # or the next run would score the CPU's image as the GPU's
         raise SystemExit("did not run on the GPU: " + " ".join(cmd))
     return read_pfm(pfm)
 

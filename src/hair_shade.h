@@ -195,13 +195,14 @@ inline double hairFoldFCos(const hair::LobeAngular& la, const HairShade& s, cons
 
 // hairFCos and hair::pdf for every shade of a bundle (`hs[0..n)`, sharing hit and arrival:
 // hairShadeRetint) toward one LOCAL direction `wl` with its longitudinal cosine. The angular
-// half of f() is computed once, at hs[0]; every wavelength's value, the hero's pdf included,
-// then folds from it (hairFoldFCos). `pdf` may be null.
+// half of f() is computed once, at hs[0]; every wavelength's value, the hero's pdf included
+// unless its medulla is live, then folds from it (hairFoldFCos). `pdf` may be null.
 inline void hairBundleAt(const HairShade* hs, int n, const Vec3& wl, double cosLong,
                          double* fcos, double* pdf) {
     hair::LobeAngular la;
     fcos[0] = hair::f(hs[0].b, hs[0].woLocal, wl, &la) * cosLong;
-    if (pdf) hairFoldFCos(la, hs[0], wl, cosLong, &pdf[0]);
+    if (pdf) pdf[0] = la.valid ? hs[0].b.opacity * hair::pdfFromLobes(la, hs[0].b.sigmaA, hs[0].b.specR)
+                               : hair::pdf(hs[0].b, hs[0].woLocal, wl);
     for (int i = 1; i < n; ++i) fcos[i] = hairFoldFCos(la, hs[i], wl, cosLong, pdf ? &pdf[i] : nullptr);
 }
 

@@ -1502,6 +1502,15 @@ struct Scene {
     std::vector<Medium> media;
 
     bool anyMedium() const { return !media.empty(); }
+    // Whether the hero-wavelength bundle can cross every medium here: each one's extinction is
+    // flat in wavelength (Medium::achroSigma), so a free flight, its transmittance and the albedo
+    // coin are the same for every member, and a rainbow phase -- the one direction left that
+    // depends on wavelength -- is carried by spectral MIS. Modes R, W and D gate their bundle on
+    // it, host and device.
+    bool mediaKeepBundle() const {
+        for (const Medium& m : media) if (!m.achroSigma) return false;
+        return true;
+    }
 
     // Emitters. Forward tracing selects one per photon with probability
     // proportional to power (so every photon carries beta = totalPower, keeping
@@ -2302,8 +2311,8 @@ struct Scene {
     // from the map's luminance CDF (pdfW = solid-angle density); for a constant env
     // it is a uniform sphere direction (pdfW = 1/4pi).
     Vec3 sampleEnvDir(Pcg32& rng, double& pdfW) const {
-        if (envMap) return envMap->sample(rng.uniform(), rng.uniform(), pdfW);
-        const double u1 = rng.uniform(), u2 = rng.uniform();
+        const double u1 = rng.uniform(), u2 = rng.uniform();   // named: argument order is unspecified
+        if (envMap) return envMap->sample(u1, u2, pdfW);
         pdfW = 1.0 / (4.0 * PI);
         return uniformSphere(u1, u2);
     }

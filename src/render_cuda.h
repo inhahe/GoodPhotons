@@ -485,21 +485,22 @@ long long sppmSessionEmitted(const SppmSession* s);
 void sppmSessionEnd(SppmSession* s);
 
 // ---- GPU VCM / UPS (mode U) ------------------------------------------------------------
-// Resident device VCM session mirroring vcm.h's vcmPass. Each pass traces one light + one
-// camera subpath per pixel, combining BDPT vertex CONNECTIONS with photon-map vertex MERGING
-// under one balance-heuristic MIS. Light vertices are stored into a per-path slab on the
-// device, downloaded and compacted host-side into contiguous per-path ranges, and a uniform
-// hash grid (cell = merge radius) is built over them (byte-for-byte mirror of vcm.h
+// Resident device VCM session mirroring vcm.h's vcmPass. Each pass traces one camera subpath
+// per pixel and nLight light subpaths -- one per pixel, or fewer when their vertices would not
+// fit the light-vertex store's memory budget, each then shared by several camera paths --
+// combining BDPT vertex CONNECTIONS with photon-map vertex MERGING under one balance-heuristic
+// MIS. The light vertices are compacted on the device into contiguous per-path ranges and a
+// uniform hash grid (cell = merge radius) is built over them (a mirror of vcm.h
 // VcmGrid::build); the camera kernel then does emission/NEE/connection/merge and accumulates
-// the running per-pixel sum. Resolve divides by the pass count. Validated statistically
-// against the CPU (independent MC).
+// the running per-pixel sum. Resolve divides by the pass count.
 struct VcmSession;   // opaque; lives in render_cuda.cu
 // True when the scene is device-bakeable for VCM: the BDPT device scope (mode D) PLUS a
 // no-participating-media restriction (mode U is surfaces-only). Pinhole cameras only
 // (cam.project) — the caller gates the camera choice.
 bool cudaVcmSupported(const Scene& scene);
-// Returns nullptr if CUDA is unavailable or the scene is out of scope. `maxDepth` (<1 =>
-// default 8) is the full path length in edges (also the per-light-subpath stored-vertex cap).
+// Returns nullptr if CUDA is unavailable, the scene is out of scope, or the GPU has no room
+// for the film and one light subpath's store. `maxDepth` (<= 1 => 9) is the longest path in
+// EDGES (-max-bounce + 1); a light subpath stores at most maxDepth - 1 vertices.
 // `heroC` > 1 carries a hero-wavelength bundle of that width along BOTH subpaths (clamped to
 // hero::kHeroMax); 1 is the classic single-λ session, which the templated kernels reproduce
 // bit-identically and without allocating the per-vertex secondary slab at all.

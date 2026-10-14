@@ -13428,8 +13428,9 @@ static void warnWhittedHeroCollapse(const Scene& scene) {
 // rendered at N wavelengths, shared. The error is a global colour cast, so it does not
 // average down per pixel -- it only goes away once N covers the spectrum.
 //
-// Measured on scenes/gallery_rain.ftsl (rain volume => scalar path), frame-mean B/G against
-// the converged 512-spp answer (0.705):
+// Measured in 0.199 on scenes/gallery_rain.ftsl, whose rain then took the scalar path (a grey
+// medium keeps the bundle now: Scene::mediaKeepBundle), frame-mean B/G against the converged
+// 512-spp answer (0.705):
 //
 //     spp    1     2     4     8    16    32    64   512
 //     B/G  0.000 0.085 0.483 1.243 0.691 0.787 0.694 0.705
@@ -13447,7 +13448,7 @@ static const int kWhittedDeHeroSpp = 64;
 // (kWSppCap, in the -explore loop) cannot drift apart.
 static const char* whittedDeHeroes(const Scene& scene) {
     if (g_heroC <= 1)                   return "-heroc 1 (the hero bundle is off)";
-    if (!scene.media.empty())           return "participating media";
+    if (!scene.mediaKeepBundle())       return "a medium whose extinction varies with wavelength";
     if (grin::sceneHasGrin(scene))      return "a GRIN volume";
     return nullptr;
 }
@@ -17798,7 +17799,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // VCM/UPS: runs BDPT vertex connections AND photon-map vertex merging under one MIS
     // balance heuristic, so it is robust across diffuse GI, glossy, and specular caustics
     // in a single unbiased-in-the-limit estimator. Persistent per-pass accumulation lives
-    // in `st`; each pass traces one light + one camera subpath per pixel, shrinking the
+    // in `st`; each pass traces one light + one camera subpath per pixel (the GPU may trace
+    // fewer light subpaths, each shared, when their vertices would not fit), shrinking the
     // merge radius as r_i = R0 * i^((alpha-1)/2). -n is ignored (paths are per-pixel);
     // -spp = number of passes (or a -time/-noise budget). -vcmalpha = radius-shrink rate.
     if (mode == 'U') {
@@ -17821,10 +17823,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         const int vcmHeroC = g_heroC;
 #ifdef HAVE_CUDA
         // GPU VCM (M12): resident device session mirroring vcm.h's vcmPass. Each pass traces
-        // one light + one camera subpath per pixel, combining BDPT vertex connections with
-        // photon-map vertex merging under one balance-heuristic MIS; light vertices are stored
-        // in a per-path slab, downloaded + compacted host-side, and gridded (cell = radius),
-        // then the camera kernel does emission/NEE/connection/merge. Pinhole cameras only and
+        // one camera subpath per pixel and up to as many light subpaths (vcmSessionBegin),
+        // combining BDPT vertex connections with photon-map vertex merging under one
+        // balance-heuristic MIS; light vertices are stored in a per-path slab, compacted and
+        // gridded on the device (cell = radius), then the camera kernel does
+        // emission/NEE/connection/merge. Pinhole cameras only and
         // the BDPT-supported, media-free scene scope; anything else falls through to the CPU.
         {
             const bool wantGpu  = !std::strcmp(device, "gpu");
@@ -18745,8 +18748,8 @@ static void printHelp(const char* prog) {
 "                        default: luma is left bit-identical, so no detail is lost. MC\n"
 "                        colour noise is mostly chroma and the eye barely resolves chroma\n"
 "                        detail, so this removes the rainbow confetti in dispersive\n"
-"                        caustics / media (where the hero-wavelength bundle is unavailable\n"
-"                        and every path is single-lambda) while keeping every edge. Costs\n"
+"                        caustics and wavelength-dependent media (where the hero bundle\n"
+"                        splits and each path carries one lambda) while keeping every edge. Costs\n"
 "                        ~1%% of render time. amount scales the chroma tolerance, default 1\n"
 "  -denoise-chroma <x>   chroma edge-stop tolerance in local sigma (default 2). Lower it\n"
 "                        to protect real rainbow fringing; raise it to kill more speckle\n"
@@ -22884,32 +22887,20 @@ static int run(int argc, char** argv) {
             // fallback; they are only worth taking when the scene actually contains such a
             // material, since anywhere else they are bit-for-bit identical work.
             //
-            // The DISPERSIVE materials (dielectric / thin-film / multilayer / grating /
-            // half-mirror / fluorescent) used to be the main offender -- a Cornell SF10 ball
-            // rendered flat green until ~16 spp. They no longer are: mode W now SPLITS the bundle
-            // at a dispersive vertex into C monochromatic sub-paths, each on its own Snell
-            // direction (BackwardRenderer::heroSplit), so glass is colour-correct at 1 spp.
-            // `Layered` used to be the remaining offender for the same reason (it de-hero'd
-            // unconditionally, so a clearcoat previewed monochromatic); as of v0.115.1 its coat
-            // reflectance is applied as a PER-λ weight with the bundle intact, and only a
-            // genuinely chromatic coat -- one where the R >= 0.5 dominant branch differs across
-            // λ -- fans out, so layered scenes are 1-spp-clean too. What still de-heroes is the
-            // scalar (bundle-free) path taken for media / GRIN / heroC 1.
-            // (Thin-film and multilayer needed a SECOND fix beyond the split, in v0.112.0: the
-            // split gives each λ its own direction, but the reflect-or-transmit choice at the
-            // interface was still a coin flip with no `whitted` branch, so those two stayed
-            // grainy here even at C > 1. They now take the dominant branch weighted, like
-            // Dielectric -- see thinFilmInterface's whittedWeight.)
+            // The dispersive materials keep the bundle: mode W splits it at a dispersive vertex
+            // into C monochromatic sub-paths, each on its own direction
+            // (BackwardRenderer::heroSplit), and takes an interface's dominant branch weighted
+            // (interfaceOptics' whittedWeight); a `Layered` coat applies its reflectance per
+            // wavelength and fans out only where its dominant branch differs across the bundle.
+            // What still de-heroes is whittedDeHeroes' list: -heroc 1, a medium whose
+            // extinction varies with wavelength, GRIN.
             // (No hasLens() term: the viewer builds its camera fresh from the pose each frame,
             // so the preview camera is always a plain one even if the scene authored a lens.)
-            // The floor is the SAME constant the batch warning quotes (kWhittedDeHeroSpp),
-            // and the same predicate (whittedDeHeroes) decides whether it applies -- two
-            // copies of this rule is how the viewer and the batch path came to disagree.
-            // It was 16 here, which the gallery_rain measurement in warnWhittedDeHeroSpp
-            // shows is still ~18% off in R/G; 64 lands within ~2%. The extra passes cost
-            // nothing in responsiveness because ANY camera movement abandons the unfinished
-            // refinement outright -- they only run while you are holding still, and every
-            // one of them is displayed as it lands.
+            // The floor is the constant the batch warning quotes (kWhittedDeHeroSpp) and the
+            // predicate is the one it uses, so the viewer and the batch path cannot disagree.
+            // The extra passes cost nothing in responsiveness: any camera movement abandons
+            // the unfinished refinement, so they run only while you hold still, and each is
+            // shown as it lands.
             const int kWSppCap = kWhittedDeHeroSpp;
             bool wNeedSpp = whittedDeHeroes(scene) != nullptr;
             // Rough GLOSSY is deliberately NOT on that list, even though its lobe is likewise

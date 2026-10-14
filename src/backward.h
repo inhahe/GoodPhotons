@@ -8,7 +8,7 @@
 // energy conservation alone cannot catch.
 //
 // It deliberately REUSES the material primitives (Fresnel via Renderer::
-// refractOrReflect, the glossy lobe via sampleGlossy) so the two renderers agree
+// interfaceOptics, the glossy lobe via sampleGlossy) so the two renderers agree
 // on materials by construction. That isolates the validation to the part that
 // actually differs — the transport and camera math (connect / G / We).
 //
@@ -46,7 +46,7 @@
 #pragma once
 #include "scene.h"
 #include "camera.h"
-#include "render.h"   // sampleGlossy, Renderer::refractOrReflect, clamp01, PI
+#include "render.h"   // sampleGlossy, Renderer::interfaceStep, clamp01, PI
 #include "medium_stack.h" // nested-dielectric priority stack
 #include "grin.h"     // shared gradient-index (GRIN) Eikonal marcher
 #include "hero.h"     // hero-wavelength spectral sampling (kHeroC)
@@ -3950,14 +3950,11 @@ struct BackwardRenderer {
     void renderRows(const Scene& scene, const Camera& cam, Film& film,
                     int y0, int y1, long long spp, unsigned long long sampleBase) const {
         const int C = heroC;
-        // Media admit the bundle when every medium's extinction is flat in λ (Medium::
-        // achroSigma): the free flight, its transmittance and the albedo coin are then the
-        // same for every wavelength, and only a rainbow phase still varies -- which the bundle
-        // carries by spectral MIS (radianceHeroLoop). A chromatic extinction would need
-        // per-wavelength free flights, so such a scene stays on one wavelength per path.
-        bool mediaFlat = true;
-        for (const Medium& md : scene.media) if (!md.achroSigma) { mediaFlat = false; break; }
-        const bool useHero = (C > 1) && mediaFlat &&
+        // Media admit the bundle when every medium's extinction is flat in λ
+        // (Scene::mediaKeepBundle); a rainbow phase in one is carried by spectral MIS
+        // (radianceHeroLoop). A chromatic extinction would need per-wavelength free flights,
+        // so such a scene stays on one wavelength per path.
+        const bool useHero = (C > 1) && scene.mediaKeepBundle() &&
                              !grin::sceneHasGrin(scene) && !cam.hasLens();
         const uint64_t nPix = (uint64_t)film.resX * (uint64_t)film.resY;
         // Per-sample SPD table (see SpdCache): nBase×C (nBase×1 on the scalar path),

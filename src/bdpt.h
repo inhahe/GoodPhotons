@@ -3561,8 +3561,8 @@ struct SurfMergeWeight {
         // THE DEPTH CAP, exactly as BeamMergeWeight's and for the same reason, at this merge's
         // depth j+k-1 (see SHAPE). Past the cap the merged path is one no connection strategy
         // builds, so its energy would have nothing to MIS against; AT the cap it is one they do
-        // build, and their weights count this merge (misWeight), so refusing it there loses its
-        // share: -max-bounce 1 rendered x0.83 of mode R.
+        // build, and their weights count this merge (misWeight), so refusing it there would lose
+        // its share of those paths.
         if ((int)lm.vert + camVert - 1 > maxDepth) return 0.0;
         const double etaS = kappaS * lm.pdfFwdA;      // THIS merge, as a ratio against C1
         if (!(etaS > 0.0)) return 0.0;
@@ -3676,15 +3676,13 @@ struct BdptRenderer {
         // ray path, so a GRIN field (per-λ curvature), a dispersive finite lens (per-λ
         // refraction at the elements) or a medium whose EXTINCTION varies with λ (per-λ
         // free flight) forces the scalar single-λ path. A medium flat in its coefficients
-        // (Medium::achroSigma, the common grey fog, cloud or rain) shares its free flights,
+        // (Scene::mediaKeepBundle: the common grey fog, cloud or rain) shares its free flights,
         // transmittance and albedo across the bundle; a rainbow phase in it is the one
         // λ-dependent direction left, and the walk carries it per λ (see the medium event).
         const int C = (heroC > hero::kHeroMax) ? hero::kHeroMax : heroC;
-        bool mediaFlat = true;
-        for (const Medium& md : scene.media) if (!md.achroSigma) { mediaFlat = false; break; }
         // Mode J's beam merges in a medium were written for one wavelength per path, so a
         // mode-J render with media stays there until they are taught the bundle.
-        const bool useHero = (C > 1) && mediaFlat &&
+        const bool useHero = (C > 1) && scene.mediaKeepBundle() &&
                              (scene.media.empty() || beams == nullptr) &&
                              !grin::sceneHasGrin(scene) && !cam.hasLens();
         // Only pay for escape tracking when the scene actually has a distant sun.

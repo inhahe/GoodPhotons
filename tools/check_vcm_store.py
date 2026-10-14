@@ -62,10 +62,16 @@ def main():
                 raise SystemExit("render failed at %d" % r)
             if "VCM/UPS on " not in log:
                 raise SystemExit("did not run on the GPU at %d" % r)
-            if seed == 1:
-                for ln in log.splitlines():
-                    if ln.startswith("[mode U]"):
-                        print("  %dx%d: %s" % (r, r, ln.strip()), flush=True)
+            # The large frame must actually overflow the store and the small one fit it, or the
+            # comparison tests nothing (a card with room for 1600x1600 would pass any pairing).
+            shared = [ln.strip() for ln in log.splitlines()
+                      if ln.startswith("[mode U]") and "light subpaths a pass" in ln]
+            if (r == 1600) != bool(shared):
+                raise SystemExit("at %dx%d the light-vertex store %s its budget; the check needs "
+                                 "it to overflow at 1600 only" % (r, r, "overflowed" if shared
+                                                                  else "fit"))
+            if seed == 1 and shared:
+                print("  %dx%d: %s" % (r, r, shared[0]), flush=True)
             means.append(read_pfm(pfm).sum(-1).mean())
         m = np.array(means)
         res[r] = (m.mean(), m.std(ddof=1) / np.sqrt(len(m)))

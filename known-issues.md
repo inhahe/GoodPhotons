@@ -71,6 +71,103 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-10-14, next): MODE-M-FOLD-SUPPORT — mode M's spectral fold is biased where the branches a step can take depend on the wavelength
+
+Mode M's camera walk runs at one wavelength and estimates every photon wavelength L from it: the
+spectral carrier (`SpecThr` / `DSpecThr`) folds each coin the walk tossed as p_L(branch) /
+p_lambda(branch) (`Renderer::stepFactorAt`). That is an importance reweighting, and it is unbiased
+only if every branch possible at L is possible at the walk's wavelength too. Where the branch SET
+changes with the wavelength, it is not:
+
+* a coat clear at some wavelengths and opaque at others (a `substrate_k` zero over part of the
+  band) inside a medium that ranks it no lower: where it is clear the priority rule passes the ray
+  straight through, where it is opaque it reflects or absorbs;
+* total internal reflection at some wavelengths of a dispersive interface and not at others.
+
+A walk at a wavelength where a branch is impossible cannot sample it, so its estimate of the
+wavelengths where that branch carries light misses it entirely; averaged over the walks, each such
+wavelength comes out scaled by the share of walk wavelengths that can take its branches. Measured
+on `check_coat_modes`' water tank with a thin-film ball ranked as the water and opaque above ~570 nm
+(framed close, device mode R at 8192 spp as the reference, which the host's mode R matches within
+4 % in every bright tile): mode M reads x0.50 in blue and x0.49 in red over the ball's upper half,
+host and device alike. Before 0.381.1 the fold also took the pass-through at the opaque
+wavelengths, which leaked light through the coat there (red x1.17 above the ball) and partly
+masked the loss (red x0.65 on it); 0.381.1 makes that term 0, which is right term by term, but the
+loss remains. Every scene whose coins keep the same branches at every wavelength (every Fresnel
+and interference coin short of total internal reflection, every clear or opaque coat) is
+unaffected.
+
+**Fix:** divide not by the walk's own branch probability but by the branch sequence's probability
+averaged over the wavelengths the walk could have been drawn at -- a spectral MIS over the
+carrier's bins (one more per-bin product, of the coins' probabilities alone, beside the fold's
+`v`), on host and device. The test is in `scraps/face/check_coat_modes_partial.py`: mode M against
+mode R on that tank, which must pass once the fold is unbiased there.
+
+## DONE (2026-10-14, 0.381.1): REVIEW-0380 — what the Opus and Fable reviews of 0.379.0-0.380.0 found
+
+Opus (max) and Fable (xhigh) reviewed be06cd57..0867bcaa. Fixed:
+
+* **The device's fog light sampling measured a tilted quad light by its authored normal**
+  (`bkNeeVolumeHero`; also the RGB preview's `bkNeeLightRGB`): x0.66 in fog under a light tilted
+  45 degrees. 0.276.3 had fixed the host's and the device's surface NEE only.
+  `tools/check_tilted_light.py`. The light-side paths have the same question open:
+  TILTED-LIGHT-EMIT.
+* **Mode M's fold at a coat clear at some wavelengths and opaque at others** (Fable): the priority
+  rule's pass-through is decided at the walk's wavelength, and the fold took it at every photon's,
+  so light leaked through the coat at the wavelengths where it is opaque, and a walk that met the
+  opaque coat folded its reflectance at wavelengths where it would have passed. The step now
+  records whether the rule applies (`InterfaceStep::suppressible`, `DStepRecord`), and
+  `stepFactorAt` gives 0 to a branch the walk could not have taken at that wavelength. That makes
+  each term right, but measuring it showed the fold itself is biased wherever the branch set
+  depends on the wavelength: MODE-M-FOLD-SUPPORT, where its test waits.
+* **Mode W's de-hero warning still named every medium** (`whittedDeHeroes`), though the bundle has
+  crossed flat media since 0.375.0 (host) / 0.379.0 (device): one predicate,
+  `Scene::mediaKeepBundle`, now gates modes R, W and D on both backends.
+* **GPU mode U's light-vertex store ignored free memory** (both reviews): its budget is now at most
+  half of what is free once the scene is up, and an allocation that still fails halves the light
+  subpaths instead of ending the run. `check_vcm_store.py` now requires the store to overflow at
+  1600x1600 and fit at 160x160, so it cannot pass without testing the pairing.
+* **A cold fire's loader fix had no test** (Fable): `tools/check_cold_fire.py`.
+* `check_hero_spectral.py` deleted a CPU fallback's image only on a cache miss, so a rerun scored
+  it as the device's.
+* Simplifications: one `dSampleEnvDir` for the device's three sky draws (two uniforms named in
+  order, as `Scene::sampleEnvDir` now names them too); mode M's device fiber fold through
+  `dHairSpecAt` / `dHairFoldFCos` (and `dHairMedullaLiveAt` gone); `dHairBundleAt` /
+  `hairBundleAt` take the hero's pdf without a second BCSDF evaluation, `bkHairHeroStep` its
+  specular pattern once; the VCM pairing index renamed `lp` (a loop variable shadowed `j`);
+  comments naming deleted functions, describing one light subpath per pixel, or narrating
+  history, rewritten.
+* Dismissed: running the cold-fire test before `build()` (both reviews) -- the exact test scans
+  the whole temperature grid, so it would cost every fire scene a second scan to save a second
+  BVH build that happens only when a preview opens a scene whose only light is a fire that emits
+  nothing.
+
+## OPEN (2026-10-14, design decision): TILTED-LIGHT-EMIT — a tilted quad light is measured by its patch on the camera side and by its authored normal on the light side
+
+A quad light's `normal` may leave the patch's plane (`Emitter::normalTilted`; `scenes/mirror_selfie`
+has three). Since 0.276.3 the camera side measures such a light by the patch's own orientation
+(`nGeom`) and tests the emitting side by the authored `normal`: host `emitterGeom` and
+`volumeEmitterGeom`, device `bkEmitterGeom`, and since 0.381.1 the device's volume NEE
+(`bkNeeVolumeHero`) and RGB preview (`bkNeeLightRGB`), which 0.276.3 had missed (the Opus review
+of 0.379.0-0.380.0 found the first).
+
+The light side still does both by the authored normal: BDPT's light subpaths (bdpt.h, the
+cosine emission about `nOut` and its density, `L0.ng`) and s = 1 connection (`Wgeom = cosLight *
+area / ...`), their device twins, VCM's light pass and camera connection (vcm.h, `kVcmLightT`), and
+every forward photon birth (`emitterSamplePoint` hands back the authored normal for a quad). So
+for a tilted light the camera-side and light-side strategies disagree: modes D, J and U combine
+two inconsistent estimates, and the forward modes emit a different flux than mode R sees.
+
+The semantics are the decision. Under the current one (emission over the hemisphere about the
+authored `normal`, measured against the patch: Le |cos_geo| dA dw), the emitting set includes a
+sliver of directions BEHIND the patch's plane, which a cosine emission about the patch cannot
+reach; covering it needs an emission over the whole sphere with the authored side rejected.
+**Proposed instead:** snap a tilted `normal` at load to the side of the patch's plane it points to
+(`nGeom` or `-nGeom`). The warning already tells authors a tilt does not aim the light; the snap
+makes that literally true, makes every estimator consistent by construction, and removes the
+`normalTilted` special cases from every reader (host and device). It changes only malformed lights
+(of the shipped scenes, `mirror_selfie`'s wall-washes, by the sliver behind their planes).
+
 ## DONE (2026-10-14, 0.379.1): REVIEW-0378-FABLE — what the Fable review of 0.378.4-0.378.6 found
 
 Opus (max) reviewed the batch first (its follow-ups are 0.378.6); Fable (xhigh) then found:
