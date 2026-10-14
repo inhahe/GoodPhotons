@@ -3513,9 +3513,9 @@ struct BeamMergeWeight {
 // vertex, not along a ray) and applied once per gathered photon.
 //
 // SHAPE. The merged path is y_0 .. y_{j-1}, [ y_j == eye[k] ], eye[k-1], .., eye[0]: j+k+1
-// vertices, depth j+k — one SHORTER than a beam merge with the same indices, because this
-// merge identifies a vertex both walks already have instead of inserting a new one. For the
-// same reason its reference technique C1 is the connection at split s = j (join y_{j-1} to
+// vertices, so s = j and t = k+1, depth s+t-2 = j+k-1 — two SHORTER than a beam merge with the
+// same indices (j+k+1), because this merge inserts no vertex and its photon's vertex IS the
+// camera's. Its reference technique C1 is the connection at split s = j (join y_{j-1} to
 // the merge site, which is the last camera vertex), one strategy earlier than the beam case.
 // EVERY light-side accumulator is therefore read at j-1 where BeamMis reads at j; that offset
 // is baked into SurfMis at store time, so nothing here has to know about it.
@@ -3558,10 +3558,12 @@ struct SurfMergeWeight {
     int    maxDepth     = 0;
 
     double operator()(const SurfMis& lm, double pdfDirRev, double pdfDirFwd) const {
-        // THE DEPTH CAP, exactly as BeamMergeWeight's and for the same reason — but at j+k,
-        // not j+k+1: this merge adds no vertex. Past the cap the merged path is one no
-        // connection strategy builds, so its energy would have nothing to MIS against.
-        if ((int)lm.vert + camVert > maxDepth) return 0.0;
+        // THE DEPTH CAP, exactly as BeamMergeWeight's and for the same reason, at this merge's
+        // depth j+k-1 (see SHAPE). Past the cap the merged path is one no connection strategy
+        // builds, so its energy would have nothing to MIS against; AT the cap it is one they do
+        // build, and their weights count this merge (misWeight), so refusing it there loses its
+        // share: -max-bounce 1 rendered x0.83 of mode R.
+        if ((int)lm.vert + camVert - 1 > maxDepth) return 0.0;
         const double etaS = kappaS * lm.pdfFwdA;      // THIS merge, as a ratio against C1
         if (!(etaS > 0.0)) return 0.0;
         // pdfRev(y_{j-1})/pdfFwd(y_{j-1}) — the light loop's first (and only patched) step.
@@ -4083,10 +4085,10 @@ struct BdptRenderer {
                         // for free.
                         if (surfOn) {
                             const double vmNorm = 1.0 / mk.surf;
-                            // A point merge at eye[k] makes depth j + k with j >= 1 (photons are
-                            // stored past the light's own vertex), so past k = maxDepth - 1 the
+                            // A point merge at eye[k] makes depth j + k - 1 with j >= 1 (photons
+                            // are stored past the light's own vertex), so past k = maxDepth the
                             // weight refuses every one: no query.
-                            const int kEnd = std::min(nE, maxDepth);
+                            const int kEnd = std::min(nE, maxDepth + 1);
                             for (int k = 1; k < kEnd; ++k) {
                                 const Vertex& vk = eye[(size_t)k];
                                 // The site predicate is `surfMergeSite` and MUST be, because

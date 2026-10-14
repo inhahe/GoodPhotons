@@ -2319,17 +2319,21 @@ multilayer stack -- through one shared step, `Renderer::interfaceStep` (0.378.3;
 three since 0.378.5), which takes the transport as a required argument (`Renderer::Transport`),
 so no walk can leave the factor out by omission. It applies the nested-dielectric priority rule
 (the far side's index from the enclosing medium, `exteriorIor`; a boundary of no higher priority
-than the medium it lies in suppressed, the ray going straight on), then the material's own
-interface -- `refractOrReflect`, or the coating's interference reflectance -- and keeps the stack:
-a body the ray enters goes on it, a coated one as a glass one does, so a walk inside a coated body
+than the medium it lies in suppressed, the ray going straight on; an opaque coat, never entered,
+is no medium and is never suppressed), then the surface's optics -- `interfaceOptics` (0.379.1),
+one function for plain, thin-film and multilayer surfaces: the Fresnel or interference reflectance,
+total internal reflection, and the reflect-or-absorb of an opaque coat -- and keeps the stack: a
+body the ray enters goes on it, a coated one as a glass one does, so a walk inside a coated body
 knows its index and a body inside it ranks against it. It returns an `InterfaceStep`: the
 continuation ray, the throughput factor, mode W's branch weight, whether an opaque coating absorbed
 the ray, and what mode M's spectral gather needs to re-express the step at each photon's
-wavelength: `stepFactorAt`, the probability of the branch the coin took at that wavelength -- a
-coat's whole interference colour, a dispersive Fresnel term -- times the radiance factor there.
+wavelength: its own branch factor (`factor`, from `branchFactor`) and `stepFactorAt`, the same
+quantity at any other wavelength -- the probability of the branch the coin took there (a coat's
+whole interference colour, a dispersive Fresnel term) times the radiance factor. Both come from
+`interfaceOptics`, so the coin and the gather's ratio agree by construction.
 Modes M and S send coated bodies through it too (until 0.378.5 their camera walks bounced off a
-coat as off a half mirror). The device's twin is `dDielectricStep` (with `dExteriorIor` and
-`dStepFactorAt`, folded through `DSpecThr::mul`), whose `radianceScale` argument -- non-null on a
+coat as off a half mirror). The device's twin is `dDielectricStep` (with `dExteriorIor`,
+`dInterfaceOptics` and `dStepFactorAt`, folded through `DSpecThr::mul`), whose `radianceScale` argument -- non-null on a
 camera-side walk -- every caller states, as `dVcmScatter`'s callers do. Like a glass body, a
 coated one must be closed: a ray that refracts in through an open surface stays "inside" it.
 Mode W's two air-unit quantities, its 1/512 throughput cutoff and its flat `-ambient` fill, are
@@ -3894,12 +3898,12 @@ as the one at fault.
   above, so the bundle survives a clearcoat), and a Mix
   hard-thresholds via `mixResolveDominant` (`scene.h`); **Dielectric** likewise takes the
   dominant Fresnel branch (reflect iff R ≥ 0.5) with that branch's weight folded into the
-  throughput, via `refractOrReflect`'s `whittedWeight` out-param (`render.h`) — which also
+  throughput, via the interface step's `whitted` switch (`Renderer::interfaceStep`) — which also
   skips the frosting perturbation, the other rng draw at that interface (0.107.0; before
   that a dielectric was the one estimator left tossing a coin, and at `-spp 1` a coin flip
   per pixel is not noise but salt-and-pepper — glass rendered as a speckled blob).
   **ThinFilm / Multilayer** take the *same* `whittedWeight` contract as of 0.112.0
-  (`thinFilmInterface` / `multilayerInterface`): a lossless substrate reflects iff R ≥ 0.5 with
+  (now all in `interfaceStep`): a lossless substrate reflects iff R ≥ 0.5 with
   weight R or 1−R, while an *opaque* substrate — where transmission is absorbed, so there is
   only one surviving branch — always reflects with weight R, the reflectance becoming a
   throughput weight rather than a survival probability, exactly as Mirror/Filter do. Those two

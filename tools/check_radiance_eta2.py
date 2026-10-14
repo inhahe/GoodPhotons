@@ -50,12 +50,11 @@ any failure.
 """
 import argparse
 import os
-import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
-from check_glossy_nee_media import read_pfm, tile_stats, tile_verdict  # noqa: E402
+from check_glossy_nee_media import render_seeds, tile_stats, tile_verdict  # noqa: E402
 
 NL = chr(10)
 
@@ -147,29 +146,8 @@ def main():
             f.write(NL.join(lines) + NL)
 
     def render(tag, scene, args, device="cpu", spp=None):
-        """Two seeds of one configuration; a device render must say it ran on the GPU (mode M
-        logs `[gpu]` lines, modes U and S name the device they run on -- `VCM/UPS on`, `SPPM
-        on` -- and the others print a `-> GPU` device line)."""
-        imgs = []
-        for seed in (1, 2):
-            png = "%s_s%d.png" % (tag, seed)
-            pfm = os.path.join(d, png[:-4] + ".pfm")
-            for f in (os.path.join(d, png), pfm):       # never score an earlier run's image
-                if os.path.exists(f):
-                    os.remove(f)
-            cmd = [a.exe, "-in", scene, "-device", device, "-seed", str(seed), "-hdr", "-no-meter",
-                   "-spp", str(spp or a.spp), "-o", png] + args
-            p = subprocess.run(cmd, cwd=d, capture_output=True, text=True, encoding="utf-8",
-                               errors="replace")
-            if p.returncode != 0 or not os.path.exists(pfm):
-                print(p.stdout[-1500:], p.stderr[-1500:])
-                raise SystemExit("render failed: " + " ".join(cmd))
-            log = p.stdout + p.stderr
-            if device == "gpu" and not any(t in log for t in ("-> GPU", "[gpu]", "VCM/UPS on ",
-                                                               "SPPM on ")):
-                raise SystemExit("did not run on the GPU: " + " ".join(cmd))
-            imgs.append(read_pfm(pfm).sum(-1))
-        return imgs
+        """Two seeds of one configuration (render_seeds)."""
+        return render_seeds(a.exe, d, scene, tag, args, device, spp or a.spp)
 
     def ball(imgs):
         """The tank frame's middle: the ball and the water around it."""

@@ -71,6 +71,43 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-10-14, 0.379.1): REVIEW-0378-FABLE — what the Fable review of 0.378.4-0.378.6 found
+
+Opus (max) reviewed the batch first (its follow-ups are 0.378.6); Fable (xhigh) then found:
+
+* **J-SURF-DEPTH: mode J refused its point merges at exactly `-max-bounce`.** A photon stored at
+  light vertex j and merged at eye vertex k makes a path of j + k + 1 vertices -- depth j + k - 1
+  -- but `SurfMergeWeight` (and the device's `DSurfMergeW`) capped it as j + k, so a path of
+  depth `maxDepth` lost the merge's share of the weight that the connections' `misWeight` still
+  gave it. Measured against mode R in `check_bdpt_depth.py`'s box: **x0.83 at `-max-bounce 1`**
+  (device x0.82), x0.94 at 2, x0.976 at 3; mode D x1.000 throughout. The beam merge's cap
+  (j + k + 1) was right. Both backends fixed; the depth check now runs mode J too.
+* **An opaque coat could be ranked away.** A thin film or stack on an absorbing substrate (or
+  with an absorbing layer) given a `priority` no higher than the medium around it was suppressed by
+  the priority rule -- the ball vanished -- and pushed on the medium stack. It is never entered, so
+  it is no medium: `Material::coatOpaque` / `dCoatOpaque` keep the rule off it (the priority audit
+  uses the same test). `check_coat_modes.py` renders such a ball in a ranked water tank, ranked
+  below and above the water, in modes R (host and device) and D.
+* **A fire that emits nothing lit a scene.** The loader's "scene has no light" check runs before
+  `build()` demotes such a fire to smoke, so a scene whose only light it was rendered black. The
+  check runs again after `build()`.
+* Simplifications: one `interfaceOptics` / `dInterfaceOptics` for every dielectric surface, used
+  by the step's coin and by mode M's `stepFactorAt` alike (four copies of the formulas before), the
+  step reporting its own branch factor; the device `multilayerReflectance` takes `reversed`; one
+  `render_seeds` for the check scripts.
+* Dismissed: an open coated surface leaves a stack entry behind (as Opus had raised) -- FTSL.md
+  now says a clear coated surface is a body's and should be closed; a free film is `ior 1`.
+
+## OPEN (2026-10-14): VCM-DEPTH-EDGES — mode U's `-max-bounce` counted path edges, one more than every other mode
+
+`vcm.h` and the device VCM take `maxDepth` as the longest path in EDGES (SmallVCM's
+convention), consistently across every strategy, so mode U at `-max-bounce N` rendered paths of at
+most N - 1 scattering vertices where modes R, D and J render N. Measured in
+`check_bdpt_depth.py`'s box: U at `-max-bounce 1` read x0.407 of R at 1 (only the lamp seen
+directly survives), and U at N + 1 matched R at N (x1.0007 at N = 1, x1.0008 at 2). Found while
+measuring J-SURF-DEPTH above. Fix: pass `-max-bounce + 1` edges, and stop the light walk one edge
+earlier, where its vertices can make no path at all.
+
 ## OPEN (2026-10-14, tech debt): GPU-STACK-DRIFT — every kernel's stack reservation moves when unrelated device code changes
 
 Each megakernel reserves its per-thread stack (`cudaFuncAttributes::localSizeBytes`, the

@@ -1,4 +1,5 @@
-"""Regression check: modes M and S render a coated body as one -- refracting, in its own colour.
+"""Regression check: coated bodies -- modes M and S render one as a refracting body, in its own
+colour, and an opaque one is no medium.
 
     D:/python314/python.exe -u tools/check_coat_modes.py [--out <dir>] [--exe ftrace.exe]
                                                          [--spp N] [--no-gpu]
@@ -14,17 +15,22 @@ over a floor and in front of a wall, and requires against mode R, per tile:
   * mode S, the sum of the channels (mode S folds no spectral factor per photon for any
     material: known-issues SPPM-SPECTRAL);
   * unless --no-gpu, both on the device against the host.
+And an OPAQUE coated ball -- a stack with an absorbing layer -- in a water tank that carries a
+`priority`: it is never entered, so it is no medium, and the priority it is given cannot matter.
+Mode R (host, and device unless --no-gpu) and mode D (host) must render it the same ranked below
+the water as above it. (Until 0.379.1 the priority rule suppressed it when it ranked no higher than
+the water, and the ball vanished.)
 A tile fails when the two differ by more than 5 standard errors (two seeds each) AND by more
 than 5 %. Exits 1 on any failure.
 """
 import argparse
 import os
-import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
-from check_glossy_nee_media import read_pfm, tile_stats, tile_verdict  # noqa: E402
+from check_glossy_nee_media import render_seeds, tile_stats, tile_verdict  # noqa: E402
+from check_radiance_eta2 import TANK  # noqa: E402
 
 NL = chr(10)
 SCENE = [
@@ -46,6 +52,20 @@ SCENE = [
 ]
 
 
+def opaque_tank(priority):
+    """check_radiance_eta2's water tank, the water ranked 1 and its ball an opaque Bragg stack
+    ranked `priority`."""
+    out = []
+    for ln in TANK:
+        if ln.startswith('material "water"'):
+            out += ['material "water" { type dielectric  ior 1.333  priority 1 }',
+                    'material "beetle" { type multilayer  ior 1.5  layer 1.56 0.0 120  '
+                    'layer 1.0 0.5 80  layer 1.56 0.0 120  priority %d }' % priority]
+            continue
+        out.append(ln.replace("radius 0.25  material white", "radius 0.25  material beetle"))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split(NL)[0])
     ap.add_argument("--out", default=os.path.join(ROOT, "png", "check_coat_modes"))
@@ -58,28 +78,13 @@ def main():
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "coats.ftsl"), "w", encoding="utf-8", newline="") as f:
         f.write(NL.join(SCENE) + NL)
+    for pri in (1, 2):
+        with open(os.path.join(d, "opaque_p%d.ftsl" % pri), "w", encoding="utf-8", newline="") as f:
+            f.write(NL.join(opaque_tank(pri)) + NL)
 
     def render(tag, args, device="cpu"):
-        """Two seeds of one configuration (RGB images); a device render must say it ran there."""
-        imgs = []
-        for seed in (1, 2):
-            png = "%s_s%d.png" % (tag, seed)
-            pfm = os.path.join(d, png[:-4] + ".pfm")
-            for f in (os.path.join(d, png), pfm):       # never score an earlier run's image
-                if os.path.exists(f):
-                    os.remove(f)
-            cmd = [a.exe, "-in", "coats.ftsl", "-device", device, "-seed", str(seed), "-hdr",
-                   "-no-meter", "-spp", str(a.spp), "-o", png] + args
-            p = subprocess.run(cmd, cwd=d, capture_output=True, text=True, encoding="utf-8",
-                               errors="replace")
-            if p.returncode != 0 or not os.path.exists(pfm):
-                print(p.stdout[-1500:], p.stderr[-1500:])
-                raise SystemExit("render failed: " + " ".join(cmd))
-            log = p.stdout + p.stderr
-            if device == "gpu" and not any(t in log for t in ("-> GPU", "[gpu]", "SPPM on ")):
-                raise SystemExit("did not run on the GPU: " + " ".join(cmd))
-            imgs.append(read_pfm(pfm))
-        return imgs
+        """Two seeds of one configuration, as RGB images (render_seeds)."""
+        return render_seeds(a.exe, d, "coats.ftsl", tag, args, device, a.spp, rgb=True)
 
     modeM = ["-mode", "M", "-n", "20000000"]
     modeS = ["-mode", "S", "-n", "2000000"]
@@ -96,6 +101,13 @@ def main():
                    [x[..., c] for x in m]) for c in range(3)]
         pairs.append(("mode S device / host, luminance", [x.sum(-1) for x in sg],
                       [x.sum(-1) for x in s]))
+    devs = ["cpu"] if a.no_gpu else ["cpu", "gpu"]
+    for mode, dev in [("R", x) for x in devs] + [("D", "cpu")]:
+        tag = "opaque_%s%s" % (mode, "g" if dev == "gpu" else "")
+        lo, hi = [render_seeds(a.exe, d, "opaque_p%d.ftsl" % pri, "%s_p%d" % (tag, pri),
+                               ["-mode", mode], dev, a.spp) for pri in (1, 2)]
+        pairs.append(("opaque coat in water, mode %s%s: ranked below / above the water" % (
+            mode, " (device)" if dev == "gpu" else ""), lo, hi))
     ok = True
     for name, x1, x0 in pairs:
         ratio, z, bad = tile_verdict(tile_stats(*x1), tile_stats(*x0), 0.05)

@@ -259,6 +259,17 @@ struct Material {
     // nanometres. Layer 0 is the outermost (nearest the incident medium).
     std::vector<double> layerN, layerK, layerThick;
 
+    // A coating that takes the transmitted light instead of passing it into a body: a thin film
+    // or multilayer stack on an absorbing substrate, or a stack with an absorbing layer, at
+    // `lambda`. Such a surface reflects or absorbs, is never entered, and so is no medium
+    // (Renderer::interfaceStep, the priority audit).
+    bool coatOpaque(double lambda) const {
+        if (type != MatType::ThinFilm && type != MatType::Multilayer) return false;
+        if (substrateK(lambda) > 0.0) return true;
+        for (double k : layerK) if (k != 0.0) return true;
+        return false;
+    }
+
     // --- Diffraction grating (MatType::Grating) -----------------------------
     // A reflective diffraction grating with groove period `grooveSpacing` (nm) and
     // grooves running along `grooveDir` (world, projected into the surface plane).

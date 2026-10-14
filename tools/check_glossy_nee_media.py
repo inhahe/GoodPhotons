@@ -82,6 +82,39 @@ def read_pfm(path):
     return data.astype(np.float64)
 
 
+# What a device render prints to say where it ran: the `-> GPU` device line (modes R, W, D, J and
+# the forward modes), `[gpu]` lines (mode M), and the device modes U and S name (`VCM/UPS on`,
+# `SPPM on`). One list, so every check asks the same question.
+GPU_TOKENS = ("-> GPU", "[gpu]", "VCM/UPS on ", "SPPM on ")
+
+
+def render_seeds(exe, cwd, scene, tag, args, device="cpu", spp=256, seeds=(1, 2), rgb=False):
+    """Render `scene` (a path relative to `cwd`, or absolute) once per seed with the extra
+    command-line `args`, as linear PFMs `cwd/<tag>_s<seed>.pfm`, and return the images: summed
+    over the colour channels, or h x w x 3 with `rgb`. An earlier run's output is deleted first,
+    so a render that fails to write can never be scored, and a device render that does not say
+    it ran on the GPU fails the check."""
+    imgs = []
+    for seed in seeds:
+        png = "%s_s%d.png" % (tag, seed)
+        pfm = os.path.join(cwd, png[:-4] + ".pfm")
+        for f in (os.path.join(cwd, png), pfm):
+            if os.path.exists(f):
+                os.remove(f)
+        cmd = [exe, "-in", scene, "-device", device, "-seed", str(seed), "-hdr", "-no-meter",
+               "-spp", str(spp), "-o", png] + list(args)
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace")
+        if p.returncode != 0 or not os.path.exists(pfm):
+            print(p.stdout[-1500:], p.stderr[-1500:])
+            raise SystemExit("render failed: " + " ".join(cmd))
+        if device == "gpu" and not any(t in p.stdout + p.stderr for t in GPU_TOKENS):
+            raise SystemExit("did not run on the GPU: " + " ".join(cmd))
+        img = read_pfm(pfm)
+        imgs.append(img if rgb else img.sum(-1))
+    return imgs
+
+
 def tile_stats(a, b, n=4):
     """Per-tile mean of (a + b) / 2 and its standard error, the larger of two estimates: from
     the two tile means (one degree of freedom) and from the per-pixel seed differences (many,
@@ -141,23 +174,13 @@ def main():
         for heroc in (1, 4):
             stats = {}
             for flag in ("on", "off"):
-                imgs = []
-                for seed in (1, 2):
-                    png = os.path.join(out, "%s_%s_c%d_%s_s%d_n%d.png" % (name, a.mode, heroc, flag, seed,
-                                                                          a.spp))
-                    cmd = [a.exe, "-in", scene, "-mode", a.mode, "-device", a.device, "-spp", str(a.spp),
-                           "-heroc", str(heroc), "-seed", str(seed), "-hdr", "-no-meter", "-o", png]
-                    if flag == "off":
-                        cmd.append("-no-glossy-nee")
-                    if a.mode == "M":
-                        cmd += ["-n", "5000000"]
-                    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                                       errors="replace")
-                    pfm = png[:-4] + ".pfm"
-                    if r.returncode != 0 or not os.path.exists(pfm):
-                        print(r.stdout[-1500:], r.stderr[-1500:])
-                        raise SystemExit("render failed: " + " ".join(cmd))
-                    imgs.append(read_pfm(pfm).sum(-1))
+                args = ["-mode", a.mode, "-heroc", str(heroc)]
+                if flag == "off":
+                    args.append("-no-glossy-nee")
+                if a.mode == "M":
+                    args += ["-n", "5000000"]
+                imgs = render_seeds(a.exe, out, scene, "%s_%s_c%d_%s_n%d" % (
+                    name, a.mode, heroc, flag, a.spp), args, a.device, a.spp)
                 stats[flag] = tile_stats(imgs[0], imgs[1])
             good, frame, worst, zw = tile_summary(stats["on"], stats["off"], 0.01)
             ok &= good

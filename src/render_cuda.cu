@@ -2452,11 +2452,12 @@ __device__ static inline DCplx csin_(DCplx z) {  // sin(a+bi) = sin a cosh b + i
 
 // Multilayer stack reflectance (Abeles characteristic matrix; port of render.h
 // multilayerReflectance). nL/kL/dL are the per-layer index/extinction/thickness,
-// nLayers entries; substrate ns + i*ks. Returns R in [0,1].
+// nLayers entries; substrate ns + i*ks. Returns R in [0,1]. `reversed` reads the layers last to
+// first, for a ray meeting the stack from its substrate side.
 __device__ static Real multilayerReflectance(Real n0, Real cosI, Real lambda,
                                              const double* nL, const double* kL,
                                              const double* dL, int nLayers,
-                                             Real ns, Real ks) {
+                                             Real ns, Real ks, bool reversed = false) {
     cosI = clamp01(fabs(cosI));
     Real sin0_2 = fmax((Real)0, (Real)1 - cosI * cosI);
     Real n0s = n0 * n0 * sin0_2;
@@ -2465,7 +2466,8 @@ __device__ static Real multilayerReflectance(Real n0, Real cosI, Real lambda,
     for (int pol = 0; pol < 2; ++pol) {
         bool pPol = (pol == 1);
         DCplx M00(1, 0), M01(0, 0), M10(0, 0), M11(1, 0);
-        for (int j = 0; j < nLayers; ++j) {
+        for (int jj = 0; jj < nLayers; ++jj) {
+            const int j = reversed ? nLayers - 1 - jj : jj;
             DCplx nj((Real)nL[j], (Real)kL[j]);
             DCplx qj = csqrt_(csub(cmul(nj, nj), DCplx(n0s, 0)));
             DCplx eta = pPol ? cdiv(cmul(nj, nj), qj) : qj;
@@ -3964,59 +3966,6 @@ __device__ static inline double dCavityOf(const DScene& sc, const DHit& h) {
 // here for frosted glass before its point of definition.
 __device__ static Real dMatRoughness(const DScene& sc, const DMaterial& m, const DHit& h);
 
-// Dielectric interface: Fresnel-weighted specular reflect-or-refract (Snell, spectral
-// index -> dispersion). A non-zero per-hit roughness frosts BOTH lobes (rough glass):
-// the chosen direction is jittered by a power-cosine lobe, rejecting jitters that would
-// cross to the wrong side so no light leaks through. `transmitted` (optional) reports
-// whether the ray refracted vs. reflected/TIR — the caller uses it to track which
-// medium it is now inside (interior absorption). Mirrors host refractOrReflect.
-//
-// `whittedWeight` (non-null only in mode W) switches the Fresnel coin flip for the DOMINANT
-// branch (reflect iff R >= 0.5) and reports that branch's weight for the caller to fold into
-// the throughput — same expected value, zero variance. It also suppresses the frosting
-// perturbation, the other rng draw at this interface: at 1 spp a coin flip per pixel is not
-// noise but salt-and-pepper, and glass rendered as a speckled blob. TIR reports weight 1.
-// `radianceScale`: (n_from / n_to)^2 on a refraction, 1 on a reflection -- what a camera-side walk
-// multiplies its throughput by (host twin: Renderer::refractOrReflect).
-__device__ static void refractOrReflect(const DScene& sc, const DMaterial& m, const DHit& h,
-                                         const DVec3& d, Real lambda, DRng& rng,
-                                         DVec3& ro, DVec3& rd, bool* transmitted = nullptr,
-                                         Real extIor = (Real)1, double* whittedWeight = nullptr,
-                                         double* radianceScale = nullptr) {
-    Real ng = specLookup(m.ior, lambda);
-    bool entering = dot(d, h.ng) < 0;
-    DVec3 nl = entering ? h.ng : -h.ng;
-    Real n1 = entering ? extIor : ng, n2 = entering ? ng : extIor;
-    Real eta = n1 / n2;
-    Real cosI = -dot(d, nl);
-    Real sin2t = eta * eta * ((Real)1 - cosI * cosI);
-    DVec3 outDir;
-    bool refracted = false;
-    if (sin2t > 1) { outDir = reflectv(d, nl); if (whittedWeight) *whittedWeight = 1.0; }
-    else {
-        Real cosT = sqrt((Real)1 - sin2t);
-        Real rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
-        Real rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
-        Real R = (Real)0.5 * (rs * rs + rp * rp);
-        const bool doReflect = whittedWeight ? (R >= (Real)0.5) : (rng.uniform() < R);
-        if (whittedWeight) *whittedWeight = doReflect ? (double)R : 1.0 - (double)R;
-        if (doReflect) outDir = reflectv(d, nl);
-        else { outDir = d * eta + nl * (eta * cosI - cosT); refracted = true; }
-    }
-    outDir = normalize(outDir);
-    // Frosted glass: jitter the chosen lobe, keeping it on the intended side. Skipped in
-    // mode W (see whittedWeight) — that draw is the other source of 1-spp salt-and-pepper.
-    Real rough = whittedWeight ? (Real)0 : dMatRoughness(sc, m, h);
-    if (rough > (Real)1e-3) {
-        DVec3 pert = sampleGlossy(outDir, rough, rng);
-        bool ok = refracted ? (dot(pert, nl) < 0) : (dot(pert, nl) > 0);
-        if (ok) outDir = pert;
-    }
-    if (transmitted) *transmitted = refracted;
-    if (radianceScale) *radianceScale = refracted ? (double)(eta * eta) : 1.0;
-    rd = outDir; ro = dOffsetAlong(h.p, h.ng, rd);
-}
-
 // The far-side index for a surface of material m whose far side is the top of `outer` (the stack
 // without m): the enclosing medium's when both carry an explicit priority (air always counts), else
 // 1 -- the flat air<->glass model, so priority-free scenes render as they always did. `extMat`
@@ -4039,135 +3988,114 @@ __device__ static double dLocalN2(const DScene& sc, const DMediumStack& stk, Rea
     const double n = (double)specLookup(sc.mats[top].ior, lambda);
     return n * n;
 }
-// Returns false if the photon is absorbed by an opaque (absorbing) substrate.
-// Forward decl: the per-hit thin-film thickness helper (definition with the other
-// texture samplers, below dTexScalarAt) is used here before its point of definition.
+// Forward decl: the per-hit thin-film thickness helper (definition with the other texture
+// samplers, below dTexScalarAt) is used here before its point of definition.
 __device__ static Real dMatFilmThickness(const DScene& sc, const DMaterial& m, const DHit& h);
 
-// `whittedWeight` (non-null only in mode W) is the same deterministic contract
-// refractOrReflect has: take the DOMINANT interference branch and report its weight for the
-// caller to fold into the throughput, instead of tossing a coin against R. Opaque substrate
-// has only one surviving branch, so it always reflects and reports R (reflectance as a weight
-// rather than a survival probability, as Mirror/Filter already do in mode W).
-// `extIor`: the far side's index (dExteriorIor; 1 in air); `transmitted` reports a refraction.
-// Called through dDielectricStep.
-__device__ static bool thinFilmInterface(const DScene& sc, const DMaterial& m, const DHit& h,
-                                          const DVec3& d,
-                                          Real lambda, DRng& rng, DVec3& ro, DVec3& rd, Real extIor,
-                                          bool* transmitted, double* whittedWeight,
-                                          double* radianceScale) {
-    *transmitted = false;
-    if (radianceScale) *radianceScale = 1.0;     // see refractOrReflect; set on refraction
-    Real ns = specLookup(m.ior, lambda), nf = (Real)m.filmIor;
-    Real ks = specLookup(m.substrateK, lambda);
-    Real thickness = dMatFilmThickness(sc, m, h);   // per-hit (map or constant)
-    bool entering = dot(d, h.ng) < 0;
-    DVec3 nl = entering ? h.ng : -h.ng;
-    Real cosI = -dot(d, nl);
-    if (ks > 0) {                                // opaque metal-backed film
-        if (!entering) return false;             // inside absorbing substrate: absorbed
-        Real R = thinFilmReflectance(extIor, nf, ns, ks, thickness, cosI, lambda);
-        if (whittedWeight) *whittedWeight = (double)R;   // weight, not a survival roll
-        else if (rng.uniform() >= R) return false;       // transmitted -> absorbed
-        DVec3 o = normalize(reflectv(d, nl));
-        rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
-        return true;
-    }
-    Real nA = entering ? extIor : ns, nB = entering ? ns : extIor;
-    Real eta = nA / nB;
-    Real sin2t = eta * eta * ((Real)1 - cosI * cosI);
-    DVec3 outDir;
-    if (sin2t > 1) { outDir = reflectv(d, nl); if (whittedWeight) *whittedWeight = 1.0; }
-    else {
-        Real cosT = sqrt((Real)1 - sin2t);
-        Real R = thinFilmReflectance(nA, nf, nB, (Real)0, thickness, cosI, lambda);
-        const bool doReflect = whittedWeight ? (R >= (Real)0.5) : (rng.uniform() < R);
-        if (whittedWeight) *whittedWeight = doReflect ? (double)R : 1.0 - (double)R;
-        if (doReflect) outDir = reflectv(d, nl);
-        else {
-            outDir = d * eta + nl * (eta * cosI - cosT);
-            *transmitted = true;
-            if (radianceScale) *radianceScale = (double)(eta * eta);
-        }
-    }
-    outDir = normalize(outDir);
-    rd = outDir; ro = dOffsetAlong(h.p, h.ng, rd);
-    return true;
+// A coating that takes the transmitted light instead of passing it into a body: a thin film or
+// multilayer stack on an absorbing substrate, or a stack with an absorbing layer, at `lambda`. It
+// reflects or absorbs, is never entered, and so is no medium (host twin: Material::coatOpaque).
+__device__ static bool dCoatOpaque(const DMaterial& m, Real lambda) {
+    if (m.type != D_THINFILM && m.type != D_MULTILAYER) return false;
+    if (specLookup(m.substrateK, lambda) > 0) return true;
+    if (m.type == D_MULTILAYER)
+        for (int j = 0; j < m.layerCount; ++j) if (m.layerK[j] != 0) return true;
+    return false;
 }
-// Multilayer stack interface (port of render.h multilayerInterface). Returns false
-// if the photon is absorbed by an absorbing stack/substrate.
-// `whittedWeight`: same deterministic dominant-branch contract as thinFilmInterface.
-// `extIor`, `transmitted`: as thinFilmInterface. Called through dDielectricStep.
-__device__ static bool multilayerInterface(const DMaterial& m, const DHit& h, const DVec3& d,
-                                            Real lambda, DRng& rng, DVec3& ro, DVec3& rd,
-                                            Real extIor, bool* transmitted, double* whittedWeight,
-                                            double* radianceScale) {
-    *transmitted = false;
-    if (radianceScale) *radianceScale = 1.0;     // see refractOrReflect; set on refraction
-    Real ns = specLookup(m.ior, lambda);
-    Real ks = specLookup(m.substrateK, lambda);
-    int nL = m.layerCount;
-    bool entering = dot(d, h.ng) < 0;
-    DVec3 nl = entering ? h.ng : -h.ng;
-    Real cosI = -dot(d, nl);
-    bool anyAbs = ks > 0;
-    for (int j = 0; j < nL; ++j) if (m.layerK[j] != 0) { anyAbs = true; break; }
-    if (anyAbs) {                                // opaque: reflect-or-absorb
-        if (!entering) return false;
-        Real R = multilayerReflectance(extIor, cosI, lambda, m.layerN, m.layerK, m.layerThick, nL, ns, ks);
-        if (whittedWeight) *whittedWeight = (double)R;   // weight, not a survival roll
-        else if (rng.uniform() >= R) return false;
-        DVec3 o = normalize(reflectv(d, nl)); rd = o; ro = dOffsetAlong(h.p, h.ng, rd); return true;
+
+// What a ray along `d` meets at `h`, a surface of material `m` -- plain (D_DIELECTRIC), or coated
+// with a thin film (D_THINFILM) or a multilayer stack (D_MULTILAYER) -- at wavelength L, the far
+// side having index `extIor` (dExteriorIor): which way each branch goes, and how likely it is
+// (host twin: Renderer::interfaceOptics, where the cases are spelled out). dDielectricStep tosses
+// its coin on `R`, and mode M's spectral gather evaluates the same function at each photon's
+// wavelength (dStepFactorAt), so the two agree by construction.
+struct DInterfaceOptics {
+    bool  entering;   // met from outside the material
+    DVec3 nl;         // the normal on the incidence side
+    Real  cosI;       // > 0
+    bool  opaque;     // reflect with R, else absorbed
+    bool  tir;        // total internal reflection: R = 1
+    Real  eta;        // n_incidence / n_transmission, on a clear surface
+    Real  cosT;       // the refraction cosine, on a clear surface short of TIR
+    Real  R;          // the probability of the reflected branch
+};
+__device__ static DInterfaceOptics dInterfaceOptics(const DScene& sc, const DMaterial& m,
+                                                    const DHit& h, const DVec3& d, Real extIor,
+                                                    Real L) {
+    DInterfaceOptics o;
+    o.entering = dot(d, h.ng) < 0;
+    o.nl = o.entering ? h.ng : -h.ng;
+    o.cosI = -dot(d, o.nl);
+    o.opaque = false; o.tir = false; o.eta = (Real)1; o.cosT = (Real)0; o.R = (Real)0;
+    const Real ns = specLookup(m.ior, L);               // the body's (the substrate's) index
+    if (dCoatOpaque(m, L)) {
+        o.opaque = true;
+        if (!o.entering) return o;                       // inside the absorbing body: absorbed
+        const Real ks = specLookup(m.substrateK, L);
+        o.R = (m.type == D_THINFILM)
+            ? thinFilmReflectance(extIor, (Real)m.filmIor, ns, ks, dMatFilmThickness(sc, m, h),
+                                  o.cosI, L)
+            : multilayerReflectance(extIor, o.cosI, L, m.layerN, m.layerK, m.layerThick,
+                                    m.layerCount, ns, ks);
+        return o;
     }
-    Real nA = entering ? extIor : ns, nB = entering ? ns : extIor;
-    Real eta = nA / nB;
-    Real sin2t = eta * eta * ((Real)1 - cosI * cosI);
-    DVec3 outDir;
-    if (sin2t > 1) { outDir = reflectv(d, nl); if (whittedWeight) *whittedWeight = 1.0; }
-    else {
-        Real cosT = sqrt((Real)1 - sin2t);
-        Real R;
-        if (entering) R = multilayerReflectance(extIor, cosI, lambda, m.layerN, m.layerK, m.layerThick, nL, ns, (Real)0);
-        else {
-            double rn[D_MAXLAYERS], rk[D_MAXLAYERS], rt[D_MAXLAYERS];
-            for (int j = 0; j < nL; ++j) { rn[j] = m.layerN[nL-1-j]; rk[j] = m.layerK[nL-1-j]; rt[j] = m.layerThick[nL-1-j]; }
-            R = multilayerReflectance(ns, cosI, lambda, rn, rk, rt, nL, extIor, (Real)0);
-        }
-        const bool doReflect = whittedWeight ? (R >= (Real)0.5) : (rng.uniform() < R);
-        if (whittedWeight) *whittedWeight = doReflect ? (double)R : 1.0 - (double)R;
-        if (doReflect) outDir = reflectv(d, nl);
-        else {
-            outDir = d * eta + nl * (eta * cosI - cosT);
-            *transmitted = true;
-            if (radianceScale) *radianceScale = (double)(eta * eta);
-        }
+    const Real n1 = o.entering ? extIor : ns, n2 = o.entering ? ns : extIor;
+    o.eta = n1 / n2;
+    const Real sin2t = o.eta * o.eta * ((Real)1 - o.cosI * o.cosI);
+    if (sin2t > 1) { o.tir = true; o.R = (Real)1; return o; }
+    o.cosT = sqrt((Real)1 - sin2t);
+    if (m.type == D_THINFILM) {
+        o.R = thinFilmReflectance(n1, (Real)m.filmIor, n2, (Real)0, dMatFilmThickness(sc, m, h),
+                                  o.cosI, L);
+    } else if (m.type == D_MULTILAYER) {
+        o.R = o.entering
+            ? multilayerReflectance(extIor, o.cosI, L, m.layerN, m.layerK, m.layerThick,
+                                    m.layerCount, ns, (Real)0)
+            : multilayerReflectance(ns, o.cosI, L, m.layerN, m.layerK, m.layerThick,
+                                    m.layerCount, extIor, (Real)0, /*reversed=*/true);
+    } else {
+        const Real rs = (n1 * o.cosI - n2 * o.cosT) / (n1 * o.cosI + n2 * o.cosT);
+        const Real rp = (n1 * o.cosT - n2 * o.cosI) / (n1 * o.cosT + n2 * o.cosI);
+        o.R = (Real)0.5 * (rs * rs + rp * rp);
     }
-    outDir = normalize(outDir); rd = outDir; ro = dOffsetAlong(h.p, h.ng, rd); return true;
+    return o;
 }
+
+// The probability of the branch a step took at the wavelength `o` describes, times the radiance
+// factor (n_from / n_to)^2 if it refracted (host twin: Renderer::branchFactor).
+__device__ static double dBranchFactor(const DInterfaceOptics& o, bool refracted) {
+    if (!refracted) return (double)o.R;
+    return (o.opaque || o.tir) ? 0.0 : (1.0 - (double)o.R) * (double)(o.eta * o.eta);
+}
+
 // One surface of a dielectric body -- plain, or coated with a thin film or a multilayer stack --
 // for every device walk (host twin: Renderer::interfaceStep). First the nested-dielectric PRIORITY
 // rule (Schmidt & Budge 2002): the far side's index from the enclosing medium (dExteriorIor), and a
-// boundary of no higher priority than the medium it lies in suppressed -- the ray goes straight on.
-// Then the material's own interface: refractOrReflect, or the coating's interference reflectance.
-// A body the ray enters goes on `stk` and comes off when it leaves, a coated one as a glass one
-// does. `mi` is m's index (Mix/Layered aware). `whittedWeight` asks for mode W's deterministic
-// branch and receives its weight (1 at a pass-through); `radianceScale` is non-null on a
+// boundary of no higher priority than the medium it lies in suppressed -- the ray goes straight on;
+// an opaque coat is never entered, so it is no medium and never suppressed. Then the surface's own
+// optics (dInterfaceOptics): reflect, refract, or -- opaque -- be absorbed. A body the ray enters
+// goes on `stk` and comes off when it leaves, a coated one as a glass one does. `mi` is m's index
+// (Mix/Layered aware). `whittedWeight` asks for mode W's deterministic step -- the DOMINANT branch
+// with its probability as weight, no frosting; an opaque coat always reflects and carries R -- and
+// receives that weight (1 at a pass-through and at TIR). `radianceScale` is non-null on a
 // camera-side walk, which carries radiance, and null on a light-side one, which carries flux --
-// every caller says which. `refractedOut` / `farMatOut`: whether the ray crossed into the other
-// medium, the far side's material (-1: index 1) and whether the boundary was suppressed, for mode
-// M's spectral gather (dStepFactorAt).
+// every caller says which. `refractedOut` / `farMatOut` / `passOut` / `factorOut`: whether the ray
+// crossed into the other medium, the far side's material (-1: index 1), whether the boundary was
+// suppressed, and the branch's probability times the radiance factor (dBranchFactor; 1 at a
+// pass-through) -- for mode M's spectral gather (dStepFactorAt).
 // False when an opaque coating or substrate absorbed the ray.
 __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, const DHit& h,
                                        const DVec3& d, Real lambda, DRng& rng,
                                        int mi, DMediumStack& stk, DVec3& outO, DVec3& outD,
                                        double* whittedWeight, double* radianceScale,
                                        bool* refractedOut = nullptr, int* farMatOut = nullptr,
-                                       bool* passOut = nullptr) {
+                                       bool* passOut = nullptr, double* factorOut = nullptr) {
     if (whittedWeight) *whittedWeight = 1.0;
     if (radianceScale) *radianceScale = 1.0;
     if (refractedOut) *refractedOut = false;
     if (farMatOut) *farMatOut = -1;
     if (passOut) *passOut = false;
+    if (factorOut) *factorOut = 1.0;
     const bool entering = dot(d, h.ng) < 0;
     // The far side: the medium the ray comes from when it enters, the one it returns to when it
     // leaves (the stack without mi).
@@ -4176,27 +4104,47 @@ __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, con
     const DMediumStack& outer = entering ? stk : after;
     int extMat = -1; bool ranked = false;
     const Real extIor = dExteriorIor(sc, m, outer, lambda, extMat, ranked);
-    if (ranked && outer.topMat() >= 0 && m.priority <= outer.topPri()) {   // suppressed
+    if (ranked && outer.topMat() >= 0 && m.priority <= outer.topPri() &&
+        !dCoatOpaque(m, lambda)) {                                          // suppressed
         if (entering) stk.push(mi, m.priority); else stk.popMat(mi);
         if (passOut) *passOut = true;
         outD = d; outO = dOffsetAlong(h.p, h.ng, outD); return true;
     }
-    bool transmitted = false; DVec3 nro, nrd;
-    bool alive = true;
-    if (m.type == D_THINFILM)
-        alive = thinFilmInterface(sc, m, h, d, lambda, rng, nro, nrd, extIor, &transmitted,
-                                  whittedWeight, radianceScale);
-    else if (m.type == D_MULTILAYER)
-        alive = multilayerInterface(m, h, d, lambda, rng, nro, nrd, extIor, &transmitted,
-                                    whittedWeight, radianceScale);
-    else
-        refractOrReflect(sc, m, h, d, lambda, rng, nro, nrd, &transmitted, extIor, whittedWeight,
-                         radianceScale);
-    if (!alive) return false;
-    if (refractedOut) *refractedOut = transmitted;
     if (farMatOut) *farMatOut = extMat;
-    if (transmitted) { if (entering) stk.push(mi, m.priority); else stk.popMat(mi); }
-    outO = nro; outD = nrd;
+    const DInterfaceOptics o = dInterfaceOptics(sc, m, h, d, extIor, lambda);
+    if (o.opaque) {                                      // reflect with R, else absorbed
+        if (!o.entering) return false;
+        if (whittedWeight) *whittedWeight = (double)o.R;
+        else if (rng.uniform() >= o.R) return false;
+        outD = normalize(reflectv(d, o.nl)); outO = dOffsetAlong(h.p, h.ng, outD);
+        if (factorOut) *factorOut = (double)o.R;
+        return true;
+    }
+    DVec3 out;
+    bool refracted = false;
+    if (o.tir) {
+        out = reflectv(d, o.nl);                         // lossless: the weight stays 1
+    } else {
+        const bool doReflect = whittedWeight ? (o.R >= (Real)0.5) : (rng.uniform() < o.R);
+        if (whittedWeight) *whittedWeight = doReflect ? (double)o.R : 1.0 - (double)o.R;
+        if (doReflect) out = reflectv(d, o.nl);
+        else { out = d * o.eta + o.nl * (o.eta * o.cosI - o.cosT); refracted = true; }
+    }
+    out = normalize(out);
+    // Frosted glass (`roughness`): jitter the chosen lobe, rejecting a jitter that would cross to
+    // the other side, so no light leaks through.
+    if (m.type == D_DIELECTRIC && !whittedWeight) {
+        const Real rough = dMatRoughness(sc, m, h);
+        if (rough > (Real)1e-3) {
+            const DVec3 pert = sampleGlossy(out, rough, rng);
+            if (refracted ? (dot(pert, o.nl) < 0) : (dot(pert, o.nl) > 0)) out = pert;
+        }
+    }
+    if (radianceScale && refracted) *radianceScale = (double)(o.eta * o.eta);
+    if (refractedOut) *refractedOut = refracted;
+    if (factorOut) *factorOut = dBranchFactor(o, refracted);
+    if (refracted) { if (entering) stk.push(mi, m.priority); else stk.popMat(mi); }
+    outD = out; outO = dOffsetAlong(h.p, h.ng, outD);
     return true;
 }
 // Grating diffraction (port of render.h gratingDiffract). Returns false if absorbed.
@@ -6273,7 +6221,7 @@ struct DSurfMis {                             // the light-side half of the merg
     double sumC, sumMb, sumMs, pdfFwdA;
     float  rCoef;
     unsigned char  gateC1;
-    unsigned short vert;                      // j, for the depth cap (merge depth = j + k)
+    unsigned short vert;                      // j, for the depth cap (merge depth = j + k - 1)
 };
 struct DSurfMap {
     const DSurfPhoton* pts;
@@ -14428,7 +14376,7 @@ struct DSurfMergeW {
     int camVert = 0, maxDepth = 0;
 
     __device__ double operator()(const DSurfMis& lm, double pdfDirRev, double pdfDirFwd) const {
-        if ((int)lm.vert + camVert > maxDepth) return 0.0;   // merge depth is j + k here
+        if ((int)lm.vert + camVert - 1 > maxDepth) return 0.0;   // merge depth is j + k - 1
         const double etaS = kappaS * lm.pdfFwdA;
         if (!(etaS > 0.0)) return 0.0;
         const double R  = pdfDirRev * (double)lm.rCoef;
@@ -14828,7 +14776,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
             // "merges off == mode D bit-for-bit" survives this for free.
             if (kappaSurf > 0.0 && sm.nPts > 0) {
                 const double vmNorm = 1.0 / kappaSurf;
-                const int kEnd = (nE < maxDepth) ? nE : maxDepth;   // past it every merge is capped
+                const int kEnd = (nE < maxDepth + 1) ? nE : maxDepth + 1;   // past it every merge is capped
                 for (int k = 1; k < kEnd; ++k) {
                     const DVertex& vk = eye[k];
                     if (!dSurfMergeSite(sc, vk) || !(vk.beta > 0.0)) continue;
@@ -15254,54 +15202,13 @@ __device__ static void dSpecFold(DSpecThr& st, const DScene& sc, const DMaterial
 // at the hit `h` (host twin: Renderer::stepFactorAt): at wavelength L, the probability of the branch
 // it took -- the Fresnel or interference reflectance for the same incidence, or one minus it --
 // times the radiance factor (n_from / n_to)^2 if it refracted; 1 at a pass-through. `farMat` is the
-// far side's material (-1: index 1).
+// far side's material (-1: index 1). Folded against the step's own factorOut.
 __device__ static double dStepFactorAt(const DScene& sc, const DMaterial& m, const DHit& h,
-                                       const DVec3& d, bool entering, bool refracted, bool pass,
-                                       int farMat, Real L) {
+                                       const DVec3& d, bool refracted, bool pass, int farMat,
+                                       Real L) {
     if (pass) return 1.0;
-    const double nm = (double)specLookup(m.ior, L);
-    const double ne = (farMat >= 0) ? (double)specLookup(sc.mats[farMat].ior, L) : 1.0;
-    const double n1 = entering ? ne : nm, n2 = entering ? nm : ne;
-    const DVec3 nl = entering ? h.ng : h.ng * (Real)(-1);
-    const double cosI = -(double)dot(d, nl);
-    const double eta = n1 / n2;
-    const double sin2t = eta * eta * (1.0 - cosI * cosI);
-    double Rf;
-    if (m.type == D_THINFILM) {
-        const double ks = (double)specLookup(m.substrateK, L);
-        const Real th = dMatFilmThickness(sc, m, h);
-        Rf = (ks > 0.0)
-            ? (double)thinFilmReflectance((Real)ne, (Real)m.filmIor, (Real)nm, (Real)ks, th, (Real)cosI, L)
-            : (sin2t > 1.0) ? 1.0
-            : (double)thinFilmReflectance((Real)n1, (Real)m.filmIor, (Real)n2, (Real)0, th, (Real)cosI, L);
-    } else if (m.type == D_MULTILAYER) {
-        const int nL = m.layerCount;
-        const double ks = (double)specLookup(m.substrateK, L);
-        bool opaque = ks > 0.0;
-        for (int j = 0; j < nL && !opaque; ++j) opaque = (m.layerK[j] != 0.0);
-        if (opaque)
-            Rf = (double)multilayerReflectance((Real)ne, (Real)cosI, L, m.layerN, m.layerK,
-                                               m.layerThick, nL, (Real)nm, (Real)ks);
-        else if (sin2t > 1.0) Rf = 1.0;
-        else if (entering)
-            Rf = (double)multilayerReflectance((Real)ne, (Real)cosI, L, m.layerN, m.layerK,
-                                               m.layerThick, nL, (Real)nm, (Real)0);
-        else {
-            double rn[D_MAXLAYERS], rk[D_MAXLAYERS], rt[D_MAXLAYERS];
-            for (int j = 0; j < nL; ++j) {
-                rn[j] = m.layerN[nL - 1 - j]; rk[j] = m.layerK[nL - 1 - j]; rt[j] = m.layerThick[nL - 1 - j];
-            }
-            Rf = (double)multilayerReflectance((Real)nm, (Real)cosI, L, rn, rk, rt, nL, (Real)ne, (Real)0);
-        }
-    } else if (sin2t > 1.0) {
-        Rf = 1.0;                                       // total internal reflection
-    } else {
-        const double cosT = sqrt(1.0 - sin2t);
-        const double rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
-        const double rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
-        Rf = 0.5 * (rs * rs + rp * rp);
-    }
-    return refracted ? (1.0 - Rf) * eta * eta : Rf;
+    const Real ne = (farMat >= 0) ? specLookup(sc.mats[farMat].ior, L) : (Real)1;
+    return dBranchFactor(dInterfaceOptics(sc, m, h, d, ne, L), refracted);
 }
 
 // The device twin of camMediaTrSpec (photonmap_render.h): one straight camera segment's media
@@ -15678,15 +15585,15 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             case D_MULTILAYER: {
                 // A dielectric body's surface, plain or coated: radiance across a refraction, and
                 // SPECGATHER re-expresses the step at each photon's wavelength (dStepFactorAt).
-                DVec3 nro, nrd; double rs = 1.0; bool refr = false, pass = false; int farMat = -1;
+                DVec3 nro, nrd; double rs = 1.0, fac = 1.0; bool refr = false, pass = false;
+                int farMat = -1;
                 const DVec3 d0 = rd;
-                const bool entering = dot(rd, h.ng) < 0;
                 if (!dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr, &rs,
-                                     &refr, &farMat, &pass)) return;
+                                     &refr, &farMat, &pass, &fac)) return;
                 thr *= rs;                               // radiance across the interface
                 sthr.mul([&](Real L) {
-                    return dStepFactorAt(sc, m, h, d0, entering, refr, pass, farMat, L);
-                }, dStepFactorAt(sc, m, h, d0, entering, refr, pass, farMat, lambda));
+                    return dStepFactorAt(sc, m, h, d0, refr, pass, farMat, L);
+                }, fac);
                 ro = nro; rd = nrd; break;
             }
             case D_HALFMIRROR: {

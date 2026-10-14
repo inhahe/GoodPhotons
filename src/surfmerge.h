@@ -126,9 +126,10 @@ struct SurfMis {
                                // never delta (surfMergeSite), so this asks about y_{j-1}.
     unsigned short vert = 0;   // j — the light subpath index, for the depth cap only. Merging
                                // light vertex j with camera vertex k builds a path of depth
-                               // j+k, and the connection loop refuses depth > maxDepth, so
-                               // the merge must refuse it too (cf. BeamMis::vert, whose beam
-                               // merge inserts a vertex and so caps at j+k+1).
+                               // j+k-1 (SurfMergeWeight's SHAPE), and the connection loop
+                               // refuses depth > maxDepth, so the merge must refuse it too
+                               // (cf. BeamMis::vert, whose beam merge inserts a vertex and
+                               // keeps y_j, and so caps at j+k+1).
 };
 
 struct SurfPhoton {

@@ -1608,8 +1608,9 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             case MatType::Multilayer: {
                 // A dielectric body's surface, plain or coated (Renderer::interfaceStep); this
                 // camera-side walk carries radiance across a refraction. SPECGATHER re-expresses
-                // the step at each photon's wavelength (stepFactorAt): the branch the coin took,
-                // whose probability is a coat's whole interference colour, and the radiance factor.
+                // the step at each photon's wavelength (stepFactorAt) against its value here
+                // (st.factor): the branch the coin took, whose probability is a coat's whole
+                // interference colour, and the radiance factor.
                 const Vec3 d0 = ray.d;
                 const Renderer::InterfaceStep st =
                     mats.interfaceStep(scene, m, h, d0, lambda, rng, stk,
@@ -1618,7 +1619,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 ray = st.ray;
                 thr *= st.scale;
                 sthr.mul([&](double Lw) { return mats.stepFactorAt(scene, m, st, h, d0, Lw); },
-                         mats.stepFactorAt(scene, m, st, h, d0, lambda));
+                         st.factor);
                 break;
             }
             case MatType::HalfMirror: {

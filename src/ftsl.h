@@ -1189,21 +1189,24 @@ public:
         bool haveVolumeEmission = false;
         for (const Medium& m : L.scene.media)
             if (m.emissive()) { haveVolumeEmission = true; break; }
-        if (!haveLight && L.scene.emitters.empty() && !haveVolumeEmission) {
+        // An unlit scene: an error, or -- a preview run (Loaded::studioIfUnlit, 0.369.0) -- lit
+        // the way the mesh quick-view lights a bare model. main.cpp says so, and frames the scene
+        // if it has no camera either: a fragment made to be included usually has neither.
+        auto unlit = [&]() {
             if (!L.studioIfUnlit) {
                 fail("scene has no light: add a 'light' block, an emissive ('emit') mesh, "
-                     "or an emissive volume ('temperature' + 'emission blackbody'). To just "
-                     "look at it -- a groom or prop written to be `include`d, say -- open it in "
-                     "the preview (`ftrace <scene.ftsl>` with no render flags, or -raster), "
-                     "which lights an unlit scene with the model viewer's photo studio");
+                     "or an emissive volume ('temperature' + 'emission blackbody') that emits. "
+                     "To just look at it -- a groom or prop written to be `include`d, say -- "
+                     "open it in the preview (`ftrace <scene.ftsl>` with no render flags, or "
+                     "-raster), which lights an unlit scene with the model viewer's photo studio");
                 return false;
             }
-            // A preview run (Loaded::studioIfUnlit, 0.369.0): light it the way the mesh
-            // quick-view lights a bare model. main.cpp says so, and frames the scene if it has
-            // no camera either -- a fragment made to be included usually has neither.
             if (!addStudioEnv(L, 1024, 0.0, 1.0)) return false;
             L.studioAdded = true;
-        }
+            return true;
+        };
+        if (!haveLight && L.scene.emitters.empty() && !haveVolumeEmission && !unlit())
+            return false;
         // Catch errors recorded via fail() inside add* helpers that returned true
         // without re-checking `err` (e.g. an unknown `spd preset:`/`spectrum:` name
         // in a light or material silently falls back otherwise). Any recorded error
@@ -1299,6 +1302,15 @@ public:
         }
         if (L.beforeBvh) L.beforeBvh(L);
         { detail::AccelTimer _ct; L.scene.build(); }
+        // build() demotes a fire that emits nothing to the smoke it is made of
+        // (finalizeEmissiveVolumes), so the test above -- which runs before build(), where the
+        // studio can still be added cheaply -- counted a light that is not one if that was the
+        // scene's only one. Ask again with the fires build() kept; a preview built again lit.
+        if (!haveLight && L.scene.emitters.empty() && L.scene.emissiveVolumes.empty()) {
+            if (!unlit()) return false;
+            detail::AccelTimer _ct;
+            L.scene.build();
+        }
         // build() -> finalizeEmitters() has now adopted each emitter's emitPat from the
         // material on its geometry, so this is the first moment the SHAPE of every
         // emission pattern's emitter is known. Reject the shapes that cannot honour one.

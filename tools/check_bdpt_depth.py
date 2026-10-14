@@ -1,4 +1,4 @@
-"""Regression check: mode D's paths of exactly the maximum depth carry their full weight.
+"""Regression check: modes D and J's paths of exactly the maximum depth carry their full weight.
 
     D:/python314/python.exe -u tools/check_bdpt_depth.py [--out <dir>] [--exe ftrace.exe]
                                                          [--spp N] [--no-gpu]
@@ -7,22 +7,26 @@ BDPT weights every path over all the strategies that could make it, s = 0 (the e
 on a light) included -- so the eye walk has to be able to make each one: a path of depth d
 (d scattering vertices) needs d + 2 eye vertices for s = 0. Mode D generated maxDepth + 1, so a
 path of depth exactly maxDepth was made by every strategy but s = 0 while still weighted as if
-s = 0 shared it, and lost that share (known-issues BDPT-LAST-DEPTH). It shows where the last
-bounce carries a large share of the light and s = 0 a large share of its weight -- a low
--max-bounce, and a lamp as big as the ceiling -- so this renders a closed box lit that way at
--max-bounce 1 and 2, mode D against mode R (whose -max-bounce counts the same scattering
-vertices), on the host and, unless --no-gpu, the device. Mode D read x0.936 and x0.987 of R.
+s = 0 shared it, and lost that share (known-issues BDPT-LAST-DEPTH). Mode J adds point merges
+to the same weights, and its merge refused a path of depth exactly maxDepth too (its cap was one
+too strict: a photon at light vertex j merged at eye vertex k makes depth j + k - 1, not j + k).
+Both show where the last bounce carries a large share of the light -- a low -max-bounce, and a
+lamp as big as the ceiling -- so this renders a closed box lit that way at -max-bounce 1 and 2,
+modes D and J against mode R (whose -max-bounce counts the same scattering vertices), on the
+host and, unless --no-gpu, the device. Mode D read x0.936 and x0.987 of R; mode J x0.83 and
+x0.94 at the default merge radius. Mode J merges at a quarter of it here -- at the default, its
+point merges' own density-estimation bias reads ~1 % bright near the corners, which is not what
+this checks -- where it read x0.984 and x0.995 (14 and 6 sigma), their share being smaller.
 A tile fails when the two differ by more than 5 standard errors (two seeds each) AND by more
 than 2 %; the frame, by more than 5 standard errors AND 0.5 %. Exits 1 on any failure.
 """
 import argparse
 import os
-import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
-from check_glossy_nee_media import read_pfm, tile_stats, tile_verdict  # noqa: E402
+from check_glossy_nee_media import render_seeds, tile_stats, tile_verdict  # noqa: E402
 
 NL = chr(10)
 
@@ -58,34 +62,23 @@ def main():
         f.write(NL.join(BOX) + NL)
 
     def render(tag, args, device="cpu"):
-        """Two seeds of one configuration; a device render must say it ran on the GPU."""
-        imgs = []
-        for seed in (1, 2):
-            png = "%s_s%d.png" % (tag, seed)
-            pfm = os.path.join(d, png[:-4] + ".pfm")
-            for f in (os.path.join(d, png), pfm):       # never score an earlier run's image
-                if os.path.exists(f):
-                    os.remove(f)
-            cmd = [a.exe, "-in", "box.ftsl", "-device", device, "-seed", str(seed), "-hdr",
-                   "-no-meter", "-spp", str(a.spp), "-o", png] + args
-            p = subprocess.run(cmd, cwd=d, capture_output=True, text=True, encoding="utf-8",
-                               errors="replace")
-            if p.returncode != 0 or not os.path.exists(pfm):
-                print(p.stdout[-1500:], p.stderr[-1500:])
-                raise SystemExit("render failed: " + " ".join(cmd))
-            if device == "gpu" and "-> GPU" not in p.stdout + p.stderr:
-                raise SystemExit("did not run on the GPU: " + " ".join(cmd))
-            imgs.append(read_pfm(pfm).sum(-1))
-        return imgs
+        """Two seeds of one configuration (render_seeds)."""
+        return render_seeds(a.exe, d, "box.ftsl", tag, args, device, a.spp)
 
     pairs = []
     for depth in ("1", "2"):
         r = render("r_" + depth, ["-mode", "R", "-max-bounce", depth])
-        pairs.append(("-max-bounce %s: mode D / mode R" % depth,
-                      render("d_" + depth, ["-mode", "D", "-max-bounce", depth]), r))
-        if not a.no_gpu:
-            pairs.append(("-max-bounce %s: mode D on the device / mode R" % depth,
-                          render("dg_" + depth, ["-mode", "D", "-max-bounce", depth], "gpu"), r))
+        for mode in ("D", "J"):
+            # Mode J's point merges (and mode U's) at a quarter of the default radius: at the
+            # default, their O(r^2) density-estimation bias reads ~1 % bright near the corners,
+            # up to x1.03 on a tile, which this check is not about.
+            args = ["-mode", mode, "-max-bounce", depth] + (
+                ["-pmradiusfrac", "0.005"] if mode in "JU" else [])
+            pairs.append(("-max-bounce %s: mode %s / mode R" % (depth, mode),
+                          render("%s_%s" % (mode.lower(), depth), args), r))
+            if not a.no_gpu:
+                pairs.append(("-max-bounce %s: mode %s on the device / mode R" % (depth, mode),
+                              render("%sg_%s" % (mode.lower(), depth), args, "gpu"), r))
     ok = True
     for name, x1, x0 in pairs:
         ratio, z, bad = tile_verdict(tile_stats(*x1), tile_stats(*x0), 0.02)

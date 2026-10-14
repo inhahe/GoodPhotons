@@ -50,9 +50,7 @@ inline std::vector<std::string> audit(const Scene& sc) {
         const Material& mt = sc.mats[m];
         if (mt.type == MatType::Dielectric) return true;
         if (mt.type != MatType::ThinFilm && mt.type != MatType::Multilayer) return false;
-        if (mt.substrateK(550.0) > 0.0) return false;
-        for (double k : mt.layerK) if (k != 0.0) return false;
-        return true;
+        return !mt.coatOpaque(550.0);
     };
     auto matName = [&](int m) { return std::string("material #") + std::to_string(m); };
 
