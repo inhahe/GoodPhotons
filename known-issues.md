@@ -260,9 +260,14 @@ colour bias, in either direction. It is the bias mode M had until SPECGATHER (ph
 SpecThr), which carries those factors on a coarse wavelength grid beside the scalar and reweights
 each photon at its own wavelength. Most visible on a coated body seen in mode S (its interference
 colour washes toward grey) and on anything seen in a coloured mirror. `tools/check_coat_modes.py`
-therefore holds mode S to mode R in brightness only. Fix: give sppmVisiblePoint (and the device's
-dSppmVisiblePoint) a SpecThr, store it with the visible point, and multiply each gathered photon
-by its ratio at the photon's wavelength, as photonGather does.
+therefore holds mode S to mode R in brightness only. Fix: carry a SpecThr on the visible point's
+walk (sppmVisiblePoint, the device's dSppmVisiblePoint) and multiply each gathered photon by its
+ratio at the photon's wavelength, as photonGather does. The catch is where it lives: a pass traces
+the visible points, then the photons, then gathers, so the ratio has to survive from the first
+step to the third -- 24 bins a pixel (~96 B as floats, ~200 MB at 1080p, on the device too) on top
+of the stored visible point. The alternative is to reorder a pass -- photons first, then each
+pixel's camera walk gathering at once -- which needs no per-pixel visible point at all; it
+touches the host pass, the device pipeline and the resident session alike.
 
 ## OPEN (2026-10-13): BIRTH-EMPTY-STACK — a light walk born inside a dielectric does not know it is inside
 
