@@ -27,6 +27,9 @@ render is also held against the host's, by the same test. Scenes:
   hairback -- red and pale fur rim-lit by a large area light behind them: built to favour a joint
            (strategy x hero wavelength) MIS weight in mode D, measured and not kept (known-issues
            SPECTRAL-BUNDLE); fibers seen by both camera and light strategies.
+  hairhalf -- fur lit only through a half mirror (shadow rays stop at it), so its light arrives
+           through a fiber vertex and then a de-hero, which must take the spectral-MIS weight
+           back out (at 4x --spp: the error it guards against is +4.8 % of the frame).
   hairmed -- fur whose medulla scatters only above 550 nm, so a bundle's wavelengths differ in
            whether their fiber is solid: the per-lobe fold of a solid fiber must not be applied
            to a wavelength whose own medulla is live (it once took the hero's word for it).
@@ -114,6 +117,28 @@ SCENES = {
         'sphere "b1" { center 0 0.13 0.3  radius 0.10  material skin }',
         'fur "b1_coat" { on "b1"  material furm  count 25000  length 0.05  length_jitter 0.3  radius 0.0006  droop 0.5  jitter 0.25  seed 5 }',
     ],
+    "hairhalf": [
+        # Fur lit ONLY through a half mirror: a large lamp above a horizontal half-mirror ceiling.
+        # Every shadow ray stops at the mirror, so the fur's light arrives fiber -> half mirror ->
+        # lamp: a fiber vertex (spectral MIS) and then a de-hero, which must divide the MIS weight
+        # back out. Red fur, whose wavelengths' lobe densities differ most, filling the frame. In
+        # `hair` such paths carry too little of the light to show a de-hero that forgets (+0.17 %
+        # of the frame); here it is +4.8 %.
+        'scene { units meters }',
+        'camera "c" { eye -0.12 0.14 0.06  look_at -0.12 0.11 0.3  up 0 1 0  fov_y 40  film { res 96 72 } }',
+        'material "floor" { type diffuse  reflect 0.2 }',
+        'material "half"  { type halfmirror  reflect 0.5 }',
+        'material "skin"  { type diffuse  reflect rgb 0.30 0.20 0.18 }',
+        'material "red"   { type hair  reflect rgb 0.70 0.10 0.04  beta_m 0.15  beta_n 0.30 }',
+        'material "pale"  { type hair  reflect rgb 0.85 0.75 0.50  beta_m 0.20  beta_n 0.30 }',
+        'quad { origin -2 0 -2   u 0 0 4   v 4 0 0   material floor }',
+        'quad { origin -1 0.45 -1  u 2 0 0  v 0 0 2  material half }',
+        'light area { origin -0.6 0.7 -0.4  u 1.2 0 0  v 0 0 1.2  normal 0 -1 0  power 300  spd preset:d65 }',
+        'sphere "b1" { center -0.12 0.11 0.3  radius 0.08  material skin }',
+        'fur "b1_coat" { on "b1"  material red  count 20000  length 0.05  length_jitter 0.3  radius 0.0006  droop 0.4  jitter 0.25  seed 3 }',
+        'sphere "b2" { center 0.12 0.11 0.36  radius 0.08  material skin }',
+        'fur "b2_coat" { on "b2"  material pale  count 20000  length 0.05  length_jitter 0.3  radius 0.0006  droop 0.4  jitter 0.25  seed 4 }',
+    ],
     "fog": [
         'scene { units meters }',
         'camera "c" { eye 0.5 0.4 -1.2  look_at 0.5 0.25 0.6  up 0 1 0  fov_y 36  film { res 160 120 } }',
@@ -174,10 +199,13 @@ Z_MAX = 5.0
 REL_MAX = 0.01
 
 # The modes each scene runs in: BDPT (mode D) refuses an environment light.
-MODES = {"hair": "R", "hairsun": "RD", "hairback": "RD", "hairmed": "RD", "fog": "RD", "fogcli": "R",
+MODES = {"hair": "R", "hairsun": "RD", "hairback": "RD", "hairmed": "RD", "hairhalf": "R",
+         "fog": "RD", "fogcli": "R",
          "coatfog": "R", "rain": "RD"}
 # Command-line arguments a scene renders with.
 EXTRA = {"fogcli": ["-fog", "1.5"]}
+# Scenes that need more samples than --spp to see what they guard against, as a multiple of it.
+SPP_SCALE = {"hairhalf": 4}
 
 
 def read_pfm(path):
@@ -216,27 +244,32 @@ def compare(x1, x2, y1, y2):
     failing tiles, the whole-frame luminance ratio and the worst tile as (sigma, ratio). The
     standard error of the difference is taken two ways and the larger kept: from each seed
     pair's tile means (one degree of freedom: can come out small by luck) and from their pixels
-    (many, but blind to correlation between pixels)."""
-    lumx = ((tiles(x1) + tiles(x2)) / 2).sum(-1)
-    lumy = ((tiles(y1) + tiles(y2)) / 2).sum(-1)
-    se_pair = np.sqrt(((tiles(y1) - tiles(y2)).sum(-1) / 2) ** 2 +
-                      ((tiles(x1) - tiles(x2)).sum(-1) / 2) ** 2)
-    se_pix = np.sqrt(tile_se(y1, y2) ** 2 + tile_se(x1, x2) ** 2)
-    selum = np.maximum(se_pair, se_pix)
-    floor = 0.02 * lumy.max()                      # tiles this dark carry no information
+    (many, but blind to correlation between pixels). The whole frame is judged too, as one more
+    tile: an error spread evenly over the frame can hide in every tile's noise and not in theirs
+    together."""
     bad = []
     worst = (0.0, 1.0)
-    for i in range(lumy.shape[0]):
-        for j in range(lumy.shape[1]):
-            if lumy[i, j] < floor:
-                continue
-            ratio = lumx[i, j] / lumy[i, j]
-            z = abs(lumx[i, j] - lumy[i, j]) / max(selum[i, j], 1e-30)
-            if z > worst[0]:
-                worst = (z, ratio)
-            if z > Z_MAX and abs(ratio - 1.0) > REL_MAX:
-                bad.append("tile (%d,%d): x%.3f, %.1f sigma" % (i, j, ratio, z))
-    return bad, lumx.sum() / lumy.sum(), worst
+    for n in (4, 1):
+        lumx = ((tiles(x1, n) + tiles(x2, n)) / 2).sum(-1)
+        lumy = ((tiles(y1, n) + tiles(y2, n)) / 2).sum(-1)
+        se_pair = np.sqrt(((tiles(y1, n) - tiles(y2, n)).sum(-1) / 2) ** 2 +
+                          ((tiles(x1, n) - tiles(x2, n)).sum(-1) / 2) ** 2)
+        se_pix = np.sqrt(tile_se(y1, y2, n) ** 2 + tile_se(x1, x2, n) ** 2)
+        selum = np.maximum(se_pair, se_pix)
+        floor = 0.02 * lumy.max()                  # tiles this dark carry no information
+        for i in range(lumy.shape[0]):
+            for j in range(lumy.shape[1]):
+                if lumy[i, j] < floor:
+                    continue
+                ratio = lumx[i, j] / lumy[i, j]
+                z = abs(lumx[i, j] - lumy[i, j]) / max(selum[i, j], 1e-30)
+                if z > worst[0]:
+                    worst = (z, ratio)
+                if z > Z_MAX and abs(ratio - 1.0) > REL_MAX:
+                    bad.append(("frame" if n == 1 else "tile (%d,%d)" % (i, j)) +
+                               ": x%.3f, %.1f sigma" % (ratio, z))
+    whole = (tiles(x1, 1) + tiles(x2, 1)).sum() / (tiles(y1, 1) + tiles(y2, 1)).sum()
+    return bad, whole, worst
 
 
 def tiles(img, n=4):
@@ -300,7 +333,8 @@ def main():
             # The device runs mode R's bundle; its mode D still keeps media to one wavelength.
             if mode not in a.modes or (a.device == "gpu" and mode != "R"):
                 continue
-            r = {(c, sd): render(a.exe, scene, out, mode, c, sd, a.spp, a.device)
+            spp = a.spp * SPP_SCALE.get(name, 1)
+            r = {(c, sd): render(a.exe, scene, out, mode, c, sd, spp, a.device)
                  for c in (1, 4) for sd in (1, 2)}
             bad, whole, worst = compare(r[(4, 1)], r[(4, 2)], r[(1, 1)], r[(1, 2)])
             cn1 = chroma_noise(r[(1, 1)], r[(1, 2)]); cn4 = chroma_noise(r[(4, 1)], r[(4, 2)])
@@ -316,7 +350,7 @@ def main():
             if a.device == "gpu":
                 # The device's single-wavelength walk against the host's: the two share the
                 # volume NEE with the bundle, so a fault there would pass the comparison above.
-                h = {sd: render(a.exe, scene, out, mode, 1, sd, a.spp) for sd in (1, 2)}
+                h = {sd: render(a.exe, scene, out, mode, 1, sd, spp) for sd in (1, 2)}
                 bad, whole, worst = compare(r[(1, 1)], r[(1, 2)], h[1], h[2])
                 good = not bad
                 ok &= good

@@ -529,8 +529,15 @@ chroma noise; `-fog` x1.0021, 5.21x; coated fog x0.9977, 5.98x; rainbow rain x1.
 device's `-heroc 1` against the host's within 3 % / 3 sigma per tile; media-free scenes
 byte-identical to 0.378.6.
 
+**GPU mode R fibers, 0.380.0:** `bkHairHeroStep` is the Hair case of `radianceHeroLoop` on the
+device -- the hero's shade, each secondary's spectral coefficients alone (`DHairSpec`, the rest of a
+fiber's BCSDF being the same at every wavelength of a hit), values and densities folded from the
+hero's angular products (`dHairFoldFCos`, `dhair::pdfFromLobes`), the bundle's fiber NEE to lights
+and sky (`bkNeeLightHeroHair`, `bkNeeEnvHeroHair`, the latter weighing against the mixture
+density), policy-3 survival capped at 1, the continuation's mixture density. Mode W and a lone hero
+still go the dispersive way, as on the host.
+
 **Still open:**
-- the GPU twin's fiber: it still de-heros there, so device fur keeps most of its chroma noise;
 - the other modes' media gates, the device's mode D among them (the host's admits flat media
   since 0.375.2);
 - a fiber with a DISPERSIVE index: `hair.h` takes one `eta` for all wavelengths. The spectral MIS

@@ -3828,7 +3828,12 @@ as the one at fault.
   hero's wavelength (`bkNeeLightHero`, `bkNeeEnvHero`, `bkNeeVolumeHero`, `bkNeeEnvVolumeHero`; a
   vacuum scene draws none and multiplies by exactly 1, so media-free renders are unchanged), and
   the scalar walk's volume NEE is `bkNeeVolumeHero` / `bkNeeEnvVolumeHero` at one wavelength, as
-  the host's is.
+  the host's is. **A fiber keeps the device bundle too (0.380.0):** `bkHairHeroStep` (`__noinline__`)
+  mirrors the host's Hair case -- the hero's `DHairShade`, and per secondary only the spectral
+  coefficients (`DHairSpec`: tint, absorption, medulla), values and densities folded from the
+  hero's `dhair::LobeAngular` (`dHairFoldFCos`; a fiber with a live medulla evaluated in full),
+  NEE through `bkEmitterGeom`'s `hairUnit` geometry -- and `dhair::make` now finishes with
+  `dhair::makeSpectral`, the host's split.
 
   **Split-at-dispersion (`heroSplit`)** mirrors the forward tracer's policy: the bounce
   loop is factored out as **`radianceHeroLoop`** (`radianceHero` is now a thin wrapper

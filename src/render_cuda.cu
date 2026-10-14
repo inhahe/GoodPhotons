@@ -4564,14 +4564,24 @@ struct Chord {
     double len      = 0.0;   // the unscattered path's length across the fiber, in radii
 };
 
+// The wavelength-dependent part of make() (host twin hair.h makeSpectral): the cuticle tint, the
+// absorption and the medulla's coefficients. Everything else in a Bcsdf is the same at every
+// wavelength of a hit. Needs `kappa` already set.
+__device__ static void makeSpectral(Bcsdf& b, double specR, double sigmaA, double mSigmaS,
+                                    double mSigmaA) {
+    b.specR   = (specR < 0.0) ? 0.0 : (specR > 1.0 ? 1.0 : specR);
+    b.sigmaA  = fmax(0.0, sigmaA);
+    b.mSigmaS = fmax(0.0, mSigmaS);
+    b.mSigmaA = fmax(0.0, mSigmaA);
+    b.hasMedulla = (b.kappa > 0.0) && (b.mSigmaS + b.mSigmaA > 0.0);
+}
+
 __device__ static Bcsdf make(const Params& pr, double h, double sigmaA) {
     Bcsdf b;
     b.h      = clampd(h, -1.0, 1.0);
     b.gammaO = asin(b.h);
     b.eta    = pr.eta;
-    b.specR  = (pr.specR < 0.0) ? 0.0 : (pr.specR > 1.0 ? 1.0 : pr.specR);
     b.opacity = (pr.opacity < 0.0) ? 0.0 : (pr.opacity > 1.0 ? 1.0 : pr.opacity);
-    b.sigmaA = fmax(0.0, sigmaA);
     // Chiang's perceptual-roughness fits (hair.h::make).
     const double bm = clampd(pr.betaM, 1e-4, 1.0);
     const double bn = clampd(pr.betaN, 1e-4, 1.0);
@@ -4589,10 +4599,8 @@ __device__ static Bcsdf make(const Params& pr, double h, double sigmaA) {
         b.cos2kAlpha[i] = sqr(b.cos2kAlpha[i - 1]) - sqr(b.sin2kAlpha[i - 1]);
     }
     b.kappa   = clampd(pr.kappa, 0.0, 0.999);
-    b.mSigmaS = fmax(0.0, pr.mSigmaS);
-    b.mSigmaA = fmax(0.0, pr.mSigmaA);
     b.mG      = clampd(pr.mG, -0.999, 0.999);
-    b.hasMedulla = (b.kappa > 0.0) && (b.mSigmaS + b.mSigmaA > 0.0);
+    makeSpectral(b, pr.specR, sigmaA, pr.mSigmaS, pr.mSigmaA);
     return b;
 }
 
@@ -4706,6 +4714,19 @@ __device__ static double fFromLobes(const LobeAngular& la, double sigmaA, double
     double sum = 0.0;
     for (int p = 0; p <= kPMax; ++p) sum += la.G[p] * ap[p];
     sum *= la.invCosI;
+    return isfinite(sum) ? fmax(0.0, sum) : 0.0;
+}
+// pdf() at another wavelength, likewise (host twin hair.h pdfFromLobes): the same angular
+// products, weighted by apPdf's lobe probabilities A_p / sum A instead of A_p, and no projection.
+// Neither this nor fFromLobes includes the coverage (`opacity`), which the caller applies.
+__device__ static double pdfFromLobes(const LobeAngular& la, double sigmaA, double specR) {
+    double ap[kPMax + 1];
+    ApFromF(la.F, exp(-fmax(0.0, sigmaA) * la.len), ap, specR);
+    double total = 0.0;
+    for (int p = 0; p <= kPMax; ++p) total += ap[p];
+    double sum = 0.0;
+    for (int p = 0; p <= kPMax; ++p)                  // apPdf's uniform fallback when degenerate
+        sum += la.G[p] * ((total <= 1e-12) ? 1.0 / double(kPMax + 1) : ap[p] / total);
     return isfinite(sum) ? fmax(0.0, sum) : 0.0;
 }
 
@@ -5046,6 +5067,56 @@ __device__ static inline Real dHairFCos(const DHairShade& s, const DVec3& wWorld
     const dhair::V3 wl = dhair::toLocal(s.fr, wWorld);
     const double cosLong = dhair::safeSqrt(1.0 - dhair::sqr(dhair::clampd(wl.x, -1.0, 1.0)));
     return (Real)(dhair::f(s.b, s.woLocal, wl) * cosLong);
+}
+
+// A fiber's coefficients at one wavelength of a hero bundle: what dhair::makeSpectral re-reads
+// (host twin: hairShadeRetint). Frame, impact parameter, roughness, tilt, index and coverage are
+// the same at every wavelength of a hit, so the bundle keeps the hero's DHairShade whole and only
+// these for each secondary -- the shade is ~250 bytes of a frame that is VRAM times every
+// resident thread.
+struct DHairSpec { double specR, sigmaA, mSigmaS, mSigmaA; bool hasMedulla; };
+__device__ static DHairSpec dHairSpecOf(const dhair::Bcsdf& b) {
+    return DHairSpec{b.specR, b.sigmaA, b.mSigmaS, b.mSigmaA, b.hasMedulla};
+}
+// `specPat` (dHairSpecPatAt) and `kappa` are the hit's, as in the hero's shade.
+__device__ static DHairSpec dHairSpecAt(const DScene& sc, const DMaterial& m, const DHit& h,
+                                        Real lambda, double specPat, double kappa) {
+    dhair::Bcsdf b;
+    b.kappa = kappa;
+    dhair::makeSpectral(b, dHairSpecularFrom(m, lambda, specPat), dHairSigmaAAt(sc, m, h, lambda),
+                        (double)specLookup(m.hairMedullaSigmaS, lambda),
+                        (double)specLookup(m.hairMedullaSigmaA, lambda));
+    return dHairSpecOf(b);
+}
+// One wavelength's f * cosLong (and pdf, if asked) toward the LOCAL direction `wl`, from the
+// angular products `la` that dhair::f filled toward `wl` at the hero's shade `base` (host twin
+// hairFoldFCos). The fold (one exp) factors only a solid fiber, and whether the medulla is live
+// is each wavelength's own property, so it serves only when both la's wavelength (la.valid) and
+// this one are solid; otherwise the BCSDF is evaluated in full.
+__device__ static double dHairFoldFCos(const dhair::LobeAngular& la, const DHairShade& base,
+                                       const DHairSpec& sp, const dhair::V3& wl, double cosLong,
+                                       double* pdf) {
+    const double op = base.b.opacity;
+    if (la.valid && !sp.hasMedulla) {
+        if (pdf) *pdf = op * dhair::pdfFromLobes(la, sp.sigmaA, sp.specR);
+        return op * dhair::fFromLobes(la, sp.sigmaA, sp.specR) * cosLong;
+    }
+    dhair::Bcsdf b = base.b;
+    dhair::makeSpectral(b, sp.specR, sp.sigmaA, sp.mSigmaS, sp.mSigmaA);
+    if (pdf) *pdf = dhair::pdf(b, base.woLocal, wl);
+    return dhair::f(b, base.woLocal, wl) * cosLong;
+}
+// f * cosLong and pdf toward `wl` for every member of a bundle (`sp[0..n)`, sp[0] the hero's)
+// at the hero's shade `base` (host twin hairBundleAt): the angular half once, every value -- the
+// hero's pdf included -- folded from it. `pdf` may be null.
+__device__ static void dHairBundleAt(const DHairShade& base, const DHairSpec* sp, int n,
+                                     const dhair::V3& wl, double cosLong, double* fcos,
+                                     double* pdf) {
+    dhair::LobeAngular la;
+    fcos[0] = dhair::f(base.b, base.woLocal, wl, &la) * cosLong;
+    if (pdf) dHairFoldFCos(la, base, sp[0], wl, cosLong, &pdf[0]);
+    for (int i = 1; i < n; ++i)
+        fcos[i] = dHairFoldFCos(la, base, sp[i], wl, cosLong, pdf ? &pdf[i] : nullptr);
 }
 // bsdf_eval.h hairCosGuard twin: the connection evaluators pre-divide the fiber's f by |cos(ns,wi)|
 // so the caller's cosine yields the longitudinal projection a round strand presents; guard the
@@ -10853,9 +10924,11 @@ __device__ static Real bkHairTransmittance(const DScene& sc, const DHit& h, cons
 // `hs` non-null = the shading vertex is a hair fiber: swap the cosine/terminator response
 // and the surface-offset shadow ray for the hair versions above (all remaining geometry —
 // point sampling, falloff, cosLight, 1/dist^2 — is shared). No rng draw moves either way.
+// `hairUnit` (with `hs`): leave the fiber's response OUT (cosSurf = stG = 1), for a caller that
+// applies it per wavelength itself (bkNeeLightHeroHair); the shadow ray is cast regardless.
 __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec3& ngo,
                                      const DEmitter& em, Real su1, Real su2, BkNeeGeom& g,
-                                     const DHairShade* hs = nullptr) {
+                                     const DHairShade* hs = nullptr, bool hairUnit = false) {
     // Shadow transmittance, not a yes/no: hair with `opacity` below 1 attenuates. Folded into
     // the geometric weight at each exit, so every device NEE consumer inherits it untouched.
     Real vis = (Real)1;
@@ -10868,7 +10941,8 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         g.dist  = sqrt(g.dist2);
         g.wi = toL / g.dist;
         if (hs) {
-            if (!bkHairResponse(*hs, g.wi, g.cosSurf, g.stG)) return false;
+            if (hairUnit) { g.cosSurf = (Real)1; g.stG = (Real)1; }
+            else if (!bkHairResponse(*hs, g.wi, g.cosSurf, g.stG)) return false;
         } else {
             g.cosSurf = dot(h.n, g.wi);
             if (g.cosSurf <= (Real)0) return false;
@@ -10894,7 +10968,8 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         // coordinates, matching the area path (see dEmitterNeedsUV).
         g.wi = dSunSampleCone(em, em.beamDir * (Real)(-1), (double)su1, (double)su2);
         if (hs) {
-            if (!bkHairResponse(*hs, g.wi, g.cosSurf, g.stG)) return false;
+            if (hairUnit) { g.cosSurf = (Real)1; g.stG = (Real)1; }
+            else if (!bkHairResponse(*hs, g.wi, g.cosSurf, g.stG)) return false;
         } else {
             g.cosSurf = dot(h.n, g.wi);
             if (g.cosSurf <= (Real)0) return false;
@@ -10924,7 +10999,8 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     g.dist = sqrt(g.dist2);
     g.wi = toL / g.dist;
     if (hs) {
-        if (!bkHairResponse(*hs, g.wi, g.cosSurf, g.stG)) return false;
+        if (hairUnit) { g.cosSurf = (Real)1; g.stG = (Real)1; }
+        else if (!bkHairResponse(*hs, g.wi, g.cosSurf, g.stG)) return false;
     } else {
         g.cosSurf = dot(h.n, g.wi);
         if (g.cosSurf <= 0) return false;
@@ -11586,6 +11662,174 @@ __device__ __noinline__ static bool bkMediumHeroStep(const DScene& sc, const DMe
     }
     ro = p; rd = wOut;
     return true;
+}
+
+// Hero-bundle NEE at a FIBER vertex (SPECTRAL-BUNDLE; host twin backward.h neeLightHeroHair).
+// One emitter draw and one shadow ray per sample, as bkNeeLight's; the fiber's response applied
+// per wavelength from that wavelength's coefficients `sp[i]` on the hero's shade `hs0`, since a
+// fiber's colour differs across the bundle. An emitter is reached from a fiber by this connection
+// alone (a continuation after a fiber does not count an emitter it hits), so there is no MIS
+// weight, as in the scalar twin. One transmittance estimate serves the bundle (see
+// bkNeeLightHero).
+__device__ static void bkNeeLightHeroHair(const DScene& sc, const DHit& h, const DHairShade& hs0,
+                                          const DHairSpec* sp, double* L, const double* thr,
+                                          const Real* lam, const double* invPdf, int nUp,
+                                          DRng& rng) {
+    const DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
+    for (int di = 0; di < draw.n; ++di) {
+        const int k = draw.emitter(di);
+        const double selW = draw.weight(di);            // 1/p(e); exactly 1 on the all path
+        if (selW <= 0.0) continue;
+        const DEmitter& em = sc.emitters[k];
+        if (em.collimated || em.shape == 3) continue;   // collimated beams / env
+        Real su1 = (Real)0, su2 = (Real)0;
+        if (dEmitterNeedsUV(em)) { su1 = rng.uniform(); su2 = rng.uniform(); }
+        BkNeeGeom g;
+        if (!bkEmitterGeom(sc, h, ngo0, em, su1, su2, g, &hs0, /*hairUnit=*/true)) continue;
+        // The connection's geometry and visibility, without the fiber (cosSurf = stG = 1).
+        double w = g.sun ? (double)g.wSun
+                 : g.spot ? (double)g.fall / (double)g.dist2
+                 : (double)g.G * (double)em.area;
+        if (sc.mediaN > 0) w *= (double)dMediaTransmittance(sc, h.p, g.wi, g.dist, lam[0], rng);
+        w *= selW;
+        if (!(w > 0.0)) continue;
+        const dhair::V3 wl = dhair::toLocal(hs0.fr, g.wi);
+        double resp[hero::kHeroMax];
+        dHairBundleAt(hs0, sp, nUp, wl,
+                      dhair::safeSqrt(1.0 - dhair::sqr(dhair::clampd(wl.x, -1.0, 1.0))), resp,
+                      nullptr);
+        for (int i = 0; i < nUp; ++i) {
+            if (!(thr[i] > 0.0) || !(resp[i] > 0.0)) continue;
+            L[i] += thr[i] * resp[i] * ((double)specLookup(em.emitSpd, lam[i]) * invPdf[i]) * w;
+        }
+    }
+}
+
+// The environment twin of bkNeeLightHeroHair (host twin backward.h neeEnvHeroHair): one sky
+// direction and one shadow ray, the fiber's response per wavelength, and the balance heuristic
+// against the continuation. That continuation samples the HERO's lobes, but under spectral MIS
+// the density to weigh it against is the bundle's mixture `pbar = sum_j r_j pdf_j / sum_j r_j`
+// over the wavelengths `tech` that could have been the hero, `r_j` (`specR`) being each one's
+// path-pdf ratio to the hero's so far. bkHairHeroStep carries the same mixture forward as
+// contBsdfPdf, so the two weights are exactly the balance heuristic over every (hero wavelength
+// x strategy) pair.
+__device__ static void bkNeeEnvHeroHair(const DScene& sc, const DHit& h, const DHairShade& hs0,
+                                        const DHairSpec* sp, double* L, const double* thr,
+                                        const Real* lam, const double* invPdf, int nUp,
+                                        const double* specR, const bool* tech, DRng& rng) {
+    if (sc.envIndex < 0) return;
+    DVec3 wi; double pdfW;
+    const bool imageEnv = (sc.env.scale != nullptr);
+    if (imageEnv) {                                   // the same two draws as bkEnvGeom
+        dEnvSample(sc.env, (double)rng.uniform(), (double)rng.uniform(), wi, pdfW);
+        if (pdfW <= 0.0) return;
+    } else {
+        const double z = 1.0 - 2.0 * (double)rng.uniform();
+        const double sr = sqrt(fmax(0.0, 1.0 - z * z));
+        const double phi = 2.0 * DPI * (double)rng.uniform();
+        wi = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
+        pdfW = 1.0 / (4.0 * DPI);
+    }
+    const double farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
+    // bkEnvGeom's fiber shadow ray: past the strand's own body, through strands of opacity below 1.
+    double vis = (double)shadowTransmittance(sc, h.p + wi * (Real)RAY_EPS, wi, (Real)farDist,
+                                             RAY_EPS, dHairExitOffset(hs0, h.n, wi));
+    if (!(vis > 0.0)) return;
+    if (sc.mediaN > 0) {
+        vis *= (double)dMediaTransmittance(sc, h.p, wi, (Real)farDist, lam[0], rng);
+        if (!(vis > 0.0)) return;
+    }
+    const dhair::V3 wl = dhair::toLocal(hs0.fr, wi);
+    double resp[hero::kHeroMax], pdfJ[hero::kHeroMax];
+    dHairBundleAt(hs0, sp, nUp, wl, dhair::safeSqrt(1.0 - dhair::sqr(dhair::clampd(wl.x, -1.0, 1.0))),
+                  resp, pdfJ);
+    double num = 0.0, den = 0.0;
+    for (int j = 0; j < nUp; ++j)
+        if (tech[j]) { num += specR[j] * pdfJ[j]; den += specR[j]; }
+    const double pbar = (den > 0.0) ? num / den : 0.0;
+    const double wMis = pdfW / (pdfW + pbar);
+    for (int i = 0; i < nUp; ++i) {
+        if (!(thr[i] > 0.0) || !(resp[i] > 0.0)) continue;
+        const double Lenv = imageEnv ? dEnvRadiance(sc.env, wi, lam[i])
+                                     : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lam[i]);
+        if (!(Lenv > 0.0)) continue;
+        L[i] += thr[i] * resp[i] * Lenv * invPdf[i] / pdfW * wMis * vis;
+    }
+}
+
+// A FIBER KEEPS THE BUNDLE (SPECTRAL-BUNDLE; host twin: radianceHeroLoop's Hair case). A fiber's
+// lobes depend on lambda through the absorption and the cuticle tint, but smoothly: every
+// wavelength has SOME density wherever the hero samples. So each wavelength carries its own
+// f/pdf_hero and the path takes the spectral-MIS weight (`specR`/`specW`, bkRadianceHeroLoop)
+// instead of collapsing to the hero. The NEE above, the hero's sample, the per-wavelength
+// densities and values, survival (policy 3, capped at 1: a secondary the hero under-samples can
+// gain weight) and the continuation. Split out and __noinline__ for the reason bkInteractHair
+// gives. Returns 0 = the path ended, 1 = it continues, 2 = it continues past a coverage
+// pass-through, which is no vertex: the caller restores the glossy record and refunds the bounce.
+__device__ __noinline__ static int bkHairHeroStep(const DScene& sc, const DMaterial& m,
+        const DHit& h, DVec3& ro, DVec3& rd, double* L, double* thr, const Real* lam,
+        const double* invPdf, int nUp, double* specR, const bool* specTech, double& specW,
+        double& contBsdfPdf, bool& specularArrival, Real& curveTmin, DRng& rng) {
+    // `wPrev` points back toward the eye: the model's reference direction, as in the scalar case.
+    const DHairShade hs0 = dHairShadeAt(sc, m, h, lam[0], rd * (Real)(-1));
+    const double specPat = dHairSpecPatAt(sc, m, h);
+    DHairSpec sp[hero::kHeroMax];
+    sp[0] = dHairSpecOf(hs0.b);
+    for (int i = 1; i < nUp; ++i) sp[i] = dHairSpecAt(sc, m, h, lam[i], specPat, hs0.b.kappa);
+    bkNeeLightHeroHair(sc, h, hs0, sp, L, thr, lam, invPdf, nUp, rng);
+    if (sc.envIndex >= 0)
+        bkNeeEnvHeroHair(sc, h, hs0, sp, L, thr, lam, invPdf, nUp, specR, specTech, rng);
+    // Named u's: argument evaluation order is unspecified, and these must leave the stream in order.
+    const double u0 = rng.uniform(), u1 = rng.uniform(), u2 = rng.uniform(), u3 = rng.uniform();
+    double pdf0 = 0.0, f0 = 0.0;
+    dhair::LobeAngular la;                       // the angular half of f0, for the others
+    const dhair::V3 wl = dhair::sample(hs0.b, hs0.woLocal, u0, u1, u2, u3, pdf0, f0, &la);
+    if (!(pdf0 > 0.0)) return 0;
+    // A coverage pass-through returns exactly -wo: a DISCRETE event, of mass (1 - opacity) at
+    // every wavelength, where a scatter is a direction density.
+    const bool passThru = (wl.x == -hs0.woLocal.x && wl.y == -hs0.woLocal.y &&
+                           wl.z == -hs0.woLocal.z);
+    const double cosLong = dhair::safeSqrt(1.0 - dhair::sqr(dhair::clampd(wl.x, -1.0, 1.0)));
+    // Per wavelength: its density for this event over the hero's (ratio) and its f*cos over the
+    // hero's density (g). The hero's g is its lobe attenuation T, the scalar case's survival.
+    double ratio[hero::kHeroMax], g[hero::kHeroMax];
+    for (int j = 0; j < nUp; ++j) {
+        double pj, fcj;
+        if (passThru)    { pj = 1.0 - hs0.b.opacity; fcj = pj; }
+        else if (j == 0) { pj = pdf0; fcj = f0 * cosLong; }
+        else fcj = dHairFoldFCos(la, hs0, sp[j], wl, cosLong, &pj);
+        ratio[j] = pj / pdf0;
+        g[j]     = fcj / pdf0;
+    }
+    double sumOld = 0.0, sumNew = 0.0;
+    for (int j = 0; j < nUp; ++j)
+        if (specTech[j]) { sumOld += specR[j]; sumNew += specR[j] * ratio[j]; }
+    // A live hero's own ratio is 1 and its specR stays 1, so then sumNew >= 1; with a dead hero
+    // (zero-mass lambda bin) it can be 0.
+    if (!(sumNew > 0.0)) return 0;
+    const double rescale = sumOld / sumNew;               // specW: new over old
+    for (int j = 0; j < nUp; ++j) specR[j] *= ratio[j];
+    specW *= rescale;
+    double fac[hero::kHeroMax], q = 0.0;
+    for (int i = 0; i < nUp; ++i) {
+        fac[i] = g[i] * rescale;
+        if (thr[i] > 0.0 && fac[i] > q) q = fac[i];
+    }
+    if (q > 1.0) q = 1.0;
+    if (!(q > 0.0) || (double)rng.uniform() >= q) return 0;
+    for (int i = 0; i < nUp; ++i) thr[i] *= fac[i] / q;
+    const DVec3 wOut = dhair::toWorld(hs0.fr, wl);
+    // Clear the strand's own body without displacing the ray (see bkInteractHair).
+    curveTmin = dHairExitOffset(hs0, h.n, wOut);
+    ro = dOffsetPoint(h.p, wOut);
+    rd = wOut;
+    if (passThru) return 2;
+    // The env-escape MIS partner: the bundle's mixture density for wOut, the same pbar
+    // bkNeeEnvHeroHair weighed against (sum r_old p_j / sum r_old).
+    contBsdfPdf = pdf0 * sumNew / sumOld;
+    specularArrival = false;
+    return 1;
 }
 
 // Mode W path context (device twin of BackwardRenderer::GiCtx). `depth == 0` is the primary
@@ -12524,14 +12768,31 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 specularArrival = true;
                 break;
             }
+            case D_HAIR:
+                // A fiber keeps the bundle by spectral MIS (bkHairHeroStep). What that does not
+                // cover -- a lone hero, and mode W, whose wavelength lattice is shared by every
+                // pixel of a pass, so a de-hero there would tint the whole fur one colour per
+                // pass -- falls through to the dispersive group: split per lambda where the policy
+                // is on (always, in mode W), de-hero otherwise. Host twin: radianceHeroLoop.
+                if (secAlive && nUp >= 2 && !whitted && !directOnly) {
+                    const int r = bkHairHeroStep(sc, *mp, h, ro, rd, L, thr, lam, invPdf, nUp,
+                                                 specR, specTech, specW, contBsdfPdf,
+                                                 specularArrival, curveTmin, rng);
+                    if (r == 0) return;
+                    if (r == 2) {               // a coverage pass-through is no vertex
+                        gmis = gmisIn;
+                        if (nullStepsH < 256) { --b; ++nullStepsH; }
+                    }
+                    break;
+                }
+                [[fallthrough]];
             case D_DIELECTRIC: case D_THINFILM: case D_MULTILAYER:
             case D_GRATING:    case D_HALFMIRROR:
-            case D_FLUORESCENT: case D_HAIR: {
+            case D_FLUORESCENT: {
                 // Dispersive / wavelength-switching: the outgoing direction (and, for a
                 // grating/fluorophore, the wavelength itself) depends on λ, so the bundle
-                // cannot keep riding one shared direction past this interface. Hair is
-                // λ-coupled too: σ_a(λ) steers the lobe-selection pdf, so its sampled
-                // direction cannot be shared across the bundle either.
+                // cannot keep riding one shared direction past this interface. A fiber is
+                // here only when it cannot keep the bundle (see its case above).
                 if constexpr (AllowSplit) {
                 if (secAlive && nUp > 1) {
                     // SPLIT-AT-DISPERSION: fan out instead of de-hero'ing. Each secondary

@@ -2684,12 +2684,13 @@ second:**
   are then the same for every wavelength (measured in mode `D`: 4.25× less chroma noise in fog,
   3.96× in rainbow rain, unbiased; on the GPU in mode `R`, 5.4× in fog and 5.0× in rain); in every
   other mode (mode `J` included, whose beam merges are single-λ, and GPU mode `D`), and for a
-  medium whose extinction varies with λ, a scene with media is still single-λ. In mode `R` a **hair fiber** and a **`phase rainbow`**
-  scatter keep the bundle too, by *spectral MIS* (Wilkie et al. 2014): their lobes move with λ but
+  medium whose extinction varies with λ, a scene with media is still single-λ. In mode `R` (on the GPU too since 0.380.0, rainbows since 0.379.0) a **hair fiber**
+  and a **`phase rainbow`** scatter keep the bundle too, by *spectral MIS* (Wilkie et al. 2014): their lobes move with λ but
   smoothly, so the hero samples the direction, every wavelength carries its own value, and the
   path is weighted by the balance heuristic over which wavelength could have been the hero. On
   `gallery_rain` that turns the hair's rainbow speckle into ordinary grain: 3.65–4.31× less
-  chroma noise on fur, fog and rain test scenes, for ~1.35× the time per sample. Mode `D` keeps
+  chroma noise on fur, fog and rain test scenes, for ~1.35× the time per sample on the CPU
+  (on the GPU, fur: 3.95–4.4× less for ~1.17× the time). Mode `D` keeps
   the bundle through both as well, each wavelength carrying its own value over the hero's
   density, with BDPT's strategy weights taken at the hero: weighting those per wavelength too
   was measured to remove no noise on fur and ~5 % of the variance in rain, for ~17 % more time,
