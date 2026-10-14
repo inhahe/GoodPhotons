@@ -7953,7 +7953,8 @@ as the one at fault.
   spp — unbiased). Since 0.39.0 (M12) there is a resident **GPU VCM/UPS** session (mode `U`,
   `VcmSession`, `cudaVcmSupported == cudaBdptSupported && media.empty()` — surfaces-only, pinhole
   only; it briefly carried its own spot/sun reject in 0.126.0, dropped again in 0.127.0 once the
-  kernels learned delta lights) mirroring `vcm.h`'s `vcmPass`: each pass (1) `kVcmLight` traces one light subpath per pixel,
+  kernels learned delta lights) mirroring `vcm.h`'s `vcmPass`: each pass (1) `kVcmLight` traces one light subpath per pixel
+  (or fewer, past the store's budget -- see below),
   storing connectible vertices into a **per-path slab** (`lvSlab[i·vcmCap+k]`, no cross-thread
   atomics) and splatting the connect-to-camera (t=1) light-image contributions (atomic into a
   per-pass double buffer); (2) compacts the slab **on-device** (0.39.1: thrust scans over the
@@ -8056,11 +8057,15 @@ as the one at fault.
   `dRandomWalk`/`dGenCameraSubpath`/`dGenLightSubpath`, and exactly two variants are
   instantiated — `BDPT_MAXDEPTH` (8, bit-for-bit the old kernel, still the default launch)
   and `BDPT_DEEPDEPTH` (64), the deep one launched only when `-max-bounce > 8`. GPU mode U
-  additionally bounds its light-vertex slab (`npix * vcmCap * sizeof(DVcmLV)`) by a 768 MB
-  budget and reports when that cap is under the light walk's own (`maxDepth - 1` edges); the
-  unstored deepest vertices then lose their merges and connections while every strategy's MIS
-  weight still counts them, so a capped render reads dark at those depths (known-issues
-  VCM-SLAB-CAP). Mode U counts a path's length in EDGES internally, so `-max-bounce N` is
+  additionally bounds its light-vertex store -- the per-path slab and its compact copy, every
+  subpath's `maxDepth - 1` vertices, with their secondary-λ rows -- by a budget (an eighth of the
+  card, at least 768 MB). A pass that would not fit traces FEWER light subpaths (`nLight`, said
+  on stdout) and pairs camera path i with light subpath `i % nLight` for its bundle and its
+  connections; the weights already carry the light-path count (`ctx.nLightPaths`, which merges
+  and the camera splat are normalised by), so the estimator is unchanged and only its variance
+  moves (0.379.3; before, it stored fewer vertices per subpath while the weights still counted
+  their merges and connections -- x0.989 at 1600x1600, known-issues VCM-SLAB-CAP,
+  `tools/check_vcm_store.py`). Mode U counts a path's length in EDGES internally, so `-max-bounce N` is
   `N + 1` of them there (0.379.2; it was `N`, one bounce fewer than every other mode). Why it
   matters: a specular cavity has a
   photon mean free path of `1/(1-R)` bounces — ~33 for silver — so truncating at 8 does not

@@ -16327,7 +16327,8 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
 // Phase 1: one light subpath per pixel. Stores connectible vertices into the per-path slab
 // `lvSlab[i*vcmCap + k]` (count in `lvCount[i]`), splats connect-to-camera contributions into
 // `splat` (atomic, W*H*3 XYZ), and records this path index's wavelength BUNDLE (shared with the
-// camera path of the SAME index) into lamBuf/invLamBuf at stride C. Device twin of vcm.h
+// camera paths it is paired with) into lamBuf/invLamBuf at stride C. `nPaths` light subpaths a
+// pass -- the pixel count, unless the store would not fit (vcmSessionBegin). Device twin of vcm.h
 // traceLightSubpath.
 //
 // Templated on the number of SECONDARY hero slots exactly like kBdptT: the scalar
@@ -16338,13 +16339,12 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                            DVcmLV* lvSlab, DVcmSec* lvSec, int secStride, int heroC,
                            int* lvCount, double* splat,
                            Real* lamBuf, double* invLamBuf, int resX, int resY, int vcmCap,
-                           unsigned long long seedBase, long long passIdx) {
+                           long long nPaths, unsigned long long seedBase, long long passIdx) {
     constexpr int SECN = (NS > 0) ? NS : 1;
     const int C = (NS > 0) ? heroC : 1;
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
-    long long npix = (long long)resX * resY;
-    for (long long i = g; i < npix; i += G) {
+    for (long long i = g; i < nPaths; i += G) {
         lvCount[i] = 0;
         unsigned long long s = (unsigned long long)i * 0x9E3779B97F4A7C15ULL
                              + (unsigned long long)passIdx * 0xD1B54A32D192ED03ULL;
@@ -16665,25 +16665,32 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                             const DVcmSec* lvSec, int secStride, int heroC,
                             const int* pathBegin, const int* pathEnd, const double* splat,
                             double* accum, const Real* lamBuf, const double* invLamBuf,
-                            int resX, int resY, unsigned long long seedBase, long long passIdx) {
+                            int resX, int resY, long long nLight, unsigned long long seedBase,
+                            long long passIdx) {
     constexpr int SECN = (NS > 0) ? NS : 1;
     const int C = (NS > 0) ? heroC : 1;
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     long long npix = (long long)resX * resY;
     for (long long i = g; i < npix; i += G) {
+        // The light subpath this camera path is paired with -- its own index, unless a pass
+        // traces fewer light subpaths than pixels (vcmSessionBegin), when several camera paths
+        // share one. Each still connects to an independent draw of the light subpath, and the
+        // weights count nLight light subpaths for merging and the camera splat (ctx.nLightPaths),
+        // so the estimator is the same; only its variance changes.
+        const long long j = i % nLight;
         double sxl = splat[i * 3 + 0], syl = splat[i * 3 + 1], szl = splat[i * 3 + 2];
-        double invPdfLambda = invLamBuf[i * C];
+        double invPdfLambda = invLamBuf[j * C];
         if (invPdfLambda <= 0.0) {                         // no valid wavelength: only the splat
             accum[i * 3 + 0] += sxl; accum[i * 3 + 1] += syl; accum[i * 3 + 2] += szl;
             continue;
         }
-        // THE bundle of path index i — the SAME C wavelengths the light kernel walked for this
-        // index. That pairing is what makes strategy (c) (connection to the paired light
+        // THE bundle of the paired light subpath j — the SAME C wavelengths the light kernel
+        // walked. That pairing is what makes strategy (c) (connection to the paired light
         // subpath) exact per-λ rather than an approximation: both ends share the λ set.
         Real lamAll[SECN + 1];
         double invAll[SECN + 1];
-        for (int k = 0; k < C; ++k) { lamAll[k] = lamBuf[i * C + k]; invAll[k] = invLamBuf[i * C + k]; }
+        for (int k = 0; k < C; ++k) { lamAll[k] = lamBuf[j * C + k]; invAll[k] = invLamBuf[j * C + k]; }
         Real lambda = lamAll[0];
         int nUp = C;
         int px = (int)(i % resX), py = (int)(i / resX);
@@ -16967,7 +16974,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                 }
 
                 // (c) Vertex connection to the PAIRED light subpath's stored vertices.
-                int pb = pathBegin[i], pe = pathEnd[i];
+                int pb = pathBegin[j], pe = pathEnd[j];
                 for (int j = pb; j < pe; ++j) {
                     const DVcmLV& lv = grid.lv[j];
                     if (edges + lv.edges + 1 > ctx.maxDepth) continue;
@@ -22494,6 +22501,7 @@ struct VcmSession {
     int  diffraction = 0;
     int  maxDepth = 8;
     int  vcmCap = 8;              // max stored connectible vertices per light subpath (maxDepth - 1)
+    size_t nLight = 0;            // light subpaths a pass: npix, or fewer if the store would not fit
     int  heroC = 1;               // hero bundle width (1 == classic single-λ session)
     int  secStride = 0;           // heroC-1 secondary slots per stored vertex (0 when heroC==1)
     long long passes = 0;
@@ -22536,43 +22544,51 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
     s->resX = resX; s->resY = resY; s->npix = (size_t)resX * resY;
     s->diffraction = diffraction ? 1 : 0;
     s->maxDepth = (maxDepth > 1) ? maxDepth : 9;     // EDGES: -max-bounce + 1
-    // A light subpath stores at most one vertex per edge up to maxDepth - 1 (kVcmLightT's
-    // lastEdge). The light-vertex slab is npix * vcmCap * sizeof(DVcmLV) (~128 B) of DEVICE
-    // memory, so that would ask for 6.6 GB at 1100x733 and -max-bounce 64. Bound the slab
-    // by a byte budget instead and say so: a smaller cap only means the deepest light-subpath
-    // vertices are not STORED for merging (paths still walk to maxDepth and still connect),
-    // so the estimator stays unbiased, it just loses some of the merge strategies down there.
-    {
-        const size_t kSlabBudget = (size_t)768 << 20;   // 768 MB
-        int capByMem = (int)(kSlabBudget / (s->npix * sizeof(gpu::DVcmLV)));
-        if (capByMem < 4) capByMem = 4;
-        const int maxStored = s->maxDepth - 1;
-        s->vcmCap = (maxStored < capByMem) ? maxStored : capByMem;
-        if (s->vcmCap < maxStored)
-            std::printf("[mode U] light-vertex store capped at %d of %d vertices/subpath "
-                        "(slab budget %zu MB at %dx%d)\n",
-                        s->vcmCap, maxStored, kSlabBudget >> 20, resX, resY);
-    }
     // Hero bundle width. The kernels are templated on the SECONDARY slot count, so a C==1
     // session instantiates kVcm*T<0>: no sec slab, no per-λ arrays, no extra registers.
     int C = (heroC < 1) ? 1 : heroC;
     if (C > BDPT_NSEC + 1) C = BDPT_NSEC + 1;
     s->heroC = C;
     s->secStride = C - 1;
+    // A light subpath stores at most one vertex per edge up to maxDepth - 1 (kVcmLightT's
+    // lastEdge), and a pass holds every stored vertex twice -- the per-path slab and its compact
+    // copy -- with the secondary-λ rows beside each. One light subpath per pixel would ask for
+    // 6.6 GB at 1100x733 and -max-bounce 64, so the store gets a budget -- an eighth of the card,
+    // and never under 768 MB -- and a pass that would not fit traces FEWER light subpaths, each
+    // shared by several camera paths (kVcmCameraT's pairing). Every vertex of every subpath is
+    // stored, so no strategy the weights count goes missing: only the variance moves. (Storing
+    // fewer vertices per subpath instead, as before 0.379.3, dropped the deepest ones' merges and
+    // connections while the weights still counted them: x0.989 at 1600x1600, VCM-SLAB-CAP.)
+    s->vcmCap = s->maxDepth - 1;
+    {
+        size_t freeB = 0, totalB = 0;
+        cudaMemGetInfo(&freeB, &totalB);
+        size_t budget = totalB / 8;
+        if (budget < ((size_t)768 << 20)) budget = (size_t)768 << 20;
+        const size_t perPath = (size_t)s->vcmCap *
+            (2 * sizeof(gpu::DVcmLV) + 2 * (size_t)s->secStride * sizeof(gpu::DVcmSec));
+        size_t nLight = budget / (perPath > 0 ? perPath : 1);
+        if (nLight < 1) nLight = 1;
+        s->nLight = (nLight < s->npix) ? nLight : s->npix;
+        if (s->nLight < s->npix)
+            std::printf("[mode U] %zu light subpaths a pass for %zu pixels (light-vertex store "
+                        "budget %zu MB at %dx%d, %d vertices a subpath)\n",
+                        s->nLight, s->npix, budget >> 20, resX, resY, s->vcmCap);
+    }
     buildUploadScene(scene, s->up);
     s->cam = bakeCamera(scene, cam, resX, resY, s->up);
-    const size_t np = s->npix;
-    CUDA_CHECK(cudaMalloc(&s->d_lvSlab,  np * (size_t)s->vcmCap * sizeof(gpu::DVcmLV)));
+    const size_t np = s->npix, nl = s->nLight;
+    CUDA_CHECK(cudaMalloc(&s->d_lvSlab,  nl * (size_t)s->vcmCap * sizeof(gpu::DVcmLV)));
     if (s->secStride > 0)
         CUDA_CHECK(cudaMalloc(&s->d_lvSecSlab,
-                              np * (size_t)s->vcmCap * (size_t)s->secStride * sizeof(gpu::DVcmSec)));
-    CUDA_CHECK(cudaMalloc(&s->d_lvCount, np * sizeof(int)));
+                              nl * (size_t)s->vcmCap * (size_t)s->secStride * sizeof(gpu::DVcmSec)));
+    CUDA_CHECK(cudaMalloc(&s->d_lvCount, nl * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&s->d_splat,   np * 3 * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&s->d_accum,   np * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&s->d_lamBuf,  np * (size_t)C * sizeof(gpu::Real)));
-    CUDA_CHECK(cudaMalloc(&s->d_invLam,  np * (size_t)C * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&s->d_pathBegin, np * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&s->d_pathEnd,   np * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&s->d_lamBuf,  nl * (size_t)C * sizeof(gpu::Real)));
+    CUDA_CHECK(cudaMalloc(&s->d_invLam,  nl * (size_t)C * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_pathBegin, nl * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&s->d_pathEnd,   nl * sizeof(int)));
     CUDA_CHECK(cudaMemset(s->d_accum, 0, np * 3 * sizeof(double)));
     return s;
 }
@@ -22582,13 +22598,14 @@ void vcmSessionPass(VcmSession* s, double radius) {
     using namespace gpu;
     const long long passIdx = s->passes;                 // 0-based index of THIS pass
     const int W = s->resX, H = s->resY;
-    const size_t np = s->npix;
+    const size_t np = s->npix, nl = s->nLight;
     if (radius <= 0.0) radius = 1e-6;
 
-    // Per-pass MIS constants (device twin of vcm.h PassCtx).
+    // Per-pass MIS constants (device twin of vcm.h PassCtx). The light-path count is what the
+    // merges and the camera splat are normalised by, so it is the pass's own (nLight).
     DVcmCtx ctx{};
     ctx.radius = radius;
-    ctx.nLightPaths = (double)np;
+    ctx.nLightPaths = (double)nl;
     double etaVCM = DPI * radius * radius * ctx.nLightPaths;
     ctx.misVcWeight = (etaVCM > 0.0) ? 1.0 / etaVCM : 0.0;
     ctx.misVmWeight = etaVCM;
@@ -22596,7 +22613,7 @@ void vcmSessionPass(VcmSession* s, double radius) {
     ctx.imagePlaneDist = (double)W / (2.0 * s->cam.tanHalfX);
     ctx.maxDepth = s->maxDepth;
 
-    // (1) Light pass — zero the per-pass splat, then trace one light subpath per pixel.
+    // (1) Light pass — zero the per-pass splat, then trace nLight light subpaths.
     CUDA_CHECK(cudaMemset(s->d_splat, 0, np * 3 * sizeof(double)));
     unsigned long long seedL = 0xD1B54A32D192ED03ULL
                              ^ ((unsigned long long)(passIdx + 1) * 0x9E3779B97F4A7C15ULL)
@@ -22605,12 +22622,14 @@ void vcmSessionPass(VcmSession* s, double radius) {
         kVcmLightT<BDPT_NSEC><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx,
                                  s->d_lvSlab, s->d_lvSecSlab, s->secStride, s->heroC,
                                  s->d_lvCount, s->d_splat,
-                                 s->d_lamBuf, s->d_invLam, W, H, s->vcmCap, seedL, passIdx);
+                                 s->d_lamBuf, s->d_invLam, W, H, s->vcmCap, (long long)nl,
+                                 seedL, passIdx);
     else
         kVcmLightT<0><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx,
                                  s->d_lvSlab, nullptr, 0, 1,
                                  s->d_lvCount, s->d_splat,
-                                 s->d_lamBuf, s->d_invLam, W, H, s->vcmCap, seedL, passIdx);
+                                 s->d_lamBuf, s->d_invLam, W, H, s->vcmCap, (long long)nl,
+                                 seedL, passIdx);
     cudaCheckKernel("vcm-light");
 
     // (2) Compact the slab ON DEVICE into contiguous per-path ranges: exclusive-scan the
@@ -22621,10 +22640,10 @@ void vcmSessionPass(VcmSession* s, double radius) {
     ThrustArenaAlloc tal{&s->arena};
     auto pol = FT_THRUST_PAR(tal);
     thrust::device_ptr<int> tCount(s->d_lvCount), tBegin(s->d_pathBegin), tEnd(s->d_pathEnd);
-    thrust::exclusive_scan(pol, tCount, tCount + np, tBegin);
-    thrust::inclusive_scan(pol, tCount, tCount + np, tEnd);
+    thrust::exclusive_scan(pol, tCount, tCount + nl, tBegin);
+    thrust::inclusive_scan(pol, tCount, tCount + nl, tEnd);
     int nLVi = 0;
-    CUDA_CHECK(cudaMemcpy(&nLVi, s->d_pathEnd + (np - 1), sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&nLVi, s->d_pathEnd + (nl - 1), sizeof(int), cudaMemcpyDeviceToHost));
     const size_t nLV = (size_t)((nLVi > 0) ? nLVi : 0);
     if (nLV > 0) {
         ensureDevCap(s->d_lvCompact, s->lvCompactCap, nLV);
@@ -22632,7 +22651,7 @@ void vcmSessionPass(VcmSession* s, double radius) {
             ensureDevCap(s->d_lvSecCompact, s->lvSecCompactCap, nLV * (size_t)s->secStride);
         kVcmCompactScatter<<<2048, 128>>>(s->d_lvSlab, s->d_lvSecSlab, s->secStride,
                                           s->d_lvCount, s->d_pathBegin,
-                                          s->d_lvCompact, s->d_lvSecCompact, (int)np, s->vcmCap);
+                                          s->d_lvCompact, s->d_lvSecCompact, (int)nl, s->vcmCap);
         cudaCheckKernel("vcm-compact");
     }
 
@@ -22680,7 +22699,8 @@ void vcmSessionPass(VcmSession* s, double radius) {
     grid.order = (nLV > 0) ? s->d_order : nullptr;
     grid.lo = gLo; grid.cell = cell; grid.nx = gnx; grid.ny = gny; grid.nz = gnz;
 
-    // (5) Camera pass — one camera subpath per pixel; adds this pass's radiance into accum.
+    // (5) Camera pass — one camera subpath per pixel, each paired with light subpath
+    // (pixel % nLight); adds this pass's radiance into accum.
     unsigned long long seedC = 0xC2B2AE3D27D4EB4FULL
                              ^ ((unsigned long long)(passIdx + 1) * 0xA24BAED4963EE407ULL)
                              ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
@@ -22688,12 +22708,12 @@ void vcmSessionPass(VcmSession* s, double radius) {
         kVcmCameraT<BDPT_NSEC><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx, grid,
                               (nLV > 0) ? s->d_lvSecCompact : nullptr, s->secStride, s->heroC,
                               s->d_pathBegin, s->d_pathEnd, s->d_splat, s->d_accum,
-                              s->d_lamBuf, s->d_invLam, W, H, seedC, passIdx);
+                              s->d_lamBuf, s->d_invLam, W, H, (long long)nl, seedC, passIdx);
     else
         kVcmCameraT<0><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx, grid,
                               nullptr, 0, 1,
                               s->d_pathBegin, s->d_pathEnd, s->d_splat, s->d_accum,
-                              s->d_lamBuf, s->d_invLam, W, H, seedC, passIdx);
+                              s->d_lamBuf, s->d_invLam, W, H, (long long)nl, seedC, passIdx);
     cudaCheckKernel("vcm-camera");
 
     s->passes += 1;

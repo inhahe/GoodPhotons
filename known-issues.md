@@ -110,7 +110,7 @@ both backends, and the light walk stops one edge short of that (`lastEdge`), whe
 could join no path at all -- it used to trace and store one such vertex per subpath.
 `check_bdpt_depth.py` holds mode U to mode R as it does D and J.
 
-## OPEN (2026-10-14): VCM-SLAB-CAP — GPU mode U's capped light-vertex store under-weights the deepest paths
+## DONE (2026-10-14, 0.379.3): VCM-SLAB-CAP — GPU mode U's capped light-vertex store under-weighted the deepest paths
 
 `vcmSessionBegin` bounds the light-vertex slab by a 768 MB budget (`vcmCap`), and says so, when
 `npix * (maxDepth - 1) * sizeof(DVcmLV)` would exceed it -- a large frame at a deep
@@ -121,8 +121,12 @@ bias at those depths, not the "fewer candidates, still unbiased" design.md used 
 **Measured** (`scraps/face/vcm_slabcap_probe.py`: `check_bdpt_depth.py`'s box at `-max-bounce 8`,
 the frame mean at 1600x1600 -- capped at 4 of 8 vertices -- against the same view at 160x160):
 **x0.9893, 70 sigma** -- and the 768 MB budget caps a frame past roughly 0.8 Mpx at that depth, so
-this is every large GPU mode-U render, not a corner case. Fix options: a weight that knows the cap (the recurrences stop crediting merges and
-connections at light depths past it, as BDPT's do past `maxDepth`), or a slab paged per tile.
+this is every large GPU mode-U render, not a corner case. **Fixed in 0.379.3:** a pass that would
+not fit traces fewer light subpaths and stores all of their vertices; camera path i pairs with
+light subpath `i % nLight`, and the weights already count `nLight` light subpaths for merging and
+the camera splat, so nothing they count goes missing -- only the variance moves. The budget is
+now an eighth of the card (at least 768 MB), so it binds later. `tools/check_vcm_store.py`
+holds the 1600x1600 frame to the 160x160 one; 0.379.2 fails it.
 
 ## OPEN (2026-10-14, tech debt): GPU-STACK-DRIFT — every kernel's stack reservation moves when unrelated device code changes
 
