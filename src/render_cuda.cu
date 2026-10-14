@@ -193,12 +193,10 @@ namespace gpu {
 #if FTRACE_GPU_FP32
 using Real = float;
 static constexpr Real RAY_EPS = 1e-4f;   // self-intersection offset (float-safe at unit scale)
-static constexpr Real DET_EPS = 1e-6f;   // triangle determinant reject (float-safe)
 static constexpr Real BIG     = 1e30f;   // "no hit" sentinel distance
 #else
 using Real = double;
 static constexpr Real RAY_EPS = 1e-6;
-static constexpr Real DET_EPS = 1e-9;
 static constexpr Real BIG     = 1e30;
 #endif
 
@@ -3152,11 +3150,6 @@ __device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const 
     hit.curv = (Real)(flipped ? -tri.curvature : tri.curvature);
     hit.vcol = tri.vcol; hit.vb0 = b0; hit.vb1 = b1;
     return true;
-}
-// Interface-preserving wrapper (builds the shear inline) for any one-off caller.
-__device__ static inline bool intersectTri(const DVec3& ro, const DVec3& rd, const DTri& tri,
-                                            Real tmin, DHit& hit) {
-    return intersectTri(makeTriShear(rd), ro, rd, tri, tmin, hit);
 }
 __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const DSphere& s,
                                         Real tmin, DHit& hit) {
@@ -7438,9 +7431,6 @@ __device__ static Real sampleLambdaU(const DScene& sc, const DEmitter& em, doubl
     double frac = (c1 > c0) ? (u - c0) / (c1 - c0) : 0.5;
     pdf = (Real)((c1 - c0) / em.cdfStep);
     return (Real)(DLMIN + (lo + frac) * em.cdfStep);
-}
-__device__ static Real sampleLambda(const DScene& sc, const DEmitter& em, DRng& rng, Real& pdf) {
-    return sampleLambdaU(sc, em, (double)rng.uniform(), pdf);
 }
 
 // Power-weighted emitter selection (mirrors Scene::selectEmitter). Single
@@ -12058,7 +12048,6 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 if (directOnly) return L;                          // Whitted: single-scatter only
                 Real alb = medAlbedo(med, lambda);
                 if (rng.uniform() >= (double)alb) return L;        // absorbed
-                DVec3 wIn = rd;
                 Real phPdf;
                 ro = p; rd = dMedPhaseSample(med, rd, lambda, rng, phPdf); specularArrival = false;
                 contBsdfPdf = (double)phPdf;  // phase pdf of the scatter (env MIS)
@@ -15059,24 +15048,6 @@ __device__ static void dSunNeeMarch(const DScene& sc, const DVec3& oc, const DVe
     }
 }
 
-// Media transmittance of one straight CAMERA segment: one ratio-tracking sample, or
-// pbeams::kSunDiscTrSamples of them when the segment points into a sun's disc (host twin
-// camMediaTr, photonmap_render.h; see the constant's note in photonbeams.h).
-__device__ static double dCamMediaTr(const DScene& sc, const DVec3& o, const DVec3& d, Real len,
-                                     Real lambda, DRng& rng) {
-    int n = 1;
-    if (sc.sunCount > 0)
-        for (int k = 0; k < sc.nEmitters; ++k)
-            if (sc.emitters[k].shape == 6 && dInSunCone(sc.emitters[k], d)) { n = pbeams::kSunDiscTrSamples; break; }
-    if (n == 1) return (double)dMediaTransmittance(sc, o, d, len, lambda, rng);
-    double s = 0.0;
-    for (int i = 0; i < n; ++i) s += (double)dMediaTransmittance(sc, o, d, len, lambda, rng);
-    return s / (double)n;
-}
-
-// The spectral twin of dCamMediaTr: the segment's transmittance at every DSpecThr grid wavelength
-// plus, in the last slot, the camera's own -- all from one shared walk, so the scalar `thr` and the
-// carrier's denominator are the same number by construction.
 // ---- SPECGATHER: the camera walk's spectral throughput (host twin: photonmap_render.h) ------
 // The walk is MONOCHROMATIC at the camera sample's wavelength; the photon map is POLYCHROMATIC.
 // The density estimate below gets this right per photon (`dDiffuseRho(..., ph.lambda)`), but every
@@ -15173,8 +15144,10 @@ __device__ static void dSpecFoldEta(DSpecThr& st, const DScene& sc, const DMater
         st.v[k] *= dEta2At(sc, m, farMat, entering, DSpecThr::lamOf(k));
 }
 
-// The spectral twin of dCamMediaTr: the segment's transmittance at every DSpecThr grid wavelength
-// plus, in the last slot, the camera's own -- all from ONE shared walk, so the scalar `thr` and the
+// The device's camMediaTr (photonmap_render.h), spectral: one straight camera segment's media
+// transmittance -- one ratio-tracking sample, or pbeams::kSunDiscTrSamples of them when the
+// segment points into a sun's disc -- at every DSpecThr grid wavelength plus, in the last slot,
+// the camera's own, all from ONE shared walk, so the scalar `thr` and the
 // carrier's denominator are the same number by construction rather than by coincidence.
 __device__ static void dCamMediaTrSpec(const DScene& sc, const DVec3& o, const DVec3& d, Real len,
                                        Real lambda, DRng& rng, double* Tv) {

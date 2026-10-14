@@ -221,7 +221,7 @@ POV_HD inline double povFnEval(int id, const double* _pp) {
     return( fmin(10., fmax(PARAM(0)*r,-10.)) );
     }
     case 21: { // f_folium_surface_2d
-    double r, x2=PARAM_X*PARAM_X, y2=PARAM_Y*PARAM_Y, z2=PARAM_Z*PARAM_Z, th;
+    double r, x2=PARAM_X*PARAM_X, y2=PARAM_Y*PARAM_Y, th;
     ROT2D(PARAM(3),PARAM(4),PARAM(5))
     r = -( y2  * (1 + (PARAM(2) - 4*PARAM(1))*PARAM_X) + x2*(1 + PARAM(2)));
     return( fmin(10., fmax(PARAM(0)*r, -10.)) );

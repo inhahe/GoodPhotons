@@ -1400,17 +1400,6 @@ __global__ void kClear(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     }
 }
 
-// Clamp a device float array UP to a floor. `-glass-haze`: the milk product is a running
-// product over crossed surfaces, so a deep pile drives it to 0 (full haze); flooring it
-// caps how much of the pixel the frost may take. Applied to the finished product rather
-// than inside kClear's atomics, which is exactly equivalent for a decreasing product and
-// leaves the accumulation loop (and its atomicMulF) untouched.
-__global__ static void kFloorF(float* a, float lo, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    if (a[i] < lo) a[i] = lo;
-}
-
 // Fold the rim half of milkT into the physical half and apply the haze floor, so every
 // downstream reader still sees one float per pixel. Mirrors raster.h's fold pass.
 __global__ static void kFold(const float* clearT, float* clearRGB, float* milkT, int n,
@@ -2137,11 +2126,9 @@ static bool renderCore(Scene* sc, const Camera& cam, int W, int H,
     // See-through clear pass: reset clearT/milkT to 1 and accumulate each clear surface's
     // transmittance/haze against the now-complete opaque depth (sc->zbuf, written by kShade).
     if (seeThrough) {
-        // clearT is 3 floats per pixel, so it needs its own grid: gPix only covers N
-        // threads, and kFillF's `i >= n` guard would silently leave two thirds of the
+        // clearT is 6 floats per pixel, so it needs its own grid: gPix only covers N
+        // threads, and kFillF's `i >= n` guard would silently leave five sixths of the
         // buffer at whatever the last frame left there.
-        const int gClear = (int)((N * 3 + TPB - 1) / TPB);
-        const int gPix2 = (int)((N * 2 + TPB - 1) / TPB);
         const int gClr6 = (int)((N * 6 + TPB - 1) / TPB);
         kFillF<<<gClr6, TPB>>>(sc->clearT, 0.0f, N * 6);   // sums, so they start at 0
         kFillF<<<gPix, TPB>>>(sc->milkT,  0.0f, N);        // thickness: a sum
