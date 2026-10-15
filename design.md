@@ -4954,7 +4954,9 @@ as the one at fault.
   −44 % on cloth and −70 % on hair, in proportion to how much of the disc is real surface.
 
   The fix measures the covered fraction by **ray probe** rather than analytically: `M` stratified
-  points in the tangent-plane disc, each traced from `r` above the plane straight down, accepted
+  points in the tangent-plane disc, each traced from `r` above the plane straight down -- through
+  any surface that holds no photon (`probePassesThrough`: glass, a clear coat, a filter, a half
+  mirror; 0.381.6) and through a fiber with the probability its opacity leaves it absent -- accepted
   on the same 60-degree test the photon query uses, and weighted by `1/cos(tilt)` because the
   probe samples PROJECTED area while the estimator needs SURFACE area. `gatherCoverage` /
   `gatherAreaScale` in `photonmap_render.h`, device twin `dGatherCoverage` in `render_cuda.cu`.

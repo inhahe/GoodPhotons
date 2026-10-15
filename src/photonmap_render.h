@@ -309,6 +309,19 @@ inline std::vector<GaDiagMat>& gaDiag() {
 // The estimator itself. Wrapped by `gatherCoverage` below, which only records the result -- the
 // wrapper exists so that every early return here (flat-interior gate, tangle gate, fiber gate)
 // is histogrammed without editing any of them.
+// Whether a footprint probe passes through a surface of material `m` rather than stopping on it:
+// one no photon is ever stored on and light crosses -- glass, a clear coat, a filter, a half
+// mirror. Stopping there, the probe counted such a face lying within the radius above the gather
+// surface (a tank a centimetre off the floor) and the ball test then rejected it for its height,
+// so the coverage read low (known-issues GATHERAREA-TRANSPARENT). Device twin dProbePassesThrough.
+inline bool probePassesThrough(const Material& m) {
+    switch (m.type) {
+        case MatType::Dielectric: case MatType::Filter: case MatType::HalfMirror: return true;
+        case MatType::ThinFilm: case MatType::Multilayer: return !m.coatOpaque(550.0);
+        default: return false;
+    }
+}
+
 inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n,
                              double r, Pcg32& rng, int M, int matId = -1,
                              double fiberR = 0.0) {
@@ -440,6 +453,11 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 if (!h.valid) break;
                 h.t += tAcc;
                 const Material* pm = (h.matId >= 0 && h.matId < (int)scene.mats.size()) ? &scene.mats[h.matId] : nullptr;
+                if (pm && probePassesThrough(*pm)) {                    // holds no photon: on through
+                    tAcc = h.t;
+                    pr = Ray{h.p + pr.d * 1e-9, pr.d};
+                    continue;
+                }
                 if (!pm || pm->type != MatType::Hair || h.fiberRadius <= 0.0) break;
                 const double o = hairOpacityAt(scene, *pm, h);
                 if (o >= 1.0 || rng.uniform() < o) break;            // the strand IS here

@@ -5536,6 +5536,15 @@ struct DGatherPhoton {
 //     covered by definition -- and the gate then fires on nearly every gather and the
 //     correction stops happening. Measured: cap_gyroid -16.9 % stratified against -4.3 %
 //     independent. Do not "improve" this without re-reading the host comment.
+// Host twin probePassesThrough: a surface no photon is ever stored on and light crosses.
+__device__ static bool dProbePassesThrough(const DMaterial& m) {
+    switch (m.type) {
+        case D_DIELECTRIC: case D_FILTER: case D_HALFMIRROR: return true;
+        case D_THINFILM: case D_MULTILAYER: return !dCoatOpaque(m, (Real)550);
+        default: return false;
+    }
+}
+
 __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const DVec3& n,
                                          Real r, DRng& rng, int M, Real fiberR = (Real)0) {
     if (M <= 0 || !(r > (Real)0)) return 1.0;
@@ -5553,7 +5562,30 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
         const DVec3 q = p + t * (Real)(rr * cos(ph)) + b * (Real)(rr * sin(ph));
         // `2r` of travel: within the disc a curved surface deviates from the tangent plane by
         // at most ~r^2/(2R), far inside this window for any radius worth gathering at.
-        const DHit h = closestHit(sc, q + n * r, n * (Real)(-1), RAY_EPS, (Real)2 * r, false);
+        // Through any surface that holds no photon (dProbePassesThrough), and through a fiber of
+        // opacity below 1 with the probability it is absent -- the coin every walk tosses there
+        // (host twin gatherCoverageRaw). `h.t` stays the depth from the launch point.
+        DHit h;
+        {
+            DVec3 o = q + n * r;
+            const DVec3 dn = n * (Real)(-1);
+            Real tAcc = (Real)0, curveTmin = (Real)0;
+            for (int pass = 0; pass < 16; ++pass) {
+                h = closestHit(sc, o, dn, RAY_EPS, (Real)2 * r - tAcc, false, curveTmin);
+                if (!h.valid) break;
+                h.t += tAcc;
+                const DMaterial& hm = sc.mats[h.matId];
+                if (dProbePassesThrough(hm)) {
+                    tAcc = h.t; o = h.p; curveTmin = (Real)0;
+                    continue;
+                }
+                if (hm.type != D_HAIR || !(h.fiberRadius > (Real)0)) break;
+                double op = hm.hairOpacity;
+                if (hm.hairOpacityPat >= 0) op *= (double)clamp01(dPatternScalarAt(sc, hm.hairOpacityPat, h));
+                if (op >= 1.0 || (double)rng.uniform() < op) break;   // the strand IS here
+                tAcc = h.t; o = h.p; curveTmin = (Real)2.5 * h.fiberRadius;
+            }
+        }
         if (!h.valid) continue;
         const double c = (double)dot(h.n, n);
         // Only `area` is gated on the ball (see DScene::gaBall), so nRej and therefore the

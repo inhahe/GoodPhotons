@@ -71,7 +71,7 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
-## OPEN (2026-10-14): GATHERAREA-TRANSPARENT — a photon-map footprint probe stops on a transparent face that holds no photons
+## DONE (2026-10-14, 0.381.6): GATHERAREA-TRANSPARENT — a photon-map footprint probe stopped on a transparent face that holds no photons
 
 M-GATHERAREA's coverage probe (`gatherCoverageRaw` / `dGatherCoverage`) traces from r above a
 gather point's tangent plane straight down and takes the first surface it meets. A glass, water or
@@ -85,6 +85,13 @@ Both backends do it; it went unnoticed because the light under water is mostly t
 which gathers at a radius smaller than the gap. Fix: let the probe continue through dielectric,
 coated (clear), filter and half-mirror surfaces, host and device -- the device's probe has no
 pass-through loop at all yet (not even the host's fiber one) -- and measure on the bare tank.
+
+**Fixed in 0.381.6:** `probePassesThrough` / `dProbePassesThrough` (dielectric, a coat clear at
+550 nm, filter, half mirror) send the probe on through, and the device's probe gained the host's
+fiber pass-through too. `tools/check_gather_glass.py`: a floor lit only by a wall's bounce, a glass
+slab 1 cm above it, seen through the slab -- mode M against mode R read x1.113 over the frame and
+x1.29 at worst (32 sigma host, 28 device) before, x0.997 after, on both backends. Host mode M
+byte-identical elsewhere (a Cornell box, a glass scene, a thin film, fur).
 
 ## DONE (2026-10-14, 0.381.2): MODE-M-FOLD-SUPPORT — mode M's spectral fold was biased where the branches a step can take depend on the wavelength
 
