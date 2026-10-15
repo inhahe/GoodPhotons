@@ -71,6 +71,21 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-10-14): GATHERAREA-TRANSPARENT — a photon-map footprint probe stops on a transparent face that holds no photons
+
+M-GATHERAREA's coverage probe (`gatherCoverageRaw` / `dGatherCoverage`) traces from r above a
+gather point's tangent plane straight down and takes the first surface it meets. A glass, water or
+coated face lying within r above the surface -- a tank standing a centimetre off the floor, its
+bottom face over the floor beneath it -- is that first surface: it is counted, and then mostly
+rejected by the ball test for lying above the plane, so the coverage reads low and the main map's
+estimate there is scaled up (x2-4 under `check_radiance_eta2`'s bare tank at the default radius,
+measured in the probe printout behind GPU-M-FLOOR). No photon is ever stored on such a face, so
+the probe should pass through it as the host's already passes through a fiber of opacity below 1.
+Both backends do it; it went unnoticed because the light under water is mostly the caustic map's,
+which gathers at a radius smaller than the gap. Fix: let the probe continue through dielectric,
+coated (clear), filter and half-mirror surfaces, host and device -- the device's probe has no
+pass-through loop at all yet (not even the host's fiber one) -- and measure on the bare tank.
+
 ## DONE (2026-10-14, 0.381.2): MODE-M-FOLD-SUPPORT — mode M's spectral fold was biased where the branches a step can take depend on the wavelength
 
 Mode M's camera walk runs at one wavelength and estimates every photon wavelength L from it: the
@@ -600,7 +615,7 @@ emitters once per emitter and for fires per point. Until then, a lamp or fire in
 be clear glass in air for the light walks to be right; check_radiance_eta2 and check_fire_d use
 exactly that.
 
-## OPEN (2026-10-13, to investigate): GPU-M-FLOOR — the device's mode M reads the floor in front of a water tank 2.4x too bright
+## DONE (2026-10-14, 0.381.5): GPU-M-FLOOR — the device's mode M read the floor in front of a water tank 2.4x too bright
 
 `tools/check_radiance_eta2.py`'s water tank (a closed box of water, n 1.333, on a diffuse floor,
 lit by an area lamp above it and seen from outside), mode M, 64x48, 64 spp, 50 M photons, four
@@ -637,6 +652,20 @@ more, by something the two codes' text does not show (both flip the hit normal t
 probe from r above the plane over 2r). Next: count the device's probes the way FTRACE_GADIAG does.
 Two questions beside the divergence: whether a transparent face should count as covering the disc
 at all (photons are stored on the floor beneath it, not on it), and so which backend is right.
+
+**Fixed in 0.381.5.** Printing every probe of the gather points in the strip (a scratch build)
+showed host and device probes identical: under the tank every main-map probe meets the bottom face
+1 cm above the floor and only 2-5 of 8 pass the ball test, on both. The coverage was never the
+difference -- what it multiplied was. The host scales each map's estimate by that map's own
+coverage (`est`); the device (`dPhotonGather` and its final-gather sub-walk) added the caustic
+map's sum into the main map's first and then multiplied the total by the MAIN map's scale, so under
+the tank, where light that crossed the water is caustic-map light, the caustic map took the main
+map's x2-4. Each map's correction now scales that map's sum alone, as the host's does. The "strip in
+front of the tank" was the floor under the water seen through the tank's front face, in the same
+tile row. `check_radiance_eta2.py` now compares mode M device / host over the whole tank frame, and
+on the tank without its pool floor (this repro). Whether a transparent face should count as covering
+the disc is a separate question, open: both backends count it (and the ball test then rejects it
+for being above the plane), so both under-read the coverage there.
 
 ## OPEN (2026-10-13, scope): GRIN-RADIANCE-SCALE — a camera path ending inside a GRIN region misses the n^2 radiance scale
 

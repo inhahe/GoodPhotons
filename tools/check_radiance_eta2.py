@@ -41,9 +41,10 @@ pool floor seen in the water's surface read up to 19 % low near the floor's edge
 radius bias, gone at the smaller radius). Then, unless --no-gpu, the device against the host,
 each device render required to say it ran on the GPU: mode R on the glass, thin-film and
 multilayer blocks, and the fast RGB walk (-rgb, device only) against the spectral one there; mode
-W on the lamp seen in glass; modes M (both ways) and S on the tank, M over the ball (the floor in
-front of the tank carries a separate device / host difference, known-issues GPU-M-FLOOR); modes D
-and U on the submerged lamp. Every render's outputs are deleted before it runs, so a run that
+W on the lamp seen in glass; modes M (both ways) and S on the tank; mode M on the tank without its
+pool floor, where the floor under the water lies a centimetre below the tank's bottom face (until
+0.381.5 the device scaled the caustic map's light there by the main map's footprint correction,
+x2.4 -- known-issues GPU-M-FLOOR); modes D and U on the submerged lamp. Every render's outputs are deleted before it runs, so a run that
 writes nothing cannot be scored on an earlier run's image. A tile fails when the two differ by
 more than 5 standard errors (two seeds each) AND by more than the pair's tolerance. Exits 1 on
 any failure.
@@ -111,6 +112,10 @@ TANK = [
     TANK_LAMP,
 ] + box(-0.7, 0.01, -0.7, 0.7, 0.9, 0.7, "water")
 
+# 2b. The tank without its pool floor: the room's floor runs under the water, a centimetre below the
+#     tank's bottom face, which a photon-map footprint probe there meets first.
+TANK_BARE = [ln for ln in TANK if not ln.startswith("quad { origin -0.69 0.05 -0.69")]
+
 # 3. The tank with its lamp under the water's surface, above the ball.
 SUBMERGED = [ln for ln in TANK if ln != TANK_LAMP] + [
     'light area { origin -0.15 0.8 -0.15  u 0.3 0 0  v 0 0 0.3  normal 0 -1 0  power 50  '
@@ -140,7 +145,8 @@ def main():
     os.makedirs(d, exist_ok=True)
     for name, lines in (("lamp_in_glass.ftsl", LAMP_IN_GLASS), ("lamp_in_film.ftsl", LAMP_IN_FILM),
                         ("lamp_in_stack.ftsl", LAMP_IN_STACK), ("glass_seen.ftsl", GLASS_SEEN),
-                        ("tank.ftsl", TANK), ("submerged.ftsl", SUBMERGED),
+                        ("tank.ftsl", TANK), ("tank_bare.ftsl", TANK_BARE),
+                        ("submerged.ftsl", SUBMERGED),
                         ("nested.ftsl", NESTED), ("nested_coat.ftsl", NESTED_COAT)):
         with open(os.path.join(d, name), "w", encoding="utf-8", newline="") as f:
             f.write(NL.join(lines) + NL)
@@ -148,11 +154,6 @@ def main():
     def render(tag, scene, args, device="cpu", spp=None):
         """Two seeds of one configuration (render_seeds)."""
         return render_seeds(a.exe, d, scene, tag, args, device, spp or a.spp)
-
-    def ball(imgs):
-        """The tank frame's middle: the ball and the water around it."""
-        h, w = imgs[0].shape
-        return [im[h // 4:3 * h // 4, w // 3:2 * w // 3] for im in imgs]
 
     def middle(imgs):
         """The 16 x 16 pixels at the frame's centre: the lamp seen through the glass."""
@@ -219,10 +220,12 @@ def main():
             tag = scene[8:-5]
             pairs.append(("lamp in a %s: mode R, device / host" % label,
                           render(tag + "_Rg", scene, ["-mode", "R"], "gpu"), coats[scene], 0.03))
-        pairs += [("tank: mode M on the ball, device / host",
-                   ball(render("tank_Mg", tank, modeM, "gpu")), ball(mt), 0.05),
-                  ("tank: mode M -pmfg 4 on the ball, device / host",
-                   ball(render("tank_Mfgg", tank, modeMfg, "gpu", spp=sppFg)), ball(mft), 0.05),
+        pairs += [("tank: mode M, device / host", render("tank_Mg", tank, modeM, "gpu"), mt, 0.05),
+                  ("tank: mode M -pmfg 4, device / host",
+                   render("tank_Mfgg", tank, modeMfg, "gpu", spp=sppFg), mft, 0.05),
+                  ("tank without its pool floor: mode M, device / host",
+                   render("bare_Mg", "tank_bare.ftsl", modeM, "gpu"),
+                   render("bare_M", "tank_bare.ftsl", modeM), 0.05),
                   ("tank: mode S, device / host", render("tank_Sg", tank, modeS, "gpu"), st, 0.05),
                   ("submerged lamp: mode D, device / host",
                    render("sub_Dg", sub, modeD, "gpu"), ds, 0.05),

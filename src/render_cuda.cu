@@ -15613,6 +15613,18 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 float w = rhoY * rhoV;
                 gx += w * ph.pX; gy += w * ph.pY; gz += w * ph.pZ;
             });
+            // M-GATHERAREA, the MAIN map's coverage, on the main map's sum alone -- before the
+            // caustic map's is added, which takes its own coverage below (host twin: each `est`
+            // scales its own map). The device folds norm/pi into every photon record at upload
+            // (DGatherPhoton), so the correction multiplies the sum rather than a normalisation.
+            if (sc.gatherArea) {
+                const double ms = dGatherAreaScale(sc.gaBias,
+                    dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea,
+                                    h.fiberRadius));
+                gx = (float)((double)gx * ms);
+                gy = (float)((double)gy * ms);
+                gz = (float)((double)gz * ms);
+            }
             if (causOn) {
                 // The caustic map gathers at its own PER-QUERY radius (dPmAdaptiveRadius).
                 // pX/pY/pZ carry the fold for the map's fixed radius, so rescale the sum by
@@ -15641,18 +15653,6 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 gx += cx * (float)(aw * cs);
                 gy += cy * (float)(aw * cs);
                 gz += cz * (float)(aw * cs);
-            }
-            // ...and the MAIN map's, at its own radius. The device folds norm/pi into every
-            // photon record at UPLOAD time (see DGatherPhoton), so unlike the host there is no
-            // per-gather normalisation to scale -- the correction multiplies the accumulated
-            // sum instead. Same estimator, different place to put the multiply.
-            if (sc.gatherArea) {
-                const double ms = dGatherAreaScale(sc.gaBias,
-                    dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea,
-                                    h.fiberRadius));
-                gx = (float)((double)gx * ms);
-                gy = (float)((double)gy * ms);
-                gz = (float)((double)gz * ms);
             }
             oX += (double)gx * thr; oY += (double)gy * thr; oZ += (double)gz * thr;
             return;
@@ -16253,6 +16253,18 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             // Caustic map: same estimator, its own PER-QUERY radius, summed in (see the
             // header comment and dPmAdaptiveRadius). The area ratio r^2/r_q^2 corrects the
             // fixed-radius normalisation already folded into pX/pY/pZ.
+            // M-GATHERAREA, the MAIN map's coverage, on the main map's sum alone -- before the
+            // caustic map's is added, which takes its own coverage below (host twin: each `est`
+            // scales its own map). The device folds norm/pi into every photon record at upload
+            // (DGatherPhoton), so the correction multiplies the sum rather than a normalisation.
+            if (sc.gatherArea) {
+                const double ms = dGatherAreaScale(sc.gaBias,
+                    dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea,
+                                    h.fiberRadius));
+                gx = (float)((double)gx * ms);
+                gy = (float)((double)gy * ms);
+                gz = (float)((double)gz * ms);
+            }
             if (causOn) {
                 const Real rq  = dPmAdaptiveRadius(pmC, h.p, h.n);
                 const Real r2q = rq * rq;
@@ -16281,18 +16293,6 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 gx += cx * (float)(aw * cs);
                 gy += cy * (float)(aw * cs);
                 gz += cz * (float)(aw * cs);
-            }
-            // ...and the MAIN map's, at its own radius. The device folds norm/pi into every
-            // photon record at UPLOAD time (see DGatherPhoton), so unlike the host there is no
-            // per-gather normalisation to scale -- the correction multiplies the accumulated
-            // sum instead. Same estimator, different place to put the multiply.
-            if (sc.gatherArea) {
-                const double ms = dGatherAreaScale(sc.gaBias,
-                    dGatherCoverage(sc, h.p, h.n, (Real)sqrt((double)r2), rng, sc.gatherArea,
-                                    h.fiberRadius));
-                gx = (float)((double)gx * ms);
-                gy = (float)((double)gy * ms);
-                gz = (float)((double)gz * ms);
             }
             oX += (double)gx * thr; oY += (double)gy * thr; oZ += (double)gz * thr;
             return;

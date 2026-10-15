@@ -4957,8 +4957,11 @@ as the one at fault.
   points in the tangent-plane disc, each traced from `r` above the plane straight down, accepted
   on the same 60-degree test the photon query uses, and weighted by `1/cos(tilt)` because the
   probe samples PROJECTED area while the estimator needs SURFACE area. `gatherCoverage` /
-  `gatherAreaScale` in `photonmap_render.h`, device twin `dGatherCoverage` in `render_cuda.cu`,
-  and `sppm_render.h` applies it to each pass's flux BEFORE it enters `tau` — coverage belongs to
+  `gatherAreaScale` in `photonmap_render.h`, device twin `dGatherCoverage` in `render_cuda.cu`.
+  Each map's coverage is taken at that map's radius and scales that map's estimate alone: the
+  caustic map gathers at its own per-query radius, so the main map's correction must not reach it
+  (the device applied it to the sum of both until 0.381.5, GPU-M-FLOOR). `sppm_render.h`
+  applies it to each pass's flux BEFORE it enters `tau` — coverage belongs to
   the radius actually gathered at, and SPPM shrinks its radius every pass, so a single coverage
   measured at the final radius would misprice every earlier one.
 
