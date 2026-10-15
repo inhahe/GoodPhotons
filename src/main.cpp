@@ -13442,10 +13442,8 @@ static void warnWhittedHeroCollapse(const Scene& scene) {
 // incomplete) set of shared wavelengths. Expected, not a bug.
 static const int kWhittedDeHeroSpp = 64;
 
-// Which of the three, or nullptr if the bundle survives (so 1 spp really is exact).
-// `-heroc 1` is checked first because it is the one the user typed, and it makes the other
-// two moot. Kept as ONE predicate so the batch warning below and the viewer's pass floor
-// (kWSppCap, in the -explore loop) cannot drift apart.
+// Which of the three, or nullptr if the bundle survives (no colour cast). `-heroc 1` is checked
+// first because it is the one the user typed, and it makes the other two moot.
 static const char* whittedDeHeroes(const Scene& scene) {
     if (g_heroC <= 1)                   return "-heroc 1 (the hero bundle is off)";
     if (!scene.mediaKeepBundle())       return "a medium whose extinction varies with wavelength";
@@ -13478,11 +13476,20 @@ static void warnWhittedDeHeroSpp(const Scene& scene, long long spp) {
                 spp, why, spp, spp == 1 ? "" : "s", kWhittedDeHeroSpp);
 }
 
+// Whether a mode-W frame needs passes rather than one: when the bundle does not survive (a colour
+// cast, whittedDeHeroes) or the scene has a medium (its free flights, and a fire's light, are drawn
+// at random: grain, noteWhittedMediaSpp). ONE predicate, so the batch messages and the viewer's pass
+// floor (kWSppCap, in the -explore loop) cannot drift apart.
+static bool whittedNeedsPasses(const Scene& scene) {
+    return whittedDeHeroes(scene) != nullptr || !scene.media.empty();
+}
+
 // Batch mode W only, like the warning above, for the other thing one pass cannot settle: a
 // participating medium (a fire is one) -- mode W draws its free flights, and a fire's light
 // sampling, at random. That is grain, which averages down per pixel, not a cast, so a note.
 static void noteWhittedMediaSpp(const Scene& scene, long long spp) {
-    if (scene.media.empty() || spp >= kWhittedDeHeroSpp) return;
+    // A de-hero warning already printed covers it (same advice), so one message per cause.
+    if (scene.media.empty() || spp >= kWhittedDeHeroSpp || whittedDeHeroes(scene)) return;
     bool fire = false;
     for (const Medium& m : scene.media) if (m.emissive()) { fire = true; break; }
     std::printf("[mode W] note: -spp %lld with %s -- mode W samples %s at random, so the image "
@@ -22910,15 +22917,14 @@ static int run(int argc, char** argv) {
             // extinction varies with wavelength, GRIN.
             // (No hasLens() term: the viewer builds its camera fresh from the pose each frame,
             // so the preview camera is always a plain one even if the scene authored a lens.)
-            // The floor is the constant the batch warning quotes (kWhittedDeHeroSpp) and the
-            // predicate is the one it uses, so the viewer and the batch path cannot disagree.
+            // The floor is the constant the batch messages quote (kWhittedDeHeroSpp) and the
+            // predicate theirs (whittedNeedsPasses: a de-hero, or any medium), so the viewer and
+            // the batch path cannot disagree.
             // The extra passes cost nothing in responsiveness: any camera movement abandons
             // the unfinished refinement, so they run only while you hold still, and each is
             // shown as it lands.
             const int kWSppCap = kWhittedDeHeroSpp;
-            // A medium needs the passes too, de-heroed or not: mode W draws its free flights from
-            // the rng, so one pass of fog is a scatter-or-not salt and pepper, not the answer.
-            bool wNeedSpp = whittedDeHeroes(scene) != nullptr || !scene.media.empty();
+            bool wNeedSpp = whittedNeedsPasses(scene);
             // Rough GLOSSY is deliberately NOT on that list, even though its lobe is likewise
             // resolved across samples (whittedGlossyDir) rather than within one. The difference
             // is what a single pass looks like: a de-hero'd dielectric is flatly WRONG (a green

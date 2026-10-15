@@ -1920,9 +1920,6 @@ struct BackwardRenderer {
         return on;
     }
 
-    // The solid-angle density with which the cone half of fireNee's mixture samples direction `d`
-    // (unit) from `x` for fire `v`, and the sampler itself (fireDirPdf has the mixture's density).
-    // `oneMinusCos` is 1 - cos(theta_max) written stably, so a small distant fire keeps its digits.
     // The cone of directions from `x` that holds the fire box's bounding sphere, shared by its
     // sampler and its density: `tc` from x to the box's centre, `d2` its squared length, `cosMax`
     // and `oneMinusCos` the cone's half angle (the latter in the form that stays exact for a small
@@ -1940,6 +1937,8 @@ struct BackwardRenderer {
         c.oneMinusCos = s2 / (1.0 + c.cosMax);
         return c;
     }
+    // The solid-angle density with which the cone half of fireNee's mixture samples direction `d`
+    // (unit) from `x` for fire `v`, and the sampler itself (fireDirPdf has the mixture's density).
     static double fireConePdf(const Scene::EmissiveVolume& v, const Vec3& x, const Vec3& d) {
         const FireCone c = fireCone(v, x);
         if (c.inside) return 1.0 / (4.0 * PI);

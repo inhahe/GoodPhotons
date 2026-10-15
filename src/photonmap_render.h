@@ -306,22 +306,24 @@ inline std::vector<GaDiagMat>& gaDiag() {
     return t;
 }
 
-// The estimator itself. Wrapped by `gatherCoverage` below, which only records the result -- the
-// wrapper exists so that every early return here (flat-interior gate, tangle gate, fiber gate)
-// is histogrammed without editing any of them.
 // Whether a footprint probe passes through a surface of material `m` rather than stopping on it:
-// one no photon is ever stored on and light crosses -- glass, a clear coat, a filter, a half
-// mirror. Stopping there, the probe counted such a face lying within the radius above the gather
-// surface (a tank a centimetre off the floor) and the ball test then rejected it for its height,
-// so the coverage read low (known-issues GATHERAREA-TRANSPARENT). Device twin dProbePassesThrough.
+// one no photon is ever stored on -- anything but a diffuse, diffuse-transmitting or fluorescent
+// surface, or a compound or fiber that may be one. The photons near such a face lie on the surface
+// beyond it, and a face within the radius above the tangent plane would otherwise be counted and
+// then ball-rejected for its height, though that surface is there (known-issues
+// GATHERAREA-TRANSPARENT). Device twin dProbePassesThrough.
 inline bool probePassesThrough(const Material& m) {
     switch (m.type) {
-        case MatType::Dielectric: case MatType::Filter: case MatType::HalfMirror: return true;
-        case MatType::ThinFilm: case MatType::Multilayer: return !m.coatOpaque(550.0);
+        case MatType::Dielectric: case MatType::ThinFilm: case MatType::Multilayer:
+        case MatType::Filter: case MatType::HalfMirror: case MatType::Mirror:
+        case MatType::Glossy: case MatType::Grating: return true;
         default: return false;
     }
 }
 
+// The estimator itself. Wrapped by `gatherCoverage` below, which only records the result -- the
+// wrapper exists so that every early return here (flat-interior gate, tangle gate, fiber gate)
+// is histogrammed without editing any of them.
 inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n,
                              double r, Pcg32& rng, int M, int matId = -1,
                              double fiberR = 0.0) {
@@ -452,8 +454,12 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 h = scene.closestHit(pr);
                 if (!h.valid) break;
                 h.t += tAcc;
+                if (h.t > 2.0 * r) break;                               // past the window: a miss
                 const Material* pm = (h.matId >= 0 && h.matId < (int)scene.mats.size()) ? &scene.mats[h.matId] : nullptr;
-                if (pm && probePassesThrough(*pm)) {                    // holds no photon: on through
+                // On through a face that holds no photon -- but only one above the plane: a face ON
+                // it (a glass box standing on the floor, coplanar with it) is the surface's own
+                // height, and passing it would skip the surface beside it.
+                if (pm && probePassesThrough(*pm) && r - h.t > 1e-3 * r) {
                     tAcc = h.t;
                     pr = Ray{h.p + pr.d * 1e-9, pr.d};
                     continue;
@@ -1007,28 +1013,24 @@ struct SpecThr {
         int b = (int)((lam - LAMBDA_MIN) / (LAMBDA_MAX - LAMBDA_MIN) * K);
         return b < 0 ? 0 : (b >= K ? K - 1 : b);
     }
-    // Fold in one spectral factor, `f(lambda)`. Probes three wavelengths first: a factor that
-    // agrees at all three is taken as flat and folded as a constant, which cancels in the ratio
-    // anyway -- so even a spectrum that fools the probe can only be mis-taken where it is already
-    // nearly flat, and the common case (every uncoloured material in the scene) pays three calls.
-    // `f` evaluates the factor at a wavelength; `atCam` is the value the scalar throughput just
-    // used at the camera's wavelength, passed in rather than recomputed so the two can never
-    // disagree (see `cam`).
+    // Fold in one spectral factor, `f(lambda)`, at every bin: a band between any few probe
+    // wavelengths -- a notch, a band-pass gel -- is as much the factor as its ends, and a zero in it
+    // is a hole in the support. A factor equal at every bin folds as the constant it is and leaves
+    // `any` alone (it cancels in the ratio). `atCam` is the value the scalar throughput just used at
+    // the camera's wavelength, passed in rather than recomputed so the two can never disagree (see
+    // `cam`).
     template <class F> void mul(const F& f, double atCam) {
         cam *= atCam;
-        const double a = f(lamOf(0)), b = f(lamOf(K / 2)), c = f(lamOf(K - 1));
-        const double tol = 1e-12 * (1.0 + std::fabs(a));
-        if (std::fabs(a - b) <= tol && std::fabs(a - c) <= tol) {
-            for (int k = 0; k < K; ++k) v[k] *= a;   // flat: cancels in the ratio regardless
-            return;
-        }
-        any = true;
-        bool zero = false;
+        double a = 0.0;
+        bool flat = true, zero = false;
         for (int k = 0; k < K; ++k) {
             const double fk = f(lamOf(k));
+            if (k == 0) a = fk;
+            else if (std::fabs(fk - a) > 1e-12 * (1.0 + std::fabs(a))) flat = false;
             v[k] *= fk;
             if (!(fk > 0.0)) { p[k] = 0.0; zero = true; }
         }
+        if (!flat) any = true;
         // A weight zero in some bins leaves a walk drawn there with nothing to carry, at any
         // wavelength: the same support problem as a coin's (see `p`), so the walks drawn where it
         // is not zero stand in for them.
@@ -1037,16 +1039,15 @@ struct SpecThr {
     // Fold in a factor already evaluated ON the grid, plus its value at the camera's wavelength.
     // The media term comes this way: its per-wavelength values fall out of one shared
     // ratio-tracking walk rather than from a function that can be called per bin.
-    // A weight zero in some bins is a partial support, as in mul.
+    // A zero here is NOT a hole in the support, as a zero weight in mul is: the media term is a
+    // ratio-tracking estimate, so a zero is one realization's event, and whether it happens depends
+    // on the walk's wavelength (the majorant is taken over it), which `partial` must never.
     void mulVec(const double* vk, double atCam) {
         cam *= atCam;
-        bool zero = false;
         for (int k = 0; k < K; ++k) {
             if (!any && std::fabs(vk[k] - vk[0]) > 1e-12 * (1.0 + std::fabs(vk[0]))) any = true;
             v[k] *= vk[k];
-            if (!(vk[k] > 0.0)) { p[k] = 0.0; zero = true; }
         }
-        if (zero) { partial = true; rescale(); }
     }
     // Fold in a coin the walk tossed: f(lambda, prob) returns the branch's factor at lambda (its
     // probability times any weight -- Renderer::stepFactorAt) and sets `prob` to its probability
@@ -1467,7 +1468,9 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                             sthr.mulVec(Tv, Tv[SpecThr::K]);
                         }
                     }
-                    if (aGlass > 0.0) {
+                    // Inside a dielectric whatever it absorbs at the walk's own wavelength: a
+                    // glass clear there may absorb at a photon's (clear glass folds exactly 1).
+                    if (cmIdx >= 0) {
                         thr *= std::exp(-aGlass * slen);
                         const int cmA = cmIdx; const double sl = slen;
                         sthr.mul([&](double L) { return std::exp(-scene.mats[cmA].absorb(L) * sl); },
@@ -1507,7 +1510,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             if (thr <= 0.0) return L;
         }
         if (h.valid) {                                   // Beer-Lambert in current medium
-            if (aGlass > 0.0) {
+            if (cmIdx >= 0) {                        // (see the curved pre-pass's note)
                 thr *= std::exp(-aGlass * h.t);      // coloured glass is spectral: SPECGATHER too
                 const int cmA = cmIdx; const double tt = h.t;
                 sthr.mul([&](double L) { return std::exp(-scene.mats[cmA].absorb(L) * tt); },

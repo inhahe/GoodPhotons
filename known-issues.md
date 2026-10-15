@@ -92,6 +92,13 @@ fiber pass-through too. `tools/check_gather_glass.py`: a floor lit only by a wal
 slab 1 cm above it, seen through the slab -- mode M against mode R read x1.113 over the frame and
 x1.29 at worst (32 sigma host, 28 device) before, x0.997 after, on both backends. Host mode M
 byte-identical elsewhere (a Cornell box, a glass scene, a thin film, fur).
+0.381.7 widened the list to every surface that holds no photon (mirrors, glossy, gratings, opaque
+coats) and passes a face only when it lies above the plane (a glass box ON the floor is the floor's
+height). Still open: an OPAQUE surface that holds photons hovering within the radius above another
+(a shelf a centimetre over a floor), and a `Mix` whose children are all transparent (the probe sees
+the unresolved compound). Continuing past any ball-rejected hit would cover both, but it would also
+feed a curved surface's own back faces to the tangle gate, whose reject count the ball test holds
+fixed by construction; not adopted (REVIEW-0381B).
 
 ## DONE (2026-10-14, 0.381.2): MODE-M-FOLD-SUPPORT — mode M's spectral fold was biased where the branches a step can take depend on the wavelength
 
@@ -137,7 +144,7 @@ twelve pairs (the coat x0.42-0.62 at 34-50 sigma, the half mirror x0.47 in red a
 own resolution, SPECGATHER-BIN-RESOLUTION, found here. A layered coat's coin (its Fresnel
 reflectance) is still taken at the walk's wavelength; it varies only with the coat's dispersion.
 
-## OPEN (2026-10-14): SPECGATHER-BIN-RESOLUTION — mode M's carrier resolves a spectral edge inside one of its bins badly where the edge changes which branches a coin can take
+## OPEN (2026-10-14): SPECGATHER-BIN-RESOLUTION — mode M's 24-bin carrier misreads a spectral edge or kink inside one of its bins
 
 Mode M's camera walk re-expresses its spectral factors at each photon's wavelength through a 24-bin
 carrier (`SpecThr` / `DSpecThr`, 19.6 nm bins over 360-830 nm), and since 0.381.2, where a coin's
@@ -170,11 +177,59 @@ A coin or weight that changes only INSIDE one bin (a reflectance band narrower t
 every centre) is the extreme case: the carrier sees it flat, at a value other than the walk's.
 Since 0.381.4 it folds as that value rather than being skipped, which zeroes such a band's light
 instead of crediting it to every wavelength -- still wrong, at the bins' resolution.
+Kinks count as much as edges: `check_coat_modes`' green gel, a linear ramp from 0 at 440 nm to 0.9
+at 500 (and back down from 560 to 600), reads blue x1.07 behind it on both backends, from the kink
+at 440 sitting inside bin 4 (438-458 nm) where the blue colour-matching weight peaks; reading the
+carrier linearly interpolated between centres made it x1.09-1.11 (an interpolation across the kink
+is wrong in the same direction). The device adds its own resolution on top: its spectral tables are
+96 entries, 4.9 nm apart and interpolated, so any step reaches it as a 5 nm ramp -- a step placed on
+a carrier bin boundary for the host straddles that boundary on the device.
 
 **Proposed fix:** take the denominator's walk density per bin only over the part of the bin that
 can take the branches, resolved finer than the bin -- the support is cheap to test at sub-bin
 wavelengths (a coat's opacity is a spectrum lookup, total internal reflection one comparison of
 indices), while the probabilities themselves can stay at the centres. Then explain the ramp.
+
+## DONE (2026-10-14, 0.381.7): REVIEW-0381B — what the Opus and Fable reviews of 0.381.3-0.381.6 found
+
+Opus (max) and Fable (xhigh) reviewed d3e5b315..95fc7b9e. Fixed:
+
+* **Mode M's spectral carrier probed three wavelengths for flatness** (Fable): a factor equal at
+  369.8, 604.8 and 820.2 nm was folded as a constant, so a band between them was invisible -- a
+  green band-pass gel, zero at all three, folded as a flat zero and the wall behind it rendered
+  black; a magenta gel kept its green. `mul` now evaluates every bin (host and device).
+  `check_coat_modes.py` adds a green band-pass gel (0 below 440 and above 600 nm), zero at all
+  three probes: 0.381.6 reads its green x0.27 and red x5 (~400 sigma), host and device; 0.381.7
+  reads within 10 % (its ramps' kinks inside carrier bins leave ~8 % in blue: SPECGATHER-BIN-
+  RESOLUTION).
+* **Glass absorption in mode M** (Opus): the device folded a dielectric's Beer-Lambert absorption
+  into `thr` only, at the walk's wavelength, so coloured glass on the GPU took its mean
+  transmittance; the host folded it only where the glass absorbs at the walk's own wavelength, so
+  a glass clear there passed every photon unattenuated. Both fold it whenever the walk is inside
+  a dielectric.
+* **The media term's zeros are no support hole** (both): 0.381.4 let a zero in the ratio-tracking
+  transmittance vector mark the carrier partial, though it is one realization's event and depends
+  on the walk's wavelength. Only deterministic weights do now (`mul`, and the device's fiber weight
+  through `mulVec`).
+* **The footprint probe** (both): it passes every surface that holds no photon (mirrors, glossy,
+  gratings and opaque coats too, not just glass), but only above the plane -- a glass box standing
+  on the floor is the floor's own height and counts (a relaunch would skip the coplanar floor); the
+  device's relaunch past a fiber takes tmin 0 as every curve-tmin caller does; the host's pass-
+  through loop stops at the window's 2r.
+* **GPU mode U's cell table** (both): the dense grid grew as (extent / radius)^3 as the radius
+  shrank and could end a long run or overflow an int; past 2^26 cells the cells grow instead.
+* **Mode J's wavefront beam gather seeds** (Opus): they carried neither -seed nor a stable key
+  (the atomic slot a hit was given); they take the kernel's seed and key on (segment, beam).
+* Tidiness: `whittedNeedsPasses`, one predicate for mode W's passes (Opus); the mode-W note no
+  longer repeats the de-hero warning (Fable); `dHairOpacityAt`, one device copy (both); four
+  comments put back above the functions they describe and one narration rewritten (Opus);
+  `check_gather_glass.py`'s lamp moved so no floor in view sees it, as its docstring says (Opus);
+  `check_radiance_eta2.py`'s bare tank named, not string-matched (Fable).
+* Not adopted: continuing the probe past ANY hit above the plane that the ball test rejects
+  (Fable), which would also cover an opaque shelf hovering over a floor. The coverage code holds
+  the tangle gate's reject count fixed under the ball test by construction, and continuing would
+  let a curved surface's own back faces feed it, changing the correction where it was measured
+  (hair, cloth). The opaque-shelf case stays open under GATHERAREA-TRANSPARENT.
 
 ## DONE (2026-10-14, 0.381.4): REVIEW-0381 — what the Opus and Fable reviews of 0.380.1-0.381.2 found
 

@@ -1027,9 +1027,10 @@ wrong in either direction for a coloured one (measured up to 14 %).
 product over a 24-bin grid beside the scalar; the estimate reweights each photon by
 `v[bin(ph.lambda)] / cam`. The denominator `cam` is accumulated from **the very scalars that went
 into `thr`**, not re-sampled from the grid — that is what makes `thr * ratio` collapse exactly to
-(everything else) x v[lambda_p]. Folding a factor probes three wavelengths first and treats an
-agreeing one as constant, so uncoloured materials cost three lookups rather than 24 and flat scenes
-are unchanged. Cost measured at +4 % on a gallery_rain frame.
+(everything else) x v[lambda_p]. A factor is evaluated at every bin (since 0.381.7: a three-point
+flatness probe used to stand in for that, and folded a band-pass gel, zero at all three, as a flat
+zero), and one equal at every bin folds as a constant that leaves the ratio exactly 1. Cost measured
+at +4 % on a gallery_rain frame with the probe.
 
 **Hair (0.333.0).** The fiber BCSDF is the most coloured factor a camera walk meets -- a blonde
 fiber absorbs blue and green -- and its case in `photonGather` multiplied only the scalar `thr`,
@@ -1062,8 +1063,9 @@ its wavelength, so the exact importance ratio (where the support is whole) and t
 (where it is not) combine without bias; the average is taken at bin centres, the carrier's own
 resolution. A plain weight (a filter's transmission, a mirror's or glossy lobe's reflectance)
 that is zero in some bins is the same problem without a coin -- a walk drawn there carries nothing
-at any wavelength -- so `mul` / `mulVec` fold its support (zero or not, per bin) into `p` too
-(0.381.4). A half mirror folds its coin since then too (a coloured one reflected every photon
+at any wavelength -- so `mul` folds its support (zero or not, per bin) into `p` too (0.381.4), as
+the device does for a fiber's per-bin weight through `mulVec`. Not the media term: a ratio-tracking
+estimate's zeros are one realization's, and depend on the walk's wavelength. A half mirror folds its coin since then too (a coloured one reflected every photon
 wavelength by the walk's reflectance). A layered coat's coin (its Fresnel reflectance) is still
 taken at the walk's wavelength: it varies only with the coat's dispersion, a few tenths of a
 percent. `tools/check_coat_modes.py` holds both to mode R.
@@ -4955,8 +4957,10 @@ as the one at fault.
 
   The fix measures the covered fraction by **ray probe** rather than analytically: `M` stratified
   points in the tangent-plane disc, each traced from `r` above the plane straight down -- through
-  any surface that holds no photon (`probePassesThrough`: glass, a clear coat, a filter, a half
-  mirror; 0.381.6) and through a fiber with the probability its opacity leaves it absent -- accepted
+  any surface above the plane that holds no photon (`probePassesThrough`: all but diffuse,
+  diffuse-transmitting and fluorescent surfaces and the compounds and fibers that may be one;
+  0.381.6-0.381.7; a face ON the plane is the surface's own height and counts) and through a fiber
+  with the probability its opacity leaves it absent -- accepted
   on the same 60-degree test the photon query uses, and weighted by `1/cos(tilt)` because the
   probe samples PROJECTED area while the estimator needs SURFACE area. `gatherCoverage` /
   `gatherAreaScale` in `photonmap_render.h`, device twin `dGatherCoverage` in `render_cuda.cu`.

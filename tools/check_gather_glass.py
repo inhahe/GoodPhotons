@@ -10,11 +10,15 @@ counted that face and then rejected it for lying above the plane, so the coverag
 estimate high, though no photon is ever stored on glass and the floor beneath holds them all (known-
 issues GATHERAREA-TRANSPARENT). The probes now pass through such faces.
 
-The scene: a floor lit only by the bounce off a white wall (the lamp faces the wall), a glass slab
-standing 1 cm above the floor, and the camera looking down through the slab -- so the floor under it
-is main-map light (lamp, wall, glass, floor: no caustic-map path), gathered at a radius above the
-gap. Mode M (host, and device unless --no-gpu) against mode R, per tile, two seeds each; a tile
-fails when they differ by more than 5 standard errors AND by more than 5 %. Exits 1 on failure.
+The scene: a lamp facing a white wall from 0.6 m, a glass slab standing 1 cm above the floor, and the
+camera looking down through the slab. The floor between the lamp and the wall is lit directly; the
+floor under the slab, in front of the lamp, only by the wall's bounce (lamp, wall, glass, floor: main-
+map light, a caustic-map path needing the glass first) -- except its far strip past the lamp's plane,
+which the lamp also reaches through the glass (caustic-map light). The main map's coverage is what
+this tests, gathered at a radius above the gap. (Not the lamp right at the wall: its hot spot there
+is sharper than a photon map resolves, which mode M blurs whatever the coverage.) Mode M (host,
+and device unless --no-gpu) against mode R, per tile, two seeds each; a tile fails when they differ
+by more than 5 standard errors AND by more than 5 %. Exits 1 on failure.
 """
 import argparse
 import os

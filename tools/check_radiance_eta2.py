@@ -5,7 +5,7 @@
 
 Radiance over n^2 is what a ray conserves across a refraction, so a walk that carries radiance --
 the camera side of every mode -- multiplies its throughput by (n_from / n_to)^2 there, and one that
-carries flux -- the forward tracer, BDPT's light walk -- does not (Renderer::refractOrReflect,
+carries flux -- the forward tracer, BDPT's light walk -- does not (Renderer::interfaceStep,
 RADIANCE-ETA2). Going into a body and out again it cancels; ending inside one, it does not. Until
 0.378.1 no camera-side walk applied it. The scenes:
   1. a lamp inside a solid glass block (n 1.5) lighting the floor below it: modes R and D against
@@ -44,8 +44,8 @@ multilayer blocks, and the fast RGB walk (-rgb, device only) against the spectra
 W on the lamp seen in glass; modes M (both ways) and S on the tank; mode M on the tank without its
 pool floor, where the floor under the water lies a centimetre below the tank's bottom face (until
 0.381.5 the device scaled the caustic map's light there by the main map's footprint correction,
-x2.4 -- known-issues GPU-M-FLOOR); modes D and U on the submerged lamp. Every render's outputs are deleted before it runs, so a run that
-writes nothing cannot be scored on an earlier run's image. A tile fails when the two differ by
+x2.4 -- known-issues GPU-M-FLOOR); modes D and U on the submerged lamp. Every render's outputs
+are deleted before it runs, so a run that writes nothing cannot be scored on an earlier run's image. A tile fails when the two differ by
 more than 5 standard errors (two seeds each) AND by more than the pair's tolerance. Exits 1 on
 any failure.
 """
@@ -101,6 +101,7 @@ GLASS_SEEN = [
 #    outside.
 TANK_LAMP = ('light area { origin -0.4 2.0 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  power 200  '
              'spd preset:d65 }')
+POOL_FLOOR = 'quad { origin -0.69 0.05 -0.69   u 0 0 1.38   v 1.38 0 0   material white }'
 TANK = [
     'camera "c" { eye 0 0.55 -2.4  look_at 0 0.45 0  up 0 1 0  fov_y 36  film { res 64 48 } }',
     'material "floor" { type diffuse  reflect 0.5 }',
@@ -108,13 +109,14 @@ TANK = [
     'material "water" { type dielectric  ior 1.333 }',
     'quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material floor }',
     'sphere { center 0 0.4 0  radius 0.25  material white }',
-    'quad { origin -0.69 0.05 -0.69   u 0 0 1.38   v 1.38 0 0   material white }',
+    POOL_FLOOR,
     TANK_LAMP,
 ] + box(-0.7, 0.01, -0.7, 0.7, 0.9, 0.7, "water")
 
 # 2b. The tank without its pool floor: the room's floor runs under the water, a centimetre below the
 #     tank's bottom face, which a photon-map footprint probe there meets first.
-TANK_BARE = [ln for ln in TANK if not ln.startswith("quad { origin -0.69 0.05 -0.69")]
+TANK_BARE = [ln for ln in TANK if ln != POOL_FLOOR]
+assert len(TANK_BARE) == len(TANK) - 1
 
 # 3. The tank with its lamp under the water's surface, above the ball.
 SUBMERGED = [ln for ln in TANK if ln != TANK_LAMP] + [

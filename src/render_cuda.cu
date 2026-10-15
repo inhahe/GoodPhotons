@@ -3809,6 +3809,14 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
 // pattern evaluator, which is defined ~3800 lines later in this file.
 __device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit& h);
 
+// A fiber's coverage at a hit, clamped to [0,1]: the probability the strand is there, the same at
+// every wavelength (host twin hairOpacityAt).
+__device__ static double dHairOpacityAt(const DScene& sc, const DMaterial& m, const DHit& h) {
+    double op = m.hairOpacity;
+    if (m.hairOpacityPat >= 0) op *= (double)clamp01(dPatternScalarAt(sc, m.hairOpacityPat, h));
+    return op < 0.0 ? 0.0 : (op > 1.0 ? 1.0 : op);
+}
+
 __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& dir,
                                  Real maxDist, Real tmin = RAY_EPS, bool camLeg = false,
                                  Real curveTmin = (Real)0) {
@@ -3901,10 +3909,7 @@ __device__ static Real shadowTransmittance(const DScene& sc, const DVec3& o, con
                         // bound opacity pattern needs) and attenuate rather than block
                         if (!intersectCurveSeg(cray, o, dir, cs, fmaxf((float)tmin, (float)curveTmin), h, false)) blocked = false;
                         else {
-                            double op = cm.hairOpacity;
-                            if (cm.hairOpacityPat >= 0) op *= clamp01(dPatternScalarAt(sc, cm.hairOpacityPat, h));
-                            op = op < 0.0 ? 0.0 : (op > 1.0 ? 1.0 : op);
-                            T *= (1.0 - op);
+                            T *= (1.0 - dHairOpacityAt(sc, cm, h));
                             blocked = (T <= 1e-4);
                         }
                     }
@@ -5115,9 +5120,7 @@ __device__ __noinline__ static DHairShade dHairShadeAt(const DScene& sc, const D
     dhair::Params pr;
     pr.eta   = m.hairEta;
     {   pr.specR = dHairSpecularFrom(m, lambda, (specPat >= 0.0) ? specPat : dHairSpecPatAt(sc, m, h));
-        double op = m.hairOpacity;
-        if (m.hairOpacityPat >= 0) op *= (double)clamp01(dPatternScalarAt(sc, m.hairOpacityPat, h));
-        pr.opacity = op < 0.0 ? 0.0 : (op > 1.0 ? 1.0 : op);
+        pr.opacity = dHairOpacityAt(sc, m, h);
     }
     pr.betaM = m.hairBetaM;
     pr.betaN = m.hairBetaN;
@@ -5516,6 +5519,16 @@ struct DGatherPhoton {
     float lambda;           // wavelength (nm) — rho(lambda_p) still varies per photon
 };
 
+// Whether a footprint probe passes through a surface of material `m`: one no photon is ever stored
+// on (host twin probePassesThrough, where the reasoning lives).
+__device__ static bool dProbePassesThrough(const DMaterial& m) {
+    switch (m.type) {
+        case D_DIELECTRIC: case D_THINFILM: case D_MULTILAYER: case D_FILTER: case D_HALFMIRROR:
+        case D_MIRROR: case D_GLOSSY: case D_GRATING: return true;
+        default: return false;
+    }
+}
+
 // ---- GATHER FOOTPRINT (M-GATHERAREA), device twin of photonmap_render.h ----------------------
 // The density estimate divides by pi*r^2, the area of the whole gather disc, while collecting
 // only from the part of that disc that is real, same-facing surface. Where the disc overhangs --
@@ -5536,15 +5549,6 @@ struct DGatherPhoton {
 //     covered by definition -- and the gate then fires on nearly every gather and the
 //     correction stops happening. Measured: cap_gyroid -16.9 % stratified against -4.3 %
 //     independent. Do not "improve" this without re-reading the host comment.
-// Host twin probePassesThrough: a surface no photon is ever stored on and light crosses.
-__device__ static bool dProbePassesThrough(const DMaterial& m) {
-    switch (m.type) {
-        case D_DIELECTRIC: case D_FILTER: case D_HALFMIRROR: return true;
-        case D_THINFILM: case D_MULTILAYER: return !dCoatOpaque(m, (Real)550);
-        default: return false;
-    }
-}
-
 __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const DVec3& n,
                                          Real r, DRng& rng, int M, Real fiberR = (Real)0) {
     if (M <= 0 || !(r > (Real)0)) return 1.0;
@@ -5571,17 +5575,21 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
             const DVec3 dn = n * (Real)(-1);
             Real tAcc = (Real)0, curveTmin = (Real)0;
             for (int pass = 0; pass < 16; ++pass) {
-                h = closestHit(sc, o, dn, RAY_EPS, (Real)2 * r - tAcc, false, curveTmin);
+                // Past a strand the curve tmin clears its tube and a surface just behind it must
+                // still be found: tmin 0 then, as every curve-tmin caller does.
+                h = closestHit(sc, o, dn, (curveTmin > (Real)0) ? (Real)0 : RAY_EPS,
+                               (Real)2 * r - tAcc, false, curveTmin);
                 if (!h.valid) break;
                 h.t += tAcc;
                 const DMaterial& hm = sc.mats[h.matId];
-                if (dProbePassesThrough(hm)) {
+                // Only a face above the plane, by more than the relaunch's own tmin skips: one on it
+                // is the surface's height (a glass box standing on the floor) -- host twin.
+                if (dProbePassesThrough(hm) && r - h.t > fmaxf((Real)1e-3 * r, (Real)2 * RAY_EPS)) {
                     tAcc = h.t; o = h.p; curveTmin = (Real)0;
                     continue;
                 }
                 if (hm.type != D_HAIR || !(h.fiberRadius > (Real)0)) break;
-                double op = hm.hairOpacity;
-                if (hm.hairOpacityPat >= 0) op *= (double)clamp01(dPatternScalarAt(sc, hm.hairOpacityPat, h));
+                const double op = dHairOpacityAt(sc, hm, h);
                 if (op >= 1.0 || (double)rng.uniform() < op) break;   // the strand IS here
                 tAcc = h.t; o = h.p; curveTmin = (Real)2.5 * h.fiberRadius;
             }
@@ -6542,7 +6550,9 @@ __global__ void kWfBeamEval(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm,
         double x2 = (double)d2 * (double)b.invRad * (double)b.invRad;
         if (x2 >= 1.0) x2 = 0.999999;   // the candidate passed x2 < 1 in kWfBeamHits; keep it
         DRng rng;
-        rng.seedUnit(((unsigned long long)h.beam << 32) ^ (unsigned long long)(unsigned)hi, sg.seed);
+        // Keyed by the (segment, beam) pair -- a segment meets a beam at one closest point -- and
+        // not by `hi`, a slot the scheduling hands out.
+        rng.seedUnit((unsigned long long)h.beam, sg.seed);
         double oX = 0.0, oY = 0.0, oZ = 0.0;
         dBeamHitEval(sc, bm, b, h.beam, oc, dc, t, s, cosT, den, x2, sg.aGlass, rng,
                      &sg.mw, &sg.tr, env, oX, oY, oZ);
@@ -15465,7 +15475,11 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                         DWfSeg& ws = wq.segs[si];
                         ws.o = sg.o; ws.d = sg.d; ws.tMax = sg.tMax; ws.beta = sg.beta; ws.aGlass = sg.aGlass;
                         ws.mw = mw; ws.tr = camTr; ws.px = px; ws.py = py; ws.lambda = (float)lambda;
-                        ws.seed = (unsigned long long)gidx * 1315423911ull + (unsigned long long)i * 2654435761ull;
+                        // The segment's own stream: its sample and its index along the walk, under
+                        // the kernel's seed (which carries -seed), so it is the same however the
+                        // queue's slots were handed out.
+                        ws.seed = ((unsigned long long)gidx * 1315423911ull + (unsigned long long)i * 2654435761ull)
+                                  ^ seedBase;
                         queued = true;
                     } else {
                         atomicAdd(&wq.overflow[0], 1);
@@ -15898,38 +15912,35 @@ struct DSpecThr {
     // Fold in a factor already evaluated ON the grid plus its value at the camera's wavelength --
     // the media term, whose per-wavelength values come from one shared walk rather than from a
     // function that can be called per bin.
-    // A weight zero in some bins is a partial support, as a coin's is (host twin SpecThr::mul).
-    __device__ void mulVec(const DScene& sc, const double* vk, double atCam) {
+    // `support`: whether a zero in `vk` is a hole in the support, as a zero weight in mul is (a
+    // fiber's deterministic per-bin weight, host twin SpecThr::mul) -- not for the media term, a
+    // ratio-tracking estimate whose zeros are one realization's (host twin SpecThr::mulVec).
+    __device__ void mulVec(const DScene& sc, const double* vk, double atCam, bool support) {
         cam *= atCam;
         bool zero = false;
         for (int k = 0; k < K; ++k) {
             if (!any && fabs(vk[k] - vk[0]) > 1e-12 * (1.0 + fabs(vk[0]))) any = 1;
             v[k] *= vk[k];
-            if (!(vk[k] > 0.0)) { p[k] = 0.0f; zero = true; }
+            if (support && !(vk[k] > 0.0)) { p[k] = 0.0f; zero = true; }
         }
         if (zero) { partial = 1; rescale(sc); }
     }
-    // Fold in one spectral factor, f(lambda), with `atCam` its value at the camera's wavelength --
-    // passed in rather than recomputed, so the ratio's denominator is exactly the factor sitting
-    // inside `thr`. Probes three wavelengths first: a factor that agrees at all three is folded as a
-    // constant (it cancels in the ratio regardless), so every uncoloured one costs three lookups
-    // instead of K (host twin: SpecThr::mul).
+    // Fold in one spectral factor, f(lambda), at every bin (host twin SpecThr::mul, where the
+    // reasoning lives), with `atCam` its value at the camera's wavelength -- passed in rather than
+    // recomputed, so the ratio's denominator is exactly the factor sitting inside `thr`.
     template <class F> __device__ void mul(const DScene& sc, const F& f, double atCam) {
         cam *= atCam;
-        const double a = f(lamOf(0)), b = f(lamOf(K / 2)), c = f(lamOf(K - 1));
-        const double tol = 1e-12 * (1.0 + fabs(a));
-        if (fabs(a - b) <= tol && fabs(a - c) <= tol) {
-            for (int k = 0; k < K; ++k) v[k] *= a;
-            return;
-        }
-        any = 1;
-        bool zero = false;
+        double a = 0.0;
+        bool flat = true, zero = false;
         for (int k = 0; k < K; ++k) {
             const double fk = f(lamOf(k));
+            if (k == 0) a = fk;
+            else if (fabs(fk - a) > 1e-12 * (1.0 + fabs(a))) flat = false;
             v[k] *= fk;
             if (!(fk > 0.0)) { p[k] = 0.0f; zero = true; }
         }
-        if (zero) { partial = 1; rescale(sc); }     // a weight zero in some bins: see mulVec
+        if (!flat) any = 1;
+        if (zero) { partial = 1; rescale(sc); }     // a weight zero in some bins: a support hole
     }
     // Fold in a coin (host twin SpecThr::mulCoin): f(L, prob) the branch's factor at L, its
     // probability alone in `prob`; the same at the walk's wavelength passed in. Without
@@ -16127,10 +16138,18 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                         double Tv[DSpecThr::K + 1];
                         dCamMediaTrSpec(sc, pro, rd, slen, lambda, rng, Tv);
                         thr *= Tv[DSpecThr::K];
-                        sthr.mulVec(sc, Tv, Tv[DSpecThr::K]);
+                        sthr.mulVec(sc, Tv, Tv[DSpecThr::K], false);
                     }
                 }
-                if (aGlass > 0.0) thr *= exp(-aGlass * (double)gm.arc);
+                // Coloured glass is spectral (SPECGATHER), whatever it absorbs at the walk's own
+                // wavelength: a glass clear there may absorb at a photon's (host twin).
+                if (cmIdx >= 0) {
+                    const double arc = (double)gm.arc;
+                    thr *= exp(-aGlass * arc);
+                    sthr.mul(sc, [&](Real L) {
+                        return exp(-(double)specLookup(sc.mats[cmIdx].absorb, L) * arc);
+                    }, exp(-aGlass * arc));
+                }
             }
             if (thr <= 0.0) return;
         }
@@ -16153,12 +16172,16 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 double Tv[DSpecThr::K + 1];
                 dCamMediaTrSpec(sc, ro, rd, dSeg, lambda, rng, Tv);
                 thr *= Tv[DSpecThr::K];
-                sthr.mulVec(sc, Tv, Tv[DSpecThr::K]);
+                sthr.mulVec(sc, Tv, Tv[DSpecThr::K], false);
             }
             if (thr <= 0.0) return;
         }
-        if (h.valid) {                                   // Beer-Lambert in current medium
-            if (aGlass > 0.0) thr *= exp(-aGlass * (double)h.t);
+        if (h.valid && cmIdx >= 0) {                     // Beer-Lambert in current medium
+            const double tt = (double)h.t;               // (spectral: see the march above)
+            thr *= exp(-aGlass * tt);
+            sthr.mul(sc, [&](Real L) {
+                return exp(-(double)specLookup(sc.mats[cmIdx].absorb, L) * tt);
+            }, exp(-aGlass * tt));
         }
         if (!h.valid) {                                  // escaped -> environment
             // Direct env term on gather-ray escape (mirrors photonGather, fgRays==0). The
@@ -16282,9 +16305,6 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 gy += rho * ph.pY;
                 gz += rho * ph.pZ;
             });
-            // Caustic map: same estimator, its own PER-QUERY radius, summed in (see the
-            // header comment and dPmAdaptiveRadius). The area ratio r^2/r_q^2 corrects the
-            // fixed-radius normalisation already folded into pX/pY/pZ.
             // M-GATHERAREA, the MAIN map's coverage, on the main map's sum alone -- before the
             // caustic map's is added, which takes its own coverage below (host twin: each `est`
             // scales its own map). The device folds norm/pi into every photon record at upload
@@ -16297,6 +16317,9 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 gy = (float)((double)gy * ms);
                 gz = (float)((double)gz * ms);
             }
+            // Caustic map: same estimator, its own PER-QUERY radius, summed in (see the
+            // header comment and dPmAdaptiveRadius). The area ratio r^2/r_q^2 corrects the
+            // fixed-radius normalisation already folded into pX/pY/pZ.
             if (causOn) {
                 const Real rq  = dPmAdaptiveRadius(pmC, h.p, h.n);
                 const Real r2q = rq * rq;
@@ -16455,7 +16478,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                         const double w = dHairFoldFCos(la, hsv, spk, wl, cosLong, nullptr) / pdfH;
                         vk[k] = w < 0.0 ? 0.0 : (w > 1.0 ? 1.0 : w);
                     }
-                    sthr.mulVec(sc, vk, wCam);
+                    sthr.mulVec(sc, vk, wCam, true);
                 }
                 const DVec3 wOut = dhair::toWorld(hsv.fr, wl);
                 // Clear the strand by skipping curves within its exit distance on the next
@@ -23562,12 +23585,22 @@ void vcmSessionPass(VcmSession* s, double radius) {
             thrust::device_pointer_cast(s->d_lvCompact + nLV),
             LvToBboxF{}, BboxF{FLT_MAX, FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX},
             BboxMergeF{});
-        gLo = DVec3(bb.mnx - cell * 0.5, bb.mny - cell * 0.5, bb.mnz - cell * 0.5);
-        DVec3 ext(bb.mxx - gLo.x + cell * 0.5, bb.mxy - gLo.y + cell * 0.5, bb.mxz - gLo.z + cell * 0.5);
-        gnx = std::max(1, (int)std::ceil(ext.x / cell));
-        gny = std::max(1, (int)std::ceil(ext.y / cell));
-        gnz = std::max(1, (int)std::ceil(ext.z / cell));
-        const long long nCells = (long long)gnx * gny * gnz;
+        // The dense cell table grows as (extent / radius)^3 while the radius shrinks pass by
+        // pass. Past kMaxCells (256 MB of ints, and int-indexed) the cells grow instead: the
+        // camera's 3x3x3 lookup tests distance against the radius, not the cell, so a cell
+        // bigger than the radius only adds candidates.
+        const long long kMaxCells = 1LL << 26;
+        long long nCells = 0;
+        for (int grow = 0; grow < 8; ++grow) {
+            gLo = DVec3(bb.mnx - cell * 0.5, bb.mny - cell * 0.5, bb.mnz - cell * 0.5);
+            DVec3 ext(bb.mxx - gLo.x + cell * 0.5, bb.mxy - gLo.y + cell * 0.5, bb.mxz - gLo.z + cell * 0.5);
+            gnx = std::max(1, (int)std::ceil(std::min((double)ext.x / cell, 2e6)));
+            gny = std::max(1, (int)std::ceil(std::min((double)ext.y / cell, 2e6)));
+            gnz = std::max(1, (int)std::ceil(std::min((double)ext.z / cell, 2e6)));
+            nCells = (long long)gnx * gny * gnz;
+            if (nCells <= kMaxCells) break;
+            cell *= std::cbrt((double)nCells / (double)kMaxCells) * 1.01;
+        }
         ensureDevCap(s->d_cellKey, s->cellKeyCap, nLV);
         ensureDevCap(s->d_order,   s->orderCap,   nLV);
         kVcmCellKey<<<2048, 128>>>(s->d_lvCompact, (int)nLV, gLo, cell, gnx, gny, gnz,

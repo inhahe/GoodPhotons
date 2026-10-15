@@ -35,13 +35,19 @@ walk at every photon's wavelength, which a walk can do only for branches its own
   * a red gel filter, transmitting nothing below 595 nm, between the camera and a lit white wall:
     a weight, not a coin, but a walk drawn where it is zero carries nothing at any wavelength, the
     same support problem -- until 0.381.4 red behind it read at the share of walk wavelengths
-    above 595 nm.
-  All three put their spectral edge on a boundary of mode M's 24 carrier bins (595 nm: 360 +
+    above 595 nm; and a green band-pass gel (0 below 440 and above 600 nm, 0.9 from 500 to 560, linear
+    between): zero at all three wavelengths mode M's carrier once probed for flatness, so until
+    0.381.7 it folded as a flat zero and the wall behind it rendered black. Its edges are ramps over
+    several carrier bins, which both backends' spectral tables hold exactly (the device's are 5 nm
+    apart and interpolated, so a step reaches it as a 5 nm ramp, wherever it falls); their kinks
+    sit inside carrier bins, which leaves about 8 % in blue (SPECGATHER-BIN-RESOLUTION), so this
+    pair allows 10 %.
+  The others put their spectral edges on a boundary of mode M's 24 carrier bins (595 nm: 360 +
   12 x 470 / 24). The carrier takes each factor at its bin's centre for every photon in the bin
   (known-issues SPECGATHER-BIN-RESOLUTION); an edge inside a bin is another error, and this check
   is about the coins.
 A tile fails when the two differ by more than 5 standard errors (two seeds each) AND by more
-than 5 %. Exits 1 on any failure.
+than 5 % (10 % for the green gel, above). Exits 1 on any failure.
 """
 import argparse
 import os
@@ -117,6 +123,12 @@ FILTER = [
 ]
 
 
+GREEN_GEL = [ln.replace('material "redgel" { type filter  transmit table { 380:0 594.99:0 595.01:0.9 780:0.9 } }',
+                        'material "redgel" { type filter  transmit table { 380:0 440:0 500:0.9 '
+                        '560:0.9 600:0 780:0 } }') for ln in FILTER]
+assert GREEN_GEL != FILTER
+
+
 HALF_MIRROR = [
     'camera "c" { eye 0 0.6 -2.5  look_at 0 0.6 0  up 0 1 0  fov_y 30  film { res 64 48 } }',
     'material "white" { type diffuse  reflect 0.7 }',
@@ -145,7 +157,8 @@ def main():
     for pri in (1, 2):
         with open(os.path.join(d, "opaque_p%d.ftsl" % pri), "w", encoding="utf-8", newline="") as f:
             f.write(NL.join(opaque_tank(pri)) + NL)
-    for name, lines in (("partial", partial_tank()), ("halfmirror", HALF_MIRROR), ("filter", FILTER)):
+    for name, lines in (("partial", partial_tank()), ("halfmirror", HALF_MIRROR), ("filter", FILTER),
+                        ("greengel", GREEN_GEL)):
         with open(os.path.join(d, name + ".ftsl"), "w", encoding="utf-8", newline="") as f:
             f.write(NL.join(lines) + NL)
 
@@ -175,21 +188,27 @@ def main():
                                ["-mode", mode], dev, a.spp) for pri in (1, 2)]
         pairs.append(("opaque coat in water, mode %s%s: ranked below / above the water" % (
             mode, " (device)" if dev == "gpu" else ""), lo, hi))
-    for name, what, ref in (
+    # The green gel's ramps put kinks inside carrier bins, which the 24-bin carrier resolves to
+    # about 8 % in blue (known-issues SPECGATHER-BIN-RESOLUTION); what the pair guards is the band
+    # being seen at all (x0.27 / x5 without it), so it allows 10 %.
+    for name, what, ref, tol in (
             ("partial", "coat opaque in the red only, in water",
-             (["-mode", "R"], "cpu", 1024) if a.no_gpu else (["-mode", "R"], "gpu", 8192)),
-            ("halfmirror", "half mirror reflecting red", (["-mode", "R"], "cpu", a.spp)),
-            ("filter", "red gel filter", (["-mode", "R"], "cpu", a.spp))):
+             (["-mode", "R"], "cpu", 1024) if a.no_gpu else (["-mode", "R"], "gpu", 8192), 0.05),
+            ("halfmirror", "half mirror reflecting red", (["-mode", "R"], "cpu", a.spp), 0.05),
+            ("filter", "red gel filter", (["-mode", "R"], "cpu", a.spp), 0.05),
+            ("greengel", "green band-pass gel", (["-mode", "R"], "cpu", a.spp), 0.10)):
         rr = render_seeds(a.exe, d, name + ".ftsl", name + "_R", ref[0], ref[1], ref[2], rgb=True)
         for dev in devs:
             mm = render_seeds(a.exe, d, name + ".ftsl", name + "_M" + ("g" if dev == "gpu" else ""),
                               modeM, dev, a.spp, rgb=True)
             pairs += [("%s, mode M%s / mode R, channel %d" % (
                 what, " (device)" if dev == "gpu" else "", c), [x[..., c] for x in mm],
-                [x[..., c] for x in rr]) for c in range(3)]
+                [x[..., c] for x in rr], tol) for c in range(3)]
     ok = True
-    for name, x1, x0 in pairs:
-        ratio, z, bad = tile_verdict(tile_stats(*x1), tile_stats(*x0), 0.05)
+    for pair in pairs:
+        name, x1, x0 = pair[:3]
+        tol = pair[3] if len(pair) > 3 else 0.05
+        ratio, z, bad = tile_verdict(tile_stats(*x1), tile_stats(*x0), tol)
         good = not bad.any()
         ok &= good
         print("%s: %s; worst tile x%.4f (%.1f sigma)" % (
