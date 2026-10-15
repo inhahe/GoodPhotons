@@ -10924,34 +10924,44 @@ __device__ static DVec3 dFireCellPoint(const DEmissiveVolume& v, double u0, doub
 
 // The cone half of the light-sampling mixture: its solid-angle density for direction `d` from `x`,
 // and the sampler (host twins: fireConePdf, fireConeSample).
-__device__ static double dFireConePdf(const DEmissiveVolume& v, const DVec3& x, const DVec3& d) {
-    const double cx = 0.5 * ((double)v.bmin.x + v.bmax.x) - x.x, cy = 0.5 * ((double)v.bmin.y + v.bmax.y) - x.y,
-                 cz = 0.5 * ((double)v.bmin.z + v.bmax.z) - x.z;
+// The cone of directions from `x` that holds the fire box's bounding sphere (host twin fireCone),
+// in double: `c` from x to the box's centre, `d2` its squared length, the half angle as `cosMax`
+// and `oneMinusCos`; `inside` when x is in the sphere and every direction is in the cone.
+struct DFireCone { double cx, cy, cz, d2, cosMax, oneMinusCos; bool inside; };
+__device__ static DFireCone dFireCone(const DEmissiveVolume& v, const DVec3& x) {
+    DFireCone c;
+    c.cx = 0.5 * ((double)v.bmin.x + v.bmax.x) - x.x;
+    c.cy = 0.5 * ((double)v.bmin.y + v.bmax.y) - x.y;
+    c.cz = 0.5 * ((double)v.bmin.z + v.bmax.z) - x.z;
     const double ex = (double)v.bmax.x - v.bmin.x, ey = (double)v.bmax.y - v.bmin.y,
                  ez = (double)v.bmax.z - v.bmin.z;
-    const double R2 = (ex * ex + ey * ey + ez * ez) * 0.25, d2 = cx * cx + cy * cy + cz * cz;
-    if (d2 <= R2) return 1.0 / (4.0 * DPI);
-    const double s2 = R2 / d2, cosMax = sqrt(1.0 - s2);
-    if (d.x * cx + d.y * cy + d.z * cz < cosMax * sqrt(d2)) return 0.0;
-    return 1.0 / (2.0 * DPI * (s2 / (1.0 + cosMax)));
+    const double R2 = (ex * ex + ey * ey + ez * ez) * 0.25;
+    c.d2 = c.cx * c.cx + c.cy * c.cy + c.cz * c.cz;
+    c.inside = c.d2 <= R2;
+    if (c.inside) { c.cosMax = -1.0; c.oneMinusCos = 2.0; return c; }
+    const double s2 = R2 / c.d2;
+    c.cosMax = sqrt(1.0 - s2);
+    c.oneMinusCos = s2 / (1.0 + c.cosMax);
+    return c;
+}
+__device__ static double dFireConePdf(const DEmissiveVolume& v, const DVec3& x, const DVec3& d) {
+    const DFireCone c = dFireCone(v, x);
+    if (c.inside) return 1.0 / (4.0 * DPI);
+    if (d.x * c.cx + d.y * c.cy + d.z * c.cz < c.cosMax * sqrt(c.d2)) return 0.0;
+    return 1.0 / (2.0 * DPI * c.oneMinusCos);
 }
 __device__ static DVec3 dFireConeSample(const DEmissiveVolume& v, const DVec3& x, double u1,
                                         double u2) {
-    const double cx = 0.5 * ((double)v.bmin.x + v.bmax.x) - x.x, cy = 0.5 * ((double)v.bmin.y + v.bmax.y) - x.y,
-                 cz = 0.5 * ((double)v.bmin.z + v.bmax.z) - x.z;
-    const double ex = (double)v.bmax.x - v.bmin.x, ey = (double)v.bmax.y - v.bmin.y,
-                 ez = (double)v.bmax.z - v.bmin.z;
-    const double R2 = (ex * ex + ey * ey + ez * ez) * 0.25, d2 = cx * cx + cy * cy + cz * cz;
+    const DFireCone c = dFireCone(v, x);
     const double phi = 2.0 * DPI * u2;
-    if (d2 <= R2) {                                      // inside: uniform over the sphere
+    if (c.inside) {                                      // inside: uniform over the sphere
         const double z = 1.0 - 2.0 * u1, r = sqrt(fmax(0.0, 1.0 - z * z));
         return DVec3((Real)(r * cos(phi)), (Real)(r * sin(phi)), (Real)z);
     }
-    const double s2 = R2 / d2, oneMinusCos = s2 / (1.0 + sqrt(1.0 - s2));
-    const double om = u1 * oneMinusCos;                  // 1 - cos(theta), uniform
+    const double om = u1 * c.oneMinusCos;                // 1 - cos(theta), uniform
     const double cosT = 1.0 - om, sinT = sqrt(fmax(0.0, om * (2.0 - om)));
-    const double il = 1.0 / sqrt(d2);
-    const DVec3 a((Real)(cx * il), (Real)(cy * il), (Real)(cz * il));
+    const double il = 1.0 / sqrt(c.d2);
+    const DVec3 a((Real)(c.cx * il), (Real)(c.cy * il), (Real)(c.cz * il));
     DVec3 t, b; onb(a, t, b);
     return normalize(a * (Real)cosT + t * (Real)(sinT * cos(phi)) + b * (Real)(sinT * sin(phi)));
 }
@@ -11518,7 +11528,7 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
                      Real cosSurf, stG;
                      if (hs) {
                          if (!bkHairResponse(*hs, wi, cosSurf, stG)) return false;
-                         pdfB = dhair::pdf(hs->b, hs->woLocal, dhair::toLocal(hs->fr, wi));
+                         pdfB = 0.0;   // read only at a glossy vertex (mis): no fiber caller is one
                          ro = dOffsetPoint(h.p, wi);
                          ctmin = (double)dHairExitOffset(*hs, h.n, wi);
                      } else {
@@ -11526,7 +11536,7 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
                          if (cosSurf <= (Real)0) return false;
                          stG = dShadowTerminatorG(wi, h.n, ngo0);
                          if (stG <= (Real)0) return false;
-                         pdfB = nb ? dGlossyPdfHit(sc, *nb->m, h, nb->wo, wi) : (double)cosSurf / DPI;
+                         pdfB = nb ? dGlossyPdfHit(sc, *nb->m, h, nb->wo, wi) : 0.0;   // see above
                          ro = dOffsetAlong(h.p, h.ng, wi);
                          ctmin = 0.0;
                      }
@@ -15856,19 +15866,23 @@ struct DSpecThr {
     // Fold in a factor already evaluated ON the grid plus its value at the camera's wavelength --
     // the media term, whose per-wavelength values come from one shared walk rather than from a
     // function that can be called per bin.
-    __device__ void mulVec(const double* vk, double atCam) {
+    // A weight zero in some bins is a partial support, as a coin's is (host twin SpecThr::mul).
+    __device__ void mulVec(const DScene& sc, const double* vk, double atCam) {
         cam *= atCam;
+        bool zero = false;
         for (int k = 0; k < K; ++k) {
             if (!any && fabs(vk[k] - vk[0]) > 1e-12 * (1.0 + fabs(vk[0]))) any = 1;
             v[k] *= vk[k];
+            if (!(vk[k] > 0.0)) { p[k] = 0.0f; zero = true; }
         }
+        if (zero) { partial = 1; rescale(sc); }
     }
     // Fold in one spectral factor, f(lambda), with `atCam` its value at the camera's wavelength --
     // passed in rather than recomputed, so the ratio's denominator is exactly the factor sitting
     // inside `thr`. Probes three wavelengths first: a factor that agrees at all three is folded as a
     // constant (it cancels in the ratio regardless), so every uncoloured one costs three lookups
     // instead of K (host twin: SpecThr::mul).
-    template <class F> __device__ void mul(const F& f, double atCam) {
+    template <class F> __device__ void mul(const DScene& sc, const F& f, double atCam) {
         cam *= atCam;
         const double a = f(lamOf(0)), b = f(lamOf(K / 2)), c = f(lamOf(K - 1));
         const double tol = 1e-12 * (1.0 + fabs(a));
@@ -15877,12 +15891,17 @@ struct DSpecThr {
             return;
         }
         any = 1;
-        for (int k = 0; k < K; ++k) v[k] *= f(lamOf(k));
+        bool zero = false;
+        for (int k = 0; k < K; ++k) {
+            const double fk = f(lamOf(k));
+            v[k] *= fk;
+            if (!(fk > 0.0)) { p[k] = 0.0f; zero = true; }
+        }
+        if (zero) { partial = 1; rescale(sc); }     // a weight zero in some bins: see mulVec
     }
     // Fold in a coin (host twin SpecThr::mulCoin): f(L, prob) the branch's factor at L, its
     // probability alone in `prob`; the same at the walk's wavelength passed in. Without
-    // `exhaustive`, mul's probe; with it every bin is asked first and a coin flat in all of them
-    // is skipped.
+    // `exhaustive`, mul's probe; with it every bin, once.
     template <class F> __device__ void mulCoin(const DScene& sc, const F& f, double factorAtCam,
                                                double probAtCam, bool exhaustive) {
         double pr;
@@ -15894,30 +15913,32 @@ struct DSpecThr {
                 for (int k = 0; k < K; ++k) v[k] *= a;
                 return;
             }
-        } else {
-            const double a = f(lamOf(0), pr);
-            const double tol = 1e-12 * (1.0 + fabs(a));
-            int k = 1;
-            while (k < K && fabs(f(lamOf(k), pr) - a) <= tol) ++k;
-            if (k == K) return;
         }
+        // Every bin, once; a coin flat over them and at the walk's wavelength leaves `any` alone.
         cam *= factorAtCam;
         pcam *= probAtCam;
-        any = 1;
+        double a = 0.0;
+        bool flat = true;
         for (int k = 0; k < K; ++k) {
-            v[k] *= f(lamOf(k), pr);
+            const double fk = f(lamOf(k), pr);
+            if (k == 0) a = fk;
+            else if (fabs(fk - a) > 1e-12 * (1.0 + fabs(a))) flat = false;
+            v[k] *= fk;
             p[k] *= (float)pr;
             if (!(pr > 0.0)) partial = 1;
         }
-        if (partial) {
-            double D = 0.0;
-            for (int k = 0; k < K; ++k) {
-                const double lo = DLMIN + k * (DLMAX - DLMIN) / (double)K;
-                const double hi = DLMIN + (k + 1) * (DLMAX - DLMIN) / (double)K;
-                D += (dEmitCdfAt(sc, hi) - dEmitCdfAt(sc, lo)) * (double)p[k];
-            }
-            pscale = (D > 0.0) ? pcam / D : 1.0;
+        if (!flat || fabs(factorAtCam - a) > 1e-12 * (1.0 + fabs(a))) any = 1;
+        if (partial) rescale(sc);
+    }
+    // pscale = pcam / sum_k Q_k p[k] (host twin SpecThr::rescale).
+    __device__ void rescale(const DScene& sc) {
+        double D = 0.0;
+        for (int k = 0; k < K; ++k) {
+            const double lo = DLMIN + k * (DLMAX - DLMIN) / (double)K;
+            const double hi = DLMIN + (k + 1) * (DLMAX - DLMIN) / (double)K;
+            D += (dEmitCdfAt(sc, hi) - dEmitCdfAt(sc, lo)) * (double)p[k];
         }
+        pscale = (D > 0.0) ? pcam / D : 1.0;
     }
     __device__ double ratio(Real lamP) const {
         if (!any) return 1.0;
@@ -15928,7 +15949,7 @@ struct DSpecThr {
 // A material's reflect or transmit slot, folded into the carrier (DSpecThr::mul).
 __device__ static void dSpecFold(DSpecThr& st, const DScene& sc, const DMaterial& m, const DHit& h,
                                  double atCam, bool transmit) {
-    st.mul([&](Real L) {
+    st.mul(sc, [&](Real L) {
         return transmit ? (double)clamp01(dTransmitSlot(sc, m, h, L))
                         : (double)clamp01(dReflectSlot(sc, m, h, L));
     }, atCam);
@@ -16074,7 +16095,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                         double Tv[DSpecThr::K + 1];
                         dCamMediaTrSpec(sc, pro, rd, slen, lambda, rng, Tv);
                         thr *= Tv[DSpecThr::K];
-                        sthr.mulVec(Tv, Tv[DSpecThr::K]);
+                        sthr.mulVec(sc, Tv, Tv[DSpecThr::K]);
                     }
                 }
                 if (aGlass > 0.0) thr *= exp(-aGlass * (double)gm.arc);
@@ -16100,7 +16121,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 double Tv[DSpecThr::K + 1];
                 dCamMediaTrSpec(sc, ro, rd, dSeg, lambda, rng, Tv);
                 thr *= Tv[DSpecThr::K];
-                sthr.mulVec(Tv, Tv[DSpecThr::K]);
+                sthr.mulVec(sc, Tv, Tv[DSpecThr::K]);
             }
             if (thr <= 0.0) return;
         }
@@ -16402,7 +16423,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                         const double w = dHairFoldFCos(la, hsv, spk, wl, cosLong, nullptr) / pdfH;
                         vk[k] = w < 0.0 ? 0.0 : (w > 1.0 ? 1.0 : w);
                     }
-                    sthr.mulVec(vk, wCam);
+                    sthr.mulVec(sc, vk, wCam);
                 }
                 const DVec3 wOut = dhair::toWorld(hsv.fr, wl);
                 // Clear the strand by skipping curves within its exit distance on the next
@@ -23305,7 +23326,9 @@ struct VcmSession {
     double* d_invLam  = nullptr;       // nLight*heroC (invPdfLambda; [i*C]<=0 marks "no wavelength")
     int*    d_pathBegin = nullptr;     // nLight (device-scanned per-pass)
     int*    d_pathEnd   = nullptr;     // nLight
-    // Grow-only device scratch for the on-device compaction + grid build (no per-pass malloc):
+    // Device scratch for the on-device compaction + grid build. The vertex-sized ones are allocated
+    // in Begin at the most a pass can need (nLight * vcmCap), so ensureDevCap never grows them;
+    // the cell table and the thrust arena grow with the grid:
     gpu::DVcmLV* d_lvCompact = nullptr; size_t lvCompactCap = 0;
     gpu::DVcmSec* d_lvSecCompact = nullptr; size_t lvSecCompactCap = 0;
     int*    d_cellKey   = nullptr;      size_t cellKeyCap = 0;
@@ -23361,6 +23384,10 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
             budget = std::min(std::max(totalB / 8, budget), freeB / 2);
         else
             cudaGetLastError();
+        // FTRACE_VCM_BUDGET_MB caps it, so a check can make a frame overflow on any card
+        // (tools/check_vcm_store.py).
+        if (const char* e = std::getenv("FTRACE_VCM_BUDGET_MB"))
+            if (std::atoll(e) > 0) budget = std::min(budget, (size_t)std::atoll(e) << 20);
     }
     const size_t perPath = (size_t)s->vcmCap *
         (2 * sizeof(gpu::DVcmLV) + 2 * (size_t)s->secStride * sizeof(gpu::DVcmSec) + 2 * sizeof(int));
@@ -23387,14 +23414,28 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
             tryAlloc(&s->d_lamBuf, nl * (size_t)C * sizeof(gpu::Real)) &&
             tryAlloc(&s->d_invLam, nl * (size_t)C * sizeof(double)) &&
             tryAlloc(&s->d_pathBegin, nl * sizeof(int)) &&
-            tryAlloc(&s->d_pathEnd, nl * sizeof(int)))
+            tryAlloc(&s->d_pathEnd, nl * sizeof(int)) &&
+            // ...and the pass's compact copy and grid keys at the most a pass can need (every
+            // subpath storing every vertex), so no pass allocates them and none can fail to.
+            tryAlloc(&s->d_lvCompact, lv * sizeof(gpu::DVcmLV)) &&
+            (s->secStride == 0 ||
+             tryAlloc(&s->d_lvSecCompact, lv * (size_t)s->secStride * sizeof(gpu::DVcmSec))) &&
+            tryAlloc(&s->d_cellKey, lv * sizeof(int)) &&
+            tryAlloc(&s->d_order, lv * sizeof(int))) {
+            s->lvCompactCap = lv;
+            s->lvSecCompactCap = lv * (size_t)s->secStride;
+            s->cellKeyCap = s->orderCap = lv;
             break;
+        }
         for (void* q : {(void*)s->d_lvSlab, (void*)s->d_lvSecSlab, (void*)s->d_lvCount,
                         (void*)s->d_lamBuf, (void*)s->d_invLam, (void*)s->d_pathBegin,
-                        (void*)s->d_pathEnd})
+                        (void*)s->d_pathEnd, (void*)s->d_lvCompact, (void*)s->d_lvSecCompact,
+                        (void*)s->d_cellKey, (void*)s->d_order})
             cudaFree(q);
         s->d_lvSlab = nullptr; s->d_lvSecSlab = nullptr; s->d_lvCount = nullptr;
         s->d_lamBuf = nullptr; s->d_invLam = nullptr; s->d_pathBegin = nullptr; s->d_pathEnd = nullptr;
+        s->d_lvCompact = nullptr; s->d_lvSecCompact = nullptr; s->d_cellKey = nullptr;
+        s->d_order = nullptr;
         if (nl == 1) {
             std::fprintf(stderr, "[mode U] no room on the GPU for the light-vertex store\n");
             vcmSessionEnd(s);
@@ -23405,8 +23446,8 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
     s->nLight = nl;
     if (nl < np)
         std::printf("[mode U] %zu light subpaths a pass for %zu pixels (light-vertex store "
-                    "budget %zu MB at %dx%d, %d vertices a subpath)\n",
-                    nl, np, budget >> 20, resX, resY, s->vcmCap);
+                    "%zu MB of a %zu MB budget at %dx%d, %d vertices a subpath)\n",
+                    nl, np, (nl * perPath) >> 20, budget >> 20, resX, resY, s->vcmCap);
     CUDA_CHECK(cudaMemset(s->d_accum, 0, np * 3 * sizeof(double)));
     return s;
 }

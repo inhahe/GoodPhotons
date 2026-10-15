@@ -13478,6 +13478,20 @@ static void warnWhittedDeHeroSpp(const Scene& scene, long long spp) {
                 spp, why, spp, spp == 1 ? "" : "s", kWhittedDeHeroSpp);
 }
 
+// Batch mode W only, like the warning above, for the other thing one pass cannot settle: a
+// participating medium (a fire is one) -- mode W draws its free flights, and a fire's light
+// sampling, at random. That is grain, which averages down per pixel, not a cast, so a note.
+static void noteWhittedMediaSpp(const Scene& scene, long long spp) {
+    if (scene.media.empty() || spp >= kWhittedDeHeroSpp) return;
+    bool fire = false;
+    for (const Medium& m : scene.media) if (m.emissive()) { fire = true; break; }
+    std::printf("[mode W] note: -spp %lld with %s -- mode W samples %s at random, so the image "
+                "is grainy at low spp and converges with more (try -spp %d or more)\n",
+                spp, fire ? "a fire" : "a participating medium",
+                fire ? "a fire's light and a medium's free flights" : "a medium's free flights",
+                kWhittedDeHeroSpp);
+}
+
 // PHOTON-BEAMS gather for the shared multi-camera forward pass (CLI -beams). When set,
 // the shared A/B pass has each camera resample its own medium in-scatter point per beam
 // segment, so a volumetric FLYBY (rainbow/fogbow/fog) gets independent per-frame noise
@@ -20649,7 +20663,7 @@ static int run(int argc, char** argv) {
     // Same "only a real batch render" gate, for the OTHER way mode W stops being exact at
     // low spp: a de-hero'd path plus a pixel-shared wavelength lattice = a global colour
     // cast. See warnWhittedDeHeroSpp for the measurement this threshold comes from.
-    if (g_whitted && !wPreview) warnWhittedDeHeroSpp(scene, spp);
+    if (g_whitted && !wPreview) { warnWhittedDeHeroSpp(scene, spp); noteWhittedMediaSpp(scene, spp); }
     // Kept out of the chain above: rejecting -gi is independent of whether the run is
     // also direct-only, and folding it in would swallow that notice when both are given.
     // Mode R already carries real multi-bounce GI; the gather is mode W's substitute for
@@ -22902,7 +22916,9 @@ static int run(int argc, char** argv) {
             // the unfinished refinement, so they run only while you hold still, and each is
             // shown as it lands.
             const int kWSppCap = kWhittedDeHeroSpp;
-            bool wNeedSpp = whittedDeHeroes(scene) != nullptr;
+            // A medium needs the passes too, de-heroed or not: mode W draws its free flights from
+            // the rng, so one pass of fog is a scatter-or-not salt and pepper, not the answer.
+            bool wNeedSpp = whittedDeHeroes(scene) != nullptr || !scene.media.empty();
             // Rough GLOSSY is deliberately NOT on that list, even though its lobe is likewise
             // resolved across samples (whittedGlossyDir) rather than within one. The difference
             // is what a single pass looks like: a de-hero'd dielectric is flatly WRONG (a green

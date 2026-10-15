@@ -11,7 +11,8 @@ the same view at 160x160. Since 0.379.3 a pass that would not fit traces fewer l
 instead, each shared by several camera paths, and stores all of their vertices.
 
 This renders check_bdpt_depth's box (diffuse walls, a ceiling-sized lamp) at -max-bounce 8 on the
-GPU at 160x160 (one light subpath per pixel) and at 1600x1600 (past the budget), four seeds each,
+GPU, with the store's budget held at 512 MB (FTRACE_VCM_BUDGET_MB), at 160x160 (one light subpath
+per pixel) and at 1600x1600 (past the budget), four seeds each,
 with the merge radius held at its start (-vcmalpha 1: the two run different numbers of passes, and
 a shrinking radius would leave them different merge biases), and requires the frame means to
 agree: it fails when they differ by more than 5 standard errors (from the seed-to-seed spread of
@@ -42,6 +43,10 @@ def main():
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "box.ftsl"), "w", encoding="utf-8", newline="") as f:
         f.write(NL.join(BOX) + NL)
+    # A 512 MB store, whatever the card: 160x160 fits in it (~75 MB) and 1600x1600 (~7 GB) does
+    # not, so the check exercises the pairing on any GPU.
+    env = dict(os.environ)
+    env["FTRACE_VCM_BUDGET_MB"] = "512"
     res = {}
     for r, spp in ((160, 256), (1600, 4)):
         means = []
@@ -55,7 +60,7 @@ def main():
                                 "-spp", str(spp),
                                 "-seed", str(seed), "-hdr", "-no-meter", "-o", png],
                                cwd=d, capture_output=True, text=True, encoding="utf-8",
-                               errors="replace")
+                               errors="replace", env=env)
             log = p.stdout + p.stderr
             if p.returncode != 0 or not os.path.exists(pfm):
                 print(log[-1500:])

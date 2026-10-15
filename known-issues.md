@@ -144,11 +144,46 @@ branch's averaged probability misses the clear half of bin 9's walk density (blu
 ball reads high, x1.15) and the reflection's counts it (the coat's reflection, green here, reads
 low, x0.76). The 555-585 nm ramp's green excess is not yet explained.
 `check_coat_modes` puts its edges on a bin boundary (595 nm) so it tests the coins and not this.
+A coin or weight that changes only INSIDE one bin (a reflectance band narrower than a bin, missing
+every centre) is the extreme case: the carrier sees it flat, at a value other than the walk's.
+Since 0.381.4 it folds as that value rather than being skipped, which zeroes such a band's light
+instead of crediting it to every wavelength -- still wrong, at the bins' resolution.
 
 **Proposed fix:** take the denominator's walk density per bin only over the part of the bin that
 can take the branches, resolved finer than the bin -- the support is cheap to test at sub-bin
 wavelengths (a coat's opacity is a spectrum lookup, total internal reflection one comparison of
 indices), while the probabilities themselves can stay at the centres. Then explain the ramp.
+
+## DONE (2026-10-14, 0.381.4): REVIEW-0381 — what the Opus and Fable reviews of 0.380.1-0.381.2 found
+
+Opus (max) and Fable (xhigh) reviewed 0867bcaa..d3e5b315. Fixed:
+
+* **Mode M lost a walk whose own wavelength a plain weight zeroes** (Opus): a filter, mirror or
+  glossy reflectance zero over part of the band zeroed the walks drawn there for every photon
+  wavelength, so red behind a red gel came out at the share of walk wavelengths above its edge.
+  `mul` / `mulVec` now fold the weight's support into the coin product `p` (MODE-M-FOLD-SUPPORT's
+  machinery). `check_coat_modes.py` adds a red gel filter in front of a lit wall.
+* **The explorer's mode-W preview stopped after one pass in fog** (Opus; 0.381.1's
+  `whittedDeHeroes` change): mode W samples a medium's free flights (and a fire's light) at random,
+  so any medium needs passes, colour cast or not. The pass floor now counts every medium, and a
+  batch mode-W render prints a `[mode W] note` below 64 spp (Fable: a fire did not even have that).
+* **FTSL.md listed mode W among the modes that refuse a fire** (Fable): mode W runs as mode R
+  (`normMode`) and renders it. 0.381.0's doc edit and commit message said otherwise.
+* **GPU mode U's pass buffers could still end the run** (Opus): the compact copy and grid keys grew
+  per pass under CUDA_CHECK. They are allocated in `vcmSessionBegin`, inside its halving loop, at
+  the most a pass can need. Its message now reports the store actually allocated (Fable), and
+  `FTRACE_VCM_BUDGET_MB` lets `check_vcm_store.py` overflow the store on any card (Fable: on a
+  44 GB+ card the check failed on a correct build).
+* **A coin flat at the bins but not at the walk's wavelength was skipped** (Opus): it cancels only
+  if the walk's own value agrees. The exhaustive path is now one pass over the bins (Fable: it
+  evaluated each twice).
+* A carrier needs its walk density: `SpecThr`'s constructor takes it (Fable: a default of null
+  silently disabled the partial rule).
+* Simplifications and waste: one cone helper for the fire's sampler and density, host and device
+  (Fable); the fire's light sampling at a fiber no longer computes a pdf it never reads (Opus);
+  the host's mode-M fiber fold goes through `hairShadeRetint` / `hairFoldFCos` as the device's
+  does, the retint taking the cached absorption (Opus).
+* Dismissed: nothing.
 
 ## DONE (2026-10-14, 0.381.1): REVIEW-0380 — what the Opus and Fable reviews of 0.379.0-0.380.0 found
 
@@ -584,6 +619,24 @@ frame) to tank.ftsl, then for seeds 1-4 and devices cpu and gpu run
 M_<dev>_s<s>.png` and compare the PFMs' bottom row of 8 x 8-pixel tiles (the host is right: it
 agrees with mode R, `-mode R -spp 2048`). The check compares the device with the host over the
 ball only, until this is fixed.
+
+**Localised (2026-10-14, 0.381.3): the device's gather-area coverage (M-GATHERAREA), where a
+transparent face lies within the gather radius above the floor.** Measured on the repro (two seeds,
+50 M photons, device / host over the floor strip): unchanged with the tank's index set to 1.0
+(x2.15 -- so not refraction: any dielectric face does it); x1.000 with the tank removed;
+**x1.000 with `-gatherarea 0`**; x1.000 with `FTRACE_GABALL=0` (the coverage's ball test off);
+still x2.5 / x2.2 / x2.0 with the pseudo-count off, the tangle gate off, or 4 probes; **x1.000 with
+the tank's bottom face removed, or with the tank raised 3 cm** (above the 1.2 cm gather radius both
+backends use). Mode B, the same forward photons splatted to the camera, agrees (x1.0003), so the
+photons are not the difference. The tank stands 1 cm above the floor: a probe under its edge starts
+inside it and first meets its bottom face 1 cm above the tangent plane, which the ball test (`rr^2 +
+dz^2 <= r^2`) mostly rejects at r = 1.2 cm. The host's FTRACE_GADIAG shows its probes 100 %
+accepted with a mean depth of -0.125 r (about 15 % on that face) and 82.5 % of floor gather points
+at coverage >= 0.875 -- the host's coverage IS lowered there, but the device's must be lowered far
+more, by something the two codes' text does not show (both flip the hit normal toward the ray, both
+probe from r above the plane over 2r). Next: count the device's probes the way FTRACE_GADIAG does.
+Two questions beside the divergence: whether a transparent face should count as covering the disc
+at all (photons are stored on the floor beneath it, not on it), and so which backend is right.
 
 ## OPEN (2026-10-13, scope): GRIN-RADIANCE-SCALE — a camera path ending inside a GRIN region misses the n^2 radiance scale
 

@@ -978,8 +978,8 @@ struct SpecThr {
     double pcam = 1.0;
     bool   partial = false;
     double pscale = 1.0;                         // pcam / sum_k Q_k p[k] once partial
-    const EmissionSampler* walkDensity = nullptr;
-    explicit SpecThr(const EmissionSampler* walk = nullptr) : walkDensity(walk) {
+    const EmissionSampler* walkDensity;          // never null: the ratio needs it once partial
+    explicit SpecThr(const EmissionSampler& walk) : walkDensity(&walk) {
         for (int k = 0; k < K; ++k) { v[k] = 1.0; p[k] = 1.0; }
     }
     static double lamOf(int k) {
@@ -1005,25 +1005,37 @@ struct SpecThr {
             return;
         }
         any = true;
-        for (int k = 0; k < K; ++k) v[k] *= f(lamOf(k));
+        bool zero = false;
+        for (int k = 0; k < K; ++k) {
+            const double fk = f(lamOf(k));
+            v[k] *= fk;
+            if (!(fk > 0.0)) { p[k] = 0.0; zero = true; }
+        }
+        // A weight zero in some bins leaves a walk drawn there with nothing to carry, at any
+        // wavelength: the same support problem as a coin's (see `p`), so the walks drawn where it
+        // is not zero stand in for them.
+        if (zero) { partial = true; rescale(); }
     }
     // Fold in a factor already evaluated ON the grid, plus its value at the camera's wavelength.
     // The media term comes this way: its per-wavelength values fall out of one shared
     // ratio-tracking walk rather than from a function that can be called per bin.
+    // A weight zero in some bins is a partial support, as in mul.
     void mulVec(const double* vk, double atCam) {
         cam *= atCam;
+        bool zero = false;
         for (int k = 0; k < K; ++k) {
             if (!any && std::fabs(vk[k] - vk[0]) > 1e-12 * (1.0 + std::fabs(vk[0]))) any = true;
             v[k] *= vk[k];
+            if (!(vk[k] > 0.0)) { p[k] = 0.0; zero = true; }
         }
+        if (zero) { partial = true; rescale(); }
     }
     // Fold in a coin the walk tossed: f(lambda, prob) returns the branch's factor at lambda (its
     // probability times any weight -- Renderer::stepFactorAt) and sets `prob` to its probability
     // alone; factorAtCam / probAtCam are the same at the walk's wavelength. Without `exhaustive`,
     // mul's three-point probe: a factor flat there is folded as the constant it is (it cancels).
-    // `exhaustive` asks every bin first, where a branch impossible in a narrow band could slip past
-    // the probe (a coated surface, a half mirror), and skips a coin flat in all of them -- it
-    // cancels, and a coin no fold took before must leave the carrier as it was.
+    // `exhaustive` evaluates every bin, where a branch impossible in a narrow band could slip past
+    // the probe (a coated surface, a half mirror).
     template <class F> void mulCoin(const F& f, double factorAtCam, double probAtCam,
                                     bool exhaustive) {
         double pr;
@@ -1035,33 +1047,37 @@ struct SpecThr {
                 for (int k = 0; k < K; ++k) v[k] *= a;
                 return;
             }
-        } else {
-            const double a = f(lamOf(0), pr);
-            const double tol = 1e-12 * (1.0 + std::fabs(a));
-            int k = 1;
-            while (k < K && std::fabs(f(lamOf(k), pr) - a) <= tol) ++k;
-            if (k == K) return;
         }
+        // Every bin, once. A coin flat over the bins AND equal to the walk's own value cancels: it
+        // is folded like any other but leaves `any` alone, so ratio() stays exactly 1 if nothing
+        // else varies. Flat over the bins but not at the walk's wavelength (a change inside one
+        // bin) does not cancel.
         cam *= factorAtCam;
         pcam *= probAtCam;
-        any = true;
+        double a = 0.0;
+        bool flat = true;
         for (int k = 0; k < K; ++k) {
-            v[k] *= f(lamOf(k), pr);
+            const double fk = f(lamOf(k), pr);
+            if (k == 0) a = fk;
+            else if (std::fabs(fk - a) > 1e-12 * (1.0 + std::fabs(a))) flat = false;
+            v[k] *= fk;
             p[k] *= pr;
             if (!(pr > 0.0)) partial = true;
         }
-        if (partial && walkDensity) {
-            // sum_k Q_k p[k], Q_k the walk density's mass in bin k. Zero only if no bin centre
-            // the walk could be drawn at takes these branches, which the walk itself just did:
-            // then the bins cannot resolve the support, and the walk's own probability serves.
-            double D = 0.0;
-            for (int k = 0; k < K; ++k) {
-                const double lo = LAMBDA_MIN + k * (LAMBDA_MAX - LAMBDA_MIN) / (double)K;
-                const double hi = LAMBDA_MIN + (k + 1) * (LAMBDA_MAX - LAMBDA_MIN) / (double)K;
-                D += (walkDensity->cdfAt(hi) - walkDensity->cdfAt(lo)) * p[k];
-            }
-            pscale = (D > 0.0) ? pcam / D : 1.0;
+        if (!flat || std::fabs(factorAtCam - a) > 1e-12 * (1.0 + std::fabs(a))) any = true;
+        if (partial) rescale();
+    }
+    // pscale = pcam / sum_k Q_k p[k], Q_k the walk density's mass in bin k. The sum is zero only if
+    // no bin centre the walk could be drawn at takes these branches, which the walk itself just
+    // did: then the bins cannot resolve the support, and the walk's own probability serves.
+    void rescale() {
+        double D = 0.0;
+        for (int k = 0; k < K; ++k) {
+            const double lo = LAMBDA_MIN + k * (LAMBDA_MAX - LAMBDA_MIN) / (double)K;
+            const double hi = LAMBDA_MIN + (k + 1) * (LAMBDA_MAX - LAMBDA_MIN) / (double)K;
+            D += (walkDensity->cdfAt(hi) - walkDensity->cdfAt(lo)) * p[k];
         }
+        pscale = (D > 0.0) ? pcam / D : 1.0;
     }
     // The correction a photon of wavelength `lamP` needs. Denominator is `cam`, so this
     // multiplied by `thr` leaves the walk's spectral factors evaluated at lamP and everything
@@ -1389,7 +1405,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
 
     // SPECGATHER: the walk's spectral factors, beside the scalar `thr`; its wavelength came from
     // the emission sampler (above).
-    SpecThr sthr(&scene.emitSampler);
+    SpecThr sthr(scene.emitSampler);
     const bool volOn = (bm != nullptr) && !bm->empty() && !scene.media.empty();
     // -sunnee: the sun's single scatter is marched, not gathered (beamgather.h sunNeeMarch).
     // Not gated on the map being non-empty: erasing the direct-sun chords may have emptied it.
@@ -1785,20 +1801,15 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     // wavelength is exactly that (hair.h lobeAngular / fFromLobes). A bin whose own
                     // medulla is live (or a hero whose was) keeps the full rebuild: whether the
                     // medulla is live depends on the wavelength.
-                    const bool perLobe = la.valid;
                     // the absorption per bin: a per-material table when the colour is constant
                     // (hairSigmaBins), else inverted at each wavelength
                     const double* bins = hairSigmaBins<SpecThr::K, &SpecThr::lamOf>(scene, m, h);
                     sthr.mul([&](double lamK) {
-                        if (perLobe && !hairMedullaLiveAt(hs.b, m, lamK)) {
-                            const double sig = bins ? bins[SpecThr::binOf(lamK)]
-                                                    : hairSigmaAAt(scene, m, h, lamK);
-                            return clamp01(hs.b.opacity *
-                                           hair::fFromLobes(la, sig, hairSpecularFrom(m, lamK, hs.specPat)) *
-                                           cosLong / pdfH);
-                        }
-                        const HairShade hk = hairShadeAt(scene, m, h, lamK, wPrev);
-                        return clamp01(hair::f(hk.b, hk.woLocal, wl) * cosLong / pdfH);
+                        // this wavelength's shade, folded from the sample's angular half where
+                        // both fibers are solid and evaluated in full where not (hairFoldFCos)
+                        const HairShade hk = hairShadeRetint(scene, m, h, lamK, hs,
+                                                             bins ? bins[SpecThr::binOf(lamK)] : -1.0);
+                        return clamp01(hairFoldFCos(la, hk, wl, cosLong, nullptr) / pdfH);
                     }, wCam);
                 }
                 const Vec3 wo = hair::toWorld(hs.fr, wl);

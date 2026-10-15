@@ -20,7 +20,7 @@ And an OPAQUE coated ball -- a stack with an absorbing layer -- in a water tank 
 Mode R (host, and device unless --no-gpu) and mode D (host) must render it the same ranked below
 the water as above it. (Until 0.379.1 the priority rule suppressed it when it ranked no higher than
 the water, and the ball vanished.)
-And two scenes where a coin's branches, or their weights, depend on the wavelength, mode M (host,
+And three scenes where what a walk can carry depends on its wavelength, mode M (host,
 and device unless --no-gpu) against mode R per colour channel -- mode M's gather re-expresses its
 walk at every photon's wavelength, which a walk can do only for branches its own wavelength allows
 (SpecThr::mulCoin, known-issues MODE-M-FOLD-SUPPORT):
@@ -31,8 +31,12 @@ walk at every photon's wavelength, which a walk can do only for branches its own
     M read x0.50 in blue over the ball;
   * a half mirror at 45 degrees that reflects red and passes cyan, reflecting a lit white wall
     and, above the horizon, passing nothing but the dark: until 0.381.2 mode M took its coin at the
-    walk's wavelength for every photon, so the reflection came out in the mirror's average colour.
-  Both scenes put their spectral edge on a boundary of mode M's 24 carrier bins (595 nm: 360 +
+    walk's wavelength for every photon, so the reflection came out in the mirror's average colour;
+  * a red gel filter, transmitting nothing below 595 nm, between the camera and a lit white wall:
+    a weight, not a coin, but a walk drawn where it is zero carries nothing at any wavelength, the
+    same support problem -- until 0.381.4 red behind it read at the share of walk wavelengths
+    above 595 nm.
+  All three put their spectral edge on a boundary of mode M's 24 carrier bins (595 nm: 360 +
   12 x 470 / 24). The carrier takes each factor at its bin's centre for every photon in the bin
   (known-issues SPECGATHER-BIN-RESOLUTION); an edge inside a bin is another error, and this check
   is about the coins.
@@ -101,6 +105,18 @@ def partial_tank():
     return out
 
 
+FILTER = [
+    'camera "c" { eye 0 0.6 -2.5  look_at 0 0.6 0  up 0 1 0  fov_y 30  film { res 64 48 } }',
+    'material "white" { type diffuse  reflect 0.7 }',
+    'material "redgel" { type filter  transmit table { 380:0 594.99:0 595.01:0.9 780:0.9 } }',
+    'quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material white }',
+    'quad { origin -3 0 1.5  u 6 0 0   v 0 3 0   material white }',
+    'quad { origin -0.6 0.05 -0.5  u 1.2 0 0  v 0 1.2 0  material redgel }',
+    'light area { origin -0.5 2.4 0.3  u 1 0 0  v 0 0 1  normal 0 -1 0  power 150  '
+    'spd preset:d65 }',
+]
+
+
 HALF_MIRROR = [
     'camera "c" { eye 0 0.6 -2.5  look_at 0 0.6 0  up 0 1 0  fov_y 30  film { res 64 48 } }',
     'material "white" { type diffuse  reflect 0.7 }',
@@ -129,7 +145,7 @@ def main():
     for pri in (1, 2):
         with open(os.path.join(d, "opaque_p%d.ftsl" % pri), "w", encoding="utf-8", newline="") as f:
             f.write(NL.join(opaque_tank(pri)) + NL)
-    for name, lines in (("partial", partial_tank()), ("halfmirror", HALF_MIRROR)):
+    for name, lines in (("partial", partial_tank()), ("halfmirror", HALF_MIRROR), ("filter", FILTER)):
         with open(os.path.join(d, name + ".ftsl"), "w", encoding="utf-8", newline="") as f:
             f.write(NL.join(lines) + NL)
 
@@ -162,7 +178,8 @@ def main():
     for name, what, ref in (
             ("partial", "coat opaque in the red only, in water",
              (["-mode", "R"], "cpu", 1024) if a.no_gpu else (["-mode", "R"], "gpu", 8192)),
-            ("halfmirror", "half mirror reflecting red", (["-mode", "R"], "cpu", a.spp))):
+            ("halfmirror", "half mirror reflecting red", (["-mode", "R"], "cpu", a.spp)),
+            ("filter", "red gel filter", (["-mode", "R"], "cpu", a.spp))):
         rr = render_seeds(a.exe, d, name + ".ftsl", name + "_R", ref[0], ref[1], ref[2], rgb=True)
         for dev in devs:
             mm = render_seeds(a.exe, d, name + ".ftsl", name + "_M" + ("g" if dev == "gpu" else ""),

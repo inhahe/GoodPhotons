@@ -148,12 +148,13 @@ inline HairShade hairShadeAt(const Scene& scene, const Material& m, const Hit& h
 // hairShadeAt at another wavelength, for the same hit and arrival direction: a copy of `base`
 // with only the wavelength-dependent coefficients re-read (hair::makeSpectral). The frame, the
 // impact parameter, the roughness and the tilt are the same at every wavelength, so a hero
-// bundle builds them once.
+// bundle builds them once. `sigmaA`, if not negative, is the absorption at `lambda` already in
+// hand (hairSigmaBins) instead of hairSigmaAAt's.
 inline HairShade hairShadeRetint(const Scene& scene, const Material& m, const Hit& hit,
-                                 double lambda, const HairShade& base) {
+                                 double lambda, const HairShade& base, double sigmaA = -1.0) {
     HairShade s = base;
     hair::makeSpectral(s.b, hairSpecularFrom(m, lambda, base.specPat),
-                       hairSigmaAAt(scene, m, hit, lambda),
+                       sigmaA >= 0.0 ? sigmaA : hairSigmaAAt(scene, m, hit, lambda),
                        m.hairMedullaSigmaS(lambda), m.hairMedullaSigmaA(lambda));
     return s;
 }

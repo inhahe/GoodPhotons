@@ -1060,7 +1060,10 @@ bin k): every walk wavelength shares that denominator, so the walks that can tak
 stand in for those that cannot. Whether a walk is partial depends on its branches alone, never on
 its wavelength, so the exact importance ratio (where the support is whole) and the averaged one
 (where it is not) combine without bias; the average is taken at bin centres, the carrier's own
-resolution. A half mirror folds its coin since then too (a coloured one reflected every photon
+resolution. A plain weight (a filter's transmission, a mirror's or glossy lobe's reflectance)
+that is zero in some bins is the same problem without a coin -- a walk drawn there carries nothing
+at any wavelength -- so `mul` / `mulVec` fold its support (zero or not, per bin) into `p` too
+(0.381.4). A half mirror folds its coin since then too (a coloured one reflected every photon
 wavelength by the walk's reflectance). A layered coat's coin (its Fresnel reflectance) is still
 taken at the walk's wavelength: it varies only with the coat's dispersion, a few tenths of a
 percent. `tools/check_coat_modes.py` holds both to mode R.
@@ -8106,8 +8109,10 @@ as the one at fault.
   and `BDPT_DEEPDEPTH` (64), the deep one launched only when `-max-bounce > 8`. GPU mode U
   additionally bounds its light-vertex store -- the per-path slab and its compact copy, every
   subpath's `maxDepth - 1` vertices, with their secondary-λ rows and grid keys -- by a budget (an
-  eighth of the card, at least 768 MB, at most half the memory free once the scene is up; an
-  allocation that still fails halves the count). A pass that would not fit traces FEWER light subpaths (`nLight`, said
+  eighth of the card, at least 768 MB, at most half the memory free once the scene is up, at most
+  `FTRACE_VCM_BUDGET_MB` -- the check's knob; an allocation that still fails halves the count, and
+  the pass's compact copy and grid keys are allocated there too, at the most a pass can need, so no
+  pass allocates them). A pass that would not fit traces FEWER light subpaths (`nLight`, said
   on stdout) and pairs camera path i with light subpath `i % nLight` for its bundle and its
   connections; the weights already carry the light-path count (`ctx.nLightPaths`, which merges
   and the camera splat are normalised by), so the estimator is unchanged and only its variance

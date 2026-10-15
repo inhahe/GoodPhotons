@@ -1923,23 +1923,36 @@ struct BackwardRenderer {
     // The solid-angle density with which the cone half of fireNee's mixture samples direction `d`
     // (unit) from `x` for fire `v`, and the sampler itself (fireDirPdf has the mixture's density).
     // `oneMinusCos` is 1 - cos(theta_max) written stably, so a small distant fire keeps its digits.
+    // The cone of directions from `x` that holds the fire box's bounding sphere, shared by its
+    // sampler and its density: `tc` from x to the box's centre, `d2` its squared length, `cosMax`
+    // and `oneMinusCos` the cone's half angle (the latter in the form that stays exact for a small
+    // cone). `inside`: x is in the sphere, and the cone is every direction.
+    struct FireCone { Vec3 tc; double d2, cosMax, oneMinusCos; bool inside; };
+    static FireCone fireCone(const Scene::EmissiveVolume& v, const Vec3& x) {
+        FireCone c;
+        c.tc = (v.bmin + v.bmax) * 0.5 - x;
+        const double R2 = dot(v.bmax - v.bmin, v.bmax - v.bmin) * 0.25;
+        c.d2 = dot(c.tc, c.tc);
+        c.inside = c.d2 <= R2;
+        if (c.inside) { c.cosMax = -1.0; c.oneMinusCos = 2.0; return c; }
+        const double s2 = R2 / c.d2;
+        c.cosMax = std::sqrt(1.0 - s2);
+        c.oneMinusCos = s2 / (1.0 + c.cosMax);
+        return c;
+    }
     static double fireConePdf(const Scene::EmissiveVolume& v, const Vec3& x, const Vec3& d) {
-        const Vec3 tc = (v.bmin + v.bmax) * 0.5 - x;
-        const double R2 = dot(v.bmax - v.bmin, v.bmax - v.bmin) * 0.25, d2 = dot(tc, tc);
-        if (d2 <= R2) return 1.0 / (4.0 * PI);
-        const double s2 = R2 / d2, cosMax = std::sqrt(1.0 - s2);
-        if (dot(d, tc) < cosMax * std::sqrt(d2)) return 0.0;
-        return 1.0 / (2.0 * PI * (s2 / (1.0 + cosMax)));
+        const FireCone c = fireCone(v, x);
+        if (c.inside) return 1.0 / (4.0 * PI);
+        if (dot(d, c.tc) < c.cosMax * std::sqrt(c.d2)) return 0.0;
+        return 1.0 / (2.0 * PI * c.oneMinusCos);
     }
     static Vec3 fireConeSample(const Scene::EmissiveVolume& v, const Vec3& x, double u1, double u2) {
-        const Vec3 tc = (v.bmin + v.bmax) * 0.5 - x;
-        const double R2 = dot(v.bmax - v.bmin, v.bmax - v.bmin) * 0.25, d2 = dot(tc, tc);
+        const FireCone c = fireCone(v, x);
+        if (c.inside) return uniformSphere(u1, u2);
         const double phi = 2.0 * PI * u2;
-        if (d2 <= R2) return uniformSphere(u1, u2);
-        const double s2 = R2 / d2, oneMinusCos = s2 / (1.0 + std::sqrt(1.0 - s2));
-        const double om = u1 * oneMinusCos;                       // 1 - cos(theta), uniform
+        const double om = u1 * c.oneMinusCos;                     // 1 - cos(theta), uniform
         const double cosT = 1.0 - om, sinT = std::sqrt(std::max(0.0, om * (2.0 - om)));
-        const Vec3 a = tc / std::sqrt(d2);
+        const Vec3 a = c.tc / std::sqrt(c.d2);
         Vec3 t, b; onb(a, t, b);
         return a * cosT + t * (sinT * std::cos(phi)) + b * (sinT * std::sin(phi));
     }
