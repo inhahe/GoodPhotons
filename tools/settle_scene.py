@@ -407,18 +407,51 @@ def cache_dir():
     return os.path.abspath(d)
 
 
+CACHE_UNUSED_DAYS = 30
+
+
+def prune_cache(stamp):
+    """Delete the cache entries no run can hit again: a polygonisation by any ftrace build but
+    the one stamped `stamp` (each is keyed on its build, so a rebuild orphans all of them --
+    4.3 GB had piled up by 2026-10), and any entry unused for CACHE_UNUSED_DAYS (the VHACD
+    proxy of a mesh since edited). A hit refreshes its entry's mtime, which is what "unused"
+    reads."""
+    d = cache_dir()
+    cutoff = time.time() - CACHE_UNUSED_DAYS * 86400
+    for f in os.listdir(d):
+        p = os.path.join(d, f)
+        if not os.path.isfile(p):
+            continue
+        if (f.startswith('iso_') and not f.startswith(f'iso_{stamp}_')) or os.path.getmtime(p) < cutoff:
+            try:
+                os.remove(p)
+            except OSError:
+                pass                               # in use by a concurrent run: next time
+
+
+def _cache_hit(path):
+    """Whether a cache entry exists; marks it used if so (see prune_cache)."""
+    if not os.path.exists(path):
+        return False
+    os.utime(path)
+    return True
+
+
 def export_isosurface_meshes(scene_path, res, use_cache=True):
     """Run `ftrace -export-mesh` and return {group_name: trimesh} in world space."""
     exe = find_ftrace()
     if not exe:
         sys.exit('[settle_scene] could not find the ftrace binary to polygonise isosurfaces')
+    # The binary is part of the key: a rebuilt polygoniser can emit different tris. It is in
+    # the NAME too, so prune_cache can tell an entry no run will hit again.
+    stamp = f'{os.path.getmtime(exe):.0f}'
+    prune_cache(stamp)
     key = hashlib.sha1()
     with open(scene_path, 'rb') as fh:
         key.update(fh.read())
-    # the binary itself is part of the key: a rebuilt polygoniser can emit different tris
-    key.update(f'|{res}|{os.path.getmtime(exe):.0f}'.encode())
-    tmp = os.path.join(cache_dir(), 'iso_' + key.hexdigest()[:16] + '.obj')
-    if use_cache and os.path.exists(tmp):
+    key.update(f'|{res}'.encode())
+    tmp = os.path.join(cache_dir(), f'iso_{stamp}_' + key.hexdigest()[:16] + '.obj')
+    if use_cache and _cache_hit(tmp):
         print(f'[settle_scene] reusing cached polygonisation {os.path.basename(tmp)}')
         return parse_obj_groups(tmp)
     cmd = [exe, '-in', scene_path, '-export-mesh', tmp, '-mesh-res', str(res)]
@@ -696,7 +729,7 @@ def settle_bodies(worlds, selected, floor_y, max_steps, friction, tether=0.0,
             with open(path, 'rb') as fh:
                 vkey = hashlib.sha1(fh.read()).hexdigest()[:16]
             vh = os.path.join(cache_dir(), 'vhacd_' + vkey + '.obj')
-            if use_cache and os.path.exists(vh):
+            if use_cache and _cache_hit(vh):
                 print(f'[settle_scene] reusing cached VHACD proxy for "{name}"', flush=True)
                 col_file = vh
             else:

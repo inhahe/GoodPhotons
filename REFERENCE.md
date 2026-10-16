@@ -65,6 +65,7 @@ Three neighbouring documents cover what this one only summarises:
   - [Saving the projected model](#saving-the-projected-model)
 - [Command-line reference](#command-line-reference)
 - [Output](#output)
+  - [How long output is kept](#how-long-output-is-kept)
   - [Elapsed times and ETAs](#elapsed-times-and-etas)
   - [Denoising (`-denoise`)](#denoising--denoise)
 
@@ -5241,7 +5242,8 @@ in the `-raster` preview, so preview and final agree):
 
   **Repairing an already-rendered sequence.** If the frames were rendered with
   `-checkpoint`, no re-render is needed: each `<frame>.png.ftbuf` still holds the raw
-  linear film, so `ftrace -topng <ftbuf> <png> -exposure-anchor <value>` re-develops it
+  linear film (for a week, or until the sequence's video is made: see **How long output
+  is kept** under **Output**), so `ftrace -topng <ftbuf> <png> -exposure-anchor <value>` re-develops it
   at a shared gain in milliseconds. loom's `loom.stabilize_exposure(pngs)` automates
   exactly that — it develops each checkpoint once to read back the anchor it *would*
   have chosen, takes the **median** across the sequence (not the first frame, which on
@@ -6475,6 +6477,27 @@ word.)*
 
 A `.ftsl` is a *scene*, not an image, and `-topng` refuses it: render it with
 `-in scene.ftsl -o out.png`.
+
+### How long output is kept
+
+ftrace itself deletes nothing it writes. **`tools/clean_outputs.py`** prunes what has outlived
+its use, and `build.bat` runs it after every successful build (its log is
+`scraps/_clean_last.txt`); run it by hand for a dry run of what would go, or with `--delete`.
+
+| Goes | When |
+|---|---|
+| a `.ftbuf` checkpoint under `png/` or `gallery/` | a week after it was last written (`--days`) |
+| a `-hdr` `.pfm` under `png/` or `gallery/` | a week after it was last written |
+| the numbered frames of a sequence, with their `.ftbuf`, `.pfm`, `.ppm` and `.jpg` | once a `.gif` or `.mp4` beside them is newer than every frame and holds at least as many frames, and is either named with the frames' prefix or beside no other sequence |
+| a `-savemap` photon map | once the loader no longer reads its format |
+| anything in `scraps/` but scripts, scenes and notes under 1 MB | a week after it was last written |
+
+What stays, whatever its age: a file git tracks; a file a script, scene or document cites by
+path, or that such a cited file cites in turn; everything under the output directory of a live
+render; a sequence's per-frame scenes, its logs and its unnumbered stills (`_cam`, `_meter`).
+So a sequence keeps its frames until it is assembled, and a gif that keeps one frame in three
+does not release them. To keep frames past their video, or a checkpoint you mean to `-resume`
+or re-develop with `-topng` after a week, move them out of `png/`, `gallery/` and `scraps/`.
 
 ### Elapsed times and ETAs
 
