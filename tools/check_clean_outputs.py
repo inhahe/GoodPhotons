@@ -11,6 +11,8 @@ ignored note and from a virtual environment, a junction, a copy with an old modi
 and a live render's directory -- runs the cleaner's finder over it, and compares the result
 with the list it should give. Exits 1 on any difference.
 """
+import contextlib
+import io
 import os
 import subprocess
 import sys
@@ -62,7 +64,7 @@ def build(t):
             set_created(p, when)
         return p
 
-    def gif(rel, n, age_days=0.0):
+    def gif(rel, n, age_days=0.0, created_now=False):
         from PIL import Image
         p = os.path.join(t, rel)
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -70,7 +72,8 @@ def build(t):
         frames[0].save(p, save_all=True, append_images=frames[1:], duration=40, loop=0)
         when = time.time() - age_days * DAY
         os.utime(p, (when, when))
-        set_created(p, when)
+        if not created_now:
+            set_created(p, when)
 
     def frames(d, stem, n, age_days=0.5, sib=(".png.ftbuf", ".pfm")):
         names = []
@@ -91,13 +94,15 @@ def build(t):
     # ftbuf / pfm: by age -- the later of written and created
     put("png/a/old.png.ftbuf", age_days=10); gone.add("png/a/old.png.ftbuf")
     put("png/a/new.png.ftbuf", age_days=1); kept.add("png/a/new.png.ftbuf")
-    put("png/a/copied.png.ftbuf", age_days=10, created_now=True); kept.add("png/a/copied.png.ftbuf")
-    put("png/a/old.pfm", age_days=10); gone.add("png/a/old.pfm")
+    put("png/a/copied.png.ftbuf", age_days=10, created_now=True)     # copied in today: new where
+    (kept if os.name == "nt" else gone).add("png/a/copied.png.ftbuf")  # a birth time is kept
+    put("png/a/old.pfm", age_days=10); gone.add("png/a/old.pfm")            # beside old.png
     put("png/a/new.pfm", age_days=1); kept.add("png/a/new.pfm")
     put("png/a/old.png", age_days=10); kept.add("png/a/old.png")            # a still: no rule
-    # an unassembled sequence keeps its checkpoints (loom resumes and re-develops by them)
-    for f in frames("png/seq", "seq", 9, age_days=10):
-        (gone if f.endswith(".pfm") else kept).add(f)
+    put("png/a/studio_env.pfm", age_days=10); kept.add("png/a/studio_env.pfm")   # an input
+    # an unassembled sequence keeps its checkpoints (loom resumes and re-develops by them) and
+    # its HDR frames (graded from them)
+    kept.update(frames("png/seq", "seq", 9, age_days=10))
 
     # frames: a video beside no other set, holding exactly as many, takes the set at any age
     gone.update(frames("png/fly", "fly", 10))
@@ -119,6 +124,9 @@ def build(t):
     kept.update(frames("png/rain", "rain_axicon_fly", 9))
     gif("png/rain/rain_fly.gif", 9); kept.add("png/rain/rain_fly.gif")
     gif("png/rain/rain.gif", 20); kept.add("png/rain/rain.gif")
+    # an old video copied back in after the frames were re-rendered is as old as its content
+    kept.update(frames("png/copyv", "cv", 9, age_days=0.0))
+    gif("png/copyv/cv.gif", 9, age_days=1, created_now=True); kept.add("png/copyv/cv.gif")
 
     # pmap: only a format older than the oldest the loader reads
     put("gallery/old.ftpmap", b"FTPMP01\n" + b"\0" * 64, age_days=0.5); gone.add("gallery/old.ftpmap")
@@ -130,6 +138,8 @@ def build(t):
     put("scraps/new.npy", age_days=1); kept.add("scraps/new.npy")
     put("scraps/try.py", age_days=10); kept.add("scraps/try.py")
     put("scraps/dump.txt", b"y" * (co.SCRAPS_DATA_SIZE + 1), age_days=10); gone.add("scraps/dump.txt")
+    put("scraps/strands.ftsl", b"y" * (co.SCRAPS_DATA_SIZE + 1), age_days=10)   # a big scene
+    kept.add("scraps/strands.ftsl")
     put("scraps/sub/a.log", age_days=10); gone.add("scraps/sub/a.log")
     put("scraps/.settle_cache/iso_1_ab.obj", age_days=60); kept.add("scraps/.settle_cache/iso_1_ab.obj")
 
@@ -156,16 +166,26 @@ def build(t):
     put("scraps/g/grey_a.exr", age_days=10); kept.add("scraps/g/grey_a.exr")      # glob -> scene
     for k in (1, 2, 3):
         put("png/b/groom%d_x.pfm" % k, age_days=10)
+        put("png/b/groom%d_x.png" % k, age_days=10); kept.add("png/b/groom%d_x.png" % k)
     kept.update({"png/b/groom1_x.pfm", "png/b/groom2_x.pfm"}); gone.add("png/b/groom3_x.pfm")
+    put("scraps/rig2/a.npy", age_days=10); kept.add("scraps/rig2/a.npy")          # rig2/*
+    put("scraps/rig2/sub/b.npy", age_days=10); gone.add("scraps/rig2/sub/b.npy")  # * stops at /
+    put("scraps/esc/cloud.vdb", age_days=10); kept.add("scraps/esc/cloud.vdb")    # escaped \\
+    put("scraps/esc2/x.npy", age_days=10); kept.add("scraps/esc2/x.npy")          # ... unquoted
+    put("scraps/casecited.npy", age_days=10)                                       # cited as
+    (kept if os.name == "nt" else gone).add("scraps/casecited.npy")                # CaseCited
     put("scraps/big_cited.npy", age_days=10); kept.add("scraps/big_cited.npy")
     put("scraps/ign_cited.npy", age_days=10); kept.add("scraps/ign_cited.npy")
     put("scraps/venv_cited.npy", age_days=10); gone.add("scraps/venv_cited.npy")
 
-    put("png/tracked.pfm", age_days=10); kept.add("png/tracked.pfm")
+    put("png/tracked.pfm", age_days=10); kept.add("png/tracked.pfm")       # a sidecar, of
+    put("png/tracked.png", age_days=10); kept.add("png/tracked.png")       # this image
     put("notes.md", b"Repro: scraps/repro.py, data scraps/cited.npy, and `png/cited_frames/c000.pfm`."
                     b" Rig: `scraps/rig/`. Greys: scraps/g/grey_*.ftsl. Grooms: png/b/groom{1,2}_*.pfm."
-                    b" Model: scraps/model.obj.")
-    put("tests/test_x.py", b'SCRAPS = "../scraps"\npath = os.path.join(SCRAPS, "bare.vdb")\n')
+                    b" Model: scraps/model.obj. Rig 2: scraps/rig2/* -- and scraps/CaseCited.npy."
+                    b" A repr: scraps\\\\esc2\\\\x.npy is the input.")
+    put("tests/test_x.py", b'SCRAPS = "../scraps"\npath = os.path.join(SCRAPS, "bare.vdb")\n'
+                           b'cloud = "scraps\\\\esc\\\\cloud.vdb"\n')
     # a source past the dump-size cap still counts (known-issues.md is megabytes)
     put("big.md", b"x " * (co.SCAN_CAP // 2 + 1) + b"see scraps/big_cited.npy")
     put("scenes/untracked.ftsl", b'mesh "../scraps/scene_mesh.glb"')       # untracked source
@@ -199,31 +219,45 @@ def build(t):
 
 
 def main():
-    real_root, real_chan = co.ROOT, co.stop_channel_dir
+    if os.name != "nt" and hasattr(os.stat(__file__), "st_birthtime"):
+        # macOS and the BSDs keep a birth time this check cannot back-date, so every file it
+        # builds would read as new and no rule could be tested.
+        print("SKIPPED: this platform's birth times cannot be back-dated")
+        return 0
+    real_root, real_chan, real_argv = co.ROOT, co.stop_channel_dir, sys.argv
+    problems = []
     with tempfile.TemporaryDirectory(prefix="clean_outputs_") as t:
         try:
             gone, kept, chan = build(t)
             co.ROOT = t
             co.stop_channel_dir = lambda: chan
             found = {co.rel(full) for _, full, _ in co.find(set(co.RULES), 7.0)}
+            problems += ["kept %s, which a rule names" % f for f in sorted(gone - found)]
+            problems += ["would delete %s, which must stay" % f for f in sorted(found & kept)]
+            problems += ["would delete %s, which the check did not expect" % f
+                         for f in sorted(found - gone - kept)]
+            # Then delete for real, through main(), and look at what is left on disk.
+            sys.argv = ["clean_outputs.py", "--delete"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = co.main()
+            if rc != 0:
+                problems.append("--delete exited %d" % rc)
+            problems += ["--delete left %s" % f for f in sorted(found)
+                         if os.path.exists(os.path.join(t, f))]
+            problems += ["--delete removed %s" % f for f in sorted(kept)
+                         if not os.path.exists(os.path.join(t, f))]
+            if os.path.isdir(os.path.join(t, "scraps", "sub")):
+                problems.append("--delete left the directory it emptied, scraps/sub")
         finally:
-            co.ROOT, co.stop_channel_dir = real_root, real_chan
+            co.ROOT, co.stop_channel_dir, sys.argv = real_root, real_chan, real_argv
             link = os.path.join(t, "png", "link")
             if os.path.isdir(link):
                 os.rmdir(link)                      # the junction itself, never its target's files
 
-    ok = True
-    for f in sorted(gone - found):
-        print("FAIL: kept %s, which a rule names" % f)
-        ok = False
-    for f in sorted(found & kept):
-        print("FAIL: would delete %s, which must stay" % f)
-        ok = False
-    for f in sorted(found - gone - kept):
-        print("FAIL: would delete %s, which the check did not expect" % f)
-        ok = False
-    print("PASS (%d deleted, %d kept)" % (len(gone), len(kept)) if ok else "FAILED")
-    return 0 if ok else 1
+    for p in problems:
+        print("FAIL: " + p)
+    print("FAILED" if problems else "PASS (%d deleted, %d kept)" % (len(gone), len(kept)))
+    return 1 if problems else 0
 
 
 if __name__ == "__main__":

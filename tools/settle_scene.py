@@ -408,32 +408,39 @@ def cache_dir():
 
 
 CACHE_UNUSED_DAYS = 30
+CACHE_GRACE_S = 3600
 
 
 def prune_cache(stamp):
     """Delete the cache entries no run can hit again: a polygonisation by any ftrace build but
-    the one stamped `stamp` (each is keyed on its build, so a rebuild orphans all of them --
-    4.3 GB had piled up by 2026-10), and any entry unused for CACHE_UNUSED_DAYS (the VHACD
-    proxy of a mesh since edited). A hit refreshes its entry's mtime, which is what "unused"
-    reads."""
+    the one stamped `stamp` (each is keyed on its build, so a rebuild orphans all of them), and
+    any entry unused for CACHE_UNUSED_DAYS (the VHACD proxy of a mesh since edited). A hit
+    refreshes its entry's mtime, which is what "unused" reads, and nothing used or written in
+    the last CACHE_GRACE_S goes: a concurrent run still on the previous build keeps the entry
+    it has just hit, or is writing, until it is done with it."""
     d = cache_dir()
-    cutoff = time.time() - CACHE_UNUSED_DAYS * 86400
+    now = time.time()
     for f in os.listdir(d):
         p = os.path.join(d, f)
-        if not os.path.isfile(p):
-            continue
-        if (f.startswith('iso_') and not f.startswith(f'iso_{stamp}_')) or os.path.getmtime(p) < cutoff:
-            try:
+        try:
+            if not os.path.isfile(p):
+                continue
+            idle = now - os.path.getmtime(p)
+            other_build = f.startswith('iso_') and not f.startswith(f'iso_{stamp}_')
+            if idle > CACHE_GRACE_S and (other_build or idle > CACHE_UNUSED_DAYS * 86400):
                 os.remove(p)
-            except OSError:
-                pass                               # in use by a concurrent run: next time
+        except OSError:
+            pass                       # gone, or held by a concurrent run: the next run retries
 
 
 def _cache_hit(path):
     """Whether a cache entry exists; marks it used if so (see prune_cache)."""
     if not os.path.exists(path):
         return False
-    os.utime(path)
+    try:
+        os.utime(path)
+    except OSError:
+        pass                           # held open or read-only: still a hit, just not marked
     return True
 
 

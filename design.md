@@ -9663,26 +9663,31 @@ to `genRay`'s film mapping.
 ## Output retention (`tools/clean_outputs.py`)
 
 ftrace deletes nothing it writes; `tools/clean_outputs.py` prunes `png/`, `scraps/` and
-`gallery/`, and the local `build.bat` runs it with `--delete` after every successful build.
-Five rules, each a property of the file rather than a guess about intent ("written" is the
-later of mtime and creation time, so a copy is as new as the copying):
+`gallery/` (the maintainer's local, untracked `build.bat` runs it with `--delete` after every
+successful build). Five rules, each a property of the file rather than a guess about intent
+("written" is the later of mtime and creation time, so a copy is as new as the copying):
 
-- a checkpoint or HDR sidecar not written for a week — except a numbered sequence's
-  checkpoints, which loom resumes and re-develops exposure from, and which go with the frames;
-- the numbered frames of a sequence once a video beside them is newer than all of them and
-  either is named for the set and holds at least as many frames, or is beside no other set and
-  holds exactly as many (counted with PIL / ffprobe, so a gif that subsamples releases
-  nothing; a shared prefix is no match — `rain.mp4` is not `rain_axicon_fly`'s);
+- a checkpoint, or an HDR sidecar (a `.pfm` beside an image of its stem; a lone `.pfm` is an
+  input), not written for a week — except a numbered sequence's, which loom resumes and
+  re-develops exposure from and `grade_hdr.py` grades from, and which go with the frames;
+- the numbered frames of a sequence once a video beside them was modified after all of them
+  (its own mtime: an old video copied back in is as old as its content) and either is named
+  for the set and holds at least as many frames, or is beside no other set and holds exactly
+  as many (counted with PIL / ffprobe, so a gif that subsamples releases nothing; a shared
+  prefix is no match — `rain.mp4` is not `rain_axicon_fly`'s);
 - a photon map whose format is older than the oldest `loadPhotonMap` reads (read off
   `src/photonmap_io.h`, so the rule follows the loader; a newer format is never touched);
-- week-old scraps data: anything but source text of up to 1 MB.
+- week-old scraps data: anything but source text, and a text dump (`.txt`, `.csv`, `.json`,
+  `.html`) over 1 MB — a scene or script is source at any size.
 
 Four exclusions bind every rule: git tracks it; something cites it; a live render writes under
-it (the stop channel's `<pid>.run` registrations, each pid checked alive); it is reached
-through a junction or symlink. Citation is a closure. The seeds are every source outside the
+it (the stop channel's `<pid>.run` registrations, found where ftrace's GetTempPath puts them,
+each pid checked alive); it is reached through a junction or symlink. Paths are compared
+case-insensitively on Windows. Citation is a closure. The seeds are every source outside the
 output roots — tracked, untracked, and ignored local notes and scripts, but not environments,
 caches, build directories or vendored code. A citation is a path into an output root (a file;
-a directory, standing for its own sources; a glob, braces expanded) or a quoted file name
+a directory, standing for its own sources; a glob, braces expanded, `*` within one directory;
+runs of slashes collapsed, as a string literal doubles them) or a quoted file name
 resolved beside the citer, from the root, or from the top of each output root. Cited sources,
 OBJ/MTL files (their `mtllib` and map lines) and glTF files are read in turn, so a known-issues
 repro keeps its script, the mesh the script loads and the mesh's textures. Everything runs off
@@ -9865,8 +9870,9 @@ User-facing rules: REFERENCE.md → *How long output is kept*. Regression check:
   content hash. Iterating on `--tether`/`--jitter`/`--seed` then skips both. The cache
   prunes itself on every polygonisation (`prune_cache`): a polygonisation's name carries
   the ftrace build it was keyed on, so one by any other build -- which no run can hit again
-  -- is deleted, and so is any entry unused for 30 days (a hit refreshes the mtime). Before
-  that, every rebuild orphaned the lot and nothing removed them (4.3 GB by 2026-10). Per-phase
+  -- is deleted, and so is any entry unused for 30 days (a hit refreshes the mtime). Nothing
+  used or written in the last hour goes, so a concurrent run still on the previous build keeps
+  the entry it has just hit or is writing. Per-phase
   timings are printed so a slow or non-converging bake is visible rather than silent.
 
 - **`make_klein_collar.py`** — **RETIRED 2026-08-03** (deleted with `meshes/collar_klein.obj`

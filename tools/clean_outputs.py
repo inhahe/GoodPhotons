@@ -17,11 +17,15 @@ modification time says):
           hours of the render, not weeks. A numbered sequence's checkpoints are the exception:
           loom resumes a sequence by them (`render_range(skip_existing=True)`) and re-develops
           its exposure from them, so they stay until the frames rule takes the sequence.
-  pfm     A `-hdr` sidecar under png/ or gallery/ older than --days: written for a comparison
-          that has since been made.
+  pfm     A `-hdr` sidecar under png/ or gallery/ older than --days: a .pfm beside the image (or
+          checkpoint) of the same stem, written for a comparison that has since been made. A
+          .pfm alone is an input (an environment map, a reference) and stays; a numbered
+          sequence's go with its frames, since a sequence is graded from them
+          (tools/grade_hdr.py) until its video is made.
   frames  The numbered frames under png/ (`<name>000.png` ..., at least 8 of them) of a set
           already assembled into a video beside them, with each frame's .ftbuf, .pfm, .ppm and
-          .jpg -- at any age. The video must be newer than every frame and either be named for
+          .jpg -- at any age. The video must have been modified after every frame was written
+          (its modification time: a copy of an old video is as old as its content) and either be named for
           the set (`<name>.mp4` for `<name>000.png`) and hold at least as many frames, or be
           beside no other set and hold exactly as many (a flyby's own directory, whose video
           is often named for its frame rate). Frames are counted with PIL for a gif, ffprobe
@@ -30,8 +34,8 @@ modification time says):
   pmap    A photon map (`-savemap`) whose format is older than the oldest one the loader in
           src/photonmap_io.h still reads. A newer or unrecognised format is left alone.
   scraps  A file in scraps/ older than --days that is data rather than a script, scene or note:
-          anything not source text, and any file over 1 MB whatever its name. scraps/.settle_cache
-          is left to tools/settle_scene.py, which prunes its own.
+          anything not source text, and a text dump (.txt, .csv, .json, .html) over 1 MB.
+          scraps/.settle_cache is left to tools/settle_scene.py, which prunes its own.
 
 Never touched, by any rule:
   - a file git tracks;
@@ -40,8 +44,9 @@ Never touched, by any rule:
     and scripts (CLAUDE.md, notes/, the root .bat files), but not virtual environments, build
     directories or vendored code. A citation is a path into png/, scraps/ or gallery/ (a file;
     a directory, standing for the scripts, scenes and notes directly in it; a glob, braces
-    included), or a quoted file name resolved beside the citing file, from the repo root, or
-    from the top of an output root (a test that joins "_sphere.vdb" onto its scraps path).
+    included, whose `*` stops at a `/`), or a quoted file name resolved beside the citing file,
+    from the repo root, or from the top of an output root (a test that joins "_sphere.vdb" onto
+    its scraps path). On Windows a citation matches whatever its case.
     Cited sources, OBJ/MTL files and glTF files are read in turn, so a repro script keeps the
     mesh it loads and the mesh its textures;
   - anything under the output directory of a live ftrace process (its stop-channel registration
@@ -51,7 +56,6 @@ Never touched, by any rule:
 import argparse
 import bisect
 import collections
-import fnmatch
 import os
 import re
 import subprocess
@@ -73,14 +77,18 @@ SOURCE_EXT = {".md", ".py", ".ftsl", ".txt", ".bat", ".cmd", ".ps1", ".sh", ".js
 # textures, a glTF's buffers and images.
 ASSET_REF_EXT = {".obj", ".mtl", ".gltf"}
 SCAN_CAP = 4 * MB          # how much of an output file or an ignored file is read for citations
+# Text formats tools dump into: over SCRAPS_DATA_SIZE one is data, not a note. A scene or a
+# script is source at any size (a groom scene with explicit strands runs to megabytes).
+DUMP_EXT = {".txt", ".csv", ".json", ".html"}
 SCRAPS_DATA_SIZE = 1 * MB
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".ppm")   # what `-o` writes, beside which `-hdr` puts a .pfm
 VIDEO_EXT = {".gif", ".mp4", ".webm", ".mov", ".avi", ".mkv"}
 FRAME_SIBLINGS = (".png.ftbuf", ".pfm", ".ppm", ".jpg")
 MIN_FRAMES = 8
 FRAME_RE = re.compile(r"^(?P<stem>.*?)(?P<num>\d{2,})\.png$", re.IGNORECASE)
 # Directories whose files cite nothing of ours: environments, caches, CMake output, vendored code.
 NOT_SOURCE_DIRS = {".git", ".venv", "venv", "node_modules", "site-packages", "__pycache__",
-                   ".pytest_cache", ".mypy_cache", ".vs", ".claude", "third_party"}
+                   ".pytest_cache", ".mypy_cache", ".vs", ".claude", "third_party", "out"}
 # A path into an output root, as a script, scene or document writes it: either slash, any
 # leading ../ dropped (which resolves it from the repo root, where every such path points), and
 # glob and brace characters kept.
@@ -104,14 +112,28 @@ def git_files(*args):
     return [f for f in r.stdout.decode("utf-8", "replace").split("\0") if f]
 
 
+def key(r):
+    """The lookup form of a repo-relative path: Windows paths are case-insensitive, so a citation
+    spelled `Scraps/Mesh.obj` names `scraps/mesh.obj`."""
+    return r.lower() if os.name == "nt" else r
+
+
 def under_pruned(r):
-    return r.split("/", 1)[0] in PRUNED
+    return r.split("/", 1)[0].lower() in PRUNED
 
 
 def is_source(name, size):
     """Whether a file under an output root is a script, scene or note rather than data: source
-    text no larger than SCRAPS_DATA_SIZE (a bigger "text" file is a dump or a log)."""
-    return os.path.splitext(name)[1].lower() in SOURCE_EXT and size <= SCRAPS_DATA_SIZE
+    text, and if it is in a dump format, no larger than SCRAPS_DATA_SIZE."""
+    ext = os.path.splitext(name)[1].lower()
+    return ext in SOURCE_EXT and (ext not in DUMP_EXT or size <= SCRAPS_DATA_SIZE)
+
+
+def glob_re(pat):
+    """A glob as a regex whose `*` and `?` stop at a `/`, so `scraps/rig/*` names the files in
+    scraps/rig and not those in its subdirectories, as a directory citation does."""
+    return re.compile("".join("[^/]*" if c == "*" else "[^/]" if c == "?" else re.escape(c)
+                              for c in pat) + r"\Z")
 
 
 def is_link(full):
@@ -126,8 +148,8 @@ def age_stamp(st):
 
 
 class Tree:
-    """Every file under the output roots, walked once: repo-relative path -> os.stat result, the
-    files of each directory, and a sorted list for directory and glob lookups."""
+    """Every file under the output roots, walked once: key(repo-relative path) -> os.stat
+    result, the files of each directory, and a sorted list for directory and glob lookups."""
 
     def __init__(self):
         self.stat = {}
@@ -139,11 +161,15 @@ class Tree:
                 for f in files:
                     full = os.path.join(d, f)
                     try:
-                        self.stat[rel(full)] = os.stat(full)
+                        self.stat[key(rel(full))] = os.stat(full)
                     except OSError:
                         continue
                     self.dirs[d].append(f)
         self.sorted = sorted(self.stat)
+
+    def of(self, full):
+        """The stat of the file at the full path `full`, which the walk found."""
+        return self.stat[key(rel(full))]
 
     def under(self, prefix):
         """The files whose repo-relative path starts with `prefix`."""
@@ -153,18 +179,20 @@ class Tree:
             i += 1
 
     def match(self, r, wide):
-        """The files the repo-relative path `r` names: itself; with `wide`, also every match
-        when it is a glob, and the scripts, scenes and notes directly in it when it is a
+        """The files (as keys) the repo-relative path `r` names: itself; with `wide`, also every
+        match when it is a glob, and the scripts, scenes and notes directly in it when it is a
         directory below a root. A cited directory is a rig, and what its scripts and scenes
         load is protected through them; protecting all of it would keep a tool's whole default
         output directory -- every checkpoint and sidecar in it -- for good."""
+        r = key(r)
         if r in self.stat:
             return {r}
         if not wide:
             return set()
         if "*" in r or "?" in r:
             lit = r[:min(i for i in (r.find("*"), r.find("?")) if i >= 0)]
-            return {f for f in self.under(lit.rsplit("/", 1)[0] + "/") if fnmatch.fnmatchcase(f, r)}
+            pat = glob_re(r)
+            return {f for f in self.under(lit.rsplit("/", 1)[0] + "/") if pat.match(f)}
         d = r.rstrip("/")
         if d in PRUNED or "/" not in d:
             return set()                      # a whole output root is no citation
@@ -185,11 +213,11 @@ def citations(path, text, tree):
     """The repo-relative output files that the file at `path` names."""
     here = os.path.dirname(path)
     out = set()
-    root = os.path.join(ROOT, "")
+    root = os.path.normcase(os.path.join(ROOT, ""))
 
     def named(c, wide, bases):
         for base in bases:
-            full = os.path.normpath(os.path.join(base, c))
+            full = os.path.normcase(os.path.normpath(os.path.join(base, c)))
             if full.startswith(root):
                 r = full[len(root):].replace(os.sep, "/")
                 if under_pruned(r):
@@ -201,7 +229,8 @@ def citations(path, text, tree):
                 named(tok, False, (here,))
         return out
     for m in CITE_RE.finditer(text):
-        for c in expand_braces(m.group(1).replace("\\", "/").rstrip(".,:;")):
+        # A run of slashes is one separator: a string literal writes scraps\\x\\y.npy.
+        for c in expand_braces(re.sub(r"[\\/]+", "/", m.group(1)).rstrip(".,:;")):
             out.update(tree.match(c, True))
     roots = tuple(os.path.join(ROOT, r) for r in PRUNED)
     for m in QUOTED_RE.finditer(text):
@@ -213,12 +242,12 @@ def ignored_sources():
     """Ignored text sources outside the output roots: local notes and scripts such as CLAUDE.md,
     notes/ and the root .bat files -- not environments, caches or build directories."""
     def skipped(seg):
-        return seg in NOT_SOURCE_DIRS or seg.lower().startswith("build")
+        return seg.lower() in NOT_SOURCE_DIRS or seg.lower().startswith("build")
 
     out = []
     for e in git_files("--others", "--ignored", "--exclude-standard", "--directory"):
         segs = e.rstrip("/").split("/")
-        if segs[0] in PRUNED or any(skipped(s) for s in (segs if e.endswith("/") else segs[:-1])):
+        if segs[0].lower() in PRUNED or any(skipped(s) for s in (segs if e.endswith("/") else segs[:-1])):
             continue
         if not e.endswith("/"):
             if os.path.splitext(e)[1].lower() in SOURCE_EXT:
@@ -236,7 +265,7 @@ def protected_files(tracked, tree):
     a doc cites scraps/repro.py, which loads scraps/repro_mesh.obj, which names its .mtl."""
     curated = set(tracked) | set(git_files("--others", "--exclude-standard"))
     todo = [(f, None) for f in curated if os.path.splitext(f)[1].lower() in SOURCE_EXT
-            and not NOT_SOURCE_DIRS.intersection(f.split("/")[:-1])]
+            and not NOT_SOURCE_DIRS.intersection(f.lower().split("/")[:-1])]
     todo += [(f, SCAN_CAP) for f in ignored_sources()]
     seen, cited = {f for f, _ in todo}, set()
     while todo:
@@ -282,7 +311,14 @@ def pid_alive(pid):
 
 
 def stop_channel_dir():
-    """Where every ftrace process registers itself (stopChannelDir in src/main.cpp)."""
+    """Where every ftrace process registers itself (stopChannelDir in src/main.cpp:
+    std::filesystem::temp_directory_path, i.e. GetTempPath on Windows, whose TMP-first order
+    differs from Python's TMPDIR-first one)."""
+    if os.name == "nt":
+        import ctypes
+        buf = ctypes.create_unicode_buffer(32768)
+        if ctypes.WinDLL("kernel32").GetTempPathW(len(buf), buf):
+            return os.path.join(buf.value, "ftrace")
     return os.path.join(tempfile.gettempdir(), "ftrace")
 
 
@@ -347,7 +383,7 @@ def frame_sets(files):
 
 def find(rules, days):
     """[(rule, full path, size)] of everything the rules would delete."""
-    tracked = set(git_files())
+    tracked = {key(f) for f in git_files()}
     tree = Tree()
     keep = protected_files(tracked, tree)
     live = live_output_dirs()
@@ -355,7 +391,7 @@ def find(rules, days):
     out, taken = [], set()
 
     def take(rule, full):
-        r = rel(full)
+        r = key(rel(full))
         if r in tracked or r in keep or r in taken or r not in tree.stat:
             return
         nd = os.path.normcase(os.path.abspath(full))
@@ -365,30 +401,32 @@ def find(rules, days):
         out.append((rule, full, tree.stat[r].st_size))
 
     def old(full):
-        return age_stamp(tree.stat[rel(full)]) < cutoff
+        return age_stamp(tree.of(full)) < cutoff
 
     def in_root(d, *tops):
-        return rel(d).split("/", 1)[0] in tops
+        return rel(d).split("/", 1)[0].lower() in tops
 
-    sequence_frames = set()                       # full paths of every numbered frame
+    sequence_frames = set()                       # normcase'd full paths of every numbered frame
     for d, files in tree.dirs.items():
         if not in_root(d, "png", "gallery"):
             continue
         sets = frame_sets(files)
         for frames in sets.values():
-            sequence_frames.update(os.path.join(d, f) for f in frames)
+            sequence_frames.update(os.path.normcase(os.path.join(d, f)) for f in frames)
         if "frames" not in rules or not in_root(d, "png"):
             continue
         vids = [f for f in files if os.path.splitext(f)[1].lower() in VIDEO_EXT]
         for stem, frames in sets.items():
-            key = stem.lower().rstrip("_-. ")
-            newest = max(age_stamp(tree.stat[rel(os.path.join(d, f))]) for f in frames)
+            skey = stem.lower().rstrip("_-. ")
+            newest = max(age_stamp(tree.of(os.path.join(d, f))) for f in frames)
             covered = False
             for v in vids:
                 vfull = os.path.join(d, v)
-                if age_stamp(tree.stat[rel(vfull)]) < newest - 2.0:
+                # The video's own modification time: a copy of an old video made after the
+                # frames were re-rendered is as old as its content, not as new as the copy.
+                if tree.of(vfull).st_mtime < newest - 2.0:
                     continue                      # older than a frame: may not show it
-                named = os.path.splitext(v)[0].lower().rstrip("_-. ") == key
+                named = os.path.splitext(v)[0].lower().rstrip("_-. ") == skey
                 if not named and len(sets) != 1:
                     continue
                 n = video_frames(vfull)
@@ -406,13 +444,19 @@ def find(rules, days):
     for d, files in tree.dirs.items():
         if not in_root(d, "png", "gallery"):
             continue
+        names = {f.lower() for f in files}
         for f in files:
             low = f.lower()
             full = os.path.join(d, f)
             if "ftbuf" in rules and low.endswith(".ftbuf") and old(full) \
-                    and full[:-len(".ftbuf")] not in sequence_frames:
+                    and os.path.normcase(full[:-len(".ftbuf")]) not in sequence_frames:
                 take("ftbuf", full)
-            elif "pfm" in rules and low.endswith(".pfm") and old(full):
+            # A `-hdr` sidecar: a .pfm beside the image (or checkpoint) of the same stem. A .pfm
+            # alone is an input (an environment map, a reference), and a sequence's frames go
+            # with the sequence, for grading (tools/grade_hdr.py) until its video is made.
+            elif "pfm" in rules and low.endswith(".pfm") and old(full) \
+                    and any(low[:-4] + e in names for e in IMAGE_EXT + (".png.ftbuf",)) \
+                    and os.path.normcase(full[:-4] + ".png") not in sequence_frames:
                 take("pfm", full)
 
     if "pmap" in rules:
@@ -426,8 +470,12 @@ def find(rules, days):
                     if os.path.splitext(f)[1].lower() not in (".ftpmap", ".ftpm", ".pmap", ".map"):
                         continue
                     full = os.path.join(d, f)
-                    with open(full, "rb") as fh:
-                        m = re.match(rb"FTPMP(\d\d)\n", fh.read(8))
+                    try:
+                        with open(full, "rb") as fh:
+                            m = re.match(rb"FTPMP(\d\d)\n", fh.read(8))
+                    except OSError as e:
+                        print("[clean] cannot read %s (%s); left alone" % (rel(full), e.strerror))
+                        continue
                     if m and int(m.group(1)) < oldest:
                         take("pmap", full)
 
@@ -437,7 +485,7 @@ def find(rules, days):
                 continue
             for f in files:
                 full = os.path.join(d, f)
-                if old(full) and not is_source(f, tree.stat[rel(full)].st_size):
+                if old(full) and not is_source(f, tree.of(full).st_size):
                     take("scraps", full)
     return out
 
@@ -488,9 +536,12 @@ def main():
         except OSError as e:
             failed.append("%s: %s" % (rel(full), e.strerror))
     for d in sorted(dirs, key=len, reverse=True):           # directories the rules emptied,
-        while "/" in rel(d) and os.path.isdir(d) and not os.listdir(d):   # never a root itself
-            os.rmdir(d)
-            d = os.path.dirname(d)
+        try:                                                 # never a root itself
+            while "/" in rel(d) and os.path.isdir(d) and not os.listdir(d):
+                os.rmdir(d)
+                d = os.path.dirname(d)
+        except OSError:
+            pass                       # held open (Explorer, a viewer's cwd): an empty dir stays
     print("freed %.2f GB in %d files" % (freed / (1 << 30), len(found) - len(failed)))
     for f in failed:
         print("  could not delete " + f)
