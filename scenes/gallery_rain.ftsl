@@ -2394,8 +2394,8 @@ mesh "cp_turquoise" { file "meshes/compote_with_gems.glb"  import_materials no
 # Jakob-Hanika reflectance, a marble slab rescaled to a target albedo. She is painted from the
 # GLB's 2048^2 baseColor, normal and metallic-roughness atlases: the scene's demonstration that a
 # spectral forward renderer can eat an off-the-shelf textured asset. Her dress's sequins are a
-# clean metal mask in that map, and the loader types the dress by the map's mean (non-metal)
-# unless the render passes `-import-metal mix`.
+# clean metal mask in that map, which her mesh block reads texel by texel (`import_metal mix`
+# in alice2_gallery.ftsl), so the sequins glint as metal in the sun.
 #
 # THE FALLBACK MATERIAL IS NOT DECORATION. FTSL requires one on every `mesh` and it is what
 # the primitives get if the glTF material fails to import, so it has to be a value that would

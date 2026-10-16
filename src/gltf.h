@@ -56,7 +56,8 @@
 // the same render time, and the default is layered again.
 namespace gltfimp { inline int dielectricSpecular = 2; }
 // `-import-metal mix`: honour a metallicRoughness map's metalness PER TEXEL, as a two-lobe
-// body chosen by the map, instead of typing the whole material by the map's mean. OFF by
+// body chosen by the map, instead of typing the whole material by the map's mean -- for every
+// mesh that does not choose for itself with `import_metal mix|mean` (see loadGltf). OFF by
 // default because the assets this would change are AI-generator exports whose metalness is a
 // mid-grey nobody intended physically (Alice's map: max 0.612, i.e. no metal anywhere, yet a
 // 0.281 mean makes the dress visibly metallic when honoured). Turning it on is a look
@@ -422,10 +423,16 @@ struct GltfSection {
     std::vector<Tri> ref;             // a skipped primitive's triangles, world space
 };
 
+// `metalMix`: how this file's part-metal metallicRoughness maps are read -- 1 texel by texel
+// (a mesh block's `import_metal mix`), 0 by the map's mean (`import_metal mean`), -1 as the
+// `-import-metal` flag says (gltfimp::metalMixImport), which is the default for every mesh that
+// does not choose.
 inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& xf,
                     bool importMaterials, std::string& err,
                     const std::vector<std::string>& skipMaterials = {},
-                    std::vector<GltfSection>* sections = nullptr) {
+                    std::vector<GltfSection>* sections = nullptr,
+                    int metalMix = -1) {
+    const bool honourMetal = metalMix < 0 ? gltfimp::metalMixImport : metalMix == 1;
     using namespace gltfimpl;
     const auto _gltfT0 = std::chrono::steady_clock::now();
     const double _gltfTex0 = gltfimpl::g_texDecodeMs;   // running total; differenced at the end
@@ -686,17 +693,18 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
         return id;
     };
 
-    // --- the -import-metal hint (0.368.1) ---------------------------------------------
+    // --- the import_metal hint (0.368.1) ----------------------------------------------
     // A material whose metalness map is part metal is typed by the map's MEAN unless
-    // `-import-metal mix` is given, and that default is defensive: AI-generated assets often
-    // carry a murky mid-grey metalness nobody meant physically (the Meshy Alice: 86 % of texels
-    // between 0.15 and 0.85), which per-texel import turns into metallic-looking paint and fabric.
+    // `import_metal mix` (or `-import-metal mix`) is given, and that default is defensive:
+    // AI-generated assets often carry a murky mid-grey metalness nobody meant physically (the
+    // Meshy Alice: 86 % of texels between 0.15 and 0.85), which per-texel import turns into
+    // metallic-looking paint and fabric.
     // A CLEAN map -- nearly every texel clearly metal or clearly not -- is the opposite case, an
     // intentional mask (sequins, trim, inlay), and there the mean is exactly wrong. So the
     // loader measures the murky share and says which case it is looking at, once per distinct
     // map; it does not act on it. Thresholds from the assets on hand: the sequinned Alice 0 %,
     // then nothing below 39 % (the Meshy vacuum chamber).
-    // `mixOn`: the flag is already given, so the verdict confirms it or warns against it.
+    // `mixOn`: the per-texel reading is already chosen, so the verdict confirms it or warns.
     auto metalVerdict = [](double murky, bool mixOn) -> std::string {
         char b[512];
         if (mixOn) {
@@ -706,16 +714,16 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
             else if (murky >= 0.30)
                 std::snprintf(b, sizeof b, "the map is MURKY (%.1f%% of its texels are between 0.15 and 0.85), "
                               "which reads as generator noise -- if paint or fabric now looks metallic, "
-                              "drop -import-metal mix", 100.0 * murky);
+                              "drop import_metal mix", 100.0 * murky);
             else
                 std::snprintf(b, sizeof b, "the map is PARTLY MURKY (%.1f%% of its texels are between 0.15 "
-                              "and 0.85) -- compare with a render without -import-metal mix", 100.0 * murky);
+                              "and 0.85) -- compare with a render without import_metal mix", 100.0 * murky);
             return b;
         }
         if (murky < 0.10)
             std::snprintf(b, sizeof b, "the map is CLEAN (only %.1f%% of its texels are between 0.15 and "
                           "0.85; the rest are clearly metal or clearly not), which reads as an "
-                          "intentional metal mask -- you probably WANT -import-metal mix", 100.0 * murky);
+                          "intentional metal mask -- you probably WANT import_metal mix", 100.0 * murky);
         else if (murky >= 0.30)
             std::snprintf(b, sizeof b, "the map is MURKY (%.1f%% of its texels are between 0.15 and 0.85, "
                           "neither metal nor not), which reads as generator noise -- the default "
@@ -723,7 +731,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
         else
             std::snprintf(b, sizeof b, "the map is PARTLY MURKY (%.1f%% of its texels are between 0.15 "
                           "and 0.85) -- it could go either way; compare a render with and without "
-                          "-import-metal mix", 100.0 * murky);
+                          "import_metal mix", 100.0 * murky);
         return b;
     };
     std::vector<std::pair<int, double>> metalHinted;   // (image source, metallicFactor) already reported
@@ -834,26 +842,27 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                 // When the map is neither mostly-metal nor mostly-dielectric, the body becomes
                 // TWO lobes chosen per texel by the map. The window is deliberately wide: a map
                 // that is 99 % one thing is typed as that one thing and imports bit-identically.
-                const bool metalMix = (gltfimp::metalMixImport && mrTex.index >= 0 &&
-                                       khrTransmission < 0.5 &&
-                                       metalFrac > 0.02 && metalFrac < 0.98);
+                const bool partMetal = (mrTex.index >= 0 && khrTransmission < 0.5 &&
+                                        metalFrac > 0.02 && metalFrac < 0.98);
+                const bool mixBody = honourMetal && partMetal;
                 int metalTexId = -1;
                 const minijson::Value* matNameV = mj.find("name");
                 const std::string matName = (matNameV && matNameV->isString()) ? matNameV->str
                                                                             : "#" + std::to_string(i);
-                if (!gltfimp::metalMixImport && mrTex.index >= 0 && khrTransmission < 0.5 &&
-                    metalFrac > 0.02 && metalFrac < 0.98 && firstHint(mrTex.index, metalFactor0))
+                // A mesh that chose `import_metal mean` has decided: no hint for it.
+                if (!honourMetal && metalMix < 0 && partMetal && firstHint(mrTex.index, metalFactor0))
                     std::fprintf(stderr,
                         "[gltf] %s: material \"%s\" is part metal (%.1f%% of its texels have metalness >= 0.5; "
                         "mean %.3f), so it is imported as %s -- the whole material typed by the map's mean.\n"
-                        "       `-import-metal mix` would honour the map texel by texel instead: metal where it "
-                        "says metal, the dielectric elsewhere. The mean is the default because AI-generated "
-                        "maps are often a murky mid-grey nobody meant physically, which per-texel import turns "
-                        "into metallic-looking paint and fabric.\n"
+                        "       `import_metal mix` on the mesh block (or -import-metal mix, for every mesh) "
+                        "would honour the map texel by texel instead: metal where it says metal, the "
+                        "dielectric elsewhere. The mean is the default because AI-generated maps are often a "
+                        "murky mid-grey nobody meant physically, which per-texel import turns into "
+                        "metallic-looking paint and fabric.\n"
                         "       For this model: %s.\n",
                         authored.c_str(), matName.c_str(), 100.0 * metalFrac, metallic,
                         metallic >= 0.5 ? "METAL" : "NON-METAL", metalVerdict(murkyFrac, false).c_str());
-                if (metalMix) {
+                if (mixBody) {
                     metalTexId = bindTex(mrTex.index, TexRole::Metalness, metalFactor0, 0.0, 0.0, nullptr);
                     if (metalTexId < 0) {
                         std::fprintf(stderr, "[gltf] %s: metalness map could not be bound -- "
@@ -899,7 +908,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                             m.absorbRefDist = attDist;   // preview hint; see Material
                         }
                     }
-                } else if (metalMix) {
+                } else if (mixBody) {
                     // MIXED metalness (0.339.0): neither answer is right for the whole
                     // surface, so the body becomes two lobes picked per texel by the map.
                     // Built as the dielectric below -- the metal lobe is spliced in after the
@@ -1010,7 +1019,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                 // body-lobe list of the layered stack rather than wrapping it -- wrapping would
                 // nest Mix over Layered, which neither backend unwraps, and the dielectric would
                 // silently shade through the `default:` branch.
-                if (metalMix && metalTexId >= 0) {
+                if (mixBody && metalTexId >= 0) {
                     Material metal;
                     metal.type = MatType::Glossy;
                     metal.reflect = rgbToReflectanceJH(r, g, b);   // glTF: base colour IS the metal's tint
@@ -1052,7 +1061,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                     }
                     if (firstHint(mrTex.index, metalFactor0))
                         std::fprintf(stderr, "[gltf] %s: material \"%s\": metalness map is mixed (%.1f%% of texels "
-                                             "metal, mean %.3f) -- -import-metal mix splits the body into a metal "
+                                             "metal, mean %.3f) -- import_metal mix splits the body into a metal "
                                              "lobe and a dielectric one, chosen per texel.\n"
                                              "       For this model: %s.\n",
                                      authored.c_str(), matName.c_str(), 100.0 * metalFrac, metallic,

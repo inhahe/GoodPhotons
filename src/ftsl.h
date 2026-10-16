@@ -327,6 +327,19 @@ inline std::string strOf(const Block& b, const char* key, const std::string& dfl
     const Stmt* s = find(b, key);
     return (s && !s->val.words.empty()) ? s->val.words[0] : dflt;
 }
+// A mesh or mesh_asset block's `import_metal mix|mean`: how its glTF's part-metal
+// metallicRoughness maps are read -- 1 texel by texel, 0 by the map's mean, -1 (absent) as the
+// `-import-metal` flag says (loadGltf's `metalMix`). Any other value is an error, written to
+// `err`, and -2 is returned.
+inline int importMetalOf(const Block& b, std::string& err) {
+    const std::string v = strOf(b, "import_metal");
+    if (v.empty()) return -1;
+    if (v == "mix") return 1;
+    if (v == "mean") return 0;
+    err = "import_metal must be `mix` (honour the metalness map texel by texel) or `mean` "
+          "(type the material by the map's mean), not `" + v + "`";
+    return -2;
+}
 inline bool vec3Of(const Block& b, const char* key, Vec3& out) {
     const Stmt* s = find(b, key);
     if (!s || s->val.words.size() < 3) return false;
@@ -5871,6 +5884,14 @@ private:
             ext = file.substr(dot);
             for (char& c : ext) c = (char)std::tolower((unsigned char)c);
         }
+        std::string imErr;
+        const int importMetal = importMetalOf(b, imErr);
+        if (importMetal == -2) { fail("mesh: " + imErr); return false; }
+        if (importMetal >= 0 && ext != ".gltf" && ext != ".glb") {
+            fail("mesh: import_metal reads a glTF metallicRoughness map, and \"" + file +
+                 "\" is not a .gltf/.glb");
+            return false;
+        }
         if (ext == ".gltf" || ext == ".glb") {
             bool importMats = (strOf(b, "import_materials") != "no");
             // `skip_material <substr>[,<substr>…]` (glTF/GLB only), repeatable: drop
@@ -5885,7 +5906,7 @@ private:
             {
                 detail::AssetTimer _at;
                 if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr, skipMats,
-                             keepSectionsRef() ? &gltfSecs : nullptr) == 0
+                             keepSectionsRef() ? &gltfSecs : nullptr, importMetal) == 0
                     && !gerr.empty()) {
                     fail("mesh: " + gerr); return false;
                 }
@@ -6177,13 +6198,22 @@ private:
             ext = file.substr(dot);
             for (char& c : ext) c = (char)std::tolower((unsigned char)c);
         }
+        std::string imErr;                                // see the mesh block
+        const int importMetal = importMetalOf(b, imErr);
+        if (importMetal == -2) { fail("mesh_asset: " + imErr); return false; }
+        if (importMetal >= 0 && ext != ".gltf" && ext != ".glb") {
+            fail("mesh_asset: import_metal reads a glTF metallicRoughness map, and \"" + file +
+                 "\" is not a .gltf/.glb");
+            return false;
+        }
         if (ext == ".gltf" || ext == ".glb") {
             bool importMats = (strOf(b, "import_materials") != "no");
             std::string gerr;
             std::vector<std::string> skipMats = wordListOf(b, "skip_material");  // see the mesh block
             {
                 detail::AssetTimer _at;
-                if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr, skipMats) == 0
+                if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr, skipMats, nullptr,
+                             importMetal) == 0
                     && !gerr.empty()) {
                     fail("mesh_asset: " + gerr); return false;
                 }

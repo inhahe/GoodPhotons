@@ -1804,14 +1804,18 @@ first version of this flag was, and the A/B silently compared two identical rend
 
 **The `-import-metal` hint (0.368.1).** A glTF material whose metalness map is part metal (2-98 %
 of texels at 0.5 or above) is typed by the map's mean unless `-import-metal mix` asks for it per
-texel. The default is defensive -- generator exports carry murky mid-grey metalness nobody meant
+texel -- or, per mesh, the block's `import_metal mix|mean` (0.382.0), which `importMetalOf`
+(ftsl.h) parses and `loadGltf` takes as `metalMix` (1 / 0, or -1 for "the flag decides"). The
+choice belongs to the asset, not the render: one scene's assets can want different readings,
+and a flag every render command must repeat is easy to drop (Alice2's sequins needed it on every
+gallery render). The default is defensive -- generator exports carry murky mid-grey metalness nobody meant
 (the Meshy Alice: 86 % of texels between 0.15 and 0.85) -- and exactly wrong for a clean mask (the
 sequinned Alice: 0 %). `bindTex` measures that murky share beside the mean and the metal fraction,
 and the loader prints, once per distinct map (a 7-material atlas used to repeat the old line seven
 times), what `mix` would do, why the mean is the default, and a verdict: under 10 % murky reads as
 an intentional mask (probably use `mix`), 30 % or more as noise (the mean is probably right). It
 only advises -- the user chose not to let it switch the default -- and with `mix` on it confirms or
-warns instead. The thresholds come from the assets on hand: nothing between 0 % and 39 %.
+warns instead; a mesh that chose `mean` gets no hint. The thresholds come from the assets on hand: nothing between 0 % and 39 %.
 
 **The preview honours `hide_camera` (0.368.2).** It used to draw every hidden fill flat as a solid
 white panel, on the theory that a viewport should show where its lights are -- which in a studio

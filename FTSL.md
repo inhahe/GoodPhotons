@@ -1742,6 +1742,22 @@ has the details. Add `import_materials no` to ignore glTF's materials and paint 
 primitive with the block's FTSL `material` instead. The block `material` is always
 the fallback for primitives that carry no material.
 
+`import_metal mix|mean` (glTF/GLB only, since 0.382.0) chooses, for this mesh, how a
+material whose **metalness map is part metal** is read. glTF defines metalness per texel,
+and a material here is one BSDF. **`mean`** types the whole material by the map's mean,
+which is right for the murky mid-grey maps AI generators emit. **`mix`** honours the map
+texel by texel: the body becomes a metal lobe and a dielectric one, chosen by the map,
+which is right for a clean mask (sequins, trim, inlay). Without the keyword the
+`-import-metal` flag decides, and its default is `mean`; with it, the mesh's choice wins
+over the flag. The loader prints, once per such map, which kind it looks like. Any other
+value, or the keyword on a non-glTF mesh, is an error.
+
+```
+mesh "alice2" { file "meshes/alice2_doll.glb"  material alice_unpainted
+    import_metal mix          # her dress's sequins are a clean metal mask: glint as metal
+    translate 9.15 0.9 3.55  scale 0.46 }
+```
+
 `skip_material <substr>[,<substr>…]` **drops** every primitive whose glTF material
 *name* contains one of the given substrings (case-insensitive). Asset-store models
 routinely bundle a backdrop into the same file as the subject — a ground plane, a
@@ -1842,6 +1858,7 @@ mesh_asset "ball" {           # load ONCE into local space (no world transform)
     uv use_mesh               # optional: read OBJ vt
     usemtl use_names          # optional: per-usemtl-group material by name
     import_materials no       # optional (glTF): ignore glTF materials
+    import_metal mix          # optional (glTF): read a metalness map per texel (see `mesh`)
     skip_material ground      # optional (glTF): drop prims by material name
 }
 

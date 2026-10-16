@@ -212,8 +212,11 @@ def main():
            "# blocks' lengths are times the scale %.6f." % s,
            "",
            "# the doll, her sculpted hair (glTF material root.1) left out for the strands below; the",
-           "# fallback material is gallery_rain's `alice_unpainted`",
+           "# fallback material is gallery_rain's `alice_unpainted`. `import_metal mix`: her dress's",
+           "# sequins are a clean metal mask in the metallicRoughness map, read texel by texel so",
+           "# they glint as metal (by the map's mean the whole dress is non-metal, the sparkle only paint)",
            'mesh "alice2" { file "meshes/alice2_doll.glb"  material alice_unpainted  skip_material root.1',
+           "    import_metal mix",
            "    " + xf + " }",
            ""]
 
