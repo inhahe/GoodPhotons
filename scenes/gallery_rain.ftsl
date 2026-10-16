@@ -1,8 +1,9 @@
 # Hero Room, WEATHER EDITION — the exhibits on an open GRID PLANE, with rain and a real bow.
 #
-# The same nine hero pieces, in the same places, as scenes/gallery_settled.ftsl (which stays
-# the canonical still + flyby scene; this is a separate edition, not a replacement — it is a
-# copy of that file, so re-bake it from gallery.ftsl the same way if the pieces ever move),
+# THIS IS THE GALLERY: the scene the still and the flyby are rendered from. It began as a copy
+# of scenes/gallery_settled.ftsl (the earlier, roofed edition, kept as it is) and holds the same
+# nine hero pieces in the same places; the settled poses came from re-baking gallery.ftsl, so a
+# moved piece is re-baked there and its pose carried here by hand,
 # plus a TENTH that exists only here: the CRYSTAL AXICON, front-left, which is the only piece
 # in either scene that throws a genuinely COLOURED caustic. See its own block down in HERO
 # PIECES for the measurements that chose its shape, angle and height.

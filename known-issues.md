@@ -24437,7 +24437,15 @@ pass (klein rescued 0.37→1.38, heart 0.14→1.12). The committed `gallery_sett
 swapping the five tumbled `group` deltas for the tether-settled values. (Distinct from the separate
 OPEN mode-D GPU-BDPT launch-failure on the same scene, logged 2026-07-15.)
 
-### TECH DEBT (2026-07-19): `scenes/gallery_settled.ftsl` has diverged from its authored source `scenes/gallery.ftsl`
+### CLOSED (2026-10-16, by decision): `scenes/gallery_settled.ftsl` has diverged from its authored source `scenes/gallery.ftsl`
+
+**Closed without the back-port.** Asked which of the two is canonical, the user answered that the
+scene in use is neither: it is `scenes/gallery_rain.ftsl`, whose header now says so.
+`gallery_settled.ftsl` stays as the earlier roofed edition, as it is; back-porting its hand edits
+into `gallery.ftsl` would serve only a regeneration nobody needs. If a hero piece moves, it is
+re-baked from `gallery.ftsl` and the pose carried into `gallery_rain.ftsl`.
+
+The original entry:
 The generated settled file was hand-edited by three later commits (4c86261 prefer{}/else{} camera
 mode-D/B fallback, f0786d6 flyby `frames 600`, bc9d664 scene-level `default_mode` + fps hint) that were
 **never back-ported** to the authored `scenes/gallery.ftsl` (still plain `camera mode D`, `frames 144`).
