@@ -3110,6 +3110,11 @@ Both expand into N `CamSpec` frames sharing `look_at`/`up`/`fov_y`/`mode`/`film`
 `lens`. Each frame's output file is `<base><zero-padded index>`, so a multi-camera
 render writes one PNG per frame ready for ffmpeg.
 
+A path's frames render when the path is selected: `-camera <base>` (all its frames,
+`-frames A B` for a range) or `-camera all`. A plain render of a scene that also has a
+still camera renders the stills and names each path it skipped (0.383.0); a scene with
+no still camera renders its paths.
+
 ### 15.1 `camera_path` — keyframed dolly
 ```
 camera_path "dolly" {

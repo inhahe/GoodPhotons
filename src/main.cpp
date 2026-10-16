@@ -21000,6 +21000,7 @@ static int run(int argc, char** argv) {
         // The index and nearest selectors make it easy to aim the live window at
         // one frame of a long camera_curve without hunting for its frame name.
         std::vector<const ftsl::CamSpec*> sel;
+        bool framesApplied = false;            // -frames took effect: a path was selected by name
         if (cameraSel && std::strcmp(cameraSel, "all") != 0) {
             const std::string q = cameraSel;
             if (!q.empty() && q[0] == '#') {
@@ -21066,6 +21067,7 @@ static int run(int argc, char** argv) {
                         std::printf("[camera] -frames %lld %lld -> %zu of the path's %zu frames (%s..%s)\n",
                                     framesLo, framesHi, kept.size(), sel.size(), kept.front()->name.c_str(), kept.back()->name.c_str());
                         sel.swap(kept);
+                        framesApplied = true;
                     }
                     if (!sel.empty()) {
                         // Resolve the flyby's playback fps hint (per-camera, else scene
@@ -21091,8 +21093,34 @@ static int run(int argc, char** argv) {
                     return 1;
                 }
             }
-        } else {
+        } else if (cameraSel) {                // `-camera all`
             for (const auto& cs : ftslScene.cameras) sel.push_back(&cs);
+        } else {
+            // No -camera: the scene's STILL cameras. A camera_path / camera_curve / orbit is a
+            // batch of frames -- hundreds of renders -- that a plain `-o out.png` almost never
+            // means, so a path renders when it is named (`-camera fly`) or with `-camera all`.
+            // A scene of paths alone renders them: that is all it has.
+            std::vector<std::pair<std::string, size_t>> skipped;   // path base, frames; declared order
+            for (const auto& cs : ftslScene.cameras) {
+                if (cs.pathBase.empty()) { sel.push_back(&cs); continue; }
+                auto it = std::find_if(skipped.begin(), skipped.end(),
+                                       [&](const auto& p) { return p.first == cs.pathBase; });
+                if (it == skipped.end()) skipped.emplace_back(cs.pathBase, 1);
+                else ++it->second;
+            }
+            if (sel.empty()) {
+                for (const auto& cs : ftslScene.cameras) sel.push_back(&cs);
+                skipped.clear();
+            }
+            for (const auto& [base, n] : skipped)
+                std::printf("[camera] path '%s' (%zu frames) is not rendered by default: "
+                            "-camera %s renders it, -camera all renders everything\n",
+                            base.c_str(), n, base.c_str());
+        }
+        if (framesLo >= 0 && !framesApplied) {
+            std::fprintf(stderr, "error: -frames %lld %lld selects frames of a camera path, so it needs "
+                                 "-camera <path base name> (e.g. -camera fly)\n", framesLo, framesHi);
+            return 1;
         }
         // Every camera's rendered mode, the -on-unsupported policy decided for the run at once
         // (resolveCameraModes): lens routing first, then whatever that mode cannot render.

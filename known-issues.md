@@ -29308,7 +29308,18 @@ Still open as a possible extension: mode `R`/`P` hit the same condition, where i
 as pathological convergence rather than a black frame, and would benefit from the same
 warning. The probe is mode-agnostic; only the call site is gated.
 
-## OPEN (minor, 2026-08-03): rendering a scene without `-camera` also renders its 600-frame flyby
+## DONE (2026-10-16, 0.383.0): rendering a scene without `-camera` also renders its 600-frame flyby
+
+**Resolved by changing the default** (the user left the choice to judgement): without `-camera`
+a scene renders its still cameras, and names each `camera_path` / `camera_curve` / `orbit` it
+skipped with its frame count and the flag that renders it (`-camera fly`, or `-camera all`). A
+scene with no still camera renders its paths, since that is all it has. Paths were already the
+one kind of camera addressed by name (`-camera <base>`, `-frames A B`), and a 600-frame batch is
+almost never what a plain `-o out.png` means. `-frames` without a path named by `-camera`, which
+was silently ignored, is now an error. `-explore` follows the selection: without `-camera` it
+opens on the still, and `-explore -camera fly` gives the flyby's timeline.
+
+The original report:
 
 `ftrace -in scenes/gallery_settled.ftsl -mode W -o png/gal_w.png` renders the still camera
 *and* then all 600 frames of the scene's `camera_curve "fly"`, writing `png/gal_w_fly000

@@ -9664,6 +9664,17 @@ symptom in the numbers. `roiBoxesReport` now traces the first and last row and c
 the camera's own up vector to decide which end is the top, so the answer survives any future change
 to `genRay`'s film mapping.
 
+## Camera selection (`-camera`, main.cpp)
+
+A scene's cameras are its stills and the frames its `camera_path` / `camera_curve` / `orbit`
+blocks expand into; a frame carries its path's base name (`CamSpec::pathBase`). `-camera`
+picks: an exact name, a path's base name (every frame; `-frames A B` narrows it by frame
+number, and is refused unless a path was named), `#N`, `near=X,Y,Z`, or `all`. Without it
+(0.383.0) the stills render and each path is named as skipped, with its frame count; a scene
+with no still renders its paths. Everything downstream -- the per-camera mode resolution, the
+exposure-lock metering, the path subdirectory for output, `-explore`'s timeline -- works on
+that selection, so none of them needs to know the default.
+
 ## Output retention (`tools/clean_outputs.py`)
 
 ftrace deletes nothing it writes; `tools/clean_outputs.py` prunes `png/`, `scraps/` and
