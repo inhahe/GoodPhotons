@@ -20364,7 +20364,21 @@ previews its marble and grid correctly. All residuals are the usual hard-thresho
 hard-checker edges under float-vs-double.
 
 
-### OPEN (2026-08-04): `textures/marble_dumbbell.png` is derived from a WATERMARKED stock preview — replace before any public release
+### DONE (2026-10-16): `textures/marble_dumbbell.png` is derived from a WATERMARKED stock preview — replace before any public release
+
+**Three sheets, not one, and five caps.** Asked to confirm the watermark (the shipped texture shows
+none, because the tool cropped the bar), every source was checked: the 3.5 sheet carries the
+VectorStock footer bar ("VectorStock.com/51127374"); `marble texture 1.jpeg` a tiled, semi-
+transparent **Vecteezy** logo across the whole sheet, and `marble texture 2.jpg` a tiled **pngtree**
+logo -- both faint, both legible in a contrast-stretched or high-pass view of the caps cut from them
+(`marble_gold`, `marble_alice`, `marble_chrome`, `marble_creature`), and no crop removes a tiled
+mark. The other seven sheets show none under the same high-pass. The five caps are re-quarried from
+the clean sheets: `marble_gold` from all of #8 (the one clean gold-veined sheet), brass, chrome,
+dumbbell and creature from #8's four quadrants, Alice from a turned slab of #7.
+`tools/make_marble_caps.py` lists the three in `WATERMARKED` and refuses to build from them; the
+caustic-critical caps (axicon, orb, compote, diamond gyroid) are untouched and pixel-identical.
+
+The original entry:
 
 **What.** `marble texture 3.5.avif`, one of the ten source sheets, is a VectorStock **comp**: a
 black footer bar carrying the agency name and stock id runs across the bottom ~9 %. That bar is

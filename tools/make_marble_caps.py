@@ -50,9 +50,20 @@ def lin_to_srgb(c):
 
 _S2L = [srgb_to_lin(i / 255.0) for i in range(256)]
 
-# name          source                     cap                    crop            k     s
+# Stock-site previews, watermarked, never to be used: 3.5 carries a VectorStock footer bar
+# ("VectorStock.com/51127374"), 1 a tiled Vecteezy logo and 2 a tiled pngtree logo over the
+# whole sheet -- faint, but legible in a high-pass of the caps cut from them, and no crop
+# removes a tiled mark. main() refuses any of them.
+WATERMARKED = {'marble texture 3.5.avif', 'marble texture 1.jpeg', 'marble texture 2.jpg'}
+
+# name          source                     cap                    crop            k     s    [rot]
 # `crop` is (left, top, right, bottom) as FRACTIONS, applied before anything else.
 # k = linear contrast about the mean, s = saturation.  1.0 = untouched.
+# rot (optional, degrees: 90/180/270) turns the slab after the crop.
+#
+# No two caps show the same view of the same stone: their crops are disjoint, or they differ
+# in turn and scale -- a 90-degree turn at three times the magnification of another cap's slab
+# is a different-looking piece of the same block, as a real quarry's slabs are.
 #
 # The three caps that catch a MEASURED caustic get the flattest, most neutral stone in the
 # set and get it further calmed (k/s well below 1).  Ranking is from the float re-measurement
@@ -93,58 +104,32 @@ CAPS = [
     ('marble_heart',   'marble texture 5.jpg',    'stand_heart_cap',    None,           0.85, 0.80),
     ('marble_oil',     'marble texture 3.6.jpg',  'stand_oil_cap',      None,           0.85, 0.80),
     # ---- free: opaque / metal pieces, full drama ----------------------------------------
-    # The gold-veined sheets go under the GOLD gyroid and the BRASS cluster on purpose: the
-    # centrepiece cap is the biggest surface in the frame and the vein colour rhymes with the
-    # metal standing on it, at zero caustic cost because both pieces are opaque.
-    #
-    # #1 IS THE THIRD SHEET CUT INTO TWO SLABS (after #2 for chrome/creature and #7 for
-    # orb/compote), because the gallery grew a THIRTEENTH cap -- Alice -- and there are still
-    # only ten source drops. #1 is the one to quarry now for the same reason #2 and #7 were:
-    # at 1098x1960 it is the second-tallest sheet in the set, and half of it is still 1098x980
-    # against a MAXDIM of 1024, so the gyroid's 634x293 px cap loses nothing visible.
-    # The gyroid keeps the TOP half, which carries the heavy gold band; Alice takes the
-    # BOTTOM, whose veining is finer and whose field is more white. The two crops share no
-    # pixel, so they are two slabs off one block rather than the same stone printed twice.
-    ('marble_gold',    'marble texture 1.jpeg',   'stand_gyroid_cap',  (0, 0, 1, 0.50),  1.00, 1.00),
-    ('marble_brass',   'marble texture 8.jpg',    'stand_brass_cap',    None,           1.00, 1.00),
+    # #8 is the one clean GOLD-VEINED sheet, so it goes under the metal pieces, where the vein
+    # colour rhymes with the metal at zero caustic cost (all opaque). The GOLD gyroid's cap,
+    # the biggest surface in the frame (634x293 px in the still), takes the whole sheet: at
+    # 512x512 it is a little under the cap's screen width, which the texture filter carries.
+    ('marble_gold',    'marble texture 8.jpg',    'stand_gyroid_cap',   None,             1.00, 1.00),
+    # The small metal caps (84-105 px in the still) take #8's four quadrants, one each: each is
+    # the stone at twice the gold cap's magnification, and they are disjoint from each other.
+    ('marble_brass',   'marble texture 8.jpg',    'stand_brass_cap',   (0, 0, 0.5, 0.5),  1.00, 1.00),
+    ('marble_chrome',  'marble texture 8.jpg',    'stand_chrome_cap',  (0.5, 0, 1, 0.5),  0.75, 1.00),
+    ('marble_dumbbell', 'marble texture 8.jpg',   'stand_dumbbell_cap', (0, 0.5, 0.5, 1), 1.00, 1.00),
+    # The creature is opaque fur -- zero caustic, so the stone is free -- but it is the only
+    # cap with a DARK BROWN subject on it, so the stone is compressed (k=0.70) to keep the paws
+    # reading against #8's dark veins.
+    ('marble_creature', 'marble texture 8.jpg',   'stand_creature_cap', (0.5, 0.5, 1, 1), 0.70, 1.00),
     # ALICE's cap is free by the caustic ranking -- she is an opaque painted figure and throws
     # nothing -- but it is the only cap in the hall with a COLOURED subject standing on it, so
-    # it gets calmed for the two reasons the creature's was, one of which is new:
-    #   * her SHOES are dark and her stockings are white, and both have to separate from the
-    #     stone (the creature's k=0.70 exists for exactly this, its dark paws on #2's near-
-    #     black field);
-    #   * she is the one object in this gallery whose colour is PAINT rather than physics --
-    #     an imported baseColor atlas -- so a saturated gold slab beneath her would compete
-    #     with the only texture in the frame. s=0.80 leaves the vein visible as vein and takes
-    #     the tint off the light bouncing back up into her pinafore.
-    ('marble_alice',   'marble texture 1.jpeg',   'stand_alice_cap',   (0, 0.50, 1, 1),  0.70, 0.80),
-    # #2 carries a near-black grey field beside its gold; at full contrast it bottoms out at
-    # 0.006 linear (sRGB 19), which reads as a HOLE in the tabletop rather than dark stone.
-    # k=0.75 lifts the floor without touching the veins.
-    #
-    # #2 IS ALSO THE ONE SHEET CUT INTO TWO SLABS, because the gallery grew an eleventh cap
-    # (the fur creature) and there are only ten source drops. Reusing a sheet whole would put
-    # the same stone on two tabletops, which is the one thing this set exists not to do — so
-    # the sheet is quarried instead: it is 1200x2141, the tallest in the set, and chrome takes
-    # the top 52% while the creature takes the bottom 48%. The two crops share no pixel, so
-    # they are two slabs off one block, which is what a real gallery's matched tabletops are.
-    # Chrome's cap is 105x21 px in the still, so losing half its sheet costs nothing visible.
-    ('marble_chrome',  'marble texture 2.jpg',    'stand_chrome_cap',  (0, 0, 1, 0.52),  0.75, 1.00),
-    # The creature is opaque fur — zero caustic, so the stone is free. It gets a touch more
-    # compression than chrome (0.70 vs 0.75) for a reason chrome does not have: it is the only
-    # cap with a DARK BROWN subject standing on it, and #2's near-black field would swallow the
-    # paws. k=0.70 lifts the floor far enough for the feet to read against it.
-    ('marble_creature', 'marble texture 2.jpg',   'stand_creature_cap', (0, 0.52, 1, 1),  0.70, 1.00),
-    # `marble texture 3.5.avif` is a WATERMARKED VectorStock preview: a black footer bar with
-    # the agency name and stock id runs across the bottom ~9 % (it is why that file measured
-    # p5 = 0.000 while every other sheet floors around 0.45).  The stone above the bar is
-    # clean, so the bar is cropped off here — but the file is still a watermarked comp, so
-    # this is flagged in the scene and in known-issues.md rather than silently shipped.
-    ('marble_dumbbell', 'marble texture 3.5.avif', 'stand_dumbbell_cap', (0, 0, 1, 0.905), 1.00, 1.00),
+    # it is calmed: her dark shoes and white stockings must separate from the stone, and she is
+    # the one object whose colour is PAINT rather than physics, so the stone must not compete
+    # with it. A slab of #7 (206x64 px on screen): the middle of its lower third, turned 270
+    # degrees -- the orb and the compote take #7's two halves whole, so this is the stone at
+    # three times their magnification and turned, a different-looking slab of the same block.
+    ('marble_alice',   'marble texture 7.jpg',    'stand_alice_cap',   (1/3, 2/3, 2/3, 1),  0.70, 0.80, 270),
 ]
 
 
-def build(name, src, crop, k, s, report=False):
+def build(name, src, crop, k, s, report=False, rot=0):
     path = os.path.join(SRC_DIR, src)
     try:
         im = Image.open(path).convert('RGB')
@@ -154,6 +139,9 @@ def build(name, src, crop, k, s, report=False):
     if crop:
         w, h = im.size
         im = im.crop((int(crop[0] * w), int(crop[1] * h), int(crop[2] * w), int(crop[3] * h)))
+    if rot:
+        im = im.transpose({90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180,
+                           270: Image.Transpose.ROTATE_270}[rot])
     w, h = im.size
     if max(w, h) > MAXDIM:                       # box-filter down; keeps veins, drops the bulk
         sc = MAXDIM / max(w, h)
@@ -197,13 +185,16 @@ def build(name, src, crop, k, s, report=False):
 
 def main():
     report = '--report' in sys.argv
+    bad = sorted({c[1] for c in CAPS} & WATERMARKED)
+    if bad:
+        sys.exit('make_marble_caps: watermarked stock previews in CAPS: ' + ', '.join(bad))
     if not report:
         os.makedirs(OUT_DIR, exist_ok=True)
     print(f'target mean LINEAR reflectance {TARGET_ALBEDO} (= capwhite), max dim {MAXDIM}\n')
     print(f'{"texture":18s} {"source":24s} {"size":11s} {"srcmean":>7s} '
           f'{"p2":>6s} {"p98":>6s} {"swing":>6s}  cap')
-    for name, src, cap, crop, k, s, in CAPS:
-        r = build(name, src, crop, k, s, report)
+    for name, src, cap, crop, k, s, *rot in CAPS:
+        r = build(name, src, crop, k, s, report, rot[0] if rot else 0)
         if r is None:
             continue
         st, enc = r

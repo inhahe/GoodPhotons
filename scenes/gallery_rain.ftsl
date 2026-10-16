@@ -619,10 +619,12 @@ texture "tex_marble_heart"    { file textures/marble_heart.png    encoding srgb 
 texture "tex_marble_brass"    { file textures/marble_brass.png    encoding srgb  filter bilinear  wrap clamp }
 texture "tex_marble_oil"      { file textures/marble_oil.png      encoding srgb  filter bilinear  wrap clamp }
 texture "tex_marble_axicon"   { file textures/marble_axicon.png   encoding srgb  filter bilinear  wrap clamp }
-# The eleventh cap, and the only one whose slab is not its own sheet: there are ten source
-# drops and eleven stands now, so `marble texture 2.jpg` (the tallest, 1200x2141) is CUT IN
-# TWO — chrome takes its top 52%, the creature its bottom 48%. The crops share no pixel, so
-# these are two slabs off one block rather than the same stone printed twice.
+# Three of the ten source drops are watermarked stock previews (Vecteezy, pngtree, VectorStock)
+# and are not used (tools/make_marble_caps.py refuses them), so the free metal caps share the
+# one clean gold-veined sheet, `marble texture 8.jpg`: the gold gyroid takes it whole, and the
+# brass, chrome, dumbbell and creature caps take its four quadrants -- disjoint slabs, each at
+# twice the gyroid cap's magnification. The creature's is compressed (k=0.70) so its dark paws
+# read against the dark veins.
 texture "tex_marble_creature" { file textures/marble_creature.png encoding srgb  filter bilinear  wrap clamp }
 # The TWELFTH cap, and the second slab quarried out of one sheet rather than given its own.
 # The gem compote arrived after all ten drops were spoken for, so `marble texture 7.jpg` is
@@ -633,18 +635,14 @@ texture "tex_marble_creature" { file textures/marble_creature.png encoding srgb 
 # (k=0.45, s=0.30) rather than the orb's, because this cap catches coloured caustics from
 # THIRTEEN refracting solids at once and the stone must not tint any of them.
 texture "tex_marble_compote"  { file textures/marble_compote.png  encoding srgb  filter bilinear  wrap clamp }
-# The THIRTEENTH cap, and the THIRD sheet quarried rather than given its own: ten drops,
-# thirteen stands. `marble texture 1.jpeg` is cut top/bottom — the gold gyroid keeps the TOP
-# half with the heavy gold band, Alice takes the BOTTOM, whose veining is finer and whose
-# field is more white. At 1098x1960 the sheet halves to 1098x980, still over the tool's
-# 1024 MAXDIM, so the gyroid's 634x293 px cap loses nothing visible; the two crops share no
-# pixel, so they are two slabs off one block. Prepared at k=0.70 / s=0.80 rather than the
-# free caps' 1.0/1.0, for two reasons, one of which no other cap has:
-#   * her SHOES are dark and #1 bottoms out at 0.035 linear uncompressed — the creature's
-#     problem exactly, and k=0.70 is the creature's answer (floor lifted to 0.071);
+# The THIRTEENTH cap: a white slab of `marble texture 7.jpg`, the middle of its lower third
+# turned 270 degrees -- the stone at three times the orb's and compote's magnification, so a
+# different-looking slab of the same block. Prepared at k=0.70 / s=0.80 rather than the free
+# caps' 1.0/1.0, for two reasons, one of which no other cap has:
+#   * her SHOES are dark and her stockings white, and both must separate from the stone;
 #   * she is the one object in this hall whose colour is imported PAINT rather than physics
-#     (a glTF baseColor atlas), so a saturated gold slab under her would be the only thing in
-#     the frame competing with the only texture in the frame. s=0.80 keeps the vein a vein.
+#     (a glTF baseColor atlas), so the stone under her must not compete with the only texture
+#     in the frame. s=0.80 keeps the vein a vein.
 texture "tex_marble_alice"    { file textures/marble_alice.png    encoding srgb  filter bilinear  wrap clamp }
 
 # `wrap clamp` (not `repeat`) with `uv planar axis=y` on each cap isosurface maps ONE slab
