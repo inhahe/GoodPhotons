@@ -3251,8 +3251,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             for (int i = 0; i + 1 < nUp; ++i) if (fSec[i] > mxF) mxF = fSec[i];
             if (!(mxF > 0.0)) return 0.0;
         }
-        if (scene.occluded(connOrigin(pt, wi), wi, dist - occlEps, 1e-6, false,
-                           connFiberStep(pt, wi))) return 0.0;   // hard block: see t=1
+        if (scene.occludedTo(connOrigin(pt, wi), y, occlEps, 1e-6, false,
+                             connFiberStep(pt, wi))) return 0.0;   // hard block: see t=1
         const double vis = 1.0;
         // Hero transmittance, shared by the bundle (flat extinction; see the t==1 branch).
         double Tr = mats.mediaTransmittance(scene, pt.p, wi, dist, lambda, rng) * vis;
@@ -3348,8 +3348,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         // Both ENDS can be fibers here, and a connection arriving at a strand from its far
         // side would clip the tube just short of the vertex, so stop the shadow ray early at
         // that end too. Adds an exact 0.0 for every non-fiber pair.
-        if (scene.occluded(connOrigin(pt, w), w, dist - 2e-6 - connShorten(qs, w * -1.0, 0.0),
-                           1e-6, false, connFiberStep(pt, w))) return 0.0;   // hard block: see t=1
+        if (scene.occludedTo(connOrigin(pt, w), qs.p, 2e-6, 1e-6, false, connFiberStep(pt, w),
+                             connShorten(qs, w * -1.0, 0.0))) return 0.0;   // hard block: see t=1
         const double vis = 1.0;
         // Hero transmittance, shared by the bundle (flat extinction; see the t==1 branch).
         double Tr = mats.mediaTransmittance(scene, pt.p, w, dist, lambda, rng) * vis;

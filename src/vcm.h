@@ -1090,8 +1090,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                             }
                             const bool isHairV = (mp->type == MatType::Hair);
                             const double visL = (mxfLe > 0.0 &&
-                                !scene.occluded(fiberOrigin(h, isHairV, wi), wi, distL - occlEps,
-                                                1e-6, false, fiberStep(h, isHairV, wi)))
+                                !scene.occludedTo(fiberOrigin(h, isHairV, wi), h.p + wi * distL,
+                                                  occlEps, 1e-6, false, fiberStep(h, isHairV, wi)))
                                 ? 1.0 : 0.0;   // hard block: see t=1
                             if (visL > 0.0) {
                                 double pdfChoice = em.power / scene.totalPower;
@@ -1184,9 +1184,9 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 {   // Either end may be a strand; clear both tubes (0 for non-fibers).
                     const bool camHair = (mp->type == MatType::Hair);
                     const bool litHair = (lv.mat && lv.mat->type == MatType::Hair);
-                    if (scene.occluded(fiberOrigin(h, camHair, w), w,
-                                       distc - fiberStep(lv.hit, litHair, w * -1.0) - 2e-6,
-                                       1e-6, false, fiberStep(h, camHair, w)))
+                    if (scene.occludedTo(fiberOrigin(h, camHair, w), lv.p, 2e-6, 1e-6, false,
+                                         fiberStep(h, camHair, w),
+                                         fiberStep(lv.hit, litHair, w * -1.0)))
                         continue;   // hard block: see t=1
                     visV = 1.0;
                 }

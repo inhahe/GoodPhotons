@@ -4390,7 +4390,13 @@ as the one at fault.
   scene-exit rays (sun cone, environment) keep plain `occluded()`: nothing sits at their
   far end to overshoot into. Rule: **moving a ray's origin means re-deriving its direction
   and length from where it now starts; never keep a direction computed from a point the
-  ray no longer leaves from.**
+  ray no longer leaves from.** The host keeps the same rule since 0.384.1:
+  `Scene::occludedTo` / `shadowTransmittanceTo`, shortened by `Scene::connMaxT` (the
+  relative 1e-5 with an absolute floor), carry every host shadow ray that ends on a sampled
+  point: mode R's NEE, BDPT's light sampling and interior connection, VCM's light sampling
+  and vertex connection. Before, the host BDPT and VCM moved the origin 1e-6 off the surface
+  and kept the unmoved direction, so past cos(a) = 1/3 at the far end their light sampling
+  struck the light itself (known-issues GRAZING-SHADOW-SELFHIT).
 
   `-rgb` is refused in mode `W` (`main.cpp`, with a message): the fast RGB backward is a
   separate reduced tracer with no deterministic estimator, so it would return precisely the

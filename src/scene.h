@@ -3494,6 +3494,42 @@ struct Scene {
         return hardBlock ? 0.0 : T;
     }
 
+    // How far a shadow ray of length `dist` that ENDS ON a sampled surface point may run: it
+    // stops short, so it does not hit the surface it is aimed at and report itself occluded.
+    // Relative (1e-5: 10 um at 1 m, 4 mm at 400 m), because a near-tangent hit on a sphere is
+    // reached by the sampler and the intersector by different routes that disagree by
+    // O(r * sqrt(eps)); `absEps` is the floor for near geometry, and 0 means "do not shorten"
+    // (a distant sun's far end is the scene's exit, not a surface). The device's twin is
+    // render_cuda.cu's connMaxT.
+    static double connMaxT(double dist, double absEps) {
+        if (absEps <= 0.0) return dist;
+        const double e = dist * 1e-5;
+        return dist - (e > absEps ? e : absEps);
+    }
+
+    // Visibility of a TARGET point from an origin `o` already moved off its own surface. The ray
+    // is aimed from the moved origin (PBRT's SpawnRayTo). Aimed along the direction from the
+    // unmoved point instead, a move of s carries the ray's end up to s / cos(a) past the
+    // target's surface, a being the angle the ray meets it at, so a grazing connection strikes
+    // the very light it samples and counts as shadowed, whatever the far-end shortening. `farClear`
+    // stops it short of a fiber target's tube as well; the other arguments are occluded()'s.
+    // Only the query is re-aimed: the estimator keeps its directions, distances and densities.
+    // The device's twin is occludedTo.
+    bool occludedTo(const Vec3& o, const Vec3& target, double absEps, double tmin = 1e-6,
+                    bool camLeg = false, double curveTmin = 0.0, double farClear = 0.0) const {
+        const Vec3 tv = target - o;
+        const double td = length(tv);
+        if (!(td > 0.0)) return false;
+        return occluded(o, tv / td, connMaxT(td, absEps) - farClear, tmin, camLeg, curveTmin);
+    }
+    // shadowTransmittance() to a target point, aimed and shortened as occludedTo() does.
+    double shadowTransmittanceTo(const Vec3& o, const Vec3& target, double absEps) const {
+        const Vec3 tv = target - o;
+        const double td = length(tv);
+        if (!(td > 0.0)) return 1.0;
+        return shadowTransmittance(o, tv / td, connMaxT(td, absEps));
+    }
+
     // Like occluded(), but fibers are INVISIBLE to it: only non-hair geometry blocks.
     //
     // This is the visibility half of the density-grid path (`-dual-grid`). When a coat's

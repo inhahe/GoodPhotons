@@ -71,6 +71,51 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-10-16): D-SILENT-EXIT — one host mode-D render ended with no output and no image
+
+`check_light_side.py`'s seen-from-behind part, run on 0.384.0 while a CUDA build compiled
+alongside, stopped at `ftrace -in behind.ftsl -seed 2 -mode D -device cpu -spp 128 -n 5000000`
+(96 x 72, a diffuse floor and one quad light): no stdout or stderr at all, not even the scene
+load or `[selftest]` lines, and no image. The same command right after, and 12 more times,
+exited 0 with its image every time, so the empty output is most likely a crash that took the
+process's unflushed stdout with it. The checks did not print the exit code then; they do now
+(`render failed (exit N)`), which is what the next occurrence needs to tell a crash
+(0xC0000005, 0xC0000409) from a deliberate exit. To try: the same scene in a loop under memory
+pressure (a CUDA build, or a large allocation alongside).
+
+## DONE (2026-10-16, 0.384.1): GRAZING-SHADOW-SELFHIT — a host shadow ray moved off its surface struck the light it was aimed at
+
+Found by `check_tilted_light.py`'s analytic floor, with a FLAT light: modes D and U rendered a
+diffuse floor under a 0.2 x 0.2 quad light 1 m up correctly near the light and darker beyond
+about 2.7 m from it -- 0.93 at 2.8 m, 0.45 at 3.1 m, 0.06 at 3.6 m of the analytic irradiance,
+bit-identical in 0.383.1, with a floor of any size. Modes R and B were right. Rendered strategy
+by strategy (an unweighted single (s, t), a throwaway build), BDPT's light sampling (s = 1) alone
+carried the loss, down to 0.1 % in the far corner, while light tracing and the eye path landing
+on the light matched.
+
+**Cause.** Every host connection moved its shadow ray's origin 1e-6 off the surface it left
+(`connOrigin` / `fiberOrigin`, along the geometric normal) but kept the direction and length
+computed from the unmoved point. Shifted that way, the ray reaches the target's plane up to
+1e-6 / cos(a) early, a being the angle it arrives at, while `occluded` stopped it only 3e-6
+short (the caller's 2e-6 and its own 1e-6 tmin). Past cos(a) = 1/3 -- 3 m from a light 1 m up
+-- the ray struck the very light it was sampling and the sample counted as shadowed. Light
+sampling carries nearly all of a small light's weight there, so the MIS sum lost almost
+everything. Mode R shortened its ray by a relative 1e-5 of its length (hostConnMaxT), which
+covered the move except within ~0.1/d of grazing: a sliver, but the same flaw. The device had
+fixed exactly this in its own tracers already (`occludedTo`, PBRT's SpawnRayTo).
+
+**Fix.** `Scene::occludedTo` / `shadowTransmittanceTo`, the host twins: the ray runs from the
+moved origin to the target point, shortened by `Scene::connMaxT` (mode R's relative rule, moved
+there). Every host shadow ray that ends on a sampled point goes through them: mode R's NEE, BDPT's
+light sampling and interior connection, VCM's light sampling and vertex connection. Rays that end
+at the camera, at the sky or sun, or that start along their own direction cannot overshoot and
+are unchanged. `tools/check_grazing_shadow.py` compares modes R, D and U on both backends with
+the analytic floor: on 0.384.0 the host's D and U fail it (lowest tile x0.575 and x0.613, the
+device's pass), on 0.384.1 every case passes (lowest tile x0.9988 and x0.996). The aimed-light
+check passes in D and U on both backends with it, and the NEE and connection checks (bdpt_s1,
+bdpt_depth, split_mis, glossy_nee_media, env_nee, distant_light, fur_null, hair_nee_sun,
+fire_d, fire_r, vcm_store, light_side's first part) all still pass.
+
 ## DONE (2026-10-14, 0.381.6): GATHERAREA-TRANSPARENT — a photon-map footprint probe stopped on a transparent face that holds no photons
 
 M-GATHERAREA's coverage probe (`gatherCoverageRaw` / `dGatherCoverage`) traces from r above a

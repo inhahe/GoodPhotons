@@ -107,7 +107,7 @@ def render_seeds(exe, cwd, scene, tag, args, device="cpu", spp=256, seeds=(1, 2)
                            errors="replace")
         if p.returncode != 0 or not os.path.exists(pfm):
             print(p.stdout[-1500:], p.stderr[-1500:])
-            raise SystemExit("render failed: " + " ".join(cmd))
+            raise SystemExit("render failed (exit %d): %s" % (p.returncode, " ".join(cmd)))
         if device == "gpu" and not any(t in p.stdout + p.stderr for t in GPU_TOKENS):
             raise SystemExit("did not run on the GPU: " + " ".join(cmd))
         img = read_pfm(pfm)
