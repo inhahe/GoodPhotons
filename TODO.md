@@ -77,12 +77,10 @@ commit.
 
 ### 4.1 Decisions the user owes (each blocks its fix)
 
-- [ ] **TILTED-LIGHT-EMIT** — a tilted quad light is measured by its patch on the camera side and by
-  its authored normal on the light side. Proposal: snap a tilted normal to its plane's side at load.
-  Measured on `mirror_selfie` (mode R, `png/tilt_cmp/compare.png`): the snap moves 3.6 % (the 22°
-  fill) and 10.1 % (the 37° wall-washes) of a light's flux from grazing directions behind the panel
-  to grazing ones in front; the frame's mean moves 0.03 %, no region more than 3 %. Explained to the
-  user 2026-10-16; waiting on the decision.
+- [x] **TILTED-LIGHT-EMIT** (0.384.0) — a tilted quad light was measured by its patch on the camera
+  side and by its authored normal on the light side. The user's decision (2026-10-16), instead of
+  the proposed snap: a leaning normal AIMS the light and the rectangle keeps its orientation. Every
+  strategy on both backends now reads one model (`Emitter::aimCos`); `check_tilted_light.py`.
 - [x] **`scenes/gallery_settled.ftsl` has diverged from `scenes/gallery.ftsl`** — closed by the
   user's answer (2026-10-16): the scene in use is `gallery_rain.ftsl`; no back-port.
 - [x] **`textures/marble_dumbbell.png` derives from a WATERMARKED stock preview** — and so did four

@@ -7122,55 +7122,49 @@ private:
         // photons landing back on it are absorbed (matches buildCornell).
         Vec3 o{0, 1, 0}, u{1, 0, 0}, v{0, 0, 1}, nrm{0, -1, 0};
         vec3Of(b, "origin", o); vec3Of(b, "u", u); vec3Of(b, "v", v);
-        // `normal` is a free override of the emission axis, defaulting to the panel's own
-        // u x v. Nothing here CHANGES it -- a tilted normal is a deliberate aiming control in
-        // at least one shipped scene (`scenes/mirror_selfie.ftsl` aims two wall-washes with
-        // `normal 0.8 0 -0.6` on a panel whose plane faces +x, and says so in a comment) -- but
-        // it is worth saying out loud, because a tilted normal makes the emitter INCONSISTENT
-        // and does so silently.
-        //
-        // A flat rectangle's geometric normal is perpendicular to it, necessarily. The renderer
-        // uses one normal for both the emission falloff (where an authored aim is a fair, if
-        // non-physical, control) AND the area <-> solid-angle conversion `pdf_A * dist^2 / cos`,
-        // which is pure geometry and must use u x v: the solid angle a patch subtends depends on
-        // how the patch is ORIENTED, not on where its emission is aimed. Tilt them apart and the
-        // conversion is wrong, so estimators applying that cosine in different places disagree
-        // with each other. Measured: a 45-degree tilt cost +5 % mode D against mode R, looked
-        // exactly like a BDPT weighting bug, and took two iterations to pin on the scene rather
-        // than the renderer. See known-issues.md; the real fix separates nEmit from nGeom.
+        // `normal` picks the side that emits and, when it leans off the panel's own u x v, AIMS
+        // it: the panel stays where it is and throws the light the same panel turned to face
+        // `normal` would, in front of its own plane (Emitter::nGeom has the model; 0.384.0).
         const bool nrmGiven = vec3Of(b, "normal", nrm);
+        bool leanAuthored = false;
         if (!nrmGiven) {
             nrm = normalize(cross(u, v));
         } else {
             const Vec3 cx = cross(u, v);
             const double lc = length(cx), ln = length(nrm);
-            // 1e-6 on |cos| is ~0.08 deg: tight enough to catch a real tilt, loose enough that a
+            // 1e-6 on |cos| is ~0.08 deg: tight enough to catch a real lean, loose enough that a
             // hand-typed 0.707 against an exact 1/sqrt(2) stays quiet.
-            if (lc > 0.0 && ln > 0.0) {
-                const double d = dot(nrm / ln, cx / lc);
-                if (std::fabs(d) < 1.0 - 1e-6) {
-                    const double deg = std::acos(std::fmin(1.0, std::fabs(d))) * 180.0 / PI;
-                    std::fprintf(stderr,
-                        "[light] WARNING: area light at (%g %g %g) declares `normal %g %g %g`, "
-                        "which is %.1f deg off perpendicular to its own `u`x`v`. Since 0.276.3 "
-                        "the MEASURE is handled correctly -- the area<->solid-angle conversion "
-                        "uses the patch's own orientation, so the tilt no longer dims this light "
-                        "by cos(tilt) -- but it is probably still not what you meant: an area "
-                        "light is LAMBERTIAN, so tilting `normal` does not aim or beam it, it "
-                        "only rotates which hemisphere emits. To point light somewhere, move the "
-                        "panel or rotate `u`/`v`; use `normal` only to pick which SIDE emits.\n",
-                        o.x, o.y, o.z, nrm.x, nrm.y, nrm.z, deg);
+            if (lc > 0.0 && ln > 0.0) leanAuthored = std::fabs(dot(nrm / ln, cx / lc)) < 1.0 - 1e-6;
+        }
+        // Transform origin as a point and the u/v edge vectors as directions, then fold in the
+        // unit scale. The emitter area is recomputed from the actual transformed edges (exact
+        // for any affine). An aim is a direction and is carried as one; a normal standing
+        // straight out of the panel stays exactly perpendicular to it, even where a
+        // non-uniform scale or shear would lean the direction map's image of it.
+        Vec3 os = P(xf.apply(o)), us = xf.applyDir(u) * L_, vs = xf.applyDir(v) * L_;
+        Vec3 nw = normalize(xf.applyDir(nrm));
+        double cosAim = 1.0;                      // cos of the aim's lean off the panel's face
+        {
+            const Vec3 cw = cross(us, vs);
+            const double lcw = length(cw);
+            if (lcw > 0.0) {
+                cosAim = std::fabs(dot(nw, cw / lcw));
+                if (!leanAuthored && cosAim < 1.0 - 1e-6) {
+                    nw = (dot(nw, cw) >= 0.0 ? cw : cw * -1.0) / lcw;
+                    cosAim = 1.0;
                 }
             }
         }
-        // Transform origin as a point and the u/v edge vectors as directions, then
-        // fold in the unit scale. The emitter area is recomputed from the actual
-        // transformed edges (exact for any affine). The emission normal is the
-        // authored normal carried by the direction map (exact for rotation +
-        // uniform scale; see known-issues.md for the non-uniform-scale caveat).
-        Vec3 os = P(xf.apply(o)), us = xf.applyDir(u) * L_, vs = xf.applyDir(v) * L_;
-        Vec3 nw = normalize(xf.applyDir(nrm));
-        spd = absPower(b, spd, length(cross(us, vs)) * PI, L);
+        const bool aimed = cosAim < 1.0 - 1e-6;
+        if (aimed)
+            std::printf("[light] area light at (%g %g %g) is AIMED %.1f deg off its face: it throws "
+                        "its light toward `normal %g %g %g`, as if turned to face it, and nothing "
+                        "behind its own plane\n", o.x, o.y, o.z,
+                        std::acos(std::fmin(1.0, cosAim)) * 180.0 / PI, nrm.x, nrm.y, nrm.z);
+        // A `power` is the light's total flux: area * PI for a Lambertian panel, area * aimNorm
+        // for an aimed one (Emitter::aimNorm -- the same constant addAreaLight derives).
+        spd = absPower(b, spd, aimed ? length(cross(us, vs)) * (PI * (1.0 + cosAim) / 2.0)
+                                     : length(cross(us, vs)) * PI, L);
         Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
         lm.emitPat = spdPat;
         // `hide_camera on` — primary visibility off. The emitter is untouched (it lights,

@@ -933,15 +933,26 @@ struct EmitTri {
 
 struct Emitter {
     Vec3 origin, u, v, normal;
-    // Quad only: the PATCH's own orientation, `normalize(cross(u,v))`, and whether the authored
-    // `normal` differs from it. `normal` is a free override of the emission axis, so the two can
-    // disagree -- and then the solid angle the patch subtends (the `cos` in G and in the
-    // area->solid-angle conversion) belongs to `nGeom`, while the one-sided emission test belongs
-    // to `normal`. See known-issues.md: a 45 deg tilt dims the light by exactly cos(45).
-    // `normalTilted` is false for every well-formed light, and the readers keep their original
-    // float expression in that case, so a well-formed scene is bit-identical.
+    // Quad only: the PATCH's own orientation, `normalize(cross(u,v))` turned to the side `normal`
+    // points to, and whether the authored `normal` leans off it.
+    //
+    // A LEANING `normal` AIMS THE PANEL (0.384.0): the patch stays where it is, and throws the
+    // light the same patch turned to face `normal` would throw, in every direction in front of
+    // its own plane -- what an asymmetric wall-washer's optics do. With w the unit direction
+    // leaving the patch, cos_a = w.normal and cos_g = w.nGeom:
+    //
+    //   radiance           Le * cos_a / cos_g     where cos_a > 0 and cos_g > 0, else 0
+    //   intensity / area   Le * cos_a             (radiance times the patch's projected area)
+    //   total flux         Le * area * aimNorm,   aimNorm = PI * (1 + cos t) / 2 for a tilt t
+    //
+    // Nothing leaves behind the plane: an aimed panel cannot reach there, so the turned panel's
+    // light that would is not emitted, and aimNorm is that much under PI. The functions below are
+    // the one definition every estimator reads (aimCos, aimRadiance, aimDirPdf, sampleAimDir);
+    // `normalTilted` is false for every panel whose normal stands straight out of it, and the
+    // readers keep their original float expressions then, so such a scene is bit-identical.
     Vec3 nGeom{0, 0, 0};
     bool normalTilted = false;
+    double aimNorm = PI;
     double area = 0.0;
     EmitterShape shape = EmitterShape::Quad;
     // Index into Scene::mats of the emissive material on this light's GEOMETRY
@@ -1023,7 +1034,44 @@ struct Emitter {
     double geomWeight() const {
         if (shape == EmitterShape::Spot) return spotOmega;
         if (shape == EmitterShape::Env || shape == EmitterShape::Sun) return envGeom;
+        if (normalTilted) return area * aimNorm;          // an aimed quad (see nGeom)
         return area * PI;
+    }
+
+    // ---- an AIMED quad (normalTilted; see nGeom) ------------------------------------------
+    // Each takes `w`, the unit direction LEAVING the patch. The readers call them only when
+    // normalTilted; an untilted light keeps its own expressions.
+    //
+    // The emitter-side cosine of a light-sampling connection: a point sampled uniformly on the
+    // patch contributes Le * aimCos * cosSurf * area / dist^2, and its solid-angle pdf stays
+    // dist^2 / (area * w.nGeom) -- the patch's measure.
+    double aimCos(const Vec3& w) const {
+        const double cg = dot(nGeom, w), ca = dot(normal, w);
+        return (cg > 0.0 && ca > 0.0) ? ca : 0.0;
+    }
+    // Radiance towards `w`, as a multiple of Le: what a ray hitting the patch from -w sees.
+    double aimRadiance(const Vec3& w) const {
+        const double cg = dot(nGeom, w), ca = dot(normal, w);
+        return (cg > 0.0 && ca > 0.0) ? ca / cg : 0.0;
+    }
+    // Solid-angle pdf of sampleAimDir drawing `w` -- proportional to the emitted intensity.
+    double aimDirPdf(const Vec3& w) const { return aimCos(w) / aimNorm; }
+    // An emission direction for a photon or light subpath: cosine about `normal`, kept only in
+    // front of the patch (rejection; the aim leans under 90 deg, so at least half the draws are
+    // kept). `uniform` returns a fresh uniform in [0,1). The weight it implies,
+    // Le * aimCos / (pdfPos * aimDirPdf) = Le * area * aimNorm, is the flux, as for a Lambertian
+    // panel. pdfW = 0 (and the direction is unusable) only after 64 rejections in a row.
+    template <class Uniform> Vec3 sampleAimDir(Uniform&& uniform, double& pdfW) const {
+        Vec3 t, b; onb(normal, t, b);
+        for (int k = 0; k < 64; ++k) {
+            const double u1 = uniform(), u2 = uniform();
+            const double r = std::sqrt(u1), phi = 6.283185307179586 * u2;
+            const Vec3 w = normalize(t * (r * std::cos(phi)) + b * (r * std::sin(phi))
+                                     + normal * std::sqrt(1.0 - u1));
+            if (dot(nGeom, w) > 0.0) { pdfW = aimDirPdf(w); return w; }
+        }
+        pdfW = 0.0;
+        return normal;
     }
 
     // Sample a surface point `y` and its outward unit normal `nOut` from two
@@ -2143,8 +2191,10 @@ struct Scene {
             const Vec3 cx = cross(U, V);
             const double lc = length(cx), ln = length(n);
             if (lc > 0.0 && ln > 0.0) {
-                e.nGeom = cx / lc;
-                e.normalTilted = std::fabs(dot(n / ln, e.nGeom)) < 1.0 - 1e-6;
+                const double c = dot(n / ln, cx / lc);
+                e.nGeom = (c >= 0.0 ? cx : cx * -1.0) / lc;      // the emitting side
+                e.normalTilted = std::fabs(c) < 1.0 - 1e-6;
+                if (e.normalTilted) e.aimNorm = PI * (1.0 + std::fabs(c)) / 2.0;
             }
         }
         e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
@@ -2232,6 +2282,18 @@ struct Scene {
         for (const auto& e : emitters)
             if (e.matId == matId) return &e;
         return nullptr;
+    }
+
+    // By matId, the index of the AIMED quad (Emitter::normalTilted) whose surface carries that
+    // material, else -1; EMPTY when the scene has no aimed light, which is the readers' fast
+    // path. Filled by finalizeEmitters.
+    std::vector<int> aimOfMat;
+    // What a ray leaving an emissive surface of material `matId` toward `w` carries, as a
+    // multiple of the material's Le: Emitter::aimRadiance for an aimed quad's surface, 1 for
+    // every other. Readers call it only when aimOfMat is non-empty.
+    double aimedEmission(int matId, const Vec3& w) const {
+        if (matId < 0 || matId >= (int)aimOfMat.size() || aimOfMat[(size_t)matId] < 0) return 1.0;
+        return emitters[(size_t)aimOfMat[(size_t)matId]].aimRadiance(w);
     }
 
     // Register a spotlight: a point at `pos` radiating into a cone about unit
@@ -2407,11 +2469,20 @@ struct Scene {
                 : (emitters[i].shape == EmitterShape::Env ||
                    emitters[i].shape == EmitterShape::Sun)
                     ? emitters[i].emitIntegral * emitters[i].envGeom
+                : emitters[i].normalTilted                      // an aimed quad (see nGeom)
+                    ? emitters[i].emitIntegral * emitters[i].area * emitters[i].aimNorm
                 : emitters[i].emitIntegral * emitters[i].area * PI;
             totalPower += emitters[i].power;
             emitterCdf[i] = totalPower;
         }
         if (totalPower > 0) for (auto& c : emitterCdf) c /= totalPower;
+        aimOfMat.clear();
+        for (size_t i = 0; i < emitters.size(); ++i) {
+            const Emitter& e = emitters[i];
+            if (!e.normalTilted || e.matId < 0) continue;
+            if (aimOfMat.empty()) aimOfMat.assign(std::max(mats.size(), (size_t)e.matId + 1), -1);
+            aimOfMat[(size_t)e.matId] = (int)i;
+        }
         buildSpdBases();
         // Combined g(lambda) = sum_k geomWeight_k*SPD_k(lambda), at the sampler's bin centres.
         const int nb = static_cast<int>((LAMBDA_MAX - LAMBDA_MIN) / stepNm);

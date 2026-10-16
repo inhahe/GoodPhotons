@@ -647,7 +647,8 @@ struct Renderer {
                     const double omegaOuter = 2.0 * PI * (1.0 - em->spotCosOuter);
                     spotW = spotFalloff(ct, em->spotCosInner, em->spotCosOuter)
                           * omegaOuter / em->spotOmega;
-                } else if (em && dot(dir, emitN) <= 0.0) {
+                } else if (em && (em->normalTilted ? em->aimCos(dir) <= 0.0
+                                                   : dot(dir, emitN) <= 0.0)) {
                     return false;                                 // below the horizon: p_u = 0
                 }
             }
@@ -655,6 +656,8 @@ struct Renderer {
             if (em && em->shape == EmitterShape::Spot) {
                 const double ct = dot(dir, em->beamDir);
                 pu = (ct > em->spotCosOuter) ? 1.0 / (2.0 * PI * (1.0 - em->spotCosOuter)) : 0.0;
+            } else if (em && em->normalTilted) {
+                pu = em->aimDirPdf(dir);                          // an aimed quad (Emitter::nGeom)
             } else if (em) {
                 const double c = dot(dir, emitN);
                 pu = (c > 0.0) ? c / PI : 0.0;                    // cosine hemisphere
@@ -1537,11 +1540,14 @@ struct Renderer {
     // Splat a surface vertex to every camera target. In model B (the shared-pass case)
     // camSplat -> connect draws no RNG, so the loop is RNG-neutral; with nCam==1 this is
     // exactly the old single-camera call (model A draws its aperture sample once here).
+    // `plane` (optional): an aimed quad's face (Emitter::nGeom) -- a camera behind it gets
+    // nothing, whatever `n` (the aim) says.
     void camSplatAll(const Scene& scene, const CamTarget* cams, int nCam, const Vec3& p,
                      const Vec3& n, const Vec3& ng, const Vec3& wi, double lambda, double beta,
-                     double rho, Pcg32& rng) const {
+                     double rho, Pcg32& rng, const Vec3* plane = nullptr) const {
         for (int c = 0; c < nCam; ++c)
-            if (cams[c].cam && cams[c].film)
+            if (cams[c].cam && cams[c].film &&
+                !(plane && dot(*plane, cams[c].cam->eye - p) <= 0.0))
                 camSplat(scene, *cams[c].cam, *cams[c].film, p, n, ng, wi, lambda, beta, rho, rng);
     }
 
@@ -1575,9 +1581,11 @@ struct Renderer {
     }
     void camSplatAllHero(const Scene& scene, const CamTarget* cams, int nCam, const Vec3& p,
                          const Vec3& n, const Vec3& ng, const Vec3& wi, const double* lam,
-                         const double* beta, const double* rho, int nUp, Pcg32& rng) const {
+                         const double* beta, const double* rho, int nUp, Pcg32& rng,
+                         const Vec3* plane = nullptr) const {        // see camSplatAll
         for (int c = 0; c < nCam; ++c)
-            if (cams[c].cam && cams[c].film)
+            if (cams[c].cam && cams[c].film &&
+                !(plane && dot(*plane, cams[c].cam->eye - p) <= 0.0))
                 camSplatHero(scene, *cams[c].cam, *cams[c].film, p, n, ng, wi, lam, beta, rho, nUp, rng);
     }
 
@@ -1611,10 +1619,15 @@ struct Renderer {
         Vec3  wIn;                // incoming photon direction (volume vertices)
         double g = 0;             // HG asymmetry (volume vertices)
         double weight = 0;        // surface: Lambertian rho ; volume: single-scatter albedo
+        // An aimed quad (Emitter::nGeom) sends nothing behind its own face, whatever `np`
+        // (its aim) says: `gated` turns on that second test, against `plane`.
+        bool gated = false;
+        Vec3 plane;
         // Throughput at the vertex for a connection leaving toward `wP` (unit, toward
         // the sphere). Returns <0 to signal "reject" (camera-side behind a surface).
         double term(const Vec3& wP) const {
             if (volume) return weight * hgPhase(dot(wIn, wP), g);
+            if (gated && dot(plane, wP) <= 0.0) return -1.0;
             double cosSurf = dot(np, wP);
             return cosSurf <= 0.0 ? -1.0 : (weight / PI) * cosSurf;
         }
@@ -1626,6 +1639,7 @@ struct Renderer {
         // path's float ordering (and therefore its images) stay bit-identical.
         double shape(const Vec3& wP) const {
             if (volume) return hgPhase(dot(wIn, wP), g);
+            if (gated && dot(plane, wP) <= 0.0) return -1.0;
             double cosSurf = dot(np, wP);
             return cosSurf <= 0.0 ? -1.0 : cosSurf / PI;
         }
@@ -2292,8 +2306,9 @@ struct Renderer {
     // and reflect it in every mirror.
     void camSpecularSplatAll(const Scene& scene, const CamTarget* cams, int nCam,
                              const Vec3& p, const Vec3& n, double lambda, double beta,
-                             double rho, Pcg32& rng) const {
+                             double rho, Pcg32& rng, const Vec3* plane = nullptr) const {
         SpecVtx vt; vt.volume = false; vt.np = n; vt.weight = rho;
+        if (plane) { vt.gated = true; vt.plane = *plane; }                 // see SpecVtx
         camSpecularSplatAllVtx(scene, cams, nCam, p, vt, lambda, beta, rng);
     }
     // Hero variant. The sphere REFRACTION is dispersive (glass IOR varies per λ), so it
@@ -2304,8 +2319,9 @@ struct Renderer {
     void camSpecularSplatAllHero(const Scene& scene, const CamTarget* cams, int nCam,
                                  const Vec3& p, const Vec3& n, const double* lam,
                                  const double* beta, const double* rho, int nUp,
-                                 Pcg32& rng) const {
+                                 Pcg32& rng, const Vec3* plane = nullptr) const {
         SpecVtx vt; vt.volume = false; vt.np = n; vt.weight = rho[0];
+        if (plane) { vt.gated = true; vt.plane = *plane; }                 // see SpecVtx
         camSpecularSplatAllVtxN(scene, cams, nCam, p, vt, lam, beta, rho, nUp, rng);
     }
     // Volume vertex: refract the fog in-scatter at p through every glass sphere, so the
@@ -2690,7 +2706,12 @@ struct Renderer {
             // returns this point's `emit pattern:` factor — 1.0 (and a bit-identical
             // call) when the emitter carries no pattern.
             emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN);
-            dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
+            if (em.collimated) dir = em.beamDir;
+            else if (em.normalTilted) {             // an aimed quad: intensity-proportional
+                double pdfAim = 0.0;
+                dir = em.sampleAimDir([&] { return rng.uniform(); }, pdfAim);
+                if (!(pdfAim > 0.0)) return;
+            } else dir = cosineHemisphere(emitN, rng);
         }
         // Aimed caustic emission (causticaim.h). Placed here, after the shape branch has
         // produced an ordinary sample and BEFORE `beta *= spotW`, because the aimed pass
@@ -2798,8 +2819,19 @@ struct Renderer {
         if (nCam > 0 && !forwardCatch &&
             em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env &&
             em.shape != EmitterShape::Sun) {
-            camSplatAll(scene, cams, nCam, origin, emitN, emitN, emitN, lambda, beta, 1.0, rng);
-            camSpecularSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, 1.0, rng);
+            if (em.normalTilted) {
+                // An aimed quad: intensity Le*aimCos per unit area, so the splat's Lambertian
+                // rho/PI * cos(emitN) becomes aimCos / aimNorm -- rho = PI/aimNorm about the aim
+                // -- and nothing reaches a camera or a mirror behind the face.
+                const double rhoAim = PI / em.aimNorm;
+                camSplatAll(scene, cams, nCam, origin, emitN, emitN, emitN, lambda, beta, rhoAim, rng,
+                            &em.nGeom);
+                camSpecularSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, rhoAim, rng,
+                                    &em.nGeom);
+            } else {
+                camSplatAll(scene, cams, nCam, origin, emitN, emitN, emitN, lambda, beta, 1.0, rng);
+                camSpecularSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, 1.0, rng);
+            }
         }
         }   // end emitter-birth branch
 
@@ -3594,7 +3626,12 @@ struct Renderer {
             emitN = dir;
         } else {
             emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN);
-            dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
+            if (em.collimated) dir = em.beamDir;
+            else if (em.normalTilted) {             // an aimed quad -- see the scalar tracer
+                double pdfAim = 0.0;
+                dir = em.sampleAimDir([&] { return rng.uniform(); }, pdfAim);
+                if (!(pdfAim > 0.0)) return;
+            } else dir = cosineHemisphere(emitN, rng);
         }
         // Aimed caustic emission — see the scalar tracer. Before `base *= spotW` for the
         // same reason (the aimed pass recomputes spotW).
@@ -3630,9 +3667,13 @@ struct Renderer {
         if (nCam > 0 && !forwardCatch &&
             em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env &&
             em.shape != EmitterShape::Sun) {
-            double rhoOne[hero::kHeroMax]; for (int i = 0; i < C; ++i) rhoOne[i] = 1.0;
-            camSplatAllHero(scene, cams, nCam, origin, emitN, emitN, emitN, lam, beta, rhoOne, C, rng);
-            camSpecularSplatAllHero(scene, cams, nCam, origin, emitN, lam, beta, rhoOne, C, rng);
+            // An aimed quad: rho = PI/aimNorm about the aim, gated by its face (scalar tracer).
+            const double rhoE = em.normalTilted ? PI / em.aimNorm : 1.0;
+            const Vec3* plane = em.normalTilted ? &em.nGeom : nullptr;
+            double rhoOne[hero::kHeroMax]; for (int i = 0; i < C; ++i) rhoOne[i] = rhoE;
+            camSplatAllHero(scene, cams, nCam, origin, emitN, emitN, emitN, lam, beta, rhoOne, C, rng,
+                            plane);
+            camSpecularSplatAllHero(scene, cams, nCam, origin, emitN, lam, beta, rhoOne, C, rng, plane);
         }
 
         Ray ray{origin + dir * 1e-6, dir};

@@ -230,6 +230,7 @@ struct DLight {
     float  cosInner, cosOuter;
     float3 rgb;               // intensity (area: along its normal) / sun: irradiance
     float  size;              // source radius / sun: angular radius (rad)
+    float3 face;              // an aimed area light's face (raster::PLight::face), else zero
 };
 // Host twin: raster::PreviewLight's environment (kEnvW / kEnvH / kEnvLevels, sh, fill, envSpec).
 constexpr int kPrevEnvW = 64, kPrevEnvH = 32, kPrevEnvLevels = 6;
@@ -956,7 +957,10 @@ __device__ static inline bool previewLightAtD(const DLight& lp, float3 P, float3
     const float r2 = fmaxf(dist2, lp.size * lp.size);
     float g = 1.0f / r2;
     if (lp.kind == 1)      g *= spotFalloffD(dot3(lp.dir, Ld * -1.0f), lp.cosInner, lp.cosOuter);
-    else if (lp.kind == 2) g *= fmaxf(0.0f, -dot3(lp.dir, Ld));
+    else if (lp.kind == 2) {
+        g *= fmaxf(0.0f, -dot3(lp.dir, Ld));
+        if (dot3(lp.face, Ld) > 0.0f) g = 0.0f;             // behind an aimed panel's face
+    }
     if (!(g > 0.0f)) return false;
     E = lp.rgb * g;
     ang = lp.size / sqrtf(r2);
@@ -1867,7 +1871,7 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
         DLight& d = hl[i];
         d.pos = toF3(p.pos); d.dir = toF3(p.dir); d.kind = p.kind;
         d.cosInner = (float)p.cosInner; d.cosOuter = (float)p.cosOuter;
-        d.rgb = toF3(p.rgb); d.size = (float)p.size;
+        d.rgb = toF3(p.rgb); d.size = (float)p.size; d.face = toF3(p.face);
     }
     sc->nLights  = (int)hl.size();
     static_assert(kPrevEnvW == raster::kEnvW && kPrevEnvH == raster::kEnvH &&

@@ -312,6 +312,8 @@ struct PLight {
                                 // Sun: the irradiance on a surface facing it
     double size = 0.0;          // Point / Spot / Area: the source's radius -- 1/d^2 is clamped
                                 // inside it and it widens the highlight; Sun: angular radius (rad)
+    Vec3   face{0, 0, 0};       // Area, aimed (Emitter::nGeom): its face -- nothing lights what
+                                // is behind it; zero for every other light
 };
 
 // ---- RASTER-PBR: the split-sum specular ------------------------------------------------------
@@ -365,7 +367,10 @@ inline bool previewLightAt(const PLight& lp, const Vec3& P, Vec3& Ld, Vec3& E, d
     const double r2 = std::max(dist2, lp.size * lp.size);   // inside the source: stop growing
     double g = 1.0 / r2;
     if (lp.kind == PLight::Spot)      g *= spotFalloff(dot(lp.dir, Ld * -1.0), lp.cosInner, lp.cosOuter);
-    else if (lp.kind == PLight::Area) g *= std::max(0.0, -dot(lp.dir, Ld));   // one-sided, Lambertian
+    else if (lp.kind == PLight::Area) {
+        g *= std::max(0.0, -dot(lp.dir, Ld));                // one-sided, about the aim
+        if (dot(lp.face, Ld) > 0.0) g = 0.0;                 // behind an aimed panel's face
+    }
     if (!(g > 0.0)) return false;
     E = lp.rgb * g;
     srcAng = lp.size / std::sqrt(r2);
@@ -606,6 +611,7 @@ inline PreviewLight deriveLight(const Scene& sc, const Vec3& probePos, bool prob
                 p.kind = PLight::Area;
                 p.pos = e.origin + (e.u + e.v) * 0.5;
                 p.dir = e.collimated ? normalize(e.beamDir) : normalize(e.normal);
+                if (e.normalTilted && !e.collimated) p.face = e.nGeom;   // an aimed quad
                 p.rgb  = rgb * e.area;                       // I(w) = L A cos -- the cos is per point
                 p.size = std::sqrt(std::max(0.0, e.area) / PI);
                 break;

@@ -140,8 +140,10 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 ? bwNee.glossyHitWeight(scene, gmis, BackwardRenderer::emitterIndexOfResolved(scene, m),
                                         ray.d, &h.p, &h.n)
                 : 1.0;
+            const double aim = scene.aimOfMat.empty() ? 1.0       // an aimed quad (Emitter::nGeom)
+                : scene.aimedEmission((int)(&m - scene.mats.data()), ray.d * -1.0);
             directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                       * (thr * emitSlot(scene, m, h, lambda) * invPdfL * wMis);
+                       * (thr * emitSlot(scene, m, h, lambda) * invPdfL * (wMis * aim));
             return;
         }
 

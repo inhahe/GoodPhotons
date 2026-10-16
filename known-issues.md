@@ -301,7 +301,21 @@ Opus (max) and Fable (xhigh) reviewed be06cd57..0867bcaa. Fixed:
   BVH build that happens only when a preview opens a scene whose only light is a fire that emits
   nothing.
 
-## OPEN (2026-10-14, design decision): TILTED-LIGHT-EMIT — a tilted quad light is measured by its patch on the camera side and by its authored normal on the light side
+## DONE (2026-10-16, 0.384.0): TILTED-LIGHT-EMIT — a tilted quad light is measured by its patch on the camera side and by its authored normal on the light side
+
+**Resolved by the user's decision, not the snap proposed below:** a leaning `normal` now AIMS the
+light, and the rectangle keeps the orientation `u` and `v` give it. The model (scene.h, beside
+`Emitter::aimCos`): radiance `Le·cos_a/cos_g` toward `w` (`cos_a` from the aim, `cos_g` from the
+face, zero unless both are positive), so the intensity per unit area is `Le·cos_a`, a cosine lobe
+about the aim cut off at the face's plane, of flux `Le·area·π(1 + cos t)/2`. Every reader listed
+below, host and device, now takes its cosines, densities and births from the one set of helpers
+(design.md → *Aimed quads*), so the camera-side and light-side strategies agree by construction.
+`tools/check_tilted_light.py` predicts each pixel of an aimed light's floor from the flat light's
+render and an integral over the light, for every mode on both backends, and compares fog across
+modes; it fails on 0.383.1. A quad whose normal stands straight out of it is untouched,
+bit-for-bit. `mirror_selfie`'s three leaning lights now aim where their normals point.
+
+The entry as it stood:
 
 A quad light's `normal` may leave the patch's plane (`Emitter::normalTilted`; `scenes/mirror_selfie`
 has three). Since 0.276.3 the camera side measures such a light by the patch's own orientation

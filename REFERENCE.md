@@ -2846,6 +2846,23 @@ it is intersected). The raster preview honours it too (since 0.368.2; before, it
 every hidden flat as a solid white panel — a giant white square behind the subject that
 no render shows); `-raster-hidden` draws them to see where they are. See FTSL.md §11.1.
 
+**Aiming an area light: a `normal` that leans (0.384.0).** A rectangle's `normal` normally
+stands straight out of it (it defaults to `u`×`v`), and the panel is then a plain Lambertian
+emitter: brightest straight ahead, falling off as the cosine to its edges. Lean the `normal` out of
+the rectangle's plane and the light **shines along it**, while the rectangle keeps the orientation
+`u` and `v` give it. Its intensity per unit area is `Le·cos a`, where `a` is the angle from the
+leaning normal, so the brightest direction is the normal's, and the lobe is cut off at the
+rectangle's own plane: nothing leaves through the back, and nothing leaves at more than 90° from
+the normal. A wall-wash fixture is the natural use: a panel flush with the ceiling, its normal
+leaning toward the wall it washes. `power` (or `lumens`) is still the light's total flux, which a
+lean of `t` spreads over `π(1 + cos t)/2` instead of `π`, so a lean concentrates the light rather
+than dimming it. Seen head-on, the panel's own brightness follows the same law, `Le·cos a / cos g`
+(`g` the angle from the rectangle's face), so a leaning panel looks brightest when you look along
+its normal. Every mode honours it on both backends. ftrace names each aimed light at load, with its
+lean. (Before 0.384.0 a leaning normal only picked the emitting side, and modes disagreed about how
+much light it gave: the camera-side strategies measured the rectangle, the light-side ones the
+normal.)
+
 **Distant sun.** `light sun { … }` is a first-class **directional** emitter: an
 infinitely-distant disc of angular diameter `angle` (degrees; default `0.53`, the real
 sun) whose rays arrive parallel. Aim it with `elevation <deg>` + `azimuth <deg>`

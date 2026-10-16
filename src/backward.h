@@ -613,18 +613,16 @@ struct BackwardRenderer {
         dist = std::sqrt(dist2);
         wi = toL / dist;
         double cosLight = dot(nLight, -wi);              // light is one-sided
-        if (cosLight <= 0) return false;                 // tested first: a dual-scattering
+        // An AIMED quad (Emitter::nGeom): what leaves toward the receiver per unit area is
+        // Le * aimCos -- the emitter-side cosine of G -- while the area -> solid-angle MEASURE is
+        // the patch's own cos_geom. For an untilted light both are cosLight, bit for bit.
+        double cosGeo = cosLight;
+        if (em.normalTilted) { cosGeo = dot(em.nGeom, wi * -1.0); cosLight = em.aimCos(wi * -1.0); }
+        if (cosLight <= 0 || !(cosGeo > 0.0)) return false;   // tested first: a dual-scattering
         double cosSurf, stG;                             // response is a shadow WALK, and
         if (!response(wi, cosSurf, stG)) return false;    // a back-facing sample is free to skip
         if (blocked(wi, dist, 2e-6)) return false;
-        // The SIDE test above used the authored normal, where an aimed panel is legitimate. The
-        // MEASURE below is the solid angle the PATCH subtends, so it belongs to the patch's own
-        // orientation: a `normal` tilted out of plane otherwise scales this emitter's whole
-        // contribution by cos(tilt). Identical expression, bit for bit, unless the light is
-        // actually tilted (see Emitter::normalTilted).
-        const double cosGeo = em.normalTilted ? std::fabs(dot(em.nGeom, wi * -1.0)) : cosLight;
-        if (!(cosGeo > 0.0)) return false;
-        double G = cosSurf * cosGeo / dist2;             // geometry term
+        double G = cosSurf * cosLight / dist2;           // geometry term
         w = G * effArea * stG * vis;                     // pdf_area = 1/effArea (visible area for cylinder)
         if (epat != 1.0) w *= epat;                      // no-op (and bit-identical) without a pattern
         // Area measure -> solid angle: pdf_W = pdf_A * dist^2 / cos(light). `epat` is a
@@ -1590,14 +1588,11 @@ struct BackwardRenderer {
                 const double dist2 = dot(toL, toL);
                 dist = std::sqrt(dist2);
                 wi = toL / dist;
-                const double cosLight = dot(nLight, -wi);  // the light is one-sided
+                // The light is one-sided, and an AIMED quad emits Le * aimCos per unit area toward
+                // the vertex (see emitterGeom). The same expression unless the light is tilted.
+                const double cosLight = em.normalTilted ? em.aimCos(wi * -1.0) : dot(nLight, -wi);
                 if (cosLight <= 0) return false;
-                // Patch orientation for the measure, authored normal for the side test above --
-                // see emitterGeom. The same unless the light is tilted.
-                const double cosGeoV = em.normalTilted ? std::fabs(dot(em.nGeom, wi * -1.0))
-                                                       : cosLight;
-                if (!(cosGeoV > 0.0)) return false;
-                geom = cosGeoV / dist2 * effArea;          // no surface cosine at a volume vertex
+                geom = cosLight / dist2 * effArea;         // no surface cosine at a volume vertex
                 if (epat != 1.0) geom *= epat;
             }
             shadowLen = dist - 2e-6;
@@ -2925,6 +2920,9 @@ struct BackwardRenderer {
                 if (gmis.pdf > 0.0)
                     wMis = glossyHitWeight(scene, gmis, emitterIndexOfResolved(scene, m),
                                            ray.d, &h.p, &h.n);
+                // An aimed quad's radiance depends on the direction it is seen from.
+                if (!scene.aimOfMat.empty())
+                    wMis *= scene.aimedEmission((int)(&m - scene.mats.data()), ray.d * -1.0);
                 L += thr * emitSlot(scene, m, h, lambda) * invPdfLambda * wMis;
             }
 
@@ -3406,6 +3404,9 @@ struct BackwardRenderer {
                 if (gmis.pdf > 0.0)
                     ep *= glossyHitWeight(scene, gmis, emitterIndexOfResolved(scene, m),
                                           ray.d, &h.p, &h.n);
+                // An aimed quad's radiance depends on the direction it is seen from.
+                if (!scene.aimOfMat.empty())
+                    ep *= scene.aimedEmission((int)(&m - scene.mats.data()), ray.d * -1.0);
                 for (int i = 0; i < nUp; ++i)
                     L[i] += thr[i] * m.emit(lam[i]) * ep * invPdf[i];
             }

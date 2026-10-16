@@ -2571,6 +2571,26 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
   keeps an inward-wound import (e.g. `torus.obj`) from radiating into its own hollow.
   The GPU mirrors the sampler: `DEmitter` gains a device `DEmitTri*` CDF +
   `emitterSamplePoint` shape-5 branch, uploaded per emitter.
+  **Aimed quads** (since 0.384.0): a quad whose authored `normal` leans out of its plane
+  (`Emitter::normalTilted`) keeps two normals: `normal`, the aim, and `nGeom`, the rectangle's
+  face oriented to the side the aim leans to. The radiance leaving the patch toward `w` is
+  `Le·cos_a/cos_g` (`cos_a = w·normal`, `cos_g = w·nGeom`), zero unless both are positive, so
+  the intensity per unit area is `Le·cos_a`: a cosine lobe about the aim cut off at the face's
+  plane, of flux `Le·area·aimNorm`, `aimNorm = π(1 + cos t)/2` for a lean `t`. One set of
+  helpers states it and every estimator reads them: `aimCos` (the cosine a light-side
+  connection or NEE weight multiplies by), `aimRadiance` (the factor on emission a ray *hits*),
+  `aimDirPdf`/`sampleAimDir` (forward births and light subpaths: cosine about the aim, rejecting
+  directions behind the face, density `cos_a/aimNorm`), and `Scene::aimedEmission(matId, w)`
+  for emission-on-hit, which looks the emitter up through `aimOfMat` (empty when no light is
+  aimed). Solid-angle conversions stay with the face (`cos_g`), since that is the patch's real
+  orientation. The device twins are `dAimCos`/`dAimRadiance`/`dAimDirPdf`/`dSampleAimDir`, and
+  the raster preview gates its lights by the face (`PLight::face`). A forward splat from an aimed
+  light's surface point is gated by the face too (`SpecVtx::gated`, the `plane` argument of the
+  splat functions), since a camera behind the plane sees nothing of it. Every reader branches on
+  `normalTilted`, so a quad whose normal stands straight out of it takes the old code
+  bit-for-bit. The loader keeps an authored perpendicular normal perpendicular through a
+  non-uniform transform (it is re-snapped to the transformed `u`×`v`): only an authored lean aims.
+  `tools/check_tilted_light.py` checks every mode on both backends against an analytic floor.
   **Emitter-less emissive surfaces** (since 0.118.1): `emit` lives on the *material*, so
   a sphere / CSG solid / marched `isosurface` can carry it too, but none of those have
   triangles to register an emitter against. The CPU already handled them, because

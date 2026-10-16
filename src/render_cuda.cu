@@ -287,6 +287,10 @@ struct DVec3 {
     HD Real& operator[](int i)       { return (&x)[i]; }
 };
 HD static inline Real dot(const DVec3& a, const DVec3& b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+// The same dot product accumulated in double, whatever Real is (FTRACE_GPU_FP32).
+__device__ static inline double ddot(const DVec3& a, const DVec3& b) {
+    return (double)a.x * b.x + (double)a.y * b.y + (double)a.z * b.z;
+}
 
 // ---- Self-intersection-safe ray ORIGIN --------------------------------------------------
 // Wachter & Binder, "A Fast and Robust Method for Avoiding Self-Intersection", Ray Tracing
@@ -908,8 +912,9 @@ struct DEmitTri { DVec3 v0, e1, e2, nrm; double cumArea; DVec3 uv0, uvE1, uvE2; 
 // wavelength CDF slice inside the flattened lightCdfAll buffer.
 struct DEmitter {
     DVec3  origin, u, v, normal, beamDir;
-    DVec3  nGeom;              // quad: normalize(cross(u,v)); see Emitter::nGeom
-    int    normalTilted;       // 1 when the authored normal left the patch's plane
+    DVec3  nGeom;              // quad: the patch's face, on the emitting side; see Emitter::nGeom
+    int    normalTilted;       // 1 for an AIMED quad (its normal leans off the face)
+    double aimNorm;            // an aimed quad's flux constant, PI*(1+cos t)/2 (Emitter::aimNorm)
     double area, power;
     int    collimated;
     int    shape;              // 0 quad, 1 sphere, 2 spot, 3 env, 4 cylinder, 5 mesh, 6 sun
@@ -1647,6 +1652,27 @@ __device__ static DVec3 cosineHemisphere(const DVec3& n, DRng& rng) {
     Real lx = r * cos(phi), ly = r * sin(phi), lz = sqrt((Real)1 - u1);
     DVec3 t, b; onb(n, t, b);
     return normalize(t * lx + b * ly + n * lz);
+}
+// ---- an AIMED quad (DEmitter::normalTilted) -- device twins of Emitter::aimCos / aimRadiance /
+// aimDirPdf / sampleAimDir (scene.h, which states the model). `w` leaves the patch. ------------
+__device__ static inline Real dAimCos(const DEmitter& em, const DVec3& w) {
+    const Real cg = ddot(em.nGeom, w), ca = ddot(em.normal, w);
+    return (cg > (Real)0 && ca > (Real)0) ? ca : (Real)0;
+}
+__device__ static inline Real dAimRadiance(const DEmitter& em, const DVec3& w) {
+    const Real cg = ddot(em.nGeom, w), ca = ddot(em.normal, w);
+    return (cg > (Real)0 && ca > (Real)0) ? ca / cg : (Real)0;
+}
+__device__ static inline double dAimDirPdf(const DEmitter& em, const DVec3& w) {
+    return (double)dAimCos(em, w) / em.aimNorm;
+}
+__device__ static DVec3 dSampleAimDir(const DEmitter& em, DRng& rng, double& pdfW) {
+    for (int k = 0; k < 64; ++k) {
+        const DVec3 w = cosineHemisphere(em.normal, rng);
+        if (ddot(em.nGeom, w) > (Real)0) { pdfW = dAimDirPdf(em, w); return w; }
+    }
+    pdfW = 0.0;
+    return em.normal;
 }
 // Power-cosine lobe around a mirror direction, from two CANONICAL uniforms rather than an
 // rng — the device twin of glossyDirUV (src/render.h), split out of sampleGlossy for the
@@ -6570,11 +6596,14 @@ __global__ void kWfBeamEval(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm,
 // (it consumes the photon per camera), so this is a no-op for CAM_C. For model A each
 // camera draws its own aperture sample, so the loop consumes RNG proportional to nCam
 // (deterministic given the camera order).
+// `plane` (optional): an aimed quad's face (DEmitter::nGeom) -- a camera behind it gets nothing.
 __device__ static void splatSurfaceAll(const DScene& sc, const DCamSet& cs, int camMode,
                                         const DVec3& p, const DVec3& n, const DVec3& ng,
                                         const DVec3& wi, Real lambda,
-                                        Real beta, Real rho, DRng& rng) {
+                                        Real beta, Real rho, DRng& rng,
+                                        const DVec3* plane = nullptr) {
     for (int c = 0; c < cs.nCam; ++c) {
+        if (plane && ddot(*plane, cs.cams[c].eye - p) <= (Real)0) continue;
         if (camMode == CAM_B) connect(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng);
         else if (camMode == CAM_A) connectLens(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng);
     }
@@ -6826,11 +6855,16 @@ struct DSpecVtx {
     double weight;             // surface: Lambertian rho ; volume: single-scatter albedo
     const DMedium* med;        // scattering medium (volume vertices) — for rainbow phase
     Real   lambda;             // wavelength (volume vertices) — for rainbow phase
+    // An aimed quad (DEmitter::nGeom) sends nothing behind its own face, whatever `np` (its
+    // aim) says: `gated` turns on that second test, against `plane`. Host twin SpecVtx.
+    bool   gated = false;
+    D3     plane;
     // Throughput at the vertex for a connection leaving toward `wP` (unit, toward the
     // sphere). Returns <0 to signal "reject" (camera-side behind a surface). A rainbow
     // medium uses its tabulated Airy phase; HG media use the analytic lobe.
     __device__ double term(const D3& wP) const {
         if (volume) return weight * (double)dMedPhase(*med, (Real)d3dot(wIn, wP), lambda);
+        if (gated && d3dot(plane, wP) <= 0.0) return -1.0;
         double cosSurf = d3dot(np, wP);
         return cosSurf <= 0.0 ? -1.0 : (weight / DPI) * cosSurf;
     }
@@ -6845,6 +6879,7 @@ struct DSpecVtx {
     // λ-dependent phase is still evaluated at the right wavelength.)
     __device__ double shape(const D3& wP) const {
         if (volume) return (double)dMedPhase(*med, (Real)d3dot(wIn, wP), lambda);
+        if (gated && d3dot(plane, wP) <= 0.0) return -1.0;
         double cosSurf = d3dot(np, wP);
         return cosSurf <= 0.0 ? -1.0 : cosSurf / DPI;
     }
@@ -7541,9 +7576,11 @@ __device__ static void camSpecularSplatAllVtx(const DScene& sc, const DCamSet& c
 // reflect it in every mirror.
 __device__ static void camSpecularSplatAll(const DScene& sc, const DCamSet& cs, int camMode,
                                            const DVec3& p, const DVec3& n, Real lambda,
-                                           Real beta, Real rho, DRng& rng) {
+                                           Real beta, Real rho, DRng& rng,
+                                           const DVec3* plane = nullptr) {
     DSpecVtx vt; vt.volume = false; vt.np = D3(n); vt.weight = (double)rho; vt.g = 0;
     vt.med = nullptr; vt.lambda = lambda;
+    if (plane) { vt.gated = true; vt.plane = D3(*plane); }               // see DSpecVtx
     camSpecularSplatAllVtx(sc, cs, camMode, D3(p), vt, lambda, beta, rng);
 }
 // Volume vertex: refract the fog in-scatter at p through every glass sphere, so the
@@ -8676,7 +8713,8 @@ __device__ static bool dApplyCausticAim(const DScene& sc, const DCamSet& cs,
                 const double omegaOuter = 2.0 * DPI * (1.0 - em->spotCosOuter);
                 spotW = (Real)(spotFalloff(ct, em->spotCosInner, em->spotCosOuter)
                                * omegaOuter / em->spotOmega);
-            } else if (em && (double)dot(dir, emitN) <= 0.0) {
+            } else if (em && (em->normalTilted ? dAimCos(*em, dir) <= (Real)0
+                                               : (double)dot(dir, emitN) <= 0.0)) {
                 return false;                                  // below the horizon: p_u = 0
             }
         }
@@ -8684,6 +8722,8 @@ __device__ static bool dApplyCausticAim(const DScene& sc, const DCamSet& cs,
         if (em && em->shape == 2) {
             const double ct = (double)dot(dir, em->beamDir);
             pu = (ct > em->spotCosOuter) ? 1.0 / (2.0 * DPI * (1.0 - em->spotCosOuter)) : 0.0;
+        } else if (em && em->normalTilted) {
+            pu = dAimDirPdf(*em, dir);                         // an aimed quad (DEmitter::nGeom)
         } else if (em) {
             const double c = (double)dot(dir, emitN);
             pu = (c > 0.0) ? c / DPI : 0.0;                    // cosine hemisphere
@@ -8835,7 +8875,12 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         // quad: constant normal; sphere: surface point. Also returns this point's
         // `emit pattern:` factor — 1.0 (and a bit-identical draw) when unpatterned.
         emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, origin, emitN);
-        dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
+        if (em.collimated) dir = em.beamDir;
+        else if (em.normalTilted) {                // an aimed quad: intensity-proportional
+            double pdfAim = 0.0;
+            dir = dSampleAimDir(em, rng, pdfAim);
+            if (!(pdfAim > 0.0)) return false;
+        } else dir = cosineHemisphere(emitN, rng);
     }
     // Aimed caustic emission (causticaim.h). Placed here, after the shape branch has produced
     // an ordinary sample and BEFORE `beta *= spotW`, because the aimed pass resamples the
@@ -8929,8 +8974,12 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     if (em.shape != 2 && em.shape != 3 && em.shape != 6) {
         // Emitter vertex: ns==ng==emitN, so the adjoint correction is identically 1
         // (wi is irrelevant here — pass emitN).
-        splatSurfaceAll(sc, cs, camMode, origin, emitN, emitN, emitN, lambda, beta, (Real)1, rng);
-        camSpecularSplatAll(sc, cs, camMode, origin, emitN, lambda, beta, (Real)1, rng);
+        // An aimed quad: rho = PI/aimNorm about the aim, gated by its face (host twin in
+        // Renderer::tracePhoton).
+        const Real rhoE = em.normalTilted ? (Real)(DPI / em.aimNorm) : (Real)1;
+        const DVec3* plane = em.normalTilted ? &em.nGeom : nullptr;
+        splatSurfaceAll(sc, cs, camMode, origin, emitN, emitN, emitN, lambda, beta, rhoE, rng, plane);
+        camSpecularSplatAll(sc, cs, camMode, origin, emitN, lambda, beta, rhoE, rng, plane);
     }
 
     ro = dOffsetAlong(origin, emitN, dir); rd = dir;
@@ -9555,8 +9604,10 @@ __device__ static void connectLensHero(const DScene& sc, const DCamera& cam, dou
 // mode C (which consumes the photon) and for the mode-M deposit pass (nCam == 0).
 __device__ static void splatSurfaceAllHero(const DScene& sc, const DCamSet& cs, int camMode,
         const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
-        const Real* lam, const Real* beta, const Real* rho, int nUp, DRng& rng) {
+        const Real* lam, const Real* beta, const Real* rho, int nUp, DRng& rng,
+        const DVec3* plane = nullptr) {                                   // see splatSurfaceAll
     for (int c = 0; c < cs.nCam; ++c) {
+        if (plane && ddot(*plane, cs.cams[c].eye - p) <= (Real)0) continue;
         if (camMode == CAM_B) connectHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp, rng);
         else if (camMode == CAM_A) connectLensHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp, rng);
     }
@@ -9569,9 +9620,10 @@ __device__ static void splatSurfaceAllHero(const DScene& sc, const DCamSet& cs, 
 // per λ. Draws no RNG (mode B only inside).
 __device__ static void camSpecularSplatAllHero(const DScene& sc, const DCamSet& cs, int camMode,
         const DVec3& p, const DVec3& n, const Real* lam, const Real* beta, const Real* rho,
-        int nUp, DRng& rng) {
+        int nUp, DRng& rng, const DVec3* plane = nullptr) {
     DSpecVtx vt; vt.volume = false; vt.np = D3(n); vt.weight = (double)rho[0]; vt.g = 0;
     vt.med = nullptr; vt.lambda = lam[0];
+    if (plane) { vt.gated = true; vt.plane = D3(*plane); }               // see DSpecVtx
     camSpecularSplatAllVtxN(sc, cs, camMode, D3(p), vt, lam, beta, rho, nUp, rng);
 }
 
@@ -9636,7 +9688,12 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
         emitN = dir;
     } else {
         emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, origin, emitN);
-        dir = em.collimated ? em.beamDir : cosineHemisphere(emitN, rng);
+        if (em.collimated) dir = em.beamDir;
+        else if (em.normalTilted) {                // an aimed quad: intensity-proportional
+            double pdfAim = 0.0;
+            dir = dSampleAimDir(em, rng, pdfAim);
+            if (!(pdfAim > 0.0)) return false;
+        } else dir = cosineHemisphere(emitN, rng);
     }
     // Aimed caustic emission — see the scalar genPhoton. Before `base *= spotW` for the same
     // reason (the aimed pass recomputes spotW).
@@ -9680,9 +9737,12 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
     // Direct emitter->camera connection (area/quad emitters only; spot/env/sun have no
     // direct term). No-op for mode C (splat helpers skip it) and the mode-M deposit pass (nCam==0).
     if (em.shape != 2 && em.shape != 3 && em.shape != 6) {
-        Real rhoOne[hero::kHeroMax]; for (int i = 0; i < nUp; ++i) rhoOne[i] = (Real)1;
-        splatSurfaceAllHero(sc, cs, camMode, origin, emitN, emitN, emitN, lam, beta, rhoOne, nUp, rng);
-        camSpecularSplatAllHero(sc, cs, camMode, origin, emitN, lam, beta, rhoOne, nUp, rng);
+        const Real rhoE = em.normalTilted ? (Real)(DPI / em.aimNorm) : (Real)1;   // aimed quad
+        const DVec3* plane = em.normalTilted ? &em.nGeom : nullptr;
+        Real rhoOne[hero::kHeroMax]; for (int i = 0; i < nUp; ++i) rhoOne[i] = rhoE;
+        splatSurfaceAllHero(sc, cs, camMode, origin, emitN, emitN, emitN, lam, beta, rhoOne, nUp, rng,
+                            plane);
+        camSpecularSplatAllHero(sc, cs, camMode, origin, emitN, lam, beta, rhoOne, nUp, rng, plane);
     }
 
     ro = dOffsetAlong(origin, emitN, dir); rd = dir;
@@ -10286,9 +10346,6 @@ __device__ static inline DHit dVertHit(const DVertex& vt) {
     return h;
 }
 
-__device__ static inline double ddot(const DVec3& a, const DVec3& b) {
-    return (double)a.x * b.x + (double)a.y * b.y + (double)a.z * b.z;
-}
 // Medium (volume) vertices carry no surface, so onSurface() is false — ConvertDensity
 // then omits the cosine Jacobian, giving the correct cosine-free volume area density.
 __device__ static inline bool dOnSurface(const DVertex& v) {
@@ -10551,6 +10608,12 @@ __device__ static float dVertexPdfLightF(const DScene& sc, const DVertex& cur, c
         float solid = 2.0f * (float)DPI * (1.0f - (float)em->spotCosOuter);
         if (solid <= 0.f) return 0.f;
         pdf = (1.0f / solid) * invD2;                 // uniform in the outer cone
+    } else if (cur.lightIdx >= 0 && sc.emitters[cur.lightIdx].normalTilted) {
+        // An aimed quad, at its subpath start or where an eye path hit it (host twin
+        // bdpt.h vertexPdfLight): the density its emission sampler draws `wn` with.
+        const float pAim = (float)dAimDirPdf(sc.emitters[cur.lightIdx], wn);
+        if (!(pAim > 0.f)) return 0.f;
+        pdf = pAim * invD2;
     } else {
         float cosLight = dot(cur.ng, wn);             // one-sided Lambertian emitter
         if (cosLight <= 0.f) return 0.f;
@@ -10624,6 +10687,9 @@ __device__ static double dVertexLe(const DScene& sc, const DVertex& v, const DVe
     else if (v.matId >= 0 && sc.mats[v.matId].matIsLight) eSpd = sc.mats[v.matId].matEmit;
     if (!eSpd) return 0.0;
     if (ddot(v.ng, w) <= 0.0) return 0.0;
+    if (v.lightIdx >= 0 && sc.emitters[v.lightIdx].normalTilted)    // an aimed quad
+        return (double)specLookup(eSpd, lambda) * invPdfLambda * (double)v.emitPatW
+             * (double)dAimRadiance(sc.emitters[v.lightIdx], w);
     return (double)specLookup(eSpd, lambda) * invPdfLambda * (double)v.emitPatW;
 }
 // Emitter that owns an emissive surface material (mirrors Scene::emitterForMat).
@@ -10698,6 +10764,7 @@ __device__ static double dEmitterG(const DScene& sc, Real lambda) {
         double gw = (e.shape == 2) ? e.spotOmega
                   : (e.shape == 3) ? (4.0 * DPI * DPI * sc.sceneRadius * sc.sceneRadius)
                   : (e.shape == 6) ? (e.spotOmega * DPI * sc.sceneRadius * sc.sceneRadius)
+                  : e.normalTilted   ? ((double)e.area * e.aimNorm)      // an aimed quad
                                    : ((double)e.area * DPI);
         g += gw * (double)specLookup(e.emitSpd, lambda);
     }
@@ -11388,7 +11455,15 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         if (g.stG <= (Real)0) return false;
     }
     Real cosLight = dot(nL, -g.wi);               // light is one-sided
-    if (cosLight <= 0) return false;
+    // An AIMED quad: Le * aimCos leaves toward the receiver per unit area (the emitter-side
+    // cosine of G), while the area -> solid-angle MEASURE is the patch's own cos_geom. Host twin
+    // backward.h's emitterGeom; both are cosLight, bit for bit, for an untilted light.
+    double cosGeo = (double)cosLight;
+    if (em.normalTilted) {
+        cosGeo = (double)ddot(em.nGeom, g.wi * (Real)(-1));
+        cosLight = dAimCos(em, g.wi * (Real)(-1));
+    }
+    if (cosLight <= 0 || !(cosGeo > 0.0)) return false;
     // To the sampled POINT (shadowTransmittanceTo): re-aimed from the moved origin and stopped
     // short of the light's own surface. The bare (origin, wi, dist) form ends on or inside the
     // emitter, where a sphere light shadows its own sample on the float32 device
@@ -11397,15 +11472,7 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
              : shadowTransmittanceTo(sc, dOffsetAlong(h.p, h.ng, g.wi), h.p + g.wi * g.dist,
                                      2 * RAY_EPS);
     if (!(vis > (Real)0)) return false;
-    // Side test above: authored normal. Measure below: the patch's own orientation, since the
-    // solid angle a patch subtends depends on how it is oriented and not on where its emission is
-    // aimed. Host twin backward.h's emitterGeom, where the reasoning lives. Bit-identical unless
-    // the light is actually tilted.
-    const double cosGeo = em.normalTilted
-                              ? fabs((double)ddot(em.nGeom, g.wi * (Real)(-1)))
-                              : (double)cosLight;
-    if (!(cosGeo > 0.0)) return false;
-    g.G = (Real)((double)g.cosSurf * cosGeo / (double)g.dist2 * (double)vis);
+    g.G = (Real)((double)g.cosSurf * (double)cosLight / (double)g.dist2 * (double)vis);
     if (epat != 1.0) g.G = (Real)((double)g.G * epat);   // no-op without a pattern
     g.fall = (Real)1; g.spot = false; g.sun = false;
     // Uniform over em.area, so pdf_W = pdf_A * dist^2 / cos(light). `epat` is a radiance
@@ -11815,15 +11882,14 @@ __device__ __noinline__ static void bkNeeVolumeHero(const DScene& sc, const DMed
             const Real dist2 = dot(toL, toL);
             dist = sqrt(dist2);
             wi = toL / dist;
-            const Real cosLight = dot(nL, wi * (Real)(-1));     // light is one-sided
+            // One-sided; an AIMED quad emits Le * aimCos per unit area toward the vertex
+            // (bkEmitterGeom; host twin volumeEmitterGeom). No surface cosine at a volume vertex.
+            const Real cosLight = em.normalTilted ? dAimCos(em, wi * (Real)(-1))
+                                                  : dot(nL, wi * (Real)(-1));
             if (cosLight <= 0) continue;
             const Real vis = shadowTransmittanceTo(sc, p + wi * RAY_EPS, p + wi * dist, 2 * RAY_EPS);
             if (!(vis > (Real)0)) continue;
-            // The side test takes the authored normal, the measure the patch's own orientation
-            // (bkEmitterGeom; host twin volumeEmitterGeom). No surface cosine at a volume vertex.
-            const double cosGeo = em.normalTilted ? fabs((double)ddot(em.nGeom, wi * (Real)(-1)))
-                                                  : (double)cosLight;
-            geom = cosGeo / (double)dist2 * (double)em.area * (double)vis * epat;
+            geom = (double)cosLight / (double)dist2 * (double)em.area * (double)vis * epat;
         }
         geom *= (double)dMediaTransmittance(sc, p, wi, dist, lam[0], rng) * selW;
         if (!(geom > 0.0)) continue;
@@ -12857,8 +12923,10 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             if (eSpd) {
                 // GLOSSY-NEE's lobe-sampling half; 1 -- and this expression bit-identical to
                 // its pre-0.266 form -- unless the previous bounce was a MIS'd glossy one.
-                const double wMis = (gmis.pdf > 0.0)
+                double wMis = (gmis.pdf > 0.0)
                     ? dGlossyHitWeight(sc, gmis, li, rd, &h.p, &h.n) : 1.0;
+                if (li >= 0 && sc.emitters[li].normalTilted)          // an aimed quad's radiance depends on
+                    wMis *= (double)dAimRadiance(sc.emitters[li], rd * (Real)(-1));  // the view
                 L += thr * (double)specLookup(eSpd, lambda) * invPdfLambda
                          * dEmitPatMul(sc, mp->emitPat, h) * wMis;
             }
@@ -13088,6 +13156,8 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 double ep = dEmitPatMul(sc, mp->emitPat, h);
                 if (gmis.pdf > 0.0)          // GLOSSY-NEE, as in the scalar loop
                     ep *= dGlossyHitWeight(sc, gmis, li, rd, &h.p, &h.n);
+                if (li >= 0 && sc.emitters[li].normalTilted)          // an aimed quad (scalar loop)
+                    ep *= (double)dAimRadiance(sc.emitters[li], rd * (Real)(-1));
                 for (int i = 0; i < nUp; ++i)
                     L[i] += thr[i] * (double)specLookup(eSpd, lam[i]) * invPdf[i] * ep;
             }
@@ -13670,11 +13740,10 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         if (cosSurf <= 0) continue;
         Real stG = dShadowTerminatorG(wi, h.n, ngo0);
         if (stG <= (Real)0) continue;
-        Real cosLight = dot(nL, -wi);
+        // One-sided; an AIMED quad emits Le * aimCos per unit area (bkEmitterGeom).
+        Real cosLight = em.normalTilted ? dAimCos(em, -wi) : dot(nL, -wi);
         if (cosLight <= 0) continue;
         if (occludedTo(sc, dOffsetAlong(h.p, h.ng, wi), h.p + wi * dist, 2 * RAY_EPS)) continue;
-        // Side test: the authored normal; measure: the patch's own orientation (bkEmitterGeom).
-        if (em.normalTilted) cosLight = (Real)fabs((double)ddot(em.nGeom, wi * (Real)(-1)));
         Real G = cosSurf * cosLight / dist2;
         if (epat != 1.0) G = (Real)((double)G * epat);   // no-op without a pattern
         total = total + hadamard(f * (G * em.area * stG * selWr), em.rgbEmit);
@@ -13767,6 +13836,8 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
             // Emitter-less emissive geometry (isosurface / CSG solid) falls back to the
             // material's own baked emission, exactly as the spectral paths do.
             double ep = dEmitPatMul(sc, mp->emitPat, h);
+            if (li >= 0 && sc.emitters[li].normalTilted)              // an aimed quad (bkRadiance)
+                ep *= (double)dAimRadiance(sc.emitters[li], rd * (Real)(-1));
             L = L + hadamard(beta * (Real)ep,
                              (li >= 0) ? sc.emitters[li].rgbEmit : mp->rgbMatEmit);
         }
@@ -14586,7 +14657,10 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     double pdfPos = (em.area > 0.0) ? 1.0 / em.area : 0.0;
     if (pdfPos <= 0.0) return 0;
     DVertex L0;
-    L0.type = BV_LIGHT; L0.p = y; L0.ns = nOut; L0.ng = nOut;
+    // An aimed quad's vertex carries its FACE (DEmitter::nGeom), which every density conversion
+    // at it measures; nOut is its aim. Host twin bdpt.h generateLightSubpath.
+    const DVec3 nFace = em.normalTilted ? em.nGeom : nOut;
+    L0.type = BV_LIGHT; L0.p = y; L0.ns = nFace; L0.ng = nFace;
     L0.beta = Le; L0.pdfFwd = pdfChoice * pdfPos; L0.pdfRev = 0; L0.delta = 0;
     L0.matId = em.matId; L0.lightIdx = ei;
     L0.emitPatW = (Real)emitPatW;
@@ -14595,15 +14669,23 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     // filled above).
     L0.nUp = hb.C;
     path[0] = L0; int n = 1;
-    DVec3 dir = cosineHemisphere(nOut, rng);
-    double cosLight = ddot(nOut, dir);
-    if (cosLight <= 0.0) return 1;
-    double pdfDir = cosLight / DPI;
+    DVec3 dir;
+    double cosLight, pdfDir;
+    if (em.normalTilted) {                       // an aimed quad: intensity-proportional
+        dir = dSampleAimDir(em, rng, pdfDir);
+        cosLight = (double)dAimCos(em, dir);     // Le(dir) * cos_geom = Le * aimCos
+        if (!(pdfDir > 0.0) || cosLight <= 0.0) return 1;
+    } else {
+        dir = cosineHemisphere(nOut, rng);
+        cosLight = ddot(nOut, dir);
+        if (cosLight <= 0.0) return 1;
+        pdfDir = cosLight / DPI;
+    }
     double betaWalk = Le * cosLight / (pdfChoice * pdfPos * pdfDir);
     double betaWalkSec[BDPT_NSEC];
     for (int i = 0; i + 1 < hb.C; ++i)
         betaWalkSec[i] = pathSec[i] * cosLight / (pdfChoice * pdfPos * pdfDir);
-    DVec3 ro = y + nOut * (Real)1e-6;
+    DVec3 ro = y + nFace * (Real)1e-6;
     dRandomWalk(sc, cam, diffraction, ro, dir, betaWalk, pdfDir, hb, maxDepth - 1, rng,
                 path, pathSec, secStride, maxV, n, true, betaWalkSec, hb.C);
     return n;
@@ -14896,10 +14978,13 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             DVec3 toL = y - pt.p; double dist2 = ddot(toL, toL);
             if (dist2 <= 0.0) return 0.0;
             dist = sqrt(dist2); wi = toL * (Real)(1.0 / dist);
-            double cosLight = ddot(nOut, wi * (Real)(-1));
+            // One-sided; an aimed quad sends Le * aimCos per unit area (host twin connectBDPT).
+            double cosLight = em.normalTilted ? (double)dAimCos(em, wi * (Real)(-1))
+                                              : ddot(nOut, wi * (Real)(-1));
             if (cosLight <= 0.0) return 0.0;           // emitter stays one-sided
             if (em.area <= 0.0) return 0.0;
             Wgeom = cosLight * em.area / (dist2 * pdfChoice);   // == cosLight/(d^2 * pdfA)
+            if (em.normalTilted) nOut = em.nGeom;      // the vertex carries the face (see L0)
         }
         nUp = pt.nUp;
         double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * emitPatW;
@@ -15639,6 +15724,8 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 double rhoV = (double)clamp01(dDiffuseRho(sc, visMat, visHit, lambda));
                 double e = (double)specLookup(eSpd, lambda) * thr * rhoV * invPdfL
                          * dEmitPatMul(sc, m.emitPat, h);   // `emit pattern:` at this hit
+                if (li >= 0 && sc.emitters[li].normalTilted)          // an aimed quad (bkRadiance)
+                    e *= (double)dAimRadiance(sc.emitters[li], rd * (Real)(-1));
                 oX += (double)cieX(lambda) * e; oY += (double)cieY(lambda) * e; oZ += (double)cieZ(lambda) * e;
             }
         }
@@ -16243,6 +16330,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                                   ? dGlossyHitWeight(sc, gmis, li, rd, &h.p, &h.n) : 1.0;
                 double e = (double)specLookup(eSpd, lambda) * thr * invPdfL * wMis
                          * dEmitPatMul(sc, m.emitPat, h);    // `emit pattern:` at this hit
+                if (li >= 0 && sc.emitters[li].normalTilted)          // an aimed quad (bkRadiance)
+                    e *= (double)dAimRadiance(sc.emitters[li], rd * (Real)(-1));
                 oX += (double)cieX(lambda) * e;
                 oY += (double)cieY(lambda) * e;
                 oZ += (double)cieZ(lambda) * e;
@@ -16692,6 +16781,8 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         if (li >= 0) {                                   // directly-viewed / specular-seen emitter
             double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * invPdfL
                      * dEmitPatMul(sc, m.emitPat, h);    // `emit pattern:` at this hit
+            if (sc.emitters[li].normalTilted)            // an aimed quad (bkRadiance)
+                e *= (double)dAimRadiance(sc.emitters[li], rd * (Real)(-1));
             dX += (double)cieX(lambda) * e;
             dY += (double)cieY(lambda) * e;
             dZ += (double)cieZ(lambda) * e;
@@ -17217,7 +17308,9 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
         // exactly 1 for both delta lights because their emission "normal" IS the direction.
         // Keeping emitScale out of every pdf is what lets directPdf / emissionPdfW stay
         // exactly what the camera kernel's s=0 / s=1 terms assume.
-        double emitScale = 1.0, emitCos = 1.0, pdfPos = 1.0, pdfDirW = 0.0;
+        // `emitLeCos` is Le(dir) * cos / Le, what the throughput carries: emitCos, except for an
+        // aimed quad, whose emitCos is its face's and emitLeCos its aimCos (host twin vcm.h).
+        double emitScale = 1.0, emitCos = 1.0, emitLeCos = 1.0, pdfPos = 1.0, pdfDirW = 0.0;
         if (isDelta) {
             // Both delta lights emit uniformly inside a cone about beamDir (pdfW = 1/Omega).
             // NOTE spotOmega is the FALLOFF-weighted solid angle for a spot, so the sampling
@@ -17249,10 +17342,19 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             emitScale = dEmitterSamplePointPat(sc, em, u1, u2, y, nOut);
             if (em.area <= 0.0) continue;
             pdfPos = 1.0 / em.area;
-            dir = cosineHemisphere(nOut, rng);
-            emitCos = ddot(nOut, dir);
-            if (emitCos <= 0.0) continue;
-            pdfDirW = emitCos / DPI;
+            if (em.normalTilted) {                   // an aimed quad: intensity-proportional
+                dir = dSampleAimDir(em, rng, pdfDirW);
+                nOut = em.nGeom;                     // the face, for the offset and the measure
+                emitCos = ddot(nOut, dir);
+                emitLeCos = (double)dAimCos(em, dir);
+                if (!(pdfDirW > 0.0) || emitCos <= 0.0 || emitLeCos <= 0.0) continue;
+            } else {
+                dir = cosineHemisphere(nOut, rng);
+                emitCos = ddot(nOut, dir);
+                if (emitCos <= 0.0) continue;
+                pdfDirW = emitCos / DPI;
+                emitLeCos = emitCos;
+            }
         }
         double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * emitScale;
         // Max-over-live-λ: the hero can legitimately sit in a gap of the emission spectrum
@@ -17275,7 +17377,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
         // sun — exactly SmallVCM's PointLight / DirectionalLight constants.
         double directPdfW = pdfChoice * (isInfinite ? pdfDirW : (isDelta ? 1.0 : pdfPos));
 
-        double beta = Le * emitCos / emissionPdfW;
+        double beta = Le * emitLeCos / emissionPdfW;
         // MIS bookkeeping is the HERO's for the whole bundle: every sampling density in this
         // renderer (cosine / glossy-lobe / emitter pdfs) is wavelength-INDEPENDENT, so one
         // dVCM/dVC/dVM triple serves every λ — only the throughput VALUES differ.
@@ -17289,7 +17391,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
         double betaSec[SECN];
         double cieSx[SECN], cieSy[SECN], cieSz[SECN];
         for (int k = 0; k + 1 < nUp; ++k) {
-            betaSec[k] = LeSec[k] * emitCos / emissionPdfW;
+            betaSec[k] = LeSec[k] * emitLeCos / emissionPdfW;
             cieSx[k] = (double)cieX(lamAll[k + 1]);
             cieSy[k] = (double)cieY(lamAll[k + 1]);
             cieSz[k] = (double)cieZ(lamAll[k + 1]);
@@ -17622,6 +17724,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     // Achromatic `emit pattern:` factor at this hit — the same value the
                     // light-subpath / NEE sides get from the sampler at this point.
                     double ep = dEmitPatMul(sc, mp->emitPat, h);
+                    if (sc.emitters[li].normalTilted)    // an aimed quad (vcm.h)
+                        ep *= (double)dAimRadiance(sc.emitters[li], wo);
                     double Le = (double)specLookup(sc.emitters[li].emitSpd, lambda) * invPdfLambda * ep;
                     double LeSec[SECN], mxLe = Le;
                     for (int k = 0; k + 1 < nUp; ++k) {
@@ -17634,7 +17738,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                         if (em.area > 0.0 && sc.totalPower > 0.0 && edges >= 2) {
                             double pdfChoice = em.power / sc.totalPower;
                             double directPdfA = pdfChoice / em.area;
-                            double emissionPdfW = pdfChoice * cosLight / (DPI * em.area);   // joint density (see vcm.h)
+                            double emissionPdfW = em.normalTilted       // joint density (see vcm.h)
+                                ? pdfChoice * dAimDirPdf(em, wo) / em.area
+                                : pdfChoice * cosLight / (DPI * em.area);
                             double wCamera = directPdfA * dVCM + emissionPdfW * dVC;
                             misW = 1.0 / (1.0 + wCamera);
                         }
@@ -17719,11 +17825,20 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                             DVec3 toL = yL - h.p; dist2 = ddot(toL, toL);
                             if (dist2 > 1e-12 && em.area > 0.0) {
                                 distL = sqrt(dist2); wiL = toL * (Real)(1.0 / distL);
-                                cosAtLight = ddot(nL, wiL * (Real)-1);
-                                if (cosAtLight > 0.0) {           // emitter stays one-sided
+                                // An aimed quad (host twin vcm.h): the face's cosine is the
+                                // measure, the aimed density the emission's, and its radiance
+                                // factor scales Le alone, as `epat` does.
+                                cosAtLight = em.normalTilted ? ddot(em.nGeom, wiL * (Real)-1)
+                                                             : ddot(nL, wiL * (Real)-1);
+                                const double aimR = em.normalTilted
+                                    ? (double)dAimRadiance(em, wiL * (Real)-1) : 1.0;
+                                if (cosAtLight > 0.0 && aimR > 0.0) {   // emitter stays one-sided
                                     double invArea = 1.0 / em.area;
                                     neeDirectPdfW = invArea * dist2 / cosAtLight;
-                                    neeEmissionPdfW = invArea * cosAtLight / DPI;
+                                    neeEmissionPdfW = em.normalTilted
+                                        ? invArea * dAimDirPdf(em, wiL * (Real)-1)
+                                        : invArea * cosAtLight / DPI;
+                                    if (em.normalTilted) epat *= aimR;
                                     geomOk = true;
                                 }
                             }
@@ -19311,6 +19426,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         de.normal  = {e.normal.x, e.normal.y, e.normal.z};
         de.nGeom   = {e.nGeom.x, e.nGeom.y, e.nGeom.z};
         de.normalTilted = e.normalTilted ? 1 : 0;
+        de.aimNorm = e.aimNorm;
         de.beamDir = {e.beamDir.x, e.beamDir.y, e.beamDir.z};
         de.area = e.area; de.power = e.power;
         de.collimated = e.collimated ? 1 : 0;

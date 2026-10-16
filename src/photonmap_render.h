@@ -1222,8 +1222,10 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 ? bwNee.glossyHitWeight(scene, gmis,
                         BackwardRenderer::emitterIndexOfResolved(scene, m), ray.d, &h.p, &h.n)
                 : 1.0;
+            const double aim = scene.aimOfMat.empty() ? 1.0       // an aimed quad (Emitter::nGeom)
+                : scene.aimedEmission((int)(&m - scene.mats.data()), ray.d * -1.0);
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                 * (thr * rhoV * emitSlot(scene, m, h, lambda) * invPdfL * wMis);
+                 * (thr * rhoV * emitSlot(scene, m, h, lambda) * invPdfL * (wMis * aim));
         }
 
         // GLOSSY-NEE: cleared HERE and not at the top of the loop. `gmis` is written by the
@@ -1572,8 +1574,10 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 ? bwNee.glossyHitWeight(scene, gmis,
                         BackwardRenderer::emitterIndexOfResolved(scene, m), ray.d, &h.p, &h.n)
                 : 1.0;
+            const double aim = scene.aimOfMat.empty() ? 1.0       // an aimed quad (Emitter::nGeom)
+                : scene.aimedEmission((int)(&m - scene.mats.data()), ray.d * -1.0);
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                 * (thr * emitSlot(scene, m, h, lambda) * invPdfL * wMis);
+                 * (thr * emitSlot(scene, m, h, lambda) * invPdfL * (wMis * aim));
         }
 
         // GLOSSY-NEE: cleared HERE and not at the top of the loop. `gmis` is written by the

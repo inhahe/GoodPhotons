@@ -561,7 +561,9 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
     // dVM derived from them — stay exactly what the camera side's s=0 / s=1 terms assume.
     // `emitCos` is |cos| at the light: the cosine-hemisphere cosine for an area light,
     // and exactly 1 for the two delta lights (their emission "normal" IS the direction).
-    double emitScale = 1.0, emitCos = 1.0, pdfPos = 1.0, pdfDirW = 0.0;
+    // `emitLeCos` is Le(dir) * cos / Le, what the throughput carries: emitCos itself, except
+    // for an aimed quad (Emitter::nGeom), whose emitCos is its face's and emitLeCos its aimCos.
+    double emitScale = 1.0, emitCos = 1.0, emitLeCos = 1.0, pdfPos = 1.0, pdfDirW = 0.0;
     if (isDelta) {
         // Spot and sun both emit uniformly inside a cone about beamDir (pdfW = 1/Omega,
         // exact at any half-angle). NOTE spotOmega is the FALLOFF-weighted solid angle for
@@ -591,10 +593,19 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         emitScale = emitterSamplePoint(scene, em, u1, u2, y, nOut);
         if (em.area <= 0.0) return;
         pdfPos = 1.0 / em.area;
-        dir = cosineHemisphere(nOut, rng);
-        emitCos = dot(nOut, dir);
-        if (emitCos <= 0.0) return;
-        pdfDirW = emitCos / PI;
+        if (em.normalTilted) {                       // an aimed quad: intensity-proportional
+            dir = em.sampleAimDir([&] { return rng.uniform(); }, pdfDirW);
+            nOut = em.nGeom;                         // the face, for the offset and the measure
+            emitCos = dot(nOut, dir);
+            emitLeCos = em.aimCos(dir);
+            if (!(pdfDirW > 0.0) || emitCos <= 0.0 || emitLeCos <= 0.0) return;
+        } else {
+            dir = cosineHemisphere(nOut, rng);
+            emitCos = dot(nOut, dir);
+            if (emitCos <= 0.0) return;
+            pdfDirW = emitCos / PI;
+            emitLeCos = emitCos;
+        }
     }
     double Le = em.spdFn(lambda) * invPdfLambda * emitScale;
     // Max over the LIVE wavelengths, never the hero alone (hero.h policy 3): a spiky
@@ -620,8 +631,8 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
 
     // Geometric throughput leaving the light (Le carries the spectral radiance). Every
     // factor but Le is purely geometric, so the secondaries share it exactly.
-    double beta = Le * emitCos / emissionPdfW;
-    for (int i = 0; i + 1 < C; ++i) betaSec[i] = LeSec[i] * emitCos / emissionPdfW;
+    double beta = Le * emitLeCos / emissionPdfW;
+    for (int i = 0; i + 1 < C; ++i) betaSec[i] = LeSec[i] * emitLeCos / emissionPdfW;
 
     // Running MIS quantities (SmallVCM GenerateLightSample). A delta light cannot be hit
     // by BSDF sampling, so dVC (and the dVM built from it) start at ZERO: that is what
@@ -932,6 +943,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 // Achromatic `emit pattern:` factor at this hit — the same value the
                 // light-subpath / NEE sides get from emitterSamplePoint at this point.
                 double ep = (mp->emitPat < 0) ? 1.0 : slotPatMul(scene, mp->emitPat, h);
+                if (!scene.aimOfMat.empty()) ep *= scene.aimedEmission(h.matId, wo);   // aimed quad
                 double Le = mp->emit(lambda) * invPdfLambda * ep;
                 double LeSec[hero::kHeroMax - 1] = {0}, mxLe = Le;
                 for (int i = 0; i + 1 < nUp; ++i) {
@@ -952,7 +964,9 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                         // landing on the light after a bounce kept nearly full weight while the
                         // splat and the merge kept theirs: +4.4 % over mode R on a bare
                         // floor+sphere scene, and +24 % on skin whose NEE fur blocks (0.363.0).
-                        double emissionPdfW = pdfChoice * cosLight / (PI * em->area);
+                        double emissionPdfW = em->normalTilted        // an aimed quad
+                            ? pdfChoice * em->aimDirPdf(wo) / em->area
+                            : pdfChoice * cosLight / (PI * em->area);
                         double wCamera = Mis(directPdfA) * dVCM + Mis(emissionPdfW) * dVC;
                         misW = 1.0 / (1.0 + wCamera);
                     }
@@ -1035,11 +1049,19 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                         Vec3 toL = yL - h.p; dist2 = dot(toL, toL);
                         if (dist2 > 1e-12 && em.area > 0.0) {
                             distL = std::sqrt(dist2); wi = toL / distL;
-                            cosAtLight = dot(nL, wi * -1.0);
-                            if (cosAtLight > 0.0) {                 // emitter stays one-sided
+                            // An aimed quad (Emitter::nGeom): the face's cosine is the
+                            // measure, the aimed density the emission's, and its radiance
+                            // factor scales Le alone, as `epat` does.
+                            cosAtLight = em.normalTilted ? dot(em.nGeom, wi * -1.0)
+                                                         : dot(nL, wi * -1.0);
+                            const double aimR = em.normalTilted ? em.aimRadiance(wi * -1.0) : 1.0;
+                            if (cosAtLight > 0.0 && aimR > 0.0) {   // emitter stays one-sided
                                 double invArea = 1.0 / em.area;
                                 directPdfW = invArea * dist2 / cosAtLight;   // (no pickProb)
-                                emissionPdfW = invArea * cosAtLight / PI;    // (no pickProb)
+                                emissionPdfW = em.normalTilted               // (no pickProb)
+                                    ? invArea * em.aimDirPdf(wi * -1.0)
+                                    : invArea * cosAtLight / PI;
+                                if (em.normalTilted) epat *= aimR;
                                 geomOk = true;
                             }
                         }

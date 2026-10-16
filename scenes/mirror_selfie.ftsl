@@ -98,9 +98,12 @@ light area {
     origin 0.2 1.4 2.9   u 1.6 0 0   v 0 0.8 0   normal 0 -0.4 -1
     spd preset:bb5200
 }
-# Two wall-wash lights flanking the mirror (outside the view cone, so unseen directly)
-# that face the back wall head-on — lighting the cream frame and the wall around it so
-# the framed mirror clearly reads as an object hanging on the wall.
+# Two wall-wash lights flanking the mirror (outside the view cone, so unseen directly):
+# upright panels facing across the room, their normals leaning 37 degrees toward the
+# back wall, which aims them at it (a leaning normal aims an area light) — lighting the
+# cream frame and the wall around it so the framed mirror clearly reads as an object
+# hanging on the wall. The fill above, a panel facing the back wall, is aimed 22 degrees
+# down by its normal the same way.
 light area {
     origin 0.28 0.15 0.80   u 0 1.55 0   v 0 0 0.35   normal 0.8 0 -0.6
     spd preset:bb5500
