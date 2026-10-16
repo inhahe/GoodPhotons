@@ -15733,8 +15733,8 @@ static bool modeFormsLensImage(char mode) { return mode == 'R' || mode == 'D' ||
 // Core capability check: return a reason string if `mode` cannot render `scene` with a
 // camera of the given `projection`, else nullptr. Volumetric emission restricts every mode
 // but A/B/C/R/D (modeRendersVolumeEmission); A and C image through one rectilinear thin lens;
-// otherwise only the modes with real restrictions (D BDPT, J UPBP, U VCM) gate anything, and
-// the general modes (B/R/M/S/P) render everything.
+// otherwise only the modes with real restrictions (D BDPT, J UPBP, U VCM, S SPPM's surfaces-only
+// gather) gate anything, and the general modes (B/R/M/P) render everything.
 static const char* modeFeatureUnsupported(const Scene& scene, char mode, int projection) {
     if (sceneHasEmissiveMedium(scene)) {
         if (!modeRendersVolumeEmission(mode))
@@ -15771,6 +15771,11 @@ static const char* modeFeatureUnsupported(const Scene& scene, char mode, int pro
         if (!scene.media.empty()) return "participating media (mode U is surfaces-only)";
         if (projection != CAM_RECTILINEAR)
             return "a non-rectilinear (fisheye/panoramic) camera in mode U";
+    } else if (mode == 'S') {
+        // SPPM's passes deposit photons on surfaces and its visible points sit on surfaces, so a
+        // medium dims what lies behind it but never scatters light into the picture: the fog
+        // itself renders black.
+        if (!scene.media.empty()) return "participating media (mode S is surfaces-only)";
     }
     return nullptr;
 }

@@ -127,10 +127,13 @@ def main():
     for name, cams in scenes.items():
         with open(os.path.join(d, name), "w", encoding="utf-8", newline="") as f:
             f.write(NL.join(cams + medium) + NL)
-    # 14: the fire made cold by its scale.
+    # 14: the fire made cold by its scale. Cold, it lights nothing, and a scene with no light at
+    # all is refused before any mode is asked, so a lamp shows the smoke.
     with open(os.path.join(d, "firecold.ftsl"), "w", encoding="utf-8", newline="") as f:
         f.write(NL.join(scenes["fire.ftsl"] + [ln.replace("emission_scale 4", "emission_scale 0")
-                                                for ln in medium]) + NL)
+                                                for ln in medium] + [
+            'light area { origin -0.5 2 -0.5  u 1 0 0  v 0 0 1  normal 0 -1 0  power 50  '
+            'spd preset:bb5500 }']) + NL)
     # 15: two single hot voxels at opposite corners of a 128^3 temperature grid, in thin fog.
     spots = np.zeros((128, 128, 128))
     spots[3, 3, 3] = spots[124, 124, 124] = 1.0

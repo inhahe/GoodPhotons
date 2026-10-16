@@ -71,6 +71,27 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-10-16, 0.384.2): SPPM-LIGHT-SIDE — mode S lit the back of every light, showed device glows black, and rendered fog as nothing
+
+Three defects in mode S, all found while extending the light checks to it:
+
+* **The back of a light glowed.** A camera path that met a light added its emission whichever
+  face it hit (sppm_render.h's `m.isLight` branch; the device's `dSppmVisiblePoint`), where every
+  other mode tests `dot(ray, ng) < 0`. Seen from behind, a lamp in mode S put 34 times the rest
+  of the frame's light where mode R renders black. Both now emit from the front face only.
+* **On the device, a glowing surface with no emitter was black** (a marched isosurface or CSG
+  solid whose material has `emit`): `dSppmVisiblePoint` keyed emission off `dEmitterForMat`
+  alone, while the host took `m.isLight`. It now falls back to the material's `emit` the way
+  `bkRadiance` does (sphere seen directly: 1.8e-16 of mode R before, matching after).
+* **Participating media rendered as nothing.** SPPM deposits and gathers on surfaces only, so a
+  fog dimmed what lay behind it (frame x0.91 on the check's fog box) but never scattered light
+  into the picture: the fog itself was black, with no warning. Mode S now refuses a scene with
+  media, as mode U does (`-on-unsupported fallback` renders it in mode R instead). A volume
+  estimator for mode S (photon beams, as mode M's `-beams`) is the feature that would lift it.
+
+`check_light_side.py` gained a seen-from-behind part (every pixel mode R renders black must stay
+black, modes R W D U S M B P on both backends; it fails mode S alone on 0.384.1).
+
 ## OPEN (2026-10-16): D-SILENT-EXIT — one host mode-D render ended with no output and no image
 
 `check_light_side.py`'s seen-from-behind part, run on 0.384.0 while a CUDA build compiled

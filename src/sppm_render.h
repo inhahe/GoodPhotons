@@ -134,6 +134,9 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
         const Material& m = *mp;
 
         if (m.isLight) {
+            // A light emits from the face its triangles are wound to (the side its `normal`
+            // picks, as backward.h tests it); its back is black, and the path ends either way.
+            if (dot(ray.d, h.ng) >= 0.0) return;
             // GLOSSY-NEE's lobe-sampling half; 1, and this expression bit-identical to its
             // pre-0.266 form, unless the previous bounce was a MIS'd glossy one.
             const double wMis = (gmis.pdf > 0.0)

@@ -16777,15 +16777,24 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         }
         const DMaterial& m = *mp;
 
+        // A directly-viewed / specular-seen light ends the path, as on the host (sppm_render.h's
+        // `m.isLight`): an emitter's own geometry, or a surface whose material glows with no
+        // emitter registered for it (a marched isosurface or CSG solid; bkRadiance falls back
+        // to the material's `emit` the same way). It adds its emission from its front face only.
         int li = dEmitterForMat(sc, matId);
-        if (li >= 0) {                                   // directly-viewed / specular-seen emitter
-            double e = (double)specLookup(sc.emitters[li].emitSpd, lambda) * thr * invPdfL
-                     * dEmitPatMul(sc, m.emitPat, h);    // `emit pattern:` at this hit
-            if (sc.emitters[li].normalTilted)            // an aimed quad (bkRadiance)
-                e *= (double)dAimRadiance(sc.emitters[li], rd * (Real)(-1));
-            dX += (double)cieX(lambda) * e;
-            dY += (double)cieY(lambda) * e;
-            dZ += (double)cieZ(lambda) * e;
+        const double* eSpd = (li >= 0)        ? sc.emitters[li].emitSpd
+                           : (m.matIsLight)   ? m.matEmit
+                                              : nullptr;
+        if (eSpd) {
+            if (dot(rd, h.ng) < (Real)0) {
+                double e = (double)specLookup(eSpd, lambda) * thr * invPdfL
+                         * dEmitPatMul(sc, m.emitPat, h);    // `emit pattern:` at this hit
+                if (li >= 0 && sc.emitters[li].normalTilted)  // an aimed quad (bkRadiance)
+                    e *= (double)dAimRadiance(sc.emitters[li], rd * (Real)(-1));
+                dX += (double)cieX(lambda) * e;
+                dY += (double)cieY(lambda) * e;
+                dZ += (double)cieZ(lambda) * e;
+            }
             return;
         }
 
