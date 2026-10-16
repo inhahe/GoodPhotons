@@ -9664,17 +9664,32 @@ to `genRay`'s film mapping.
 
 ftrace deletes nothing it writes; `tools/clean_outputs.py` prunes `png/`, `scraps/` and
 `gallery/`, and the local `build.bat` runs it with `--delete` after every successful build.
-Five rules, each a property of the file rather than a guess about intent: a checkpoint or
-HDR sidecar not written for a week; the numbered frames of a sequence once a video beside
-them is newer than all of them and holds at least as many (counted with PIL / ffprobe, so a
-gif that subsamples releases nothing); a photon map whose magic `loadPhotonMap` no longer
-accepts (read off `src/photonmap_io.h`, so the rule follows the loader); and week-old
-scraps data — anything but source text under 1 MB. Three exclusions bind every rule: git
-tracks it; something cites it — any tracked or untracked-but-not-ignored text file, closed
-over the cited files' own citations, so a known-issues repro script keeps the mesh it loads;
-or a live render writes under it (`ftrace -stop`'s listing). User-facing rules: REFERENCE.md
-→ *How long output is kept*. Regression check: `tools/check_clean_outputs.py`. The settle
-cache is pruned by `settle_scene.py` itself (below), not here.
+Five rules, each a property of the file rather than a guess about intent ("written" is the
+later of mtime and creation time, so a copy is as new as the copying):
+
+- a checkpoint or HDR sidecar not written for a week — except a numbered sequence's
+  checkpoints, which loom resumes and re-develops exposure from, and which go with the frames;
+- the numbered frames of a sequence once a video beside them is newer than all of them and
+  either is named for the set and holds at least as many frames, or is beside no other set and
+  holds exactly as many (counted with PIL / ffprobe, so a gif that subsamples releases
+  nothing; a shared prefix is no match — `rain.mp4` is not `rain_axicon_fly`'s);
+- a photon map whose format is older than the oldest `loadPhotonMap` reads (read off
+  `src/photonmap_io.h`, so the rule follows the loader; a newer format is never touched);
+- week-old scraps data: anything but source text of up to 1 MB.
+
+Four exclusions bind every rule: git tracks it; something cites it; a live render writes under
+it (the stop channel's `<pid>.run` registrations, each pid checked alive); it is reached
+through a junction or symlink. Citation is a closure. The seeds are every source outside the
+output roots — tracked, untracked, and ignored local notes and scripts, but not environments,
+caches, build directories or vendored code. A citation is a path into an output root (a file;
+a directory, standing for its own sources; a glob, braces expanded) or a quoted file name
+resolved beside the citer, from the root, or from the top of each output root. Cited sources,
+OBJ/MTL files (their `mtllib` and map lines) and glTF files are read in turn, so a known-issues
+repro keeps its script, the mesh the script loads and the mesh's textures. Everything runs off
+one walk of the output roots, so a citation costs a set lookup rather than a stat.
+User-facing rules: REFERENCE.md → *How long output is kept*. Regression check:
+`tools/check_clean_outputs.py`. The settle cache is pruned by `settle_scene.py` itself
+(below), not here.
 
 ## Scene-authoring tools (`tools/`)
 

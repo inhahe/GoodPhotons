@@ -6486,18 +6486,33 @@ its use, and `build.bat` runs it after every successful build (its log is
 
 | Goes | When |
 |---|---|
-| a `.ftbuf` checkpoint under `png/` or `gallery/` | a week after it was last written (`--days`) |
-| a `-hdr` `.pfm` under `png/` or `gallery/` | a week after it was last written |
-| the numbered frames of a sequence, with their `.ftbuf`, `.pfm`, `.ppm` and `.jpg` | once a `.gif` or `.mp4` beside them is newer than every frame and holds at least as many frames, and is either named with the frames' prefix or beside no other sequence |
-| a `-savemap` photon map | once the loader no longer reads its format |
-| anything in `scraps/` but scripts, scenes and notes under 1 MB | a week after it was last written |
+| a `.ftbuf` checkpoint under `png/` or `gallery/` — not a numbered sequence's | a week after it was written (`--days`) |
+| a `-hdr` `.pfm` under `png/` or `gallery/` | a week after it was written |
+| the numbered frames of a sequence (`name000.png` …), with their `.ftbuf`, `.pfm`, `.ppm` and `.jpg` | once a `.gif` or `.mp4` beside them is newer than every frame and either is named for them (`name.mp4`) and holds at least as many frames, or is beside no other sequence and holds exactly as many |
+| a `-savemap` photon map | once its format is older than any the loader still reads |
+| anything in `scraps/` but scripts, scenes and notes of up to 1 MB | a week after it was written |
 
-What stays, whatever its age: a file git tracks; a file a script, scene or document cites by
-path, or that such a cited file cites in turn; everything under the output directory of a live
-render; a sequence's per-frame scenes, its logs and its unnumbered stills (`_cam`, `_meter`).
+"Written" is the later of a file's modification and creation times, so a file copied in today
+is new whatever date it carries. What stays, whatever its age:
+
+- a file git tracks;
+- a file something cites, or that a cited file cites in turn. The citers are every script,
+  scene and note outside `png/`, `scraps/` and `gallery/` — tracked or not, local ignored notes
+  included, virtual environments and build directories not. A citation is a path into those
+  directories (a file; a directory, meaning its own scripts and scenes and so what they load; a
+  glob such as `png/b/groom{1,2}_*.pfm`), or a quoted file name, read beside the citing file,
+  from the repo root or from the top of an output directory. An OBJ's material library and its
+  textures count, through the OBJ;
+- everything under the output directory of a live render;
+- a numbered sequence's checkpoints, until its video is made: loom resumes a sequence by them
+  (`render_range(skip_existing=True)`) and re-develops its exposure from them;
+- a sequence's per-frame scenes, its logs and its unnumbered stills (`_cam`, `_meter`);
+- anything reached through a junction or symlink inside those directories.
+
 So a sequence keeps its frames until it is assembled, and a gif that keeps one frame in three
-does not release them. To keep frames past their video, or a checkpoint you mean to `-resume`
-or re-develop with `-topng` after a week, move them out of `png/`, `gallery/` and `scraps/`.
+does not release them. To keep frames past their video, or a still's checkpoint you mean to
+`-resume` or re-develop with `-topng` after a week, cite them, or move them out of `png/`,
+`gallery/` and `scraps/`.
 
 ### Elapsed times and ETAs
 
