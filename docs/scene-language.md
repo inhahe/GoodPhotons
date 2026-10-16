@@ -1042,10 +1042,12 @@ scene-facing; they stay CLI-only.)
 **Multiple named cameras are implemented** (Phase 3a). Any number of `camera`
 blocks accumulate; one render invocation produces one image per camera. Selection:
 
-- default (no `-camera`): render **every** declared camera;
+- default (no `-camera`): render every still `camera`, and name each `camera_path` /
+  `camera_curve` / `camera_orbit` skipped with its frame count (0.383.0; a scene with no
+  still renders its paths);
 - `-camera <name>`: render just that one (errors listing the available names if
-  unknown);
-- `-camera all`: explicit "render every camera".
+  unknown); `-camera <path base name>` renders every frame of that path;
+- `-camera all`: render every camera, paths included.
 
 Each camera has its own **film resolution** (`film { res W H }`) and its own
 measurement `mode` (`A`/`B`/`C`), used unless a CLI `-r`/`-mode` forces the value

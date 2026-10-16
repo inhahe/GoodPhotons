@@ -84,8 +84,8 @@ CAPS = [
     # #6 is the flattest AND most neutral sheet in the set (contrast 0.18, chroma 0.003), so
     # it goes under the one piece whose entire purpose is to put COLOUR on a cap.
     ('marble_axicon',  'marble texture 6.jpg',    'stand_axicon_cap',   None,           0.45, 0.30),
-    # #7 IS THE SECOND SHEET CUT INTO TWO SLABS, for the reason #2 was: the gallery grew a
-    # TWELFTH cap (the gem compote) and there are still only ten source drops. #7 is the one
+    # #7 IS CUT INTO SLABS because the gallery has more caps than clean source sheets (the
+    # gem compote was the twelfth, and three of the ten drops are refused). #7 is the one
     # to quarry because it is by far the largest in the set at 4650x4650 -- the orb's cap spans
     # 225x70 px in the still, so it was already throwing away 97% of the sheet, and half of it
     # is still 2325x4650 against a MAXDIM of 1024. Orb takes the left half, the compote the
@@ -109,15 +109,16 @@ CAPS = [
     # the biggest surface in the frame (634x293 px in the still), takes the whole sheet: at
     # 512x512 it is a little under the cap's screen width, which the texture filter carries.
     ('marble_gold',    'marble texture 8.jpg',    'stand_gyroid_cap',   None,             1.00, 1.00),
-    # The small metal caps (84-105 px in the still) take #8's four quadrants, one each: each is
-    # the stone at twice the gold cap's magnification, and they are disjoint from each other.
-    ('marble_brass',   'marble texture 8.jpg',    'stand_brass_cap',   (0, 0, 0.5, 0.5),  1.00, 1.00),
-    ('marble_chrome',  'marble texture 8.jpg',    'stand_chrome_cap',  (0.5, 0, 1, 0.5),  0.75, 1.00),
-    ('marble_dumbbell', 'marble texture 8.jpg',   'stand_dumbbell_cap', (0, 0.5, 0.5, 1), 1.00, 1.00),
+    # The small metal caps (84-105 px in the still) take #8's four quadrants, one each, each
+    # turned: the stone at twice the gold cap's magnification and at another angle, so no cap
+    # repeats the gold cap's veining; the quadrants are disjoint from each other.
+    ('marble_brass',   'marble texture 8.jpg',    'stand_brass_cap',   (0, 0, 0.5, 0.5),  1.00, 1.00, 90),
+    ('marble_chrome',  'marble texture 8.jpg',    'stand_chrome_cap',  (0.5, 0, 1, 0.5),  0.75, 1.00, 180),
+    ('marble_dumbbell', 'marble texture 8.jpg',   'stand_dumbbell_cap', (0, 0.5, 0.5, 1), 1.00, 1.00, 270),
     # The creature is opaque fur -- zero caustic, so the stone is free -- but it is the only
     # cap with a DARK BROWN subject on it, so the stone is compressed (k=0.70) to keep the paws
     # reading against #8's dark veins.
-    ('marble_creature', 'marble texture 8.jpg',   'stand_creature_cap', (0.5, 0.5, 1, 1), 0.70, 1.00),
+    ('marble_creature', 'marble texture 8.jpg',   'stand_creature_cap', (0.5, 0.5, 1, 1), 0.70, 1.00, 90),
     # ALICE's cap is free by the caustic ranking -- she is an opaque painted figure and throws
     # nothing -- but it is the only cap in the hall with a COLOURED subject standing on it, so
     # it is calmed: her dark shoes and white stockings must separate from the stone, and she is

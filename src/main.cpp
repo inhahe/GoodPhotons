@@ -20989,9 +20989,15 @@ static int run(int argc, char** argv) {
         cameraSel = "view";
     }
 
+    if (framesLo >= 0 && !(fromFtsl && !ftslScene.cameras.empty())) {
+        std::fprintf(stderr, "error: -frames %lld %lld selects frames of a camera path, and this scene "
+                             "declares no cameras\n", framesLo, framesHi);
+        return 1;
+    }
     if (fromFtsl && !ftslScene.cameras.empty()) {
-        // Select which cameras to render. `-camera` accepts:
-        //   all           every camera (default when several are declared)
+        // Select which cameras to render. Without `-camera`: the still cameras (paths are named
+        // as skipped), or every path when there is no still. `-camera` accepts:
+        //   all           every camera, paths included
         //   <name>        exact camera/frame name (e.g. hero, fly137)
         //   <pathbase>    a whole camera_path/curve/orbit by its base name (e.g.
         //                 `fly` selects fly000..fly143 but not an unrelated still)

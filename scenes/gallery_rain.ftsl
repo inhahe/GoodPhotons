@@ -622,13 +622,14 @@ texture "tex_marble_axicon"   { file textures/marble_axicon.png   encoding srgb 
 # Three of the ten source drops are watermarked stock previews (Vecteezy, pngtree, VectorStock)
 # and are not used (tools/make_marble_caps.py refuses them), so the free metal caps share the
 # one clean gold-veined sheet, `marble texture 8.jpg`: the gold gyroid takes it whole, and the
-# brass, chrome, dumbbell and creature caps take its four quadrants -- disjoint slabs, each at
-# twice the gyroid cap's magnification. The creature's is compressed (k=0.70) so its dark paws
-# read against the dark veins.
+# brass, chrome, dumbbell and creature caps take its four quadrants, each turned -- disjoint
+# slabs, each at twice the gyroid cap's magnification and at another angle, so none repeats the
+# gyroid cap's veining. The creature's is compressed (k=0.70) so its dark paws read against the
+# dark veins.
 texture "tex_marble_creature" { file textures/marble_creature.png encoding srgb  filter bilinear  wrap clamp }
 # The TWELFTH cap, and the second slab quarried out of one sheet rather than given its own.
 # The gem compote arrived after all ten drops were spoken for, so `marble texture 7.jpg` is
-# cut the way `2.jpg` was for chrome/creature: it is 4650x4650, by far the largest in the set,
+# cut in two: it is 4650x4650, by far the largest in the set,
 # and the orb cap it used to carry alone spans 225x70 px in the still — it was already
 # discarding 97% of the sheet. The orb keeps the LEFT half and this takes the RIGHT; the two
 # crops share no pixel, so they are two slabs off one block. Prepared to the axicon's numbers

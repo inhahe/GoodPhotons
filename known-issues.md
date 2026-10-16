@@ -20387,6 +20387,11 @@ dumbbell and creature from #8's four quadrants, Alice from a turned slab of #7.
 `tools/make_marble_caps.py` lists the three in `WATERMARKED` and refuses to build from them; the
 caustic-critical caps (axicon, orb, compote, diamond gyroid) are untouched and pixel-identical.
 
+**Still in the history (the user's decision).** The tip is clean, but every commit before ede6b2a6
+carries the old derivatives, and GitHub already has the ones from before the last push (August
+onward). Removing them means rewriting history (`git filter-repo` on the five PNG paths' old
+blobs) and force-pushing -- irreversible for anyone with a clone, so not done without the user.
+
 The original entry:
 
 **What.** `marble texture 3.5.avif`, one of the ten source sheets, is a VectorStock **comp**: a

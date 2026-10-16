@@ -704,8 +704,10 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
     // loader measures the murky share and says which case it is looking at, once per distinct
     // map; it does not act on it. Thresholds from the assets on hand: the sequinned Alice 0 %,
     // then nothing below 39 % (the Meshy vacuum chamber).
-    // `mixOn`: the per-texel reading is already chosen, so the verdict confirms it or warns.
-    auto metalVerdict = [](double murky, bool mixOn) -> std::string {
+    // `mixOn`: the per-texel reading is already chosen, so the verdict confirms it or warns,
+    // naming what chose it -- the mesh's keyword or the flag.
+    const char* const mixBy = metalMix > 0 ? "import_metal mix" : "-import-metal mix";
+    auto metalVerdict = [mixBy](double murky, bool mixOn) -> std::string {
         char b[512];
         if (mixOn) {
             if (murky < 0.10)
@@ -714,16 +716,16 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
             else if (murky >= 0.30)
                 std::snprintf(b, sizeof b, "the map is MURKY (%.1f%% of its texels are between 0.15 and 0.85), "
                               "which reads as generator noise -- if paint or fabric now looks metallic, "
-                              "drop import_metal mix", 100.0 * murky);
+                              "drop %s", 100.0 * murky, mixBy);
             else
                 std::snprintf(b, sizeof b, "the map is PARTLY MURKY (%.1f%% of its texels are between 0.15 "
-                              "and 0.85) -- compare with a render without import_metal mix", 100.0 * murky);
+                              "and 0.85) -- compare with a render without %s", 100.0 * murky, mixBy);
             return b;
         }
         if (murky < 0.10)
             std::snprintf(b, sizeof b, "the map is CLEAN (only %.1f%% of its texels are between 0.15 and "
                           "0.85; the rest are clearly metal or clearly not), which reads as an "
-                          "intentional metal mask -- you probably WANT import_metal mix", 100.0 * murky);
+                          "intentional metal mask -- you probably WANT import_metal mix (or -import-metal mix)", 100.0 * murky);
         else if (murky >= 0.30)
             std::snprintf(b, sizeof b, "the map is MURKY (%.1f%% of its texels are between 0.15 and 0.85, "
                           "neither metal nor not), which reads as generator noise -- the default "
@@ -731,7 +733,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
         else
             std::snprintf(b, sizeof b, "the map is PARTLY MURKY (%.1f%% of its texels are between 0.15 "
                           "and 0.85) -- it could go either way; compare a render with and without "
-                          "import_metal mix", 100.0 * murky);
+                          "import_metal mix (or -import-metal mix)", 100.0 * murky);
         return b;
     };
     std::vector<std::pair<int, double>> metalHinted;   // (image source, metallicFactor) already reported
@@ -1061,11 +1063,11 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                     }
                     if (firstHint(mrTex.index, metalFactor0))
                         std::fprintf(stderr, "[gltf] %s: material \"%s\": metalness map is mixed (%.1f%% of texels "
-                                             "metal, mean %.3f) -- import_metal mix splits the body into a metal "
+                                             "metal, mean %.3f) -- %s splits the body into a metal "
                                              "lobe and a dielectric one, chosen per texel.\n"
                                              "       For this model: %s.\n",
                                      authored.c_str(), matName.c_str(), 100.0 * metalFrac, metallic,
-                                     metalVerdict(murkyFrac, true).c_str());
+                                     mixBy, metalVerdict(murkyFrac, true).c_str());
                 }
                 int id = (int)s.mats.size();
                 s.mats.push_back(m);

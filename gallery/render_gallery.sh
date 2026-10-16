@@ -34,7 +34,7 @@ run "mode V (validate, numeric)"        -- -scene cornell -mode V -r 192 -n 4000
 # ============================================================================
 run "DOF: shallow (wide aperture)"  -- -scene cornell -mode A -aperture 0.30 -focus 2.2 -r 256 -n 120000000 -o $OUT/10_dof_shallow.png
 run "DOF: deep (narrow aperture)"   -- -scene cornell -mode A -aperture 0.05 -focus 2.2 -r 256 -n 120000000 -o $OUT/11_dof_deep.png
-run "fisheye projection (CPU)"      -- -in scenes/fisheye.ftsl -r 256 -n 30000000 -o $OUT/12_fisheye.png
+run "fisheye projection (CPU)"      -- -in scenes/fisheye.ftsl -camera all -r 256 -n 30000000 -o $OUT/12_fisheye.png
 run "camera_path dolly (5 frames)"  -- -in scenes/dolly.ftsl -r 192 -n 25000000 -o $OUT/13_dolly.png
 run "exposure / ISO+shutter"        -- -in scenes/expo.ftsl -r 192 -n 25000000 -o $OUT/14_expo.png
 run "multi-camera (twocam)"         -- -in scenes/twocam.ftsl -r 192 -n 25000000 -o $OUT/15_twocam.png

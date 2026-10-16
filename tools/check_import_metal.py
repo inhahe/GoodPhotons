@@ -11,8 +11,10 @@ fully metal, half not, the case per-texel import exists for (a sequin mask) -- a
     import, and `import_metal mix` with `-import-metal mean` is the per-texel one;
   - the per-texel import differs from the plain one, so the rig can see the effect;
   - the plain import prints the part-metal hint naming the keyword; a mesh that chose `mean`
-    does not get it;
-  - `import_metal` with another value, or on an OBJ, is refused with a message;
+    does not get it; the per-texel note names what chose it, the keyword or the flag;
+  - the same holds through a `mesh_asset` placed by a `mesh_instance`;
+  - `import_metal` with another value or none, on an OBJ, or beside `import_materials no` is
+    refused with a message;
   - the key is never reported unknown.
 
 Exits 1 on any failure.
@@ -78,14 +80,19 @@ def write_glb(path):
         f.write(struct.pack("<4sII", b"glTF", 2, 12 + len(body)) + body)
 
 
-def scene(mesh_file, keyword):
+def scene(mesh_file, keyword, asset=False, extra=""):
+    """A lit quad from `mesh_file`; `keyword` is import_metal's value (None: absent, "": bare);
+    `asset` places it as a mesh_asset + mesh_instance instead of a mesh."""
+    kw = "" if keyword is None else "  import_metal" + (" " + keyword if keyword else "")
+    body = 'file "%s"  material grey%s%s' % (mesh_file, kw, extra)
+    geo = (['mesh_asset "a" { %s }' % body, 'mesh_instance { of "a" }'] if asset
+           else ['mesh "t" { %s }' % body])
     return NL.join([
         'camera "c" { eye 0 0 1.6  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 48 48 } }',
         'material "grey" { type diffuse  reflect 0.5 }',
         'light area { origin -0.4 0.6 0.2  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  power 50  '
         'spd preset:d65 }',
-        'mesh "t" { file "%s"  material grey%s }' % (mesh_file, ("  import_metal " + keyword) if keyword else ""),
-    ]) + NL
+    ] + geo) + NL
 
 
 def main():
@@ -100,9 +107,9 @@ def main():
     with open(os.path.join(d, "t.obj"), "w", encoding="utf-8", newline="") as f:
         f.write("v 0 0 0" + NL + "v 1 0 0" + NL + "v 0 1 0" + NL + "f 1 2 3" + NL)
 
-    def render(tag, mesh_file, keyword, flag):
+    def render(tag, mesh_file, keyword, flag, asset=False, extra=""):
         with open(os.path.join(d, tag + ".ftsl"), "w", encoding="utf-8", newline="") as f:
-            f.write(scene(mesh_file, keyword))
+            f.write(scene(mesh_file, keyword, asset, extra))
         pfm = os.path.join(d, tag + ".pfm")
         if os.path.exists(pfm):
             os.remove(pfm)
@@ -142,10 +149,22 @@ def main():
           "the plain import's part-metal hint names the keyword")
     check("is part metal" not in runs["kw_mean_flag_mix"][1],
           "a mesh that chose `mean` gets no hint")
+    check("import_metal mix splits" in runs["kw_mix"][1] and "-import-metal mix splits" in runs["flag_mix"][1],
+          "the per-texel note names what chose it: the keyword, or the flag")
+    a_kw = render("asset_kw_mix", "t.glb", "mix", None, asset=True)
+    a_flag = render("asset_flag_mix", "t.glb", None, "mix", asset=True)
+    a_plain = render("asset_plain", "t.glb", None, None, asset=True)
+    check(a_kw[2] is not None and a_kw[2] == a_flag[2] and a_kw[2] != a_plain[2],
+          "mesh_asset: import_metal mix == -import-metal mix, and differs from the plain import")
     rc, log, _ = render("bad", "t.glb", "shiny", None)
     check(rc != 0 and "import_metal must be" in log, "import_metal shiny is refused (exit %d)" % rc)
+    rc, log, _ = render("bare", "t.glb", "", None)
+    check(rc != 0 and "import_metal must be" in log, "a bare import_metal is refused (exit %d)" % rc)
     rc, log, _ = render("obj", "t.obj", "mix", None)
     check(rc != 0 and "not a .gltf/.glb" in log, "import_metal on an OBJ is refused (exit %d)" % rc)
+    rc, log, _ = render("nomats", "t.glb", "mix", None, extra="  import_materials no")
+    check(rc != 0 and "nothing to act on" in log,
+          "import_metal beside import_materials no is refused (exit %d)" % rc)
     print("PASS" if not fails else "FAILED (%d)" % len(fails))
     return 1 if fails else 0
 

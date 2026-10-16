@@ -1,6 +1,6 @@
 """Regression check: which cameras a render selects, with and without `-camera` / `-frames`.
 
-    D:/python314/python.exe -u tools/check_camera_default.py [--out <dir>] [--exe ftrace.exe]
+    D:/python314/python.exe -u tools/check_camera_default.py [--exe ftrace.exe]
 
 A scene with a still, a 3-frame `camera_path` and a 4-frame `camera_orbit`, and one with the
 path alone, rendered at 16x16 with one sample, counting the images written:
@@ -9,14 +9,17 @@ path alone, rendered at 16x16 with one sample, counting the images written:
   - `-camera all`: everything; `-camera dolly`: the path's frames, nothing named as skipped;
   - a scene of paths alone, no `-camera`: its frames;
   - `-camera dolly -frames 1 2`: two frames;
-  - `-frames` without a path named by `-camera` (none, or a still): refused with a message.
+  - `-frames` without a path named by `-camera` (none, or a still), or on a built-in scene:
+    refused with a message.
+
+Everything is written in a temporary directory of its own.
 
 Exits 1 on any failure.
 """
 import argparse
 import glob
 import os
-import shutil
+import tempfile
 import subprocess
 import sys
 
@@ -36,14 +39,13 @@ SPIN = ('camera_orbit "spin" { center 0 0.5 0  radius 3  height 0.5  up 0 1 0  f
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split(NL)[0])
-    ap.add_argument("--out", default=os.path.join(ROOT, "png", "check_camera_default"))
     ap.add_argument("--exe", default=os.path.join(ROOT, "ftrace.exe"))
     a = ap.parse_args()
-    exe = os.path.abspath(a.exe)
-    d = os.path.abspath(a.out)
-    if os.path.isdir(d):
-        shutil.rmtree(d)
-    os.makedirs(d)
+    with tempfile.TemporaryDirectory(prefix="check_camera_default_") as d:   # its own, whole
+        return check_all(os.path.abspath(a.exe), d)
+
+
+def check_all(exe, d):
     for name, blocks in (("mixed", [STILL, DOLLY, SPIN]), ("paths", [DOLLY])):
         with open(os.path.join(d, name + ".ftsl"), "w", encoding="utf-8", newline="") as f:
             f.write(NL.join(COMMON + blocks) + NL)
@@ -51,10 +53,12 @@ def main():
     fails = []
 
     def run(tag, scene, args):
+        """Render `scene` (a scene file's stem, or a built-in's `-scene` name prefixed '@')."""
         out = os.path.join(d, tag)
         os.makedirs(out)
-        cmd = [exe, "-in", scene + ".ftsl", "-mode", "R", "-device", "cpu", "-spp", "1", "-no-meter",
-               "-o", os.path.join(tag, "img.png")] + args
+        src = ["-scene", scene[1:], "-r", "16"] if scene.startswith("@") else ["-in", scene + ".ftsl"]
+        cmd = [exe] + src + ["-mode", "R", "-device", "cpu", "-spp", "1", "-no-meter",
+                             "-o", os.path.join(tag, "img.png")] + args
         p = subprocess.run(cmd, cwd=d, capture_output=True, text=True, encoding="utf-8", errors="replace")
         n = len(glob.glob(os.path.join(out, "**", "*.png"), recursive=True))
         return p.returncode, p.stdout + p.stderr, n
@@ -85,6 +89,9 @@ def main():
     rc, log, n = run("framesstill", "mixed", ["-camera", "still", "-frames", "0", "1"])
     check(rc != 0 and n == 0 and "needs -camera" in log,
           "-frames with a still named is refused (exit %d, %d images)" % (rc, n))
+    rc, log, n = run("framesbuiltin", "@cornell", ["-frames", "0", "1"])
+    check(rc != 0 and n == 0 and "declares no cameras" in log,
+          "-frames on a built-in scene is refused (exit %d, %d images)" % (rc, n))
     print("PASS" if not fails else "FAILED (%d)" % len(fails))
     return 1 if fails else 0
 

@@ -329,16 +329,30 @@ inline std::string strOf(const Block& b, const char* key, const std::string& dfl
 }
 // A mesh or mesh_asset block's `import_metal mix|mean`: how its glTF's part-metal
 // metallicRoughness maps are read -- 1 texel by texel, 0 by the map's mean, -1 (absent) as the
-// `-import-metal` flag says (loadGltf's `metalMix`). Any other value is an error, written to
-// `err`, and -2 is returned.
-inline int importMetalOf(const Block& b, std::string& err) {
-    const std::string v = strOf(b, "import_metal");
-    if (v.empty()) return -1;
-    if (v == "mix") return 1;
-    if (v == "mean") return 0;
-    err = "import_metal must be `mix` (honour the metalness map texel by texel) or `mean` "
-          "(type the material by the map's mean), not `" + v + "`";
-    return -2;
+// `-import-metal` flag says (loadGltf's `metalMix`). `ext` is the mesh file's lower-case
+// extension. The key without a value, any other value, the key on a non-glTF mesh, and the key
+// beside `import_materials no` (which imports no material for it to act on) are errors: `err`
+// says which, and -2 is returned.
+inline int importMetalOf(const Block& b, const std::string& ext, const std::string& file,
+                         std::string& err) {
+    const Stmt* s = find(b, "import_metal");
+    if (!s) return -1;
+    const std::string v = s->val.words.empty() ? std::string() : s->val.words[0];
+    if (v != "mix" && v != "mean") {
+        err = "import_metal must be `mix` (honour the metalness map texel by texel) or `mean` "
+              "(type the material by the map's mean), not `" + v + "`";
+        return -2;
+    }
+    if (ext != ".gltf" && ext != ".glb") {
+        err = "import_metal reads a glTF metallicRoughness map, and \"" + file + "\" is not a .gltf/.glb";
+        return -2;
+    }
+    if (strOf(b, "import_materials") == "no") {
+        err = "import_metal has nothing to act on beside `import_materials no`, which imports none of "
+              "\"" + file + "\"'s materials";
+        return -2;
+    }
+    return v == "mix" ? 1 : 0;
 }
 inline bool vec3Of(const Block& b, const char* key, Vec3& out) {
     const Stmt* s = find(b, key);
@@ -5885,13 +5899,8 @@ private:
             for (char& c : ext) c = (char)std::tolower((unsigned char)c);
         }
         std::string imErr;
-        const int importMetal = importMetalOf(b, imErr);
+        const int importMetal = importMetalOf(b, ext, file, imErr);
         if (importMetal == -2) { fail("mesh: " + imErr); return false; }
-        if (importMetal >= 0 && ext != ".gltf" && ext != ".glb") {
-            fail("mesh: import_metal reads a glTF metallicRoughness map, and \"" + file +
-                 "\" is not a .gltf/.glb");
-            return false;
-        }
         if (ext == ".gltf" || ext == ".glb") {
             bool importMats = (strOf(b, "import_materials") != "no");
             // `skip_material <substr>[,<substr>…]` (glTF/GLB only), repeatable: drop
@@ -6199,13 +6208,8 @@ private:
             for (char& c : ext) c = (char)std::tolower((unsigned char)c);
         }
         std::string imErr;                                // see the mesh block
-        const int importMetal = importMetalOf(b, imErr);
+        const int importMetal = importMetalOf(b, ext, file, imErr);
         if (importMetal == -2) { fail("mesh_asset: " + imErr); return false; }
-        if (importMetal >= 0 && ext != ".gltf" && ext != ".glb") {
-            fail("mesh_asset: import_metal reads a glTF metallicRoughness map, and \"" + file +
-                 "\" is not a .gltf/.glb");
-            return false;
-        }
         if (ext == ".gltf" || ext == ".glb") {
             bool importMats = (strOf(b, "import_materials") != "no");
             std::string gerr;
