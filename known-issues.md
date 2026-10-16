@@ -71,6 +71,39 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-10-16): GLOW-LIGHT-MODES — what a glow with no emitter lights differs by mode, and mode P breaks on it
+
+A surface whose material emits but that has no emitter (a marched isosurface or CSG solid; the
+KNOWN LIMITATION under the 0.199.3 entry) is said to "glow but illuminate nothing, consistently
+in every mode". Measured 2026-10-16 on a 0.3 m sphere (`emit preset:bb3000`, unnormalised, so
+~1e12) beside a floor lit by a 20 W quad, 64 x 48, 32 spp, the floor under the sphere:
+
+| mode | floor |
+|---|---|
+| R, W, M, S, B | 1.5e-3 (the quad alone: the glow drops on a diffuse arrival, as documented) |
+| D (both backends), J | ~1.2e9 (the eye path landing on the glow, at a partial MIS weight) |
+| U (host) | 1.5e10 (the same, at full weight) |
+
+So the limitation is not consistent. Mode U's host counts a diffuse arrival on the glow at full
+weight (`vcm.h`: no emitter, no MIS), which is the unbiased answer for a light nothing else can
+reach. Modes D and J weight it against an s = 1 strategy that cannot exist for this surface
+(its densities remapped from 0 to 1, so the weight is arbitrary), and modes R, M and S drop it.
+Mode P renders the whole frame x368 (the glow x9.2): its composite fits the forward layer, in
+which the glow is dark, against the backward one, and the fit runs away.
+
+The proper fix is the one the limitation entry names: register an emitter for an emissive
+analytic primitive at scene build, so every mode can sample it, light-trace it and weight it.
+That changes `gallery_rain`, whose grid lines are meant to glow without lighting the scene, so
+it waits on the user: either the grid gets a material flag that keeps it unlit, or the fix
+lands and the scene is rebalanced. Until then, mode P's runaway fit is the one result here that
+is plainly wrong rather than a choice; its fix belongs with the emitter registration.
+
+**Fixed alongside (0.384.3): device mode U showed such a glow black.** Its camera kernel keyed
+emission on hit off `dEmitterForMat` alone, and its light subpaths scattered off a glow the host
+stops at; both now take the material's `isLight` as `vcm.h` does (the glow seen directly: black
+before, matching mode R after). `check_light_side.py`'s glow part checks the direct view in
+modes R W D U S M J on both backends.
+
 ## DONE (2026-10-16, 0.384.2): SPPM-LIGHT-SIDE — mode S lit the back of every light, showed device glows black, and rendered fog as nothing
 
 Three defects in mode S, all found while extending the light checks to it:
@@ -16497,7 +16530,8 @@ called from `light` blocks and mesh lights). A bare `quad {}` whose material car
 slot therefore has emissive *material* and no emitter, so NEE can never sample it and no light
 subpath ever starts on it. Every mode adds its self-emission on a camera/specular arrival (that
 is the `matIsLight`/`matEmit` fallback above) and every mode drops its contribution on a
-diffuse arrival — consistently, but the surface still lights nothing. `gallery_rain` relies on
+diffuse arrival — consistently, but the surface still lights nothing. (Measured 2026-10-16: not
+consistently, modes D, J and U count part or all of it; see GLOW-LIGHT-MODES.) `gallery_rain` relies on
 this deliberately (its grid lines "GLOW rather than being lit"), which is why it has not been
 fixed. The proper fix is to register an emitter for emissive analytic primitives at scene
 build; the cost is that a huge emissive quad's flux then enters the power CDF and starves the

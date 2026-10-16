@@ -17442,7 +17442,9 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 if (c < 0) break;
                 mp = &sc.mats[c]; matId = c;
             }
-            if (dEmitterForMat(sc, matId) >= 0) break;    // light subpath doesn't scatter off emitters
+            // A light subpath doesn't scatter off a light: an emitter's own geometry, or a surface
+            // that glows with no emitter (vcm.h tests `isLight`, which covers both).
+            if (mp->matIsLight || dEmitterForMat(sc, matId) >= 0) break;
 
             // misArrival(dist, cosThetaIn, foldDist2 = !(isInfinite && edges == 1)). The one
             // edge in the whole renderer that skips the dist^2 area conversion is the FIRST
@@ -17725,26 +17727,32 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
 
             DVec3 wo = normalize(prevP - h.p);
 
-            // (a) Emission (s=0).
+            // (a) Emission (s=0): an emitter's own geometry, or a surface that glows with no
+            // emitter registered (a marched isosurface or CSG solid: vcm.h's `isLight`), whose
+            // spectrum falls back to the material's `emit` as bkRadiance's does. With no emitter
+            // nothing else can reach the path, so it keeps the whole weight.
             int li = dEmitterForMat(sc, matId);
-            if (li >= 0) {
+            const double* eSpd = (li >= 0)          ? sc.emitters[li].emitSpd
+                               : (mp->matIsLight)   ? mp->matEmit
+                                                    : nullptr;
+            if (eSpd) {
                 double cosLight = ddot(h.ng, wo);
                 if (cosLight > 0.0) {
                     // Achromatic `emit pattern:` factor at this hit — the same value the
                     // light-subpath / NEE sides get from the sampler at this point.
                     double ep = dEmitPatMul(sc, mp->emitPat, h);
-                    if (sc.emitters[li].normalTilted)    // an aimed quad (vcm.h)
+                    if (li >= 0 && sc.emitters[li].normalTilted)    // an aimed quad (vcm.h)
                         ep *= (double)dAimRadiance(sc.emitters[li], wo);
-                    double Le = (double)specLookup(sc.emitters[li].emitSpd, lambda) * invPdfLambda * ep;
+                    double Le = (double)specLookup(eSpd, lambda) * invPdfLambda * ep;
                     double LeSec[SECN], mxLe = Le;
                     for (int k = 0; k + 1 < nUp; ++k) {
-                        LeSec[k] = (double)specLookup(sc.emitters[li].emitSpd, lamAll[k + 1]) * invAll[k + 1] * ep;
+                        LeSec[k] = (double)specLookup(eSpd, lamAll[k + 1]) * invAll[k + 1] * ep;
                         if (LeSec[k] > mxLe) mxLe = LeSec[k];
                     }
                     if (mxLe > 0.0) {
                         double misW = 1.0;
-                        const DEmitter& em = sc.emitters[li];
-                        if (em.area > 0.0 && sc.totalPower > 0.0 && edges >= 2) {
+                        if (li >= 0 && sc.emitters[li].area > 0.0 && sc.totalPower > 0.0 && edges >= 2) {
+                            const DEmitter& em = sc.emitters[li];
                             double pdfChoice = em.power / sc.totalPower;
                             double directPdfA = pdfChoice / em.area;
                             double emissionPdfW = em.normalTilted       // joint density (see vcm.h)

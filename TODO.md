@@ -89,9 +89,15 @@ commit.
   now refuses the three).
 - [x] **Rendering a scene without `-camera` also renders its 600-frame flyby** — left to judgement;
   stills by default, paths by name (0.383.0).
+- [ ] **GLOW-LIGHT-MODES** — a glow with no emitter lights nothing in R/M/S/B, part of itself in
+  D/J, all of itself in U; mode P runs away on it (x368). The fix is to register emitters for
+  emissive analytic primitives (4.6's first line), which makes `gallery_rain`'s grid lines light
+  the scene: does the grid keep glowing unlit (a material flag), or does the scene get rebalanced?
 
 ### 4.2 Wrong, missing or silent output
 
+- [ ] **D-SILENT-EXIT** — one host mode-D render ended with no output and no image during a CUDA
+  build; 13 reruns clean. The checks now print the exit code; reproduce under memory pressure.
 - [ ] **SPECGATHER-BIN-RESOLUTION** — mode M's 24-bin carrier misreads a spectral edge or kink inside
   a bin; the 555-585 nm ramp's green excess is unexplained.
 - [ ] **SPPM-SPECTRAL** — mode S applies a camera path's spectral factors at the camera's wavelength
@@ -225,7 +231,10 @@ commit.
 ### 4.6 Missing features and scoped follow-ups
 
 - [ ] **An emissive `quad` / isosurface / CSG solid glows but does not illuminate** (two entries:
-  "KNOWN LIMITATION" and "LIMITATION (2026-08-02)") — register emitters for them.
+  "KNOWN LIMITATION" and "LIMITATION (2026-08-02)") — register emitters for them. Waits on the
+  GLOW-LIGHT-MODES decision (4.1).
+- [ ] **Mode S in participating media** — refused since 0.384.2 (SPPM-LIGHT-SIDE); a volume
+  estimator (photon beams, as mode M's `-beams`) would lift it.
 - [ ] **"the live window cannot repaint mid-image"**.
 - [ ] **"cache ftrace's per-scene preprocessing before rasterizing"** (feature request).
 - [ ] **"option for curve-editor curve to be occluded by geometry"** (feature request).
