@@ -327,6 +327,15 @@ makes that literally true, makes every estimator consistent by construction, and
 `normalTilted` special cases from every reader (host and device). It changes only malformed lights
 (of the shipped scenes, `mirror_selfie`'s wall-washes, by the sliver behind their planes).
 
+**Measured (2026-10-16).** Snapping moves a share of a Lambertian panel's flux from the grazing
+sliver behind its plane to the grazing sliver in front, on the opposite side (integrated
+numerically): 3.6 % at a 22° tilt (the mirror_selfie fill), 10.1 % at 37° (its two wall-washes);
+total flux is unchanged. Rendered both
+ways in mode R (1024 spp, same seed, `png/tilt_cmp/`), the frame's mean moves by 0.03 % and no
+sixth-by-quarter tile by more than 3 % (the outer wall strips -2 %, the lower centre +3 %). Neither
+the current render nor the snapped one aims the light where the tilted normal points: a panel
+emits about its own face either way, so aiming one means turning the panel itself (`u`, `v`).
+
 ## DONE (2026-10-14, 0.379.1): REVIEW-0378-FABLE — what the Fable review of 0.378.4-0.378.6 found
 
 Opus (max) reviewed the batch first (its follow-ups are 0.378.6); Fable (xhigh) then found:

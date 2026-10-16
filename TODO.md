@@ -29,27 +29,24 @@ Alice2 carries her v3 hair in `gallery_rain`, and her hair renders on the GPU in
   so a scratch Builder can run it); named-sphere `bald "name"` zones drawn; the `on` mesh chosen from
   a list; per-point radius dragging; `-groom` on a bare mesh (auto-scalp); a depth pre-pass so a
   closed see-through shell does not blend twice; snapping a whole strand inside a part; moving a box
-  selection together. (Its untested drags are GROOM-DRAG-UNTESTED, in §5.)
+  selection together. (Its untested drags are GROOM-DRAG-UNTESTED, in §4.)
 
 ## 2. The `gallery_rain` 960x540 flyby — the deliverable, waiting on the user
 
 1147 frames, `camera_curve "fly"`, mode M at the final recipe (`-mode M -device gpu -n 20000000
 -spp 24 -r 960 540 -denoise -fireflies 3 -denoise-levels 2`); four scattered frames render clean
-(`png/flyframes2/sheet.png`). **The user's decisions:** launching it (it owns the GPU for about two
-days, and another GPU job beside a long mode-M gather is what killed an earlier run), and whether
-to LOD the hair (§1). Before launching, re-read the two run hazards in `known-issues.md`: the
+(`png/flyframes2/sheet.png`). Decided 2026-10-16: the flight path stays as it is, Alice keeps her
+`rotate 0 20 0` turn, and she wears the sparkle dress (`import_metal mix`, 0.382.0).
+**Still the user's decisions:** launching it (it owns the GPU for about two days, and another GPU
+job beside a long mode-M gather is what killed an earlier run), and whether to LOD the hair (§1).
+The command must now name the path (`-camera fly`, since 0.383.0 a plain render is the still).
+Before launching, re-read the two run hazards in `known-issues.md`: the
 machine's COMMIT limit (the GPU path now holds one frame of host film, so check `commit available`
 rather than assume), and a gather that dies with `unspecified launch failure` under concurrent GPU
 load — ftrace exits 1 with a `[cuda] ... kernel failed` line, so the chain must check exit codes
 and re-run `-frames N end`.
 
-## 3. `-import-metal mix` for Alice — the user's call
-
-Built in 0.339.0 and off by default (the default import is byte-identical to 0.338.0). Alice's
-metalness map is the generator's house mid-grey (max 0.612, mean 0.281): honouring it makes her
-dress visibly metallic (`png/alicehair/mm_dress.png`). Whether she uses it is the user's decision.
-
-## 4. The A3 LOBE-WIDTH claim is untested — the rig's two sides are not geometrically identical
+## 3. The A3 LOBE-WIDTH claim is untested — the rig's two sides are not geometrically identical
 
 **The lobe-width claim is untested — its own control fails at +10.2 % with no coat present, so those
 numbers can't be cited. Measuring it needs a rig whose two sides are geometrically identical (a
@@ -70,7 +67,7 @@ the analytic BSDF at the same (wi, wo) pairs, with no scene, no camera and no fi
 *(Keeping the failing control is deliberate — deleting it would restore the appearance of a
 measurement. A test that says "this instrument cannot answer this question" is the useful output.)*
 
-## 5. Everything open in `known-issues.md` that should be fixed
+## 4. Everything open in `known-issues.md` that should be fixed
 
 Listed 2026-10-16 from an entry-by-entry read of `known-issues.md` (its 2026-09-10 audit is the last
 time every entry was checked against the code). **Not started: the user asked for the list first.**
@@ -78,18 +75,24 @@ Each line names its entry by ID or by a phrase of its heading, so `grep` finds i
 detail. Mark a line `[x]` with the version when it is fixed, and mark the entry DONE in the same
 commit.
 
-### 5.1 Decisions the user owes (each blocks its fix)
+### 4.1 Decisions the user owes (each blocks its fix)
 
 - [ ] **TILTED-LIGHT-EMIT** — a tilted quad light is measured by its patch on the camera side and by
   its authored normal on the light side. Proposal: snap a tilted normal to its plane's side at load.
-- [ ] **`scenes/gallery_settled.ftsl` has diverged from `scenes/gallery.ftsl`** — which is canonical
-  (`frames 600` or `144`; the `prefer`/`else` camera wrapper)? Then back-port and regenerate.
-- [ ] **`textures/marble_dumbbell.png` derives from a WATERMARKED stock preview** — needs a licensed
-  replacement before any public release.
-- [ ] **Rendering a scene without `-camera` also renders its 600-frame flyby** — keep "every camera"
-  as the default, or skip a `camera_curve` unless asked?
+  Measured on `mirror_selfie` (mode R, `png/tilt_cmp/compare.png`): the snap moves 3.6 % (the 22°
+  fill) and 10.1 % (the 37° wall-washes) of a light's flux from grazing directions behind the panel
+  to grazing ones in front; the frame's mean moves 0.03 %, no region more than 3 %. Explained to the
+  user 2026-10-16; waiting on the decision.
+- [x] **`scenes/gallery_settled.ftsl` has diverged from `scenes/gallery.ftsl`** — closed by the
+  user's answer (2026-10-16): the scene in use is `gallery_rain.ftsl`; no back-port.
+- [x] **`textures/marble_dumbbell.png` derives from a WATERMARKED stock preview** — and so did four
+  more caps: sources 1 (Vecteezy) and 2 (pngtree) carry tiled watermarks, legible in the shipped
+  textures. All five re-quarried from the clean sheets 7 and 8 (2026-10-16, `make_marble_caps.py`
+  now refuses the three).
+- [x] **Rendering a scene without `-camera` also renders its 600-frame flyby** — left to judgement;
+  stills by default, paths by name (0.383.0).
 
-### 5.2 Wrong, missing or silent output
+### 4.2 Wrong, missing or silent output
 
 - [ ] **SPECGATHER-BIN-RESOLUTION** — mode M's 24-bin carrier misreads a spectral edge or kink inside
   a bin; the 555-585 nm ramp's green excess is unexplained.
@@ -144,7 +147,7 @@ commit.
 - [ ] **"`tools/_capchroma.py` scores marble VEINS as a caustic"** — refuse a textured cap.
 - [ ] **"`python -m loom.viewer` prints a runpy double-import RuntimeWarning"** (cosmetic).
 
-### 5.3 Estimator approximations and accuracy debt
+### 4.3 Estimator approximations and accuracy debt
 
 - [ ] **BDPT-MIS-TR** — mode D's MIS weights take every connection edge's transmittance as 1 in a
   medium.
@@ -172,7 +175,7 @@ commit.
 - [ ] **Mode D's heavy noise tail** — per-frame noise falls as ~`spp^-0.15`; a 4 %-energy,
   1669x-peaked connection residual in shared BDPT machinery. Characterised, no fix proposed yet.
 
-### 5.4 Tech debt
+### 4.4 Tech debt
 
 - [ ] **GPU-STACK-DRIFT** — every kernel's stack reservation moves when unrelated device code changes.
 - [ ] **SLAB-DDA-COPIES** — the box clip and the grid walk are written out several times.
@@ -201,7 +204,7 @@ commit.
 - [ ] **"loom preview server (`-serve`) is resident-process only"**.
 - [ ] **"HIP alias block deliberately omits `__shfl_sync`"** (HIP is untested anyway).
 
-### 5.5 Performance
+### 4.5 Performance
 
 - [ ] **FIRE-NEE-STRATA-COST** — one fire light sample costs up to 32 traversals.
 - [ ] **Fire births** (EMISSIVE-VOLUME-SILENT's efficiency debt) — drawn uniformly over the box;
@@ -221,7 +224,7 @@ commit.
 - [ ] **"scene loading is down 5×, but the graph walk ... is what's left"** — only if load shows up
   again.
 
-### 5.6 Missing features and scoped follow-ups
+### 4.6 Missing features and scoped follow-ups
 
 - [ ] **An emissive `quad` / isosurface / CSG solid glows but does not illuminate** (two entries:
   "KNOWN LIMITATION" and "LIMITATION (2026-08-02)") — register emitters for them.
@@ -239,7 +242,7 @@ commit.
 - [ ] **"the ~11 % of cloud beams that a dispersive event disqualifies"** — check first: 0.257.0's
   per-member bundle weights may be this (then it is 5.7).
 
-### 5.7 Bookkeeping: entries whose heading still says OPEN for finished work
+### 4.7 Bookkeeping: entries whose heading still says OPEN for finished work
 
 Verify each against the code, then mark it DONE (or retitle it) in `known-issues.md`.
 
@@ -256,7 +259,7 @@ Verify each against the code, then mark it DONE (or retitle it) in `known-issues
 - [ ] **"the `gallery_rain` 600-frame mode-M flyby cannot start — the machine's COMMIT limit"** —
   re-test on the frame-at-a-time GPU path; it may be closed.
 
-### 5.8 Not listed, on purpose
+### 4.8 Not listed, on purpose
 
 Notes and by-design entries (the GitHub `<video>` NOTE, the p99 anchor BY-DESIGN, `SetWindowTextW`,
 `-gi-clamp`, the CIE side-table "don't retry", the timed-out-shell NOTE), work deliberately not
@@ -264,7 +267,7 @@ done (`PatOp::MatMulAdd`, GPU marching cubes, sweeps as an FTSL primitive), the 
 admin-locked counters, the one-off `build.bat` failure, the nvlddmkm teardown BSOD — a driver bug,
 mitigated), and data whose entries call it acceptable (the F-series SPDs, the material presets).
 
-## 6. The paired-timing rule into `CLAUDE.md`
+## 5. The paired-timing rule into `CLAUDE.md`
 
 "Time paired within a repetition, warm-up discarded" is a standing measurement rule that lives only
 in session context and in this file's last section. It belongs in `CLAUDE.md`. (The old block —
