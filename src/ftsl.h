@@ -6903,6 +6903,7 @@ private:
             Vec3 cw = P(xf.apply(c));
             spd = absPower(b, spd, (4.0 * PI * rad * rad) * PI, L);
             Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
+            lm.reflectsNothing = true;
             int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
             L.scene.spheres.push_back(Sphere{cw, rad, id});
             L.scene.addSphereLight(cw, rad, spd, binWidth_, /*matId*/id);
@@ -6933,6 +6934,7 @@ private:
             Vec3 axisW = normalize(xf.applyDir(dir)) * len;   // world axis vector (|.| = len)
             Vec3 baseW = P(xf.apply(c)) - axisW * 0.5;        // base-cap center
             Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
+            lm.reflectsNothing = true;
             int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
             // Tessellate the lateral wall. onb(normalize(axisW),...) here matches the
             // basis addCylinderLight computes, so facets align with the sampled radius.
@@ -7127,15 +7129,8 @@ private:
         // `normal` would, in front of its own plane (Emitter::nGeom has the model; 0.384.0).
         const bool nrmGiven = vec3Of(b, "normal", nrm);
         bool leanAuthored = false;
-        if (!nrmGiven) {
-            nrm = normalize(cross(u, v));
-        } else {
-            const Vec3 cx = cross(u, v);
-            const double lc = length(cx), ln = length(nrm);
-            // 1e-6 on |cos| is ~0.08 deg: tight enough to catch a real lean, loose enough that a
-            // hand-typed 0.707 against an exact 1/sqrt(2) stays quiet.
-            if (lc > 0.0 && ln > 0.0) leanAuthored = std::fabs(dot(nrm / ln, cx / lc)) < 1.0 - 1e-6;
-        }
+        if (!nrmGiven) nrm = normalize(cross(u, v));
+        else           leanAuthored = Emitter::leans(Emitter::leanCos(nrm, u, v));
         // Transform origin as a point and the u/v edge vectors as directions, then fold in the
         // unit scale. The emitter area is recomputed from the actual transformed edges (exact
         // for any affine). An aim is a direction and is carried as one; a normal standing
@@ -7143,29 +7138,22 @@ private:
         // non-uniform scale or shear would lean the direction map's image of it.
         Vec3 os = P(xf.apply(o)), us = xf.applyDir(u) * L_, vs = xf.applyDir(v) * L_;
         Vec3 nw = normalize(xf.applyDir(nrm));
-        double cosAim = 1.0;                      // cos of the aim's lean off the panel's face
-        {
+        double cosAim = Emitter::leanCos(nw, us, vs);    // the aim's lean off the panel's face
+        if (!leanAuthored && Emitter::leans(cosAim)) {
             const Vec3 cw = cross(us, vs);
-            const double lcw = length(cw);
-            if (lcw > 0.0) {
-                cosAim = std::fabs(dot(nw, cw / lcw));
-                if (!leanAuthored && cosAim < 1.0 - 1e-6) {
-                    nw = (dot(nw, cw) >= 0.0 ? cw : cw * -1.0) / lcw;
-                    cosAim = 1.0;
-                }
-            }
+            nw = (dot(nw, cw) >= 0.0 ? cw : cw * -1.0) / length(cw);
+            cosAim = 1.0;
         }
-        const bool aimed = cosAim < 1.0 - 1e-6;
-        if (aimed)
+        if (Emitter::leans(cosAim))
             std::printf("[light] area light at (%g %g %g) is AIMED %.1f deg off its face: it throws "
                         "its light toward `normal %g %g %g`, as if turned to face it, and nothing "
                         "behind its own plane\n", o.x, o.y, o.z,
                         std::acos(std::fmin(1.0, cosAim)) * 180.0 / PI, nrm.x, nrm.y, nrm.z);
-        // A `power` is the light's total flux: area * PI for a Lambertian panel, area * aimNorm
-        // for an aimed one (Emitter::aimNorm -- the same constant addAreaLight derives).
-        spd = absPower(b, spd, aimed ? length(cross(us, vs)) * (PI * (1.0 + cosAim) / 2.0)
-                                     : length(cross(us, vs)) * PI, L);
+        // A `power` is the light's total flux: area * aimNorm (PI for a panel that does not lean),
+        // the flux addAreaLight's emitter emits.
+        spd = absPower(b, spd, length(cross(us, vs)) * Emitter::aimNormFor(cosAim), L);
         Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
+        lm.reflectsNothing = true;
         lm.emitPat = spdPat;
         // `hide_camera on` — primary visibility off. The emitter is untouched (it lights,
         // it is sampled by NEE, its power keeps the same share of the selection CDF) and so

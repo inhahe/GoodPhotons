@@ -71,6 +71,49 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-10-16, 0.384.4): REVIEW-0384 — what the Opus and Fable reviews of 0.384.0-0.384.3 found
+
+Opus (max) and Fable (xhigh) reviewed 8b07bdae..4d75937f. Fixed:
+
+* **Modes S and U ended the path at every emissive surface**, dropping the body of one that
+  also reflects (`type diffuse reflect 0.5 emit 1`): host S and U always had, and 0.384.2/0.384.3
+  copied it to the device (both reviews). Modes R, D and M add the emission and shade on. Now S
+  and U do too, on both backends, camera side and VCM's light subpaths alike; only a light
+  block's own surface, which reflects nothing, ends a path (`Material::reflectsNothing`, set
+  where light blocks and the built-in scenes make their lamps). `check_light_side.py`'s glow
+  sphere now also reflects, under a lamp and with no floor, its glow dimmed so the lit body is
+  15 % of its light (at `emit 1` the body was 0.3 %, and the test could not see it): 0.384.0's
+  host S and U render it x0.85, 0.384.4's x1.005 and x0.995.
+* **Mode S's media refusal caught pure index fields** (GRIN with no extinction), which S does
+  render, and **it never reached a built-in or camera-less scene** (Opus). It now refuses only a
+  medium that absorbs or scatters (`Medium::attenuates`; an absorbing-only fog came out up to
+  x1.8 of mode R per tile in S, so absorbing media stay refused), and the mode-S branch checks
+  again at render time, as mode U's does.
+* **Mode R's fog light sampling still shortened its shadow ray by a flat 2e-6** (Opus): now
+  `shadowTransmittanceTo` with `connMaxT`, like its surface twin and the device's.
+* **A thin-lens camera's splat from an aimed light was gated at the eye**, while the connection
+  goes to a sampled pupil point that can lie across the light's plane (Fable): the gate moved
+  into `connectLens` / `connectLensHero` (host and device), tested at the sampled point; the
+  pinhole keeps the eye.
+* **REFERENCE said an aimed panel looks brightest along its normal** (both): under the model its
+  radiance rises toward grazing views on the lean side, without bound. REFERENCE and the model's
+  comment now say so, and that a grazing view seen only by a camera or mirror ray is noisy.
+* Simplifications: the aim factor at emission-on-hit is applied inside `emitHitScale` /
+  `emitSlot` (host) and `dEmitHitScale` (device) instead of by hand at thirteen sites (Opus);
+  the lean test and `aimNorm` come from `Emitter::leanCos` / `leans` / `aimNormFor`, which the
+  loader and `addAreaLight` share (both); `sampleAimDir` takes the generator and reuses
+  `cosineHemisphere` (Opus); the scalar photon tracer's light splat is one call, as its twins'
+  are (Fable); a collimated light's beam no longer counts as a lean.
+* `check_tilted_light.py` takes its fog reference from mode R on the host, always and by name
+  (both), and checks the same aimed light written against u x v (Fable: mirror_selfie's fill).
+  `dVertexPdfLightF`'s comment no longer says a light's surface vertex is always Lambertian.
+* design.md gained mode S's scope, the shared emission helpers and the reflectsNothing rule
+  (Opus).
+
+Dismissed: clamping `aimRadiance` near grazing (Fable offered it as one option) -- a clamp would
+bias every aimed light seen edge-on to cure noise in the views no other strategy reaches; the
+model is documented instead.
+
 ## OPEN (2026-10-16): GLOW-LIGHT-MODES — what a glow with no emitter lights differs by mode, and mode P breaks on it
 
 A surface whose material emits but that has no emitter (a marched isosurface or CSG solid; the
@@ -101,7 +144,8 @@ is plainly wrong rather than a choice; its fix belongs with the emitter registra
 **Fixed alongside (0.384.3): device mode U showed such a glow black.** Its camera kernel keyed
 emission on hit off `dEmitterForMat` alone, and its light subpaths scattered off a glow the host
 stops at; both now take the material's `isLight` as `vcm.h` does (the glow seen directly: black
-before, matching mode R after). `check_light_side.py`'s glow part checks the direct view in
+before, matching mode R after). 0.384.4 then let modes S and U walk on through every emissive
+surface but a light block's own, on both backends (REVIEW-0384). `check_light_side.py`'s glow part checks the direct view in
 modes R W D U S M J on both backends.
 
 ## DONE (2026-10-16, 0.384.2): SPPM-LIGHT-SIDE — mode S lit the back of every light, showed device glows black, and rendered fog as nothing

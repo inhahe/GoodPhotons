@@ -594,7 +594,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         if (em.area <= 0.0) return;
         pdfPos = 1.0 / em.area;
         if (em.normalTilted) {                       // an aimed quad: intensity-proportional
-            dir = em.sampleAimDir([&] { return rng.uniform(); }, pdfDirW);
+            dir = em.sampleAimDir(rng, pdfDirW);
             nOut = em.nGeom;                         // the face, for the offset and the measure
             emitCos = dot(nOut, dir);
             emitLeCos = em.aimCos(dir);
@@ -686,7 +686,9 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
             if (c < 0) return;
             mp = &scene.mats[c];
         }
-        if (mp->isLight) return;                 // light subpath doesn't scatter off emitters
+        // A light block's own surface absorbs; any other glowing material also reflects, and
+        // the subpath scatters off it as off any surface (bdpt.h's walk does the same).
+        if (mp->reflectsNothing) return;
 
         // Skip the dist^2 area conversion on the first edge of an INFINITE light: that
         // vertex's forward density is the planar 1/(pi R^2) over the fictitious disc, not
@@ -940,10 +942,10 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         if (mp->isLight) {
             double cosLight = dot(h.ng, wo);
             if (cosLight > 0.0) {
-                // Achromatic `emit pattern:` factor at this hit — the same value the
-                // light-subpath / NEE sides get from emitterSamplePoint at this point.
-                double ep = (mp->emitPat < 0) ? 1.0 : slotPatMul(scene, mp->emitPat, h);
-                if (!scene.aimOfMat.empty()) ep *= scene.aimedEmission(h.matId, wo);   // aimed quad
+                // Achromatic `emit pattern:` and aimed-quad factor at this hit (emitHitScale) —
+                // the same value the light-subpath / NEE sides get from emitterSamplePoint and
+                // the aim helpers at this point.
+                double ep = emitHitScale(scene, *mp, h, wo);
                 double Le = mp->emit(lambda) * invPdfLambda * ep;
                 double LeSec[hero::kHeroMax - 1] = {0}, mxLe = Le;
                 for (int i = 0; i + 1 < nUp; ++i) {
@@ -980,7 +982,9 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     result += add;
                 }
             }
-            return result;   // can't scatter off a light
+            // A light block's own surface ends the path; any other glowing material has a body,
+            // which the strategies below shade as any surface's.
+            if (mp->reflectsNothing) return result;
         }
 
         bool connectible = isConnectibleMat(*mp);

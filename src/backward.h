@@ -1523,7 +1523,9 @@ struct BackwardRenderer {
     bool volumeEmitterGeom(const Scene& scene, const Emitter& em, const Vec3& p, double lambda,
                            Pcg32& rng, Vec3& wi, double& geom) const {
         if (em.collimated) return false;                  // beams aren't area-samplable
-        double dist = 0.0, shadowLen = 0.0;
+        // The shadow ray's far-end shortening (Scene::connMaxT): 0 for the sun, whose far end is
+        // the scene's exit, not a sampled point.
+        double dist = 0.0, shorten = 2e-6;
         if (em.shape == EmitterShape::Spot) {
             // Point spot: no surface cosine at a volume vertex, cone falloff only.
             const Vec3 toL = em.origin - p;
@@ -1533,12 +1535,12 @@ struct BackwardRenderer {
             const double fall = spotFalloff(dot(-wi, em.beamDir), em.spotCosInner, em.spotCosOuter);
             if (fall <= 0) return false;
             geom = fall / dist2;
-            shadowLen = dist - 2e-6;
         } else if (em.shape == EmitterShape::Sun) {
             // Distant sun: a cone-sampled direction (pdf 1/Omega), shadowed to the scene exit.
             const double s1 = rng.uniform(), s2 = rng.uniform();
             wi = em.sampleCone(-em.beamDir, s1, s2);
-            dist = shadowLen = length(scene.sceneCenter - p) + scene.sceneRadius;
+            dist = length(scene.sceneCenter - p) + scene.sceneRadius;
+            shorten = 0.0;
             geom = em.spotOmega;
         } else {
             const double u1 = rng.uniform(), u2 = rng.uniform();
@@ -1570,11 +1572,11 @@ struct BackwardRenderer {
                 geom = cosLight / dist2 * effArea;         // no surface cosine at a volume vertex
                 if (epat != 1.0) geom *= epat;
             }
-            shadowLen = dist - 2e-6;
         }
         // A fiber of `opacity` below 1 attenuates the shadow ray rather than blocking it, as on
-        // every other NEE leg (emitterGeom).
-        const double vis = scene.shadowTransmittance(p + wi * 1e-6, wi, shadowLen);
+        // every other NEE leg (emitterGeom). Aimed from the moved origin at the far end and
+        // stopped short of it (Scene::shadowTransmittanceTo), as emitterGeom's ray is.
+        const double vis = scene.shadowTransmittanceTo(p + wi * 1e-6, p + wi * dist, shorten);
         if (!(vis > 0.0)) return false;
         geom *= vis * mediaTr(scene, p + wi * 1e-6, wi, dist, lambda, rng);
         return geom > 0.0;
@@ -2895,10 +2897,7 @@ struct BackwardRenderer {
                 if (gmis.pdf > 0.0)
                     wMis = glossyHitWeight(scene, gmis, emitterIndexOfResolved(scene, m),
                                            ray.d, &h.p, &h.n);
-                // An aimed quad's radiance depends on the direction it is seen from.
-                if (!scene.aimOfMat.empty())
-                    wMis *= scene.aimedEmission((int)(&m - scene.mats.data()), ray.d * -1.0);
-                L += thr * emitSlot(scene, m, h, lambda) * invPdfLambda * wMis;
+                L += thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfLambda * wMis;
             }
 
             bool nullEvt = false;
@@ -3370,18 +3369,15 @@ struct BackwardRenderer {
             const Material& m = *mp;
 
             // Surface emission on a specular/camera arrival (NEE covers diffuse).
-            // An `emit pattern:` is achromatic, so evaluate it ONCE for the whole hero
-            // bundle rather than per-wavelength inside emitSlot.
+            // emitHitScale (an `emit pattern:`, an aimed quad's law) is achromatic, so evaluate
+            // it ONCE for the whole hero bundle rather than per-wavelength inside emitSlot.
             if (m.isLight && specularArrival && dot(ray.d, h.ng) < 0.0) {
-                double ep = (m.emitPat < 0) ? 1.0 : slotPatMul(scene, m.emitPat, h);
+                double ep = emitHitScale(scene, m, h, ray.d * -1.0);
                 // The lobe-sampling half of the glossy MIS weight; 1 (and bit-identical to the
                 // old expression) unless the last bounce was a MIS'd glossy one.
                 if (gmis.pdf > 0.0)
                     ep *= glossyHitWeight(scene, gmis, emitterIndexOfResolved(scene, m),
                                           ray.d, &h.p, &h.n);
-                // An aimed quad's radiance depends on the direction it is seen from.
-                if (!scene.aimOfMat.empty())
-                    ep *= scene.aimedEmission((int)(&m - scene.mats.data()), ray.d * -1.0);
                 for (int i = 0; i < nUp; ++i)
                     L[i] += thr[i] * m.emit(lam[i]) * ep * invPdf[i];
             }

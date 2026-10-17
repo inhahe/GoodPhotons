@@ -25,11 +25,14 @@ Modes R W D U S M B P on the host and the device (A images through a lens whose 
 light across edges). Until 0.384.2 mode S added a light's emission on whichever side its camera
 path met it, so the back of every light glowed in mode S on both backends.
 
-And a GLOW: a sphere whose material emits but which has no emitter (an isosurface registers
-none), seen directly, must look as it does in mode R -- the mean over its centre within 2 % (or
-5 standard errors, from the two seeds) in modes R W D U S M J on both backends. B, A and C trace
-light only from emitters, so such a surface is dark to them by design (known-issues, the glow
-limitation). Until 0.384.2 device mode S, and until 0.384.3 device mode U, showed it black.
+And a GLOW: a sphere whose material emits AND reflects but which has no emitter (an
+isosurface registers none), under a lamp, seen directly, must look as it does in mode R -- glow
+and lit body together, of about equal brightness, the mean over the sphere within 2 % (or 5
+standard errors, from the two seeds) -- in modes R W D U S M J on both backends. There is no floor, so nothing the glow lights
+can come back to it (what such a glow lights differs by mode: GLOW-LIGHT-MODES). B, A and C
+trace light only from emitters, so the glow itself is dark to them by design. Until 0.384.2
+device mode S, and until 0.384.3 device mode U, showed it black; until 0.384.4 modes S and U
+dropped its body, on both backends.
 Exits 1 on any failure.
 """
 import argparse
@@ -63,12 +66,11 @@ BEHIND = [
     LAMPS["with"],
 ]
 BEHIND_MODES = "RWDUSMBP"
-# A sphere that glows with no emitter behind it, seen directly.
+# A sphere that glows and reflects with no emitter behind it, under a lamp, seen directly.
 GLOW = [
     'camera "c" { eye 0 0.6 -2.5  look_at 0 0.4 0  up 0 1 0  fov_y 40  film { res 64 48 } }',
-    'material "floor" { type diffuse  reflect 0.5 }',
-    'material "glow" { type diffuse  reflect 0  emit 5 }',
-    'quad { origin -3 0 -3  u 0 0 6  v 6 0 0  material floor }',
+    # emit is per nm: 0.002 puts the glow beside the lamp-lit body, so losing either shows.
+    'material "glow" { type diffuse  reflect 0.6  emit 0.002 }',
     'isosurface { material glow  sphere { center 0 0.4 0  radius 0.3 } }',
     'light area { origin -0.3 1.6 -0.3  u 0.6 0 0  v 0 0 0.6  normal 0 -1 0  power 20  spd preset:d65 }',
 ]
@@ -147,17 +149,17 @@ def main():
 
     with open(os.path.join(d, "glow.ftsl"), "w", encoding="utf-8", newline="") as f:
         f.write(NL.join(GLOW) + NL)
-    centre = None                                 # the sphere's centre, from mode R on the host
+    sphere = None                                 # the sphere's pixels, from mode R on the host
     for dev in ["cpu"] + ([] if a.no_gpu else ["gpu"]):
         for m in GLOW_MODES:
             n = 5000000 // a.spp if m == "S" else 5000000
             imgs = render("glow", m + dev, ["-mode", m, "-device", dev, "-spp", str(a.spp),
                                              "-n", str(n)])
-            if centre is None:
+            if sphere is None:
                 r = (imgs[0] + imgs[1]) / 2
-                centre = r > 0.5 * r.max()
-                ref = r[centre].mean()
-            v = [x[centre].mean() for x in imgs]
+                sphere = r > 0.05 * r.max()       # all but its dimmest rim; the rest is black
+                ref = r[sphere].mean()
+            v = [x[sphere].mean() for x in imgs]
             err = max(abs(v[0] - v[1]) / 2, 1e-30)
             ratio = (v[0] + v[1]) / 2 / ref
             good = not (abs(ratio - 1.0) > 0.02 and abs(ratio - 1.0) * ref > 5 * err)

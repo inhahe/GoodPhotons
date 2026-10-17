@@ -519,6 +519,7 @@ struct DMaterial {
     // the camera sees them. matEmit is that fallback, consulted only when
     // dEmitterForMat() < 0 so a mesh/quad light never double-counts.
     int    matIsLight;
+    int    matReflectsNothing;   // Material::reflectsNothing: a light block's own surface
     // Device twin of Material::hideCamera — primary visibility off. Only the bounce-0
     // camera ray of a gather/backward path skips this material; every other ray sees it.
     // See Material::hideCamera (scene.h) for why the flag exists at all, and
@@ -4428,13 +4429,17 @@ __device__ static void connectVolume(const DScene& sc, const DMedium& med, const
 // Renderer::connectLens — the importance-sampled form of model C's brute-force catch,
 // so A and C share both scale and shape. Weight beta*rho*cosSurf*cosLens*R^2/dist^2
 // (the BRDF's 1/pi cancels the pupil pdf's pi R^2).
+// `plane` (optional): an aimed quad's face (DEmitter::nGeom); a pupil point behind it gets
+// nothing. Tested at the sampled point, not the eye: a pupil can straddle the plane.
 __device__ static void connectLens(const DScene& sc, const DCamera& cam, double* film, double* hits,
                                    const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
-                                   Real lambda, Real beta, Real rho, DRng& rng) {
+                                   Real lambda, Real beta, Real rho, DRng& rng,
+                                   const DVec3* plane = nullptr) {
     Real R  = (Real)cam.apertureR;
     Real rr = R * sqrt(rng.uniform());
     Real a  = (Real)(2.0 * DPI) * rng.uniform();
     DVec3 A = cam.eye + cam.u * (rr * cos(a)) + cam.v * (rr * sin(a));
+    if (plane && ddot(*plane, A - p) <= 0.0) return;
     DVec3 toA = A - p;
     Real dist = length(toA);
     if (dist < (Real)1e-9) return;
@@ -6596,16 +6601,21 @@ __global__ void kWfBeamEval(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm,
 // (it consumes the photon per camera), so this is a no-op for CAM_C. For model A each
 // camera draws its own aperture sample, so the loop consumes RNG proportional to nCam
 // (deterministic given the camera order).
-// `plane` (optional): an aimed quad's face (DEmitter::nGeom) -- a camera behind it gets nothing.
+// `plane` (optional): an aimed quad's face (DEmitter::nGeom) -- a camera point behind it gets
+// nothing: the eye for the pinhole, the sampled pupil point for the lens (connectLens).
 __device__ static void splatSurfaceAll(const DScene& sc, const DCamSet& cs, int camMode,
                                         const DVec3& p, const DVec3& n, const DVec3& ng,
                                         const DVec3& wi, Real lambda,
                                         Real beta, Real rho, DRng& rng,
                                         const DVec3* plane = nullptr) {
     for (int c = 0; c < cs.nCam; ++c) {
-        if (plane && ddot(*plane, cs.cams[c].eye - p) <= (Real)0) continue;
-        if (camMode == CAM_B) connect(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng);
-        else if (camMode == CAM_A) connectLens(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng);
+        if (camMode == CAM_B) {
+            if (plane && ddot(*plane, cs.cams[c].eye - p) <= (Real)0) continue;
+            connect(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng);
+        } else if (camMode == CAM_A) {
+            connectLens(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng,
+                        plane);
+        }
     }
 }
 // Fiber (D_HAIR) analogue of splatSurfaceAll — device twin of Renderer::camSplatAllHair.
@@ -8383,6 +8393,17 @@ __device__ static double dEmitPatMul(const DScene& sc, int emitPat, const DHit& 
     return clamp01(dPatternScalarAt(sc, emitPat, h));
 }
 
+// The wavelength-free factor on what an emissive surface sends toward `wo` from a hit on it:
+// the bound emission pattern there, times an aimed quad's law (dAimRadiance) when the hit's
+// emitter `li` is one. Device twin of emitHitScale (scene.h); every device emission-on-hit site
+// multiplies by it, so none can render an aimed light flat.
+__device__ static double dEmitHitScale(const DScene& sc, int emitPat, int li, const DHit& h,
+                                       const DVec3& wo) {
+    double s = dEmitPatMul(sc, emitPat, h);
+    if (li >= 0 && sc.emitters[li].normalTilted) s *= (double)dAimRadiance(sc.emitters[li], wo);
+    return s;
+}
+
 // The emission-pattern multiplier at a point on `em`, given the point's own texture
 // coordinates (device twin of host emitterPatMulAt). Clamped to [0,1] like the
 // reflect/transmit slot patterns, so a runaway formula can never manufacture light.
@@ -9573,11 +9594,13 @@ __device__ static void connectHero(const DScene& sc, const DCamera& cam, double*
 // connectLens().
 __device__ static void connectLensHero(const DScene& sc, const DCamera& cam, double* film, double* hits,
         const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
-        const Real* lam, const Real* beta, const Real* rho, int nUp, DRng& rng) {
+        const Real* lam, const Real* beta, const Real* rho, int nUp, DRng& rng,
+        const DVec3* plane = nullptr) {                                   // see connectLens
     Real R  = (Real)cam.apertureR;
     Real rr = R * sqrt(rng.uniform());
     Real a  = (Real)(2.0 * DPI) * rng.uniform();
     DVec3 A = cam.eye + cam.u * (rr * cos(a)) + cam.v * (rr * sin(a));
+    if (plane && ddot(*plane, A - p) <= 0.0) return;
     DVec3 toA = A - p;
     Real dist = length(toA);
     if (dist < (Real)1e-9) return;
@@ -9607,9 +9630,13 @@ __device__ static void splatSurfaceAllHero(const DScene& sc, const DCamSet& cs, 
         const Real* lam, const Real* beta, const Real* rho, int nUp, DRng& rng,
         const DVec3* plane = nullptr) {                                   // see splatSurfaceAll
     for (int c = 0; c < cs.nCam; ++c) {
-        if (plane && ddot(*plane, cs.cams[c].eye - p) <= (Real)0) continue;
-        if (camMode == CAM_B) connectHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp, rng);
-        else if (camMode == CAM_A) connectLensHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp, rng);
+        if (camMode == CAM_B) {
+            if (plane && ddot(*plane, cs.cams[c].eye - p) <= (Real)0) continue;
+            connectHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp, rng);
+        } else if (camMode == CAM_A) {
+            connectLensHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp,
+                            rng, plane);
+        }
     }
 }
 // Refract each live wavelength's Lambertian reflection through every glass sphere, and
@@ -10594,9 +10621,10 @@ __device__ static float dVertexPdfLightF(const DScene& sc, const DVertex& cur, c
     if (d2 == 0.f) return 0.f;
     float invD2 = 1.0f / d2;
     DVec3 wn = w * (Real)sqrtf(invD2);
-    // Only a BV_LIGHT endpoint can be a delta emitter: spot/sun carry no geometry, so an
-    // emissive SURFACE vertex — whether or not it registered an emitter — always takes the
-    // cosine branch, which is exactly what an unregistered glowing quad/isosurface wants.
+    // Only a BV_LIGHT endpoint can be a delta emitter: spot/sun carry no geometry. An emissive
+    // SURFACE vertex takes its emitter's own sampling density: the aim branch below for a
+    // registered aimed quad, the cosine branch for anything else -- which is exactly what an
+    // unregistered glowing quad/isosurface wants.
     const DEmitter* em = (cur.type == BV_LIGHT && cur.lightIdx >= 0) ? &sc.emitters[cur.lightIdx]
                                                                      : nullptr;
     float pdf;
@@ -12925,10 +12953,8 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 // its pre-0.266 form -- unless the previous bounce was a MIS'd glossy one.
                 double wMis = (gmis.pdf > 0.0)
                     ? dGlossyHitWeight(sc, gmis, li, rd, &h.p, &h.n) : 1.0;
-                if (li >= 0 && sc.emitters[li].normalTilted)          // an aimed quad's radiance depends on
-                    wMis *= (double)dAimRadiance(sc.emitters[li], rd * (Real)(-1));  // the view
                 L += thr * (double)specLookup(eSpd, lambda) * invPdfLambda
-                         * dEmitPatMul(sc, mp->emitPat, h) * wMis;
+                         * dEmitHitScale(sc, mp->emitPat, li, h, rd * (Real)(-1)) * wMis;
             }
         }
 
@@ -13153,11 +13179,9 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                : (mp->matIsLight) ? mp->matEmit
                                                   : nullptr;
             if (eSpd) {
-                double ep = dEmitPatMul(sc, mp->emitPat, h);
+                double ep = dEmitHitScale(sc, mp->emitPat, li, h, rd * (Real)(-1));
                 if (gmis.pdf > 0.0)          // GLOSSY-NEE, as in the scalar loop
                     ep *= dGlossyHitWeight(sc, gmis, li, rd, &h.p, &h.n);
-                if (li >= 0 && sc.emitters[li].normalTilted)          // an aimed quad (scalar loop)
-                    ep *= (double)dAimRadiance(sc.emitters[li], rd * (Real)(-1));
                 for (int i = 0; i < nUp; ++i)
                     L[i] += thr[i] * (double)specLookup(eSpd, lam[i]) * invPdf[i] * ep;
             }
@@ -13835,9 +13859,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
             // The emission pattern is achromatic, so it scales the baked RGB radiance.
             // Emitter-less emissive geometry (isosurface / CSG solid) falls back to the
             // material's own baked emission, exactly as the spectral paths do.
-            double ep = dEmitPatMul(sc, mp->emitPat, h);
-            if (li >= 0 && sc.emitters[li].normalTilted)              // an aimed quad (bkRadiance)
-                ep *= (double)dAimRadiance(sc.emitters[li], rd * (Real)(-1));
+            double ep = dEmitHitScale(sc, mp->emitPat, li, h, rd * (Real)(-1));
             L = L + hadamard(beta * (Real)ep,
                              (li >= 0) ? sc.emitters[li].rgbEmit : mp->rgbMatEmit);
         }
@@ -15723,9 +15745,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             if (eSpd && specularSeen && dot(rd, h.ng) < 0 && !hairArrival) {
                 double rhoV = (double)clamp01(dDiffuseRho(sc, visMat, visHit, lambda));
                 double e = (double)specLookup(eSpd, lambda) * thr * rhoV * invPdfL
-                         * dEmitPatMul(sc, m.emitPat, h);   // `emit pattern:` at this hit
-                if (li >= 0 && sc.emitters[li].normalTilted)          // an aimed quad (bkRadiance)
-                    e *= (double)dAimRadiance(sc.emitters[li], rd * (Real)(-1));
+                         * dEmitHitScale(sc, m.emitPat, li, h, rd * (Real)(-1));   // pattern and aim at this hit
                 oX += (double)cieX(lambda) * e; oY += (double)cieY(lambda) * e; oZ += (double)cieZ(lambda) * e;
             }
         }
@@ -16329,9 +16349,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 const double wMis = (gmis.pdf > 0.0)
                                   ? dGlossyHitWeight(sc, gmis, li, rd, &h.p, &h.n) : 1.0;
                 double e = (double)specLookup(eSpd, lambda) * thr * invPdfL * wMis
-                         * dEmitPatMul(sc, m.emitPat, h);    // `emit pattern:` at this hit
-                if (li >= 0 && sc.emitters[li].normalTilted)          // an aimed quad (bkRadiance)
-                    e *= (double)dAimRadiance(sc.emitters[li], rd * (Real)(-1));
+                         * dEmitHitScale(sc, m.emitPat, li, h, rd * (Real)(-1));    // pattern and aim at this hit
                 oX += (double)cieX(lambda) * e;
                 oY += (double)cieY(lambda) * e;
                 oZ += (double)cieZ(lambda) * e;
@@ -16777,10 +16795,12 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         }
         const DMaterial& m = *mp;
 
-        // A directly-viewed / specular-seen light ends the path, as on the host (sppm_render.h's
-        // `m.isLight`): an emitter's own geometry, or a surface whose material glows with no
-        // emitter registered for it (a marched isosurface or CSG solid; bkRadiance falls back
-        // to the material's `emit` the same way). It adds its emission from its front face only.
+        // A directly-viewed / specular-seen light, as on the host (sppm_render.h's `m.isLight`):
+        // an emitter's own geometry, or a surface whose material glows with no emitter
+        // registered for it (a marched isosurface or CSG solid; bkRadiance falls back to the
+        // material's `emit` the same way). It adds its emission from its front face only; a
+        // light block's own surface then ends the path, and any other glowing material has a
+        // body that is shaded below like any surface.
         int li = dEmitterForMat(sc, matId);
         const double* eSpd = (li >= 0)        ? sc.emitters[li].emitSpd
                            : (m.matIsLight)   ? m.matEmit
@@ -16788,14 +16808,12 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         if (eSpd) {
             if (dot(rd, h.ng) < (Real)0) {
                 double e = (double)specLookup(eSpd, lambda) * thr * invPdfL
-                         * dEmitPatMul(sc, m.emitPat, h);    // `emit pattern:` at this hit
-                if (li >= 0 && sc.emitters[li].normalTilted)  // an aimed quad (bkRadiance)
-                    e *= (double)dAimRadiance(sc.emitters[li], rd * (Real)(-1));
+                         * dEmitHitScale(sc, m.emitPat, li, h, rd * (Real)(-1));    // pattern and aim at this hit
                 dX += (double)cieX(lambda) * e;
                 dY += (double)cieY(lambda) * e;
                 dZ += (double)cieZ(lambda) * e;
             }
-            return;
+            if (m.matReflectsNothing) return;
         }
 
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
@@ -17442,9 +17460,9 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 if (c < 0) break;
                 mp = &sc.mats[c]; matId = c;
             }
-            // A light subpath doesn't scatter off a light: an emitter's own geometry, or a surface
-            // that glows with no emitter (vcm.h tests `isLight`, which covers both).
-            if (mp->matIsLight || dEmitterForMat(sc, matId) >= 0) break;
+            // A light block's own surface absorbs; any other glowing material also reflects, and
+            // the subpath scatters off it as off any surface (vcm.h, bdpt.h's walk).
+            if (mp->matReflectsNothing) break;
 
             // misArrival(dist, cosThetaIn, foldDist2 = !(isInfinite && edges == 1)). The one
             // edge in the whole renderer that skips the dist^2 area conversion is the FIRST
@@ -17740,9 +17758,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                 if (cosLight > 0.0) {
                     // Achromatic `emit pattern:` factor at this hit — the same value the
                     // light-subpath / NEE sides get from the sampler at this point.
-                    double ep = dEmitPatMul(sc, mp->emitPat, h);
-                    if (li >= 0 && sc.emitters[li].normalTilted)    // an aimed quad (vcm.h)
-                        ep *= (double)dAimRadiance(sc.emitters[li], wo);
+                    double ep = dEmitHitScale(sc, mp->emitPat, li, h, wo);
                     double Le = (double)specLookup(eSpd, lambda) * invPdfLambda * ep;
                     double LeSec[SECN], mxLe = Le;
                     for (int k = 0; k + 1 < nUp; ++k) {
@@ -17771,7 +17787,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                         rx += ax; ry += ay; rz += az;
                     }
                 }
-                break;                                    // can't scatter off a light
+                // A light block's own surface ends the path; any other glowing material has a
+                // body, which the strategies below shade as any surface's.
+                if (mp->matReflectsNothing) break;
             }
 
             if (dConnectibleType(mp->type)) {
@@ -19260,6 +19278,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         // CSG/quadric solids). bakeSpec of a null Spectrum yields all zeros, so a
         // non-emissive material costs nothing but the storage.
         d.matIsLight = m.isLight ? 1 : 0;
+        d.matReflectsNothing = m.reflectsNothing ? 1 : 0;
         d.hideCamera = m.hideCamera ? 1 : 0;
         bakeSpec(m.emit, d.matEmit);
         { Vec3 le = m.emit ? rgbbake::emitToRgb(m.emit) : Vec3{0, 0, 0};
@@ -19378,6 +19397,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         coat.mixCount = 0;
         coat.coatChild = -1;
         coat.matIsLight = 0;
+        coat.matReflectsNothing = 0;
         coat.emitPat = -1;
         mats[i].coatChild = (int)mats.size();
         mats.push_back(coat);

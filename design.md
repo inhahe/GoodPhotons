@@ -2582,7 +2582,10 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
   `aimDirPdf`/`sampleAimDir` (forward births and light subpaths: cosine about the aim, rejecting
   directions behind the face, density `cos_a/aimNorm`), and `Scene::aimedEmission(matId, w)`
   for emission-on-hit, which looks the emitter up through `aimOfMat` (empty when no light is
-  aimed). Solid-angle conversions stay with the face (`cos_g`), since that is the patch's real
+  aimed) and which every emission-on-hit site reaches through `emitHitScale` / `emitSlot`
+  (device: `dEmitHitScale`), so none can miss it. The lean test and `aimNorm` come from
+  `Emitter::leanCos` / `leans` / `aimNormFor`, shared by the loader's `power` normalisation and
+  `addAreaLight`. Solid-angle conversions stay with the face (`cos_g`), since that is the patch's real
   orientation. The device twins are `dAimCos`/`dAimRadiance`/`dAimDirPdf`/`dSampleAimDir`, and
   the raster preview gates its lights by the face (`PLight::face`). A forward splat from an aimed
   light's surface point is gated by the face too (`SpecVtx::gated`, the `plane` argument of the
@@ -2602,7 +2605,12 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
   its SPD may carry a `power`/`lumens` flux normalisation the raw material spectrum does
   not, and that ordering is also what stops a mesh light double-counting. Such surfaces
   remain emission-on-hit only (no NEE, no forward emission): they glow but illuminate
-  nothing, including themselves — logged as a known limitation.
+  nothing, including themselves — logged as a known limitation (and not uniformly so: modes D,
+  J and U count part or all of what a diffuse arrival sees of one, known-issues
+  GLOW-LIGHT-MODES). Every emission-on-hit site reads the per-hit factor through `emitHitScale` /
+  `dEmitHitScale` (the emission pattern times an aimed quad's law, 0.384.4), and a path ends at
+  an emissive surface only when it is a light block's own (`Material::reflectsNothing`): any other
+  emissive material's body is shaded on, in modes S and U since 0.384.4 as in R, D and M.
   0.118.1 fixed only the *backward* (mode R/W) sites; **0.129.0 extends the same fallback
   to BDPT (mode `D`) on the GPU**, whose s=0 strategy asked the same question through
   `dIsLightVertex` (`v.lightIdx >= 0`) and `dVertexLe` (`sc.emitters[v.lightIdx]`) and so
@@ -7941,7 +7949,9 @@ as the one at fault.
 - **The `-on-unsupported` policy** (`main.cpp`) reads one set of capability predicates --
   `modeRendersVolumeEmission`, `modeRendersGrin`, `modeFormsLensImage`, and the per-mode scope
   checks in `modeFeatureUnsupported` -- so the refusal, the fallback, the strip and the error's
-  advice cannot disagree. A physical-lens camera is first routed to a lens-forming mode
+  advice cannot disagree. (Mode U refuses any medium and mode S one that absorbs or scatters,
+  `Medium::attenuates`; both modes check again at render time, which a built-in scene or one
+  with no camera block reaches without passing this policy.) A physical-lens camera is first routed to a lens-forming mode
   (`lensRoutedMode`: R, or D/J); the fallback is the first of R and B that renders everything the
   camera needs, lens included (`fallbackModeFor`; none for a fire beside a GRIN medium seen
   through a lens, which then errors). A strip removes only what the camera's mode lacks and only what no camera of the run
@@ -8030,7 +8040,14 @@ as the one at fault.
   `pX = cie(lambda)·power/pi` with NO area/nEmitted fold (those depend on the current
   per-pixel radius, applied at resolve) — unlike mode M, which folds them in. Validated
   GPU==CPU on a Cornell glass-sphere caustic (mean 0.2–1.2%, background wall 0.3%, per-pixel
-  diff shrinking with passes). Since 0.33.0 (M4) the mode-M **`-pmfg` Jensen final gather**
+  diff shrinking with passes). **Mode S's scope (0.384.2, 0.384.4):** SPPM deposits and gathers
+  on surfaces only, so a medium that absorbs or scatters is refused (`modeFeatureUnsupported`,
+  and again at the top of the mode-S branch for a built-in or camera-less scene); a pure index
+  field (GRIN with no extinction, `Medium::attenuates`) is not, since the visible-point walk
+  follows it. The walk (`sppmVisiblePoint`, `dSppmVisiblePoint`) adds a light's emission from its
+  front face only, falls back to the material's `emit` for a glow with no emitter (as
+  `bkRadiance` does), and ends only at a light block's own surface (`Material::reflectsNothing`);
+  any other emissive material's body is gathered like any surface's. Since 0.33.0 (M4) the mode-M **`-pmfg` Jensen final gather**
   also runs on the device: `dPhotonGather` gained an `fgRays>0` branch (NEE direct term via
   `bkNeeLight` + `K` cosine-hemisphere sub-rays), each sub-ray handled by `dPhotonGatherSub`
   (device twin of `photonGatherSub`) — it follows specular surfaces, then at the first diffuse

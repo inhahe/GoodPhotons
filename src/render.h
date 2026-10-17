@@ -1347,14 +1347,18 @@ struct Renderer {
     // vignetting); the film-cell mapping supplies the rest of the angular falloff and
     // the depth-of-field spread automatically. Rectilinear film mapping only — a real
     // fisheye needs a wide-angle lens element, so author fisheye with model B instead.
+    // `plane` (optional): an aimed quad's face (Emitter::nGeom); a pupil point behind it gets
+    // nothing, whatever `n` (the aim) says. Tested at the sampled point, not the eye: a pupil
+    // can straddle the plane.
     void connectLens(const Scene& scene, const Camera& cam, Film& film,
                      const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
                      double lambda, double beta, double rho, Pcg32& rng,
-                     const HairShade* hs = nullptr) const {
+                     const HairShade* hs = nullptr, const Vec3* plane = nullptr) const {
         double R = cam.apertureR;
         double rr = R * std::sqrt(rng.uniform());
         double a  = 2.0 * PI * rng.uniform();
         Vec3 A = cam.eye + cam.u * (rr * std::cos(a)) + cam.v * (rr * std::sin(a));
+        if (plane && dot(*plane, A - p) <= 0.0) return;
         Vec3 toA = A - p;
         double dist = length(toA);
         if (dist < 1e-9) return;
@@ -1413,11 +1417,12 @@ struct Renderer {
     void connectLensHero(const Scene& scene, const Camera& cam, Film& film,
                          const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
                          const double* lam, const double* beta, const double* rho, int nUp,
-                         Pcg32& rng) const {
+                         Pcg32& rng, const Vec3* plane = nullptr) const {   // see connectLens
         double R = cam.apertureR;
         double rr = R * std::sqrt(rng.uniform());
         double a  = 2.0 * PI * rng.uniform();
         Vec3 A = cam.eye + cam.u * (rr * std::cos(a)) + cam.v * (rr * std::sin(a));
+        if (plane && dot(*plane, A - p) <= 0.0) return;
         Vec3 toA = A - p;
         double dist = length(toA);
         if (dist < 1e-9) return;
@@ -1530,25 +1535,28 @@ struct Renderer {
     }
 
     // Route a camera connection to the pinhole (model B) or the finite lens (model A).
+    // `plane` (optional): an aimed quad's face (Emitter::nGeom); a camera point behind it gets
+    // nothing -- the eye for the pinhole, the sampled pupil point for the lens.
     void camSplat(const Scene& scene, const Camera& cam, Film& film, const Vec3& p,
                   const Vec3& n, const Vec3& ng, const Vec3& wi, double lambda, double beta,
-                  double rho, Pcg32& rng) const {
-        if (lensMode) connectLens(scene, cam, film, p, n, ng, wi, lambda, beta, rho, rng);
-        else          connect(scene, cam, film, p, n, ng, wi, lambda, beta, rho, rng);
+                  double rho, Pcg32& rng, const Vec3* plane = nullptr) const {
+        if (lensMode) connectLens(scene, cam, film, p, n, ng, wi, lambda, beta, rho, rng, nullptr,
+                                  plane);
+        else if (!(plane && dot(*plane, cam.eye - p) <= 0.0))
+            connect(scene, cam, film, p, n, ng, wi, lambda, beta, rho, rng);
     }
 
     // Splat a surface vertex to every camera target. In model B (the shared-pass case)
     // camSplat -> connect draws no RNG, so the loop is RNG-neutral; with nCam==1 this is
     // exactly the old single-camera call (model A draws its aperture sample once here).
-    // `plane` (optional): an aimed quad's face (Emitter::nGeom) -- a camera behind it gets
-    // nothing, whatever `n` (the aim) says.
+    // `plane` (optional): an aimed quad's face, passed to camSplat.
     void camSplatAll(const Scene& scene, const CamTarget* cams, int nCam, const Vec3& p,
                      const Vec3& n, const Vec3& ng, const Vec3& wi, double lambda, double beta,
                      double rho, Pcg32& rng, const Vec3* plane = nullptr) const {
         for (int c = 0; c < nCam; ++c)
-            if (cams[c].cam && cams[c].film &&
-                !(plane && dot(*plane, cams[c].cam->eye - p) <= 0.0))
-                camSplat(scene, *cams[c].cam, *cams[c].film, p, n, ng, wi, lambda, beta, rho, rng);
+            if (cams[c].cam && cams[c].film)
+                camSplat(scene, *cams[c].cam, *cams[c].film, p, n, ng, wi, lambda, beta, rho, rng,
+                         plane);
     }
 
     // Fiber (MatType::Hair) analogue of camSplat/camSplatAll. The BCSDF and its projection
@@ -1575,18 +1583,21 @@ struct Renderer {
     // over the camera loop); mode A draws its single aperture sample once per camera.
     void camSplatHero(const Scene& scene, const Camera& cam, Film& film, const Vec3& p,
                       const Vec3& n, const Vec3& ng, const Vec3& wi, const double* lam,
-                      const double* beta, const double* rho, int nUp, Pcg32& rng) const {
-        if (lensMode) connectLensHero(scene, cam, film, p, n, ng, wi, lam, beta, rho, nUp, rng);
-        else          connectHero(scene, cam, film, p, n, ng, wi, lam, beta, rho, nUp, rng);
+                      const double* beta, const double* rho, int nUp, Pcg32& rng,
+                      const Vec3* plane = nullptr) const {           // see camSplat
+        if (lensMode)
+            connectLensHero(scene, cam, film, p, n, ng, wi, lam, beta, rho, nUp, rng, plane);
+        else if (!(plane && dot(*plane, cam.eye - p) <= 0.0))
+            connectHero(scene, cam, film, p, n, ng, wi, lam, beta, rho, nUp, rng);
     }
     void camSplatAllHero(const Scene& scene, const CamTarget* cams, int nCam, const Vec3& p,
                          const Vec3& n, const Vec3& ng, const Vec3& wi, const double* lam,
                          const double* beta, const double* rho, int nUp, Pcg32& rng,
                          const Vec3* plane = nullptr) const {        // see camSplatAll
         for (int c = 0; c < nCam; ++c)
-            if (cams[c].cam && cams[c].film &&
-                !(plane && dot(*plane, cams[c].cam->eye - p) <= 0.0))
-                camSplatHero(scene, *cams[c].cam, *cams[c].film, p, n, ng, wi, lam, beta, rho, nUp, rng);
+            if (cams[c].cam && cams[c].film)
+                camSplatHero(scene, *cams[c].cam, *cams[c].film, p, n, ng, wi, lam, beta, rho, nUp,
+                             rng, plane);
     }
 
     // ===================================================================
@@ -2709,7 +2720,7 @@ struct Renderer {
             if (em.collimated) dir = em.beamDir;
             else if (em.normalTilted) {             // an aimed quad: intensity-proportional
                 double pdfAim = 0.0;
-                dir = em.sampleAimDir([&] { return rng.uniform(); }, pdfAim);
+                dir = em.sampleAimDir(rng, pdfAim);
                 if (!(pdfAim > 0.0)) return;
             } else dir = cosineHemisphere(emitN, rng);
         }
@@ -2819,19 +2830,13 @@ struct Renderer {
         if (nCam > 0 && !forwardCatch &&
             em.shape != EmitterShape::Spot && em.shape != EmitterShape::Env &&
             em.shape != EmitterShape::Sun) {
-            if (em.normalTilted) {
-                // An aimed quad: intensity Le*aimCos per unit area, so the splat's Lambertian
-                // rho/PI * cos(emitN) becomes aimCos / aimNorm -- rho = PI/aimNorm about the aim
-                // -- and nothing reaches a camera or a mirror behind the face.
-                const double rhoAim = PI / em.aimNorm;
-                camSplatAll(scene, cams, nCam, origin, emitN, emitN, emitN, lambda, beta, rhoAim, rng,
-                            &em.nGeom);
-                camSpecularSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, rhoAim, rng,
-                                    &em.nGeom);
-            } else {
-                camSplatAll(scene, cams, nCam, origin, emitN, emitN, emitN, lambda, beta, 1.0, rng);
-                camSpecularSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, 1.0, rng);
-            }
+            // An aimed quad: intensity Le*aimCos per unit area, so the splat's Lambertian
+            // rho/PI * cos(emitN) becomes aimCos / aimNorm -- rho = PI/aimNorm about the aim --
+            // and nothing reaches a camera or a mirror behind the face.
+            const double rhoE = em.normalTilted ? PI / em.aimNorm : 1.0;
+            const Vec3* plane = em.normalTilted ? &em.nGeom : nullptr;
+            camSplatAll(scene, cams, nCam, origin, emitN, emitN, emitN, lambda, beta, rhoE, rng, plane);
+            camSpecularSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, rhoE, rng, plane);
         }
         }   // end emitter-birth branch
 
@@ -3629,7 +3634,7 @@ struct Renderer {
             if (em.collimated) dir = em.beamDir;
             else if (em.normalTilted) {             // an aimed quad -- see the scalar tracer
                 double pdfAim = 0.0;
-                dir = em.sampleAimDir([&] { return rng.uniform(); }, pdfAim);
+                dir = em.sampleAimDir(rng, pdfAim);
                 if (!(pdfAim > 0.0)) return;
             } else dir = cosineHemisphere(emitN, rng);
         }

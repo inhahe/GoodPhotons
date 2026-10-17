@@ -1671,7 +1671,7 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     Vec3 dir;
     double cosLight, pdfDir;
     if (em.normalTilted) {                            // an aimed quad: intensity-proportional
-        dir = em.sampleAimDir([&] { return rng.uniform(); }, pdfDir);
+        dir = em.sampleAimDir(rng, pdfDir);
         cosLight = em.aimCos(dir);                    // Le(dir) * cos_geom = Le * aimCos
         if (!(pdfDir > 0.0) || cosLight <= 0.0) return 1;
     } else {

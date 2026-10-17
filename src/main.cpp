@@ -381,7 +381,8 @@ static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
     Material red;   red.reflect   = redWall();                   s.mats.push_back(red);   // 1
     Material green; green.reflect = greenWall();                 s.mats.push_back(green); // 2
     Material light; light.reflect = constantSpectrum(0.0);
-    light.emit = lightSpd; light.isLight = true;                 s.mats.push_back(light); // 3
+    light.emit = lightSpd; light.isLight = true; light.reflectsNothing = true;
+    s.mats.push_back(light); // 3
     Material glass; glass.type = MatType::Dielectric;
     glass.roughness = 0.0;
     Spectrum sf10; if (!resolveGlassIor("SF10", sf10)) sf10 = iorConstant(1.7283);
@@ -439,7 +440,8 @@ static Scene buildMaterials(int res, const Spectrum& lightSpd) {
     Material red;   red.reflect   = redWall();                   s.mats.push_back(red);   // 1
     Material green; green.reflect = greenWall();                 s.mats.push_back(green); // 2
     Material light; light.reflect = constantSpectrum(0.0);
-    light.emit = lightSpd; light.isLight = true;                 s.mats.push_back(light); // 3
+    light.emit = lightSpd; light.isLight = true; light.reflectsNothing = true;
+    s.mats.push_back(light); // 3
     Material mirror; mirror.type = MatType::Mirror;
     mirror.reflect = constantSpectrum(0.95);                     s.mats.push_back(mirror);// 4
     Material glossy; glossy.type = MatType::Glossy;
@@ -15772,10 +15774,11 @@ static const char* modeFeatureUnsupported(const Scene& scene, char mode, int pro
         if (projection != CAM_RECTILINEAR)
             return "a non-rectilinear (fisheye/panoramic) camera in mode U";
     } else if (mode == 'S') {
-        // SPPM's passes deposit photons on surfaces and its visible points sit on surfaces, so a
-        // medium dims what lies behind it but never scatters light into the picture: the fog
-        // itself renders black.
-        if (!scene.media.empty()) return "participating media (mode S is surfaces-only)";
+        // SPPM deposits and gathers on surfaces only: a fog's own scattering renders black, and
+        // even a purely absorbing medium comes out wrong (tiles up to x1.8 of mode R). A pure
+        // index field bends rays and nothing else, which the visible-point walk follows (GRIN).
+        for (const Medium& m : scene.media)
+            if (m.attenuates()) return "participating media (mode S is surfaces-only)";
     }
     return nullptr;
 }
@@ -17752,6 +17755,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // the camera visible points (stochastic PPM), traces N photons, gathers, and updates the
     // radius/flux. -n = photons PER PASS, -spp = number of passes (or a -time/-noise budget).
     if (mode == 'S') {
+        // A scene's cameras were judged before the run (resolveCameraModes), but a built-in
+        // scene, or one with no camera block, comes straight here.
+        if (const char* unsupported = modeFeatureUnsupported(scene, 'S', cam.projection)) {
+            std::fprintf(stderr, "[mode S] this scene uses %s, which SPPM (mode S) does not "
+                                 "render; render it in mode R, B, or M with -beams instead.\n",
+                         unsupported);
+            return 1;
+        }
         double R0 = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                           : scene.sceneRadius * g_pmRadiusFactor;
 #ifdef HAVE_CUDA

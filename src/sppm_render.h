@@ -135,19 +135,21 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
 
         if (m.isLight) {
             // A light emits from the face its triangles are wound to (the side its `normal`
-            // picks, as backward.h tests it); its back is black, and the path ends either way.
-            if (dot(ray.d, h.ng) >= 0.0) return;
-            // GLOSSY-NEE's lobe-sampling half; 1, and this expression bit-identical to its
-            // pre-0.266 form, unless the previous bounce was a MIS'd glossy one.
-            const double wMis = (gmis.pdf > 0.0)
-                ? bwNee.glossyHitWeight(scene, gmis, BackwardRenderer::emitterIndexOfResolved(scene, m),
-                                        ray.d, &h.p, &h.n)
-                : 1.0;
-            const double aim = scene.aimOfMat.empty() ? 1.0       // an aimed quad (Emitter::nGeom)
-                : scene.aimedEmission((int)(&m - scene.mats.data()), ray.d * -1.0);
-            directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                       * (thr * emitSlot(scene, m, h, lambda) * invPdfL * (wMis * aim));
-            return;
+            // picks, as backward.h tests it).
+            if (dot(ray.d, h.ng) < 0.0) {
+                // GLOSSY-NEE's lobe-sampling half; 1, and this expression bit-identical to its
+                // pre-0.266 form, unless the previous bounce was a MIS'd glossy one.
+                const double wMis = (gmis.pdf > 0.0)
+                    ? bwNee.glossyHitWeight(scene, gmis,
+                                            BackwardRenderer::emitterIndexOfResolved(scene, m),
+                                            ray.d, &h.p, &h.n)
+                    : 1.0;
+                directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                           * (thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfL * wMis);
+            }
+            // A light block's own surface ends the path; any other emissive material also has
+            // a body, which is shaded below like any surface (mode M's gather does the same).
+            if (m.reflectsNothing) return;
         }
 
         // GLOSSY-NEE: cleared HERE, after the two sites that read it and before the branch that

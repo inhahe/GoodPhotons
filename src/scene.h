@@ -10,6 +10,7 @@
 #include <atomic>
 #include <unordered_map>
 #include "geometry.h"
+#include "rng.h"
 #include "bvh.h"
 #include "implicit.h"
 #include "curve.h"
@@ -128,6 +129,10 @@ struct Material {
     double roughness = 0.1;                    // glossy lobe width [0,1]; on a Dielectric it
                                                // roughens the reflected+refracted lobes (frosted)
     bool isLight = false;
+    // The surface a `light` block (or a built-in scene's lamp) makes: it emits and reflects
+    // nothing, so a path that meets it can end there. Any other emissive material -- `emit` on
+    // a material of its own -- may also reflect, and a path is walked on through it.
+    bool reflectsNothing = false;
     // Invisible to CAMERA (primary) rays only — the standard "primary visibility off"
     // of a production renderer, and the reason it exists here: an `light area` is not an
     // abstract emitter, it is two real triangles in the BVH (ftsl.h), so a studio fill
@@ -743,6 +748,13 @@ struct Medium {
         double t = s + std::max(0.0, sigma_a(lambda));
         return t > 0.0 ? s / t : 0.0;
     }
+    // Does this medium absorb or scatter anywhere in the rendered band? False for a pure
+    // index field (a GRIN lens with no extinction), which only bends rays.
+    bool attenuates() const {
+        for (double l = 360.0; l <= 830.0; l += 5.0)
+            if (sigmaT(l) > 0.0) return true;
+        return false;
+    }
 
     // Inside-test for an implicit-shaped bound: is world point p within the field?
     bool insideField(const Vec3& p, const PatTables* tabs = nullptr) const {
@@ -1050,24 +1062,40 @@ struct Emitter {
         return (cg > 0.0 && ca > 0.0) ? ca : 0.0;
     }
     // Radiance towards `w`, as a multiple of Le: what a ray hitting the patch from -w sees.
+    // Unbounded as `w` nears the face's plane on the lean side (cos_g -> 0 while cos_a stays
+    // positive): a finite intensity on a vanishing projected area. What an estimator reads of it
+    // has a finite mean, but a sample that grazes the panel can be very large -- noise where
+    // only a camera or mirror ray sees it edge-on (REFERENCE, aiming an area light).
     double aimRadiance(const Vec3& w) const {
         const double cg = dot(nGeom, w), ca = dot(normal, w);
         return (cg > 0.0 && ca > 0.0) ? ca / cg : 0.0;
+    }
+    // |cos| of the angle between an authored normal `n` and a quad's face u x v; 1 when either
+    // is degenerate. The loader and addAreaLight both read the lean through these three, so a
+    // `power` is normalised to the very flux the emitter then emits.
+    static double leanCos(const Vec3& n, const Vec3& u, const Vec3& v) {
+        const Vec3 cx = cross(u, v);
+        const double lc = length(cx), ln = length(n);
+        return (lc > 0.0 && ln > 0.0) ? std::fabs(dot(n / ln, cx / lc)) : 1.0;
+    }
+    // Whether that lean aims the light. 1e-6 on |cos| is ~0.08 deg: tight enough to catch a real
+    // lean, loose enough that a hand-typed 0.707 against an exact 1/sqrt(2) stays flat.
+    static bool leans(double cosLean) { return cosLean < 1.0 - 1e-6; }
+    // aimNorm for that lean: the patch's flux per unit area and unit Le, PI (1 + cos t) / 2
+    // (PI, a Lambertian panel's, when it does not lean).
+    static double aimNormFor(double cosLean) {
+        return leans(cosLean) ? PI * (1.0 + cosLean) / 2.0 : PI;
     }
     // Solid-angle pdf of sampleAimDir drawing `w` -- proportional to the emitted intensity.
     double aimDirPdf(const Vec3& w) const { return aimCos(w) / aimNorm; }
     // An emission direction for a photon or light subpath: cosine about `normal`, kept only in
     // front of the patch (rejection; the aim leans under 90 deg, so at least half the draws are
-    // kept). `uniform` returns a fresh uniform in [0,1). The weight it implies,
-    // Le * aimCos / (pdfPos * aimDirPdf) = Le * area * aimNorm, is the flux, as for a Lambertian
-    // panel. pdfW = 0 (and the direction is unusable) only after 64 rejections in a row.
-    template <class Uniform> Vec3 sampleAimDir(Uniform&& uniform, double& pdfW) const {
-        Vec3 t, b; onb(normal, t, b);
+    // kept). The weight it implies, Le * aimCos / (pdfPos * aimDirPdf) = Le * area * aimNorm, is
+    // the flux, as for a Lambertian panel. pdfW = 0 (and the direction is unusable) only after
+    // 64 rejections in a row.
+    Vec3 sampleAimDir(Pcg32& rng, double& pdfW) const {
         for (int k = 0; k < 64; ++k) {
-            const double u1 = uniform(), u2 = uniform();
-            const double r = std::sqrt(u1), phi = 6.283185307179586 * u2;
-            const Vec3 w = normalize(t * (r * std::cos(phi)) + b * (r * std::sin(phi))
-                                     + normal * std::sqrt(1.0 - u1));
+            const Vec3 w = cosineHemisphere(normal, rng);
             if (dot(nGeom, w) > 0.0) { pdfW = aimDirPdf(w); return w; }
         }
         pdfW = 0.0;
@@ -1798,6 +1826,7 @@ struct Scene {
             coat.mixWeights.clear();
             coat.coatChild = -1;
             coat.isLight = false;
+            coat.reflectsNothing = false;
             mats[i].coatChild = (int)mats.size();
             mats.push_back(coat);
             // THE BODY needs a copy of its own, because being under a coat changes its albedo
@@ -2189,12 +2218,13 @@ struct Scene {
         // the FTSL loader and the built-in scenes alike -- gets it.
         {
             const Vec3 cx = cross(U, V);
-            const double lc = length(cx), ln = length(n);
-            if (lc > 0.0 && ln > 0.0) {
-                const double c = dot(n / ln, cx / lc);
-                e.nGeom = (c >= 0.0 ? cx : cx * -1.0) / lc;      // the emitting side
-                e.normalTilted = std::fabs(c) < 1.0 - 1e-6;
-                if (e.normalTilted) e.aimNorm = PI * (1.0 + std::fabs(c)) / 2.0;
+            const double lc = length(cx);
+            if (lc > 0.0 && length(n) > 0.0) {
+                e.nGeom = (dot(n, cx) >= 0.0 ? cx : cx * -1.0) / lc;   // the emitting side
+                // A collimated light's `n` is its beam, a single direction: no lobe to aim.
+                const double c = collimated ? 1.0 : Emitter::leanCos(n, U, V);
+                e.normalTilted = Emitter::leans(c);
+                e.aimNorm = Emitter::aimNormFor(c);
             }
         }
         e.spd.build(spd, stepNm); e.spdFn = spd; e.emitIntegral = e.spd.integral;
@@ -4068,15 +4098,25 @@ inline double transmitSlot(const Scene& scene, const Material& m,
     return m.transmitPat < 0 ? v : v * slotPatMul(scene, m.transmitPat, h);
 }
 
-// Emitted radiance at a hit ON an emissive surface, i.e. emission-on-hit: the material's
-// `emit` SPD scaled by a bound emission pattern. The single point of truth for that half
-// of the emission slot; the other half — Le at a point the emitter SAMPLER drew — goes
-// through emitterSamplePoint() below, and the two are constructed to agree pointwise
-// because MIS combines them (see Material::emitPat).
-inline double emitSlot(const Scene& scene, const Material& m,
-                       const Hit& h, double lambda) {
-    double v = m.emit(lambda);
-    return m.emitPat < 0 ? v : v * slotPatMul(scene, m.emitPat, h);
+// The wavelength-free factor on the radiance an emissive surface sends toward `wo` from a
+// hit `h` on it: a bound emission pattern at the hit, times an aimed quad's Le cos_a / cos_g
+// law (Emitter::aimRadiance; 1 for every other surface). `m` is the hit's resolved material,
+// an element of scene.mats. A site that evaluates `emit` itself, wavelength by wavelength,
+// multiplies by this; every other one calls emitSlot.
+inline double emitHitScale(const Scene& scene, const Material& m, const Hit& h, const Vec3& wo) {
+    double s = (m.emitPat < 0) ? 1.0 : slotPatMul(scene, m.emitPat, h);
+    if (!scene.aimOfMat.empty()) s *= scene.aimedEmission((int)(&m - scene.mats.data()), wo);
+    return s;
+}
+
+// Emitted radiance at a hit ON an emissive surface toward `wo`, i.e. emission-on-hit: the
+// material's `emit` SPD times emitHitScale. The single point of truth for that half of the
+// emission slot; the other half — Le at a point the emitter SAMPLER drew — goes through
+// emitterSamplePoint() below, and the two are constructed to agree pointwise because MIS
+// combines them (see Material::emitPat).
+inline double emitSlot(const Scene& scene, const Material& m, const Hit& h, double lambda,
+                       const Vec3& wo) {
+    return m.emit(lambda) * emitHitScale(scene, m, h, wo);
 }
 
 // The emission-pattern multiplier at a point on `em`, given the point's own texture

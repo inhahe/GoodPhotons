@@ -22,7 +22,9 @@ plane, and its flux is Le * area * pi * (1 + cos t) / 2 for a lean of t.
    grid fails when the two differ by more than 5 standard errors (two seeds each) AND --tol
    (2 %). And the floor past the aim's horizon (x < -1.3: the light still faces it, but leans
    away from it) must stay black, under 0.5 % of what the flat light puts there.
-   Pixels the light's back covers, even partly, are left out.
+   Pixels the light's back covers, even partly, are left out. The same light written with u and
+   v swapped -- so its normal leans against u x v, the loader's other winding -- must match the
+   same prediction (mirror_selfie's fill is written that way).
 
 2. Fog. The aimed light over a box of fog on a floor, the same 4 x 4 tiles compared between
    every strategy and mode R on the host: the volume's light sampling and the forward tracer's
@@ -66,18 +68,21 @@ MODE_ARGS = {"M": ["-beams"]}             # the fog needs the beam map in mode M
 NO_FOG = "WUSA"
 
 
-def light_block(normal):
+def light_block(normal, flip=False):
+    """The light. `flip` swaps u and v: the same rectangle, with u x v pointing the other way,
+    so the same `normal` now leans against it -- the loader's other winding, the same light."""
+    u, v = (LIGHT_V, LIGHT_U) if flip else (LIGHT_U, LIGHT_V)
     return ('light area { origin %g %g %g  u %g %g %g  v %g %g %g  normal %s  power 40  '
-            'spd preset:d65 }' % (tuple(LIGHT_O) + tuple(LIGHT_U) + tuple(LIGHT_V) + (normal,)))
+            'spd preset:d65 }' % (tuple(LIGHT_O) + tuple(u) + tuple(v) + (normal,)))
 
 
-def floor_scene(normal):
+def floor_scene(normal, flip=False):
     return [
         'camera "c" { eye %g %g %g  look_at %g %g %g  up %g %g %g  fov_y %g  film { res %d %d } }'
         % (tuple(EYE) + tuple(LOOK) + tuple(UP) + (FOV_Y,) + RES),
         'material "floor" { type diffuse  reflect 0.6 }',
         'quad { origin -4 0 -4  u 0 0 8  v 8 0 0  material floor }',
-        light_block(normal),
+        light_block(normal, flip),
     ]
 
 
@@ -177,6 +182,8 @@ def main():
             with open(os.path.join(d, "%s_%s.ftsl" % (kind, name)), "w", encoding="utf-8",
                       newline="") as f:
                 f.write(NL.join(build(normal)) + NL)
+    with open(os.path.join(d, "floor_aimflip.ftsl"), "w", encoding="utf-8", newline="") as f:
+        f.write(NL.join(floor_scene(normals["aimed"], flip=True)) + NL)
 
     ratio, blocked, dark = predicted_ratio()
     keep = ~blocked
@@ -195,7 +202,11 @@ def main():
         return "worst tile x%.4f (%s)" % (r[i, j], sig)
 
     devices = ["cpu"] + ([] if a.no_gpu else ["gpu"])
-    fog_ref = None
+    # The fog's reference is always mode R on the host, rendered here whatever --modes holds;
+    # mode R's own host run below reuses it (same seeds and arguments) rather than scoring it
+    # against itself.
+    fog_ref = tile_stats(*render_seeds(a.exe, d, "fog_aimed.ftsl", "fog_aimed_R",
+                                       ["-mode", "R", "-n", str(a.n)], "cpu", a.spp))
     for dev in devices:
         for m in a.modes:
             label = "mode %s, %s" % (m, "device" if dev == "gpu" else "host")
@@ -215,17 +226,20 @@ def main():
             leak = sum(x[dark].mean() for x in aimd) / max(lit, 1e-30)
             report(lit > 0.0 and leak < 0.005,
                    "%s, floor past the aim's horizon: %.3f %% of the flat light" % (label, 100 * leak))
+            flip = render_seeds(a.exe, d, "floor_aimflip.ftsl", "floor_aimflip_" + tag, args, dev,
+                                a.spp)
+            r, z, bad = tile_verdict(tile_stats(*[x * keep for x in flip]), tile_stats(*pred),
+                                     a.tol)
+            report(not bad.any(), "%s, floor, the same light written against u x v: %s"
+                   % (label, worst(r, z)))
 
-            if m in NO_FOG:
+            if m in NO_FOG or (m == "R" and dev == "cpu"):
                 continue
             fog = render_seeds(a.exe, d, "fog_aimed.ftsl", "fog_aimed_" + tag,
                                args + MODE_ARGS.get(m, []), dev, a.spp)
-            if fog_ref is None:
-                fog_ref = tile_stats(*fog)          # mode R on the host, the first case run
-                continue
             r, z, bad = tile_verdict(tile_stats(*fog), fog_ref, a.tol)
-            report(not bad.any(), "%s, fog: against mode %s on the host; %s"
-                   % (label, a.modes[0], worst(r, z)))
+            report(not bad.any(), "%s, fog: against mode R on the host; %s"
+                   % (label, worst(r, z)))
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 
