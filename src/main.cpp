@@ -14946,6 +14946,10 @@ struct LiveStatus {
     const char* tag = "live";        // the budget in force: live | spp | time | noise | forever | gather
     double elapsed = 0.0, budgetSec = 0.0;
     long long photons = -1, photonsTotal = -1, spp = -1, sppTotal = -1, batches = -1;
+    // What `photons` / `spp` already held when this session began (loaded by -resume), so the
+    // throughput is this session's: counting the loaded samples over this session's elapsed
+    // time read a resumed 0.5 spp/s render as hundreds.
+    long long photonsBase = 0, sppBase = 0;
     double noisePct = -1.0, noiseTarget = 0.0;
     const char* noiseNote = "";      // shown in the noise slot when there is no noise figure
                                      // ("deterministic" for a whitted preview)
@@ -14970,8 +14974,10 @@ static std::string liveStatusText(const LiveStatus& s) {
     // forward passes, spp/s for the gathers, whichever the driver counts in.
     if (s.elapsed > 0.5) {
         char rb[48];
-        if (s.photons > 0)      { std::snprintf(rb, sizeof rb, "%s/s", humanCount((double)s.photons / s.elapsed).c_str()); t += sep + rb; }
-        else if (s.spp > 0)     { std::snprintf(rb, sizeof rb, "%.3g spp/s", (double)s.spp / s.elapsed); t += sep + rb; }
+        const long long dPh = s.photons - s.photonsBase, dSpp = s.spp - s.sppBase;
+        if (s.photons > 0) {
+            if (dPh > 0) { std::snprintf(rb, sizeof rb, "%s/s", humanCount((double)dPh / s.elapsed).c_str()); t += sep + rb; }
+        } else if (dSpp > 0) { std::snprintf(rb, sizeof rb, "%.3g spp/s", (double)dSpp / s.elapsed); t += sep + rb; }
     }
     if (s.noisePct >= 0.0) {
         char nb[64];
@@ -16214,6 +16220,7 @@ static int runSppProgressive(
                 ls.tag = runForever ? "forever" : timeBudgetSec > 0.0 ? "time" : noiseTarget > 0.0 ? "noise" : "spp";
                 ls.elapsed = elapsed; ls.budgetSec = timeBudgetSec;
                 ls.spp = totalSpp; ls.sppTotal = (ls.tag[0] == 's') ? baseSpp + sppReq : -1;
+                ls.sppBase = baseSpp;
                 ls.noisePct = g_whitted ? -1.0 : noisePct;   // whitted is deterministic: no noise figure,
                 ls.noiseNote = g_whitted ? "deterministic" : "";   // and the title says so in that slot
                 ls.noiseTarget = noiseTarget; ls.why = why;
@@ -16326,6 +16333,7 @@ static int runCompositeProgressive(
             std::fprintf(stderr, "[checkpoint] could not write %s\n",
                          checkpointPath(outPath).c_str());
     };
+    const long long resumedN = acc.N, resumedSpp = acc.spp;   // a checkpoint's, for the rate
 
     for (;;) {
         long long dSpp = batchSpp;
@@ -16414,6 +16422,7 @@ static int runCompositeProgressive(
                 ls.elapsed = elapsed; ls.budgetSec = timeBudgetSec;
                 ls.photons = acc.N; ls.photonsTotal = (ls.tag[0] == 's') ? Nreq : -1;
                 ls.spp = acc.spp;   ls.sppTotal     = (ls.tag[0] == 's') ? sppReq : -1;
+                ls.photonsBase = resumedN; ls.sppBase = resumedSpp;
                 ls.noisePct = noisePct; ls.noiseTarget = noiseTarget; ls.why = why;
                 liveWindowUpdate(comp, 1.0, manualExposure, absolute, liveStatusText(ls).c_str());
             }
@@ -18151,6 +18160,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         long long batches = 0;
         bool metNoise = false;
         bool metTime  = false;      // which budget ended it — reported in the window title
+        const long long resumedN = acc.N;   // a checkpoint's, for the window's rate
         for (;;) {
             runBatch(batchN); ++batches;
             double elapsed   = std::chrono::duration<double>(clk::now() - t0).count();
@@ -18217,6 +18227,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         ls.tag = chunkFixed ? "live" : runForever ? "forever" : timeBudgetSec > 0.0 ? "time" : "noise";
                         ls.elapsed = elapsed; ls.budgetSec = timeBudgetSec;
                         ls.photons = acc.N; ls.photonsTotal = chunkFixed ? N : -1;
+                        ls.photonsBase = resumedN;
                         ls.batches = chunkFixed ? -1 : batches;
                         ls.noisePct = noisePct; ls.noiseTarget = chunkFixed ? 0.0 : noiseTarget; ls.why = why;
                         liveWindowUpdate(disp, (double)acc.N, manualExposure, scene.absolute, liveStatusText(ls).c_str());
@@ -24918,6 +24929,7 @@ static int run(int argc, char** argv) {
         std::vector<Film> acc(nc);
         for (int c = 0; c < nc; ++c) { acc[c].resX = rxs[c]; acc[c].resY = rys[c]; acc[c].alloc(); }
         long long accN = 0;
+        long long resumedN = 0;   // what -resume loaded, for the window's rate
         EnergyReport accE;
 
         const bool progressive   = timeBudgetSec > 0.0 || runForever || noiseTarget > 0.0;
@@ -24938,6 +24950,7 @@ static int run(int argc, char** argv) {
             if (ok && n0 > 0) {
                 for (int c = 0; c < nc; ++c) acc[c] = cks[c].film;
                 accN = n0; accE = cks[0].energy;
+                resumedN = n0;
                 std::printf("[resume] loaded shared model-%c group (%d cameras): %lld photons accumulated so far\n",
                             groupMode, nc, accN);
             } else if (n0 > 0) {
@@ -25142,6 +25155,7 @@ static int run(int argc, char** argv) {
                             ls.tag = chunkFixed ? "live" : runForever ? "forever" : timeBudgetSec > 0.0 ? "time" : "noise";
                             ls.elapsed = elapsed; ls.budgetSec = timeBudgetSec;
                             ls.photons = accN; ls.photonsTotal = chunkFixed ? N : -1;
+                            ls.photonsBase = resumedN;
                             ls.batches = chunkFixed ? -1 : batches;   // same fields as the single-camera loop
                             ls.noisePct = noisePct; ls.noiseTarget = chunkFixed ? 0.0 : noiseTarget; ls.why = why;
                             g_windowFrame = sharedFrame;
