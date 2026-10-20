@@ -14942,35 +14942,51 @@ static double filmNoisePct(const Film& f) {
 // their per-driver wording ("[spp] ...", "[time] ...", "[gather] ..."); only the window is
 // shaped by this.
 //   [tag] elapsed[ / budget] · photons[ / total] · spp[ / total] · batches · ~noise% [(target)] · why
+//
+// A TRAILING RATE: the slope of a growing count over the last `win` seconds of real samples,
+// for the title's throughput and the stage progress's rate and ETA. A sample is recorded only
+// when the count changes and the rate is HELD between changes, so a coarse unit of work (a
+// gather slice, a 1-spp chunk) still yields a rate and it never decays toward zero while the
+// next unit is in flight. Trimming keeps the oldest sample that is at least `win` old, so the
+// window settles at win..win+one-update and never collapses to one update.
+//
+// Each render owns one and `start`s it with the count it begins from (what -resume loaded, 0
+// otherwise), so the rate exists from the first advance and never counts loaded work. Left
+// unstarted, there is no rate until two samples exist (the stage progress wants that: its first
+// sample is a probe slice whose rate was never true of anything). A count that DROPS is a new
+// frame's film: the history restarts from the previous sample's time at zero.
+struct TrailingRate {
+    TrailingRate() = default;   // a 60 s window
+    explicit TrailingRate(double windowSec) : win(windowSec) {}
+    void start(double t, double count) { hist.clear(); hist.emplace_back(t, count); rate = 0.0; }
+    // Record `count` at time `t` (seconds on the owner's clock) and return the rate, 0 if none yet.
+    double add(double t, double count) {
+        if (!hist.empty() && count < hist.back().second) start(hist.back().first, 0.0);
+        if (!hist.empty() && count == hist.back().second) return rate;
+        hist.emplace_back(t, count);
+        while (hist.size() >= 2 && t - hist[1].first >= win) hist.pop_front();
+        const double span = t - hist.front().first;
+        if (span > 1e-3 && count > hist.front().second) rate = (count - hist.front().second) / span;
+        return rate;
+    }
+    double rate = 0.0;
+private:
+    double win = 60.0;
+    std::deque<std::pair<double, double>> hist;
+};
+
 struct LiveStatus {
     const char* tag = "live";        // the budget in force: live | spp | time | noise | forever | gather
     double elapsed = 0.0, budgetSec = 0.0;
     long long photons = -1, photonsTotal = -1, spp = -1, sppTotal = -1, batches = -1;
+    // The driver's own TrailingRate readings (0 = none): photons/s is shown when there is one,
+    // else spp/s.
+    double photonRate = 0.0, sppRate = 0.0;
     double noisePct = -1.0, noiseTarget = 0.0;
     const char* noiseNote = "";      // shown in the noise slot when there is no noise figure
                                      // ("deterministic" for a whitted preview)
     const char* why = "";            // "(stopping)", "(noise target met)", ...
 };
-// The rate of `count` over the trailing ~60 s of the updates that reported it (`elapsed` is the
-// reporting driver's clock), for liveStatusText; `which` keeps the photon and spp histories
-// apart. A history restarts when the clock goes backwards (a new driver, frame or session) or the
-// count drops (a new frame's film). -1 until it spans two updates at least 0.5 s apart, or while
-// the count is not growing.
-static double trailingRate(long long count, double elapsed, int which) {
-    static std::deque<std::pair<double, double>> hist[2];
-    static std::mutex mu;   // drivers report from the main thread, but the GPU callbacks need not
-    std::lock_guard<std::mutex> lk(mu);
-    auto& h = hist[which];
-    if (count < 0) { h.clear(); return -1.0; }
-    const double c = (double)count;
-    if (!h.empty() && (elapsed < h.back().first || c < h.back().second)) h.clear();
-    if (h.empty() || elapsed > h.back().first) h.emplace_back(elapsed, c);
-    else h.back().second = c;
-    while (h.size() > 2 && elapsed - h[1].first >= 60.0) h.pop_front();
-    if (h.size() < 2) return -1.0;
-    const double dt = h.back().first - h.front().first, dc = h.back().second - h.front().second;
-    return (dt >= 0.5 && dc > 0.0) ? dc / dt : -1.0;
-}
 static std::string liveStatusText(const LiveStatus& s) {
     const std::string sep = "  \xC2\xB7  ";
     std::string t = "[" + std::string(s.tag) + "] " + humanDur(s.elapsed);
@@ -14986,18 +15002,13 @@ static std::string liveStatusText(const LiveStatus& s) {
         t += " spp";
     }
     if (s.batches >= 0) t += sep + std::to_string(s.batches) + (s.batches == 1 ? " batch" : " batches");
-    // Throughput, derived here so every driver reports it the same way: photons/s while the
-    // photon count is growing (the forward passes), else spp/s (the gathers, and mode M, whose
-    // photon count is fixed while it gathers). It is the change over the trailing ~60 s of
-    // updates, not count / elapsed, so it needs nothing from the driver: samples a -resume
-    // loaded, a map traced before the gather, and setup before the first update are not this
-    // session's work and do not enter it.
+    // Throughput: photons/s from a forward pass, else spp/s (the gathers; mode M's photon count is
+    // fixed while it gathers, so it reports no photon rate). Each driver measures its own over a
+    // trailing window (TrailingRate), never count / elapsed, which counted what -resume loaded.
     {
-        const double rPh = trailingRate(s.photons, s.elapsed, 0);
-        const double rSpp = trailingRate(s.spp, s.elapsed, 1);
         char rb[48];
-        if (rPh > 0.0)       { std::snprintf(rb, sizeof rb, "%s/s", humanCount(rPh).c_str()); t += sep + rb; }
-        else if (rSpp > 0.0) { std::snprintf(rb, sizeof rb, "%.3g spp/s", rSpp); t += sep + rb; }
+        if (s.photonRate > 0.0)   { std::snprintf(rb, sizeof rb, "%s/s", humanCount(s.photonRate).c_str()); t += sep + rb; }
+        else if (s.sppRate > 0.0) { std::snprintf(rb, sizeof rb, "%.3g spp/s", s.sppRate); t += sep + rb; }
     }
     if (s.noisePct >= 0.0) {
         char nb[64];
@@ -15020,11 +15031,13 @@ static std::string liveStatusText(const LiveStatus& s) {
 // (g_windowFrame), so its label (main's frameLabel) is stamped here rather than folded into
 // the progress text.
 static std::string pmGatherStatus(const Film& f, long long sppDone, long long sppTotal,
-                                  const std::string& frame, long long photons, double elapsed) {
+                                  const std::string& frame, long long photons, double elapsed,
+                                  double sppRate) {
     g_windowFrame = frame;
     LiveStatus s;
     s.tag = "gather"; s.elapsed = elapsed;
     s.photons = photons; s.spp = sppDone; s.sppTotal = sppTotal;
+    s.sppRate = sppRate;   // the caller's TrailingRate; the photons were traced before the gather
     s.noisePct = filmNoisePct(f);
     return liveStatusText(s);
 }
@@ -15040,32 +15053,20 @@ static std::string pmGatherStatus(const Film& f, long long sppDone, long long sp
 static StageProgress makeStageProgress(int w, int h, double expComp = 1.0,
                                        bool absolute = false) {
     using clk = std::chrono::steady_clock;
-    // `hist` is a TRAILING rate window held as a ring of real (time, done) samples: the rate
-    // is the slope between the newest sample and the oldest one still inside the window.
-    //
-    // It replaces a two-bucket (mark/prev) scheme that rolled one bucket into the other every
-    // kRateWin seconds. That was not wrong arithmetically — both buckets always held genuine
-    // samples — but its window was only ever kRateWin..2*kRateWin wide, and `done` advances
-    // once per gather SLICE, which on gallery_rain is ~12 s. A 15 s window was therefore one
-    // to two updates wide, so it did not average anything: it reported the cost of whichever
-    // scanline band the gather happened to be crossing. Measured on the baseline arm it
-    // printed 5.3k/s, 1.0k/s, 280/s, 916/s across four log lines whose segment averages were
-    // 759, 589 and 675/s. The flapping was real signal, not noise — and useless, because the
-    // question a progress line answers is "how long for the REST of the frame", which no
-    // single band can predict.
+    // The rate is a TrailingRate (60 s, its default): wide enough to span several gather slices
+    // (and so several scanline bands) even when a slice costs ~12 s, as on gallery_rain, and
+    // still short enough to abandon the opening sky probe within a minute of leaving it. A
+    // window one or two slices wide reports whichever band the gather is crossing (5.3k/s,
+    // 1.0k/s, 280/s, 916/s on four lines whose averages were 759, 589 and 675/s), and the
+    // question a progress line answers is how long the REST of the frame will take.
     struct Ticker {
         clk::time_point t0 = clk::now(), lastWin{}, lastLog{};
-        std::deque<std::pair<clk::time_point, long long>> hist;
-        long long lastDone = -1;
-        double rate = 0.0;      // last good trailing rate, held between advances
+        TrailingRate tr;   // left unstarted: no rate until two samples (see TrailingRate)
         // Adaptive repaint gap — see kDuty below. Starts at the nominal 4 Hz and is widened
         // to whatever keeps painting down to a fixed fraction of the work being reported on.
         double winGap = 0.25;
         clk::time_point probeT{};   // when wantFilm() last said yes; start of the draw's cost
     };
-    // Wide enough to span several slices (and so several bands) even when a slice costs ~12 s,
-    // and still short enough to abandon the opening sky probe within a minute of leaving it.
-    constexpr double kRateWin = 60.0;
     // Ceiling on the share of a phase's wall clock the live preview may consume.
     //
     // This exists because a progress display that changes what it displays is not a display,
@@ -15173,17 +15174,7 @@ static StageProgress makeStageProgress(int w, int h, double expComp = 1.0,
         // and the throttles are a display cadence; letting a skipped repaint also skip a
         // measurement would silently thin the history on any phase that reports faster than
         // 4 Hz, for no benefit — recording one (time, done) pair costs nothing.
-        if (total > 0 && done != tk->lastDone) {
-            tk->lastDone = done;
-            tk->hist.emplace_back(now, done);
-            while (tk->hist.size() >= 2 &&
-                   std::chrono::duration<double>(now - tk->hist[1].first).count() >= kRateWin)
-                tk->hist.pop_front();
-            const double span = tk->hist.size() >= 2
-                ? std::chrono::duration<double>(now - tk->hist.front().first).count() : 0.0;
-            if (span > 1e-3 && done > tk->hist.front().second)
-                tk->rate = (double)(done - tk->hist.front().second) / span;
-        }
+        if (total > 0) tk->tr.add(elapsed, (double)done);
         if (!wantWin && !wantLog) return;
         char b[220];
         if (total > 0) {
@@ -15199,21 +15190,10 @@ static StageProgress makeStageProgress(int w, int h, double expComp = 1.0,
             // rate once the gather reached the cloud (3205 beams per probe ray) was 280/s,
             // 45x slower. The cumulative average was still reporting 677/s six minutes in
             // and its ETA had climbed 986s -> 17974s without converging, every value of it
-            // wrong and wrong in the flattering direction. A trailing window reaches the
-            // real number in about a minute and then tracks it.
-            //
-            // The window advances on DATA, not on wall clock. report() is called at the
-            // window cadence, but `done` only moves when a unit of work lands, so sampling on
-            // time alone would keep capturing spans with no progress in them at all. Recording
-            // only on an advance makes the window self-scaling: it is always at least one
-            // update wide however coarse the updates are, and the rate is HELD between
-            // advances rather than decaying toward zero while a slice is in flight.
-            //
-            // Trimming keeps the OLDEST sample that is still at least kRateWin old, so the
-            // window settles at kRateWin..kRateWin+one-update and never collapses to a single
-            // update. The front is dropped only while the sample behind it is old enough to
-            // take over, which is what guarantees that. (Sampled above, before the throttles.)
-            const double rate = tk->rate;
+            // wrong and wrong in the flattering direction. A trailing window (TrailingRate,
+            // sampled above, before the throttles) reaches the real number in about a minute
+            // and then tracks it.
+            const double rate = tk->tr.rate;
             // Until two samples exist there is no trailing rate, and the honest thing to
             // print is that there isn't one. Printing `0/s, ~0s left` would read as a stalled
             // render, and printing the one-sample cumulative average instead would reinstate
@@ -16175,11 +16155,14 @@ static int runSppProgressive(
 
     SppProgress prog;
     prog.sampleBase = baseSpp;   // bias fresh seeds past the loaded samples
+    TrailingRate sppMeter;
+    sppMeter.start(0.0, (double)baseSpp);   // this session's rate, not the loaded samples'
     prog.report = [&](const Film& film, long long sppDone, bool final) -> bool {
         long long totalSpp = baseSpp + sppDone;
         finalSpp = totalSpp;
         double elapsed   = std::chrono::duration<double>(clk::now() - t0).count();
         double sinceSave = std::chrono::duration<double>(clk::now() - lastSave).count();
+        const double sppRate = sppMeter.add(elapsed, (double)totalSpp);
         // Every pixel receives exactly totalSpp samples, so the Monte-Carlo relative error
         // ~ 1/sqrt(samples) gives an honest graininess ballpark straight from the count.
         double noisePct = totalSpp > 0 ? 100.0 / std::sqrt((double)totalSpp) : 0.0;
@@ -16246,6 +16229,7 @@ static int runSppProgressive(
                 ls.tag = runForever ? "forever" : timeBudgetSec > 0.0 ? "time" : noiseTarget > 0.0 ? "noise" : "spp";
                 ls.elapsed = elapsed; ls.budgetSec = timeBudgetSec;
                 ls.spp = totalSpp; ls.sppTotal = (ls.tag[0] == 's') ? baseSpp + sppReq : -1;
+                ls.sppRate = sppRate;
                 ls.noisePct = g_whitted ? -1.0 : noisePct;   // whitted is deterministic: no noise figure,
                 ls.noiseNote = g_whitted ? "deterministic" : "";   // and the title says so in that slot
                 ls.noiseTarget = noiseTarget; ls.why = why;
@@ -16361,6 +16345,9 @@ static int runCompositeProgressive(
     // -n / -spp under -resume ADD that many to what the checkpoint holds (REFERENCE.md, as modes
     // R/D/J do): the fixed budgets' totals are counted from what was loaded.
     const long long endN = acc.N + Nreq, endSpp = acc.spp + sppReq;
+    TrailingRate phMeter, sppMeter;   // this session's rates, from what was loaded
+    phMeter.start(0.0, (double)acc.N);
+    sppMeter.start(0.0, (double)acc.spp);
 
     for (;;) {
         long long dSpp = batchSpp;
@@ -16412,6 +16399,8 @@ static int runCompositeProgressive(
         double elapsed   = std::chrono::duration<double>(clk::now() - t0).count();
         double sinceSave = std::chrono::duration<double>(clk::now() - lastSave).count();
         double noisePct  = acc.spp > 0 ? 100.0 / std::sqrt((double)acc.spp) : 0.0;
+        const double phRate  = phMeter.add(elapsed, (double)acc.N);
+        const double sppRate = sppMeter.add(elapsed, (double)acc.spp);
         bool stopped  = g_stopRequested != 0;
         bool timeUp   = (!runForever && timeBudgetSec > 0.0 && elapsed >= timeBudgetSec);
         bool noiseMet = (noiseTarget > 0.0 && acc.spp > 0 && noisePct <= noiseTarget);
@@ -16449,6 +16438,10 @@ static int runCompositeProgressive(
                 ls.elapsed = elapsed; ls.budgetSec = timeBudgetSec;
                 ls.photons = acc.N; ls.photonsTotal = (ls.tag[0] == 's') ? endN : -1;
                 ls.spp = acc.spp;   ls.sppTotal     = (ls.tag[0] == 's') ? endSpp : -1;
+                // Once a fixed photon budget is met only spp grows: show its rate, not the
+                // photons' held one.
+                ls.photonRate = (budgeted || acc.N < endN) ? phRate : 0.0;
+                ls.sppRate = sppRate;
                 ls.noisePct = noisePct; ls.noiseTarget = noiseTarget; ls.why = why;
                 liveWindowUpdate(comp, 1.0, manualExposure, absolute, liveStatusText(ls).c_str());
             }
@@ -18190,9 +18183,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // path does (one runBatch(N)), so it counts from what the checkpoint held; and the last
         // chunk is clamped so the render stops at exactly that total.
         const long long endN = acc.N + N;
+        TrailingRate phMeter;
+        phMeter.start(0.0, (double)acc.N);   // this session's rate, from what was loaded
         for (;;) {
             runBatch((chunkFixed && N > 0) ? std::min(batchN, endN - acc.N) : batchN); ++batches;
             double elapsed   = std::chrono::duration<double>(clk::now() - t0).count();
+            const double phRate = phMeter.add(elapsed, (double)acc.N);
             double sinceSave = std::chrono::duration<double>(clk::now() - lastSave).count();
             bool stopped = g_stopRequested != 0;
             bool timeUp  = (!runForever && timeBudgetSec > 0.0 && elapsed >= timeBudgetSec);
@@ -18256,6 +18252,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         ls.tag = chunkFixed ? "live" : runForever ? "forever" : timeBudgetSec > 0.0 ? "time" : "noise";
                         ls.elapsed = elapsed; ls.budgetSec = timeBudgetSec;
                         ls.photons = acc.N; ls.photonsTotal = chunkFixed ? endN : -1;
+                        ls.photonRate = phRate;
                         ls.batches = chunkFixed ? -1 : batches;
                         ls.noisePct = noisePct; ls.noiseTarget = chunkFixed ? 0.0 : noiseTarget; ls.why = why;
                         liveWindowUpdate(disp, (double)acc.N, manualExposure, scene.absolute, liveStatusText(ls).c_str());
@@ -25116,9 +25113,12 @@ static int run(int argc, char** argv) {
             // A chunked -n's total counts from what -resume loaded, and the last chunk is clamped
             // to it (the single-camera loop's endN).
             const long long endN = accN + N;
+            TrailingRate phMeter;
+            phMeter.start(0.0, (double)accN);   // this session's rate, from what was loaded
             for (;;) {
                 runBatch((chunkFixed && N > 0) ? std::min(batchN, endN - accN) : batchN); ++batches;
                 double elapsed   = std::chrono::duration<double>(clk::now() - t0).count();
+                const double phRate = phMeter.add(elapsed, (double)accN);
                 double sinceSave = std::chrono::duration<double>(clk::now() - lastSave).count();
                 bool stopped = g_stopRequested != 0;
                 bool timeUp  = (!runForever && timeBudgetSec > 0.0 && elapsed >= timeBudgetSec);
@@ -25184,6 +25184,7 @@ static int run(int argc, char** argv) {
                             ls.tag = chunkFixed ? "live" : runForever ? "forever" : timeBudgetSec > 0.0 ? "time" : "noise";
                             ls.elapsed = elapsed; ls.budgetSec = timeBudgetSec;
                             ls.photons = accN; ls.photonsTotal = chunkFixed ? endN : -1;
+                            ls.photonRate = phRate;
                             ls.batches = chunkFixed ? -1 : batches;   // same fields as the single-camera loop
                             ls.noisePct = noisePct; ls.noiseTarget = chunkFixed ? 0.0 : noiseTarget; ls.why = why;
                             g_windowFrame = sharedFrame;
@@ -25348,12 +25349,16 @@ static int run(int argc, char** argv) {
                     // spends a quarter of an hour per spp is indistinguishable in a log from
                     // one that has wedged. 30 s matches the StageProgress log cadence.
                     auto lastEcho = std::make_shared<std::chrono::steady_clock::time_point>();
-                    liveProg.report = [&, liveExp, lastEcho](const Film& f, long long sppDone, bool) -> bool {
+                    // One meter for the group: a new frame's spp drops, which restarts it.
+                    auto gMeter = std::make_shared<TrailingRate>();
+                    gMeter->start(0.0, 0.0);
+                    liveProg.report = [&, liveExp, lastEcho, gMeter](const Film& f, long long sppDone, bool) -> bool {
                         const auto now = std::chrono::steady_clock::now();
                         const double el = std::chrono::duration<double>(now - gStart).count();
                         const size_t gf = std::min(gatherFrame, idx.size() - 1);
                         const std::string st = pmGatherStatus(
-                            f, sppDone, spp, frameLabel(toRender[idx[gf]], gf + 1, idx.size()), N, el);
+                            f, sppDone, spp, frameLabel(toRender[idx[gf]], gf + 1, idx.size()), N, el,
+                            gMeter->add(el, (double)sppDone));
                         if (g_showWindow)
                             liveWindowUpdate(f, (double)sppDone, liveExp, scene.absolute, st.c_str());
                         if (preview) ansiPreview(f, (double)sppDone, liveExp, st.c_str());
@@ -25794,13 +25799,16 @@ static int run(int argc, char** argv) {
             // untouched).
             SppProgress liveProg;
             const auto gStart = std::chrono::steady_clock::now();
+            TrailingRate fMeter;          // this frame's gather rate
+            fMeter.start(0.0, 0.0);
             if (g_showWindow) {
                 const double liveExp = rc.exposure;
                 liveProg.report = [&, liveExp](const Film& pf, long long sppDone, bool) -> bool {
                     const double el = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - gStart).count();
                     liveWindowUpdate(pf, (double)sppDone, liveExp, scene.absolute,
-                        pmGatherStatus(pf, sppDone, spp, frameLabel(rc, k + 1, idx.size()), N, el).c_str());
+                        pmGatherStatus(pf, sppDone, spp, frameLabel(rc, k + 1, idx.size()), N, el,
+                                       fMeter.add(el, (double)sppDone)).c_str());
                     return g_stopRequested != 0;   // window closed / -stop -> stop after this chunk
                 };
             }

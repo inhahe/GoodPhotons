@@ -8805,11 +8805,15 @@ as the one at fault.
   not exactly one flight adds the run position. `-frame-label` overrides it for loom, which
   renders one frame per process and alone knows the sequence. **The progress text is one format for every driver** too:
   each fills a `LiveStatus` (tag, elapsed, budget, photons, spp, batches, noise, target,
-  reason) and `liveStatusText()` prints the fields in a fixed order with a derived
-  throughput — `[time] 0:58 / 1:00  ·  12.3M / 40.0M photons  ·  8 / 32 spp  ·  245.1k/s  ·
+  reason, and the throughput the driver measured) and `liveStatusText()` prints the fields
+  in a fixed order — `[time] 0:58 / 1:00  ·  12.3M / 40.0M photons  ·  8 / 32 spp  ·  245.1k/s  ·
   ~8.84% noise (target 2%)  ·  (stopping)` — leaving out only what a driver has no value
   for (a backward mode has no photons) and never anything it does know. The console lines
   keep their older per-driver wording; the window is the thing that was inconsistent.
+  The throughput is each driver's own `TrailingRate` (0.389.3), the 60 s trailing window the
+  stage progress also uses: started at the count the render begins from (what `-resume`
+  loaded), so it never counts loaded work, and owned per render, so one camera's history
+  cannot leak into the next. `count / elapsed` read a resumed 0.5 spp/s render as hundreds.
   `backendLabel(gpu, nThreads)` renders `GPU (NVIDIA GeForce RTX 4090)` (the real
   `cudaDeviceName()`, so a multi-GPU box says *which*) or `CPU (12 threads)`, and it is
   stamped into `g_windowBackend` **where the device is actually resolved**, i.e. after
