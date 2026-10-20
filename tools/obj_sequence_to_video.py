@@ -136,14 +136,16 @@ def find_ftrace(explicit):
         if os.path.exists(explicit):
             return explicit
         sys.exit(f"ftrace not found at --ftrace path: {explicit}")
-    # Prefer a built binary in the repo; fall back to PATH.
-    cands = []
-    for sub in ("build_cuda2", "build_cuda", "build"):
-        for exe in ("ftrace.exe", "ftrace"):
-            cands.append(os.path.join(ROOT, sub, "bin", exe))
-    for c in cands:
-        if os.path.exists(c):
-            return c
+    # The repo-root binary build.bat installs after every build; else the newest build*/bin
+    # one (a fixed list of build directories goes stale when build.bat moves to a new one);
+    # else PATH.
+    for exe in ("ftrace.exe", "ftrace"):
+        if os.path.isfile(os.path.join(ROOT, exe)):
+            return os.path.join(ROOT, exe)
+    cands = [c for exe in ("ftrace.exe", "ftrace")
+             for c in glob.glob(os.path.join(ROOT, "build*", "bin", exe)) if os.path.isfile(c)]
+    if cands:
+        return max(cands, key=os.path.getmtime)
     onpath = shutil.which("ftrace")
     if onpath:
         return onpath

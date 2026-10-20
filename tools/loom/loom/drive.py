@@ -37,17 +37,15 @@ def repo_root() -> Path:
 
 
 def find_ftrace() -> Path:
-    """Locate the newest built ftrace.exe under the repo's build dirs."""
+    """The repo-root ftrace.exe, which build.bat installs after every build; else the newest
+    build*/bin/ftrace.exe. A fixed list of build directories goes stale whenever build.bat moves
+    to a new one, and then silently renders with an old binary."""
     root = repo_root()
-    cands = [p for p in [
-        root / "build" / "bin" / "ftrace.exe",
-        root / "build_cuda" / "bin" / "ftrace.exe",
-        root / "build_cuda2" / "bin" / "ftrace.exe",
-    ] if p.exists()]
+    if (root / "ftrace.exe").is_file():
+        return root / "ftrace.exe"
+    cands = [p for p in root.glob("build*/bin/ftrace.exe") if p.is_file()]
     if not cands:
-        cands = list(root.glob("**/ftrace.exe"))
-    if not cands:
-        raise FileNotFoundError("ftrace.exe not found; build the renderer first")
+        raise FileNotFoundError("ftrace.exe not found; build the renderer first (build.bat)")
     return max(cands, key=lambda p: p.stat().st_mtime)
 
 

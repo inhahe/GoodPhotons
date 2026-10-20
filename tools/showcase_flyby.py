@@ -30,7 +30,17 @@ from pathlib import Path
 
 # Repo root = parent of this tools/ dir, so the script works from any cwd.
 ROOT = Path(__file__).resolve().parent.parent
-FTRACE = ROOT / "build" / "bin" / "ftrace.exe"
+def _find_ftrace() -> Path:
+    """The repo-root ftrace.exe, which build.bat installs after every build; else the newest
+    build*/bin/ftrace.exe. (A fixed build directory goes stale when build.bat moves to a new
+    one: this script ran a July binary from build/bin until 2026-10-20.)"""
+    if (ROOT / "ftrace.exe").is_file():
+        return ROOT / "ftrace.exe"
+    cands = [p for p in ROOT.glob("build*/bin/ftrace.exe") if p.is_file()]
+    return max(cands, key=lambda p: p.stat().st_mtime) if cands else ROOT / "ftrace.exe"
+
+
+FTRACE = _find_ftrace()
 DEFAULT_SCENE = "scenes/gallery_settled.ftsl"
 DEFAULT_CAMERA = "fly"          # the camera_curve path base name in the scene
 FRAME_DIR = ROOT / "png" / "showcase_fly"   # flyby series gets its own subdir

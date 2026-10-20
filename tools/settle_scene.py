@@ -379,7 +379,7 @@ def find_ftrace():
     """Locate the ftrace binary, PREFERRING the repo-root copy that build.bat installs.
 
     Order matters: stale CMake build dirs from earlier configurations hang around (this
-    repo has both `build_cuda` and the current `build_cuda2`), and picking one of those
+    repo has `build_cuda` and `build_cuda2` beside the current one), and picking one of those
     first silently polygonises with a binary that can be weeks out of date — so a scene
     using any newer feature meshes wrongly, or not at all, with no error. `build.bat`
     always copies the freshly built exe to the repo root, so that is the authoritative
