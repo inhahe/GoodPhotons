@@ -310,6 +310,10 @@ void cudaSetJHostLight(bool on);
 // mode (ROUTE_D / ROUTE_J), whether any medium routes J, and each mode's sample multiplier
 // (`mode_spp`). runRender sets it per D/J render.
 void cudaSetRouting(int on, int routeDefault, int anyMedJ, double sppD, double sppJ);
+// Pin the spp-progressive GPU renders' chunks to 1 spp instead of sizing them by timing, so
+// whatever a chunk draws (mode J's device surface photons, salted by the chunk's first sample)
+// lands on the same samples in every render. Set by mode J under `-beamepochs`, cleared after.
+void cudaSetFixedChunks(bool on);
 // JSPEC's dispersive window (0.386.2, bdpt g_jDispWinNm / g_jDispAll): its full width in nm, and
 // whether dispersive refraction and a real lens open it as a grating's non-zero order does.
 void cudaSetJDisp(double winNm, int all);

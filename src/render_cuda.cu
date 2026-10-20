@@ -21755,6 +21755,13 @@ bool cudaBdptSupported(const Scene& scene) {
 // wrong image: its lattice is indexed by absolute sample, so `3 spp + resume 5` produced
 // samples {0,1,2} ∪ {0..4} instead of {0..7} — measurably different from a plain 8 spp
 // (max channel difference 163/255 on the loom jumping_jack frame that found this).
+//
+// cudaSetFixedChunks(true) pins every chunk to 1 spp, so the chunk boundaries -- and with them
+// anything a launch draws per chunk, as mode J's device surface-photon map is, salted by the
+// chunk's first sample -- fall on the same samples in every render rather than wherever the
+// timing put them (main.cpp `-beamepochs`).
+static bool g_fixedChunks = false;
+void cudaSetFixedChunks(bool on) { g_fixedChunks = on; }
 template <class LaunchFn, class DownloadFn>
 static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
                          LaunchFn&& launch, DownloadFn&& download) {
@@ -21766,7 +21773,7 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
     //   FTRACE_CHUNK_DEBUG=1 log each chunk's size and wall time
     // The GPU chunker went without these, which is exactly why a 320x180 4-spp frame that
     // would not finish in 7 minutes could not be told apart from a deadlock without a debugger.
-    long long forcedChunk = 0;
+    long long forcedChunk = g_fixedChunks ? 1 : 0;
     if (const char* e = std::getenv("FTRACE_CHUNK_SPP")) forcedChunk = std::atoll(e);
     const bool chunkDebug = [] { const char* e = std::getenv("FTRACE_CHUNK_DEBUG");
                                  return e && *e && std::strcmp(e, "0"); }();

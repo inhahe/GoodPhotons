@@ -2112,6 +2112,21 @@ worth stating because they are what make the change safe rather than merely plau
   loops (one map, advance every camera's epoch, rebuild), which also changes each frame's
   write/checkpoint cadence; that half of PERF is still open.
 
+**`-beamepochs K` gives a flyby a refreshing light side that is still coherent (0.391.0).** The
+problem with the wall-clock refresh in a flyby is not cost but *flicker*: each frame averages
+whichever realizations its own timing fitted, so the beam streaks and caustic photons land
+somewhere new every frame — on `gallery_rain` at 64 spp, after `-oidn -denoise`, the rain curtain
+differs by 7.4 (RMS, display 0–255, 4×4 downsample) between two independent renders of one frame,
+and still 4.6 at 256 spp. Freezing fixes the flicker (2.3: the camera noise alone) but one
+realization is a static rainbow-barred curtain. `-beamepochs` splits the frame's spp into K
+equal epochs, epoch *e* drawn under salt *e* (the same `buildLightSide(e, saltOff)` the refresh
+uses; only the epoch's *end* moves from the clock to the sample count, `renderChunked`). Since
+the light side is view-independent, every frame averages the same K realizations: as coherent
+as the freeze, as averaged as the refresh, at the refresh's cost. Two details keep it exact:
+the device's surface-photon map is redrawn per *chunk* salted by the chunk's first sample, so
+the GPU chunks are pinned to 1 spp (`cudaSetFixedChunks`) and fall on the same samples in every
+frame; and it needs a fixed `-spp` — a `-time`/`-noise` budget has no total to split.
+
 **Mode `M` has the same disease, and got the same cure in 0.252.0** (M-FROZEN in known-issues.md).
 A single-camera mode-`M` render builds its photon map, caustic map and beam map once and then
 spends the whole budget growing camera spp, so the light-side half of its error is a floor — and

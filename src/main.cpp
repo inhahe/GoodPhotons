@@ -12569,6 +12569,20 @@ static double    g_beamRefreshFrac = 0.10;
 // Was `-beamrefresh` named on the command line? An explicit value must win over the mode-J
 // device-light-side retune below, which is a DEFAULT and not an override.
 static bool      g_beamRefreshSet  = false;
+// `-beamepochs K` (alias `-lightepochs`): mode J's refresh with its epochs fixed by SAMPLE COUNT
+// instead of by the wall clock -- the render's spp split into K equal epochs, epoch e drawing the
+// light-side realization of salt e. The light side is view-independent (see JLightCache), so
+// every camera of a flyby then averages the SAME K realizations: from frame to frame the
+// light-side noise holds still in the world instead of flickering, while each frame still
+// averages K of them. The wall-clock refresh cannot give that -- how many epochs fit, and so
+// which realizations a frame gets, depends on how fast that frame happened to render -- and
+// -beamfreeze, which can, is K = 1 and looks it: one realization of gallery_rain's rain shaft
+// is a few thousand saturated single-wavelength streaks. Measured there at 64 spp (seed-to-seed
+// RMS, display 0-255, 4x4 downsample, after -oidn -denoise): the curtain flickers 7.4 refreshed
+// and 2.3 with the light side held still. 0 = the wall-clock refresh. Needs a fixed -spp; the
+// GPU chunks are pinned to 1 spp while it is on, so the device's per-chunk surface-photon
+// redraws (salted by the chunk's first sample) also fall on the same samples in every frame.
+static int       g_beamEpochs      = 0;
 // The retuned value for a mode-J render whose light side is on the device (0.272.4). Measured
 // 1.56x better than 0.10 on `_fog_thick` whole-frame variance, with 0.60 worse than 0.30, so the
 // optimum is interior. NOT applied to mode M or to CPU mode J: neither gets the device tree, so
@@ -17621,7 +17635,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // merely correlates with it is what makes those three impossible rather than
             // fixed: the `-n` sentence can now only be reached from epoch 0, where it is true.
             if (!first) {
-                if (epoch == 1)
+                if (epoch == 1 && g_beamEpochs > 0)
+                    std::printf("mode J: light-side refresh — redrawing %lld subpaths under the "
+                                "next of %d fixed salts and averaging the realizations "
+                                "(-beamepochs) ...\n", Nepoch, g_beamEpochs);
+                else if (epoch == 1)
                     std::printf("mode J: light-side refresh — redrawing %lld subpaths under a "
                                 "fresh salt every ~%.0f%% of the wall clock and averaging the "
                                 "realizations, so the MERGE noise falls with the render too "
@@ -17812,6 +17830,40 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         //   * the outer reporter must always see the WHOLE film, so the live image, the
         //     noise estimate and the .ftbuf checkpoint stay in terms of total spp rather
         //     than resetting to zero at every epoch boundary.
+        // -beamepochs (g_beamEpochs): epochs fixed by sample count, the same K realizations for
+        // every camera. Only meaningful against a fixed -spp: a -time/-noise/-forever budget has
+        // no total to split, and -beamfreeze already holds one realization throughout.
+        const bool budgetedJ   = timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever;
+        const bool fixedEpochs = g_beamEpochs > 0 && !g_beamFreeze && !budgetedJ &&
+                                 (beamsPtr || photonsPtr);
+        if (g_beamEpochs > 0 && !fixedEpochs) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                std::printf("[mode J] -beamepochs ignored: %s\n",
+                            g_beamFreeze ? "-beamfreeze holds one light-side realization throughout"
+                            : budgetedJ  ? "it splits a fixed -spp, and this render has a "
+                                           "-time/-noise/-forever budget instead"
+                                         : "there is no light-side map to redraw");
+            }
+        } else if (fixedEpochs) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                std::printf("mode J: -beamepochs %d: each camera's samples split into %d equal "
+                            "epochs over the same %d light-side realizations, so the light-side "
+                            "noise holds still from frame to frame%s\n",
+                            g_beamEpochs, g_beamEpochs, g_beamEpochs,
+                            useGpu ? " (GPU chunks pinned to 1 spp)" : "");
+            }
+        }
+#ifdef HAVE_CUDA
+        struct FixedChunkScope {
+            bool on;
+            explicit FixedChunkScope(bool v) : on(v) { if (on) cudaSetFixedChunks(true); }
+            ~FixedChunkScope() { if (on) cudaSetFixedChunks(false); }
+        } fixedChunkScope(fixedEpochs && useGpu);
+#endif
         auto renderChunked = [&](long long sppTarget, const SppProgress* prog) -> Film {
             // Nothing to decorrelate (no map => mode D exactly, and gate 1a requires that path
             // stay bit-identical), or the user asked for the historical single map.
@@ -17822,6 +17874,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             long long sppAll = 0;
             bool stopAll = false;
             uint64_t epoch = 0;
+            // Under -beamepochs, epoch e ends once (e+1)/K of the samples are in; else on the clock.
+            const long long nFixed = fixedEpochs ? std::max(1LL, std::min<long long>(g_beamEpochs, sppTarget)) : 0;
+            auto fixedEnd = [&](uint64_t e) { return (sppTarget * (long long)(e + 1)) / nFixed; };
             for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
                 double rebuildSec = 0.0;
                 if (epoch > 0) {
@@ -17906,6 +17961,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     Film comb = f; comb.merge(acc);
                     const long long tot = sppAll + sppDone;
                     if (prog->report(comb, tot, final && tot >= sppTarget)) { stopAll = true; return true; }
+                    if (nFixed) return false;       // a fixed epoch runs its whole share
                     // Not a stop — just the end of this epoch, so the next one draws a new map.
                     return std::chrono::duration<double>(clk::now() - tEpoch).count() >= epochSec;
                 };
@@ -17918,7 +17974,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 // any later non-epoch caller narrates normally.
                 g_gpuQuietRebuild = (epoch != 0);
                 const auto tg = clk::now();
-                Film f = renderEpoch(sppTarget - sppAll, &inner);
+                Film f = renderEpoch((nFixed ? fixedEnd(epoch) : sppTarget) - sppAll, &inner);
                 lsGatherSec += std::chrono::duration<double>(clk::now() - tg).count();
                 g_gpuQuietRebuild = false;
                 if (epochSpp <= 0) break;      // produced nothing; refreshing again cannot help
@@ -19006,6 +19062,11 @@ static void printHelp(const char* prog) {
 "                        (default 0.10; alias -lightrefresh). The epoch length adapts to the\n"
 "                        measured per-epoch overhead, so a heavy scene refreshes rarely and a\n"
 "                        cheap one often. 0 means -beamfreeze\n"
+"  -beamepochs <K>       mode J (alias -lightepochs): refresh in K epochs of a fixed share of\n"
+"                        -spp, epoch e drawing salt e, instead of on the wall clock. Every frame\n"
+"                        of a flyby then averages the SAME K realizations, so the light-side\n"
+"                        noise (beam streaks, caustic photons) holds still instead of\n"
+"                        flickering. Needs a fixed -spp; K ~ spp/8 matches the default's count\n"
 "  -beamblur <frac>      mode-M beam kernel half-width, as a fraction of each MEDIUM'S OWN\n"
 "                        measured mean free path (default 0.01). This is the quality knob:\n"
 "                        the blur is a physical scale independent of the photon count, so\n"
@@ -20642,6 +20703,16 @@ static int run(int argc, char** argv) {
         // one once it nears ~100 links.
         if (!std::strcmp(argv[i], "-checkspherequery")) checkSphereQueryOnly = true;
         else if (!std::strcmp(argv[i], "-no-modes") || !std::strcmp(argv[i], "-nomodes")) g_noObjectModes = true;
+        // -beamepochs K: mode J's light-side epochs fixed by sample count (see g_beamEpochs).
+        else if ((!std::strcmp(argv[i], "-beamepochs") ||
+                  !std::strcmp(argv[i], "-lightepochs")) && i + 1 < argc) {
+            g_beamEpochs = std::atoi(argv[++i]);
+            if (g_beamEpochs < 1) {
+                std::fprintf(stderr, "error: %s wants a count of epochs >= 1 (1 is -beamfreeze)\n",
+                             argv[i - 1]);
+                return 2;
+            }
+        }
         else if (!std::strcmp(argv[i], "-jdispwin") && i + 1 < argc) {
             const double v = std::atof(argv[++i]);
             if (!(v > 0.0)) { std::fprintf(stderr, "-jdispwin wants a width in nm > 0, got '%s'\n", argv[i]); return 1; }
