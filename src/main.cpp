@@ -15423,6 +15423,17 @@ static bool writeCheckpoint(const std::string& outPath, const Checkpoint& c,
 // is missing, malformed, or its identity guard/resolution disagrees with this render
 // (a clear message is printed for the mismatch cases so a stale file never silently
 // poisons the image).
+// Whether `in` holds at least `n` more bytes from its current position, which it keeps: a
+// checkpoint body is sized from its header, so a truncated one is caught before it is read.
+static bool checkpointHasBytes(std::ifstream& in, std::streamoff n) {
+    const std::streampos here = in.tellg();
+    if (here < 0) return false;
+    in.seekg(0, std::ios::end);
+    const std::streampos end = in.tellg();
+    in.seekg(here);
+    return end >= 0 && (std::streamoff)(end - here) >= n;
+}
+
 static bool readCheckpoint(const std::string& outPath, int res, int resY, uint64_t guard,
                            char mode, Checkpoint& c) {
     std::ifstream in(checkpointPath(outPath), std::ios::binary);
@@ -15439,26 +15450,35 @@ static bool readCheckpoint(const std::string& outPath, int res, int resY, uint64
     in.read((char*)&N, 8);
     double en[5] = {0,0,0,0,0}; in.read((char*)en, sizeof en);
     uint64_t g = 0; in.read((char*)&g, 8);
-    if (!in) return false;
+    if (!in) { std::fprintf(stderr, "[resume] checkpoint %s truncated; starting fresh\n",
+                            checkpointPath(outPath).c_str()); return false; }
     if (rx != res || ry != resY || m != (int32_t)(unsigned char)mode || g != guard) {
         std::fprintf(stderr, "[resume] checkpoint %s does not match this render "
                              "(scene/mode/resolution differ); starting fresh\n",
                      checkpointPath(outPath).c_str());
         return false;
     }
-    // Into a local: callers pass their live accumulator, so `c` changes only on success and a
-    // "starting fresh" really starts from what the caller had.
-    Checkpoint r;
-    r.film.resX = rx; r.film.resY = ry; r.film.alloc();
-    r.N = N;
-    r.energy = {en[0], en[1], en[2], en[3], en[4]};
-    in.read((char*)r.film.xyz.data(), r.film.xyz.size() * sizeof(Vec3));
-    in.read((char*)r.film.hits.data(), r.film.hits.size() * sizeof(double));
-    if (!in) { std::fprintf(stderr, "[resume] checkpoint %s truncated; starting fresh\n",
-                            checkpointPath(outPath).c_str()); return false; }
+    // Callers pass their live accumulator, so `c` must not change unless the load succeeds:
+    // a truncated body is caught from the file size before anything is written to it.
+    const std::streamoff body = (std::streamoff)rx * ry * (std::streamoff)(sizeof(Vec3) + sizeof(double));
+    if (!checkpointHasBytes(in, body)) {
+        std::fprintf(stderr, "[resume] checkpoint %s truncated; starting fresh\n",
+                     checkpointPath(outPath).c_str());
+        return false;
+    }
+    c.film.resX = rx; c.film.resY = ry; c.film.alloc();
+    in.read((char*)c.film.xyz.data(), c.film.xyz.size() * sizeof(Vec3));
+    in.read((char*)c.film.hits.data(), c.film.hits.size() * sizeof(double));
+    if (!in) {                        // an I/O error after the size check: leave `c` empty
+        c.film.alloc(); c.N = 0; c.energy = {};
+        std::fprintf(stderr, "[resume] checkpoint %s could not be read; starting fresh\n",
+                     checkpointPath(outPath).c_str());
+        return false;
+    }
+    c.N = N;
+    c.energy = {en[0], en[1], en[2], en[3], en[4]};
     readRadCacheSection(in);          // optional trailing section; absent in older sidecars
     warnIfOtherBuild(checkpointPath(outPath));
-    c = std::move(r);
     return true;
 }
 
@@ -15514,27 +15534,38 @@ static bool readCompositeCheckpoint(const std::string& outPath, int res, int res
     in.read((char*)&N, 8); in.read((char*)&spp, 8);
     double en[5] = {0,0,0,0,0}; in.read((char*)en, sizeof en);
     uint64_t g = 0; in.read((char*)&g, 8);
-    if (!in) return false;
+    if (!in) { std::fprintf(stderr, "[resume] composite checkpoint %s truncated; starting fresh\n",
+                            checkpointPath(outPath).c_str()); return false; }
     if (rx != res || ry != resY || g != guard) {
         std::fprintf(stderr, "[resume] composite checkpoint %s does not match this render "
                              "(scene/resolution differ); starting fresh\n",
                      checkpointPath(outPath).c_str());
         return false;
     }
-    CompositeCheckpoint r;            // a local, committed to `c` only on success (readCheckpoint)
-    r.fwd.resX = rx; r.fwd.resY = ry; r.fwd.alloc();
-    r.ref.resX = rx; r.ref.resY = ry; r.ref.alloc();
-    r.N = N; r.spp = spp;
-    r.energy = {en[0], en[1], en[2], en[3], en[4]};
-    in.read((char*)r.fwd.xyz.data(), r.fwd.xyz.size() * sizeof(Vec3));
-    in.read((char*)r.fwd.hits.data(), r.fwd.hits.size() * sizeof(double));
-    in.read((char*)r.ref.xyz.data(), r.ref.xyz.size() * sizeof(Vec3));
-    in.read((char*)r.ref.hits.data(), r.ref.hits.size() * sizeof(double));
-    if (!in) { std::fprintf(stderr, "[resume] composite checkpoint %s truncated; starting fresh\n",
-                            checkpointPath(outPath).c_str()); return false; }
+    // As readCheckpoint: `c` is the caller's live accumulator, so a truncated body is caught
+    // from the file size before anything is written to it.
+    const std::streamoff body = 2 * (std::streamoff)rx * ry * (std::streamoff)(sizeof(Vec3) + sizeof(double));
+    if (!checkpointHasBytes(in, body)) {
+        std::fprintf(stderr, "[resume] composite checkpoint %s truncated; starting fresh\n",
+                     checkpointPath(outPath).c_str());
+        return false;
+    }
+    c.fwd.resX = rx; c.fwd.resY = ry; c.fwd.alloc();
+    c.ref.resX = rx; c.ref.resY = ry; c.ref.alloc();
+    in.read((char*)c.fwd.xyz.data(), c.fwd.xyz.size() * sizeof(Vec3));
+    in.read((char*)c.fwd.hits.data(), c.fwd.hits.size() * sizeof(double));
+    in.read((char*)c.ref.xyz.data(), c.ref.xyz.size() * sizeof(Vec3));
+    in.read((char*)c.ref.hits.data(), c.ref.hits.size() * sizeof(double));
+    if (!in) {                        // an I/O error after the size check: leave `c` empty
+        c.fwd.alloc(); c.ref.alloc(); c.N = 0; c.spp = 0; c.energy = {};
+        std::fprintf(stderr, "[resume] composite checkpoint %s could not be read; starting fresh\n",
+                     checkpointPath(outPath).c_str());
+        return false;
+    }
+    c.N = N; c.spp = spp;
+    c.energy = {en[0], en[1], en[2], en[3], en[4]};
     readRadCacheSection(in);          // optional trailing section; absent in older sidecars
     warnIfOtherBuild(checkpointPath(outPath));
-    c = std::move(r);
     return true;
 }
 
@@ -16406,7 +16437,12 @@ static int runCompositeProgressive(
         bool noiseMet = (noiseTarget > 0.0 && acc.spp > 0 && noisePct <= noiseTarget);
         if (noiseMet) metNoise = true;
         if (timeUp)   metTime  = true;
-        bool done = stopped || timeUp || noiseMet;
+        // A fixed budget met by this batch ends the render HERE, so its finished composite goes
+        // through the save, the status line and the window like any other finish (the guard at
+        // the top of the loop only persists, and the last clamped batch rarely lands on a
+        // window repaint).
+        const bool budgetMet = !budgeted && acc.spp >= endSpp && acc.N >= endN;
+        bool done = stopped || timeUp || noiseMet || budgetMet;
         bool wantSave = done || sinceSave >= intervalSec;
         bool wantWin  = done || liveWindowDue();      // window repaints on its own cadence
         if (wantSave || wantWin) {
@@ -18226,9 +18262,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                 : noiseMet ? " (noise target met)"
                                 : totalDone ? " (done)" : "";
                 char st[220];
-                if (chunkFixed)
+                if (chunkFixed && N > 0)
                     std::snprintf(st, sizeof st, "[live] %s, %lld / %lld photons, ~%.1f%% noise%s",
                                   humanDur(elapsed).c_str(), acc.N, endN, noisePct, why);
+                else if (chunkFixed)   // -n 0: no total to count toward
+                    std::snprintf(st, sizeof st, "[live] %s, %lld photons, ~%.1f%% noise%s",
+                                  humanDur(elapsed).c_str(), acc.N, noisePct, why);
                 else if (runForever)
                     std::snprintf(st, sizeof st, "[forever] %s elapsed, %lld batches, %lld photons, ~%.1f%% noise%s",
                                   humanDur(elapsed).c_str(), batches, acc.N, noisePct, why);
@@ -18251,7 +18290,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         LiveStatus ls;
                         ls.tag = chunkFixed ? "live" : runForever ? "forever" : timeBudgetSec > 0.0 ? "time" : "noise";
                         ls.elapsed = elapsed; ls.budgetSec = timeBudgetSec;
-                        ls.photons = acc.N; ls.photonsTotal = chunkFixed ? endN : -1;
+                        ls.photons = acc.N; ls.photonsTotal = (chunkFixed && N > 0) ? endN : -1;
                         ls.photonRate = phRate;
                         ls.batches = chunkFixed ? -1 : batches;
                         ls.noisePct = noisePct; ls.noiseTarget = chunkFixed ? 0.0 : noiseTarget; ls.why = why;
@@ -24972,7 +25011,7 @@ static int run(int argc, char** argv) {
                 else if (cks[c].N != n0) ok = false;
             }
             if (ok && n0 > 0) {
-                for (int c = 0; c < nc; ++c) acc[c] = cks[c].film;
+                for (int c = 0; c < nc; ++c) acc[c] = std::move(cks[c].film);
                 accN = n0; accE = cks[0].energy;
                 std::printf("[resume] loaded shared model-%c group (%d cameras): %lld photons accumulated so far\n",
                             groupMode, nc, accN);
@@ -25158,9 +25197,12 @@ static int run(int argc, char** argv) {
                     const char* why = stopped ? " (stopping)" : noiseMet ? " (noise target met)"
                                     : totalDone ? " (done)" : "";
                     char st[240];
-                    if (chunkFixed)
+                    if (chunkFixed && N > 0)
                         std::snprintf(st, sizeof st, "[live] %s, %lld / %lld photons, %d cams, ~%.1f%% noise%s",
                                       humanDur(elapsed).c_str(), accN, endN, nc, noisePct, why);
+                    else if (chunkFixed)   // -n 0: no total to count toward
+                        std::snprintf(st, sizeof st, "[live] %s, %lld photons, %d cams, ~%.1f%% noise%s",
+                                      humanDur(elapsed).c_str(), accN, nc, noisePct, why);
                     else if (runForever)
                         std::snprintf(st, sizeof st, "[forever] %s, %lld batches, %lld photons, %d cams, ~%.1f%% noise%s",
                                       humanDur(elapsed).c_str(), batches, accN, nc, noisePct, why);
@@ -25183,7 +25225,7 @@ static int run(int argc, char** argv) {
                             LiveStatus ls;
                             ls.tag = chunkFixed ? "live" : runForever ? "forever" : timeBudgetSec > 0.0 ? "time" : "noise";
                             ls.elapsed = elapsed; ls.budgetSec = timeBudgetSec;
-                            ls.photons = accN; ls.photonsTotal = chunkFixed ? endN : -1;
+                            ls.photons = accN; ls.photonsTotal = (chunkFixed && N > 0) ? endN : -1;
                             ls.photonRate = phRate;
                             ls.batches = chunkFixed ? -1 : batches;   // same fields as the single-camera loop
                             ls.noisePct = noisePct; ls.noiseTarget = chunkFixed ? 0.0 : noiseTarget; ls.why = why;
