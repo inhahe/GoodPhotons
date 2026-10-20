@@ -8795,9 +8795,14 @@ as the one at fault.
   multi-camera paths (`runSharedGroup` / `runSharedPhotonMap`) never stamped a device
   because only `runRender` did, and only the shared mode-M gather ever named the frame.
   Now `g_windowMode`, `g_windowFrame` and `g_windowBackend` are stamped by whichever loop
-  knows them (the flight loop names `'fly0555' (556/1147)`, the shared gather `frame
-  7/601`, a shared forward group `12 cameras (shared flight)`), and a caller can only
-  supply the progress text. **The progress text is one format for every driver** too:
+  knows them, and a caller can only supply the progress text. The frame field comes from
+  ONE function for every path (main's `frameLabel`, 0.388.1): each `RenderCam` carries its
+  index in its whole flight and the flight's length (`flightIdx`/`flightN`, counted from the
+  scene's camera list, which `-frames` does not filter), so the flight loop, the shared
+  mode-M gather and the shared forward group all read `frame 556/1208 (fly0555)`; the shared
+  forward group adds that it shows the first of frames rendering at once, and a run that is
+  not exactly one flight adds the run position. `-frame-label` overrides it for loom, which
+  renders one frame per process and alone knows the sequence. **The progress text is one format for every driver** too:
   each fills a `LiveStatus` (tag, elapsed, budget, photons, spp, batches, noise, target,
   reason) and `liveStatusText()` prints the fields in a fixed order with a derived
   throughput — `[time] 0:58 / 1:00  ·  12.3M / 40.0M photons  ·  8 / 32 spp  ·  245.1k/s  ·

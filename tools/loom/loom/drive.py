@@ -237,8 +237,11 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
             print(f"{tag}: {png.name} is INCOMPLETE "
                   f"({'no checkpoint' if have is None else f'{have}/{want} spp'}), "
                   f"re-rendering", flush=True)
+        # -frame-label: each frame is its own ftrace process and scene file, so only this loop
+        # knows the frame's place in the sequence; the live window's title shows it.
         cmd = [str(ftrace), "-in", str(fp), "-o", str(png),
-               "-interval", f"{interval:g}", "-checkpoint", *budget]
+               "-interval", f"{interval:g}", "-checkpoint", *budget,
+               "-frame-label", f"frame {i + 1}/{len(ftsl_paths)}"]
         if window:
             cmd.append("-window")
         cmd.extend(extra_args)

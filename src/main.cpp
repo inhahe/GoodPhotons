@@ -14686,6 +14686,9 @@ static std::string g_windowRest;
 // single still. Lives here, not in each driver's progress text, for the same reason the
 // mode and the device do: a field owned by the assembler cannot be forgotten by a driver.
 static std::string                 g_windowFrame;
+// `-frame-label <text>`: the frame field for a caller that renders a sequence one process per
+// frame (loom), which alone knows the frame's place in it. Replaces what main would stamp.
+static std::string                 g_frameLabelCli;
 // The ONE order every window title comes out in, whatever the mode is doing:
 //     [DONE -- why --] subject -- mode -- frame -- progress -- device
 // Before 0.307.0 the mode was prepended by ONE of the paths (liveWindowUpdate) and hand-written
@@ -14988,16 +14991,12 @@ static std::string liveStatusText(const LiveStatus& s) {
     }
     return t;
 }
-// The shared mode-M gather's progress. The frame-within-flight is a title field of its own
-// now (g_windowFrame), so it is stamped here rather than folded into the progress text.
+// The shared mode-M gather's progress. The frame being gathered is a title field of its own
+// (g_windowFrame), so its label (main's frameLabel) is stamped here rather than folded into
+// the progress text.
 static std::string pmGatherStatus(const Film& f, long long sppDone, long long sppTotal,
-                                  size_t frame, size_t nFrames, long long photons,
-                                  double elapsed) {
-    if (nFrames > 1) {
-        char fb[48];
-        std::snprintf(fb, sizeof fb, "frame %zu/%zu", frame, nFrames);
-        g_windowFrame = fb;
-    }
+                                  const std::string& frame, long long photons, double elapsed) {
+    g_windowFrame = frame;
     LiveStatus s;
     s.tag = "gather"; s.elapsed = elapsed;
     s.photons = photons; s.spp = sppDone; s.sppTotal = sppTotal;
@@ -18630,6 +18629,8 @@ static void printHelp(const char* prog) {
 "  -light <name>         built-in light preset (default: bb6500)\n"
 "  -camera <sel>         pick FTSL camera(s): <name>|<pathbase>|all|#N|near=X,Y,Z\n"
 "  -frames <A> <B>       with -camera <pathbase>: only the frames numbered A..B (inclusive), to resume or split a run\n"
+"  -frame-label <text>   what the live window's title shows as the frame (default: \"frame 556/1208 (fly0555)\"\n"
+"                        for a flight); for tools that render a sequence one process per frame\n"
 "  -view EX,EY,EZ/LX,LY,LZ[/FOV]   ad-hoc eye/look-at[/fovY] camera; renders just it\n"
 "  -exposure|-ev <c>     override every camera's exposure compensation\n"
 "  -exposure-lock        one shared auto-exposure anchor across all rendered cameras\n"
@@ -19926,6 +19927,7 @@ static int run(int argc, char** argv) {
             framesLo = std::atoll(argv[++i]); framesHi = std::atoll(argv[++i]);
             if (framesLo < 0 || framesHi < framesLo) { std::fprintf(stderr, "error: -frames needs A B with 0 <= A <= B\n"); return 1; }
         }
+        else if (!std::strcmp(argv[i], "-frame-label") && i + 1 < argc) g_frameLabelCli = argv[++i];
         else if (!std::strcmp(argv[i], "-view") && i + 1 < argc) {
             // Ad-hoc preview/render camera: EX,EY,EZ/LX,LY,LZ[/FOV] (',' and '/'
             // are interchangeable separators). Renders and previews just this
@@ -21137,8 +21139,29 @@ static int run(int argc, char** argv) {
     };
     struct RenderCam { std::string name; Camera cam; char mode; int res; int resY; double exposure; int expGroup;
                        Vec3 lookAt{0,0,0}; Vec3 up{0,1,0}; double fovY = 40.0;   // lookAt/up/fovY: for the interactive raster viewer
-                       std::string pathBase; };  // owning camera_path/orbit/curve base name ("" = standalone camera)
+                       std::string pathBase;     // owning camera_path/orbit/curve base name ("" = standalone camera)
+                       int flightIdx = -1;       // this frame's 0-based index in its whole flight (-1 = standalone)
+                       int flightN   = 0; };     // that flight's frame count, whatever -frames selected
     std::vector<RenderCam> toRender;
+    // The live window's frame field (g_windowFrame) for camera `rc`, `runPos` of `runN` in this
+    // run (1-based). A flight frame reads "frame 556/1208 (fly0555)": its place in the WHOLE flight,
+    // counted from 1, then its name, which counts from 0 as the frame files do; when the run is
+    // not exactly that flight (a -frames subset, or several paths), its place in the run follows.
+    // `-frame-label` replaces it outright (loom renders one frame per process, and only it knows
+    // the sequence).
+    auto frameLabel = [&](const RenderCam& rc, size_t runPos, size_t runN) -> std::string {
+        if (!g_frameLabelCli.empty()) return g_frameLabelCli;
+        if (rc.flightIdx >= 0 && rc.flightN > 0) {
+            std::string s = "frame " + std::to_string(rc.flightIdx + 1) + "/" +
+                            std::to_string(rc.flightN) + " (" + rc.name;
+            if (runN != (size_t)rc.flightN)
+                s += "; " + std::to_string(runPos) + "/" + std::to_string(runN) + " this run";
+            return s + ")";
+        }
+        if (runN > 1)
+            return "'" + rc.name + "' (" + std::to_string(runPos) + "/" + std::to_string(runN) + ")";
+        return rc.name.empty() ? std::string() : "'" + rc.name + "'";
+    };
     // The mode each FTSL camera of this run renders in, by its index in ftslScene.cameras (0 for
     // one the run does not render): what resolveCameraModes decided, read by the exposure meter.
     std::vector<char> renderedOf;
@@ -21322,6 +21345,13 @@ static int run(int argc, char** argv) {
         renderedOf.assign(ftslScene.cameras.size(), 0);
         for (size_t si = 0; si < sel.size(); ++si)
             renderedOf[(size_t)(sel[si] - ftslScene.cameras.data())] = resolved[si];
+        // Each camera's place in its flight, from the scene's own list (a path's frames are
+        // added in order and -frames filters only `sel`), for the window's frame field.
+        std::vector<int> flightIdxOf(ftslScene.cameras.size(), -1);
+        std::map<std::string, int> flightCount;
+        for (size_t k = 0; k < ftslScene.cameras.size(); ++k)
+            if (!ftslScene.cameras[k].pathBase.empty())
+                flightIdxOf[k] = flightCount[ftslScene.cameras[k].pathBase]++;
         for (size_t si = 0; si < sel.size(); ++si) {
             const ftsl::CamSpec* cs = sel[si];
             int cresX = resFromCli ? res : (cs->res  > 0 ? cs->res  : res);
@@ -21405,6 +21435,10 @@ static int run(int argc, char** argv) {
             }
             toRender.push_back({cs->name, c, cmode, cresX, cresY, cexp, eg, cs->look, cs->up, cs->fov,
                                 cs->pathBase});
+            if (!cs->pathBase.empty()) {
+                toRender.back().flightIdx = flightIdxOf[(size_t)(cs - ftslScene.cameras.data())];
+                toRender.back().flightN   = flightCount[cs->pathBase];
+            }
         }
     } else {
         // Built-in scene: one camera. Every image-forming mode (A/B/C/P/D/M/S/U/ref)
@@ -24932,7 +24966,11 @@ static int run(int argc, char** argv) {
 #else
         g_windowBackend = backendLabel(false, nThreads);
 #endif
-        g_windowFrame = std::to_string(nc) + " cameras (shared flight)";
+        // Every camera of the group accumulates at once and the window shows the first, so the
+        // frame field names the one on screen and says the rest are rendering with it.
+        const std::string sharedFrame = frameLabel(toRender[idx[0]], 1, idx.size()) +
+                                        " shown; all " + std::to_string(nc) + " render at once";
+        g_windowFrame = sharedFrame;
 
 #ifdef HAVE_CUDA
         // Resident GPU session for the whole group render: the scene and every camera are
@@ -25109,7 +25147,7 @@ static int run(int argc, char** argv) {
                             ls.photons = accN; ls.photonsTotal = chunkFixed ? N : -1;
                             ls.batches = chunkFixed ? -1 : batches;   // same fields as the single-camera loop
                             ls.noisePct = noisePct; ls.noiseTarget = chunkFixed ? 0.0 : noiseTarget; ls.why = why;
-                            g_windowFrame = std::to_string(nc) + " cameras (shared flight)";
+                            g_windowFrame = sharedFrame;
                             liveWindowUpdate(disp, (double)accN, toRender[idx[0]].exposure,
                                              scene.absolute, liveStatusText(ls).c_str());
                             // Charge the sync + env composite to the repaint budget too.
@@ -25168,8 +25206,7 @@ static int run(int argc, char** argv) {
         // runRender's stamp either, so it names its own device -- and its own frame: a
         // single camera also arrives here, and it never passes the flight loop's stamp.
         g_windowBackend = backendLabel(false, nThreads);
-        g_windowFrame   = (idx.size() == 1 && !toRender[idx[0]].name.empty())
-                        ? "'" + toRender[idx[0]].name + "'" : std::string();   // multi: per gather frame
+        g_windowFrame   = frameLabel(toRender[idx[0]], 1, idx.size());   // re-stamped per gather frame
         double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                               : scene.sceneRadius * g_pmRadiusFactor;
         // Photon beams (the view-independent volume cache). Decided — and warned about —
@@ -25273,8 +25310,9 @@ static int run(int argc, char** argv) {
                     liveProg.report = [&, liveExp, lastEcho](const Film& f, long long sppDone, bool) -> bool {
                         const auto now = std::chrono::steady_clock::now();
                         const double el = std::chrono::duration<double>(now - gStart).count();
-                        const std::string st = pmGatherStatus(f, sppDone, spp, gatherFrame + 1,
-                                                              cams.size(), N, el);
+                        const size_t gf = std::min(gatherFrame, idx.size() - 1);
+                        const std::string st = pmGatherStatus(
+                            f, sppDone, spp, frameLabel(toRender[idx[gf]], gf + 1, idx.size()), N, el);
                         if (g_showWindow)
                             liveWindowUpdate(f, (double)sppDone, liveExp, scene.absolute, st.c_str());
                         if (preview) ansiPreview(f, (double)sppDone, liveExp, st.c_str());
@@ -25714,7 +25752,7 @@ static int run(int argc, char** argv) {
                     const double el = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - gStart).count();
                     liveWindowUpdate(pf, (double)sppDone, liveExp, scene.absolute,
-                        pmGatherStatus(pf, sppDone, spp, k + 1, idx.size(), N, el).c_str());
+                        pmGatherStatus(pf, sppDone, spp, frameLabel(rc, k + 1, idx.size()), N, el).c_str());
                     return g_stopRequested != 0;   // window closed / -stop -> stop after this chunk
                 };
             }
@@ -25768,11 +25806,9 @@ static int run(int argc, char** argv) {
             std::printf("[camera] rendering '%s' (mode %c, %dx%d) -> %s  [%zu/%zu]\n",
                         rc.name.c_str(), rc.mode, rc.res, rc.resY, outFor(rc.name).c_str(),
                         ri + 1, restIdx.size());
-        // Name the frame in the title bar: the camera and its place in the run. runRender
-        // stamps the mode itself; the frame is the flight loop's to know.
-        g_windowFrame = (toRender.size() > 1)
-            ? "'" + rc.name + "' (" + std::to_string(ri + 1) + "/" + std::to_string(restIdx.size()) + ")"
-            : (rc.name.empty() ? std::string() : "'" + rc.name + "'");
+        // Name the frame in the title bar (frameLabel). runRender stamps the mode itself; the
+        // frame is the flight loop's to know.
+        g_windowFrame = frameLabel(rc, ri + 1, restIdx.size());
         double* anchor = (rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
         int rv = runRender(scene, rc.cam, rc.mode, N, rc.res, rc.resY, spp, nThreads,
                            device, diffraction, lightLabel, outFor(rc.name), rc.exposure,
