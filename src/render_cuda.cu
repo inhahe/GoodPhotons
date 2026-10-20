@@ -268,6 +268,34 @@ __device__ __host__ inline Real connMaxT(double dist, double absEps = 2e-6, doub
 
 
 
+// copysign, ROUTED EXPLICITLY (0.385.0). nvcc's device pass compiles this file against the HOST
+// compiler's <cmath>, and MSVC 14.5x's (VS 2026) float overload copysign(float, float) comes out of
+// it as a device function that returns 0 for EVERY input -- found by the FTRACE_DEVICE_PROBE math
+// probe below, which checks every math function the device code calls against the host: of 1046
+// cases that was the only real disagreement (the double overload is fine). onb() starts from
+// copysign(1, n.z), so on an FP32 device build every SAMPLED direction came out NaN -- mode B
+// absorbed every photon and rendered black, D read 0.58x and R 0.72x of the truth, while mode W
+// (no sampled directions) was perfect. That is the "MSVC newer than CUDA miscompiles the device
+// code" CMakeLists.txt has warned about since 2026-08-16; it was never a miscompile, just this.
+// BOTH overloads live here so an unqualified copysign anywhere in namespace gpu resolves to one of
+// them -- declaring only the float one would HIDE the global double overloads and silently narrow
+// every double call. The device half is the sign-bit splice itself, so no header can intervene.
+HD static inline float copysign(float a, float b) {
+#ifdef __CUDA_ARCH__
+    return __int_as_float((__float_as_int(a) & 0x7fffffff) | (__float_as_int(b) & (int)0x80000000));
+#else
+    return std::copysign(a, b);
+#endif
+}
+HD static inline double copysign(double a, double b) {
+#ifdef __CUDA_ARCH__
+    return __longlong_as_double((__double_as_longlong(a) & 0x7fffffffffffffffLL) |
+                                (__double_as_longlong(b) & (long long)0x8000000000000000ULL));
+#else
+    return std::copysign(a, b);
+#endif
+}
+
 // DVec3 stores Real and does Real arithmetic (the hot path), but its 3-arg
 // constructor keeps DOUBLE parameters so the host baking code's brace-init from
 // double Scene coordinates ({v.x, v.y, v.z}) is a widening conversion (legal),
@@ -525,6 +553,7 @@ struct DMaterial {
     // See Material::hideCamera (scene.h) for why the flag exists at all, and
     // closestHit(..., camHide) below for how it is enforced.
     int    hideCamera;
+    int    route;              // Material::route: -1 untagged, 0 = mode D, 1 = mode J (0.386.0)
     double matEmit[SPEC_N];
     DVec3  rgbMatEmit;          // matEmit baked to linear sRGB, for the fast RGB backward
     // Nested-dielectric priority (Schmidt & Budge 2002): higher wins where dielectrics
@@ -831,6 +860,7 @@ struct DMajWalk {
 
 struct DMedium {
     int    enabled;
+    int    route;              // Medium::route: -1 untagged, 0 = mode D, 1 = mode J (0.386.0)
     double sigma_a[SPEC_N];
     double sigma_s[SPEC_N];
     double g;
@@ -1261,6 +1291,13 @@ struct DScene {
     // sliced by DMaterial::recRoughStopOff/recRoughStopN. Null when no scalar record is bound.
     const DRecScalarStop* recScalarStops;
     const DEmitter*  emitters; int nEmitters;
+    // JSPEC (0.386.1): each emitter's spectral fold quadrature (scene.h Emitter::foldLam/foldCie),
+    // DJSPEC_FOLD x {lam, X, Y, Z} per emitter, zero past its foldN. Read only when a mode-J merge
+    // re-colours a deposit-folded beam for a chromatic camera path (dJSpecFoldColor).
+    const float*     emFold;
+    // 1 / (sum over the 1 nm grid of the emitter's SPD), per emitter: emitSpd(lambda) * this is its
+    // spectral density per nm, which a windowed merge reads for a flat-folded beam (0.386.2).
+    const float*     emSpdInv;
     const double*    emitCdf;       // size nEmitters, cumulative power, normalised
     double           totalPower;
     // Conty-Kulla light BVH over the emitters (lighttree.h), uploaded VERBATIM from
@@ -2427,6 +2464,82 @@ __device__ static Real dMediaTransmittance(const DScene& sc, const DVec3& o,
         if (Tr <= (Real)0) break;
     }
     return Tr;
+}
+
+// TRANSMITTANCE AT MANY DISTANCES ALONG ONE RAY, FROM ONE WALK (0.386.0). `q` supplies
+// ascending distances q.t(0..n-1) and takes each one's factor through q.mul(k, f) (multiplied in,
+// so media chain). For every query the factor is exactly the estimator dMedTransmittance(dist =
+// q.t(k)) computes -- the same control-variate term and the same Poisson process of tentative
+// collisions, of which a shorter walk sees the prefix, clamped at zero where that walk would be --
+// so each result is unbiased on its own. They are CORRELATED, which costs a little variance and
+// buys one walk instead of n. On a heterogeneous medium a walk's cost is the majorant DDA, paid
+// per cell crossed whether or not anything is sampled there, so for mode J's beam gather, where
+// each hit walked again from its segment's origin and from its beam's, those walks were most of
+// the work (gallery_rain's still, 0.385.0: 85 % of hit evaluation). kBeamTr0 uses this for the
+// beam side; the camera side is still walked per hit (see dBeamHitEval for why).
+template <class Q>
+__device__ static void dMedTransmittanceMulti(const DMedium& m, const DVec3& o, const DVec3& dir,
+                                              Real lambda, DRng& rng, const DPatEnv& env, Q& q) {
+    const int n = q.count();
+    if (n <= 0) return;
+    const double stBase = (double)medSigmaT(m, lambda);
+    if (stBase <= 0.0) return;
+    double ta, tb;
+    if (!dMedClip(m, o, dir, 0.0, (double)q.t(n - 1), ta, tb)) return;
+    int k = 0;
+    while (k < n && (double)q.t(k) <= ta) ++k;          // short of the medium: factor 1
+    if (!m.heterogeneous) {
+        for (; k < n; ++k) q.mul(k, exp(-stBase * (fmin((double)q.t(k), tb) - ta)));
+        return;
+    }
+    double Tr = 1.0;
+    if (m.majorant.ctrl) {
+        DMajWalk w; w.init(m.majorant, o, dir, ta, tb);
+        size_t ci; double a, b;
+        while (k < n && w.next(m.majorant, ci, a, b)) {
+            const double sigC = stBase * (double)m.majorant.ctrl[ci];
+            const double sigR = stBase * (double)m.majorant.res[ci];
+            if (sigR > 0.0) {
+                double t = a;
+                for (;;) {
+                    t += -log(1.0 - (double)rng.uniformOpen()) / sigR;
+                    if (t >= b) break;
+                    for (; k < n && (double)q.t(k) < t; ++k)
+                        q.mul(k, fmax(0.0, Tr * exp(-sigC * ((double)q.t(k) - a))));
+                    if (k >= n) break;
+                    DVec3 pp = o + dir * (Real)t;
+                    const double sigT = stBase * dMedDensityAt(m, pp, env);
+                    Tr *= 1.0 - (sigT - sigC) / sigR;
+                    if (Tr == 0.0) break;
+                }
+            }
+            if (Tr == 0.0) break;
+            for (; k < n && (double)q.t(k) < b; ++k)
+                q.mul(k, fmax(0.0, Tr * exp(-sigC * ((double)q.t(k) - a))));
+            if (sigC > 0.0) Tr *= exp(-sigC * (b - a));
+        }
+        for (; k < n; ++k) q.mul(k, fmax(0.0, Tr));
+        return;
+    }
+    const double sigMax = stBase * m.densityMax;
+    if (sigMax <= 0.0) return;
+    double t = ta;
+    while (k < n) {
+        t += -log(1.0 - (double)rng.uniformOpen()) / sigMax;
+        if (t >= tb) break;
+        for (; k < n && (double)q.t(k) < t; ++k) q.mul(k, Tr);
+        if (k >= n) break;
+        DVec3 pp = o + dir * (Real)t;
+        const double sigT = stBase * dMedDensityAt(m, pp, env);
+        Tr *= 1.0 - sigT / sigMax;
+    }
+    for (; k < n; ++k) q.mul(k, Tr);
+}
+template <class Q>
+__device__ static void dMediaTransmittanceMulti(const DScene& sc, const DVec3& o, const DVec3& dir,
+                                                Real lambda, DRng& rng, Q& q) {
+    const DPatEnv env = dPatEnvOf(sc);
+    for (int i = 0; i < sc.mediaN; ++i) dMedTransmittanceMulti(sc.media[i], o, dir, lambda, rng, env, q);
 }
 
 // Transmittance at several wavelengths along one segment through one medium, from a SINGLE
@@ -4266,10 +4379,33 @@ __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, con
 // efficiency (0, -1, +1, -2, +2, ...) so u = 0 selects the specular order m = 0 -- see the host
 // gratingDiffract for the full rationale. The pick is analog either way, so this is a variance
 // change only, not an estimator change.
+// The order normaliser at `lambda` and whether `order` propagates (host twin Renderer::gratingWsum).
+__device__ static double dGratingWsum(const DMaterial& m, const DHit& h, const DVec3& din,
+                                      Real lambda, int diffraction, int order, bool& live) {
+    live = false;
+    DVec3 nl = dot(din, h.ng) < 0 ? h.ng : -h.ng;
+    DVec3 g = m.grooveDir - nl * dot(m.grooveDir, nl);
+    if (dot(g, g) < (Real)1e-12)
+        g = fabs(nl.x) < (Real)0.9 ? cross(nl, DVec3{1,0,0}) : cross(nl, DVec3{0,1,0});
+    g = normalize(g);
+    DVec3 t = normalize(cross(nl, g));
+    DVec3 ut = din - nl * dot(din, nl);
+    int M = diffraction ? (m.gratingMaxOrder < 0 ? 0 : (m.gratingMaxOrder > 32 ? 32 : m.gratingMaxOrder)) : 0;
+    Real lod = lambda / (Real)m.grooveSpacing;
+    double wsum = 0.0;
+    for (int mm = -M; mm <= M; ++mm) {
+        DVec3 a = ut + t * ((Real)mm * lod);
+        if (dot(a, a) >= 1) continue;
+        wsum += 1.0 / (1.0 + (double)(mm < 0 ? -mm : mm));
+        if (mm == order) live = true;
+    }
+    return wsum;
+}
+
 __device__ static bool gratingDiffract(const DMaterial& m, const DHit& h, const DVec3& din,
                                         Real lambda, int diffraction, DRng& rng,
                                         DVec3& ro, DVec3& rd,
-                                        const double* whittedU = nullptr) {
+                                        const double* whittedU = nullptr, int* pickOut = nullptr) {
     DVec3 nl = dot(din, h.ng) < 0 ? h.ng : -h.ng;
     DVec3 g = m.grooveDir - nl * dot(m.grooveDir, nl);
     if (dot(g, g) < (Real)1e-12)
@@ -4316,6 +4452,7 @@ __device__ static bool gratingDiffract(const DMaterial& m, const DHit& h, const 
         Real xi = rng.uniform() * wsum, acc = 0; pick = ord[cnt - 1];
         for (int i = 0; i < cnt; ++i) { acc += wgt[i]; if (xi < acc) { pick = ord[i]; break; } }
     }
+    if (pickOut) *pickOut = pick;
     DVec3 a = ut + t * ((Real)pick * lod);
     DVec3 v = a + nl * sqrt(fmax((Real)0, (Real)1 - dot(a, a)));
     v = normalize(v);
@@ -5111,7 +5248,9 @@ struct DHairShade {
 // Forward declaration: dHairShadeAt's from-reflectance path reads the material's diffuse
 // reflectance (textures/patterns/records included); dDiffuseRho is defined further down
 // with the texture helpers.
-__device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda);
+struct DJBase;   // JSPEC's captured slot shape, defined with DJSpec
+__device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda,
+                                   DJBase* shp = nullptr);
 
 // Build the BCSDF at a hit — device twin of hairShadeAt. `wPrev` points away from the
 // surface, back along the path that got here (toward the light for the forward tracer,
@@ -5857,6 +5996,224 @@ __device__ static inline double dMisRemap0(double f) { return f != 0.0 ? f : 1.0
 // one, because the reject test becomes d2*invRad^2 >= 1, which is the same quantity (d/r)^2
 // the Epanechnikov kernel needs anyway. The old code took a sqrt to get d and then squared
 // x = d*invRadius straight back.
+// ---- JSPEC (0.386.1): mode J's camera-side spectral carrier, device twin -----------------------
+// Host twin and the reasoning: beamgather.h, JSpec / JSpecRun / jSpecFoldColor. A merge pairs a
+// camera walk at lambda_c with a beam at its own wavelength; the walk's spectral factors sit in
+// `beta` at lambda_c, and the carrier re-expresses them at the beam's. `c_jSpecOn` is the host's
+// bdpt::jSpecEnabled() (FTRACE_JSPEC=0 restores the old estimator); `c_jTrSpec` says some medium's
+// sigma_t is chromatic, so a segment folds its transmittance ratio too.
+__constant__ int c_jSpecOn = 0;
+__constant__ int c_jTrSpec = 0;
+__constant__ double c_jDispWin = 10.0;   // the dispersive window's width, nm (host g_jDispWinNm)
+__constant__ int    c_jDispAll = 0;      // -jdispall (host g_jDispAll)
+// Merges after a specular bounce read the light-side density's 0 as 1 (host bdpt::g_jDeltaMerge,
+// MODE-J-SDS, 0.387.0). 0 = the pre-0.387.0 reading, for A/B runs (FTRACE_JDELTA=0).
+__constant__ int    c_jDeltaMerge = 1;
+// THE AIMED SUN (host bdpt.h SunAim, MODE-J-SDS, 0.387.0). c_sunAimN == 0: the uniform disc.
+#define SUNAIM_MAX 64
+__constant__ int    c_sunAimN = 0;
+__constant__ double c_sunAimF = 0.0;
+__constant__ double c_sunAimSumR2 = 0.0;
+__constant__ double c_sunAimC[SUNAIM_MAX * 3];
+__constant__ double c_sunAimR[SUNAIM_MAX];
+__device__ static inline bool dSunAimOn() {
+    return c_sunAimN > 0 && c_sunAimF > 0.0 && c_sunAimSumR2 > 0.0;
+}
+// Target j's centre projected onto the sun disc, in the (t, b) basis, relative to the scene centre.
+__device__ static inline void dSunAimProject(const DScene& sc, const DVec3& t, const DVec3& b, int j,
+                                             double& cx, double& cy) {
+    const double wx = c_sunAimC[3 * j + 0] - (double)sc.sceneCenter.x;
+    const double wy = c_sunAimC[3 * j + 1] - (double)sc.sceneCenter.y;
+    const double wz = c_sunAimC[3 * j + 2] - (double)sc.sceneCenter.z;
+    cx = wx * (double)t.x + wy * (double)t.y + wz * (double)t.z;
+    cy = wx * (double)b.x + wy * (double)b.y + wz * (double)b.z;
+}
+// Host twin bdpt::sunOriginPdf: the sun's origin density at disc coordinates (x, y).
+__device__ static double dSunOriginPdf(const DScene& sc, const DEmitter& em, double x, double y) {
+    const double R = sc.sceneRadius;
+    if (!dSunAimOn()) return 1.0 / (DPI * R * R);
+    double p = (x * x + y * y <= R * R) ? (1.0 - c_sunAimF) / (DPI * R * R) : 0.0;
+    DVec3 t, b; onb(em.beamDir, t, b);
+    int n = 0;
+    for (int j = 0; j < c_sunAimN; ++j) {
+        double cx, cy; dSunAimProject(sc, t, b, j, cx, cy);
+        const double dx = x - cx, dy = y - cy;
+        if (dx * dx + dy * dy < c_sunAimR[j] * c_sunAimR[j]) ++n;
+    }
+    if (n > 0) p += c_sunAimF * (double)n / (DPI * c_sunAimSumR2);
+    return p;
+}
+// Host twin bdpt::sunOriginPdfAlong: the density for the ray cur -> next, read at the disc point
+// it would have started from. All in double: the disc is a scene radius upstream.
+__device__ static double dSunOriginPdfAlong(const DScene& sc, const DEmitter& em,
+                                            const DVec3& curP, const DVec3& nextP) {
+    const double R = sc.sceneRadius;
+    if (!dSunAimOn()) return 1.0 / (DPI * R * R);
+    double wx = (double)nextP.x - (double)curP.x, wy = (double)nextP.y - (double)curP.y,
+           wz = (double)nextP.z - (double)curP.z;
+    const double L = sqrt(wx * wx + wy * wy + wz * wz);
+    if (!(L > 0.0)) return 0.0;
+    wx /= L; wy /= L; wz /= L;
+    const double nx = em.beamDir.x, ny = em.beamDir.y, nz = em.beamDir.z;
+    const double cw = wx * nx + wy * ny + wz * nz;
+    if (!(cw > 0.0)) return 0.0;
+    const double p0x = (double)sc.sceneCenter.x - nx * R, p0y = (double)sc.sceneCenter.y - ny * R,
+                 p0z = (double)sc.sceneCenter.z - nz * R;
+    const double sA = (((double)nextP.x - p0x) * nx + ((double)nextP.y - p0y) * ny +
+                       ((double)nextP.z - p0z) * nz) / cw;
+    const double ox = (double)nextP.x - wx * sA - (double)sc.sceneCenter.x;
+    const double oy = (double)nextP.y - wy * sA - (double)sc.sceneCenter.y;
+    const double oz = (double)nextP.z - wz * sA - (double)sc.sceneCenter.z;
+    DVec3 t, b; onb(em.beamDir, t, b);
+    const double x = ox * (double)t.x + oy * (double)t.y + oz * (double)t.z;
+    const double y = ox * (double)b.x + oy * (double)b.y + oz * (double)b.z;
+    return dSunOriginPdf(sc, em, x, y);
+}
+// Host twin bdpt::mergeLightDensity: the light-side density a merge's weight reads at a site
+// whose light-side neighbour is `fromDelta`, with a delta bounce's 0 read as 1 (MODE-J-SDS,
+// 0.387.0). Any other 0 -- a strategy that cannot produce the vertex -- stays 0.
+__device__ static inline double dMergeLightDensity(double p, bool fromDelta) {
+    return (c_jDeltaMerge && fromDelta && p == 0.0) ? 1.0 : p;
+}
+#define DJSPEC_K    24     // JSpec::K
+#define DJSPEC_FOLD 12     // scene.h kFoldBins (static_assert'ed at the upload)
+struct DJSpec {
+    float  r[DJSPEC_K];
+    int    any;
+    double logS;   // the carrier's magnitude, apart from `r` (host twin JSpec::logS, where the why is)
+    int    disp;   // the dispersive window is open (host twin JSpec::disp)
+    float  lamC, invPdfC;
+    __device__ double beta(double b) const {
+        if (logS == 0.0 || !(b > 0.0)) return b;
+        return exp(log(b) + logS);
+    }
+    __device__ bool on() const { return any || disp; }
+    __device__ double atC() const { return (logS == 0.0) ? 1.0 : exp(-logS); }
+    // The window's weight for a monochromatic member at `lam` (host twin jDispWeight).
+    __device__ double winW(double lam) const {
+        if (!(fabs(lam - (double)lamC) <= 0.5 * c_jDispWin)) return 0.0;
+        return (double)invPdfC / c_jDispWin;
+    }
+    __device__ static double lamOf(int k) {
+        return DLMIN + ((double)k + 0.5) * (DLMAX - DLMIN) / (double)DJSPEC_K;
+    }
+    __device__ double at(double lam) const {
+        if (!any) return 1.0;
+        const double u = (lam - DLMIN) / (DLMAX - DLMIN) * (double)DJSPEC_K - 0.5;
+        if (!(u > 0.0)) return (double)r[0];
+        if (u >= (double)(DJSPEC_K - 1)) return (double)r[DJSPEC_K - 1];
+        const int i = (int)u;
+        const double f = u - (double)i;
+        return (double)r[i] + ((double)r[i + 1] - (double)r[i]) * f;
+    }
+};
+struct DJSpecRun {
+    double r[DJSPEC_K];
+    int    any;
+    double logS;                     // see DJSpec::logS
+    int    disp;                     // see DJSpec::disp
+    double lamC, invPdfC;
+    __device__ void init() {
+        for (int k = 0; k < DJSPEC_K; ++k) r[k] = 1.0;
+        any = 0; logS = 0.0; disp = 0; lamC = 0.0; invPdfC = 0.0;
+    }
+    __device__ void markDisp(double lam, double invPdf) {
+        if (disp) return;
+        disp = 1; lamC = lam; invPdfC = invPdf;
+    }
+    // ONE call site for `f`, deliberately (host twin JSpecRun::mul has two): the three probe bins
+    // are simply visited first. `f` is a texture or pattern read, and every extra inlined copy of
+    // one pushes nvcc's inliner to emit it out of line, where its register count no longer fits
+    // the kernels' __launch_bounds__ and nvlink refuses the build.
+    template <class F> __device__ void mul(const F& f, double atCam, bool exhaustive) {
+        if (!(atCam > 0.0)) return;
+        const double tol = 1e-12 * (1.0 + fabs(atCam));
+        double v[DJSPEC_K];
+        bool probeFlat = !exhaustive;
+        for (int j = 0; j < DJSPEC_K; ++j) {
+            const int k = (j == 0) ? 0 : (j == 1) ? DJSPEC_K / 2 : (j == 2) ? DJSPEC_K - 1
+                        : (j - 2 < DJSPEC_K / 2) ? j - 2 : j - 1;
+            v[k] = f(DJSpec::lamOf(k));
+            if (probeFlat && fabs(v[k] - atCam) > tol) probeFlat = false;
+            if (j == 2 && probeFlat) return;
+        }
+        mulVec(v, atCam);
+    }
+    // The fold from values already in hand at the bin centres (host twin JSpecRun::mulVec).
+    // `v` is overwritten.
+    __device__ void mulVec(double* v, double atCam) {
+        if (!(atCam > 0.0)) return;
+        // Magnitudes past a float go to logS (host twin JSpecRun::mul).
+        double inv = 1.0;
+        if (atCam < 1e-280) logS -= log(atCam); else inv = 1.0 / atCam;
+        double qMax = 0.0;
+        bool flat = true;
+        for (int k = 0; k < DJSPEC_K; ++k) {
+            double q = v[k] * inv;
+            if (!isfinite(q) || q < 0.0) q = 0.0;
+            if (fabs(q - 1.0) > 1e-12) flat = false;
+            v[k] = q;
+            qMax = fmax(qMax, q);
+        }
+        if (qMax > 1e30) {
+            for (int k = 0; k < DJSPEC_K; ++k) v[k] /= qMax;
+            logS += log(qMax);
+        }
+        double rMax = 0.0;
+        for (int k = 0; k < DJSPEC_K; ++k) { r[k] *= v[k]; rMax = fmax(rMax, r[k]); }
+        if (rMax > 1e15 || (rMax > 0.0 && rMax < 1e-15)) {
+            for (int k = 0; k < DJSPEC_K; ++k) r[k] /= rMax;
+            logS += log(rMax);
+        }
+        if (!flat) any = 1;
+    }
+    __device__ void snap(DJSpec& o) const {
+        o.any = any;
+        o.logS = logS;
+        o.disp = disp; o.lamC = (float)lamC; o.invPdfC = (float)invPdfC;
+        for (int k = 0; k < DJSPEC_K; ++k) o.r[k] = (float)r[k];
+    }
+    __device__ void from(const DJSpec& o) {
+        any = o.any;
+        logS = o.any ? o.logS : 0.0;
+        disp = o.disp; lamC = o.lamC; invPdfC = o.invPdfC;
+        for (int k = 0; k < DJSPEC_K; ++k) r[k] = o.any ? (double)o.r[k] : 1.0;
+    }
+};
+// A hit's reflect-slot SPECTRAL SHAPE, captured from the walk's own dReflectBase call (0.386.2):
+// whatever chose the per-hit spectrum -- the constant table, a texture's sigmoid (stochastic tiling
+// included: the blended crops' coefficients), a record's driver, a triplanar blend, a vertex colour
+// -- and the wavelength-free pattern multiplier. JSPEC then reads the slot at 24 wavelengths from
+// it with table lookups, exactly (dJBaseEval), without calling a texture or pattern reader again:
+// new call sites of those are what pushed nvcc to emit them out of line, past every kernel's
+// __launch_bounds__ (0.386.1, nvlink). Filled only when the walk asks (a non-null pointer).
+struct DJBase {
+    int    mode;        // 0 constant m.reflect, 1 one sigmoid (c), 2 triplanar (c x3, w), 3 record (recD)
+    double c[9];
+    double w[3];
+    double recD;
+    int    vc;          // a vertex colour multiplies (cv)
+    double cv[3];
+    Real   pm;          // the reflect pattern multiplier, 1 if none
+};
+
+// Re-colour a DEPOSIT-folded beam (achro == 1) for a chromatic camera path, through its emitter's
+// fold quadrature (host twin jSpecFoldColor). False if the table or the emitter is unknown, and the
+// caller keeps the record's colour.
+__device__ static bool dJSpecFoldColor(const DScene& sc, const DJSpec& js, int em,
+                                       double& cx, double& cy, double& cz) {
+    cx = cy = cz = 0.0;
+    if (!sc.emFold || em < 0 || em >= sc.nEmitters) return false;
+    const float* t = sc.emFold + (size_t)em * DJSPEC_FOLD * 4;
+    for (int k = 0; k < DJSPEC_FOLD; ++k) {
+        const float* e = t + k * 4;
+        if (e[1] == 0.f && e[2] == 0.f && e[3] == 0.f) continue;
+        const double q = js.at((double)e[0]);
+        cx += (double)e[1] * q; cy += (double)e[2] * q; cz += (double)e[3] * q;
+    }
+    return true;
+}
+
 struct DBeamRec {
     DVec3 o, d;             // parent beam origin (world) and unit direction
     float s0, len;          // this sub-segment's [s0, s0+len] range along the beam
@@ -5913,6 +6270,8 @@ struct DBeamMis {
     double sumM;          // light-side BEAM-merge accumulator, without the n_m * 2r factor
     double sumMs;         // light-side POINT-merge accumulator, without its n_m * pi r_s^2
     float  pdfDir;        // solid-angle pdf of the beam's direction at y_{s-1}
+    float  pdfPlanar;     // > 0: the area-measure light density at x instead of pdfDir/rho^2 --
+                          // a beam leaving the sun's vertex (host BeamMis::pdfPlanar, 0.386.0)
     float  rCoef;         // cos(y_{s-1}) / pdfFwd(y_{s-1}); the cos is 1 off a surface
     float  etaPrev;       // the BEAM merge AT y_{s-1}, still missing only its Tr; 0 off a medium
     float  etaPrevS;      // the POINT merge AT y_{s-1}, complete but for its kappaS; 0 off a
@@ -5964,6 +6323,15 @@ struct DBeamMap {
     // separate kernel argument that could be forgotten at one of the call sites.
     double          mergeKappa = 0.0;
     double          sinMin = 0.0;   // twin of BeamMap::sinMin (`-beamsinmin`); 0 = unbounded
+    // MODE J (0.386.0): per sub-beam, an unbiased estimate of the beam-side transmittance
+    // Tr(o -> o + d*s0) to that sub-beam's start, drawn once per parent beam per light-side
+    // realization by kBeamTr0 -- one ratio-tracking walk down the whole parent, read off at every
+    // sub-beam's s0 -- so a hit at s walks only [s0, s] (dBeamHitEval). Tr over [0, s] is Tr over
+    // [0, s0] times Tr over [s0, s], and the product of independent unbiased estimates of the two
+    // is unbiased. A SIDE array, not a DBeamRec field: kWfBeamHits streams every record it tests
+    // through the BVH and never needs this, and 4 more bytes a record cost it 8 % on _fog_cornell.
+    // Null (mode M; a map not laid out per parent): every hit walks from the beam's origin.
+    float*          tr0 = nullptr;
 
     // The MIS partials of sub-beam `i`, or null when the map carries none.
     __device__ const DBeamMis* misOf(int i) const {
@@ -6092,7 +6460,8 @@ __device__ static double dBeamMergeWeight(const DScene& sc, const DBeamMergeW& m
     if (!(tCam > 0.0) || !(rhoL > 0.0)) return 0.0;
     const double invR2 = 1.0 / (rhoL * rhoL), invT2 = 1.0 / (tCam * tCam);
     // The pair of geometric densities AT x. Both are cosine-free: x is a medium point.
-    const double gL = (double)lm.pdfDir * invR2;     // light side  (p_L-perp)
+    const double gL = (lm.pdfPlanar > 0.f) ? (double)lm.pdfPlanar   // the sun's chord (BeamMis;
+                                           : (double)lm.pdfDir * invR2;  // 1 after a delta, 0.387.0)
     const double gC = mw.pdfDirCam * invT2;          // camera side (the free flight)
     if (!(gL > 0.0)) return 0.0;                     // delta light-side density
     if (b.med < 0 || b.med >= sc.mediaN) return 0.0;
@@ -6154,7 +6523,8 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
                                     double aGlassCam, DRng& rng,
                                     const DBeamMergeW* mw, const DTrRay* camTr,
                                     const DPatEnv& env,
-                                    double& oX, double& oY, double& oZ) {
+                                    double& oX, double& oY, double& oZ,
+                                    const DJSpec* js = nullptr) {
         if (b.med < 0 || b.med >= sc.mediaN) return;
         const DMedium& md = sc.media[b.med];
         const Real lam = b.lambda;
@@ -6182,9 +6552,9 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
         // 1D Epanechnikov kernel, normalised so its integral over [-r, r] is 1.
         const double kk = 1.0 - x2;
         const double K1 = 0.75 * (double)b.invRad * kk;
-        // Bounded at `bm.sinMin` (`-beamsinmin`, UPBP-CONV (3)): the same clamp the host applies
-        // in BeamMap::hitBeam, and applied at the same place -- before the MIS weight below
-        // reads it -- so the technique and its pdf stay one function.
+        // Bounded at `bm.sinMin` (`-beamsinmin`, UPBP-CONV (3); 0 = unbounded, the default since
+        // 0.386.1): the same clamp the host applies in BeamMap::hitBeam, before the MIS weight
+        // below reads it. Consistent weights, but a biased estimate wherever it binds (host note).
         const double sinT = fmax((double)sqrt((double)den), bm.sinMin);
         double w = K1 / sinT * ss * phase;
         // MIS (mode J); exactly absent in mode M. `dens` and `phase` are handed over
@@ -6202,14 +6572,60 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
         if (!(w > 0.0)) return;
         if (b.absorb > 0.f)  w *= exp(-(double)b.absorb * (double)s);   // glass, beam side
         if (aGlassCam > 0.0) w *= exp(-aGlassCam * (double)t);          // glass, camera side
-        if (s > (Real)0) w *= (double)dMediaTransmittance(sc, b.o, b.d, s, lam, rng);
-        if (t > (Real)0) w *= (double)dMediaTransmittance(sc, oc, dc, t, lam, rng);
+        // THE BEAM SIDE ARRIVES HALF-WALKED (0.386.0): `b.tr0` is Tr to this sub-beam's start,
+        // drawn once per parent beam by kBeamTr0 (see dMedTransmittanceMulti), so only [s0, s] is
+        // walked here. -1 = not drawn: walk from the origin as before. Measured on gallery_rain's
+        // still before this, the two walks below were 85 % of hit evaluation, half of it this one.
+        // (The camera side was batched per segment too, for ~4 % there, and cost 13 % on
+        // _fog_cornell's homogeneous fog through kWfBeamHits' extra stack; it was dropped.)
+        if (s > (Real)0) {
+            const float t0 = bm.tr0 ? bm.tr0[beamIdx] : -1.0f;
+            if (t0 >= 0.f && s >= (Real)b.s0) {
+                w *= (double)t0;
+                if (w > 0.0 && s > (Real)b.s0)
+                    w *= (double)dMediaTransmittance(sc, b.o + b.d * (Real)b.s0, b.d, s - (Real)b.s0, lam, rng);
+            } else {
+                w *= (double)dMediaTransmittance(sc, b.o, b.d, s, lam, rng);
+            }
+        }
+        if (t > (Real)0 && w > 0.0) w *= (double)dMediaTransmittance(sc, oc, dc, t, lam, rng);
         if (!(w > 0.0)) return;
         // A folded beam takes its colour from the bow table (already divided by the phase it
         // carries, exactly as the host's `bowCie`), scaled by the colourless power; every other
         // beam uses the record's baked colour.
-        if (folded) { const double pwf = (double)b.pw * w;
+        // JSPEC (mode J): the camera's spectral factors at THIS beam's wavelength, or, for a
+        // deposit-folded beam, over its emitter's fold quadrature. Off unless the camera path met
+        // a chromatic factor, and then the arithmetic is the old one exactly.
+        const bool specOn = js && js->on();
+        const bool dispOn = specOn && js->disp;
+        double fcx, fcy, fcz;
+        if (dispOn) {
+            // Windowed (DJSpec::disp; host twin gatherPhotonBeamsW): light at lambda_c only,
+            // coloured there. A flat-folded beam is read at lambda_c from its emitter's SPD.
+            const Real lc = (Real)js->lamC;
+            if (b.achro == 1) {
+                if (b.emIdx >= 0 && b.emIdx < sc.nEmitters && sc.emSpdInv) {
+                    const double dens = (double)specLookup(sc.emitters[b.emIdx].emitSpd, lc) *
+                                        (double)sc.emSpdInv[b.emIdx];
+                    const double pwf = (double)b.pw * w * dens * (double)js->invPdfC * js->atC();
+                    oX += (double)cieX(lc) * pwf; oY += (double)cieY(lc) * pwf; oZ += (double)cieZ(lc) * pwf;
+                }
+            } else {
+                const double ww = js->winW((double)lam);
+                if (ww > 0.0) {
+                    const double pwf = (double)b.pw * w * ww * js->atC();
+                    oX += (double)cieX(lc) * pwf; oY += (double)cieY(lc) * pwf; oZ += (double)cieZ(lc) * pwf;
+                }
+            }
+        }
+        else if (folded) { const double pwf = (double)b.pw * w;
                       oX += bowX * pwf; oY += bowY * pwf; oZ += bowZ * pwf; }
+        else if (specOn && b.achro == 1 && dJSpecFoldColor(sc, *js, (int)b.emIdx, fcx, fcy, fcz)) {
+                      const double pwf = (double)b.pw * w;
+                      oX += fcx * pwf; oY += fcy * pwf; oZ += fcz * pwf; }
+        else if (specOn && b.achro != 1) {
+                      const double q = w * js->at((double)lam);
+                      oX += (double)b.pX * q; oY += (double)b.pY * q; oZ += (double)b.pZ * q; }
         else        { oX += (double)b.pX * w; oY += (double)b.pY * w; oZ += (double)b.pZ * w; }
         // SECONDARY wavelengths of the spectral bundle (host twin: gatherPhotonBeams).
         // They share this beam's geometry, its kernel weight and — decisively — BOTH
@@ -6226,7 +6642,16 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
                 if (!(ssi > 0.0)) continue;
                 const double phi = (double)dMedPhase(md, -cosT, li);
                 if (!(phi > 0.0)) continue;
-                const double wi = wShared * (double)b.pwSec[k] * ssi * phi;
+                if (dispOn) {
+                    const double ww = js->winW((double)li);
+                    if (!(ww > 0.0)) continue;
+                    const Real lc = (Real)js->lamC;
+                    const double wiw = wShared * (double)b.pwSec[k] * ssi * phi * ww * js->atC();
+                    oX += (double)cieX(lc) * wiw; oY += (double)cieY(lc) * wiw; oZ += (double)cieZ(lc) * wiw;
+                    continue;
+                }
+                const double wi = wShared * (double)b.pwSec[k] * ssi * phi *
+                                  (specOn ? js->at((double)li) : 1.0);
                 oX += (double)cieX(li) * wi;
                 oY += (double)cieY(li) * wi;
                 oZ += (double)cieZ(li) * wi;
@@ -6353,12 +6778,56 @@ __device__ static void dVolCacheMarch(const DScene& sc, const DBeamMap& bm,
     }
 }
 
+// ---- PER-OBJECT RENDER MODES (0.386.0) ---------------------------------------------------------
+// Host twin: bdpt.h routeOfEye. A path is ROUTED by the most capable mode (J > D) among the vertices
+// of its camera end's LEADING CHAIN -- eye[1..f], f the first non-delta eye vertex -- an untagged
+// surface or medium counting as the camera's mode. The route is a property of the PATH, so every
+// strategy that builds it agrees on it: connections with t >= 2 share the camera subpath's chain,
+// a t = 1 splat's chain is its one light vertex, and a merge's is the camera prefix it extends.
+// A D-routed path is weighted with both merge constants at zero -- mode D's weight exactly -- and
+// is never merged; a J-routed one gets mode J's whole estimator. Each part of path space is then
+// covered by one unbiased estimator, so the sum is unbiased.
+// c_routeOn == 0 (any scene without a `mode` tag) computes no route: every weight is the full one.
+__constant__ int c_routeOn = 0;
+__constant__ int c_routeDefault = 1;   // the camera's mode: 0 = D, 1 = J
+__constant__ int c_routeAnyMedJ = 0;   // does any medium route J? (else a merge off the chain cannot)
+// PER-MODE SAMPLE COUNTS (0.386.0, `mode_spp D=.. J=..` / `-mode-spp`). A route with multiplier m
+// takes floor(m) sub-samples per base sample, plus one more with probability frac(m), and weights
+// each of its contributions 1/m, so E[its contribution per base sample] is its integral whatever m
+// is (and whatever the chunk size: nothing is rounded per chunk). A sub-sample in which a route is
+// not drawn skips that route's work: a D-routed subpath's connections in a J-only sub-sample, every
+// merge in a D-only one. Both 1 (the default) is one sub-sample of weight 1 -- bit-identical.
+// Base samples are what -spp, -time, -noise and the checkpoint count. Read only when c_routeOn.
+__constant__ double c_routeSppD = 1.0, c_routeSppJ = 1.0;
+// How many sub-samples base sample `g` draws for a route with multiplier m (see c_routeSppD). The
+// fractional draw hashes the base sample's own index, so it is reproducible and independent of
+// every path's random stream.
+__device__ static inline int dRouteSubCount(double m, unsigned long long g, unsigned long long seedBase,
+                                            unsigned long long salt) {
+    if (m == 1.0) return 1;
+    const int fl = (int)floor(m);
+    const double fr = m - (double)fl;
+    if (!(fr > 0.0)) return fl;
+    const unsigned long long h = dMix64(g ^ salt ^ (seedBase * 0x9E3779B97F4A7C15ull));
+    return fl + (((double)(h >> 11) * (1.0 / 9007199254740992.0)) < fr ? 1 : 0);
+}
+__device__ static inline int dRouteOfMat(const DScene& sc, int matId) {
+    const int r = (matId >= 0) ? sc.mats[matId].route : -1;
+    return (r >= 0) ? r : c_routeDefault;
+}
+__device__ static inline int dRouteOfMed(const DScene& sc, int medId) {
+    const int r = (medId >= 0 && medId < sc.mediaN) ? sc.media[medId].route : -1;
+    return (r >= 0) ? r : c_routeDefault;
+}
+
 __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                                           const DVec3& oc, const DVec3& dc, Real tMax,
                                           double aGlassCam, DRng& rng,
                                           double& oX, double& oY, double& oZ,
                                           const DBeamMergeW* mw = nullptr,
-                                          const DTrRay* camTr = nullptr) {
+                                          const DTrRay* camTr = nullptr,
+                                          int routeMedJ = 0,
+                                          const DJSpec* js = nullptr) {
     oX = oY = oZ = 0.0;
     // The cache's share first: it is additive and independent of the beam traversal, and it
     // must run even when the split left no beams at all (nNodes == 0).
@@ -6400,8 +6869,9 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                 // (d_perp / r_med)^2, with r_med this beam's own medium's half-width.
                 const double x2 = (double)d2 * (double)b.invRad * (double)b.invRad;
                 if (!(x2 < 1.0)) continue;
+                if (routeMedJ && dRouteOfMed(sc, b.med) != 1) continue;   // D-routed merge (0.386.0)
                 dBeamHitEval(sc, bm, b, bm.primIdx[n.first + i], oc, dc, t, s, cosT, den, x2,
-                             aGlassCam, rng, mw, camTr, env, oX, oY, oZ);
+                             aGlassCam, rng, mw, camTr, env, oX, oY, oZ, js);
             }
         } else {
             Real tc;
@@ -6437,6 +6907,11 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
 // only). Both halves keep the SAME MIS weights they have in a full render, so the two sum to
 // it -- which is what makes a CPU-vs-GPU comparison of ONE half a clean measurement.
 __constant__ int c_jHalf = 0;
+// DIAGNOSTIC (FTRACE_ONLY_ST="s,t"): accumulate only the one BDPT connection strategy (s,t) --
+// its MIS-WEIGHTED contribution, so two builds or backends can be compared strategy by strategy.
+// -1 = every strategy (the default; a normal render never reads anything else).
+__constant__ int c_dbgOnlyS = -1;
+__constant__ int c_dbgOnlyT = -1;
 
 struct DSurfPhoton {
     DVec3 p, wo;                              // wo: unit, toward the PREVIOUS light vertex
@@ -6469,7 +6944,10 @@ struct DWfSeg {
     DTrRay      tr;
     int    px, py;
     float  lambda;
+    int    routeMedJ;   // 1: a merge here is J-routed only in a J medium (a chain-prefix segment);
+                        // sits in the padding before `seed`, so the record does not grow
     unsigned long long seed;
+    DJSpec spec;        // JSPEC: the camera carrier at the segment origin (DPathSeg::spec)
 };
 struct DWfHit { int seg; int beam; float t, s; };
 // One band of the wave-schedule PROFILE (see renderBdptCuda): what the paths of pixel slots
@@ -6503,6 +6981,37 @@ struct DWfQueue {
     unsigned runsPerRow, nRuns, runMask, runMul;
 };
 
+// The sub-beams of ONE parent beam, ascending in s0: the query view kBeamTr0 walks.
+struct DQBeamTr0 {
+    const DBeamRec* b; float* tr0; int i0, n;
+    __device__ int  count() const { return n; }
+    __device__ Real t(int k) const { return (Real)b[i0 + k].s0; }
+    __device__ void mul(int k, double f) { tr0[i0 + k] = (float)((double)tr0[i0 + k] * f); }
+};
+// One thread per PARENT beam: one ratio-tracking walk down it, read off at each sub-beam's s0
+// (see DBeamRec::tr0). `pStart` is the CSR of parents over the sub-beam array.
+__global__ void kBeamTr0(DScene sc, const DBeamRec* beams, float* tr0, const int* pStart, int nP,
+                         unsigned long long salt) {
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < nP; j += gridDim.x * blockDim.x) {
+        const int i0 = pStart[j], i1 = pStart[j + 1];
+        if (i1 <= i0) continue;
+        for (int i = i0; i < i1; ++i) tr0[i] = 1.0f;
+        DRng rng; rng.seedUnit((unsigned long long)j, salt);
+        DQBeamTr0 q{beams, tr0, i0, i1 - i0};
+        dMediaTransmittanceMulti(sc, beams[i0].o, beams[i0].d, (Real)beams[i0].lambda, rng, q);
+    }
+}
+
+// The hit-queue-overflow path of kWfBeamHits, kept OUT of line: inlined, dBeamHitEval's body sat in
+// the BVH loop's register and stack budget for a branch most hits never take (0.386.0, -6 % on
+// _fog_cornell, which overflows 12.8 M hits a frame, when the body grew by the tr0 branch).
+__device__ __noinline__ static void dBeamHitEvalSpill(const DScene& sc, const DBeamMap& bm,
+        const DBeamRec& b, int bi, const DVec3& oc, const DVec3& dc, Real t, Real s, Real cosT,
+        Real den, double x2, double aGlass, DRng& rng, const DBeamMergeW* mw, const DTrRay* tr,
+        const DPatEnv& env, double& fX, double& fY, double& fZ, const DJSpec* js) {
+    dBeamHitEval(sc, bm, b, bi, oc, dc, t, s, cosT, den, x2, aGlass, rng, mw, tr, env, fX, fY, fZ, js);
+}
+
 __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm, int resX) {
     const int nS = min(*q.nSegs, q.segCap);
     const DPatEnv env = dPatEnvOf(sc);
@@ -6516,6 +7025,7 @@ __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm,
         if (!boxHit(bm.nodes[0], oc, invD, (Real)0, tMax, tRoot)) continue;
         int stack[64]; int sp = 0; stack[sp++] = 0;
         int stopPoll = 0;
+        const int routeMedJ = sg.routeMedJ;   // once, not per candidate (q.hits aliases q.segs)
         DRng rng; rng.seedUnit(sg.seed, 0x9E3779B97F4A7C15ull);   // on-the-spot fallback only
         double fX = 0.0, fY = 0.0, fZ = 0.0;
         while (sp) {
@@ -6539,13 +7049,14 @@ __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm,
                     const Real d2 = dot(diff, diff);
                     const double x2 = (double)d2 * (double)b.invRad * (double)b.invRad;
                     if (!(x2 < 1.0)) continue;
+                    if (routeMedJ && dRouteOfMed(sc, b.med) != 1) continue;   // D-routed merge
                     const int h = atomicAdd(q.nHits, 1);
                     if (h < q.hitCap) {
                         q.hits[h] = DWfHit{si, bi, (float)t, (float)s};
                     } else {
                         atomicAdd(&q.overflow[1], 1);
-                        dBeamHitEval(sc, bm, b, bi, oc, dc, t, s, cosT, den, x2, sg.aGlass, rng,
-                                     &sg.mw, &sg.tr, env, fX, fY, fZ);
+                        dBeamHitEvalSpill(sc, bm, b, bi, oc, dc, t, s, cosT, den, x2, sg.aGlass, rng,
+                                          &sg.mw, &sg.tr, env, fX, fY, fZ, &sg.spec);
                     }
                 }
             } else {
@@ -6586,7 +7097,7 @@ __global__ void kWfBeamEval(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm,
         rng.seedUnit((unsigned long long)h.beam, sg.seed);
         double oX = 0.0, oY = 0.0, oZ = 0.0;
         dBeamHitEval(sc, bm, b, h.beam, oc, dc, t, s, cosT, den, x2, sg.aGlass, rng,
-                     &sg.mw, &sg.tr, env, oX, oY, oZ);
+                     &sg.mw, &sg.tr, env, oX, oY, oZ, &sg.spec);
         if (oX != 0.0 || oY != 0.0 || oZ != 0.0) {
             const size_t o = ((size_t)sg.py * resX + sg.px) * 3;
             atomicAdd(&camFilm[o + 0], oX * sg.beta);
@@ -7277,7 +7788,8 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
 
 // Defined further down (it needs the pattern/record evaluators); declared here so the
 // mirror connectors can read a textured/driven mirror's reflectance at the exact hit.
-__device__ static Real dReflectSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda);
+__device__ static Real dReflectSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda,
+                                    DJBase* shp = nullptr);
 
 // Materials whose reflection is a perfect delta the connection can solve for. Device twin
 // of isPlanarMirrorMat (scene.h): halfmirror's reflect slot IS its specular reflectance in
@@ -7664,7 +8176,7 @@ __device__ static int dWrapIndex(int i, int n, int wrap) {
 // Spatially-varying reflectance at (u,v,lambda): bilerp the per-texel JH coeffs
 // (v flipped so v=0 is the image bottom) then evaluate the sigmoid. The exact
 // device twin of Texture::reflectanceAt (nearest + bilinear filtering).
-__device__ static Real dTexReflAt(const DTexture& tx, Real u, Real v, Real lambda) {
+__device__ static Real dTexReflAt(const DTexture& tx, Real u, Real v, Real lambda, double* cOut = nullptr) {
     if (tx.stoch.on && tx.gaussRgb && tx.jhLut) {   // O7 — twin of Texture::reflectanceAt
         // Blend the three crops in linear RGB — the same planes, lattice and weights the
         // raster preview uses — then convert that colour to a spectrum through the shared
@@ -7674,12 +8186,15 @@ __device__ static Real dTexReflAt(const DTexture& tx, Real u, Real v, Real lambd
                     (double)u, (double)v, c);
         double cs[3];
         stochJhCoeff(tx.jhLut, c[0], c[1], c[2], cs);
+        if (cOut) { cOut[0] = cs[0]; cOut[1] = cs[1]; cOut[2] = cs[2]; }   // JSPEC shape
         return dReflAt(cs, lambda);
     }
     if (tx.filter == 0) {   // Nearest
         int x = dWrapIndex((int)floor((double)u * tx.w), tx.w, tx.wrap);
         int y = dWrapIndex((int)floor((1.0 - (double)v) * tx.h), tx.h, tx.wrap);
-        return dReflAt(&tx.coeff[3 * ((size_t)y * tx.w + x)], lambda);
+        const double* q = &tx.coeff[3 * ((size_t)y * tx.w + x)];
+        if (cOut) { cOut[0] = q[0]; cOut[1] = q[1]; cOut[2] = q[2]; }      // JSPEC shape
+        return dReflAt(q, lambda);
     }
     double tu = (double)u * tx.w - 0.5, tv = (1.0 - (double)v) * tx.h - 0.5;
     double flx = floor(tu), fly = floor(tv);
@@ -7696,6 +8211,7 @@ __device__ static Real dTexReflAt(const DTexture& tx, Real u, Real v, Real lambd
         double b = c01[k] * (1 - fx) + c11[k] * fx;
         c[k] = a * (1 - fy) + b * fy;
     }
+    if (cOut) { cOut[0] = c[0]; cOut[1] = c[1]; cOut[2] = c[2]; }          // JSPEC shape
     return dReflAt(c, lambda);
 }
 
@@ -7703,16 +8219,20 @@ __device__ static Real dTexReflAt(const DTexture& tx, Real u, Real v, Real lambd
 // the three world axes (plane ⊥X at (z,y), ⊥Y at (x,z), ⊥Z at (x,y), each scaled)
 // and blend by |n|^4 componentwise. Exact device twin of Texture::reflectanceTriplanar.
 __device__ static Real dTexReflTriplanar(const DTexture& tx, const DVec3& p, const DVec3& n,
-                                         double scale, Real lambda) {
+                                         double scale, Real lambda, DJBase* shp = nullptr) {
     double ax = fabs((double)n.x), ay = fabs((double)n.y), az = fabs((double)n.z);
     double wx = ax * ax * ax * ax, wy = ay * ay * ay * ay, wz = az * az * az * az;
     double s = wx + wy + wz;
-    if (s <= 0.0) return dTexReflAt(tx, (Real)(p.x * scale), (Real)(p.y * scale), lambda);
+    if (s <= 0.0) {
+        if (shp) { shp->mode = 1; }
+        return dTexReflAt(tx, (Real)(p.x * scale), (Real)(p.y * scale), lambda, shp ? shp->c : nullptr);
+    }
     wx /= s; wy /= s; wz /= s;
+    if (shp) { shp->mode = 2; shp->w[0] = wx; shp->w[1] = wy; shp->w[2] = wz; }   // JSPEC shape
     double r = 0.0;
-    if (wx > 0.0) r += wx * (double)dTexReflAt(tx, (Real)(p.z * scale), (Real)(p.y * scale), lambda);
-    if (wy > 0.0) r += wy * (double)dTexReflAt(tx, (Real)(p.x * scale), (Real)(p.z * scale), lambda);
-    if (wz > 0.0) r += wz * (double)dTexReflAt(tx, (Real)(p.x * scale), (Real)(p.y * scale), lambda);
+    if (wx > 0.0) r += wx * (double)dTexReflAt(tx, (Real)(p.z * scale), (Real)(p.y * scale), lambda, shp ? shp->c : nullptr);
+    if (wy > 0.0) r += wy * (double)dTexReflAt(tx, (Real)(p.x * scale), (Real)(p.z * scale), lambda, shp ? shp->c + 3 : nullptr);
+    if (wz > 0.0) r += wz * (double)dTexReflAt(tx, (Real)(p.x * scale), (Real)(p.y * scale), lambda, shp ? shp->c + 6 : nullptr);
     return (Real)r;
 }
 
@@ -8169,12 +8689,15 @@ __device__ static int dMixResolveDominant(const DScene& sc, const DMaterial& m, 
 // viewer -- only |cos| is used, so either sign is correct, which is what lets the eleven call
 // sites pass whatever they already have in hand.
 __device__ static double dLayeredCoatReflectance(const DScene& sc, const DMaterial& m,
-                                                 const DHit& h, const DVec3& d, Real lambda) {
+                                                 const DHit& h, const DVec3& d, Real lambda,
+                                                 double* cosIOut = nullptr, Real* thOut = nullptr) {
     if (m.coatModel == 2) return (double)clamp01((Real)m.coatSpecular);
     double cosI = fabs((double)dot(h.ng, d));
     if (cosI > 1.0) cosI = 1.0;
+    if (cosIOut) *cosIOut = cosI;
     if (m.coatModel == 1) {                          // thin-film (Airy) coat
         const Real th = dMatFilmThickness(sc, m, h);
+        if (thOut) *thOut = th;
         const Real ns = specLookup(m.ior, lambda);
         return (double)clamp01(thinFilmReflectance((Real)1, (Real)m.filmIor, ns, (Real)0,
                                                    th, (Real)cosI, lambda));
@@ -8201,12 +8724,40 @@ __device__ static inline bool dIsCompound(int t) { return t == D_MIX || t == D_L
 // `if (rng.uniform() < R) coat; else mixPickChild(rng.uniform())`, including the leftover
 // absorption a body whose weights sum below 1 still gets.
 __device__ static int dResolveCompound(const DScene& sc, const DMaterial& m, const DHit& h,
-                                       const DVec3& d, Real lambda, DRng& rng) {
+                                       const DVec3& d, Real lambda, DRng& rng,
+                                       int* coatPick = nullptr, double* coatR = nullptr,
+                                       double* cosIOut = nullptr, Real* thOut = nullptr,
+                                       double* uOut = nullptr) {
+    if (coatPick) *coatPick = -1;                    // -1: not a layered coin (JSPEC, hero coin)
     if (m.type == D_LAYERED) {
-        const double R = dLayeredCoatReflectance(sc, m, h, d, lambda);
-        if ((double)rng.uniform() < R) return m.coatChild;
+        const double R = dLayeredCoatReflectance(sc, m, h, d, lambda, cosIOut, thOut);
+        if (coatR) *coatR = R;
+        const double u = (double)rng.uniform();
+        if (uOut) *uOut = u;
+        const bool coat = u < R;
+        if (coatPick) *coatPick = coat ? 1 : 0;
+        if (coat) return m.coatChild;
     }
     return dMixResolveChild(sc, m, h, rng.uniform());
+}
+// dLayeredCoatReflectance at another wavelength from what its lambda_c call captured (the
+// incidence cosine and the film thickness), with no texture or pattern read (JSPEC, 0.386.2).
+__device__ static double dCoatRAtJ(const DMaterial& m, double cosI, Real th, Real lambda) {
+    if (m.coatModel == 2) return (double)clamp01((Real)m.coatSpecular);
+    if (m.coatModel == 1) {
+        const Real ns = specLookup(m.ior, lambda);
+        return (double)clamp01(thinFilmReflectance((Real)1, (Real)m.filmIor, ns, (Real)0,
+                                                   th, (Real)cosI, lambda));
+    }
+    const double n1 = 1.0, n2 = (double)specLookup(m.ior, lambda);
+    const double eta = n1 / n2;
+    const double sin2t = eta * eta * (1.0 - cosI * cosI);
+    if (sin2t >= 1.0) return 1.0;
+    const double cosT = sqrt(1.0 - sin2t);
+    const double rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
+    const double rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
+    const double R = 0.5 * (rs * rs + rp * rp);
+    return R < 0.0 ? 0.0 : (R > 1.0 ? 1.0 : R);
 }
 
 // Deterministic twin for mode W, mirroring backward.h's Whitted layered branch: the coat is taken
@@ -8247,13 +8798,14 @@ __device__ static Real dRecReflAt(const double* coeff, int N, double lo, double 
 // pre-baked into m.reflect, so they take the ordinary specLookup path). The single point
 // of truth so diffuse albedo AND specular tint see identical driven reflectance.
 __device__ static bool dRecordReflect(const DScene& sc, const DMaterial& m,
-                                      const DHit& h, Real lambda, Real& out) {
+                                      const DHit& h, Real lambda, Real& out, double* dOut = nullptr) {
     if (m.recReflDriven != 1) return false;
     double px = h.p.x, py = h.p.y, pz = h.p.z;
     double r = sqrt(px * px + py * py + pz * pz);
     double d = dPatternEval(sc.recDrivers + m.recReflDrvOff, m.recReflDrvN,
                             px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw,
                             dPatEnvOf(sc));
+    if (dOut) *dOut = d;                                                     // JSPEC shape
     out = dRecReflAt(sc.recCoeff + m.recReflOff, REC_LUT_N,
                      (double)m.recReflLo, (double)m.recReflHi, d, lambda);
     return true;
@@ -8316,14 +8868,19 @@ __device__ static inline Real dCoatedAlbedoAt(const DMaterial& m, Real a, Real l
 // diffuse one clamps after the pattern, the specular one leaves that to its callers), so each
 // keeps its own tail and neither changes a bit for a material without a texture or a vertex
 // colour (host twin: reflectSlot / diffuseReflectance).
-__device__ static Real dReflectBase(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
+__device__ static Real dReflectBase(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda,
+                                    DJBase* shp = nullptr) {
     Real rv;
-    if (!dRecordReflect(sc, m, h, lambda, rv)) {
+    if (shp) { shp->mode = 0; shp->vc = 0; shp->pm = (Real)1; }
+    if (dRecordReflect(sc, m, h, lambda, rv, shp ? &shp->recD : nullptr)) {
+        if (shp) shp->mode = 3;
+    } else {
         if (m.reflectTex >= 0) {
             const DTexture& tx = sc.textures[m.reflectTex];
+            if (shp) shp->mode = 1;
             rv = (m.triplanarScale > 0.0)
-                     ? dTexReflTriplanar(tx, h.p, h.ng, m.triplanarScale, lambda)
-                     : dTexReflAt(tx, h.u, h.v, lambda);
+                     ? dTexReflTriplanar(tx, h.p, h.ng, m.triplanarScale, lambda, shp)
+                     : dTexReflAt(tx, h.u, h.v, lambda, shp ? shp->c : nullptr);
         } else {
             rv = specLookup(m.reflect, lambda);
         }
@@ -8343,6 +8900,7 @@ __device__ static Real dReflectBase(const DScene& sc, const DMaterial& m, const 
             double c[3];
             stochJhCoeff(sc.jhLut, r, g, b, c);
             rv *= stochReflAt(c, (double)lambda);   // the host's upsample::reflAt, device side
+            if (shp) { shp->vc = 1; shp->cv[0] = c[0]; shp->cv[1] = c[1]; shp->cv[2] = c[2]; }
         }
     }
     return rv;
@@ -8351,17 +8909,28 @@ __device__ static Real dReflectBase(const DScene& sc, const DMaterial& m, const 
 // Specular tint (mirror / half-mirror / grating / glossy -- and an imported glTF metal, whose
 // tint IS its base colour, texture included): the shared base, the pattern, the coat. Untinted
 // for a textured metal until 0.367.2, when the base gained the texture (host twin: reflectSlot).
-__device__ static Real dReflectSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
-    Real v = dReflectBase(sc, m, h, lambda);
-    v = m.reflectPat < 0 ? v : v * dReflectPatMul(sc, m, h);
+__device__ static Real dReflectSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda,
+                                    DJBase* shp) {
+    Real v = dReflectBase(sc, m, h, lambda, shp);
+    if (m.reflectPat >= 0) {
+        const Real pm = dReflectPatMul(sc, m, h);
+        v = v * pm;
+        if (shp) shp->pm = pm;
+    }
     return dCoatedAlbedoAt(m, v, lambda);
 }
 
 // Diffuse reflectance at a hit: the shared base, then scaled by a bound reflect pattern and
 // clamped (mirrors host diffuseReflectance).
-__device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
-    Real rv = dReflectBase(sc, m, h, lambda);
-    rv = clamp01(m.reflectPat < 0 ? rv : rv * dReflectPatMul(sc, m, h));
+__device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda,
+                                   DJBase* shp) {
+    Real rv = dReflectBase(sc, m, h, lambda, shp);
+    if (m.reflectPat >= 0) {
+        const Real pm = dReflectPatMul(sc, m, h);
+        rv = rv * pm;
+        if (shp) shp->pm = pm;
+    }
+    rv = clamp01(rv);
     // UNDER A COAT (host twin: diffuseReflectance): what the internal multiple reflections leave,
     // and what an absorbing layer takes on the way through.
     return dCoatedAlbedoAt(m, rv, lambda);
@@ -8371,10 +8940,14 @@ __device__ static Real dDiffuseRho(const DScene& sc, const DMaterial& m, const D
 // transmit spectrum scaled by a bound transmit pattern. Serves BOTH readings of the slot
 // — a filter's gel transmittance T(lambda) and a translucent's back-lobe albedo rhoT —
 // so every device transmit read goes through here, exactly as the host does.
-__device__ static Real dTransmitSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
+__device__ static Real dTransmitSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda,
+                                     Real* tpOut = nullptr) {
     Real v = specLookup(m.transmit, lambda);
+    if (tpOut) *tpOut = (Real)1;
     if (m.transmitPat < 0) return v;
-    return v * (Real)clamp01(dPatternScalarAt(sc, m.transmitPat, h));
+    const Real tp = (Real)clamp01(dPatternScalarAt(sc, m.transmitPat, h));
+    if (tpOut) *tpOut = tp;                                                  // JSPEC shape
+    return v * tp;
 }
 
 // ---- emission slot: the two halves of `emit pattern:` on the device -----------------
@@ -9789,7 +10362,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         int diffraction, int C, const DHit& h, DVec3& ro, DVec3& rd, Real* lam, Real* beta,
         bool& secAlive, DRng& rng, double& eAbsorbed, double& eSensor, double& eEscaped,
         DMediumStack& stk, DPathCaustic* pathC = nullptr, Real* curveTminOut = nullptr) {
-    const int nUp = C;
+    int nUp = C;   // drops to 1 if a coat's coin de-heroes the bundle (below)
     Real dEvent = h.valid ? h.t : BIG;
 
     // Model C aperture catch: deposit every live wavelength that threads the pupil.
@@ -9821,8 +10394,18 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     const DMaterial* mptr = &sc.mats[h.matId];
     int matIndex = h.matId;
     if (dIsCompound(mptr->type)) {
-        int child = dResolveCompound(sc, *mptr, h, rd, lam[0], rng);
+        int cpF = -1; double cRF = 0.0, cCosF = 1.0, cUF = 0.0; Real cThF = (Real)0;
+        int child = dResolveCompound(sc, *mptr, h, rd, lam[0], rng, &cpF, &cRF, &cCosF, &cThF, &cUF);
         if (child < 0) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
+        // A layered coat's coin and the bundle (0.386.2; host twin tracePhotonHero): one coin
+        // compared per wavelength; where they disagree, de-hero (boost the hero x C).
+        if (cpF >= 0 && nUp > 1) {
+            for (int i = 1; i < nUp; ++i)
+                if ((cUF < dCoatRAtJ(*mptr, cCosF, cThF, lam[i])) != (cpF == 1)) {
+                    beta[0] *= (Real)C; secAlive = false; nUp = 1;
+                    break;
+                }
+        }
         mptr = &sc.mats[child]; matIndex = child;
     }
     const DMaterial& m = *mptr;
@@ -9931,7 +10514,8 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         // one fiber interaction cannot be shared across C wavelengths — matching the CPU
         // tracePhotonHero, which de-heroes onto the scalar MatType::Hair path.
         if (pathC) pathC->bits |= dPhotonVertexBit(sc, m, h);   // caustic split
-        beta[0] *= (Real)C; secAlive = false;
+        if (nUp > 1) beta[0] *= (Real)C;   // not twice: a coat's coin may have de-heroed already
+        secAlive = false;
         return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
                                 ro, rd, beta[0], lam[0], rng, eAbsorbed, stk, curveTminOut);
     }
@@ -10320,6 +10904,11 @@ struct DVertex {
     int   nUp;                  // live hero wavelengths here (1 = single-λ walk / de-hero'd)
 };
 
+// The route a vertex contributes to its path's leading chain (see c_routeOn).
+__device__ static inline int dRouteOfVert(const DScene& sc, const DVertex& v) {
+    return (v.type == BV_MEDIUM) ? dRouteOfMed(sc, v.mediumId) : dRouteOfMat(sc, v.matId);
+}
+
 // Number of SECONDARY wavelength slots a hero bundle can carry (the hero itself rides in
 // the scalar `beta`). The per-vertex secondary throughputs live in a PARALLEL array
 // (`pathSec`, stride `secStride`) rather than inside DVertex, so the scalar kernel — which
@@ -10370,6 +10959,12 @@ __device__ static inline DHit dVertHit(const DVertex& vt) {
     h.matId = vt.matId; h.sensorId = -1;
     h.u = vt.u; h.v = vt.v; h.curv = vt.curv;
     h.tangent = vt.tangent; h.fiberRadius = vt.fiberR;
+    // EVERY other field defined too. DHit has members with no default (vcol, vb0, vb1,
+    // bitangentSign), and dDiffuseRho reads vcol -- which gates the per-vertex colour lookup --
+    // so a reconstructed hit used to carry whatever the stack held there. vcol = -1 is "no
+    // vertex colour", which is what a connection evaluation must assume: DVertex does not carry
+    // the colour, so a vertex-coloured mesh is shaded uncoloured by the connections (logged).
+    h.vcol = -1; h.vb0 = (Real)0; h.vb1 = (Real)0; h.bitangentSign = (Real)1;
     return h;
 }
 
@@ -10400,17 +10995,86 @@ __device__ static inline bool dConnectibleType(int tp) {
 // gather and the weight must ask the same question the store did -- a site the weight counts but
 // the map never fills under-weights every competing technique, and one the map fills but the
 // weight ignores double-counts.
+//
+// NOT a fiber (bdpt.h, 0.365.0): a photon that landed on a strand lying on the skin would bleed into
+// every skin gather point within the radius. And NOT ON ANY CURVE (0.385.0, known-issues
+// VCM-THIN-CURVES): a merge divides by the area of a disc of the merge radius, which assumes the
+// surface around the camera vertex IS a disc -- on a strand a radius wide it is mostly empty space,
+// so a diffuse curve (a coat of `type diffuse` fur, grass, wire) read 0.80 of mode R. `fiberR > 0`
+// is set for every curve hit and nothing else (the walk copies DHit::fiberRadius). One predicate
+// gates the store, the gather and the MIS eta terms, so the exclusion is consistent by construction.
 __device__ static inline bool dSurfMergeSite(const DScene& sc, const DVertex& v) {
     if (v.type != BV_SURFACE || v.delta || v.matId < 0) return false;
-    return dConnectibleType(sc.mats[v.matId].type);
+    const int tp = sc.mats[v.matId].type;
+    return dConnectibleType(tp) && tp != D_HAIR && !(v.fiberR > (Real)0);
 }
 
+// bdpt.h connOrigin / connFiberStep twins for a BDPT vertex (dFiberConnOrigin / dFiberStep take a
+// DHit). Only an EYE-side vertex can be a strand -- a light walk never stores one (dRandomWalk) --
+// so these matter at the camera end of a connection. A fiber connecting out its FAR side starts
+// along the connection, inside its own tube, and clears the tube with the exact chord as a
+// CURVE-ONLY tmin; offsetting along the normal hid its own grazing far-side connections (0.365.0).
+// A ray LEAVING A STRAND must not skip what lies within a strand's width of it. RAY_EPS is 1e-4 in
+// the FP32 build -- more than the radius of a typical hair -- so as a tmin it stepped over the
+// neighbouring strands and the strand's own next segment, and light leaked through dense fur
+// (+6..19 % on every strategy that continues off a fiber; the first connection, which leaves no
+// strand, matched). The fp64 build's 1e-6 is right; in FP32 the same idea needs a floor: 1 % of the
+// radius, but never below 128 ulps of the largest coordinate (the origin's own rounding), and never
+// above RAY_EPS. In the fp64 build this IS 1e-6 at every scale a scene is authored at.
+__device__ static inline Real dStrandEps(const DVec3& p, Real r) {
+    const Real m = fmax(fabs(p.x), fmax(fabs(p.y), fabs(p.z)));
+    const Real ulps = m * (Real)(128.0 / 8388608.0);
+    return fmin(RAY_EPS, fmax((Real)0.01 * r, ulps));
+}
+__device__ static inline bool dVertOnStrand(const DScene& sc, const DVertex& v) {
+    return v.type == BV_SURFACE && v.matId >= 0 && sc.mats[v.matId].type == D_HAIR &&
+           v.fiberR > (Real)0;
+}
+// WHERE A RAY LEAVING A STRAND STARTS, AND WHAT IT MAY SKIP (FP32 device builds, 0.385.0).
+//   * origin: the exact hit point. dOffsetPoint pushes each coordinate by its own ulp count (or by
+//     1/65536 below 1/32), so the push is NOT parallel to the ray, and on a tube a radius wide it moved
+//     a far-side exit sideways far enough that the chord no longer cleared the strand's own far wall:
+//     the ray re-hit it from inside, made a spurious second fiber vertex, and that vertex collected the
+//     same light again. It was the largest single error in the FP32 bidirectional hair transport.
+//   * the own tube: skipped by the exact chord on the FAR side (dHairChordExit), and by kNear radii of
+//     curve on the NEAR side -- a convex tube cannot be re-entered by a ray leaving its surface, so what
+//     that skips is float noise at t ~ 0, not geometry (0.01 / 0.1 / 0.25 measured alike).
+//   * everything else: past dStrandEps, never RAY_EPS (1e-4, a whole hair).
+// Measured with FTRACE_ONLY_ST, FP32 device against the FP64 device build (which matches the CPU):
+// before, every strategy that continues off a fiber read +6..36 % (the first connection, which leaves
+// no strand, matched); after, every strategy agrees within its seed-to-seed noise and the frames read
+// 0.991-1.005 on dense fur near the origin and +0.8..1.2 % 9 m from it (an FP32 ulp there is ~1e-6).
+// The FP64 build keeps the CPU's scheme (absolute 1e-6 offsets), with which it agrees bit-for-bit
+// in spirit and statistically in fact, so this is compiled for FP32 only.
+struct DStrandStart { DVec3 o; Real tmin, curveTmin; };
+__device__ static inline DStrandStart dStrandStart(const DVec3& p, const DVec3& n, const DVec3& axis,
+                                                   Real r, const DVec3& w, Real kNear = (Real)0.25) {
+    DStrandStart st;
+    st.o = p;
+    st.tmin = dStrandEps(p, r);
+    const Real chord = dHairChordExit(r, n, axis, w);           // 0 on the near side
+    st.curveTmin = (chord > (Real)0) ? fmax(chord, st.tmin) : fmax(kNear * r, st.tmin);
+    return st;
+}
+__device__ static inline DVec3 dVertConnOrigin(const DScene& sc, const DVertex& v, const DVec3& w) {
+    if (dVertOnStrand(sc, v) && dot(v.ns, w) < (Real)0) return dOffsetPoint(v.p, w);
+    return dOffsetAlong(v.p, v.ng, w);
+}
+__device__ static inline Real dVertFiberStep(const DScene& sc, const DVertex& v, const DVec3& w) {
+    return dVertOnStrand(sc, v) ? dHairChordExit(v.fiberR, v.ns, v.tangent, w) : (Real)0;
+}
+
+// The POINT merge's eta at a stored-photon site (host mergeEtaPrimeSurf), less its kappaS.
+__device__ static inline double dMergeEtaSurf(bool site, double pLight) {
+    if (!site) return 0.0;
+    return (pLight > 0.0) ? pLight : 0.0;   // callers pass dMergeLightDensity (0.387.0)
+}
 __device__ static double dMergeEtaPrime(const DScene& sc, const DVec3& pPrev, const DVertex& v,
                                         const DVec3& pNext, double pLight, Real lambda,
                                         const DPatEnv& env) {
     if (v.type != BV_MEDIUM) return 0.0;
     if (v.mediumId < 0 || v.mediumId >= sc.mediaN) return 0.0;
-    if (!(pLight > 0.0)) return 0.0;
+    if (!(pLight > 0.0)) return 0.0;                 // callers pass dMergeLightDensity (0.387.0)
     DVec3 din = v.p - pPrev;
     const double dl = sqrt(ddot(din, din));
     if (!(dl > 0.0)) return 0.0;
@@ -10488,9 +11152,10 @@ __device__ static inline bool dTwoSidedType(int tp) { return tp == D_DIFFUSETRAN
 // bdpt.h diffuseTransmitAlbedos). rhoR is the per-hit front lobe (texture-aware).
 __device__ static inline void dDiffuseTransmitAlbedos(const DScene& sc, const DMaterial& m,
                                                       const DHit& h, Real lambda,
-                                                      double& rhoR, double& rhoT) {
-    rhoR = clamp01(dDiffuseRho(sc, m, h, lambda));
-    rhoT = clamp01(dTransmitSlot(sc, m, h, lambda));
+                                                      double& rhoR, double& rhoT,
+                                                      DJBase* shp = nullptr, Real* tpOut = nullptr) {
+    rhoR = clamp01(dDiffuseRho(sc, m, h, lambda, shp));
+    rhoT = clamp01(dTransmitSlot(sc, m, h, lambda, tpOut));
     double sum = rhoR + rhoT;
     if (sum > 1.0) { rhoR /= sum; rhoT /= sum; }
 }
@@ -10631,7 +11296,10 @@ __device__ static float dVertexPdfLightF(const DScene& sc, const DVertex& cur, c
     if (em && dIsInfiniteEmitter(*em)) {
         float R = (float)sc.sceneRadius;
         if (R <= 0.f) return 0.f;
-        pdf = 1.0f / ((float)DPI * R * R);            // planar density over the sun disc
+        if (em->shape == 6 && dSunAimOn())            // the aimed mixture (0.387.0, host twin)
+            pdf = (float)dSunOriginPdfAlong(sc, *em, cur.p, next.p);
+        else
+            pdf = 1.0f / ((float)DPI * R * R);        // planar density over the sun disc
     } else if (em && em->shape == 2) {
         float solid = 2.0f * (float)DPI * (1.0f - (float)em->spotCosOuter);
         if (solid <= 0.f) return 0.f;
@@ -13165,9 +13833,29 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
         if (dIsCompound(mp->type)) {                       // resolve the mix to a child material
+            int cpH = -1; double cRH = 0.0, cCosH = 1.0, cUH = 0.0; Real cThH = (Real)0;
             int child = whitted ? dResolveCompoundDominant(sc, *mp, h, rd, lam[0])
-                                : dResolveCompound(sc, *mp, h, rd, lam[0], rng);
+                                : dResolveCompound(sc, *mp, h, rd, lam[0], rng,
+                                                   &cpH, &cRH, &cCosH, &cThH, &cUH);
             if (child < 0) return;                      // absorbed
+            // A layered coat's coin and the bundle (0.386.2; host twin radianceHeroLoop, which
+            // fans out instead): one coin compared per wavelength, unbiased per lambda while they
+            // agree; where they disagree, the default de-hero below (boost the hero, drop the
+            // rest). Before this every secondary rode the hero's coin: a thin-film coat read 6 %
+            // low in green and 7 % high in blue against the host.
+            if (!whitted && cpH >= 0 && secAlive && nUp > 1) {
+                bool agree = true;
+                for (int i = 1; i < nUp && agree; ++i)
+                    if (invPdf[i] != 0.0 &&
+                        ((cUH < dCoatRAtJ(*mp, cCosH, cThH, lam[i])) != (cpH == 1))) agree = false;
+                if (!agree) {
+                    thr[0] *= (double)C / specW;
+                    secAlive = false;
+                    specW = 1.0;
+                    for (int j = 0; j < C; ++j) specR[j] = 1.0;
+                    nUp = 1;
+                }
+            }
             mp = &sc.mats[child]; matId = child;
         }
         // Surface emission on a specular/camera arrival (NEE covers diffuse arrivals).
@@ -14168,6 +14856,96 @@ __global__ void kIsoPreview(DScene sc, DCamera cam, DPreviewLight pl,
     }
 }
 
+// The reflect slot's BASE at `L` from a captured shape (DJBase): exactly what dReflectBase returned
+// at the capture's wavelength, re-read at another. Table lookups and three-term polynomials only.
+__device__ static double dJBaseEval(const DScene& sc, const DMaterial& m, const DJBase& b, double L) {
+    double v;
+    if (b.mode == 1)      v = (double)dReflAt(b.c, (Real)L);
+    else if (b.mode == 2) {   // only the planes dTexReflTriplanar read (a zero weight left its slot unset)
+        v = 0.0;
+        for (int q = 0; q < 3; ++q) if (b.w[q] > 0.0) v += b.w[q] * (double)dReflAt(b.c + 3 * q, (Real)L);
+    }
+    else if (b.mode == 3) v = (double)dRecReflAt(sc.recCoeff + m.recReflOff, REC_LUT_N,
+                                                 (double)m.recReflLo, (double)m.recReflHi, b.recD, (Real)L);
+    else                  v = (double)specLookup(m.reflect, (Real)L);
+    if (b.vc) v *= stochReflAt(b.cv, L);
+    return v;
+}
+// dDiffuseRho (diffuse = true) or dReflectSlot at `L` from a captured shape, the walk's outer clamp
+// included -- the value its `betaFactor` took, at another wavelength.
+__device__ static double dJSlotAt(const DScene& sc, const DMaterial& m, const DJBase& b, double L, bool diffuse) {
+    double v = dJBaseEval(sc, m, b, L);
+    if (m.reflectPat >= 0) v *= (double)b.pm;
+    if (diffuse) v = (double)clamp01((Real)v);
+    return (double)clamp01(dCoatedAlbedoAt(m, (Real)v, (Real)L));
+}
+
+// The optical depth a segment crosses in each medium, wavelength-free: the clipped length of a
+// homogeneous one, the density integral (DJ_TRQUAD midpoints) of a heterogeneous one.
+// A chromatic medium's Tr(lam)/Tr(lambda) is then exp(-sum_m (sigma_t,m(lam) - sigma_t,m(lambda))
+// tau_m), with one density read per sample point rather than one per wavelength.
+#define DJ_MAXMED 16
+#define DJ_TRQUAD 32   // host kJTrQuad: midpoints of a heterogeneous medium's density integral
+__device__ static void dJDepths(const DScene& sc, const DVec3& o, const DVec3& d, double dist,
+                                double* tau) {
+    const DPatEnv env = dPatEnvOf(sc);
+    for (int i = 0; i < sc.mediaN && i < DJ_MAXMED; ++i) {
+        tau[i] = 0.0;
+        const DMedium& m = sc.media[i];
+        double ta, tb;
+        if (!dMedClip(m, o, d, 0.0, dist, ta, tb) || !(tb > ta)) continue;
+        if (!m.heterogeneous) { tau[i] = tb - ta; continue; }
+        const double dt = (tb - ta) / (double)DJ_TRQUAD;
+        double acc = 0.0;
+        for (int q = 0; q < DJ_TRQUAD; ++q) acc += dMedDensityAt(m, o + d * (Real)(ta + ((double)q + 0.5) * dt), env);
+        tau[i] = acc * dt;
+    }
+}
+// Fold a segment's chromatic transmittance ratio into `jr` (host twin: randomWalk's trDet fold).
+__device__ static void dJTrFold(const DScene& sc, DJSpecRun& jr, const DVec3& o, const DVec3& d,
+                                double dist, Real lambda) {
+    if (sc.mediaN > DJ_MAXMED) return;
+    double tau[DJ_MAXMED];
+    dJDepths(sc, o, d, dist, tau);
+    double v[DJSPEC_K];
+    for (int k = 0; k < DJSPEC_K; ++k) {
+        double e = 0.0;
+        for (int i = 0; i < sc.mediaN; ++i)
+            if (tau[i] > 0.0)
+                e += ((double)medSigmaT(sc.media[i], (Real)DJSpec::lamOf(k)) -
+                      (double)medSigmaT(sc.media[i], lambda)) * tau[i];
+        v[k] = exp(-e);
+    }
+    jr.mulVec(v, 1.0);
+}
+
+
+// What mode M's spectral gather folds per photon wavelength for a dDielectricStep the ray `d` made
+// at the hit `h` (host twin: Renderer::stepFactorAt): at wavelength L, the probability of the branch
+// it took -- the Fresnel or interference reflectance for the same incidence, or one minus it --
+// times the radiance factor (n_from / n_to)^2 if it refracted. At a boundary the priority rule
+// suppresses wherever the coat is clear, 1 for a pass-through where it is clear at L and 0 for
+// any branch the walk could not have taken there. `st` is what the step recorded; folded against
+// its own `st.factor`. `prob`, if given, receives the branch's probability alone at L
+// (DSpecThr::mulCoin; st.prob at the walk's wavelength). Defined here, above dRandomWalk,
+// because mode J's camera walk folds it too (JSPEC).
+__device__ static double dStepFactorAt(const DScene& sc, const DMaterial& m, const DHit& h,
+                                       const DVec3& d, const DStepRecord& st, Real L,
+                                       double* prob = nullptr) {
+    double f;
+    if (st.suppressible && !dCoatOpaque(m, L)) f = st.pass ? 1.0 : 0.0;
+    else if (st.pass) f = 0.0;
+    else {
+        const Real ne = (st.farMat >= 0) ? specLookup(sc.mats[st.farMat].ior, L) : (Real)1;
+        const DInterfaceOptics o = dInterfaceOptics(sc, m, h, d, ne, L);
+        if (prob) *prob = dBranchProb(o, st.refracted);
+        return dBranchFactor(o, st.refracted);
+    }
+    if (prob) *prob = f;                                 // a pass-through's factor is its probability
+    return f;
+}
+
+
 // --- Subpath ray segments, for the mode-J (UPBP) beam merge ---------------------------
 //
 // Device twin of bdpt.h's PathSeg. A BDPT *connection* joins two sampled vertices, so it
@@ -14196,6 +14974,8 @@ struct DPathSeg {
     double aGlass;     // absorption of the dielectric the ray is inside (exp(-a*t) per hit)
     double pdfDir;     // solid-angle density of `d` at the vertex this segment leaves
     int    vert;       // index in the subpath of that vertex
+    int    glassMat;   // the dielectric the ray is inside (stk.topMat()), -1 in air
+    DJSpec spec;       // JSPEC: the camera carrier at `o` (host twin PathSeg::spec); any == 0 off
 };
 
 // Continue a subpath whose endpoint is already path[0]; append surface vertices
@@ -14219,7 +14999,8 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                                    bool importance, const double* betaSecIn, int nUpIn,
                                    DEscape* esc = nullptr,
                                    DPathSeg* segs = nullptr, int* nSegs = nullptr,
-                                   int maxSegs = 0) {
+                                   int maxSegs = 0, DJSpecRun* jrun = nullptr,
+                                   DJSpec* vspec = nullptr) {
     const Real lambda = hb.lam[0];   // the hero drives geometry, sampling and every pdf
     if (maxDepth == 0) return;
     double pdfFwd = pdfDir;
@@ -14228,12 +15009,19 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
     int nUp = nUpIn < 1 ? 1 : nUpIn;
     for (int i = 0; i + 1 < nUp; ++i) betaSec[i] = betaSecIn[i];
     DMediumStack stk; stk.clear();   // nested-dielectric medium stack for exterior-IOR resolution
+    // A fiber's far-side exit clearance for the NEXT hop, curve primitives only (bdpt.h
+    // randomWalk's `fiberFar` Ray, kVcmCameraT's twin). 0 everywhere off a strand, so a hair-free
+    // walk traces exactly the rays it always did.
+    Real curveTmin = (Real)0;
+    Real nextTmin = (Real)-1;    // >= 0: the next trace leaves a strand (dStrandStart) -- its tmin
     for (int bounces = 0;;) {
         // `hide_camera` is primary visibility only, so it applies to exactly one ray in this
         // walk: the first edge of the RADIANCE (camera) subpath. An importance walk starts at
         // a light and never has a camera ray at all. See DMaterial::hideCamera.
-        DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG,
-                            /*camHide=*/(!importance && bounces == 0));
+        DHit h = closestHit(sc, ro, rd,
+                            (nextTmin >= (Real)0) ? nextTmin : ((curveTmin > (Real)0) ? (Real)0 : RAY_EPS), BIG,
+                            /*camHide=*/(!importance && bounces == 0), curveTmin);
+        curveTmin = (Real)0; nextTmin = (Real)-1;
         if (h.valid && h.sensorId >= 0) return;
         double dSurf = h.valid ? (double)h.t : 1e30;
 
@@ -14249,6 +15037,8 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             sg.aGlass = (cmS >= 0) ? (double)specLookup(sc.mats[cmS].absorb, lambda) : 0.0;
             sg.pdfDir = pdfFwd;
             sg.vert   = n - 1;
+            sg.glassMat = cmS;
+            if (jrun) jrun->snap(sg.spec); else { sg.spec.any = 0; sg.spec.logS = 0.0; sg.spec.disp = 0; }   // JSPEC
             ++(*nSegs);
         }
 
@@ -14280,6 +15070,17 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 if (ai > 0.0) betaSec[i] *= exp(-ai * (mediumEvent ? tMed : dSurf));
             }
         }
+        // JSPEC (a mode-J camera walk; host twin randomWalk): this segment's factors re-expressed
+        // at every bin -- coloured glass, and a chromatic medium's Tr(lam)/Tr(lambda) up to the
+        // event. An escaping segment makes no further vertex: skipped.
+        if (jrun && (mediumEvent ? tMed : dSurf) < 1e29) {
+            const double dE = mediumEvent ? tMed : dSurf;
+            const int cmJ = stk.topMat();
+            if (cmJ >= 0)
+                jrun->mul([&](double L) { return exp(-(double)specLookup(sc.mats[cmJ].absorb, (Real)L) * dE); },
+                          exp(-(double)specLookup(sc.mats[cmJ].absorb, lambda) * dE), false);
+            if (c_jTrSpec && sc.mediaN > 0) dJTrFold(sc, *jrun, ro, rd, dE, lambda);
+        }
 
         // Medium collision precedes the surface: append a volume in-scatter vertex, then
         // scatter (prob = albedo) or absorb. Throughput unchanged on scatter (HG sampling
@@ -14296,10 +15097,12 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             v.beta = beta; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0;
             v.matId = -1; v.lightIdx = -1; v.emitPatW = (Real)1;
             v.mediumG = sm.g; v.mediumId = scatterMed;
+            v.tangent = DVec3(0, 0, 0); v.fiberR = (Real)0;   // not a strand (dSurfMergeSite / fiber tests)
             // Hero is gated off for scenes with media, so nUp is 1 here in practice.
             v.nUp = nUp;
             v.pdfFwd = dConvertDensity(pdfFwd, path[prevIdx], v);
             path[n] = v; int cur = n; n++;
+            if (jrun && vspec) jrun->snap(vspec[cur]);   // JSPEC: the carrier arriving here
             for (int i = 0; i + 1 < nUp; ++i) pathSec[cur * secStride + i] = betaSec[i];
             if (++bounces >= maxDepth) return;
             if (rng.uniform() >= (double)medAlbedo(sm, lambda)) return;   // absorbed (vertex retained)
@@ -14312,6 +15115,17 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             DVec3 wo = normalize(dwo);                                    // toward previous vertex
             Real phPdf;
             DVec3 wi = dMedPhaseSample(sm, rd, lambda, rng, phPdf);       // scattered dir (HG or rainbow)
+            // JSPEC: the scatter at every bin -- sigma_s(lam)/sigma_s(lambda), and a rainbow's
+            // phase at the direction lambda sampled (host twin randomWalk).
+            if (jrun && phPdf > (Real)0) {
+                jrun->mul([&](double L) { return (double)specLookup(sm.sigma_s, (Real)L); },
+                          (double)specLookup(sm.sigma_s, lambda), false);
+                if (sm.rbPdf) {
+                    const Real cJ = dot(rd, normalize(wi));
+                    jrun->mul([&](double L) { return (double)dMedPhase(sm, cJ, (Real)L); },
+                              (double)dMedPhase(sm, cJ, lambda), false);
+                }
+            }
             double pdfW    = dPhasePdf(sc, path[cur], wo, wi, lambda);
             double pdfRevW = dPhasePdf(sc, path[cur], wi, wo, lambda);
             path[prevIdx].pdfRev = dConvertDensity(pdfRevW, path[cur], path[prevIdx]);
@@ -14331,8 +15145,27 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
         if (dIsCompound(mp->type)) {
-            int child = dResolveCompound(sc, *mp, h, rd, lambda, rng);   // honours per-hit blend mask
+            int coatPick = -1; double coatR = 0.0, coatCos = 1.0, coatU = 0.0; Real coatTh = (Real)0;
+            int child = dResolveCompound(sc, *mp, h, rd, lambda, rng,     // honours per-hit blend mask
+                                         &coatPick, &coatR, &coatCos, &coatTh, &coatU);
             if (child < 0) return;
+            // THE HERO BUNDLE at a coat's coin (host twin randomWalk, where the reasoning is): one
+            // coin compared per wavelength; if they disagree the bundle collapses AT this vertex.
+            if (coatPick >= 0 && nUp > 1)
+                for (int i = 0; i + 1 < nUp; ++i)
+                    if ((coatU < dCoatRAtJ(*mp, coatCos, coatTh, hb.lam[i + 1])) != (coatPick == 1)) {
+                        nUp = 1;
+                        break;
+                    }
+            // JSPEC: a layered coat's coat-or-body coin at every bin (host twin randomWalk), folded
+            // before the push so a point merge here carries it too.
+            if (jrun && coatPick >= 0) {
+                const DMaterial& lm = *mp;
+                const bool cp = coatPick == 1;
+                jrun->mul([&](double L) { const double r = dCoatRAtJ(lm, coatCos, coatTh, (Real)L);
+                                          return cp ? r : 1.0 - r; },
+                          cp ? coatR : 1.0 - coatR, false);
+            }
             mp = &sc.mats[child]; matId = child;
         }
         if (n >= maxV) return;
@@ -14346,9 +15179,14 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         v.emitPatW = (mp->emitPat >= 0) ? (Real)dEmitPatMul(sc, mp->emitPat, h) : (Real)1;
         v.mediumG = 0.0; v.mediumId = -1;
         v.u = h.u; v.v = h.v; v.curv = h.curv;   // per-hit texcoords + curvature for textured/patterned/record BSDF eval (M9, O3)
+        // The strand frame and radius: dBsdfF / dBsdfPdf read them at a D_HAIR vertex (the fiber
+        // BCSDF's frame), the connections' far-side clearance reads them, and fiberR > 0 is how
+        // dSurfMergeSite knows a vertex sits on ANY curve primitive. 0 off a curve (DHit default).
+        v.tangent = h.tangent; v.fiberR = h.fiberRadius;
         v.nUp = nUp;
         v.pdfFwd = dConvertDensity(pdfFwd, path[n - 1], v);
         path[n] = v; int cur = n; n++;
+        if (jrun && vspec) jrun->snap(vspec[cur]);   // JSPEC: the carrier arriving here (coin included)
         for (int i = 0; i + 1 < nUp; ++i) pathSec[cur * secStride + i] = betaSec[i];
         if (++bounces >= maxDepth) return;
 
@@ -14367,12 +15205,85 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         // cases leave `secChromatic` false and reuse `betaFactor`. Ignored when nUp == 1.
         double secF[BDPT_NSEC];
         bool secChromatic = false;
+        // A fiber can end the bundle at its own vertex (the mixed solid/medulla rule in the D_HAIR
+        // case); unlike a delta's de-hero it also narrows THIS vertex, not just its continuation.
+        bool collapse = false;
+        // JSPEC needs the step a dielectric took and the branch a half mirror's coin picked.
+        DStepRecord jSt; bool jHmRefl = false;
+        DJBase jbS; jbS.mode = 0; jbS.vc = 0; jbS.pm = (Real)1;   // the slot's shape, captured below
+        Real tpS = (Real)1;
         switch (mp->type) {
+            case D_HAIR: {
+                // Fiber BCSDF -- device twin of bdpt.h randomWalk's Hair case (and of dVcmScatter's,
+                // whose sampling it shares). NOT delta: the lobes are narrow but finite, so a strand
+                // vertex is connectible on the CAMERA side (dConnectibleType, two-sided). A coverage
+                // pass-through (hair `opacity` < 1) returns EXACTLY -wo -- the ray was never
+                // intercepted -- which is a delta continuation, the same for every wavelength.
+                const DHairShade hs = dHairShadeAt(sc, *mp, h, lambda, wo);
+                double pdfH = 0.0, fv = 0.0;
+                const double u0 = rng.uniform(), u1 = rng.uniform(), u2 = rng.uniform(), u3 = rng.uniform();
+                const dhair::V3 wl = dhair::sample(hs.b, hs.woLocal, u0, u1, u2, u3, pdfH, fv);
+                if (!(pdfH > 0.0) || !(fv > 0.0)) { terminate = true; break; }
+                wi = dhair::toWorld(hs.fr, wl);
+                const bool passThru = (wl.x == -hs.woLocal.x && wl.y == -hs.woLocal.y &&
+                                       wl.z == -hs.woLocal.z);
+                pdfW    = pdfH;
+                pdfRevW = passThru ? pdfH : dBsdfPdf(sc, path[cur], wi, wo, lambda);
+                delta   = passThru ? 1 : 0;
+                if (passThru) keepBundle = true;
+                // LIGHT SUBPATHS STOP AT STRANDS (0.365.0; bdpt.h has the reasoning, known-issues
+                // HAIR-RECIPROCITY): the near-field fiber model is not reciprocal and its offset
+                // belongs to the CAMERA ray, so a strand on the light side of a path has no value
+                // that agrees pointwise with the camera side's. A light walk that scatters at one
+                // ends here, unstored and unconnectible -- every path through a strand is built from
+                // the camera side, and dMisWeight / the mode-J camera-side sums drop the light-side
+                // alternatives through it. A pass-through is the same from either side, so it rides on.
+                if (importance && !passThru) { --n; return; }
+                // f*cos/pdf collapses to the total lobe attenuation (hair.h); exactly 1 for a pass-through.
+                const double cosLong = dhair::safeSqrt(1.0 - dhair::sqr(dhair::clampd(wl.x, -1.0, 1.0)));
+                betaFactor = clamp01(fv * cosLong / pdfH);
+                secChromatic = true;
+                // A bundle MIXING solid fibers with fibers whose medulla is live goes on as the hero
+                // alone from HERE, this vertex included (bdpt.h: the medulla's wide scattered lobes
+                // carried on f_i / p_hero across that divide are heavy-tailed). The decision depends
+                // only on the SET of wavelengths, never on which is the hero, so it stays unbiased.
+                if (!passThru && nUp > 1) {
+                    bool anySolid = !hs.b.hasMedulla, anyMedulla = hs.b.hasMedulla;
+                    for (int i = 0; i + 1 < nUp; ++i) {
+                        const double lw = (double)hb.lam[i + 1];
+                        const bool live = hs.b.kappa > 0.0 &&
+                            fmax(0.0, (double)specLookup(mp->hairMedullaSigmaS, (Real)lw)) +
+                            fmax(0.0, (double)specLookup(mp->hairMedullaSigmaA, (Real)lw)) > 0.0;
+                        if (live) anyMedulla = true; else anySolid = true;
+                    }
+                    if (anySolid && anyMedulla) { collapse = true; path[cur].nUp = 1; }
+                }
+                // sigma_a is per-λ: each secondary re-evaluates its own fiber along the hero's direction.
+                // The bundle's secondaries and, for JSPEC, the fiber at lambda and at every bin, in
+                // ONE loop: a second call site of the BCSDF readers is the kind of growth that tips
+                // nvcc into emitting them out of line (see DJBase).
+                const int nSec = nUp - 1;
+                const int nJ = (jrun && !passThru) ? DJSPEC_K + 1 : 0;
+                double hv[DJSPEC_K + 1];
+                for (int i = 0; i < nSec + nJ; ++i) {
+                    const bool sec = i < nSec;
+                    if (sec && passThru) { secF[i] = 1.0; continue; }   // the ray missed the fiber at every λ
+                    if (sec && collapse) { secF[i] = 0.0; continue; }   // the hero goes on alone
+                    const int jk = i - nSec - 1;                        // -1: lambda itself
+                    const Real Li = sec ? hb.lam[i + 1] : (jk < 0 ? lambda : (Real)DJSpec::lamOf(jk));
+                    const DHairShade hsi = dHairShadeAt(sc, *mp, h, Li, wo);
+                    const double fc = (double)dHairFCos(hsi, wi);
+                    if (sec) secF[i] = fc / pdfH; else hv[jk + 1] = (double)clamp01((Real)(fc / pdfH));
+                }
+                // The clamped factor at every bin over the clamped one at lambda (host twin).
+                if (nJ) jrun->mulVec(hv + 1, hv[0]);
+                break;
+            }
             case D_DIFFUSE:
             case D_FLUORESCENT: {
                 wi = cosineHemisphere(path[cur].ns, rng);
                 if (dot(wi, path[cur].ns) <= 0) { terminate = true; break; }
-                double rho = clamp01(dDiffuseRho(sc, *mp, h, lambda));   // per-hit (tex/pat/record)
+                double rho = clamp01(dDiffuseRho(sc, *mp, h, lambda, jrun ? &jbS : nullptr));   // per-hit (tex/pat/record)
                 pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
                 pdfRevW = dBsdfPdf(sc, path[cur], wi, wo, lambda);
                 betaFactor = rho;
@@ -14385,7 +15296,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 DVec3 mdir = reflectv(rd, path[cur].ns);   // rd == -wo (incoming dir)
                 wi = sampleGlossy(mdir, dMatRoughness(sc, *mp, h), rng);   // per-hit roughness
                 if (dot(wi, path[cur].ns) <= 0) { terminate = true; break; }
-                double r = clamp01(dReflectSlot(sc, *mp, h, lambda));      // per-hit reflect
+                double r = clamp01(dReflectSlot(sc, *mp, h, lambda, jrun ? &jbS : nullptr));      // per-hit reflect
                 pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
                 pdfRevW = dBsdfPdf(sc, path[cur], wi, wo, lambda);
                 betaFactor = r;
@@ -14404,7 +15315,8 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 // transmit (-ns) with prob rhoT/(rhoR+rhoT); cosine-sample the chosen
                 // hemisphere. Analog: on a scatter beta is unchanged (f*|cos|/pdf == 1 with
                 // the lobe-selection pdf), like the diffuse case. Device twin of render.h.
-                double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, *mp, h, lambda, rhoR, rhoT);
+                double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, *mp, h, lambda, rhoR, rhoT,
+                                                           jrun ? &jbS : nullptr, jrun ? &tpS : nullptr);
                 double tot = rhoR + rhoT;
                 if (tot <= 0) { terminate = true; break; }
                 DVec3 nb = path[cur].ns * (Real)(-1);
@@ -14444,19 +15356,23 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 // priority). Radiance on the eye walk, flux on the light's.
                 DVec3 nro, nrd; double rs = 1.0;
                 if (!dDielectricStep(sc, *mp, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr,
-                                     importance ? nullptr : &rs)) { terminate = true; break; }
+                                     importance ? nullptr : &rs, jrun ? &jSt : nullptr)) { terminate = true; break; }
                 wi = nrd; betaFactor = rs; delta = 1;
+                // -jdispall: a dispersive refraction opens the window (host twin randomWalk).
+                if (jrun && c_jDispAll && jSt.refracted &&
+                    fabs((double)specLookup(mp->ior, (Real)DLMIN) - (double)specLookup(mp->ior, (Real)DLMAX)) > 1e-9)
+                    jrun->markDisp((double)lambda, (double)hb.invPdf[0]);
                 break;
             }
             case D_HALFMIRROR: {
                 double r = clamp01(specLookup(mp->reflect, lambda));
-                if (rng.uniform() < r) wi = reflectv(rd, path[cur].ns); else wi = rd;
+                if (rng.uniform() < r) { wi = reflectv(rd, path[cur].ns); jHmRefl = true; } else wi = rd;
                 betaFactor = 1.0; delta = 1;
                 break;
             }
             case D_FILTER: {
                 // Colored gel filter: straight-through delta, throughput ×= T(lambda).
-                double t = clamp01(dTransmitSlot(sc, *mp, h, lambda));
+                double t = clamp01(dTransmitSlot(sc, *mp, h, lambda, jrun ? &tpS : nullptr));
                 wi = rd; betaFactor = t; delta = 1;
                 // Straight-through for every λ: keep the bundle, reweight per-λ. This is
                 // the case with the widest per-λ spread (a Wratten gel is 0 over most of
@@ -14469,9 +15385,26 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             case D_GRATING: {
                 double r = clamp01(specLookup(mp->reflect, lambda));
                 if (r <= 0) { terminate = true; break; }
-                DVec3 nro, nrd;
-                if (!gratingDiffract(*mp, h, rd, lambda, diffraction, rng, nro, nrd)) { terminate = true; break; }
+                DVec3 nro, nrd; int pickG = 0;
+                if (!gratingDiffract(*mp, h, rd, lambda, diffraction, rng, nro, nrd, nullptr,
+                                     jrun ? &pickG : nullptr)) { terminate = true; break; }
                 wi = nrd; betaFactor = r; delta = 1;
+                // JSPEC (host twin randomWalk): the order at every bin, r(lam) / wsum(lam), 0
+                // where it is evanescent; any order but 0 opens the dispersive window.
+                if (jrun) {
+                    bool liveC;
+                    const double wsC = dGratingWsum(*mp, h, rd, lambda, diffraction, pickG, liveC);
+                    if (wsC > 0.0) {
+                        const DVec3 dIn = rd;
+                        jrun->mul([&](double L) {
+                                      bool live;
+                                      const double ws = dGratingWsum(*mp, h, dIn, (Real)L, diffraction, pickG, live);
+                                      return (live && ws > 0.0)
+                                                 ? (double)clamp01(specLookup(mp->reflect, (Real)L)) / ws : 0.0; },
+                                  r / wsC, true);
+                    }
+                    if (pickG != 0) jrun->markDisp((double)lambda, (double)hb.invPdf[0]);
+                }
                 break;
             }
             default: terminate = true; break;
@@ -14483,6 +15416,62 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         double mxF = betaFactor;
         if (secChromatic) for (int i = 0; i + 1 < nUp; ++i) if (secF[i] > mxF) mxF = secF[i];
         if (terminate || !(mxF > 0.0)) return;
+
+        // JSPEC (host twin randomWalk, where the reasoning is): this scatter's factor at every
+        // bin over the value `betaFactor` took at lambda. Hair and the grating fold in their cases.
+        if (jrun) {
+            switch (mp->type) {
+                // The reflect slot through the shape the walk's own read captured (DJBase): exact,
+                // patterns, records, stochastic tiling and coats included.
+                case D_DIFFUSE:
+                case D_FLUORESCENT:
+                case D_GLOSSY: {
+                    const bool dif = (mp->type != D_GLOSSY);
+                    auto fJ = [&](double L) { return dJSlotAt(sc, *mp, jbS, L, dif); };
+                    jrun->mul(fJ, fJ((double)lambda), false);
+                    break;
+                }
+                case D_DIFFUSETRANSMIT: {   // the lobe's albedo, normalised as dDiffuseTransmitAlbedos does
+                    const bool reflJ = dot(wi, path[cur].ns) > (Real)0;
+                    auto fJ = [&](double L) {
+                        const double rR = dJSlotAt(sc, *mp, jbS, L, true);
+                        Real tv = specLookup(mp->transmit, (Real)L);
+                        if (mp->transmitPat >= 0) tv = tv * tpS;
+                        const double rT = (double)clamp01(tv);
+                        const double sum = rR + rT;
+                        const double nrm = (sum > 1.0) ? 1.0 / sum : 1.0;
+                        return (reflJ ? rR : rT) * nrm; };
+                    jrun->mul(fJ, fJ((double)lambda), false);
+                    break;
+                }
+                case D_MIRROR:
+                    jrun->mul([&](double L) { return (double)clamp01(specLookup(mp->reflect, (Real)L)); },
+                              betaFactor, true);
+                    break;
+                case D_FILTER: {   // dTransmitSlot, its pattern captured
+                    auto fJ = [&](double L) {
+                        Real tv = specLookup(mp->transmit, (Real)L);
+                        if (mp->transmitPat >= 0) tv = tv * tpS;
+                        return (double)clamp01(tv); };
+                    jrun->mul(fJ, fJ((double)lambda), true);
+                    break;
+                }
+                case D_HALFMIRROR: {
+                    const double r0 = (double)clamp01(specLookup(mp->reflect, lambda));
+                    jrun->mul([&](double L) { const double r = (double)clamp01(specLookup(mp->reflect, (Real)L));
+                                              return jHmRefl ? r : 1.0 - r; },
+                              jHmRefl ? r0 : 1.0 - r0, true);
+                    break;
+                }
+                case D_DIELECTRIC:
+                case D_THINFILM:
+                case D_MULTILAYER:
+                    jrun->mul([&](double L) { return dStepFactorAt(sc, *mp, h, rd, jSt, (Real)L); },
+                              jSt.factor, false);
+                    break;
+                default: break;
+            }
+        }
 
         path[cur].delta = delta;
         if (delta) { pdfW = 0.0; pdfRevW = 0.0; }
@@ -14504,9 +15493,19 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         // really was reached by all C wavelengths); only its continuation is single-λ.
         // EXCEPTION: Mirror and Filter are delta but wavelength-INDEPENDENT in direction,
         // so they set keepBundle and carry the secondaries on a per-λ secF instead.
-        if (delta && !keepBundle) nUp = 1;
-        ro = dOffsetAlong(path[cur].p, path[cur].ng, wi);
+        if ((delta && !keepBundle) || collapse) nUp = 1;
         rd = normalize(wi);
+        // A fiber leaving its FAR side steps clear of its own tube with the exact chord, as a
+        // CURVE-ONLY tmin for the next trace (dHairChordExit is 0 on the near side). RAY_EPS is
+        // 1e-4 in FP32 -- a whole strand -- and would skip the neighbouring hair too (bdpt.h).
+        curveTmin = (mp->type == D_HAIR) ? dHairChordExit(h.fiberRadius, h.n, h.tangent, rd) : (Real)0;
+        ro = (curveTmin > (Real)0) ? dOffsetPoint(h.p, rd) : dOffsetAlong(path[cur].p, path[cur].ng, wi);
+#if FTRACE_GPU_FP32
+        if (mp->type == D_HAIR && h.fiberRadius > (Real)0) {   // see dStrandStart
+            const DStrandStart st = dStrandStart(h.p, h.n, h.tangent, h.fiberRadius, rd);
+            ro = st.o; nextTmin = st.tmin; curveTmin = st.curveTmin;
+        }
+#endif
         pdfFwd = delta ? 0.0 : pdfW;
     }
 }
@@ -14525,8 +15524,11 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
                                         DRng& rng, DVertex* path, double* pathSec, int secStride,
                                         int maxV, DEscape* esc = nullptr,
                                         DPathSeg* segs = nullptr, int* nSegs = nullptr,
-                                        int maxSegs = 0) {
+                                        int maxSegs = 0, DJSpecRun* jrun = nullptr,
+                                        DJSpec* vspec = nullptr) {
     const Real lambda = hb.lam[0];
+    if (jrun) jrun->init();   // JSPEC: the camera vertex carries no spectral factor
+    if (jrun && vspec) jrun->snap(vspec[0]);
     // The camera vertex sees every wavelength at unit throughput: the bundle starts at full
     // width with all secondary throughputs 1 (importance leaves the camera achromatic).
     double betaSec0[BDPT_NSEC];
@@ -14542,7 +15544,19 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
         Real u1 = rng.uniform(), u2 = rng.uniform();
         DVec3 ro, rd; Real wl = 0;
         c.nUp = 1;               // lensed cameras are single-λ (the hero gate excludes them)
-        if (!dGenLensRay(cam, px, py, jx, jy, u1, u2, lambda, ro, rd, wl) || wl <= 0) {
+        // JSPEC: the same film and pupil sample traced at every bin too (host twin
+        // generateCameraSubpath), in the one loop -- one call site of the lens tracer.
+        bool okL = false;
+        double wB[DJSPEC_K];
+        const int nLam = jrun ? DJSPEC_K + 1 : 1;
+        for (int j = 0; j < nLam; ++j) {
+            DVec3 roj, rdj; Real wlj = 0;
+            const Real Lj = (j == 0) ? lambda : (Real)DJSpec::lamOf(j - 1);
+            const bool okj = dGenLensRay(cam, px, py, jx, jy, u1, u2, Lj, roj, rdj, wlj);
+            if (j == 0) { okL = okj; ro = roj; rd = rdj; wl = wlj; if (!okL || wl <= 0) break; }
+            else wB[j - 1] = (okj && wlj > 0) ? (double)wlj : 0.0;
+        }
+        if (!okL || wl <= 0) {
             // Vignetted: lone delta camera vertex (nE=1) contributes 0 (t=1 off, t>=2 needs a
             // scene vertex we never added).
             c.p = cam.eye; c.delta = 1;
@@ -14552,10 +15566,14 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
         c.beta = (double)wl;     // radiometric lens weight -> per-pixel measurement
         c.delta = 1;             // no closed-form lens inverse: not connectible (t=1 off)
         path[0] = c; int n = 1;
+        if (jrun) {
+            jrun->mulVec(wB, (double)wl);
+            if (c_jDispAll) jrun->markDisp((double)lambda, (double)hb.invPdf[0]);
+        }
         double pdfDir = dCameraPdfDir(cam, ddot(rd, cam.w));   // MIS-irrelevant placeholder
         dRandomWalk(sc, cam, diffraction, ro, rd, (double)wl, pdfDir, hb, maxDepth - 1, rng,
                     path, pathSec, secStride, maxV, n, false, betaSec0, 1, esc,
-                    segs, nSegs, maxSegs);
+                    segs, nSegs, maxSegs, jrun, vspec);
         return n;
     }
     c.p = cam.eye;
@@ -14568,7 +15586,7 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
     double pdfDir = dCameraPdfDir(cam, cosCam);
     dRandomWalk(sc, cam, diffraction, cam.eye, rd, 1.0, pdfDir, hb, maxDepth - 1, rng,
                 path, pathSec, secStride, maxV, n, false, betaSec0, hb.C, esc,
-                segs, nSegs, maxSegs);
+                segs, nSegs, maxSegs, jrun, vspec);
     return n;
 }
 // Sample a light subpath. path[0] is the light endpoint (beta = Le).
@@ -14609,10 +15627,29 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
             double R = sc.sceneRadius;
             if (R <= 0.0) return 0;
             DVec3 tt, bb; onb(em.beamDir, tt, bb);
-            double rr = R * sqrt((double)rng.uniform()), phi = 2.0 * DPI * (double)rng.uniform();
-            org = sc.sceneCenter + tt * (Real)(rr * cos(phi)) + bb * (Real)(rr * sin(phi))
-                - em.beamDir * (Real)R;
-            pdfPosD = 1.0 / (DPI * R * R);
+            double x, y;
+            if (dSunAimOn() && (double)rng.uniform() < c_sunAimF) {
+                // THE AIMED SHARE (host deltaLightSubpath): a target circle by r^2, a point in it.
+                const double pick = (double)rng.uniform() * c_sunAimSumR2;
+                double acc = 0.0;
+                int j = 0;
+                for (; j + 1 < c_sunAimN; ++j) {
+                    acc += c_sunAimR[j] * c_sunAimR[j];
+                    if (pick < acc) break;
+                }
+                double cx, cy; dSunAimProject(sc, tt, bb, j, cx, cy);
+                const double rr = c_sunAimR[j] * sqrt((double)rng.uniform());
+                const double phi = 2.0 * DPI * (double)rng.uniform();
+                x = cx + rr * cos(phi);
+                y = cy + rr * sin(phi);
+            } else {
+                double rr = R * sqrt((double)rng.uniform()), phi = 2.0 * DPI * (double)rng.uniform();
+                x = rr * cos(phi);
+                y = rr * sin(phi);
+            }
+            org = sc.sceneCenter + tt * (Real)x + bb * (Real)y - em.beamDir * (Real)R;
+            pdfPosD = dSunOriginPdf(sc, em, x, y);   // 1/(pi R^2) with the aim off
+            if (!(pdfPosD > 0.0)) return 0;
         } else {
             org = em.origin;
         }
@@ -14774,18 +15811,27 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
         if (i == ti)       { num = ptPdfRev;             den = (float)PtP->pdfFwd;   dl = 0; }
         else if (i == tMi) { num = ptMPdfRev;            den = (float)eye[i].pdfFwd; dl = eye[i].delta; }
         else               { num = (float)eye[i].pdfRev; den = (float)eye[i].pdfFwd; dl = eye[i].delta; }
+        // A strand is never a light vertex (dRandomWalk, 0.365.0): every strategy from here inward
+        // would put eye[i] on the light side, so none of them exists (bdpt.h misWeight). At i == ti
+        // the endpoint counts as non-delta, exactly as bdpt.h's ScopedAssign makes it.
+        {
+            const DVertex& vi = (i == ti) ? *PtP : eye[i];
+            if (!dl && vi.type == BV_SURFACE && vi.matId >= 0 && sc.mats[vi.matId].type == D_HAIR) break;
+        }
         ri *= (num != 0.f ? num : 1.f) / (den != 0.f ? den : 1.f);
         if (!dl && !eye[i - 1].delta) sumRi += ri;
         if (merges && i >= 2) {                      // merge at eye[i-1]
-            const double pRev = (i - 1 == tMi) ? (double)ptMPdfRev : eye[i - 1].pdfRev;
+            // eye[i-1]'s light-side neighbour is eye[i], whose flag is `dl` (0 at pt).
+            const double pRev = dMergeLightDensity((i - 1 == tMi) ? (double)ptMPdfRev
+                                                                  : (double)eye[i - 1].pdfRev, dl != 0);
             const double e = dMergeEtaPrime(sc, eye[i].p, eye[i - 1], eye[i - 2].p,
                                             pRev, lambda, env);
             // ...and the POINT merge at the same vertex. A vertex is a medium point or a
             // surface, never both, so at most one of these is non-zero -- but BOTH have to be
             // here, or a connection keeps a weight that ignores a technique competing for its
             // paths and the weights stop summing to one (measured: +15 % on `_cornell_diffuse`).
-            const double eS = (kappaSurf > 0.0 && dSurfMergeSite(sc, eye[i - 1]) && pRev > 0.0)
-                            ? pRev : 0.0;
+            const double eS = (kappaSurf > 0.0) ? dMergeEtaSurf(dSurfMergeSite(sc, eye[i - 1]), pRev)
+                                                : 0.0;
             if (e > 0.0 || eS > 0.0) sumMg += (double)ri * (e * mergeKappa + eS * kappaSurf);
         }
     }
@@ -14807,10 +15853,9 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
         if (!dl && !deltaPrev) sumRi += ri;
         if (merges && i >= 1 && t > 0) {             // merge at light[i]
             const DVec3 pNext = (i + 1 <= s - 1) ? light[i + 1].p : PtP->p;
-            const double e = dMergeEtaPrime(sc, light[i - 1].p, light[i], pNext,
-                                            light[i].pdfFwd, lambda, env);
-            const double eS = (kappaSurf > 0.0 && dSurfMergeSite(sc, light[i]) &&
-                               light[i].pdfFwd > 0.0) ? (double)light[i].pdfFwd : 0.0;
+            const double plI = dMergeLightDensity((double)light[i].pdfFwd, light[i - 1].delta != 0);
+            const double e = dMergeEtaPrime(sc, light[i - 1].p, light[i], pNext, plI, lambda, env);
+            const double eS = (kappaSurf > 0.0) ? dMergeEtaSurf(dSurfMergeSite(sc, light[i]), plI) : 0.0;
             if (e > 0.0 || eS > 0.0) sumMg += (double)ri * (e * mergeKappa + eS * kappaSurf);
         }
     }
@@ -14819,8 +15864,8 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
     if (merges && s >= 1 && t >= 2) {
         const double e = dMergeEtaPrime(sc, QsP->p, *PtP, eye[tMi].p,
                                         (double)ptPdfRev, lambda, env);
-        const double eS = (kappaSurf > 0.0 && dSurfMergeSite(sc, *PtP) && ptPdfRev > 0.0)
-                        ? (double)ptPdfRev : 0.0;
+        const double eS = (kappaSurf > 0.0) ? dMergeEtaSurf(dSurfMergeSite(sc, *PtP), (double)ptPdfRev)
+                                            : 0.0;
         if (e > 0.0 || eS > 0.0) sumMg += e * mergeKappa + eS * kappaSurf;
     }
     return 1.0 / (1.0 + (double)sumRi + sumMg);
@@ -14860,6 +15905,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
     sampled.delta = 0; sampled.matId = -1; sampled.lightIdx = -1;
     sampled.emitPatW = (Real)1;
     sampled.mediumG = 0.0; sampled.mediumId = -1; sampled.u = 0; sampled.v = 0;
+    sampled.tangent = DVec3(0, 0, 0); sampled.fiberR = (Real)0;   // an emitter sample, never a strand
 
     if (s == 0) {
         if (t < 2) return 0.0;
@@ -15042,9 +16088,18 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
                 stG = (double)dShadowTerminatorG(wi, pt.ns, ngoP);
                 if (stG <= 0.0) return 0.0;
             }
-                        o = dOffsetAlong(pt.p, pt.ng, wi);
+                        o = dVertConnOrigin(sc, pt, wi);   // a strand's far side starts along wi (bdpt.h connOrigin)
         }
-        if (occludedTo(sc, o, pt.p + wi * (Real)dist, occlEps)) return 0.0;
+        // A strand eye vertex clears its own tube with the curve-only chord (bdpt.h connFiberStep);
+        // 0 for every other vertex, i.e. the call it always was.
+#if FTRACE_GPU_FP32
+        if (dVertOnStrand(sc, pt)) {   // see dStrandStart
+            const DStrandStart st = dStrandStart(pt.p, pt.ns, pt.tangent, pt.fiberR, wi);
+            if (occludedTo(sc, st.o, pt.p + wi * (Real)dist, occlEps, st.tmin, false, st.curveTmin)) return 0.0;
+        } else
+#endif
+        if (occludedTo(sc, o, pt.p + wi * (Real)dist, occlEps, RAY_EPS, false,
+                       (pt.type == BV_MEDIUM) ? (Real)0 : dVertFiberStep(sc, pt, wi))) return 0.0;
         double f = (pt.type == BV_MEDIUM) ? dMediumScatterF(sc, pt, wo, wi, lambda)
                                           : dBsdfF(sc, pt, wo, wi, lambda) * stG;
         double fSec[BDPT_NSEC];
@@ -15115,7 +16170,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
                 stGE = (double)dShadowTerminatorG(w, pt.ns, ngoE);
                 if (stGE <= 0.0) return 0.0;
             }
-                        o = dOffsetAlong(pt.p, pt.ng, w);
+                        o = dVertConnOrigin(sc, pt, w);   // a strand's far side starts along w (bdpt.h connOrigin)
         }
         if (qs.type != BV_MEDIUM) {
             cosL = ddot(qs.ns, w * (Real)-1);
@@ -15133,7 +16188,16 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         } else {
             cosL = 1.0;
         }
-        if (occludedTo(sc, o, pt.p + w * (Real)dist, 2e-6)) return 0.0;
+        // The eye end may be a strand (bdpt.h connFiberStep); the light end never is -- a light walk
+        // does not store one -- so bdpt.h's connShorten at qs is identically 0 here.
+#if FTRACE_GPU_FP32
+        if (dVertOnStrand(sc, pt)) {   // see dStrandStart
+            const DStrandStart st = dStrandStart(pt.p, pt.ns, pt.tangent, pt.fiberR, w);
+            if (occludedTo(sc, st.o, pt.p + w * (Real)dist, 2e-6, st.tmin, false, st.curveTmin)) return 0.0;
+        } else
+#endif
+        if (occludedTo(sc, o, pt.p + w * (Real)dist, 2e-6, RAY_EPS, false,
+                       (pt.type == BV_MEDIUM) ? (Real)0 : dVertFiberStep(sc, pt, w))) return 0.0;
         double fE, fL;
         double fESec[BDPT_NSEC], fLSec[BDPT_NSEC];
         if (pt.type == BV_MEDIUM) {
@@ -15228,7 +16292,8 @@ struct DSurfMergeW {
 // the host and a second transcription of it is a second chance to disagree.
 __device__ static void dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const DVertex& vk,
                                     const DVec3& woCam, const DSurfMergeW& sw,
-                                    double& gX, double& gY, double& gZ) {
+                                    double& gX, double& gY, double& gZ,
+                                    const DJSpec* js = nullptr) {
     const double r2 = (double)sm.radius * (double)sm.radius;
     const int ix = (int)fmin(fmax(floor(((double)vk.p.x - (double)sm.lo.x) / (double)sm.cell), 0.0), (double)(sm.nx - 1));
     const int iy = (int)fmin(fmax(floor(((double)vk.p.y - (double)sm.lo.y) / (double)sm.cell), 0.0), (double)(sm.ny - 1));
@@ -15252,7 +16317,15 @@ __device__ static void dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const 
             const double pdfDirFwd = dBsdfPdf(sc, vk, ph.wo, woCam, lam);
             const double w = sw(lm, pdfDirRev, pdfDirFwd);
             if (!(w > 0.0)) continue;
-            const double cf = w * fCam * (double)ph.beta;
+            if (js && js->disp) {   // windowed (DJSpec::disp): light at lambda_c only, coloured there
+                const double ww = js->winW((double)lam);
+                if (!(ww > 0.0)) continue;
+                const double lc = (double)js->lamC;
+                const double cfw = w * fCam * (double)ph.beta * ww * js->atC();
+                gX += (double)cieX((Real)lc) * cfw; gY += (double)cieY((Real)lc) * cfw; gZ += (double)cieZ((Real)lc) * cfw;
+                continue;
+            }
+            const double cf = w * fCam * (double)ph.beta * (js ? js->at((double)lam) : 1.0);   // JSPEC
             gX += (double)ph.cx * cf; gY += (double)ph.cy * cf; gZ += (double)ph.cz * cf;
         }
     }}}
@@ -15316,6 +16389,12 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
     // zero is what makes every surface term in the weight vanish -- the same gate mergeKappa is
     // for the beams.
     const double kappaSurf = (sm.nPts > 0) ? sm.kappaS : 0.0;
+    // JSPEC: the camera walk carries its spectral factors on a grid so each merge can read them
+    // at its beam's or photon's own wavelength (DJSpec). The point merges read theirs off the
+    // segment INTO the merge vertex, so with the carrier on, the walk records segments for them
+    // too -- recording draws nothing, so the paths are unchanged.
+    const bool jSpecOn = MERGE && c_jSpecOn && (mergeOn || kappaSurf > 0.0);
+    const bool wantSegs = mergeOn;
     if (maxDepth > MAXD) maxDepth = MAXD;   // device array bound (host picks the variant)
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
@@ -15334,10 +16413,23 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
             if (px0 >= resX) continue;           // padding slot of a partial run
             pix = (long long)row * (long long)resX + px0;
         }
-        long long gidx = pix * sppTotal + sampleBase + (idx - slot * chunkSpp);
-        DRng rng; rng.seedUnit((unsigned long long)gidx, seedBase);
+        const long long gidxBase = pix * sppTotal + sampleBase + (idx - slot * chunkSpp);
         int px = (int)(pix % resX);
         int py = (int)(pix / resX);
+        // PER-MODE SAMPLE COUNTS (see c_routeSppD): kD / kJ sub-samples of this base sample. Sub-sample
+        // 0 is the base sample itself (its index, its stream), so both counts at 1 change nothing.
+        // (The loop body below keeps its old indentation.)
+        int kD = 1, kJ = 1;
+        if (MERGE && c_routeOn) {
+            kD = dRouteSubCount(c_routeSppD, (unsigned long long)gidxBase, seedBase, 0x5851F42D4C957F2Dull);
+            kJ = dRouteSubCount(c_routeSppJ, (unsigned long long)gidxBase, seedBase, 0x14057B7EF767814Full);
+        }
+        const int nSub = (kD > kJ) ? kD : kJ;
+        for (int sub = 0; sub < nSub; ++sub) {
+        const long long gidx = (sub == 0) ? gidxBase
+            : (long long)(dMix64((unsigned long long)gidxBase * 0xD1B54A32D192ED03ull + (unsigned long long)sub) >> 1);
+        const bool allowD = sub < kD, allowJ = sub < kJ;
+        DRng rng; rng.seedUnit((unsigned long long)gidx, seedBase);
 
         // Hero + C-1 stratified secondaries from ONE base uniform (u + i/C wrapped into
         // [0,1)), pushed through the same inverse-CDF the scalar path uses. The hero must
@@ -15369,15 +16461,39 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
         double eyeSec[MAXV * SECN], lightSec[MAXV * SECN];
         DPathSeg segs[SEGN];
         int nSegs = 0;
+        DJSpecRun jrun;
+        DJSpec vspec[MERGE ? MAXV : 1];   // JSPEC: the carrier arriving at each eye vertex (point merges)
         // Only pay for escape tracking when the scene actually has a distant sun.
         DEscape esc; esc.escaped = 0; esc.beta = 0.0; esc.nUp = 1;
         // maxDepth + 2 eye vertices, so s = 0 can make a path of every depth it is weighted for
         // (host twin: BdptRenderer::renderRows).
         int nE = dGenCameraSubpath(sc, cam, diffraction, px, py, hb, maxDepth + 2, rng, eye, eyeSec, NS, MAXV,
                                    (sc.sunCount > 0) ? &esc : nullptr,
-                                   mergeOn ? segs : nullptr, mergeOn ? &nSegs : nullptr,
-                                   mergeOn ? (int)SEGN : 0);
+                                   wantSegs ? segs : nullptr, wantSegs ? &nSegs : nullptr,
+                                   wantSegs ? (int)SEGN : 0, jSpecOn ? &jrun : nullptr,
+                                   (jSpecOn && kappaSurf > 0.0) ? vspec : nullptr);
         int nL = dGenLightSubpath(sc, cam, diffraction, hb, maxDepth + 1, rng, light, lightSec, NS, MAXV);
+
+        // PER-OBJECT ROUTE (0.386.0; see c_routeOn). routeR: the route of every path this camera
+        // subpath makes with t >= 2, which all share its leading chain eye[1..fIdx]. prefJ bit k
+        // (0 < k < fIdx): the chain PREFIX eye[1..k] is already J, so a beam merge on segment k,
+        // which extends that prefix by a medium point, is J whatever the medium; otherwise such a
+        // merge is J only in a J medium (DWfSeg::routeMedJ).
+        int routeR = 1, fIdx = nE;
+        unsigned prefJ = 0u;
+        const bool routeOn = MERGE && c_routeOn;
+        if (routeOn) {
+            int r = -1;
+            for (int k = 1; k < nE; ++k) {
+                const int m = dRouteOfVert(sc, eye[k]);
+                if (m > r) r = m;
+                if (!eye[k].delta) { fIdx = k; break; }
+                if (r == 1 && k < 32) prefJ |= (1u << k);
+            }
+            routeR = (r < 0) ? c_routeDefault : r;
+        }
+        const double wD = routeOn ? 1.0 / c_routeSppD : 1.0;   // per-mode sample weights
+        const double wJ = routeOn ? 1.0 / c_routeSppJ : 1.0;
 
         Real cx = cieX(lambda), cy = cieY(lambda), cz = cieZ(lambda);
         Real cxS[SECN], cyS[SECN], czS[SECN];
@@ -15395,7 +16511,9 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
         if (esc.escaped) {
             bool allDelta = true;
             for (int i = 1; i < nE; ++i) if (!eye[i].delta) { allDelta = false; break; }
-            if (allDelta) {
+            const bool escOk = !routeOn || ((routeR == 1) ? allowJ : allowD);
+            const double wEsc = (routeOn && routeR != 1) ? wD : wJ;
+            if (allDelta && escOk) {
                 for (int k = 0; k < sc.nEmitters; ++k) {
                     const DEmitter& em = sc.emitters[k];
                     if (em.shape != 6 || !dInSunCone(em, esc.dir)) continue;
@@ -15407,6 +16525,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                         ax += cxS[i] * ek; ay += cyS[i] * ek; az += czS[i] * ek;
                     }
                     if (esc.nUp > 1) { double inv = 1.0 / esc.nUp; ax *= inv; ay *= inv; az *= inv; }
+                    ax *= wEsc; ay *= wEsc; az *= wEsc;
                     size_t o = ((size_t)py * resX + px) * 3;
                     atomicAdd(&camFilm[o + 0], ax);
                     atomicAdd(&camFilm[o + 1], ay);
@@ -15422,11 +16541,21 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
             for (int s = 0; s <= sMax; ++s) {
                 int depth = t + s - 2;
                 if ((s == 1 && t == 1) || depth < 0 || depth > maxDepth) continue;
+                if ((c_dbgOnlyS >= 0 && s != c_dbgOnlyS) || (c_dbgOnlyT >= 0 && t != c_dbgOnlyT)) continue;
                 int spx = 0, spy = 0, isSplat = 0, nUpConn = 0;
                 double Lsec[SECN];
+                // A D-routed path takes mode D's weight: both merge constants zero. A t = 1 splat's
+                // chain is the light vertex it connects to the lens; every t >= 2 path shares routeR.
+                double mkST = mergeKappa, ksST = kappaSurf, wST = 1.0;
+                if (routeOn) {
+                    const int rt = (t >= 2) ? routeR : ((s >= 1) ? dRouteOfVert(sc, light[s - 1]) : routeR);
+                    if (rt != 1) { if (!allowD) continue; mkST = 0.0; ksST = 0.0; wST = wD; }
+                    else         { if (!allowJ) continue; wST = wJ; }
+                }
                 double c = (c_jHalf == 2) ? 0.0 : dConnectBDPT(sc, cam, light, eye, lightSec, eyeSec, NS,
                                         s, t, hb, rng, spx, spy, isSplat, Lsec, nUpConn,
-                                        mergeKappa, kappaSurf);
+                                        mkST, ksST);
+                if (wST != 1.0) { c *= wST; for (int i = 0; i + 1 < nUpConn; ++i) Lsec[i] *= wST; }
                 if (nUpConn <= 0) continue;
                 // Reject a non-positive — and, critically, a NON-FINITE — contribution before
                 // it reaches the film, exactly as BdptRenderer::renderRows does. Negated form
@@ -15483,7 +16612,9 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
         // Either merge kind opens this region. `mergeOn` needs a BEAM map, so gating the
         // whole block on it silently dropped the point merges on any scene without media --
         // exactly the scene the point merges exist for.
-        if ((mergeOn || kappaSurf > 0.0) && c_jHalf != 1) {
+        // Every merge makes a J-routed path (see c_routeOn), so a sub-sample that does not draw
+        // mode J does none of them; one that does weights them wJ.
+        if ((mergeOn || kappaSurf > 0.0) && c_jHalf != 1 && allowJ) {
             // The camera half of every merge weight, replayed ONCE for the whole subpath.
             // dMisWeight's camera loop telescopes inward from the merge point; everything it
             // accumulates strictly camera-side of eye[k] is independent of WHERE along the
@@ -15503,11 +16634,12 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                     // surface, never both, so exactly one of these is non-zero.
                     double eK = 0.0;
                     if (k >= 2) {
+                        const double plK = dMergeLightDensity((double)eye[k - 1].pdfRev,
+                                                              eye[k].delta != 0);
                         eK = mergeKappa * dMergeEtaPrime(sc, eye[k].p, eye[k - 1], eye[k - 2].p,
-                                                         eye[k - 1].pdfRev, lambda, dPatEnvOf(sc));
-                        if (kappaSurf > 0.0 && dSurfMergeSite(sc, eye[k - 1]) &&
-                            eye[k - 1].pdfRev > 0.0)
-                            eK += kappaSurf * eye[k - 1].pdfRev;
+                                                         plK, lambda, dPatEnvOf(sc));
+                        if (kappaSurf > 0.0)
+                            eK += kappaSurf * dMergeEtaSurf(dSurfMergeSite(sc, eye[k - 1]), plK);
                     }
                     double carry = 0.0, carryM = 0.0;
                     if (k >= 2) {
@@ -15518,14 +16650,28 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                         carry  = rC * segSumC[k - 1];
                         carryM = rC * segSumM[k - 1];
                     }
-                    segSumC[k] = gate + carry;
-                    segSumM[k] = eK + carryM;
+                    // A strand is never a light vertex (dRandomWalk, 0.365.0): every camera-side
+                    // alternative from eye[k] inward puts it there (bdpt.h cameraSideSums' fiberK).
+                    const bool fiberK = !eye[k].delta && eye[k].type == BV_SURFACE &&
+                                        eye[k].matId >= 0 && sc.mats[eye[k].matId].type == D_HAIR;
+                    segSumC[k] = fiberK ? 0.0 : gate + carry;
+                    segSumM[k] = fiberK ? 0.0 : eK + carryM;
                 }
             }
             for (int i = 0; mergeOn && i < nSegs; ++i) {
                 const DPathSeg& sg = segs[i];
                 if (!(sg.beta > 0.0)) continue;
                 if (sg.vert >= maxDepth) continue;   // every merge past the depth cap (host twin)
+                // The merged path's route (see routeR above): past the chain it is this subpath's;
+                // on a chain segment it is the prefix's, or the hit medium's if the prefix is D.
+                int routeMedJ = 0;
+                if (routeOn) {
+                    if (sg.vert >= fIdx) { if (routeR != 1) continue; }
+                    else if (!(sg.vert >= 1 && sg.vert < 32 && ((prefJ >> sg.vert) & 1u))) {
+                        if (!c_routeAnyMedJ) continue;
+                        routeMedJ = 1;
+                    }
+                }
                 // Hoisted out of the per-hit weight: the ray/bounds clip and the spectral
                 // sigma_t lookup are constants of the SEGMENT, and a dense medium hands one
                 // segment hundreds of hits. Built unconditionally so the gather's `camTr` is
@@ -15580,8 +16726,11 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                     const int si = atomicAdd(wq.nSegs, 1);
                     if (si < wq.segCap) {
                         DWfSeg& ws = wq.segs[si];
-                        ws.o = sg.o; ws.d = sg.d; ws.tMax = sg.tMax; ws.beta = sg.beta; ws.aGlass = sg.aGlass;
+                        ws.o = sg.o; ws.d = sg.d; ws.tMax = sg.tMax; ws.aGlass = sg.aGlass;
+                        ws.beta = sg.spec.beta(sg.beta) * wJ;   // JSPEC: the carrier's scale folded in
+                        ws.routeMedJ = routeMedJ;
                         ws.mw = mw; ws.tr = camTr; ws.px = px; ws.py = py; ws.lambda = (float)lambda;
+                        ws.spec = sg.spec;   // JSPEC (any == 0 when the carrier is off)
                         // The segment's own stream: its sample and its index along the walk, under
                         // the kernel's seed (which carries -seed), so it is the same however the
                         // queue's slots were handed out.
@@ -15595,12 +16744,13 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                 if (!queued) {
                     double mX = 0.0, mY = 0.0, mZ = 0.0;
                     dGatherPhotonBeams(sc, bm, sg.o, sg.d, (Real)sg.tMax, sg.aGlass, rng,
-                                       mX, mY, mZ, &mw, &camTr);
+                                       mX, mY, mZ, &mw, &camTr, routeMedJ, &sg.spec);
                     if (mX != 0.0 || mY != 0.0 || mZ != 0.0) {
                         size_t o = ((size_t)py * resX + px) * 3;
-                        atomicAdd(&camFilm[o + 0], mX * sg.beta);
-                        atomicAdd(&camFilm[o + 1], mY * sg.beta);
-                        atomicAdd(&camFilm[o + 2], mZ * sg.beta);
+                        const double bJ = sg.spec.beta(sg.beta) * wJ;   // JSPEC scale
+                        atomicAdd(&camFilm[o + 0], mX * bJ);
+                        atomicAdd(&camFilm[o + 1], mY * bJ);
+                        atomicAdd(&camFilm[o + 2], mZ * bJ);
                     }
                 }
             }
@@ -15609,7 +16759,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
             // Per VERTEX, not per segment -- a point merge happens where the camera walk
             // actually landed, so there is no ray to march and no rng draw, which is also why
             // "merges off == mode D bit-for-bit" survives this for free.
-            if (kappaSurf > 0.0 && sm.nPts > 0) {
+            if (kappaSurf > 0.0 && sm.nPts > 0 && (!routeOn || routeR == 1)) {
                 const double vmNorm = 1.0 / kappaSurf;
                 const int kEnd = (nE < maxDepth + 1) ? nE : maxDepth + 1;   // past it every merge is capped
                 for (int k = 1; k < kEnd; ++k) {
@@ -15643,10 +16793,13 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                     sw.segSumM      = (k - 1 < (int)SEGN) ? segSumM[k - 1] : 0.0;
                     sw.camVert      = k;
                     sw.maxDepth     = maxDepth;
+                    // JSPEC: the carrier arriving at eye[k] (the walk's snapshot), coin included;
+                    // eye[k]'s own BSDF is evaluated at the photon's wavelength by the merge.
+                    const DJSpec* vks = (jSpecOn && vspec[k].on()) ? &vspec[k] : nullptr;
                     double gX = 0.0, gY = 0.0, gZ = 0.0;
-                    dSurfMergeAt(sc, sm, vk, woCam, sw, gX, gY, gZ);
+                    dSurfMergeAt(sc, sm, vk, woCam, sw, gX, gY, gZ, vks);
                     if (gX != 0.0 || gY != 0.0 || gZ != 0.0) {
-                        const double f = vk.beta * vmNorm;
+                        const double f = (vks ? vks->beta(vk.beta) : vk.beta) * vmNorm * wJ;   // JSPEC scale
                         const size_t o = ((size_t)py * resX + px) * 3;
                         atomicAdd(&camFilm[o + 0], gX * f);
                         atomicAdd(&camFilm[o + 1], gY * f);
@@ -15655,6 +16808,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                 }
             }
         }
+        }   // sub-samples (per-mode sample counts)
     }
 }
 
@@ -16105,29 +17259,6 @@ __device__ static void dSpecFold(DSpecThr& st, const DScene& sc, const DMaterial
     }, atCam);
 }
 
-// What mode M's spectral gather folds per photon wavelength for a dDielectricStep the ray `d` made
-// at the hit `h` (host twin: Renderer::stepFactorAt): at wavelength L, the probability of the branch
-// it took -- the Fresnel or interference reflectance for the same incidence, or one minus it --
-// times the radiance factor (n_from / n_to)^2 if it refracted. At a boundary the priority rule
-// suppresses wherever the coat is clear, 1 for a pass-through where it is clear at L and 0 for
-// any branch the walk could not have taken there. `st` is what the step recorded; folded against
-// its own `st.factor`. `prob`, if given, receives the branch's probability alone at L
-// (DSpecThr::mulCoin; st.prob at the walk's wavelength).
-__device__ static double dStepFactorAt(const DScene& sc, const DMaterial& m, const DHit& h,
-                                       const DVec3& d, const DStepRecord& st, Real L,
-                                       double* prob = nullptr) {
-    double f;
-    if (st.suppressible && !dCoatOpaque(m, L)) f = st.pass ? 1.0 : 0.0;
-    else if (st.pass) f = 0.0;
-    else {
-        const Real ne = (st.farMat >= 0) ? specLookup(sc.mats[st.farMat].ior, L) : (Real)1;
-        const DInterfaceOptics o = dInterfaceOptics(sc, m, h, d, ne, L);
-        if (prob) *prob = dBranchProb(o, st.refracted);
-        return dBranchFactor(o, st.refracted);
-    }
-    if (prob) *prob = f;                                 // a pass-through's factor is its probability
-    return f;
-}
 
 // The device twin of camMediaTrSpec (photonmap_render.h): one straight camera segment's media
 // transmittance -- one ratio-tracking sample, or pbeams::kSunDiscTrSamples of them when the
@@ -17352,10 +18483,28 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 double R = sc.sceneRadius;
                 if (R <= 0.0) continue;
                 DVec3 tt, bb; onb(em.beamDir, tt, bb);
-                double rr = R * sqrt((double)rng.uniform()), phi = 2.0 * DPI * (double)rng.uniform();
-                y = sc.sceneCenter + tt * (Real)(rr * cos(phi)) + bb * (Real)(rr * sin(phi))
-                  - em.beamDir * (Real)R;
-                pdfPos = 1.0 / (DPI * R * R);
+                double x, yy;
+                if (dSunAimOn() && (double)rng.uniform() < c_sunAimF) {
+                    // THE AIMED SUN (0.387.0; host twin vcm.h, reasoning bdpt.h SunAim).
+                    const double pick = (double)rng.uniform() * c_sunAimSumR2;
+                    double acc = 0.0;
+                    int j = 0;
+                    for (; j + 1 < c_sunAimN; ++j) {
+                        acc += c_sunAimR[j] * c_sunAimR[j];
+                        if (pick < acc) break;
+                    }
+                    double cx, cy; dSunAimProject(sc, tt, bb, j, cx, cy);
+                    const double rr = c_sunAimR[j] * sqrt((double)rng.uniform());
+                    const double phi = 2.0 * DPI * (double)rng.uniform();
+                    x = cx + rr * cos(phi);
+                    yy = cy + rr * sin(phi);
+                } else {
+                    double rr = R * sqrt((double)rng.uniform()), phi = 2.0 * DPI * (double)rng.uniform();
+                    x = rr * cos(phi);
+                    yy = rr * sin(phi);
+                }
+                y = sc.sceneCenter + tt * (Real)x + bb * (Real)yy - em.beamDir * (Real)R;
+                pdfPos = dSunOriginPdf(sc, em, x, yy);   // 1/(pi R^2) with the aim off
             } else {
                 y = em.origin;                             // delta position: pdfPos == 1
                 emitScale = spotFalloff(ddot(dir, em.beamDir), em.spotCosInner, em.spotCosOuter);
@@ -17686,12 +18835,15 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
         bool camAllDelta = true;
         const bool hasSun = sc.sunCount > 0;
         Real curveTmin = (Real)0;   // far-side fiber clearance for the NEXT hop (see the continuation)
+        Real nextTmin = (Real)-1;   // >= 0: the next hop leaves a strand (dStrandStart) -- its tmin
 
         for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
             // edges == 1 is the camera-to-first-vertex edge — the primary ray; see
             // DMaterial::hideCamera. (The light subpath walk never gets this.)
-            DHit h = closestHit(sc, ro, rd, (curveTmin > (Real)0) ? (Real)0 : RAY_EPS, BIG,
+            DHit h = closestHit(sc, ro, rd,
+                                (nextTmin >= (Real)0) ? nextTmin : ((curveTmin > (Real)0) ? (Real)0 : RAY_EPS), BIG,
                                 /*camHide=*/(edges == 1), curveTmin);
+            nextTmin = (Real)-1;
             if (!h.valid) {
                 // The ray left the scene. No env map in VCM scope, but a `light sun` is a
                 // delta-DIRECTION emitter with no geometry: the s=0 term never fires for it
@@ -17850,7 +19002,11 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                 dist2 = distL * distL;
                                 occlEps = 0.0;
                                 neeDirectPdfW = 1.0 / coneSolid;
-                                neeEmissionPdfW = 1.0 / (DPI * R * R * coneSolid);
+                                // The aimed mixture at the origin a light subpath would
+                                // have needed (0.387.0; 1/(pi R^2) with the aim off).
+                                neeEmissionPdfW = (dSunAimOn()
+                                    ? dSunOriginPdfAlong(sc, em, h.p + wiL * (Real)distL, h.p)
+                                    : 1.0 / (DPI * R * R)) / coneSolid;
                                 geomOk = true;
                             }
                         } else {
@@ -17894,9 +19050,18 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                                                 DVec3 oo = dFiberConnOrigin(h, mp->type == D_HAIR, wiL);
                                 double f = 0.0, fSec[SECN];
                                 for (int k = 0; k + 1 < nUp; ++k) fSec[k] = 0.0;
+#if FTRACE_GPU_FP32
+                                // A strand camera vertex starts its shadow ray per dStrandStart (0.385.0).
+                                DStrandStart nst; nst.o = oo; nst.tmin = RAY_EPS;
+                                nst.curveTmin = dFiberStep(h, mp->type == D_HAIR, wiL);
+                                if (mp->type == D_HAIR && h.fiberRadius > (Real)0)
+                                    nst = dStrandStart(h.p, h.n, h.tangent, h.fiberRadius, wiL);
+#else
+                                const DStrandStart nst{oo, RAY_EPS, dFiberStep(h, mp->type == D_HAIR, wiL)};
+#endif
                                 if (mxLe > 0.0 &&
-                                    !occludedTo(sc, oo, h.p + wiL * (Real)distL, occlEps, RAY_EPS, false,
-                                                dFiberStep(h, mp->type == D_HAIR, wiL))) {
+                                    !occludedTo(sc, nst.o, h.p + wiL * (Real)distL, occlEps, nst.tmin, false,
+                                                nst.curveTmin)) {
                                     f = dBsdfF(sc, vt, wo, wiL, lambda) * stG;
                                     for (int k = 0; k + 1 < nUp; ++k)
                                         fSec[k] = dBsdfF(sc, vt, wo, wiL, lamAll[k + 1]) * stG;
@@ -17975,8 +19140,17 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     // tmin and stop short of the light vertex's (vcm.h fiberStep at both ends).
                     const bool litHair = (sc.mats[lv.matId].type == D_HAIR);
                     const Real lvStep = litHair ? dHairChordExit(lv.fiberR, lv.ns, lv.tangent, w * (Real)-1) : (Real)0;
-                    if (occludedTo(sc, oo, h.p + w * (Real)(distc - (double)lvStep), 2e-6, RAY_EPS, false,
-                                   dFiberStep(h, mp->type == D_HAIR, w))) continue;
+#if FTRACE_GPU_FP32
+                    // A strand camera vertex starts its shadow ray per dStrandStart (0.385.0).
+                    DStrandStart cst; cst.o = oo; cst.tmin = RAY_EPS;
+                    cst.curveTmin = dFiberStep(h, mp->type == D_HAIR, w);
+                    if (mp->type == D_HAIR && h.fiberRadius > (Real)0)
+                        cst = dStrandStart(h.p, h.n, h.tangent, h.fiberRadius, w);
+#else
+                    const DStrandStart cst{oo, RAY_EPS, dFiberStep(h, mp->type == D_HAIR, w)};
+#endif
+                    if (occludedTo(sc, cst.o, h.p + w * (Real)(distc - (double)lvStep), 2e-6, cst.tmin, false,
+                                   cst.curveTmin)) continue;
                     DVertex lvt = dVertFromLV(lv);
                     double adjLit = (double)dShadingAdjointCorr(lv.wo, w * (Real)-1, lv.ns, ngoLit) * stGLit;
                     double fCam = dBsdfF(sc, vt, wo, w, lambda) * stGCam;
@@ -18130,6 +19304,12 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             curveTmin = dFiberStep(h, mp->type == D_HAIR, wi);
             rd = normalize(wi);
             ro = (curveTmin > (Real)0) ? dOffsetPoint(h.p, rd) : dOffsetAlong(h.p, h.ng, wi);
+#if FTRACE_GPU_FP32
+            if (mp->type == D_HAIR && h.fiberRadius > (Real)0) {   // see dStrandStart (0.385.0)
+                const DStrandStart st = dStrandStart(h.p, h.n, h.tangent, h.fiberRadius, rd);
+                ro = st.o; nextTmin = st.tmin; curveTmin = st.curveTmin;
+            }
+#endif
         }
 
         accum[i * 3 + 0] += rx + sxl;
@@ -18525,12 +19705,14 @@ kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
             // non-zero (a vertex is in a medium or on a surface, never both).
             double eBeam = 0.0, eSurf = 0.0;
             if (u >= 2) {
-                eBeam = dMergeEtaPrime(sc, path[u - 2].p, path[u - 1], path[u].p,
-                                       path[u - 1].pdfFwd, lambda, env);
-                if (dSurfMergeSite(sc, path[u - 1]) && path[u - 1].pdfFwd > 0.0)
-                    eSurf = path[u - 1].pdfFwd;
+                const double plP = dMergeLightDensity((double)path[u - 1].pdfFwd, path[u - 2].delta != 0);
+                eBeam = dMergeEtaPrime(sc, path[u - 2].p, path[u - 1], path[u].p, plP, lambda, env);
+                eSurf = dMergeEtaSurf(dSurfMergeSite(sc, path[u - 1]), plP);
             }
-            if (dSurfMergeSite(sc, path[u]) && path[u].pdfFwd > 0.0 && path[u].beta > 0.0) {
+            // A photon that arrived through glass (pdfFwd 0 after a delta y_{u-1}) is stored too
+            // since 0.387.0, with that 0 read as 1 (host: traceLightBeamPass's store; MODE-J-SDS).
+            const double plU = dMergeLightDensity((double)path[u].pdfFwd, path[u - 1].delta != 0);
+            if (dSurfMergeSite(sc, path[u]) && plU > 0.0 && path[u].beta > 0.0) {
                 DVec3 dp = path[u - 1].p - path[u].p;
                 const double rho2 = ddot(dp, dp);
                 if (rho2 > 0.0) {
@@ -18554,7 +19736,7 @@ kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
                         sm.sumC    = accC;
                         sm.sumMb   = accMb + eBeam;
                         sm.sumMs   = accMs + eSurf;
-                        sm.pdfFwdA = path[u].pdfFwd;
+                        sm.pdfFwdA = plU;                 // a delta y_{u-1}'s 0 reads 1
                         sm.rCoef   = (float)(cosPrev /
                                              (rho2 * dMisRemap0(path[u - 1].pdfFwd)));
                         sm.gateC1  = (unsigned char)(gate > 0.0 ? 1 : 0);
@@ -18579,12 +19761,116 @@ template __global__ void kJSurfLightT<BDPT_MAXDEPTH>(
 template __global__ void kJSurfLightT<BDPT_DEEPDEPTH>(
     DScene, DCamera, int, int, long long, unsigned long long, DJSurfOut);
 
+// ---- DEVICE PROBE (FTRACE_DEVICE_PROBE=1; 0.385.0) -------------------------------------------
+// nvcc compiles this file twice -- the host half with the host compiler, the device half with its
+// own front end -- and BOTH halves read the HOST compiler's headers. So two things can go wrong
+// on the device alone after a host-toolchain change, silently: no CUDA error, a plausible image.
+//   * a struct the host fills and uploads is laid out differently by the device front end;
+//   * a <cmath> function compiles to something else on the device. MSVC 14.5x's float copysign
+//     returned 0 for every input there (see the copysign overloads at the top of namespace gpu),
+//     which NaN-ed every sampled direction -- what CMakeLists.txt had blamed on a "miscompile".
+// The probe prints sizeof() of every struct that crosses the boundary as each half sees it, and
+// evaluates every math function the device code calls (ftMathRow, float and double, edge inputs
+// included) on both halves. RUN IT after any change to the host compiler or the CUDA toolkit
+// (tools/check_device_probe.py); it found the copysign bug in one build.
+#define FT_DEVICE_LAYOUT_TYPES(X) \
+    X(DVec3) X(DTexture) X(DMaterial) X(DMediumStack) X(DTri) X(DSphere) \
+    X(DCurveSeg) X(DNode) X(DMirrorPlane) X(DBlas) X(DInstance) X(DFieldNode) \
+    X(DFieldNodeF) X(DImplicit) X(DVdbGrid) X(DMajorant) X(DMedium) X(DEmitTri) \
+    X(DEmitter) X(DEnvMap) X(DRecScalarStop) X(DEmissiveVolume) X(DBowTab) X(DScene) \
+    X(DLensSurface) X(DLensSystem) X(DCamera) X(DRng) X(DHit) X(DGrinMedia) \
+    X(DHairShade) X(DPhoton) X(DBeamDep) X(DBeamSpec) X(DAimTarget) X(DAimMap) \
+    X(DCamSet) X(DGatherPhoton) X(DPhotonMap) X(DTrRay) X(DBeamRec) X(DBeamMis) \
+    X(DVolCache) X(DBeamMap) X(DBeamMergeW) X(DSurfPhoton) X(DSurfMis) X(DSurfMap) \
+    X(DWfSeg) X(DWfHit) X(DWfQueue) X(DVertex) X(DEscape) X(DHeroBundle) \
+    X(DPLight) X(DPreviewLight) X(DPTex) X(DPathSeg) X(DSurfMergeW) X(DSppmState)
+enum { FT_MATH_N = 25 };
+template <class T> HD inline void ftMathRow(T x, T y, double* o) {
+    o[0] = sqrt(x);  o[1] = fabs(x);  o[2] = cos(x);   o[3] = exp(x);   o[4] = sin(x);  o[5] = floor(x);
+    o[6] = log(x);   o[7] = acos(x);  o[8] = asin(x);  o[9] = sinh(x);  o[10] = tan(x); o[11] = log2(x);
+    o[12] = cosh(x); o[13] = atan(x); o[14] = cbrt(x); o[15] = ceil(x); o[16] = fmax(x, y);
+    o[17] = fmin(x, y); o[18] = pow(x, y); o[19] = atan2(x, y); o[20] = copysign(x, y);
+    o[21] = nextafter(x, y); o[22] = isfinite(x) ? 1.0 : 0.0; o[23] = ldexp(x, 3);
+    o[24] = fma(x, y, (T)0.5);
+}
+__global__ void kDeviceProbe(unsigned long long* sizes, double* math, const double* xs,
+                             const double* ys, int n) {
+    int i = 0;
+#define FT_SZ(T) sizes[i++] = sizeof(T);
+    FT_DEVICE_LAYOUT_TYPES(FT_SZ)
+#undef FT_SZ
+    for (int r = 0; r < n; ++r) {
+        ftMathRow<float>((float)xs[r], (float)ys[r], math + (2 * r) * FT_MATH_N);
+        ftMathRow<double>(xs[r], ys[r], math + (2 * r + 1) * FT_MATH_N);
+    }
+}
+
 } // namespace gpu
 
 // ============================ host: bake + launch ============================
 
 static bool g_queried = false, g_available = false;
 static char g_devName[256] = "none";
+
+// Host half of the device probe (see kDeviceProbe). Returns the number of disagreements.
+static int deviceProbe() {
+    using namespace gpu;
+    static const char* tn[] = {
+#define FT_NM(T) #T,
+        FT_DEVICE_LAYOUT_TYPES(FT_NM)
+#undef FT_NM
+    };
+    static const unsigned long long hs[] = {
+#define FT_SZ(T) (unsigned long long)sizeof(T),
+        FT_DEVICE_LAYOUT_TYPES(FT_SZ)
+#undef FT_SZ
+    };
+    const int NT = (int)(sizeof(hs) / sizeof(hs[0]));
+    static const char* fn[FT_MATH_N] = {"sqrt", "fabs", "cos", "exp", "sin", "floor", "log", "acos",
+        "asin", "sinh", "tan", "log2", "cosh", "atan", "cbrt", "ceil", "fmax", "fmin", "pow", "atan2",
+        "copysign", "nextafter", "isfinite", "ldexp", "fma"};
+    const double xs[] = {0.0, -0.0, 1.0, -1.0, 0.5, -2.5, 3.0, 1e-30, 1e30, INFINITY, -INFINITY, NAN};
+    const double ys[] = {-1.5, 2.0, -0.0, 0.5, -3.0, 0.0, -1.0, 2.5, -2.0, 1.0, -0.5, 3.0};
+    const int NR = (int)(sizeof(xs) / sizeof(xs[0]));
+    unsigned long long* dSz = nullptr; double *dM = nullptr, *dX = nullptr, *dY = nullptr;
+    cudaMalloc(&dSz, NT * sizeof(unsigned long long));
+    cudaMalloc(&dM, 2 * NR * FT_MATH_N * sizeof(double));
+    cudaMalloc(&dX, NR * sizeof(double)); cudaMalloc(&dY, NR * sizeof(double));
+    cudaMemcpy(dX, xs, NR * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(dY, ys, NR * sizeof(double), cudaMemcpyHostToDevice);
+    kDeviceProbe<<<1, 1>>>(dSz, dM, dX, dY, NR);
+    std::vector<unsigned long long> dsz(NT);
+    std::vector<double> dm(2 * NR * FT_MATH_N), hm(2 * NR * FT_MATH_N);
+    cudaMemcpy(dsz.data(), dSz, NT * sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+    cudaMemcpy(dm.data(), dM, dm.size() * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaFree(dSz); cudaFree(dM); cudaFree(dX); cudaFree(dY);
+    int bad = 0;
+    for (int k = 0; k < NT; ++k)
+        if (dsz[k] != hs[k]) {
+            ++bad;
+            std::printf("[probe] LAYOUT %-16s host %llu device %llu\n", tn[k], hs[k], dsz[k]);
+        }
+    for (int r = 0; r < NR; ++r) {
+        ftMathRow<float>((float)xs[r], (float)ys[r], hm.data() + (2 * r) * FT_MATH_N);
+        ftMathRow<double>(xs[r], ys[r], hm.data() + (2 * r + 1) * FT_MATH_N);
+    }
+    for (size_t k = 0; k < hm.size(); ++k) {
+        const double a = hm[k], b = dm[k];
+        const bool same = (std::isnan(a) && std::isnan(b)) || a == b ||
+                          (std::isfinite(a) && std::isfinite(b) &&
+                           std::fabs(a - b) <= 1e-4 * std::fmax(std::fabs(a), 1e-300));
+        if (!same) {
+            ++bad;
+            const int f = (int)(k % FT_MATH_N), r = (int)(k / FT_MATH_N / 2);
+            const bool dbl = ((k / FT_MATH_N) % 2) != 0;
+            std::printf("[probe] MATH %s<%s>(%g, %g)  host %.9g  device %.9g\n", fn[f],
+                        dbl ? "double" : "float", xs[r], ys[r], a, b);
+        }
+    }
+    std::printf("[probe] %d disagreement(s) between the host and device compilers (%d structs, %d math values)\n",
+                bad, NT, (int)hm.size());
+    return bad;
+}
 
 bool cudaAvailable() {
     if (g_queried) return g_available;
@@ -18598,6 +19884,7 @@ bool cudaAvailable() {
         g_devName[sizeof(g_devName) - 1] = '\0';
     }
     g_available = true;
+    if (const char* e = std::getenv("FTRACE_DEVICE_PROBE")) if (*e && std::strcmp(e, "0")) deviceProbe();
     return true;
 }
 const char* cudaDeviceName() { cudaAvailable(); return g_devName; }
@@ -19280,6 +20567,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.matIsLight = m.isLight ? 1 : 0;
         d.matReflectsNothing = m.reflectsNothing ? 1 : 0;
         d.hideCamera = m.hideCamera ? 1 : 0;
+        d.route = m.route;
         bakeSpec(m.emit, d.matEmit);
         { Vec3 le = m.emit ? rgbbake::emitToRgb(m.emit) : Vec3{0, 0, 0};
           d.rgbMatEmit = {le.x, le.y, le.z}; }
@@ -19681,6 +20969,23 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.patNodes = d_pnodes; sc.patterns = d_pat; sc.nPatterns = (int)dpat.size();
     sc.recCoeff = d_recCoeff; sc.recDrivers = d_recDrv; sc.recScalarStops = d_recStops;
     sc.emitters = d_ems; sc.nEmitters = (int)dems.size();
+    {   // JSPEC: each emitter's fold quadrature, {lam, X, Y, Z} x DJSPEC_FOLD (dJSpecFoldColor)
+        static_assert(kFoldBins == DJSPEC_FOLD, "DJSPEC_FOLD must track scene.h kFoldBins");
+        std::vector<float> fold((size_t)scene.emitters.size() * DJSPEC_FOLD * 4, 0.0f);
+        for (size_t e = 0; e < scene.emitters.size(); ++e) {
+            const Emitter& em = scene.emitters[e];
+            for (int k = 0; k < em.foldN && k < DJSPEC_FOLD; ++k) {
+                float* f = fold.data() + (e * DJSPEC_FOLD + (size_t)k) * 4;
+                f[0] = (float)em.foldLam[k];
+                f[1] = (float)em.foldCie[k].x; f[2] = (float)em.foldCie[k].y; f[3] = (float)em.foldCie[k].z;
+            }
+        }
+        sc.emFold = fold.empty() ? nullptr : (const float*)keep(uploadVec(fold));
+        std::vector<float> spdInv(scene.emitters.size(), 0.0f);
+        for (size_t e = 0; e < scene.emitters.size(); ++e)
+            spdInv[e] = scene.emitters[e].spdDen > 0.0 ? (float)(1.0 / scene.emitters[e].spdDen) : 0.0f;
+        sc.emSpdInv = spdInv.empty() ? nullptr : (const float*)keep(uploadVec(spdInv));
+    }
     sc.emitCdf = d_emitCdf; sc.totalPower = scene.totalPower;
     // Light BVH: POD nodes referring to each other by index, so a straight memcpy. The
     // knobs come from lt:: (the same globals the CPU BackwardRenderer reads) so a scene
@@ -19815,6 +21120,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             const Medium& m = scene.media[i];
             DMedium& dm = dmeds[i];
             dm.enabled = m.enabled ? 1 : 0;
+            dm.route = m.route;
             dm.g = m.g;
             bakeSpec(m.sigma_a, dm.sigma_a);
             bakeSpec(m.sigma_s, dm.sigma_s);
@@ -20419,14 +21725,18 @@ static bool cudaBidirCoreSupported(const Scene& scene) {
     // read the uploaded (lambda x mu) Airy table for rainbow media. No fallback needed.
     return true;
 }
-// Hair runs on the device forward/backward tracers and, since 0.364.0, in mode U's kernels
-// (kVcmLightT / kVcmCameraT carry the fiber BCSDF, the tube clearance and the strand merge
-// exclusion), but NOT in the BDPT vertex machinery -- a hair scene still falls back to the CPU
-// BDPT. The two gates therefore split here. A fire likewise: the CPU BDPT reaches it (bdpt.h, the
-// fires note); the device's does not.
+// Hair runs on the device forward/backward tracers, since 0.364.0 in mode U's kernels (kVcmLightT /
+// kVcmCameraT carry the fiber BCSDF, the tube clearance and the strand merge exclusion), and since
+// 0.385.0 in the BDPT vertex machinery that modes D and J share -- so hair no longer splits the two
+// gates. What still does is a fire: the CPU BDPT reaches it (bdpt.h, the fires note); the
+// device's does not.
 bool cudaBdptSupported(const Scene& scene) {
     for (const Medium& m : scene.media) if (m.emissive()) return false;
-    return cudaBidirCoreSupported(scene) && !sceneUsesHairMaterial(scene);
+    // Hair joined the BDPT kernels in 0.385.0: dRandomWalk samples the fiber BCSDF and ends a light
+    // walk at a strand, dConnectBDPT clears a strand eye vertex's tube, dMisWeight and mode J's
+    // camera-side sums drop the light-side alternatives through one, and dSurfMergeSite refuses
+    // strands (and every curve). sceneUsesHairMaterial is kept for the other gates that use it.
+    return cudaBidirCoreSupported(scene);
 }
 
 // Drives a chunked samples-per-pixel render for the GPU reference/BDPT paths. Repeatedly
@@ -20703,6 +22013,44 @@ struct JSurfDev {
 // `-jhostlight` (see render_cuda.h). Set once from argv, read per render.
 static bool g_jHostLight = false;
 void cudaSetJHostLight(bool on) { g_jHostLight = on; }
+// Per-object render modes (0.386.0): see gpu::c_routeOn. Set by runRender before a D/J render.
+static int g_routeOn = 0, g_routeDefault = 1, g_routeAnyMedJ = 0;
+static double g_routeSppD = 1.0, g_routeSppJ = 1.0;
+void cudaSetRouting(int on, int routeDefault, int anyMedJ, double sppD, double sppJ) {
+    g_routeOn = on; g_routeDefault = routeDefault; g_routeAnyMedJ = anyMedJ;
+    g_routeSppD = sppD; g_routeSppJ = sppJ;
+}
+// JSPEC's dispersive window (see gpu::c_jDispWin). Set once from argv.
+static double g_jDispWinHost = 10.0;
+static int    g_jDispAllHost = 0;
+void cudaSetJDisp(double winNm, int all) { g_jDispWinHost = winNm; g_jDispAllHost = all; }
+// The aimed sun (bdpt.h SunAim): host copies, uploaded at the top of every renderBdptCuda.
+static std::vector<double> g_sunAimCHost, g_sunAimRHost;
+static double g_sunAimSumR2Host = 0.0, g_sunAimFHost = 0.0;
+void cudaSetSunAim(const double* cxyz, const double* r, int n, double sumR2, double f) {
+    if (n > SUNAIM_MAX) {
+        // causticaim.h clusters to -causticaimk targets (default 64); past the device's array the
+        // device would disagree with the host, so turn the aim off on BOTH sides rather than
+        // render a mismatch. (bdpt::g_sunAim is the host's; main.cpp keeps -causticaimk <= 64.)
+        std::fprintf(stderr, "[sun aim] %d targets exceed the device's %d: aim disabled for the GPU\n",
+                     n, SUNAIM_MAX);
+        n = 0;
+    }
+    g_sunAimCHost.assign(cxyz, cxyz + 3 * (size_t)(n > 0 ? n : 0));
+    g_sunAimRHost.assign(r, r + (size_t)(n > 0 ? n : 0));
+    g_sunAimSumR2Host = (n > 0) ? sumR2 : 0.0;
+    g_sunAimFHost = (n > 0) ? f : 0.0;
+}
+static void uploadSunAim() {
+    const int n = (int)g_sunAimRHost.size();
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_sunAimN, &n, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_sunAimF, &g_sunAimFHost, sizeof(double)));
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_sunAimSumR2, &g_sunAimSumR2Host, sizeof(double)));
+    if (n > 0) {
+        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_sunAimC, g_sunAimCHost.data(), sizeof(double) * 3 * n));
+        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_sunAimR, g_sunAimRHost.data(), sizeof(double) * n));
+    }
+}
 
 static unsigned long long jSurfSalt(const SppProgress* prog) {
     const unsigned long long base = (unsigned long long)(prog ? prog->sampleBase : 0);
@@ -20981,6 +22329,48 @@ static void uploadSurfMapCuda(const bdpt::SurfMap* smap, DUpload& up, gpu::DSurf
     dsm.nPts   = (long long)n;
 }
 
+// Mode J: draw every sub-beam's DBeamRec::tr0 (kBeamTr0), one walk per parent beam. The host
+// split pushes a parent's sub-beams contiguously and in order of s0; a map that is not laid out
+// that way is left at tr0 = -1, where every hit walks from the beam's origin as before.
+static void drawBeamTr0(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& dbm) {
+    if (!bmap || !dbm.beams || !dbm.mis) return;
+    {   // FTRACE_BEAMTR0=0: leave tr0 at -1 (every hit walks from the beam's origin) -- the A/B arm
+        static const char* e = std::getenv("FTRACE_BEAMTR0");
+        if (e && std::atoi(e) == 0) return;
+    }
+    const auto tr0T0 = std::chrono::steady_clock::now();
+    const std::vector<int>& mi = bmap->misIdx;
+    const size_t nb = bmap->beams.size();
+    if (mi.size() != nb || nb == 0) return;
+    std::vector<int> start; start.reserve(bmap->mis.size() + 1);
+    std::vector<char> seen(bmap->mis.size(), 0);
+    for (size_t i = 0; i < nb; ++i) {
+        if (i == 0 || mi[i] != mi[i - 1]) {
+            const int p = mi[i];
+            if (p < 0 || (size_t)p >= seen.size() || seen[p]) return;
+            seen[p] = 1;
+            start.push_back((int)i);
+        } else if (bmap->beams[i].s0 < bmap->beams[i - 1].s0) {
+            return;
+        }
+    }
+    start.push_back((int)nb);
+    const int nP = (int)start.size() - 1;
+    const int* dStart = (const int*)up.keep(uploadVec(start));
+    float* dTr0 = (float*)up.keep(uploadVec(std::vector<float>(nb, -1.0f)));
+    static unsigned long long epoch = 0;   // a fresh draw per light-side realization
+    ++epoch;
+    gpu::kBeamTr0<<<(nP + 127) / 128, 128>>>(up.sc, dbm.beams, dTr0, dStart, nP,
+                                             0xD6E8FEB86659FD93ull * epoch);
+    dbm.tr0 = dTr0;
+    cudaCheckKernel("beam-tr0");
+    if (std::getenv("FTRACE_BEAMTR0_TIME")) {
+        cudaDeviceSynchronize();
+        std::fprintf(stderr, "[beam-tr0] %d parents, %zu sub-beams: %.1f ms\n", nP, nb,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tr0T0).count());
+    }
+}
+
 static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& dbm,
                               const StageProgress* stage, bool withMis, bool lbvh = false) {
     // `lbvh` means the host deliberately skipped its tree because a device one is coming, so an
@@ -21033,7 +22423,9 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
         // still what a beam with no table uses -- the demotion above is now the FALLBACK
         // rather than the only choice.
         r.pw = (float)w;
-        r.emIdx = (short)b.emIdx;
+        // A gather-time fold names its emitter in `emIdx`; a DEPOSIT fold (achro == 1) carries it
+        // in `srcEm`, and JSPEC needs it to re-colour the beam for a chromatic camera path.
+        r.emIdx = (b.achro == 2) ? (short)b.emIdx : (b.achro == 1 ? (short)b.srcEm : (short)-1);
         r.achro = (short)b.achro;
         r.lambda = b.lambda; r.absorb = b.absorb; r.med = b.med;
         r.nSec = (unsigned char)b.nSec; r.pad = 0;
@@ -21102,7 +22494,7 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
             // multiplied by kappaS -- which is itself zero without one. So an unused surface
             // map costs exactly the two loads and nothing else.
             d.sumC = s.sumC; d.sumM = s.sumMb; d.sumMs = s.sumMs;
-            d.pdfDir = s.pdfDir; d.rCoef = s.rCoef;
+            d.pdfDir = s.pdfDir; d.pdfPlanar = s.pdfPlanar; d.rCoef = s.rCoef;
             d.etaPrev = s.etaPrev; d.leadIn = s.leadIn;
             d.gateC1 = (int)s.gateC1; d.vert = (int)s.vert;
         }
@@ -21146,6 +22538,9 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
 
     DUpload up;
     buildUpload(scene, cam, resX, resY, up);
+    // The aimed sun (MODE-J-SDS, 0.387.0): before the first light subpath of this render, which
+    // in mode J is the device light pass below, ahead of the per-render J constants.
+    uploadSunAim();
 
     // Hero-wavelength gate — the same one the CPU BDPT applies (bdpt.h BdptRenderer::
     // renderRows): a participating medium makes the shadow-ray transmittance wavelength-
@@ -21195,6 +22590,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         std::atoi(std::getenv("FTRACE_JLBVH")) == 0;
     const bool wantLbvh = !g_jHostLight && !envOff;
     if (bmap) uploadBeamMapCuda(bmap, up, dbm, stage, /*withMis=*/true, wantLbvh);
+    if (bmap) drawBeamTr0(bmap, up, dbm);
     // FTRACE_JLBVH=1: rebuild the NODES on the device over the very same sub-beams. Same beams,
     // same gather, a different tree -- so an image difference is a traversal-acceptance
     // difference and a time difference is tree quality, with no third variable to blame.
@@ -21333,6 +22729,40 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                               : (!std::strcmp(e, "merges") || !std::strcmp(e, "merges-raw")) ? 2 : 0);
         CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jHalf, &jh, sizeof(int)));
     }
+    {   // JSPEC: the camera-side spectral carrier (bdpt::jSpecEnabled -- same env string), and
+        // whether any medium's sigma_t is chromatic (bdpt::mediumSigmaTChromatic's test).
+        const char* e = std::getenv("FTRACE_JSPEC");
+        const int on = (e && e[0] == '0') ? 0 : 1;
+        int tr = 0;
+        for (const Medium& m : scene.media) {
+            const double a = m.sigmaT(360.0 + 0.5 * (830.0 - 360.0) / 24.0);
+            for (int k = 1; k < 24 && !tr; ++k)
+                if (std::fabs(m.sigmaT(360.0 + (k + 0.5) * (830.0 - 360.0) / 24.0) - a) > 1e-12 * (1.0 + std::fabs(a))) tr = 1;
+        }
+        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jSpecOn, &on, sizeof(int)));
+        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jTrSpec, &tr, sizeof(int)));
+        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispWin, &g_jDispWinHost, sizeof(double)));
+        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispAll, &g_jDispAllHost, sizeof(int)));
+        {
+            // The same environment switch bdpt::g_jDeltaMerge reads (this file does not see
+            // bdpt.h's host globals); MODE-J-SDS.
+            const char* jde = std::getenv("FTRACE_JDELTA");
+            const int jd = (jde && jde[0] == '0') ? 0 : 1;
+            CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDeltaMerge, &jd, sizeof(int)));
+        }
+    }
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_routeOn, &g_routeOn, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_routeDefault, &g_routeDefault, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_routeAnyMedJ, &g_routeAnyMedJ, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_routeSppD, &g_routeSppD, sizeof(double)));
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_routeSppJ, &g_routeSppJ, sizeof(double)));
+    {   // FTRACE_ONLY_ST="s,t" (see c_dbgOnlyS)
+        int os = -1, ot = -1;
+        if (const char* e = std::getenv("FTRACE_ONLY_ST")) std::sscanf(e, "%d,%d", &os, &ot);
+        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_dbgOnlyS, &os, sizeof(int)));
+        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_dbgOnlyT, &ot, sizeof(int)));
+        if (os >= 0 || ot >= 0) std::printf("[diag] FTRACE_ONLY_ST: strategy s=%d t=%d only\n", os, ot);
+    }
     const bool mergeOn = (dbm.nNodes > 0);
     // WAVEFRONT gather queue (UPBP-CONV): sized for one wave of camera paths; the chunk is run
     // as consecutive waves. FTRACE_NOWAVEFRONT=1 forces the inline gather (the A/B control).
@@ -21349,8 +22779,17 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         CUDA_CHECK(cudaMalloc(&d_wfCounters, 4 * sizeof(int)));
         wq.nSegs = d_wfCounters; wq.nHits = d_wfCounters + 1; wq.overflow = d_wfCounters + 2;
         wq.segCap = segCap; wq.hitCap = hitCap;
-        waveSamples = (long long)segCap / (long long)(maxDepth + 3);   // SEGN = MAXV = depth + 3
-        if (waveSamples < 1) waveSamples = 1;
+        // The wave CEILING is one queued segment per path, not the worst case. It was
+        // segCap / (maxDepth + 3) -- room for every path of the wave to queue its deepest walk --
+        // which at `max_bounce 32` is 29 959 paths: fewer than the GPU holds resident, and each
+        // wave then waited on its single longest path (a 32-bounce walk through a cloud) with the
+        // rest of the device idle. gallery_rain's paths queue ~4 segments in a band with media
+        // and exactly 1 in a plain one, so that ceiling ran its camera walk 3x slower than the
+        // same kernel launched once per chunk. The waves are sized from the MEASURED segments
+        // and hits per path (sizeFor, and the previous chunk's per-band profile), and a wave
+        // that outruns its estimate loses nothing: what does not fit is gathered inline.
+        waveSamples = (long long)segCap;
+        (void)maxDepth;
         // wave order (see DWfQueue): bands by default; FTRACE_WFSTRAT=1 = stratified, 32-pixel
         // runs on a power-of-two domain permuted by an odd golden-ratio multiplier under the mask
         wq.runsPerRow = ((unsigned)resX + 31u) / 32u;
@@ -23681,6 +25120,7 @@ void vcmSessionPass(VcmSession* s, double radius) {
     ctx.maxDepth = s->maxDepth;
 
     // (1) Light pass — zero the per-pass splat, then trace nLight light subpaths.
+    uploadSunAim();                       // the aimed sun (0.387.0), before any light subpath
     CUDA_CHECK(cudaMemset(s->d_splat, 0, np * 3 * sizeof(double)));
     unsigned long long seedL = 0xD1B54A32D192ED03ULL
                              ^ ((unsigned long long)(passIdx + 1) * 0x9E3779B97F4A7C15ULL)

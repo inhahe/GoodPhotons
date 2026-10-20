@@ -34,6 +34,178 @@
 #include "photonbeams.h"
 #include "volcache.h"   // VOLCACHE prototype (flag-gated; unused unless FTRACE_VOLCACHE)
 
+// --- Mode J's camera-side spectral carrier (JSPEC, 0.386.1) ----------------------------
+//
+// A mode-J merge pairs a camera subpath walked at ONE wavelength, the camera sample's
+// lambda_c, with a beam or photon that carries its OWN, lambda_b. Every spectral factor the
+// camera walk met before the merge (a coloured wall's albedo, a rainbow's phase, a dielectric's
+// Fresnel coin, coloured glass, a chromatic medium) sits in the scalar `beta` at lambda_c.
+// Multiplying that scalar into a sum over beams of every wavelength computes
+//     r(lambda_c) * sum_b L_b CIE(lambda_b)    where the estimator owes    sum_b r(lambda_b) L_b CIE(lambda_b).
+// The two agree when r is flat. Otherwise the result is a colour error that washes colours toward grey,
+// and moves brightness by however r correlates with the beams' spectrum. On `_fog_cornell` at
+// max-bounce 8 the frame read 2.3 % dark against mode D, the red wall's side 4-10 % BRIGHT and the
+// green wall's 10-14 % DARK; with every wall grey the pattern vanished (known-issues.md, JSPEC).
+// Mode M had the same bug on its specular chains and fixed it with SPECGATHER
+// (photonmap_render.h, SpecThr). This is that fix for a walk that also bounces diffusely and
+// scatters in media.
+//
+// `r[k]` is prod_events f(lam_k) / f(lambda_c) on a K-bin grid over the band, so a merge that
+// multiplies `beta * at(lambda_b)` gets the camera's factors evaluated at the beam's own
+// wavelength. `any` stays false while every factor met so far was flat; at() is then exactly 1,
+// so a camera path with no chromatic factor renders bit-for-bit as before.
+struct JSpec {
+    static constexpr int K = 24;                       // SpecThr's grid: ~19.6 nm bins
+    float r[K];
+    bool  any = false;
+    // The carrier's magnitude, kept apart from `r`: the ratio is r * exp(logS). Inside coloured
+    // glass that absorbs at lambda_c, `beta` can fall to 1e-218 while other wavelengths pass, and
+    // the ratio then reaches 1e+217 -- beyond a float and, two such segments on, a double (the
+    // first device build wrote NaN pixels in gallery_rain from exactly this). beta * ratio is
+    // finite and is all a merge needs, so `r` stays normalised and the merge scales `beta` in log
+    // space (beta()). 0 unless a factor needed it, so the common path multiplies nothing.
+    double logS = 0.0;
+    // THE DISPERSIVE WINDOW (0.386.2). A delta event whose DIRECTION is a function of wavelength --
+    // a grating's non-zero order always; dispersive refraction and a real lens under `-jdispall`
+    // -- leaves a camera path that exists only at lambda_c: at a beam's wavelength the same
+    // sample would have gone elsewhere, so no ratio can re-express it. From then on a merge pairs
+    // the path with light AT lambda_c only: a beam or photon within `g_jDispWinNm` of it counts,
+    // coloured at lambda_c and scaled by invPdfC / window, and a flat-folded beam, whose spectrum
+    // is its emitter's SPD, is read at lambda_c exactly (beamgather.h, jDispFold).
+    // E over lambda_c of invPdfC * CIE(lambda_c) * (1/w) * integral over the window of the merge's
+    // integrand is the pixel integral, so the estimate is consistent as the window narrows.
+    bool  disp = false;
+    float lamC = 0.0f, invPdfC = 0.0f;
+    // `b` (a throughput carrying this carrier's lambda_c factors) re-expressed with its scale.
+    double beta(double b) const {
+        if (logS == 0.0 || !(b > 0.0)) return b;
+        return std::exp(std::log(b) + logS);
+    }
+    // Anything a merge has to apply at all?
+    bool on() const { return any || disp; }
+    // The camera side AT lambda_c, in the units at() uses: a windowed merge (disp) needs no ratio
+    // -- the path is evaluated at lambda_c and so is the light it takes -- but the caller scales
+    // `beta` by exp(logS) (beta()), which this undoes.
+    double atC() const { return (logS == 0.0) ? 1.0 : std::exp(-logS); }
+    static double lamOf(int k) {
+        return LAMBDA_MIN + (k + 0.5) * (LAMBDA_MAX - LAMBDA_MIN) / (double)K;
+    }
+    // Linear between bin centres, held flat past the outer two. SpecThr reads the nearest bin;
+    // interpolating costs one more load and follows a steep reflectance edge (a red wall's
+    // ~600 nm rise) instead of stepping across it.
+    double at(double lam) const {
+        if (!any) return 1.0;
+        const double u = (lam - LAMBDA_MIN) / (LAMBDA_MAX - LAMBDA_MIN) * (double)K - 0.5;
+        if (!(u > 0.0)) return (double)r[0];
+        if (u >= (double)(K - 1)) return (double)r[K - 1];
+        const int i = (int)u;
+        const double f = u - (double)i;
+        return (double)r[i] + ((double)r[i + 1] - (double)r[i]) * f;
+    }
+};
+
+// The running product a camera walk accumulates (in double) and snapshots into JSpec.
+struct JSpecRun {
+    double r[JSpec::K];
+    bool   any = false;
+    double logS = 0.0;                 // see JSpec::logS
+    bool   disp = false;               // see JSpec::disp
+    double lamC = 0.0, invPdfC = 0.0;
+    JSpecRun() { for (double& x : r) x = 1.0; }
+    // The path is valid only at lambda_c from here on (JSpec::disp). The first event fixes it.
+    void markDisp(double lam, double invPdf) {
+        if (disp) return;
+        disp = true; lamC = lam; invPdfC = invPdf;
+    }
+    // Fold one factor: `f(lambda)` at every bin, over `atCam`, the value the scalar `beta` took
+    // at the walk's own wavelength. `atCam` comes from the caller rather than being re-evaluated
+    // here, so the ratio's denominator is exactly the factor inside `beta`. SPECGATHER's first
+    // attempt divided by the nearest bin centre instead and blew up where a spectrum falls
+    // steeply at the band edge. A factor equal at three probe bins AND at the walk's
+    // wavelength is taken as flat and cancels. `exhaustive` skips the probe, for slots that may
+    // carry a notch between probes (a gel, a mirror coating).
+    template <class F> void mul(const F& f, double atCam, bool exhaustive) {
+        if (!(atCam > 0.0)) return;            // beta just went to 0: the walk ends here anyway
+        if (!exhaustive) {
+            const double a = f(JSpec::lamOf(0)), b = f(JSpec::lamOf(JSpec::K / 2)),
+                         c = f(JSpec::lamOf(JSpec::K - 1));
+            const double tol = 1e-12 * (1.0 + std::fabs(atCam));
+            if (std::fabs(a - atCam) <= tol && std::fabs(b - atCam) <= tol &&
+                std::fabs(c - atCam) <= tol) return;
+        }
+        double v[JSpec::K];
+        for (int k = 0; k < JSpec::K; ++k) v[k] = f(JSpec::lamOf(k));
+        mulVec(v, atCam);
+    }
+    // The same fold from values already evaluated at the bin centres (`v[k]` at lamOf(k)), for a
+    // factor whose evaluation shares work across wavelengths (a fiber, a lens trace).
+    void mulVec(const double* v, double atCam) {
+        if (!(atCam > 0.0)) return;
+        // A factor all but zero at lambda_c (deep in a glass's absorption band) would overflow
+        // 1/atCam; its magnitude goes to logS instead (JSpec::logS).
+        double inv = 1.0;
+        if (atCam < 1e-280) logS -= std::log(atCam); else inv = 1.0 / atCam;
+        double q[JSpec::K], qMax = 0.0;
+        bool flat = true;
+        for (int k = 0; k < JSpec::K; ++k) {
+            q[k] = v[k] * inv;
+            if (!std::isfinite(q[k]) || q[k] < 0.0) q[k] = 0.0;   // never let one bin poison the rest
+            if (std::fabs(q[k] - 1.0) > 1e-12) flat = false;
+            qMax = std::max(qMax, q[k]);
+        }
+        if (qMax > 1e30) {                              // fold the magnitude first, then multiply
+            for (int k = 0; k < JSpec::K; ++k) q[k] /= qMax;
+            logS += std::log(qMax);
+        }
+        double rMax = 0.0;
+        for (int k = 0; k < JSpec::K; ++k) { r[k] *= q[k]; rMax = std::max(rMax, r[k]); }
+        if (rMax > 1e15 || (rMax > 0.0 && rMax < 1e-15)) {   // keep `r` well inside a float
+            for (int k = 0; k < JSpec::K; ++k) r[k] /= rMax;
+            logS += std::log(rMax);
+        }
+        if (!flat) any = true;
+    }
+    void snap(JSpec& s) const {
+        s.any = any;
+        s.logS = logS;
+        s.disp = disp; s.lamC = (float)lamC; s.invPdfC = (float)invPdfC;
+        for (int k = 0; k < JSpec::K; ++k) s.r[k] = (float)r[k];
+    }
+};
+
+// The dispersive window's full width in nm (`-jdispwin`), and whether dispersive refraction and a
+// real lens open it too (`-jdispall`; a grating's non-zero order always does). See JSpec::disp.
+inline double g_jDispWinNm = 10.0;
+inline bool   g_jDispAll   = false;
+
+// A flat-folded beam's colour READ AT ONE WAVELENGTH for a windowed merge (JSpec::disp): its
+// spectrum is its emitter's SPD, so its spectral density at lambda_c is SPD(lambda_c) / sum SPD
+// (per nm, the 1 nm sum cieMean uses: Emitter::spdDen). No window needed, and no window's noise.
+inline Vec3 jDispFoldColor(const JSpec& cs, const Emitter& em) {
+    if (!(em.spdDen > 0.0)) return Vec3{0, 0, 0};
+    const double l = (double)cs.lamC;
+    return Vec3(cieX(l), cieY(l), cieZ(l)) * (em.spdFn(l) / em.spdDen * (double)cs.invPdfC);
+}
+// The window's weight for a monochromatic member at `lam` (0 outside it).
+inline double jDispWeight(const JSpec& cs, double lam) {
+    const double hw = 0.5 * g_jDispWinNm;
+    if (!(std::fabs(lam - (double)cs.lamC) <= hw)) return 0.0;
+    return (double)cs.invPdfC / g_jDispWinNm;
+}
+
+// A DEPOSIT-folded beam (PhotonBeam::achro == 1) carries one colour, its emitter's cieMean,
+// rather than a wavelength, so at() has nothing to evaluate. Mode J folds only beams whose
+// light path met no chromatic factor (bdpt.h depositSeg), whose spectrum is exactly the
+// emitter's SPD. The camera-corrected colour is then the emitter's fold quadrature, reweighted
+// bin by bin: sum_k foldCie[k] * r(foldLam[k]). sum_k foldCie[k] == cieMean is an identity
+// (scene.h), so a flat carrier reproduces the stored colour.
+inline Vec3 jSpecFoldColor(const JSpec& cs, const Emitter& em, const Vec3& fallback) {
+    if (em.foldN <= 0) return fallback;
+    Vec3 c{0, 0, 0};
+    for (int k = 0; k < em.foldN; ++k) c += em.foldCie[k] * cs.at(em.foldLam[k]);
+    return c;
+}
+
 // The default weight: every beam hit counts once, in full. This is mode M, where the beam
 // map IS the estimator and there is no second technique to share with.
 //
@@ -47,6 +219,8 @@
 struct BeamWeightOne {
     static constexpr bool kFoldGatherTime = true;
     double operator()(const BeamHit&, const PhotonBeam&, double, double) const { return 1.0; }
+    // No camera-side spectral carrier (JSpec). Mode M passes none.
+    const JSpec* camSpec() const { return nullptr; }
 };
 
 // --- Deterministic transmittance, for MIS WEIGHTS ONLY --------------------------------
@@ -603,6 +777,10 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
     }
     const double invN = 1.0 / (double)bm.nEmitted;
     const PatTables tabs = scene.patTables();
+    // Mode J's camera-side spectral carrier (JSPEC), or null. Constant over the segment.
+    const JSpec* camSpec = w1.camSpec();
+    const bool   specOn  = camSpec && camSpec->on();
+    const bool   dispOn  = specOn && camSpec->disp;
     bm.gather(oc, dc, tMax, [&](const BeamHit& bh) {
         const PhotonBeam& b = bm.beams[bh.idx];
         // Skip only if THIS beam's own medium has a ready grid -- a partially-cached scene
@@ -693,7 +871,32 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
             if (b.order >= 2 && b.order != kBeamOrderUnknown)
                 beamDiag().wMS.fetch_add(w, std::memory_order_relaxed);
         }
-        acc += (bow ? bowCie : bm.cie[bh.idx]) * w;
+        // JSPEC: the camera's spectral factors at THIS beam's wavelength (or, for a deposit-
+        // folded beam, over its emitter's fold quadrature). Off, and bit-identical, unless the
+        // camera path met a chromatic factor.
+        if (dispOn) {
+            // Windowed (JSpec::disp): only light at lambda_c counts, coloured there.
+            const double lc = (double)camSpec->lamC;
+            const Vec3 cieC(cieX(lc), cieY(lc), cieZ(lc));
+            if (b.achro == 1) {
+                if (b.srcEm >= 0 && b.srcEm < (int)scene.emitters.size())
+                    acc += jDispFoldColor(*camSpec, scene.emitters[(size_t)b.srcEm]) * (w * camSpec->atC());
+            } else {
+                const double ww = jDispWeight(*camSpec, lam);
+                if (ww > 0.0) acc += cieC * (w * ww * camSpec->atC());
+            }
+        } else if (specOn) {
+            if (b.achro == 1) {
+                const Vec3 c0 = bm.cie[bh.idx];
+                acc += ((b.srcEm >= 0 && b.srcEm < (int)scene.emitters.size())
+                            ? jSpecFoldColor(*camSpec, scene.emitters[(size_t)b.srcEm], c0)
+                            : c0) * w;
+            } else {
+                acc += (bow ? bowCie : bm.cie[bh.idx]) * (w * camSpec->at(lam));
+            }
+        } else {
+            acc += (bow ? bowCie : bm.cie[bh.idx]) * w;
+        }
         // SECONDARY wavelengths of the bundle. They share this beam's geometry, its kernel
         // weight and BOTH transmittance marches — the bundle only exists on a path whose
         // extinction is achromatic (Renderer::beamSpecC), which is precisely the condition
@@ -714,8 +917,16 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
                 if (!(ssi > 0.0)) continue;
                 const double phi = md.phaseValue(-bh.cosT, li);
                 if (!(phi > 0.0)) continue;
+                if (dispOn) {
+                    const double ww = jDispWeight(*camSpec, li);
+                    if (!(ww > 0.0)) continue;
+                    const double lc = (double)camSpec->lamC;
+                    acc += Vec3(cieX(lc), cieY(lc), cieZ(lc)) *
+                           (wShared * (double)b.wS[i] * ssi * phi * ww * camSpec->atC());
+                    continue;
+                }
                 acc += Vec3(cieX(li), cieY(li), cieZ(li)) *
-                       (wShared * (double)b.wS[i] * ssi * phi);
+                       (wShared * (double)b.wS[i] * ssi * phi * (specOn ? camSpec->at(li) : 1.0));
             }
         }
     });

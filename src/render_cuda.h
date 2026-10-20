@@ -299,6 +299,16 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
 // whole-frame variance at equal wall clock on a surfaces-only scene, and inert where a frame is
 // already down to one sample per chunk. This is the switch for reproducing pre-0.272.0 output.
 void cudaSetJHostLight(bool on);
+// Per-object render modes (0.386.0, Material::route / Medium::route): routing on, the camera's
+// mode (ROUTE_D / ROUTE_J), whether any medium routes J, and each mode's sample multiplier
+// (`mode_spp`). runRender sets it per D/J render.
+void cudaSetRouting(int on, int routeDefault, int anyMedJ, double sppD, double sppJ);
+// JSPEC's dispersive window (0.386.2, bdpt g_jDispWinNm / g_jDispAll): its full width in nm, and
+// whether dispersive refraction and a real lens open it as a grating's non-zero order does.
+void cudaSetJDisp(double winNm, int all);
+// The aimed sun for modes D/J (MODE-J-SDS, 0.387.0; bdpt.h SunAim): the target spheres (centres as
+// x,y,z triples, radii), SUM r^2 and the aimed share. n == 0 or f == 0: the uniform disc.
+void cudaSetSunAim(const double* cxyz, const double* r, int n, double sumR2, double f);
 
 bool cudaBdptSupported(const Scene& scene);
 

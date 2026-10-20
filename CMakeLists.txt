@@ -189,20 +189,22 @@ if(CMAKE_CUDA_COMPILER)
     if(MSVC)
         target_link_options(ftrace PRIVATE /NODEFAULTLIB:LIBCMT)
     endif()
-    # A host compiler newer than the CUDA toolkit supports is NOT a benign warning here.
-    # Measured 2026-08-16 with CUDA 13.3 + MSVC 14.51 (the VS 2026 BuildTools preview):
-    # nvcc accepted it, every kernel launched and ran without a single CUDA error, and
-    # every GPU render came out BLACK (mode B: absorbed=1.0000, escaped=0.0000, "0.0%
-    # noise"). The same source built with MSVC 14.44 is correct at both sm_75 and sm_89,
-    # so it is the host pass, not the device arch. Nothing at runtime can catch that —
-    # so shout at configure time. (build.bat pins the VS 2022 generator for this reason.)
+    # THE HOST COMPILER'S HEADERS REACH THE DEVICE CODE. Measured 2026-08-16 with CUDA 13.3 +
+    # MSVC 14.51 (VS 2026): every kernel launched without a CUDA error and every GPU render came
+    # out BLACK (mode B: absorbed=1.0000). That was blamed on a miscompile and VS 2022 pinned.
+    # 2026-10-18, with VS 2022 gone from this machine, it was found instead (render_cuda.cu, the
+    # copysign overloads at the top of namespace gpu): nvcc's device pass compiles against the
+    # host compiler's <cmath>, and MSVC 14.5x's float copysign(float, float) came out of it as a
+    # device function returning 0 for every input, which NaN-ed every sampled direction. Routed
+    # explicitly now, MSVC 14.51 + CUDA 13.4 renders bit-identically to the old 14.44 + 13.3 build.
+    # The general lesson stands, so instead of refusing a compiler, CHECK it: after any change to
+    # the host compiler or the CUDA toolkit run `python tools/check_device_probe.py`, which has the
+    # device report every uploaded struct's size and every math function it calls next to the host.
     if(MSVC AND MSVC_VERSION GREATER_EQUAL 1950)
-        message(WARNING
-            "MSVC ${MSVC_VERSION} is newer than this CUDA toolkit "
-            "(${CMAKE_CUDA_COMPILER_VERSION}) officially supports. That combination has "
-            "been observed to MISCOMPILE the device code silently — GPU renders come out "
-            "black with no CUDA error. Configure with -G \"Visual Studio 17 2022\" (what "
-            "build.bat does) or another supported host compiler.")
+        message(STATUS
+            "MSVC ${MSVC_VERSION} with CUDA ${CMAKE_CUDA_COMPILER_VERSION}: run "
+            "tools/check_device_probe.py on the new binary (a host-header change can break device "
+            "math silently; see CMakeLists.txt).")
     endif()
     message(STATUS "CUDA backend enabled (FTRACE_CUDA_ARCH=${FTRACE_CUDA_ARCH}; "
                    "use -DFTRACE_CUDA_ARCH=all-major for a portable fat binary; "

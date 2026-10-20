@@ -579,10 +579,29 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
             double R = scene.sceneRadius;
             if (R <= 0.0) return;
             Vec3 tt, bb; onb(em.beamDir, tt, bb);
-            double rr = R * std::sqrt(rng.uniform()), phi = 2.0 * PI * rng.uniform();
-            y = scene.sceneCenter + tt * (rr * std::cos(phi)) + bb * (rr * std::sin(phi))
-              - em.beamDir * R;
-            pdfPos = 1.0 / (PI * R * R);
+            double x, yy;
+            if (bdpt::g_sunAim.on() && rng.uniform() < bdpt::g_sunAim.f) {
+                // THE AIMED SUN (0.387.0, bdpt.h SunAim): a target circle by r^2, a point in it.
+                const bdpt::SunAim& sa = bdpt::g_sunAim;
+                const double pick = rng.uniform() * sa.sumR2;
+                double acc = 0.0;
+                size_t j = 0;
+                for (; j + 1 < sa.c.size(); ++j) {
+                    acc += sa.r[j] * sa.r[j];
+                    if (pick < acc) break;
+                }
+                const Vec3 w = sa.c[j] - scene.sceneCenter;
+                const double rr = sa.r[j] * std::sqrt(rng.uniform());
+                const double phi = 2.0 * PI * rng.uniform();
+                x = dot(w, tt) + rr * std::cos(phi);
+                yy = dot(w, bb) + rr * std::sin(phi);
+            } else {
+                double rr = R * std::sqrt(rng.uniform()), phi = 2.0 * PI * rng.uniform();
+                x = rr * std::cos(phi);
+                yy = rr * std::sin(phi);
+            }
+            y = scene.sceneCenter + tt * x + bb * yy - em.beamDir * R;
+            pdfPos = bdpt::sunOriginPdf(scene, em, x, yy);   // 1/(pi R^2) with the aim off
         } else {
             y = em.origin;                                 // delta position: pdfPos == 1
             emitScale = spotFalloff(dot(dir, em.beamDir), em.spotCosInner, em.spotCosOuter);
@@ -1044,7 +1063,12 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                             dist2 = distL * distL;
                             occlEps = 0.0;
                             directPdfW = 1.0 / coneSolid;
-                            emissionPdfW = 1.0 / (PI * R * R * coneSolid);
+                            // The aimed mixture's density at the origin a light subpath would
+                            // have needed to reach h.p along -wi (0.387.0; 1/(pi R^2) with the
+                            // aim off -- bdpt.h SunAim).
+                            emissionPdfW = (bdpt::g_sunAim.on()
+                                                ? bdpt::sunOriginPdfAlong(scene, em, h.p, wi * -1.0)
+                                                : 1.0 / (PI * R * R)) / coneSolid;
                             geomOk = true;
                         }
                     } else {

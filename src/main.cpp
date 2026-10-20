@@ -12099,6 +12099,11 @@ static long long g_causticAimN = -1;
 // geometry more tightly (fewer aimed photons land on empty space) at a linear cost in the
 // per-photon pdf evaluation, which is a handful of dot products over a cache-hot array.
 static int    g_causticAimK   = 64;
+// THE AIMED SUN for modes D and J (MODE-J-SDS, 0.387.0; bdpt.h SunAim). The share of the sun's
+// light subpaths drawn from the same focusing-geometry targets as above, as ONE mixture sample
+// whose density every MIS weight reads -- so, unlike -causticn, it is not a second pass. 0 = the
+// uniform disc, bit for bit.
+static double g_sunAimFrac    = 0.25;
 
 // Build the aim map for this scene, or leave it empty when aiming is off / there is nothing
 // focusing to aim at. Says out loud what it found, because "the caustic pass did nothing" and
@@ -12343,12 +12348,15 @@ static bool      g_beamRefreshSet  = false;
 // a realization still costs them the full host SAH build and their optimum has not moved.
 static constexpr double kBeamRefreshDevJ = 0.30;
 // UPBP-CONV (3): lower bound on a merge's sin(theta) -- the beam x ray kernel's Jacobian
-// denominator, and its singularity. 0 = the literal, unbounded estimator. The default 0.3 (the
-// clamp binds when a beam lies within ~17.5 deg of the camera ray) is measured, not chosen: on
-// _fog_thick at 180 s it costs -0.61 % of the image mean against the unbounded estimator's own
-// -0.57 % -- no resolvable bias -- while cutting the worst pixel from 4350x to 1690x the
-// reference and the mean relative squared error from 1.219 to 0.836. See BeamMap::sinMin.
-static double    g_beamSinMin    = 0.3;
+// denominator, and its singularity. 0 = the literal, unbounded estimator, the DEFAULT since
+// 0.386.1. The bound is BIASED: where sin(theta) < v the estimate is scaled by sin(theta)/v,
+// and the merge weight, which reads the same clamped value, does not hand that share back to the
+// connections. It was 0.3 from UPBP-CONV, on a measurement that put its bias below resolution.
+// Re-measured once JSPEC had removed the larger error it was hiding under (paired seeds, GPU,
+// equal spp): on _fog_cornell at depth 8 it cost -0.54 % of the mean for no noise gain (mean
+// per-pixel noise 0.0257 vs 0.0262); on _fog_thick -1.0 % +- 0.6 % for ~6 % less variance
+// (0.336 vs 0.346). Keep it for a render that wants that trade. See known-issues J-FOGCORNELL.
+static double    g_beamSinMin    = 0.0;
 // 4M since 0.290.0, measured down from 8M. Splitting trades BVH BUILD against TRAVERSAL: build
 // costs ~1.05 us per split entry and rises linearly, while traversal SATURATES above ~4M splits
 // (on _fog_thick: 19.0, 16.4, 15.5, 15.2 s at 2/4/8/16M), so there is an interior optimum and 8M
@@ -12429,6 +12437,12 @@ static bool g_jDevBeamOk = false;
 // Forwarded to the device backend through cudaSetJHostLight rather than threaded through
 // renderBdptCuda, whose parameter list is already long and whose callers do not decide this.
 static bool g_jHostLight = false;
+// `-no-modes` (0.386.0): ignore every per-object `mode` tag, so the camera's mode renders the whole
+// frame -- the A/B arm for a scene that tags objects (see runRender's per-object modes block).
+static bool g_noObjectModes = false;
+// Per-mode sample multipliers (`-mode-spp D=x,J=y`, or the scene's `render { mode_spp … }`).
+static double g_modeSppD = 1.0, g_modeSppJ = 1.0;
+static bool   g_modeSppCli = false;
 
 // SKIP THE HOST TREE when a device LBVH is going to be built over the same sub-beams. ONE
 // definition, because `buildBeamMap` has two build branches (`-beamradius` and the auto one) and
@@ -16489,6 +16503,46 @@ struct JLightCache {
 // and writes the result. Factored out of main so any number of cameras (Phase 3a
 // multi-camera) share exactly one render path. `res` is the camera's own film
 // resolution; `cam` must already be built at that resolution.
+// The aimed sun's targets (bdpt.h SunAim), built once per scene for modes D and J and handed to
+// the device. Every BDPT-family weight reads bdpt::g_sunAim, so it must be settled before the
+// first light subpath of the render and must not change during it.
+static void prepareSunAim(const Scene& scene) {
+    static const Scene* builtFor = nullptr;
+    if (builtFor == &scene) return;
+    builtFor = &scene;
+    bdpt::g_sunAim = bdpt::SunAim{};
+    bool hasSun = false;
+    for (const Emitter& em : scene.emitters) hasSun |= (em.shape == EmitterShape::Sun);
+    if (hasSun && g_sunAimFrac > 0.0) {
+        const caim::AimMap am = caim::build(scene, g_causticAimK);
+        if (am.empty()) {
+            std::printf("[sun aim] no glass, mirror or other focusing geometry: the sun's light paths "
+                        "stay uniform.\n");
+        } else {
+            bdpt::g_sunAim.f = g_sunAimFrac;
+            for (const caim::Target& t : am.targets) {
+                bdpt::g_sunAim.c.push_back(t.c);
+                bdpt::g_sunAim.r.push_back(t.r);
+            }
+            bdpt::g_sunAim.sumR2 = am.sumR2;
+            const double R = scene.sceneRadius;
+            std::printf("[sun aim] %.0f%% of the sun's light paths aimed at %lld focusing prim%s in %zu "
+                        "target sphere%s (they cover %.3g%% of the sun's %.3g m disc; -sunaim 0 = off)\n",
+                        100.0 * g_sunAimFrac, am.nPrims, am.nPrims == 1 ? "" : "s",
+                        am.targets.size(), am.targets.size() == 1 ? "" : "s",
+                        R > 0.0 ? 100.0 * am.sumR2 / (R * R) : 0.0, R);
+        }
+    }
+    std::vector<double> cxyz, rr;
+    for (size_t j = 0; j < bdpt::g_sunAim.c.size(); ++j) {
+        cxyz.push_back(bdpt::g_sunAim.c[j].x);
+        cxyz.push_back(bdpt::g_sunAim.c[j].y);
+        cxyz.push_back(bdpt::g_sunAim.c[j].z);
+        rr.push_back(bdpt::g_sunAim.r[j]);
+    }
+    cudaSetSunAim(cxyz.data(), rr.data(), (int)rr.size(), bdpt::g_sunAim.sumR2, bdpt::g_sunAim.f);
+}
+
 static int runRender(const Scene& scene, const Camera& cam, char mode,
                      long long N, int res, int resY, long long spp, int nThreads,
                      const char* device, bool diffraction,
@@ -16501,6 +16555,62 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      double* exposureAnchor = nullptr, bool rgbBackward = false,
                      int maxBounceOverride = -1, bool directOnly = false,
                      JLightCache* jcache = nullptr) {
+    // PER-OBJECT RENDER MODES (0.386.0): `mode D` / `mode J` on an object, group, material or
+    // medium (Material::route, Medium::route). Modes D and J are one renderer -- J is D plus its
+    // merges -- so a frame can switch between them path by path: each path is routed by what its
+    // camera end meets (bdpt::routeOfEye) and gets that mode's estimator. A camera in mode D with
+    // anything tagged J therefore runs on mode J's renderer, merging only on J-routed paths; a
+    // camera in mode J with things tagged D merges everywhere else. Every other mode has one
+    // estimator for the whole frame and ignores the tags, and says so.
+    {
+        bool anyD = false, anyJ = false;
+        for (const Material& m : scene.mats) { anyD |= (m.route == ROUTE_D); anyJ |= (m.route == ROUTE_J); }
+        for (const Medium& md : scene.media) { anyD |= (md.route == ROUTE_D); anyJ |= (md.route == ROUTE_J); }
+        int on = 0, def = ROUTE_J, anyMedJ = 0;
+        if ((anyD || anyJ) && g_noObjectModes) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                std::printf("[ignore] per-object modes (-no-modes): mode %c renders the whole frame\n", mode);
+            }
+        } else if (anyD || anyJ) {
+            if (mode == 'D' || mode == 'J') {
+                def = (mode == 'J') ? ROUTE_J : ROUTE_D;
+                if (mode == 'D' && anyJ) mode = 'J';
+                on = (mode == 'J') ? 1 : 0;
+                for (const Medium& md : scene.media)
+                    if ((md.route >= 0 ? md.route : def) == ROUTE_J) anyMedJ = 1;
+                if (on) {
+                    int nm = 0, nmd = 0;
+                    const int other = (def == ROUTE_J) ? ROUTE_D : ROUTE_J;
+                    for (const Material& m : scene.mats) nm += (m.route == other);
+                    for (const Medium& md : scene.media) nmd += (md.route == other);
+                    std::printf("[mode] per-object modes: camera mode %c; %d material(s) and %d medium(s) "
+                                "in mode %c. Rendering on mode J's renderer, merging only on paths "
+                                "routed J.\n", def == ROUTE_J ? 'J' : 'D', nm, nmd,
+                                other == ROUTE_J ? 'J' : 'D');
+                    if (g_modeSppD != 1.0 || g_modeSppJ != 1.0)
+                        std::printf("[mode] samples per base sample: D-routed paths x%.3g, J-routed "
+                                    "x%.3g (-spp and the progress line count base samples)\n",
+                                    g_modeSppD, g_modeSppJ);
+                }
+            } else {
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    std::fprintf(stderr, "[mode] this scene tags objects with `mode D` / `mode J`, which "
+                                         "only modes D and J honour; this render is mode %c, so the "
+                                         "tags are ignored.\n", mode);
+                }
+            }
+        }
+        const double sD = on ? g_modeSppD : 1.0, sJ = on ? g_modeSppJ : 1.0;
+        bdpt::g_routeOn = on; bdpt::g_routeDefault = def; bdpt::g_routeAnyMedJ = anyMedJ;
+        bdpt::g_routeSppD = sD; bdpt::g_routeSppJ = sJ;
+        cudaSetRouting(on, def, anyMedJ, sD, sJ);
+    }
+    // The aimed sun (bdpt.h SunAim): settled before the first BDPT-family light subpath.
+    if (mode == 'D' || mode == 'J' || mode == 'U') prepareSunAim(scene);
     // `-mode W` is dispatched as mode R with the whitted flag set, so ask the flag: the
     // title should say what the user asked for, not how it is plumbed.
     g_windowMode = modeLabel(g_whitted ? 'W' : mode);   // title bar shows the transport mode of this frame
@@ -16644,9 +16754,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // dGenLensRay, exactly as the GPU mode-R backward megakernel does.
             if (!cudaBdptSupported(scene)) {
                 const char* why = "scene has a BDPT-GPU-unsupported feature "
-                                  "(hair, GRIN media, env/collimated light, or a "
+                                  "(GRIN media, env/collimated light, an emissive 'fire' volume, or a "
                                   "GPU-unsupported material: layered, indexed-palette, "
-                                  "oversized multilayer/mix, or an emissive 'fire' volume)";
+                                  "oversized multilayer/mix)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
@@ -18581,9 +18691,17 @@ static void printHelp(const char* prog) {
 "                        -n and -spp genuinely reduce volume noise (before 0.201.0 the radius\n"
 "                        was sized to a fixed gathered count, i.e. r ~ 1/n, and they did not)\n"
 "  -beamk <k>            FLOOR on mode-M beams gathered per camera segment (default 32).\n"
-"  -beamsinmin <v>       bound a beam x ray merge's 1/sin(theta) at 1/v (default 0.3; 0 = unbounded).\n"
 "                        Scales the radii up only if a sparse map would gather fewer, which\n"
 "                        is what stops a thin volume rendering as individual streaks\n"
+"  -beamsinmin <v>       bound a beam x ray merge's 1/sin(theta) at 1/v (default 0 = unbounded; biased low).\n"
+"  -jdispwin <nm>        mode J: spectral window for merges after a wavelength-dependent direction (a\n"
+"                        grating's non-zero order; with -jdispall also dispersive glass and a real lens).\n"
+"                        Narrower is less biased and noisier (default 10).\n"
+"  -jdispall             mode J: dispersive refraction and real lenses open that window too, so merges\n"
+"                        seen through them resolve chromatic dispersion exactly (noisier).\n"
+"  -sunaim <f>           modes D/J/U: share of the sun's light paths aimed at the scene's glass, mirrors and\n"
+"                        other focusing pieces (default 0.25; 0 = off). Caustics converge far faster;\n"
+"                        unbiased (every weight reads the aimed density). -causticaimk sets the targets.\n"
 "  -beamareaslack <f>    ceiling: fraction by which the kernel may inflate the total sub-beam\n"
 "                        AABB area, the gather's cost metric (default 1.0 = allow doubling)\n"
 "  -beamradius <r>       mode-M beam kernel half-width in world units, one value for every\n"
@@ -19780,6 +19898,11 @@ static int run(int argc, char** argv) {
             g_causticAimK = std::atoi(argv[++i]);
             if (g_causticAimK < 1) g_causticAimK = 1;
         }
+        else if (!std::strcmp(argv[i], "-sunaim") && i + 1 < argc) {
+            g_sunAimFrac = std::atof(argv[++i]);
+            if (!(g_sunAimFrac > 0.0)) g_sunAimFrac = 0.0;
+            if (g_sunAimFrac > 0.95) g_sunAimFrac = 0.95;   // keep the uniform disc in the mixture
+        }
         else if (!std::strcmp(argv[i], "-pmfg") && i + 1 < argc) { g_pmFinalGather = std::atoi(argv[++i]); if (g_pmFinalGather < 0) g_pmFinalGather = 0; }
         else if (!std::strcmp(argv[i], "-savemap") && i + 1 < argc) g_pmapSave = argv[++i];
         else if (!std::strcmp(argv[i], "-dumpcurves") && i + 1 < argc) g_dumpCurves = argv[++i];
@@ -20146,6 +20269,35 @@ static int run(int argc, char** argv) {
         // segment note at the top of the option table: append to a segment, and start a new
         // one once it nears ~100 links.
         if (!std::strcmp(argv[i], "-checkspherequery")) checkSphereQueryOnly = true;
+        else if (!std::strcmp(argv[i], "-no-modes") || !std::strcmp(argv[i], "-nomodes")) g_noObjectModes = true;
+        else if (!std::strcmp(argv[i], "-jdispwin") && i + 1 < argc) {
+            const double v = std::atof(argv[++i]);
+            if (!(v > 0.0)) { std::fprintf(stderr, "-jdispwin wants a width in nm > 0, got '%s'\n", argv[i]); return 1; }
+            ::g_jDispWinNm = v; cudaSetJDisp(::g_jDispWinNm, ::g_jDispAll ? 1 : 0);
+        }
+        else if (!std::strcmp(argv[i], "-jdispall")) {
+            ::g_jDispAll = true; cudaSetJDisp(::g_jDispWinNm, 1);
+        }
+        else if (!std::strcmp(argv[i], "-mode-spp") && i + 1 < argc) {
+            // D=<x>,J=<y> (either or both, each > 0): see FTSL.md 16.1.
+            std::string a = argv[++i];
+            size_t p0 = 0;
+            while (p0 <= a.size()) {
+                size_t p1 = a.find(',', p0);
+                if (p1 == std::string::npos) p1 = a.size();
+                const std::string w = a.substr(p0, p1 - p0);
+                const size_t eq = w.find('=');
+                const double v = (eq == std::string::npos) ? 0.0 : std::atof(w.c_str() + eq + 1);
+                const char k = w.empty() ? '?' : (char)std::toupper((unsigned char)w[0]);
+                if (eq != 1 || !(v > 0.0) || (k != 'D' && k != 'J')) {
+                    std::fprintf(stderr, "-mode-spp: expected D=<x>,J=<y> with each > 0, got '%s'\n", a.c_str());
+                    return 1;
+                }
+                if (k == 'D') g_modeSppD = v; else g_modeSppJ = v;
+                p0 = p1 + 1;
+            }
+            g_modeSppCli = true;
+        }
         else if (!std::strcmp(argv[i], "-checkbvhparallel")) checkBvhParallelOnly = true;
         else if (!std::strcmp(argv[i], "-roiboxes")) roiBoxesOnly = true;
         else if (!std::strcmp(argv[i], "-roi-audit") && i + 1 < argc) roiAuditFile = argv[++i];
@@ -20634,6 +20786,20 @@ static int run(int argc, char** argv) {
     // default, and a thin-walled glass shell with another tube inside it presents about
     // that many dielectric interfaces on one line of sight, so the innermost surface
     // renders as a black plug. An explicit CLI `-max-bounce` still wins.
+    // A scene may also say what mode J's surface-merge radius should be: the default is a fraction
+    // of the scene's radius, which an open scene (gallery_rain: 33 m, so 0.65 m) makes far too wide
+    // for the caustics the merges are there for -- slow, and blurred. `-jsurf-radius` still wins.
+    if (g_jSurfRadius <= 0.0 && ftslScene.jsurfRadius > 0.0) {
+        g_jSurfRadius = ftslScene.jsurfRadius;
+        std::printf("[scene] mode J surface-merge radius = %g m (from the scene's render block)\n",
+                    g_jSurfRadius);
+    }
+    if (!g_modeSppCli && (ftslScene.modeSppD > 0.0 || ftslScene.modeSppJ > 0.0)) {
+        if (ftslScene.modeSppD > 0.0) g_modeSppD = ftslScene.modeSppD;
+        if (ftslScene.modeSppJ > 0.0) g_modeSppJ = ftslScene.modeSppJ;
+        std::printf("[scene] mode samples: D x%.3g, J x%.3g (from the scene's render block)\n",
+                    g_modeSppD, g_modeSppJ);
+    }
     if (maxBounceOverride < 1 && ftslScene.maxBounce >= 1) {
         maxBounceOverride = ftslScene.maxBounce;
         std::printf("[scene] max bounce = %d (from the scene's render block)\n", maxBounceOverride);

@@ -568,6 +568,15 @@ struct BeamMis {
     double sumMb = 0.0;     // light-side BEAM-merge accumulator, without its n_m*2r factor
     double sumMs = 0.0;     // light-side POINT-merge accumulator, without its n_m*pi r_s^2
     float  pdfDir = 0.0f;   // solid-angle pdf of the beam's direction at y_{s-1}
+    // The light-side density of a merge point x on this beam IN AREA MEASURE, when it is not
+    // pdfDir / |y_{s-1} - x|^2: a beam leaving the SUN's vertex (0.386.0). The sun's subpath
+    // starts on a fictitious disc R_scene away and draws its direction from the 0.53 deg solar
+    // cone, so pdfDir there is 1/coneSolid (~15000 / sr). But deltaLightSubpath rewrites the
+    // first scene vertex's pdfFwd to the PLANAR 1/(pi R^2), as PBRT does for an infinite light, and
+    // every connection weight reads that -- so a merge on the sun's chord that weighed itself with
+    // pdfDir/rho^2 claimed ~10^4 times the share the connections left it, and the weights summed
+    // past 1: single-scattered sunlight counted roughly twice. 0 = use pdfDir / rho^2.
+    float  pdfPlanar = 0.0f;
     float  rCoef  = 0.0f;   // cos(y_{s-1}) / pdfFwd(y_{s-1}); the cos is 1 off a surface
     float  etaPrev = 0.0f;  // sin(theta) * pdfFwd(y_{s-1}) / sigma_t(y_{s-1}) — the BEAM merge
                             // AT y_{s-1}, still missing only its Tr; 0 if y_{s-1} is not a
@@ -712,7 +721,7 @@ struct BeamHit {
 // traversal a density estimate needs, with no new traversal code to keep in sync.
 struct BeamMap {
     // Lower bound on the sin(theta) of a beam x ray merge -- see hitBeam. 0 = unbounded (the
-    // literal estimator); a small positive value trades a bounded bias at grazing angles for a
+    // literal estimator, and the default); a positive value trades a bias at grazing angles for a
     // bounded contribution. Set from `-beamsinmin`.
     double sinMin = 0.0;
     std::vector<PhotonBeam> beams;
@@ -1423,9 +1432,11 @@ struct BeamMap {
         out.dPerp = std::sqrt(d2);
         // sin(theta) is the 1D-blur Jacobian's DENOMINATOR, so it is also the estimator's
         // singularity: a beam parallel to the camera ray gives an unbounded contribution
-        // (UPBP-CONV (3)). `sinMin` bounds it. Clamping HERE and not at the estimator is
-        // deliberate -- the MIS weight (bdpt.h, etaS) reads the same `bh.sinT`, so the
-        // technique and the pdf it is weighted by stay the same function.
+        // (UPBP-CONV (3)). `sinMin` (`-beamsinmin`, default 0 since 0.386.1) bounds it, and the
+        // MIS weight (bdpt.h, etaS) reads the same `bh.sinT`, so the weights stay consistent.
+        // That does NOT make the bound unbiased: the estimate is scaled by sin/sinMin wherever
+        // the bound binds, and no other technique picks up the difference (known-issues.md,
+        // J-FOGCORNELL: -0.5 % to -1 % at 0.3).
         out.sinT = std::max(std::sqrt(den), sinMin); out.cosT = cosT;
         return true;
     }

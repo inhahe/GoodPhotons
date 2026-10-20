@@ -152,6 +152,13 @@ struct Material {
     // it is intersected — every prim type carries `matId`, so the test is a load and a
     // compare, and a hidden surface costs strictly less than a visible one.
     bool hideCamera = false;
+    // PER-OBJECT RENDER MODE (0.386.0): `mode D` / `mode J` on a material, or on an object or
+    // group (the loader then gives the object its own copy of each material it uses, with this
+    // set). -1 = untagged, i.e. the camera's mode. Read only by the bidirectional family: each
+    // camera path is ROUTED by the most capable mode among the surfaces and media its camera end
+    // meets up to and including its first non-specular vertex, and mode J's merges run only on a
+    // J-routed path (bdpt::routeOfEye, design.md "Per-object modes"). ROUTE_D / ROUTE_J below.
+    int route = -1;
     // Spatially-varying diffuse albedo: index into Scene::textures (-1 = use the
     // constant `reflect` spectrum). When set, the reflectance at a hit is the
     // texture's per-texel Jakob-Hanika reflectance sampled at the surface (u,v).
@@ -519,8 +526,15 @@ inline Material makeFluoroMaterial() {
 // NOT the mesh's AABB, which is what a named mesh used to degrade to.
 enum class MediumBound { Box, Sphere, Implicit, Mesh };
 
+// Values of Material::route / Medium::route (0.386.0). Ordered by capability: a path whose camera
+// end meets both takes the larger, since mode J's estimator contains mode D's.
+enum { ROUTE_D = 0, ROUTE_J = 1 };
+
 struct Medium {
     bool enabled = false;
+    // `mode D` / `mode J` on the medium block (0.386.0), -1 = the camera's mode. A medium vertex on
+    // a camera path's leading chain routes it like a surface does (see Material::route).
+    int route = -1;
     Spectrum sigma_a = constantSpectrum(0.0); // absorption coefficient vs lambda
     Spectrum sigma_s = constantSpectrum(0.0); // scattering coefficient vs lambda
     double g = 0.0;                            // HG anisotropy [-1,1] (0 = isotropic)
@@ -1008,6 +1022,9 @@ struct Emitter {
     // rather than merely averaging it down (photonbeams.h, ACHROMATIC-PATH BEAMS). Set for
     // EVERY emitter in finalizeEmitters(), unlike viewXYZ which only suns need.
     Vec3 cieMean{0, 0, 0};
+    // sum over the 1 nm grid of spdFn -- cieMean's denominator, kept so SPD(lambda) / spdDen is
+    // the emitter's spectral density per nm (JSPEC's dispersive window, jDispFoldColor).
+    double spdDen = 0.0;
     // THE SPECTRAL FOLD TABLE (kFoldBins above). `foldCie[k]` is the CIE response integrated
     // over bin k against the emitter's own emission pdf,
     //
@@ -2445,6 +2462,7 @@ struct Scene {
                 den += s;
             }
             e.cieMean = (den > 0.0) ? num * (1.0 / den) : Vec3{0, 0, 0};
+            e.spdDen = den;
             // THE SPECTRAL FOLD TABLE (Emitter::foldCie/foldLam). Same grid, second pass:
             // split the band into kFoldBins intervals of EQUAL SPD MASS and record each
             // one's CIE integral and its SPD-weighted mean wavelength.

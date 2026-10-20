@@ -119,6 +119,12 @@ argument for standing a groom in a hall of polished objects.*
   λ per photon, bit-identically.)
 - **Forward *and* backward** engines that validate each other (mode `V` reports
   the residual between them).
+- **Per-object render modes** — tag a glass piece, a gem or a cloud `mode J` and only the
+  paths that need mode J's photon merges pay for them. The caustic seen *through* the glass
+  gets them (since 0.387.0, which also aims part of the sun at the glass: `-sunaim`); everything
+  else stays in mode D. Each mode can take its own sample count
+  (`mode_spp D=1 J=2`), and it is still one unbiased image with no seams.
+  See REFERENCE.md, *Per-object render modes*.
 - **Realistic cameras** — from a simple pinhole to a **physical multi-element
   lens** (real glass prescription: depth of field, vignetting, spherical &
   chromatic aberration all emergent), plus fisheye/panoramic projections.
@@ -253,7 +259,9 @@ argument for standing a groom in a hall of polished objects.*
   not, while the light/beam pass stays on the CPU on both backends. See
   [known-issues.md](known-issues.md) → UPBP-CONV, and UPBP-THICK for a brightness bias on
   optically thick multi-bounce scenes that predates the port and is identical on both
-  backends.)*
+  backends. Since 0.386.1 a merge also reads the camera path's colours at the beam's own
+  wavelength, which fixed J's colours washing toward grey and its brightness drifting a few
+  percent from D's in coloured scenes; see JSPEC.)*
   Mode
   `D` and mode `M -beams` each solve half of a thick-medium scene and fail where the other
   succeeds: a BDPT connection needs the camera's free-flight distance sampling to *reach*
@@ -316,12 +324,17 @@ The binary lands at `build/bin/ftrace` (`.exe` on Windows).
 > configure prints `CUDA not found; building CPU-only`, point the toolset at the CUDA
 > install directly and select the VS instance that has the integration, e.g.:
 > ```sh
-> cmake -B build -S . -G "Visual Studio 17 2022" -A x64 \
->   -T "cuda=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3" \
->   -DCMAKE_GENERATOR_INSTANCE="C:/Program Files/Microsoft Visual Studio/2022/Community"
+> cmake -B build -S . -G "Visual Studio 18 2026" -A x64 \
+>   -T "cuda=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.4"
 > ```
 > A CUDA-linked `ftrace.exe` is ~3 MB vs ~0.8 MB for a CPU-only build — a quick size
 > check tells you which you got.
+>
+> **After any change of host compiler or CUDA toolkit, run `python tools/check_device_probe.py`.**
+> The GPU half of the binary is compiled against the host compiler's headers, so a toolchain
+> change can break it with no error and a plausible-looking (but wrong, or black) image — it
+> happened with VS 2026's `copysign`, fixed in 0.385.0. The probe has the GPU report its struct
+> layouts and math results next to the CPU's; `build.bat` runs it after every build.
 
 Useful CMake options:
 

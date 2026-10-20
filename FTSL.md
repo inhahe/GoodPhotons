@@ -3029,7 +3029,8 @@ group {
 A group's transform composes with its parent's (parent applied last) and is baked
 into every child at load time (no runtime scene graph). Allowed children: `sphere`,
 `quad`, `triangle`, `mesh`, `light`, nested `group`. A light anywhere in the tree
-satisfies the "scene needs a light" check.
+satisfies the "scene needs a light" check. A group's `mode D` / `mode J` applies to every child
+that has no `mode` of its own (§16.1).
 
 ---
 
@@ -3291,6 +3292,8 @@ render { photons 1000000  device gpu  mode R  out png/out.png  res 900  max_boun
 | `out` | output path (`.png` → `png/`, `.ppm` → `ppm/` per repo convention) |
 | `res` | global resolution |
 | `max_bounce` | path-depth cap (≥ 1); same meaning as `-max-bounce` |
+| `mode_spp` | per-mode sample multipliers for per-object render modes, `mode_spp D=1 J=0.5` (§16.1); same meaning as `-mode-spp` |
+| `jsurf_radius` | mode J's starting surface-merge radius (authored length, > 0); same meaning as `-jsurf-radius`. The default is a fraction of the scene's radius (`-pmradiusfrac`, 2 %), which an open scene makes far too wide for the caustics the merges are for: `gallery_rain`'s 33 m hall gets 0.65 m, slow and visibly blurred, so it says `jsurf_radius 0.01` |
 
 Any of these are overridden by the matching CLI flag.
 
@@ -3304,6 +3307,60 @@ Klein bottle) should declare the depth it needs itself. Pickup is announced with
 `[scene] max bounce = N (from the scene's render block)` so the setting never applies
 invisibly; deeper paths are not free (≈35% of the sample rate on the gallery), which
 is why this stays per-scene rather than a raised global default.
+
+### 16.1 Per-object render modes (`mode D` / `mode J`)
+
+```
+sphere { center 7.7 1.70 3.95  radius 0.5  material glass  mode J }   # one object
+group  { mode J   mesh "gem" { … }   sphere { … } }                     # a group: every child
+material "crystal" { type dielectric  ior glass:crystal  mode J }       # every object using it
+medium { sigma_t 0.6  albedo 0.85  mode J }                            # a medium
+```
+
+`mode D` or `mode J` on an object, a `group`, a `fur` block, a `material` or a `medium` picks the
+render mode **for that part of the frame**. Everything untagged keeps the camera's mode. Only
+these two modes can be given per object, and only a camera in mode D or J honours the tags:
+J is D plus its merges, so the two are one renderer and can be switched path by path. Any other
+mode renders the frame with one estimator and prints that it is ignoring the tags.
+
+**What a tag decides.** Each camera path is routed by what its camera end meets: the surfaces
+and media along its leading run of mirror and glass bounces, up to and including the first
+surface or medium point that is neither. If any of them is tagged J (or untagged under a mode-J
+camera), the path gets mode J's estimator. Otherwise it gets mode D's. So `mode J` on a glass
+sphere routes J for:
+- everything seen *through* the sphere, including a caustic on the floor behind it (a
+  specular–diffuse–specular path, which only J's merges render well);
+- the sphere's own reflections.
+
+The floor seen directly stays in mode D, and costs what mode D costs. A camera in mode D with
+anything tagged J runs on mode J's renderer, which builds its light side (photon beams and
+surface photons) as usual but merges only on J-routed paths. The run says so:
+`[mode] per-object modes: camera mode D; 3 material(s) and 0 medium(s) in mode J. …`
+
+**It stays one unbiased image.** Every way of building a given path routes it the same way, so
+each part of path space is covered by exactly one complete estimator, D's or J's, and there is
+no seam to blend. With every object tagged D the render matches mode D bit for bit, and with
+every object tagged J it matches mode J bit for bit (`scraps/_rt_*.ftsl`, 0.386.0).
+
+**Rules and limits.**
+- A child's own `mode` wins over its group's.
+- A tagged object gets its own copies of the materials it uses, named `glass [mode J]` in
+  `-roi-mask` legends. A tagged mix's children are copied too, because the renderer shades
+  the child.
+- An emissive surface cannot be tagged; it keeps the camera's mode, with a warning. Its
+  light is found by its material, and a copy would orphan it.
+- A `mesh_instance` can be tagged only together with a `material` override. Its asset's
+  materials are shared by every placement.
+- **Each mode can have its own sample count**: `render { mode_spp D=1 J=0.5 }`, or
+  `-mode-spp D=1,J=0.5` on the command line (which wins). `-spp`, `-time`, `-noise` and the
+  progress line count base samples. A path routed to a mode with multiplier m gets m samples per
+  base sample on average: floor(m), plus one more with probability frac(m), each weighted 1/m.
+  So the image is unchanged in expectation for any multipliers, including below 1. A sample that
+  does not draw a mode skips that mode's work: J's merges in a D-only sample, and a D-routed path's
+  connections in a J-only one. Use it to spend samples where the noise is. If mode J's region is
+  already quiet (a medium under its beams), `J=0.5` halves what it costs. If it is the noisiest
+  part, `J=2` doubles its samples without doubling the frame. With both at 1 the render is
+  bit-identical to one without the key.
 
 ---
 

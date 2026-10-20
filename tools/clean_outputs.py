@@ -106,7 +106,12 @@ def rel(p):
 
 
 def git_files(*args):
-    r = subprocess.run(["git", "-C", ROOT, "ls-files", "-z", *args], capture_output=True)
+    try:
+        r = subprocess.run(["git", "-C", ROOT, "ls-files", "-z", *args], capture_output=True)
+    except FileNotFoundError:
+        # Not every shell that runs build.bat has git on PATH (a PowerShell session did not, on
+        # 2026-10-18). Without the tracked-file list nothing can be judged safe, so stop.
+        sys.exit("[clean] git is not on PATH -- cannot tell tracked files from output; nothing deleted.")
     if r.returncode != 0:
         sys.exit("[clean] git ls-files failed: " + r.stderr.decode("utf-8", "replace"))
     return [f for f in r.stdout.decode("utf-8", "replace").split("\0") if f]

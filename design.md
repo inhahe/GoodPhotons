@@ -2160,7 +2160,7 @@ paths mode `D` cannot.
 
   **Where it does pay, measured (0.262.0).** On `_fog_thick` (`sigma_t 20, albedo 0.95`) at `-max-bounce 32` — the depth that medium actually needs, since `D`/`J` default to 8 while the unidirectional tracers default to 32, and at 8 all three modes miss 88 % of the image — mode `J` beats mode `D` at equal time by **3× on mean relative squared error** (1.85× trimmed, 1.38× at the 99th percentile) against a 600 s mode-`R` reference, while rendering 12.9× fewer samples. That is the technique's own mechanism: long multiple-scattering paths are what connections sample badly and merges capture, and the merge's cost is the beam gather, which does not grow with depth the way the connection cost's ~depth² does. At depth 8 the same comparison has mode `J` 1.4× behind — the crossover is the depth, not the estimator. See `known-issues.md` → UPBP-CONV (4)/(5).
 
-  **The `1/sinθ` singularity is bounded now (0.262.0, `-beamsinmin`, default 0.3).** The beam×ray kernel's Jacobian denominator is `sinθ` between the camera ray and the beam, so a near-parallel merge contributes without bound — and the MIS weight does not suppress it, because such a configuration is genuinely one the connections sample badly and the balance heuristic correctly hands the merge a large weight. It is clamped where `sinθ` is *computed* (`BeamMap::hitBeam`; `dBeamHitEval` on the device), not at the estimator, because the MIS weight reads the same value — so the merge stays one function, a technique whose kernel saturates at grazing angles, rather than an estimator weighted by a pdf it no longer has. Measured on `_fog_thick` at 180 s: no resolvable bias (−0.61 % of the image mean against the unbounded estimator's own −0.57 %), worst pixel 4350× → 1690× the reference, mean relative squared error 1.219 → 0.836, and no cost in samples. `-beamsinmin 0` restores the literal estimator; past ~0.5 the bias is real, and at 1.0 the Jacobian is gone (−12 %).
+  **The `1/sinθ` singularity is bounded now (0.262.0, `-beamsinmin`, default 0.3; back to 0, unbounded, in 0.386.1 — the bound is biased, see known-issues J-FOGCORNELL).** The beam×ray kernel's Jacobian denominator is `sinθ` between the camera ray and the beam, so a near-parallel merge contributes without bound — and the MIS weight does not suppress it, because such a configuration is genuinely one the connections sample badly and the balance heuristic correctly hands the merge a large weight. It is clamped where `sinθ` is *computed* (`BeamMap::hitBeam`; `dBeamHitEval` on the device), not at the estimator, because the MIS weight reads the same value — so the merge stays one function, a technique whose kernel saturates at grazing angles, rather than an estimator weighted by a pdf it no longer has. Measured on `_fog_thick` at 180 s: no resolvable bias (−0.61 % of the image mean against the unbounded estimator's own −0.57 %), worst pixel 4350× → 1690× the reference, mean relative squared error 1.219 → 0.836, and no cost in samples. `-beamsinmin 0` restores the literal estimator; past ~0.5 the bias is real, and at 1.0 the Jacobian is gone (−12 %).
 
 **And on a thick medium (0.219.1) — the merges work, the estimator is too expensive.** Measured on
 `scenes/_fog_thick.ftsl` (`sigma_t 20 / albedo 0.95`) against a converged mode-`D` reference, mode
@@ -2232,6 +2232,402 @@ reads 1.0030× (gate 3); and CPU-vs-GPU whole-frame energy on `_fog_thick` agree
 `-beamk 1`. That last number is the one that matters for a port, and it is also what proved the
 thick-medium overshoot (UPBP-THICK) is *not* a port bug: both backends overshoot mode `D` by the same
 1.64×, so the device faithfully reproduces a bias the CPU already had.
+
+### Mode `J`'s camera pass, 2.6× faster (0.386.0)
+
+Measured on `gallery_rain`'s still (1280×720, `max_bounce 32`, RTX 4090), 32 spp, two interleaved
+runs per binary: 0.385.0 130–134 s, 0.386.0 49–52 s, against mode D's 19.6–21.4 s. Ablations put mode J's extra
+cost almost entirely in the BEAM half. At 16 spp the same render cost:
+- 15 s with `-nobeams`;
+- 61 s with `-nojsurf`;
+- 63 s with both merge kinds.
+
+There were two separate causes:
+
+- **The wave ceiling.** The wavefront gather runs the camera kernel in waves sized to the
+  segment queue (2^20 entries). The ceiling was `segCap / (maxDepth + 3)`, room for every path to
+  queue its deepest walk. At `max_bounce 32` that is 29 959 paths, fewer than the ~49 k threads the
+  kernel keeps resident on a 4090. Each wave also waited on its single longest path, a 32-bounce
+  walk through the cloud, with the rest of the device idle. Paths here queue ~4 segments in a band
+  with media and exactly 1 elsewhere, so the ceiling is now one segment per path. The wave size
+  comes from the measured segments and hits per path (`sizeFor`, plus the previous chunk's per-band
+  profile), and a wave that outruns its estimate loses nothing: what does not fit the queue is
+  gathered inline, as it always was. Bit-identical to 0.385.0 with `-beamfreeze`; 2.0× on its own.
+- **Transmittance walked once per hit.** With the walk fixed, timing switches on `dBeamHitEval`
+  put 85 % of hit evaluation in its two ratio-tracking walks. One ran down the beam from its
+  origin to the hit and one down the camera segment from its origin to the hit, both repeated for
+  every hit. On a heterogeneous medium the cost is the majorant DDA, paid per cell crossed whether
+  or not anything is sampled, so this was most of the gather. `dMedTransmittanceMulti` walks a ray
+  once and reads the estimate off at many ascending distances. Each reading is exactly the
+  estimator a walk to that distance would compute (the same control term, the prefix of the same
+  Poisson process of tentative collisions, clamped where that walk would be), so each is unbiased
+  on its own; they are correlated, which costs a little variance and buys one walk instead of n.
+  - **Beam side.** `kBeamTr0` runs one walk per parent beam per light-side realization, read off
+    at every sub-beam's start, into the side array `DBeamMap::tr0` (11.5 k parents, 263 k
+    sub-beams, 2.5–21 ms). A hit then walks only from its sub-beam's start, since Tr over [0, s]
+    is Tr over [0, s0] times Tr over [s0, s], and the product of independent unbiased estimates is
+    unbiased. Hit evaluation fell from 6.2 s to 1.1 s per 8 spp. It is a side array rather than a
+    `DBeamRec` field because `kWfBeamHits` streams every record it tests through the BVH, and 4
+    more bytes per record cost it 8 % on `_fog_cornell`.
+  - **Camera side, tried and dropped.** `kWfBeamHits` batched each segment's hits, sorted them by
+    t and walked the segment once. That bought ~4 % on `gallery_rain`, because a segment averages
+    only ~3.4 hits there. It cost 2.3× on `_fog_cornell` before being gated to heterogeneous media,
+    and still 13 % after: the batch arrays and their lambda added 1.8 KB of stack per thread to
+    `kWfBeamHits`. The camera side is still walked per hit.
+
+  Validated against 0.385.0 on six paired seeds with frozen maps (the same seed draws the same
+  map, so the paired difference isolates the estimator). Whole frame +0.010 % ± 0.038 %, surfaces
+  +0.003 % ± 0.007 %, cloud and rain +0.036 % ± 0.489 %. A single seed's media can move ±1–2 %,
+  because one parent's `tr0` is shared by every pixel that hits its sub-beams. That is per-pixel
+  correlation within one realization, so per-pixel standard errors understate it. A render averages
+  it away over its realizations: 136 in 45 minutes here. `FTRACE_BEAMTR0=0` turns the beam half off
+  for an A/B, and `FTRACE_BEAMTR0_TIME=1` times `kBeamTr0`.
+
+  **The one regression:** `_fog_cornell` at 96², 16 spp, frozen map. Its fog is homogeneous and
+  dense with hits, so transmittance is a single exp and none of this helps it. It runs about 4 %
+  slower than 0.385.0 (7.1 s against 6.8 s), all of it in `kWfBeamHits` (5.3 s against 5.0 s). The
+  per-candidate route check accounts for 0.1 s, `tr0` none (`FTRACE_BEAMTR0=0` measures the same),
+  and moving the hit-queue-overflow evaluation out of line (`dBeamHitEvalSpill`) did not recover
+  the rest. Accepted against the 2.6× on `gallery_rain`.
+
+What is left is the walk itself (~0.8 s/spp, against 0.94 s/spp for the whole of `-nobeams` J)
+and the MIS weight's deterministic transmittances (`dTrDet`, ~0.1 s/spp). Those cannot be cached
+per segment without changing the value every competing strategy computes for the same edge, which
+would break the partition of unity.
+
+### Per-object render modes (0.386.0)
+
+`mode D` / `mode J` on an object, group, fur, material or medium (FTSL.md §16.1) chooses the
+estimator for that part of the frame. Modes D and J are one renderer: J is D plus its two merge
+kinds. So the frame can switch between them PATH BY PATH and stay a single unbiased image, which a
+compositing script could not do without a seam.
+
+**The route.** A path is routed by the most capable mode (`ROUTE_J` > `ROUTE_D`) among the
+vertices of its camera end's leading chain: eye[1..f], with f the first non-delta eye vertex. An
+untagged surface or medium counts as the camera's mode. The route has to be a property of the
+PATH, not of the strategy that happens to build it, and the leading chain is one:
+- every connection with t ≥ 2 shares the camera subpath's chain (eye[t−1] is non-delta, so
+  f ≤ t−1);
+- a t = 1 splat's chain is the single light vertex it connects to the lens, non-delta by
+  construction;
+- a surface merge at eye[k] (k ≥ f) keeps the subpath's chain;
+- a beam merge on segment k extends the prefix eye[1..k] by a medium point. Past the chain
+  (k ≥ f) that is the subpath's route. On a chain segment it is the prefix's route, or the hit
+  medium's if the prefix is D (`prefJ`, `DWfSeg::routeMedJ`).
+
+A D-routed path is weighted with both merge constants at zero, which is mode D's weight exactly,
+and is never merged. A J-routed path gets mode J's weight and merges. Each part of path space is
+covered by one complete estimator, so the sum is unbiased.
+
+**Why the chain rather than the first hit.** A caustic on a plinth seen through a glass sphere is
+the case the feature exists for. Its first hit is the glass (delta) and the diffuse vertex is
+behind it, so a first-hit rule would have to tag the plinth. Tagging the glass routes everything
+seen through it, and through a mirror chain that reaches it. Media count only through their own
+vertices, a scatter point on the chain or a merge point, so a ray crossing a tagged medium on its
+way to an untagged wall routes that wall D while the merges along the crossing route J.
+
+**Materials carry it.** Hits know only a material id, so a tagged object gets route-tagged copies of
+its materials (`routedMat`, memoised per (material, route); an inner tag wins). The loader snapshots
+the primitive pools before an object or group is added and retags what it added, which covers
+glTF meshes with many materials. A mix's children are copied too, because both walks store the
+RESOLVED child on the vertex. A layered coat is synthesised later from its parent, so it inherits.
+Emitters are found by material, so an emissive surface keeps the camera's mode.
+
+**Dispatch.** `runRender` reads the tags. A camera in D with anything tagged J becomes a mode-J
+render with `ROUTE_D` as the default (`cudaSetRouting`, `bdpt::g_routeOn`); every other mode prints
+that it ignores the tags. `c_routeOn == 0` computes nothing, so an untagged scene is untouched.
+
+**Per-mode sample counts (`mode_spp D=x J=y`, `-mode-spp`).** One sample count for the frame
+forces a trade: a J-routed region costs mode J's price per sample, so either it is under-sampled
+or the D-routed rest pays for samples it does not need. Each base sample therefore draws kD and kJ
+SUB-SAMPLES. A route with multiplier m takes floor(m), plus one more with probability frac(m),
+decided by a hash of the base sample's index so it is reproducible and independent of every path's
+stream. Each of its contributions is weighted 1/m, so its expected contribution per base sample is
+its integral for any m. Nothing is rounded per chunk, which keeps it unbiased at the 1-spp chunks a
+media frame runs. Sub-sample j draws route r iff j < k_r, and the work follows:
+- a D-routed subpath's connections are skipped in a J-only sub-sample, and only its t = 1 splats
+  onto J-routed light vertices still run;
+- every merge (always J-routed) is skipped in a D-only one.
+
+The splat film stays correctly normalised, because every pixel draws the same expected number of
+route-r sub-samples. Sub-sample 0 is the base sample itself, with the same index and stream, so
+multipliers of 1 are bit-identical (checked on GPU and CPU). Six seeds per variant at J=4,
+D=3+J=0.5, J=0.25 and D=2.5 agree with the ×1 renders within 1.1 SE in every region, and the noise
+moves as it should: the J-routed region's seed spread halves at J=4.
+
+**Gates (scraps/_rt_*.ftsl on `_fog_cornell`).** Everything tagged D under a J camera equals mode
+D bit for bit, and everything tagged J under a D camera equals mode J bit for bit, on the GPU and
+on the CPU. The CPU D case needs `-heroc 1`: CPU mode D runs the hero-wavelength bundle in that
+flat-extinction fog and mode J with beams does not, which is a pre-existing difference between the
+two renderers, not a routing one. The mixed case is checked statistically (known-issues.md,
+PER-OBJECT-MODES).
+
+### Mode `J` counted sunlight off the sun's own chord twice (0.386.0)
+
+**Symptom.** `gallery_rain`'s cloud rendered ~10 % brighter in mode J than in mode D
+(known-issues.md, RAIN-J-VS-D). Mode R settled which was wrong. At 320x180 it agrees with itself
+across backends in the cloud (CPU/GPU 1.002), and mode D sits within 2 % of it. Mode J read +11.9 %
+over 4 seeds (seed spread 1.2 %), identically on the CPU, and the same with `-nojsurf`, so the
+excess was in the beam half's shared algorithm, not the device port. A sunlit blob with the
+cloud's coefficients (`scraps/_jcloud*.ftsl`) reproduced it:
+- with only an area light, J/R 0.995;
+- with the sun, 1.02–1.05, larger for a bigger blob.
+
+**Cause.** Every strategy that builds a path has to agree on its densities, or the balance
+heuristic stops summing to 1. The sun's light subpath (`deltaLightSubpath`) starts on a fictitious
+disc R_scene away and draws its direction from the 0.53° solar cone. Two densities describe its
+first chord:
+- the walk records the direction density 1/coneSolid (~15 000 / sr);
+- PBRT's infinite-light patch then rewrites the first scene vertex's `pdfFwd` to the planar
+  1/(πR²).
+
+Every connection weight (`misWeight`, the light-side sums) reads the patched value, and the merge
+eta it computes at a point on that chord is tiny. The beam merge's own weight (`BeamMergeWeight`,
+`dBeamMergeWeight`) read pdfDir/ρ², about 10⁴ times larger, and so claimed nearly the whole path.
+The two shares summed to almost 2 on single-scattered sunlight. That light is a modest fraction of
+a thick, bright cloud, hence +12 % there and +2–5 % in the repro. It is absent in the thin rain over
+the grid, where the ground behind dominates the pixel, and in any scene without a sun.
+
+**Fix.** `BeamMis::pdfPlanar`, with its device twin. A beam leaving the sun's vertex carries the
+planar 1/(πR²), computed with the same R and formula as the patch, and the merge weight uses it as
+its light density gL in place of pdfDir/ρ². Spot lights need nothing: their first vertex keeps the
+solid-angle density, which is consistent already. Measured on the big-blob repro (3 seeds, CPU):
+J/R +4.01 % (9.5 SE) before, −0.76 % (1.9 SE) after. The small low residual matches the −2 % J has
+long read on `_fog_cornell` (known-issues.md, J-FOGCORNELL), which is not sun-related.
+On `gallery_rain` (320x180), the fixed J agrees with D in the media to 0.1–0.5 %. Mode R, the
+reference for nearly everything else, reads 1.7–4.5 % LOW in this scene's sunlit media. The sun's
+light also reaches them by reflecting off chrome, gold and glass, and next-event estimation cannot
+pass a specular surface. So a backward walk finds that light only by sampling a mirror chain onto
+the 0.53° disc, which is never at practical sample counts. Forward mode B, which emits from the
+sun, agrees with D (0.995 / 1.009). Lesson: R is not a reference for media lit through specular
+geometry by a small source.
+
+### Mode `J` read the camera's spectral factors at the camera's wavelength (JSPEC, 0.386.1)
+
+**Symptom.** After the sun fix, mode J still read low against D: −2.66 % on `_fog_cornell` at
+`-max-bounce 8`, −1.6 % at 2, about nothing at 1 (known-issues.md, J-FOGCORNELL). Bounding the
+merge's sin θ explained 0.36 points of it (`-beamsinmin`, which is biased and so off by default since
+0.386.1; known-issues.md, J-FOGCORNELL). A partition-of-unity audit of
+`BeamMergeWeight` against `misWeightReference` (temporary code, now removed) showed the weights
+summing to 1 within 0.1–0.3 % once the clamp was off. The weights were right, so the error had to
+be in what the merge estimates. The image said what: J/D luma by 8×8 block ran **1.04–1.10 beside
+the red wall and 0.86–0.90 beside the green**, and per channel R 0.958, G 0.979, B 1.027. The
+colours were washing toward grey. Grey walls made the pattern vanish. The glass ball and its
+dispersion did not matter: colour walls with an index-1.5 ball −2.29 %, without the ball −2.44 %.
+
+**Cause.** A merge pairs a camera subpath with a beam (or a surface photon) that was traced
+separately, at its OWN wavelength λ_b. The camera walk ran at the camera sample's λ_c, and every
+spectral factor it met sits in the scalar `beta` at λ_c: a coloured wall's albedo, a rainbow's
+phase, a dielectric's Fresnel coin, coloured glass, a chromatic σ_t. Multiplying that scalar into
+a sum over beams of every wavelength computes r(λ_c)·Σ L_b CIE(λ_b), where the estimator owes
+Σ r(λ_b) L_b CIE(λ_b). Mode M had this exact bug on its specular chains, fixed in 0.321.0
+(SPECGATHER, above). Mode J's camera walk also bounces diffusely and scatters in media, and nothing
+re-expressed it. The connections are immune: both of their subpaths run at λ_c.
+
+**Fix.** The camera walk carries its spectral factors on a 24-bin grid (`JSpec` / `JSpecRun`,
+beamgather.h; `DJSpec` / `DJSpecRun` on the device). Each bin holds Π f(λ_k) / f(λ_c), so
+`beta · at(λ_b)` is the camera side evaluated at the beam's wavelength. `at()` interpolates
+linearly between bin centres. A segment snapshots the carrier at its origin (`PathSeg::spec`), and
+the point merges read it as it arrives at their vertex (`JSpecWalk::vert`; the device rebuilds it
+from the previous segment's snapshot). What is folded, each against the value `beta` took at λ_c:
+- **Lambertian, glossy, diffuse-transmit:** the lobe's albedo. Any lobe coin cancels, because the
+  ratio re-expresses the sample, not the sampler.
+- **Mirror, filter, half mirror:** the slot, or its coin.
+- **Dielectric, thin film, multilayer:** the interface step's branch factor, `stepFactorAt`, the
+  same function SPECGATHER folds.
+- **Medium scatter:** σ_s(λ)/σ_s(λ_c), and a rainbow's phase at the direction λ_c sampled.
+- **Segment:** coloured glass, and Tr(λ)/Tr(λ_c) when some medium's σ_t is chromatic
+  (deterministic transmittance, so the ratio is not a ratio of two noisy estimates).
+
+A flat factor costs three probe evaluations and cancels. So a camera path that met nothing
+chromatic has `any == false`, and its merges are bit-for-bit the old arithmetic.
+
+**Folded beams.** A deposit-folded beam (`achro == 1`) stores a colour, not a wavelength, so
+`at()` has nothing to read. Mode J now folds only a path that met nothing chromatic
+(`PathSeg::fFlat`), whose spectrum is exactly its emitter's SPD, and records the emitter
+(`PhotonBeam::srcEm`, uploaded as `DBeamRec::emIdx`). For a chromatic camera path the merge
+re-colours the beam through that emitter's own fold quadrature, Σ_k foldCie[k] · r(foldLam[k])
+(`jSpecFoldColor`). The identity Σ foldCie = cieMean makes that exact at r ≡ 1. A path that DID
+meet a chromatic factor deposits the `-beamspec` bundle instead, whose members each have a
+wavelength. `gallery_rain`'s sunlit cloud keeps its fold. A beam off a coloured floor becomes a
+bundle.
+
+**The device folds read spectral SHAPES, not the material functions.** The first device build
+called `dDiffuseRho` and friends per bin. The extra call sites tipped nvcc into emitting
+`dReflectBase`, `dPatternScalarAt` and `dPatternEval` out of line, at 169–254 registers, and no
+`__launch_bounds__(128, 3)` kernel can call them: nvlink refused the build. Forcing those inline
+just moved the problem to `dFieldEval` and `intersectImplicit`. So since 0.386.2 the device takes
+each hit's spectral SHAPE from the walk's OWN read of the slot (`DJBase`, filled through an optional
+pointer that `dDiffuseRho` / `dReflectSlot` / `dReflectBase` / `dTexReflAt` / `dRecordReflect` /
+`dTransmitSlot` pass down): which of a constant table, a texture's sigmoid (stochastic tiling's
+blended coefficients included), a record's driver or a triplanar blend chose the spectrum, the
+vertex colour's sigmoid, and the wavelength-free pattern multipliers. `dJSlotAt` re-reads the slot
+at 24 wavelengths from that with lookups and three-term polynomials, so it is exact, coats over
+patterned bases included, and adds no call site of any texture or pattern reader. (0.386.1 had
+re-derived the shape on its own and approximated three cases; this replaced it.) A chromatic
+heterogeneous medium folds its Tr ratio from one density integral per segment (`dJDepths`: four
+midpoints per medium, as `dTrDetMedium`), shared by every bin. The rule that keeps nvlink happy
+is the same everywhere: a factor whose reader is heavy is evaluated in a loop with ONE call site
+(`DJSpecRun::mul`, the fiber's loop shared with the hero bundle's secondaries, the lens trace's
+loop shared with the main trace).
+
+**The ratio is stored normalised, with its magnitude in `logS`.** A camera ray inside glass that
+absorbs at λ_c can leave `beta` at 1e−218 while other wavelengths pass. The ratio then reaches
+1e+217: past a float, and two such segments on, past a double. The first full device build wrote
+689 NaN pixels into `gallery_rain` at 2048 spp. `beta × ratio` is finite, and it is all a merge
+uses. So `r` stays inside [1e−15, 1e15] and the excess goes to `logS`, which a merge folds into
+`beta` in log space (`JSpec::beta`). A non-finite or negative bin is zeroed. A walk whose `beta`
+underflows to 0 at λ_c still contributes nothing at any wavelength, a support loss confined to
+glass dark enough at one wavelength to swallow e^−700.
+
+**Hair, the layered coin, the grating and the lens (0.386.2).**
+- **Hair:** the fiber at every bin along the direction λ_c sampled, the same f·cos the hero
+  bundle's secondaries take (`hairFoldFCos`; the device shares the secondaries' loop).
+- **A layered coat's coin:** R(λ)/R(λ_c) for the coat, (1−R(λ))/(1−R(λ_c)) for the body. It is folded
+  before the vertex's arrival snapshot, because a point merge there evaluates only the chosen
+  child. That is why the device now keeps per-vertex arrival snapshots like the host
+  (`DJSpec vspec[MAXV]` in the merge kernels): 0.386.1 rebuilt them from the previous segment,
+  which cannot see a coin taken at the vertex itself. The coin's re-reads use the incidence
+  cosine and film thickness its λ_c call captured (`dCoatRAtJ`).
+- **The grating:** the order's probability is 1/(1+|m|) over the orders that propagate, which
+  depends on λ, so at another wavelength the order carries r(λ)·wsum(λ_c)/wsum(λ), or nothing where
+  it is evanescent (`gratingWsum`).
+- **A real lens:** its weight at every bin, the same film and pupil sample traced again.
+
+**The dispersive window (0.386.2).** A grating's non-zero order sends each wavelength a different
+way, so the sample a camera walk took exists at λ_c alone. No ratio re-expresses a direction.
+From such an event on (`JSpecRun::markDisp`), a merge pairs the path with light AT λ_c:
+- a beam member or photon within `-jdispwin` (10 nm) of it counts, coloured CIE(λ_c) and weighted
+  1/(p_cam(λ_c)·window);
+- a flat-folded beam, whose spectrum is its emitter's SPD, is read at λ_c exactly
+  (`jDispFoldColor`; `Emitter::spdDen`, device `emSpdInv`), with no window and no window noise;
+- the camera side then needs no ratio at all (`JSpec::atC`).
+
+The expectation over λ_c is the pixel integral, to O(window). The noise of the windowed members
+grows as band / window. Measured on a fog blob seen only in a grating (`scraps/jspec2/grating3`):
+the old estimator lost 35–40 % of the red in the ±1 orders, and the window brings them to within a
+few percent, which is this scene's noise. The full table, one scene per closed gap, is in
+known-issues.md, JSPEC-GAPS. One detail from that table: the walk clamps a fiber's factor,
+clamp01(f·cos/pdf), and the carrier has to re-express the clamped factor, not f·cos. Unclamped,
+red got past the cap that had stopped λ_c and read 1.3 % high around blond fur. Dispersive refraction and a real lens bend wavelengths apart too, but
+by far less. They keep the ratio re-expression and the λ_c direction, a sub-pixel chromatic blur,
+unless `-jdispall` opens the window for them as well.
+
+**Still not re-expressed:** the camera-side glass absorption *inside* the gather (`aGlassCam`, read
+at λ_c over the beam's closest-approach distance), and the support of a factor that is zero at
+λ_c. Mode M's own beam gather still multiplies by the scalar `thr`: its specular-chain carrier
+reaches its photons but not its beams. All of these are listed in known-issues.md, JSPEC-GAPS.
+
+**Measured** (`_fog_cornell`, `-max-bounce 8 -beamcount 1e5 -beamk 2 -nojsurf -beamsinmin 0`, CPU,
+J 1024 spp against D 4096 spp, 64²). Before: J/D −2.30 %, by block 0.86–1.10, R/G/B 0.958 / 0.979
+/ 1.027. After, 4 seeds: by block 0.96–1.02 with no wall pattern, R/G/B 0.981 / 0.992 / 0.996.
+After, 12 seeds: −0.69 % (3.0 SE). The GPU, same scene and flags, J 4096 spp against D 16384, 4
+seeds each: `FTRACE_JSPEC=0` −1.69 % with R/G/B 0.972 / 0.983 / 1.030; fixed −0.69 % (seeds −0.58 to
+−0.78) with 0.991 / 0.994 / 0.998, flat across the frame. The grey-wall control reads the same on
+matched CPU seeds (the J light side shares its streams across those scenes), so that −0.7 % is not
+spectral. It is the beam kernel's boundary blur: it scales with `-beamblur` (−1.76 % at 4×, −0.14 %
+at ¼), because in a closed box every camera ray ends on a wall and the blur reaches past it, where
+there are no beams (J-FOGCORNELL; the fix would be a shrinking beam radius, UPBP-BEAM-RADIUS).
+`FTRACE_JSPEC=0` restores the old estimator on both backends for A/B runs.
+
+**Gates** (`-beamsinmin 0.3 -beamfreeze`, same seed, against the 0.386.0 binary, md5 of the PFM, on the
+CPU and the GPU): grey walls with JSPEC on, and coloured walls under `FTRACE_JSPEC=0`, are both
+bit-identical. A camera path that meets nothing chromatic, or a run with the carrier off, is
+exactly the old estimator.
+
+**Cost:** none measurable. `gallery_rain` as tagged, 1280x720, slope of `-spp 4` to `-spp 20`: 1.36 s/spp
+with the carrier, 1.38 without. **On `gallery_rain`** (320x180, full-frame J, 4 seeds × 2048 spp,
+against D 4 × 4096): the rain over the coloured grid went from −7.3 % to +1.1 %, and the cloud and
+the rain against the sky stayed within 0.3–0.9 % (known-issues.md, RAIN-J-VS-D).
+
+### Mode `J` merges through glass, and the aimed sun (MODE-J-SDS, 0.387.0)
+
+**The gap.** A path light → glass → diffuse → glass → camera (a caustic seen *through* glass) has
+no BDPT strategy when the light is a sun or a spot: light tracing and connections cannot cross a
+specular vertex, and the camera path cannot hit a delta light. Merging is the only strategy, and
+mode `J` never took it. After a delta bounce the walk writes the next vertex's light-side density
+as 0 (PBRT's convention; `randomWalk`, `pdfFwd = delta ? 0 : pdfW`). The connection weights read
+that 0 as 1 (`misRemap0`), because every strategy that builds the path samples through the same
+delta vertex and the factor cancels. The merges read it literally instead: the photon store
+required `pdfFwd > 0`, and `mergeEtaPrimeSurf` / `mergeEtaPrimeBeam` / `SurfMergeWeight` /
+`BeamMergeWeight` / `BeamMis` all treated the site as "no such strategy". That was consistent, so
+nothing was double counted, but no photon that reached a surface through glass was ever stored.
+On a test scene (a glass ball over a floor, sun, camera looking back through the ball) mode `J`
+returned 7 % of mode `R` through the ball.
+
+**The fix: one convention, every site.** The merges now read a delta bounce's 0 as 1 too
+(`mergeLightDensity`), at every site where a merge's weight or store looks at a light-side
+density. Those sites are the store and the merge AT y_{u-1} in the light pass (host and device),
+misWeight's light and camera loops, `misWeightReference`, `cameraSideSums`, and `BeamMis`. Since
+every strategy's weight reads the same chain of ratios, the weights still sum to one. A stored
+photon carries the corrected density in `SurfMis::pdfFwdA`, and a beam that left a delta vertex
+carries its merge point's corrected density in `BeamMis::pdfPlanar` (the field `BeamMergeWeight`
+already reads as gL outright), so neither weight struct changed.
+
+**Only a delta neighbour's 0.** A light-side density is also 0 when the strategy cannot produce
+the vertex at all: a one-sided lobe, or the device's FP32 reverse-density probe landing just under
+a surface. Reading that 0 as 1 adds a strategy that never contributes. So each site passes the
+delta flag of the vertex the light came FROM, and only that 0 is read as 1. The first cut read
+every 0 as 1, and a GPU md5 mismatch on `_cornell_diffuse` (no delta vertex anywhere) was what
+prompted the narrowing. That mismatch turned out to be timing, see **Gates**, but the narrowed
+rule is the correct one regardless.
+
+**The aimed sun.** Storing those photons is not enough when few of them exist. A sun light
+subpath starts uniformly on a disc of radius `sceneRadius`, 33 m on `gallery_rain`, so about
+3 in 100 000 reach its prism, and a merge of radius 1 cm finds almost none. A share `f` (default
+0.25, `-sunaim`) of sun subpaths now draws its origin from the focusing geometry's footprint
+instead. The targets are the bounding spheres `causticaim.h` builds for mode `M` (64 by
+`-causticaimk`), each projected onto the disc as a circle and picked by r². The mixture density is
+
+    p(x) = (1 - f) [|x| <= R] / (pi R^2)  +  f * count(x) / (pi SUM_j r_j^2)
+
+Unlike mode `M`'s separate aimed pass, this is ONE sample from the mixture. Every place the sun's
+origin density is read uses p(x): the walk's throughput (`deltaLightSubpath`, device
+`dGenLightSubpath`), the first vertex's forward density, `vertexPdfLight` (`dVertexPdfLightF`),
+which also serves NEE to the sun, and `BeamMis::pdfPlanar`. The reverse evaluation runs the ray
+back to the disc plane (`sunOriginPdfAlong`), which reproduces the sampler's own origin for a
+light subpath and the origin a light subpath would have needed for an NEE connection. Only the
+sun is aimed. Mode `U` and the forward modes keep their own samplers (and their own consistency).
+`main.cpp`'s `prepareSunAim` builds the targets once per scene for modes D, J and U (U since 0.388.0:
+its own sampler in `vcm.h` / `kVcmLightT` draws from the same mixture, and its two readers of the sun's
+origin density, the subpath's `emissionPdfW` (hence `dVCM`) and the NEE weight's `emissionPdfW`, read
+it; through the ball mode U reads 1.0152 ± 0.0018 aimed against 1.0129 ± 0.0041 uniform on the CPU and
+1.0121 ± 0.0009 aimed on the GPU, the same 1.2–1.5 % above R its default 5.7 cm merge radius blurs in) and hands them to
+the device (`cudaSetSunAim`, uploaded at the top of `renderBdptCuda`, before the device light
+pass). On `gallery_rain` it reports 556 649 focusing prims in 64 targets covering 0.64 % of the
+disc, so sun subpaths are about 50× denser on the glass.
+
+**Measured.** Ratios to mode `R`, `-max-bounce 32` throughout. Modes D and J default to depth 8
+against R's 32, and that alone reads 0.35 % low on a floor and 1.3 % low through a plate.
+`scraps/sds/` holds the scenes and `cmp.py`:
+
+| scene, region | new J, CPU | new J, GPU | old J / mode D |
+|---|---:|---:|---:|
+| ball lens, sun, the caustic seen through the ball | 1.0043 ± 0.0031 | 0.9993 ± 0.0008 | 0.071 |
+| flat plate, sun, the floor seen through it (no focusing) | 1.0041 ± 0.0024 | 1.0003 ± 0.0012 | 0.026 |
+| floors seen directly | 1.0002–1.0008 | 1.0003 | 1.0002 |
+| ball lens, area light, through the ball (s=0 already reaches it) | 0.9985 ± 0.016 | | 0.9986 |
+
+And against mode D on `_fog_cornell` (an area light, so D reaches every path; fog behind and under a
+glass ball, so beams that LEFT the glass now merge; 64², `-beamcount 1e5 -beamk 2 -nojsurf`, GPU,
+4 seeds): J/D −0.53 % ± 0.13 new, −0.46 % ± 0.14 old. That is the beam kernel's known blur
+(J-FOGCORNELL, −0.69 %), unchanged. The new beam weights share with the old strategies without moving
+the answer. Speed is unchanged too: one `gallery_rain` flyby frame took 68 s against 71 s, and
+`_fog_cornell` 121 s against 120 s.
+
+The ball needed `-n 1e6` to get there: at one light subpath per pixel, J's seeds spread
+1.53–1.66 against R's 1.548–1.557, a heavy tail from the few photon realizations. Aiming: on
+`gallery_rain`'s prism cap, mode D's stripe seen directly reads 0.07634 ± 0.00003 aimed against
+0.07680 ± 0.00082 uniform (GPU, 4 seeds × 512 spp). That is the same answer with 27× less error.
+At 128 spp the uniform render is scattered speckle and the aimed one a clean rainbow.
+
+**Gates** (md5 of the PFM, old 0.386.2 binary against the new one, CPU and GPU). Without glass,
+mirrors or a sun (`_cornell_diffuse`, modes J and D), the defaults are bit-identical. With
+`FTRACE_JDELTA=0 -sunaim 0` (`_fog_cornell` and the sun-lit ball, modes J and D), the old estimator
+is bit-identical. MODE J NEEDS `-beamfreeze` FOR ANY md5 GATE: its light side is redrawn on a
+wall-clock schedule ("every ~10 % of the wall clock"), so the number of realizations, and with it
+the image, depends on how busy the machine was. The old binary itself gave two different
+checksums for one command on the GPU. `-beamfreeze` makes it reproducible.
 
 ### Mode `J` gate 3 — an *analytic* reference, and the truncation bug it found (0.241.0)
 
@@ -3200,6 +3596,38 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
     merge's MIS η term, so the exclusion is consistent by construction) — a photon stored on a
     strand lying on the skin had bled into every skin gather point within the radius, 2–6× too
     bright on fur.
+  - *GPU modes D and J take hair since 0.385.0; the FP32 device build needs its own strand ray start.*
+    Before 0.385.0 `cudaBdptSupported` refused any `type hair`, so modes D and J ran a hair scene on the
+    CPU (gallery_rain mode D at 1.27 s/spp, against 0.52 on the GPU). The port reproduces the rules
+    above on the device:
+    - `dRandomWalk` gained a `D_HAIR` case (`dHairShadeAt` + `dhair::sample`, a coverage pass-through
+      as a delta continuation that keeps the bundle, the mixed-medulla collapse to the hero), and a
+      light walk drops the vertex.
+    - `DVertex` carries `tangent` and `fiberR`, so `dVertHit` can rebuild the fiber frame for a
+      connection.
+    - `dMisWeight`'s camera loop breaks at a strand, and mode J's `segSumC/segSumM` zero there.
+    - `dSurfMergeSite` (and the host `surfMergeSite`) exclude any vertex with `fiberR > 0`, not just
+      `type hair`. A photon stored on a thin diffuse curve bled into the gather points around it,
+      exactly as one on a strand did (`known-issues.md` VCM-THIN-CURVES).
+    The FP64 device build then matched the CPU. The FP32 build read 3–7 % bright on fine dense fur.
+    `FTRACE_ONLY_ST` (one `(s,t)` strategy at a time, FP32 against FP64) put the excess
+    in every strategy that continues off a fiber; the first connection, which leaves no strand, matched.
+    The cause was the ray origin. `dOffsetPoint` pushes each coordinate by its own ulp count (by
+    1/65536 below 1/32), so the push is not parallel to the ray. On a tube one radius wide, that moved
+    a far-side exit sideways far enough that the exact chord no longer cleared the strand's own far
+    wall. The ray re-hit the strand from inside, made a spurious second fiber vertex, and that vertex
+    collected the same light again. `RAY_EPS` (1e-4 in FP32) is itself a whole hair, so the near side
+    could not simply use it either. `dStrandStart` is the FP32 rule, used by the walk's continuation,
+    by the NEE and vertex-connection shadow rays of `dConnectBDPT`, and by mode U's `kVcmCameraT`:
+    - the origin is the exact hit point;
+    - the own tube is skipped by the exact chord on the far side, and by 0.25 r of curve on the near
+      side, where a convex tube cannot be re-entered, so all that is skipped is float noise at t ≈ 0;
+    - everything else is skipped by `dStrandEps` = 1 % of the radius, at least 128 ulps of the largest
+      coordinate, at most `RAY_EPS`.
+    Afterwards, every strategy agreed with FP64 within its seed noise. GPU and CPU agree to 0.1–1.2 % on
+    the fur of three scenes in each of D/J/U (`known-issues.md` HAIR-GPU-BDPT has the table), and read +0.8–1.2 % 9 m from the origin, where an FP32 ulp
+    is about 1e-6. The FP64 build keeps the CPU's absolute offsets, so this is compiled for FP32 only.
+    Hair-free renders are bit-identical to 0.384.4.
   - *Modes M / S scatter but never gather.* `struct Photon { Vec3 n; float power; float
     lambda; }` carries **no incident direction**, so a directional BCSDF has nothing to
     evaluate against at a density-estimate gather. `sppm_render.h` and `photonmap_render.h`
@@ -4894,7 +5322,7 @@ as the one at fault.
   **cleared** alongside the beam banks — `nEmitted` comes from the real pass, and leaving the
   pilot's photons in the map would put ~3 % more flux in it than the normalisation divides by.
 - **`vcm.h`**, **`sppm_render.h`**, **`photonmap.h`/`photonmap_render.h`/`photonmap_io.h`/`causticaim.h`** — U/S/M.
-  PhotonMap::build precomputes per-photon CIE X/Y/Z (the 3.65× mode-M win); VCM
+  PhotonMap::build precomputes per-photon CIE R/G/B (the 3.65× mode-M win); VCM
   caches CIE lookups; kd/grid structures for gathers.
   **`PhotonMap` is structure-of-arrays, and that is load-bearing.** Deposit positions
   live in `pos[]`, everything the gather reads after acceptance in `photons[]`, and the
@@ -7326,7 +7754,38 @@ as the one at fault.
       diamond 0.060 → 0.062, orb 0.097 → 0.099), which independently confirms the `k`/`s`
       calming was sized correctly. To meter a decorative cap properly the tool would have to
       divide the texture back out before thresholding.
-    - **The glass orb is levitated 0.30 m on three pins, and its cap is cantilevered.** The
+    - **Everything in this list was measured under the 45° sun, and the sun is now 20°
+      (2026-10-18 re-siting).** When `gallery_rain` dropped its sun to 20° (298de855, for the
+      behind-the-cloud flyby and the bow) nobody re-measured the caustic pieces, and
+      `tools/_gemsweep.py` could not have: it carried the 45° sun as a literal. It now reads
+      the sun from the scene (`GEMSUN` overrides), can slide its metered window downwind
+      (`GEMOFF`, `GEMHALF`) because a caustic now walks cot 20° = 2.75 m per metre of drop
+      instead of 1.0, and can seat a piece in a holed cap (`GEMHOLE`). Re-measured over a bare
+      cap in the scene's sun:
+      - **Axicon** — still the best piece: the two wide cusps merge into *one* compact spot,
+        peak 29×, sat 0.24, fan 0.79, 0.15 × 0.38 m, centred 0.74 m downwind. **75 % of it
+        fell past its cap's far edge**, into the gap before the crystal gyroid's cap (the
+        "lip splash" in the full-scene render). Cap far edge 4.77 → 4.42; the room came from
+        trimming `stand_diamond_cap`'s front lip 4.55 → 4.32, which catches nothing.
+      - **Glass orb** — **no caustic at any height over a cap** (peak 2.1×, zero coverage at
+        the old 0.80 m drop). Not a tuning problem but geometry: a ball focuses ~1.43 R from
+        its centre *along the light*, which a 20° sun tips only 0.49 R below the centre —
+        above the ball's own bottom — so every surface it floats over is far past focus. The
+        only flat surface near the focus is one the ball sinks into: the cap is now a raised
+        plinth (top y 1.30) with a spherical seat, 0.40 m below the centre (7.0× peak, 1.19 %
+        coverage; 0.25 m gives 111× and clips). The pins went (the seat's rim is where they
+        touched the ball), and five `fly` points moved round the new plinth, with every
+        arc-keyed stop remapped (`scraps/_fly_reroute.py`).
+      - **Crystal gyroid** — unchanged: its small 6.4× spot already lands on its cap.
+      - **Gem compote** — nothing at 20° (peak 1.4×, even on an unlimited catcher): the light
+        has to cross the ruby bowl's walls sideways and is absorbed. Under 45° it threw a
+        7.7× spot covering 0.01 % — it was always marginal. No cap position can fix it.
+      Both upright fill panels were moved in the same pass because, at 20°, they cast shadows
+      their `hide_camera on` made unexplained: the left one over 45 % of the axicon cap
+      (x 1.5 → 0.70), the right one over a third of Alice's cap (z 6–9 → 8.4–11.4, power
+      2 → 6.2 kW so the rain's irradiance — the bow's backdrop — is unchanged).
+    - **The glass orb is levitated 0.30 m on three pins, and its cap is cantilevered** *(the
+      45° design — superseded by the plinth above).* The
       height was *measured*, not computed. The textbook ball-lens `f = nR/(2(n−1))` — 0.734 m
       from centre for BK7 at R=0.5 — is **paraxial**, and a full-aperture sphere has gross
       spherical aberration: the marginal rays carry most of the flux (area ∝ r²) and cross far
@@ -7676,6 +8135,34 @@ as the one at fault.
       the crystal gyroid, which occluded it completely; the error was invisible in the scene
       text and obvious the moment it was rendered. Project the candidate point through the
       camera basis before committing to a position.
+    - **Since 2026-10-19 the colour source is a CRYSTAL PRISM, not the axicon.** The axicon
+      was tuned entirely under the 45° sun, and nobody re-tuned it when the sun dropped to 20°
+      (298de855). A cone bends every ray by the same angle only when light comes in along its
+      axis. At 20° the light arrives 70° off it, so it formed a *line* focus whose colours lay
+      along the line, on top of each other: the still showed a white streak with an orange tip,
+      white even developed at 1/16 exposure. Two findings carry beyond this scene. **A higher
+      index is not more colour**: in the rig (`tools/_gemsweep.py`, scene sun, SF10, drop 0.65)
+      raising the index 0.4 at SF10's dispersion dropped the peak from 22× to 3.6×, and diamond
+      threw no caustic at all (total internal reflection). Colour is dispersion. Tripling it at
+      SF10's index kept the brightness and raised `sat` 0.23 → 0.34 and `spread` 0.058 → 0.170,
+      but only coloured the tip of the streak. **The geometry has to spread the colours across
+      the caustic, not along it.** A prism bar lying crosswise to the sun does, and is the
+      shipped piece: 0.9 m of SF10, 0.104 m faces, rolled 70° (one face square to the sun), at
+      the cone's place and height on two pins. It throws one rainbow stripe across the same cap
+      (rig, `GEMCUT=1.15`: peak 4.7×, `sat` 0.40, `spread` 0.21). Whether the colours separate
+      is the spread at the screen (drop × angular dispersion) against the beam width (the face),
+      which is why the bar is thin. A standing prism throwing two sideways fans was the
+      runner-up. The scene's block on the piece carries the full table;
+      `scraps/_caus_prism.py`, `_caus_ior.py` and `_caus_scene.py` reproduce it.
+      **Later the same day the bar became a FAT prism tilted on three axes** (inradius 0.18 m, six
+      times the bar, axis 44.5 deg off horizontal), asked for "wide and more interesting than a bar".
+      A face that wide throws white patches with thin coloured edges at most orientations; colour
+      comes back where light leaves a face near grazing after an internal reflection, where the
+      angular dispersion grows as 1/cos(exit angle). So the orientation was SEARCHED
+      (`scraps/_fatprism.py` over the gem rig, scored by the share of a cap-sized window whose
+      chromaticity differs from bare cap): 48 random orientations had a median of ~0.1 % coloured
+      cap, the best 18.6 %, refined to 22 % at the shipped angles, a narrow optimum (5 deg of roll
+      takes it to 0.1 %). The flyby's prism pass was re-planned around it (scene, `camera_curve`).
     - **`rotate` is not a valid key inside an FTSL `function` block** (only `translate` is), and
       the loader emits a **warning, not an error**, then carries on — so a rotated field
       silently renders unrotated. A prism roll sweep came back as six identical rows before
@@ -9970,10 +10457,16 @@ User-facing rules: REFERENCE.md → *How long output is kept*. Regression check:
   own register allocation exceeds the cap (169 vs 168 for `kBdptT`). Device helpers must be
   `static` (internal linkage) so the partitioner keeps them with their callers — already
   the house style, and now a requirement.
-- `build.bat` → CMake/VS2022 x64 Release into `build_cuda2/`, copies
-  `ftrace.exe` to the repo root. **Warning:** freshly-configured build dirs
-  currently produce a GPU-silently-dead exe (see known-issues, 2026-07-22) — build
-  in the long-lived `build_cuda2`.
+- `build.bat` → CMake x64 Release into `build_cuda3/` (VS 2026 generator first, then VS 2022,
+  then CMake's default; the CUDA toolset named explicitly from `CUDA_PATH`, or the VS generator
+  quietly configures CPU-only), copies `ftrace.exe` to the repo root, then runs
+  `tools/check_device_probe.py` and warns loudly if the GPU half disagrees with the host half.
+  The "freshly-configured build dirs produce a GPU-silently-dead exe" problem (known-issues,
+  2026-07-22 and 2026-08-16) was MSVC 14.5x's float `copysign` returning 0 in nvcc's device pass,
+  fixed in `render_cuda.cu` in 0.385.0; the probe exists because that class of bug -- a host-header
+  change breaking device code with no CUDA error -- can recur with any host compiler.
+  (`build_cuda2/` is the pre-2026-10-18 VS 2022 + CUDA 13.3 tree; its cache cannot follow the
+  toolchain change.)
   **A running render no longer blocks the build (0.141.0).** Windows locks a live
   exe against write/delete but still permits *rename*, so if the copy fails
   build.bat moves the old binary aside to `build_cuda2/ftrace.locked.<n>.exe` and

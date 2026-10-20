@@ -4279,9 +4279,34 @@ struct Renderer {
     // is the undiffracted image. Total mass is the same wsum either way, so the two orders of
     // traversal agree in distribution; the stochastic path keeps its original ascending walk and
     // stays bit-identical.
+    // The order normaliser at `lambda`: sum of 1/(1+|m|) over the orders that propagate for this
+    // incidence, and whether `order` is one of them. gratingDiffract's own loop, kept beside it so
+    // the two cannot drift: JSPEC re-expresses the order a camera walk took at other wavelengths,
+    // where its probability is 1/(1+|order|) over THIS normaliser (0 if the order is evanescent).
+    double gratingWsum(const Material& m, const Hit& h, const Vec3& din, double lambda,
+                       int order, bool& orderLive) const {
+        orderLive = false;
+        Vec3 nl = dot(din, h.ng) < 0.0 ? h.ng : -h.ng;
+        Vec3 g = m.grooveDir - nl * dot(m.grooveDir, nl);
+        if (dot(g, g) < 1e-12)
+            g = std::fabs(nl.x) < 0.9 ? cross(nl, Vec3{1, 0, 0}) : cross(nl, Vec3{0, 1, 0});
+        g = normalize(g);
+        Vec3 t = normalize(cross(nl, g));
+        Vec3 ut = din - nl * dot(din, nl);
+        int M = diffraction ? std::max(0, std::min(m.gratingMaxOrder, 32)) : 0;
+        double lod = lambda / m.grooveSpacing, wsum = 0.0;
+        for (int mm = -M; mm <= M; ++mm) {
+            Vec3 a = ut + t * ((double)mm * lod);
+            if (dot(a, a) >= 1.0) continue;
+            wsum += 1.0 / (1.0 + std::abs(mm));
+            if (mm == order) orderLive = true;
+        }
+        return wsum;
+    }
+
     Ray gratingDiffract(const Material& m, const Hit& h, const Vec3& din,
                         double lambda, Pcg32& rng, bool& absorbed,
-                        const double* whittedU = nullptr) const {
+                        const double* whittedU = nullptr, int* pickOut = nullptr) const {
         absorbed = false;
         Vec3 nl = dot(din, h.ng) < 0.0 ? h.ng : -h.ng;      // incidence-side normal
         // Groove direction projected into the surface; dispersion axis perpendicular.
@@ -4324,6 +4349,7 @@ struct Renderer {
             double xi = rng.uniform() * wsum, acc = 0.0; pick = ord[cnt - 1];
             for (int i = 0; i < cnt; ++i) { acc += wgt[i]; if (xi < acc) { pick = ord[i]; break; } }
         }
+        if (pickOut) *pickOut = pick;
         Vec3 a = ut + t * ((double)pick * lod);
         Vec3 v = a + nl * std::sqrt(std::max(0.0, 1.0 - dot(a, a)));
         v = normalize(v);

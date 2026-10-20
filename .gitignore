@@ -2,6 +2,8 @@
 /build/
 /build_cuda/
 /build_cuda2/
+/build_cuda3/
+/build_cuda3_fp64/
 /build_het/
 /build_fp64/
 /build_verify/

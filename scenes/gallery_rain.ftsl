@@ -4,9 +4,10 @@
 # of scenes/gallery_settled.ftsl (the earlier, roofed edition, kept as it is) and holds the same
 # nine hero pieces in the same places; the settled poses came from re-baking gallery.ftsl, so a
 # moved piece is re-baked there and its pose carried here by hand,
-# plus a TENTH that exists only here: the CRYSTAL AXICON, front-left, which is the only piece
-# in either scene that throws a genuinely COLOURED caustic. See its own block down in HERO
-# PIECES for the measurements that chose its shape, angle and height.
+# plus a TENTH that exists only here: the CRYSTAL PRISM, front-left, a fat flint prism tilted on
+# three axes that throws a broad rainbow band across its cap (it replaced the crystal AXICON, and
+# then a thin prism bar, on 2026-10-19). See its own block down in HERO PIECES for the search that
+# chose its tilt.
 # What is different here is the weather, and the setting built to make the weather legible:
 #
 #   * NO ROOM. The walls, the ceiling and the polished stone floor are gone. In their place
@@ -158,16 +159,41 @@
 #     specular-chain paths.
 #
 # Render (still) — don't pass -mode, the scene's prefer{}/else{} picks it:
-#   ftrace -in scenes/gallery_rain.ftsl -camera cam -noise 2 \
-#          -window -keepwindow -interval 15 -checkpoint -o png/gallery_rain.png
-# Budget honestly: this is BDPT through three stacked media, so it is slow. RE-MEASURED
-# 2026-08-31 on an RTX 4090 at v0.193.1, 1280x720: the cost is LINEAR in spp at 0.49 s/spp
-# with a fixed ~0.75 s of setup, so 600 s is ~1220 spp. The `~N% noise` the progress line
-# reports is not measured for R/D, it is exactly 100/sqrt(spp) (main.cpp ~19790), so 1220 spp
-# reads 2.9% and `-noise 2` is by definition 2500 spp = ~20 min.
-#   That is 3.9x faster than the number this comment used to carry (310 spp in 600 s, hence
-# "-noise 2 is well over an hour"). Nothing about the scene changed; the ENGINE did, and a
-# rate baked into a comment silently rots into bad advice. If you are budgeting off this,
+#   ftrace -in scenes/gallery_rain.ftsl -camera cam -noise 2 -beamblur 0.0025 \
+#          -window-min -keepwindow -interval 15 -checkpoint -o png/gallery_rain.png
+# (add -resume to continue from png/gallery_rain.png.ftbuf). -beamblur 0.0025: a quarter of the
+# default radius, so a quarter of mode J's beam-blur bias in the media, for ~7 % more time and no
+# extra noise, because mode J's beam budget is knee-bound (known-issues.md, UPBP-BEAM-RADIUS).
+# PER-OBJECT MODES (0.386.0; FTSL.md 16.1). The camera says mode D. The transparent pieces
+# -- `glass` (orb, crystal gyroid, Klein bottle), `flint` (prism), `diamond`, the compote's
+# `cp_*` -- and both media (the cloud and the rain) say `mode J`. So every path whose camera end
+# passes through one of them gets mode J's merges. That is what renders a caustic seen THROUGH the
+# glass, which mode D cannot sample -- since 0.387.0 (MODE-J-SDS; the "+4 % on the orb's lower half"
+# this comment used to quote predates it and cannot have come from those merges) -- and what makes the media converge
+# (below: 1.2 against mode D's 3.3). The rest of the frame is plain mode D. The run prints
+# `[mode] per-object modes: ...`; `-no-modes` renders the whole frame in mode D. `render { mode_spp
+# D=x J=y }` gives the two their own sample counts (REFERENCE.md, "Per-object render modes").
+# Budget honestly: this is BDPT through three stacked media, so it is slow. MEASURED 2026-10-19,
+# RTX 4090, 1280x720 (v0.386.1): 1.47 s/spp as tagged (0.91 with the media in mode D, at
+# 0.386.0); 0.67 with `-no-modes`; 1.6 in mode J throughout (`-mode J`). Before 0.385.0 Alice's
+# `type hair` sent mode D to the CPU, at 1.27 s/spp. The `~N% noise` the progress line reports is
+# not measured for R/D/J, it is exactly 100/sqrt(spp).
+# MEASURED NOISE (luma, per pixel, relative; scraps/_jtest_watch.py + scraps/_jtest_noise.py,
+# which meter it from one render's own -hdr snapshots, -vcmalpha 1).
+# Noise x sqrt(spp), median / 90th percentile over 8x8 blocks:
+#                         surfaces    cloud+rain   through the orb   other glass
+#   as tagged (0.386.1)   3.9 / 10.6   1.2 / 2.8    3.8 / 14          4.0 / 12
+#   media in D (0.386.0)  4.1 / 10.6   3.2 / 6.3    3.7 / 13          4.1 / 13-19
+#   mode D (0.385.0)      4.2 / 11     3.3 / 7      6.3 / 27  (no caustic)
+#   mode J (0.385.0)      3.8 / 10     1.1 / 2.4    3.6 / 14
+# To a 2 % median everywhere: as tagged ~15 h (the glass and the surfaces set it; the media get
+# there in 1.3 h). With the media in D, ~10.5 h; mode J ~16 h; mode D ~18 h (orb-limited, and
+# missing its caustic). To 1 %: ~61 h as tagged. Since 0.386.1 mode J and mode D agree in the media
+# and over the grid (known-issues.md, RAIN-J-VS-D and JSPEC). Fireflies converge at none of these
+# rates; clamp them (`-fireflies`).
+#   History: this comment has carried 310 spp in 600 s ("-noise 2 is well over an hour"), then
+# 0.49 s/spp at 0.193.1, then 0.583 at 0.385.0, each time with the scene unchanged and the ENGINE
+# changed under it -- a rate baked into a comment silently rots into bad advice. If you are budgeting off this,
 # re-measure with two short runs at different -spp and take the slope -- it is a two-minute
 # check (`-camera cam -spp 4` then `-spp 32`, -no-meter, subtract).
 #
@@ -459,7 +485,11 @@ scene { units meters  spectral 360 830 1 }
 # run out and it renders as a solid black plug in an otherwise clear bottle. 32 is comfortably
 # past the deepest stack in the room (measured: at 32 the plug is gone and the tube reads as
 # glass). Cost is ~35% of the sample rate. A CLI -max-bounce still overrides this.
-render { max_bounce 32 }
+# jsurf_radius: mode J's surface merges (the glass pieces and media are `mode J`, see PER-OBJECT
+# MODES in the header) start at 1 cm, about a pixel at the orb from the still. The default is 2 %
+# of the scene radius, which this open 33 m hall makes 0.65 m: measured at 320x180, it ran mode J at
+# 2.5 s/spp and blurred the gold gyroid's interior +40 % against mode R. -jsurf-radius overrides.
+render { max_bounce 32  jsurf_radius 0.01 }
 
 # --- The ground plane ----------------------------------------------------------
 # Two patterns over the SAME world-space field, one per slot.
@@ -696,11 +726,13 @@ material "brass"    { preset brass }
 # blob with a faint coloured rim and a caustic with colour actually in it. It is also the
 # honest material for this room: BK7 is an optical blank, cut lead crystal is what a
 # gallery would put on a plinth. `glass:SF10` splays 3.2x if more is wanted.
-material "glass"    { type dielectric ior glass:crystal }
+material "glass"    { type dielectric ior glass:crystal  mode J }   # mode J: see PER-OBJECT MODES
 #
 # AND MORE IS WANTED, BY EXACTLY ONE PIECE. Crystal is right for the orb and the gyroid,
-# whose caustics are white-with-a-rim whatever the glass, but the axicon exists ONLY to put
-# colour on a screen, so it is cut from dense flint instead. Head to head in the isolation
+# whose caustics are white-with-a-rim whatever the glass, but the colour piece (the AXICON
+# when this was written, the crystal PRISM since 2026-10-19, cut from the same flint) exists
+# ONLY to put colour on a screen, so it is cut from dense flint instead. The table below is the
+# axicon's, under the 45 deg sun. Head to head in the isolation
 # rig at matched settings (`_gemsweep.py` at GEMRES=960 GEMSPP=1200, each at its own best
 # drop — a denser glass deviates harder, so it moves the ring focus and the drop has to be
 # re-optimised with it, 0.35 -> 0.65):
@@ -717,7 +749,7 @@ material "glass"    { type dielectric ior glass:crystal }
 # scene by an order of magnitude (5.96% of its cap in the finished frame), so area is the
 # one thing it does not need more of, and half of a lot is still far more than any other
 # piece has. Colour was the whole reason the exhibit exists.
-material "flint"    { type dielectric ior glass:SF10 }
+material "flint"    { type dielectric ior glass:SF10  mode J }
 #
 # `diamond` is NOT the caustic material, despite dispersing as hard as SF10. A solid sphere
 # focuses at f = n/(2(n-1)) times its radius FROM ITS CENTRE, and at n=2.42 that is 0.853 R
@@ -725,7 +757,7 @@ material "flint"    { type dielectric ior glass:SF10 }
 # internally-reflects and SPARKLES instead. Crystal's 1.307 R puts the focus 0.31 R clear of
 # the surface, close enough to concentrate hard and far enough to land on a cap. Kept as a
 # named material because sparkle is a real look, but nothing in this scene uses it now.
-material "diamond"  { preset diamond }
+material "diamond"  { preset diamond  mode J }
 material "morpho"   { preset morpho }       # iridescent multilayer Bragg (blue morpho)
 material "oilslick" { preset oil-slick }    # iridescent thin-film (rainbow) — 2nd iridescent, different model
 
@@ -797,19 +829,19 @@ material "oilslick" { preset oil-slick }    # iridescent thin-film (rainbow) —
 #     of them. Ranking them 2..13 (in the file's own node order) costs nothing, silences all
 #     22, and is the better answer even where it never fires: if two facets ever do touch, a
 #     deterministic winner beats an arbitrary one.
-material "cp_bowl"       { type dielectric  ior glass:crystal  priority  1  absorb rgb   24.8   88.3   78.6 }
-material "cp_onyx"       { type dielectric  ior glass:SF10     priority  2  absorb rgb  135.4  135.4  135.4 }
-material "cp_chartreuse" { type dielectric  ior glass:SF10     priority  3  absorb rgb   23.5    3.1   47.8 }
-material "cp_pink"       { type dielectric  ior glass:SF10     priority  4  absorb rgb    3.1   37.2   18.6 }
-material "cp_azure"      { type dielectric  ior glass:SF10     priority  5  absorb rgb   53.6   24.5    3.1 }
-material "cp_yellow"     { type dielectric  ior glass:SF10     priority  6  absorb rgb    3.1    8.0  135.4 }
-material "cp_amber"      { type dielectric  ior glass:SF10     priority  7  absorb rgb    3.1   51.9  135.4 }
-material "cp_clear"      { type dielectric  ior glass:SF10     priority  8  absorb rgb    0.0    0.0    0.0 }
-material "cp_cobalt"     { type dielectric  ior glass:SF10     priority  9  absorb rgb  135.4  135.4    3.1 }
-material "cp_green"      { type dielectric  ior glass:SF10     priority 10  absorb rgb   77.2    3.1  135.4 }
-material "cp_red"        { type dielectric  ior glass:SF10     priority 11  absorb rgb    3.1  135.4  135.4 }
-material "cp_violet"     { type dielectric  ior glass:SF10     priority 12  absorb rgb    9.7   37.6    3.1 }
-material "cp_turquoise"  { type dielectric  ior glass:SF10     priority 13  absorb rgb   61.0    9.5    3.1 }
+material "cp_bowl"       { type dielectric  ior glass:crystal  priority  1  absorb rgb   24.8   88.3   78.6  mode J }
+material "cp_onyx"       { type dielectric  ior glass:SF10     priority  2  absorb rgb  135.4  135.4  135.4  mode J }
+material "cp_chartreuse" { type dielectric  ior glass:SF10     priority  3  absorb rgb   23.5    3.1   47.8  mode J }
+material "cp_pink"       { type dielectric  ior glass:SF10     priority  4  absorb rgb    3.1   37.2   18.6  mode J }
+material "cp_azure"      { type dielectric  ior glass:SF10     priority  5  absorb rgb   53.6   24.5    3.1  mode J }
+material "cp_yellow"     { type dielectric  ior glass:SF10     priority  6  absorb rgb    3.1    8.0  135.4  mode J }
+material "cp_amber"      { type dielectric  ior glass:SF10     priority  7  absorb rgb    3.1   51.9  135.4  mode J }
+material "cp_clear"      { type dielectric  ior glass:SF10     priority  8  absorb rgb    0.0    0.0    0.0  mode J }
+material "cp_cobalt"     { type dielectric  ior glass:SF10     priority  9  absorb rgb  135.4  135.4    3.1  mode J }
+material "cp_green"      { type dielectric  ior glass:SF10     priority 10  absorb rgb   77.2    3.1  135.4  mode J }
+material "cp_red"        { type dielectric  ior glass:SF10     priority 11  absorb rgb    3.1  135.4  135.4  mode J }
+material "cp_violet"     { type dielectric  ior glass:SF10     priority 12  absorb rgb    9.7   37.6    3.1  mode J }
+material "cp_turquoise"  { type dielectric  ior glass:SF10     priority 13  absorb rgb   61.0    9.5    3.1  mode J }
 
 # --- Fur-creature materials (the eleventh exhibit) ---------------------------------
 # Lifted unchanged from `scenes/fur_creature.ftsl`, prefixed `cr_` so nothing here can
@@ -1011,7 +1043,7 @@ isosurface "stand_gyroid_cap" { material capmarble_gold
 }
 
 group { translate 1.00 0 0.45          # --- exhibit: GLASS ORB ---
-isosurface "stand_glass" {   # right-front pedestal, cap top y=0.90
+isosurface "stand_glass" {   # right-front pedestal, cap top y=1.30 (raised plinth; see the cap)
     # Moved from x=6.2 to x=6.7. At 6.2 its base slab (x 5.75..6.65) drove 0.30 m into the
     # gyroid plinth's base slab (x 3.95..6.05) — a pre-existing intersection from the Tron
     # rework, two wireframe boxes crossing through each other at floor level. 6.7 puts the
@@ -1024,11 +1056,11 @@ isosurface "stand_glass" {   # right-front pedestal, cap top y=0.90
             box { center 6.7 0.09 3.5  size 0.878 0.2   0.878 }
             box { center 6.7 0.09 3.5  size 0.878 0.158 0.92  }
         }
-        difference {
-            box { center 6.7 0.525 3.5  size 0.42  0.69  0.42  }
-            box { center 6.7 0.525 3.5  size 0.44  0.668 0.398 }
-            box { center 6.7 0.525 3.5  size 0.398 0.71  0.398 }
-            box { center 6.7 0.525 3.5  size 0.398 0.668 0.44  }
+        difference {   # column y 0.18..1.12 (was ..0.72): it carries the RAISED orb plinth
+            box { center 6.7 0.65 3.5  size 0.42  0.94  0.42  }
+            box { center 6.7 0.65 3.5  size 0.44  0.918 0.398 }
+            box { center 6.7 0.65 3.5  size 0.398 0.96  0.398 }
+            box { center 6.7 0.65 3.5  size 0.398 0.918 0.44  }
         }
     }
 }
@@ -1042,7 +1074,35 @@ isosurface "stand_glass_cap" { material capmarble_orb
     # (y=1.70) to this cap (y=0.90) the focal axis walks +0.17 m in x and -0.78 m in z,
     # putting the disc at (6.87, 2.72). A cap centred under the column would have missed it
     # by half a metre; even this one only just contains it (near edge z=2.20).
-    box { center 6.7 0.81 3.05  size 1.1 0.18 1.7  round 0.02 } }
+    #
+    # ALL OF THAT IS THE 45 deg SUN, AND THIS CAP IS NOW A RAISED PLINTH THE ORB SITS IN (top
+    # y 1.30, was 0.90; 2026-10-18). At 20 deg no cap UNDER the orb can catch its caustic, at
+    # any height, and the reason is geometric: a ball lens focuses at f = nR/(2(n-1)) ~ 1.43R
+    # from its centre ALONG THE LIGHT, which a 20 deg sun tips only 0.49R below the centre --
+    # ABOVE the ball's own bottom (1.0R). Any surface the ball floats over is therefore far past
+    # the focus, where the light has spread back out: at the old 0.80 m drop the rig measured
+    # peak 2.1x and zero coverage, i.e. no caustic, and the full-scene render agreed (the cap
+    # behind the orb came out at 0.74x the sunlit cap -- shadow, not light).
+    # The only flat surface that can sit near that focus is one the ball SINKS INTO, so the cap
+    # rose to meet it and has a spherical seat cut in it. tools/_gemsweep.py GEMHOLE=0.502
+    # GEMOFF=auto `piece orb <drop>` under the scene's sun, cap top below the orb's centre:
+    #     0.25 m  peak 111x  coverage 0.66%     0.35 m  peak 11.1x  coverage 1.21%
+    #     0.30 m  peak  23x  coverage 1.04%     0.40 m  peak  7.0x  coverage 1.19%   <- this
+    # 0.40 gives as much area as any depth, and a peak that fits the ~6.7x headroom `capwhite`
+    # buys (so it keeps its colour instead of printing #FFFFFF); shallower is brighter and
+    # smaller and clips. The patch is compact and sits right behind the ball: offsets from the
+    # orb's axis x 0..+0.35, z -0.50..-1.05 (nothing beyond either), i.e. world x 7.70..8.05,
+    # z 2.90..3.45. This box holds it with 0.15 m to spare (far edge z 2.75) and keeps the old
+    # 1.1 m width under the orb.
+    # The seat is the orb's own sphere grown 2 mm, so the ball sits in it with a hairline gap;
+    # its rim (radius 0.30 at y 1.30) is exactly where the three pins used to touch the ball,
+    # so the plinth takes over their job and they are gone (see the orb).
+    # The flyby had to move for this: two legs (out of the rain shaft, and orb -> Klein) used
+    # to cross the volume this plinth now fills. See `fly`.
+    difference {
+        box { center 6.7 1.21 3.15  size 1.1 0.18 1.7  round 0.02 }
+        sphere { center 6.7 1.70 3.5  radius 0.502 }
+    } }
 }
 
 group { translate -0.60 0 0.55         # --- exhibit: CRYSTAL GYROID ---
@@ -1103,7 +1163,17 @@ isosurface "stand_diamond_cap" { material capmarble_gyroidx
     # reasoning as before -- cropping a plinth to its caustic makes an exhibit look undersized
     # -- but if the piece is ever restored to the 0.750 m fallback this is the other number
     # that should be revisited rather than left to drift.
-    box { center 3.40 0.75 3.10  size 1.7 0.20 1.8  round 0.02 } }
+    #
+    # THE FRONT LIP CAME BACK 0.23 m (world z 4.55 -> 4.32, depth 1.8 -> 1.57) on 2026-10-18 to
+    # give stand_axicon_cap room. Under the 20 deg sun the axicon's caustic lands 0.52-0.95 m
+    # DOWNWIND of its own axis, i.e. in the old 0.22 m gap between the two caps and on this
+    # lip (75% of it fell past the axicon cap's old far edge -- see that cap). The two caps
+    # overlap in y, so they cannot overlap in plan, and this lip was the only place the room
+    # could come from without moving a piece. It costs nothing that catches light: the plate's
+    # own caustic (tools/_gemsweep.py `plate10/0.3125` at drop 0.45 under the scene's sun) lands
+    # at world z 3.80-4.01, and the plate's footprint ends at z 4.2475, 0.07 m inside the lip.
+    # The "+z clearance" paragraph above predates this and describes the 45 deg sun.
+    box { center 3.40 0.75 2.985  size 1.7 0.20 1.57  round 0.02 } }
 }
 
 group { translate 0.55 0 -0.05         # --- exhibit: KLEIN BOTTLE ---
@@ -1251,7 +1321,9 @@ isosurface "stand_oil_cap" { material capmarble_oil
     box { center 5.3 0.82 1.5  size 0.82 0.20 0.82  round 0.02 } }
 }
 
-# --- exhibit: CRYSTAL AXICON (the tenth stand, and the only NEW one) -------------------
+# --- exhibit: CRYSTAL PRISM, formerly the CRYSTAL AXICON (the tenth stand) --------------
+# The siting below was done for the axicon and holds unchanged for the prism, which hangs at
+# the same point over the same cap with a smaller silhouette (see the piece, in HERO PIECES).
 # Authored directly in WORLD coordinates, with no `group { translate }` wrapper — unlike the
 # other nine it has no earlier layout position to be displaced from, so there is nothing to
 # offset and a `translate 0 0 0` would be noise. `scraps/_standaudit.py` sums enclosing
@@ -1353,7 +1425,22 @@ isosurface "stand_axicon_cap" { material capmarble_axicon
     # grows the patch to 1.49 x 1.22 and pushes its core from +0.16 to +0.25 z. The old cap
     # ended at exactly +0.60 z, i.e. ZERO margin on the far edge, which is not a cap size —
     # it is a coincidence waiting to become a clipped cusp.
-    box { center 2.54 0.80 5.44  size 1.6 0.20 1.34  round 0.02 } }
+    #
+    # EVERYTHING ABOVE IS THE 45 deg SUN, AND THE FAR EDGE MOVED 0.35 m (z 4.77 -> 4.42) on
+    # 2026-10-18. When the sun dropped to 20 deg (298de855) nobody re-measured this piece, and
+    # the caustic had moved: under the scene's own sun (tools/_gemsweep.py, which now reads it
+    # from this file -- GEMIOR=glass:SF10 GEMBOX=0.7 GEMOFF=0.9 `piece gcone0.04 0.65`) the two
+    # wide cusps are gone and the light gathers into ONE compact spot, peak 29x the bare cap,
+    # sat 0.24, fan 0.79 (genuinely spectral, not speckle), 90% of it in 0.15 x 0.38 m, centred
+    # +0.16 x / -0.74 z from the axis. 75.5% of it fell PAST the old far edge, into the gap
+    # before stand_diamond_cap and onto that cap's lip -- which is where the full-scene render
+    # showed it. None of it lies beyond -0.95 z, so z 4.42 holds all of it with 0.08 m to
+    # spare; the room came from trimming stand_diamond_cap's front lip to 4.32 (0.10 m gap).
+    # A spot this bright clips in the still; that is the price of the low sun, not of the cap.
+    #
+    # SINCE 2026-10-19 IT CATCHES THE FAT PRISM'S RAINBOW BAND instead (see the piece): about
+    # x 1.9..3.0, z 5.0..5.2, with a white streak and patch beside it, all inside this cap.
+    box { center 2.54 0.80 5.265  size 1.6 0.20 1.69  round 0.02 } }
 
 # --- exhibit: THE FUR CREATURE (the eleventh stand) ------------------------------------
 # Authored in WORLD coordinates with no `group { translate }` wrapper, for the same reason
@@ -1722,9 +1809,12 @@ isosurface "stand_gem_mount" {
 }
 
 # --- GLASS SPHERE (fly-through orb; NOT settled — analytic placement) ------------------
-# A plain crystal orb, now LEVITATED 0.30 m above its cap on three thin pins (centre y=1.70,
-# radius 0.50, cap top y=0.90 -- so 0.80 m of DROP, which is the number that matters). The flyby dives
-# straight THROUGH it. Native sphere for exact analytic refraction.
+# A plain crystal orb, centre y=1.70, radius 0.50, SET INTO a raised plinth whose top is
+# y=1.30 (0.40 m of drop) -- see stand_glass_cap for why a 20 deg sun forces that. The flyby
+# dives straight THROUGH it. Native sphere for exact analytic refraction.
+#
+# EVERYTHING BELOW, down to the pins, is the 45 deg sun and is kept as the record of how the
+# old 0.80 m drop was found; at 20 deg that drop throws no caustic at all (peak 2.1x).
 #
 # The height is not a styling choice, it is the caustic, and it was MEASURED rather than
 # derived — see `scraps/_focalsweep.py`, which renders the orb at a range of heights and
@@ -1756,28 +1846,12 @@ isosurface "stand_gem_mount" {
 group { translate 1.00 0 0.45          # --- exhibit: GLASS ORB ---
 sphere { center 6.7 1.70 3.5   radius 0.5   material glass }
 
-# The three pins the orb stands on. Deliberately in `wirecage`, 12 mm — the same visual
-# language as the stands' 11 mm bars. (They were 24 mm at first, i.e. twice everything else
-# in the scene, and against a mid-grey cap that read as three loud green bars over the hero
-# element. Halving them also halves their screen footprint over the caustic.)
-#
-# They are at horizontal radius 0.30, so they touch the sphere at y = 1.70 - sqrt(0.25-0.09)
-# = 1.30, OUTSIDE the converging cone there (radius 0.228) — they cast nothing into the disc.
-# All three are below the equator, so they never shadow the sunlit upper hemisphere that
-# forms the caustic.
-#
-# The triad's azimuths (11/131/251 deg from +z) are not arbitrary. The camera's sight line to
-# the disc centre crosses pin height (y=1.10) at (6.644, 3.220), and the disc's screen
-# footprint at that height spans +-0.14 m. At the obvious 0/120/240 the nearest pin sat 0.242 m
-# from that point and clipped the disc's edge; rotating 11 deg pushes the two near pins to
-# 0.292 m, so with a 6 mm half-width nothing overlaps the disc at all.
-isosurface "stand_glass_mount" {
-    material wirecage  union {
-        box { center 6.7572 1.10 3.7945  size 0.012 0.40 0.012 }
-        box { center 6.9264 1.10 3.3032  size 0.012 0.40 0.012 }
-        box { center 6.4164 1.10 3.4023  size 0.012 0.40 0.012 }
-    }
-}
+# NO PINS ANY MORE (2026-10-18). The orb used to stand on three 12 mm `wirecage` pins at
+# horizontal radius 0.30, touching the ball at y 1.30. Under the 20 deg sun its cap was
+# raised to y 1.30 with a spherical seat (see stand_glass_cap), whose rim is that same
+# 0.30 m circle -- the plinth now holds the ball where the pins did, and a pin would stand
+# entirely inside it. The old triad (azimuths 11/131/251 deg, chosen to keep the pins off
+# the 45 deg sun's disc) is in git history if the plinth is ever lowered again.
 }
 
 # --- KLEIN BOTTLE in glass (clear, intricate transparent piece; SETTLED) ---------------
@@ -1952,161 +2026,65 @@ isosurface "chrome_ring" {
 }
 }
 
-# --- CRYSTAL AXICON (front-left; NOT settled — levitated, analytic placement) ----------
-# THE SCENE'S COLOUR SOURCE, and the only piece in it chosen for that job by measurement
-# rather than by eye. `tools/_gemsweep.py` renders a candidate over a bare cap under this
-# scene's own sun and meters four things: peak brightness, the fraction of the cap covered
-# above 2x the bare sunlight, `sat` (how far the caustic is from white), and `spread` — the
-# one that actually answers the question, because `sat` cannot tell a uniformly amber patch
-# from a red-to-violet fan. `spread` is twice the excess-weighted RMS radius of the caustic's
-# CHROMATICITY scatter, so white collapses to a point and a real spectrum is a long streak.
+# --- CRYSTAL PRISM (front-left; NOT settled — levitated, analytic placement) -----------
+# THE SCENE'S COLOUR SOURCE: a FAT triangular prism of SF10 flint, tilted on three axes, that
+# throws a broad rainbow band across its cap. Inradius 0.18 m (faces 0.62 m wide, six times the
+# bar it replaced), 1.0 m long, its axis leaning 44.5 deg from horizontal and rolled about it, so
+# no face is square to anything. It hangs over the same cap the axicon and the bar did.
 #
-#     piece (crystal, best drop for each)        coverage   sat     spread   peak
-#     AXICON, 45 deg, apex down, drop 0.35         0.29%   0.320    0.212    5.9x   <- this
-#     axicon, same, drop 0.90                      0.31%   0.319    0.183    7.1x
-#     apex-UP cone, 42 deg, drop 0.90              0.07%   0.289    0.157    ~3x
-#     round BRILLIANT cut, R=0.40, drop 0.90       0.18%   0.257    0.092    3.6x
-#     oblate spheroid (astigmatic lens)            0.19%   0.196    0.051    ~4x
-#     ORB (what the scene already had), drop 0.80  0.16%   0.265    0.048    6.0x
-#     glass torus (ring lens)                      0.03%   0.210    0.045    ~3x
-#     SOLID gyroid k=10   (the crystal gyroid)     0.00%     -        -       -
-#     shell gyroid k=13, klein bottle, prism       0.00%     -        -       -
+# HISTORY. The crystal AXICON (a cone) threw only a white streak once the sun dropped to 20 deg;
+# a thin bar (0.104 m faces, rolled 70 deg) replaced it on 2026-10-19 and threw a clean rainbow
+# stripe; this fat, tilted prism replaced the bar the same day, asked for "5-6x as fat and very
+# tilted, so the caustics are wide and more interesting than a bar". Both earlier pieces and their
+# measurements are in git.
 #
-# WHY A CONE, when a sphere is the obvious lens. A caustic is BRIGHT because a surface
-# CONVERGES light and COLOURED because it disperses light SIDEWAYS, and the two normally
-# exclude each other. A ball lens is concentric, so its dispersion is purely LONGITUDINAL:
-# every wavelength lands on the same axis a little deeper, and they stack into one white disc
-# with a faint coloured rim (hence the orb's spread of 0.048 — the scene's brightest caustic
-# is also one of its whitest). A prism disperses hard sideways but has parallel entry and
-# exit geometry, so it never converges at all and its coloured band never rises above the
-# bare sunlight beside it — a flat 0.00% here, which is not a bug but the answer.
+# WHY A FAT PRISM IS NOT SIMPLY A FATTER STRIPE. A thin bar gives a full rainbow because the
+# spread of the spectrum at the cap (drop x angular dispersion, a few cm for SF10) exceeds the
+# beam's own width, the face. A face 0.62 m wide does not: most orientations throw broad WHITE
+# patches with thin coloured edges (scored ~0.1 % colour below). Colour returns where light
+# leaves a face near GRAZING, after an internal reflection: the angular dispersion grows as
+# 1/cos(exit angle), so near the critical angle the spectrum fans out over tens of cm -- the
+# "fire" of a cut gem. Only some orientations do that, so they were searched for.
 #
-# A cone breaks the trade-off. Light enters the flat top undeviated, and every point of the
-# conical exit face is a prism at the SAME tilt — so the deviation is constant, which gives a
-# line focus (bright), while the dispersion is a prism's (coloured). That is 4.4x the orb's
-# chromatic spread at comparable brightness, and it is why the caustic reads as two rainbow
-# CUSPS flanking the piece rather than as a disc under it.
+# THE SEARCH (scraps/_fatprism.py over tools/_gemsweep.py's rig: the scene's sun, a bare cap,
+# top-down float renders, 320 px / 300 spp, the prism hung with its lowest corner 0.15 m above
+# the cap). Score = the share of a cap-sized window (+-0.85 m) whose 4x4-averaged chromaticity
+# differs from the bare cap's by > 0.03 (the prism's own silhouette masked out), i.e. visibly
+# COLOURED cap. 48 random orientations at r 0.165: median ~0.1 %, three above 4 %, one at
+# 18.6 % (angles a 91.7 / b 2.0 / c 135.5 deg, R = Rz(c) Ry(b) Rx(a), a about the prism's own
+# axis). It is a narrow optimum: b -4 deg drops it to 1 %, a 85-88 deg to 0.1 % (the fan leaves
+# the window or goes into TIR), so the shipped angles sit inside the plateau, not on its edge:
+#     a  88 / 90 / 92 / 94 / 96 (r 0.18, half-length 0.50, b 2, c 135.5):
+#        colour 0.1 / 18.0 / 22.7 / 12.9 / 12.7 %
+# r 0.18 (6x) and half-length 0.50 both helped (19.5 % and 21.5 % at a 91.7 against 18.5 %).
+# The shipped piece measures 22.2 % at 480 px / 600 spp: a rainbow band ~0.65 m long beside the
+# prism, a bright white streak, a pale patch and two small white wedges.
 #
-# WHY NOT THE OBVIOUS "GEM". A flat table over a conical bottom is exactly what a cut gem is,
-# and the trade evolved that cut for "fire", so a round brilliant was built and measured
-# (1 table + 16 girdle + 8 crown bezels at 34.5 deg + 8 pavilion mains at 40.75 deg, as an
-# intersection of half-spaces). It LOSES, at 0.092 spread, and the reason is the point of the
-# cut: a 40.75 deg pavilion sits just past crystal's 40.2 deg critical angle, so the pavilion
-# TOTAL-INTERNALLY-REFLECTS and throws the fire back up at the viewer instead of down at the
-# table. Sweeping the pavilion below the critical angle (20/25/30/35 deg) did not recover it.
+# PLACEMENT. Centre (2.72, 1.631, 5.45): the old centre moved 0.12 m in +x so the band clears the
+# cap's -x edge (it ran to within 5 cm), at the height that puts the lowest corner 0.15 m above
+# the cap (top y 0.90), as the search did. The band lands at about x 1.9..3.0, z 5.0..5.2. The
+# top corner is 1.29 m above the cap (y 2.19). Bounding sphere 0.62 m.
 #
-# WHY THE LATTICE CANNOT DO THIS JOB, however it is shaped. The obvious way to keep the
-# crystal gyroid AND get colour was to clip the gyroid to this axicon instead of to a ball,
-# which was built and measured too: 0.13% / sat 0.205 / spread 0.099, less than half this
-# piece on every axis. The outer boundary only sets the FIRST surface a ray meets; behind it
-# are the same thin curved internal sheets that make a gyroid a DIFFUSER. So the crystal
-# gyroid stays exactly as it is, and this is an additional exhibit rather than a replacement.
-#
-# DROP 0.65 IS MEASURED — AND IT IS A PROPERTY OF THE GLASS, NOT OF THE SHAPE. On floats
-# (`-hdr -fireflies 3`; the numbers this comment used to quote were taken through the 8-bit
-# clamp and are retracted) the drop turns out to buy AREA, not colour: in crystal, `spread`
-# is flat at 0.065-0.083 all the way from 0.35 to 1.10 while the patch grows 1.37 x 0.96 m
-# to 2.33 x 1.55 m. So the old "colour falls off monotonically above ~0.5 m" was the clamp
-# talking — a bigger drop threw a BRIGHTER caustic, which clipped harder, which the 8-bit
-# meter then scored as whiter.
-#
-# What DOES pin the drop is the glass. SF10 deviates ~17% harder than crystal, so the ring
-# focus sits at a different height and the drop has to be re-swept with the material
-# (coverage / sat / spread / fan at 45 deg, 480 px):
-#     drop 0.30   0.04%  0.520  0.045   --      ring focus short of the cap
-#     drop 0.35   0.08%  0.548  0.050   --      <- crystal's optimum; in SF10 it is a null
-#     drop 0.40   0.08%  0.545  0.047   --
-#     drop 0.50   0.13%  0.480  0.109   --
-#     drop 0.65   0.15%  0.469  0.139  0.95     <- best organised colour
-#     drop 0.80   0.16%  0.482  0.121  0.92
-# So the piece hangs at apex y=1.27, 0.37 m over the tabletop.
-#
-# 45 DEG (k=1.0) IS MEASURED TOO, and the reason once given for it was wrong. Sweeping the
-# half-angle in crystal at drop 0.35 (k = tan of the half-angle) gives coverage
-# 0.09 / 0.03 / 0.30 / 0.25 / 0.10% at k = 0.70 / 0.85 / 1.00 / 1.20 / 1.40. The collapse is
-# at k=0.85 (40.4 deg), BELOW 45, with 50.2 and 54.5 deg both still working — so this is not
-# a one-sided TIR cliff past 45 deg as the file used to say. Across the null the caustic core
-# also SWITCHES SIDES, +0.63 z at k=0.70 to -0.61 z at k=1.20: the ring focus is passing
-# through infinity there. 40.4 deg landing on crystal's 40.2 deg critical angle is a
-# coincidence, and is named as one so the wrong mechanism is not re-derived from it.
-#
-# SIZE IS THE RAINBOW KNOB, and it is the one axis where "wider" costs nothing in colour.
-# An axicon's cusps land at a distance that scales with the piece, so the top radius decides
-# how wide a cap the exhibit needs -- but it was not obvious that it also decides how much
-# SPECTRUM there is, because a bigger aperture usually just means a brighter, whiter patch.
-# It does not here (`vcone1.0/<h>`, half-height h, top radius 2h, SF10, drop 0.65, 480 px,
-# GEMBOX 0.9, cut 1.2x cap -- all one resolution, so these rank against each other only):
-#     h 0.28  r 0.56  <- SHIPPED   cov 0.56%  sat 0.327  spread 0.107  fan 0.65  1.43 x 0.44 m
-#     h 0.40  r 0.80                cov 0.29%  sat 0.527  spread 0.128  fan 0.76  1.93 x 0.47 m
-#     h 0.52  r 1.04                cov 0.60%  sat 0.445  spread 0.172  fan 0.44  2.48 x 1.90 m
-# `spread` rises MONOTONICALLY with size and `sat` rises with it too -- the ring simply gets
-# bigger, so the wavelengths that were landing on top of each other separate. h=0.40 is the
-# most ORGANISED colour measured anywhere in this scene (fan 0.76 against this piece's 0.65),
-# and h=0.52 is the widest rainbow (spread 0.172, a 2.48 m fan) at the cost of fan falling to
-# 0.44 as the two cusps grow into each other. THE SHIPPED SIZE IS NOT THE OPTICAL OPTIMUM; it
-# is the LAYOUT optimum. h=0.52 is a 2.08 m-wide piece, larger than anything else in the room
-# and larger than the gold gyroid it would have to share a frame with, and its patch (2.48 x
-# 1.90 m) is bigger than its own 1.8 x 1.7 cap, so the rainbow would fall off onto the floor
-# cage. Growing this piece means re-siting and re-capping it, not just editing one number.
-#
-# IT HAS A GIRDLE, AND THAT IS THE ONLY GEM CUT IT CAN AFFORD. Asked to shape this "more
-# like a diamond", the honest reply is that a diamond cut is an ANTI-CAUSTIC shape and this
-# was re-measured rather than argued (tools/_gemsweep.py, `gcone`, SF10, drop 0.65, 480 px /
-# 600 spp, GEMBOX=0.7 so nothing is clipped). Everything above the girdle plane, in order:
-#     nothing (a bare cone)     peak 35.79x  cov 0.12%  sat 0.509  spread 0.282  1.40 x 1.17 m
-#     girdle 0.02               peak 36.41x  cov 0.15%  sat 0.480  spread 0.273  1.46 x 1.20 m
-#     girdle 0.04  <- SHIPPED   peak 37.07x  cov 0.17%  sat 0.463  spread 0.254  1.49 x 1.22 m
-#     girdle 0.08               peak 27.35x  cov 0.19%  sat 0.392  spread 0.226  1.60 x 0.38 m
-#     girdle 0.04, 16 facets    peak 32.41x  cov 0.17%  sat 0.428  spread 0.242  1.49 x 0.38 m
-#     girdle 0.04,  8 facets    peak 13.83x  cov 0.15%  sat 0.377  spread 0.099  1.49 x 0.35 m
-#     + crown 34.5 deg / 75% table            cov 0.01%  sat 0.272  spread 0.036
-#     + crown 34.5 deg / 53% table            cov 0.01%  sat 0.229  spread 0.004  <- a real
-#     + crown 20.0 deg / 60% table            cov 0.02%  sat 0.254  spread 0.041     brilliant
-#
-# A STRAIGHT GIRDLE IS BETTER THAN FREE, because a ray that enters the flat table crosses no
-# interface until the cone and so arrives there on the same line it always did, just starting
-# 0.04 m higher; only the rim is touched. 0.04 m comes out brighter AND 42% wider-covering
-# than the bare cone. Past that the band starts eating the rim: at 0.08 the patch collapses
-# from two cusps (1.17 m of z) to a single band (0.38 m), and 16 vertical facets -- which
-# cannot deviate the descending aperture at all, being vertical -- collapse it the same way
-# for the same reason. 8 facets are far worse again, so the cost is monotonic in coarseness
-# and the glinting waist is not worth it at any count.
-#
-# A CROWN IS FATAL, and that is the same finding as the round-brilliant row in the sweep
-# above (0.06% against this piece's 0.30% in crystal), from the other direction: a crown facet
-# at angle c bends a descending ray inward by c - asin(sin c / n) -- 15.6 deg at c=34.5 in
-# SF10 -- so the whole annulus outside the table meets the cone at the wrong incidence. Three
-# crown geometries all land at 0.01-0.02% coverage, i.e. no caustic at all. The mechanism is
-# the point of the cut: a brilliant is engineered to throw its fire UP AT THE VIEWER, and
-# flint makes that worse than crystal, not better (critical angle 35.4 deg against 40.2).
-#
-# So the piece is a table, a 0.04 m girdle and a 45 deg pavilion -- a gem's silhouette minus
-# exactly the one feature that would switch the caustic off.
-#
-# The field is max() of the (girdle-capped) cone against the two end slabs; every term is
-# unit-Lipschitz except the cone's, whose gradient is sqrt(2), so max_gradient 2 is still
-# exact and generous. NOTE the parens around `0.28 + y`: it is subtracted from the sqrt, and
-# unbracketed it would parse as `(sqrt(...) - 0.28) + y` and build a different solid. Here
-# the `min(...)` commas bracket it already, but the trap is one edit away.
-isosurface "crystal_axicon" {
+# A higher dispersion than SF10 would widen the colour further, at the cost of real glass; the
+# piece stays SF10 (`python scraps/_caus_ior.py 2` prints a 2x curve to try).
+isosurface "crystal_prism" {
     material flint
     function {
-        translate 2.6 1.55 5.45
-        expr "max(sqrt(x*x + z*z) - min(0.28 + y, 0.56), max(-y - 0.28, y - 0.32))"
+        translate 2.72 1.631 5.45
+        expr "max(max(max((+0.00042*x + -0.04934*y + -0.99878*z - 0.18000), (+0.60718*x + +0.64125*y + +0.46919*z - 0.18000)), (-0.60760*x + -0.59191*y + +0.52960*z - 0.18000)), max((-0.71282*x + +0.70048*y + -0.03490*z - 0.50000), (+0.71282*x + -0.70048*y + +0.03490*z - 0.50000)))"
     }
-    contained_by { min 2.00 1.25 4.85   max 3.20 1.90 6.05 }
+    contained_by { min 2.125 1.030 5.222   max 3.315 2.214 5.847 }
     max_gradient 2
 }
-# The same three-pin mount the orb and the crystal gyroid use. The cone's surface radius is
-# 0.28 + y, so a pin standing at horizontal radius 0.30 meets it at local y = +0.02, i.e.
-# world y = 1.57, and the reach from the cap top at 0.90 is 0.67 m. Azimuths 0/120/240 from
-# +z put one pin on the +z side and the other two at x = 2.34 and 2.86 — inboard of the cusps
-# at x = 1.83 and 3.25, so their 12 mm shadows fall on neither.
-isosurface "stand_axicon_mount" {
+# THREE PINS, a tripod under the corners the prism rests on: the two lowest corners of its lower
+# end (0.15 and 0.40 m above the cap) and the lowest corner of its upper end (0.85 m). Each pin's
+# top is where the glass begins over its 12 mm footprint, so it touches without entering the
+# glass (scraps/_fatprism.py geometry; computed, not eyeballed).
+isosurface "stand_prism_mount" {
     material wirecage  union {
-        box { center 2.6000 1.235 5.7500  size 0.012 0.67 0.012 }
-        box { center 2.8598 1.235 5.3000  size 0.012 0.67 0.012 }
-        box { center 2.3402 1.235 5.3000  size 0.012 0.67 0.012 }
+        box { center 2.8578 0.9750 5.2985  size 0.012 0.1499 0.012 }
+        box { center 3.0763 1.0991 5.8270  size 0.012 0.3982 0.012 }
+        box { center 2.1450 1.3248 5.2636  size 0.012 0.8496 0.012 }
     }
 }
 
@@ -2482,7 +2460,9 @@ light area {
 # studio-style fill flat, a couple of metres to the camera's left, facing the exhibits.
 #
 # EVERY NUMBER HERE IS A CONSTRAINT, not a taste call:
-#   * x = 1.5 keeps it OUT OF FRAME, but ONLY TOGETHER WITH ITS z RANGE, and the 1.6x spread
+#   * (x is 0.70 now, not the 1.5 this bullet was written for; the SUN bullet below is why.
+#     The framing argument here is history either way -- see `hide_camera on`.)
+#     x = 1.5 keeps it OUT OF FRAME, but ONLY TOGETHER WITH ITS z RANGE, and the 1.6x spread
 #     is exactly the "if the framing ever moves" this used to warn about. Half the horizontal
 #     field is atan(tan(26) * 16/9) = 41 deg, so the left frame edge at depth z is
 #     x = 5 - (9.35 - z)*tan(41) = 5 - 0.869*(9.35 - z). It was authored for an eye at
@@ -2493,7 +2473,7 @@ light area {
 #     The fix is the z range, NOT x: sliding the panel back to z[6.0, 10.2] puts its far end
 #     where the frame edge is x = 2.09, clear by 0.59 m, and it costs the light nothing. The
 #     panel exists to be seen in the gold gyroid's rim, the gyroid moved with the spread to
-#     z = 6.05, and the panel is still the same 3.5 m off its -x flank — it is now ALONGSIDE
+#     z = 6.05, and the panel was still the same 3.5 m off its -x flank — it is now ALONGSIDE
 #     the ball instead of ahead of it, which is the same geometry the right fill panel already
 #     uses deliberately (see below). Re-derive both ends from the formula if the eye moves.
 #     ...WHICH IS NO LONGER SOMETHING YOU HAVE TO DO, because `hide_camera on` below now
@@ -2512,16 +2492,34 @@ light area {
 #     Only the bounce-0 camera ray passes through it. See FTSL.md 11.1.
 #   * y stops at 2.60, below every cloud in the scene, so a panel whose whole purpose is to
 #     be seen in a metal cannot instead show up as a bright wash on the underside of fog.
-#   * it cannot eclipse the sun the way an early sky panel did. The sun is nearly overhead
-#     and behind (dir +y +z), so a shadow ray leaving any visible point toward it crosses
-#     the x = 1.5 plane at y > 4.8 — always above the panel's top edge.
-#   * 2.5 kW over 10.3 m2 is ~240 W/m2 exitance; the gyroid is 3.5 m away and sees a view
-#     factor of ~0.27, so ~65 W/m2 against the sun's 1000. It lifts the rim off black without
-#     touching the exposure, and being on the LEFT it stays 9 m from the rain, so it adds
-#     essentially nothing to the multiply-scattered veil the bow has to be read against.
+#   * it must not SHADE THE CAPS, and that is what sets x = 0.70. This bullet used to say a
+#     shadow ray toward the sun crosses the x = 1.5 plane at y > 4.8, always above the
+#     panel. That was true of the 45 deg sun and went stale when the sun dropped to 20 deg
+#     (298de855): the sun now comes in LOW from the LEFT and behind (dir -0.1954 0.3420
+#     0.9192), so a shadow ray climbs only 0.3420/0.1954 = 1.75 m per metre it travels in -x.
+#     From the axicon cap's left edge (x 1.74, top y 0.90) it crossed x = 1.5 at y 1.32,
+#     squarely inside the panel, which threw a hard diagonal shadow over 45% of the axicon
+#     cap, 28% of the crystal gyroid's and 4% of the chrome ring's -- a shadow with nothing
+#     visible casting it, because the caster is `hide_camera on`. At x = 0.70 the lowest
+#     crossing is 0.90 + 1.75*(1.74 - 0.70) = 2.72, 0.12 m over the panel's 2.60 top, and
+#     no cap is shaded. 0.75 also clears, by 0.03 m, which is a coincidence and not a
+#     margin; 1.0 still shades 14% of the axicon cap. `python scraps/_panel_shadow.py [lx rx]`
+#     checks both panels, read from this file, against every cap and piece; the two optional
+#     args try other x positions. NOTE what the move did NOT do:
+#     the panel never shaded the axicon CONE, so no caustic got any stronger -- the shadow
+#     only darkened the screen under part of one, which if anything helped its contrast.
+#     The fix is cosmetic, and re-check it if the sun moves again.
+#   * 2.5 kW over 10.3 m2 is ~240 W/m2 exitance. At x = 0.70 the panel is 4.3 m off the
+#     gyroid's centre (3.5 m at the old x = 1.5); integrated over the rectangle, a -x-facing
+#     point on the ball's flank gets ~35 W/m2 from it (was ~47) against the sun's 1000. A
+#     metal reflects the panel's RADIANCE, which the move does not change, so the rim's
+#     reflection is as BRIGHT as before and only smaller: 32 x 45 deg as seen from the ball,
+#     down from 39 x 51. It lifts the rim off black without touching the exposure, and being
+#     on the LEFT it stays 9 m from the rain, so it adds essentially nothing to the
+#     multiply-scattered veil the bow has to be read against.
 # cross(u,v) = +x, so it faces the room.
 light area {
-    origin 1.5 0.15 6.0   u 0 2.45 0   v 0 0 4.2
+    origin 0.70 0.15 6.0   u 0 2.45 0   v 0 0 4.2
     spd blackbody 5500   power 2500
     hide_camera on
 }
@@ -2544,10 +2542,26 @@ light area {
 # the still camera, which is only a guarantee for THAT camera - a yawing flyby swings it into
 # frame as readily as it did the left one. It still fills the gyroid's +x flank exactly as
 # before (a bounce-1 ray is not a camera ray). See FTSL.md 11.1.
+#
+# z[8.4, 11.4] AND 6.2 kW, NOT z[6.0, 9.0] AND 2 kW -- moved 2026-10-18 because at z[6, 9] it
+# SHADED ALICE. The 20 deg sun comes in low from the left, so anything EAST of this panel (x >
+# 8.6) whose shadow ray crosses x = 8.6 below y 2.40 with z inside the panel's range is in its
+# shadow: that was 33% of stand_alice_cap, ~21% of Alice herself and a 1.7% sliver of the rain
+# volume, a hard shadow cast by a caster `hide_camera on` makes invisible. Every such ray
+# crosses at z <= 8.18 (Alice's far corner), so starting the panel at 8.4 clears them by 0.22 m;
+# `python scraps/_panel_shadow.py` checks both panels against every cap and piece.
+# WHY BACK IN z AND NOT EAST IN x: both clear Alice, and both cost fill, but they cost the RAIN
+# differently, and the rain is the constraint above. Moving east to x 9.7 keeps 64% of the
+# gyroid fill but turns the panel to face the rain (+79% on it, +180% once powered back up);
+# sliding back moves it away from both, and the rain is so much further off in -z that it
+# loses the rain faster than the gyroid. At 2 kW the new z range gives 24% of the old fill and
+# 32% of the old rain irradiance, so 6.2 kW (x3.1) puts the rain back where it was (the bow
+# level must not move) and the gyroid's +x flank at 74% of its old fill (~35 vs ~47 W/m2,
+# integrated over the rectangle).
 # cross(u,v) = -x, so it faces the room.
 light area {
-    origin 8.6 0.15 9.0   u 0 2.25 0   v 0 0 -3.0
-    spd blackbody 5500   power 2000
+    origin 8.6 0.15 11.4   u 0 2.25 0   v 0 0 -3.0
+    spd blackbody 5500   power 6200
     hide_camera on
 }
 
@@ -2674,6 +2688,7 @@ mesh "raincloud" {
 # the term a wrong albedo compounds. See REFERENCE.md `-beams-order`.
 medium {
     sigma_t 2.78   albedo 0.9964   g 0.46
+    mode J        # PER-OBJECT MODES (header): the cloud renders in mode J
     bounds { object "raincloud"   voxels 192   feather 0.13 }
     # The mesh already supplies the silhouette, so this only breaks up the INTERIOR — a
     # uniform fill inside a mesh reads as jelly rather than as cloud. It never reaches 0, so
@@ -2716,6 +2731,7 @@ medium {
 #     the -20 deg yaw shrinks the true silhouette in from its AABB.
 medium {
     sigma_t 0.35   albedo 0.99
+    mode J        # PER-OBJECT MODES (header): so does the rain
     bounds { min 6.5 0 0.6   max 9.5 3.2 3.4 }
     phase rainbow { droplet_um 300   dispersion 0.577 }
     # A soft elliptical shaft, densest at the top where it leaves the cloud and thinning as it
@@ -2982,6 +2998,19 @@ prefer {
 # camera is moving least. The whole loop is a lazy
 # figure eight -- down the centre, right to the orb and the bottle, left and back behind the
 # ring, then forward again up the left-centre -- so it never retraces its own path either.
+#
+# FIVE POINTS MOVED ON 2026-10-18 (tagged in place) because the orb's cap became a RAISED
+# PLINTH, top y 1.30, spanning x 7.15..8.25 / z 2.75..4.45 (see stand_glass_cap), and three
+# legs ran through or past that volume: the exit from the rain shaft (it went straight through
+# it -- 42 samples inside), the orb -> Klein descent (3 cm over its edge), and the climb out of
+# the fur creature (7 cm). The shaft exit now passes WEST of the plinth, the orb exit stays
+# above it until past its far edge and then dives west onto the bottle, and the creature climb
+# rises 0.15 m more. Closest approach to the plinth is now 0.120 m, inside the loop's existing
+# tightest margin (the Klein cap, 0.111). The loop grew 48.66 -> 49.28 m, so every
+# density_at / aim_at / aim_weight_at stop was REMAPPED, not left alone -- each sits the same
+# fraction of the way between the same two control points as before (scraps/_fly_reroute.py;
+# the biggest shift was 6.6 frames). `python scraps/_flyplan.py` now reads this curve itself
+# (it used to carry a hand copy that never got the cloud circuit) and checks every cap in 3-D.
 camera_curve "fly" {
     point 5.32   2.28  8.55     # START — apex of the closure arc: the loop's furthest-back
     point 5.05   2.16  8.15     # turn onto the centre line, already heading -z
@@ -3000,7 +3029,7 @@ camera_curve "fly" {
     point 5.954  1.308 4.638    # coat entry, 0.55 m off the nose
     point 6.45   1.308 4.40     # THROUGH THE FUR CREATURE — nose to tail
     point 6.946  1.308 4.162    # coat exit, out over the tail brush
-    point 7.35   1.45  4.09     # climb out and swing toward the orb
+    point 7.35   1.6   4.09     # climb out and swing toward the orb  [moved 2026-10-18: raised orb plinth]
 
     # ---- BEHIND THE CLOUD ------------------------------------------------------------
     # A closed circuit out around the rain and back, whose reason for existing is the four
@@ -3069,8 +3098,8 @@ camera_curve "fly" {
     point 8.5     1.85   -0.3      # peel off, dropping UNDER the cloud rather than into it
     point 8.3     1.55   0.55      # below the underside, entering the backlit rain
     point 8       1.3    1.45      # under the cloud, inside the shaft, looking up-sun
-    point 7.55    1.22   2.4       # through the shaft
-    point 7       1.35   3.3       # out the north side
+    point 7.2    1.2   2.3       # through the shaft  [moved 2026-10-18: raised orb plinth]
+    point 6.8    1.38  3.28       # out the north side  [moved 2026-10-18: raised orb plinth]
     point 6.45    1.55   4.15      # swing west
     point 6.4     1.68   4.85      # turn east
     point 6.95    1.68   5         # heading east
@@ -3080,8 +3109,8 @@ camera_curve "fly" {
     point 7.62   1.62  4.02     # final approach, dropping onto the orb's centre
     point 7.70   1.70  3.95     # THROUGH THE GLASS ORB
     point 7.62   1.58  3.58     # out the far side, looking down its own caustic
-    point 7.38   1.44  3.18
-    point 7.05   1.28  2.82     # descend-left toward the bottle
+    point 7.5    1.55  3.05     #  [moved 2026-10-18: raised orb plinth]
+    point 7.38   1.3   2.45     # descend-left toward the bottle  [moved 2026-10-18: raised orb plinth]
     point 6.751  1.12  2.594    # klein entry (+0.30 along the body's long axis) — LEVEL
     point 6.4584 1.12  2.5311   # THROUGH THE KLEIN BOTTLE's bulb, where the cut shows 4 loops
     point 6.165  1.12  2.468    # klein exit (-0.30 along the axis) — LEVEL
@@ -3098,14 +3127,16 @@ camera_curve "fly" {
     point 2.62   1.31  2.08     # out the front of the ring, whole hall opening up ahead
     point 2.70   1.45  2.62
     point 2.90   1.75  3.25     # climb toward the crystal gyroid
-    point 3.35   2.10  3.98     # swing right past it (0.345 m outside its 0.50 clip sphere)
-    point 3.85   2.35  4.85
+    # 2026-10-19: points 61..63 re-routed past the crystal prism (scraps/_prism_flypass.py); they were: point 2.441 2.064 4.858 # prism pass (2026-10-19); point 2.81 2.064 4.874 # PRISM PASS: the orbit behind the crystal prism, looking down THROUGH it at its stripe; point 3.102 2.064 5.098 # prism pass (2026-10-19)
+    point 2.891  2.319  4.482   # prism pass (2026-10-19)
+    point 3.357  2.262  4.813   # PRISM PASS: the orbit behind the crystal prism, looking down THROUGH it at its stripe
+    point 3.743  2.231  5.27    # prism pass (2026-10-19)
     point 4.35   2.52  5.70     # rise onto the cruise
     point 4.95   2.62  6.55     # over the gold gyroid (its clip tops out at y=2.11)
     point 5.35   2.55  7.45
     point 5.55   2.42  8.15     # out past the front of the hall — hands back to the START,
-    up 0 1 0   fov_y 70   mode D   frames 1147
-    fps 30                         # 1147 frames -> 38.2 s
+    up 0 1 0   fov_y 70   mode D   frames 1208
+    fps 30                         # 1208 frames -> 40.3 s
     #
     # 600 -> 1147 IS NOT A ROUND-UP, IT IS WHAT HOLDS THE FLYTHROUGH'S SPEED. `frames` is a
     # TOTAL and `density_at` only distributes it, so leaving 600 across a path that grew
@@ -3116,36 +3147,55 @@ camera_curve "fly" {
     # So the number falls out of the pacing; it is not a free parameter. If you change any
     # rho below, recompute it the same way or the gallery will drift off its beat.
     #
+    # 1147 -> 1208 (2026-10-19) IS THE PRISM PASS, by the same rule. Points 61..63 are an arc
+    # 1.1-1.2 m behind and right of the fat crystal prism, 30-35 deg above it, from where its
+    # rainbow can be seen THROUGH the glass (`scraps/_prism_view.py` maps those directions from the
+    # scene's own prism planes and a caustic mask, scraps/caus/caustic_mask.npz). A `density_at`
+    # stop of 40.0162 slows the camera there, solved so that N_old * C_new / C_old is exactly an
+    # integer, and an `aim_at` ramp holds the view on the prism for frames 1084..1164. Every other
+    # frame keeps its eye (largest shift 10 mm); every stop and aim key was re-mapped, not
+    # hand-moved. `python scraps/_prism_flypass.py --replace ... --drop-stop <old rho>` re-plans it
+    # (it drops the previous pass first) and prints that check. Through the pass the prism fills
+    # ~15 % of the frame, the caustic seen through it up to 3 %, for 2.1 s; the camera never comes
+    # within 0.73 m of the glass. (Earlier the same day the pass orbited the thin bar at 0.8 m.)
+    # Mode J renders the caustic through the glass since 0.387.0 (known-issues.md, MODE-J-SDS).
+    #
     # AND THE t VALUES BELOW ARE NORMALISED ARC LENGTH, NOT CONTROL-POINT INDEX (ftsl.h
     # walks the spline twice for exactly this reason -- see its comment). That is why every
     # key here was re-solved rather than left alone: inserting the cloud circuit at point 18
     # slides every downstream key, and a key that no longer sits on its feature is a dwell
     # spent on empty floor. The detour's own keys run 7 (open ground, nothing to look at)
     # up to 24 on the backlit leg, which is the slowest motion anywhere in the scene.
-    density_at 0.0000 6.89  density_at 0.0270 8  density_at 0.0515 20  density_at 0.0819 20
-    density_at 0.1006 10  density_at 0.1153 26  density_at 0.1379 26  density_at 0.1473 12
-    density_at 0.1720 8  density_at 0.2019 7  density_at 0.2343 7  density_at 0.2668 7
-    density_at 0.3029 7  density_at 0.3363 8  density_at 0.3657 9  density_at 0.3884 11
-    density_at 0.4017 14  density_at 0.4248 20  density_at 0.4554 24  density_at 0.4760 24
-    density_at 0.4965 22  density_at 0.5063 18  density_at 0.5253 16  density_at 0.5454 15
-    density_at 0.5671 13  density_at 0.5889 9  density_at 0.6101 7  density_at 0.6252 7
-    density_at 0.6375 7  density_at 0.6505 8  density_at 0.6660 22  density_at 0.6836 14
-    density_at 0.7091 24  density_at 0.7326 10  density_at 0.7817 6  density_at 0.8342 20
-    density_at 0.8700 10  density_at 0.8906 14  density_at 0.9289 8  density_at 0.9779 6
-    density_at 1.0000 6.89
+    density_at 0.000000 6.89  density_at 0.026485 8  density_at 0.050491 20  density_at 0.080250 20
+    density_at 0.098503 10  density_at 0.112886 26  density_at 0.135106 26  density_at 0.145819 12
+    density_at 0.170023 8  density_at 0.199286 7  density_at 0.231029 7  density_at 0.262870 7
+    density_at 0.298185 7  density_at 0.330919 8  density_at 0.359686 9  density_at 0.382006 11
+    density_at 0.395001 14  density_at 0.417617 20  density_at 0.447575 24  density_at 0.467811 24
+    density_at 0.487848 22  density_at 0.497471 18  density_at 0.516020 16  density_at 0.535760 15
+    density_at 0.559469 13  density_at 0.581094 9  density_at 0.600238 7  density_at 0.615019 7
+    density_at 0.627021 7  density_at 0.639718 8  density_at 0.654896 22  density_at 0.673247 14
+    density_at 0.707073 24  density_at 0.730087 10  density_at 0.778197 6  density_at 0.829581 20
+    density_at 0.865692 10  density_at 0.887633 14  density_at 0.905588 40.0162  density_at 0.928289 8
+    density_at 0.978375 6  density_at 1.000000 6.89
     # ---- AIM SPLINE: face the cloud on the circuit, then ease back onto the path ------
     # `aim_at` keys are control points of a world-space Catmull-Rom spline over the frame
     # timeline; `aim_weight_at` blends it over the tangent look (smoothstep between keys),
     # so the view turns as continuously as the eye moves. Generated by scraps/aimcurve.py,
     # which also measures the result; regenerate rather than hand-edit if the path moves.
-    aim_at 0.228422 8.000 2.000 2.000        # frame 262
-    aim_at 0.366173 8.000 2.200 2.000        # frame 420
-    aim_at 0.488230 8.000 1.700 2.000        # frame 560
-    aim_at 0.549259 7.700 1.350 2.600        # frame 630
-    aim_at 0.610288 6.353 1.644 4.634        # frame 700
-    aim_at 0.645161 7.687 1.682 3.976        # frame 740
-    aim_at 0.687010 5.713 0.840 1.840        # frame 788
-    aim_weight_at 0.228422 0   aim_weight_at 0.261552 1   aim_weight_at 0.662598 1   aim_weight_at 0.687010 0
+    aim_at 0.215625 8.000 2.000 2.000        # frame 260
+    aim_at 0.344773 8.000 2.200 2.000        # frame 416
+    aim_at 0.459206 8.000 1.700 2.000        # frame 555
+    aim_at 0.516906 7.700 1.350 2.600        # frame 624
+    aim_at 0.574732 6.353 1.644 4.634        # frame 694
+    aim_at 0.607369 7.687 1.682 3.976        # frame 734
+    aim_at 0.648475 5.713 0.840 1.840        # frame 783
+    aim_at 0.689582 5.713 0.840 1.840        # guard: holds the cloud spline's last segment
+    aim_at 0.864238 2.720 1.480 5.450        # PRISM PASS, frame 1044
+    aim_at 0.897351 2.720 1.480 5.450        # PRISM PASS, frame 1084
+    aim_at 0.963576 2.720 1.480 5.450        # PRISM PASS, frame 1164
+    aim_at 0.996689 2.720 1.480 5.450        # PRISM PASS, frame 1204
+    aim_weight_at 0.215625 0   aim_weight_at 0.246685 1   aim_weight_at 0.623717 1   aim_weight_at 0.648475 0
+    aim_weight_at 0.897351 0   aim_weight_at 0.915563 1   aim_weight_at 0.947020 1   aim_weight_at 0.963576 0   # the prism pass
     # ---- end of aim spline ----------------------------------------------------------------
     closed
     exposure_lock

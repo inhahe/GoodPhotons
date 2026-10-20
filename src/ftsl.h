@@ -922,6 +922,12 @@ struct Loaded {
     // interfaces on one line of sight, so at the default the innermost tube renders as a
     // solid BLACK plug — truncated paths, not a material bug. A CLI `-max-bounce` still wins.
     int maxBounce = -1;
+    // render { mode_spp D=<x> J=<y> } (0.386.0): per-mode sample multipliers for per-object render
+    // modes; <= 0 = not specified. A CLI `-mode-spp` still wins.
+    double modeSppD = -1.0, modeSppJ = -1.0;
+    // render { jsurf_radius <len> } (0.386.0): mode J's starting surface-merge radius, when the scene
+    // knows the default (-pmradiusfrac of the scene radius) is wrong for it; <= 0 = not specified.
+    double jsurfRadius = -1.0;
     std::string device;          // empty = not specified
     std::string out;             // empty = not specified
     // Keys no builder read (see collectUnusedKeys). Carried on Loaded rather than
@@ -1164,16 +1170,16 @@ public:
         std::vector<const Block*> furBlocks;
         for (const auto& b : blocks) {
             if (stopped()) return false;
-            if      (b.type == "sphere")   { if (!addSphere(b, L)) return false; }
-            else if (b.type == "quad")     { if (!addQuad(b, L)) return false; }
-            else if (b.type == "triangle") { if (!addTriangle(b, L)) return false; }
-            else if (b.type == "mesh")     { if (!addMesh(b, L)) return false; }
-            else if (b.type == "mesh_instance") { if (!addMeshInstance(b, L)) return false; }
-            else if (b.type == "isosurface") { if (!addIsosurface(b, L)) return false; }
-            else if (b.type == "curve")    { if (!addCurve(b, L)) return false; }
+            if      (b.type == "sphere")   { if (!routed(b, L, [&] { return addSphere(b, L); })) return false; }
+            else if (b.type == "quad")     { if (!routed(b, L, [&] { return addQuad(b, L); })) return false; }
+            else if (b.type == "triangle") { if (!routed(b, L, [&] { return addTriangle(b, L); })) return false; }
+            else if (b.type == "mesh")     { if (!routed(b, L, [&] { return addMesh(b, L); })) return false; }
+            else if (b.type == "mesh_instance") { if (!routed(b, L, [&] { return addMeshInstance(b, L); })) return false; }
+            else if (b.type == "isosurface") { if (!routed(b, L, [&] { return addIsosurface(b, L); })) return false; }
+            else if (b.type == "curve")    { if (!routed(b, L, [&] { return addCurve(b, L); })) return false; }
             else if (b.type == "fur")      { furBlocks.push_back(&b); }
             else if (b.type == "light")    { if (!addLight(b, L, b.subtype)) return false; haveLight = true; }
-            else if (b.type == "group")    { if (!addGroup(b, L, Affine::identity(), haveLight)) return false; }
+            else if (b.type == "group")    { if (!routed(b, L, [&] { return addGroup(b, L, Affine::identity(), haveLight); })) return false; }
             else if (b.type == "medium")   { mediaBlocks.push_back(&b); }
             else if (b.type == "settle")   { settleBlocks.push_back(&b); }
             else if (b.type == "camera")   { if (!addCamera(b, L)) return false; }
@@ -1198,7 +1204,7 @@ public:
         // a groom can be grown on a `shape_only` scalp that is then removed from the scene.
         for (const Block* fb : furBlocks) {
             if (stopped()) return false;
-            if (!addFur(*fb, L)) return false;
+            if (!routed(*fb, L, [&] { return addFur(*fb, L); })) return false;
         }
         // Deferred medium sweep (object-name bounds resolve against the registries).
         for (const Block* mb : mediaBlocks) {
@@ -1327,6 +1333,7 @@ public:
             }
             std::fprintf(stderr, "[settle] %s\n", rep.c_str());
         }
+        propagateMaterialRoutes(L);   // per-object render modes: a tagged mix's children (0.386.0)
         if (L.beforeBvh) L.beforeBvh(L);
         { detail::AccelTimer _ct; L.scene.build(); }
         // build() demotes a fire that emits nothing to the smoke it is made of
@@ -1351,6 +1358,14 @@ public:
         for (const auto& kv : matIndex_)
             if (kv.second >= 0 && kv.second < (int)L.scene.matNames.size())
                 L.scene.matNames[kv.second] = kv.first;
+        // A per-object `mode` copy is named for its original: "glass [mode J]" (see routedMat).
+        for (const auto& kv : routeClone_)
+            if (kv.second >= 0 && kv.second < (int)L.scene.matNames.size() &&
+                kv.first.first >= 0 && kv.first.first < (int)L.scene.matNames.size())
+                L.scene.matNames[kv.second] = (L.scene.matNames[kv.first.first].empty()
+                                                   ? std::string("material ") + std::to_string(kv.first.first)
+                                                   : L.scene.matNames[kv.first.first]) +
+                                              (kv.first.second == ROUTE_J ? " [mode J]" : " [mode D]");
         warnCurvOnFlatGeometry(L);
         // Decide whether any cavity probe rays will ever be fired, and how far.
         setupCavity(L);
@@ -4750,7 +4765,14 @@ private:
         return m;
     }
 
+    // Every material block, whatever builds it (a preset returns early, a record override has a
+    // builder of its own), can carry `mode D` / `mode J` (0.386.0): every object using it.
     Material buildMaterial(const Block& b, Loaded& L) {
+        Material m = buildMaterialBody(b, L);
+        routeOf(b, m.route);          // a bad value fail()s; the caller checks err
+        return m;
+    }
+    Material buildMaterialBody(const Block& b, Loaded& L) {
         if (isRecordOverrideBlock(b)) return buildRecordOverrideMaterial(b, L);
         Material m;
         // `preset <name>` is one keyword with two populations behind it. Most names are a
@@ -6363,6 +6385,112 @@ private:
         return true;
     }
 
+    // ---- per-object render mode (`mode D` / `mode J`, 0.386.0) ----
+    // `mode` on an object, group, fur, material or medium block. Only the two modes of the
+    // bidirectional family can be given per object: they share one renderer (mode J is mode D
+    // plus its merges), so a frame can switch between them path by path and stay one unbiased
+    // estimator. -1 = no `mode` here.
+    bool routeOf(const Block& b, int& route) {
+        route = -1;
+        if (!find(b, "mode")) return true;
+        std::string v = strOf(b, "mode");
+        std::string u = v;
+        for (char& c : u) c = (char)std::toupper((unsigned char)c);
+        if (u == "D")      route = ROUTE_D;
+        else if (u == "J") route = ROUTE_J;
+        else {
+            fail("`mode " + v + "` on a " + b.type + " block: only D and J can be given per object "
+                 "(they are one renderer -- J is D plus its merges -- so a frame can mix them path "
+                 "by path; see FTSL.md, Per-object render modes)");
+            return false;
+        }
+        return true;
+    }
+    // Where the primitive pools stood before an object was added, so its own primitives can be
+    // found afterwards whatever kind it turned out to be (a mesh file can hold many materials).
+    struct PrimMark { size_t tris, spheres, implicits, curves, curveSegs, instances; };
+    static PrimMark primMark(const Loaded& L) {
+        return {L.scene.tris.size(), L.scene.spheres.size(), L.scene.implicits.size(),
+                L.scene.curves.size(), L.scene.curveSegs.size(), L.scene.instances.size()};
+    }
+    // (material, route) -> the routed copy. A copy is a whole Material, so every renderer reads
+    // it exactly as it reads the original; only `route` differs.
+    std::map<std::pair<int, int>, int> routeClone_;
+    bool routeWarnedLight_ = false, routeWarnedInst_ = false;
+    int routedMat(int id, int route, Loaded& L) {
+        if (id < 0 || id >= (int)L.scene.mats.size()) return id;
+        if (L.scene.mats[(size_t)id].route >= 0) return id;    // already tagged: the inner tag wins
+        // An emitter is found BY its material (Scene::emitterForMat), so a light's material
+        // cannot be copied without orphaning its emitter. It keeps the camera's mode.
+        if (L.scene.mats[(size_t)id].isLight) {
+            if (!routeWarnedLight_) {
+                routeWarnedLight_ = true;
+                std::fprintf(stderr, "[ftsl] warning: `mode` does not apply to an emissive surface; "
+                                     "it keeps the camera's mode\n");
+            }
+            return id;
+        }
+        const auto key = std::make_pair(id, route);
+        auto it = routeClone_.find(key);
+        if (it != routeClone_.end()) return it->second;
+        Material c = L.scene.mats[(size_t)id];
+        c.route = route;
+        // A MIX resolves to one of its children before anything shades it, and the walks store
+        // the CHILD on the vertex (bdpt.h Vertex::mat, the device's resolved matId), so the
+        // route has to live on the children too: they get routed copies of their own. (A
+        // layered coat is synthesised later, in build(), as a copy of this material, so it
+        // inherits the route there.)
+        for (int& ch : c.mixChildren) ch = routedMat(ch, route, L);
+        const int nid = (int)L.scene.mats.size();
+        L.scene.mats.push_back(std::move(c));
+        routeClone_[key] = nid;
+        return nid;
+    }
+    // A material tagged in its OWN block passes its route to the children it resolves to, for
+    // the reason routedMat gives. Run once, after every object, before build().
+    void propagateMaterialRoutes(Loaded& L) {
+        const size_t n = L.scene.mats.size();
+        for (size_t i = 0; i < n; ++i) {
+            const int r = L.scene.mats[i].route;
+            if (r < 0 || L.scene.mats[i].mixChildren.empty()) continue;
+            std::vector<int> ch = L.scene.mats[i].mixChildren;   // routedMat may grow `mats`
+            for (int& c : ch) c = routedMat(c, r, L);
+            L.scene.mats[i].mixChildren = ch;
+        }
+    }
+    void applyRoute(const PrimMark& mk, int route, Loaded& L) {
+        Scene& S = L.scene;
+        for (size_t i = mk.tris; i < S.tris.size(); ++i)           S.tris[i].matId = routedMat(S.tris[i].matId, route, L);
+        for (size_t i = mk.spheres; i < S.spheres.size(); ++i)     S.spheres[i].matId = routedMat(S.spheres[i].matId, route, L);
+        for (size_t i = mk.implicits; i < S.implicits.size(); ++i) S.implicits[i].matId = routedMat(S.implicits[i].matId, route, L);
+        for (size_t i = mk.curves; i < S.curves.size(); ++i)       S.curves[i].matId = routedMat(S.curves[i].matId, route, L);
+        for (size_t i = mk.curveSegs; i < S.curveSegs.size(); ++i) S.curveSegs[i].matId = routedMat(S.curveSegs[i].matId, route, L);
+        for (size_t i = mk.instances; i < S.instances.size(); ++i) {
+            MeshInstance& in = S.instances[i];
+            if (in.matOverride >= 0) { in.matOverride = routedMat(in.matOverride, route, L); continue; }
+            // An instance without a material override shares its asset's triangles, and their
+            // materials, with every other instance of the asset: they cannot be retagged for
+            // this placement alone.
+            if (!routeWarnedInst_) {
+                routeWarnedInst_ = true;
+                std::fprintf(stderr, "[ftsl] warning: `mode` on a mesh_instance needs a `material` "
+                                     "override (its asset's own materials are shared); ignored\n");
+            }
+        }
+    }
+    // Add one object (or group, or fur) and retag what it added. Mode keys on a group reach its
+    // children through this too: they are added inside `add`, then retagged here unless a
+    // child's own `mode` already did it.
+    template <class F>
+    bool routed(const Block& b, Loaded& L, F&& add) {
+        int route = -1;
+        if (!routeOf(b, route)) return false;
+        const PrimMark mk = primMark(L);
+        if (!add()) return false;
+        if (route >= 0) applyRoute(mk, route, L);
+        return true;
+    }
+
     // ---- group (transform hierarchy) ----
     // A `group { translate .. rotate .. scale .. <child prims / nested groups> }`
     // node. The group's own transform composes with its parent's (parent applied
@@ -6406,15 +6534,15 @@ private:
             const Block* cb = s.val.block.get();
             if (!cb) continue;
             s.used = true;   // a child block: dispatched below, or rejected by name
-            if      (s.key == "sphere")   { if (!addSphere(*cb, L, world)) return false; }
-            else if (s.key == "quad")     { if (!addQuad(*cb, L, world)) return false; }
-            else if (s.key == "triangle") { if (!addTriangle(*cb, L, world)) return false; }
-            else if (s.key == "mesh")     { if (!addMesh(*cb, L, world)) return false; }
-            else if (s.key == "mesh_instance") { if (!addMeshInstance(*cb, L, world)) return false; }
-            else if (s.key == "isosurface") { if (!addIsosurface(*cb, L, world)) return false; }
-            else if (s.key == "curve")    { if (!addCurve(*cb, L, world)) return false; }
+            if      (s.key == "sphere")   { if (!routed(*cb, L, [&] { return addSphere(*cb, L, world); })) return false; }
+            else if (s.key == "quad")     { if (!routed(*cb, L, [&] { return addQuad(*cb, L, world); })) return false; }
+            else if (s.key == "triangle") { if (!routed(*cb, L, [&] { return addTriangle(*cb, L, world); })) return false; }
+            else if (s.key == "mesh")     { if (!routed(*cb, L, [&] { return addMesh(*cb, L, world); })) return false; }
+            else if (s.key == "mesh_instance") { if (!routed(*cb, L, [&] { return addMeshInstance(*cb, L, world); })) return false; }
+            else if (s.key == "isosurface") { if (!routed(*cb, L, [&] { return addIsosurface(*cb, L, world); })) return false; }
+            else if (s.key == "curve")    { if (!routed(*cb, L, [&] { return addCurve(*cb, L, world); })) return false; }
             else if (s.key == "light")    { if (!addLight(*cb, L, (cb->type == "light" ? std::string() : cb->type), world)) return false; haveLight = true; }
-            else if (s.key == "group")    { if (!addGroup(*cb, L, world, haveLight)) return false; }
+            else if (s.key == "group")    { if (!routed(*cb, L, [&] { return addGroup(*cb, L, world, haveLight); })) return false; }
             else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, mesh_instance, isosurface, curve, light, group)"); return false; }
         }
         return true;
@@ -7203,6 +7331,7 @@ private:
     bool addMedium(const Block& b, Loaded& L) {
         Medium med;
         med.enabled = true;
+        if (!routeOf(b, med.route)) return false;   // per-object render mode (0.386.0)
         med.g = dblOf(b, "g", 0.0);
         med.beamBlur = dblOf(b, "beam_blur", -1.0);   // per-medium mode-M kernel (see scene.h)
         bool rayleigh = strOf(b, "rayleigh") == "true" || strOf(b, "rayleigh") == "1";
@@ -9000,6 +9129,25 @@ private:
             int n = (int)num(mb->val.words[0]);
             if (n < 1) { fail("render: max_bounce must be >= 1"); return false; }
             L.maxBounce = n;
+        }
+        if (const Stmt* jr = find(b, "jsurf_radius")) {
+            const double v = jr->val.words.empty() ? 0.0 : num(jr->val.words[0]);
+            if (!(v > 0.0)) { fail("render: jsurf_radius must be > 0"); return false; }
+            L.jsurfRadius = v * L_;
+        }
+        // `mode_spp D=1 J=0.5`: per-mode sample multipliers (FTSL.md 16.1). key=val words, so they
+        // continue one statement (1.1).
+        if (const Stmt* ms = find(b, "mode_spp")) {
+            for (const std::string& w : ms->val.words) {
+                const size_t eq = w.find('=');
+                const std::string k = (eq == std::string::npos) ? w : w.substr(0, eq);
+                const double v = (eq == std::string::npos) ? 0.0 : num(w.substr(eq + 1));
+                if (!(v > 0.0) || (k != "D" && k != "J" && k != "d" && k != "j")) {
+                    fail("render: mode_spp takes D=<x> and/or J=<y>, each > 0 (got '" + w + "')");
+                    return false;
+                }
+                if (k == "D" || k == "d") L.modeSppD = v; else L.modeSppJ = v;
+            }
         }
         return true;
     }
