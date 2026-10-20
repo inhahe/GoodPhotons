@@ -21240,6 +21240,11 @@ static int run(int argc, char** argv) {
                        int flightIdx = -1;       // this frame's 0-based index in its whole flight (-1 = standalone)
                        int flightN   = 0; };     // that flight's frame count, whatever -frames selected
     std::vector<RenderCam> toRender;
+    // `-camera <path base>` (with or without -frames) picked a path's frames by name. Each frame
+    // is then written under its own name in the path's directory (outFor) even when only ONE is
+    // selected -- `-frames 1207 1207` resuming a stopped flyby at its last frame must land on
+    // that frame's file and checkpoint, not on -o itself.
+    bool pathByName = false;
     // The live window's frame field (g_windowFrame) for camera `rc`, `runPos` of `runN` in this
     // run (1-based). A flight frame reads "frame 556/1208 (fly0555)": its place in the WHOLE flight,
     // counted from 1, then its name, which counts from 0 as the frame files do; when the run is
@@ -21378,6 +21383,7 @@ static int run(int argc, char** argv) {
                         framesApplied = true;
                     }
                     if (!sel.empty()) {
+                        pathByName = true;
                         // Resolve the flyby's playback fps hint (per-camera, else scene
                         // default) so a user running ftrace directly sees the authored rate
                         // the video tooling will assemble at; 0 => none authored.
@@ -21668,7 +21674,7 @@ static int run(int argc, char** argv) {
     // of a path (`-camera fly042`) is a one-off and stays beside `-o`, as does any
     // standalone `camera`, so only an actual series creates a directory.
     auto outFor = [&](const std::string& name) -> std::string {
-        if (toRender.size() <= 1 || name.empty()) return out;
+        if (name.empty() || (toRender.size() <= 1 && !pathByName)) return out;
         std::string base = out;
         auto dot = base.find_last_of('.');
         std::string stem = (dot == std::string::npos) ? base : base.substr(0, dot);
@@ -21682,7 +21688,7 @@ static int run(int argc, char** argv) {
         if (!pb.empty()) {
             size_t nInPath = 0;
             for (const RenderCam& rc : toRender) if (rc.pathBase == pb) ++nInPath;
-            if (nInPath > 1) {
+            if (nInPath > 1 || pathByName) {
                 std::string dir = stem + "_" + pb;
                 auto slash = stem.find_last_of("/\\");
                 std::string leaf = (slash == std::string::npos) ? stem : stem.substr(slash + 1);
