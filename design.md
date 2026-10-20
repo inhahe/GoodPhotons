@@ -6474,6 +6474,45 @@ as the one at fault.
   one off. `levels` and `chroma` were swept against the reference too: the optimum is a
   plateau at **2–3 levels**, not SVGF's 5, because with no luma term holding the edges a wide
   chroma support bleeds colour across material boundaries (by 7 levels it is a net loss).
+- **`oidn_rt.cpp` + `denoise_guide.h`** — `-oidn`, Intel Open Image Denoise's learned `RT`
+  filter, for the *luma* noise the chroma filter deliberately leaves (a low-sample flyby frame).
+  Three pieces:
+  - **Loaded at run time, not linked** (`oidn_rt.cpp`, its own TU so `<windows.h>` stays out
+    of `main.cpp`). OIDN is ~70 MB of DLLs and ftrace.exe ships as one file, so the first
+    denoise `LoadLibraryEx`es `OpenImageDenoise.dll` (from `$FTRACE_OIDN`, beside the exe, or
+    `external/oidn/<release>/bin` up to three directories above it — where the repo keeps the
+    git-ignored download) and resolves the fifteen C entry points it uses by name. `run()` loads
+    it before the scene is built (`oidnStartup`), so a machine without it fails at the start,
+    not after hours of undenoised frames. One device, filter and buffer set live for the
+    process, rebuilt only when the image shape changes, behind a mutex; they are never released,
+    because a CUDA device torn down by a static destructor races the runtime's own exit.
+  - **Guide images** (`denoise_guide.h`): per pixel, the albedo and world-space shading normal
+    of the first surface that is *not* a perfect specular, which is what OIDN's README asks for
+    and what lets it keep the floor grid, marble veining and silhouettes while it smooths. A
+    guide ray follows clear glass, mirrors, gels and near-mirror glossy lobes (roughness < 0.05)
+    by mode W's deterministic step (`Renderer::interfaceStep(..., whitted)`) at 550 nm, tinting
+    by mirror colour, gel transmittance and coloured glass's Beer–Lambert along the way; media
+    are ignored. 16 stratified rays a pixel (`-oidn-guide-spp`), so they are antialiased like
+    the box-filtered film. Deterministic, hence passed as `cleanAux`, and world-space so a
+    static surface's guide holds still across a flyby. 0.6–2.8 s a 960x540 frame on the CPU.
+  - **Plumbing.** `runRender` holds a `GuideScope` for its camera: it renders the guides on
+    entry, publishes them (`setGuide`) and withdraws them on exit. `filmToLinear` — the one
+    reduction behind the PNG, the `-hdr` PFM and the live window — runs `oidnApply`, which uses
+    the published guides when they match the film's size. Everything rendered outside
+    `runRender` (the meter pre-pass, the shared multi-camera passes) therefore denoises
+    unguided rather than against another camera's edges. Modes A and C get no guides: their
+    film images through the finite lens and is blurred out of focus where a pinhole guide is
+    sharp. The `.ftbuf` keeps the raw film, so `-resume` re-denoises the larger total and
+    `-topng -oidn -oidn-guides <stem>` re-develops a checkpoint against the guides a render
+    saved with `-oidn-write-guides`. OIDN gets the image **upright** (the film is stored
+    bottom-up): its network is not flip-symmetric — 6 % mean absolute difference between the two
+    orientations of one 64 spp frame — and upright is what it was trained on and what
+    `oidnDenoise` feeds it, which this path reproduces bit for bit.
+  OIDN clamps negative input to 0, and a single-wavelength sample's linear sRGB often has a
+  negative channel; on gallery_rain at 64 spp that is ~5 % of the absolute energy, and the
+  denoised mean lands within ~1–2 % of the raw one. With `-denoise` too the order is: firefly
+  clamp, OIDN, chroma filter (a lone lucky path is what a learned denoiser handles worst — it
+  spreads it into a blob).
 - **`materials.h` / `pattern.h` / `texture.h` / `layered`** — BSDFs (diffuse,
   mirror, glossy, dielectric w/ nested IOR, diffuse-transmission, filter gels,
   fluorescence, layered), procedural patterns (POV-derived `pov_noise.h` /

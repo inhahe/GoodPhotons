@@ -45,6 +45,7 @@ add_executable(ftrace
     src/main.cpp
     src/stb_image_impl.cpp   # compiles vendored stb_image (texture load) + stb_image_write (PNG/JPG output) once
     src/livewindow.cpp       # -window live-preview OS window (Win32 GDI; no-op stub off Windows)
+    src/oidn_rt.cpp          # -oidn: loads Intel Open Image Denoise at run time (keeps <windows.h> out of main.cpp)
     src/vdbgrid.cpp          # confines vendored NanoVDB.h to one TU; bakes .nvdb -> dense fog grid
     src/vdb_openvdb.cpp      # native OpenVDB .vdb reader (no OpenVDB/NanoVDB dep); bakes .vdb -> dense fog grid
     src/third_party/lz4.c    # vendored single-file LZ4 (BSD) for blosc LZ4 decode in the .vdb reader

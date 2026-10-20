@@ -15,6 +15,9 @@
 # build_cuda2/bin/ftrace.exe open and blocks relinking it.
 /build_cpu/
 /out/
+# Third-party binaries fetched for local use, not vendored: external/oidn/ holds an Intel Open
+# Image Denoise release (~70 MB of DLLs), which `-oidn` finds there at run time (oidn_rt.cpp).
+/external/
 # ftrace.exe copied into the repo root by build.bat (build artifact). A RelWithDebInfo
 # binary copied there for debugging drags its .pdb along, so ignore that too.
 /ftrace.exe

@@ -89,6 +89,7 @@ Two causes, both fixed (design.md, "Mode `J`'s camera pass, 2.6x faster"):
 Final: 0.385.0 130–134 s, 0.386.0 49–52 s for 32 spp (2.6x), against mode D's 19.6–21.4 s.
 `_fog_cornell` (homogeneous fog, dense hits, none of this helps) is ~4 % slower (7.1 s against
 6.8 s for 16 spp at 96²); see the design note for what was ruled out.
+
 ## OPEN (2026-10-20): CPU-ONLY-BUILD — a build without CUDA does not compile
 
 `build_cpu` (`scraps/build_cpu.bat`, configured with an empty `CMAKE_CUDA_COMPILER`, kept so CPU
@@ -101,6 +102,21 @@ Four `cuda*` setter calls were guarded on 2026-10-20 (`cudaSetRouting`, `cudaSet
 types and helpers. **Fix:** guard each, or give `render_cuda.h` / `raster_cuda.h` CPU stubs, and
 build `build_cpu` after any change that touches the device boundary.
 
+## OPEN (2026-10-20, 0.390.0): OIDN-SHARED-PASSES — the shared multi-camera passes denoise without guides
+
+`-oidn`'s albedo/normal guides are rendered per camera by `GuideScope`, which `runRender` holds
+for the camera it renders (`main.cpp`). The passes that render many cameras at once never enter
+`runRender`: the forward modes' shared group (`runSharedGroup`, all cameras accumulating together)
+and mode `M`'s shared photon-map gather (GPU `writeFrame` and its CPU twin). Their frames are
+denoised from the colour alone. Measured on `gallery_rain` frame 100 at 64 spp, that is luma error
+3.85 against 2.81 guided (display space, 4x4 downsample, against an independent 484 spp render).
+
+**Fix:** mode `M` gathers one frame at a time, so its loop can render frame k's guides when frame
+k's gather starts (`gatherFrame` already tracks it) and publish them with `setGuide` for that
+frame's live repaints and its `writeFrame`. The forward shared group writes every camera's film on
+each `-interval`; guides for all of them at once cost 2 x 24 B a pixel per camera (30 GB for 1208
+frames at 960x540), so it wants them rendered at the final write only, or cached on disk beside
+each frame.
 
 ## OPEN (2026-10-18): PER-OBJECT-MODES — what per-object render modes do not do yet
 

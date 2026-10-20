@@ -170,6 +170,8 @@
 #include "animlive.h"           // -anim -loom: the live editor<->loom value channel (E2 channel b)
 #include "livewindow.h"         // -window: real OS live-preview window (Win32 GDI)
 #include "denoise.h"            // -denoise: luma/chroma a-trous filter for MC speckle
+#include "denoise_guide.h"      // -oidn: the albedo/normal guide images the learned denoiser reads
+#include "oidn_rt.h"            // -oidn: Intel Open Image Denoise, loaded at run time
 #include "viewer_gui.h"         // -viewer: loom native viewer host (Dear ImGui + Win32/D3D11)
 #include "fur_grid.h"           // -checkfurgrid / -dual-grid: voxel fiber density + orientation grid
 #include "fur_volume.h"         // -checkfurvol: aggregate fiber scattering (P2 stage 2)
@@ -11719,6 +11721,133 @@ static bool parseDenoiseFlag(int argc, char** argv, int& i) {
     return true;
 }
 
+// -oidn: Intel Open Image Denoise (src/oidn_rt.h), guided by albedo and normal images of the
+// camera being rendered (src/denoise_guide.h). Like -denoise it runs in filmToLinear, so the
+// written image, the -hdr sidecar and the live window all get it -- and a .ftbuf checkpoint
+// keeps the RAW film, so a resumed render is denoised afresh from its larger total.
+static bool            g_oidn            = false;
+static bool            g_oidnGuides      = true;    // -oidn-noguides: denoise the colour alone
+static int             g_oidnGuideSide   = 4;       // -oidn-guide-spp n: sqrt(n) rays a side per pixel
+static bool            g_oidnWriteGuides = false;   // -oidn-write-guides: the guides as PFMs beside -o
+static oidnrt::Options g_oidnOpts;
+
+// The guides of the camera runRender is rendering, or null: published by GuideScope and read
+// by filmToLinear for any film of their size. A film of another camera never meets them, since
+// the meter pre-pass and the shared multi-camera passes run outside runRender, where this is
+// null.
+static std::mutex g_guideMu;
+static std::shared_ptr<const dguide::Images> g_guide;
+static std::shared_ptr<const dguide::Images> currentGuide() {
+    std::lock_guard<std::mutex> lk(g_guideMu);
+    return g_guide;
+}
+static void setGuide(std::shared_ptr<const dguide::Images> g) {
+    std::lock_guard<std::mutex> lk(g_guideMu);
+    g_guide = std::move(g);
+}
+
+// The -oidn flags, shared like parseDenoiseFlag's: `-oidn`, `-oidn-noguides`,
+// `-oidn-write-guides`, `-oidn-guide-spp <n>`, `-oidn-quality high|balanced|fast`,
+// `-oidn-device auto|cpu|cuda`. Each turns -oidn on. A value it does not know is fatal: a
+// misspelt quality must not quietly become a 30-hour flyby at the default.
+static bool parseOidnFlag(int argc, char** argv, int& i) {
+    const char* a = argv[i];
+    if      (!std::strcmp(a, "-oidn"))              {}
+    else if (!std::strcmp(a, "-oidn-noguides"))     g_oidnGuides = false;
+    else if (!std::strcmp(a, "-oidn-write-guides")) g_oidnWriteGuides = true;
+    else if (i + 1 >= argc)                         return false;
+    else if (!std::strcmp(a, "-oidn-guide-spp")) {
+        const int n = std::atoi(argv[++i]);
+        if (n < 1) { std::fprintf(stderr, "error: -oidn-guide-spp wants a count >= 1\n"); std::exit(2); }
+        g_oidnGuideSide = std::max(1, (int)std::lround(std::sqrt((double)n)));
+    } else if (!std::strcmp(a, "-oidn-quality")) {
+        const char* v = argv[++i];
+        if      (!std::strcmp(v, "high"))     g_oidnOpts.quality = oidnrt::Quality::High;
+        else if (!std::strcmp(v, "balanced")) g_oidnOpts.quality = oidnrt::Quality::Balanced;
+        else if (!std::strcmp(v, "fast"))     g_oidnOpts.quality = oidnrt::Quality::Fast;
+        else { std::fprintf(stderr, "error: -oidn-quality '%s': use high, balanced or fast\n", v); std::exit(2); }
+    } else if (!std::strcmp(a, "-oidn-device")) {
+        const char* v = argv[++i];
+        if      (!std::strcmp(v, "auto")) g_oidnOpts.device = oidnrt::Device::Default;
+        else if (!std::strcmp(v, "cpu"))  g_oidnOpts.device = oidnrt::Device::Cpu;
+        else if (!std::strcmp(v, "cuda")) g_oidnOpts.device = oidnrt::Device::Cuda;
+        else { std::fprintf(stderr, "error: -oidn-device '%s': use auto, cpu or cuda\n", v); std::exit(2); }
+    } else {
+        return false;
+    }
+    g_oidn = true;
+    return true;
+}
+
+// Load OIDN now, before any rendering, so a machine without it fails at the start rather than
+// writing noisy frames for hours; then log what was loaded. False (and the reason printed) if
+// it could not be.
+static bool oidnStartup() {
+    std::vector<float> probe(8 * 8 * 3, 0.5f);
+    std::string err;
+    if (!oidnrt::denoise(probe.data(), nullptr, nullptr, 8, 8, false, g_oidnOpts, err)) {
+        std::fprintf(stderr, "error: -oidn: %s\n", err.c_str());
+        return false;
+    }
+    if (g_oidnGuides)
+        std::printf("[oidn] %s; guided by albedo + normal, %d rays per pixel\n",
+                    oidnrt::describe().c_str(), g_oidnGuideSide * g_oidnGuideSide);
+    else
+        std::printf("[oidn] %s; colour only (-oidn-noguides)\n", oidnrt::describe().c_str());
+    return true;
+}
+
+// Denoise `lin` (W x H, film row order) with OIDN, guided by the current camera's guides when
+// they are this size. A failure leaves the image as it was and is printed (the first, then
+// every 100th): a run hours into a flyby should lose one frame's denoise, not the run.
+static void oidnApply(std::vector<Vec3>& lin, int W, int H) {
+    const size_t N = (size_t)W * H;
+    if (lin.size() != N || N == 0) return;
+    std::shared_ptr<const dguide::Images> g = g_oidnGuides ? currentGuide() : nullptr;
+    if (g && (g->W != W || g->H != H)) {
+        // Inside runRender every film is the camera's size, so this is a -topng guide given
+        // for another image. Said once; the image is still denoised, unguided.
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr, "[oidn] the guides are %dx%d and the image %dx%d: denoising "
+                                 "it without them\n", g->W, g->H, W, H);
+        g = nullptr;
+    }
+    // OIDN gets the image UPRIGHT, row 0 at the top, which is the reverse of the film's order.
+    // Its network was trained on upright images and is not symmetric under a flip: measured on
+    // gallery_rain's frame 100 at 64 spp, the same input denoised the film's way up and the
+    // right way up differed by 6 % mean absolute. Upright is also the orientation oidnDenoise
+    // feeds it, so this path reproduces the reference tool's output exactly.
+    auto pack = [N, W, H](const std::vector<Vec3>& v) {
+        std::vector<float> f(N * 3);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const Vec3& p = v[(size_t)(H - 1 - y) * W + x];
+                float* q = &f[((size_t)y * W + x) * 3];
+                q[0] = (float)p.x; q[1] = (float)p.y; q[2] = (float)p.z;
+            }
+        return f;
+    };
+    std::vector<float> c = pack(lin), al, nr;
+    if (g) { al = pack(g->albedo); nr = pack(g->normal); }
+    std::string err;
+    if (!oidnrt::denoise(c.data(), g ? al.data() : nullptr, g ? nr.data() : nullptr, W, H,
+                         g && g->clean, g_oidnOpts, err)) {
+        static std::atomic<int> fails{0};
+        const int k = fails++;
+        if (k % 100 == 0)
+            std::fprintf(stderr, "[oidn] %s -- this image is NOT denoised (failure %d)\n",
+                         err.c_str(), k + 1);
+        return;
+    }
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const float* q = &c[((size_t)y * W + x) * 3];
+            lin[(size_t)(H - 1 - y) * W + x] =
+                Vec3{std::max(0.0, (double)q[0]), std::max(0.0, (double)q[1]), std::max(0.0, (double)q[2])};
+        }
+}
+
 // Tone-map a film into an 8-bit RGB buffer (W*H*3, row 0 = image top; +y flipped to
 // image-top to match writeImage). Shared by writeFilm (PNG/PPM output) and the live
 // preview window so both see identical pixels. Auto-exposure mirrors writeFilm:
@@ -11738,7 +11867,21 @@ static std::vector<Vec3> filmToLinear(const Film& f, double N) {
     // an order statistic over the luminances, so leaving the fireflies in would let a
     // handful of lucky paths set the exposure for the whole image and darken everything
     // else to compensate. Filtering first makes the anchor describe the picture.
-    if (g_denoise) denoise::apply(lin, W, H, g_denoiseParams);
+    //
+    // With -oidn as well, the firefly clamp goes FIRST and the chroma filter after: a lone
+    // lucky path is what a learned denoiser handles worst (it spreads it into a blob rather
+    // than removing it), and the chroma pass, if asked for, refines its output.
+    if (g_oidn) {
+        if (g_denoise) denoise::clampFireflies(lin, W, H, g_denoiseParams.fireflies);
+        oidnApply(lin, W, H);
+        if (g_denoise) {
+            denoise::Params p = g_denoiseParams;
+            p.fireflies = 0.0;
+            denoise::apply(lin, W, H, p);
+        }
+    } else if (g_denoise) {
+        denoise::apply(lin, W, H, g_denoiseParams);
+    }
     return lin;
 }
 
@@ -11775,11 +11918,15 @@ struct AbsDark {
     double evUnder  = 0.0;     // out: stops below the auto-exposure level
 };
 static constexpr int kAbsDarkByte = 8;
+// `outLin`, if given, receives the scene-linear buffer the bytes were made from (filmToLinear's,
+// denoised) -- so a caller that also wants it, the -hdr sidecar, does not reduce and denoise the
+// film a second time.
 static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
                                        bool absolute, double* lockAnchor,
                                        double* outEAuto = nullptr,
                                        double* outExposure = nullptr,
-                                       AbsDark* dark = nullptr) {
+                                       AbsDark* dark = nullptr,
+                                       std::vector<Vec3>* outLin = nullptr) {
     const int W = f.resX, H = f.resY;
     std::vector<Vec3> lin = filmToLinear(f, N);
     double eAuto;
@@ -11842,6 +11989,7 @@ static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
     }
     if (outEAuto)    *outEAuto = eAuto;
     if (outExposure) *outExposure = exposure;
+    if (outLin)      *outLin = std::move(lin);
     return img;
 }
 
@@ -11882,6 +12030,38 @@ static bool writePfm(const std::string& path, int W, int H, const std::vector<Ve
     });
 }
 
+// Read a colour PFM back into film row order -- writePfm's inverse, so no flip (PFM runs
+// bottom-to-top, as the film does). Accepts either endianness. False on a file that is
+// missing, not a colour PFM, or short, with `err` saying which.
+static bool readPfm(const std::string& path, int& W, int& H, std::vector<Vec3>& out,
+                    std::string& err) {
+    std::ifstream fi(path, std::ios::binary);
+    if (!fi) { err = "cannot open " + path; return false; }
+    std::string magic;
+    double scale = 0.0;
+    fi >> magic >> W >> H >> scale;
+    fi.get();                                       // the one whitespace after the scale
+    if (magic != "PF" || !fi || W <= 0 || H <= 0 || scale == 0.0) {
+        err = path + " is not a colour PFM";
+        return false;
+    }
+    std::vector<float> buf((size_t)W * H * 3);
+    fi.read((char*)buf.data(), (std::streamsize)(buf.size() * sizeof(float)));
+    if (fi.gcount() != (std::streamsize)(buf.size() * sizeof(float))) {
+        err = path + " is shorter than its header says";
+        return false;
+    }
+    if (scale > 0.0)                                // big-endian
+        for (float& x : buf) {
+            uint32_t u; std::memcpy(&u, &x, 4);
+            u = (u >> 24) | ((u >> 8) & 0xFF00u) | ((u << 8) & 0xFF0000u) | (u << 24);
+            std::memcpy(&x, &u, 4);
+        }
+    out.resize((size_t)W * H);
+    for (size_t i = 0; i < out.size(); ++i) out[i] = Vec3{buf[3 * i], buf[3 * i + 1], buf[3 * i + 2]};
+    return true;
+}
+
 // `<path>` with its extension replaced by `.pfm` (appended if it has none), so the sidecar
 // lands beside the image and inherits any per-frame numbering a camera_path gave it.
 static std::string pfmPathFor(const std::string& path) {
@@ -11891,6 +12071,51 @@ static std::string pfmPathFor(const std::string& path) {
         return path + ".pfm";
     return path.substr(0, dot) + ".pfm";
 }
+
+// -oidn's guides for ONE camera, alive for the length of its render: runRender makes one on
+// entry, which renders the guides and publishes them to filmToLinear, and its destructor
+// withdraws them, so nothing rendered afterwards is denoised against this camera's edges.
+// Modes A and C get none: their film is the finite-aperture lens's, blurred out of focus,
+// and a pinhole guide would hand the denoiser sharp edges the image does not have.
+struct GuideScope {
+    GuideScope(const Scene& scene, const Camera& cam, int W, int H, char mode,
+               const std::string& outPath) {
+        if (!g_oidn || !g_oidnGuides) return;
+        if (mode == 'A' || mode == 'C') {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                std::printf("[oidn] mode %c images through the finite lens, so it is denoised "
+                            "without guides\n", mode);
+            }
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        auto g = std::make_shared<dguide::Images>(dguide::render(scene, cam, W, H, g_oidnGuideSide));
+        if (g->W == 0) return;                      // a stop arrived while they rendered
+        std::printf("[oidn] guides for %dx%d (%d rays/pixel) in %.2f s%s\n", W, H,
+                    g_oidnGuideSide * g_oidnGuideSide,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                    g->clean ? "" : " -- the lens pupil is sampled, so they are not marked clean");
+        if (g_oidnWriteGuides) {
+            const std::string stem = pfmPathFor(outPath).substr(0, pfmPathFor(outPath).size() - 4);
+            for (const auto& [suffix, img] : {std::pair<const char*, const std::vector<Vec3>*>
+                                                  {".albedo.pfm", &g->albedo},
+                                              {".normal.pfm", &g->normal}}) {
+                const std::string p = stem + suffix;
+                if (writePfm(p, W, H, *img)) std::printf("wrote %s\n", p.c_str());
+                else std::fprintf(stderr, "warning: could not write %s\n", p.c_str());
+            }
+        }
+        setGuide(std::move(g));
+        active = true;
+    }
+    ~GuideScope() { if (active) setGuide(nullptr); }
+    GuideScope(const GuideScope&) = delete;
+    GuideScope& operator=(const GuideScope&) = delete;
+private:
+    bool active = false;
+};
 
 // Returns true on success, false if the image encoder failed. Callers that own the
 // process exit code should propagate a non-zero status on false. (GPU renders that
@@ -11918,8 +12143,10 @@ static bool writeFilm(const char* path, const Film& f, double N, double expComp 
     const int W = f.resX, H = f.resY;
     double eAuto = 0.0, exposure = 0.0;
     AbsDark dk;
+    std::vector<Vec3> lin;
     std::vector<uint8_t> img = filmToRgb8(f, N, expComp, absolute, lockAnchor,
-                                          &eAuto, &exposure, absolute ? &dk : nullptr);
+                                          &eAuto, &exposure, absolute ? &dk : nullptr,
+                                          g_writeHdr ? &lin : nullptr);
     if (!writeImage(path, W, H, img)) {
         std::fprintf(stderr, "error: could not write %s\n", path);
         return false;
@@ -11931,7 +12158,7 @@ static bool writeFilm(const char* path, const Film& f, double N, double expComp 
     // that is still converging.
     if (g_writeHdr) {
         std::string hp = pfmPathFor(path);
-        if (!writePfm(hp, W, H, filmToLinear(f, N)))
+        if (!writePfm(hp, W, H, lin))
             std::fprintf(stderr, "warning: could not write %s\n", hp.c_str());
         else if (!quiet)
             std::printf("wrote %s (%dx%d, 32-bit float, scene-linear)\n", hp.c_str(), W, H);
@@ -16685,6 +16912,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // created it; this also covers any path that reaches a render without going through
     // that dispatch.
     liveWindowPlaceholder(res, resY, "starting\xE2\x80\xA6");   // the mode is liveTitle()'s field now
+    // -oidn: this camera's albedo/normal guides, for every image written until we return.
+    const GuideScope guideScope(scene, cam, res, resY, mode, outPath);
     const bool refMode      = (mode == 'R' || mode == 'V');
     const bool useCamera    = (mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' ||
                                mode == 'D' || mode == 'J' || refMode);
@@ -19008,6 +19237,17 @@ static void printHelp(const char* prog) {
 "                        optimum is 2-3; by 7 the chroma bleed costs more than it removes\n"
 "  -fireflies <k>        clamp isolated outliers to k x the 2nd-brightest neighbour\n"
 "                        (hue preserved). Implies -denoise. Try 2-4. 0 = off (default)\n"
+"  -oidn                 Intel Open Image Denoise (luma AND chroma), guided by albedo and\n"
+"                        normal images traced for each camera (through glass and mirrors).\n"
+"                        Loads OpenImageDenoise.dll at run time: from FTRACE_OIDN, beside\n"
+"                        ftrace.exe, or external/oidn/<release>/bin. The .ftbuf stays raw.\n"
+"                        With -denoise too: firefly clamp, then OIDN, then the chroma filter\n"
+"  -oidn-noguides        denoise the colour alone (implies -oidn)\n"
+"  -oidn-guide-spp <n>   guide rays per pixel, rounded to a square (default 16)\n"
+"  -oidn-write-guides    also write <out>.albedo.pfm / <out>.normal.pfm (implies -oidn);\n"
+"                        -topng -oidn-guides <stem> re-develops a checkpoint with them\n"
+"  -oidn-quality <q>     high | balanced | fast (default high)\n"
+"  -oidn-device <d>      auto | cpu | cuda (default auto: the GPU if OIDN supports it)\n"
 "\n"
 "Output, preview & checkpointing:\n"
 "  -o <file.ppm|.png>    output path (default: cornell.ppm)\n"
@@ -19139,7 +19379,8 @@ static int run(int argc, char** argv) {
     if (argc >= 2 && (!std::strcmp(argv[1], "-topng") || !std::strcmp(argv[1], "-convert"))) {
         if (argc < 4) {
             std::fprintf(stderr, "usage: %s -topng <input.ppm|input.ftbuf> <output.png> [-ev <c>] "
-                                 "[-exposure-anchor <val|file>] [-denoise [amount] ...]\n", argv[0]);
+                                 "[-exposure-anchor <val|file>] [-hdr] [-denoise [amount] ...] "
+                                 "[-oidn ... [-oidn-guides <stem>]]\n", argv[0]);
             return 2;
         }
         // This branch runs before the main parse loop, so -exposure/-ev has to be picked
@@ -19152,15 +19393,25 @@ static int run(int argc, char** argv) {
         // developed through. Anything else is refused rather than dropped.
         double convExp = 0.0;   // <=0 = plain p99 auto-exposure
         std::string convAnchorArg;
+        // -oidn-guides <stem>: the guides a render saved with -oidn-write-guides
+        // (<stem>.albedo.pfm, <stem>.normal.pfm). There is no camera here to render them from.
+        std::string convGuideStem;
         for (int i = 4; i < argc; ++i) {
             if ((!std::strcmp(argv[i], "-exposure") || !std::strcmp(argv[i], "-ev")) && i + 1 < argc)
                 convExp = std::atof(argv[++i]);
             else if (!std::strcmp(argv[i], "-exposure-anchor") && i + 1 < argc)
                 convAnchorArg = argv[++i];
-            else if (!parseDenoiseFlag(argc, argv, i)) {
+            else if (!std::strcmp(argv[i], "-oidn-guides") && i + 1 < argc) {
+                convGuideStem = argv[++i];
+                g_oidn = true;
+            }
+            else if (!std::strcmp(argv[i], "-hdr"))   // the developed linear image as a PFM too
+                g_writeHdr = true;
+            else if (!parseDenoiseFlag(argc, argv, i) && !parseOidnFlag(argc, argv, i)) {
                 std::fprintf(stderr, "error: -topng: '%s' is not one of its flags, or its value is "
-                                     "missing (it takes -ev <c>, -exposure-anchor <v|file> and the "
-                                     "-denoise flags)\n", argv[i]);
+                                     "missing (it takes -ev <c>, -exposure-anchor <v|file>, -hdr, the "
+                                     "-denoise flags, and the -oidn flags with -oidn-guides <stem>)\n",
+                             argv[i]);
                 return 2;
             }
         }
@@ -19168,6 +19419,33 @@ static int run(int argc, char** argv) {
         if (g_denoise && isPpm)
             std::fprintf(stderr, "warning: -denoise ignored for a .ppm input (already 8-bit sRGB); "
                                  "it only applies to a .ftbuf's linear film\n");
+        if (g_oidn && isPpm) {
+            std::fprintf(stderr, "warning: -oidn ignored for a .ppm input (already 8-bit sRGB); "
+                                 "it only applies to a .ftbuf's linear film\n");
+            g_oidn = false;
+        }
+        if (g_oidn && !oidnStartup()) return 2;
+        if (g_oidn && g_oidnGuides && !convGuideStem.empty()) {
+            auto g = std::make_shared<dguide::Images>();
+            int wa = 0, ha = 0, wn = 0, hn = 0;
+            std::string gerr;
+            if (!readPfm(convGuideStem + ".albedo.pfm", wa, ha, g->albedo, gerr) ||
+                !readPfm(convGuideStem + ".normal.pfm", wn, hn, g->normal, gerr)) {
+                std::fprintf(stderr, "error: -oidn-guides: %s\n", gerr.c_str());
+                return 2;
+            }
+            if (wa != wn || ha != hn) {
+                std::fprintf(stderr, "error: -oidn-guides: %s.albedo.pfm is %dx%d but .normal.pfm "
+                                     "is %dx%d\n", convGuideStem.c_str(), wa, ha, wn, hn);
+                return 2;
+            }
+            g->W = wa; g->H = ha;
+            g->clean = true;   // what -oidn-write-guides writes is deterministic (denoise_guide.h)
+            setGuide(std::move(g));
+        } else if (g_oidn && g_oidnGuides) {
+            std::printf("[oidn] -topng has no camera to render guides from: denoising the colour "
+                        "alone (pass -oidn-guides <stem> for a render's saved guides)\n");
+        }
         if (convExp > 0.0 && isPpm)
             std::fprintf(stderr, "warning: -ev ignored for a .ppm input (already 8-bit sRGB); "
                                  "it only applies to a .ftbuf's linear film\n");
@@ -19956,6 +20234,7 @@ static int run(int argc, char** argv) {
             g_dualMaxCross = std::max(1, std::atoi(argv[++i]));
         }
         else if (parseDenoiseFlag(argc, argv, i)) {}
+        else if (parseOidnFlag(argc, argv, i)) {}
         else if (!std::strcmp(argv[i], "-hdr")) g_writeHdr = true;
         else if (!std::strcmp(argv[i], "-on-unsupported") && i + 1 < argc) { ++i; /* pre-scanned into g_onUnsupported */ }
         // An explicit absolute radius pins the radius: don't then adapt it out from under
@@ -20452,6 +20731,8 @@ static int run(int argc, char** argv) {
         }   // end segment 3
     }
     if (nThreads < 1) nThreads = 1;
+    // -oidn: load the library now, so a machine without it fails before the scene is built.
+    if (g_oidn && !oidnStartup()) return 2;
 
     // ---- -nd: resolve the deferred fill / angle specs ---------------------------
     // Both were collected as text during the option scan because a plane's index and a

@@ -70,6 +70,7 @@ Three neighbouring documents cover what this one only summarises:
   - [How long output is kept](#how-long-output-is-kept)
   - [Elapsed times and ETAs](#elapsed-times-and-etas)
   - [Denoising (`-denoise`)](#denoising--denoise)
+  - [Learned denoising (`-oidn`)](#learned-denoising--oidn)
 
 ---
 
@@ -6006,7 +6007,7 @@ survive exactly.
 | `-n <photons>` | Trace exactly this many photons/samples |
 | `-r <res>` / `-r <W> <H>` | Output resolution (overrides scene default); one value = square, two = non-square film |
 | `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension). Missing parent directories are created before the render starts (reported as `[out] created output directory …`), so a render aimed at a fresh `png/<series>/` subdir can't be traced to completion and then lost at write time. Mode `V` produces a *pair* of images (the two independent estimates it cross-checks) and writes them as `<out>_forward` / `<out>_backward` beside the given path |
-| `-topng <in> <out.png> [-ev <c>] [-exposure-anchor <v\|file>] [-denoise …]` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); `-ev` re-develops a `.ftbuf` brighter/darker, `-exposure-anchor` develops it at a **shared** gain so a whole sequence of checkpoints can be re-developed flicker-free, and the `-denoise` flags filter its chroma first. Any other flag is an error. See **Output** |
+| `-topng <in> <out.png> [-ev <c>] [-exposure-anchor <v\|file>] [-hdr] [-denoise …] [-oidn … [-oidn-guides <stem>]]` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); `-ev` re-develops a `.ftbuf` brighter/darker, `-exposure-anchor` develops it at a **shared** gain so a whole sequence of checkpoints can be re-developed flicker-free, `-hdr` writes the developed linear image as a PFM too, the `-denoise` flags filter its chroma first, and `-oidn` denoises it (with a render's saved guides via `-oidn-guides`; see **Learned denoising**). Any other flag is an error. See **Output** |
 | `-review <base>` | Play a directory of already-rendered frames (`<base><digits>.<ext>`, e.g. `png/swoop/swoop`) on the live window/timeline — scrub/Play, re-time by painting speed, and Save a re-paced copy (no rendering); see the fly-viewer section |
 | `-serve` | **Resident preview server.** With `-serve -in <scene.ftsl> [flags…]`, ftrace does *not* exit after one render: it keeps the process — and with it the live window, CUDA context, and spectral/spectral-upsampling tables — resident, and re-renders whenever a new scene path arrives on **stdin** (one path per line), reusing all the other flags (`-mode`/`-n`/`-r`/`-window`/`-o`/…) with only `-in` swapped per frame. Line protocol: prints `[serve] ready` once, then `[serve] done <path>` after each frame; `quit`/`exit`/EOF ends the loop (`[serve] shutdown`). This skips the per-frame cost of process spawn + window/CUDA/table init — the dominant fixed overhead for cheap preview frames — so an external driver (e.g. loom's `PreviewServer`) can stream an animation into a single window that updates in place. Scope: resident-process reuse only; each frame is still a full independent render (no delta/geometry caching yet) and the window keeps the first frame's resolution for the session. |
 | `-mode <A..D,J,M,S,U,P,R,V>` | Render mode (default `B`) |
@@ -6377,6 +6378,7 @@ alone can't restore, so they are not disk-resumable.
 | `-exposure-lock` | Share one auto-exposure anchor across all rendered cameras (no `camera_path` flicker); a per-path `exposure_lock [selector]` keyword instead locks just that path, metered from a chosen viewpoint (default the path `average`; also `first`/`index i`/`near x y z`/`camera "name"`). **Process-local** — it can only share an anchor between frames rendered by *this* invocation; for a frame-per-invocation sequence use `-exposure-anchor` |
 | `-exposure-anchor <v\|file>` | **Share one auto-exposure anchor across separate `ftrace` invocations** — the missing piece for a sequence whose frames are each rendered by their own process (loom's `render_range`, a batch script, a re-render of one frame). Implies `-exposure-lock`. With a **number** the anchor is used directly (no metering). With a **path**: if the file exists and holds a number that anchor is loaded and reused; otherwise this run meters normally and **writes** its resolved anchor there, so every later frame pointed at the same file develops at the identical gain. Also accepted by **`-topng`**, which is how a *finished* sequence is repaired from its `.ftbuf` checkpoints with no re-render (see **Output**). Without it, per-frame metering can jump — the p99 anchor solves `area(L) = 1%` for a level, and on a scene with a bright compact highlight population the tail density is so thin (~0.25% of frame per octave) that the inversion is ill-conditioned, so a rotating highlight swings the anchor by a third of an octave (measured on `pastel_jack_ring`: 36% single-frame anchor step while every honest brightness measure moved ≤ 2.3%). This is not fixable in the statistic — see the `exposure_lock` notes and `known-issues.md` |
 | `-hdr` | Also write a **32-bit float PFM** beside `-o` (`<out>.pfm`) holding the **scene-linear** image — the exact buffer the tone map consumes, with no exposure, no gamma and **no clamp**. Written on every periodic in-progress write too, so a still-converging render can be metered. Use it whenever you intend to *measure* rather than look: an 8-bit PNG clamps at white, and a caustic is by definition the brightest thing in frame, so its core prints as `#FFFFFF` with all three channels **equal** — the tone map destroys the caustic's colour and its peak-to-screen ratio before any analysis can see them. (Values are radiance in the film's own scale; peak/median ratios and chromaticity are exposure-invariant, so two renders shot at different stops stay comparable.) PFM is a 3-line ASCII header + raw little-endian `float32` RGB triples, raster order left-to-right **bottom-to-top**. **`-o out.pfm` is not a way to get one** — `.pfm` is not a recognised output extension, so that writes a tone-mapped 8-bit PPM under a `.pfm` name, which looks like a PFM to everything except a reader that checks the header. `-hdr` is the only way. Develop a rendered PFM sequence with `tools/grade_hdr.py`, which reproduces this table's own exposure and sRGB transfer exactly (verified pixel-identical to 1 level) and adds a keyframed EV ramp -- so a flythrough whose shots differ by several stops can be graded after the render instead of being locked to frame 0's anchor. **ftrace warns when you do it** (since 0.300.0) — the failure is otherwise silent and the file looks right, and it has already cost a measurement in this repo: an A/B scored on auto-exposed 8-bit, where the exposure normalises away the very mean-radiance difference being measured. |
+| `-oidn` (and `-oidn-noguides`, `-oidn-guide-spp <n>`, `-oidn-write-guides`, `-oidn-quality <q>`, `-oidn-device <d>`) | Denoise every written image and the live window with Intel Open Image Denoise, guided by albedo and normal images ftrace traces for each camera. Needs OIDN's DLLs (not bundled); see **Learned denoising (`-oidn`)** under **Output** |
 | `-exposure <c>` / `-ev <c>` | Override the exposure **compensation** for every rendered camera (a relative stop multiplied on top of the p99 auto-exposure; `1.0` = neutral), replacing the per-camera film `exposure`. Applies to both the real render and the `-raster` preview — handy when a scene's authored `exposure` (tuned for the physical integrator's bright highlights/caustics) blows out the flat-shaded raster. |
 | `-stereo <mode>` | **3-D stereoscopic output** (stills *and* movies). Renders each camera **twice** — a Left/Right eye pair — and composites them into the `-o` image. `mode` picks the fusion: `sbs` (side-by-side **wall-eyed**, L\|R), `cross` (side-by-side **cross-eyed**, R\|L), `anaglyph` (**red-cyan** Dubois glasses, the default kind), or `anaglyph-gm` (**green-magenta** Dubois). Uses the correct **off-axis** rig — two *parallel* cameras offset along the camera right axis with **asymmetric (sheared) frusta** sharing a convergence plane, so there's **no vertical parallax** (toe-in's eye-strain cause). Both eyes share one auto-exposure anchor, so L/R — and every frame of an exposure-locked `camera_path` — tone-map identically. Rectilinear cameras only (a fisheye camera renders mono, with a warning). See **Stereoscopic 3-D** below. |
 | `-eye-sep <m>` | Interocular (eye-to-eye) distance for `-stereo`, in metres. Default `0.063` (63 mm, average human). |
@@ -6722,3 +6724,64 @@ luma).
 | `-denoise-levels <n>` | à-trous levels, support 2ⁿ wide (default 3). Swept against the reference, the optimum is a plateau at 2–3, *not* SVGF's 5: with no luma term holding the edges a very wide chroma support bleeds gold into white and caustic into floor, and by 7 levels it is a net loss |
 | `-denoise-luma <x>` | **also** filter luma (default 0 = off). Measured, this makes the image *worse* — −2.4 dB at `0.45`, because the filter cannot tell a wire or a caustic rim from a noise spike. Available for stills you want *smoothed*, not *truer* |
 | `-fireflies <k>` | clamp isolated outliers to `k`× the 2nd-brightest neighbour, hue preserved. Deliberately not energy-preserving. Implies `-denoise`; try 2–4 |
+
+### Learned denoising (`-oidn`)
+
+`-oidn` runs [Intel Open Image Denoise](https://www.openimagedenoise.org/)'s `RT` filter on the
+linear image, at the same point as `-denoise`, so the PNG, the `-hdr` PFM and the live window all
+get it. Where `-denoise` deliberately touches only chroma, OIDN cleans **luma** too, which is what a
+low-sample frame needs: a flyby rendered at 64 spp rather than thousands.
+
+**It is guided.** Before each camera renders, ftrace traces an **albedo** and a **normal** image of
+it (16 stratified rays a pixel on the CPU, 0.6–2.8 s for a 960×540 `gallery_rain` frame), and OIDN
+uses them to tell a real edge — the floor grid, marble veining, a silhouette — from noise. A guide
+ray looks *through* clear glass, mirrors and gels to the first surface with a texture of its own,
+so the scene refracted in a glass orb keeps its edges too. The guides are deterministic, so OIDN is
+told they are clean and trusts them fully; normals are in world space, so a static surface's guide
+holds still across a flyby. Measured on `gallery_rain`'s frame 100 at 64 spp, scored in display
+space after a 4×4 downsample against an independent 484 spp render: luma error 4.41 raw, 3.85
+denoised without guides, **2.81 with them**.
+
+**The checkpoint keeps the raw film.** A `.ftbuf` written under `-oidn` is the un-denoised sum, so
+`-resume` adds samples and denoises the larger total afresh, and `-topng` can re-develop it:
+
+```
+ftrace -in scene.ftsl -camera fly -spp 64 -oidn -oidn-write-guides -checkpoint -o png/s/s.png
+    # frames land in png/s/s_fly/: s_fly0100.png, .png.ftbuf, .albedo.pfm, .normal.pfm, ...
+ftrace -topng png/s/s_fly/s_fly0100.png.ftbuf again.png -oidn -oidn-guides png/s/s_fly/s_fly0100
+```
+
+`-topng` has no camera to trace guides from, so it uses the ones `-oidn-write-guides` saved (or
+denoises the colour alone, and says so).
+
+**Installing it.** OIDN is not built into `ftrace.exe` (it is ~70 MB of DLLs, one device module
+per GPU vendor); the first denoise loads `OpenImageDenoise.dll` from, in order: `FTRACE_OIDN` (the
+DLL or its directory), the directory `ftrace.exe` is in, `<that>/oidn`, and
+`external/oidn/<release>/bin` in that directory or up to three above it. So unpacking a
+[release](https://github.com/RenderKit/oidn/releases) (the `x64.windows` zip) into `external/oidn/`
+of a checkout serves both the repo-root `ftrace.exe` and `build*/bin/ftrace.exe`. ftrace loads it
+before building the scene, so a machine without it stops at once, listing where it looked, rather
+than writing undenoised frames for hours. Without `-oidn` nothing is loaded. It runs on the GPU when
+OIDN supports it (about 10 ms a 960×540 frame on an RTX 4090), else on the CPU.
+
+| flag | meaning |
+|---|---|
+| `-oidn` | denoise every written image and the live window with OIDN, guided |
+| `-oidn-noguides` | denoise the colour alone (implies `-oidn`) |
+| `-oidn-guide-spp <n>` | guide rays per pixel, rounded to a square (default 16) |
+| `-oidn-write-guides` | also write each camera's guides beside `-o`: `<out>.albedo.pfm`, `<out>.normal.pfm` (normals in −1…1). Implies `-oidn` |
+| `-oidn-guides <stem>` | `-topng` only: develop with the guides in `<stem>.albedo.pfm` / `<stem>.normal.pfm` |
+| `-oidn-quality high\|balanced\|fast` | OIDN's quality mode (default `high`) |
+| `-oidn-device auto\|cpu\|cuda` | which OIDN device (default `auto`: the GPU if OIDN supports it) |
+
+Things to know:
+
+- **Modes A and C are denoised unguided.** Their film images through the finite lens, blurred out
+  of focus where a pinhole guide would be sharp. So is anything rendered outside a single camera's
+  pass: the exposure meter, and the shared multi-camera passes of the forward modes and mode `M`.
+- **OIDN clamps negative input to 0.** A single-wavelength sample often has a negative channel in
+  linear sRGB; on `gallery_rain` at 64 spp that is ~5 % of the absolute energy, and the denoised
+  frame's mean lands within ~1–2 % of the raw one.
+- **With `-denoise` as well**, the order is: firefly clamp, OIDN, chroma filter. The chroma filter
+  after OIDN tames single-wavelength streaks a learned denoiser keeps as detail (the coloured photon
+  beams of mode `J` at low samples); elsewhere it changes little.
