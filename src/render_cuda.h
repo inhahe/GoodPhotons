@@ -34,11 +34,18 @@ bool cudaMemInfo(size_t* freeB, size_t* totalB);
 
 // Bytes of device memory the megakernel for render `mode` reserves for per-thread LOCAL
 // storage alone, at the instantiation this render will launch (`maxDepth` / `heroC` select
-// the same BDPT variant renderBdptCuda does). This is real VRAM and it is often gigabytes.
-// If the card cannot hold it, the driver silently spills it to host RAM over PCIe and the
-// kernel runs 2-3 orders of magnitude slower at 100% reported utilisation — see the comment
-// on the definition. Returns 0 for "unknown" (no device, or a mode with no megakernel).
+// the same BDPT variant renderBdptCuda does): its local size times the threads the card
+// holds resident. This is real VRAM and it is often gigabytes, and the context keeps it
+// after the kernel returns, for the next launch to reuse. If the card cannot hold it, the
+// driver silently spills it to host RAM over PCIe and the kernel runs 2-3 orders of
+// magnitude slower at 100% reported utilisation — see the comment on the definition.
+// Returns 0 for "unknown" (no device, or a mode with no megakernel).
 size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC);
+
+// The local-memory reservation this process's context holds now: its per-thread stack limit
+// (which the driver raises to the largest kernel launched so far) times the threads the card
+// holds resident. A kernel launched later reuses it. 0 if unknown.
+size_t cudaLocalReservedBytes();
 
 // Orderly CUDA teardown: synchronize any outstanding device work, then destroy the
 // primary context (cudaDeviceReset) while the process is still in a clean, quiescent

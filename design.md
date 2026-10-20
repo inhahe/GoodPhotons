@@ -2208,6 +2208,18 @@ by the medium and takes the scalar merge kernel with the `DPathSeg` array on top
 the failure that matters (it is what lets a render start and then thrash on host memory over PCIe),
 so it reports the **larger** of the two.
 
+**The reservation is per RESIDENT thread, and the context keeps it (0.389.5).** The driver backs a
+kernel's local memory for every thread the card holds at once (SMs × max threads per SM: 196608
+on an RTX 4090), not for the 2048 × 128 launch grid, and keeps that reservation after the kernel
+returns. Both mattered. The estimate used the grid and over-reported by a third (15.2 GB against
+the 11.4 GB actually reserved), and the preflight counted the whole reservation as still needed,
+so frame 2 of every GPU mode-`J` flyby found 11.3 GB free against 11.4 GB "wanted", blamed "some
+other process", and every frame after the first rendered on the CPU. The estimate now uses
+resident threads, and the preflight subtracts what this process's context already holds —
+measured, not tracked: `cudaLocalReservedBytes` is the context's stack limit (which the driver
+raises to the largest kernel launched) times resident threads, 0.19 GB fresh and 11.40 GB after
+one mode-`J` frame, exactly the drop in free memory.
+
 **The bug the gates caught.** Gate 1a — mode `J` == mode `D` bit-for-bit on a media-free scene —
 failed on the first build, and not for any reason involving merges: mode `J` was passing `heroC = 1`
 to `renderBdptCuda` where mode `D` passes `g_heroC`, so mode `D` ran the hero-wavelength bundle and

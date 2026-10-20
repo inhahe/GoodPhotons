@@ -16908,22 +16908,31 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         const int hero = (mode == 'D' || mode == 'J') ? g_heroC : 1;
         const int mdep = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
         size_t needLocal = cudaMegakernelLocalBytes(mode, mdep, hero);
+        // The local reservation THIS process's context already holds, from whatever kernel of
+        // ours ran before (cudaLocalReservedBytes: measured, not tracked). The context keeps it
+        // after the kernel returns, so `freeB` below is already short of it -- and the next
+        // launch reuses it rather than reserving it again. Counting it as needed again is what
+        // sent every frame of a mode-J flyby after the first to the CPU: frame 1 left 11.4 GB
+        // reserved, frame 2 saw 11.3 GB free against 11.4 GB "wanted", and blamed "some other
+        // process".
+        const size_t reused = std::min(needLocal, cudaLocalReservedBytes());
         size_t freeB = 0, totalB = 0;
         if (cudaMemInfo(&freeB, &totalB)) {
             // Headroom on top of the local-memory reservation for the scene upload, the
             // film buffers and the driver's own context. The film pair is known exactly
             // (two double3 images); 256 MB covers the rest with room to spare.
             const size_t film   = (size_t)res * resY * 3 * sizeof(double) * 2;
-            const size_t needAll = needLocal + film + (size_t)256 * 1024 * 1024;
+            const size_t needAll = needLocal - reused + film + (size_t)256 * 1024 * 1024;
             const double toGB = 1.0 / (1024.0 * 1024.0 * 1024.0);
             // Always say what the card looks like. This one line is what turns "the render
             // is mysteriously hung" into "something else is holding 20 of my 24 GB", which
             // is otherwise only visible from outside the process (nvidia-smi reports it as
             // 100% busy either way, and per-process VRAM is N/A under WDDM).
             std::printf("[vram] %.2f GB free of %.2f GB on %s; mode-%c kernel wants "
-                        "%.2f GB local + %.2f GB film/scene/context\n",
+                        "%.2f GB local (%.2f GB of it already reserved by this process) + "
+                        "%.2f GB film/scene/context\n",
                         freeB * toGB, totalB * toGB, cudaDeviceName(), mode,
-                        needLocal * toGB, (needAll - needLocal) * toGB);
+                        needLocal * toGB, reused * toGB, (needAll - (needLocal - reused)) * toGB);
             // Fall back on either signal: the explicit budget, or a card so nearly full
             // that whatever we failed to account for will certainly not fit.
             //
@@ -16934,19 +16943,23 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // NOT tripping as meaningless. The reliable detector is the runtime one:
             // gpuSppChunks' stall watchdog, which measures the chunk that is actually in
             // flight and can therefore see contention this query is blind to.
+            // Both tests count our own reservation as ours: `needAll` leaves out what is
+            // reused, and the near-full test adds it back to what is free.
             const bool tooTight = freeB < needAll;
-            const bool nearFull = totalB && (double)freeB < 0.12 * (double)totalB;
+            const bool nearFull = totalB && (double)(freeB + reused) < 0.12 * (double)totalB;
             if (tooTight || nearFull) {
                 std::fprintf(stderr,
                     "[device] NOT ENOUGH FREE VRAM for the GPU path (%s): the mode-%c "
-                    "megakernel reserves %.2f GB of per-thread local memory (+%.2f GB "
-                    "film/scene/context) but only %.2f GB of %.2f GB is free on %s.\n"
+                    "megakernel reserves %.2f GB of per-thread local memory (%.2f GB of it "
+                    "already this process's, +%.2f GB film/scene/context) but only %.2f GB of "
+                    "%.2f GB is free on %s.\n"
                     "[device] Some other process on this machine is holding the card. Running "
                     "on the GPU anyway would spill that local memory to host RAM over PCIe and "
                     "render 100-1000x slower at 100%% reported GPU load, with -interval, -time "
                     "and -stop all inert. Using the CPU instead (-device gpu forces the GPU).\n",
                     tooTight ? "over budget" : "card is >88% full",
-                    mode, needLocal * toGB, (needAll - needLocal) * toGB,
+                    mode, needLocal * toGB, reused * toGB,
+                    (needAll - (needLocal - reused)) * toGB,
                     freeB * toGB, totalB * toGB, cudaDeviceName());
                 if (!wantGpu) useGpu = false;      // `auto`: fall back, which is the whole point
                 else std::fprintf(stderr, "[device] -device gpu given explicitly; proceeding "

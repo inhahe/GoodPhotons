@@ -23030,10 +23030,15 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
 // ------------------------- device-memory preflight ---------------------------
 //
 // WHY THIS EXISTS: a megakernel's per-thread LOCAL memory is real device memory. The BDPT
-// kernel carries its path vertices in thread-local arrays, so the fixed 2048 x 128 grid
-// every megakernel here launches with (MEGAKERNEL_THREADS below) reserves
-// `localSizeBytes * 262144` bytes of backing store before it traces a single sample — on
-// this project that is GIGABYTES, not megabytes.
+// kernel carries its path vertices in thread-local arrays, and the driver backs them for
+// every thread the card can hold RESIDENT at once (residentThreads below) before the kernel
+// traces a single sample — on this project that is GIGABYTES, not megabytes. Resident, not
+// the 2048 x 128 launch grid: the grid's 262144 threads run in waves of the card's resident
+// capacity (196608 on an RTX 4090: 128 SMs x 1536), and the measured reservation is exactly
+// localSizeBytes x 196608 (11.43 GB for gallery_rain's mode-J kernel at 62.4 KB a thread,
+// where x 262144 had predicted 15.2). The context then KEEPS that reservation after the
+// kernel returns, which is what the caller's preflight has to know (main.cpp, runRender):
+// a second frame finds the card that much emptier, and the memory is its own.
 //
 // When another process has filled the card, that allocation does NOT fail. The WDDM driver
 // backs the spill with host memory across PCIe and the kernel simply CRAWLS — measured at
@@ -23048,7 +23053,31 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
 //
 // So: ask the driver what the kernel actually reserves, ask the card what is actually free,
 // and let the caller refuse the GPU with a real explanation instead of thrashing silently.
-#define MEGAKERNEL_THREADS ((size_t)2048 * 128)
+
+// Threads the current device holds resident at once: what the driver sizes a kernel's local
+// memory for. 0 if the device cannot be queried.
+static size_t residentThreads() {
+    static const size_t n = [] {
+        int dev = 0;
+        cudaDeviceProp p{};
+        if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return (size_t)0;
+        }
+        return (size_t)p.multiProcessorCount * (size_t)p.maxThreadsPerMultiProcessor;
+    }();
+    return n;
+}
+
+size_t cudaLocalReservedBytes() {
+    if (!cudaAvailable()) return 0;
+    size_t perThread = 0;
+    if (cudaDeviceGetLimit(&perThread, cudaLimitStackSize) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+    return perThread * residentThreads();
+}
 
 bool cudaMemInfo(size_t* freeB, size_t* totalB) {
     if (!cudaAvailable()) return false;
@@ -23104,7 +23133,7 @@ size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
     cudaFuncAttributes fa{};
     if (cudaFuncGetAttributes(&fa, fn) != cudaSuccess) return 0;
     cudaGetLastError();                       // don't leave a sticky error for the next launch
-    return (size_t)fa.localSizeBytes * MEGAKERNEL_THREADS;
+    return (size_t)fa.localSizeBytes * residentThreads();
 }
 
 // --------------------- backward reference (mode R) host ----------------------
