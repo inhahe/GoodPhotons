@@ -16602,7 +16602,9 @@ static void prepareSunAim(const Scene& scene) {
         cxyz.push_back(bdpt::g_sunAim.c[j].z);
         rr.push_back(bdpt::g_sunAim.r[j]);
     }
+#ifdef HAVE_CUDA
     cudaSetSunAim(cxyz.data(), rr.data(), (int)rr.size(), bdpt::g_sunAim.sumR2, bdpt::g_sunAim.f);
+#endif
 }
 
 static int runRender(const Scene& scene, const Camera& cam, char mode,
@@ -16669,7 +16671,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         const double sD = on ? g_modeSppD : 1.0, sJ = on ? g_modeSppJ : 1.0;
         bdpt::g_routeOn = on; bdpt::g_routeDefault = def; bdpt::g_routeAnyMedJ = anyMedJ;
         bdpt::g_routeSppD = sD; bdpt::g_routeSppJ = sJ;
+#ifdef HAVE_CUDA
         cudaSetRouting(on, def, anyMedJ, sD, sJ);
+#endif
     }
     // The aimed sun (bdpt.h SunAim): settled before the first BDPT-family light subpath.
     if (mode == 'D' || mode == 'J' || mode == 'U') prepareSunAim(scene);
@@ -20349,10 +20353,16 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-jdispwin") && i + 1 < argc) {
             const double v = std::atof(argv[++i]);
             if (!(v > 0.0)) { std::fprintf(stderr, "-jdispwin wants a width in nm > 0, got '%s'\n", argv[i]); return 1; }
-            ::g_jDispWinNm = v; cudaSetJDisp(::g_jDispWinNm, ::g_jDispAll ? 1 : 0);
+            ::g_jDispWinNm = v;
+#ifdef HAVE_CUDA
+            cudaSetJDisp(::g_jDispWinNm, ::g_jDispAll ? 1 : 0);
+#endif
         }
         else if (!std::strcmp(argv[i], "-jdispall")) {
-            ::g_jDispAll = true; cudaSetJDisp(::g_jDispWinNm, 1);
+            ::g_jDispAll = true;
+#ifdef HAVE_CUDA
+            cudaSetJDisp(::g_jDispWinNm, 1);
+#endif
         }
         else if (!std::strcmp(argv[i], "-mode-spp") && i + 1 < argc) {
             // D=<x>,J=<y> (either or both, each > 0): see FTSL.md 16.1.

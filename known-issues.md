@@ -89,6 +89,18 @@ Two causes, both fixed (design.md, "Mode `J`'s camera pass, 2.6x faster"):
 Final: 0.385.0 130–134 s, 0.386.0 49–52 s for 32 spp (2.6x), against mode D's 19.6–21.4 s.
 `_fog_cornell` (homogeneous fog, dense hits, none of this helps) is ~4 % slower (7.1 s against
 6.8 s for 16 spp at 96²); see the design note for what was ruled out.
+## OPEN (2026-10-20): CPU-ONLY-BUILD — a build without CUDA does not compile
+
+`build_cpu` (`scraps/build_cpu.bat`, configured with an empty `CMAKE_CUDA_COMPILER`, kept so CPU
+work can build while a render holds `build_cuda*/bin/ftrace.exe`) fails in `main.cpp`: code outside
+`#ifdef HAVE_CUDA` names device-only things — `PatOpProbeIn` (main.cpp ~2808, the pattern-op
+probe), `raster_cuda` / `gpuRaster` (the GPU preview rasterizer), `NdResident` / `ndRes` /
+`keepDegen` (the resident `-nd` warp). The compiler stops there, so there may be more behind them.
+Four `cuda*` setter calls were guarded on 2026-10-20 (`cudaSetRouting`, `cudaSetSunAim`, two
+`cudaSetJDisp`); those are the ones a grep for unguarded `cuda[A-Z]\w*(` finds, and the rest are
+types and helpers. **Fix:** guard each, or give `render_cuda.h` / `raster_cuda.h` CPU stubs, and
+build `build_cpu` after any change that touches the device boundary.
+
 
 ## OPEN (2026-10-18): PER-OBJECT-MODES — what per-object render modes do not do yet
 
