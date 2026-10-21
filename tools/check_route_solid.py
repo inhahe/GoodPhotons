@@ -11,7 +11,7 @@ check wants the frame means equal to 0.1 %. Before 0.391.5 the tagged cube read 
 
 Usage::
 
-    python tools/check_route_solid.py [--out DIR] [--exe EXE] [--device gpu|cpu]
+    python tools/check_route_solid.py [--out DIR] [--exe EXE] [--device gpu|cpu|both]
 
 Exit status is non-zero if any channel differs by more than the tolerance.
 """
@@ -54,11 +54,12 @@ def main():
     ap.add_argument("--out", default=os.path.join(_REPO, "png", "check_route_solid"))
     ap.add_argument("--exe", default=_FTRACE)
     ap.add_argument("--tol", type=float, default=0.1, help="per-channel tolerance, %%")
+    ap.add_argument("--device", choices=("gpu", "cpu", "both"), default="both")
     a = ap.parse_args()
     a.exe = os.path.abspath(a.exe)
     os.makedirs(a.out, exist_ok=True)
     bad = 0
-    for device in ("gpu", "cpu"):
+    for device in (("gpu", "cpu") if a.device == "both" else (a.device,)):
         ref = render(a.exe, "_route_solid_ref.ftsl", device, os.path.join(a.out, "ref_%s.png" % device),
                      os.path.join(a.out, "ref_%s.log" % device))
         tag = render(a.exe, "_route_solid.ftsl", device, os.path.join(a.out, "tagged_%s.png" % device),

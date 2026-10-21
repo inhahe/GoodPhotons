@@ -139,6 +139,89 @@ sample index crosses a fixed block boundary (split a chunk at the boundaries it 
 light side's epochs already are under `-beamepochs`. Then the chunker can keep adapting and the
 pin and its global switch go. (Both reviewers of 0.391.0 suggested this or a fixed chunk size.)
 
+## DONE (2026-10-21, 0.391.6): REVIEW-03915 — what the Opus review of 0.391.5 found
+
+Opus (xhigh) reviewed 322249f..9cd5c76, the follow-ups to REVIEW-0391. Fixed:
+
+* **The MIS audit was not given 0.391.5's `sunMiss` rule.** `misWeightReference` still counted
+  the camera-side strategies of a sun's NEE to a point no sun subpath can reach, so `-misaudit`
+  failed on correct code: on `_sun_haze` (mode D, CPU) 153 029 of 1.1 M weights disagreed, worst
+  relative difference 1.0. It now refuses those strategies and the merges there: 0 disagree, worst
+  4e-14.
+* **`Material::absorbChroma` asked only at the carriers' 24 bin centres,** so a glass absorbing
+  between two of them read as flat and kept the light walk's spectral claim. It is a 1 nm scan
+  now (`variesOverBand` takes the bin count). New gate `tools/check_glass_claim.py` (CPU; the
+  device's beam map makes no claim): mode M with its spectral claims against mode M with neither
+  (`-beamachro off -beamspec 1`) on `scenes/_glass_claim.ftsl`, a glass that absorbs the red half
+  of the band except at the red probe wavelengths. 0.391.5 reads R/G/B 2.88 / 0.65 / 0.66 of the
+  claim-free render there (the fog painted white), 0.391.6 0.999 / 0.999 / 1.001.
+* **Two of 0.391.5's fixes had no gate that failed without them.** The glass claim has the one
+  above. The disc foreshortening moved `_sun_rim` by under 2 %, inside its 3 % tolerance, so
+  `check_sun_rim.py` gained `scenes/_sun_slab.ftsl`: a floor a 60 deg sun lights only through a
+  glass slab, where NEE cannot connect and light tracing carries the image. Modes D and U read
+  1.073 and 1.074 of R there in 0.391.2 (the cone's mean 1/cos is 1.072) and 1.000 and 1.000 now
+  on the CPU; on the GPU 1.073 and 1.071, now 1.002 and 1.005.
+* **The size tripwires could not see a field added into padding,** and did not check the device
+  twins. `BeamMis` and `SurfMis` (and `DSurfMis`) now carry their padding as named fields, and
+  `DBeamMis` / `DSurfMis` are asserted too.
+* **Stale comments** that still called the sun's density the disc's planar one, without the w.n
+  (`vertexPdfLight`, `dVertexPdfLightF`, the light-subpath headers, `BeamMis::pdfPlanar`, mode
+  U's NEE); a comment narrating J-GPU-ETAPREVS's history.
+* **`SpecThr::K`, `DSpecThr::K` and `DJSPEC_K` were separate literal 24s:** tied to
+  `kBandProbeBins`, the device one by a `static_assert`.
+* **The `-no-modes` note and the "tags are ignored" warning still printed once per process:** once
+  per scene, like the rest of that block.
+* `dDielectricStep`'s unused `mi` parameter is gone; the design.md text on the claim names
+  `absorbChroma`; the rim check's haze ran whatever `--arms` said and now obeys it (and
+  `check_route_solid.py` gained the `--device` flag its usage line already advertised).
+
+Logged rather than fixed: the general form of the `sunMiss` rule (REMAP0-IMPOSSIBLE, below).
+
+## OPEN (2026-10-21): DEVICE-SPECTRAL-GRID — the GPU reads every material spectrum off a 4.9 nm grid, so features narrower than that render differently on the two backends
+
+`buildUploadScene` bakes each material spectrum (`bakeSpec`: reflectance, transmittance,
+absorption, emission, ...) into `SPEC_N` = 96 entries over 360-830 nm, 4.9 nm apart, linearly
+interpolated. The host evaluates the spectrum itself. A feature narrower than the grid -- a
+notch or window a few nm wide, an emission line -- is sampled wherever the grid points happen to
+fall: smeared, shifted, or missed outright. Measured on `scenes/_glass_claim.ftsl`, whose glass
+absorbs the red half of the band except in 3-5 nm windows with 1 nm ramps: the fog's red channel
+reads 4.40e10 in mode R on the CPU and 1.25e10 on the GPU (mode M: 4.20e10 / 1.27e10); green
+and blue agree to 1 %. The GPU's grid lands mostly on the absorbing shoulders and shuts the
+windows: without them its red moves only from 1.25e10 to 1.23e10, the CPU's from 4.40e10 to
+1.67e10. The 36 % left is the edge itself. The authored step at 594-596 nm becomes a ramp between
+the grid points at 592.5 and 597.5, which moves the half-transmission point ~2 nm bluewards, and
+the red of a blue-green light is a small difference of large X, Y, Z terms, so 2 nm at 594 nm
+moves it a lot. With the step put on those two grid points the two read 1.20e10 / 1.12e10, and
+with clear glass 1.780e11 / 1.783e11. (design.md has long called the grid acceptable for smooth
+spectra, which it is: measured reflectances and Sellmeier indices sit well within noise.)
+
+**Proper fix:** store a `table` spectrum's own knots on the device (sorted wavelengths and values,
+a binary search per lookup) so a tabulated spectrum is exact on both backends, and bake only
+analytic spectra; or a 1 nm grid (471 entries) for the tables, if the per-material memory
+(several tables of 3.8 KB each) and the cache cost measure acceptably. Either needs a gate: this
+scene in mode R, CPU against GPU, per channel.
+
+## OPEN (2026-10-21): REMAP0-IMPOSSIBLE — the MIS sums read a zero density as a delta's, whatever made it zero
+
+`misWeight`'s `remap0` (bdpt.h; `dMisWeight` and the merge weights' first steps likewise) turns
+every zero density into 1. That is right where the zero comes from a delta neighbour, whose density
+cancels, and wrong where it means the strategy cannot happen: then the sum still counts strategies
+that never fire, and the estimator that does fire is weighted down. The only such zero known today
+is a sun's origin density at a point no sun subpath can reach. 0.391.5 special-cased it (`sunMiss`,
+in `misWeight`, `dMisWeight` and, since 0.391.6, `misWeightReference`), which cured the haze
+(REVIEW-0391); any new way to make a non-delta vertex's reverse density 0 (an emitter whose origin
+density has holes, a BSDF whose sampling support is narrower than its value's) would need its own
+case on three code paths.
+
+**The proper fix** (the Opus review of 0.391.5): in the camera loop, stop accumulating at the first
+vertex whose `pdfRev` is 0 while its light-side neighbour (eye[i+1], or the connection vertex for
+pt) is not delta, and likewise in the light loop; `sunMiss` then goes. Host `misWeight`,
+`misWeightReference` (its log sums), `dMisWeight`, and the first steps of the beam and surface merge
+weights all need the same rule. It moves no pixel in any scene measured so far, since the sun is the
+only source of such zeros, so it is robustness, not a bias fix. Validate with `-misaudit` on the
+standard scenes, `check_sun_rim.py` (all arms) and a D-against-R sweep on both backends, once the
+GPU is free (the `gallery_rain` flyby holds it as of this writing).
+
 ## DONE (2026-10-21, 0.391.5): REVIEW-0391 — what the Opus review of 0.391.3-0.391.4 found
 
 Opus (xhigh) reviewed 3921bc9..322249f, the follow-ups to REVIEW-0388 and J-GPU-ETAPREVS. Fixed:

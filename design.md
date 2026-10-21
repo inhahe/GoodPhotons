@@ -696,8 +696,10 @@ Four consequences worth knowing:
   - Implementation: `PathSeg` carries `achro` (the per-segment half of the claim), the subpath
     carries one `BeamSpectral` (the per-emitter half), and `randomWalk` runs the same
     survives-an-achromatic-scatter rule `Renderer::tracePhoton` runs (since 0.257.0: cleared by a
-    wavelength-*divergent* surface event, by glass absorption, and by a scatter in a chromatic
-    medium — but **not** by a diffuse bounce, which is folded into `foldT`/`beamW` instead, and
+    wavelength-*divergent* surface event, by glass absorption -- and since 0.391.5 inside any glass
+    whose absorption varies over the band, even where it is clear at the walk's own wavelength
+    (`Material::absorbChroma`, a 1 nm scan `Scene::build()` bakes with `variesOverBand`) -- and by a
+    scatter in a chromatic medium — but **not** by a diffuse bounce, which is folded into `foldT`/`beamW` instead, and
     **not** by a scatter in an achromatic medium, which is what lets it ride the cloud's ~278
     bounces). `PathSeg` carries the resulting `fCie` and `fW[]` per segment. The rule tests the
     medium the walk is scattering *in*, not the media the segment *crosses*, which is precisely
@@ -2559,10 +2561,10 @@ red got past the cap that had stopped λ_c and read 1.3 % high around blond fur.
 by far less. They keep the ratio re-expression and the λ_c direction, a sub-pixel chromatic blur,
 unless `-jdispall` opens the window for them as well.
 
-**Still not re-expressed:** the camera-side glass absorption *inside* the gather (`aGlassCam`, read
-at λ_c over the beam's closest-approach distance), and the support of a factor that is zero at
-λ_c. Mode M's own beam gather still multiplies by the scalar `thr`: its specular-chain carrier
-reaches its photons but not its beams. All of these are listed in known-issues.md, JSPEC-GAPS.
+**Still not re-expressed:** the support of a factor that is zero at λ_c (known-issues.md,
+JSPEC-GAPS). The camera-side glass absorption on the gather's own partial segment is, since 0.391.3,
+taken at the beam's wavelength (`PathSeg::glassMat`). Mode M's beam gather still multiplies by the
+scalar `thr`: its specular-chain carrier reaches its photons but not its beams (MODEM-BEAM-CARRIER).
 
 **Measured** (`_fog_cornell`, `-max-bounce 8 -beamcount 1e5 -beamk 2 -nojsurf -beamsinmin 0`, CPU,
 J 1024 spp against D 4096 spp, 64²). Before: J/D −2.30 %, by block 0.86–1.10, R/G/B 0.958 / 0.979
@@ -2629,7 +2631,8 @@ under a 30 deg sun in mode D before 0.391.3; `tools/check_sun_rim.py`). One `sam
 `sunOriginPdf` is per unit area of the DISC; a ray tilted from the beam by its own direction w crosses
 disc area dA with cross-section dA (w.n), so the density every strategy reads -- the walk's `pdfPos`,
 `sunOriginPdfAlong`, `BeamMis::pdfPlanar` -- is that over w.n (1/cos bright in light tracing before
-0.391.5: 1.7 % under a 30 deg sun, nothing under the real 0.53 deg one). A point no sun subpath can
+0.391.5: +7 % on a floor a 60 deg sun lights only through glass, `scenes/_sun_slab.ftsl`, where
+light tracing carries the image; nothing under the real 0.53 deg sun). A point no sun subpath can
 reach -- upstream of the disc plane, or off the disc and every target, as in an unbounded haze
 outside the bounding sphere -- reads 0, and `misWeight` / `dMisWeight` drop the camera-side
 alternatives of a sun's NEE there (`sunMiss`) instead of reading that 0 as a delta's. A share `f` (default

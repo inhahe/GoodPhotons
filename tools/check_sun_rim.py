@@ -19,6 +19,14 @@ cannot reach it, so the sun's NEE must not share its weight with it there (bdpt.
 `sunMiss`): mode D read that haze at 0.215 of mode R before 0.391.5. Whole frame, mode D on both
 backends against mode R.
 
+The third, scenes/_sun_slab.ftsl, tests the disc's foreshortening: a ray tilted by w from the beam
+crosses disc area dA with cross-section dA (w.n), and without that factor (before 0.391.5) light
+tracing read every tilted ray 1/(w.n) bright. Under the rim scene's sun NEE carries most of the
+floor and hides it (1.000-1.005 of R before), so here a 60 deg sun lights a floor only through a
+glass slab, where NEE cannot connect and the light subpaths carry the image: modes D and U read
+1.071 and 1.073 of R there before (the cone's mean 1/cos is 1.072), 0.995-1.000 after. Whole
+frame, modes D and U on both backends, against mode R.
+
 Usage::
 
     python tools/check_sun_rim.py [--spp N] [--tol PCT] [--out DIR] [--arms D-gpu,U-cpu,...] [--exe EXE]
@@ -39,6 +47,7 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _FTRACE = os.path.join(_REPO, "ftrace.exe")
 _SCENE = os.path.join(_REPO, "scenes", "_sun_rim.ftsl")
 _HAZE = os.path.join(_REPO, "scenes", "_sun_haze.ftsl")
+_SLAB = os.path.join(_REPO, "scenes", "_sun_slab.ftsl")
 
 # name -> (mode, extra flags, spp scale). The CPU arms take fewer samples: they are slower, and
 # the tolerance is far wider than their noise.
@@ -48,6 +57,18 @@ _ARMS = {
     "D-cpu":       ("D", ["-device", "cpu"], 0.25),
     "U-gpu":       ("U", ["-device", "gpu"], 1.0),
     "U-cpu":       ("U", ["-device", "cpu"], 0.25),
+}
+
+# The whole-frame arms: name -> (scene, mode, flags, spp scale), each against its scene's mode-R
+# frame, rendered once at 4x the spp. The slab's CPU arms keep the full count: its 96x96 frame is
+# cheap, and light tracing alone is noisier than the rim's NEE (0.4 % between seeds at 256 spp).
+_FRAME_ARMS = {
+    "haze-D-gpu": (_HAZE, "D", ["-device", "gpu"], 1.0),
+    "haze-D-cpu": (_HAZE, "D", ["-device", "cpu"], 0.25),
+    "slab-D-gpu": (_SLAB, "D", ["-device", "gpu"], 1.0),
+    "slab-D-cpu": (_SLAB, "D", ["-device", "cpu"], 1.0),
+    "slab-U-gpu": (_SLAB, "U", ["-device", "gpu"], 1.0),
+    "slab-U-cpu": (_SLAB, "U", ["-device", "cpu"], 1.0),
 }
 
 _PATCH = 28   # pixels a side, at the scene's 320x320
@@ -92,18 +113,25 @@ def main():
     ap.add_argument("--spp", type=int, default=256)
     ap.add_argument("--tol", type=float, default=3.0, help="per-patch tolerance against mode R, %%")
     ap.add_argument("--out", default=os.path.join(_REPO, "png", "check_sun_rim"))
-    ap.add_argument("--arms", default=",".join(_ARMS), help="comma-separated: " + ", ".join(_ARMS))
+    every = list(_ARMS) + list(_FRAME_ARMS)
+    ap.add_argument("--arms", default=",".join(every), help="comma-separated: " + ", ".join(every))
     ap.add_argument("--exe", default=_FTRACE, help="the binary under test (the reference too)")
     a = ap.parse_args()
     a.exe = os.path.abspath(a.exe)   # CreateProcess resolves a relative path with / poorly
     os.makedirs(a.out, exist_ok=True)
 
-    ref = render(a.exe, "R", [], a.spp, os.path.join(a.out, "R.png"), os.path.join(a.out, "R.log"))
-    where = patches(ref.w, ref.h)
-    refm = {k: patch_mean(ref, x, y, _PATCH) for k, (x, y) in where.items()}
-
+    arms = a.arms.split(",")
+    for name in arms:
+        if name not in _ARMS and name not in _FRAME_ARMS:
+            ap.error("unknown arm %r" % name)
+    rim = [n for n in arms if n in _ARMS]
+    frame = [n for n in arms if n in _FRAME_ARMS]
     bad = 0
-    for name in a.arms.split(","):
+    if rim:
+        ref = render(a.exe, "R", [], a.spp, os.path.join(a.out, "R.png"), os.path.join(a.out, "R.log"))
+        where = patches(ref.w, ref.h)
+        refm = {k: patch_mean(ref, x, y, _PATCH) for k, (x, y) in where.items()}
+    for name in rim:
         mode, flags, scale = _ARMS[name]
         spp = max(16, int(a.spp * scale))
         img = render(a.exe, mode, flags, spp, os.path.join(a.out, name + ".png"),
@@ -115,15 +143,17 @@ def main():
             bad += miss
             cells.append("%s %.3f%s" % (k, ratio, " FAIL" if miss else ""))
         print("%-12s %s" % (name, "  ".join(cells)))
-    # The haze: the frame's mean, every channel.
-    href = render(a.exe, "R", [], a.spp * 4, os.path.join(a.out, "haze_R.png"),
-                  os.path.join(a.out, "haze_R.log"), _HAZE)
-    hm = frame_mean(href)
-    for name, flags, spp in (("haze D-gpu", ["-device", "gpu"], a.spp),
-                             ("haze D-cpu", ["-device", "cpu"], max(16, a.spp // 4))):
-        img = render(a.exe, "D", flags, spp, os.path.join(a.out, name.replace(" ", "_") + ".png"),
-                     os.path.join(a.out, name.replace(" ", "_") + ".log"), _HAZE)
-        ratio = frame_mean(img) / hm
+    # The whole-frame scenes: the frame's mean, every channel.
+    refs = {}
+    for name in frame:
+        scene, mode, flags, scale = _FRAME_ARMS[name]
+        if scene not in refs:
+            tag = os.path.splitext(os.path.basename(scene))[0].lstrip("_")
+            refs[scene] = frame_mean(render(a.exe, "R", [], a.spp * 4, os.path.join(a.out, tag + "_R.png"),
+                                            os.path.join(a.out, tag + "_R.log"), scene))
+        img = render(a.exe, mode, flags, max(16, int(a.spp * scale)), os.path.join(a.out, name + ".png"),
+                     os.path.join(a.out, name + ".log"), scene)
+        ratio = frame_mean(img) / refs[scene]
         miss = abs(ratio - 1.0) * 100.0 > a.tol
         bad += miss
         print("%-12s frame %.3f%s" % (name, ratio, " FAIL" if miss else ""))

@@ -1,0 +1,24 @@
+# A glass that the carriers' 24 probe wavelengths see as clear (tools/check_glass_claim.py).
+#
+# It absorbs everything above ~595 nm except narrow windows exactly at the red probe wavelengths
+# (JSpec::lamOf / kBandProbeBins), so a probe at those 24 wavelengths reads 0 everywhere, while the
+# light it really passes is the blue half of the band. A light walk's spectral claim must not cross
+# it: a claimed walk folds to the emitter's full colour, painting the blue light white. Material::
+# absorbChroma scans at 1 nm (0.391.6); before, at the 24 probes, and called this glass flat.
+# Mode M with its spectral claims (the defaults) and with neither (-beamachro off -beamspec 1) must agree.
+
+scene { units meters  spectral 360 830 1 }
+
+material "grey" { type diffuse reflect 0.5 }
+material "bluepass" { type dielectric ior 1.0001  absorb table { 360:0 594:0 596:8 602.292:8 603.292:0 606.292:0 607.292:8 621.875:8 622.875:0 625.875:0 626.875:8 641.458:8 642.458:0 645.458:0 646.458:8 661.042:8 662.042:0 665.042:0 666.042:8 680.625:8 681.625:0 684.625:0 685.625:8 700.208:8 701.208:0 704.208:0 705.208:8 719.792:8 720.792:0 723.792:0 724.792:8 739.375:8 740.375:0 743.375:0 744.375:8 758.958:8 759.958:0 762.958:0 763.958:8 778.542:8 779.542:0 782.542:0 783.542:8 798.125:8 799.125:0 802.125:0 803.125:8 817.708:8 818.708:0 821.708:0 822.708:8 830:8 } }
+
+quad { origin -3 0 -3  u 0 0 6  v 6 0 0  material grey }
+sphere { center 0 2.0 0  radius 0.7  material bluepass }
+medium { sigma_t 3.0  albedo 0.9  g 0.0  bounds { min -0.5 0.05 -0.5  max 0.5 1.0 0.5 } }
+light sphere { center 0 3.2 0  radius 0.35  spd preset:bb6500 }
+
+camera "cam" {
+    eye 2.6 0.6 2.6   look_at 0 0.55 0   up 0 1 0   fov_y 30
+    mode M
+    film { res 200 160 }
+}

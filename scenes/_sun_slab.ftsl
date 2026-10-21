@@ -1,0 +1,48 @@
+# A floor lit by a wide sun only THROUGH a glass slab (tools/check_sun_rim.py, the slab arms).
+#
+# A sun light subpath starts on a disc perpendicular to the beam; a ray tilted by w from the beam
+# crosses disc area dA with cross-section dA (w.n), so every ray-space density of the subpath is the
+# disc's over w.n. Without that factor light tracing reads each tilted ray 1/(w.n) bright. Under
+# the real 0.53 deg sun that is nothing, so the sun here is 60 deg across, overhead, and every
+# direction of it that reaches the floor in view crosses the slab: NEE cannot connect through the
+# glass, and the light-subpath strategies carry nearly the whole image. The camera sits between
+# floor and slab looking straight down, so the frame is that floor and nothing else.
+#
+# Mode R reaches the sun by BSDF sampling through the glass and never draws a sun origin: it is the
+# reference.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "grey"  { type diffuse reflect 0.5 }
+material "glass" { type dielectric ior 1.5 }
+
+# The floor is the slab's footprint and no larger: the sun's origin disc spans the bounding sphere,
+# and the smaller it is, the more light subpaths land in view.
+quad { origin -1.5 0 -1.5   u 0 0 3   v 3 0 0   material grey }
+
+# The slab: 3 m square, 5 cm thick, 1 m up; outward normals (u x v) on every face.
+quad { origin -1.5 1 -1.5      u 3 0 0      v 0 0 3      material glass }   # bottom, -y
+quad { origin -1.5 1.05 -1.5   u 0 0 3      v 3 0 0      material glass }   # top, +y
+quad { origin -1.5 1 1.5       u 3 0 0      v 0 0.05 0   material glass }   # front, +z
+quad { origin -1.5 1 -1.5      u 0 0.05 0   v 3 0 0      material glass }   # back, -z
+quad { origin 1.5 1 -1.5       u 0 0.05 0   v 0 0 3      material glass }   # right, +x
+quad { origin -1.5 1 -1.5      u 0 0 3      v 0 0.05 0   material glass }   # left, -x
+
+light sun {
+    elevation 90   azimuth 0
+    angle     60
+    spd       preset:bb5800
+    intensity 3
+}
+
+# 0.6 m up with a 90 deg field: the frame spans 1.2 m of floor, its corners 0.85 m from the centre,
+# so every point of it is more than the 0.61 m a ray 30 deg off vertical drifts before it clears the
+# glass inside the slab's edge.
+camera "cam" {
+    eye 0 0.6 0   look_at 0 0 0   up 0 0 -1   fov_y 90
+    mode D
+    film { res 96 96 }
+}

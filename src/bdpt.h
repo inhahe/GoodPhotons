@@ -550,9 +550,9 @@ inline double sunOriginPdfAlong(const Scene& scene, const Emitter& em, const Vec
 //                           density), pdfW = 1/(2 PI (1 - cosOuter)), same conversion.
 //   Sun (infinite)        - no finite emission point: the subpath origin is a point on a
 //                           disc outside the scene (sampleSunOrigin), so the density of
-//                           `next` is the PLANAR density sunOriginPdf with NO 1/dist^2
-//                           (the disc-point -> hit-point map is a shear along the beam,
-//                           whose Jacobian is exactly the cos(next) below).
+//                           `next` is PLANAR, with NO 1/dist^2: sunOriginPdfAlong, the
+//                           disc's density over w.n (per area across the ray), times the
+//                           cos(next) below that takes it onto `next`'s surface.
 inline double vertexPdfLight(const Scene& scene, const Vertex& cur, const Vertex& next) {
     Vec3 w = next.p - cur.p;
     double d2 = dot(w, w);
@@ -1889,8 +1889,9 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
 //         quantity is an intensity (W/sr), not a radiance.
 //   Sun   an infinitely distant disc: the origin is a point on a disc centred one radius
 //         UPSTREAM of the scene centre and perpendicular to `beamDir` (sampleSunOrigin), so
-//         every emitted ray enters the scene's cross-section (pdfPos = sunOriginPdf); the
-//         direction is drawn inside the solar cone (pdfW = 1/Omega).
+//         every emitted ray enters the scene's cross-section (pdfPos = sunOriginPdf / w.n,
+//         per area across the ray); the direction is drawn inside the solar cone
+//         (pdfW = 1/Omega).
 //         `spdFn` is the sun's radiance (addSunLight already divided by Omega).
 //
 // Both are delta lights: path[0].pdfFwd is 0 (PBRT's convention — see
@@ -3235,6 +3236,10 @@ inline double misWeightReference(const Scene& scene, const std::vector<Vertex>& 
     // the latter is a Surface, so isDeltaLight() is correctly false for it.
     const bool deltaLight = (s > 0) ? light[0].isDeltaLight()
                                     : eye[(size_t)(n - 1)].isDeltaLight();
+    // misWeight's `sunMiss`: a sun's NEE to a point no sun subpath can reach. Every strategy whose
+    // light subpath contains that point (j > s), and every merge, is impossible.
+    const bool sunMiss = s == 1 && light[0].light && light[0].light->shape == EmitterShape::Sun &&
+                         !(pl[1] > 0.0);
 
     // log p_j = A[j] + B[j], with A the light-side prefix and B the camera-side suffix.
     std::vector<double> A((size_t)n + 1, 0.0), B((size_t)n + 1, 0.0);
@@ -3245,6 +3250,7 @@ inline double misWeightReference(const Scene& scene, const std::vector<Vertex>& 
 
     // Strategies j = 0..n-1 (t' = n-j >= 1; BDPT never runs t'==0).
     auto allowed = [&](int j) {
+        if (sunMiss && j > s) return false;                  // the sun cannot reach x_s
         if (j > firstFiber) return false;                    // a strand on the light side
         if (dl[(size_t)j]) return false;                     // camera-side end of the edge
         if (j == 0) return !deltaLight;                      // eye path hits the emitter
@@ -3261,7 +3267,7 @@ inline double misWeightReference(const Scene& scene, const std::vector<Vertex>& 
     // connection strategy at the same vertex, so it rides the ratio already computed above.
     // No `allowed` test: a merge connects nothing, so a delta neighbour does not kill it —
     // it only needs both subpaths to REACH x_i, which by construction they do.
-    if (mk.any()) {
+    if (mk.any() && !sunMiss) {
         auto vAt = [&](int i) -> const Vertex& {
             return (i < s) ? light[(size_t)i] : eye[(size_t)(n - 1 - i)];
         };

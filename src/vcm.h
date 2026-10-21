@@ -1043,9 +1043,9 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                         // (pdfW = 1/Omega) and shadow-ray all the way out of the scene —
                         // so the ray must NOT be shortened by the endpoint epsilon. No
                         // 1/dist^2 and no cosLight; spdFn is already a radiance. The
-                        // emission density is the PLANAR 1/(pi R^2) times 1/Omega, which is
-                        // what makes the wCamera ratio come out as |cos|/(pi R^2) — pbrt's
-                        // infinite-light branch of Vertex::PdfLight.
+                        // emission density is the PLANAR one (bdpt.h sunOriginPdfAlong) times
+                        // 1/Omega, which is what makes the wCamera ratio come out as |cos| times
+                        // that planar density -- pbrt's infinite-light branch of Vertex::PdfLight.
                         double coneSolid = 2.0 * PI * (1.0 - em.spotCosOuter);
                         double R = scene.sceneRadius;
                         if (coneSolid > 0.0 && R > 0.0) {

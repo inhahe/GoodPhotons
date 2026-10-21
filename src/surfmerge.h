@@ -124,6 +124,8 @@ struct SurfMis {
                                // rCoef's role, one vertex earlier.
     unsigned char gateC1 = 0;  // 1 if connecting y_{j-1} to y_j is a legal strategy. y_j is
                                // never delta (surfMergeSite), so this asks about y_{j-1}.
+    unsigned char pad_ = 0;    // explicit, so the struct has no implicit padding a new field could
+                               // hide in: the device upload copies every field and asserts the size
     unsigned short vert = 0;   // j — the light subpath index, for the depth cap only. Merging
                                // light vertex j with camera vertex k builds a path of depth
                                // j+k-1 (SurfMergeWeight's SHAPE), and the connection loop

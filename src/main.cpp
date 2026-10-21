@@ -16913,9 +16913,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         for (const Medium& md : scene.media) { anyD |= (md.route == ROUTE_D); anyJ |= (md.route == ROUTE_J); }
         int on = 0, def = ROUTE_J, anyMedJ = 0;
         if ((anyD || anyJ) && g_noObjectModes) {
-            static bool said = false;
-            if (!said) {
-                said = true;
+            static uint64_t saidFor = 0;   // once per scene, as every note in this block
+            if (saidFor != scene.generation) {
+                saidFor = scene.generation;
                 std::printf("[ignore] per-object modes (-no-modes): mode %c renders the whole frame\n", mode);
             }
         } else if (anyD || anyJ) {
@@ -16957,9 +16957,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                     g_modeSppD, g_modeSppJ);
                 }
             } else {
-                static bool warned = false;
-                if (!warned) {
-                    warned = true;
+                static uint64_t warnedFor = 0;
+                if (warnedFor != scene.generation) {
+                    warnedFor = scene.generation;
                     std::fprintf(stderr, "[mode] this scene tags objects with `mode D` / `mode J`, which "
                                          "only modes D and J honour; this render is mode %c, so the "
                                          "tags are ignored.\n", mode);

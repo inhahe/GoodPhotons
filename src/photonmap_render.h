@@ -977,7 +977,7 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
 // BIT-IDENTICALLY, which is the regression test), and a factor is probed at three wavelengths first
 // so a flat one costs three evaluations rather than K.
 struct SpecThr {
-    static constexpr int K = 24;                 // bins across [LAMBDA_MIN, LAMBDA_MAX]
+    static constexpr int K = kBandProbeBins;     // bins across [LAMBDA_MIN, LAMBDA_MAX]
     double v[K];                                 // the product over the grid (the numerator)
     // The SAME product at the camera's wavelength, accumulated from the very scalars the walk
     // multiplied into `thr`. It is NOT recomputed from the grid, and that is the whole point:

@@ -572,7 +572,7 @@ struct BeamMis {
     // pdfDir / |y_{s-1} - x|^2: a beam leaving the SUN's vertex (0.386.0). The sun's subpath
     // starts on a fictitious disc R_scene away and draws its direction from the 0.53 deg solar
     // cone, so pdfDir there is 1/coneSolid (~15000 / sr). But deltaLightSubpath rewrites the
-    // first scene vertex's pdfFwd to the PLANAR sunOriginPdf, as PBRT does for an infinite light, and
+    // first scene vertex's pdfFwd to the PLANAR density (sunOriginPdf / w.n), as PBRT does for an infinite light, and
     // every connection weight reads that -- so a merge on the sun's chord that weighed itself with
     // pdfDir/rho^2 claimed ~10^4 times the share the connections left it, and the weights summed
     // past 1: single-scattered sunlight counted roughly twice. 0 = use pdfDir / rho^2.
@@ -590,11 +590,16 @@ struct BeamMis {
                             // distance the light-side density is measured over
     unsigned char gateC1 = 0;  // is "connect x to y_{s-1}" a legal strategy? (y_{s-1} not
                                // delta) — the reference technique of the whole ratio
+    // Explicit padding (with padV_), so the struct has none implicitly: uploadBeamMapCuda copies
+    // every field to gpu::DBeamMis and asserts this struct's size, and a field added into
+    // implicit padding would pass that assert without being copied. A new field grows the struct.
+    unsigned char padG_ = 0;
     unsigned short vert = 0;   // the light subpath vertex index j of y_{s-1} (so s = j+1).
                                // Needed ONLY for the depth cap: merging light vertex j with
                                // camera vertex k builds a path of depth j + k + 1, and the
                                // connection loop refuses depth > maxDepth, so the merge must
                                // refuse it too or mode J renders paths mode D never builds.
+    unsigned int  padV_ = 0;   // explicit padding to the 8-byte alignment; see padG_
 };
 
 // ---- Diagnostic tallies for the beam x ray query (FTRACE_BEAM_DIAG=1) ---------------------

@@ -4306,8 +4306,8 @@ struct DStepRecord {
 // boundary of no higher priority than the medium it lies in suppressed -- the ray goes straight on;
 // an opaque coat is never entered, so it is no medium and never suppressed. Then the surface's own
 // optics (dInterfaceOptics): reflect, refract, or -- opaque -- be absorbed. A body the ray enters
-// goes on `stk` and comes off when it leaves, a coated one as a glass one does. `mi` is m's index
-// (Mix/Layered aware). `whittedWeight` asks for mode W's deterministic step -- the DOMINANT branch
+// goes on `stk` and comes off when it leaves, a coated one as a glass one does, by its solidId.
+// `whittedWeight` asks for mode W's deterministic step -- the DOMINANT branch
 // with its probability as weight, no frosting; an opaque coat always reflects and carries R -- and
 // receives that weight (1 at a pass-through and at TIR). `radianceScale` is non-null on a
 // camera-side walk, which carries radiance, and null on a light-side one, which carries flux --
@@ -4315,7 +4315,7 @@ struct DStepRecord {
 // the step did (DStepRecord). False when an opaque coating or substrate absorbed the ray.
 __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, const DHit& h,
                                        const DVec3& d, Real lambda, DRng& rng,
-                                       int mi, DMediumStack& stk, DVec3& outO, DVec3& outD,
+                                       DMediumStack& stk, DVec3& outO, DVec3& outD,
                                        double* whittedWeight, double* radianceScale,
                                        DStepRecord* rec = nullptr) {
     if (whittedWeight) *whittedWeight = 1.0;
@@ -4323,9 +4323,9 @@ __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, con
     if (rec) *rec = DStepRecord{};
     const bool entering = dot(d, h.ng) < 0;
     // The far side: the medium the ray comes from when it enters, the one it returns to when it
-    // leaves (the stack without mi).
+    // leaves (the stack without this solid, which the stack knows by its solidId -- host twin
+    // interfaceStep).
     DMediumStack after;
-    // The stack knows a solid by its solidId (host twin interfaceStep).
     const int si = m.solidId;
     if (!entering) { after = stk; after.popMat(si); }
     const DMediumStack& outer = entering ? stk : after;
@@ -5283,9 +5283,6 @@ __device__ static double dHairSpecularFrom(const DMaterial& m, Real lambda, doub
     const double sp = (double)specLookup(m.hairSpecular, lambda) * specPat;
     return sp < 0.0 ? 0.0 : (sp > 1.0 ? 1.0 : sp);
 }
-__device__ static double dHairSpecularAt(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda) {
-    return dHairSpecularFrom(m, lambda, dHairSpecPatAt(sc, m, h));
-}
 
 // `specPat`: the hit's dHairSpecPatAt when the caller has it already; negative = evaluate it.
 __device__ __noinline__ static DHairShade dHairShadeAt(const DScene& sc, const DMaterial& m,
@@ -6109,6 +6106,7 @@ __device__ static inline double dMergeLightDensity(double p, bool fromDelta) {
     return (c_jDeltaMerge && fromDelta && p == 0.0) ? 1.0 : p;
 }
 #define DJSPEC_K    24     // JSpec::K
+static_assert(DJSPEC_K == kBandProbeBins, "the device carrier's grid must be the host's (JSpec::K)");
 #define DJSPEC_FOLD 12     // scene.h kFoldBins (static_assert'ed at the upload)
 struct DJSpec {   // 120 B, unpadded: one rides on every recorded segment and eye vertex
     float  r[DJSPEC_K];
@@ -6964,6 +6962,7 @@ struct DSurfMis {                             // the light-side half of the merg
     double sumC, sumMb, sumMs, pdfFwdA;
     float  rCoef;
     unsigned char  gateC1;
+    unsigned char  pad_;                      // explicit: no implicit padding (see the upload)
     unsigned short vert;                      // j, for the depth cap (merge depth = j + k - 1)
 };
 struct DSurfMap {
@@ -9692,7 +9691,7 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
     if (m.type == D_DIELECTRIC || m.type == D_THINFILM || m.type == D_MULTILAYER) {
         // A dielectric body's surface, plain or coated. A photon carries flux: no radiance scale.
         DVec3 nro, nrd;
-        if (!dDielectricStep(sc, m, h, rd, lambda, rng, matIndex, stk, nro, nrd, nullptr, nullptr)) {
+        if (!dDielectricStep(sc, m, h, rd, lambda, rng, stk, nro, nrd, nullptr, nullptr)) {
             eAbsorbed += beta; return WF_TERMINATE;
         }
         ro = nro; rd = nrd; return WF_CONTINUE;
@@ -11325,10 +11324,9 @@ __device__ static double dConvertDensity(double pdfW, const DVertex& from, const
 //   spot (shape 2)        - uniform inside the OUTER cone (the smoothstep falloff is
 //                           throughput, not density), pdfW = 1/(2 PI (1 - cosOuter)).
 //   sun (shape 6)         - INFINITE: no finite emission point, so the density of `next`
-//                           is the PLANAR density dSunOriginPdf over the fictitious origin
-//                           disc, with NO 1/dist^2 (the disc-point -> hit-point map is a
-//                           shear along the beam whose Jacobian is exactly the cos(next)
-//                           applied at the bottom).
+//                           is PLANAR, with NO 1/dist^2: dSunOriginPdfAlong, the origin
+//                           disc's density over w.n (per area across the ray), times the
+//                           cos(next) applied at the bottom.
 __device__ static float dVertexPdfLightF(const DScene& sc, const DVertex& cur, const DVertex& next) {
     DVec3 w = next.p - cur.p;
     float d2 = dot(w, w);
@@ -13229,7 +13227,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             // returning false here just ends the path at this vertex, as elsewhere in mode W.
             double wW = 1.0, rs = 1.0;
             DVec3 nro, nrd;
-            if (!dDielectricStep(sc, *mp, h, rd, lambda, rng, matId, stk, nro, nrd,
+            if (!dDielectricStep(sc, *mp, h, rd, lambda, rng, stk, nro, nrd,
                                  whitted ? &wW : nullptr, &rs)) return false;
             thr *= rs;                                   // radiance across the interface
             if (whitted && !dWhittedAttenuate(thr, wW, dLocalN2(sc, stk, lambda))) return false;
@@ -14604,7 +14602,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
         switch (mp->type) {
             case D_DIELECTRIC: {
                 DVec3 nro, nrd; double rs = 1.0;
-                dDielectricStep(sc, *mp, h, rd, LREP_RGB, rng, matId, stk, nro, nrd, nullptr, &rs);
+                dDielectricStep(sc, *mp, h, rd, LREP_RGB, rng, stk, nro, nrd, nullptr, &rs);
                 beta = beta * (Real)rs;                  // radiance across the interface
                 ro = nro; rd = nrd; specularArrival = true; break;
             }
@@ -15400,7 +15398,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 // A dielectric body's surface, plain or coated (dDielectricStep: nested bodies by
                 // priority). Radiance on the eye walk, flux on the light's.
                 DVec3 nro, nrd; double rs = 1.0;
-                if (!dDielectricStep(sc, *mp, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr,
+                if (!dDielectricStep(sc, *mp, h, rd, lambda, rng, stk, nro, nrd, nullptr,
                                      importance ? nullptr : &rs, jrun ? &jSt : nullptr)) { terminate = true; break; }
                 wi = nrd; betaFactor = rs; delta = 1;
                 // -jdispall: a dispersive refraction opens the window (host twin randomWalk).
@@ -15654,7 +15652,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
         //  sun   an infinitely distant disc: the origin is a point on a disc centred one
         //        radius UPSTREAM of the scene centre and perpendicular to beamDir
         //        (dSampleSunOrigin), so every emitted ray enters the scene's cross-section
-        //        (pdfPos = dSunOriginPdf); the direction is drawn inside the
+        //        (pdfPos = dSunOriginPdf / w.n); the direction is drawn inside the
         //        solar cone (pdfW = 1/Omega) and emitSpd is a RADIANCE (addSunLight already
         //        divided the irradiance by Omega).
         // Both store path[0].pdfFwd = 0 (PBRT's delta convention — see
@@ -17009,7 +17007,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             case D_THINFILM:
             case D_MULTILAYER: {                         // a dielectric body, plain or coated
                 DVec3 nro, nrd; double rs = 1.0;
-                if (!dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr, &rs))
+                if (!dDielectricStep(sc, m, h, rd, lambda, rng, stk, nro, nrd, nullptr, &rs))
                     return;
                 thr *= rs;                               // radiance across the interface
                 ro = nro; rd = nrd; break;
@@ -17170,7 +17168,7 @@ __device__ static double dEmitCdfAt(const DScene& sc, double lam) {
 }
 
 struct DSpecThr {
-    static const int K = 24;
+    static const int K = kBandProbeBins;   // SpecThr::K, the host twin's grid
     double v[K];
     // The same product at the camera's wavelength, accumulated from the very scalars that went into
     // `thr` -- NOT re-sampled from the grid. `thr` already contains this factor, so `thr * ratio`
@@ -17678,7 +17676,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 DVec3 nro, nrd; double rs = 1.0;
                 DStepRecord st;
                 const DVec3 d0 = rd;
-                if (!dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr, &rs,
+                if (!dDielectricStep(sc, m, h, rd, lambda, rng, stk, nro, nrd, nullptr, &rs,
                                      &st)) return;
                 thr *= rs;                               // radiance across the interface
                 sthr.mulCoin(sc, [&](Real L, double& pr) {
@@ -17996,7 +17994,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
             case D_THINFILM:
             case D_MULTILAYER: {                         // a dielectric body, plain or coated
                 DVec3 nro, nrd; double rs = 1.0;
-                if (!dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr, &rs))
+                if (!dDielectricStep(sc, m, h, rd, lambda, rng, stk, nro, nrd, nullptr, &rs))
                     return;
                 thr *= rs;                               // radiance across the interface
                 ro = nro; rd = nrd; break;
@@ -18386,7 +18384,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
         case D_THINFILM:
         case D_MULTILAYER: {
             DVec3 nro, nrd;
-            if (!dDielectricStep(sc, m, h, rd, lambda, rng, matId, stk, nro, nrd, nullptr,
+            if (!dDielectricStep(sc, m, h, rd, lambda, rng, stk, nro, nrd, nullptr,
                                  radianceScale)) { terminate = true; break; }
             wi = nrd; betaFactor = 1.0; delta = true;
             break;
@@ -22346,10 +22344,12 @@ static void uploadSurfMapCuda(const bdpt::SurfMap* smap, DUpload& up, gpu::DSurf
         d.cx = q.cx; d.cy = q.cy; d.cz = q.cz;
         d.misIdx = q.misIdx;
     }
-    // Every SurfMis field is copied below. A field a copy misses is uploaded as 0 -- what
-    // BeamMis::etaPrevS was, for a 4 % GPU-only bias (J-GPU-ETAPREVS) -- so a change to the struct
-    // fails the build until the copy is revisited.
+    // Every SurfMis field is copied below, and a field a copy misses reaches the device as 0. Both
+    // structs carry their padding explicitly, so any field added to either changes its size and
+    // stops the build here until the copy has been revisited.
     static_assert(sizeof(bdpt::SurfMis) == 40, "SurfMis changed: copy the new field into DSurfMis "
+                                               "here, then update this size");
+    static_assert(sizeof(gpu::DSurfMis) == 40, "DSurfMis changed: fill the new field from SurfMis "
                                                "here, then update this size");
     std::vector<gpu::DSurfMis> mis(smap->mis.size());
     for (size_t i = 0; i < smap->mis.size(); ++i) {
@@ -22529,9 +22529,11 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
     }
     size_t nMis = 0;
     if (withMis && !bmap->mis.empty()) {
-        // Every BeamMis field is copied below; see the SurfMis upload for why this trips.
+        // Every BeamMis field is copied below; see the SurfMis upload for why these trip.
         static_assert(sizeof(BeamMis) == 56, "BeamMis changed: copy the new field into DBeamMis "
                                              "here, then update this size");
+        static_assert(sizeof(gpu::DBeamMis) == 56, "DBeamMis changed: fill the new field from "
+                                                   "BeamMis here, then update this size");
         std::vector<gpu::DBeamMis> dm(bmap->mis.size());
         for (size_t i = 0; i < dm.size(); ++i) {
             const BeamMis& s = bmap->mis[i]; gpu::DBeamMis& d = dm[i];

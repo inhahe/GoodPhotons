@@ -84,13 +84,14 @@ inline const char* matTypeName(MatType t) {
 // The spectral carriers' bin count (JSpec::K, SpecThr::K), and so the wavelengths at which the
 // question "does this vary over the band?" is asked.
 constexpr int kBandProbeBins = 24;
-// Whether f(lambda) differs anywhere over the band, read at the centres of kBandProbeBins bins
-// (relative tolerance 1e-12). One predicate for every such question (Material::absorbChroma,
-// bdpt::anyMediumSigmaTChromatic), so they agree with each other and with the carriers' grid.
-template <class F> inline bool variesOverBand(const F& f) {
-    const double step = (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
+// Whether f(lambda) differs anywhere over the band, read at the centres of `bins` bins (relative
+// tolerance 1e-12). One predicate for every such question. A question about what a carrier will
+// see asks at the carriers' own grid, kBandProbeBins (bdpt::anyMediumSigmaTChromatic); a physical
+// one asks finely enough not to step over a feature (Material::absorbChroma, 1 nm).
+template <class F> inline bool variesOverBand(const F& f, int bins = kBandProbeBins) {
+    const double step = (LAMBDA_MAX - LAMBDA_MIN) / (double)bins;
     const double a = f(LAMBDA_MIN + 0.5 * step);
-    for (int k = 1; k < kBandProbeBins; ++k)
+    for (int k = 1; k < bins; ++k)
         if (std::fabs(f(LAMBDA_MIN + (k + 0.5) * step) - a) > 1e-12 * (1.0 + std::fabs(a))) return true;
     return false;
 }
@@ -3147,8 +3148,10 @@ struct Scene {
         finalizeEmissiveVolumes();
         finalizeBowLuts();
         finalizeLayeredCoats();
-        // After the coats, which append materials. Whole-band probes, once, rather than per walk.
-        for (auto& m : mats) m.absorbChroma = variesOverBand([&](double L) { return m.absorb(L); });
+        // After the coats, which append materials. A 1 nm scan, once, rather than a probe per walk:
+        // a glass that absorbs only between the carriers' bin centres still absorbs.
+        const int nm = (int)(LAMBDA_MAX - LAMBDA_MIN);
+        for (auto& m : mats) m.absorbChroma = variesOverBand([&](double L) { return m.absorb(L); }, nm);
     }
     void finalizeTris() { build(); }   // kept for existing call sites
 
