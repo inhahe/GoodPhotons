@@ -197,10 +197,23 @@
 # re-measure with two short runs at different -spp and take the slope -- it is a two-minute
 # check (`-camera cam -spp 4` then `-spp 32`, -no-meter, subtract).
 #
-# Render (flyby) — the `fly` curve below, 600 frames at 960x540, ALSO mode D (it declares it):
-#   ftrace -in scenes/gallery_rain.ftsl -camera fly -spp 140 \
-#          -window-min -keepwindow -interval 15 -checkpoint \
-#          -o png/gallery_rain_fly/gallery_rain.png
+# Render (flyby) — the `fly` curve below, 1208 frames at 960x540, 30 fps (0.391.0):
+#   ftrace -in scenes/gallery_rain.ftsl -camera fly -spp 64 -beamepochs 8 \
+#          -oidn -oidn-write-guides -denoise \
+#          -window-min -keepwindow -interval 15 -checkpoint -o png/gallery_rain.png
+# -> png/gallery_rain_fly/gallery_rain_fly0000.png .. 1207.png. Measured on fly0100 (the gold
+# gyroid close-up, one of the dearest frames, 2:20 a frame on an RTX 4090; ~30-35 h the loop):
+#   * 64 spp is grainy raw and clean after -oidn, whose albedo/normal guides keep the floor
+#     grid, the marble and what the glass refracts sharp (luma error, 4x4 downsample, against
+#     an independent 484 spp render: 4.41 raw, 3.85 OIDN unguided, 2.81 guided).
+#   * What flickers from frame to frame after that is mode J's light side: the rain curtain's
+#     single-wavelength beam streaks, redrawn per frame. -beamepochs 8 hands every frame the
+#     SAME 8 realizations, so they hold still in the world: curtain flicker (RMS, display
+#     0-255) 9.3 with the default wall-clock refresh, 5.9 even at 256 spp, 2.3 with this.
+#     -beamfreeze is as still but is ONE realization: a static rainbow-barred curtain.
+#   * -denoise after OIDN desaturates those streaks (curtain chroma error -20 %).
+# The paragraphs below predate all three (mode D, 600 frames, -spp 140): their per-frame
+# SPREAD and the -spp-not--time argument still hold; their seconds-per-spp do not.
 # BUDGET WITH -spp, NOT -time, and the reason is the 4x per-frame spread measured below. A
 # flat -time hands each frame a fixed number of SECONDS, so the cheap open-hall frames get 4x
 # the samples the expensive gyroid-channel frames do and the grain visibly BREATHES over the
