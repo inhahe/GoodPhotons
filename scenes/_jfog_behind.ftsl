@@ -4,7 +4,7 @@
 # has to get right. Every mode at -max-bounce 32 (D, J and U default to 8 edges, R to 32).
 # gallery_rain's configuration: the camera path crosses the glass whole and merges outside it,
 # reading the glass through JSPEC's carrier (G 7-8 % bright with the carrier read by straight
-# lines, before 0.391.3).
+# lines, before 0.391.4).
 
 scene {
     units    meters

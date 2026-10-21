@@ -3,7 +3,8 @@
 # from above; `tint` absorbs strongly and very unevenly across the band, the case a spectral carrier
 # has to get right. Every mode at -max-bounce 32 (D, J and U default to 8 edges, R to 32).
 # The merge's partial camera segment runs in the glass, whose absorption has to be taken at the
-# beam's wavelength (R 0.73, G 1.24 of mode R before 0.391.3).
+# beam's wavelength (R 0.73, G 1.24 of mode R before 0.391.3; the merge's glass fix is 0.391.3's,
+# measured on 0.391.4).
 
 scene {
     units    meters

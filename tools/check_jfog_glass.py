@@ -6,13 +6,13 @@ each rendered in mode R, the reference, and in mode J on the GPU and on the CPU.
 of the frame is compared channel by channel. Every arm runs at -max-bounce 32: modes D, J and U
 default to 8 edges and mode R to 32, and a comparison across two caps measures the cap.
 
-What failed before 0.391.3 (fog region, J / R):
+What failed before 0.391.4 (fog region, J / R):
   floor   GPU 1.043 (the device's beam-merge weight lacked the point merge at the vertex a beam
           left, J-GPU-ETAPREVS), CPU 0.998
   behind  G +7-8 % on both (JSPEC's carrier read by straight lines between its bins)
   inside  R 0.73, G 1.24 on both (the merge's partial camera segment took the glass's absorption
           at the camera's wavelength)
-and what 0.391.3 reads: floor 0.999 / 0.998, behind R 0.99-1.00 G 1.025-1.036, inside R 0.98-0.99
+and what 0.391.4 reads: floor 0.999 / 0.998, behind R 0.99-1.00 G 1.025-1.036, inside R 0.98-0.99
 G 1.00. Blue is left out of the tinted scenes: the glass passes about 1 % of it, so its ratio is
 noise. The behind scene's green keeps a wider tolerance for the bins' resolution (known-issues
 J-GPU-ETAPREVS, the note on the carrier).
@@ -27,13 +27,15 @@ from __future__ import annotations
 
 import argparse
 import os
-import struct
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _pfm import Linear  # noqa: E402  (scene-linear RGB, image order)
+
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _FTRACE = os.path.join(_REPO, "ftrace.exe")
-_BOX = (90, 60, 150, 140)          # the fog, in PFM rows (bottom to top), at the scenes' 240x200
+_BOX = (90, 60, 150, 140)          # the fog, x0 y0 x1 y1 in image order, at the scenes' 240x200
 _DEPTH = ["-max-bounce", "32"]
 
 # scene -> per-channel tolerances in % (None: channel not checked)
@@ -48,31 +50,13 @@ _ARMS = {
 }
 
 
-def read_pfm(path):
-    with open(path, "rb") as f:
-        hdr = f.readline().strip()
-        if hdr not in (b"PF", b"Pf"):
-            raise ValueError("not a PFM: %r" % hdr)
-        nc = 3 if hdr == b"PF" else 1
-        line = f.readline()
-        while line.startswith(b"#"):
-            line = f.readline()
-        w, h = (int(x) for x in line.split())
-        scale = float(f.readline().strip())
-        n = w * h * nc
-        data = struct.unpack("%s%df" % ("<" if scale < 0 else ">", n), f.read(4 * n))
-    return w, h, nc, data
-
-
 def box_means(img):
-    w, _h, nc, d = img
     x0, y0, x1, y1 = _BOX
-    acc = [0.0] * nc
+    acc = [0.0, 0.0, 0.0]
     for y in range(y0, y1):
         for x in range(x0, x1):
-            i = (y * w + x) * nc
-            for c in range(nc):
-                acc[c] += d[i + c]
+            for c, v in enumerate(img.at(x, y)):
+                acc[c] += v
     n = (x1 - x0) * (y1 - y0)
     return [a / n for a in acc]
 
@@ -83,7 +67,7 @@ def render(exe, scene, flags, out_png, log):
         r = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT)
     if r.returncode != 0:
         raise RuntimeError("%s exited %d (log: %s)" % (" ".join(cmd), r.returncode, log))
-    return box_means(read_pfm(os.path.splitext(out_png)[0] + ".pfm"))
+    return box_means(Linear(os.path.splitext(out_png)[0] + ".pfm"))
 
 
 def main():

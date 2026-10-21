@@ -3,7 +3,7 @@
 # from above; `tint` absorbs strongly and very unevenly across the band, the case a spectral carrier
 # has to get right. Every mode at -max-bounce 32 (D, J and U default to 8 edges, R to 32).
 # Beams leaving the floor into the fog: GPU mode J dropped the point merge at the vertex a beam
-# left (known-issues J-GPU-ETAPREVS) and read this fog 4 % bright before 0.391.3.
+# left (known-issues J-GPU-ETAPREVS) and read this fog 4 % bright before 0.391.4.
 
 scene {
     units    meters

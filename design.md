@@ -2365,7 +2365,9 @@ way to an untagged wall routes that wall D while the merges along the crossing r
 **Materials carry it.** Hits know only a material id, so a tagged object gets route-tagged copies of
 its materials (`routedMat`, memoised per (material, route)). The more specific tag wins: a copy an
 object's own tag made survives its group's tag, and a tag in a material's own block, the default for
-every object using it, gives way to either (`routeIsClone_` tells the two apart). The loader snapshots
+every object using it, gives way to either (`routeIsClone_` tells the two apart). A copy keeps its
+original's identity in the nested-dielectric stack (`Material::routeBase`, `solidId`), so a glass solid
+built from parts tagged differently is still one solid to a ray crossing it. The loader snapshots
 the primitive pools before an object or group is added and retags what it added, which covers
 glTF meshes with many materials. A mix's children are copied too, because both walks store the
 RESOLVED child on the vertex. A layered coat is synthesised later from its parent, so it inherits.
@@ -2623,7 +2625,14 @@ The disc's radius is `Emitter::sunDiscR` = R (1 + sin t) / cos t, t the cone's h
 ray tilted by t reaches the rim of the bounding sphere from that far out, and on a disc of radius R
 those rim points had no light-tracing strategy while every MIS weight counted one (22 % dark corners
 under a 30 deg sun in mode D before 0.391.3; `tools/check_sun_rim.py`). One `sampleSunOrigin` /
-`dSampleSunOrigin` per side draws from the disc, so the sampler and `sunOriginPdf` cannot drift. A share `f` (default
+`dSampleSunOrigin` per side draws from the disc, so the sampler and `sunOriginPdf` cannot drift.
+`sunOriginPdf` is per unit area of the DISC; a ray tilted from the beam by its own direction w crosses
+disc area dA with cross-section dA (w.n), so the density every strategy reads -- the walk's `pdfPos`,
+`sunOriginPdfAlong`, `BeamMis::pdfPlanar` -- is that over w.n (1/cos bright in light tracing before
+0.391.5: 1.7 % under a 30 deg sun, nothing under the real 0.53 deg one). A point no sun subpath can
+reach -- upstream of the disc plane, or off the disc and every target, as in an unbounded haze
+outside the bounding sphere -- reads 0, and `misWeight` / `dMisWeight` drop the camera-side
+alternatives of a sun's NEE there (`sunMiss`) instead of reading that 0 as a delta's. A share `f` (default
 0.25, `-sunaim`) of sun subpaths now draws its origin from the focusing geometry's footprint
 instead. The targets are the bounding spheres `causticaim.h` builds for mode `M` (64 by
 `-causticaimk`), each projected onto the disc as a circle and picked by r². The mixture density is
@@ -2641,7 +2650,7 @@ sun is aimed. Mode `U` and the forward modes keep their own samplers (and their 
 its own sampler in `vcm.h` / `kVcmLightT` draws from the same mixture, and its two readers of the sun's
 origin density, the subpath's `emissionPdfW` (hence `dVCM`) and the NEE weight's `emissionPdfW`, read
 it; through the ball mode U reads 1.0152 ± 0.0018 aimed against 1.0129 ± 0.0041 uniform on the CPU and
-1.0121 ± 0.0009 aimed on the GPU, the same 1.2–1.5 % above R its default 5.7 cm merge radius blurs in) and hands them to
+1.0121 ± 0.0009 aimed on the GPU, 1.2–1.5 % above R; most of that was the sun disc's missing foreshortening, fixed in 0.391.5, after which mode U reads within 0.5 % of R on `_sun_rim`) and hands them to
 the device (`cudaSetSunAim`, uploaded at the top of `renderBdptCuda`, before the device light
 pass). On `gallery_rain` it reports 556 649 focusing prims in 64 targets covering 0.64 % of the
 disc, so sun subpaths are about 50× denser on the glass.

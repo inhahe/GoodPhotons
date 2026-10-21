@@ -503,12 +503,16 @@ inline Vec3 sampleSunOrigin(const Scene& scene, const Emitter& em, Pcg32& rng, d
     return scene.sceneCenter + t * x + b * y - em.beamDir * scene.sceneRadius;
 }
 
-// The sun's origin density at disc coordinates (x, y) (see sampleSunOrigin). With the aim off,
-// exactly 1/(pi Rd^2).
+// The sun's origin density per unit area OF THE DISC at disc coordinates (x, y) (see
+// sampleSunOrigin): with the aim off 1/(pi Rd^2) on the disc and 0 off it. A ray's density per
+// unit area across ITS OWN direction w is this over w.n (n = beamDir): a ray tilted from the
+// beam crosses disc area dA with cross-section dA (w.n), so the estimator owes that factor
+// wherever the ray-space density is meant (deltaLightSubpath, sunOriginPdfAlong).
 inline double sunOriginPdf(const Emitter& em, double x, double y) {
     const double Rd = em.sunDiscR;
-    if (!g_sunAim.on()) return 1.0 / (PI * Rd * Rd);
-    double p = (x * x + y * y <= Rd * Rd) ? (1.0 - g_sunAim.f) / (PI * Rd * Rd) : 0.0;
+    const bool onDisc = (x * x + y * y <= Rd * Rd);
+    if (!g_sunAim.on()) return onDisc ? 1.0 / (PI * Rd * Rd) : 0.0;
+    double p = onDisc ? (1.0 - g_sunAim.f) / (PI * Rd * Rd) : 0.0;
     Vec3 t, b; onb(em.beamDir, t, b);
     int n = 0;
     for (size_t j = 0; j < g_sunAim.w.size(); ++j) {
@@ -518,20 +522,24 @@ inline double sunOriginPdf(const Emitter& em, double x, double y) {
     if (n > 0) p += g_sunAim.f * (double)n / (PI * g_sunAim.sumR2);
     return p;
 }
-// The same density for a ray arriving at `p` along unit `w` (the light's travel direction):
-// run the ray back to the disc plane and read its origin there. For a light subpath's own first
-// vertex this is the origin it was drawn at; for an NEE connection it is the origin a light
-// subpath would have needed to reach `p` along that direction.
+// The density of the ray arriving at `p` along unit `w` (the light's travel direction), per unit
+// area across that ray: run it back to the disc plane, read the origin it needs there, divide
+// by w.n. For a light subpath's own first vertex this is the origin it was drawn at; for an NEE
+// connection it is the origin a light subpath would have needed. 0 where no sun subpath can start:
+// `p` upstream of the disc plane, or the origin off the disc and every target -- a point outside
+// the bounding sphere, in an unbounded haze, say. misWeight drops light tracing there rather than
+// reading the 0 as a delta's.
 inline double sunOriginPdfAlong(const Scene& scene, const Emitter& em, const Vec3& p, const Vec3& w) {
-    if (!g_sunAim.on()) return sunOriginPdf(em, 0.0, 0.0);
     const Vec3& n = em.beamDir;
     const double cw = dot(w, n);
     if (!(cw > 0.0)) return 0.0;
     const Vec3 p0 = scene.sceneCenter - n * scene.sceneRadius;
-    const Vec3 q = p - w * (dot(p - p0, n) / cw);
+    const double ax = dot(p - p0, n);              // how far downstream of the disc plane
+    if (!(ax > 0.0)) return 0.0;
+    const Vec3 q = p - w * (ax / cw);
     Vec3 t, b; onb(n, t, b);
     const Vec3 o = q - scene.sceneCenter;
-    return sunOriginPdf(em, dot(o, t), dot(o, b));
+    return sunOriginPdf(em, dot(o, t), dot(o, b)) / cw;
 }
 
 // Emission directional density at a light vertex `cur` toward `next`, area measure
@@ -778,22 +786,11 @@ inline void jTrFold(const Scene& scene, JSpecRun& jr, const Vec3& o, const Vec3&
     jr.mulVec(e, 1.0);
 }
 
-// Whether a dielectric's interior absorption varies over the band, probed at the carrier's bins.
-inline bool absorbChromatic(const Material& m) {
-    const double a = m.absorb(JSpec::lamOf(0));
-    for (int k = 1; k < JSpec::K; ++k)
-        if (std::fabs(m.absorb(JSpec::lamOf(k)) - a) > 1e-12 * (1.0 + std::fabs(a))) return true;
-    return false;
-}
-
 // Whether some medium's extinction varies over the band (JSpecWalk::trSpec; the device's
 // c_jTrSpec, which main.cpp sets from this).
 inline bool anyMediumSigmaTChromatic(const Scene& scene) {
-    for (const Medium& m : scene.media) {
-        const double a = m.sigmaT(JSpec::lamOf(0));
-        for (int k = 1; k < JSpec::K; ++k)
-            if (std::fabs(m.sigmaT(JSpec::lamOf(k)) - a) > 1e-12 * (1.0 + std::fabs(a))) return true;
-    }
+    for (const Medium& m : scene.media)
+        if (variesOverBand([&](double L) { return m.sigmaT(L); })) return true;
     return false;
 }
 
@@ -987,6 +984,10 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                                  /*skipCamHidden=*/(mode == Mode::Radiance && bounces == 0));
         if (h.valid && h.sensorId >= 0) return;      // model-A sensor: not used in BDPT
         double dSurf = h.valid ? h.t : 1e30;
+        // Inside glass whose absorption varies over the band (Material::absorbChroma)? Read by
+        // the segment's claim snapshot below and by the claim rule after the segment.
+        const int cmG = stk.topMat();
+        const bool glassChroma = cmG >= 0 && scene.mats[(size_t)cmG].absorbChroma;
 
         // Record the segment for the mode-J (UPBP) merge, BEFORE the free-flight draw below
         // consumes it (see PathSeg). Both walks ask for this and mean different things by
@@ -1013,10 +1014,11 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             // `aGlass` is the exception and has to be folded in here rather than left to that
             // rule: emitBeams re-applies exp(-aGlass * ta) over each beam's own lead-in, so a
             // segment travelling inside coloured glass deposits a beam whose power is
-            // wavelength-dependent even though nothing has happened to `beta` yet. Same
-            // condition render.h's tracePhoton reaches by clearing the flag with the
-            // Beer-Lambert step that precedes its deposit.
-            sg.achro = achroPath && !(sg.aGlass > 0.0);
+            // wavelength-dependent even though nothing has happened to `beta` yet; and so does
+            // glass that absorbs only elsewhere in the band (glassChroma), whose aGlass reads 0
+            // at this walk's wavelength. Same condition render.h's tracePhoton reaches by
+            // clearing the flag with the Beer-Lambert step that precedes its deposit.
+            sg.achro = achroPath && !(sg.aGlass > 0.0) && !glassChroma;
             if (sg.achro) {
                 // Collapse the running per-bin ratios into the single CIE triple this beam
                 // will be stored with. With nothing folded yet (`foldChroma` false) that is
@@ -1072,7 +1074,10 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             // because `PhotonBeam::absorb` is a single scalar the gather re-applies to every
             // member of the record alike: there is nowhere to put a per-wavelength Beer
             // exponent. (Same reasoning as render.h's FK_GlassAbsorb.)
-            if (a > 0.0) { beta *= std::exp(-a * dEvent); retireSpectral(FK_GlassAbsorb); }
+            // Glass clear at `lambda` but not elsewhere retires it too: the photon would go on
+            // standing for wavelengths the glass took away.
+            if (a > 0.0) beta *= std::exp(-a * dEvent);
+            if (a > 0.0 || glassChroma) retireSpectral(FK_GlassAbsorb);
             // Per-λ absorption for the bundle. A non-empty stack means we are inside a
             // dielectric, and entering one de-heros — so nUp is always 1 whenever `a`
             // can be non-zero and this loop never actually runs. Kept for generality.
@@ -1912,7 +1917,7 @@ inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Render
         if (scene.sceneRadius <= 0.0) return 0;
         double x, y;
         org = sampleSunOrigin(scene, em, rng, x, y);
-        pdfPos = sunOriginPdf(em, x, y);
+        pdfPos = sunOriginPdf(em, x, y) / dot(dir, em.beamDir);   // per area across the ray
         if (!(pdfPos > 0.0)) return 0;
     } else {
         org = em.origin;
@@ -2546,9 +2551,6 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     const bool beamSpecOK  = beamSpectralOK(scene);
     const bool beamAchroOK = pbeams::gAchro && beamSpecOK;
     const int  beamSpecC   = beamSpecOK ? pbeams::gSpecC : 1;
-    // Which dielectrics absorb differently at different wavelengths (depositSeg), per material.
-    std::vector<char> absorbChroma(scene.mats.size(), 0);
-    for (size_t m = 0; m < scene.mats.size(); ++m) absorbChroma[m] = absorbChromatic(scene.mats[m]) ? 1 : 0;
 
     auto worker = [&](int tid, long long total, uint64_t salt, bool pilot) {
         Renderer mats; mats.diffraction = diffraction;
@@ -2643,15 +2645,6 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 const double* lamS = nullptr; int nSec = 0;
                 const Vec3* cie = nullptr;
                 double wsBuf[kBeamSpecMax];
-                // The dielectric this segment runs inside, if any. Its absorption along the
-                // beam is applied at the gather as ONE scalar (PhotonBeam::absorb), so it has to
-                // be taken at the wavelength the beam is deposited at -- on a claimed segment
-                // that is not the walk's -- and a folded colour or a bundle, which stand for
-                // several wavelengths, cannot carry it unless it is the same at all of them.
-                // randomWalk refuses the claim inside glass that absorbs at the walk's own
-                // wavelength; a glass clear there and absorbing elsewhere reaches here claimed.
-                const Material* gm = (sg.glassMat >= 0) ? &scene.mats[(size_t)sg.glassMat] : nullptr;
-                const bool glassChroma = gm && absorbChroma[(size_t)sg.glassMat];
                 if (sg.achro) {
                     // JSPEC: a folded beam stores a COLOUR, not a wavelength, so the camera
                     // side can re-express a merge with it only through the emitter's own fold
@@ -2660,7 +2653,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                     // chromatic factor deposits as the bundle below, whose every member has a
                     // wavelength the camera side can be evaluated at. In gallery_rain this keeps
                     // the fold for the sunlit cloud; a beam off the coloured floor is a bundle.
-                    const bool fold = beamAchroOK && !glassChroma && (sg.fFlat || !jSpecEnabled()) &&
+                    const bool fold = beamAchroOK && (sg.fFlat || !jSpecEnabled()) &&
                         (sg.fCie.x > 0.0 || sg.fCie.y > 0.0 || sg.fCie.z > 0.0);
                     if (fold) {
                         // FOLDED (-beamachro): the beam is gathered at `fCie`, whose per-bin
@@ -2686,7 +2679,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                         if (!(w0 > 0.0)) return;             // T(bs.lam[0]) == 0: no flux
                         lam = dLam;
                         pw  = sg.beta * dSc * w0;
-                        if (dSec > 0 && !glassChroma) {
+                        if (dSec > 0) {
                             for (int i = 0; i < dSec; ++i) wsBuf[i] = sg.fW[i + 1] / w0;
                             lamS = dLamS; nSec = dSec;
                         }
@@ -2712,8 +2705,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 // "unknown" out loud.
                 // `srcEm` (the subpath's emitter) is what lets a merge recolour a folded beam
                 // through that emitter's quadrature (JSPEC, jSpecFoldColor).
-                const double aDep = gm ? gm->absorb(lam) : 0.0;   // == sg.aGlass at the walk's lambda
-                mats.emitBeams(scene, sg.o, sg.d, sg.tMax, lam, pw, aDep, rng,
+                mats.emitBeams(scene, sg.o, sg.d, sg.tMax, lam, pw, sg.aGlass, rng,
                                kBeamOrderUnknown,
                                Renderer::MedAll, lamS, nSec, cie, dEm,
                                nSec > 0 ? wsBuf : nullptr, bs.ok ? bs.emIdx : -1);
@@ -2829,7 +2821,8 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                     const Emitter& se = *path[0].light;
                     Vec3 st, sb; onb(se.beamDir, st, sb);
                     const Vec3 so = path[0].p - scene.sceneCenter;
-                    m.pdfPlanar = (float)sunOriginPdf(se, dot(so, st), dot(so, sb));
+                    m.pdfPlanar = (float)(sunOriginPdf(se, dot(so, st), dot(so, sb)) /
+                                          dot(sg.d, se.beamDir));   // across the beam
                 }
                 // cos / pdfFwd, the merge-independent half of pdfRev*(y_{s-1})/pdfFwd(y_{s-1}):
                 // the gather multiplies in the phase value at x and 1/rho_L^2. The cosine is
@@ -3350,8 +3343,13 @@ inline double misWeight(const Scene& scene, const Camera& cam,
     if (qsM) a7 = ScopedAssign<double>(&qsM->pdfRev, vertexPdf(scene, cam, pt, *qs, *qsM, lambda));
 
     const bool merges = mk.any();
+    // A sun's NEE (s == 1) to a point no sun subpath can reach (sunOriginPdfAlong's 0): every
+    // camera-side alternative traces light from the sun THROUGH pt, so none exists. remap0 would
+    // read that 0 as a delta's and weigh NEE against strategies that never fire.
+    const bool sunMiss = s == 1 && t >= 2 && qs->light && qs->light->shape == EmitterShape::Sun &&
+                         !(pt->pdfRev > 0.0);
     double sumRi = 0.0, ri = 1.0;
-    for (int i = t - 1; i > 0; --i) {                // hypothetical camera strategies
+    for (int i = t - 1; !sunMiss && i > 0; --i) {    // hypothetical camera strategies
         // A strand is never a light vertex (randomWalk, 0.365.0): every strategy from here
         // inward would put eye[i] on the light side, so none of them exists.
         if (!eye[i].delta && eye[i].mat && isFiberMat(*eye[i].mat)) break;

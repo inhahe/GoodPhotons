@@ -578,7 +578,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
             if (scene.sceneRadius <= 0.0) return;
             double x, yy;
             y = bdpt::sampleSunOrigin(scene, em, rng, x, yy);
-            pdfPos = bdpt::sunOriginPdf(em, x, yy);
+            pdfPos = bdpt::sunOriginPdf(em, x, yy) / dot(dir, em.beamDir);   // across the ray
         } else {
             y = em.origin;                                 // delta position: pdfPos == 1
             emitScale = spotFalloff(dot(dir, em.beamDir), em.spotCosInner, em.spotCosOuter);

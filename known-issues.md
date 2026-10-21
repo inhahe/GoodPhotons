@@ -139,7 +139,57 @@ sample index crosses a fixed block boundary (split a chunk at the boundaries it 
 light side's epochs already are under `-beamepochs`. Then the chunker can keep adapting and the
 pin and its global switch go. (Both reviewers of 0.391.0 suggested this or a fixed chunk size.)
 
-## DONE (2026-10-21, 0.391.3): J-GPU-ETAPREVS — GPU mode J's beam merges left out the point merge at the vertex a beam left, and read a fog 4 % bright
+## DONE (2026-10-21, 0.391.5): REVIEW-0391 — what the Opus review of 0.391.3-0.391.4 found
+
+Opus (xhigh) reviewed 3921bc9..322249f, the follow-ups to REVIEW-0388 and J-GPU-ETAPREVS. Fixed:
+
+* **A glass solid built from parts tagged differently left the medium stack inside the glass.**
+  The stack popped a solid by exact material index, and a routed copy (`mode` on an object) has
+  its own; 0.391.3 made it likelier by giving an object tagged like its material a copy too. A
+  tinted glass cube of six quads, three tagged, rendered 0.919 / 0.972 / 0.999 of the untagged
+  cube in mode R, whether the three said `mode J` like their material or `mode D`; 1.000 after.
+  Copies now carry their original's identity (`Material::routeBase` / `solidId`), host and device.
+* **A sun subpath's throughput lacked the disc's foreshortening** (pre-existing): a ray tilted
+  by w from the beam crosses disc area dA with cross-section dA (w.n), so light tracing and mode
+  J's sun beams read 1/cos bright, about 1.7 % under a 30 deg sun and nothing under the real one.
+  Every ray-space density (the walk's `pdfPos`, `sunOriginPdfAlong`, `BeamMis::pdfPlanar`, mode
+  U's) is now the disc density over w.n, host and device. On `_sun_rim` (30 deg) mode D's floor
+  went from 1.000-1.005 of R to 0.999-1.002, and mode U's from 1.011-1.018 to 0.998-1.005 (GPU):
+  the ~1.5 % design.md had put down to mode U's merge blur was mostly this.
+* **A point no sun subpath can reach still read the disc's light density** (pre-existing): with
+  the aim off it was the constant for any point, so in an unbounded haze outside the bounding
+  sphere NEE's weight counted a light-tracing strategy that never fires: a sun-lit unbounded
+  haze seen from 7 m off a 1.5 m prop (scenes/_sun_haze.ftsl) rendered at 0.215 of mode R in
+  mode D, 1.008 after; `tools/check_sun_rim.py` now renders it too. It now
+  reads 0 upstream of the disc or off it, and `misWeight` / `dMisWeight` drop a sun NEE's
+  camera-side alternatives there instead of reading the 0 as a delta's.
+* **A light walk's spectral claim crossed glass that was clear at its wavelength but absorbed
+  elsewhere** (pre-existing in modes J and M, host and device). Mode J's light walk retires the
+  claim at every dielectric vertex anyway, so it met this only through priority-suppressed
+  interfaces; mode M folds through dielectric steps and met it under `-beamachro`. A fog lit
+  through a red-pass glass (MODEM-REDPASS's scene), mode M `-beamachro`: green 1.018 of R before
+  -- a full-colour beam from every red-wavelength walk, on top of MODEM-REDPASS's own deficit --
+  and 0.897 after, that deficit alone (0.917 without `-beamachro`, unchanged). Glass whose absorption varies over the
+  band (`Material::absorbChroma`, baked in `build()`) retires it, as absorbing glass did. That
+  makes 0.391.4's deposit-time guard dead code, and it is gone.
+* **The device's geometric interpolation formed b/a in float**, which can pass FLT_MAX across the
+  carrier's range: now in log space on the hardware log2/exp2.
+* **The "tags set aside" note printed once per process**: once per scene now.
+* **Field-by-field mirroring was left unguarded** after etaPrevS: `BeamMis` and `SurfMis`, both
+  copied whole to the device, now fail the build by size when a field is added.
+* Version labels for J-GPU-ETAPREVS corrected to 0.391.4; both new gates read PFMs through
+  `tools/_pfm.Linear`; one band-flatness predicate (`variesOverBand`) instead of two; the rim
+  check gained the haze scene.
+
+Dismissed, with measurements: geometric interpolation reading a reflectance edge low (the AM-GM
+argument holds, but on `_fog_cornell`'s coloured walls, J against D at 64² and 4096 spp, geometric
+reads 0.1-0.25 % below linear across the frame and both wall strips, against a 5-point gain on
+coloured glass); a pow per beam hit (3 % of render time on `_fog_cornell`, merge-bound, 4:53
+against 4:44; the device now uses the hardware units, and per-segment logs would mean a new
+carrier layout); a size tripwire on `Emitter` (only a chosen subset reaches the device, so it
+would fire on every host-only change).
+
+## DONE (2026-10-21, 0.391.4): J-GPU-ETAPREVS — GPU mode J's beam merges left out the point merge at the vertex a beam left, and read a fog 4 % bright
 
 Found while testing REVIEW-0388's glass fix. On a plain fog box lit from above over a grey floor
 (scraps/rimtest/gfd_noglass.ftsl, every mode at `-max-bounce 32`, fog region against mode R):
@@ -255,6 +305,19 @@ gather-time BOW fold (`achro == 2`), which integrates the wavelength out with th
 so cannot be re-expressed per wavelength: mode J declines it for that reason. Mode M would have
 to keep the fold only while the carrier is flat and fall back to the beam's own wavelength when it
 is not, or fold the carrier into the bow table's integral.
+
+## OPEN (2026-10-21): MODEM-REDPASS — mode M reads a fog lit through a red-pass glass 8 % low in green
+
+Seen while testing REVIEW-0391's claim fix, not investigated. A fog box lit by a sphere lamp
+through a glass sphere whose `absorb table { 360:8 590:8 610:0 830:0 }` is exactly 0 above 610 nm
+(scraps/rimtest/redpass.py writes it), camera beside the fog, not looking through the glass; both
+modes at `-max-bounce 32`: mode M `-beams` 0.998 / 0.917 / 0.971 of mode R in the fog, on 0.391.4 and
+0.391.5 alike; mode J 1.020 / 1.029 / 0.971. Under `-beamachro`, 0.391.4 read 1.004 / 1.018 / 0.994,
+which only looked right: REVIEW-0391's claim fix removed a full-colour beam from every red walk and
+0.391.5 reads 0.997 / 0.897 / 0.970. The camera side is plain, so this is the light side or the
+beam gather. The steep 590-610 nm edge suggests a spectral read with too coarse a grid
+(SPECGATHER-BIN-RESOLUTION) somewhere the photon's wavelength meets the table, but nothing here
+says which. Copy the scene into `scenes/` before working on it.
 
 ## OPEN (2026-10-21): JSPEC-CARRIER-SIZE — every mode-J GPU thread reserves room for a 120-byte spectral carrier per segment and per eye vertex, chromatic scene or not
 

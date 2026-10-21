@@ -560,6 +560,8 @@ struct DMaterial {
     // overlap; INT_MIN (D_NO_PRIORITY) means "unset" -> flat air<->glass fallback. Device
     // twin of Material::priority.
     int    priority;
+    int    solidId;     // Material::solidId: the identity the medium stack knows this solid by
+    int    absorbChroma;// Material::absorbChroma: `absorb` varies over the band
     // Parametric-record REFLECT binding (§records stage 6a — device twin of the CPU
     // recordReflectBound path). recReflDriven==0 means no record drives reflect per-hit
     // (a *constant* selStop binding is instead baked straight into reflect[] at upload,
@@ -4323,14 +4325,16 @@ __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, con
     // The far side: the medium the ray comes from when it enters, the one it returns to when it
     // leaves (the stack without mi).
     DMediumStack after;
-    if (!entering) { after = stk; after.popMat(mi); }
+    // The stack knows a solid by its solidId (host twin interfaceStep).
+    const int si = m.solidId;
+    if (!entering) { after = stk; after.popMat(si); }
     const DMediumStack& outer = entering ? stk : after;
     int extMat = -1; bool ranked = false;
     const Real extIor = dExteriorIor(sc, m, outer, lambda, extMat, ranked);
     const bool suppressible = ranked && outer.topMat() >= 0 && m.priority <= outer.topPri();
     if (rec) rec->suppressible = suppressible;
     if (suppressible && !dCoatOpaque(m, lambda)) {                          // suppressed
-        if (entering) stk.push(mi, m.priority); else stk.popMat(mi);
+        if (entering) stk.push(si, m.priority); else stk.popMat(si);
         if (rec) rec->pass = true;
         outD = d; outO = dOffsetAlong(h.p, h.ng, outD); return true;
     }
@@ -4370,7 +4374,7 @@ __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, con
         rec->factor = dBranchFactor(o, refracted);
         rec->prob = dBranchProb(o, refracted);
     }
-    if (refracted) { if (entering) stk.push(mi, m.priority); else stk.popMat(mi); }
+    if (refracted) { if (entering) stk.push(si, m.priority); else stk.popMat(si); }
     outD = out; outO = dOffsetAlong(h.p, h.ng, outD);
     return true;
 }
@@ -6054,11 +6058,13 @@ __device__ static DVec3 dSampleSunOrigin(const DScene& sc, const DEmitter& em, D
     }
     return sc.sceneCenter + t * (Real)x + b * (Real)y - em.beamDir * (Real)sc.sceneRadius;
 }
-// Host twin bdpt::sunOriginPdf: the sun's origin density at disc coordinates (x, y).
+// Host twin bdpt::sunOriginPdf: the sun's origin density per unit area of the disc at disc
+// coordinates (x, y), 0 off the disc and every target.
 __device__ static double dSunOriginPdf(const DEmitter& em, double x, double y) {
     const double Rd = em.sunDiscR;
-    if (!dSunAimOn()) return 1.0 / (DPI * Rd * Rd);
-    double p = (x * x + y * y <= Rd * Rd) ? (1.0 - c_sunAimF) / (DPI * Rd * Rd) : 0.0;
+    const bool onDisc = (x * x + y * y <= Rd * Rd);
+    if (!dSunAimOn()) return onDisc ? 1.0 / (DPI * Rd * Rd) : 0.0;
+    double p = onDisc ? (1.0 - c_sunAimF) / (DPI * Rd * Rd) : 0.0;
     DVec3 t, b; onb(em.beamDir, t, b);
     int n = 0;
     for (int j = 0; j < c_sunAimN; ++j) {
@@ -6073,7 +6079,6 @@ __device__ static double dSunOriginPdf(const DEmitter& em, double x, double y) {
 // it would have started from. All in double: the disc is a scene radius upstream.
 __device__ static double dSunOriginPdfAlong(const DScene& sc, const DEmitter& em,
                                             const DVec3& curP, const DVec3& nextP) {
-    if (!dSunAimOn()) return dSunOriginPdf(em, 0.0, 0.0);
     const double R = sc.sceneRadius;
     double wx = (double)nextP.x - (double)curP.x, wy = (double)nextP.y - (double)curP.y,
            wz = (double)nextP.z - (double)curP.z;
@@ -6085,15 +6090,17 @@ __device__ static double dSunOriginPdfAlong(const DScene& sc, const DEmitter& em
     if (!(cw > 0.0)) return 0.0;
     const double p0x = (double)sc.sceneCenter.x - nx * R, p0y = (double)sc.sceneCenter.y - ny * R,
                  p0z = (double)sc.sceneCenter.z - nz * R;
-    const double sA = (((double)nextP.x - p0x) * nx + ((double)nextP.y - p0y) * ny +
-                       ((double)nextP.z - p0z) * nz) / cw;
+    const double ax = ((double)nextP.x - p0x) * nx + ((double)nextP.y - p0y) * ny +
+                      ((double)nextP.z - p0z) * nz;   // how far downstream of the disc plane
+    if (!(ax > 0.0)) return 0.0;                        // upstream: no sun subpath starts there
+    const double sA = ax / cw;
     const double ox = (double)nextP.x - wx * sA - (double)sc.sceneCenter.x;
     const double oy = (double)nextP.y - wy * sA - (double)sc.sceneCenter.y;
     const double oz = (double)nextP.z - wz * sA - (double)sc.sceneCenter.z;
     DVec3 t, b; onb(em.beamDir, t, b);
     const double x = ox * (double)t.x + oy * (double)t.y + oz * (double)t.z;
     const double y = ox * (double)b.x + oy * (double)b.y + oz * (double)b.z;
-    return dSunOriginPdf(em, x, y);
+    return dSunOriginPdf(em, x, y) / cw;                // per area across the ray (host twin)
 }
 // Host twin bdpt::mergeLightDensity: the light-side density a merge's weight reads at a site
 // whose light-side neighbour is `fromDelta`, with a delta bounce's 0 read as 1 (MODE-J-SDS,
@@ -6130,10 +6137,14 @@ struct DJSpec {   // 120 B, unpadded: one rides on every recorded segment and ey
         if (u >= (double)(DJSPEC_K - 1)) return (double)r[DJSPEC_K - 1];
         const int i = (int)u;
         const double f = u - (double)i;
-        // Geometric between two live bins (host twin JSpec::at, where the why is). In float: the
-        // bins are floats, and a double pow is a slow call on a GeForce part.
+        // Geometric between two live bins (host twin JSpec::at, where the why is), in log space:
+        // the bins span ~1e-38..1e15, so b/a can pass FLT_MAX where log2 b - log2 a cannot, and
+        // the hardware log2/exp2 cost less than a powf.
         const float a = r[i], b = r[i + 1];
-        if (a > 0.f && b > 0.f) return (double)(a * powf(b / a, (float)f));
+        if (a > 0.f && b > 0.f) {
+            const float la = __log2f(a), lb = __log2f(b);
+            return (double)exp2f(la + (float)f * (lb - la));
+        }
         return (double)a + ((double)b - (double)a) * f;
     }
 };
@@ -9951,8 +9962,10 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     {
         int cm = stk.topMat();
         Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
-        if (a > 0) {
-            beta *= exp(-a * dEvent);
+        // Glass clear at `lambda` but absorbing elsewhere in the band retires the claims too
+        // (host twin tracePhoton, Material::absorbChroma).
+        if (a > 0 || (cm >= 0 && sc.mats[cm].absorbChroma)) {
+            if (a > 0) beta *= exp(-a * dEvent);
             // Coloured glass: sigma_a is per-wavelength, and the beam record stores ONE
             // `absorb` which the gather Beer-Lamberts every wavelength with. Handing the
             // secondaries the hero's absorption would be a bias, not noise, so a beam that
@@ -15659,7 +15672,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
             if (sc.sceneRadius <= 0.0) return 0;
             double x, y;
             org = dSampleSunOrigin(sc, em, rng, x, y);
-            pdfPosD = dSunOriginPdf(em, x, y);
+            pdfPosD = dSunOriginPdf(em, x, y) / (double)ddot(dir, em.beamDir);   // across the ray
             if (!(pdfPosD > 0.0)) return 0;
         } else {
             org = em.origin;
@@ -15816,8 +15829,12 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
     if (s >= 1) qsPdfRev  = dVertexPdfF(sc, cam, (t > 1) ? &eye[tMi] : nullptr, *PtP, *QsP, lambda);
     if (s >= 2) qsMPdfRev = dVertexPdfF(sc, cam, PtP, *QsP, light[sMi], lambda);
 
+    // A sun's NEE to a point no sun subpath can reach: no camera-side alternative exists (host
+    // twin misWeight's sunMiss).
+    const bool sunMiss = s == 1 && t >= 2 && QsP->type == BV_LIGHT && QsP->lightIdx >= 0 &&
+                         sc.emitters[QsP->lightIdx].shape == 6 && !(ptPdfRev > 0.f);
     float sumRi = 0.f, ri = 1.f;
-    for (int i = t - 1; i > 0; --i) {
+    for (int i = t - 1; !sunMiss && i > 0; --i) {
         float num, den; int dl;
         if (i == ti)       { num = ptPdfRev;             den = (float)PtP->pdfFwd;   dl = 0; }
         else if (i == tMi) { num = ptMPdfRev;            den = (float)eye[i].pdfFwd; dl = eye[i].delta; }
@@ -18495,7 +18512,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 if (sc.sceneRadius <= 0.0) continue;
                 double x, yy;
                 y = dSampleSunOrigin(sc, em, rng, x, yy);
-                pdfPos = dSunOriginPdf(em, x, yy);
+                pdfPos = dSunOriginPdf(em, x, yy) / (double)ddot(dir, em.beamDir);   // across the ray
             } else {
                 y = em.origin;                             // delta position: pdfPos == 1
                 emitScale = spotFalloff(ddot(dir, em.beamDir), em.spotCosInner, em.spotCosOuter);
@@ -20500,6 +20517,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
                         m.absorb ? m.absorb(465.0) : 0.0 };
         d.rgbIor = m.ior ? m.ior(550.0) : 1.0;
         d.priority = m.priority;        // nested-dielectric priority (INT_MIN == unset)
+        d.solidId  = m.solidId((int)i); // routed copies of one material are one solid
+        d.absorbChroma = m.absorbChroma ? 1 : 0;
         d.reflectTex = m.reflectTex;
         d.triplanarScale = m.triplanarScale;
         // Fluorescence tables (zero/inert for every non-fluorescent material).
@@ -22327,6 +22346,11 @@ static void uploadSurfMapCuda(const bdpt::SurfMap* smap, DUpload& up, gpu::DSurf
         d.cx = q.cx; d.cy = q.cy; d.cz = q.cz;
         d.misIdx = q.misIdx;
     }
+    // Every SurfMis field is copied below. A field a copy misses is uploaded as 0 -- what
+    // BeamMis::etaPrevS was, for a 4 % GPU-only bias (J-GPU-ETAPREVS) -- so a change to the struct
+    // fails the build until the copy is revisited.
+    static_assert(sizeof(bdpt::SurfMis) == 40, "SurfMis changed: copy the new field into DSurfMis "
+                                               "here, then update this size");
     std::vector<gpu::DSurfMis> mis(smap->mis.size());
     for (size_t i = 0; i < smap->mis.size(); ++i) {
         const bdpt::SurfMis& m = smap->mis[i];
@@ -22505,6 +22529,9 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
     }
     size_t nMis = 0;
     if (withMis && !bmap->mis.empty()) {
+        // Every BeamMis field is copied below; see the SurfMis upload for why this trips.
+        static_assert(sizeof(BeamMis) == 56, "BeamMis changed: copy the new field into DBeamMis "
+                                             "here, then update this size");
         std::vector<gpu::DBeamMis> dm(bmap->mis.size());
         for (size_t i = 0; i < dm.size(); ++i) {
             const BeamMis& s = bmap->mis[i]; gpu::DBeamMis& d = dm[i];

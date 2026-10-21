@@ -1,0 +1,24 @@
+# A sun-lit UNBOUNDED haze seen from outside the scene's bounding sphere (tools/check_sun_rim.py).
+#
+# The bounding sphere is the prop's, 1.5 m across; the camera stands 7 m off, so most of the haze
+# it sees lies where no sun light subpath can start toward (bdpt.h sunOriginPdfAlong). Light
+# tracing cannot reach those points, so the MIS weight of the sun's NEE must not count it there.
+# Before 0.391.5 the light density read the disc's constant for any point, and mode D rendered
+# this haze at 0.215 of mode R. Every mode at one -max-bounce.
+
+scene { units meters  spectral 360 830 5 }
+
+material "grey" { type diffuse reflect 0.5 }
+
+quad { origin -1 0 -1  u 0 0 2  v 2 0 0  material grey }
+sphere { center 0 0.4 0  radius 0.4  material grey }
+
+medium { sigma_t 0.15  albedo 0.9  g 0.0 }   # no bounds: unbounded
+
+light sun { elevation 40  azimuth 30  angle 0.53  spd preset:bb5800  intensity 3 }
+
+camera "cam" {
+    eye 0 1.2 7   look_at 0 0.4 0   up 0 1 0   fov_y 40
+    mode D
+    film { res 200 150 }
+}

@@ -13,6 +13,12 @@ Each arm's floor is compared patch by patch against mode R, which lights the flo
 and never draws a sun origin. The four corner patches sit in the rim band; the fifth, mid-floor,
 is the control: if it fails too, something other than the rim is wrong.
 
+The second scene, scenes/_sun_haze.ftsl, is the other side of the same disc: a sun-lit unbounded
+haze seen from outside the bounding sphere, where no sun subpath can start toward. Light tracing
+cannot reach it, so the sun's NEE must not share its weight with it there (bdpt.h misWeight,
+`sunMiss`): mode D read that haze at 0.215 of mode R before 0.391.5. Whole frame, mode D on both
+backends against mode R.
+
 Usage::
 
     python tools/check_sun_rim.py [--spp N] [--tol PCT] [--out DIR] [--arms D-gpu,U-cpu,...] [--exe EXE]
@@ -23,13 +29,16 @@ from __future__ import annotations
 
 import argparse
 import os
-import struct
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _pfm import Linear  # noqa: E402  (scene-linear RGB, image order)
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _FTRACE = os.path.join(_REPO, "ftrace.exe")
 _SCENE = os.path.join(_REPO, "scenes", "_sun_rim.ftsl")
+_HAZE = os.path.join(_REPO, "scenes", "_sun_haze.ftsl")
 
 # name -> (mode, extra flags, spp scale). The CPU arms take fewer samples: they are slower, and
 # the tolerance is far wider than their noise.
@@ -44,51 +53,38 @@ _ARMS = {
 _PATCH = 28   # pixels a side, at the scene's 320x320
 
 
-def read_pfm(path):
-    with open(path, "rb") as f:
-        hdr = f.readline().strip()
-        if hdr not in (b"PF", b"Pf"):
-            raise ValueError("not a PFM: %r" % hdr)
-        nc = 3 if hdr == b"PF" else 1
-        line = f.readline()
-        while line.startswith(b"#"):
-            line = f.readline()
-        w, h = (int(x) for x in line.split())
-        scale = float(f.readline().strip())
-        n = w * h * nc
-        data = struct.unpack("%s%df" % ("<" if scale < 0 else ">", n), f.read(4 * n))
-    return w, h, nc, data
-
-
 def patch_mean(img, x0, y0, s):
-    w, _h, nc, d = img
     acc = 0.0
     for y in range(y0, y0 + s):
         for x in range(x0, x0 + s):
-            i = (y * w + x) * nc
-            acc += sum(d[i:i + nc])
+            acc += sum(img.at(x, y))
     return acc / (s * s)
 
 
-def patches(w):
+def frame_mean(img):
+    return sum(sum(img.at(x, y)) for y in range(img.h) for x in range(img.w)) / (img.w * img.h)
+
+
+def patches(w, h):
+    """Patch corners in image coordinates (top-down); the scene's frame is square."""
     s, m = _PATCH, 14   # inset from the frame edge: the floor starts ~8 px in
     return {
-        "corner 1": (m, m), "corner 2": (w - m - s, m),
-        "corner 3": (m, w - m - s), "corner 4": (w - m - s, w - m - s),
-        "mid floor": (w // 2 - s // 2 + 80, w // 2 - s // 2 - 80),
+        "corner 1": (m, h - m - s), "corner 2": (w - m - s, h - m - s),
+        "corner 3": (m, m), "corner 4": (w - m - s, m),
+        "mid floor": (w // 2 - s // 2 + 80, h // 2 - s // 2 + 80),
     }
 
 
-def render(exe, mode, flags, spp, out_png, log):
+def render(exe, mode, flags, spp, out_png, log, scene=_SCENE):
     # One depth for every arm: modes D, J and U default to 8 edges and mode R to 32, and a
     # comparison across two caps measures the cap, not the light.
-    cmd = [exe, "-in", _SCENE, "-camera", "top", "-mode", mode, "-spp", str(spp), "-hdr",
+    cmd = [exe, "-in", scene, "-mode", mode, "-spp", str(spp), "-hdr",
            "-max-bounce", "16", "-o", out_png] + flags
     with open(log, "w", encoding="utf-8") as lf:
         r = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT)
     if r.returncode != 0:
         raise RuntimeError("%s exited %d (log: %s)" % (" ".join(cmd), r.returncode, log))
-    return os.path.splitext(out_png)[0] + ".pfm"
+    return Linear(os.path.splitext(out_png)[0] + ".pfm")
 
 
 def main():
@@ -102,17 +98,16 @@ def main():
     a.exe = os.path.abspath(a.exe)   # CreateProcess resolves a relative path with / poorly
     os.makedirs(a.out, exist_ok=True)
 
-    ref_pfm = render(a.exe, "R", [], a.spp, os.path.join(a.out, "R.png"), os.path.join(a.out, "R.log"))
-    ref = read_pfm(ref_pfm)
-    where = patches(ref[0])
+    ref = render(a.exe, "R", [], a.spp, os.path.join(a.out, "R.png"), os.path.join(a.out, "R.log"))
+    where = patches(ref.w, ref.h)
     refm = {k: patch_mean(ref, x, y, _PATCH) for k, (x, y) in where.items()}
 
     bad = 0
     for name in a.arms.split(","):
         mode, flags, scale = _ARMS[name]
         spp = max(16, int(a.spp * scale))
-        img = read_pfm(render(a.exe, mode, flags, spp, os.path.join(a.out, name + ".png"),
-                              os.path.join(a.out, name + ".log")))
+        img = render(a.exe, mode, flags, spp, os.path.join(a.out, name + ".png"),
+                     os.path.join(a.out, name + ".log"))
         cells = []
         for k, (x, y) in where.items():
             ratio = patch_mean(img, x, y, _PATCH) / refm[k]
@@ -120,6 +115,18 @@ def main():
             bad += miss
             cells.append("%s %.3f%s" % (k, ratio, " FAIL" if miss else ""))
         print("%-12s %s" % (name, "  ".join(cells)))
+    # The haze: the frame's mean, every channel.
+    href = render(a.exe, "R", [], a.spp * 4, os.path.join(a.out, "haze_R.png"),
+                  os.path.join(a.out, "haze_R.log"), _HAZE)
+    hm = frame_mean(href)
+    for name, flags, spp in (("haze D-gpu", ["-device", "gpu"], a.spp),
+                             ("haze D-cpu", ["-device", "cpu"], max(16, a.spp // 4))):
+        img = render(a.exe, "D", flags, spp, os.path.join(a.out, name.replace(" ", "_") + ".png"),
+                     os.path.join(a.out, name.replace(" ", "_") + ".log"), _HAZE)
+        ratio = frame_mean(img) / hm
+        miss = abs(ratio - 1.0) * 100.0 > a.tol
+        bad += miss
+        print("%-12s frame %.3f%s" % (name, ratio, " FAIL" if miss else ""))
     print("check_sun_rim: %s (tolerance %.1f %% against mode R)" % ("FAIL" if bad else "ok", a.tol))
     return 1 if bad else 0
 

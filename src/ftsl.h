@@ -6447,6 +6447,7 @@ private:
         if (it != routeClone_.end()) return it->second;
         Material c = L.scene.mats[(size_t)id];
         c.route = route;
+        c.routeBase = L.scene.mats[(size_t)id].solidId(id);   // one solid with its original
         // A MIX resolves to one of its children before anything shades it, and the walks store
         // the CHILD on the vertex (bdpt.h Vertex::mat, the device's resolved matId), so the
         // route has to live on the children too: they get routed copies of their own. (A

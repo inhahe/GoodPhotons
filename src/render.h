@@ -3094,7 +3094,12 @@ struct Renderer {
                 // here, BEFORE the deposit below reads them. (Making this foldable means giving
                 // the record a per-member `absorb`, which is a second widening for a case — a
                 // beam deposited inside coloured glass — that no scene in the suite exercises.)
-                if (a > 0.0) { beta *= std::exp(-a * dEvent); retireSpectral(FK_GlassAbsorb); }
+                // Glass clear at `lambda` but absorbing elsewhere in the band retires it too
+                // (Material::absorbChroma): the photon would go on standing for the wavelengths
+                // the glass took away.
+                if (a > 0.0) beta *= std::exp(-a * dEvent);
+                const int cmA = stk.topMat();
+                if (a > 0.0 || (cmA >= 0 && scene.mats[cmA].absorbChroma)) retireSpectral(FK_GlassAbsorb);
             }
 
             // PHOTON-BEAMS single-scatter gather (CLI -beams, shared multi-camera pass).
@@ -4168,13 +4173,16 @@ struct Renderer {
         // The far side: the medium the ray comes from when it enters, the one it returns to when
         // it leaves (the stack without m).
         MediumStack after;
-        if (!st.entering) { after = stk; after.popMat((int)mi); }
+        // The stack knows a solid by Material::solidId, so routed copies of one material are one
+        // solid however its parts were tagged.
+        const int si = m.solidId((int)mi);
+        if (!st.entering) { after = stk; after.popMat(si); }
         const MediumStack& outer = st.entering ? stk : after;
         bool ranked = false;
         const double extIor = exteriorIor(scene, m, outer, lambda, st.extMat, &ranked);
         st.suppressible = ranked && outer.topMat() >= 0 && m.priority <= outer.topPri();
         if (st.suppressible && !m.coatOpaque(lambda)) {                      // suppressed
-            if (st.entering) stk.push((int)mi, m.priority); else stk.popMat((int)mi);
+            if (st.entering) stk.push(si, m.priority); else stk.popMat(si);
             st.ray = Ray{h.p + d * 1e-6, d};
             st.passThrough = true;
             st.extMat = -1;
@@ -4217,7 +4225,7 @@ struct Renderer {
         // carries flux, does not (RADIANCE-ETA2). It cancels for a ray that goes into a body and
         // out again; not for a camera path that ends inside one.
         if (tr == Transport::Radiance && st.refracted) st.scale = o.eta * o.eta;
-        if (st.refracted) { if (st.entering) stk.push((int)mi, m.priority); else stk.popMat((int)mi); }
+        if (st.refracted) { if (st.entering) stk.push(si, m.priority); else stk.popMat(si); }
         return st;
     }
 

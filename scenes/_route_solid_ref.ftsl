@@ -1,0 +1,31 @@
+# The untagged twin of _route_solid (tools/check_route_solid.py; its twin is _route_solid).
+#
+# One tinted glass cube built from six quads, a camera looking through it at a wall. Every
+# object `mode` tag gives its object a routed COPY of its material, and a ray entering the cube
+# through one face and leaving through another must still leave the solid: the medium stack knows
+# a routed copy by its original (Material::solidId). Before 0.391.5 it popped by exact material
+# index, a ray entering through a tagged face never left, and mode R -- which ignores the tags,
+# so the twins must render alike -- read the tagged cube 0.919 / 0.972 / 0.999 of the untagged.
+
+scene { units meters  spectral 360 830 5 }
+
+material "g" { type dielectric ior 1.5  absorb rgb 0.5 2 4  mode J }
+material "w" { type diffuse reflect 0.7 }
+
+quad { origin -4 -0.01 -4  u 0 0 8  v 8 0 0  material w }
+quad { origin -4 -0.01 -2  u 8 0 0  v 0 4 0  material w }
+
+quad { origin -0.5 0 -0.5  u 1 0 0  v 0 0 1  material g }   # bottom
+quad { origin -0.5 1 -0.5  u 0 0 1  v 1 0 0  material g }   # top
+quad { origin -0.5 0 0.5  u 1 0 0  v 0 1 0  material g }   # front
+quad { origin -0.5 0 -0.5  u 0 1 0  v 1 0 0  material g }   # back
+quad { origin 0.5 0 -0.5  u 0 1 0  v 0 0 1  material g }   # right
+quad { origin -0.5 0 -0.5  u 0 0 1  v 0 1 0  material g }   # left
+
+light sphere { center 1.5 3 3  radius 0.5  spd preset:bb6500 }
+
+camera "cam" {
+    eye 0.6 0.7 3.0   look_at 0 0.5 0   up 0 1 0   fov_y 40
+    mode R
+    film { res 160 120 }
+}

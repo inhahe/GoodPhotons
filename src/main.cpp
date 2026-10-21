@@ -16926,9 +16926,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             const char* jCannot = (mode == 'D' && anyJ)
                                 ? modeFeatureUnsupported(scene, 'J', cam.projection) : nullptr;
             if (jCannot) {
-                static bool said = false;
-                if (!said) {
-                    said = true;
+                static uint64_t saidFor = 0;   // once per scene, as the banner below
+                if (saidFor != scene.generation) {
+                    saidFor = scene.generation;
                     std::printf("[mode] per-object `mode J` tags set aside: mode J cannot render this "
                                 "scene's %s, so the mode-D camera renders the whole frame in mode D\n",
                                 jCannot);

@@ -55,7 +55,7 @@
 // wavelength. `any` stays false while every factor met so far was flat; at() is then exactly 1,
 // so a camera path with no chromatic factor renders bit-for-bit as before.
 struct JSpec {
-    static constexpr int K = 24;                       // SpecThr's grid: ~19.6 nm bins
+    static constexpr int K = kBandProbeBins;           // SpecThr's grid: ~19.6 nm bins
     float r[K];
     bool  any = false;
     // The carrier's magnitude, kept apart from `r`: the ratio is r * exp(logS). Inside coloured

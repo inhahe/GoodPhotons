@@ -81,6 +81,20 @@ inline const char* matTypeName(MatType t) {
     }
 }
 
+// The spectral carriers' bin count (JSpec::K, SpecThr::K), and so the wavelengths at which the
+// question "does this vary over the band?" is asked.
+constexpr int kBandProbeBins = 24;
+// Whether f(lambda) differs anywhere over the band, read at the centres of kBandProbeBins bins
+// (relative tolerance 1e-12). One predicate for every such question (Material::absorbChroma,
+// bdpt::anyMediumSigmaTChromatic), so they agree with each other and with the carriers' grid.
+template <class F> inline bool variesOverBand(const F& f) {
+    const double step = (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
+    const double a = f(LAMBDA_MIN + 0.5 * step);
+    for (int k = 1; k < kBandProbeBins; ++k)
+        if (std::fabs(f(LAMBDA_MIN + (k + 0.5) * step) - a) > 1e-12 * (1.0 + std::fabs(a))) return true;
+    return false;
+}
+
 struct Material {
     MatType type = MatType::Diffuse;
     // reflect means: diffuse albedo / mirror tint / glossy tint / half-mirror
@@ -105,6 +119,10 @@ struct Material {
     // Dielectric's, and a thin-film or multilayer body's substrate (all three join the medium
     // stack -- Renderer::interfaceStep).
     Spectrum absorb  = constantSpectrum(0.0);
+    // `absorb` varies over the band (variesOverBand), baked by Scene::build(). A light walk's
+    // spectral claim cannot cross such glass even where it is clear at the walk's own wavelength:
+    // the photon would go on standing for wavelengths the glass took away.
+    bool absorbChroma = false;
     // The characteristic THICKNESS `absorb` was authored against, in scene units, or 0
     // when nobody said. Beer-Lambert absorption is a coefficient per unit length, so on
     // its own it cannot say how dark a piece of this glass looks — that needs a distance,
@@ -159,6 +177,13 @@ struct Material {
     // meets up to and including its first non-specular vertex, and mode J's merges run only on a
     // J-routed path (bdpt::routeOfEye, design.md "Per-object modes"). ROUTE_D / ROUTE_J below.
     int route = -1;
+    // A routed copy's original (the material the loader copied for `mode`), or -1 for an
+    // original. The copies differ only in `route`, so a dielectric solid built from parts tagged
+    // differently is still ONE solid: MediumStack pushes and pops it by this identity
+    // (Material::solidId), or a ray entering through a tagged part and leaving through an untagged
+    // one would never leave it.
+    int routeBase = -1;
+    int solidId(int self) const { return routeBase >= 0 ? routeBase : self; }
     // Spatially-varying diffuse albedo: index into Scene::textures (-1 = use the
     // constant `reflect` spectrum). When set, the reflectance at a hit is the
     // texture's per-texel Jakob-Hanika reflectance sampled at the surface (u,v).
@@ -1854,6 +1879,7 @@ struct Scene {
             coat.mixChildren.clear();
             coat.mixWeights.clear();
             coat.coatChild = -1;
+            coat.routeBase = -1;              // a material of its own, not a routed copy
             coat.isLight = false;
             coat.reflectsNothing = false;
             mats[i].coatChild = (int)mats.size();
@@ -1873,6 +1899,7 @@ struct Scene {
                 const int cid = mats[i].mixChildren[k];
                 if (cid < 0 || cid >= (int)mats.size()) continue;
                 Material body = mats[(size_t)cid];
+                body.routeBase = -1;          // a material of its own, not a routed copy
                 if (body.coatFdr > 0.0) continue;          // already a body copy (idempotent)
                 // `scatter none` (glTF's model): no internal bounce, so no exit series -- the
                 // body keeps its authored albedo under the coat (coatedAlbedoAt returns it as is)
@@ -3120,6 +3147,8 @@ struct Scene {
         finalizeEmissiveVolumes();
         finalizeBowLuts();
         finalizeLayeredCoats();
+        // After the coats, which append materials. Whole-band probes, once, rather than per walk.
+        for (auto& m : mats) m.absorbChroma = variesOverBand([&](double L) { return m.absorb(L); });
     }
     void finalizeTris() { build(); }   // kept for existing call sites
 
