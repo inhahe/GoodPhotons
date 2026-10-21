@@ -2122,7 +2122,13 @@ realization is a static rainbow-barred curtain. `-beamepochs` splits the frame's
 equal epochs, epoch *e* drawn under salt *e* (the same `buildLightSide(e, saltOff)` the refresh
 uses; only the epoch's *end* moves from the clock to the sample count, `renderChunked`). Since
 the light side is view-independent, every frame averages the same K realizations: as coherent
-as the freeze, as averaged as the refresh, at the refresh's cost. Two details keep it exact:
+as the freeze, as averaged as the refresh, at the refresh's cost. The epochs are laid over the
+frame's absolute sample indices (epoch ⌊n/⌈T/K⌉⌋ for sample n of a frame totalling T), not over
+the samples this run adds, so a frame resumed to the same total draws the same light-side
+realizations as a straight render (measured with one-sample epochs, stopped at 11 of 16 spp and
+resumed: 0.9 % mean film difference, against 10^-17 between two straight runs; the likely residue,
+not yet isolated, is the beam split, which `buildBeamMap` sizes from the run's spp). Two more
+details keep it exact:
 the device's surface-photon map is redrawn per *chunk* salted by the chunk's first sample, so
 the GPU chunks are pinned to 1 spp (`cudaSetFixedChunks`) and fall on the same samples in every
 frame; and it needs a fixed `-spp` — a `-time`/`-noise` budget has no total to split.
@@ -2230,10 +2236,13 @@ returns. Both mattered. The estimate used the grid and over-reported by a third 
 the 11.4 GB actually reserved), and the preflight counted the whole reservation as still needed,
 so frame 2 of every GPU mode-`J` flyby found 11.3 GB free against 11.4 GB "wanted", blamed "some
 other process", and every frame after the first rendered on the CPU. The estimate now uses
-resident threads, and the preflight subtracts what this process's context already holds —
+resident threads, and the preflight knows what this process's context already holds —
 measured, not tracked: `cudaLocalReservedBytes` is the context's stack limit (which the driver
 raises to the largest kernel launched) times resident threads, 0.19 GB fresh and 11.40 GB after
-one mode-`J` frame, exactly the drop in free memory.
+one mode-`J` frame, exactly the drop in free memory. A launch that fits in that reservation
+needs none of its local memory anew; one that does not is charged all of it, since nothing says
+the driver grows the old block in place. The near-full test, which is about *other* programs,
+adds back everything that is ours (the reservation and OIDN's memory cap).
 
 **The bug the gates caught.** Gate 1a — mode `J` == mode `D` bit-for-bit on a media-free scene —
 failed on the first build, and not for any reason involving merges: mode `J` was passing `heroC = 1`
@@ -6499,13 +6508,19 @@ as the one at fault.
     git-ignored download) and resolves the fifteen C entry points it uses by name. `run()` loads
     it before the scene is built (`oidnStartup`), so a machine without it fails at the start,
     not after hours of undenoised frames. One device, filter and buffer set live for the
-    process, rebuilt only when the image shape changes, behind a mutex; they are never released,
-    because a CUDA device torn down by a static destructor races the runtime's own exit.
+    process, rebuilt only when the image shape changes, behind a mutex, the guides uploaded once
+    per guide set (keyed by `Images::id`, never by address, which a freed set can hand on).
+    `main` releases them (`oidnrt::shutdown`) just before `cudaGracefulShutdown`, which it then
+    runs even when ftrace's own CUDA never started if OIDN was on a GPU, so OIDN's context is
+    not left for the driver to reap after exit. OIDN's device follows `-device cpu` unless
+    `-oidn-device` says otherwise, and its requested memory cap (`maxMemoryMB`, 1 GB) counts as
+    this process's in the VRAM preflight.
   - **Guide images** (`denoise_guide.h`): per pixel, the albedo and world-space shading normal
     of the first surface that is *not* a perfect specular, which is what OIDN's README asks for
     and what lets it keep the floor grid, marble veining and silhouettes while it smooths. A
-    guide ray follows clear glass, mirrors, gels and near-mirror glossy lobes (roughness < 0.05)
-    by mode W's deterministic step (`Renderer::interfaceStep(..., whitted)`) at 550 nm, tinting
+    guide ray follows clear glass, mirrors, gels and near-mirror glossy lobes (roughness < 0.05;
+    frosted glass at or above it stops the ray, as a rough lobe does, since the render blurs what
+    is behind it) by mode W's deterministic step (`Renderer::interfaceStep(..., whitted)`) at 550 nm, tinting
     by mirror colour, gel transmittance and coloured glass's Beer–Lambert along the way; media
     are ignored. 16 stratified rays a pixel (`-oidn-guide-spp`), so they are antialiased like
     the box-filtered film. Deterministic, hence passed as `cleanAux`, and world-space so a
@@ -6519,7 +6534,9 @@ as the one at fault.
     film images through the finite lens and is blurred out of focus where a pinhole guide is
     sharp. The `.ftbuf` keeps the raw film, so `-resume` re-denoises the larger total and
     `-topng -oidn -oidn-guides <stem>` re-develops a checkpoint against the guides a render
-    saved with `-oidn-write-guides`. OIDN gets the image **upright** (the film is stored
+    saved with `-oidn-write-guides` (a `<stem>.guides-noisy.txt` beside them, written for a lens
+    camera's pupil-sampled guides, turns `cleanAux` off). `-explore`, whose deterministic preview
+    is developed in bands, turns `-oidn` off. OIDN gets the image **upright** (the film is stored
     bottom-up): its network is not flip-symmetric — 6 % mean absolute difference between the two
     orientations of one 64 spp frame — and upright is what it was trained on and what
     `oidnDenoise` feeds it, which this path reproduces bit for bit.

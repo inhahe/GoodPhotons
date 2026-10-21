@@ -205,6 +205,10 @@ public:
     // True once the user has closed the window — lets the render stop early.
     bool closed() const;
 
+    // True while the window is minimized to the taskbar, where a frame pushed to it cannot be
+    // seen: the caller may skip preparing one (main.cpp liveWindowUpdate). Thread-safe.
+    bool minimized() const;
+
     // Return (and clear) the accumulated fly-camera input since the last call: mouse-look
     // deltas, wheel-throttle notches, the current held state of the forward/back throttle
     // keys, and the one-shot reset/print edges. Thread-safe. See NavInput for units.

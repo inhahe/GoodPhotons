@@ -25,6 +25,7 @@ void LiveWindow::update(int, int, const std::vector<uint8_t>&) {}
 bool LiveWindow::renderShared(int, int, const std::function<bool(void*, void*)>&) { return false; }
 void LiveWindow::setTitle(const std::string&) {}
 bool LiveWindow::closed() const { return false; }
+bool LiveWindow::minimized() const { return false; }
 NavInput LiveWindow::drainNav() { return {}; }
 bool LiveWindow::clientSize(int&, int&) const { return false; }
 double LiveWindow::scale() const { return 1.0; }
@@ -2093,6 +2094,12 @@ void LiveWindow::setTitle(const std::string& utf8) {
 }
 
 bool LiveWindow::closed() const { return impl_ && impl_->closedFlag.load(); }
+
+bool LiveWindow::minimized() const {
+    if (!impl_) return false;
+    const HWND h = impl_->hwnd.load();
+    return h && IsIconic(h);
+}
 
 NavInput LiveWindow::drainNav() {
     if (!impl_) return {};

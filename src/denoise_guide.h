@@ -31,7 +31,9 @@
 // pixel reconstruction filter as the beauty image").
 #pragma once
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 #include "camera.h"
 #include "color.h"
@@ -48,8 +50,9 @@ constexpr double kGuideLambda = 550.0;
 // Path vertices followed through specular surfaces before giving up (the pixel then keeps
 // what it has, albedo 0). The deepest stacks in the gallery are ~8 interfaces.
 constexpr int kMaxDepth = 32;
-// A Glossy lobe narrower than this is treated as a mirror: its reflection is sharp in the
-// render, so the guide should carry the reflected surface, not the metal's flat tint.
+// A Glossy lobe narrower than this is treated as a mirror, and a Dielectric this smooth as
+// clear glass: what they show is sharp in the render, so the guide carries that surface. At or
+// above it they blur it, and the guide stops at them (their tint, their normal).
 constexpr double kMirrorRoughness = 0.05;
 
 struct Images {
@@ -57,7 +60,31 @@ struct Images {
     std::vector<Vec3> albedo;   // linear sRGB in [0,1]
     std::vector<Vec3> normal;   // world-space shading normal, averaged over the pixel
     bool clean = true;          // deterministic (see the header comment)
+    // What the denoiser is handed, made once by seal(): the two images as float RGB rows,
+    // UPRIGHT (row 0 = the top of the image; the film is stored bottom-up), and an id unique
+    // to this guide set, so the denoiser uploads them once rather than at every write.
+    std::vector<float> albedoUp, normalUp;
+    uint64_t id = 0;
 };
+
+// Fill `g`'s denoiser-side copies and id. Call once the images are final.
+inline void seal(Images& g) {
+    static std::atomic<uint64_t> nextId{1};
+    const size_t N = (size_t)g.W * (size_t)g.H;
+    auto pack = [&](const std::vector<Vec3>& v, std::vector<float>& out) {
+        out.assign(N * 3, 0.0f);
+        if (v.size() != N) return;
+        for (int y = 0; y < g.H; ++y)
+            for (int x = 0; x < g.W; ++x) {
+                const Vec3& p = v[(size_t)(g.H - 1 - y) * g.W + x];
+                float* q = &out[((size_t)y * g.W + x) * 3];
+                q[0] = (float)p.x; q[1] = (float)p.y; q[2] = (float)p.z;
+            }
+    };
+    pack(g.albedo, g.albedoUp);
+    pack(g.normal, g.normalUp);
+    g.id = nextId.fetch_add(1);
+}
 
 // Spectrum -> linear sRGB for a REFLECTANCE (a value in [0,1] per wavelength): K samples of
 // the CIE 1931 observer, weighted so that a flat 1 maps to (1,1,1) exactly. Reflectance
@@ -134,6 +161,13 @@ inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& al
             case MatType::Dielectric:
             case MatType::ThinFilm:
             case MatType::Multilayer: {
+                // Frosted glass blurs what is behind it in the render (interfaceStep jitters the
+                // lobe; its whitted step, used here, does not), so the guide stops at it, as at a
+                // rough Glossy lobe: a clear surface's albedo, 1, and its own normal.
+                if (m.type == MatType::Dielectric &&
+                    materialRoughness(scene, m, h) >= kMirrorRoughness) {
+                    alb = alb + tint; nrm = nrm + h.n; return;
+                }
                 const Renderer::InterfaceStep st =
                     rr.interfaceStep(scene, m, h, ray.d, kGuideLambda, rng, stk,
                                      Renderer::Transport::Radiance, /*whitted=*/true);
@@ -216,6 +250,7 @@ inline Images render(const Scene& scene, const Camera& cam, int W, int H, int si
     });
     if (!ok) return Images{};
     g.W = W; g.H = H;
+    seal(g);
     return g;
 }
 

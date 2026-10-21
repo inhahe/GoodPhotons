@@ -9,6 +9,10 @@ path alone, rendered at 16x16 with one sample, counting the images written:
   - `-camera all`: everything; `-camera dolly`: the path's frames, nothing named as skipped;
   - a scene of paths alone, no `-camera`: its frames;
   - `-camera dolly -frames 1 2`: two frames;
+  - `-camera dolly -frames 2 2`: one frame, written under its own name in the path's directory
+    like the frames of a longer range (so resuming at a path's last frame finds its files),
+    while `-camera dolly2` -- the frame named exactly -- and a still matched by prefix
+    (`-camera cam` finding `cam1`) still write `-o` itself;
   - `-frames` without a path named by `-camera` (none, or a still), or on a built-in scene:
     refused with a message.
 
@@ -35,6 +39,8 @@ DOLLY = ('camera_path "dolly" { look_at 0 0 0  up 0 1 0  fov_y 40  frames 3  fil
          + '    key 0 0 1 3' + NL + '    key 1 1 1 3 }')
 SPIN = ('camera_orbit "spin" { center 0 0.5 0  radius 3  height 0.5  up 0 1 0  fov_y 40  frames 4'
         + '  film { res 16 16 } }')
+CAM1 = 'camera "cam1" { eye 0 1 3  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 16 16 } }'
+HERO = 'camera "hero" { eye 1 1 3  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 16 16 } }'
 
 
 def main():
@@ -46,7 +52,7 @@ def main():
 
 
 def check_all(exe, d):
-    for name, blocks in (("mixed", [STILL, DOLLY, SPIN]), ("paths", [DOLLY])):
+    for name, blocks in (("mixed", [STILL, DOLLY, SPIN]), ("paths", [DOLLY]), ("stills", [CAM1, HERO])):
         with open(os.path.join(d, name + ".ftsl"), "w", encoding="utf-8", newline="") as f:
             f.write(NL.join(COMMON + blocks) + NL)
 
@@ -83,6 +89,18 @@ def check_all(exe, d):
           "a scene of paths alone renders them without -camera (exit %d, %d images)" % (rc, n))
     rc, log, n = run("range", "mixed", ["-camera", "dolly", "-frames", "1", "2"])
     check(rc == 0 and n == 2, "-camera dolly -frames 1 2 renders 2 frames (exit %d, %d images)" % (rc, n))
+    rc, log, n = run("one", "mixed", ["-camera", "dolly", "-frames", "2", "2"])
+    framed = glob.glob(os.path.join(d, "one", "img_dolly", "img_dolly*2.png"))
+    check(rc == 0 and n == 1 and len(framed) == 1,
+          "-camera dolly -frames 2 2 writes its one frame as img_dolly/img_dolly<n>.png "
+          "(exit %d, %d images, %d in the path's directory)" % (rc, n, len(framed)))
+    frame = os.path.basename(framed[0])[len("img_"):-len(".png")] if framed else "dolly2"
+    rc, log, n = run("exact", "mixed", ["-camera", frame])
+    check(rc == 0 and n == 1 and os.path.exists(os.path.join(d, "exact", "img.png")),
+          "-camera %s (one frame named exactly) writes -o itself (exit %d, %d images)" % (frame, rc, n))
+    rc, log, n = run("prefix", "stills", ["-camera", "cam"])
+    check(rc == 0 and n == 1 and os.path.exists(os.path.join(d, "prefix", "img.png")),
+          "-camera cam (a still matched by prefix) writes -o itself (exit %d, %d images)" % (rc, n))
     rc, log, n = run("framesbare", "mixed", ["-frames", "0", "1"])
     check(rc != 0 and n == 0 and "needs -camera" in log,
           "-frames without -camera is refused (exit %d, %d images)" % (rc, n))

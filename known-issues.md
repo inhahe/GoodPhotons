@@ -118,6 +118,22 @@ each `-interval`; guides for all of them at once cost 2 x 24 B a pixel per camer
 frames at 960x540), so it wants them rendered at the final write only, or cached on disk beside
 each frame.
 
+## OPEN (2026-10-20, 0.391.0): BEAMEPOCHS-CHUNK-PIN — `-beamepochs` pins the GPU chunks to 1 spp
+
+The device redraws mode J's surface-photon map per CHUNK, salted by the chunk's first sample
+(`render_cuda.cu`, `jPerChunk` / `jSurfSalt`), and the chunk size adapts to timing. For the
+redraws to fall on the same samples in every frame, `-beamepochs` pins chunks to 1 spp
+(`cudaSetFixedChunks`). On the expensive media frames the flag is for, that changes nothing --
+`gpuSppChunks` already settles on 1 spp when a sample takes longer than its 0.15 s target
+(gallery_rain: 0.5-1.8 s a sample). On a CHEAP scene it costs: a film download, report and merge
+per sample, and the per-chunk realization split (`jSplitN = 4`) goes inert, so the surface map is
+redrawn once per sample instead of four times per adaptive chunk.
+
+**Fix:** make the redraw schedule independent of the chunking -- redraw whenever the absolute
+sample index crosses a fixed block boundary (split a chunk at the boundaries it spans), as the
+light side's epochs already are under `-beamepochs`. Then the chunker can keep adapting and the
+pin and its global switch go. (Both reviewers of 0.391.0 suggested this or a fixed chunk size.)
+
 ## OPEN (2026-10-18): PER-OBJECT-MODES — what per-object render modes do not do yet
 
 `mode D` / `mode J` per object, group, fur, material or medium shipped in 0.386.0 (FTSL.md §16.1,

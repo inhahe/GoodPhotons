@@ -8,6 +8,8 @@
 //
 // Kept in its own translation unit so <windows.h> stays out of main.cpp.
 #pragma once
+#include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace oidnrt {
@@ -29,15 +31,29 @@ struct Options {
 //            only alongside an albedo, so a normal without an albedo is ignored.
 //   cleanAux the guides are noise-free (OIDN then trusts their edges fully; set it only when
 //            they are deterministic, or their noise is printed into the result).
+//   auxKey   identifies this guide set (nonzero, unique to it): the guides are uploaded only
+//            when it differs from the last call's, since a camera's guides do not change
+//            during its render. 0 uploads them every call.
 // Thread-safe: calls are serialised, and the device, filter and buffers persist between
 // calls, so after the first one a frame costs only the copies and the filter itself.
+// The device's selection (`opt.device`) is fixed by the first call.
 // Returns false with `err` set if the library cannot be found or loaded or the filter fails;
 // a failed load is remembered, so later calls fail at once with the same message.
 bool denoise(float* color, const float* albedo, const float* normal, int W, int H,
-             bool cleanAux, const Options& opt, std::string& err);
+             bool cleanAux, uint64_t auxKey, const Options& opt, std::string& err);
 
 // One line for the log naming the library loaded and the device it runs on, or the reason
 // it did not load; "" until the first denoise() call.
 std::string describe();
+
+// Device memory OIDN may be holding on a GPU (its requested cap plus slack): this process's,
+// for a preflight that must not blame it on another program. 0 on the CPU or when not loaded.
+size_t deviceMemoryAllowance();
+
+// Release the filter, its buffers and the device. Call once, before the process's CUDA
+// teardown, so OIDN's GPU context is not left for the driver to reap after exit. Returns true
+// if the device was a GPU's (the caller should then tear CUDA down even if it never used it
+// itself). Later denoise() calls fail.
+bool shutdown();
 
 }  // namespace oidnrt

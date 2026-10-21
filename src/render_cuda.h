@@ -56,8 +56,10 @@ size_t cudaLocalReservedBytes();
 // the whole machine (observed as BSOD/reboot "a couple seconds after the window closed",
 // worst with an abrupt kill). Draining + resetting synchronously here removes that
 // window: by the time we return there is no live GPU work and no context left to reap.
-// No-op (and safe to call) when CUDA is unavailable or was never initialised.
-void cudaGracefulShutdown();
+// No-op (and safe to call) when CUDA is unavailable or was never initialised -- unless
+// `force`, which says another user of the driver in this process (OIDN on the GPU) has had a
+// context: the device is then brought up and reset anyway, so no context is left to reap.
+void cudaGracefulShutdown(bool force = false);
 
 // True if this scene can be rendered on the GPU (no unsupported material such as
 // Fluorescent). When false, the caller must use the CPU renderer.

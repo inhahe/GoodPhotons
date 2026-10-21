@@ -20004,10 +20004,12 @@ static void teardownLog(const char* step) {
     std::fclose(f);
 }
 
-void cudaGracefulShutdown() {
+void cudaGracefulShutdown(bool force) {
     // Only touch the driver if a device was actually brought up; probing when none is
     // present (or CUDA never initialised) would needlessly spin up a context just to
-    // tear it down. cudaAvailable() is cached and cheap.
+    // tear it down. cudaAvailable() is cached and cheap. `force`: another library in this
+    // process (OIDN) used the GPU, so its context is there to tear down even if ours never was.
+    if (!g_queried && force) cudaAvailable();
     if (!g_queried) { teardownLog("cuda: never initialised, skip"); return; }  // CUDA path never taken
     if (!g_available) { teardownLog("cuda: no device, skip"); return; }        // no usable device
     // Drain outstanding work first so the reset doesn't race a still-running kernel /
@@ -23042,10 +23044,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
 // traces a single sample — on this project that is GIGABYTES, not megabytes. Resident, not
 // the 2048 x 128 launch grid: the grid's 262144 threads run in waves of the card's resident
 // capacity (196608 on an RTX 4090: 128 SMs x 1536), and the measured reservation is exactly
-// localSizeBytes x 196608 (11.43 GB for gallery_rain's mode-J kernel at 62.4 KB a thread,
-// where x 262144 had predicted 15.2). The context then KEEPS that reservation after the
-// kernel returns, which is what the caller's preflight has to know (main.cpp, runRender):
-// a second frame finds the card that much emptier, and the memory is its own.
+// localSizeBytes x resident threads (11.43 GB for gallery_rain's mode-J kernel at 62.4 KB a
+// thread). The context then KEEPS that reservation after the kernel returns, which the
+// caller's preflight has to know (main.cpp, runRender): a later render finds the card that
+// much emptier, and the memory is its own.
 //
 // When another process has filled the card, that allocation does NOT fail. The WDDM driver
 // backs the spill with host memory across PCIe and the kernel simply CRAWLS — measured at

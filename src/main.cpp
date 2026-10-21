@@ -11730,6 +11730,7 @@ static bool            g_oidnGuides      = true;    // -oidn-noguides: denoise t
 static int             g_oidnGuideSide   = 4;       // -oidn-guide-spp n: sqrt(n) rays a side per pixel
 static bool            g_oidnWriteGuides = false;   // -oidn-write-guides: the guides as PFMs beside -o
 static oidnrt::Options g_oidnOpts;
+static bool            g_oidnDeviceSet   = false;   // -oidn-device given; else it follows -device
 
 // The guides of the camera runRender is rendering, or null: published by GuideScope and read
 // by filmToLinear for any film of their size. A film of another camera never meets them, since
@@ -11748,35 +11749,38 @@ static void setGuide(std::shared_ptr<const dguide::Images> g) {
 
 // The -oidn flags, shared like parseDenoiseFlag's: `-oidn`, `-oidn-noguides`,
 // `-oidn-write-guides`, `-oidn-guide-spp <n>`, `-oidn-quality high|balanced|fast`,
-// `-oidn-device auto|cpu|cuda`. Each turns -oidn on. A value it does not know is fatal: a
-// misspelt quality must not quietly become a 30-hour flyby at the default.
-static bool parseOidnFlag(int argc, char** argv, int& i) {
+// `-oidn-device auto|cpu|cuda`. Each turns -oidn on. Returns 1 if argv[i] was one of them
+// (leaving `i` on its last token), 0 if not, and -1 -- the reason printed -- for a value it does
+// not know, which the caller must treat as fatal: a misspelt quality must not quietly become a
+// 30-hour flyby at the default. Returned, not exited, so under -serve it ends one frame.
+static int parseOidnFlag(int argc, char** argv, int& i) {
     const char* a = argv[i];
     if      (!std::strcmp(a, "-oidn"))              {}
     else if (!std::strcmp(a, "-oidn-noguides"))     g_oidnGuides = false;
     else if (!std::strcmp(a, "-oidn-write-guides")) g_oidnWriteGuides = true;
-    else if (i + 1 >= argc)                         return false;
+    else if (i + 1 >= argc)                         return 0;
     else if (!std::strcmp(a, "-oidn-guide-spp")) {
         const int n = std::atoi(argv[++i]);
-        if (n < 1) { std::fprintf(stderr, "error: -oidn-guide-spp wants a count >= 1\n"); std::exit(2); }
+        if (n < 1) { std::fprintf(stderr, "error: -oidn-guide-spp wants a count >= 1\n"); return -1; }
         g_oidnGuideSide = std::max(1, (int)std::lround(std::sqrt((double)n)));
     } else if (!std::strcmp(a, "-oidn-quality")) {
         const char* v = argv[++i];
         if      (!std::strcmp(v, "high"))     g_oidnOpts.quality = oidnrt::Quality::High;
         else if (!std::strcmp(v, "balanced")) g_oidnOpts.quality = oidnrt::Quality::Balanced;
         else if (!std::strcmp(v, "fast"))     g_oidnOpts.quality = oidnrt::Quality::Fast;
-        else { std::fprintf(stderr, "error: -oidn-quality '%s': use high, balanced or fast\n", v); std::exit(2); }
+        else { std::fprintf(stderr, "error: -oidn-quality '%s': use high, balanced or fast\n", v); return -1; }
     } else if (!std::strcmp(a, "-oidn-device")) {
         const char* v = argv[++i];
         if      (!std::strcmp(v, "auto")) g_oidnOpts.device = oidnrt::Device::Default;
         else if (!std::strcmp(v, "cpu"))  g_oidnOpts.device = oidnrt::Device::Cpu;
         else if (!std::strcmp(v, "cuda")) g_oidnOpts.device = oidnrt::Device::Cuda;
-        else { std::fprintf(stderr, "error: -oidn-device '%s': use auto, cpu or cuda\n", v); std::exit(2); }
+        else { std::fprintf(stderr, "error: -oidn-device '%s': use auto, cpu or cuda\n", v); return -1; }
+        g_oidnDeviceSet = true;
     } else {
-        return false;
+        return 0;
     }
     g_oidn = true;
-    return true;
+    return 1;
 }
 
 // Load OIDN now, before any rendering, so a machine without it fails at the start rather than
@@ -11785,7 +11789,7 @@ static bool parseOidnFlag(int argc, char** argv, int& i) {
 static bool oidnStartup() {
     std::vector<float> probe(8 * 8 * 3, 0.5f);
     std::string err;
-    if (!oidnrt::denoise(probe.data(), nullptr, nullptr, 8, 8, false, g_oidnOpts, err)) {
+    if (!oidnrt::denoise(probe.data(), nullptr, nullptr, 8, 8, false, 0, g_oidnOpts, err)) {
         std::fprintf(stderr, "error: -oidn: %s\n", err.c_str());
         return false;
     }
@@ -11814,25 +11818,21 @@ static void oidnApply(std::vector<Vec3>& lin, int W, int H) {
         g = nullptr;
     }
     // OIDN gets the image UPRIGHT, row 0 at the top, which is the reverse of the film's order.
-    // Its network was trained on upright images and is not symmetric under a flip: measured on
-    // gallery_rain's frame 100 at 64 spp, the same input denoised the film's way up and the
-    // right way up differed by 6 % mean absolute. Upright is also the orientation oidnDenoise
-    // feeds it, so this path reproduces the reference tool's output exactly.
-    auto pack = [N, W, H](const std::vector<Vec3>& v) {
-        std::vector<float> f(N * 3);
-        for (int y = 0; y < H; ++y)
-            for (int x = 0; x < W; ++x) {
-                const Vec3& p = v[(size_t)(H - 1 - y) * W + x];
-                float* q = &f[((size_t)y * W + x) * 3];
-                q[0] = (float)p.x; q[1] = (float)p.y; q[2] = (float)p.z;
-            }
-        return f;
-    };
-    std::vector<float> c = pack(lin), al, nr;
-    if (g) { al = pack(g->albedo); nr = pack(g->normal); }
+    // Its network was trained on upright images and is not symmetric under a flip (two
+    // orientations of one 64 spp frame differ by 6 % mean absolute); upright is also what
+    // oidnDenoise feeds it, so this path reproduces the reference tool exactly. The guides were
+    // packed the same way once, by dguide::seal.
+    std::vector<float> c(N * 3);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const Vec3& p = lin[(size_t)(H - 1 - y) * W + x];
+            float* q = &c[((size_t)y * W + x) * 3];
+            q[0] = (float)p.x; q[1] = (float)p.y; q[2] = (float)p.z;
+        }
     std::string err;
-    if (!oidnrt::denoise(c.data(), g ? al.data() : nullptr, g ? nr.data() : nullptr, W, H,
-                         g && g->clean, g_oidnOpts, err)) {
+    if (!oidnrt::denoise(c.data(), g ? g->albedoUp.data() : nullptr,
+                         g ? g->normalUp.data() : nullptr, W, H, g && g->clean,
+                         g ? g->id : 0, g_oidnOpts, err)) {
         static std::atomic<int> fails{0};
         const int k = fails++;
         if (k % 100 == 0)
@@ -11920,15 +11920,19 @@ struct AbsDark {
 static constexpr int kAbsDarkByte = 8;
 // `outLin`, if given, receives the scene-linear buffer the bytes were made from (filmToLinear's,
 // denoised) -- so a caller that also wants it, the -hdr sidecar, does not reduce and denoise the
-// film a second time.
+// film a second time. `inLin`, if given, IS that buffer for this film and N, already made (by a
+// write in the same report), and is used instead of reducing the film again.
 static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
                                        bool absolute, double* lockAnchor,
                                        double* outEAuto = nullptr,
                                        double* outExposure = nullptr,
                                        AbsDark* dark = nullptr,
-                                       std::vector<Vec3>* outLin = nullptr) {
+                                       std::vector<Vec3>* outLin = nullptr,
+                                       const std::vector<Vec3>* inLin = nullptr) {
     const int W = f.resX, H = f.resY;
-    std::vector<Vec3> lin = filmToLinear(f, N);
+    std::vector<Vec3> linOwn;
+    if (!inLin) linOwn = filmToLinear(f, N);
+    const std::vector<Vec3>& lin = inLin ? *inLin : linOwn;
     double eAuto;
     double exposure;
     if (absolute) {
@@ -11989,7 +11993,7 @@ static std::vector<uint8_t> filmToRgb8(const Film& f, double N, double expComp,
     }
     if (outEAuto)    *outEAuto = eAuto;
     if (outExposure) *outExposure = exposure;
-    if (outLin)      *outLin = std::move(lin);
+    if (outLin)      *outLin = inLin ? *inLin : std::move(linOwn);
     return img;
 }
 
@@ -12037,26 +12041,10 @@ static bool readPfm(const std::string& path, int& W, int& H, std::vector<Vec3>& 
                     std::string& err) {
     std::ifstream fi(path, std::ios::binary);
     if (!fi) { err = "cannot open " + path; return false; }
-    std::string magic;
-    double scale = 0.0;
-    fi >> magic >> W >> H >> scale;
-    fi.get();                                       // the one whitespace after the scale
-    if (magic != "PF" || !fi || W <= 0 || H <= 0 || scale == 0.0) {
-        err = path + " is not a colour PFM";
-        return false;
-    }
-    std::vector<float> buf((size_t)W * H * 3);
-    fi.read((char*)buf.data(), (std::streamsize)(buf.size() * sizeof(float)));
-    if (fi.gcount() != (std::streamsize)(buf.size() * sizeof(float))) {
-        err = path + " is shorter than its header says";
-        return false;
-    }
-    if (scale > 0.0)                                // big-endian
-        for (float& x : buf) {
-            uint32_t u; std::memcpy(&u, &x, 4);
-            u = (u >> 24) | ((u >> 8) & 0xFF00u) | ((u << 8) & 0xFF0000u) | (u << 24);
-            std::memcpy(&x, &u, 4);
-        }
+    int comp = 0;
+    std::vector<float> buf;
+    if (!parsePfm(fi, W, H, comp, buf, err)) { err = path + ": " + err; return false; }
+    if (comp != 3) { err = path + " is a grayscale PFM, not a colour one"; return false; }
     out.resize((size_t)W * H);
     for (size_t i = 0; i < out.size(); ++i) out[i] = Vec3{buf[3 * i], buf[3 * i + 1], buf[3 * i + 2]};
     return true;
@@ -12106,6 +12094,18 @@ struct GuideScope {
                 if (writePfm(p, W, H, *img)) std::printf("wrote %s\n", p.c_str());
                 else std::fprintf(stderr, "warning: could not write %s\n", p.c_str());
             }
+            // A PFM has nowhere to say its guides are noisy, and -topng -oidn-guides must not
+            // then treat them as clean: a marker beside them says so (and its absence, clean).
+            const std::string noisy = stem + ".guides-noisy.txt";
+            if (!g->clean) {
+                std::ofstream mk(noisy);
+                mk << "The guides beside this file were traced through a physical lens, whose "
+                      "pupil is sampled: they are not noise-free, and -topng -oidn-guides denoises "
+                      "against them with OIDN's cleanAux off.\n";
+            } else {
+                std::error_code ec;
+                std::filesystem::remove(noisy, ec);   // a stale one from an earlier lens render
+            }
         }
         setGuide(std::move(g));
         active = true;
@@ -12137,16 +12137,22 @@ static void warnAbsDark(const char* path, double evUnder) {
         path, ABS_EXPOSURE_GAIN, evUnder, std::pow(2.0, evUnder));
     std::fflush(stderr);
 }
+// `linOut`, if given, receives the scene-linear (denoised) buffer the image was made from, for a
+// live-window repaint of the same film in the same report (liveWindowUpdate's `lin`).
 static bool writeFilm(const char* path, const Film& f, double N, double expComp = 0.0,
                       bool quiet = false, double* lockAnchor = nullptr,
-                      bool absolute = false) {
+                      bool absolute = false, std::vector<Vec3>* linOut = nullptr) {
     const int W = f.resX, H = f.resY;
     double eAuto = 0.0, exposure = 0.0;
     AbsDark dk;
     std::vector<Vec3> lin;
     std::vector<uint8_t> img = filmToRgb8(f, N, expComp, absolute, lockAnchor,
                                           &eAuto, &exposure, absolute ? &dk : nullptr,
-                                          g_writeHdr ? &lin : nullptr);
+                                          (g_writeHdr || linOut) ? &lin : nullptr);
+    struct HandOver {   // on every return, so a failed write still spares the repaint the work
+        std::vector<Vec3>& from; std::vector<Vec3>* to;
+        ~HandOver() { if (to) *to = std::move(from); }
+    } handOver{lin, linOut};
     if (!writeImage(path, W, H, img)) {
         std::fprintf(stderr, "error: could not write %s\n", path);
         return false;
@@ -12570,7 +12576,8 @@ static double    g_beamRefreshFrac = 0.10;
 // device-light-side retune below, which is a DEFAULT and not an override.
 static bool      g_beamRefreshSet  = false;
 // `-beamepochs K` (alias `-lightepochs`): mode J's refresh with its epochs fixed by SAMPLE COUNT
-// instead of by the wall clock -- the render's spp split into K equal epochs, epoch e drawing the
+// instead of by the wall clock -- the frame's samples split into K equal epochs (over their
+// absolute indices, so a resume keeps the layout: renderChunked), epoch e drawing the
 // light-side realization of salt e. The light side is view-independent (see JLightCache), so
 // every camera of a flyby then averages the SAME K realizations: from frame to frame the
 // light-side noise holds still in the world instead of flickering, while each frame still
@@ -12579,9 +12586,10 @@ static bool      g_beamRefreshSet  = false;
 // -beamfreeze, which can, is K = 1 and looks it: one realization of gallery_rain's rain shaft
 // is a few thousand saturated single-wavelength streaks. Measured there at 64 spp (seed-to-seed
 // RMS, display 0-255, 4x4 downsample, after -oidn -denoise): the curtain flickers 7.4 refreshed
-// and 2.3 with the light side held still. 0 = the wall-clock refresh. Needs a fixed -spp; the
-// GPU chunks are pinned to 1 spp while it is on, so the device's per-chunk surface-photon
-// redraws (salted by the chunk's first sample) also fall on the same samples in every frame.
+// and 2.3 with the light side held still. 0, the default, is the wall-clock refresh (the flag
+// itself takes K >= 1). Needs a fixed -spp. The GPU chunks are pinned to 1 spp while it is on,
+// so the device's per-chunk surface-photon redraws (salted by the chunk's first sample) also
+// fall on the same samples in every frame.
 static int       g_beamEpochs      = 0;
 // The retuned value for a mode-J render whose light side is on the device (0.272.4). Measured
 // 1.56x better than 0.10 on `_fog_thick` whole-frame variance, with 0.60 worse than 0.30, so the
@@ -15080,9 +15088,27 @@ static void liveWindowPlaceholder(int w, int h, const std::string& stage) {
     setLiveTitle(stage);
 }
 
+// `final`: this is the caller's last frame. While the window is minimized nobody can see a
+// frame, so an ordinary update only re-titles it (the taskbar button shows the title) and skips
+// the tone map -- which under -oidn -denoise is ~0.2 s at 960x540, up to the 1/12 of the wall
+// clock the repaint budget allows, spent on a picture in the taskbar. The final frame is always
+// drawn, so a window held open after the render (-keepwindow) shows the finished image when it
+// is restored; restored mid-render, it is redrawn at the next update.
+// `lin`: this film's scene-linear buffer at N, if a write in the same report already made it
+// (writeFilm's `linOut`), so the repaint does not reduce and denoise the film a second time.
 static void liveWindowUpdate(const Film& f, double N, double expComp, bool absolute,
-                             const char* status = nullptr) {
+                             const char* status = nullptr, bool final = false,
+                             const std::vector<Vec3>* lin = nullptr) {
     if (!g_showWindow || N <= 0.0) return;
+    if (!final && g_liveWin && g_liveWin->minimized()) {
+        setLiveTitle(status ? std::string(status) : std::string());
+        if (g_liveWin->closed()) g_stopRequested = 1;
+        g_lastWindowPaint = std::chrono::steady_clock::now();
+        static const bool dbgMin = [] { const char* e = std::getenv("FTRACE_WINDOW_DEBUG");
+                                        return e && *e && std::strcmp(e, "0"); }();
+        if (dbgMin) std::fprintf(stderr, "[window] minimized: re-titled, not repainted (N=%.0f)\n", N);
+        return;
+    }
     // Creating the window is a ONE-TIME cost (register the class, size the DIB, show it)
     // and must not be timed: it measured 342 ms against a 45 ms steady-state repaint, and
     // feeding that into the cost budget set the floor to 4 s — which on a 5 s frame meant
@@ -15101,7 +15127,8 @@ static void liveWindowUpdate(const Film& f, double N, double expComp, bool absol
     // job is to show the render converging.
     AbsDark dk; dk.reexpose = true;
     std::vector<uint8_t> rgb = filmToRgb8(f, N, expComp, absolute, nullptr, nullptr, nullptr,
-                                          absolute ? &dk : nullptr);
+                                          absolute ? &dk : nullptr, nullptr,
+                                          (lin && lin->size() == f.xyz.size()) ? lin : nullptr);
     g_liveWin->update(f.resX, f.resY, rgb);
     // The title's fixed fields (subject, mode, frame, device) are liveTitle()'s; only the
     // progress text is this caller's to supply.
@@ -16477,11 +16504,13 @@ static int runSppProgressive(
             else
                 std::snprintf(st, sizeof st, "[spp] %lld / %lld, %s, %s",
                               totalSpp, baseSpp + sppReq, humanDur(elapsed).c_str(), nz);
+            std::vector<Vec3> shownLin;   // the write's linear buffer, reused by the repaint
             if (wantSave) {
                 // The converged/stopping frame owns the exposure anchor; intermediate frames
                 // auto-expose independently (they only refine, never lock the anchor).
                 writeOk = writeFilm(outPath.c_str(), *shown, (double)totalSpp, manualExposure,
-                                    /*quiet*/preview, done ? exposureAnchor : nullptr, absolute);
+                                    /*quiet*/preview, done ? exposureAnchor : nullptr, absolute,
+                                    wantWin ? &shownLin : nullptr);
                 if (wantCheckpoint) {
                     Checkpoint save; save.film = *shown; save.N = totalSpp;
                     if (!writeCheckpoint(outPath, save, guard, mode))
@@ -16505,7 +16534,9 @@ static int runSppProgressive(
                 ls.noisePct = g_whitted ? -1.0 : noisePct;   // whitted is deterministic: no noise figure,
                 ls.noiseNote = g_whitted ? "deterministic" : "";   // and the title says so in that slot
                 ls.noiseTarget = noiseTarget; ls.why = why;
-                liveWindowUpdate(*shown, (double)totalSpp, manualExposure, absolute, liveStatusText(ls).c_str());
+                liveWindowUpdate(*shown, (double)totalSpp, manualExposure, absolute,
+                                 liveStatusText(ls).c_str(), done,
+                                 shownLin.empty() ? nullptr : &shownLin);
             }
         }
         return stop;
@@ -16720,7 +16751,7 @@ static int runCompositeProgressive(
                 ls.photonRate = (budgeted || acc.N < endN) ? phRate : 0.0;
                 ls.sppRate = sppRate;
                 ls.noisePct = noisePct; ls.noiseTarget = noiseTarget; ls.why = why;
-                liveWindowUpdate(comp, 1.0, manualExposure, absolute, liveStatusText(ls).c_str());
+                liveWindowUpdate(comp, 1.0, manualExposure, absolute, liveStatusText(ls).c_str(), done);
             }
         }
         if (done) break;
@@ -16918,6 +16949,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     }
     // The aimed sun (bdpt.h SunAim): settled before the first BDPT-family light subpath.
     if (mode == 'D' || mode == 'J' || mode == 'U') prepareSunAim(scene);
+    // -beamepochs is mode J's alone (its refresh loop reads it); say so rather than accept it
+    // in silence where it does nothing -- mode M's refresh, say, keeps the wall clock.
+    if (g_beamEpochs > 0 && mode != 'J') {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::printf("[ignore] -beamepochs: only mode J's light-side refresh takes it; this "
+                        "render is mode %c\n", mode);
+        }
+    }
     // `-mode W` is dispatched as mode R with the whitted flag set, so ask the flag: the
     // title should say what the user asked for, not how it is plumbed.
     g_windowMode = modeLabel(g_whitted ? 'W' : mode);   // title bar shows the transport mode of this frame
@@ -17151,14 +17192,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         const int hero = (mode == 'D' || mode == 'J') ? g_heroC : 1;
         const int mdep = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
         size_t needLocal = cudaMegakernelLocalBytes(mode, mdep, hero);
-        // The local reservation THIS process's context already holds, from whatever kernel of
-        // ours ran before (cudaLocalReservedBytes: measured, not tracked). The context keeps it
-        // after the kernel returns, so `freeB` below is already short of it -- and the next
-        // launch reuses it rather than reserving it again. Counting it as needed again is what
-        // sent every frame of a mode-J flyby after the first to the CPU: frame 1 left 11.4 GB
-        // reserved, frame 2 saw 11.3 GB free against 11.4 GB "wanted", and blamed "some other
-        // process".
-        const size_t reused = std::min(needLocal, cudaLocalReservedBytes());
+        // Memory this process already holds, which `freeB` below is short of and which must not
+        // be blamed on another program: the local reservation its context keeps from whatever
+        // kernel of ours ran before (cudaLocalReservedBytes, measured), and what OIDN may hold
+        // on the same GPU. A launch that fits in the reservation reuses it and needs none of
+        // `needLocal` anew; one that does not is counted as needing all of it, since nothing
+        // says the driver grows the old block in place rather than holding both while it swaps.
+        const size_t held   = cudaLocalReservedBytes();
+        const size_t reused = (held >= needLocal) ? needLocal : 0;
+        const size_t ours   = held + oidnrt::deviceMemoryAllowance();
         size_t freeB = 0, totalB = 0;
         if (cudaMemInfo(&freeB, &totalB)) {
             // Headroom on top of the local-memory reservation for the scene upload, the
@@ -17186,10 +17228,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // NOT tripping as meaningless. The reliable detector is the runtime one:
             // gpuSppChunks' stall watchdog, which measures the chunk that is actually in
             // flight and can therefore see contention this query is blind to.
-            // Both tests count our own reservation as ours: `needAll` leaves out what is
-            // reused, and the near-full test adds it back to what is free.
+            // Both tests count what is ours as ours: `needAll` leaves out what is reused, and
+            // the near-full test, which is about OTHER programs, adds all of it back.
             const bool tooTight = freeB < needAll;
-            const bool nearFull = totalB && (double)(freeB + reused) < 0.12 * (double)totalB;
+            const bool nearFull = totalB && (double)(freeB + ours) < 0.12 * (double)totalB;
             if (tooTight || nearFull) {
                 std::fprintf(stderr,
                     "[device] NOT ENOUGH FREE VRAM for the GPU path (%s): the mode-%c "
@@ -17556,6 +17598,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // variance -- so a resume that reuses maps improves almost nothing. `epoch == 0` still
         // decides FIRST-ness, so the reports and the one-time setup are unmoved, and a fresh run
         // passes saltOff = 0 and is bit-for-bit unchanged.
+        // Whether this render's epochs are -beamepochs's fixed ones: decided below, once the maps
+        // exist, and read by buildLightSide only for epochs >= 1, which run after that.
+        bool fixedEpochsOn = false;
+        bool refreshSaid   = false;     // the first redraw has announced the refresh
         auto buildLightSide = [&](uint64_t epoch, uint64_t saltOff = 0) {
             RngSaltScope saltScope(epoch + saltOff);
             const bool first = (epoch == 0);
@@ -17635,11 +17681,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // merely correlates with it is what makes those three impossible rather than
             // fixed: the `-n` sentence can now only be reached from epoch 0, where it is true.
             if (!first) {
-                if (epoch == 1 && g_beamEpochs > 0)
+                // Once, at the first redraw -- which under -beamepochs on a resumed frame is not
+                // necessarily epoch 1.
+                const bool firstRedraw = !refreshSaid;
+                refreshSaid = true;
+                if (firstRedraw && fixedEpochsOn)
                     std::printf("mode J: light-side refresh — redrawing %lld subpaths under the "
-                                "next of %d fixed salts and averaging the realizations "
-                                "(-beamepochs) ...\n", Nepoch, g_beamEpochs);
-                else if (epoch == 1)
+                                "fixed salt of each epoch and averaging the realizations "
+                                "(-beamepochs) ...\n", Nepoch);
+                else if (firstRedraw)
                     std::printf("mode J: light-side refresh — redrawing %lld subpaths under a "
                                 "fresh salt every ~%.0f%% of the wall clock and averaging the "
                                 "realizations, so the MERGE noise falls with the render too "
@@ -17847,16 +17897,20 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                          : "there is no light-side map to redraw");
             }
         } else if (fixedEpochs) {
+            // An epoch holds at least one sample, so there are at most -spp of them.
+            const long long nEp = std::min<long long>(g_beamEpochs, std::max<long long>(spp, 1));
             static bool said = false;
             if (!said) {
                 said = true;
-                std::printf("mode J: -beamepochs %d: each camera's samples split into %d equal "
-                            "epochs over the same %d light-side realizations, so the light-side "
-                            "noise holds still from frame to frame%s\n",
-                            g_beamEpochs, g_beamEpochs, g_beamEpochs,
+                std::printf("mode J: -beamepochs %d: each camera's samples split into %lld equal "
+                            "epochs over the same %lld light-side realizations, so the light-side "
+                            "noise holds still from frame to frame%s%s\n",
+                            g_beamEpochs, nEp, nEp,
+                            nEp < g_beamEpochs ? " (no more epochs than -spp)" : "",
                             useGpu ? " (GPU chunks pinned to 1 spp)" : "");
             }
         }
+        fixedEpochsOn = fixedEpochs;
 #ifdef HAVE_CUDA
         struct FixedChunkScope {
             bool on;
@@ -17874,14 +17928,27 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             long long sppAll = 0;
             bool stopAll = false;
             uint64_t epoch = 0;
-            // Under -beamepochs, epoch e ends once (e+1)/K of the samples are in; else on the clock.
-            const long long nFixed = fixedEpochs ? std::max(1LL, std::min<long long>(g_beamEpochs, sppTarget)) : 0;
-            auto fixedEnd = [&](uint64_t e) { return (sppTarget * (long long)(e + 1)) / nFixed; };
+            // Under -beamepochs the epochs are laid over the frame's ABSOLUTE samples: with T the
+            // frame's total (what a resume loaded plus what it adds) and K epochs of S = ceil(T/K)
+            // samples, sample n belongs to epoch n/S and draws that epoch's realization (salt
+            // n/S). The layout depends on T alone, so a frame stopped and resumed to the same T
+            // draws the light-side realizations a straight render of it would -- the ones every
+            // other frame of the flyby uses. (Its pixels are not bit-identical: the camera seed and
+            // the device's per-chunk surface photons are keyed to where each call starts, and the
+            // beam split to the run's spp.) Otherwise an epoch ends on the clock.
+            const long long base   = prog ? prog->sampleBase : 0;
+            const long long total  = base + sppTarget;
+            const long long nFixed = fixedEpochs ? std::max(1LL, std::min<long long>(g_beamEpochs, total)) : 0;
+            const long long epLen  = nFixed ? (total + nFixed - 1) / nFixed : 0;
+            uint64_t lsEpoch = 0;                    // whose realization the maps hold now
             for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
                 double rebuildSec = 0.0;
-                if (epoch > 0) {
+                const uint64_t want = nFixed ? (uint64_t)((base + sppAll) / epLen) : epoch;
+                if (nFixed ? want != lsEpoch : epoch > 0) {
                     auto tr = clk::now();
-                    buildLightSide(epoch, prog ? (uint64_t)prog->sampleBase : 0ull);
+                    if (nFixed) buildLightSide(want, 0);
+                    else        buildLightSide(epoch, prog ? (uint64_t)prog->sampleBase : 0ull);
+                    lsEpoch = want;
                     rebuildSec = std::chrono::duration<double>(clk::now() - tr).count();
                     // A refresh that came back empty would leave the gather pointing at an
                     // empty map, which silently turns the rest of the render into mode D.
@@ -17974,7 +18041,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 // any later non-epoch caller narrates normally.
                 g_gpuQuietRebuild = (epoch != 0);
                 const auto tg = clk::now();
-                Film f = renderEpoch((nFixed ? fixedEnd(epoch) : sppTarget) - sppAll, &inner);
+                Film f = renderEpoch(nFixed ? std::min<long long>((long long)(want + 1) * epLen, total)
+                                                  - (base + sppAll)
+                                            : sppTarget - sppAll, &inner);
                 lsGatherSec += std::chrono::duration<double>(clk::now() - tg).count();
                 g_gpuQuietRebuild = false;
                 if (epochSpp <= 0) break;      // produced nothing; refreshing again cannot help
@@ -18596,7 +18665,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         ls.photonRate = phRate;
                         ls.batches = chunkFixed ? -1 : batches;
                         ls.noisePct = noisePct; ls.noiseTarget = chunkFixed ? 0.0 : noiseTarget; ls.why = why;
-                        liveWindowUpdate(disp, (double)acc.N, manualExposure, scene.absolute, liveStatusText(ls).c_str());
+                        liveWindowUpdate(disp, (double)acc.N, manualExposure, scene.absolute,
+                                         liveStatusText(ls).c_str(), done);
                         liveWindowNotePaintCost(     // env composite is part of the repaint
                             std::chrono::duration<double>(clk::now() - tPrep).count());
                     }
@@ -19468,7 +19538,9 @@ static int run(int argc, char** argv) {
             }
             else if (!std::strcmp(argv[i], "-hdr"))   // the developed linear image as a PFM too
                 g_writeHdr = true;
-            else if (!parseDenoiseFlag(argc, argv, i) && !parseOidnFlag(argc, argv, i)) {
+            else if (parseDenoiseFlag(argc, argv, i)) {}
+            else if (const int ro = parseOidnFlag(argc, argv, i); ro != 0) { if (ro < 0) return 2; }
+            else {
                 std::fprintf(stderr, "error: -topng: '%s' is not one of its flags, or its value is "
                                      "missing (it takes -ev <c>, -exposure-anchor <v|file>, -hdr, the "
                                      "-denoise flags, and the -oidn flags with -oidn-guides <stem>)\n",
@@ -19501,7 +19573,10 @@ static int run(int argc, char** argv) {
                 return 2;
             }
             g->W = wa; g->H = ha;
-            g->clean = true;   // what -oidn-write-guides writes is deterministic (denoise_guide.h)
+            // Deterministic, as -oidn-write-guides writes them, unless the render left the
+            // marker GuideScope writes for guides that were not (a physical lens's pupil).
+            g->clean = !std::filesystem::exists(convGuideStem + ".guides-noisy.txt");
+            dguide::seal(*g);
             setGuide(std::move(g));
         } else if (g_oidn && g_oidnGuides) {
             std::printf("[oidn] -topng has no camera to render guides from: denoising the colour "
@@ -20295,7 +20370,7 @@ static int run(int argc, char** argv) {
             g_dualMaxCross = std::max(1, std::atoi(argv[++i]));
         }
         else if (parseDenoiseFlag(argc, argv, i)) {}
-        else if (parseOidnFlag(argc, argv, i)) {}
+        else if (const int ro = parseOidnFlag(argc, argv, i); ro != 0) { if (ro < 0) return 2; }
         else if (!std::strcmp(argv[i], "-hdr")) g_writeHdr = true;
         else if (!std::strcmp(argv[i], "-on-unsupported") && i + 1 < argc) { ++i; /* pre-scanned into g_onUnsupported */ }
         // An explicit absolute radius pins the radius: don't then adapt it out from under
@@ -20802,6 +20877,18 @@ static int run(int argc, char** argv) {
         }   // end segment 3
     }
     if (nThreads < 1) nThreads = 1;
+    // -oidn's device follows -device unless -oidn-device names one: a render sent to the CPU
+    // (often to keep off a GPU something else is saturating) must not denoise on that GPU,
+    // synchronously, at every write and repaint.
+    if (g_oidn && !g_oidnDeviceSet && !std::strcmp(device, "cpu"))
+        g_oidnOpts.device = oidnrt::Device::Cpu;
+    // -explore develops its view in bands of a size that changes as it refines: a learned
+    // denoiser would see each band as an image of its own (seams at every edge, and a filter
+    // rebuilt per band), and its deterministic mode-W preview has no noise to remove anyway.
+    if (g_oidn && exploreMode) {
+        std::printf("[oidn] -explore refines its view in bands, so -oidn is off for it\n");
+        g_oidn = false;
+    }
     // -oidn: load the library now, so a machine without it fails before the scene is built.
     if (g_oidn && !oidnStartup()) return 2;
 
@@ -21592,7 +21679,8 @@ static int run(int argc, char** argv) {
                        int flightIdx = -1;       // this frame's 0-based index in its whole flight (-1 = standalone)
                        int flightN   = 0; };     // that flight's frame count, whatever -frames selected
     std::vector<RenderCam> toRender;
-    // `-camera <path base>` (with or without -frames) picked a path's frames by name. Each frame
+    // `-camera <path base>` (with or without -frames) picked a path's frames -- frames of a
+    // camera_path/curve/orbit, not stills whose names merely share the prefix. Each frame
     // is then written under its own name in the path's directory (outFor) even when only ONE is
     // selected -- `-frames 1207 1207` resuming a stopped flyby at its last frame must land on
     // that frame's file and checkpoint, not on -o itself.
@@ -21735,7 +21823,11 @@ static int run(int argc, char** argv) {
                         framesApplied = true;
                     }
                     if (!sel.empty()) {
-                        pathByName = true;
+                        // Only frames of a camera_path/curve/orbit: the prefix-and-digits match
+                        // also picks still cameras (`-camera cam` finds `cam1`), which keep -o.
+                        pathByName = std::all_of(sel.begin(), sel.end(), [](const ftsl::CamSpec* c) {
+                            return !c->pathBase.empty();
+                        });
                         // Resolve the flyby's playback fps hint (per-camera, else scene
                         // default) so a user running ftrace directly sees the authored rate
                         // the video tooling will assemble at; 0 => none authored.
@@ -25612,7 +25704,7 @@ static int run(int argc, char** argv) {
                             ls.noisePct = noisePct; ls.noiseTarget = chunkFixed ? 0.0 : noiseTarget; ls.why = why;
                             g_windowFrame = sharedFrame;
                             liveWindowUpdate(disp, (double)accN, toRender[idx[0]].exposure,
-                                             scene.absolute, liveStatusText(ls).c_str());
+                                             scene.absolute, liveStatusText(ls).c_str(), done);
                             // Charge the sync + env composite to the repaint budget too.
                             liveWindowNotePaintCost(
                                 std::chrono::duration<double>(clk::now() - tPrep).count());
@@ -25775,7 +25867,7 @@ static int run(int argc, char** argv) {
                     // One meter for the group: a new frame's spp drops, which restarts it.
                     auto gMeter = std::make_shared<TrailingRate>();
                     gMeter->start(0.0, 0.0);
-                    liveProg.report = [&, liveExp, lastEcho, gMeter](const Film& f, long long sppDone, bool) -> bool {
+                    liveProg.report = [&, liveExp, lastEcho, gMeter](const Film& f, long long sppDone, bool fin) -> bool {
                         const auto now = std::chrono::steady_clock::now();
                         const double el = std::chrono::duration<double>(now - gStart).count();
                         const size_t gf = std::min(gatherFrame, idx.size() - 1);
@@ -25783,7 +25875,7 @@ static int run(int argc, char** argv) {
                             f, sppDone, spp, frameLabel(toRender[idx[gf]], gf + 1, idx.size()), N, el,
                             gMeter->add(el, (double)sppDone));
                         if (g_showWindow)
-                            liveWindowUpdate(f, (double)sppDone, liveExp, scene.absolute, st.c_str());
+                            liveWindowUpdate(f, (double)sppDone, liveExp, scene.absolute, st.c_str(), fin);
                         if (preview) ansiPreview(f, (double)sppDone, liveExp, st.c_str());
                         if (lastEcho->time_since_epoch().count() == 0 ||
                             std::chrono::duration<double>(now - *lastEcho).count() >= 30.0) {
@@ -26226,12 +26318,12 @@ static int run(int argc, char** argv) {
             fMeter.start(0.0, 0.0);
             if (g_showWindow) {
                 const double liveExp = rc.exposure;
-                liveProg.report = [&, liveExp](const Film& pf, long long sppDone, bool) -> bool {
+                liveProg.report = [&, liveExp](const Film& pf, long long sppDone, bool fin) -> bool {
                     const double el = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - gStart).count();
                     liveWindowUpdate(pf, (double)sppDone, liveExp, scene.absolute,
                         pmGatherStatus(pf, sppDone, spp, frameLabel(rc, k + 1, idx.size()), N, el,
-                                       fMeter.add(el, (double)sppDone)).c_str());
+                                       fMeter.add(el, (double)sppDone)).c_str(), fin);
                     return g_stopRequested != 0;   // window closed / -stop -> stop after this chunk
                 };
             }
@@ -26307,10 +26399,16 @@ static int run(int argc, char** argv) {
             if (!stereoComposite(stereoMode, sp.leftPath, sp.rightPath, sp.finalPath))
                 sharedWriteFail = true;
             if (!stereoKeepEyes) {
-                std::remove(sp.leftPath.c_str());
-                std::remove(sp.rightPath.c_str());
-                std::remove((sp.leftPath  + ".ftbuf").c_str());
-                std::remove((sp.rightPath + ".ftbuf").c_str());
+                for (const std::string& eye : {sp.leftPath, sp.rightPath}) {
+                    std::remove(eye.c_str());
+                    std::remove((eye + ".ftbuf").c_str());
+                    // -oidn-write-guides' files for the eye: the composite has no camera of its
+                    // own to use them with.
+                    const std::string pfm = pfmPathFor(eye);
+                    const std::string stem = pfm.substr(0, pfm.size() - 4);
+                    for (const char* sfx : {".albedo.pfm", ".normal.pfm", ".guides-noisy.txt"})
+                        std::remove((stem + sfx).c_str());
+                }
             }
         }
     }
@@ -26648,8 +26746,14 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     stopChannelEnd();
+    // OIDN first: its GPU context has to be released before the CUDA teardown, and that
+    // teardown has to run even when ftrace's own CUDA never did (`-topng -oidn`,
+    // `-device cpu -oidn`) -- otherwise OIDN's context is the one the driver reaps after exit.
+    const bool oidnOnGpu = oidnrt::shutdown();
 #ifdef HAVE_CUDA
-    cudaGracefulShutdown();
+    cudaGracefulShutdown(oidnOnGpu);
+#else
+    (void)oidnOnGpu;
 #endif
     return rc;
 }

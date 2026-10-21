@@ -37,6 +37,7 @@ constexpr int kFormatFloat3 = 3;   // OIDN_FORMAT_FLOAT3
 
 struct Api {
     OIDNDevice (*newDevice)(int type);
+    void       (*releaseDevice)(OIDNDevice);
     void       (*commitDevice)(OIDNDevice);
     int        (*getDeviceError)(OIDNDevice, const char** msg);
     int        (*getDeviceInt)(OIDNDevice, const char* name);
@@ -61,23 +62,30 @@ constexpr const char* kLibName = "OpenImageDenoise.dll";
 constexpr const char* kLibName = "libOpenImageDenoise.so.2";
 #endif
 
+// OIDN asked to stay under this much device memory (its `maxMemoryMB`; it may exceed it a
+// little). At 960x540 it does not need to tile to honour it.
+constexpr int kMaxMemoryMB = 1024;
+
 struct State {
     std::mutex mu;
-    bool tried = false;          // load attempted (it is attempted once per process)
-    std::string loadErr;         // why it failed; empty once loaded
+    bool tried = false;          // a load has been attempted (once per process)
+    bool loaded = false;         // ...and succeeded; shutdown() clears it
+    std::string loadErr;         // why it is not loaded: the failure, or "shut down"
     std::string desc;            // describe()'s line
     Api api{};
     OIDNDevice dev = nullptr;
+    int devType = 0;             // OIDNDeviceType of the device that was created
     int quality = -1;
     // The committed filter and its buffers, rebuilt only when the image shape changes.
     OIDNFilter filt = nullptr;
     OIDNBuffer bColor = nullptr, bAlb = nullptr, bNrm = nullptr;
     int W = 0, H = 0;
     bool hasAlb = false, hasNrm = false, clean = false;
+    uint64_t auxKey = 0;            // the guide set now in bAlb/bNrm (denoise's auxKey)
 };
 
-// Deliberately never destroyed. Releasing a CUDA device from a static destructor runs after,
-// or during, the CUDA runtime's own process-exit teardown; exit frees it all anyway.
+// Never destroyed: shutdown() releases the device at a point the caller controls, ahead of
+// the CUDA teardown. A static destructor would run during the CUDA runtime's own exit.
 State& state() { static State* s = new State; return *s; }
 
 fs::path exeDir() {
@@ -97,8 +105,8 @@ fs::path exeDir() {
 // Where the library may be, in the order tried:
 //   $FTRACE_OIDN                  the library itself, or the directory holding it;
 //   <exe dir>, <exe dir>/oidn     a copy shipped beside ftrace.exe;
-//   external/oidn/<release>/bin   in the exe's directory or up to three above it, newest
-//                                 release name first. That is where the repo keeps the
+//   external/oidn/<release>/bin   in the exe's directory or up to three above it, highest
+//                                 version in the release's name first. That is where the repo keeps the
 //                                 downloaded release, and it covers both the repo-root
 //                                 ftrace.exe and build*/bin/ftrace.exe.
 std::vector<fs::path> searchPaths() {
@@ -119,8 +127,21 @@ std::vector<fs::path> searchPaths() {
             std::vector<fs::path> rel;
             for (const auto& ent : fs::directory_iterator(ext, ec))
                 if (ent.is_directory(ec)) rel.push_back(ent.path());
-            std::sort(rel.begin(), rel.end(), [](const fs::path& a, const fs::path& b) {
-                return a.filename().string() > b.filename().string();
+            // Newest first by the numbers in the name, compared as numbers: as strings,
+            // "oidn-2.3.1" would sort above "oidn-2.10.0".
+            auto version = [](const fs::path& p) {
+                std::vector<long> v;
+                long cur = -1;
+                for (const char c : p.filename().string()) {
+                    if (c >= '0' && c <= '9') cur = (cur < 0 ? 0 : cur * 10) + (c - '0');
+                    else if (cur >= 0) { v.push_back(cur); cur = -1; }
+                }
+                if (cur >= 0) v.push_back(cur);
+                return v;
+            };
+            std::sort(rel.begin(), rel.end(), [&](const fs::path& a, const fs::path& b) {
+                const auto va = version(a), vb = version(b);
+                return va != vb ? va > vb : a.filename().string() > b.filename().string();
             });
             for (const fs::path& r : rel) out.push_back(r / "bin" / kLibName);
         }
@@ -152,10 +173,9 @@ bool noError(State& s, const char* what, std::string& err) {
     return false;
 }
 
-// Load the library, resolve the API and create and commit the device: once per process.
-bool load(State& s, const Options& opt) {
-    if (s.tried) return s.loadErr.empty();
-    s.tried = true;
+// Load the library, resolve the API and create and commit the device. True on success; on
+// failure `s.loadErr` says why.
+bool loadImpl(State& s, const Options& opt) {
     std::string looked;
     for (const fs::path& p : searchPaths()) {
         std::error_code ec;
@@ -187,6 +207,7 @@ bool load(State& s, const Options& opt) {
         };
         Api& a = s.api;
         get(a.newDevice, "oidnNewDevice");           get(a.commitDevice, "oidnCommitDevice");
+        get(a.releaseDevice, "oidnReleaseDevice");
         get(a.getDeviceError, "oidnGetDeviceError"); get(a.getDeviceInt, "oidnGetDeviceInt");
         get(a.newBuffer, "oidnNewBuffer");           get(a.writeBuffer, "oidnWriteBuffer");
         get(a.readBuffer, "oidnReadBuffer");         get(a.releaseBuffer, "oidnReleaseBuffer");
@@ -209,17 +230,35 @@ bool load(State& s, const Options& opt) {
         a.commitDevice(s.dev);
         if (!noError(s, "starting the device", s.loadErr)) return false;
         const int ver = a.getDeviceInt(s.dev, "version");   // e.g. 20501 for 2.5.1
+        s.devType = a.getDeviceInt(s.dev, "type");
         char line[512];
         std::snprintf(line, sizeof line, "Open Image Denoise %d.%d.%d on %s, from %s",
-                      ver / 10000, (ver / 100) % 100, ver % 100,
-                      deviceName(a.getDeviceInt(s.dev, "type")), p.string().c_str());
+                      ver / 10000, (ver / 100) % 100, ver % 100, deviceName(s.devType),
+                      p.string().c_str());
         s.desc = line;
+        s.loadErr.clear();
         return true;
     }
     s.loadErr = std::string("OIDN: ") + kLibName + " not found. Looked in:" + looked +
                 "\n  Download a release from https://github.com/RenderKit/oidn/releases and unpack it"
                 " to external/oidn/, put its bin/ beside ftrace.exe, or point FTRACE_OIDN at it.";
     return false;
+}
+
+// Once per process. `loaded` is set only by a load that got all the way through, so a throw
+// out of the middle (a path the code page cannot spell, a directory iterator failing) leaves
+// "not loaded" behind, with the reason, rather than null entry points that look loaded.
+bool load(State& s, const Options& opt) {
+    if (s.tried) return s.loaded;
+    s.tried = true;
+    s.loadErr = "OIDN: loading did not complete";
+    try {
+        s.loaded = loadImpl(s, opt);
+    } catch (const std::exception& e) {
+        s.loaded = false;
+        s.loadErr = std::string("OIDN: loading failed: ") + e.what();
+    }
+    return s.loaded;
 }
 
 void dropFilter(State& s) {
@@ -230,12 +269,13 @@ void dropFilter(State& s) {
     if (s.bNrm)   a.releaseBuffer(s.bNrm);
     s.filt = nullptr; s.bColor = s.bAlb = s.bNrm = nullptr;
     s.W = s.H = 0;
+    s.auxKey = 0;
 }
 
 }  // namespace
 
 bool denoise(float* color, const float* albedo, const float* normal, int W, int H,
-             bool cleanAux, const Options& opt, std::string& err) {
+             bool cleanAux, uint64_t auxKey, const Options& opt, std::string& err) {
     State& s = state();
     std::lock_guard<std::mutex> lk(s.mu);
     if (!load(s, opt)) { err = s.loadErr; return false; }
@@ -260,14 +300,19 @@ bool denoise(float* color, const float* albedo, const float* normal, int W, int 
         a.setFilterBool(s.filt, "hdr", true);
         a.setFilterBool(s.filt, "cleanAux", clean);
         a.setFilterInt(s.filt, "quality", (int)opt.quality);
+        a.setFilterInt(s.filt, "maxMemoryMB", kMaxMemoryMB);
         a.commitFilter(s.filt);
         if (!noError(s, "setting up the filter", err)) { dropFilter(s); return false; }
         s.W = W; s.H = H; s.hasAlb = hasAlb; s.hasNrm = hasNrm; s.clean = clean;
         s.quality = (int)opt.quality;
     }
     a.writeBuffer(s.bColor, 0, bytes, color);
-    if (hasAlb) a.writeBuffer(s.bAlb, 0, bytes, albedo);
-    if (hasNrm) a.writeBuffer(s.bNrm, 0, bytes, normal);
+    // The guides are constant for a camera's whole render: upload them once per guide set.
+    if (hasAlb && (auxKey == 0 || auxKey != s.auxKey)) {
+        a.writeBuffer(s.bAlb, 0, bytes, albedo);
+        if (hasNrm) a.writeBuffer(s.bNrm, 0, bytes, normal);
+        s.auxKey = auxKey;
+    }
     a.executeFilter(s.filt);
     if (!noError(s, "denoising", err)) return false;
     a.readBuffer(s.bColor, 0, bytes, color);
@@ -277,7 +322,27 @@ bool denoise(float* color, const float* albedo, const float* normal, int W, int 
 std::string describe() {
     State& s = state();
     std::lock_guard<std::mutex> lk(s.mu);
-    return s.loadErr.empty() ? s.desc : s.loadErr;
+    return s.loaded ? s.desc : s.loadErr;
+}
+
+size_t deviceMemoryAllowance() {
+    State& s = state();
+    std::lock_guard<std::mutex> lk(s.mu);
+    if (!s.loaded || s.devType == 1 /*CPU*/) return 0;
+    return ((size_t)kMaxMemoryMB + 256) * 1024 * 1024;
+}
+
+bool shutdown() {
+    State& s = state();
+    std::lock_guard<std::mutex> lk(s.mu);
+    if (!s.loaded) return false;
+    const bool gpu = s.devType != 1;
+    dropFilter(s);
+    s.api.releaseDevice(s.dev);
+    s.dev = nullptr;
+    s.loaded = false;
+    s.loadErr = "OIDN: shut down";
+    return gpu;
 }
 
 }  // namespace oidnrt

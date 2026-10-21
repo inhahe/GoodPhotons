@@ -52,6 +52,37 @@ enum class TexEncoding { sRGB, Linear };
 enum class TexFilter   { Nearest, Bilinear };
 enum class TexWrap     { Repeat, Clamp, Mirror };
 
+// Parse a PFM: "PF" (colour) or "Pf" (grayscale), then W H, then a scale line whose sign gives
+// the endianness (negative = little-endian). Fills `buf` with W*H*comp floats in the FILE's row
+// order (bottom-to-top) and native byte order; `comp` is 3 or 1. False, with `err` set, on a
+// header that is not a PFM or data shorter than it promises. Shared by Texture::loadPFM (which
+// flips the rows into its top-down storage) and main.cpp's readPfm (which keeps them: the film
+// runs bottom-up too).
+inline bool parsePfm(std::istream& s, int& w, int& h, int& comp, std::vector<float>& buf,
+                     std::string& err) {
+    std::string magic;
+    double scale = 0.0;
+    s >> magic >> w >> h >> scale;
+    // The one whitespace after the scale line -- two if a Windows tool ended it CRLF, or the
+    // raster would be read a byte out of step.
+    if (s.get() == '\r' && s.peek() == '\n') s.get();
+    if ((magic != "PF" && magic != "Pf") || !s || w <= 0 || h <= 0 || scale == 0.0) {
+        err = "not a PFM";
+        return false;
+    }
+    comp = (magic == "PF") ? 3 : 1;
+    buf.resize((size_t)w * h * comp);
+    s.read((char*)buf.data(), (std::streamsize)(buf.size() * sizeof(float)));
+    if (s.gcount() != (std::streamsize)(buf.size() * sizeof(float))) { err = "short PFM data"; return false; }
+    if (scale > 0.0)   // big-endian floats
+        for (auto& x : buf) {
+            uint32_t u; std::memcpy(&u, &x, 4);
+            u = (u >> 24) | ((u >> 8) & 0xFF00) | ((u << 8) & 0xFF0000) | (u << 24);
+            std::memcpy(&x, &u, 4);
+        }
+    return true;
+}
+
 struct Texture {
     std::string name;
     int w = 0, h = 0;
@@ -503,23 +534,10 @@ struct Texture {
     // sign gives endianness (negative = little-endian). Pixels are float, bottom-up,
     // and always linear -> force the encoding to Linear.
     bool loadPFM(std::istream& s, std::string& err) {
-        std::string magic; s >> magic;
-        bool colour = (magic == "PF");
-        s >> w >> h;
-        double scale; s >> scale;
-        s.get();   // one whitespace after the scale line
-        bool little = (scale < 0);
-        int comp = colour ? 3 : 1;
-        std::vector<float> buf((size_t)w * h * comp);
-        s.read((char*)buf.data(), (std::streamsize)(buf.size() * sizeof(float)));
-        if (s.gcount() != (std::streamsize)(buf.size() * sizeof(float))) { err = "short PFM data"; return false; }
-        if (!little) {   // swap big-endian floats
-            for (auto& x : buf) {
-                uint32_t u; std::memcpy(&u, &x, 4);
-                u = (u >> 24) | ((u >> 8) & 0xFF00) | ((u << 8) & 0xFF0000) | (u << 24);
-                std::memcpy(&x, &u, 4);
-            }
-        }
+        int comp = 0;
+        std::vector<float> buf;
+        if (!parsePfm(s, w, h, comp, buf, err)) return false;
+        const bool colour = (comp == 3);
         encoding = TexEncoding::Linear;
         rgb.assign((size_t)w * h, Vec3{0, 0, 0});
         // PFM rows run bottom-to-top; flip into our top-left-origin storage.
