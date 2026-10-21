@@ -6130,7 +6130,11 @@ struct DJSpec {   // 120 B, unpadded: one rides on every recorded segment and ey
         if (u >= (double)(DJSPEC_K - 1)) return (double)r[DJSPEC_K - 1];
         const int i = (int)u;
         const double f = u - (double)i;
-        return (double)r[i] + ((double)r[i + 1] - (double)r[i]) * f;
+        // Geometric between two live bins (host twin JSpec::at, where the why is). In float: the
+        // bins are floats, and a double pow is a slow call on a GeForce part.
+        const float a = r[i], b = r[i + 1];
+        if (a > 0.f && b > 0.f) return (double)(a * powf(b / a, (float)f));
+        return (double)a + ((double)b - (double)a) * f;
     }
 };
 static_assert(sizeof(DJSpec) == 120, "DJSpec has picked up padding");
@@ -22510,7 +22514,7 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
             // map costs exactly the two loads and nothing else.
             d.sumC = s.sumC; d.sumM = s.sumMb; d.sumMs = s.sumMs;
             d.pdfDir = s.pdfDir; d.pdfPlanar = s.pdfPlanar; d.rCoef = s.rCoef;
-            d.etaPrev = s.etaPrev; d.leadIn = s.leadIn;
+            d.etaPrev = s.etaPrev; d.etaPrevS = s.etaPrevS; d.leadIn = s.leadIn;
             d.gateC1 = (int)s.gateC1; d.vert = (int)s.vert;
         }
         nMis = dm.size();

@@ -32,7 +32,7 @@ Both belong to the same family as the `cmd /c` failure this script was written f
 said nothing, and silence was read as information.
 
 **THE ONE MEASUREMENT ERROR THIS PROJECT KEEPS MAKING, in the header because it has now caused
-SEVEN wrong conclusions and each was recorded only in its own entry.** Every one has the same
+EIGHT wrong conclusions and each was recorded only in its own entry.** Every one has the same
 shape: **the thing measured was not the thing meant**, and in every case the number looked
 perfectly reasonable. Not one was caught by thinking harder about the value; every one was caught
 by going back to the definition.
@@ -46,8 +46,9 @@ by going back to the definition.
 | mode-`J` "8.7x regression" | totals divided by **different epoch counts** (5 against 17) |
 | `cap_gyroid` coverage | a **per-material** histogram compared against an **edge-strip ROI**'s requirement |
 | `cap_gyroid` material | analysed `capmarble_gyroidx` because the ROI is *named* `cap_gyroid`; its definition says `capmarble_gold`, "clear of the gyroid" |
+| mode J / D "9 % low through glass" (2026-10-21) | each mode at its **default depth**: D, J and U stop at 8 edges, R at 32, and the two glass faces spend two of D's eight. At one `-max-bounce` for all, D read 1.000 of R |
 
-**The check that would have caught all seven, and it is one sentence: before comparing two numbers,
+**The check that would have caught all eight, and it is one sentence: before comparing two numbers,
 say out loud which population each is drawn from, and confirm they are the same one.** For a
 diagnostic specifically: **every member of the denominator must be able to contribute to the
 numerator.** For an ROI: **open the file that defines it** — `scraps/gallery_rain.rois` carries a
@@ -138,6 +139,37 @@ sample index crosses a fixed block boundary (split a chunk at the boundaries it 
 light side's epochs already are under `-beamepochs`. Then the chunker can keep adapting and the
 pin and its global switch go. (Both reviewers of 0.391.0 suggested this or a fixed chunk size.)
 
+## DONE (2026-10-21, 0.391.3): J-GPU-ETAPREVS — GPU mode J's beam merges left out the point merge at the vertex a beam left, and read a fog 4 % bright
+
+Found while testing REVIEW-0388's glass fix. On a plain fog box lit from above over a grey floor
+(scraps/rimtest/gfd_noglass.ftsl, every mode at `-max-bounce 32`, fog region against mode R):
+
+| | before | 0.391.3 |
+|---|---:|---:|
+| GPU mode J | 1.043 | 0.999 |
+| CPU mode J | 0.998 | 0.998 |
+| GPU mode D | 1.001 | — |
+
+The bias grew as the beam kernel shrank (1.068 at `-beamblur 0.0025`, 1.005 at 0.04), did not move
+with `FTRACE_BEAMTR0=0` or `FTRACE_NOWAVEFRONT=1`, and sat wholly in the merge half (GPU/CPU 1.046
+under `FTRACE_J_HALF=merges`). **Cause:** `uploadBeamMapCuda` copied every `BeamMis` field to the
+device but `etaPrevS`, so on the GPU it was always 0: the denominator of every beam merge's weight
+lacked the POINT merge at the vertex the beam left (`kappaS * etaPrevS`), and a beam leaving a
+surface into a medium -- light off the floor into the fog -- was weighted as though that technique
+did not exist. A smaller kernel shrinks the beam technique's constant against the point
+technique's, which is why the excess grew with it. Mode J has its surface map on by default, so
+this reached every GPU mode-J render with a lit surface beside a medium, gallery_rain included.
+One line in the upload.
+
+**The same tests found JSPEC's carrier misreading coloured glass.** Fog seen through a glass
+sphere with `absorb rgb 0.2 2.5 5.0` (gfbehind.ftsl): mode D 1.000 of R, mode J G +7-8 %. The
+carrier's 24 bins were read by a straight line between bin centres, which overestimates an
+exponential (the glass's transmission over its chord) by its convexity across a bin. `JSpec::at`
+(and the device's) now interpolates geometrically between two live bins, which is exact where the
+absorption exponent is linear in wavelength across a bin: G +2.5 % (GPU) / +3.6 % (CPU) after,
+R 0.99 / 1.00, B -5 % on a channel the glass passes ~1 % of. The rest is the bins' resolution
+(SPECGATHER-BIN-RESOLUTION's twin for JSPEC).
+
 ## DONE (2026-10-21, 0.391.3): REVIEW-0388 — what the Opus and Fable reviews of 0.385.0-0.388.0 found
 
 Opus (max) and Fable (xhigh) reviewed 4c796bb..5997485, the per-object modes, JSPEC, the aimed
@@ -201,6 +233,28 @@ Dismissed: the dispersive window dropping a folded beam whose emitter is unknown
 happen: only `-loadmap` makes such beams, and only mode M loads maps, which has no camera carrier;
 mode J folds a beam only while its subpath's spectral claim lives, which always records the
 emitter. The carrier's size (Opus) is JSPEC-CARRIER-SIZE below.
+
+## OPEN (2026-10-21): MODEM-BEAM-CARRIER — mode M's beam gather reads the camera path's spectral factors at the camera's wavelength
+
+Found beside J-GPU-ETAPREVS. Mode M keeps a spectral carrier on its camera walk (SPECGATHER's
+`sthr`, photonmap_render.h), but only the SURFACE photon gather reads it: `gatherPhotonBeams` is
+multiplied by the scalar `thr`, which holds every camera-side factor at the camera's own wavelength,
+and is handed the camera's glass absorption `aGlass` at that wavelength for the partial segment.
+Each beam carries its own wavelength, so through or inside coloured glass the merge pairs the beam
+with a tint taken at an unrelated wavelength: the colour averages out and the brightness comes out
+wrong. This is the error JSPEC removed from mode J (0.386.1, and 0.391.3 for the partial segment).
+Measured on scraps/rimtest/gfd_grey_lowalb.ftsl (fog inside a sphere of `absorb rgb 1.5 1.5 1.5`,
+which is NOT flat, albedo 0.1), fog region against mode R: mode M 1.30 / 1.42 / 1.22 (a run stopped
+part-way, so only roughly). The device's mode-M gather (dGatherPhotonBeams with no weight) has the
+same shape. Repro scenes need copying into `scenes/` before anyone works on this.
+
+**Proper fix.** Hand the gather the carrier: build a `JSpec` from `sthr` per camera segment (both
+are 24 bins over the band) and call `gatherPhotonBeamsW` with a weight that returns it from
+`camSpec()` and the glass from `glassCam()`, and do the same on the device. The catch is mode M's
+gather-time BOW fold (`achro == 2`), which integrates the wavelength out with the phase table and
+so cannot be re-expressed per wavelength: mode J declines it for that reason. Mode M would have
+to keep the fold only while the carrier is flat and fall back to the beam's own wavelength when it
+is not, or fold the carrier into the bow table's integral.
 
 ## OPEN (2026-10-21): JSPEC-CARRIER-SIZE — every mode-J GPU thread reserves room for a 120-byte spectral carrier per segment and per eye vertex, chromatic scene or not
 

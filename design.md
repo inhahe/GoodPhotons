@@ -2465,7 +2465,10 @@ re-expressed it. The connections are immune: both of their subpaths run at λ_c.
 **Fix.** The camera walk carries its spectral factors on a 24-bin grid (`JSpec` / `JSpecRun`,
 beamgather.h; `DJSpec` / `DJSpecRun` on the device). Each bin holds Π f(λ_k) / f(λ_c), so
 `beta · at(λ_b)` is the camera side evaluated at the beam's wavelength. `at()` interpolates
-linearly between bin centres. A segment snapshots the carrier at its origin (`PathSeg::spec`), and
+geometrically between two live bin centres, which is exact where an absorption exponent is linear
+in λ across a bin; a straight line overestimated coloured glass's transmission by its convexity
+(G +7 % on fog seen through a tinted sphere before 0.391.4; `tools/check_jfog_glass.py`). Beside a
+dead bin it stays linear. A segment snapshots the carrier at its origin (`PathSeg::spec`), and
 the point merges read it as it arrives at their vertex (`JSpecWalk::vert`; the device rebuilds it
 from the previous segment's snapshot). What is folded, each against the value `beta` took at λ_c:
 - **Lambertian, glossy, diffuse-transmit:** the lobe's albedo. Any lobe coin cancels, because the

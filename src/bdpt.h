@@ -778,6 +778,14 @@ inline void jTrFold(const Scene& scene, JSpecRun& jr, const Vec3& o, const Vec3&
     jr.mulVec(e, 1.0);
 }
 
+// Whether a dielectric's interior absorption varies over the band, probed at the carrier's bins.
+inline bool absorbChromatic(const Material& m) {
+    const double a = m.absorb(JSpec::lamOf(0));
+    for (int k = 1; k < JSpec::K; ++k)
+        if (std::fabs(m.absorb(JSpec::lamOf(k)) - a) > 1e-12 * (1.0 + std::fabs(a))) return true;
+    return false;
+}
+
 // Whether some medium's extinction varies over the band (JSpecWalk::trSpec; the device's
 // c_jTrSpec, which main.cpp sets from this).
 inline bool anyMediumSigmaTChromatic(const Scene& scene) {
@@ -2538,6 +2546,9 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     const bool beamSpecOK  = beamSpectralOK(scene);
     const bool beamAchroOK = pbeams::gAchro && beamSpecOK;
     const int  beamSpecC   = beamSpecOK ? pbeams::gSpecC : 1;
+    // Which dielectrics absorb differently at different wavelengths (depositSeg), per material.
+    std::vector<char> absorbChroma(scene.mats.size(), 0);
+    for (size_t m = 0; m < scene.mats.size(); ++m) absorbChroma[m] = absorbChromatic(scene.mats[m]) ? 1 : 0;
 
     auto worker = [&](int tid, long long total, uint64_t salt, bool pilot) {
         Renderer mats; mats.diffraction = diffraction;
@@ -2632,6 +2643,15 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 const double* lamS = nullptr; int nSec = 0;
                 const Vec3* cie = nullptr;
                 double wsBuf[kBeamSpecMax];
+                // The dielectric this segment runs inside, if any. Its absorption along the
+                // beam is applied at the gather as ONE scalar (PhotonBeam::absorb), so it has to
+                // be taken at the wavelength the beam is deposited at -- on a claimed segment
+                // that is not the walk's -- and a folded colour or a bundle, which stand for
+                // several wavelengths, cannot carry it unless it is the same at all of them.
+                // randomWalk refuses the claim inside glass that absorbs at the walk's own
+                // wavelength; a glass clear there and absorbing elsewhere reaches here claimed.
+                const Material* gm = (sg.glassMat >= 0) ? &scene.mats[(size_t)sg.glassMat] : nullptr;
+                const bool glassChroma = gm && absorbChroma[(size_t)sg.glassMat];
                 if (sg.achro) {
                     // JSPEC: a folded beam stores a COLOUR, not a wavelength, so the camera
                     // side can re-express a merge with it only through the emitter's own fold
@@ -2640,7 +2660,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                     // chromatic factor deposits as the bundle below, whose every member has a
                     // wavelength the camera side can be evaluated at. In gallery_rain this keeps
                     // the fold for the sunlit cloud; a beam off the coloured floor is a bundle.
-                    const bool fold = beamAchroOK && (sg.fFlat || !jSpecEnabled()) &&
+                    const bool fold = beamAchroOK && !glassChroma && (sg.fFlat || !jSpecEnabled()) &&
                         (sg.fCie.x > 0.0 || sg.fCie.y > 0.0 || sg.fCie.z > 0.0);
                     if (fold) {
                         // FOLDED (-beamachro): the beam is gathered at `fCie`, whose per-bin
@@ -2666,7 +2686,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                         if (!(w0 > 0.0)) return;             // T(bs.lam[0]) == 0: no flux
                         lam = dLam;
                         pw  = sg.beta * dSc * w0;
-                        if (dSec > 0) {
+                        if (dSec > 0 && !glassChroma) {
                             for (int i = 0; i < dSec; ++i) wsBuf[i] = sg.fW[i + 1] / w0;
                             lamS = dLamS; nSec = dSec;
                         }
@@ -2692,7 +2712,8 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 // "unknown" out loud.
                 // `srcEm` (the subpath's emitter) is what lets a merge recolour a folded beam
                 // through that emitter's quadrature (JSPEC, jSpecFoldColor).
-                mats.emitBeams(scene, sg.o, sg.d, sg.tMax, lam, pw, sg.aGlass, rng,
+                const double aDep = gm ? gm->absorb(lam) : 0.0;   // == sg.aGlass at the walk's lambda
+                mats.emitBeams(scene, sg.o, sg.d, sg.tMax, lam, pw, aDep, rng,
                                kBeamOrderUnknown,
                                Renderer::MedAll, lamS, nSec, cie, dEm,
                                nSec > 0 ? wsBuf : nullptr, bs.ok ? bs.emIdx : -1);

@@ -1,0 +1,32 @@
+# Mode J's merges in a fog seen through coloured glass (tools/check_jfog_glass.py; one of
+# _jfog_floor / _jfog_behind / _jfog_inside). A fog box over a grey floor, lit by a big sphere lamp
+# from above; `tint` absorbs strongly and very unevenly across the band, the case a spectral carrier
+# has to get right. Every mode at -max-bounce 32 (D, J and U default to 8 edges, R to 32).
+# gallery_rain's configuration: the camera path crosses the glass whole and merges outside it,
+# reading the glass through JSPEC's carrier (G 7-8 % bright with the carrier read by straight
+# lines, before 0.391.3).
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "grey"  { type diffuse reflect 0.5 }
+material "tint"  { type dielectric ior 1.0001  absorb rgb 0.2 2.5 5.0 }
+
+quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material grey }
+
+sphere { center 0 0.72 1.0  radius 0.5  material tint }
+
+medium {
+    sigma_t 3.0   albedo 0.9   g 0.0
+    bounds { min -0.6 0.1 -1.2   max 0.6 1.3 -0.2 }
+}
+
+light sphere { center 0 3.0 -0.7   radius 0.7   spd preset:bb6500 }
+
+camera "cam" {
+    eye 0 0.75 3.2   look_at 0 0.72 0   up 0 1 0   fov_y 34
+    mode J
+    film { res 240 200 }
+}

@@ -90,9 +90,9 @@ struct JSpec {
     static double lamOf(int k) {
         return LAMBDA_MIN + (k + 0.5) * (LAMBDA_MAX - LAMBDA_MIN) / (double)K;
     }
-    // Linear between bin centres, held flat past the outer two. SpecThr reads the nearest bin;
-    // interpolating costs one more load and follows a steep reflectance edge (a red wall's
-    // ~600 nm rise) instead of stepping across it.
+    // Interpolated between bin centres (see below for how), held flat past the outer two.
+    // SpecThr reads the nearest bin; interpolating costs one more load and follows a steep
+    // reflectance edge (a red wall's ~600 nm rise) instead of stepping across it.
     double at(double lam) const {
         if (!any) return 1.0;
         const double u = (lam - LAMBDA_MIN) / (LAMBDA_MAX - LAMBDA_MIN) * (double)K - 0.5;
@@ -100,7 +100,14 @@ struct JSpec {
         if (u >= (double)(K - 1)) return (double)r[K - 1];
         const int i = (int)u;
         const double f = u - (double)i;
-        return (double)r[i] + ((double)r[i + 1] - (double)r[i]) * f;
+        // Geometric between two live bins: the carrier's factors are largely exponentials in
+        // wavelength (glass absorption over a path, a medium's transmittance), which a straight
+        // line overestimates by the convexity of exp across a bin; geometric interpolation is
+        // exact wherever the exponent is linear in wavelength within the bin. A dead bin keeps
+        // the straight line, which reaches 0 at that bin rather than everywhere next to it.
+        const double a = (double)r[i], b = (double)r[i + 1];
+        if (a > 0.0 && b > 0.0) return a * std::pow(b / a, f);
+        return a + (b - a) * f;
     }
 };
 
