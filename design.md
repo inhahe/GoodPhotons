@@ -6528,9 +6528,12 @@ as the one at fault.
   - **Plumbing.** `runRender` holds a `GuideScope` for its camera: it renders the guides on
     entry, publishes them (`setGuide`) and withdraws them on exit. `filmToLinear` — the one
     reduction behind the PNG, the `-hdr` PFM and the live window — runs `oidnApply`, which uses
-    the published guides when they match the film's size. Everything rendered outside
-    `runRender` (the meter pre-pass, the shared multi-camera passes) therefore denoises
-    unguided rather than against another camera's edges. Modes A and C get no guides: their
+    the published guides when they match the film's size. The shared multi-camera passes hold a
+    `GuideScope` per frame themselves: mode `M`'s gathers frame by frame, so it moves the scope
+    on to frame k+1 in `writeFrame` after writing frame k (CPU: one per loop iteration); the
+    forward group writes every camera each `-interval`, so only its final write is guided, a
+    scope per camera. The meter pre-pass, outside all of them, denoises unguided rather than
+    against another camera's edges. Modes A and C get no guides: their
     film images through the finite lens and is blurred out of focus where a pinhole guide is
     sharp. The `.ftbuf` keeps the raw film, so `-resume` re-denoises the larger total and
     `-topng -oidn -oidn-guides <stem>` re-develops a checkpoint against the guides a render

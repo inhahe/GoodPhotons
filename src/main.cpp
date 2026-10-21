@@ -25566,7 +25566,10 @@ static int run(int argc, char** argv) {
         // Write every camera's image (+ optional .ftbuf). `quiet` suppresses the per-file
         // announce for intermediate saves; these groups are per-frame-auto-exposed
         // (expGroup < 0) so no shared exposure anchor is involved.
-        auto writeOut = [&](bool quiet) {
+        // `final`: the group's last write. Under -oidn that one is guided, camera by camera (a
+        // guide pass is 1-3 s a 960x540 camera); the interim writes, which rewrite EVERY camera
+        // each -interval, are denoised from the colour alone.
+        auto writeOut = [&](bool quiet, bool final) {
             syncAcc();
             for (int c = 0; c < nc; ++c) {
                 const RenderCam& rc = toRender[idx[c]];
@@ -25576,6 +25579,9 @@ static int run(int argc, char** argv) {
                 if (!quiet && toRender.size() > 1)
                     std::printf("[camera] '%s' (mode %c, %dx%d) -> %s\n",
                                 rc.name.c_str(), groupMode, rc.res, rc.resY, op.c_str());
+                std::unique_ptr<GuideScope> guides;
+                if (final && g_oidn)
+                    guides = std::make_unique<GuideScope>(scene, rc.cam, rc.res, rc.resY, groupMode, op);
                 if (!writeFilm(op.c_str(), disp, (double)accN, rc.exposure, quiet, nullptr, scene.absolute))
                     sharedWriteFail = true;
                 if (wantCheckpoint) {
@@ -25666,7 +25672,7 @@ static int run(int argc, char** argv) {
                 bool wantSave = done || wantStatus;
                 bool wantWin  = g_showWindow && (done || wantWinPre);
                 if (wantSave || wantWin) {
-                    if (wantSave) { writeOut(/*quiet*/preview); lastSave = clk::now(); }
+                    if (wantSave) { writeOut(/*quiet*/preview, /*final*/done); lastSave = clk::now(); }
                     const char* why = stopped ? " (stopping)" : noiseMet ? " (noise target met)"
                                     : totalDone ? " (done)" : "";
                     char st[240];
@@ -25734,7 +25740,7 @@ static int run(int argc, char** argv) {
             std::printf("[camera] shared model-%c pass: %d cameras, %lld photons on %s (light=%s)%s ...\n",
                         groupMode, nc, N, backend.c_str(), lightLabel, (resume && accN > 0) ? " [resuming]" : "");
             runBatch(N);
-            writeOut(/*quiet*/false);
+            writeOut(/*quiet*/false, /*final*/true);
         }
 #ifdef HAVE_CUDA
         // Tear the resident session down. Every exit path above ends in a writeOut(),
@@ -25914,6 +25920,19 @@ static int run(int argc, char** argv) {
                 // ("stopped at N / spp"), must not re-announce the output path, and must not
                 // advance the title's frame counter past the one frame there is.
                 bool midEpoch = false;
+                // -oidn: the guides of the frame being gathered. The device gathers the frames in
+                // order and writes each through writeFrame, which then moves these on to the next
+                // frame -- so frame k's repaints and its write see frame k's guides. Started for
+                // frame 0 just before the gather (below) and dropped after it.
+                std::unique_ptr<GuideScope> frameGuides;
+                auto guidesFor = [&](size_t k) {
+                    frameGuides.reset();
+                    if (k < idx.size()) {
+                        const RenderCam& gc = toRender[idx[k]];
+                        frameGuides = std::make_unique<GuideScope>(scene, gc.cam, gc.res, gc.resY,
+                                                                   'M', outFor(gc.name));
+                    }
+                };
                 std::function<bool(int, const Film&, long long)> writeFrame =
                     [&](int k, const Film& f, long long sppDone) -> bool {
                         const RenderCam& rc = toRender[idx[k]];
@@ -25933,6 +25952,7 @@ static int run(int argc, char** argv) {
                         if (!writeFilm(op.c_str(), f, (double)sppDone, rc.exposure, false, anchor, scene.absolute))
                             sharedWriteFail = true;
                         if (!midEpoch) {
+                            guidesFor((size_t)k + 1);
                             gatherFrame = (size_t)k + 1;
                             // Label the next frame now: the device draws its first spp through
                             // StageProgress, which reads the frame field but never stamps it.
@@ -26065,6 +26085,10 @@ static int run(int argc, char** argv) {
                 // has to be the map that was actually gathered from.
                 const bool refreshGpu = (cams.size() == 1) && !g_beamFreeze &&
                                         g_pmapLoad.empty() && g_pmapSave.empty();
+                guidesFor(0);
+                struct DropGuides {   // after the gather, on every way out of it
+                    std::unique_ptr<GuideScope>& g; ~DropGuides() { g.reset(); }
+                } dropGuides{frameGuides};
                 if (!refreshGpu) {
                     runPass(spp, g_showWindow ? &liveProg : nullptr, &writeFrame, nullptr);
                 } else {
@@ -26294,6 +26318,8 @@ static int run(int argc, char** argv) {
             // the whole flythrough or abruptly terminating a live render mid-gather.
             if (g_stopRequested) break;
             const RenderCam& rc = toRender[idx[k]];
+            // -oidn: this frame's guides, for its live repaints and its write (as runRender's).
+            const GuideScope guideScope(scene, rc.cam, rc.res, rc.resY, 'M', outFor(rc.name));
             // Drive the live window, exactly as the GPU branch above does with its own
             // `liveProg`. This path had NO window feed at all: it wrote each frame to disk and
             // never repainted, so a flythrough ran to completion behind the frozen

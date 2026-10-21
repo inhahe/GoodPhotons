@@ -6778,8 +6778,10 @@ OIDN supports it (about 10 ms a 960×540 frame on an RTX 4090), else on the CPU.
 Things to know:
 
 - **Modes A and C are denoised unguided.** Their film images through the finite lens, blurred out
-  of focus where a pinhole guide would be sharp. So is anything rendered outside a single camera's
-  pass: the exposure meter, and the shared multi-camera passes of the forward modes and mode `M`.
+  of focus where a pinhole guide would be sharp. So is the exposure meter. Mode `M`'s shared
+  flyby pass traces each frame's guides as it gathers it; the forward modes' shared pass guides
+  its final write only, camera by camera, since its interim writes rewrite every camera at every
+  `-interval`.
 - **OIDN clamps negative input to 0.** A single-wavelength sample often has a negative channel in
   linear sRGB; on `gallery_rain` at 64 spp that is ~5 % of the absolute energy, and the denoised
   frame's mean lands within ~1–2 % of the raw one.

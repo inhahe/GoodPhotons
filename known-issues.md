@@ -102,7 +102,11 @@ Four `cuda*` setter calls were guarded on 2026-10-20 (`cudaSetRouting`, `cudaSet
 types and helpers. **Fix:** guard each, or give `render_cuda.h` / `raster_cuda.h` CPU stubs, and
 build `build_cpu` after any change that touches the device boundary.
 
-## OPEN (2026-10-20, 0.390.0): OIDN-SHARED-PASSES — the shared multi-camera passes denoise without guides
+## DONE (2026-10-21, 0.391.2): OIDN-SHARED-PASSES — the shared multi-camera passes denoise without guides
+
+Done as the fix below proposes: mode `M`'s shared pass moves a `GuideScope` on from frame to frame
+(GPU: in `writeFrame`, after frame k is written; CPU: one per loop iteration), and the forward
+group guides its final write, camera by camera. Its interim writes stay unguided.
 
 `-oidn`'s albedo/normal guides are rendered per camera by `GuideScope`, which `runRender` holds
 for the camera it renders (`main.cpp`). The passes that render many cameras at once never enter
