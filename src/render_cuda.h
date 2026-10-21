@@ -312,6 +312,9 @@ void cudaSetJHostLight(bool on);
 // mode (ROUTE_D / ROUTE_J), whether any medium routes J, and each mode's sample multiplier
 // (`mode_spp`). runRender sets it per D/J render.
 void cudaSetRouting(int on, int routeDefault, int anyMedJ, double sppD, double sppJ);
+// The aimed sun's target capacity on the device (its constant arrays). The host clusters the
+// targets to bdpt::SunAim::kMaxTargets, which main.cpp asserts equals this.
+constexpr int kSunAimMaxTargets = 64;
 // Pin the spp-progressive GPU renders' chunks to 1 spp instead of sizing them by timing, so
 // whatever a chunk draws (mode J's device surface photons, salted by the chunk's first sample)
 // lands on the same samples in every render. Set by mode J under `-beamepochs`, cleared after.
@@ -319,9 +322,17 @@ void cudaSetFixedChunks(bool on);
 // JSPEC's dispersive window (0.386.2, bdpt g_jDispWinNm / g_jDispAll): its full width in nm, and
 // whether dispersive refraction and a real lens open it as a grating's non-zero order does.
 void cudaSetJDisp(double winNm, int all);
-// The aimed sun for modes D/J (MODE-J-SDS, 0.387.0; bdpt.h SunAim): the target spheres (centres as
-// x,y,z triples, radii), SUM r^2 and the aimed share. n == 0 or f == 0: the uniform disc.
-void cudaSetSunAim(const double* cxyz, const double* r, int n, double sumR2, double f);
+// Mode J's estimator switches, set per render from the host's own (bdpt.h holds them; the
+// device has no copy of their environment strings or tests): the JSPEC carrier
+// (bdpt::jSpecEnabled), whether some medium's sigma_t is chromatic
+// (bdpt::anyMediumSigmaTChromatic), a delta bounce's light density read as 1
+// (bdpt::g_jDeltaMerge), and the half-render diagnostic (bdpt::jHalfMode: 0 full, 1
+// connections, 2 merges; the device has no merges-raw).
+void cudaSetJSwitches(int jSpec, int trSpec, int deltaMerge, int half);
+// The aimed sun for modes D/J (MODE-J-SDS, 0.387.0; bdpt.h SunAim): the target spheres (centres
+// relative to the scene centre as x,y,z triples, radii), SUM r^2 and the aimed share. n == 0 or
+// f == 0: the uniform disc.
+void cudaSetSunAim(const double* wxyz, const double* r, int n, double sumR2, double f);
 
 bool cudaBdptSupported(const Scene& scene);
 

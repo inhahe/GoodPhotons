@@ -870,6 +870,10 @@ sphere { center 0.5 0.32 0.4  radius 0.25  material glass }        # ...includin
 medium { sigma_t 0.35  albedo 0.99  mode J }                       # and the rain
 ```
 
+Where tags disagree, the more specific one wins: an object's own tag over its group's, and either
+over the tag in its material's block, which is only the default for every object using that
+material (since 0.391.3; before, the material's tag silently won).
+
 **Why only D and J.** They are one renderer: mode J is mode D plus its two merge kinds (photon
 beams in media, surface photons). So a frame can switch between them path by path, and it stays a
 single unbiased image with no seam to blend. Every other mode is a different algorithm over the
@@ -882,7 +886,7 @@ caustic on the stand behind it, which is a specular–diffuse–specular path th
 connections cannot sample well. The same object's reflections route J too. Surfaces seen
 directly stay in mode D. A camera in mode D with anything tagged J runs on mode J's renderer: it
 builds J's light side as usual, but merges only on J-routed paths, and the D-routed rest of the
-frame costs close to what mode D costs. The run says so:
+frame costs close to what mode D costs. The run says so, once per scene:
 
 ```
 [mode] per-object modes: camera mode D; 16 material(s) and 0 medium(s) in mode J. Rendering on mode J's renderer, merging only on paths routed J.

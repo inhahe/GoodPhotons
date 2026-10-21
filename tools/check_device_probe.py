@@ -33,7 +33,8 @@ def main():
     out = os.path.join(ROOT, 'scraps', '_device_probe.png')
     r = subprocess.run([os.path.abspath(a.exe), '-in', os.path.join(ROOT, 'scenes', 'cornell.ftsl'),
                         '-mode', 'W', '-device', 'gpu', '-spp', '1', '-r', '16', '12', '-no-meter',
-                        '-o', out], capture_output=True, text=True, env=env)
+                        '-o', out], capture_output=True, text=True, encoding='utf-8',
+                       errors='replace', env=env)
     text = r.stdout + r.stderr
     lines = [l for l in text.splitlines() if l.startswith('[probe]')]
     for l in lines:

@@ -3343,7 +3343,9 @@ no seam to blend. With every object tagged D the render matches mode D bit for b
 every object tagged J it matches mode J bit for bit (`scraps/_rt_*.ftsl`, 0.386.0).
 
 **Rules and limits.**
-- A child's own `mode` wins over its group's.
+- The more specific tag wins. A child's own `mode` wins over its group's, and either wins over
+  the `mode` in the block of a material it uses, which is only the default for every object
+  using that material. A tagged mix passes its mode to those of its children that have none.
 - A tagged object gets its own copies of the materials it uses, named `glass [mode J]` in
   `-roi-mask` legends. A tagged mix's children are copied too, because the renderer shades
   the child.

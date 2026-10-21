@@ -6416,10 +6416,22 @@ private:
     // (material, route) -> the routed copy. A copy is a whole Material, so every renderer reads
     // it exactly as it reads the original; only `route` differs.
     std::map<std::pair<int, int>, int> routeClone_;
+    std::vector<char> routeIsClone_;   // by material id: made by routedMat for an object or group
     bool routeWarnedLight_ = false, routeWarnedInst_ = false;
-    int routedMat(int id, int route, Loaded& L) {
+    // The material an object (or group, or a tagged material's mix) tagged `route` should shade
+    // with: a copy of `id` routed `route`, or `id` itself where a more specific tag got there
+    // first. A copy an object's own tag made is kept when its group's tag comes through (`id` is
+    // then a clone), while a tag in the material's own block -- the default for every object
+    // using it -- gives way to an object's or group's (`ownYields`). An object tagged the same
+    // as its material's default still gets a copy, which renders identically: it is what tells
+    // an enclosing group's tag that the object chose. propagateMaterialRoutes passes false:
+    // there the tagged mix is the less specific of the two.
+    int routedMat(int id, int route, Loaded& L, bool ownYields = true) {
         if (id < 0 || id >= (int)L.scene.mats.size()) return id;
-        if (L.scene.mats[(size_t)id].route >= 0) return id;    // already tagged: the inner tag wins
+        if (L.scene.mats[(size_t)id].route >= 0) {
+            const bool clone = (size_t)id < routeIsClone_.size() && routeIsClone_[(size_t)id];
+            if (clone || !ownYields) return id;
+        }
         // An emitter is found BY its material (Scene::emitterForMat), so a light's material
         // cannot be copied without orphaning its emitter. It keeps the camera's mode.
         if (L.scene.mats[(size_t)id].isLight) {
@@ -6440,10 +6452,12 @@ private:
         // route has to live on the children too: they get routed copies of their own. (A
         // layered coat is synthesised later, in build(), as a copy of this material, so it
         // inherits the route there.)
-        for (int& ch : c.mixChildren) ch = routedMat(ch, route, L);
+        for (int& ch : c.mixChildren) ch = routedMat(ch, route, L, ownYields);
         const int nid = (int)L.scene.mats.size();
         L.scene.mats.push_back(std::move(c));
         routeClone_[key] = nid;
+        routeIsClone_.resize(L.scene.mats.size(), 0);
+        routeIsClone_[(size_t)nid] = 1;
         return nid;
     }
     // A material tagged in its OWN block passes its route to the children it resolves to, for
@@ -6454,7 +6468,7 @@ private:
             const int r = L.scene.mats[i].route;
             if (r < 0 || L.scene.mats[i].mixChildren.empty()) continue;
             std::vector<int> ch = L.scene.mats[i].mixChildren;   // routedMat may grow `mats`
-            for (int& c : ch) c = routedMat(c, r, L);
+            for (int& c : ch) c = routedMat(c, r, L, /*ownYields=*/false);
             L.scene.mats[i].mixChildren = ch;
         }
     }

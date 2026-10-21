@@ -64,10 +64,10 @@
 //     is what removes the light vertex from the BSDF-sampling side of every ratio, and
 //     wLight is forced to 0 in the NEE weight. dVCM starts at the cone solid angle.
 //   * sun - delta DIRECTION *and* infinitely distant. Same missing strategies, plus its
-//     subpath origin is a fictitious point on a disc of radius sceneRadius outside the
-//     scene, so the first scene vertex's density is PLANAR (1/(pi R^2)) rather than a
+//     subpath origin is a fictitious point on a disc outside the scene (bdpt.h
+//     sampleSunOrigin), so the first scene vertex's density is PLANAR rather than a
 //     solid-angle density converted with 1/dist^2 — misArrival therefore skips the dist^2
-//     factor on that first edge. dVCM starts at pi R^2.
+//     factor on that first edge. dVCM starts at 1/pdfPos.
 //   * Because no connectible vertex exists on a sun, a purely SPECULAR eye chain that
 //     escapes into the solar cone is a strategy nothing else can reach (NEE, every s>=2
 //     connection, the t==1 splat and merging all need a connectible vertex), so it is
@@ -573,35 +573,12 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         pdfDirW = 1.0 / coneSolid;
         dir = em.sampleCone(em.beamDir, u1, u2);
         if (isInfinite) {
-            // The origin is a point on a disc of radius sceneRadius, one radius upstream
-            // of the scene centre and perpendicular to beamDir, so every emitted ray
-            // enters the scene's cross-section: a PLANAR density 1/(pi R^2).
-            double R = scene.sceneRadius;
-            if (R <= 0.0) return;
-            Vec3 tt, bb; onb(em.beamDir, tt, bb);
+            // The origin is a point on the sun's disc upstream of the scene, so every emitted
+            // ray enters the scene's cross-section: a PLANAR density (bdpt.h sampleSunOrigin).
+            if (scene.sceneRadius <= 0.0) return;
             double x, yy;
-            if (bdpt::g_sunAim.on() && rng.uniform() < bdpt::g_sunAim.f) {
-                // THE AIMED SUN (0.387.0, bdpt.h SunAim): a target circle by r^2, a point in it.
-                const bdpt::SunAim& sa = bdpt::g_sunAim;
-                const double pick = rng.uniform() * sa.sumR2;
-                double acc = 0.0;
-                size_t j = 0;
-                for (; j + 1 < sa.c.size(); ++j) {
-                    acc += sa.r[j] * sa.r[j];
-                    if (pick < acc) break;
-                }
-                const Vec3 w = sa.c[j] - scene.sceneCenter;
-                const double rr = sa.r[j] * std::sqrt(rng.uniform());
-                const double phi = 2.0 * PI * rng.uniform();
-                x = dot(w, tt) + rr * std::cos(phi);
-                yy = dot(w, bb) + rr * std::sin(phi);
-            } else {
-                double rr = R * std::sqrt(rng.uniform()), phi = 2.0 * PI * rng.uniform();
-                x = rr * std::cos(phi);
-                yy = rr * std::sin(phi);
-            }
-            y = scene.sceneCenter + tt * x + bb * yy - em.beamDir * R;
-            pdfPos = bdpt::sunOriginPdf(scene, em, x, yy);   // 1/(pi R^2) with the aim off
+            y = bdpt::sampleSunOrigin(scene, em, rng, x, yy);
+            pdfPos = bdpt::sunOriginPdf(em, x, yy);
         } else {
             y = em.origin;                                 // delta position: pdfPos == 1
             emitScale = spotFalloff(dot(dir, em.beamDir), em.spotCosInner, em.spotCosOuter);
@@ -644,7 +621,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
     // measure that strategy works in: an area density for a finite surface light, the
     // solid-angle 1/Omega for the infinitely distant sun, and 1 for a delta position
     // (SmallVCM's PointLight::Emit reports oDirectPdfA = 1). The dVCM ratio below then
-    // comes out as 1/pdfDirW == Omega for a spot and 1/pdfPos == pi R^2 for a sun, which
+    // comes out as 1/pdfDirW == Omega for a spot and 1/pdfPos for a sun, which
     // is exactly what SmallVCM's PointLight / DirectionalLight produce.
     double directPdf = pdfChoice * (isInfinite ? pdfDirW : (isDelta ? 1.0 : pdfPos));
 
@@ -698,10 +675,17 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
             mp = &scene.mats[c];
         } else if (mp->type == MatType::Layered) {
             // Coat with probability R, else a body lobe (bdpt.h's randomWalk explains the
-            // convention). `rd` is the travel direction, and only |cos| is used.
+            // convention). `rd` is the travel direction, and only |cos| is used. One coin for
+            // the whole bundle, compared per wavelength; where the wavelengths disagree the
+            // bundle collapses to the hero at this vertex (bdpt.h, HERO-COAT-COIN).
             const double R = layeredCoatReflectance(scene, *mp, h, rd, lambda);
-            int c = (rng.uniform() < R) ? mp->coatChild
-                                        : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map (device twin: dResolveCompound)
+            const double uCoat = rng.uniform();
+            const bool coatPick = (uCoat < R);
+            for (int i = 0; nUp > 1 && i + 1 < nUp; ++i)
+                if ((uCoat < layeredCoatReflectance(scene, *mp, h, rd, hb.lam[i + 1])) != coatPick)
+                    nUp = 1;
+            int c = coatPick ? mp->coatChild
+                             : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map (device twin: dResolveCompound)
             if (c < 0) return;
             mp = &scene.mats[c];
         }
@@ -945,10 +929,17 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
             mp = &scene.mats[c];
         } else if (mp->type == MatType::Layered) {
             // Coat with probability R, else a body lobe (bdpt.h's randomWalk explains the
-            // convention). `rd` is the travel direction, and only |cos| is used.
+            // convention). `rd` is the travel direction, and only |cos| is used. One coin for
+            // the whole bundle, compared per wavelength; where the wavelengths disagree the
+            // bundle collapses to the hero at this vertex (bdpt.h, HERO-COAT-COIN).
             const double R = layeredCoatReflectance(scene, *mp, h, rd, lambda);
-            int c = (rng.uniform() < R) ? mp->coatChild
-                                        : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map (device twin: dResolveCompound)
+            const double uCoat = rng.uniform();
+            const bool coatPick = (uCoat < R);
+            for (int i = 0; nUp > 1 && i + 1 < nUp; ++i)
+                if ((uCoat < layeredCoatReflectance(scene, *mp, h, rd, hb.lam[i + 1])) != coatPick)
+                    nUp = 1;
+            int c = coatPick ? mp->coatChild
+                             : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map (device twin: dResolveCompound)
             if (c < 0) return result;
             mp = &scene.mats[c];
         }
@@ -1063,12 +1054,10 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                             dist2 = distL * distL;
                             occlEps = 0.0;
                             directPdfW = 1.0 / coneSolid;
-                            // The aimed mixture's density at the origin a light subpath would
-                            // have needed to reach h.p along -wi (0.387.0; 1/(pi R^2) with the
-                            // aim off -- bdpt.h SunAim).
-                            emissionPdfW = (bdpt::g_sunAim.on()
-                                                ? bdpt::sunOriginPdfAlong(scene, em, h.p, wi * -1.0)
-                                                : 1.0 / (PI * R * R)) / coneSolid;
+                            // The origin density a light subpath would have needed to reach h.p
+                            // along -wi (bdpt.h sampleSunOrigin, the aimed mixture included).
+                            emissionPdfW = bdpt::sunOriginPdfAlong(scene, em, h.p, wi * -1.0)
+                                         / coneSolid;
                             geomOk = true;
                         }
                     } else {

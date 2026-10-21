@@ -956,6 +956,7 @@ struct DEmitter {
     // exactly the solar cone's solid angle 2*PI*(1-cos theta) — the same field reuse the
     // host Emitter makes, so no extra members are needed on either side.
     double spotCosInner, spotCosOuter, spotOmega;
+    double sunDiscR;  // sun (shape==6): the radius of its subpaths' origin disc (Emitter::sunDiscR)
     DVec3  viewXYZ;   // integral CIE(lam)*SPD(lam) dlam (host Emitter::viewXYZ): a sun's folded colour
     // Mesh area light (shape==5): device pointer to this emitter's triangle CDF and its
     // count. nullptr/0 for every other shape. area == sum of the triangle areas.
@@ -6009,34 +6010,59 @@ __constant__ int    c_jDispAll = 0;      // -jdispall (host g_jDispAll)
 // Merges after a specular bounce read the light-side density's 0 as 1 (host bdpt::g_jDeltaMerge,
 // MODE-J-SDS, 0.387.0). 0 = the pre-0.387.0 reading, for A/B runs (FTRACE_JDELTA=0).
 __constant__ int    c_jDeltaMerge = 1;
-// THE AIMED SUN (host bdpt.h SunAim, MODE-J-SDS, 0.387.0). c_sunAimN == 0: the uniform disc.
-#define SUNAIM_MAX 64
+// THE SUN'S DISC AND THE AIMED SUN (host bdpt.h SunAim, MODE-J-SDS, 0.387.0). c_sunAimN == 0: the
+// uniform disc.
+#define SUNAIM_MAX kSunAimMaxTargets
 __constant__ int    c_sunAimN = 0;
 __constant__ double c_sunAimF = 0.0;
 __constant__ double c_sunAimSumR2 = 0.0;
-__constant__ double c_sunAimC[SUNAIM_MAX * 3];
+__constant__ Real   c_sunAimW[SUNAIM_MAX * 3];   // target centres relative to the scene centre
 __constant__ double c_sunAimR[SUNAIM_MAX];
 __device__ static inline bool dSunAimOn() {
     return c_sunAimN > 0 && c_sunAimF > 0.0 && c_sunAimSumR2 > 0.0;
 }
-// Target j's centre projected onto the sun disc, in the (t, b) basis, relative to the scene centre.
-__device__ static inline void dSunAimProject(const DScene& sc, const DVec3& t, const DVec3& b, int j,
-                                             double& cx, double& cy) {
-    const double wx = c_sunAimC[3 * j + 0] - (double)sc.sceneCenter.x;
-    const double wy = c_sunAimC[3 * j + 1] - (double)sc.sceneCenter.y;
-    const double wz = c_sunAimC[3 * j + 2] - (double)sc.sceneCenter.z;
-    cx = wx * (double)t.x + wy * (double)t.y + wz * (double)t.z;
-    cy = wx * (double)b.x + wy * (double)b.y + wz * (double)b.z;
+// Target j's centre projected onto the sun disc, in the (t, b) basis. In Real: a target's place
+// on the disc needs no more precision than the basis it is projected on, and a dMisWeight that
+// reaches the sun pays this for every target.
+__device__ static inline void dSunAimProject(const DVec3& t, const DVec3& b, int j, double& cx, double& cy) {
+    const DVec3 w{c_sunAimW[3 * j + 0], c_sunAimW[3 * j + 1], c_sunAimW[3 * j + 2]};
+    cx = (double)dot(w, t);
+    cy = (double)dot(w, b);
+}
+// Host twin bdpt::sampleSunOrigin, and drawn the same way: the origin of a sun light subpath, and
+// in (x, y) its disc coordinates for dSunOriginPdf.
+__device__ static DVec3 dSampleSunOrigin(const DScene& sc, const DEmitter& em, DRng& rng,
+                                         double& x, double& y) {
+    DVec3 t, b; onb(em.beamDir, t, b);
+    if (dSunAimOn() && (double)rng.uniform() < c_sunAimF) {
+        const double pick = (double)rng.uniform() * c_sunAimSumR2;   // a target circle by r^2...
+        double acc = 0.0;
+        int j = 0;
+        for (; j + 1 < c_sunAimN; ++j) {
+            acc += c_sunAimR[j] * c_sunAimR[j];
+            if (pick < acc) break;
+        }
+        double cx, cy; dSunAimProject(t, b, j, cx, cy);
+        const double rr = c_sunAimR[j] * sqrt((double)rng.uniform());   // ...and a point in it
+        const double phi = 2.0 * DPI * (double)rng.uniform();
+        x = cx + rr * cos(phi);
+        y = cy + rr * sin(phi);
+    } else {
+        const double rr = em.sunDiscR * sqrt((double)rng.uniform()), phi = 2.0 * DPI * (double)rng.uniform();
+        x = rr * cos(phi);
+        y = rr * sin(phi);
+    }
+    return sc.sceneCenter + t * (Real)x + b * (Real)y - em.beamDir * (Real)sc.sceneRadius;
 }
 // Host twin bdpt::sunOriginPdf: the sun's origin density at disc coordinates (x, y).
-__device__ static double dSunOriginPdf(const DScene& sc, const DEmitter& em, double x, double y) {
-    const double R = sc.sceneRadius;
-    if (!dSunAimOn()) return 1.0 / (DPI * R * R);
-    double p = (x * x + y * y <= R * R) ? (1.0 - c_sunAimF) / (DPI * R * R) : 0.0;
+__device__ static double dSunOriginPdf(const DEmitter& em, double x, double y) {
+    const double Rd = em.sunDiscR;
+    if (!dSunAimOn()) return 1.0 / (DPI * Rd * Rd);
+    double p = (x * x + y * y <= Rd * Rd) ? (1.0 - c_sunAimF) / (DPI * Rd * Rd) : 0.0;
     DVec3 t, b; onb(em.beamDir, t, b);
     int n = 0;
     for (int j = 0; j < c_sunAimN; ++j) {
-        double cx, cy; dSunAimProject(sc, t, b, j, cx, cy);
+        double cx, cy; dSunAimProject(t, b, j, cx, cy);
         const double dx = x - cx, dy = y - cy;
         if (dx * dx + dy * dy < c_sunAimR[j] * c_sunAimR[j]) ++n;
     }
@@ -6047,8 +6073,8 @@ __device__ static double dSunOriginPdf(const DScene& sc, const DEmitter& em, dou
 // it would have started from. All in double: the disc is a scene radius upstream.
 __device__ static double dSunOriginPdfAlong(const DScene& sc, const DEmitter& em,
                                             const DVec3& curP, const DVec3& nextP) {
+    if (!dSunAimOn()) return dSunOriginPdf(em, 0.0, 0.0);
     const double R = sc.sceneRadius;
-    if (!dSunAimOn()) return 1.0 / (DPI * R * R);
     double wx = (double)nextP.x - (double)curP.x, wy = (double)nextP.y - (double)curP.y,
            wz = (double)nextP.z - (double)curP.z;
     const double L = sqrt(wx * wx + wy * wy + wz * wz);
@@ -6067,7 +6093,7 @@ __device__ static double dSunOriginPdfAlong(const DScene& sc, const DEmitter& em
     DVec3 t, b; onb(em.beamDir, t, b);
     const double x = ox * (double)t.x + oy * (double)t.y + oz * (double)t.z;
     const double y = ox * (double)b.x + oy * (double)b.y + oz * (double)b.z;
-    return dSunOriginPdf(sc, em, x, y);
+    return dSunOriginPdf(em, x, y);
 }
 // Host twin bdpt::mergeLightDensity: the light-side density a merge's weight reads at a site
 // whose light-side neighbour is `fromDelta`, with a delta bounce's 0 read as 1 (MODE-J-SDS,
@@ -6077,10 +6103,10 @@ __device__ static inline double dMergeLightDensity(double p, bool fromDelta) {
 }
 #define DJSPEC_K    24     // JSpec::K
 #define DJSPEC_FOLD 12     // scene.h kFoldBins (static_assert'ed at the upload)
-struct DJSpec {
+struct DJSpec {   // 120 B, unpadded: one rides on every recorded segment and eye vertex
     float  r[DJSPEC_K];
-    int    any;
     double logS;   // the carrier's magnitude, apart from `r` (host twin JSpec::logS, where the why is)
+    int    any;
     int    disp;   // the dispersive window is open (host twin JSpec::disp)
     float  lamC, invPdfC;
     __device__ double beta(double b) const {
@@ -6107,6 +6133,7 @@ struct DJSpec {
         return (double)r[i] + ((double)r[i + 1] - (double)r[i]) * f;
     }
 };
+static_assert(sizeof(DJSpec) == 120, "DJSpec has picked up padding");
 struct DJSpecRun {
     double r[DJSPEC_K];
     int    any;
@@ -6172,12 +6199,6 @@ struct DJSpecRun {
         o.logS = logS;
         o.disp = disp; o.lamC = (float)lamC; o.invPdfC = (float)invPdfC;
         for (int k = 0; k < DJSPEC_K; ++k) o.r[k] = (float)r[k];
-    }
-    __device__ void from(const DJSpec& o) {
-        any = o.any;
-        logS = o.any ? o.logS : 0.0;
-        disp = o.disp; lamC = o.lamC; invPdfC = o.invPdfC;
-        for (int k = 0; k < DJSPEC_K; ++k) r[k] = o.any ? (double)o.r[k] : 1.0;
     }
 };
 // A hit's reflect-slot SPECTRAL SHAPE, captured from the walk's own dReflectBase call (0.386.2):
@@ -6524,7 +6545,7 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
                                     const DBeamMergeW* mw, const DTrRay* camTr,
                                     const DPatEnv& env,
                                     double& oX, double& oY, double& oZ,
-                                    const DJSpec* js = nullptr) {
+                                    const DJSpec* js = nullptr, int glassMatCam = -1) {
         if (b.med < 0 || b.med >= sc.mediaN) return;
         const DMedium& md = sc.media[b.med];
         const Real lam = b.lambda;
@@ -6571,7 +6592,13 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
         }
         if (!(w > 0.0)) return;
         if (b.absorb > 0.f)  w *= exp(-(double)b.absorb * (double)s);   // glass, beam side
-        if (aGlassCam > 0.0) w *= exp(-aGlassCam * (double)t);          // glass, camera side
+        // Glass, camera side: at the beam's wavelength wherever JSPEC is on, live carrier or not
+        // (host twin beamgather.h, where the why is), else at the camera sample's own.
+        {
+            const double aC = (js && c_jSpecOn && glassMatCam >= 0)
+                            ? (double)specLookup(sc.mats[glassMatCam].absorb, lam) : aGlassCam;
+            if (aC > 0.0) w *= exp(-aC * (double)t);
+        }
         // THE BEAM SIDE ARRIVES HALF-WALKED (0.386.0): `b.tr0` is Tr to this sub-beam's start,
         // drawn once per parent beam by kBeamTr0 (see dMedTransmittanceMulti), so only [s0, s] is
         // walked here. -1 = not drawn: walk from the origin as before. Measured on gallery_rain's
@@ -6827,7 +6854,7 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                                           const DBeamMergeW* mw = nullptr,
                                           const DTrRay* camTr = nullptr,
                                           int routeMedJ = 0,
-                                          const DJSpec* js = nullptr) {
+                                          const DJSpec* js = nullptr, int glassMatCam = -1) {
     oX = oY = oZ = 0.0;
     // The cache's share first: it is additive and independent of the beam traversal, and it
     // must run even when the split left no beams at all (nNodes == 0).
@@ -6871,7 +6898,7 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                 if (!(x2 < 1.0)) continue;
                 if (routeMedJ && dRouteOfMed(sc, b.med) != 1) continue;   // D-routed merge (0.386.0)
                 dBeamHitEval(sc, bm, b, bm.primIdx[n.first + i], oc, dc, t, s, cosT, den, x2,
-                             aGlassCam, rng, mw, camTr, env, oX, oY, oZ, js);
+                             aGlassCam, rng, mw, camTr, env, oX, oY, oZ, js, glassMatCam);
             }
         } else {
             Real tc;
@@ -6945,10 +6972,14 @@ struct DWfSeg {
     int    px, py;
     float  lambda;
     int    routeMedJ;   // 1: a merge here is J-routed only in a J medium (a chain-prefix segment);
-                        // sits in the padding before `seed`, so the record does not grow
+                        // it fills the padding before `seed`
     unsigned long long seed;
     DJSpec spec;        // JSPEC: the camera carrier at the segment origin (DPathSeg::spec)
+    int    glassMat;    // DPathSeg::glassMat, for the camera-side glass under JSPEC
 };
+#if FTRACE_GPU_FP32
+static_assert(sizeof(DWfSeg) == 400, "DWfSeg changed size: update renderBdptCuda's segCap note");
+#endif
 struct DWfHit { int seg; int beam; float t, s; };
 // One band of the wave-schedule PROFILE (see renderBdptCuda): what the paths of pixel slots
 // [px0, px1) produced. Kept across calls, so the first chunk of every epoch is sized right.
@@ -7008,8 +7039,9 @@ __global__ void kBeamTr0(DScene sc, const DBeamRec* beams, float* tr0, const int
 __device__ __noinline__ static void dBeamHitEvalSpill(const DScene& sc, const DBeamMap& bm,
         const DBeamRec& b, int bi, const DVec3& oc, const DVec3& dc, Real t, Real s, Real cosT,
         Real den, double x2, double aGlass, DRng& rng, const DBeamMergeW* mw, const DTrRay* tr,
-        const DPatEnv& env, double& fX, double& fY, double& fZ, const DJSpec* js) {
-    dBeamHitEval(sc, bm, b, bi, oc, dc, t, s, cosT, den, x2, aGlass, rng, mw, tr, env, fX, fY, fZ, js);
+        const DPatEnv& env, double& fX, double& fY, double& fZ, const DJSpec* js, int glassMat) {
+    dBeamHitEval(sc, bm, b, bi, oc, dc, t, s, cosT, den, x2, aGlass, rng, mw, tr, env, fX, fY, fZ, js,
+                 glassMat);
 }
 
 __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm, int resX) {
@@ -7056,7 +7088,7 @@ __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm,
                     } else {
                         atomicAdd(&q.overflow[1], 1);
                         dBeamHitEvalSpill(sc, bm, b, bi, oc, dc, t, s, cosT, den, x2, sg.aGlass, rng,
-                                          &sg.mw, &sg.tr, env, fX, fY, fZ, &sg.spec);
+                                          &sg.mw, &sg.tr, env, fX, fY, fZ, &sg.spec, sg.glassMat);
                     }
                 }
             } else {
@@ -7097,7 +7129,7 @@ __global__ void kWfBeamEval(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm,
         rng.seedUnit((unsigned long long)h.beam, sg.seed);
         double oX = 0.0, oY = 0.0, oZ = 0.0;
         dBeamHitEval(sc, bm, b, h.beam, oc, dc, t, s, cosT, den, x2, sg.aGlass, rng,
-                     &sg.mw, &sg.tr, env, oX, oY, oZ, &sg.spec);
+                     &sg.mw, &sg.tr, env, oX, oY, oZ, &sg.spec, sg.glassMat);
         if (oX != 0.0 || oY != 0.0 || oZ != 0.0) {
             const size_t o = ((size_t)sg.py * resX + sg.px) * 3;
             atomicAdd(&camFilm[o + 0], oX * sg.beta);
@@ -11276,7 +11308,7 @@ __device__ static double dConvertDensity(double pdfW, const DVertex& from, const
 //   spot (shape 2)        - uniform inside the OUTER cone (the smoothstep falloff is
 //                           throughput, not density), pdfW = 1/(2 PI (1 - cosOuter)).
 //   sun (shape 6)         - INFINITE: no finite emission point, so the density of `next`
-//                           is the PLANAR density 1/(pi R^2) over the fictitious origin
+//                           is the PLANAR density dSunOriginPdf over the fictitious origin
 //                           disc, with NO 1/dist^2 (the disc-point -> hit-point map is a
 //                           shear along the beam whose Jacobian is exactly the cos(next)
 //                           applied at the bottom).
@@ -11296,10 +11328,10 @@ __device__ static float dVertexPdfLightF(const DScene& sc, const DVertex& cur, c
     if (em && dIsInfiniteEmitter(*em)) {
         float R = (float)sc.sceneRadius;
         if (R <= 0.f) return 0.f;
-        if (em->shape == 6 && dSunAimOn())            // the aimed mixture (0.387.0, host twin)
+        if (em->shape == 6)                           // planar, over the sun's disc (host twin)
             pdf = (float)dSunOriginPdfAlong(sc, *em, cur.p, next.p);
         else
-            pdf = 1.0f / ((float)DPI * R * R);        // planar density over the sun disc
+            pdf = 1.0f / ((float)DPI * R * R);        // the env's disc
     } else if (em && em->shape == 2) {
         float solid = 2.0f * (float)DPI * (1.0f - (float)em->spotCosOuter);
         if (solid <= 0.f) return 0.f;
@@ -14880,43 +14912,34 @@ __device__ static double dJSlotAt(const DScene& sc, const DMaterial& m, const DJ
     return (double)clamp01(dCoatedAlbedoAt(m, (Real)v, (Real)L));
 }
 
-// The optical depth a segment crosses in each medium, wavelength-free: the clipped length of a
-// homogeneous one, the density integral (DJ_TRQUAD midpoints) of a heterogeneous one.
-// A chromatic medium's Tr(lam)/Tr(lambda) is then exp(-sum_m (sigma_t,m(lam) - sigma_t,m(lambda))
-// tau_m), with one density read per sample point rather than one per wavelength.
-#define DJ_MAXMED 16
-#define DJ_TRQUAD 32   // host kJTrQuad: midpoints of a heterogeneous medium's density integral
-__device__ static void dJDepths(const DScene& sc, const DVec3& o, const DVec3& d, double dist,
-                                double* tau) {
+// Fold a segment's chromatic transmittance ratio into `jr` (host twin jTrFold, where the why is):
+// exp(-sum_m (sigma_t,m(lam) - sigma_t,m(lambda)) tau_m), tau_m the segment's wavelength-free
+// optical depth in medium m -- its clipped length if homogeneous, its density integral
+// (DJ_TRQUAD midpoints) if not -- so one density read per sample point serves every wavelength.
+#define DJ_TRQUAD 32   // host kJTrQuad
+__device__ static void dJTrFold(const DScene& sc, DJSpecRun& jr, const DVec3& o, const DVec3& d,
+                                double dist, Real lambda) {
     const DPatEnv env = dPatEnvOf(sc);
-    for (int i = 0; i < sc.mediaN && i < DJ_MAXMED; ++i) {
-        tau[i] = 0.0;
+    double e[DJSPEC_K];   // the exponent at each bin, summed medium by medium
+    for (int k = 0; k < DJSPEC_K; ++k) e[k] = 0.0;
+    for (int i = 0; i < sc.mediaN; ++i) {
         const DMedium& m = sc.media[i];
         double ta, tb;
         if (!dMedClip(m, o, d, 0.0, dist, ta, tb) || !(tb > ta)) continue;
-        if (!m.heterogeneous) { tau[i] = tb - ta; continue; }
-        const double dt = (tb - ta) / (double)DJ_TRQUAD;
-        double acc = 0.0;
-        for (int q = 0; q < DJ_TRQUAD; ++q) acc += dMedDensityAt(m, o + d * (Real)(ta + ((double)q + 0.5) * dt), env);
-        tau[i] = acc * dt;
+        double tau = tb - ta;
+        if (m.heterogeneous) {
+            const double dt = (tb - ta) / (double)DJ_TRQUAD;
+            double acc = 0.0;
+            for (int q = 0; q < DJ_TRQUAD; ++q) acc += dMedDensityAt(m, o + d * (Real)(ta + ((double)q + 0.5) * dt), env);
+            tau = acc * dt;
+        }
+        if (!(tau > 0.0)) continue;
+        const double s0 = (double)medSigmaT(m, lambda);
+        for (int k = 0; k < DJSPEC_K; ++k)
+            e[k] += ((double)medSigmaT(m, (Real)DJSpec::lamOf(k)) - s0) * tau;
     }
-}
-// Fold a segment's chromatic transmittance ratio into `jr` (host twin: randomWalk's trDet fold).
-__device__ static void dJTrFold(const DScene& sc, DJSpecRun& jr, const DVec3& o, const DVec3& d,
-                                double dist, Real lambda) {
-    if (sc.mediaN > DJ_MAXMED) return;
-    double tau[DJ_MAXMED];
-    dJDepths(sc, o, d, dist, tau);
-    double v[DJSPEC_K];
-    for (int k = 0; k < DJSPEC_K; ++k) {
-        double e = 0.0;
-        for (int i = 0; i < sc.mediaN; ++i)
-            if (tau[i] > 0.0)
-                e += ((double)medSigmaT(sc.media[i], (Real)DJSpec::lamOf(k)) -
-                      (double)medSigmaT(sc.media[i], lambda)) * tau[i];
-        v[k] = exp(-e);
-    }
-    jr.mulVec(v, 1.0);
+    for (int k = 0; k < DJSPEC_K; ++k) e[k] = exp(-e[k]);
+    jr.mulVec(e, 1.0);
 }
 
 
@@ -15188,7 +15211,12 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         path[n] = v; int cur = n; n++;
         if (jrun && vspec) jrun->snap(vspec[cur]);   // JSPEC: the carrier arriving here (coin included)
         for (int i = 0; i + 1 < nUp; ++i) pathSec[cur * secStride + i] = betaSec[i];
-        if (++bounces >= maxDepth) return;
+        if (++bounces >= maxDepth) {
+            // Nor does a light walk END on a strand (host twin, bdpt.h): it would be connected to
+            // with the fiber read from the light side, which dMisWeight does not count.
+            if (importance && mp->type == D_HAIR) --n;
+            return;
+        }
 
         DVec3 dwo = path[cur - 1].p - path[cur].p;   // degeneracy guard: normalize(0) is NaN
         if (ddot(dwo, dwo) == 0.0) return;
@@ -15606,10 +15634,10 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
         //        uniform there (pdfW = 1/(2 PI (1 - cosOuter))) and the smoothstep penumbra
         //        scales the emitted INTENSITY (emitSpd is W/sr for a spot, since its
         //        geomWeight is spotOmega). pdfPos is 1 — the position is a Dirac delta.
-        //  sun   an infinitely distant disc: the origin is a point on a disc of radius
-        //        sceneRadius, centred one radius UPSTREAM of the scene centre and
-        //        perpendicular to beamDir, so every emitted ray enters the scene's
-        //        cross-section (pdfPos = 1/(pi R^2)); the direction is drawn inside the
+        //  sun   an infinitely distant disc: the origin is a point on a disc centred one
+        //        radius UPSTREAM of the scene centre and perpendicular to beamDir
+        //        (dSampleSunOrigin), so every emitted ray enters the scene's cross-section
+        //        (pdfPos = dSunOriginPdf); the direction is drawn inside the
         //        solar cone (pdfW = 1/Omega) and emitSpd is a RADIANCE (addSunLight already
         //        divided the irradiance by Omega).
         // Both store path[0].pdfFwd = 0 (PBRT's delta convention — see
@@ -15624,31 +15652,10 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
         double pdfDirD = 1.0 / coneSolid;
         DVec3 org; double pdfPosD = 1.0;             // delta (spot) unless the sun's disc
         if (isSun) {
-            double R = sc.sceneRadius;
-            if (R <= 0.0) return 0;
-            DVec3 tt, bb; onb(em.beamDir, tt, bb);
+            if (sc.sceneRadius <= 0.0) return 0;
             double x, y;
-            if (dSunAimOn() && (double)rng.uniform() < c_sunAimF) {
-                // THE AIMED SHARE (host deltaLightSubpath): a target circle by r^2, a point in it.
-                const double pick = (double)rng.uniform() * c_sunAimSumR2;
-                double acc = 0.0;
-                int j = 0;
-                for (; j + 1 < c_sunAimN; ++j) {
-                    acc += c_sunAimR[j] * c_sunAimR[j];
-                    if (pick < acc) break;
-                }
-                double cx, cy; dSunAimProject(sc, tt, bb, j, cx, cy);
-                const double rr = c_sunAimR[j] * sqrt((double)rng.uniform());
-                const double phi = 2.0 * DPI * (double)rng.uniform();
-                x = cx + rr * cos(phi);
-                y = cy + rr * sin(phi);
-            } else {
-                double rr = R * sqrt((double)rng.uniform()), phi = 2.0 * DPI * (double)rng.uniform();
-                x = rr * cos(phi);
-                y = rr * sin(phi);
-            }
-            org = sc.sceneCenter + tt * (Real)x + bb * (Real)y - em.beamDir * (Real)R;
-            pdfPosD = dSunOriginPdf(sc, em, x, y);   // 1/(pi R^2) with the aim off
+            org = dSampleSunOrigin(sc, em, rng, x, y);
+            pdfPosD = dSunOriginPdf(em, x, y);
             if (!(pdfPosD > 0.0)) return 0;
         } else {
             org = em.origin;
@@ -15687,7 +15694,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
                     path, pathSec, secStride, maxV, nD, true, betaWalkSecD, hb.C);
         // Infinite-light density patch (PBRT): the first scene vertex was given a
         // solid-angle density converted with 1/dist^2 from the fictitious disc point, but
-        // the reverse direction (dVertexPdfLightF) reports the planar 1/(pi R^2). Rewrite
+        // the reverse direction (dVertexPdfLightF) reports the planar pdfPos. Rewrite
         // it to match, or the two sides of every MIS ratio disagree.
         if (isSun && nD > 1) {
             double pdf = pdfPosD;
@@ -16390,9 +16397,8 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
     // for the beams.
     const double kappaSurf = (sm.nPts > 0) ? sm.kappaS : 0.0;
     // JSPEC: the camera walk carries its spectral factors on a grid so each merge can read them
-    // at its beam's or photon's own wavelength (DJSpec). The point merges read theirs off the
-    // segment INTO the merge vertex, so with the carrier on, the walk records segments for them
-    // too -- recording draws nothing, so the paths are unchanged.
+    // at its beam's or photon's own wavelength (DJSpec). A beam merge reads it off the recorded
+    // segment it lies on (DPathSeg::spec), a point merge off the eye vertex it merges at (vspec).
     const bool jSpecOn = MERGE && c_jSpecOn && (mergeOn || kappaSurf > 0.0);
     const bool wantSegs = mergeOn;
     if (maxDepth > MAXD) maxDepth = MAXD;   // device array bound (host picks the variant)
@@ -16480,7 +16486,8 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
         // which extends that prefix by a medium point, is J whatever the medium; otherwise such a
         // merge is J only in a J medium (DWfSeg::routeMedJ).
         int routeR = 1, fIdx = nE;
-        unsigned prefJ = 0u;
+        // 64 bits, as the host's routeOfEye: the deep kernel's chains run past 32 vertices.
+        unsigned long long prefJ = 0ull;
         const bool routeOn = MERGE && c_routeOn;
         if (routeOn) {
             int r = -1;
@@ -16488,7 +16495,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                 const int m = dRouteOfVert(sc, eye[k]);
                 if (m > r) r = m;
                 if (!eye[k].delta) { fIdx = k; break; }
-                if (r == 1 && k < 32) prefJ |= (1u << k);
+                if (r == 1 && k < 64) prefJ |= (1ull << k);
             }
             routeR = (r < 0) ? c_routeDefault : r;
         }
@@ -16667,7 +16674,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                 int routeMedJ = 0;
                 if (routeOn) {
                     if (sg.vert >= fIdx) { if (routeR != 1) continue; }
-                    else if (!(sg.vert >= 1 && sg.vert < 32 && ((prefJ >> sg.vert) & 1u))) {
+                    else if (!(sg.vert >= 1 && sg.vert < 64 && ((prefJ >> sg.vert) & 1ull))) {
                         if (!c_routeAnyMedJ) continue;
                         routeMedJ = 1;
                     }
@@ -16731,6 +16738,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                         ws.routeMedJ = routeMedJ;
                         ws.mw = mw; ws.tr = camTr; ws.px = px; ws.py = py; ws.lambda = (float)lambda;
                         ws.spec = sg.spec;   // JSPEC (any == 0 when the carrier is off)
+                        ws.glassMat = sg.glassMat;
                         // The segment's own stream: its sample and its index along the walk, under
                         // the kernel's seed (which carries -seed), so it is the same however the
                         // queue's slots were handed out.
@@ -16744,7 +16752,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                 if (!queued) {
                     double mX = 0.0, mY = 0.0, mZ = 0.0;
                     dGatherPhotonBeams(sc, bm, sg.o, sg.d, (Real)sg.tMax, sg.aGlass, rng,
-                                       mX, mY, mZ, &mw, &camTr, routeMedJ, &sg.spec);
+                                       mX, mY, mZ, &mw, &camTr, routeMedJ, &sg.spec, sg.glassMat);
                     if (mX != 0.0 || mY != 0.0 || mZ != 0.0) {
                         size_t o = ((size_t)py * resX + px) * 3;
                         const double bJ = sg.spec.beta(sg.beta) * wJ;   // JSPEC scale
@@ -18478,33 +18486,12 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             pdfDirW = 1.0 / coneSolid;
             dir = dSunSampleCone(em, em.beamDir, (double)u1, (double)u2);
             if (isInfinite) {
-                // Origin on a disc of radius sceneRadius, one radius upstream of the scene
-                // centre and perpendicular to beamDir: a PLANAR density 1/(pi R^2).
-                double R = sc.sceneRadius;
-                if (R <= 0.0) continue;
-                DVec3 tt, bb; onb(em.beamDir, tt, bb);
+                // Origin on the sun's disc upstream of the scene: a PLANAR density (host twin
+                // vcm.h, reasoning bdpt.h sampleSunOrigin).
+                if (sc.sceneRadius <= 0.0) continue;
                 double x, yy;
-                if (dSunAimOn() && (double)rng.uniform() < c_sunAimF) {
-                    // THE AIMED SUN (0.387.0; host twin vcm.h, reasoning bdpt.h SunAim).
-                    const double pick = (double)rng.uniform() * c_sunAimSumR2;
-                    double acc = 0.0;
-                    int j = 0;
-                    for (; j + 1 < c_sunAimN; ++j) {
-                        acc += c_sunAimR[j] * c_sunAimR[j];
-                        if (pick < acc) break;
-                    }
-                    double cx, cy; dSunAimProject(sc, tt, bb, j, cx, cy);
-                    const double rr = c_sunAimR[j] * sqrt((double)rng.uniform());
-                    const double phi = 2.0 * DPI * (double)rng.uniform();
-                    x = cx + rr * cos(phi);
-                    yy = cy + rr * sin(phi);
-                } else {
-                    double rr = R * sqrt((double)rng.uniform()), phi = 2.0 * DPI * (double)rng.uniform();
-                    x = rr * cos(phi);
-                    yy = rr * sin(phi);
-                }
-                y = sc.sceneCenter + tt * (Real)x + bb * (Real)yy - em.beamDir * (Real)R;
-                pdfPos = dSunOriginPdf(sc, em, x, yy);   // 1/(pi R^2) with the aim off
+                y = dSampleSunOrigin(sc, em, rng, x, yy);
+                pdfPos = dSunOriginPdf(em, x, yy);
             } else {
                 y = em.origin;                             // delta position: pdfPos == 1
                 emitScale = spotFalloff(ddot(dir, em.beamDir), em.spotCosInner, em.spotCosOuter);
@@ -18605,8 +18592,16 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             const DMaterial* mp = &sc.mats[h.matId];
             int matId = h.matId;
             if (dIsCompound(mp->type)) {
-                int c = dResolveCompound(sc, *mp, h, rdCur, lamAll[0], rng);
+                int coatPick = -1; double coatR = 0.0, coatCos = 1.0, coatU = 0.0; Real coatTh = (Real)0;
+                int c = dResolveCompound(sc, *mp, h, rdCur, lamAll[0], rng,
+                                         &coatPick, &coatR, &coatCos, &coatTh, &coatU);
                 if (c < 0) break;
+                // One coat coin for the bundle, compared per wavelength; disagreeing wavelengths
+                // collapse it to the hero here (vcm.h, bdpt.h HERO-COAT-COIN).
+                if (coatPick >= 0)
+                    for (int k = 0; nUp > 1 && k + 1 < nUp; ++k)
+                        if ((coatU < dCoatRAtJ(*mp, coatCos, coatTh, lamAll[k + 1])) != (coatPick == 1))
+                            nUp = 1;
                 mp = &sc.mats[c]; matId = c;
             }
             // A light block's own surface absorbs; any other glowing material also reflects, and
@@ -18887,8 +18882,15 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             const DMaterial* mp = &sc.mats[h.matId];
             int matId = h.matId;
             if (dIsCompound(mp->type)) {
-                int c = dResolveCompound(sc, *mp, h, rdCur, lamAll[0], rng);
+                int coatPick = -1; double coatR = 0.0, coatCos = 1.0, coatU = 0.0; Real coatTh = (Real)0;
+                int c = dResolveCompound(sc, *mp, h, rdCur, lamAll[0], rng,
+                                         &coatPick, &coatR, &coatCos, &coatTh, &coatU);
                 if (c < 0) break;
+                // One coat coin for the bundle, compared per wavelength (as the light kernel).
+                if (coatPick >= 0)
+                    for (int k = 0; nUp > 1 && k + 1 < nUp; ++k)
+                        if ((coatU < dCoatRAtJ(*mp, coatCos, coatTh, lamAll[k + 1])) != (coatPick == 1))
+                            nUp = 1;
                 mp = &sc.mats[c]; matId = c;
             }
 
@@ -19002,11 +19004,10 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                 dist2 = distL * distL;
                                 occlEps = 0.0;
                                 neeDirectPdfW = 1.0 / coneSolid;
-                                // The aimed mixture at the origin a light subpath would
-                                // have needed (0.387.0; 1/(pi R^2) with the aim off).
-                                neeEmissionPdfW = (dSunAimOn()
-                                    ? dSunOriginPdfAlong(sc, em, h.p + wiL * (Real)distL, h.p)
-                                    : 1.0 / (DPI * R * R)) / coneSolid;
+                                // The origin density a light subpath would have needed
+                                // (dSampleSunOrigin, the aimed mixture included).
+                                neeEmissionPdfW = dSunOriginPdfAlong(sc, em, h.p + wiL * (Real)distL, h.p)
+                                                / coneSolid;
                                 geomOk = true;
                             }
                         } else {
@@ -20807,6 +20808,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         }
         de.spotCosInner = e.spotCosInner; de.spotCosOuter = e.spotCosOuter;
         de.spotOmega = e.spotOmega;
+        de.sunDiscR = e.sunDiscR;
         de.viewXYZ = {e.viewXYZ.x, e.viewXYZ.y, e.viewXYZ.z};
         de.cdfOffset = (int)cdfAll.size();
         de.cdfN = (int)e.spd.cdf.size();
@@ -22033,19 +22035,23 @@ void cudaSetRouting(int on, int routeDefault, int anyMedJ, double sppD, double s
 static double g_jDispWinHost = 10.0;
 static int    g_jDispAllHost = 0;
 void cudaSetJDisp(double winNm, int all) { g_jDispWinHost = winNm; g_jDispAllHost = all; }
+// Mode J's estimator switches (see cudaSetJSwitches): uploaded at the top of every renderBdptCuda.
+static int g_jSpecHost = 1, g_jTrSpecHost = 0, g_jDeltaMergeHost = 1, g_jHalfHost = 0;
+void cudaSetJSwitches(int jSpec, int trSpec, int deltaMerge, int half) {
+    g_jSpecHost = jSpec; g_jTrSpecHost = trSpec; g_jDeltaMergeHost = deltaMerge; g_jHalfHost = half;
+}
 // The aimed sun (bdpt.h SunAim): host copies, uploaded at the top of every renderBdptCuda.
-static std::vector<double> g_sunAimCHost, g_sunAimRHost;
+static std::vector<gpu::Real> g_sunAimWHost;
+static std::vector<double> g_sunAimRHost;
 static double g_sunAimSumR2Host = 0.0, g_sunAimFHost = 0.0;
-void cudaSetSunAim(const double* cxyz, const double* r, int n, double sumR2, double f) {
+void cudaSetSunAim(const double* wxyz, const double* r, int n, double sumR2, double f) {
     if (n > SUNAIM_MAX) {
-        // causticaim.h clusters to -causticaimk targets (default 64); past the device's array the
-        // device would disagree with the host, so turn the aim off on BOTH sides rather than
-        // render a mismatch. (bdpt::g_sunAim is the host's; main.cpp keeps -causticaimk <= 64.)
-        std::fprintf(stderr, "[sun aim] %d targets exceed the device's %d: aim disabled for the GPU\n",
-                     n, SUNAIM_MAX);
-        n = 0;
+        // main.cpp's prepareSunAim clusters the targets to at most this many, so host and device
+        // aim at the same set; a larger set reaching here is a bug, not a configuration.
+        throw std::logic_error("cudaSetSunAim: " + std::to_string(n) + " targets exceed the "
+                               "device's " + std::to_string(SUNAIM_MAX));
     }
-    g_sunAimCHost.assign(cxyz, cxyz + 3 * (size_t)(n > 0 ? n : 0));
+    g_sunAimWHost.assign(wxyz, wxyz + 3 * (size_t)(n > 0 ? n : 0));
     g_sunAimRHost.assign(r, r + (size_t)(n > 0 ? n : 0));
     g_sunAimSumR2Host = (n > 0) ? sumR2 : 0.0;
     g_sunAimFHost = (n > 0) ? f : 0.0;
@@ -22056,7 +22062,7 @@ static void uploadSunAim() {
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_sunAimF, &g_sunAimFHost, sizeof(double)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_sunAimSumR2, &g_sunAimSumR2Host, sizeof(double)));
     if (n > 0) {
-        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_sunAimC, g_sunAimCHost.data(), sizeof(double) * 3 * n));
+        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_sunAimW, g_sunAimWHost.data(), sizeof(gpu::Real) * 3 * n));
         CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_sunAimR, g_sunAimRHost.data(), sizeof(double) * n));
     }
 }
@@ -22729,37 +22735,13 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     const long long jPaths = jDevLight ? (long long)smap->nEmitted : 0;
     const double    jRad   = jDevLight ? smap->radius : 0.0;
     const long long jCap   = jDevLight ? ((long long)smap->pts.size() * 2 + 1024) : 0;
-    {   // the half-render diagnostic, mirrored from the host so one half can be compared
-        // backend to backend (bdpt::jHalfMode: 1 = connections only, 2 = merges only)
-        // Same strings bdpt.h's jHalfMode() reads -- that function is the source of truth, but
-        // it lives in a header this translation unit does not include.
-        const char* e = std::getenv("FTRACE_J_HALF");
-        const int jh = !e ? 0 : (!std::strcmp(e, "connections") ? 1
-                              : (!std::strcmp(e, "merges") || !std::strcmp(e, "merges-raw")) ? 2 : 0);
-        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jHalf, &jh, sizeof(int)));
-    }
-    {   // JSPEC: the camera-side spectral carrier (bdpt::jSpecEnabled -- same env string), and
-        // whether any medium's sigma_t is chromatic (bdpt::mediumSigmaTChromatic's test).
-        const char* e = std::getenv("FTRACE_JSPEC");
-        const int on = (e && e[0] == '0') ? 0 : 1;
-        int tr = 0;
-        for (const Medium& m : scene.media) {
-            const double a = m.sigmaT(360.0 + 0.5 * (830.0 - 360.0) / 24.0);
-            for (int k = 1; k < 24 && !tr; ++k)
-                if (std::fabs(m.sigmaT(360.0 + (k + 0.5) * (830.0 - 360.0) / 24.0) - a) > 1e-12 * (1.0 + std::fabs(a))) tr = 1;
-        }
-        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jSpecOn, &on, sizeof(int)));
-        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jTrSpec, &tr, sizeof(int)));
-        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispWin, &g_jDispWinHost, sizeof(double)));
-        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispAll, &g_jDispAllHost, sizeof(int)));
-        {
-            // The same environment switch bdpt::g_jDeltaMerge reads (this file does not see
-            // bdpt.h's host globals); MODE-J-SDS.
-            const char* jde = std::getenv("FTRACE_JDELTA");
-            const int jd = (jde && jde[0] == '0') ? 0 : 1;
-            CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDeltaMerge, &jd, sizeof(int)));
-        }
-    }
+    // Mode J's switches, as the host settled them for this render (cudaSetJSwitches).
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jHalf, &g_jHalfHost, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jSpecOn, &g_jSpecHost, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jTrSpec, &g_jTrSpecHost, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDeltaMerge, &g_jDeltaMergeHost, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispWin, &g_jDispWinHost, sizeof(double)));
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispAll, &g_jDispAllHost, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_routeOn, &g_routeOn, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_routeDefault, &g_routeDefault, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_routeAnyMedJ, &g_routeAnyMedJ, sizeof(int)));
@@ -22779,7 +22761,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     int* d_wfCounters = nullptr;
     long long waveSamples = 0;
     if (mergeOn && !(std::getenv("FTRACE_NOWAVEFRONT") && std::atoi(std::getenv("FTRACE_NOWAVEFRONT")) != 0)) {
-        const int segCap = 1 << 20;          // ~270 B each (~280 MB)
+        const int segCap = 1 << 20;          // 400 B each (~420 MB), 128 of them JSPEC's
         const int hitCap = 1 << 25;          // 16 B each  (512 MB): a dense map yields thousands of
                                              // candidates per segment (_fog_cornell: ~2000), and a
                                              // spilled candidate is evaluated divergently, on the spot

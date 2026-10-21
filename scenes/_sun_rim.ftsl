@@ -1,0 +1,36 @@
+# The sun's disc reaches the rim of the bounding sphere (tools/check_sun_rim.py).
+#
+# A BDPT-family light subpath (modes D, J, U) starts a sun ray on a disc perpendicular to the
+# beam, one scene radius upstream. A ray tilted by the cone's half-angle reaches a point on the
+# rim of the scene's bounding sphere from outside a disc of radius R, so the disc must be wider
+# (Emitter::sunDiscR). Where it was not, light tracing could not produce those paths while MIS
+# still weighed against it, and with the sun aim on the origin density there read 0 -- the
+# floor's corners, which lie on the bounding sphere, came out 22 % dark in mode D (0.391.2).
+#
+# The sun is 30 deg across to make the rim band wide; the glass ball turns the sun aim on.
+# Mode R lights the floor by NEE alone and is the reference.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "grey"  { type diffuse reflect 0.5 }
+material "glass" { type dielectric ior 1.5 }
+
+quad { origin -6 0 -6   u 0 0 12   v 12 0 0   material grey }
+
+sphere { center 0 0.6 0   radius 0.6   material glass }
+
+light sun {
+    elevation 35   azimuth 45
+    angle     30
+    spd       preset:bb5800
+    intensity 3
+}
+
+camera "top" {
+    eye 0 22 0.001   look_at 0 0 0   up 0 0 -1   fov_y 32
+    mode D
+    film { res 320 320 }
+}

@@ -16841,41 +16841,50 @@ struct JLightCache {
 // the device. Every BDPT-family weight reads bdpt::g_sunAim, so it must be settled before the
 // first light subpath of the render and must not change during it.
 static void prepareSunAim(const Scene& scene) {
-    static const Scene* builtFor = nullptr;
-    if (builtFor == &scene) return;
-    builtFor = &scene;
+#ifdef HAVE_CUDA
+    static_assert(bdpt::SunAim::kMaxTargets == kSunAimMaxTargets,
+                  "host and device must agree on the aimed sun's target capacity");
+#endif
+    // Keyed on the scene's generation, not its address: -serve builds each frame's scene anew,
+    // often at the same address.
+    static uint64_t builtFor = 0;
+    if (builtFor == scene.generation) return;
+    builtFor = scene.generation;
     bdpt::g_sunAim = bdpt::SunAim{};
-    bool hasSun = false;
-    for (const Emitter& em : scene.emitters) hasSun |= (em.shape == EmitterShape::Sun);
-    if (hasSun && g_sunAimFrac > 0.0) {
-        const caim::AimMap am = caim::build(scene, g_causticAimK);
+    const Emitter* sun = nullptr;
+    for (const Emitter& em : scene.emitters)
+        if (em.shape == EmitterShape::Sun && !sun) sun = &em;
+    if (sun && g_sunAimFrac > 0.0) {
+        // No more targets than the device holds, so host and device aim at the same set (a
+        // larger -causticaimk still serves mode M's caustic aim, which has no such limit).
+        const caim::AimMap am = caim::build(scene, std::min(g_causticAimK, bdpt::SunAim::kMaxTargets));
         if (am.empty()) {
             std::printf("[sun aim] no glass, mirror or other focusing geometry: the sun's light paths "
                         "stay uniform.\n");
         } else {
             bdpt::g_sunAim.f = g_sunAimFrac;
             for (const caim::Target& t : am.targets) {
-                bdpt::g_sunAim.c.push_back(t.c);
+                bdpt::g_sunAim.w.push_back(t.c - scene.sceneCenter);
                 bdpt::g_sunAim.r.push_back(t.r);
             }
             bdpt::g_sunAim.sumR2 = am.sumR2;
-            const double R = scene.sceneRadius;
+            const double R = sun->sunDiscR;
             std::printf("[sun aim] %.0f%% of the sun's light paths aimed at %lld focusing prim%s in %zu "
-                        "target sphere%s (they cover %.3g%% of the sun's %.3g m disc; -sunaim 0 = off)\n",
+                        "target sphere%s (they cover %.3g%% of the sun's disc, radius %.3g m; -sunaim 0 = off)\n",
                         100.0 * g_sunAimFrac, am.nPrims, am.nPrims == 1 ? "" : "s",
                         am.targets.size(), am.targets.size() == 1 ? "" : "s",
                         R > 0.0 ? 100.0 * am.sumR2 / (R * R) : 0.0, R);
         }
     }
-    std::vector<double> cxyz, rr;
-    for (size_t j = 0; j < bdpt::g_sunAim.c.size(); ++j) {
-        cxyz.push_back(bdpt::g_sunAim.c[j].x);
-        cxyz.push_back(bdpt::g_sunAim.c[j].y);
-        cxyz.push_back(bdpt::g_sunAim.c[j].z);
+    std::vector<double> wxyz, rr;
+    for (size_t j = 0; j < bdpt::g_sunAim.w.size(); ++j) {
+        wxyz.push_back(bdpt::g_sunAim.w[j].x);
+        wxyz.push_back(bdpt::g_sunAim.w[j].y);
+        wxyz.push_back(bdpt::g_sunAim.w[j].z);
         rr.push_back(bdpt::g_sunAim.r[j]);
     }
 #ifdef HAVE_CUDA
-    cudaSetSunAim(cxyz.data(), rr.data(), (int)rr.size(), bdpt::g_sunAim.sumR2, bdpt::g_sunAim.f);
+    cudaSetSunAim(wxyz.data(), rr.data(), (int)rr.size(), bdpt::g_sunAim.sumR2, bdpt::g_sunAim.f);
 #endif
 }
 
@@ -16910,13 +16919,30 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 std::printf("[ignore] per-object modes (-no-modes): mode %c renders the whole frame\n", mode);
             }
         } else if (anyD || anyJ) {
-            if (mode == 'D' || mode == 'J') {
+            // A mode-D camera runs on mode J's renderer only if mode J can render this scene:
+            // the camera's mode was checked against the scene's features (resolveCameraModes),
+            // and J renders fewer of them (no fire, for one). Where it cannot, the tags are set
+            // aside and the camera's own mode D renders the frame.
+            const char* jCannot = (mode == 'D' && anyJ)
+                                ? modeFeatureUnsupported(scene, 'J', cam.projection) : nullptr;
+            if (jCannot) {
+                static bool said = false;
+                if (!said) {
+                    said = true;
+                    std::printf("[mode] per-object `mode J` tags set aside: mode J cannot render this "
+                                "scene's %s, so the mode-D camera renders the whole frame in mode D\n",
+                                jCannot);
+                }
+            } else if (mode == 'D' || mode == 'J') {
                 def = (mode == 'J') ? ROUTE_J : ROUTE_D;
                 if (mode == 'D' && anyJ) mode = 'J';
                 on = (mode == 'J') ? 1 : 0;
                 for (const Medium& md : scene.media)
                     if ((md.route >= 0 ? md.route : def) == ROUTE_J) anyMedJ = 1;
-                if (on) {
+                // Once per scene, not per frame: a flyby would print it at every frame.
+                static uint64_t saidFor = 0;
+                if (on && saidFor != scene.generation) {
+                    saidFor = scene.generation;
                     int nm = 0, nmd = 0;
                     const int other = (def == ROUTE_J) ? ROUTE_D : ROUTE_J;
                     for (const Material& m : scene.mats) nm += (m.route == other);
@@ -16945,6 +16971,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         bdpt::g_routeSppD = sD; bdpt::g_routeSppJ = sJ;
 #ifdef HAVE_CUDA
         cudaSetRouting(on, def, anyMedJ, sD, sJ);
+        cudaSetJSwitches(bdpt::jSpecEnabled() ? 1 : 0, bdpt::anyMediumSigmaTChromatic(scene) ? 1 : 0,
+                         bdpt::g_jDeltaMerge ? 1 : 0, std::min(bdpt::jHalfMode(), 2));
 #endif
     }
     // The aimed sun (bdpt.h SunAim): settled before the first BDPT-family light subpath.
@@ -19471,6 +19499,10 @@ static int run(int argc, char** argv) {
     // tolerance, and would otherwise compound frame after frame.
     g_denoise = false;
     g_denoiseParams = denoise::Params{};
+    // And state a SCENE sets when the command line leaves it alone (`render { jsurf_radius,
+    // mode_spp }`): left over, frame 1's values would override frame 2's own, or its defaults.
+    g_jSurfRadius = 0.0;
+    g_modeSppD = 1.0; g_modeSppJ = 1.0; g_modeSppCli = false;
     // Normalize GNU-style double-dash options to the single-dash spellings the parser
     // uses, so EVERY flag accepts either form (`--window` == `-window`, `--beams` ==
     // `-beams`, etc.). We simply advance the pointer past one leading dash for any token

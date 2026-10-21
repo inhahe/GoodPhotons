@@ -1002,6 +1002,14 @@ struct Emitter {
     // Omega*PI*R^2 (cone solid angle x the scene's projected disc). Both set in build()
     // because both depend on the scene bounding sphere.
     double envGeom = 0.0;
+    // Sun only: the radius of the disc a BDPT-family light subpath starts on (bdpt.h
+    // sampleSunOrigin), perpendicular to beamDir one scene radius upstream of the centre. A
+    // disc of radius R would do for a beam exactly along beamDir, but a ray tilted by up to the
+    // cone's half-angle theta reaches a point of the bounding sphere from as far out as
+    // R (1 + sin theta) / cos theta (the sphere's support in the direction (1, tan theta)), and a
+    // point no subpath can start from has no light-tracing strategy for MIS to weigh against.
+    // Set in build() with envGeom.
+    double sunDiscR = 0.0;
     // Sun only: the directly-viewed XYZ of this light, integral(CIE(lam)*L(lam) dlam).
     // Precomputed in build() because the direct-view path (a camera/specular ray that
     // escapes into the sun's cone) is evaluated per pixel and must not re-integrate.
@@ -1512,6 +1520,10 @@ struct Scene;
 inline double slotPatMul(const Scene& scene, int pat, const Hit& h);
 
 struct Scene {
+    // Distinct for every Scene constructed in the process (copies share it, being the same
+    // content): a key for per-scene caches that must not mistake one load for another just
+    // because -serve built the next scene at the same address.
+    uint64_t generation = [] { static std::atomic<uint64_t> next{1}; return next.fetch_add(1); }();
     std::vector<Tri> tris;
     std::vector<Sphere> spheres;
     std::vector<Implicit> implicits;   // isosurfaces / metaballs / (smooth) CSG
@@ -3083,6 +3095,9 @@ struct Scene {
         for (auto& e : emitters)
             if (e.shape == EmitterShape::Sun) {
                 e.envGeom = e.spotOmega * PI * sceneRadius * sceneRadius;
+                const double c = e.spotCosOuter;   // > 0: the parser keeps the cone under 90 deg
+                e.sunDiscR = (c > 0.0) ? sceneRadius * (1.0 + std::sqrt(std::max(0.0, 1.0 - c * c))) / c
+                                       : sceneRadius;
                 e.viewXYZ = Vec3{0, 0, 0};
                 for (double lam = LAMBDA_MIN; lam <= LAMBDA_MAX; lam += 1.0)
                     e.viewXYZ += Vec3(cieX(lam), cieY(lam), cieZ(lam)) * e.spdFn(lam);

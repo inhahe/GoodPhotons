@@ -221,6 +221,7 @@ struct BeamWeightOne {
     double operator()(const BeamHit&, const PhotonBeam&, double, double) const { return 1.0; }
     // No camera-side spectral carrier (JSpec). Mode M passes none.
     const JSpec* camSpec() const { return nullptr; }
+    const Material* glassCam() const { return nullptr; }
 };
 
 // --- Deterministic transmittance, for MIS WEIGHTS ONLY --------------------------------
@@ -862,7 +863,15 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
         w *= w1(bh, b, dens, phaseMis);
         if (!(w > 0.0)) { beamDiag().bump(beamDiag().rejW); return; }
         if (b.absorb > 0.0f) w *= std::exp(-(double)b.absorb * bh.sBeam);   // glass, beam side
-        if (aGlassCam > 0.0) w *= std::exp(-aGlassCam * bh.tCam);           // glass, camera side
+        // Glass, camera side: at the beam's wavelength wherever JSPEC is on (the carrier `camSpec`
+        // was snapshotted before this segment's absorption, so the partial segment is this
+        // merge's to re-express), else at the camera sample's own. Not gated on the carrier
+        // being live: a camera's first segment inside the glass carries a flat one.
+        {
+            const Material* gc = w1.glassCam();
+            const double aC = gc ? gc->absorb(lam) : aGlassCam;
+            if (aC > 0.0) w *= std::exp(-aC * bh.tCam);
+        }
         if (bh.sBeam > 0.0)  w *= mats.mediaTransmittance(scene, b.o, b.d, bh.sBeam, lam, rng);
         if (bh.tCam  > 0.0)  w *= mats.mediaTransmittance(scene, oc, dc, bh.tCam, lam, rng);
         if (!(w > 0.0)) { beamDiag().bump(beamDiag().rejTr); return; }

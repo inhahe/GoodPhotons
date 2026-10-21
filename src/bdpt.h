@@ -180,8 +180,8 @@ inline bool isDeltaEmitter(const Emitter& em) {
     return em.shape == EmitterShape::Spot || em.shape == EmitterShape::Sun || em.collimated;
 }
 // INFINITE lights have no finite emission point: their light-subpath origin is a fictitious
-// point on a disc outside the scene bounds, so the density of the first scene vertex is the
-// PLANAR density 1/(pi R^2) over that disc rather than a solid-angle density over 1/dist^2
+// point on a disc outside the scene bounds, so the density of the first scene vertex is a
+// PLANAR density over that disc rather than a solid-angle density over 1/dist^2
 // (PBRT's Vertex::PdfLight infinite branch). Sun is one; Env would be the other, but Env is
 // still outside BDPT scope (it also needs escaped-ray radiance, which the walk doesn't do).
 inline bool isInfiniteEmitter(const Emitter& em) {
@@ -438,48 +438,81 @@ inline double vertexPdf(const Scene& scene, const Camera& cam,
                         double lambda);
 inline double vertexPdfLight(const Scene& scene, const Vertex& cur, const Vertex& next);
 
-// --- THE AIMED SUN (MODE-J-SDS, 0.387.0) --------------------------------------------------
-// A sun light subpath starts at a point drawn on a disc of radius sceneRadius perpendicular to
-// the beam, so the share of subpaths that meets a small piece of glass is its projected area
-// over pi R^2: about 3e-5 for gallery_rain's prism, whose ground plane makes R 33 m. A caustic
-// lit that way is sampled by a handful of subpaths per light pass, which no number of camera
-// samples fixes -- light tracing and mode J's merges both draw on those subpaths.
+// --- THE SUN'S DISC AND THE AIMED SUN (MODE-J-SDS, 0.387.0) ---------------------------------
+// A sun light subpath starts at a point drawn on a disc perpendicular to the beam, one scene
+// radius upstream of the scene centre, of radius Emitter::sunDiscR -- a little over the scene
+// radius R, so that a ray tilted by the cone's half-angle still covers every point of the
+// bounding sphere (scene.h derives it). The share of subpaths that meets a small piece of glass
+// is then its projected area over that disc: about 3e-5 for gallery_rain's prism, whose ground
+// plane makes R 33 m. A caustic lit that way is sampled by a handful of subpaths per light
+// pass, which no number of camera samples fixes -- light tracing and mode J's merges both draw
+// on those subpaths.
 //
 // So a share `f` of sun subpaths draws its origin from the focusing geometry's footprint
 // instead: the bounding spheres causticaim.h builds for mode M's caustic aim (materialMayFocus;
 // main.cpp fills g_sunAim), each projected onto the disc as a circle. Picking a circle with
 // probability r_j^2 / SUM r^2 and a point uniformly in it makes the mixture density
 //
-//     p(x) = (1 - f) [|x| <= R] / (pi R^2)  +  f * count(x) / (pi SUM_j r_j^2)
+//     p(x) = (1 - f) [|x| <= Rd] / (pi Rd^2)  +  f * count(x) / (pi SUM_j r_j^2)
 //
 // one count and one divide (causticaim.h derives it). Unlike mode M, which runs a separate
 // aimed pass and weights the two passes against each other, BDPT draws ONE sample from the
 // mixture and divides by p(x), so every strategy that reads the light's origin density reads
-// this p instead of 1/(pi R^2): the walk's throughput (deltaLightSubpath), the first vertex's
-// forward density, the reverse density vertexPdfLight reports to every MIS weight (NEE to the
-// sun included), and BeamMis::pdfPlanar. The partition of unity is untouched, and a target set
-// that misses some glass costs that glass only its aimed share, never correctness.
-// `-sunaim 0` (or no focusing geometry, or no sun) is the uniform disc, bit for bit.
+// this p: the walk's throughput (deltaLightSubpath), the first vertex's forward density, the
+// reverse density vertexPdfLight reports to every MIS weight (NEE to the sun included), and
+// BeamMis::pdfPlanar. The partition of unity is untouched, and a target set that misses some
+// glass costs that glass only its aimed share, never correctness.
+// `-sunaim 0` (or no focusing geometry, or no sun) is the uniform disc.
 struct SunAim {
+    // The most targets there may be: the device holds them in constant arrays of this size
+    // (render_cuda.h kSunAimMaxTargets, which main.cpp asserts equal), and host and device must
+    // aim at the same set, so main.cpp clusters the focusing geometry into at most this many.
+    static constexpr int kMaxTargets = 64;
     double f = 0.0;                 // share of sun subpaths drawn from the targets
-    std::vector<Vec3>   c;          // target sphere centres (world)
+    std::vector<Vec3>   w;          // target sphere centres, relative to the scene centre
     std::vector<double> r;          // and radii
     double sumR2 = 0.0;             // SUM r_j^2
-    bool on() const { return f > 0.0 && sumR2 > 0.0 && !c.empty(); }
+    bool on() const { return f > 0.0 && sumR2 > 0.0 && !w.empty(); }
 };
 inline SunAim g_sunAim;
 
-// The sun's origin density at disc coordinates (x, y) -- offsets from the scene centre in the
-// onb(beamDir) basis deltaLightSubpath draws in. With the aim off, exactly 1/(pi R^2).
-inline double sunOriginPdf(const Scene& scene, const Emitter& em, double x, double y) {
-    const double R = scene.sceneRadius;
-    if (!g_sunAim.on()) return 1.0 / (PI * R * R);
-    double p = (x * x + y * y <= R * R) ? (1.0 - g_sunAim.f) / (PI * R * R) : 0.0;
+// Draws a sun light subpath's origin (see above): from the aim's targets with probability f,
+// else uniformly on the disc. Returns the world point, and in (x, y) its disc coordinates --
+// offsets from the scene centre in the onb(beamDir) basis -- for sunOriginPdf. RNG: one draw
+// for the share when the aim is on, then three (aimed) or two (uniform). The device's twin is
+// dSampleSunOrigin.
+inline Vec3 sampleSunOrigin(const Scene& scene, const Emitter& em, Pcg32& rng, double& x, double& y) {
+    Vec3 t, b; onb(em.beamDir, t, b);
+    if (g_sunAim.on() && rng.uniform() < g_sunAim.f) {
+        const double pick = rng.uniform() * g_sunAim.sumR2;   // a target circle by r^2...
+        double acc = 0.0;
+        size_t j = 0;
+        for (; j + 1 < g_sunAim.w.size(); ++j) {
+            acc += g_sunAim.r[j] * g_sunAim.r[j];
+            if (pick < acc) break;
+        }
+        const double rr = g_sunAim.r[j] * std::sqrt(rng.uniform());   // ...and a point in it
+        const double phi = 2.0 * PI * rng.uniform();
+        x = dot(g_sunAim.w[j], t) + rr * std::cos(phi);
+        y = dot(g_sunAim.w[j], b) + rr * std::sin(phi);
+    } else {
+        const double rr = em.sunDiscR * std::sqrt(rng.uniform()), phi = 2.0 * PI * rng.uniform();
+        x = rr * std::cos(phi);
+        y = rr * std::sin(phi);
+    }
+    return scene.sceneCenter + t * x + b * y - em.beamDir * scene.sceneRadius;
+}
+
+// The sun's origin density at disc coordinates (x, y) (see sampleSunOrigin). With the aim off,
+// exactly 1/(pi Rd^2).
+inline double sunOriginPdf(const Emitter& em, double x, double y) {
+    const double Rd = em.sunDiscR;
+    if (!g_sunAim.on()) return 1.0 / (PI * Rd * Rd);
+    double p = (x * x + y * y <= Rd * Rd) ? (1.0 - g_sunAim.f) / (PI * Rd * Rd) : 0.0;
     Vec3 t, b; onb(em.beamDir, t, b);
     int n = 0;
-    for (size_t j = 0; j < g_sunAim.c.size(); ++j) {
-        const Vec3 w = g_sunAim.c[j] - scene.sceneCenter;
-        const double dx = x - dot(w, t), dy = y - dot(w, b);
+    for (size_t j = 0; j < g_sunAim.w.size(); ++j) {
+        const double dx = x - dot(g_sunAim.w[j], t), dy = y - dot(g_sunAim.w[j], b);
         if (dx * dx + dy * dy < g_sunAim.r[j] * g_sunAim.r[j]) ++n;
     }
     if (n > 0) p += g_sunAim.f * (double)n / (PI * g_sunAim.sumR2);
@@ -490,16 +523,15 @@ inline double sunOriginPdf(const Scene& scene, const Emitter& em, double x, doub
 // vertex this is the origin it was drawn at; for an NEE connection it is the origin a light
 // subpath would have needed to reach `p` along that direction.
 inline double sunOriginPdfAlong(const Scene& scene, const Emitter& em, const Vec3& p, const Vec3& w) {
-    const double R = scene.sceneRadius;
-    if (!g_sunAim.on()) return 1.0 / (PI * R * R);
+    if (!g_sunAim.on()) return sunOriginPdf(em, 0.0, 0.0);
     const Vec3& n = em.beamDir;
     const double cw = dot(w, n);
     if (!(cw > 0.0)) return 0.0;
-    const Vec3 p0 = scene.sceneCenter - n * R;
+    const Vec3 p0 = scene.sceneCenter - n * scene.sceneRadius;
     const Vec3 q = p - w * (dot(p - p0, n) / cw);
     Vec3 t, b; onb(n, t, b);
     const Vec3 o = q - scene.sceneCenter;
-    return sunOriginPdf(scene, em, dot(o, t), dot(o, b));
+    return sunOriginPdf(em, dot(o, t), dot(o, b));
 }
 
 // Emission directional density at a light vertex `cur` toward `next`, area measure
@@ -509,8 +541,8 @@ inline double sunOriginPdfAlong(const Scene& scene, const Emitter& em, const Vec
 //   Spot                  - uniform inside the OUTER cone (the falloff is throughput, not
 //                           density), pdfW = 1/(2 PI (1 - cosOuter)), same conversion.
 //   Sun (infinite)        - no finite emission point: the subpath origin is a point on a
-//                           disc of radius sceneRadius outside the scene, so the density
-//                           of `next` is the PLANAR density 1/(pi R^2) with NO 1/dist^2
+//                           disc outside the scene (sampleSunOrigin), so the density of
+//                           `next` is the PLANAR density sunOriginPdf with NO 1/dist^2
 //                           (the disc-point -> hit-point map is a shear along the beam,
 //                           whose Jacobian is exactly the cos(next) below).
 inline double vertexPdfLight(const Scene& scene, const Vertex& cur, const Vertex& next) {
@@ -525,9 +557,9 @@ inline double vertexPdfLight(const Scene& scene, const Vertex& cur, const Vertex
     } else if (cur.light && isInfiniteEmitter(*cur.light)) {
         double R = scene.sceneRadius;
         if (R <= 0.0) return 0.0;
-        pdf = (cur.light->shape == EmitterShape::Sun && g_sunAim.on())
-                ? sunOriginPdfAlong(scene, *cur.light, next.p, w)   // the aimed mixture (0.387.0)
-                : 1.0 / (PI * R * R);                // planar density over the sun disc
+        pdf = (cur.light->shape == EmitterShape::Sun)
+                ? sunOriginPdfAlong(scene, *cur.light, next.p, w)   // planar, over the sun's disc
+                : 1.0 / (PI * R * R);                // the env's disc
     } else if (cur.light && cur.light->shape == EmitterShape::Spot) {
         double solid = 2.0 * PI * (1.0 - cur.light->spotCosOuter);
         if (solid <= 0.0) return 0.0;
@@ -649,6 +681,8 @@ struct PathSeg {
     double betaSec[hero::kHeroMax - 1] = {0};
     int nUp = 1;
     double aGlass = 0.0;  // absorption of the dielectric the ray is inside (exp(-a*t) per hit)
+    int glassMat = -1;    // that dielectric (scene.mats index; -1 in air), for a merge that
+                          // needs its absorption at another wavelength (JSPEC)
     int vert = 0;         // index in the subpath of the vertex this segment leaves
     // Solid-angle density of `d` at the vertex this segment leaves. The merge weight needs
     // it on BOTH sides and cannot recover it from the vertex list: a merge point x is not a
@@ -724,37 +758,34 @@ struct JSpecWalk {
 constexpr int kJTrQuad = 32;
 inline void jTrFold(const Scene& scene, JSpecRun& jr, const Vec3& o, const Vec3& d, double dist,
                     double lambda) {
-    const size_t nm = scene.media.size();
-    if (nm > 16) return;
     const PatTables tabs = scene.patTables();
-    double tau[16];
-    for (size_t i = 0; i < nm; ++i) {
-        tau[i] = 0.0;
-        const Medium& m = scene.media[i];
+    double e[JSpec::K] = {0.0};   // the exponent at each bin, summed medium by medium
+    for (const Medium& m : scene.media) {
         double ta, tb;
         if (!m.clipToBounds(o, d, 0.0, dist, ta, tb) || !(tb > ta)) continue;
-        if (!m.heterogeneous()) { tau[i] = tb - ta; continue; }
-        const double dt = (tb - ta) / (double)kJTrQuad;
-        double acc = 0.0;
-        for (int q = 0; q < kJTrQuad; ++q) acc += m.densityAt(o + d * (ta + ((double)q + 0.5) * dt), &tabs);
-        tau[i] = acc * dt;
+        double tau = tb - ta;
+        if (m.heterogeneous()) {
+            const double dt = (tb - ta) / (double)kJTrQuad;
+            double acc = 0.0;
+            for (int q = 0; q < kJTrQuad; ++q) acc += m.densityAt(o + d * (ta + ((double)q + 0.5) * dt), &tabs);
+            tau = acc * dt;
+        }
+        if (!(tau > 0.0)) continue;
+        const double s0 = m.sigmaT(lambda);
+        for (int k = 0; k < JSpec::K; ++k) e[k] += (m.sigmaT(JSpec::lamOf(k)) - s0) * tau;
     }
-    double v[JSpec::K];
-    for (int k = 0; k < JSpec::K; ++k) {
-        double e = 0.0;
-        for (size_t i = 0; i < nm; ++i)
-            if (tau[i] > 0.0)
-                e += (scene.media[i].sigmaT(JSpec::lamOf(k)) - scene.media[i].sigmaT(lambda)) * tau[i];
-        v[k] = std::exp(-e);
-    }
-    jr.mulVec(v, 1.0);
+    for (int k = 0; k < JSpec::K; ++k) e[k] = std::exp(-e[k]);
+    jr.mulVec(e, 1.0);
 }
 
-// Whether a medium's extinction varies over the band (JSpecWalk::trSpec).
-inline bool mediumSigmaTChromatic(const Medium& m) {
-    const double a = m.sigmaT(JSpec::lamOf(0));
-    for (int k = 1; k < JSpec::K; ++k)
-        if (std::fabs(m.sigmaT(JSpec::lamOf(k)) - a) > 1e-12 * (1.0 + std::fabs(a))) return true;
+// Whether some medium's extinction varies over the band (JSpecWalk::trSpec; the device's
+// c_jTrSpec, which main.cpp sets from this).
+inline bool anyMediumSigmaTChromatic(const Scene& scene) {
+    for (const Medium& m : scene.media) {
+        const double a = m.sigmaT(JSpec::lamOf(0));
+        for (int k = 1; k < JSpec::K; ++k)
+            if (std::fabs(m.sigmaT(JSpec::lamOf(k)) - a) > 1e-12 * (1.0 + std::fabs(a))) return true;
+    }
     return false;
 }
 
@@ -963,6 +994,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             sg.beta = beta; sg.nUp = nUp;
             for (int i = 0; i + 1 < nUp; ++i) sg.betaSec[i] = betaSec[i];
             sg.aGlass = curAbsorb(lambda);
+            sg.glassMat = stk.topMat();   // even where aGlass is 0: absorb(lambda) may not be
             sg.vert = (int)path.size() - 1;
             sg.pdfDir = pdfFwd;          // solid-angle density of ray.d (see PathSeg::pdfDir)
             // Snapshot the spectral claim AS IT STANDS AT THE SEGMENT ORIGIN, which is the
@@ -1193,19 +1225,16 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             // the wavelengths DISAGREE (a thin-film coat's R swings across the band) they cannot
             // share the child this vertex becomes, so the bundle collapses AT this vertex and the
             // hero goes on alone, standing in for every member -- the decision reads the set of
-            // R_i and u, never which member is the hero (the hair rule above). Before this the
-            // secondaries rode the hero's coin unweighted: mode D read a thin-film coat 7 % low in
-            // green and 7 % high in blue against mode R (known-issues.md, HERO-COAT-COIN).
+            // R_i and u, never which member is the hero (the hair rule above). known-issues.md,
+            // HERO-COAT-COIN.
             if (nUp > 1)
                 for (int i = 0; i + 1 < nUp; ++i)
                     if ((uCoat < layeredCoatReflectance(scene, *mp, h, ray.d, hb.lam[i + 1])) != coatPick) {
                         nUp = 1;
                         break;
                     }
-            // The light walk's spectral claim cannot fold a coin this peaked either -- the
-            // forward tracer retires it here (render.h, FK_Layered) and so does this walk now.
-            // It used to carry the claim across, so a beam off a coated wall kept a fold or a
-            // bundle that ignored the coin, and mode J coloured its light wrong.
+            // The light walk's spectral claim cannot fold a coin this peaked either, so it is
+            // retired here, as the forward tracer retires it (render.h, FK_Layered).
             retireSpectral(FK_Layered);
             int c = coatPick ? mp->coatChild
                              : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map (device twin: dResolveCompound)
@@ -1244,7 +1273,17 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         path.push_back(v);
         if (jsw) { jsw->vert.resize(path.size()); jsw->run.snap(jsw->vert.back()); }
         Vertex& cur = path.back();
-        if (++bounces >= maxDepth) return;
+        if (++bounces >= maxDepth) {
+            // A light walk does not END on a strand either: a strand vertex there would be
+            // connected to (the camera at t = 1, an eye vertex otherwise) with the fiber read from
+            // the light side, which the MIS weights do not count (see LIGHT SUBPATHS STOP AT
+            // STRANDS below, where a walk that scatters at one is cut).
+            if (mode == Mode::Importance && mp->type == MatType::Hair) {
+                path.pop_back();
+                if (jsw) jsw->vert.resize(path.size());
+            }
+            return;
+        }
 
         // Sample a continuation direction wi, its forward solid-angle pdf pdfW, the
         // reverse pdf pdfRevW (wi<->wo swapped), the throughput factor, and whether
@@ -1615,10 +1654,9 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // the same at every wavelength and cancel). That holds for any lobe-selection coin, a
         // diffuse-transmit's included, because it reweights the SAMPLE, not the sampler. The
         // delta lobes fold their slot (mirror, filter), their coin (half mirror) or the
-        // interface step's branch factor (Renderer::stepFactorAt, SPECGATHER's own). NOT
-        // re-expressed, and so still read at lambda: the grating (its order's direction is a
-        // function of lambda), hair (24 BCSDF evaluations a vertex), and a layered coat's
-        // coat-or-body coin. known-issues.md, JSPEC.
+        // interface step's branch factor (Renderer::stepFactorAt, SPECGATHER's own). The
+        // grating, hair and a layered coat's coat-or-body coin fold where they are sampled,
+        // above, from values only the sampler has in hand, so the switch passes them by.
         if (jsw) {
             JSpecRun& jr = jsw->run;
             switch (mp->type) {
@@ -1836,16 +1874,16 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
 //         density, so the mean walk weight is I*spotOmega = the emitter's power. `spdFn`
 //         is the peak intensity per unit SPD (geomWeight == spotOmega), so the emitted
 //         quantity is an intensity (W/sr), not a radiance.
-//   Sun   an infinitely distant disc: the origin is a point on a disc of radius
-//         sceneRadius, centred one radius UPSTREAM of the scene centre and perpendicular
-//         to `beamDir`, so every emitted ray enters the scene's cross-section (pdfPos =
-//         1/(pi R^2)); the direction is drawn inside the solar cone (pdfW = 1/Omega).
+//   Sun   an infinitely distant disc: the origin is a point on a disc centred one radius
+//         UPSTREAM of the scene centre and perpendicular to `beamDir` (sampleSunOrigin), so
+//         every emitted ray enters the scene's cross-section (pdfPos = sunOriginPdf); the
+//         direction is drawn inside the solar cone (pdfW = 1/Omega).
 //         `spdFn` is the sun's radiance (addSunLight already divided by Omega).
 //
 // Both are delta lights: path[0].pdfFwd is 0 (PBRT's convention — see
 // vertexPdfLightOrigin) and misWeight drops the s=0 strategy for them. For the INFINITE
 // sun the first scene vertex's forward density must also be rewritten to the planar
-// 1/(pi R^2) form that vertexPdfLight reports in reverse (PBRT's "correct subpath
+// form that vertexPdfLight reports in reverse (PBRT's "correct subpath
 // sampling densities for infinite area lights" patch), or the two sides disagree and the
 // MIS weights are wrong. Returns the subpath length.
 inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Renderer& mats,
@@ -1863,31 +1901,10 @@ inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Render
     Vec3 org;
     double pdfPos = 1.0;                             // delta (spot) unless the sun's disc
     if (isSun) {
-        double R = scene.sceneRadius;
-        if (R <= 0.0) return 0;
-        Vec3 t, b; onb(em.beamDir, t, b);
+        if (scene.sceneRadius <= 0.0) return 0;
         double x, y;
-        if (g_sunAim.on() && rng.uniform() < g_sunAim.f) {
-            // THE AIMED SHARE (0.387.0, see SunAim): a target circle by r^2, a point in it.
-            const double pick = rng.uniform() * g_sunAim.sumR2;
-            double acc = 0.0;
-            size_t j = 0;
-            for (; j + 1 < g_sunAim.c.size(); ++j) {
-                acc += g_sunAim.r[j] * g_sunAim.r[j];
-                if (pick < acc) break;
-            }
-            const Vec3 w = g_sunAim.c[j] - scene.sceneCenter;
-            const double rr = g_sunAim.r[j] * std::sqrt(rng.uniform());
-            const double phi = 2.0 * PI * rng.uniform();
-            x = dot(w, t) + rr * std::cos(phi);
-            y = dot(w, b) + rr * std::sin(phi);
-        } else {
-            double rr = R * std::sqrt(rng.uniform()), phi = 2.0 * PI * rng.uniform();
-            x = rr * std::cos(phi);
-            y = rr * std::sin(phi);
-        }
-        org = scene.sceneCenter + t * x + b * y - em.beamDir * R;
-        pdfPos = sunOriginPdf(scene, em, x, y);      // 1/(pi R^2) with the aim off
+        org = sampleSunOrigin(scene, em, rng, x, y);
+        pdfPos = sunOriginPdf(em, x, y);
         if (!(pdfPos > 0.0)) return 0;
     } else {
         org = em.origin;
@@ -1931,7 +1948,7 @@ inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Render
                Mode::Importance, rng, path, betaWalkSec, hb.C, nullptr, segs, bs);
     // Infinite-light density patch (PBRT): the first scene vertex was given a solid-angle
     // density converted with 1/dist^2 from the fictitious disc point, but the reverse
-    // direction (vertexPdfLight) reports the planar 1/(pi R^2). Rewrite it to match.
+    // direction (vertexPdfLight) reports the planar pdfPos. Rewrite it to match.
     if (isSun && path.size() > 1) {
         double pdf = pdfPos;
         if (path[1].onSurface()) pdf *= std::abs(dot(path[1].ns, dir));
@@ -2783,16 +2800,15 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 m.sumMs  = accMs[j < np ? j : np - 1];
                 m.pdfDir = (float)sg.pdfDir;
                 // A beam leaving the SUN's vertex: its merge points' light density is the planar
-                // 1/(pi R^2) deltaLightSubpath patches onto the first scene vertex, which is what
-                // every connection weight reads (BeamMis::pdfPlanar). Same R, same formula.
+                // one deltaLightSubpath patches onto the first scene vertex, which is what every
+                // connection weight reads (BeamMis::pdfPlanar): sunOriginPdf at this subpath's
+                // origin, the aimed mixture included.
                 if (j == 0 && path[0].type == VType::Light && path[0].light &&
                     path[0].light->shape == EmitterShape::Sun && scene.sceneRadius > 0.0) {
-                    // The aimed mixture's density at this subpath's origin (0.387.0, SunAim);
-                    // 1/(pi R^2) with the aim off.
                     const Emitter& se = *path[0].light;
                     Vec3 st, sb; onb(se.beamDir, st, sb);
                     const Vec3 so = path[0].p - scene.sceneCenter;
-                    m.pdfPlanar = (float)sunOriginPdf(scene, se, dot(so, st), dot(so, sb));
+                    m.pdfPlanar = (float)sunOriginPdf(se, dot(so, st), dot(so, sb));
                 }
                 // cos / pdfFwd, the merge-independent half of pdfRev*(y_{s-1})/pdfFwd(y_{s-1}):
                 // the gather multiplies in the phase value at x and 1/rho_L^2. The cosine is
@@ -3950,6 +3966,10 @@ struct BeamMergeWeight {
     // null. Read by gatherPhotonBeamsW, not by the weight: the MIS densities stay at lambda_c.
     const JSpec* spec = nullptr;
     const JSpec* camSpec() const { return spec; }
+    // ...and the coloured glass the segment runs through (PathSeg::glassMat), or null: under
+    // JSPEC the merge takes its absorption over the partial segment at the beam's wavelength too.
+    const Material* glass = nullptr;
+    const Material* glassCam() const { return glass; }
 
     double operator()(const BeamHit& bh, const PhotonBeam& b, double dens, double phase) const {
         if (diag) diag->hits.fetch_add(1, std::memory_order_relaxed);
@@ -4250,11 +4270,7 @@ struct BdptRenderer {
         // wavelength (JSpec, beamgather.h). Only the merges read it; the walk draws nothing extra,
         // so the paths are the ones it always took. FTRACE_JSPEC=0 turns it off for A/B runs.
         const bool jSpecOn = (mergeOn || surfOn) && jSpecEnabled();
-        if (jSpecOn) {
-            jsw.trSpec = false;
-            for (const Medium& m : scene.media)
-                if (mediumSigmaTChromatic(m)) { jsw.trSpec = true; break; }
-        }
+        if (jSpecOn) jsw.trSpec = anyMediumSigmaTChromatic(scene);
         // FTRACE_J_HALF (diagnostic): 1 = connections only, 2 = merges only. Deliberately
         // does NOT touch the merge constants — both halves keep the SAME MIS weights they
         // have in a full render, so the two images sum to the full one.
@@ -4582,6 +4598,8 @@ struct BdptRenderer {
                             w1.scene = &scene; w1.bm = beams; w1.sg = &sg;
                             w1.routeMedJ = routeMedJ;
                             w1.spec = jSpecOn ? &sg.spec : nullptr;
+                            w1.glass = (jSpecOn && sg.glassMat >= 0)
+                                     ? &scene.mats[(size_t)sg.glassMat] : nullptr;
                             w1.lamCam = lamCam; w1.kappa = mergeKappa;
                             w1.kappaS = mk.surf;
                             w1.tabs = &tabs;

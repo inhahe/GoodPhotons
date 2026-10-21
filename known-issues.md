@@ -138,6 +138,94 @@ sample index crosses a fixed block boundary (split a chunk at the boundaries it 
 light side's epochs already are under `-beamepochs`. Then the chunker can keep adapting and the
 pin and its global switch go. (Both reviewers of 0.391.0 suggested this or a fixed chunk size.)
 
+## DONE (2026-10-21, 0.391.3): REVIEW-0388 — what the Opus and Fable reviews of 0.385.0-0.388.0 found
+
+Opus (max) and Fable (xhigh) reviewed 4c796bb..5997485, the per-object modes, JSPEC, the aimed
+sun and the device hair BDPT, which went in before every batch was reviewed. Fixed (the first
+three in 0.389.x-0.391.x, the rest in 0.391.3):
+
+* **A CPU-only build no longer compiled** (both): `cudaSetSunAim`, `cudaSetRouting` and
+  `cudaSetJDisp` were called outside `HAVE_CUDA`. Guarded; the wider breakage is CPU-ONLY-BUILD.
+* **`-causticaimk` over 64 turned the aim off on the device only** (both), so host-traced beams
+  carried aimed densities the device's weights did not. `prepareSunAim` now builds at most
+  `SunAim::kMaxTargets`, which main.cpp asserts equal to the device's capacity, and a larger set
+  reaching `cudaSetSunAim` is an exception, not a silent switch-off.
+* **`prepareSunAim` cached by the Scene's address** (both): `-serve` and a live scene swap reuse
+  the address. Keyed on `Scene::generation` now, a counter every constructed scene takes.
+* **The sun's disc missed the rim of the bounding sphere** (Opus). A sun light subpath starts on a
+  disc of radius R, but a ray tilted by the cone's half-angle reaches the rim from up to
+  R (1 + sin t) / cos t out, so those points had no light-tracing strategy while every MIS weight
+  counted one, and with the aim on the origin density there read 0. `scenes/_sun_rim.ftsl` (a
+  30 deg sun) rendered its floor's corners 22 % dark in mode D (6 % with `-sunaim 0`). The disc is
+  now `Emitter::sunDiscR`, wide enough, on host and device; one `sampleSunOrigin` /
+  `dSampleSunOrigin` per side replaces four copies of the draw (Opus), and the device projects
+  the targets in Real from offsets stored once (both). `tools/check_sun_rim.py` gates it (fails on
+  0.391.2, passes on 0.391.3). Every sun render in modes D, J and U changes by the ~1 % of
+  subpaths that now start in the widened rim.
+* **A mode-D camera with anything tagged J was promoted to J without checking J could render the
+  scene** (Opus): a fire then aborted the run. The tags are now set aside with a note.
+* **`render { jsurf_radius / mode_spp }` leaked into later `-serve` frames** (Opus): run() resets
+  them.
+* **The device hair BDPT let a light subpath end on a strand at max depth** (Opus), which the
+  camera side never counts; the host had the same ordering. Both pop the strand there.
+* **Mode U's walks still shared a layered coat's coin across the bundle** (Opus; HERO-COAT-COIN,
+  which this entry completes): host vcm.h and the device VCM kernels now compare one coin per
+  wavelength and collapse the bundle where they disagree. `scenes/_lay_chroma.ftsl`, whole frame
+  against CPU mode R, both at `-max-bounce 32`: mode U 0.975 / 0.920 / 1.082 before (CPU and GPU
+  alike), 0.989 / 0.996 / 1.007 (CPU) and 0.988 / 0.994 / 1.007 (GPU) after; what is left is
+  within the merge radius's blur, design.md's "1.2-1.5 % above R".
+* **JSPEC took the camera side's glass absorption at the camera's wavelength** on the partial
+  segment of a merge inside coloured glass (Opus). It now reads the glass (`PathSeg::glassMat`)
+  at the beam's wavelength wherever JSPEC is on, host and device -- not only where the camera's
+  carrier is live, which would miss a camera's first segment inside the glass, where it is flat.
+  Fog inside a sphere of `absorb rgb 0.2 2.5 5.0` (scenes/_jfog_inside.ftsl, every mode at
+  `-max-bounce 32`), fog region against mode R: R 0.73, G 1.24 before; R 0.98-0.99, G 1.00 after,
+  GPU and CPU alike (`tools/check_jfog_glass.py`, 0.391.4).
+* **The device's chain-prefix mask was 32 bits against the host's 64** (Opus).
+* **A material's own `mode` silently beat an explicit `mode` on an object or group using it**
+  (Fable). The more specific tag now wins (FTSL.md 16.1).
+* **`jTrFold` / `dJTrFold` silently skipped scenes with more than 16 media** (Fable): they now sum
+  the exponent medium by medium with no cap.
+* **The `[mode] per-object modes` banner printed once per frame** of a flyby (Fable): once per
+  scene now.
+* Simplifications and hygiene: mode J's switches (JSPEC, the chromatic-medium test, the delta
+  reading, the half-render diagnostic) reach the device through one host setter,
+  `cudaSetJSwitches`, instead of each side parsing the environment and the device re-implementing
+  the chromatic test with literal 360/830/24 (both); `DJSpecRun::from`, never called, is gone
+  (both); `DJSpec` lost its padding (128 to 120 B) and `DWfSeg`'s size is asserted where its queue
+  is sized (Fable: the comments said 270 B, it was 408); stale comments in `randomWalk` (the
+  grating, hair and coin ARE folded), in `kBdptT` (point merges read `vspec`) and two that
+  narrated history (Fable) were rewritten; `check_device_probe.py` reads its subprocess as UTF-8.
+
+Dismissed: the dispersive window dropping a folded beam whose emitter is unknown (Fable) cannot
+happen: only `-loadmap` makes such beams, and only mode M loads maps, which has no camera carrier;
+mode J folds a beam only while its subpath's spectral claim lives, which always records the
+emitter. The carrier's size (Opus) is JSPEC-CARRIER-SIZE below.
+
+## OPEN (2026-10-21): JSPEC-CARRIER-SIZE — every mode-J GPU thread reserves room for a 120-byte spectral carrier per segment and per eye vertex, chromatic scene or not
+
+Found by the Opus review of 0.385-0.388. `DJSpec` (render_cuda.cu) is JSPEC's camera carrier: 24
+float bins, a log scale, two flags and the window's wavelength. One rides on every recorded
+`DPathSeg` (the beam merges read it) and `kBdptT<MERGE>` keeps one per eye vertex in `vspec` (the
+point merges read it). Both arrays are sized statically, so the kernel's local frame holds them
+whether JSPEC is on, the scene has anything chromatic, or `FTRACE_JSPEC=0`. At 0.391.3's 120 B
+(it was 128 before the fields were reordered) that is about 2.6 KB a thread on the default merge
+kernel (MAXV 11) and about 16 KB on the deep one (MAXV 67, `max_bounce` over 8). The driver
+reserves local memory for every resident thread (196 608 on an RTX 4090, see the VRAM preflight),
+so that is roughly 0.5 GB and 3.2 GB of VRAM. The wavefront queue's `DWfSeg` carries one too: 128
+of its 400 bytes, about 134 MB at `segCap`.
+
+**Proper fix.** Make the carrier cost nothing where it is off, then make it smaller where it is on:
+(1) a `JSPEC` template parameter on the merge kernels, with the carrier arrays sized 1 when the
+host's `cudaSetJSwitches` says off (achromatic scene or `FTRACE_JSPEC=0`), and the queue's
+carriers in a separate array allocated only then; (2) store the bins as `__half` normalised by
+their maximum, folding the maximum into `logS` (48 B instead of 96). (1) costs compile time, two
+more variants of the largest kernel. (2) changes the carrier's precision to about 5e-4 per bin,
+which needs measuring against the float carrier on `_lay_chroma` and gallery_rain before it
+replaces it. Not done in 0.391.3 because `gallery_rain`, the scene the VRAM matters for, is
+chromatic (its prism disperses), so only (2) would help it, and its flyby was waiting on the
+correctness fixes.
+
 ## OPEN (2026-10-18): PER-OBJECT-MODES — what per-object render modes do not do yet
 
 `mode D` / `mode J` per object, group, fur, material or medium shipped in 0.386.0 (FTSL.md §16.1,
@@ -247,6 +335,8 @@ per wavelength). Where the wavelengths disagree, the bundle collapses at that ve
 that means the hero stands in for all, as at a fiber. The device's backward loop de-heroes and
 boosts; the device forward hero step does the same, now with a lane count that can drop.
 After: CPU D 1.003 / 0.993 / 1.007, GPU D 1.003 / 0.995 / 1.004, GPU R 1.000 / 1.001 / 0.999.
+"Everywhere" missed mode U's walks (vcm.h and the device VCM kernels), which kept the hero's coin
+until 0.391.3 (REVIEW-0388: 0.920 → 0.996 in green).
 
 **The light walk had the twin of this bug.** `randomWalk` carried the light subpath's spectral
 claim (the fold, or the beam bundle's per-member weights) across the coin. So a mode-J beam off a

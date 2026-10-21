@@ -2363,7 +2363,9 @@ vertices, a scatter point on the chain or a merge point, so a ray crossing a tag
 way to an untagged wall routes that wall D while the merges along the crossing route J.
 
 **Materials carry it.** Hits know only a material id, so a tagged object gets route-tagged copies of
-its materials (`routedMat`, memoised per (material, route); an inner tag wins). The loader snapshots
+its materials (`routedMat`, memoised per (material, route)). The more specific tag wins: a copy an
+object's own tag made survives its group's tag, and a tag in a material's own block, the default for
+every object using it, gives way to either (`routeIsClone_` tells the two apart). The loader snapshots
 the primitive pools before an object or group is added and retags what it added, which covers
 glTF meshes with many materials. A mix's children are copied too, because both walks store the
 RESOLVED child on the vertex. A layered coat is synthesised later from its parent, so it inherits.
@@ -2473,7 +2475,10 @@ from the previous segment's snapshot). What is folded, each against the value `b
   same function SPECGATHER folds.
 - **Medium scatter:** σ_s(λ)/σ_s(λ_c), and a rainbow's phase at the direction λ_c sampled.
 - **Segment:** coloured glass, and Tr(λ)/Tr(λ_c) when some medium's σ_t is chromatic
-  (deterministic transmittance, so the ratio is not a ratio of two noisy estimates).
+  (deterministic transmittance, so the ratio is not a ratio of two noisy estimates). The merge's
+  own partial segment comes after the snapshot, so the gather takes it at λ_b itself: the medium's
+  transmittance, and inside coloured glass the glass's absorption (`PathSeg::glassMat`), whether the
+  carrier is live or not.
 
 A flat factor costs three probe evaluations and cancels. So a camera path that met nothing
 chromatic has `any == false`, and its merges are bit-for-bit the old arithmetic.
@@ -2609,13 +2614,18 @@ prompted the narrowing. That mismatch turned out to be timing, see **Gates**, bu
 rule is the correct one regardless.
 
 **The aimed sun.** Storing those photons is not enough when few of them exist. A sun light
-subpath starts uniformly on a disc of radius `sceneRadius`, 33 m on `gallery_rain`, so about
-3 in 100 000 reach its prism, and a merge of radius 1 cm finds almost none. A share `f` (default
+subpath starts uniformly on a disc perpendicular to the beam, one scene radius R upstream (33 m on
+`gallery_rain`), so about 3 in 100 000 reach its prism, and a merge of radius 1 cm finds almost none.
+The disc's radius is `Emitter::sunDiscR` = R (1 + sin t) / cos t, t the cone's half-angle, not R: a
+ray tilted by t reaches the rim of the bounding sphere from that far out, and on a disc of radius R
+those rim points had no light-tracing strategy while every MIS weight counted one (22 % dark corners
+under a 30 deg sun in mode D before 0.391.3; `tools/check_sun_rim.py`). One `sampleSunOrigin` /
+`dSampleSunOrigin` per side draws from the disc, so the sampler and `sunOriginPdf` cannot drift. A share `f` (default
 0.25, `-sunaim`) of sun subpaths now draws its origin from the focusing geometry's footprint
 instead. The targets are the bounding spheres `causticaim.h` builds for mode `M` (64 by
 `-causticaimk`), each projected onto the disc as a circle and picked by r². The mixture density is
 
-    p(x) = (1 - f) [|x| <= R] / (pi R^2)  +  f * count(x) / (pi SUM_j r_j^2)
+    p(x) = (1 - f) [|x| <= Rd] / (pi Rd^2)  +  f * count(x) / (pi SUM_j r_j^2),   Rd = sunDiscR
 
 Unlike mode `M`'s separate aimed pass, this is ONE sample from the mixture. Every place the sun's
 origin density is read uses p(x): the walk's throughput (`deltaLightSubpath`, device

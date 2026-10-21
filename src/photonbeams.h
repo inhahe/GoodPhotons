@@ -572,7 +572,7 @@ struct BeamMis {
     // pdfDir / |y_{s-1} - x|^2: a beam leaving the SUN's vertex (0.386.0). The sun's subpath
     // starts on a fictitious disc R_scene away and draws its direction from the 0.53 deg solar
     // cone, so pdfDir there is 1/coneSolid (~15000 / sr). But deltaLightSubpath rewrites the
-    // first scene vertex's pdfFwd to the PLANAR 1/(pi R^2), as PBRT does for an infinite light, and
+    // first scene vertex's pdfFwd to the PLANAR sunOriginPdf, as PBRT does for an infinite light, and
     // every connection weight reads that -- so a merge on the sun's chord that weighed itself with
     // pdfDir/rho^2 claimed ~10^4 times the share the connections left it, and the weights summed
     // past 1: single-scattered sunlight counted roughly twice. 0 = use pdfDir / rho^2.
