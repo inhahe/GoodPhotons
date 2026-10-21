@@ -139,6 +139,26 @@ sample index crosses a fixed block boundary (split a chunk at the boundaries it 
 light side's epochs already are under `-beamepochs`. Then the chunker can keep adapting and the
 pin and its global switch go. (Both reviewers of 0.391.0 suggested this or a fixed chunk size.)
 
+## DONE (2026-10-21, 0.392.0): FLYBY-BEAM-STREAKS — the `gallery_rain` flyby showed every light beam in the cloud and rain as a sharp coloured streak
+
+Reported by the user from the first frames of the 1280x720 flyby (`-spp 64 -beamepochs 8`): strong
+coloured beams of light through the rain and the cloud, held still in the world from frame to
+frame. They were single beams. A mode-J light-side realization is one knee-sized beam map
+(`-beamk`), only ~14 000 beams on `gallery_rain`, and `-beamepochs 8` gives a frame 8 of them,
+the same 8 for every frame: about 115 000 beams for the whole cloud and rain shaft, each a visible
+line, saturated where the rain's chromatic phase had made it single-wavelength. The still never
+showed them: it averages tens of thousands of samples under the wall-clock refresh.
+
+Fix: one realization per sample, `-beamepochs 64` at 64 spp. On fly frame 9 (luma RMSE over the
+cloud against a render with 16x the beams, 640x360): 0.236 at 8 epochs, 0.071 at 64, 0.048 with
+4x the beams per realization as well. What made 64 epochs expensive was not the light side but
+`renderBdptCuda` uploading the whole scene on every call (1.6 s here, once per epoch): the epoch
+loop now holds one device copy for the frame (`cudaHoldScene`). At 1280x720, frame 9 renders in
+173 s at 8 epochs before, 161 s at 8 epochs and 194 s at 64 epochs after; 4x the beams would cost
+290 s, so the flyby uses 64 epochs and the knee's beam count. The bat, the scene's recipe comment,
+`-beamepochs`'s help and REFERENCE.md now say K = spp (0.391.0 had recommended spp/8). The 11 frames
+already rendered with 8 epochs were deleted and the flyby restarted.
+
 ## DONE (2026-10-21, 0.391.6): REVIEW-03915 — what the Opus review of 0.391.5 found
 
 Opus (xhigh) reviewed 322249f..9cd5c76, the follow-ups to REVIEW-0391. Fixed:

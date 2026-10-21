@@ -2135,6 +2135,22 @@ the device's surface-photon map is redrawn per *chunk* salted by the chunk's fir
 the GPU chunks are pinned to 1 spp (`cudaSetFixedChunks`) and fall on the same samples in every
 frame; and it needs a fixed `-spp` — a `-time`/`-noise` budget has no total to split.
 
+**K wants to be the spp, and the scene stays on the device so that it can be (0.392.0).** A
+realization is one knee-sized beam map (`-beamk`; ~14 000 beams on `gallery_rain`), so a frame
+sees K of them and no more, and at the K ≈ spp/8 0.391.0 recommended every beam of `gallery_rain`'s
+rain and cloud stayed a visible streak, saturated where the rain's chromatic phase had made it
+single-wavelength (fly frame 9, 64 spp: luma RMSE over the cloud 0.236 at K = 8, 0.071 at K = 64,
+against a render with 16× the beams). More beams per realization would also do it, but the gather
+pays for every beam on every sample (4× the subpaths: 290 s against 194 s), while more
+realizations cost only their build. That build was dominated by `renderBdptCuda` uploading the
+whole scene on every call, 1.6 s on `gallery_rain`; mode J's epoch loop (`renderChunked`) now
+holds one device copy for the frame (`cudaHoldScene`, released before OIDN runs) and every call
+renders against it. `DScene` holds only const pointers, so no call can leave state in it for the
+next. What an epoch still costs is the light trace and the beam map, ~0.5 s there: K = 64 renders
+that frame in 194 s, K = 8 in 161 s (173 s before the hold). The wall-clock refresh paces its
+epochs by this same overhead, so it refreshes more often too: a 60 s `gallery_rain` still at
+640x360 now averages 14 realizations, against 6 before.
+
 **Mode `M` has the same disease, and got the same cure in 0.252.0** (M-FROZEN in known-issues.md).
 A single-camera mode-`M` render builds its photon map, caustic map and beam map once and then
 spends the whole budget growing camera spp, so the light-side half of its error is a floor — and

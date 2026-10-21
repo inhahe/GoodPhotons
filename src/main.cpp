@@ -17603,12 +17603,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         bdpt::BeamBudgetInfo& jbb = jlc.jbb;
         // WHERE THE LIGHT-SIDE BUDGET GOES, split four ways, because the four have wildly
         // different fixes and the totals are what decide which one is worth building: a device
-        // TRACE, a faster BVH, a cheaper surface grid, or a scene left RESIDENT on the device
-        // across epochs. See the [jstats] line at the end of the render.
+        // TRACE, a faster BVH, a cheaper surface grid, or a cheaper per-call device setup (the
+        // scene itself already stays resident across a frame's epochs: cudaHoldScene). See the
+        // [jstats] line at the end of the render.
         double lsTraceSec = 0.0;    // the subpath trace itself (bdpt::traceLightBeamPass)
         double lsBeamSec  = 0.0;    // buildBeamMap: split + SAH BVH over the chords
         double lsSurfSec  = 0.0;    // SurfMap::build: the point-merge grid
-        double lsSetupSec = 0.0;    // per-epoch gap to the first sample (device scene re-upload)
+        double lsSetupSec = 0.0;    // per-epoch gap to the first sample (the call's device setup)
         double lsGatherSec = 0.0;   // the gather, i.e. what all of the above is overhead ON
         // THE LIGHT SIDE AS A FUNCTION OF THE EPOCH, rather than a one-off. Epoch 0 is the
         // original build bit-for-bit; every later epoch redraws the same map under a different
@@ -17866,6 +17867,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         const BeamMap* beamsPtr = (wantBeams && !bmap.empty()) ? &bmap : nullptr;
         const bdpt::SurfMap* photonsPtr =
             (wantSurf && !smap.empty() && smap.nEmitted > 0) ? &smap : nullptr;
+#ifdef HAVE_CUDA
+        // The device copy of the scene that every epoch of one frame renders against
+        // (cudaHoldScene), set by renderChunked's epoch loop; null elsewhere, where the single
+        // call uploads the scene itself.
+        CudaSceneHold* jHeld = nullptr;
+#endif
         auto renderEpoch = [&](long long sppTarget, const SppProgress* p) -> Film {
 #ifdef HAVE_CUDA
             // `g_heroC`, exactly as mode D passes it — NOT 1. The kernel applies the same
@@ -17887,7 +17894,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // `photonsPtr` below is what carries the surface map to the device.
             if (useGpu) return renderBdptCuda(scene, cam, res, resY, sppTarget, maxDepth,
                                               diffraction, p, g_heroC, beamsPtr, &stageProg,
-                                              photonsPtr);
+                                              photonsPtr, jHeld);
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
@@ -17951,6 +17958,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // stay bit-identical), or the user asked for the historical single map.
             if ((!beamsPtr && !photonsPtr) || g_beamFreeze || !prog || !prog->report)
                 return renderEpoch(sppTarget, prog);
+#ifdef HAVE_CUDA
+            // One upload of the scene for every epoch of this frame instead of one per epoch.
+            // Released on the way out, before anything after the render (OIDN) wants the VRAM.
+            struct HoldScope {
+                CudaSceneHold*& slot;
+                HoldScope(CudaSceneHold*& s, CudaSceneHold* h) : slot(s) { slot = h; }
+                ~HoldScope() { cudaReleaseScene(slot); slot = nullptr; }
+            } holdScope(jHeld, useGpu ? cudaHoldScene(scene) : nullptr);
+#endif
             using clk = std::chrono::steady_clock;
             Film acc; acc.resX = res; acc.resY = resY; acc.alloc();
             long long sppAll = 0;
@@ -18005,11 +18021,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 }
                 const auto tEpoch = clk::now();
                 // How long this epoch should run. The overhead being amortised is NOT just the
-                // subpath trace: renderBdptCuda re-uploads the whole scene on every call, so on
-                // a heavy scene the per-epoch cost is dominated by that instead. Measuring the
-                // real gap — rebuild, plus everything before the first sample lands — makes the
-                // rule self-correcting: a cheap scene refreshes often, an expensive one
-                // stretches its epochs out until, in the limit, it behaves like -beamfreeze.
+                // subpath trace: each renderBdptCuda call also uploads the new maps and sets up
+                // its gather. Measuring the real gap — rebuild, plus everything before the first
+                // sample lands — makes the rule self-correcting: a cheap scene refreshes often,
+                // an expensive one stretches its epochs out until, in the limit, it behaves like
+                // -beamfreeze.
                 double epochSec = 0.0;
                 long long epochSpp = 0;
                 SppProgress inner;
@@ -18021,9 +18037,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         epochSec = (rebuildSec + setupSec) / g_beamRefreshFrac;
                         // `setupSec` measures the gap to the FIRST report, which already
                         // includes rendering, so it over-counts the true setup. Recorded
-                        // anyway and labelled as an upper bound: on the device it is the
-                        // per-epoch scene re-upload, and an upper bound that is already small
-                        // is enough to rule that fix out.
+                        // anyway and labelled as an upper bound: an upper bound that is already
+                        // small is enough to rule out a fix aimed at it.
                         lsSetupSec += setupSec;
                         // The floor was a full second, from when the only map here was an
                         // expensive BEAM map and the epoch count was purely a decorrelation
@@ -19164,7 +19179,9 @@ static void printHelp(const char* prog) {
 "                        -spp, epoch e drawing salt e, instead of on the wall clock. Every frame\n"
 "                        of a flyby then averages the SAME K realizations, so the light-side\n"
 "                        noise (beam streaks, caustic photons) holds still instead of\n"
-"                        flickering. Needs a fixed -spp; K ~ spp/8 matches the default's count\n"
+"                        flickering. Needs a fixed -spp. Use K = spp, one realization per\n"
+"                        sample: a realization is only ~14 k beams on gallery_rain, and fewer\n"
+"                        leave each beam a visible streak (an epoch costs ~0.5 s there)\n"
 "  -beamblur <frac>      mode-M beam kernel half-width, as a fraction of each MEDIUM'S OWN\n"
 "                        measured mean free path (default 0.01). This is the quality knob:\n"
 "                        the blur is a physical scale independent of the photon count, so\n"

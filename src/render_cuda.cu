@@ -21395,6 +21395,26 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
     up.dc = bakeCamera(scene, cam, resX, resY, up);
 }
 
+// render_cuda.h. `up` holds only the scene half (up.dc is unused) and owns its allocations,
+// which a renderBdptCuda call against the hold never frees: the call copies `up.sc` (a POD of
+// device pointers) and keeps its own per-call allocations in a DUpload of its own.
+struct CudaSceneHold {
+    const Scene* scene = nullptr;
+    DUpload up;
+};
+CudaSceneHold* cudaHoldScene(const Scene& scene) {
+    if (!cudaAvailable()) return nullptr;
+    CudaSceneHold* h = new CudaSceneHold;
+    h->scene = &scene;
+    buildUploadScene(scene, h->up);
+    return h;
+}
+void cudaReleaseScene(CudaSceneHold* held) {
+    if (!held) return;
+    freeUpload(held->up);
+    delete held;
+}
+
 // Assemble a device DCamSet: upload the DCamera array plus the arrays of per-camera
 // film / hits device pointers. All three device arrays are recorded in up.frees; the
 // film/hits buffers themselves stay owned by the caller.
@@ -22574,7 +22594,7 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
 Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     long long spp, int maxDepth, bool diffraction, const SppProgress* prog,
                     int heroC, const BeamMap* bmap, const StageProgress* stage,
-                    const bdpt::SurfMap* smap) {
+                    const bdpt::SurfMap* smap, const CudaSceneHold* held) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaBdptSupported(scene)) return out;
@@ -22585,7 +22605,17 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     if (maxDepth > BDPT_DEEPDEPTH) maxDepth = BDPT_DEEPDEPTH;   // device array bound
 
     DUpload up;
-    buildUpload(scene, cam, resX, resY, up);
+    if (held) {
+        // A hold of another scene would render that scene's geometry under this one's camera,
+        // lights and materials: refuse it rather than mix them.
+        if (held->scene != &scene)
+            throw std::logic_error("renderBdptCuda: the held device scene is not the scene "
+                                   "being rendered");
+        up.sc = held->up.sc;
+        up.dc = bakeCamera(scene, cam, resX, resY, up);
+    } else {
+        buildUpload(scene, cam, resX, resY, up);
+    }
     // The aimed sun (MODE-J-SDS, 0.387.0): before the first light subpath of this render, which
     // in mode J is the device light pass below, ahead of the per-render J constants.
     uploadSunAim();

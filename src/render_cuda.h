@@ -336,6 +336,17 @@ void cudaSetSunAim(const double* wxyz, const double* r, int n, double sumR2, dou
 
 bool cudaBdptSupported(const Scene& scene);
 
+// A device copy of one Scene, kept across several renderBdptCuda calls. Uploading a scene is a
+// fixed cost per call (1.6 s on gallery_rain, more than a 640x360 spp of rendering), and mode J
+// calls once per light-side epoch, so a frame that redraws its light side often pays it over and
+// over for a scene that has not changed. The copy is read-only to every kernel (DScene holds
+// only const pointers), so reusing it cannot carry state from one call to the next. The caller
+// must not modify `scene` while the hold lives: the copy does not follow it. Returns null when
+// no device is available. cudaReleaseScene(null) is a no-op.
+struct CudaSceneHold;
+CudaSceneHold* cudaHoldScene(const Scene& scene);
+void cudaReleaseScene(CudaSceneHold* held);
+
 // GPU bidirectional path trace (mode D). Renders `spp` samples per pixel at the given
 // resolution and returns the film accumulated as a SUM over spp (display divides by
 // spp: writeFilm(film, spp)). maxDepth is the maximum path length in edges (clamped to
@@ -356,16 +367,18 @@ bool cudaBdptSupported(const Scene& scene);
 // its MIS partials and MIS-combined with the connections inside the kernel. Null is mode D,
 // and then the kernel is bit-for-bit the mode-D one (no segment recording, no merge terms —
 // the merge machinery is a template parameter, not a runtime branch, so mode D does not even
-// `smap` is mode J's OTHER merge kind, the point x point surface merges of `-jsurf` (surfmerge.h);
-// null or empty leaves the estimator exactly two-technique, which is validation gate 1's premise.
 // pay the occupancy). A non-null but EMPTY map (`-nobeams`) also degenerates to exactly mode
 // D, which is validation gate 1. `stage` reports progress during the (potentially very long)
 // host-to-device conversion of a multi-million-sub-beam map.
+// `smap` is mode J's OTHER merge kind, the point x point surface merges of `-jsurf` (surfmerge.h);
+// null or empty leaves the estimator exactly two-technique, which is validation gate 1's premise.
+// `held`, when non-null, is cudaHoldScene's copy of this same `scene`: the call renders against
+// it instead of uploading the scene itself.
 Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     long long spp, int maxDepth, bool diffraction,
                     const SppProgress* prog = nullptr, int heroC = 1,
                     const BeamMap* bmap = nullptr, const StageProgress* stage = nullptr,
-                    const bdpt::SurfMap* smap = nullptr);
+                    const bdpt::SurfMap* smap = nullptr, const CudaSceneHold* held = nullptr);
 
 // True if this scene + camera can be rendered by the GPU backward reference megakernel
 // (mode R), including the physical (mesh-lens) camera as a ray-generation front-end.
