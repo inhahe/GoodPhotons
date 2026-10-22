@@ -139,6 +139,56 @@ sample index crosses a fixed block boundary (split a chunk at the boundaries it 
 light side's epochs already are under `-beamepochs`. Then the chunker can keep adapting and the
 pin and its global switch go. (Both reviewers of 0.391.0 suggested this or a fixed chunk size.)
 
+## DONE (2026-10-21, 0.392.1): REVIEW-0392 — what the Opus review of 0.392.0 found
+
+Opus (xhigh) reviewed fb6c3c7..ce37c50 (the held device scene and K = spp). Fixed:
+
+* **The device drew every beam's transmittance (`kBeamTr0`) from a per-call counter,** so a
+  `-beamepochs` (or `-beamfreeze`) flyby, whose frames all render the same realizations, redrew
+  them per frame: through a heterogeneous medium the beams' brightness flickered between frames,
+  the very thing `-beamepochs` exists to stop, and `-seed` did not move it. Pre-existing since the
+  tr0 draw (0.386.0). It is now seeded from `BeamMap::salt`, the salt the realization was traced
+  under. `gallery_rain` fly frame 10, 320x180, 8 spp, `-beamepochs 8`, rendered after frame 9 in
+  one run against alone: 0.53 % mean difference (one pixel 3.8x the image mean) before, bit-identical
+  after.
+* **The two-line GPU wave summary printed at the end of every epoch's call,** 128 lines a frame at
+  K = 64: once per frame now (`g_gpuQuietRebuild`).
+* **Stale docs:** `-beamrefresh` in REFERENCE.md and the refresh paragraph in design.md still said
+  every epoch re-uploads the scene; the hold's comment and design.md said it is released before
+  OIDN runs, when OIDN runs inside the epochs' progress reports with it resident.
+* **`Use K = spp` was unqualified:** on the CPU (or `-jhostlight`) an epoch also rebuilds the host
+  SAH beam tree; the help and REFERENCE.md now say so.
+* The hold is checked against the scene's generation as well as its address; it reaches the
+  epoch's render as a parameter owned by a `unique_ptr` instead of through a shared slot; and
+  `FTRACE_NOHOLD=1` turns it off for an in-binary A/B (held and unheld frames bit-identical; the
+  unheld one's gather 15.3 s against 4.2 s at 8 epochs, 320x180).
+
+Dismissed, with measurements: the per-call wavefront queue (`cudaMalloc` of ~1 GB per epoch) --
+timed at ~2 ms, and the call's whole teardown at ~30 ms; the host surface grid built and then
+unused under the device light pass -- ~30 ms an epoch (`surf grid` in `[jstats]`), 1 % of a frame,
+with the device-or-host decision made inside render_cuda.cu.
+
+Logged rather than fixed: JFLYBY-REALIZATION-REUSE, below.
+
+## OPEN (2026-10-21): JFLYBY-REALIZATION-REUSE — a mode-J flyby rebuilds the same K light-side realizations, and re-uploads the same scene, for every frame
+
+Under `-beamepochs K` every frame of a flyby renders the same K realizations (salt e, view-
+independent), yet each frame traces and builds all K again, in series with the GPU: on
+`gallery_rain` at K = 64 about 0.5 s an epoch (`buildBeamMap` ~0.33 s with its volume-cache split,
+the trace ~0.05 s, the surface grid ~0.03 s, the device call's setup ~0.1 s), ~32 s of a ~176 s
+frame, ~10 h of the 1208-frame loop. The scene hold (0.392.0) is per frame, so the scene is still
+uploaded 1208 times (1.6 s each), and a mode-D or `-beamfreeze` flyby, which never enters the epoch
+loop, gets no hold at all. Three fixes, roughly in order of payoff:
+
+* **Cache the K realizations across the batch**, beside `jLightCache`, which already holds the
+  single `-beamfreeze` realization. Measure the memory first: a realization is ~14 k beams but
+  ~320 k sub-beams after the split, plus its MIS records and surface map.
+* **Or build epoch e+1 while epoch e renders**, on a worker thread with double-buffered maps.
+  `RngSaltScope` is a process-wide salt that the camera pass reads too (renderBdptCuda folds
+  `g_rngSalt` into its seed), so the light pass would have to take its salt explicitly first.
+* **Hold the scene at the batch loop** rather than per frame, which also serves mode D's flybys and
+  the meter pre-pass.
+
 ## DONE (2026-10-21, 0.392.0): FLYBY-BEAM-STREAKS — the `gallery_rain` flyby showed every light beam in the cloud and rain as a sharp coloured streak
 
 Reported by the user from the first frames of the 1280x720 flyby (`-spp 64 -beamepochs 8`): strong
@@ -157,7 +207,9 @@ loop now holds one device copy for the frame (`cudaHoldScene`). At 1280x720, fra
 173 s at 8 epochs before, 161 s at 8 epochs and 194 s at 64 epochs after; 4x the beams would cost
 290 s, so the flyby uses 64 epochs and the knee's beam count. The bat, the scene's recipe comment,
 `-beamepochs`'s help and REFERENCE.md now say K = spp (0.391.0 had recommended spp/8). The 11 frames
-already rendered with 8 epochs were deleted and the flyby restarted.
+already rendered with 8 epochs were deleted and the flyby restarted, and restarted again on 0.392.1,
+whose fixed transmittance draw (REVIEW-0392) stops the beams flickering between frames. It runs at
+~2:55 a frame, ~2.5 days for the loop.
 
 ## DONE (2026-10-21, 0.391.6): REVIEW-03915 — what the Opus review of 0.391.5 found
 

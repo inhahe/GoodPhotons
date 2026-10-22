@@ -748,6 +748,11 @@ struct BeamMap {
                                       // (after buildAuto) the MAX over media — the one number
                                       // worth printing when a scene has a single medium.
     long long nEmitted = 0;           // photons emitted by the pass (normalisation)
+    // The RNG salt (g_rngSalt) the realization was traced under, so that whatever is drawn
+    // later from this map alone -- the device's per-beam transmittance, kBeamTr0 -- is drawn
+    // the same way whenever the same realization is rendered: in every frame of a
+    // -beamepochs or -beamfreeze flyby, and on a resume.
+    uint64_t  salt = 0;
     size_t    nDeposited = 0;         // crossings actually deposited, BEFORE decimateTo —
                                       // reported so the overshoot over `-beamcount` (i.e. the
                                       // mean media-crossing multiplicity of a photon) is

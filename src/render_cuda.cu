@@ -21400,12 +21400,18 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
 // device pointers) and keeps its own per-call allocations in a DUpload of its own.
 struct CudaSceneHold {
     const Scene* scene = nullptr;
+    uint64_t generation = 0;   // with the address: a scene rebuilt where the old one was is new
     DUpload up;
 };
 CudaSceneHold* cudaHoldScene(const Scene& scene) {
     if (!cudaAvailable()) return nullptr;
+    // FTRACE_NOHOLD=1: hold nothing, so every call uploads the scene itself -- the A/B arm for
+    // checking that a held render is bit-identical to an unheld one.
+    static const bool off = std::getenv("FTRACE_NOHOLD") && std::atoi(std::getenv("FTRACE_NOHOLD")) != 0;
+    if (off) return nullptr;
     CudaSceneHold* h = new CudaSceneHold;
     h->scene = &scene;
+    h->generation = scene.generation;
     buildUploadScene(scene, h->up);
     return h;
 }
@@ -22421,10 +22427,11 @@ static void drawBeamTr0(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& dbm) {
     const int nP = (int)start.size() - 1;
     const int* dStart = (const int*)up.keep(uploadVec(start));
     float* dTr0 = (float*)up.keep(uploadVec(std::vector<float>(nb, -1.0f)));
-    static unsigned long long epoch = 0;   // a fresh draw per light-side realization
-    ++epoch;
+    // Keyed to the realization (BeamMap::salt), not to the call: a flyby renders the same
+    // realizations in every frame (-beamepochs, -beamfreeze), and a draw that changed per call
+    // would make the beams' transmittance through a heterogeneous medium flicker between them.
     gpu::kBeamTr0<<<(nP + 127) / 128, 128>>>(up.sc, dbm.beams, dTr0, dStart, nP,
-                                             0xD6E8FEB86659FD93ull * epoch);
+                                             mix64(bmap->salt ^ 0xD6E8FEB86659FD93ull));
     dbm.tr0 = dTr0;
     cudaCheckKernel("beam-tr0");
     if (std::getenv("FTRACE_BEAMTR0_TIME")) {
@@ -22608,7 +22615,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     if (held) {
         // A hold of another scene would render that scene's geometry under this one's camera,
         // lights and materials: refuse it rather than mix them.
-        if (held->scene != &scene)
+        if (held->scene != &scene || held->generation != scene.generation)
             throw std::logic_error("renderBdptCuda: the held device scene is not the scene "
                                    "being rendered");
         up.sc = held->up.sc;
@@ -23064,7 +23071,9 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     if (wq.segs) {
         int ov[4] = {0, 0, 0, 0};
         cudaMemcpy(ov, d_wfCounters, sizeof ov, cudaMemcpyDeviceToHost);
-        std::fprintf(stderr, "[gpu] mode J wavefront gather: %lld waves (first up to %lld paths, adaptive after); "
+        // Once per frame, not once per light-side epoch (see g_gpuQuietRebuild): one realization
+        // per sample would otherwise print it 64 times a frame.
+        if (!g_gpuQuietRebuild) std::fprintf(stderr, "[gpu] mode J wavefront gather: %lld waves (first up to %lld paths, adaptive after); "
                              "last wave %d segments / %d hits; spilled over the whole render: %lld segments "
                              "gathered inline, %lld hits evaluated on the spot (FTRACE_NOWAVEFRONT=1 forces "
                              "the inline path)\n"

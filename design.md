@@ -2051,8 +2051,9 @@ fall as `1/sqrt(epochs)` alongside the connection noise. Same `-n`, same 60 s: s
 only because the *gather* dominates mode `J` (UPBP-CONV) — the whole light side is ~2.6 % of a
 render. `-beamfreeze` restores the old single-map behaviour bit-for-bit; `-beamrefresh <frac>`
 (default 0.10) sets the rebuild share of the wall clock, and the epoch length adapts to the
-*measured* per-epoch overhead, so a heavy scene — where `renderBdptCuda` re-uploads the whole scene
-every epoch — stretches its epochs out and degrades gracefully toward `-beamfreeze` instead of
+*measured* per-epoch overhead (the light trace, the beam map and the device call's setup; the scene
+itself stays on the device across a frame's epochs since 0.392.0), so a scene whose realizations
+are dear stretches its epochs out and degrades gracefully toward `-beamfreeze` instead of
 thrashing.
 
 **MODE `J`'S SURFACE LIGHT SIDE RUNS ON THE DEVICE, PER CHUNK (0.272.0).** `-jsurf`'s surface
@@ -2144,9 +2145,13 @@ against a render with 16× the beams). More beams per realization would also do 
 pays for every beam on every sample (4× the subpaths: 290 s against 194 s), while more
 realizations cost only their build. That build was dominated by `renderBdptCuda` uploading the
 whole scene on every call, 1.6 s on `gallery_rain`; mode J's epoch loop (`renderChunked`) now
-holds one device copy for the frame (`cudaHoldScene`, released before OIDN runs) and every call
-renders against it. `DScene` holds only const pointers, so no call can leave state in it for the
-next. What an epoch still costs is the light trace and the beam map, ~0.5 s there: K = 64 renders
+holds one device copy for the frame (`cudaHoldScene`, released when the frame's last epoch returns,
+so the progress reports inside the epochs, which write the `-interval` images through OIDN, run with
+it resident) and every call renders against it. `DScene` holds only const pointers, so no call can
+leave state in it for the next; a hold is checked against the scene's address and generation, and
+`FTRACE_NOHOLD=1` turns it off for an A/B in one binary. The device's per-beam transmittance
+(`kBeamTr0`) is seeded from the realization's salt (`BeamMap::salt`), not per call, so the same
+realization draws the same transmittances in every frame. What an epoch still costs is the light trace and the beam map, ~0.5 s there: K = 64 renders
 that frame in 194 s, K = 8 in 161 s (173 s before the hold). The wall-clock refresh paces its
 epochs by this same overhead, so it refreshes more often too: a 60 s `gallery_rain` still at
 640x360 now averages 14 realizations, against 6 before.

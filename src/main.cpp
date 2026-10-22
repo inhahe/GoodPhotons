@@ -186,6 +186,7 @@
 #include "render_cuda.h"
 #include "raster_cuda.h"   // GPU preview rasterizer (device twin of raster::renderFrame)
 #endif
+struct CudaSceneHold;      // render_cuda.h; named in signatures a CPU-only build compiles too
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX               // keep std::min/std::max (windows.h else macro-clobbers them)
@@ -17757,6 +17758,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             bdpt::traceLightBeamPass(scene, cam, Nepoch, nThreads, maxDepth, diffraction,
                                      bmap, &stageProg, jreq, &jbb,
                                      wantSurf ? &smap : nullptr);
+            bmap.salt = g_rngSalt;   // this realization's salt (saltScope above), for kBeamTr0
             const double traceSec =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
             lsTraceSec += traceSec;
@@ -17867,13 +17869,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         const BeamMap* beamsPtr = (wantBeams && !bmap.empty()) ? &bmap : nullptr;
         const bdpt::SurfMap* photonsPtr =
             (wantSurf && !smap.empty() && smap.nEmitted > 0) ? &smap : nullptr;
-#ifdef HAVE_CUDA
-        // The device copy of the scene that every epoch of one frame renders against
-        // (cudaHoldScene), set by renderChunked's epoch loop; null elsewhere, where the single
-        // call uploads the scene itself.
-        CudaSceneHold* jHeld = nullptr;
-#endif
-        auto renderEpoch = [&](long long sppTarget, const SppProgress* p) -> Film {
+        // `held`: the device copy of the scene that every epoch of one frame renders against
+        // (cudaHoldScene, owned by renderChunked's epoch loop); null where the single call
+        // uploads the scene itself.
+        auto renderEpoch = [&](long long sppTarget, const SppProgress* p,
+                               const CudaSceneHold* held = nullptr) -> Film {
 #ifdef HAVE_CUDA
             // `g_heroC`, exactly as mode D passes it — NOT 1. The kernel applies the same
             // hero gate the CPU BdptRenderer does (a medium, GRIN or a physical lens falls
@@ -17894,7 +17894,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // `photonsPtr` below is what carries the surface map to the device.
             if (useGpu) return renderBdptCuda(scene, cam, res, resY, sppTarget, maxDepth,
                                               diffraction, p, g_heroC, beamsPtr, &stageProg,
-                                              photonsPtr, jHeld);
+                                              photonsPtr, held);
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
@@ -17958,14 +17958,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // stay bit-identical), or the user asked for the historical single map.
             if ((!beamsPtr && !photonsPtr) || g_beamFreeze || !prog || !prog->report)
                 return renderEpoch(sppTarget, prog);
-#ifdef HAVE_CUDA
             // One upload of the scene for every epoch of this frame instead of one per epoch.
-            // Released on the way out, before anything after the render (OIDN) wants the VRAM.
-            struct HoldScope {
-                CudaSceneHold*& slot;
-                HoldScope(CudaSceneHold*& s, CudaSceneHold* h) : slot(s) { slot = h; }
-                ~HoldScope() { cudaReleaseScene(slot); slot = nullptr; }
-            } holdScope(jHeld, useGpu ? cudaHoldScene(scene) : nullptr);
+            // It lives until the frame's last epoch returns, so the progress reports inside the
+            // epochs (which write the -interval images, through OIDN when it is on) run with it
+            // resident.
+#ifdef HAVE_CUDA
+            const std::unique_ptr<CudaSceneHold, void (*)(CudaSceneHold*)> holdOwner(
+                useGpu ? cudaHoldScene(scene) : nullptr, cudaReleaseScene);
+            const CudaSceneHold* const held = holdOwner.get();
+#else
+            const CudaSceneHold* const held = nullptr;
 #endif
             using clk = std::chrono::steady_clock;
             Film acc; acc.resX = res; acc.resY = resY; acc.alloc();
@@ -18086,7 +18088,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 const auto tg = clk::now();
                 Film f = renderEpoch(nFixed ? std::min<long long>((long long)(want + 1) * epLen, total)
                                                   - (base + sppAll)
-                                            : sppTarget - sppAll, &inner);
+                                            : sppTarget - sppAll, &inner, held);
                 lsGatherSec += std::chrono::duration<double>(clk::now() - tg).count();
                 g_gpuQuietRebuild = false;
                 if (epochSpp <= 0) break;      // produced nothing; refreshing again cannot help
@@ -19181,7 +19183,8 @@ static void printHelp(const char* prog) {
 "                        noise (beam streaks, caustic photons) holds still instead of\n"
 "                        flickering. Needs a fixed -spp. Use K = spp, one realization per\n"
 "                        sample: a realization is only ~14 k beams on gallery_rain, and fewer\n"
-"                        leave each beam a visible streak (an epoch costs ~0.5 s there)\n"
+"                        leave each beam a visible streak. An epoch costs ~0.5 s there on the\n"
+"                        GPU; on the CPU it also rebuilds the host beam tree, up to seconds\n"
 "  -beamblur <frac>      mode-M beam kernel half-width, as a fraction of each MEDIUM'S OWN\n"
 "                        measured mean free path (default 0.01). This is the quality knob:\n"
 "                        the blur is a physical scale independent of the photon count, so\n"
