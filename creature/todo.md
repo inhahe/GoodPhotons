@@ -1410,7 +1410,8 @@ chimera and it reads as a bug.
 - [ ] **Add a spatially-varying ambient velocity field** that the aero model samples. It is cheap,
       and it is the prerequisite for thermals, ridge lift, gusts, ground effect and therefore for
       soaring at all. **The same field drives P7's quasi-static fur/feather wind deflection** — so
-      one piece of infrastructure serves both the physics layer and the look layer. (Note this is
+      one piece of infrastructure serves both the physics layer and the look layer. *(A third
+      consumer since 2026-10-22: it carries scent to the nose for P14's sense of smell.)* (Note this is
       *not* the "object interaction is content" category from P10: a velocity field is a few numbers
       per point, not a world of graspable objects.)
 
@@ -1735,6 +1736,33 @@ and overridable by them — design.md §Directability applied to behaviour. It c
 the level 0–1 vocabulary becomes an interface with two writers, so it must exist as conditioning
 inputs from the start (P10's governing principle).
 
+**Directing by staged stimuli — the third way in** *(added 2026-10-22, asked for explicitly)*. Instead
+of setting an intent, the animator places a stimulus — a scent upwind, a noise behind a wall, a
+person at the gate — and the animal reacts through the whole stack. This is how real animal actors
+are directed: a wrangler off camera with a treat or a squeaky toy. The stack therefore has three
+entry points, from least to most precise:
+
+| entry point | what the animator sets | what they get |
+|---|---|---|
+| staged stimulus | something in the animal's world | a genuine reaction, not a specified one |
+| intent / affect (P10 levels 0–1) | what the animal wants, and how it feels | that want, executed physically |
+| part goals / hard constraints (P10 levels 3–4) | a foot on a mark at a frame | exactly that, with the body balancing around it |
+
+They combine: stage the scare, then nudge the intent so the flight goes left. Simulation improves
+on a film set in two ways, and both are first-class features rather than tricks:
+- **Phantom stimuli.** A stimulus can be perceptible to the animal and invisible to the film camera
+  — the off-camera wrangler, without anyone hiding behind the set. In the scene it is an ordinary
+  stimulus with a "camera-invisible" flag; the senses see it, the renderer does not.
+- **Takes are free.** The reaction depends on internal state and noise, so a staged stimulus gives
+  a *distribution* of reactions. Run it under N seeds and pick a take; the seed is what makes the
+  chosen take reproducible, which puts the Cross-cutting determinism item on this phase's critical
+  path.
+
+The wrangler's limits come with it, which is why the intent layer stays: a staged stimulus cannot
+hit a mark at a frame, it only reaches reactions the stimulus → intent model learned, and a take
+where the animal fails to react needs the intent readout to say which stage failed — perception,
+appraisal or execution.
+
 Work, in order:
 
 - [ ] **Identifiability study on simulated data — FIRST.** Extend `tools/fit_selftest.py` from pose
@@ -1757,12 +1785,30 @@ Work, in order:
       counter-example sessions against the label confound.
 - [ ] **Behaviour discovery** — motif segmentation over P5's footage, clusters named against the
       species' ethogram.
+- [ ] **Senses: exteroception, under `sensing.py`'s contract.** Nothing outside the body reaches the
+      policy today. Each sense is a channel group in the head frame, normalised, with its own
+      conduction delay, and never a world coordinate (`test_no_world_frame_channel_leaks_in`
+      applies). Each must be a conditioning input from the first training run that will ever use
+      it (P10's principle):
+      - **vision** — what is in the field of view: line-of-sight tests first, a low-resolution
+        render from the eyes only if that proves too poor. Model the species, not a camera: dogs
+        are dichromatic, see a wide field, resolve less detail and are sensitive to motion;
+      - **hearing** — sources as direction and loudness relative to the head;
+      - **smell** — scent advected by P11's ambient velocity field, sampled at the nose; for a dog
+        this is the dominant sense;
+      - **touch** — contacts, which the simulation already produces.
+
+      The capture protocol must log stimuli **in these same terms**, so that what the model
+      learned from real sessions is what a staged stimulus presents.
 - [ ] **Stimulus → intent model**, writing P10's level 0–1 channels, with the directed/undirected
       switch exposed to the animator.
+- [ ] **Staged-stimulus directing:** stimuli as scene objects (sight, sound or scent source,
+      position, timing), the camera-invisible flag for phantom stimuli, and a takes runner that
+      plays one staging under N seeds and shows the animator the intent readout for each.
 - [ ] **Bar:** single-camera footage of an animal the system has never seen, shot by someone else →
       a creature that moves recognisably like it, every parameter marked measured or prior, that an
       animator can direct by intent, and that, left alone, reacts to a logged stimulus the way the
-      real animal did.
+      real animal did — including when that stimulus is staged as a phantom the camera never sees.
 
 **Explicitly not:** simulating internals the identifiability table shows are invisible, beyond what
 the template carries anyway; a network that outputs a network; claiming recovered muscle
