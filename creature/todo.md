@@ -1833,7 +1833,7 @@ activations as measurements; inference across body plans before one plan works.
 ## Cross-cutting
 
 - [x] `design.md` kept current (it is the architecture record) — ongoing, not a milestone
-- [x] `known-issues.md` for bugs/tech debt — 3 open, 6 resolved
+- [x] `known-issues.md` for bugs/tech debt — 9 open, 10 resolved (recounted 2026-10-22)
 - [x] Version control: `git init`ed at the close of P0; `out/`, `runs/`, `*.pt` ignored
 - [ ] Determinism: seed everything; training runs must be re-runnable
 - [ ] **Measure GPU physics before P2 spends real compute** *(added 2026-10-22)*. Training runs

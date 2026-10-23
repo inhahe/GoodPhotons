@@ -347,6 +347,24 @@ genuinely needed and the fast band decays past the eval noise floor early.
 
 ---
 
+### 11. A new file in `notes/` is silently left out of git
+
+Found 2026-10-22 while committing `notes/capture.md`. The repo root's `.gitignore` carries an
+unanchored `notes/` line (in the block headed "Local-only", added 2026-09-18 when the project
+began publishing from its own directory). It was meant for the top-level `notes/` folder, but an
+unanchored pattern matches a `notes/` directory at any depth — including this one. The four files
+here (`capture.md`, `keypoints.yaml`, `pipeline.md`, `training.md`) were tracked before the rule
+existed, so edits to them still commit; `git add` merely warns that the path is ignored and exits 1.
+A **new** file created here is never staged by `git add`, never shown by `git status`, and so
+never committed or published — while todo.md and design.md go on citing it.
+
+Reproduce: `git check-ignore -v --no-index notes/anything.md` from `creature/` →
+`.gitignore:164:notes/`.
+
+Fix: anchor the rule as `/notes/`, which keeps the top-level folder local-only and stops matching
+`creature/notes/`. Not applied yet because that block decides what the published repo leaves out,
+which is the user's call.
+
 ## Done
 
 ### 10. Slope and stairs at difficulty 1 were an unlearnable task, and the curriculum trained there  **DONE**
