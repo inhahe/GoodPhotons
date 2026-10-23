@@ -127,6 +127,16 @@ CAPS = [
     # degrees -- the orb and the compote take #7's two halves whole, so this is the stone at
     # three times their magnification and turned, a different-looking slab of the same block.
     ('marble_alice',   'marble texture 7.jpg',    'stand_alice_cap',   (1/3, 2/3, 2/3, 1),  0.70, 0.80, 270),
+    # The GNOME is the hall's second painted figure (red hat, beige coat, blue jeans), so its
+    # cap is calmed exactly as Alice's is. #6 is the flattest, most neutral stone in the set,
+    # which is what a painted subject wants under it; the axicon takes #6 whole, so this is its
+    # right half turned 90 degrees, the stone at twice the magnification and at another angle.
+    ('marble_gnome',   'marble texture 6.jpg',    'stand_gnome_cap',   (0.5, 0, 1, 1),      0.70, 0.80, 90),
+    # The 3-D JULIA is opaque (a rose glaze under a clear coat) and throws no caustic, so its
+    # cap is free: full drama. #3's rust-and-rose veining rhymes with the glaze. The diamond
+    # gyroid's cap takes #3 whole and calmed, so this is #3's lower half turned 90 degrees, at
+    # full contrast and colour, which makes it a different-looking slab of the same block.
+    ('marble_julia',   'marble texture 3.jpg',    'stand_julia_cap',   (0, 0.5, 1, 1),      1.00, 1.00, 90),
 ]
 
 

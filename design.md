@@ -1443,6 +1443,25 @@ cannot be placed at two different scales:
   headband's section of the rig's scene, its material names prefixed `alice2_`.
 - **Rerun it** whenever the doll or the hair is regenerated.
 
+**The gnome and the 3-D Julia in gallery_rain (2026-10-23, `tools/downscale_glb.py`).** The
+fourteenth and fifteenth stands, side by side on raised (1.30 m) caps in the far-left court, the
+last plot in the still's frame that neither screens nor is screened by another piece
+(`scraps/_newsite.py`, `_newsite_pair.py`). Both meshes are image-to-3D output many times
+heavier than their source images can justify, so both are first slimmed by
+`tools/downscale_glb.py` (REFERENCE.md has its usage). It sweeps quadric-edge-collapse face
+counts and measures each one's departure from the original in *source-image pixels*, then takes
+the fewest faces that lose nothing the image could show. Textures are padded past their UV charts
+and Lanczos-resized in linear light. The slimmed files are written beside the originals, outside
+the repo, and the scene names them by absolute path.
+- **The gnome** (Meshy, textured): 43 MB → 4.3 MB, 62 k faces and a 1024² atlas from 8192². It is
+  painted from its own glTF materials, as Alice is.
+- **The Julia** (Hyper3D, untextured): 2 M → 850 k faces, worn as a fitted material (a rose
+  diffuse body under a Fresnel clear coat, `layered`), because the source image is one glazed
+  material and the PBR variant's texture bakes in its lighting.
+- **Rest poses:** the gnome stands on its flat base. The Julia has no upright rest of its own
+  (the centre of mass falls outside every near-level facet of its convex hull), so it stands on
+  its lowest lobe plus two wirecage pins, `stand_julia_mount`, the prism mount's idiom.
+
 **Alice2's eyes (2026-10-07..11, `tools/alice2_eyes.py`, tooling only): a new copy of the GLB with
 crisp, matching eyes; the face round them unchanged.** Problems in the source:
 - **Resolution.** All seven parts share one 2048² colour atlas, and the face's share is scattered

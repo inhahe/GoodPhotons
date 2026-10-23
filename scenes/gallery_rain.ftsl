@@ -696,6 +696,14 @@ texture "tex_marble_compote"  { file textures/marble_compote.png  encoding srgb 
 #     (a glTF baseColor atlas), so the stone under her must not compete with the only texture
 #     in the frame. s=0.80 keeps the vein a vein.
 texture "tex_marble_alice"    { file textures/marble_alice.png    encoding srgb  filter bilinear  wrap clamp }
+# The FOURTEENTH cap, under the GNOME: `marble texture 6.jpg`'s right half turned 90 degrees
+# (the axicon takes #6 whole). Calmed to Alice's k=0.70 / s=0.80 for Alice's reason: the
+# gnome is the second painted figure, and its red hat and blue jeans are paint, not physics.
+texture "tex_marble_gnome"    { file textures/marble_gnome.png    encoding srgb  filter bilinear  wrap clamp }
+# The FIFTEENTH, under the 3-D JULIA: `marble texture 3.jpg`'s lower half turned 90 degrees
+# (the diamond gyroid's cap takes #3 whole). Full contrast and colour: the Julia is opaque and
+# throws no caustic, and #3's rust veins rhyme with its rose glaze.
+texture "tex_marble_julia"    { file textures/marble_julia.png    encoding srgb  filter bilinear  wrap clamp }
 
 # `wrap clamp` (not `repeat`) with `uv planar axis=y` on each cap isosurface maps ONE slab
 # across each tabletop, referenced to that primitive's own world bounds — a quarried slab cut
@@ -716,6 +724,8 @@ material "capmarble_axicon"   { type diffuse  reflect texture:tex_marble_axicon 
 material "capmarble_creature" { type diffuse  reflect texture:tex_marble_creature }
 material "capmarble_compote"  { type diffuse  reflect texture:tex_marble_compote }
 material "capmarble_alice"    { type diffuse  reflect texture:tex_marble_alice }
+material "capmarble_gnome"    { type diffuse  reflect texture:tex_marble_gnome }
+material "capmarble_julia"    { type diffuse  reflect texture:tex_marble_julia }
 
 # --- Hero-object materials -----------------------------------------------------
 # `roughness` after `preset` overrides the preset's polished lobe. Gold needs a LOT here, and
@@ -1661,6 +1671,80 @@ isosurface "stand_alice_cap" { material capmarble_alice
     # 27 px.
     box { center 9.15 0.81 3.55  size 1.00 0.18 1.00  round 0.02 } }
 
+# --- exhibits: the 3-D JULIA and the GNOME (the fifteenth and fourteenth stands) ---------------
+# World coordinates, no group wrapper, for Alice's reason. Both on RAISED plinths (cap top 1.30,
+# the glass orb's height), side by side in the FAR-LEFT court, the one stretch of this frame
+# that was still empty: black sky over bare grid, left of the chrome ring and behind the prism.
+#
+# WHY HERE: `scraps/_newsite.py` (Alice's search, extended to a piece standing on a cap, with
+# Alice added as a neighbour and the crystal PRISM's real box in place of the axicon's)
+# and `scraps/_newsite_pair.py` (the best PAIR rather than the best of each) agree that this
+# court is the only place left where a new piece is neither screened by a nearer one nor
+# screening a farther one. Everything right of x=1 is the packed hall Alice's comment
+# describes. The flyby never comes this way, so it clears the spline by metres.
+#   * THE RAISED CAP is what makes the court work. On a 0.90 cap both pieces would stand
+#     behind the prism's upper-left edge, which on screen climbs from (111,407) to its peak
+#     at (213,349) (`scraps/_prism_sil.py`, the prism's exact convex outline). At 1.30 their
+#     feet clear that edge.
+#   * THE JULIA takes the plot at the frame's left edge; the gnome stands 1.15 m to its right
+#     and 0.7 m further back, between it and the chrome ring, just right of the prism's peak.
+#     Both plots are 10.3 m from the eye, as far as the back row, so the pieces are small in
+#     the still (the Julia ~75 px wide, the gnome ~55 px tall); the search, which ranks plots
+#     by unscreened on-screen area, found no clear plot that shows either piece bigger.
+isosurface "stand_julia" {   # cap top y=1.30
+    material wirecage  union {
+        difference {
+            box { center -1.0 0.09 1.05  size 0.80  0.18  0.80  }
+            box { center -1.0 0.09 1.05  size 0.82  0.158 0.778 }
+            box { center -1.0 0.09 1.05  size 0.778 0.20  0.778 }
+            box { center -1.0 0.09 1.05  size 0.778 0.158 0.82  }
+        }
+        difference {   # column y 0.18..1.12, under a raised cap as stand_glass's is
+            box { center -1.0 0.65 1.05  size 0.40  0.94  0.40  }
+            box { center -1.0 0.65 1.05  size 0.42  0.918 0.378 }
+            box { center -1.0 0.65 1.05  size 0.378 0.96  0.378 }
+            box { center -1.0 0.65 1.05  size 0.378 0.918 0.42  }
+        }
+    }
+}
+isosurface "stand_julia_cap" { material capmarble_julia
+    uv planar axis=y
+    # Centred: the Julia is opaque and throws no caustic to lean toward. 1.00 x 1.00 against
+    # the piece's 0.76 x 0.76 m footprint (turned to face the camera).
+    box { center -1.0 1.21 1.05  size 1.00 0.18 1.00  round 0.02 } }
+isosurface "stand_julia_mount" {
+    # TWO PINS, because the Julia has no upright rest of its own. Its underside is a field of
+    # lobes, and the convex hull's near-upright facets all leave the centre of mass outside the
+    # facet (`scraps/meshes/rest_pose.py`): set down flat, it would rock onto a side. It rests
+    # on its lowest lobe, and these pins, 3 and 13 mm tall, carry the two low points that make
+    # a triangle around the centre of mass, 5.8 cm inside its nearest edge
+    # (`scraps/meshes/julia_mount.py`). Each pin's top is the mesh vertex it carries, placed.
+    material wirecage  union {
+        box { center -0.7765 1.3017 1.1222  size 0.012 0.0034 0.012 }
+        box { center -1.1898 1.3065 1.0826  size 0.012 0.0130 0.012 }
+    }
+}
+isosurface "stand_gnome" {   # cap top y=1.30
+    material wirecage  union {
+        difference {
+            box { center 0.15 0.09 0.35  size 0.60  0.18  0.60  }
+            box { center 0.15 0.09 0.35  size 0.62  0.158 0.578 }
+            box { center 0.15 0.09 0.35  size 0.578 0.20  0.578 }
+            box { center 0.15 0.09 0.35  size 0.578 0.158 0.62  }
+        }
+        difference {
+            box { center 0.15 0.65 0.35  size 0.30  0.94  0.30  }
+            box { center 0.15 0.65 0.35  size 0.32  0.918 0.278 }
+            box { center 0.15 0.65 0.35  size 0.278 0.96  0.278 }
+            box { center 0.15 0.65 0.35  size 0.278 0.918 0.32  }
+        }
+    }
+}
+isosurface "stand_gnome_cap" { material capmarble_gnome
+    uv planar axis=y
+    # 0.70 x 0.70 against the gnome's 0.29 x 0.24 m footprint, Alice's margins and then some.
+    box { center 0.15 1.21 0.35  size 0.70 0.18 0.70  round 0.02 } }
+
 # ==============================  HERO PIECES  =================================
 # Each piece is wrapped in the SAME `group { translate }` as its stand — see THE SPREAD
 # above for the offset table. The offsets must stay in lockstep between the two sections or
@@ -2414,6 +2498,51 @@ mesh "cp_turquoise" { file "meshes/compote_with_gems.glb"  import_materials no
 # fifth of the frame's height to three quarters, and the camera passes within 0.5 m of her face
 # at frames 256-260, looking away from her.
 include "alice2_gallery.ftsl"
+
+# --- THE 3-D JULIA (far-left court, on stand_julia; NOT settled — pinned, see the mount) ------
+# A Hyper3D reconstruction of the quaternion Julia set in d:/mypage/lightgallery/art/fractals/
+# 3DJulia2.jpg. Its 2 M-face original is decimated to 850 k (`tools/downscale_glb.py`) where
+# the reconstruction stops gaining anything the 1024^2 source image could show: 99.9% of the
+# original's vertices lie within a quarter of a source pixel of the result. The mesh is left
+# untextured on purpose. The Hyper3D PBR variant bakes the picture's lighting into its texture,
+# dark on the back, and the original image is a single glazed material: so is this.
+#
+# THE MATERIAL is fitted to that image: a rose diffuse body under a clear coat, matched on
+# its midtone, lit and highlight colours in a two-lamp test (scraps/meshes/cmp/julia.ftsl).
+# The coat's 0.40 roughness is what gives the image's broad, soft sheen rather than pin
+# highlights; the Fresnel coat is what makes the grazing rims of every lobe go pale.
+#
+# 0.80 m tall (scale 0.80 / 1.896). Its front (the image's view) is the model's +z, turned
+# 35.9 deg to face the still camera square. It stands on its lowest lobe at the cap top and
+# on the two pins of stand_julia_mount.
+material "julia_body" { type diffuse  reflect rgb 0.56 0.26 0.26 }
+material "julia"      { type layered  ior 1.5
+                        coat { reflectance fresnel  roughness 0.40 }
+                        layer "julia_body" 1.0 }
+mesh "julia3d" { file "d:/youtube/philosophy/3d objects/3djulia/3djulia hyper3d 2m/base_basic_shaded_850k.glb"
+    material julia  import_materials no
+    translate -1.0 1.30 1.05   rotate 0 35.86 0   scale 0.421941 }
+
+# --- THE GNOME (far-left court, on stand_gnome; NOT settled — analytic rest) -----------------
+# "Gnome Chomsky", a Meshy reconstruction of the garden gnome in d:/youtube/philosophy/images/
+# gnome chomsky*.jpg, painted from its own glTF atlas like Alice. The source photographs are
+# ~250 x 440 px, so the 43 MB original carries far more than they hold: it is decimated to 62 k
+# faces, the fewest tried at which no original vertex is more than half a source pixel from the
+# result (worst 0.45 px), and its colour atlas goes from 8192^2 to 1024^2 (the metal-roughness
+# map from 4096^2), still more than one texel per photograph pixel everywhere on the figure
+# (`tools/downscale_glb.py`).
+#
+# 0.70 m tall on its own lettered base (scale 0.70 / 1.900). The base is flat: the convex
+# hull facet it stands on is 0.57 deg off level with the centre of mass well inside it
+# (`scraps/meshes/rest_pose.py`), so `rotate 0.567` about x sets that facet level and the
+# translate puts it on the cap top. The y turn, 28.3 deg, faces the still camera square.
+#
+# `gnome_unpainted` is the fallback FTSL requires on every mesh, flat grey for Alice's
+# reason: a texture-import regression should show as a grey statue, not ship quietly.
+material "gnome_unpainted" { type diffuse  reflect 0.5 }
+mesh "gnome" { file "d:/youtube/philosophy/3d objects/Meshy_AI_Garden_Gnome_Scholar_0715074653_texture_62k_tex1k.glb"
+    material gnome_unpainted
+    translate 0.15 1.64981 0.35   rotate 0.567 28.32 0   scale 0.368479 }
 
 # ==============================  LIGHTING  ====================================
 # TWO lights now that the roof is gone (the xenon short-arc lamp that used to hang here was
