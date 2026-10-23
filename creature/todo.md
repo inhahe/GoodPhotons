@@ -58,6 +58,9 @@ P12 sound                   (offline + event-driven, downstream of everything �
 P13 animator handoff        (a fitted rig with no network in it + motion baked to
                              editable curves; its proof needs nothing above, the
                              real thing needs P5's captures, P7's skin, P9's face)
+P14 inverse creature        (anatomy + controller + intent from any footage, trained
+                             on our own synthetic data; its identifiability study
+                             needs nothing above, the rest follows P5, P3 and P10)
 ```
 
 **P10's design cannot wait for its slot.** Every control channel you want at the end — morph vector,
@@ -896,6 +899,10 @@ anything expensive**, even though it's built later.
 | 3 | "look at that while you keep trotting", "favour the left fore" | part-specific goals |
 | 4 | "plant the left forefoot **here** at t=1.2 s" | shot-specific hard constraint |
 
+- [ ] **Above level 0: a learned stimulus → intent layer (P14)** *(added 2026-10-22)*. It writes
+      this table's level 0–1 vocabulary, never excitations, so an animator can read what the animal
+      "wants" and override it. That gives the vocabulary two writers — the animator and P14's model
+      — and makes it an interface to design before P2 trains, by the principle above.
 - [ ] **Level 1 — the knobs.** design.md already guessed at these ("menace is probably a knob, not a
       layer"); this is where that gets cashed out. Randomise them during P2/P3 training.
       - **Establish which kind of grounding each knob needs before building it** — see design.md
@@ -1638,6 +1645,128 @@ Work, in order — the first item needs nothing from any other phase:
 
 **Explicitly not:** a neural deformer (it is what this phase exists to avoid); reimplementing Dem
 Bones / SSDR (it exists and is BSD-3: wrap it); hand-painted weights in the source (see above).
+
+---
+
+## P14 — Inverse creature: anatomy, controller and intent from any footage, trained on our own synthetic data  `[ ]`
+*(added 2026-10-22 — asked for explicitly. The proposal, condensed: simulate and render complete
+animals — bones, cartilage, sinews, muscles, skin, fur, nails, teeth, eyes — moving purely from
+muscle excitations; generate a large synthetic video corpus from them; train a model that turns
+footage of any creature into (a) an explicit anatomical definition and (b) a learned account of how
+it drives its muscles in response to stimuli; and tie actions to intentions, so animators direct the
+animal by what it wants.)*
+
+**What it adds to P5.** P5 fits one animal by optimisation from four calibrated views, and its
+initialisation is already nearly free (triangulated segment lengths), so a trained network adds
+little there. Its value is in three places P5 does not reach:
+1. **Monocular, in-the-wild footage of any animal of a body plan** — zoo, wildlife, phone video.
+   This is the "separate, later ambition" of P5 §Monocular. What such footage never carries is
+   ground truth, and synthetic data supplies it.
+2. **Parameters only dynamics can see** — mass distribution, muscle strength, tendon stiffness —
+   which P5 deliberately leaves to a bathroom scale and the rig's density model.
+3. **The controller half** — a style code for the shared controller, see below.
+
+The two data sources complement each other: P5's sessions give *real* paired (video, 3D motion)
+data, this phase gives *synthetic* pairs with the internals labelled too. Train on both.
+
+**Why it is plausible.** The labels are perfect and free, because we own both the musculoskeletal
+simulator and a physically based renderer, which few groups do. Training perception on synthetic data
+alone has worked before: faces (Wood et al. 2021, "Fake It Till You Make It") and zebra shape (Zuffi
+et al. 2019, "Three-D Safari", trained on images of a SMAL model).
+
+**Four corrections to the proposal as first stated, decided now:**
+- **Do not render the training corpus at final quality.** 10⁵ clips × 300 frames × 4 views is
+  ~10⁸ frames: at one second a frame that is ~3 GPU-years, and a furred ftrace frame takes about a
+  minute. Real footage reaches the network through P5's front-end anyway — keypoints, silhouettes,
+  depth, optical flow — and the simulator emits those for almost nothing. So motion and anatomy
+  train on simulated *features*, which also shrinks the sim-to-real gap, since both sides arrive in
+  the same form. Appearance (fur, skin, eyes) is fitted separately from far fewer renders, the way
+  P7's groom already plans (analysis-by-synthesis, `notes/capture.md`).
+- **Estimate what is identifiable, take the rest from priors, and say which is which.** Video sees
+  the surface. Muscle redundancy — co-contraction moves nothing — makes activations unrecoverable
+  from video in principle: infer them, never claim them. Cartilage, sinews, nail structure and
+  tooth roots barely touch the image. The species template, scaled by allometry and built from
+  veterinary atlases and CT, supplies them. Every output parameter carries a flag, *measured* or
+  *prior*: "the most plausible complete animal consistent with this footage" is the honest claim.
+- **The network does not output a network.** Its output is the morph vector plus a style code for
+  the shared morph-conditioned controller (P4, and P10 level 2's ASE latent), followed by a
+  per-animal RL fine-tune that imitates the reconstructed motion — SFV's recipe. Generating a
+  controller's weights directly is harder and buys nothing.
+- **Every fit ends with analysis-by-synthesis against the real footage.** The network's answer is
+  only θ₀: the last step simulates the fitted animal, scores it with P5's objective, and refines.
+  That step is what catches the cases where the sim-to-real gap fooled the network.
+
+**The bootstrap.** Random excitations produce flailing, not behaviour, so the synthetic corpus can
+only contain what existing controllers do, and the inverse model cannot recognise behaviour outside
+it. The loop: P2's mocap-trained controllers → fit real captures → add the fitted bodies and
+behaviours to the generator → regenerate and retrain. Morph randomisation spreads the anatomy side,
+within one body plan (design.md §Morphology) — quadruped mammals first.
+
+**Intentions.** design.md §"How a knob acquires meaning" already splits this in two:
+- *Goal* intents — flee, approach, go there — need no labels. They are measured outcomes, handled
+  by P10's level-0 planner.
+- *How a species expresses* an intent — the crouched, ears-back approach — is grounded by examples.
+  Capture can make the examples cheap:
+  - **Designed sessions with controlled, logged stimuli** — a food bowl placed, a knock at the door,
+    a stranger walking in. The stimulus is the label; nobody has to judge intent from footage.
+  - **Unsupervised behaviour segmentation first** (MoSeq, B-SOiD): find the recurring motifs, then
+    have a person name the clusters, which costs far less than labelling raw footage.
+  - **Ethograms as the vocabulary**: ethologists' standard behaviour catalogues per species, the
+    FACS of behaviour.
+- **Learning stimulus → response needs the stimuli recorded**: where people, objects and food were,
+  what sounded (P12 already records audio from day one), where the animal looked. Hidden state —
+  hunger, fatigue, mood — is a latent to infer, and open research; design.md §State's slow-variable
+  vector is where it lands.
+- **P10's label confound bites harder here**: if every fearful clip is also fast, fear becomes a
+  second speed knob. Controlled stimuli allow deliberate counter-examples ("scared, but staying put").
+
+**The architectural decision: an explicit intent layer is the bottleneck.**
+
+```
+stimuli ──(learned)──► intent + affect, in P10's vocabulary ──(learned)──► excitations ──► physics
+                          ▲
+                          the animator reads and overrides here
+```
+
+The learned perception model never drives muscles directly. Left undirected, the animal reacts on
+its own — flinches at the knock, goes to the bowl; directed, the animator's intent replaces the
+learned one, and everything below stays physical. This keeps learned behaviour legible to people
+and overridable by them — design.md §Directability applied to behaviour. It constrains P10 *now*:
+the level 0–1 vocabulary becomes an interface with two writers, so it must exist as conditioning
+inputs from the start (P10's governing principle).
+
+Work, in order:
+
+- [ ] **Identifiability study on simulated data — FIRST.** Extend `tools/fit_selftest.py` from pose
+      to *anatomy and dynamics*: random morphs from canis's morph space, motion from today's
+      controller, observed only as keypoints and silhouettes through `creaturelab/camera.py`'s
+      four-camera model — and through one camera, for the monocular case. Recover θ with P5's fit
+      and with a small regression network; report the error per parameter. Today's body is
+      torque-driven, so the dynamics half covers mass distribution and joint strength; muscle and
+      tendon parameters join when P3 lands. **Bar:** a table saying which parameters footage
+      determines, which only dynamics determines, and which nothing determines — and therefore
+      which parts of the full-anatomy simulation are worth building for this phase at all.
+- [ ] **Synthetic feature corpus generator.** Randomise morph × controller × command × camera ×
+      occlusion; emit keypoints, silhouettes, depth and flow, plus every label (θ, excitations,
+      contacts, command / intent). Budget it before building it (design.md's cost-model rule).
+- [ ] **Amortised inverse network** — features → θ with uncertainty, plus a style code; multi-view
+      first, then monocular; always followed by the analysis-by-synthesis refinement.
+- [ ] **Appearance inverse** — fur, skin and eye parameters from a few renders or photos; shares
+      P7's groom fit rather than duplicating it.
+- [ ] **Stimulus-logged capture protocol**, in `notes/capture.md`: what to log, which stimuli, and
+      counter-example sessions against the label confound.
+- [ ] **Behaviour discovery** — motif segmentation over P5's footage, clusters named against the
+      species' ethogram.
+- [ ] **Stimulus → intent model**, writing P10's level 0–1 channels, with the directed/undirected
+      switch exposed to the animator.
+- [ ] **Bar:** single-camera footage of an animal the system has never seen, shot by someone else →
+      a creature that moves recognisably like it, every parameter marked measured or prior, that an
+      animator can direct by intent, and that, left alone, reacts to a logged stimulus the way the
+      real animal did.
+
+**Explicitly not:** simulating internals the identifiability table shows are invisible, beyond what
+the template carries anyway; a network that outputs a network; claiming recovered muscle
+activations as measurements; inference across body plans before one plan works.
 
 ---
 

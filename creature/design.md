@@ -25,6 +25,8 @@ Most components already exist and should not be reinvented:
 | morphology-conditioned policies | MetaMorph; Shared Modular Policies |
 | fur / soft tissue | Marschner–d'Eon–Yan fiber BSDFs; Ziva; Weta Tissue |
 | conventional rigs fitted from scans (no network at playback) | SMPL, SMAL, FLAME; Dem Bones (SSDR) — todo.md P13 |
+| perception trained on synthetic data alone | Wood et al. 2021 (faces); Zuffi et al. 2019 (zebras, from SMAL) — todo.md P14 |
+| unsupervised behaviour segmentation | MoSeq; B-SOiD — todo.md P14 |
 
 Three links are genuinely thin, and they are where effort should go:
 
