@@ -2585,8 +2585,11 @@ static int checkContainer(long long rays) {
     return bad == 0 ? 0 : 1;
 }
 
-// The physical lens traced forward (camera.h lensConnect / lensCatch / lensPdfDir), on a
-// 50 mm f/2.8 achromat. Three claims, each one a render could only show as noise:
+// The physical lens traced forward (camera.h lensEntry / lensCatch / lensPdfDir), on two
+// 50 mm lenses: an f/2.8 achromat, whose rear surface is its planar stop, and an f/4 singlet,
+// whose rear surface is curved (genLensRay samples a planar rear's disk but a curved rear's
+// clear cap, and lensPdfDir must follow it). Each claim is one a render could only show as
+// noise:
 //   (1) lensPdfDir is a DENSITY of genLensRay's rays: integrated over front-element area and
 //       exit direction it must equal the share of genLensRay samples the lens does not
 //       vignette. lensPdfDir returns p * A_front, so with y uniform on the element (1/A)
@@ -2596,10 +2599,11 @@ static int checkContainer(long long rays) {
 //   (3) the next-event connection and the brute-force catch measure the same thing: for a
 //       point source, the solid angle of rays that reach the sensor (lensConnect's weight
 //       times the cell area, averaged; the catch's hit share times the cone's solid angle),
-//       and where they land.
-static bool checkLensPhysical() {
+//       and where they land -- for a point 2 m out and for one 5 km out, which only works if
+//       the entry is solved from near the glass rather than from the scene point.
+static bool checkLensPhysicalOne(const char* preset, double fstop) {
     LensSystem L;
-    if (!resolveLensPreset("achromat", 50.0, 2.8, L)) { std::printf("[checklens] no achromat\n"); return false; }
+    if (!resolveLensPreset(preset, 50.0, fstop, L)) { std::printf("[checklens] no %s\n", preset); return false; }
     L.focusAt(2.4);
     Camera cam;
     cam.lookAt({0, 0, 0}, {0, 0, 1}, {0, 1, 0}, 40.0, 64, 43);
@@ -2619,13 +2623,13 @@ static bool checkLensPhysical() {
     }
     const double pValid = (double)ok / nCam;
     // ... and the integral of the density, directions drawn in a 40 deg cone about the axis
-    // (the 50 mm lens sees under 25 deg off axis at its corners).
+    // (a 50 mm lens sees under 25 deg off axis at its corners).
     const double cosC = std::cos(40.0 * PI / 180.0), W = 2.0 * PI * (1.0 - cosC);
     const int nInt = 4000000;
     double acc = 0.0, acc2 = 0.0;
     for (int k = 0; k < nInt; ++k) {
         Vec3 n;
-        const Vec3 yl = L.sampleFront(rng.uniform(), rng.uniform(), n);
+        const Vec3 yl = L.sampleSurface(0, rng.uniform(), rng.uniform(), n);
         const double cz = 1.0 - rng.uniform() * (1.0 - cosC), ph = 2.0 * PI * rng.uniform();
         const double sz = std::sqrt(std::max(0.0, 1.0 - cz * cz));
         const Vec3 dl(sz * std::cos(ph), sz * std::sin(ph), cz);
@@ -2637,49 +2641,57 @@ static bool checkLensPhysical() {
     const double se = std::sqrt(std::max(0.0, acc2 / nInt - integ * integ) / nInt);
     const double seCam = std::sqrt(pValid * (1.0 - pValid) / nCam);
     const double z1 = std::fabs(integ - pValid) / std::sqrt(se * se + seCam * seCam);
-    std::printf("[checklens] physical: integral of lensPdfDir %.5f +- %.5f vs unvignetted share %.5f "
-                "+- %.5f (%.1f sigma)\n", integ, se, pValid, seCam, z1);
-    std::printf("[checklens] physical: %lld of %lld camera rays read back with zero density\n",
-                zeroBack, ok);
-    // (3) a point 2 m out and off axis: connection vs catch.
-    const Vec3 X = cam.w * 2.0 + cam.u * 0.3 + cam.v * (-0.2);
-    const int nConn = 400000;
-    double sumConn = 0.0, cxC = 0.0, cyC = 0.0;
-    const double aCell = 1.0 / cam.lensCellNorm();
-    for (int k = 0; k < nConn; ++k) {
-        Vec3 Y, wd; double dist, wgt; int px, py;
-        if (!cam.lensConnect(X, lambda, rng.uniform(), rng.uniform(), Y, wd, dist, px, py, wgt)) continue;
-        sumConn += wgt * aCell; cxC += wgt * aCell * px; cyC += wgt * aCell * py;
+    std::printf("[checklens] %s: integral of lensPdfDir %.5f +- %.5f vs unvignetted share %.5f "
+                "+- %.5f (%.1f sigma)\n", preset, integ, se, pValid, seCam, z1);
+    std::printf("[checklens] %s: %lld of %lld camera rays read back with zero density\n",
+                preset, zeroBack, ok);
+    bool pass = ok > 0 && z1 < 4.0 && zeroBack == 0;
+    // (3) a point source off axis, near and far: connection vs catch.
+    for (const double range : {2.0, 5000.0}) {
+        const Vec3 X = cam.w * range + cam.u * (0.15 * range) + cam.v * (-0.1 * range);
+        const int nConn = 400000;
+        double sumConn = 0.0, cxC = 0.0, cyC = 0.0;
+        const double aCell = 1.0 / cam.lensCellNorm();
+        for (int k = 0; k < nConn; ++k) {
+            Vec3 Y, wd; double dist, wgt; int px, py;
+            if (!cam.lensConnect(X, lambda, rng.uniform(), rng.uniform(), Y, wd, dist, px, py, wgt)) continue;
+            sumConn += wgt * aCell; cxC += wgt * aCell * px; cyC += wgt * aCell * py;
+        }
+        const double omegaConn = sumConn / nConn;
+        // Catch: directions uniform in a cone about X -> eye wide enough to cover the element.
+        const Vec3 toEye = normalize(cam.eye - X);
+        const double halfAng = std::atan(2.0 * L.capRadius(0) * 1e-3 / length(cam.eye - X));
+        const double oneMinusCosK = 2.0 * std::sin(0.5 * halfAng) * std::sin(0.5 * halfAng);
+        const double WK = 2.0 * PI * oneMinusCosK;
+        Vec3 t1 = normalize(cross(toEye, std::fabs(toEye.x) < 0.9 ? Vec3(1, 0, 0) : Vec3(0, 1, 0)));
+        Vec3 t2 = cross(toEye, t1);
+        const int nCatch = 4000000;
+        long long caught = 0; double cxK = 0.0, cyK = 0.0;
+        for (int k = 0; k < nCatch; ++k) {
+            const double om = rng.uniform() * oneMinusCosK, ph = 2.0 * PI * rng.uniform();
+            const double cz = 1.0 - om, sz = std::sqrt(std::max(0.0, om * (2.0 - om)));
+            const Vec3 d = toEye * cz + t1 * (sz * std::cos(ph)) + t2 * (sz * std::sin(ph));
+            int px, py;
+            if (cam.lensCatch(Ray{X, d}, 1e30, lambda, px, py) != Camera::LENS_CAUGHT) continue;
+            ++caught; cxK += px; cyK += py;
+        }
+        const double pK = (double)caught / nCatch;
+        const double omegaCatch = pK * WK, seK = std::sqrt(pK * (1.0 - pK) / nCatch) * WK;
+        const double z3 = std::fabs(omegaConn - omegaCatch) / std::max(seK, 1e-300);
+        const double mx1 = sumConn > 0 ? cxC / sumConn : -1, my1 = sumConn > 0 ? cyC / sumConn : -1;
+        const double mx2 = caught ? cxK / caught : -2, my2 = caught ? cyK / caught : -2;
+        std::printf("[checklens] %s: point source at %g m, solid angle reaching the sensor: connect "
+                    "%.4e, catch %.4e +- %.1e (%.1f sigma); image at (%.2f,%.2f) vs (%.2f,%.2f)\n",
+                    preset, range, omegaConn, omegaCatch, seK, z3, mx1, my1, mx2, my2);
+        pass = pass && caught > 1000 && z3 < 4.0 && std::fabs(mx1 - mx2) < 0.5 && std::fabs(my1 - my2) < 0.5;
     }
-    const double omegaConn = sumConn / nConn;
-    // Catch: directions uniform in a cone about X -> eye wide enough to cover the element.
-    const Vec3 toEye = normalize(cam.eye - X);
-    const double halfAng = std::atan(2.0 * L.surf[0].aperture * 1e-3 / length(cam.eye - X));
-    const double cosK = std::cos(halfAng), WK = 2.0 * PI * (1.0 - cosK);
-    Vec3 t1 = normalize(cross(toEye, std::fabs(toEye.x) < 0.9 ? Vec3(1, 0, 0) : Vec3(0, 1, 0)));
-    Vec3 t2 = cross(toEye, t1);
-    const int nCatch = 4000000;
-    long long caught = 0; double cxK = 0.0, cyK = 0.0;
-    for (int k = 0; k < nCatch; ++k) {
-        const double cz = 1.0 - rng.uniform() * (1.0 - cosK), ph = 2.0 * PI * rng.uniform();
-        const double sz = std::sqrt(std::max(0.0, 1.0 - cz * cz));
-        const Vec3 d = toEye * cz + t1 * (sz * std::cos(ph)) + t2 * (sz * std::sin(ph));
-        int px, py;
-        if (!cam.lensCatch(Ray{X, d}, 1e30, lambda, px, py)) continue;
-        ++caught; cxK += px; cyK += py;
-    }
-    const double pK = (double)caught / nCatch;
-    const double omegaCatch = pK * WK, seK = std::sqrt(pK * (1.0 - pK) / nCatch) * WK;
-    const double z3 = std::fabs(omegaConn - omegaCatch) / std::max(seK, 1e-30);
-    const double mx1 = sumConn > 0 ? cxC / sumConn : -1, my1 = sumConn > 0 ? cyC / sumConn : -1;
-    const double mx2 = caught ? cxK / caught : -2, my2 = caught ? cyK / caught : -2;
-    std::printf("[checklens] physical: point source, solid angle reaching the sensor: connect %.4e, "
-                "catch %.4e +- %.1e (%.1f sigma); image at (%.2f,%.2f) vs (%.2f,%.2f)\n",
-                omegaConn, omegaCatch, seK, z3, mx1, my1, mx2, my2);
-    const bool pass = ok > 0 && z1 < 4.0 && zeroBack == 0 && caught > 1000 && z3 < 4.0 &&
-                      std::fabs(mx1 - mx2) < 0.5 && std::fabs(my1 - my2) < 0.5;
-    std::printf("[checklens] physical lens %s\n", pass ? "PASS" : "FAIL");
+    std::printf("[checklens] %s %s\n", preset, pass ? "PASS" : "FAIL");
     return pass;
+}
+static bool checkLensPhysical() {
+    const bool a = checkLensPhysicalOne("achromat", 2.8);
+    const bool b = checkLensPhysicalOne("singlet", 4.0);
+    return a && b;
 }
 
 // Deterministic thin-lens (mode C) self-test. Forward catch is far too photon-
@@ -14088,9 +14100,98 @@ static void thinFilmSwatch(double n1, double n2) {
 // view of the solar disc — like the sky behind the geometry — is a pure camera-ray
 // term. `sunXYZForDir` returns 0 outside every sun's cone, so this costs nothing
 // for a scene without one.
+// The same pass through a PHYSICAL lens. A pinhole sees one sky direction per pixel; a lens
+// sees the sky over its pupil -- blurred where it is out of focus, darkened toward the corners,
+// dispersed by the glass -- and at the lens image's irradiance scale (genLensRay's weight),
+// which is what the forward lens splat deposits for everything else. So each pixel averages
+// camera rays over its area, the pupil and the visible band, each MONOCHROMATIC since the
+// glass bends every wavelength its own way:
+//   (1/K) sum_k cie(lambda_k) * L_sky(d_k, lambda_k) * wLens_k * (830 - 360).
+// That is mode R's estimator, with mode R's variance per sample, so a fixed handful of samples
+// would leave a grainy sky over a converged scene. The count grows with the render instead:
+// K = photons per pixel / 4, between 64 and 4096, added to a running sum each time a write
+// asks for more (the wavelengths follow a per-pixel van der Corput sequence, so they stay
+// stratified at any K). The sums are kept for the last camera that asked, since a render adds
+// the sky to every interval write.
+static void addEnvBackgroundLens(Film& film, const Scene& scene, const Camera& cam, long long N) {
+    constexpr double kLo = 360.0, kHi = 830.0;
+    struct Cache {
+        const LensSystem* lens = nullptr;
+        Vec3 eye, w, u;
+        int rx = 0, ry = 0;
+        long long K = 0;                 // samples per pixel in `sum`
+        std::vector<Vec3> sum;
+    };
+    static std::mutex mtx;
+    static Cache cache;
+    std::lock_guard<std::mutex> lock(mtx);
+    const int rx = film.resX, ry = film.resY;
+    const bool same = cache.lens == cam.lens.get() && cache.rx == rx && cache.ry == ry &&
+                      cache.eye.x == cam.eye.x && cache.eye.y == cam.eye.y && cache.eye.z == cam.eye.z &&
+                      cache.w.x == cam.w.x && cache.w.y == cam.w.y && cache.w.z == cam.w.z &&
+                      cache.u.x == cam.u.x && cache.u.y == cam.u.y && cache.u.z == cam.u.z;
+    if (!same) {
+        cache.lens = cam.lens.get(); cache.rx = rx; cache.ry = ry;
+        cache.eye = cam.eye; cache.w = cam.w; cache.u = cam.u;
+        cache.K = 0;
+        cache.sum.assign((size_t)rx * (size_t)ry, Vec3{0, 0, 0});
+    }
+    const double perPixel = (double)N / ((double)rx * (double)ry);
+    const long long want = std::max(64LL, std::min(4096LL, (long long)(perPixel / 4.0)));
+    if (cache.K < want) {
+        const long long k0 = cache.K, k1 = want;
+        const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
+        std::vector<Vec3> add((size_t)rx * (size_t)ry, Vec3{0, 0, 0});
+        const bool done = ft::parallelFor((size_t)ry, 1, [&](size_t py) {
+            for (int px = 0; px < rx; ++px) {
+                const uint64_t pix = (uint64_t)py * (uint64_t)rx + (uint64_t)px;
+                Pcg32 rot;
+                seedUnit(rot, pix, 0x5EC7A11E5C0FFEEULL);
+                const double off = rot.uniform();
+                Pcg32 rng;
+                seedUnit(rng, pix, 0xB6C0FFEEULL ^ ((uint64_t)k0 * 0x9E3779B97F4A7C15ULL));
+                Vec3 acc{0, 0, 0};
+                for (long long k = k0; k < k1; ++k) {
+                    double u = off;              // van der Corput in base 2, rotated per pixel
+                    for (double f = 0.5, kk = (double)k; kk >= 1.0; f *= 0.5) {
+                        const double bit = std::fmod(kk, 2.0);
+                        u += f * bit; kk = std::floor(kk / 2.0);
+                    }
+                    u -= std::floor(u);
+                    const double lambda = kLo + (kHi - kLo) * u;
+                    Ray r; double wLens = 0.0;
+                    if (!cam.genLensRay(px, (int)py, rng.uniform(), rng.uniform(), rng.uniform(),
+                                        rng.uniform(), lambda, r, wLens) || !(wLens > 0.0)) continue;
+                    const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false,
+                                                   /*skipCamHidden=*/true);
+                    if (h.valid) continue;
+                    double L = 0.0;
+                    if (haveEnv) L += scene.envRadiance(r.d, lambda);
+                    if (haveSun) L += scene.sunRadiance(r.d, lambda);
+                    if (!(L > 0.0)) continue;
+                    acc += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens * (kHi - kLo));
+                }
+                add[pix] = acc;
+            }
+        });
+        if (done) {                       // a stop part-way leaves the sums as they were
+            for (size_t i = 0; i < add.size(); ++i) cache.sum[i] += add[i];
+            cache.K = k1;
+        }
+    }
+    if (cache.K <= 0) return;
+    const double scale = (double)N / (double)cache.K;
+    for (int py = 0; py < ry; ++py)
+        for (int px = 0; px < rx; ++px) {
+            const Vec3& b = cache.sum[(size_t)py * rx + px];
+            if (b.x != 0.0 || b.y != 0.0 || b.z != 0.0) film.add(px, py, b * scale);
+        }
+}
+
 static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, long long N) {
     const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
     if (!haveEnv && !haveSun) return;
+    if (cam.hasLens()) { addEnvBackgroundLens(film, scene, cam, N); return; }
     for (int py = 0; py < film.resY; ++py)
         for (int px = 0; px < film.resX; ++px) {
             Ray r = cam.genRay(px, py, 0.5, 0.5);
@@ -16233,26 +16334,36 @@ static char lensRoutedMode(const Scene& scene, char mode) {
     return 'R';
 }
 
+// The mode a scene's camera renders in, before lens routing. The run loop and the
+// prefer{}/else{} predicate both ask this, so they cannot disagree. A CLI -mode (`cliMode`,
+// 0 = none) forces every camera; else the camera's own `mode`; else the scene's
+// `default_mode`; else the global `mode`, which a `render { mode }` block sets and which
+// otherwise trails the first camera's. A physical-lens camera that no authored mode reaches
+// (no CLI mode, no camera mode, no default_mode, no `render { mode }`) renders in R: the
+// forward modes image through a lens too, but not a mirror or glass seen directly through it,
+// so for a lens camera they are a choice to make, not a default to fall into.
+static char sceneCameraMode(const ftsl::Loaded& L, char camMode, bool lens, char cliMode) {
+    if (cliMode) return cliMode;
+    if (camMode) return camMode;
+    if (lens && !L.modeSet && !L.defaultMode) return 'R';
+    if (L.defaultMode) return L.defaultMode;
+    return L.mode ? L.mode : 'B';
+}
+
 // `prefer{}/else{}` predicate handed to ftsl::load: a branch is renderable iff EVERY
 // camera it declares can render the scene in the mode it will render in -- its effective mode,
 // routed for a physical lens as the run loop routes it. `cliMode` (0 = none) is a `-mode`
 // override that forces the mode for all cameras.
 static const char* sceneModeUnsupported(const ftsl::Loaded& L, char cliMode) {
-    auto effOf = [&](char camMode) -> char {
-        if (cliMode) return cliMode;
-        if (camMode) return camMode;
-        return L.mode ? L.mode : 'B';
-    };
     if (!L.cameras.empty()) {
         for (const auto& cs : L.cameras) {
-            // An unauthored physical-lens camera renders in R (the run loop's effModeCam).
-            const bool authored = cliMode || cs.mode || L.modeSet || L.defaultMode;
-            const char m = cs.lens ? lensRoutedMode(L.scene, authored ? effOf(cs.mode) : 'R')
-                                   : effOf(cs.mode);
+            const char e = sceneCameraMode(L, cs.mode, cs.lens != nullptr, cliMode);
+            const char m = cs.lens ? lensRoutedMode(L.scene, e) : e;
             if (const char* r = modeFeatureUnsupported(L.scene, m, cs.projection)) return r;
         }
     } else {
-        if (const char* r = modeFeatureUnsupported(L.scene, effOf(0), CAM_RECTILINEAR))
+        if (const char* r = modeFeatureUnsupported(L.scene, sceneCameraMode(L, 0, false, cliMode),
+                                                   CAM_RECTILINEAR))
             return r;
     }
     return nullptr;
@@ -17376,11 +17487,6 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                   "oversized multilayer/mix)";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
-            } else if (!cudaLensFits(cam)) {
-                // Uploaded without its glass, the camera would image as a pinhole.
-                const char* why = "a physical lens with more surfaces than the device holds";
-                if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
-                else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
                 useGpu = true;
                 std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu",
@@ -17423,10 +17529,6 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     "[device] GPU can't accelerate this render: %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             }
-        } else if (cam.hasLens() && !cudaLensFits(cam)) {
-            const char* why = "a physical lens with more surfaces than the device holds";
-            if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
-            else         std::printf("[device] auto -> CPU (%s)\n", why);
         } else if (!cudaForwardSupported(scene)) {
             const char* why = "GPU-unsupported feature (layered material, indexed "
                               "palette, parametric record, oversized multilayer/mix "
@@ -22146,14 +22248,10 @@ static int run(int argc, char** argv) {
         if (modeFromCli) return mode;         // CLI -mode forces every camera
         return camMode ? camMode : mode;      // else per-camera, else the global default
     };
-    // A physical-lens camera nobody chose a mode for renders in R, as it always has. The
-    // forward modes image through a lens too, but not a mirror or glass seen directly through
-    // it, so for a lens camera they are a choice to make (-mode, the camera's `mode`, or the
-    // scene's), not a default to fall into.
+    // A scene camera's mode (sceneCameraMode, shared with the prefer{}/else{} predicate).
     const bool modeAuthored = modeFromCli || ftslScene.modeSet || ftslScene.defaultMode;
     auto effModeCam = [&](const ftsl::CamSpec& cs) -> char {
-        if (cs.lens && !cs.mode && !modeAuthored) return 'R';
-        return effMode(cs.mode);
+        return sceneCameraMode(ftslScene, cs.mode, cs.lens != nullptr, modeFromCli ? mode : 0);
     };
     struct RenderCam { std::string name; Camera cam; char mode; int res; int resY; double exposure; int expGroup;
                        Vec3 lookAt{0,0,0}; Vec3 up{0,1,0}; double fovY = 40.0;   // lookAt/up/fovY: for the interactive raster viewer
@@ -25785,11 +25883,7 @@ static int run(int argc, char** argv) {
     {
         const bool wantGpu  = !std::strcmp(device, "gpu");
         const bool wantAuto = !std::strcmp(device, "auto");
-        // A physical lens deeper than the device holds is uploaded without its glass, so its
-        // camera would image as a pinhole: such a set stays on the CPU.
-        bool lensesFit = true;
-        for (const RenderCam& rc : toRender) if (!cudaLensFits(rc.cam)) lensesFit = false;
-        if ((wantGpu || wantAuto) && cudaAvailable() && cudaForwardSupported(scene) && lensesFit)
+        if ((wantGpu || wantAuto) && cudaAvailable() && cudaForwardSupported(scene))
             useGpuForward = true;   // -beams per-camera resample is supported on the GPU too
     }
 #endif

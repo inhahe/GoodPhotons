@@ -6428,27 +6428,38 @@ as the one at fault.
   difference in it (the loader reports it) rather than design a NaN camera.
   - **The physical lens in both directions (0.394.0).** `genLensRay` is the camera's own
     direction, film -> glass -> scene (modes R, D, J). Light tracing needs the reverse, and
-    three functions provide it, after Hanika & Dachsbacher 2014: `lensConnect` samples a point
+    three functions provide it, after Hanika & Dachsbacher 2014. `lensEntry` samples a point
     uniformly by area on the FRONT element's clear cap (the one sampling that covers every ray
-    able to enter the lens, from any direction), traces the ray from the scene point through
-    every element onto the sensor, and weights it `cosY * A_front / (dist^2 * A_cell)`, the
-    flux through the lens over the cell's area -- the irradiance the backward camera's
-    `cos^4 A/Z^2` measures, so forward and backward share one absolute scale. `lensCatch` is
-    mode C's physical version. `lensPdfDir` is the density with which the camera subpath would
-    have made a given exit ray, times A_front: genLensRay's film x rear-disc density turned into
-    front-element x exit-direction terms by etendue conservation. BDPT stores it as the camera
+    able to enter the lens, from any direction) and solves the entry from a start rebased to
+    just in front of the glass (from a scene point kilometres out, the sphere solve would
+    cancel most of its digits); `lensEntryImage` traces it through every element onto the
+    sensor at one wavelength and weights it `cosY * A_front / (dist^2 * A_cell)`, the flux
+    through the lens over the cell's area -- the irradiance the backward camera's weight
+    measures, so forward and backward share one absolute scale. `lensConnect` is the two at
+    once. `lensCatch` is mode C's physical version, three-way (missed: flies on; caught;
+    absorbed by the glass), the same for every wavelength of a hero bundle. `lensPdfDir` is
+    the density with which the camera subpath would have made a given exit ray, times
+    A_front: genLensRay's film x rear-element density turned into front-element x
+    exit-direction terms by etendue conservation. genLensRay samples a planar rear element's
+    disk but a CURVED rear element's clear cap, uniformly by area, since a disk misses the
+    rays that cross a curved cap outside its shadow, and lensPdfDir follows both cases. BDPT stores it as the camera
     vertex's direction pdf, which makes the ordinary per-vertex MIS ratio come out right
     although the light image (t=1) and the camera subpath give the exit point different
     densities; the camera vertex is no longer delta. Users: the forward splats of modes A/B
     (`Renderer::connectLensPhysical` and its hero / volume twins, routed by `lensCam`, so a
     lens camera in mode B images through its glass), mode C's catch, and BDPT's t=1 branch.
-    Device twins in `render_cuda.cu` (`dLensConnect` / `dLensCatch` / `dLensPdfDir`) run in
-    double: in the lens's millimetre frame a scene point metres away is beyond float's
-    resolution; the interface primitives are templates over the vector type, so the camera
-    direction's float arithmetic is unchanged. `-checklens` pins the three: the density
-    integrates to the unvignetted share of genLensRay's samples, every camera ray reads back
-    with a nonzero density, and the connection and the catch agree on a point source's flux
-    and image position. A lens camera with no authored mode still renders in R. Modes M, S
+    Device twins in `render_cuda.cu` (`dLensEntry` / `dLensEntryImage` / `dLensCatch` /
+    `dLensPdfDir`) run in double (`D3`); the interface primitives are templates over the vector
+    type, DVec3 for the camera and D3 for light. The device lens lives in device memory
+    (`DLensSystem::surf` / `iorAll`, uploaded by bakeCamera), so a prescription has no surface
+    limit. The forward modes' directly seen sky goes through the lens too
+    (`addEnvBackgroundLens`): monochromatic camera rays averaged per pixel, their count growing
+    with photons per pixel, kept in a running sum for the last camera. `-checklens` pins it all
+    on a planar-rear achromat and a curved-rear singlet: the density integrates to the
+    unvignetted share of genLensRay's samples, every camera ray reads back with a nonzero
+    density, and the connection and the catch agree on a point source's flux and image position
+    at 2 m and at 5 km. A lens camera nobody chose a mode for renders in R (`sceneCameraMode`,
+    shared by the run and the prefer{}/else{} predicate). Modes M, S
     and U keep routing a lens camera to R: their gathers and merges sum photons of every
     wavelength at the point one camera ray found, which a dispersive lens moves per wavelength,
     so they would average its colour fringes away; wavelength-matched gathering would fix it at

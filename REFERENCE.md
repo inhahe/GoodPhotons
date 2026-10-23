@@ -1954,13 +1954,16 @@ lens when you want a specific real objective's look.
 *Current limits:* a forward splat cannot image a mirror or glass seen directly through
 the lens (as with the thin lens, those pixels need `R`, `D` or `P`), and the analytic mirror
 and glass-sphere connections of mode `B` are pinhole-only, so they are skipped for a
-physical lens. The light entering the lens is sampled uniformly over the front element:
-exact for any lens, but a prescription whose front element is much larger than its
+physical lens. The directly seen sky and sun are imaged through the lens in `A` and `B`
+too, by camera rays averaged over each pixel, the pupil and the visible band; their count
+grows with the photon budget (a quarter of the photons per pixel, 64 to 4096), so the sky
+converges with the render. The light entering the lens is sampled uniformly over the front
+element: exact for any lens, but a prescription whose front element is much larger than its
 aperture stop wastes most of those samples. It maps the sensor across the film width, so a
 film whose aspect matches the sensor (e.g. `res 360 240` for a 3:2 sensor) covers it
 without cropping, while a mismatched aspect crops. It does not model inter-element
 flare/ghosting or shaped-iris bokeh. On the GPU it inherits its mode's scope (no
-env/collimated lights or fluorescence, and at most 16 lens surfaces); outside that scope it falls
+env/collimated lights or fluorescence; any number of lens surfaces); outside that scope it falls
 back to the CPU automatically.
 
 ---

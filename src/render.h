@@ -1351,9 +1351,11 @@ struct Renderer {
                              double lambda, double beta, double rho, Pcg32& rng,
                              const HairShade* hs, const Vec3* plane) const {
         const double u1 = rng.uniform(), u2 = rng.uniform();
-        Vec3 Y, wdir; double dist, wgt; int px, py;
-        if (!cam.lensConnect(p, lambda, u1, u2, Y, wdir, dist, px, py, wgt)) return;
-        if (plane && dot(*plane, Y - p) <= 0.0) return;
+        Camera::LensEntry le;
+        if (!cam.lensEntry(p, u1, u2, le)) return;
+        // The tests that need only the entry come before the trace through the glass.
+        if (plane && dot(*plane, le.Y - p) <= 0.0) return;
+        const Vec3& wdir = le.wdir;
         const double cosSurf = dot(n, wdir);
         double stG = 1.0;                                   // see connectLens
         if (!hs) {
@@ -1362,48 +1364,51 @@ struct Renderer {
             if (stG <= 0.0) return;
         }
         const double off = hs ? hairExitOffset(*hs, n, wdir) : 1e-6;
-        if (off >= dist) return;
-        if (scene.occluded(p + (hs ? wdir : ng) * (hs ? 1e-6 : off), wdir, dist - off - 1e-6, 1e-6,
+        if (off >= le.dist) return;
+        int px, py; double wgt;
+        if (!cam.lensEntryImage(le, lambda, px, py, wgt)) return;
+        if (scene.occluded(p + (hs ? wdir : ng) * (hs ? 1e-6 : off), wdir, le.dist - off - 1e-6, 1e-6,
                            /*camLeg=*/true, hs ? off : 0.0)) return;
         const double corr = hs ? 1.0 : shadingAdjointCorr(wi, wdir, n, ng);
         const double fcos = hs ? hairFCos(*hs, wdir) : (rho / PI) * cosSurf;
         double contrib = beta * fcos * corr * wgt * stG;
         if (!scene.media.empty())
-            contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
+            contrib *= mediaTransmittance(scene, p, wdir, le.dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
-    // Hero bundle through a physical lens. The glass disperses, so the wavelengths share the
-    // front-element sample (one draw, so the RNG stream does not depend on C) and the scene
-    // leg from p to it, but each is traced through the lens on its own and lands in its own
-    // cell, or is clipped on its own.
+    // Hero bundle through a physical lens. The wavelengths share the front-element sample (one
+    // draw, so the RNG stream does not depend on C), the entry and the scene leg from p to it;
+    // the glass disperses, so each is traced through it on its own and lands in its own cell,
+    // or is clipped on its own.
     void connectLensHeroPhysical(const Scene& scene, const Camera& cam, Film& film,
                                  const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
                                  const double* lam, const double* beta, const double* rho,
                                  int nUp, Pcg32& rng, const Vec3* plane) const {
         const double u1 = rng.uniform(), u2 = rng.uniform();
-        Vec3 Y, wdir; double dist = 0.0;
-        int px[hero::kHeroMax], py[hero::kHeroMax];
-        double wgt[hero::kHeroMax];
-        bool ok[hero::kHeroMax] = {}, any = false;
-        for (int i = 0; i < nUp; ++i) {
-            Vec3 Yi, wi_; double di;
-            ok[i] = cam.lensConnect(p, lam[i], u1, u2, Yi, wi_, di, px[i], py[i], wgt[i]);
-            if (ok[i] && !any) { Y = Yi; wdir = wi_; dist = di; any = true; }
-        }
-        if (!any) return;
-        if (plane && dot(*plane, Y - p) <= 0.0) return;
+        Camera::LensEntry le;
+        if (!cam.lensEntry(p, u1, u2, le)) return;
+        if (plane && dot(*plane, le.Y - p) <= 0.0) return;
+        const Vec3& wdir = le.wdir;
         const double cosSurf = dot(n, wdir);
         if (cosSurf <= 0) return;
         const double stG = shadowTerminatorG(wdir, n, ng);
         if (stG <= 0.0) return;
-        if (scene.occluded(p + ng * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
+        int px[hero::kHeroMax], py[hero::kHeroMax];
+        double wgt[hero::kHeroMax];
+        bool ok[hero::kHeroMax] = {}, any = false;
+        for (int i = 0; i < nUp; ++i) {
+            ok[i] = cam.lensEntryImage(le, lam[i], px[i], py[i], wgt[i]);
+            any = any || ok[i];
+        }
+        if (!any) return;
+        if (scene.occluded(p + ng * 1e-6, wdir, le.dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
         const double corr = shadingAdjointCorr(wi, wdir, n, ng);
         for (int i = 0; i < nUp; ++i) {
             if (!ok[i]) continue;
             double contrib = beta[i] * (rho[i] / PI) * cosSurf * corr * wgt[i] * stG;
             if (!scene.media.empty())
-                contrib *= mediaTransmittance(scene, p, wdir, dist, lam[i], rng);
+                contrib *= mediaTransmittance(scene, p, wdir, le.dist, lam[i], rng);
             film.add(px[i], py[i], Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
@@ -3163,8 +3168,12 @@ struct Renderer {
                 int px, py;
                 const Camera& cc = *cams[0].cam;
                 // A physical lens catches what enters its front element and comes out on the
-                // sensor (lensCatch); otherwise the photon must thread the thin lens's disc.
-                if (cc.hasLens() ? cc.lensCatch(ray, dEvent, lambda, px, py)
+                // sensor, and absorbs what enters and is clipped inside (lensCatch); a thin
+                // lens catches what threads its disc.
+                const int lc = cc.hasLens() ? cc.lensCatch(ray, dEvent, lambda, px, py)
+                                            : Camera::LENS_MISSED;
+                if (lc == Camera::LENS_ABSORBED) { e.absorbed += beta; return; }
+                if (cc.hasLens() ? lc == Camera::LENS_CAUGHT
                                  : cc.catchPhoton(ray, dEvent, px, py)) {
                     // Same flux->film-irradiance normaliser as connectLens (model A): a
                     // caught photon deposits pupil FLUX into the cell; divide by the cell
@@ -3846,18 +3855,19 @@ struct Renderer {
 
             // Model C aperture catch: the photon physically threads the pupil.
             if (forwardCatch && nCam > 0 && cams[0].cam && cams[0].film && cams[0].cam->hasLens()) {
-                // Through a physical lens the glass disperses: each live wavelength is traced
-                // to its own cell, and one the lens clips is absorbed by it. The photon ends
-                // if any wavelength reaches the sensor; if none does it flies on, as a photon
-                // that misses the thin lens's disc does.
+                // Through a physical lens. Entering the front element is geometry, the same
+                // for every live wavelength; inside, the glass disperses, so each wavelength is
+                // traced to its own cell, and one the lens clips is absorbed by it. A photon
+                // that enters ends there, as the scalar tracer's does; one that misses flies on.
                 const Camera& cc = *cams[0].cam;
                 int pxs[hero::kHeroMax], pys[hero::kHeroMax];
-                bool any = false, hit[hero::kHeroMax] = {};
+                bool entered = false, hit[hero::kHeroMax] = {};
                 for (int i = 0; i < nUp; ++i) {
-                    hit[i] = cc.lensCatch(ray, dEvent, lam[i], pxs[i], pys[i]);
-                    any = any || hit[i];
+                    const int lc = cc.lensCatch(ray, dEvent, lam[i], pxs[i], pys[i]);
+                    hit[i] = (lc == Camera::LENS_CAUGHT);
+                    entered = entered || lc != Camera::LENS_MISSED;
                 }
-                if (any) {
+                if (entered) {
                     const double cCell = cc.lensCellNorm();
                     const bool envSeen = (bounce == 0 && envBorn);
                     EnvMap::Taps tp{};
