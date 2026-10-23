@@ -992,8 +992,10 @@ that converges to the same physical image.
   connected to a sampled point of the lens's front element and the ray is traced through
   every element onto the sensor, so the image carries that objective's distortion,
   vignetting, aberrations and colour fringing, on the same absolute scale as mode `R`
-  through the same lens. Mode `B` does the same with a physical lens, which has no pinhole
-  limit (its aperture is part of the glass).
+  through the same lens. Under a physical lens `A` and `B` are **one and the same
+  estimator**: the glass takes the place of both the thin lens and the pinhole (its
+  aperture is part of the prescription), so the two modes give identical images from the
+  same seed. Render one of them, not both.
 - **`C` — finite-aperture catch (brute-force DoF oracle, slow).** Photons must
   physically pass through the aperture to be counted, giving true thin-lens depth of
   field and bokeh — but it is **catch-starved** (most photons miss the aperture), so
@@ -1907,7 +1909,8 @@ geometry** — no thin-lens approximation. Light tracing goes the other way thro
 same glass: from a scene point to a sampled point on the front element, then through
 every element onto the sensor (Hanika & Dachsbacher 2014, "Efficient Monte Carlo rendering
 with realistic lenses"). So a physical lens renders in mode `R` (backward), in the forward
-modes `A`, `B` (both splat through the lens) and `C` (catches what flies through it), in
+modes `A` and `B` (one splat through the lens: the two give identical images, so render
+either) and `C` (catches what flies through it), in
 mode `D` and `J` (camera rays out through it, the light image into it), and in `V`; mode
 `P` routes to `D` or `R`, and modes `M`, `S`, `U` render it in `R`: their photon gathers sum
 light of every wavelength at the point one camera ray found, which is exact only while that

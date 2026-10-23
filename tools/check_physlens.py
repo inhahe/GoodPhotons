@@ -4,7 +4,9 @@
 
 A camera's `lens { }` is imaged two ways. Mode R traces camera rays out through the glass
 (genLensRay). The forward modes trace light in: A and B splat every vertex through a sampled
-point of the front element, C catches what flies through it, and D/J add that light image
+point of the front element (one estimator under a physical lens, so their rows match to the
+digit; B's is there to catch it falling back to the pinhole), C catches what flies through
+it, and D/J add that light image
 to BDPT's camera paths under a MIS weight built from the lens's own camera density. Each
 estimator carries its own normalisation (a cell's irradiance; BDPT's light image divided by
 W*H against its spp normaliser; the catch's flux per cell area), and the device versions are
