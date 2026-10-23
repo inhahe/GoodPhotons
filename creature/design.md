@@ -24,6 +24,7 @@ Most components already exist and should not be reinvented:
 | 3D animal reconstruction from images | SMAL family, BITE, LASSIE, MagicPony, 3D-Fauna |
 | morphology-conditioned policies | MetaMorph; Shared Modular Policies |
 | fur / soft tissue | Marschner–d'Eon–Yan fiber BSDFs; Ziva; Weta Tissue |
+| conventional rigs fitted from scans (no network at playback) | SMPL, SMAL, FLAME; Dem Bones (SSDR) — todo.md P13 |
 
 Three links are genuinely thin, and they are where effort should go:
 

@@ -55,6 +55,9 @@ P11 flight                  (out of the main line; a separate body plan and a
 P12 sound                   (offline + event-driven, downstream of everything —
                              except its raw material, which P5's capture sessions
                              record from day one; see capture.md §Audio)
+P13 animator handoff        (a fitted rig with no network in it + motion baked to
+                             editable curves; its proof needs nothing above, the
+                             real thing needs P5's captures, P7's skin, P9's face)
 ```
 
 **P10's design cannot wait for its slot.** Every control channel you want at the end — morph vector,
@@ -1546,6 +1549,95 @@ Sound has an unusually clean version of that claim, because bioacoustics already
 - **Speech and lip-sync** — different literature, different face rig, and it drags in language.
 - **Hearing as a sense** (the creature reacting to sounds) — deferred until a world exists to
   produce them; P10's "object interaction is content" argument applies verbatim.
+
+---
+
+## P13 — Animator handoff: a fitted rig with no network in it, and motion as editable curves  `[ ]`
+*(added 2026-10-22 — asked for explicitly.)*
+
+**The idea.** Learning and fitting run once, at build time, on captures; what ships is a
+**conventional rig** — joints, skin weights, blendshapes, pose-driven correctives — that Blender, Maya
+or any USD tool evaluates with plain linear algebra and no neural network. The learned controller
+stays, but as an *optional source of motion*, whose output is baked to animation curves an animator
+edits like any others. This is the concrete form of design.md §Directability ("sim as a default that
+can be overridden anywhere, never as a mandate"): the physics drafts the trot, the graph editor has
+the last word.
+
+**It is well-trodden, which is the point.** SMPL (Loper et al. 2015) is exactly this for humans:
+fitted to thousands of scans, it ships as a template mesh, a joint regressor, LBS weights, 10 shape
+blendshapes and 207 pose correctives that are *linear* in the joint rotation matrices — evaluating it
+is a few matrix multiplies. SMAL (Zuffi et al. 2017) did the same for quadrupeds from 41 scans of toy
+figurines, FLAME for faces, and Epic's MetaHuman fits scans to a joint-and-blendshape rig and confines
+ML to the capture solve. **Their licences are non-commercial research**: use them as yardsticks and
+for the proof below, never as the shipped model. Fit our own.
+
+**How it sits with rules already in this file:**
+- **P0's diagram already reserves the third target** (`(USD) → art tools`). This phase is that emitter
+  plus the fitting it needs. The creature layer stays a generator; the exported rig is a compiled
+  artifact, like the MJCF.
+- **design.md §Morphology already says anatomy comes from fitting, not training.** This extends the
+  fit from the skeleton and muscles to the surface.
+- **P7's groom rule applies to weights too: nothing is hand-painted in the source.** Painted maps go
+  stale the moment P4 changes the body. Weights and correctives are *fitted per morph by the
+  pipeline*; an artist's touch-ups happen on the exported rig, downstream, like retouching a frame.
+- **P9 says the face is muscle-driven, not blendshapes — that stays true.** The blendshapes here are
+  *sampled from* the muscle face, one per muscle or action unit: a compiled view of the one actuation
+  model, not a second one. So the face half of this phase is blocked on P9's step 1; the body half
+  is not.
+
+Work, in order — the first item needs nothing from any other phase:
+
+- [ ] **Proof: how close does a network-free rig get?** Run EA's Dem Bones (BSD-3; reads and writes
+      Alembic/FBX; solves bones + LBS weights from a mesh sequence, or the weights alone given skeleton
+      poses) on a public registered 4D sequence — Dynamic FAUST's human scans, already in one fixed
+      topology (research licence, fine for a measurement). Report surface error in mm against bone
+      count; then fit SMPL-style linear pose correctives to the residual by least squares and report
+      it again. **Bar:** we know, in millimetres, what plain LBS leaves and what linear correctives
+      buy back, before any of our own pipeline exists. Re-run the same measurement on the creature
+      once P7's skin deforms.
+- [ ] **Skin mesh and bind pose** — this *is* P7's "Skin as a surface" item (a); do it once, there.
+      What this phase changes is its (b): the weights are fitted, not painted.
+- [ ] **Weights from captures, against our own skeleton.** P5's multi-view sessions → per-frame
+      surface reconstruction → non-rigid registration to the skin template (one topology across all
+      frames) → LBS weights solved with the *fitted* skeleton's poses held fixed (Dem Bones'
+      weights-given-poses mode). The skeleton comes from P5's fit, not from Dem Bones' own bone
+      placement, so the rig's joints stay the ones MuJoCo simulates.
+- [ ] **Pose-space correctives, local and named.** Regress the LBS residual against each joint's
+      rotation features (SMPL's linear form), but restrict each joint's correctives to the vertices
+      that joint weights, so a shoulder corrective cannot move the tail. Global correctives fit
+      slightly better and cannot be edited by a person; prefer local. They play back as UsdSkel's
+      animated blendshape weights, and are re-emitted as drivers / driven keys in the target tool
+      wherever the rig must stay editable (USD itself has no drivers).
+- [ ] **Morphs: re-fit, or ship a shape space — decide by measurement.** Either the export is one rig
+      per morph vector (re-run the fit; it is an optimisation, not a training run), or a SMAL-style
+      rig whose shape blendshapes span P4's morph neighbourhood. Measure first how far the weights and
+      correctives move across that neighbourhood; if they barely move, shape blendshapes win.
+- [ ] **Face shapes, sampled from P9's muscle face.** Drive each facial muscle — or each action unit
+      of the species' FACS where one exists (DogFACS, CatFACS, EquiFACS) — alone and in the
+      combinations that collide, record the surface, and store one named blendshape per unit plus
+      combination correctives. Named by construction, and that is what makes them usable: a PCA basis
+      fitted straight to captures moves the whole face per component and means nothing to an animator.
+- [ ] **USD emitter: the deformation rig, plus what a control rig needs.** UsdSkel carries joints,
+      weights, blendshapes and animation. Animators also need the *control* layer — IK chains, pole
+      vectors, foot roll, a face panel. The `.ftcl` already names limbs and sites, so emit enough for
+      a generator to build it; decide between building it ourselves and emitting a Rigify metarig for
+      Blender to build from. FBX only if a specific tool demands it.
+- [ ] **Motion → editable curves.** Record policy rollouts, then key-reduce each channel to a sparse
+      set of Bézier keys within an error tolerance. Two rules decide whether the result is editable or
+      merely exported:
+      1. **Planted feet bake to IK controls, not FK rotations.** A stance phase becomes a held foot
+         position. Baked as FK, retiming the body slides every foot, and the first edit breaks contact.
+      2. **Rotations go through an Euler filter** (or bake as quaternions where the tool takes them),
+         or the keys flip at ±180° and the graph editor shows spikes nobody authored.
+      The return direction — an animator's edited curves fed back as P10 goals, or as a trajectory-
+      optimisation target so the physics re-balances around the edit — is the real directability
+      payoff, and a later item.
+- [ ] **Bar:** the exported creature opens in Blender with no Python or network dependency, matches
+      the simulated surface within the error the proof established, and a baked trot can be retimed in
+      the graph editor without a foot sliding.
+
+**Explicitly not:** a neural deformer (it is what this phase exists to avoid); reimplementing Dem
+Bones / SSDR (it exists and is BSD-3: wrap it); hand-painted weights in the source (see above).
 
 ---
 
