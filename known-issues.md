@@ -262,7 +262,7 @@ Opus (xhigh) reviewed 322249f..9cd5c76, the follow-ups to REVIEW-0391. Fixed:
 
 Logged rather than fixed: the general form of the `sunMiss` rule (REMAP0-IMPOSSIBLE, below).
 
-## OPEN (2026-10-21): DEVICE-SPECTRAL-GRID — the GPU reads every material spectrum off a 4.9 nm grid, so features narrower than that render differently on the two backends
+## DONE (2026-10-23, 0.393.1): DEVICE-SPECTRAL-GRID — the GPU read every material spectrum off a 4.9 nm grid, so features narrower than that rendered differently on the two backends
 
 `buildUploadScene` bakes each material spectrum (`bakeSpec`: reflectance, transmittance,
 absorption, emission, ...) into `SPEC_N` = 96 entries over 360-830 nm, 4.9 nm apart, linearly
@@ -285,6 +285,13 @@ a binary search per lookup) so a tabulated spectrum is exact on both backends, a
 analytic spectra; or a 1 nm grid (471 entries) for the tables, if the per-material memory
 (several tables of 3.8 KB each) and the cache cost measure acceptably. Either needs a gate: this
 scene in mode R, CPU against GPU, per channel.
+
+**Fixed (0.393.1)** the first way. A `table` or measured-file spectrum, shared or scaled, reaches
+the device as its own knots (spectrum.h `spectrumKnots`, render_cuda `DSpec`, with a per-nm bucket
+index so a lookup finds its interval in a step or two); everything else keeps the grid. Gate
+`tools/check_spectral_grid.py`: this glass and a room reflecting fifteen 2 nm bands between the old
+grid's points, mode R, GPU against CPU -- red 0.30 and 0.017 before, 1.03 and 1.000 after (the glass's
+red is noisy: +-4 % between CPU seeds). The 1.9 % blue gap noted with clear glass was noise too.
 
 ## OPEN (2026-10-21): REMAP0-IMPOSSIBLE — the MIS sums read a zero density as a delta's, whatever made it zero
 

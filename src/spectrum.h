@@ -156,10 +156,11 @@ inline Spectrum iorConstant(double n) { return [n](double) { return n; }; }
 // sorted by wavelength at build time; sampling clamps to the endpoints outside the
 // measured range and linearly interpolates within. This is the ingestion point for
 // measured reflectance/SPD data (FTSL `table { 400:0.05 450:0.12 ... }`).
-inline Spectrum tabulatedSpectrum(std::vector<std::pair<double, double>> pairs) {
-    std::sort(pairs.begin(), pairs.end(),
-              [](const auto& a, const auto& b) { return a.first < b.first; });
-    return [pairs](double w) -> double {
+// A named type rather than a lambda so that a consumer holding only the Spectrum can recover
+// its knots (spectrumKnots) -- the device does, to read a table exactly instead of off its grid.
+struct TabulatedLinear {
+    std::vector<std::pair<double, double>> pairs;   // sorted by wavelength
+    double operator()(double w) const {
         if (pairs.empty()) return 0.0;
         if (w <= pairs.front().first) return pairs.front().second;
         if (w >= pairs.back().first)  return pairs.back().second;
@@ -173,7 +174,12 @@ inline Spectrum tabulatedSpectrum(std::vector<std::pair<double, double>> pairs) 
         double v0 = pairs[lo].second, v1 = pairs[lo + 1].second;
         double f = (w1 > w0) ? (w - w0) / (w1 - w0) : 0.0;
         return v0 + (v1 - v0) * f;
-    };
+    }
+};
+inline Spectrum tabulatedSpectrum(std::vector<std::pair<double, double>> pairs) {
+    std::sort(pairs.begin(), pairs.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    return TabulatedLinear{std::move(pairs)};
 }
 
 // Monotone piecewise-cubic (Fritsch-Carlson / PCHIP) measured curve — the opt-in
@@ -185,6 +191,26 @@ inline Spectrum tabulatedSpectrum(std::vector<std::pair<double, double>> pairs) 
 // where linear kinks are visible; for dense measured data it matches linear closely.
 // Reduces to linear for 2 points; clamps to the endpoints outside the measured range
 // (no extrapolation — same tail policy as tabulatedSpectrum).
+// The monotone-cubic table's evaluator: knots x, values y, Hermite tangents m. Named for the
+// same reason as TabulatedLinear.
+struct TabulatedMono {
+    std::vector<double> x, y, m;
+    double operator()(double w) const {
+        size_t n = x.size();
+        if (n == 0) return 0.0;
+        if (n == 1 || w <= x.front()) return y.front();
+        if (w >= x.back()) return y.back();
+        size_t lo = 0, hi = n - 1;
+        while (lo + 1 < hi) { size_t mid = (lo + hi) / 2; (x[mid] <= w ? lo : hi) = mid; }
+        double hlen = x[lo + 1] - x[lo];
+        double t = (w - x[lo]) / hlen, t2 = t * t, t3 = t2 * t;
+        double h00 =  2 * t3 - 3 * t2 + 1;   // Hermite basis
+        double h10 =      t3 - 2 * t2 + t;
+        double h01 = -2 * t3 + 3 * t2;
+        double h11 =      t3 -     t2;
+        return h00 * y[lo] + h10 * hlen * m[lo] + h01 * y[lo + 1] + h11 * hlen * m[lo + 1];
+    }
+};
 inline Spectrum tabulatedSpectrumMono(std::vector<std::pair<double, double>> pairs) {
     std::sort(pairs.begin(), pairs.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -219,21 +245,44 @@ inline Spectrum tabulatedSpectrumMono(std::vector<std::pair<double, double>> pai
             m[n - 1] = endTangent(h[n - 2], h[n - 3], d[n - 2], d[n - 3]);
         }
     }
-    return [x, y, m](double w) -> double {
-        size_t n = x.size();
-        if (n == 0) return 0.0;
-        if (n == 1 || w <= x.front()) return y.front();
-        if (w >= x.back()) return y.back();
-        size_t lo = 0, hi = n - 1;
-        while (lo + 1 < hi) { size_t mid = (lo + hi) / 2; (x[mid] <= w ? lo : hi) = mid; }
-        double hlen = x[lo + 1] - x[lo];
-        double t = (w - x[lo]) / hlen, t2 = t * t, t3 = t2 * t;
-        double h00 =  2 * t3 - 3 * t2 + 1;   // Hermite basis
-        double h10 =      t3 - 2 * t2 + t;
-        double h01 = -2 * t3 + 3 * t2;
-        double h11 =      t3 -     t2;
-        return h00 * y[lo] + h10 * hlen * m[lo] + h01 * y[lo + 1] + h11 * hlen * m[lo + 1];
-    };
+    return TabulatedMono{std::move(x), std::move(y), std::move(m)};
+}
+
+// The knots of a piecewise-linear curve that reproduces `s`, for a consumer that reads curves off
+// a grid (the device's SPEC_N tables, 4.9 nm apart) and must not lose what falls between its
+// points: a window a few nm wide, an emission line. Exact for a linear table (TabulatedLinear),
+// also when shared or scaled (SharedSpectrum, ScaledSpectrum); a monotone-cubic table
+// (TabulatedMono) is split into kMonoSub linear pieces per interval. False for anything else --
+// a constant, an analytic curve (smooth on the grid's scale), a lambda nobody can see into -- and
+// the caller keeps its grid. `x` comes back ascending, `y` the matching values.
+inline bool spectrumKnots(const Spectrum& s, std::vector<double>& x, std::vector<double>& y) {
+    constexpr int kMonoSub = 16;
+    x.clear(); y.clear();
+    double k = 1.0;
+    const Spectrum* cur = &s;
+    for (int guard = 0; guard < 16 && cur && *cur; ++guard) {   // see through shares and scales
+        if (const SharedSpectrum* t = cur->target<SharedSpectrum>()) { cur = t->fn.get(); continue; }
+        if (const ScaledSpectrum* t = cur->target<ScaledSpectrum>()) { k *= t->k; cur = t->fn.get(); continue; }
+        break;
+    }
+    if (!cur || !*cur) return false;
+    if (const TabulatedLinear* t = cur->target<TabulatedLinear>()) {
+        if (t->pairs.size() < 2) return false;
+        for (const auto& p : t->pairs) { x.push_back(p.first); y.push_back(p.second * k); }
+        return true;
+    }
+    if (const TabulatedMono* t = cur->target<TabulatedMono>()) {
+        const size_t n = t->x.size();
+        if (n < 2) return false;
+        for (size_t i = 0; i + 1 < n; ++i)
+            for (int j = 0; j < kMonoSub; ++j) {
+                const double w = t->x[i] + (t->x[i + 1] - t->x[i]) * (double)j / kMonoSub;
+                x.push_back(w); y.push_back((*t)(w) * k);
+            }
+        x.push_back(t->x[n - 1]); y.push_back(t->y[n - 1] * k);
+        return true;
+    }
+    return false;
 }
 
 // RGB -> reflectance upsampling now lives in src/upsample.h

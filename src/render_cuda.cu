@@ -422,24 +422,38 @@ struct DTexture {
     __device__ double patScalarAt(double u, double v) const;
 };
 
+// A material, medium or emitter spectrum on the device: its SPEC_N grid (4.9 nm apart), and --
+// for a curve the host knows to be piecewise linear, a `table` or a measured file, scaled or not
+// (spectrum.h spectrumKnots) -- its own knots, so a feature narrower than the grid (a window a few
+// nm wide, an emission line) reads on the device what it reads on the host (DEVICE-SPECTRAL-GRID).
+// Read it with specLookup(const DSpec&, lambda); bakeSpec(Spectrum, DSpec&, DUpload&) fills it.
+static constexpr int DSPEC_KB = (int)(DLMAX - DLMIN) + 1;   // knot buckets, one per nm
+struct DSpec {
+    double tab[SPEC_N];                      // the grid, always filled
+    const float*          kx = nullptr;      // knot wavelengths, ascending; null: read the grid
+    const double*         ky = nullptr;      // knot values
+    const unsigned short* kb = nullptr;      // per nm from DLMIN: the last knot at or below it
+    int                   kn = 0;            // knot count (>= 2), 0 without knots
+};
+
 struct DMaterial {
     int    type;
     // Twin of Material::readsCavity — the per-hit gate on the cavity probe. See the
     // note there and on ftsl::setupCavity: without it, one cavity-driven material would
     // charge cavitySamples occlusion rays to every OTHER patterned surface in the scene.
     int    readsCavity;
-    double reflect[SPEC_N];     // baked reflect spectrum
-    double ior[SPEC_N];         // baked index spectrum
-    double substrateK[SPEC_N];  // baked thin-film substrate extinction kappa (0 = transparent)
+    DSpec  reflect;     // baked reflect spectrum
+    DSpec  ior;         // baked index spectrum
+    DSpec  substrateK;  // baked thin-film substrate extinction kappa (0 = transparent)
     // Beer-Lambert interior absorption sigma_a(lambda) per metre travelled INSIDE a
     // dielectric (colored/attenuating glass). All-zero = colorless (default). Consulted
     // only for D_DIELECTRIC, via the `interior` material tracked through the transport
     // loop (device twin of Material::absorb).
-    double absorb[SPEC_N];
+    DSpec  absorb;
     // Diffuse-transmission albedo (D_DIFFUSETRANSMIT only): the back-hemisphere (-n)
     // Lambertian lobe. `reflect` is the front (+n) lobe; reflect+transmit is energy-
     // clamped to <= 1 per wavelength at shade time. Device twin of Material::transmit.
-    double transmit[SPEC_N];
+    DSpec  transmit;
     double roughness;
     double filmIor, filmThickness;
     // Spatially-varying diffuse albedo: index into DScene::textures (-1 = use the
@@ -468,7 +482,7 @@ struct DMaterial {
     // epsilon(lambda); the dye re-radiates (quantum yield fluoYield) at a Stokes-
     // shifted lambda' drawn from the emission-SPD CDF slice [fluoCdfOffset,
     // fluoCdfOffset+fluoCdfN) inside DScene::fluoCdfAll (fluoCdfStep = bin width nm).
-    double fluoAbsorb[SPEC_N];
+    DSpec  fluoAbsorb;
     double fluoYield;
     int    fluoCdfOffset, fluoCdfN;
     double fluoCdfStep;
@@ -476,7 +490,7 @@ struct DMaterial {
     // evaluate the continuous emission density gOut = (M(lambda)/fluoMint)*invPdf
     // at a FIXED output wavelength (the forward path samples lambda' from the CDF
     // instead, where M/pdf cancels and these aren't needed).
-    double fluoEmitSpec[SPEC_N];
+    DSpec  fluoEmitSpec;
     double fluoMint;
     // EXCITATION-wavelength CDF slice (device twin of Material::fluoInSampler), also
     // living inside DScene::fluoCdfAll. Built from absorb(lambda)*g(lambda), so the
@@ -513,7 +527,7 @@ struct DMaterial {
     // A2: absorption inside the coat LAYER. coatAbsorb is sigma_a (1/m); the two path lengths
     // fold the layer depth and the cone geometry in at scene-build time, so shading pays two
     // exps and no trigonometry. Host twins: Material::coatAbsorb / coatPathIo / coatPathRt.
-    double coatAbsorb[SPEC_N];
+    DSpec  coatAbsorb;
     double coatPathIo;   // d * (secant in + secant out) through the escape cone
     double coatPathRt;   // 2 * d * secant beyond the critical angle: one TIR round trip
     // A3: the MEASURED distribution of body-bounce counts before escape (host twin
@@ -554,7 +568,7 @@ struct DMaterial {
     // closestHit(..., camHide) below for how it is enforced.
     int    hideCamera;
     int    route;              // Material::route: -1 untagged, 0 = mode D, 1 = mode J (0.386.0)
-    double matEmit[SPEC_N];
+    DSpec  matEmit;
     DVec3  rgbMatEmit;          // matEmit baked to linear sRGB, for the fast RGB backward
     // Nested-dielectric priority (Schmidt & Budge 2002): higher wins where dielectrics
     // overlap; INT_MIN (D_NO_PRIORITY) means "unset" -> flat air<->glass fallback. Device
@@ -608,13 +622,13 @@ struct DMaterial {
     double hairEta, hairBetaM, hairBetaN, hairAlpha, hairKappa, hairMedullaG;
     // Cuticle reflectance tint (host twin Material::hairSpecular). Spectral, because a
     // coloured sheen is the whole point; 1 everywhere reproduces the plain dielectric Fresnel.
-    double hairSpecular[SPEC_N];
+    DSpec  hairSpecular;
     int    hairSpecPat;
     double hairOpacity;          // coverage: the same at every wavelength
     int    hairOpacityPat;
-    double hairSigmaA[SPEC_N];
-    double hairMedullaSigmaS[SPEC_N];
-    double hairMedullaSigmaA[SPEC_N];
+    DSpec  hairSigmaA;
+    DSpec  hairMedullaSigmaS;
+    DSpec  hairMedullaSigmaA;
     int    hairSigmaAFromReflect;
 };
 // Sentinel for an unset dielectric priority (device twin of host INT_MIN).
@@ -863,8 +877,8 @@ struct DMajWalk {
 struct DMedium {
     int    enabled;
     int    route;              // Medium::route: -1 untagged, 0 = mode D, 1 = mode J (0.386.0)
-    double sigma_a[SPEC_N];
-    double sigma_s[SPEC_N];
+    DSpec  sigma_a;
+    DSpec  sigma_s;
     double g;
     // --- Optional heterogeneous density field + spatial bound (mirrors host Medium) ---
     // When `heterogeneous`, sigma_a/sigma_s are multiplied per point by a dimensionless
@@ -969,7 +983,7 @@ struct DEmitter {
     // (for the s=0 direct-hit strategy); emitSpd is the baked emission SPD so the
     // device can evaluate Le(lambda) directly (DMaterial carries no emit spectrum).
     int    matId;
-    double emitSpd[SPEC_N];
+    DSpec  emitSpd;
     // Index into DScene::patterns of this emitter's emission profile (device twin of
     // Emitter::emitPat, itself adopted from the emissive material at registration);
     // -1 = uniform. Deliberately absent from `power` — the pattern modulates the
@@ -2077,6 +2091,21 @@ __device__ static Real specLookup(const double* tab, Real lambda) {
     if (f >= SPEC_N - 1) return (Real)tab[SPEC_N - 1];
     int i = (int)f; Real frac = f - i;
     return (Real)tab[i] * ((Real)1 - frac) + (Real)tab[i + 1] * frac;
+}
+// A DSpec: its knots when it has them (the bucket finds the interval in a step or two), else its
+// grid. Clamps outside the knots as the host's tables do.
+__device__ static Real specLookup(const DSpec& s, Real lambda) {
+    if (s.kn <= 0) return specLookup(s.tab, lambda);
+    const int n = s.kn;
+    if (lambda <= (Real)s.kx[0])     return (Real)s.ky[0];
+    if (lambda >= (Real)s.kx[n - 1]) return (Real)s.ky[n - 1];
+    int b = (int)(lambda - (Real)DLMIN);
+    b = b < 0 ? 0 : (b >= DSPEC_KB ? DSPEC_KB - 1 : b);
+    int k = s.kb[b];
+    while (k + 2 < n && (Real)s.kx[k + 1] <= lambda) ++k;
+    const Real x0 = (Real)s.kx[k], x1 = (Real)s.kx[k + 1];
+    const Real f = (x1 > x0) ? (lambda - x0) / (x1 - x0) : (Real)0;
+    return (Real)s.ky[k] + ((Real)s.ky[k + 1] - (Real)s.ky[k]) * f;
 }
 __device__ static inline double dSunRadiance(const DScene& sc, const DVec3& d, Real lambda) {
     if (sc.sunCount == 0) return 0.0;
@@ -11425,15 +11454,15 @@ __device__ static float dVertexPdfLightOriginF(const DScene& sc, const DVertex& 
 // emitter-then-material precedence the backward tracer uses in bkRadiance.
 __device__ static double dVertexLe(const DScene& sc, const DVertex& v, const DVec3& w,
                                    Real lambda, double invPdfLambda) {
-    const double* eSpd = nullptr;
-    if (v.lightIdx >= 0)                                  eSpd = sc.emitters[v.lightIdx].emitSpd;
-    else if (v.matId >= 0 && sc.mats[v.matId].matIsLight) eSpd = sc.mats[v.matId].matEmit;
+    const DSpec* eSpd = nullptr;
+    if (v.lightIdx >= 0)                                  eSpd = &sc.emitters[v.lightIdx].emitSpd;
+    else if (v.matId >= 0 && sc.mats[v.matId].matIsLight) eSpd = &sc.mats[v.matId].matEmit;
     if (!eSpd) return 0.0;
     if (ddot(v.ng, w) <= 0.0) return 0.0;
     if (v.lightIdx >= 0 && sc.emitters[v.lightIdx].normalTilted)    // an aimed quad
-        return (double)specLookup(eSpd, lambda) * invPdfLambda * (double)v.emitPatW
+        return (double)specLookup(*eSpd, lambda) * invPdfLambda * (double)v.emitPatW
              * (double)dAimRadiance(sc.emitters[v.lightIdx], w);
-    return (double)specLookup(eSpd, lambda) * invPdfLambda * (double)v.emitPatW;
+    return (double)specLookup(*eSpd, lambda) * invPdfLambda * (double)v.emitPatW;
 }
 // Emitter that owns an emissive surface material (mirrors Scene::emitterForMat).
 __device__ static int dEmitterForMat(const DScene& sc, int matId) {
@@ -13660,15 +13689,15 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             // flux normalisation the raw material spectrum does not); fall back to the
             // material's own `emit` when this geometry has no emitter — an isosurface or
             // CSG solid is marched, never tessellated, so nothing registers for it.
-            const double* eSpd = (li >= 0)          ? sc.emitters[li].emitSpd
-                               : (mp->matIsLight)   ? mp->matEmit
+            const DSpec* eSpd = (li >= 0)          ? &sc.emitters[li].emitSpd
+                               : (mp->matIsLight)   ? &mp->matEmit
                                                     : nullptr;
             if (eSpd) {
                 // GLOSSY-NEE's lobe-sampling half; 1 -- and this expression bit-identical to
                 // its pre-0.266 form -- unless the previous bounce was a MIS'd glossy one.
                 double wMis = (gmis.pdf > 0.0)
                     ? dGlossyHitWeight(sc, gmis, li, rd, &h.p, &h.n) : 1.0;
-                L += thr * (double)specLookup(eSpd, lambda) * invPdfLambda
+                L += thr * (double)specLookup(*eSpd, lambda) * invPdfLambda
                          * dEmitHitScale(sc, mp->emitPat, li, h, rd * (Real)(-1)) * wMis;
             }
         }
@@ -13910,15 +13939,15 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         int li = dEmitterForMat(sc, matId);
         if (specularArrival && dot(rd, h.ng) < 0) {
             // Same emitter-then-material fallback as the single-wavelength path above.
-            const double* eSpd = (li >= 0)        ? sc.emitters[li].emitSpd
-                               : (mp->matIsLight) ? mp->matEmit
+            const DSpec* eSpd = (li >= 0)        ? &sc.emitters[li].emitSpd
+                               : (mp->matIsLight) ? &mp->matEmit
                                                   : nullptr;
             if (eSpd) {
                 double ep = dEmitHitScale(sc, mp->emitPat, li, h, rd * (Real)(-1));
                 if (gmis.pdf > 0.0)          // GLOSSY-NEE, as in the scalar loop
                     ep *= dGlossyHitWeight(sc, gmis, li, rd, &h.p, &h.n);
                 for (int i = 0; i < nUp; ++i)
-                    L[i] += thr[i] * (double)specLookup(eSpd, lam[i]) * invPdf[i] * ep;
+                    L[i] += thr[i] * (double)specLookup(*eSpd, lam[i]) * invPdf[i] * ep;
             }
         }
 
@@ -16920,12 +16949,12 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
         // has a BSDF. Host twin: photonGatherSub.
         {
             const int li = dEmitterForMat(sc, matId);
-            const double* eSpd = (li >= 0)        ? sc.emitters[li].emitSpd
-                               : (m.matIsLight)   ? m.matEmit
+            const DSpec* eSpd = (li >= 0)        ? &sc.emitters[li].emitSpd
+                               : (m.matIsLight)   ? &m.matEmit
                                                   : nullptr;
             if (eSpd && specularSeen && dot(rd, h.ng) < 0 && !hairArrival) {
                 double rhoV = (double)clamp01(dDiffuseRho(sc, visMat, visHit, lambda));
-                double e = (double)specLookup(eSpd, lambda) * thr * rhoV * invPdfL
+                double e = (double)specLookup(*eSpd, lambda) * thr * rhoV * invPdfL
                          * dEmitHitScale(sc, m.emitPat, li, h, rd * (Real)(-1));   // pattern and aim at this hit
                 oX += (double)cieX(lambda) * e; oY += (double)cieY(lambda) * e; oZ += (double)cieZ(lambda) * e;
             }
@@ -17497,8 +17526,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         // twin: photonGather — see its comment for the four-mode measurement.
         {
             const int li = dEmitterForMat(sc, matId);
-            const double* eSpd = (li >= 0)        ? sc.emitters[li].emitSpd
-                               : (m.matIsLight)   ? m.matEmit
+            const DSpec* eSpd = (li >= 0)        ? &sc.emitters[li].emitSpd
+                               : (m.matIsLight)   ? &m.matEmit
                                                   : nullptr;
             if (eSpd && dot(rd, h.ng) < 0 && !hairArrival) {
                 // GLOSSY-NEE's other half: if the previous bounce was a glossy lobe that was
@@ -17506,7 +17535,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 // the emitter is not counted twice (host twin: photonGather).
                 const double wMis = (gmis.pdf > 0.0)
                                   ? dGlossyHitWeight(sc, gmis, li, rd, &h.p, &h.n) : 1.0;
-                double e = (double)specLookup(eSpd, lambda) * thr * invPdfL * wMis
+                double e = (double)specLookup(*eSpd, lambda) * thr * invPdfL * wMis
                          * dEmitHitScale(sc, m.emitPat, li, h, rd * (Real)(-1));    // pattern and aim at this hit
                 oX += (double)cieX(lambda) * e;
                 oY += (double)cieY(lambda) * e;
@@ -17960,12 +17989,12 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         // light block's own surface then ends the path, and any other glowing material has a
         // body that is shaded below like any surface.
         int li = dEmitterForMat(sc, matId);
-        const double* eSpd = (li >= 0)        ? sc.emitters[li].emitSpd
-                           : (m.matIsLight)   ? m.matEmit
+        const DSpec* eSpd = (li >= 0)        ? &sc.emitters[li].emitSpd
+                           : (m.matIsLight)   ? &m.matEmit
                                               : nullptr;
         if (eSpd) {
             if (dot(rd, h.ng) < (Real)0) {
-                double e = (double)specLookup(eSpd, lambda) * thr * invPdfL
+                double e = (double)specLookup(*eSpd, lambda) * thr * invPdfL
                          * dEmitHitScale(sc, m.emitPat, li, h, rd * (Real)(-1));    // pattern and aim at this hit
                 dX += (double)cieX(lambda) * e;
                 dY += (double)cieY(lambda) * e;
@@ -18923,8 +18952,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             // spectrum falls back to the material's `emit` as bkRadiance's does. With no emitter
             // nothing else can reach the path, so it keeps the whole weight.
             int li = dEmitterForMat(sc, matId);
-            const double* eSpd = (li >= 0)          ? sc.emitters[li].emitSpd
-                               : (mp->matIsLight)   ? mp->matEmit
+            const DSpec* eSpd = (li >= 0)          ? &sc.emitters[li].emitSpd
+                               : (mp->matIsLight)   ? &mp->matEmit
                                                     : nullptr;
             if (eSpd) {
                 double cosLight = ddot(h.ng, wo);
@@ -18932,10 +18961,10 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     // Achromatic `emit pattern:` factor at this hit — the same value the
                     // light-subpath / NEE sides get from the sampler at this point.
                     double ep = dEmitHitScale(sc, mp->emitPat, li, h, wo);
-                    double Le = (double)specLookup(eSpd, lambda) * invPdfLambda * ep;
+                    double Le = (double)specLookup(*eSpd, lambda) * invPdfLambda * ep;
                     double LeSec[SECN], mxLe = Le;
                     for (int k = 0; k + 1 < nUp; ++k) {
-                        LeSec[k] = (double)specLookup(eSpd, lamAll[k + 1]) * invAll[k + 1] * ep;
+                        LeSec[k] = (double)specLookup(*eSpd, lamAll[k + 1]) * invAll[k + 1] * ep;
                         if (LeSec[k] > mxLe) mxLe = LeSec[k];
                     }
                     if (mxLe > 0.0) {
@@ -20269,6 +20298,32 @@ static void freeUpload(DUpload& up) {
     up.frees.clear();
 }
 
+// Bake a Spectrum into a DSpec: its grid (bakeSpec above), and -- when the host can see the curve
+// is piecewise linear (spectrumKnots) -- its knots, uploaded through `up`, so the device reads the
+// curve itself rather than its samples 4.9 nm apart. Sets every field, so an uninitialised DSpec
+// is fine to pass.
+static void bakeSpec(const Spectrum& s, gpu::DSpec& d, DUpload& up) {
+    bakeSpec(s, d.tab);
+    d.kx = nullptr; d.ky = nullptr; d.kb = nullptr; d.kn = 0;
+    std::vector<double> x, y;
+    if (!s || !spectrumKnots(s, x, y)) return;
+    const int n = (int)x.size();
+    if (n < 2 || n > 65535) return;               // the buckets index knots in 16 bits
+    std::vector<float> kx((size_t)n);
+    for (int i = 0; i < n; ++i) kx[(size_t)i] = (float)x[(size_t)i];
+    std::vector<unsigned short> kb((size_t)gpu::DSPEC_KB);
+    int k = 0;
+    for (int b = 0; b < gpu::DSPEC_KB; ++b) {     // the last knot at or below DLMIN + b
+        const double w = DLMIN + (double)b;
+        while (k + 1 < n && x[(size_t)k + 1] <= w) ++k;
+        kb[(size_t)b] = (unsigned short)std::min(k, n - 2);
+    }
+    d.kx = (const float*)up.keep(uploadVec(kx));
+    d.ky = (const double*)up.keep(uploadVec(y));
+    d.kb = (const unsigned short*)up.keep(uploadVec(kb));
+    d.kn = n;
+}
+
 // Bake the std::function Scene into POD device tables and upload them (camera-
 // independent). Every cudaMalloc'd pointer is recorded in up.frees; call freeUpload(up)
 // when done. The camera is baked separately (bakeCamera) so one baked scene can serve a
@@ -20500,11 +20555,11 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     for (size_t i = 0; i < scene.mats.size(); ++i) {
         const Material& m = scene.mats[i]; DMaterial& d = mats[i];
         d.type = (int)m.type;
-        bakeSpec(m.reflect, d.reflect);
-        bakeSpec(m.ior, d.ior);
-        bakeSpec(m.substrateK, d.substrateK);
-        bakeSpec(m.absorb, d.absorb);   // Beer-Lambert interior tint (colored glass)
-        bakeSpec(m.transmit, d.transmit); // diffuse-transmission back-lobe albedo (translucent)
+        bakeSpec(m.reflect, d.reflect, up);
+        bakeSpec(m.ior, d.ior, up);
+        bakeSpec(m.substrateK, d.substrateK, up);
+        bakeSpec(m.absorb, d.absorb, up);   // Beer-Lambert interior tint (colored glass)
+        bakeSpec(m.transmit, d.transmit, up); // diffuse-transmission back-lobe albedo (translucent)
         // Fast RGB backward (mode R -rgb) bakes: linear-sRGB reflect/transmit albedo,
         // a representative achromatic index (ior at 550 nm) and a 3-tap Beer-Lambert
         // sigma_a at the R/G/B pivots (610/550/465 nm). Inert for the spectral paths.
@@ -20520,7 +20575,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.reflectTex = m.reflectTex;
         d.triplanarScale = m.triplanarScale;
         // Fluorescence tables (zero/inert for every non-fluorescent material).
-        bakeSpec(m.fluoAbsorb, d.fluoAbsorb);
+        bakeSpec(m.fluoAbsorb, d.fluoAbsorb, up);
         d.fluoYield = m.fluoYield;
         if (m.type == MatType::Fluorescent && !m.fluoEmitSampler.cdf.empty() &&
             m.fluoEmitSampler.integral > 0.0) {
@@ -20529,11 +20584,11 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             d.fluoCdfStep = m.fluoEmitSampler.step;
             fluoCdfAll.insert(fluoCdfAll.end(), m.fluoEmitSampler.cdf.begin(),
                               m.fluoEmitSampler.cdf.end());
-            bakeSpec(m.fluoEmit, d.fluoEmitSpec);       // continuous M(lambda) for backward gOut
+            bakeSpec(m.fluoEmit, d.fluoEmitSpec, up);       // continuous M(lambda) for backward gOut
             d.fluoMint = m.fluoEmitSampler.integral;
         } else {
             d.fluoCdfOffset = 0; d.fluoCdfN = 0; d.fluoCdfStep = 1.0;
-            for (int s = 0; s < SPEC_N; ++s) d.fluoEmitSpec[s] = 0.0;
+            for (int s = 0; s < SPEC_N; ++s) d.fluoEmitSpec.tab[s] = 0.0;
             d.fluoMint = 0.0;
         }
         // Excitation CDF (absorb x illuminant), appended to the SAME flat buffer with
@@ -20573,7 +20628,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.coatSpecular = m.coatSpecular;
         d.coatChild = -1;                   // filled by the coat-synthesis loop after this bake
         d.coatFdr   = m.coatFdr;            // >0 on a body copy under a coat (scene.h coatedAlbedo)
-        bakeSpec(m.coatAbsorb, d.coatAbsorb);   // A2: sigma_a inside the coat layer, 1/m
+        bakeSpec(m.coatAbsorb, d.coatAbsorb, up);   // A2: sigma_a inside the coat layer, 1/m
         d.coatPathIo = m.coatPathIo;
         d.coatPathRt = m.coatPathRt;
         d.coatMomN = m.coatMomN;                // A3: 0 keeps the analytic series
@@ -20592,7 +20647,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.matReflectsNothing = m.reflectsNothing ? 1 : 0;
         d.hideCamera = m.hideCamera ? 1 : 0;
         d.route = m.route;
-        bakeSpec(m.emit, d.matEmit);
+        bakeSpec(m.emit, d.matEmit, up);
         { Vec3 le = m.emit ? rgbbake::emitToRgb(m.emit) : Vec3{0, 0, 0};
           d.rgbMatEmit = {le.x, le.y, le.z}; }
         // --- parametric-record REFLECT binding (§records stage 6a) ---
@@ -20609,7 +20664,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
                 const Record& rec = scene.records[rb->recordIndex];
                 const RecChannel& ch = rec.channels[rb->channel];
                 if (rb->selStop >= 0 && rb->selStop < (int)ch.stops.size()) {
-                    bakeSpec(ch.stops[rb->selStop].color, d.reflect);   // constant stop → bake
+                    bakeSpec(ch.stops[rb->selStop].color, d.reflect, up);   // constant stop → bake
                 } else if ((int)ch.coeff.size() == REC_LUT_N) {
                     d.recReflDriven = 1;
                     d.recReflOff = (int)recCoeffPool.size();
@@ -20676,7 +20731,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         // the hit (texture/pattern-driven), so the device inverts per-hit exactly like
         // the CPU hairShadeAt.
         d.hairEta      = m.hairEta;
-        bakeSpec(m.hairSpecular, d.hairSpecular);
+        bakeSpec(m.hairSpecular, d.hairSpecular, up);
         d.hairSpecPat  = m.hairSpecPat;
         d.hairOpacity  = m.hairOpacity;
         d.hairOpacityPat = m.hairOpacityPat;
@@ -20685,9 +20740,9 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.hairAlpha    = m.hairAlpha;
         d.hairKappa    = m.hairKappa;
         d.hairMedullaG = m.hairMedullaG;
-        bakeSpec(m.hairSigmaA,        d.hairSigmaA);
-        bakeSpec(m.hairMedullaSigmaS, d.hairMedullaSigmaS);
-        bakeSpec(m.hairMedullaSigmaA, d.hairMedullaSigmaA);
+        bakeSpec(m.hairSigmaA, d.hairSigmaA, up);
+        bakeSpec(m.hairMedullaSigmaS, d.hairMedullaSigmaS, up);
+        bakeSpec(m.hairMedullaSigmaA, d.hairMedullaSigmaA, up);
         d.hairSigmaAFromReflect = m.hairSigmaAFromReflect ? 1 : 0;
     }
 
@@ -20702,7 +20757,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         if (scene.mats[i].type != MatType::Layered) continue;
         DMaterial coat = mats[i];
         coat.type = D_GLOSSY;
-        for (int s2 = 0; s2 < SPEC_N; ++s2) coat.reflect[s2] = 1.0;
+        for (int s2 = 0; s2 < SPEC_N; ++s2) coat.reflect.tab[s2] = 1.0;
+        coat.reflect.kn = 0;   // the copy carried the base's knots
         coat.rgbAlbedo = {1.0, 1.0, 1.0};
         coat.reflectTex = -1;
         coat.reflectPat = -1;
@@ -20836,7 +20892,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         de.cdfStep = e.spd.step;
         de.matId = e.matId;                 // BDPT: link to emissive surface material
         de.emitPat = e.emitPat;             // `emit pattern:` profile over this emitter
-        bakeSpec(e.spdFn, de.emitSpd);       // BDPT: baked emission SPD for Le(lambda)
+        bakeSpec(e.spdFn, de.emitSpd, up);       // BDPT: baked emission SPD for Le(lambda)
         { Vec3 le = rgbbake::emitToRgb(e.spdFn); de.rgbEmit = {le.x, le.y, le.z}; }  // fast RGB backward
         de.cieMean = {e.cieMean.x, e.cieMean.y, e.cieMean.z};   // achromatic-path beam fold
         cdfAll.insert(cdfAll.end(), e.spd.cdf.begin(), e.spd.cdf.end());
@@ -21147,8 +21203,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             dm.enabled = m.enabled ? 1 : 0;
             dm.route = m.route;
             dm.g = m.g;
-            bakeSpec(m.sigma_a, dm.sigma_a);
-            bakeSpec(m.sigma_s, dm.sigma_s);
+            bakeSpec(m.sigma_a, dm.sigma_a, up);
+            bakeSpec(m.sigma_s, dm.sigma_s, up);
             dm.heterogeneous = m.heterogeneous() ? 1 : 0;
             dm.density  = m.density.empty() ? nullptr : (const PatNode*)keep(uploadVec(m.density));
             dm.densityN = (int)m.density.size();

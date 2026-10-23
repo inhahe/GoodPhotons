@@ -1,0 +1,21 @@
+# Reflectance bands narrower than the device's old spectral grid (tools/check_spectral_grid.py).
+#
+# The wall and floor reflect 0.9 in fifteen 2 nm bands between 557 and 629 nm -- each centred
+# between two points of the 96-entry grid the device used to read every spectrum off, 4.9 nm
+# apart -- and 0.01 elsewhere. The bands carry most of what the surfaces reflect, so a grid that
+# steps over them renders the room near-grey where the host renders it amber. A `table` spectrum
+# now reaches the device as its own knots; mode R on the CPU and on the GPU must agree.
+
+scene { units meters  spectral 360 830 1 }
+
+material "bands" { type diffuse reflect table { 360:0.01 558.868:0.01 559.368:0.9 561.368:0.9 561.868:0.01 563.816:0.01 564.316:0.9 566.316:0.9 566.816:0.01 568.763:0.01 569.263:0.9 571.263:0.9 571.763:0.01 573.711:0.01 574.211:0.9 576.211:0.9 576.711:0.01 578.658:0.01 579.158:0.9 581.158:0.9 581.658:0.01 583.605:0.01 584.105:0.9 586.105:0.9 586.605:0.01 588.553:0.01 589.053:0.9 591.053:0.9 591.553:0.01 593.5:0.01 594:0.9 596:0.9 596.5:0.01 598.447:0.01 598.947:0.9 600.947:0.9 601.447:0.01 603.395:0.01 603.895:0.9 605.895:0.9 606.395:0.01 608.342:0.01 608.842:0.9 610.842:0.9 611.342:0.01 613.289:0.01 613.789:0.9 615.789:0.9 616.289:0.01 618.237:0.01 618.737:0.9 620.737:0.9 621.237:0.01 623.184:0.01 623.684:0.9 625.684:0.9 626.184:0.01 628.132:0.01 628.632:0.9 630.632:0.9 631.132:0.01 830:0.01 } }
+
+quad { origin -3 0 -3  u 0 0 6  v 6 0 0  material bands }
+quad { origin -3 0 -3  u 0 3 0  v 6 0 0  material bands }
+light sphere { center 0 2.8 2.8  radius 0.3  spd preset:bb5500 }   # above the camera, out of frame
+
+camera "cam" {
+    eye 0 1.2 3.2   look_at 0 0.6 0   up 0 1 0   fov_y 45
+    mode R
+    film { res 160 120 }
+}

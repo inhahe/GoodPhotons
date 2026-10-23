@@ -10276,6 +10276,34 @@ branch rejection — see above. `-checkprefer` (`main.cpp`) is the regression gu
 cases covering all three `Trial` outcomes, the single-node fast path, the multi-node rebuild
 and the ordering artifact.
 
+## The device reads a tabulated spectrum as the host does (`DSpec`, 0.393.1)
+
+The host evaluates every `Spectrum` itself; the device used to read each material, medium and
+emitter spectrum off a 96-entry grid over 360-830 nm, 4.9 nm apart and linearly interpolated, so a
+feature narrower than that came out differently on the two backends (known-issues.md,
+DEVICE-SPECTRAL-GRID): a glass absorbing the red half of the band except in 3-5 nm windows read red
+1.25e10 on the GPU and 4.40e10 on the CPU, in modes R and M alike, partly from the windows and
+partly from its edge, which the grid moved 2 nm. The grid stays -- it is exact for constants and
+plenty for analytic curves, smooth on its scale -- and a curve the host can see is piecewise
+linear now also carries its own knots:
+
+* `spectrum.h`: the `table { }` and measured-file builders are named functor types
+  (`TabulatedLinear`, `TabulatedMono` for `interp=cubic`), so `spectrumKnots` can recover the knots
+  through `std::function::target`, seeing through `SharedSpectrum`/`ScaledSpectrum`. A cubic table
+  is split into 16 linear pieces per interval. Anything else (a lambda, Planck, Sellmeier) reports
+  no knots.
+* `render_cuda.cu`: `DSpec` is the grid plus optional knot arrays (wavelengths as float, values as
+  double) and a per-nm bucket index naming the last knot at or below each nm, so
+  `specLookup(const DSpec&, lambda)` finds the interval in a step or two and interpolates exactly
+  as the host's table does, clamping outside it. Every `DMaterial` spectrum, `DMedium::sigma_a`/
+  `sigma_s` and `DEmitter::emitSpd` is a `DSpec`, baked by `bakeSpec(Spectrum, DSpec&, DUpload&)`;
+  the lens index and the environment illuminant keep plain grids.
+
+`tools/check_spectral_grid.py` renders that glass and a room whose reflectance is fifteen 2 nm bands
+between the old grid's points in mode R on both backends: red GPU/CPU 0.30 and 0.017 before, 1.03
+(within the glass's noise) and 1.000 after. A scene without tables is unchanged; `gallery_rain` moves
+by 1.6e-4 (its gold's measured n and k are a table).
+
 ## GPU support gates fail safe, never coerce
 
 `cudaForwardSupported()` (`render_cuda.cu`) is the single gatekeeper — all eight GPU
