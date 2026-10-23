@@ -2156,6 +2156,25 @@ that frame in 194 s, K = 8 in 161 s (173 s before the hold). The wall-clock refr
 epochs by this same overhead, so it refreshes more often too: a 60 s `gallery_rain` still at
 640x360 now averages 14 realizations, against 6 before.
 
+**And a batch keeps them (0.393.0).** Under fixed epochs every frame of a flyby renders the same K
+realizations, so `BatchCache` (main.cpp; `-beamfreeze`'s one realization lived there before) keeps
+each one, traced and built once, for the whole batch, while an eighth of physical memory holds
+them; the scene's device copy is held for the batch too, mode D's frames included. A realization
+is ~47 MB on `gallery_rain` once its maps are trimmed to size and the host's surface-photon grid,
+which the device never reads when it grids its own (`cudaJSurfOnDevice`), is left unbuilt -- it was
+a 50 M-cell, 200 MB array for 29 k photons. The cache is keyed on everything a realization depends on,
+including whether the GPU gathers it: a map built for the device has no host trees, and a camera
+that falls back to the CPU mid-batch (a full card) rebuilds instead of gathering nothing, which is
+what `-beamfreeze`'s cache had done unnoticed. A frame rendered inside the batch is bit-identical to
+the same frame rendered alone. With the realizations kept, one per sample costs little, so it is now
+the default for a batch of several cameras and `-beamepochs spp` asks for it elsewhere. It is capped
+by `-beamrefresh`'s share (`jAutoEpochs`): the first frame renders its first sample (sample 0 of the
+frame under any K, so nothing waits on the decision), the device call's fixed cost and the sample's
+are read (`cudaLastBdptOverheadSec`), each realization's build is spread over the frames left when
+the batch can keep it, and the largest K within the share is settled once for the batch. It binds
+on a tiny frame (K = 8 of 16 at 64x36) and not at 1280x720. An explicit K below the samples gets a
+note in a batch.
+
 **Mode `M` has the same disease, and got the same cure in 0.252.0** (M-FROZEN in known-issues.md).
 A single-camera mode-`M` render builds its photon map, caustic map and beam map once and then
 spends the whole budget growing camera spp, so the light-side half of its error is a floor — and

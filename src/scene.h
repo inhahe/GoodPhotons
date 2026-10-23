@@ -1550,6 +1550,10 @@ struct Scene {
     // content): a key for per-scene caches that must not mistake one load for another just
     // because -serve built the next scene at the same address.
     uint64_t generation = [] { static std::atomic<uint64_t> next{1}; return next.fetch_add(1); }();
+    // How many times build() has run on this object. A device copy of the scene (render_cuda.h
+    // cudaHoldScene) is keyed on it as well as on `generation`, so geometry rebuilt in place is
+    // not rendered from a copy of the old.
+    uint64_t buildCount = 0;
     std::vector<Tri> tris;
     std::vector<Sphere> spheres;
     std::vector<Implicit> implicits;   // isosurfaces / metaballs / (smooth) CSG
@@ -3068,6 +3072,7 @@ struct Scene {
     // Finalize triangle normals and build the BVH. Call after all geometry is
     // added. Primitive index i: i < tris.size() -> tris[i]; else spheres[i-nTris].
     void build() {
+        ++buildCount;
         for (auto& t : tris) t.finalize();
         for (auto& bl : blasList) bl.build();   // shared instanced assets (local space)
         buildBvh();

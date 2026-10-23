@@ -170,7 +170,7 @@ with the device-or-host decision made inside render_cuda.cu.
 
 Logged rather than fixed: JFLYBY-REALIZATION-REUSE, below.
 
-## OPEN (2026-10-21): JFLYBY-REALIZATION-REUSE — a mode-J flyby rebuilds the same K light-side realizations, and re-uploads the same scene, for every frame
+## DONE (2026-10-23, 0.393.0): JFLYBY-REALIZATION-REUSE — a mode-J flyby rebuilt the same K light-side realizations, and re-uploaded the same scene, for every frame
 
 Under `-beamepochs K` every frame of a flyby renders the same K realizations (salt e, view-
 independent), yet each frame traces and builds all K again, in series with the GPU: on
@@ -188,6 +188,19 @@ loop, gets no hold at all. Three fixes, roughly in order of payoff:
   `g_rngSalt` into its seed), so the light pass would have to take its salt explicitly first.
 * **Hold the scene at the batch loop** rather than per frame, which also serves mode D's flybys and
   the meter pre-pass.
+
+**Fixed (0.393.0) by the first and third.** `BatchCache` (main.cpp, which replaced `JLightCache`)
+keeps each fixed epoch's realization for the batch while an eighth of physical memory holds them,
+and holds the scene's device copy for the batch -- mode D's frames included (`gallery_rain` mode D at
+160x90: 3.8 s for the first frame, 1.5 s for the next). Kept realizations are trimmed to size, and
+the host no longer grids the surface photons the device grids itself, which had been 200 MB of
+`cellStart` (50 M cells for 29 k photons) per realization: ~47 MB each now, ~3 GB for gallery_rain's
+64. A frame rendered after another in one batch is bit-identical to the same frame alone, and its
+light side costs 0 (`[jstats] 8 epochs (8 kept from earlier in the batch): trace 0.00s ...`).
+Overlap was not needed. Testing it showed the shared light side was not keyed on the device (nor
+had `-beamfreeze`'s been), so a camera that fell back to the CPU mid-batch (a card filled by another
+program) gathered nothing from maps built without host trees: in the test, a gallery_rain frame's
+cloud at 57 % brightness. The key now includes it.
 
 ## DONE (2026-10-21, 0.392.0): FLYBY-BEAM-STREAKS — the `gallery_rain` flyby showed every light beam in the cloud and rain as a sharp coloured streak
 

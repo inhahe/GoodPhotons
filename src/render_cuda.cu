@@ -21400,9 +21400,16 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
 // device pointers) and keeps its own per-call allocations in a DUpload of its own.
 struct CudaSceneHold {
     const Scene* scene = nullptr;
-    uint64_t generation = 0;   // with the address: a scene rebuilt where the old one was is new
+    uint64_t generation = 0;   // with the address: a scene loaded where the old one was is new
+    uint64_t buildCount = 0;   // and a scene rebuilt in place (Scene::build) is new too
     DUpload up;
 };
+bool cudaSceneHoldFits(const CudaSceneHold* held, const Scene& scene) {
+    return held && held->scene == &scene && held->generation == scene.generation &&
+           held->buildCount == scene.buildCount;
+}
+static double g_lastBdptOverheadSec = 0.0;
+double cudaLastBdptOverheadSec() { return g_lastBdptOverheadSec; }
 CudaSceneHold* cudaHoldScene(const Scene& scene) {
     if (!cudaAvailable()) return nullptr;
     // FTRACE_NOHOLD=1: hold nothing, so every call uploads the scene itself -- the A/B arm for
@@ -21412,6 +21419,7 @@ CudaSceneHold* cudaHoldScene(const Scene& scene) {
     CudaSceneHold* h = new CudaSceneHold;
     h->scene = &scene;
     h->generation = scene.generation;
+    h->buildCount = scene.buildCount;
     buildUploadScene(scene, h->up);
     return h;
 }
@@ -22071,6 +22079,13 @@ struct JSurfDev {
 // `-jhostlight` (see render_cuda.h). Set once from argv, read per render.
 static bool g_jHostLight = false;
 void cudaSetJHostLight(bool on) { g_jHostLight = on; }
+// renderBdptCuda's light-pass arm (see the level table there): 0 host, else the device's.
+static int jDevLightLevel() {
+    int level = g_jHostLight ? 0 : 3;
+    if (const char* e = std::getenv("FTRACE_JDEVLIGHT")) level = std::atoi(e);
+    return level;
+}
+bool cudaJSurfOnDevice() { return jDevLightLevel() != 0; }
 // Per-object render modes (0.386.0): see gpu::c_routeOn. Set by runRender before a D/J render.
 static int g_routeOn = 0, g_routeDefault = 1, g_routeAnyMedJ = 0;
 static double g_routeSppD = 1.0, g_routeSppJ = 1.0;
@@ -22605,6 +22620,9 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaBdptSupported(scene)) return out;
+    // Everything but the chunks is this call's fixed cost (cudaLastBdptOverheadSec): what a
+    // mode-J epoch pays on top of its samples.
+    const auto tCall0 = std::chrono::steady_clock::now();
     // Two kernel variants: the default shallow stack, and a deep one for scenes that need
     // it. Anything past BDPT_DEEPDEPTH still clamps — going deeper would need another
     // instantiation, and the local-memory footprint is already ~13 KB/thread there.
@@ -22615,7 +22633,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     if (held) {
         // A hold of another scene would render that scene's geometry under this one's camera,
         // lights and materials: refuse it rather than mix them.
-        if (held->scene != &scene || held->generation != scene.generation)
+        if (!cudaSceneHoldFits(held, scene))
             throw std::logic_error("renderBdptCuda: the held device scene is not the scene "
                                    "being rendered");
         up.sc = held->up.sc;
@@ -22724,8 +22742,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // DECIDED BEFORE THE UPLOAD BELOW, because the answer changes whether the upload is worth
     // doing at all: `buildJSurfMapDevice` opens with `dsm = gpu::DSurfMap{}`, so on the device
     // path every byte `uploadSurfMapCuda` converts and ships is overwritten a few lines later.
-    int jdevLevel = g_jHostLight ? 0 : 3;
-    if (const char* e = std::getenv("FTRACE_JDEVLIGHT")) jdevLevel = std::atoi(e);
+    const int jdevLevel = jDevLightLevel();
     const bool jDevLight = smap && smap->nEmitted > 0 && jdevLevel != 0;
 
     DSurfMap dsm{};
@@ -23064,8 +23081,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
       }
     };
 
+    const auto tCall1 = std::chrono::steady_clock::now();
     if (!prog || !prog->report) { launch(spp, sppBase); download(out); }   // single-shot
     else gpuSppChunks(spp, *prog, out, launch, download);
+    const auto tCall2 = std::chrono::steady_clock::now();
 
     freeUpload(up);
     if (wq.segs) {
@@ -23087,6 +23106,9 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         cudaFree(wq.segs); cudaFree(wq.hits); cudaFree(d_wfCounters);
     }
     cudaFree(d_cam); cudaFree(d_splat);
+    g_lastBdptOverheadSec =
+        std::chrono::duration<double>((tCall1 - tCall0) +
+                                      (std::chrono::steady_clock::now() - tCall2)).count();
     return out;
 }
 

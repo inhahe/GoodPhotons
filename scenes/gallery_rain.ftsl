@@ -213,10 +213,12 @@
 #     realizations, so they hold still in the world: curtain flicker (RMS, display 0-255) 9.3
 #     with the default wall-clock refresh, 5.9 even at 256 spp, 2.3 with 8 epochs.
 #     -beamfreeze is as still but is ONE realization: a static rainbow-barred curtain.
-#   * 64 epochs, not 8: a realization is ~14 k beams, so with 8 of them every beam of the
-#     cloud and rain is its own coloured streak, held still across the whole flyby. 64 makes
-#     them smooth (fly0009, luma RMSE over the cloud 0.236 -> 0.071) for 3:14 a frame against
-#     2:41 at 8 epochs.
+#   * 64 epochs, one per sample, not 8: a realization is ~14 k beams, so with 8 of them every
+#     beam of the cloud and rain is its own coloured streak, held still across the whole flyby.
+#     64 makes them smooth (fly0009, luma RMSE over the cloud 0.236 -> 0.071). Since 0.393.0 a
+#     batch gets one per sample by default and keeps each realization for every frame (~3 GB
+#     here), so after frame 0 the light side costs almost nothing; the bat still names 64, so a
+#     resumed run cannot land on another K.
 #   * -denoise after OIDN desaturates those streaks (curtain chroma error -20 %).
 # The paragraphs below predate all three (mode D, 600 frames, -spp 140): their per-frame
 # SPREAD and the -spp-not--time argument still hold; their seconds-per-spp do not.

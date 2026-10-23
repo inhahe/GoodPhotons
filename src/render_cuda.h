@@ -346,6 +346,20 @@ bool cudaBdptSupported(const Scene& scene);
 struct CudaSceneHold;
 CudaSceneHold* cudaHoldScene(const Scene& scene);
 void cudaReleaseScene(CudaSceneHold* held);
+// Whether `held` is a copy of `scene` as it is now: the same object, the same load
+// (Scene::generation) and the same build (Scene::buildCount). False for null.
+bool cudaSceneHoldFits(const CudaSceneHold* held, const Scene& scene);
+
+// Whether renderBdptCuda traces and grids mode J's surface photon map on the device itself (the
+// default; -jhostlight or FTRACE_JDEVLIGHT=0 keep it on the host). Then it reads only the host
+// map's photon count, emission count and radius, so the host need not grid it
+// (bdpt::SurfMap::radiusOnly).
+bool cudaJSurfOnDevice();
+
+// The fixed cost of the last renderBdptCuda call, in seconds: everything but its chunks (the
+// setup before the first launch and the teardown after the last). Mode J's epoch loop reads
+// it to weigh one light-side realization per sample against the samples themselves.
+double cudaLastBdptOverheadSec();
 
 // GPU bidirectional path trace (mode D). Renders `spp` samples per pixel at the given
 // resolution and returns the film accumulated as a SUM over spp (display divides by

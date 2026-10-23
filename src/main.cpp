@@ -12579,7 +12579,7 @@ static bool      g_beamRefreshSet  = false;
 // `-beamepochs K` (alias `-lightepochs`): mode J's refresh with its epochs fixed by SAMPLE COUNT
 // instead of by the wall clock -- the frame's samples split into K equal epochs (over their
 // absolute indices, so a resume keeps the layout: renderChunked), epoch e drawing the
-// light-side realization of salt e. The light side is view-independent (see JLightCache), so
+// light-side realization of salt e. The light side is view-independent (see BatchCache), so
 // every camera of a flyby then averages the SAME K realizations: from frame to frame the
 // light-side noise holds still in the world instead of flickering, while each frame still
 // averages K of them. The wall-clock refresh cannot give that -- how many epochs fit, and so
@@ -12587,10 +12587,19 @@ static bool      g_beamRefreshSet  = false;
 // -beamfreeze, which can, is K = 1 and looks it: one realization of gallery_rain's rain shaft
 // is a few thousand saturated single-wavelength streaks. Measured there at 64 spp (seed-to-seed
 // RMS, display 0-255, 4x4 downsample, after -oidn -denoise): the curtain flickers 7.4 refreshed
-// and 2.3 with the light side held still. 0, the default, is the wall-clock refresh (the flag
-// itself takes K >= 1). Needs a fixed -spp. The GPU chunks are pinned to 1 spp while it is on,
-// so the device's per-chunk surface-photon redraws (salted by the chunk's first sample) also
-// fall on the same samples in every frame.
+// and 2.3 with the light side held still. Needs a fixed -spp. The GPU chunks are pinned to 1 spp
+// while it is on, so the device's per-chunk surface-photon redraws (salted by the chunk's first
+// sample) also fall on the same samples in every frame.
+//
+// K wants to be the spp. A realization is one knee-sized beam map (~14 k beams on gallery_rain),
+// so a frame sees K of them and no more; at K = spp/8 every beam of gallery_rain's rain and cloud
+// stayed a visible streak (FLYBY-BEAM-STREAKS). `-beamepochs spp` asks for one per sample, and it
+// is what a batch of several cameras (a flyby) gets when the flag is absent, capped so the light
+// side stays within -beamrefresh's share of the frame (jAutoEpochs). `-beamepochs off` keeps the
+// wall-clock refresh even in a batch. Values: K >= 1, kBeamEpochsSpp, kBeamEpochsOff, or 0 for
+// not given (one per sample in a batch, the wall-clock refresh for a single camera).
+constexpr int    kBeamEpochsSpp    = -1;
+constexpr int    kBeamEpochsOff    = -2;
 static int       g_beamEpochs      = 0;
 // The retuned value for a mode-J render whose light side is on the device (0.272.4). Measured
 // 1.56x better than 0.10 on `_fog_thick` whole-frame variance, with 0.60 worse than 0.30, so the
@@ -16777,7 +16786,31 @@ static int runCompositeProgressive(
     return writeOk ? 0 : 1;
 }
 
-// MODE J'S LIGHT SIDE, SHARED ACROSS THE CAMERAS OF ONE BATCH (-beamfreeze).
+// `-beamepochs spp`'s K: the largest K <= T (the frame's samples) whose light side stays within
+// `frac` of the frame (-beamrefresh's share). Each of the K epochs pays the device call's fixed
+// cost `tSetup`, and each realization its build `tBuild` -- spread over the `framesLeft` frames
+// of the batch when the batch can keep it (the first `keepable` of them), paid by every frame
+// when it cannot. `tSpp` is what one sample of the frame costs. Decided once per batch, from
+// the first frame's epoch 0, so every frame of the batch renders the same K realizations.
+static long long jAutoEpochs(long long T, double tSetup, double tBuild, double tSpp,
+                             double framesLeft, long long keepable, double frac) {
+    if (T <= 1) return 1;
+    const double allow = frac / (1.0 - frac) * (double)T * tSpp;
+    auto light = [&](long long K) {
+        const long long kept = std::min(K, keepable);
+        return (double)K * tSetup +
+               tBuild * ((double)kept / std::max(framesLeft, 1.0) + (double)(K - kept));
+    };
+    if (light(T) <= allow) return T;
+    long long lo = 1, hi = T;               // light() grows with K: the largest K it allows
+    while (lo < hi) {
+        const long long mid = (lo + hi + 1) / 2;
+        if (light(mid) <= allow) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+}
+
+// WHAT THE CAMERAS OF ONE BATCH SHARE: mode J's light side, and the device copy of the scene.
 //
 // The beam map and the surface photon map are VIEW-INDEPENDENT: `traceLightBeamPass` takes a
 // `Camera&` only to hand it to `generateLightSubpath`, whose `randomWalk` opens with
@@ -16787,50 +16820,117 @@ static int runCompositeProgressive(
 // "To the bit" is not a hope here, it is forced by three things that already hold:
 //   * the light pass seeds per ABSOLUTE subpath index (`seedUnit(rng, salt + i, ...)` in
 //     bdpt.h), so the map does not depend on the thread count or on the chunking;
-//   * the only per-pass salt is `RngSaltScope(epoch)`, and epoch 0 is the identity
-//     (rng.h: "`k == 0` is the identity"), so every camera's epoch 0 draws one stream;
+//   * the only per-pass salt is `RngSaltScope(epoch)`, a function of the epoch index alone
+//     (and epoch 0 is the identity: rng.h), so every camera's epoch e draws one stream;
 //   * the budget pilot has its own fixed seed, so `jbb` comes back the same too.
-// So this cache changes the render's COST and not its pixels, and that is testable rather
-// than arguable -- see known-issues.md PERF.
+// So sharing changes the render's COST and not its pixels, and that is testable rather than
+// arguable: a frame rendered inside a batch is bit-identical to the same frame rendered alone.
 //
-// It is gated on `-beamfreeze` for a reason that is not conservatism. Without the freeze the
-// light side is REDRAWN between epochs under a fresh salt (UPBP-THICK), and which realization
-// a camera ends on then depends on how many epochs its own budget fitted -- so there is no one
-// map to share, and hoisting one would silently hand frame 2 whatever realization frame 1
-// happened to stop on. Transposing the loops (one epoch, all cameras, repeat) is the version
-// that shares a refreshing light side, and it is a different change.
-struct JLightCache {
+// Two light sides can be shared, each only where every camera would draw the same one:
+//   * `-beamfreeze`'s single realization (`bmap`/`smap`, under `matches`);
+//   * `-beamepochs`'s realizations by epoch index (`epochs`), since under fixed epochs every
+//     frame renders the same K. Each is kept for the batch while the cache's memory share
+//     lasts (`keepEpoch`), so a flyby traces and builds it once (JFLYBY-REALIZATION-REUSE).
+// The wall-clock refresh shares nothing: which realizations a camera gets depends on how many
+// epochs its own budget fitted, so there is no one set to share.
+//
+// And for every GPU mode-D/J render of the batch, one device copy of the scene (`sceneHold`),
+// uploaded once instead of once per frame (and, in mode J, once per epoch).
+struct BatchCache {
     BeamMap              bmap;
     bdpt::SurfMap        smap;
     bdpt::BeamBudgetInfo jbb;
-    // The key. Everything `buildLightSide(0)` reads that a second camera could differ in:
+    // The key. Everything `buildLightSide(e)` reads that a second camera could differ in:
     // `-n`, the film (which sizes `jreq.surfPaths` on a media-free -jsurf run AND, via
-    // res*resY*spp, buildBeamMap's split length), and the transport parameters. The rest of
-    // its inputs are command-line globals, fixed for the process, so they cannot vary between
-    // two cameras of one batch and are deliberately not copied here.
+    // res*resY*spp, buildBeamMap's split length), the transport parameters, and whether the GPU
+    // gathers the maps: one built for it has no host beam tree (jSkipHostBvh) and no host surface
+    // grid (SurfMap::radiusOnly), so a camera that fell back to the CPU mid-batch would gather
+    // nothing from it. The rest of its inputs are command-line globals, fixed for the process, so
+    // they cannot vary between two cameras of one batch and are deliberately not copied here.
     const Scene* scene = nullptr;
     long long    N = 0, spp = 0;
     int          res = 0, resY = 0, maxDepth = 0, nThreads = 0;
-    bool         diffraction = false, wantBeams = false, wantSurf = false;
+    bool         diffraction = false, wantBeams = false, wantSurf = false, gpu = false;
     double       surfRadius = 0.0;
     bool         valid = false;
 
+    // -beamepochs's realizations, by epoch index; null where one was not kept. Valid under the
+    // key above, and dropped with it.
+    struct Realization { BeamMap bmap; bdpt::SurfMap smap; };
+    std::vector<std::unique_ptr<Realization>> epochs;
+    size_t epochBytes = 0;       // what `epochs` holds
+    size_t epochBudget = 0;      // what it may hold: an eighth of physical memory (keepEpoch)
+    long long autoK = 0;         // `-beamepochs spp`'s K, decided once for the batch (jAutoEpochs)
+    bool epochsSaid = false;     // the batch's epoch note is out
+    size_t frames = 1;           // cameras in this batch
+    size_t framesLeft = 1;       // of them, still to render, the current one included
+#ifdef HAVE_CUDA
+    CudaSceneHold* held = nullptr;
+#endif
+
     bool matches(const Scene* sc, long long n, long long sp, int rx, int ry, int md, int nt,
-                 bool diff, bool wb, bool ws, double sr) const {
+                 bool diff, bool wb, bool ws, double sr, bool g) const {
         return valid && scene == sc && N == n && spp == sp && res == rx && resY == ry &&
                maxDepth == md && nThreads == nt && diffraction == diff &&
-               wantBeams == wb && wantSurf == ws && surfRadius == sr;
+               wantBeams == wb && wantSurf == ws && surfRadius == sr && gpu == g;
     }
     void stamp(const Scene* sc, long long n, long long sp, int rx, int ry, int md, int nt,
-               bool diff, bool wb, bool ws, double sr) {
+               bool diff, bool wb, bool ws, double sr, bool g) {
+        if (!matches(sc, n, sp, rx, ry, md, nt, diff, wb, ws, sr, g)) dropEpochs();
         scene = sc; N = n; spp = sp; res = rx; resY = ry; maxDepth = md; nThreads = nt;
-        diffraction = diff; wantBeams = wb; wantSurf = ws; surfRadius = sr; valid = true;
+        diffraction = diff; wantBeams = wb; wantSurf = ws; surfRadius = sr; gpu = g;
+        valid = true;
+    }
+    const Realization* epochAt(uint64_t e) const {
+        return (e < epochs.size()) ? epochs[(size_t)e].get() : nullptr;
+    }
+    // Move epoch e's freshly built maps into the batch when there is room, returning the kept
+    // copy (and leaving `b`/`s` empty), or null when it does not fit (the maps stay where they
+    // are, and every frame builds this realization again).
+    const Realization* keepEpoch(uint64_t e, BeamMap& b, bdpt::SurfMap& s) {
+        b.shrinkToFit(); s.shrinkToFit();
+        const size_t bytes = realizationBytes(b, s);
+        if (epochBudget == 0) {
+            double phys = 0.0;
+            if (ftalloc::memStat) { const ftalloc::MemStat m = ftalloc::memStat(); phys = m.totalPhys; }
+            epochBudget = phys > 0.0 ? (size_t)(phys / 8.0) : ((size_t)4 << 30);
+        }
+        if (epochBytes + bytes > epochBudget) return nullptr;
+        if (epochs.size() <= e) epochs.resize((size_t)e + 1);
+        epochs[(size_t)e] = std::make_unique<Realization>(Realization{std::move(b), std::move(s)});
+        b = BeamMap{}; s = bdpt::SurfMap{};
+        epochBytes += bytes;
+        return epochs[(size_t)e].get();
+    }
+    // How many realizations of `bytes` each the batch can keep, for jAutoEpochs's weighing.
+    long long keepable(size_t bytes) const {
+        const size_t budget = epochBudget ? epochBudget : ((size_t)4 << 30);
+        return bytes ? (long long)((budget > epochBytes ? budget - epochBytes : 0) / bytes) : 0;
+    }
+    void dropEpochs() { epochs.clear(); epochBytes = 0; autoK = 0; epochsSaid = false; }
+#ifdef HAVE_CUDA
+    // The batch's device copy of `sc`, made on first use and remade if the scene changed under
+    // it (another load, or a rebuild in place).
+    const CudaSceneHold* sceneHold(const Scene& sc) {
+        if (!cudaSceneHoldFits(held, sc)) { cudaReleaseScene(held); held = cudaHoldScene(sc); }
+        return held;
+    }
+#endif
+    // Bytes held by one realization's maps (the containers' allocations), for the cache's budget.
+    static size_t realizationBytes(const BeamMap& b, const bdpt::SurfMap& s) {
+        return b.heapBytes() + s.heapBytes();
     }
     // Explicit rather than left to the destructor: the maps are hundreds of MB and the batch
     // holds this object until every camera is done, so the caller drops it the moment the
-    // last mode-J frame is written rather than at scope exit.
-    void clear() { bmap = BeamMap{}; smap = bdpt::SurfMap{}; jbb = bdpt::BeamBudgetInfo{};
-                   valid = false; }
+    // last frame is written rather than at scope exit.
+    void clear() {
+        bmap = BeamMap{}; smap = bdpt::SurfMap{}; jbb = bdpt::BeamBudgetInfo{};
+        valid = false; dropEpochs();
+#ifdef HAVE_CUDA
+        cudaReleaseScene(held); held = nullptr;
+#endif
+    }
+    ~BatchCache() { clear(); }
 };
 
 // Render one camera into `outPath`. Resolves the -device request for THIS mode,
@@ -16899,8 +16999,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      bool preview = false, double intervalSec = 15.0,
                      double noiseTarget = 0.0, bool wavefront = false,
                      double* exposureAnchor = nullptr, bool rgbBackward = false,
-                     int maxBounceOverride = -1, bool directOnly = false,
-                     JLightCache* jcache = nullptr) {
+                     BatchCache* batch = nullptr) {
     // PER-OBJECT RENDER MODES (0.386.0): `mode D` / `mode J` on an object, group, material or
     // medium (Material::route, Medium::route). Modes D and J are one renderer -- J is D plus its
     // merges -- so a frame can switch between them path by path: each path is routed by what its
@@ -17442,7 +17541,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 #ifdef HAVE_CUDA
             // g_heroC > 1 enables the hero-wavelength bundle on both subpaths; the kernel
             // applies the media/GRIN/lens gate itself (matching the CPU BdptRenderer).
-            if (useGpu) return renderBdptCuda(scene, cam, res, resY, sppTarget, maxDepth, diffraction, p, g_heroC);
+            if (useGpu) return renderBdptCuda(scene, cam, res, resY, sppTarget, maxDepth, diffraction, p, g_heroC,
+                                              nullptr, nullptr, nullptr,
+                                              batch ? batch->sceneHold(scene) : nullptr);
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
@@ -17568,11 +17669,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         g_noBeams ? "-nobeams was given" : "no participating media",
                         surfRadius0, g_vcmAlpha);
         warnBeamsGrinMedia(scene, wantBeams);
-        // THE THREE OBJECTS THAT MOVE AS A UNIT (see JLightCache): the beam map, the surface
+        // THE THREE OBJECTS THAT MOVE AS A UNIT (see BatchCache): the beam map, the surface
         // photon map built from the SAME subpaths, and the budget the pilot settled on. They
-        // live in the batch's cache when this render can share one -- a flyby under
-        // `-beamfreeze` -- and in a local otherwise, so an unshared render still owns its map
-        // and releases it at the end of its own scope exactly as before.
+        // live in the batch's cache when this render can share them -- a flyby under
+        // `-beamfreeze` or fixed epochs -- and in a local otherwise, so an unshared render still
+        // owns its map and releases it at the end of its own scope exactly as before.
         // "Every beam map built inside this mode-J render will be gathered on the device."
         // Scoped rather than assigned, because runRender leaves this block through
         // runSppProgressive and a bare assignment would leak the state into the next camera of
@@ -17592,9 +17693,21 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             }
             ~JRefreshScope() { if (active) g_beamRefreshFrac = prev; }
         } jrfScope(jSkipHostBvh() && !g_beamRefreshSet && !g_beamFreeze);
-        const bool shareLight = (jcache != nullptr) && g_beamFreeze;
-        JLightCache jlocal;
-        JLightCache& jlc = shareLight ? *jcache : jlocal;
+        // THE EPOCH REQUEST. Fixed epochs when -beamepochs names K or `spp`, and one realization
+        // per sample by default in a batch of several cameras (a flyby), where the wall-clock
+        // refresh would hand every frame different realizations -- unless `-beamepochs off`.
+        // Only against a fixed -spp: a -time/-noise/-forever budget has no total to split, and
+        // -beamfreeze holds one realization throughout. Whether the maps turn out non-empty is
+        // the last condition, settled once epoch 0 exists (`fixedEpochs` below).
+        const bool budgetedJ = timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever;
+        const bool inBatch   = batch && batch->frames > 1;
+        const bool perSample = g_beamEpochs == kBeamEpochsSpp || (g_beamEpochs == 0 && inBatch);
+        const bool epochsAsked  = g_beamEpochs > 0 || perSample;
+        const bool epochsWanted = epochsAsked && !g_beamFreeze && !budgetedJ && (wantBeams || wantSurf);
+        const bool shareFrozen = batch && g_beamFreeze;
+        const bool shareEpochs = inBatch && epochsWanted;   // a lone camera reuses nothing
+        BatchCache jlocal;
+        BatchCache& jlc = (shareFrozen || shareEpochs) ? *batch : jlocal;
         BeamMap&       bmap = jlc.bmap;
         bdpt::SurfMap& smap = jlc.smap;
         StageProgress stageProg = makeStageProgress(res, resY);
@@ -17824,6 +17937,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 // schedule is what keeps the point merges consistent. Epoch 0 gets exactly
                 // surfRadius0 (pow(1, x) == 1), so the first realization is unchanged.
                 const auto tsb = std::chrono::steady_clock::now();
+                // The device grids its own map per chunk; the host's grid would go unread.
+#ifdef HAVE_CUDA
+                if (useGpu && cudaJSurfOnDevice()) smap.radiusOnly(surfRadiusFor(epoch));
+                else
+#endif
                 smap.build(surfRadiusFor(epoch));
                 lsSurfSec += std::chrono::duration<double>(
                                  std::chrono::steady_clock::now() - tsb).count();
@@ -17840,12 +17958,41 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                          "-jsurf is doing nothing here.\n");
             }
         };
+        // The realization the render draws from now: the working maps (`bmap`/`smap`), or the
+        // batch's kept copy of an epoch's (BatchCache::epochs). Every reader goes through these.
+        const BeamMap*       curB = &bmap;
+        const bdpt::SurfMap* curS = &smap;
+        double    build0Sec = 0.0;    // what epoch 0's build cost this render (0: the batch had it)
+        long long lsReused  = 0;      // epochs drawn from the batch's kept realizations
+        // Make epoch e's realization current: the batch's copy when it kept one, else built into
+        // the working maps -- and kept for the batch's other frames when it fits. Only a fixed
+        // epoch's realization is kept (saltOff 0): the wall-clock refresh's are drawn once.
+        // Returns what the build cost, 0 for a kept one.
+        auto realize = [&](uint64_t e, uint64_t saltOff) -> double {
+            if (shareEpochs && saltOff == 0) {
+                if (const BatchCache::Realization* r = jlc.epochAt(e)) {
+                    curB = &r->bmap; curS = &r->smap; ++lsReused;
+                    return 0.0;
+                }
+            }
+            const auto tb = std::chrono::steady_clock::now();
+            buildLightSide(e, saltOff);
+            const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tb).count();
+            curB = &bmap; curS = &smap;
+            if (shareEpochs && saltOff == 0)
+                if (const BatchCache::Realization* r = jlc.keepEpoch(e, bmap, smap)) {
+                    curB = &r->bmap; curS = &r->smap;
+                }
+            return sec;
+        };
         if (wantBeams || wantSurf) {
             // A CACHE HIT IS THE WHOLE FLYBY WIN. `matches` is false by construction on the
             // first camera and on any unshared render (`jlocal.valid` starts false), so this
-            // reduces to the historical single call everywhere except the case it is for.
-            if (jlc.matches(&scene, N, spp, res, resY, maxDepth, nThreads, diffraction,
-                            wantBeams, wantSurf, surfRadius0)) {
+            // reduces to the historical single call everywhere except the cases it is for.
+            const bool keyOk = jlc.matches(&scene, N, spp, res, resY, maxDepth, nThreads,
+                                           diffraction, wantBeams, wantSurf, surfRadius0,
+                                           useGpu);
+            if (shareFrozen && keyOk) {
                 std::printf("mode J: UPBP at %dx%d — camera pass on %s (maxDepth=%d, "
                             "light=%s) — reusing this batch's frozen light side: %zu beams"
                             " / %zu surface photons from %lld subpaths. Retracing it for this"
@@ -17854,10 +18001,25 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                             res, resY, camWhere.c_str(), maxDepth, lightLabel,
                             bmap.beams.size(), smap.size(), bmap.nEmitted);
             } else {
-                buildLightSide(0);
-                if (shareLight)
+                // Stamped first under epochs: a camera with other settings drops the batch's
+                // realizations rather than render against them.
+                if (shareEpochs)
                     jlc.stamp(&scene, N, spp, res, resY, maxDepth, nThreads, diffraction,
-                              wantBeams, wantSurf, surfRadius0);
+                              wantBeams, wantSurf, surfRadius0, useGpu);
+                if (shareEpochs && jlc.epochAt(0)) {
+                    realize(0, 0);
+                    std::printf("mode J: UPBP at %dx%d — camera pass on %s (maxDepth=%d, "
+                                "light=%s) — rendering against this batch's kept light side "
+                                "(%zu realization(s), %.0f MB): retracing them for this camera "
+                                "would reproduce them bit-for-bit ...\n",
+                                res, resY, camWhere.c_str(), maxDepth, lightLabel,
+                                jlc.epochs.size(), (double)jlc.epochBytes / (1024.0 * 1024.0));
+                } else {
+                    build0Sec = realize(0, 0);
+                }
+                if (shareFrozen)
+                    jlc.stamp(&scene, N, spp, res, resY, maxDepth, nThreads, diffraction,
+                              wantBeams, wantSurf, surfRadius0, useGpu);
             }
         } else {
             std::printf("mode J: UPBP at %dx%d on %s (maxDepth=%d, light=%s) ...\n",
@@ -17866,9 +18028,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // An empty map is passed as null, so the renderer's merge path is not merely skipped
         // per-ray but never entered — which is what makes gate (1)'s "bit-identical to mode D"
         // a property of the code rather than of floating-point luck. Same for the photons.
-        const BeamMap* beamsPtr = (wantBeams && !bmap.empty()) ? &bmap : nullptr;
+        // Whether each is there is settled by epoch 0; which realization they point at moves
+        // with the epoch (realize).
+        const BeamMap* beamsPtr = (wantBeams && !curB->empty()) ? curB : nullptr;
         const bdpt::SurfMap* photonsPtr =
-            (wantSurf && !smap.empty() && smap.nEmitted > 0) ? &smap : nullptr;
+            (wantSurf && !curS->empty() && curS->nEmitted > 0) ? curS : nullptr;
         // `held`: the device copy of the scene that every epoch of one frame renders against
         // (cudaHoldScene, owned by renderChunked's epoch loop); null where the single call
         // uploads the scene itself.
@@ -17918,10 +18082,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // -beamepochs (g_beamEpochs): epochs fixed by sample count, the same K realizations for
         // every camera. Only meaningful against a fixed -spp: a -time/-noise/-forever budget has
         // no total to split, and -beamfreeze already holds one realization throughout.
-        const bool budgetedJ   = timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever;
-        const bool fixedEpochs = g_beamEpochs > 0 && !g_beamFreeze && !budgetedJ &&
-                                 (beamsPtr || photonsPtr);
-        if (g_beamEpochs > 0 && !fixedEpochs) {
+        const bool fixedEpochs = epochsWanted && (beamsPtr || photonsPtr);
+        // Only a flag that was given is said to be ignored: a batch's default falls back silently.
+        if ((g_beamEpochs > 0 || g_beamEpochs == kBeamEpochsSpp) && !fixedEpochs) {
             static bool said = false;
             if (!said) {
                 said = true;
@@ -17931,19 +18094,31 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                            "-time/-noise/-forever budget instead"
                                          : "there is no light-side map to redraw");
             }
-        } else if (fixedEpochs) {
-            // An epoch holds at least one sample, so there are at most -spp of them.
-            const long long nEp = std::min<long long>(g_beamEpochs, std::max<long long>(spp, 1));
-            static bool said = false;
-            if (!said) {
-                said = true;
-                std::printf("mode J: -beamepochs %d: each camera's samples split into %lld equal "
-                            "epochs over the same %lld light-side realizations, so the light-side "
-                            "noise holds still from frame to frame%s%s\n",
-                            g_beamEpochs, nEp, nEp,
-                            nEp < g_beamEpochs ? " (no more epochs than -spp)" : "",
-                            useGpu ? " (GPU chunks pinned to 1 spp)" : "");
-            }
+        }
+        // The batch's epoch note, once (or once per render for a single camera, whose cache is
+        // its own). One realization per sample is announced when its K is known (renderChunked).
+        if (fixedEpochs && !perSample && !jlc.epochsSaid) {
+            jlc.epochsSaid = true;
+            // Epochs of equal whole samples: at most -spp of them, and K of ceil(spp/K) samples
+            // each is really ceil(spp / ceil(spp/K)).
+            const long long sp1 = std::max<long long>(spp, 1);
+            const long long perEp = (sp1 + std::min<long long>(g_beamEpochs, sp1) - 1) /
+                                    std::min<long long>(g_beamEpochs, sp1);
+            const long long nEp = (sp1 + perEp - 1) / perEp;
+            std::printf("mode J: -beamepochs %d: each camera's samples split into %lld equal "
+                        "epochs over the same %lld light-side realizations, so the light-side "
+                        "noise holds still from frame to frame%s%s\n",
+                        g_beamEpochs, nEp, nEp,
+                        nEp < g_beamEpochs ? " (as many as epochs of whole samples allow)" : "",
+                        useGpu ? " (GPU chunks pinned to 1 spp)" : "");
+            // FLYBY-BEAM-STREAKS: what a low K looks like across a flyby.
+            if (inBatch && nEp < spp)
+                std::printf("[mode J] note: that is %lld samples per realization. A realization "
+                            "holds only ~%lld beams, so in a medium each can show as a streak -- "
+                            "held still across every frame of the batch. -beamepochs spp draws "
+                            "one per sample.\n",
+                            (spp + nEp - 1) / nEp,
+                            jbb.budget > 0 ? jbb.budget : (long long)curB->beams.size());
         }
         fixedEpochsOn = fixedEpochs;
 #ifdef HAVE_CUDA
@@ -17956,19 +18131,23 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         auto renderChunked = [&](long long sppTarget, const SppProgress* prog) -> Film {
             // Nothing to decorrelate (no map => mode D exactly, and gate 1a requires that path
             // stay bit-identical), or the user asked for the historical single map.
-            if ((!beamsPtr && !photonsPtr) || g_beamFreeze || !prog || !prog->report)
-                return renderEpoch(sppTarget, prog);
-            // One upload of the scene for every epoch of this frame instead of one per epoch.
-            // It lives until the frame's last epoch returns, so the progress reports inside the
-            // epochs (which write the -interval images, through OIDN when it is on) run with it
-            // resident.
+            // One upload of the scene for every epoch of this frame instead of one per epoch: the
+            // batch's copy, which every frame of it shares, or one held for this frame alone. It
+            // stays resident through the progress reports inside the epochs (which write the
+            // -interval images, through OIDN when it is on).
 #ifdef HAVE_CUDA
-            const std::unique_ptr<CudaSceneHold, void (*)(CudaSceneHold*)> holdOwner(
-                useGpu ? cudaHoldScene(scene) : nullptr, cudaReleaseScene);
-            const CudaSceneHold* const held = holdOwner.get();
+            std::unique_ptr<CudaSceneHold, void (*)(CudaSceneHold*)> holdOwner(nullptr,
+                                                                               cudaReleaseScene);
+            const CudaSceneHold* held = nullptr;
+            if (useGpu) {
+                if (batch) held = batch->sceneHold(scene);
+                else { holdOwner.reset(cudaHoldScene(scene)); held = holdOwner.get(); }
+            }
 #else
             const CudaSceneHold* const held = nullptr;
 #endif
+            if ((!beamsPtr && !photonsPtr) || g_beamFreeze || !prog || !prog->report)
+                return renderEpoch(sppTarget, prog, held);
             using clk = std::chrono::steady_clock;
             Film acc; acc.resX = res; acc.resY = resY; acc.alloc();
             long long sppAll = 0;
@@ -17984,18 +18163,50 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // beam split to the run's spp.) Otherwise an epoch ends on the clock.
             const long long base   = prog ? prog->sampleBase : 0;
             const long long total  = base + sppTarget;
-            const long long nFixed = fixedEpochs ? std::max(1LL, std::min<long long>(g_beamEpochs, total)) : 0;
-            const long long epLen  = nFixed ? (total + nFixed - 1) / nFixed : 0;
+            // K: as given; or one per sample, capped once for the batch (jAutoEpochs) from what
+            // epoch 0's first sample costs. That first sample is sample 0 of the frame under any
+            // K, so it can be rendered before K is known; a frame resumed part-way cannot wait
+            // for it, and takes K = T uncapped.
+            long long nFixed = 0;
+            bool decideK = false;
+            if (fixedEpochs) {
+                if (!perSample)          nFixed = std::min<long long>(g_beamEpochs, total);
+                else if (jlc.autoK > 0)  nFixed = std::min<long long>(jlc.autoK, total);
+                else {
+                    nFixed  = total;
+                    decideK = (base == 0 && total > 1);
+                    if (!decideK) jlc.autoK = total;
+                }
+                nFixed = std::max(1LL, nFixed);
+            }
+            long long epLen = nFixed ? (total + nFixed - 1) / nFixed : 0;
+            if (nFixed) nFixed = (total + epLen - 1) / epLen;   // the epochs there really are
+            if (fixedEpochs && perSample && !jlc.epochsSaid) {
+                jlc.epochsSaid = true;
+                std::printf("mode J: one light-side realization per sample (K = %lld%s)%s: every "
+                            "camera renders the same ones, so the light-side noise holds still from "
+                            "frame to frame%s%s\n",
+                            nFixed, decideK ? ", unless that would cost more than "
+                                              "-beamrefresh's share of the frame" : "",
+                            g_beamEpochs == 0 ? ", the default for a batch of several cameras "
+                                                "(-beamepochs K to choose, off for the wall-clock "
+                                                "refresh)" : " (-beamepochs spp)",
+                            shareEpochs ? "; each is traced once and kept for the batch while "
+                                          "an eighth of memory holds them" : "",
+                            useGpu ? " (GPU chunks pinned to 1 spp)" : "");
+            }
             uint64_t lsEpoch = 0;                    // whose realization the maps hold now
+            uint64_t nRealized = 1;                  // realizations this frame drew (epoch 0's)
             for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
                 double rebuildSec = 0.0;
                 const uint64_t want = nFixed ? (uint64_t)((base + sppAll) / epLen) : epoch;
                 if (nFixed ? want != lsEpoch : epoch > 0) {
-                    auto tr = clk::now();
-                    if (nFixed) buildLightSide(want, 0);
-                    else        buildLightSide(epoch, prog ? (uint64_t)prog->sampleBase : 0ull);
+                    rebuildSec = nFixed ? realize(want, 0)
+                                        : realize(epoch, prog ? (uint64_t)prog->sampleBase : 0ull);
+                    if (beamsPtr)   beamsPtr   = curB;
+                    if (photonsPtr) photonsPtr = curS;
                     lsEpoch = want;
-                    rebuildSec = std::chrono::duration<double>(clk::now() - tr).count();
+                    ++nRealized;
                     // A refresh that came back empty would leave the gather pointing at an
                     // empty map, which silently turns the rest of the render into mode D.
                     // Cannot happen if epoch 0 was non-empty (same scene, same counts), but
@@ -18012,12 +18223,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     // `-jsurf` on a media-free scene the beam map is legitimately empty every
                     // epoch, and treating that as a failure would stop the render on its
                     // first refresh.
-                    if ((beamsPtr && bmap.empty()) || (photonsPtr && smap.empty())) {
+                    if ((beamsPtr && curB->empty()) || (photonsPtr && curS->empty())) {
                         std::fprintf(stderr, "[mode J] light-side refresh produced an empty "
                                              "%s map; stopping here with the %lld spp already "
                                              "averaged over %llu realization(s).\n",
-                                     (beamsPtr && bmap.empty()) ? "beam" : "surface photon",
-                                     sppAll, (unsigned long long)epoch);
+                                     (beamsPtr && curB->empty()) ? "beam" : "surface photon",
+                                     sppAll, (unsigned long long)(nRealized - 1));
                         break;
                     }
                 }
@@ -18089,29 +18300,65 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 Film f = renderEpoch(nFixed ? std::min<long long>((long long)(want + 1) * epLen, total)
                                                   - (base + sppAll)
                                             : sppTarget - sppAll, &inner, held);
-                lsGatherSec += std::chrono::duration<double>(clk::now() - tg).count();
+                const double callSec = std::chrono::duration<double>(clk::now() - tg).count();
+                lsGatherSec += callSec;
                 g_gpuQuietRebuild = false;
                 if (epochSpp <= 0) break;      // produced nothing; refreshing again cannot help
                 acc.merge(f);
                 sppAll += epochSpp;
+                // Epoch 0 has rendered its first sample: settle K for the batch. Epoch 0 simply
+                // runs on if K turns out smaller than one per sample.
+                if (decideK) {
+                    decideK = false;
+#ifdef HAVE_CUDA
+                    const double tSetup = useGpu ? cudaLastBdptOverheadSec() : 0.0;
+#else
+                    const double tSetup = 0.0;
+#endif
+                    const double tSpp = std::max(callSec - tSetup, 1e-6) / (double)epochSpp;
+                    const size_t bytes = BatchCache::realizationBytes(*curB, *curS);
+                    const long long keepable =
+                        shareEpochs ? (long long)(jlc.epochAt(0) ? 1 : 0) + jlc.keepable(bytes) : 0;
+                    const double framesLeft = shareEpochs ? (double)jlc.framesLeft : 1.0;
+                    long long K = jAutoEpochs(total, tSetup, build0Sec, tSpp, framesLeft,
+                                              keepable, g_beamRefreshFrac);
+                    // Equal epochs of whole samples: K epochs of ceil(T/K) is really
+                    // ceil(T / ceil(T/K)) of them, which is the K to report and keep.
+                    K = (total + (total + K - 1) / K - 1) / ((total + K - 1) / K);
+                    jlc.autoK = K;
+                    if (K < total) {
+                        nFixed = K;
+                        epLen  = (total + K - 1) / K;
+                        std::printf("[mode J] one light-side realization per sample would spend more "
+                                    "than %.0f%% of each frame on the light side (an epoch's fixed "
+                                    "cost %.3fs and its build %.3fs, against %.3fs a sample), so K = "
+                                    "%lld for this batch. Pass -beamepochs %lld to keep a resumed run "
+                                    "on the same realizations.\n",
+                                    100.0 * g_beamRefreshFrac, tSetup, build0Sec, tSpp, K, K);
+                    }
+                }
             }
-            if (epoch > 1)
+            if (nRealized > 1)
                 std::printf("mode J: averaged %llu independent light-side realizations "
-                            "(%lld spp total) — the merge noise fell with the render, not just "
-                            "the connection noise\n", (unsigned long long)epoch, sppAll);
+                            "(%lld spp total%s) — the merge noise fell with the render, not just "
+                            "the connection noise\n", (unsigned long long)nRealized, sppAll,
+                            lsReused > 0 ? (std::string(", ") + std::to_string(lsReused) +
+                                            " of them kept from earlier in the batch").c_str()
+                                         : "");
             // WHAT A REALIZATION COST, ITEMISED. Printed whenever the render actually
             // refreshed, because the number of realizations is mode J's dominant remaining
             // variance term (U-vs-J: mode U draws ~8500 to mode J's ~150 and is 16x better at
             // equal blur, ~14x of it light-side density) and this line says which of the four
             // costs is standing in the way of more of them. `setup` is an UPPER bound -- it is
             // measured to the first progress report, which already includes rendering.
-            if (epoch > 1) {
+            if (nRealized > 1) {
                 const double tot = lsTraceSec + lsBeamSec + lsSurfSec + lsGatherSec;
                 const double pct = (tot > 0.0) ? 100.0 / tot : 0.0;
-                std::printf("[jstats] %llu epochs: trace %.2fs (%.1f%%), beam BVH %.2fs "
+                std::printf("[jstats] %llu epochs (%lld kept from earlier in the batch): trace "
+                            "%.2fs (%.1f%%), beam BVH %.2fs "
                             "(%.1f%%), surf grid %.2fs (%.1f%%), gather %.2fs (%.1f%%); "
                             "setup <= %.2fs. Light side = %.1f%% of the render\n",
-                            (unsigned long long)epoch,
+                            (unsigned long long)nRealized, lsReused,
                             lsTraceSec, lsTraceSec * pct, lsBeamSec, lsBeamSec * pct,
                             lsSurfSec, lsSurfSec * pct, lsGatherSec, lsGatherSec * pct,
                             lsSetupSec,
@@ -19177,14 +19424,16 @@ static void printHelp(const char* prog) {
 "                        (default 0.10; alias -lightrefresh). The epoch length adapts to the\n"
 "                        measured per-epoch overhead, so a heavy scene refreshes rarely and a\n"
 "                        cheap one often. 0 means -beamfreeze\n"
-"  -beamepochs <K>       mode J (alias -lightepochs): refresh in K epochs of a fixed share of\n"
-"                        -spp, epoch e drawing salt e, instead of on the wall clock. Every frame\n"
-"                        of a flyby then averages the SAME K realizations, so the light-side\n"
-"                        noise (beam streaks, caustic photons) holds still instead of\n"
-"                        flickering. Needs a fixed -spp. Use K = spp, one realization per\n"
-"                        sample: a realization is only ~14 k beams on gallery_rain, and fewer\n"
-"                        leave each beam a visible streak. An epoch costs ~0.5 s there on the\n"
-"                        GPU; on the CPU it also rebuilds the host beam tree, up to seconds\n"
+"  -beamepochs <K|spp|off>  mode J (alias -lightepochs): refresh in K epochs of a fixed share\n"
+"                        of -spp, epoch e drawing salt e, instead of on the wall clock. Every\n"
+"                        frame of a flyby then averages the SAME K realizations, so the\n"
+"                        light-side noise (beam streaks, caustic photons) holds still instead\n"
+"                        of flickering; each is traced once and kept for the batch while an\n"
+"                        eighth of memory holds them. Needs a fixed -spp. `spp` = one per\n"
+"                        sample, capped so the light side stays within -beamrefresh's share of\n"
+"                        the frame -- and the default for a batch of several cameras. A\n"
+"                        realization is only ~14 k beams on gallery_rain, so fewer leave each\n"
+"                        beam a visible streak. `off`: the wall-clock refresh even in a batch\n"
 "  -beamblur <frac>      mode-M beam kernel half-width, as a fraction of each MEDIUM'S OWN\n"
 "                        measured mean free path (default 0.01). This is the quality knob:\n"
 "                        the blur is a physical scale independent of the photon count, so\n"
@@ -20833,11 +21082,17 @@ static int run(int argc, char** argv) {
         // -beamepochs K: mode J's light-side epochs fixed by sample count (see g_beamEpochs).
         else if ((!std::strcmp(argv[i], "-beamepochs") ||
                   !std::strcmp(argv[i], "-lightepochs")) && i + 1 < argc) {
-            g_beamEpochs = std::atoi(argv[++i]);
-            if (g_beamEpochs < 1) {
-                std::fprintf(stderr, "error: %s wants a count of epochs >= 1 (1 is -beamfreeze)\n",
-                             argv[i - 1]);
-                return 2;
+            const char* v = argv[++i];
+            if (!std::strcmp(v, "spp"))      g_beamEpochs = kBeamEpochsSpp;
+            else if (!std::strcmp(v, "off")) g_beamEpochs = kBeamEpochsOff;
+            else {
+                g_beamEpochs = std::atoi(v);
+                if (g_beamEpochs < 1) {
+                    std::fprintf(stderr, "error: %s wants a count of epochs >= 1 (1 is -beamfreeze), "
+                                         "`spp` (one per sample) or `off` (the wall-clock refresh)\n",
+                                 argv[i - 1]);
+                    return 2;
+                }
             }
         }
         else if (!std::strcmp(argv[i], "-jdispwin") && i + 1 < argc) {
@@ -26430,11 +26685,13 @@ static int run(int argc, char** argv) {
     };
     runSharedPhotonMap(groupM);
 
-    // Mode J's light side, shared across this batch's cameras when `-beamfreeze` makes one
-    // realization the right answer for all of them. Declared here rather than as a static
-    // inside runRender so its (large) maps are released when the batch ends, not at exit.
-    JLightCache jLightCache;
+    // What this batch's cameras share (BatchCache): mode J's light side where every camera
+    // would draw the same one, and the device copy of the scene. Declared here rather than as a
+    // static inside runRender so its (large) maps are released when the batch ends, not at exit.
+    BatchCache batchCache;
+    batchCache.frames = restIdx.size();
     for (size_t ri = 0; ri < restIdx.size(); ++ri) {
+        batchCache.framesLeft = restIdx.size() - ri;
         const int i = restIdx[ri];
         // Poll the interrupt BETWEEN frames, exactly as the mode-M loop above does. A stop
         // request (Ctrl-C, window close, or `ftrace -stop <pid>`) means "stop the RUN", not
@@ -26463,10 +26720,10 @@ static int run(int argc, char** argv) {
                            device, diffraction, lightLabel, outFor(rc.name), rc.exposure,
                            timeBudgetSec, resume, wantCheckpointFlag, runForever,
                            preview, intervalSec, noiseTarget, wavefront, anchor, rgbBackward,
-                           maxBounceOverride, directOnly, &jLightCache);
+                           &batchCache);
         if (rv != 0) return rv;
     }
-    jLightCache.clear();
+    batchCache.clear();
 
     // --- Stereoscopic compositing (-stereo): fuse each eye pair into the -o image ------
     // Every eye rendered to its own PNG (sharing an exposure anchor for identical tone-

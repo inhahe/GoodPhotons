@@ -744,6 +744,20 @@ struct BeamMap {
     // its entry and is filled by the first split. See BeamMis.
     std::vector<BeamMis> mis;
     std::vector<int>     misIdx;
+    // Bytes held by the containers above (their capacity), for a cache that budgets maps by size.
+    size_t heapBytes() const {
+        return beams.capacity() * sizeof(PhotonBeam) + cie.capacity() * sizeof(Vec3) +
+               bvh.nodes.capacity() * sizeof(BvhNode) + bvh.primIdx.capacity() * sizeof(int) +
+               radMed.capacity() * sizeof(float) + mis.capacity() * sizeof(BeamMis) +
+               misIdx.capacity() * sizeof(int);
+    }
+    // Release the containers' spare capacity: a map kept for long (a batch's realizations) need
+    // hold only what it uses, and the split's growth leaves the beam array ~2x oversized.
+    void shrinkToFit() {
+        beams.shrink_to_fit(); cie.shrink_to_fit(); bvh.nodes.shrink_to_fit();
+        bvh.primIdx.shrink_to_fit(); radMed.shrink_to_fit(); mis.shrink_to_fit();
+        misIdx.shrink_to_fit();
+    }
     double    radius   = 0.02;        // fallback for a beam whose med is out of range, and
                                       // (after buildAuto) the MAX over media — the one number
                                       // worth printing when a scene has a single medium.
