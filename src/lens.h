@@ -42,6 +42,7 @@
 #include "spectral_library.h"   // defaultGlass (BK7/SF10 dispersion)
 #include "parallel.h"           // ft::parallelFor (the pupil table's build)
 #include "rng.h"                // Pcg32
+#include "color.h"              // LAMBDA_MIN / LAMBDA_MAX
 
 // One refracting interface of the lens (a spherical cap, or a plane when radius==0).
 struct LensSurface {
@@ -260,6 +261,65 @@ struct LensSystem {
         onFilm = out.o + out.d * t;
         dFilm = out.d;
         if (rearExit) *rearExit = out.o;
+        return true;
+    }
+
+    // The unaimed samplers, shared by the camera, the pupil tables' build and -checklens, so
+    // what the tables are fitted and checked against is what renders draw.
+    //
+    // Light: from lens-local point `pl`, the leg to a point Y uniform on the front cap (with
+    // the cap's +z-side normal nY), started just in front of the glass at `o` with unit
+    // direction `d` (Camera::lensEntry explains the rebased start); `dmm` = |Y - pl|. False if
+    // the leg does not head for the sensor, or Y is not the first point of the cap it meets
+    // (a convex element's far side is hidden).
+    bool frontLeg(const Vec3& pl, double u1, double u2, Vec3& Y, Vec3& nY, Vec3& o, Vec3& d,
+                  double& dmm) const {
+        Y = sampleSurface(0, u1, u2, nY);
+        d = Y - pl;
+        dmm = length(d);
+        if (!(dmm > 1e-9)) return false;
+        d = d / dmm;
+        if (!(d.z < 0.0)) return false;                      // light must travel toward the sensor
+        const double back = 2.0 * capRadius(0) + 1.0;
+        o = (dmm > back) ? Y - d * back : pl;
+        Vec3 hit, n;
+        if (!hitSurface(0, o, d, hit, n)) return false;
+        const Vec3 gap = hit - Y;
+        return dot(gap, gap) <= 1e-12;                       // 1 nm off: Y is on the hidden side
+    }
+    // Camera: from film point `f` (on the sensor plane), the unit direction `d` through a point
+    // uniform on the rear element -- its disk when planar, else its clear cap, the point being
+    // the first of the cap the ray meets -- and the ray's importance: cos^4 * A_rear / Z^2 for
+    // the disk (PBRT's), cosT * cosR * A_cap / r^2 for the cap. False if the point is hidden or
+    // the ray does not head into the lens. The caller traces it.
+    bool rearDir(const Vec3& f, double u1, double u2, Vec3& d, double& weight) const {
+        const int jr = (int)surf.size() - 1;
+        if (surf[jr].radius != 0.0) {
+            Vec3 nR;
+            const Vec3 pR = sampleSurface(jr, u1, u2, nR);
+            d = pR - f;
+            const double r = length(d);
+            if (!(r > 1e-12)) return false;
+            d = d / r;
+            const double cosT = d.z;
+            if (cosT <= 0.0) return false;
+            Vec3 hit, n;
+            if (!hitSurface(jr, f, d, hit, n)) return false;
+            const Vec3 gap = hit - pR;
+            if (dot(gap, gap) > 1e-12) return false;         // pR is on the cap's hidden side
+            weight = cosT * std::fabs(dot(d, nR)) * surfaceArea(jr) / (r * r);
+            return true;
+        }
+        const double rr = std::sqrt(u1 > 0 ? u1 : 0.0) * rearAperture();
+        const double phi = 2.0 * PI * u2;
+        d = normalize(Vec3(rr * std::cos(phi), rr * std::sin(phi), rearZ()) - f);
+        const double cosT = d.z;                             // d is unit; z = cos to the axis
+        if (cosT <= 0.0) return false;
+        const double cos4 = (cosT * cosT) * (cosT * cosT);
+        const double A = PI * rearAperture() * rearAperture();
+        const double Z = rearZ() - filmZ;
+        if (Z <= 1e-9) return false;
+        weight = cos4 * A / (Z * Z);
         return true;
     }
 
@@ -574,11 +634,14 @@ inline void resolveUnlit(std::vector<LensPupilCell>& cells, const std::vector<ch
 }
 }   // namespace lenspupil
 
-// Build both tables for lens L focused as it is, for a film reaching `racc` mm from the
-// sensor's centre. Null if the lens is empty or the build was stopped (-stop).
-inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, double racc) {
+// Build both tables for lens L focused as it is, for a film reaching sqrt(`racc2`) mm from the
+// sensor's centre. The square is kept as given: Camera::pupil compares it with the raster's
+// own, and a square root squared back can come out an ulp short. Null if the lens is empty or
+// the build was stopped (-stop).
+inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, double racc2) {
     const int M = (int)L.surf.size();
-    if (M == 0 || !(racc > 0.0)) return nullptr;
+    if (M == 0 || !(racc2 > 0.0)) return nullptr;
+    const double racc = std::sqrt(racc2);
     auto P = std::make_shared<LensPupil>();
     const double lamD = 587.6;
     // The stop: the marked one, else the surface whose paraxial entrance pupil (its aperture
@@ -608,9 +671,9 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
         if (stop < 0) stop = 0;
     }
     P->stop = stop;
-    P->racc2 = racc * racc;
+    P->racc2 = racc2;
     P->filmZ = L.filmZ;
-    const double lamLo = 360.0, lamHi = 830.0;          // every wavelength a scene can carry
+    const double lamLo = LAMBDA_MIN, lamHi = LAMBDA_MAX; // every wavelength a scene can carry
     constexpr double kWiden = 0.15;                     // a bin's points reach 15% past its edges:
                                                         // a region's extremes sit at those edges,
                                                         // which points drawn only inside approach
@@ -655,23 +718,13 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
             if (!L.traceToFilm(o, d, lamLo + (lamHi - lamLo) * rng.uniform(), f, df)) return false;
             return f.x * f.x + f.y * f.y <= P->racc2;
         };
-        // Uniform on the front cap, as lensEntry's front sampler draws.
+        // Uniform on the front cap, as lensEntry's front sampler draws (LensSystem::frontLeg).
         auto frontRay = [&](Vec3& X) {
             Vec3 p;
             if (!point(p)) return -1;
-            Vec3 nY;
-            const Vec3 Y = L.sampleSurface(0, rng.uniform(), rng.uniform(), nY);
-            Vec3 d = Y - p;
-            const double dm = length(d);
-            if (!(dm > 1e-9)) return 0;
-            d = d / dm;
-            if (!(d.z < 0.0)) return 0;
-            const double back = 2.0 * capR + 1.0;
-            const Vec3 o = (dm > back) ? Y - d * back : p;
-            Vec3 h, n;
-            if (!L.hitSurface(0, o, d, h, n)) return 0;
-            const Vec3 g = h - Y;
-            if (dot(g, g) > 1e-12) return 0;
+            Vec3 Y, nY, o, d;
+            double dm;
+            if (!L.frontLeg(p, rng.uniform(), rng.uniform(), Y, nY, o, d, dm)) return 0;
             if (!reaches(o, d)) return 0;
             X = Y + d * ((zRef - Y.z) / d.z);
             X.y = std::fabs(X.y);
@@ -728,28 +781,12 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
             Ray out;
             return L.trace(f, d, lamLo + (lamHi - lamLo) * rng.uniform(), /*sensorToScene=*/true, out);
         };
-        // Uniform on the rear element, as genLensRay's unaimed sampler draws: its disk when
-        // planar, else its clear cap, from the first side the film point sees.
+        // Uniform on the rear element, as genLensRay's unaimed sampler draws (LensSystem::rearDir).
         auto rearRay = [&](Vec3& X) {
             const Vec3 f = filmPoint();
             Vec3 d;
-            if (L.surf[jr].radius != 0.0) {
-                Vec3 nR;
-                const Vec3 pR = L.sampleSurface(jr, rng.uniform(), rng.uniform(), nR);
-                d = pR - f;
-                const double r = length(d);
-                if (!(r > 1e-12)) return 0;
-                d = d / r;
-                if (!(d.z > 0.0)) return 0;
-                Vec3 h, n;
-                if (!L.hitSurface(jr, f, d, h, n)) return 0;
-                const Vec3 g = h - pR;
-                if (dot(g, g) > 1e-12) return 0;
-            } else {
-                const double rr = std::sqrt(rng.uniform()) * apR, ph = 2.0 * PI * rng.uniform();
-                d = normalize(Vec3(rr * std::cos(ph), rr * std::sin(ph), L.zpos[jr]) - f);
-                if (!(d.z > 0.0)) return 0;
-            }
+            double w;
+            if (!L.rearDir(f, rng.uniform(), rng.uniform(), d, w)) return 0;
             if (!getsOut(f, d)) return 0;
             X = f + d * ((zExit - f.z) / d.z);
             X.y = std::fabs(X.y);
@@ -774,20 +811,20 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
     return P;
 }
 
-// The tables for a shared lens and film radius, built once and kept while the lens lives (a
-// flyby's hundreds of frames share one lens). Prints a line when it builds them.
-inline std::shared_ptr<const LensPupil> lensPupilFor(const std::shared_ptr<LensSystem>& L, double racc) {
+// The tables for a shared lens and squared film radius (mm^2), built once and kept while the
+// lens lives (a flyby's hundreds of frames share one lens). Prints a line when it builds them.
+inline std::shared_ptr<const LensPupil> lensPupilFor(const std::shared_ptr<LensSystem>& L, double racc2) {
     if (!L || L->surf.empty()) return nullptr;
-    struct Entry { std::weak_ptr<LensSystem> lens; double racc, filmZ; std::shared_ptr<const LensPupil> tab; };
+    struct Entry { std::weak_ptr<LensSystem> lens; double racc2, filmZ; std::shared_ptr<const LensPupil> tab; };
     static std::mutex mtx;
     static std::vector<Entry> cache;
     std::lock_guard<std::mutex> g(mtx);
     cache.erase(std::remove_if(cache.begin(), cache.end(),
                                [](const Entry& e) { return e.lens.expired(); }), cache.end());
     for (const Entry& e : cache)
-        if (e.lens.lock() == L && e.racc == racc && e.filmZ == L->filmZ) return e.tab;
+        if (e.lens.lock() == L && e.racc2 == racc2 && e.filmZ == L->filmZ) return e.tab;
     const auto t0 = std::chrono::steady_clock::now();
-    std::shared_ptr<const LensPupil> tab = buildLensPupil(*L, racc);
+    std::shared_ptr<const LensPupil> tab = buildLensPupil(*L, racc2);
     if (!tab) return nullptr;
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::printf("[lens] '%s': pupil tables aim at the stop (surface %d): light in %d of %d bins "
@@ -796,7 +833,7 @@ inline std::shared_ptr<const LensPupil> lensPupilFor(const std::shared_ptr<LensS
                 L->name.c_str(), tab->stop, tab->nAim, (int)tab->cells.size(), tab->nFront,
                 tab->nNone, tab->nExitAim, (int)tab->exitCells.size(), tab->nExitFront,
                 tab->nExitNone, ms);
-    cache.push_back({L, racc, L->filmZ, tab});
+    cache.push_back({L, racc2, L->filmZ, tab});
     return tab;
 }
 

@@ -3999,10 +3999,11 @@ struct BeamMergeWeight {
     int    camVert    = 0;    // k: the camera subpath index of the vertex this segment leaves
     int    maxDepth   = 0;    // the same cap the connection loop applies (see below)
     // The first segment of a physical lens's camera subpath: the light image would pick the
-    // camera vertex `lensY` from the merge point x with a density that depends on x, so the
-    // camera side's density there takes Camera::lensAimRatio(lensY, x). Null elsewhere.
+    // camera vertex from the merge point x with a density that depends on x, so the camera
+    // side's density there takes Camera::lensAimRatio(vertex, x). The vertex is the segment's
+    // origin: the walk records one segment per vertex it leaves, so the segment leaving
+    // eye[0] starts at eye[0]. Null elsewhere.
     const Camera* lensCam = nullptr;
-    Vec3   lensY;
     // Per-ray transmittance data, hoisted out of the per-hit path. `camTr` is built once for
     // this camera segment (see TrRay: a dense medium hands one segment hundreds of hits, and
     // trDet would re-clip and re-evaluate sigma_t for every one of them); `tabs` is the
@@ -4051,7 +4052,7 @@ struct BeamMergeWeight {
         const double gL = (lm->pdfPlanar > 0.f) ? (double)lm->pdfPlanar      // the sun's chord
                                                 : (double)lm->pdfDir * invR2;  // light side  (p_L-perp)
         double gC = sg->pdfDir * invT2;                      // camera side (the free flight)
-        if (lensCam) gC *= lensCam->lensAimRatio(lensY, sg->o + sg->d * tc);
+        if (lensCam) gC *= lensCam->lensAimRatio(sg->o, sg->o + sg->d * tc);
         if (!(gL > 0.0)) return 0.0;                         // delta light-side density
         const double sigT = scene->media[b.med].sigmaT(lamCam) * dens;
         if (!(sigT > 0.0)) return 0.0;
@@ -4682,7 +4683,7 @@ struct BdptRenderer {
                                 // path of depth j + k + 1.
                                 w1.camVert    = (int)(k < (size_t)nE ? k : (size_t)nE - 1);
                                 w1.maxDepth   = maxDepth;
-                                if (k == 0 && cam.hasLens()) { w1.lensCam = &cam; w1.lensY = eye[0].p; }
+                                if (k == 0 && cam.hasLens()) w1.lensCam = &cam;
                                 // The merge AT eye[k]. Its light-side incoming direction is
                                 // -sg.d whatever x turns out to be, so sin(theta) and the
                                 // whole coefficient are merge-point INDEPENDENT and belong

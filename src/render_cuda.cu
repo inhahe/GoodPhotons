@@ -2621,7 +2621,8 @@ __device__ static double dLensPdfDir(const DCamera& cam, const DVec3& y, const D
     if (ce == -2) return 0.0;
     if (ce >= 0) {
         // Aimed (host twin lensPdfDir): the film ray's crossing of the exit plane must lie in the
-        // film point's region; density r^2 / (cosT * A_region) per film solid angle.
+        // film point's region; density r^2 / (cosT * A_region) per film solid angle. The slack is
+        // not what absorbs float's rounding of y; the region's padding is (see dLensAimRatio).
         const double* C = L.exitCells + 4 * ce;
         const double r = (L.exitZ - onFilm.z) / cosT;
         if (!(dPupilRegionNorm(C, onFilm - dFilm * r, cphi, sphi) <= 1.0 + 1e-6)) return 0.0;
@@ -2654,7 +2655,10 @@ __device__ static double dLensPdfDir(const DCamera& cam, const DVec3& y, const D
 // The factor BDPT's lens camera densities carry for camera vertex Y next to scene point x
 // (host twin Camera::lensAimRatio, which derives it): (1/A_front) / p_entry(Y | x), 1 where
 // x keeps the front sampler, capped at 1e12 where the entry cannot pick Y from x. The world
-// points arrive in Real; the slack on the region test absorbs float's rounding of Y.
+// points arrive in Real, which rounds Y by ~1e-4 mm at a metre or two from the origin -- far
+// more than the region test's slack. What keeps that harmless is the regions' 3% padding past
+// every crossing that gets through: no camera ray or light-image sample that reaches the film
+// lies near a region's rim, so none is misread as outside.
 __device__ static double dLensAimRatio(const DCamera& cam, const DVec3& Yw, const DVec3& xw) {
     const DLensSystem& L = cam.lens;
     if (L.pupilN == 0) return 1.0;
@@ -7103,11 +7107,6 @@ struct DBeamMergeW {
     double segSumM    = 0.0;  // camera-side merge accumulator, kappa factored out
     int    camVert    = 0;    // k: the camera subpath index of the vertex this segment leaves
     int    maxDepth   = 0;    // the same cap the connection loop applies
-    // The camera vertex, for a physical lens's first segment (camVert == 0): the camera density
-    // at merge point x there takes dLensAimRatio(lensY, x) (host twin BeamMergeWeight::lensCam).
-    // The camera itself comes from the kernel (dBeamMergeWeight's `cam`): a segment queued for
-    // the wavefront gather is read by another kernel, where no pointer into this one is valid.
-    DVec3  lensY{0, 0, 0};
 };
 
 // Beam x Ray 1D single-scatter estimate along the camera segment [oc, oc + dc*tMax] —
@@ -7211,7 +7210,11 @@ __device__ static double dBeamMergeWeight(const DScene& sc, const DBeamMergeW& m
     const double gL = (lm.pdfPlanar > 0.f) ? (double)lm.pdfPlanar   // the sun's chord (BeamMis;
                                            : (double)lm.pdfDir * invR2;  // 1 after a delta, 0.387.0)
     double gC = mw.pdfDirCam * invT2;                // camera side (the free flight)
-    if (mw.camVert == 0 && cam && cam->hasLens) gC *= dLensAimRatio(*cam, mw.lensY, oc + dc * (Real)tCam);
+    // A physical lens's first segment (host twin BeamMergeWeight::lensCam): the camera density
+    // at x takes dLensAimRatio(camera vertex, x), the vertex being the segment's origin `oc`.
+    // The camera comes from the kernel: a segment queued for the wavefront gather is read by
+    // another kernel, where no pointer into this one would be valid.
+    if (mw.camVert == 0 && cam && cam->hasLens) gC *= dLensAimRatio(*cam, oc, oc + dc * (Real)tCam);
     if (!(gL > 0.0)) return 0.0;                     // delta light-side density
     if (b.med < 0 || b.med >= sc.mediaN) return 0.0;
     const double sigT = (double)medSigmaT(sc.media[b.med], (Real)mw.lamCam) * dens;
@@ -7709,7 +7712,7 @@ struct DWfSeg {
     int    glassMat;    // DPathSeg::glassMat, for the camera-side glass under JSPEC
 };
 #if FTRACE_GPU_FP32
-static_assert(sizeof(DWfSeg) == 416, "DWfSeg changed size: update renderBdptCuda's segCap note");
+static_assert(sizeof(DWfSeg) == 400, "DWfSeg changed size: update renderBdptCuda's segCap note");
 #endif
 struct DWfHit { int seg; int beam; float t, s; };
 // One band of the wave-schedule PROFILE (see renderBdptCuda): what the paths of pixel slots
@@ -17385,7 +17388,6 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                     // at light vertex j on this segment makes a path of depth j + k + 1.
                     mw.camVert    = k;
                     mw.maxDepth   = maxDepth;
-                    if (k == 0 && cam.hasLens) mw.lensY = eye[0].p;
                     // The merge AT eye[k]. Its light-side incoming direction is -sg.d
                     // whatever x turns out to be, so sin(theta) and the whole coefficient are
                     // merge-point INDEPENDENT and belong here, not in the per-hit weight.
@@ -23597,7 +23599,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     int* d_wfCounters = nullptr;
     long long waveSamples = 0;
     if (mergeOn && !(std::getenv("FTRACE_NOWAVEFRONT") && std::atoi(std::getenv("FTRACE_NOWAVEFRONT")) != 0)) {
-        const int segCap = 1 << 20;          // 416 B each (~436 MB), 128 of them JSPEC's
+        const int segCap = 1 << 20;          // 400 B each (~420 MB), 128 of them JSPEC's
         const int hitCap = 1 << 25;          // 16 B each  (512 MB): a dense map yields thousands of
                                              // candidates per segment (_fog_cornell: ~2000), and a
                                              // spilled candidate is evaluated divergently, on the spot

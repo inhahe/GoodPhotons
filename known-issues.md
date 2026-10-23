@@ -88,7 +88,12 @@ camera ray clipped; with the radii negated it measures 50.4 mm and renders sharp
 The `[stop]` word never reached the reader at all: the grammar ends a value at a plain word
 (`cont = NUMWORD | KVWORD | STRING`), so `stop` became a statement of its own and drew an
 "unknown key" warning. `readLens` now takes a `stop` statement as marking the surface right
-before it. (Nothing in the renderer reads `isStop` yet; the flag is kept for what does.)
+before it. Since 0.395.0 the pupil tables (lens.h `buildLensPupil`) take the marked surface as
+the stop, which places the entrance and exit pupil planes they are built on; unmarked, the stop
+is the surface with the smallest paraxial entrance pupil. The ior column takes a number (0 =
+air, as pbrt writes its stop rows; mapped since 0.396.0, which also rejects a word that is
+neither a glass nor a number instead of reading it as index 0) or a glass name, which must
+be quoted for the same grammar reason as `stop`.
 
 ## DONE (2026-10-18, 0.386.0): J-CAMERA-COST — mode J's camera pass ran at 6.6x mode D's cost on `gallery_rain`; now 2.4x
 

@@ -6470,9 +6470,10 @@ as the one at fault.
     so BDPT's lens camera densities carry `lensAimRatio(Y, x) = (1/A_front) / p_entry(Y | x)`:
     in `vertexPdf`, on eye[1]'s pdfFwd after the walk (the walk could not know eye[1] when it
     converted the direction), and in mode J's merges on the first camera segment, per merge
-    point (`BeamMergeWeight::lensCam`; on the device the camera is passed down to the gather
-    and `DBeamMergeW::lensY` rides the wavefront queue, since a queued segment is read by
-    another kernel). Device twins: `dLensPupilClassify`, the aimed branch of `dLensEntry`,
+    point (`BeamMergeWeight::lensCam`, the camera vertex being that segment's origin, since the
+    walk records one segment per vertex; on the device the camera is passed down to the gather,
+    wavefront kernels included, since a queued segment is read by another kernel and no pointer
+    into the queuing one would be valid). Device twins: `dLensPupilClassify`, the aimed branch of `dLensEntry`,
     `dLensAimRatio`; bakeCamera uploads the table (`DLensSystem::pupil*`) when it fits the
     baked raster.
   - **Aiming camera rays at the stop (0.396.0).** The mirror problem: genLensRay drew where a

@@ -8085,12 +8085,19 @@ private:
     // Resolve a lens-surface `ior` word: a glass name (`glass:BK7`, `BK7`, `SF10`,
     // `flint`, ...) -> its Sellmeier dispersion; otherwise a bare number -> constant
     // index. Air is index 1.
-    static Spectrum lensIorOf(const std::string& raw) {
+    // A lens surface's `ior` word: a glass name (`glass:` prefix optional; it has to be quoted,
+    // since an unquoted word ends the value) or a non-negative number, 0 meaning air as in pbrt's
+    // lens files, whose stop rows carry it. False for anything else (a mistyped glass name
+    // would otherwise read as index 0 and black the render out).
+    static bool lensIorOf(const std::string& raw, Spectrum& out) {
         std::string name = raw;
         if (name.rfind("glass:", 0) == 0) name = name.substr(6);
-        Spectrum g;
-        if (resolveGlassIor(name, g)) return g;
-        return iorConstant(std::atof(raw.c_str()));
+        if (resolveGlassIor(name, out)) return true;
+        char* end = nullptr;
+        const double v = std::strtod(raw.c_str(), &end);
+        if (end == raw.c_str() || *end != '\0' || !std::isfinite(v) || v < 0.0) return false;
+        out = iorConstant(v == 0.0 ? 1.0 : v);
+        return true;
     }
 
     // Parse an optional physical lens: `lens { preset <name> | surface <r> <t> <ior>
@@ -8138,14 +8145,19 @@ private:
             s.used = true;
             const auto& wds = s.val.words;
             if (wds.size() < 4) { fail("camera '" + cs.name + "' lens: `surface` needs "
-                                       "<radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop]"); return false; }
+                                       "<radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop] "
+                                       "(a glass name in the ior column must be quoted: \"BK7\")"); return false; }
             LensSurface e;
             const double r = num(wds[0]);
             e.radius    = (r == 0.0) ? 0.0 : -r;            // 0 = planar (a stop or a flat)
             e.thickness = num(wds[1]);
-            e.ior       = lensIorOf(wds[2]);
+            if (!lensIorOf(wds[2], e.ior)) {
+                fail("camera '" + cs.name + "' lens: surface ior '" + wds[2] + "' is neither a "
+                     "glass name (quote it: \"BK7\") nor a non-negative number");
+                return false;
+            }
             e.aperture  = num(wds[3]);
-            if (wds.size() >= 5 && wds[4] == "stop") { e.isStop = true; }
+            if (wds.size() >= 5 && wds[4] == "stop") { e.isStop = true; }   // a quoted "stop"
             sys->surf.push_back(e);
             ++nSurf;
         }

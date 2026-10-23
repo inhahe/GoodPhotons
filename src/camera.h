@@ -111,7 +111,7 @@ struct Camera {
         // same render with and without aiming must agree.
         const char* off = std::getenv("FTRACE_LENS_FRONT");
         if (off && *off && *off != '0') return;
-        if (hasLens()) lensPupil = lensPupilFor(lens, std::sqrt(lensFilmRadius2()));
+        if (hasLens()) lensPupil = lensPupilFor(lens, lensFilmRadius2());
     }
     // The squared radius (mm^2) round the sensor centre that the film raster reaches
     // (lensFilmToPixel's rectangle, by its corners).
@@ -335,42 +335,15 @@ struct Camera {
             if (cosT <= 0.0) return false;
             if (!L.trace(pFilm, d0, lambda, /*sensorToScene=*/true, outLocal)) return false;
             weight = cosT * cosT * P->exitArea(ce) / (r * r);
-        } else if (L.surf[jr].radius != 0.0) {
-            // A CURVED rear element: a point uniform on its clear cap, so every ray that
-            // crosses the clear glass can be drawn (the plane disc below would miss the ones
-            // crossing the cap outside the disc's shadow). The point must be the first of the
-            // cap the film ray meets. Importance: cos at the film * cos at the cap * cap area
-            // over the squared distance, the irradiance estimate for this pupil sample.
-            Vec3 nR;
-            const Vec3 pR = L.sampleSurface(jr, u1, u2, nR);
-            Vec3 d0 = pR - pFilm;
-            const double r = length(d0);
-            if (!(r > 1e-12)) return false;
-            d0 = d0 / r;
-            const double cosT = d0.z;
-            if (cosT <= 0.0) return false;
-            Vec3 hit, n;
-            if (!L.hitSurface(jr, pFilm, d0, hit, n)) return false;
-            const Vec3 gap = hit - pR;
-            if (dot(gap, gap) > 1e-12) return false;        // pR is on the cap's hidden side
-            if (!L.trace(pFilm, d0, lambda, /*sensorToScene=*/true, outLocal)) return false;
-            weight = cosT * std::fabs(dot(d0, nR)) * L.surfaceArea(jr) / (r * r);
         } else {
-            // A planar rear (a stop, or a flat): a uniform sample on its disk.
-            double rr = std::sqrt(u1 > 0 ? u1 : 0.0) * L.rearAperture();
-            double phi = 2.0 * PI * u2;
-            Vec3 pRear(rr * std::cos(phi), rr * std::sin(phi), L.rearZ());
-            Vec3 d0 = normalize(pRear - pFilm);
+            // Unaimed: a point uniform on the rear element (LensSystem::rearDir) -- its clear cap
+            // when curved, since a disc in the plane would miss the rays crossing the cap outside
+            // its shadow; its disk when planar, with PBRT's cos^4 A / Z^2 importance.
+            Vec3 d0;
+            double w = 0.0;
+            if (!L.rearDir(pFilm, u1, u2, d0, w)) return false;
             if (!L.trace(pFilm, d0, lambda, /*sensorToScene=*/true, outLocal)) return false;
-            // PBRT-style importance: cos^4 of the film-ray axis angle, times the sampled
-            // pupil area, over the squared film->pupil axial distance.
-            double cosT = d0.z;                       // d0 is unit; z-component = cos to axis
-            if (cosT <= 0.0) return false;
-            double cos4 = (cosT * cosT) * (cosT * cosT);
-            double A = PI * L.rearAperture() * L.rearAperture();
-            double Z = L.rearZ() - L.filmZ;
-            if (Z <= 1e-9) return false;
-            weight = cos4 * A / (Z * Z);
+            weight = w;
         }
         // Lens-local (mm) -> world. The front-surface vertex plane is pinned at `eye`;
         // transverse offsets and the axial (z-T) offset convert mm -> scene metres.
@@ -482,20 +455,10 @@ struct Camera {
                 return std::isfinite(e.omega) && e.omega > 0.0;
             }
         }
-        Vec3 nY;
-        const Vec3 yl = L.sampleSurface(0, u1, u2, nY);
         const Vec3 pl = lensLocalPoint(p);
-        Vec3 dl = yl - pl;
-        const double dmm = length(dl);
-        if (!(dmm > 1e-9)) return false;
-        dl = dl / dmm;
-        if (!(dl.z < 0.0)) return false;                     // light must travel toward the sensor
-        const double back = 2.0 * L.capRadius(0) + 1.0;
-        const Vec3 o = (dmm > back) ? yl - dl * back : pl;
-        Vec3 hit, n;
-        if (!L.hitSurface(0, o, dl, hit, n)) return false;
-        const Vec3 gap = hit - yl;
-        if (dot(gap, gap) > 1e-12) return false;             // 1 nm off: Y is on the hidden side
+        Vec3 yl, nY, o, dl;
+        double dmm;
+        if (!L.frontLeg(pl, u1, u2, yl, nY, o, dl, dmm)) return false;
         e.Y = lensWorldPoint(yl);
         const Vec3 toY = e.Y - p;
         e.dist = length(toY);

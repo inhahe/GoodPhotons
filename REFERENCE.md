@@ -1945,10 +1945,11 @@ camera "real" {
   Zemax tables, patents): a radius is positive when its centre of curvature lies on the
   sensor side, so a front element convex toward the scene has a positive radius, and 0 is
   planar. `thickness` is the gap to the next surface (the last one's to the sensor, which
-  autofocus then moves); `ior` is a glass name or a number; `stop` marks the aperture stop.
-  A pbrt lens file's rows paste in directly once its aperture *diameters* are halved. Before
-  0.394.3 radii were read with the opposite sign, which turned a pasted prescription into a
-  different lens.
+  autofocus then moves); `ior` is a number (0 means air, as pbrt writes its stop rows) or a
+  glass name in quotes (`"BK7"`: an unquoted word ends the line's values, so it would cut the
+  surface short); `stop` marks the aperture stop. A pbrt lens file's rows paste in directly
+  once its aperture *diameters* are halved. Before 0.394.3 radii were read with the opposite
+  sign, which turned a pasted prescription into a different lens.
 
 **Analytic vs. simulated — the tradeoff:** the physical lens is the **accurate but
 slower** option. It captures real optical behaviour the thin lens cannot

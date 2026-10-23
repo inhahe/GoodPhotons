@@ -2708,7 +2708,8 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
     camF.lensPupil.reset();
     const LensSystem& CL = *cam.lens;
     // (4) coverage. Scene points up to 50 deg off axis (the raster's corners are ~23 deg),
-    // 5 cm to 5 km out (log-uniform), one front-sampler ray each.
+    // 5 cm to 5 km out (log-uniform), one front-sampler ray each, at a wavelength across the
+    // band.
     long long reached = 0, aimedReached = 0, outside = 0, rejected = 0;
     for (int k = 0; k < 2000000; ++k) {
         const double th = (50.0 * PI / 180.0) * rng.uniform(), ph = 2.0 * PI * rng.uniform();
@@ -2718,7 +2719,8 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
         Camera::LensEntry e;
         if (!camF.lensEntry(X, rng.uniform(), rng.uniform(), e)) continue;
         Vec3 onFilm, dFilm; int px, py;
-        if (!CL.traceToFilm(e.o, e.d, lambda, onFilm, dFilm) || !cam.lensFilmToPixel(onFilm, px, py)) continue;
+        const double lam4 = LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * rng.uniform();   // the tables hold every wavelength
+        if (!CL.traceToFilm(e.o, e.d, lam4, onFilm, dFilm) || !cam.lensFilmToPixel(onFilm, px, py)) continue;
         ++reached;
         double cphi = 1.0, sphi = 0.0;
         const int c = P->classify(cam.lensLocalPoint(X), cphi, sphi);
@@ -2800,31 +2802,17 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
     auto filmPoint = [&](double fx, double fy) {        // fx, fy in [0, 1) across the raster
         return Vec3(-(2.0 * fx - 1.0) * halfW, -(2.0 * fy - 1.0) * halfH, CL.filmZ);
     };
-    const int jr = (int)CL.surf.size() - 1;
-    // (7) coverage: unaimed rays (uniform on the rear element, as genLensRay draws where the
-    // table does not aim) that get out of the lens fall inside their film point's region, and
-    // none comes from a rejecting bin.
+    // (7) coverage: unaimed rays (LensSystem::rearDir, genLensRay's sampler where the table
+    // does not aim), at wavelengths across the band, that get out of the lens fall inside
+    // their film point's region, and none comes from a rejecting bin.
     long long out7 = 0, outside7 = 0, rejected7 = 0, aimed7 = 0;
     for (int k = 0; k < 2000000; ++k) {
         const Vec3 f = filmPoint(rng.uniform(), rng.uniform());
         Vec3 d;
-        if (CL.surf[jr].radius != 0.0) {
-            Vec3 nR;
-            const Vec3 pR = CL.sampleSurface(jr, rng.uniform(), rng.uniform(), nR);
-            d = pR - f;
-            const double r = length(d);
-            if (!(r > 1e-12)) continue;
-            d = d / r;
-            Vec3 h, n;
-            if (!(d.z > 0.0) || !CL.hitSurface(jr, f, d, h, n)) continue;
-            const Vec3 g = h - pR;
-            if (dot(g, g) > 1e-12) continue;
-        } else {
-            const double rr = std::sqrt(rng.uniform()) * CL.rearAperture(), ph = 2.0 * PI * rng.uniform();
-            d = normalize(Vec3(rr * std::cos(ph), rr * std::sin(ph), CL.rearZ()) - f);
-        }
+        double w;
+        if (!CL.rearDir(f, rng.uniform(), rng.uniform(), d, w)) continue;
         Ray o;
-        if (!CL.trace(f, d, lambda, /*sensorToScene=*/true, o)) continue;
+        if (!CL.trace(f, d, LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * rng.uniform(), /*sensorToScene=*/true, o)) continue;
         ++out7;
         double cphi = 1.0, sphi = 0.0;
         const int c = P->classifyFilm(f, cphi, sphi);
@@ -2888,6 +2876,26 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
                     preset, px, py, m[0], se[0], m[1], se[1], z9, 100.0 * hit[0] / n, 100.0 * hit[1] / n);
         pass = pass && (hit[0] + hit[1] == 0 || z9 < 4.0);
     }
+    // (10) the tables are handed out for any raster: Camera::pupil compares the tables' squared
+    // film radius with the raster's own, and one squared back from its square root comes out an
+    // ulp short for a fair share of rasters (640x427 on a 36 mm sensor, 300x300 on 23.6 mm),
+    // which silently turned the aiming off.
+    int refused = 0, tried = 0;
+    for (const double fw : {36.0, 23.6}) {
+        auto lw = std::make_shared<LensSystem>(*cam.lens);
+        lw->filmW_mm = fw;
+        for (const auto& r : {std::array<int, 2>{97, 61}, {640, 427}, {1920, 1080}, {333, 222}, {512, 342},
+                              {801, 599}, {1000, 667}, {123, 45}, {300, 300}, {720, 480}, {4096, 2731}, {55, 89}}) {
+            Camera c2;
+            c2.lookAt({0, 0, 0}, {0, 0, 1}, {0, 1, 0}, 40.0, r[0], r[1]);
+            c2.lens = lw;
+            c2.prepareLensPupil();
+            ++tried;
+            if (!c2.pupil()) ++refused;
+        }
+    }
+    std::printf("[checklens] %s: pupil tables refused to %d of %d rasters\n", preset, refused, tried);
+    pass = pass && refused == 0;
     std::printf("[checklens] %s %s\n", preset, pass ? "PASS" : "FAIL");
     return pass;
 }
