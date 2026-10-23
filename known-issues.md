@@ -2665,6 +2665,24 @@ import `r_t = min(1, r² / 0.646)` (1.55 r²), applied to the constant and to th
 per texel, validated against a GGX reference at a few r. It changes the look of every glTF, so it
 waits for its own A/B rather than riding along with another change.
 
+## OPEN (2026-10-23, 0.394.0): PHYSLENS-FRONT-SAMPLING — light enters a physical lens through a uniform front-element sample, which wastes most samples on a lens whose front glass dwarfs its stop
+
+`Camera::lensConnect` (and its device twin `dLensConnect`), the forward splat of modes A/B and
+BDPT's light image through a physical lens, picks the point where light enters the lens
+uniformly by area on the front element's clear cap. That is exact for any lens, because every
+ray able to enter the lens crosses that cap, but it is only efficient while most of those rays
+also clear the aperture stop. The built-in presets keep the stop the size of the front element
+(the singlet is its own stop, the achromat's stop is 0.95x its glass), so nearly every sample
+survives. A real prescription pasted as `surface` lines, a fast wide-angle or a zoom stopped
+down to f/11, can have a front element several times the stop's image, and then most samples
+are clipped inside the lens and the forward image is that much noisier at equal cost (the
+backward camera, which samples the rear element, has the mirror problem for a large rear
+element). **Proper fix:** importance-sample the stop, as Hanika & Dachsbacher 2014 sec. 5.2 and
+Schrade et al. 2016 do: draw the point on the stop, solve for the direction from the scene point
+that reaches it through the front elements (a few Newton steps on the traced map, or a fitted
+polynomial), and divide by the Jacobian of that map, which the same Newton steps provide.
+`-checklens`'s density-normalisation and connect-vs-catch checks are the regression gates for it.
+
 ## OPEN (2026-10-23): GLTF-MAP-MEAN-GUTTERS — the importer's mean metalness and roughness count the atlas gutters
 
 Found by the review of `tools/downscale_glb.py`. `src/gltf.h` (the `TexRole::Metalness` and

@@ -2585,6 +2585,103 @@ static int checkContainer(long long rays) {
     return bad == 0 ? 0 : 1;
 }
 
+// The physical lens traced forward (camera.h lensConnect / lensCatch / lensPdfDir), on a
+// 50 mm f/2.8 achromat. Three claims, each one a render could only show as noise:
+//   (1) lensPdfDir is a DENSITY of genLensRay's rays: integrated over front-element area and
+//       exit direction it must equal the share of genLensRay samples the lens does not
+//       vignette. lensPdfDir returns p * A_front, so with y uniform on the element (1/A)
+//       and the direction uniform in a cone of solid angle W, the integral is E[pdf * W].
+//   (2) every ray genLensRay makes reads back with a nonzero density (a 0 would drop that
+//       ray's camera strategy from BDPT's MIS and weigh the others wrongly);
+//   (3) the next-event connection and the brute-force catch measure the same thing: for a
+//       point source, the solid angle of rays that reach the sensor (lensConnect's weight
+//       times the cell area, averaged; the catch's hit share times the cone's solid angle),
+//       and where they land.
+static bool checkLensPhysical() {
+    LensSystem L;
+    if (!resolveLensPreset("achromat", 50.0, 2.8, L)) { std::printf("[checklens] no achromat\n"); return false; }
+    L.focusAt(2.4);
+    Camera cam;
+    cam.lookAt({0, 0, 0}, {0, 0, 1}, {0, 1, 0}, 40.0, 64, 43);
+    cam.lens = std::make_shared<LensSystem>(L);
+    Pcg32 rng; rng.seed(4242u, 17u);
+    const double lambda = 550.0;
+    // (1) normalisation. P(not vignetted) from the camera's own sampling ...
+    const int nCam = 400000;
+    long long ok = 0, zeroBack = 0;
+    for (int k = 0; k < nCam; ++k) {
+        const int px = (int)(rng.uniform() * 64), py = (int)(rng.uniform() * 43);
+        Ray r; double wgt;
+        if (!cam.genLensRay(px, py, rng.uniform(), rng.uniform(), rng.uniform(), rng.uniform(),
+                            lambda, r, wgt) || !(wgt > 0.0)) continue;
+        ++ok;
+        if (!(cam.lensPdfDir(r.o, r.d, lambda) > 0.0)) ++zeroBack;   // (2)
+    }
+    const double pValid = (double)ok / nCam;
+    // ... and the integral of the density, directions drawn in a 40 deg cone about the axis
+    // (the 50 mm lens sees under 25 deg off axis at its corners).
+    const double cosC = std::cos(40.0 * PI / 180.0), W = 2.0 * PI * (1.0 - cosC);
+    const int nInt = 4000000;
+    double acc = 0.0, acc2 = 0.0;
+    for (int k = 0; k < nInt; ++k) {
+        Vec3 n;
+        const Vec3 yl = L.sampleFront(rng.uniform(), rng.uniform(), n);
+        const double cz = 1.0 - rng.uniform() * (1.0 - cosC), ph = 2.0 * PI * rng.uniform();
+        const double sz = std::sqrt(std::max(0.0, 1.0 - cz * cz));
+        const Vec3 dl(sz * std::cos(ph), sz * std::sin(ph), cz);
+        const double v = cam.lensPdfDir(cam.lensWorldPoint(yl), cam.u * dl.x + cam.v * dl.y + cam.w * dl.z,
+                                        lambda) * W;
+        acc += v; acc2 += v * v;
+    }
+    const double integ = acc / nInt;
+    const double se = std::sqrt(std::max(0.0, acc2 / nInt - integ * integ) / nInt);
+    const double seCam = std::sqrt(pValid * (1.0 - pValid) / nCam);
+    const double z1 = std::fabs(integ - pValid) / std::sqrt(se * se + seCam * seCam);
+    std::printf("[checklens] physical: integral of lensPdfDir %.5f +- %.5f vs unvignetted share %.5f "
+                "+- %.5f (%.1f sigma)\n", integ, se, pValid, seCam, z1);
+    std::printf("[checklens] physical: %lld of %lld camera rays read back with zero density\n",
+                zeroBack, ok);
+    // (3) a point 2 m out and off axis: connection vs catch.
+    const Vec3 X = cam.w * 2.0 + cam.u * 0.3 + cam.v * (-0.2);
+    const int nConn = 400000;
+    double sumConn = 0.0, cxC = 0.0, cyC = 0.0;
+    const double aCell = 1.0 / cam.lensCellNorm();
+    for (int k = 0; k < nConn; ++k) {
+        Vec3 Y, wd; double dist, wgt; int px, py;
+        if (!cam.lensConnect(X, lambda, rng.uniform(), rng.uniform(), Y, wd, dist, px, py, wgt)) continue;
+        sumConn += wgt * aCell; cxC += wgt * aCell * px; cyC += wgt * aCell * py;
+    }
+    const double omegaConn = sumConn / nConn;
+    // Catch: directions uniform in a cone about X -> eye wide enough to cover the element.
+    const Vec3 toEye = normalize(cam.eye - X);
+    const double halfAng = std::atan(2.0 * L.surf[0].aperture * 1e-3 / length(cam.eye - X));
+    const double cosK = std::cos(halfAng), WK = 2.0 * PI * (1.0 - cosK);
+    Vec3 t1 = normalize(cross(toEye, std::fabs(toEye.x) < 0.9 ? Vec3(1, 0, 0) : Vec3(0, 1, 0)));
+    Vec3 t2 = cross(toEye, t1);
+    const int nCatch = 4000000;
+    long long caught = 0; double cxK = 0.0, cyK = 0.0;
+    for (int k = 0; k < nCatch; ++k) {
+        const double cz = 1.0 - rng.uniform() * (1.0 - cosK), ph = 2.0 * PI * rng.uniform();
+        const double sz = std::sqrt(std::max(0.0, 1.0 - cz * cz));
+        const Vec3 d = toEye * cz + t1 * (sz * std::cos(ph)) + t2 * (sz * std::sin(ph));
+        int px, py;
+        if (!cam.lensCatch(Ray{X, d}, 1e30, lambda, px, py)) continue;
+        ++caught; cxK += px; cyK += py;
+    }
+    const double pK = (double)caught / nCatch;
+    const double omegaCatch = pK * WK, seK = std::sqrt(pK * (1.0 - pK) / nCatch) * WK;
+    const double z3 = std::fabs(omegaConn - omegaCatch) / std::max(seK, 1e-30);
+    const double mx1 = sumConn > 0 ? cxC / sumConn : -1, my1 = sumConn > 0 ? cyC / sumConn : -1;
+    const double mx2 = caught ? cxK / caught : -2, my2 = caught ? cyK / caught : -2;
+    std::printf("[checklens] physical: point source, solid angle reaching the sensor: connect %.4e, "
+                "catch %.4e +- %.1e (%.1f sigma); image at (%.2f,%.2f) vs (%.2f,%.2f)\n",
+                omegaConn, omegaCatch, seK, z3, mx1, my1, mx2, my2);
+    const bool pass = ok > 0 && z1 < 4.0 && zeroBack == 0 && caught > 1000 && z3 < 4.0 &&
+                      std::fabs(mx1 - mx2) < 0.5 && std::fabs(my1 - my2) < 0.5;
+    std::printf("[checklens] physical lens %s\n", pass ? "PASS" : "FAIL");
+    return pass;
+}
+
 // Deterministic thin-lens (mode C) self-test. Forward catch is far too photon-
 // inefficient to validate the lens by rendering, so instead we fire rays from a
 // fixed scene point through many aperture positions and measure the circle of
@@ -2639,8 +2736,10 @@ static int checkLens() {
     std::printf("[checklens] off-axis focus mean=(%.1f,%.1f) vs pinhole project=(%d,%d) err=%.1fpx\n",
                 mxO, myO, ppx, ppy, projErr);
     bool pass = (cF > 0 && cN > 0 && cO > 0) && (sF <= 1) && (sN >= 8) && (projErr <= 1.5);
-    std::printf("[checklens] %s\n", pass ? "PASS" : "FAIL");
-    return pass ? 0 : 1;
+    std::printf("[checklens] thin lens %s\n", pass ? "PASS" : "FAIL");
+    const bool passPhys = checkLensPhysical();
+    std::printf("[checklens] %s\n", (pass && passPhys) ? "PASS" : "FAIL");
+    return (pass && passPhys) ? 0 : 1;
 }
 
 // Fire random rays and report average BVH work per ray (nodes visited, leaf
@@ -16060,10 +16159,16 @@ static bool modeRendersVolumeEmission(char mode) {
 }
 // GRIN media: BDPT and the modes built on its transport (D, J, U) refuse them.
 static bool modeRendersGrin(char mode) { return mode != 'D' && mode != 'J' && mode != 'U'; }
-// A physical multi-element lens forms its image in R (traced backward) and in D and J (kept on
-// the camera subpath, Plan B). The run loop routes every other mode to one of those
+// A physical multi-element lens forms its image in R (traced backward), in D and J (camera
+// rays out through it, the light image into it), and in the forward modes A, B and C, which
+// trace light INTO the lens: A and B splat each vertex through it (Camera::lensConnect), C
+// catches what flies through it (Camera::lensCatch). V compares the forward splat with R
+// through the same glass. The run loop routes every other mode to one of those
 // (lensRoutedMode).
-static bool modeFormsLensImage(char mode) { return mode == 'R' || mode == 'D' || mode == 'J'; }
+static bool modeFormsLensImage(char mode) {
+    return mode == 'R' || mode == 'D' || mode == 'J' || mode == 'A' || mode == 'B' || mode == 'C' ||
+           mode == 'V';
+}
 
 // Core capability check: return a reason string if `mode` cannot render `scene` with a
 // camera of the given `projection`, else nullptr. Volumetric emission restricts every mode
@@ -16116,9 +16221,9 @@ static const char* modeFeatureUnsupported(const Scene& scene, char mode, int pro
     return nullptr;
 }
 
-// The mode a camera with a physical lens renders in: D and J keep the lens on their camera
-// subpath (Plan B); P, whose forward pass splats to a pinhole, goes to that lens-aware BDPT when
-// the scene is within its scope and to R otherwise; everything else goes to R.
+// The mode a camera with a physical lens renders in: the modes that form the lens image keep
+// their own (modeFormsLensImage); P, whose forward pass splats to a pinhole, goes to the
+// lens-aware BDPT when the scene is within its scope and to R otherwise; everything else to R.
 static char lensRoutedMode(const Scene& scene, char mode) {
     if (modeFormsLensImage(mode)) return mode;
     if (mode == 'P') return bdptUnsupportedFeature(scene) ? 'R' : 'D';
@@ -16137,7 +16242,10 @@ static const char* sceneModeUnsupported(const ftsl::Loaded& L, char cliMode) {
     };
     if (!L.cameras.empty()) {
         for (const auto& cs : L.cameras) {
-            const char m = cs.lens ? lensRoutedMode(L.scene, effOf(cs.mode)) : effOf(cs.mode);
+            // An unauthored physical-lens camera renders in R (the run loop's effModeCam).
+            const bool authored = cliMode || cs.mode || L.modeSet || L.defaultMode;
+            const char m = cs.lens ? lensRoutedMode(L.scene, authored ? effOf(cs.mode) : 'R')
+                                   : effOf(cs.mode);
             if (const char* r = modeFeatureUnsupported(L.scene, m, cs.projection)) return r;
         }
     } else {
@@ -17255,14 +17363,19 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         } else if (gpuBdptMode) {
             // Modes D and J share this (stricter) GPU support check: BDPT scope only — mode J
             // is the same megakernel with the merges switched on, so anything mode D can run
-            // on the device, mode J can. A realistic lens on the camera subpath (Plan B) is
-            // supported on-device too — the BDPT kernel generates the lens ray via
-            // dGenLensRay, exactly as the GPU mode-R backward megakernel does.
+            // on the device, mode J can. A physical lens is supported on-device too: the
+            // kernel traces camera rays out through it (dGenLensRay, as GPU mode R does) and
+            // the light image into it (dLensConnect).
             if (!cudaBdptSupported(scene)) {
                 const char* why = "scene has a BDPT-GPU-unsupported feature "
                                   "(GRIN media, env/collimated light, an emissive 'fire' volume, or a "
                                   "GPU-unsupported material: layered, indexed-palette, "
                                   "oversized multilayer/mix)";
+                if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
+                else         std::printf("[device] auto -> CPU (%s)\n", why);
+            } else if (!cudaLensFits(cam)) {
+                // Uploaded without its glass, the camera would image as a pinhole.
+                const char* why = "a physical lens with more surfaces than the device holds";
                 if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
@@ -17307,6 +17420,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     "[device] GPU can't accelerate this render: %s; using CPU\n", why);
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             }
+        } else if (cam.hasLens() && !cudaLensFits(cam)) {
+            const char* why = "a physical lens with more surfaces than the device holds";
+            if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
+            else         std::printf("[device] auto -> CPU (%s)\n", why);
         } else if (!cudaForwardSupported(scene)) {
             const char* why = "GPU-unsupported feature (layered material, indexed "
                               "palette, parametric record, oversized multilayer/mix "
@@ -22026,6 +22143,15 @@ static int run(int argc, char** argv) {
         if (modeFromCli) return mode;         // CLI -mode forces every camera
         return camMode ? camMode : mode;      // else per-camera, else the global default
     };
+    // A physical-lens camera nobody chose a mode for renders in R, as it always has. The
+    // forward modes image through a lens too, but not a mirror or glass seen directly through
+    // it, so for a lens camera they are a choice to make (-mode, the camera's `mode`, or the
+    // scene's), not a default to fall into.
+    const bool modeAuthored = modeFromCli || ftslScene.modeSet || ftslScene.defaultMode;
+    auto effModeCam = [&](const ftsl::CamSpec& cs) -> char {
+        if (cs.lens && !cs.mode && !modeAuthored) return 'R';
+        return effMode(cs.mode);
+    };
     struct RenderCam { std::string name; Camera cam; char mode; int res; int resY; double exposure; int expGroup;
                        Vec3 lookAt{0,0,0}; Vec3 up{0,1,0}; double fovY = 40.0;   // lookAt/up/fovY: for the interactive raster viewer
                        std::string pathBase;     // owning camera_path/orbit/curve base name ("" = standalone camera)
@@ -22237,7 +22363,7 @@ static int run(int argc, char** argv) {
         // (resolveCameraModes): lens routing first, then whatever that mode cannot render.
         std::vector<CamRequest> reqs;
         for (const ftsl::CamSpec* cs : sel) {
-            const char m = cs->lens ? lensRoutedMode(scene, effMode(cs->mode)) : effMode(cs->mode);
+            const char m = cs->lens ? lensRoutedMode(scene, effModeCam(*cs)) : effModeCam(*cs);
             reqs.push_back({m, cs->projection, cs->lens != nullptr, cs->name.c_str()});
         }
         std::vector<char> resolved;
@@ -22262,25 +22388,35 @@ static int run(int argc, char** argv) {
             c.apertureR = cs->aperture;
             if (cs->filmDist_m > 0.0) { c.filmDist = cs->filmDist_m; c.lensF = cs->lensF_m; }  // physical-optics (lens/fstop): film at image distance, real focal
             else                      { c.setFocus(cs->focus); }                                // legacy unit-film camera
-            char cmode = effMode(cs->mode);
+            char cmode = effModeCam(*cs);
             if (cs->lens) {
-                // Physical multi-element lens: the realistic-camera ray-gen (genLensRay)
-                // traces film->scene through the real glass. The analytic pinhole/thin-
-                // lens forward modes (A/B/C) and the pinhole-splat composite (P) can't
-                // form that image, so they render in mode R (backward realistic camera).
-                // Mode D keeps the lens on its camera subpath (Plan B): the backward lens
-                // ray still lights through the glass while forward light transport keeps
-                // its caustic efficiency (the light-image splat, t=1, is disabled).
-                // Mode P routes to that lens-aware BDPT, since P's forward pass splats to
-                // a pinhole and can't be pushed through the lens.
+                // Physical multi-element lens. Mode R traces camera rays film->scene through
+                // the real glass (genLensRay); the forward modes trace light the other way,
+                // scene->glass->sensor: A and B splat every vertex through the lens, C catches
+                // what flies through it. Mode D keeps the lens on its camera subpath (Plan B).
+                // Mode P routes to that lens-aware BDPT, since P's forward pass splats to a
+                // pinhole; every other mode renders in R.
                 c.lens = cs->lens;
                 double flmm = cs->lens->focalLengthMM();
                 double fw = cs->lens->filmW_mm, fh = cs->lens->filmH_mm;
                 const char routed = lensRoutedMode(scene, cmode);
-                if (cmode == 'D' || cmode == 'J') {
-                    std::printf("[camera] '%s' has a physical lens -> mode %c (%s) with "
-                                "the lens on the camera subpath (Plan B; light-image splat "
-                                "disabled); f=%.1fmm, sensor %.1fx%.1fmm\n",
+                if (!cs->mode && !modeAuthored)
+                    std::printf("[camera] '%s' has a physical lens and no mode chosen -> mode R "
+                                "(backward); -mode A, B or C traces light into it forward, "
+                                "-mode D both ways\n", cs->name.c_str());
+                if (cmode == 'A' || cmode == 'B' || cmode == 'C' || cmode == 'V') {
+                    std::printf("[camera] '%s' has a physical lens -> mode %c traces light into "
+                                "it (%s); f=%.1fmm, sensor %.1fx%.1fmm\n",
+                                cs->name.c_str(), cmode,
+                                cmode == 'C' ? "only light that flies through the glass onto the "
+                                               "sensor is caught"
+                                             : "each vertex is splatted through a sampled point "
+                                               "of the front element",
+                                flmm, fw, fh);
+                } else if (cmode == 'D' || cmode == 'J') {
+                    std::printf("[camera] '%s' has a physical lens -> mode %c (%s): camera "
+                                "rays traced out through it, the light image traced into it; "
+                                "f=%.1fmm, sensor %.1fx%.1fmm\n",
                                 cs->name.c_str(), cmode, cmode == 'J' ? "UPBP" : "BDPT",
                                 flmm, fw, fh);
                 } else if (cmode == 'P' && routed == 'R') {
@@ -22324,7 +22460,7 @@ static int run(int argc, char** argv) {
             // untouched here (they must NOT double-apply 1/N²; their gross-scale mis-seat
             // is the separate issue #1). No effect outside absolute EV (auto-exposure's
             // p99 anchor cancels any uniform aperture scale anyway).
-            if (scene.absolute && cmode == 'B' && c.lensF > 0.0 && c.apertureR > 0.0) {
+            if (scene.absolute && cmode == 'B' && c.lensF > 0.0 && c.apertureR > 0.0 && !c.hasLens()) {
                 double N = c.lensF / (2.0 * c.apertureR);           // f-number = focal / (2·apertureR)
                 if (N > 0.0) {
                     double camEq = (PI / 4.0) / (N * N);            // (π/4)/N² image-side irradiance factor
@@ -22689,7 +22825,7 @@ static int run(int argc, char** argv) {
             const size_t ci = (size_t)(&cs - ftslScene.cameras.data());
             m.mode = (ci < renderedOf.size() && renderedOf[ci])
                          ? renderedOf[ci]
-                         : renderedMode(scene, effMode(cs.mode), cs.projection, cs.lens != nullptr);
+                         : renderedMode(scene, effModeCam(cs), cs.projection, cs.lens != nullptr);
             if (cs.lens) m.cam.lens = cs.lens;
             m.name = cs.name;
             return m;
@@ -25646,7 +25782,11 @@ static int run(int argc, char** argv) {
     {
         const bool wantGpu  = !std::strcmp(device, "gpu");
         const bool wantAuto = !std::strcmp(device, "auto");
-        if ((wantGpu || wantAuto) && cudaAvailable() && cudaForwardSupported(scene))
+        // A physical lens deeper than the device holds is uploaded without its glass, so its
+        // camera would image as a pinhole: such a set stays on the CPU.
+        bool lensesFit = true;
+        for (const RenderCam& rc : toRender) if (!cudaLensFits(rc.cam)) lensesFit = false;
+        if ((wantGpu || wantAuto) && cudaAvailable() && cudaForwardSupported(scene) && lensesFit)
             useGpuForward = true;   // -beams per-camera resample is supported on the GPU too
     }
 #endif

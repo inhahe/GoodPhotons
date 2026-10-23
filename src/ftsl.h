@@ -900,6 +900,7 @@ struct Loaded {
     Vec3 camEye{0, 1, 3}, camLook{0, 1, 0}, camUp{0, 1, 0};
     double camFov = 40.0, camAperture = 0.02, camFocus = 0.0;
     char mode = 'B';
+    bool modeSet = false;        // did the file author `mode` anywhere (a camera's, or `render { mode }`)?
     char defaultMode = 0;        // scene { default_mode X }: fallback mode for cameras that
                                  //   don't author their own `mode` (0 = not specified). Unlike
                                  //   `mode` above (which trails the last camera/render block),
@@ -8180,7 +8181,7 @@ private:
         if (!L.hasCamera) {
             L.camEye = cs.eye; L.camLook = cs.look; L.camUp = cs.up;
             L.camFov = cs.fov; L.camAperture = cs.aperture; L.camFocus = cs.focus;
-            if (cs.mode) L.mode = cs.mode;
+            if (cs.mode) { L.mode = cs.mode; L.modeSet = true; }
             if (cs.res > 0) L.res = cs.res;
             L.hasCamera = true;
         }
@@ -8332,7 +8333,7 @@ private:
             if (!L.hasCamera) {
                 L.camEye = cs.eye; L.camLook = cs.look; L.camUp = cs.up;
                 L.camFov = cs.fov; L.camAperture = cs.aperture; L.camFocus = cs.focus;
-                if (cs.mode) L.mode = cs.mode;
+                if (cs.mode) { L.mode = cs.mode; L.modeSet = true; }
                 if (cs.res > 0) L.res = cs.res;
                 L.hasCamera = true;
             }
@@ -8414,7 +8415,7 @@ private:
             if (!L.hasCamera) {
                 L.camEye = cs.eye; L.camLook = cs.look; L.camUp = cs.up;
                 L.camFov = cs.fov; L.camAperture = cs.aperture; L.camFocus = cs.focus;
-                if (cs.mode) L.mode = cs.mode;
+                if (cs.mode) { L.mode = cs.mode; L.modeSet = true; }
                 if (cs.res > 0) L.res = cs.res;
                 L.hasCamera = true;
             }
@@ -9119,7 +9120,7 @@ private:
             if (!L.hasCamera) {
                 L.camEye = cs.eye; L.camLook = cs.look; L.camUp = cs.up;
                 L.camFov = cs.fov; L.camAperture = cs.aperture; L.camFocus = cs.focus;
-                if (cs.mode) L.mode = cs.mode;
+                if (cs.mode) { L.mode = cs.mode; L.modeSet = true; }
                 if (cs.res > 0) L.res = cs.res;
                 L.hasCamera = true;
             }
@@ -9134,7 +9135,7 @@ private:
         std::string dev = strOf(b, "device");
         if (!dev.empty()) L.device = dev;
         std::string md = strOf(b, "mode");
-        if (!md.empty()) L.mode = normMode(md, L);
+        if (!md.empty()) { L.mode = normMode(md, L); L.modeSet = true; }
         std::string o = strOf(b, "out");
         if (!o.empty()) L.out = o;
         const Stmt* r = find(b, "res");

@@ -313,6 +313,156 @@ struct Camera {
         return true;
     }
 
+    // ---- the physical lens traced FORWARD: light tracing into the glass --------------
+    // genLensRay above is the camera's own direction: film point -> glass -> scene. The
+    // forward modes need the opposite, so a scene point can be imaged through the real
+    // optics. Three things use it: the next-event lens splat of modes A and B (lensConnect),
+    // the brute-force catch of mode C (lensCatch), and BDPT's light-image strategy, which
+    // also needs the density the camera subpath would have drawn the same ray with
+    // (lensPdfDir).
+    //
+    // World <-> lens-local mm, the inverse of genLensRay's mapping: the front vertex plane
+    // is pinned at `eye`, the optical axis is +z toward the scene.
+    Vec3 lensLocalPoint(const Vec3& p) const {
+        const Vec3 d = p - eye;
+        return Vec3(dot(d, u) * 1e3, dot(d, v) * 1e3, dot(d, w) * 1e3 + lens->T);
+    }
+    Vec3 lensLocalDir(const Vec3& d) const { return Vec3(dot(d, u), dot(d, v), dot(d, w)); }
+    Vec3 lensWorldPoint(const Vec3& q) const {
+        return eye + (u * q.x + v * q.y) * 1e-3 + w * ((q.z - lens->T) * 1e-3);
+    }
+    // The film raster under the physical lens, as genLensRay lays it out: the sensor width
+    // spans resX square pixels, so a pixel is filmW_mm/resX on a side; the image is real,
+    // so a scene direction +u/+v lands at -x/-y on the sensor.
+    double lensPixelMM() const { return lens->filmW_mm / (double)film.resX; }
+    bool lensFilmToPixel(const Vec3& f, int& px, int& py) const {
+        const double halfW = 0.5 * lens->filmW_mm;
+        const double halfH = halfW * ((double)film.resY / (double)film.resX);
+        const double sx = -f.x / halfW, sy = -f.y / halfH;
+        if (!(sx >= -1.0 && sx < 1.0 && sy >= -1.0 && sy < 1.0)) return false;
+        px = (int)((sx * 0.5 + 0.5) * film.resX);
+        py = (int)((sy * 0.5 + 0.5) * film.resY);
+        if (px >= film.resX) px = film.resX - 1;
+        if (py >= film.resY) py = film.resY - 1;
+        return true;
+    }
+    // 1 / (area of one film cell, in scene m^2): turns flux landing in a cell into the
+    // cell's irradiance, which is what the backward lens camera measures (genLensRay's
+    // cos^4*A/Z^2 weight is an irradiance per unit radiance). The sensor's mm are 1e-3 of a
+    // scene metre, the mapping genLensRay places the glass in the world with.
+    double lensCellNorm() const { const double a = lensPixelMM() * 1e-3; return 1.0 / (a * a); }
+
+    // One next-event connection from scene point `p` through the physical lens. Samples a
+    // point Y uniformly on the front element (u1,u2), takes the straight ray p -> Y and
+    // traces it through the glass at `lambda` onto the sensor. On success:
+    //   Y, wdir, dist  the world entry point, the unit direction p -> Y, and |Y - p|;
+    //   px, py         the film cell the ray lands in;
+    //   w              cosY * A_front / (dist^2 * A_cell): times beta * f * cosSurf (or
+    //                  albedo * phase) it is the irradiance the connection adds to the cell.
+    // The flux through dA at Y is beta * f * cosSurf * cosY * dA / dist^2, and sampling Y
+    // with density 1/A_front makes that the estimator; glass conserves radiance, so the flux
+    // that leaves the rear element is the flux that entered (Fresnel loss is not modelled,
+    // as in genLensRay). False if the ray misses the clear aperture, a stop or element clips
+    // it, it is totally internally reflected, it lands off the film, or Y is not the FIRST
+    // point of the front element the ray meets (a convex element's far side is hidden).
+    bool lensConnect(const Vec3& p, double lambda, double u1, double u2,
+                     Vec3& Y, Vec3& wdir, double& dist, int& px, int& py, double& wgt) const {
+        const LensSystem& L = *lens;
+        Vec3 nY;
+        const Vec3 yl = L.sampleFront(u1, u2, nY);
+        const Vec3 pl = lensLocalPoint(p);
+        Vec3 dl = yl - pl;
+        const double dmm = length(dl);
+        if (!(dmm > 1e-9)) return false;
+        dl = dl / dmm;
+        if (!(dl.z < 0.0)) return false;                     // light must travel toward the sensor
+        Vec3 onFilm, dFilm, entry;
+        if (!L.traceToFilm(pl, dl, lambda, onFilm, dFilm, &entry)) return false;
+        // The ray meets the element first somewhere else: Y is on its hidden side. The
+        // tolerance is rounding in the intersection, which grows with the ray's length.
+        const Vec3 gap = entry - yl;
+        const double tol = 1e-6 + 1e-12 * dmm;               // mm
+        if (dot(gap, gap) > tol * tol) return false;
+        if (!lensFilmToPixel(onFilm, px, py)) return false;
+        Y = lensWorldPoint(yl);
+        Vec3 toY = Y - p;
+        dist = length(toY);
+        if (!(dist > 1e-12)) return false;
+        wdir = toY / dist;
+        const double cosY = std::fabs(dot(dl, nY));
+        const double aFront = L.frontArea();
+        const double aCell = lensPixelMM() * lensPixelMM();
+        wgt = cosY * (aFront / aCell) / (dist * dist);       // the mm^2 of both areas cancel
+        return std::isfinite(wgt) && wgt > 0.0;
+    }
+
+    // Mode C through the physical lens: does this photon ray, before it travels hitDist,
+    // enter the front element and come out on the sensor? Pure forward physics, as
+    // catchPhoton is for the thin lens. On success sets the cell.
+    bool lensCatch(const Ray& ray, double hitDist, double lambda, int& px, int& py) const {
+        const LensSystem& L = *lens;
+        const Vec3 ol = lensLocalPoint(ray.o), dl = lensLocalDir(ray.d);
+        if (!(dl.z < 0.0)) return false;
+        Vec3 entry, n;
+        if (!L.hitSurface(0, ol, normalize(dl), entry, n)) return false;
+        const Vec3 e = entry - ol;
+        if (!(length(e) * 1e-3 < hitDist)) return false;   // the scene was in the way
+        Vec3 onFilm, dFilm;
+        if (!L.traceToFilm(ol, dl, lambda, onFilm, dFilm)) return false;
+        return lensFilmToPixel(onFilm, px, py);
+    }
+
+    // BDPT's density for the camera subpath generating the ray that leaves front-element
+    // point `y` (world) in direction `dir` (unit, into the scene), DIVIDED by the density
+    // 1/A_front with which lensConnect picks y. The light-image (t=1) strategy picks y
+    // uniformly on the front element; the camera subpath gets its exit point from the film
+    // and rear-pupil sample instead, so the two strategies give y different densities. The
+    // MIS ratio between them is p_light(next) * (1/A_front) / p_cam(y, next), and writing
+    // the camera's pdfDir as p_cam(y, dir) * A_front makes the ordinary per-vertex ratio
+    // (pdfRev / pdfFwd at the next vertex) come out as exactly that.
+    //
+    // p_cam(y, dir): genLensRay draws the film point uniformly over the film (BDPT counts
+    // the whole film, see cameraPdfDir) and a point uniformly on the rear-plane disc, so per
+    // film area and film solid angle the density is Z^2 / (A_film * A_rear * cos^3 th),
+    // th the film ray's angle to the axis. Glass conserves etendue, dA cos dw, so per front
+    // area and exit solid angle that becomes Z^2 * cosFront / (A_film * A_rear * cos^4 th).
+    // All lengths in mm, so the result is per steradian. 0 if no camera sample could have
+    // made this ray: it is clipped, lands off the film, or crosses the rear plane outside
+    // the disc genLensRay samples.
+    double lensPdfDir(const Vec3& y, const Vec3& dir, double lambda) const {
+        const LensSystem& L = *lens;
+        const Vec3 yl = lensLocalPoint(y), wl = lensLocalDir(dir);
+        if (!(wl.z > 0.0)) return 0.0;                       // a camera ray leaves toward the scene
+        const Vec3 o = yl + wl * 1.0;                        // 1 mm out, aimed back at y
+        const Vec3 d = wl * -1.0;
+        Vec3 onFilm, dFilm, entry;
+        if (!L.traceToFilm(o, d, lambda, onFilm, dFilm, &entry)) return 0.0;
+        int px, py;
+        if (!lensFilmToPixel(onFilm, px, py)) return 0.0;
+        const double cosT = -dFilm.z;                        // film ray's cosine to the axis
+        if (!(cosT > 1e-9)) return 0.0;
+        const double Z = L.rearZ() - L.filmZ;
+        if (!(Z > 1e-9)) return 0.0;
+        // Where the film ray, run back up, crosses the rear plane: inside the sampled disc?
+        const double tR = Z / cosT;
+        const Vec3 pr = onFilm + dFilm * (-tR);
+        const double ra = L.rearAperture();
+        // A sliver of tolerance: a ray the camera itself drew at the disc's rim must not
+        // read back as outside it through rounding.
+        if (pr.x * pr.x + pr.y * pr.y > ra * ra * (1.0 + 1e-9)) return 0.0;
+        // Surface 0's normal at the exit point, for the etendue's front cosine.
+        Vec3 n0;
+        if (L.surf[0].radius == 0.0) n0 = Vec3(0, 0, 1);
+        else n0 = normalize(entry - Vec3(0, 0, L.zpos[0] + L.surf[0].radius));
+        const double cosF = std::fabs(dot(wl, n0));
+        const double halfW = 0.5 * L.filmW_mm;
+        const double aFilm = (2.0 * halfW) * (2.0 * halfW * (double)film.resY / (double)film.resX);
+        const double aRear = PI * ra * ra;
+        const double c2 = cosT * cosT;
+        const double pdf = Z * Z * cosF * L.frontArea() / (aFilm * aRear * c2 * c2);
+        return std::isfinite(pdf) ? pdf : 0.0;
+    }
+
     // Image a photon that enters the lens at pupil point `A` travelling along
     // `dir`, refract it through the thin lens (if any) and find the raster cell it
     // lands on. Shared by the brute-force catch (model C) and the next-event lens

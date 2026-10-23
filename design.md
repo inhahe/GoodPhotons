@@ -15,9 +15,9 @@ This file records the *internal* architecture. `known-issues.md` tracks bugs/deb
 
 | Mode | What | Core |
 |---|---|---|
-| `A` | forward + finite-lens physical camera (photons hit the lens) | `render.h` |
+| `A` | forward next-event splat through the finite lens: the thin lens, or a physical lens's glass | `render.h`, `camera.h` |
 | `B` | forward light tracing, splat through pinhole/lens to film (flagship) | `render.h` |
-| `C` | forward + contact sensor | `render.h` |
+| `C` | forward brute-force catch through the finite lens (thin or physical) | `render.h`, `camera.h` |
 | `R` | backward (unidirectional) path tracer — the reference | `backward.h` |
 | `W` | deterministic Whitted/POV-Ray preview: mode `R`'s walk with every estimator replaced by a fixed quadrature (noise-free at 1 spp, biased; CPU + GPU since 0.110.0, fully on-device since 0.116.0) | `backward.h` (`whitted`), `render_cuda.cu` (`WhittedOpts`) |
 | `P` | composite: forward B + backward R passes merged | `main.cpp` orchestration |
@@ -6426,6 +6426,29 @@ as the one at fault.
   Sellmeier fit built in, so a binary away from its data renders the same glass. An achromat is
   designed from its glasses' dispersion, and `makeAchromat` refuses two glasses without a
   difference in it (the loader reports it) rather than design a NaN camera.
+  - **The physical lens in both directions (0.394.0).** `genLensRay` is the camera's own
+    direction, film -> glass -> scene (modes R, D, J). Light tracing needs the reverse, and
+    three functions provide it, after Hanika & Dachsbacher 2014: `lensConnect` samples a point
+    uniformly by area on the FRONT element's clear cap (the one sampling that covers every ray
+    able to enter the lens, from any direction), traces the ray from the scene point through
+    every element onto the sensor, and weights it `cosY * A_front / (dist^2 * A_cell)`, the
+    flux through the lens over the cell's area -- the irradiance the backward camera's
+    `cos^4 A/Z^2` measures, so forward and backward share one absolute scale. `lensCatch` is
+    mode C's physical version. `lensPdfDir` is the density with which the camera subpath would
+    have made a given exit ray, times A_front: genLensRay's film x rear-disc density turned into
+    front-element x exit-direction terms by etendue conservation. BDPT stores it as the camera
+    vertex's direction pdf, which makes the ordinary per-vertex MIS ratio come out right
+    although the light image (t=1) and the camera subpath give the exit point different
+    densities; the camera vertex is no longer delta. Users: the forward splats of modes A/B
+    (`Renderer::connectLensPhysical` and its hero / volume twins, routed by `lensCam`, so a
+    lens camera in mode B images through its glass), mode C's catch, and BDPT's t=1 branch.
+    Device twins in `render_cuda.cu` (`dLensConnect` / `dLensCatch` / `dLensPdfDir`) run in
+    double: in the lens's millimetre frame a scene point metres away is beyond float's
+    resolution; the interface primitives are templates over the vector type, so the camera
+    direction's float arithmetic is unchanged. `-checklens` pins the three: the density
+    integrates to the unvignetted share of genLensRay's samples, every camera ray reads back
+    with a nonzero density, and the connection and the catch agree on a point source's flux
+    and image position. A lens camera with no authored mode still renders in R.
 - **`bvh.h` sphere queries** — `Aabb::dist2To` (exact point-to-box squared distance) and
   `Bvh::traverseSphere(c, r, leafFn)`, an unordered no-early-exit traversal reporting every
   primitive in a node box meeting the ball. Built for M-GATHERAREA's geometric footprint: the

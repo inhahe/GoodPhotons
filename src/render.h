@@ -469,6 +469,10 @@ struct Renderer {
                                  // the aperture (brute-force oracle, no connect/splat).
     bool lensMode     = false;   // model A: next-event splat through the finite lens
                                  // pupil (physical camera with depth of field).
+    // Does this camera take the lens splat? Mode A always does; a camera with a PHYSICAL
+    // multi-element lens does in every forward mode, since it has no pinhole limit to splat
+    // to (its aperture is part of the glass): in mode B it images through its lens as in A.
+    bool lensCam(const Camera& cam) const { return lensMode || cam.hasLens(); }
     bool diffraction = true;     // when false, MatType::Grating collapses to its m=0
                                  // (specular) order — a plain mirror (CLI -diffraction).
     bool useHero      = false;   // hero-wavelength sampling: each photon carries C
@@ -1331,6 +1335,95 @@ struct Renderer {
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
+    // ---- next-event splats through a PHYSICAL multi-element lens (modes A and B) -------
+    // The thin-lens connections below sample a point on the aperture disc and image it with
+    // the paraxial lens law. A physical lens samples a point on its front element instead
+    // and traces the ray through the real glass onto the sensor (Camera::lensConnect, which
+    // also derives the weight), so distortion, vignetting, aberrations and dispersion
+    // emerge exactly as in the backward camera (genLensRay), and the image lands on the
+    // same absolute scale: the flux through the lens divided by the film cell's area, the
+    // irradiance the backward camera's cos^4*A/Z^2 weight measures.
+    //
+    // Surface (or fiber) vertex: beta * f * cosSurf * w, f the BRDF (rho/pi for this
+    // Lambertian splat; the fiber's hairFCos carries its own projection).
+    void connectLensPhysical(const Scene& scene, const Camera& cam, Film& film,
+                             const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
+                             double lambda, double beta, double rho, Pcg32& rng,
+                             const HairShade* hs, const Vec3* plane) const {
+        const double u1 = rng.uniform(), u2 = rng.uniform();
+        Vec3 Y, wdir; double dist, wgt; int px, py;
+        if (!cam.lensConnect(p, lambda, u1, u2, Y, wdir, dist, px, py, wgt)) return;
+        if (plane && dot(*plane, Y - p) <= 0.0) return;
+        const double cosSurf = dot(n, wdir);
+        double stG = 1.0;                                   // see connectLens
+        if (!hs) {
+            if (cosSurf <= 0) return;
+            stG = shadowTerminatorG(wdir, n, ng);
+            if (stG <= 0.0) return;
+        }
+        const double off = hs ? hairExitOffset(*hs, n, wdir) : 1e-6;
+        if (off >= dist) return;
+        if (scene.occluded(p + (hs ? wdir : ng) * (hs ? 1e-6 : off), wdir, dist - off - 1e-6, 1e-6,
+                           /*camLeg=*/true, hs ? off : 0.0)) return;
+        const double corr = hs ? 1.0 : shadingAdjointCorr(wi, wdir, n, ng);
+        const double fcos = hs ? hairFCos(*hs, wdir) : (rho / PI) * cosSurf;
+        double contrib = beta * fcos * corr * wgt * stG;
+        if (!scene.media.empty())
+            contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
+        film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
+    }
+
+    // Hero bundle through a physical lens. The glass disperses, so the wavelengths share the
+    // front-element sample (one draw, so the RNG stream does not depend on C) and the scene
+    // leg from p to it, but each is traced through the lens on its own and lands in its own
+    // cell, or is clipped on its own.
+    void connectLensHeroPhysical(const Scene& scene, const Camera& cam, Film& film,
+                                 const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
+                                 const double* lam, const double* beta, const double* rho,
+                                 int nUp, Pcg32& rng, const Vec3* plane) const {
+        const double u1 = rng.uniform(), u2 = rng.uniform();
+        Vec3 Y, wdir; double dist = 0.0;
+        int px[hero::kHeroMax], py[hero::kHeroMax];
+        double wgt[hero::kHeroMax];
+        bool ok[hero::kHeroMax] = {}, any = false;
+        for (int i = 0; i < nUp; ++i) {
+            Vec3 Yi, wi_; double di;
+            ok[i] = cam.lensConnect(p, lam[i], u1, u2, Yi, wi_, di, px[i], py[i], wgt[i]);
+            if (ok[i] && !any) { Y = Yi; wdir = wi_; dist = di; any = true; }
+        }
+        if (!any) return;
+        if (plane && dot(*plane, Y - p) <= 0.0) return;
+        const double cosSurf = dot(n, wdir);
+        if (cosSurf <= 0) return;
+        const double stG = shadowTerminatorG(wdir, n, ng);
+        if (stG <= 0.0) return;
+        if (scene.occluded(p + ng * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
+        const double corr = shadingAdjointCorr(wi, wdir, n, ng);
+        for (int i = 0; i < nUp; ++i) {
+            if (!ok[i]) continue;
+            double contrib = beta[i] * (rho[i] / PI) * cosSurf * corr * wgt[i] * stG;
+            if (!scene.media.empty())
+                contrib *= mediaTransmittance(scene, p, wdir, dist, lam[i], rng);
+            film.add(px[i], py[i], Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
+        }
+    }
+
+    // A volume vertex through a physical lens: `phaseW` is what replaces f * cosSurf, the
+    // in-scatter albedo * phase for a fog vertex or the isotropic 1/(4 pi) for a fire.
+    void connectVolumeLensPhysical(const Scene& scene, const Camera& cam, Film& film,
+                                   const Vec3& p, double lambda, double beta, double phaseW,
+                                   const Vec3* wIn, const Medium* med, Pcg32& rng) const {
+        const double u1 = rng.uniform(), u2 = rng.uniform();
+        Vec3 Y, wdir; double dist, wgt; int px, py;
+        if (!cam.lensConnect(p, lambda, u1, u2, Y, wdir, dist, px, py, wgt)) return;
+        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
+        double f = phaseW;
+        if (med && wIn) f = med->albedo(lambda) * med->phaseValue(dot(*wIn, wdir), lambda);
+        double contrib = beta * f * wgt;
+        contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
+        film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
+    }
+
     // Model A (physical camera): next-event splat through the finite lens pupil.
     // Sample a point A uniformly on the aperture disc, connect the surface vertex to
     // A, refract through the thin lens and splat onto the film cell A images to.
@@ -1354,6 +1447,10 @@ struct Renderer {
                      const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
                      double lambda, double beta, double rho, Pcg32& rng,
                      const HairShade* hs = nullptr, const Vec3* plane = nullptr) const {
+        if (cam.hasLens()) {
+            connectLensPhysical(scene, cam, film, p, n, ng, wi, lambda, beta, rho, rng, hs, plane);
+            return;
+        }
         double R = cam.apertureR;
         double rr = R * std::sqrt(rng.uniform());
         double a  = 2.0 * PI * rng.uniform();
@@ -1418,6 +1515,10 @@ struct Renderer {
                          const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
                          const double* lam, const double* beta, const double* rho, int nUp,
                          Pcg32& rng, const Vec3* plane = nullptr) const {   // see connectLens
+        if (cam.hasLens()) {
+            connectLensHeroPhysical(scene, cam, film, p, n, ng, wi, lam, beta, rho, nUp, rng, plane);
+            return;
+        }
         double R = cam.apertureR;
         double rr = R * std::sqrt(rng.uniform());
         double a  = 2.0 * PI * rng.uniform();
@@ -1453,6 +1554,10 @@ struct Renderer {
     void connectLensVolume(const Scene& scene, const Medium& med, const Camera& cam, Film& film,
                            const Vec3& p, const Vec3& wIn, double lambda, double beta,
                            Pcg32& rng) const {
+        if (cam.hasLens()) {
+            connectVolumeLensPhysical(scene, cam, film, p, lambda, beta, 0.0, &wIn, &med, rng);
+            return;
+        }
         double R = cam.apertureR;
         double rr = R * std::sqrt(rng.uniform());
         double a  = 2.0 * PI * rng.uniform();
@@ -1505,6 +1610,11 @@ struct Renderer {
     // 1/(4π) emission term.
     void connectEmissionLensVolume(const Scene& scene, const Camera& cam, Film& film,
                                    const Vec3& p, double lambda, double beta, Pcg32& rng) const {
+        if (cam.hasLens()) {
+            connectVolumeLensPhysical(scene, cam, film, p, lambda, beta, 1.0 / (4.0 * PI),
+                                      nullptr, nullptr, rng);
+            return;
+        }
         double R = cam.apertureR;
         double rr = R * std::sqrt(rng.uniform());
         double a  = 2.0 * PI * rng.uniform();
@@ -1529,7 +1639,7 @@ struct Renderer {
                              const Vec3& p, double lambda, double beta, Pcg32& rng) const {
         for (int c = 0; c < nCam; ++c)
             if (cams[c].cam && cams[c].film) {
-                if (lensMode) connectEmissionLensVolume(scene, *cams[c].cam, *cams[c].film, p, lambda, beta, rng);
+                if (lensCam(*cams[c].cam)) connectEmissionLensVolume(scene, *cams[c].cam, *cams[c].film, p, lambda, beta, rng);
                 else          connectEmissionVolume(scene, *cams[c].cam, *cams[c].film, p, lambda, beta, rng);
             }
     }
@@ -1540,7 +1650,7 @@ struct Renderer {
     void camSplat(const Scene& scene, const Camera& cam, Film& film, const Vec3& p,
                   const Vec3& n, const Vec3& ng, const Vec3& wi, double lambda, double beta,
                   double rho, Pcg32& rng, const Vec3* plane = nullptr) const {
-        if (lensMode) connectLens(scene, cam, film, p, n, ng, wi, lambda, beta, rho, rng, nullptr,
+        if (lensCam(cam)) connectLens(scene, cam, film, p, n, ng, wi, lambda, beta, rho, rng, nullptr,
                                   plane);
         else if (!(plane && dot(*plane, cam.eye - p) <= 0.0))
             connect(scene, cam, film, p, n, ng, wi, lambda, beta, rho, rng);
@@ -1567,7 +1677,7 @@ struct Renderer {
     void camSplatHair(const Scene& scene, const Camera& cam, Film& film, const Vec3& p,
                       const Vec3& n, const Vec3& ng, const Vec3& wi, double lambda,
                       double beta, const HairShade& hs, Pcg32& rng) const {
-        if (lensMode) connectLens(scene, cam, film, p, n, ng, wi, lambda, beta, 0.0, rng, &hs);
+        if (lensCam(cam)) connectLens(scene, cam, film, p, n, ng, wi, lambda, beta, 0.0, rng, &hs);
         else          connect(scene, cam, film, p, n, ng, wi, lambda, beta, 0.0, rng, &hs);
     }
     void camSplatAllHair(const Scene& scene, const CamTarget* cams, int nCam, const Vec3& p,
@@ -1585,7 +1695,7 @@ struct Renderer {
                       const Vec3& n, const Vec3& ng, const Vec3& wi, const double* lam,
                       const double* beta, const double* rho, int nUp, Pcg32& rng,
                       const Vec3* plane = nullptr) const {           // see camSplat
-        if (lensMode)
+        if (lensCam(cam))
             connectLensHero(scene, cam, film, p, n, ng, wi, lam, beta, rho, nUp, rng, plane);
         else if (!(plane && dot(*plane, cam.eye - p) <= 0.0))
             connectHero(scene, cam, film, p, n, ng, wi, lam, beta, rho, nUp, rng);
@@ -2264,7 +2374,8 @@ struct Renderer {
 
     // Splat vertex p to every camera through every smooth dielectric sphere (the
     // refracted image of p) and off every perfect mirror (the reflected image of p).
-    // Mode B (pinhole) only; draws no aperture RNG.
+    // Mode B (pinhole) only; draws no aperture RNG. A camera with a physical lens is
+    // skipped: these closed-form connections aim at the pinhole, which it does not have.
     //
     // `w[i]` is the vertex's per-λ weight (Lambertian rho / single-scatter albedo);
     // vt.weight is ignored, and vt is copied per λ for the dielectric path. The loop
@@ -2287,7 +2398,7 @@ struct Renderer {
                     const Material& gm = scene.mats[S.matId];
                     const double ng = gm.ior(lam[i]);
                     for (int c = 0; c < nCam; ++c)
-                        if (cams[c].cam && cams[c].film)
+                        if (cams[c].cam && cams[c].film && !cams[c].cam->hasLens())
                             connectSpecularSphere(scene, *cams[c].cam, *cams[c].film, S, gm, ng,
                                                   p, vi, lam[i], beta[i], rng);
                 }
@@ -2297,13 +2408,13 @@ struct Renderer {
         for (int si : scene.mirrorSphereIdx) {
             const Sphere& S = scene.spheres[(size_t)si];
             for (int c = 0; c < nCam; ++c)
-                if (cams[c].cam && cams[c].film)
+                if (cams[c].cam && cams[c].film && !cams[c].cam->hasLens())
                     connectSpecularSphereMirror(scene, *cams[c].cam, *cams[c].film, S,
                                                 p, vt, lam, beta, w, nUp, rng);
         }
         for (const Scene::MirrorPlane& mp : scene.mirrorPlanes)
             for (int c = 0; c < nCam; ++c)
-                if (cams[c].cam && cams[c].film)
+                if (cams[c].cam && cams[c].film && !cams[c].cam->hasLens())
                     connectSpecularPlane(scene, *cams[c].cam, *cams[c].film, mp,
                                          p, vt, lam, beta, w, nUp, rng);
     }
@@ -2353,7 +2464,7 @@ struct Renderer {
                            double beta, Pcg32& rng) const {
         for (int c = 0; c < nCam; ++c)
             if (cams[c].cam && cams[c].film) {
-                if (lensMode) connectLensVolume(scene, med, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta, rng);
+                if (lensCam(*cams[c].cam)) connectLensVolume(scene, med, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta, rng);
                 else          connectVolume(scene, med, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta, rng);
             }
     }
@@ -3050,14 +3161,18 @@ struct Renderer {
             // (nearer than the surface AND any fog collision), it lands on the film.
             if (forwardCatch && nCam > 0 && cams[0].cam && cams[0].film) {
                 int px, py;
-                if (cams[0].cam->catchPhoton(ray, dEvent, px, py)) {
+                const Camera& cc = *cams[0].cam;
+                // A physical lens catches what enters its front element and comes out on the
+                // sensor (lensCatch); otherwise the photon must thread the thin lens's disc.
+                if (cc.hasLens() ? cc.lensCatch(ray, dEvent, lambda, px, py)
+                                 : cc.catchPhoton(ray, dEvent, px, py)) {
                     // Same flux->film-irradiance normaliser as connectLens (model A): a
                     // caught photon deposits pupil FLUX into the cell; divide by the cell
                     // area A_cell = pixelPlaneArea()*filmDist^2 so brute-force C keeps the
                     // SAME absolute scale as the importance-sampled A (validated equal),
                     // and both now match B's radiance*camEq in absolute EV.
-                    const Camera& cc = *cams[0].cam;
-                    double cCell = 1.0 / (cc.pixelPlaneArea() * cc.filmDist * cc.filmDist);
+                    double cCell = cc.hasLens() ? cc.lensCellNorm()
+                                                : 1.0 / (cc.pixelPlaneArea() * cc.filmDist * cc.filmDist);
                     // An env photon caught on its FIRST flight is the environment SEEN, so it
                     // carries the bilinear lookup every other mode's camera ray now shows
                     // (EnvMap::radianceSeen, 0.370.0) instead of the nearest texel its birth
@@ -3155,7 +3270,7 @@ struct Renderer {
                         Vec3 xc = ray.o + ray.d * tC;
                         double betaC = (aC > 0.0) ? betaPre * std::exp(-aC * tC) : betaPre;
                         const Medium& smc = scene.media[whichC];
-                        if (lensMode) connectLensVolume(scene, smc, *cams[c].cam, *cams[c].film, xc, ray.d, lambda, betaC, crng);
+                        if (lensCam(*cams[c].cam)) connectLensVolume(scene, smc, *cams[c].cam, *cams[c].film, xc, ray.d, lambda, betaC, crng);
                         else          connectVolume(scene, smc, *cams[c].cam, *cams[c].film, xc, ray.d, lambda, betaC, crng);
                         camSpecularSplatVolumeAll(scene, smc, &cams[c], 1, xc, ray.d, lambda, betaC, crng);
                     }
@@ -3730,7 +3845,39 @@ struct Renderer {
             double dEvent = h.valid ? h.t : 1e30;
 
             // Model C aperture catch: the photon physically threads the pupil.
-            if (forwardCatch && nCam > 0 && cams[0].cam && cams[0].film) {
+            if (forwardCatch && nCam > 0 && cams[0].cam && cams[0].film && cams[0].cam->hasLens()) {
+                // Through a physical lens the glass disperses: each live wavelength is traced
+                // to its own cell, and one the lens clips is absorbed by it. The photon ends
+                // if any wavelength reaches the sensor; if none does it flies on, as a photon
+                // that misses the thin lens's disc does.
+                const Camera& cc = *cams[0].cam;
+                int pxs[hero::kHeroMax], pys[hero::kHeroMax];
+                bool any = false, hit[hero::kHeroMax] = {};
+                for (int i = 0; i < nUp; ++i) {
+                    hit[i] = cc.lensCatch(ray, dEvent, lam[i], pxs[i], pys[i]);
+                    any = any || hit[i];
+                }
+                if (any) {
+                    const double cCell = cc.lensCellNorm();
+                    const bool envSeen = (bounce == 0 && envBorn);
+                    EnvMap::Taps tp{};
+                    if (envSeen) tp = scene.envMap->taps(-ray.d);
+                    double sensorAdd = 0.0;
+                    for (int i = 0; i < nUp; ++i) {
+                        if (!hit[i]) { e.absorbed += beta[i]; continue; }   // clipped in the glass
+                        double seen = 1.0;
+                        if (envSeen) {
+                            const double Ln = scene.envMap->radiance(-ray.d, lam[i]);
+                            seen = (Ln > 0.0) ? scene.envMap->radianceAt(tp, lam[i]) / Ln : 0.0;
+                        }
+                        cams[0].film->add(pxs[i], pys[i], Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i]))
+                                                          * (beta[i] * seen * cCell));
+                        sensorAdd += beta[i] * seen;
+                    }
+                    e.sensor += sensorAdd;
+                    return;
+                }
+            } else if (forwardCatch && nCam > 0 && cams[0].cam && cams[0].film) {
                 int px, py;
                 if (cams[0].cam->catchPhoton(ray, dEvent, px, py)) {
                     const Camera& cc = *cams[0].cam;

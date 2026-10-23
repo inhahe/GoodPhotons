@@ -3089,8 +3089,9 @@ allow `fov_y ≥ 180`.
 
 ### 14.5 Physical `lens { … }` block
 
-Renders through the backward realistic-camera path (mode R), tracing real glass
-interfaces (radii/thicknesses/apertures in **millimetres**).
+Images through real glass interfaces (radii/thicknesses/apertures in **millimetres**):
+mode R traces camera rays out through it, the forward modes A, B and C trace light into it,
+and modes D and J do both (REFERENCE.md, *Physical (realistic) lens*).
 
 ```
 lens { preset achromat  focal 50  fstop 2.8  glass BK7 }

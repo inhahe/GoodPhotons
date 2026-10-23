@@ -1,10 +1,13 @@
 # Realistic (mesh-lens) camera demo. The camera carries a physical lens
 # prescription — a stack of spherical glass interfaces plus an aperture stop —
 # so depth of field, distortion, vignetting and chromatic aberration all emerge
-# from tracing rays through the actual optics. A physical lens forces mode R
-# (the backward realistic-camera path).
+# from tracing rays through the actual optics. Mode R (the default for a lens camera
+# here) traces camera rays out through the glass; the forward modes trace light in:
+# A and B splat every vertex through the lens, C catches what flies through it, and
+# D does both. All of them land on the same absolute image scale.
 #
 #   ftrace -in scenes/realcam.ftsl -n 4000000 -o realcam.ppm
+#   ftrace -in scenes/realcam.ftsl -mode A -n 400000000 -o realcam_fwd.png
 #
 # Three glossy spheres recede into the distance; only the one at the focus
 # distance is sharp, the others blur. A bright key light gives the out-of-focus

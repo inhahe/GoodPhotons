@@ -86,9 +86,9 @@ paths they can capture at all**.
 
 | Mode | Name | What it does | Backend |
 |---|---|---|---|
-| `A` | Finite-lens camera | Forward next-event splat through a finite aperture + thin lens (true depth of field, efficient) | CPU + GPU |
-| `B` | Pinhole splat *(default)* | Light-tracing splat to a pinhole camera; independent photons | CPU + **GPU** |
-| `C` | Finite-aperture catch | Forward photon catch through a thin lens (real depth of field) | CPU + GPU |
+| `A` | Finite-lens camera | Forward next-event splat through a finite aperture + thin lens, or through a physical `lens { }`'s real glass (true depth of field, efficient) | CPU + GPU |
+| `B` | Pinhole splat *(default)* | Light-tracing splat to a pinhole camera (through a physical `lens { }`'s glass as in `A`, when the camera has one); independent photons | CPU + **GPU** |
+| `C` | Finite-aperture catch | Forward photon catch through a thin lens or a physical lens (real depth of field) | CPU + GPU |
 | `R` | Backward reference | Backward path-traced reference image; drives the physical-lens camera | CPU + **GPU** |
 | `W` | Deterministic preview | Mode `R` with **every estimator replaced by a fixed quadrature** — a POV-Ray-style Whitted render that is noise-free at `-spp 1` and ~2 orders of magnitude faster than converging `R`. Trades multi-bounce GI (see `-ambient` for a flat fill, `-gi` for a real deterministic one-bounce gather) and unbiasedness for speed. **Caveat — media/GRIN need spp.** Mode `W` samples a participating medium's free flights (and a fire's light) at random, so any medium is grainy at 1 spp and converges with passes; below 64 spp ftrace prints a `[mode W] note` saying so. And "noise-free at 1 spp" holds only while the path stays in the hero *bundle*; a medium whose extinction varies with wavelength, a GRIN volume, or `-heroc 1` drop it onto a scalar path carrying **one wavelength per sample** (a grey fog, cloud or rain keeps the bundle: since 0.375.0 on the CPU, 0.379.0 on the GPU), and mode `W`'s wavelength lattice depends on the sample index *alone* (shared by every pixel), so an N-spp frame is the whole image rendered at N shared wavelengths. The error is a **uniform colour cast**, not noise — it does not average down per pixel. Measured on `gallery_rain` in 0.199, when its rain still dropped the bundle, frame-mean B/G vs. the converged answer 0.705: `1 spp → 0.000` (no blue at all), `8 → 1.243` (magenta), `16 → 0.691`, `64 → 0.694`. Use `-spp 64` or more on such a scene; ftrace prints a `[mode W] WARNING` below that. This is also why a live `-window` on such a render **changes hue between repaints** while it climbs through the first few dozen spp. Also drives the interactive viewer's live lit preview (`-explore`, `T`) | CPU + **GPU** (see below) |
 | `V` | Validate | Runs `B` and `R` and reports the best-fit residual between them | CPU (+GPU forward pass) |
@@ -952,9 +952,9 @@ that converges to the same physical image.
 | Mode | Best for | Speed | Specular-first | Depth of field | Caustics | GPU | Main limitation |
 |---|---|---|---|---|---|---|---|
 | **`-raster`** *(preview)* | Composition & camera-motion preview | Instant | — *(flat ghost/tint)* | ✗ | ✗ | ✓ *(`-device gpu`; else threaded CPU)* | **No light transport at all** — no shadows, reflection, refraction or GI (`-see-through` fakes clear glass) |
-| `B` *(default)* | Diffuse & caustic-heavy scenes | **Fastest** | ~ *(mirrors + glass spheres)* | ✗ | ✓ | ✓ | Other specular-first pixels (mesh glass, rough specular, mirror-in-mirror) still black; no depth of field |
-| `A` | Efficient depth of field / bokeh | Fast | ✗ | ✓ | ✓ | ✓ | Rectilinear only; specular-first still black (the analytic connections are pinhole-only) |
-| `C` | Ground-truth DoF oracle | Slow | ✗ | ✓ | ✓ | ✓ | Catch-starved → far noisier than `A` for the same budget |
+| `B` *(default)* | Diffuse & caustic-heavy scenes | **Fastest** | ~ *(mirrors + glass spheres)* | ✗ *(✓ through a physical lens)* | ✓ | ✓ | Other specular-first pixels (mesh glass, rough specular, mirror-in-mirror) still black; no depth of field |
+| `A` | Efficient depth of field / bokeh | Fast | ✗ | ✓ *(thin or physical lens)* | ✓ | ✓ | Thin lens rectilinear only; specular-first still black (the analytic connections are pinhole-only) |
+| `C` | Ground-truth DoF oracle | Slow | ✗ | ✓ *(thin or physical lens)* | ✓ | ✓ | Catch-starved → far noisier than `A` for the same budget |
 | `R` | Quiet reference; any first hit; **fluorescence** | Medium | ✓ | ✓ *(physical lens)* | ✗ *(noisy)* | ✓ | Noisy on caustics |
 | `W` *(preview)* | **Noise-free look preview** — materials, shadows, reflections, at `-spp 1`; also the interactive viewer's lit preview (`-explore`, `T`) | ~300× `R` | ✓ | ✓ | ✗ | ✗ | Biased: GI is a flat `-ambient` fill or a one-bounce `-gi` gather, rough glossy needs `-spp` to resolve its lobe; fully on the GPU |
 | `V` | Correctness check (`B` vs `R` residual) | ~2× *(runs both)* | ✓ *(via `R`)* | ✓ *(via `R`)* | ~ | forward pass | Diagnostic, not a production renderer |
@@ -987,13 +987,21 @@ that converges to the same physical image.
   This gives **true thin-lens depth of field and bokeh** at a fraction of `C`'s cost,
   because photons don't have to physically hit the aperture. `B` is the `aperture→0`
   pinhole limit of this camera; rectilinear only (a fisheye needs a wide-angle element
-  the single thin lens can't form). Use when you want DoF without `C`'s noise.
+  the single thin lens can't form). Use when you want DoF without `C`'s noise. With a
+  **physical `lens { }`** the splat goes through the real glass instead: each vertex is
+  connected to a sampled point of the lens's front element and the ray is traced through
+  every element onto the sensor, so the image carries that objective's distortion,
+  vignetting, aberrations and colour fringing, on the same absolute scale as mode `R`
+  through the same lens. Mode `B` does the same with a physical lens, which has no pinhole
+  limit (its aperture is part of the glass).
 - **`C` — finite-aperture catch (brute-force DoF oracle, slow).** Photons must
   physically pass through the aperture to be counted, giving true thin-lens depth of
   field and bokeh — but it is **catch-starved** (most photons miss the aperture), so
   it is **much noisier / slower** than `A`/`B` for the same photon budget. Mainly the
   ground-truth `A` is validated against; use directly only when you want the
-  unapproximated forward-catch.
+  unapproximated forward-catch. With a physical lens a photon counts when it enters the
+  front element and comes out on the sensor; each wavelength of a hero bundle is traced
+  through the dispersive glass to its own pixel.
 - **`R` — backward reference (unbiased, general).** Traces from the camera, so it
   renders **any** first-hit surface including specular, and is the **quiet, reliable
   reference** for camera-visible lighting. It also renders **fluorescence** — the
@@ -1042,9 +1050,9 @@ that converges to the same physical image.
   captures **specular-first pixels and diffuse caustics in a single pass** on the
   absolute-radiance scale (no composite seam). GPU-accelerated (its own megakernel).
   It also supports the **physical (realistic) lens on its camera subpath** — the
-  camera ray is traced through the real glass while forward light transport keeps its
-  caustic efficiency (the light-image splat strategy is disabled, since a multi-element
-  lens has no closed-form sensor projection; runs on the CPU **and GPU**). It renders
+  camera ray is traced through the real glass, and the light-image strategy traces light
+  *into* it through a sampled point of the front element, so caustics seen through the
+  glass keep their forward efficiency (runs on the CPU **and GPU**). It renders
   **participating media of every kind** — global haze, multiple superposed media,
   box/sphere/object-bounded fog, and **heterogeneous `density`-field blobs** — with volume
   in-scatter vertices, HG-phase connections and transmittance-weighted edges (subpath
@@ -1895,10 +1903,17 @@ glass interfaces plus an aperture stop. The backward tracer samples a film point
 and a point on the rear element and traces the ray *through the actual glass*
 (per-wavelength Snell refraction), so **depth of field, distortion, spherical &
 chromatic aberration, field curvature and vignetting all emerge from the
-geometry** — no thin-lens approximation. A physical lens renders in mode `R`
-(backward realistic camera) by default, or in mode `D` (BDPT with the lens on the
-camera subpath) when you want forward light transport's caustic efficiency through
-the glass; mode `P` routes to whichever of those fits the scene.
+geometry** — no thin-lens approximation. Light tracing goes the other way through the
+same glass: from a scene point to a sampled point on the front element, then through
+every element onto the sensor (Hanika & Dachsbacher 2014, "Efficient Monte Carlo rendering
+with realistic lenses"). So a physical lens renders in mode `R` (backward), in the forward
+modes `A`, `B` (both splat through the lens) and `C` (catches what flies through it), in
+mode `D` and `J` (camera rays out through it, the light image into it), and in `V`; mode
+`P` routes to `D` or `R`, and modes `M`, `S`, `U` render it in `R`. A lens camera nobody
+chose a mode for (no `-mode`, no camera `mode`, no scene `mode`/`default_mode`) renders in
+`R`, since a forward splat cannot image a mirror seen directly through the glass. All of
+these agree on the absolute image scale; `-checklens` checks the forward tracing against
+the backward camera.
 
 ```ftsl
 camera "real" {
@@ -1926,15 +1941,19 @@ slower** option. It captures real optical behaviour the thin lens cannot
 (aberrations, distortion, field curvature, natural vignetting, dispersion-driven
 colour fringing, and aperture-shaped bokeh), but it traces every camera ray
 through the glass stack, so it is more expensive per sample than the analytic thin
-lens. In both mode `R` and mode `D` it **runs on the GPU** (the backward and BDPT
-megakernels each refract the camera ray through the glass stack on the device via the
-same lens tracer), so within the GPU-supported scope it is still fast. Reach for the
+lens. It **runs on the GPU** in every mode that forms its image (the device traces the
+glass stack in double precision for light coming in, since a scene point metres away is
+too far for single precision at the lens's millimetre scale), so within the GPU-supported
+scope it is still fast. Reach for the
 analytic lens/projection when you want speed and a clean ideal image, and the physical
 lens when you want a specific real objective's look.
 
-*Current limits:* the lens attaches to the **camera subpath** — mode `R` (backward),
-mode `D` (BDPT, keeping forward caustics but with the light-image splat disabled), or
-mode `P` (which routes to `D`/`R`). It maps the sensor across the film width, so a
+*Current limits:* a forward splat cannot image a mirror or glass seen directly through
+the lens (as with the thin lens, those pixels need `R`, `D` or `P`), and the analytic mirror
+and glass-sphere connections of mode `B` are pinhole-only, so they are skipped for a
+physical lens. The light entering the lens is sampled uniformly over the front element:
+exact for any lens, but a prescription whose front element is much larger than its
+aperture stop wastes most of those samples. It maps the sensor across the film width, so a
 film whose aspect matches the sensor (e.g. `res 360 240` for a 3:2 sensor) covers it
 without cropping, while a mismatched aspect crops. It does not model inter-element
 flare/ghosting or shaped-iris bokeh. On the GPU it inherits its mode's scope (no

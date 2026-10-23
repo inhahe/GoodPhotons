@@ -364,8 +364,10 @@ ftrace -in scenes/cornell.ftsl -n 200000000 -o out.png
 # Quick-view a bare mesh — auto-lit, auto-framed, live raster preview window
 ftrace cloud1.glb            # also .obj/.gltf/.fbx/.stl/.ply; drag-drop / double-click works
 
-# Physical-lens camera demo (depth of field from real optics; forces mode R)
+# Physical-lens camera demo (depth of field from real optics), traced backward (R)
+# or forward (A: light traced into the glass)
 ftrace -in scenes/realcam.ftsl -n 6000000 -o realcam.png
+ftrace -in scenes/realcam.ftsl -mode A -n 400000000 -o realcam_fwd.png
 
 # Render until a wall-clock budget with a live preview
 ftrace -in scenes/group.ftsl -time 120 -preview -o group.png

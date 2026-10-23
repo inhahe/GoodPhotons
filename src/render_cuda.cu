@@ -2114,6 +2114,297 @@ __device__ static Real specLookup(const DSpec& s, Real lambda) {
     const Real f = (x1 > x0) ? (lambda - x0) / (x1 - x0) : (Real)0;
     return (Real)s.ky[k] + ((Real)s.ky[k + 1] - (Real)s.ky[k]) * f;
 }
+// ======================= physical lens (device twin of lens.h / camera.h) ==========
+// The camera traces film -> glass -> scene (dGenLensRay: GPU mode R, the BDPT camera
+// subpath); the forward kernels and BDPT's light image trace light the other way, scene ->
+// glass -> sensor (dLensConnect, dLensCatch, dLensPdfDir). Host twins: LensSystem and the
+// Camera::lens* functions, which carry the derivations.
+//
+// PRECISION. Film -> scene runs in Real: its origin is on the film, a few mm from the lens
+// frame's origin. Scene -> sensor cannot: a scene point a few metres out sits ~10^4 mm away
+// in the lens frame, where float's step is a sizeable fraction of a millimetre, coarser than
+// the tolerance that tells a front-element point hidden behind the element's own curve. So
+// the interface primitives are templates over the vector type, DVec3 (Real) for the camera
+// and DLV (double) for light, and the DVec3 instances are the same arithmetic as before.
+struct DLV {
+    double x, y, z;
+    HD DLV operator+(const DLV& o) const { return {x + o.x, y + o.y, z + o.z}; }
+    HD DLV operator-(const DLV& o) const { return {x - o.x, y - o.y, z - o.z}; }
+    HD DLV operator*(double s)     const { return {x * s, y * s, z * s}; }
+    HD DLV operator/(double s)     const { return {x / s, y / s, z / s}; }
+    HD DLV operator-()             const { return {-x, -y, -z}; }
+};
+HD static inline double dot(const DLV& a, const DLV& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+HD static inline double length(const DLV& a) { return sqrt(dot(a, a)); }
+HD static inline DLV normalize(const DLV& a) { return a / length(a); }
+HD static inline DLV toDLV(const DVec3& v) { return DLV{(double)v.x, (double)v.y, (double)v.z}; }
+
+// Sensor-side index of surface j (air baked as 1); scene-side = sensor side of j-1.
+__device__ static Real dLensIorSensor(const DLensSystem& L, int j, Real lambda) {
+    return specLookup(L.iorAll + (size_t)j * SPEC_N, lambda);
+}
+__device__ static Real dLensIorScene(const DLensSystem& L, int j, Real lambda) {
+    return (j == 0) ? (Real)1 : dLensIorSensor(L, j - 1, lambda);
+}
+// Refract `d` at `n` (faced against d) with eta = n_in/n_out (port of refractDir).
+template <class V>
+__device__ static bool dLensRefract(const V& d, const V& n, decltype(V::x) eta, V& out) {
+    using S = decltype(V::x);
+    S cosi = -dot(d, n);
+    S k = (S)1 - eta * eta * ((S)1 - cosi * cosi);
+    if (k < 0) return false;                          // TIR -> blocked
+    out = normalize(d * eta + n * (eta * cosi - sqrt(k)));
+    return true;
+}
+// Intersect a lens-local ray with surface j; hitP + normal (against d). Clipped by the
+// clear aperture => false (vignetting). Port of LensSystem::hitSurface.
+template <class V>
+__device__ static bool dLensHitSurface(const DLensSystem& L, int j, const V& o,
+                                       const V& d, V& hitP, V& nrm) {
+    using S = decltype(V::x);
+    double zv = L.surf[j].zpos, R = L.surf[j].radius, ap = L.surf[j].aperture;
+    if (R == 0.0) {                                   // planar (stop / flat)
+        if (fabs((double)d.z) < 1e-12) return false;
+        double t = (zv - (double)o.z) / (double)d.z;
+        if (t < 1e-9) return false;
+        hitP = o + d * (S)t;
+        nrm = V{0, 0, d.z > 0 ? -1.0 : 1.0};
+    } else {
+        V C{0, 0, zv + R};
+        V op = o - C;
+        S b = dot(op, d);
+        S c = dot(op, op) - (S)(R * R);
+        S disc = b * b - c;
+        if (disc < 0) return false;
+        S sq = sqrt(disc);
+        S t0 = -b - sq, t1 = -b + sq;
+        bool closer = (d.z > 0) ^ (R < 0);
+        S t = closer ? fmin(t0, t1) : fmax(t0, t1);
+        if (t < (S)1e-9) t = closer ? fmax(t0, t1) : fmin(t0, t1);
+        if (t < (S)1e-9) return false;
+        hitP = o + d * t;
+        nrm = normalize(hitP - C);
+        if (dot(nrm, d) > 0) nrm = -nrm;
+    }
+    if ((double)hitP.x * (double)hitP.x + (double)hitP.y * (double)hitP.y > ap * ap)
+        return false;                                 // clipped by the clear aperture
+    return true;
+}
+// Trace a lens-local ray from the film out through every interface (sensor->scene; the
+// camera-ray direction). Port of LensSystem::trace.
+__device__ static bool dLensTrace(const DLensSystem& L, const DVec3& o0, const DVec3& d0,
+                                  Real lambda, DVec3& outO, DVec3& outD) {
+    DVec3 o = o0, d = normalize(d0);
+    for (int j = L.nSurf - 1; j >= 0; --j) {
+        DVec3 hp, n;
+        if (!dLensHitSurface(L, j, o, d, hp, n)) return false;
+        o = hp;
+        if (L.surf[j].radius != 0.0) {
+            Real eta = dLensIorSensor(L, j, lambda) / dLensIorScene(L, j, lambda);
+            DVec3 nd;
+            if (!dLensRefract(d, n, eta, nd)) return false;
+            d = nd;
+        }
+    }
+    outO = o; outD = d;
+    return true;
+}
+// Generate a world-space camera ray through the physical lens (port of
+// Camera::genLensRay). Returns false on vignetting (element/stop clip or TIR); on
+// success `weight` is the radiometric importance cos^4*A_rear/Z^2.
+__device__ static bool dGenLensRay(const DCamera& cam, int px, int py, Real jx, Real jy,
+                                   Real u1, Real u2, Real lambda,
+                                   DVec3& oW, DVec3& dW, Real& weight) {
+    weight = 0;
+    const DLensSystem& L = cam.lens;
+    double sx = 2.0 * ((px + jx) / (double)cam.resX) - 1.0;
+    double sy = 2.0 * ((py + jy) / (double)cam.resY) - 1.0;
+    double halfW = 0.5 * L.filmW_mm;
+    double halfH = halfW * ((double)cam.resY / (double)cam.resX);
+    DVec3 pFilm{-sx * halfW, -sy * halfH, L.filmZ};
+    double rearAp = L.surf[L.nSurf - 1].aperture;
+    double rearZ  = L.surf[L.nSurf - 1].zpos;
+    double rr  = sqrt(u1 > 0 ? (double)u1 : 0.0) * rearAp;
+    double phi = 2.0 * DPI * (double)u2;
+    DVec3 pRear{rr * cos(phi), rr * sin(phi), rearZ};
+    DVec3 d0 = normalize(pRear - pFilm);
+    DVec3 oL, dL;
+    if (!dLensTrace(L, pFilm, d0, lambda, oL, dL)) return false;
+    Real cosT = d0.z;                                 // d0 unit; z = cos to axis
+    if (cosT <= 0) return false;
+    Real cos4 = (cosT * cosT) * (cosT * cosT);
+    double A = DPI * rearAp * rearAp;
+    double Z = rearZ - L.filmZ;
+    if (Z <= 1e-9) return false;
+    weight = (Real)((double)cos4 * A / (Z * Z));
+    // Lens-local (mm) -> world: front vertex plane pinned at eye, mm -> scene metres.
+    oW = cam.eye + (cam.u * oL.x + cam.v * oL.y) * (Real)1e-3
+                 + cam.w * (Real)(((double)oL.z - L.T) * 1e-3);
+    dW = normalize(cam.u * dL.x + cam.v * dL.y + cam.w * dL.z);
+    return true;
+}
+
+// ---- scene -> sensor (light tracing into the lens), all in double ------------------
+// World <-> lens-local mm: the front vertex plane is pinned at the eye (dGenLensRay).
+__device__ static inline DLV dLensLocalPoint(const DCamera& cam, const DLV& p) {
+    const DLV d = p - toDLV(cam.eye);
+    return DLV{dot(d, toDLV(cam.u)) * 1e3, dot(d, toDLV(cam.v)) * 1e3,
+               dot(d, toDLV(cam.w)) * 1e3 + cam.lens.T};
+}
+__device__ static inline DLV dLensLocalDir(const DCamera& cam, const DLV& d) {
+    return DLV{dot(d, toDLV(cam.u)), dot(d, toDLV(cam.v)), dot(d, toDLV(cam.w))};
+}
+__device__ static inline DLV dLensWorldPoint(const DCamera& cam, const DLV& q) {
+    return toDLV(cam.eye) + (toDLV(cam.u) * q.x + toDLV(cam.v) * q.y) * 1e-3
+                          + toDLV(cam.w) * ((q.z - cam.lens.T) * 1e-3);
+}
+// Surface 0's clear area (mm^2) and a uniform point on it with its scene-facing normal
+// (host twins LensSystem::frontArea / sampleFront).
+__device__ static double dLensFrontArea(const DLensSystem& L) {
+    const double R = fabs(L.surf[0].radius), ap = L.surf[0].aperture;
+    if (R == 0.0) return DPI * ap * ap;
+    const double sag = R - sqrt(fmax(0.0, R * R - ap * ap));
+    return 2.0 * DPI * R * sag;
+}
+__device__ static DLV dLensSampleFront(const DLensSystem& L, double u1, double u2, DLV& nScene) {
+    const double R = L.surf[0].radius, ap = L.surf[0].aperture, zv = L.surf[0].zpos;
+    const double phi = 2.0 * DPI * u2;
+    if (R == 0.0) {
+        const double r = ap * sqrt(u1);
+        nScene = DLV{0, 0, 1};
+        return DLV{r * cos(phi), r * sin(phi), zv};
+    }
+    const double aR = fabs(R);
+    const double cosMax = sqrt(fmax(0.0, 1.0 - (ap / aR) * (ap / aR)));
+    const double ca = 1.0 - u1 * (1.0 - cosMax);
+    const double sa = sqrt(fmax(0.0, 1.0 - ca * ca));
+    const double s = (R < 0.0) ? 1.0 : -1.0;
+    const DLV P{aR * sa * cos(phi), aR * sa * sin(phi), zv + R + s * aR * ca};
+    const DLV out = normalize(P - DLV{0, 0, zv + R}) * s;
+    nScene = (out.z >= 0.0) ? out : out * -1.0;
+    return P;
+}
+// A ray from the scene (d.z < 0) through every interface onto the sensor plane (host twin
+// LensSystem::traceToFilm); `entry` receives where it crossed surface 0.
+__device__ static bool dLensTraceToFilm(const DLensSystem& L, DLV o, DLV d, Real lambda,
+                                        DLV& onFilm, DLV& dFilm, DLV* entry) {
+    d = normalize(d);
+    for (int j = 0; j < L.nSurf; ++j) {
+        DLV hp, n;
+        if (!dLensHitSurface(L, j, o, d, hp, n)) return false;
+        if (j == 0 && entry) *entry = hp;
+        o = hp;
+        if (L.surf[j].radius != 0.0) {
+            const double eta = (double)dLensIorScene(L, j, lambda) / (double)dLensIorSensor(L, j, lambda);
+            DLV nd;
+            if (!dLensRefract(d, n, eta, nd)) return false;
+            d = nd;
+        }
+    }
+    if (!(d.z < -1e-12)) return false;
+    const double t = (L.filmZ - o.z) / d.z;
+    if (!(t > 0.0)) return false;
+    onFilm = o + d * t;
+    dFilm = d;
+    return true;
+}
+// The film raster under the lens (host twin Camera::lensFilmToPixel).
+__device__ static bool dLensFilmToPixel(const DCamera& cam, const DLV& f, int& px, int& py) {
+    const double halfW = 0.5 * cam.lens.filmW_mm;
+    const double halfH = halfW * ((double)cam.resY / (double)cam.resX);
+    const double sx = -f.x / halfW, sy = -f.y / halfH;
+    if (!(sx >= -1.0 && sx < 1.0 && sy >= -1.0 && sy < 1.0)) return false;
+    px = (int)((sx * 0.5 + 0.5) * cam.resX);
+    py = (int)((sy * 0.5 + 0.5) * cam.resY);
+    px = px >= cam.resX ? cam.resX - 1 : px;
+    py = py >= cam.resY ? cam.resY - 1 : py;
+    return true;
+}
+__device__ static inline double dLensCellNorm(const DCamera& cam) {
+    const double a = cam.lens.filmW_mm / (double)cam.resX * 1e-3;
+    return 1.0 / (a * a);
+}
+// One next-event connection from scene point p through the lens (host twin
+// Camera::lensConnect, which derives the weight): a uniform front-element point Y, the ray
+// p -> Y traced to the sensor. wgt = cosY * A_front / (dist^2 * A_cell).
+__device__ static bool dLensConnect(const DCamera& cam, const DVec3& p, Real lambda,
+                                    double u1, double u2, DVec3& Yw, DVec3& wdir,
+                                    double& dist, int& px, int& py, double& wgt) {
+    const DLensSystem& L = cam.lens;
+    DLV nY;
+    const DLV yl = dLensSampleFront(L, u1, u2, nY);
+    const DLV pw = toDLV(p);
+    const DLV pl = dLensLocalPoint(cam, pw);
+    DLV dl = yl - pl;
+    const double dmm = length(dl);
+    if (!(dmm > 1e-9)) return false;
+    dl = dl / dmm;
+    if (!(dl.z < 0.0)) return false;
+    DLV onFilm, dFilm, entry;
+    if (!dLensTraceToFilm(L, pl, dl, lambda, onFilm, dFilm, &entry)) return false;
+    const DLV gap = entry - yl;
+    const double tol = 1e-6 + 1e-12 * dmm;
+    if (dot(gap, gap) > tol * tol) return false;            // Y is on the element's hidden side
+    if (!dLensFilmToPixel(cam, onFilm, px, py)) return false;
+    const DLV Y = dLensWorldPoint(cam, yl);
+    const DLV toY = Y - pw;
+    dist = length(toY);
+    if (!(dist > 1e-12)) return false;
+    const DLV wd = toY / dist;
+    Yw = DVec3{Y.x, Y.y, Y.z};
+    wdir = DVec3{wd.x, wd.y, wd.z};
+    const double cosY = fabs(dot(dl, nY));
+    const double cell = L.filmW_mm / (double)cam.resX;
+    wgt = cosY * (dLensFrontArea(L) / (cell * cell)) / (dist * dist);
+    return isfinite(wgt) && wgt > 0.0;
+}
+// Mode C through the lens (host twin Camera::lensCatch).
+__device__ static bool dLensCatch(const DCamera& cam, const DVec3& ro, const DVec3& rd,
+                                  Real hitDist, Real lambda, int& px, int& py) {
+    const DLensSystem& L = cam.lens;
+    const DLV ol = dLensLocalPoint(cam, toDLV(ro));
+    const DLV dl = dLensLocalDir(cam, toDLV(rd));
+    if (!(dl.z < 0.0)) return false;
+    DLV entry, n;
+    if (!dLensHitSurface(L, 0, ol, normalize(dl), entry, n)) return false;
+    if (!(length(entry - ol) * 1e-3 < (double)hitDist)) return false;
+    DLV onFilm, dFilm;
+    if (!dLensTraceToFilm(L, ol, dl, lambda, onFilm, dFilm, nullptr)) return false;
+    return dLensFilmToPixel(cam, onFilm, px, py);
+}
+// BDPT's camera direction density at front-element point y for direction dir, times
+// A_front (host twin Camera::lensPdfDir, which derives it).
+__device__ static double dLensPdfDir(const DCamera& cam, const DVec3& y, const DVec3& dir, Real lambda) {
+    const DLensSystem& L = cam.lens;
+    const DLV yl = dLensLocalPoint(cam, toDLV(y)), wl = dLensLocalDir(cam, toDLV(dir));
+    if (!(wl.z > 0.0)) return 0.0;
+    const DLV o = yl + wl * 1.0;
+    DLV onFilm, dFilm, entry;
+    if (!dLensTraceToFilm(L, o, wl * -1.0, lambda, onFilm, dFilm, &entry)) return 0.0;
+    int px, py;
+    if (!dLensFilmToPixel(cam, onFilm, px, py)) return 0.0;
+    const double cosT = -dFilm.z;
+    if (!(cosT > 1e-9)) return 0.0;
+    const double rearZ = L.surf[L.nSurf - 1].zpos, ra = L.surf[L.nSurf - 1].aperture;
+    const double Z = rearZ - L.filmZ;
+    if (!(Z > 1e-9)) return 0.0;
+    const DLV pr = onFilm + dFilm * (-(Z / cosT));
+    if (pr.x * pr.x + pr.y * pr.y > ra * ra * (1.0 + 1e-9)) return 0.0;
+    const DLV n0 = (L.surf[0].radius == 0.0) ? DLV{0, 0, 1}
+                                             : normalize(entry - DLV{0, 0, L.surf[0].zpos + L.surf[0].radius});
+    const double cosF = fabs(dot(wl, n0));
+    const double halfW = 0.5 * L.filmW_mm;
+    const double aFilm = (2.0 * halfW) * (2.0 * halfW * (double)cam.resY / (double)cam.resX);
+    const double aRear = DPI * ra * ra;
+    const double c2 = cosT * cosT;
+    const double pdf = Z * Z * cosF * dLensFrontArea(L) / (aFilm * aRear * c2 * c2);
+    return isfinite(pdf) ? pdf : 0.0;
+}
+// Does camera c take the lens splat? Mode A always; a physical-lens camera in mode B too
+// (host twin Renderer::lensCam).
+__device__ static inline bool dLensCam(int camMode, const DCamera& c) {
+    return camMode == CAM_A || (camMode == CAM_B && c.hasLens);
+}
 __device__ static inline double dSunRadiance(const DScene& sc, const DVec3& d, Real lambda) {
     if (sc.sunCount == 0) return 0.0;
     double L = 0.0;
@@ -4609,10 +4900,84 @@ __device__ static void connectVolume(const DScene& sc, const DMedium& med, const
 // (the BRDF's 1/pi cancels the pupil pdf's pi R^2).
 // `plane` (optional): an aimed quad's face (DEmitter::nGeom); a pupil point behind it gets
 // nothing. Tested at the sampled point, not the eye: a pupil can straddle the plane.
+// ---- next-event splats through a PHYSICAL multi-element lens (modes A and B) -----------
+// Host twins: Renderer::connectLensPhysical / connectLensHeroPhysical /
+// connectVolumeLensPhysical. A front-element point is sampled and the ray traced through the
+// glass onto the sensor (dLensConnect); the deposit is beta * f * cosSurf * wgt, where wgt
+// carries cosY * A_front / (dist^2 * A_cell). The weight is formed in double.
+__device__ static void connectLensPhysical(const DScene& sc, const DCamera& cam, double* film,
+                                           double* hits, const DVec3& p, const DVec3& n,
+                                           const DVec3& ng, const DVec3& wi, Real lambda,
+                                           Real beta, Real rho, DRng& rng, const DVec3* plane) {
+    const double u1 = rng.uniform(), u2 = rng.uniform();
+    DVec3 Y, wdir; double dist, wgt; int px, py;
+    if (!dLensConnect(cam, p, lambda, u1, u2, Y, wdir, dist, px, py, wgt)) return;
+    if (plane && ddot(*plane, Y - p) <= 0.0) return;
+    const Real cosSurf = dot(n, wdir);
+    if (cosSurf <= 0) return;
+    const Real stG = dShadowTerminatorG(wdir, n, ng);
+    if (stG <= (Real)0) return;
+    if (occludedTo(sc, dOffsetAlong(p, ng, wdir), Y, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;
+    const Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
+    Real contrib = (Real)((double)beta * ((double)rho / DPI) * (double)cosSurf * (double)corr *
+                          wgt * (double)stG);
+    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, (Real)dist, lambda, rng);
+    filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
+}
+// Volume vertex: `phaseW` replaces f * cosSurf -- the in-scatter albedo * phase of `med`
+// along wIn (when given), or the isotropic 1/(4 pi) of a fire.
+__device__ static void connectVolumeLensPhysical(const DScene& sc, const DCamera& cam, double* film,
+                                                 double* hits, const DVec3& p, Real lambda,
+                                                 Real beta, Real phaseW, const DVec3* wIn,
+                                                 const DMedium* med, DRng& rng) {
+    const double u1 = rng.uniform(), u2 = rng.uniform();
+    DVec3 Y, wdir; double dist, wgt; int px, py;
+    if (!dLensConnect(cam, p, lambda, u1, u2, Y, wdir, dist, px, py, wgt)) return;
+    if (occludedTo(sc, p + wdir * RAY_EPS, Y, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;
+    Real f = phaseW;
+    if (med && wIn) f = medAlbedo(*med, lambda) * dMedPhase(*med, dot(*wIn, wdir), lambda);
+    Real contrib = (Real)((double)beta * (double)f * wgt);
+    contrib *= dMediaTransmittance(sc, p, wdir, (Real)dist, lambda, rng);
+    filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
+}
+// Hero bundle: one front-element sample and one scene leg shared by the wavelengths, each
+// traced through the dispersive glass on its own to its own cell.
+__device__ static void connectLensHeroPhysical(const DScene& sc, const DCamera& cam, double* film,
+                                               double* hits, const DVec3& p, const DVec3& n,
+                                               const DVec3& ng, const DVec3& wi, const Real* lam,
+                                               const Real* beta, const Real* rho, int nUp,
+                                               DRng& rng, const DVec3* plane) {
+    const double u1 = rng.uniform(), u2 = rng.uniform();
+    DVec3 Y, wdir; double dist = 0.0;
+    int px[hero::kHeroMax], py[hero::kHeroMax];
+    double wg[hero::kHeroMax];
+    bool ok[hero::kHeroMax], any = false;
+    for (int i = 0; i < nUp; ++i) {
+        DVec3 Yi, wi_; double di;
+        ok[i] = dLensConnect(cam, p, lam[i], u1, u2, Yi, wi_, di, px[i], py[i], wg[i]);
+        if (ok[i] && !any) { Y = Yi; wdir = wi_; dist = di; any = true; }
+    }
+    if (!any) return;
+    if (plane && ddot(*plane, Y - p) <= 0.0) return;
+    const Real cosSurf = dot(n, wdir);
+    if (cosSurf <= 0) return;
+    const Real stG = dShadowTerminatorG(wdir, n, ng);
+    if (stG <= (Real)0) return;
+    if (occludedTo(sc, dOffsetAlong(p, ng, wdir), Y, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;
+    const Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
+    for (int i = 0; i < nUp; ++i) {
+        if (!ok[i]) continue;
+        Real contrib = (Real)((double)beta[i] * ((double)rho[i] / DPI) * (double)cosSurf *
+                              (double)corr * wg[i] * (double)stG);
+        if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, (Real)dist, lam[i], rng);
+        filmAdd(film, hits, cam.resX, px[i], py[i], lam[i], contrib);
+    }
+}
 __device__ static void connectLens(const DScene& sc, const DCamera& cam, double* film, double* hits,
                                    const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
                                    Real lambda, Real beta, Real rho, DRng& rng,
                                    const DVec3* plane = nullptr) {
+    if (cam.hasLens) { connectLensPhysical(sc, cam, film, hits, p, n, ng, wi, lambda, beta, rho, rng, plane); return; }
     Real R  = (Real)cam.apertureR;
     Real rr = R * sqrt(rng.uniform());
     Real a  = (Real)(2.0 * DPI) * rng.uniform();
@@ -4652,6 +5017,7 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
                                          double* film, double* hits,
                                          const DVec3& p, const DVec3& wIn, Real lambda,
                                          Real beta, DRng& rng) {
+    if (cam.hasLens) { connectVolumeLensPhysical(sc, cam, film, hits, p, lambda, beta, 0, &wIn, &med, rng); return; }
     Real R  = (Real)cam.apertureR;
     Real rr = R * sqrt(rng.uniform());
     Real a  = (Real)(2.0 * DPI) * rng.uniform();
@@ -5487,9 +5853,27 @@ __device__ static void connectHair(const DScene& sc, const DCamera& cam, double*
 // Fiber (D_HAIR) twin of connectLens(): model-A finite-lens next-event splat from a hair
 // vertex. fcos = PI * dHairFCos — the BCSDF's 1/pi convention meets the pupil pdf's
 // pi R^2 (see CPU connectLens); corr and stG are 1, and there is no horizon reject.
+// Fiber vertex: the BCSDF carries its own projection (dHairFCos), and the connection leaves
+// the far side of the strand along the chord (dHairExitOffset), as connectLensHair's does.
+__device__ static void connectLensHairPhysical(const DScene& sc, const DCamera& cam, double* film,
+                                               double* hits, const DVec3& p, const DVec3& n,
+                                               const DHairShade& hs, Real lambda, Real beta,
+                                               DRng& rng) {
+    const double u1 = rng.uniform(), u2 = rng.uniform();
+    DVec3 Y, wdir; double dist, wgt; int px, py;
+    if (!dLensConnect(cam, p, lambda, u1, u2, Y, wdir, dist, px, py, wgt)) return;
+    const Real off = dHairExitOffset(hs, n, wdir);
+    if ((double)off >= dist) return;
+    if (occluded(sc, p + wdir * off, wdir, connMaxT(dist - (double)off, RAY_EPS, dMaxAbs(p)), RAY_EPS,
+                 /*camLeg=*/true)) return;
+    Real contrib = (Real)((double)beta * (double)dHairFCos(hs, wdir) * wgt);
+    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, (Real)dist, lambda, rng);
+    filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
+}
 __device__ static void connectLensHair(const DScene& sc, const DCamera& cam, double* film, double* hits,
                                        const DVec3& p, const DVec3& n, const DHairShade& hs,
                                        Real lambda, Real beta, DRng& rng) {
+    if (cam.hasLens) { connectLensHairPhysical(sc, cam, film, hits, p, n, hs, lambda, beta, rng); return; }
     Real R  = (Real)cam.apertureR;
     Real rr = R * sqrt(rng.uniform());
     Real a  = (Real)(2.0 * DPI) * rng.uniform();
@@ -7202,10 +7586,10 @@ __device__ static void splatSurfaceAll(const DScene& sc, const DCamSet& cs, int 
                                         Real beta, Real rho, DRng& rng,
                                         const DVec3* plane = nullptr) {
     for (int c = 0; c < cs.nCam; ++c) {
-        if (camMode == CAM_B) {
+        if (camMode == CAM_B && !cs.cams[c].hasLens) {
             if (plane && ddot(*plane, cs.cams[c].eye - p) <= (Real)0) continue;
             connect(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng);
-        } else if (camMode == CAM_A) {
+        } else if (dLensCam(camMode, cs.cams[c])) {
             connectLens(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng,
                         plane);
         }
@@ -7218,8 +7602,8 @@ __device__ static void splatSurfaceAllHair(const DScene& sc, const DCamSet& cs, 
                                            const DVec3& p, const DVec3& n, const DHairShade& hs,
                                            Real lambda, Real beta, DRng& rng) {
     for (int c = 0; c < cs.nCam; ++c) {
-        if (camMode == CAM_B) connectHair(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, hs, lambda, beta, rng);
-        else if (camMode == CAM_A) connectLensHair(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, hs, lambda, beta, rng);
+        if (camMode == CAM_B && !cs.cams[c].hasLens) connectHair(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, hs, lambda, beta, rng);
+        else if (dLensCam(camMode, cs.cams[c])) connectLensHair(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, hs, lambda, beta, rng);
     }
 }
 // Append a photon record at a diffuse / translucent vertex (device twin of
@@ -7364,8 +7748,8 @@ __device__ static void splatVolumeAll(const DScene& sc, const DMedium& med, cons
                                        int camMode, const DVec3& p, const DVec3& wIn, Real lambda,
                                        Real beta, DRng& rng) {
     for (int c = 0; c < cs.nCam; ++c) {
-        if (camMode == CAM_B) connectVolume(sc, med, cs.cams[c], cs.films[c], cs.hits[c], p, wIn, lambda, beta, rng);
-        else if (camMode == CAM_A) connectLensVolume(sc, med, cs.cams[c], cs.films[c], cs.hits[c], p, wIn, lambda, beta, rng);
+        if (camMode == CAM_B && !cs.cams[c].hasLens) connectVolume(sc, med, cs.cams[c], cs.films[c], cs.hits[c], p, wIn, lambda, beta, rng);
+        else if (dLensCam(camMode, cs.cams[c])) connectLensVolume(sc, med, cs.cams[c], cs.films[c], cs.hits[c], p, wIn, lambda, beta, rng);
     }
 }
 
@@ -7392,6 +7776,11 @@ __device__ static void connectEmissionVolume(const DScene& sc, const DCamera& ca
 __device__ static void connectEmissionLensVolume(const DScene& sc, const DCamera& cam,
                                                  double* film, double* hits,
                                                  const DVec3& p, Real lambda, Real beta, DRng& rng) {
+    if (cam.hasLens) {
+        connectVolumeLensPhysical(sc, cam, film, hits, p, lambda, beta, (Real)(1.0 / (4.0 * DPI)),
+                                  nullptr, nullptr, rng);
+        return;
+    }
     Real R  = (Real)cam.apertureR;
     Real rr = R * sqrt(rng.uniform());
     Real a  = (Real)(2.0 * DPI) * rng.uniform();
@@ -7413,8 +7802,8 @@ __device__ static void connectEmissionLensVolume(const DScene& sc, const DCamera
 __device__ static void camSplatEmissionAll(const DScene& sc, const DCamSet& cs, int camMode,
                                             const DVec3& p, Real lambda, Real beta, DRng& rng) {
     for (int c = 0; c < cs.nCam; ++c) {
-        if (camMode == CAM_B) connectEmissionVolume(sc, cs.cams[c], cs.films[c], cs.hits[c], p, lambda, beta, rng);
-        else if (camMode == CAM_A) connectEmissionLensVolume(sc, cs.cams[c], cs.films[c], cs.hits[c], p, lambda, beta, rng);
+        if (camMode == CAM_B && !cs.cams[c].hasLens) connectEmissionVolume(sc, cs.cams[c], cs.films[c], cs.hits[c], p, lambda, beta, rng);
+        else if (dLensCam(camMode, cs.cams[c])) connectEmissionLensVolume(sc, cs.cams[c], cs.films[c], cs.hits[c], p, lambda, beta, rng);
     }
 }
 
@@ -8153,7 +8542,8 @@ __device__ static void camSpecularSplatAllVtxN(const DScene& sc, const DCamSet& 
                 const DMaterial& gm = sc.mats[S.matId];
                 double ng = (double)specLookup(gm.ior, lam[i]);
                 for (int c = 0; c < cs.nCam; ++c)
-                    dConnectSpecularSphere(sc, cs.cams[c], cs.films[c], cs.hits[c], S, gm, ng,
+                    if (!cs.cams[c].hasLens)   // a physical lens has no pinhole to aim at
+                        dConnectSpecularSphere(sc, cs.cams[c], cs.films[c], cs.hits[c], S, gm, ng,
                                            pd, vi, lam[i], (double)beta[i], rng);
             }
         }
@@ -8162,12 +8552,14 @@ __device__ static void camSpecularSplatAllVtxN(const DScene& sc, const DCamSet& 
     for (int k = 0; k < sc.nMirrorSph; ++k) {
         const DSphere& S = sc.sph[sc.mirrorSph[k]];
         for (int c = 0; c < cs.nCam; ++c)
-            dConnectSpecularSphereMirror(sc, cs.cams[c], cs.films[c], cs.hits[c], S,
+            if (!cs.cams[c].hasLens)   // a physical lens has no pinhole to aim at
+                dConnectSpecularSphereMirror(sc, cs.cams[c], cs.films[c], cs.hits[c], S,
                                          pd, vt, lam, beta, w, nUp, rng);
     }
     for (int mi = 0; mi < sc.nMirrorPlanes; ++mi)
         for (int c = 0; c < cs.nCam; ++c)
-            dConnectSpecularPlane(sc, cs.cams[c], cs.films[c], cs.hits[c],
+            if (!cs.cams[c].hasLens)   // a physical lens has no pinhole to aim at
+                dConnectSpecularPlane(sc, cs.cams[c], cs.films[c], cs.hits[c],
                                   sc.mirrorPlanes[mi], pd, vt, lam, beta, w, nUp, rng);
 }
 __device__ static void camSpecularSplatAllVtx(const DScene& sc, const DCamSet& cs, int camMode,
@@ -9970,12 +10362,16 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     // nearer than the surface/fog event, it lands on the film. Analog physics.
     if (camMode == CAM_C) {
         int px, py;
-        // Model C never shares a trace (it consumes the photon), so nCam==1 here.
-        if (cs.cams[0].catchPhoton(ro, rd, dEvent, px, py)) {
+        // Model C never shares a trace (it consumes the photon), so nCam==1 here. A physical
+        // lens catches what enters its front element and reaches the sensor (dLensCatch).
+        const DCamera& cc = cs.cams[0];
+        if (cc.hasLens ? dLensCatch(cc, ro, rd, dEvent, lambda, px, py)
+                       : cc.catchPhoton(ro, rd, dEvent, px, py)) {
             // Flux->film-irradiance normaliser (see host render.h): keep brute-force C
             // on the SAME absolute scale as A/B (per-camera constant; auto-exposed
             // scenes unaffected).
-            Real cCell = (Real)1 / (Real)(cs.cams[0].pixelPlaneArea() * cs.cams[0].filmDist * cs.cams[0].filmDist);
+            Real cCell = cc.hasLens ? (Real)dLensCellNorm(cc)
+                                    : (Real)1 / (Real)(cs.cams[0].pixelPlaneArea() * cs.cams[0].filmDist * cs.cams[0].filmDist);
             // an env photon's first flight is the env SEEN: bilinear (PV_BIT_ENVFIRST)
             Real seen = (Real)1;
             if (pathC && (pathC->bits & PV_BIT_ENVFIRST)) {
@@ -10047,7 +10443,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
             DVec3 xc = ro + rd * tC;
             Real betaC = (aC > 0) ? betaPre * exp(-aC * tC) : betaPre;
             const DMedium& smc = sc.media[whichC];
-            if (camMode == CAM_A) connectLensVolume(sc, smc, cs.cams[c], cs.films[c], cs.hits[c], xc, rd, lambda, betaC, *crng);
+            if (dLensCam(camMode, cs.cams[c])) connectLensVolume(sc, smc, cs.cams[c], cs.films[c], cs.hits[c], xc, rd, lambda, betaC, *crng);
             else                  connectVolume(sc, smc, cs.cams[c], cs.films[c], cs.hits[c], xc, rd, lambda, betaC, *crng);
             // Per-camera specular volume splat (fog seen through a smooth sphere caustic):
             // a 1-camera slice of the set so the "All" helper targets only camera c.
@@ -10253,6 +10649,10 @@ __device__ static void connectLensHero(const DScene& sc, const DCamera& cam, dou
         const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
         const Real* lam, const Real* beta, const Real* rho, int nUp, DRng& rng,
         const DVec3* plane = nullptr) {                                   // see connectLens
+    if (cam.hasLens) {
+        connectLensHeroPhysical(sc, cam, film, hits, p, n, ng, wi, lam, beta, rho, nUp, rng, plane);
+        return;
+    }
     Real R  = (Real)cam.apertureR;
     Real rr = R * sqrt(rng.uniform());
     Real a  = (Real)(2.0 * DPI) * rng.uniform();
@@ -10287,10 +10687,10 @@ __device__ static void splatSurfaceAllHero(const DScene& sc, const DCamSet& cs, 
         const Real* lam, const Real* beta, const Real* rho, int nUp, DRng& rng,
         const DVec3* plane = nullptr) {                                   // see splatSurfaceAll
     for (int c = 0; c < cs.nCam; ++c) {
-        if (camMode == CAM_B) {
+        if (camMode == CAM_B && !cs.cams[c].hasLens) {
             if (plane && ddot(*plane, cs.cams[c].eye - p) <= (Real)0) continue;
             connectHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp, rng);
-        } else if (camMode == CAM_A) {
+        } else if (dLensCam(camMode, cs.cams[c])) {
             connectLensHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp,
                             rng, plane);
         }
@@ -10449,8 +10849,35 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     int nUp = C;   // drops to 1 if a coat's coin de-heroes the bundle (below)
     Real dEvent = h.valid ? h.t : BIG;
 
-    // Model C aperture catch: deposit every live wavelength that threads the pupil.
-    if (camMode == CAM_C) {
+    // Model C through a physical lens: the glass disperses, so each live wavelength is traced
+    // to its own cell and one the lens clips is absorbed by it; the photon ends if any
+    // reaches the sensor and flies on if none does (host twin in render.h).
+    if (camMode == CAM_C && cs.cams[0].hasLens) {
+        const DCamera& cc = cs.cams[0];
+        int pxs[hero::kHeroMax], pys[hero::kHeroMax];
+        bool hitL[hero::kHeroMax], any = false;
+        for (int i = 0; i < nUp; ++i) {
+            hitL[i] = dLensCatch(cc, ro, rd, dEvent, lam[i], pxs[i], pys[i]);
+            any = any || hitL[i];
+        }
+        if (any) {
+            const Real cCell = (Real)dLensCellNorm(cc);
+            const bool envSeen = pathC && (pathC->bits & PV_BIT_ENVFIRST);
+            DEnvTaps tp;
+            if (envSeen) tp = dEnvTaps(sc.env, -rd);
+            for (int i = 0; i < nUp; ++i) {
+                if (!hitL[i]) { eAbsorbed += (double)beta[i]; continue; }
+                Real seen = (Real)1;
+                if (envSeen) {
+                    const double Ln = dEnvRadiance(sc.env, -rd, lam[i]);
+                    seen = (Ln > 0.0) ? (Real)(dEnvRadianceAt(sc.env, tp, lam[i]) / Ln) : (Real)0;
+                }
+                filmAdd(cs.films[0], cs.hits[0], cc.resX, pxs[i], pys[i], lam[i], beta[i] * seen * cCell);
+                eSensor += (double)(beta[i] * seen);
+            }
+            return WF_TERMINATE;
+        }
+    } else if (camMode == CAM_C) {
         int px, py;
         if (cs.cams[0].catchPhoton(ro, rd, dEvent, px, py)) {
             Real cCell = (Real)1 / (Real)(cs.cams[0].pixelPlaneArea() * cs.cams[0].filmDist * cs.cams[0].filmDist);
@@ -11409,7 +11836,10 @@ __device__ static float dVertexPdfF(const DScene& sc, const DCamera& cam,
     if (dot(wn, wn) == 0.f) return 0.f;
     wn = normalize(wn);
     float pdfW = 0.f;
-    if (cur.type == BV_CAMERA) {
+    if (cur.type == BV_CAMERA && cam.hasLens) {
+        // A physical lens's camera vertex sits on its front element (host twin vertexPdf).
+        pdfW = (float)dLensPdfDir(cam, cur.p, wn, lambda);
+    } else if (cur.type == BV_CAMERA) {
         DVec3 d = next.p - cam.eye;                       // dCameraPdfDir in FP32
         float len = sqrtf(dot(d, d));
         float cosCam = len > 0.f ? dot(d, cam.w) / len : 0.f;
@@ -11579,106 +12009,6 @@ __device__ static double dCamInvPdfLambda(const DScene& sc, Real lambda) {
 // gratingDiffract), the diffuse reflectance (dDiffuseRho) and the emitter sampler, so
 // materials agree with the CPU path by construction. Scope: cudaBackwardSupported.
 
-// Sensor-side index of surface j (air baked as 1); scene-side = sensor side of j-1.
-__device__ static Real dLensIorSensor(const DLensSystem& L, int j, Real lambda) {
-    return specLookup(L.iorAll + (size_t)j * SPEC_N, lambda);
-}
-__device__ static Real dLensIorScene(const DLensSystem& L, int j, Real lambda) {
-    return (j == 0) ? (Real)1 : dLensIorSensor(L, j - 1, lambda);
-}
-// Refract `d` at `n` (faced against d) with eta = n_in/n_out (port of refractDir).
-__device__ static bool dLensRefract(const DVec3& d, const DVec3& n, Real eta, DVec3& out) {
-    Real cosi = -dot(d, n);
-    Real k = (Real)1 - eta * eta * ((Real)1 - cosi * cosi);
-    if (k < 0) return false;                          // TIR -> blocked
-    out = normalize(d * eta + n * (eta * cosi - sqrt(k)));
-    return true;
-}
-// Intersect a lens-local ray with surface j; hitP + normal (against d). Clipped by the
-// clear aperture => false (vignetting). Port of LensSystem::hitSurface.
-__device__ static bool dLensHitSurface(const DLensSystem& L, int j, const DVec3& o,
-                                       const DVec3& d, DVec3& hitP, DVec3& nrm) {
-    double zv = L.surf[j].zpos, R = L.surf[j].radius, ap = L.surf[j].aperture;
-    if (R == 0.0) {                                   // planar (stop / flat)
-        if (fabs((double)d.z) < 1e-12) return false;
-        double t = (zv - (double)o.z) / (double)d.z;
-        if (t < 1e-9) return false;
-        hitP = o + d * (Real)t;
-        nrm = DVec3{0, 0, d.z > 0 ? -1.0 : 1.0};
-    } else {
-        DVec3 C{0, 0, zv + R};
-        DVec3 op = o - C;
-        Real b = dot(op, d);
-        Real c = dot(op, op) - (Real)(R * R);
-        Real disc = b * b - c;
-        if (disc < 0) return false;
-        Real sq = sqrt(disc);
-        Real t0 = -b - sq, t1 = -b + sq;
-        bool closer = (d.z > 0) ^ (R < 0);
-        Real t = closer ? fmin(t0, t1) : fmax(t0, t1);
-        if (t < (Real)1e-9) t = closer ? fmax(t0, t1) : fmin(t0, t1);
-        if (t < (Real)1e-9) return false;
-        hitP = o + d * t;
-        nrm = normalize(hitP - C);
-        if (dot(nrm, d) > 0) nrm = -nrm;
-    }
-    if ((double)hitP.x * (double)hitP.x + (double)hitP.y * (double)hitP.y > ap * ap)
-        return false;                                 // clipped by the clear aperture
-    return true;
-}
-// Trace a lens-local ray from the film out through every interface (sensor->scene;
-// the only order the camera-ray generator needs). Port of LensSystem::trace.
-__device__ static bool dLensTrace(const DLensSystem& L, const DVec3& o0, const DVec3& d0,
-                                  Real lambda, DVec3& outO, DVec3& outD) {
-    DVec3 o = o0, d = normalize(d0);
-    for (int j = L.nSurf - 1; j >= 0; --j) {
-        DVec3 hp, n;
-        if (!dLensHitSurface(L, j, o, d, hp, n)) return false;
-        o = hp;
-        if (L.surf[j].radius != 0.0) {
-            Real eta = dLensIorSensor(L, j, lambda) / dLensIorScene(L, j, lambda);
-            DVec3 nd;
-            if (!dLensRefract(d, n, eta, nd)) return false;
-            d = nd;
-        }
-    }
-    outO = o; outD = d;
-    return true;
-}
-// Generate a world-space camera ray through the physical lens (port of
-// Camera::genLensRay). Returns false on vignetting (element/stop clip or TIR); on
-// success `weight` is the radiometric importance cos^4*A_rear/Z^2.
-__device__ static bool dGenLensRay(const DCamera& cam, int px, int py, Real jx, Real jy,
-                                   Real u1, Real u2, Real lambda,
-                                   DVec3& oW, DVec3& dW, Real& weight) {
-    weight = 0;
-    const DLensSystem& L = cam.lens;
-    double sx = 2.0 * ((px + jx) / (double)cam.resX) - 1.0;
-    double sy = 2.0 * ((py + jy) / (double)cam.resY) - 1.0;
-    double halfW = 0.5 * L.filmW_mm;
-    double halfH = halfW * ((double)cam.resY / (double)cam.resX);
-    DVec3 pFilm{-sx * halfW, -sy * halfH, L.filmZ};
-    double rearAp = L.surf[L.nSurf - 1].aperture;
-    double rearZ  = L.surf[L.nSurf - 1].zpos;
-    double rr  = sqrt(u1 > 0 ? (double)u1 : 0.0) * rearAp;
-    double phi = 2.0 * DPI * (double)u2;
-    DVec3 pRear{rr * cos(phi), rr * sin(phi), rearZ};
-    DVec3 d0 = normalize(pRear - pFilm);
-    DVec3 oL, dL;
-    if (!dLensTrace(L, pFilm, d0, lambda, oL, dL)) return false;
-    Real cosT = d0.z;                                 // d0 unit; z = cos to axis
-    if (cosT <= 0) return false;
-    Real cos4 = (cosT * cosT) * (cosT * cosT);
-    double A = DPI * rearAp * rearAp;
-    double Z = rearZ - L.filmZ;
-    if (Z <= 1e-9) return false;
-    weight = (Real)((double)cos4 * A / (Z * Z));
-    // Lens-local (mm) -> world: front vertex plane pinned at eye, mm -> scene metres.
-    oW = cam.eye + (cam.u * oL.x + cam.v * oL.y) * (Real)1e-3
-                 + cam.w * (Real)(((double)oL.z - L.T) * 1e-3);
-    dW = normalize(cam.u * dL.x + cam.v * dL.y + cam.w * dL.z);
-    return true;
-}
 // Pinhole/fisheye camera ray for pixel (px,py) (port of Camera::genRay). Used by the
 // backward tracer when the camera has no physical lens.
 __device__ static void dGenRay(const DCamera& cam, int px, int py, Real jx, Real jy,
@@ -15590,14 +15920,11 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
 }
 
 // Trace an eye subpath through pixel (px,py). path[0] is the camera vertex (beta=1).
-// Realistic-lens cameras (cam.hasLens, Plan B): the first ray is traced through the real
-// glass (dGenLensRay, as GPU mode R does), the camera vertex sits at the ray's scene-entry
-// point with beta = the lens weight wLens, and is flagged delta. The multi-element lens map
-// has no closed-form inverse, so the light-image splat (t=1) is disabled in dConnectBDPT and
-// the delta flag makes dMisWeight omit that strategy too — the surviving strategies (s>=0,
-// t>=2) still partition unity, so the estimator stays unbiased. The camera vertex being
-// delta means its direction pdf only enters the excluded t=1 term, so the placeholder
-// dCameraPdfDir seed is never used in a retained MIS ratio. Mirrors bdpt.h.
+// Realistic-lens cameras (cam.hasLens): the first ray is traced through the real glass
+// (dGenLensRay, as GPU mode R does), and the camera vertex sits at the ray's exit point on
+// the front element with beta = the lens weight wLens. It is connectible: the light image
+// (t=1) reaches it by tracing light into the lens (dLensConnect), and eye[1]'s forward
+// density is the lens's own, dLensPdfDir. Mirrors bdpt.h.
 __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, int diffraction,
                                         int px, int py, const DHeroBundle& hb, int maxDepth,
                                         DRng& rng, DVertex* path, double* pathSec, int secStride,
@@ -15636,20 +15963,20 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
             else wB[j - 1] = (okj && wlj > 0) ? (double)wlj : 0.0;
         }
         if (!okL || wl <= 0) {
-            // Vignetted: lone delta camera vertex (nE=1) contributes 0 (t=1 off, t>=2 needs a
-            // scene vertex we never added).
+            // Vignetted: a lone camera vertex (nE=1). t>=2 needs a scene vertex this sample
+            // never made; t=1 places its own camera vertex, so only the light image survives.
             c.p = cam.eye; c.delta = 1;
             path[0] = c; return 1;
         }
-        c.p = ro;                // scene-entry point (front element plane): correct wo / dist
+        c.p = ro;                // exit point on the front element: correct wo / dist
         c.beta = (double)wl;     // radiometric lens weight -> per-pixel measurement
-        c.delta = 1;             // no closed-form lens inverse: not connectible (t=1 off)
+        c.delta = 0;             // connectible: t=1 traces light into the lens
         path[0] = c; int n = 1;
         if (jrun) {
             jrun->mulVec(wB, (double)wl);
             if (c_jDispAll) jrun->markDisp((double)lambda, (double)hb.invPdf[0]);
         }
-        double pdfDir = dCameraPdfDir(cam, ddot(rd, cam.w));   // MIS-irrelevant placeholder
+        double pdfDir = dLensPdfDir(cam, ro, rd, lambda);
         dRandomWalk(sc, cam, diffraction, ro, rd, (double)wl, pdfDir, hb, maxDepth - 1, rng,
                     path, pathSec, secStride, maxV, n, false, betaSec0, 1, esc,
                     segs, nSegs, maxSegs, jrun, vspec);
@@ -15989,18 +16316,25 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         L = pt.beta * Le;
         for (int i = 0; i + 1 < nUp; ++i) Lsec[i] = eyeSec[(t - 1) * secStride + i] * LeSec[i];
     } else if (t == 1) {
-        // Realistic lens (Plan B): the light-image splat needs a world->sensor projection
-        // the multi-element lens map can't provide (no closed-form inverse), so it's
-        // disabled. dMisWeight omits this strategy too (camera vertex is delta), so the
-        // retained strategies still partition unity.
-        if (cam.hasLens) return 0.0;
+        // Light image. A pinhole projects the vertex onto the sensor; a physical lens is
+        // reached by tracing light INTO it, through a sampled front-element point that
+        // becomes this strategy's camera vertex (host twin connectBDPT).
         const DVertex& qs = light[s - 1];
         if (!dVertConnectible(sc, qs)) return 0.0;
-        int px, py; Real cc, d2f;
-        if (!cam.project(qs.p, px, py, cc, d2f)) return 0.0;
-        double dist2 = ddot(cam.eye - qs.p, cam.eye - qs.p);
-        double dist = sqrt(dist2);
-        DVec3 wcam = (cam.eye - qs.p) * (Real)(1.0 / dist);
+        int px, py;
+        double dist2, dist, lensW = 0.0;
+        DVec3 wcam, camP = cam.eye;
+        if (cam.hasLens) {
+            const double u1 = rng.uniform(), u2 = rng.uniform();
+            if (!dLensConnect(cam, qs.p, lambda, u1, u2, camP, wcam, dist, px, py, lensW)) return 0.0;
+            dist2 = dist * dist;
+        } else {
+            Real cc, d2f;
+            if (!cam.project(qs.p, px, py, cc, d2f)) return 0.0;
+            dist2 = ddot(cam.eye - qs.p, cam.eye - qs.p);
+            dist = sqrt(dist2);
+            wcam = (cam.eye - qs.p) * (Real)(1.0 / dist);
+        }
         DVec3 dwo = light[s - 2].p - qs.p;           // degeneracy guard: normalize(0) is NaN
         if (ddot(dwo, dwo) == 0.0) return 0.0;
         DVec3 wo = normalize(dwo);
@@ -16042,20 +16376,29 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             for (int i = 0; i + 1 < nUp; ++i) if (fSec[i] > mxF) mxF = fSec[i];
             if (!(mxF > 0.0)) return 0.0;
         }
-        if (occludedTo(sc, o, cam.eye, 2e-6, RAY_EPS, /*camLeg=*/true)) return 0.0;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
-        double cosCam = ddot(qs.p - cam.eye, cam.w) / dist;   // positive (point in front)
+        if (occludedTo(sc, o, camP, 2e-6, RAY_EPS, /*camLeg=*/true)) return 0.0;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
         // Hero-only transmittance: the hero gate excludes any medium, so Tr is exactly 1
         // whenever nUp > 1.
         double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc, qs.p, wcam, (Real)dist, lambda, rng) : 1.0;
-        double G = fabs(cosSurf) * cosCam / dist2;
-        L = qs.beta * f * G * dCameraWe(cam, cosCam) * Tr;
-        for (int i = 0; i + 1 < nUp; ++i)
-            Lsec[i] = lightSec[(s - 1) * secStride + i] * fSec[i] * G * dCameraWe(cam, cosCam) * Tr;
+        if (cam.hasLens) {
+            // A cell's irradiance per light path, over the W*H light paths per spp the light
+            // image is not divided by (host twin connectBDPT).
+            const double gw = fabs(cosSurf) * lensW / ((double)cam.resX * (double)cam.resY);
+            L = qs.beta * f * gw * Tr;
+            for (int i = 0; i + 1 < nUp; ++i)
+                Lsec[i] = lightSec[(s - 1) * secStride + i] * fSec[i] * gw * Tr;
+        } else {
+            double cosCam = ddot(qs.p - cam.eye, cam.w) / dist;   // positive (point in front)
+            double G = fabs(cosSurf) * cosCam / dist2;
+            L = qs.beta * f * G * dCameraWe(cam, cosCam) * Tr;
+            for (int i = 0; i + 1 < nUp; ++i)
+                Lsec[i] = lightSec[(s - 1) * secStride + i] * fSec[i] * G * dCameraWe(cam, cosCam) * Tr;
+        }
         {   double mxL = L;
             for (int i = 0; i + 1 < nUp; ++i) if (Lsec[i] > mxL) mxL = Lsec[i];
             if (!(mxL > 0.0)) return 0.0;
         }
-        sampled.type = BV_CAMERA; sampled.p = cam.eye; sampled.ns = cam.w; sampled.ng = cam.w;
+        sampled.type = BV_CAMERA; sampled.p = camP; sampled.ns = cam.w; sampled.ng = cam.w;
         sampled.beta = 1.0;
         outPx = px; outPy = py; isSplat = 1;
     } else if (s == 1) {
@@ -21436,8 +21779,8 @@ static gpu::DCamera bakeCamera(const Scene& /*scene*/, const Camera& cam, int re
 
     // Physical multi-element lens (mesh-lens camera). Bake each surface's sensor-side
     // index into an SPEC_N table (air => 1) so the std::function Spectrum stays host-
-    // side. Used by the backward tracer (GPU mode R) and the BDPT camera subpath (mode D,
-    // Plan B); the pinhole forward kernels ignore it.
+    // side. Used by the backward tracer (GPU mode R), by BDPT (camera subpath and light
+    // image), and by the forward kernels' lens splat and catch (modes A, B and C).
     dc.hasLens = 0;
     dc.lens.iorAll = nullptr;
     if (cam.hasLens()) {
@@ -23308,6 +23651,11 @@ size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
 }
 
 // --------------------- backward reference (mode R) host ----------------------
+
+// Does this camera's physical lens fit the device (at most D_MAXLENS surfaces)?
+bool cudaLensFits(const Camera& cam) {
+    return !cam.hasLens() || (int)cam.lens->surf.size() <= D_MAXLENS;
+}
 
 bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     // GPU mode R renders what the forward path can bake (cudaForwardSupported) with the

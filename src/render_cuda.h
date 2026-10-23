@@ -403,6 +403,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
 // area/sphere/cylinder Lambertian + point-spot emitters; a lens no deeper than the device
 // cap (D_MAXLENS). Image-based env, collimated beams and GRIN media fall back to the CPU tracer.
 bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
+// A physical lens fits the device when it has at most D_MAXLENS (16) surfaces.
+bool cudaLensFits(const Camera& cam);
 
 // ---- Mode W (deterministic Whitted / POV-Ray-style preview) ----------------------------
 // Device twin of BackwardRenderer's mode-W fields (src/backward.h). Passing a non-null

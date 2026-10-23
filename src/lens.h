@@ -191,6 +191,65 @@ struct LensSystem {
         filmZ = zCross;                                   // move the sensor to it
     }
 
+    // ---- the front element, for tracing light INTO the lens (light tracing) ----------
+    // Light tracing reverses the camera above: it picks where a scene point's light enters
+    // the lens, which is a point on the clear surface of the FRONT element (surface 0), and
+    // traces it through to the sensor (Hanika & Dachsbacher 2014, "Efficient Monte Carlo
+    // rendering with realistic lenses", sec. 3.2). Sampling that surface uniformly by area
+    // covers every ray that can enter the lens, whatever direction it comes from, which a
+    // disc in some plane in front of a curved element does not.
+    //
+    // Area of surface 0's clear part (mm^2): a spherical cap, or a disc when planar.
+    double frontArea() const {
+        if (surf.empty()) return 0.0;
+        const double R = std::fabs(surf[0].radius), ap = surf[0].aperture;
+        if (R == 0.0) return PI * ap * ap;
+        const double sag = R - std::sqrt(std::fmax(0.0, R * R - ap * ap));
+        return 2.0 * PI * R * sag;
+    }
+    // A point uniform by area on surface 0's clear part, and the surface normal there
+    // (unit, pointing toward the scene, +z side). Archimedes: on a sphere, area is uniform
+    // in the axial coordinate, so the cap is sampled by a uniform cos(alpha).
+    Vec3 sampleFront(double u1, double u2, Vec3& nScene) const {
+        const double R = surf[0].radius, ap = surf[0].aperture, zv = zpos[0];
+        const double phi = 2.0 * PI * u2;
+        if (R == 0.0) {
+            const double r = ap * std::sqrt(u1);
+            nScene = Vec3(0, 0, 1);
+            return Vec3(r * std::cos(phi), r * std::sin(phi), zv);
+        }
+        const double aR = std::fabs(R);
+        const double cosMax = std::sqrt(std::fmax(0.0, 1.0 - (ap / aR) * (ap / aR)));
+        const double ca = 1.0 - u1 * (1.0 - cosMax);           // uniform in [cosMax, 1]
+        const double sa = std::sqrt(std::fmax(0.0, 1.0 - ca * ca));
+        // The centre sits at zv + R; the vertex lies from it along -sign(R) z.
+        const double s = (R < 0.0) ? 1.0 : -1.0;
+        Vec3 P(aR * sa * std::cos(phi), aR * sa * std::sin(phi), zv + R + s * aR * ca);
+        Vec3 out = normalize(P - Vec3(0, 0, zv + R)) * s;     // outward from the centre, toward +z at the vertex
+        nScene = (out.z >= 0.0) ? out : out * -1.0;
+        return P;
+    }
+    // Trace a lens-local ray that comes FROM the scene (d.z < 0) through every interface
+    // and onto the sensor plane z = filmZ. `entry`, if given, receives the point where it
+    // crossed surface 0. False if any element or the stop clips it, on total internal
+    // reflection, or if it never reaches the sensor plane.
+    bool traceToFilm(const Vec3& o, const Vec3& d, double lambda, Vec3& onFilm,
+                     Vec3& dFilm, Vec3* entry = nullptr) const {
+        if (surf.empty()) return false;
+        if (entry) {
+            Vec3 n;
+            if (!hitSurface(0, o, normalize(d), *entry, n)) return false;
+        }
+        Ray out;
+        if (!trace(o, d, lambda, /*sensorToScene=*/false, out)) return false;
+        if (!(out.d.z < -1e-12)) return false;               // not heading for the sensor
+        const double t = (filmZ - out.o.z) / out.d.z;
+        if (!(t > 0.0)) return false;
+        onFilm = out.o + out.d * t;
+        dFilm = out.d;
+        return true;
+    }
+
     // Effective focal length (mm), measured from a near-axis parallel probe at the
     // design wavelength: f = h / tan(angle of the emergent ray). Used for reporting.
     double focalLengthMM() const {
