@@ -2432,7 +2432,7 @@ __device__ static inline double dLensCellNorm(const DCamera& cam) {
     const double a = cam.lens.filmW_mm / (double)cam.resX * 1e-3;
     return 1.0 / (a * a);
 }
-// The entrance-pupil table (host twins LensPupil::classify / sampleCrossing / inCell, where
+// The entrance-pupil table (host twins LensPupil::classify / LensPupilTable, where
 // lens.h explains it): which sampler light from lens-local point p takes -- a bin >= 0 to aim
 // (cphi, sphi = p's azimuth), -1 the front sampler, -2 no light from p reaches the film.
 __device__ static int dLensPupilClassify(const DLensSystem& L, const D3& p, double& cphi, double& sphi) {
@@ -2453,16 +2453,6 @@ __device__ static int dLensPupilClassify(const DLensSystem& L, const D3& p, doub
     const double r = sqrt(r2);
     if (r > 0.0) { cphi = p.x / r; sphi = p.y / r; } else { cphi = 1.0; sphi = 0.0; }
     return c;
-}
-__device__ static inline double dLensPupilArea(const DLensSystem& L, int c) {
-    return dPupilRegionArea(L.pupilCells + 4 * c);
-}
-__device__ static inline D3 dLensPupilSample(const DLensSystem& L, int c, double cphi, double sphi,
-                                             double u1, double u2) {
-    return dPupilRegionSample(L.pupilCells + 4 * c, cphi, sphi, u1, u2, L.pupilZRef);
-}
-__device__ static inline double dLensPupilNorm(const DLensSystem& L, int c, const D3& X, double cphi, double sphi) {
-    return dPupilRegionNorm(L.pupilCells + 4 * c, X, cphi, sphi);
 }
 // Where light from scene point p enters the lens (host twin Camera::lensEntry, which explains
 // both samplers and the rebased start): Y on the front element's clear cap, the leg p -> Y,
@@ -2486,7 +2476,7 @@ __device__ static bool dLensEntry(const DCamera& cam, const DVec3& p, double u1,
         const int c = dLensPupilClassify(L, pl, cphi, sphi);
         if (c == -2) return false;
         if (c >= 0) {
-            const D3 X = dLensPupilSample(L, c, cphi, sphi, u1, u2);
+            const D3 X = dPupilRegionSample(L.pupilCells + 4 * c, cphi, sphi, u1, u2, L.pupilZRef);
             D3 dl = X - pl;
             const double dX = length(dl);
             dl = dl / dX;
@@ -2502,7 +2492,7 @@ __device__ static bool dLensEntry(const DCamera& cam, const DVec3& p, double u1,
             e.o = o; e.d = dl;
             e.cosY = fabs(dot(dl, nY));
             e.aimed = 1;
-            e.omega = -dl.z * dLensPupilArea(L, c) / (dX * dX);
+            e.omega = -dl.z * dPupilRegionArea(L.pupilCells + 4 * c) / (dX * dX);
             return isfinite(e.omega) && e.omega > 0.0;
         }
     }
@@ -2621,11 +2611,11 @@ __device__ static double dLensPdfDir(const DCamera& cam, const DVec3& y, const D
     if (ce == -2) return 0.0;
     if (ce >= 0) {
         // Aimed (host twin lensPdfDir): the film ray's crossing of the exit plane must lie in the
-        // film point's region; density r^2 / (cosT * A_region) per film solid angle. The slack is
-        // not what absorbs float's rounding of y; the region's padding is (see dLensAimRatio).
+        // film point's region; density r^2 / (cosT * A_region) per film solid angle. The slack
+        // is float's (see dLensAimRatio).
         const double* C = L.exitCells + 4 * ce;
         const double r = (L.exitZ - onFilm.z) / cosT;
-        if (!(dPupilRegionNorm(C, onFilm - dFilm * r, cphi, sphi) <= 1.0 + 1e-6)) return 0.0;
+        if (!(dPupilRegionNorm(C, onFilm - dFilm * r, cphi, sphi) <= 1.0 + 1e-4)) return 0.0;
         const double pdf = r * r * cosF * dLensSurfaceArea(L, 0) / (aFilm * dPupilRegionArea(C) * cosT * cosT);
         return isfinite(pdf) ? pdf : 0.0;
     }
@@ -2655,10 +2645,11 @@ __device__ static double dLensPdfDir(const DCamera& cam, const DVec3& y, const D
 // The factor BDPT's lens camera densities carry for camera vertex Y next to scene point x
 // (host twin Camera::lensAimRatio, which derives it): (1/A_front) / p_entry(Y | x), 1 where
 // x keeps the front sampler, capped at 1e12 where the entry cannot pick Y from x. The world
-// points arrive in Real, which rounds Y by ~1e-4 mm at a metre or two from the origin -- far
-// more than the region test's slack. What keeps that harmless is the regions' 3% padding past
-// every crossing that gets through: no camera ray or light-image sample that reaches the film
-// lies near a region's rim, so none is misread as outside.
+// points arrive in Real, which rounds Y by ~1e-4 mm at a metre or two from the origin, so the
+// region test takes a slack of that order (1e-4 of the region), not the host's 1e-9. Wider is
+// the safe side: a recomputed crossing in the slack band that the sampler could not draw
+// would have to come from a ray that gets through outside the region, which the table's
+// verification rules out.
 __device__ static double dLensAimRatio(const DCamera& cam, const DVec3& Yw, const DVec3& xw) {
     const DLensSystem& L = cam.lens;
     if (L.pupilN == 0) return 1.0;
@@ -2675,11 +2666,11 @@ __device__ static double dLensAimRatio(const DCamera& cam, const DVec3& Yw, cons
     dl = dl / dXY;
     if (!(dl.z < 0.0)) return kCap;
     const double sYP = (L.pupilZRef - yl.z) / dl.z;
-    if (!(dLensPupilNorm(L, c, yl + dl * sYP, cphi, sphi) <= 1.0 + 1e-6)) return kCap;
+    if (!(dPupilRegionNorm(L.pupilCells + 4 * c, yl + dl * sYP, cphi, sphi) <= 1.0 + 1e-4)) return kCap;
     const D3 n0 = (L.surf[0].radius == 0.0) ? D3(0, 0, 1)
                                             : normalize(yl - D3(0, 0, L.surf[0].zpos + L.surf[0].radius));
     const double k = (dXY + sYP) / dXY;
-    const double q = k * k * fabs(dot(dl, n0)) * dLensSurfaceArea(L, 0) / (-dl.z * dLensPupilArea(L, c));
+    const double q = k * k * fabs(dot(dl, n0)) * dLensSurfaceArea(L, 0) / (-dl.z * dPupilRegionArea(L.pupilCells + 4 * c));
     return (q > 1.0 / kCap) ? 1.0 / q : kCap;
 }
 // Does camera c take the lens splat? Mode A always; a physical-lens camera in mode B too
@@ -22102,30 +22093,26 @@ static gpu::DCamera bakeCamera(const Scene& /*scene*/, const Camera& cam, int re
         // (the host's Camera::pupil test, against resX x resY).
         const LensPupil* P = cam.lensPupil.get();
         const double halfW = 0.5 * L.filmW_mm, halfH = halfW * ((double)resY / (double)resX);
-        if (P && P->filmZ == L.filmZ && P->racc2 >= halfW * halfW + halfH * halfH && !P->cells.empty()) {
-            std::vector<double> cells(P->cells.size() * 4);
-            for (size_t i = 0; i < P->cells.size(); ++i) {
-                cells[4 * i + 0] = P->cells[i].cx;
-                cells[4 * i + 1] = P->cells[i].a;
-                cells[4 * i + 2] = P->cells[i].b;
-                cells[4 * i + 3] = (double)P->cells[i].kind;
+        auto flatten = [](const std::vector<LensPupilCell>& cs) {
+            std::vector<double> out(cs.size() * 4);
+            for (size_t i = 0; i < cs.size(); ++i) {
+                out[4 * i + 0] = cs[i].cx; out[4 * i + 1] = cs[i].a;
+                out[4 * i + 2] = cs[i].b;  out[4 * i + 3] = (double)cs[i].kind;
             }
-            dc.lens.pupilCells = (const double*)up.keep(uploadVec(cells));
-            dc.lens.pupilNT = P->nTheta; dc.lens.pupilNU = P->nU; dc.lens.pupilN = (int)P->cells.size();
-            dc.lens.pupilZRef = P->zRef; dc.lens.pupilZStart = P->zStart;
+            return out;
+        };
+        if (P && P->fits(&L, halfW * halfW + halfH * halfH) && !P->entry.cells.empty()) {
+            dc.lens.pupilCells = (const double*)up.keep(uploadVec(flatten(P->entry.cells)));
+            dc.lens.pupilNT = P->nTheta; dc.lens.pupilNU = P->nU; dc.lens.pupilN = (int)P->entry.cells.size();
+            dc.lens.pupilZRef = P->entry.z; dc.lens.pupilZStart = P->zStart;
             dc.lens.pupilDMin = P->dMin; dc.lens.pupilDTheta = P->dTheta;
-            if (!P->exitCells.empty()) {
-                std::vector<double> ex(P->exitCells.size() * 4);
-                for (size_t i = 0; i < P->exitCells.size(); ++i) {
-                    ex[4 * i + 0] = P->exitCells[i].cx;
-                    ex[4 * i + 1] = P->exitCells[i].a;
-                    ex[4 * i + 2] = P->exitCells[i].b;
-                    ex[4 * i + 3] = (double)P->exitCells[i].kind;
-                }
-                dc.lens.exitCells = (const double*)up.keep(uploadVec(ex));
-                dc.lens.exitN = (int)P->exitCells.size();
-                dc.lens.exitZ = P->zExit; dc.lens.exitDRho = P->dRho;
+            if (!P->exit.cells.empty()) {
+                dc.lens.exitCells = (const double*)up.keep(uploadVec(flatten(P->exit.cells)));
+                dc.lens.exitN = (int)P->exit.cells.size();
+                dc.lens.exitZ = P->exit.z; dc.lens.exitDRho = P->dRho;
             }
+        } else if (P) {
+            lensPupilRefused();
         }
     }
     return dc;

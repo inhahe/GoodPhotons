@@ -8082,20 +8082,18 @@ private:
         return true;
     }
 
-    // Resolve a lens-surface `ior` word: a glass name (`glass:BK7`, `BK7`, `SF10`,
-    // `flint`, ...) -> its Sellmeier dispersion; otherwise a bare number -> constant
-    // index. Air is index 1.
-    // A lens surface's `ior` word: a glass name (`glass:` prefix optional; it has to be quoted,
-    // since an unquoted word ends the value) or a non-negative number, 0 meaning air as in pbrt's
-    // lens files, whose stop rows carry it. False for anything else (a mistyped glass name
-    // would otherwise read as index 0 and black the render out).
+    // A lens surface's `ior` word: a glass name (`glass:BK7`, `BK7`, `SF10`, `flint`, ... -> its
+    // Sellmeier dispersion; quoted, since an unquoted word ends the value), or a number: 0 means
+    // air, as in pbrt's lens files, whose stop rows carry it, and anything else must be at least
+    // 1. False otherwise: a mistyped glass name would read as index 0 and black the render out,
+    // and an index below 1 (0.67 for 1.67) would clip most rays by total internal reflection.
     static bool lensIorOf(const std::string& raw, Spectrum& out) {
         std::string name = raw;
         if (name.rfind("glass:", 0) == 0) name = name.substr(6);
         if (resolveGlassIor(name, out)) return true;
         char* end = nullptr;
         const double v = std::strtod(raw.c_str(), &end);
-        if (end == raw.c_str() || *end != '\0' || !std::isfinite(v) || v < 0.0) return false;
+        if (end == raw.c_str() || *end != '\0' || !std::isfinite(v) || (v != 0.0 && v < 1.0)) return false;
         out = iorConstant(v == 0.0 ? 1.0 : v);
         return true;
     }
@@ -8153,7 +8151,7 @@ private:
             e.thickness = num(wds[1]);
             if (!lensIorOf(wds[2], e.ior)) {
                 fail("camera '" + cs.name + "' lens: surface ior '" + wds[2] + "' is neither a "
-                     "glass name (quote it: \"BK7\") nor a non-negative number");
+                     "glass name (quote it: \"BK7\") nor a number that is 0 (air) or at least 1");
                 return false;
             }
             e.aperture  = num(wds[3]);
@@ -8164,6 +8162,11 @@ private:
         if (nSurf > 0) {
             sys->finalize();
             sys->name = "custom";
+            // The convention changed in 0.394.3 (known-issues.md LENS-SURFACE-SIGN), so a scene
+            // written against the old reader now renders a different lens: say which is in use.
+            std::printf("[ftsl] camera '%s' lens: %d surfaces, radii read as published (pbrt, Zemax, "
+                        "patents): positive = centre of curvature on the sensor side. Before 0.394.3 the "
+                        "sign was the opposite.\n", cs.name.c_str(), nSurf);
         } else {
             // 2) a named preset (singlet/achromat/doublet/telephoto/wide), else default
             //    to an achromatic doublet at the derived focal length + f-number.

@@ -120,11 +120,15 @@ struct Camera {
         const double halfH = halfW * ((double)film.resY / (double)film.resX);
         return halfW * halfW + halfH * halfH;
     }
-    // The tables if they fit: built for this focus and for a film circle at least this
-    // raster's. Null otherwise, and lensEntry and genLensRay keep their unaimed samplers.
+    // The tables if they fit (LensPupil::fits): built for this lens, at this focus, for a film
+    // circle at least this raster's. Null otherwise -- said once in the log -- and lensEntry
+    // and genLensRay keep their unaimed samplers.
     const LensPupil* pupil() const {
         const LensPupil* P = lensPupil.get();
-        return (P && P->filmZ == lens->filmZ && P->racc2 >= lensFilmRadius2()) ? P : nullptr;
+        if (!P) return nullptr;
+        if (P->fits(lens.get(), lensFilmRadius2())) return P;
+        lensPupilRefused();
+        return nullptr;
     }
 
     // Configure a thin lens so the plane at `focusDist` in front of the lens
@@ -326,7 +330,7 @@ struct Camera {
             // plane's normal being the axis, so the importance cosT / density is
             // cosT^2 * A_region / r^2 -- the planar rear's cos^4 A / Z^2 with the region for
             // the disk.
-            const Vec3 X = P->sampleExit(ce, cphi, sphi, u1, u2);
+            const Vec3 X = P->exit.sample(ce, cphi, sphi, u1, u2);
             Vec3 d0 = X - pFilm;
             const double r = length(d0);
             if (!(r > 1e-12)) return false;
@@ -334,7 +338,7 @@ struct Camera {
             const double cosT = d0.z;
             if (cosT <= 0.0) return false;
             if (!L.trace(pFilm, d0, lambda, /*sensorToScene=*/true, outLocal)) return false;
-            weight = cosT * cosT * P->exitArea(ce) / (r * r);
+            weight = cosT * cosT * P->exit.area(ce) / (r * r);
         } else {
             // Unaimed: a point uniform on the rear element (LensSystem::rearDir) -- its clear cap
             // when curved, since a disc in the plane would miss the rays crossing the cap outside
@@ -436,11 +440,11 @@ struct Camera {
             const int c = P->classify(pl, cphi, sphi);
             if (c == -2) return false;                       // no light from p reaches the film
             if (c >= 0) {
-                const Vec3 X = P->sampleCrossing(c, cphi, sphi, u1, u2);
+                const Vec3 X = P->entry.sample(c, cphi, sphi, u1, u2);
                 Vec3 dl = X - pl;
                 const double dX = length(dl);
                 dl = dl / dX;                                // dl.z < 0: p lies above zStart > zRef
-                const Vec3 o = X - dl * ((P->zStart - P->zRef) / -dl.z);
+                const Vec3 o = X - dl * ((P->zStart - P->entry.z) / -dl.z);
                 Vec3 yl, nY;
                 if (!L.hitSurface(0, o, dl, yl, nY)) return false;
                 e.Y = lensWorldPoint(yl);
@@ -451,14 +455,13 @@ struct Camera {
                 e.o = o; e.d = dl;
                 e.cosY = std::fabs(dot(dl, nY));
                 e.aimed = true;
-                e.omega = -dl.z * P->cellArea(c) / (dX * dX);
+                e.omega = -dl.z * P->entry.area(c) / (dX * dX);
                 return std::isfinite(e.omega) && e.omega > 0.0;
             }
         }
         const Vec3 pl = lensLocalPoint(p);
         Vec3 yl, nY, o, dl;
-        double dmm;
-        if (!L.frontLeg(pl, u1, u2, yl, nY, o, dl, dmm)) return false;
+        if (!L.frontLeg(pl, u1, u2, yl, nY, o, dl)) return false;
         e.Y = lensWorldPoint(yl);
         const Vec3 toY = e.Y - p;
         e.dist = length(toY);
@@ -590,9 +593,9 @@ struct Camera {
             // Aimed: genLensRay drew this film ray only if its crossing of the exit plane lies in
             // the film point's region, with density r^2 / (cosT * A_region) per film solid angle
             // (r the distance along the ray to the plane).
-            const double r = (P->zExit - onFilm.z) / cosT;
-            if (!P->inExit(ce, onFilm - dFilm * r, cphi, sphi)) return 0.0;
-            const double pdf = r * r * cosF * L.frontArea() / (aFilm * P->exitArea(ce) * cosT * cosT);
+            const double r = (P->exit.z - onFilm.z) / cosT;
+            if (!P->exit.inside(ce, onFilm - dFilm * r, cphi, sphi)) return 0.0;
+            const double pdf = r * r * cosF * L.frontArea() / (aFilm * P->exit.area(ce) * cosT * cosT);
             return std::isfinite(pdf) ? pdf : 0.0;
         }
         const int jr = (int)L.surf.size() - 1;
@@ -647,14 +650,14 @@ struct Camera {
         if (!(dXY > 0.0)) return kCap;
         dl = dl / dXY;
         if (!(dl.z < 0.0)) return kCap;
-        const double sYP = (P->zRef - yl.z) / dl.z;          // from Y on to the crossing
-        if (!P->inCell(c, yl + dl * sYP, cphi, sphi)) return kCap;
+        const double sYP = (P->entry.z - yl.z) / dl.z;       // from Y on to the crossing
+        if (!P->entry.inside(c, yl + dl * sYP, cphi, sphi)) return kCap;
         const LensSystem& L = *lens;
         const Vec3 n0 = (L.surf[0].radius == 0.0)
                             ? Vec3(0, 0, 1)
                             : normalize(yl - Vec3(0, 0, L.zpos[0] + L.surf[0].radius));
         const double k = (dXY + sYP) / dXY;
-        const double q = k * k * std::fabs(dot(dl, n0)) * L.frontArea() / (-dl.z * P->cellArea(c));
+        const double q = k * k * std::fabs(dot(dl, n0)) * L.frontArea() / (-dl.z * P->entry.area(c));
         return (q > 1.0 / kCap) ? 1.0 / q : kCap;
     }
 

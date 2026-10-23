@@ -6450,8 +6450,9 @@ as the one at fault.
     when the front element dwarfs the beam the stop admits, and traces every out-of-field
     vertex through the glass for nothing. `LensPupil` (lens.h), built per lens and film circle
     by `buildLensPupil` and cached by `lensPupilFor` (`Camera::prepareLensPupil`, called where
-    a lens camera is made; `Camera::pupil()` withholds it from a camera whose raster outgrew
-    it or whose focus moved), bins scene points by angle off axis (64 bins over 90 deg) and by
+    a lens camera is made; `Camera::pupil()` withholds it, saying so once, from a camera whose
+    lens is not the one it was built for, whose raster outgrew it or whose focus moved --
+    `LensPupil::fits`, which the GPU's bake asks too), bins scene points by angle off axis (64 bins over 90 deg) and by
     inverse distance (8 bins past `dMin`) and keeps per bin a region on the entrance-pupil
     plane (the chief ray's axis crossing; the stop is the marked surface or the paraxially
     smallest pupil) holding every crossing of a ray that reaches the film circle: an ellipse
@@ -6478,7 +6479,7 @@ as the one at fault.
     baked raster.
   - **Aiming camera rays at the stop (0.396.0).** The mirror problem: genLensRay drew where a
     camera ray heads uniformly on the rear element (disk or cap), of which a stopped-down beam
-    uses a few per cent. The same `LensPupil` carries an exit table (`exitCells`, built in
+    uses a few per cent. The same `LensPupil` carries an exit table (`exit`, a `LensPupilTable` like the entrance side's `entry`; built in
     `buildLensPupil` by the same `lenspupil::fitRegion` the entrance side uses): 64 bins by the
     film point's distance from the sensor centre, each a region on the exit-pupil plane
     (`zExit`, the chief ray's image-space axis crossing, kept in front of the sensor) holding

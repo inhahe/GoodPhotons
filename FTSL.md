@@ -3099,7 +3099,7 @@ lens { surface <radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop]  … }
 ```
 
 - Explicit `surface` lines take priority (paste a real prescription, front to rear; `ior` = a
-  number, 0 meaning air as in pbrt's stop rows, or a quoted glass name such as `"BK7"`, since an
+  number of at least 1 (0 meaning air, as in pbrt's stop rows), or a quoted glass name such as `"BK7"`, since an
   unquoted word ends the value; `stop` marks the aperture stop). Radii follow the published
   convention (pbrt lens files, Zemax, patents): positive when the centre of curvature is on
   the sensor side, 0 for a plane.

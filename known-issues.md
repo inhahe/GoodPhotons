@@ -2734,7 +2734,7 @@ uniform on the rear element (its disk, or its clear cap when curved). The share 
 that get out of the lens, measured by `-checklens`: 56.6% for the achromat at the film's
 centre, 99% for the singlet, **5.0% for the double Gauss at f/8** -- R traced twenty camera rays
 there for every one that reached the scene. Fixed the way pbrt's exit-pupil bounds do it,
-built like the entrance table: `LensPupil::exitCells`, 64 bins by film radius, each a region
+built like the entrance table: `LensPupil::exit`, 64 bins by film radius, each a region
 on the exit-pupil plane holding every film-to-scene ray that gets out (lenspupil::fitRegion,
 the same procedure as the entrance side). genLensRay aims there; lensPdfDir follows the same
 density; the camera density stays a function of the ray alone, so nothing else in BDPT

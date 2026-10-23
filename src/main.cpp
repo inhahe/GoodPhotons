@@ -2728,22 +2728,22 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
         if (c < 0) continue;
         ++aimedReached;
         const Vec3 yl = cam.lensLocalPoint(e.Y);
-        const Vec3 Xc = yl + e.d * ((P->zRef - yl.z) / e.d.z);
-        if (!P->inCell(c, Xc, cphi, sphi)) {
+        const Vec3 Xc = yl + e.d * ((P->entry.z - yl.z) / e.d.z);
+        if (!P->entry.inside(c, Xc, cphi, sphi)) {
             if (++outside <= 5) {
-                const LensPupilCell& C = P->cells[(size_t)c];
+                const LensPupilCell& C = P->entry.cells[(size_t)c];
                 const double ex = Xc.x * cphi + Xc.y * sphi, ey = -Xc.x * sphi + Xc.y * cphi;
                 std::printf("[checklens] %s:   outside: bin %d (angle bin %d, distance bin %d, %s), point "
                             "%.3g m %.2f deg off axis, crossing (%.4f, %.4f) mm vs region centre %.4f, "
                             "half-widths %.4f x %.4f (%.4f of its size)\n", preset, c, c / P->nU, c % P->nU,
                             C.kind == LensPupil::AIMBOX ? "rectangle" : "ellipse", range, th * 180.0 / PI,
-                            ex, ey, C.cx, C.a, C.b, LensPupil::regionNorm(C, ex, ey));
+                            ex, ey, C.cx, C.a, C.b, pupilRegionNorm(C, ex, ey));
             }
         }
     }
     std::printf("[checklens] %s: pupil table aims in %d bins, front sampler in %d, rejects %d "
                 "(stop = surface %d, entrance pupil z = %.2f mm, %lld build-time enlargements)\n",
-                preset, P->nAim, P->nFront, P->nNone, P->stop, P->zRef, P->enlarged);
+                preset, P->entry.nAim, P->entry.nFront, P->entry.nNone, P->stop, P->entry.z, P->entry.enlarged);
     std::printf("[checklens] %s: of %lld front-sampler rays that reached the film, %lld came from aimed "
                 "points: %lld outside the region, %lld from rejecting bins\n",
                 preset, reached, aimedReached, outside, rejected);
@@ -2819,11 +2819,11 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
         if (c == -2) { ++rejected7; continue; }
         if (c < 0) continue;
         ++aimed7;
-        if (!P->inExit(c, f + d * ((P->zExit - f.z) / d.z), cphi, sphi)) ++outside7;
+        if (!P->exit.inside(c, f + d * ((P->exit.z - f.z) / d.z), cphi, sphi)) ++outside7;
     }
     std::printf("[checklens] %s: exit table aims in %d film bins, rear sampler in %d, rejects %d "
                 "(exit pupil z = %.2f mm, %lld build-time enlargements)\n",
-                preset, P->nExitAim, P->nExitFront, P->nExitNone, P->zExit, P->exitEnlarged);
+                preset, P->exit.nAim, P->exit.nFront, P->exit.nNone, P->exit.z, P->exit.enlarged);
     std::printf("[checklens] %s: of %lld unaimed camera rays that got out, %lld from aimed film bins: "
                 "%lld outside the region, %lld from rejecting bins\n",
                 preset, out7, aimed7, outside7, rejected7);
@@ -2896,6 +2896,14 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
     }
     std::printf("[checklens] %s: pupil tables refused to %d of %d rasters\n", preset, refused, tried);
     pass = pass && refused == 0;
+    // (11) ... and to no camera whose lens is not the one they were built for: a copy of the
+    // prescription (same focus, same raster) must not inherit another lens's regions.
+    Camera swapped = cam;
+    swapped.lens = std::make_shared<LensSystem>(*cam.lens);
+    const bool stale = swapped.pupil() != nullptr;
+    std::printf("[checklens] %s: a camera given another lens after its tables were built %s them\n",
+                preset, stale ? "still USES" : "no longer uses");
+    pass = pass && !stale;
     std::printf("[checklens] %s %s\n", preset, pass ? "PASS" : "FAIL");
     return pass;
 }

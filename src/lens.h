@@ -32,6 +32,7 @@
 #include <string>
 #include <cmath>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <memory>
@@ -269,14 +270,13 @@ struct LensSystem {
     //
     // Light: from lens-local point `pl`, the leg to a point Y uniform on the front cap (with
     // the cap's +z-side normal nY), started just in front of the glass at `o` with unit
-    // direction `d` (Camera::lensEntry explains the rebased start); `dmm` = |Y - pl|. False if
-    // the leg does not head for the sensor, or Y is not the first point of the cap it meets
-    // (a convex element's far side is hidden).
-    bool frontLeg(const Vec3& pl, double u1, double u2, Vec3& Y, Vec3& nY, Vec3& o, Vec3& d,
-                  double& dmm) const {
+    // direction `d` (Camera::lensEntry explains the rebased start). False if the leg does not
+    // head for the sensor, or Y is not the first point of the cap it meets (a convex element's
+    // far side is hidden).
+    bool frontLeg(const Vec3& pl, double u1, double u2, Vec3& Y, Vec3& nY, Vec3& o, Vec3& d) const {
         Y = sampleSurface(0, u1, u2, nY);
         d = Y - pl;
-        dmm = length(d);
+        const double dmm = length(d);
         if (!(dmm > 1e-9)) return false;
         d = d / dmm;
         if (!(d.z < 0.0)) return false;                      // light must travel toward the sensor
@@ -408,39 +408,60 @@ inline double pupilRegionNormAt(const LensPupilCell& C, const Vec3& X, double cp
 }
 inline double pupilRegionArea(const LensPupilCell& C) { return (C.kind == 3 ? 4.0 : PI) * C.a * C.b; }
 
+// One side's table: its bins' regions, all on the plane z.
+struct LensPupilTable {
+    double z = 0.0;                      // the plane (mm): the entrance or the exit pupil's
+    std::vector<LensPupilCell> cells;
+    int nAim = 0, nFront = 0, nNone = 0;
+    long long enlarged = 0;              // uniform rays that got through outside their bin's
+                                         // fitted region, each of which enlarged it
+    // A crossing uniform in bin c's region, rotated to azimuth (cphi, sphi).
+    Vec3 sample(int c, double cphi, double sphi, double u1, double u2) const {
+        return pupilRegionSample(cells[c], cphi, sphi, u1, u2, z);
+    }
+    // Is X (on the plane) inside bin c's region at azimuth (cphi, sphi)? The slack covers the
+    // rounding between a crossing drawn and the same crossing recomputed from its ray.
+    bool inside(int c, const Vec3& X, double cphi, double sphi) const {
+        return pupilRegionNormAt(cells[c], X, cphi, sphi) <= 1.0 + 1e-9;
+    }
+    double area(int c) const { return pupilRegionArea(cells[c]); }
+};
+
 struct LensPupil {
     // FRONT keeps the unaimed sampler (uniform on the front element for light, on the rear
     // element for camera rays); NONE rejects before any trace.
     enum { FRONT = 0, AIM = 1, NONE = 2, AIMBOX = 3 };
-    double racc2 = 0.0;    // squared film radius (mm^2) the tables are built for
-    double filmZ = 0.0;    // the sensor plane they were built for
+    // What the tables were built for. They describe the prescription as it stood then: a
+    // LensSystem is to be edited only before its cameras call prepareLensPupil.
+    const LensSystem* lens = nullptr;
+    double racc2 = 0.0;    // squared film radius (mm^2)
+    double filmZ = 0.0;    // the sensor plane
     int stop = -1;         // the surface taken as the stop (for the report)
 
-    // ---- the entrance side: light traced in (Camera::lensEntry) ----
-    double zRef = 0.0;     // the plane crossings are drawn on (mm): the entrance pupil's
+    // ---- the entrance side: light traced in (Camera::lensEntry); entry.z is zRef ----
+    LensPupilTable entry;  // bins [iTheta * nU + iU], iU = floor(nU * dMin / distance)
     double zStart = 0.0;   // above every point of the front cap: where an aimed leg starts
-    double dMin = 0.0;     // scene points nearer than this to (0, 0, zRef) keep the front sampler
+    double dMin = 0.0;     // scene points nearer than this to (0, 0, entry.z) keep the front sampler
     int nTheta = 0, nU = 0;
     double dTheta = 0.0;   // bin width in the angle off the axis, over [0, pi/2)
-    std::vector<LensPupilCell> cells;   // [iTheta * nU + iU], iU = floor(nU * dMin / distance)
-    int nAim = 0, nFront = 0, nNone = 0;
-    long long enlarged = 0;             // uniform rays that got through outside their bin's
-                                        // fitted region, each of which enlarged it
 
     // ---- the exit side: camera rays traced out (Camera::genLensRay) ----
-    double zExit = 0.0;    // the plane camera rays' crossings are drawn on (mm): the exit pupil's
+    LensPupilTable exit;   // bins [iRho]
     int nRho = 0;
     double dRho = 0.0;     // bin width in the film point's distance from the sensor centre
-    std::vector<LensPupilCell> exitCells;   // [iRho]
-    int nExitAim = 0, nExitFront = 0, nExitNone = 0;
-    long long exitEnlarged = 0;
 
-    // Which sampler light from lens-local point p takes: a bin index >= 0 to aim (cphi, sphi
-    // then hold p's azimuth), -1 for the front sampler, -2 when no light from p reaches the
-    // film. Points beside the glass or near it keep the front sampler.
+    // Do the tables serve lens L at its current focus, for a raster reaching sqrt(racc2Needed)
+    // mm from the sensor centre? Camera::pupil and the GPU's bake both ask this.
+    bool fits(const LensSystem* L, double racc2Needed) const {
+        return L == lens && L && filmZ == L->filmZ && racc2 >= racc2Needed;
+    }
+
+    // Which sampler light from lens-local point p takes: an entrance bin >= 0 to aim (cphi,
+    // sphi then hold p's azimuth), -1 for the front sampler, -2 when no light from p reaches
+    // the film. Points beside the glass or near it keep the front sampler.
     int classify(const Vec3& p, double& cphi, double& sphi) const {
         if (!(p.z > zStart)) return -1;
-        const double r2 = p.x * p.x + p.y * p.y, qz = p.z - zRef;
+        const double r2 = p.x * p.x + p.y * p.y, qz = p.z - entry.z;
         const double D2 = r2 + qz * qz;
         if (!(D2 >= dMin * dMin)) return -1;
         const double D = std::sqrt(D2);
@@ -449,46 +470,38 @@ struct LensPupil {
         it = std::min(std::max(it, 0), nTheta - 1);
         iu = std::min(std::max(iu, 0), nU - 1);
         const int c = it * nU + iu;
-        const int k = cells[c].kind;
+        const int k = entry.cells[c].kind;
         if (k == NONE) return -2;
         if (k != AIM && k != AIMBOX) return -1;
         const double r = std::sqrt(r2);
         if (r > 0.0) { cphi = p.x / r; sphi = p.y / r; } else { cphi = 1.0; sphi = 0.0; }
         return c;
     }
-    Vec3 sampleCrossing(int c, double cphi, double sphi, double u1, double u2) const {
-        return pupilRegionSample(cells[c], cphi, sphi, u1, u2, zRef);
-    }
-    static double regionNorm(const LensPupilCell& C, double ex, double ey) { return pupilRegionNorm(C, ex, ey); }
-    // Is crossing X inside bin c's region? The slack covers the rounding between a crossing
-    // drawn and the same crossing recomputed from its ray.
-    bool inCell(int c, const Vec3& X, double cphi, double sphi) const {
-        return pupilRegionNormAt(cells[c], X, cphi, sphi) <= 1.0 + 1e-9;
-    }
-    double cellArea(int c) const { return pupilRegionArea(cells[c]); }
-
-    // The same for a camera ray from film point f (lens-local, on the sensor plane): a bin
-    // >= 0 to aim (cphi, sphi = f's azimuth), -1 for the rear-element sampler, -2 when no ray
-    // from that far off centre gets out of the lens.
+    // The same for a camera ray from film point f (lens-local, on the sensor plane): an exit
+    // bin >= 0 to aim (cphi, sphi = f's azimuth), -1 for the rear-element sampler, -2 when no
+    // ray from that far off centre gets out of the lens.
     int classifyFilm(const Vec3& f, double& cphi, double& sphi) const {
-        if (exitCells.empty()) return -1;
+        if (exit.cells.empty()) return -1;
         const double r = std::sqrt(f.x * f.x + f.y * f.y);
         int i = (int)(r / dRho);
         i = std::min(std::max(i, 0), nRho - 1);
-        const int k = exitCells[i].kind;
+        const int k = exit.cells[i].kind;
         if (k == NONE) return -2;
         if (k != AIM && k != AIMBOX) return -1;
         if (r > 0.0) { cphi = f.x / r; sphi = f.y / r; } else { cphi = 1.0; sphi = 0.0; }
         return i;
     }
-    Vec3 sampleExit(int c, double cphi, double sphi, double u1, double u2) const {
-        return pupilRegionSample(exitCells[c], cphi, sphi, u1, u2, zExit);
-    }
-    bool inExit(int c, const Vec3& X, double cphi, double sphi) const {
-        return pupilRegionNormAt(exitCells[c], X, cphi, sphi) <= 1.0 + 1e-9;
-    }
-    double exitArea(int c) const { return pupilRegionArea(exitCells[c]); }
 };
+
+// Says once per run that a camera's tables no longer fit it (Camera::pupil): the render is
+// still right, only noisier, and nothing else would show why.
+inline void lensPupilRefused() {
+    static std::atomic<bool> said{false};
+    if (!said.load(std::memory_order_relaxed) && !said.exchange(true))
+        std::printf("[lens] a camera's focus, film or lens changed after its pupil tables were built: "
+                    "it renders without aiming at the stop (the same image, noisier) until "
+                    "Camera::prepareLensPupil rebuilds them\n");
+}
 
 namespace lenspupil {
 // One bin's region, found by tracing. `uniformRay(X)` draws a ray the unaimed way over the
@@ -632,6 +645,15 @@ inline void resolveUnlit(std::vector<LensPupilCell>& cells, const std::vector<ch
             cells[(size_t)(i * n1 + j)].kind = byLit ? LensPupil::FRONT : LensPupil::NONE;
         }
 }
+// Count a table's bins by kind, for the report.
+inline void countKinds(LensPupilTable& T) {
+    T.nAim = T.nFront = T.nNone = 0;
+    for (const LensPupilCell& C : T.cells) {
+        if (C.kind == LensPupil::AIM || C.kind == LensPupil::AIMBOX) ++T.nAim;
+        else if (C.kind == LensPupil::NONE) ++T.nNone;
+        else ++T.nFront;
+    }
+}
 }   // namespace lenspupil
 
 // Build both tables for lens L focused as it is, for a film reaching sqrt(`racc2`) mm from the
@@ -670,6 +692,7 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
         }
         if (stop < 0) stop = 0;
     }
+    P->lens = &L;
     P->stop = stop;
     P->racc2 = racc2;
     P->filmZ = L.filmZ;
@@ -690,13 +713,13 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
     const double capR = L.capRadius(0), ap0 = L.surf[0].aperture;
     const double track = L.zpos[0] - L.zpos[M - 1];
     zRef = std::max(std::min(zRef, L.zpos[0]), L.zpos[M - 1] - track - 10.0);
-    P->zRef = zRef;
+    P->entry.z = zRef;
     P->zStart = L.zpos[0] + capR + 1.0;
     P->dMin = (P->zStart - zRef) + 4.0 * capR;
     P->nTheta = 64; P->nU = 8;
     P->dTheta = 0.5 * PI / P->nTheta;
     const int nCells = P->nTheta * P->nU;
-    P->cells.assign((size_t)nCells, LensPupilCell{});
+    P->entry.cells.assign((size_t)nCells, LensPupilCell{});
     std::vector<char> lit((size_t)nCells, 0);
     std::vector<long long> enl((size_t)nCells, 0);
     bool done = ft::parallelFor((size_t)nCells, 1, [&](size_t ci) {
@@ -723,8 +746,7 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
             Vec3 p;
             if (!point(p)) return -1;
             Vec3 Y, nY, o, d;
-            double dm;
-            if (!L.frontLeg(p, rng.uniform(), rng.uniform(), Y, nY, o, d, dm)) return 0;
+            if (!L.frontLeg(p, rng.uniform(), rng.uniform(), Y, nY, o, d)) return 0;
             if (!reaches(o, d)) return 0;
             X = Y + d * ((zRef - Y.z) / d.z);
             X.y = std::fabs(X.y);
@@ -740,16 +762,12 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
             const Vec3 o = X - d * ((P->zStart - zRef) / -d.z);
             return reaches(o, d) ? 1 : 0;
         };
-        lit[ci] = lenspupil::fitRegion(rng, frontRay, aimRay, ap0, P->cells[ci], enl[ci]) ? 1 : 0;
+        lit[ci] = lenspupil::fitRegion(rng, frontRay, aimRay, ap0, P->entry.cells[ci], enl[ci]) ? 1 : 0;
     });
     if (!done) return nullptr;
-    lenspupil::resolveUnlit(P->cells, lit, P->nTheta, P->nU);
-    for (const LensPupilCell& C : P->cells) {
-        if (C.kind == LensPupil::AIM || C.kind == LensPupil::AIMBOX) ++P->nAim;
-        else if (C.kind == LensPupil::NONE) ++P->nNone;
-        else ++P->nFront;
-    }
-    for (long long e : enl) P->enlarged += e;
+    lenspupil::resolveUnlit(P->entry.cells, lit, P->nTheta, P->nU);
+    lenspupil::countKinds(P->entry);
+    for (long long e : enl) P->entry.enlarged += e;
 
     // ---- the exit side ----
     // The plane: where the chief ray, leaving the stop's centre for the sensor, crosses the axis
@@ -763,10 +781,10 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
     zExit = std::min(zExit, L.zpos[0]);
     if (!(zExit > L.filmZ + 1.0)) zExit = std::max(L.zpos[jr], L.filmZ + 1.0);
     const double apR = L.surf[jr].aperture;
-    P->zExit = zExit;
+    P->exit.z = zExit;
     P->nRho = 64;
     P->dRho = racc / P->nRho;
-    P->exitCells.assign((size_t)P->nRho, LensPupilCell{});
+    P->exit.cells.assign((size_t)P->nRho, LensPupilCell{});
     std::vector<char> litE((size_t)P->nRho, 0);
     std::vector<long long> enlE((size_t)P->nRho, 0);
     done = ft::parallelFor((size_t)P->nRho, 1, [&](size_t ci) {
@@ -798,16 +816,12 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
             const Vec3 d = normalize(Vec3(ex, ey, zExit) - f);
             return getsOut(f, d) ? 1 : 0;
         };
-        litE[ci] = lenspupil::fitRegion(rng, rearRay, aimRay, apR, P->exitCells[ci], enlE[ci]) ? 1 : 0;
+        litE[ci] = lenspupil::fitRegion(rng, rearRay, aimRay, apR, P->exit.cells[ci], enlE[ci]) ? 1 : 0;
     });
     if (!done) return nullptr;
-    lenspupil::resolveUnlit(P->exitCells, litE, P->nRho, 1);
-    for (const LensPupilCell& C : P->exitCells) {
-        if (C.kind == LensPupil::AIM || C.kind == LensPupil::AIMBOX) ++P->nExitAim;
-        else if (C.kind == LensPupil::NONE) ++P->nExitNone;
-        else ++P->nExitFront;
-    }
-    for (long long e : enlE) P->exitEnlarged += e;
+    lenspupil::resolveUnlit(P->exit.cells, litE, P->nRho, 1);
+    lenspupil::countKinds(P->exit);
+    for (long long e : enlE) P->exit.enlarged += e;
     return P;
 }
 
@@ -830,9 +844,9 @@ inline std::shared_ptr<const LensPupil> lensPupilFor(const std::shared_ptr<LensS
     std::printf("[lens] '%s': pupil tables aim at the stop (surface %d): light in %d of %d bins "
                 "(front sampler %d, rejects %d), camera rays in %d of %d (rear sampler %d, rejects "
                 "%d); %.0f ms\n",
-                L->name.c_str(), tab->stop, tab->nAim, (int)tab->cells.size(), tab->nFront,
-                tab->nNone, tab->nExitAim, (int)tab->exitCells.size(), tab->nExitFront,
-                tab->nExitNone, ms);
+                L->name.c_str(), tab->stop, tab->entry.nAim, (int)tab->entry.cells.size(),
+                tab->entry.nFront, tab->entry.nNone, tab->exit.nAim, (int)tab->exit.cells.size(),
+                tab->exit.nFront, tab->exit.nNone, ms);
     cache.push_back({L, racc2, L->filmZ, tab});
     return tab;
 }
