@@ -3146,6 +3146,20 @@ the node hierarchy anyway. A `<file>.orig.glb` backup is made once. Used to put 
 at her true 10 inches and the gem compote's bowl at 6 (both had been authored oversize; a scene
 that shows them at a display scale then keeps their real proportion for free).
 
+**Slimming an image-to-3D asset to its source's detail (`tools/downscale_glb.py`).** A Meshy or
+Hyper3D mesh is made from one or a few photographs, so anything finer than their pixels is
+invention, and these files carry a lot of it (the gallery's gnome was 43 MB from 250 x 440 px
+photographs). `--sweep N1,N2,… --px <mesh units per source pixel>` decimates to each face count
+and prints how far the result strays from the original in source pixels: the worst detail lost
+and added, the share of the original's vertices more than half a pixel off, and the 99.9th
+percentile. Then pick the fewest faces that keep every original vertex within half a pixel (the
+docstring gives the relaxed rule for a mesh with a lone outlier), and
+`--out OUT.glb --faces N [--tex 1024]` writes the result: quadric edge collapse (texture-aware
+while the mesh keeps its texture), with the textures padded past their UV charts and resized by
+Lanczos-3, the sRGB base colour in linear light. Use `--no-texture` to drop the textures and weld
+the UV seams first. The source file is never written. It needs `pymeshlab`
+(`pip install pymeshlab`).
+
 **Per-vertex colour** is imported from every format that carries it — PLY's
 `red`/`green`/`blue` (or `diffuse_red`/…), OBJ's extended `v x y z r g b`, glTF's
 `COLOR_0`, and an FBX colour layer — and **multiplies** the material's albedo, which is
