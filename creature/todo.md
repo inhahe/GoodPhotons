@@ -460,6 +460,39 @@ AMP now means P5 doesn't need a new controller.
       and why an implementation that ties panting to exertion reads as fake. Respiration and
       thermoregulation share an airway and nothing else.
 - [ ] Retrain P2's controller on muscle actuation
+      - **Budget, written down before the first muscle run** *(added 2026-10-22)*. Measured today
+        (`notes/training.md`): ~2 400 env-steps/s flat and ~1 400 on terrain, at 64 envs, with
+        joint motors; P1 tracked its commands by 3.4 M steps and plateaued by 13–20 M. Assumed
+        until the first muscle run measures it: muscles make a step ~2× dearer (spatial tendons,
+        more actuators), so ~1 000 steps/s. Published muscle locomotion sits near 10⁸ steps —
+        DEP-RL's 120-muscle ostrich trained 10⁸ steps in ~48 h on a V100 plus 20 CPU cores, and
+        its 80–90-muscle human walkers are on the same scale — with an off-policy learner, so
+        our PPO may need more. Hence:
+
+        | stage | steps | this machine's CPU | 4090 under GPU physics (if ~10⁵ steps/s) |
+        |---|---|---|---|
+        | proof of concept: one dog, muscles, walk/trot/gallop on command, flat | 10⁸–10⁹ | **1–12 days a run** | minutes to ~3 h |
+        | + P2's mocap manners | ~10⁹ | ~2 weeks | a few hours |
+        | full: P4's body range + P10's skills and affect, ASE-scale | 10¹⁰–3·10¹⁰ | 4 months–1 year: **not practical** | 1–4 days |
+
+        ASE's skill space took over 10¹⁰ samples — ~10 days on one V100 with 4 096 simulations on
+        the GPU — for a motor-driven human with no body variation, which is why the last row is
+        not cheaper. Budget 3–5 runs a stage, not one: runs fail, need tuning, or expose rig bugs.
+        The Cross-cutting GPU-physics measurement decides the last column, and with it whether
+        any compute has to be bought.
+      - **Shortcut to try first: a muscle-coordination layer under P1's torque policy.** A network
+        that maps the torques a joint needs to the muscle activations that produce them can be
+        trained by plain supervised learning from the rig itself; put it under the working P1
+        controller, then fine-tune the whole with RL. That is how Lee et al. (2019) made a
+        346-muscle human tractable, and it should take the proof of concept well under a
+        from-scratch run.
+      - **Build the proof of concept with the final interface.** The morph vector and P10's
+        level 0–1 channels are inputs from the first muscle run, even while they barely vary,
+        so scaling up is the same code with wider ranges and more compute — not a redesign.
+      - **Compute buys breadth of body, not new expressions.** Widening P4's morph range costs
+        compute only (design.md: range width is nearly free). Every manner or affect grounded by
+        examples needs **clips of it** — capture or mocap — and no amount of compute substitutes
+        for footage that does not exist.
 
 ---
 
@@ -1680,32 +1713,79 @@ alone has worked before: faces (Wood et al. 2021, "Fake It Till You Make It") an
 et al. 2019, "Three-D Safari", trained on images of a SMAL model).
 
 **Four corrections to the proposal as first stated, decided now:**
-- **Do not render the training corpus at final quality.** 10⁵ clips × 300 frames × 4 views is
-  ~10⁸ frames: at one second a frame that is ~3 GPU-years, and a furred ftrace frame takes about a
-  minute. Real footage reaches the network through P5's front-end anyway — keypoints, silhouettes,
-  depth, optical flow — and the simulator emits those for almost nothing. So motion and anatomy
-  train on simulated *features*, which also shrinks the sim-to-real gap, since both sides arrive in
-  the same form. Appearance (fur, skin, eyes) is fitted separately from far fewer renders, the way
-  P7's groom already plans (analysis-by-synthesis, `notes/capture.md`).
+- **Train on simulated features first; rendered images are a measured option, not the default.**
+  Real footage reaches the network through P5's front-end anyway — keypoints, silhouettes, depth,
+  optical flow — and the simulator emits those for almost nothing, which also shrinks the
+  sim-to-real gap, since both sides arrive in the same form. Rendered images are affordable rather
+  than impossible *(revised 2026-10-22; this bullet first said a furred ftrace frame takes "about a
+  minute", a figure nobody measured)*: at an assumed 2–10 s per denoised 256² crop on the 4090,
+  ~5 M crops is years locally but ~$1 000–5 000 on rented consumer GPUs — see "What it costs" below.
+  What images buy is a network that reads pixels directly; what they cost, beyond the rendering, is
+  the synthetic-to-real appearance gap. Appearance itself (fur, skin, eyes) is fitted separately
+  from far fewer renders, the way P7's groom already plans (analysis-by-synthesis,
+  `notes/capture.md`).
 - **Estimate what is identifiable, take the rest from priors, and say which is which.** Video sees
   the surface. Muscle redundancy — co-contraction moves nothing — makes activations unrecoverable
   from video in principle: infer them, never claim them. Cartilage, sinews, nail structure and
   tooth roots barely touch the image. The species template, scaled by allometry and built from
   veterinary atlases and CT, supplies them. Every output parameter carries a flag, *measured* or
   *prior*: "the most plausible complete animal consistent with this footage" is the honest claim.
-- **The network does not output a network.** Its output is the morph vector plus a style code for
-  the shared morph-conditioned controller (P4, and P10 level 2's ASE latent), followed by a
-  per-animal RL fine-tune that imitates the reconstructed motion — SFV's recipe. Generating a
-  controller's weights directly is harder and buys nothing.
+- **The network does not output a network.** Its output is the morph vector, per-frame pose and
+  muscle signals (flagged *inferred*: see the bullet above), and a style code for the shared
+  morph-conditioned controller (P4, and P10 level 2's ASE latent), followed by a per-animal RL
+  fine-tune that imitates the reconstructed motion — SFV's recipe. That fine-tuned copy is the
+  animal's own stimulus → muscle-signal network: it is produced by *training*, not *written* by
+  another network, because predicting millions of weights from footage would need thousands of
+  (video, finished controller) pairs, each one a full RL run.
 - **Every fit ends with analysis-by-synthesis against the real footage.** The network's answer is
   only θ₀: the last step simulates the fitted animal, scores it with P5's objective, and refines.
   That step is what catches the cases where the sim-to-real gap fooled the network.
 
-**The bootstrap.** Random excitations produce flailing, not behaviour, so the synthetic corpus can
-only contain what existing controllers do, and the inverse model cannot recognise behaviour outside
-it. The loop: P2's mocap-trained controllers → fit real captures → add the fitted bodies and
-behaviours to the generator → regenerate and retrain. Morph randomisation spreads the anatomy side,
-within one body plan (design.md §Morphology) — quadruped mammals first.
+**Why a controller is needed at all.** Physics answers "given these muscle signals now, how does the
+body move?"; it cannot answer "which signals make a dog trot at 2 m/s without falling?" — ~100
+muscles, 50 times a second, each decision changing the next. Zero signals give a heap, random ones a
+twitch, and a replayed recording falls within seconds, because balance needs constant correction
+from what the body is doing now. The controller is that closed loop: feel the body, decide the
+signals, repeat. It appears twice in this phase — as the source of varied motion for the corpus, and
+as the second product (the animal's own stimulus → muscle-signal network).
+
+**Labelled motion without a trained controller — how the corpus starts.** Biomechanics' standard
+route needs no training: take recorded motion (P2's public dog mocap, P5's captures), retarget it
+onto randomly varied bodies with P5's fit, compute the forces that must have caused it by inverse
+dynamics (`mj_inverse`, already used by `tune.py`), and split those forces among the muscles by
+minimising total effort (static optimisation, as OpenSim does). The labels are minimum-effort by
+construction — a convention, not a measurement, since video cannot tell them from any co-contracted
+alternative that moves the body the same way. Until
+P3 adds muscles, the same pipeline labels **joint torques**, so the proof of concept need not wait
+for P3. Its limits are why the bootstrap below still exists: it covers only motions somebody
+recorded; retargeting far from the recorded body gives forces for a motion that body could not
+make — the method returns numbers regardless; and it creates no new behaviour.
+
+**The bootstrap.** Random excitations produce flailing, not behaviour, so beyond the recorded
+motions the synthetic corpus can only contain what existing controllers do, and the inverse model
+cannot recognise behaviour outside it. The loop: P2's mocap-trained controllers → fit real captures
+→ add the fitted bodies and behaviours to the generator → regenerate and retrain. Morph
+randomisation spreads the anatomy side, within one body plan (design.md §Morphology) — quadruped
+mammals first.
+
+**What it costs** *(estimated 2026-10-22; the render time is assumed, not measured)*. Training the
+inverse network is the cheap part; making its data is not, and the choice of input decides it:
+
+| input | cost a frame | proof of concept (~200 k views) | full (~5 M views) |
+|---|---|---|---|
+| keypoints + silhouettes + depth, straight from the simulator | ~1 ms, CPU | minutes | hours |
+| ftrace path-traced with fur, 256² animal crops, denoised | **~2–10 s on the 4090 (assumed)** | 5–23 days locally; ~$40–190 rented | 3–15 years locally; ~$1 000–5 000 rented |
+| ftrace's raster preview | ~2–5 ms (measured on the 4090) | minutes | hours |
+
+The raster preview is fast but not photoreal: right for silhouettes and depth, wrong for
+appearance. Labelling the motion (retargeting, inverse dynamics, static optimisation) is
+milliseconds a frame — a few CPU hours for a million frames. The network trains on the 4090: a
+feature network (millions of parameters) in a few hours; an image network on a pretrained backbone
+in a few hours for the proof of concept and about a day a run at full size — for scale, a ResNet-50
+trained from scratch on all of ImageNet is roughly a day on a 4090. Rendering rents well because it
+splits perfectly: twenty rented cards finish the image proof of concept in a day. The controller
+that widens the motion beyond recordings is costed in P3's budget item, and the Cross-cutting
+GPU-physics measurement decides whether that part is bought.
 
 **Intentions.** design.md §"How a knob acquires meaning" already splits this in two:
 - *Goal* intents — flee, approach, go there — need no labels. They are measured outcomes, handled
@@ -1769,18 +1849,30 @@ appraisal or execution.
 
 Work, in order:
 
-- [ ] **Identifiability study on simulated data — FIRST.** Extend `tools/fit_selftest.py` from pose
-      to *anatomy and dynamics*: random morphs from canis's morph space, motion from today's
-      controller, observed only as keypoints and silhouettes through `creaturelab/camera.py`'s
-      four-camera model — and through one camera, for the monocular case. Recover θ with P5's fit
-      and with a small regression network; report the error per parameter. Today's body is
-      torque-driven, so the dynamics half covers mass distribution and joint strength; muscle and
-      tendon parameters join when P3 lands. **Bar:** a table saying which parameters footage
-      determines, which only dynamics determines, and which nothing determines — and therefore
-      which parts of the full-anatomy simulation are worth building for this phase at all.
-- [ ] **Synthetic feature corpus generator.** Randomise morph × controller × command × camera ×
-      occlusion; emit keypoints, silhouettes, depth and flow, plus every label (θ, excitations,
+- [ ] **Identifiability study on simulated data — FIRST; it is also the feature-based proof of
+      concept.** Extend `tools/fit_selftest.py` from pose to *anatomy and dynamics*: random morphs
+      from canis's morph space; motion from P2's mocap labelled by inverse dynamics (above) and
+      from today's controller; observed only as keypoints and silhouettes through
+      `creaturelab/camera.py`'s four-camera model — and through one camera, for the monocular case.
+      Recover θ and the per-frame joint torques with P5's fit and with a small regression network;
+      report the error per parameter. Today's body is torque-driven, so the dynamics half covers
+      mass distribution and joint strength; muscle and tendon parameters join when P3 lands.
+      About a day of machine time ("What it costs"). **Bar:** a table saying which parameters
+      footage determines, which only dynamics determines, and which nothing determines — and
+      therefore which parts of the full-anatomy simulation are worth building for this phase at all.
+- [ ] **Measure the render time of a furred animal crop on the 4090** — `scenes/fur_creature.ftsl`
+      framed to a 256² crop, denoised, at the lowest sample count that still reads as fur. It is the
+      one assumed number in "What it costs" (2–10 s), and it alone settles the image column. Run it
+      on the machine with the 4090; ftrace has no recorded time for that scene.
+- [ ] **Synthetic feature corpus generator.** Randomise morph × motion source (labelled mocap first,
+      controllers once P2/P3 provide them) × command × camera × occlusion; emit keypoints,
+      silhouettes, depth and flow, plus every label (θ, muscle signals — joint torques until P3 —
       contacts, command / intent). Budget it before building it (design.md's cost-model rule).
+- [ ] **Image proof of concept — optional, after the render-time measurement.** ~200 k rendered views
+      (5–23 days on the 4090, or ~$40–190 rented and done in a day), the animal rendered alone and
+      composited over real background photos, with lighting and coat colour randomised. It answers
+      whether a network reading pixels transfers to real footage; skip it if the feature route
+      already does what is needed.
 - [ ] **Amortised inverse network** — features → θ with uncertainty, plus a style code; multi-view
       first, then monocular; always followed by the analysis-by-synthesis refinement.
 - [ ] **Appearance inverse** — fur, skin and eye parameters from a few renders or photos; shares
@@ -1814,6 +1906,26 @@ Work, in order:
 
       The capture protocol must log stimuli **in these same terms**, so that what the model
       learned from real sessions is what a staged stimulus presents.
+
+      **Why senses are computed, not left implicit** *(asked 2026-10-22)*. A network reacts only to
+      the numbers it is handed, so some description of the environment reaches it either way; the
+      choice is which. Handing it the world as it is — every object's true position — makes an
+      omniscient animal: it reacts to the fox behind the wall, is never startled, never searches,
+      and has no reason to look around, swivel its ears or sniff, which are exactly the behaviours
+      limited senses produce. It also makes the capture data contradict itself: the same layout,
+      a dog that flees in one take and ignores the threat in the next because the wind had turned.
+      Letting a network learn the senses from that world description fails differently: it would
+      have to learn occlusion, sound attenuation and scent transport from a few hours of footage in
+      one yard, and would be guessing in a forest it never saw. So the rule is **learn what cannot
+      be written down (the animal's appraisal and habits), compute what can (light travels in
+      straight lines everywhere)** — the senses model physical delivery, never behaviour.
+      Rendering the animal's own view as raw input would make the senses truly learned, but fails
+      the cost model: a render per control step across ~10⁸ training steps.
+
+      **Rejected: a head-mounted camera and microphone during capture.** It would record what the
+      animal saw and heard, but the gear changes how the animal looks and behaves, contaminating
+      the footage this phase learns from; and capturing a particular motor act still needs a
+      stimulus that evokes it, which is why part goals (P10) stay the way to ask for one.
 - [ ] **Stimulus → intent model**, writing P10's level 0–1 channels, with the directed/undirected
       switch exposed to the animator.
 - [ ] **Staged-stimulus directing:** stimuli as scene objects (sight, sound or scent source,
@@ -1848,7 +1960,9 @@ activations as measurements; inference across body plans before one plan works.
       required" is about the fit and stays true.
       - *If no-go, rent CPUs:* a 192-vCPU server has ~16× today's threads; even if batching scaled
         linearly, which design.md §"The vec env is batched" shows is never automatic, a 10¹⁰-step
-        run is ~2.5 days, roughly $150–600 at a few dollars an hour.
+        run is ~2.5 days at today's per-step cost (~$150–600 at a few dollars an hour), and ~a
+        week once muscles roughly halve the step rate (~$500–1 700). P3's budget item has the
+        per-stage step counts.
       - *GPU rental, as of 2026-10:* RTX 4090 $0.14–0.74/h, A100 80 GB ~$0.50–1.40, H100 ~$1.50–4,
         B200 ~$4.40–6.80. **For ftrace renders, rent consumer cards:** ftrace uses no ray-tracing
         cores, so a datacenter card's premium buys it nothing — except fp64, ~25× faster there,
