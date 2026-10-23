@@ -900,8 +900,9 @@ struct Loaded {
     Vec3 camEye{0, 1, 3}, camLook{0, 1, 0}, camUp{0, 1, 0};
     double camFov = 40.0, camAperture = 0.02, camFocus = 0.0;
     char mode = 'B';
-    bool modeSet = false;        // did a `render { mode }` block author the global mode? (A
-                                 //   camera's own `mode` sets `mode` too, but only for itself.)
+    char renderMode = 0;         // a `render { mode }` block's mode (0 = none). `mode` above
+                                 //   holds it too, but the first camera's `mode` overwrites
+                                 //   that slot, so this is the only reliable record of it.
     char defaultMode = 0;        // scene { default_mode X }: fallback mode for cameras that
                                  //   don't author their own `mode` (0 = not specified). Unlike
                                  //   `mode` above (which trails the last camera/render block),
@@ -9136,7 +9137,7 @@ private:
         std::string dev = strOf(b, "device");
         if (!dev.empty()) L.device = dev;
         std::string md = strOf(b, "mode");
-        if (!md.empty()) { L.mode = normMode(md, L); L.modeSet = true; }
+        if (!md.empty()) { L.mode = normMode(md, L); L.renderMode = L.mode; }
         std::string o = strOf(b, "out");
         if (!o.empty()) L.out = o;
         const Stmt* r = find(b, "res");

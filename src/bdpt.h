@@ -4218,8 +4218,9 @@ inline void cameraSideSums(const Scene& scene, const std::vector<Vertex>& eye, i
 // --- Renderer --------------------------------------------------------------------
 // Renders pixel rows [y0,y1). t>=2 (camera-image) contributions land on the current
 // pixel in `camFilm`; t==1 (light-image) splats land on `splatFilm` at the projected
-// raster position. The caller normalises camFilm by spp and splatFilm by the total
-// light-subpath count (W*H*spp), matching mode B's absolute-radiance convention.
+// raster position. The caller sums the two and normalises both by spp: a splat's weight
+// carries the whole-film camera importance (cameraWe; through a physical lens,
+// lensW / (W*H)), which makes spp the light-tracing normaliser (renderBdpt explains).
 struct BdptRenderer {
     int maxDepth = 8;          // maximum path length in edges (connection cost ~ depth^2)
     bool diffraction = true;   // mirrors Renderer::diffraction for MatType::Grating

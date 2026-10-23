@@ -457,25 +457,35 @@ struct Camera {
     // wavelength. The start is rebased as in lensEntry, behind a closest-approach test that
     // rejects nearly every flight without touching the glass.
     enum { LENS_MISSED = 0, LENS_CAUGHT = 1, LENS_ABSORBED = 2 };
-    int lensCatch(const Ray& ray, double hitDist, double lambda, int& px, int& py) const {
+    // The geometric half: does the flight enter the clear cap before hitDist? On success
+    // `o`, `d` are the flight as a lens-local leg started just in front of the glass.
+    bool lensCatchEntry(const Ray& ray, double hitDist, Vec3& o, Vec3& d) const {
         const LensSystem& L = *lens;
         const Vec3 ol = lensLocalPoint(ray.o);
-        const Vec3 dl = normalize(lensLocalDir(ray.d));
-        if (!(dl.z < 0.0)) return LENS_MISSED;
+        d = normalize(lensLocalDir(ray.d));
+        if (!(d.z < 0.0)) return false;
         const Vec3 v0(0.0, 0.0, L.zpos[0]);
         const double rB = L.capRadius(0);
-        const double tc = dot(v0 - ol, dl);                  // closest approach to the vertex
-        const Vec3 c = ol + dl * tc - v0;
-        if (dot(c, c) > (rB + 1e-6) * (rB + 1e-6)) return LENS_MISSED;
-        if (tc < -rB) return LENS_MISSED;                    // the element is behind the start
+        const double tc = dot(v0 - ol, d);                   // closest approach to the vertex
+        const Vec3 c = ol + d * tc - v0;
+        if (dot(c, c) > (rB + 1e-6) * (rB + 1e-6)) return false;
+        if (tc < -rB) return false;                          // the element is behind the start
         const double back = rB + 1.0;
-        const Vec3 o = (tc > back) ? ol + dl * (tc - back) : ol;
+        o = (tc > back) ? ol + d * (tc - back) : ol;
         Vec3 entry, n;
-        if (!L.hitSurface(0, o, dl, entry, n)) return LENS_MISSED;
-        if (!(length(entry - ol) * 1e-3 < hitDist)) return LENS_MISSED;   // the scene was in the way
+        if (!L.hitSurface(0, o, d, entry, n)) return false;
+        return length(entry - ol) * 1e-3 < hitDist;          // else the scene was in the way
+    }
+    // The wavelength half: an entered flight traced onto the sensor at `lambda`.
+    int lensCatchImage(const Vec3& o, const Vec3& d, double lambda, int& px, int& py) const {
         Vec3 onFilm, dFilm;
-        if (!L.traceToFilm(o, dl, lambda, onFilm, dFilm)) return LENS_ABSORBED;
+        if (!lens->traceToFilm(o, d, lambda, onFilm, dFilm)) return LENS_ABSORBED;
         return lensFilmToPixel(onFilm, px, py) ? LENS_CAUGHT : LENS_ABSORBED;
+    }
+    int lensCatch(const Ray& ray, double hitDist, double lambda, int& px, int& py) const {
+        Vec3 o, d;
+        if (!lensCatchEntry(ray, hitDist, o, d)) return LENS_MISSED;
+        return lensCatchImage(o, d, lambda, px, py);
     }
 
     // BDPT's density for the camera subpath generating the ray that leaves front-element
@@ -495,8 +505,7 @@ struct Camera {
     // distance to the cap point and cosR the ray's cosine at the cap. Glass conserves etendue,
     // dA cos dw, so per front area and exit solid angle each gains a factor cosFront / cos th.
     // All lengths in mm, so the result is per steradian. 0 if no camera sample could have
-    // made this ray: it is clipped, lands off the film, or (planar rear) crosses the rear
-    // plane outside the sampled disk.
+    // made this ray: it is clipped, or lands off the film.
     double lensPdfDir(const Vec3& y, const Vec3& dir, double lambda) const {
         const LensSystem& L = *lens;
         const Vec3 yl = lensLocalPoint(y), wl = lensLocalDir(dir);
@@ -532,15 +541,11 @@ struct Camera {
             if (!(cosR > 1e-12)) return 0.0;
             pdf = r * r * cosF * L.frontArea() / (aFilm * L.surfaceArea(jr) * cosR * cosT);
         } else {
+            // The disk genLensRay samples is the planar rear's own clear aperture, which the
+            // trace just checked, so any ray that got through crosses it inside.
             const double Z = L.rearZ() - L.filmZ;
             if (!(Z > 1e-9)) return 0.0;
-            // Where the film ray, run back up, crosses the rear plane: inside the sampled disk?
-            const double tR = Z / cosT;
-            const Vec3 pr = onFilm + dFilm * (-tR);
             const double ra = L.rearAperture();
-            // A sliver of tolerance: a ray the camera itself drew at the disk's rim must not
-            // read back as outside it through rounding.
-            if (pr.x * pr.x + pr.y * pr.y > ra * ra * (1.0 + 1e-9)) return 0.0;
             const double aRear = PI * ra * ra;
             const double c2 = cosT * cosT;
             pdf = Z * Z * cosF * L.frontArea() / (aFilm * aRear * c2 * c2);

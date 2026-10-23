@@ -2423,38 +2423,48 @@ __device__ static bool dLensConnect(const DCamera& cam, const DVec3& p, Real lam
     Yw = e.Y; wdir = e.wdir; dist = e.dist;
     return true;
 }
-// Mode C through the lens (host twin Camera::lensCatch): DLENS_MISSED (flies on),
-// DLENS_CAUGHT (px, py set) or DLENS_ABSORBED (entered, clipped inside). A closest-approach
-// test in Real rejects nearly every flight before any double arithmetic.
+// Mode C through the lens (host twins Camera::lensCatchEntry / lensCatchImage / lensCatch):
+// DLENS_MISSED (flies on), DLENS_CAUGHT (px, py set) or DLENS_ABSORBED (entered, clipped
+// inside). The entry is geometry, once per flight; the image is per wavelength.
 enum { DLENS_MISSED = 0, DLENS_CAUGHT = 1, DLENS_ABSORBED = 2 };
-__device__ static int dLensCatch(const DCamera& cam, const DVec3& ro, const DVec3& rd,
-                                 Real hitDist, Real lambda, int& px, int& py) {
+__device__ static bool dLensCatchEntry(const DCamera& cam, const DVec3& ro, const DVec3& rd,
+                                       Real hitDist, D3& o, D3& d) {
     const DLensSystem& L = cam.lens;
     const double rB = dLensCapRadius(L, 0);
-    {   // cheap reject, world metres: the flight's closest approach to the eye against the
-        // cap's bound, with a margin well above float's rounding at scene scale
+    {   // Cheap reject in Real, world metres: the flight's closest approach to the eye against
+        // the cap's bound. toE - rd*tcw loses a few ulps of |toE| to cancellation, so the
+        // margin grows with the distance (16 ulps of it) on top of 1% of the bound.
         const DVec3 toE = cam.eye - ro;
         const Real tcw = dot(toE, rd);
         const DVec3 cw = toE - rd * tcw;
-        const Real lim = (Real)(rB * 1e-3 * 1.01 + 1e-5);
-        if (dot(cw, cw) > lim * lim) return DLENS_MISSED;
+        const Real lim = (Real)(rB * 1e-3 * 1.01 + 1e-5) + (Real)1e-6 * length(toE);
+        if (dot(cw, cw) > lim * lim) return false;
     }
     const D3 ol = dLensLocalPoint(cam, D3(ro));
-    const D3 dl = normalize(dLensLocalDir(cam, D3(rd)));
-    if (!(dl.z < 0.0)) return DLENS_MISSED;
+    d = normalize(dLensLocalDir(cam, D3(rd)));
+    if (!(d.z < 0.0)) return false;
     const D3 v0(0.0, 0.0, L.surf[0].zpos);
-    const double tc = dot(v0 - ol, dl);
-    const D3 c = ol + dl * tc - v0;
-    if (dot(c, c) > (rB + 1e-6) * (rB + 1e-6)) return DLENS_MISSED;
-    if (tc < -rB) return DLENS_MISSED;
+    const double tc = dot(v0 - ol, d);
+    const D3 c = ol + d * tc - v0;
+    if (dot(c, c) > (rB + 1e-6) * (rB + 1e-6)) return false;
+    if (tc < -rB) return false;
     const double back = rB + 1.0;
-    const D3 o = (tc > back) ? ol + dl * (tc - back) : ol;
+    o = (tc > back) ? ol + d * (tc - back) : ol;
     D3 entry, n;
-    if (!dLensHitSurface(L, 0, o, dl, entry, n)) return DLENS_MISSED;
-    if (!(length(entry - ol) * 1e-3 < (double)hitDist)) return DLENS_MISSED;
+    if (!dLensHitSurface(L, 0, o, d, entry, n)) return false;
+    return length(entry - ol) * 1e-3 < (double)hitDist;
+}
+__device__ static int dLensCatchImage(const DCamera& cam, const D3& o, const D3& d, Real lambda,
+                                      int& px, int& py) {
     D3 onFilm, dFilm;
-    if (!dLensTraceToFilm(L, o, dl, lambda, onFilm, dFilm, nullptr)) return DLENS_ABSORBED;
+    if (!dLensTraceToFilm(cam.lens, o, d, lambda, onFilm, dFilm, nullptr)) return DLENS_ABSORBED;
     return dLensFilmToPixel(cam, onFilm, px, py) ? DLENS_CAUGHT : DLENS_ABSORBED;
+}
+__device__ static int dLensCatch(const DCamera& cam, const DVec3& ro, const DVec3& rd,
+                                 Real hitDist, Real lambda, int& px, int& py) {
+    D3 o, d;
+    if (!dLensCatchEntry(cam, ro, rd, hitDist, o, d)) return DLENS_MISSED;
+    return dLensCatchImage(cam, o, d, lambda, px, py);
 }
 // BDPT's camera direction density at front-element point y for direction dir, times
 // A_front (host twin Camera::lensPdfDir, which derives both rear cases).
@@ -2491,8 +2501,6 @@ __device__ static double dLensPdfDir(const DCamera& cam, const DVec3& y, const D
         const double rearZ = L.surf[jr].zpos, ra = L.surf[jr].aperture;
         const double Z = rearZ - L.filmZ;
         if (!(Z > 1e-9)) return 0.0;
-        const D3 pr = onFilm + dFilm * (-(Z / cosT));
-        if (pr.x * pr.x + pr.y * pr.y > ra * ra * (1.0 + 1e-9)) return 0.0;
         const double aRear = DPI * ra * ra;
         const double c2 = cosT * cosT;
         pdf = Z * Z * cosF * dLensSurfaceArea(L, 0) / (aFilm * aRear * c2 * c2);
@@ -10946,13 +10954,11 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     if (camMode == CAM_C && cs.cams[0].hasLens) {
         const DCamera& cc = cs.cams[0];
         int pxs[hero::kHeroMax], pys[hero::kHeroMax];
-        bool hitL[hero::kHeroMax], entered = false;
-        for (int i = 0; i < nUp; ++i) {
-            const int lc = dLensCatch(cc, ro, rd, dEvent, lam[i], pxs[i], pys[i]);
-            hitL[i] = (lc == DLENS_CAUGHT);
-            entered = entered || lc != DLENS_MISSED;
-        }
-        if (entered) {
+        bool hitL[hero::kHeroMax];
+        D3 lo, ld;
+        if (dLensCatchEntry(cc, ro, rd, dEvent, lo, ld)) {
+            for (int i = 0; i < nUp; ++i)
+                hitL[i] = dLensCatchImage(cc, lo, ld, lam[i], pxs[i], pys[i]) == DLENS_CAUGHT;
             const Real cCell = (Real)dLensCellNorm(cc);
             const bool envSeen = pathC && (pathC->bits & PV_BIT_ENVFIRST);
             DEnvTaps tp;

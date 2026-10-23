@@ -1916,7 +1916,8 @@ else, so they would average its colour fringes into grey. A lens camera nobody
 chose a mode for (no `-mode`, no camera `mode`, no scene `mode`/`default_mode`) renders in
 `R`, since a forward splat cannot image a mirror seen directly through the glass. All of
 these agree on the absolute image scale; `-checklens` checks the forward tracing against
-the backward camera.
+the backward camera, and `python tools/check_physlens.py` renders the same lens scenes in
+`R`, `A`, `B`, `C` and `D` on the CPU and GPU and compares them region by region.
 
 ```ftsl
 camera "real" {

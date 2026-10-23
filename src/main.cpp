@@ -14111,8 +14111,9 @@ static void thinFilmSwatch(double n1, double n2) {
 // would leave a grainy sky over a converged scene. The count grows with the render instead:
 // K = photons per pixel / 4, between 64 and 4096, added to a running sum each time a write
 // asks for more (the wavelengths follow a per-pixel van der Corput sequence, so they stay
-// stratified at any K). The sums are kept for the last camera that asked, since a render adds
-// the sky to every interval write.
+// stratified at any K). The sums are kept for the last four cameras that asked (least
+// recently used evicted), since a render adds the sky to every interval write and a
+// multi-camera render writes its cameras in turn.
 static void addEnvBackgroundLens(Film& film, const Scene& scene, const Camera& cam, long long N) {
     constexpr double kLo = 360.0, kHi = 830.0;
     struct Cache {
@@ -14120,22 +14121,34 @@ static void addEnvBackgroundLens(Film& film, const Scene& scene, const Camera& c
         Vec3 eye, w, u;
         int rx = 0, ry = 0;
         long long K = 0;                 // samples per pixel in `sum`
+        unsigned long long used = 0;     // last use, for eviction
         std::vector<Vec3> sum;
     };
+    constexpr size_t kSlots = 4;
     static std::mutex mtx;
-    static Cache cache;
+    static std::vector<Cache> slots;
+    static unsigned long long clock = 0;
     std::lock_guard<std::mutex> lock(mtx);
     const int rx = film.resX, ry = film.resY;
-    const bool same = cache.lens == cam.lens.get() && cache.rx == rx && cache.ry == ry &&
-                      cache.eye.x == cam.eye.x && cache.eye.y == cam.eye.y && cache.eye.z == cam.eye.z &&
-                      cache.w.x == cam.w.x && cache.w.y == cam.w.y && cache.w.z == cam.w.z &&
-                      cache.u.x == cam.u.x && cache.u.y == cam.u.y && cache.u.z == cam.u.z;
-    if (!same) {
-        cache.lens = cam.lens.get(); cache.rx = rx; cache.ry = ry;
-        cache.eye = cam.eye; cache.w = cam.w; cache.u = cam.u;
-        cache.K = 0;
-        cache.sum.assign((size_t)rx * (size_t)ry, Vec3{0, 0, 0});
+    auto same = [&](const Cache& c) {
+        return c.lens == cam.lens.get() && c.rx == rx && c.ry == ry &&
+               c.eye.x == cam.eye.x && c.eye.y == cam.eye.y && c.eye.z == cam.eye.z &&
+               c.w.x == cam.w.x && c.w.y == cam.w.y && c.w.z == cam.w.z &&
+               c.u.x == cam.u.x && c.u.y == cam.u.y && c.u.z == cam.u.z;
+    };
+    Cache* hit = nullptr;
+    for (Cache& c : slots) if (same(c)) { hit = &c; break; }
+    if (!hit) {
+        if (slots.size() < kSlots) slots.emplace_back();
+        hit = &slots[0];
+        for (Cache& c : slots) if (c.used < hit->used) hit = &c;   // an empty slot has used == 0
+        hit->lens = cam.lens.get(); hit->rx = rx; hit->ry = ry;
+        hit->eye = cam.eye; hit->w = cam.w; hit->u = cam.u;
+        hit->K = 0;
+        hit->sum.assign((size_t)rx * (size_t)ry, Vec3{0, 0, 0});
     }
+    hit->used = ++clock;
+    Cache& cache = *hit;
     const double perPixel = (double)N / ((double)rx * (double)ry);
     const long long want = std::max(64LL, std::min(4096LL, (long long)(perPixel / 4.0)));
     if (cache.K < want) {
@@ -14166,7 +14179,7 @@ static void addEnvBackgroundLens(Film& film, const Scene& scene, const Camera& c
                                                    /*skipCamHidden=*/true);
                     if (h.valid) continue;
                     double L = 0.0;
-                    if (haveEnv) L += scene.envRadiance(r.d, lambda);
+                    if (haveEnv) L += scene.envRadianceSeen(r.d, lambda);   // the bilinear camera view
                     if (haveSun) L += scene.sunRadiance(r.d, lambda);
                     if (!(L > 0.0)) continue;
                     acc += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens * (kHi - kLo));
@@ -14558,11 +14571,10 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
 // Mode D: bidirectional path tracing. Each thread renders a band of rows into its own
 // camera-image film (t>=2 connections, current-pixel) and light-image film (t==1
 // splats to the projected raster position), then all bands are merged. BDPT produces
-// one absolute-radiance image: normalise the camera image by spp (the per-pixel
-// radiance convention shared with the backward reference, mode R) and the light image
-// by the total light-subpath count (W*H*spp), matching mode B's splat convention. The
-// two normalised films sum to the final radiance; writeFilm(...,1.0) then only divides
-// by cieYIntegral for display, exactly like mode P's composite.
+// one absolute-radiance image: the camera image (t>=2) and the light image (t==1) are
+// summed and BOTH normalised by spp, the light image's per-splat weight carrying the
+// whole-film camera importance that makes that the light-tracing scale (cameraWe; through a
+// physical lens, lensW / (W*H)). Below, at the merge, the same in more detail.
 // `beams` (mode J, UPBP) is the view-independent photon-beam cache to merge against; null
 // (mode D) is connections only and leaves every sample bit-identical.
 static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY,
@@ -16337,16 +16349,17 @@ static char lensRoutedMode(const Scene& scene, char mode) {
 // The mode a scene's camera renders in, before lens routing. The run loop and the
 // prefer{}/else{} predicate both ask this, so they cannot disagree. A CLI -mode (`cliMode`,
 // 0 = none) forces every camera; else the camera's own `mode`; else the scene's
-// `default_mode`; else the global `mode`, which a `render { mode }` block sets and which
-// otherwise trails the first camera's. A physical-lens camera that no authored mode reaches
-// (no CLI mode, no camera mode, no default_mode, no `render { mode }`) renders in R: the
-// forward modes image through a lens too, but not a mirror or glass seen directly through it,
-// so for a lens camera they are a choice to make, not a default to fall into.
+// `default_mode`; else the global `mode`, which holds whichever came later in the file of a
+// `render { mode }` block and the first camera's `mode`. A physical-lens camera takes no
+// other camera's mode: past its own and the CLI's, only default_mode or a `render { mode }`
+// choose for it, and with neither it renders in R. The forward modes image through a lens
+// too, but not a mirror or glass seen directly through it, so for a lens camera they are a
+// choice to make, not a default to fall into.
 static char sceneCameraMode(const ftsl::Loaded& L, char camMode, bool lens, char cliMode) {
     if (cliMode) return cliMode;
     if (camMode) return camMode;
-    if (lens && !L.modeSet && !L.defaultMode) return 'R';
     if (L.defaultMode) return L.defaultMode;
+    if (lens) return L.renderMode ? L.renderMode : 'R';
     return L.mode ? L.mode : 'B';
 }
 
@@ -20740,7 +20753,7 @@ static int run(int argc, char** argv) {
         // A scene-level `default_mode` is the authoritative fallback for cameras that don't
         // author their own `mode`. It takes precedence over the incidental global `mode`
         // above (which just trails the last camera/render block), but a per-camera `mode`
-        // (via effMode) and a CLI -mode still override it.
+        // (sceneCameraMode) and a CLI -mode still override it.
         if (ftslScene.defaultMode)        mode = ftslScene.defaultMode;
         if (!ftslScene.device.empty())    device = ftslScene.device.c_str();
         if (!ftslScene.out.empty())       out = ftslScene.out.c_str();
@@ -22244,12 +22257,8 @@ static int run(int argc, char** argv) {
     // them globally). All cameras share the single already-built scene.
     // -light names a built-in scene's light; an FTSL scene brings its own.
     const char* lightLabel = fromFtsl ? "scene" : (prism || grating) ? "beam" : lightName;
-    auto effMode = [&](char camMode) -> char {
-        if (modeFromCli) return mode;         // CLI -mode forces every camera
-        return camMode ? camMode : mode;      // else per-camera, else the global default
-    };
     // A scene camera's mode (sceneCameraMode, shared with the prefer{}/else{} predicate).
-    const bool modeAuthored = modeFromCli || ftslScene.modeSet || ftslScene.defaultMode;
+    const bool modeAuthored = modeFromCli || ftslScene.renderMode || ftslScene.defaultMode;
     auto effModeCam = [&](const ftsl::CamSpec& cs) -> char {
         return sceneCameraMode(ftslScene, cs.mode, cs.lens != nullptr, modeFromCli ? mode : 0);
     };

@@ -3861,13 +3861,11 @@ struct Renderer {
                 // that enters ends there, as the scalar tracer's does; one that misses flies on.
                 const Camera& cc = *cams[0].cam;
                 int pxs[hero::kHeroMax], pys[hero::kHeroMax];
-                bool entered = false, hit[hero::kHeroMax] = {};
-                for (int i = 0; i < nUp; ++i) {
-                    const int lc = cc.lensCatch(ray, dEvent, lam[i], pxs[i], pys[i]);
-                    hit[i] = (lc == Camera::LENS_CAUGHT);
-                    entered = entered || lc != Camera::LENS_MISSED;
-                }
-                if (entered) {
+                bool hit[hero::kHeroMax] = {};
+                Vec3 lo, ld;
+                if (cc.lensCatchEntry(ray, dEvent, lo, ld)) {
+                    for (int i = 0; i < nUp; ++i)
+                        hit[i] = cc.lensCatchImage(lo, ld, lam[i], pxs[i], pys[i]) == Camera::LENS_CAUGHT;
                     const double cCell = cc.lensCellNorm();
                     const bool envSeen = (bounce == 0 && envBorn);
                     EnvMap::Taps tp{};

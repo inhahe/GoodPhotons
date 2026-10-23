@@ -6458,8 +6458,14 @@ as the one at fault.
     on a planar-rear achromat and a curved-rear singlet: the density integrates to the
     unvignetted share of genLensRay's samples, every camera ray reads back with a nonzero
     density, and the connection and the catch agree on a point source's flux and image position
-    at 2 m and at 5 km. A lens camera nobody chose a mode for renders in R (`sceneCameraMode`,
-    shared by the run and the prefer{}/else{} predicate). Modes M, S
+    at 2 m and at 5 km. `tools/check_physlens.py` is the end-to-end gate on top: realcam's
+    achromat and a curved-rear singlet in R, A, B and D, a visible sky in A, and a uniform panel
+    in C, CPU and GPU, region means against R within 1% (3% for the catch) -- what a
+    normalisation slip in one estimator, or a mis-transcribed device twin, would break (a light
+    image 10% too bright moves D by only 1-2.6%, MIS giving it part of each pixel, hence the
+    tight bound; a correct build stays within 0.5%). A lens camera nobody chose a mode
+    for renders in R (`sceneCameraMode`, shared by the run and the prefer{}/else{} predicate;
+    only default_mode or a `render { mode }` choose for it, never another camera). Modes M, S
     and U keep routing a lens camera to R: their gathers and merges sum photons of every
     wavelength at the point one camera ray found, which a dispersive lens moves per wavelength,
     so they would average its colour fringes away; wavelength-matched gathering would fix it at
