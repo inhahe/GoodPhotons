@@ -696,13 +696,15 @@ texture "tex_marble_compote"  { file textures/marble_compote.png  encoding srgb 
 #     (a glTF baseColor atlas), so the stone under her must not compete with the only texture
 #     in the frame. s=0.80 keeps the vein a vein.
 texture "tex_marble_alice"    { file textures/marble_alice.png    encoding srgb  filter bilinear  wrap clamp }
-# The FOURTEENTH cap, under the GNOME: `marble texture 6.jpg`'s right half turned 90 degrees
-# (the axicon takes #6 whole). Calmed to Alice's k=0.70 / s=0.80 for Alice's reason: the
-# gnome is the second painted figure, and its red hat and blue jeans are paint, not physics.
+# The FOURTEENTH cap, under the GNOME: a square from `marble texture 6.jpg`'s right half (its
+# upper three quarters), turned 90 degrees; the axicon takes #6 whole. Calmed to Alice's
+# k=0.70 / s=0.80 for Alice's reason: the gnome is the second painted figure, and its red hat
+# and blue jeans are paint, not physics.
 texture "tex_marble_gnome"    { file textures/marble_gnome.png    encoding srgb  filter bilinear  wrap clamp }
-# The FIFTEENTH, under the 3-D JULIA: `marble texture 3.jpg`'s lower half turned 90 degrees
-# (the diamond gyroid's cap takes #3 whole). Full contrast and colour: the Julia is opaque and
-# throws no caustic, and #3's rust veins rhyme with its rose glaze.
+# The FIFTEENTH, under the 3-D JULIA: the square that is `marble texture 3.jpg`'s lower two
+# thirds, turned 90 degrees; the diamond gyroid's cap takes #3 whole. Full contrast and
+# colour: the Julia is opaque and throws no caustic, and #3's rust veins rhyme with its rose
+# glaze.
 texture "tex_marble_julia"    { file textures/marble_julia.png    encoding srgb  filter bilinear  wrap clamp }
 
 # `wrap clamp` (not `repeat`) with `uv planar axis=y` on each cap isosurface maps ONE slab
@@ -2526,23 +2528,23 @@ mesh "julia3d" { file "d:/youtube/philosophy/3d objects/3djulia/3djulia hyper3d 
 # --- THE GNOME (far-left court, on stand_gnome; NOT settled — analytic rest) -----------------
 # "Gnome Chomsky", a Meshy reconstruction of the garden gnome in d:/youtube/philosophy/images/
 # gnome chomsky*.jpg, painted from its own glTF atlas like Alice. The source photographs are
-# ~250 x 440 px, so the 43 MB original carries far more than they hold: it is decimated to 62 k
-# faces, the fewest tried at which no original vertex is more than half a source pixel from the
-# result (worst 0.45 px), and its colour atlas goes from 8192^2 to 1024^2 (the metal-roughness
-# map from 4096^2), still more than one texel per photograph pixel everywhere on the figure
-# (`tools/downscale_glb.py`).
+# ~250 x 440 px, so the 43 MB original carries far more than they hold: it is decimated to 56 k
+# faces, the fewest at which 99.9% of the original's vertices lie within a quarter of a source
+# pixel of the result (one of its 183,700 is 0.66 px off at every face count tried), and its
+# colour atlas goes from 8192^2 to 1024^2 (the metal-roughness map from 4096^2), still more
+# than one texel per photograph pixel everywhere on the figure (`tools/downscale_glb.py`).
 #
-# 0.70 m tall on its own lettered base (scale 0.70 / 1.900). The base is flat: the convex
-# hull facet it stands on is 0.57 deg off level with the centre of mass well inside it
-# (`scraps/meshes/rest_pose.py`), so `rotate 0.567` about x sets that facet level and the
+# 0.70 m tall on its own lettered base (scale 0.70 / 1.899). The base is flat: the convex
+# hull facet it stands on is 0.48 deg off level with the centre of mass well inside it
+# (`scraps/meshes/rest_pose.py`), so `rotate 0.481` about x sets that facet level and the
 # translate puts it on the cap top. The y turn, 28.3 deg, faces the still camera square.
 #
 # `gnome_unpainted` is the fallback FTSL requires on every mesh, flat grey for Alice's
 # reason: a texture-import regression should show as a grey statue, not ship quietly.
 material "gnome_unpainted" { type diffuse  reflect 0.5 }
-mesh "gnome" { file "d:/youtube/philosophy/3d objects/Meshy_AI_Garden_Gnome_Scholar_0715074653_texture_62k_tex1k.glb"
+mesh "gnome" { file "d:/youtube/philosophy/3d objects/Meshy_AI_Garden_Gnome_Scholar_0715074653_texture_56k_tex1k.glb"
     material gnome_unpainted
-    translate 0.15 1.64981 0.35   rotate 0.567 28.32 0   scale 0.368479 }
+    translate 0.15 1.64993 0.35   rotate 0.481 28.32 0   scale 0.368612 }
 
 # ==============================  LIGHTING  ====================================
 # TWO lights now that the roof is gone (the xenon short-arc lamp that used to hang here was

@@ -129,14 +129,16 @@ CAPS = [
     ('marble_alice',   'marble texture 7.jpg',    'stand_alice_cap',   (1/3, 2/3, 2/3, 1),  0.70, 0.80, 270),
     # The GNOME is the hall's second painted figure (red hat, beige coat, blue jeans), so its
     # cap is calmed exactly as Alice's is. #6 is the flattest, most neutral stone in the set,
-    # which is what a painted subject wants under it; the axicon takes #6 whole, so this is its
-    # right half turned 90 degrees, the stone at twice the magnification and at another angle.
-    ('marble_gnome',   'marble texture 6.jpg',    'stand_gnome_cap',   (0.5, 0, 1, 1),      0.70, 0.80, 90),
+    # which is what a painted subject wants under it; the axicon takes #6 whole, so this is the
+    # upper three quarters of its right half -- a SQUARE, 800 px, for a square cap -- turned 90
+    # degrees: the stone at twice the magnification and at another angle.
+    ('marble_gnome',   'marble texture 6.jpg',    'stand_gnome_cap',   (0.5, 0, 1, 0.75),   0.70, 0.80, 90),
     # The 3-D JULIA is opaque (a rose glaze under a clear coat) and throws no caustic, so its
     # cap is free: full drama. #3's rust-and-rose veining rhymes with the glaze. The diamond
-    # gyroid's cap takes #3 whole and calmed, so this is #3's lower half turned 90 degrees, at
-    # full contrast and colour, which makes it a different-looking slab of the same block.
-    ('marble_julia',   'marble texture 3.jpg',    'stand_julia_cap',   (0, 0.5, 1, 1),      1.00, 1.00, 90),
+    # gyroid's cap takes #3 whole and calmed, so this is #3's lower two thirds (a 408 px square,
+    # for a square cap) turned 90 degrees, at full contrast and colour, which makes it a
+    # different-looking slab of the same block.
+    ('marble_julia',   'marble texture 3.jpg',    'stand_julia_cap',   (0, 1/3, 1, 1),      1.00, 1.00, 90),
 ]
 
 
@@ -204,6 +206,7 @@ def main():
     print(f'target mean LINEAR reflectance {TARGET_ALBEDO} (= capwhite), max dim {MAXDIM}\n')
     print(f'{"texture":18s} {"source":24s} {"size":11s} {"srcmean":>7s} '
           f'{"p2":>6s} {"p98":>6s} {"swing":>6s}  cap')
+    written = 0
     for name, src, cap, crop, k, s, *rot in CAPS:
         r = build(name, src, crop, k, s, report, rot[0] if rot else 0)
         if r is None:
@@ -214,9 +217,17 @@ def main():
               f'{st["swing"]:6.2f}  {cap}')
         if enc is not None:
             dst = os.path.join(OUT_DIR, name + '.png')
+            # Rewrite only a slab whose pixels changed: re-encoding an identical image still
+            # changes the file's bytes (the PNG encoder differs between Pillow versions), which
+            # would put every unchanged cap in the diff.
+            if os.path.exists(dst):
+                with Image.open(dst) as old:
+                    if old.size == enc.size and old.convert('RGB').tobytes() == enc.tobytes():
+                        continue
             enc.save(dst)
+            written += 1
     if not report:
-        print(f'\nwrote {len(CAPS)} textures to textures/')
+        print(f'\nwrote {written} of {len(CAPS)} textures to textures/ (the rest were unchanged)')
 
 
 if __name__ == '__main__':

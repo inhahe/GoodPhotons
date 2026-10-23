@@ -2665,6 +2665,24 @@ import `r_t = min(1, r² / 0.646)` (1.55 r²), applied to the constant and to th
 per texel, validated against a GGX reference at a few r. It changes the look of every glTF, so it
 waits for its own A/B rather than riding along with another change.
 
+## OPEN (2026-10-23): GLTF-MAP-MEAN-GUTTERS — the importer's mean metalness and roughness count the atlas gutters
+
+Found by the review of `tools/downscale_glb.py`. `src/gltf.h` (the `TexRole::Metalness` and
+`TexRole::Roughness` branches, ~620-670) averages the metal-roughness map over **every texel**
+to get the mean metalness, which types the material (and feeds the `-import-metal` hint's
+`metalFrac`/`murkyFrac`), and the mean roughness, which becomes the material's constant
+roughness. A texture atlas is not all surface: the gnome's UV charts cover 68% of its map, and
+the other 32% (gutters and background) is never sampled by any hit, yet weighs a third of
+both means. The gnome is harmless (metalness 0.0107 over all texels against 0.0074 over the
+charts, roughness 0.688 against 0.691), but an atlas with black (metal 0, rough 0) or
+default-filled gutters can be typed on the wrong side of 0.5 or get a constant roughness that
+none of its surface has. A tool that pads gutters (downscale_glb does, so its resize cannot
+bleed them into chart edges) also moves the means. That tool prints the importer's two numbers
+for source and result so a shift is visible. **Proper fix:** weight the means by UV coverage.
+Rasterise the mesh's UV triangles over the map at import (the loader has the UVs) and average
+over covered texels only, or weight each texel by the surface area mapped onto it. This changes
+the import of every textured glTF with gutters, Alice's included, so it needs its own A/B.
+
 ## DONE (2026-09-28, 0.371.0): GLTF-LAYERED-DEFAULT — `layered` was never the glTF import (0.317.0–0.367.2), then rendered the Alice2 GLB a third darker; explained, fixed, and the default again
 
 **History.** 0.317.0 documented `-import-specular layered` as the default, but a `bool wantCoat`

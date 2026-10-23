@@ -3154,11 +3154,17 @@ and prints how far the result strays from the original in source pixels: the wor
 and added, the share of the original's vertices more than half a pixel off, and the 99.9th
 percentile. Then pick the fewest faces that keep every original vertex within half a pixel (the
 docstring gives the relaxed rule for a mesh with a lone outlier), and
-`--out OUT.glb --faces N [--tex 1024]` writes the result: quadric edge collapse (texture-aware
-while the mesh keeps its texture), with the textures padded past their UV charts and resized by
-Lanczos-3, the sRGB base colour in linear light. Use `--no-texture` to drop the textures and weld
-the UV seams first. The source file is never written. It needs `pymeshlab`
-(`pip install pymeshlab`).
+`--out OUT.glb --faces N [--tex 1024] [--crease 60]` writes the result. The vertices split
+along UV seams are welded first, so the seams simplify like the rest of the surface, and the
+collapse is texture-aware while the mesh keeps its texture. Normals are recomputed per corner,
+smooth except across edges sharper than `--crease` degrees. Every map and factor of the
+material is carried: each map is padded past the original's UV charts and resized by Lanczos-3
+so its longer side is `--tex` (never enlarged), colour maps in linear light. The tool also prints
+the mean metalness and roughness ftrace's importer will derive, for source and result. A source
+with several materials, or maps it cannot carry, is refused rather than slimmed lossily; use
+`--no-texture` to drop the material and keep only the geometry. `--out` may not name the source,
+which is never written. It needs numpy, pillow, pymeshlab, pygltflib, scipy, opencv-python and
+trimesh (`pip install pymeshlab pygltflib scipy opencv-python trimesh`).
 
 **Per-vertex colour** is imported from every format that carries it — PLY's
 `red`/`green`/`blue` (or `diffuse_red`/…), OBJ's extended `v x y z r g b`, glTF's

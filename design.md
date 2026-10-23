@@ -1450,10 +1450,12 @@ last plot in the still's frame that neither screens nor is screened by another p
 heavier than their source images can justify, so both are first slimmed by
 `tools/downscale_glb.py` (REFERENCE.md has its usage). It sweeps quadric-edge-collapse face
 counts and measures each one's departure from the original in *source-image pixels*, then takes
-the fewest faces that lose nothing the image could show. Textures are padded past their UV charts
-and Lanczos-resized in linear light. The slimmed files are written beside the originals, outside
-the repo, and the scene names them by absolute path.
-- **The gnome** (Meshy, textured): 43 MB → 4.3 MB, 62 k faces and a 1024² atlas from 8192². It is
+the fewest faces that lose nothing the image could show. It welds the vertices glTF splits along
+UV seams before decimating; otherwise MeshLab treats every seam as an open boundary and keeps
+it vertex for vertex. Normals are recomputed per corner with a crease angle. Every map is padded
+past the original's UV charts and Lanczos-resized in linear light. The slimmed files are written
+beside the originals, outside the repo, and the scene names them by absolute path.
+- **The gnome** (Meshy, textured): 43 MB → 4.3 MB, 56 k faces and a 1024² atlas from 8192². It is
   painted from its own glTF materials, as Alice is.
 - **The Julia** (Hyper3D, untextured): 2 M → 850 k faces, worn as a fitted material (a rose
   diffuse body under a Fresnel clear coat, `layered`), because the source image is one glazed
