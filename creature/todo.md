@@ -120,6 +120,10 @@ The creature layer is a *generator*; it never becomes part of a runtime.
         acting as a transient damper. See known-issues → armature, DONE.)
 - [ ] Decide: does FTSL itself need to change, or does the creature layer only ever
       *emit* it? (Current answer: emit only. Keep ftrace static and bit-reproducible.)
+      *(2026-10-22: the renderer's planned motion blur — `../ROADMAP.md` item 11 — adds
+      per-frame motion samples to FTSL: static data loaded with the frame, not simulation state,
+      so this answer stands. What changes is what the emitter writes: the pose at shutter-open
+      and shutter-close, not one pose.)*
 
 ### Why not just write MJCF by hand?
 Because MJCF has no symbolic morphology. `femur_len` must be **one named parameter** that

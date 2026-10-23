@@ -571,3 +571,88 @@ added).
 **Status.** Confirmed `scenes/showcase.ftsl` already has the closed front wall
 (`front (behind camera)`) and front fill light. Re-rendering with the live window to
 confirm the gold reads correctly head-on.
+
+---
+
+# User requests — 2026-10-22
+
+Captured from a planning conversation that began "how do studios animate?" and ended with "we
+should start thinking about adding animation to our renderer". Status: **PLANNED** — nothing
+built yet.
+
+## (11) Animation in the renderer: time samples, motion blur, motion vectors, temporal denoising — PLANNED
+
+**What already animates** (so this is not "add animation" from scratch):
+
+- **Camera**: `camera_path` (linear keyframes), `camera_orbit`, `camera_curve` (a Catmull-Rom path
+  whose `density` sets speed), with per-channel `<name>_at <t> <value>` tracks for fov, focus,
+  f-stop and orientation (FTSL.md). The `_at` tracks are **piecewise-linear**, so speed jumps at
+  every key.
+- **Moving geometry**: loom emits **one `.ftsl` per frame** — the RenderMan-RIB pattern studios
+  used for decades — with transforms, materials and fields driven by its signals;
+  `tools/obj_sequence_to_video.py` renders baked OBJ sequences; `-anim`/`-loom` scrub a drive live.
+- **Cross-frame reuse for camera-only motion**: mode M/J flybys build one photon map, or share
+  one light side, across all of a flyby's frames.
+- **Denoising**: `-denoise` (edge-aware à-trous chroma filter, SVGF-style but spatial only) and
+  `-oidn` (Intel OIDN 2.5.1 with albedo/normal guides). Both work **one frame at a time**, so
+  residual noise flickers in an animation.
+
+**What is missing**, in the order it should be built — each step needs the one before it:
+
+1. **Motion samples in the scene description.** Today nothing in a frame's scene says where an
+   object was a moment earlier, and motion blur and motion vectors both need exactly that. Let a
+   frame's FTSL carry **N samples across the shutter interval** — at least shutter-open and
+   shutter-close — for group transforms, cameras, lights and mesh/curve vertex positions. This
+   keeps ftrace's load-time baking and bit-reproducibility: the samples are static data loaded
+   with the frame, not simulation state flowing through the renderer, so the creature layer stays
+   "emit only" (creature/todo.md P0) and frames stay independently renderable. Loom emits the
+   extra sample(s) per frame. Whole-shot time-sampled curves in FTSL (USD-style, one file per
+   shot) are a later option, worth it only if per-frame emission becomes a bottleneck.
+2. **Real keyframe curves for the `_at` tracks** — and for any new animated channel. Each key: time,
+   value, in/out tangents, and an interpolation type: step, linear, auto/spline, clamped (no
+   overshoot past neighbouring keys), flat (ease in/out), broken (different in and out slopes).
+   Between keys a cubic Bézier in the (time, value) plane, evaluated by solving its time cubic for
+   the curve parameter (tangent handles constrained so time stays monotonic). Extrapolation before
+   the first and after the last key: constant, linear, cycle, cycle-with-offset, oscillate.
+   Rotations need an Euler filter, or quaternion tracks, or they flip at ±180°. Independent of 1,
+   and can land in parallel. Grammar goes in FTSL.md when built.
+3. **Motion blur.** Each light/camera path gets **one time** in the shutter interval, shared by all
+   its vertices and by its camera connection; time becomes one more dimension of the sampler,
+   beside wavelength. Geometry moves linearly per primitive between its motion samples, and the
+   BVH bounds each primitive's swept box — the standard approach, and the one that fits load-time
+   baking. Meshes, curves (fur) and spheres first; isosurfaces and volumes later. Exposure versus
+   blur: film `shutter` today is an exposure multiplier, and physically the exposure time *is* the
+   blur interval, but blur must be **opt-in** (e.g. a camera `shutter_open`/`shutter_close` as
+   fractions of a frame) so every existing scene that sets `shutter` for exposure renders
+   bit-identically. **Cross-frame reuse breaks with moving geometry**: the mode M/J shared light
+   side is valid only while nothing moves, so the shared route must refuse (or rebuild per frame)
+   when a scene carries motion samples, and light paths must carry their time into the maps.
+   CPU and GPU together, as every other feature.
+4. **Motion vectors and depth** as outputs of the guide pass `-oidn` already traces (albedo,
+   normal). Velocity from the shutter samples, scaled to a frame interval, is the standard
+   approximation; exact vectors need the neighbouring frames' positions. Every temporal denoiser
+   needs them, so this gates step 5.
+5. **Temporal denoising.**
+   - **OptiX's temporal denoiser** — available now, NVIDIA-only (fine on the 4090): needs the flow
+     image and the previous denoised frame; needs only OptiX's headers, the runtime ships with the
+     driver.
+   - **OIDN 3** — kernel-prediction temporal model with a real-time mode (previous denoised frame,
+     backward motion vectors, depth) and a final-quality mode (adds future frames and forward
+     motion vectors); scheduled for the second half of 2026 and not released as of 2026-10-22. It
+     would drop into the existing `-oidn` path.
+   - **Make `-denoise` temporal**: SVGF's own temporal half (reprojecting accumulated history
+     through the motion vectors) is the part our spatial-only chroma filter lacks, and it would tame
+     the frame-to-frame chroma flicker of single-wavelength samples that RGB-trained denoisers
+     treat as detail.
+   RenderMan's denoiser (Disney Research's kernel-predicting network, which reads two frames either
+   side) is closed and its weights proprietary; the published architecture is reproducible, but
+   its training data — terabytes of production frames — is the asset, so it is not a realistic
+   target to copy.
+
+**Later, for animated characters** (ties to creature/todo.md P7 and P13): subdivision surfaces with
+render-time displacement; **wrinkle maps** — displacement or normal maps faded in by the same
+weights that drive blendshapes; and native blendshapes in FTSL, whose weighted sum can be
+evaluated exactly at any time in the shutter, making them the easiest deforming motion blur.
+
+**Start order:** 1 and 2 in parallel → 3 → 4 → 5 (OptiX first; OIDN 3 when it ships; temporal
+`-denoise` alongside).
