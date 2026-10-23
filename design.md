@@ -6448,7 +6448,11 @@ as the one at fault.
     direction's float arithmetic is unchanged. `-checklens` pins the three: the density
     integrates to the unvignetted share of genLensRay's samples, every camera ray reads back
     with a nonzero density, and the connection and the catch agree on a point source's flux
-    and image position. A lens camera with no authored mode still renders in R.
+    and image position. A lens camera with no authored mode still renders in R. Modes M, S
+    and U keep routing a lens camera to R: their gathers and merges sum photons of every
+    wavelength at the point one camera ray found, which a dispersive lens moves per wavelength,
+    so they would average its colour fringes away; wavelength-matched gathering would fix it at
+    the cost of most of their efficiency.
 - **`bvh.h` sphere queries** — `Aabb::dist2To` (exact point-to-box squared distance) and
   `Bvh::traverseSphere(c, r, leafFn)`, an unordered no-early-exit traversal reporting every
   primitive in a node box meeting the ball. Built for M-GATHERAREA's geometric footprint: the

@@ -16164,7 +16164,10 @@ static bool modeRendersGrin(char mode) { return mode != 'D' && mode != 'J' && mo
 // trace light INTO the lens: A and B splat each vertex through it (Camera::lensConnect), C
 // catches what flies through it (Camera::lensCatch). V compares the forward splat with R
 // through the same glass. The run loop routes every other mode to one of those
-// (lensRoutedMode).
+// (lensRoutedMode). M, S and U stay routed: their gathers and merges sum photons of every
+// wavelength at the point a single-wavelength camera ray found, exact only while that point
+// is wavelength-independent; a dispersive lens moves it per wavelength, so they would average
+// its colour fringes away.
 static bool modeFormsLensImage(char mode) {
     return mode == 'R' || mode == 'D' || mode == 'J' || mode == 'A' || mode == 'B' || mode == 'C' ||
            mode == 'V';

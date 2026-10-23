@@ -1909,7 +1909,10 @@ every element onto the sensor (Hanika & Dachsbacher 2014, "Efficient Monte Carlo
 with realistic lenses"). So a physical lens renders in mode `R` (backward), in the forward
 modes `A`, `B` (both splat through the lens) and `C` (catches what flies through it), in
 mode `D` and `J` (camera rays out through it, the light image into it), and in `V`; mode
-`P` routes to `D` or `R`, and modes `M`, `S`, `U` render it in `R`. A lens camera nobody
+`P` routes to `D` or `R`, and modes `M`, `S`, `U` render it in `R`: their photon gathers sum
+light of every wavelength at the point one camera ray found, which is exact only while that
+point is the same for every wavelength, and a dispersive lens puts each wavelength somewhere
+else, so they would average its colour fringes into grey. A lens camera nobody
 chose a mode for (no `-mode`, no camera `mode`, no scene `mode`/`default_mode`) renders in
 `R`, since a forward splat cannot image a mirror seen directly through the glass. All of
 these agree on the absolute image scale; `-checklens` checks the forward tracing against
