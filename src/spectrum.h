@@ -254,8 +254,11 @@ inline Spectrum tabulatedSpectrumMono(std::vector<std::pair<double, double>> pai
 // also when shared or scaled (SharedSpectrum, ScaledSpectrum); a monotone-cubic table
 // (TabulatedMono) is split into kMonoSub linear pieces per interval. False for anything else --
 // a constant, an analytic curve (smooth on the grid's scale), a lambda nobody can see into -- and
-// the caller keeps its grid. `x` comes back ascending, `y` the matching values.
-inline bool spectrumKnots(const Spectrum& s, std::vector<double>& x, std::vector<double>& y) {
+// the caller keeps its grid. `x` comes back ascending, `y` the matching values. `id`, when given,
+// receives the table's own address and `scale` the factor folded into `y`: two spectra with the
+// same pair have the same knots, so a consumer can store them once.
+inline bool spectrumKnots(const Spectrum& s, std::vector<double>& x, std::vector<double>& y,
+                          const void** id = nullptr, double* scale = nullptr) {
     constexpr int kMonoSub = 16;
     x.clear(); y.clear();
     double k = 1.0;
@@ -266,9 +269,12 @@ inline bool spectrumKnots(const Spectrum& s, std::vector<double>& x, std::vector
         break;
     }
     if (!cur || !*cur) return false;
+    if (id) *id = nullptr;
+    if (scale) *scale = k;
     if (const TabulatedLinear* t = cur->target<TabulatedLinear>()) {
         if (t->pairs.size() < 2) return false;
         for (const auto& p : t->pairs) { x.push_back(p.first); y.push_back(p.second * k); }
+        if (id) *id = t;
         return true;
     }
     if (const TabulatedMono* t = cur->target<TabulatedMono>()) {
@@ -280,6 +286,7 @@ inline bool spectrumKnots(const Spectrum& s, std::vector<double>& x, std::vector
                 x.push_back(w); y.push_back((*t)(w) * k);
             }
         x.push_back(t->x[n - 1]); y.push_back(t->y[n - 1] * k);
+        if (id) *id = t;
         return true;
     }
     return false;

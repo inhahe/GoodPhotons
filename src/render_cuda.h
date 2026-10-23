@@ -349,6 +349,8 @@ void cudaReleaseScene(CudaSceneHold* held);
 // Whether `held` is a copy of `scene` as it is now: the same object, the same load
 // (Scene::generation) and the same build (Scene::buildCount). False for null.
 bool cudaSceneHoldFits(const CudaSceneHold* held, const Scene& scene);
+// The device memory `held` occupies (0 for null): this process's own, for the VRAM preflight.
+size_t cudaSceneHoldBytes(const CudaSceneHold* held);
 
 // Whether renderBdptCuda traces and grids mode J's surface photon map on the device itself (the
 // default; -jhostlight or FTRACE_JDEVLIGHT=0 keep it on the host). Then it reads only the host

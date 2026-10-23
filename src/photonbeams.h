@@ -751,6 +751,13 @@ struct BeamMap {
                radMed.capacity() * sizeof(float) + mis.capacity() * sizeof(BeamMis) +
                misIdx.capacity() * sizeof(int);
     }
+    // Bytes the containers above actually use (their size), what heapBytes comes to once trimmed.
+    size_t usedBytes() const {
+        return beams.size() * sizeof(PhotonBeam) + cie.size() * sizeof(Vec3) +
+               bvh.nodes.size() * sizeof(BvhNode) + bvh.primIdx.size() * sizeof(int) +
+               radMed.size() * sizeof(float) + mis.size() * sizeof(BeamMis) +
+               misIdx.size() * sizeof(int);
+    }
     // Release the containers' spare capacity: a map kept for long (a batch's realizations) need
     // hold only what it uses, and the split's growth leaves the beam array ~2x oversized.
     void shrinkToFit() {

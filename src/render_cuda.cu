@@ -49,6 +49,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <map>                   // DUpload::knots
 #include <chrono>
 #include <thread>                // gpuSppChunks' stall watchdog
 #include <atomic>
@@ -432,7 +433,7 @@ struct DSpec {
     double tab[SPEC_N];                      // the grid, always filled
     const float*          kx = nullptr;      // knot wavelengths, ascending; null: read the grid
     const double*         ky = nullptr;      // knot values
-    const unsigned short* kb = nullptr;      // per nm from DLMIN: the last knot at or below it
+    const unsigned int*   kb = nullptr;      // per nm from DLMIN: the last knot at or below it
     int                   kn = 0;            // knot count (>= 2), 0 without knots
 };
 
@@ -2092,8 +2093,10 @@ __device__ static Real specLookup(const double* tab, Real lambda) {
     int i = (int)f; Real frac = f - i;
     return (Real)tab[i] * ((Real)1 - frac) + (Real)tab[i + 1] * frac;
 }
-// A DSpec: its knots when it has them (the bucket finds the interval in a step or two), else its
-// grid. Clamps outside the knots as the host's tables do.
+// A DSpec: its knots when it has them, else its grid. The interval holding lambda lies between the
+// buckets of its nm and the next, found there by bisection (log2 of the knots per nm: 0 for a
+// table coarser than 1 nm, 4 for a cubic one at 1 nm). Clamps outside the knots as the host's
+// tables do.
 __device__ static Real specLookup(const DSpec& s, Real lambda) {
     if (s.kn <= 0) return specLookup(s.tab, lambda);
     const int n = s.kn;
@@ -2101,8 +2104,12 @@ __device__ static Real specLookup(const DSpec& s, Real lambda) {
     if (lambda >= (Real)s.kx[n - 1]) return (Real)s.ky[n - 1];
     int b = (int)(lambda - (Real)DLMIN);
     b = b < 0 ? 0 : (b >= DSPEC_KB ? DSPEC_KB - 1 : b);
-    int k = s.kb[b];
-    while (k + 2 < n && (Real)s.kx[k + 1] <= lambda) ++k;
+    int k = (int)s.kb[b];                                    // kx[k] <= lambda
+    int hi = (b + 1 < DSPEC_KB) ? (int)s.kb[b + 1] : n - 2;  // the last knot at or below lambda
+    while (k < hi) {
+        const int mid = (k + hi + 1) >> 1;
+        if ((Real)s.kx[mid] <= lambda) k = mid; else hi = mid - 1;
+    }
     const Real x0 = (Real)s.kx[k], x1 = (Real)s.kx[k + 1];
     const Real f = (x1 > x0) ? (lambda - x0) / (x1 - x0) : (Real)0;
     return (Real)s.ky[k] + ((Real)s.ky[k + 1] - (Real)s.ky[k]) * f;
@@ -20290,6 +20297,10 @@ struct DUpload {
     gpu::DScene  sc{};
     gpu::DCamera dc{};
     std::vector<void*> frees;
+    // Knot arrays already uploaded, by (table, scale) (bakeSpec): a table that many materials or
+    // emitters share goes up once.
+    struct Knots { const float* kx; const double* ky; const unsigned int* kb; int kn; };
+    std::map<std::pair<const void*, double>, Knots> knots;
     // Record a device allocation for later freeUpload(); returns it for chaining.
     void* keep(void* p) { if (p) frees.push_back(p); return p; }
 };
@@ -20306,22 +20317,33 @@ static void bakeSpec(const Spectrum& s, gpu::DSpec& d, DUpload& up) {
     bakeSpec(s, d.tab);
     d.kx = nullptr; d.ky = nullptr; d.kb = nullptr; d.kn = 0;
     std::vector<double> x, y;
-    if (!s || !spectrumKnots(s, x, y)) return;
+    const void* id = nullptr;
+    double scale = 1.0;
+    if (!s || !spectrumKnots(s, x, y, &id, &scale)) return;
     const int n = (int)x.size();
-    if (n < 2 || n > 65535) return;               // the buckets index knots in 16 bits
+    if (n < 2) return;
+    const auto key = std::make_pair(id, scale);
+    if (id) {
+        const auto it = up.knots.find(key);
+        if (it != up.knots.end()) {
+            d.kx = it->second.kx; d.ky = it->second.ky; d.kb = it->second.kb; d.kn = it->second.kn;
+            return;
+        }
+    }
     std::vector<float> kx((size_t)n);
     for (int i = 0; i < n; ++i) kx[(size_t)i] = (float)x[(size_t)i];
-    std::vector<unsigned short> kb((size_t)gpu::DSPEC_KB);
+    std::vector<unsigned int> kb((size_t)gpu::DSPEC_KB);
     int k = 0;
     for (int b = 0; b < gpu::DSPEC_KB; ++b) {     // the last knot at or below DLMIN + b
         const double w = DLMIN + (double)b;
         while (k + 1 < n && x[(size_t)k + 1] <= w) ++k;
-        kb[(size_t)b] = (unsigned short)std::min(k, n - 2);
+        kb[(size_t)b] = (unsigned int)std::min(k, n - 2);
     }
     d.kx = (const float*)up.keep(uploadVec(kx));
     d.ky = (const double*)up.keep(uploadVec(y));
-    d.kb = (const unsigned short*)up.keep(uploadVec(kb));
+    d.kb = (const unsigned int*)up.keep(uploadVec(kb));
     d.kn = n;
+    if (id) up.knots.emplace(key, DUpload::Knots{d.kx, d.ky, d.kb, d.kn});
 }
 
 // Bake the std::function Scene into POD device tables and upload them (camera-
@@ -21458,8 +21480,10 @@ struct CudaSceneHold {
     const Scene* scene = nullptr;
     uint64_t generation = 0;   // with the address: a scene loaded where the old one was is new
     uint64_t buildCount = 0;   // and a scene rebuilt in place (Scene::build) is new too
+    size_t   bytes = 0;        // the device memory it holds (cudaSceneHoldBytes)
     DUpload up;
 };
+size_t cudaSceneHoldBytes(const CudaSceneHold* held) { return held ? held->bytes : 0; }
 bool cudaSceneHoldFits(const CudaSceneHold* held, const Scene& scene) {
     return held && held->scene == &scene && held->generation == scene.generation &&
            held->buildCount == scene.buildCount;
@@ -21476,7 +21500,13 @@ CudaSceneHold* cudaHoldScene(const Scene& scene) {
     h->scene = &scene;
     h->generation = scene.generation;
     h->buildCount = scene.buildCount;
+    // Measured as the fall in free device memory: the upload's allocations are many and sized
+    // in many places, and what the VRAM preflight needs is what they took from the card.
+    size_t free0 = 0, free1 = 0, total = 0;
+    cudaMemGetInfo(&free0, &total);
     buildUploadScene(scene, h->up);
+    cudaMemGetInfo(&free1, &total);
+    h->bytes = free0 > free1 ? free0 - free1 : 0;
     return h;
 }
 void cudaReleaseScene(CudaSceneHold* held) {

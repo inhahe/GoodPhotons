@@ -2166,14 +2166,19 @@ a 50 M-cell, 200 MB array for 29 k photons. The cache is keyed on everything a r
 including whether the GPU gathers it: a map built for the device has no host trees, and a camera
 that falls back to the CPU mid-batch (a full card) rebuilds instead of gathering nothing, which is
 what `-beamfreeze`'s cache had done unnoticed. A frame rendered inside the batch is bit-identical to
-the same frame rendered alone. With the realizations kept, one per sample costs little, so it is now
-the default for a batch of several cameras and `-beamepochs spp` asks for it elsewhere. It is capped
-by `-beamrefresh`'s share (`jAutoEpochs`): the first frame renders its first sample (sample 0 of the
-frame under any K, so nothing waits on the decision), the device call's fixed cost and the sample's
-are read (`cudaLastBdptOverheadSec`), each realization's build is spread over the frames left when
-the batch can keep it, and the largest K within the share is settled once for the batch. It binds
-on a tiny frame (K = 8 of 16 at 64x36) and not at 1280x720. An explicit K below the samples gets a
-note in a batch.
+the same frame rendered alone where the cap does not bind. With the realizations kept, one per
+sample costs little, so it is now the default for every frame of a flight -- `RenderCam::flightN`,
+so a frame re-rendered alone with `-frames` gets it too and matches its neighbours -- and
+`-beamepochs spp` asks for it elsewhere. It is capped by `-beamrefresh`'s share (`jAutoEpochs`):
+the first frame renders its first sample (sample 0 of the frame under any K, so nothing waits on
+the decision); the device call's fixed cost (`cudaLastBdptOverheadSec`), the sample's (less the
+progress reports inside it) and epoch 0's build (less its one-time budget pilot) are read; each
+realization's build is spread over the whole flight, as a batch of it keeps them; and the largest K
+within the share is settled once for the batch. It binds on a tiny frame (K = 8 of 16 at 64x36)
+and not at 1280x720; being timed, it can settle differently near the edge of the share, so it
+prints its K to pin. An explicit K below the samples gets a note on a flight frame. The VRAM
+preflight counts the batch's scene copy as this process's (a mode-D/J frame reuses it; another
+GPU mode releases it first, so the scene is never held twice).
 
 **Mode `M` has the same disease, and got the same cure in 0.252.0** (M-FROZEN in known-issues.md).
 A single-camera mode-`M` render builds its photon map, caustic map and beam map once and then
@@ -10294,8 +10299,9 @@ linear now also carries its own knots:
   no knots.
 * `render_cuda.cu`: `DSpec` is the grid plus optional knot arrays (wavelengths as float, values as
   double) and a per-nm bucket index naming the last knot at or below each nm, so
-  `specLookup(const DSpec&, lambda)` finds the interval in a step or two and interpolates exactly
-  as the host's table does, clamping outside it. Every `DMaterial` spectrum, `DMedium::sigma_a`/
+  `specLookup(const DSpec&, lambda)` bisects between one nm's bucket and the next (no step for a
+  table coarser than 1 nm) and interpolates exactly as the host's table does, clamping outside it.
+  Knots are uploaded once per table and scale, however many materials share it. Every `DMaterial` spectrum, `DMedium::sigma_a`/
   `sigma_s` and `DEmitter::emitSpd` is a `DSpec`, baked by `bakeSpec(Spectrum, DSpec&, DUpload&)`;
   the lens index and the environment illuminant keep plain grids.
 

@@ -170,6 +170,24 @@ with the device-or-host decision made inside render_cuda.cu.
 
 Logged rather than fixed: JFLYBY-REALIZATION-REUSE, below.
 
+## DONE (2026-10-23, 0.393.2): REVIEW-0393 — what the Opus review of 0.393.0-0.393.1 found
+
+Opus (xhigh) reviewed 0bdc3db..66b0112; all fifteen findings held up and were fixed. The ones that
+mattered: the VRAM preflight took the batch's resident scene copy for another program's memory
+(it could tip a frame onto the CPU and drop every kept realization); one realization per sample was
+the default only for a batch of several cameras of any mode, so a flight frame re-rendered alone
+fell back to the wall-clock refresh and no longer matched its neighbours (the default now follows
+`RenderCam::flightN`, and the cap weighs builds over the whole flight: gallery_rain frame 10 alone
+and after frame 9 is bit-identical with no `-beamepochs`); the cap's timings carried the budget
+pilot and the progress reports; a table of more than 65 535 knots fell back to the grid silently
+(32-bit buckets now), and a lookup scanned linearly within its nm (it bisects; the gate's images
+are bit-identical to the scanning build's). Also: knots uploaded once per table; the spectral gate
+checks its GPU arm ran on the GPU; `-beamrefresh` >= 1 guarded; the non-J ignore note covers `spp`
+and `off`; realizations are weighed before they are trimmed; `BatchCache` copies deleted; the
+duplicated epoch arithmetic and budget fallback made one each; the kept count counts realizations;
+`SurfMap::build` has its comment back. A cubic table, which no gate had touched, reads GPU/CPU
+1.0007 / 1.0005 / 1.0010.
+
 ## DONE (2026-10-23, 0.393.0): JFLYBY-REALIZATION-REUSE — a mode-J flyby rebuilt the same K light-side realizations, and re-uploaded the same scene, for every frame
 
 Under `-beamepochs K` every frame of a flyby renders the same K realizations (salt e, view-

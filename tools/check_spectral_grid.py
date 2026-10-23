@@ -62,8 +62,12 @@ def render(exe, scene, device, spp, out_png, log):
         r = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT, cwd=_REPO)
     if r.returncode != 0:
         raise RuntimeError("%s exited %d (log: %s)" % (" ".join(cmd), r.returncode, log))
-    # An explicit -device gpu is forced, never quietly moved to the CPU, so the two arms really
-    # are the two backends.
+    # -device gpu still runs on the CPU when there is no device or the scene is outside the
+    # GPU's scope, and then the gate would compare the CPU with itself.
+    if device == "gpu":
+        with open(log, encoding="utf-8", errors="replace") as lf:
+            if "-> GPU" not in lf.read():
+                raise RuntimeError("the GPU arm did not run on the GPU (log: %s)" % log)
     return os.path.splitext(out_png)[0] + ".pfm"
 
 

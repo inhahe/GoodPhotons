@@ -175,6 +175,11 @@ struct SurfMap {
         return pts.capacity() * sizeof(SurfPhoton) + mis.capacity() * sizeof(SurfMis) +
                cellStart.capacity() * sizeof(int) + order.capacity() * sizeof(int);
     }
+    // Bytes the containers above actually use (their size).
+    size_t usedBytes() const {
+        return pts.size() * sizeof(SurfPhoton) + mis.size() * sizeof(SurfMis) +
+               cellStart.size() * sizeof(int) + order.size() * sizeof(int);
+    }
     // Release the containers' spare capacity (see BeamMap::shrinkToFit).
     void shrinkToFit() {
         pts.shrink_to_fit(); mis.shrink_to_fit(); cellStart.shrink_to_fit(); order.shrink_to_fit();
@@ -206,9 +211,6 @@ struct SurfMap {
         iz = std::min(std::max(iz, 0LL), nz - 1);
     }
 
-    // `r` is the gather radius; the cell is sized to it so a query touches 3x3x3 cells.
-    // A grid that would exceed `maxCells` is coarsened instead of refused — a coarser cell
-    // only makes the query visit more photons, which costs time and changes no result.
     // The radius alone, without the grid: for a map the device grids itself (render_cuda.h
     // cudaJSurfOnDevice), which reads only its photon count, emission count and radius. The grid
     // runs to hundreds of MB (gallery_rain: 50 M cells for 29 k photons), held for nothing.
@@ -219,6 +221,9 @@ struct SurfMap {
         cellStart.clear(); cellStart.shrink_to_fit();
         order.clear(); order.shrink_to_fit();
     }
+    // `r` is the gather radius; the cell is sized to it so a query touches 3x3x3 cells.
+    // A grid that would exceed `maxCells` is coarsened instead of refused — a coarser cell
+    // only makes the query visit more photons, which costs time and changes no result.
     void build(double r, long long maxCells = 64LL << 20) {
         radius = (r > 0.0) ? r : 1e-6;
         cell = radius;

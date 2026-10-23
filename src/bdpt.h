@@ -2368,6 +2368,7 @@ struct BeamBudgetInfo {
     // --- the surface map's half of the same decision (-jsurf) ---------------------------
     double    surfPerPath  = 0.0;    // surface photons per subpath, measured by the same pilot
     bool      surfBound    = false;  // did the SURFACE ceiling pick nPaths, rather than the beams?
+    double    pilotSec     = 0.0;    // what the pilot cost, a one-time part of epoch 0's build
 };
 
 // What the caller wants of the map. A struct rather than three more parameters because `blur`
@@ -2904,6 +2905,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     // on a scene with no media at all (where `maxBeams` measures nothing) — hence the `||`
     // rather than a beams-only gate.
     if ((req.maxBeams > 0 || (smOut && req.maxSurfPhotons > 0)) && nPaths > 4 * kPilotMin) {
+        const auto tPilot0 = std::chrono::steady_clock::now();
         // FTRACE_JPILOT overrides the size, for the sweep that decides whether `/32` is
         // buying anything. The sizing is off the REQUESTED nPaths, which on a knee-bound scene
         // is wildly larger than what the pass will actually trace: `-n 2000000` gives a 62 500
@@ -3026,6 +3028,8 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
             budgetOut->applied      = (nPaths < nPathsAsked);
             budgetOut->surfPerPath  = surfPerPath;
             budgetOut->surfBound    = surfBound;
+            budgetOut->pilotSec     = std::chrono::duration<double>(
+                                          std::chrono::steady_clock::now() - tPilot0).count();
         }
         if (ft::stopRequested()) {
             bm.beams.clear(); bm.mis.clear(); bm.nEmitted = 0;
