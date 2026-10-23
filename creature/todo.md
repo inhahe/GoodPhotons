@@ -1832,6 +1832,23 @@ activations as measurements; inference across body plans before one plan works.
 - [x] `known-issues.md` for bugs/tech debt — 3 open, 6 resolved
 - [x] Version control: `git init`ed at the close of P0; `out/`, `runs/`, `*.pt` ignored
 - [ ] Determinism: seed everything; training runs must be re-runnable
+- [ ] **Measure GPU physics before P2 spends real compute** *(added 2026-10-22)*. Training runs
+      MuJoCo on the CPU at ~3000 env-steps/s (P1's batched vec env): 2·10⁷ steps is ~2 h, but 10⁹ is
+      ~4 days and 10¹⁰ ~40 days, and a muscle-driven, morph-conditioned, many-skill policy (P2–P4,
+      P10) plausibly needs billions. MJX (JAX) and MuJoCo Warp step thousands of environments in
+      parallel on one GPU; DeepMind's MuJoCo Playground trains locomotion policies on a single GPU
+      in minutes. Measure canis on the 4090 under either: steps/s against env count, beside the CPU
+      vec env; whether everything the rig uses is supported (tendons, the actuators P3 adds, P1b's
+      terrain contacts); and whether `sensing.py`'s observation and its delay ring buffer port.
+      **Bar:** a steps/s table and a go/no-go. This is the *training* question; P5's "MJX is not
+      required" is about the fit and stays true.
+      - *If no-go, rent CPUs:* a 192-vCPU server has ~16× today's threads; even if batching scaled
+        linearly, which design.md §"The vec env is batched" shows is never automatic, a 10¹⁰-step
+        run is ~2.5 days, roughly $150–600 at a few dollars an hour.
+      - *GPU rental, as of 2026-10:* RTX 4090 $0.14–0.74/h, A100 80 GB ~$0.50–1.40, H100 ~$1.50–4,
+        B200 ~$4.40–6.80. **For ftrace renders, rent consumer cards:** ftrace uses no ray-tracing
+        cores, so a datacenter card's premium buys it nothing — except fp64, ~25× faster there,
+        which matters only for the fp64 build.
 - [ ] Literature sweep before assuming any link is unclaimed — this field moves fast and
       video→animal-motion is actively worked on
 
