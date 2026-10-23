@@ -98,15 +98,17 @@ struct Camera {
     // pinhole/thin-lens projection. Shared so copies of a Camera share one lens.
     std::shared_ptr<LensSystem> lens;
     bool hasLens() const { return lens && !lens->surf.empty(); }
-    // The lens's entrance-pupil table (lens.h LensPupil), which lets lensEntry aim light at
-    // the stop instead of spreading it over the front element. Set by prepareLensPupil once
-    // the lens and the film resolution are known; read through pupil(), which hands it out
-    // only while it still fits this camera.
+    // The lens's pupil tables (lens.h LensPupil), which let lensEntry aim light at the stop
+    // instead of spreading it over the front element, and genLensRay aim camera rays at it
+    // instead of the whole rear element. Set by prepareLensPupil once the lens and the film
+    // resolution are known; read through pupil(), which hands them out only while they still
+    // fit this camera.
     std::shared_ptr<const LensPupil> lensPupil;
     void prepareLensPupil() {
         lensPupil.reset();
-        // FTRACE_LENS_FRONT=1 leaves every lens camera on the uniform front-element sampler: a
-        // diagnostic, since the same render with and without aiming must agree.
+        // FTRACE_LENS_FRONT=1 leaves every lens camera on the unaimed samplers (uniform on the
+        // front element for light, on the rear element for camera rays): a diagnostic, since the
+        // same render with and without aiming must agree.
         const char* off = std::getenv("FTRACE_LENS_FRONT");
         if (off && *off && *off != '0') return;
         if (hasLens()) lensPupil = lensPupilFor(lens, std::sqrt(lensFilmRadius2()));
@@ -118,8 +120,8 @@ struct Camera {
         const double halfH = halfW * ((double)film.resY / (double)film.resX);
         return halfW * halfW + halfH * halfH;
     }
-    // The table if it fits: built for this focus and for a film circle at least this raster's.
-    // Null otherwise, and lensEntry falls back to the front sampler.
+    // The tables if they fit: built for this focus and for a film circle at least this
+    // raster's. Null otherwise, and lensEntry and genLensRay keep their unaimed samplers.
     const LensPupil* pupil() const {
         const LensPupil* P = lensPupil.get();
         return (P && P->filmZ == lens->filmZ && P->racc2 >= lensFilmRadius2()) ? P : nullptr;
@@ -287,9 +289,10 @@ struct Camera {
     }
 
     // Generate a world-space camera ray for pixel (px,py) through the physical lens
-    // (requires hasLens()). Samples the film point (with pixel jitter jx,jy) and a
-    // point on the rear element (u1,u2: its disk, or its clear cap when it is curved),
-    // then refracts the ray from the film out
+    // (requires hasLens()). Samples the film point (with pixel jitter jx,jy) and, from u1,u2,
+    // where the ray heads: through the exit-pupil region the pupil table gives that film
+    // point, or, where the table keeps the unaimed sampler, a point on the rear element (its
+    // disk, or its clear cap when it is curved); then refracts the ray from the film out
     // through every glass interface at wavelength `lambda` (so chromatic aberration is
     // exact). Returns false if the ray is vignetted (clipped by an element or the
     // stop, or total-internal-reflected). On success `weight` is the radiometric
@@ -313,7 +316,26 @@ struct Camera {
         Vec3 pFilm(-sx * halfW, -sy * halfH, L.filmZ);
         Ray outLocal;
         const int jr = (int)L.surf.size() - 1;
-        if (L.surf[jr].radius != 0.0) {
+        double cphi = 1.0, sphi = 0.0;
+        const LensPupil* P = pupil();
+        const int ce = P ? P->classifyFilm(pFilm, cphi, sphi) : -1;
+        if (ce == -2) return false;                      // no ray from this far off centre gets out
+        if (ce >= 0) {
+            // Aimed at the exit pupil (lens.h LensPupil): a crossing uniform in the bin's region
+            // of its plane. Per film solid angle that is density r^2 / (cosT * A_region), the
+            // plane's normal being the axis, so the importance cosT / density is
+            // cosT^2 * A_region / r^2 -- the planar rear's cos^4 A / Z^2 with the region for
+            // the disk.
+            const Vec3 X = P->sampleExit(ce, cphi, sphi, u1, u2);
+            Vec3 d0 = X - pFilm;
+            const double r = length(d0);
+            if (!(r > 1e-12)) return false;
+            d0 = d0 / r;
+            const double cosT = d0.z;
+            if (cosT <= 0.0) return false;
+            if (!L.trace(pFilm, d0, lambda, /*sensorToScene=*/true, outLocal)) return false;
+            weight = cosT * cosT * P->exitArea(ce) / (r * r);
+        } else if (L.surf[jr].radius != 0.0) {
             // A CURVED rear element: a point uniform on its clear cap, so every ray that
             // crosses the clear glass can be drawn (the plane disc below would miss the ones
             // crossing the cap outside the disc's shadow). The point must be the first of the
@@ -572,7 +594,9 @@ struct Camera {
     // uniform on its disk: per film area and film solid angle that is
     // Z^2 / (A_film * A_rear * cos^3 th), th the film ray's angle to the axis. On a curved
     // rear, a point uniform on its clear cap: r^2 / (A_film * A_cap * cosR), r the film point's
-    // distance to the cap point and cosR the ray's cosine at the cap. Glass conserves etendue,
+    // distance to the cap point and cosR the ray's cosine at the cap. Where the pupil table
+    // aims, a crossing uniform in the film point's exit region: r^2 / (A_film * A_region *
+    // cos th), r the distance to the exit plane along the ray. Glass conserves etendue,
     // dA cos dw, so per front area and exit solid angle each gains a factor cosFront / cos th.
     // All lengths in mm, so the result is per steradian. 0 if no camera sample could have
     // made this ray: it is clipped, or lands off the film.
@@ -595,6 +619,19 @@ struct Camera {
         const double cosF = std::fabs(dot(wl, n0));
         const double halfW = 0.5 * L.filmW_mm;
         const double aFilm = (2.0 * halfW) * (2.0 * halfW * (double)film.resY / (double)film.resX);
+        double cphi = 1.0, sphi = 0.0;
+        const LensPupil* P = pupil();
+        const int ce = P ? P->classifyFilm(onFilm, cphi, sphi) : -1;
+        if (ce == -2) return 0.0;
+        if (ce >= 0) {
+            // Aimed: genLensRay drew this film ray only if its crossing of the exit plane lies in
+            // the film point's region, with density r^2 / (cosT * A_region) per film solid angle
+            // (r the distance along the ray to the plane).
+            const double r = (P->zExit - onFilm.z) / cosT;
+            if (!P->inExit(ce, onFilm - dFilm * r, cphi, sphi)) return 0.0;
+            const double pdf = r * r * cosF * L.frontArea() / (aFilm * P->exitArea(ce) * cosT * cosT);
+            return std::isfinite(pdf) ? pdf : 0.0;
+        }
         const int jr = (int)L.surf.size() - 1;
         double pdf;
         if (L.surf[jr].radius != 0.0) {

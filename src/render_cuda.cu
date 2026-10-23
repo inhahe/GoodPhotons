@@ -1529,6 +1529,11 @@ struct DLensSystem {
     const double* pupilCells;
     int    pupilNT, pupilNU, pupilN;
     double pupilZRef, pupilZStart, pupilDMin, pupilDTheta;
+    // The exit-pupil table (camera rays): 4 doubles per film-radius bin. exitN == 0 => none,
+    // the rear-element sampler everywhere.
+    const double* exitCells;
+    int    exitN;
+    double exitZ, exitDRho;
 };
 
 struct DCamera {
@@ -2260,10 +2265,50 @@ __device__ static D3 dLensSampleSurface(const DLensSystem& L, int j, double u1, 
     n = (out.z >= 0.0) ? out : -out;
     return P;
 }
+// A pupil table bin's region (4 doubles: cx, a, b, kind) for a point at azimuth (cphi, sphi):
+// the ellipse (AIM, kind 1) or the rectangle (AIMBOX, kind 3) with half-widths a, b round
+// (cx, 0) on the plane z (host twins pupilRegionSample / pupilRegionNormAt / pupilRegionArea).
+__device__ static inline D3 dPupilRegionSample(const double* C, double cphi, double sphi,
+                                               double u1, double u2, double z) {
+    double ex, ey;
+    if ((int)C[3] == 3) {
+        ex = C[0] + C[1] * (2.0 * u1 - 1.0);
+        ey = C[2] * (2.0 * u2 - 1.0);
+    } else {
+        const double rr = sqrt(u1), an = 2.0 * DPI * u2;
+        ex = C[0] + C[1] * rr * cos(an);
+        ey = C[2] * rr * sin(an);
+    }
+    return D3(ex * cphi - ey * sphi, ex * sphi + ey * cphi, z);
+}
+// How far X lies out in the region: <= 1 inside.
+__device__ static inline double dPupilRegionNorm(const double* C, const D3& X, double cphi, double sphi) {
+    const double ex = X.x * cphi + X.y * sphi, ey = -X.x * sphi + X.y * cphi;
+    const double qx = (ex - C[0]) / C[1], qy = ey / C[2];
+    return ((int)C[3] == 3) ? fmax(fabs(qx), fabs(qy)) : sqrt(qx * qx + qy * qy);
+}
+__device__ static inline double dPupilRegionArea(const double* C) {
+    return ((int)C[3] == 3 ? 4.0 : DPI) * C[1] * C[2];
+}
+// The exit-pupil table (host twin LensPupil::classifyFilm): for a camera ray from film point f,
+// a bin >= 0 to aim (cphi, sphi = f's azimuth), -1 the rear-element sampler, -2 no ray from that
+// far off centre gets out of the lens.
+__device__ static int dLensExitClassify(const DLensSystem& L, double fx, double fy, double& cphi, double& sphi) {
+    if (L.exitN == 0) return -1;
+    const double r = sqrt(fx * fx + fy * fy);
+    int i = (int)(r / L.exitDRho);
+    i = i < 0 ? 0 : (i >= L.exitN ? L.exitN - 1 : i);
+    const int kind = (int)L.exitCells[4 * i + 3];
+    if (kind == 2) return -2;
+    if (kind != 1 && kind != 3) return -1;
+    if (r > 0.0) { cphi = fx / r; sphi = fy / r; } else { cphi = 1.0; sphi = 0.0; }
+    return i;
+}
 // Generate a world-space camera ray through the physical lens (port of
 // Camera::genLensRay). Returns false on vignetting (element/stop clip or TIR); on
-// success `weight` is the radiometric importance: cos^4*A_rear/Z^2 through a planar rear's
-// disk, cosT*cosR*A_cap/r^2 through a curved rear's clear cap.
+// success `weight` is the radiometric importance: cosT^2*A_region/r^2 aimed at the exit
+// pupil, else cos^4*A_rear/Z^2 through a planar rear's disk, cosT*cosR*A_cap/r^2 through a
+// curved rear's clear cap.
 __device__ static bool dGenLensRay(const DCamera& cam, int px, int py, Real jx, Real jy,
                                    Real u1, Real u2, Real lambda,
                                    DVec3& oW, DVec3& dW, Real& weight) {
@@ -2276,7 +2321,23 @@ __device__ static bool dGenLensRay(const DCamera& cam, int px, int py, Real jx, 
     DVec3 pFilm{-sx * halfW, -sy * halfH, L.filmZ};
     const int jr = L.nSurf - 1;
     DVec3 oL, dL;
-    if (L.surf[jr].radius != 0.0) {
+    double cphi = 1.0, sphi = 0.0;
+    const int ce = dLensExitClassify(L, -sx * halfW, -sy * halfH, cphi, sphi);
+    if (ce == -2) return false;                          // no ray from this far off centre gets out
+    if (ce >= 0) {
+        // Aimed at the exit pupil (host twin genLensRay): importance cosT^2 * A_region / r^2. In
+        // double, like the curved rear, then traced in Real.
+        const double* C = L.exitCells + 4 * ce;
+        const D3 X = dPupilRegionSample(C, cphi, sphi, (double)u1, (double)u2, L.exitZ);
+        D3 d0 = X - D3(pFilm);
+        const double r = length(d0);
+        if (!(r > 1e-12)) return false;
+        d0 = d0 / r;
+        const double cosT = d0.z;
+        if (cosT <= 0.0) return false;
+        if (!dLensTrace(L, pFilm, d0.toR(), lambda, oL, dL)) return false;
+        weight = (Real)(cosT * cosT * dPupilRegionArea(C) / (r * r));
+    } else if (L.surf[jr].radius != 0.0) {
         // A curved rear element: a point uniform on its clear cap, the first of the cap the
         // film ray meets (host twin genLensRay). In double: the hidden-side test is a
         // nanometre comparison.
@@ -2394,31 +2455,14 @@ __device__ static int dLensPupilClassify(const DLensSystem& L, const D3& p, doub
     return c;
 }
 __device__ static inline double dLensPupilArea(const DLensSystem& L, int c) {
-    const double* C = L.pupilCells + 4 * c;
-    return ((int)C[3] == 3 ? 4.0 : DPI) * C[1] * C[2];
+    return dPupilRegionArea(L.pupilCells + 4 * c);
 }
-// A crossing uniform in bin c's region at azimuth (cphi, sphi): the ellipse (AIM) or the
-// rectangle (AIMBOX) with half-widths a, b round (cx, 0).
 __device__ static inline D3 dLensPupilSample(const DLensSystem& L, int c, double cphi, double sphi,
                                              double u1, double u2) {
-    const double* C = L.pupilCells + 4 * c;
-    double ex, ey;
-    if ((int)C[3] == 3) {
-        ex = C[0] + C[1] * (2.0 * u1 - 1.0);
-        ey = C[2] * (2.0 * u2 - 1.0);
-    } else {
-        const double rr = sqrt(u1), an = 2.0 * DPI * u2;
-        ex = C[0] + C[1] * rr * cos(an);
-        ey = C[2] * rr * sin(an);
-    }
-    return D3(ex * cphi - ey * sphi, ex * sphi + ey * cphi, L.pupilZRef);
+    return dPupilRegionSample(L.pupilCells + 4 * c, cphi, sphi, u1, u2, L.pupilZRef);
 }
-// How far crossing X lies out in bin c's region: <= 1 inside.
 __device__ static inline double dLensPupilNorm(const DLensSystem& L, int c, const D3& X, double cphi, double sphi) {
-    const double* C = L.pupilCells + 4 * c;
-    const double ex = X.x * cphi + X.y * sphi, ey = -X.x * sphi + X.y * cphi;
-    const double qx = (ex - C[0]) / C[1], qy = ey / C[2];
-    return ((int)C[3] == 3) ? fmax(fabs(qx), fabs(qy)) : sqrt(qx * qx + qy * qy);
+    return dPupilRegionNorm(L.pupilCells + 4 * c, X, cphi, sphi);
 }
 // Where light from scene point p enters the lens (host twin Camera::lensEntry, which explains
 // both samplers and the rebased start): Y on the front element's clear cap, the leg p -> Y,
@@ -2572,6 +2616,18 @@ __device__ static double dLensPdfDir(const DCamera& cam, const DVec3& y, const D
     const double cosF = fabs(dot(wl, n0));
     const double halfW = 0.5 * L.filmW_mm;
     const double aFilm = (2.0 * halfW) * (2.0 * halfW * (double)cam.resY / (double)cam.resX);
+    double cphi = 1.0, sphi = 0.0;
+    const int ce = dLensExitClassify(L, onFilm.x, onFilm.y, cphi, sphi);
+    if (ce == -2) return 0.0;
+    if (ce >= 0) {
+        // Aimed (host twin lensPdfDir): the film ray's crossing of the exit plane must lie in the
+        // film point's region; density r^2 / (cosT * A_region) per film solid angle.
+        const double* C = L.exitCells + 4 * ce;
+        const double r = (L.exitZ - onFilm.z) / cosT;
+        if (!(dPupilRegionNorm(C, onFilm - dFilm * r, cphi, sphi) <= 1.0 + 1e-6)) return 0.0;
+        const double pdf = r * r * cosF * dLensSurfaceArea(L, 0) / (aFilm * dPupilRegionArea(C) * cosT * cosT);
+        return isfinite(pdf) ? pdf : 0.0;
+    }
     const int jr = L.nSurf - 1;
     double pdf;
     if (L.surf[jr].radius != 0.0) {
@@ -22015,6 +22071,9 @@ static gpu::DCamera bakeCamera(const Scene& /*scene*/, const Camera& cam, int re
     dc.lens.pupilCells = nullptr;
     dc.lens.pupilNT = dc.lens.pupilNU = dc.lens.pupilN = 0;
     dc.lens.pupilZRef = dc.lens.pupilZStart = dc.lens.pupilDMin = dc.lens.pupilDTheta = 0.0;
+    dc.lens.exitCells = nullptr;
+    dc.lens.exitN = 0;
+    dc.lens.exitZ = dc.lens.exitDRho = 0.0;
     if (cam.hasLens()) {
         const LensSystem& L = *cam.lens;
         const int M = (int)L.surf.size();
@@ -22053,6 +22112,18 @@ static gpu::DCamera bakeCamera(const Scene& /*scene*/, const Camera& cam, int re
             dc.lens.pupilNT = P->nTheta; dc.lens.pupilNU = P->nU; dc.lens.pupilN = (int)P->cells.size();
             dc.lens.pupilZRef = P->zRef; dc.lens.pupilZStart = P->zStart;
             dc.lens.pupilDMin = P->dMin; dc.lens.pupilDTheta = P->dTheta;
+            if (!P->exitCells.empty()) {
+                std::vector<double> ex(P->exitCells.size() * 4);
+                for (size_t i = 0; i < P->exitCells.size(); ++i) {
+                    ex[4 * i + 0] = P->exitCells[i].cx;
+                    ex[4 * i + 1] = P->exitCells[i].a;
+                    ex[4 * i + 2] = P->exitCells[i].b;
+                    ex[4 * i + 3] = (double)P->exitCells[i].kind;
+                }
+                dc.lens.exitCells = (const double*)up.keep(uploadVec(ex));
+                dc.lens.exitN = (int)P->exitCells.size();
+                dc.lens.exitZ = P->zExit; dc.lens.exitDRho = P->dRho;
+            }
         }
     }
     return dc;

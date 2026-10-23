@@ -6474,7 +6474,24 @@ as the one at fault.
     and `DBeamMergeW::lensY` rides the wavefront queue, since a queued segment is read by
     another kernel). Device twins: `dLensPupilClassify`, the aimed branch of `dLensEntry`,
     `dLensAimRatio`; bakeCamera uploads the table (`DLensSystem::pupil*`) when it fits the
-    baked raster. Users of the light-tracing functions: the forward splats of modes A/B
+    baked raster.
+  - **Aiming camera rays at the stop (0.396.0).** The mirror problem: genLensRay drew where a
+    camera ray heads uniformly on the rear element (disk or cap), of which a stopped-down beam
+    uses a few per cent. The same `LensPupil` carries an exit table (`exitCells`, built in
+    `buildLensPupil` by the same `lenspupil::fitRegion` the entrance side uses): 64 bins by the
+    film point's distance from the sensor centre, each a region on the exit-pupil plane
+    (`zExit`, the chief ray's image-space axis crossing, kept in front of the sensor) holding
+    every crossing of a film-to-scene ray that gets out of the lens. genLensRay aims there
+    (importance `cosT^2 * A_region / r^2`, the planar rear's formula with the region for the
+    disk), keeps the rear sampler where aiming would not pay, and rejects film radii no ray
+    leaves from. lensPdfDir follows: inside the region the camera density is
+    `r^2 cosF A_front / (A_film A_region cosT^2)`, 0 outside, so -- unlike the entrance side --
+    nothing else in BDPT changes (the density is still a function of the ray alone). Every
+    camera ray keeps the invariant importance x lensPdfDir = cosF A_front / A_film, which
+    `-checklens` asserts for all of them. Users: modes R (the lens camera's default), D and J's
+    camera subpaths, M/S/U through R, and `addEnvBackgroundLens`. Device twins:
+    `dLensExitClassify`, the aimed branches of `dGenLensRay` and `dLensPdfDir`
+    (`DLensSystem::exit*`). Users of the light-tracing functions: the forward splats of modes A/B
     (`Renderer::connectLensPhysical` and its hero / volume twins, routed by `lensCam`, so a
     lens camera in mode B images through its glass), mode C's catch, and BDPT's t=1 branch.
     Device twins in `render_cuda.cu` (`dLensEntry` / `dLensEntryImage` / `dLensCatch` /

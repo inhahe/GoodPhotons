@@ -279,7 +279,7 @@ struct LensSystem {
 };
 
 // ---------------------------------------------------------------------------
-// The entrance pupil, for aiming light at the stop.
+// The pupils, for aiming at the stop from either side.
 //
 // Light tracing picks where light from a scene point enters the lens. Uniform over the front
 // element's clear cap (sampleSurface) is exact for any lens, but when the front element is
@@ -287,52 +287,93 @@ struct LensSystem {
 // picks are clipped inside, and for a point outside the field of view every pick is traced
 // through the glass only to miss the film. Hanika & Dachsbacher (2014, sec. 5.2) and Schrade
 // et al. (2016) aim at the stop instead, solving per sample for the direction that reaches a
-// sampled point of it (Newton steps on a fitted polynomial): several traces per sample. This
-// table aims for the price of a lookup.
+// sampled point of it (Newton steps on a fitted polynomial): several traces per sample. These
+// tables aim for the price of a lookup. The camera's rays have the mirror problem: genLensRay
+// picks a point uniform on the REAR element, of which a stopped-down beam uses a few per cent,
+// and pbrt's exit-pupil bounds (RealisticCamera::BoundExitPupil) are the fix this mirrors.
 //
 // The rays from a scene point that get through to the film cross a plane at the entrance
 // pupil (the stop's image seen from the scene) in a region that, a pupil being what it is,
 // barely moves with the point's distance and moves slowly with its angle off the axis. The
-// table bins scene points by that angle and by inverse distance and keeps, per bin, a region
-// on that plane -- an ellipse, or a rectangle where an ellipse fits badly -- holding every
-// crossing that reaches the film. lensEntry then draws the crossing uniformly in the region
-// and aims at it. The lens is rotationally symmetric, so a bin's region is built for points at
-// azimuth 0 and serves every azimuth rotated.
+// entrance table bins scene points by that angle and by inverse distance and keeps, per bin, a
+// region on that plane -- an ellipse, or a rectangle where an ellipse fits badly -- holding
+// every crossing that reaches the film; lensEntry draws the crossing uniformly in the region
+// and aims at it. The exit table does the same for camera rays: bins by the film point's
+// distance from the sensor's centre, regions on the exit pupil's plane (the stop's image seen
+// from the sensor) holding every crossing of a film-to-scene ray that gets out of the lens;
+// genLensRay draws there. The lens is rotationally symmetric, so a bin's region is built for
+// points at azimuth 0 and serves every azimuth rotated.
 //
 // The regions come from tracing, not from paraxial optics, so aberrations, vignetting by any
-// element and the film's edge are all in them. Per bin, over scene points from the bin
-// widened by 15% on every side: rays drawn the old way (uniform on the front cap) find where
-// light gets through; rays aimed inside a growing ellipse find its edge; the region is fitted
-// and padded; then fresh batches of uniform rays check that nothing reaching the film falls
-// outside, enlarging the region over anything that does, until a whole batch finds nothing
-// (the count is kept for -checklens). A bin keeps the front sampler where aiming would not
-// pay -- the stop already fills the front element -- or where its region never comes clean,
-// and a bin where no light got through, nor in any neighbouring bin, rejects outright, before
-// any tracing. The film edge used is a circle round the sensor's corners, which the lens's
-// rotational symmetry needs; a camera whose raster outgrows that circle, or whose
-// focus moves, stops using the table (Camera::pupil).
+// element and the film's edge are all in them (lenspupil::fitRegion). Per bin, over points
+// from the bin widened by 15% on every side: rays drawn the old way (uniform on the element)
+// find where light gets through; rays aimed inside a growing ellipse find its edge; the region
+// is fitted and padded; then fresh batches of uniform rays check that nothing getting through
+// falls outside, enlarging the region over anything that does, until a whole batch finds
+// nothing (the count is kept for -checklens). A bin keeps the unaimed sampler where aiming
+// would not pay -- the stop already fills the element -- or where its region never comes
+// clean, and a bin where no light got through, nor in any neighbouring bin, rejects outright,
+// before any tracing. The film edge used is a circle round the sensor's corners, which the
+// lens's rotational symmetry needs; a camera whose raster outgrows that circle, or whose
+// focus moves, stops using the tables (Camera::pupil).
 struct LensPupilCell {
-    double cx = 0.0, a = 0.0, b = 0.0;   // region on z = zRef (mm) for azimuth 0: centred at
+    double cx = 0.0, a = 0.0, b = 0.0;   // region on its plane (mm) for azimuth 0: centred at
                                          // (cx, 0), half-widths a (radial, along x) and b (along y)
     int kind = 0;                        // LensPupil::FRONT / AIM / NONE / AIMBOX
 };
+// A bin's region, for a point at azimuth (cphi, sphi): AIM is the ellipse with semi-axes a, b;
+// AIMBOX the rectangle with half-widths a, b, for a region an ellipse fits badly (a crescent
+// at the edge of the field, where the film's rim cuts the beam).
+inline Vec3 pupilRegionSample(const LensPupilCell& C, double cphi, double sphi, double u1, double u2,
+                              double z) {
+    double ex, ey;
+    if (C.kind == 3) {                                   // LensPupil::AIMBOX
+        ex = C.cx + C.a * (2.0 * u1 - 1.0);
+        ey = C.b * (2.0 * u2 - 1.0);
+    } else {
+        const double rr = std::sqrt(u1), an = 2.0 * PI * u2;
+        ex = C.cx + C.a * rr * std::cos(an);
+        ey = C.b * rr * std::sin(an);
+    }
+    return Vec3(ex * cphi - ey * sphi, ex * sphi + ey * cphi, z);
+}
+// How far (ex, ey), in the bin's own azimuth-0 frame, lies out in the region: <= 1 inside.
+inline double pupilRegionNorm(const LensPupilCell& C, double ex, double ey) {
+    const double qx = (ex - C.cx) / C.a, qy = ey / C.b;
+    return (C.kind == 3) ? std::max(std::fabs(qx), std::fabs(qy)) : std::sqrt(qx * qx + qy * qy);
+}
+// The same for a point X of the plane, seen at azimuth (cphi, sphi).
+inline double pupilRegionNormAt(const LensPupilCell& C, const Vec3& X, double cphi, double sphi) {
+    return pupilRegionNorm(C, X.x * cphi + X.y * sphi, -X.x * sphi + X.y * cphi);
+}
+inline double pupilRegionArea(const LensPupilCell& C) { return (C.kind == 3 ? 4.0 : PI) * C.a * C.b; }
+
 struct LensPupil {
-    // AIM draws in the ellipse with semi-axes a, b; AIMBOX in the rectangle with half-widths
-    // a, b, for a region an ellipse fits badly (a crescent at the edge of the field, where
-    // the film's rim cuts the beam).
+    // FRONT keeps the unaimed sampler (uniform on the front element for light, on the rear
+    // element for camera rays); NONE rejects before any trace.
     enum { FRONT = 0, AIM = 1, NONE = 2, AIMBOX = 3 };
+    double racc2 = 0.0;    // squared film radius (mm^2) the tables are built for
+    double filmZ = 0.0;    // the sensor plane they were built for
+    int stop = -1;         // the surface taken as the stop (for the report)
+
+    // ---- the entrance side: light traced in (Camera::lensEntry) ----
     double zRef = 0.0;     // the plane crossings are drawn on (mm): the entrance pupil's
     double zStart = 0.0;   // above every point of the front cap: where an aimed leg starts
     double dMin = 0.0;     // scene points nearer than this to (0, 0, zRef) keep the front sampler
-    double racc2 = 0.0;    // squared film radius (mm^2) the table admits rays within
-    double filmZ = 0.0;    // the sensor plane it was built for
     int nTheta = 0, nU = 0;
     double dTheta = 0.0;   // bin width in the angle off the axis, over [0, pi/2)
     std::vector<LensPupilCell> cells;   // [iTheta * nU + iU], iU = floor(nU * dMin / distance)
-    int stop = -1;                      // the surface taken as the stop (for the report)
     int nAim = 0, nFront = 0, nNone = 0;
-    long long enlarged = 0;             // uniform rays that reached the film outside their bin's
+    long long enlarged = 0;             // uniform rays that got through outside their bin's
                                         // fitted region, each of which enlarged it
+
+    // ---- the exit side: camera rays traced out (Camera::genLensRay) ----
+    double zExit = 0.0;    // the plane camera rays' crossings are drawn on (mm): the exit pupil's
+    int nRho = 0;
+    double dRho = 0.0;     // bin width in the film point's distance from the sensor centre
+    std::vector<LensPupilCell> exitCells;   // [iRho]
+    int nExitAim = 0, nExitFront = 0, nExitNone = 0;
+    long long exitEnlarged = 0;
 
     // Which sampler light from lens-local point p takes: a bin index >= 0 to aim (cphi, sphi
     // then hold p's azimuth), -1 for the front sampler, -2 when no light from p reaches the
@@ -355,43 +396,186 @@ struct LensPupil {
         if (r > 0.0) { cphi = p.x / r; sphi = p.y / r; } else { cphi = 1.0; sphi = 0.0; }
         return c;
     }
-    // A crossing uniform in bin c's region, rotated to azimuth (cphi, sphi).
     Vec3 sampleCrossing(int c, double cphi, double sphi, double u1, double u2) const {
-        const LensPupilCell& C = cells[c];
-        double ex, ey;
-        if (C.kind == AIMBOX) {
-            ex = C.cx + C.a * (2.0 * u1 - 1.0);
-            ey = C.b * (2.0 * u2 - 1.0);
-        } else {
-            const double rr = std::sqrt(u1), an = 2.0 * PI * u2;
-            ex = C.cx + C.a * rr * std::cos(an);
-            ey = C.b * rr * std::sin(an);
-        }
-        return Vec3(ex * cphi - ey * sphi, ex * sphi + ey * cphi, zRef);
+        return pupilRegionSample(cells[c], cphi, sphi, u1, u2, zRef);
     }
-    // How far crossing X lies out in bin c's region at azimuth (cphi, sphi): <= 1 inside.
-    double cellNorm(int c, const Vec3& X, double cphi, double sphi) const {
-        const LensPupilCell& C = cells[c];
-        const double ex = X.x * cphi + X.y * sphi, ey = -X.x * sphi + X.y * cphi;
-        return regionNorm(C, ex, ey);
-    }
-    static double regionNorm(const LensPupilCell& C, double ex, double ey) {
-        const double qx = (ex - C.cx) / C.a, qy = ey / C.b;
-        return (C.kind == AIMBOX) ? std::max(std::fabs(qx), std::fabs(qy)) : std::sqrt(qx * qx + qy * qy);
-    }
+    static double regionNorm(const LensPupilCell& C, double ex, double ey) { return pupilRegionNorm(C, ex, ey); }
     // Is crossing X inside bin c's region? The slack covers the rounding between a crossing
     // drawn and the same crossing recomputed from its ray.
     bool inCell(int c, const Vec3& X, double cphi, double sphi) const {
-        return cellNorm(c, X, cphi, sphi) <= 1.0 + 1e-9;
+        return pupilRegionNormAt(cells[c], X, cphi, sphi) <= 1.0 + 1e-9;
     }
-    double cellArea(int c) const {
-        const LensPupilCell& C = cells[c];
-        return (C.kind == AIMBOX ? 4.0 : PI) * C.a * C.b;
+    double cellArea(int c) const { return pupilRegionArea(cells[c]); }
+
+    // The same for a camera ray from film point f (lens-local, on the sensor plane): a bin
+    // >= 0 to aim (cphi, sphi = f's azimuth), -1 for the rear-element sampler, -2 when no ray
+    // from that far off centre gets out of the lens.
+    int classifyFilm(const Vec3& f, double& cphi, double& sphi) const {
+        if (exitCells.empty()) return -1;
+        const double r = std::sqrt(f.x * f.x + f.y * f.y);
+        int i = (int)(r / dRho);
+        i = std::min(std::max(i, 0), nRho - 1);
+        const int k = exitCells[i].kind;
+        if (k == NONE) return -2;
+        if (k != AIM && k != AIMBOX) return -1;
+        if (r > 0.0) { cphi = f.x / r; sphi = f.y / r; } else { cphi = 1.0; sphi = 0.0; }
+        return i;
     }
+    Vec3 sampleExit(int c, double cphi, double sphi, double u1, double u2) const {
+        return pupilRegionSample(exitCells[c], cphi, sphi, u1, u2, zExit);
+    }
+    bool inExit(int c, const Vec3& X, double cphi, double sphi) const {
+        return pupilRegionNormAt(exitCells[c], X, cphi, sphi) <= 1.0 + 1e-9;
+    }
+    double exitArea(int c) const { return pupilRegionArea(exitCells[c]); }
 };
 
-// Build the table for lens L focused as it is, admitting rays that land within `racc` mm of
-// the sensor's centre. Null if the lens is empty or the build was stopped (-stop).
+namespace lenspupil {
+// One bin's region, found by tracing. `uniformRay(X)` draws a ray the unaimed way over the
+// bin's points and returns -1 (no usable point), 0 (lost in the lens) or 1 (got through, X
+// its crossing of the plane with y folded to >= 0 by the mirror symmetry about the x-z
+// plane); `aimRay(ex, ey)` draws one through the crossing (ex, ey) the way the sampler aims,
+// with the same returns. `scale` (mm) sets the paddings. Fills C (AIM, AIMBOX or FRONT; NONE
+// when no light got through, which the caller resolves against the neighbours) and counts
+// the verification's enlargements into `enlarged`. Returns whether any light got through.
+template <class U, class A>
+inline bool fitRegion(Pcg32& rng, U&& uniformRay, A&& aimRay, double scale, LensPupilCell& C,
+                      long long& enlarged) {
+    std::vector<double> xs, ys;                    // crossings that got through
+    long long nUni = 0, okUni = 0;                 // uniform rays tried / through
+    auto uniformBatch = [&](int n) {
+        for (int k = 0; k < n; ++k) {
+            Vec3 X;
+            const int r = uniformRay(X);
+            if (r < 0) continue;
+            ++nUni;
+            if (r) { ++okUni; xs.push_back(X.x); ys.push_back(X.y); }
+        }
+    };
+    uniformBatch(1536);
+    if (xs.empty()) uniformBatch(2048);
+    if (xs.empty()) { C.kind = LensPupil::NONE; return false; }
+    auto fit = [&](double& cx, double& a, double& b) {
+        double x0 = 1e300, x1 = -1e300, y1 = 0.0;
+        for (size_t i = 0; i < xs.size(); ++i) {
+            x0 = std::min(x0, xs[i]); x1 = std::max(x1, xs[i]); y1 = std::max(y1, ys[i]);
+        }
+        cx = 0.5 * (x0 + x1);
+        a = std::max(0.5 * (x1 - x0), 1e-6 * scale);
+        b = std::max(y1, 1e-6 * scale);
+    };
+    // Find the edge: aim inside a padded ellipse round what the uniform rays found, and grow it
+    // until nothing that gets through comes near its rim.
+    double cx, a, b;
+    fit(cx, a, b);
+    double ra = 1.3 * a + 0.02 * scale, rb = 1.3 * b + 0.02 * scale;
+    bool bounded = false;
+    for (int round = 0; round < 8 && !bounded; ++round) {
+        std::vector<double> bx, by;
+        double edge = 0.0;
+        for (int k = 0; k < 1536; ++k) {
+            const double rr = std::sqrt(rng.uniform()), an = 2.0 * PI * rng.uniform();
+            const double ex = cx + ra * rr * std::cos(an), ey = rb * rr * std::sin(an);
+            const int r = aimRay(ex, ey);
+            if (r == 1) { bx.push_back(ex); by.push_back(std::fabs(ey)); edge = std::max(edge, rr); }
+        }
+        if (edge < 0.92) {
+            bounded = true;
+            xs.insert(xs.end(), bx.begin(), bx.end());
+            ys.insert(ys.end(), by.begin(), by.end());
+        } else {
+            ra *= 1.5; rb *= 1.5;
+        }
+    }
+    if (!bounded) { C.kind = LensPupil::FRONT; return true; }
+    // The region: centred on the crossings' extent. An ellipse when the crossings fit one
+    // (scaled to hold every one, it grows by at most 5%), else the extent's rectangle -- an
+    // ellipse round a crescent's horns would need its sparse tips sampled to be sure of holding
+    // them, a rectangle only the extent. Padded 3%.
+    fit(cx, a, b);
+    double s = 0.0;
+    for (size_t i = 0; i < xs.size(); ++i) {
+        const double qx = (xs[i] - cx) / a, qy = ys[i] / b;
+        s = std::max(s, std::sqrt(qx * qx + qy * qy));
+    }
+    LensPupilCell R;
+    R.cx = cx;
+    if (s <= 1.05) { R.kind = LensPupil::AIM;    R.a = a * s * 1.03 + 1e-4 * scale; R.b = b * s * 1.03 + 1e-4 * scale; }
+    else           { R.kind = LensPupil::AIMBOX; R.a = a * 1.03 + 1e-4 * scale;     R.b = b * 1.03 + 1e-4 * scale; }
+    // Check with fresh uniform rays that whatever gets through falls inside, enlarging over any
+    // that does not, until a whole batch finds nothing outside. A region that never comes clean
+    // keeps the unaimed sampler.
+    bool clean = false;
+    for (int round = 0; round < 6 && !clean; ++round) {
+        const size_t from = xs.size();
+        uniformBatch(2048);
+        double grow = 1.0;
+        for (size_t i = from; i < xs.size(); ++i) {
+            const double q = pupilRegionNorm(R, xs[i], ys[i]);
+            if (q > 1.0) { ++enlarged; grow = std::max(grow, q); }
+        }
+        if (grow > 1.0) { R.a *= grow * 1.03; R.b *= grow * 1.03; }
+        else clean = true;
+    }
+    if (!clean) { C.kind = LensPupil::FRONT; return true; }
+    // Aim only where it pays: the share of aimed rays that get through against the share of
+    // uniform ones, measured over the same points.
+    long long nE = 0, okE = 0;
+    for (int k = 0; k < 1024; ++k) {
+        const Vec3 X = pupilRegionSample(R, 1.0, 0.0, rng.uniform(), rng.uniform(), 0.0);
+        const int r = aimRay(X.x, X.y);
+        if (r < 0) continue;
+        ++nE; okE += r;
+    }
+    const double fUni = nUni ? (double)okUni / (double)nUni : 0.0;
+    const double fAim = nE ? (double)okE / (double)nE : 0.0;
+    C.cx = R.cx; C.a = R.a; C.b = R.b;
+    C.kind = (fAim > 1.1 * fUni) ? R.kind : LensPupil::FRONT;
+    return true;
+}
+
+// Where a ray leaving the axial point z0 at a small angle, traced through surfaces j0, j0+dj,
+// ..., crosses the axis once it is out: the pupil the stop at z0 makes through them. NaN if
+// the ray is clipped or comes out parallel.
+inline double pupilImageZ(const LensSystem& L, double z0, int j0, int dj, double lambda) {
+    const int M = (int)L.surf.size();
+    const double ang = 1e-3;
+    Vec3 o(0.0, 0.0, z0), d(std::sin(ang), 0.0, dj < 0 ? std::cos(ang) : -std::cos(ang));
+    for (int j = j0; j >= 0 && j < M; j += dj) {
+        Vec3 hp, n;
+        if (!L.hitSurface(j, o, d, hp, n)) return NAN;
+        o = hp;
+        if (L.surf[j].radius != 0.0) {
+            const double eta = (dj < 0) ? L.iorSensorSide(j, lambda) / L.iorSceneSide(j, lambda)
+                                        : L.iorSceneSide(j, lambda) / L.iorSensorSide(j, lambda);
+            Vec3 nd;
+            if (!LensSystem::refractDir(d, n, eta, nd)) return NAN;
+            d = nd;
+        }
+    }
+    if (!(std::fabs(d.x) > 1e-12)) return NAN;
+    return o.z - o.x * d.z / d.x;
+}
+
+// A bin with no light keeps the unaimed sampler if a neighbour (lit[] true) saw any -- its
+// footprint may be too thin for the batches to have hit -- and rejects only when none did.
+inline void resolveUnlit(std::vector<LensPupilCell>& cells, const std::vector<char>& lit, int n0, int n1) {
+    for (int i = 0; i < n0; ++i)
+        for (int j = 0; j < n1; ++j) {
+            if (lit[(size_t)(i * n1 + j)]) continue;
+            bool byLit = false;
+            for (int di = -1; di <= 1 && !byLit; ++di)
+                for (int dj = -1; dj <= 1 && !byLit; ++dj) {
+                    const int a = i + di, b = j + dj;
+                    if (a >= 0 && a < n0 && b >= 0 && b < n1 && lit[(size_t)(a * n1 + b)]) byLit = true;
+                }
+            cells[(size_t)(i * n1 + j)].kind = byLit ? LensPupil::FRONT : LensPupil::NONE;
+        }
+}
+}   // namespace lenspupil
+
+// Build both tables for lens L focused as it is, for a film reaching `racc` mm from the
+// sensor's centre. Null if the lens is empty or the build was stopped (-stop).
 inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, double racc) {
     const int M = (int)L.surf.size();
     if (M == 0 || !(racc > 0.0)) return nullptr;
@@ -423,54 +607,41 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
         }
         if (stop < 0) stop = 0;
     }
-    // The entrance pupil's plane: where the chief ray, leaving the stop's centre for the scene
-    // at a small angle, crosses the axis in object space. A plane elsewhere would still be
-    // exact, only less tight.
+    P->stop = stop;
+    P->racc2 = racc * racc;
+    P->filmZ = L.filmZ;
+    const double lamLo = 360.0, lamHi = 830.0;          // every wavelength a scene can carry
+    constexpr double kWiden = 0.15;                     // a bin's points reach 15% past its edges:
+                                                        // a region's extremes sit at those edges,
+                                                        // which points drawn only inside approach
+                                                        // but never reach
+
+    // ---- the entrance side ----
+    // The plane: where the chief ray, leaving the stop's centre for the scene at a small angle,
+    // crosses the axis in object space. A plane elsewhere would still be exact, only less tight.
     double zRef = L.zpos[stop];
     if (stop > 0) {
-        const double ang = 1e-3;
-        Vec3 o(0.0, 0.0, L.zpos[stop]), d(std::sin(ang), 0.0, std::cos(ang));
-        bool ok = true;
-        for (int j = stop - 1; j >= 0 && ok; --j) {
-            Vec3 hp, n;
-            if (!L.hitSurface(j, o, d, hp, n)) { ok = false; break; }
-            o = hp;
-            if (L.surf[j].radius != 0.0) {
-                Vec3 nd;
-                if (!LensSystem::refractDir(d, n, L.iorSensorSide(j, lamD) / L.iorSceneSide(j, lamD), nd)) ok = false;
-                else d = nd;
-            }
-        }
-        if (ok && std::fabs(d.x) > 1e-12) {
-            const double z = o.z - o.x * d.z / d.x;
-            if (std::isfinite(z)) zRef = z;
-        }
+        const double z = lenspupil::pupilImageZ(L, L.zpos[stop], stop - 1, -1, lamD);
+        if (std::isfinite(z)) zRef = z;
     }
     const double capR = L.capRadius(0), ap0 = L.surf[0].aperture;
     const double track = L.zpos[0] - L.zpos[M - 1];
     zRef = std::max(std::min(zRef, L.zpos[0]), L.zpos[M - 1] - track - 10.0);
-    P->stop = stop;
     P->zRef = zRef;
     P->zStart = L.zpos[0] + capR + 1.0;
     P->dMin = (P->zStart - zRef) + 4.0 * capR;
-    P->racc2 = racc * racc;
-    P->filmZ = L.filmZ;
     P->nTheta = 64; P->nU = 8;
     P->dTheta = 0.5 * PI / P->nTheta;
     const int nCells = P->nTheta * P->nU;
     P->cells.assign((size_t)nCells, LensPupilCell{});
-    std::vector<char> lit((size_t)nCells, 0);          // did any light get through in this bin?
+    std::vector<char> lit((size_t)nCells, 0);
     std::vector<long long> enl((size_t)nCells, 0);
-    const double lamLo = 360.0, lamHi = 830.0;          // every wavelength a scene can carry
-    const bool done = ft::parallelFor((size_t)nCells, 1, [&](size_t ci) {
+    bool done = ft::parallelFor((size_t)nCells, 1, [&](size_t ci) {
         const int it = (int)ci / P->nU, iu = (int)ci % P->nU;
         Pcg32 rng; rng.seed(0x9e3779b97f4a7c15ULL + ci, 0x5e1ec7ULL);
-        // A scene point at azimuth 0 (the +x half of the x-z plane) in this bin widened by 15% of
-        // its width on every side: a region's extremes sit at the bin's edges, which points
-        // drawn only inside would approach but never reach. False where the point lies beside
-        // the glass, which classify never aims from.
+        // A scene point of the (widened) bin at azimuth 0, the +x half of the x-z plane; false
+        // where it lies beside the glass, which classify never aims from.
         auto point = [&](Vec3& p) {
-            constexpr double kWiden = 0.15;
             const double th = std::min(std::max((it - kWiden + (1.0 + 2.0 * kWiden) * rng.uniform()) * P->dTheta,
                                                 0.0), 0.5 * PI - 1e-9);
             const double u = std::max((iu - kWiden + (1.0 + 2.0 * kWiden) * (1.0 - rng.uniform())) / P->nU,
@@ -484,8 +655,7 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
             if (!L.traceToFilm(o, d, lamLo + (lamHi - lamLo) * rng.uniform(), f, df)) return false;
             return f.x * f.x + f.y * f.y <= P->racc2;
         };
-        // One ray the front sampler's way: -1 no usable point, 0 lost, 1 reached the film
-        // (X = its crossing, y folded to >= 0 by the mirror symmetry about the x-z plane).
+        // Uniform on the front cap, as lensEntry's front sampler draws.
         auto frontRay = [&](Vec3& X) {
             Vec3 p;
             if (!point(p)) return -1;
@@ -507,7 +677,7 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
             X.y = std::fabs(X.y);
             return 1;
         };
-        // One ray aimed at crossing (ex, ey) the way lensEntry aims.
+        // Aimed at crossing (ex, ey), as lensEntry aims.
         auto aimRay = [&](double ex, double ey) {
             Vec3 p;
             if (!point(p)) return -1;
@@ -517,135 +687,95 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
             const Vec3 o = X - d * ((P->zStart - zRef) / -d.z);
             return reaches(o, d) ? 1 : 0;
         };
-        std::vector<double> xs, ys;                    // crossings that reached the film
-        long long nUni = 0, okUni = 0;                 // uniform rays tried / through
-        auto uniformBatch = [&](int n) {
-            for (int k = 0; k < n; ++k) {
-                Vec3 X;
-                const int r = frontRay(X);
-                if (r < 0) continue;
-                ++nUni;
-                if (r) { ++okUni; xs.push_back(X.x); ys.push_back(X.y); }
-            }
-        };
-        uniformBatch(1536);
-        if (xs.empty()) uniformBatch(2048);
-        LensPupilCell& C = P->cells[ci];
-        if (xs.empty()) { C.kind = LensPupil::NONE; return; }   // dilated below
-        lit[ci] = 1;
-        auto fit = [&](double& cx, double& a, double& b) {
-            double x0 = 1e300, x1 = -1e300, y1 = 0.0;
-            for (size_t i = 0; i < xs.size(); ++i) {
-                x0 = std::min(x0, xs[i]); x1 = std::max(x1, xs[i]); y1 = std::max(y1, ys[i]);
-            }
-            cx = 0.5 * (x0 + x1);
-            a = std::max(0.5 * (x1 - x0), 1e-6 * ap0);
-            b = std::max(y1, 1e-6 * ap0);
-        };
-        // Find the edge: aim inside a padded ellipse round what the uniform rays found, and
-        // grow it until nothing that gets through comes near its rim.
-        double cx, a, b;
-        fit(cx, a, b);
-        double ra = 1.3 * a + 0.02 * ap0, rb = 1.3 * b + 0.02 * ap0;
-        bool bounded = false;
-        for (int round = 0; round < 8 && !bounded; ++round) {
-            std::vector<double> bx, by;
-            double edge = 0.0;
-            for (int k = 0; k < 1536; ++k) {
-                const double rr = std::sqrt(rng.uniform()), an = 2.0 * PI * rng.uniform();
-                const double ex = cx + ra * rr * std::cos(an), ey = rb * rr * std::sin(an);
-                const int r = aimRay(ex, ey);
-                if (r == 1) { bx.push_back(ex); by.push_back(std::fabs(ey)); edge = std::max(edge, rr); }
-            }
-            if (edge < 0.92) {
-                bounded = true;
-                xs.insert(xs.end(), bx.begin(), bx.end());
-                ys.insert(ys.end(), by.begin(), by.end());
-            } else {
-                ra *= 1.5; rb *= 1.5;
-            }
-        }
-        if (!bounded) { C.kind = LensPupil::FRONT; return; }
-        // The region: centred on the crossings' extent. An ellipse when the crossings fit one
-        // (scaled to hold every one, it grows by at most 5%), else the extent's rectangle -- an
-        // ellipse round a crescent's horns would need its sparse tips sampled to be sure of
-        // holding them, a rectangle only the extent. Padded 3%.
-        fit(cx, a, b);
-        double s = 0.0;
-        for (size_t i = 0; i < xs.size(); ++i) {
-            const double qx = (xs[i] - cx) / a, qy = ys[i] / b;
-            s = std::max(s, std::sqrt(qx * qx + qy * qy));
-        }
-        LensPupilCell R;
-        R.cx = cx;
-        if (s <= 1.05) { R.kind = LensPupil::AIM;    R.a = a * s * 1.03 + 1e-4 * ap0; R.b = b * s * 1.03 + 1e-4 * ap0; }
-        else           { R.kind = LensPupil::AIMBOX; R.a = a * 1.03 + 1e-4 * ap0;     R.b = b * 1.03 + 1e-4 * ap0; }
-        // Check with fresh uniform rays that whatever reaches the film falls inside, enlarging
-        // over any that does not, until a whole batch finds nothing outside. A region that
-        // never comes clean keeps the front sampler.
-        bool clean = false;
-        for (int round = 0; round < 6 && !clean; ++round) {
-            const size_t from = xs.size();
-            uniformBatch(2048);
-            double grow = 1.0;
-            for (size_t i = from; i < xs.size(); ++i) {
-                const double q = LensPupil::regionNorm(R, xs[i], ys[i]);
-                if (q > 1.0) { ++enl[ci]; grow = std::max(grow, q); }
-            }
-            if (grow > 1.0) { R.a *= grow * 1.03; R.b *= grow * 1.03; }
-            else clean = true;
-        }
-        if (!clean) { C.kind = LensPupil::FRONT; return; }
-        cx = R.cx; a = R.a; b = R.b;
-        // Aim only where it pays: the share of aimed rays that get through against the share
-        // of uniform ones, measured on the same points.
-        long long nE = 0, okE = 0;
-        for (int k = 0; k < 1024; ++k) {
-            double ex, ey;
-            if (R.kind == LensPupil::AIMBOX) {
-                ex = cx + a * (2.0 * rng.uniform() - 1.0);
-                ey = b * (2.0 * rng.uniform() - 1.0);
-            } else {
-                const double rr = std::sqrt(rng.uniform()), an = 2.0 * PI * rng.uniform();
-                ex = cx + a * rr * std::cos(an);
-                ey = b * rr * std::sin(an);
-            }
-            const int r = aimRay(ex, ey);
-            if (r < 0) continue;
-            ++nE; okE += r;
-        }
-        const double fFront = nUni ? (double)okUni / (double)nUni : 0.0;
-        const double fAim = nE ? (double)okE / (double)nE : 0.0;
-        C.cx = cx; C.a = a; C.b = b;
-        C.kind = (fAim > 1.1 * fFront) ? R.kind : LensPupil::FRONT;
+        lit[ci] = lenspupil::fitRegion(rng, frontRay, aimRay, ap0, P->cells[ci], enl[ci]) ? 1 : 0;
     });
     if (!done) return nullptr;
-    // A bin where no light got through keeps the front sampler if a neighbour saw any (its
-    // footprint may be too thin for the batch to have hit), and rejects only when none did.
-    for (int it = 0; it < P->nTheta; ++it)
-        for (int iu = 0; iu < P->nU; ++iu) {
-            LensPupilCell& C = P->cells[(size_t)(it * P->nU + iu)];
-            if (lit[(size_t)(it * P->nU + iu)]) continue;
-            bool byLit = false;
-            for (int dt = -1; dt <= 1 && !byLit; ++dt)
-                for (int du = -1; du <= 1 && !byLit; ++du) {
-                    const int jt = it + dt, ju = iu + du;
-                    if (jt >= 0 && jt < P->nTheta && ju >= 0 && ju < P->nU && lit[(size_t)(jt * P->nU + ju)])
-                        byLit = true;
-                }
-            C.kind = byLit ? LensPupil::FRONT : LensPupil::NONE;
-        }
+    lenspupil::resolveUnlit(P->cells, lit, P->nTheta, P->nU);
     for (const LensPupilCell& C : P->cells) {
         if (C.kind == LensPupil::AIM || C.kind == LensPupil::AIMBOX) ++P->nAim;
         else if (C.kind == LensPupil::NONE) ++P->nNone;
         else ++P->nFront;
     }
     for (long long e : enl) P->enlarged += e;
+
+    // ---- the exit side ----
+    // The plane: where the chief ray, leaving the stop's centre for the sensor, crosses the axis
+    // once out of the glass. It must lie in front of the sensor, which aims from below it.
+    const int jr = M - 1;
+    double zExit = L.zpos[stop];
+    if (stop < jr) {
+        const double z = lenspupil::pupilImageZ(L, L.zpos[stop], stop + 1, +1, lamD);
+        if (std::isfinite(z)) zExit = z;
+    }
+    zExit = std::min(zExit, L.zpos[0]);
+    if (!(zExit > L.filmZ + 1.0)) zExit = std::max(L.zpos[jr], L.filmZ + 1.0);
+    const double apR = L.surf[jr].aperture;
+    P->zExit = zExit;
+    P->nRho = 64;
+    P->dRho = racc / P->nRho;
+    P->exitCells.assign((size_t)P->nRho, LensPupilCell{});
+    std::vector<char> litE((size_t)P->nRho, 0);
+    std::vector<long long> enlE((size_t)P->nRho, 0);
+    done = ft::parallelFor((size_t)P->nRho, 1, [&](size_t ci) {
+        const int ir = (int)ci;
+        Pcg32 rng; rng.seed(0x2545f4914f6cdd1dULL + ci, 0xe417ULL);
+        // A film point of the (widened) bin at azimuth 0.
+        auto filmPoint = [&]() {
+            const double r = std::max((ir - kWiden + (1.0 + 2.0 * kWiden) * rng.uniform()) * P->dRho, 0.0);
+            return Vec3(r, 0.0, L.filmZ);
+        };
+        auto getsOut = [&](const Vec3& f, const Vec3& d) {
+            Ray out;
+            return L.trace(f, d, lamLo + (lamHi - lamLo) * rng.uniform(), /*sensorToScene=*/true, out);
+        };
+        // Uniform on the rear element, as genLensRay's unaimed sampler draws: its disk when
+        // planar, else its clear cap, from the first side the film point sees.
+        auto rearRay = [&](Vec3& X) {
+            const Vec3 f = filmPoint();
+            Vec3 d;
+            if (L.surf[jr].radius != 0.0) {
+                Vec3 nR;
+                const Vec3 pR = L.sampleSurface(jr, rng.uniform(), rng.uniform(), nR);
+                d = pR - f;
+                const double r = length(d);
+                if (!(r > 1e-12)) return 0;
+                d = d / r;
+                if (!(d.z > 0.0)) return 0;
+                Vec3 h, n;
+                if (!L.hitSurface(jr, f, d, h, n)) return 0;
+                const Vec3 g = h - pR;
+                if (dot(g, g) > 1e-12) return 0;
+            } else {
+                const double rr = std::sqrt(rng.uniform()) * apR, ph = 2.0 * PI * rng.uniform();
+                d = normalize(Vec3(rr * std::cos(ph), rr * std::sin(ph), L.zpos[jr]) - f);
+                if (!(d.z > 0.0)) return 0;
+            }
+            if (!getsOut(f, d)) return 0;
+            X = f + d * ((zExit - f.z) / d.z);
+            X.y = std::fabs(X.y);
+            return 1;
+        };
+        // Aimed at crossing (ex, ey), as genLensRay aims.
+        auto aimRay = [&](double ex, double ey) {
+            const Vec3 f = filmPoint();
+            const Vec3 d = normalize(Vec3(ex, ey, zExit) - f);
+            return getsOut(f, d) ? 1 : 0;
+        };
+        litE[ci] = lenspupil::fitRegion(rng, rearRay, aimRay, apR, P->exitCells[ci], enlE[ci]) ? 1 : 0;
+    });
+    if (!done) return nullptr;
+    lenspupil::resolveUnlit(P->exitCells, litE, P->nRho, 1);
+    for (const LensPupilCell& C : P->exitCells) {
+        if (C.kind == LensPupil::AIM || C.kind == LensPupil::AIMBOX) ++P->nExitAim;
+        else if (C.kind == LensPupil::NONE) ++P->nExitNone;
+        else ++P->nExitFront;
+    }
+    for (long long e : enlE) P->exitEnlarged += e;
     return P;
 }
 
-// The table for a shared lens and film radius, built once and kept while the lens lives (a
-// flyby's hundreds of frames share one lens). Prints a line when it builds one.
+// The tables for a shared lens and film radius, built once and kept while the lens lives (a
+// flyby's hundreds of frames share one lens). Prints a line when it builds them.
 inline std::shared_ptr<const LensPupil> lensPupilFor(const std::shared_ptr<LensSystem>& L, double racc) {
     if (!L || L->surf.empty()) return nullptr;
     struct Entry { std::weak_ptr<LensSystem> lens; double racc, filmZ; std::shared_ptr<const LensPupil> tab; };
@@ -660,10 +790,12 @@ inline std::shared_ptr<const LensPupil> lensPupilFor(const std::shared_ptr<LensS
     std::shared_ptr<const LensPupil> tab = buildLensPupil(*L, racc);
     if (!tab) return nullptr;
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    std::printf("[lens] '%s': pupil table aims light at the stop (surface %d, entrance pupil at "
-                "z=%.2f mm) in %d of %d bins, keeps the front sampler in %d, rejects %d; %.0f ms\n",
-                L->name.c_str(), tab->stop, tab->zRef, tab->nAim, (int)tab->cells.size(),
-                tab->nFront, tab->nNone, ms);
+    std::printf("[lens] '%s': pupil tables aim at the stop (surface %d): light in %d of %d bins "
+                "(front sampler %d, rejects %d), camera rays in %d of %d (rear sampler %d, rejects "
+                "%d); %.0f ms\n",
+                L->name.c_str(), tab->stop, tab->nAim, (int)tab->cells.size(), tab->nFront,
+                tab->nNone, tab->nExitAim, (int)tab->exitCells.size(), tab->nExitFront,
+                tab->nExitNone, ms);
     cache.push_back({L, racc, L->filmZ, tab});
     return tab;
 }

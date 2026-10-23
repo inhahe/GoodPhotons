@@ -2795,6 +2795,99 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
                     100.0 * hit[0] / n, 100.0 * hit[1] / n);
         pass = pass && (hit[0] + hit[1] == 0 || z6 < 4.0);
     }
+    // The exit side: camera rays. A film point as genLensRay lays one out.
+    const double halfW = 0.5 * CL.filmW_mm, halfH = halfW * 43.0 / 64.0;
+    auto filmPoint = [&](double fx, double fy) {        // fx, fy in [0, 1) across the raster
+        return Vec3(-(2.0 * fx - 1.0) * halfW, -(2.0 * fy - 1.0) * halfH, CL.filmZ);
+    };
+    const int jr = (int)CL.surf.size() - 1;
+    // (7) coverage: unaimed rays (uniform on the rear element, as genLensRay draws where the
+    // table does not aim) that get out of the lens fall inside their film point's region, and
+    // none comes from a rejecting bin.
+    long long out7 = 0, outside7 = 0, rejected7 = 0, aimed7 = 0;
+    for (int k = 0; k < 2000000; ++k) {
+        const Vec3 f = filmPoint(rng.uniform(), rng.uniform());
+        Vec3 d;
+        if (CL.surf[jr].radius != 0.0) {
+            Vec3 nR;
+            const Vec3 pR = CL.sampleSurface(jr, rng.uniform(), rng.uniform(), nR);
+            d = pR - f;
+            const double r = length(d);
+            if (!(r > 1e-12)) continue;
+            d = d / r;
+            Vec3 h, n;
+            if (!(d.z > 0.0) || !CL.hitSurface(jr, f, d, h, n)) continue;
+            const Vec3 g = h - pR;
+            if (dot(g, g) > 1e-12) continue;
+        } else {
+            const double rr = std::sqrt(rng.uniform()) * CL.rearAperture(), ph = 2.0 * PI * rng.uniform();
+            d = normalize(Vec3(rr * std::cos(ph), rr * std::sin(ph), CL.rearZ()) - f);
+        }
+        Ray o;
+        if (!CL.trace(f, d, lambda, /*sensorToScene=*/true, o)) continue;
+        ++out7;
+        double cphi = 1.0, sphi = 0.0;
+        const int c = P->classifyFilm(f, cphi, sphi);
+        if (c == -2) { ++rejected7; continue; }
+        if (c < 0) continue;
+        ++aimed7;
+        if (!P->inExit(c, f + d * ((P->zExit - f.z) / d.z), cphi, sphi)) ++outside7;
+    }
+    std::printf("[checklens] %s: exit table aims in %d film bins, rear sampler in %d, rejects %d "
+                "(exit pupil z = %.2f mm, %lld build-time enlargements)\n",
+                preset, P->nExitAim, P->nExitFront, P->nExitNone, P->zExit, P->exitEnlarged);
+    std::printf("[checklens] %s: of %lld unaimed camera rays that got out, %lld from aimed film bins: "
+                "%lld outside the region, %lld from rejecting bins\n",
+                preset, out7, aimed7, outside7, rejected7);
+    pass = pass && out7 > 10000 && outside7 == 0 && rejected7 == 0;
+    // (8) every camera ray's importance times its BDPT density is cosF * A_front / A_film: the
+    // two describe one sampler (the film point is uniform; the rest cancels).
+    long long n8 = 0, bad8 = 0; double worst8 = 0.0;
+    const double aFilm = (2.0 * halfW) * (2.0 * halfH);
+    for (int k = 0; k < 400000; ++k) {
+        const int px = (int)(rng.uniform() * 64), py = (int)(rng.uniform() * 43);
+        Ray r; double wgt;
+        if (!cam.genLensRay(px, py, rng.uniform(), rng.uniform(), rng.uniform(), rng.uniform(),
+                            lambda, r, wgt) || !(wgt > 0.0)) continue;
+        ++n8;
+        const Vec3 yl = cam.lensLocalPoint(r.o), wl = cam.lensLocalDir(r.d);
+        const Vec3 n0 = (CL.surf[0].radius == 0.0) ? Vec3(0, 0, 1)
+                                                   : normalize(yl - Vec3(0, 0, CL.zpos[0] + CL.surf[0].radius));
+        const double want = std::fabs(dot(wl, n0)) * CL.frontArea() / aFilm;
+        const double rel = std::fabs(wgt * cam.lensPdfDir(r.o, r.d, lambda) / want - 1.0);
+        worst8 = std::max(worst8, rel);
+        if (!(rel < 1e-6)) ++bad8;
+    }
+    std::printf("[checklens] %s: %lld camera rays, %lld whose importance x density is off "
+                "cosF A_front / A_film (worst relative error %.1e)\n", preset, n8, bad8, worst8);
+    pass = pass && n8 > 0 && bad8 == 0;
+    // (9) aimed against unaimed camera rays: the mean importance at a film point (its irradiance
+    // per unit radiance) and the share of rays that get out.
+    for (const auto& fp : {std::array<double, 2>{0.5, 0.5}, std::array<double, 2>{0.75, 0.6},
+                           std::array<double, 2>{0.97, 0.95}}) {
+        const int px = (int)(fp[0] * 64), py = (int)(fp[1] * 43);
+        double s[2] = {0, 0}, s2[2] = {0, 0}; long long hit[2] = {0, 0};
+        const int n = 400000;
+        for (int which = 0; which < 2; ++which) {
+            const Camera& cc = which ? camF : cam;
+            for (int k = 0; k < n; ++k) {
+                Ray r; double wgt;
+                if (!cc.genLensRay(px, py, 0.5, 0.5, rng.uniform(), rng.uniform(), lambda, r, wgt) ||
+                    !(wgt > 0.0)) continue;
+                s[which] += wgt; s2[which] += wgt * wgt; ++hit[which];
+            }
+        }
+        double m[2], se[2];
+        for (int i = 0; i < 2; ++i) {
+            m[i] = s[i] / n;
+            se[i] = std::sqrt(std::max(0.0, s2[i] / n - m[i] * m[i]) / n);
+        }
+        const double z9 = std::fabs(m[0] - m[1]) / std::max(std::sqrt(se[0] * se[0] + se[1] * se[1]), 1e-300);
+        std::printf("[checklens] %s: film pixel (%d, %d): importance aimed %.5e +- %.1e, unaimed %.5e "
+                    "+- %.1e (%.1f sigma); rays out aimed %.1f%%, unaimed %.1f%%\n",
+                    preset, px, py, m[0], se[0], m[1], se[1], z9, 100.0 * hit[0] / n, 100.0 * hit[1] / n);
+        pass = pass && (hit[0] + hit[1] == 0 || z9 < 4.0);
+    }
     std::printf("[checklens] %s %s\n", preset, pass ? "PASS" : "FAIL");
     return pass;
 }

@@ -3,7 +3,8 @@
     python tools/check_physlens.py [--exe ftrace.exe] [--cpu-only]
 
 A camera's `lens { }` is imaged two ways. Mode R traces camera rays out through the glass
-(genLensRay). The forward modes trace light in: A and B splat every vertex through a sampled
+(genLensRay, aimed at the exit pupil by the pupil table; R is also checked against itself with
+the aiming off, FTRACE_LENS_FRONT, and across devices). The forward modes trace light in: A and B splat every vertex through a sampled
 point of the front element (one estimator under a physical lens, so their rows match to the
 digit; B's is there to catch it falling back to the pinhole), C catches what flies through
 it, and D/J add that light image
@@ -127,10 +128,19 @@ def main():
     allok = True
     for lens in ('achromat', 'singlet'):
         print(f'{lens}:')
-        ref = render(exe, scenes[lens], f'{lens}_R', ['-mode', 'R', '-spp', '4096', '-device',
-                                                       'gpu' if 'gpu' in devices else 'cpu'])
+        refdev = 'gpu' if 'gpu' in devices else 'cpu'
+        ref = render(exe, scenes[lens], f'{lens}_R', ['-mode', 'R', '-spp', '4096', '-device', refdev])
         if ref is None:
             return 1
+        # R itself aims its camera rays at the exit pupil: the other device's R, and R with the
+        # aiming off (FTRACE_LENS_FRONT), must agree with the reference.
+        for dev, env, label in ((('cpu' if refdev == 'gpu' else None), None, 'R on the CPU'),
+                                (refdev, {'FTRACE_LENS_FRONT': '1'}, f'R on the {refdev.upper()}, unaimed')):
+            if dev is None:
+                continue
+            img = render(exe, scenes[lens], f'{lens}_R_{dev}{"_front" if env else ""}',
+                         ['-mode', 'R', '-spp', '4096', '-device', dev], env=env)
+            allok = (img is not None and compare(label, ref, img, REGIONS, TOL)) and allok
         for dev in devices:
             for mode, args in (('A', ['-n', '200000000']), ('B', ['-n', '200000000']),
                                ('D', ['-spp', '4096'])):
@@ -139,14 +149,18 @@ def main():
                     allok = False
                     continue
                 allok = compare(f'{mode} on the {dev.upper()}', ref, img, REGIONS, TOL) and allok
-    # R's camera samples the whole rear element, of which the f/8 beam uses ~5%
-    # (known-issues.md PHYSLENS-REAR-SAMPLING), hence its 32768 spp: at 16384 two seeds of it
-    # differed by 0.8% on the small blue sphere.
     print('double Gauss at f/8 (front element ~6x the beam):')
-    ref = render(exe, scenes['dg8'], 'dg8_R', ['-mode', 'R', '-spp', '32768', '-device',
-                                              'gpu' if 'gpu' in devices else 'cpu'])
+    refdev = 'gpu' if 'gpu' in devices else 'cpu'
+    ref = render(exe, scenes['dg8'], 'dg8_R', ['-mode', 'R', '-spp', '16384', '-device', refdev])
     if ref is None:
         return 1
+    # Unaimed, R's camera rays use ~5% of the rear element at f/8, hence 16x the samples.
+    if refdev == 'gpu':
+        img = render(exe, scenes['dg8'], 'dg8_R_cpu', ['-mode', 'R', '-spp', '4096', '-device', 'cpu'])
+        allok = (img is not None and compare('R on the CPU', ref, img, REGIONS, TOL)) and allok
+    img = render(exe, scenes['dg8'], f'dg8_R_{refdev}_front', ['-mode', 'R', '-spp', '65536', '-device', refdev],
+                 env={'FTRACE_LENS_FRONT': '1'})
+    allok = (img is not None and compare(f'R on the {refdev.upper()}, unaimed', ref, img, REGIONS, TOL)) and allok
     for dev in devices:
         for mode, args in (('A', ['-n', '200000000']), ('D', ['-spp', '4096'])):
             img = render(exe, scenes['dg8'], f'dg8_{mode}_{dev}', ['-mode', mode, '-device', dev] + args)

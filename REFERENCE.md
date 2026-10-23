@@ -1977,11 +1977,16 @@ whose front element is much wider than the beam its stop admits (a fast wide-ang
 lens stopped down) wastes no samples on glass the beam never crosses, and a vertex outside the
 field of view costs a table lookup instead of a trace through the glass. Where aiming would
 not pay (the stop already fills the front element, as in the presets near the axis) a bin
-keeps the uniform front-element sampling. Same image, less noise: the table only moves
-samples to where light gets through. `-checklens` checks it holds every ray that reaches the
-film, and `FTRACE_LENS_FRONT=1` turns the aiming off (every lens camera samples the whole
-front element) for comparing a render with and without it. It maps the sensor across the film
-width, so a
+keeps the uniform front-element sampling. Camera rays are aimed the same way from the other
+side: mode `R`, and the camera half of `D` and `J`, used to pick where each ray leaves the
+film anywhere on the rear element, of which a stopped-down beam uses a few per cent (5% for a
+50 mm double Gauss at f/8); a second table, binned by distance from the sensor's centre, holds
+where on the exit pupil's plane the rays that get out of the lens cross, and camera rays are
+drawn there (pbrt's exit-pupil bounds, built the same way as the light's table). Same image,
+less noise: the tables only move samples to where light gets through. `-checklens` checks
+they hold every ray that gets through, and `FTRACE_LENS_FRONT=1` turns all aiming off (every
+lens camera samples its whole front and rear elements) for comparing a render with and
+without it. It maps the sensor across the film width, so a
 film whose aspect matches the sensor (e.g. `res 360 240` for a 3:2 sensor) covers it
 without cropping, while a mismatched aspect crops. It does not model inter-element
 flare/ghosting or shaped-iris bokeh. On the GPU it inherits its mode's scope (no

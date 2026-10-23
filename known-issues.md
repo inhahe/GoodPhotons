@@ -2721,19 +2721,22 @@ is larger. **Proper fix:** UPBP-BEAM-RADIUS's (a kernel radius that shrinks with
 count, or a bias-corrected kernel). The lens check holds J to J with the aiming off instead of
 to R for this reason. Repro: `scenes/_realcam_fog.ftsl`.
 
-## OPEN (2026-10-23): PHYSLENS-REAR-SAMPLING — the backward lens camera samples the whole rear element, which wastes most camera rays on a lens stopped down
+## DONE (2026-10-23, 0.396.0): PHYSLENS-REAR-SAMPLING — the backward lens camera sampled the whole rear element, which wasted most camera rays on a lens stopped down
 
 The mirror image of PHYSLENS-FRONT-SAMPLING, on the camera side. `Camera::genLensRay` (mode R,
-the default for a lens camera, and BDPT's camera subpaths) draws the film point and then a point
-uniform on the rear element (its disk, or its clear cap when curved). `-checklens`'s (1) measures
-the share of those rays the lens does not clip: 0.567 for the achromat, 0.985 for the singlet,
-**0.050 for the double Gauss at f/8** -- R there traces twenty camera rays for every one that
-reaches the scene. **Proper fix:** pbrt's exit-pupil bounds (RealisticCamera::BoundExitPupil),
-built the way LensPupil is: per film radius bin, a region on the rear element (or the exit-pupil
-plane) holding every film-to-scene ray that gets through, found by tracing, padded and verified;
-genLensRay draws inside it, rotated to the film point's azimuth. `lensPdfDir` is BDPT's camera
-density and must follow the same sampler (the region's area replaces A_rear / A_cap, zero outside
-it), and `addEnvBackgroundLens` and `-checklens`'s (1)-(2) with it.
+the default for a lens camera, and BDPT's camera subpaths) drew the film point and then a point
+uniform on the rear element (its disk, or its clear cap when curved). The share of those rays
+that get out of the lens, measured by `-checklens`: 56.6% for the achromat at the film's
+centre, 99% for the singlet, **5.0% for the double Gauss at f/8** -- R traced twenty camera rays
+there for every one that reached the scene. Fixed the way pbrt's exit-pupil bounds do it,
+built like the entrance table: `LensPupil::exitCells`, 64 bins by film radius, each a region
+on the exit-pupil plane holding every film-to-scene ray that gets out (lenspupil::fitRegion,
+the same procedure as the entrance side). genLensRay aims there; lensPdfDir follows the same
+density; the camera density stays a function of the ray alone, so nothing else in BDPT
+changes. Rays out now ~94% (achromat), ~92% (double Gauss f/8); the singlet keeps the rear
+sampler (no gain). `-checklens` asserts coverage, aimed-vs-unaimed irradiance at three film
+points, and importance x lensPdfDir = cosF A_front / A_film for every camera ray;
+`tools/check_physlens.py` R aimed against R unaimed and across devices.
 
 ## OPEN (2026-10-23): GLTF-MAP-MEAN-GUTTERS — the importer's mean metalness and roughness count the atlas gutters
 
