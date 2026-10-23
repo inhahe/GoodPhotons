@@ -2907,35 +2907,47 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
     std::printf("[checklens] %s %s\n", preset, pass ? "PASS" : "FAIL");
     return pass;
 }
-// pbrt's dgauss.50mm.dat (Tronnier, US 2,673,491), as `lens { surface ... }` reads it: radii
-// negated into LensSystem's frame, apertures halved. `stopSemi` sets the f-number (8.55 mm is
-// f/2, 2.14 mm f/8).
-static LensSystem checkLensDGauss(double stopSemi) {
-    const double rows[11][4] = {{29.475, 3.76, 1.67, 12.6}, {84.83, 0.12, 1, 12.6}, {19.275, 4.025, 1.67, 11.5},
-                                {40.77, 3.275, 1.699, 11.5}, {12.75, 5.705, 1, 9.0}, {0, 4.5, 1, stopSemi},
-                                {-14.495, 1.18, 1.603, 8.5}, {40.77, 6.065, 1.658, 10.0},
-                                {-20.385, 0.19, 1, 10.0}, {437.065, 3.22, 1.717, 10.0}, {-39.73, 40, 1, 10.0}};
-    LensSystem L; L.name = "dgauss";
-    for (const auto& r : rows) {
-        LensSurface s;
-        s.radius = (r[0] == 0.0) ? 0.0 : -r[0];
-        s.thickness = r[1]; s.ior = iorConstant(r[2]); s.aperture = r[3];
-        s.isStop = (r[0] == 0.0);
-        L.surf.push_back(s);
+// The dgauss preset (makeDoubleGauss) is a published prescription scaled and stopped down:
+// (12) it must come out at the focal length and f-number asked for -- the entrance pupil's
+// diameter focal / N -- and a request wider than the design's f/2 must stop there.
+static bool checkLensDGaussPreset() {
+    auto measure = [](double focal, double fstop, double& f, double& N) {
+        LensSystem L;
+        if (!resolveLensPreset("dgauss", focal, fstop, L)) return false;
+        int stop = -1;
+        for (int j = 0; j < (int)L.surf.size(); ++j) if (L.surf[j].isStop) stop = j;
+        f = L.focalLengthMM();
+        N = f / (2.0 * L.surf[(size_t)stop].aperture * L.entrancePupilScale(stop));
+        return stop >= 0;
+    };
+    // The design's own widest opening: what any wider request is capped at.
+    double f0, Nmax;
+    if (!measure(50.0, 0.5, f0, Nmax)) { std::printf("[checklens] no dgauss preset\n"); return false; }
+    bool pass = Nmax > 1.9 && Nmax < 2.1;
+    std::printf("[checklens] dgauss preset: the design opens to f/%.4f\n", Nmax);
+    for (const auto& q : {std::array<double, 2>{50.0, 2.8}, {35.0, 4.0}, {85.0, 8.0}, {50.0, 2.0}, {50.0, 1.4}}) {
+        double f, N;
+        if (!measure(q[0], q[1], f, N)) { std::printf("[checklens] no dgauss preset\n"); return false; }
+        const double want = std::max(q[1], Nmax);
+        const bool ok = std::fabs(f / q[0] - 1.0) < 1e-6 && std::fabs(N / want - 1.0) < 1e-6;
+        std::printf("[checklens] dgauss preset asked %g mm f/%g: %.6f mm f/%.4f%s %s\n", q[0], q[1], f, N,
+                    q[1] < Nmax ? " (capped at the design's opening)" : "", ok ? "ok" : "WRONG");
+        pass = pass && ok;
     }
-    L.finalize();
-    return L;
+    return pass;
 }
 static bool checkLensPhysical() {
-    LensSystem a, s;
-    if (!resolveLensPreset("achromat", 50.0, 2.8, a) || !resolveLensPreset("singlet", 50.0, 4.0, s)) {
+    LensSystem a, s, d;
+    if (!resolveLensPreset("achromat", 50.0, 2.8, a) || !resolveLensPreset("singlet", 50.0, 4.0, s) ||
+        !resolveLensPreset("dgauss", 50.0, 8.0, d)) {
         std::printf("[checklens] missing a preset\n");
         return false;
     }
     const bool pa = checkLensPhysicalOne("achromat", a);
     const bool ps = checkLensPhysicalOne("singlet", s);
-    const bool pd = checkLensPhysicalOne("dgauss f/8", checkLensDGauss(2.14));
-    return pa && ps && pd;
+    const bool pd = checkLensPhysicalOne("dgauss f/8", d);
+    const bool pp = checkLensDGaussPreset();
+    return pa && ps && pd && pp;
 }
 
 // Deterministic thin-lens (mode C) self-test. Forward catch is far too photon-

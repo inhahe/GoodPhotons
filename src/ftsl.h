@@ -8181,7 +8181,7 @@ private:
             } else if (!preset.empty()) {
                 if (!resolveLensPreset(preset, focalMM, fstop, *sys)) {
                     fail("camera '" + cs.name + "' lens: unknown preset '" + preset +
-                         "' (singlet, achromat/doublet, telephoto, wide)"); return false;
+                         "' (singlet, achromat/doublet, telephoto, wide, dgauss)"); return false;
                 }
             } else {
                 *sys = makeAchromat(focalMM, fstop, defaultGlass("BK7"), defaultGlass("SF10"));

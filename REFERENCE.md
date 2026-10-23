@@ -1928,7 +1928,7 @@ camera "real" {
     focus 2.4
     film { res 512 512   format full-frame }
     lens {
-        preset achromat   # singlet | biconvex | achromat | doublet | telephoto | wide
+        preset achromat   # singlet | biconvex | achromat | doublet | telephoto | wide | dgauss
         focal 50          # mm
         fstop 2.8
         glass BK7
@@ -1939,6 +1939,14 @@ camera "real" {
 - **Presets** are physically derived (lensmaker equation for the singlet, Abbe-number
   power split for the achromatic doublet), so focal length and colour correction are
   correct by construction; render-time dispersion uses real Sellmeier glass indices.
+- **`preset dgauss`** (or `doublegauss`) is a real prescription instead: the 50 mm f/2
+  double Gauss of pbrt's `dgauss.50mm.dat` (Tronnier's patent, the classic normal-lens
+  design: two cemented meniscus groups round a central stop), scaled so its focal length is
+  exactly `focal` and stopped down to exactly `fstop` (sized from its own pupil
+  magnification). It opens no wider than its design's f/2 (f/2.03 measured), and the published prescription
+  gives each glass a single index, so it shows the double Gauss's distortion, field
+  curvature, vignetting and bokeh but no colour fringing. `scenes/realcam_dgauss.ftsl`
+  pastes the same rows as `surface` lines.
 - Or paste an **arbitrary real prescription** as repeated
   `surface <radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop]` lines, front
   (scene side) to rear, in the convention prescriptions are published in (pbrt lens files,

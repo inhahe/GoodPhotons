@@ -6425,7 +6425,12 @@ as the one at fault.
   come from `defaultGlass` (`spectral_library.h`): the `data/glass` file, else the same Schott
   Sellmeier fit built in, so a binary away from its data renders the same glass. An achromat is
   designed from its glasses' dispersion, and `makeAchromat` refuses two glasses without a
-  difference in it (the loader reports it) rather than design a NaN camera.
+  difference in it (the loader reports it) rather than design a NaN camera. `makeDoubleGauss`
+  (preset `dgauss`, 0.397.0) is the one preset that is a published prescription rather than a
+  design: pbrt's 50 mm f/2 double Gauss, scaled by focal / its measured focal length, its stop
+  sized through `LensSystem::entrancePupilScale` (the paraxial pupil magnification, which the
+  pupil tables also use to find an unmarked stop) for exactly f/`fstop`, capped at the
+  design's opening; one index per glass, as published, so no dispersion.
   - **The physical lens in both directions (0.394.0).** `genLensRay` is the camera's own
     direction, film -> glass -> scene (modes R, D, J). Light tracing needs the reverse, and
     three functions provide it, after Hanika & Dachsbacher 2014. `lensEntry` samples a point

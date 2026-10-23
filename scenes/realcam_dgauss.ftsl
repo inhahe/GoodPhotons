@@ -11,8 +11,13 @@
 #   ftrace -in scenes/realcam_dgauss.ftsl -spp 256 -o png/realcam_dgauss.png          (mode R)
 #   ftrace -in scenes/realcam_dgauss.ftsl -mode A -n 400000000 -o png/realcam_dgauss_a.png
 #
-# The stop's semi-aperture sets the f-number: 8.55 mm is f/2; 2.14 mm stops it to f/8, where
-# the front element (12.6 mm) is several times wider than the beam the stop lets through.
+# The stop's semi-aperture sets the f-number: 8.55 mm is the design's f/2 (f/2.03 measured);
+# 2.14 mm stops it to about f/8, where the front element (12.6 mm) is several times wider
+# than the beam the stop lets through.
+#
+# The same lens is built in as `lens { preset dgauss  focal 50  fstop 8 }`, which scales it to
+# exactly `focal` and sizes the stop for exactly `fstop`; this file shows how a prescription is
+# pasted.
 
 scene {
     units    meters

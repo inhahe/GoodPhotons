@@ -3104,7 +3104,10 @@ lens { surface <radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop]  … }
   convention (pbrt lens files, Zemax, patents): positive when the centre of curvature is on
   the sensor side, 0 for a plane.
 - Otherwise a `preset`: `singlet`/`biconvex`/`simple`, `achromat`/`doublet`,
-  `telephoto`, `wide` (default = achromatic doublet at the derived focal/f-number).
+  `telephoto`, `wide` (default = achromatic doublet at the derived focal/f-number), or
+  `dgauss`/`doublegauss`, a real 50 mm f/2 double Gauss prescription scaled to `focal` and
+  stopped to `fstop` (no wider than the design's f/2.03; no dispersion: the published prescription gives one
+  index per glass).
 - Sensor size comes from the camera `film` (default full-frame); autofocuses at `focus`.
 
 ---

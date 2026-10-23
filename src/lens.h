@@ -323,6 +323,28 @@ struct LensSystem {
         return true;
     }
 
+    // How wide a beam from the scene surface j's aperture admits, per unit of that aperture:
+    // a ray parallel to the axis at height h0 reaches surface j at height y_j (paraxially, at
+    // the design wavelength), so an aperture of radius a there makes an entrance pupil of
+    // radius a * h0 / y_j. Returns h0 / y_j, or 0 if the probe is lost before j.
+    double entrancePupilScale(int j) const {
+        const double lambdaD = 587.6;
+        const double h0 = 1e-3 * std::max(1e-3, surf[0].aperture);
+        Vec3 o(h0, 0.0, T + 1.0), d(0.0, 0.0, -1.0);
+        for (int i = 0; i <= j; ++i) {
+            Vec3 hp, n;
+            if (!hitSurface(i, o, d, hp, n)) return 0.0;
+            if (i == j) return std::fabs(hp.x) > 1e-15 ? h0 / std::fabs(hp.x) : 0.0;
+            o = hp;
+            if (surf[i].radius != 0.0) {
+                Vec3 nd;
+                if (!refractDir(d, n, iorSceneSide(i, lambdaD) / iorSensorSide(i, lambdaD), nd)) return 0.0;
+                d = nd;
+            }
+        }
+        return 0.0;
+    }
+
     // Effective focal length (mm), measured from a near-axis parallel probe at the
     // design wavelength: f = h / tan(angle of the emergent ray). Used for reporting.
     double focalLengthMM() const {
@@ -672,23 +694,12 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
     int stop = -1;
     for (int j = 0; j < M; ++j) if (L.surf[j].isStop) { stop = j; break; }
     if (stop < 0) {
-        const double h0 = 1e-3 * std::max(1e-3, L.surf[0].aperture);
-        Vec3 o(h0, 0.0, L.T + 1.0), d(0.0, 0.0, -1.0);
         double best = 1e300;
         for (int j = 0; j < M; ++j) {
-            Vec3 hp, n;
-            if (!L.hitSurface(j, o, d, hp, n)) break;
-            const double yj = std::fabs(hp.x);
-            if (yj > 1e-15) {
-                const double rep = L.surf[j].aperture * h0 / yj;
-                if (rep < best) { best = rep; stop = j; }
-            }
-            o = hp;
-            if (L.surf[j].radius != 0.0) {
-                Vec3 nd;
-                if (!LensSystem::refractDir(d, n, L.iorSceneSide(j, lamD) / L.iorSensorSide(j, lamD), nd)) break;
-                d = nd;
-            }
+            const double sc = L.entrancePupilScale(j);
+            if (!(sc > 0.0)) continue;
+            const double rep = L.surf[j].aperture * sc;
+            if (rep < best) { best = rep; stop = j; }
         }
         if (stop < 0) stop = 0;
     }
@@ -931,9 +942,52 @@ inline LensSystem makeAchromat(double focalMM, double fstop,
     return L;
 }
 
+// A real prescription: the 50 mm f/2 double Gauss of pbrt's dgauss.50mm.dat (Tronnier, US
+// 2,673,491; Smith, Modern Lens Design, p. 312), the classic normal-lens layout -- two
+// meniscus groups round a central stop. The rows are as published: radius in the published
+// sign convention (centre of curvature on the sensor side when positive, negated below into
+// this frame; 0 is the stop), gap to the next surface, refractive index, semi-aperture (the
+// file's diameters halved). The file gives each glass a single index, so the preset has no
+// dispersion. Scaled so its focal length is exactly `focalMM`; the stop is sized from its own
+// entrance-pupil magnification so the lens works at exactly f/`fstop`, but opens no wider than
+// the design's own stop, f/2.03 by that measure (a larger one would only be clipped by the
+// elements round it).
+inline LensSystem makeDoubleGauss(double focalMM, double fstop) {
+    static const double rows[11][4] = {
+        { 29.475, 3.76,  1.67,  12.6 }, { 84.83,  0.12,  1.0,   12.6 }, { 19.275, 4.025, 1.67,  11.5 },
+        { 40.77,  3.275, 1.699, 11.5 }, { 12.75,  5.705, 1.0,   9.0  }, { 0.0,    4.5,   1.0,   8.55 },
+        {-14.495, 1.18,  1.603, 8.5  }, { 40.77,  6.065, 1.658, 10.0 }, {-20.385, 0.19,  1.0,   10.0 },
+        { 437.065, 3.22, 1.717, 10.0 }, {-39.73,  40.0,  1.0,   10.0 }};
+    LensSystem L; L.name = "dgauss";
+    int stop = -1;
+    for (const auto& r : rows) {
+        LensSurface s;
+        s.radius = (r[0] == 0.0) ? 0.0 : -r[0];
+        s.thickness = r[1];
+        s.ior = iorConstant(r[2]);
+        s.aperture = r[3];
+        s.isStop = (r[0] == 0.0);
+        if (s.isStop) stop = (int)L.surf.size();
+        L.surf.push_back(s);
+    }
+    L.finalize();
+    const double f0 = L.focalLengthMM();
+    const double k = (f0 > 0.0 && focalMM > 0.0) ? focalMM / f0 : 1.0;
+    for (LensSurface& s : L.surf) { s.radius *= k; s.thickness *= k; s.aperture *= k; }
+    L.finalize();
+    // The entrance pupil f/N needs is focal / 2N across; the stop that makes it is that over the
+    // stop's pupil scale.
+    const double sc = L.entrancePupilScale(stop);
+    const double want = (sc > 0.0 && fstop > 0.0) ? L.focalLengthMM() / (2.0 * fstop) / sc : L.surf[stop].aperture;
+    L.surf[stop].aperture = std::min(want, L.surf[stop].aperture);
+    L.focusAt(0.0);
+    return L;
+}
+
 // Resolve a named lens preset into a prescription, scaled to `focalMM` at f/`fstop`.
 // Known names: singlet/biconvex, achromat/doublet, telephoto (achromat), wide/wide-
-// angle (short-focal achromat). Returns false on an unknown name.
+// angle (short-focal achromat), dgauss/doublegauss (a real double Gauss, makeDoubleGauss).
+// Returns false on an unknown name.
 inline bool resolveLensPreset(const std::string& name, double focalMM, double fstop,
                               LensSystem& out) {
     std::string k;
@@ -954,6 +1008,9 @@ inline bool resolveLensPreset(const std::string& name, double focalMM, double fs
     if (k == "wide" || k == "wideangle") {                 // short achromat
         double f = focalMM > 0.0 ? focalMM : 28.0;
         out = makeAchromat(f, fstop, bk7, sf10); out.name = "wide"; return true;
+    }
+    if (k == "dgauss" || k == "doublegauss") {             // a real prescription
+        out = makeDoubleGauss(focalMM, fstop); return true;
     }
     return false;
 }
