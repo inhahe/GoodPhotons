@@ -120,6 +120,7 @@
 //                  fixed -spp R/D render also rewrites the image and prints "[spp] x/total"
 //                  progress as its chunks land).
 
+#include <array>
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -2601,13 +2602,24 @@ static int checkContainer(long long rays) {
 //       times the cell area, averaged; the catch's hit share times the cone's solid angle),
 //       and where they land -- for a point 2 m out and for one 5 km out, which only works if
 //       the entry is solved from near the glass rather than from the scene point.
-static bool checkLensPhysicalOne(const char* preset, double fstop) {
-    LensSystem L;
-    if (!resolveLensPreset(preset, 50.0, fstop, L)) { std::printf("[checklens] no %s\n", preset); return false; }
+// And the pupil table that lets lensEntry aim at the stop (lens.h LensPupil):
+//   (4) it holds every ray that can reach the film: over scene points across and beyond the
+//       field, near and far, every front-sampler ray that lands on the raster falls inside
+//       its point's region, and none comes from a point whose bin rejects -- a miss would
+//       be light the aimed sampler can never draw, a bias no render shows except as a dim
+//       patch;
+//   (5) the density lensEntry draws an aimed leg with is the one lensAimRatio recomputes from
+//       the leg's two ends (BDPT's MIS weighs the light image by the second);
+//   (6) the aimed and the front sampler estimate the same solid angle reaching the sensor,
+//       on and off axis, near and far; their hit rates say what the aiming buys.
+// The third lens is pbrt's 50 mm double Gauss stopped to f/8, where the front element is
+// several times the beam the stop admits: the case the table is for.
+static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
     L.focusAt(2.4);
     Camera cam;
     cam.lookAt({0, 0, 0}, {0, 0, 1}, {0, 1, 0}, 40.0, 64, 43);
     cam.lens = std::make_shared<LensSystem>(L);
+    cam.prepareLensPupil();
     Pcg32 rng; rng.seed(4242u, 17u);
     const double lambda = 550.0;
     // (1) normalisation. P(not vignetted) from the camera's own sampling ...
@@ -2685,13 +2697,136 @@ static bool checkLensPhysicalOne(const char* preset, double fstop) {
                     preset, range, omegaConn, omegaCatch, seK, z3, mx1, my1, mx2, my2);
         pass = pass && caught > 1000 && z3 < 4.0 && std::fabs(mx1 - mx2) < 0.5 && std::fabs(my1 - my2) < 0.5;
     }
+    // The pupil table.
+    const LensPupil* P = cam.pupil();
+    if (!P) {
+        std::printf("[checklens] %s: no pupil table\n", preset);
+        std::printf("[checklens] %s FAIL\n", preset);
+        return false;
+    }
+    Camera camF = cam;                  // the same camera with the front sampler only
+    camF.lensPupil.reset();
+    const LensSystem& CL = *cam.lens;
+    // (4) coverage. Scene points up to 50 deg off axis (the raster's corners are ~23 deg),
+    // 5 cm to 5 km out (log-uniform), one front-sampler ray each.
+    long long reached = 0, aimedReached = 0, outside = 0, rejected = 0;
+    for (int k = 0; k < 2000000; ++k) {
+        const double th = (50.0 * PI / 180.0) * rng.uniform(), ph = 2.0 * PI * rng.uniform();
+        const double range = 0.05 * std::pow(1e5, rng.uniform());
+        const Vec3 X = cam.eye + (cam.w * std::cos(th) + (cam.u * std::cos(ph) + cam.v * std::sin(ph)) *
+                                  std::sin(th)) * range;
+        Camera::LensEntry e;
+        if (!camF.lensEntry(X, rng.uniform(), rng.uniform(), e)) continue;
+        Vec3 onFilm, dFilm; int px, py;
+        if (!CL.traceToFilm(e.o, e.d, lambda, onFilm, dFilm) || !cam.lensFilmToPixel(onFilm, px, py)) continue;
+        ++reached;
+        double cphi = 1.0, sphi = 0.0;
+        const int c = P->classify(cam.lensLocalPoint(X), cphi, sphi);
+        if (c == -2) { ++rejected; continue; }
+        if (c < 0) continue;
+        ++aimedReached;
+        const Vec3 yl = cam.lensLocalPoint(e.Y);
+        const Vec3 Xc = yl + e.d * ((P->zRef - yl.z) / e.d.z);
+        if (!P->inCell(c, Xc, cphi, sphi)) {
+            if (++outside <= 5) {
+                const LensPupilCell& C = P->cells[(size_t)c];
+                const double ex = Xc.x * cphi + Xc.y * sphi, ey = -Xc.x * sphi + Xc.y * cphi;
+                std::printf("[checklens] %s:   outside: bin %d (angle bin %d, distance bin %d, %s), point "
+                            "%.3g m %.2f deg off axis, crossing (%.4f, %.4f) mm vs region centre %.4f, "
+                            "half-widths %.4f x %.4f (%.4f of its size)\n", preset, c, c / P->nU, c % P->nU,
+                            C.kind == LensPupil::AIMBOX ? "rectangle" : "ellipse", range, th * 180.0 / PI,
+                            ex, ey, C.cx, C.a, C.b, LensPupil::regionNorm(C, ex, ey));
+            }
+        }
+    }
+    std::printf("[checklens] %s: pupil table aims in %d bins, front sampler in %d, rejects %d "
+                "(stop = surface %d, entrance pupil z = %.2f mm, %lld build-time enlargements)\n",
+                preset, P->nAim, P->nFront, P->nNone, P->stop, P->zRef, P->enlarged);
+    std::printf("[checklens] %s: of %lld front-sampler rays that reached the film, %lld came from aimed "
+                "points: %lld outside the region, %lld from rejecting bins\n",
+                preset, reached, aimedReached, outside, rejected);
+    pass = pass && reached > 10000 && outside == 0 && rejected == 0;
+    // (5) the drawn density against the recomputed one.
+    long long nAimed = 0, mismatched = 0; double worst = 0.0;
+    for (int k = 0; k < 400000; ++k) {
+        const double th = (30.0 * PI / 180.0) * rng.uniform(), ph = 2.0 * PI * rng.uniform();
+        const double range = 0.05 * std::pow(1e5, rng.uniform());
+        const Vec3 X = cam.eye + (cam.w * std::cos(th) + (cam.u * std::cos(ph) + cam.v * std::sin(ph)) *
+                                  std::sin(th)) * range;
+        Camera::LensEntry e;
+        if (!cam.lensEntry(X, rng.uniform(), rng.uniform(), e) || !e.aimed) continue;
+        ++nAimed;
+        const double dXY = length(cam.lensLocalPoint(e.Y) - cam.lensLocalPoint(X));
+        const double qDrawn = CL.frontArea() * e.cosY / (e.omega * dXY * dXY);
+        const double qBack = 1.0 / cam.lensAimRatio(e.Y, X);
+        const double rel = std::fabs(qDrawn / qBack - 1.0);
+        worst = std::max(worst, rel);
+        if (!(rel < 1e-6)) ++mismatched;
+    }
+    std::printf("[checklens] %s: %lld aimed entries, %lld whose recomputed density disagrees "
+                "(worst relative error %.1e)\n", preset, nAimed, mismatched, worst);
+    pass = pass && mismatched == 0;
+    // (6) aimed against front, per point: solid angle reaching the sensor and hit rate.
+    const double aCell = 1.0 / cam.lensCellNorm();
+    for (const auto& pt : {std::array<double, 3>{2.0, 0.0, 0.0}, std::array<double, 3>{2.0, 0.15, -0.1},
+                           std::array<double, 3>{5000.0, 0.15, -0.1}, std::array<double, 3>{8.0, 0.3, 0.2}}) {
+        const double range = pt[0];
+        const Vec3 X = cam.w * range + cam.u * (pt[1] * range) + cam.v * (pt[2] * range);
+        double s[2] = {0, 0}, s2[2] = {0, 0}; long long hit[2] = {0, 0};
+        const int n = 400000;
+        for (int which = 0; which < 2; ++which) {
+            const Camera& cc = which ? camF : cam;
+            for (int k = 0; k < n; ++k) {
+                Vec3 Y, wd; double dist, wgt; int px, py;
+                if (!cc.lensConnect(X, lambda, rng.uniform(), rng.uniform(), Y, wd, dist, px, py, wgt)) continue;
+                const double v = wgt * aCell;
+                s[which] += v; s2[which] += v * v; ++hit[which];
+            }
+        }
+        double m[2], se[2];
+        for (int i = 0; i < 2; ++i) {
+            m[i] = s[i] / n;
+            se[i] = std::sqrt(std::max(0.0, s2[i] / n - m[i] * m[i]) / n);
+        }
+        const double z6 = std::fabs(m[0] - m[1]) / std::max(std::sqrt(se[0] * se[0] + se[1] * se[1]), 1e-300);
+        std::printf("[checklens] %s: point at %g m (%.2f, %.2f): solid angle aimed %.4e +- %.1e, front "
+                    "%.4e +- %.1e (%.1f sigma); hit rate aimed %.1f%%, front %.1f%%\n",
+                    preset, range, pt[1], pt[2], m[0], se[0], m[1], se[1], z6,
+                    100.0 * hit[0] / n, 100.0 * hit[1] / n);
+        pass = pass && (hit[0] + hit[1] == 0 || z6 < 4.0);
+    }
     std::printf("[checklens] %s %s\n", preset, pass ? "PASS" : "FAIL");
     return pass;
 }
+// pbrt's dgauss.50mm.dat (Tronnier, US 2,673,491), as `lens { surface ... }` reads it: radii
+// negated into LensSystem's frame, apertures halved. `stopSemi` sets the f-number (8.55 mm is
+// f/2, 2.14 mm f/8).
+static LensSystem checkLensDGauss(double stopSemi) {
+    const double rows[11][4] = {{29.475, 3.76, 1.67, 12.6}, {84.83, 0.12, 1, 12.6}, {19.275, 4.025, 1.67, 11.5},
+                                {40.77, 3.275, 1.699, 11.5}, {12.75, 5.705, 1, 9.0}, {0, 4.5, 1, stopSemi},
+                                {-14.495, 1.18, 1.603, 8.5}, {40.77, 6.065, 1.658, 10.0},
+                                {-20.385, 0.19, 1, 10.0}, {437.065, 3.22, 1.717, 10.0}, {-39.73, 40, 1, 10.0}};
+    LensSystem L; L.name = "dgauss";
+    for (const auto& r : rows) {
+        LensSurface s;
+        s.radius = (r[0] == 0.0) ? 0.0 : -r[0];
+        s.thickness = r[1]; s.ior = iorConstant(r[2]); s.aperture = r[3];
+        s.isStop = (r[0] == 0.0);
+        L.surf.push_back(s);
+    }
+    L.finalize();
+    return L;
+}
 static bool checkLensPhysical() {
-    const bool a = checkLensPhysicalOne("achromat", 2.8);
-    const bool b = checkLensPhysicalOne("singlet", 4.0);
-    return a && b;
+    LensSystem a, s;
+    if (!resolveLensPreset("achromat", 50.0, 2.8, a) || !resolveLensPreset("singlet", 50.0, 4.0, s)) {
+        std::printf("[checklens] missing a preset\n");
+        return false;
+    }
+    const bool pa = checkLensPhysicalOne("achromat", a);
+    const bool ps = checkLensPhysicalOne("singlet", s);
+    const bool pd = checkLensPhysicalOne("dgauss f/8", checkLensDGauss(2.14));
+    return pa && ps && pd;
 }
 
 // Deterministic thin-lens (mode C) self-test. Forward catch is far too photon-
@@ -22507,6 +22642,7 @@ static int run(int argc, char** argv) {
                 // Mode P routes to that lens-aware BDPT, since P's forward pass splats to a
                 // pinhole; every other mode renders in R.
                 c.lens = cs->lens;
+                c.prepareLensPupil();              // lets light tracing aim at the stop
                 double flmm = cs->lens->focalLengthMM();
                 double fw = cs->lens->filmW_mm, fh = cs->lens->filmH_mm;
                 const char routed = lensRoutedMode(scene, cmode);
@@ -22936,7 +23072,7 @@ static int run(int argc, char** argv) {
             m.mode = (ci < renderedOf.size() && renderedOf[ci])
                          ? renderedOf[ci]
                          : renderedMode(scene, effModeCam(cs), cs.projection, cs.lens != nullptr);
-            if (cs.lens) m.cam.lens = cs.lens;
+            if (cs.lens) { m.cam.lens = cs.lens; m.cam.prepareLensPupil(); }
             m.name = cs.name;
             return m;
         };

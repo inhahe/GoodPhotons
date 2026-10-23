@@ -594,8 +594,9 @@ inline double vertexPdf(const Scene& scene, const Camera& cam,
     wn = normalize(wn);
     double pdfW = 0.0;
     if (cur.type == VType::Camera) {
-        // A physical lens's camera vertex sits on its front element (cur.p), not at the eye.
-        pdfW = cam.hasLens() ? cam.lensPdfDir(cur.p, wn, lambda)
+        // A physical lens's camera vertex sits on its front element (cur.p), not at the eye;
+        // its density is written against the light image's pick of that vertex from `next`.
+        pdfW = cam.hasLens() ? cam.lensPdfDir(cur.p, wn, lambda) * cam.lensAimRatio(cur.p, next.p)
                              : cameraPdfDir(cam, camCos(cam, next.p));
     } else if (cur.type == VType::Medium) {          // volume in-scatter: HG phase pdf
         if (!prev) return 0.0;
@@ -1862,6 +1863,11 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
         double pdfDir = cam.lensPdfDir(ray.o, ray.d, lambda);
         randomWalk(scene, cam, mats, ray, wLens, pdfDir, hb, maxDepth - 1,
                    Mode::Radiance, rng, path, betaSec0, 1, esc, segs, nullptr, jsw);
+        // The light image picks this camera vertex with a density that depends on the vertex
+        // it is picked from (lensAimRatio), which was not known until the walk found eye[1].
+        // The first segment's pdfDir stays against 1/A_front: mode J's merges along it apply
+        // the factor at their own merge point (BeamMergeWeight::lensCam).
+        if (path.size() > 1) path[1].pdfFwd *= cam.lensAimRatio(ray.o, path[1].p);
         return (int)path.size();
     }
     c.p = cam.eye;
@@ -3992,6 +3998,11 @@ struct BeamMergeWeight {
                               // them, so nothing is deferred here)
     int    camVert    = 0;    // k: the camera subpath index of the vertex this segment leaves
     int    maxDepth   = 0;    // the same cap the connection loop applies (see below)
+    // The first segment of a physical lens's camera subpath: the light image would pick the
+    // camera vertex `lensY` from the merge point x with a density that depends on x, so the
+    // camera side's density there takes Camera::lensAimRatio(lensY, x). Null elsewhere.
+    const Camera* lensCam = nullptr;
+    Vec3   lensY;
     // Per-ray transmittance data, hoisted out of the per-hit path. `camTr` is built once for
     // this camera segment (see TrRay: a dense medium hands one segment hundreds of hits, and
     // trDet would re-clip and re-evaluate sigma_t for every one of them); `tabs` is the
@@ -4039,7 +4050,8 @@ struct BeamMergeWeight {
         // so convertDensity applies no projected cosine to it.
         const double gL = (lm->pdfPlanar > 0.f) ? (double)lm->pdfPlanar      // the sun's chord
                                                 : (double)lm->pdfDir * invR2;  // light side  (p_L-perp)
-        const double gC = sg->pdfDir * invT2;                // camera side (the free flight)
+        double gC = sg->pdfDir * invT2;                      // camera side (the free flight)
+        if (lensCam) gC *= lensCam->lensAimRatio(lensY, sg->o + sg->d * tc);
         if (!(gL > 0.0)) return 0.0;                         // delta light-side density
         const double sigT = scene->media[b.med].sigmaT(lamCam) * dens;
         if (!(sigT > 0.0)) return 0.0;
@@ -4670,6 +4682,7 @@ struct BdptRenderer {
                                 // path of depth j + k + 1.
                                 w1.camVert    = (int)(k < (size_t)nE ? k : (size_t)nE - 1);
                                 w1.maxDepth   = maxDepth;
+                                if (k == 0 && cam.hasLens()) { w1.lensCam = &cam; w1.lensY = eye[0].p; }
                                 // The merge AT eye[k]. Its light-side incoming direction is
                                 // -sg.d whatever x turns out to be, so sin(theta) and the
                                 // whole coefficient are merge-point INDEPENDENT and belong

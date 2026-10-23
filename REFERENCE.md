@@ -1968,9 +1968,20 @@ and glass-sphere connections of mode `B` are pinhole-only, so they are skipped f
 physical lens. The directly seen sky and sun are imaged through the lens in `A` and `B`
 too, by camera rays averaged over each pixel, the pupil and the visible band; their count
 grows with the photon budget (a quarter of the photons per pixel, 64 to 4096), so the sky
-converges with the render. The light entering the lens is sampled uniformly over the front
-element: exact for any lens, but a prescription whose front element is much larger than its
-aperture stop wastes most of those samples. It maps the sensor across the film width, so a
+converges with the render. Light entering the lens is aimed at the aperture stop: at startup
+each lens camera traces a table (`[lens] ... pupil table ...` in the log, tens of
+milliseconds) of where, on the plane of the stop's image, the rays that reach the film cross,
+binned by how far off axis and how far away the scene point is. The forward modes then draw
+each vertex's ray through that region instead of anywhere on the front element, so a lens
+whose front element is much wider than the beam its stop admits (a fast wide-angle, or any
+lens stopped down) wastes no samples on glass the beam never crosses, and a vertex outside the
+field of view costs a table lookup instead of a trace through the glass. Where aiming would
+not pay (the stop already fills the front element, as in the presets near the axis) a bin
+keeps the uniform front-element sampling. Same image, less noise: the table only moves
+samples to where light gets through. `-checklens` checks it holds every ray that reaches the
+film, and `FTRACE_LENS_FRONT=1` turns the aiming off (every lens camera samples the whole
+front element) for comparing a render with and without it. It maps the sensor across the film
+width, so a
 film whose aspect matches the sensor (e.g. `res 360 240` for a 3:2 sensor) covers it
 without cropping, while a mismatched aspect crops. It does not model inter-element
 flare/ghosting or shaped-iris bokeh. On the GPU it inherits its mode's scope (no

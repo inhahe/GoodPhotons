@@ -2683,23 +2683,57 @@ import `r_t = min(1, r² / 0.646)` (1.55 r²), applied to the constant and to th
 per texel, validated against a GGX reference at a few r. It changes the look of every glTF, so it
 waits for its own A/B rather than riding along with another change.
 
-## OPEN (2026-10-23, 0.394.0): PHYSLENS-FRONT-SAMPLING — light enters a physical lens through a uniform front-element sample, which wastes most samples on a lens whose front glass dwarfs its stop
+## DONE (2026-10-23, 0.395.0): PHYSLENS-FRONT-SAMPLING — light entered a physical lens through a uniform front-element sample, which wasted most samples on a lens whose front glass dwarfs its stop
 
-`Camera::lensConnect` (and its device twin `dLensConnect`), the forward splat of modes A/B and
-BDPT's light image through a physical lens, picks the point where light enters the lens
-uniformly by area on the front element's clear cap. That is exact for any lens, because every
-ray able to enter the lens crosses that cap, but it is only efficient while most of those rays
-also clear the aperture stop. The built-in presets keep the stop the size of the front element
-(the singlet is its own stop, the achromat's stop is 0.95x its glass), so nearly every sample
-survives. A real prescription pasted as `surface` lines, a fast wide-angle or a zoom stopped
-down to f/11, can have a front element several times the stop's image, and then most samples
-are clipped inside the lens and the forward image is that much noisier at equal cost (the
-backward camera, which samples the rear element, has the mirror problem for a large rear
-element). **Proper fix:** importance-sample the stop, as Hanika & Dachsbacher 2014 sec. 5.2 and
-Schrade et al. 2016 do: draw the point on the stop, solve for the direction from the scene point
-that reaches it through the front elements (a few Newton steps on the traced map, or a fitted
-polynomial), and divide by the Jacobian of that map, which the same Newton steps provide.
-`-checklens`'s density-normalisation and connect-vs-catch checks are the regression gates for it.
+`Camera::lensEntry` (the forward splat of modes A/B and BDPT's light image through a physical
+lens) picked where light enters uniformly by area on the front element's clear cap: exact,
+but only efficient while most of those rays also clear the stop. Measured by `-checklens`, the
+share of front-sampler connections that reach the film: 63.5% for the achromat preset, 5.7% for
+pbrt's double Gauss stopped to f/8 (`scenes/realcam_dgauss.ftsl` with the stop at 2.14 mm).
+Every vertex outside the field of view was also traced through the glass only to miss the film.
+
+The papers' fix (Hanika & Dachsbacher 2014 sec. 5.2, Schrade et al. 2016) solves per sample for
+the direction that reaches a sampled stop point, a few Newton steps each: slower per sample
+than the uniform pick, which the presets would pay for nothing. Instead a per-lens table
+(`LensPupil`, lens.h) bins scene points by angle off axis and inverse distance and keeps per
+bin a region (ellipse, or a rectangle for crescent-shaped ones at the field's edge) on the
+entrance-pupil plane holding every crossing that reaches the film; lensEntry draws the crossing
+there. Cost per sample: a table lookup, and out-of-field vertices are rejected by it before any
+trace. Hit rates now 90.6% (achromat) and 93.9% (double Gauss f/8). BDPT's lens camera densities
+carry the aimed pick's density (`lensAimRatio`) in vertexPdf, eye[1]'s pdfFwd and mode J's
+first-segment merges. The first build of the table missed crescent tips at the field edge (1
+ray in 451 268 for the achromat, 3 in 147 aimed ones for the singlet, all in the bin just past
+the film's corner): fixed by the rectangle, by building each bin over points 15% past its edges,
+and by re-verifying until a whole uniform batch finds nothing outside. `-checklens` gates
+coverage, the density, and aimed-vs-uniform agreement; `tools/check_physlens.py` the images.
+
+## OPEN (2026-10-23): J-FOG-REALCAM — mode J reads realcam's scene in fog 2-4% low, lens or none: the beam kernel's blur
+
+Found by `tools/check_physlens.py`'s fog case. `scenes/realcam.ftsl` (pinhole, `fov_y 27`) inside
+`medium { sigma_t 0.15 albedo 0.8 g 0.0 }`, everything at `-max-bounce 8`, GPU, 128x86, R 8192 spp
+against J 4096: floor 0.965, green 0.970, red 0.989, blue 0.963 of R, where D reads 0.997-1.002.
+Through the achromat lens J reads the same (0.965 / 0.969 / 0.986 / 0.958), so the lens adds
+nothing. At `-beamblur 0.0025` (a quarter of the default) J 1024 spp reads 0.990 / 0.993 / 1.013 /
+0.980: most of it is the beam merges' kernel blur already measured on `_fog_cornell`
+(J-FOGCORNELL, UPBP-BEAM-RADIUS), only larger here -- the merges carry more of this image (a dark
+scene lit through fog, the camera ray crossing metres of it), so the blur's share of the image
+is larger. **Proper fix:** UPBP-BEAM-RADIUS's (a kernel radius that shrinks with the beam
+count, or a bias-corrected kernel). The lens check holds J to J with the aiming off instead of
+to R for this reason. Repro: `scenes/_realcam_fog.ftsl`.
+
+## OPEN (2026-10-23): PHYSLENS-REAR-SAMPLING — the backward lens camera samples the whole rear element, which wastes most camera rays on a lens stopped down
+
+The mirror image of PHYSLENS-FRONT-SAMPLING, on the camera side. `Camera::genLensRay` (mode R,
+the default for a lens camera, and BDPT's camera subpaths) draws the film point and then a point
+uniform on the rear element (its disk, or its clear cap when curved). `-checklens`'s (1) measures
+the share of those rays the lens does not clip: 0.567 for the achromat, 0.985 for the singlet,
+**0.050 for the double Gauss at f/8** -- R there traces twenty camera rays for every one that
+reaches the scene. **Proper fix:** pbrt's exit-pupil bounds (RealisticCamera::BoundExitPupil),
+built the way LensPupil is: per film radius bin, a region on the rear element (or the exit-pupil
+plane) holding every film-to-scene ray that gets through, found by tracing, padded and verified;
+genLensRay draws inside it, rotated to the film point's azimuth. `lensPdfDir` is BDPT's camera
+density and must follow the same sampler (the region's area replaces A_rear / A_cap, zero outside
+it), and `addEnvBackgroundLens` and `-checklens`'s (1)-(2) with it.
 
 ## OPEN (2026-10-23): GLTF-MAP-MEAN-GUTTERS — the importer's mean metalness and roughness count the atlas gutters
 

@@ -6445,7 +6445,36 @@ as the one at fault.
     rays that cross a curved cap outside its shadow, and lensPdfDir follows both cases. BDPT stores it as the camera
     vertex's direction pdf, which makes the ordinary per-vertex MIS ratio come out right
     although the light image (t=1) and the camera subpath give the exit point different
-    densities; the camera vertex is no longer delta. Users: the forward splats of modes A/B
+    densities; the camera vertex is no longer delta.
+  - **Aiming light at the stop (0.395.0).** Uniform on the front cap wastes most samples
+    when the front element dwarfs the beam the stop admits, and traces every out-of-field
+    vertex through the glass for nothing. `LensPupil` (lens.h), built per lens and film circle
+    by `buildLensPupil` and cached by `lensPupilFor` (`Camera::prepareLensPupil`, called where
+    a lens camera is made; `Camera::pupil()` withholds it from a camera whose raster outgrew
+    it or whose focus moved), bins scene points by angle off axis (64 bins over 90 deg) and by
+    inverse distance (8 bins past `dMin`) and keeps per bin a region on the entrance-pupil
+    plane (the chief ray's axis crossing; the stop is the marked surface or the paraxially
+    smallest pupil) holding every crossing of a ray that reaches the film circle: an ellipse
+    when the crossings fit one, else their extent's rectangle (`AIMBOX`: a crescent at the
+    field's edge, whose horns an ellipse would need densely sampled to be sure of). Built by
+    tracing over points from the bin widened 15% on every side (a region's extremes sit at the
+    bin's edges): uniform rays find the light, aimed rays grow an ellipse until none that pass
+    come near its rim, the fit is padded 3%, and fresh uniform batches enlarge it over anything
+    that still falls outside until one whole batch finds nothing (a bin that never comes clean
+    keeps the front sampler); the bin aims only if the aimed hit rate beats the uniform one by
+    10%. Unlit bins with no lit neighbour reject (`classify` -> -2) before any trace. Rotational
+    symmetry: a bin is built at azimuth 0 and rotated to the point's. `lensEntry` aims where the
+    table says (`omega = cos_P * A_ellipse / |P - p|^2`, the solid angle per sample;
+    `lensEntryImage` weights `omega / A_cell`), else keeps the uniform sampler bit for bit.
+    The light image's pick of the camera vertex now depends on the vertex it is picked from,
+    so BDPT's lens camera densities carry `lensAimRatio(Y, x) = (1/A_front) / p_entry(Y | x)`:
+    in `vertexPdf`, on eye[1]'s pdfFwd after the walk (the walk could not know eye[1] when it
+    converted the direction), and in mode J's merges on the first camera segment, per merge
+    point (`BeamMergeWeight::lensCam`; on the device the camera is passed down to the gather
+    and `DBeamMergeW::lensY` rides the wavefront queue, since a queued segment is read by
+    another kernel). Device twins: `dLensPupilClassify`, the aimed branch of `dLensEntry`,
+    `dLensAimRatio`; bakeCamera uploads the table (`DLensSystem::pupil*`) when it fits the
+    baked raster. Users of the light-tracing functions: the forward splats of modes A/B
     (`Renderer::connectLensPhysical` and its hero / volume twins, routed by `lensCam`, so a
     lens camera in mode B images through its glass), mode C's catch, and BDPT's t=1 branch.
     Device twins in `render_cuda.cu` (`dLensEntry` / `dLensEntryImage` / `dLensCatch` /
@@ -6455,10 +6484,13 @@ as the one at fault.
     limit. The forward modes' directly seen sky goes through the lens too
     (`addEnvBackgroundLens`): monochromatic camera rays averaged per pixel, their count growing
     with photons per pixel, kept in a running sum for the last camera. `-checklens` pins it all
-    on a planar-rear achromat and a curved-rear singlet: the density integrates to the
-    unvignetted share of genLensRay's samples, every camera ray reads back with a nonzero
-    density, and the connection and the catch agree on a point source's flux and image position
-    at 2 m and at 5 km. `tools/check_physlens.py` is the end-to-end gate on top: realcam's
+    on a planar-rear achromat, a curved-rear singlet and pbrt's double Gauss at f/8: the
+    density integrates to the unvignetted share of genLensRay's samples, every camera ray reads
+    back with a nonzero density, the connection and the catch agree on a point source's flux
+    and image position at 2 m and at 5 km, no front-sampler ray that reaches the film falls
+    outside its bin's ellipse or in a rejecting bin, the aimed entry's density is the one
+    lensAimRatio recomputes, and aimed and uniform connections agree on and off axis.
+    `tools/check_physlens.py` is the end-to-end gate on top: realcam's
     achromat and a curved-rear singlet in R, A, B and D, a visible sky in A, and a uniform panel
     in C, CPU and GPU, region means against R within 1% (3% for the catch) -- what a
     normalisation slip in one estimator, or a mis-transcribed device twin, would break (a light

@@ -1524,6 +1524,11 @@ struct DLensSystem {
     double T, filmZ;             // total track (front vertex z) and sensor plane z (mm)
     const DLensSurface* surf;    // nSurf interfaces
     const double* iorAll;        // nSurf*SPEC_N sensor-side index tables (air baked as 1)
+    // The entrance-pupil table (host twin LensPupil): 4 doubles per bin (cx, a, b, kind).
+    // pupilN == 0 => no table, the front sampler everywhere.
+    const double* pupilCells;
+    int    pupilNT, pupilNU, pupilN;
+    double pupilZRef, pupilZStart, pupilDMin, pupilDTheta;
 };
 
 struct DCamera {
@@ -2366,18 +2371,97 @@ __device__ static inline double dLensCellNorm(const DCamera& cam) {
     const double a = cam.lens.filmW_mm / (double)cam.resX * 1e-3;
     return 1.0 / (a * a);
 }
+// The entrance-pupil table (host twins LensPupil::classify / sampleCrossing / inCell, where
+// lens.h explains it): which sampler light from lens-local point p takes -- a bin >= 0 to aim
+// (cphi, sphi = p's azimuth), -1 the front sampler, -2 no light from p reaches the film.
+__device__ static int dLensPupilClassify(const DLensSystem& L, const D3& p, double& cphi, double& sphi) {
+    if (L.pupilN == 0) return -1;
+    if (!(p.z > L.pupilZStart)) return -1;
+    const double r2 = p.x * p.x + p.y * p.y, qz = p.z - L.pupilZRef;
+    const double D2 = r2 + qz * qz;
+    if (!(D2 >= L.pupilDMin * L.pupilDMin)) return -1;
+    const double D = sqrt(D2);
+    int it = (int)(acos(fmin(1.0, qz / D)) / L.pupilDTheta);
+    int iu = (int)(L.pupilDMin / D * L.pupilNU);
+    it = it < 0 ? 0 : (it >= L.pupilNT ? L.pupilNT - 1 : it);
+    iu = iu < 0 ? 0 : (iu >= L.pupilNU ? L.pupilNU - 1 : iu);
+    const int c = it * L.pupilNU + iu;
+    const int kind = (int)L.pupilCells[4 * c + 3];
+    if (kind == 2) return -2;                         // LensPupil::NONE
+    if (kind != 1 && kind != 3) return -1;            // LensPupil::AIM / AIMBOX
+    const double r = sqrt(r2);
+    if (r > 0.0) { cphi = p.x / r; sphi = p.y / r; } else { cphi = 1.0; sphi = 0.0; }
+    return c;
+}
+__device__ static inline double dLensPupilArea(const DLensSystem& L, int c) {
+    const double* C = L.pupilCells + 4 * c;
+    return ((int)C[3] == 3 ? 4.0 : DPI) * C[1] * C[2];
+}
+// A crossing uniform in bin c's region at azimuth (cphi, sphi): the ellipse (AIM) or the
+// rectangle (AIMBOX) with half-widths a, b round (cx, 0).
+__device__ static inline D3 dLensPupilSample(const DLensSystem& L, int c, double cphi, double sphi,
+                                             double u1, double u2) {
+    const double* C = L.pupilCells + 4 * c;
+    double ex, ey;
+    if ((int)C[3] == 3) {
+        ex = C[0] + C[1] * (2.0 * u1 - 1.0);
+        ey = C[2] * (2.0 * u2 - 1.0);
+    } else {
+        const double rr = sqrt(u1), an = 2.0 * DPI * u2;
+        ex = C[0] + C[1] * rr * cos(an);
+        ey = C[2] * rr * sin(an);
+    }
+    return D3(ex * cphi - ey * sphi, ex * sphi + ey * cphi, L.pupilZRef);
+}
+// How far crossing X lies out in bin c's region: <= 1 inside.
+__device__ static inline double dLensPupilNorm(const DLensSystem& L, int c, const D3& X, double cphi, double sphi) {
+    const double* C = L.pupilCells + 4 * c;
+    const double ex = X.x * cphi + X.y * sphi, ey = -X.x * sphi + X.y * cphi;
+    const double qx = (ex - C[0]) / C[1], qy = ey / C[2];
+    return ((int)C[3] == 3) ? fmax(fabs(qx), fabs(qy)) : sqrt(qx * qx + qy * qy);
+}
 // Where light from scene point p enters the lens (host twin Camera::lensEntry, which explains
-// the rebased start): Y uniform on the front element's clear cap, the leg p -> Y, and that leg
-// in lens-local mm started just in front of the glass. Independent of wavelength.
+// both samplers and the rebased start): Y on the front element's clear cap, the leg p -> Y,
+// and that leg in lens-local mm started just in front of the glass. Independent of wavelength.
 struct DLensEntry {
     DVec3 Y, wdir;     // world entry point; unit direction p -> Y
     double dist;       // |Y - p| (world)
     D3 o, d;           // the leg in lens-local mm
     double cosY;       // cosine between the leg and the element's normal at Y
+    int aimed;         // drawn through the pupil table (else uniform on the front cap)
+    double omega;      // aimed only: the solid angle (sr) one sample stands for
 };
 __device__ static bool dLensEntry(const DCamera& cam, const DVec3& p, double u1, double u2,
                                   DLensEntry& e) {
     const DLensSystem& L = cam.lens;
+    e.aimed = 0;
+    if (L.pupilN > 0) {
+        const D3 pw(p);
+        const D3 pl = dLensLocalPoint(cam, pw);
+        double cphi = 1.0, sphi = 0.0;
+        const int c = dLensPupilClassify(L, pl, cphi, sphi);
+        if (c == -2) return false;
+        if (c >= 0) {
+            const D3 X = dLensPupilSample(L, c, cphi, sphi, u1, u2);
+            D3 dl = X - pl;
+            const double dX = length(dl);
+            dl = dl / dX;
+            const D3 o = X - dl * ((L.pupilZStart - L.pupilZRef) / -dl.z);
+            D3 yl, nY;
+            if (!dLensHitSurface(L, 0, o, dl, yl, nY)) return false;
+            const D3 Y = dLensWorldPoint(cam, yl);
+            const D3 toY = Y - pw;
+            e.dist = length(toY);
+            if (!(e.dist > 1e-12)) return false;
+            e.Y = Y.toR();
+            e.wdir = (toY / e.dist).toR();
+            e.o = o; e.d = dl;
+            e.cosY = fabs(dot(dl, nY));
+            e.aimed = 1;
+            e.omega = -dl.z * dLensPupilArea(L, c) / (dX * dX);
+            return isfinite(e.omega) && e.omega > 0.0;
+        }
+    }
     D3 nY;
     const D3 yl = dLensSampleSurface(L, 0, u1, u2, nY);
     const D3 pw(p);
@@ -2404,15 +2488,19 @@ __device__ static bool dLensEntry(const DCamera& cam, const DVec3& p, double u1,
     return true;
 }
 // Trace an entry through the glass at lambda (host twin Camera::lensEntryImage):
-// wgt = cosY * A_front / (dist^2 * A_cell).
+// wgt = omega / A_cell, which for the front sampler is cosY * A_front / (dist^2 * A_cell).
 __device__ static bool dLensEntryImage(const DCamera& cam, const DLensEntry& e, Real lambda,
                                        int& px, int& py, double& wgt) {
     const DLensSystem& L = cam.lens;
     D3 onFilm, dFilm;
     if (!dLensTraceToFilm(L, e.o, e.d, lambda, onFilm, dFilm, nullptr)) return false;
     if (!dLensFilmToPixel(cam, onFilm, px, py)) return false;
-    const double cell = L.filmW_mm / (double)cam.resX;
-    wgt = e.cosY * (dLensSurfaceArea(L, 0) / (cell * cell)) / (e.dist * e.dist);
+    if (e.aimed) {
+        wgt = e.omega * dLensCellNorm(cam);
+    } else {
+        const double cell = L.filmW_mm / (double)cam.resX;
+        wgt = e.cosY * (dLensSurfaceArea(L, 0) / (cell * cell)) / (e.dist * e.dist);
+    }
     return isfinite(wgt) && wgt > 0.0;
 }
 __device__ static bool dLensConnect(const DCamera& cam, const DVec3& p, Real lambda,
@@ -2506,6 +2594,33 @@ __device__ static double dLensPdfDir(const DCamera& cam, const DVec3& y, const D
         pdf = Z * Z * cosF * dLensSurfaceArea(L, 0) / (aFilm * aRear * c2 * c2);
     }
     return isfinite(pdf) ? pdf : 0.0;
+}
+// The factor BDPT's lens camera densities carry for camera vertex Y next to scene point x
+// (host twin Camera::lensAimRatio, which derives it): (1/A_front) / p_entry(Y | x), 1 where
+// x keeps the front sampler, capped at 1e12 where the entry cannot pick Y from x. The world
+// points arrive in Real; the slack on the region test absorbs float's rounding of Y.
+__device__ static double dLensAimRatio(const DCamera& cam, const DVec3& Yw, const DVec3& xw) {
+    const DLensSystem& L = cam.lens;
+    if (L.pupilN == 0) return 1.0;
+    const D3 xl = dLensLocalPoint(cam, D3(xw));
+    double cphi = 1.0, sphi = 0.0;
+    const int c = dLensPupilClassify(L, xl, cphi, sphi);
+    if (c == -1) return 1.0;
+    const double kCap = 1e12;
+    if (c == -2) return kCap;
+    const D3 yl = dLensLocalPoint(cam, D3(Yw));
+    D3 dl = yl - xl;
+    const double dXY = length(dl);
+    if (!(dXY > 0.0)) return kCap;
+    dl = dl / dXY;
+    if (!(dl.z < 0.0)) return kCap;
+    const double sYP = (L.pupilZRef - yl.z) / dl.z;
+    if (!(dLensPupilNorm(L, c, yl + dl * sYP, cphi, sphi) <= 1.0 + 1e-6)) return kCap;
+    const D3 n0 = (L.surf[0].radius == 0.0) ? D3(0, 0, 1)
+                                            : normalize(yl - D3(0, 0, L.surf[0].zpos + L.surf[0].radius));
+    const double k = (dXY + sYP) / dXY;
+    const double q = k * k * fabs(dot(dl, n0)) * dLensSurfaceArea(L, 0) / (-dl.z * dLensPupilArea(L, c));
+    return (q > 1.0 / kCap) ? 1.0 / q : kCap;
 }
 // Does camera c take the lens splat? Mode A always; a physical-lens camera in mode B too
 // (host twin Renderer::lensCam).
@@ -6932,6 +7047,11 @@ struct DBeamMergeW {
     double segSumM    = 0.0;  // camera-side merge accumulator, kappa factored out
     int    camVert    = 0;    // k: the camera subpath index of the vertex this segment leaves
     int    maxDepth   = 0;    // the same cap the connection loop applies
+    // The camera vertex, for a physical lens's first segment (camVert == 0): the camera density
+    // at merge point x there takes dLensAimRatio(lensY, x) (host twin BeamMergeWeight::lensCam).
+    // The camera itself comes from the kernel (dBeamMergeWeight's `cam`): a segment queued for
+    // the wavefront gather is read by another kernel, where no pointer into this one is valid.
+    DVec3  lensY{0, 0, 0};
 };
 
 // Beam x Ray 1D single-scatter estimate along the camera segment [oc, oc + dc*tMax] —
@@ -7021,7 +7141,8 @@ __device__ static double dBeamMergeWeight(const DScene& sc, const DBeamMergeW& m
                                           const DBeamMis& lm, const DBeamRec& b,
                                           const DTrRay& camTr, const DVec3& oc, const DVec3& dc,
                                           double tCam, double sBeam, double sinT,
-                                          double dens, double phase, const DPatEnv& env) {
+                                          double dens, double phase, const DPatEnv& env,
+                                          const DCamera* cam) {
     // THE DEPTH CAP. The merged path has s = j+1 light vertices and t = k+2 camera ones,
     // hence depth = j+k+1. The connection loop refuses depth > maxDepth, so a merge past the
     // cap would contribute a path length mode D never builds — energy with nothing to MIS
@@ -7033,7 +7154,8 @@ __device__ static double dBeamMergeWeight(const DScene& sc, const DBeamMergeW& m
     // The pair of geometric densities AT x. Both are cosine-free: x is a medium point.
     const double gL = (lm.pdfPlanar > 0.f) ? (double)lm.pdfPlanar   // the sun's chord (BeamMis;
                                            : (double)lm.pdfDir * invR2;  // 1 after a delta, 0.387.0)
-    const double gC = mw.pdfDirCam * invT2;          // camera side (the free flight)
+    double gC = mw.pdfDirCam * invT2;                // camera side (the free flight)
+    if (mw.camVert == 0 && cam && cam->hasLens) gC *= dLensAimRatio(*cam, mw.lensY, oc + dc * (Real)tCam);
     if (!(gL > 0.0)) return 0.0;                     // delta light-side density
     if (b.med < 0 || b.med >= sc.mediaN) return 0.0;
     const double sigT = (double)medSigmaT(sc.media[b.med], (Real)mw.lamCam) * dens;
@@ -7095,7 +7217,8 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
                                     const DBeamMergeW* mw, const DTrRay* camTr,
                                     const DPatEnv& env,
                                     double& oX, double& oY, double& oZ,
-                                    const DJSpec* js = nullptr, int glassMatCam = -1) {
+                                    const DJSpec* js = nullptr, int glassMatCam = -1,
+                                    const DCamera* cam = nullptr) {
         if (b.med < 0 || b.med >= sc.mediaN) return;
         const DMedium& md = sc.media[b.med];
         const Real lam = b.lambda;
@@ -7138,7 +7261,7 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
             // A null entry means the map carries no MIS data for this beam, which is
             // the gather's signal to fall back to weight 1 (mode M's estimator).
             if (lm) w *= dBeamMergeWeight(sc, *mw, *lm, b, *camTr, oc, dc,
-                                          (double)t, (double)s, sinT, dens, phase, env);
+                                          (double)t, (double)s, sinT, dens, phase, env, cam);
         }
         if (!(w > 0.0)) return;
         if (b.absorb > 0.f)  w *= exp(-(double)b.absorb * (double)s);   // glass, beam side
@@ -7404,7 +7527,8 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                                           const DBeamMergeW* mw = nullptr,
                                           const DTrRay* camTr = nullptr,
                                           int routeMedJ = 0,
-                                          const DJSpec* js = nullptr, int glassMatCam = -1) {
+                                          const DJSpec* js = nullptr, int glassMatCam = -1,
+                                          const DCamera* cam = nullptr) {
     oX = oY = oZ = 0.0;
     // The cache's share first: it is additive and independent of the beam traversal, and it
     // must run even when the split left no beams at all (nNodes == 0).
@@ -7448,7 +7572,7 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                 if (!(x2 < 1.0)) continue;
                 if (routeMedJ && dRouteOfMed(sc, b.med) != 1) continue;   // D-routed merge (0.386.0)
                 dBeamHitEval(sc, bm, b, bm.primIdx[n.first + i], oc, dc, t, s, cosT, den, x2,
-                             aGlassCam, rng, mw, camTr, env, oX, oY, oZ, js, glassMatCam);
+                             aGlassCam, rng, mw, camTr, env, oX, oY, oZ, js, glassMatCam, cam);
             }
         } else {
             Real tc;
@@ -7529,7 +7653,7 @@ struct DWfSeg {
     int    glassMat;    // DPathSeg::glassMat, for the camera-side glass under JSPEC
 };
 #if FTRACE_GPU_FP32
-static_assert(sizeof(DWfSeg) == 400, "DWfSeg changed size: update renderBdptCuda's segCap note");
+static_assert(sizeof(DWfSeg) == 416, "DWfSeg changed size: update renderBdptCuda's segCap note");
 #endif
 struct DWfHit { int seg; int beam; float t, s; };
 // One band of the wave-schedule PROFILE (see renderBdptCuda): what the paths of pixel slots
@@ -7590,12 +7714,13 @@ __global__ void kBeamTr0(DScene sc, const DBeamRec* beams, float* tr0, const int
 __device__ __noinline__ static void dBeamHitEvalSpill(const DScene& sc, const DBeamMap& bm,
         const DBeamRec& b, int bi, const DVec3& oc, const DVec3& dc, Real t, Real s, Real cosT,
         Real den, double x2, double aGlass, DRng& rng, const DBeamMergeW* mw, const DTrRay* tr,
-        const DPatEnv& env, double& fX, double& fY, double& fZ, const DJSpec* js, int glassMat) {
+        const DPatEnv& env, double& fX, double& fY, double& fZ, const DJSpec* js, int glassMat,
+        const DCamera* cam) {
     dBeamHitEval(sc, bm, b, bi, oc, dc, t, s, cosT, den, x2, aGlass, rng, mw, tr, env, fX, fY, fZ, js,
-                 glassMat);
+                 glassMat, cam);
 }
 
-__global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm, int resX) {
+__global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm, int resX, DCamera cam) {
     const int nS = min(*q.nSegs, q.segCap);
     const DPatEnv env = dPatEnvOf(sc);
     for (int si = blockIdx.x * blockDim.x + threadIdx.x; si < nS; si += gridDim.x * blockDim.x) {
@@ -7639,7 +7764,7 @@ __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm,
                     } else {
                         atomicAdd(&q.overflow[1], 1);
                         dBeamHitEvalSpill(sc, bm, b, bi, oc, dc, t, s, cosT, den, x2, sg.aGlass, rng,
-                                          &sg.mw, &sg.tr, env, fX, fY, fZ, &sg.spec, sg.glassMat);
+                                          &sg.mw, &sg.tr, env, fX, fY, fZ, &sg.spec, sg.glassMat, &cam);
                     }
                 }
             } else {
@@ -7657,7 +7782,7 @@ __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm,
     }
 }
 
-__global__ void kWfBeamEval(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm, int resX) {
+__global__ void kWfBeamEval(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm, int resX, DCamera cam) {
     const int nH = min(*q.nHits, q.hitCap);
     const DPatEnv env = dPatEnvOf(sc);
     for (int hi = blockIdx.x * blockDim.x + threadIdx.x; hi < nH; hi += gridDim.x * blockDim.x) {
@@ -7680,7 +7805,7 @@ __global__ void kWfBeamEval(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm,
         rng.seedUnit((unsigned long long)h.beam, sg.seed);
         double oX = 0.0, oY = 0.0, oZ = 0.0;
         dBeamHitEval(sc, bm, b, h.beam, oc, dc, t, s, cosT, den, x2, sg.aGlass, rng,
-                     &sg.mw, &sg.tr, env, oX, oY, oZ, &sg.spec, sg.glassMat);
+                     &sg.mw, &sg.tr, env, oX, oY, oZ, &sg.spec, sg.glassMat, &cam);
         if (oX != 0.0 || oY != 0.0 || oZ != 0.0) {
             const size_t o = ((size_t)sg.py * resX + sg.px) * 3;
             atomicAdd(&camFilm[o + 0], oX * sg.beta);
@@ -11935,8 +12060,9 @@ __device__ static float dVertexPdfF(const DScene& sc, const DCamera& cam,
     wn = normalize(wn);
     float pdfW = 0.f;
     if (cur.type == BV_CAMERA && cam.hasLens) {
-        // A physical lens's camera vertex sits on its front element (host twin vertexPdf).
-        pdfW = (float)dLensPdfDir(cam, cur.p, wn, lambda);
+        // A physical lens's camera vertex sits on its front element (host twin vertexPdf),
+        // its density written against the light image's pick of it from `next`.
+        pdfW = (float)(dLensPdfDir(cam, cur.p, wn, lambda) * dLensAimRatio(cam, cur.p, next.p));
     } else if (cur.type == BV_CAMERA) {
         DVec3 d = next.p - cam.eye;                       // dCameraPdfDir in FP32
         float len = sqrtf(dot(d, d));
@@ -16078,6 +16204,9 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
         dRandomWalk(sc, cam, diffraction, ro, rd, (double)wl, pdfDir, hb, maxDepth - 1, rng,
                     path, pathSec, secStride, maxV, n, false, betaSec0, 1, esc,
                     segs, nSegs, maxSegs, jrun, vspec);
+        // The light image's pick of the camera vertex depends on eye[1] (host twin
+        // generateCameraSubpath); mode J's merges on the first segment take it per merge point.
+        if (n > 1) path[1].pdfFwd *= dLensAimRatio(cam, ro, path[1].p);
         return n;
     }
     c.p = cam.eye;
@@ -17200,6 +17329,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                     // at light vertex j on this segment makes a path of depth j + k + 1.
                     mw.camVert    = k;
                     mw.maxDepth   = maxDepth;
+                    if (k == 0 && cam.hasLens) mw.lensY = eye[0].p;
                     // The merge AT eye[k]. Its light-side incoming direction is -sg.d
                     // whatever x turns out to be, so sin(theta) and the whole coefficient are
                     // merge-point INDEPENDENT and belong here, not in the per-hit weight.
@@ -17248,7 +17378,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                 if (!queued) {
                     double mX = 0.0, mY = 0.0, mZ = 0.0;
                     dGatherPhotonBeams(sc, bm, sg.o, sg.d, (Real)sg.tMax, sg.aGlass, rng,
-                                       mX, mY, mZ, &mw, &camTr, routeMedJ, &sg.spec, sg.glassMat);
+                                       mX, mY, mZ, &mw, &camTr, routeMedJ, &sg.spec, sg.glassMat, &cam);
                     if (mX != 0.0 || mY != 0.0 || mZ != 0.0) {
                         size_t o = ((size_t)py * resX + px) * 3;
                         const double bJ = sg.spec.beta(sg.beta) * wJ;   // JSPEC scale
@@ -21882,6 +22012,9 @@ static gpu::DCamera bakeCamera(const Scene& /*scene*/, const Camera& cam, int re
     dc.hasLens = 0;
     dc.lens.surf = nullptr;
     dc.lens.iorAll = nullptr;
+    dc.lens.pupilCells = nullptr;
+    dc.lens.pupilNT = dc.lens.pupilNU = dc.lens.pupilN = 0;
+    dc.lens.pupilZRef = dc.lens.pupilZStart = dc.lens.pupilDMin = dc.lens.pupilDTheta = 0.0;
     if (cam.hasLens()) {
         const LensSystem& L = *cam.lens;
         const int M = (int)L.surf.size();
@@ -21904,6 +22037,23 @@ static gpu::DCamera bakeCamera(const Scene& /*scene*/, const Camera& cam, int re
         }
         dc.lens.surf = (const DLensSurface*)up.keep(uploadVec(surf));
         dc.lens.iorAll = (const double*)up.keep(uploadVec(iorAll));
+        // The pupil table, if the camera has one that fits the raster this bake images onto
+        // (the host's Camera::pupil test, against resX x resY).
+        const LensPupil* P = cam.lensPupil.get();
+        const double halfW = 0.5 * L.filmW_mm, halfH = halfW * ((double)resY / (double)resX);
+        if (P && P->filmZ == L.filmZ && P->racc2 >= halfW * halfW + halfH * halfH && !P->cells.empty()) {
+            std::vector<double> cells(P->cells.size() * 4);
+            for (size_t i = 0; i < P->cells.size(); ++i) {
+                cells[4 * i + 0] = P->cells[i].cx;
+                cells[4 * i + 1] = P->cells[i].a;
+                cells[4 * i + 2] = P->cells[i].b;
+                cells[4 * i + 3] = (double)P->cells[i].kind;
+            }
+            dc.lens.pupilCells = (const double*)up.keep(uploadVec(cells));
+            dc.lens.pupilNT = P->nTheta; dc.lens.pupilNU = P->nU; dc.lens.pupilN = (int)P->cells.size();
+            dc.lens.pupilZRef = P->zRef; dc.lens.pupilZStart = P->zStart;
+            dc.lens.pupilDMin = P->dMin; dc.lens.pupilDTheta = P->dTheta;
+        }
     }
     return dc;
 }
@@ -23376,7 +23526,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     int* d_wfCounters = nullptr;
     long long waveSamples = 0;
     if (mergeOn && !(std::getenv("FTRACE_NOWAVEFRONT") && std::atoi(std::getenv("FTRACE_NOWAVEFRONT")) != 0)) {
-        const int segCap = 1 << 20;          // 400 B each (~420 MB), 128 of them JSPEC's
+        const int segCap = 1 << 20;          // 416 B each (~436 MB), 128 of them JSPEC's
         const int hitCap = 1 << 25;          // 16 B each  (512 MB): a dense map yields thousands of
                                              // candidates per segment (_fog_cornell: ~2000), and a
                                              // spilled candidate is evaluated divergently, on the spot
@@ -23557,10 +23707,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                 if (wq.segs) {
                     cudaCheckKernel("bdpt");
                     CUDA_CHECK(cudaEventRecord(wfEv[1]));
-                    kWfBeamHits<<<2048, 128>>>(up.sc, dbm, wq, d_cam, resX);
+                    kWfBeamHits<<<2048, 128>>>(up.sc, dbm, wq, d_cam, resX, up.dc);
                     cudaCheckKernel("wf-hits");
                     CUDA_CHECK(cudaEventRecord(wfEv[2]));
-                    kWfBeamEval<<<4096, 128>>>(up.sc, dbm, wq, d_cam, resX);
+                    kWfBeamEval<<<4096, 128>>>(up.sc, dbm, wq, d_cam, resX, up.dc);
                     cudaCheckKernel("wf-eval");
                     CUDA_CHECK(cudaEventRecord(wfEv[3]));
                     ++wfWaves;

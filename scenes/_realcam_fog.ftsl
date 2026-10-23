@@ -1,0 +1,49 @@
+# Repro for known-issues.md J-FOG-REALCAM: realcam.ftsl through a pinhole (fov_y 27, the
+# achromat lens's framing) in a homogeneous fog. Mode J reads it 2-4% low against R at
+# -max-bounce 8; mode D matches R.
+#
+#   ftrace -in scenes/_realcam_fog.ftsl -r 128 86 -mode R -spp 8192 -max-bounce 8 -o png/_realcam_fog_r.png
+#   ftrace -in scenes/_realcam_fog.ftsl -r 128 86 -mode J -spp 4096 -max-bounce 8 -o png/_realcam_fog_j.png
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+# --- materials -------------------------------------------------------------
+material "floor"  { type diffuse    reflect rgb 0.6 0.6 0.62 }
+material "red"    { type diffuse    reflect rgb 0.75 0.15 0.12 }
+material "green"  { type diffuse    reflect rgb 0.15 0.6 0.2 }
+material "blue"   { type diffuse    reflect rgb 0.15 0.25 0.7 }
+material "chrome" { type mirror     reflect rgb 0.9 0.9 0.9 }
+
+# --- ground plane ----------------------------------------------------------
+quad { origin -10 0 -20   u 20 0 0   v 0 0 30   material floor }
+
+# --- three spheres at increasing depth (z) ---------------------------------
+sphere { center -0.9 0.35 1.2   radius 0.35   material red   }   # near
+sphere { center  0.0 0.35 2.4   radius 0.35   material green }   # focus plane
+sphere { center  1.1 0.35 3.8   radius 0.35   material blue  }   # far
+
+# --- a small chrome ball for specular highlights ---------------------------
+sphere { center 0.55 0.18 1.6   radius 0.18   material chrome }
+
+# --- lighting: overhead area light + warm key --------------------------------
+light area {
+    origin -0.6 3.0 1.8   u 1.2 0 0   v 0 0 1.2   normal 0 -1 0
+    spd preset:bb6500
+}
+light area {
+    origin 2.2 1.6 0.6   u 0 0.6 0   v 0 0 0.6   normal -1 0 0
+    spd preset:bb3200
+}
+
+# --- pinhole camera, framed as the achromat lens frames it ---------------
+camera "real" {
+    eye 0.0 0.55 -1.6   look_at 0.0 0.35 2.4   up 0 1 0
+    focus 2.4
+    film { res 512 342   format full-frame }
+    fov_y 27
+}
+
+medium { sigma_t 0.15   albedo 0.8   g 0.0 }
