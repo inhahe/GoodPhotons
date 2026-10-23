@@ -1781,8 +1781,18 @@ Work, in order:
       first, then monocular; always followed by the analysis-by-synthesis refinement.
 - [ ] **Appearance inverse** — fur, skin and eye parameters from a few renders or photos; shares
       P7's groom fit rather than duplicating it.
-- [ ] **Stimulus-logged capture protocol**, in `notes/capture.md`: what to log, which stimuli, and
-      counter-example sessions against the label confound.
+- [ ] **Environment log — measure the surroundings, never reverse-engineer them.** Protocol written
+      2026-10-22 in `notes/capture.md` §Environment log; this item is running it. Recovering the
+      environment from footage would mean inverse-rendering the scene, and for scent it is
+      impossible — but in our own sessions we control the environment, so we measure it: one scan
+      of the space per layout, registered into the rig's frame; stimuli as a timecoded event log
+      (the handler calls each event aloud and the GoPro mics stamp it); wind from an anemometer;
+      sound direction from the four calibrated mics. The scan rendered from each camera is a
+      background plate that helps separate the animal from its surroundings. Footage shot by
+      others yields anatomy and movement style only, never stimulus → response — the line that
+      keeps this phase off the inverse-rendering problem. The protocol also carries the
+      counter-example takes against the label confound, and the welfare rule: only stimuli the
+      animal meets in ordinary life, so fear is captured when it happens and never provoked.
 - [ ] **Behaviour discovery** — motif segmentation over P5's footage, clusters named against the
       species' ethogram.
 - [ ] **Senses: exteroception, under `sensing.py`'s contract.** Nothing outside the body reaches the

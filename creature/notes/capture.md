@@ -357,14 +357,15 @@ A realistic first motion session, in order:
 | 1 | rig placement, tape the floor marks, power/cards in | 20 min |
 | 2 | QR-config all four, timecode sync, RAW audio on | 5 min |
 | 3 | calibration: intrinsics (if mode changed) + extrinsics + floor + verify | 15–20 min |
-| 4 | weigh the animal; tape-measure a couple of bones; log it | 5 min |
-| 5 | **standing square** takes | 5 min |
-| 6 | walk passes, both directions | 10–15 min |
-| 7 | trot passes, both directions | 10–15 min |
-| 8 | gallop passes (if the space allows) | 15–20 min |
-| 9 | front/rear passes, circles | 10 min |
-| 10 | postural transitions, shake, scratch, head turns | 10–15 min |
-| 11 | closing calibration re-shoot | 5 min |
+| 4 | environment: scan the space (new layout only), anemometer logging, light noted (§Environment log) | 5–15 min |
+| 5 | weigh the animal; tape-measure a couple of bones; log it | 5 min |
+| 6 | **standing square** takes | 5 min |
+| 7 | walk passes, both directions | 10–15 min |
+| 8 | trot passes, both directions | 10–15 min |
+| 9 | gallop passes (if the space allows) | 15–20 min |
+| 10 | front/rear passes, circles | 10 min |
+| 11 | postural transitions, shake, scratch, head turns | 10–15 min |
+| 12 | closing calibration re-shoot | 5 min |
 | | **total on site** | **~2 hours** |
 
 What that yields, roughly: ~15–25 min of *recorded* footage, of which — with an uncooperative
@@ -383,10 +384,10 @@ Three physical limits that will end a session early if unplanned for:
   minutes of recording is ~70 GB. 256 GB cards minimum, V30 or better, and offload before the
   session ends — a card swap mid-session is also a chance to knock a tripod.
 - **Power.** High-fps recording drains a HERO battery in well under an hour. External USB power on
-  all four, or the session ends at step 8.
+  all four, or the session ends at step 9.
 
 **Log every session**: layout used, camera modes, calibration files, the animal's mass, what was
-shot in each take, and anything that went wrong (a nudged tripod, a failed timecode). A take with no
+shot in each take, the environment log (§Environment log), and anything that went wrong (a nudged tripod, a failed timecode). A take with no
 provenance is a take you will not trust in six months.
 
 ### Groom mode hardware note
@@ -459,3 +460,55 @@ motion mode cannot resolve the jaw/lip/throat detail that must co-animate with a
 and the close session captures exactly that (sound, face/head motion) pair at high resolution.
 That is the audio analogue of "groom needs its own stills session" — and like groom mode, it is
 cheap, unhurried, and can be repeated on a calm subject.
+
+## Environment log — the other half of every reaction  *(added 2026-10-22)*
+
+todo.md **P14** learns how the animal responds to its surroundings, so every take needs a record
+of the surroundings as well as of the animal. Recovering them from the footage would mean
+inverse-rendering the scene — expensive, and for scent impossible, since nothing in an image
+shows where a smell went. **We do not need to: in our own sessions we control the environment, so
+we measure it.** That is also the line between our footage and anyone else's: footage shot by
+others yields anatomy and movement style, never stimulus → response, because its environment was
+never measured.
+
+The audio argument applies with the same shape. The consumers come late, but a session that ran
+without the log cannot be logged afterwards — nobody will remember in a year which second the
+treat went down. So the cheap parts are recorded **from the first session onward**, and the
+stimulus parts from the first session that stages anything.
+
+### What to log
+
+| what | how | when |
+|---|---|---|
+| **Space geometry** | one scan of the static space — phone LiDAR, or photogrammetry from a slow walk-round with one GoPro — registered into the rig's frame through the calibration board and floor marks | once per layout; re-scan if anything fixed moves |
+| **Movable objects** | position at the start of each take: a photo from one fixed spot, or tracked by the four cameras like the animal | per take |
+| **Stimuli** | event log: what, where, when (timecode), by whom — food down, a knock, a person entering, a toy thrown. Moving stimuli are tracked by the rig | per event |
+| **Scent sources** | what, where, placed and removed when | per event |
+| **Sound** | already recorded (§Audio): four synced mics at calibrated positions give each sound's direction from arrival-time differences | free |
+| **Wind** | an anemometer with direction, logging continuously at a recorded spot — it is what carries scent to the nose | continuous |
+| **Light** | a note of light level and sun direction: what the animal could see depends on it | per session |
+| **Other animals and people** | tracked by the rig if in view, logged if not | per take |
+
+**The event log costs no extra hardware: the handler calls each event aloud** ("treat down, left
+marker"). The GoPro mics record the call, timecode-stamped like everything else, and transcribing
+it afterwards gives a timed event list. For an event whose exact moment matters, clap with it.
+
+**An off-camera stimulus is exactly what the log is for.** The knock at the door is outside all
+four views; without the log, the dog's head turn has no cause in the data.
+
+### Separating the animal from its environment
+
+P5's silhouette segmentation does the per-frame work. The scan adds a **background plate**: the
+static space rendered from each calibrated camera, so whatever differs from it is the animal, a
+person, or a moved object. That helps exactly where segmentation struggles — a dog lying on a rug
+of its own colour.
+
+### Two rules for staging stimuli
+
+- **Counter-example takes against the label confound** (todo.md P10): if every startled take is
+  also a fast take, the model learns startle as speed. Stage combinations that break the
+  correlation — a startle the animal sits through, an approach that stays slow.
+- **Welfare first: only stimuli the animal meets in ordinary life, with its owner's consent.**
+  Food, toys, knocks, a familiar person, a stranger at a distance. Fear and defence are captured
+  opportunistically, never provoked — and a reaction that would need a frightening stimulus to
+  evoke on camera is directed later through intent and part goals (todo.md P10) instead.
