@@ -206,10 +206,11 @@ def main():
     print(f'target mean LINEAR reflectance {TARGET_ALBEDO} (= capwhite), max dim {MAXDIM}\n')
     print(f'{"texture":18s} {"source":24s} {"size":11s} {"srcmean":>7s} '
           f'{"p2":>6s} {"p98":>6s} {"swing":>6s}  cap')
-    written = 0
+    written = failed = 0
     for name, src, cap, crop, k, s, *rot in CAPS:
         r = build(name, src, crop, k, s, report, rot[0] if rot else 0)
         if r is None:
+            failed += 1
             continue
         st, enc = r
         print(f'{name:18s} {src:24s} {st["size"][0]:4d}x{st["size"][1]:<5d} '
@@ -227,7 +228,11 @@ def main():
             enc.save(dst)
             written += 1
     if not report:
-        print(f'\nwrote {written} of {len(CAPS)} textures to textures/ (the rest were unchanged)')
+        print(f'\nwrote {written} of {len(CAPS)} textures to textures/, '
+              f'{len(CAPS) - written - failed} unchanged'
+              + (f', {failed} FAILED (see !! above)' if failed else ''))
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == '__main__':

@@ -1452,7 +1452,7 @@ heavier than their source images can justify, so both are first slimmed by
 counts and measures each one's departure from the original in *source-image pixels*, then takes
 the fewest faces that lose nothing the image could show. It welds the vertices glTF splits along
 UV seams before decimating; otherwise MeshLab treats every seam as an open boundary and keeps
-it vertex for vertex. Normals are recomputed per corner with a crease angle. Every map is padded
+it vertex for vertex. Normals are recomputed, hard only across creases. Every map is padded
 past the original's UV charts and Lanczos-resized in linear light. The slimmed files are written
 beside the originals, outside the repo, and the scene names them by absolute path.
 - **The gnome** (Meshy, textured): 43 MB → 4.3 MB, 56 k faces and a 1024² atlas from 8192². It is

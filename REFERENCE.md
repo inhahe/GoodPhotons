@@ -3156,13 +3156,15 @@ percentile. Then pick the fewest faces that keep every original vertex within ha
 docstring gives the relaxed rule for a mesh with a lone outlier), and
 `--out OUT.glb --faces N [--tex 1024] [--crease 60]` writes the result. The vertices split
 along UV seams are welded first, so the seams simplify like the rest of the surface, and the
-collapse is texture-aware while the mesh keeps its texture. Normals are recomputed per corner,
-smooth except across edges sharper than `--crease` degrees. Every map and factor of the
-material is carried: each map is padded past the original's UV charts and resized by Lanczos-3
-so its longer side is `--tex` (never enlarged), colour maps in linear light. The tool also prints
-the mean metalness and roughness ftrace's importer will derive, for source and result. A source
-with several materials, or maps it cannot carry, is refused rather than slimmed lossily; use
-`--no-texture` to drop the material and keep only the geometry. `--out` may not name the source,
+collapse is texture-aware while the mesh keeps its texture. Normals are recomputed, smooth
+except across edges sharper than `--crease` degrees. Every map of the material is carried with
+its sampler, and so are the factors: each map is padded past the original's UV charts and
+resized by Lanczos-3 so its longer side is `--tex` (never enlarged), colour maps in linear
+light. The tool also prints the mean metalness and roughness ftrace's importer will derive, for
+source and result. A source the tool cannot carry whole (several materials, material
+extensions, vertex colours, a second UV set, external images) is refused rather than slimmed
+lossily; use `--no-texture` to drop the material, textures and vertex colours and keep only the
+geometry. `--out` may not name the source,
 which is never written. It needs numpy, pillow, pymeshlab, pygltflib, scipy, opencv-python and
 trimesh (`pip install pymeshlab pygltflib scipy opencv-python trimesh`).
 
