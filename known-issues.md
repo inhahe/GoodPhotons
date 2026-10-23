@@ -72,6 +72,24 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-10-23, 0.394.3): LENS-SURFACE-SIGN — a pasted lens prescription was read with every radius negated, and its `stop` flag was rejected
+
+`lens { surface <radius> <thickness> <ior> <semi_aperture> [stop] }` was documented as the
+pbrt lens-file convention, and the docs described that convention as "+radius ⇒ centre of
+curvature on the scene side". Both halves were wrong together: pbrt lens files, Zemax tables
+and patents put a positive radius's centre on the IMAGE side (a front element convex toward
+the scene has R > 0), while `readLens` stored the number as written into LensSystem's frame,
+whose +z runs toward the scene with the centre at vertex + radius. So every real prescription
+pasted as documented became a different lens. pbrt's `dgauss.50mm.dat` (now
+`scenes/realcam_dgauss.ftsl`) measured f = 47.9 mm and rendered as noise in mode R, almost every
+camera ray clipped; with the radii negated it measures 50.4 mm and renders sharp at its focus.
+`readLens` now negates the radius (the presets' generators already negated theirs).
+
+The `[stop]` word never reached the reader at all: the grammar ends a value at a plain word
+(`cont = NUMWORD | KVWORD | STRING`), so `stop` became a statement of its own and drew an
+"unknown key" warning. `readLens` now takes a `stop` statement as marking the surface right
+before it. (Nothing in the renderer reads `isStop` yet; the flag is kept for what does.)
+
 ## DONE (2026-10-18, 0.386.0): J-CAMERA-COST — mode J's camera pass ran at 6.6x mode D's cost on `gallery_rain`; now 2.4x
 
 Measured on `gallery_rain`'s still (1280x720, `max_bounce 32`, RTX 4090). Mode J (`-jsurf-radius

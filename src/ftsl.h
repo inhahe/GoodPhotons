@@ -8111,15 +8111,37 @@ private:
 
         auto sys = std::make_shared<LensSystem>();
         // 1) explicit surfaces take priority (paste any real prescription).
+        //
+        // The radius is read in the convention every prescription is published in (pbrt lens
+        // files, Zemax tables, patents): positive when the centre of curvature lies on the
+        // SENSOR side of the surface, so a front element convex toward the scene has R > 0.
+        // LensSystem's frame runs +z toward the scene and puts the centre at vertex + radius,
+        // the opposite sign, so it is negated here (as makeSinglet/makeAchromat negate theirs).
+        //
+        // A trailing `stop` ends the value (the grammar ends a value at a plain word), so it
+        // arrives as a statement of its own right after its surface.
         int nSurf = 0;
+        const Stmt* prev = nullptr;
         for (const auto& s : lb.stmts) {
+            const Stmt* before = prev;
+            prev = &s;
+            if (s.key == "stop") {
+                s.used = true;
+                if (!before || before->key != "surface" || sys->surf.empty()) {
+                    fail("camera '" + cs.name + "' lens: `stop` must follow the `surface` it marks");
+                    return false;
+                }
+                sys->surf.back().isStop = true;
+                continue;
+            }
             if (s.key != "surface") continue;
             s.used = true;
             const auto& wds = s.val.words;
             if (wds.size() < 4) { fail("camera '" + cs.name + "' lens: `surface` needs "
                                        "<radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop]"); return false; }
             LensSurface e;
-            e.radius    = num(wds[0]);
+            const double r = num(wds[0]);
+            e.radius    = (r == 0.0) ? 0.0 : -r;            // 0 = planar (a stop or a flat)
             e.thickness = num(wds[1]);
             e.ior       = lensIorOf(wds[2]);
             e.aperture  = num(wds[3]);

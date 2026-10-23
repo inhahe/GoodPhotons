@@ -1940,8 +1940,15 @@ camera "real" {
   power split for the achromatic doublet), so focal length and colour correction are
   correct by construction; render-time dispersion uses real Sellmeier glass indices.
 - Or paste an **arbitrary real prescription** as repeated
-  `surface <radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop]` lines
-  (PBRT lens-file convention). See `scenes/realcam.ftsl` for a working demo.
+  `surface <radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop]` lines, front
+  (scene side) to rear, in the convention prescriptions are published in (pbrt lens files,
+  Zemax tables, patents): a radius is positive when its centre of curvature lies on the
+  sensor side, so a front element convex toward the scene has a positive radius, and 0 is
+  planar. `thickness` is the gap to the next surface (the last one's to the sensor, which
+  autofocus then moves); `ior` is a glass name or a number; `stop` marks the aperture stop.
+  A pbrt lens file's rows paste in directly once its aperture *diameters* are halved. Before
+  0.394.3 radii were read with the opposite sign, which turned a pasted prescription into a
+  different lens.
 
 **Analytic vs. simulated — the tradeoff:** the physical lens is the **accurate but
 slower** option. It captures real optical behaviour the thin lens cannot

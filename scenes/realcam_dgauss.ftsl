@@ -1,0 +1,62 @@
+# A real lens prescription pasted into a camera: the 50 mm f/2 double Gauss of pbrt's
+# dgauss.50mm.dat (US patent 2,673,491, Tronnier; Modern Lens Design p. 312, scaled from
+# 100 mm to 50 mm). The scene is realcam.ftsl's; only the lens differs.
+#
+# The `surface` rows are pbrt's, front (scene side) to rear, in the convention every
+# prescription is published in: a positive radius has its centre of curvature on the sensor
+# side, 0 is a plane. pbrt lists aperture DIAMETERS; ftrace wants semi-apertures, so the
+# fourth column is halved. The last thickness is a nominal gap to the sensor, which autofocus
+# then moves to the focus distance.
+#
+#   ftrace -in scenes/realcam_dgauss.ftsl -spp 256 -o png/realcam_dgauss.png          (mode R)
+#   ftrace -in scenes/realcam_dgauss.ftsl -mode A -n 400000000 -o png/realcam_dgauss_a.png
+#
+# The stop's semi-aperture sets the f-number: 8.55 mm is f/2; 2.14 mm stops it to f/8, where
+# the front element (12.6 mm) is several times wider than the beam the stop lets through.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "floor"  { type diffuse    reflect rgb 0.6 0.6 0.62 }
+material "red"    { type diffuse    reflect rgb 0.75 0.15 0.12 }
+material "green"  { type diffuse    reflect rgb 0.15 0.6 0.2 }
+material "blue"   { type diffuse    reflect rgb 0.15 0.25 0.7 }
+material "chrome" { type mirror     reflect rgb 0.9 0.9 0.9 }
+
+quad { origin -10 0 -20   u 20 0 0   v 0 0 30   material floor }
+
+sphere { center -0.9 0.35 1.2   radius 0.35   material red   }
+sphere { center  0.0 0.35 2.4   radius 0.35   material green }
+sphere { center  1.1 0.35 3.8   radius 0.35   material blue  }
+sphere { center 0.55 0.18 1.6   radius 0.18   material chrome }
+
+light area {
+    origin -0.6 3.0 1.8   u 1.2 0 0   v 0 0 1.2   normal 0 -1 0
+    spd preset:bb6500
+}
+light area {
+    origin 2.2 1.6 0.6   u 0 0.6 0   v 0 0 0.6   normal -1 0 0
+    spd preset:bb3200
+}
+
+camera "real" {
+    eye 0.0 0.55 -1.6   look_at 0.0 0.35 2.4   up 0 1 0
+    focus 2.4
+    film { res 512 342   format full-frame }
+    lens {
+        #       radius   thick   ior     semi-ap
+        surface  29.475  3.76    1.67    12.6
+        surface  84.83   0.12    1       12.6
+        surface  19.275  4.025   1.67    11.5
+        surface  40.77   3.275   1.699   11.5
+        surface  12.75   5.705   1       9.0
+        surface  0       4.5     1       8.55   stop
+        surface -14.495  1.18    1.603   8.5
+        surface  40.77   6.065   1.658   10.0
+        surface -20.385  0.19    1       10.0
+        surface  437.065 3.22    1.717   10.0
+        surface -39.73   40      1       10.0
+    }
+}

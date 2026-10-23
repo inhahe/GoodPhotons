@@ -3098,8 +3098,10 @@ lens { preset achromat  focal 50  fstop 2.8  glass BK7 }
 lens { surface <radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop]  … }
 ```
 
-- Explicit `surface` lines take priority (paste a real prescription; `ior` = glass
-  name or a number; `stop` marks the aperture stop).
+- Explicit `surface` lines take priority (paste a real prescription, front to rear; `ior` =
+  glass name or a number; `stop` marks the aperture stop). Radii follow the published
+  convention (pbrt lens files, Zemax, patents): positive when the centre of curvature is on
+  the sensor side, 0 for a plane.
 - Otherwise a `preset`: `singlet`/`biconvex`/`simple`, `achromat`/`doublet`,
   `telephoto`, `wide` (default = achromatic doublet at the derived focal/f-number).
 - Sensor size comes from the camera `film` (default full-frame); autofocuses at `focus`.
