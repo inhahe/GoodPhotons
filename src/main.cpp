@@ -3272,83 +3272,60 @@ static PatOpWhere patOpWhere(PatOp op, const char*& why) {
     }
 }
 
-// The checker generator puts a surface on a cell boundary in one cell, whatever the sign of
-// its hit points' rounding error (pattern_gen::kCheckerTieBreak): one parity on each side of
-// every boundary plane, for a 0.25 m checker near the origin and a 1 cm one 10 m out, from
-// errors up to a few float ulps of the coordinate there (5 um at 10 m). Host VM only -- the property is the
-// program's, and the opcode check below holds the device VMs to the host.
-static bool checkCheckerTieBreak() {
-    struct Case { double size; std::array<double, 4> planes; std::array<double, 7> errs; };
-    const Case cases[] = {
-        {0.25, {0.0, 0.25, 5.0, -2.0}, {0.0, 1e-12, -1e-12, 1e-7, -1e-7, 2e-6, -2e-6}},
-        {0.01, {10.0, -10.0, 3.0, 0.0}, {0.0, 1e-12, -1e-12, 1e-6, -1e-6, 5e-6, -5e-6}},
-    };
-    int bad = 0;
-    for (const Case& k : cases) {
-        const std::vector<PatNode> chk = pattern_gen::checker(k.size);
-        for (const double plane : k.planes) {
-            for (int axis = 0; axis < 3; ++axis) {
-                double first = -1.0;
-                for (const double err : k.errs) {
-                    PatCtx c;
-                    // inside a cell on the other two axes
-                    c.x = 0.43 * k.size; c.y = 0.37 * k.size; c.z = 0.61 * k.size;
-                    (axis == 0 ? c.x : axis == 1 ? c.y : c.z) = plane + err;
-                    const double v = patternEval(chk.data(), (int)chk.size(), c);
-                    if (first < 0.0) first = v;
-                    else if (v != first) ++bad;
-                }
-            }
-        }
-    }
-    std::printf("[checkpatops] checker on a cell boundary: %d hit points off by a rounding error "
-                "changed cell %s\n", bad, bad ? "FAIL" : "ok");
-    return bad == 0;
-}
-
-// A pattern reads a surface hit a hair to the ray's side of it (pattern.h patNudgedPoint, used
-// by patCtxFromHit): hits within rounding of a step -- on a floor at y = 0, at +-1e-12 of it as
-// an exported floor's vertices put them, on a sphere hit along the ray at r = 0.5 +- an ulp --
-// all read the ray's side of floor(4y) or step(0.5, r), seen from either side. Without the
-// nudge, the same hits read both sides. And an emitter's sampled point reads an emission
-// pattern as a hit there does (emitterPatMulAt nudges too).
+// A pattern reads a surface point a hair outside the surface, along its geometric normal
+// (pattern.h patNudgedPoint, used by patCtxFromHit and emitterPatMulAt), whichever side the ray
+// came from. Hits within rounding of a step -- a floor at y = 0, at +-1e-12 of it as an
+// exported floor's vertices put them; a sphere at r = 0.5 +- an ulp; the built-in checker on
+// a cell wall facing either way, out to 200 m, where a tie-break that once shifted its walls
+// made a ring -- all read the outside, seen from either side. An emitter's sampled point reads
+// an emission pattern as a hit there does. And a CPU sphere hit from 100 km away, whose
+// textbook t is far coarser than the hair, reads outside: the hit is put back on the sphere.
 static bool checkPatternNudge() {
-    std::vector<PatNode> floor4y, stepR;
+    std::vector<PatNode> floor4y, stepR, lit;
     std::string err;
-    if (!compilePatternExpr("floor(4 * y)", floor4y, err) || !compilePatternExpr("step(0.5, r)", stepR, err)) {
+    if (!compilePatternExpr("floor(4 * y)", floor4y, err) || !compilePatternExpr("step(0.5, r)", stepR, err) ||
+        !compilePatternExpr("1 + floor(4 * y)", lit, err)) {
         std::printf("[checkpatops] pattern nudge: %s FAIL\n", err.c_str());
         return false;
     }
     Scene sc;
-    int bad = 0, n = 0;
     auto read = [&](const std::vector<PatNode>& prog, const Vec3& p, const Vec3& ng, const Vec3& nFacing) {
         Hit h;
         h.p = p; h.ng = ng; h.n = nFacing; h.matId = -1;
         return patternEval(prog.data(), (int)prog.size(), patCtxFromHit(sc, h));
     };
+    int bad = 0, n = 0;
     for (const double side : {1.0, -1.0}) {                      // seen from above, then from below
-        const Vec3 up(0, 1, 0), facing(0, side, 0);
-        const double want = side > 0.0 ? 0.0 : -1.0;             // floor(4 y) just above / below 0
         for (const double y : {0.0, 1e-12, -1e-12, 1e-9, -1e-9, 5e-324})
             for (const double x : {0.3, -7.0, 120.5}) {
                 ++n;
-                if (read(floor4y, Vec3(x, y, 0.7), up, facing) != want) ++bad;
+                if (read(floor4y, Vec3(x, y, 0.7), Vec3(0, 1, 0), Vec3(0, side, 0)) != 0.0) ++bad;
             }
     }
     for (int k = 0; k < 64; ++k) {                               // a sphere of radius 0.5 at the origin
         const double th = 0.1 + 0.05 * k, ph = 0.37 * k;
         const Vec3 dir(std::sin(th) * std::cos(ph), std::cos(th), std::sin(th) * std::sin(ph));
-        for (const double dr : {0.0, 1e-16, -1e-16, 5e-17}) {
-            ++n;
-            if (read(stepR, dir * (0.5 + dr), dir, dir) != 1.0) ++bad;   // from outside: r > 0.5
-        }
+        for (const double dr : {0.0, 1e-16, -1e-16, 5e-17})
+            for (const double side : {1.0, -1.0}) {              // from outside, then from inside
+                ++n;
+                if (read(stepR, dir * (0.5 + dr), dir, dir * side) != 1.0) ++bad;
+            }
     }
-    // An emission pattern at a point the emitter sampler drew reads the side the emitter emits
-    // into, as a ray arriving there reads it: MIS adds the two estimates, so they must agree.
-    std::vector<PatNode> lit;                                    // 1 just above y = 0, 0 just below
-    if (!compilePatternExpr("1 + floor(4 * y)", lit, err)) {
-        std::printf("[checkpatops] pattern nudge: %s FAIL\n", err.c_str());
-        return false;
+    // The checker's walls: y = k s, facing up or down; the cell outside is the one half a cell
+    // along the normal.
+    int chkBad = 0, chkN = 0;
+    for (const double s : {0.25, 0.025}) {
+        const std::vector<PatNode> chk = pattern_gen::checker(s);
+        for (const double k : {0.0, 1.0, 80.0, -3.0})
+            for (const double up : {1.0, -1.0})
+                for (const double x : {0.0123, 1.37, -24.71, 199.31}) {
+                    const Vec3 p(x, k * s, 0.6789), ng(0, up, 0);
+                    PatCtx c = makePatCtx(p + ng * (0.5 * s), 0.0, ng);
+                    ++chkN;
+                    if (read(chk, p, ng, ng) != patternEval(chk.data(), (int)chk.size(), c)) ++chkBad;
+                    ++chkN;
+                    if (read(chk, p, ng, ng * -1.0) != patternEval(chk.data(), (int)chk.size(), c)) ++chkBad;
+                }
     }
     Scene se;
     se.patterns.push_back(Pattern{lit});
@@ -3360,15 +3337,25 @@ static bool checkPatternNudge() {
         for (const double y : {0.0, 1e-12, -1e-12}) {
             const Vec3 p(0.3, y, 0.7);
             Hit h;
-            h.p = p; h.ng = Vec3(0, 1, 0); h.n = nOut; h.matId = -1;
+            h.p = p; h.ng = nOut; h.n = nOut; h.matId = -1;      // a one-sided emitter's ng faces its light
             ++emN;
             if (emitterPatMulAt(se, em, p, nOut, 0.0, 0.0) != slotPatMul(se, 0, h)) ++emBad;
         }
     }
-    std::printf("[checkpatops] pattern nudge: %d of %d hits within rounding of a step read the wrong side, "
-                "%d of %d emitter samples disagree with a hit there %s\n",
-                bad, n, emBad, emN, bad || emBad ? "FAIL" : "ok");
-    return bad == 0 && emBad == 0;
+    int farBad = 0, farN = 0;
+    const Sphere ball{Vec3(0, 0, 0), 0.5, -1};
+    for (int k = 0; k < 64; ++k) {                               // rays from 100 km up, across the ball
+        const Vec3 o(0, 1e5, 0), aim(0.45 * std::cos(0.7 * k) * (k % 8) / 8.0, 0, 0.45 * std::sin(0.7 * k) * (k % 8) / 8.0);
+        Hit h;
+        if (!intersectSphere(Ray{o, normalize(aim - o)}, ball, 1e-9, h)) { ++farBad; continue; }
+        ++farN;
+        if (patternEval(stepR.data(), (int)stepR.size(), patCtxFromHit(sc, h)) != 1.0) ++farBad;
+    }
+    std::printf("[checkpatops] pattern nudge: %d of %d hits within rounding of a step read the inside, "
+                "%d of %d on checker walls, %d of %d emitter samples disagree with a hit there, "
+                "%d of %d sphere hits from 100 km %s\n",
+                bad, n, chkBad, chkN, emBad, emN, farBad, farN, bad || chkBad || emBad || farBad ? "FAIL" : "ok");
+    return bad == 0 && chkBad == 0 && emBad == 0 && farBad == 0;
 }
 
 // -checkpatops: every pattern opcode, through all THREE implementations of the VM.
@@ -3391,7 +3378,7 @@ static bool checkPatternNudge() {
 // dimensionality). Those are counted as SKIPPED rather than quietly passing -- a check that
 // says "all clear" about opcodes it never exercised would be worse than no check.
 static int checkPatOps() {
-    const bool tieOk = checkCheckerTieBreak() & checkPatternNudge();
+    const bool nudgeOk = checkPatternNudge();
     struct Prog { PatOp op; int off, len; };
     std::vector<PatNode> pool;
     std::vector<Prog>    progs;
@@ -3483,11 +3470,11 @@ static int checkPatOps() {
                 progs.size(), unknownArity, exempt);
     if (!haveDev) {
         std::printf("[checkpatops] no CUDA device: host VM only, device twins SKIPPED\n");
-        std::printf("[checkpatops] %s (host only)\n", tieOk ? "PASS" : "FAIL");
-        return tieOk ? 0 : 1;
+        std::printf("[checkpatops] %s (host only)\n", nudgeOk ? "PASS" : "FAIL");
+        return nudgeOk ? 0 : 1;
     }
     std::printf("[checkpatops] device fp64 mismatches %d, fp32 mismatches %d\n", bad64, bad32);
-    const bool ok = tieOk && !bad64 && !bad32;
+    const bool ok = nudgeOk && !bad64 && !bad32;
     std::printf("[checkpatops] %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
@@ -10339,9 +10326,16 @@ static int checkTriNormal() {
     // old code responded by NEGATING ns, `hit.n` and `hit.curv` along with it, turning a
     // sphere's bulge into a pit in a one-pixel rim. Vacuity would make this section
     // meaningless, so the straddler count is asserted too.
+    //
+    // The same rays also go through the facet as an instance's mesh (turned and scaled), whose
+    // world hit must keep the direct hit's orientation: instanceHitToWorld re-orienting the
+    // shading normal against the world ray by the shading normal itself is the same bug.
+    const Affine silXf = MeshXform{Vec3(0.7, -1.1, 2.3), Vec3(1.5, 1.5, 1.5), Vec3(30, -45, 10)}.toAffine();
+    MeshInstance silInst;
+    silInst.setToWorld(silXf);
     auto silhouetteSweep = [&](const char* tag, const std::vector<Tri>& tris) {
-        int straddlers = 0, hits = 0;
-        int badN = 0, badNg = 0, badCurv = 0, badOgn = 0;
+        int straddlers = 0, hits = 0, instHits = 0;
+        int badN = 0, badNg = 0, badCurv = 0, badOgn = 0, badInst = 0;
         for (const auto& t : tris) {
             Vec3 vn = t.n0 + t.n1 + t.n2;
             Vec3 gnf = (dot(t.gn, vn) < 0.0) ? t.gn * -1.0 : t.gn;   // authored outward side
@@ -10364,6 +10358,14 @@ static int checkTriNormal() {
                 if (!(dot(h.ng, gnf) > 0.0))         badNg++;   // ng on the authored side
                 if (!(h.curv > 0.0))                 badCurv++; // a bulge is still a bulge
                 if (!(dot(orientedGeoN(h), gnf) > 0.0)) badOgn++;
+                const Ray wr{silXf.apply(r.o), silXf.applyDir(r.d)};
+                const Ray lr{silInst.toLocal.apply(wr.o), silInst.toLocal.applyDir(wr.d)};
+                Hit lh;
+                if (!intersectTri(lr, t, 1e-9, lh)) continue;
+                Scene::instanceHitToWorld(silInst, lh);
+                instHits++;
+                const Vec3 wgnf = normalize(silInst.toWorld.applyNormal(gnf));
+                if (!(dot(lh.n, wgnf) > 0.0) || !(dot(lh.ng, wgnf) > 0.0) || !(lh.curv > 0.0)) badInst++;
             }
         }
         char lbl[128];
@@ -10377,9 +10379,11 @@ static int checkTriNormal() {
         chkb(lbl, badCurv == 0);
         std::snprintf(lbl, sizeof lbl, "S1b %s: orientedGeoN on the authored side", tag);
         chkb(lbl, badOgn == 0);
+        std::snprintf(lbl, sizeof lbl, "S1b %s: an instance's hit keeps n, ng and curv's side", tag);
+        chkb(lbl, instHits > 64 && badInst == 0);
         std::printf("[checktrinormal] S1b %-9s %d silhouette rays, %d hit, "
-                    "%d/%d/%d/%d bad (n/ng/curv/orientedGeoN)\n",
-                    tag, straddlers, hits, badN, badNg, badCurv, badOgn);
+                    "%d/%d/%d/%d bad (n/ng/curv/orientedGeoN); as an instance %d hit, %d bad\n",
+                    tag, straddlers, hits, badN, badNg, badCurv, badOgn, instHits, badInst);
     };
     silhouetteSweep("smooth", smoothCcw);
     silhouetteSweep("inverted", smoothCw);
@@ -10525,7 +10529,7 @@ static int checkTriNormal() {
                         const Ray lr{inst.toLocal.apply(wr.o), inst.toLocal.applyDir(wr.d)};
                         Hit lh; lh.t = 1e30;
                         if (!intersectTri(lr, tri, 1e-9, lh)) { ++bad; continue; }
-                        Scene::instanceHitToWorld(inst, wr, lh);
+                        Scene::instanceHitToWorld(inst, lh);
                         if (lh.p[wa] != w0[wa]) ++bad;
                     }
                 }
@@ -23769,6 +23773,7 @@ static int run(int argc, char** argv) {
         // otherwise be re-allocated and re-zeroed per frame, which used to cost more than
         // the rasterization itself.
         raster::RasterScratch rasterScratch;
+        bool gpuFrameFailSaid = false;   // a failed GPU frame is said once, not per frame
         auto rasterOne = [&](const Camera& cam, int W, int H, double ev, bool autoExp,
                              double* lock) -> std::vector<uint8_t> {
 #ifdef HAVE_CUDA
@@ -23786,6 +23791,10 @@ static int run(int argc, char** argv) {
                     raster_cuda::renderFrame(gpuRaster, cam, W, H, nThreads, ev, autoExp, lock,
                                              rasterSeeThrough, rasterClarity, rasterHaze);
                 if (!img.empty()) return img;
+                if (!gpuFrameFailSaid) {
+                    gpuFrameFailSaid = true;
+                    std::fprintf(stderr, "[raster] a GPU frame failed; rendering on the CPU\n");
+                }
             }
 #endif
             ensurePrims();   // lazy fallback (also the sole path when the GPU is unavailable)

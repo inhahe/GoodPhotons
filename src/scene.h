@@ -3349,15 +3349,17 @@ struct Scene {
     }
 
     // Transform a BLAS-local hit (from Blas::intersectLocal) back into world space for
-    // instance `inst` under the world ray `r`. Positions map by toWorld; shading and
-    // geometric normals map by the inverse-transpose (toWorld.applyNormal) and the
-    // shading normal is re-oriented against the world ray (matching the primitive path).
-    static void instanceHitToWorld(const MeshInstance& inst, const Ray& r, Hit& lh) {
-        lh.p  = inst.toWorld.apply(lh.p);              // from the local point (intersectTri says why)
-        Vec3 wn  = normalize(inst.toWorld.applyNormal(lh.n));
-        Vec3 wng = normalize(inst.toWorld.applyNormal(lh.ng));
-        lh.ng = wng;
-        lh.n  = (dot(r.d, wn) < 0.0) ? wn : -wn;
+    // instance `inst`. Positions map by toWorld; shading and
+    // geometric normals map by the inverse-transpose (toWorld.applyNormal). The shading
+    // normal keeps the orientation the local intersectTri gave it, which it decided from the
+    // geometric normal: the transform preserves the sign of dot(d, n) (dot(M^-T n, d) =
+    // dot(n, M^-1 d)), so this is the primitive path's orientation. Re-orienting it against
+    // the world ray by the SHADING normal would negate it, and curvature with it, in the
+    // silhouette band intersectTri's comment describes.
+    static void instanceHitToWorld(const MeshInstance& inst, Hit& lh) {
+        lh.p  = inst.toWorld.apply(lh.p);             // from the local point (intersectTri says why)
+        lh.n  = normalize(inst.toWorld.applyNormal(lh.n));
+        lh.ng = normalize(inst.toWorld.applyNormal(lh.ng));
         // Map the surface tangent through the instance transform too (C6 normal maps
         // on instanced meshes). The tangent is a direction, so it uses applyDir (not
         // applyNormal); handedness (bitangentSign) is preserved for proper transforms.
@@ -3370,9 +3372,7 @@ struct Scene {
         // that matters) and a reasonable mean under a mild non-uniform one — a genuinely
         // anisotropic scale changes the two principal curvatures by DIFFERENT amounts, so
         // no single scalar can be right and this is documented as an approximation.
-        // Also re-flip if the world-space re-orientation flipped the shading normal.
         lh.curv *= inst.curvScale;
-        if (dot(r.d, wn) >= 0.0) lh.curv = -lh.curv;
         if (inst.matOverride >= 0) lh.matId = inst.matOverride;
     }
 
@@ -3477,7 +3477,7 @@ struct Scene {
                 Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
                 Hit lh; lh.t = h.t;                    // running world tMax == local tMax
                 if (blasList[inst.blasId].intersectLocal(lr, tmin, lh, vcolData())) {
-                    instanceHitToWorld(inst, r, lh);
+                    instanceHitToWorld(inst, lh);
                     h = lh; tm = h.t;
                 }
             }
@@ -3860,7 +3860,7 @@ struct Scene {
             Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
             Hit lh; lh.t = h.t;
             if (blasList[inst.blasId].intersectLocal(lr, tmin, lh)) {
-                instanceHitToWorld(inst, r, lh);
+                instanceHitToWorld(inst, lh);
                 h = lh;
             }
         }
@@ -4023,7 +4023,7 @@ inline double cavityAt(const Scene& scene, const Hit& h) {
 }
 
 // Build a procedural-pattern evaluation context from a hit: world point (x,y,z) -- the hit
-// moved a hair to the ray's side of the surface (patNudgedPoint says why) --, implicit field
+// moved a hair off the surface along h.ng (patNudgedPoint says why) --, implicit field
 // value f (0 on non-implicit surfaces), oriented normal, radius, and the scene's pattern
 // tables (so `tex:<name>(u,v)` and `grid:<name>(…)` sampling inside a pattern work).
 inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
@@ -4040,7 +4040,7 @@ inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
         h.cavityDone = true;
     }
     Vec3 q;
-    patNudgedPoint(h.p.x, h.p.y, h.p.z, h.ng.x, h.ng.y, h.ng.z, dot(h.n, h.ng) < 0.0 ? -1.0 : 1.0, q.x, q.y, q.z);
+    patNudgedPoint(h.p.x, h.p.y, h.p.z, h.ng.x, h.ng.y, h.ng.z, q.x, q.y, q.z);
     PatCtx c = makePatCtx(q, h.fieldVal, h.n, h.u, h.v, h.curv, h.cavity, h.fw);
     bindPatScene(c, scene);
     return c;
@@ -4194,13 +4194,13 @@ inline double emitSlot(const Scene& scene, const Material& m, const Hit& h, doub
 // The emission-pattern multiplier at a point on `em`, given the point's own texture
 // coordinates. Clamped to [0,1] like the reflect/transmit slot patterns, so a runaway
 // formula can never manufacture light. Read a hair off the surface on the side it emits
-// into (nOut), as a ray arriving there reads it (patCtxFromHit), so the two agree on a
-// pattern stepping at the surface.
+// into (nOut), which is the side its geometric normal faces -- one-sided emission is tested
+// against it -- so a hit there (patCtxFromHit) reads the same point: MIS adds the two.
 inline double emitterPatMulAt(const Scene& scene, const Emitter& em,
                               const Vec3& y, const Vec3& nOut, double uu, double vv) {
     if (em.emitPat < 0 || em.emitPat >= (int)scene.patterns.size()) return 1.0;
     Vec3 q;
-    patNudgedPoint(y.x, y.y, y.z, nOut.x, nOut.y, nOut.z, 1.0, q.x, q.y, q.z);
+    patNudgedPoint(y.x, y.y, y.z, nOut.x, nOut.y, nOut.z, q.x, q.y, q.z);
     PatCtx c = makePatCtx(q, 0.0, nOut, uu, vv);
     bindPatScene(c, scene);
     double p = scene.patterns[em.emitPat].eval(c);

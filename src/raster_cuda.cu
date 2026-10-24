@@ -908,20 +908,23 @@ __device__ inline double dRasterFw(const DCam& cam, float3 wpos, float3 wn) {
     return patShadingFootprint((double)cam.fwPerDist, dist, (double)dot3(dv, nn) / dist);
 }
 
-// The point a pattern reads at this preview pixel: wpos moved a hair off the triangle
-// (p0, p1, p2) toward the eye, as the tracers read a hit (pattern.h patNudgedPoint), so a
-// pattern stepping at the surface shows the side the tracers show. Host twin: raster.h ctx().
-__device__ inline void dRasterPatPoint(const DCam& cam, float3 p0, float3 p1, float3 p2, float3 wpos,
-                                       double& qx, double& qy, double& qz) {
+// The point a pattern reads at this preview pixel, and its distance r from the origin: wpos
+// moved a hair off the triangle (p0, p1, p2) along its geometric normal, turned to the side
+// its source vertex normals (summed: nsum) face -- as the tracers read a hit (pattern.h
+// patNudgedPoint; intersectTri orients h.ng so) -- so a pattern stepping at the surface shows
+// the side the tracers show. Host twin: raster.h ctx().
+__device__ inline void dRasterPatPoint(float3 p0, float3 p1, float3 p2, float3 nsum, float3 wpos,
+                                       double& qx, double& qy, double& qz, double& r) {
     const double ax = (double)p1.x - p0.x, ay = (double)p1.y - p0.y, az = (double)p1.z - p0.z;
     const double bx = (double)p2.x - p0.x, by = (double)p2.y - p0.y, bz = (double)p2.z - p0.z;
     double nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
     const double l = sqrt(nx * nx + ny * ny + nz * nz);
     qx = wpos.x; qy = wpos.y; qz = wpos.z;
-    if (!(l > 0.0)) return;
-    nx /= l; ny /= l; nz /= l;
-    const double toward = nx * (qx - cam.eye.x) + ny * (qy - cam.eye.y) + nz * (qz - cam.eye.z);
-    patNudgedPoint(qx, qy, qz, nx, ny, nz, toward < 0.0 ? 1.0 : -1.0, qx, qy, qz);
+    if (l > 0.0) {
+        const double k = (nx * nsum.x + ny * nsum.y + nz * nsum.z < 0.0 ? -1.0 : 1.0) / l;
+        patNudgedPoint(qx, qy, qz, nx * k, ny * k, nz * k, qx, qy, qz);
+    }
+    r = sqrt(qx * qx + qy * qy + qz * qz);
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,6 +1161,14 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     // Perspective-correct UV, needed by the skin, the normal map and the pattern VM alike.
     float uu = (uv0.x * (w0 * t.invd0) + uv1.x * (w1 * t.invd1) + uv2.x * (w2 * t.invd2)) * d;
     float vv = (uv0.y * (w0 * t.invd0) + uv1.y * (w1 * t.invd1) + uv2.y * (w2 * t.invd2)) * d;
+    // The point the pattern sites below read (dRasterPatPoint), made once per pixel, by the
+    // first that needs it. The source triangle's normals orient it: this slot's may be
+    // flipped to face the eye (kSlotBack) or lerped by the near clip.
+    double qx = 0.0, qy = 0.0, qz = 0.0, qr = 0.0;
+    bool qReady = false;
+    auto patPoint = [&]() {
+        if (!qReady) { dRasterPatPoint(wp0, wp1, wp2, vsrc.n0 + vsrc.n1 + vsrc.n2, wpos, qx, qy, qz, qr); qReady = true; }
+    };
 
     // Per-hit `mix`: a `weight_map` selects between two whole material payloads at every
     // point, so it must be resolved before anything below reads one. The mix index is
@@ -1171,9 +1182,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         if (mx.weightPat >= 0 && mx.weightPat < nPatterns && patNodes) {
             const DPattern& wp = patterns[mx.weightPat];
             float3 pn = normalize3(wn);
-            double qx, qy, qz;
-            dRasterPatPoint(cam, wp0, wp1, wp2, wpos, qx, qy, qz);
-            double qr = sqrt(qx * qx + qy * qy + qz * qz);
+            patPoint();
             // curv = 0: the raster preview shades a VERTEX BUFFER, not a ray-triangle
             // hit, so no per-face curvature is in hand here. The CPU raster twin passes
             // none either, so the two previews agree; `curv` is a tracer-only input.
@@ -1219,14 +1228,12 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     if (pat >= 0 && pat < nPatterns && patNodes) {
         const DPattern& pp = patterns[pat];
         float3 pn = normalize3(wn);
-        double px, py, pz;
-        dRasterPatPoint(cam, wp0, wp1, wp2, wpos, px, py, pz);
-        double r  = sqrt(px * px + py * py + pz * pz);
+        patPoint();
         // f = 0: the implicit field value is exactly 0 on the level set the marched mesh
         // approximates, matching both the CPU preview and the tracer's own hit context.
         // curv/cavity = 0 here for the same reason as the mix-weight site above.
-        double s = dPatternEval(patNodes + pp.off, pp.n, px, py, pz, 0.0,
-                                pn.x, pn.y, pn.z, r, (double)uu, (double)vv, 0.0, 0.0,
+        double s = dPatternEval(patNodes + pp.off, pp.n, qx, qy, qz, 0.0,
+                                pn.x, pn.y, pn.z, qr, (double)uu, (double)vv, 0.0, 0.0,
                                 dRasterFw(cam, wpos, wn), patEnv);
         col = col * (float)fmin(1.0, fmax(0.0, s));
     }
@@ -1259,9 +1266,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         if (shRPat >= 0 && shRPat < nPatterns && patNodes) {
             const DPattern& rp = patterns[shRPat];
             float3 pn = normalize3(wn);
-            double qx, qy, qz;
-            dRasterPatPoint(cam, wp0, wp1, wp2, wpos, qx, qy, qz);
-            double qr = sqrt(qx * qx + qy * qy + qz * qz);
+            patPoint();
             rough = previewRoughD((float)dPatternEval(patNodes + rp.off, rp.n, qx, qy, qz, 0.0,
                                                       pn.x, pn.y, pn.z, qr, (double)uu, (double)vv,
                                                       0.0, 0.0, dRasterFw(cam, wpos, wn), patEnv));

@@ -655,26 +655,32 @@ struct PatTableScope {
     }
 };
 
-// The point a pattern reads at a surface hit: the hit point moved a hair along the geometric
-// normal (gx, gy, gz), to the side the ray came from (side = +-1). A pattern that steps where
-// a surface lies -- `floor(4*y)` on a floor at y = 0, a step a hair off an exported floor's
-// noisy vertices, a radial step on a sphere hit along the ray -- would otherwise take each
-// hit's value from whichever side its rounding error put it on, and a pixel would average
-// the two (grey speckle, or a seam). Moved off by more than any hit point's rounding, every
-// hit reads the ray's side. The hair is kPatNudge of the point's distance from the origin,
-// and at least kPatNudge * kPatNudgeFloor (1e-7) in absolute terms: some 80 float ulps of the
-// point, and 10^10 double ones, while a thousandth of a millimetre at a metre is no detail a
-// pattern shows. That outruns a hit point's rounding as long as the rounding is relative to
-// the surface's own coordinates, not the ray origin's, so hit points are made so: a
-// triangle's comes from its vertices, and the GPU's float sphere, isosurface and curve hits
-// are taken from the surface rather than along the ray.
-// Host patCtxFromHit, emitterPatMulAt and the rasterizer, and the device's pattern sites, share it.
-constexpr double kPatNudge = 1e-5, kPatNudgeFloor = 1e-2;
+// The point a pattern reads at a surface point p: p moved a hair along the surface's unit
+// geometric normal g, to just outside the surface -- the side g faces, whichever side the ray
+// came from. A pattern that steps where a surface lies (`floor(4*y)` on a floor at y = 0, a
+// step a hair off an exported floor's noisy vertices, a radial step on a sphere) would
+// otherwise take each hit's value from whichever side its rounding put it on, and a pixel
+// would average the two: grey speckle, or a seam. Read off the surface by more than that
+// rounding, every hit reads one side. That side is fixed by the surface, not the ray, so a
+// transmissive surface reads the same value for light crossing it either way (reciprocity,
+// which forward, backward and bidirectional modes rely on), and nothing turns on the shading
+// normal's orientation, which normal maps and instances can tip.
+//
+// The hair is kPatNudge (some 17 float ulps) of the point's distance from the origin, and at
+// least kPatNudge * kPatNudgeFloor in absolute terms. It must outrun the rounding of the hit
+// point -- so every intersector takes its hit from the surface's own coordinates (a
+// triangle's from its vertices; spheres, isosurfaces and curves put back on the surface or
+// solved about it), not along the ray -- and the float noise of an exported mesh's vertices,
+// which double hit points inherit too. Smaller would not cover those; larger shifts a pattern
+// that varies along the normal (at a kilometre from the origin the hair is 2 mm).
+// Shared by every surface pattern read: host patCtxFromHit, emitterPatMulAt and the
+// rasterizer, and their device twins.
+constexpr double kPatNudge = 2e-6, kPatNudgeFloor = 1e-2;
 PATTERN_HD inline void patNudgedPoint(double px, double py, double pz, double gx, double gy, double gz,
-                                      double side, double& ox, double& oy, double& oz) {
+                                      double& ox, double& oy, double& oz) {
     double r = sqrt(px * px + py * py + pz * pz);
     if (r < kPatNudgeFloor) r = kPatNudgeFloor;
-    const double d = (side < 0.0 ? -kPatNudge : kPatNudge) * r;
+    const double d = kPatNudge * r;
     ox = px + gx * d; oy = py + gy * d; oz = pz + gz * d;
 }
 
@@ -1855,25 +1861,15 @@ inline std::vector<PatNode> bands(PatOp coord, double freq, double phase) {
 }
 
 // checker: 3-D checkerboard parity in {0,1} at the given cell size.
-// value = mod(floor(x/s + e)+floor(y/s + e)+floor(z/s + e), 2), e = kCheckerTieBreak
-//
+// value = mod(floor(x/s)+floor(y/s)+floor(z/s), 2)
 // A surface lying on a cell boundary -- a floor at y = 0, a wall at a multiple of the size --
-// takes its parity from the side of the boundary each hit is read on. Hits are read a hair to
-// the ray's side (patNudgedPoint), which settles that for every surface; the offset moves
-// every boundary a thousandth of a cell off the round coordinates as well, so a point read
-// without that nudge -- a caller of the program outside the renderers -- also sits in one cell
-// for any rounding error under 10 um at a 1 cm checker, a shift of the pattern no render can
-// show. Loom's two checkers carry the same as a phase (spatial.CHECKER_TIE_BREAK).
-inline constexpr double kCheckerTieBreak = 1e-3;
+// shows the cell just outside it, as every pattern does (patNudgedPoint).
 inline std::vector<PatNode> checker(double size) {
     std::vector<PatNode> o;
     double inv = (size != 0.0) ? 1.0 / size : 1.0;
-    pushOp(o, PatOp::VarX); pushConst(o, inv); pushOp(o, PatOp::Mul);
-    pushConst(o, kCheckerTieBreak); pushOp(o, PatOp::Add); pushOp(o, PatOp::Floor);
-    pushOp(o, PatOp::VarY); pushConst(o, inv); pushOp(o, PatOp::Mul);
-    pushConst(o, kCheckerTieBreak); pushOp(o, PatOp::Add); pushOp(o, PatOp::Floor); pushOp(o, PatOp::Add);
-    pushOp(o, PatOp::VarZ); pushConst(o, inv); pushOp(o, PatOp::Mul);
-    pushConst(o, kCheckerTieBreak); pushOp(o, PatOp::Add); pushOp(o, PatOp::Floor); pushOp(o, PatOp::Add);
+    pushOp(o, PatOp::VarX); pushConst(o, inv); pushOp(o, PatOp::Mul); pushOp(o, PatOp::Floor);
+    pushOp(o, PatOp::VarY); pushConst(o, inv); pushOp(o, PatOp::Mul); pushOp(o, PatOp::Floor); pushOp(o, PatOp::Add);
+    pushOp(o, PatOp::VarZ); pushConst(o, inv); pushOp(o, PatOp::Mul); pushOp(o, PatOp::Floor); pushOp(o, PatOp::Add);
     pushConst(o, 2.0); pushOp(o, PatOp::Mod);
     return o;
 }

@@ -3669,12 +3669,11 @@ __device__ static float dFieldEvalF(const DFieldNodeF* nodes, int n,
     }
     return sp > 0 ? st[0] : (float)BIG;
 }
-// The field's unit gradient at p (gx, gy, gz), by tetrahedral central differences of
-// half-width eps; mirrors fieldGradient. `mag`, when given, receives |grad f| itself.
+// Field gradient (tetrahedron central differences) -> unit normal. Mirrors fieldGradient.
 __device__ static void dFieldGradient(const DFieldNode* nodes, int n,
                                       double px, double py, double pz, double eps,
                                       double& gx, double& gy, double& gz,
-                                      const PatNode* exprPool, const DPatEnv& env, double* mag = nullptr) {
+                                      const PatNode* exprPool, const DPatEnv& env) {
     // stencil offsets k1(1,-1,-1) k2(-1,-1,1) k3(-1,1,-1) k4(1,1,1)
     double f1 = dFieldEval(nodes, n, px + eps, py - eps, pz - eps, exprPool, env);
     double f2 = dFieldEval(nodes, n, px - eps, py - eps, pz + eps, exprPool, env);
@@ -3684,7 +3683,6 @@ __device__ static void dFieldGradient(const DFieldNode* nodes, int n,
     gy = -f1 - f2 + f3 + f4;
     gz = -f1 + f2 - f3 + f4;
     double len = sqrt(gx*gx + gy*gy + gz*gz);
-    if (mag) *mag = len / (4.0 * eps);           // each raw component is 4 eps df/dx_i
     if (len > 0.0) { gx /= len; gy /= len; gz /= len; }
     else           { gx = 0.0; gy = 0.0; gz = 1.0; }
 }
@@ -3874,73 +3872,58 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
         float fn = dFieldEvalF(ndF, N, oxF + dxF*tn, oyF + dyF*tn, ozF + dzF*tn, exprPoolF, env);
         bool crossed = (f > 0.0f && fn <= 0.0f) || (f < 0.0f && fn >= 0.0f) || (f == 0.0f && fn != 0.0f);
         if (crossed) {
-            // Any-hit fast path: refinement keeps [ta,tb] inside [t,tn] (tm is guarded
-            // strictly interior), and th = 0.5*((double)ta+(double)tb) lies in
-            // [(double)ta,(double)tb]. So when (double)t >= tmin and (double)tn <
-            // (double)hit.t, the acceptance test below is guaranteed to pass — return
-            // the boolean without refining. (The guard is conservative: t = (float)t0
-            // can round below tmin, and tn == t1F can sit at/above hit.t after the
-            // float clamp; those rare corners take the full path and match baseline.)
+            // Any-hit fast path: the refined root th = t + s lies in [t, tn] (s stays in
+            // [0, tn - t]: the trial point is guarded strictly interior). So when (double)t >=
+            // tmin and (double)tn < (double)hit.t, the acceptance test below is guaranteed to
+            // pass — return the boolean without refining. (The guard is conservative: t =
+            // (float)t0 can round below tmin, and tn == t1F can sit at/above hit.t after the
+            // float clamp; those rare corners take the full path.)
             if (anyHit && (double)t >= (double)tmin && (double)tn < (double)hit.t) return true;
-            float ta = t, tb = tn, fa = f, fb = fn;
+            // Refine about the step's start, not the ray's origin. In float, o + d t rounds
+            // like the ray's coordinates, which a camera far from the surface makes far coarser
+            // than the surface's own (from 3000 m, ~1e-4 off a surface 0.5 m from the origin:
+            // past the hair a pattern reads a hit off it at, patNudgedPoint). The start
+            // b = o + d t is rounded once, from double, and the search runs on s in b + d s,
+            // which rounds like the point itself (intersectCurveSeg recentres for the same
+            // reason). The ends keep the march's values: they decide the search the same way
+            // whenever the step straddles the surface, and when it does not after all (the
+            // march read it at coarser points), the search ends at the nearer end either way,
+            // no worse than the march's own root.
+            const double t0d = (double)t;
+            const float bxF = (float)(ox + dx*t0d), byF = (float)(oy + dy*t0d), bzF = (float)(oz + dz*t0d);
+            float sa = 0.0f, sb = tn - t, fa = f, fb = fn;
+            // Stop once the bracket is an ulp of b long: the point b + d s rounds to that
+            // anyway, and s, which starts at 0, would otherwise halve on through float's finer
+            // spacing near 0 to the iteration cap (18 % of a gyroid room's render).
+            const float sTol = 1.2e-7f * (fabsf(bxF) + fabsf(byF) + fabsf(bzF)) / dlenF;
             int rfSide = 0;
-            for (int b = 0; b < 48; ++b) {
-                float tm;
+            for (int b = 0; b < 48 && sb - sa > sTol; ++b) {
+                float sm;
                 if (regulaFalsi && (fb - fa) != 0.0f) {
-                    tm = (ta * fb - tb * fa) / (fb - fa);
-                    if (tm <= ta || tm >= tb) tm = 0.5f*(ta + tb);
+                    sm = (sa * fb - sb * fa) / (fb - fa);
+                    if (sm <= sa || sm >= sb) sm = 0.5f*(sa + sb);
                 } else {
-                    tm = 0.5f*(ta + tb);
+                    sm = 0.5f*(sa + sb);
                 }
-                if (tm <= ta || tm >= tb) break;   // float interval exhausted: converged
-                float fm = dFieldEvalF(ndF, N, oxF + dxF*tm, oyF + dyF*tm, ozF + dzF*tm, exprPoolF, env);
+                if (sm <= sa || sm >= sb) break;   // float interval exhausted: converged
+                float fm = dFieldEvalF(ndF, N, bxF + dxF*sm, byF + dyF*sm, bzF + dzF*sm, exprPoolF, env);
                 if ((fa > 0.0f) == (fm > 0.0f)) {
-                    ta = tm; fa = fm;
+                    sa = sm; fa = fm;
                     if (regulaFalsi && rfSide == +1) fb *= 0.5f;
                     rfSide = +1;
                 } else {
-                    tb = tm; fb = fm;
+                    sb = sm; fb = fm;
                     if (regulaFalsi && rfSide == -1) fa *= 0.5f;
                     rfSide = -1;
                 }
             }
-            double th = 0.5*((double)ta + (double)tb);
+            const double sh = 0.5*((double)sa + (double)sb);
+            const double th = t0d + sh;
             if (th < tmin || th >= (double)hit.t) return false;
             if (anyHit) return true;   // boolean only: skip gradient + writeHit
-            double px = ox + dx*th, py = oy + dy*th, pz = oz + dz*th;
+            const double px = (double)bxF + dx*sh, py = (double)byF + dy*sh, pz = (double)bzF + dz*sh;
             double eps = fmax(1e-6, 1e-4*th);
-            double gx, gy, gz, gmag;
-            dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz, exprPool, env, &gmag);
-            // The float march puts the root within float rounding of the coordinates it read
-            // the field at -- the ray's origin and o + d t -- which a camera far from the surface
-            // makes far coarser than the surface's own: from 3000 m, ~1e-4 off a surface 0.5 m
-            // from the origin, past the hair a pattern reads the hit off it at (patNudgedPoint,
-            // some 84 float ulps of the point). So where those coordinates reach past 8 times
-            // the point's (rounding past ~8 of its ulps), the point is put back on the surface
-            // through the double field, along the normal (along the ray, a grazing hit's slope
-            // vanishes): a Newton step, its slope |grad f| from the normal's stencil (1e-4 t
-            // wide, so it can be far off), then secant steps through the last two values, until
-            // a step moves the point by under a hundredth of the hair. An iterate further off
-            // than a few float ulps of the march's coordinates ends the polish. The hit keeps
-            // its t, as a sphere's does. Nearer -- most camera rays, nearly every bounce -- the
-            // float root already sits well inside the hair.
-            const double reach = fabs(ox) + fabs(oy) + fabs(oz) + dlen * th;   // the march's coordinates
-            const double prad = fmax(sqrt(px*px + py*py + pz*pz), kPatNudgeFloor);
-            if (reach > 8.0 * prad && gmag > 0.0) {
-                const double hair = kPatNudge * prad, reachUlps = 1e-6 * reach;
-                double sp = 0.0, fp = dFieldEval(nd, N, px, py, pz, exprPool, env);   // offset along the normal; f there
-                double sc = -fp / gmag;                   // the current offset
-                double sk = 0.0;                          // the last offset within reach of the march's rounding
-                for (int k = 0; k < 5 && fp != 0.0 && fabs(sc) <= reachUlps; ++k) {
-                    sk = sc;
-                    if (fabs(sc - sp) < 0.01 * hair) break;   // settled
-                    const double fc = dFieldEval(nd, N, px + gx*sc, py + gy*sc, pz + gz*sc, exprPool, env);
-                    if (fc == 0.0 || fc == fp) break;
-                    const double next = sc - fc * (sc - sp) / (fc - fp);
-                    sp = sc; fp = fc; sc = next;
-                }
-                px += gx*sk; py += gy*sk; pz += gz*sk;
-            }
+            double gx, gy, gz; dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz, exprPool, env);
             return writeHit(th, px, py, pz, gx, gy, gz);
         }
         if (last) {
@@ -4380,25 +4363,22 @@ __device__ static bool blasOccluded(const DScene& sc, const DInstance& inst,
     return false;
 }
 
-// Transform a BLAS-local hit `lh` back into world space for instance `inst` under the
-// world ray direction rd -- once per ray, for the closest hit (the traversal compares local t,
-// which equals world t). The point maps by toWorld (Wm, Wt), in double, from the local one (taken from the triangle's
-// vertices, so an instance placed by exact numbers keeps a plane's exact coordinate); normals
-// by (toWorld)^-T (Nm); the shading normal is re-oriented against the world ray. Mirrors the
-// host Scene::instanceHitToWorld exactly.
-__device__ static void instanceHitToWorld(const DInstance& inst, const DVec3& rd, DHit& lh) {
-    lh.p = affPoint(inst.Wm, inst.Wt, lh.p);
-    DVec3 wn  = normalize(affDir(inst.Nm, lh.n));
-    DVec3 wng = normalize(affDir(inst.Nm, lh.ng));
-    lh.ng = wng;
-    lh.n  = (dot(rd, wn) < 0) ? wn : -wn;
+// Transform a BLAS-local hit `lh` back into world space for instance `inst` -- once per ray,
+// for the closest hit (the traversal compares local t, which equals world t). The point maps
+// by toWorld (Wm, Wt), in double, from the local one (taken from the triangle's vertices, so an
+// instance placed by exact numbers keeps a plane's exact coordinate); normals by (toWorld)^-T
+// (Nm), keeping the orientation the local intersectTri gave the shading normal (the transform
+// preserves the sign of dot(d, n); the host twin says why that matters). Mirrors the host
+// Scene::instanceHitToWorld exactly.
+__device__ static void instanceHitToWorld(const DInstance& inst, DHit& lh) {
+    lh.p  = affPoint(inst.Wm, inst.Wt, lh.p);
+    lh.n  = normalize(affDir(inst.Nm, lh.n));
+    lh.ng = normalize(affDir(inst.Nm, lh.ng));
     // Map the surface tangent through the instance's toWorld linear part (C6).
     DVec3 wt = affDir(inst.Wm, lh.tangent);
     Real wtl = sqrt(dot(wt, wt));
     if (wtl > (Real)1e-12) lh.tangent = wt * ((Real)1 / wtl);
-    // O3: rescale curvature into world units and re-flip with the normal — mirrors host.
-    lh.curv *= (Real)inst.curvScale;
-    if (dot(rd, wn) >= 0) lh.curv = -lh.curv;
+    lh.curv *= (Real)inst.curvScale;   // O3: curvature into world units -- mirrors host
     if (inst.matOverride >= 0) lh.matId = inst.matOverride;
 }
 
@@ -4489,7 +4469,7 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
             else if (hR)   { stack[sp] = n.right; tStack[sp] = tR; ++sp; }
         }
     }
-    if (hInst >= 0) instanceHitToWorld(sc.instances[hInst], rd, h);
+    if (hInst >= 0) instanceHitToWorld(sc.instances[hInst], h);
     dApplyNormalMap(sc, h);   // C6: perturb shading normal by a bound normal map
     return h;
 }
@@ -9385,21 +9365,20 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
     }
     return sp > 0 ? st[0] : 0.0f;
 }
-// The point a pattern reads at hit h: the hit moved a hair to the ray's side of the surface
-// (host twin patCtxFromHit; pattern.h patNudgedPoint says why).
-__device__ static inline void dPatPoint(const DHit& h, double& px, double& py, double& pz) {
-    const double side = ((double)h.n.x * h.ng.x + (double)h.n.y * h.ng.y + (double)h.n.z * h.ng.z) < 0.0 ? -1.0 : 1.0;
+// The point a pattern reads at hit h, and its distance r from the origin: the hit moved a
+// hair off the surface along h.ng (host twin patCtxFromHit; pattern.h patNudgedPoint says why).
+__device__ static inline void dPatPoint(const DHit& h, double& px, double& py, double& pz, double& r) {
     patNudgedPoint((double)h.p.x, (double)h.p.y, (double)h.p.z, (double)h.ng.x, (double)h.ng.y, (double)h.ng.z,
-                   side, px, py, pz);
+                   px, py, pz);
+    r = sqrt(px * px + py * py + pz * pz);
 }
 // Evaluate a bound pattern at a hit (device twin of patternScalarAt/patCtxFromHit).
 // The implicit field value f is 0 (like the CPU: intersectImplicit never sets it), so
 // the `f` variable is 0 at surfaces on both backends.
 __device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit& h) {
     const DPattern& p = sc.patterns[pat];
-    double px, py, pz;
-    dPatPoint(h, px, py, pz);
-    double r = sqrt(px * px + py * py + pz * pz);
+    double px, py, pz, r;
+    dPatPoint(h, px, py, pz, r);
     return dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
                         h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw, dPatEnvOf(sc));
 }
@@ -9418,9 +9397,8 @@ __device__ static double dRecFCTangent(const double* pos, const double* sec, int
 // Evaluate one scalar-record stop's per-hit expression program at the hit.
 __device__ static double dRecStopVal(const DScene& sc, const DRecScalarStop& s, const DHit& h) {
     if (s.exprN <= 0) return 0.0;
-    double px, py, pz;
-    dPatPoint(h, px, py, pz);
-    double r = sqrt(px * px + py * py + pz * pz);
+    double px, py, pz, r;
+    dPatPoint(h, px, py, pz, r);
     return dPatternEval(sc.recDrivers + s.exprOff, s.exprN, px, py, pz, 0.0,
                         h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw, dPatEnvOf(sc));
 }
@@ -9467,18 +9445,16 @@ __device__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, co
     if (m.recRoughMode < 0) return false;
     double v;
     if (m.recRoughMode == 0) {                             // direct scalar expression
-        double px, py, pz;
-        dPatPoint(h, px, py, pz);
-        const double r = sqrt(px * px + py * py + pz * pz);
+        double px, py, pz, r;
+        dPatPoint(h, px, py, pz, r);
         v = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
                          px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw,
                          dPatEnvOf(sc));
     } else if (m.recRoughMode == 1) {                      // constant selStop (one stop, per-hit)
         v = dRecStopVal(sc, sc.recScalarStops[m.recRoughStopOff], h);
     } else {                                               // per-hit driven
-        double px, py, pz;
-        dPatPoint(h, px, py, pz);
-        const double r = sqrt(px * px + py * py + pz * pz);
+        double px, py, pz, r;
+        dPatPoint(h, px, py, pz, r);
         double d = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
                                 px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw,
                                 dPatEnvOf(sc));
@@ -9667,9 +9643,8 @@ __device__ static Real dRecReflAt(const double* coeff, int N, double lo, double 
 __device__ static bool dRecordReflect(const DScene& sc, const DMaterial& m,
                                       const DHit& h, Real lambda, Real& out, double* dOut = nullptr) {
     if (m.recReflDriven != 1) return false;
-    double px, py, pz;
-    dPatPoint(h, px, py, pz);
-    double r = sqrt(px * px + py * py + pz * pz);
+    double px, py, pz, r;
+    dPatPoint(h, px, py, pz, r);
     double d = dPatternEval(sc.recDrivers + m.recReflDrvOff, m.recReflDrvN,
                             px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw,
                             dPatEnvOf(sc));
@@ -9849,14 +9824,14 @@ __device__ static double dEmitHitScale(const DScene& sc, int emitPat, int li, co
 // coordinates (device twin of host emitterPatMulAt). Clamped to [0,1] like the
 // reflect/transmit slot patterns, so a runaway formula can never manufacture light.
 // The implicit field value f is 0, matching dPatternScalarAt and the host's makePatCtx.
-// Read a hair off the surface on the side it emits into, as a ray arriving there reads it.
+// Read a hair off the surface on the side it emits into, as a hit there reads it (along h.ng).
 __device__ static double dEmitterPatMulAt(const DScene& sc, const DEmitter& em,
                                           const DVec3& y, const DVec3& nOut,
                                           double uu, double vv) {
     if (em.emitPat < 0 || em.emitPat >= sc.nPatterns) return 1.0;
     const DPattern& p = sc.patterns[em.emitPat];
     double px, py, pz;
-    patNudgedPoint((double)y.x, (double)y.y, (double)y.z, (double)nOut.x, (double)nOut.y, (double)nOut.z, 1.0,
+    patNudgedPoint((double)y.x, (double)y.y, (double)y.z, (double)nOut.x, (double)nOut.y, (double)nOut.z,
                    px, py, pz);
     double r = sqrt(px * px + py * py + pz * pz);
     return clamp01(dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,

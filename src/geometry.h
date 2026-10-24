@@ -455,8 +455,12 @@ inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit
     double t = (-b - sq) / (2.0 * a);
     if (t < tmin) t = (-b + sq) / (2.0 * a);
     if (t < tmin || t >= hit.t) return false;
-    hit.t = t; hit.p = r.o + r.d * t; hit.valid = true;
-    Vec3 ng = normalize(hit.p - s.c);
+    hit.t = t; hit.valid = true;
+    Vec3 ng = normalize((r.o + r.d * t) - s.c);
+    // On the sphere itself: the textbook discriminant's t carries rounding that grows as the
+    // square of the ray origin's distance over the radius (from 100 km, past the hair a pattern
+    // reads the hit off it at, patNudgedPoint); the point's direction from the centre does not.
+    hit.p = s.c + ng * s.r;
     hit.ng = ng;
     bool sFlipped = !(dot(r.d, ng) < 0.0);
     hit.n = sFlipped ? -ng : ng;

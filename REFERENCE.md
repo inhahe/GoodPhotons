@@ -4462,16 +4462,24 @@ maps, mix `weight_map` masks, colored glass, and frosted (rough) glass on-device
 
 A pattern that steps -- `floor`, `fract`, `%`, `step`, `sign` of a coordinate -- exactly
 where a surface lies (a floor at `y 0` under `floor(4*y)`, a sphere of radius 0.5 under
-`step(0.5, r)`) reads the side of the step the ray arrives from, on every hit, on CPU and GPU
-alike: a pattern reads a surface at a point a hair off it toward the ray, along the surface's
-own normal -- a hundred-thousandth of the point's distance from the origin, and at least
-10^-7 scene units. So the floor above reads `floor(4*y)` = 0 from above and -1 from below,
-and a surface within that hair of a step -- an exported floor whose heights are float noise
-either side of 0, a sphere hit at a radius rounded either side of 0.5 -- reads it the same
-way. (Since 0.399.7; before, hit points rounded to either side of the step from ray to ray,
-and such a surface came out grey or split along a seam.) A pattern detail finer than that
-hair moves by up to its width, which no render resolves. The built-in `type checker`
-also keeps its cell walls a thousandth of a cell off the round coordinates.
+`step(0.5, r)`, a checker floor on a cell wall) shows the value just outside the surface, on
+every hit, from either side, on CPU and GPU, in renders and in the `-raster` preview alike:
+a pattern reads a surface at a point a hair off it along the surface's own geometric normal
+-- two millionths of the point's distance from the origin, and at least 2x10^-8 scene units.
+"Outside" is the side that normal faces: away from a sphere's, isosurface's or curve's
+interior, and for a mesh, quad or triangle the side its vertex normals face (or, without
+them, its winding's: a `quad`'s `u` x `v`). So a floor at `y 0` facing up reads
+`floor(4*y)` = 0 from above and from below, and one facing down reads -1 -- which a `quad`
+with `u` along x and `v` along z does; swap them, or `rotate`, to show the cells above. A
+checker floor lying on a cell wall shows that side's phase (from 0.398.1 to 0.399.7 the
+built-in checker's walls were shifted to show the cell above). A surface within that hair of a step -- an
+exported floor whose heights are float noise either side of 0, a sphere hit at a radius
+rounded either side of 0.5 -- reads it the same way. (Since 0.399.7; before, hit points
+rounded to either side of the step from ray to ray, and such a surface came out grey or split
+along a seam. 0.399.7 read the side the ray came from; since 0.399.8 the side is the
+surface's, so light crossing a transmissive surface sees the same value either way.) A
+pattern varying along the normal moves by up to that hair: 2 um at a metre from the origin,
+2 mm at a kilometre.
 
 **Pattern-driven reflectance.** The `reflect` slot takes a pattern as well, and a scalar in
 a *spectral* slot is a per-hit **multiplier** on whatever the slot otherwise holds. Two
@@ -6558,9 +6566,10 @@ accepts it only inside an `upsample` body, which the loader evaluates at load ti
 measure them on. That table is half the check — a VM that silently drops an opcode and one
 that was never meant to have it are indistinguishable from the outside, so the only thing
 that separates them is a written-down decision. It also checks that a hit within rounding of a
-pattern's step reads the ray's side of it (a floor at `y 0` under `floor(4*y)` from above and
-below, a sphere under `step(0.5, r)`), and that the built-in checker keeps a surface on a cell
-boundary in one cell. `tools/check_pattern_seam.py` renders the same on both devices.
+pattern's step reads the outside of the surface (a floor at `y 0` under `floor(4*y)` and the
+built-in checker's cell walls, facing up and down, seen from both sides; a sphere under
+`step(0.5, r)`, including one hit from 100 km), and that a light sample reads an emission
+pattern as a hit there does. `tools/check_pattern_seam.py` renders the same on both devices.
 `-checkpaths` guards **asset path resolution** (see *Where asset paths
 are looked for*): it builds a throwaway project tree in the temp directory, `cd`s
 somewhere unrelated, and asserts that a scene loads from there with its texture found

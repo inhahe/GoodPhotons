@@ -7291,49 +7291,61 @@ as the one at fault.
     op, so those analyses would still be correct if reordered, but running it last means
     no future analysis has to know that `LdReg` exists.
   * **Patterns on their own discontinuities.** A surface lying where a pattern steps (a
-    `y 0` floor under `floor(4*y)`, a radius-0.5 sphere under `step(0.5, r)`) would take each
-    hit's value from the side its rounded hit point falls on, and a ray-traced hit point
-    rounds to either side from ray to ray: the floor renders grey, or splits along a seam. So
-    a pattern reads a surface hit at a point nudged off it toward the ray (`pattern.h
-    patNudgedPoint`, 0.399.7): by `kPatNudge` = 1e-5 of the point's distance from the origin
-    (at least `kPatNudgeFloor` = 1e-2 of it, so 1e-7 scene units near the origin), along the
-    geometric normal turned to the side the shading normal faces (the ray's side). That is
-    some 80 float ulps of the point (10^10 double ones) and far below anything a pixel
-    resolves, so every hit within rounding of a step -- exact geometry, an export's float
-    noise, a sphere or isosurface hit along the ray -- reads the ray's side of it, seen from
-    either side. Sites: host `patCtxFromHit` (every host pattern read at a hit goes through
-    it), `emitterPatMulAt` (a point the emitter sampler drew, nudged along nOut, the side a
-    ray reaching it arrives from, since MIS needs the two to agree) and the rasterizer's
-    `ctx()` (along the face normal toward the eye); device `dPatPoint` at each site that
-    builds a pattern point from a `DHit`, `dEmitterPatMulAt`, and raster_cuda's
-    `dRasterPatPoint`. The nudge outruns rounding that is relative to the surface's own
-    coordinates, so the hit points are made so: a triangle's hit is taken from its
-    vertices, `v0 + b1 (v1 - v0) + b2 (v2 - v0)` (`intersectTri`, host and device,
-    0.399.5); an instance's world point is its local one through toWorld
-    (`instanceHitToWorld`; on the device in double, once per ray, after the traversal has
-    found the closest hit); `MeshXform::sinCosDeg` makes quarter turns exact (0.399.6); and
-    on the GPU, whose o + d t rounds relative to the ray's float origin, a sphere hit is put
-    back on the sphere (`c + n r`), an isosurface hit is put back on the surface through the
-    double field along its normal (a Newton step, then secant steps until one moves the
-    point by under 1% of the nudge; along the ray instead, a grazing hit's slope vanishes
-    and the silhouette stayed split), and a curve hit is its segment's end plus the local
-    offset the recentred solve found (an end ball's put back on the ball) (0.399.7). The
-    sphere and isosurface hits keep their t. The isosurface polish runs only where the
-    march's coordinates (|o| + |d| t) exceed 8 times the hit's distance from the origin,
-    past which the float root's rounding nears the nudge; nearer -- most camera rays, nearly
-    every bounce -- it costs nothing (ungated, it cost 4.8 % of a gyroid room's GPU render;
-    gated, 0.3 %, within noise). The host computes in double, where
-    o + d t is close enough. `-checkpatops` "pattern nudge" reads hits at y in {0, +-1e-12,
-    +-1e-9, denormal} from both sides and on a sphere at r = 0.5 +- an ulp, and holds an
-    emitter's sampled point to a hit there; tools/check_pattern_seam.py renders such
-    surfaces on both devices, the rasterizer's preview of a noisy floor, and a sphere, an
-    isosurface and a curve from 3000 m as emitters against the same surface glowing evenly
-    (a pixel's ratio is then exactly the fraction of its hits reading outside the step).
-    `pattern_gen::checker` also keeps `kCheckerTieBreak` (1e-3 of a cell) inside each floor
-    (0.398.1, widened 0.399.3; loom's two checkers carry the same as a phase). Two load-time
-    probes that warned of a pattern splitting a surface (0.399.3's, then
-    `warnPatternsSplitBySteps` in 0.399.6) went when the nudge made what they looked for
-    impossible.
+    `y 0` floor under `floor(4*y)`, a radius-0.5 sphere under `step(0.5, r)`, a checker floor
+    on a cell wall) would take each hit's value from the side its rounded hit point falls on,
+    and a hit point rounds to either side from ray to ray: the floor renders grey, or splits
+    along a seam. So a pattern reads a surface point nudged just outside it (`pattern.h
+    patNudgedPoint`): by `kPatNudge` = 2e-6 of the point's distance from the origin (at least
+    `kPatNudgeFloor` = 1e-2 of it), along the unit geometric normal as the intersector
+    leaves it -- outward for spheres, isosurfaces and curves; for triangles `intersectTri`'s
+    `gn`, the winding normal turned to the vertex normals' side. The side is the surface's,
+    not the ray's: 0.399.7 read the ray's side, which made a transmissive surface's pattern
+    differ with the direction light crossed it (non-reciprocal: forward, backward and BDPT
+    strategies integrated different things) and turned on the shading normal's orientation,
+    which normal maps and instances tip. Sites: host `patCtxFromHit` (every host pattern read
+    at a hit), `emitterPatMulAt` (a point the emitter sampler drew, along nOut -- the side a
+    one-sided emitter's ng faces, so a hit there reads the same point, as MIS needs) and the
+    rasterizer's `ctx()` (the face normal turned to its vertex normals' side, as
+    intersectTri turns ng); device `dPatPoint` at every site that builds a pattern point
+    from a `DHit`, `dEmitterPatMulAt`, and raster_cuda's `dRasterPatPoint` (once per pixel).
+  * **The nudge's size** is a compromise. It must outrun the hit point's rounding and the
+    float noise of an exported mesh's vertices, which double hit points inherit too: 2e-6 is
+    some 17 float ulps of the point. Larger shifts a pattern that varies along the normal --
+    and faces with different normals sample it at slightly different points -- by more: 2 um
+    at a metre from the origin, 2 mm at a kilometre (0.399.7's 1e-5 was 1 cm there). It only
+    outruns rounding that is relative to the surface's own coordinates, so every intersector
+    takes its hit from those: a triangle's from its vertices, `v0 + b1 (v1 - v0) + b2 (v2 -
+    v0)` (`intersectTri`, host and device, 0.399.5); an instance's world point is its local
+    one through toWorld (`instanceHitToWorld`; on the device in double, once per ray, after
+    the traversal has found the closest hit); `MeshXform::sinCosDeg` makes quarter turns
+    exact (0.399.6); a sphere hit is put back on the sphere (`c + n r`: on the GPU since
+    0.399.7, whose float o + d t rounds like the ray's origin; on the host since 0.399.8,
+    whose textbook discriminant's t errs as reach^2 / r, past the hair beyond ~100 km); the
+    GPU's isosurface march refines its crossing about the bracketing step's start, b + d s
+    with b rounded once from double, so the root rounds like the point (0.399.8; 0.399.7's
+    double Newton/secant polish of it went). That search keeps the march's end values and
+    stops once the bracket is an ulp of b long -- without the stop, s, starting at 0, halved
+    on through float's finer spacing to the 48-step cap and cost a gyroid room 18 %; with
+    it the room renders 1 % faster than the unrecentred search did; a GPU curve hit is its segment's end plus the
+    local offset the recentred solve found (an end ball's put back on the ball). Both devices
+    then read clean out to 30 km (scraps' radial probe). What still rounds past the hair: a
+    GPU triangle hit rounds relative to its vertices' magnitudes, so a huge tilted triangle
+    hit far from its vertices (a 10 km ramp under `floor(4*(x+y))`, hit near the origin) can
+    still split -- known-issues GPU-TRI-HIT-ROUNDING.
+  * **Checks.** `-checkpatops` "pattern nudge": hits at y in {0, +-1e-12, +-1e-9, denormal}
+    on a floor facing up, seen from both sides; a sphere at r = 0.5 +- an ulp from outside
+    and inside; the built-in checker's walls facing up and down out to 200 m; an emitter's
+    sampled point against a hit there; a CPU sphere hit from 100 km. `-checktrinormal` S1b
+    sends its silhouette rays through an instance too. tools/check_pattern_seam.py renders
+    floors on both devices (traced, and the rasterizer's preview, which must show the cells
+    the trace shows), and a sphere from 2.2 m and a sphere, an isosurface and a curve from
+    3000 m as emitters against the same surface glowing evenly (a pixel's ratio is then
+    exactly the fraction of its hits reading outside the step). `pattern_gen::checker` and
+    loom's two checkers had their walls shifted a thousandth of a cell (0.398.1-0.399.7);
+    on a wall the nudge carries toward its lower cell, that read the shifted cell near the
+    origin and the nudged one past |p| = 500 cells -- a ring -- so it went in 0.399.8. Two load-time probes that warned of a
+    pattern splitting a surface (0.399.3's, then `warnPatternsSplitBySteps` in 0.399.6) went
+    when the nudge made what they looked for impossible.
   * `addFunctionLeaf` now passes the tables too, so a `grid:`-sampling field formula is
     optimized as well. It stays a separate call site because the program is about to be
     appended to a *shared* node pool holding one leaf after another, and the pass requires

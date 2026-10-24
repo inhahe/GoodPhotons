@@ -6,7 +6,7 @@ step on every hit, on the CPU and the GPU alike.
 A floor at y = 0 under a hand-written checker, fract(0.5 (floor(4x) + floor(4y) + floor(4z))) * 2,
 lies on the checker's own cell walls: floor(4y) steps at y = 0. A pattern read at a hit point
 that rounds to either side of the step from ray to ray renders grey, or splits into two phases
-along a seam. Patterns read a hit a hair to the ray's side of the surface (pattern.h
+along a seam. Patterns read a hit a hair outside the surface, along its normal (pattern.h
 patNudgedPoint), hit points are taken from the surface's own coordinates rather than along the
 ray, and quarter turns are exact; this renders the cases those cover.
 
@@ -17,11 +17,14 @@ way round would put it at y = 2); one modelled upright in z = 0 and only turned;
 vertices carry an export's float noise, y = +-1e-12. Each must show the checker's contrast (a
 grey floor lacks it) and match the quad on the CPU pixel by pixel (a seam, speckle or a
 misplaced surface does not). The rasterizer's preview (-raster) of the noisy floor is held to
-the quad's the same way, on each device.
+the quad's the same way, on each device (which must really be the GPU's rasterizer, not a
+silent fall back to the CPU's), and the quad's preview must show the cells the CPU trace
+shows: the floor lies on a cell wall, and a preview reading its other side shows the other
+phase.
 
 And surfaces of radius 0.5 under a step at that radius, hit along the ray: a sphere seen from
 2.2 m, and a sphere, an isosurface sphere and a curve's tube seen from 3000 m, where a float hit
-point computed along the ray rounds relative to the camera's distance, some ten times past the
+point computed along the ray rounds relative to the camera's distance, a hundred times past the
 nudge, so the GPU must take these hits from the surfaces themselves. They glow, seen directly,
 against the same surface with the pattern replaced by 1 and the same seed: a pixel's ratio of
 the two is exactly the fraction of its hits that read the outside of the step, which must be
@@ -150,6 +153,10 @@ def render_raster(exe, out, scene, name, dev):
     if r.returncode != 0 or not os.path.exists(png):
         print(f'  raster failed: {" ".join(cmd)}\n{r.stdout[-600:]}{r.stderr[-600:]}')
         return None
+    log = r.stdout + r.stderr
+    if dev == 'gpu' and ('GPU rasterizer' not in log or 'rendering on the CPU' in log or 'using CPU' in log):
+        print(f'  the preview did not run on the GPU: {" ".join(cmd)}\n{log[-600:]}')
+        return None
     a = np.asarray(Image.open(png).convert('RGB'), dtype=np.float64) / 255.0
     a = np.where(a <= 0.04045, a / 12.92, ((a + 0.055) / 1.055) ** 2.4)
     return a[..., 0] * 0.2126 + a[..., 1] * 0.7152 + a[..., 2] * 0.0722
@@ -162,6 +169,20 @@ def contrast(img):
     m = img[h // 4: 3 * h // 4, w // 4: 3 * w // 4]
     lo, hi = np.percentile(m, 10), np.percentile(m, 90)
     return hi / max(lo, 1e-30)
+
+
+def same_cells(img, ref):
+    """The fraction of `ref`'s pixels whose checker cell (pale or dark) `img` shows too, `img`
+    sampled at `ref`'s pixel centres (both frame the same view), each split at the geometric
+    mean of its own 10th and 90th percentiles."""
+    h, w = ref.shape
+    ys = ((np.arange(h) + 0.5) * img.shape[0] / h).astype(int)
+    xs = ((np.arange(w) + 0.5) * img.shape[1] / w).astype(int)
+    s = img[np.ix_(ys, xs)]
+
+    def pale(a):
+        return a > np.sqrt(np.percentile(a, 10) * np.percentile(a, 90))
+    return float(np.mean(pale(s) == pale(ref)))
 
 
 def off3x(img, ref, floor=1e-30):
@@ -229,6 +250,8 @@ def main():
     # straddle y = 0 as its vertices do, and must read the eye's side of floor(4y) as the exact
     # quad does. Each device's preview against its own quad (the two rasterizers shade alike
     # but not identically); deterministic, so any pixel 3x off is a phase swapped.
+    # And the preview must show the cells the tracer shows: the quad lies on the checker's
+    # wall, so a preview reading the other side of it would show the other phase.
     for dev in devices:
         rq = render_raster(exe, a.out, paths['quad'], 'quad', dev)
         rn = render_raster(exe, a.out, paths['noisy'], 'noisy', dev)
@@ -238,6 +261,10 @@ def main():
         c, off = contrast(rn), off3x(rn, rq, 1e-6)
         report(c > 4.0 and off < 0.02, f'noisy raster {dev.upper()}: floor contrast {c:6.2f}, '
                                        f'{off * 100:.2f}% of pixels 3x off the quad\'s')
+        if ref is not None:
+            agree = same_cells(rq, ref)
+            report(agree > 0.75, f'quad raster {dev.upper()}: {agree * 100:.1f}% of pixels in the cell the CPU '
+                                f'trace shows there')
     print('PASS' if ok else 'FAIL')
     return 0 if ok else 1
 

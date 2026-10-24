@@ -133,6 +133,46 @@ the fixes nearly every GPU pixel has hits inside. Its first far cases, mixes fro
 floor's lamp, passed without the fixes: a pixel needs most of its hits wrong to read 3x off, and
 the lamp hung between camera and surface, so the images were black.
 
+0.399.8, after the review of 0.399.7: the side read is the surface's -- along its geometric
+normal, outward -- not the ray's, since a ray-dependent side made a transmissive surface's
+pattern differ with the direction light crossed it (forward, backward and BDPT strategies then
+integrate different things) and turned on the shading normal's orientation, which normal maps
+and instances tip. The nudge shrank to 2e-6 of the distance from the origin (17 float ulps; 1e-5
+shifted along-normal detail by 1 cm at a kilometre). The checker tie-break went, ftrace's and
+loom's: on a wall whose normal faces its lower cell it read the shifted cell within 500 cells of
+the origin and the nudged one beyond -- a ring (`-checkpatops` checks walls facing up and down
+out to 200 m; it fails with the tie-break back). The GPU isosurface root is refined about the
+bracketing step's start (b + d s, b rounded once from double) instead of polished afterwards in
+double; the host sphere hit is put back on the sphere (its textbook t erred past the hair beyond
+~100 km; `-checkpatops` fires rays from 100 km, and fails without it). A default `quad` floor
+(`u` along x, `v` along z) faces down, so a checker floor on a cell wall now shows the cell below:
+the opposite phase from 0.398.1-0.399.7.
+
+## OPEN (2026-10-24, 0.399.8): GPU-TRI-HIT-ROUNDING — a GPU triangle hit rounds relative to its vertices, so a huge tilted triangle can still split a pattern step lying on it
+
+A pattern reads a hit a hair (2e-6 of its distance from the origin) outside the surface, which
+settles a step lying on the surface as long as the hit point rounds by less (CHECKER-ON-BOUNDARY
+above). The GPU's triangle hit, `v0 + b1 e1 + b2 e2` in float, rounds by a few float ulps of the
+vertices' magnitudes, not the hit's: the barycentrics themselves are float. A triangle hit far
+from its vertices, relative to its distance from the origin -- a 10 km ramp on x + y = 0 under
+`floor(4*(x+y))`, hit near the origin, is off its plane by ~ulp(5000) = 5e-4 -- still splits.
+An axis-aligned surface is exact whatever its size (all three vertices carry the coordinate),
+and the CPU is exact enough in double. **Fix:** split, at load, triangles whose extent is large
+against their distance from the origin, so every hit lies near a vertex of its own triangle.
+Measure first: nothing seen so far does this.
+
+## DONE (2026-10-24, 0.399.8): INSTANCE-SILHOUETTE-FLIP — an instanced smooth mesh negated its shading normal and curvature in the silhouette band
+
+Found by the review of 0.399.7. `instanceHitToWorld` (host and device) re-oriented the world
+shading normal against the world ray by the shading normal itself, `dot(d, wn) < 0 ? wn : -wn`,
+and flipped curvature to match. That is the bug c027d2f fixed in `intersectTri` on 2026-08-12:
+in the band where a smooth mesh's shading normal has turned away from a front-facing ray, it
+negates `n` and `curv`, so a bulge reads as a pit in a one-pixel rim. The instance path (written
+2026-07-13) kept the old rule. It now keeps the local hit's orientation, which `intersectTri`
+decided from the geometric normal; the instance transform preserves the sign of dot(d, n).
+`-checktrinormal` S1b sends its silhouette rays through a turned, scaled instance too, and
+fails without the fix.
+
 ## DONE (2026-10-24, 0.398.0): PRESET-FNUMBER-TRACED — presets let in less light than their f-number; the singlet's rear face trimmed its beam; the pupil tables missed sparse crossings at a fisheye's field edge
 
 Found while adding the published telephoto, wide-angle and fisheye (0.398.0), by `-checklens`.

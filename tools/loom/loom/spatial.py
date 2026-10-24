@@ -1255,19 +1255,11 @@ def moire(freq: Union[SpatialExpr, Signal, Number] = 1.0,
     return 0.5 + 0.25 * (sin(freq * X) + sin(f2 * xr))
 
 
-# A thousandth of a checker cell (pi radians), added to each sine's argument of both
-# checkers (this one and material.checker): a surface lying on a cell boundary -- a floor at
-# y = 0, where every sine is 0 -- then sits in one cell instead of taking its sign from each
-# hit point's rounding error, which the GPU averages to grey. ftrace's own `type checker`
-# carries the same tie-break (pattern_gen::kCheckerTieBreak).
-CHECKER_TIE_BREAK = 3.14159e-3
-
-
 def checker(freq: Union[SpatialExpr, Signal, Number] = 1.0) -> SpatialExpr:
-    """3-D checkerboard in [0, 1] (sign of the product of three sines), each argument shifted
-    by ``CHECKER_TIE_BREAK`` so a surface on a cell boundary sits in one cell."""
-    t = CHECKER_TIE_BREAK
-    return 0.5 + 0.5 * sign(sin(freq * X + t) * sin(freq * Y + t) * sin(freq * Z + t))
+    """3-D checkerboard in [0, 1] (sign of the product of three sines). A surface on a cell
+    boundary shows the cell just outside it: ftrace reads every pattern a hair off the surface
+    along its normal."""
+    return 0.5 + 0.5 * sign(sin(freq * X) * sin(freq * Y) * sin(freq * Z))
 
 
 def gyroid(freq: Union[SpatialExpr, Signal, Number] = 1.0) -> SpatialExpr:
