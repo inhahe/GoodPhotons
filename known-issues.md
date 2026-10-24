@@ -105,13 +105,15 @@ ten-thousandth left the camrig scenes' 1 cm resolution cards 1 um off their wall
 (fails with the offset at 0). Loom's two checkers (`material.checker`, `spatial.checker`:
 `sign(sin x sin y sin z)`, worse still, 0.5 exactly on every boundary and y = 0 always one)
 take the same tie-break as a phase (`spatial.CHECKER_TIE_BREAK`), tested by
-`tests/test_checker_tiebreak.py`. The root cause went in 0.399.5 (its review called it):
+`tests/test_checker_tiebreak.py`. The root cause went in 0.399.5 (a review called it):
 both devices computed a triangle's hit point along the ray, o + d t, which rounds to either
-side of a surface's own coordinate. It is now taken from the triangle's vertices, so a
-surface at y = 0 is hit at exactly 0 and any pattern, a hand-written one too, reads one side
-(`-checktrinormal` S8; tools/check_pattern_seam.py renders it on both devices). 0.399.3's
-load-time warning for user patterns on their surfaces' steps was removed with it. Spheres and
-isosurfaces are still hit along the ray, which the built-in checker's tie-break covers.
+side of a surface's own coordinate. It is now taken from the triangle's vertices, so a surface
+whose vertices carry a coordinate exactly is hit at exactly it, and any pattern, a hand-written
+one too, reads one side (`-checktrinormal` S8; tools/check_pattern_seam.py renders it on both
+devices); quarter turns are exact since 0.399.6. Still open by nature: a surface only within
+rounding of a step (its vertices float noise either side of it) is split by it, which the loader warns
+of (`warnPatternsSplitBySteps`, 0.399.6); spheres, isosurfaces and curves are hit along the ray
+and not probed, which the built-in checker's tie-break covers for it.
 
 ## DONE (2026-10-24, 0.398.0): PRESET-FNUMBER-TRACED — presets let in less light than their f-number; the singlet's rear face trimmed its beam; the pupil tables missed sparse crossings at a fisheye's field edge
 

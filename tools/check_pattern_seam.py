@@ -1,18 +1,21 @@
 """Regression check: a pattern that steps exactly where a surface lies reads one side of the
 step on every hit, on the CPU and the GPU alike.
 
-    python tools/check_pattern_seam.py [--exe ftrace.exe] [--cpu-only]
+    python tools/check_pattern_seam.py [--out png/check_pattern_seam] [--exe ftrace.exe] [--cpu-only]
 
 A floor at y = 0 under a hand-written checker, fract(0.5 (floor(4x) + floor(4y) + floor(4z))) * 2,
 lies on the checker's own cell walls: floor(4y) steps at y = 0. A hit point taken along the ray
-(o + d t) rounds to either side from ray to ray; the GPU's did, so its pixels averaged the two
-cells and the floor rendered grey. A triangle's hit point is now taken from its vertices
-(geometry.h intersectTri and its device twin), which puts every hit at exactly y = 0. Two
-floors: a quad, and the same square as a mesh_asset modelled at y = -1 and lifted to y = 0 by
-mesh_instance (the instance hit path, whose world point now comes from the local one through
-the instance's transform). Each renders from above on the CPU and the GPU; the check is the
-floor's contrast -- the checker's two cells against each other, which a grey floor lacks --
-and the CPU against the GPU tile by tile. Exits 0 when everything holds, 1 otherwise.
+(o + d t) rounds to either side from ray to ray, and the floor renders grey; a triangle's hit
+point taken from its vertices (geometry.h intersectTri and its device twin) puts every hit at
+exactly y = 0. Four floors, one square at y = 0: a quad; a mesh_asset modelled at y = -1 and
+lifted by mesh_instance; one modelled upright in z = 2 at twice the size and stood on the floor
+by a quarter turn about x, a half scale and a lift (the instance's transform applied the wrong
+way round would put it at y = 2); and one modelled upright in z = 0 and only turned (a quarter
+turn that is not exact, cos 90 = 6e-17, would leave its halves either side of y = 0: two
+checker phases with a seam between). Each renders from above on the CPU and the GPU; the check
+is the floor's contrast -- the checker's two cells against each other, which a grey floor
+lacks -- and every image against the quad's on the CPU, tile by tile, which a seam or a
+misplaced floor fails. Exits 0 when everything holds, 1 otherwise.
 """
 import argparse
 import os
@@ -22,7 +25,6 @@ import sys
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = os.path.join(ROOT, 'scraps', '_pattern_seam')
 RES = 64
 CHECKER = 'fract(0.5 * (floor(4*x) + floor(4*y) + floor(4*z))) * 2'
 
@@ -46,31 +48,50 @@ def read_pfm(p):
     return a[..., 0] * 0.2126 + a[..., 1] * 0.7152 + a[..., 2] * 0.0722 if ch == 3 else a[..., 0]
 
 
-def scenes():
-    os.makedirs(OUT, exist_ok=True)
-    obj = os.path.join(OUT, 'floor_low.obj')
-    with open(obj, 'w', encoding='utf-8', newline='\n') as f:
-        f.write('v -1 -1 -1\nv 1 -1 -1\nv 1 -1 1\nv -1 -1 1\nf 1 2 3\nf 1 3 4\n')
-    quad = HEAD + 'quad { origin -1 0 -1  u 2 0 0  v 0 0 2  material floor }\n'
-    inst = HEAD + ('mesh_asset "low" { file "%s"  material floor }\n'
-                   'mesh_instance { of "low"  translate 0 1 0 }\n') % obj.replace('\\', '/')
+def write(path, text):
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(text)
+
+
+def scenes(out):
+    os.makedirs(out, exist_ok=True)
+    low = os.path.join(out, 'floor_low.obj').replace('\\', '/')
+    upright = os.path.join(out, 'floor_upright.obj').replace('\\', '/')
+    write(low, 'v -1 -1 -1\nv 1 -1 -1\nv 1 -1 1\nv -1 -1 1\nf 1 2 3\nf 1 3 4\n')
+    write(upright, 'v -2 -2 2\nv 2 -2 2\nv 2 2 2\nv -2 2 2\nf 1 2 3\nf 1 3 4\n')
+    upright0 = os.path.join(out, 'floor_upright0.obj').replace('\\', '/')
+    write(upright0, 'v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\nf 1 2 3\nf 1 3 4\n')
+    texts = {
+        'quad': HEAD + 'quad { origin -1 0 -1  u 2 0 0  v 0 0 2  material floor }\n',
+        'instance': HEAD + ('mesh_asset "low" { file "%s"  material floor }\n'
+                            'mesh_instance { of "low"  translate 0 1 0 }\n') % low,
+        # Rx(90) carries z = 1 (after the half scale) to y = -1; the move lifts it to y = 0.
+        'turned': HEAD + ('mesh_asset "up" { file "%s"  material floor }\n'
+                          'mesh_instance { of "up"  scale 0.5  rotate 90 0 0  translate 0 1 0 }\n') % upright,
+        'upright': HEAD + ('mesh_asset "up0" { file "%s"  material floor }\n'
+                           'mesh_instance { of "up0"  rotate 90 0 0 }\n') % upright0,
+    }
     paths = {}
-    for name, text in (('quad', quad), ('instance', inst)):
-        p = os.path.join(OUT, name + '.ftsl')
-        with open(p, 'w', encoding='utf-8', newline='\n') as f:
-            f.write(text)
-        paths[name] = p
+    for name, text in texts.items():
+        paths[name] = os.path.join(out, name + '.ftsl')
+        write(paths[name], text)
     return paths
 
 
-def render(exe, scene, name, dev):
-    out = os.path.join(OUT, f'{name}_{dev}.png')
+def render(exe, out, scene, name, dev):
+    png = os.path.join(out, f'{name}_{dev}.png')
+    pfm = png[:-4] + '.pfm'
+    for stale in (png, pfm):
+        if os.path.exists(stale):
+            os.remove(stale)
     cmd = [exe, '-in', scene, '-hdr', '-no-meter', '-seed', '3', '-mode', 'R', '-spp', '64', '-device', dev,
-           '-o', out]
+           '-o', png]
     r = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
-    pfm = out[:-4] + '.pfm'
     if r.returncode != 0 or not os.path.exists(pfm):
         print(f'  render failed: {" ".join(cmd)}\n{r.stdout[-600:]}{r.stderr[-600:]}')
+        return None
+    if dev == 'gpu' and '-> GPU' not in r.stdout + r.stderr:
+        print(f'  did not run on the GPU: {" ".join(cmd)}')
         return None
     return read_pfm(pfm)
 
@@ -84,17 +105,19 @@ def contrast(img):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('--out', default=os.path.join(ROOT, 'png', 'check_pattern_seam'))
     ap.add_argument('--exe', default=os.path.join(ROOT, 'ftrace.exe'))
     ap.add_argument('--cpu-only', action='store_true')
     a = ap.parse_args()
     exe = os.path.abspath(a.exe)
     devices = ['cpu'] if a.cpu_only else ['cpu', 'gpu']
     ok = True
-    for name, scene in scenes().items():
+    ref = None                                           # the quad on the CPU
+    for name, scene in scenes(a.out).items():
         imgs = {}
         for dev in devices:
-            img = render(exe, scene, name, dev)
+            img = render(exe, a.out, scene, name, dev)
             if img is None:
                 ok = False
                 continue
@@ -103,16 +126,21 @@ def main():
             good = c > 4.0
             ok = ok and good
             print(f'  {name:9s} {dev.upper()}: floor contrast {c:6.2f} {"ok" if good else "FAIL (grey: hits on both sides of the step)"}')
-        if 'cpu' in imgs and 'gpu' in imgs:
-            q = []
-            for i in range(4):
-                for j in range(4):
-                    sl = (slice(i * RES // 4, (i + 1) * RES // 4), slice(j * RES // 4, (j + 1) * RES // 4))
-                    q.append(imgs['gpu'][sl].mean() / max(imgs['cpu'][sl].mean(), 1e-30))
-            worst = max(abs(x - 1.0) for x in q)
-            good = worst < 0.03
+        if ref is None and 'cpu' in imgs:
+            ref = imgs['cpu']
+        for dev, img in imgs.items():
+            if ref is None or (name == 'quad' and dev == 'cpu'):
+                continue
+            # Pixel by pixel: a cell of the other colour reads 16x off (0.8 against 0.05), noise
+            # at 64 spp a few tens of per cent, so a seam -- half the floor in the other phase --
+            # or a misplaced floor shows as many pixels 3x off. Tile means would not: a tile
+            # spans whole pairs of cells, whose mean a swap of their colours leaves alone.
+            ratio = (img + 1e-30) / (ref + 1e-30)
+            off = float(np.mean((ratio > 3.0) | (ratio < 1.0 / 3.0)))
+            good = off < 0.02
             ok = ok and good
-            print(f'  {name:9s} GPU against CPU by tile: worst {worst * 100:.2f}% {"ok" if good else "FAIL"}')
+            print(f'  {name:9s} {dev.upper()} against the quad on the CPU: {off * 100:.2f}% of pixels 3x off '
+                  f'{"ok" if good else "FAIL (a seam, or the floor misplaced)"}')
     print('PASS' if ok else 'FAIL')
     return 0 if ok else 1
 

@@ -7291,18 +7291,32 @@ as the one at fault.
     op, so those analyses would still be correct if reordered, but running it last means
     no future analysis has to know that `LdReg` exists.
   * **Patterns on their own discontinuities.** A surface lying where a pattern steps (a
-    `y 0` floor under `floor(4*y)`) used to take each hit's value from the side its hit
-    point rounded to; the GPU's rounded both ways, so its pixels averaged two values and a
-    checker floor rendered grey. Since 0.399.5 a triangle's hit point is taken from its
-    vertices, `v0 + b1 (v1 - v0) + b2 (v2 - v0)` (`intersectTri`, host and device), and an
-    instance's world point is its local one through `toWorld` (`instanceHitToWorld`, both;
-    `DInstance::Wt` carries the translation), so a surface at a coordinate c is hit at
-    exactly c and every hit reads one side (`-checktrinormal` S8). Spheres and isosurfaces
-    are still hit along the ray. `pattern_gen::checker` also adds `kCheckerTieBreak` (1e-3 of
-    a cell, 10 um for a 1 cm checker) inside each floor, which covers those (0.398.1, widened
-    in 0.399.3; loom's two checkers carry the same as a phase). 0.399.3 had a load-time probe
-    warning of patterns on their surfaces' steps; the vertex hit points made it moot, and it
-    went in 0.399.5.
+    `y 0` floor under `floor(4*y)`) takes each hit's value from the side its hit point falls
+    on. Since 0.399.5 a triangle's hit point is taken from its vertices,
+    `v0 + b1 (v1 - v0) + b2 (v2 - v0)` (`intersectTri`, host and device), and an instance's
+    world point is its local one through toWorld (`instanceHitToWorld`; on the device a Real
+    3x4 copy, `DInstance::Pw`), so a surface whose vertices carry a coordinate c exactly is hit
+    at exactly c and every hit reads one side (`-checktrinormal` S8; it had rounded both ways,
+    and the GPU's float pixels averaged a checker floor grey). `MeshXform::sinCosDeg` makes
+    quarter turns exact (0.399.6), so a Z-up model stood upright by `rotate -90 0 0` stays
+    exact too. What stays inexact is a surface whose vertices only nearly carry the step's
+    coordinate (an export's float noise either side of it), where the pattern splits the
+    surface into a seam or speckle; rounding often cancels (a ramp at x + y = 0, a rotation
+    and its inverse land every hit on one side), so the probe judges the hit points, not the
+    geometry. `Builder::warnPatternsSplitBySteps`
+    (0.399.6) finds it: per material, 256 points drawn by area (a weighted reservoir of up to
+    256 triangles, from at most 2M offered: a stride over `Scene::tris`, a random subset of
+    each instance's mesh), each computed as intersectTri computes a hit, every
+    position-reading pattern slot, record driver and mix layer's evaluated there and at
+    +-eps and +-eps/16 along the normal (eps = 2.5e-7 of the distance from the origin; a step
+    reads nearly the same at both, anything smooth a sixteenth at the second); where a
+    step lies within eps the point's own value says its side, and both sides among the points
+    (3 or more each) warns, into `Loaded::patternSplits` too (`-checkpatops`: six surfaces).
+    A surface exactly on a step is left alone. Spheres, isosurfaces and curves are hit along
+    the ray and not probed; `pattern_gen::checker` adds `kCheckerTieBreak` (1e-3 of a cell, 10
+    um at 1 cm) inside each floor for them (0.398.1, widened in 0.399.3; loom's two checkers
+    carry the same as a phase). 0.399.3's first probe, which warned of any surface within eps
+    of a step, exact or not, went in 0.399.5.
   * `addFunctionLeaf` now passes the tables too, so a `grid:`-sampling field formula is
     optimized as well. It stays a separate call site because the program is about to be
     appended to a *shared* node pool holding one leaf after another, and the pass requires

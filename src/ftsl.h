@@ -861,6 +861,9 @@ struct Loaded {
     // Control points of every authored `camera_curve` (for the in-viewer editor's
     // round-trip load; see AuthoredCurve). Empty for scenes with no curve.
     std::vector<AuthoredCurve> authoredCurves;
+    // One entry per (material, pattern) a step of which splits the material's surfaces
+    // (Builder::warnPatternsSplitBySteps), each also printed as a load warning.
+    std::vector<std::string> patternSplits;
     // The authored `curve` blocks as the GROOM TOOL sees them (0.329.0): every NAMED node at
     // every level -- 0 a strand, 1 a curve of strands, 2 a curve of those, ... -- with its
     // children's names, its placement parameters, and its strands in WORLD space. Recorded
@@ -1382,6 +1385,7 @@ public:
                                                    : L.scene.matNames[kv.first.first]) +
                                               (kv.first.second == ROUTE_J ? " [mode J]" : " [mode D]");
         warnCurvOnFlatGeometry(L);
+        warnPatternsSplitBySteps(L);
         // Decide whether any cavity probe rays will ever be fired, and how far.
         setupCavity(L);
         // LAST: collapse repeated subexpressions in every shading-hot program.
@@ -1694,6 +1698,185 @@ public:
                 "vertex normals — regenerate it with `tools/make_mesh.py --smooth`, or "
                 "export with smoothing on.\n",
                 matName[i] ? matName[i]->c_str() : "<unnamed>");
+        }
+    }
+
+    // A pattern that steps exactly where a surface lies -- `floor(4*y)` on a floor at y = 0 --
+    // reads one side of the step on every hit only if every hit point has the surface's exact
+    // coordinate there. A triangle's hit point comes from its vertices, so a surface whose
+    // vertices all carry the coordinate exactly does (an axis-aligned quad, or one turned by
+    // quarter turns or moved by representable amounts). One whose vertices only nearly carry it
+    // does not -- an exported floor whose y values are float noise either side of 0, a surface
+    // whose transform rounds its vertices differently: its hit points fall on both sides, in a
+    // seam where they change sign or in speckle where they jitter, and the GPU's float pixels
+    // average the speckle grey. (Rounding often cancels: a ramp at x + y = 0, or a rotation and
+    // its inverse, still lands every hit on one side, which is why the points are evaluated
+    // where intersectTri puts them rather than judged by geometry.)
+    // So, per material, up to 256 points drawn by area on the triangles it shades, each
+    // computed as the intersector computes a hit (v0 + b1 e1 + b2 e2), and every pattern of it
+    // or of its mix layers that reads the position, and every record driver, evaluated there
+    // and a hair either side along the normal (eps, 2.5e-7 of the point's distance from the
+    // origin: a couple of float ulps). A step tells itself from a slope by reading nearly the
+    // same at eps / 16, where anything smooth is linear and reads a sixteenth; probing at a
+    // larger distance instead would mistake a fine pattern's curvature for a step, far from the
+    // origin where eps spans much of its period. The steps that matter are the ones a surface's
+    // own hit points straddle, far closer than eps / 16. Where a step lies within eps, the
+    // point's own value says which side it took;
+    // when some points took one side and some the other, the step splits the surface, and the
+    // loader warns and records it in L.patternSplits. A surface exactly on a step, every hit on
+    // one side, is left alone. Spheres, isosurfaces and curves are hit along the ray and are
+    // not probed; the built-in checker keeps its walls off round coordinates for them.
+    void warnPatternsSplitBySteps(Loaded& L) {
+        const Scene& sc = L.scene;
+        const size_t nm = sc.mats.size(), np = sc.patterns.size();
+        if (nm == 0) return;
+        auto readsPos = [](const std::vector<PatNode>& prog) {
+            std::vector<PatOp> vars;
+            patternCollectVars(prog, vars);
+            for (PatOp o : vars)
+                if (o == PatOp::VarX || o == PatOp::VarY || o == PatOp::VarZ || o == PatOp::VarR) return true;
+            return false;
+        };
+        std::vector<char> patPos(np, 0);
+        for (size_t i = 0; i < np; ++i) patPos[i] = readsPos(sc.patterns[i].nodes) ? 1 : 0;
+        // Names: materials from Scene::matNames (route clones included), patterns from the
+        // loader's map; a pattern built by the loader itself has none of its own.
+        std::vector<const std::string*> patName(np, nullptr);
+        for (const auto& kv : patternIndex_)
+            if (kv.second >= 0 && kv.second < (int)np) patName[(size_t)kv.second] = &kv.first;
+        auto matLabel = [&](int m) {
+            return (m >= 0 && m < (int)sc.matNames.size() && !sc.matNames[(size_t)m].empty())
+                       ? sc.matNames[(size_t)m] : std::string("<unnamed>");
+        };
+        auto patLabel = [&](int pi) {
+            const std::string* nmp = patName[(size_t)pi];
+            if (!nmp) return std::string("a pattern the loader built");
+            if (nmp->rfind("__arr", 0) == 0) return std::string("an inline array");
+            return "pattern '" + *nmp + "'";
+        };
+        // The position-reading programs that shade each material: its own pattern slots and
+        // record drivers, and its mix layers' (geometry names the mix, not its layers).
+        struct Use { const std::vector<PatNode>* prog; std::string what; };
+        std::vector<std::vector<Use>> uses(nm);
+        auto addOwn = [&](std::vector<Use>& out, int mi, bool layer) {
+            const Material& m = sc.mats[(size_t)mi];
+            const std::string from = layer ? ", in its layer '" + matLabel(mi) + "'" : "";
+            const std::pair<int, const char*> slots[6] = {
+                {m.roughnessPat, "roughness"}, {m.filmThicknessPat, "film thickness"}, {m.mixWeightPat, "weight_map"},
+                {m.reflectPat, "reflect"}, {m.transmitPat, "transmit"}, {m.emitPat, "emit"}};
+            for (const auto& sl : slots)
+                if (sl.first >= 0 && sl.first < (int)np && patPos[(size_t)sl.first])
+                    out.push_back({&sc.patterns[(size_t)sl.first].nodes,
+                                   std::string(sl.second) + " " + patLabel(sl.first) + from});
+            for (const RecBinding& rb : m.recBindings)
+                if (readsPos(rb.driver)) out.push_back({&rb.driver, "record driver" + from});
+        };
+        bool any = false;
+        for (size_t i = 0; i < nm; ++i) {
+            addOwn(uses[i], (int)i, false);
+            for (int c : sc.mats[i].mixChildren)
+                if (c >= 0 && c < (int)nm && c != (int)i) addOwn(uses[i], c, true);
+            any = any || !uses[i].empty();
+        }
+        if (!any) return;
+        // Up to kPick triangles per material by area (a weighted reservoir keeping the largest
+        // log(u) / area), from at most kOffers triangles in all: past that a stride over
+        // Scene::tris and a random subset of each instance's mesh, at the area each stands for.
+        // A splitmix64 stream, so the warning is deterministic.
+        constexpr size_t kPick = 256, kOffers = 2000000;
+        struct Pick { double key, area; Vec3 a, b, c, ua, ub, uc; double curv; };
+        std::vector<std::vector<Pick>> picks(nm);
+        std::vector<size_t> offered(nm, 0);
+        uint64_t st = 0x5eedf00dULL;
+        auto uni = [&st]() {
+            uint64_t z = (st += 0x9E3779B97F4A7C15ULL);
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+            return ((z ^ (z >> 31)) >> 11) * (1.0 / 9007199254740992.0) + 1e-300;
+        };
+        auto heapLess = [](const Pick& x, const Pick& y) { return x.key > y.key; };   // min-heap on key
+        auto offer = [&](int m, const Vec3& a, const Vec3& b, const Vec3& c, const Tri& t, double weight) {
+            if (m < 0 || m >= (int)nm || uses[(size_t)m].empty()) return;
+            const double area = 0.5 * length(cross(b - a, c - a));
+            if (!(area > 0.0)) return;
+            ++offered[(size_t)m];
+            Pick p{std::log(uni()) / (area * weight), area, a, b, c, t.uv0, t.uv1, t.uv2, t.curvature};
+            std::vector<Pick>& h = picks[(size_t)m];
+            if (h.size() < kPick) { h.push_back(p); std::push_heap(h.begin(), h.end(), heapLess); return; }
+            if (p.key <= h.front().key) return;
+            std::pop_heap(h.begin(), h.end(), heapLess);
+            h.back() = p;
+            std::push_heap(h.begin(), h.end(), heapLess);
+        };
+        size_t instTris = 0;
+        for (const MeshInstance& mi : sc.instances)
+            if (mi.blasId >= 0 && mi.blasId < (int)sc.blasList.size()) instTris += sc.blasList[(size_t)mi.blasId].tris.size();
+        const size_t total = sc.tris.size() + instTris;
+        const double keep = total > kOffers ? (double)kOffers / (double)total : 1.0;
+        {
+            const size_t stride = std::max<size_t>(1, (size_t)std::ceil(1.0 / keep));
+            for (size_t i = (size_t)(uni() * stride) % stride; i < sc.tris.size(); i += stride) {
+                const Tri& t = sc.tris[i];
+                offer(t.matId, t.v0, t.v1, t.v2, t, (double)stride);
+            }
+        }
+        for (const MeshInstance& mi : sc.instances) {
+            if (mi.blasId < 0 || mi.blasId >= (int)sc.blasList.size()) continue;
+            const std::vector<Tri>& bt = sc.blasList[(size_t)mi.blasId].tris;
+            if (bt.empty()) continue;
+            const size_t n = std::max<size_t>(1, std::min(bt.size(), (size_t)std::ceil(keep * (double)bt.size())));
+            for (size_t k = 0; k < n; ++k) {
+                const Tri& t = (n == bt.size()) ? bt[k] : bt[std::min(bt.size() - 1, (size_t)(uni() * bt.size()))];
+                offer(mi.matOverride >= 0 ? mi.matOverride : t.matId, mi.toWorld.apply(t.v0),
+                      mi.toWorld.apply(t.v1), mi.toWorld.apply(t.v2), t, (double)bt.size() / (double)n);
+            }
+        }
+        constexpr int kPoints = 256;
+        for (size_t m = 0; m < nm; ++m) {
+            const std::vector<Pick>& pk = picks[m];
+            if (pk.empty()) continue;
+            // The reservoir already drew its triangles by area when it had more than it kept;
+            // when it kept every one, the points go by area instead.
+            const bool byArea = offered[m] <= kPick;
+            std::vector<double> cdf;
+            double tot = 0.0;
+            for (const Pick& p : pk) cdf.push_back(tot += byArea ? p.area : 1.0);
+            for (const Use& u : uses[m]) {
+                int stepping = 0, sideA = 0, sideB = 0;
+                for (int k = 0; k < kPoints; ++k) {
+                    const size_t ip = std::min(pk.size() - 1,
+                                               (size_t)(std::lower_bound(cdf.begin(), cdf.end(), uni() * tot) - cdf.begin()));
+                    const Pick& q = pk[ip];
+                    double b1 = uni(), b2 = uni();
+                    if (b1 + b2 > 1.0) { b1 = 1.0 - b1; b2 = 1.0 - b2; }
+                    const Vec3 p = q.a + (q.b - q.a) * b1 + (q.c - q.a) * b2;     // as intersectTri does
+                    const Vec3 n = normalize(cross(q.b - q.a, q.c - q.a));
+                    const Vec3 uv = q.ua + (q.ub - q.ua) * b1 + (q.uc - q.ua) * b2;
+                    const double eps = 2.5e-7 * std::max(length(p), 1e-3);
+                    auto at = [&](double s) {
+                        PatCtx c = makePatCtx(p + n * s, 0.0, n, uv.x, uv.y, q.curv, 0.0, 0.0);
+                        bindPatScene(c, sc);
+                        return patternEval(u.prog->data(), (int)u.prog->size(), c);
+                    };
+                    const double vp = at(eps), vm = at(-eps);
+                    const double d1 = std::fabs(vp - vm), dFine = std::fabs(at(eps / 16.0) - at(-eps / 16.0));
+                    if (!(d1 > 1e-9 && dFine > 0.5 * d1)) continue;         // no step within eps here
+                    ++stepping;
+                    const double v0 = at(0.0);
+                    if (std::fabs(v0 - vp) < std::fabs(v0 - vm)) ++sideA; else ++sideB;
+                }
+                if (sideA < 3 || sideB < 3) continue;
+                const std::string msg = "material '" + matLabel((int)m) + "' (" + u.what + "): " +
+                    std::to_string(stepping) + " of " + std::to_string(kPoints) + " points sampled on its "
+                    "surfaces lie within rounding of a step of the pattern, " + std::to_string(sideA) + " on one "
+                    "side and " + std::to_string(sideB) + " on the other: the surface is not exactly where the "
+                    "step is (its vertices only nearly carry the step's coordinate), so the "
+                    "pattern splits it -- a seam where the side changes, grey speckle where it jitters. Put the "
+                    "surface exactly on the step or clearly off it, or shift the pattern's coordinate a small "
+                    "fraction of a step";
+                std::fprintf(stderr, "[ftsl] warning: %s.\n", msg.c_str());
+                L.patternSplits.push_back(msg);
+            }
         }
     }
 

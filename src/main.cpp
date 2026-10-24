@@ -3306,6 +3306,60 @@ static bool checkCheckerTieBreak() {
     return bad == 0;
 }
 
+// The loader's warning for a pattern step that splits a surface (ftsl
+// Builder::warnPatternsSplitBySteps): warned for a floor whose vertices carry an export's
+// float noise (y = +-1e-12, so its hits fall on both sides of floor(4y)'s step at 0); quiet
+// where every hit lands on one side -- a floor at y = 0, one at exactly y = 1e-12, a Z-up floor
+// stood upright by a quarter turn (exact in MeshXform), a ramp at x + y = 0 under
+// floor(4(x+y)) (exact: fl(-1 + a) and fl(1 - a) cancel) -- and where the pattern only slopes,
+// or curves finely far from the origin.
+static bool checkPatternSplits() {
+    const char* checker = "expr \"fract(0.5 * (floor(4*x) + floor(4*y) + floor(4*z))) * 2\"";
+    const char* floor0 = "quad { origin -1 0 -1  u 2 0 0  v 0 0 2  material floor }";
+    struct Case { const char* what; const char* pattern; const char* geometry; size_t want; };
+    const Case cases[] = {
+        {"checker, floor at y = 0", checker, floor0, 0},
+        {"checker, floor with y = +-1e-12 noise", checker,
+         "triangle { v0 -1 1e-12 -1  v1 1 -1e-12 -1  v2 1 1e-12 1  material floor }\n"
+         "triangle { v0 -1 1e-12 -1  v1 1 1e-12 1  v2 -1 -1e-12 1  material floor }", 1},
+        {"checker, floor at exactly y = 1e-12", checker,
+         "quad { origin -1 1e-12 -1  u 2 0 0  v 0 0 2  material floor }", 0},
+        {"checker, Z-up floor turned upright", checker,
+         "group { rotate -90 0 0  quad { origin -1 -1 0  u 2 0 0  v 0 2 0  material floor } }", 0},
+        {"floor(4(x+y)), ramp x + y = 0", "expr \"floor(4 * (x + y)) * 0.25\"",
+         "quad { origin -1 1 -1  u 2 -2 0  v 0 0 2  material floor }", 0},
+        {"steep smooth, floor at y = 0", "expr \"0.5 + 0.5 * sin(2000 * y)\"", floor0, 0},
+        // scenes/pattern_fnoise.ftsl's floor: fine noise out to 400 m, where eps spans much of a
+        // noise cell, so the pattern curves within a few eps, which must not read as a step.
+        {"fnoise floor out to 400 m",
+         "expr \"0.18 + 0.62 * mix(fnoise(90*x, 90*y + 0.5, 90*z, 90*fw, 3), "
+         "fnoise(90*x, 90*y + 0.5, 90*z, 0, 3), step(0, x))\"",
+         "quad { origin -150 0 -5   u 0 0 405   v 300 0 0   material floor }", 0},
+    };
+    bool ok = true;
+    for (const Case& k : cases) {
+        const std::string src = std::string("scene { units meters }\n") +
+            "pattern \"p\" { " + k.pattern + " }\n"
+            "material \"pale\" { type diffuse reflect rgb 0.7 0.7 0.7 }\n"
+            "material \"dark\" { type diffuse reflect rgb 0.1 0.1 0.1 }\n"
+            "material \"floor\" { type mix  layer \"pale\" 0.5  layer \"dark\" 0.5  weight_map pattern:p }\n" +
+            k.geometry + "\n"
+            "light area { origin 0 2 0  u 0.5 0 0  v 0 0 0.5  normal 0 -1 0  spd preset:bb6500 }\n"
+            "camera \"c\" { eye 0 1 -3  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n";
+        ftsl::Loaded L; std::string e;
+        if (!ftsl::loadSource(src, "<checkpatops>", L, e)) {
+            std::printf("[checkpatops] pattern splits: %s did not load: %s FAIL\n", k.what, e.c_str());
+            ok = false;
+            continue;
+        }
+        const bool good = L.patternSplits.size() == k.want;
+        std::printf("[checkpatops] pattern splits: %-36s %zu warning(s), want %zu %s\n", k.what,
+                    L.patternSplits.size(), k.want, good ? "ok" : "FAIL");
+        ok = ok && good;
+    }
+    return ok;
+}
+
 // -checkpatops: every pattern opcode, through all THREE implementations of the VM.
 //
 // The VM exists three times -- `patternEval` on the host, the fp64 device template
@@ -3326,7 +3380,7 @@ static bool checkCheckerTieBreak() {
 // dimensionality). Those are counted as SKIPPED rather than quietly passing -- a check that
 // says "all clear" about opcodes it never exercised would be worse than no check.
 static int checkPatOps() {
-    const bool tieOk = checkCheckerTieBreak();
+    const bool tieOk = checkCheckerTieBreak() & checkPatternSplits();
     struct Prog { PatOp op; int off, len; };
     std::vector<PatNode> pool;
     std::vector<Prog>    progs;
@@ -10411,10 +10465,12 @@ static int checkTriNormal() {
     }
 
     // §8 The hit point of a triangle lying in a plane x, y or z = c has exactly c there, from
-    // any ray, and so does an instance's placed by exact numbers: a pattern that steps at c
-    // reads one side on every hit (a checker floor at y = 0 had rendered grey on the GPU,
-    // whose hit points rounded to both sides). Rays from scattered origins at the triangle's
-    // interior, against planes at 0, at a binary-exact and an inexact coordinate, far out.
+    // any ray, and so does an instance's whose transform maps the plane to one exactly: a
+    // translation by representable amounts, and a quarter turn with a power-of-two scale
+    // (MeshXform's quarter turns are exact), which carries the plane to another axis -- a
+    // transposed or misplaced instance matrix lands it elsewhere. Rays from scattered origins
+    // at the triangle's interior, from either side, against planes at 0, at a binary-exact and
+    // at an inexact coordinate, and far out.
     {
         int bad = 0, n = 0;
         unsigned long long st = 0x9e3779b97f4a7c15ULL;
@@ -10422,6 +10478,9 @@ static int checkTriNormal() {
             st ^= st << 13; st ^= st >> 7; st ^= st << 17;
             return (double)(st >> 11) * (1.0 / 9007199254740992.0);
         };
+        const Affine xfs[2] = {
+            MeshXform{Vec3(3.0, -5.0, 0.5), Vec3(1, 1, 1), Vec3(0, 0, 0)}.toAffine(),
+            MeshXform{Vec3(1.5, -2.0, 0.25), Vec3(2, 2, 2), Vec3(0, 0, 90)}.toAffine()};
         for (int axis = 0; axis < 3; ++axis) {
             for (const double c : {0.0, 2.75, 0.3, -1234.1}) {
                 auto at = [&](double a, double b) {          // a point of the plane, by its other two axes
@@ -10432,11 +10491,6 @@ static int checkTriNormal() {
                 Tri tri;
                 tri.v0 = at(-1.3, -0.7); tri.v1 = at(2.1, -0.4); tri.v2 = at(0.2, 1.9);
                 tri.gn = normalize(cross(tri.v1 - tri.v0, tri.v2 - tri.v0));
-                MeshInstance inst;
-                Affine xf = Affine::identity();
-                xf.t = Vec3(3.0, -5.0, 0.5);                 // exact in binary: the plane moves by it exactly
-                inst.setToWorld(xf);
-                const double cw = c + xf.t[axis];
                 for (int k = 0; k < 200; ++k) {
                     const double b1 = 0.05 + 0.6 * uni(), b2 = 0.05 + 0.3 * uni();
                     const Vec3 target = tri.v0 + (tri.v1 - tri.v0) * b1 + (tri.v2 - tri.v0) * b2;
@@ -10447,17 +10501,27 @@ static int checkTriNormal() {
                     if (!intersectTri(r, tri, 1e-9, h)) continue;
                     ++n;
                     if (h.p[axis] != c) ++bad;
-                    // The same triangle as an instance's mesh, the ray carried into its frame.
-                    const Ray lr{inst.toLocal.apply(r.o + xf.t) , inst.toLocal.applyDir(r.d)};
-                    Hit lh; lh.t = 1e30;
-                    if (!intersectTri(lr, tri, 1e-9, lh)) { ++bad; continue; }
-                    Scene::instanceHitToWorld(inst, Ray{r.o + xf.t, r.d}, lh);
-                    if (lh.p[axis] != cw) ++bad;
+                    // The same triangle as an instance's mesh, the ray carried into the world and
+                    // back into the instance's frame as a render carries it.
+                    for (const Affine& xf : xfs) {
+                        MeshInstance inst;
+                        inst.setToWorld(xf);
+                        const Vec3 w0 = xf.apply(tri.v0), w1 = xf.apply(tri.v1), w2 = xf.apply(tri.v2);
+                        int wa = -1;                         // the world axis the plane maps to
+                        for (int q = 0; q < 3; ++q) if (w0[q] == w1[q] && w1[q] == w2[q]) wa = q;
+                        if (wa < 0) { ++bad; continue; }
+                        const Ray wr{xf.apply(r.o), xf.applyDir(r.d)};
+                        const Ray lr{inst.toLocal.apply(wr.o), inst.toLocal.applyDir(wr.d)};
+                        Hit lh; lh.t = 1e30;
+                        if (!intersectTri(lr, tri, 1e-9, lh)) { ++bad; continue; }
+                        Scene::instanceHitToWorld(inst, wr, lh);
+                        if (lh.p[wa] != w0[wa]) ++bad;
+                    }
                 }
             }
         }
-        std::printf("[checktrinormal] S8 hits on axis-aligned triangles off their plane: %d of %d (and instanced)\n",
-                    bad, n);
+        std::printf("[checktrinormal] S8 hits on axis-aligned triangles off their plane: %d of %d "
+                    "(each also under two instance transforms)\n", bad, n);
         chkb("S8 a hit on a triangle in the plane x/y/z = c has exactly c there", bad == 0 && n > 1000);
     }
 

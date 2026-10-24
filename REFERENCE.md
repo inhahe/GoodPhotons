@@ -4462,12 +4462,17 @@ maps, mix `weight_map` masks, colored glass, and frosted (rough) glass on-device
 
 A pattern that steps -- `floor`, `fract`, `%`, `step`, `sign` of a coordinate -- exactly
 where a surface lies (a floor at `y 0` under `floor(4*y)`) reads one side of the step on
-every hit, on CPU and GPU alike: a hit on a mesh, quad or instance takes its position from
-the triangle's own vertices, so a surface at `y 0` is hit at exactly 0 (since 0.399.5;
-before, the GPU's hit points rounded to both sides and such a floor came out grey). Spheres
-and isosurfaces are still hit along the ray: there a step that coincides with the surface
-can still flicker. The built-in `type checker` keeps its cell walls a thousandth of a cell
-off the round coordinates as well, which covers those.
+every hit, on CPU and GPU alike, wherever the surface's vertices carry that coordinate
+exactly: a hit on a mesh, quad or instance takes its position from the triangle's own
+vertices (since 0.399.5; before, hit points rounded to both sides and such a floor came out
+grey on the GPU), and `rotate` makes quarter turns exact, so an axis-aligned surface, one
+moved by round numbers or one stood upright by a quarter turn stays exact. A surface whose
+vertices only nearly carry the step's coordinate -- an exported floor whose heights are float
+noise either side of it -- is split by it into a seam or grey speckle, and the loader warns of
+that (`[ftsl] warning: material '...' ...
+the pattern splits it`). Spheres, isosurfaces and curves are hit along the ray and are not
+checked; the built-in `type checker` keeps its cell walls a thousandth of a cell off the
+round coordinates for them.
 
 **Pattern-driven reflectance.** The `reflect` slot takes a pattern as well, and a scalar in
 a *spectral* slot is a per-hit **multiplier** on whatever the slot otherwise holds. Two

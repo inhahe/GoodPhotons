@@ -83,13 +83,28 @@ struct MeshXform {
     Vec3 scale{1, 1, 1};
     Vec3 rotDeg{0, 0, 0};      // Euler XYZ, degrees
 
+    // sin and cos of an angle in degrees, exactly 0 and +-1 at the quarter turns. cos(90 deg)
+    // in floating point is 6.1e-17, which would leave a floor modelled Z-up and stood upright by
+    // `rotate -90 0 0` a hair off its plane, with opposite signs on its two halves: any pattern
+    // that steps at that plane would split along the seam (hit points come from the vertices).
+    static void sinCosDeg(double deg, double& s, double& c) {
+        const double q = deg / 90.0;
+        if (q == std::floor(q) && std::fabs(q) < 1e15) {
+            static const double S[4] = {0.0, 1.0, 0.0, -1.0}, C[4] = {1.0, 0.0, -1.0, 0.0};
+            const int k = (int)(((long long)q % 4 + 4) % 4);
+            s = S[k]; c = C[k];
+            return;
+        }
+        const double r = deg * (3.14159265358979323846 / 180.0);
+        s = std::sin(r); c = std::cos(r);
+    }
     // Linear part only (scale + rotation, no translation): scale first
     // (component-wise), then rotate X, then Y, then Z.
     Vec3 applyLinear(const Vec3& p) const {
-        const double d2r = 3.14159265358979323846 / 180.0;
-        double cx = std::cos(rotDeg.x * d2r), sx = std::sin(rotDeg.x * d2r);
-        double cy = std::cos(rotDeg.y * d2r), sy = std::sin(rotDeg.y * d2r);
-        double cz = std::cos(rotDeg.z * d2r), sz = std::sin(rotDeg.z * d2r);
+        double cx, sx, cy, sy, cz, sz;
+        sinCosDeg(rotDeg.x, sx, cx);
+        sinCosDeg(rotDeg.y, sy, cy);
+        sinCosDeg(rotDeg.z, sz, cz);
         Vec3 v{p.x * scale.x, p.y * scale.y, p.z * scale.z};
         v = Vec3{v.x, cx * v.y - sx * v.z, sx * v.y + cx * v.z};        // Rx
         v = Vec3{cy * v.x + sy * v.z, v.y, -sy * v.x + cy * v.z};       // Ry

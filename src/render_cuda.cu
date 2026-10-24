@@ -707,7 +707,10 @@ struct DInstance {
     // toWorld linear part (local -> world for plain DIRECTIONS): transforms the surface
     // tangent for normal mapping on instanced meshes (C6). affDir(Wm, tangent).
     double Wm[9];
-    double Wt[3];   // toWorld's translation: with Wm, a local hit point -> world
+    // toWorld as a 3x4 in Real (row-major, translation last): a local hit point -> world, once
+    // per closer instance hit, in the tracer's own precision. Exact entries (quarter turns,
+    // power-of-two scales, representable moves) map an exact coordinate exactly.
+    Real Pw[12];
     // O3: local curvature (1/length) -> world curvature multiplier, = 1/|det(linear)|^(1/3).
     // Host-precomputed (MeshInstance::curvScale) so the device does no cbrt per hit.
     double curvScale;
@@ -4337,13 +4340,16 @@ __device__ static bool blasOccluded(const DScene& sc, const DInstance& inst,
 }
 
 // Transform a BLAS-local hit `lh` back into world space for instance `inst` under the
-// world ray (ro,rd). The point maps by toWorld from the local one (taken from the triangle's
+// world ray direction rd. The point maps by toWorld (Pw) from the local one (taken from the triangle's
 // vertices, so an instance placed by exact numbers keeps a plane's exact coordinate); normals
 // by (toWorld)^-T (Nm); the shading normal is re-oriented against the world ray. Mirrors the
 // host Scene::instanceHitToWorld exactly.
-__device__ static void instanceHitToWorld(const DInstance& inst, const DVec3& ro,
-                                          const DVec3& rd, DHit& lh) {
-    lh.p = affPoint(inst.Wm, inst.Wt, lh.p);
+__device__ static void instanceHitToWorld(const DInstance& inst, const DVec3& rd, DHit& lh) {
+    const Real* P = inst.Pw;
+    const DVec3 q = lh.p;
+    lh.p = DVec3(P[0] * q.x + P[1] * q.y + P[2] * q.z + P[3],
+                 P[4] * q.x + P[5] * q.y + P[6] * q.z + P[7],
+                 P[8] * q.x + P[9] * q.y + P[10] * q.z + P[11]);
     DVec3 wn  = normalize(affDir(inst.Nm, lh.n));
     DVec3 wng = normalize(affDir(inst.Nm, lh.ng));
     lh.ng = wng;
@@ -4425,7 +4431,7 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
                     DVec3 lrd = affDir(inst.Lm, rd);
                     DHit lh; lh.t = h.t; lh.valid = false;
                     if (blasClosest(sc, inst, lro, lrd, tmin, lh)) {
-                        instanceHitToWorld(inst, ro, rd, lh);
+                        instanceHitToWorld(inst, rd, lh);
                         h = lh; tMax = h.t;
                     }
                 }
@@ -21152,7 +21158,10 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.Nm[3] = inv.m[1]; d.Nm[4] = inv.m[4]; d.Nm[5] = inv.m[7];
         d.Nm[6] = inv.m[2]; d.Nm[7] = inv.m[5]; d.Nm[8] = inv.m[8];
         for (int k = 0; k < 9; ++k) d.Wm[k] = in.toWorld.m[k];   // tangent local->world (C6)
-        d.Wt[0] = in.toWorld.t.x; d.Wt[1] = in.toWorld.t.y; d.Wt[2] = in.toWorld.t.z;
+        for (int r = 0; r < 3; ++r) {
+            for (int k = 0; k < 3; ++k) d.Pw[4 * r + k] = (Real)in.toWorld.m[3 * r + k];
+            d.Pw[4 * r + 3] = (Real)(r == 0 ? in.toWorld.t.x : r == 1 ? in.toWorld.t.y : in.toWorld.t.z);
+        }
         d.curvScale = in.curvScale;                              // curvature local->world (O3)
         d.blasId = in.blasId; d.matOverride = in.matOverride;
     }

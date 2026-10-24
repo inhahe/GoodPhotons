@@ -1841,8 +1841,10 @@ inline std::vector<PatNode> bands(PatOp coord, double freq, double phase) {
 // off the round coordinates, so such a surface sits in one cell for any rounding error
 // smaller than that: 10 um for a 1 cm checker, against a float hit point's few tenths of a
 // micrometre per metre from the origin -- safe to some 30 m out, and a shift of the pattern no
-// render can show. Triangles no longer need it (their hit points come from their vertices,
-// geometry.h intersectTri); spheres and isosurfaces, hit along the ray, still do.
+// render can show. A triangle whose vertices carry a coordinate exactly is hit at exactly it
+// (intersectTri takes hit points from the vertices); what this guards is the rest: spheres,
+// isosurfaces and curves, hit along the ray, and triangles whose vertices only nearly carry
+// a wall's coordinate.
 inline constexpr double kCheckerTieBreak = 1e-3;
 inline std::vector<PatNode> checker(double size) {
     std::vector<PatNode> o;
