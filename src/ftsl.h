@@ -8204,6 +8204,23 @@ private:
                          "fisheye)");
                     return false;
                 }
+                // The camera keys that choose a focal length for every other camera -- fov_y,
+                // zoom, a scalar `lens <mm>`, an archetype preset -- do not size a real
+                // prescription. Say so when the scene wrote one that asks for another.
+                if (published && !find(lb, "focal")) {
+                    std::string keys;
+                    int nKeys = 0;
+                    for (const char* k : {"fov_y", "zoom", "preset"})
+                        if (find(b, k)) { keys += std::string(nKeys++ ? ", `" : "`") + k + "`"; }
+                    for (const auto& st : b.stmts)
+                        if (st.key == "lens" && !st.val.block) { keys += nKeys++ ? ", `lens`" : "`lens`"; break; }
+                    const double fOwn = sys->focalLengthMM();
+                    if (nKeys > 0 && fOwn > 0.0 && std::fabs(fOwn / focalMM - 1.0) > 0.01)
+                        std::printf("[ftsl] camera '%s' lens: preset '%s' keeps its own %.1f mm focal length; the "
+                                    "camera's %s %s for %.1f mm, which a real prescription takes only as `focal "
+                                    "%.1f` in its lens block\n", cs.name.c_str(), preset.c_str(), fOwn, keys.c_str(),
+                                    nKeys == 1 ? "asks" : "ask", focalMM, focalMM);
+                }
             } else {
                 *sys = makeAchromat(focalMM, fstop, defaultGlass("BK7"), defaultGlass("SF10"));
             }

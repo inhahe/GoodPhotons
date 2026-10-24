@@ -1967,7 +1967,9 @@ camera "real" {
 
   (The f-numbers are the real beams', as above, and match what the designs are labelled:
   f/2, f/5.6, f/4. Paraxially they would read f/2.03, f/5.42, f/2.68 and f/3.95.)
-  Each keeps its published size and full opening unless `focal` or `fstop` says otherwise;
+  Each keeps its published size and full opening unless `focal` or `fstop` says otherwise
+  (the camera's `fov_y`, `zoom`, `lens <mm>` or archetype `preset` do not size it; the log
+  says so when one asks for another focal length);
   then it is scaled so its focal length is exactly `focal` and stopped down so it lets in
   exactly an f/`fstop` beam, but it opens no wider than its design (the log says so when
   asked more than 2% wider). The published prescriptions give each glass a single
