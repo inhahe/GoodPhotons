@@ -655,6 +655,29 @@ struct PatTableScope {
     }
 };
 
+// The point a pattern reads at a surface hit: the hit point moved a hair along the geometric
+// normal (gx, gy, gz), to the side the ray came from (side = +-1). A pattern that steps where
+// a surface lies -- `floor(4*y)` on a floor at y = 0, a step a hair off an exported floor's
+// noisy vertices, a radial step on a sphere hit along the ray -- would otherwise take each
+// hit's value from whichever side its rounding error put it on, and a pixel would average
+// the two (grey speckle, or a seam). Moved off by more than any hit point's rounding, every
+// hit reads the ray's side. The hair is kPatNudge of the point's distance from the origin,
+// and at least kPatNudge * kPatNudgeFloor (1e-7) in absolute terms: some 80 float ulps of the
+// point, and 10^10 double ones, while a thousandth of a millimetre at a metre is no detail a
+// pattern shows. That outruns a hit point's rounding as long as the rounding is relative to
+// the surface's own coordinates, not the ray origin's, so hit points are made so: a
+// triangle's comes from its vertices, and the GPU's float sphere, isosurface and curve hits
+// are taken from the surface rather than along the ray.
+// Host patCtxFromHit, emitterPatMulAt and the rasterizer, and the device's pattern sites, share it.
+constexpr double kPatNudge = 1e-5, kPatNudgeFloor = 1e-2;
+PATTERN_HD inline void patNudgedPoint(double px, double py, double pz, double gx, double gy, double gz,
+                                      double side, double& ox, double& oy, double& oz) {
+    double r = sqrt(px * px + py * py + pz * pz);
+    if (r < kPatNudgeFloor) r = kPatNudgeFloor;
+    const double d = (side < 0.0 ? -kPatNudge : kPatNudge) * r;
+    ox = px + gx * d; oy = py + gy * d; oz = pz + gz * d;
+}
+
 inline PatCtx makePatCtx(const Vec3& p, double f, const Vec3& n, double u = 0, double v = 0,
                          double curv = 0, double cavity = 0, double fw = 0) {
     PatCtx c;
@@ -1835,16 +1858,12 @@ inline std::vector<PatNode> bands(PatOp coord, double freq, double phase) {
 // value = mod(floor(x/s + e)+floor(y/s + e)+floor(z/s + e), 2), e = kCheckerTieBreak
 //
 // A surface lying on a cell boundary -- a floor at y = 0, a wall at a multiple of the size --
-// would otherwise take its parity from the sign of each hit point's rounding error, which
-// differs between the CPU and the GPU and from ray to ray: the pixel averages the two cells
-// and the checker vanishes into grey. The offset moves every boundary a thousandth of a cell
-// off the round coordinates, so such a surface sits in one cell for any rounding error
-// smaller than that: 10 um for a 1 cm checker, against a float hit point's few tenths of a
-// micrometre per metre from the origin -- safe to some 30 m out, and a shift of the pattern no
-// render can show. A triangle whose vertices carry a coordinate exactly is hit at exactly it
-// (intersectTri takes hit points from the vertices); what this guards is the rest: spheres,
-// isosurfaces and curves, hit along the ray, and triangles whose vertices only nearly carry
-// a wall's coordinate.
+// takes its parity from the side of the boundary each hit is read on. Hits are read a hair to
+// the ray's side (patNudgedPoint), which settles that for every surface; the offset moves
+// every boundary a thousandth of a cell off the round coordinates as well, so a point read
+// without that nudge -- a caller of the program outside the renderers -- also sits in one cell
+// for any rounding error under 10 um at a 1 cm checker, a shift of the pattern no render can
+// show. Loom's two checkers carry the same as a phase (spatial.CHECKER_TIE_BREAK).
 inline constexpr double kCheckerTieBreak = 1e-3;
 inline std::vector<PatNode> checker(double size) {
     std::vector<PatNode> o;

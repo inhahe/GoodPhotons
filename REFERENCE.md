@@ -4461,18 +4461,17 @@ maps, mix `weight_map` masks, colored glass, and frosted (rough) glass on-device
 (per-hit point threaded through its MIS kernel).)*
 
 A pattern that steps -- `floor`, `fract`, `%`, `step`, `sign` of a coordinate -- exactly
-where a surface lies (a floor at `y 0` under `floor(4*y)`) reads one side of the step on
-every hit, on CPU and GPU alike, wherever the surface's vertices carry that coordinate
-exactly: a hit on a mesh, quad or instance takes its position from the triangle's own
-vertices (since 0.399.5; before, hit points rounded to both sides and such a floor came out
-grey on the GPU), and `rotate` makes quarter turns exact, so an axis-aligned surface, one
-moved by round numbers or one stood upright by a quarter turn stays exact. A surface whose
-vertices only nearly carry the step's coordinate -- an exported floor whose heights are float
-noise either side of it -- is split by it into a seam or grey speckle, and the loader warns of
-that (`[ftsl] warning: material '...' ...
-the pattern splits it`). Spheres, isosurfaces and curves are hit along the ray and are not
-checked; the built-in `type checker` keeps its cell walls a thousandth of a cell off the
-round coordinates for them.
+where a surface lies (a floor at `y 0` under `floor(4*y)`, a sphere of radius 0.5 under
+`step(0.5, r)`) reads the side of the step the ray arrives from, on every hit, on CPU and GPU
+alike: a pattern reads a surface at a point a hair off it toward the ray, along the surface's
+own normal -- a hundred-thousandth of the point's distance from the origin, and at least
+10^-7 scene units. So the floor above reads `floor(4*y)` = 0 from above and -1 from below,
+and a surface within that hair of a step -- an exported floor whose heights are float noise
+either side of 0, a sphere hit at a radius rounded either side of 0.5 -- reads it the same
+way. (Since 0.399.7; before, hit points rounded to either side of the step from ray to ray,
+and such a surface came out grey or split along a seam.) A pattern detail finer than that
+hair moves by up to its width, which no render resolves. The built-in `type checker`
+also keeps its cell walls a thousandth of a cell off the round coordinates.
 
 **Pattern-driven reflectance.** The `reflect` slot takes a pattern as well, and a scalar in
 a *spectral* slot is a per-hit **multiplier** on whatever the slot otherwise holds. Two
@@ -6558,7 +6557,11 @@ accepts it only inside an `upsample` body, which the loader evaluates at load ti
 `curv` / `cavity` / `fw` are absent from the FP32 VM because a field march has no surface to
 measure them on. That table is half the check — a VM that silently drops an opcode and one
 that was never meant to have it are indistinguishable from the outside, so the only thing
-that separates them is a written-down decision. `-checkpaths` guards **asset path resolution** (see *Where asset paths
+that separates them is a written-down decision. It also checks that a hit within rounding of a
+pattern's step reads the ray's side of it (a floor at `y 0` under `floor(4*y)` from above and
+below, a sphere under `step(0.5, r)`), and that the built-in checker keeps a surface on a cell
+boundary in one cell. `tools/check_pattern_seam.py` renders the same on both devices.
+`-checkpaths` guards **asset path resolution** (see *Where asset paths
 are looked for*): it builds a throwaway project tree in the temp directory, `cd`s
 somewhere unrelated, and asserts that a scene loads from there with its texture found
 via the scene's *parent* directory, that an absolute path is returned unchanged, that an

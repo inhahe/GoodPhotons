@@ -4022,10 +4022,10 @@ inline double cavityAt(const Scene& scene, const Hit& h) {
     return (double)blocked / (double)N;
 }
 
-// Build a procedural-pattern evaluation context from a hit: world point (x,y,z),
-// implicit field value f (0 on non-implicit surfaces), oriented normal, radius, and
-// the scene's pattern tables (so `tex:<name>(u,v)` and `grid:<name>(…)` sampling
-// inside a pattern work).
+// Build a procedural-pattern evaluation context from a hit: world point (x,y,z) -- the hit
+// moved a hair to the ray's side of the surface (patNudgedPoint says why) --, implicit field
+// value f (0 on non-implicit surfaces), oriented normal, radius, and the scene's pattern
+// tables (so `tex:<name>(u,v)` and `grid:<name>(…)` sampling inside a pattern work).
 inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
     // `cavity` is filled here rather than by the intersector because it needs the whole
     // scene, and cached on the Hit because one shading point builds several PatCtxs.
@@ -4039,7 +4039,9 @@ inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
         h.cavity = cavityAt(scene, h);
         h.cavityDone = true;
     }
-    PatCtx c = makePatCtx(h.p, h.fieldVal, h.n, h.u, h.v, h.curv, h.cavity, h.fw);
+    Vec3 q;
+    patNudgedPoint(h.p.x, h.p.y, h.p.z, h.ng.x, h.ng.y, h.ng.z, dot(h.n, h.ng) < 0.0 ? -1.0 : 1.0, q.x, q.y, q.z);
+    PatCtx c = makePatCtx(q, h.fieldVal, h.n, h.u, h.v, h.curv, h.cavity, h.fw);
     bindPatScene(c, scene);
     return c;
 }
@@ -4191,11 +4193,15 @@ inline double emitSlot(const Scene& scene, const Material& m, const Hit& h, doub
 
 // The emission-pattern multiplier at a point on `em`, given the point's own texture
 // coordinates. Clamped to [0,1] like the reflect/transmit slot patterns, so a runaway
-// formula can never manufacture light.
+// formula can never manufacture light. Read a hair off the surface on the side it emits
+// into (nOut), as a ray arriving there reads it (patCtxFromHit), so the two agree on a
+// pattern stepping at the surface.
 inline double emitterPatMulAt(const Scene& scene, const Emitter& em,
                               const Vec3& y, const Vec3& nOut, double uu, double vv) {
     if (em.emitPat < 0 || em.emitPat >= (int)scene.patterns.size()) return 1.0;
-    PatCtx c = makePatCtx(y, 0.0, nOut, uu, vv);
+    Vec3 q;
+    patNudgedPoint(y.x, y.y, y.z, nOut.x, nOut.y, nOut.z, 1.0, q.x, q.y, q.z);
+    PatCtx c = makePatCtx(q, 0.0, nOut, uu, vv);
     bindPatScene(c, scene);
     double p = scene.patterns[em.emitPat].eval(c);
     return p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p);

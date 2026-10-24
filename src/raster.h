@@ -2601,7 +2601,18 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                     const Vec3 dv = g.wpos[i] - cam.eye;
                     const double dist = length(dv);
                     const double cs = dist > 0.0 ? dot(dv, N0) / dist : 0.0;
-                    pc = makePatCtx(g.wpos[i], 0.0, N0, g.uv[i].x, g.uv[i].y, 0.0, 0.0,
+                    // Read a hair off the face toward the eye, as the tracers read a hit
+                    // (patCtxFromHit), so a pattern stepping at the surface shows the same side.
+                    const Vec3 fc = cross(pt.p1 - pt.p0, pt.p2 - pt.p0);
+                    const double fl = length(fc);
+                    const Vec3& w = g.wpos[i];
+                    Vec3 q = w;
+                    if (fl > 0.0) {
+                        const Vec3 fn = fc / fl;                    // unit face normal
+                        patNudgedPoint(w.x, w.y, w.z, fn.x, fn.y, fn.z, dot(fn, dv) < 0.0 ? 1.0 : -1.0,
+                                       q.x, q.y, q.z);
+                    }
+                    pc = makePatCtx(q, 0.0, N0, g.uv[i].x, g.uv[i].y, 0.0, 0.0,
                                     patShadingFootprint(fwPerDist, dist, cs));
                     bindPatScene(pc, *scenePtr);
                     pcReady = true;

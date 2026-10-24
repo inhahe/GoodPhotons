@@ -4,18 +4,31 @@ step on every hit, on the CPU and the GPU alike.
     python tools/check_pattern_seam.py [--out png/check_pattern_seam] [--exe ftrace.exe] [--cpu-only]
 
 A floor at y = 0 under a hand-written checker, fract(0.5 (floor(4x) + floor(4y) + floor(4z))) * 2,
-lies on the checker's own cell walls: floor(4y) steps at y = 0. A hit point taken along the ray
-(o + d t) rounds to either side from ray to ray, and the floor renders grey; a triangle's hit
-point taken from its vertices (geometry.h intersectTri and its device twin) puts every hit at
-exactly y = 0. Four floors, one square at y = 0: a quad; a mesh_asset modelled at y = -1 and
+lies on the checker's own cell walls: floor(4y) steps at y = 0. A pattern read at a hit point
+that rounds to either side of the step from ray to ray renders grey, or splits into two phases
+along a seam. Patterns read a hit a hair to the ray's side of the surface (pattern.h
+patNudgedPoint), hit points are taken from the surface's own coordinates rather than along the
+ray, and quarter turns are exact; this renders the cases those cover.
+
+Five floors, one square at y = 0, seen from 2.2 m: a quad; a mesh_asset modelled at y = -1 and
 lifted by mesh_instance; one modelled upright in z = 2 at twice the size and stood on the floor
 by a quarter turn about x, a half scale and a lift (the instance's transform applied the wrong
-way round would put it at y = 2); and one modelled upright in z = 0 and only turned (a quarter
-turn that is not exact, cos 90 = 6e-17, would leave its halves either side of y = 0: two
-checker phases with a seam between). Each renders from above on the CPU and the GPU; the check
-is the floor's contrast -- the checker's two cells against each other, which a grey floor
-lacks -- and every image against the quad's on the CPU, tile by tile, which a seam or a
-misplaced floor fails. Exits 0 when everything holds, 1 otherwise.
+way round would put it at y = 2); one modelled upright in z = 0 and only turned; and one whose
+vertices carry an export's float noise, y = +-1e-12. Each must show the checker's contrast (a
+grey floor lacks it) and match the quad on the CPU pixel by pixel (a seam, speckle or a
+misplaced surface does not). The rasterizer's preview (-raster) of the noisy floor is held to
+the quad's the same way, on each device.
+
+And surfaces of radius 0.5 under a step at that radius, hit along the ray: a sphere seen from
+2.2 m, and a sphere, an isosurface sphere and a curve's tube seen from 3000 m, where a float hit
+point computed along the ray rounds relative to the camera's distance, some ten times past the
+nudge, so the GPU must take these hits from the surfaces themselves. They glow, seen directly,
+against the same surface with the pattern replaced by 1 and the same seed: a pixel's ratio of
+the two is exactly the fraction of its hits that read the outside of the step, which must be
+all of them. (A mix of two colours would not do: a pixel reads 3x off only once most of its
+hits are wrong.)
+
+Exits 0 when everything holds, 1 otherwise.
 """
 import argparse
 import os
@@ -27,15 +40,39 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RES = 64
 CHECKER = 'fract(0.5 * (floor(4*x) + floor(4*y) + floor(4*z))) * 2'
+RADIAL = 'step(0.5, r)'
+TUBE = 'step(0.5, sqrt(y*y + z*z))'
+NEAR_CAM = 'eye 0 2.2 0.001  look_at 0 0 0  up 0 0 1  fov_y 50'
+# 3000 m above the origin, the field narrowed to the same 1.2 m.
+FAR_CAM = 'eye 0 3000 0.001  look_at 0 0 0  up 0 0 1  fov_y 0.023'
 
-HEAD = '''scene { units meters }
+
+def head(expr=CHECKER, cam=NEAR_CAM):
+    # The lamp hangs over the floor; for the far camera, whose line of sight it would block,
+    # well out of frame (the far surfaces glow by themselves; the loader wants a light).
+    lamp = 'origin -0.5 2.5 -0.5' if cam == NEAR_CAM else 'origin 20 20 20'
+    return '''scene { units meters }
 pattern "p" { expr "%s" }
 material "pale"  { type diffuse reflect rgb 0.8 0.8 0.8 }
 material "dark"  { type diffuse reflect rgb 0.05 0.05 0.05 }
 material "floor" { type mix  layer "pale" 0.5  layer "dark" 0.5  weight_map pattern:p }
-light area { origin -0.5 2.5 -0.5  u 1 0 0  v 0 0 1  normal 0 -1 0  spd preset:bb6500 }
-camera "top" { eye 0 2.2 0.001  look_at 0 0 0  up 0 0 1  fov_y 50  film { res %d %d } }
-''' % (CHECKER, RES, RES)
+material "glow"  { type diffuse  reflect 0.0  emit blackbody 6500  emit_map pattern:p }
+light area { %s  u 1 0 0  v 0 0 1  normal 0 -1 0  spd preset:bb6500 }
+camera "top" { %s  film { res %d %d } }
+''' % (expr, lamp, cam, RES, RES)
+
+
+HEAD = head()
+# The floors, checked for contrast and against the quad on the CPU.
+FLOORS = ('quad', 'instance', 'turned', 'upright', 'noisy')
+# The glowing surfaces: each '<name>' (emit_map the step) against '<name>_one' (emit_map 1).
+SPHERE = 'sphere { center 0 0 0  radius 0.5  material glow }'
+GLOW = {
+    'sphere': (RADIAL, SPHERE, NEAR_CAM),
+    'sphere_far': (RADIAL, SPHERE, FAR_CAM),
+    'iso_far': (RADIAL, 'isosurface { material glow  sphere { center 0 0 0  radius 0.5 } }', FAR_CAM),
+    'curve_far': (TUBE, 'curve { material glow  basis linear  radius 0.5  point -1 0 0  point 1 0 0 }', FAR_CAM),
+}
 
 
 def read_pfm(p):
@@ -61,6 +98,8 @@ def scenes(out):
     write(upright, 'v -2 -2 2\nv 2 -2 2\nv 2 2 2\nv -2 2 2\nf 1 2 3\nf 1 3 4\n')
     upright0 = os.path.join(out, 'floor_upright0.obj').replace('\\', '/')
     write(upright0, 'v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\nf 1 2 3\nf 1 3 4\n')
+    noisy = os.path.join(out, 'floor_noisy.obj').replace('\\', '/')
+    write(noisy, 'v -1 1e-12 -1\nv 1 -1e-12 -1\nv 1 1e-12 1\nv -1 -1e-12 1\nf 1 2 3\nf 1 3 4\n')
     texts = {
         'quad': HEAD + 'quad { origin -1 0 -1  u 2 0 0  v 0 0 2  material floor }\n',
         'instance': HEAD + ('mesh_asset "low" { file "%s"  material floor }\n'
@@ -70,7 +109,11 @@ def scenes(out):
                           'mesh_instance { of "up"  scale 0.5  rotate 90 0 0  translate 0 1 0 }\n') % upright,
         'upright': HEAD + ('mesh_asset "up0" { file "%s"  material floor }\n'
                            'mesh_instance { of "up0"  rotate 90 0 0 }\n') % upright0,
+        'noisy': HEAD + 'mesh { file "%s"  material floor }\n' % noisy,
     }
+    for name, (expr, body, cam) in GLOW.items():
+        texts[name] = head(expr, cam) + body + '\n'
+        texts[name + '_one'] = head('1', cam) + body + '\n'
     paths = {}
     for name, text in texts.items():
         paths[name] = os.path.join(out, name + '.ftsl')
@@ -96,12 +139,35 @@ def render(exe, out, scene, name, dev):
     return read_pfm(pfm)
 
 
+def render_raster(exe, out, scene, name, dev):
+    """The rasterizer's preview of `scene` on `dev`, as linear luminance (it writes an sRGB PNG)."""
+    from PIL import Image
+    png = os.path.join(out, f'{name}_raster_{dev}.png')
+    if os.path.exists(png):
+        os.remove(png)
+    cmd = [exe, '-in', scene, '-raster', '-device', dev, '-o', png]
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
+    if r.returncode != 0 or not os.path.exists(png):
+        print(f'  raster failed: {" ".join(cmd)}\n{r.stdout[-600:]}{r.stderr[-600:]}')
+        return None
+    a = np.asarray(Image.open(png).convert('RGB'), dtype=np.float64) / 255.0
+    a = np.where(a <= 0.04045, a / 12.92, ((a + 0.055) / 1.055) ** 2.4)
+    return a[..., 0] * 0.2126 + a[..., 1] * 0.7152 + a[..., 2] * 0.0722
+
+
 def contrast(img):
     """The checker's two cells against each other: the 90th over the 10th percentile of the
     middle of the floor (its cells are 0.8 and 0.05; averaged, both read the same grey)."""
-    m = img[RES // 4: 3 * RES // 4, RES // 4: 3 * RES // 4]
+    h, w = img.shape
+    m = img[h // 4: 3 * h // 4, w // 4: 3 * w // 4]
     lo, hi = np.percentile(m, 10), np.percentile(m, 90)
     return hi / max(lo, 1e-30)
+
+
+def off3x(img, ref, floor=1e-30):
+    """The fraction of pixels 3x off the reference either way."""
+    ratio = (img + floor) / (ref + floor)
+    return float(np.mean((ratio > 3.0) | (ratio < 1.0 / 3.0)))
 
 
 def main():
@@ -113,34 +179,65 @@ def main():
     exe = os.path.abspath(a.exe)
     devices = ['cpu'] if a.cpu_only else ['cpu', 'gpu']
     ok = True
-    ref = None                                           # the quad on the CPU
-    for name, scene in scenes(a.out).items():
-        imgs = {}
+    imgs = {}
+    paths = scenes(a.out)
+    for name, scene in paths.items():
         for dev in devices:
             img = render(exe, a.out, scene, name, dev)
             if img is None:
                 ok = False
+            else:
+                imgs[(name, dev)] = img
+
+    def report(good, line):
+        nonlocal ok
+        ok = ok and good
+        print(f'  {line} {"ok" if good else "FAIL"}')
+
+    # The floors: the checker's contrast, and every pixel against the quad on the CPU. A cell of
+    # the other colour reads 16x off (0.8 against 0.05), noise at 64 spp a few tens of per cent,
+    # so grey speckle, a seam -- half the floor in the other phase -- or a misplaced surface
+    # shows as many pixels 3x off. Tile means would not: a tile spans whole pairs of cells,
+    # whose mean a swap of their colours leaves alone.
+    ref = imgs.get(('quad', 'cpu'))
+    for name in FLOORS:
+        for dev in devices:
+            img = imgs.get((name, dev))
+            if img is None:
                 continue
-            imgs[dev] = img
             c = contrast(img)
-            good = c > 4.0
-            ok = ok and good
-            print(f'  {name:9s} {dev.upper()}: floor contrast {c:6.2f} {"ok" if good else "FAIL (grey: hits on both sides of the step)"}')
-        if ref is None and 'cpu' in imgs:
-            ref = imgs['cpu']
-        for dev, img in imgs.items():
-            if ref is None or (name == 'quad' and dev == 'cpu'):
+            report(c > 4.0, f'{name:10s} {dev.upper()}: floor contrast {c:6.2f}')
+            if (name, dev) == ('quad', 'cpu'):
                 continue
-            # Pixel by pixel: a cell of the other colour reads 16x off (0.8 against 0.05), noise
-            # at 64 spp a few tens of per cent, so a seam -- half the floor in the other phase --
-            # or a misplaced floor shows as many pixels 3x off. Tile means would not: a tile
-            # spans whole pairs of cells, whose mean a swap of their colours leaves alone.
-            ratio = (img + 1e-30) / (ref + 1e-30)
-            off = float(np.mean((ratio > 3.0) | (ratio < 1.0 / 3.0)))
-            good = off < 0.02
-            ok = ok and good
-            print(f'  {name:9s} {dev.upper()} against the quad on the CPU: {off * 100:.2f}% of pixels 3x off '
-                  f'{"ok" if good else "FAIL (a seam, or the floor misplaced)"}')
+            if ref is None:
+                report(False, f'{name:10s} {dev.upper()}: no reference (the quad on the CPU did not render)')
+                continue
+            report(off3x(img, ref) < 0.02, f'{name:10s} {dev.upper()} against the quad on the CPU: '
+                                           f'{off3x(img, ref) * 100:.2f}% of pixels 3x off')
+    # The glowing surfaces: per pixel, the fraction of its hits that read the inside of the step.
+    for name in GLOW:
+        for dev in devices:
+            img, one = imgs.get((name, dev)), imgs.get((name + '_one', dev))
+            if img is None or one is None:
+                continue
+            m = one > 1e-3 * one.max() if one.max() > 0 else np.zeros_like(one, dtype=bool)
+            inside = 1.0 - img[m] / one[m] if m.any() else np.ones(1)
+            report(m.sum() > RES * RES // 8 and inside.max() < 1e-3,
+                   f'{name:10s} {dev.upper()}: {m.sum()} pixels, {np.mean(inside > 1e-3) * 100:.2f}% with hits '
+                   f'reading inside the step (worst {inside.max() * 100:.1f}% of its hits)')
+    # The rasterizer reads its patterns at interpolated vertex positions: the noisy floor's
+    # straddle y = 0 as its vertices do, and must read the eye's side of floor(4y) as the exact
+    # quad does. Each device's preview against its own quad (the two rasterizers shade alike
+    # but not identically); deterministic, so any pixel 3x off is a phase swapped.
+    for dev in devices:
+        rq = render_raster(exe, a.out, paths['quad'], 'quad', dev)
+        rn = render_raster(exe, a.out, paths['noisy'], 'noisy', dev)
+        if rq is None or rn is None:
+            ok = False
+            continue
+        c, off = contrast(rn), off3x(rn, rq, 1e-6)
+        report(c > 4.0 and off < 0.02, f'noisy raster {dev.upper()}: floor contrast {c:6.2f}, '
+                                       f'{off * 100:.2f}% of pixels 3x off the quad\'s')
     print('PASS' if ok else 'FAIL')
     return 0 if ok else 1
 

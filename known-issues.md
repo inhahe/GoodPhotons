@@ -110,10 +110,28 @@ both devices computed a triangle's hit point along the ray, o + d t, which round
 side of a surface's own coordinate. It is now taken from the triangle's vertices, so a surface
 whose vertices carry a coordinate exactly is hit at exactly it, and any pattern, a hand-written
 one too, reads one side (`-checktrinormal` S8; tools/check_pattern_seam.py renders it on both
-devices); quarter turns are exact since 0.399.6. Still open by nature: a surface only within
-rounding of a step (its vertices float noise either side of it) is split by it, which the loader warns
-of (`warnPatternsSplitBySteps`, 0.399.6); spheres, isosurfaces and curves are hit along the ray
-and not probed, which the built-in checker's tie-break covers for it.
+devices); quarter turns are exact since 0.399.6. That left a surface only within rounding of a
+step (its vertices float noise either side of it) split by it, and spheres, isosurfaces and
+curves, which are hit along the ray; 0.399.6 warned of the first at load. Since 0.399.7 a
+pattern reads every hit a hair to the ray's side of the surface (`pattern.h patNudgedPoint`:
+1e-5 of the distance from the origin along the geometric normal), which settles all of them for
+every primitive, and the warning went (`-checkpatops` "pattern nudge"; the seam check's noisy
+floor and `step(0.5, r)` sphere both fail without it). The nudge has to outrun the hit point's
+rounding, and the GPU's sphere, isosurface and curve hits, `o + d t` in float, rounded relative
+to the ray's origin: measured on a radius-0.5 surface at the origin under a step at its radius,
+from 300 m a quarter of the sphere's pixels averaged hits inside the step, from 3000 m 83 % of
+them (38 % for the isosurface, 37 % for the curve), against none on the CPU. They are now taken
+from the surface's own coordinates (a sphere's put back on it, an isosurface's put back on it
+through the double field along its normal by a Newton step and secant steps, a curve's built from
+the segment's end; one Newton step alone along the ray, its slope from the normal's 1e-4 t-wide
+gradient stencil, left 19 % of the isosurface's pixels inside from 3000 m, and secant steps along
+the ray still lost its silhouette, where a grazing ray's slope vanishes). Clean now out to 30 km
+for all three. The seam check renders
+all three from 3000 m as emitters, seen directly, against the same surface glowing evenly with
+the same seed, so a pixel's ratio is exactly the fraction of its hits that read outside; without
+the fixes nearly every GPU pixel has hits inside. Its first far cases, mixes from 300 m under the
+floor's lamp, passed without the fixes: a pixel needs most of its hits wrong to read 3x off, and
+the lamp hung between camera and surface, so the images were black.
 
 ## DONE (2026-10-24, 0.398.0): PRESET-FNUMBER-TRACED — presets let in less light than their f-number; the singlet's rear face trimmed its beam; the pupil tables missed sparse crossings at a fisheye's field edge
 

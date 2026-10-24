@@ -3306,58 +3306,69 @@ static bool checkCheckerTieBreak() {
     return bad == 0;
 }
 
-// The loader's warning for a pattern step that splits a surface (ftsl
-// Builder::warnPatternsSplitBySteps): warned for a floor whose vertices carry an export's
-// float noise (y = +-1e-12, so its hits fall on both sides of floor(4y)'s step at 0); quiet
-// where every hit lands on one side -- a floor at y = 0, one at exactly y = 1e-12, a Z-up floor
-// stood upright by a quarter turn (exact in MeshXform), a ramp at x + y = 0 under
-// floor(4(x+y)) (exact: fl(-1 + a) and fl(1 - a) cancel) -- and where the pattern only slopes,
-// or curves finely far from the origin.
-static bool checkPatternSplits() {
-    const char* checker = "expr \"fract(0.5 * (floor(4*x) + floor(4*y) + floor(4*z))) * 2\"";
-    const char* floor0 = "quad { origin -1 0 -1  u 2 0 0  v 0 0 2  material floor }";
-    struct Case { const char* what; const char* pattern; const char* geometry; size_t want; };
-    const Case cases[] = {
-        {"checker, floor at y = 0", checker, floor0, 0},
-        {"checker, floor with y = +-1e-12 noise", checker,
-         "triangle { v0 -1 1e-12 -1  v1 1 -1e-12 -1  v2 1 1e-12 1  material floor }\n"
-         "triangle { v0 -1 1e-12 -1  v1 1 1e-12 1  v2 -1 -1e-12 1  material floor }", 1},
-        {"checker, floor at exactly y = 1e-12", checker,
-         "quad { origin -1 1e-12 -1  u 2 0 0  v 0 0 2  material floor }", 0},
-        {"checker, Z-up floor turned upright", checker,
-         "group { rotate -90 0 0  quad { origin -1 -1 0  u 2 0 0  v 0 2 0  material floor } }", 0},
-        {"floor(4(x+y)), ramp x + y = 0", "expr \"floor(4 * (x + y)) * 0.25\"",
-         "quad { origin -1 1 -1  u 2 -2 0  v 0 0 2  material floor }", 0},
-        {"steep smooth, floor at y = 0", "expr \"0.5 + 0.5 * sin(2000 * y)\"", floor0, 0},
-        // scenes/pattern_fnoise.ftsl's floor: fine noise out to 400 m, where eps spans much of a
-        // noise cell, so the pattern curves within a few eps, which must not read as a step.
-        {"fnoise floor out to 400 m",
-         "expr \"0.18 + 0.62 * mix(fnoise(90*x, 90*y + 0.5, 90*z, 90*fw, 3), "
-         "fnoise(90*x, 90*y + 0.5, 90*z, 0, 3), step(0, x))\"",
-         "quad { origin -150 0 -5   u 0 0 405   v 300 0 0   material floor }", 0},
-    };
-    bool ok = true;
-    for (const Case& k : cases) {
-        const std::string src = std::string("scene { units meters }\n") +
-            "pattern \"p\" { " + k.pattern + " }\n"
-            "material \"pale\" { type diffuse reflect rgb 0.7 0.7 0.7 }\n"
-            "material \"dark\" { type diffuse reflect rgb 0.1 0.1 0.1 }\n"
-            "material \"floor\" { type mix  layer \"pale\" 0.5  layer \"dark\" 0.5  weight_map pattern:p }\n" +
-            k.geometry + "\n"
-            "light area { origin 0 2 0  u 0.5 0 0  v 0 0 0.5  normal 0 -1 0  spd preset:bb6500 }\n"
-            "camera \"c\" { eye 0 1 -3  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n";
-        ftsl::Loaded L; std::string e;
-        if (!ftsl::loadSource(src, "<checkpatops>", L, e)) {
-            std::printf("[checkpatops] pattern splits: %s did not load: %s FAIL\n", k.what, e.c_str());
-            ok = false;
-            continue;
-        }
-        const bool good = L.patternSplits.size() == k.want;
-        std::printf("[checkpatops] pattern splits: %-36s %zu warning(s), want %zu %s\n", k.what,
-                    L.patternSplits.size(), k.want, good ? "ok" : "FAIL");
-        ok = ok && good;
+// A pattern reads a surface hit a hair to the ray's side of it (pattern.h patNudgedPoint, used
+// by patCtxFromHit): hits within rounding of a step -- on a floor at y = 0, at +-1e-12 of it as
+// an exported floor's vertices put them, on a sphere hit along the ray at r = 0.5 +- an ulp --
+// all read the ray's side of floor(4y) or step(0.5, r), seen from either side. Without the
+// nudge, the same hits read both sides. And an emitter's sampled point reads an emission
+// pattern as a hit there does (emitterPatMulAt nudges too).
+static bool checkPatternNudge() {
+    std::vector<PatNode> floor4y, stepR;
+    std::string err;
+    if (!compilePatternExpr("floor(4 * y)", floor4y, err) || !compilePatternExpr("step(0.5, r)", stepR, err)) {
+        std::printf("[checkpatops] pattern nudge: %s FAIL\n", err.c_str());
+        return false;
     }
-    return ok;
+    Scene sc;
+    int bad = 0, n = 0;
+    auto read = [&](const std::vector<PatNode>& prog, const Vec3& p, const Vec3& ng, const Vec3& nFacing) {
+        Hit h;
+        h.p = p; h.ng = ng; h.n = nFacing; h.matId = -1;
+        return patternEval(prog.data(), (int)prog.size(), patCtxFromHit(sc, h));
+    };
+    for (const double side : {1.0, -1.0}) {                      // seen from above, then from below
+        const Vec3 up(0, 1, 0), facing(0, side, 0);
+        const double want = side > 0.0 ? 0.0 : -1.0;             // floor(4 y) just above / below 0
+        for (const double y : {0.0, 1e-12, -1e-12, 1e-9, -1e-9, 5e-324})
+            for (const double x : {0.3, -7.0, 120.5}) {
+                ++n;
+                if (read(floor4y, Vec3(x, y, 0.7), up, facing) != want) ++bad;
+            }
+    }
+    for (int k = 0; k < 64; ++k) {                               // a sphere of radius 0.5 at the origin
+        const double th = 0.1 + 0.05 * k, ph = 0.37 * k;
+        const Vec3 dir(std::sin(th) * std::cos(ph), std::cos(th), std::sin(th) * std::sin(ph));
+        for (const double dr : {0.0, 1e-16, -1e-16, 5e-17}) {
+            ++n;
+            if (read(stepR, dir * (0.5 + dr), dir, dir) != 1.0) ++bad;   // from outside: r > 0.5
+        }
+    }
+    // An emission pattern at a point the emitter sampler drew reads the side the emitter emits
+    // into, as a ray arriving there reads it: MIS adds the two estimates, so they must agree.
+    std::vector<PatNode> lit;                                    // 1 just above y = 0, 0 just below
+    if (!compilePatternExpr("1 + floor(4 * y)", lit, err)) {
+        std::printf("[checkpatops] pattern nudge: %s FAIL\n", err.c_str());
+        return false;
+    }
+    Scene se;
+    se.patterns.push_back(Pattern{lit});
+    Emitter em;
+    em.emitPat = 0;
+    int emBad = 0, emN = 0;
+    for (const double side : {1.0, -1.0}) {                      // emitting up, then down
+        const Vec3 nOut(0, side, 0);
+        for (const double y : {0.0, 1e-12, -1e-12}) {
+            const Vec3 p(0.3, y, 0.7);
+            Hit h;
+            h.p = p; h.ng = Vec3(0, 1, 0); h.n = nOut; h.matId = -1;
+            ++emN;
+            if (emitterPatMulAt(se, em, p, nOut, 0.0, 0.0) != slotPatMul(se, 0, h)) ++emBad;
+        }
+    }
+    std::printf("[checkpatops] pattern nudge: %d of %d hits within rounding of a step read the wrong side, "
+                "%d of %d emitter samples disagree with a hit there %s\n",
+                bad, n, emBad, emN, bad || emBad ? "FAIL" : "ok");
+    return bad == 0 && emBad == 0;
 }
 
 // -checkpatops: every pattern opcode, through all THREE implementations of the VM.
@@ -3380,7 +3391,7 @@ static bool checkPatternSplits() {
 // dimensionality). Those are counted as SKIPPED rather than quietly passing -- a check that
 // says "all clear" about opcodes it never exercised would be worse than no check.
 static int checkPatOps() {
-    const bool tieOk = checkCheckerTieBreak() & checkPatternSplits();
+    const bool tieOk = checkCheckerTieBreak() & checkPatternNudge();
     struct Prog { PatOp op; int off, len; };
     std::vector<PatNode> pool;
     std::vector<Prog>    progs;

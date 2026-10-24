@@ -7291,32 +7291,49 @@ as the one at fault.
     op, so those analyses would still be correct if reordered, but running it last means
     no future analysis has to know that `LdReg` exists.
   * **Patterns on their own discontinuities.** A surface lying where a pattern steps (a
-    `y 0` floor under `floor(4*y)`) takes each hit's value from the side its hit point falls
-    on. Since 0.399.5 a triangle's hit point is taken from its vertices,
-    `v0 + b1 (v1 - v0) + b2 (v2 - v0)` (`intersectTri`, host and device), and an instance's
-    world point is its local one through toWorld (`instanceHitToWorld`; on the device a Real
-    3x4 copy, `DInstance::Pw`), so a surface whose vertices carry a coordinate c exactly is hit
-    at exactly c and every hit reads one side (`-checktrinormal` S8; it had rounded both ways,
-    and the GPU's float pixels averaged a checker floor grey). `MeshXform::sinCosDeg` makes
-    quarter turns exact (0.399.6), so a Z-up model stood upright by `rotate -90 0 0` stays
-    exact too. What stays inexact is a surface whose vertices only nearly carry the step's
-    coordinate (an export's float noise either side of it), where the pattern splits the
-    surface into a seam or speckle; rounding often cancels (a ramp at x + y = 0, a rotation
-    and its inverse land every hit on one side), so the probe judges the hit points, not the
-    geometry. `Builder::warnPatternsSplitBySteps`
-    (0.399.6) finds it: per material, 256 points drawn by area (a weighted reservoir of up to
-    256 triangles, from at most 2M offered: a stride over `Scene::tris`, a random subset of
-    each instance's mesh), each computed as intersectTri computes a hit, every
-    position-reading pattern slot, record driver and mix layer's evaluated there and at
-    +-eps and +-eps/16 along the normal (eps = 2.5e-7 of the distance from the origin; a step
-    reads nearly the same at both, anything smooth a sixteenth at the second); where a
-    step lies within eps the point's own value says its side, and both sides among the points
-    (3 or more each) warns, into `Loaded::patternSplits` too (`-checkpatops`: six surfaces).
-    A surface exactly on a step is left alone. Spheres, isosurfaces and curves are hit along
-    the ray and not probed; `pattern_gen::checker` adds `kCheckerTieBreak` (1e-3 of a cell, 10
-    um at 1 cm) inside each floor for them (0.398.1, widened in 0.399.3; loom's two checkers
-    carry the same as a phase). 0.399.3's first probe, which warned of any surface within eps
-    of a step, exact or not, went in 0.399.5.
+    `y 0` floor under `floor(4*y)`, a radius-0.5 sphere under `step(0.5, r)`) would take each
+    hit's value from the side its rounded hit point falls on, and a ray-traced hit point
+    rounds to either side from ray to ray: the floor renders grey, or splits along a seam. So
+    a pattern reads a surface hit at a point nudged off it toward the ray (`pattern.h
+    patNudgedPoint`, 0.399.7): by `kPatNudge` = 1e-5 of the point's distance from the origin
+    (at least `kPatNudgeFloor` = 1e-2 of it, so 1e-7 scene units near the origin), along the
+    geometric normal turned to the side the shading normal faces (the ray's side). That is
+    some 80 float ulps of the point (10^10 double ones) and far below anything a pixel
+    resolves, so every hit within rounding of a step -- exact geometry, an export's float
+    noise, a sphere or isosurface hit along the ray -- reads the ray's side of it, seen from
+    either side. Sites: host `patCtxFromHit` (every host pattern read at a hit goes through
+    it), `emitterPatMulAt` (a point the emitter sampler drew, nudged along nOut, the side a
+    ray reaching it arrives from, since MIS needs the two to agree) and the rasterizer's
+    `ctx()` (along the face normal toward the eye); device `dPatPoint` at each site that
+    builds a pattern point from a `DHit`, `dEmitterPatMulAt`, and raster_cuda's
+    `dRasterPatPoint`. The nudge outruns rounding that is relative to the surface's own
+    coordinates, so the hit points are made so: a triangle's hit is taken from its
+    vertices, `v0 + b1 (v1 - v0) + b2 (v2 - v0)` (`intersectTri`, host and device,
+    0.399.5); an instance's world point is its local one through toWorld
+    (`instanceHitToWorld`; on the device in double, once per ray, after the traversal has
+    found the closest hit); `MeshXform::sinCosDeg` makes quarter turns exact (0.399.6); and
+    on the GPU, whose o + d t rounds relative to the ray's float origin, a sphere hit is put
+    back on the sphere (`c + n r`), an isosurface hit is put back on the surface through the
+    double field along its normal (a Newton step, then secant steps until one moves the
+    point by under 1% of the nudge; along the ray instead, a grazing hit's slope vanishes
+    and the silhouette stayed split), and a curve hit is its segment's end plus the local
+    offset the recentred solve found (an end ball's put back on the ball) (0.399.7). The
+    sphere and isosurface hits keep their t. The isosurface polish runs only where the
+    march's coordinates (|o| + |d| t) exceed 8 times the hit's distance from the origin,
+    past which the float root's rounding nears the nudge; nearer -- most camera rays, nearly
+    every bounce -- it costs nothing (ungated, it cost 4.8 % of a gyroid room's GPU render;
+    gated, 0.3 %, within noise). The host computes in double, where
+    o + d t is close enough. `-checkpatops` "pattern nudge" reads hits at y in {0, +-1e-12,
+    +-1e-9, denormal} from both sides and on a sphere at r = 0.5 +- an ulp, and holds an
+    emitter's sampled point to a hit there; tools/check_pattern_seam.py renders such
+    surfaces on both devices, the rasterizer's preview of a noisy floor, and a sphere, an
+    isosurface and a curve from 3000 m as emitters against the same surface glowing evenly
+    (a pixel's ratio is then exactly the fraction of its hits reading outside the step).
+    `pattern_gen::checker` also keeps `kCheckerTieBreak` (1e-3 of a cell) inside each floor
+    (0.398.1, widened 0.399.3; loom's two checkers carry the same as a phase). Two load-time
+    probes that warned of a pattern splitting a surface (0.399.3's, then
+    `warnPatternsSplitBySteps` in 0.399.6) went when the nudge made what they looked for
+    impossible.
   * `addFunctionLeaf` now passes the tables too, so a `grid:`-sampling field formula is
     optimized as well. It stays a separate call site because the program is about to be
     appended to a *shared* node pool holding one leaf after another, and the pass requires
