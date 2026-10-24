@@ -72,6 +72,33 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-10-23, 0.397.1): ACHROMAT-FNUMBER — the achromat and singlet presets did not work at the focal length or f-number asked for; the achromat's crown was thinner than its own curves
+
+Found while testing `preset dgauss`, by `-checklens` (12), which measures every preset's
+f-number by tracing the widest on-axis beam that gets through, independently of the paraxial
+helpers. Three faults, all in the generators (lens.h):
+
+1. **Faces that cross.** makeAchromat gave the crown a centre thickness of max(2, 0.16 semi)
+   mm, but its two faces each curve away by their sag over the clear aperture: for 50 mm f/2.8,
+   1.57 mm each, 3.1 mm against 2 mm of glass, so they crossed 7.7 mm off axis, inside the
+   9.4 mm aperture. Rays beyond passed outside the glass and were lost: "f/2.8" worked at about
+   f/3.35, and the error grew with focal length and speed. The singlet did the same at fast
+   apertures (50 mm f/2). Every element now gets at least the thickness for an edge of
+   max(0.8 mm, 8% of its aperture) (`lensEdgeGain`, `lensEdgeMin`).
+2. **A stop sized as if it were the pupil.** The achromat's stop sits behind the converging
+   doublet, which narrows the beam on its way there; sized at f/2N it admitted more than the
+   front element (f/2.68 for f/2.8, had the glass been thick enough). It is now sized through
+   its pupil magnification (`LensSystem::setFNumber`), as the double Gauss's is.
+3. **Thin-lens focal lengths.** The lensmaker equation and the achromat's power split are
+   thin-lens formulas; with real thicknesses the focal length came out about 0.5% long. The
+   presets are now scaled to it exactly (`LensSystem::scaleToFocal`).
+
+Achromat renders are brighter than before (a point source's light through the 50 mm f/2.8 is
++31%), at the f-number they always claimed, and the image scale moves by the focal length's
+half per cent. The stop is sized with no floor, so a preset now closes to any f-number (the
+old 1 / 1.5 mm floors had capped a 50 mm singlet at f/25); readLens says when a preset does
+not work at the f-number asked, which is now only the double Gauss asked wider than f/2.03.
+
 ## DONE (2026-10-23, 0.394.3): LENS-SURFACE-SIGN — a pasted lens prescription was read with every radius negated, and its `stop` flag was rejected
 
 `lens { surface <radius> <thickness> <ior> <semi_aperture> [stop] }` was documented as the
@@ -2722,7 +2749,20 @@ nothing. At `-beamblur 0.0025` (a quarter of the default) J 1024 spp reads 0.990
 0.980: most of it is the beam merges' kernel blur already measured on `_fog_cornell`
 (J-FOGCORNELL, UPBP-BEAM-RADIUS), only larger here -- the merges carry more of this image (a dark
 scene lit through fog, the camera ray crossing metres of it), so the blur's share of the image
-is larger. **Proper fix:** UPBP-BEAM-RADIUS's (a kernel radius that shrinks with the beam
+is larger.
+
+**The CPU's J reads lower still** (0.397.1, the same scene, 1024 spp each, D 4096 on the GPU as
+reference): CPU J 0.936 / 0.958 / 0.988 / 0.965 of D where GPU J reads 0.963 / 0.972 / 1.003 /
+0.956 -- the two devices' J disagree by up to 2.8% on the floor, a gap D does not show. Some
+technique of the CPU's J is biased beyond the shared kernel blur. One visible consequence:
+through a physical lens whose light image is aimed (`preset dgauss` at f/4), CPU J with and
+without the aiming (FTRACE_LENS_FRONT) differ by +1.7% green / -1.2% red, the same every run
+(spread < 0.2%), because aiming moves weight between techniques and so moves the biased one's
+share; the GPU's agree to 0.5%. tools/check_physlens.py holds CPU J to 3% there for this reason.
+To find it: FTRACE_J_HALF splits the estimator, and the CPU/GPU difference per half on
+`scenes/_realcam_fog.ftsl` should name the technique.
+
+**Proper fix:** UPBP-BEAM-RADIUS's (a kernel radius that shrinks with the beam
 count, or a bias-corrected kernel). The lens check holds J to J with the aiming off instead of
 to R for this reason. Repro: `scenes/_realcam_fog.ftsl`.
 

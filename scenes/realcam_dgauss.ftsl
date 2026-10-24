@@ -15,9 +15,10 @@
 # 2.14 mm stops it to about f/8, where the front element (12.6 mm) is several times wider
 # than the beam the stop lets through.
 #
-# The same lens is built in as `lens { preset dgauss  focal 50  fstop 8 }`, which scales it to
-# exactly `focal` and sizes the stop for exactly `fstop`; this file shows how a prescription is
-# pasted.
+# The same lens is built in: `lens { preset dgauss  focal 50.36  fstop 2 }` is this file's lens
+# (its own focal length, opened fully: f/2 asks wider than the design's f/2.03, so it stops
+# there), and other values of `focal` and `fstop` scale it and size its stop for exactly those.
+# This file shows how a prescription is pasted.
 
 scene {
     units    meters

@@ -103,10 +103,11 @@ struct LensSystem {
     }
 
     // Intersect a lens-local ray (o,d) with surface j. Returns the hit point and the
-    // surface normal oriented against d. `false` if it misses or is clipped by the
-    // surface's clear aperture (vignetting). Planar surfaces (radius 0) intersect the
-    // vertex plane z = zpos[j].
-    bool hitSurface(int j, const Vec3& o, const Vec3& d, Vec3& hitP, Vec3& nrm) const {
+    // surface normal oriented against d. `false` if it misses or, unless `clip` is false, is
+    // clipped by the surface's clear aperture (vignetting). Planar surfaces (radius 0)
+    // intersect the vertex plane z = zpos[j]. The paraxial probes pass clip = false: paraxial
+    // optics has no apertures, and a probe clipped by a small stop would measure nothing.
+    bool hitSurface(int j, const Vec3& o, const Vec3& d, Vec3& hitP, Vec3& nrm, bool clip = true) const {
         double zv = zpos[j];
         double R  = surf[j].radius;
         double ap = surf[j].aperture;
@@ -134,7 +135,7 @@ struct LensSystem {
             nrm = normalize(hitP - C);
             if (dot(nrm, d) > 0.0) nrm = -nrm;            // face against the ray
         }
-        if (hitP.x * hitP.x + hitP.y * hitP.y > ap * ap) return false;   // clipped
+        if (clip && hitP.x * hitP.x + hitP.y * hitP.y > ap * ap) return false;   // clipped
         return true;
     }
 
@@ -142,13 +143,13 @@ struct LensSystem {
     // iteration order (rear->front for camera-ray generation; front->rear for the
     // paraxial focus probe). Returns the outgoing ray in air on success.
     bool trace(const Vec3& o0, const Vec3& d0, double lambda,
-               bool sensorToScene, Ray& outLocal) const {
+               bool sensorToScene, Ray& outLocal, bool clip = true) const {
         Vec3 o = o0, d = normalize(d0);
         int M = (int)surf.size();
         if (sensorToScene) {
             for (int j = M - 1; j >= 0; --j) {
                 Vec3 hp, n;
-                if (!hitSurface(j, o, d, hp, n)) return false;
+                if (!hitSurface(j, o, d, hp, n, clip)) return false;
                 o = hp;
                 if (surf[j].radius != 0.0) {
                     double eta = iorSensorSide(j, lambda) / iorSceneSide(j, lambda);
@@ -160,7 +161,7 @@ struct LensSystem {
         } else {
             for (int j = 0; j < M; ++j) {
                 Vec3 hp, n;
-                if (!hitSurface(j, o, d, hp, n)) return false;
+                if (!hitSurface(j, o, d, hp, n, clip)) return false;
                 o = hp;
                 if (surf[j].radius != 0.0) {
                     double eta = iorSceneSide(j, lambda) / iorSensorSide(j, lambda);
@@ -193,7 +194,7 @@ struct LensSystem {
             d = Vec3(0.0, 0.0, -1.0);
         }
         Ray out;
-        if (!trace(o, d, lambdaD, /*sensorToScene=*/false, out)) return;   // keep default
+        if (!trace(o, d, lambdaD, /*sensorToScene=*/false, out, /*clip=*/false)) return;   // keep default
         if (std::fabs(out.d.x) < 1e-12) return;
         double t = -out.o.x / out.d.x;                    // where the ray crosses the axis
         double zCross = out.o.z + out.d.z * t;            // paraxial image plane z
@@ -323,26 +324,72 @@ struct LensSystem {
         return true;
     }
 
-    // How wide a beam from the scene surface j's aperture admits, per unit of that aperture:
-    // a ray parallel to the axis at height h0 reaches surface j at height y_j (paraxially, at
-    // the design wavelength), so an aperture of radius a there makes an entrance pupil of
-    // radius a * h0 / y_j. Returns h0 / y_j, or 0 if the probe is lost before j.
-    double entrancePupilScale(int j) const {
+    // How wide a beam from the scene each surface's aperture admits, per unit of that
+    // aperture: a ray parallel to the axis at height h0 reaches surface j at height y_j
+    // (paraxially, at the design wavelength, apertures ignored), so an aperture of radius a
+    // there makes an entrance pupil of radius a * h0 / y_j. Element j of the result is
+    // h0 / y_j, or 0 where the probe misses the sphere or crosses the axis.
+    std::vector<double> entrancePupilScales() const {
         const double lambdaD = 587.6;
-        const double h0 = 1e-3 * std::max(1e-3, surf[0].aperture);
+        std::vector<double> out(surf.size(), 0.0);
+        const double h0 = 1e-3 * std::max(1e-3, surf.empty() ? 1.0 : surf[0].aperture);
         Vec3 o(h0, 0.0, T + 1.0), d(0.0, 0.0, -1.0);
-        for (int i = 0; i <= j; ++i) {
+        for (int j = 0; j < (int)surf.size(); ++j) {
             Vec3 hp, n;
-            if (!hitSurface(i, o, d, hp, n)) return 0.0;
-            if (i == j) return std::fabs(hp.x) > 1e-15 ? h0 / std::fabs(hp.x) : 0.0;
+            if (!hitSurface(j, o, d, hp, n, /*clip=*/false)) break;
+            if (std::fabs(hp.x) > 1e-15) out[(size_t)j] = h0 / std::fabs(hp.x);
             o = hp;
-            if (surf[i].radius != 0.0) {
+            if (surf[j].radius != 0.0) {
                 Vec3 nd;
-                if (!refractDir(d, n, iorSceneSide(i, lambdaD) / iorSensorSide(i, lambdaD), nd)) return 0.0;
+                if (!refractDir(d, n, iorSceneSide(j, lambdaD) / iorSensorSide(j, lambdaD), nd)) break;
                 d = nd;
             }
         }
-        return 0.0;
+        return out;
+    }
+    // The aperture stop: the first surface marked `stop`, else the surface whose entrance pupil
+    // is smallest (the textbook definition). -1 for an empty lens.
+    int stopIndex() const {
+        for (int j = 0; j < (int)surf.size(); ++j) if (surf[j].isStop) return j;
+        const std::vector<double> sc = entrancePupilScales();
+        int stop = surf.empty() ? -1 : 0;
+        double best = 1e300;
+        for (int j = 0; j < (int)surf.size(); ++j)
+            if (sc[(size_t)j] > 0.0 && surf[j].aperture * sc[(size_t)j] < best) {
+                best = surf[j].aperture * sc[(size_t)j];
+                stop = j;
+            }
+        return stop;
+    }
+    // Scale the whole prescription (radii, gaps, apertures) so its focal length is exactly
+    // `focalMM`: a lens scales without changing its form, its f-number or its aberrations'
+    // shapes. Leaves it alone if either focal length is not positive.
+    void scaleToFocal(double focalMM) {
+        const double f0 = focalLengthMM();
+        if (!(f0 > 0.0 && focalMM > 0.0)) return;
+        const double k = focalMM / f0;
+        for (LensSurface& sf : surf) { sf.radius *= k; sf.thickness *= k; sf.aperture *= k; }
+        finalize();
+    }
+    // The paraxial f-number: focal length over the stop's entrance pupil diameter. 0 if it
+    // cannot be measured.
+    double fNumber() const {
+        const int stop = stopIndex();
+        if (stop < 0) return 0.0;
+        const double sc = entrancePupilScales()[(size_t)stop], f = focalLengthMM();
+        const double d = 2.0 * surf[stop].aperture * sc;
+        return (d > 0.0 && f > 0.0) ? f / d : 0.0;
+    }
+    // Size the stop so the lens works at f/`fstop`, but no wider than `maxAperture` (mm) when
+    // that is positive. Leaves the lens alone if the f-number cannot be measured.
+    void setFNumber(double fstop, double maxAperture = 0.0) {
+        const int stop = stopIndex();
+        if (stop < 0 || !(fstop > 0.0)) return;
+        const double sc = entrancePupilScales()[(size_t)stop], f = focalLengthMM();
+        if (!(sc > 0.0 && f > 0.0)) return;
+        double a = f / (2.0 * fstop) / sc;
+        if (maxAperture > 0.0) a = std::min(a, maxAperture);
+        surf[stop].aperture = a;
     }
 
     // Effective focal length (mm), measured from a near-axis parallel probe at the
@@ -350,10 +397,13 @@ struct LensSystem {
     double focalLengthMM() const {
         if (surf.empty()) return 0.0;
         const double lambdaD = 587.6;
-        double h = std::fmax(0.05, 0.02 * rearAperture());
+        // A probe height that is paraxial (1e-4 of the front aperture: spherical aberration
+        // moves a finite ray's focal length off the lens's) and does not depend on any aperture
+        // a generator resizes afterwards, so measuring before and after it agree.
+        const double h = 1e-4 * std::fmax(1e-3, surf[0].aperture);
         Vec3 o(h, 0.0, T + 1.0), d(0.0, 0.0, -1.0);
         Ray out;
-        if (!trace(o, d, lambdaD, /*sensorToScene=*/false, out)) return 0.0;
+        if (!trace(o, d, lambdaD, /*sensorToScene=*/false, out, /*clip=*/false)) return 0.0;
         double slope = -out.d.x / out.d.z;                // dx/dz of the emergent ray
         if (std::fabs(slope) < 1e-12) return 0.0;
         return std::fabs(h / slope);                      // report the magnitude (mm)
@@ -638,7 +688,7 @@ inline double pupilImageZ(const LensSystem& L, double z0, int j0, int dj, double
     Vec3 o(0.0, 0.0, z0), d(std::sin(ang), 0.0, dj < 0 ? std::cos(ang) : -std::cos(ang));
     for (int j = j0; j >= 0 && j < M; j += dj) {
         Vec3 hp, n;
-        if (!L.hitSurface(j, o, d, hp, n)) return NAN;
+        if (!L.hitSurface(j, o, d, hp, n, /*clip=*/false)) return NAN;
         o = hp;
         if (L.surf[j].radius != 0.0) {
             const double eta = (dj < 0) ? L.iorSensorSide(j, lambda) / L.iorSceneSide(j, lambda)
@@ -688,21 +738,7 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
     const double racc = std::sqrt(racc2);
     auto P = std::make_shared<LensPupil>();
     const double lamD = 587.6;
-    // The stop: the marked one, else the surface whose paraxial entrance pupil (its aperture
-    // scaled by the height a ray parallel to the axis keeps from the scene to it) is smallest,
-    // the textbook definition.
-    int stop = -1;
-    for (int j = 0; j < M; ++j) if (L.surf[j].isStop) { stop = j; break; }
-    if (stop < 0) {
-        double best = 1e300;
-        for (int j = 0; j < M; ++j) {
-            const double sc = L.entrancePupilScale(j);
-            if (!(sc > 0.0)) continue;
-            const double rep = L.surf[j].aperture * sc;
-            if (rep < best) { best = rep; stop = j; }
-        }
-        if (stop < 0) stop = 0;
-    }
+    const int stop = std::max(L.stopIndex(), 0);   // marked, else the smallest entrance pupil
     P->lens = &L;
     P->stop = stop;
     P->racc2 = racc2;
@@ -864,10 +900,11 @@ inline std::shared_ptr<const LensPupil> lensPupilFor(const std::shared_ptr<LensS
 
 // ---------------------------------------------------------------------------
 // Generators — build a lens prescription from high-level parameters. All lengths
-// in millimetres. These are physically derived (lensmaker / achromat equations),
-// not fabricated data, so the focal length and (for the achromat) the chromatic
-// correction are correct by construction; dispersion during rendering comes from
-// the real Sellmeier glass indices.
+// in millimetres. The singlet and the achromat are physically derived (lensmaker /
+// achromat equations), not fabricated data, so the focal length and (for the
+// achromat) the chromatic correction are correct by construction; dispersion during
+// rendering comes from the real Sellmeier glass indices. The double Gauss is the
+// other kind: a published prescription (makeDoubleGauss), scaled and stopped down.
 // ---------------------------------------------------------------------------
 
 // Abbe number V_d = (n_d - 1)/(n_F - n_C) from a Sellmeier index function.
@@ -877,6 +914,23 @@ inline double abbeNumber(const Spectrum& ior) {
     return (std::fabs(den) < 1e-9) ? 0.0 : (nd - 1.0) / den;
 }
 
+// How much thicker an element is at height `ap` than on the axis, from its front and rear
+// radii (this frame's convention: centre at vertex + radius). Each surface departs from its
+// vertex plane by its sag, toward the sensor when its centre is behind it (R < 0). A
+// generator gives an element centre thickness `edgeMin - lensEdgeGain(...)` at least, so the
+// two faces never cross inside the clear aperture: past where they would, rays pass outside
+// the glass and are lost, silently narrowing the lens.
+inline double lensEdgeGain(double Rfront, double Rrear, double ap) {
+    auto delta = [ap](double R) {
+        if (R == 0.0) return 0.0;
+        const double a = std::fabs(R);
+        const double sag = (ap < a) ? a - std::sqrt(a * a - ap * ap) : a;
+        return (R < 0.0) ? -sag : sag;
+    };
+    return delta(Rfront) - delta(Rrear);
+}
+inline double lensEdgeMin(double ap) { return std::fmax(0.8, 0.08 * ap); }
+
 // A single biconvex glass singlet of focal length `focalMM` at f/`fstop`. The clear
 // semi-diameter (= focal/(2*fstop)) doubles as the aperture stop. Strong spherical
 // and chromatic aberration on purpose — the simplest "real lens".
@@ -885,7 +939,8 @@ inline LensSystem makeSinglet(double focalMM, double fstop, const Spectrum& glas
     double f  = focalMM;
     double R  = 2.0 * (nd - 1.0) * f;                     // equiconvex: 1/f=(n-1)(2/R)
     double semi = std::fmax(1.0, f / (2.0 * std::fmax(0.5, fstop)));
-    double ct = std::fmax(1.5, 0.12 * semi);              // a plausible centre thickness
+    // A plausible centre thickness, and at least enough for an edge at the clear aperture.
+    double ct = std::fmax(std::fmax(1.5, 0.12 * semi), lensEdgeMin(semi) - lensEdgeGain(-R, +R, semi));
     LensSystem L; L.name = "singlet";
     // The lensmaker radii above are in the object->image sign convention; our lens
     // frame stores curvature as `centre = vertex + radius` with +z toward the scene
@@ -894,6 +949,10 @@ inline LensSystem makeSinglet(double focalMM, double fstop, const Spectrum& glas
     L.surf.push_back({ -R, ct,  glass,            semi });   // front (convex toward scene)
     L.surf.push_back({ +R, f,   iorConstant(1.0), semi });   // back; rear gap ~ f (autofocus refines)
     L.finalize();
+    // The lensmaker equation is the thin lens's: the thickness moves the focal length off it,
+    // so scale to the one asked for; then size the stop (the front surface) for f/fstop.
+    L.scaleToFocal(focalMM);
+    L.setFNumber(fstop);
     L.focusAt(0.0);
     return L;
 }
@@ -927,17 +986,26 @@ inline LensSystem makeAchromat(double focalMM, double fstop,
     // doublet actually converges.
     R1 = -R1; R2 = -R2; R4 = -R4;
     double semi = std::fmax(1.5, f / (2.0 * std::fmax(0.5, fstop)));
-    double ct1 = std::fmax(2.0, 0.16 * semi);            // crown centre thickness
-    double ct2 = std::fmax(1.2, 0.08 * semi);            // flint centre thickness
+    const double ap = semi * 1.05;                       // the elements' clear semi-aperture
+    // Centre thicknesses: plausible, and at least enough for an edge at the clear aperture (an
+    // f/2.8 crown at 2 mm had its faces cross at 7.7 mm off axis, inside its 9.4 mm aperture).
+    double ct1 = std::fmax(std::fmax(2.0, 0.16 * semi), lensEdgeMin(ap) - lensEdgeGain(R1, R2, ap));
+    double ct2 = std::fmax(std::fmax(1.2, 0.08 * semi), lensEdgeMin(ap) - lensEdgeGain(R2, R4, ap));
     double gap = std::fmax(1.0, 0.5 * semi);             // stop stand-off
     LensSystem L; L.name = "achromat";
-    L.surf.push_back({ R1, ct1, crown,            semi * 1.05 });          // crown front
-    L.surf.push_back({ R2, ct2, flint,            semi * 1.05 });          // cemented crown/flint
-    L.surf.push_back({ R4, gap, iorConstant(1.0), semi * 1.05 });          // flint rear -> air
+    L.surf.push_back({ R1, ct1, crown,            ap });          // crown front
+    L.surf.push_back({ R2, ct2, flint,            ap });          // cemented crown/flint
+    L.surf.push_back({ R4, gap, iorConstant(1.0), ap });          // flint rear -> air
     LensSurface stop; stop.radius = 0.0; stop.thickness = f; stop.ior = iorConstant(1.0);
     stop.aperture = semi; stop.isStop = true;
     L.surf.push_back(stop);                                                 // diaphragm, rear gap ~ f
     L.finalize();
+    // The power split is the thin-lens one: the thicknesses move the focal length off it, so
+    // scale to the one asked for. Then the stop: it sits behind the converging doublet, which
+    // narrows the beam on its way there, so it is sized through its pupil magnification for an
+    // entrance pupil of exactly f/2N, which every element's aperture clears.
+    L.scaleToFocal(focalMM);
+    L.setFNumber(fstop);
     L.focusAt(0.0);
     return L;
 }
@@ -971,15 +1039,8 @@ inline LensSystem makeDoubleGauss(double focalMM, double fstop) {
         L.surf.push_back(s);
     }
     L.finalize();
-    const double f0 = L.focalLengthMM();
-    const double k = (f0 > 0.0 && focalMM > 0.0) ? focalMM / f0 : 1.0;
-    for (LensSurface& s : L.surf) { s.radius *= k; s.thickness *= k; s.aperture *= k; }
-    L.finalize();
-    // The entrance pupil f/N needs is focal / 2N across; the stop that makes it is that over the
-    // stop's pupil scale.
-    const double sc = L.entrancePupilScale(stop);
-    const double want = (sc > 0.0 && fstop > 0.0) ? L.focalLengthMM() / (2.0 * fstop) / sc : L.surf[stop].aperture;
-    L.surf[stop].aperture = std::min(want, L.surf[stop].aperture);
+    L.scaleToFocal(focalMM);
+    L.setFNumber(fstop, /*maxAperture=*/L.surf[stop].aperture);
     L.focusAt(0.0);
     return L;
 }

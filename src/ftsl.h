@@ -8167,21 +8167,30 @@ private:
             std::printf("[ftsl] camera '%s' lens: %d surfaces, radii read as published (pbrt, Zemax, "
                         "patents): positive = centre of curvature on the sensor side. Before 0.394.3 the "
                         "sign was the opposite.\n", cs.name.c_str(), nSurf);
+            if (find(lb, "preset") || find(lb, "glass") || find(lb, "focal") || find(lb, "fstop"))
+                std::printf("[ftsl] camera '%s' lens: the `surface` lines are the lens; its preset, "
+                            "glass, focal and fstop keys have no effect\n", cs.name.c_str());
         } else {
-            // 2) a named preset (singlet/achromat/doublet/telephoto/wide), else default
+            // 2) a named preset (singlet/achromat/doublet/telephoto/wide/dgauss), else default
             //    to an achromatic doublet at the derived focal length + f-number.
             std::string preset = strOf(lb, "preset", "");
             std::string pk;
             for (char c : preset) { if (c==' '||c=='_'||c=='-') continue; pk += (char)std::tolower((unsigned char)c); }
-            if ((pk == "singlet" || pk == "biconvex" || pk == "simple")) {
+            const bool singlet = (pk == "singlet" || pk == "biconvex" || pk == "simple");
+            if (singlet) {
                 Spectrum g;
-                if (!resolveGlassIor((glassName.rfind("glass:",0)==0?glassName.substr(6):glassName), g))
+                if (!resolveGlassIor((glassName.rfind("glass:",0)==0?glassName.substr(6):glassName), g)) {
+                    if (find(lb, "glass"))
+                        std::printf("[ftsl] camera '%s' lens: unknown glass '%s', the singlet uses BK7\n",
+                                    cs.name.c_str(), glassName.c_str());
                     g = defaultGlass("BK7");
+                }
                 *sys = makeSinglet(focalMM, fstop, g);
             } else if (!preset.empty()) {
                 if (!resolveLensPreset(preset, focalMM, fstop, *sys)) {
                     fail("camera '" + cs.name + "' lens: unknown preset '" + preset +
-                         "' (singlet, achromat/doublet, telephoto, wide, dgauss)"); return false;
+                         "' (singlet/biconvex, achromat/doublet, telephoto, wide, dgauss/doublegauss)");
+                    return false;
                 }
             } else {
                 *sys = makeAchromat(focalMM, fstop, defaultGlass("BK7"), defaultGlass("SF10"));
@@ -8190,6 +8199,19 @@ private:
                 fail("camera '" + cs.name + "' lens: an achromat needs two glasses of different "
                      "dispersion"); return false;
             }
+            // Only the singlet is built from the `glass` given; the achromat's BK7/SF10 and the
+            // double Gauss's published indices are part of their designs.
+            if (!singlet && find(lb, "glass"))
+                std::printf("[ftsl] camera '%s' lens: `glass` has no effect on preset '%s' (only the "
+                            "singlet takes one)\n", cs.name.c_str(), preset.empty() ? "achromat" : preset.c_str());
+            // A preset opens no wider than its design (the double Gauss's f/2.03), and its stop
+            // closes no further than its generator's floor: say so when the lens does not work at
+            // the f-number asked for.
+            const double nEff = sys->fNumber();
+            if (nEff > 0.0 && std::fabs(nEff / fstop - 1.0) > 0.005)
+                std::printf("[ftsl] camera '%s' lens: preset '%s' works at f/%.2f, not the f/%.2f asked for "
+                            "(as far as it opens or closes)\n", cs.name.c_str(),
+                            preset.empty() ? "achromat" : preset.c_str(), nEff, fstop);
         }
         // Sensor size from the camera film (default full-frame 36x24 mm).
         sys->filmW_mm = (cs.filmW_mm > 0.0) ? cs.filmW_mm : 36.0;

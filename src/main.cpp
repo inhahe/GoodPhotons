@@ -2907,31 +2907,46 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
     std::printf("[checklens] %s %s\n", preset, pass ? "PASS" : "FAIL");
     return pass;
 }
-// The dgauss preset (makeDoubleGauss) is a published prescription scaled and stopped down:
-// (12) it must come out at the focal length and f-number asked for -- the entrance pupil's
-// diameter focal / N -- and a request wider than the design's f/2 must stop there.
-static bool checkLensDGaussPreset() {
-    auto measure = [](double focal, double fstop, double& f, double& N) {
+// The f-number measured by tracing rather than paraxially: the widest beam parallel to the
+// axis that gets through every aperture, found by bisection on the ray's height. It shares
+// nothing with LensSystem::fNumber / setFNumber but the trace itself.
+static double tracedFNumber(const LensSystem& L) {
+    double lo = 0.0, hi = L.surf[0].aperture;              // nothing past the front rim gets in
+    for (int k = 0; k < 60; ++k) {
+        const double h = 0.5 * (lo + hi);
+        Ray out;
+        if (L.trace(Vec3(h, 0.0, L.T + 1.0), Vec3(0.0, 0.0, -1.0), 587.6, /*sensorToScene=*/false, out)) lo = h;
+        else hi = h;
+    }
+    return lo > 0.0 ? L.focalLengthMM() / (2.0 * lo) : 0.0;
+}
+// (12) The presets work at the focal length and f-number asked for: paraxially to 1e-6, and by
+// the traced widest beam to 2% (the pupil's own aberration). The double Gauss stops at its
+// design's opening when asked wider, and its rows are locked by its native focal length.
+static bool checkLensPresetsFNumber() {
+    bool pass = true;
+    // The double Gauss as published (makeDoubleGauss leaves an unset focal length unscaled):
+    // a row edited by mistake moves its focal length and its widest opening.
+    const LensSystem native = makeDoubleGauss(0.0, 0.5);
+    const double fNative = native.focalLengthMM(), nMax = native.fNumber();
+    const bool okNative = std::fabs(fNative / 50.3582 - 1.0) < 1e-5 && std::fabs(nMax / 2.0302 - 1.0) < 1e-4;
+    std::printf("[checklens] dgauss as published: %.4f mm, opens to f/%.4f %s\n", fNative, nMax,
+                okNative ? "ok" : "WRONG (a row changed?)");
+    pass = pass && okNative;
+    struct Q { const char* preset; double focal, fstop; };
+    for (const Q& q : {Q{"achromat", 50.0, 2.8}, Q{"achromat", 135.0, 5.6}, Q{"singlet", 50.0, 4.0},
+                       Q{"dgauss", 50.0, 2.8}, Q{"dgauss", 35.0, 4.0}, Q{"dgauss", 85.0, 8.0},
+                       Q{"dgauss", 50.0, 2.0}, Q{"dgauss", 50.0, 1.4}}) {
         LensSystem L;
-        if (!resolveLensPreset("dgauss", focal, fstop, L)) return false;
-        int stop = -1;
-        for (int j = 0; j < (int)L.surf.size(); ++j) if (L.surf[j].isStop) stop = j;
-        f = L.focalLengthMM();
-        N = f / (2.0 * L.surf[(size_t)stop].aperture * L.entrancePupilScale(stop));
-        return stop >= 0;
-    };
-    // The design's own widest opening: what any wider request is capped at.
-    double f0, Nmax;
-    if (!measure(50.0, 0.5, f0, Nmax)) { std::printf("[checklens] no dgauss preset\n"); return false; }
-    bool pass = Nmax > 1.9 && Nmax < 2.1;
-    std::printf("[checklens] dgauss preset: the design opens to f/%.4f\n", Nmax);
-    for (const auto& q : {std::array<double, 2>{50.0, 2.8}, {35.0, 4.0}, {85.0, 8.0}, {50.0, 2.0}, {50.0, 1.4}}) {
-        double f, N;
-        if (!measure(q[0], q[1], f, N)) { std::printf("[checklens] no dgauss preset\n"); return false; }
-        const double want = std::max(q[1], Nmax);
-        const bool ok = std::fabs(f / q[0] - 1.0) < 1e-6 && std::fabs(N / want - 1.0) < 1e-6;
-        std::printf("[checklens] dgauss preset asked %g mm f/%g: %.6f mm f/%.4f%s %s\n", q[0], q[1], f, N,
-                    q[1] < Nmax ? " (capped at the design's opening)" : "", ok ? "ok" : "WRONG");
+        if (!resolveLensPreset(q.preset, q.focal, q.fstop, L)) { std::printf("[checklens] no %s\n", q.preset); return false; }
+        const bool capped = std::string(q.preset) == "dgauss" && q.fstop < nMax;
+        const double want = capped ? nMax : q.fstop;
+        const double f = L.focalLengthMM(), nPar = L.fNumber(), nTr = tracedFNumber(L);
+        const bool ok = std::fabs(f / q.focal - 1.0) < 1e-6 && std::fabs(nPar / want - 1.0) < 1e-6 &&
+                        std::fabs(nTr / want - 1.0) < 0.02;
+        std::printf("[checklens] %s asked %g mm f/%g: %.4f mm, f/%.4f paraxial, f/%.4f traced%s %s\n",
+                    q.preset, q.focal, q.fstop, f, nPar, nTr, capped ? " (capped at the design's opening)" : "",
+                    ok ? "ok" : "WRONG");
         pass = pass && ok;
     }
     return pass;
@@ -2946,7 +2961,7 @@ static bool checkLensPhysical() {
     const bool pa = checkLensPhysicalOne("achromat", a);
     const bool ps = checkLensPhysicalOne("singlet", s);
     const bool pd = checkLensPhysicalOne("dgauss f/8", d);
-    const bool pp = checkLensDGaussPreset();
+    const bool pp = checkLensPresetsFNumber();
     return pa && ps && pd && pp;
 }
 

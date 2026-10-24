@@ -6428,9 +6428,17 @@ as the one at fault.
   difference in it (the loader reports it) rather than design a NaN camera. `makeDoubleGauss`
   (preset `dgauss`, 0.397.0) is the one preset that is a published prescription rather than a
   design: pbrt's 50 mm f/2 double Gauss, scaled by focal / its measured focal length, its stop
-  sized through `LensSystem::entrancePupilScale` (the paraxial pupil magnification, which the
-  pupil tables also use to find an unmarked stop) for exactly f/`fstop`, capped at the
-  design's opening; one index per glass, as published, so no dispersion.
+  sized for exactly f/`fstop` and capped at the design's opening (f/2.03); one index per glass,
+  as published, so no dispersion. The paraxial helpers it uses are shared:
+  `LensSystem::entrancePupilScales` (one unclipped probe pass: each surface's pupil
+  magnification), `stopIndex` (the marked stop, else the smallest entrance pupil -- the pupil
+  tables' stop too), `fNumber` and `setFNumber`. Paraxial probes (`focusAt`, `focalLengthMM`, the pupil probes) pass
+  `clip = false` to hitSurface / trace, so a stop smaller than the probe cannot defeat them.
+  All three generators end the same way (0.397.1): elements thick enough for a real edge at
+  their clear aperture (`lensEdgeGain` / `lensEdgeMin`; the achromat's crown had been thinner
+  than its curves), `scaleToFocal` (the singlet's and achromat's formulas are thin-lens ones),
+  then `setFNumber`; `-checklens` (12) checks focal length and f-number for each, the latter
+  also by tracing the widest beam that gets through.
   - **The physical lens in both directions (0.394.0).** `genLensRay` is the camera's own
     direction, film -> glass -> scene (modes R, D, J). Light tracing needs the reverse, and
     three functions provide it, after Hanika & Dachsbacher 2014. `lensEntry` samples a point
