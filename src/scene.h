@@ -3353,7 +3353,7 @@ struct Scene {
     // geometric normals map by the inverse-transpose (toWorld.applyNormal) and the
     // shading normal is re-oriented against the world ray (matching the primitive path).
     static void instanceHitToWorld(const MeshInstance& inst, const Ray& r, Hit& lh) {
-        lh.p  = r.o + r.d * lh.t;                       // world t == local t (see Blas)
+        lh.p  = inst.toWorld.apply(lh.p);              // from the local point (intersectTri says why)
         Vec3 wn  = normalize(inst.toWorld.applyNormal(lh.n));
         Vec3 wng = normalize(inst.toWorld.applyNormal(lh.ng));
         lh.ng = wng;

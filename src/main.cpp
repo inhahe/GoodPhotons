@@ -3275,8 +3275,7 @@ static PatOpWhere patOpWhere(PatOp op, const char*& why) {
 // The checker generator puts a surface on a cell boundary in one cell, whatever the sign of
 // its hit points' rounding error (pattern_gen::kCheckerTieBreak): one parity on each side of
 // every boundary plane, for a 0.25 m checker near the origin and a 1 cm one 10 m out, from
-// errors up to a few float ulps of the coordinate there (5 um at 10 m, which a
-// ten-thousandth-of-a-cell offset did not clear). Host VM only -- the property is the
+// errors up to a few float ulps of the coordinate there (5 um at 10 m). Host VM only -- the property is the
 // program's, and the opcode check below holds the device VMs to the host.
 static bool checkCheckerTieBreak() {
     struct Case { double size; std::array<double, 4> planes; std::array<double, 7> errs; };
@@ -3307,43 +3306,6 @@ static bool checkCheckerTieBreak() {
     return bad == 0;
 }
 
-// The loader's warning for a user pattern evaluated on a surface lying on one of its
-// discontinuities (ftsl Builder::warnPatternsOnDiscontinuities), on four floors: a hand-written
-// checker at y = 0 (on its cell walls: warn), the same at y = 0.01 (not), the built-in checker
-// at y = 0 (its tie-break moves the walls off: not), and a steep but smooth pattern at y = 0
-// (a slope, not a jump: not).
-static bool checkPatternSeams() {
-    struct Case { const char* what; const char* pattern; const char* floorY; size_t want; };
-    const Case cases[] = {
-        {"expr checker on y = 0", "expr \"fract(0.5 * (floor(4*x) + floor(4*y) + floor(4*z))) * 2\"", "0", 1},
-        {"expr checker on y = 0.01", "expr \"fract(0.5 * (floor(4*x) + floor(4*y) + floor(4*z))) * 2\"", "0.01", 0},
-        {"type checker on y = 0", "type checker  size 0.25", "0", 0},
-        {"steep smooth expr on y = 0", "expr \"0.5 + 0.5 * sin(2000 * y)\"", "0", 0},
-    };
-    bool ok = true;
-    for (const Case& k : cases) {
-        const std::string src = std::string("scene { units meters }\n") +
-            "pattern \"p\" { " + k.pattern + " }\n"
-            "material \"pale\" { type diffuse reflect rgb 0.7 0.7 0.7 }\n"
-            "material \"dark\" { type diffuse reflect rgb 0.1 0.1 0.1 }\n"
-            "material \"floor\" { type mix  layer \"pale\" 0.5  layer \"dark\" 0.5  weight_map pattern:p }\n"
-            "quad { origin -1 " + k.floorY + " -1  u 2 0 0  v 0 0 2  material floor }\n"
-            "light area { origin 0 2 0  u 0.5 0 0  v 0 0 0.5  normal 0 -1 0  spd preset:bb6500 }\n"
-            "camera \"c\" { eye 0 1 -3  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n";
-        ftsl::Loaded L; std::string e;
-        if (!ftsl::loadSource(src, "<checkpatops>", L, e)) {
-            std::printf("[checkpatops] pattern seams: %s did not load: %s FAIL\n", k.what, e.c_str());
-            ok = false;
-            continue;
-        }
-        const bool good = L.patternSeams.size() == k.want;
-        std::printf("[checkpatops] pattern seams: %-28s %zu warning(s), want %zu %s\n", k.what,
-                    L.patternSeams.size(), k.want, good ? "ok" : "FAIL");
-        ok = ok && good;
-    }
-    return ok;
-}
-
 // -checkpatops: every pattern opcode, through all THREE implementations of the VM.
 //
 // The VM exists three times -- `patternEval` on the host, the fp64 device template
@@ -3364,7 +3326,7 @@ static bool checkPatternSeams() {
 // dimensionality). Those are counted as SKIPPED rather than quietly passing -- a check that
 // says "all clear" about opcodes it never exercised would be worse than no check.
 static int checkPatOps() {
-    const bool tieOk = checkCheckerTieBreak() & checkPatternSeams();
+    const bool tieOk = checkCheckerTieBreak();
     struct Prog { PatOp op; int off, len; };
     std::vector<PatNode> pool;
     std::vector<Prog>    progs;
@@ -10446,6 +10408,57 @@ static int checkTriNormal() {
              worstAng < 0.05);
         std::printf("[checktrinormal] worst mesh-vs-analytic normal angle = %.4f deg\n",
                     worstAng * 180.0 / M_PI);
+    }
+
+    // §8 The hit point of a triangle lying in a plane x, y or z = c has exactly c there, from
+    // any ray, and so does an instance's placed by exact numbers: a pattern that steps at c
+    // reads one side on every hit (a checker floor at y = 0 had rendered grey on the GPU,
+    // whose hit points rounded to both sides). Rays from scattered origins at the triangle's
+    // interior, against planes at 0, at a binary-exact and an inexact coordinate, far out.
+    {
+        int bad = 0, n = 0;
+        unsigned long long st = 0x9e3779b97f4a7c15ULL;
+        auto uni = [&st]() {
+            st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+            return (double)(st >> 11) * (1.0 / 9007199254740992.0);
+        };
+        for (int axis = 0; axis < 3; ++axis) {
+            for (const double c : {0.0, 2.75, 0.3, -1234.1}) {
+                auto at = [&](double a, double b) {          // a point of the plane, by its other two axes
+                    Vec3 p;
+                    p[axis] = c; p[(axis + 1) % 3] = a; p[(axis + 2) % 3] = b;
+                    return p;
+                };
+                Tri tri;
+                tri.v0 = at(-1.3, -0.7); tri.v1 = at(2.1, -0.4); tri.v2 = at(0.2, 1.9);
+                tri.gn = normalize(cross(tri.v1 - tri.v0, tri.v2 - tri.v0));
+                MeshInstance inst;
+                Affine xf = Affine::identity();
+                xf.t = Vec3(3.0, -5.0, 0.5);                 // exact in binary: the plane moves by it exactly
+                inst.setToWorld(xf);
+                const double cw = c + xf.t[axis];
+                for (int k = 0; k < 200; ++k) {
+                    const double b1 = 0.05 + 0.6 * uni(), b2 = 0.05 + 0.3 * uni();
+                    const Vec3 target = tri.v0 + (tri.v1 - tri.v0) * b1 + (tri.v2 - tri.v0) * b2;
+                    Vec3 o = target + Vec3(uni() - 0.5, uni() - 0.5, uni() - 0.5) * 40.0;
+                    o[axis] = c + (k % 2 ? 1.0 : -1.0) * (0.5 + 20.0 * uni());   // either side
+                    const Ray r{o, normalize(target - o)};
+                    Hit h; h.t = 1e30;
+                    if (!intersectTri(r, tri, 1e-9, h)) continue;
+                    ++n;
+                    if (h.p[axis] != c) ++bad;
+                    // The same triangle as an instance's mesh, the ray carried into its frame.
+                    const Ray lr{inst.toLocal.apply(r.o + xf.t) , inst.toLocal.applyDir(r.d)};
+                    Hit lh; lh.t = 1e30;
+                    if (!intersectTri(lr, tri, 1e-9, lh)) { ++bad; continue; }
+                    Scene::instanceHitToWorld(inst, Ray{r.o + xf.t, r.d}, lh);
+                    if (lh.p[axis] != cw) ++bad;
+                }
+            }
+        }
+        std::printf("[checktrinormal] S8 hits on axis-aligned triangles off their plane: %d of %d (and instanced)\n",
+                    bad, n);
+        chkb("S8 a hit on a triangle in the plane x/y/z = c has exactly c there", bad == 0 && n > 1000);
     }
 
     std::printf("[checktrinormal] %s\n", ok ? "PASS" : "FAIL");

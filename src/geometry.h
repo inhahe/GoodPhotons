@@ -376,7 +376,14 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     double t = T * invDet;
     if (t < tmin || t >= hit.t) return false;
     double b0 = U * invDet, b1 = V * invDet, b2 = W * invDet;   // barycentric of v0,v1,v2
-    hit.t = t; hit.p = r.o + r.d * t; hit.valid = true;
+    // The hit point from the triangle's own vertices, v0 + b1 (v1 - v0) + b2 (v2 - v0), not
+    // from the ray (o + d t): on a surface lying at x, y or z = c every hit then has exactly
+    // c there -- the edge differences are exactly 0 -- so a pattern that steps at c (a
+    // checker floor at y = 0) reads one side on every ray, on both devices, where o + d t
+    // rounds to either side from ray to ray and a pixel averages the two values. The error
+    // also scales with the vertices rather than with the ray's travel. (Not
+    // b0 v0 + b1 v1 + b2 v2: the b's need not sum to exactly 1, which breaks the exactness.)
+    hit.t = t; hit.p = tri.v0 + (tri.v1 - tri.v0) * b1 + (tri.v2 - tri.v0) * b2; hit.valid = true;
     hit.matId = tri.matId; hit.sensorId = tri.sensorId;
     // Barycentric-interpolated UV and shading normal (matches the old M-T convention:
     // b0,b1,b2 == w0,u,v).

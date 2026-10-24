@@ -707,6 +707,7 @@ struct DInstance {
     // toWorld linear part (local -> world for plain DIRECTIONS): transforms the surface
     // tangent for normal mapping on instanced meshes (C6). affDir(Wm, tangent).
     double Wm[9];
+    double Wt[3];   // toWorld's translation: with Wm, a local hit point -> world
     // O3: local curvature (1/length) -> world curvature multiplier, = 1/|det(linear)|^(1/3).
     // Host-precomputed (MeshInstance::curvScale) so the device does no cbrt per hit.
     double curvScale;
@@ -4003,7 +4004,8 @@ __device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const 
     Real t = T * invDet;
     if (t < tmin || t >= hit.t) return false;
     Real b0 = U * invDet, b1 = V * invDet, b2 = W * invDet;   // barycentric of v0,v1,v2
-    hit.t = t; hit.p = ro + rd * t; hit.valid = true;
+    // From the vertices, not the ray (host twin intersectTri says why).
+    hit.t = t; hit.p = tri.v0 + (tri.v1 - tri.v0) * b1 + (tri.v2 - tri.v0) * b2; hit.valid = true;
     hit.matId = tri.matId; hit.sensorId = tri.sensorId;
     hit.u = b0 * tri.uv0.x + b1 * tri.uv1.x + b2 * tri.uv2.x;
     hit.v = b0 * tri.uv0.y + b1 * tri.uv1.y + b2 * tri.uv2.y;
@@ -4335,12 +4337,13 @@ __device__ static bool blasOccluded(const DScene& sc, const DInstance& inst,
 }
 
 // Transform a BLAS-local hit `lh` back into world space for instance `inst` under the
-// world ray (ro,rd). Positions map by the world t (== local t); normals by (toWorld)^-T
-// (Nm); the shading normal is re-oriented against the world ray. Mirrors the host
-// Scene::instanceHitToWorld exactly.
+// world ray (ro,rd). The point maps by toWorld from the local one (taken from the triangle's
+// vertices, so an instance placed by exact numbers keeps a plane's exact coordinate); normals
+// by (toWorld)^-T (Nm); the shading normal is re-oriented against the world ray. Mirrors the
+// host Scene::instanceHitToWorld exactly.
 __device__ static void instanceHitToWorld(const DInstance& inst, const DVec3& ro,
                                           const DVec3& rd, DHit& lh) {
-    lh.p = ro + rd * lh.t;
+    lh.p = affPoint(inst.Wm, inst.Wt, lh.p);
     DVec3 wn  = normalize(affDir(inst.Nm, lh.n));
     DVec3 wng = normalize(affDir(inst.Nm, lh.ng));
     lh.ng = wng;
@@ -21149,6 +21152,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.Nm[3] = inv.m[1]; d.Nm[4] = inv.m[4]; d.Nm[5] = inv.m[7];
         d.Nm[6] = inv.m[2]; d.Nm[7] = inv.m[5]; d.Nm[8] = inv.m[8];
         for (int k = 0; k < 9; ++k) d.Wm[k] = in.toWorld.m[k];   // tangent local->world (C6)
+        d.Wt[0] = in.toWorld.t.x; d.Wt[1] = in.toWorld.t.y; d.Wt[2] = in.toWorld.t.z;
         d.curvScale = in.curvScale;                              // curvature local->world (O3)
         d.blasId = in.blasId; d.matOverride = in.matOverride;
     }
