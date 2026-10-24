@@ -4460,6 +4460,14 @@ paths, including a roughness pattern on a `dielectric` (frosted glass). GPU BDPT
 maps, mix `weight_map` masks, colored glass, and frosted (rough) glass on-device too
 (per-hit point threaded through its MIS kernel).)*
 
+A pattern that steps -- `floor`, `fract`, `%`, `step`, `sign` of a coordinate -- must not
+step exactly where a surface lies, or each hit takes the value of whichever side its
+rounding error falls on: a floor at `y 0` under `floor(4*y)` comes out grey on the GPU,
+which averages the two. The built-in `type checker` keeps its cell walls a thousandth of a
+cell off the round coordinates for this; for any other pattern the loader probes
+each material's surfaces and warns (`[ftsl] warning: material '...' ... lies on a
+discontinuity of the pattern`) when they sit on one.
+
 **Pattern-driven reflectance.** The `reflect` slot takes a pattern as well, and a scalar in
 a *spectral* slot is a per-hit **multiplier** on whatever the slot otherwise holds. Two
 spellings, one mechanism: `reflect pattern:<name>` (or `reflect [0 1](u)`) leaves the

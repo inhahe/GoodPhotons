@@ -3274,27 +3274,74 @@ static PatOpWhere patOpWhere(PatOp op, const char*& why) {
 
 // The checker generator puts a surface on a cell boundary in one cell, whatever the sign of
 // its hit points' rounding error (pattern_gen::kCheckerTieBreak): one parity on each side of
-// every boundary plane, from errors far past the GPU's. Host VM only -- the property is the
+// every boundary plane, for a 0.25 m checker near the origin and a 1 cm one 10 m out, from
+// errors up to a few float ulps of the coordinate there (5 um at 10 m, which a
+// ten-thousandth-of-a-cell offset did not clear). Host VM only -- the property is the
 // program's, and the opcode check below holds the device VMs to the host.
 static bool checkCheckerTieBreak() {
-    const std::vector<PatNode> chk = pattern_gen::checker(0.25);
+    struct Case { double size; std::array<double, 4> planes; std::array<double, 7> errs; };
+    const Case cases[] = {
+        {0.25, {0.0, 0.25, 5.0, -2.0}, {0.0, 1e-12, -1e-12, 1e-7, -1e-7, 2e-6, -2e-6}},
+        {0.01, {10.0, -10.0, 3.0, 0.0}, {0.0, 1e-12, -1e-12, 1e-6, -1e-6, 5e-6, -5e-6}},
+    };
     int bad = 0;
-    for (const double plane : {0.0, 0.25, 5.0, -2.0}) {
-        for (int axis = 0; axis < 3; ++axis) {
-            double first = -1.0;
-            for (const double err : {0.0, 1e-12, -1e-12, 1e-7, -1e-7, 2e-6, -2e-6}) {
-                PatCtx c;
-                c.x = 0.11; c.y = 0.37; c.z = 0.61;           // inside a cell on the other two axes
-                (axis == 0 ? c.x : axis == 1 ? c.y : c.z) = plane + err;
-                const double v = patternEval(chk.data(), (int)chk.size(), c);
-                if (first < 0.0) first = v;
-                else if (v != first) ++bad;
+    for (const Case& k : cases) {
+        const std::vector<PatNode> chk = pattern_gen::checker(k.size);
+        for (const double plane : k.planes) {
+            for (int axis = 0; axis < 3; ++axis) {
+                double first = -1.0;
+                for (const double err : k.errs) {
+                    PatCtx c;
+                    // inside a cell on the other two axes
+                    c.x = 0.43 * k.size; c.y = 0.37 * k.size; c.z = 0.61 * k.size;
+                    (axis == 0 ? c.x : axis == 1 ? c.y : c.z) = plane + err;
+                    const double v = patternEval(chk.data(), (int)chk.size(), c);
+                    if (first < 0.0) first = v;
+                    else if (v != first) ++bad;
+                }
             }
         }
     }
     std::printf("[checkpatops] checker on a cell boundary: %d hit points off by a rounding error "
                 "changed cell %s\n", bad, bad ? "FAIL" : "ok");
     return bad == 0;
+}
+
+// The loader's warning for a user pattern evaluated on a surface lying on one of its
+// discontinuities (ftsl Builder::warnPatternsOnDiscontinuities), on four floors: a hand-written
+// checker at y = 0 (on its cell walls: warn), the same at y = 0.01 (not), the built-in checker
+// at y = 0 (its tie-break moves the walls off: not), and a steep but smooth pattern at y = 0
+// (a slope, not a jump: not).
+static bool checkPatternSeams() {
+    struct Case { const char* what; const char* pattern; const char* floorY; size_t want; };
+    const Case cases[] = {
+        {"expr checker on y = 0", "expr \"fract(0.5 * (floor(4*x) + floor(4*y) + floor(4*z))) * 2\"", "0", 1},
+        {"expr checker on y = 0.01", "expr \"fract(0.5 * (floor(4*x) + floor(4*y) + floor(4*z))) * 2\"", "0.01", 0},
+        {"type checker on y = 0", "type checker  size 0.25", "0", 0},
+        {"steep smooth expr on y = 0", "expr \"0.5 + 0.5 * sin(2000 * y)\"", "0", 0},
+    };
+    bool ok = true;
+    for (const Case& k : cases) {
+        const std::string src = std::string("scene { units meters }\n") +
+            "pattern \"p\" { " + k.pattern + " }\n"
+            "material \"pale\" { type diffuse reflect rgb 0.7 0.7 0.7 }\n"
+            "material \"dark\" { type diffuse reflect rgb 0.1 0.1 0.1 }\n"
+            "material \"floor\" { type mix  layer \"pale\" 0.5  layer \"dark\" 0.5  weight_map pattern:p }\n"
+            "quad { origin -1 " + k.floorY + " -1  u 2 0 0  v 0 0 2  material floor }\n"
+            "light area { origin 0 2 0  u 0.5 0 0  v 0 0 0.5  normal 0 -1 0  spd preset:bb6500 }\n"
+            "camera \"c\" { eye 0 1 -3  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n";
+        ftsl::Loaded L; std::string e;
+        if (!ftsl::loadSource(src, "<checkpatops>", L, e)) {
+            std::printf("[checkpatops] pattern seams: %s did not load: %s FAIL\n", k.what, e.c_str());
+            ok = false;
+            continue;
+        }
+        const bool good = L.patternSeams.size() == k.want;
+        std::printf("[checkpatops] pattern seams: %-28s %zu warning(s), want %zu %s\n", k.what,
+                    L.patternSeams.size(), k.want, good ? "ok" : "FAIL");
+        ok = ok && good;
+    }
+    return ok;
 }
 
 // -checkpatops: every pattern opcode, through all THREE implementations of the VM.
@@ -3317,7 +3364,7 @@ static bool checkCheckerTieBreak() {
 // dimensionality). Those are counted as SKIPPED rather than quietly passing -- a check that
 // says "all clear" about opcodes it never exercised would be worse than no check.
 static int checkPatOps() {
-    const bool tieOk = checkCheckerTieBreak();
+    const bool tieOk = checkCheckerTieBreak() & checkPatternSeams();
     struct Prog { PatOp op; int off, len; };
     std::vector<PatNode> pool;
     std::vector<Prog>    progs;

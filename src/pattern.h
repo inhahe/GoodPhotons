@@ -1837,10 +1837,13 @@ inline std::vector<PatNode> bands(PatOp coord, double freq, double phase) {
 // A surface lying on a cell boundary -- a floor at y = 0, a wall at a multiple of the size --
 // would otherwise take its parity from the sign of each hit point's rounding error, which
 // differs between the CPU and the GPU and from ray to ray: the pixel averages the two cells
-// and the checker vanishes into grey. The offset moves every boundary a ten-thousandth of a
-// cell off the round coordinates, so such a surface sits in one cell for any rounding error
-// smaller than that (25 um for a 0.25 m checker, against the GPU's ~1 um at 10 m).
-inline constexpr double kCheckerTieBreak = 1e-4;
+// and the checker vanishes into grey. The offset moves every boundary a thousandth of a cell
+// off the round coordinates, so such a surface sits in one cell for any rounding error
+// smaller than that: 10 um for a 1 cm checker, against a float hit point's few tenths of a
+// micrometre per metre from the origin -- safe to some 30 m out, and a shift of the pattern no
+// render can show. (A ten-thousandth, 0.398.1, left a 1 cm checker 1 um off, within a few
+// metres of float's reach.)
+inline constexpr double kCheckerTieBreak = 1e-3;
 inline std::vector<PatNode> checker(double size) {
     std::vector<PatNode> o;
     double inv = (size != 0.0) ? 1.0 / size : 1.0;

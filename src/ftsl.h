@@ -849,6 +849,9 @@ struct Loaded {
     // Control points of every authored `camera_curve` (for the in-viewer editor's
     // round-trip load; see AuthoredCurve). Empty for scenes with no curve.
     std::vector<AuthoredCurve> authoredCurves;
+    // One entry per (material, pattern) whose surfaces lie on a discontinuity of the pattern
+    // (Builder::warnPatternsOnDiscontinuities), each also printed as a load warning.
+    std::vector<std::string> patternSeams;
     // The authored `curve` blocks as the GROOM TOOL sees them (0.329.0): every NAMED node at
     // every level -- 0 a strand, 1 a curve of strands, 2 a curve of those, ... -- with its
     // children's names, its placement parameters, and its strands in WORLD space. Recorded
@@ -1370,6 +1373,7 @@ public:
                                                    : L.scene.matNames[kv.first.first]) +
                                               (kv.first.second == ROUTE_J ? " [mode J]" : " [mode D]");
         warnCurvOnFlatGeometry(L);
+        warnPatternsOnDiscontinuities(L);
         // Decide whether any cavity probe rays will ever be fired, and how far.
         setupCavity(L);
         // LAST: collapse repeated subexpressions in every shading-hot program.
@@ -1682,6 +1686,157 @@ public:
                 "vertex normals — regenerate it with `tools/make_mesh.py --smooth`, or "
                 "export with smoothing on.\n",
                 matName[i] ? matName[i]->c_str() : "<unnamed>");
+        }
+    }
+
+    // A pattern evaluated on a surface that lies on one of its own discontinuities -- a floor
+    // at y = 0 under `floor(y * 4)`, a cell wall of a hand-written checker -- takes each hit's
+    // value from the side its rounding error falls on. The CPU's hit points may all round one
+    // way; the GPU's go both ways from ray to ray, so its pixels average the two values (a
+    // checker floor renders grey). The built-in checkers carry a tie-break against exactly
+    // this (pattern_gen::kCheckerTieBreak); a user expression cannot be fixed for its author,
+    // but the case can be found. At points sampled by area on the triangles each material
+    // shades, every pattern of it (or of its mix layers) that reads the position is evaluated
+    // a hair either side of the surface, at eps and at 10 eps (eps 2.5e-7 of the point's
+    // distance from the origin: a couple of float ulps, the GPU hit point's own error, so a
+    // surface farther than that from a step is left alone). A jump reads the same at
+    // both; a slope, ten times more at the second. Where a quarter of the points or more sit on
+    // a jump, the surface lies on a discontinuity: the loader warns, and records it in
+    // L.patternSeams. Instanced meshes are probed through a bounded random subset of their
+    // triangles.
+    void warnPatternsOnDiscontinuities(Loaded& L) {
+        const Scene& sc = L.scene;
+        const size_t nm = sc.mats.size(), np = sc.patterns.size();
+        if (nm == 0 || np == 0) return;
+        // Which patterns read the position: only those can change across a surface.
+        std::vector<char> readsPos(np, 0);
+        bool any = false;
+        std::vector<PatOp> vars;
+        for (size_t i = 0; i < np; ++i) {
+            vars.clear();
+            patternCollectVars(sc.patterns[i].nodes, vars);
+            for (PatOp o : vars)
+                if (o == PatOp::VarX || o == PatOp::VarY || o == PatOp::VarZ || o == PatOp::VarR) {
+                    readsPos[i] = 1; any = true; break;
+                }
+        }
+        if (!any) return;
+        // Each geometry material's (pattern, slot) pairs: its own, and its mix layers' (geometry
+        // names the mix, not its layers), to the depth a nested mix can reach.
+        struct Use { int pat; const char* slot; int owner; };
+        std::vector<std::vector<Use>> uses(nm);
+        auto addOwn = [&](std::vector<Use>& out, int mi) {
+            const Material& m = sc.mats[(size_t)mi];
+            const std::pair<int, const char*> slots[6] = {
+                {m.roughnessPat, "roughness"}, {m.filmThicknessPat, "film thickness"}, {m.mixWeightPat, "weight_map"},
+                {m.reflectPat, "reflect"}, {m.transmitPat, "transmit"}, {m.emitPat, "emit"}};
+            for (const auto& s : slots)
+                if (s.first >= 0 && s.first < (int)np && readsPos[(size_t)s.first]) out.push_back({s.first, s.second, mi});
+        };
+        for (size_t i = 0; i < nm; ++i) {
+            std::vector<int> stack{(int)i};
+            std::vector<char> seen(nm, 0);
+            while (!stack.empty()) {
+                const int mi = stack.back(); stack.pop_back();
+                if (mi < 0 || mi >= (int)nm || seen[(size_t)mi]) continue;
+                seen[(size_t)mi] = 1;
+                addOwn(uses[i], mi);
+                for (int c : sc.mats[(size_t)mi].mixChildren) stack.push_back(c);
+            }
+        }
+        // Up to kPick triangles per material, drawn by area: a weighted reservoir keeping the
+        // largest keys log(u) / area. A splitmix64 stream: deterministic, so is the warning.
+        constexpr size_t kPick = 256;
+        struct Pick { double key, area; Vec3 a, b, c, ua, ub, uc; double curv; };
+        std::vector<std::vector<Pick>> picks(nm);
+        uint64_t st = 0x5eedf00dULL;
+        auto uni = [&st]() {
+            uint64_t z = (st += 0x9E3779B97F4A7C15ULL);
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+            return ((z ^ (z >> 31)) >> 11) * (1.0 / 9007199254740992.0) + 1e-300;
+        };
+        auto heapLess = [](const Pick& x, const Pick& y) { return x.key > y.key; };   // min-heap on key
+        auto offer = [&](int m, const Vec3& a, const Vec3& b, const Vec3& c, const Tri& t, double areaScale) {
+            if (m < 0 || m >= (int)nm || uses[(size_t)m].empty()) return;
+            const double area = 0.5 * length(cross(b - a, c - a)) * areaScale;
+            if (!(area > 0.0)) return;
+            Pick p{std::log(uni()) / area, area, a, b, c, t.uv0, t.uv1, t.uv2, t.curvature};
+            std::vector<Pick>& h = picks[(size_t)m];
+            if (h.size() < kPick) { h.push_back(p); std::push_heap(h.begin(), h.end(), heapLess); return; }
+            if (p.key <= h.front().key) return;
+            std::pop_heap(h.begin(), h.end(), heapLess);
+            h.back() = p;
+            std::push_heap(h.begin(), h.end(), heapLess);
+        };
+        for (const Tri& t : sc.tris) offer(t.matId, t.v0, t.v1, t.v2, t, 1.0);
+        if (!sc.instances.empty()) {
+            // A bounded number of instanced triangles in all, each instance offering a random
+            // subset of its mesh at the area the whole subset stands for.
+            const size_t perInst = std::max<size_t>(1, (size_t)1000000 / sc.instances.size());
+            for (const MeshInstance& mi : sc.instances) {
+                if (mi.blasId < 0 || mi.blasId >= (int)sc.blasList.size()) continue;
+                const std::vector<Tri>& bt = sc.blasList[(size_t)mi.blasId].tris;
+                if (bt.empty()) continue;
+                const size_t n = std::min(perInst, bt.size());
+                for (size_t k = 0; k < n; ++k) {
+                    const Tri& t = (n == bt.size()) ? bt[k] : bt[std::min(bt.size() - 1, (size_t)(uni() * bt.size()))];
+                    offer(mi.matOverride >= 0 ? mi.matOverride : t.matId, mi.toWorld.apply(t.v0),
+                          mi.toWorld.apply(t.v1), mi.toWorld.apply(t.v2), t, (double)bt.size() / (double)n);
+                }
+            }
+        }
+        // Names for the message: materials from the loader's map, patterns from theirs (an
+        // applied material's substituted copies have none).
+        std::vector<const std::string*> matName(nm, nullptr), patName(np, nullptr);
+        for (const auto& kv : matIndex_) if (kv.second >= 0 && kv.second < (int)nm) matName[(size_t)kv.second] = &kv.first;
+        for (const auto& kv : patternIndex_) if (kv.second >= 0 && kv.second < (int)np) patName[(size_t)kv.second] = &kv.first;
+        constexpr int kPoints = 256;
+        for (size_t m = 0; m < nm; ++m) {
+            if (picks[m].empty()) continue;
+            // The points: kPoints over the picked triangles by area (a quad is two triangles).
+            std::vector<double> cdf;
+            double tot = 0.0;
+            for (const Pick& pk : picks[m]) cdf.push_back(tot += pk.area);
+            for (const Use& u : uses[m]) {
+                const Pattern& pat = sc.patterns[(size_t)u.pat];
+                int jumps = 0;
+                for (int k = 0; k < kPoints; ++k) {
+                    const size_t ip = std::min(picks[m].size() - 1,
+                                               (size_t)(std::lower_bound(cdf.begin(), cdf.end(), uni() * tot) - cdf.begin()));
+                    const Pick& pk = picks[m][ip];
+                    double b1 = uni(), b2 = uni();
+                    if (b1 + b2 > 1.0) { b1 = 1.0 - b1; b2 = 1.0 - b2; }
+                    const Vec3 p = pk.a + (pk.b - pk.a) * b1 + (pk.c - pk.a) * b2;
+                    const Vec3 n = normalize(cross(pk.b - pk.a, pk.c - pk.a));
+                    const Vec3 uv = pk.ua + (pk.ub - pk.ua) * b1 + (pk.uc - pk.ua) * b2;
+                    const double eps = 2.5e-7 * std::max(length(p), 1e-3);
+                    auto at = [&](double s) {
+                        PatCtx c = makePatCtx(p + n * s, 0.0, n, uv.x, uv.y, pk.curv, 0.0, 0.0);
+                        bindPatScene(c, sc);
+                        return pat.eval(c);
+                    };
+                    const double d1 = std::fabs(at(eps) - at(-eps)), d10 = std::fabs(at(10.0 * eps) - at(-10.0 * eps));
+                    if (d1 > 1e-9 && d10 < 3.0 * d1) ++jumps;
+                }
+                if (4 * jumps < kPoints) continue;
+                char msg[512];
+                std::snprintf(msg, sizeof msg,
+                    "material '%s' (%s pattern '%s'%s): %d of %d points sampled on its surfaces take "
+                    "different values just either side of them -- the surface lies on a discontinuity of "
+                    "the pattern (where a floor, mod, step or sign steps), so each hit takes the side its "
+                    "rounding error falls on, and the GPU renders the average of the two. Move the surface, "
+                    "or shift the pattern's coordinate a small fraction of a step (`type checker` does this "
+                    "itself)",
+                    matName[m] ? matName[m]->c_str() : "<unnamed>", u.slot,
+                    patName[(size_t)u.pat] ? patName[(size_t)u.pat]->c_str() : "<applied>",
+                    u.owner == (int)m ? "" : (std::string(", from its layer '") +
+                                              (matName[(size_t)u.owner] ? *matName[(size_t)u.owner] : "<unnamed>") +
+                                              "'").c_str(),
+                    jumps, kPoints);
+                std::fprintf(stderr, "[ftsl] warning: %s.\n", msg);
+                L.patternSeams.push_back(msg);
+            }
         }
     }
 

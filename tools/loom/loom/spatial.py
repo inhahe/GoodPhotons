@@ -1255,12 +1255,12 @@ def moire(freq: Union[SpatialExpr, Signal, Number] = 1.0,
     return 0.5 + 0.25 * (sin(freq * X) + sin(f2 * xr))
 
 
-# A ten-thousandth of a checker cell (pi radians), added to each sine's argument of both
+# A thousandth of a checker cell (pi radians), added to each sine's argument of both
 # checkers (this one and material.checker): a surface lying on a cell boundary -- a floor at
 # y = 0, where every sine is 0 -- then sits in one cell instead of taking its sign from each
 # hit point's rounding error, which the GPU averages to grey. ftrace's own `type checker`
 # carries the same tie-break (pattern_gen::kCheckerTieBreak).
-CHECKER_TIE_BREAK = 3.14159e-4
+CHECKER_TIE_BREAK = 3.14159e-3
 
 
 def checker(freq: Union[SpatialExpr, Signal, Number] = 1.0) -> SpatialExpr:

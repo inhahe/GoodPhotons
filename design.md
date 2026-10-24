@@ -7290,6 +7290,22 @@ as the one at fault.
     program and every `Medium::density`/`ior`. CSE preserves the first occurrence of every
     op, so those analyses would still be correct if reordered, but running it last means
     no future analysis has to know that `LdReg` exists.
+  * **Patterns on their own discontinuities.** A surface lying where a pattern steps takes
+    each hit's value from the side its rounding error falls on, and the GPU's hit points
+    round both ways, so its pixels average two values (a `y 0` checker floor rendered grey).
+    `pattern_gen::checker` adds `kCheckerTieBreak` (1e-3 of a cell: 10 um for a 1 cm checker,
+    safe to ~30 m from the origin) inside each floor, so its walls miss round coordinates
+    (0.398.1, widened from 1e-4 in 0.399.2; loom's two checkers carry the same as a phase).
+    A user expression cannot be fixed for its author, so `Builder::warnPatternsOnDiscontinuities`
+    (0.399.2, after `warnCurvOnFlatGeometry`) finds the case: per material, up to 256 points
+    drawn by area (a weighted reservoir of up to 256 triangles over `Scene::tris` and a
+    bounded random subset of instanced triangles, then the points over those by area),
+    every position-reading pattern of it or its mix layers evaluated at +-eps and +-10 eps
+    along the normal (eps = 2.5e-7 of the point's distance from the origin, a couple of
+    float ulps: the GPU hit point's own error); a jump reads the same at both, a slope ten
+    times more. A quarter or more of
+    the points on a jump warns, into `Loaded::patternSeams` too; `-checkpatops` checks four
+    floors.
   * `addFunctionLeaf` now passes the tables too, so a `grid:`-sampling field formula is
     optimized as well. It stays a separate call site because the program is about to be
     appended to a *shared* node pool holding one leaf after another, and the pass requires

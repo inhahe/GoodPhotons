@@ -97,14 +97,19 @@ floor is a `type checker size 0.25` mix at y = 0, exactly on a cell boundary, so
 `floor(y / size)` there is 0 or -1 by the sign of the hit point's rounding error. The CPU's
 hit points happened to round one way; the GPU's went both ways from ray to ray, so every
 pixel averaged two cells and the floor's checker vanished (a pinhole render of the room with
-the floor at y = 0.01 showed it on both). The generator now adds a ten-thousandth of a cell
+the floor at y = 0.01 showed it on both). The generator now adds a thousandth of a cell
 inside each `floor` (`pattern_gen::kCheckerTieBreak`), which puts a surface on a boundary in
-one cell for any rounding error under 25 um at a 0.25 m checker. `-checkpatops` checks it
+one cell for any rounding error under 10 um at a 1 cm checker (0.399.2; 0.398.1's
+ten-thousandth left the camrig scenes' 1 cm resolution cards 1 um off their walls, which the
+seam probe below flagged). `-checkpatops` checks it
 (fails with the offset at 0). Loom's two checkers (`material.checker`, `spatial.checker`:
 `sign(sin x sin y sin z)`, worse still, 0.5 exactly on every boundary and y = 0 always one)
 take the same tie-break as a phase (`spatial.CHECKER_TIE_BREAK`), tested by
-`tests/test_checker_tiebreak.py`. The trap remains open to any user `expr` that floors a
-coordinate a surface lies on; only the built-in checkers are guarded.
+`tests/test_checker_tiebreak.py`. A user `expr` that floors a coordinate a surface lies on
+cannot be fixed for its author; since 0.399.2 the loader finds the case
+(`warnPatternsOnDiscontinuities`: a probe either side of each material's surfaces, a jump
+told from a steep slope by comparing eps with 10 eps) and warns, which `-checkpatops`
+checks on four floors.
 
 ## DONE (2026-10-24, 0.398.0): PRESET-FNUMBER-TRACED — presets let in less light than their f-number; the singlet's rear face trimmed its beam; the pupil tables missed sparse crossings at a fisheye's field edge
 
