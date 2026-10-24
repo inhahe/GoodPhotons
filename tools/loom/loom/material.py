@@ -30,6 +30,7 @@ from .mathnd import Mat
 from .ftsl_emit import EmitCtx, num, fmt
 from .scene import Element, Material, Pattern
 from .iso import _mat3_at, _coord_expr
+from .spatial import CHECKER_TIE_BREAK
 
 # A pattern template: coordinate expression strings -> a scalar ftsl formula.
 PatternFn = Callable[[str, str, str], str]
@@ -44,8 +45,11 @@ def waves(cx: str, cy: str, cz: str) -> str:
     return f"0.5+0.5*sin({cx})"
 
 def checker(cx: str, cy: str, cz: str) -> str:
-    """A 3-D checkerboard in [0, 1] (``sign`` of the product of three sines)."""
-    return f"0.5+0.5*sign(sin({cx})*sin({cy})*sin({cz}))"
+    """A 3-D checkerboard in [0, 1] (``sign`` of the product of three sines), each sine's
+    argument shifted by ``spatial.CHECKER_TIE_BREAK`` so a surface on a cell boundary sits
+    in one cell."""
+    t = CHECKER_TIE_BREAK
+    return f"0.5+0.5*sign(sin({cx}+{t})*sin({cy}+{t})*sin({cz}+{t}))"
 
 def rings(cx: str, cy: str, cz: str) -> str:
     """Concentric shells: ``0.5 + 0.5 sin |c|`` in [0, 1]."""

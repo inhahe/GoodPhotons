@@ -3208,7 +3208,33 @@ static PatOpWhere patOpWhere(PatOp op, const char*& why) {
 // is not knowable from the node alone (Grid/Scatter, whose arity is the named table's
 // dimensionality). Those are counted as SKIPPED rather than quietly passing -- a check that
 // says "all clear" about opcodes it never exercised would be worse than no check.
+// The checker generator puts a surface on a cell boundary in one cell, whatever the sign of
+// its hit points' rounding error (pattern_gen::kCheckerTieBreak): one parity on each side of
+// every boundary plane, from errors far past the GPU's. Host VM only -- the property is the
+// program's, and the opcode check below holds the device VMs to the host.
+static bool checkCheckerTieBreak() {
+    const std::vector<PatNode> chk = pattern_gen::checker(0.25);
+    int bad = 0;
+    for (const double plane : {0.0, 0.25, 5.0, -2.0}) {
+        for (int axis = 0; axis < 3; ++axis) {
+            double first = -1.0;
+            for (const double err : {0.0, 1e-12, -1e-12, 1e-7, -1e-7, 2e-6, -2e-6}) {
+                PatCtx c;
+                c.x = 0.11; c.y = 0.37; c.z = 0.61;           // inside a cell on the other two axes
+                (axis == 0 ? c.x : axis == 1 ? c.y : c.z) = plane + err;
+                const double v = patternEval(chk.data(), (int)chk.size(), c);
+                if (first < 0.0) first = v;
+                else if (v != first) ++bad;
+            }
+        }
+    }
+    std::printf("[checkpatops] checker on a cell boundary: %d hit points off by a rounding error "
+                "changed cell %s\n", bad, bad ? "FAIL" : "ok");
+    return bad == 0;
+}
+
 static int checkPatOps() {
+    const bool tieOk = checkCheckerTieBreak();
     struct Prog { PatOp op; int off, len; };
     std::vector<PatNode> pool;
     std::vector<Prog>    progs;
@@ -3300,12 +3326,13 @@ static int checkPatOps() {
                 progs.size(), unknownArity, exempt);
     if (!haveDev) {
         std::printf("[checkpatops] no CUDA device: host VM only, device twins SKIPPED\n");
-        std::printf("[checkpatops] PASS (host only)\n");
-        return 0;
+        std::printf("[checkpatops] %s (host only)\n", tieOk ? "PASS" : "FAIL");
+        return tieOk ? 0 : 1;
     }
     std::printf("[checkpatops] device fp64 mismatches %d, fp32 mismatches %d\n", bad64, bad32);
-    std::printf("[checkpatops] %s\n", (bad64 || bad32) ? "FAIL" : "PASS");
-    return (bad64 || bad32) ? 1 : 0;
+    const bool ok = tieOk && !bad64 && !bad32;
+    std::printf("[checkpatops] %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
 }
 
 // -checkndgpu: the resident N-D complex re-projected on the GPU must agree with the warp

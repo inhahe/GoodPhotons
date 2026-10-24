@@ -4436,7 +4436,7 @@ or a native-primitive wrap — see below), the **mean curvature `curv`** (see
   | `axis`    | `axis <x\|y\|z>` `[scale]` `[offset]` | a coordinate ramp |
   | `radial`  | `[center <x y z>]` `[scale]` | distance from a point |
   | `bands`   | `axis <x\|y\|z>` `[freq]` `[phase]` | `0.5+0.5·sin(2π·freq·coord+phase)` stripes |
-  | `checker` | `[size]` | 0/1 world-space checkerboard |
+  | `checker` | `[size]` | 0/1 world-space checkerboard; a surface on a cell boundary (a floor at `y 0`) sits in one cell, on CPU and GPU alike (before 0.398.1 the GPU averaged it to grey) |
   | `noise`   | `[freq]` | deterministic value noise in [0,1] (CPU/GPU bit-identical) |
   | `field`   | `[scale]` | the raw implicit field value `f`, scaled |
 

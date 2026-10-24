@@ -1832,13 +1832,24 @@ inline std::vector<PatNode> bands(PatOp coord, double freq, double phase) {
 }
 
 // checker: 3-D checkerboard parity in {0,1} at the given cell size.
-// value = mod(floor(x/s)+floor(y/s)+floor(z/s), 2)
+// value = mod(floor(x/s + e)+floor(y/s + e)+floor(z/s + e), 2), e = kCheckerTieBreak
+//
+// A surface lying on a cell boundary -- a floor at y = 0, a wall at a multiple of the size --
+// would otherwise take its parity from the sign of each hit point's rounding error, which
+// differs between the CPU and the GPU and from ray to ray: the pixel averages the two cells
+// and the checker vanishes into grey. The offset moves every boundary a ten-thousandth of a
+// cell off the round coordinates, so such a surface sits in one cell for any rounding error
+// smaller than that (25 um for a 0.25 m checker, against the GPU's ~1 um at 10 m).
+inline constexpr double kCheckerTieBreak = 1e-4;
 inline std::vector<PatNode> checker(double size) {
     std::vector<PatNode> o;
     double inv = (size != 0.0) ? 1.0 / size : 1.0;
-    pushOp(o, PatOp::VarX); pushConst(o, inv); pushOp(o, PatOp::Mul); pushOp(o, PatOp::Floor);
-    pushOp(o, PatOp::VarY); pushConst(o, inv); pushOp(o, PatOp::Mul); pushOp(o, PatOp::Floor); pushOp(o, PatOp::Add);
-    pushOp(o, PatOp::VarZ); pushConst(o, inv); pushOp(o, PatOp::Mul); pushOp(o, PatOp::Floor); pushOp(o, PatOp::Add);
+    pushOp(o, PatOp::VarX); pushConst(o, inv); pushOp(o, PatOp::Mul);
+    pushConst(o, kCheckerTieBreak); pushOp(o, PatOp::Add); pushOp(o, PatOp::Floor);
+    pushOp(o, PatOp::VarY); pushConst(o, inv); pushOp(o, PatOp::Mul);
+    pushConst(o, kCheckerTieBreak); pushOp(o, PatOp::Add); pushOp(o, PatOp::Floor); pushOp(o, PatOp::Add);
+    pushOp(o, PatOp::VarZ); pushConst(o, inv); pushOp(o, PatOp::Mul);
+    pushConst(o, kCheckerTieBreak); pushOp(o, PatOp::Add); pushOp(o, PatOp::Floor); pushOp(o, PatOp::Add);
     pushConst(o, 2.0); pushOp(o, PatOp::Mod);
     return o;
 }

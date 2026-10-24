@@ -72,6 +72,23 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-10-24, 0.398.1): CHECKER-ON-BOUNDARY — on the GPU a checker on a surface lying on a cell boundary (a floor at y = 0) rendered as flat grey
+
+Found by `tools/check_physlens.py`'s fisheye case: every CPU estimator read the bottom of the
+frame 0.4-0.8% off every GPU one, alternating block by block. `scenes/realcam_fisheye.ftsl`'s
+floor is a `type checker size 0.25` mix at y = 0, exactly on a cell boundary, so
+`floor(y / size)` there is 0 or -1 by the sign of the hit point's rounding error. The CPU's
+hit points happened to round one way; the GPU's went both ways from ray to ray, so every
+pixel averaged two cells and the floor's checker vanished (a pinhole render of the room with
+the floor at y = 0.01 showed it on both). The generator now adds a ten-thousandth of a cell
+inside each `floor` (`pattern_gen::kCheckerTieBreak`), which puts a surface on a boundary in
+one cell for any rounding error under 25 um at a 0.25 m checker. `-checkpatops` checks it
+(fails with the offset at 0). Loom's two checkers (`material.checker`, `spatial.checker`:
+`sign(sin x sin y sin z)`, worse still, 0.5 exactly on every boundary and y = 0 always one)
+take the same tie-break as a phase (`spatial.CHECKER_TIE_BREAK`), tested by
+`tests/test_checker_tiebreak.py`. The trap remains open to any user `expr` that floors a
+coordinate a surface lies on; only the built-in checkers are guarded.
+
 ## DONE (2026-10-24, 0.398.0): PRESET-FNUMBER-TRACED — presets let in less light than their f-number; the singlet's rear face trimmed its beam; the pupil tables missed sparse crossings at a fisheye's field edge
 
 Found while adding the published telephoto, wide-angle and fisheye (0.398.0), by `-checklens`.
