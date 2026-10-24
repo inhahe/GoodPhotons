@@ -48,7 +48,7 @@ def checker(cx: str, cy: str, cz: str) -> str:
     """A 3-D checkerboard in [0, 1] (``sign`` of the product of three sines), each sine's
     argument shifted by ``spatial.CHECKER_TIE_BREAK`` so a surface on a cell boundary sits
     in one cell."""
-    t = CHECKER_TIE_BREAK
+    t = fmt(CHECKER_TIE_BREAK)
     return f"0.5+0.5*sign(sin({cx}+{t})*sin({cy}+{t})*sin({cz}+{t}))"
 
 def rings(cx: str, cy: str, cz: str) -> str:

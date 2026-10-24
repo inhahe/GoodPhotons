@@ -2586,10 +2586,14 @@ static int checkContainer(long long rays) {
     return bad == 0 ? 0 : 1;
 }
 
-// The physical lens traced forward (camera.h lensEntry / lensCatch / lensPdfDir), on two
-// 50 mm lenses: an f/2.8 achromat, whose rear surface is its planar stop, and an f/4 singlet,
-// whose rear surface is curved (genLensRay samples a planar rear's disk but a curved rear's
-// clear cap, and lensPdfDir must follow it). Each claim is one a render could only show as
+// The physical lens traced forward (camera.h lensEntry / lensCatch / lensPdfDir) and its
+// pupil tables, for one lens; checkLensPhysical runs it on a 50 mm f/2.8 achromat, whose rear
+// surface is its planar stop, a 50 mm f/4 singlet, whose rear surface is curved (genLensRay
+// samples a planar rear's disk but a curved rear's clear cap, and lensPdfDir must follow it),
+// pbrt's double Gauss stopped to f/8, where the front element is several times the beam the
+// stop admits (the case the tables are for), and the published telephoto, wide-angle and
+// fisheye as published (fields from 5 to 156 degrees; the test cone and the spread of the
+// off-axis points follow each lens's field). Each claim is one a render could only show as
 // noise:
 //   (1) lensPdfDir is a DENSITY of genLensRay's rays: integrated over front-element area and
 //       exit direction it must equal the share of genLensRay samples the lens does not
@@ -2602,18 +2606,17 @@ static int checkContainer(long long rays) {
 //       times the cell area, averaged; the catch's hit share times the cone's solid angle),
 //       and where they land -- for a point 2 m out and for one 5 km out, which only works if
 //       the entry is solved from near the glass rather than from the scene point.
-// And the pupil table that lets lensEntry aim at the stop (lens.h LensPupil):
-//   (4) it holds every ray that can reach the film: over scene points across and beyond the
-//       field, near and far, every front-sampler ray that lands on the raster falls inside
-//       its point's region, and none comes from a point whose bin rejects -- a miss would
-//       be light the aimed sampler can never draw, a bias no render shows except as a dim
-//       patch;
+// And the pupil tables that let lensEntry and genLensRay aim at the stop (lens.h LensPupil):
+//   (4) the entrance table holds the rays that can reach the film: over scene points across
+//       and beyond the field, near and far, front-sampler rays that land on the raster fall
+//       inside their point's region -- all but a bounded few, since a region found by tracing
+//       cannot be proven complete -- and none comes from a point whose bin rejects;
 //   (5) the density lensEntry draws an aimed leg with is the one lensAimRatio recomputes from
 //       the leg's two ends (BDPT's MIS weighs the light image by the second);
 //   (6) the aimed and the front sampler estimate the same solid angle reaching the sensor,
-//       on and off axis, near and far; their hit rates say what the aiming buys.
-// The third lens is pbrt's 50 mm double Gauss stopped to f/8, where the front element is
-// several times the beam the stop admits: the case the table is for.
+//       on and off axis, near and far; their hit rates say what the aiming buys;
+//   (7)-(9) the exit table's twins of (4)-(6) for camera rays, and (10)-(11) that the tables
+//       are handed to every raster they fit and to no other lens.
 static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
     L.focusAt(2.4);
     Camera cam;
@@ -2627,8 +2630,8 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
     // estimate, capped short of 90 degrees, which also covers a fisheye's 78), and the off-axis
     // points are spread by `kf`, the factor that takes a 50 mm lens's field to this one's.
     const double fMM = cam.lens->focalLengthMM();
-    const double halfDiag = std::sqrt(18.0 * 18.0 + (18.0 * 43.0 / 64.0) * (18.0 * 43.0 / 64.0));
-    const double field = std::min(89.0 * PI / 180.0, 1.3 * std::atan(halfDiag / fMM));
+    const double halfW = 0.5 * cam.lens->filmW_mm, halfH = halfW * 43.0 / 64.0;   // the 64x43 raster's
+    const double field = std::min(89.0 * PI / 180.0, 1.3 * std::atan(std::hypot(halfW, halfH) / fMM));
     const double kf = 50.0 / fMM;
     // (1) normalisation. P(not vignetted) from the camera's own sampling ...
     const int nCam = 400000;
@@ -2814,7 +2817,6 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
         pass = pass && (hit[0] + hit[1] == 0 || z6 < 4.0);
     }
     // The exit side: camera rays. A film point as genLensRay lays one out.
-    const double halfW = 0.5 * CL.filmW_mm, halfH = halfW * 43.0 / 64.0;
     auto filmPoint = [&](double fx, double fy) {        // fx, fy in [0, 1) across the raster
         return Vec3(-(2.0 * fx - 1.0) * halfW, -(2.0 * fy - 1.0) * halfH, CL.filmZ);
     };
@@ -2940,11 +2942,13 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
 // and the beam the lens really lets in (tracedFNumber, the f-number setFNumber sizes the stop
 // for) to 1e-6 -- unless a published lens is asked wider than its design, when it is at the
 // design's own opening, or a fast formula lens's aberration narrows the beam before any stop
-// can let it in, when the stop stays at its paraxial size. No element's faces cross inside its
-// aperture (the formula-built ones keep at least lensEdgeMin, the published ones are as
-// published). A published lens's rows are locked by its native focal length and its paraxial
-// and traced openings, computed apart by an independent (Python) trace of pbrt's rows; the
-// traced one also ties tracedPupilRadius, which the sizing and this check share, to it.
+// can let it in, when its stop is the smallest that admits the widest beam it passes. No
+// element's faces cross inside its aperture (the formula-built ones keep at least lensEdgeMin,
+// the published ones are as published). The sizing (setFNumber, through axialRayPast) and the
+// measure (tracedFNumber, through trace) are separate traces. A published lens's rows are
+// locked by its native focal length and its paraxial and traced openings, computed apart by
+// tools/published_lenses.py, an independent trace of the rows that also checks them against
+// pbrt's files.
 static bool checkLensPresetsFNumber() {
     bool pass = true;
     struct Native { const char* name; double f, nPar, nTr; };
@@ -2991,7 +2995,11 @@ static bool checkLensPresetsFNumber() {
         const bool capped = published && q.fstop < nMax[q.preset];
         const double want = capped ? nMax[q.preset] : q.fstop;
         const double f = L.focalLengthMM(), nPar = L.fNumber(), nTr = L.tracedFNumber(), edge = edgeShare(L);
-        const bool fNumberOk = q.fast ? (nTr > want * (1.0 + 1e-6) && std::fabs(nPar / want - 1.0) < 1e-6)
+        // A lens that cannot let the beam in has the smallest stop that admits the widest one
+        // it passes: a stop 1% wider lets in no more.
+        LensSystem wider = L;
+        wider.surf[(size_t)wider.stopIndex()].aperture *= 1.01;
+        const bool fNumberOk = q.fast ? (nTr > want * (1.0 + 1e-6) && std::fabs(wider.tracedFNumber() / nTr - 1.0) < 1e-9)
                                       : std::fabs(nTr / want - 1.0) < 1e-6;
         const bool ok = std::fabs(f / q.focal - 1.0) < 1e-6 && fNumberOk &&
                         (published ? edge > 0.0 : edge >= 1.0 - 1e-9);
@@ -3107,46 +3115,6 @@ static void bvhStats(const Scene& scene, long long rays) {
                 (double)totNodes / rays, (double)totLeaf / rays, 100.0 * hits / rays);
 }
 
-// Deterministic fluorescence self-test. Forward fluorescence has no analytic image
-// to compare against, so instead we validate the reradiation primitives directly:
-//   (a) the emission sampler is unbiased  -> its mean lambda matches the SPD's;
-//   (b) the branch probabilities are correct -> the re-emission fraction at a
-//       strongly-excited input wavelength equals epsilon*Q (= aEff*Q);
-//   (c) the Stokes shift is physical -> re-emitted lambda' is longer than the
-//       excitation lambda and centred on the emission band.
-// It exercises the same fluoroInteract()/fluoEmitSampler used by the renderer, so a
-// bug in the transport math surfaces here without needing a full render.
-// -checknd: the N-D warp's algebra and combinatorics (ndwarp.h). Deterministic, no
-// scene and no GPU needed. The claims worth pinning down are the ones a reader would
-// otherwise have to take on trust:
-//
-//   * the Givens product really is a rotation (R R^T = I) for several dimensions;
-//   * a zero-filled lift + orthographic projection really IS one 3x3 matrix, and an x-w
-//     rotation really is "scale x by cos t" -- the fact the whole feature is designed
-//     around, and the one that decides whether a user needs a FILL;
-//   * 180 degrees in a mixed plane really does reach the MIRROR image (det = -1), which
-//     is the one thing 4-D rotation buys that 3-D cannot do;
-//   * the prism's 2-skeleton really has 2F + 2E triangles, so an extrusion's cost is
-//     predictable before it is built.
-// -checkpatops: every pattern opcode, through all THREE implementations of the VM.
-//
-// The VM exists three times — `patternEval` on the host, the fp64 device template
-// `dPatternEval`, and `dPatternEvalF`, an FP32 twin that is what the sphere-trace march
-// actually runs. None of their switches has a `default:`, so an opcode one of them has
-// never heard of is neither a compile error nor a crash: the node is skipped, the operand
-// stack is left one short, and the program returns the wrong slot. That is how adding
-// `d4` (0.230.0) left the GPU tracer rendering an isosurface as NOTHING — the field read 0
-// everywhere, and an invisible surface looks like an empty scene rather than a broken
-// shader. It cost a bisect across four backends to localise.
-//
-// So: build a minimal well-formed program per opcode, run it through all three, compare.
-// A skipped opcode changes what is on top of the stack, so it shows up as a mismatch
-// against the host rather than as silence.
-//
-// Arity comes from patOpStackEffect, the VM's own table, which also reports when an arity
-// is not knowable from the node alone (Grid/Scatter, whose arity is the named table's
-// dimensionality). Those are counted as SKIPPED rather than quietly passing — a check that
-// says "all clear" about opcodes it never exercised would be worse than no check.
 static const char* patOpLabel(PatOp op) {
     // varName() names the VARIABLE opcodes (the ones this check exists for); anything
     // else is identified by its enum index, which is all a failure report needs.
@@ -3189,25 +3157,6 @@ static PatOpWhere patOpWhere(PatOp op, const char*& why) {
     }
 }
 
-// -checkpatops: every pattern opcode, through all THREE implementations of the VM.
-//
-// The VM exists three times -- `patternEval` on the host, the fp64 device template
-// `dPatternEval`, and `dPatternEvalF`, an FP32 twin that is what the sphere-trace march
-// actually runs. None of their switches has a `default:`, so an opcode one of them has
-// never heard of is neither a compile error nor a crash: the node is skipped, the operand
-// stack is left one short, and the program returns the wrong slot. That is how adding
-// `d4` (0.230.0) left the GPU tracer rendering an isosurface as NOTHING -- the field read 0
-// everywhere, and an invisible surface looks like an empty scene rather than a broken
-// shader. It cost a bisect across four backends to localise.
-//
-// So: build a minimal well-formed program per opcode, run it through all three, compare.
-// A skipped opcode leaves a different value at the bottom of the stack -- `patternEval`
-// returns `sp > 0 ? st[0] : 0.0` -- so it surfaces as a mismatch rather than as silence.
-//
-// Arity comes from patOpStackEffect, the VM's own table, which also reports when an arity
-// is not knowable from the node alone (Grid/Scatter, whose arity is the named table's
-// dimensionality). Those are counted as SKIPPED rather than quietly passing -- a check that
-// says "all clear" about opcodes it never exercised would be worse than no check.
 // The checker generator puts a surface on a cell boundary in one cell, whatever the sign of
 // its hit points' rounding error (pattern_gen::kCheckerTieBreak): one parity on each side of
 // every boundary plane, from errors far past the GPU's. Host VM only -- the property is the
@@ -3233,6 +3182,25 @@ static bool checkCheckerTieBreak() {
     return bad == 0;
 }
 
+// -checkpatops: every pattern opcode, through all THREE implementations of the VM.
+//
+// The VM exists three times -- `patternEval` on the host, the fp64 device template
+// `dPatternEval`, and `dPatternEvalF`, an FP32 twin that is what the sphere-trace march
+// actually runs. None of their switches has a `default:`, so an opcode one of them has
+// never heard of is neither a compile error nor a crash: the node is skipped, the operand
+// stack is left one short, and the program returns the wrong slot. That is how adding
+// `d4` (0.230.0) left the GPU tracer rendering an isosurface as NOTHING -- the field read 0
+// everywhere, and an invisible surface looks like an empty scene rather than a broken
+// shader. It cost a bisect across four backends to localise.
+//
+// So: build a minimal well-formed program per opcode, run it through all three, compare.
+// A skipped opcode leaves a different value at the bottom of the stack -- `patternEval`
+// returns `sp > 0 ? st[0] : 0.0` -- so it surfaces as a mismatch rather than as silence.
+//
+// Arity comes from patOpStackEffect, the VM's own table, which also reports when an arity
+// is not knowable from the node alone (Grid/Scatter, whose arity is the named table's
+// dimensionality). Those are counted as SKIPPED rather than quietly passing -- a check that
+// says "all clear" about opcodes it never exercised would be worse than no check.
 static int checkPatOps() {
     const bool tieOk = checkCheckerTieBreak();
     struct Prog { PatOp op; int off, len; };
@@ -3480,6 +3448,18 @@ static int checkNdGpu() {
 #endif
 }
 
+// -checknd: the N-D warp's algebra and combinatorics (ndwarp.h). Deterministic, no
+// scene and no GPU needed. The claims worth pinning down are the ones a reader would
+// otherwise have to take on trust:
+//
+//   * the Givens product really is a rotation (R R^T = I) for several dimensions;
+//   * a zero-filled lift + orthographic projection really IS one 3x3 matrix, and an x-w
+//     rotation really is "scale x by cos t" -- the fact the whole feature is designed
+//     around, and the one that decides whether a user needs a FILL;
+//   * 180 degrees in a mixed plane really does reach the MIRROR image (det = -1), which
+//     is the one thing 4-D rotation buys that 3-D cannot do;
+//   * the prism's 2-skeleton really has 2F + 2E triangles, so an extrusion's cost is
+//     predictable before it is built.
 static int checkNd() {
     int fails = 0;
     auto ok = [&](bool cond, const char* what) {
@@ -3690,6 +3670,15 @@ static int checkNd() {
     return fails ? 1 : 0;
 }
 
+// Deterministic fluorescence self-test. Forward fluorescence has no analytic image
+// to compare against, so instead we validate the reradiation primitives directly:
+//   (a) the emission sampler is unbiased  -> its mean lambda matches the SPD's;
+//   (b) the branch probabilities are correct -> the re-emission fraction at a
+//       strongly-excited input wavelength equals epsilon*Q (= aEff*Q);
+//   (c) the Stokes shift is physical -> re-emitted lambda' is longer than the
+//       excitation lambda and centred on the emission band.
+// It exercises the same fluoroInteract()/fluoEmitSampler used by the renderer, so a
+// bug in the transport math surfaces here without needing a full render.
 static int checkFluoro() {
     Material m = makeFluoroMaterial();
 

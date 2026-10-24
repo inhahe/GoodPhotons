@@ -6444,10 +6444,14 @@ as the one at fault.
   aperture at 587.6 nm, by bisection: the real entrance pupil) and `setFNumber`. Since 0.398.0
   `fstop` means the traced f-number -- what designers quote (the published lenses' traced
   openings are their labels, f/2, f/5.6, f/4, where the paraxial ones are up to 4% off by
-  pupil aberration) and what exposure follows: setFNumber bisects the stop's aperture for the
-  smallest one that lets the f/`fstop` beam through, searching up to the cap (or twice the
-  paraxial size), and where no stop does -- the cap, or a fast simple lens whose aberration
-  narrows the beam first -- leaves it at the cap, else the paraxial size. Paraxial probes
+  pupil aberration) and what exposure follows: setFNumber traces the beam's rim ray, the
+  axial ray at height focal / (2 fstop), past every aperture but the stop's
+  (`axialRayPast`) and makes the stop's radius the height it crosses at, no wider than the
+  cap; where the rest of the lens passes no beam that wide (a fast simple lens whose
+  aberration bends its rim rays out), it takes the rim ray of the widest beam it does pass
+  (one bisection with the stop unclipped), so the stop is the smallest that admits it.
+  The sizing and `tracedFNumber`, which measures the result through `trace`, are separate
+  traces. Paraxial probes
   (`focusAt`, `focalLengthMM`, the pupil probes) pass `clip = false` to hitSurface / trace,
   so a stop smaller than the probe cannot defeat them.
   All three generators end in `lensFinishPreset` (0.397.1): thicken any element whose faces
@@ -6456,9 +6460,10 @@ as the one at fault.
   `scaleToFocal` (the singlet's and achromat's formulas are thin-lens ones), `setFNumber`,
   repeated until thickening changes nothing (scaling and the stop move the apertures the
   edges are checked at), then focus. `-checklens` (12) checks focal length, the traced
-  f-number (exact, or the cap's, or for a fast lens the paraxial size kept) and the edges
-  for slow and fast presets; readLens reports a traced opening more than 2% off the f-number
-  asked for.
+  f-number (exact, or the cap's, or for a fast lens one a 1% wider stop does not widen) and
+  the edges for slow and fast presets; readLens reports a traced opening more than 2% off the
+  f-number asked for. `tools/published_lenses.py` re-derives (12)'s locked numbers by its own
+  trace of the rows and, with `--fetch`, checks the rows against pbrt's files.
   - **The physical lens in both directions (0.394.0).** `genLensRay` is the camera's own
     direction, film -> glass -> scene (modes R, D, J). Light tracing needs the reverse, and
     three functions provide it, after Hanika & Dachsbacher 2014. `lensEntry` samples a point

@@ -177,46 +177,19 @@ def main():
     scenes = write_scenes()
     devices = ['cpu'] if a.cpu_only else ['cpu', 'gpu']
     allok = True
+    # Each lens: R on the GPU (else the CPU) the reference; the other device's R and R with the
+    # aiming off (FTRACE_LENS_FRONT) held to it, since R aims its own camera rays too; then
+    # every mode on every device.
     for lens in [s for s in ('achromat', 'singlet') if want(s)]:
         print(f'{lens}:')
-        refdev = 'gpu' if 'gpu' in devices else 'cpu'
-        ref = render(exe, scenes[lens], f'{lens}_R', ['-mode', 'R', '-spp', '4096', '-device', refdev])
-        if ref is None:
-            return 1
-        # R itself aims its camera rays at the exit pupil: the other device's R, and R with the
-        # aiming off (FTRACE_LENS_FRONT), must agree with the reference.
-        for dev, env, label in ((('cpu' if refdev == 'gpu' else None), None, 'R on the CPU'),
-                                (refdev, {'FTRACE_LENS_FRONT': '1'}, f'R on the {refdev.upper()}, unaimed')):
-            if dev is None:
-                continue
-            img = render(exe, scenes[lens], f'{lens}_R_{dev}{"_front" if env else ""}',
-                         ['-mode', 'R', '-spp', '4096', '-device', dev], env=env)
-            allok = (img is not None and compare(label, ref, img, REGIONS, TOL)) and allok
-        for dev in devices:
-            for mode, args in (('A', ['-n', '200000000']), ('B', ['-n', '200000000']),
-                               ('D', ['-spp', '4096'])):
-                img = render(exe, scenes[lens], f'{lens}_{mode}_{dev}', ['-mode', mode, '-device', dev] + args)
-                if img is None:
-                    allok = False
-                    continue
-                allok = compare(f'{mode} on the {dev.upper()}', ref, img, REGIONS, TOL) and allok
+        allok = check_lens(exe, scenes[lens], lens, devices, REGIONS,
+                           (('A', ['-n', '200000000']), ('B', ['-n', '200000000']), ('D', ['-spp', '4096']))) and allok
     if want('dg8'):
-        print('double Gauss at f/8 (front element ~6x the beam):')
-        refdev = 'gpu' if 'gpu' in devices else 'cpu'
-        ref = render(exe, scenes['dg8'], 'dg8_R', ['-mode', 'R', '-spp', '16384', '-device', refdev])
-        if ref is None:
-            return 1
         # Unaimed, R's camera rays use ~5% of the rear element at f/8, hence 16x the samples.
-        if refdev == 'gpu':
-            img = render(exe, scenes['dg8'], 'dg8_R_cpu', ['-mode', 'R', '-spp', '4096', '-device', 'cpu'])
-            allok = (img is not None and compare('R on the CPU', ref, img, REGIONS, TOL)) and allok
-        img = render(exe, scenes['dg8'], f'dg8_R_{refdev}_front', ['-mode', 'R', '-spp', '65536', '-device', refdev],
-                     env={'FTRACE_LENS_FRONT': '1'})
-        allok = (img is not None and compare(f'R on the {refdev.upper()}, unaimed', ref, img, REGIONS, TOL)) and allok
-        for dev in devices:
-            for mode, args in (('A', ['-n', '200000000']), ('D', ['-spp', '4096'])):
-                img = render(exe, scenes['dg8'], f'dg8_{mode}_{dev}', ['-mode', mode, '-device', dev] + args)
-                allok = (img is not None and compare(f'{mode} on the {dev.upper()}', ref, img, REGIONS, TOL)) and allok
+        print('double Gauss at f/8 (front element ~6x the beam):')
+        allok = check_lens(exe, scenes['dg8'], 'dg8', devices, REGIONS,
+                           (('A', ['-n', '200000000']), ('D', ['-spp', '4096'])),
+                           ref_spp=16384, front_spp=65536) and allok
     # The published lenses as published, compared tile by tile (their framings differ). The
     # telephoto's 5-degree field sees the green sphere alone; the wide-angle's retrofocus and
     # the fisheye's 156 degrees bend camera rays far off axis, where the pupil tables' bins for
@@ -231,21 +204,9 @@ def main():
                  ('fish', 'fisheye (10 mm f/4, 156 degrees)', 200000000, 16384))
     for lens, title, nA, sppD in published if want('published') else ():
         print(f'{title}, as published, by tile:')
-        refdev = 'gpu' if 'gpu' in devices else 'cpu'
-        ref = render(exe, scenes[lens], f'{lens}_R', ['-mode', 'R', '-spp', '16384', '-device', refdev])
-        if ref is None:
-            return 1
-        reg = tiles(ref)
-        if refdev == 'gpu':
-            img = render(exe, scenes[lens], f'{lens}_R_cpu', ['-mode', 'R', '-spp', '16384', '-device', 'cpu'])
-            allok = (img is not None and compare('R on the CPU', ref, img, reg, TOL)) and allok
-        img = render(exe, scenes[lens], f'{lens}_R_{refdev}_front', ['-mode', 'R', '-spp', '65536', '-device', refdev],
-                     env={'FTRACE_LENS_FRONT': '1'})
-        allok = (img is not None and compare(f'R on the {refdev.upper()}, unaimed', ref, img, reg, TOL)) and allok
-        for dev in devices:
-            for mode, args in (('A', ['-n', str(nA)]), ('D', ['-spp', str(sppD)])):
-                img = render(exe, scenes[lens], f'{lens}_{mode}_{dev}', ['-mode', mode, '-device', dev] + args)
-                allok = (img is not None and compare(f'{mode} on the {dev.upper()}', ref, img, reg, TOL)) and allok
+        allok = check_lens(exe, scenes[lens], lens, devices, tiles,
+                           (('A', ['-n', str(nA)]), ('D', ['-spp', str(sppD)])),
+                           ref_spp=16384, cpu_spp=16384, front_spp=65536) and allok
     if want('dgp'):
         print('the dgauss preset against its rows pasted as surface lines (mode R):')
         refdev = 'gpu' if 'gpu' in devices else 'cpu'
@@ -260,6 +221,30 @@ def main():
         allok = check_panel(exe, scenes, devices) and allok
     print('PASS' if allok else 'FAIL')
     return 0 if allok else 1
+
+
+def check_lens(exe, scene, name, devices, regions, modes, ref_spp=4096, cpu_spp=4096, front_spp=4096):
+    """One lens scene: R the reference (on the GPU when there is one), R on the CPU and R with
+    the aiming off held to it, then each (mode, args) of `modes` on each device. `regions` is
+    a dict of regions, or a function making them from the reference (tiles). False if anything
+    fails to render or to agree; the caller goes on to the next section either way."""
+    refdev = 'gpu' if 'gpu' in devices else 'cpu'
+    ref = render(exe, scene, f'{name}_R', ['-mode', 'R', '-spp', str(ref_spp), '-device', refdev])
+    if ref is None:
+        return False
+    reg = regions(ref) if callable(regions) else regions
+    ok = True
+    if refdev == 'gpu':
+        img = render(exe, scene, f'{name}_R_cpu', ['-mode', 'R', '-spp', str(cpu_spp), '-device', 'cpu'])
+        ok = (img is not None and compare('R on the CPU', ref, img, reg, TOL)) and ok
+    img = render(exe, scene, f'{name}_R_{refdev}_front', ['-mode', 'R', '-spp', str(front_spp), '-device', refdev],
+                 env={'FTRACE_LENS_FRONT': '1'})
+    ok = (img is not None and compare(f'R on the {refdev.upper()}, unaimed', ref, img, reg, TOL)) and ok
+    for dev in devices:
+        for mode, args in modes:
+            img = render(exe, scene, f'{name}_{mode}_{dev}', ['-mode', mode, '-device', dev] + args)
+            ok = (img is not None and compare(f'{mode} on the {dev.upper()}', ref, img, reg, TOL)) and ok
+    return ok
 
 
 def check_fog(exe, scenes, devices):

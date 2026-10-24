@@ -8179,9 +8179,9 @@ private:
             // 2) a named preset (lens.h resolveLensPreset), else default to an achromatic
             //    doublet at the derived focal length + f-number.
             std::string preset = strOf(lb, "preset", "");
-            std::string pk;
-            for (char c : preset) { if (c==' '||c=='_'||c=='-') continue; pk += (char)std::tolower((unsigned char)c); }
-            const bool singlet = (pk == "singlet" || pk == "biconvex" || pk == "simple");
+            const std::string canon = lensPresetName(preset);
+            const bool singlet = (canon == "singlet");
+            const bool published = lensPresetIsPublished(canon);
             if (singlet) {
                 Spectrum g;
                 if (!resolveGlassIor((glassName.rfind("glass:",0)==0?glassName.substr(6):glassName), g)) {
@@ -8196,7 +8196,6 @@ private:
                 // length without a `focal` of its own -- not the one the camera's field of view
                 // implies, which the formula-built achromat follows -- and its own full opening
                 // without an `fstop`.
-                const bool published = lensPresetIsPublished(lensPresetName(pk));
                 const double f = (published && !find(lb, "focal")) ? 0.0 : focalMM;
                 const double n = (published && !fstopGiven) ? 0.0 : fstop;
                 if (!resolveLensPreset(preset, f, n, *sys)) {
@@ -8223,7 +8222,7 @@ private:
             // below it at any stop size. Say so when the traced opening is more than 2% off what
             // was asked (a published lens asked for nothing is at its own opening).
             const double nTr = sys->tracedFNumber();
-            const bool asked = fstopGiven || !lensPresetIsPublished(lensPresetName(pk));
+            const bool asked = fstopGiven || !published;
             if (asked && nTr > 0.0 && std::fabs(nTr / fstop - 1.0) > 0.02)
                 std::printf("[ftsl] camera '%s' lens: preset '%s' lets in an f/%.2f beam, not the f/%.2f asked for "
                             "(its widest opening, or a fast lens's aberration)\n", cs.name.c_str(),

@@ -1975,7 +1975,9 @@ camera "real" {
   no colour fringing. `scenes/realcam_dgauss.ftsl` pastes the double Gauss's rows as
   `surface` lines, and `scenes/realcam_fisheye.ftsl` looks through the fisheye. Before
   0.398.0 `telephoto` and `wide` were achromats at 135 and 28 mm (`preset achromat focal
-  135` is that lens).
+  135` is that lens), and `dgauss` given no `focal` or `fstop` took the camera's `fov_y`
+  focal length and f/2.8, where it now keeps its own 50.4 mm and opens fully (f/2.02,
+  about twice the light): give it `fstop 2.8` for the old exposure.
 - Or paste an **arbitrary real prescription** as repeated
   `surface <radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop]` lines, front
   (scene side) to rear, in the convention prescriptions are published in (pbrt lens files,

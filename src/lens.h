@@ -405,35 +405,51 @@ struct LensSystem {
         const double r = tracedPupilRadius(), f = focalLengthMM();
         return (r > 0.0 && f > 0.0) ? f / (2.0 * r) : 0.0;
     }
+    // The ray parallel to the axis at height h, traced from the scene at the design wavelength
+    // through every surface, clipped by every aperture but surface `skip`'s. True if it gets
+    // out; `hSkip` is then its distance from the axis where it crosses surface `skip`.
+    bool axialRayPast(double h, int skip, double& hSkip) const {
+        const double lambdaD = 587.6;
+        Vec3 o(h, 0.0, T + 1.0), d(0.0, 0.0, -1.0);
+        hSkip = 0.0;
+        for (int j = 0; j < (int)surf.size(); ++j) {
+            Vec3 hp, n;
+            if (!hitSurface(j, o, d, hp, n, /*clip=*/j != skip)) return false;
+            if (j == skip) hSkip = std::sqrt(hp.x * hp.x + hp.y * hp.y);
+            o = hp;
+            if (surf[j].radius != 0.0) {
+                Vec3 nd;
+                if (!refractDir(d, n, iorSceneSide(j, lambdaD) / iorSensorSide(j, lambdaD), nd)) return false;
+                d = nd;
+            }
+        }
+        return true;
+    }
     // Size the stop so the lens lets in exactly an f/`fstop` beam (tracedFNumber), but open
-    // it no wider than `maxAperture` (mm) when that is positive. The search starts from the
-    // paraxial size and allows up to twice it; when no stop in that range lets the beam in
-    // (the cap, the front rim or a fast lens's aberration limits it first), the stop is left at
-    // the cap, else at the paraxial size, and tracedFNumber says what the lens does. Leaves
-    // the lens alone if the f-number cannot be measured.
+    // it no wider than `maxAperture` (mm) when that is positive. The stop's radius is where the
+    // beam's rim ray, the axial ray at height focal / (2 fstop), crosses it. Where the rest of
+    // the lens passes no beam that wide (the front rim, or a fast lens whose aberration bends
+    // the rim rays out), the stop is the smallest that admits the widest beam it does pass;
+    // tracedFNumber then says what the lens lets in. Leaves the lens alone if the f-number
+    // cannot be measured or nothing gets through.
     void setFNumber(double fstop, double maxAperture = 0.0) {
-        const std::vector<double> sc = entrancePupilScales();
-        const int stop = stopIndex(sc);
+        const int stop = stopIndex();
         if (stop < 0 || !(fstop > 0.0)) return;
         const double f = focalLengthMM();
-        if (!(sc[(size_t)stop] > 0.0 && f > 0.0)) return;
-        const double want = f / (2.0 * fstop);                // the entrance pupil's radius
-        const double paraxial = want / sc[(size_t)stop];
-        double& a = surf[(size_t)stop].aperture;
-        const double hi = (maxAperture > 0.0) ? maxAperture : 2.0 * paraxial;
-        a = hi;
-        if (tracedPupilRadius() < want) {
-            a = (maxAperture > 0.0) ? maxAperture : paraxial;
-            return;
-        }
-        // The beam widens with the stop until something else limits it: the smallest stop
-        // that lets it in.
-        double lo = 0.0, up = hi;
+        if (!(f > 0.0)) return;
+        // The widest axial pencil the lens passes with the stop out of the way, by bisection on
+        // its height (passing is taken to be an interval from the axis out, as tracedPupilRadius
+        // takes it). Nothing past every surface's aperture can get through any of them.
+        double reach = 0.0;
+        for (const LensSurface& sf : surf) reach = std::max(reach, sf.aperture);
+        double lo = 0.0, hi = 4.0 * reach, hStop = 0.0;
         for (int k = 0; k < 60; ++k) {
-            a = 0.5 * (lo + up);
-            if (tracedPupilRadius() >= want) up = a; else lo = a;
+            const double mid = 0.5 * (lo + hi);
+            if (axialRayPast(mid, stop, hStop)) lo = mid; else hi = mid;
         }
-        a = up;
+        const double rim = std::min(f / (2.0 * fstop), lo);
+        if (!(rim > 0.0) || !axialRayPast(rim, stop, hStop)) return;
+        surf[(size_t)stop].aperture = (maxAperture > 0.0) ? std::min(hStop, maxAperture) : hStop;
     }
 
     // Effective focal length (mm), measured from a near-axis parallel probe at the
@@ -530,8 +546,9 @@ struct LensPupilTable {
     double z = 0.0;                      // the plane (mm): the entrance or the exit pupil's
     std::vector<LensPupilCell> cells;
     int nAim = 0, nFront = 0, nNone = 0;
-    long long enlarged = 0;              // uniform rays that got through outside their bin's
-                                         // fitted region, each of which enlarged it
+    long long enlarged = 0;              // rays the build's checks found getting through outside
+                                         // their bin's region, each of which enlarged it (the
+                                         // aimed edge-band ones and the uniform ones together)
     // A crossing uniform in bin c's region, rotated to azimuth (cphi, sphi).
     Vec3 sample(int c, double cphi, double sphi, double u1, double u2) const {
         return pupilRegionSample(cells[c], cphi, sphi, u1, u2, z);
@@ -1111,8 +1128,9 @@ inline LensSystem makeAchromat(double focalMM, double fstop,
     L.finalize();
     // The power split is the thin-lens one: the thicknesses move the focal length off it. The
     // stop sits behind the converging doublet, which narrows the beam on its way there, so
-    // setFNumber sizes it through its pupil magnification, for an entrance pupil of exactly
-    // f/2N, which every element's aperture clears.
+    // setFNumber sizes it where the f/N beam's rim ray crosses it. The elements clear that
+    // beam by 5%; a fast achromat whose aberration bends its rim rays out of them gets the
+    // widest beam they pass instead.
     lensFinishPreset(L, focalMM, fstop);
     return L;
 }
@@ -1161,11 +1179,14 @@ inline const double kLensFisheye[12][4] = {
     {  0.0,     1.4163, 0.0,    6.08 }, { 29.4541,  2.1934, 1.517,  5.96 }, { -5.2265,  0.9714, 1.805,  5.84 },
     {-14.2884,  0.0627, 1.0,    5.96 }, {-22.3726,  0.94,   1.673,  5.96 }, {-15.0404,  0.0,    1.0,    6.52 }};
 
+// A table's entry, its row count taken from the array itself.
+template <std::size_t N>
+constexpr PublishedLens publishedLens(const char* name, const double (&rows)[N][4]) { return { name, rows, (int)N }; }
 inline const PublishedLens kPublishedLenses[] = {
-    { "dgauss",    kLensDGauss,    11 },
-    { "telephoto", kLensTelephoto,  7 },
-    { "wide",      kLensWide,      13 },
-    { "fisheye",   kLensFisheye,   12 },
+    publishedLens("dgauss",    kLensDGauss),
+    publishedLens("telephoto", kLensTelephoto),
+    publishedLens("wide",      kLensWide),
+    publishedLens("fisheye",   kLensFisheye),
 };
 
 // Build a published lens: scaled so its focal length is exactly `focalMM` (<= 0 keeps the
@@ -1198,9 +1219,11 @@ inline const PublishedLens* findPublishedLens(const std::string& key) {
     return nullptr;
 }
 
-// The canonical name of a preset (`k` already lowercased with spaces, '_' and '-' removed):
-// the aliases folded in, "" if unknown.
-inline std::string lensPresetName(const std::string& k) {
+// The canonical name of the preset a scene calls `name` (case, spaces, '_' and '-' ignored;
+// the aliases folded in), "" if unknown.
+inline std::string lensPresetName(const std::string& name) {
+    std::string k;
+    for (char c : name) { if (c == ' ' || c == '_' || c == '-') continue; k += (char)std::tolower((unsigned char)c); }
     if (k == "singlet" || k == "biconvex" || k == "simple") return "singlet";
     if (k == "achromat" || k == "doublet") return "achromat";
     if (k == "dgauss" || k == "doublegauss") return "dgauss";
@@ -1220,9 +1243,7 @@ inline bool lensPresetIsPublished(const std::string& canonical) {
 // Returns false on an unknown name.
 inline bool resolveLensPreset(const std::string& name, double focalMM, double fstop,
                               LensSystem& out) {
-    std::string k;
-    for (char c : name) { if (c == ' ' || c == '_' || c == '-') continue; k += (char)std::tolower((unsigned char)c); }
-    const std::string canon = lensPresetName(k);
+    const std::string canon = lensPresetName(name);
     if (canon.empty()) return false;
     if (const PublishedLens* P = findPublishedLens(canon)) {
         out = makePublishedLens(*P, focalMM, fstop);
