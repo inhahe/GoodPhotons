@@ -263,6 +263,18 @@ inline const Stmt* find(const Block& b, const char* key) {
     for (const auto& s : b.stmts) if (s.key == key) { s.used = true; return &s; }
     return nullptr;
 }
+// The first statement with `key` that holds a block, or the first that holds a value: for a
+// key that names both, like a camera's `lens <mm>` and `lens { ... }`, each read from its own
+// kind whichever comes first (find would hand back whichever is written first, and the other
+// would go unread).
+inline const Stmt* findBlock(const Block& b, const char* key) {
+    for (const auto& s : b.stmts) if (s.key == key && s.val.block) { s.used = true; return &s; }
+    return nullptr;
+}
+inline const Stmt* findValue(const Block& b, const char* key) {
+    for (const auto& s : b.stmts) if (s.key == key && !s.val.block) { s.used = true; return &s; }
+    return nullptr;
+}
 // Mark every statement with `key` as read. `find` only reaches the first one, so
 // the loops that gather a REPEATED key (`point`, `look_point`, `fwd_at`, a light's
 // `spd` stops, …) call this to account for the rest.
@@ -8201,7 +8213,9 @@ private:
         double hmm = (cs.filmH_mm > 0.0) ? cs.filmH_mm : 24.0;
         // `lens`/`fstop` default to the archetype preset's values when one is named, so
         // the preset supplies focal length + aperture unless the block overrides them.
-        double lensMM = dblOf(b, "lens", hasPreset ? preset.lensMM : 0.0);  // focal length in mm
+        const Stmt* lensV = findValue(b, "lens");          // `lens <mm>`, not a `lens { }` block
+        double lensMM = (lensV && !lensV->val.words.empty()) ? num(lensV->val.words[0])
+                                                             : (hasPreset ? preset.lensMM : 0.0);   // focal length in mm
         // `zoom <x>` multiplies the focal length (x>1 = tele/narrower fov; x<1 = wider).
         // It is the animatable "zoom ring" and composes on top of `lens`/`fov_y`.
         double zoom  = dblOf(b, "zoom", 1.0);
@@ -8258,8 +8272,8 @@ private:
     // apertures are millimetres (the lens's own units). Builds the LensSystem, sets
     // the sensor size from the camera film, and autofocuses at `cs.focus`.
     bool readLens(const Block& b, CamSpec& cs) {
-        const Stmt* ls = find(b, "lens");
-        if (!ls || !ls->val.block) return true;    // no lens block (a scalar `lens <mm>` is handled elsewhere)
+        const Stmt* ls = findBlock(b, "lens");
+        if (!ls) return true;                      // no lens block (a scalar `lens <mm>` is readFilmExposure's)
         const Block& lb = *ls->val.block;
 
         double focalMM = (cs.focal > 0.0) ? cs.focal * 1000.0 : 50.0;
@@ -8365,12 +8379,15 @@ private:
                 if (published && !find(lb, "focal")) {
                     std::string keys;
                     int nKeys = 0;
+                    const double fov = dblOf(b, "fov_y", 0.0);
+                    const bool fovFocal = cs.projection == CAM_RECTILINEAR && fov > 0.0 && fov < 179.0;
                     for (const char* k : {"fov_y", "zoom", "preset"})
-                        if (find(b, k)) { keys += std::string(nKeys++ ? ", `" : "`") + k + "`"; }
-                    for (const auto& st : b.stmts)
-                        if (st.key == "lens" && !st.val.block) { keys += nKeys++ ? ", `lens`" : "`lens`"; break; }
+                        if (find(b, k) && (std::strcmp(k, "fov_y") != 0 || fovFocal))
+                            keys += std::string(nKeys++ ? ", `" : "`") + k + "`";
+                    if (findValue(b, "lens")) keys += nKeys++ ? ", `lens`" : "`lens`";
                     const double fOwn = sys->focalLengthMM();
-                    if (nKeys > 0 && fOwn > 0.0 && std::fabs(fOwn / focalMM - 1.0) > 0.01)
+                    if (nKeys > 0 && cs.focal > 0.0 && std::isfinite(focalMM) && focalMM >= 0.1 && fOwn > 0.0 &&
+                        std::fabs(fOwn / focalMM - 1.0) > 0.01)
                         std::printf("[ftsl] camera '%s' lens: preset '%s' keeps its own %.1f mm focal length; the "
                                     "camera's %s %s for %.1f mm, which a real prescription takes only as `focal "
                                     "%.1f` in its lens block\n", cs.name.c_str(), preset.c_str(), fOwn, keys.c_str(),
@@ -8609,6 +8626,7 @@ private:
     bool addCameraOrbit(const Block& b, Loaded& L) {
         std::string base = b.name.empty() ? ("orbit" + std::to_string(L.cameras.size())) : b.name;
         CamSpec shared;
+        shared.name = base;                       // for readLens's messages; each frame renames its copy
         vec3Of(b, "up", shared.up);
         shared.fov = dblOf(b, "fov_y", 40.0);
         shared.aperture = Len(dblOf(b, "aperture", 0.02));
@@ -8724,6 +8742,7 @@ private:
     bool addCameraCurve(const Block& b, Loaded& L) {
         std::string base = b.name.empty() ? ("curve" + std::to_string(L.cameras.size())) : b.name;
         CamSpec shared;
+        shared.name = base;                       // for readLens's messages; each frame renames its copy
         vec3Of(b, "up", shared.up);
         shared.fov = dblOf(b, "fov_y", 40.0);
         shared.aperture = Len(dblOf(b, "aperture", 0.02));
@@ -9097,7 +9116,8 @@ private:
         // per-frame re-derivation starts from the authored baseline (never double-applies).
         double rollConst  = dblOf(b, "roll",  0.0);
         double baseFovDeg = dblOf(b, "fov_y", 40.0);
-        double baseLensMM = dblOf(b, "lens",  0.0);
+        const Stmt* lensV = findValue(b, "lens");          // `lens <mm>`, not a `lens { }` block
+        double baseLensMM = (lensV && !lensV->val.words.empty()) ? num(lensV->val.words[0]) : 0.0;
         double baseZoom   = dblOf(b, "zoom",  1.0);
         double baseFstop  = dblOf(b, "fstop", 0.0);
         double hmm        = (shared.filmH_mm > 0.0) ? shared.filmH_mm : 24.0;
