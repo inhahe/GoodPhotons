@@ -6434,11 +6434,16 @@ as the one at fault.
   magnification), `stopIndex` (the marked stop, else the smallest entrance pupil -- the pupil
   tables' stop too), `fNumber` and `setFNumber`. Paraxial probes (`focusAt`, `focalLengthMM`, the pupil probes) pass
   `clip = false` to hitSurface / trace, so a stop smaller than the probe cannot defeat them.
-  All three generators end the same way (0.397.1): elements thick enough for a real edge at
-  their clear aperture (`lensEdgeGain` / `lensEdgeMin`; the achromat's crown had been thinner
-  than its curves), `scaleToFocal` (the singlet's and achromat's formulas are thin-lens ones),
-  then `setFNumber`; `-checklens` (12) checks focal length and f-number for each, the latter
-  also by tracing the widest beam that gets through.
+  All three generators end in `lensFinishPreset` (0.397.1): thicken any element whose faces
+  come closer than `lensEdgeMin` (8% of the aperture) at its clear aperture
+  (`lensThickenElements`; the achromat's crown had been thinner than its curves),
+  `scaleToFocal` (the singlet's and achromat's formulas are thin-lens ones), `setFNumber`,
+  repeated until thickening changes nothing (scaling and the stop move the apertures the
+  edges are checked at), then focus. The double Gauss's published edges all exceed the
+  minimum, so it is left as published. `-checklens` (12) checks focal length, the paraxial
+  f-number, the edges, and the traced f-number (`tracedFNumber`, the widest beam that gets
+  through) for slow and fast presets; readLens reports a traced opening more than 2% off the
+  f-number asked for.
   - **The physical lens in both directions (0.394.0).** `genLensRay` is the camera's own
     direction, film -> glass -> scene (modes R, D, J). Light tracing needs the reverse, and
     three functions provide it, after Hanika & Dachsbacher 2014. `lensEntry` samples a point

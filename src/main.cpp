@@ -2907,22 +2907,12 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
     std::printf("[checklens] %s %s\n", preset, pass ? "PASS" : "FAIL");
     return pass;
 }
-// The f-number measured by tracing rather than paraxially: the widest beam parallel to the
-// axis that gets through every aperture, found by bisection on the ray's height. It shares
-// nothing with LensSystem::fNumber / setFNumber but the trace itself.
-static double tracedFNumber(const LensSystem& L) {
-    double lo = 0.0, hi = L.surf[0].aperture;              // nothing past the front rim gets in
-    for (int k = 0; k < 60; ++k) {
-        const double h = 0.5 * (lo + hi);
-        Ray out;
-        if (L.trace(Vec3(h, 0.0, L.T + 1.0), Vec3(0.0, 0.0, -1.0), 587.6, /*sensorToScene=*/false, out)) lo = h;
-        else hi = h;
-    }
-    return lo > 0.0 ? L.focalLengthMM() / (2.0 * lo) : 0.0;
-}
-// (12) The presets work at the focal length and f-number asked for: paraxially to 1e-6, and by
-// the traced widest beam to 2% (the pupil's own aberration). The double Gauss stops at its
-// design's opening when asked wider, and its rows are locked by its native focal length.
+// (12) The presets work at the focal length and f-number asked for: paraxially to 1e-6; by the
+// widest beam that really gets through (LensSystem::tracedFNumber, which shares nothing with
+// the paraxial helpers but the trace) to 2% wherever a lens is not fast enough for its own
+// aberration to narrow that beam; and every element keeps a real edge at its final aperture,
+// so no face crosses another inside it. The double Gauss stops at its design's opening when
+// asked wider, and its rows are locked by its native focal length and opening.
 static bool checkLensPresetsFNumber() {
     bool pass = true;
     // The double Gauss as published (makeDoubleGauss leaves an unset focal length unscaled):
@@ -2933,20 +2923,35 @@ static bool checkLensPresetsFNumber() {
     std::printf("[checklens] dgauss as published: %.4f mm, opens to f/%.4f %s\n", fNative, nMax,
                 okNative ? "ok" : "WRONG (a row changed?)");
     pass = pass && okNative;
-    struct Q { const char* preset; double focal, fstop; };
-    for (const Q& q : {Q{"achromat", 50.0, 2.8}, Q{"achromat", 135.0, 5.6}, Q{"singlet", 50.0, 4.0},
-                       Q{"dgauss", 50.0, 2.8}, Q{"dgauss", 35.0, 4.0}, Q{"dgauss", 85.0, 8.0},
-                       Q{"dgauss", 50.0, 2.0}, Q{"dgauss", 50.0, 1.4}}) {
+    // The thinnest edge of any element, as a fraction of what lensEdgeMin asks (>= 1 is right).
+    auto edgeShare = [](const LensSystem& L) {
+        double worst = 1e300;
+        for (int j = 0; j + 1 < (int)L.surf.size(); ++j) {
+            if (L.iorSensorSide(j, 587.6) == 1.0) continue;
+            const double ap = std::max(L.surf[j].aperture, L.surf[j + 1].aperture);
+            const double edge = L.surf[j].thickness + lensEdgeGain(L.surf[j].radius, L.surf[j + 1].radius, ap);
+            worst = std::min(worst, edge / lensEdgeMin(ap));
+        }
+        return worst;
+    };
+    struct Q { const char* preset; double focal, fstop; bool fast; };
+    for (const Q& q : {Q{"achromat", 50.0, 2.8, false}, Q{"achromat", 135.0, 5.6, false},
+                       Q{"achromat", 50.0, 2.0, true}, Q{"achromat", 50.0, 1.4, true},
+                       Q{"singlet", 50.0, 4.0, false}, Q{"singlet", 50.0, 1.4, true},
+                       Q{"singlet", 50.0, 0.8, true},
+                       Q{"dgauss", 50.0, 2.8, false}, Q{"dgauss", 35.0, 4.0, false}, Q{"dgauss", 85.0, 8.0, false},
+                       Q{"dgauss", 50.0, 2.0, false}, Q{"dgauss", 50.0, 1.4, false}}) {
         LensSystem L;
         if (!resolveLensPreset(q.preset, q.focal, q.fstop, L)) { std::printf("[checklens] no %s\n", q.preset); return false; }
         const bool capped = std::string(q.preset) == "dgauss" && q.fstop < nMax;
         const double want = capped ? nMax : q.fstop;
-        const double f = L.focalLengthMM(), nPar = L.fNumber(), nTr = tracedFNumber(L);
+        const double f = L.focalLengthMM(), nPar = L.fNumber(), nTr = L.tracedFNumber(), edge = edgeShare(L);
         const bool ok = std::fabs(f / q.focal - 1.0) < 1e-6 && std::fabs(nPar / want - 1.0) < 1e-6 &&
-                        std::fabs(nTr / want - 1.0) < 0.02;
-        std::printf("[checklens] %s asked %g mm f/%g: %.4f mm, f/%.4f paraxial, f/%.4f traced%s %s\n",
-                    q.preset, q.focal, q.fstop, f, nPar, nTr, capped ? " (capped at the design's opening)" : "",
-                    ok ? "ok" : "WRONG");
+                        (q.fast || std::fabs(nTr / want - 1.0) < 0.02) && edge >= 1.0 - 1e-9;
+        std::printf("[checklens] %s asked %g mm f/%g: %.4f mm, f/%.4f paraxial, f/%.4f traced%s, thinnest "
+                    "edge %.2f of the minimum %s\n", q.preset, q.focal, q.fstop, f, nPar, nTr,
+                    capped ? " (capped at the design's opening)" : (q.fast ? " (fast: aberration narrows it)" : ""),
+                    edge, ok ? "ok" : "WRONG");
         pass = pass && ok;
     }
     return pass;

@@ -20,6 +20,8 @@ same scenes in all of them and compares region means with mode R:
   * pbrt's double Gauss (scenes/realcam_dgauss.ftsl) stopped to f/8, in A and D: its front
     element is several times the beam the stop admits, where the pupil table's aiming, and
     BDPT's weighting of it, carry the image;
+  * `preset dgauss` at its published size and full opening against scenes/realcam_dgauss.ftsl's
+    rows, in R (the preset's copy of the prescription and the parser's reading of it agree);
   * the scene through `preset dgauss` at f/4 in a homogeneous fog, in D against R, and in J
     against J with the aiming turned off (mode J's merges on the camera's first segment
     weigh the aimed light image too, and J itself reads this fog a few per cent off R, lens
@@ -85,7 +87,7 @@ def write_scenes():
              'light area { origin -0.6 0.0 2.0   u 0.9 0 0   v 0 0.8 0   normal 0 0 -1   spd preset:bb6500 }\n'
              'camera "real" { eye 0.0 0.4 -1.6   look_at 0.0 0.4 2.4   up 0 1 0   focus 2.4\n'
              '    film { res 64 43   format full-frame }\n'
-             '    lens { preset achromat  focal 50  fstop 2.8  glass BK7 } }\n')
+             '    lens { preset achromat  focal 50  fstop 2.8 } }\n')
     # pbrt's double Gauss stopped to f/8: its front element is ~6x the beam the stop admits,
     # the case the pupil table aims for (and the one a uniform front-element sampler wastes
     # ~95% of its samples on).
@@ -94,18 +96,24 @@ def write_scenes():
     dg8 = dgauss.replace('8.55   stop', '2.14   stop')
     # Fog through the lens: mode J's merges along the camera's first segment weigh the light
     # image's pick of the camera vertex from the merge point (lensAimRatio), which nothing
-    # surface-only exercises. Through `preset dgauss` at f/4, where the tables aim (the presets
-    # built from formulas fill their own beam, so they keep the unaimed samplers) and the
-    # unaimed comparison is still quiet enough.
+    # surface-only exercises. Through `preset dgauss` at f/4, where the tables aim over the whole
+    # field (the achromat now fills its beam on axis, so it aims only off axis and none of its
+    # camera rays) and the unaimed comparison is still quiet enough.
     lens_block = src[src.index('    lens {'):src.index('    }', src.index('    lens {')) + 5]
     fog = (src.replace(lens_block, '    lens { preset dgauss  focal 50  fstop 4 }') +
            '\nmedium { sigma_t 0.15   albedo 0.8   g 0.0 }\n')
+    # The built-in double Gauss at the published size and full opening, against the same rows
+    # pasted as `surface` lines: makeDoubleGauss's copy of the rows, and readLens's reading of
+    # them, have to describe one lens.
+    dgp = dgauss[:dgauss.index('    lens {')] + '    lens { preset dgauss  focal 50.3582  fstop 2 }\n}\n'
     paths = {}
-    for name, text in (('singlet', singlet), ('sky', sky), ('panel', panel), ('dg8', dg8), ('fog', fog)):
+    for name, text in (('singlet', singlet), ('sky', sky), ('panel', panel), ('dg8', dg8), ('fog', fog),
+                       ('dgp', dgp)):
         p = os.path.join(OUT, name + '.ftsl')
         open(p, 'w', encoding='utf-8', newline='').write(text)
         paths[name] = p
     paths['achromat'] = os.path.join(ROOT, 'scenes', 'realcam.ftsl')
+    paths['dgrows'] = os.path.join(ROOT, 'scenes', 'realcam_dgauss.ftsl')
     return paths
 
 
@@ -175,6 +183,11 @@ def main():
     # pupil table turned off (FTRACE_LENS_FRONT) the light image samples the whole front
     # element and lensAimRatio is 1 everywhere, so the two renders differ only by what aiming
     # changes -- in J, the merges' weighing of it on the camera's first segment.
+    print('the dgauss preset against its rows pasted as surface lines (mode R):')
+    refdev = 'gpu' if 'gpu' in devices else 'cpu'
+    ref = render(exe, scenes['dgrows'], 'dgrows_R', ['-mode', 'R', '-spp', '4096', '-device', refdev])
+    img = render(exe, scenes['dgp'], 'dgp_R', ['-mode', 'R', '-spp', '4096', '-device', refdev])
+    allok = (ref is not None and img is not None and compare('preset vs pasted rows', ref, img, REGIONS, TOL)) and allok
     print('fog through the lens (every mode at -max-bounce 8):')
     deep = ['-max-bounce', '8']
     ref = render(exe, scenes['fog'], 'fog_R', ['-mode', 'R', '-spp', '8192', '-device',
@@ -188,7 +201,10 @@ def main():
         # density), so a bias in any one technique moves their totals apart. The CPU's J carries
         # one the GPU's does not -- with no lens at all CPU J reads this fog up to 2.8% off GPU J
         # (known-issues.md J-FOG-REALCAM) -- and aimed and unaimed CPU J differ by ~1.7%, the same
-        # every run; the GPU's agree to 0.5%. Hence 1% on the GPU, 3% on the CPU until that is fixed.
+        # every run; the GPU's agree to 0.5%. It is not the lens code: J's one lens-specific term
+        # (BeamMergeWeight::lensCam) moves CPU J by under 0.07% when removed, and the terms J
+        # shares with D are D's, which matches R on the CPU in this fog. Hence 1% on the GPU, 3%
+        # on the CPU until the CPU J's own bias is fixed.
         jtol = TOL if dev == 'gpu' else 0.03
         jargs = ['-mode', 'J', '-spp', '1024', '-device', dev] + deep
         front = render(exe, scenes['fog'], f'fog_Jfront_{dev}', jargs, env={'FTRACE_LENS_FRONT': '1'})

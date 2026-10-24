@@ -3094,7 +3094,7 @@ mode R traces camera rays out through it, the forward modes A, B and C trace lig
 and modes D and J do both (REFERENCE.md, *Physical (realistic) lens*).
 
 ```
-lens { preset achromat  focal 50  fstop 2.8  glass BK7 }
+lens { preset achromat  focal 50  fstop 2.8 }     # `glass <name>` too, for the singlet
 lens { surface <radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop]  … }
 ```
 

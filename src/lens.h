@@ -327,8 +327,10 @@ struct LensSystem {
     // How wide a beam from the scene each surface's aperture admits, per unit of that
     // aperture: a ray parallel to the axis at height h0 reaches surface j at height y_j
     // (paraxially, at the design wavelength, apertures ignored), so an aperture of radius a
-    // there makes an entrance pupil of radius a * h0 / y_j. Element j of the result is
-    // h0 / y_j, or 0 where the probe misses the sphere or crosses the axis.
+    // there makes an entrance pupil of radius a * h0 / |y_j| -- past an internal image too,
+    // where the probe has crossed the axis. Element j of the result is h0 / |y_j|, or 0 where
+    // the probe is lost (it misses a sphere or is totally reflected) or passes exactly
+    // through the axis.
     std::vector<double> entrancePupilScales() const {
         const double lambdaD = 587.6;
         std::vector<double> out(surf.size(), 0.0);
@@ -347,20 +349,6 @@ struct LensSystem {
         }
         return out;
     }
-    // The aperture stop: the first surface marked `stop`, else the surface whose entrance pupil
-    // is smallest (the textbook definition). -1 for an empty lens.
-    int stopIndex() const {
-        for (int j = 0; j < (int)surf.size(); ++j) if (surf[j].isStop) return j;
-        const std::vector<double> sc = entrancePupilScales();
-        int stop = surf.empty() ? -1 : 0;
-        double best = 1e300;
-        for (int j = 0; j < (int)surf.size(); ++j)
-            if (sc[(size_t)j] > 0.0 && surf[j].aperture * sc[(size_t)j] < best) {
-                best = surf[j].aperture * sc[(size_t)j];
-                stop = j;
-            }
-        return stop;
-    }
     // Scale the whole prescription (radii, gaps, apertures) so its focal length is exactly
     // `focalMM`: a lens scales without changing its form, its f-number or its aberrations'
     // shapes. Leaves it alone if either focal length is not positive.
@@ -371,23 +359,54 @@ struct LensSystem {
         for (LensSurface& sf : surf) { sf.radius *= k; sf.thickness *= k; sf.aperture *= k; }
         finalize();
     }
+    // The aperture stop: the first surface marked `stop`, else the surface whose entrance pupil
+    // is smallest (the textbook definition), given the pupil scales `sc`. -1 for an empty lens.
+    int stopIndex(const std::vector<double>& sc) const {
+        for (int j = 0; j < (int)surf.size(); ++j) if (surf[j].isStop) return j;
+        int stop = surf.empty() ? -1 : 0;
+        double best = 1e300;
+        for (int j = 0; j < (int)surf.size(); ++j)
+            if (sc[(size_t)j] > 0.0 && surf[j].aperture * sc[(size_t)j] < best) {
+                best = surf[j].aperture * sc[(size_t)j];
+                stop = j;
+            }
+        return stop;
+    }
+    int stopIndex() const { return stopIndex(entrancePupilScales()); }
     // The paraxial f-number: focal length over the stop's entrance pupil diameter. 0 if it
     // cannot be measured.
     double fNumber() const {
-        const int stop = stopIndex();
+        const std::vector<double> sc = entrancePupilScales();
+        const int stop = stopIndex(sc);
         if (stop < 0) return 0.0;
-        const double sc = entrancePupilScales()[(size_t)stop], f = focalLengthMM();
-        const double d = 2.0 * surf[stop].aperture * sc;
+        const double f = focalLengthMM(), d = 2.0 * surf[stop].aperture * sc[(size_t)stop];
         return (d > 0.0 && f > 0.0) ? f / d : 0.0;
     }
-    // Size the stop so the lens works at f/`fstop`, but no wider than `maxAperture` (mm) when
-    // that is positive. Leaves the lens alone if the f-number cannot be measured.
+    // The f-number by the beam the lens really lets in: the widest pencil parallel to the axis
+    // that gets through every aperture at the design wavelength (bisection on its height),
+    // over the focal length. It differs from fNumber() by the pupil's aberration, which a fast
+    // simple lens makes large. 0 if nothing gets through.
+    double tracedFNumber() const {
+        if (surf.empty()) return 0.0;
+        double lo = 0.0, hi = surf[0].aperture;              // nothing past the front rim gets in
+        for (int k = 0; k < 60; ++k) {
+            const double h = 0.5 * (lo + hi);
+            Ray out;
+            if (trace(Vec3(h, 0.0, T + 1.0), Vec3(0.0, 0.0, -1.0), 587.6, /*sensorToScene=*/false, out)) lo = h;
+            else hi = h;
+        }
+        const double f = focalLengthMM();
+        return (lo > 0.0 && f > 0.0) ? f / (2.0 * lo) : 0.0;
+    }
+    // Size the stop so the lens works at f/`fstop` paraxially, but no wider than `maxAperture`
+    // (mm) when that is positive. Leaves the lens alone if the f-number cannot be measured.
     void setFNumber(double fstop, double maxAperture = 0.0) {
-        const int stop = stopIndex();
+        const std::vector<double> sc = entrancePupilScales();
+        const int stop = stopIndex(sc);
         if (stop < 0 || !(fstop > 0.0)) return;
-        const double sc = entrancePupilScales()[(size_t)stop], f = focalLengthMM();
-        if (!(sc > 0.0 && f > 0.0)) return;
-        double a = f / (2.0 * fstop) / sc;
+        const double f = focalLengthMM();
+        if (!(sc[(size_t)stop] > 0.0 && f > 0.0)) return;
+        double a = f / (2.0 * fstop) / sc[(size_t)stop];
         if (maxAperture > 0.0) a = std::min(a, maxAperture);
         surf[stop].aperture = a;
     }
@@ -397,10 +416,10 @@ struct LensSystem {
     double focalLengthMM() const {
         if (surf.empty()) return 0.0;
         const double lambdaD = 587.6;
-        // A probe height that is paraxial (1e-4 of the front aperture: spherical aberration
-        // moves a finite ray's focal length off the lens's) and does not depend on any aperture
-        // a generator resizes afterwards, so measuring before and after it agree.
-        const double h = 1e-4 * std::fmax(1e-3, surf[0].aperture);
+        // A probe height that is paraxial (spherical aberration moves a finite ray's focal
+        // length off the lens's) and set by the lens's length, which no aperture change moves:
+        // measuring before and after a generator resizes its stop agrees.
+        const double h = 1e-5 * std::fmax(1.0, T);
         Vec3 o(h, 0.0, T + 1.0), d(0.0, 0.0, -1.0);
         Ray out;
         if (!trace(o, d, lambdaD, /*sensorToScene=*/false, out, /*clip=*/false)) return 0.0;
@@ -929,7 +948,38 @@ inline double lensEdgeGain(double Rfront, double Rrear, double ap) {
     };
     return delta(Rfront) - delta(Rrear);
 }
-inline double lensEdgeMin(double ap) { return std::fmax(0.8, 0.08 * ap); }
+// The thinnest edge a generator leaves: 8% of the aperture, relative so a lens keeps its
+// form at any scale (a published prescription's edges are all wider than this).
+inline double lensEdgeMin(double ap) { return 0.08 * ap; }
+
+// Thicken every element (glass between surfaces j and j+1) whose faces come closer than
+// lensEdgeMin at its clear aperture, the larger of its faces'. True if it changed anything.
+inline bool lensThickenElements(LensSystem& L) {
+    bool changed = false;
+    for (int j = 0; j + 1 < (int)L.surf.size(); ++j) {
+        if (L.iorSensorSide(j, 587.6) == 1.0) continue;    // air after j: a gap, not an element
+        const double ap = std::max(L.surf[j].aperture, L.surf[j + 1].aperture);
+        const double need = lensEdgeMin(ap) - lensEdgeGain(L.surf[j].radius, L.surf[j + 1].radius, ap);
+        // A hair past the minimum, so the rescale that follows (thicker glass lengthens the
+        // focal length, so it shrinks the lens) does not leave the edge just short again.
+        if (L.surf[j].thickness < need) { L.surf[j].thickness = need + 1e-3 * lensEdgeMin(ap); changed = true; }
+    }
+    if (changed) L.finalize();
+    return changed;
+}
+// A generator's last steps: elements thick enough for a real edge, the focal length exactly
+// `focalMM`, the stop sized for f/`fstop` and no wider than `maxStopPerMM` * focalMM when that
+// is positive. Repeated until thickening changes nothing, since scaling and the stop move the
+// apertures the edges are checked at. Then focus at infinity.
+inline void lensFinishPreset(LensSystem& L, double focalMM, double fstop, double maxStopPerMM = 0.0) {
+    for (int pass = 0; pass < 50; ++pass) {
+        const bool thickened = lensThickenElements(L);
+        L.scaleToFocal(focalMM);
+        L.setFNumber(fstop, maxStopPerMM > 0.0 ? maxStopPerMM * L.focalLengthMM() : 0.0);
+        if (!thickened && pass > 0) break;
+    }
+    L.focusAt(0.0);
+}
 
 // A single biconvex glass singlet of focal length `focalMM` at f/`fstop`. The clear
 // semi-diameter (= focal/(2*fstop)) doubles as the aperture stop. Strong spherical
@@ -949,11 +999,8 @@ inline LensSystem makeSinglet(double focalMM, double fstop, const Spectrum& glas
     L.surf.push_back({ -R, ct,  glass,            semi });   // front (convex toward scene)
     L.surf.push_back({ +R, f,   iorConstant(1.0), semi });   // back; rear gap ~ f (autofocus refines)
     L.finalize();
-    // The lensmaker equation is the thin lens's: the thickness moves the focal length off it,
-    // so scale to the one asked for; then size the stop (the front surface) for f/fstop.
-    L.scaleToFocal(focalMM);
-    L.setFNumber(fstop);
-    L.focusAt(0.0);
+    // The lensmaker equation is the thin lens's: the thickness moves the focal length off it.
+    lensFinishPreset(L, focalMM, fstop);
     return L;
 }
 
@@ -987,8 +1034,7 @@ inline LensSystem makeAchromat(double focalMM, double fstop,
     R1 = -R1; R2 = -R2; R4 = -R4;
     double semi = std::fmax(1.5, f / (2.0 * std::fmax(0.5, fstop)));
     const double ap = semi * 1.05;                       // the elements' clear semi-aperture
-    // Centre thicknesses: plausible, and at least enough for an edge at the clear aperture (an
-    // f/2.8 crown at 2 mm had its faces cross at 7.7 mm off axis, inside its 9.4 mm aperture).
+    // Centre thicknesses: plausible, and at least enough for an edge at the clear aperture.
     double ct1 = std::fmax(std::fmax(2.0, 0.16 * semi), lensEdgeMin(ap) - lensEdgeGain(R1, R2, ap));
     double ct2 = std::fmax(std::fmax(1.2, 0.08 * semi), lensEdgeMin(ap) - lensEdgeGain(R2, R4, ap));
     double gap = std::fmax(1.0, 0.5 * semi);             // stop stand-off
@@ -1000,13 +1046,11 @@ inline LensSystem makeAchromat(double focalMM, double fstop,
     stop.aperture = semi; stop.isStop = true;
     L.surf.push_back(stop);                                                 // diaphragm, rear gap ~ f
     L.finalize();
-    // The power split is the thin-lens one: the thicknesses move the focal length off it, so
-    // scale to the one asked for. Then the stop: it sits behind the converging doublet, which
-    // narrows the beam on its way there, so it is sized through its pupil magnification for an
-    // entrance pupil of exactly f/2N, which every element's aperture clears.
-    L.scaleToFocal(focalMM);
-    L.setFNumber(fstop);
-    L.focusAt(0.0);
+    // The power split is the thin-lens one: the thicknesses move the focal length off it. The
+    // stop sits behind the converging doublet, which narrows the beam on its way there, so
+    // setFNumber sizes it through its pupil magnification, for an entrance pupil of exactly
+    // f/2N, which every element's aperture clears.
+    lensFinishPreset(L, focalMM, fstop);
     return L;
 }
 
@@ -1039,9 +1083,10 @@ inline LensSystem makeDoubleGauss(double focalMM, double fstop) {
         L.surf.push_back(s);
     }
     L.finalize();
-    L.scaleToFocal(focalMM);
-    L.setFNumber(fstop, /*maxAperture=*/L.surf[stop].aperture);
-    L.focusAt(0.0);
+    // Its widest opening is the design's own stop, which scales with the lens. Its published
+    // elements are all thicker at the edge than lensEdgeMin asks, so finishing leaves them be.
+    const double f0 = L.focalLengthMM();
+    lensFinishPreset(L, focalMM > 0.0 ? focalMM : f0, fstop, f0 > 0.0 ? L.surf[stop].aperture / f0 : 0.0);
     return L;
 }
 
@@ -1053,9 +1098,12 @@ inline bool resolveLensPreset(const std::string& name, double focalMM, double fs
                               LensSystem& out) {
     std::string k;
     for (char c : name) { if (c == ' ' || c == '_' || c == '-') continue; k += (char)std::tolower((unsigned char)c); }
-    if (focalMM <= 0.0) focalMM = 50.0;
     if (fstop   <= 0.0) fstop   = 2.8;
     const Spectrum bk7 = defaultGlass("BK7"), sf10 = defaultGlass("SF10");
+    // An unset focal length (<= 0) takes the preset's own: 135 mm for the telephoto, 28 mm for
+    // the wide, 50 mm otherwise.
+    const bool ownFocal = (k == "telephoto" || k == "tele" || k == "wide" || k == "wideangle");
+    if (!ownFocal && focalMM <= 0.0) focalMM = 50.0;
     if (k == "singlet" || k == "biconvex" || k == "simple") {
         out = makeSinglet(focalMM, fstop, bk7); out.name = "singlet"; return true;
     }

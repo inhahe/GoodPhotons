@@ -1929,9 +1929,8 @@ camera "real" {
     film { res 512 512   format full-frame }
     lens {
         preset achromat   # singlet | biconvex | achromat | doublet | telephoto | wide | dgauss
-        focal 50          # mm
+        focal 50          # mm (default: what the camera's fov_y implies; 135 / 28 for telephoto / wide)
         fstop 2.8
-        glass BK7
     }
 }
 ```
@@ -1939,15 +1938,19 @@ camera "real" {
 - **Presets** are physically derived (lensmaker equation for the singlet, Abbe-number
   power split for the achromatic doublet), so focal length and colour correction are
   correct by construction; render-time dispersion uses real Sellmeier glass indices. Each
-  works at exactly the `focal` and `fstop` asked for: its elements are thick enough to keep
-  a real edge at their clear aperture, the whole lens is scaled to the focal length (the
-  lensmaker and power-split formulas are thin-lens ones), and the stop is sized through its
-  own pupil magnification. Before 0.397.1 the achromat's crown was thinner than its curves
-  needed, its faces crossing inside the aperture (a 50 mm "f/2.8" worked at about f/3.35,
-  and longer or faster ones worse), and focal lengths were off by about half a per cent;
-  achromat renders are brighter now, at the f-number they always claimed. Where a preset
-  cannot reach the f-number asked for, the log says what it works at instead. Only the
-  singlet takes `glass`; the log says so if another preset is given one.
+  comes out at exactly the `focal` and `fstop` asked for (the f-number paraxially): its
+  elements are thick enough to keep a real edge at their clear aperture, the whole lens is
+  scaled to the focal length (the lensmaker and power-split formulas are thin-lens ones),
+  and the stop is sized through its own pupil magnification. Before 0.397.1 the achromat's
+  crown was thinner than its curves needed, its faces crossing inside the aperture (a 50 mm
+  "f/2.8" worked at about f/3.35, and longer or faster ones worse), and focal lengths were
+  off by about half a per cent; achromat renders are brighter now, at the f-number they
+  always claimed. A fast simple lens lets in a narrower beam than its paraxial f-number (its
+  own aberration bends the rim rays out); when the beam that really gets through is more
+  than 2% off the f-number asked for, the log says what it is. `telephoto` and `wide` are
+  achromats that default to 135 mm and 28 mm; the others take their focal length from
+  `focal`, else the camera's `fov_y`. Only the singlet takes `glass <name>` (BK7 by
+  default); the log says so if another preset is given one.
 - **`preset dgauss`** (or `doublegauss`) is a real prescription instead: the 50 mm f/2
   double Gauss of pbrt's `dgauss.50mm.dat` (Tronnier's patent, the classic normal-lens
   design: two cemented meniscus groups round a central stop), scaled so its focal length is

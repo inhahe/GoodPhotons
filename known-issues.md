@@ -83,8 +83,10 @@ helpers. Three faults, all in the generators (lens.h):
    1.57 mm each, 3.1 mm against 2 mm of glass, so they crossed 7.7 mm off axis, inside the
    9.4 mm aperture. Rays beyond passed outside the glass and were lost: "f/2.8" worked at about
    f/3.35, and the error grew with focal length and speed. The singlet did the same at fast
-   apertures (50 mm f/2). Every element now gets at least the thickness for an edge of
-   max(0.8 mm, 8% of its aperture) (`lensEdgeGain`, `lensEdgeMin`).
+   apertures (50 mm f/2). Every element now gets at least the thickness for an edge of 8% of
+   its aperture at its final clear aperture (`lensFinishPreset`: thicken, rescale, resize the
+   stop, repeat until nothing thickens -- the first version checked the edge before the
+   rescale and the stop moved the apertures, which a review caught for a fast singlet).
 2. **A stop sized as if it were the pupil.** The achromat's stop sits behind the converging
    doublet, which narrows the beam on its way there; sized at f/2N it admitted more than the
    front element (f/2.68 for f/2.8, had the glass been thick enough). It is now sized through
@@ -96,8 +98,11 @@ helpers. Three faults, all in the generators (lens.h):
 Achromat renders are brighter than before (a point source's light through the 50 mm f/2.8 is
 +31%), at the f-number they always claimed, and the image scale moves by the focal length's
 half per cent. The stop is sized with no floor, so a preset now closes to any f-number (the
-old 1 / 1.5 mm floors had capped a 50 mm singlet at f/25); readLens says when a preset does
-not work at the f-number asked, which is now only the double Gauss asked wider than f/2.03.
+old 1 / 1.5 mm floors had capped a 50 mm singlet at f/25). The f-number is exact paraxially;
+the beam a fast simple lens really lets through is narrower, by its aberration, and readLens
+reports it when it is more than 2% off what was asked (and the double Gauss asked wider than
+its f/2.03). The same review found `preset telephoto` / `wide` never got their 135 / 28 mm:
+every preset took the focal length the camera's fov implied; those two now default to theirs.
 
 ## DONE (2026-10-23, 0.394.3): LENS-SURFACE-SIGN — a pasted lens prescription was read with every radius negated, and its `stop` flag was rejected
 
@@ -2758,7 +2763,10 @@ technique of the CPU's J is biased beyond the shared kernel blur. One visible co
 through a physical lens whose light image is aimed (`preset dgauss` at f/4), CPU J with and
 without the aiming (FTRACE_LENS_FRONT) differ by +1.7% green / -1.2% red, the same every run
 (spread < 0.2%), because aiming moves weight between techniques and so moves the biased one's
-share; the GPU's agree to 0.5%. tools/check_physlens.py holds CPU J to 3% there for this reason.
+share; the GPU's agree to 0.5%. It is not the lens code: J's one lens-specific term (the
+first camera segment's merge weight, BeamMergeWeight::lensCam) moves CPU J by under 0.07% when
+removed, and the terms J shares with D are D's, which matches R on the CPU in this fog.
+tools/check_physlens.py holds CPU J to 3% there for this reason.
 To find it: FTRACE_J_HALF splits the estimator, and the CPU/GPU difference per half on
 `scenes/_realcam_fog.ftsl` should name the technique.
 

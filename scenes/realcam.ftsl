@@ -59,6 +59,5 @@ camera "real" {
         preset achromat
         focal 50
         fstop 2.8
-        glass BK7
     }
 }

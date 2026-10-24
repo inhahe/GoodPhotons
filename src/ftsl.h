@@ -8109,6 +8109,10 @@ private:
 
         double focalMM = (cs.focal > 0.0) ? cs.focal * 1000.0 : 50.0;
         focalMM = dblOf(lb, "focal", focalMM);
+        if (!(focalMM > 0.0)) {
+            fail("camera '" + cs.name + "' lens: `focal` must be a positive length in mm");
+            return false;
+        }
         double fstop = dblOf(lb, "fstop", 0.0);
         if (fstop <= 0.0) fstop = dblOf(b, "fstop", 0.0);
         if (fstop <= 0.0) fstop = 2.8;
@@ -8187,7 +8191,11 @@ private:
                 }
                 *sys = makeSinglet(focalMM, fstop, g);
             } else if (!preset.empty()) {
-                if (!resolveLensPreset(preset, focalMM, fstop, *sys)) {
+                // The telephoto and the wide are named for their focal lengths (135 / 28 mm):
+                // without a `focal` of their own they take those, not the one the camera's field
+                // of view implies, which every other preset follows.
+                const bool named = (pk == "telephoto" || pk == "tele" || pk == "wide" || pk == "wideangle");
+                if (!resolveLensPreset(preset, (named && !find(lb, "focal")) ? 0.0 : focalMM, fstop, *sys)) {
                     fail("camera '" + cs.name + "' lens: unknown preset '" + preset +
                          "' (singlet/biconvex, achromat/doublet, telephoto, wide, dgauss/doublegauss)");
                     return false;
@@ -8204,14 +8212,15 @@ private:
             if (!singlet && find(lb, "glass"))
                 std::printf("[ftsl] camera '%s' lens: `glass` has no effect on preset '%s' (only the "
                             "singlet takes one)\n", cs.name.c_str(), preset.empty() ? "achromat" : preset.c_str());
-            // A preset opens no wider than its design (the double Gauss's f/2.03), and its stop
-            // closes no further than its generator's floor: say so when the lens does not work at
-            // the f-number asked for.
-            const double nEff = sys->fNumber();
-            if (nEff > 0.0 && std::fabs(nEff / fstop - 1.0) > 0.005)
-                std::printf("[ftsl] camera '%s' lens: preset '%s' works at f/%.2f, not the f/%.2f asked for "
-                            "(as far as it opens or closes)\n", cs.name.c_str(),
-                            preset.empty() ? "achromat" : preset.c_str(), nEff, fstop);
+            // Every preset's stop is sized for the f-number asked, paraxially. What the lens lets
+            // in can still fall short: the double Gauss opens no wider than its design's f/2.03,
+            // and a fast simple lens's aberrations narrow the beam that really gets through. Say
+            // so when the traced opening is more than 2% off what was asked.
+            const double nTr = sys->tracedFNumber();
+            if (nTr > 0.0 && std::fabs(nTr / fstop - 1.0) > 0.02)
+                std::printf("[ftsl] camera '%s' lens: preset '%s' lets in an f/%.2f beam, not the f/%.2f asked for "
+                            "(its widest opening, or a fast lens's aberration)\n", cs.name.c_str(),
+                            preset.empty() ? "achromat" : preset.c_str(), nTr, fstop);
         }
         // Sensor size from the camera film (default full-frame 36x24 mm).
         sys->filmW_mm = (cs.filmW_mm > 0.0) ? cs.filmW_mm : 36.0;
