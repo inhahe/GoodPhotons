@@ -2622,6 +2622,14 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
     cam.prepareLensPupil();
     Pcg32 rng; rng.seed(4242u, 17u);
     const double lambda = 550.0;
+    // The lens's field, so the test points and directions below sit inside it whatever its
+    // focal length: `field` is a little past the angle the raster's corner sees (rectilinear
+    // estimate, capped short of 90 degrees, which also covers a fisheye's 78), and the off-axis
+    // points are spread by `kf`, the factor that takes a 50 mm lens's field to this one's.
+    const double fMM = cam.lens->focalLengthMM();
+    const double halfDiag = std::sqrt(18.0 * 18.0 + (18.0 * 43.0 / 64.0) * (18.0 * 43.0 / 64.0));
+    const double field = std::min(89.0 * PI / 180.0, 1.3 * std::atan(halfDiag / fMM));
+    const double kf = 50.0 / fMM;
     // (1) normalisation. P(not vignetted) from the camera's own sampling ...
     const int nCam = 400000;
     long long ok = 0, zeroBack = 0;
@@ -2634,9 +2642,9 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
         if (!(cam.lensPdfDir(r.o, r.d, lambda) > 0.0)) ++zeroBack;   // (2)
     }
     const double pValid = (double)ok / nCam;
-    // ... and the integral of the density, directions drawn in a 40 deg cone about the axis
-    // (a 50 mm lens sees under 25 deg off axis at its corners).
-    const double cosC = std::cos(40.0 * PI / 180.0), W = 2.0 * PI * (1.0 - cosC);
+    // ... and the integral of the density, directions drawn in a cone about the axis that
+    // holds every direction a camera ray leaves in (`field`).
+    const double cosC = std::cos(field), W = 2.0 * PI * (1.0 - cosC);
     const int nInt = 4000000;
     double acc = 0.0, acc2 = 0.0;
     for (int k = 0; k < nInt; ++k) {
@@ -2660,7 +2668,7 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
     bool pass = ok > 0 && z1 < 4.0 && zeroBack == 0;
     // (3) a point source off axis, near and far: connection vs catch.
     for (const double range : {2.0, 5000.0}) {
-        const Vec3 X = cam.w * range + cam.u * (0.15 * range) + cam.v * (-0.1 * range);
+        const Vec3 X = cam.w * range + cam.u * (0.15 * kf * range) + cam.v * (-0.1 * kf * range);
         const int nConn = 400000;
         double sumConn = 0.0, cxC = 0.0, cyC = 0.0;
         const double aCell = 1.0 / cam.lensCellNorm();
@@ -2707,12 +2715,18 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
     Camera camF = cam;                  // the same camera with the front sampler only
     camF.lensPupil.reset();
     const LensSystem& CL = *cam.lens;
-    // (4) coverage. Scene points up to 50 deg off axis (the raster's corners are ~23 deg),
+    // (4) coverage. Scene points up to 89 deg off axis (well past any field but a fisheye's),
     // 5 cm to 5 km out (log-uniform), one front-sampler ray each, at a wavelength across the
-    // band.
+    // band. A region found by tracing cannot be proven to hold every crossing: a crescent's tip
+    // is reached by almost no ray. What a miss costs is its share of the light, so the bound is
+    // on that share (1e-5) and on how far out a miss lies (5% of its region); a fault in the
+    // tables themselves -- a wrong frame, plane or bin -- misses far more, and far further.
     long long reached = 0, aimedReached = 0, outside = 0, rejected = 0;
-    for (int k = 0; k < 2000000; ++k) {
-        const double th = (50.0 * PI / 180.0) * rng.uniform(), ph = 2.0 * PI * rng.uniform();
+    double worstOut = 0.0;
+    // At least 2M draws, and more until 30000 reach the film: a fisheye's front element lets
+    // well under 1% of them through.
+    for (int k = 0; k < 2000000 || (reached < 30000 && k < 16000000); ++k) {
+        const double th = (89.0 * PI / 180.0) * rng.uniform(), ph = 2.0 * PI * rng.uniform();
         const double range = 0.05 * std::pow(1e5, rng.uniform());
         const Vec3 X = cam.eye + (cam.w * std::cos(th) + (cam.u * std::cos(ph) + cam.v * std::sin(ph)) *
                                   std::sin(th)) * range;
@@ -2730,6 +2744,7 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
         const Vec3 yl = cam.lensLocalPoint(e.Y);
         const Vec3 Xc = yl + e.d * ((P->entry.z - yl.z) / e.d.z);
         if (!P->entry.inside(c, Xc, cphi, sphi)) {
+            worstOut = std::max(worstOut, pupilRegionNormAt(P->entry.cells[(size_t)c], Xc, cphi, sphi));
             if (++outside <= 5) {
                 const LensPupilCell& C = P->entry.cells[(size_t)c];
                 const double ex = Xc.x * cphi + Xc.y * sphi, ey = -Xc.x * sphi + Xc.y * cphi;
@@ -2745,13 +2760,14 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
                 "(stop = surface %d, entrance pupil z = %.2f mm, %lld build-time enlargements)\n",
                 preset, P->entry.nAim, P->entry.nFront, P->entry.nNone, P->stop, P->entry.z, P->entry.enlarged);
     std::printf("[checklens] %s: of %lld front-sampler rays that reached the film, %lld came from aimed "
-                "points: %lld outside the region, %lld from rejecting bins\n",
-                preset, reached, aimedReached, outside, rejected);
-    pass = pass && reached > 10000 && outside == 0 && rejected == 0;
+                "points: %lld outside the region (worst %.4f of its size), %lld from rejecting bins\n",
+                preset, reached, aimedReached, outside, worstOut, rejected);
+    pass = pass && reached > 10000 && (double)outside <= 1e-5 * (double)aimedReached && worstOut <= 1.05 &&
+           rejected == 0;
     // (5) the drawn density against the recomputed one.
     long long nAimed = 0, mismatched = 0; double worst = 0.0;
     for (int k = 0; k < 400000; ++k) {
-        const double th = (30.0 * PI / 180.0) * rng.uniform(), ph = 2.0 * PI * rng.uniform();
+        const double th = field * rng.uniform(), ph = 2.0 * PI * rng.uniform();
         const double range = 0.05 * std::pow(1e5, rng.uniform());
         const Vec3 X = cam.eye + (cam.w * std::cos(th) + (cam.u * std::cos(ph) + cam.v * std::sin(ph)) *
                                   std::sin(th)) * range;
@@ -2773,7 +2789,7 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
     for (const auto& pt : {std::array<double, 3>{2.0, 0.0, 0.0}, std::array<double, 3>{2.0, 0.15, -0.1},
                            std::array<double, 3>{5000.0, 0.15, -0.1}, std::array<double, 3>{8.0, 0.3, 0.2}}) {
         const double range = pt[0];
-        const Vec3 X = cam.w * range + cam.u * (pt[1] * range) + cam.v * (pt[2] * range);
+        const Vec3 X = cam.w * range + cam.u * (pt[1] * kf * range) + cam.v * (pt[2] * kf * range);
         double s[2] = {0, 0}, s2[2] = {0, 0}; long long hit[2] = {0, 0};
         const int n = 400000;
         for (int which = 0; which < 2; ++which) {
@@ -2804,8 +2820,9 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
     };
     // (7) coverage: unaimed rays (LensSystem::rearDir, genLensRay's sampler where the table
     // does not aim), at wavelengths across the band, that get out of the lens fall inside
-    // their film point's region, and none comes from a rejecting bin.
+    // their film point's region (bounded as (4) bounds it), and none comes from a rejecting bin.
     long long out7 = 0, outside7 = 0, rejected7 = 0, aimed7 = 0;
+    double worstOut7 = 0.0;
     for (int k = 0; k < 2000000; ++k) {
         const Vec3 f = filmPoint(rng.uniform(), rng.uniform());
         Vec3 d;
@@ -2819,15 +2836,27 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
         if (c == -2) { ++rejected7; continue; }
         if (c < 0) continue;
         ++aimed7;
-        if (!P->exit.inside(c, f + d * ((P->exit.z - f.z) / d.z), cphi, sphi)) ++outside7;
+        const Vec3 X = f + d * ((P->exit.z - f.z) / d.z);
+        if (!P->exit.inside(c, X, cphi, sphi)) {
+            worstOut7 = std::max(worstOut7, pupilRegionNormAt(P->exit.cells[(size_t)c], X, cphi, sphi));
+            if (++outside7 <= 5) {
+                const LensPupilCell& C = P->exit.cells[(size_t)c];
+                std::printf("[checklens] %s:   outside: film bin %d (%s), film radius %.4f mm, crossing "
+                            "(%.4f, %.4f) mm vs region centre %.4f, half-widths %.4f x %.4f (%.4f of its size)\n",
+                            preset, c, C.kind == LensPupil::AIMBOX ? "rectangle" : "ellipse",
+                            std::sqrt(f.x * f.x + f.y * f.y), X.x * cphi + X.y * sphi, -X.x * sphi + X.y * cphi,
+                            C.cx, C.a, C.b, pupilRegionNormAt(C, X, cphi, sphi));
+            }
+        }
     }
     std::printf("[checklens] %s: exit table aims in %d film bins, rear sampler in %d, rejects %d "
                 "(exit pupil z = %.2f mm, %lld build-time enlargements)\n",
                 preset, P->exit.nAim, P->exit.nFront, P->exit.nNone, P->exit.z, P->exit.enlarged);
     std::printf("[checklens] %s: of %lld unaimed camera rays that got out, %lld from aimed film bins: "
-                "%lld outside the region, %lld from rejecting bins\n",
-                preset, out7, aimed7, outside7, rejected7);
-    pass = pass && out7 > 10000 && outside7 == 0 && rejected7 == 0;
+                "%lld outside the region (worst %.4f of its size), %lld from rejecting bins\n",
+                preset, out7, aimed7, outside7, worstOut7, rejected7);
+    pass = pass && out7 > 10000 && (double)outside7 <= 1e-5 * (double)aimed7 && worstOut7 <= 1.05 &&
+           rejected7 == 0;
     // (8) every camera ray's importance times its BDPT density is cosF * A_front / A_film: the
     // two describe one sampler (the film point is uniform; the rest cancels).
     long long n8 = 0, bad8 = 0; double worst8 = 0.0;
@@ -2907,23 +2936,34 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
     std::printf("[checklens] %s %s\n", preset, pass ? "PASS" : "FAIL");
     return pass;
 }
-// (12) The presets work at the focal length and f-number asked for: paraxially to 1e-6; by the
-// widest beam that really gets through (LensSystem::tracedFNumber, which shares nothing with
-// the paraxial helpers but the trace) to 2% wherever a lens is not fast enough for its own
-// aberration to narrow that beam; and every element keeps a real edge at its final aperture,
-// so no face crosses another inside it. The double Gauss stops at its design's opening when
-// asked wider, and its rows are locked by its native focal length and opening.
+// (12) The presets work at the focal length and f-number asked for: the focal length to 1e-6,
+// and the beam the lens really lets in (tracedFNumber, the f-number setFNumber sizes the stop
+// for) to 1e-6 -- unless a published lens is asked wider than its design, when it is at the
+// design's own opening, or a fast formula lens's aberration narrows the beam before any stop
+// can let it in, when the stop stays at its paraxial size. No element's faces cross inside its
+// aperture (the formula-built ones keep at least lensEdgeMin, the published ones are as
+// published). A published lens's rows are locked by its native focal length and its paraxial
+// and traced openings, computed apart by an independent (Python) trace of pbrt's rows; the
+// traced one also ties tracedPupilRadius, which the sizing and this check share, to it.
 static bool checkLensPresetsFNumber() {
     bool pass = true;
-    // The double Gauss as published (makeDoubleGauss leaves an unset focal length unscaled):
-    // a row edited by mistake moves its focal length and its widest opening.
-    const LensSystem native = makeDoubleGauss(0.0, 0.5);
-    const double fNative = native.focalLengthMM(), nMax = native.fNumber();
-    const bool okNative = std::fabs(fNative / 50.3582 - 1.0) < 1e-5 && std::fabs(nMax / 2.0302 - 1.0) < 1e-4;
-    std::printf("[checklens] dgauss as published: %.4f mm, opens to f/%.4f %s\n", fNative, nMax,
-                okNative ? "ok" : "WRONG (a row changed?)");
-    pass = pass && okNative;
-    // The thinnest edge of any element, as a fraction of what lensEdgeMin asks (>= 1 is right).
+    struct Native { const char* name; double f, nPar, nTr; };
+    std::map<std::string, double> nMax;
+    for (const Native& nat : {Native{"dgauss", 50.358167, 2.030153, 2.017902},
+                              Native{"telephoto", 249.566611, 5.423442, 5.592131},
+                              Native{"wide", 22.023496, 2.683819, 2.788261},
+                              Native{"fisheye", 9.991418, 3.946634, 3.994819}}) {
+        const LensSystem L = makePublishedLens(*findPublishedLens(nat.name), 0.0, 0.0);
+        const double f = L.focalLengthMM(), nPar = L.fNumber(), nTr = L.tracedFNumber();
+        const bool ok = std::fabs(f / nat.f - 1.0) < 1e-5 && std::fabs(nPar / nat.nPar - 1.0) < 1e-5 &&
+                        std::fabs(nTr / nat.nTr - 1.0) < 1e-5;
+        std::printf("[checklens] %s as published: %.4f mm, opens to f/%.4f (f/%.4f paraxial) %s\n", nat.name, f,
+                    nTr, nPar, ok ? "ok" : "WRONG (a row changed?)");
+        pass = pass && ok;
+        nMax[nat.name] = nTr;
+    }
+    // The thinnest edge of any element, as a fraction of what lensEdgeMin asks (>= 1 for the
+    // formula-built presets; > 0, no crossing, for a published one).
     auto edgeShare = [](const LensSystem& L) {
         double worst = 1e300;
         for (int j = 0; j + 1 < (int)L.surf.size(); ++j) {
@@ -2936,18 +2976,25 @@ static bool checkLensPresetsFNumber() {
     };
     struct Q { const char* preset; double focal, fstop; bool fast; };
     for (const Q& q : {Q{"achromat", 50.0, 2.8, false}, Q{"achromat", 135.0, 5.6, false},
-                       Q{"achromat", 50.0, 2.0, true}, Q{"achromat", 50.0, 1.4, true},
-                       Q{"singlet", 50.0, 4.0, false}, Q{"singlet", 50.0, 1.4, true},
+                       Q{"achromat", 50.0, 2.0, false}, Q{"achromat", 50.0, 1.4, false},
+                       Q{"singlet", 50.0, 4.0, false}, Q{"singlet", 50.0, 1.4, false},
                        Q{"singlet", 50.0, 0.8, true},
                        Q{"dgauss", 50.0, 2.8, false}, Q{"dgauss", 35.0, 4.0, false}, Q{"dgauss", 85.0, 8.0, false},
-                       Q{"dgauss", 50.0, 2.0, false}, Q{"dgauss", 50.0, 1.4, false}}) {
+                       Q{"dgauss", 50.0, 2.0, false}, Q{"dgauss", 50.0, 1.4, false},
+                       Q{"telephoto", 250.0, 5.6, false}, Q{"telephoto", 400.0, 8.0, false},
+                       Q{"telephoto", 250.0, 4.0, false},
+                       Q{"wide", 22.0, 2.8, false}, Q{"wide", 28.0, 4.0, false}, Q{"wide", 22.0, 2.0, false},
+                       Q{"fisheye", 10.0, 4.0, false}, Q{"fisheye", 8.0, 5.6, false}, Q{"fisheye", 10.0, 2.8, false}}) {
         LensSystem L;
         if (!resolveLensPreset(q.preset, q.focal, q.fstop, L)) { std::printf("[checklens] no %s\n", q.preset); return false; }
-        const bool capped = std::string(q.preset) == "dgauss" && q.fstop < nMax;
-        const double want = capped ? nMax : q.fstop;
+        const bool published = nMax.count(q.preset) > 0;
+        const bool capped = published && q.fstop < nMax[q.preset];
+        const double want = capped ? nMax[q.preset] : q.fstop;
         const double f = L.focalLengthMM(), nPar = L.fNumber(), nTr = L.tracedFNumber(), edge = edgeShare(L);
-        const bool ok = std::fabs(f / q.focal - 1.0) < 1e-6 && std::fabs(nPar / want - 1.0) < 1e-6 &&
-                        (q.fast || std::fabs(nTr / want - 1.0) < 0.02) && edge >= 1.0 - 1e-9;
+        const bool fNumberOk = q.fast ? (nTr > want * (1.0 + 1e-6) && std::fabs(nPar / want - 1.0) < 1e-6)
+                                      : std::fabs(nTr / want - 1.0) < 1e-6;
+        const bool ok = std::fabs(f / q.focal - 1.0) < 1e-6 && fNumberOk &&
+                        (published ? edge > 0.0 : edge >= 1.0 - 1e-9);
         std::printf("[checklens] %s asked %g mm f/%g: %.4f mm, f/%.4f paraxial, f/%.4f traced%s, thinnest "
                     "edge %.2f of the minimum %s\n", q.preset, q.focal, q.fstop, f, nPar, nTr,
                     capped ? " (capped at the design's opening)" : (q.fast ? " (fast: aberration narrows it)" : ""),
@@ -2957,17 +3004,21 @@ static bool checkLensPresetsFNumber() {
     return pass;
 }
 static bool checkLensPhysical() {
-    LensSystem a, s, d;
+    LensSystem a, s, d, t, w, f;
     if (!resolveLensPreset("achromat", 50.0, 2.8, a) || !resolveLensPreset("singlet", 50.0, 4.0, s) ||
-        !resolveLensPreset("dgauss", 50.0, 8.0, d)) {
+        !resolveLensPreset("dgauss", 50.0, 8.0, d) || !resolveLensPreset("telephoto", 0.0, 0.0, t) ||
+        !resolveLensPreset("wide", 0.0, 0.0, w) || !resolveLensPreset("fisheye", 0.0, 0.0, f)) {
         std::printf("[checklens] missing a preset\n");
         return false;
     }
     const bool pa = checkLensPhysicalOne("achromat", a);
     const bool ps = checkLensPhysicalOne("singlet", s);
     const bool pd = checkLensPhysicalOne("dgauss f/8", d);
+    const bool pt = checkLensPhysicalOne("telephoto", t);
+    const bool pw = checkLensPhysicalOne("wide", w);
+    const bool pf = checkLensPhysicalOne("fisheye", f);
     const bool pp = checkLensPresetsFNumber();
-    return pa && ps && pd && pp;
+    return pa && ps && pd && pt && pw && pf && pp;
 }
 
 // Deterministic thin-lens (mode C) self-test. Forward catch is far too photon-

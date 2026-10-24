@@ -1,6 +1,6 @@
 """Regression check: every mode that images through a physical lens agrees with mode R.
 
-    python tools/check_physlens.py [--exe ftrace.exe] [--cpu-only]
+    python tools/check_physlens.py [--exe ftrace.exe] [--cpu-only] [--only published,fog,...]
 
 A camera's `lens { }` is imaged two ways. Mode R traces camera rays out through the glass
 (genLensRay, aimed at the exit pupil by the pupil table; R is also checked against itself
@@ -20,6 +20,10 @@ same scenes in all of them and compares region means with mode R:
   * pbrt's double Gauss (scenes/realcam_dgauss.ftsl) stopped to f/8, in A and D: its front
     element is several times the beam the stop admits, where the pupil table's aiming, and
     BDPT's weighting of it, carry the image;
+  * the published telephoto, wide-angle and fisheye as published (`preset telephoto` / `wide`
+    in realcam's scene, scenes/realcam_fisheye.ftsl), in A and D and R unaimed, tile by tile:
+    fields from 5 to 156 degrees, the fisheye's far off axis where the pupil tables' edge bins
+    and the light image's density there carry the image;
   * `preset dgauss` at its published size and full opening against scenes/realcam_dgauss.ftsl's
     rows, in R (the preset's copy of the prescription and the parser's reading of it agree);
   * the scene through `preset dgauss` at f/4 in a homogeneous fog, in D against R, and in J
@@ -53,6 +57,9 @@ REGIONS = {'floor': (75, 86, 0, 128), 'green': (30, 55, 50, 75), 'red': (28, 60,
 # its scale is diluted: a light image 10% too bright moves D's regions by just 1-2.6%, which
 # a looser bound would let through. The catch (C) is heavy-tailed and keeps 3%.
 TOL = 0.01
+# The sections, in the order they run; --only picks some (a full run is about 50 minutes, most
+# of it mode J in the fog).
+SECTIONS = ('achromat', 'singlet', 'dg8', 'published', 'dgp', 'fog', 'sky', 'panel')
 
 
 def read_pfm(p):
@@ -102,13 +109,21 @@ def write_scenes():
     lens_block = src[src.index('    lens {'):src.index('    }', src.index('    lens {')) + 5]
     fog = (src.replace(lens_block, '    lens { preset dgauss  focal 50  fstop 4 }') +
            '\nmedium { sigma_t 0.15   albedo 0.8   g 0.0 }\n')
-    # The built-in double Gauss at the published size and full opening, against the same rows
-    # pasted as `surface` lines: makeDoubleGauss's copy of the rows, and readLens's reading of
-    # them, have to describe one lens.
-    dgp = dgauss[:dgauss.index('    lens {')] + '    lens { preset dgauss  focal 50.3582  fstop 2 }\n}\n'
+    # The built-in double Gauss as a scene gets it with neither `focal` nor `fstop` -- the
+    # published size and full opening -- against the same rows pasted as `surface` lines:
+    # lens.h's copy of the rows, and readLens's reading of them, have to describe one lens.
+    dgp = dgauss[:dgauss.index('    lens {')] + '    lens { preset dgauss }\n}\n'
+    # The published telephoto, wide-angle and fisheye at their own size and opening: realcam's
+    # scene through the first two, the fisheye's own room for the third. The chrome ball goes
+    # (no forward splat images a mirror, and the tiles below would hold it).
+    chrome = 'sphere { center 0.55 0.18 1.6   radius 0.18   material chrome }\n'
+    fisheye = open(os.path.join(ROOT, 'scenes', 'realcam_fisheye.ftsl'), encoding='utf-8').read()
+    assert chrome in src and chrome in fisheye
+    tele = src.replace(chrome, '').replace(lens_block, '    lens { preset telephoto }')
+    wide = src.replace(chrome, '').replace(lens_block, '    lens { preset wide }')
     paths = {}
     for name, text in (('singlet', singlet), ('sky', sky), ('panel', panel), ('dg8', dg8), ('fog', fog),
-                       ('dgp', dgp)):
+                       ('dgp', dgp), ('tele', tele), ('wide', wide), ('fish', fisheye.replace(chrome, ''))):
         p = os.path.join(OUT, name + '.ftsl')
         open(p, 'w', encoding='utf-8', newline='').write(text)
         paths[name] = p
@@ -129,17 +144,40 @@ def compare(label, ref, img, regions, tol):
     return ok
 
 
+def tiles(ref, n=4, floor=0.25):
+    """The n x n tiles of the frame that `ref` lights to at least `floor` of its mean: regions
+    for a framing nobody hand-placed them in. A dark tile's ratio is mostly noise, and a
+    fisheye's corners get no light at all."""
+    h, w = ref.shape
+    out = {}
+    for i in range(n):
+        for j in range(n):
+            box = (i * h // n, (i + 1) * h // n, j * w // n, (j + 1) * w // n)
+            if ref[box[0]:box[1], box[2]:box[3]].mean() >= floor * ref.mean():
+                out[f'{i}{j}'] = box
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--exe', default=os.path.join(ROOT, 'ftrace.exe'))
     ap.add_argument('--cpu-only', action='store_true')
+    ap.add_argument('--only', default='', help='comma-separated sections to run (default: all): ' +
+                    ', '.join(SECTIONS))
     a = ap.parse_args()
+    only = {s.strip() for s in a.only.split(',') if s.strip()}
+    if only - set(SECTIONS):
+        ap.error(f'unknown section(s) {", ".join(sorted(only - set(SECTIONS)))}; choose from {", ".join(SECTIONS)}')
+
+    def want(section):
+        return not only or section in only
+
     exe = os.path.abspath(a.exe)
     os.makedirs(OUT, exist_ok=True)
     scenes = write_scenes()
     devices = ['cpu'] if a.cpu_only else ['cpu', 'gpu']
     allok = True
-    for lens in ('achromat', 'singlet'):
+    for lens in [s for s in ('achromat', 'singlet') if want(s)]:
         print(f'{lens}:')
         refdev = 'gpu' if 'gpu' in devices else 'cpu'
         ref = render(exe, scenes[lens], f'{lens}_R', ['-mode', 'R', '-spp', '4096', '-device', refdev])
@@ -162,41 +200,85 @@ def main():
                     allok = False
                     continue
                 allok = compare(f'{mode} on the {dev.upper()}', ref, img, REGIONS, TOL) and allok
-    print('double Gauss at f/8 (front element ~6x the beam):')
-    refdev = 'gpu' if 'gpu' in devices else 'cpu'
-    ref = render(exe, scenes['dg8'], 'dg8_R', ['-mode', 'R', '-spp', '16384', '-device', refdev])
-    if ref is None:
-        return 1
-    # Unaimed, R's camera rays use ~5% of the rear element at f/8, hence 16x the samples.
-    if refdev == 'gpu':
-        img = render(exe, scenes['dg8'], 'dg8_R_cpu', ['-mode', 'R', '-spp', '4096', '-device', 'cpu'])
-        allok = (img is not None and compare('R on the CPU', ref, img, REGIONS, TOL)) and allok
-    img = render(exe, scenes['dg8'], f'dg8_R_{refdev}_front', ['-mode', 'R', '-spp', '65536', '-device', refdev],
-                 env={'FTRACE_LENS_FRONT': '1'})
-    allok = (img is not None and compare(f'R on the {refdev.upper()}, unaimed', ref, img, REGIONS, TOL)) and allok
-    for dev in devices:
-        for mode, args in (('A', ['-n', '200000000']), ('D', ['-spp', '4096'])):
-            img = render(exe, scenes['dg8'], f'dg8_{mode}_{dev}', ['-mode', mode, '-device', dev] + args)
-            allok = (img is not None and compare(f'{mode} on the {dev.upper()}', ref, img, REGIONS, TOL)) and allok
-    # Mode J is held to itself rather than to R: its merges read this fog 3-4% low with no lens
-    # at all (known-issues.md J-FOG-REALCAM), which would hide anything the lens adds. With the
-    # pupil table turned off (FTRACE_LENS_FRONT) the light image samples the whole front
-    # element and lensAimRatio is 1 everywhere, so the two renders differ only by what aiming
-    # changes -- in J, the merges' weighing of it on the camera's first segment.
-    print('the dgauss preset against its rows pasted as surface lines (mode R):')
-    refdev = 'gpu' if 'gpu' in devices else 'cpu'
-    ref = render(exe, scenes['dgrows'], 'dgrows_R', ['-mode', 'R', '-spp', '4096', '-device', refdev])
-    img = render(exe, scenes['dgp'], 'dgp_R', ['-mode', 'R', '-spp', '4096', '-device', refdev])
-    allok = (ref is not None and img is not None and compare('preset vs pasted rows', ref, img, REGIONS, TOL)) and allok
+    if want('dg8'):
+        print('double Gauss at f/8 (front element ~6x the beam):')
+        refdev = 'gpu' if 'gpu' in devices else 'cpu'
+        ref = render(exe, scenes['dg8'], 'dg8_R', ['-mode', 'R', '-spp', '16384', '-device', refdev])
+        if ref is None:
+            return 1
+        # Unaimed, R's camera rays use ~5% of the rear element at f/8, hence 16x the samples.
+        if refdev == 'gpu':
+            img = render(exe, scenes['dg8'], 'dg8_R_cpu', ['-mode', 'R', '-spp', '4096', '-device', 'cpu'])
+            allok = (img is not None and compare('R on the CPU', ref, img, REGIONS, TOL)) and allok
+        img = render(exe, scenes['dg8'], f'dg8_R_{refdev}_front', ['-mode', 'R', '-spp', '65536', '-device', refdev],
+                     env={'FTRACE_LENS_FRONT': '1'})
+        allok = (img is not None and compare(f'R on the {refdev.upper()}, unaimed', ref, img, REGIONS, TOL)) and allok
+        for dev in devices:
+            for mode, args in (('A', ['-n', '200000000']), ('D', ['-spp', '4096'])):
+                img = render(exe, scenes['dg8'], f'dg8_{mode}_{dev}', ['-mode', mode, '-device', dev] + args)
+                allok = (img is not None and compare(f'{mode} on the {dev.upper()}', ref, img, REGIONS, TOL)) and allok
+    # The published lenses as published, compared tile by tile (their framings differ). The
+    # telephoto's 5-degree field sees the green sphere alone; the wide-angle's retrofocus and
+    # the fisheye's 156 degrees bend camera rays far off axis, where the pupil tables' bins for
+    # the field's edge, and the light image's density there, carry the image. A tile is a few
+    # hundred pixels, not a region of thousands, so each render gets the budget that keeps its
+    # tiles' noise near 0.3%: the reference 4x the usual; unaimed R 16x (most of the wide-
+    # angle's and fisheye's unaimed camera rays never get out); the telephoto's A 10x (its
+    # 5-degree field sees few of the photons' vertices); the fisheye's D 4x (it looks straight
+    # at both lights).
+    published = (('tele', 'telephoto (250 mm f/5.6)', 2000000000, 4096),
+                 ('wide', 'wide-angle (22 mm f/2.8)', 200000000, 4096),
+                 ('fish', 'fisheye (10 mm f/4, 156 degrees)', 200000000, 16384))
+    for lens, title, nA, sppD in published if want('published') else ():
+        print(f'{title}, as published, by tile:')
+        refdev = 'gpu' if 'gpu' in devices else 'cpu'
+        ref = render(exe, scenes[lens], f'{lens}_R', ['-mode', 'R', '-spp', '16384', '-device', refdev])
+        if ref is None:
+            return 1
+        reg = tiles(ref)
+        if refdev == 'gpu':
+            img = render(exe, scenes[lens], f'{lens}_R_cpu', ['-mode', 'R', '-spp', '16384', '-device', 'cpu'])
+            allok = (img is not None and compare('R on the CPU', ref, img, reg, TOL)) and allok
+        img = render(exe, scenes[lens], f'{lens}_R_{refdev}_front', ['-mode', 'R', '-spp', '65536', '-device', refdev],
+                     env={'FTRACE_LENS_FRONT': '1'})
+        allok = (img is not None and compare(f'R on the {refdev.upper()}, unaimed', ref, img, reg, TOL)) and allok
+        for dev in devices:
+            for mode, args in (('A', ['-n', str(nA)]), ('D', ['-spp', str(sppD)])):
+                img = render(exe, scenes[lens], f'{lens}_{mode}_{dev}', ['-mode', mode, '-device', dev] + args)
+                allok = (img is not None and compare(f'{mode} on the {dev.upper()}', ref, img, reg, TOL)) and allok
+    if want('dgp'):
+        print('the dgauss preset against its rows pasted as surface lines (mode R):')
+        refdev = 'gpu' if 'gpu' in devices else 'cpu'
+        ref = render(exe, scenes['dgrows'], 'dgrows_R', ['-mode', 'R', '-spp', '4096', '-device', refdev])
+        img = render(exe, scenes['dgp'], 'dgp_R', ['-mode', 'R', '-spp', '4096', '-device', refdev])
+        allok = (ref is not None and img is not None and compare('preset vs pasted rows', ref, img, REGIONS, TOL)) and allok
+    if want('fog'):
+        allok = check_fog(exe, scenes, devices) and allok
+    if want('sky'):
+        allok = check_sky(exe, scenes, devices) and allok
+    if want('panel'):
+        allok = check_panel(exe, scenes, devices) and allok
+    print('PASS' if allok else 'FAIL')
+    return 0 if allok else 1
+
+
+def check_fog(exe, scenes, devices):
+    """The scene in fog through `preset dgauss` at f/4: D against R, J against unaimed J."""
+    allok = True
     print('fog through the lens (every mode at -max-bounce 8):')
     deep = ['-max-bounce', '8']
     ref = render(exe, scenes['fog'], 'fog_R', ['-mode', 'R', '-spp', '8192', '-device',
                                               'gpu' if 'gpu' in devices else 'cpu'] + deep)
     if ref is None:
-        return 1
+        return False
     for dev in devices:
         img = render(exe, scenes['fog'], f'fog_D_{dev}', ['-mode', 'D', '-spp', '4096', '-device', dev] + deep)
         allok = (img is not None and compare(f'D on the {dev.upper()}', ref, img, REGIONS, TOL)) and allok
+        # Mode J is held to itself rather than to R: its merges read this fog 3-4% low with no
+        # lens at all (known-issues.md J-FOG-REALCAM), which would hide anything the lens adds.
+        # With the pupil table turned off (FTRACE_LENS_FRONT) the light image samples the whole
+        # front element and lensAimRatio is 1 everywhere, so the two renders differ only by what
+        # aiming changes -- in J, the merges' weighing of it on the camera's first segment.
         # The two J renders weigh their techniques differently (aiming changes the light image's
         # density), so a bias in any one technique moves their totals apart. The CPU's J carries
         # one the GPU's does not -- with no lens at all CPU J reads this fog up to 2.8% off GPU J
@@ -211,26 +293,37 @@ def main():
         img = render(exe, scenes['fog'], f'fog_J_{dev}', jargs)
         allok = (img is not None and front is not None and
                  compare(f'J on the {dev.upper()}, vs unaimed', front, img, REGIONS, jtol)) and allok
+    return allok
+
+
+def check_sky(exe, scenes, devices):
+    """The achromat scene under a visible sky, in A: the sky imaged through the lens."""
+    allok = True
     print('sky through the lens:')
     sky_regions = {'sky': (3, 15, 38, 90), 'corner': (0, 8, 0, 15)}
     ref = render(exe, scenes['sky'], 'sky_R', ['-mode', 'R', '-spp', '4096', '-device',
                                               'gpu' if 'gpu' in devices else 'cpu'])
     if ref is None:
-        return 1
+        return False
     for dev in devices:
         img = render(exe, scenes['sky'], f'sky_A_{dev}', ['-mode', 'A', '-n', '200000000', '-device', dev])
         allok = (img is not None and compare(f'A on the {dev.upper()}', ref, img, sky_regions, TOL)) and allok
+    return allok
+
+
+def check_panel(exe, scenes, devices):
+    """A uniform emitter panel in C, the catch."""
+    allok = True
     print('catch (mode C) on a uniform panel:')
     panel_regions = {'centre': (14, 29, 18, 46)}
     ref = render(exe, scenes['panel'], 'panel_R', ['-mode', 'R', '-spp', '4096', '-device', 'cpu'], (64, 43))
     if ref is None:
-        return 1
+        return False
     for dev in devices:
         img = render(exe, scenes['panel'], f'panel_C_{dev}',
                      ['-mode', 'C', '-n', '3000000000' if dev == 'gpu' else '1000000000', '-device', dev], (64, 43))
         allok = (img is not None and compare(f'C on the {dev.upper()}', ref, img, panel_regions, 0.03)) and allok
-    print('PASS' if allok else 'FAIL')
-    return 0 if allok else 1
+    return allok
 
 
 if __name__ == '__main__':

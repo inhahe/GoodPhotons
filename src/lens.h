@@ -373,8 +373,9 @@ struct LensSystem {
         return stop;
     }
     int stopIndex() const { return stopIndex(entrancePupilScales()); }
-    // The paraxial f-number: focal length over the stop's entrance pupil diameter. 0 if it
-    // cannot be measured.
+    // The paraxial f-number: focal length over the stop's paraxial entrance pupil diameter. 0 if
+    // it cannot be measured. Only a diagnostic: the f-number the presets are sized for is
+    // tracedFNumber's.
     double fNumber() const {
         const std::vector<double> sc = entrancePupilScales();
         const int stop = stopIndex(sc);
@@ -382,11 +383,9 @@ struct LensSystem {
         const double f = focalLengthMM(), d = 2.0 * surf[stop].aperture * sc[(size_t)stop];
         return (d > 0.0 && f > 0.0) ? f / d : 0.0;
     }
-    // The f-number by the beam the lens really lets in: the widest pencil parallel to the axis
-    // that gets through every aperture at the design wavelength (bisection on its height),
-    // over the focal length. It differs from fNumber() by the pupil's aberration, which a fast
-    // simple lens makes large. 0 if nothing gets through.
-    double tracedFNumber() const {
+    // The radius (mm) of the widest pencil parallel to the axis that gets through every
+    // aperture at the design wavelength: the real entrance pupil's (bisection on its height).
+    double tracedPupilRadius() const {
         if (surf.empty()) return 0.0;
         double lo = 0.0, hi = surf[0].aperture;              // nothing past the front rim gets in
         for (int k = 0; k < 60; ++k) {
@@ -395,20 +394,46 @@ struct LensSystem {
             if (trace(Vec3(h, 0.0, T + 1.0), Vec3(0.0, 0.0, -1.0), 587.6, /*sensorToScene=*/false, out)) lo = h;
             else hi = h;
         }
-        const double f = focalLengthMM();
-        return (lo > 0.0 && f > 0.0) ? f / (2.0 * lo) : 0.0;
+        return lo;
     }
-    // Size the stop so the lens works at f/`fstop` paraxially, but no wider than `maxAperture`
-    // (mm) when that is positive. Leaves the lens alone if the f-number cannot be measured.
+    // The f-number by the beam the lens really lets in: the focal length over the real
+    // entrance pupil's diameter (tracedPupilRadius). It is the f-number lens designers quote,
+    // and the one exposure follows; the paraxial one (fNumber) misjudges it by the pupil's
+    // aberration, which a published lens at its full opening makes up to 4%. 0 if nothing gets
+    // through.
+    double tracedFNumber() const {
+        const double r = tracedPupilRadius(), f = focalLengthMM();
+        return (r > 0.0 && f > 0.0) ? f / (2.0 * r) : 0.0;
+    }
+    // Size the stop so the lens lets in exactly an f/`fstop` beam (tracedFNumber), but open
+    // it no wider than `maxAperture` (mm) when that is positive. The search starts from the
+    // paraxial size and allows up to twice it; when no stop in that range lets the beam in
+    // (the cap, the front rim or a fast lens's aberration limits it first), the stop is left at
+    // the cap, else at the paraxial size, and tracedFNumber says what the lens does. Leaves
+    // the lens alone if the f-number cannot be measured.
     void setFNumber(double fstop, double maxAperture = 0.0) {
         const std::vector<double> sc = entrancePupilScales();
         const int stop = stopIndex(sc);
         if (stop < 0 || !(fstop > 0.0)) return;
         const double f = focalLengthMM();
         if (!(sc[(size_t)stop] > 0.0 && f > 0.0)) return;
-        double a = f / (2.0 * fstop) / sc[(size_t)stop];
-        if (maxAperture > 0.0) a = std::min(a, maxAperture);
-        surf[stop].aperture = a;
+        const double want = f / (2.0 * fstop);                // the entrance pupil's radius
+        const double paraxial = want / sc[(size_t)stop];
+        double& a = surf[(size_t)stop].aperture;
+        const double hi = (maxAperture > 0.0) ? maxAperture : 2.0 * paraxial;
+        a = hi;
+        if (tracedPupilRadius() < want) {
+            a = (maxAperture > 0.0) ? maxAperture : paraxial;
+            return;
+        }
+        // The beam widens with the stop until something else limits it: the smallest stop
+        // that lets it in.
+        double lo = 0.0, up = hi;
+        for (int k = 0; k < 60; ++k) {
+            a = 0.5 * (lo + up);
+            if (tracedPupilRadius() >= want) up = a; else lo = a;
+        }
+        a = up;
     }
 
     // Effective focal length (mm), measured from a near-axis parallel probe at the
@@ -459,9 +484,10 @@ struct LensSystem {
 // element and the film's edge are all in them (lenspupil::fitRegion). Per bin, over points
 // from the bin widened by 15% on every side: rays drawn the old way (uniform on the element)
 // find where light gets through; rays aimed inside a growing ellipse find its edge; the region
-// is fitted and padded; then fresh batches of uniform rays check that nothing getting through
-// falls outside, enlarging the region over anything that does, until a whole batch finds
-// nothing (the count is kept for -checklens). A bin keeps the unaimed sampler where aiming
+// is fitted and padded; then batches of rays aimed just past its edge, and fresh batches of
+// uniform rays, check that nothing getting through falls outside, enlarging the region over
+// anything that does, until a whole batch of each finds nothing (the count is kept for
+// -checklens). A bin keeps the unaimed sampler where aiming
 // would not pay -- the stop already fills the element -- or where its region never comes
 // clean, and a bin where no light got through, nor in any neighbouring bin, rejects outright,
 // before any tracing. The film edge used is a circle round the sensor's corners, which the
@@ -666,7 +692,38 @@ inline bool fitRegion(Pcg32& rng, U&& uniformRay, A&& aimRay, double scale, Lens
     R.cx = cx;
     if (s <= 1.05) { R.kind = LensPupil::AIM;    R.a = a * s * 1.03 + 1e-4 * scale; R.b = b * s * 1.03 + 1e-4 * scale; }
     else           { R.kind = LensPupil::AIMBOX; R.a = a * 1.03 + 1e-4 * scale;     R.b = b * 1.03 + 1e-4 * scale; }
-    // Check with fresh uniform rays that whatever gets through falls inside, enlarging over any
+    // Check the edge with rays aimed into the band just past it, out to 30% beyond (uniform in
+    // how far out, round the whole rim), where anything the fit missed lies, enlarging over
+    // whatever gets through, until a whole batch finds nothing. The uniform batches below see
+    // the whole element, but where little of it reaches the film (a fisheye's front element
+    // passes under 1% of them) a batch holds a few dozen crossings, too few to find a region's
+    // sparse extremes. A region whose edge never comes clean keeps the unaimed sampler.
+    bool edgeClean = false;
+    for (int round = 0; round < 8 && !edgeClean; ++round) {
+        double grow = 1.0;
+        for (int k = 0; k < 4096; ++k) {
+            const double q = 1.0 + 0.3 * rng.uniform(), v = rng.uniform(), w = rng.uniform();
+            double ex, ey;
+            if (R.kind == LensPupil::AIMBOX) {
+                // The rectangle's rim scaled by q, uniform along it: a top or bottom side (length
+                // 2a each) or a left or right one (2b each).
+                const double s = 2.0 * v - 1.0, side = (w < 0.5) ? -1.0 : 1.0;
+                if (rng.uniform() * (R.a + R.b) < R.a) { ex = R.cx + q * R.a * s;    ey = q * R.b * side; }
+                else                                   { ex = R.cx + q * R.a * side; ey = q * R.b * s; }
+            } else {
+                const double an = 2.0 * PI * v;
+                ex = R.cx + q * R.a * std::cos(an);
+                ey = q * R.b * std::sin(an);
+            }
+            if (aimRay(ex, ey) != 1) continue;
+            const double qq = pupilRegionNorm(R, ex, std::fabs(ey));
+            if (qq > 1.0) { ++enlarged; grow = std::max(grow, qq); }
+        }
+        if (grow > 1.0) { R.a *= grow * 1.03; R.b *= grow * 1.03; }
+        else edgeClean = true;
+    }
+    if (!edgeClean) { C.kind = LensPupil::FRONT; return true; }
+    // Then with fresh uniform rays that whatever gets through falls inside, enlarging over any
     // that does not, until a whole batch finds nothing outside. A region that never comes clean
     // keeps the unaimed sampler.
     bool clean = false;
@@ -922,8 +979,9 @@ inline std::shared_ptr<const LensPupil> lensPupilFor(const std::shared_ptr<LensS
 // in millimetres. The singlet and the achromat are physically derived (lensmaker /
 // achromat equations), not fabricated data, so the focal length and (for the
 // achromat) the chromatic correction are correct by construction; dispersion during
-// rendering comes from the real Sellmeier glass indices. The double Gauss is the
-// other kind: a published prescription (makeDoubleGauss), scaled and stopped down.
+// rendering comes from the real Sellmeier glass indices. The double Gauss, telephoto,
+// wide-angle and fisheye are the other kind: published prescriptions (makePublishedLens),
+// scaled and stopped down.
 // ---------------------------------------------------------------------------
 
 // Abbe number V_d = (n_d - 1)/(n_F - n_C) from a Sellmeier index function.
@@ -967,13 +1025,15 @@ inline bool lensThickenElements(LensSystem& L) {
     if (changed) L.finalize();
     return changed;
 }
-// A generator's last steps: elements thick enough for a real edge, the focal length exactly
-// `focalMM`, the stop sized for f/`fstop` and no wider than `maxStopPerMM` * focalMM when that
-// is positive. Repeated until thickening changes nothing, since scaling and the stop move the
+// A generator's last steps: elements thick enough for a real edge (unless `thicken` is false,
+// for a published design, physical as it stands), the focal length exactly `focalMM`, the stop
+// sized for f/`fstop` (kept when <= 0) and no wider than `maxStopPerMM` * focalMM when that is
+// positive. Repeated until thickening changes nothing, since scaling and the stop move the
 // apertures the edges are checked at. Then focus at infinity.
-inline void lensFinishPreset(LensSystem& L, double focalMM, double fstop, double maxStopPerMM = 0.0) {
+inline void lensFinishPreset(LensSystem& L, double focalMM, double fstop, double maxStopPerMM = 0.0,
+                             bool thicken = true) {
     for (int pass = 0; pass < 50; ++pass) {
-        const bool thickened = lensThickenElements(L);
+        const bool thickened = thicken && lensThickenElements(L);
         L.scaleToFocal(focalMM);
         L.setFNumber(fstop, maxStopPerMM > 0.0 ? maxStopPerMM * L.focalLengthMM() : 0.0);
         if (!thickened && pass > 0) break;
@@ -981,23 +1041,26 @@ inline void lensFinishPreset(LensSystem& L, double focalMM, double fstop, double
     L.focusAt(0.0);
 }
 
-// A single biconvex glass singlet of focal length `focalMM` at f/`fstop`. The clear
-// semi-diameter (= focal/(2*fstop)) doubles as the aperture stop. Strong spherical
+// A single biconvex glass singlet of focal length `focalMM` at f/`fstop`. The front face's
+// clear semi-diameter (= focal/(2*fstop)) doubles as the aperture stop. Strong spherical
 // and chromatic aberration on purpose — the simplest "real lens".
 inline LensSystem makeSinglet(double focalMM, double fstop, const Spectrum& glass) {
     double nd = glass(587.6);
     double f  = focalMM;
     double R  = 2.0 * (nd - 1.0) * f;                     // equiconvex: 1/f=(n-1)(2/R)
     double semi = std::fmax(1.0, f / (2.0 * std::fmax(0.5, fstop)));
+    // The front face is the stop; the rear one clears the beam by 5%, as the achromat's
+    // elements do, so it never trims the axial pencil the stop is sized for.
+    const double apRear = 1.05 * semi;
     // A plausible centre thickness, and at least enough for an edge at the clear aperture.
-    double ct = std::fmax(std::fmax(1.5, 0.12 * semi), lensEdgeMin(semi) - lensEdgeGain(-R, +R, semi));
+    double ct = std::fmax(std::fmax(1.5, 0.12 * semi), lensEdgeMin(apRear) - lensEdgeGain(-R, +R, apRear));
     LensSystem L; L.name = "singlet";
     // The lensmaker radii above are in the object->image sign convention; our lens
     // frame stores curvature as `centre = vertex + radius` with +z toward the scene
     // (the PBRT convention), which is the opposite sign — so the front convex surface
     // takes -R and the rear +R to make a converging element.
     L.surf.push_back({ -R, ct,  glass,            semi });   // front (convex toward scene)
-    L.surf.push_back({ +R, f,   iorConstant(1.0), semi });   // back; rear gap ~ f (autofocus refines)
+    L.surf.push_back({ +R, f,   iorConstant(1.0), apRear }); // back; rear gap ~ f (autofocus refines)
     L.finalize();
     // The lensmaker equation is the thin lens's: the thickness moves the focal length off it.
     lensFinishPreset(L, focalMM, fstop);
@@ -1054,72 +1117,121 @@ inline LensSystem makeAchromat(double focalMM, double fstop,
     return L;
 }
 
-// A real prescription: the 50 mm f/2 double Gauss of pbrt's dgauss.50mm.dat (Tronnier, US
-// 2,673,491; Smith, Modern Lens Design, p. 312), the classic normal-lens layout -- two
-// meniscus groups round a central stop. The rows are as published: radius in the published
-// sign convention (centre of curvature on the sensor side when positive, negated below into
-// this frame; 0 is the stop), gap to the next surface, refractive index, semi-aperture (the
-// file's diameters halved). The file gives each glass a single index, so the preset has no
-// dispersion. Scaled so its focal length is exactly `focalMM`; the stop is sized from its own
-// entrance-pupil magnification so the lens works at exactly f/`fstop`, but opens no wider than
-// the design's own stop, f/2.03 by that measure (a larger one would only be clipped by the
-// elements round it).
-inline LensSystem makeDoubleGauss(double focalMM, double fstop) {
-    static const double rows[11][4] = {
-        { 29.475, 3.76,  1.67,  12.6 }, { 84.83,  0.12,  1.0,   12.6 }, { 19.275, 4.025, 1.67,  11.5 },
-        { 40.77,  3.275, 1.699, 11.5 }, { 12.75,  5.705, 1.0,   9.0  }, { 0.0,    4.5,   1.0,   8.55 },
-        {-14.495, 1.18,  1.603, 8.5  }, { 40.77,  6.065, 1.658, 10.0 }, {-20.385, 0.19,  1.0,   10.0 },
-        { 437.065, 3.22, 1.717, 10.0 }, {-39.73,  40.0,  1.0,   10.0 }};
-    LensSystem L; L.name = "dgauss";
+// ---- published prescriptions ------------------------------------------------------------
+// Real lenses, from pbrt's lens files (pbrt-v4-scenes/lenses), each the scaled version of a
+// design in Smith, "Modern Lens Design" (MLD). The rows are the files' own, untouched:
+// radius in the published sign convention (centre of curvature on the sensor side when
+// positive; 0 is the aperture stop), gap to the next surface (the last one's 0: autofocus
+// places the sensor), refractive index (0 for air, as the stop rows write it), and aperture
+// DIAMETER. Each glass has a single index, so these presets have no dispersion. They are left
+// as published -- never thickened -- and scaled as a whole.
+struct PublishedLens { const char* name; const double (*rows)[4]; int n; };
+
+// dgauss.50mm.dat: D-GAUSS F/2 22deg HFOV, US patent 2,673,491 (Tronnier), MLD p. 312, scaled
+// to 50 mm from 100 mm. The classic normal lens: two meniscus groups round a central stop.
+inline const double kLensDGauss[11][4] = {
+    { 29.475,  3.76,  1.67,  25.2 }, { 84.83,   0.12,  1.0,   25.2 }, { 19.275,  4.025, 1.67,  23.0 },
+    { 40.77,   3.275, 1.699, 23.0 }, { 12.75,   5.705, 1.0,   18.0 }, { 0.0,     4.5,   0.0,   17.1 },
+    {-14.495,  1.18,  1.603, 17.0 }, { 40.77,   6.065, 1.658, 20.0 }, {-20.385,  0.19,  1.0,   20.0 },
+    { 437.065, 3.22,  1.717, 20.0 }, {-39.73,   0.0,   1.0,   20.0 }};
+// telephoto.250mm.dat: SIGLER super achromate telephoto, EFL 254 mm, f/5.6, MLD p. 175, scaled
+// to 250 mm from 100 mm. A positive front group, the stop, a negative rear group: the lens is
+// shorter than its focal length.
+inline const double kLensTelephoto[7][4] = {
+    { 54.6275, 12.52,   1.529, 47.5 }, {-86.365,   3.755,  1.599, 44.5 }, { 271.7625, 2.8175, 1.0, 41.5 },
+    { 0.0,     67.4125, 0.0,   40.5 }, {-32.13,    3.755,  1.613, 31.5 }, { 49.5325, 12.52,   1.603, 33.5 },
+    {-50.945,  0.0,     1.0,   37.0 }};
+// wide.22mm.dat: wide-angle (38 degree) lens, Nakamura, MLD p. 360, scaled to 22 mm from 100 mm.
+// A negative front meniscus ahead of the stop, the retrofocus layout that buys back focus.
+inline const double kLensWide[13][4] = {
+    { 35.98738,  1.21638, 1.54,  23.716 }, { 11.69718,  9.9957,  1.0,   17.996 },
+    { 13.08714,  5.12622, 1.772, 12.364 }, {-22.63294,  1.76924, 1.617,  9.812 },
+    { 71.05802,  0.8184,  1.0,    9.152 }, { 0.0,       2.27766, 0.0,    8.756 },
+    { -9.58584,  2.43254, 1.617,  8.184 }, {-11.28864,  0.11506, 1.0,    9.152 },
+    {-166.7765,  3.09606, 1.713, 10.648 }, { -7.5911,   1.32682, 1.805, 11.44  },
+    {-16.7662,   3.98068, 1.0,   12.276 }, { -7.70286,  1.21638, 1.617, 13.42  },
+    {-11.97328,  0.0,     1.0,   17.996 }};
+// fisheye.10mm.dat: Muller 16 mm f/4 155.9-degree fisheye, MLD p. 164, scaled to 10 mm from
+// 100 mm. Two strongly curved negative menisci bend light from nearly 80 degrees off axis into
+// the rest of the lens -- the case a front-element sampler wastes most on (well under 1% of
+// its rays get through).
+inline const double kLensFisheye[12][4] = {
+    { 30.2249,  0.8335, 1.62,  30.34 }, { 11.3931,  7.4136, 1.0,   20.68 }, { 75.2019,  1.0654, 1.639, 17.8 },
+    {  8.3349, 11.1549, 1.0,   13.42 }, {  9.5882,  2.0054, 1.654,  9.02 }, { 43.8677,  5.3895, 1.0,    8.14 },
+    {  0.0,     1.4163, 0.0,    6.08 }, { 29.4541,  2.1934, 1.517,  5.96 }, { -5.2265,  0.9714, 1.805,  5.84 },
+    {-14.2884,  0.0627, 1.0,    5.96 }, {-22.3726,  0.94,   1.673,  5.96 }, {-15.0404,  0.0,    1.0,    6.52 }};
+
+inline const PublishedLens kPublishedLenses[] = {
+    { "dgauss",    kLensDGauss,    11 },
+    { "telephoto", kLensTelephoto,  7 },
+    { "wide",      kLensWide,      13 },
+    { "fisheye",   kLensFisheye,   12 },
+};
+
+// Build a published lens: scaled so its focal length is exactly `focalMM` (<= 0 keeps the
+// published size), its stop sized so it lets in exactly an f/`fstop` beam (<= 0 keeps the
+// design's own opening), but never wider than the design's stop (a larger one would only be
+// clipped by the elements round it). A row of radius 0 is the stop, as pbrt's files mark it.
+inline LensSystem makePublishedLens(const PublishedLens& P, double focalMM, double fstop) {
+    LensSystem L;
+    L.name = P.name;
     int stop = -1;
-    for (const auto& r : rows) {
+    for (int i = 0; i < P.n; ++i) {
+        const double* r = P.rows[i];
         LensSurface s;
-        s.radius = (r[0] == 0.0) ? 0.0 : -r[0];
+        s.radius = (r[0] == 0.0) ? 0.0 : -r[0];          // published convention -> this frame
         s.thickness = r[1];
-        s.ior = iorConstant(r[2]);
-        s.aperture = r[3];
+        s.ior = iorConstant(r[2] == 0.0 ? 1.0 : r[2]);    // 0 is air
+        s.aperture = 0.5 * r[3];                          // diameter -> semi-aperture
         s.isStop = (r[0] == 0.0);
-        if (s.isStop) stop = (int)L.surf.size();
+        if (s.isStop && stop < 0) stop = (int)L.surf.size();
         L.surf.push_back(s);
     }
     L.finalize();
-    // Its widest opening is the design's own stop, which scales with the lens. Its published
-    // elements are all thicker at the edge than lensEdgeMin asks, so finishing leaves them be.
     const double f0 = L.focalLengthMM();
-    lensFinishPreset(L, focalMM > 0.0 ? focalMM : f0, fstop, f0 > 0.0 ? L.surf[stop].aperture / f0 : 0.0);
+    const double maxStopPerMM = (f0 > 0.0 && stop >= 0) ? L.surf[stop].aperture / f0 : 0.0;
+    lensFinishPreset(L, focalMM > 0.0 ? focalMM : f0, fstop, maxStopPerMM, /*thicken=*/false);
     return L;
 }
+inline const PublishedLens* findPublishedLens(const std::string& key) {
+    for (const PublishedLens& P : kPublishedLenses) if (key == P.name) return &P;
+    return nullptr;
+}
 
-// Resolve a named lens preset into a prescription, scaled to `focalMM` at f/`fstop`.
-// Known names: singlet/biconvex, achromat/doublet, telephoto (achromat), wide/wide-
-// angle (short-focal achromat), dgauss/doublegauss (a real double Gauss, makeDoubleGauss).
+// The canonical name of a preset (`k` already lowercased with spaces, '_' and '-' removed):
+// the aliases folded in, "" if unknown.
+inline std::string lensPresetName(const std::string& k) {
+    if (k == "singlet" || k == "biconvex" || k == "simple") return "singlet";
+    if (k == "achromat" || k == "doublet") return "achromat";
+    if (k == "dgauss" || k == "doublegauss") return "dgauss";
+    if (k == "telephoto" || k == "tele") return "telephoto";
+    if (k == "wide" || k == "wideangle") return "wide";
+    if (k == "fisheye") return "fisheye";
+    return "";
+}
+// Is the preset a published prescription (true), or designed from formulas (false)?
+inline bool lensPresetIsPublished(const std::string& canonical) {
+    return findPublishedLens(canonical) != nullptr;
+}
+
+// Resolve a named lens preset into a prescription. The formula-built ones (singlet,
+// achromat) take `focalMM` (50 when <= 0) and f/`fstop` (2.8 when <= 0); the published ones
+// (dgauss, telephoto, wide, fisheye) keep their own size and opening for a value <= 0.
 // Returns false on an unknown name.
 inline bool resolveLensPreset(const std::string& name, double focalMM, double fstop,
                               LensSystem& out) {
     std::string k;
     for (char c : name) { if (c == ' ' || c == '_' || c == '-') continue; k += (char)std::tolower((unsigned char)c); }
+    const std::string canon = lensPresetName(k);
+    if (canon.empty()) return false;
+    if (const PublishedLens* P = findPublishedLens(canon)) {
+        out = makePublishedLens(*P, focalMM, fstop);
+        return true;
+    }
+    if (focalMM <= 0.0) focalMM = 50.0;
     if (fstop   <= 0.0) fstop   = 2.8;
     const Spectrum bk7 = defaultGlass("BK7"), sf10 = defaultGlass("SF10");
-    // An unset focal length (<= 0) takes the preset's own: 135 mm for the telephoto, 28 mm for
-    // the wide, 50 mm otherwise.
-    const bool ownFocal = (k == "telephoto" || k == "tele" || k == "wide" || k == "wideangle");
-    if (!ownFocal && focalMM <= 0.0) focalMM = 50.0;
-    if (k == "singlet" || k == "biconvex" || k == "simple") {
-        out = makeSinglet(focalMM, fstop, bk7); out.name = "singlet"; return true;
-    }
-    if (k == "achromat" || k == "doublet") {
-        out = makeAchromat(focalMM, fstop, bk7, sf10); out.name = "achromat"; return true;
-    }
-    if (k == "telephoto" || k == "tele") {                 // long achromat
-        double f = focalMM > 0.0 ? focalMM : 135.0;
-        out = makeAchromat(f, fstop, bk7, sf10); out.name = "telephoto"; return true;
-    }
-    if (k == "wide" || k == "wideangle") {                 // short achromat
-        double f = focalMM > 0.0 ? focalMM : 28.0;
-        out = makeAchromat(f, fstop, bk7, sf10); out.name = "wide"; return true;
-    }
-    if (k == "dgauss" || k == "doublegauss") {             // a real prescription
-        out = makeDoubleGauss(focalMM, fstop); return true;
-    }
-    return false;
+    if (canon == "singlet") { out = makeSinglet(focalMM, fstop, bk7); out.name = "singlet"; return true; }
+    out = makeAchromat(focalMM, fstop, bk7, sf10); out.name = "achromat";
+    return true;
 }

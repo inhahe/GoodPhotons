@@ -6425,25 +6425,40 @@ as the one at fault.
   come from `defaultGlass` (`spectral_library.h`): the `data/glass` file, else the same Schott
   Sellmeier fit built in, so a binary away from its data renders the same glass. An achromat is
   designed from its glasses' dispersion, and `makeAchromat` refuses two glasses without a
-  difference in it (the loader reports it) rather than design a NaN camera. `makeDoubleGauss`
-  (preset `dgauss`, 0.397.0) is the one preset that is a published prescription rather than a
-  design: pbrt's 50 mm f/2 double Gauss, scaled by focal / its measured focal length, its stop
-  sized for exactly f/`fstop` and capped at the design's opening (f/2.03); one index per glass,
-  as published, so no dispersion. The paraxial helpers it uses are shared:
-  `LensSystem::entrancePupilScales` (one unclipped probe pass: each surface's pupil
-  magnification), `stopIndex` (the marked stop, else the smallest entrance pupil -- the pupil
-  tables' stop too), `fNumber` and `setFNumber`. Paraxial probes (`focusAt`, `focalLengthMM`, the pupil probes) pass
-  `clip = false` to hitSurface / trace, so a stop smaller than the probe cannot defeat them.
+  difference in it (the loader reports it) rather than design a NaN camera. Four presets are
+  published prescriptions rather than designs (`dgauss` 0.397.0; `telephoto`, `wide`, `fisheye`
+  0.398.0, which before were achromats at 135 / 28 mm): pbrt's lens files, kept in `lens.h` as
+  `kPublishedLenses` rows exactly as published (radius, thickness, ior with 0 for air, aperture
+  diameter) so a row can be checked against the file by eye. `makePublishedLens` negates the
+  radii into ftrace's frame (`LENS-SURFACE-SIGN`), halves the diameters, and finishes through
+  `lensFinishPreset` with `thicken = false` (a published lens's edges are its designer's), a
+  focal length and f-number of 0 meaning "as published" (readLens passes 0 when the scene
+  names neither), and `maxStopPerMM` = the design's own stop per mm of focal length, so no
+  scaling or `fstop` opens it past its design. One index per glass, as published, so no
+  dispersion. `-checklens` (12) locks each one's rows by its native focal length and its
+  paraxial and traced openings, computed apart by an independent trace of the rows. The
+  helpers they use are shared: `LensSystem::entrancePupilScales` (one unclipped probe pass:
+  each surface's paraxial pupil magnification), `stopIndex` (the marked stop, else the
+  smallest entrance pupil -- the pupil tables' stop too), `fNumber` (paraxial, a diagnostic),
+  `tracedPupilRadius` / `tracedFNumber` (the widest on-axis pencil that gets through every
+  aperture at 587.6 nm, by bisection: the real entrance pupil) and `setFNumber`. Since 0.398.0
+  `fstop` means the traced f-number -- what designers quote (the published lenses' traced
+  openings are their labels, f/2, f/5.6, f/4, where the paraxial ones are up to 4% off by
+  pupil aberration) and what exposure follows: setFNumber bisects the stop's aperture for the
+  smallest one that lets the f/`fstop` beam through, searching up to the cap (or twice the
+  paraxial size), and where no stop does -- the cap, or a fast simple lens whose aberration
+  narrows the beam first -- leaves it at the cap, else the paraxial size. Paraxial probes
+  (`focusAt`, `focalLengthMM`, the pupil probes) pass `clip = false` to hitSurface / trace,
+  so a stop smaller than the probe cannot defeat them.
   All three generators end in `lensFinishPreset` (0.397.1): thicken any element whose faces
   come closer than `lensEdgeMin` (8% of the aperture) at its clear aperture
   (`lensThickenElements`; the achromat's crown had been thinner than its curves),
   `scaleToFocal` (the singlet's and achromat's formulas are thin-lens ones), `setFNumber`,
   repeated until thickening changes nothing (scaling and the stop move the apertures the
-  edges are checked at), then focus. The double Gauss's published edges all exceed the
-  minimum, so it is left as published. `-checklens` (12) checks focal length, the paraxial
-  f-number, the edges, and the traced f-number (`tracedFNumber`, the widest beam that gets
-  through) for slow and fast presets; readLens reports a traced opening more than 2% off the
-  f-number asked for.
+  edges are checked at), then focus. `-checklens` (12) checks focal length, the traced
+  f-number (exact, or the cap's, or for a fast lens the paraxial size kept) and the edges
+  for slow and fast presets; readLens reports a traced opening more than 2% off the f-number
+  asked for.
   - **The physical lens in both directions (0.394.0).** `genLensRay` is the camera's own
     direction, film -> glass -> scene (modes R, D, J). Light tracing needs the reverse, and
     three functions provide it, after Hanika & Dachsbacher 2014. `lensEntry` samples a point
@@ -6478,9 +6493,11 @@ as the one at fault.
     field's edge, whose horns an ellipse would need densely sampled to be sure of). Built by
     tracing over points from the bin widened 15% on every side (a region's extremes sit at the
     bin's edges): uniform rays find the light, aimed rays grow an ellipse until none that pass
-    come near its rim, the fit is padded 3%, and fresh uniform batches enlarge it over anything
-    that still falls outside until one whole batch finds nothing (a bin that never comes clean
-    keeps the front sampler); the bin aims only if the aimed hit rate beats the uniform one by
+    come near its rim, the fit is padded 3%, then batches aimed over the region widened 30%
+    (the band past its edge) and fresh uniform batches enlarge it over anything that still
+    falls outside until one whole batch of each finds nothing (a bin that never comes clean
+    keeps the front sampler; the aimed batches are what find a region's sparse extremes where
+    under 1% of uniform rays get through, as for the fisheye's front element, 0.398.0); the bin aims only if the aimed hit rate beats the uniform one by
     10%. Unlit bins with no lit neighbour reject (`classify` -> -2) before any trace. Rotational
     symmetry: a bin is built at azimuth 0 and rotated to the point's. `lensEntry` aims where the
     table says (`omega = cos_P * A_ellipse / |P - p|^2`, the solid angle per sample;
@@ -6521,15 +6538,20 @@ as the one at fault.
     limit. The forward modes' directly seen sky goes through the lens too
     (`addEnvBackgroundLens`): monochromatic camera rays averaged per pixel, their count growing
     with photons per pixel, kept in a running sum for the last camera. `-checklens` pins it all
-    on a planar-rear achromat, a curved-rear singlet and pbrt's double Gauss at f/8: the
+    on a planar-rear achromat, a curved-rear singlet, pbrt's double Gauss at f/8 and the
+    published telephoto, wide-angle and fisheye as published (the test cone, and the spread of
+    its off-axis points, scale with each lens's field, up to 89 degrees for the fisheye): the
     density integrates to the unvignetted share of genLensRay's samples, every camera ray reads
     back with a nonzero density, the connection and the catch agree on a point source's flux
     and image position at 2 m and at 5 km, no front-sampler ray that reaches the film falls
     outside its bin's ellipse or in a rejecting bin, the aimed entry's density is the one
     lensAimRatio recomputes, and aimed and uniform connections agree on and off axis.
     `tools/check_physlens.py` is the end-to-end gate on top: realcam's
-    achromat and a curved-rear singlet in R, A, B and D, a visible sky in A, and a uniform panel
-    in C, CPU and GPU, region means against R within 1% (3% for the catch) -- what a
+    achromat and a curved-rear singlet in R, A, B and D, the double Gauss at f/8 and the
+    published telephoto, wide-angle and fisheye in A and D (the last three by tiles of the
+    frame, bright ones only, since each frames the scene differently), a visible sky in A,
+    and a uniform panel in C, CPU and GPU, region means against R within 1% (3% for the
+    catch) -- what a
     normalisation slip in one estimator, or a mis-transcribed device twin, would break (a light
     image 10% too bright moves D by only 1-2.6%, MIS giving it part of each pixel, hence the
     tight bound; a correct build stays within 0.5%). A lens camera nobody chose a mode

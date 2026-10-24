@@ -1,0 +1,57 @@
+# A real fisheye: pbrt's fisheye.10mm.dat (Muller's 16 mm f/4 155.9-degree fisheye, Modern
+# Lens Design p. 164, scaled to 10 mm), built in as `preset fisheye`. Two strong negative menisci at
+# the front bend light in from nearly 80 degrees off axis, so the lens sees a 156-degree
+# field and draws it as a disc on the full-frame sensor: straight lines that do not pass
+# through the centre of the frame curve, ever more toward the rim, and the corners are dark
+# (no ray gets through the lens to them). The checkered floor and walls are there to show it.
+#
+#   ftrace -in scenes/realcam_fisheye.ftsl -spp 256 -o png/realcam_fisheye.png        (mode R)
+#   ftrace -in scenes/realcam_fisheye.ftsl -mode D -spp 64 -o png/realcam_fisheye_d.png
+#
+# The scene is realcam.ftsl's spheres and lights in a checkered room; the camera stands closer,
+# inside the room, so the walls fill the wide field.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+pattern  "tiles"  { type checker  size 0.25 }
+material "pale"   { type diffuse    reflect rgb 0.7 0.68 0.64 }
+material "dark"   { type diffuse    reflect rgb 0.12 0.12 0.14 }
+material "floor"  { type mix  layer "pale" 0.5  layer "dark" 0.5  weight_map pattern:tiles }
+material "lwall"  { type diffuse    reflect rgb 0.55 0.3 0.25 }
+material "rwall"  { type diffuse    reflect rgb 0.25 0.4 0.55 }
+material "ceil"   { type diffuse    reflect rgb 0.6 0.6 0.6 }
+material "red"    { type diffuse    reflect rgb 0.75 0.15 0.12 }
+material "green"  { type diffuse    reflect rgb 0.15 0.6 0.2 }
+material "blue"   { type diffuse    reflect rgb 0.15 0.25 0.7 }
+material "chrome" { type mirror     reflect rgb 0.9 0.9 0.9 }
+
+# The room: 5 m wide, 3.2 m high, the back wall at z = 5.
+quad { origin -2.5 0 -2     u 5 0 0     v 0 0 7      material floor }
+quad { origin -2.5 0 5      u 5 0 0     v 0 3.2 0    material floor }
+quad { origin -2.5 0 -2     u 0 0 7     v 0 3.2 0    material lwall }
+quad { origin  2.5 0 -2     u 0 3.2 0   v 0 0 7      material rwall }
+quad { origin -2.5 3.2 -2   u 0 0 7     v 5 0 0      material ceil }
+
+sphere { center -0.9 0.35 1.2   radius 0.35   material red   }
+sphere { center  0.0 0.35 2.4   radius 0.35   material green }
+sphere { center  1.1 0.35 3.8   radius 0.35   material blue  }
+sphere { center 0.55 0.18 1.6   radius 0.18   material chrome }
+
+light area {
+    origin -0.6 3.0 1.8   u 1.2 0 0   v 0 0 1.2   normal 0 -1 0
+    spd preset:bb6500
+}
+light area {
+    origin 2.2 1.6 0.6   u 0 0.6 0   v 0 0 0.6   normal -1 0 0
+    spd preset:bb3200
+}
+
+camera "real" {
+    eye 0.0 0.9 -0.4   look_at 0.0 0.8 2.4   up 0 1 0
+    focus 2.4
+    film { res 512 342   format full-frame }
+    lens { preset fisheye }
+}

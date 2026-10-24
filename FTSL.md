@@ -3103,11 +3103,13 @@ lens { surface <radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop]  … }
   unquoted word ends the value; `stop` marks the aperture stop). Radii follow the published
   convention (pbrt lens files, Zemax, patents): positive when the centre of curvature is on
   the sensor side, 0 for a plane.
-- Otherwise a `preset`: `singlet`/`biconvex`/`simple`, `achromat`/`doublet`,
-  `telephoto`, `wide` (default = achromatic doublet at the derived focal/f-number), or
-  `dgauss`/`doublegauss`, a real 50 mm f/2 double Gauss prescription scaled to `focal` and
-  stopped to `fstop` (no wider than the design's f/2.03; no dispersion: the published prescription gives one
-  index per glass).
+- Otherwise a `preset`: built from formulas, `singlet`/`biconvex`/`simple` and
+  `achromat`/`doublet` (the default: an achromatic doublet at the derived focal/f-number); or
+  a real published prescription (REFERENCE.md, *Physical (realistic) lens*):
+  `dgauss`/`doublegauss` (50 mm f/2 double Gauss), `telephoto`/`tele` (250 mm f/5.6),
+  `wide`/`wideangle` (22 mm f/2.8 retrofocus), `fisheye` (10 mm f/4, 156 degrees). A real one
+  keeps its own size and full opening unless `focal` / `fstop` are given, opens no wider than
+  its design, and has no dispersion (the published prescriptions give one index per glass).
 - Sensor size comes from the camera `film` (default full-frame); autofocuses at `focus`.
 
 ---

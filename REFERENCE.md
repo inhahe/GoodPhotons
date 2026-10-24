@@ -1920,7 +1920,8 @@ chose a mode for (no `-mode`, no camera `mode`, no scene `mode`/`default_mode`) 
 `R`, since a forward splat cannot image a mirror seen directly through the glass. All of
 these agree on the absolute image scale; `-checklens` checks the forward tracing against
 the backward camera, and `python tools/check_physlens.py` renders the same lens scenes in
-`R`, `A`, `B`, `C` and `D` on the CPU and GPU and compares them region by region.
+`R`, `A`, `B`, `C`, `D` and `J` on the CPU and GPU and compares them region by region
+(`--only published,fog,...` runs some of its sections; a full run is about 50 minutes).
 
 ```ftsl
 camera "real" {
@@ -1928,9 +1929,9 @@ camera "real" {
     focus 2.4
     film { res 512 512   format full-frame }
     lens {
-        preset achromat   # singlet | biconvex | achromat | doublet | telephoto | wide | dgauss
-        focal 50          # mm (default: what the camera's fov_y implies; 135 / 28 for telephoto / wide)
-        fstop 2.8
+        preset achromat   # singlet | biconvex | achromat | doublet | dgauss | telephoto | wide | fisheye
+        focal 50          # mm (default: the fov_y's for singlet/achromat, the design's own for the rest)
+        fstop 2.8         #    (default: 2.8 for singlet/achromat, the design's full opening for the rest)
     }
 }
 ```
@@ -1938,27 +1939,43 @@ camera "real" {
 - **Presets** are physically derived (lensmaker equation for the singlet, Abbe-number
   power split for the achromatic doublet), so focal length and colour correction are
   correct by construction; render-time dispersion uses real Sellmeier glass indices. Each
-  comes out at exactly the `focal` and `fstop` asked for (the f-number paraxially): its
-  elements are thick enough to keep a real edge at their clear aperture, the whole lens is
-  scaled to the focal length (the lensmaker and power-split formulas are thin-lens ones),
-  and the stop is sized through its own pupil magnification. Before 0.397.1 the achromat's
-  crown was thinner than its curves needed, its faces crossing inside the aperture (a 50 mm
-  "f/2.8" worked at about f/3.35, and longer or faster ones worse), and focal lengths were
-  off by about half a per cent; achromat renders are brighter now, at the f-number they
-  always claimed. A fast simple lens lets in a narrower beam than its paraxial f-number (its
-  own aberration bends the rim rays out); when the beam that really gets through is more
-  than 2% off the f-number asked for, the log says what it is. `telephoto` and `wide` are
-  achromats that default to 135 mm and 28 mm; the others take their focal length from
-  `focal`, else the camera's `fov_y`. Only the singlet takes `glass <name>` (BK7 by
-  default); the log says so if another preset is given one.
-- **`preset dgauss`** (or `doublegauss`) is a real prescription instead: the 50 mm f/2
-  double Gauss of pbrt's `dgauss.50mm.dat` (Tronnier's patent, the classic normal-lens
-  design: two cemented meniscus groups round a central stop), scaled so its focal length is
-  exactly `focal` and stopped down to exactly `fstop` (sized from its own pupil
-  magnification). It opens no wider than its design's f/2 (f/2.03 measured), and the published prescription
-  gives each glass a single index, so it shows the double Gauss's distortion, field
-  curvature, vignetting and bokeh but no colour fringing. `scenes/realcam_dgauss.ftsl`
-  pastes the same rows as `surface` lines.
+  comes out at exactly the `focal` and `fstop` asked for: its elements are thick enough to
+  keep a real edge at their clear aperture, the whole lens is scaled to the focal length
+  (the lensmaker and power-split formulas are thin-lens ones), and the stop is sized so the
+  widest beam parallel to the axis that gets through is exactly `focal / fstop` across. That
+  beam is the real entrance pupil: the f-number lens designers quote, and the one exposure
+  follows. The paraxial pupil, which ftrace sized the stop by before 0.398.0, misjudges it by
+  the pupil's own aberration -- up to 4% for the published lenses below at full opening, 1.7%
+  for a 50 mm f/2.8 achromat, which now lets in 3.4% more light. Before 0.397.1 the
+  achromat's crown was thinner than its curves needed, its faces crossing inside the aperture
+  (a 50 mm "f/2.8" worked at about f/3.35, and longer or faster ones worse), and focal
+  lengths were off by about half a per cent. A fast simple lens may let in no f/`fstop` beam
+  at any stop size (its own aberration bends the rim rays out); its stop then keeps the
+  paraxial size, and when the beam that really gets through is more than 2% off the f-number
+  asked for, the log says what it is. These two take their focal length from `focal`, else
+  the camera's `fov_y`. Only the singlet takes `glass <name>` (BK7 by default); the log says
+  so if another preset is given one.
+- **Real prescriptions** -- `dgauss`, `telephoto`, `wide`, `fisheye` -- are published lens
+  designs from pbrt's lens files (each from Smith, *Modern Lens Design*), as published:
+
+  | preset | design | as published |
+  |---|---|---|
+  | `dgauss` (`doublegauss`) | Tronnier's double Gauss: two meniscus groups round a central stop, the classic normal lens | 50.4 mm, f/2.02 |
+  | `telephoto` (`tele`) | Sigler's super-achromat telephoto: a positive front group, the stop, a negative rear group -- shorter than its focal length | 249.6 mm, f/5.59 |
+  | `wide` (`wideangle`) | Nakamura's wide-angle: a negative front meniscus ahead of the stop, the retrofocus layout | 22.0 mm, f/2.79 |
+  | `fisheye` | Muller's fisheye: two strong negative menisci bend in light from nearly 80 degrees off axis, a 156-degree field | 9.99 mm, f/3.99 |
+
+  (The f-numbers are the real beams', as above, and match what the designs are labelled:
+  f/2, f/5.6, f/4. Paraxially they would read f/2.03, f/5.42, f/2.68 and f/3.95.)
+  Each keeps its published size and full opening unless `focal` or `fstop` says otherwise;
+  then it is scaled so its focal length is exactly `focal` and stopped down so it lets in
+  exactly an f/`fstop` beam, but it opens no wider than its design (the log says so when
+  asked more than 2% wider). The published prescriptions give each glass a single
+  index, so these lenses bring their distortion, field curvature, vignetting and bokeh but
+  no colour fringing. `scenes/realcam_dgauss.ftsl` pastes the double Gauss's rows as
+  `surface` lines, and `scenes/realcam_fisheye.ftsl` looks through the fisheye. Before
+  0.398.0 `telephoto` and `wide` were achromats at 135 and 28 mm (`preset achromat focal
+  135` is that lens).
 - Or paste an **arbitrary real prescription** as repeated
   `surface <radius_mm> <thickness_mm> <ior> <semi_aperture_mm> [stop]` lines, front
   (scene side) to rear, in the convention prescriptions are published in (pbrt lens files,

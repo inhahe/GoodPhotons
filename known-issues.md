@@ -72,6 +72,31 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-10-24, 0.398.0): PRESET-FNUMBER-TRACED — presets let in less light than their f-number; the singlet's rear face trimmed its beam; the pupil tables missed sparse crossings at a fisheye's field edge
+
+Found while adding the published telephoto, wide-angle and fisheye (0.398.0), by `-checklens`.
+
+1. **The f-number was the paraxial one.** setFNumber sized the stop through its paraxial
+   pupil magnification, but the beam a real lens lets in is set by its real marginal ray,
+   which the pupil's own aberration moves: the published lenses at full opening admit f/2.02,
+   f/5.59, f/2.79 and f/3.99 beams where the paraxial pupil says f/2.03, f/5.42, f/2.68 and
+   f/3.95 -- and the traced values are the ones the designs are labelled with (f/2, f/5.6,
+   f/4). A 50 mm f/2.8 achromat let in an f/2.85 beam, 3.4% less light than f/2.8 means; a
+   telephoto asked for f/5.6, an f/5.76 one. setFNumber now bisects the stop for the beam
+   (`tracedPupilRadius`), so `fstop` is what the lens lets in. The check confirmed the
+   traced values with an independent Python trace of pbrt's rows (the same numbers to 1e-5),
+   and the rows themselves against pbrt's files, number for number.
+2. **The singlet's rear face had the stop's aperture**, and scaling to the exact focal length
+   shrank it 0.5%, so its rim clipped the marginal ray by 0.4 um (an f/4.0002 beam). It now
+   clears the beam by 5%, as the achromat's elements do.
+3. **The pupil tables' regions were verified with uniform rays only**, and under 1% of those
+   reach the film through a fisheye's front element: a batch held a few dozen crossings, and
+   the tables of the fisheye missed 7 in 7546 crossings 50-72 degrees off axis (up to 17%
+   outside their region). `fitRegion` now also checks the band just past each region's edge
+   with aimed rays. A region found by tracing cannot be proven complete -- a crescent's tip
+   is reached by almost no ray -- so `-checklens` (4) / (7) now bound what a miss costs
+   instead of demanding none: at most 1e-5 of the light, none past 5% of its region.
+
 ## DONE (2026-10-23, 0.397.1): ACHROMAT-FNUMBER — the achromat and singlet presets did not work at the focal length or f-number asked for; the achromat's crown was thinner than its own curves
 
 Found while testing `preset dgauss`, by `-checklens` (12), which measures every preset's
@@ -103,6 +128,8 @@ the beam a fast simple lens really lets through is narrower, by its aberration, 
 reports it when it is more than 2% off what was asked (and the double Gauss asked wider than
 its f/2.03). The same review found `preset telephoto` / `wide` never got their 135 / 28 mm:
 every preset took the focal length the camera's fov implied; those two now default to theirs.
+(0.398.0 replaced both achromats with the published telephoto and wide-angle of pbrt's lens
+files, and added its fisheye; each keeps its own size unless `focal` is given.)
 
 ## DONE (2026-10-23, 0.394.3): LENS-SURFACE-SIGN — a pasted lens prescription was read with every radius negated, and its `stop` flag was rejected
 

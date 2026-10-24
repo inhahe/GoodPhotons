@@ -8115,6 +8115,7 @@ private:
         }
         double fstop = dblOf(lb, "fstop", 0.0);
         if (fstop <= 0.0) fstop = dblOf(b, "fstop", 0.0);
+        const bool fstopGiven = fstop > 0.0;     // a published preset otherwise keeps its own opening
         if (fstop <= 0.0) fstop = 2.8;
         std::string glassName = strOf(lb, "glass", "BK7");
 
@@ -8175,8 +8176,8 @@ private:
                 std::printf("[ftsl] camera '%s' lens: the `surface` lines are the lens; its preset, "
                             "glass, focal and fstop keys have no effect\n", cs.name.c_str());
         } else {
-            // 2) a named preset (singlet/achromat/doublet/telephoto/wide/dgauss), else default
-            //    to an achromatic doublet at the derived focal length + f-number.
+            // 2) a named preset (lens.h resolveLensPreset), else default to an achromatic
+            //    doublet at the derived focal length + f-number.
             std::string preset = strOf(lb, "preset", "");
             std::string pk;
             for (char c : preset) { if (c==' '||c=='_'||c=='-') continue; pk += (char)std::tolower((unsigned char)c); }
@@ -8191,13 +8192,17 @@ private:
                 }
                 *sys = makeSinglet(focalMM, fstop, g);
             } else if (!preset.empty()) {
-                // The telephoto and the wide are named for their focal lengths (135 / 28 mm):
-                // without a `focal` of their own they take those, not the one the camera's field
-                // of view implies, which every other preset follows.
-                const bool named = (pk == "telephoto" || pk == "tele" || pk == "wide" || pk == "wideangle");
-                if (!resolveLensPreset(preset, (named && !find(lb, "focal")) ? 0.0 : focalMM, fstop, *sys)) {
+                // A published prescription (dgauss, telephoto, wide, fisheye) keeps its own focal
+                // length without a `focal` of its own -- not the one the camera's field of view
+                // implies, which the formula-built achromat follows -- and its own full opening
+                // without an `fstop`.
+                const bool published = lensPresetIsPublished(lensPresetName(pk));
+                const double f = (published && !find(lb, "focal")) ? 0.0 : focalMM;
+                const double n = (published && !fstopGiven) ? 0.0 : fstop;
+                if (!resolveLensPreset(preset, f, n, *sys)) {
                     fail("camera '" + cs.name + "' lens: unknown preset '" + preset +
-                         "' (singlet/biconvex, achromat/doublet, telephoto, wide, dgauss/doublegauss)");
+                         "' (singlet/biconvex, achromat/doublet, dgauss/doublegauss, telephoto, wide, "
+                         "fisheye)");
                     return false;
                 }
             } else {
@@ -8208,16 +8213,18 @@ private:
                      "dispersion"); return false;
             }
             // Only the singlet is built from the `glass` given; the achromat's BK7/SF10 and the
-            // double Gauss's published indices are part of their designs.
+            // published lenses' indices are part of their designs.
             if (!singlet && find(lb, "glass"))
                 std::printf("[ftsl] camera '%s' lens: `glass` has no effect on preset '%s' (only the "
                             "singlet takes one)\n", cs.name.c_str(), preset.empty() ? "achromat" : preset.c_str());
-            // Every preset's stop is sized for the f-number asked, paraxially. What the lens lets
-            // in can still fall short: the double Gauss opens no wider than its design's f/2.03,
-            // and a fast simple lens's aberrations narrow the beam that really gets through. Say
-            // so when the traced opening is more than 2% off what was asked.
+            // Every preset's stop is sized so the lens lets in the f-number asked (tracedFNumber).
+            // It can still fall short: a published lens opens no wider than its design (the
+            // double Gauss's f/2.02), and a fast simple lens's aberrations can narrow the beam
+            // below it at any stop size. Say so when the traced opening is more than 2% off what
+            // was asked (a published lens asked for nothing is at its own opening).
             const double nTr = sys->tracedFNumber();
-            if (nTr > 0.0 && std::fabs(nTr / fstop - 1.0) > 0.02)
+            const bool asked = fstopGiven || !lensPresetIsPublished(lensPresetName(pk));
+            if (asked && nTr > 0.0 && std::fabs(nTr / fstop - 1.0) > 0.02)
                 std::printf("[ftsl] camera '%s' lens: preset '%s' lets in an f/%.2f beam, not the f/%.2f asked for "
                             "(its widest opening, or a fast lens's aberration)\n", cs.name.c_str(),
                             preset.empty() ? "achromat" : preset.c_str(), nTr, fstop);
