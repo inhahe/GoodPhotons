@@ -671,7 +671,8 @@ struct DMediumStack {
 struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId;
                  DVec3 tangent; double bitangentSign;    // C6 tangent frame for normal mapping
                  double curvature;                       // O3 per-face mean curvature (Tri::finalize)
-                 int vcol; };                            // Tri::vcol -> DScene::vertColors, or -1
+                 int vcol;                               // Tri::vcol -> DScene::vertColors, or -1
+                 Real reach; };                          // farthest vertex's distance (Hit::pscale)
 struct DSphere { DVec3 c; double r; int matId; };
 // One round cone of a curve/fiber strand — the device twin of CurveSeg (curve.h). The host
 // record is already a POD in exactly this shape; only the scalar type narrows to Real.
@@ -711,6 +712,7 @@ struct DInstance {
     // O3: local curvature (1/length) -> world curvature multiplier, = 1/|det(linear)|^(1/3).
     // Host-precomputed (MeshInstance::curvScale) so the device does no cbrt per hit.
     double curvScale;
+    double reachMul, reachAdd;   // MeshInstance::reachMul/reachAdd: a hit's pscale into the world
     int    blasId;
     int    matOverride;   // >=0 replaces the BLAS triangles' matId (mirrors host)
 };
@@ -991,6 +993,7 @@ struct DEmitter {
     // -1 = uniform. Deliberately absent from `power` — the pattern modulates the
     // radiance at a point, not the emitter's selection weight, exactly as on the host.
     int    emitPat;
+    double reach;              // Emitter::reach: the scale of a sampled point's pattern hair
     // Fast RGB backward (mode R -rgb): the emitter's linear-sRGB radiance, baked as
     // xyzToLinearSrgb(integral over lambda of CIE(lambda)*emitSpd(lambda)) — the exact
     // wavelength-integrated radiance the spectral estimator converges to (the
@@ -3453,6 +3456,10 @@ struct DHit {
     // (TT) exit rays clear the fiber body. Default-initialised for the same reason
     // cavity/fw are: most intersectors never touch it.
     Real fiberRadius = (Real)0;
+    // The reach of the primitive the hit lies on (device twin of Hit::pscale): written by the
+    // triangle, sphere and curve intersectors and the instance mapping; 0 (the point's own
+    // distance stands in) elsewhere.
+    Real pscale = (Real)0;
 };
 
 // ---- implicit field evaluation (device twin of implicit.h) ----------------
@@ -3885,10 +3892,10 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             // past the hair a pattern reads a hit off it at, patNudgedPoint). The start
             // b = o + d t is rounded once, from double, and the search runs on s in b + d s,
             // which rounds like the point itself (intersectCurveSeg recentres for the same
-            // reason). The ends keep the march's values: they decide the search the same way
-            // whenever the step straddles the surface, and when it does not after all (the
-            // march read it at coarser points), the search ends at the nearer end either way,
-            // no worse than the march's own root.
+            // reason). The ends keep the march's values, read at o + d t: should the surface lie
+            // within the march's rounding of the step's end, the search ends there, outside;
+            // its start, the last point the march found outside, is never that close (measured:
+            // from 3000 m and 30 km, adaptive or fixed-step, no hit reads inside the surface).
             const double t0d = (double)t;
             const float bxF = (float)(ox + dx*t0d), byF = (float)(oy + dy*t0d), bzF = (float)(oz + dz*t0d);
             float sa = 0.0f, sb = tn - t, fa = f, fb = fn;
@@ -4022,6 +4029,7 @@ __device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const 
     Real b0 = U * invDet, b1 = V * invDet, b2 = W * invDet;   // barycentric of v0,v1,v2
     // From the vertices, not the ray (host twin intersectTri says why).
     hit.t = t; hit.p = tri.v0 + (tri.v1 - tri.v0) * b1 + (tri.v2 - tri.v0) * b2; hit.valid = true;
+    hit.pscale = tri.reach;
     hit.matId = tri.matId; hit.sensorId = tri.sensorId;
     hit.u = b0 * tri.uv0.x + b1 * tri.uv1.x + b2 * tri.uv2.x;
     hit.v = b0 * tri.uv0.y + b1 * tri.uv1.y + b2 * tri.uv2.y;
@@ -4077,7 +4085,8 @@ __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const D
     // On the sphere itself: o + d t carries float rounding of the ray's origin, which a viewer
     // far from the sphere makes far coarser than the sphere's own coordinates (a pattern
     // reading the hit a hair off the surface, patNudgedPoint, needs the latter).
-    hit.p = s.c + ng * (Real)s.r;
+    hit.p = s.c + ng * (Real)fabs(s.r);   // |r|: the quadratic only sees r^2
+    hit.pscale = sqrt(dot(s.c, s.c)) + (Real)fabs(s.r);
     hit.ng = ng;
     bool sFlipped = !(dot(rd, ng) < 0);
     hit.n = sFlipped ? -ng : ng;
@@ -4223,6 +4232,7 @@ __device__ static bool intersectCurveSeg(const DCurveRay& cr, const DVec3& ro, c
                   : (piece == 1) ? s.p0 + ng * s.r0
                                  : s.p1 + ng * s.r1;
     hit.p = p;
+    hit.pscale = fmax(sqrt(dot(s.p0, s.p0)) + s.r0, sqrt(dot(s.p1, s.p1)) + s.r1);
     hit.n  = (dot(rd, ng) < (Real)0) ? ng : -ng;
 
     // u along the strand (root -> tip), v around the circumference.
@@ -4372,6 +4382,7 @@ __device__ static bool blasOccluded(const DScene& sc, const DInstance& inst,
 // Scene::instanceHitToWorld exactly.
 __device__ static void instanceHitToWorld(const DInstance& inst, DHit& lh) {
     lh.p  = affPoint(inst.Wm, inst.Wt, lh.p);
+    lh.pscale = (Real)(inst.reachMul * (double)lh.pscale + inst.reachAdd);
     lh.n  = normalize(affDir(inst.Nm, lh.n));
     lh.ng = normalize(affDir(inst.Nm, lh.ng));
     // Map the surface tangent through the instance's toWorld linear part (C6).
@@ -9369,7 +9380,7 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
 // hair off the surface along h.ng (host twin patCtxFromHit; pattern.h patNudgedPoint says why).
 __device__ static inline void dPatPoint(const DHit& h, double& px, double& py, double& pz, double& r) {
     patNudgedPoint((double)h.p.x, (double)h.p.y, (double)h.p.z, (double)h.ng.x, (double)h.ng.y, (double)h.ng.z,
-                   px, py, pz);
+                   (double)h.pscale, px, py, pz);
     r = sqrt(px * px + py * py + pz * pz);
 }
 // Evaluate a bound pattern at a hit (device twin of patternScalarAt/patCtxFromHit).
@@ -9832,7 +9843,7 @@ __device__ static double dEmitterPatMulAt(const DScene& sc, const DEmitter& em,
     const DPattern& p = sc.patterns[em.emitPat];
     double px, py, pz;
     patNudgedPoint((double)y.x, (double)y.y, (double)y.z, (double)nOut.x, (double)nOut.y, (double)nOut.z,
-                   px, py, pz);
+                   em.reach, px, py, pz);
     double r = sqrt(px * px + py * py + pz * pz);
     return clamp01(dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
                                 nOut.x, nOut.y, nOut.z, r, uu, vv, 0.0, 0.0, 0.0, dPatEnvOf(sc)));
@@ -11771,6 +11782,7 @@ struct DVertex {
     Real  u, v;                 // interpolated surface texcoords (per-hit BSDF eval, M9)
     DVec3 tangent;              // fiber axis at a hair vertex: the BCSDF frame (mode U, 0.364.0)
     Real  fiberR;               // fiber radius there (far-side shadow-ray clearance); 0 off a strand
+    Real  pscale = (Real)0;     // the hit's DHit::pscale, so a connection reads a pattern where the sampler did
     // Mean curvature at this vertex (O3). Carried for the same reason u/v are: the
     // connection BSDF is re-evaluated here from a reconstructed DHit, and a material
     // whose roughness/reflectance is driven by `curv` would otherwise read a DIFFERENT
@@ -11842,7 +11854,7 @@ __device__ static inline DHit dVertHit(const DVertex& vt) {
     h.p = vt.p; h.n = vt.ns; h.ng = vt.ng;
     h.matId = vt.matId; h.sensorId = -1;
     h.u = vt.u; h.v = vt.v; h.curv = vt.curv;
-    h.tangent = vt.tangent; h.fiberRadius = vt.fiberR;
+    h.tangent = vt.tangent; h.fiberRadius = vt.fiberR; h.pscale = vt.pscale;
     // EVERY other field defined too. DHit has members with no default (vcol, vb0, vb1,
     // bitangentSign), and dDiffuseRho reads vcol -- which gates the per-vertex colour lookup --
     // so a reconstructed hit used to carry whatever the stack held there. vcol = -1 is "no
@@ -15960,7 +15972,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         // The strand frame and radius: dBsdfF / dBsdfPdf read them at a D_HAIR vertex (the fiber
         // BCSDF's frame), the connections' far-side clearance reads them, and fiberR > 0 is how
         // dSurfMergeSite knows a vertex sits on ANY curve primitive. 0 off a curve (DHit default).
-        v.tangent = h.tangent; v.fiberR = h.fiberRadius;
+        v.tangent = h.tangent; v.fiberR = h.fiberRadius; v.pscale = h.pscale;
         v.nUp = nUp;
         v.pdfFwd = dConvertDensity(pdfFwd, path[n - 1], v);
         path[n] = v; int cur = n; n++;
@@ -18945,6 +18957,7 @@ struct DVcmLV {
     int    nUp;            // hero wavelengths still live here (1 == de-hero'd / single-λ)
     DVec3  tangent;        // fiber axis at a strand vertex (its BCSDF frame for VC / splats, 0.364.0)
     Real   fiberR;         // fiber radius (far-side clearance of a connection that ends on it); 0 off a strand
+    Real   pscale;         // the hit's DHit::pscale (DVertex::pscale)
 };
 
 // The SECONDARY hero wavelengths of a stored light vertex, one slot per secondary. Kept in a
@@ -18984,14 +18997,14 @@ __device__ static inline DVertex dVertFromHit(const DHit& h, int matId) {
     v.beta = 0; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0; v.matId = matId; v.lightIdx = -1;
     v.emitPatW = (Real)1;   // BSDF-only helper vertex; never read for emission
     v.mediumG = 0; v.mediumId = -1; v.u = h.u; v.v = h.v; v.curv = h.curv;
-    v.tangent = h.tangent; v.fiberR = h.fiberRadius; return v;
+    v.tangent = h.tangent; v.fiberR = h.fiberRadius; v.pscale = h.pscale; return v;
 }
 __device__ static inline DVertex dVertFromLV(const DVcmLV& lv) {
     DVertex v; v.type = BV_SURFACE; v.p = lv.p; v.ns = lv.ns; v.ng = lv.ng;
     v.beta = 0; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0; v.matId = lv.matId; v.lightIdx = -1;
     v.emitPatW = (Real)1;   // BSDF-only helper vertex; never read for emission
     v.mediumG = 0; v.mediumId = -1; v.u = lv.u; v.v = lv.v; v.curv = lv.curv;
-    v.tangent = lv.tangent; v.fiberR = lv.fiberR; return v;
+    v.tangent = lv.tangent; v.fiberR = lv.fiberR; v.pscale = lv.pscale; return v;
 }
 
 // Sample a scattering continuation at a surface vertex (device twin of vcm.h scatterSample).
@@ -19405,7 +19418,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                     lv.cx = cieLx; lv.cy = cieLy; lv.cz = cieLz;
                     lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
                     lv.matId = matId; lv.edges = edges; lv.u = h.u; lv.v = h.v; lv.curv = h.curv;
-                    lv.tangent = h.tangent; lv.fiberR = h.fiberRadius;
+                    lv.tangent = h.tangent; lv.fiberR = h.fiberRadius; lv.pscale = h.pscale;
                     lv.nUp = nUp;
                     lvSlab[i * vcmCap + stored] = lv;
                     if (NS > 0 && lvSec) {
@@ -21099,6 +21112,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.curvature = t.curvature;      // O3 per-face mean curvature (from Tri::finalize)
         d.matId = t.matId; d.sensorId = t.sensorId;
         d.vcol  = t.vcol;               // per-vertex colour (Scene::vertColors), or -1
+        d.reach = (Real)std::sqrt(std::max(dot(t.v0, t.v0), std::max(dot(t.v1, t.v1), dot(t.v2, t.v2))));
         return d;
     };
     // Instancing now uses a true TWO-LEVEL BVH on the device (matching the CPU): base
@@ -21193,6 +21207,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         for (int k = 0; k < 9; ++k) d.Wm[k] = in.toWorld.m[k];   // hit point, tangent local->world
         d.Wt[0] = in.toWorld.t.x; d.Wt[1] = in.toWorld.t.y; d.Wt[2] = in.toWorld.t.z;
         d.curvScale = in.curvScale;                              // curvature local->world (O3)
+        d.reachMul = in.reachMul; d.reachAdd = in.reachAdd;
         d.blasId = in.blasId; d.matOverride = in.matOverride;
     }
     (void)haveInstances;
@@ -21635,6 +21650,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         de.cdfStep = e.spd.step;
         de.matId = e.matId;                 // BDPT: link to emissive surface material
         de.emitPat = e.emitPat;             // `emit pattern:` profile over this emitter
+        de.reach = e.reach;
         bakeSpec(e.spdFn, de.emitSpd, up);       // BDPT: baked emission SPD for Le(lambda)
         { Vec3 le = rgbbake::emitToRgb(e.spdFn); de.rgbEmit = {le.x, le.y, le.z}; }  // fast RGB backward
         de.cieMean = {e.cieMean.x, e.cieMean.y, e.cieMean.z};   // achromatic-path beam fold

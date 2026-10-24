@@ -1090,6 +1090,10 @@ struct Emitter {
     // copied from the emissive material's `emitPat` at registration; -1 = uniform.
     // Deliberately absent from `power` above — see Material::emitPat for why.
     int emitPat = -1;
+    // The farthest point of this emitter's surface from the origin (finalizeEmitters): the
+    // scale of the hair a sampled point's emission pattern is read at, as Hit::pscale is a
+    // hit's (emitterPatMulAt). 0 for the shapes with no surface.
+    double reach = 0.0;
 
     // Per-emitter spectral/geometric weight fed into the combined backward
     // wavelength sampler and the power law: area*PI for surfaces, spotOmega for a
@@ -1421,6 +1425,11 @@ struct MeshInstance {
     // Exact for a uniform scale; an approximation under a non-uniform one (see
     // instanceHitToWorld). 1.0 for any rigid transform.
     double curvScale = 1.0;
+    // Derived from toWorld: a bound on how far from the world origin a local point at
+    // distance r from the local origin lands, |toWorld p| <= reachMul * r + reachAdd (the
+    // linear part's Frobenius norm and the translation's length). Carries a hit's
+    // Hit::pscale into the world.
+    double reachMul = 1.0, reachAdd = 0.0;
     // The ONLY way to set the transform, so the derived curvScale (and toLocal) can
     // never silently go stale behind a direct `inst.toWorld = …` assignment.
     void setToWorld(const Affine& xf) {
@@ -1433,6 +1442,10 @@ struct MeshInstance {
         double a = std::fabs(det);
         double s = (a > 1e-30) ? std::cbrt(a) : 1.0;   // average linear scale
         curvScale = 1.0 / s;
+        double f2 = 0.0;
+        for (int k = 0; k < 9; ++k) f2 += m[k] * m[k];
+        reachMul = std::sqrt(f2);
+        reachAdd = std::sqrt(dot(xf.t, xf.t));
     }
 };
 
@@ -2351,7 +2364,11 @@ struct Scene {
             total += a;
             EmitTri et;
             et.v0 = t.v0; et.e1 = e1; et.e2 = e2;
-            et.nrm = nc / (2.0 * a);              // == normalize(cross(e1,e2))
+            // The face normal turned to the vertex normals' side, as intersectTri turns a hit's
+            // ng: one-sided emission is judged against it here (NEE, emission from a sample)
+            // and against h.ng on a hit, so the two must agree on which side emits -- for a
+            // mesh wound against its normals, the winding alone does not.
+            et.nrm = nc * ((dot(nc, t.n0 + t.n1 + t.n2) < 0.0 ? -1.0 : 1.0) / (2.0 * a));
             et.cumArea = total;
             // Carry the source triangle's UVs as uv0 + edges, so a sampled point can
             // report the same (u,v) the ray-hit path interpolates — required for an
@@ -2484,6 +2501,24 @@ struct Scene {
         // radiance, so no selection or positional pdf anywhere has to change.
         for (auto& e : emitters)
             e.emitPat = (e.matId >= 0 && e.matId < (int)mats.size()) ? mats[e.matId].emitPat : -1;
+        // Each surface's reach (Emitter::reach): its farthest point from the origin.
+        for (auto& e : emitters) {
+            double r = 0.0;
+            auto at = [&r](const Vec3& q) { r = std::max(r, std::sqrt(dot(q, q))); };
+            switch (e.shape) {
+                case EmitterShape::Quad:
+                    at(e.origin); at(e.origin + e.u); at(e.origin + e.v); at(e.origin + e.u + e.v); break;
+                case EmitterShape::Sphere:
+                    r = std::sqrt(dot(e.origin, e.origin)) + std::fabs(e.radius); break;
+                case EmitterShape::Cylinder:
+                    r = std::sqrt(dot(e.origin, e.origin)) + length(e.v) + std::fabs(e.radius); break;
+                case EmitterShape::Mesh:
+                    for (const EmitTri& t : e.meshTris) { at(t.v0); at(t.v0 + t.e1); at(t.v0 + t.e2); }
+                    break;
+                default: break;
+            }
+            e.reach = r;
+        }
         // Recount the distant suns here (not in addSunLight) so the flag survives every
         // path that rebuilds the emitter list, including applyIgnoreFlags' filtering.
         sunCount = 0;
@@ -3358,8 +3393,10 @@ struct Scene {
     // silhouette band intersectTri's comment describes.
     static void instanceHitToWorld(const MeshInstance& inst, Hit& lh) {
         lh.p  = inst.toWorld.apply(lh.p);             // from the local point (intersectTri says why)
-        lh.n  = normalize(inst.toWorld.applyNormal(lh.n));
-        lh.ng = normalize(inst.toWorld.applyNormal(lh.ng));
+        lh.pscale = inst.reachMul * lh.pscale + inst.reachAdd;
+        // (toWorld^-1)^T n, with the inverse the instance already holds.
+        lh.n  = normalize(inst.toLocal.applyDirTranspose(lh.n));
+        lh.ng = normalize(inst.toLocal.applyDirTranspose(lh.ng));
         // Map the surface tangent through the instance transform too (C6 normal maps
         // on instanced meshes). The tangent is a direction, so it uses applyDir (not
         // applyNormal); handedness (bitangentSign) is preserved for proper transforms.
@@ -4040,7 +4077,7 @@ inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
         h.cavityDone = true;
     }
     Vec3 q;
-    patNudgedPoint(h.p.x, h.p.y, h.p.z, h.ng.x, h.ng.y, h.ng.z, q.x, q.y, q.z);
+    patNudgedPoint(h.p.x, h.p.y, h.p.z, h.ng.x, h.ng.y, h.ng.z, h.pscale, q.x, q.y, q.z);
     PatCtx c = makePatCtx(q, h.fieldVal, h.n, h.u, h.v, h.curv, h.cavity, h.fw);
     bindPatScene(c, scene);
     return c;
@@ -4200,7 +4237,7 @@ inline double emitterPatMulAt(const Scene& scene, const Emitter& em,
                               const Vec3& y, const Vec3& nOut, double uu, double vv) {
     if (em.emitPat < 0 || em.emitPat >= (int)scene.patterns.size()) return 1.0;
     Vec3 q;
-    patNudgedPoint(y.x, y.y, y.z, nOut.x, nOut.y, nOut.z, q.x, q.y, q.z);
+    patNudgedPoint(y.x, y.y, y.z, nOut.x, nOut.y, nOut.z, em.reach, q.x, q.y, q.z);
     PatCtx c = makePatCtx(q, 0.0, nOut, uu, vv);
     bindPatScene(c, scene);
     double p = scene.patterns[em.emitPat].eval(c);

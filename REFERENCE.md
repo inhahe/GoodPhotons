@@ -4465,7 +4465,10 @@ where a surface lies (a floor at `y 0` under `floor(4*y)`, a sphere of radius 0.
 `step(0.5, r)`, a checker floor on a cell wall) shows the value just outside the surface, on
 every hit, from either side, on CPU and GPU, in renders and in the `-raster` preview alike:
 a pattern reads a surface at a point a hair off it along the surface's own geometric normal
--- two millionths of the point's distance from the origin, and at least 2x10^-8 scene units.
+-- two millionths of the reach of the primitive it lies on (the distance from the origin of
+that triangle's, sphere's or curve's farthest point; for an isosurface, of the point itself),
+and at least 2x10^-8 scene units. Sized so, it clears the float noise an exported mesh's
+vertices carry, which grows with their size: a 100 m floor's is ~10^-6.
 "Outside" is the side that normal faces: away from a sphere's, isosurface's or curve's
 interior, and for a mesh, quad or triangle the side its vertex normals face (or, without
 them, its winding's: a `quad`'s `u` x `v`). So a floor at `y 0` facing up reads
@@ -4477,9 +4480,10 @@ exported floor whose heights are float noise either side of 0, a sphere hit at a
 rounded either side of 0.5 -- reads it the same way. (Since 0.399.7; before, hit points
 rounded to either side of the step from ray to ray, and such a surface came out grey or split
 along a seam. 0.399.7 read the side the ray came from; since 0.399.8 the side is the
-surface's, so light crossing a transmissive surface sees the same value either way.) A
-pattern varying along the normal moves by up to that hair: 2 um at a metre from the origin,
-2 mm at a kilometre.
+surface's, so light crossing a transmissive surface reads the pattern at the same point either
+way -- though the normal (`nx`, `ny`, `nz`) and curvature (`curv`) a pattern sees still face the
+ray.) A pattern varying along the normal moves by up to that hair: 2 um on a primitive reaching
+a metre from the origin, 0.1 mm on a 100 m floor, 2 mm at a kilometre.
 
 **Pattern-driven reflectance.** The `reflect` slot takes a pattern as well, and a scalar in
 a *spectral* slot is a per-hit **multiplier** on whatever the slot otherwise holds. Two

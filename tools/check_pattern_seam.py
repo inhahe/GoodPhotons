@@ -10,22 +10,26 @@ along a seam. Patterns read a hit a hair outside the surface, along its normal (
 patNudgedPoint), hit points are taken from the surface's own coordinates rather than along the
 ray, and quarter turns are exact; this renders the cases those cover.
 
-Five floors, one square at y = 0, seen from 2.2 m: a quad; a mesh_asset modelled at y = -1 and
-lifted by mesh_instance; one modelled upright in z = 2 at twice the size and stood on the floor
-by a quarter turn about x, a half scale and a lift (the instance's transform applied the wrong
-way round would put it at y = 2); one modelled upright in z = 0 and only turned; and one whose
-vertices carry an export's float noise, y = +-1e-12. Each must show the checker's contrast (a
-grey floor lacks it) and match the quad on the CPU pixel by pixel (a seam, speckle or a
-misplaced surface does not). The rasterizer's preview (-raster) of the noisy floor is held to
-the quad's the same way, on each device (which must really be the GPU's rasterizer, not a
-silent fall back to the CPU's), and the quad's preview must show the cells the CPU trace
-shows: the floor lies on a cell wall, and a preview reading its other side shows the other
-phase.
+Floors seen from 2.2 m, all at y = 0 but one: a quad (facing down, as u x v has it); a
+mesh_asset modelled at y = -1 and lifted by mesh_instance; one modelled upright in z = 2 at
+twice the size and stood on the floor by a quarter turn about x, a half scale and a lift (the
+instance's transform applied the wrong way round would put it at y = 2); one modelled upright
+in z = 0 and only turned; one whose vertices carry float noise, y = +-1e-12; the quad turned to
+face up; and a 100 m floor facing up whose vertices all sit 1e-6 below 0 -- an export's float
+noise at that size, which a hair sized by the hit's own distance does not clear within a metre
+of the origin (it is sized by the triangle's reach). Each must show the checker's contrast (a
+grey floor lacks it) and match its quad -- facing the same way -- on the CPU pixel by pixel (a
+seam, speckle or a misplaced surface does not). The rasterizer's preview (-raster) of the noisy
+floor is held to the quad's the same way, on each device (which must really be the GPU's
+rasterizer, not a silent fall back to the CPU's), and the quad's preview must show the cells the
+CPU trace shows: the floor lies on a cell wall, and a preview reading its other side shows the
+other phase.
 
 And surfaces of radius 0.5 under a step at that radius, hit along the ray: a sphere seen from
-2.2 m, and a sphere, an isosurface sphere and a curve's tube seen from 3000 m, where a float hit
-point computed along the ray rounds relative to the camera's distance, a hundred times past the
-nudge, so the GPU must take these hits from the surfaces themselves. They glow, seen directly,
+2.2 m, and a sphere, an isosurface sphere and a curve's tube seen from about 3000 m and 30 km
+off, along a direction with no symmetry, where a float hit point computed along the ray rounds
+relative to the camera's distance, far past the nudge, so the GPU must take these hits from the
+surfaces themselves. They glow, seen directly,
 against the same surface with the pattern replaced by 1 and the same seed: a pixel's ratio of
 the two is exactly the fraction of its hits that read the outside of the step, which must be
 all of them. (A mix of two colours would not do: a pixel reads 3x off only once most of its
@@ -46,14 +50,18 @@ CHECKER = 'fract(0.5 * (floor(4*x) + floor(4*y) + floor(4*z))) * 2'
 RADIAL = 'step(0.5, r)'
 TUBE = 'step(0.5, sqrt(y*y + z*z))'
 NEAR_CAM = 'eye 0 2.2 0.001  look_at 0 0 0  up 0 0 1  fov_y 50'
-# 3000 m above the origin, the field narrowed to the same 1.2 m.
-FAR_CAM = 'eye 0 3000 0.001  look_at 0 0 0  up 0 0 1  fov_y 0.023'
+# About 3000 m and 30 km off along a direction with no symmetry, the field narrowed to the
+# same 1.2 m. Not straight above, where fl(dy t) is exactly -t and the march's points land on
+# the surface's own; nor along the diagonal, where the three coordinates round alike and the
+# error lies along the ray, where it does no harm.
+FAR_CAM = 'eye 2400.37 1300.91 1151.23  look_at 0 0 0  up 0 1 0  fov_y 0.023'
+FAR30K_CAM = 'eye 24003.7 13009.1 11512.3  look_at 0 0 0  up 0 1 0  fov_y 0.0023'
 
 
 def head(expr=CHECKER, cam=NEAR_CAM):
-    # The lamp hangs over the floor; for the far camera, whose line of sight it would block,
+    # The lamp hangs over the floor; for the far cameras, whose line of sight it would block,
     # well out of frame (the far surfaces glow by themselves; the loader wants a light).
-    lamp = 'origin -0.5 2.5 -0.5' if cam == NEAR_CAM else 'origin 20 20 20'
+    lamp = 'origin -0.5 2.5 -0.5' if cam == NEAR_CAM else 'origin 30 -40 10'
     return '''scene { units meters }
 pattern "p" { expr "%s" }
 material "pale"  { type diffuse reflect rgb 0.8 0.8 0.8 }
@@ -66,15 +74,23 @@ camera "top" { %s  film { res %d %d } }
 
 
 HEAD = head()
-# The floors, checked for contrast and against the quad on the CPU.
-FLOORS = ('quad', 'instance', 'turned', 'upright', 'noisy')
+# The floors, checked for contrast and against their reference on the CPU: the quad, facing
+# down (u x v), or for the floors facing up, the quad turned up.
+FLOOR_REF = {'quad': 'quad', 'instance': 'quad', 'turned': 'quad', 'upright': 'quad', 'noisy': 'quad',
+             'quad_up': 'quad_up', 'big': 'quad_up'}
+FLOORS = tuple(FLOOR_REF)
 # The glowing surfaces: each '<name>' (emit_map the step) against '<name>_one' (emit_map 1).
 SPHERE = 'sphere { center 0 0 0  radius 0.5  material glow }'
+# Long enough that its end balls, on which the step reads inside, stay out of the 1.2 m field.
+TUBE_BODY = 'curve { material glow  basis linear  radius 0.5  point -4 0 0  point 4 0 0 }'
 GLOW = {
     'sphere': (RADIAL, SPHERE, NEAR_CAM),
     'sphere_far': (RADIAL, SPHERE, FAR_CAM),
     'iso_far': (RADIAL, 'isosurface { material glow  sphere { center 0 0 0  radius 0.5 } }', FAR_CAM),
-    'curve_far': (TUBE, 'curve { material glow  basis linear  radius 0.5  point -1 0 0  point 1 0 0 }', FAR_CAM),
+    'curve_far': (TUBE, TUBE_BODY, FAR_CAM),
+    'sphere_far30k': (RADIAL, SPHERE, FAR30K_CAM),
+    'iso_far30k': (RADIAL, 'isosurface { material glow  sphere { center 0 0 0  radius 0.5 } }', FAR30K_CAM),
+    'curve_far30k': (TUBE, TUBE_BODY, FAR30K_CAM),
 }
 
 
@@ -103,8 +119,14 @@ def scenes(out):
     write(upright0, 'v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\nf 1 2 3\nf 1 3 4\n')
     noisy = os.path.join(out, 'floor_noisy.obj').replace('\\', '/')
     write(noisy, 'v -1 1e-12 -1\nv 1 -1e-12 -1\nv 1 1e-12 1\nv -1 -1e-12 1\nf 1 2 3\nf 1 3 4\n')
+    # 100 m across, facing up, 1e-6 below y = 0 -- an export's float noise at that size. Hit
+    # within a metre of the origin, a hair sized by the hit's distance would not clear it.
+    big = os.path.join(out, 'floor_big.obj').replace('\\', '/')
+    write(big, 'v -50 -1e-6 -50\nv 50 -1e-6 -50\nv 50 -1e-6 50\nv -50 -1e-6 50\nf 1 3 2\nf 1 4 3\n')
     texts = {
         'quad': HEAD + 'quad { origin -1 0 -1  u 2 0 0  v 0 0 2  material floor }\n',
+        'quad_up': HEAD + 'quad { origin -1 0 -1  u 0 0 2  v 2 0 0  material floor }\n',
+        'big': HEAD + 'mesh { file "%s"  material floor }\n' % big,
         'instance': HEAD + ('mesh_asset "low" { file "%s"  material floor }\n'
                             'mesh_instance { of "low"  translate 0 1 0 }\n') % low,
         # Rx(90) carries z = 1 (after the half scale) to y = -1; the move lifts it to y = 0.
@@ -186,8 +208,14 @@ def same_cells(img, ref):
 
 
 def off3x(img, ref, floor=1e-30):
-    """The fraction of pixels 3x off the reference either way."""
-    ratio = (img + floor) / (ref + floor)
+    """The fraction of the pixels the reference covers fully -- lit, and not on its rim, which
+    it only partly covers -- that `img` has 3x off either way (a floor larger than the
+    reference's fills the background and rim the reference leaves)."""
+    lit = ref > 1e-3 * ref.max()
+    m = lit.copy()
+    m[1:, :] &= lit[:-1, :]; m[:-1, :] &= lit[1:, :]; m[:, 1:] &= lit[:, :-1]; m[:, :-1] &= lit[:, 1:]
+    m[0, :] = m[-1, :] = False; m[:, 0] = m[:, -1] = False
+    ratio = (img[m] + floor) / (ref[m] + floor)
     return float(np.mean((ratio > 3.0) | (ratio < 1.0 / 3.0)))
 
 
@@ -220,21 +248,23 @@ def main():
     # so grey speckle, a seam -- half the floor in the other phase -- or a misplaced surface
     # shows as many pixels 3x off. Tile means would not: a tile spans whole pairs of cells,
     # whose mean a swap of their colours leaves alone.
-    ref = imgs.get(('quad', 'cpu'))
     for name in FLOORS:
+        refname = FLOOR_REF[name]
+        ref = imgs.get((refname, 'cpu'))
         for dev in devices:
             img = imgs.get((name, dev))
             if img is None:
                 continue
             c = contrast(img)
             report(c > 4.0, f'{name:10s} {dev.upper()}: floor contrast {c:6.2f}')
-            if (name, dev) == ('quad', 'cpu'):
+            if (name, dev) == (refname, 'cpu'):
                 continue
             if ref is None:
-                report(False, f'{name:10s} {dev.upper()}: no reference (the quad on the CPU did not render)')
+                report(False, f'{name:10s} {dev.upper()}: no reference ({refname} on the CPU did not render)')
                 continue
-            report(off3x(img, ref) < 0.02, f'{name:10s} {dev.upper()} against the quad on the CPU: '
+            report(off3x(img, ref) < 0.02, f'{name:10s} {dev.upper()} against {refname} on the CPU: '
                                            f'{off3x(img, ref) * 100:.2f}% of pixels 3x off')
+    ref = imgs.get(('quad', 'cpu'))
     # The glowing surfaces: per pixel, the fraction of its hits that read the inside of the step.
     for name in GLOW:
         for dev in devices:
@@ -265,6 +295,18 @@ def main():
             agree = same_cells(rq, ref)
             report(agree > 0.75, f'quad raster {dev.upper()}: {agree * 100:.1f}% of pixels in the cell the CPU '
                                 f'trace shows there')
+        # The big floor's preview against the up-facing quad's: its triangles' reach sizes the
+        # hair. The middle of the frame only: the preview's background is not black, so the
+        # border the quad leaves and the big floor fills cannot be masked out by its level.
+        ru = render_raster(exe, a.out, paths['quad_up'], 'quad_up', dev)
+        rb = render_raster(exe, a.out, paths['big'], 'big', dev)
+        if ru is None or rb is None:
+            ok = False
+            continue
+        h, w = ru.shape
+        mid = (slice(h // 10, h - h // 10), slice(w // 10, w - w // 10))
+        off = off3x(rb[mid], ru[mid], 1e-6)
+        report(off < 0.02, f'big raster {dev.upper()}: {off * 100:.2f}% of pixels 3x off the up-facing quad\'s')
     print('PASS' if ok else 'FAIL')
     return 0 if ok else 1
 

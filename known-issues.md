@@ -148,18 +148,49 @@ double; the host sphere hit is put back on the sphere (its textbook t erred past
 (`u` along x, `v` along z) faces down, so a checker floor on a cell wall now shows the cell below:
 the opposite phase from 0.398.1-0.399.7.
 
-## OPEN (2026-10-24, 0.399.8): GPU-TRI-HIT-ROUNDING — a GPU triangle hit rounds relative to its vertices, so a huge tilted triangle can still split a pattern step lying on it
+0.399.9, after the review of 0.399.8: the hair is sized by the reach of the primitive the hit lies
+on (`Hit::pscale`: a triangle's farthest vertex from the origin, a sphere's |c| + |r|, a curve's
+farther end plus its radius), not by the hit's own distance. An exported mesh's float noise and a
+GPU triangle hit's rounding both scale with the vertices, which on a big triangle hit near the
+origin dwarf the hit's distance: a 100 m floor exported in float, 1e-6 off y = 0, split within a
+metre of the origin, and so did a long curve seen from afar (`-checkpatops` and the seam check's
+100 m floor and far curves fail with the hair sized by the hit alone). Constant over a
+primitive, the hair no longer grows across one, so a surface lying a little off a step reads one
+side all over it rather than a ring.
 
-A pattern reads a hit a hair (2e-6 of its distance from the origin) outside the surface, which
-settles a step lying on the surface as long as the hit point rounds by less (CHECKER-ON-BOUNDARY
-above). The GPU's triangle hit, `v0 + b1 e1 + b2 e2` in float, rounds by a few float ulps of the
-vertices' magnitudes, not the hit's: the barycentrics themselves are float. A triangle hit far
-from its vertices, relative to its distance from the origin -- a 10 km ramp on x + y = 0 under
-`floor(4*(x+y))`, hit near the origin, is off its plane by ~ulp(5000) = 5e-4 -- still splits.
-An axis-aligned surface is exact whatever its size (all three vertices carry the coordinate),
-and the CPU is exact enough in double. **Fix:** split, at load, triangles whose extent is large
-against their distance from the origin, so every hit lies near a vertex of its own triangle.
-Measure first: nothing seen so far does this.
+## DONE (2026-10-24, 0.399.9): GPU-TRI-HIT-ROUNDING — a GPU triangle hit rounds relative to its vertices, so a huge triangle could still split a pattern step lying on it
+
+The GPU's triangle hit, `v0 + b1 e1 + b2 e2` in float, rounds by a few float ulps of the vertices'
+magnitudes, not the hit's: a 10 km ramp on x + y = 0 under `floor(4*(x+y))`, hit near the origin,
+is off its plane by ~ulp(5000) = 5e-4, against a hair (0.399.8) of 2e-6 of the hit's distance.
+Exported float noise on a mesh's vertices scales the same way, and on the CPU too. Since 0.399.9
+the hair is 2e-6 of the triangle's reach (its farthest vertex from the origin, `DTri::reach`
+baked at upload, `Hit::pscale` on the host), some 17 float ulps of the coordinates the hit was
+computed from. CHECKER-ON-BOUNDARY above has the measurements.
+
+## OPEN (2026-10-24, 0.399.9): PATTERN-NORMAL-SIDE — the normal and curvature a pattern sees face the ray, so they differ with the side a transmissive surface is crossed from
+
+A pattern reads its position just outside the surface whichever side the ray comes from
+(CHECKER-ON-BOUNDARY), but its `nx`, `ny`, `nz` are the shading normal turned to face the ray,
+and `curv` is signed toward the side being shaded (`patCtxFromHit` passes `h.n` and `h.curv`).
+On a transmissive surface (glass, `transmit`, a roughness or ior pattern) a pattern reading
+those -- `step(0, ny)`, a curvature-driven roughness -- takes a different value for light crossing
+it one way than the other: forward, backward and bidirectional modes then integrate different
+things, and BDPT/VCM's MIS weights combine them. **Fix:** hand patterns the normal and
+curvature on the surface's own side (`h.n` turned to `h.ng`'s side; `curv` with the outward
+sign), as the position already is. That changes what existing scenes see on the far side of
+thin geometry -- `step(0.7, ny)` snow on a roof would cover its underside too -- so it is a
+decision about what `ny` means, not only a fix; the user's to make.
+
+## DONE (2026-10-24, 0.399.9): MESHLIGHT-SIDE — a mesh light wound against its vertex normals emitted, for NEE and photons, from the side its hits did not
+
+`addMeshLight` took each `EmitTri::nrm` from the triangle's winding, while `intersectTri` turns a
+hit's `ng` to the vertex normals' side, and one-sided emission is judged against each: NEE and
+photon emission (`dot(nOut, w)`) against the winding normal, emission-on-hit (`dot(d, h.ng)`)
+against the vertex normals'. For a mesh wound clockwise with outward normals the two disagreed
+on which side emits, and an emission pattern stepping at the surface was read on opposite sides
+by the two estimates MIS adds. Found by the review of 0.399.8. `nrm` is now turned to the vertex
+normals' side as `ng` is; `-checkpatops` builds such a light and fails without it.
 
 ## DONE (2026-10-24, 0.399.8): INSTANCE-SILHOUETTE-FLIP — an instanced smooth mesh negated its shading normal and curvature in the silhouette band
 

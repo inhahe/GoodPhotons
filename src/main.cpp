@@ -3276,10 +3276,15 @@ static PatOpWhere patOpWhere(PatOp op, const char*& why) {
 // (pattern.h patNudgedPoint, used by patCtxFromHit and emitterPatMulAt), whichever side the ray
 // came from. Hits within rounding of a step -- a floor at y = 0, at +-1e-12 of it as an
 // exported floor's vertices put them; a sphere at r = 0.5 +- an ulp; the built-in checker on
-// a cell wall facing either way, out to 200 m, where a tie-break that once shifted its walls
-// made a ring -- all read the outside, seen from either side. An emitter's sampled point reads
-// an emission pattern as a hit there does. And a CPU sphere hit from 100 km away, whose
-// textbook t is far coarser than the hair, reads outside: the hit is put back on the sphere.
+// a cell wall facing either way, out to 200 m (a checker whose walls are shifted off the
+// round coordinates fails there: the nudge and the shift disagree on a wall facing its lower
+// cell) -- all read the outside, seen from either side. A 100 m floor triangle 1e-6 below
+// y = 0, as an export's float noise leaves it, reads outside near the origin too: the hair is
+// sized by the triangle's reach (Hit::pscale), not the hit's distance. An emitter's sampled
+// point reads an emission pattern as a hit there does, and a mesh light wound against its
+// vertex normals emits from the side a hit on it reads. And a CPU sphere hit from 100 km away,
+// whose textbook t is far coarser than the hair, reads outside: the hit is put back on the
+// sphere.
 static bool checkPatternNudge() {
     std::vector<PatNode> floor4y, stepR, lit;
     std::string err;
@@ -3351,11 +3356,49 @@ static bool checkPatternNudge() {
         ++farN;
         if (patternEval(stepR.data(), (int)stepR.size(), patCtxFromHit(sc, h)) != 1.0) ++farBad;
     }
+    int bigBad = 0, bigN = 0;
+    {
+        Tri big{Vec3(-50, -1e-6, -50), Vec3(-50, -1e-6, 50), Vec3(50, -1e-6, 50), -1, -1, {}};   // faces up
+        big.finalize();
+        for (int k = 0; k < 64; ++k) {                           // hits within 0.6 m of the origin
+            const double x = -0.6 + 0.017 * k, z = x + 0.05 + 0.004 * (k % 7);
+            Hit h;
+            if (!intersectTri(Ray{Vec3(x, 1.0, z), Vec3(0, -1, 0)}, big, 1e-9, h)) { ++bigBad; continue; }
+            ++bigN;
+            if (patternEval(floor4y.data(), (int)floor4y.size(), patCtxFromHit(sc, h)) != 0.0) ++bigBad;
+        }
+    }
+    // A sphere written with a negative radius traces as its absolute value (the quadratic sees
+    // r^2), and its hit lies where the ray meets it, not at the antipode.
+    int negBad = 0;
+    {
+        const Sphere neg{Vec3(0, 0, 0), -0.5, -1};
+        Hit h;
+        if (!intersectSphere(Ray{Vec3(0.1, 3, 0.2), Vec3(0, -1, 0)}, neg, 1e-9, h) ||
+            length(h.p - Vec3(0.1, 3.0 - h.t, 0.2)) > 1e-9)
+            negBad = 1;
+    }
+    int sideBad = 0;
+    {
+        Scene sl;
+        Tri t{Vec3(0, 0, 0), Vec3(1, 0, 0), Vec3(0, 0, 1), -1, -1, {}};   // wound down ...
+        t.n0 = t.n1 = t.n2 = Vec3(0, 1, 0);                                // ... normals up
+        t.finalize();
+        sl.tris.push_back(t);
+        sl.addMeshLight(0, 1, constantSpectrum(1.0), 1.0, -1);
+        Hit h;
+        if (sl.emitters.size() != 1 || !intersectTri(Ray{Vec3(0.2, 1, 0.3), Vec3(0, -1, 0)}, t, 1e-9, h) ||
+            !(dot(sl.emitters[0].meshTris[0].nrm, h.ng) > 0.0))
+            sideBad = 1;
+    }
     std::printf("[checkpatops] pattern nudge: %d of %d hits within rounding of a step read the inside, "
-                "%d of %d on checker walls, %d of %d emitter samples disagree with a hit there, "
-                "%d of %d sphere hits from 100 km %s\n",
-                bad, n, chkBad, chkN, emBad, emN, farBad, farN, bad || chkBad || emBad || farBad ? "FAIL" : "ok");
-    return bad == 0 && chkBad == 0 && emBad == 0 && farBad == 0;
+                "%d of %d on checker walls, %d of %d on a big noisy floor, %d of %d emitter samples disagree "
+                "with a hit there, %d of %d sphere hits from 100 km, negative-radius sphere hit %s, mesh "
+                "light's side %s; %s\n",
+                bad, n, chkBad, chkN, bigBad, bigN, emBad, emN, farBad, farN, negBad ? "misplaced" : "in place",
+                sideBad ? "differs" : "agrees",
+                bad || chkBad || bigBad || emBad || farBad || negBad || sideBad ? "FAIL" : "ok");
+    return bad == 0 && chkBad == 0 && bigBad == 0 && emBad == 0 && farBad == 0 && negBad == 0 && sideBad == 0;
 }
 
 // -checkpatops: every pattern opcode, through all THREE implementations of the VM.
@@ -23777,6 +23820,11 @@ static int run(int argc, char** argv) {
         auto rasterOne = [&](const Camera& cam, int W, int H, double ev, bool autoExp,
                              double* lock) -> std::vector<uint8_t> {
 #ifdef HAVE_CUDA
+            auto sayGpuFrameFailed = [&](const char* fallback) {
+                if (gpuFrameFailSaid) return;
+                gpuFrameFailSaid = true;
+                std::fprintf(stderr, "[raster] a GPU frame failed; %s\n", fallback);
+            };
             // G2: cast primary rays straight at the implicit on the GPU (no tessellation).
             // A physical-lens camera isn't covered by the pinhole/fisheye ray-gen, so it
             // falls through to the tessellated path (built lazily on first need).
@@ -23785,16 +23833,14 @@ static int run(int argc, char** argv) {
                     renderIsoPreviewCuda(scene, cam, W, H, nThreads, ev, autoExp, lock,
                                          nullptr, &plight, rasterShowHidden);
                 if (!img.empty()) return img;
+                sayGpuFrameFailed(gpuRaster ? "tessellating it instead" : "rendering on the CPU");
             }
             if (gpuRaster) {
                 std::vector<uint8_t> img =
                     raster_cuda::renderFrame(gpuRaster, cam, W, H, nThreads, ev, autoExp, lock,
                                              rasterSeeThrough, rasterClarity, rasterHaze);
                 if (!img.empty()) return img;
-                if (!gpuFrameFailSaid) {
-                    gpuFrameFailSaid = true;
-                    std::fprintf(stderr, "[raster] a GPU frame failed; rendering on the CPU\n");
-                }
+                sayGpuFrameFailed("rendering on the CPU");
             }
 #endif
             ensurePrims();   // lazy fallback (also the sole path when the GPU is unavailable)

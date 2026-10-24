@@ -661,24 +661,29 @@ struct PatTableScope {
 // step a hair off an exported floor's noisy vertices, a radial step on a sphere) would
 // otherwise take each hit's value from whichever side its rounding put it on, and a pixel
 // would average the two: grey speckle, or a seam. Read off the surface by more than that
-// rounding, every hit reads one side. That side is fixed by the surface, not the ray, so a
-// transmissive surface reads the same value for light crossing it either way (reciprocity,
-// which forward, backward and bidirectional modes rely on), and nothing turns on the shading
-// normal's orientation, which normal maps and instances can tip.
+// rounding, every hit reads one side. That side is fixed by the surface, not the ray, so
+// the position a transmissive surface's pattern reads is the same for light crossing it
+// either way, and nothing turns on the shading normal's orientation, which normal maps and
+// instances can tip. (The normal and curvature a pattern sees still face the ray: see
+// known-issues PATTERN-NORMAL-SIDE.)
 //
-// The hair is kPatNudge (some 17 float ulps) of the point's distance from the origin, and at
-// least kPatNudge * kPatNudgeFloor in absolute terms. It must outrun the rounding of the hit
-// point -- so every intersector takes its hit from the surface's own coordinates (a
-// triangle's from its vertices; spheres, isosurfaces and curves put back on the surface or
-// solved about it), not along the ray -- and the float noise of an exported mesh's vertices,
-// which double hit points inherit too. Smaller would not cover those; larger shifts a pattern
-// that varies along the normal (at a kilometre from the origin the hair is 2 mm).
+// The hair is kPatNudge (some 17 float ulps) of `scale` -- the reach of the primitive the
+// point lies on (Hit::pscale: its farthest point's distance from the origin), or the point's
+// own distance where that is larger or unknown -- and at least kPatNudge * kPatNudgeFloor. It
+// must outrun the rounding of the hit point -- so every intersector takes its hit from the
+// surface's own coordinates (a triangle's from its vertices; spheres, isosurfaces and curves
+// put back on the surface or solved about it), not along the ray -- and the float noise of an
+// exported mesh's vertices, which double hit points inherit too; both scale with the
+// primitive's coordinates, which on a big triangle near the origin dwarf the point's. Over
+// one primitive the scale is constant, so the hair does not grow across it. Larger shifts a
+// pattern that varies along the normal (a kilometre out, the hair is 2 mm).
 // Shared by every surface pattern read: host patCtxFromHit, emitterPatMulAt and the
 // rasterizer, and their device twins.
 constexpr double kPatNudge = 2e-6, kPatNudgeFloor = 1e-2;
 PATTERN_HD inline void patNudgedPoint(double px, double py, double pz, double gx, double gy, double gz,
-                                      double& ox, double& oy, double& oz) {
+                                      double scale, double& ox, double& oy, double& oz) {
     double r = sqrt(px * px + py * py + pz * pz);
+    if (r < scale) r = scale;
     if (r < kPatNudgeFloor) r = kPatNudgeFloor;
     const double d = kPatNudge * r;
     ox = px + gx * d; oy = py + gy * d; oz = pz + gz * d;

@@ -172,6 +172,14 @@ struct Hit {
     // being occluded by it. Nothing else reads this, and the intersector already has the
     // interpolated radius in hand, so it costs one store.
     double fiberRadius = 0.0;
+    // The reach of the primitive the hit lies on: the distance from the origin of its
+    // farthest point (a triangle's farthest vertex, a sphere's |c| + r, an isosurface's
+    // farthest container corner), or 0 where unknown. A pattern reads a hit a hair off the
+    // surface (pattern.h patNudgedPoint), sized by this: the hit point's rounding and the
+    // float noise of an exported mesh's vertices scale with the coordinates the point was
+    // computed from, not with the point's own distance, which can be far smaller on a big
+    // triangle; and over one primitive the reach is constant, so the hair is too.
+    double pscale = 0.0;
     // Barycentric-interpolated per-vertex colour at the hit (linear RGB), when the
     // triangle carried one. Resolved by the intersector, which is the only place that
     // has both the triangle and the barycentrics; everything downstream reads it off the
@@ -384,6 +392,7 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     // also scales with the vertices rather than with the ray's travel. (Not
     // b0 v0 + b1 v1 + b2 v2: the b's need not sum to exactly 1, which breaks the exactness.)
     hit.t = t; hit.p = tri.v0 + (tri.v1 - tri.v0) * b1 + (tri.v2 - tri.v0) * b2; hit.valid = true;
+    hit.pscale = std::sqrt(std::max(dot(tri.v0, tri.v0), std::max(dot(tri.v1, tri.v1), dot(tri.v2, tri.v2))));
     hit.matId = tri.matId; hit.sensorId = tri.sensorId;
     // Barycentric-interpolated UV and shading normal (matches the old M-T convention:
     // b0,b1,b2 == w0,u,v).
@@ -460,7 +469,9 @@ inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit
     // On the sphere itself: the textbook discriminant's t carries rounding that grows as the
     // square of the ray origin's distance over the radius (from 100 km, past the hair a pattern
     // reads the hit off it at, patNudgedPoint); the point's direction from the centre does not.
-    hit.p = s.c + ng * s.r;
+    // |r|: the quadratic only sees r^2, so a negative radius traces as its absolute value.
+    hit.p = s.c + ng * std::fabs(s.r);
+    hit.pscale = std::sqrt(dot(s.c, s.c)) + std::fabs(s.r);
     hit.ng = ng;
     bool sFlipped = !(dot(r.d, ng) < 0.0);
     hit.n = sFlipped ? -ng : ng;

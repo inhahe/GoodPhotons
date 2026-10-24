@@ -153,6 +153,8 @@ struct DPTri {
     int    emitPat;         // scalar `pattern` masking the emission, or -1
     int    mix;             // index into the DMix table for a per-hit mix, else -1
     float  tanSign;         // the normal map's frame handedness (host: PTri::tanSign)
+    float3 patN;            // where a pattern reads it: PTri::patN, patScale
+    float  patScale;
     // RASTER-PBR (host twin: raster.h PShade). `rough < 0` = no specular lobe, which shades
     // byte-for-byte as before, so every diffuse scene is untouched. `f0` is normal-incidence
     // reflectance -- for a metal preset that IS its measured reflectance, which is why a gold
@@ -909,21 +911,14 @@ __device__ inline double dRasterFw(const DCam& cam, float3 wpos, float3 wn) {
 }
 
 // The point a pattern reads at this preview pixel, and its distance r from the origin: wpos
-// moved a hair off the triangle (p0, p1, p2) along its geometric normal, turned to the side
-// its source vertex normals (summed: nsum) face -- as the tracers read a hit (pattern.h
-// patNudgedPoint; intersectTri orients h.ng so) -- so a pattern stepping at the surface shows
-// the side the tracers show. Host twin: raster.h ctx().
-__device__ inline void dRasterPatPoint(float3 p0, float3 p1, float3 p2, float3 nsum, float3 wpos,
-                                       double& qx, double& qy, double& qz, double& r) {
-    const double ax = (double)p1.x - p0.x, ay = (double)p1.y - p0.y, az = (double)p1.z - p0.z;
-    const double bx = (double)p2.x - p0.x, by = (double)p2.y - p0.y, bz = (double)p2.z - p0.z;
-    double nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
-    const double l = sqrt(nx * nx + ny * ny + nz * nz);
-    qx = wpos.x; qy = wpos.y; qz = wpos.z;
-    if (l > 0.0) {
-        const double k = (nx * nsum.x + ny * nsum.y + nz * nsum.z < 0.0 ? -1.0 : 1.0) / l;
-        patNudgedPoint(qx, qy, qz, nx * k, ny * k, nz * k, qx, qy, qz);
-    }
+// moved a hair off the source triangle t along its baked frame (PTri::patN, patScale), as the
+// tracers read a hit (pattern.h patNudgedPoint), so a pattern stepping at the surface shows
+// the side the tracers show. The source triangle's, not this slot's: a near-clipped slot's
+// lerped corners are float sums, off the plane. Host twin: raster.h ctx().
+__device__ inline void dRasterPatPoint(const DPTri& t, float3 wpos, double& qx, double& qy, double& qz,
+                                       double& r) {
+    patNudgedPoint((double)wpos.x, (double)wpos.y, (double)wpos.z, (double)t.patN.x, (double)t.patN.y,
+                   (double)t.patN.z, (double)t.patScale, qx, qy, qz);
     r = sqrt(qx * qx + qy * qy + qz * qz);
 }
 
@@ -1162,12 +1157,12 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     float uu = (uv0.x * (w0 * t.invd0) + uv1.x * (w1 * t.invd1) + uv2.x * (w2 * t.invd2)) * d;
     float vv = (uv0.y * (w0 * t.invd0) + uv1.y * (w1 * t.invd1) + uv2.y * (w2 * t.invd2)) * d;
     // The point the pattern sites below read (dRasterPatPoint), made once per pixel, by the
-    // first that needs it. The source triangle's normals orient it: this slot's may be
-    // flipped to face the eye (kSlotBack) or lerped by the near clip.
+    // first that needs it, from the source triangle's baked frame: this slot's normals may
+    // be flipped to face the eye (kSlotBack) and its corners lerped by the near clip.
     double qx = 0.0, qy = 0.0, qz = 0.0, qr = 0.0;
     bool qReady = false;
     auto patPoint = [&]() {
-        if (!qReady) { dRasterPatPoint(wp0, wp1, wp2, vsrc.n0 + vsrc.n1 + vsrc.n2, wpos, qx, qy, qz, qr); qReady = true; }
+        if (!qReady) { dRasterPatPoint(vsrc, wpos, qx, qy, qz, qr); qReady = true; }
     };
 
     // Per-hit `mix`: a `weight_map` selects between two whole material payloads at every
@@ -1792,6 +1787,7 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
         d.vc2 = make_float3((float)t.vc2.x, (float)t.vc2.y, (float)t.vc2.z);
         d.normalTex = t.normalTex;
         d.tanSign = t.tanSign;
+        d.patN = toF3(t.patN); d.patScale = (float)t.patScale;
         d.normalStrength = (float)t.normalStrength;
         d.reflectPat = t.reflectPat;
         d.rough = (float)t.rough;                // RASTER-PBR (host twin: raster.h PShade)
