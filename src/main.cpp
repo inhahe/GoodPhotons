@@ -2610,9 +2610,11 @@ static int checkContainer(long long rays) {
 //   (4) the entrance table holds the rays that can reach the film: over scene points across
 //       and beyond the field, near and far, front-sampler rays that land on the raster fall
 //       inside their point's region -- all but a bounded few, since a region found by tracing
-//       cannot be proven complete -- and none comes from a point whose bin rejects;
-//   (5) the density lensEntry draws an aimed leg with is the one lensAimRatio recomputes from
-//       the leg's two ends (BDPT's MIS weighs the light image by the second);
+//       cannot be proven complete, and only the defensive share draws a miss -- and none comes
+//       from a point whose bin rejects;
+//   (5) the density lensEntry draws a table bin's leg with, aimed or the defensive share, is
+//       the one lensAimRatio recomputes from the leg's two ends (BDPT's MIS weighs the light
+//       image by the second);
 //   (6) the aimed and the front sampler estimate the same solid angle reaching the sensor,
 //       on and off axis, near and far; their hit rates say what the aiming buys;
 //   (7)-(9) the exit table's twins of (4)-(6) for camera rays, and (10)-(11) that the tables
@@ -2721,9 +2723,11 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
     // (4) coverage. Scene points up to 89 deg off axis (well past any field but a fisheye's),
     // 5 cm to 5 km out (log-uniform), one front-sampler ray each, at a wavelength across the
     // band. A region found by tracing cannot be proven to hold every crossing: a crescent's tip
-    // is reached by almost no ray. What a miss costs is its share of the light, so the bound is
-    // on that share (1e-5) and on how far out a miss lies (5% of its region); a fault in the
-    // tables themselves -- a wrong frame, plane or bin -- misses far more, and far further.
+    // is reached by almost no ray. A miss is drawn only by the defensive share
+    // (kLensDefensive), at 1/kLensDefensive times the weight -- unbiased, but noisy -- so the
+    // bound is on the share of the light that pays that (1e-5) and on how far out a miss lies
+    // (5% of its region); a fault in the tables themselves -- a wrong frame, plane or bin --
+    // misses far more, and far further.
     long long reached = 0, aimedReached = 0, outside = 0, rejected = 0;
     double worstOut = 0.0;
     // At least 2M draws, and more until 30000 reach the film: a fisheye's front element lets
@@ -2906,6 +2910,65 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
                     "+- %.1e (%.1f sigma); rays out aimed %.1f%%, unaimed %.1f%%\n",
                     preset, px, py, m[0], se[0], m[1], se[1], z9, 100.0 * hit[0] / n, 100.0 * hit[1] / n);
         pass = pass && (hit[0] + hit[1] == 0 || z9 < 4.0);
+    }
+    // (9b) What the defensive share (kLensDefensive) is for: a table that misses. The same
+    // tables with every aiming region shrunk to 85% of its half-widths leave a ring of real
+    // crossings outside them, which only the share draws, at 1/kLensDefensive times the weight.
+    // The light image's solid angle at (6)'s first two points, and the importance at (9)'s
+    // first two film points, must still match the unaimed samplers -- noisier, the ring's light
+    // coming from one sample in 1/kLensDefensive. Without the share they come out short by the
+    // ring's light, many sigma.
+    {
+        auto shrunk = std::make_shared<LensPupil>(*P);
+        for (LensPupilTable* T : {&shrunk->entry, &shrunk->exit})
+            for (LensPupilCell& C : T->cells)
+                if (C.kind == LensPupil::AIM || C.kind == LensPupil::AIMBOX) { C.a *= 0.85; C.b *= 0.85; }
+        Camera camS = cam;
+        camS.lensPupil = shrunk;
+        auto report = [&](const char* what, const double* s, const double* s2, int n) {
+            double m[2], se[2];
+            for (int i = 0; i < 2; ++i) {
+                m[i] = s[i] / n;
+                se[i] = std::sqrt(std::max(0.0, s2[i] / n - m[i] * m[i]) / n);
+            }
+            const double z = std::fabs(m[0] - m[1]) / std::max(std::sqrt(se[0] * se[0] + se[1] * se[1]), 1e-300);
+            std::printf("[checklens] %s: tables shrunk to 85%%, %s: %.4e +- %.1e against unaimed %.4e +- %.1e "
+                        "(%.1f sigma)\n", preset, what, m[0], se[0], m[1], se[1], z);
+            pass = pass && (m[1] == 0.0 || z < 4.0);
+        };
+        const int n = 1600000;
+        for (const auto& pt : {std::array<double, 3>{2.0, 0.0, 0.0}, std::array<double, 3>{2.0, 0.15, -0.1}}) {
+            const Vec3 X = cam.w * pt[0] + cam.u * (pt[1] * kf * pt[0]) + cam.v * (pt[2] * kf * pt[0]);
+            double s[2] = {0, 0}, s2[2] = {0, 0};
+            for (int which = 0; which < 2; ++which) {
+                const Camera& cc = which ? camF : camS;
+                for (int k = 0; k < n; ++k) {
+                    Vec3 Y, wd; double dist, wgt; int px, py;
+                    if (!cc.lensConnect(X, lambda, rng.uniform(), rng.uniform(), Y, wd, dist, px, py, wgt)) continue;
+                    const double v = wgt * aCell;
+                    s[which] += v; s2[which] += v * v;
+                }
+            }
+            char what[64];
+            std::snprintf(what, sizeof what, "solid angle from (%.2f, %.2f) at %g m", pt[1], pt[2], pt[0]);
+            report(what, s, s2, n);
+        }
+        for (const auto& fp : {std::array<double, 2>{0.5, 0.5}, std::array<double, 2>{0.75, 0.6}}) {
+            const int px = (int)(fp[0] * 64), py = (int)(fp[1] * 43);
+            double s[2] = {0, 0}, s2[2] = {0, 0};
+            for (int which = 0; which < 2; ++which) {
+                const Camera& cc = which ? camF : camS;
+                for (int k = 0; k < n; ++k) {
+                    Ray r; double wgt;
+                    if (!cc.genLensRay(px, py, 0.5, 0.5, rng.uniform(), rng.uniform(), lambda, r, wgt) ||
+                        !(wgt > 0.0)) continue;
+                    s[which] += wgt; s2[which] += wgt * wgt;
+                }
+            }
+            char what[64];
+            std::snprintf(what, sizeof what, "importance at film pixel (%d, %d)", px, py);
+            report(what, s, s2, n);
+        }
     }
     // (10) the tables are handed out for any raster: Camera::pupil compares the tables' squared
     // film radius with the raster's own, and one squared back from its square root comes out an

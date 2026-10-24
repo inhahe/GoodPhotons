@@ -2023,8 +2023,11 @@ film anywhere on the rear element, of which a stopped-down beam uses a few per c
 50 mm double Gauss at f/8); a second table, binned by distance from the sensor's centre, holds
 where on the exit pupil's plane the rays that get out of the lens cross, and camera rays are
 drawn there (pbrt's exit-pupil bounds, built the same way as the light's table). Same image,
-less noise: the tables only move samples to where light gets through. `-checklens` checks
-they hold every ray that gets through, and `FTRACE_LENS_FRONT=1` turns all aiming off (every
+less noise: the tables only move samples to where light gets through. A table found by
+tracing cannot be proven complete, so 2% of the samples where a table aims (or rejects) still
+use the whole element (since 0.399.0): a ray the table missed is drawn rarely, as noise, not
+lost, and no table can darken a render. `-checklens` checks how nearly the tables hold every
+ray that gets through, and `FTRACE_LENS_FRONT=1` turns all aiming off (every
 lens camera samples its whole front and rear elements) for comparing a render with and
 without it. It maps the sensor across the film width, so a
 film whose aspect matches the sensor (e.g. `res 360 240` for a 3:2 sensor) covers it

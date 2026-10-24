@@ -72,6 +72,21 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-10-24, 0.399.0): PUPIL-DEFENSIVE — a crossing the pupil tables missed was light the aimed samplers could never draw
+
+The tables' regions are found by tracing, and a traced region cannot be proven to hold every
+crossing that reaches the film (a crescent's tip is reached by almost no ray), nor a
+rejecting bin proven dark. Light through a miss was simply never drawn: a bias, tiny where
+measured (the fisheye's exit table missed 2 of 572,172 rays, 0.65% past their region, after
+0.398.0's edge-band verification) but unbounded in principle, which 0.398.0's coverage bound
+in `-checklens` could only measure, not remove (the review of 5d25e4f..447a96f called it).
+Every bin that aims or rejects now draws `kLensDefensive` (2%) of its samples with the
+unaimed sampler, and every sample carries the mixture's density -- camera side and light
+side, CPU and GPU, in the importance, the light image's omega, lensPdfDir and
+lensAimRatio -- so a miss is drawn at 50x the weight instead of lost. `-checklens` (9b)
+shrinks every region to 85% and holds the light image and the importance to the unaimed
+samplers (it fails with the share switched off).
+
 ## DONE (2026-10-24, 0.398.1): CHECKER-ON-BOUNDARY — on the GPU a checker on a surface lying on a cell boundary (a floor at y = 0) rendered as flat grey
 
 Found by `tools/check_physlens.py`'s fisheye case: every CPU estimator read the bottom of the
@@ -112,7 +127,8 @@ Found while adding the published telephoto, wide-angle and fisheye (0.398.0), by
    outside their region). `fitRegion` now also checks the band just past each region's edge
    with aimed rays. A region found by tracing cannot be proven complete -- a crescent's tip
    is reached by almost no ray -- so `-checklens` (4) / (7) now bound what a miss costs
-   instead of demanding none: at most 1e-5 of the light, none past 5% of its region.
+   instead of demanding none: at most 1e-5 of the light, none past 5% of its region. (0.399.0
+   made a miss cost noise instead of light: PUPIL-DEFENSIVE.)
 
 ## DONE (2026-10-23, 0.397.1): ACHROMAT-FNUMBER — the achromat and singlet presets did not work at the focal length or f-number asked for; the achromat's crown was thinner than its own curves
 

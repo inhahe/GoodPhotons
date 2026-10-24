@@ -6507,6 +6507,15 @@ as the one at fault.
     symmetry: a bin is built at azimuth 0 and rotated to the point's. `lensEntry` aims where the
     table says (`omega = cos_P * A_ellipse / |P - p|^2`, the solid angle per sample;
     `lensEntryImage` weights `omega / A_cell`), else keeps the uniform sampler bit for bit.
+    **The defensive share (0.399.0, `kLensDefensive` = 2%).** A traced region cannot be proven
+    to hold every crossing, nor a rejecting bin proven dark, so every bin that aims or rejects
+    draws that share of its samples with the unaimed sampler (`u1` split and stretched back),
+    and every sample carries the mixture's density, `(1 - a) p_region + a / A_front` on the
+    front element (`lensEntryDensity`; 0 for the region where its crossing lies outside, or
+    the bin rejects). A miss is then drawn, at 1/a times the weight, instead of lost: the
+    estimators are unbiased whatever the tables hold, and `-checklens` bounds misses for the
+    noise they cost (1e-5 of the light). `lensAimRatio` is the same density's inverse ratio
+    (at most 1/a, where it was capped at 1e12).
     The light image's pick of the camera vertex now depends on the vertex it is picked from,
     so BDPT's lens camera densities carry `lensAimRatio(Y, x) = (1/A_front) / p_entry(Y | x)`:
     in `vertexPdf`, on eye[1]'s pdfFwd after the walk (the walk could not know eye[1] when it
@@ -6526,14 +6535,18 @@ as the one at fault.
     every crossing of a film-to-scene ray that gets out of the lens. genLensRay aims there
     (importance `cosT^2 * A_region / r^2`, the planar rear's formula with the region for the
     disk), keeps the rear sampler where aiming would not pay, and rejects film radii no ray
-    leaves from. lensPdfDir follows: inside the region the camera density is
-    `r^2 cosF A_front / (A_film A_region cosT^2)`, 0 outside, so -- unlike the entrance side --
-    nothing else in BDPT changes (the density is still a function of the ray alone). Every
+    leaves from -- in both, since 0.399.0, with the defensive share drawn by the rear sampler
+    and the importance cosT over the mixture's density per film solid angle
+    (`lensFilmDensity`: `(1 - a) r^2 / (cosT A_region) + a p_rear`, `lensRearDensity` the rear
+    sampler's). lensPdfDir follows: the same mixture times `cosF A_front / (A_film cosT)`,
+    so -- unlike the entrance side -- nothing else in BDPT changes (the density is still a
+    function of the ray alone). Every
     camera ray keeps the invariant importance x lensPdfDir = cosF A_front / A_film, which
     `-checklens` asserts for all of them. Users: modes R (the lens camera's default), D and J's
     camera subpaths, M/S/U through R, and `addEnvBackgroundLens`. Device twins:
-    `dLensExitClassify`, the aimed branches of `dGenLensRay` and `dLensPdfDir`
-    (`DLensSystem::exit*`). Users of the light-tracing functions: the forward splats of modes A/B
+    `dLensExitClassify`, the table branches of `dGenLensRay` and `dLensPdfDir`, and
+    `dLensRearDir` / `dLensRearDensity` / `dLensFilmDensity` (`DLensSystem::exit*`); on the
+    entrance side `dLensFrontLeg` / `dLensEntryDensity`. Users of the light-tracing functions: the forward splats of modes A/B
     (`Renderer::connectLensPhysical` and its hero / volume twins, routed by `lensCam`, so a
     lens camera in mode B images through its glass), mode C's catch, and BDPT's t=1 branch.
     Device twins in `render_cuda.cu` (`dLensEntry` / `dLensEntryImage` / `dLensCatch` /

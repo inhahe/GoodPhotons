@@ -505,8 +505,9 @@ struct LensSystem {
 // anything that does, until a whole batch of each finds nothing (the count is kept for
 // -checklens). A bin keeps the unaimed sampler where aiming
 // would not pay -- the stop already fills the element -- or where its region never comes
-// clean, and a bin where no light got through, nor in any neighbouring bin, rejects outright,
-// before any tracing. The film edge used is a circle round the sensor's corners, which the
+// clean, and a bin where no light got through, nor in any neighbouring bin, rejects before
+// any tracing -- all but the defensive share (kLensDefensive), which aiming and rejecting
+// bins both draw unaimed, so that nothing the tables get wrong biases a render. The film edge used is a circle round the sensor's corners, which the
 // lens's rotational symmetry needs; a camera whose raster outgrows that circle, or whose
 // focus moves, stops using the tables (Camera::pupil).
 struct LensPupilCell {
@@ -561,9 +562,20 @@ struct LensPupilTable {
     double area(int c) const { return pupilRegionArea(cells[c]); }
 };
 
+// The defensive share. A region found by tracing cannot be proven to hold every crossing
+// that reaches the film -- a crescent's tip is reached by almost no ray -- nor a rejecting
+// bin proven dark. So in every bin that aims or rejects, this share of the samples is drawn
+// the unaimed way (the front element for light, the rear element for camera rays), and every
+// sample's density is the mixture's: light a region misses is still drawn, rarely and so
+// noisily, instead of lost, and the estimators stay unbiased whatever the tables hold.
+// It costs this share of an aimed bin's samples, nearly all of which the unaimed samplers
+// waste where aiming pays; a rejecting bin traces this share of its samples instead of none.
+inline constexpr double kLensDefensive = 0.02;
+
 struct LensPupil {
     // FRONT keeps the unaimed sampler (uniform on the front element for light, on the rear
-    // element for camera rays); NONE rejects before any trace.
+    // element for camera rays); AIM / AIMBOX aim at the region, NONE rejects, both with the
+    // defensive share of unaimed samples (kLensDefensive) mixed in.
     enum { FRONT = 0, AIM = 1, NONE = 2, AIMBOX = 3 };
     // What the tables were built for. They describe the prescription as it stood then: a
     // LensSystem is to be edited only before its cameras call prepareLensPupil.
