@@ -4466,7 +4466,8 @@ where a surface lies (a floor at `y 0` under `floor(4*y)`, a sphere of radius 0.
 every hit, from either side, on CPU and GPU, in renders and in the `-raster` preview alike:
 a pattern reads a surface at a point a hair off it along the surface's own geometric normal
 -- two millionths of the reach of the primitive it lies on (the distance from the origin of
-that triangle's, sphere's or curve's farthest point; for an isosurface, of the point itself),
+that triangle's, sphere's or curve's farthest point -- through a `mesh_instance`, a bound on it;
+for an isosurface, of the point itself),
 and at least 2x10^-8 scene units. Sized so, it clears the float noise an exported mesh's
 vertices carry, which grows with their size: a 100 m floor's is ~10^-6.
 "Outside" is the side that normal faces: away from a sphere's, isosurface's or curve's

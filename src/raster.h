@@ -129,12 +129,6 @@ struct PTri : PShade {
     // UV parameterisation is degenerate/absent — the shade pass then falls back to a
     // stable frame about the shading normal, exactly as the old per-pixel path did.
     Vec3 tanRaw{0, 0, 0};
-    // Where a pattern reads this triangle (pattern.h patNudgedPoint), as the tracers read a
-    // hit on it: along its unit face normal turned to its vertex normals' side (intersectTri
-    // turns a hit's ng so; 0 for a degenerate face, read in place), a hair scaled by its
-    // farthest vertex's distance from the origin (Hit::pscale). Baked with tanRaw.
-    Vec3 patN{0, 0, 0};
-    double patScale = 0.0;
     // Per-vertex COLOUR (linear RGB), or hasVcol=false. The rasterizer is an RGB pipeline,
     // so it consumes the mesh's vertex colours directly — no Jakob-Hanika lift, which is
     // the whole reason Scene::vertColors stores RGB rather than fitted coefficients: the
@@ -1496,11 +1490,6 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             (p.mix >= 0 && p.mix < (int)geom.mixes.size() &&
              geom.mixes[p.mix].b.normalTex >= 0);
         if (wantTan) p.tanRaw = triTangentRaw(p);
-        // The pattern frame (PTri::patN, patScale), constant over the triangle.
-        const Vec3 fc = cross(p.p1 - p.p0, p.p2 - p.p0);
-        const double fl = length(fc);
-        p.patN = (fl > 0.0) ? fc * ((dot(fc, p.n0 + p.n1 + p.n2) < 0.0 ? -1.0 : 1.0) / fl) : Vec3{0, 0, 0};
-        p.patScale = std::sqrt(std::max(dot(p.p0, p.p0), std::max(dot(p.p1, p.p1), dot(p.p2, p.p2))));
     }
     // Length scale for the see-through path integral, from the geometry actually built.
     {
@@ -2612,11 +2601,15 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                     const Vec3 dv = g.wpos[i] - cam.eye;
                     const double dist = length(dv);
                     const double cs = dist > 0.0 ? dot(dv, N0) / dist : 0.0;
-                    // Read a hair off the face, as the tracers read a hit (PTri::patN), so a
-                    // pattern stepping at the surface shows the same side here.
+                    // Read a hair off the face as the tracers read a hit on it (patCtxFromHit):
+                    // along its face normal turned to its vertex normals' side, the hair sized
+                    // by its reach -- so a pattern stepping at the surface shows the same side.
+                    // Per pixel, not baked: 32 B more per preview triangle is gigabytes on a
+                    // fur preview, and this runs once per pixel, only for patterned ones.
                     const Vec3& w = g.wpos[i];
+                    const Vec3 fn = faceNormalToward(pt.p0, pt.p1, pt.p2, pt.n0 + pt.n1 + pt.n2);
                     Vec3 q;
-                    patNudgedPoint(w.x, w.y, w.z, pt.patN.x, pt.patN.y, pt.patN.z, pt.patScale, q.x, q.y, q.z);
+                    patNudgedPoint(w.x, w.y, w.z, fn.x, fn.y, fn.z, triReach(pt.p0, pt.p1, pt.p2), q.x, q.y, q.z);
                     pc = makePatCtx(q, 0.0, N0, g.uv[i].x, g.uv[i].y, 0.0, 0.0,
                                     patShadingFootprint(fwPerDist, dist, cs));
                     bindPatScene(pc, *scenePtr);

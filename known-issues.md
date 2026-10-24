@@ -192,6 +192,28 @@ on which side emits, and an emission pattern stepping at the surface was read on
 by the two estimates MIS adds. Found by the review of 0.399.8. `nrm` is now turned to the vertex
 normals' side as `ng` is; `-checkpatops` builds such a light and fails without it.
 
+0.399.10: `emit_orient auto` still judged a shell inward or outward by its winding's signed
+volume, and flipped winding and normals together -- so a shell wound inward with outward normals,
+exactly the case above, was turned to emit inward. It now takes each face on its oriented
+normal's side (`tools/emit_orient_rig.py` "normals out" fails without it). And a sampled point's
+pattern hair is sized by the patch it was drawn on, as a hit there is, not by the whole light's
+reach (`-checkpatops` "on a mesh light's near patch": 16 of 16 disagree without it).
+
+## DONE (2026-10-24, 0.399.10): HIT-RECORD-REUSE — fields of a farther candidate leaked into the closest hit
+
+The closest-hit loops, host and device, hand one Hit/DHit to every primitive they test, and an
+intersector that accepts overwrites only what it writes. The isosurface intersectors never wrote
+`pscale` (0.399.9), so an isosurface hit could keep a sky dome's reach and read its pattern 2 mm
+off instead of 1 um; spheres and isosurfaces never cleared the vertex colour (`hasVcol`; on the
+device `vcol`, which had no default and so could index the colour table with stack garbage),
+tinting a sphere by a farther vertex-coloured triangle; triangles, spheres and isosurfaces never
+cleared `fiberRadius`, so a surface hit after a fur strand was pushed off by the hair exit offset;
+isosurfaces kept a farther primitive's tangent frame. Found by the review of 0.399.9 (the
+`pscale` case) and, pre-existing, alongside it. Every intersector now writes every field it owns,
+and `DHit::vcol` defaults to -1. `-checkpatops` "reused hit record" hands each host intersector a
+record full of another primitive's values (fails with the sphere's or the isosurface's resets
+removed).
+
 ## DONE (2026-10-24, 0.399.8): INSTANCE-SILHOUETTE-FLIP — an instanced smooth mesh negated its shading normal and curvature in the silhouette band
 
 Found by the review of 0.399.7. `instanceHitToWorld` (host and device) re-oriented the world

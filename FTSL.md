@@ -1814,11 +1814,13 @@ reports such a mesh as skipped, since its geometry is gone by the time the audit
 drop `shape_only` for one run to check it.
 
 **`emit_orient auto|keep|flip` — which way an emissive mesh radiates** (0.338.0). Emission is
-one-sided: a triangle radiates along its geometric normal only. An imported shell wound *inward* —
-`torus.obj` is the classic — would therefore glow into its own hollow and look black from outside,
-so `auto` (the default) measures the shell's signed volume about its centroid and, if it is
-negative and large enough to be a real enclosed volume, reverses every winding so the emission
-points outward. It prints what it did:
+one-sided: a triangle radiates along its geometric normal turned to its vertex normals' side
+(its winding's, where it has none; 0.399.9 -- before, the winding's alone, while a ray hitting it
+saw the normals' side). An imported shell facing *inward* — `torus.obj` is the classic — would
+therefore glow into its own hollow and look black from outside, so `auto` (the default) measures
+the shell's signed volume about its centroid, each face taken on the side it emits, and, if it is
+negative and large enough to be a real enclosed volume, reverses every winding and normal so the
+emission points outward. It prints what it did:
 
 ```
 [ftsl] mesh 'shade': emissive shell wound inward (signed volume -8 over 24 m^2) -- reversing it
@@ -1833,7 +1835,7 @@ meant, which no test can recover. So:
 | value | effect |
 |---|---|
 | `auto` (default) | the volume test above, and it says so |
-| `keep` | never reorient: the authored winding **is** the emission side — what a furnace, a cove or a lampshade interior needs |
+| `keep` | never reorient: the authored side (the normals', else the winding's) **is** the emission side — what a furnace, a cove or a lampshade interior needs |
 | `flip` | always reverse — an inward-wound **open** sheet, which the volume test cannot detect at all (V ≈ 0) |
 
 ```ftsl

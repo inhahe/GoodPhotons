@@ -13,6 +13,9 @@ lampshade interior) with a grey probe quad inside it, viewed from inside. Four c
                           to within the renders' own noise.
   4. FLIP / ERROR      -- `flip` on an OUTWARD-wound cube reproduces case 2, and a misspelled
                           value is refused by name rather than silently ignored.
+  5. NORMALS OUT       -- a cube wound inward but with OUTWARD vertex normals already emits
+                          outward (a mesh light emits on its normals' side, as a hit on it sees
+                          it), so `auto` leaves it alone and the interior stays dark.
 
 Cited by known-issues ("An emissive mesh that is not PLANAR is silently re-oriented outward").
 """
@@ -36,16 +39,29 @@ CUBE_V = [(-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
 CUBE_F = [(1, 4, 3, 2), (5, 6, 7, 8), (1, 2, 6, 5), (2, 3, 7, 6), (3, 4, 8, 7), (4, 1, 5, 8)]
 
 
-def write_cube(path, inward):
-    L = ["# emit_orient rig: closed cube, %s-wound\n" % ("inward" if inward else "outward")]
+# Each CUBE_F face's outward normal, in order.
+CUBE_N = [(0, 0, -1), (0, 0, 1), (0, -1, 0), (1, 0, 0), (0, 1, 0), (-1, 0, 0)]
+
+
+def write_cube(path, inward, outward_normals=False):
+    L = ["# emit_orient rig: closed cube, %s-wound%s\n" % ("inward" if inward else "outward",
+                                                         ", outward vertex normals" if outward_normals else "")]
     for v in CUBE_V:
         L.append("v %g %g %g\n" % v)
-    for f in CUBE_F:
+    if outward_normals:
+        for n in CUBE_N:
+            L.append("vn %g %g %g\n" % n)
+    for k, f in enumerate(CUBE_F):
         a, b, c, d = f
         if inward:
             a, b, c, d = d, c, b, a
-        L.append("f %d %d %d\n" % (a, b, c))
-        L.append("f %d %d %d\n" % (a, c, d))
+        if outward_normals:
+            n = k + 1
+            L.append("f %d//%d %d//%d %d//%d\n" % (a, n, b, n, c, n))
+            L.append("f %d//%d %d//%d %d//%d\n" % (a, n, c, n, d, n))
+        else:
+            L.append("f %d %d %d\n" % (a, b, c))
+            L.append("f %d %d %d\n" % (a, c, d))
     io.open(path, "w", encoding="utf-8", newline="\n").writelines(L)
 
 
@@ -145,6 +161,17 @@ def main():
                         "-o", os.path.join(OUT, "bad.png")], capture_output=True, text=True, check=False)
     msg = r.stdout + r.stderr
     check("bad value", r.returncode != 0 and "emit_orient" in msg, msg.strip().splitlines()[-1][:80] if msg.strip() else "no message")
+
+    # A cube wound inward whose vertex normals point OUT already emits outward (a mesh light
+    # emits on its normals' side): auto must leave it alone, so the interior stays dark.
+    cube_in_n = os.path.join(OUT, "cube_in_normals.obj")
+    write_cube(cube_in_n, inward=True, outward_normals=True)
+    p_auto_n = scene(os.path.join(OUT, "auto_normals.ftsl"), mesh % (cube_in_n.replace("\\", "/"), ""))
+    pf_auto_n, log_auto_n = render(p_auto_n, "auto_normals")
+    m_auto_n = probe_mean(pf_auto_n)
+    check("normals out", m_auto_n < 0.02 * m_keep and "emit_orient keep" not in log_auto_n,
+          "inward winding, outward normals: probe %.4g vs keep's %.4g, %s" %
+          (m_auto_n, m_keep, "left alone" if "emit_orient keep" not in log_auto_n else "REVERSED"))
 
     print("\n-> emit_orient rig %s" % ("PASSED" if ok else "FAILED"))
     if not args.keep and ok:

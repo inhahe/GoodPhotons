@@ -430,8 +430,12 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
         // none of them use is the wrong trade until there is a "does any bound pattern
         // actually read curv?" gate. Written EXPLICITLY rather than left alone because
         // `hit` is a REUSED record: skipping the store would leak the previously-tested
-        // primitive's curvature into this hit. Logged in known-issues.md.
+        // primitive's curvature into this hit. Logged in known-issues.md. The same goes for
+        // every other field a primitive owns: no tangent frame, strand or vertex colours here,
+        // and the pattern hair's scale is the point's own distance (Hit::pscale = 0).
         hit.curv = 0.0;
+        hit.tangent = Vec3{1, 0, 0}; hit.bitangentSign = 1.0;
+        hit.fiberRadius = 0.0; hit.hasVcol = false; hit.pscale = 0.0;
         return true;
     };
 

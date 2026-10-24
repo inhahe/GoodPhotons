@@ -957,7 +957,7 @@ struct DMedium {
 // uv0/uvE1/uvE2 mirror the same-named host fields so a sampled point can report the
 // SAME (u,v) the ray-hit path interpolates — only read when an emission pattern is
 // bound, but uploaded unconditionally (they are part of the host EmitTri).
-struct DEmitTri { DVec3 v0, e1, e2, nrm; double cumArea; DVec3 uv0, uvE1, uvE2; };
+struct DEmitTri { DVec3 v0, e1, e2, nrm; double cumArea; DVec3 uv0, uvE1, uvE2; double reach; };
 
 // One emitter (mirrors host Emitter). `cdfOffset`/`cdfN` index this emitter's
 // wavelength CDF slice inside the flattened lightCdfAll buffer.
@@ -993,7 +993,6 @@ struct DEmitter {
     // -1 = uniform. Deliberately absent from `power` — the pattern modulates the
     // radiance at a point, not the emitter's selection weight, exactly as on the host.
     int    emitPat;
-    double reach;              // Emitter::reach: the scale of a sampled point's pattern hair
     // Fast RGB backward (mode R -rgb): the emitter's linear-sRGB radiance, baked as
     // xyzToLinearSrgb(integral over lambda of CIE(lambda)*emitSpd(lambda)) — the exact
     // wavelength-integrated radiance the spectral estimator converges to (the
@@ -1067,11 +1066,14 @@ __device__ static inline bool dInSunCone(const DEmitter& em, const DVec3& d) {
 // barycentric UV, the same interpolation the ray-hit path uses) — and left at 0
 // elsewhere, since sphere / tube / spot / env emitters reject `emit pattern:` at load.
 // Passing null (the default) keeps every existing caller's arithmetic untouched.
+// `reachOut`: the reach of the patch the point lies on (host twin Emitter::samplePoint says why).
 __device__ static void emitterSamplePoint(const DEmitter& em, double u1, double u2,
                                           DVec3& y, DVec3& nOut,
-                                          double* uuOut = nullptr, double* vvOut = nullptr) {
+                                          double* uuOut = nullptr, double* vvOut = nullptr,
+                                          double* reachOut = nullptr) {
     if (uuOut) *uuOut = 0.0;
     if (vvOut) *vvOut = 0.0;
+    if (reachOut) *reachOut = 0.0;
     if (em.shape == 1) {
         double z = 1.0 - 2.0 * u1;
         double r = sqrt(fmax(0.0, 1.0 - z * z));
@@ -1079,11 +1081,13 @@ __device__ static void emitterSamplePoint(const DEmitter& em, double u1, double 
         DVec3 d{(Real)(r * cos(phi)), (Real)(r * sin(phi)), (Real)z};
         nOut = d;
         y = em.origin + d * (Real)em.radius;
+        if (reachOut) *reachOut = sqrt((double)dot(em.origin, em.origin)) + fabs(em.radius);
     } else if (em.shape == 4) {
         // Cylinder (tube) lateral surface: u1 along the axis (v), u2 around it. u and
         // normal are the precomputed radial basis (mirrors host Emitter::samplePoint).
         double phi = 2.0 * 3.14159265358979323846 * u2;
         DVec3 rad = em.u * (Real)cos(phi) + em.normal * (Real)sin(phi);
+        if (reachOut) *reachOut = sqrt((double)dot(em.origin, em.origin)) + (double)length(em.v) + fabs(em.radius);
         if (em.caps) {
             // Closed capsule: pick lateral wall or one end disc proportional to area,
             // then reuse u1 (remapped) within the region (mirrors host samplePoint).
@@ -1132,6 +1136,7 @@ __device__ static void emitterSamplePoint(const DEmitter& em, double u1, double 
         double b2 = u2 * su;
         y = t.v0 + t.e1 * (Real)b1 + t.e2 * (Real)b2;
         nOut = t.nrm;
+        if (reachOut) *reachOut = t.reach;
         // Same barycentric weights the ray-hit path uses, so a bound emission pattern
         // reads identically from either side of the transport.
         if (uuOut) *uuOut = t.uv0.x + t.uvE1.x * (Real)b1 + t.uvE2.x * (Real)b2;
@@ -1141,6 +1146,11 @@ __device__ static void emitterSamplePoint(const DEmitter& em, double u1, double 
         nOut = em.normal;
         if (uuOut) *uuOut = u1;
         if (vvOut) *vvOut = u2;
+        if (reachOut) {                    // the half it lies in, split as addQuad splits a quad
+            auto d2 = [](const DVec3& q) { return (double)dot(q, q); };
+            const DVec3 a = em.origin, b = em.origin + em.u, c = em.origin + em.u + em.v, e = em.origin + em.v;
+            *reachOut = sqrt(u2 <= u1 ? fmax(d2(a), fmax(d2(b), d2(c))) : fmax(d2(a), fmax(d2(c), d2(e))));
+        }
     }
 }
 
@@ -3434,7 +3444,9 @@ struct DHit {
     // trade — so it stores what it cheaply has (an int and two Reals, no worse than the
     // three floats the host writes) and dDiffuseRho, which DOES hold the scene, does the
     // lookup. Same answer, paid for only where it is used.
-    int  vcol; Real vb0, vb1;
+    // Defaulted to "no colour": every intersector writes it, but a hit nobody filled must never
+    // index the colour table with whatever the stack held.
+    int  vcol = -1; Real vb0, vb1;
     // O3 stage 2 cavity, filled LAZILY by dCavityOf() and cached, exactly like the
     // host's Hit::cavity: it needs whole-scene traversal so no intersector fills it,
     // and one shading point asks for it several times (mix weight, roughness, reflect).
@@ -3862,6 +3874,9 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             hit.u = (Real)uu; hit.v = (Real)vv;
         } else { hit.u = 0; hit.v = 0; }
         hit.curv = (Real)0;   // O3: isosurface curvature needs the Hessian — see implicit.h
+        // `hit` is a reused record: every field a primitive owns is written (host twin says so).
+        hit.tangent = DVec3{(Real)1, (Real)0, (Real)0}; hit.bitangentSign = (Real)1;
+        hit.fiberRadius = (Real)0; hit.vcol = -1; hit.vb0 = hit.vb1 = (Real)0; hit.pscale = (Real)0;
         return true;
     };
 
@@ -4053,6 +4068,7 @@ __device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const 
     // O3: curvature follows the shaded side, exactly as the host intersectTri does.
     hit.curv = (Real)(flipped ? -tri.curvature : tri.curvature);
     hit.vcol = tri.vcol; hit.vb0 = b0; hit.vb1 = b1;
+    hit.fiberRadius = (Real)0;                 // `hit` is a reused record: not a strand
     return true;
 }
 __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const DSphere& s,
@@ -4102,6 +4118,7 @@ __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const D
     Real tgl = sqrt(dot(tg, tg));
     hit.tangent = (tgl > (Real)1e-9) ? tg * ((Real)1 / tgl) : DVec3{(Real)1, (Real)0, (Real)0};
     hit.bitangentSign = (Real)1;
+    hit.fiberRadius = (Real)0; hit.vcol = -1; hit.vb0 = hit.vb1 = (Real)0;   // reused record
     return true;
 }
 // ---- curve / fiber segments (device twin of curve.h) ----------------------
@@ -4261,6 +4278,7 @@ __device__ static bool intersectCurveSeg(const DCurveRay& cr, const DVec3& ro, c
     const Real hSign = (dot(rd, ng) < (Real)0) ? (Real)1 : (Real)-1;
     hit.curv = (rLoc > (Real)1e-12) ? hSign * (Real)0.5 / rLoc : (Real)0;
     hit.fiberRadius = rLoc;   // hair BCSDF exit offset (dHairExitOffset)
+    hit.vcol = -1; hit.vb0 = hit.vb1 = (Real)0;   // reused record: no vertex colours here
     return true;
 }
 
@@ -9838,12 +9856,12 @@ __device__ static double dEmitHitScale(const DScene& sc, int emitPat, int li, co
 // Read a hair off the surface on the side it emits into, as a hit there reads it (along h.ng).
 __device__ static double dEmitterPatMulAt(const DScene& sc, const DEmitter& em,
                                           const DVec3& y, const DVec3& nOut,
-                                          double uu, double vv) {
+                                          double uu, double vv, double reach) {
     if (em.emitPat < 0 || em.emitPat >= sc.nPatterns) return 1.0;
     const DPattern& p = sc.patterns[em.emitPat];
     double px, py, pz;
     patNudgedPoint((double)y.x, (double)y.y, (double)y.z, (double)nOut.x, (double)nOut.y, (double)nOut.z,
-                   em.reach, px, py, pz);
+                   reach, px, py, pz);
     double r = sqrt(px * px + py * py + pz * pz);
     return clamp01(dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
                                 nOut.x, nOut.y, nOut.z, r, uu, vv, 0.0, 0.0, 0.0, dPatEnvOf(sc)));
@@ -9858,9 +9876,9 @@ __device__ static double dEmitterSamplePointPat(const DScene& sc, const DEmitter
                                                 double u1, double u2,
                                                 DVec3& y, DVec3& nOut) {
     if (em.emitPat < 0) { emitterSamplePoint(em, u1, u2, y, nOut); return 1.0; }
-    double uu = 0.0, vv = 0.0;
-    emitterSamplePoint(em, u1, u2, y, nOut, &uu, &vv);
-    return dEmitterPatMulAt(sc, em, y, nOut, uu, vv);
+    double uu = 0.0, vv = 0.0, reach = 0.0;
+    emitterSamplePoint(em, u1, u2, y, nOut, &uu, &vv, &reach);
+    return dEmitterPatMulAt(sc, em, y, nOut, uu, vv, reach);
 }
 
 // Sample a Stokes-shifted emission wavelength lambda' ~ M for a fluorescent
@@ -21112,7 +21130,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.curvature = t.curvature;      // O3 per-face mean curvature (from Tri::finalize)
         d.matId = t.matId; d.sensorId = t.sensorId;
         d.vcol  = t.vcol;               // per-vertex colour (Scene::vertColors), or -1
-        d.reach = (Real)std::sqrt(std::max(dot(t.v0, t.v0), std::max(dot(t.v1, t.v1), dot(t.v2, t.v2))));
+        d.reach = (Real)t.reach;
         return d;
     };
     // Instancing now uses a true TWO-LEVEL BVH on the device (matching the CPU): base
@@ -21623,6 +21641,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
                 dtris[i].e2  = {(Real)s.e2.x,  (Real)s.e2.y,  (Real)s.e2.z};
                 dtris[i].nrm = {(Real)s.nrm.x, (Real)s.nrm.y, (Real)s.nrm.z};
                 dtris[i].cumArea = s.cumArea;
+                dtris[i].reach = s.reach;
                 // Source-triangle UVs, so a sampled point reports the same (u,v) the
                 // ray-hit path interpolates (an emission pattern reads both sides).
                 dtris[i].uv0  = {(Real)s.uv0.x,  (Real)s.uv0.y,  (Real)s.uv0.z};
@@ -21650,7 +21669,6 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         de.cdfStep = e.spd.step;
         de.matId = e.matId;                 // BDPT: link to emissive surface material
         de.emitPat = e.emitPat;             // `emit pattern:` profile over this emitter
-        de.reach = e.reach;
         bakeSpec(e.spdFn, de.emitSpd, up);       // BDPT: baked emission SPD for Le(lambda)
         { Vec3 le = rgbbake::emitToRgb(e.spdFn); de.rgbEmit = {le.x, le.y, le.z}; }  // fast RGB backward
         de.cieMean = {e.cieMean.x, e.cieMean.y, e.cieMean.z};   // achromatic-path beam fold

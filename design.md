@@ -7305,17 +7305,24 @@ as the one at fault.
     pattern sees, `nx`/`ny`/`nz`/`curv`, still face the ray: known-issues
     PATTERN-NORMAL-SIDE.) Sites: host `patCtxFromHit` (every host pattern read at a hit),
     `emitterPatMulAt` (a point the emitter sampler drew, along nOut -- the side a one-sided
-    emitter's ng faces, so a hit there reads the same point, as MIS needs; a mesh light's
-    `EmitTri::nrm` is turned to its vertex normals' side as intersectTri turns ng, so the
-    two also agree on which side emits) and the rasterizer (PTri::patN, baked per triangle
-    with tanRaw); device `dPatPoint` at every site that builds a pattern point from a
-    `DHit`, `dEmitterPatMulAt`, and raster_cuda's `dRasterPatPoint` (once per pixel, from the
-    source triangle's baked frame).
+    emitter's ng faces -- with the hair sized by the patch it was drawn on, which
+    `Emitter::samplePoint` reports: an `EmitTri`'s own reach, the half of a quad its point
+    falls in as `addQuad` splits it, a sphere's |c| + |r|; so a hit there reads the same
+    point, as MIS needs. A mesh light's `EmitTri::nrm` is turned to its vertex normals'
+    side as intersectTri turns ng, so the two also agree on which side emits, and
+    `emit_orient auto` judges a shell inward or outward by those same oriented normals) and
+    the rasterizer's `ctx()`; device `dPatPoint` at every site that builds a pattern point
+    from a `DHit`, `dEmitterPatMulAt`, and raster_cuda's `dRasterPatPoint`. The previews
+    compute the face normal (turned to the vertex normals' sum) and reach per pixel, once,
+    from the source triangle: baking them per triangle cost 32 B a triangle on the host
+    (gigabytes on a fur preview) and went stale where the N-D viewer moves vertices on the
+    device.
   * **The nudge's size**: `kPatNudge` = 2e-6 (some 17 float ulps) of a scale -- the reach of
     the primitive the point lies on (`Hit::pscale`/`DHit::pscale`: a triangle's farthest
     vertex from the origin, a sphere's |c| + |r|, a curve segment's farther end plus its
-    radius; through an instance, bounded by MeshInstance::reachMul/reachAdd; an emitter's
-    `Emitter::reach`; a preview triangle's `PTri::patScale`), or the point's own distance
+    radius; through an instance, a bound, MeshInstance::reachMul (the linear part's Frobenius
+    norm, at most sqrt 3 over the exact) times the local reach plus the translation's length;
+    an emitter sample's patch's; a preview pixel's source triangle's), or the point's own distance
     where that is larger or unknown (isosurfaces: their rounding is the point's once
     recentred, and a container can be far larger than the surface) -- and at least
     `kPatNudge * kPatNudgeFloor`. It must outrun the hit point's rounding and the float noise
@@ -7329,7 +7336,8 @@ as the one at fault.
     that is relative to the surface's own coordinates, so every intersector takes its hit
     from those: a triangle's from its vertices, `v0 + b1 (v1 - v0) + b2 (v2 - v0)`
     (`intersectTri`, host and device, 0.399.5), whose float rounding on the GPU scales with
-    the vertices too (the triangle's reach is baked into `DTri::reach` at upload); an
+    the vertices too (`Tri::reach`, baked by `Tri::finalize` and copied to `DTri::reach` at
+    upload, so a hit copies it); an
     instance's world point is its local one through toWorld (`instanceHitToWorld`; on the
     device in double, once per ray, after the traversal has found the closest hit; the
     normals through toLocal's transpose, the inverse the instance holds); `MeshXform::
@@ -7364,6 +7372,16 @@ as the one at fault.
     ring -- so it went in 0.399.8. Two load-time probes that warned of a pattern splitting a
     surface (0.399.3's, then `warnPatternsSplitBySteps` in 0.399.6) went when the nudge made
     what they looked for impossible.
+  * **A hit record is reused across candidates.** The closest-hit loops (host and device) hand
+    one Hit/DHit to every primitive they test; each intersector that accepts writes every field
+    a hit on its primitive owns -- `pscale`, the tangent frame, `fiberRadius`, the vertex
+    colour (`hasVcol` / `vcol`), `curv` -- since a field left alone keeps a farther candidate's:
+    an isosurface's pattern hair sized by a sky dome's reach, a sphere tinted by a mesh's vertex
+    colours, a triangle treated as a strand by the hair exit offset. `DHit::vcol` also defaults
+    to -1, so an unwritten one never indexes the colour table. `-checkpatops` hands each host
+    intersector a record full of another primitive's values. A negative `radius` on a sphere,
+    a sphere light or a tube light is taken as its magnitude at load, with a warning
+    (`radiusOf`): the intersectors only see r^2, the samplers, bounds and curvature its sign.
   * `addFunctionLeaf` now passes the tables too, so a `grid:`-sampling field formula is
     optimized as well. It stays a separate call site because the program is about to be
     appended to a *shared* node pool holding one leaf after another, and the pass requires

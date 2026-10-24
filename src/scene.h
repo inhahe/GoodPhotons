@@ -976,6 +976,7 @@ inline double spotFalloff(double ct, double cosInner, double cosOuter) {
 struct EmitTri {
     Vec3 v0, e1, e2, nrm;
     double cumArea = 0.0;
+    double reach = 0.0;   // triReach of its corners: a sampled point's pattern hair, as a hit's
     // The source triangle's texture coordinates, so a sampled point can report the SAME
     // (u,v) the ray-hit path interpolates (geometry.h: uv = b0*uv0 + b1*uv1 + b2*uv2).
     // Only read when an emission pattern is bound; stored as uv0 + the two uv edges to
@@ -1090,10 +1091,6 @@ struct Emitter {
     // copied from the emissive material's `emitPat` at registration; -1 = uniform.
     // Deliberately absent from `power` above — see Material::emitPat for why.
     int emitPat = -1;
-    // The farthest point of this emitter's surface from the origin (finalizeEmitters): the
-    // scale of the hair a sampled point's emission pattern is read at, as Hit::pscale is a
-    // hit's (emitterPatMulAt). 0 for the shapes with no surface.
-    double reach = 0.0;
 
     // Per-emitter spectral/geometric weight fed into the combined backward
     // wavelength sampler and the power law: area*PI for surfaces, spotOmega for a
@@ -1170,20 +1167,26 @@ struct Emitter {
     // interpolation geometry.h does at a hit) — and left at 0 elsewhere, since sphere /
     // tube / spot / env emitters reject `emit pattern:` at load. Passing null (the
     // default) keeps every existing caller's arithmetic untouched.
+    // `reachOut`, when given, receives the reach of the patch the point lies on -- the scale a
+    // hit there sizes its pattern hair by (Hit::pscale), so a sampled point reads an emission
+    // pattern where a hit on it does.
     void samplePoint(double u1, double u2, Vec3& y, Vec3& nOut,
-                     double* uuOut = nullptr, double* vvOut = nullptr) const {
+                     double* uuOut = nullptr, double* vvOut = nullptr, double* reachOut = nullptr) const {
         if (uuOut) *uuOut = 0.0;
         if (vvOut) *vvOut = 0.0;
+        if (reachOut) *reachOut = 0.0;
         if (shape == EmitterShape::Sphere) {
             const Vec3 d = uniformSphere(u1, u2);
             nOut = d;                                  // unit outward normal
             y = origin + d * radius;
+            if (reachOut) *reachOut = std::sqrt(dot(origin, origin)) + std::fabs(radius);
         } else if (shape == EmitterShape::Cylinder) {
             // Uniform over the lateral surface: u1 slides along the axis (v), u2 picks
             // the angle around it. u/normal are the precomputed radial basis, so the
             // outward radial direction is rad = u*cos + normal*sin (a unit vector).
             double phi = 2.0 * PI * u2;
             Vec3 rad = u * std::cos(phi) + normal * std::sin(phi);
+            if (reachOut) *reachOut = std::sqrt(dot(origin, origin)) + length(v) + std::fabs(radius);
             if (caps) {
                 // Closed capsule: pick lateral wall or one of the two end discs with
                 // probability proportional to area, then reuse u1 (remapped to [0,1))
@@ -1236,6 +1239,7 @@ struct Emitter {
             double b2 = u2 * su;
             y = t.v0 + t.e1 * b1 + t.e2 * b2;
             nOut = t.nrm;
+            if (reachOut) *reachOut = t.reach;
             // Same barycentric weights the ray-hit path uses, so a bound emission
             // pattern reads identically from either side of the transport.
             if (uuOut) *uuOut = t.uv0.x + t.uvE1.x * b1 + t.uvE2.x * b2;
@@ -1245,6 +1249,10 @@ struct Emitter {
             nOut = normal;
             if (uuOut) *uuOut = u1;
             if (vvOut) *vvOut = u2;
+            // The half the point lies in, split as a quad's geometry is (addQuad):
+            // (o, o+u, o+u+v) where u2 <= u1, else (o, o+u+v, o+v).
+            if (reachOut) *reachOut = (u2 <= u1) ? triReach(origin, origin + u, origin + u + v)
+                                                 : triReach(origin, origin + u + v, origin + v);
         }
     }
 
@@ -2368,7 +2376,8 @@ struct Scene {
             // ng: one-sided emission is judged against it here (NEE, emission from a sample)
             // and against h.ng on a hit, so the two must agree on which side emits -- for a
             // mesh wound against its normals, the winding alone does not.
-            et.nrm = nc * ((dot(nc, t.n0 + t.n1 + t.n2) < 0.0 ? -1.0 : 1.0) / (2.0 * a));
+            et.nrm = faceNormalToward(t.v0, t.v1, t.v2, t.n0 + t.n1 + t.n2);
+            et.reach = triReach(t.v0, t.v1, t.v2);
             et.cumArea = total;
             // Carry the source triangle's UVs as uv0 + edges, so a sampled point can
             // report the same (u,v) the ray-hit path interpolates — required for an
@@ -2501,24 +2510,6 @@ struct Scene {
         // radiance, so no selection or positional pdf anywhere has to change.
         for (auto& e : emitters)
             e.emitPat = (e.matId >= 0 && e.matId < (int)mats.size()) ? mats[e.matId].emitPat : -1;
-        // Each surface's reach (Emitter::reach): its farthest point from the origin.
-        for (auto& e : emitters) {
-            double r = 0.0;
-            auto at = [&r](const Vec3& q) { r = std::max(r, std::sqrt(dot(q, q))); };
-            switch (e.shape) {
-                case EmitterShape::Quad:
-                    at(e.origin); at(e.origin + e.u); at(e.origin + e.v); at(e.origin + e.u + e.v); break;
-                case EmitterShape::Sphere:
-                    r = std::sqrt(dot(e.origin, e.origin)) + std::fabs(e.radius); break;
-                case EmitterShape::Cylinder:
-                    r = std::sqrt(dot(e.origin, e.origin)) + length(e.v) + std::fabs(e.radius); break;
-                case EmitterShape::Mesh:
-                    for (const EmitTri& t : e.meshTris) { at(t.v0); at(t.v0 + t.e1); at(t.v0 + t.e2); }
-                    break;
-                default: break;
-            }
-            e.reach = r;
-        }
         // Recount the distant suns here (not in addSunLight) so the flag survives every
         // path that rebuilds the emitter list, including applyIgnoreFlags' filtering.
         sunCount = 0;
@@ -4234,10 +4225,10 @@ inline double emitSlot(const Scene& scene, const Material& m, const Hit& h, doub
 // into (nOut), which is the side its geometric normal faces -- one-sided emission is tested
 // against it -- so a hit there (patCtxFromHit) reads the same point: MIS adds the two.
 inline double emitterPatMulAt(const Scene& scene, const Emitter& em,
-                              const Vec3& y, const Vec3& nOut, double uu, double vv) {
+                              const Vec3& y, const Vec3& nOut, double uu, double vv, double reach) {
     if (em.emitPat < 0 || em.emitPat >= (int)scene.patterns.size()) return 1.0;
     Vec3 q;
-    patNudgedPoint(y.x, y.y, y.z, nOut.x, nOut.y, nOut.z, em.reach, q.x, q.y, q.z);
+    patNudgedPoint(y.x, y.y, y.z, nOut.x, nOut.y, nOut.z, reach, q.x, q.y, q.z);
     PatCtx c = makePatCtx(q, 0.0, nOut, uu, vv);
     bindPatScene(c, scene);
     double p = scene.patterns[em.emitPat].eval(c);
@@ -4252,8 +4243,9 @@ inline double emitterSamplePoint(const Scene& scene, const Emitter& em,
                                  double u1, double u2, Vec3& y, Vec3& nOut) {
     if (em.emitPat < 0) { em.samplePoint(u1, u2, y, nOut); return 1.0; }
     double uu = 0.0, vv = 0.0;
-    em.samplePoint(u1, u2, y, nOut, &uu, &vv);
-    return emitterPatMulAt(scene, em, y, nOut, uu, vv);
+    double reach = 0.0;
+    em.samplePoint(u1, u2, y, nOut, &uu, &vv, &reach);
+    return emitterPatMulAt(scene, em, y, nOut, uu, vv, reach);
 }
 
 // Evaluate a bound scalar pattern at the hit (index checked). Returns the pattern

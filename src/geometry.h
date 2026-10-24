@@ -42,6 +42,20 @@ inline bool clipRayBox(const Vec3& lo, const Vec3& hi, const Vec3& o, const Vec3
     return tb > ta;
 }
 
+// The distance from the origin of a triangle's farthest vertex: its Hit::pscale.
+inline double triReach(const Vec3& a, const Vec3& b, const Vec3& c) {
+    return std::sqrt(std::max(dot(a, a), std::max(dot(b, b), dot(c, c))));
+}
+
+// A triangle's unit face normal turned to the side of nsum, the sum of its vertex normals --
+// the side intersectTri turns a hit's ng to (it turns it to the interpolated normal's, which is
+// the same side wherever the vertex normals agree); 0 for a degenerate face.
+inline Vec3 faceNormalToward(const Vec3& a, const Vec3& b, const Vec3& c, const Vec3& nsum) {
+    const Vec3 fc = cross(b - a, c - a);
+    const double l = std::sqrt(dot(fc, fc));
+    return (l > 0.0) ? fc * ((dot(fc, nsum) < 0.0 ? -1.0 : 1.0) / l) : Vec3{0, 0, 0};
+}
+
 struct Tri {
     Vec3 v0, v1, v2;
     int matId = 0;
@@ -95,8 +109,11 @@ struct Tri {
     // pre-fitted coefficients would be: it is the colour that varies linearly across a
     // face, not the sigmoid coefficients that reproduce it.
     int vcol = -1;
+    // triReach of the vertices, baked here for the hit to copy (Hit::pscale).
+    double reach = 0.0;
     void finalize() {
         gn = normalize(cross(v1 - v0, v2 - v0));
+        reach = triReach(v0, v1, v2);
         if (dot(n0, n0) < 1e-12) n0 = gn;
         if (dot(n1, n1) < 1e-12) n1 = gn;
         if (dot(n2, n2) < 1e-12) n2 = gn;
@@ -173,12 +190,14 @@ struct Hit {
     // interpolated radius in hand, so it costs one store.
     double fiberRadius = 0.0;
     // The reach of the primitive the hit lies on: the distance from the origin of its
-    // farthest point (a triangle's farthest vertex, a sphere's |c| + r, an isosurface's
-    // farthest container corner), or 0 where unknown. A pattern reads a hit a hair off the
-    // surface (pattern.h patNudgedPoint), sized by this: the hit point's rounding and the
-    // float noise of an exported mesh's vertices scale with the coordinates the point was
-    // computed from, not with the point's own distance, which can be far smaller on a big
-    // triangle; and over one primitive the reach is constant, so the hair is too.
+    // farthest point (a triangle's farthest vertex, Tri::reach; a sphere's |c| + |r|; a curve
+    // segment's farther end plus its radius; through an instance, a bound), or 0 where the
+    // point's own distance serves (an isosurface, whose rounding is the point's). A pattern
+    // reads a hit a hair off the surface (pattern.h patNudgedPoint), sized by this: the hit
+    // point's rounding and the float noise of an exported mesh's vertices scale with the
+    // coordinates the point was computed from, not with the point's own distance, which can
+    // be far smaller on a big triangle; and over one primitive the reach is constant, so the
+    // hair is too. Every intersector writes it (the record is reused across candidates).
     double pscale = 0.0;
     // Barycentric-interpolated per-vertex colour at the hit (linear RGB), when the
     // triangle carried one. Resolved by the intersector, which is the only place that
@@ -392,12 +411,13 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     // also scales with the vertices rather than with the ray's travel. (Not
     // b0 v0 + b1 v1 + b2 v2: the b's need not sum to exactly 1, which breaks the exactness.)
     hit.t = t; hit.p = tri.v0 + (tri.v1 - tri.v0) * b1 + (tri.v2 - tri.v0) * b2; hit.valid = true;
-    hit.pscale = std::sqrt(std::max(dot(tri.v0, tri.v0), std::max(dot(tri.v1, tri.v1), dot(tri.v2, tri.v2))));
+    hit.pscale = tri.reach;
     hit.matId = tri.matId; hit.sensorId = tri.sensorId;
     // Barycentric-interpolated UV and shading normal (matches the old M-T convention:
     // b0,b1,b2 == w0,u,v).
     hit.u = b0 * tri.uv0.x + b1 * tri.uv1.x + b2 * tri.uv2.x;
     hit.v = b0 * tri.uv0.y + b1 * tri.uv1.y + b2 * tri.uv2.y;
+    hit.fiberRadius = 0.0;                 // `hit` is a reused record: not a strand
     hit.hasVcol = (tri.vcol >= 0);
     if (hit.hasVcol && vertColorTable) {
         const float* c = vertColorTable + (size_t)tri.vcol * 3;
@@ -489,6 +509,7 @@ inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit
     double tl = std::sqrt(dot(T, T));
     hit.tangent = (tl > 1e-9) ? T * (1.0 / tl) : Vec3{1, 0, 0};
     hit.bitangentSign = 1.0;
+    hit.fiberRadius = 0.0; hit.hasVcol = false;   // `hit` is a reused record: not a strand, no colours
     return true;
 }
 

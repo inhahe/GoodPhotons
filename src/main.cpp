@@ -3344,7 +3344,7 @@ static bool checkPatternNudge() {
             Hit h;
             h.p = p; h.ng = nOut; h.n = nOut; h.matId = -1;      // a one-sided emitter's ng faces its light
             ++emN;
-            if (emitterPatMulAt(se, em, p, nOut, 0.0, 0.0) != slotPatMul(se, 0, h)) ++emBad;
+            if (emitterPatMulAt(se, em, p, nOut, 0.0, 0.0, 0.0) != slotPatMul(se, 0, h)) ++emBad;
         }
     }
     int farBad = 0, farN = 0;
@@ -3377,6 +3377,49 @@ static bool checkPatternNudge() {
         if (!intersectSphere(Ray{Vec3(0.1, 3, 0.2), Vec3(0, -1, 0)}, neg, 1e-9, h) ||
             length(h.p - Vec3(0.1, 3.0 - h.t, 0.2)) > 1e-9)
             negBad = 1;
+        // ... and the loader keeps its magnitude, for the emitter samplers and bounds too.
+        ftsl::Loaded L;
+        std::string e;
+        const bool loaded = ftsl::loadSource(
+            "scene { units meters }\n"
+            "material \"m\" { type diffuse reflect 0.5 }\n"
+            "sphere { center 0 0 0  radius -0.5  material m }\n"
+            "light sphere { center 0 2 0  radius -0.1  spd preset:bb6500 }\n"
+            "camera \"c\" { eye 0 2 3  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n",
+            "<checkpatops>", L, e);
+        bool lightOk = false;
+        for (const Emitter& em : L.scene.emitters)
+            if (em.shape == EmitterShape::Sphere) lightOk = em.radius == 0.1;
+        bool sphereOk = false;
+        for (const Sphere& s : L.scene.spheres) sphereOk = sphereOk || s.r == 0.5;
+        if (!loaded || !lightOk || !sphereOk) negBad = 1;
+    }
+    // A mesh light's sampled point reads an emission pattern where a hit there does, though the
+    // light's other triangle reaches a hundred times farther: the hair is the patch's own.
+    int patchBad = 0, patchN = 0;
+    {
+        std::vector<PatNode> above;
+        compilePatternExpr("step(0, y)", above, err);
+        Scene sl;
+        sl.patterns.push_back(Pattern{above});
+        Tri triNear{Vec3(0, -1e-6, 0), Vec3(0, -1e-6, 0.2), Vec3(0.2, -1e-6, 0), -1, -1, {}};   // faces up
+        Tri triFar{Vec3(20, -1e-6, 0), Vec3(20, -1e-6, 0.2), Vec3(20.2, -1e-6, 0), -1, -1, {}};
+        triNear.finalize(); triFar.finalize();
+        sl.tris = {triNear, triFar};
+        sl.addMeshLight(0, 2, constantSpectrum(1.0), 1.0, -1);
+        if (sl.emitters.size() != 1) patchBad = 1;
+        else {
+            Emitter& em = sl.emitters[0];
+            em.emitPat = 0;
+            for (int k = 0; k < 16; ++k) {                      // u1 < 0.5 draws the near triangle
+                Vec3 y, nOut;
+                const double pm = emitterSamplePoint(sl, em, 0.03 * (k + 0.5), (k % 4 + 0.5) / 4.0, y, nOut);
+                Hit h;
+                if (!intersectTri(Ray{y + Vec3(0, 1, 0), Vec3(0, -1, 0)}, sl.tris[0], 1e-9, h)) { ++patchBad; continue; }
+                ++patchN;
+                if (pm != slotPatMul(sl, 0, h)) ++patchBad;
+            }
+        }
     }
     int sideBad = 0;
     {
@@ -3393,12 +3436,72 @@ static bool checkPatternNudge() {
     }
     std::printf("[checkpatops] pattern nudge: %d of %d hits within rounding of a step read the inside, "
                 "%d of %d on checker walls, %d of %d on a big noisy floor, %d of %d emitter samples disagree "
-                "with a hit there, %d of %d sphere hits from 100 km, negative-radius sphere hit %s, mesh "
-                "light's side %s; %s\n",
-                bad, n, chkBad, chkN, bigBad, bigN, emBad, emN, farBad, farN, negBad ? "misplaced" : "in place",
-                sideBad ? "differs" : "agrees",
-                bad || chkBad || bigBad || emBad || farBad || negBad || sideBad ? "FAIL" : "ok");
-    return bad == 0 && chkBad == 0 && bigBad == 0 && emBad == 0 && farBad == 0 && negBad == 0 && sideBad == 0;
+                "with a hit there, %d of %d on a mesh light's near patch, %d of %d sphere hits from 100 km, "
+                "negative-radius sphere hit %s, mesh light's side %s; %s\n",
+                bad, n, chkBad, chkN, bigBad, bigN, emBad, emN, patchBad, patchN, farBad, farN,
+                negBad ? "misplaced" : "in place", sideBad ? "differs" : "agrees",
+                bad || chkBad || bigBad || emBad || patchBad || farBad || negBad || sideBad ? "FAIL" : "ok");
+    return bad == 0 && chkBad == 0 && bigBad == 0 && emBad == 0 && patchBad == 0 && farBad == 0 && negBad == 0 &&
+           sideBad == 0;
+}
+
+// Every intersector writes every field a hit on its primitive owns. The closest-hit loops reuse
+// one record across candidates, so a field an intersector leaves alone keeps a farther
+// candidate's value: a pattern hair sized by a sky dome's reach, a sphere tinted by a mesh's
+// vertex colours, a triangle treated as a strand. Each intersector here is handed a record
+// full of another primitive's values. (Host only; the device intersectors mirror these.)
+static bool checkHitFieldsWritten() {
+    auto junk = []() {
+        Hit h;
+        h.t = 1e30; h.pscale = 777.0; h.fiberRadius = 0.5; h.hasVcol = true;
+        h.tangent = Vec3(0, 0, 9); h.bitangentSign = -1.0; h.curv = 99.0;
+        return h;
+    };
+    int bad = 0;
+    auto expect = [&](const char* what, bool good) {
+        if (good) return;
+        ++bad;
+        std::printf("[checkpatops] reused hit record: %s leaves a field from another primitive FAIL\n", what);
+    };
+    const Ray down{Vec3(0.1, 3, 0.2), Vec3(0, -1, 0)};
+    {
+        Hit h = junk();
+        const Sphere s{Vec3(0, 0, 0), 0.5, 0};
+        expect("a sphere", intersectSphere(down, s, 1e-9, h) && h.pscale == 0.5 && h.fiberRadius == 0.0 &&
+                           !h.hasVcol);
+    }
+    {
+        Hit h = junk();
+        Tri t{Vec3(-1, 0, -1), Vec3(-1, 0, 1), Vec3(1, 0, 1), 0, -1, {}};
+        t.finalize();
+        expect("a triangle", intersectTri(down, t, 1e-9, h) && h.pscale == t.reach && h.fiberRadius == 0.0 &&
+                             !h.hasVcol);
+    }
+    {
+        Hit h = junk();
+        CurveSeg cs;
+        cs.p0 = Vec3(-1, 0, 0); cs.p1 = Vec3(1, 0, 0); cs.r0 = cs.r1 = 0.5;
+        expect("a curve", intersectCurveSeg(makeCurveRay(down.d), down, cs, 1e-9, h) && h.pscale == 1.5 &&
+                          !h.hasVcol);
+    }
+    {
+        ftsl::Loaded L;
+        std::string e;
+        const bool loaded = ftsl::loadSource(
+            "scene { units meters }\n"
+            "material \"m\" { type diffuse reflect 0.5 }\n"
+            "isosurface { material m  sphere { center 0 0 0  radius 0.5 } }\n"
+            "light area { origin -0.5 2.5 -0.5  u 1 0 0  v 0 0 1  normal 0 -1 0  spd preset:bb6500 }\n"
+            "camera \"c\" { eye 0 2 3  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n",
+            "<checkpatops>", L, e);
+        Hit h = junk();
+        expect("an isosurface", loaded && L.scene.implicits.size() == 1 &&
+                                intersectImplicit(down, L.scene.implicits[0], 1e-9, h) && h.pscale == 0.0 &&
+                                h.fiberRadius == 0.0 && !h.hasVcol && h.tangent.z == 0.0 && h.bitangentSign == 1.0);
+    }
+    std::printf("[checkpatops] reused hit record: every intersector writes every field it owns %s\n",
+                bad ? "FAIL" : "ok");
+    return bad == 0;
 }
 
 // -checkpatops: every pattern opcode, through all THREE implementations of the VM.
@@ -3421,7 +3524,7 @@ static bool checkPatternNudge() {
 // dimensionality). Those are counted as SKIPPED rather than quietly passing -- a check that
 // says "all clear" about opcodes it never exercised would be worse than no check.
 static int checkPatOps() {
-    const bool nudgeOk = checkPatternNudge();
+    const bool nudgeOk = checkPatternNudge() & checkHitFieldsWritten();
     struct Prog { PatOp op; int off, len; };
     std::vector<PatNode> pool;
     std::vector<Prog>    progs;
@@ -23816,13 +23919,13 @@ static int run(int argc, char** argv) {
         // otherwise be re-allocated and re-zeroed per frame, which used to cost more than
         // the rasterization itself.
         raster::RasterScratch rasterScratch;
-        bool gpuFrameFailSaid = false;   // a failed GPU frame is said once, not per frame
+        bool isoFrameFailSaid = false, rasterFrameFailSaid = false;   // each fallback said once, not per frame
         auto rasterOne = [&](const Camera& cam, int W, int H, double ev, bool autoExp,
                              double* lock) -> std::vector<uint8_t> {
 #ifdef HAVE_CUDA
-            auto sayGpuFrameFailed = [&](const char* fallback) {
-                if (gpuFrameFailSaid) return;
-                gpuFrameFailSaid = true;
+            auto sayGpuFrameFailed = [&](bool& said, const char* fallback) {
+                if (said) return;
+                said = true;
                 std::fprintf(stderr, "[raster] a GPU frame failed; %s\n", fallback);
             };
             // G2: cast primary rays straight at the implicit on the GPU (no tessellation).
@@ -23833,14 +23936,14 @@ static int run(int argc, char** argv) {
                     renderIsoPreviewCuda(scene, cam, W, H, nThreads, ev, autoExp, lock,
                                          nullptr, &plight, rasterShowHidden);
                 if (!img.empty()) return img;
-                sayGpuFrameFailed(gpuRaster ? "tessellating it instead" : "rendering on the CPU");
+                sayGpuFrameFailed(isoFrameFailSaid, gpuRaster ? "tessellating it instead" : "rendering on the CPU");
             }
             if (gpuRaster) {
                 std::vector<uint8_t> img =
                     raster_cuda::renderFrame(gpuRaster, cam, W, H, nThreads, ev, autoExp, lock,
                                              rasterSeeThrough, rasterClarity, rasterHaze);
                 if (!img.empty()) return img;
-                sayGpuFrameFailed("rendering on the CPU");
+                sayGpuFrameFailed(rasterFrameFailSaid, "rendering on the CPU");
             }
 #endif
             ensurePrims();   // lazy fallback (also the sole path when the GPU is unavailable)

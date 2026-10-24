@@ -376,6 +376,16 @@ inline double dblOf(const Block& b, const char* key, double dflt) {
     const Stmt* s = find(b, key);
     return (s && !s->val.words.empty()) ? num(s->val.words[0]) : dflt;
 }
+// A sphere's or tube's `radius`: its magnitude, with a warning if written negative. The
+// intersectors only ever see r^2, so a negative radius used to trace as its magnitude while the
+// emitter samplers, bounds and curvature took its sign -- one value for all of them.
+inline double radiusOf(const Block& b, const char* what, double dflt) {
+    const double r = dblOf(b, "radius", dflt);
+    if (r < 0.0)
+        std::fprintf(stderr, "[ftsl] warning: %s %s: radius %g is negative -- using %g\n", what,
+                     b.name.empty() ? "(unnamed)" : ("'" + b.name + "'").c_str(), r, -r);
+    return std::fabs(r);
+}
 
 // Named film / sensor formats -> physical (width, height) in millimetres, landscape
 // orientation. Lets a camera say `film { format full-frame }` instead of `size 36 24`,
@@ -5239,7 +5249,7 @@ private:
     }
     bool addSphere(const Block& b, Loaded& L, const Affine& xf = Affine::identity()) {
         Vec3 c{0, 0, 0}; vec3Of(b, "center", c);
-        double r = dblOf(b, "radius", 1.0);
+        double r = radiusOf(b, "sphere", 1.0);
         int id = matFieldId(b, L, "sphere"); if (id < 0) return false;
         // A sphere stays an analytic sphere only under translate + rotation + UNIFORM
         // scale. A non-uniform scale (or a shear) would make it an ellipsoid / sheared
@@ -6140,12 +6150,17 @@ private:
                     cen = cen + tr.v0 + tr.v1 + tr.v2;
                 }
                 cen = cen / (3.0 * (double)n);
+                // The volume the faces enclose as they EMIT: each face turned to its vertex
+                // normals' side, as a mesh light's emission is (Scene::addMeshLight) -- by the
+                // winding alone, a shell wound inward with outward normals reads as inward.
                 double vol = 0.0, area2 = 0.0;
                 for (size_t t = triStart; t < triEnd; ++t) {
                     const Tri& tr = L.scene.tris[t];
                     Vec3 a = tr.v0 - cen, bb = tr.v1 - cen, cc = tr.v2 - cen;
-                    vol += dot(a, cross(bb, cc));
-                    area2 += length(cross(tr.v1 - tr.v0, tr.v2 - tr.v0));
+                    const Vec3 fc = cross(tr.v1 - tr.v0, tr.v2 - tr.v0);
+                    const Vec3 fn = faceNormalToward(tr.v0, tr.v1, tr.v2, tr.n0 + tr.n1 + tr.n2);
+                    vol += dot(a, cross(bb, cc)) * (dot(fc, fn) < 0.0 ? -1.0 : 1.0);
+                    area2 += length(fc);
                 }
                 vol /= 6.0;
                 double area = 0.5 * area2;
@@ -7057,7 +7072,7 @@ private:
             // the photon-catch camera modes (mirrors the area-light quad below).
             if (nonUniform) { fail("sphere light under non-uniform scale would be an ellipsoid; use uniform scale"); return false; }
             Vec3 c{0.5, 0.7, 0.5}; vec3Of(b, "center", c);
-            double rad = Len(dblOf(b, "radius", 0.1)) * s;
+            double rad = Len(radiusOf(b, "sphere light", 0.1)) * s;
             Vec3 cw = P(xf.apply(c));
             spd = absPower(b, spd, (4.0 * PI * rad * rad) * PI, L);
             Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
@@ -7082,7 +7097,7 @@ private:
             Vec3 c{0.5, 0.5, 0.5}; vec3Of(b, "center", c);
             Vec3 dir{0, 1, 0}; vec3Of(b, "axis", dir);
             double len = Len(dblOf(b, "length", 0.5)) * s;
-            double rad = Len(dblOf(b, "radius", 0.05)) * s;
+            double rad = Len(radiusOf(b, "cylinder light", 0.05)) * s;
             int segs = (int)dblOf(b, "segments", 48.0);
             if (segs < 3) segs = 3;
             std::string capsStr = strOf(b, "caps", "off");
