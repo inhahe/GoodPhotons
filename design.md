@@ -6503,18 +6503,23 @@ as the one at fault.
     falls outside until one whole batch of each finds nothing (a bin that never comes clean
     keeps the front sampler; the aimed batches are what find a region's sparse extremes where
     under 1% of uniform rays get through, as for the fisheye's front element, 0.398.0); the bin aims only if the aimed hit rate beats the uniform one by
-    10%. Unlit bins with no lit neighbour reject (`classify` -> -2) before any trace. Rotational
-    symmetry: a bin is built at azimuth 0 and rotated to the point's. `lensEntry` aims where the
-    table says (`omega = cos_P * A_ellipse / |P - p|^2`, the solid angle per sample;
-    `lensEntryImage` weights `omega / A_cell`), else keeps the uniform sampler bit for bit.
-    **The defensive share (0.399.0, `kLensDefensive` = 2%).** A traced region cannot be proven
-    to hold every crossing, nor a rejecting bin proven dark, so every bin that aims or rejects
-    draws that share of its samples with the unaimed sampler (`u1` split and stretched back),
-    and every sample carries the mixture's density, `(1 - a) p_region + a / A_front` on the
-    front element (`lensEntryDensity`; 0 for the region where its crossing lies outside, or
-    the bin rejects). A miss is then drawn, at 1/a times the weight, instead of lost: the
-    estimators are unbiased whatever the tables hold, and `-checklens` bounds misses for the
-    noise they cost (1e-5 of the light). `lensAimRatio` is the same density's inverse ratio
+    10%. Unlit bins with no lit neighbour reject (`classify` -> -2), tracing only their share
+    (below). Rotational symmetry: a bin is built at azimuth 0 and rotated to the point's.
+    `lensEntry` aims where the table says, else keeps the uniform sampler; every entry carries
+    `omega = cosY / (|Y - p|^2 p_A)`, the solid angle per sample from its sampler's area density
+    p_A on the element (aimed alone, `cos_P * A_region / |P - p|^2`), and `lensEntryImage`
+    weights `omega / A_cell`.
+    **The defensive share (0.399.0).** A traced region cannot be proven to hold every crossing,
+    nor a rejecting bin proven dark, so every bin that aims (`kLensDefensive`, 2%) or rejects
+    (`kLensDefensiveReject`, 1/512: far surer, and most of a narrow field's bins, where a trace
+    instead of a lookup would hold up whole GPU warps) draws that share of its samples with the
+    unaimed sampler (`lensMixPick`, `LENS_HD` so the device twins share it: `u1` split and
+    stretched back), and every sample carries the mixture's density, `(1 - a) p_region + a /
+    A_front` on the front element (`lensEntryDensity`; p_region 0 where the crossing lies
+    outside the region, or the bin rejects). A miss is then drawn, at 1/a times the weight,
+    instead of lost: the estimators are unbiased whatever the tables hold, `-checklens` (9b)
+    shows it on shrunk tables and a lit bin turned to rejecting, and (4)/(7) bound misses for
+    the noise they cost (1e-5 of the light). `lensAimRatio` is the same density's inverse ratio
     (at most 1/a, where it was capped at 1e12).
     The light image's pick of the camera vertex now depends on the vertex it is picked from,
     so BDPT's lens camera densities carry `lensAimRatio(Y, x) = (1/A_front) / p_entry(Y | x)`:

@@ -564,13 +564,36 @@ struct LensPupilTable {
 
 // The defensive share. A region found by tracing cannot be proven to hold every crossing
 // that reaches the film -- a crescent's tip is reached by almost no ray -- nor a rejecting
-// bin proven dark. So in every bin that aims or rejects, this share of the samples is drawn
-// the unaimed way (the front element for light, the rear element for camera rays), and every
+// bin proven dark. So in every bin that aims or rejects, a share of the samples is drawn the
+// unaimed way (the front element for light, the rear element for camera rays), and every
 // sample's density is the mixture's: light a region misses is still drawn, rarely and so
 // noisily, instead of lost, and the estimators stay unbiased whatever the tables hold.
-// It costs this share of an aimed bin's samples, nearly all of which the unaimed samplers
-// waste where aiming pays; a rejecting bin traces this share of its samples instead of none.
+// An aiming bin's share costs that share of its samples, nearly all of which the unaimed
+// samplers waste where aiming pays. A rejecting bin is far surer -- no light got through it
+// nor any neighbour, over thousands of traced rays -- and is most of the bins a narrow field
+// leaves (a telephoto's), where a trace instead of a lookup holds up a whole GPU warp: it
+// takes a much smaller share, 1/512, for the same guarantee at a few per cent of its cost.
 inline constexpr double kLensDefensive = 0.02;
+inline constexpr double kLensDefensiveReject = 1.0 / 512.0;
+
+#if defined(__CUDACC__) || defined(__HIPCC__)
+  #define LENS_HD __host__ __device__ inline
+#else
+  #define LENS_HD inline
+#endif
+// The mixture's pick for a sample in a table bin, from its first coordinate u1: LENS_PICK_UNAIMED
+// (the unaimed sampler draws it), LENS_PICK_AIMED, or LENS_PICK_NONE (a rejecting bin's sample
+// beyond its share: none drawn). `v1` is u1 stretched back over [0, 1) for the sampler picked.
+// `share` the bin's (lensShare). Shared by the camera's samplers and their device twins.
+enum { LENS_PICK_NONE = 0, LENS_PICK_UNAIMED = 1, LENS_PICK_AIMED = 2 };
+LENS_HD double lensShare(bool rejecting) { return rejecting ? kLensDefensiveReject : kLensDefensive; }
+LENS_HD int lensMixPick(double u1, bool rejecting, double& v1) {
+    const double a = lensShare(rejecting);
+    if (u1 < a) { v1 = u1 / a; return LENS_PICK_UNAIMED; }
+    if (rejecting) return LENS_PICK_NONE;
+    v1 = (u1 - a) / (1.0 - a);
+    return LENS_PICK_AIMED;
+}
 
 struct LensPupil {
     // FRONT keeps the unaimed sampler (uniform on the front element for light, on the rear

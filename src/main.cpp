@@ -2617,9 +2617,13 @@ static int checkContainer(long long rays) {
 //       image by the second);
 //   (6) the aimed and the front sampler estimate the same solid angle reaching the sensor,
 //       on and off axis, near and far; their hit rates say what the aiming buys;
-//   (7)-(9) the exit table's twins of (4)-(6) for camera rays, and (10)-(11) that the tables
-//       are handed to every raster they fit and to no other lens.
-static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
+//   (7)-(9) the exit table's twins of (4)-(6) for camera rays;
+//   (9b) tables that miss (every region shrunk, and a lit bin turned to rejecting) still give
+//       the unaimed samplers' answers: the defensive share (kLensDefensive) draws what they miss;
+//   (10)-(11) the tables are handed to every raster they fit and to no other lens.
+// How many (9b) comparisons the lenses made between them, per side.
+struct LensShareTally { int light = 0, camera = 0; };
+static bool checkLensPhysicalOne(const char* preset, LensSystem L, LensShareTally& tally) {
     L.focusAt(2.4);
     Camera cam;
     cam.lookAt({0, 0, 0}, {0, 0, 1}, {0, 1, 0}, 40.0, 64, 43);
@@ -2723,8 +2727,8 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
     // (4) coverage. Scene points up to 89 deg off axis (well past any field but a fisheye's),
     // 5 cm to 5 km out (log-uniform), one front-sampler ray each, at a wavelength across the
     // band. A region found by tracing cannot be proven to hold every crossing: a crescent's tip
-    // is reached by almost no ray. A miss is drawn only by the defensive share
-    // (kLensDefensive), at 1/kLensDefensive times the weight -- unbiased, but noisy -- so the
+    // is reached by almost no ray. A miss is drawn only by the defensive share (lens.h
+    // kLensDefensive), at 1/share times the weight -- unbiased, but noisy -- so the
     // bound is on the share of the light that pays that (1e-5) and on how far out a miss lies
     // (5% of its region); a fault in the tables themselves -- a wrong frame, plane or bin --
     // misses far more, and far further.
@@ -2778,8 +2782,10 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
         const double range = 0.05 * std::pow(1e5, rng.uniform());
         const Vec3 X = cam.eye + (cam.w * std::cos(th) + (cam.u * std::cos(ph) + cam.v * std::sin(ph)) *
                                   std::sin(th)) * range;
+        double cphi, sphi;
+        if (P->classify(cam.lensLocalPoint(X), cphi, sphi) == -1) continue;   // table bins only
         Camera::LensEntry e;
-        if (!cam.lensEntry(X, rng.uniform(), rng.uniform(), e) || !e.aimed) continue;
+        if (!cam.lensEntry(X, rng.uniform(), rng.uniform(), e)) continue;
         ++nAimed;
         const double dXY = length(cam.lensLocalPoint(e.Y) - cam.lensLocalPoint(X));
         const double qDrawn = CL.frontArea() * e.cosY / (e.omega * dXY * dXY);
@@ -2788,7 +2794,7 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
         worst = std::max(worst, rel);
         if (!(rel < 1e-6)) ++mismatched;
     }
-    std::printf("[checklens] %s: %lld aimed entries, %lld whose recomputed density disagrees "
+    std::printf("[checklens] %s: %lld entries from table bins, %lld whose recomputed density disagrees "
                 "(worst relative error %.1e)\n", preset, nAimed, mismatched, worst);
     pass = pass && mismatched == 0;
     // (6) aimed against front, per point: solid angle reaching the sensor and hit rate.
@@ -2911,13 +2917,16 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
                     preset, px, py, m[0], se[0], m[1], se[1], z9, 100.0 * hit[0] / n, 100.0 * hit[1] / n);
         pass = pass && (hit[0] + hit[1] == 0 || z9 < 4.0);
     }
-    // (9b) What the defensive share (kLensDefensive) is for: a table that misses. The same
-    // tables with every aiming region shrunk to 85% of its half-widths leave a ring of real
-    // crossings outside them, which only the share draws, at 1/kLensDefensive times the weight.
-    // The light image's solid angle at (6)'s first two points, and the importance at (9)'s
-    // first two film points, must still match the unaimed samplers -- noisier, the ring's light
-    // coming from one sample in 1/kLensDefensive. Without the share they come out short by the
-    // ring's light, many sigma.
+    // (9b) What the defensive share (lens.h kLensDefensive) is for: a table that misses. The
+    // same tables with every aiming region shrunk to 85% of its half-widths leave a ring of real
+    // crossings outside them, which only the share draws, at 1/share times the weight. The light
+    // image's solid angle from two scene points, and the importance at two film points, must
+    // still match the unaimed samplers -- noisier, the ring's light coming from the share alone.
+    // Without the share they come out short by the ring's light, many sigma. The points are
+    // picked where the tables aim (a bin that keeps the unaimed sampler would make the
+    // comparison empty), and the first of each is run again with its bin turned to rejecting,
+    // which only the much smaller rejecting share draws. `tally` counts the comparisons, which
+    // checkLensPhysical requires of the lenses together.
     {
         auto shrunk = std::make_shared<LensPupil>(*P);
         for (LensPupilTable* T : {&shrunk->entry, &shrunk->exit})
@@ -2925,50 +2934,88 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L) {
                 if (C.kind == LensPupil::AIM || C.kind == LensPupil::AIMBOX) { C.a *= 0.85; C.b *= 0.85; }
         Camera camS = cam;
         camS.lensPupil = shrunk;
-        auto report = [&](const char* what, const double* s, const double* s2, int n) {
-            double m[2], se[2];
-            for (int i = 0; i < 2; ++i) {
-                m[i] = s[i] / n;
-                se[i] = std::sqrt(std::max(0.0, s2[i] / n - m[i] * m[i]) / n);
-            }
-            const double z = std::fabs(m[0] - m[1]) / std::max(std::sqrt(se[0] * se[0] + se[1] * se[1]), 1e-300);
-            std::printf("[checklens] %s: tables shrunk to 85%%, %s: %.4e +- %.1e against unaimed %.4e +- %.1e "
-                        "(%.1f sigma)\n", preset, what, m[0], se[0], m[1], se[1], z);
-            pass = pass && (m[1] == 0.0 || z < 4.0);
+        // Mean and standard error of n samples of `draw` (which adds a sample's value, or nothing).
+        struct Est { double m, se; };
+        auto estimate = [&](int n, auto&& draw) {
+            double s1 = 0.0, s2 = 0.0;
+            for (int k = 0; k < n; ++k) { double v; if (draw(v)) { s1 += v; s2 += v * v; } }
+            const double m = s1 / n;
+            return Est{m, std::sqrt(std::max(0.0, s2 / n - m * m) / n)};
         };
-        const int n = 1600000;
-        for (const auto& pt : {std::array<double, 3>{2.0, 0.0, 0.0}, std::array<double, 3>{2.0, 0.15, -0.1}}) {
+        auto agree = [&](const char* what, const Est& a, const Est& b) {
+            const double z = std::fabs(a.m - b.m) / std::max(std::sqrt(a.se * a.se + b.se * b.se), 1e-300);
+            std::printf("[checklens] %s: tables shrunk to 85%%, %s: %.4e +- %.1e against unaimed %.4e +- %.1e "
+                        "(%.1f sigma)\n", preset, what, a.m, a.se, b.m, b.se, z);
+            pass = pass && b.m > 0.0 && z < 4.0;
+        };
+        const int n = 1600000, nRej = 16000000;           // a rejecting bin returns at once for all but 1/512
+        // The light side.
+        int lightDone = 0;
+        for (const auto& pt : {std::array<double, 3>{2.0, 0.0, 0.0}, std::array<double, 3>{2.0, 0.15, -0.1},
+                               std::array<double, 3>{8.0, 0.3, 0.2}, std::array<double, 3>{5000.0, 0.15, -0.1}}) {
+            if (lightDone == 2) break;
             const Vec3 X = cam.w * pt[0] + cam.u * (pt[1] * kf * pt[0]) + cam.v * (pt[2] * kf * pt[0]);
-            double s[2] = {0, 0}, s2[2] = {0, 0};
-            for (int which = 0; which < 2; ++which) {
-                const Camera& cc = which ? camF : camS;
-                for (int k = 0; k < n; ++k) {
+            double cphi, sphi;
+            const int c = P->classify(cam.lensLocalPoint(X), cphi, sphi);
+            if (c < 0) continue;
+            auto connect = [&](const Camera& cc) {
+                return [&cc, &X, &rng, lambda, aCell](double& v) {
                     Vec3 Y, wd; double dist, wgt; int px, py;
-                    if (!cc.lensConnect(X, lambda, rng.uniform(), rng.uniform(), Y, wd, dist, px, py, wgt)) continue;
-                    const double v = wgt * aCell;
-                    s[which] += v; s2[which] += v * v;
-                }
-            }
-            char what[64];
+                    if (!cc.lensConnect(X, lambda, rng.uniform(), rng.uniform(), Y, wd, dist, px, py, wgt)) return false;
+                    v = wgt * aCell;
+                    return true;
+                };
+            };
+            const Est ref = estimate(n, connect(camF));
+            char what[96];
             std::snprintf(what, sizeof what, "solid angle from (%.2f, %.2f) at %g m", pt[1], pt[2], pt[0]);
-            report(what, s, s2, n);
+            agree(what, estimate(n, connect(camS)), ref);
+            if (lightDone++ == 0) {
+                auto rej = std::make_shared<LensPupil>(*shrunk);
+                rej->entry.cells[(size_t)c].kind = LensPupil::NONE;
+                Camera camR = cam;
+                camR.lensPupil = rej;
+                std::snprintf(what, sizeof what, "the same, its bin rejecting");
+                agree(what, estimate(nRej, connect(camR)), ref);
+            }
+            ++tally.light;
         }
-        for (const auto& fp : {std::array<double, 2>{0.5, 0.5}, std::array<double, 2>{0.75, 0.6}}) {
+        // The camera side, at film points of the 64x43 raster (genLensRay's pixel centre).
+        int cameraDone = 0;
+        for (const auto& fp : {std::array<double, 2>{0.5, 0.5}, std::array<double, 2>{0.75, 0.6},
+                               std::array<double, 2>{0.9, 0.85}, std::array<double, 2>{0.3, 0.2}}) {
+            if (cameraDone == 2) break;
             const int px = (int)(fp[0] * 64), py = (int)(fp[1] * 43);
-            double s[2] = {0, 0}, s2[2] = {0, 0};
-            for (int which = 0; which < 2; ++which) {
-                const Camera& cc = which ? camF : camS;
-                for (int k = 0; k < n; ++k) {
+            const Vec3 f = filmPoint((px + 0.5) / 64.0, (py + 0.5) / 43.0);
+            double cphi, sphi;
+            const int ce = P->classifyFilm(f, cphi, sphi);
+            if (ce < 0) continue;
+            auto ray = [&](const Camera& cc) {
+                return [&cc, &rng, px, py, lambda](double& v) {
                     Ray r; double wgt;
                     if (!cc.genLensRay(px, py, 0.5, 0.5, rng.uniform(), rng.uniform(), lambda, r, wgt) ||
-                        !(wgt > 0.0)) continue;
-                    s[which] += wgt; s2[which] += wgt * wgt;
-                }
-            }
-            char what[64];
+                        !(wgt > 0.0)) return false;
+                    v = wgt;
+                    return true;
+                };
+            };
+            const Est ref = estimate(n, ray(camF));
+            char what[96];
             std::snprintf(what, sizeof what, "importance at film pixel (%d, %d)", px, py);
-            report(what, s, s2, n);
+            agree(what, estimate(n, ray(camS)), ref);
+            if (cameraDone++ == 0) {
+                auto rej = std::make_shared<LensPupil>(*shrunk);
+                rej->exit.cells[(size_t)ce].kind = LensPupil::NONE;
+                Camera camR = cam;
+                camR.lensPupil = rej;
+                std::snprintf(what, sizeof what, "the same, its bin rejecting");
+                agree(what, estimate(nRej, ray(camR)), ref);
+            }
+            ++tally.camera;
         }
+        if (lightDone == 0 || cameraDone == 0)
+            std::printf("[checklens] %s: (9b) found no %s bin that aims among its test points\n", preset,
+                        lightDone == 0 && cameraDone == 0 ? "entrance or exit" : lightDone == 0 ? "entrance" : "exit");
     }
     // (10) the tables are handed out for any raster: Camera::pupil compares the tables' squared
     // film radius with the raster's own, and one squared back from its square root comes out an
@@ -3082,14 +3129,19 @@ static bool checkLensPhysical() {
         std::printf("[checklens] missing a preset\n");
         return false;
     }
-    const bool pa = checkLensPhysicalOne("achromat", a);
-    const bool ps = checkLensPhysicalOne("singlet", s);
-    const bool pd = checkLensPhysicalOne("dgauss f/8", d);
-    const bool pt = checkLensPhysicalOne("telephoto", t);
-    const bool pw = checkLensPhysicalOne("wide", w);
-    const bool pf = checkLensPhysicalOne("fisheye", f);
+    LensShareTally tally;
+    const bool pa = checkLensPhysicalOne("achromat", a, tally);
+    const bool ps = checkLensPhysicalOne("singlet", s, tally);
+    const bool pd = checkLensPhysicalOne("dgauss f/8", d, tally);
+    const bool pt = checkLensPhysicalOne("telephoto", t, tally);
+    const bool pw = checkLensPhysicalOne("wide", w, tally);
+    const bool pf = checkLensPhysicalOne("fisheye", f, tally);
+    // (9b) has to have tested the share on both sides somewhere, or it proved nothing.
+    std::printf("[checklens] the defensive share was tested at %d scene points and %d film points\n",
+                tally.light, tally.camera);
+    const bool pt9 = tally.light > 0 && tally.camera > 0;
     const bool pp = checkLensPresetsFNumber();
-    return pa && ps && pd && pt && pw && pf && pp;
+    return pa && ps && pd && pt && pw && pf && pt9 && pp;
 }
 
 // Deterministic thin-lens (mode C) self-test. Forward catch is far too photon-

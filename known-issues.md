@@ -80,12 +80,14 @@ rejecting bin proven dark. Light through a miss was simply never drawn: a bias, 
 measured (the fisheye's exit table missed 2 of 572,172 rays, 0.65% past their region, after
 0.398.0's edge-band verification) but unbounded in principle, which 0.398.0's coverage bound
 in `-checklens` could only measure, not remove (the review of 5d25e4f..447a96f called it).
-Every bin that aims or rejects now draws `kLensDefensive` (2%) of its samples with the
-unaimed sampler, and every sample carries the mixture's density -- camera side and light
-side, CPU and GPU, in the importance, the light image's omega, lensPdfDir and
-lensAimRatio -- so a miss is drawn at 50x the weight instead of lost. `-checklens` (9b)
-shrinks every region to 85% and holds the light image and the importance to the unaimed
-samplers (it fails with the share switched off).
+Every bin that aims now draws `kLensDefensive` (2%) of its samples with the unaimed sampler,
+and every bin that rejects `kLensDefensiveReject` (1/512, 0.399.1: a rejecting bin is far
+surer, and drawing 2% there made nearly half the GPU warps of a narrow-field forward render
+trace the glass), and every sample carries the mixture's density -- camera side and light
+side, CPU and GPU, in the importance, the light image's omega, lensPdfDir and lensAimRatio --
+so a miss is drawn at 1/share times the weight instead of lost. `-checklens` (9b) shrinks
+every region to 85%, and turns a lit bin to rejecting, and holds the light image and the
+importance to the unaimed samplers (it fails with the share switched off).
 
 ## DONE (2026-10-24, 0.398.1): CHECKER-ON-BOUNDARY — on the GPU a checker on a surface lying on a cell boundary (a floor at y = 0) rendered as flat grey
 

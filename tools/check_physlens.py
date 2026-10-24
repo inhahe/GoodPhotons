@@ -270,9 +270,13 @@ def check_fog(exe, scenes, devices):
         # (known-issues.md J-FOG-REALCAM) -- and aimed and unaimed CPU J differ by ~1.7%, the same
         # every run; the GPU's agree to 0.5%. It is not the lens code: J's one lens-specific term
         # (BeamMergeWeight::lensCam) moves CPU J by under 0.07% when removed, and the terms J
-        # shares with D are D's, which matches R on the CPU in this fog. Hence 1% on the GPU, 3%
-        # on the CPU until the CPU J's own bias is fixed.
-        jtol = TOL if dev == 'gpu' else 0.03
+        # shares with D are D's, which matches R on the CPU in this fog. Hence 3% on the CPU until
+        # the CPU J's own bias is fixed. On the GPU the bound is 1.5%: at these
+        # 1024 spp a region of J's swings by up to 0.9% from build to build (the floor read
+        # 0.9911, 1.0067, 0.9946 in three), and a 1.09% blue region at 0.399.1 came back 0.50% at
+        # 4x the samples -- noise, which 1% caught one run in a few. 4x the samples would cost
+        # half an hour a run.
+        jtol = 0.015 if dev == 'gpu' else 0.03
         jargs = ['-mode', 'J', '-spp', '1024', '-device', dev] + deep
         front = render(exe, scenes['fog'], f'fog_Jfront_{dev}', jargs, env={'FTRACE_LENS_FRONT': '1'})
         img = render(exe, scenes['fog'], f'fog_J_{dev}', jargs)

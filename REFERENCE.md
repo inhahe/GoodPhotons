@@ -2015,7 +2015,8 @@ binned by how far off axis and how far away the scene point is. The forward mode
 each vertex's ray through that region instead of anywhere on the front element, so a lens
 whose front element is much wider than the beam its stop admits (a fast wide-angle, or any
 lens stopped down) wastes no samples on glass the beam never crosses, and a vertex outside the
-field of view costs a table lookup instead of a trace through the glass. Where aiming would
+field of view costs a table lookup instead of a trace through the glass (all but one time in
+512: see below). Where aiming would
 not pay (the stop already fills the front element, as in the presets near the axis) a bin
 keeps the uniform front-element sampling. Camera rays are aimed the same way from the other
 side: mode `R`, and the camera half of `D` and `J`, used to pick where each ray leaves the
@@ -2024,9 +2025,9 @@ film anywhere on the rear element, of which a stopped-down beam uses a few per c
 where on the exit pupil's plane the rays that get out of the lens cross, and camera rays are
 drawn there (pbrt's exit-pupil bounds, built the same way as the light's table). Same image,
 less noise: the tables only move samples to where light gets through. A table found by
-tracing cannot be proven complete, so 2% of the samples where a table aims (or rejects) still
-use the whole element (since 0.399.0): a ray the table missed is drawn rarely, as noise, not
-lost, and no table can darken a render. `-checklens` checks how nearly the tables hold every
+tracing cannot be proven complete, so 2% of the samples where a table aims, and one in 512
+where it rejects, still use the whole element (since 0.399.0): a ray the table missed is
+drawn rarely, as noise, not lost, and no table can darken a render. `-checklens` checks how nearly the tables hold every
 ray that gets through, and `FTRACE_LENS_FRONT=1` turns all aiming off (every
 lens camera samples its whole front and rear elements) for comparing a render with and
 without it. It maps the sensor across the film width, so a

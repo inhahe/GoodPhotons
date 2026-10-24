@@ -324,18 +324,16 @@ struct Camera {
         const LensPupil* P = pupil();
         const int ce = P ? P->classifyFilm(pFilm, cphi, sphi) : -1;
         if (ce >= 0 || ce == -2) {
-            // The pupil table's mixture (lens.h kLensDefensive): u1 picks the sampler and is
-            // stretched back over [0, 1) for it. Aimed at the exit pupil, a crossing uniform in
-            // the bin's region of its plane; else, as the defensive share (all a rejecting bin
-            // draws), a point on the rear element. The importance is cosT over the mixture's
-            // density per film solid angle (lensFilmDensity) -- aimed alone, cosT^2 A_region / r^2,
-            // the planar rear's cos^4 A / Z^2 with the region for the disk.
-            const double a = kLensDefensive;
-            const bool rear = u1 < a;
-            if (ce == -2 && !rear) return false;
-            const double v1 = rear ? u1 / a : (u1 - a) / (1.0 - a);
+            // The pupil table's mixture (lens.h lensMixPick): aimed at the exit pupil, a crossing
+            // uniform in the bin's region of its plane; else, as the defensive share (all a
+            // rejecting bin draws), a point on the rear element. The importance is cosT over the
+            // mixture's density per film solid angle (lensFilmDensity) -- aimed alone,
+            // cosT^2 A_region / r^2, the planar rear's cos^4 A / Z^2 with the region for the disk.
+            double v1;
+            const int pick = lensMixPick(u1, ce == -2, v1);
+            if (pick == LENS_PICK_NONE) return false;
             Vec3 d0;
-            if (rear) {
+            if (pick == LENS_PICK_UNAIMED) {
                 double w;
                 if (!L.rearDir(pFilm, v1, u2, d0, w)) return false;
             } else {
@@ -346,7 +344,11 @@ struct Camera {
             }
             if (!(d0.z > 0.0)) return false;
             if (!L.trace(pFilm, d0, lambda, /*sensorToScene=*/true, outLocal)) return false;
-            weight = d0.z / lensFilmDensity(*P, ce, cphi, sphi, pFilm, d0, /*knownInside=*/!rear);
+            // 0 only for a share sample the rear's own density cannot see (grazing its cap):
+            // measure zero, dropped rather than weighted infinite.
+            const double dens = lensFilmDensity(*P, ce, cphi, sphi, pFilm, d0, pick == LENS_PICK_AIMED);
+            if (!(dens > 0.0)) return false;
+            weight = d0.z / dens;
         } else {
             // Unaimed: a point uniform on the rear element (LensSystem::rearDir) -- its clear cap
             // when curved, since a disc in the plane would miss the rays crossing the cap outside
@@ -437,28 +439,24 @@ struct Camera {
         double dist;     // |Y - p| (world)
         Vec3 o, d;       // the leg in lens-local mm: start (just in front of the glass), unit direction
         double cosY;     // cosine between the leg and the element's normal at Y
-        bool aimed;      // drawn from a table bin's mixture (else the front sampler alone)
-        double omega;    // aimed only: the solid angle (sr) one sample of the mixture stands for
+        double omega;    // the solid angle (sr) one sample stands for: the inverse of its sampler's
+                         // density from p -- the mixture's in a table bin
     };
     bool lensEntry(const Vec3& p, double u1, double u2, LensEntry& e) const {
         const LensSystem& L = *lens;
-        e.aimed = false;
         const Vec3 pl = lensLocalPoint(p);
+        Vec3 yl, nY, o, dl;
         if (const LensPupil* P = pupil()) {
             double cphi = 1.0, sphi = 0.0;
             const int c = P->classify(pl, cphi, sphi);
             if (c >= 0 || c == -2) {
-                // The pupil table's mixture (lens.h kLensDefensive): u1 picks the sampler and is
-                // stretched back over [0, 1) for it -- aimed through a crossing uniform in the
-                // bin's region, else, as the defensive share (all a rejecting bin draws), the
-                // front sampler. `omega` is the solid angle per sample of the mixture's density
-                // (lensEntryDensity), whichever drew it.
-                const double a = kLensDefensive;
-                const bool front = u1 < a;
-                if (c == -2 && !front) return false;
-                const double v1 = front ? u1 / a : (u1 - a) / (1.0 - a);
-                Vec3 yl, nY, o, dl;
-                if (front) {
+                // The pupil table's mixture (lens.h lensMixPick): aimed through a crossing uniform
+                // in the bin's region, else, as the defensive share (all a rejecting bin draws),
+                // the front sampler; omega from the mixture's density, whichever drew it.
+                double v1;
+                const int pick = lensMixPick(u1, c == -2, v1);
+                if (pick == LENS_PICK_NONE) return false;
+                if (pick == LENS_PICK_UNAIMED) {
                     if (!L.frontLeg(pl, v1, u2, yl, nY, o, dl)) return false;
                 } else {
                     const Vec3 X = P->entry.sample(c, cphi, sphi, v1, u2);
@@ -466,21 +464,18 @@ struct Camera {
                     o = X - dl * ((P->zStart - P->entry.z) / -dl.z);
                     if (!L.hitSurface(0, o, dl, yl, nY)) return false;
                 }
-                if (!lensEntryFill(p, yl, nY, o, dl, e)) return false;
-                const double dXY = length(yl - pl);
-                e.aimed = true;
-                e.omega = e.cosY / (dXY * dXY * lensEntryDensity(*P, c, cphi, sphi, pl, yl, /*knownInside=*/!front));
-                return std::isfinite(e.omega) && e.omega > 0.0;
+                return lensEntryFill(p, pl, yl, nY, o, dl,
+                                     lensEntryDensity(*P, c, cphi, sphi, pl, yl, pick == LENS_PICK_AIMED), e);
             }
         }
-        Vec3 yl, nY, o, dl;
         if (!L.frontLeg(pl, u1, u2, yl, nY, o, dl)) return false;
-        return lensEntryFill(p, yl, nY, o, dl, e);
+        return lensEntryFill(p, pl, yl, nY, o, dl, 1.0 / L.frontArea(), e);
     }
-    // An entry's fields from its point yl on the element (lens-local, normal nY) and its leg
-    // (o, dl) from scene point p. False if p is on the element.
-    bool lensEntryFill(const Vec3& p, const Vec3& yl, const Vec3& nY, const Vec3& o, const Vec3& dl,
-                       LensEntry& e) const {
+    // An entry's fields from scene point p (pl lens-local), its point yl on the element (normal
+    // nY), its leg (o, dl), and `density`, the area density (per mm^2 of the element) its sampler
+    // picked yl with. False if p is on the element or the leg grazes it (no solid angle).
+    bool lensEntryFill(const Vec3& p, const Vec3& pl, const Vec3& yl, const Vec3& nY, const Vec3& o,
+                       const Vec3& dl, double density, LensEntry& e) const {
         e.Y = lensWorldPoint(yl);
         const Vec3 toY = e.Y - p;
         e.dist = length(toY);
@@ -488,11 +483,13 @@ struct Camera {
         e.wdir = toY / e.dist;
         e.o = o; e.d = dl;
         e.cosY = std::fabs(dot(dl, nY));
-        return true;
+        const double dXY = length(yl - pl);
+        e.omega = e.cosY / (dXY * dXY * density);
+        return std::isfinite(e.omega) && e.omega > 0.0;
     }
     // The area density (per mm^2 of the front element) with which lensEntry picks entry point
     // yl for light from xl (both lens-local) in table bin c (>= 0, or -2 for a rejecting one):
-    //   (1 - a) * p_region + a / A_front,   a = kLensDefensive,
+    //   (1 - a) * p_region + a / A_front,   a the bin's share (lensShare),
     // p_region the region's density carried from the entrance-pupil plane onto the element,
     //   p_region = (|P - x| / |Y - x|)^2 * cos_Y / (cos_P * A_region),
     // P where the line x -> Y crosses that plane, and 0 where P lies outside the region (unless
@@ -500,7 +497,8 @@ struct Camera {
     double lensEntryDensity(const LensPupil& P, int c, double cphi, double sphi, const Vec3& xl, const Vec3& yl,
                             bool knownInside) const {
         const LensSystem& L = *lens;
-        const double share = kLensDefensive / L.frontArea();
+        const double a = lensShare(c == -2);
+        const double share = a / L.frontArea();
         if (c < 0) return share;
         Vec3 dl = yl - xl;
         const double dXY = length(dl);
@@ -513,7 +511,7 @@ struct Camera {
                             ? Vec3(0, 0, 1)
                             : normalize(yl - Vec3(0, 0, L.zpos[0] + L.surf[0].radius));
         const double k = (dXY + sYP) / dXY;
-        return (1.0 - kLensDefensive) * k * k * std::fabs(dot(dl, n0)) / (-dl.z * P.entry.area(c)) + share;
+        return (1.0 - a) * k * k * std::fabs(dot(dl, n0)) / (-dl.z * P.entry.area(c)) + share;
     }
     // Trace an entry through the glass at `lambda` onto the sensor: its film cell, and
     //   wgt = omega / A_cell   (uniform on the front cap: omega = cosY * A_front / dist^2),
@@ -528,12 +526,7 @@ struct Camera {
         Vec3 onFilm, dFilm;
         if (!L.traceToFilm(e.o, e.d, lambda, onFilm, dFilm)) return false;
         if (!lensFilmToPixel(onFilm, px, py)) return false;
-        if (e.aimed) {
-            wgt = e.omega * lensCellNorm();
-        } else {
-            const double aCell = lensPixelMM() * lensPixelMM();
-            wgt = e.cosY * (L.frontArea() / aCell) / (e.dist * e.dist);   // the mm^2 of both areas cancel
-        }
+        wgt = e.omega * lensCellNorm();
         return std::isfinite(wgt) && wgt > 0.0;
     }
     // Both stages at once: one next-event connection from `p` through the lens.
@@ -643,37 +636,20 @@ struct Camera {
         double cphi = 1.0, sphi = 0.0;
         const LensPupil* P = pupil();
         const int ce = P ? P->classifyFilm(onFilm, cphi, sphi) : -1;
-        if (ce >= 0 || ce == -2) {
-            // A table bin: genLensRay's mixture, per film solid angle.
-            const double pdf = lensFilmDensity(*P, ce, cphi, sphi, onFilm, up, /*knownInside=*/false) *
-                               cosF * L.frontArea() / (aFilm * cosT);
-            return std::isfinite(pdf) ? pdf : 0.0;
-        }
-        double pdf;
-        if (L.surf[jr].radius != 0.0) {
-            const double r = length(rear - onFilm);
-            const Vec3 nR = normalize(rear - Vec3(0, 0, L.zpos[jr] + L.surf[jr].radius));
-            const double cosR = std::fabs(dot(up, nR));
-            if (!(cosR > 1e-12)) return 0.0;
-            pdf = r * r * cosF * L.frontArea() / (aFilm * L.surfaceArea(jr) * cosR * cosT);
-        } else {
-            // The disk genLensRay samples is the planar rear's own clear aperture, which the
-            // trace just checked, so any ray that got through crosses it inside.
-            const double Z = L.rearZ() - L.filmZ;
-            if (!(Z > 1e-9)) return 0.0;
-            const double ra = L.rearAperture();
-            const double aRear = PI * ra * ra;
-            const double c2 = cosT * cosT;
-            pdf = Z * Z * cosF * L.frontArea() / (aFilm * aRear * c2 * c2);
-        }
+        // genLensRay's density per film solid angle: a table bin's mixture, else the rear
+        // sampler's. `rear` is the curved rear's first hit, just checked.
+        const double dens = (ce >= 0 || ce == -2)
+                                ? lensFilmDensity(*P, ce, cphi, sphi, onFilm, up, /*knownInside=*/false, &rear)
+                                : lensRearDensity(onFilm, up, &rear);
+        const double pdf = dens * cosF * L.frontArea() / (aFilm * cosT);
         return std::isfinite(pdf) ? pdf : 0.0;
     }
 
     // The factor BDPT's lens camera densities carry for camera vertex `Y` (world, on the
     // front element) next to scene point `x` (world): (1/A_front) / p_entry(Y | x), where
     // p_entry is the area density with which lensEntry picks Y for light from x -- 1 where x
-    // keeps the front sampler, else the mixture's (lensEntryDensity), at most 1/kLensDefensive
-    // where the region could not have drawn Y.
+    // keeps the front sampler, else the mixture's (lensEntryDensity), at most 1/share where the
+    // region could not have drawn Y.
     double lensAimRatio(const Vec3& Y, const Vec3& x) const {
         const LensPupil* P = pupil();
         if (!P) return 1.0;
@@ -688,14 +664,15 @@ struct Camera {
     // (LensSystem::rearDir) draws direction d (unit, toward the lens) from film point f:
     // Z^2 / (A_rear cos^3 th) through a planar rear's disk, r^2 / (A_cap cosR) to the first
     // point of a curved rear's cap the ray meets (r its distance, cosR the ray's cosine there).
-    // 0 where the sampler cannot draw d.
-    double lensRearDensity(const Vec3& f, const Vec3& d) const {
+    // 0 where the sampler cannot draw d. `rearHit`, if given, is where d first meets a curved
+    // rear (the caller's own trace found it), saving the sphere solve.
+    double lensRearDensity(const Vec3& f, const Vec3& d, const Vec3* rearHit = nullptr) const {
         const LensSystem& L = *lens;
         if (!(d.z > 0.0)) return 0.0;
         const int jr = (int)L.surf.size() - 1;
         if (L.surf[jr].radius != 0.0) {
-            Vec3 hit, n;
-            if (!L.hitSurface(jr, f, d, hit, n)) return 0.0;
+            Vec3 hit = rearHit ? *rearHit : Vec3(), n;
+            if (!rearHit && !L.hitSurface(jr, f, d, hit, n)) return 0.0;
             const double r = length(hit - f);
             const Vec3 nR = normalize(hit - Vec3(0, 0, L.zpos[jr] + L.surf[jr].radius));
             const double cosR = std::fabs(dot(d, nR));
@@ -710,16 +687,18 @@ struct Camera {
     }
     // The density, per film solid angle, with which genLensRay draws direction d (unit, toward
     // the lens) from film point f in exit bin ce (>= 0, or -2 for a rejecting one):
-    //   (1 - a) * r^2 / (cos th * A_region) + a * p_rear,   a = kLensDefensive,
+    //   (1 - a) * r^2 / (cos th * A_region) + a * p_rear,   a the bin's share (lensShare),
     // the first term only where d crosses the exit plane inside the region (r the distance to
-    // the crossing; `knownInside`: d was drawn through it), p_rear lensRearDensity.
+    // the crossing; `knownInside`: d was drawn through it), p_rear lensRearDensity (`rearHit`
+    // passed on to it).
     double lensFilmDensity(const LensPupil& P, int ce, double cphi, double sphi, const Vec3& f, const Vec3& d,
-                           bool knownInside) const {
-        const double share = kLensDefensive * lensRearDensity(f, d);
+                           bool knownInside, const Vec3* rearHit = nullptr) const {
+        const double a = lensShare(ce == -2);
+        const double share = a * lensRearDensity(f, d, rearHit);
         if (ce < 0 || !(d.z > 1e-12)) return share;
         const double r = (P.exit.z - f.z) / d.z;
         if (!knownInside && !P.exit.inside(ce, f + d * r, cphi, sphi)) return share;
-        return (1.0 - kLensDefensive) * r * r / (d.z * P.exit.area(ce)) + share;
+        return (1.0 - a) * r * r / (d.z * P.exit.area(ce)) + share;
     }
 
     // Image a photon that enters the lens at pupil point `A` travelling along
