@@ -6545,7 +6545,12 @@ as the one at fault.
     (`lensFilmDensity`: `(1 - a) r^2 / (cosT A_region) + a p_rear`, `lensRearDensity` the rear
     sampler's). lensPdfDir follows: the same mixture times `cosF A_front / (A_film cosT)`,
     so -- unlike the entrance side -- nothing else in BDPT changes (the density is still a
-    function of the ray alone). Every
+    function of the ray alone). A render costs more per sample with the aiming, since its
+    camera rays get out of the lens and go on to do work: GPU mode J in check_physlens's fog
+    (the double Gauss at f/4) takes 3.1x the time per sample against FTRACE_LENS_FRONT, at
+    7.7x less variance -- 2.5x the efficiency, 1/(variance x time) (0.399.1, measured from
+    two seeds each; Nsight showed the same per-launch kernel times, three times the
+    adaptive waves). Every
     camera ray keeps the invariant importance x lensPdfDir = cosF A_front / A_film, which
     `-checklens` asserts for all of them. Users: modes R (the lens camera's default), D and J's
     camera subpaths, M/S/U through R, and `addEnvBackgroundLens`. Device twins:
