@@ -1446,6 +1446,9 @@ struct MeshInstance {
     // linear part's Frobenius norm and the translation's length). Carries a hit's
     // Hit::pscale into the world.
     double reachMul = 1.0, reachAdd = 0.0;
+    // Derived from toWorld: -1 for a mirroring transform (det < 0), which reverses a tangent
+    // frame's handedness -- a hit's Hit::bitangentSign is multiplied by it into the world.
+    double handSign = 1.0;
     // The ONLY way to set the transform, so the derived curvScale (and toLocal) can
     // never silently go stale behind a direct `inst.toWorld = …` assignment.
     void setToWorld(const Affine& xf) {
@@ -1458,6 +1461,7 @@ struct MeshInstance {
         double a = std::fabs(det);
         double s = (a > 1e-30) ? std::cbrt(a) : 1.0;   // average linear scale
         curvScale = 1.0 / s;
+        handSign = (det < 0.0) ? -1.0 : 1.0;
         double f2 = 0.0;
         for (int k = 0; k < 9; ++k) f2 += m[k] * m[k];
         reachMul = std::sqrt(f2);
@@ -3428,10 +3432,11 @@ struct Scene {
         lh.ng = normalize(inst.toLocal.applyDirTranspose(lh.ng));
         // Map the surface tangent through the instance transform too (C6 normal maps
         // on instanced meshes). The tangent is a direction, so it uses applyDir (not
-        // applyNormal); handedness (bitangentSign) is preserved for proper transforms.
+        // applyNormal); a mirroring transform reverses the frame's handedness.
         Vec3 wt = inst.toWorld.applyDir(lh.tangent);
         double wtl = std::sqrt(dot(wt, wt));
         if (wtl > 1e-12) lh.tangent = wt * (1.0 / wtl);
+        lh.bitangentSign *= inst.handSign;
         // Curvature is 1/LENGTH, so an instance that scales the mesh must scale it too:
         // blow a sphere up 10x and it gets ten times flatter. The factor is the average
         // linear scale |det(linear)|^(1/3), which is exact for a uniform scale (the case

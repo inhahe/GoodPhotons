@@ -7316,9 +7316,12 @@ as the one at fault.
     keeps the side of a direction (dot(d, n)) but not of one normal against another, and so can
     turn an interpolated normal across its face's plane. Everything that wants the geometric
     normal on the side being shaded takes it from `back` too (0.400.3: `orientedGeoN`,
-    `vertexGeoN`, `dShadedNg`, `dVertexGeoN`) -- spawn offsets, the shadow terminator, the
-    Veach adjoint, the cavity probe -- so one hit has one side; a copy whose n is flipped
-    (the transmit lobe's back hemisphere) flips `back` with it. `Hit::patOwnSide` / `DHit::patOwnSide`
+    `vertexGeoN`, `dShadedNg`, `dVertexGeoN`, `dLvGeoN`) -- NEE shadow-ray offsets, the shadow
+    terminator (which takes the plain geometric step where n is tipped, cos(Ng, Ns) <= 0), the
+    Veach adjoint, the cavity probe -- so one hit has one side; a copy seen from the other
+    side (the transmit lobe's back hemisphere) is made by `otherSide` / `dOtherSide`, which turn
+    n, curv and back together. BSDF continuations still sample and (on the host) spawn about n:
+    known-issues CONTINUATION-TIPPED. `Hit::patOwnSide` / `DHit::patOwnSide`
     is the surface's material's flag, set at the closest-hit choke points (`Scene::markPatSide`,
     the device closestHit) with the surface's own material -- the rule is the surface's, so
     every pattern on it follows it, a mix's opaque part's too. Both ride on the hit rather than
@@ -7334,8 +7337,12 @@ as the one at fault.
     from the per-triangle decision two-sided shading makes (`raster::seenFromBehind`, the GPU's
     kSlotBack). Normal maps follow the same rule, in all four twins (`applyNormalMap`,
     `dApplyNormalMap`, both previews; 0.400.2): the relief's slope lies along the surface's
-    own frame, T and B where u and v grow whichever side the ray came from (B about the
-    shading normal on the vertex normals' side, where `Tri::bitangentSign` is taken), and its
+    own frame, T and B where u and v grow whichever side the ray came from (B = cross(the
+    shading normal on the surface's own side, T) * `Hit::bitangentSign`; `Tri::bitangentSign` is
+    taken about the winding and intersectTri turns it per hit with ng, 0.400.4, so a face whose
+    vertex normals straddle it keeps dP/dv; a mirroring instance multiplies it by
+    `MeshInstance::handSign`; the previews bake it about the vertex normals' side,
+    `previewTanSign`, and turn it per pixel, `straddleSign`), and its
     height faces the viewer -- so on an opaque surface seen from behind bumps stay bumps,
     whichever way it is wound -- except from behind a surface light can cross, where the slope
     is negated too and the normal is the front one negated: the same relief seen from its

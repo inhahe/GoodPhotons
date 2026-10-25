@@ -9731,8 +9731,8 @@ static int checkCavity() {
     // A hit that is not the result of any intersection: `cavity` is a function of the
     // point and the shaded-side normal alone, so it can be probed directly.
     // `ng` is the triangle's own winding normal and does NOT flip with the ray; `n` is
-    // the ray-oriented shading normal and does. §6 relies on being able to set them
-    // independently, which is the only way to exercise orientedGeoN().
+    // the ray-oriented shading normal and does, and `back` records that it did, as an
+    // intersector would (the side cavityAt probes). §6 sets n and ng independently.
     // matId 0 throughout: §10 exercises the per-material gate, and the probe is only
     // reached through a material that declares it reads `cavity`.
     auto hitAt2 = [](const Vec3& p, const Vec3& n, const Vec3& ng) {
@@ -9827,14 +9827,14 @@ static int checkCavity() {
         // The floor tri's winding normal is FIXED at +y in both cases; only the
         // ray-oriented shading normal differs, exactly as it would for a ray arriving
         // from above vs. from below. A mutation that probed about a raw `h.ng` (or a
-        // raw "always outward") instead of orientedGeoN() reads the roof in BOTH.
+        // raw "always outward") instead of the side the ray came from reads the roof in BOTH.
         const Vec3 P{0.2, 0.0, 0.1}, GN{0, 1, 0};
         double up   = cavityAt(s, hitAt2(P, Vec3{0,  1, 0}, GN));
         double down = cavityAt(s, hitAt2(P, Vec3{0, -1, 0}, GN));
         ok &= chk("S6 hit from above sees the roof",   up,   1.0 - 0.09, 5e-3);
         ok &= chk("S6 hit from below sees open space", down, 0.0, 0.0);
         // The same for a smooth-shaded surface whose interpolated normal merely TILTS
-        // away from the facet: the flip must key off the SIGN of dot(ng, n), not
+        // away from the facet: the probe keys off the side the ray came from, not
         // replace ng with n (which would let a coarse mesh's shading normal tip the
         // hemisphere into the surface and self-report occlusion that is not there).
         Vec3 tilt = normalize(Vec3{0.45, 1.0, -0.3});
@@ -11100,6 +11100,50 @@ static int checkTriNormal() {
         std::printf("[checktrinormal] S8 hits on axis-aligned triangles off their plane: %d of %d "
                     "(each also under two instance transforms)\n", bad, n);
         chkb("S8 a hit on a triangle in the plane x/y/z = c has exactly c there", bad == 0 && n > 1000);
+    }
+
+    // ---- S9: the normal-map frame's bitangent is dP/dv on every hit ---------------------------
+    // applyNormalMap builds B = cross(the shading normal on the surface's own side, T) *
+    // Hit::bitangentSign. That must be the direction v grows whichever way the face is wound
+    // against its vertex normals, where they straddle its plane, from either side, and through a
+    // mirroring instance -- or a normal map's slope along v comes out mirrored there.
+    {
+        int bad = 0, n = 0;
+        auto frameB = [](const Hit& h) {
+            const Vec3 No = h.back ? h.n * -1.0 : h.n;
+            const Vec3 T = normalize(h.tangent - No * dot(No, h.tangent));
+            return cross(No, T) * h.bitangentSign;
+        };
+        // u grows along +x, v along +z, in the plane y = 0.
+        const Vec3 A(0, 0, 0), Bv(1, 0, 0), C(0, 0, 1), dPdv(0, 0, 1);
+        const Vec3 up(0, 1, 0), tipped = normalize(Vec3(0.2, -1, 0.1));
+        MeshInstance mirror;
+        mirror.setToWorld(MeshXform{Vec3(0, 0, 0), Vec3(-1, 1, 1), Vec3(0, 0, 0)}.toAffine());
+        for (int wind = 0; wind < 2; ++wind)
+            for (int nmode = 0; nmode < 3; ++nmode) {      // vertex normals up, down, straddling
+                Tri t;
+                t.v0 = A; t.uv0 = Vec3(0, 0, 0);
+                t.v1 = wind ? C : Bv; t.uv1 = wind ? Vec3(0, 1, 0) : Vec3(1, 0, 0);
+                t.v2 = wind ? Bv : C; t.uv2 = wind ? Vec3(1, 0, 0) : Vec3(0, 1, 0);
+                const Vec3 nv = (nmode == 1) ? up * -1.0 : up;
+                t.n0 = nv; t.n1 = nv; t.n2 = (nmode == 2) ? tipped : nv;
+                t.finalize();
+                for (const Vec3& at : {Vec3(0.1, 0, 0.1), Vec3(0.05, 0, 0.9), Vec3(0.9, 0, 0.05)})
+                    for (const double side : {1.0, -1.0}) {
+                        const Ray r{at + up * (2.0 * side), up * -side};
+                        Hit h;
+                        if (!intersectTri(r, t, 1e-9, h)) { ++bad; continue; }
+                        ++n;
+                        bad += dot(frameB(h), dPdv) > 0.0 ? 0 : 1;
+                        // Through the mirror (x -> -x): v still grows along +z.
+                        Hit lh = h;
+                        Scene::instanceHitToWorld(mirror, lh);
+                        ++n;
+                        bad += dot(frameB(lh), mirror.toWorld.applyDir(dPdv)) > 0.0 ? 0 : 1;
+                    }
+            }
+        std::printf("[checktrinormal] S9 normal-map bitangent against dP/dv: %d of %d wrong\n", bad, n);
+        chkb("S9 the normal-map frame's bitangent is where v grows on every hit", bad == 0 && n == 72);
     }
 
     std::printf("[checktrinormal] %s\n", ok ? "PASS" : "FAIL");

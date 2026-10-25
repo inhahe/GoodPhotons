@@ -1076,7 +1076,7 @@ struct BackwardRenderer {
                     GiCtx gi = GiCtx{}, const HairShade* hs = nullptr,
                     const HairDualCtx* dctx = nullptr, const NeeBsdf* nb = nullptr) const {
         double total = 0.0;
-        // Geometric normal on the shading-normal side: every light connection must lie
+        // Geometric normal on the side being shaded: every light connection must lie
         // in this hemisphere too, else a smoothed shading normal would leak light in
         // through the geometric back face (shading-normal problem). No-op for flat
         // tris / analytic spheres (ngo == h.n there). The shadow ray is also offset
@@ -2549,7 +2549,7 @@ struct BackwardRenderer {
                 L += thr * neeLight(scene, h, rhoR, invPdfLambda, lambda, rng, spdCache, gi);
                 if (scene.envIndex >= 0)
                     L += thr * neeEnv(scene, h, rhoR, invPdfLambda, lambda, rng);
-                Hit hb = h; hb.n = -h.n; hb.back = !h.back;   // back hemisphere for the transmit lobe
+                const Hit hb = otherSide(h);                 // back hemisphere for the transmit lobe
                 L += thr * neeLight(scene, hb, rhoT, invPdfLambda, lambda, rng, spdCache, gi);
                 if (scene.envIndex >= 0)
                     L += thr * neeEnv(scene, hb, rhoT, invPdfLambda, lambda, rng);
@@ -3410,7 +3410,7 @@ struct BackwardRenderer {
                     neeLightHero(scene, h, rhoR, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
                     if (scene.envIndex >= 0)
                         neeEnvHero(scene, h, rhoR, L, thr, lam, invPdf, nUp, rng);
-                    Hit hb = h; hb.n = -h.n; hb.back = !h.back;       // back hemisphere (transmit lobe)
+                    const Hit hb = otherSide(h);                     // back hemisphere (transmit lobe)
                     neeLightHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
                     if (scene.envIndex >= 0)
                         neeEnvHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng);

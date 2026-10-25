@@ -4107,7 +4107,8 @@ faces down) reads the same from above -- and a surface light can cross shows the
 from its back, its normal the front one negated, so light crossing a normal-mapped pane meets
 one surface either way (since 0.400.2, in the tracers and both previews; before, one of the
 relief's two slopes came out mirrored from behind, and on a mesh wound against its `vn` the
-slope along v from in front too). See `scraps/ripple_test.ftsl` (a flat wall reading as
+slope along v from in front too -- as it did, until 0.400.4, under a mirroring
+`mesh_instance` such as `scale -1 1 1`). See `scraps/ripple_test.ftsl` (a flat wall reading as
 corrugated under grazing light).
 
 A texture's albedo can also be **procedural in UV space**: in place of `file`, give

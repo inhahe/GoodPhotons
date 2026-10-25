@@ -714,6 +714,7 @@ struct DInstance {
     // Host-precomputed (MeshInstance::curvScale) so the device does no cbrt per hit.
     double curvScale;
     double reachMul, reachAdd;   // MeshInstance::reachMul/reachAdd: a hit's pscale into the world
+    double handSign;             // MeshInstance::handSign: -1 mirrors a tangent frame's handedness
     int    blasId;
     int    matOverride;   // >=0 replaces the BLAS triangles' matId (mirrors host)
 };
@@ -3487,6 +3488,14 @@ static_assert(sizeof(DHit) == 112, "DHit changed size");
 // The geometric normal on the side being shaded: the side the ray came from (host twin
 // orientedGeoN, which says why it is not read off n).
 __device__ static inline DVec3 dShadedNg(const DHit& h) { return h.back ? h.ng * (Real)(-1) : h.ng; }
+// The same hit seen from its other side (host twin otherSide): n, curv and back turned together.
+__device__ static inline DHit dOtherSide(const DHit& h) {
+    DHit o = h;
+    o.n = h.n * (Real)(-1);
+    o.curv = -h.curv;
+    o.back = !h.back;
+    return o;
+}
 
 // ---- implicit field evaluation (device twin of implicit.h) ----------------
 // smin/smax (Inigo Quilez quadratic blend) — filleted CSG / metaball merge.
@@ -4074,13 +4083,15 @@ __device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const 
     // `entering` / one-sided-emitter tests read the side off it. The two copies MUST
     // agree: a CPU/GPU split here shows up as one device shading silhouettes
     // differently from the other.
-    DVec3 gn = (dot(tri.gn, ns) < 0) ? -tri.gn : tri.gn;
+    const bool againstWinding = dot(tri.gn, ns) < 0;
+    DVec3 gn = againstWinding ? -tri.gn : tri.gn;
     bool flipped = !(dot(rd, gn) < 0);
     hit.ng = gn;
     hit.n = flipped ? -ns : ns;
     hit.back = flipped;
     hit.tangent = tri.tangent;                 // per-triangle tangent (C6 normal mapping)
-    hit.bitangentSign = (Real)tri.bitangentSign;
+    // About the winding; the frame about ng's side (host twin intersectTri).
+    hit.bitangentSign = againstWinding ? -(Real)tri.bitangentSign : (Real)tri.bitangentSign;
     // O3: curvature follows the shaded side, exactly as the host intersectTri does.
     hit.curv = (Real)(flipped ? -tri.curvature : tri.curvature);
     hit.vcol = tri.vcol; hit.vb0 = b0; hit.vb1 = b1;
@@ -4425,6 +4436,7 @@ __device__ static void instanceHitToWorld(const DInstance& inst, DHit& lh) {
     DVec3 wt = affDir(inst.Wm, lh.tangent);
     Real wtl = sqrt(dot(wt, wt));
     if (wtl > (Real)1e-12) lh.tangent = wt * ((Real)1 / wtl);
+    lh.bitangentSign *= (Real)inst.handSign;   // a mirroring transform reverses the frame
     lh.curv *= (Real)inst.curvScale;   // O3: curvature into world units -- mirrors host
     if (inst.matOverride >= 0) lh.matId = inst.matOverride;
 }
@@ -5243,6 +5255,7 @@ __device__ static Real dShadowTerminatorG(const DVec3& wi, const DVec3& ns, cons
     if (cosNgNs >= (Real)1 - (Real)1e-7) return (dot(ng, wi) > (Real)0) ? (Real)1 : (Real)0;
     Real cosNgWi = dot(ng, wi);
     if (cosNgWi <= (Real)0) return (Real)0;            // behind the true geometry -> hard shadow
+    if (cosNgNs <= (Real)0) return (Real)1;            // ns tipped across the plane (host twin says)
     Real denom = dot(ns, wi) * cosNgNs;
     if (denom <= (Real)1e-8) return (Real)1;           // degenerate grazing -> no softening
     Real g = cosNgWi / denom;
@@ -11841,7 +11854,8 @@ struct DVertex {
 };
 #if FTRACE_GPU_FP32
 // BDPT holds 2 * BDPT_MAXV of these per thread in local memory: a field that grows it costs
-// occupancy. Fill a hole (after lightIdx; the tail after nUp is taken) before adding a word.
+// occupancy. No padding is left (back filled the hole after lightIdx, patOwnSide the tail
+// after nUp), so a new field grows it by 8 B.
 static_assert(sizeof(DVertex) == 136, "DVertex changed size");
 #endif
 // dShadedNg of the hit a vertex was made at; a light or camera vertex (back 0) keeps its ng.
@@ -14133,7 +14147,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             L += thr * bkNeeLight(sc, h, rhoR, invPdfLambda, lambda, rng, gi.depth);  // front
             if (sc.envIndex >= 0)
                 L += thr * bkNeeEnv(sc, h, rhoR, invPdfLambda, lambda, rng);
-            DHit hb = h; hb.n = nb; hb.back = !h.back;
+            const DHit hb = dOtherSide(h);
             L += thr * bkNeeLight(sc, hb, rhoT, invPdfLambda, lambda, rng, gi.depth); // back
             if (sc.envIndex >= 0)
                 L += thr * bkNeeEnv(sc, hb, rhoT, invPdfLambda, lambda, rng);
@@ -14744,7 +14758,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 DVec3 nb = h.n * (Real)(-1);
                 bkNeeLightHero(sc, h, rhoR, L, thr, lam, invPdf, nUp, rng, gi.depth);   // front
                 if (sc.envIndex >= 0) bkNeeEnvHero(sc, h, rhoR, L, thr, lam, invPdf, nUp, rng);
-                DHit hb = h; hb.n = nb; hb.back = !h.back;                            // back hemisphere (transmit lobe)
+                const DHit hb = dOtherSide(h);                            // back hemisphere (transmit lobe)
                 bkNeeLightHero(sc, hb, rhoT, L, thr, lam, invPdf, nUp, rng, gi.depth);
                 if (sc.envIndex >= 0) bkNeeEnvHero(sc, hb, rhoT, L, thr, lam, invPdf, nUp, rng);
                 // Mode W indirect diffuse: a translucent surface receives from the FULL
@@ -15441,7 +15455,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                 DVec3 nb = h.n * (Real)(-1);
                 L = L + hadamard(beta, bkNeeLightRGB(sc, h, rhoR, rng));
                 if (sc.envIndex >= 0) L = L + hadamard(beta, bkNeeEnvRGB(sc, h, rhoR, rng));
-                DHit hb = h; hb.n = nb; hb.back = !h.back;
+                const DHit hb = dOtherSide(h);
                 L = L + hadamard(beta, bkNeeLightRGB(sc, hb, rhoT, rng));
                 if (sc.envIndex >= 0) L = L + hadamard(beta, bkNeeEnvRGB(sc, hb, rhoT, rng));
                 if (directOnly) return L;                   // Whitted: no diffuse indirect
@@ -19014,6 +19028,8 @@ struct DVcmLV {
 #if FTRACE_GPU_FP32
 static_assert(sizeof(DVcmLV) == 152, "DVcmLV changed size: it is the largest allocation in a session");
 #endif
+// dVertexGeoN's twin for a stored light vertex.
+__device__ static inline DVec3 dLvGeoN(const DVcmLV& v) { return v.back ? v.ng * (Real)(-1) : v.ng; }
 
 // The SECONDARY hero wavelengths of a stored light vertex, one slot per secondary. Kept in a
 // PARALLEL slab (`lvSec[(i*vcmCap + k)*secStride + j]`, secStride == C-1) rather than inline in
@@ -19971,7 +19987,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     double distc = sqrt(dist2); DVec3 w = dv * (Real)(1.0 / distc);
                     double cosCam = ddot(h.n, w);
                     double cosLit = ddot(lv.ns, w * (Real)-1);
-                    DVec3 ngoLit = (lv.back ? lv.ng * (Real)(-1) : lv.ng);
+                    DVec3 ngoLit = dLvGeoN(lv);
                     bool twoSidedLit = dTwoSidedType(sc.mats[lv.matId].type);
                     double stGCam = twoSidedCam ? 1.0 : (double)dShadowTerminatorG(w, h.n, ngoCam);
                     double stGLit = twoSidedLit ? 1.0 : (double)dShadowTerminatorG(w * (Real)-1, lv.ns, ngoLit);
@@ -20514,13 +20530,13 @@ __global__ static void kHitProbe(DScene sc, const DevHitProbeRay* rays, int n, D
     o.ng[0] = h.ng.x; o.ng[1] = h.ng.y; o.ng[2] = h.ng.z;
     o.pscale = (double)h.pscale; o.fiberRadius = (double)h.fiberRadius; o.curv = (double)h.curv;
     o.tangentZ = (double)h.tangent.z;
+    const DVec3 sng = dShadedNg(h);
+    o.sng[0] = sng.x; o.sng[1] = sng.y; o.sng[2] = sng.z;
     if (h.valid && h.matId >= 0) {
         const DPatIn in = dPatIn(h);
         o.q[0] = in.x; o.q[1] = in.y; o.q[2] = in.z;
         o.qn[0] = in.nx; o.qn[1] = in.ny; o.qn[2] = in.nz; o.qcurv = in.curv;
         o.cavity = dCavityOf(sc, h);
-        const DVec3 sng = dShadedNg(h);
-        o.sng[0] = sng.x; o.sng[1] = sng.y; o.sng[2] = sng.z;
     }
     out[i] = o;
 }
@@ -21312,6 +21328,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         for (int k = 0; k < 9; ++k) d.Wm[k] = in.toWorld.m[k];   // hit point, tangent local->world
         d.Wt[0] = in.toWorld.t.x; d.Wt[1] = in.toWorld.t.y; d.Wt[2] = in.toWorld.t.z;
         d.curvScale = in.curvScale;                              // curvature local->world (O3)
+        d.handSign = in.handSign;
         d.reachMul = in.reachMul; d.reachAdd = in.reachAdd;
         d.blasId = in.blasId; d.matOverride = in.matOverride;
     }

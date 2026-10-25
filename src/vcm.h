@@ -699,7 +699,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         misArrival(dist, cosThetaIn, dVCM, dVC, dVM, !(isInfinite && edges == 1));
 
         Vec3 wo = normalize(prevP - h.p);        // toward the previous light vertex
-        // Geometric normal oriented onto the shading-normal side, for the Veach adjoint
+        // Geometric normal on the side being shaded (orientedGeoN), for the Veach adjoint
         // shading-normal correction on this LIGHT (particle) subpath (§5.3; identical role
         // to render.h/bdpt.h). Exactly a no-op when h.n==h.ng (flat tris, analytic spheres).
         Vec3 ngo = orientedGeoN(h);
@@ -1149,7 +1149,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 // geometric front side, ramped smoothly instead of a hard cutoff (Chiang 2019).
                 // No-op when ns==ng (stG==1); skipped for two-sided materials.
                 Vec3 ngoCam = orientedGeoN(h);
-                Vec3 ngoLit = lv.hit.back ? lv.ng * -1.0 : lv.ng;   // orientedGeoN(lv.hit)
+                Vec3 ngoLit = orientedGeoN(lv.hit);
                 double stGCam = isTwoSidedMat(*mp)     ? 1.0 : shadowTerminatorG(w, h.n, ngoCam);
                 double stGLit = isTwoSidedMat(*lv.mat) ? 1.0 : shadowTerminatorG(w * -1.0, lv.ns, ngoLit);
                 bool camSide = isTwoSidedMat(*mp)

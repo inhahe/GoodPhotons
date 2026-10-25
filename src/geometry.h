@@ -119,10 +119,11 @@ struct Tri {
         if (dot(n2, n2) < 1e-12) n2 = gn;
         // Tangent from the UV gradient (Lengyel). Solve for the world direction along
         // which texture-u increases, then Gram-Schmidt it against gn and record the
-        // bitangent handedness -- about the face normal on the vertex normals' side, the
-        // surface's own side the normal map builds its frame on (intersectTri turns ng
-        // there too), so a mesh wound against its `vn` is not mirrored in v. Falls back to
-        // onb(gn) when UVs are degenerate.
+        // bitangent handedness about the winding normal gn. A hit's frame is built about the
+        // normal on its own side, which intersectTri turns ng to per hit, so it turns the
+        // sign with it (Hit::bitangentSign): a mesh wound against its `vn`, or a face whose
+        // vertex normals straddle it, keeps dP/dv. Falls back to onb(gn) when UVs are
+        // degenerate.
         Vec3 e1 = v1 - v0, e2 = v2 - v0;
         double du1 = uv1.x - uv0.x, dv1 = uv1.y - uv0.y;
         double du2 = uv2.x - uv0.x, dv2 = uv2.y - uv0.y;
@@ -135,8 +136,7 @@ struct Tri {
             double tl = std::sqrt(dot(T, T));
             if (tl > 1e-12) {
                 tangent = T * (1.0 / tl);
-                const Vec3 gOwn = (dot(gn, n0 + n1 + n2) < 0.0) ? gn * -1.0 : gn;
-                bitangentSign = (dot(cross(gOwn, tangent), B) < 0.0) ? -1.0 : 1.0;
+                bitangentSign = (dot(cross(gn, tangent), B) < 0.0) ? -1.0 : 1.0;
             } else { Vec3 bb; onb(gn, tangent, bb); bitangentSign = 1.0; }
         } else { Vec3 bb; onb(gn, tangent, bb); bitangentSign = 1.0; }
         // Mean curvature H = 1/2 * trace(dn restricted to the tangent plane).
@@ -276,6 +276,16 @@ inline Vec3 orientedGeoN(const Hit& h) {
     return h.back ? Vec3{-h.ng.x, -h.ng.y, -h.ng.z} : h.ng;
 }
 
+// The same hit seen from its other side -- a two-sided transmit lobe's back hemisphere: n,
+// curv and back turned together, as an intersector turns them for a ray from there.
+inline Hit otherSide(const Hit& h) {
+    Hit o = h;
+    o.n = Vec3{-h.n.x, -h.n.y, -h.n.z};
+    o.curv = -h.curv;
+    o.back = !h.back;
+    return o;
+}
+
 // Veach shading-normal ADJOINT correction factor (Veach §5.3; PBRT
 // `CorrectShadingNormal`, importance/light-transport mode). A BSDF evaluated with
 // an interpolated *shading* normal `ns` instead of the true *geometric* normal `ng`
@@ -317,9 +327,12 @@ inline double shadingAdjointCorr(const Vec3& wi, const Vec3& wo,
 //
 //   g = cos(Ng,wi) / (cos(Ns,wi) · cos(Ng,Ns)),   softened by  -g^3 + g^2 + g  on (0,1)
 //
-// `ns` = shading normal, `ng` = geometric normal ORIENTED onto the shading side (orientedGeoN),
-// `wi` = direction toward the light/connection. Callers gate on the shading cosine first, so
-// cos(Ns,wi) > 0 in practice. **Exactly 1 when Ns == Ng** (flat tris, analytic spheres): then
+// `ns` = shading normal, `ng` = geometric normal on the side being shaded -- the side the ray
+// came from (orientedGeoN) -- `wi` = direction toward the light/connection. Callers gate on the
+// shading cosine first, so cos(Ns,wi) > 0 in practice. Where ns has been tipped across the
+// surface's plane (cos(Ng,Ns) <= 0: a normal map, a non-uniform instance scale), ng and ns lie
+// on opposite sides and the softening means nothing: the plain geometric step applies, light
+// from the shaded side passing and light from behind blocked. **Exactly 1 when Ns == Ng** (flat tris, analytic spheres): then
 // cos(Ng,Ns)=1 and cos(Ng,wi)=cos(Ns,wi) ⇒ g=1 ⇒ factor 1, so every non-smooth scene is
 // bit-identical and the whole validation suite is untouched. The cubic is C1 at g=1 (its
 // derivative there is 0), so the well-lit region blends in without a crease.
@@ -335,6 +348,7 @@ inline double shadowTerminatorG(const Vec3& wi, const Vec3& ns, const Vec3& ng) 
     if (cosNgNs >= 1.0 - 1e-7) return (dot(ng, wi) > 0.0) ? 1.0 : 0.0;
     double cosNgWi = dot(ng, wi);
     if (cosNgWi <= 0.0) return 0.0;                // behind the true geometry -> hard shadow (no leak)
+    if (cosNgNs <= 0.0) return 1.0;                // ns tipped across the plane: the geometric step
     double denom = dot(ns, wi) * cosNgNs;
     if (denom <= 1e-8) return 1.0;                 // degenerate (grazing / near-perpendicular): no softening
     double g = cosNgWi / denom;
@@ -470,7 +484,8 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     // is a stable test. This mirrors PBRT's `Triangle::Intersect`, which likewise
     // faceforwards the geometric normal onto the shading normal and then decides
     // front/back from the geometric one.
-    Vec3 gn = (dot(tri.gn, ns) < 0.0) ? Vec3{-tri.gn.x, -tri.gn.y, -tri.gn.z} : tri.gn;
+    const bool againstWinding = dot(tri.gn, ns) < 0.0;
+    Vec3 gn = againstWinding ? Vec3{-tri.gn.x, -tri.gn.y, -tri.gn.z} : tri.gn;
     bool flipped = !(dot(r.d, gn) < 0.0);
     // NB `hit.ng` is deliberately NOT flipped toward the ray, here or in any other
     // primitive: downstream `bool entering = dot(d, h.ng) < 0` (refraction, medium
@@ -482,7 +497,9 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     hit.n = flipped ? -ns : ns;
     hit.back = flipped;
     hit.tangent = tri.tangent;             // per-triangle tangent (constant across the face)
-    hit.bitangentSign = tri.bitangentSign; // for tangent-space normal mapping (C6)
+    // For tangent-space normal mapping (C6): the frame is built about the normal on ng's side,
+    // and the triangle's sign is taken about its winding (Tri::finalize).
+    hit.bitangentSign = againstWinding ? -tri.bitangentSign : tri.bitangentSign;
     // Curvature follows the shaded side: seen from the back, a bulge IS a pit (O3).
     hit.curv = flipped ? -tri.curvature : tri.curvature;
     return true;

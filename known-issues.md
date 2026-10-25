@@ -176,17 +176,37 @@ vcm.h and the device's BDPT/VCM), turned ng to the side `h.n` points, `h.n` bein
 normal after the normal map. Where a map tips n across the surface's plane -- any texel with
 blue below 0.5, whatever the strength -- or a non-uniform instance scale turns an interpolated
 normal more than 90 degrees from its face's (any `scale 1 0.1 1` of a smooth mesh: 18 hits in
--checkdevhits' scene), it named the side the ray did not come from. There n points into the
-surface, so light on the ray's side meets a negative cosine either way; but light from BEHIND
-the surface leaked onto such a hit -- the terminator passed it (judged against the far side as
-if it were the shaded one) and the shadow ray was offset to the far side to reach it -- while
-`cavityAt` (0.400.1) already probed the ray's side. All of them
+-checkdevhits' scene), it named the side the ray did not come from. Light from BEHIND the
+surface then leaked onto such a hit -- the terminator passed it, judged against the far side as
+if that were the shaded one, and the shadow ray was offset to the far side to reach it -- and
+light from the ray's side that the tipped n still faces (n near the plane) was cut to nothing;
+while `cavityAt` (0.400.1) already probed the ray's side. Now the terminator takes the plain
+geometric step there (`cos(Ng, Ns) <= 0`, an explicit branch since 0.400.4): the ray's side
+lit, behind blocked. All of them
 now take the side from `Hit::back` / `DHit::back` / the vertices' `back` (`orientedGeoN`,
 `vertexGeoN`, `dShadedNg`, `dVertexGeoN`); the transmit lobe's back-hemisphere copies
 (`Hit hb = h; hb.n = -h.n`, host and device) flip `back` with n -- which also makes a pattern
-read at hb on a translucent see the normal it sees at h. Bit-identical on scenes where nothing
-tips n (13 renders, both devices, modes R, D, B and J, a normal-mapped wall among them), and on
-a squashed smooth dome lit only from above (its tipped hits get nothing either way).
+read at hb on a translucent see the normal it sees at h (0.400.4: and its curvature --
+`otherSide` / `dOtherSide` turn n, curv and back together). Bit-identical on scenes where
+nothing tips n (13 renders, both devices, modes R, D, B and J, a normal-mapped wall among
+them), and on a squashed smooth dome lit from above (its lamp lies where its tipped hits' n
+faces away). NOT covered: BSDF continuations -- see CONTINUATION-TIPPED.
+
+## OPEN (2026-10-25, 0.400.4): CONTINUATION-TIPPED — at a hit whose shading normal is tipped across the surface, BSDF continuations leak light from behind
+
+Where n is tipped across the surface's plane (see ORIENTEDGEON-TIPPED: a normal-map texel with
+blue below 0.5, a non-uniform instance scale of a smooth mesh), a continuation sampled about n
+(`cosineHemisphere(h.n)` and the glossy lobes, host and device) heads into the surface about
+half the time, and the host also spawns every continuation along n (`Ray{h.p + h.n * 1e-6, wo}`,
+some 40 sites in backward.h, render.h, photonmap_render.h, sppm_render.h; the device offsets
+along ng toward wo, `dOffsetAlong`). Such a ray travels behind the surface and brings back light
+from there. Only NEE is protected (the terminator's geometric step). Pre-existing: the classic
+shading-normal problem, here at its extreme. Proper fix: treat a continuation whose direction
+lies on the far geometric side of a reflecting surface as absorbed (PBRT's choice -- it loses the
+energy of that sample, where letting it through leaks), and spawn host continuations along ng
+toward the outgoing direction as the device does; both behind a bit-identity check on scenes
+where nothing tips n. Not done in 0.400.4: it touches every host integrator's continuation
+sites, and which of absorption or leak a tipped normal should cost is the user's call.
 Found by the Opus review of 0.400.1; -checkdevhits holds orientedGeoN to the ray's side on
 every hit and the device's dShadedNg to it.
 

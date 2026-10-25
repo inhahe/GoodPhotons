@@ -1264,7 +1264,12 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         const float3 No = behind ? N3 * -1.0f : N3;
         float3 T = dTriTangent(wp0, wp1, wp2, uv0, uv1, uv2, No);
         if (dot3(T, T) > 1e-18f) {
-            float3 B3 = cross3(No, T) * vsrc.tanSign;   // mirrored UVs: -1 (the source triangle's)
+            // Mirrored UVs: -1 (the source triangle's); and -1 again where No lies on the far
+            // side of a face whose vertex normals straddle it (host twin raster::straddleSign).
+            const float3 fw = cross3(vsrc.p1 - vsrc.p0, vsrc.p2 - vsrc.p0);
+            const bool sumAgainst = dot3(fw, vsrc.n0 + vsrc.n1 + vsrc.n2) < 0.0f;
+            const float straddle = (sumAgainst != (dot3(fw, No) < 0.0f)) ? -1.0f : 1.0f;
+            float3 B3 = cross3(No, T) * (vsrc.tanSign * straddle);
             float3 tn = dSampleNormalTS(texMeta, texels, nrmTex, uu, vv);
             const float s3 = (behind && vsrc.patOwnSide) ? -nrmS : nrmS;
             float3 pert = T * (tn.x * s3) + B3 * (tn.y * s3) + N3 * tn.z;

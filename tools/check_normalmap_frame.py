@@ -27,10 +27,14 @@ surface and a tilt down darkens it.
      the relief faces the viewer as authored, whichever way the quad is wound: the map tilts it up,
      toward the sun, in both (brighter). Mirroring the slope along v from behind, or showing the
      relief's back (bumps as dents), tilts it down (darker).
+     The same with a map tilted along T and the sun off to +T on the viewer's side both ways:
+     the slope along T faces the viewer too (brighter).
   5. WOUND AGAINST ITS NORMALS. The mapped quad of case 4 with its faces wound against its `vn`,
      seen from the `vn` side: it tilts up as the quad wound with them does. A bitangent sign
      taken against the winding instead mirrors its slope along v.
-Cases 3-5 in mode R on both devices and in both previews.
+  6. MIRRORED. The mapped quad of case 4 placed by a mirroring transform (scale -1 1 1): v still
+     grows up it, so it tilts up too. A frame handedness kept from the local mesh mirrors it.
+Cases 3-6 in mode R on both devices and in both previews.
 Comparisons are within one image, so each renderer's own exposure cancels. Exits 1 on any failure.
 """
 import argparse
@@ -86,23 +90,37 @@ def write_inputs(d):
             "vt 0 0", "vt 1 0", "vt 1 1", "vt 0 1", "vn 0 0 1"]
     write_lines(os.path.join(d, "tquad.obj"), quad + ["f 1/1/1 2/2/1 3/3/1", "f 1/1/1 3/3/1 4/4/1"])
     write_lines(os.path.join(d, "tquad_rev.obj"), quad + ["f 1/1/1 3/3/1 2/2/1", "f 1/1/1 4/4/1 3/3/1"])
+    # The mapped quad spans x 0.09-0.46 of the frame seen from in front and, the view turned
+    # round, 0.54-0.91 from behind; the mirrored copy the other way about.
+    near, far = (0.13, 0.42), (0.58, 0.87)
+    quad = 'mesh "q" { file "%s/tquad.obj"  material mt  uv use_mesh }' % d
     cases = {
-        # name: (map, the type and its parameters, quad, (view, eye, sun) ...)
-        "behind_cross": ("tiltT", "translucent reflect 0.3  transmit 0.3", "tquad",
-                         (("front", "0 0 6", "-0.8 0 0.6"), ("back", "0 0 -6", "0.8 0 -0.6"))),
-        "behind_opaque": ("tilt", "diffuse reflect 0.3", "tquad",
-                          (("front", "0 0 6", "0 0.8 0.6"), ("back", "0 0 -6", "0 0.8 -0.6"))),
-        "wound": ("tilt", "diffuse reflect 0.3", "tquad_rev", (("front", "0 0 6", "0 0.8 0.6"),)),
+        # name: (map, the type and its parameters, the mapped geometry, (view, eye, sun, box) ...)
+        "behind_cross": ("tiltT", "translucent reflect 0.3  transmit 0.3", quad,
+                         (("front", "0 0 6", "-0.8 0 0.6", near), ("back", "0 0 -6", "0.8 0 -0.6", far))),
+        "behind_opaque": ("tilt", "diffuse reflect 0.3", quad,
+                          (("front", "0 0 6", "0 0.8 0.6", near), ("back", "0 0 -6", "0 0.8 -0.6", far))),
+        # tilted along T, the sun off to +T on the viewer's side both ways
+        "behind_opaque_T": ("tiltT", "diffuse reflect 0.3", quad,
+                            (("front", "0 0 6", "0.8 0 0.6", near), ("back", "0 0 -6", "0.8 0 -0.6", far))),
+        "wound": ("tilt", "diffuse reflect 0.3",
+                  'mesh "q" { file "%s/tquad_rev.obj"  material mt  uv use_mesh }' % d,
+                  (("front", "0 0 6", "0 0.8 0.6", near),)),
+        # placed by a mirroring transform (x -> -x): v still grows up it
+        "mirrored": ("tilt", "diffuse reflect 0.3",
+                     'mesh_asset "qa" { file "%s/tquad.obj"  material mt  uv use_mesh }\n'
+                     'mesh_instance { of "qa"  scale -1 1 1 }' % d,
+                     (("front", "0 0 6", "0 0.8 0.6", far),)),
     }
-    for case, (nmap, mtype, qobj, views) in cases.items():
-        for view, eye, sun in views:
+    for case, (nmap, mtype, geom, views) in cases.items():
+        for view, eye, sun, _ in views:
             write_lines(os.path.join(d, "%s_%s.ftsl" % (case, view)), [
                 'camera "c" { eye %s  look_at 0 0 0  up 0 1 0  fov_y 25  film { res 200 200 } }' % eye,
                 'texture "nt" { file "%s/%s.ppm"  encoding linear  filter bilinear  wrap repeat }' % (d, nmap),
                 'material "mt" { type %s  normal_map texture:nt }' % mtype,
                 'material "plain" { type %s }' % mtype,
                 'light sun { dir %s  angle 0.53  spd blackbody 5800  intensity 1e-13 }' % sun,
-                'mesh "q" { file "%s/%s.obj"  material mt  uv use_mesh }' % (d, qobj),
+                geom,
                 'mesh "r" { file "%s/ref.obj"  material plain }' % d])
     return cases
 
@@ -179,16 +197,18 @@ def main():
                              "from behind the relief is mirrored along T, not the same relief"),
             "behind_opaque": ("brighter", lambda e: e > 1.1,
                               "from behind the relief does not face the viewer as authored"),
-            "wound": ("brighter", lambda e: e > 1.1, "wound against its normals, the slope along v is mirrored")}
+            "behind_opaque_T": ("brighter", lambda e: e > 1.1,
+                                "from behind the relief's slope along T does not face the viewer as authored"),
+            "wound": ("brighter", lambda e: e > 1.1, "wound against its normals, the slope along v is mirrored"),
+            "mirrored": ("brighter", lambda e: e > 1.1, "under a mirroring transform the slope along v is mirrored")}
     for name, args in (("cpu preview", ["-raster", "-device", "cpu"]), ("gpu preview", ["-raster", "-device", "gpu"]),
                        ("cpu mode R", ["-mode", "R", "-device", "cpu", "-spp", "64"]),
                        ("gpu mode R", ["-mode", "R", "-device", "gpu", "-spp", "64"])):
         tag = name.replace(" ", "_")
         for case, (_, _, _, views) in cases.items():
             effs = []
-            for view, _, _ in views:
+            for view, _, _, (x0, x1) in views:
                 img = run(a.exe, "%s/%s_%s.ftsl" % (d, case, view), "%s/%s_%s_%s.png" % (d, case, view, tag), args)
-                x0, x1 = (0.13, 0.42) if view == "front" else (0.58, 0.87)
                 effs.append(box(img, x0, x1, 0.16, 0.43) / max(1e-9, box(img, 0.40, 0.60, 0.58, 0.85)))
             word, test, why = want[case]
             good = all(test(e) for e in effs)

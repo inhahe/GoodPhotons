@@ -151,6 +151,23 @@ inline bool seenFromBehind(const PTri& t, const Vec3& eye) {
     return dot(t.n0, eye - t.p0) < 0.0 && dot(t.n1, eye - t.p1) < 0.0 && dot(t.n2, eye - t.p2) < 0.0;
 }
 
+// A mesh triangle's normal-map handedness for the preview (PTri::tanSign): about the side its
+// vertex normals face, where the shade pass builds the frame (the tracers keep it about the
+// winding, Tri::bitangentSign, and turn it per hit). `handSign`: an instance's -1 for a
+// mirroring transform (MeshInstance::handSign), else 1 -- the preview's frame is in the world.
+inline float previewTanSign(const Tri& t, double handSign) {
+    const bool againstWinding = dot(t.gn, t.n0 + t.n1 + t.n2) < 0.0;
+    return (float)((againstWinding ? -t.bitangentSign : t.bitangentSign) * handSign);
+}
+
+// -1 where a pixel's frame normal `No` lies on the far side of the face from its vertex
+// normals' sum -- a face whose vertex normals straddle it -- so the frame keeps dP/dv there,
+// as intersectTri's per-hit turn of the sign does.
+inline double straddleSign(const PTri& t, const Vec3& No) {
+    const Vec3 fw = cross(t.p1 - t.p0, t.p2 - t.p0);
+    return ((dot(fw, t.n0 + t.n1 + t.n2) < 0.0) != (dot(fw, No) < 0.0)) ? -1.0 : 1.0;
+}
+
 // Tessellated preview geometry plus the side tables its triangles index. Bundled so the
 // two cannot be handed around separately and fall out of sync: a PTri's `mix` index is
 // only meaningful against the `mixes` built in the same tessellate() call.
@@ -1169,7 +1186,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
         p.n0 = t.n0; p.n1 = t.n1; p.n2 = t.n2;
         applyMat(p, t.matId);
         p.uv0 = t.uv0; p.uv1 = t.uv1; p.uv2 = t.uv2;
-        p.tanSign = (float)t.bitangentSign;            // the tracers' own handedness
+        p.tanSign = previewTanSign(t, 1.0);
         copyVcol(p, t);
         out.push_back(p);
     }
@@ -1488,7 +1505,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             p.n2 = normalize(inst.toWorld.applyNormal(t.n2));
             applyMat(p, matId);
             p.uv0 = t.uv0; p.uv1 = t.uv1; p.uv2 = t.uv2;   // UVs are instance-invariant
-            p.tanSign = (float)t.bitangentSign;            // as the tracers keep it per instance
+            p.tanSign = previewTanSign(t, inst.handSign);
             copyVcol(p, t);                                // so are vertex colours
             out.push_back(p);
         }
@@ -2698,7 +2715,7 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                     double tl = std::sqrt(dot(T, T));
                     if (tl > 1e-12) {
                         T = T * (1.0 / tl);
-                        Vec3 B3 = cross(No, T) * (double)pt.tanSign;   // mirrored UVs: -1
+                        Vec3 B3 = cross(No, T) * ((double)pt.tanSign * straddleSign(pt, No));   // mirrored UVs: -1
                         Vec3 tn = nx.sampleNormalTS(g.uv[i].x, g.uv[i].y);
                         const double s3 = (behind && pt.patOwnSide) ? -sh->normalStrength : sh->normalStrength;
                         Vec3 pert = T * (tn.x * s3) + B3 * (tn.y * s3) + N3 * tn.z;
