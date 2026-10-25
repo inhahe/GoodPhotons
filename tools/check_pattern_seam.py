@@ -35,6 +35,14 @@ the two is exactly the fraction of its hits that read the outside of the step, w
 all of them. (A mix of two colours would not do: a pixel reads 3x off only once most of its
 hits are wrong.)
 
+And which side a pattern reads (FTSL 6.1), in the backward and bidirectional tracers and the
+preview on each device: under step(0, ny), a floor facing up and over its middle a square
+facing down, seen from above. An opaque pair reads the side the eye sees, so its two windings
+show the same cell; a pair light can cross reads its own side's, so the square reads ny = -1
+-- from behind -- and shows the other cell: a mix of translucents, a mix with one translucent
+layer, and a mix whose opaque layer carries the pattern itself (every pattern on a surface
+follows its material's rule, whichever layer a renderer picked there).
+
 Exits 0 when everything holds, 1 otherwise.
 """
 import argparse
@@ -92,6 +100,30 @@ GLOW = {
     'iso_far30k': (RADIAL, 'isosurface { material glow  sphere { center 0 0 0  radius 0.5 } }', FAR30K_CAM),
     'curve_far30k': (TUBE, TUBE_BODY, FAR30K_CAM),
 }
+# Which side a pattern reads (FTSL 6.1): step(0, ny) picks a mix's first, pale layer where ny
+# is +1 and its dark one where it is -1. Seen from above, an opaque floor reads the side the eye
+# sees whichever way it faces; a floor light can cross reads its own side's, so facing down it
+# reads ny = -1 from above. The crossable layers reflect and transmit alike, so which hemisphere
+# a renderer calls the front changes nothing but the cell. Both windings in one frame -- a
+# floor facing up, and over its middle, a millimetre above it, a square facing down -- since
+# the preview meters each frame for itself: alone, a dark floor previews as grey as a pale one.
+SIDE = 'step(0, ny)'
+# Each pair's material, and whether light crosses it: the opaque `floor`; `cross`, both layers
+# translucent; `mixed`, only its second (the preview bakes its opaque first in); `child`, a
+# constant mix whose opaque first layer's own reflect_map reads ny -- under the mix's rule, as
+# every pattern on the surface is, however the renderer picked the layer (a BDPT connection
+# rebuilds the hit from the layer's vertex).
+SIDE_MATS = '''material "tpale" { type translucent  reflect 0.45  transmit 0.45 }
+material "tdark" { type translucent  reflect 0.03  transmit 0.03 }
+material "cross" { type mix  layer "tpale" 0.5  layer "tdark" 0.5  weight_map pattern:p }
+material "mixed" { type mix  layer "pale" 0.5  layer "tdark" 0.5  weight_map pattern:p }
+material "pd"    { type diffuse  reflect rgb 0.8 0.8 0.8  reflect_map pattern:p }
+material "child" { type mix  layer "pd" 0.5  layer "tdark" 0.5 }
+'''
+SIDE_BODY = ('quad { origin -1 0 -1  u 0 0 2  v 2 0 0  material %s }\n'
+             'quad { origin -0.4 0.001 -0.4  u 0.8 0 0  v 0 0 0.8  material %s }\n')
+SIDE_CROSSES = {'floor': False, 'cross': True, 'mixed': True, 'child': True}
+SIDE_NAMES = tuple(f'side_{m}' for m in SIDE_CROSSES)
 
 
 def read_pfm(p):
@@ -139,6 +171,8 @@ def scenes(out):
     for name, (expr, body, cam) in GLOW.items():
         texts[name] = head(expr, cam) + body + '\n'
         texts[name + '_one'] = head('1', cam) + body + '\n'
+    for mat in SIDE_CROSSES:
+        texts[f'side_{mat}'] = head(SIDE) + SIDE_MATS + SIDE_BODY % (mat, mat)
     paths = {}
     for name, text in texts.items():
         paths[name] = os.path.join(out, name + '.ftsl')
@@ -146,13 +180,13 @@ def scenes(out):
     return paths
 
 
-def render(exe, out, scene, name, dev):
-    png = os.path.join(out, f'{name}_{dev}.png')
+def render(exe, out, scene, name, dev, mode='R'):
+    png = os.path.join(out, f'{name}_{dev}.png' if mode == 'R' else f'{name}_{mode}_{dev}.png')
     pfm = png[:-4] + '.pfm'
     for stale in (png, pfm):
         if os.path.exists(stale):
             os.remove(stale)
-    cmd = [exe, '-in', scene, '-hdr', '-no-meter', '-seed', '3', '-mode', 'R', '-spp', '64', '-device', dev,
+    cmd = [exe, '-in', scene, '-hdr', '-no-meter', '-seed', '3', '-mode', mode, '-spp', '64', '-device', dev,
            '-o', png]
     r = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
     if r.returncode != 0 or not os.path.exists(pfm):
@@ -307,6 +341,38 @@ def main():
         mid = (slice(h // 10, h - h // 10), slice(w // 10, w - w // 10))
         off = off3x(rb[mid], ru[mid], 1e-6)
         report(off < 0.02, f'big raster {dev.upper()}: {off * 100:.2f}% of pixels 3x off the up-facing quad\'s')
+
+    # Which side a pattern reads, in each renderer -- the backward tracer (R), the bidirectional
+    # one (D), whose connections rebuild a hit from its vertex, and the preview: the square
+    # facing down (seen from behind) over the floor round it facing up (from the front). The
+    # square spans the middle 39% of the frame each way, the floor 97%: the middle 24% against
+    # a ring from 55% to 85% out. An opaque pair reads the same cell; a crossable pair its two
+    # cells, the square the dark (0.03 against 0.45; `child`'s square has only its translucent
+    # half's 0.03 to reflect).
+    def down_over_up(img):
+        h, w = img.shape
+        yy, xx = np.mgrid[0:h, 0:w]
+        r = np.maximum(np.abs((yy + 0.5) / h * 2 - 1), np.abs((xx + 0.5) / w * 2 - 1))
+        return float(img[r < 0.24].mean()) / max(float(img[(r > 0.55) & (r < 0.85)].mean()), 1e-30)
+    for dev in devices:
+        for kind in ('R', 'D', 'raster'):
+            for n in SIDE_NAMES:
+                if kind == 'R':
+                    img = imgs.get((n, dev))
+                elif kind == 'D':
+                    img = render(exe, a.out, paths[n], n, dev, 'D')
+                else:
+                    img = render_raster(exe, a.out, paths[n], n, dev)
+                label = f'side {kind:6s} {dev.upper()} {n[5:]:6s}'
+                if img is None:
+                    report(False, f'{label}: did not render')
+                    continue
+                ratio = down_over_up(img)
+                if SIDE_CROSSES[n[5:]]:
+                    report(ratio < 1 / 3, f'{label}: facing down over facing up {ratio:.3f} '
+                                          f'(its own side\'s cell, the dark)')
+                else:
+                    report(1 / 1.5 < ratio < 1.5, f'{label}: facing down over facing up {ratio:.3f} (the same cell)')
     print('PASS' if ok else 'FAIL')
     return 0 if ok else 1
 

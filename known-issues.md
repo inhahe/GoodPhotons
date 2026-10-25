@@ -168,19 +168,28 @@ the hair is 2e-6 of the triangle's reach (its farthest vertex from the origin, `
 baked at upload, `Hit::pscale` on the host), some 17 float ulps of the coordinates the hit was
 computed from. CHECKER-ON-BOUNDARY above has the measurements.
 
-## OPEN (2026-10-24, 0.399.9): PATTERN-NORMAL-SIDE — the normal and curvature a pattern sees face the ray, so they differ with the side a transmissive surface is crossed from
+## DONE (2026-10-25, 0.400.0): PATTERN-NORMAL-SIDE — the normal, curvature and cavity a pattern sees differed with the side a transmissive surface is crossed from
 
-A pattern reads its position just outside the surface whichever side the ray comes from
-(CHECKER-ON-BOUNDARY), but its `nx`, `ny`, `nz` are the shading normal turned to face the ray,
-and `curv` is signed toward the side being shaded (`patCtxFromHit` passes `h.n` and `h.curv`).
-On a transmissive surface (glass, `transmit`, a roughness or ior pattern) a pattern reading
-those -- `step(0, ny)`, a curvature-driven roughness -- takes a different value for light crossing
-it one way than the other: forward, backward and bidirectional modes then integrate different
-things, and BDPT/VCM's MIS weights combine them. **Fix:** hand patterns the normal and
-curvature on the surface's own side (`h.n` turned to `h.ng`'s side; `curv` with the outward
-sign), as the position already is. That changes what existing scenes see on the far side of
-thin geometry -- `step(0.7, ny)` snow on a roof would cover its underside too -- so it is a
-decision about what `ny` means, not only a fix; the user's to make.
+`patCtxFromHit` handed patterns the shading normal turned to face the ray (`nx ny nz`), the
+curvature signed toward the shaded side (`curv`) and the occlusion of the hemisphere in front
+of the viewer (`cavity`). On a surface light can cross, a pattern reading them took a different
+value for light crossing one way than the other, so forward, backward and bidirectional modes
+integrated different things and BDPT/VCM's MIS combined them. Decided with the user: they now
+take the surface's own side (the side ng faces) on a surface light can cross --
+`Material::patOwnSide`: a dielectric plain or coated, half mirror, filter, translucent, or a mix
+/ layered stack with such a part -- whenever the ray came from behind. Decided once
+per hit, with the surface's own material, at the closest-hit choke points (`Hit::patOwnSide`,
+before the normal map can tip n), so every pattern on the surface follows it: a mix's opaque
+part's too, and on a GPU BDPT / VCM connection, which rebuilds the hit from a vertex holding the
+part's material. Not everywhere: on an opaque surface light leaves on the side it arrived, so the
+shaded side is already reciprocal, and with two-sided shading the winding -- the default `quad`
+faces down -- would otherwise decide what `ny` reads on every floor. CPU and GPU tracers and
+both previews (each preview triangle carries its own material's flag, not that of the part whose
+payload a mix bakes in). `-checkpatops` (normal and curvature on glass, a mix holding glass,
+and opaque, from either side, read as the surface's material and as its part's) and
+`-checkcavity` S11 fail without it; `-checkdevhits` holds the GPU's side to the CPU's;
+tools/check_pattern_seam.py renders four pairs of windings in modes R and D and the preview on
+both devices.
 
 ## DONE (2026-10-24, 0.399.9): MESHLIGHT-SIDE — a mesh light wound against its vertex normals emitted, for NEE and photons, from the side its hits did not
 

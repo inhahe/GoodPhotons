@@ -199,6 +199,13 @@ struct Hit {
     // be far smaller on a big triangle; and over one primitive the reach is constant, so the
     // hair is too. Every intersector writes it (the record is reused across candidates).
     double pscale = 0.0;
+    // Patterns here see the surface's own side (patCtxFromHit): the ray arrived from behind ng,
+    // so the intersector turned n to face it, onto a surface light can cross
+    // (Material::patOwnSide). Decided once, by Scene::markPatSide at the closest-hit choke
+    // points: before the normal map, which can tip n across the surface's plane, and with the
+    // surface's own material -- the rule is the surface's, so a mix that later resolves to an
+    // opaque part keeps it for that part's patterns too.
+    bool patOwnSide = false;
     // Barycentric-interpolated per-vertex colour at the hit (linear RGB), when the
     // triangle carried one. Resolved by the intersector, which is the only place that
     // has both the triangle and the barycentrics; everything downstream reads it off the

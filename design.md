@@ -7301,9 +7301,26 @@ as the one at fault.
     ray's: 0.399.7 read the ray's side, which made the point a transmissive surface's
     pattern is read at differ with the direction light crossed it (non-reciprocal: forward,
     backward and BDPT strategies integrated different things) and turned on the shading
-    normal's orientation, which normal maps and instances tip. (The normal and curvature a
-    pattern sees, `nx`/`ny`/`nz`/`curv`, still face the ray: known-issues
-    PATTERN-NORMAL-SIDE.) Sites: host `patCtxFromHit` (every host pattern read at a hit),
+    normal's orientation, which normal maps and instances tip. The normal, curvature and
+    cavity a pattern sees (`nx`/`ny`/`nz`/`curv`/`cavity`) follow the same idea only where it
+    matters (0.400.0): on a surface light can cross (`Material::patOwnSide`, set by
+    `Scene::finalizePatternSides`: a dielectric plain or coated, half mirror, filter,
+    translucent, or a mix / layered stack with such a part -- a part is never a stack itself,
+    the loader refuses one) they are the surface's own side's whenever the ray came from behind; elsewhere the
+    shaded side's. Decided once per hit, at the closest-hit choke points (`Scene::markPatSide`
+    and the device closestHit set `Hit::patOwnSide` / `DHit::patOwnSide`), before normal
+    mapping tips n and with the surface's own material -- the rule is the surface's, so every
+    pattern on it follows it, a mix's opaque part's too. That is why it rides on the hit
+    rather than being looked up at each read: the host keeps the mix's matId on a hit whose
+    mix resolved to a part, but a GPU BDPT / VCM vertex holds the part's, and a connection
+    rebuilds its hit from the vertex (`DVertex::patOwnSide`, `DVcmLV::patOwnSide` carry it).
+    An opaque surface returns light on the side it
+    arrived, so the shaded side is reciprocal there, and two-sided shading means the winding
+    -- which the default `quad` points down -- must not decide what `ny` reads; on a surface
+    light crosses the winding already decides inside from outside. The previews take it per
+    triangle from the triangle's own material (`PTri::patOwnSide`), not from the part whose
+    payload a mix bakes onto it, and turn the normal on a triangle the eye sees from behind.
+    Sites: host `patCtxFromHit` (every host pattern read at a hit),
     `emitterPatMulAt` (a point the emitter sampler drew, along nOut -- the side a one-sided
     emitter's ng faces -- with the hair sized by the patch it was drawn on, which
     `Emitter::samplePoint` reports: an `EmitTri`'s own reach, the half of a quad its point
@@ -7349,7 +7366,8 @@ as the one at fault.
     the point (0.399.8; 0.399.7's double Newton/secant polish of it went). That search keeps
     the march's end values -- a far camera's march can misjudge the step's end, never its
     start, which is the last point it found outside, so the search can only end outside:
-    from about 3000 m and 30 km, adaptive and fixed-step, no hit reads inside -- and stops
+    from about 3000 m and 30 km, adaptive and fixed-step, no hit reads inside, and
+    -checkdevhits finds every far hit within the hair of the host's surface -- and stops
     once the bracket is an ulp of b long (without the stop, s, starting at 0, halved on
     through float's finer spacing to the 48-step cap and cost a gyroid room 18 %; with it the
     room renders 1 % faster than the unrecentred search did). A GPU curve hit is its
@@ -7366,12 +7384,25 @@ as the one at fault.
     them, and a sphere from 2.2 m and a sphere, an isosurface and a curve from about 3000 m
     and 30 km along a direction with no symmetry, as emitters against the same surface
     glowing evenly (a pixel's ratio is then exactly the fraction of its hits reading outside
-    the step). `pattern_gen::checker` and loom's two checkers had their walls shifted a
+    the step); and, for the side rule, a floor facing up with a square facing down over it
+    under `step(0, ny)`, opaque and in three mixes light can cross (one baking its opaque part
+    into the preview, one whose opaque part carries the pattern), in modes R and D and the preview -- one frame,
+    since the preview meters each frame for itself. `pattern_gen::checker` and loom's two checkers had their walls shifted a
     thousandth of a cell (0.398.1-0.399.7); on a wall the nudge carries toward its lower
     cell, that read the shifted cell near the origin and the nudged one farther out -- a
     ring -- so it went in 0.399.8. Two load-time probes that warned of a pattern splitting a
     surface (0.399.3's, then `warnPatternsSplitBySteps` in 0.399.6) went when the nudge made
     what they looked for impossible.
+  * **The GPU's intersectors are held to the CPU's** by `-checkdevhits` (`cudaHitProbe`,
+    kernel `kHitProbe`): one small scene with every primitive kind, opaque and glass, and an
+    instanced smooth mesh; rays from either side, from 3 km and into the instance's silhouette
+    band; every field of every hit compared (the point within the float ray's own precision,
+    the pattern's read point as a height above the host's surface), and each device intersector
+    alone on a record full of another primitive's values. A float ray is itself only known to
+    a few ulps of its reach, so from 3 km the two devices meet a surface ~1e-4 apart along it;
+    the check measures the read point's height above the host's surface by casting from it
+    along the normal both ways, which no shift along the surface (nor a far isosurface's
+    coarse gradient normal) disturbs.
   * **A hit record is reused across candidates.** The closest-hit loops (host and device) hand
     one Hit/DHit to every primitive they test; each intersector that accepts writes every field
     a hit on its primitive owns -- `pscale`, the tangent frame, `fiberRadius`, the vertex

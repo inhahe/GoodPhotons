@@ -416,6 +416,12 @@ struct Material {
     // a patterned material that never says `cavity` fires none. See the long note on
     // setupCavity for why a scene-wide flag would not do.
     bool readsCavity = false;
+    // Light can cross this surface: a dielectric (plain or coated), half mirror, filter or
+    // translucent, or a mix / layered stack with such a part. Its patterns see the normal,
+    // curvature and cavity of the surface's own side (the side ng faces) whichever side a ray
+    // arrives from, so a crossing reads the same value both ways (reciprocity); every other
+    // surface's see the side being shaded. Set by Scene::finalizePatternSides.
+    bool patOwnSide = false;
 
     // --- Layered (MatType::Layered): a specular coat over a weighted body -------
     // Physical two-layer stack (spec §3.2). The COAT is a reflect-or-enter interface
@@ -3183,8 +3189,28 @@ struct Scene {
         // a glass that absorbs only between the carriers' bin centres still absorbs.
         const int nm = (int)(LAMBDA_MAX - LAMBDA_MIN);
         for (auto& m : mats) m.absorbChroma = variesOverBand([&](double L) { return m.absorb(L); }, nm);
+        finalizePatternSides();   // after the coats, which append body copies
     }
     void finalizeTris() { build(); }   // kept for existing call sites
+
+    // Material::patOwnSide for every material: light can cross it -- a dielectric, plain or
+    // coated, a half mirror, a filter, a translucent -- or it is a mix or layered stack with
+    // such a part (a layered stack whose bodies are opaque returns light on the side it came).
+    // A part is never a mix or layered stack itself (the loader refuses one), so its type
+    // decides.
+    void finalizePatternSides() {
+        auto crosses = [](MatType t) {
+            return t == MatType::Dielectric || t == MatType::ThinFilm || t == MatType::Multilayer ||
+                   t == MatType::HalfMirror || t == MatType::Filter || t == MatType::DiffuseTransmit;
+        };
+        for (auto& m : mats) {
+            bool own = crosses(m.type);
+            if (m.type == MatType::Mix || m.type == MatType::Layered)
+                for (int c : m.mixChildren)
+                    if (c >= 0 && c < (int)mats.size() && crosses(mats[c].type)) own = true;
+            m.patOwnSide = own;
+        }
+    }
 
     // Scene-ignore flags (Stage 3): cheaply strip expensive features from an
     // already-built scene so the previewer / -explore can trade physical
@@ -3515,8 +3541,16 @@ struct Scene {
                 [&](int lp, double& tm) { leaf(noHairPrim[lp], tm); }, stats);
         else
             bvh.traverseClosest(r, tmin, tMax, leaf, stats);
+        markPatSide(h);   // before the normal map tips n
         applyNormalMap(h);
         return h;
+    }
+
+    // Hit::patOwnSide for a hit whose n the intersector turned to face the ray: from behind ng,
+    // onto a surface (its own material, h.matId here) light can cross.
+    void markPatSide(Hit& h) const {
+        h.patOwnSide = h.valid && dot(h.n, h.ng) < 0.0 && h.matId >= 0 && h.matId < (int)mats.size() &&
+                       mats[h.matId].patOwnSide;
     }
 
     // Is anything blocking the segment from o toward dir, before maxDist?
@@ -3892,6 +3926,7 @@ struct Scene {
                 h = lh;
             }
         }
+        markPatSide(h);   // before the normal map tips n
         applyNormalMap(h);
         return h;
     }
@@ -4022,13 +4057,15 @@ inline void bindPatScene(PatCtx& c, const Scene& s) {
 // the point, and that is a cosine-weighted integral over the hemisphere. It also puts
 // samples where the geometry actually occludes rather than wasting them near the
 // grazing ring.
-inline double cavityAt(const Scene& scene, const Hit& h) {
+// `up`, when given, is the hemisphere's axis instead (patCtxFromHit passes the surface's own
+// side for a surface light can cross).
+inline double cavityAt(const Scene& scene, const Hit& h, const Vec3* up = nullptr) {
     const int N = scene.cavitySamples;
     if (N <= 0 || scene.cavityRadius <= 0.0) return 0.0;
     // Probe about the GEOMETRIC normal on the shaded side: using the shading normal
     // would let an interpolated normal tilt the hemisphere into the surface on a
     // coarse mesh and self-report occlusion that is not there.
-    const Vec3 n = orientedGeoN(h);
+    const Vec3 n = up ? *up : orientedGeoN(h);
     Vec3 t, b;
     onb(n, t, b);
     // Offset along the normal by a hair to avoid re-hitting the surface we sit on.
@@ -4052,9 +4089,18 @@ inline double cavityAt(const Scene& scene, const Hit& h) {
 
 // Build a procedural-pattern evaluation context from a hit: world point (x,y,z) -- the hit
 // moved a hair off the surface along h.ng (patNudgedPoint says why) --, implicit field
-// value f (0 on non-implicit surfaces), oriented normal, radius, and the scene's pattern
-// tables (so `tex:<name>(u,v)` and `grid:<name>(…)` sampling inside a pattern work).
+// value f (0 on non-implicit surfaces), normal, curvature, cavity, radius, and the scene's
+// pattern tables (so `tex:<name>(u,v)` and `grid:<name>(…)` sampling inside a pattern work).
+//
+// The normal, curvature and cavity are those of the side being shaded -- the normal facing
+// the ray, a bulge positive -- except on a surface light can cross (Material::patOwnSide),
+// where they are the surface's own side's (the side ng faces) whichever way the ray came:
+// light crossing it either way must read the same value (reciprocity: forward, backward and
+// bidirectional estimators integrate the same thing). On an opaque surface light leaves on
+// the side it arrived, so the shaded side is reciprocal already, and the winding -- which
+// nothing else there shows, under two-sided shading -- does not decide what `ny` reads.
 inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
+    const bool own = h.patOwnSide;   // decided at the hit, with the surface's material (markPatSide)
     // `cavity` is filled here rather than by the intersector because it needs the whole
     // scene, and cached on the Hit because one shading point builds several PatCtxs.
     // Doubly gated — scene-wide (one compare for the overwhelming majority of scenes,
@@ -4064,12 +4110,13 @@ inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
     if (scene.needsCavity && !h.cavityDone &&
         h.matId >= 0 && h.matId < (int)scene.mats.size() &&
         scene.mats[h.matId].readsCavity) {
-        h.cavity = cavityAt(scene, h);
+        h.cavity = own ? cavityAt(scene, h, &h.ng) : cavityAt(scene, h);
         h.cavityDone = true;
     }
     Vec3 q;
     patNudgedPoint(h.p.x, h.p.y, h.p.z, h.ng.x, h.ng.y, h.ng.z, h.pscale, q.x, q.y, q.z);
-    PatCtx c = makePatCtx(q, h.fieldVal, h.n, h.u, h.v, h.curv, h.cavity, h.fw);
+    PatCtx c = makePatCtx(q, h.fieldVal, own ? h.n * -1.0 : h.n, h.u, h.v, own ? -h.curv : h.curv,
+                          h.cavity, h.fw);
     bindPatScene(c, scene);
     return c;
 }

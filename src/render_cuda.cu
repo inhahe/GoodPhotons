@@ -443,6 +443,7 @@ struct DMaterial {
     // note there and on ftsl::setupCavity: without it, one cavity-driven material would
     // charge cavitySamples occlusion rays to every OTHER patterned surface in the scene.
     int    readsCavity;
+    int    patOwnSide;      // Material::patOwnSide: patterns see the surface's own side
     DSpec  reflect;     // baked reflect spectrum
     DSpec  ior;         // baked index spectrum
     DSpec  substrateK;  // baked thin-film substrate extinction kappa (0 = transparent)
@@ -3472,6 +3473,10 @@ struct DHit {
     // triangle, sphere and curve intersectors and the instance mapping; 0 (the point's own
     // distance stands in) elsewhere.
     Real pscale = (Real)0;
+    // Hit::patOwnSide's twin: patterns here see the surface's own side. Decided once, by
+    // closestHit, before the normal map and with the surface's own material; a BDPT / VCM
+    // vertex carries it, since it holds the material a mix resolved to and rebuilds its hit.
+    bool patOwnSide = false;
 };
 
 // ---- implicit field evaluation (device twin of implicit.h) ----------------
@@ -4499,6 +4504,8 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
         }
     }
     if (hInst >= 0) instanceHitToWorld(sc.instances[hInst], h);
+    // Before the normal map tips n (host twin Scene::markPatSide).
+    h.patOwnSide = h.valid && dot(h.n, h.ng) < (Real)0 && h.matId >= 0 && sc.mats[h.matId].patOwnSide;
     dApplyNormalMap(sc, h);   // C6: perturb shading normal by a bound normal map
     return h;
 }
@@ -4842,13 +4849,14 @@ __device__ static inline Real shadowTransmittanceTo(const DScene& sc, const DVec
 // Deliberately NOT a pattern-VM function: DPatEnvT carries only sampler tables, and
 // giving the VM a scene/BVH pointer to call through would cost far more than a
 // variable slot. See the design note in todo.md O3 stage 2.
-__device__ static double dCavityAt(const DScene& sc, const DHit& h) {
+// `ownSide`: probe about ng itself, the surface's own side (host twin cavityAt's `up`).
+__device__ static double dCavityAt(const DScene& sc, const DHit& h, bool ownSide = false) {
     const int N = sc.cavitySamples;
     if (N <= 0 || sc.cavityRadius <= 0.0) return 0.0;
     // Shaded-side geometric normal (orientedGeoN twin): the interpolated shading
     // normal could tilt the hemisphere into a coarse mesh and self-report occlusion.
     double nx = (double)h.ng.x, ny = (double)h.ng.y, nz = (double)h.ng.z;
-    if (nx * (double)h.n.x + ny * (double)h.n.y + nz * (double)h.n.z < 0.0) {
+    if (!ownSide && nx * (double)h.n.x + ny * (double)h.n.y + nz * (double)h.n.z < 0.0) {
         nx = -nx; ny = -ny; nz = -nz;
     }
     // Duff et al. branchless ONB — inlined from linalg.h onb() for bit-parity.
@@ -4888,7 +4896,7 @@ __device__ static inline double dCavityOf(const DScene& sc, const DHit& h) {
     // nothing even in a scene that does.
     if (!sc.needsCavity) return 0.0;
     if (h.matId < 0 || !sc.mats[h.matId].readsCavity) return 0.0;
-    if (!h.cavityDone) { h.cavity = (Real)dCavityAt(sc, h); h.cavityDone = true; }
+    if (!h.cavityDone) { h.cavity = (Real)dCavityAt(sc, h, h.patOwnSide); h.cavityDone = true; }
     return (double)h.cavity;
 }
 
@@ -9396,20 +9404,23 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
 }
 // The point a pattern reads at hit h, and its distance r from the origin: the hit moved a
 // hair off the surface along h.ng (host twin patCtxFromHit; pattern.h patNudgedPoint says why).
-__device__ static inline void dPatPoint(const DHit& h, double& px, double& py, double& pz, double& r) {
+// `side` multiplies the normal and curvature the pattern sees: -1 where h.patOwnSide turns them
+// to the surface's own side, else 1.
+__device__ static inline void dPatPoint(const DHit& h, double& px, double& py, double& pz, double& r, double& side) {
     patNudgedPoint((double)h.p.x, (double)h.p.y, (double)h.p.z, (double)h.ng.x, (double)h.ng.y, (double)h.ng.z,
                    (double)h.pscale, px, py, pz);
     r = sqrt(px * px + py * py + pz * pz);
+    side = h.patOwnSide ? -1.0 : 1.0;
 }
 // Evaluate a bound pattern at a hit (device twin of patternScalarAt/patCtxFromHit).
 // The implicit field value f is 0 (like the CPU: intersectImplicit never sets it), so
 // the `f` variable is 0 at surfaces on both backends.
 __device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit& h) {
     const DPattern& p = sc.patterns[pat];
-    double px, py, pz, r;
-    dPatPoint(h, px, py, pz, r);
+    double px, py, pz, r, side;
+    dPatPoint(h, px, py, pz, r, side);
     return dPatternEval(sc.patNodes + p.off, p.n, px, py, pz, 0.0,
-                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw, dPatEnvOf(sc));
+                        side * h.n.x, side * h.n.y, side * h.n.z, r, h.u, h.v, side * h.curv, dCavityOf(sc, h), h.fw, dPatEnvOf(sc));
 }
 
 // Fritsch-Carlson monotone-cubic tangent at node k (device twin of recFCTangent).
@@ -9426,10 +9437,10 @@ __device__ static double dRecFCTangent(const double* pos, const double* sec, int
 // Evaluate one scalar-record stop's per-hit expression program at the hit.
 __device__ static double dRecStopVal(const DScene& sc, const DRecScalarStop& s, const DHit& h) {
     if (s.exprN <= 0) return 0.0;
-    double px, py, pz, r;
-    dPatPoint(h, px, py, pz, r);
+    double px, py, pz, r, side;
+    dPatPoint(h, px, py, pz, r, side);
     return dPatternEval(sc.recDrivers + s.exprOff, s.exprN, px, py, pz, 0.0,
-                        h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw, dPatEnvOf(sc));
+                        side * h.n.x, side * h.n.y, side * h.n.z, r, h.u, h.v, side * h.curv, dCavityOf(sc, h), h.fw, dPatEnvOf(sc));
 }
 // Sample a scalar record channel at driver position `d` (device twin of recSampleScalar):
 // evaluate each stop's per-hit expression, then interpolate by the record's interp mode.
@@ -9474,18 +9485,18 @@ __device__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, co
     if (m.recRoughMode < 0) return false;
     double v;
     if (m.recRoughMode == 0) {                             // direct scalar expression
-        double px, py, pz, r;
-        dPatPoint(h, px, py, pz, r);
+        double px, py, pz, r, side;
+        dPatPoint(h, px, py, pz, r, side);
         v = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
-                         px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw,
+                         px, py, pz, 0.0, side * h.n.x, side * h.n.y, side * h.n.z, r, h.u, h.v, side * h.curv, dCavityOf(sc, h), h.fw,
                          dPatEnvOf(sc));
     } else if (m.recRoughMode == 1) {                      // constant selStop (one stop, per-hit)
         v = dRecStopVal(sc, sc.recScalarStops[m.recRoughStopOff], h);
     } else {                                               // per-hit driven
-        double px, py, pz, r;
-        dPatPoint(h, px, py, pz, r);
+        double px, py, pz, r, side;
+        dPatPoint(h, px, py, pz, r, side);
         double d = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN,
-                                px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw,
+                                px, py, pz, 0.0, side * h.n.x, side * h.n.y, side * h.n.z, r, h.u, h.v, side * h.curv, dCavityOf(sc, h), h.fw,
                                 dPatEnvOf(sc));
         v = dRecSampleScalar(sc, sc.recScalarStops + m.recRoughStopOff, m.recRoughStopN,
                              m.recRoughInterp, h, d);
@@ -9672,10 +9683,10 @@ __device__ static Real dRecReflAt(const double* coeff, int N, double lo, double 
 __device__ static bool dRecordReflect(const DScene& sc, const DMaterial& m,
                                       const DHit& h, Real lambda, Real& out, double* dOut = nullptr) {
     if (m.recReflDriven != 1) return false;
-    double px, py, pz, r;
-    dPatPoint(h, px, py, pz, r);
+    double px, py, pz, r, side;
+    dPatPoint(h, px, py, pz, r, side);
     double d = dPatternEval(sc.recDrivers + m.recReflDrvOff, m.recReflDrvN,
-                            px, py, pz, 0.0, h.n.x, h.n.y, h.n.z, r, h.u, h.v, h.curv, dCavityOf(sc, h), h.fw,
+                            px, py, pz, 0.0, side * h.n.x, side * h.n.y, side * h.n.z, r, h.u, h.v, side * h.curv, dCavityOf(sc, h), h.fw,
                             dPatEnvOf(sc));
     if (dOut) *dOut = d;                                                     // JSPEC shape
     out = dRecReflAt(sc.recCoeff + m.recReflOff, REC_LUT_N,
@@ -11816,6 +11827,9 @@ struct DVertex {
     // the hit — the two agree pointwise, which is what keeps s=0 / s=1 MIS unbiased.
     Real  emitPatW;
     int   nUp;                  // live hero wavelengths here (1 = single-λ walk / de-hero'd)
+    // The hit's DHit::patOwnSide: matId is the part a mix resolved to, so a connection
+    // rebuilding the hit from it could not decide the surface's rule again.
+    int   patOwnSide = 0;
 };
 
 // The route a vertex contributes to its path's leading chain (see c_routeOn).
@@ -11872,7 +11886,7 @@ __device__ static inline DHit dVertHit(const DVertex& vt) {
     h.p = vt.p; h.n = vt.ns; h.ng = vt.ng;
     h.matId = vt.matId; h.sensorId = -1;
     h.u = vt.u; h.v = vt.v; h.curv = vt.curv;
-    h.tangent = vt.tangent; h.fiberRadius = vt.fiberR; h.pscale = vt.pscale;
+    h.tangent = vt.tangent; h.fiberRadius = vt.fiberR; h.pscale = vt.pscale; h.patOwnSide = vt.patOwnSide != 0;
     // EVERY other field defined too. DHit has members with no default (vcol, vb0, vb1,
     // bitangentSign), and dDiffuseRho reads vcol -- which gates the per-vertex colour lookup --
     // so a reconstructed hit used to carry whatever the stack held there. vcol = -1 is "no
@@ -15990,7 +16004,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         // The strand frame and radius: dBsdfF / dBsdfPdf read them at a D_HAIR vertex (the fiber
         // BCSDF's frame), the connections' far-side clearance reads them, and fiberR > 0 is how
         // dSurfMergeSite knows a vertex sits on ANY curve primitive. 0 off a curve (DHit default).
-        v.tangent = h.tangent; v.fiberR = h.fiberRadius; v.pscale = h.pscale;
+        v.tangent = h.tangent; v.fiberR = h.fiberRadius; v.pscale = h.pscale; v.patOwnSide = h.patOwnSide ? 1 : 0;
         v.nUp = nUp;
         v.pdfFwd = dConvertDensity(pdfFwd, path[n - 1], v);
         path[n] = v; int cur = n; n++;
@@ -18972,7 +18986,9 @@ struct DVcmLV {
                            // in VCM than in every other integrator. Costs 8 B/slot after
                            // alignment (the slab goes 128 -> 136 B), which is the price
                            // of that consistency on the largest allocation in a session.
-    int    nUp;            // hero wavelengths still live here (1 == de-hero'd / single-λ)
+    // Hero wavelengths still live here (1 == de-hero'd / single-λ), and the hit's
+    // DHit::patOwnSide (DVertex::patOwnSide) -- shorts, so the slot does not grow.
+    short  nUp, patOwnSide;
     DVec3  tangent;        // fiber axis at a strand vertex (its BCSDF frame for VC / splats, 0.364.0)
     Real   fiberR;         // fiber radius (far-side clearance of a connection that ends on it); 0 off a strand
     Real   pscale;         // the hit's DHit::pscale (DVertex::pscale)
@@ -19015,14 +19031,15 @@ __device__ static inline DVertex dVertFromHit(const DHit& h, int matId) {
     v.beta = 0; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0; v.matId = matId; v.lightIdx = -1;
     v.emitPatW = (Real)1;   // BSDF-only helper vertex; never read for emission
     v.mediumG = 0; v.mediumId = -1; v.u = h.u; v.v = h.v; v.curv = h.curv;
-    v.tangent = h.tangent; v.fiberR = h.fiberRadius; v.pscale = h.pscale; return v;
+    v.tangent = h.tangent; v.fiberR = h.fiberRadius; v.pscale = h.pscale; v.patOwnSide = h.patOwnSide ? 1 : 0;
+    return v;
 }
 __device__ static inline DVertex dVertFromLV(const DVcmLV& lv) {
     DVertex v; v.type = BV_SURFACE; v.p = lv.p; v.ns = lv.ns; v.ng = lv.ng;
     v.beta = 0; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0; v.matId = lv.matId; v.lightIdx = -1;
     v.emitPatW = (Real)1;   // BSDF-only helper vertex; never read for emission
     v.mediumG = 0; v.mediumId = -1; v.u = lv.u; v.v = lv.v; v.curv = lv.curv;
-    v.tangent = lv.tangent; v.fiberR = lv.fiberR; v.pscale = lv.pscale; return v;
+    v.tangent = lv.tangent; v.fiberR = lv.fiberR; v.pscale = lv.pscale; v.patOwnSide = lv.patOwnSide; return v;
 }
 
 // Sample a scattering continuation at a surface vertex (device twin of vcm.h scatterSample).
@@ -19437,7 +19454,8 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                     lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
                     lv.matId = matId; lv.edges = edges; lv.u = h.u; lv.v = h.v; lv.curv = h.curv;
                     lv.tangent = h.tangent; lv.fiberR = h.fiberRadius; lv.pscale = h.pscale;
-                    lv.nUp = nUp;
+                    lv.patOwnSide = h.patOwnSide ? 1 : 0;
+                    lv.nUp = (short)nUp;
                     lvSlab[i * vcmCap + stored] = lv;
                     if (NS > 0 && lvSec) {
                         DVcmSec* row = lvSec + (size_t)(i * vcmCap + stored) * secStride;
@@ -20438,6 +20456,47 @@ __global__ static void kPatOpProbe(const PatNode* prog, const PatNodeF* progF,
                                       (float)in->r, (float)in->u, (float)in->v, env, dF);
 }
 
+// -checkdevhits (cudaHitProbe): one ray per thread, through closestHit or one intersector alone.
+// The intersectors are the renderer's own; the record handed to one alone is full of another
+// primitive's values, which every field it owns must overwrite.
+__global__ static void kHitProbe(DScene sc, const DevHitProbeRay* rays, int n, DevHitProbeOut* out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const DevHitProbeRay& q = rays[i];
+    const DVec3 ro{(Real)q.o[0], (Real)q.o[1], (Real)q.o[2]};
+    const DVec3 rd{(Real)q.d[0], (Real)q.d[1], (Real)q.d[2]};
+    DHit h;
+    if (q.kind < 0) {
+        h = closestHit(sc, ro, rd);
+    } else {
+        h.t = (Real)BIG; h.valid = false; h.matId = -7; h.sensorId = -1;
+        h.pscale = (Real)777; h.fiberRadius = (Real)0.5; h.vcol = 3; h.vb0 = h.vb1 = (Real)0.3;
+        h.tangent = DVec3{(Real)0, (Real)0, (Real)9}; h.bitangentSign = (Real)-1; h.curv = (Real)99;
+        const Real tmin = (Real)1e-6;
+        switch (q.kind) {
+            case 0: intersectSphere(ro, rd, sc.sph[q.index], tmin, h); break;
+            case 1: intersectTri(makeTriShear(rd), ro, rd, sc.tris[q.index], tmin, h); break;
+            case 2: intersectCurveSeg(makeCurveRay(rd), ro, rd, sc.curveSegs[q.index], tmin, h); break;
+            case 3: intersectImplicit(sc, sc.implicits[q.index], ro, rd, tmin, h); break;
+            default: break;
+        }
+    }
+    DevHitProbeOut o{};
+    o.valid = h.valid ? 1 : 0; o.matId = h.matId; o.patOwnSide = h.patOwnSide ? 1 : 0; o.vcol = h.vcol;
+    o.t = (double)h.t;
+    o.p[0] = h.p.x; o.p[1] = h.p.y; o.p[2] = h.p.z;
+    o.n[0] = h.n.x; o.n[1] = h.n.y; o.n[2] = h.n.z;
+    o.ng[0] = h.ng.x; o.ng[1] = h.ng.y; o.ng[2] = h.ng.z;
+    o.pscale = (double)h.pscale; o.fiberRadius = (double)h.fiberRadius; o.curv = (double)h.curv;
+    o.tangentZ = (double)h.tangent.z;
+    if (h.valid && h.matId >= 0) {
+        double r, side;
+        dPatPoint(h, o.q[0], o.q[1], o.q[2], r, side);
+        o.side = side;
+    }
+    out[i] = o;
+}
+
 // ================ MODE J'S SURFACE-PHOTON LIGHT PASS, ON THE DEVICE ====================
 //
 // Device twin of the deposit inside bdpt.h's traceLightBeamPass (~line 2080) -- the SURFACE
@@ -21410,6 +21469,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.coatMomN = m.coatMomN;                // A3: 0 keeps the analytic series
         for (int q = 0; q < 8; ++q) d.coatMom[q] = m.coatMom[q];
         d.readsCavity = m.readsCavity ? 1 : 0;
+        d.patOwnSide = m.patOwnSide ? 1 : 0;
         d.roughnessPat = m.roughnessPat;
         d.filmThicknessPat = m.filmThicknessPat;
         d.mixWeightPat = m.mixWeightPat;
@@ -22300,6 +22360,25 @@ void cudaReleaseScene(CudaSceneHold* held) {
     if (!held) return;
     freeUpload(held->up);
     delete held;
+}
+
+bool cudaHitProbe(const Scene& scene, const DevHitProbeRay* rays, int n, DevHitProbeOut* out) {
+    if (!cudaAvailable() || n <= 0) return false;
+    DUpload up;
+    buildUploadScene(scene, up);
+    DevHitProbeRay* dR = nullptr;
+    DevHitProbeOut* dO = nullptr;
+    bool ok = cudaMalloc(&dR, sizeof(DevHitProbeRay) * n) == cudaSuccess
+           && cudaMalloc(&dO, sizeof(DevHitProbeOut) * n) == cudaSuccess
+           && cudaMemcpy(dR, rays, sizeof(DevHitProbeRay) * n, cudaMemcpyHostToDevice) == cudaSuccess;
+    if (ok) {
+        gpu::kHitProbe<<<(n + 63) / 64, 64>>>(up.sc, dR, n, dO);
+        ok = cudaDeviceSynchronize() == cudaSuccess
+          && cudaMemcpy(out, dO, sizeof(DevHitProbeOut) * n, cudaMemcpyDeviceToHost) == cudaSuccess;
+    }
+    cudaFree(dR); cudaFree(dO);
+    freeUpload(up);
+    return ok;
 }
 
 // Assemble a device DCamSet: upload the DCamera array plus the arrays of per-camera

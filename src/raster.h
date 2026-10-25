@@ -135,6 +135,10 @@ struct PTri : PShade {
     // two backends want different things from the same numbers, and RGB is what both can
     // start from.
     bool hasVcol = false;
+    // Material::patOwnSide of the triangle's OWN material: the rule is the surface's, so it
+    // holds for whichever part's payload a mix bakes in or picks per pixel (in the hole after
+    // hasVcol).
+    bool patOwnSide = false;
     Vec3 vc0{1, 1, 1}, vc1{1, 1, 1}, vc2{1, 1, 1};
 };
 
@@ -1120,6 +1124,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
         const bool ok = matId >= 0 && matId < (int)matSh.size();
         static_cast<PShade&>(p) = ok ? matSh[matId] : fallback;
         p.mix = ok ? matMix[matId] : -1;
+        p.patOwnSide = ok && sc.mats[matId].patOwnSide;
     };
 
     // (1) World triangles.
@@ -2610,8 +2615,12 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                     const Vec3 fn = faceNormalToward(pt.p0, pt.p1, pt.p2, pt.n0 + pt.n1 + pt.n2);
                     Vec3 q;
                     patNudgedPoint(w.x, w.y, w.z, fn.x, fn.y, fn.z, triReach(pt.p0, pt.p1, pt.p2), q.x, q.y, q.z);
-                    pc = makePatCtx(q, 0.0, N0, g.uv[i].x, g.uv[i].y, 0.0, 0.0,
-                                    patShadingFootprint(fwPerDist, dist, cs));
+                    // The normal a pattern sees: the shaded side's (N0, already turned to face
+                    // the eye on a back-facing triangle), or on a surface light can cross the
+                    // surface's own side's, as patCtxFromHit has it.
+                    const bool flippedToEye = dot(N0, pt.n0 + pt.n1 + pt.n2) < 0.0;
+                    pc = makePatCtx(q, 0.0, (pt.patOwnSide && flippedToEye) ? N0 * -1.0 : N0, g.uv[i].x,
+                                    g.uv[i].y, 0.0, 0.0, patShadingFootprint(fwPerDist, dist, cs));
                     bindPatScene(pc, *scenePtr);
                     pcReady = true;
                 }

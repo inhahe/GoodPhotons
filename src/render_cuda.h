@@ -671,6 +671,20 @@ struct PatOpProbeIn {
 bool cudaPatOpProbe(const PatNode* prog, const int* off, const int* len, int nProg,
                     const PatOpProbeIn& in, double* outF64, double* outF32);
 
+// -checkdevhits: rays traced on the device against `scene` (uploaded for the call), each through
+// the device's closestHit (kind < 0) or through one intersector alone, handed a record full of
+// another primitive's values as a closest-hit loop's reused record carries them (kind 0 sphere,
+// 1 triangle, 2 curve segment, 3 isosurface; `index` into that DScene array, which keeps the
+// host Scene's order). The hit's fields and the pattern inputs at it come back for the host to
+// hold against its own intersectors, closestHit and patCtxFromHit.
+struct DevHitProbeRay { double o[3], d[3]; int kind, index; };
+struct DevHitProbeOut {
+    int    valid, matId, patOwnSide, vcol;
+    double t, p[3], n[3], ng[3], pscale, fiberRadius, curv, tangentZ;
+    double q[3], side;   // dPatPoint: the point a pattern reads there, and its normal's side sign
+};
+bool cudaHitProbe(const Scene& scene, const DevHitProbeRay* rays, int n, DevHitProbeOut* out);
+
 // `sizeof(Real)` — the device's working float width (4 with the default FTRACE_GPU_FP32,
 // 8 in an exact-FP64 build). The lattice helpers are `double` either way, but `gridUV`
 // hands its result back as `Real`, so `-checklattice` must narrow the host's double to the

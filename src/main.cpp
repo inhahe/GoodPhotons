@@ -141,6 +141,7 @@
 #include <atomic>              // -stop: cross-thread flags for the external stop channel
 #include <mutex>               // guards the live-window title (the deposit monitor re-titles)
 #include <filesystem>          // -review: scan a directory of rendered frames
+#include <ctime>               // -checkdevhits: a temp file name
 
 #include "version.h"          // ftraceVersion(): the repo-root VERSION string, baked into one tiny TU
 
@@ -3368,6 +3369,45 @@ static bool checkPatternNudge() {
             if (patternEval(floor4y.data(), (int)floor4y.size(), patCtxFromHit(sc, h)) != 0.0) ++bigBad;
         }
     }
+    // The normal and curvature a pattern sees (Material::patOwnSide): on an opaque surface the
+    // shaded side's, which flip with the side the ray came from; on one light can cross (a
+    // dielectric here) the surface's own, the same from either side -- in a mix with such a
+    // part too (set by Scene::finalizePatternSides from the materials' types).
+    // The rule is the surface's, decided at the hit (Scene::markPatSide): a pattern read after
+    // the hit's material became an opaque part's -- a mix resolved, as a GPU BDPT vertex keeps
+    // it -- follows it too.
+    int sideInBad = 0, sideInN = 0;
+    {
+        std::vector<PatNode> nyProg, curvProg;
+        compilePatternExpr("ny", nyProg, err);
+        compilePatternExpr("curv", curvProg, err);
+        Scene sm;
+        sm.mats.resize(4);
+        sm.mats[0].type = MatType::Diffuse;
+        sm.mats[1].type = MatType::Dielectric;
+        sm.mats[2].type = MatType::Mix;
+        sm.mats[2].mixChildren = {0, 1};
+        sm.mats[3].type = MatType::Mix;
+        sm.mats[3].mixChildren = {0};
+        sm.finalizePatternSides();
+        auto at = [&](int mat, bool fromBelow, const std::vector<PatNode>& prog, int readAs) {
+            Hit h;
+            h.valid = true; h.p = Vec3(0.3, 0, 0.7); h.ng = Vec3(0, 1, 0); h.matId = mat;
+            h.n = Vec3(0, fromBelow ? -1.0 : 1.0, 0); h.curv = fromBelow ? -0.5 : 0.5;
+            sm.markPatSide(h);
+            h.matId = readAs;
+            return patternEval(prog.data(), (int)prog.size(), patCtxFromHit(sm, h));
+        };
+        for (int mat : {0, 1, 2, 3}) {
+            const bool own = (mat == 1 || mat == 2);
+            for (const auto* prog : {&nyProg, &curvProg})
+                for (int readAs : {mat, 0}) {
+                    const double top = at(mat, false, *prog, readAs), below = at(mat, true, *prog, readAs);
+                    ++sideInN;
+                    if (top <= 0.0 || below != (own ? top : -top)) ++sideInBad;
+                }
+        }
+    }
     // A sphere written with a negative radius traces as its absolute value (the quadratic sees
     // r^2), and its hit lies where the ray meets it, not at the antipode.
     int negBad = 0;
@@ -3437,12 +3477,14 @@ static bool checkPatternNudge() {
     std::printf("[checkpatops] pattern nudge: %d of %d hits within rounding of a step read the inside, "
                 "%d of %d on checker walls, %d of %d on a big noisy floor, %d of %d emitter samples disagree "
                 "with a hit there, %d of %d on a mesh light's near patch, %d of %d sphere hits from 100 km, "
-                "negative-radius sphere hit %s, mesh light's side %s; %s\n",
+                "negative-radius sphere hit %s, mesh light's side %s, %d of %d normal/curvature reads on "
+                "the wrong side; %s\n",
                 bad, n, chkBad, chkN, bigBad, bigN, emBad, emN, patchBad, patchN, farBad, farN,
-                negBad ? "misplaced" : "in place", sideBad ? "differs" : "agrees",
-                bad || chkBad || bigBad || emBad || patchBad || farBad || negBad || sideBad ? "FAIL" : "ok");
+                negBad ? "misplaced" : "in place", sideBad ? "differs" : "agrees", sideInBad, sideInN,
+                bad || chkBad || bigBad || emBad || patchBad || farBad || negBad || sideBad || sideInBad ? "FAIL"
+                                                                                                         : "ok");
     return bad == 0 && chkBad == 0 && bigBad == 0 && emBad == 0 && patchBad == 0 && farBad == 0 && negBad == 0 &&
-           sideBad == 0;
+           sideBad == 0 && sideInBad == 0;
 }
 
 // Every intersector writes every field a hit on its primitive owns. The closest-hit loops reuse
@@ -3623,6 +3665,255 @@ static int checkPatOps() {
     const bool ok = nudgeOk && !bad64 && !bad32;
     std::printf("[checkpatops] %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
+}
+
+// -checkdevhits: the device's intersectors, closestHit and pattern inputs against the host's.
+//
+// The GPU traces in float with its own intersectors -- twins of the host's, kept in step by
+// hand, and until this check held to them only by renders. Here both trace the same rays
+// through one scene: spheres, quads and isosurfaces, each opaque and glass, a curve, and a
+// smooth-normalled mesh placed by mesh_instance; rays from either side of every surface, from
+// 3 km off, and into the instance's silhouette band (where the shading normal has turned away
+// from a ray the face still meets from the front). For each hit the validity, material, t,
+// point, normals, whether patterns see the surface's own side (Hit::patOwnSide), the pattern
+// hair's scale (pscale),
+// curvature, strand radius, vertex colour, and the point and normal side a pattern reads there
+// (patCtxFromHit / dPatPoint) must agree, within float. And each device intersector alone,
+// handed a record full of another primitive's values -- the closest-hit loops reuse one record
+// across candidates -- must leave every field it owns as its host twin does.
+static int checkDevHits() {
+#ifndef HAVE_CUDA
+    std::printf("[checkdevhits] built without CUDA -- SKIPPED\n");
+    std::printf("[checkdevhits] PASS (skipped)\n");
+    return 0;
+#else
+    if (!cudaAvailable()) {
+        std::printf("[checkdevhits] no usable CUDA device -- SKIPPED\n");
+        std::printf("[checkdevhits] PASS (skipped)\n");
+        return 0;
+    }
+    // A coarse UV sphere with outward vertex normals: smooth shading, so its facets near a
+    // silhouette carry the band.
+    std::string objPath = (std::filesystem::temp_directory_path() /
+                           ("ftrace_checkdevhits_" + std::to_string((unsigned long long)std::time(nullptr)) + ".obj"))
+                              .string();
+    for (char& ch : objPath) if (ch == '\\') ch = '/';
+    {
+        std::FILE* f = std::fopen(objPath.c_str(), "w");
+        if (!f) { std::printf("[checkdevhits] cannot write %s FAIL\n", objPath.c_str()); return 1; }
+        const int nu = 10, nv = 7;
+        for (int j = 0; j <= nv; ++j)
+            for (int i = 0; i < nu; ++i) {
+                const double th = PI * j / nv, ph = 2.0 * PI * i / nu;
+                const double x = std::sin(th) * std::cos(ph), y = std::cos(th), z = std::sin(th) * std::sin(ph);
+                std::fprintf(f, "v %.17g %.17g %.17g\nvn %.17g %.17g %.17g\n", x, y, z, x, y, z);
+            }
+        auto id = [&](int j, int i) { return j * nu + (i % nu) + 1; };
+        for (int j = 0; j < nv; ++j)
+            for (int i = 0; i < nu; ++i) {
+                const int a = id(j, i), b = id(j, i + 1), c = id(j + 1, i + 1), d = id(j + 1, i);
+                if (j > 0) std::fprintf(f, "f %d//%d %d//%d %d//%d\n", a, a, c, c, b, b);
+                if (j < nv - 1) std::fprintf(f, "f %d//%d %d//%d %d//%d\n", a, a, d, d, c, c);
+            }
+        std::fclose(f);
+    }
+    const std::string src =
+        "scene { units meters }\n"
+        "material \"opaque\" { type diffuse reflect 0.5 }\n"
+        "material \"glass\"  { type dielectric ior glass:BK7 }\n"
+        "sphere { center 0 0 0  radius 0.5  material opaque }\n"
+        "sphere { center 2 0 0  radius 0.5  material glass }\n"
+        "quad { origin -0.5 -1 4  u 1 0 0  v 0 0 1  material opaque }\n"
+        "quad { origin 1.5 -1 4  u 1 0 0  v 0 0 1  material glass }\n"
+        "isosurface { material opaque  sphere { center 0 2 0  radius 0.5 } }\n"
+        "isosurface { material glass  sphere { center 2 2 0  radius 0.5 } }\n"
+        "curve { material opaque  basis linear  radius 0.2  point -0.8 -2 0  point 0.8 -2 0 }\n"
+        "mesh_asset \"dome\" { file \"" + objPath + "\"  material opaque }\n"
+        "mesh_instance { of \"dome\"  scale 0.7  rotate 20 -30 10  translate 5 0 0 }\n"
+        "light area { origin 20 20 20  u 0.1 0 0  v 0 0 0.1  normal 0 -1 0  spd preset:bb6500 }\n"
+        "camera \"c\" { eye 0 0 10  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n";
+    ftsl::Loaded L;
+    std::string err;
+    const bool loaded = ftsl::loadSource(src, "<checkdevhits>", L, err);
+    std::remove(objPath.c_str());
+    const Scene& sc = L.scene;
+    if (!loaded || sc.spheres.size() != 2 || sc.implicits.size() != 2 || sc.curveSegs.empty() ||
+        sc.instances.size() != 1 || sc.blasList.size() != 1 || sc.tris.size() < 4) {   // the quads, then the lamp's
+        std::printf("[checkdevhits] the scene did not load as written (%zu spheres, %zu isosurfaces, %zu curve "
+                    "segments, %zu instances, %zu tris) %s FAIL\n", sc.spheres.size(), sc.implicits.size(),
+                    sc.curveSegs.size(), sc.instances.size(), sc.tris.size(), err.c_str());
+        return 1;
+    }
+
+    std::vector<DevHitProbeRay> rays;
+    auto add = [&](const Vec3& o, const Vec3& d, int kind = -1, int index = 0) {
+        const Vec3 u = normalize(d);
+        rays.push_back(DevHitProbeRay{{o.x, o.y, o.z}, {u.x, u.y, u.z}, kind, index});
+    };
+    unsigned long long st = 0x9e3779b97f4a7c15ULL;
+    auto uni = [&st]() {
+        st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+        return (double)(st >> 11) * (1.0 / 9007199254740992.0);
+    };
+    auto dirRand = [&]() {
+        const double z = 2.0 * uni() - 1.0, ph = 2.0 * PI * uni(), s = std::sqrt(1.0 - z * z);
+        return Vec3(s * std::cos(ph), z, s * std::sin(ph));
+    };
+    // Round bodies: from outside at their centre's neighbourhood, from inside outward, from 3 km.
+    const Vec3 round[5] = {{0, 0, 0}, {2, 0, 0}, {0, 2, 0}, {2, 2, 0}, {0, -2, 0}};
+    const Vec3 farOff(1800.3, 1500.7, 1700.1);
+    for (const Vec3& c : round) {
+        const bool tube = (c.y == -2.0);
+        for (int k = 0; k < 24; ++k) {
+            const Vec3 d = dirRand();
+            Vec3 aim = c + Vec3(uni() - 0.5, uni() - 0.5, uni() - 0.5) * 0.3;
+            if (tube) aim.x = c.x + (uni() - 0.5) * 1.2;
+            add(aim - d * 3.0, d);                                   // from outside
+            const Vec3 across = (d.y * d.y + d.z * d.z > 0.01) ? Vec3(0, d.y, d.z) : Vec3(0, 1, 0);
+            add(tube ? Vec3(aim.x, c.y, c.z) : c, tube ? across : d);   // from inside
+            add(c + farOff + Vec3(uni(), uni(), uni()), aim - (c + farOff));    // from 3 km
+        }
+    }
+    // The quads, facing down (u x v): from below (front) and from above (behind).
+    for (const double qx : {0.0, 2.0})
+        for (int k = 0; k < 16; ++k) {
+            const Vec3 p(qx - 0.4 + 0.8 * uni(), -1.0, 4.1 + 0.8 * uni());
+            const Vec3 d = normalize(Vec3(uni() - 0.5, 1.0, uni() - 0.5));
+            add(p - d * 2.0, d);
+            add(p + d * 2.0, d * -1.0);
+        }
+    // The instance: its silhouette band (as -checktrinormal S1b builds it, carried to the world),
+    // and rays from all round.
+    const MeshInstance& inst = sc.instances[0];
+    for (const Tri& t : sc.blasList[0].tris) {
+        const Vec3 gnf = (dot(t.gn, t.n0 + t.n1 + t.n2) < 0.0) ? t.gn * -1.0 : t.gn;
+        const Vec3 V[3] = {t.v0, t.v1, t.v2}, N[3] = {t.n0, t.n1, t.n2};
+        for (int i = 0; i < 3; ++i) {
+            const Vec3 p = V[i] * 0.9 + V[(i + 1) % 3] * 0.05 + V[(i + 2) % 3] * 0.05;
+            const Vec3 ns = normalize(N[i] * 0.9 + N[(i + 1) % 3] * 0.05 + N[(i + 2) % 3] * 0.05);
+            const Vec3 dv = ns - gnf;
+            if (dot(dv, dv) < 1e-12) continue;
+            const Vec3 d = normalize(dv);
+            if (!(dot(d, gnf) < -0.05) || !(dot(d, ns) > 0.0)) continue;
+            add(inst.toWorld.apply(p - d * 2.0), inst.toWorld.applyDir(d));
+        }
+    }
+    for (int k = 0; k < 48; ++k) {
+        const Vec3 d = dirRand();
+        add(Vec3(5, 0, 0) + Vec3(uni() - 0.5, uni() - 0.5, uni() - 0.5) * 0.6 - d * 3.0, d);
+    }
+    const size_t nClosest = rays.size();
+    // Each intersector alone, on a record full of another primitive's values.
+    for (int i = 0; i < 2; ++i) add(sc.spheres[i].c + Vec3(0.1, 3, 0.2), Vec3(0, -1, 0), 0, i);
+    for (int i = 0; i < 4; ++i) {
+        const Tri& t = sc.tris[i];
+        const Vec3 c = (t.v0 + t.v1 + t.v2) * (1.0 / 3.0);
+        add(c + Vec3(0.05, 2, 0.03), Vec3(0, -1, 0), 1, i);
+    }
+    add(Vec3(0.1, -2 + 3, 0.05), Vec3(0, -1, 0), 2, 0);
+    for (int i = 0; i < 2; ++i) add(Vec3(2.0 * i + 0.1, 2 + 3, 0.2), Vec3(0, -1, 0), 3, i);
+
+    std::vector<DevHitProbeOut> dev(rays.size());
+    if (!cudaHitProbe(sc, rays.data(), (int)rays.size(), dev.data())) {
+        std::printf("[checkdevhits] probe launch failed FAIL\n");
+        return 1;
+    }
+
+    auto junk = []() {
+        Hit h;
+        h.t = 1e30; h.matId = -7; h.pscale = 777.0; h.fiberRadius = 0.5; h.hasVcol = true;
+        h.tangent = Vec3(0, 0, 9); h.bitangentSign = -1.0; h.curv = 99.0;
+        return h;
+    };
+    const char* fieldName[] = {"validity", "material", "own-side flag", "t", "point", "shading normal",
+                               "geometric normal", "pscale", "curvature", "strand radius", "vertex colour",
+                               "tangent", "pattern height", "pattern side"};
+    const int nField = (int)(sizeof(fieldName) / sizeof(fieldName[0]));
+    std::vector<int> badField(nField, 0);
+    int hits = 0, backHits = 0, ownBack = 0;
+    auto vdot = [](const double* a, const Vec3& b) { return a[0] * b.x + a[1] * b.y + a[2] * b.z; };
+    auto vdist = [](const double* a, const Vec3& b) {
+        return std::sqrt((a[0] - b.x) * (a[0] - b.x) + (a[1] - b.y) * (a[1] - b.y) + (a[2] - b.z) * (a[2] - b.z));
+    };
+    for (size_t i = 0; i < rays.size(); ++i) {
+        const DevHitProbeRay& q = rays[i];
+        const Ray r{Vec3(q.o[0], q.o[1], q.o[2]), Vec3(q.d[0], q.d[1], q.d[2])};
+        Hit h;
+        if (q.kind < 0) {
+            h = sc.closestHit(r, 1e-6);
+        } else {
+            h = junk();
+            switch (q.kind) {
+                case 0: intersectSphere(r, sc.spheres[q.index], 1e-6, h); break;
+                case 1: intersectTri(r, sc.tris[q.index], 1e-6, h); break;
+                case 2: intersectCurveSeg(makeCurveRay(r.d), r, sc.curveSegs[q.index], 1e-6, h); break;
+                case 3: intersectImplicit(r, sc.implicits[q.index], 1e-6, h); break;
+                default: break;
+            }
+        }
+        const DevHitProbeOut& o = dev[i];
+        bool b[14] = {};
+        b[0] = (o.valid != 0) != h.valid;
+        if (h.valid && o.valid) {
+            ++hits;
+            const bool closest = q.kind < 0;
+            b[1] = o.matId != h.matId;
+            b[2] = closest && ((o.patOwnSide != 0) != h.patOwnSide);
+            b[3] = std::fabs(o.t - h.t) > 1e-4 * std::max(1.0, h.t);
+            // A float ray is only known to a few ulps of its reach, so the two may land that far
+            // apart ALONG the surface (from 3 km, ~1e-4); off it is the pattern test's business.
+            const double rayUlps = 4.8e-7 * (length(r.o) + h.t);
+            b[4] = vdist(o.p, h.p) > 2e-5 * std::max(1.0, length(h.p)) + rayUlps;
+            b[5] = vdot(o.n, h.n) < 0.999;
+            b[6] = vdot(o.ng, h.ng) < 0.999;
+            b[7] = std::fabs(o.pscale - h.pscale) > 1e-5 * std::max(1.0, h.pscale);
+            b[8] = std::fabs(o.curv - h.curv) > 1e-3 * std::max(1.0, std::fabs(h.curv));
+            b[9] = std::fabs(o.fiberRadius - h.fiberRadius) > 1e-6 * std::max(1.0, h.fiberRadius);
+            b[10] = (o.vcol >= 0) != h.hasVcol;
+            b[11] = !closest && std::fabs(o.tangentZ - h.tangent.z) > 1e-4;
+            if (h.matId >= 0 && h.matId < (int)sc.mats.size()) {
+                const PatCtx c = patCtxFromHit(sc, h);
+                // The height above the surface the pattern reads at: the device's must match the
+                // host's to a quarter of the hair. Measured by casting from the read point along
+                // the normal, both ways, to the host's surface -- not by projecting onto h.ng,
+                // which a shift along the surface would leak into wherever h.ng leans (a far
+                // isosurface's gradient stencil is 1e-4 t wide).
+                const double hair = kPatNudge * std::max(std::max(h.pscale, length(h.p)), kPatNudgeFloor);
+                auto height = [&](const Vec3& at) {
+                    const Hit in = sc.closestHit(Ray{at, h.ng * -1.0}, 0.0);
+                    const Hit out = sc.closestHit(Ray{at, h.ng}, 0.0);
+                    const double ti = in.valid ? in.t : 1e30, to = out.valid ? out.t : 1e30;
+                    return ti <= to ? ti : -to;
+                };
+                b[12] = std::fabs(height(Vec3(o.q[0], o.q[1], o.q[2])) - height(Vec3(c.x, c.y, c.z))) > 0.25 * hair;
+                b[13] = closest && (o.side < 0.0) != h.patOwnSide;
+                if (closest && dot(r.d, h.ng) > 0.0) { ++backHits; if (h.patOwnSide) ++ownBack; }
+            }
+        }
+        for (int f = 0; f < nField; ++f) {
+            if (b[f] && badField[f] == 0)
+                std::printf("[checkdevhits]   first %s mismatch: ray %zu (kind %d) from (%.4g %.4g %.4g), host t %.9g "
+                            "p (%.9g %.9g %.9g) mat %d, device t %.9g p (%.9g %.9g %.9g) mat %d\n",
+                            fieldName[f], i, q.kind, q.o[0], q.o[1], q.o[2], h.t, h.p.x, h.p.y, h.p.z, h.matId,
+                            o.t, o.p[0], o.p[1], o.p[2], o.matId);
+            badField[f] += b[f] ? 1 : 0;
+        }
+    }
+    int bad = 0;
+    for (int f = 0; f < nField; ++f) {
+        bad += badField[f];
+        if (badField[f])
+            std::printf("[checkdevhits] %-16s differs on %d of %zu rays FAIL\n", fieldName[f], badField[f], rays.size());
+    }
+    const bool covered = hits > (int)(rays.size() / 2) && backHits > 40 && ownBack > 10;
+    std::printf("[checkdevhits] %zu rays (%zu through closestHit, %zu through one intersector on a reused record), "
+                "%d hit, %d from behind (%d on glass): %d field mismatches %s\n",
+                rays.size(), nClosest, rays.size() - nClosest, hits, backHits, ownBack, bad,
+                bad == 0 && covered ? "ok" : "FAIL");
+    if (!covered) std::printf("[checkdevhits] too few hits to mean anything FAIL\n");
+    std::printf("[checkdevhits] %s\n", bad == 0 && covered ? "PASS" : "FAIL");
+    return bad == 0 && covered ? 0 : 1;
+#endif
 }
 
 // -checkndgpu: the resident N-D complex re-projected on the GPU must agree with the warp
@@ -9700,6 +9991,25 @@ static int checkCavity() {
         PatCtx c3 = patCtxFromHit(s, h2);
         ok &= chk("S10 scene gate off -> cavity 0", c3.cavity, 0.0, 0.0);
         chkb("S10 scene gate off leaves the hit unprobed", !h2.cavityDone);
+    }
+
+    // ---- §11: a surface light can cross probes its own side, from either side ----------
+    // (Material::patOwnSide.) The point under a ceiling, hit from BELOW: on an opaque surface
+    // the probe looks down, at nothing; on one light can cross it looks up, at the ceiling,
+    // as a hit from above does -- the same value for light crossing it either way.
+    {
+        Scene s;
+        addQuad(s, Vec3{-8, 0.5, -8}, Vec3{16, 0, 0}, Vec3{0, 0, 16});
+        finish(s, 1.0, 256);
+        auto fromBelow = [&](bool own) {
+            s.mats[0].patOwnSide = own;
+            Hit h = hitAt2(Vec3{0, 0, 0}, Vec3{0, -1, 0}, Vec3{0, 1, 0});
+            s.markPatSide(h);
+            return patCtxFromHit(s, h).cavity;
+        };
+        ok &= chk("S11 opaque, from below: the probe looks down", fromBelow(false), 0.0, 0.0);
+        ok &= chk("S11 crossable, from below: the probe looks up", fromBelow(true), 1.0 - 0.25, 5e-3);
+        s.mats[0].patOwnSide = false;
     }
 
     std::printf("[checkcavity] worst absolute error = %.3g\n", worst);
@@ -20970,6 +21280,7 @@ static int run(int argc, char** argv) {
     bool checkNdOnly = false;     // -checknd: N-D warp algebra + prism combinatorics (ndwarp.h)
     bool checkPatOpsOnly = false; // -checkpatops: every VM opcode across all three evaluators
     bool checkNdGpuOnly = false;  // -checkndgpu: resident N-D re-projection vs the host warp
+    bool checkDevHitsOnly = false; // -checkdevhits: the device's intersectors vs the host's
     const char* meshPath = nullptr;
     double meshScale = 1.0;
     const char* exportMeshPath = nullptr;  // -export-mesh <file.obj>: isosurface -> mesh
@@ -21796,6 +22107,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checknd")) checkNdOnly = true;
         else if (!std::strcmp(argv[i], "-checkpatops")) checkPatOpsOnly = true;
         else if (!std::strcmp(argv[i], "-checkndgpu")) checkNdGpuOnly = true;
+        else if (!std::strcmp(argv[i], "-checkdevhits")) checkDevHitsOnly = true;
         else handled = false;
 
         // ---- segment 2 (see the nesting note at the top of the loop) ----------------
@@ -22392,6 +22704,7 @@ static int run(int argc, char** argv) {
     if (checkNdOnly)       return checkNd();       // deterministic, no scene needed
     if (checkPatOpsOnly)   return checkPatOps();   // deterministic, no scene needed
     if (checkNdGpuOnly)    return checkNdGpu();    // deterministic, no scene needed
+    if (checkDevHitsOnly)  return checkDevHits();  // deterministic, builds its own scene
     if (checkFogOnly)      return checkFog();      // deterministic, no scene needed
     if (checkDenoiseOnly)  return checkDenoise();  // deterministic, no scene needed
     if (checkThinFilmOnly) return checkThinFilm(); // deterministic, no scene needed

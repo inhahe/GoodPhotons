@@ -153,6 +153,7 @@ struct DPTri {
     int    emitPat;         // scalar `pattern` masking the emission, or -1
     int    mix;             // index into the DMix table for a per-hit mix, else -1
     float  tanSign;         // the normal map's frame handedness (host: PTri::tanSign)
+    int    patOwnSide;      // PTri::patOwnSide: its patterns see the surface's own side
     // RASTER-PBR (host twin: raster.h PShade). `rough < 0` = no specular lobe, which shades
     // byte-for-byte as before, so every diffuse scene is untouched. `f0` is normal-incidence
     // reflectance -- for a metal preset that IS its measured reflectance, which is why a gold
@@ -1173,6 +1174,9 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     // first that needs it, from the source triangle.
     double qx = 0.0, qy = 0.0, qz = 0.0, qr = 0.0;
     bool qReady = false;
+    // The normal a pattern sees: the shaded side's (wn, turned to the eye on a back-facing slot),
+    // or on a surface light can cross the surface's own side's (host twin raster.h ctx()).
+    const float patSide = (vsrc.patOwnSide && (flags[slot] & kSlotBack)) ? -1.0f : 1.0f;
     auto patPoint = [&]() {
         if (!qReady) { dRasterPatPoint(vsrc, wpos, qx, qy, qz, qr); qReady = true; }
     };
@@ -1188,7 +1192,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         double wt = 0.0;
         if (mx.weightPat >= 0 && mx.weightPat < nPatterns && patNodes) {
             const DPattern& wp = patterns[mx.weightPat];
-            float3 pn = normalize3(wn);
+            float3 pn = normalize3(wn) * patSide;
             patPoint();
             // curv = 0: the raster preview shades a VERTEX BUFFER, not a ray-triangle
             // hit, so no per-face curvature is in hand here. The CPU raster twin passes
@@ -1234,7 +1238,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     int pat = emissive ? ePat : rPat;
     if (pat >= 0 && pat < nPatterns && patNodes) {
         const DPattern& pp = patterns[pat];
-        float3 pn = normalize3(wn);
+        float3 pn = normalize3(wn) * patSide;
         patPoint();
         // f = 0: the implicit field value is exactly 0 on the level set the marched mesh
         // approximates, matching both the CPU preview and the tracer's own hit context.
@@ -1272,7 +1276,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     if (rough >= 0.0f) {
         if (shRPat >= 0 && shRPat < nPatterns && patNodes) {
             const DPattern& rp = patterns[shRPat];
-            float3 pn = normalize3(wn);
+            float3 pn = normalize3(wn) * patSide;
             patPoint();
             rough = previewRoughD((float)dPatternEval(patNodes + rp.off, rp.n, qx, qy, qz, 0.0,
                                                       pn.x, pn.y, pn.z, qr, (double)uu, (double)vv,
@@ -1799,6 +1803,7 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
         d.vc2 = make_float3((float)t.vc2.x, (float)t.vc2.y, (float)t.vc2.z);
         d.normalTex = t.normalTex;
         d.tanSign = t.tanSign;
+        d.patOwnSide = t.patOwnSide ? 1 : 0;
         d.normalStrength = (float)t.normalStrength;
         d.reflectPat = t.reflectPat;
         d.rough = (float)t.rough;                // RASTER-PBR (host twin: raster.h PShade)

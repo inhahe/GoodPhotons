@@ -4482,8 +4482,9 @@ rounded either side of 0.5 -- reads it the same way. (Since 0.399.7; before, hit
 rounded to either side of the step from ray to ray, and such a surface came out grey or split
 along a seam. 0.399.7 read the side the ray came from; since 0.399.8 the side is the
 surface's, so light crossing a transmissive surface reads the pattern at the same point either
-way -- though the normal (`nx`, `ny`, `nz`) and curvature (`curv`) a pattern sees still face the
-ray.) A pattern varying along the normal moves by up to that hair: 2 um on a primitive reaching
+way -- and since 0.400.0 so do the normal (`nx`, `ny`, `nz`), curvature (`curv`) and `cavity`
+it sees there, which on an opaque surface face the viewer.) A pattern varying along the normal
+moves by up to that hair: 2 um on a primitive reaching
 a metre from the origin, 0.1 mm on a 100 m floor, 2 mm at a kilometre.
 
 **Pattern-driven reflectance.** The `reflect` slot takes a pattern as well, and a scalar in
@@ -4552,7 +4553,12 @@ when the object moves.
 
 `curv` is **signed toward the side being shaded**: convex is positive, concave negative,
 flat 0. Every intersector negates it when it flips the normal to face the ray, so the
-same sphere reads `+1/R` from outside and `−1/R` from within. What each geometry reports:
+same sphere reads `+1/R` from outside and `−1/R` from within. On a surface light can
+**cross** (a dielectric, half mirror, filter, translucent, or a mix or layered stack with
+one), `curv`, `nx ny nz` and `cavity` are instead the surface's own
+outside's, whichever way the ray came, so light crossing it either way sees the same pattern
+-- every pattern on that surface, a mix's opaque part's included (since 0.400.0; FTSL.md
+§6.1 has the rule). What each geometry reports:
 
 | Geometry | `curv` |
 |---|---|
@@ -6546,7 +6552,7 @@ alone can't restore, so they are not disk-resumable.
 `-checkbluenoise`, `-checkfnoise`, `-checkstochtile`, `-checkreaction`, `-checkcurv`,
 `-checkcavity`, `-checktrinormal`, `-checkmesh`, `-checkprefer`, `-checkpaths`,
 `-checksdf`, `-checksun`, `-checkbind`, `-checkprop`, `-checkhair`,
-`-checkarray`, `-checklattice`, `-checknd`, `-checkpatops`. Each runs deterministically without a scene and prints
+`-checkarray`, `-checklattice`, `-checknd`, `-checkpatops`, `-checkdevhits`. Each runs deterministically without a scene and prints
 `PASS`/`FAIL`. (`-misaudit` / `-misaudit-poison`, described at the end of this section, are
 also diagnostics but need a scene — they instrument a live render's MIS weights.)
 
@@ -6575,6 +6581,17 @@ pattern's step reads the outside of the surface (a floor at `y 0` under `floor(4
 built-in checker's cell walls, facing up and down, seen from both sides; a sphere under
 `step(0.5, r)`, including one hit from 100 km), and that a light sample reads an emission
 pattern as a hit there does. `tools/check_pattern_seam.py` renders the same on both devices.
+
+`-checkdevhits` holds **the GPU's intersectors to the CPU's**. The device traces in float with
+its own twins of every intersector, kept in step by hand. The check builds one small scene
+(spheres, quads and isosurfaces, opaque and glass, a curve, and an instanced smooth mesh),
+traces the same rays on both -- from either side of every surface, from 3 km, and into the
+instance's silhouettes -- and compares every field of every hit: material, t, point (within
+the float ray's own precision), normals, which side the ray came from, the pattern hair's
+scale, curvature, strand radius, vertex colour, and the height above the surface and the side
+a pattern reads there. It also hands each device intersector alone a hit record full of another
+primitive's values, which every field it owns must overwrite as its host twin does. Prints the
+first mismatch of each kind. Skips (and passes) without a CUDA device.
 `-checkpaths` guards **asset path resolution** (see *Where asset paths
 are looked for*): it builds a throwaway project tree in the temp directory, `cd`s
 somewhere unrelated, and asserts that a scene loads from there with its texture found

@@ -540,6 +540,20 @@ meshes and on native primitives that declare a `uv` wrap, see §9), `curv` (mean
 curvature — see below), `cavity` (enclosure — see below), `fw` (shading footprint —
 see `fnoise` below). Constant `pi`.
 
+**Which side a pattern sees.** `x y z` is a point just outside the surface, on the side its
+geometric normal faces, whichever side the ray came from (so a pattern stepping exactly at
+the surface shows one value). `nx ny nz`, `curv` and `cavity` are those of the side being
+shaded — the normal facing the viewer, a bulge positive, the hemisphere in front of it — on
+an opaque surface, where light leaves on the side it arrived and the triangles' winding,
+which shading two-sided hides, does not matter. On a surface light can **cross** — a
+`dielectric` (plain or coated), `half_mirror`, `filter`, `translucent`, or a `mix` /
+`layered` with such a part — they are the surface's own side's,
+whichever way the ray came, so light crossing it either way sees the same pattern (otherwise
+the forward, backward and bidirectional modes integrate different things there). The rule is
+the surface's material's: in such a mix the patterns of its opaque parts read the own side
+too. There the winding decides which side that is: the normals' side on a mesh with `vn`,
+`u` × `v` on a `quad`, the outside of a sphere or isosurface (since 0.400.0).
+
 **Functions:** `abs sqrt sin cos tan exp log floor fract sign saturate` (1 arg);
 `min max pow atan2 step` (2 args); `clamp mix smoothstep noise` (3 args).
 
@@ -547,7 +561,8 @@ see `fnoise` below). Constant `pi`.
 H = (k₁ + k₂)/2 at the shading point, in **1/length** units — a sphere of radius R
 reads `1/R`, a plane reads `0`. It is signed **relative to the side being shaded**:
 convex (bulging toward the viewer) is positive, concave is negative, so the same
-sphere reads `+1/R` from outside and `−1/R` from within.
+sphere reads `+1/R` from outside and `−1/R` from within -- on an opaque surface; on one
+light can cross it is signed from its own outside, `+1/R` from within too (see above).
 
 Every other noise in the VM is *stationary* — a function of position, with the same
 statistics everywhere. Translate the object and the pattern slides off it, because
