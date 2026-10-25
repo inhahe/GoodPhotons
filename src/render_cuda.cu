@@ -3484,6 +3484,9 @@ struct DHit {
 // Held in every kernel's registers or local memory and in the wavefront state arrays.
 static_assert(sizeof(DHit) == 112, "DHit changed size");
 #endif
+// The geometric normal on the side being shaded: the side the ray came from (host twin
+// orientedGeoN, which says why it is not read off n).
+__device__ static inline DVec3 dShadedNg(const DHit& h) { return h.back ? h.ng * (Real)(-1) : h.ng; }
 
 // ---- implicit field evaluation (device twin of implicit.h) ----------------
 // smin/smax (Inigo Quilez quadratic blend) — filleted CSG / metaball merge.
@@ -10583,7 +10586,7 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         // Elastic splat at the incoming lambda, then a glow splat at a Stokes-shifted
         // lambda' drawn ONCE (camera-independent) — matching the CPU camSplatAll order,
         // so a multi-camera model-B pass stays bit-identical. Skipped for model C.
-        DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
+        DVec3 ngo = dShadedNg(h);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
         if (camMode == CAM_A || camMode == CAM_B) {
             splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
@@ -10990,7 +10993,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         Real sum = rhoR + rhoT;
         if (sum > (Real)1) { rhoR /= sum; rhoT /= sum; sum = (Real)1; }   // energy guard
         DVec3 nb = h.n * (Real)(-1);
-        DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
+        DVec3 ngo = dShadedNg(h);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
         // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path
         depositPhoton(cs, h.p, h.n, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
@@ -11010,7 +11013,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     } else {
         // Diffuse (texture-sampled reflectance when the material binds a texture).
         Real rho = dDiffuseRho(sc, m, h, lambda);
-        DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);   // geo normal on shading side
+        DVec3 ngo = dShadedNg(h);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
         // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path
         depositPhoton(cs, h.p, h.n, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
@@ -11347,7 +11350,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
             rhoR[i] = rr; rhoT[i] = rt;
         }
         DVec3 nb = h.n * (Real)(-1);
-        DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+        DVec3 ngo = dShadedNg(h);
         DVec3 wiPrev = -rd;
         { const bool caus = dPathIsCaustic(pathC);
           for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, h.n, beta[i], lam[i], caus);
@@ -11451,7 +11454,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     // Diffuse (texture-sampled reflectance when the material binds a texture).
     Real rho[hero::kHeroMax];
     for (int i = 0; i < nUp; ++i) rho[i] = clamp01(dDiffuseRho(sc, m, h, lam[i]));
-    DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    DVec3 ngo = dShadedNg(h);
     DVec3 wiPrev = -rd;
     { const bool caus = dPathIsCaustic(pathC);
       for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, h.n, beta[i], lam[i], caus);
@@ -11841,6 +11844,8 @@ struct DVertex {
 // occupancy. Fill a hole (after lightIdx; the tail after nUp is taken) before adding a word.
 static_assert(sizeof(DVertex) == 136, "DVertex changed size");
 #endif
+// dShadedNg of the hit a vertex was made at; a light or camera vertex (back 0) keeps its ng.
+__device__ static inline DVec3 dVertexGeoN(const DVertex& v) { return v.back ? v.ng * (Real)(-1) : v.ng; }
 
 // The route a vertex contributes to its path's leading chain (see c_routeOn).
 __device__ static inline int dRouteOfVert(const DScene& sc, const DVertex& v) {
@@ -13085,7 +13090,7 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
                                     const DNeeBsdf* nb = nullptr) {
     double total = 0.0;
     Real f = rho / (Real)DPI;                         // Lambertian BRDF
-    DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    DVec3 ngo0 = dShadedNg(h);
     const bool whitted = (sc.bkWhitted != 0);
     DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
     for (int di = 0; di < draw.n; ++di) {
@@ -13212,7 +13217,7 @@ __device__ static void bkNeeLightSpecGlossy(const DScene& sc, const DHit& h, con
                                             const Real* lam, const double* thrRatio, int K,
                                             double dLam, Real lambdaCam, double thrScalar,
                                             DRng& rng, double* xyz) {
-    DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    DVec3 ngo0 = dShadedNg(h);
     DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
     for (int di = 0; di < draw.n; ++di) {
         const int k = draw.emitter(di);
@@ -13270,7 +13275,7 @@ __device__ __noinline__ static void bkNeeLightHero(const DScene& sc, const DHit&
                                       double* L, const double* thr, const Real* lam,
                                       const double* invPdf, int nUp, DRng& rng,
                                       int giDepth = 0, const DNeeBsdf* nb = nullptr) {
-    DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    DVec3 ngo0 = dShadedNg(h);
     const bool whitted = (sc.bkWhitted != 0);
     DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
     for (int di = 0; di < draw.n; ++di) {
@@ -13514,7 +13519,7 @@ __device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkE
     }
     g.cosSurf = dot(h.n, g.wi);
     if (g.cosSurf <= (Real)0) return false;                 // below the shading horizon
-    DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    DVec3 ngo = dShadedNg(h);
     g.stG = dShadowTerminatorG(g.wi, h.n, ngo);             // Chiang soft terminator (1 if flat)
     if (g.stG <= (Real)0) return false;                     // behind true geometry: hard shadow
     g.farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
@@ -13708,7 +13713,7 @@ __device__ static void bkNeeLightHeroHair(const DScene& sc, const DHit& h, const
                                           const DHairSpec* sp, double* L, const double* thr,
                                           const Real* lam, const double* invPdf, int nUp,
                                           DRng& rng) {
-    const DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    const DVec3 ngo0 = dShadedNg(h);
     DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
     for (int di = 0; di < draw.n; ++di) {
         const int k = draw.emitter(di);
@@ -14128,7 +14133,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             L += thr * bkNeeLight(sc, h, rhoR, invPdfLambda, lambda, rng, gi.depth);  // front
             if (sc.envIndex >= 0)
                 L += thr * bkNeeEnv(sc, h, rhoR, invPdfLambda, lambda, rng);
-            DHit hb = h; hb.n = nb;
+            DHit hb = h; hb.n = nb; hb.back = !h.back;
             L += thr * bkNeeLight(sc, hb, rhoT, invPdfLambda, lambda, rng, gi.depth); // back
             if (sc.envIndex >= 0)
                 L += thr * bkNeeEnv(sc, hb, rhoT, invPdfLambda, lambda, rng);
@@ -14739,7 +14744,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 DVec3 nb = h.n * (Real)(-1);
                 bkNeeLightHero(sc, h, rhoR, L, thr, lam, invPdf, nUp, rng, gi.depth);   // front
                 if (sc.envIndex >= 0) bkNeeEnvHero(sc, h, rhoR, L, thr, lam, invPdf, nUp, rng);
-                DHit hb = h; hb.n = nb;                            // back hemisphere (transmit lobe)
+                DHit hb = h; hb.n = nb; hb.back = !h.back;                            // back hemisphere (transmit lobe)
                 bkNeeLightHero(sc, hb, rhoT, L, thr, lam, invPdf, nUp, rng, gi.depth);
                 if (sc.envIndex >= 0) bkNeeEnvHero(sc, hb, rhoT, L, thr, lam, invPdf, nUp, rng);
                 // Mode W indirect diffuse: a translucent surface receives from the FULL
@@ -15056,7 +15061,7 @@ __device__ static void bkGiGatherHero(const DScene& sc, int diffraction, const D
                                       const Real* rho, double* L, const double* thr,
                                       const Real* lam, const double* invPdf, int nUp,
                                       DRng& rng, DGiCtx gi) {
-    const DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    const DVec3 ngo = dShadedNg(h);
     const int n = sc.bkGiDirs * 2;                 // full-sphere lattice; ~half faces outward
     double p1, p2; dGiPhases(gi.sIdx, p1, p2);
     double acc[hero::kHeroMax];
@@ -15090,7 +15095,7 @@ __device__ static void bkGiGatherHero(const DScene& sc, int diffraction, const D
 // physical lens, -heroc 1). Device twin of BackwardRenderer::giGather.
 __device__ static double bkGiGather(const DScene& sc, int diffraction, const DHit& h, Real rho,
                                     Real lambda, double invPdfLambda, DRng& rng, DGiCtx gi) {
-    const DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    const DVec3 ngo = dShadedNg(h);
     const int n = sc.bkGiDirs * 2;
     double p1, p2; dGiPhases(gi.sIdx, p1, p2);
     double acc = 0.0, wSum = 0.0;
@@ -15245,7 +15250,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
                                       DRng& rng) {
     DVec3 total(0, 0, 0);
     DVec3 f = rhoRGB / (Real)DPI;                     // Lambertian BRDF (per channel)
-    DVec3 ngo0 = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    DVec3 ngo0 = dShadedNg(h);
     DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
     for (int di = 0; di < draw.n; ++di) {
         const int k = draw.emitter(di);
@@ -15317,7 +15322,7 @@ __device__ static DVec3 bkNeeEnvRGB(const DScene& sc, const DHit& h, const DVec3
     double pdfW = 1.0 / (4.0 * DPI);
     Real cosSurf = dot(h.n, wi);
     if (cosSurf <= (Real)0) return DVec3(0, 0, 0);
-    DVec3 ngo = (dot(h.ng, h.n) >= 0) ? h.ng : h.ng * (Real)(-1);
+    DVec3 ngo = dShadedNg(h);
     Real stG = dShadowTerminatorG(wi, h.n, ngo);
     if (stG <= (Real)0) return DVec3(0, 0, 0);
     double farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
@@ -15436,7 +15441,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                 DVec3 nb = h.n * (Real)(-1);
                 L = L + hadamard(beta, bkNeeLightRGB(sc, h, rhoR, rng));
                 if (sc.envIndex >= 0) L = L + hadamard(beta, bkNeeEnvRGB(sc, h, rhoR, rng));
-                DHit hb = h; hb.n = nb;
+                DHit hb = h; hb.n = nb; hb.back = !h.back;
                 L = L + hadamard(beta, bkNeeLightRGB(sc, hb, rhoT, rng));
                 if (sc.envIndex >= 0) L = L + hadamard(beta, bkNeeEnvRGB(sc, hb, rhoT, rng));
                 if (directOnly) return L;                   // Whitted: no diffuse indirect
@@ -16321,7 +16326,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         // Veach adjoint shading-normal correction on the LIGHT subpath only (1 when
         // ns==ng). wo = toward previous (light-side) vertex; wi = sampled continuation.
         if (importance && !delta) {
-            DVec3 ngo = (dot(path[cur].ng, path[cur].ns) >= 0.0) ? path[cur].ng : path[cur].ng * (Real)(-1);
+            DVec3 ngo = dVertexGeoN(path[cur]);
             const double adj = (double)dShadingAdjointCorr(wo, normalize(wi), path[cur].ns, ngo);
             beta *= adj;                                        // purely geometric: same for all λ
             for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= adj;
@@ -16790,7 +16795,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             // geometric front side too, else a smoothed shading normal leaks light through the
             // back face; ramp smoothly instead of a hard cutoff (Chiang 2019). No-op when ns==ng
             // (stG==1); skipped for two-sided (transmissive) materials.
-            DVec3 ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
+            DVec3 ngoQ = dVertexGeoN(qs);
             double stG = twoSided ? 1.0 : (double)dShadowTerminatorG(wcam, qs.ns, ngoQ);
             if (stG <= 0.0) return 0.0;
             f = dBsdfFAdjoint(sc, qs, wo, wcam, lambda);   // ADJOINT: qs is a particle vertex
@@ -16922,7 +16927,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             // ramp smoothly instead of a hard cutoff (Chiang 2019). No-op when ns==ng (stG==1);
             // skipped for two-sided (transmissive) materials.
             if (!twoSided) {
-                DVec3 ngoP = (ddot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * (Real)(-1);
+                DVec3 ngoP = dVertexGeoN(pt);
                 stG = (double)dShadowTerminatorG(wi, pt.ns, ngoP);
                 if (stG <= 0.0) return 0.0;
             }
@@ -17004,7 +17009,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGE==1);
             // skipped for two-sided (transmissive) materials.
             if (!twoSidedE) {
-                DVec3 ngoE = (ddot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * (Real)(-1);
+                DVec3 ngoE = dVertexGeoN(pt);
                 stGE = (double)dShadowTerminatorG(w, pt.ns, ngoE);
                 if (stGE <= 0.0) return 0.0;
             }
@@ -17018,7 +17023,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             // Geometric-hemisphere softening on the light endpoint (connection dir -w): ramp
             // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGL==1);
             // skipped for two-sided (transmissive) materials.
-            ngoQ = (ddot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * (Real)(-1);
+            ngoQ = dVertexGeoN(qs);
             if (!twoSidedL) {
                 stGL = (double)dShadowTerminatorG(w * (Real)-1, qs.ns, ngoQ);
                 if (stGL <= 0.0) return 0.0;
@@ -17136,7 +17141,7 @@ __device__ static void dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const 
     const int ix = (int)fmin(fmax(floor(((double)vk.p.x - (double)sm.lo.x) / (double)sm.cell), 0.0), (double)(sm.nx - 1));
     const int iy = (int)fmin(fmax(floor(((double)vk.p.y - (double)sm.lo.y) / (double)sm.cell), 0.0), (double)(sm.ny - 1));
     const int iz = (int)fmin(fmax(floor(((double)vk.p.z - (double)sm.lo.z) / (double)sm.cell), 0.0), (double)(sm.nz - 1));
-    const DVec3 ngo = (ddot(vk.ng, vk.ns) >= 0.0) ? vk.ng : DVec3{-vk.ng.x, -vk.ng.y, -vk.ng.z};
+    const DVec3 ngo = dVertexGeoN(vk);
     for (int dz = -1; dz <= 1; ++dz) { const int cz = iz + dz; if (cz < 0 || cz >= sm.nz) continue;
     for (int dy = -1; dy <= 1; ++dy) { const int cy = iy + dy; if (cy < 0 || cy >= sm.ny) continue;
     for (int dx = -1; dx <= 1; ++dx) { const int cx = ix + dx; if (cx < 0 || cx >= sm.nx) continue;
@@ -19460,7 +19465,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             dVCM /= cosThetaIn; dVC /= cosThetaIn; dVM /= cosThetaIn;
 
             DVec3 wo = normalize(prevP - h.p);
-            DVec3 ngo = (ddot(h.ng, h.n) >= 0.0) ? h.ng : h.ng * (Real)-1;
+            DVec3 ngo = dShadedNg(h);
 
             // A strand is never a light vertex (vcm.h traceLightSubpath, 0.365.0): neither stored
             // nor splat, and the walk ends after its scatter below.
@@ -19791,7 +19796,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
 
             if (dConnectibleType(mp->type)) {
                 DVertex vt = dVertFromHit(h, matId);
-                DVec3 ngoCam = (ddot(h.ng, h.n) >= 0.0) ? h.ng : h.ng * (Real)-1;
+                DVec3 ngoCam = dShadedNg(h);
                 bool twoSidedCam = dTwoSidedType(mp->type);
 
                 // (b) NEE (s=1) — connect to a freshly sampled light point.
@@ -19966,7 +19971,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     double distc = sqrt(dist2); DVec3 w = dv * (Real)(1.0 / distc);
                     double cosCam = ddot(h.n, w);
                     double cosLit = ddot(lv.ns, w * (Real)-1);
-                    DVec3 ngoLit = (ddot(lv.ng, lv.ns) >= 0.0) ? lv.ng : lv.ng * (Real)-1;
+                    DVec3 ngoLit = (lv.back ? lv.ng * (Real)(-1) : lv.ng);
                     bool twoSidedLit = dTwoSidedType(sc.mats[lv.matId].type);
                     double stGCam = twoSidedCam ? 1.0 : (double)dShadowTerminatorG(w, h.n, ngoCam);
                     double stGLit = twoSidedLit ? 1.0 : (double)dShadowTerminatorG(w * (Real)-1, lv.ns, ngoLit);
@@ -20514,6 +20519,8 @@ __global__ static void kHitProbe(DScene sc, const DevHitProbeRay* rays, int n, D
         o.q[0] = in.x; o.q[1] = in.y; o.q[2] = in.z;
         o.qn[0] = in.nx; o.qn[1] = in.ny; o.qn[2] = in.nz; o.qcurv = in.curv;
         o.cavity = dCavityOf(sc, h);
+        const DVec3 sng = dShadedNg(h);
+        o.sng[0] = sng.x; o.sng[1] = sng.y; o.sng[2] = sng.z;
     }
     out[i] = o;
 }

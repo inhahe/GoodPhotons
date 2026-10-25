@@ -2549,7 +2549,7 @@ struct BackwardRenderer {
                 L += thr * neeLight(scene, h, rhoR, invPdfLambda, lambda, rng, spdCache, gi);
                 if (scene.envIndex >= 0)
                     L += thr * neeEnv(scene, h, rhoR, invPdfLambda, lambda, rng);
-                Hit hb = h; hb.n = -h.n;                 // back hemisphere for the transmit lobe
+                Hit hb = h; hb.n = -h.n; hb.back = !h.back;   // back hemisphere for the transmit lobe
                 L += thr * neeLight(scene, hb, rhoT, invPdfLambda, lambda, rng, spdCache, gi);
                 if (scene.envIndex >= 0)
                     L += thr * neeEnv(scene, hb, rhoT, invPdfLambda, lambda, rng);
@@ -3410,7 +3410,7 @@ struct BackwardRenderer {
                     neeLightHero(scene, h, rhoR, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
                     if (scene.envIndex >= 0)
                         neeEnvHero(scene, h, rhoR, L, thr, lam, invPdf, nUp, rng);
-                    Hit hb = h; hb.n = -h.n;                     // back hemisphere (transmit lobe)
+                    Hit hb = h; hb.n = -h.n; hb.back = !h.back;       // back hemisphere (transmit lobe)
                     neeLightHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
                     if (scene.envIndex >= 0)
                         neeEnvHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng);

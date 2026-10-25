@@ -702,7 +702,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         // Geometric normal oriented onto the shading-normal side, for the Veach adjoint
         // shading-normal correction on this LIGHT (particle) subpath (§5.3; identical role
         // to render.h/bdpt.h). Exactly a no-op when h.n==h.ng (flat tris, analytic spheres).
-        Vec3 ngo = (dot(h.ng, h.n) >= 0.0) ? h.ng : h.ng * -1.0;
+        Vec3 ngo = orientedGeoN(h);
 
         // Store the vertex + connect to camera (only for connectible, non-delta surfaces).
         // A strand is never a light vertex (0.365.0): neither stored nor splat, and the walk
@@ -1149,7 +1149,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 // geometric front side, ramped smoothly instead of a hard cutoff (Chiang 2019).
                 // No-op when ns==ng (stG==1); skipped for two-sided materials.
                 Vec3 ngoCam = orientedGeoN(h);
-                Vec3 ngoLit = (dot(lv.ng, lv.ns) >= 0.0) ? lv.ng : lv.ng * -1.0;
+                Vec3 ngoLit = lv.hit.back ? lv.ng * -1.0 : lv.ng;   // orientedGeoN(lv.hit)
                 double stGCam = isTwoSidedMat(*mp)     ? 1.0 : shadowTerminatorG(w, h.n, ngoCam);
                 double stGLit = isTwoSidedMat(*lv.mat) ? 1.0 : shadowTerminatorG(w * -1.0, lv.ns, ngoLit);
                 bool camSide = isTwoSidedMat(*mp)
@@ -1164,7 +1164,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                                            &lv.hit);
                 // Adjoint correction on the LIGHT-subpath endpoint lv only (particle side;
                 // outgoing = -w toward the camera vertex). fCam is the Radiance side — none.
-                // Uses lv.ng oriented to lv.ns (ngoLit above); a no-op when the mesh is flat.
+                // Uses lv.ng on the side lv was shaded from (ngoLit above); a no-op when the mesh is flat.
                 const double adjLit = shadingAdjointCorr(lv.wo, w * -1.0, lv.ns, ngoLit) * stGLit;
                 fLit *= adjLit;
                 // HERO CONNECTION. Both subpaths of this path index were drawn from ONE
@@ -1260,7 +1260,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     // Gather-side shading-normal correction (cos_s/cos_g at the merge point):
                     // rebalances the geometric-cosine density estimate onto the shading cosine
                     // so a smooth mesh merges smoothly like mode R. 1 when h.n==h.ng (flat).
-                    Vec3 ngoCam = (dot(h.ng, h.n) >= 0.0) ? h.ng : h.ng * -1.0;
+                    Vec3 ngoCam = orientedGeoN(h);
                     const double gcorr = vmGatherCorr(wMerge, h.n, ngoCam);
                     fCam *= gcorr;
                     // The merge MIS weight is built from λ-independent densities, evaluated

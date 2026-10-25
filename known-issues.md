@@ -168,19 +168,27 @@ the hair is 2e-6 of the triangle's reach (its farthest vertex from the origin, `
 baked at upload, `Hit::pscale` on the host), some 17 float ulps of the coordinates the hit was
 computed from. CHECKER-ON-BOUNDARY above has the measurements.
 
-## OPEN (2026-10-25, 0.400.1): ORIENTEDGEON-TIPPED — the shaded-side geometric normal is read off a normal-mapped n
+## DONE (2026-10-25, 0.400.3): ORIENTEDGEON-TIPPED — the shaded-side geometric normal was read off a tipped n
 
-`orientedGeoN(h)` (geometry.h) turns ng to the side `h.n` points, and `h.n` is the shading
-normal *after* the normal map. Where a strong map tips n across the surface's plane, or a
-non-uniform instance scale turns an interpolated normal more than 90 degrees from its face's
-(see `Hit::back`), it returns the side the ray did not come from. Its callers -- ray-spawn
-offsets (`h.p + orientedGeoN(h) * 1e-6` in backward.h's NEE and media transmittance),
-`shadowTerminatorG`, render.h's camera splats -- then offset into the surface or judge the
-terminator against the wrong side. Not seen in any scene; a map at strength 1 keeps n's
-normal component positive. Proper fix: `orientedGeoN` from `h.back` (`back ? -ng : ng`), which
-every intersector now records, and its device twin likewise -- but the fur volume's synthetic
-fiber hit (backward.h `vh`) sets n without an intersector, so it must set `back` too, and every
-hand-built hit in the self-checks with it. `cavityAt` already uses `back` (0.400.1).
+`orientedGeoN(h)` (geometry.h), and some twenty copies of it inline (vcm.h, the device's
+`(dot(h.ng, h.n) >= 0) ? h.ng : -h.ng`, and the vertex forms over `ng` and `ns` in bdpt.h,
+vcm.h and the device's BDPT/VCM), turned ng to the side `h.n` points, `h.n` being the shading
+normal after the normal map. Where a map tips n across the surface's plane -- any texel with
+blue below 0.5, whatever the strength -- or a non-uniform instance scale turns an interpolated
+normal more than 90 degrees from its face's (any `scale 1 0.1 1` of a smooth mesh: 18 hits in
+-checkdevhits' scene), it named the side the ray did not come from. There n points into the
+surface, so light on the ray's side meets a negative cosine either way; but light from BEHIND
+the surface leaked onto such a hit -- the terminator passed it (judged against the far side as
+if it were the shaded one) and the shadow ray was offset to the far side to reach it -- while
+`cavityAt` (0.400.1) already probed the ray's side. All of them
+now take the side from `Hit::back` / `DHit::back` / the vertices' `back` (`orientedGeoN`,
+`vertexGeoN`, `dShadedNg`, `dVertexGeoN`); the transmit lobe's back-hemisphere copies
+(`Hit hb = h; hb.n = -h.n`, host and device) flip `back` with n -- which also makes a pattern
+read at hb on a translucent see the normal it sees at h. Bit-identical on scenes where nothing
+tips n (13 renders, both devices, modes R, D, B and J, a normal-mapped wall among them), and on
+a squashed smooth dome lit only from above (its tipped hits get nothing either way).
+Found by the Opus review of 0.400.1; -checkdevhits holds orientedGeoN to the ray's side on
+every hit and the device's dShadedNg to it.
 
 ## DONE (2026-10-25, 0.400.1-0.400.2): NORMALMAP-BACK-MIRROR — a normal-mapped surface seen from behind showed one of its relief's slopes mirrored
 

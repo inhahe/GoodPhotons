@@ -683,6 +683,7 @@ struct DevHitProbeOut {
     double t, p[3], n[3], ng[3], pscale, fiberRadius, curv, tangentZ;
     double q[3], qn[3], qcurv;   // dPatIn: the point, normal and curvature a pattern reads there
     double cavity;               // dCavityOf: its `cavity`, where the material reads it
+    double sng[3];               // dShadedNg: the geometric normal on the side being shaded
 };
 bool cudaHitProbe(const Scene& scene, const DevHitProbeRay* rays, int n, DevHitProbeOut* out);
 

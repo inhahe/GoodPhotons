@@ -262,15 +262,18 @@ struct Hit {
     double fw = 0.0;
 };
 
-// Geometric surface normal oriented onto the SAME side as the (ray-oriented) shading
-// normal h.n. For a flat triangle or an analytic sphere the shading and geometric
-// normals coincide, so this returns exactly h.n's direction (the helper is a no-op
-// there). It only differs when a smooth/interpolated shading normal (authored `vn`
-// or crease-smoothing) diverges from the true geometry — the case where next-event
-// estimation and BSDF continuations must be clamped to the geometric hemisphere to
-// stop light leaking through the back of the surface (the shading-normal problem).
+// Geometric surface normal on the side being shaded: the side the ray came from, as the
+// intersector decided it (Hit::back). For a flat triangle or an analytic sphere the shading
+// and geometric normals coincide, so this returns exactly h.n's direction. It differs when
+// a smooth/interpolated shading normal (authored `vn` or crease-smoothing) diverges from the
+// true geometry -- the case where next-event estimation and BSDF continuations must be
+// clamped to the geometric hemisphere to stop light leaking through the back of the surface
+// (the shading-normal problem). Not read off h.n: where a normal map or a non-uniform
+// instance scale has turned n across the surface's plane, n points to the other side, and
+// spawn offsets, the terminator and the cavity probe would disagree about one hit. A hit
+// made by hand sets `back` as an intersector would (and a copy whose n is flipped, flips it).
 inline Vec3 orientedGeoN(const Hit& h) {
-    return (dot(h.ng, h.n) >= 0.0) ? h.ng : Vec3{-h.ng.x, -h.ng.y, -h.ng.z};
+    return h.back ? Vec3{-h.ng.x, -h.ng.y, -h.ng.z} : h.ng;
 }
 
 // Veach shading-normal ADJOINT correction factor (Veach §5.3; PBRT

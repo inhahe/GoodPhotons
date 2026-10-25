@@ -7314,7 +7314,11 @@ as the one at fault.
     triangle's from its face normal): n against ng cannot tell it after a normal map has
     tipped n across the plane, nor under a non-uniform instance scale, whose inverse transpose
     keeps the side of a direction (dot(d, n)) but not of one normal against another, and so can
-    turn an interpolated normal across its face's plane. `Hit::patOwnSide` / `DHit::patOwnSide`
+    turn an interpolated normal across its face's plane. Everything that wants the geometric
+    normal on the side being shaded takes it from `back` too (0.400.3: `orientedGeoN`,
+    `vertexGeoN`, `dShadedNg`, `dVertexGeoN`) -- spawn offsets, the shadow terminator, the
+    Veach adjoint, the cavity probe -- so one hit has one side; a copy whose n is flipped
+    (the transmit lobe's back hemisphere) flips `back` with it. `Hit::patOwnSide` / `DHit::patOwnSide`
     is the surface's material's flag, set at the closest-hit choke points (`Scene::markPatSide`,
     the device closestHit) with the surface's own material -- the rule is the surface's, so
     every pattern on it follows it, a mix's opaque part's too. Both ride on the hit rather than

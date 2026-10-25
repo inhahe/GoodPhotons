@@ -3876,12 +3876,12 @@ static int checkDevHits() {
 
     const char* fieldName[] = {"validity", "material", "back", "own-side flag", "t", "point", "shading normal",
                                "geometric normal", "pscale", "curvature", "strand radius", "vertex colour",
-                               "tangent", "pattern height", "pattern normal", "cavity"};
+                               "tangent", "pattern height", "pattern normal", "cavity", "shaded-side ng"};
     const int nField = (int)(sizeof(fieldName) / sizeof(fieldName[0]));
     std::vector<int> badField(nField, 0);
     // Host-side: hits whose `back` is not the side the ray met ng from; hits where n against ng
     // would have told it wrong (the squashed instance must make some, or it tests nothing).
-    int hits = 0, backHits = 0, ownBack = 0, backOff = 0, proxyOff = 0, probeHit = 0;
+    int hits = 0, backHits = 0, ownBack = 0, backOff = 0, proxyOff = 0, probeHit = 0, geoOff = 0;
     auto vdot = [](const double* a, const Vec3& b) { return a[0] * b.x + a[1] * b.y + a[2] * b.z; };
     auto vdist = [](const double* a, const Vec3& b) {
         return std::sqrt((a[0] - b.x) * (a[0] - b.x) + (a[1] - b.y) * (a[1] - b.y) + (a[2] - b.z) * (a[2] - b.z));
@@ -3903,7 +3903,7 @@ static int checkDevHits() {
             }
         }
         const DevHitProbeOut& o = dev[i];
-        bool b[16] = {};
+        bool b[17] = {};
         b[0] = (o.valid != 0) != h.valid;
         if (h.valid && o.valid) {
             ++hits;
@@ -3923,9 +3923,13 @@ static int checkDevHits() {
             b[10] = std::fabs(o.fiberRadius - h.fiberRadius) > 1e-6 * std::max(1.0, h.fiberRadius);
             b[11] = (o.vcol >= 0) != h.hasVcol;
             b[12] = !closest && std::fabs(o.tangentZ - h.tangent.z) > 1e-4;
+            b[16] = vdot(o.sng, orientedGeoN(h)) < 0.999;
             if (closest) {
                 const bool fromBehind = dot(r.d, h.ng) > 0.0;
                 backOff += (h.back != fromBehind) ? 1 : 0;
+                // The shaded side's geometric normal faces the ray that came from that side --
+                // spawn offsets and the terminator rely on it, tipped n or not.
+                geoOff += dot(orientedGeoN(h), r.d) > 0.0 ? 1 : 0;
                 proxyOff += ((dot(h.n, h.ng) < 0.0) != h.back) ? 1 : 0;
                 if (fromBehind) { ++backHits; if (h.patOwnSide) ++ownBack; }
             }
@@ -3983,10 +3987,12 @@ static int checkDevHits() {
     }
     if (backOff)
         std::printf("[checkdevhits] host: `back` is not the side the ray met ng from on %d hits FAIL\n", backOff);
+    if (geoOff)
+        std::printf("[checkdevhits] host: orientedGeoN faces away from the ray on %d hits FAIL\n", geoOff);
     if (nmBad || nmTilted < nmPairs || nmPairs < 12)
         std::printf("[checkdevhits] host: the normal-mapped quad's normal from behind is not its front one negated "
                     "on %d of %d pairs (%d tilted by the map) FAIL\n", nmBad, nmPairs, nmTilted);
-    bad += backOff + nmBad + (nmTilted < nmPairs || nmPairs < 12 ? 1 : 0);
+    bad += backOff + geoOff + nmBad + (nmTilted < nmPairs || nmPairs < 12 ? 1 : 0);
     const bool covered = hits > (int)(rays.size() / 2) && backHits > 40 && ownBack > 10 && proxyOff > 0 &&
                          probeHit > 10;
     if (proxyOff == 0)

@@ -359,6 +359,10 @@ struct Vertex {
     }
 };
 
+// The geometric normal on the side a vertex was shaded from (orientedGeoN): its hit's side.
+// A light or camera vertex has no hit (`back` false) and keeps its own ng.
+inline Vec3 vertexGeoN(const Vertex& v) { return v.hit.back ? v.ng * -1.0 : v.ng; }
+
 // Henyey-Greenstein phase function value AND sampling pdf at a medium vertex `v`, for
 // an incoming subpath direction `wo` (toward the previous vertex) and an outgoing /
 // connection direction `wi` (both unit, both pointing AWAY from v). The propagation
@@ -1765,7 +1769,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // all — its factor is longitudinal. On a curve ns == ±ng so this would evaluate to
         // 1 anyway; the guard is what keeps `hair` honest on a triangle mesh.)
         if (mode == Mode::Importance && !delta && mp->type != MatType::Hair) {
-            Vec3 ngo = (dot(cur.ng, cur.ns) >= 0.0) ? cur.ng : cur.ng * -1.0;
+            Vec3 ngo = vertexGeoN(cur);
             const double adj = shadingAdjointCorr(wo, normalize(wi), cur.ns, ngo);
             beta *= adj;                                     // purely geometric: same for every λ
             for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= adj;
@@ -3567,7 +3571,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             // Reflect-only vertices require the +ns side; a two-sided vertex may connect on
             // either side (transmit lobe), so gate on bsdfF and use |cosSurf| in G.
             if (cosSurf == 0.0 || (!isTwoSidedMat(*qs.mat) && cosSurf < 0.0)) return 0.0;
-            Vec3 ngo = (dot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * -1.0;
+            Vec3 ngo = vertexGeoN(qs);
             // Geometric-hemisphere softening: a reflect-only vertex must see the camera on
             // its GEOMETRIC front side, else a smoothed shading normal leaks light through the
             // back face (shading-normal problem). A hard cutoff there facets the terminator,
@@ -3747,7 +3751,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             // must see the sampled light on its geometric front side; ramp smoothly instead of
             // a hard cutoff (Chiang 2019). No-op when ns==ng (stG==1).
             if (!isTwoSidedMat(*pt.mat)) {
-                Vec3 ngo = (dot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * -1.0;
+                Vec3 ngo = vertexGeoN(pt);
                 stG = shadowTerminatorG(wi, pt.ns, ngo);
                 if (stG <= 0.0) return 0.0;
             }
@@ -3806,7 +3810,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             // Geometric-hemisphere softening on the eye endpoint (connection dir w): ramp
             // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGE==1).
             if (!isTwoSidedMat(*pt.mat)) {
-                Vec3 ngoE = (dot(pt.ng, pt.ns) >= 0.0) ? pt.ng : pt.ng * -1.0;
+                Vec3 ngoE = vertexGeoN(pt);
                 stGE = shadowTerminatorG(w, pt.ns, ngoE);
                 if (stGE <= 0.0) return 0.0;
             }
@@ -3821,7 +3825,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         } else {
             cosL = dot(qs.ns, w * -1.0);
             if (cosL == 0.0 || (!isTwoSidedMat(*qs.mat) && cosL < 0.0)) return 0.0;
-            Vec3 ngoL = (dot(qs.ng, qs.ns) >= 0.0) ? qs.ng : qs.ng * -1.0;
+            Vec3 ngoL = vertexGeoN(qs);
             // Geometric-hemisphere softening on the light endpoint (connection dir -w): ramp
             // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGL==1).
             if (!isTwoSidedMat(*qs.mat)) {
@@ -4776,8 +4780,7 @@ struct BdptRenderer {
                                 sw.segSumM      = segSumM[(size_t)k - 1];
                                 sw.camVert      = k;
                                 sw.maxDepth     = maxDepth;
-                                const Vec3 ngo = (dot(vk.ng, vk.ns) >= 0.0) ? vk.ng
-                                                                            : vk.ng * -1.0;
+                                const Vec3 ngo = vertexGeoN(vk);
                                 const JSpec* vkSpec =
                                     (jSpecOn && (size_t)k < jsw.vert.size() && jsw.vert[(size_t)k].on())
                                         ? &jsw.vert[(size_t)k] : nullptr;
