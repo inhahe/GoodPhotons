@@ -2681,13 +2681,14 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
             // the Gram-Schmidt against the interpolated normal is per-pixel work. A zero
             // tanRaw means degenerate/absent UVs: fall back to a stable basis about N,
             // exactly as before. Perturbing here (not in the G-buffer) keeps the pass-2
-            // inner loop untouched. Built about the surface's own normal and turned to the
-            // eye after, as the tracers do (Scene::applyNormalMap says why).
+            // inner loop untouched. The slope in the surface's own frame, the height toward
+            // the eye but from behind a surface light can cross, as the tracers have it
+            // (Scene::applyNormalMap says why).
             if (textures && sh->normalTex >= 0 && sh->normalTex < (int)textures->size()) {
                 const Texture& nx = (*textures)[sh->normalTex];
                 if (nx.valid()) {
-                    const double own = seenFromBehind(pt, cam.eye) ? -1.0 : 1.0;
-                    const Vec3 No = N3 * own;
+                    const bool behind = seenFromBehind(pt, cam.eye);
+                    const Vec3 No = behind ? N3 * -1.0 : N3;
                     Vec3 T = pt.tanRaw;
                     if (!(dot(T, T) > 0.0)) {
                         Vec3 ax = (std::fabs(No.x) < 0.9) ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
@@ -2699,10 +2700,10 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                         T = T * (1.0 / tl);
                         Vec3 B3 = cross(No, T) * (double)pt.tanSign;   // mirrored UVs: -1
                         Vec3 tn = nx.sampleNormalTS(g.uv[i].x, g.uv[i].y);
-                        double s3 = sh->normalStrength;
-                        Vec3 pert = T * (tn.x * s3) + B3 * (tn.y * s3) + No * tn.z;
+                        const double s3 = (behind && pt.patOwnSide) ? -sh->normalStrength : sh->normalStrength;
+                        Vec3 pert = T * (tn.x * s3) + B3 * (tn.y * s3) + N3 * tn.z;
                         double pl = std::sqrt(dot(pert, pert));
-                        if (pl > 1e-12) N3 = pert * (own / pl);
+                        if (pl > 1e-12) N3 = pert * (1.0 / pl);
                     }
                 }
             }

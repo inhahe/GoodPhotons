@@ -66,10 +66,10 @@ inline const char* matTypeName(MatType t) {
     switch (t) {
         case MatType::Dielectric:      return "dielectric";
         case MatType::Mirror:          return "mirror";
-        case MatType::HalfMirror:      return "half_mirror";
+        case MatType::HalfMirror:      return "halfmirror";
         case MatType::Glossy:          return "glossy";
         case MatType::Fluorescent:     return "fluorescent";
-        case MatType::ThinFilm:        return "thin_film";
+        case MatType::ThinFilm:        return "thinfilm";
         case MatType::Grating:         return "grating";
         case MatType::Mix:             return "mix";
         case MatType::Multilayer:      return "multilayer";
@@ -416,8 +416,10 @@ struct Material {
     // a patterned material that never says `cavity` fires none. See the long note on
     // setupCavity for why a scene-wide flag would not do.
     bool readsCavity = false;
-    // Light can cross this surface: a dielectric (plain or coated), half mirror, filter or
-    // translucent, or a mix / layered stack with such a part. Its patterns see the normal,
+    // Light can cross this surface: a dielectric (plain or coated), half mirror, filter,
+    // translucent, a thin film or multilayer stack entered somewhere in the band (one on an
+    // absorbing substrate or with an absorbing layer throughout is not: coatOpaque), or a
+    // mix / layered stack with such a part. Its patterns see the normal,
     // curvature and cavity of the surface's own side (the side ng faces) whichever side a ray
     // arrives from, so a crossing reads the same value both ways (reciprocity); every other
     // surface's see the side being shaded. Set by Scene::finalizePatternSides.
@@ -3440,16 +3442,19 @@ struct Scene {
         if (inst.matOverride >= 0) lh.matId = inst.matOverride;
     }
 
-    // Perturb the shading normal by a bound tangent-space normal map (C6). Builds a
-    // TBN frame from the shading normal on the surface's own side and the hit's surface
-    // tangent, rotates the sampled tangent-space normal into world, and turns the result
-    // to the ray: a bump seen from behind is the same bump, so its normal there is the
-    // front one negated. (About the ray-facing normal the frame's normal and bitangent
-    // would flip and its tangent would not, mirroring the bump along T from behind: light
-    // crossing a normal-mapped pane would meet a different surface each way.) A no-op
-    // unless the hit's material carries a valid normalTex. Applied at the single
-    // closestHit choke point so every CPU renderer (backward, forward, BDPT, VCM,
-    // SPPM, photon map, GRIN) sees the perturbed normal identically.
+    // Perturb the shading normal by a bound tangent-space normal map (C6), and replace h.n.
+    // The relief's slope lies along the surface's own frame -- T and B where u and v grow,
+    // whichever side the ray came from (B about the shading normal on the surface's own
+    // side, the side Tri::bitangentSign is taken on) -- and its height toward the viewer:
+    // seen from behind an opaque surface, the relief faces the viewer as authored, as a
+    // pattern does there (the winding, which two-sided shading hides, must not turn bumps
+    // into dents). Seen from behind a surface light can cross, the same relief seen from its
+    // back -- the slope negated too, so the normal is the front one negated and light
+    // crossing either way meets one surface. (A frame built about the ray-facing normal
+    // flipped B and not T from behind: the bump mirrored along T.) A no-op unless the hit's
+    // material carries a valid normalTex. Applied at the single closestHit choke point so
+    // every CPU renderer (backward, forward, BDPT, VCM, SPPM, photon map, GRIN) sees the
+    // perturbed normal identically.
     void applyNormalMap(Hit& h) const {
         if (!h.valid || h.matId < 0 || h.matId >= (int)mats.size()) return;
         const Material& m = mats[h.matId];
@@ -3457,17 +3462,16 @@ struct Scene {
         const Texture& tx = textures[m.normalTex];
         if (!tx.valid()) return;
         Vec3 tn = tx.sampleNormalTS(h.u, h.v);          // tangent-space normal
-        const double own = h.back ? -1.0 : 1.0;
-        const Vec3 N = h.n * own;                       // on the surface's own side
-        Vec3 T = h.tangent - N * dot(N, h.tangent);     // re-orthogonalize per-hit
+        const Vec3 No = h.back ? h.n * -1.0 : h.n;      // on the surface's own side
+        Vec3 T = h.tangent - No * dot(No, h.tangent);   // re-orthogonalize per-hit
         double tl = std::sqrt(dot(T, T));
         if (tl < 1e-9) return;                          // degenerate frame: leave n as-is
         T = T * (1.0 / tl);
-        Vec3 B = cross(N, T) * h.bitangentSign;
-        double s = m.normalStrength;
-        Vec3 pert = T * (tn.x * s) + B * (tn.y * s) + N * tn.z;
+        Vec3 B = cross(No, T) * h.bitangentSign;
+        const double slope = (h.back && h.patOwnSide) ? -m.normalStrength : m.normalStrength;
+        Vec3 pert = T * (tn.x * slope) + B * (tn.y * slope) + h.n * tn.z;
         double pl = std::sqrt(dot(pert, pert));
-        if (pl > 1e-12) h.n = pert * (own / pl);        // and back to the ray's side
+        if (pl > 1e-12) h.n = pert * (1.0 / pl);
     }
 
     // `skipHair` makes fibers INVISIBLE to the closest-hit query, the same way

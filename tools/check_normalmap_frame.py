@@ -15,12 +15,22 @@ surface and a tilt down darkens it.
      vertex normals outward), and must use +1 too. Checked against the path tracer: the map darkens
      or brightens the sphere's front, against a plain sphere beside it, the same way in the preview
      as in mode R.
-  3. SEEN FROM BEHIND. A quad wearing a map tilted along T, RGB (0.8, 0.5, 0.9), i.e.
-     n = (0.6, 0, 0.8), seen from in front with the sun off to -T, and from behind with the sun
-     off to +T -- the same view turned half round. A bump seen from behind is the same bump, so the
-     map turns the quad's normal from the sun in both (darker than the plain quad); a frame built
-     about the ray-facing normal mirrors the tilt along T from behind and turns it toward the sun
-     (brighter). Checked in mode R on both devices and in both previews.
+  3. SEEN FROM BEHIND, A SURFACE LIGHT CAN CROSS. Translucent quads, the mapped one wearing a
+     map tilted along T, RGB (0.8, 0.5, 0.9), i.e. n = (0.6, 0, 0.8), seen from in front with the
+     sun off to -T, and from behind with the sun off to +T -- the same view turned half round.
+     Light crossing it either way must meet one surface, so from behind it is the same relief seen
+     from its back: the map turns the quad's normal from the sun in both (darker than the plain
+     quad); a frame built about the ray-facing normal mirrors the tilt along T from behind and
+     turns it toward the sun (brighter).
+  4. SEEN FROM BEHIND, OPAQUE. Diffuse quads, the mapped one tilted along B (case 1's map), seen
+     from in front and from behind with the sun above on the viewer's side. On an opaque surface
+     the relief faces the viewer as authored, whichever way the quad is wound: the map tilts it up,
+     toward the sun, in both (brighter). Mirroring the slope along v from behind, or showing the
+     relief's back (bumps as dents), tilts it down (darker).
+  5. WOUND AGAINST ITS NORMALS. The mapped quad of case 4 with its faces wound against its `vn`,
+     seen from the `vn` side: it tilts up as the quad wound with them does. A bitangent sign
+     taken against the winding instead mirrors its slope along v.
+Cases 3-5 in mode R on both devices and in both previews.
 Comparisons are within one image, so each renderer's own exposure cancels. Exits 1 on any failure.
 """
 import argparse
@@ -69,21 +79,32 @@ def write_inputs(d):
                 ['camera "c" { eye 0 0 6  look_at 0 0 0  up 0 1 0  fov_y 25  film { res 400 200 } }'] + common +
                 ['sphere { center -0.6 0 0  radius 0.5  material m }',
                  'sphere { center 0.6 0 0  radius 0.5  material plain }'])
-    # 3) seen from behind: the top-left quad alone (u grows with x, so T = +x), tilted along T
+    # 3-5) the top-left quad alone (u grows with x, so T = +x and B = +y), wound with its vn and
+    #      against it, and the reference below
     Image.fromarray(np.full((W, W, 3), np.round(np.array((0.8, 0.5, 0.9)) * 255), np.uint8)).save(os.path.join(d, "tiltT.ppm"))
-    write_lines(os.path.join(d, "tquad.obj"), [
-        "v -1.1 0.05 0", "v -0.1 0.05 0", "v -0.1 1.05 0", "v -1.1 1.05 0",
-        "vt 0 0", "vt 1 0", "vt 1 1", "vt 0 1", "vn 0 0 1",
-        "f 1/1/1 2/2/1 3/3/1", "f 1/1/1 3/3/1 4/4/1"])
-    for view, eye, sun in (("front", "0 0 6", "-0.8 0 0.6"), ("back", "0 0 -6", "0.8 0 -0.6")):
-        write_lines(os.path.join(d, "behind_%s.ftsl" % view), [
-            'camera "c" { eye %s  look_at 0 0 0  up 0 1 0  fov_y 25  film { res 200 200 } }' % eye,
-            'texture "nt" { file "%s/tiltT.ppm"  encoding linear  filter bilinear  wrap repeat }' % d,
-            'material "mt" { type diffuse reflect 0.3  normal_map texture:nt }',
-            'material "plain" { type diffuse reflect 0.3 }',
-            'light sun { dir %s  angle 0.53  spd blackbody 5800  intensity 1e-13 }' % sun,
-            'mesh "q" { file "%s/tquad.obj"  material mt  uv use_mesh }' % d,
-            'mesh "r" { file "%s/ref.obj"  material plain }' % d])
+    quad = ["v -1.1 0.05 0", "v -0.1 0.05 0", "v -0.1 1.05 0", "v -1.1 1.05 0",
+            "vt 0 0", "vt 1 0", "vt 1 1", "vt 0 1", "vn 0 0 1"]
+    write_lines(os.path.join(d, "tquad.obj"), quad + ["f 1/1/1 2/2/1 3/3/1", "f 1/1/1 3/3/1 4/4/1"])
+    write_lines(os.path.join(d, "tquad_rev.obj"), quad + ["f 1/1/1 3/3/1 2/2/1", "f 1/1/1 4/4/1 3/3/1"])
+    cases = {
+        # name: (map, the type and its parameters, quad, (view, eye, sun) ...)
+        "behind_cross": ("tiltT", "translucent reflect 0.3  transmit 0.3", "tquad",
+                         (("front", "0 0 6", "-0.8 0 0.6"), ("back", "0 0 -6", "0.8 0 -0.6"))),
+        "behind_opaque": ("tilt", "diffuse reflect 0.3", "tquad",
+                          (("front", "0 0 6", "0 0.8 0.6"), ("back", "0 0 -6", "0 0.8 -0.6"))),
+        "wound": ("tilt", "diffuse reflect 0.3", "tquad_rev", (("front", "0 0 6", "0 0.8 0.6"),)),
+    }
+    for case, (nmap, mtype, qobj, views) in cases.items():
+        for view, eye, sun in views:
+            write_lines(os.path.join(d, "%s_%s.ftsl" % (case, view)), [
+                'camera "c" { eye %s  look_at 0 0 0  up 0 1 0  fov_y 25  film { res 200 200 } }' % eye,
+                'texture "nt" { file "%s/%s.ppm"  encoding linear  filter bilinear  wrap repeat }' % (d, nmap),
+                'material "mt" { type %s  normal_map texture:nt }' % mtype,
+                'material "plain" { type %s }' % mtype,
+                'light sun { dir %s  angle 0.53  spd blackbody 5800  intensity 1e-13 }' % sun,
+                'mesh "q" { file "%s/%s.obj"  material mt  uv use_mesh }' % (d, qobj),
+                'mesh "r" { file "%s/ref.obj"  material plain }' % d])
+    return cases
 
 
 def run(exe, scene, out, args):
@@ -126,7 +147,7 @@ def main():
     a = ap.parse_args()
     d = os.path.abspath(a.out).replace(chr(92), "/")
     os.makedirs(d, exist_ok=True)
-    write_inputs(d)
+    cases = write_inputs(d)
     ok = True
     # 1) mirrored UVs, both preview backends. At z = 0 the 25-degree camera at 6 sees +-1.33, so the
     #    top quads span x 0.09-0.46 / 0.54-0.91 and y 0.11-0.48 of the frame, the reference x
@@ -152,20 +173,29 @@ def main():
         ok &= good
         print("sphere, %s preview: the map makes its front %.2f of the plain sphere's, the path tracer %.2f  %s"
               % (name.upper(), eff[name], eff["traced"], "ok" if good else "FAIL (the preview tilts it the other way)"))
-    # 3) seen from behind: the mapped quad over the plain one, in front (it spans x 0.09-0.46 of
-    #    the frame) and from behind (the view turned round: x 0.54-0.91)
+    # 3-5) the mapped quad over the plain one, in front (it spans x 0.09-0.46 of the frame) and
+    #      from behind (the view turned round: x 0.54-0.91)
+    want = {"behind_cross": ("darker", lambda e: e < 0.9,
+                             "from behind the relief is mirrored along T, not the same relief"),
+            "behind_opaque": ("brighter", lambda e: e > 1.1,
+                              "from behind the relief does not face the viewer as authored"),
+            "wound": ("brighter", lambda e: e > 1.1, "wound against its normals, the slope along v is mirrored")}
     for name, args in (("cpu preview", ["-raster", "-device", "cpu"]), ("gpu preview", ["-raster", "-device", "gpu"]),
                        ("cpu mode R", ["-mode", "R", "-device", "cpu", "-spp", "64"]),
                        ("gpu mode R", ["-mode", "R", "-device", "gpu", "-spp", "64"])):
         tag = name.replace(" ", "_")
-        f = run(a.exe, d + "/behind_front.ftsl", "%s/behind_front_%s.png" % (d, tag), args)
-        b = run(a.exe, d + "/behind_back.ftsl", "%s/behind_back_%s.png" % (d, tag), args)
-        ef = box(f, 0.13, 0.42, 0.16, 0.43) / max(1e-9, box(f, 0.40, 0.60, 0.58, 0.85))
-        eb = box(b, 0.58, 0.87, 0.16, 0.43) / max(1e-9, box(b, 0.40, 0.60, 0.58, 0.85))
-        good = ef < 0.9 and eb < 0.9
-        ok &= good
-        print("seen from behind, %s: the map makes the quad %.2f of the plain one in front, %.2f from behind  %s"
-              % (name, ef, eb, "ok" if good else "FAIL (from behind the bump is mirrored along T)"))
+        for case, (_, _, _, views) in cases.items():
+            effs = []
+            for view, _, _ in views:
+                img = run(a.exe, "%s/%s_%s.ftsl" % (d, case, view), "%s/%s_%s_%s.png" % (d, case, view, tag), args)
+                x0, x1 = (0.13, 0.42) if view == "front" else (0.58, 0.87)
+                effs.append(box(img, x0, x1, 0.16, 0.43) / max(1e-9, box(img, 0.40, 0.60, 0.58, 0.85)))
+            word, test, why = want[case]
+            good = all(test(e) for e in effs)
+            ok &= good
+            print("%s, %s: the map makes the quad %s of the plain one (%s)  %s"
+                  % (case, name, " / ".join("%.2f %s" % (e, v[0]) for e, v in zip(effs, views)),
+                     "should be " + word, "ok" if good else "FAIL (%s)" % why))
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

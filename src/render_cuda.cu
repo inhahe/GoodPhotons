@@ -3480,6 +3480,10 @@ struct DHit {
     // distance stands in) elsewhere.
     Real pscale = (Real)0;
 };
+#if FTRACE_GPU_FP32
+// Held in every kernel's registers or local memory and in the wavefront state arrays.
+static_assert(sizeof(DHit) == 112, "DHit changed size");
+#endif
 
 // ---- implicit field evaluation (device twin of implicit.h) ----------------
 // smin/smax (Inigo Quilez quadratic blend) — filleted CSG / metaball merge.
@@ -9179,10 +9183,9 @@ __device__ static DVec3 dTexNormalAt(const DTexture& tx, Real u, Real v) {
 }
 
 // Perturb a hit's shading normal by a bound tangent-space normal map (C6), device twin
-// of Scene::applyNormalMap. Builds a TBN from the shading normal on the surface's own side
-// + the hit tangent, rotates the sampled tangent-space normal into world and turns it to
-// the ray (the host twin says why), replaces h.n. Called from the device closestHit choke
-// point so every GPU path is consistent.
+// of Scene::applyNormalMap (which says why the slope lies in the surface's own frame, and
+// faces the viewer except from behind a surface light can cross). Called from the device
+// closestHit choke point, after patOwnSide is set, so every GPU path is consistent.
 __device__ static inline void dApplyNormalMap(const DScene& sc, DHit& h) {
     if (!h.valid || h.matId < 0) return;
     const DMaterial& m = sc.mats[h.matId];
@@ -9190,17 +9193,16 @@ __device__ static inline void dApplyNormalMap(const DScene& sc, DHit& h) {
     const DTexture& tx = sc.textures[m.normalTex];
     if (!tx.rgb) return;
     DVec3 tn = dTexNormalAt(tx, h.u, h.v);
-    const Real own = h.back ? (Real)-1 : (Real)1;
-    const DVec3 N = h.n * own;
-    DVec3 T = h.tangent - N * dot(N, h.tangent);
+    const DVec3 No = h.back ? h.n * (Real)-1 : h.n;
+    DVec3 T = h.tangent - No * dot(No, h.tangent);
     Real tl = sqrt(dot(T, T));
     if (tl < (Real)1e-9) return;
     T = T * ((Real)1 / tl);
-    DVec3 B = cross(N, T) * h.bitangentSign;
-    Real s = (Real)m.normalStrength;
-    DVec3 pert = T * (tn.x * s) + B * (tn.y * s) + N * tn.z;
+    DVec3 B = cross(No, T) * h.bitangentSign;
+    const Real slope = (h.back && h.patOwnSide) ? -(Real)m.normalStrength : (Real)m.normalStrength;
+    DVec3 pert = T * (tn.x * slope) + B * (tn.y * slope) + h.n * tn.z;
     Real pl = sqrt(dot(pert, pert));
-    if (pl > (Real)1e-12) h.n = pert * (own / pl);
+    if (pl > (Real)1e-12) h.n = pert * ((Real)1 / pl);
 }
 
 // ---- procedural pattern VM ------------------------------------------------
@@ -11834,6 +11836,11 @@ struct DVertex {
     // rebuilding the hit from it could not decide the surface's rule again.
     int   patOwnSide = 0;
 };
+#if FTRACE_GPU_FP32
+// BDPT holds 2 * BDPT_MAXV of these per thread in local memory: a field that grows it costs
+// occupancy. Fill a hole (after lightIdx; the tail after nUp is taken) before adding a word.
+static_assert(sizeof(DVertex) == 136, "DVertex changed size");
+#endif
 
 // The route a vertex contributes to its path's leading chain (see c_routeOn).
 __device__ static inline int dRouteOfVert(const DScene& sc, const DVertex& v) {
@@ -18999,6 +19006,9 @@ struct DVcmLV {
     Real   fiberR;         // fiber radius (far-side clearance of a connection that ends on it); 0 off a strand
     Real   pscale;         // the hit's DHit::pscale (DVertex::pscale)
 };
+#if FTRACE_GPU_FP32
+static_assert(sizeof(DVcmLV) == 152, "DVcmLV changed size: it is the largest allocation in a session");
+#endif
 
 // The SECONDARY hero wavelengths of a stored light vertex, one slot per secondary. Kept in a
 // PARALLEL slab (`lvSec[(i*vcmCap + k)*secStride + j]`, secStride == C-1) rather than inline in
@@ -20503,6 +20513,7 @@ __global__ static void kHitProbe(DScene sc, const DevHitProbeRay* rays, int n, D
         const DPatIn in = dPatIn(h);
         o.q[0] = in.x; o.q[1] = in.y; o.q[2] = in.z;
         o.qn[0] = in.nx; o.qn[1] = in.ny; o.qn[2] = in.nz; o.qcurv = in.curv;
+        o.cavity = dCavityOf(sc, h);
     }
     out[i] = o;
 }

@@ -7328,12 +7328,19 @@ as the one at fault.
     per triangle from the triangle's own material (`PTri::patOwnSide`, a byte of the GPU
     DPTri's flag word), not from the part whose payload a mix bakes onto it, and "from behind"
     from the per-triangle decision two-sided shading makes (`raster::seenFromBehind`, the GPU's
-    kSlotBack). Normal maps are built about the surface's own normal and turned to the ray
-    after, in all four (`applyNormalMap`, `dApplyNormalMap`, both previews; 0.400.1): a bump
-    seen from behind is the same bump, so its normal there is the front one negated -- about
-    the ray-facing normal the bitangent flipped and the tangent did not, mirroring the bump
-    along T, so light crossing a normal-mapped pane met a different surface each way and a
-    pattern's own-side normal differed with the side.
+    kSlotBack). Normal maps follow the same rule, in all four twins (`applyNormalMap`,
+    `dApplyNormalMap`, both previews; 0.400.2): the relief's slope lies along the surface's
+    own frame, T and B where u and v grow whichever side the ray came from (B about the
+    shading normal on the vertex normals' side, where `Tri::bitangentSign` is taken), and its
+    height faces the viewer -- so on an opaque surface seen from behind bumps stay bumps,
+    whichever way it is wound -- except from behind a surface light can cross, where the slope
+    is negated too and the normal is the front one negated: the same relief seen from its
+    back, one surface for light crossing either way, and one own-side normal for its patterns.
+    In one expression: n = +-(T tx + B ty) s + n_ray tz, minus when back && patOwnSide. (Built
+    about the ray-facing normal, as before 0.400.1, B flipped from behind and T did not; 0.400.1
+    negated everything from behind, which turned an opaque floor's bumps into dents, the
+    winding deciding; and a sign taken against the winding mirrored v on a mesh wound against
+    its `vn`, from in front too.)
     Sites: host `patCtxFromHit` (every host pattern read at a hit),
     `emitterPatMulAt` (a point the emitter sampler drew, along nOut -- the side a one-sided
     emitter's ng faces -- with the hair sized by the patch it was drawn on, which
@@ -7416,7 +7423,8 @@ as the one at fault.
     normal-mapped glass quad, and a smooth mesh instanced twice, once tilted and squashed to a
     tenth of its height; rays from either side, from 3 km and into the instances' silhouette
     bands; every field of every hit compared (the point within the float ray's own precision,
-    the pattern's read point as a height above the host's surface, its normal and curvature),
+    the pattern's read point as a height above the host's surface, its normal and curvature,
+    and `cavity` -- every material reads it, the probe's axis being the side rule's),
     and each device intersector alone on a record full of another primitive's values. On the
     host it also holds `back` to the side the ray met ng from on every hit -- the squashed
     instance must turn some normal across its face, or the check fails as testing nothing --

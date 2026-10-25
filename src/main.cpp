@@ -3754,15 +3754,19 @@ static int checkDevHits() {
         return true;
     };
     if (!writeDome(objPath, 0.0) || !writeDome(tiltPath, 0.7) || !writeNormalMap()) {
+        for (const std::string* p : {&objPath, &tiltPath, &nmPath}) std::remove(p->c_str());
         std::printf("[checkdevhits] cannot write the scratch inputs at %s* FAIL\n", base.c_str());
         return 1;
     }
+    // Every material reads `cavity`, so each hit's probe -- its axis the side rule's -- is held
+    // to the host's too; a 0.5 m reach spans the squashed dome's 0.1 m between its faces.
     const std::string src =
-        "scene { units meters }\n"
+        "scene { units meters  cavity_radius 0.5  cavity_samples 64 }\n"
         "texture \"nm\" { file \"" + nmPath + "\"  encoding linear }\n"
-        "material \"opaque\" { type diffuse reflect 0.5 }\n"
-        "material \"glass\"  { type dielectric ior glass:BK7 }\n"
-        "material \"glassnm\" { type dielectric ior glass:BK7  normal_map texture:nm }\n"
+        "pattern \"cav\" { expr \"cavity\" }\n"
+        "material \"opaque\" { type diffuse reflect 0.5  reflect_map pattern:cav }\n"
+        "material \"glass\"  { type dielectric ior glass:BK7  roughness pattern:cav }\n"
+        "material \"glassnm\" { type dielectric ior glass:BK7  normal_map texture:nm  roughness pattern:cav }\n"
         "sphere { center 0 0 0  radius 0.5  material opaque }\n"
         "sphere { center 2 0 0  radius 0.5  material glass }\n"
         "quad { origin -0.5 -1 4  u 1 0 0  v 0 0 1  material opaque }\n"
@@ -3872,12 +3876,12 @@ static int checkDevHits() {
 
     const char* fieldName[] = {"validity", "material", "back", "own-side flag", "t", "point", "shading normal",
                                "geometric normal", "pscale", "curvature", "strand radius", "vertex colour",
-                               "tangent", "pattern height", "pattern normal"};
+                               "tangent", "pattern height", "pattern normal", "cavity"};
     const int nField = (int)(sizeof(fieldName) / sizeof(fieldName[0]));
     std::vector<int> badField(nField, 0);
     // Host-side: hits whose `back` is not the side the ray met ng from; hits where n against ng
     // would have told it wrong (the squashed instance must make some, or it tests nothing).
-    int hits = 0, backHits = 0, ownBack = 0, backOff = 0, proxyOff = 0;
+    int hits = 0, backHits = 0, ownBack = 0, backOff = 0, proxyOff = 0, probeHit = 0;
     auto vdot = [](const double* a, const Vec3& b) { return a[0] * b.x + a[1] * b.y + a[2] * b.z; };
     auto vdist = [](const double* a, const Vec3& b) {
         return std::sqrt((a[0] - b.x) * (a[0] - b.x) + (a[1] - b.y) * (a[1] - b.y) + (a[2] - b.z) * (a[2] - b.z));
@@ -3899,7 +3903,7 @@ static int checkDevHits() {
             }
         }
         const DevHitProbeOut& o = dev[i];
-        bool b[15] = {};
+        bool b[16] = {};
         b[0] = (o.valid != 0) != h.valid;
         if (h.valid && o.valid) {
             ++hits;
@@ -3942,6 +3946,10 @@ static int checkDevHits() {
                 b[13] = std::fabs(height(Vec3(o.q[0], o.q[1], o.q[2])) - height(Vec3(c.x, c.y, c.z))) > 0.25 * hair;
                 b[14] = vdot(o.qn, Vec3(c.nx, c.ny, c.nz)) < 0.999 ||
                         std::fabs(o.qcurv - c.curv) > 1e-3 * std::max(1.0, std::fabs(c.curv));
+                // A probe ray or two may graze differently in float; a hemisphere on the wrong
+                // side of the squashed dome differs by most of them.
+                b[15] = std::fabs(o.cavity - c.cavity) > 3.0 / 64.0 + 1e-9;
+                if (c.cavity > 0.15) ++probeHit;   // a sphere seen from inside: 0.25
             }
         }
         for (int f = 0; f < nField; ++f) {
@@ -3979,7 +3987,8 @@ static int checkDevHits() {
         std::printf("[checkdevhits] host: the normal-mapped quad's normal from behind is not its front one negated "
                     "on %d of %d pairs (%d tilted by the map) FAIL\n", nmBad, nmPairs, nmTilted);
     bad += backOff + nmBad + (nmTilted < nmPairs || nmPairs < 12 ? 1 : 0);
-    const bool covered = hits > (int)(rays.size() / 2) && backHits > 40 && ownBack > 10 && proxyOff > 0;
+    const bool covered = hits > (int)(rays.size() / 2) && backHits > 40 && ownBack > 10 && proxyOff > 0 &&
+                         probeHit > 10;
     if (proxyOff == 0)
         std::printf("[checkdevhits] the squashed instance turned no normal across its face: n against ng never "
                     "misreads the side, so `back` is not tested where it must be FAIL\n");

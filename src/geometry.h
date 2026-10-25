@@ -119,7 +119,10 @@ struct Tri {
         if (dot(n2, n2) < 1e-12) n2 = gn;
         // Tangent from the UV gradient (Lengyel). Solve for the world direction along
         // which texture-u increases, then Gram-Schmidt it against gn and record the
-        // bitangent handedness. Falls back to onb(gn) when UVs are degenerate.
+        // bitangent handedness -- about the face normal on the vertex normals' side, the
+        // surface's own side the normal map builds its frame on (intersectTri turns ng
+        // there too), so a mesh wound against its `vn` is not mirrored in v. Falls back to
+        // onb(gn) when UVs are degenerate.
         Vec3 e1 = v1 - v0, e2 = v2 - v0;
         double du1 = uv1.x - uv0.x, dv1 = uv1.y - uv0.y;
         double du2 = uv2.x - uv0.x, dv2 = uv2.y - uv0.y;
@@ -132,7 +135,8 @@ struct Tri {
             double tl = std::sqrt(dot(T, T));
             if (tl > 1e-12) {
                 tangent = T * (1.0 / tl);
-                bitangentSign = (dot(cross(gn, tangent), B) < 0.0) ? -1.0 : 1.0;
+                const Vec3 gOwn = (dot(gn, n0 + n1 + n2) < 0.0) ? gn * -1.0 : gn;
+                bitangentSign = (dot(cross(gOwn, tangent), B) < 0.0) ? -1.0 : 1.0;
             } else { Vec3 bb; onb(gn, tangent, bb); bitangentSign = 1.0; }
         } else { Vec3 bb; onb(gn, tangent, bb); bitangentSign = 1.0; }
         // Mean curvature H = 1/2 * trace(dn restricted to the tangent plane).

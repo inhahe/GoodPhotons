@@ -1257,18 +1257,19 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     // Normal map (C6): rotate the tangent-space normal into world with the triangle's TBN.
     // The tangent comes from the SOURCE triangle's UV parameterisation, so a clipped slot
     // (whose stored verts are lerped) still gets the same frame as its unclipped siblings.
-    // Built about the surface's own normal and turned to the eye after, as the tracers do
-    // (Scene::applyNormalMap says why).
+    // The slope in the surface's own frame, the height toward the eye but from behind a
+    // surface light can cross, as the tracers have it (Scene::applyNormalMap says why).
     if (nrmTex >= 0 && nrmTex < nTex) {
-        const float own = (flags[slot] & kSlotBack) ? -1.0f : 1.0f;
-        const float3 No = N3 * own;
+        const bool behind = (flags[slot] & kSlotBack) != 0;
+        const float3 No = behind ? N3 * -1.0f : N3;
         float3 T = dTriTangent(wp0, wp1, wp2, uv0, uv1, uv2, No);
         if (dot3(T, T) > 1e-18f) {
             float3 B3 = cross3(No, T) * vsrc.tanSign;   // mirrored UVs: -1 (the source triangle's)
             float3 tn = dSampleNormalTS(texMeta, texels, nrmTex, uu, vv);
-            float3 pert = T * (tn.x * nrmS) + B3 * (tn.y * nrmS) + No * tn.z;
+            const float s3 = (behind && vsrc.patOwnSide) ? -nrmS : nrmS;
+            float3 pert = T * (tn.x * s3) + B3 * (tn.y * s3) + N3 * tn.z;
             float pl = sqrtf(dot3(pert, pert));
-            if (pl > 1e-12f) N3 = pert * (own / pl);
+            if (pl > 1e-12f) N3 = pert * (1.0f / pl);
         }
     }
     float3 V  = normalize3(cam.eye - wpos);

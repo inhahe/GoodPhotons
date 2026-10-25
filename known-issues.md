@@ -182,19 +182,25 @@ every intersector now records, and its device twin likewise -- but the fur volum
 fiber hit (backward.h `vh`) sets n without an intersector, so it must set `back` too, and every
 hand-built hit in the self-checks with it. `cavityAt` already uses `back` (0.400.1).
 
-## DONE (2026-10-25, 0.400.1): NORMALMAP-BACK-MIRROR — a normal-mapped surface seen from behind showed its bumps mirrored along the tangent
+## DONE (2026-10-25, 0.400.1-0.400.2): NORMALMAP-BACK-MIRROR — a normal-mapped surface seen from behind showed one of its relief's slopes mirrored
 
 `applyNormalMap`, `dApplyNormalMap` and both previews built the TBN frame about the
 ray-facing shading normal. From behind that normal and the bitangent `cross(N, T)` flip and the
-tangent does not, so the perturbed normal came out `T tx - B ty - N tz` instead of the front's
-`T tx + B ty + N tz` negated: the tilt along T mirrored. A two-sided normal-mapped surface lit
-from behind shaded as a different surface, light crossing a normal-mapped pane met a different
-normal each way (non-reciprocal), and a crossable surface's own-side pattern normal (0.400.0)
-differed with the side. Now all four build the frame about the shading normal on the surface's
-own side and turn the result to the ray (`Hit::back` says which side that is). Found by the
-Opus review of 0.400.0. `-checkdevhits` holds a normal-mapped glass quad's normal from behind to
-its front one negated (and the GPU's to the CPU's); tools/check_normalmap_frame.py case 3 renders
-a quad mapped along T from in front and behind in mode R on both devices and both previews.
+tangent does not, so the perturbed normal came out `T tx - B ty - N tz`: against the relief as
+authored facing the viewer (`T tx + B ty - N tz`) the slope along v mirrored, against the same
+relief seen from its back (`-(T tx + B ty + N tz)`) the slope along T. Light crossing a
+normal-mapped pane met a different normal each way (non-reciprocal), and a crossable surface's
+own-side pattern normal (0.400.0) differed with the side. 0.400.1 (found by the Opus review of
+0.400.0) built the frame on the surface's own side and negated the result from behind -- right
+for a surface light crosses, but on an opaque one it showed the relief's back, bumps as dents,
+on every default `quad` floor seen from above (the Opus review of 0.400.1). 0.400.2: the slope
+in the own frame, the height toward the viewer, the slope negated too only from behind a
+surface light can cross. And `Tri::bitangentSign` is taken about the face normal on the vertex
+normals' side, where the frame is built: against the winding, a mesh wound against its `vn`
+had its v slope mirrored from in front as well. `-checkdevhits` holds a normal-mapped glass
+quad's normal from behind to its front one negated (and the GPU's to the CPU's);
+tools/check_normalmap_frame.py cases 3-5 render a crossable quad and an opaque one from in front
+and behind and a quad wound against its normals, in mode R on both devices and both previews.
 
 ## DONE (2026-10-25, 0.400.0): PATTERN-NORMAL-SIDE — the normal, curvature and cavity a pattern sees differed with the side a transmissive surface is crossed from
 
