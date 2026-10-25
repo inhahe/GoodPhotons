@@ -573,7 +573,7 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 >
 > * **`filter` / `translucent`** carry `transmit`, a *dimensionless* T(λ) in [0,1] — a
 >   transmittance already, so both its hue **and** its magnitude are used as-is.
-> * **`dielectric` / `thin_film`** colour their interior with `absorb`, a Beer-Lambert
+> * **`dielectric` / `thinfilm`** colour their interior with `absorb`, a Beer-Lambert
 >   coefficient per unit **length**. Turning that into a transmittance needs a thickness,
 >   and an order-independent rasterizer never pairs a front face with the back face it
 >   belongs to — so only the **hue** is taken and `-glass-clarity` goes on setting how much
@@ -4101,8 +4101,11 @@ loader warns if it isn't). Per-triangle tangents are derived from the UV gradien
 geometric normal by `strength` (1.0 = full). Tangents follow mesh instances, and the
 perturbed normal is applied at the single intersection choke point so **every**
 renderer — backward, forward, BDPT, VCM, SPPM, photon-map — and both the CPU and GPU
-paths shade identically. See `scraps/ripple_test.ftsl` (a flat wall reading as
-corrugated under grazing light).
+paths shade identically. Seen from behind, a two-sided surface shows the same bumps: its
+normal there is the front one, negated, so light crossing a normal-mapped pane meets one
+surface either way (since 0.400.1, in the tracers and both previews; before, the tilt
+along the tangent came out mirrored from behind). See `scraps/ripple_test.ftsl` (a flat
+wall reading as corrugated under grazing light).
 
 A texture's albedo can also be **procedural in UV space**: in place of `file`, give
 three quoted ftsl expressions of the surface UV — `rgb "r(u,v)" "g(u,v)" "b(u,v)"`
@@ -4554,8 +4557,9 @@ when the object moves.
 `curv` is **signed toward the side being shaded**: convex is positive, concave negative,
 flat 0. Every intersector negates it when it flips the normal to face the ray, so the
 same sphere reads `+1/R` from outside and `−1/R` from within. On a surface light can
-**cross** (a dielectric, half mirror, filter, translucent, or a mix or layered stack with
-one), `curv`, `nx ny nz` and `cavity` are instead the surface's own
+**cross** (a dielectric, half mirror, filter, translucent, a thin film or multilayer that is
+not on an absorbing substrate, or a mix or layered stack with one), `curv`, `nx ny nz` and
+`cavity` are instead the surface's own
 outside's, whichever way the ray came, so light crossing it either way sees the same pattern
 -- every pattern on that surface, a mix's opaque part's included (since 0.400.0; FTSL.md
 §6.1 has the rule). What each geometry reports:

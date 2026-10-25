@@ -334,7 +334,8 @@ inline bool intersectCurveSeg(const CurveRay& cr, const Ray& r, const CurveSeg& 
     double nl = std::sqrt(dot(ng, ng));
     ng = (nl > 1e-18) ? ng * (1.0 / nl) : normalize(ba);
     hit.ng = ng;
-    hit.n  = (dot(r.d, ng) < 0.0) ? ng : -ng;
+    hit.back = !(dot(r.d, ng) < 0.0);
+    hit.n  = hit.back ? -ng : ng;
 
     // `u` runs along the strand (0 at the root, 1 at the tip) and `v` around the
     // circumference — the parameterisation a strand texture and a fiber BCSDF both want.

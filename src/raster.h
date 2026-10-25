@@ -142,6 +142,15 @@ struct PTri : PShade {
     Vec3 vc0{1, 1, 1}, vc1{1, 1, 1}, vc2{1, 1, 1};
 };
 
+// Is the triangle seen from behind from `eye` -- decided once for the whole triangle (the GPU
+// twin is kProject's kSlotBack). Only when all three vertex normals face away: a silhouette
+// triangle straddles the horizon and keeps its smooth normals, while geometry truly seen from
+// behind has every vertex facing away. Two-sided shading turns its normals to the eye; a
+// normal map and a crossable surface's patterns work in its own frame regardless.
+inline bool seenFromBehind(const PTri& t, const Vec3& eye) {
+    return dot(t.n0, eye - t.p0) < 0.0 && dot(t.n1, eye - t.p1) < 0.0 && dot(t.n2, eye - t.p2) < 0.0;
+}
+
 // Tessellated preview geometry plus the side tables its triangles index. Bundled so the
 // two cannot be handed around separately and fall out of sync: a PTri's `mix` index is
 // only meaningful against the `mixes` built in the same tessellate() call.
@@ -2340,13 +2349,7 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
             // be per-TRIANGLE, not per-pixel. Done per pixel on the interpolated normal it
             // inverts a 1-px band at every silhouette, because there dot(N,V) grazes
             // through zero while the surface is still genuinely front-facing.
-            // A triangle counts as back-facing only when ALL THREE vertices agree: a
-            // silhouette triangle straddles the horizon (some vertices front, some back)
-            // and must keep its smooth normals, while geometry truly seen from behind has
-            // every vertex facing away and still flips exactly as it did before.
-            const bool back = dot(t.n0, cam.eye - t.p0) < 0.0 &&
-                              dot(t.n1, cam.eye - t.p1) < 0.0 &&
-                              dot(t.n2, cam.eye - t.p2) < 0.0;
+            const bool back = seenFromBehind(t, cam.eye);
             // Interpolate UVs when ANY per-pixel binding reads them: an image skin, a
             // normal map, or a scalar pattern (patterns get u/v in their context, and a
             // `[0 1](u)` ramp is exactly a UV read). Triplanar skins sample from world
@@ -2616,11 +2619,11 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                     Vec3 q;
                     patNudgedPoint(w.x, w.y, w.z, fn.x, fn.y, fn.z, triReach(pt.p0, pt.p1, pt.p2), q.x, q.y, q.z);
                     // The normal a pattern sees: the shaded side's (N0, already turned to face
-                    // the eye on a back-facing triangle), or on a surface light can cross the
-                    // surface's own side's, as patCtxFromHit has it.
-                    const bool flippedToEye = dot(N0, pt.n0 + pt.n1 + pt.n2) < 0.0;
-                    pc = makePatCtx(q, 0.0, (pt.patOwnSide && flippedToEye) ? N0 * -1.0 : N0, g.uv[i].x,
-                                    g.uv[i].y, 0.0, 0.0, patShadingFootprint(fwPerDist, dist, cs));
+                    // the eye on a triangle seen from behind), or on a surface light can cross
+                    // the surface's own side's, as patCtxFromHit has it.
+                    const bool own = pt.patOwnSide && seenFromBehind(pt, cam.eye);
+                    pc = makePatCtx(q, 0.0, own ? N0 * -1.0 : N0, g.uv[i].x, g.uv[i].y, 0.0, 0.0,
+                                    patShadingFootprint(fwPerDist, dist, cs));
                     bindPatScene(pc, *scenePtr);
                     pcReady = true;
                 }
@@ -2678,25 +2681,28 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
             // the Gram-Schmidt against the interpolated normal is per-pixel work. A zero
             // tanRaw means degenerate/absent UVs: fall back to a stable basis about N,
             // exactly as before. Perturbing here (not in the G-buffer) keeps the pass-2
-            // inner loop untouched.
+            // inner loop untouched. Built about the surface's own normal and turned to the
+            // eye after, as the tracers do (Scene::applyNormalMap says why).
             if (textures && sh->normalTex >= 0 && sh->normalTex < (int)textures->size()) {
                 const Texture& nx = (*textures)[sh->normalTex];
                 if (nx.valid()) {
+                    const double own = seenFromBehind(pt, cam.eye) ? -1.0 : 1.0;
+                    const Vec3 No = N3 * own;
                     Vec3 T = pt.tanRaw;
                     if (!(dot(T, T) > 0.0)) {
-                        Vec3 ax = (std::fabs(N3.x) < 0.9) ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
-                        T = cross(ax, N3);
+                        Vec3 ax = (std::fabs(No.x) < 0.9) ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
+                        T = cross(ax, No);
                     }
-                    T = T - N3 * dot(N3, T);     // re-orthogonalize against the shading normal
+                    T = T - No * dot(No, T);     // re-orthogonalize against the shading normal
                     double tl = std::sqrt(dot(T, T));
                     if (tl > 1e-12) {
                         T = T * (1.0 / tl);
-                        Vec3 B3 = cross(N3, T) * (double)pt.tanSign;   // mirrored UVs: -1
+                        Vec3 B3 = cross(No, T) * (double)pt.tanSign;   // mirrored UVs: -1
                         Vec3 tn = nx.sampleNormalTS(g.uv[i].x, g.uv[i].y);
                         double s3 = sh->normalStrength;
-                        Vec3 pert = T * (tn.x * s3) + B3 * (tn.y * s3) + N3 * tn.z;
+                        Vec3 pert = T * (tn.x * s3) + B3 * (tn.y * s3) + No * tn.z;
                         double pl = std::sqrt(dot(pert, pert));
-                        if (pl > 1e-12) N3 = pert * (1.0 / pl);
+                        if (pl > 1e-12) N3 = pert * (own / pl);
                     }
                 }
             }

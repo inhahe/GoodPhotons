@@ -199,12 +199,19 @@ struct Hit {
     // be far smaller on a big triangle; and over one primitive the reach is constant, so the
     // hair is too. Every intersector writes it (the record is reused across candidates).
     double pscale = 0.0;
-    // Patterns here see the surface's own side (patCtxFromHit): the ray arrived from behind ng,
-    // so the intersector turned n to face it, onto a surface light can cross
-    // (Material::patOwnSide). Decided once, by Scene::markPatSide at the closest-hit choke
-    // points: before the normal map, which can tip n across the surface's plane, and with the
-    // surface's own material -- the rule is the surface's, so a mix that later resolves to an
-    // opaque part keeps it for that part's patterns too.
+    // The ray arrived from behind ng, so the intersector turned n (and curv) to face it. The
+    // intersector's own decision, which every intersector writes (the record is reused): read
+    // back off n and ng it would be wrong wherever a normal map has tipped n across the
+    // surface's plane, or a non-uniform instance scale has turned an interpolated normal more
+    // than 90 degrees from the face normal (the inverse transpose keeps the side of a
+    // direction, dot(d, n), but not of one normal against another). An instance keeps its
+    // local one, which that same property makes the world one too.
+    bool back = false;
+    // The surface's material lets light cross it (Material::patOwnSide), so its patterns see
+    // its own side, ng's: their normal and curvature turned there when `back`, its cavity
+    // probed about ng (patCtxFromHit). Decided once, by Scene::markPatSide at the closest-hit
+    // choke points, with the surface's own material -- the rule is the surface's, so a mix
+    // that later resolves to an opaque part keeps it for that part's patterns too.
     bool patOwnSide = false;
     // Barycentric-interpolated per-vertex colour at the hit (linear RGB), when the
     // triangle carried one. Resolved by the intersector, which is the only place that
@@ -466,6 +473,7 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     // fields derive from the same `gn` — provably equals `flipped ? -gn : gn`.
     hit.ng = gn;
     hit.n = flipped ? -ns : ns;
+    hit.back = flipped;
     hit.tangent = tri.tangent;             // per-triangle tangent (constant across the face)
     hit.bitangentSign = tri.bitangentSign; // for tangent-space normal mapping (C6)
     // Curvature follows the shaded side: seen from the back, a bulge IS a pit (O3).
@@ -502,6 +510,7 @@ inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit
     hit.ng = ng;
     bool sFlipped = !(dot(r.d, ng) < 0.0);
     hit.n = sFlipped ? -ng : ng;
+    hit.back = sFlipped;
     // Analytic mean curvature of a sphere: 1/R everywhere, negated when seen from
     // inside (a room-sized sphere is concave to anything standing in it).
     hit.curv = (s.r > 1e-12) ? ((sFlipped ? -1.0 : 1.0) / s.r) : 0.0;

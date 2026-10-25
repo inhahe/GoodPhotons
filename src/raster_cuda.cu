@@ -138,22 +138,22 @@ struct DPTri {
     float2 uv0, uv1, uv2;   // per-vertex texture coords (only meaningful when tex >= 0)
     int    tex;             // bound skin texture index, or -1 (use flat `color`)
     float  triplanarScale;  // >0: sample the skin by world triplanar instead of UV
-    int    emissive;
-    int    clear;           // see-through transmissive surface (handled by the clear pass)
+    // Flags, a byte each in one word: emissive; a see-through transmissive surface (handled by
+    // the clear pass); per-vertex colours meaningful (vc0..vc2); PTri::patOwnSide, its patterns
+    // see the surface's own side.
+    unsigned char emissive, clear, hasVcol, patOwnSide;
     float3 clearTint;       // its per-crossing RGB transmittance (raster.h clearTintOf)
-    // Per-vertex colour (linear RGB) and whether it is meaningful. kShade already
-    // recomputes this pixel's barycentrics to recover position/normal/UV, so the colour
-    // rides along for free -- no extra device buffer, unlike the host G-buffer which had
-    // to grow a channel because its shade pass is deferred and has only the buffer.
+    // Per-vertex colour (linear RGB). kShade already recomputes this pixel's barycentrics to
+    // recover position/normal/UV, so the colour rides along for free -- no extra device
+    // buffer, unlike the host G-buffer which had to grow a channel because its shade pass is
+    // deferred and has only the buffer.
     float3 vc0, vc1, vc2;
-    int    hasVcol;
     int    normalTex;       // tangent-space normal map, or -1
     float  normalStrength;  // XY scale applied to the sampled tangent-space normal
     int    reflectPat;      // scalar `pattern` scaling the albedo, or -1
     int    emitPat;         // scalar `pattern` masking the emission, or -1
     int    mix;             // index into the DMix table for a per-hit mix, else -1
     float  tanSign;         // the normal map's frame handedness (host: PTri::tanSign)
-    int    patOwnSide;      // PTri::patOwnSide: its patterns see the surface's own side
     // RASTER-PBR (host twin: raster.h PShade). `rough < 0` = no specular lobe, which shades
     // byte-for-byte as before, so every diffuse scene is untouched. `f0` is normal-incidence
     // reflectance -- for a metal preset that IS its measured reflectance, which is why a gold
@@ -1257,14 +1257,18 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     // Normal map (C6): rotate the tangent-space normal into world with the triangle's TBN.
     // The tangent comes from the SOURCE triangle's UV parameterisation, so a clipped slot
     // (whose stored verts are lerped) still gets the same frame as its unclipped siblings.
+    // Built about the surface's own normal and turned to the eye after, as the tracers do
+    // (Scene::applyNormalMap says why).
     if (nrmTex >= 0 && nrmTex < nTex) {
-        float3 T = dTriTangent(wp0, wp1, wp2, uv0, uv1, uv2, N3);
+        const float own = (flags[slot] & kSlotBack) ? -1.0f : 1.0f;
+        const float3 No = N3 * own;
+        float3 T = dTriTangent(wp0, wp1, wp2, uv0, uv1, uv2, No);
         if (dot3(T, T) > 1e-18f) {
-            float3 B3 = cross3(N3, T) * vsrc.tanSign;   // mirrored UVs: -1 (the source triangle's)
+            float3 B3 = cross3(No, T) * vsrc.tanSign;   // mirrored UVs: -1 (the source triangle's)
             float3 tn = dSampleNormalTS(texMeta, texels, nrmTex, uu, vv);
-            float3 pert = T * (tn.x * nrmS) + B3 * (tn.y * nrmS) + N3 * tn.z;
+            float3 pert = T * (tn.x * nrmS) + B3 * (tn.y * nrmS) + No * tn.z;
             float pl = sqrtf(dot3(pert, pert));
-            if (pl > 1e-12f) N3 = pert * (1.0f / pl);
+            if (pl > 1e-12f) N3 = pert * (own / pl);
         }
     }
     float3 V  = normalize3(cam.eye - wpos);

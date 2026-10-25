@@ -679,9 +679,9 @@ bool cudaPatOpProbe(const PatNode* prog, const int* off, const int* len, int nPr
 // hold against its own intersectors, closestHit and patCtxFromHit.
 struct DevHitProbeRay { double o[3], d[3]; int kind, index; };
 struct DevHitProbeOut {
-    int    valid, matId, patOwnSide, vcol;
+    int    valid, matId, back, patOwnSide, vcol;
     double t, p[3], n[3], ng[3], pscale, fiberRadius, curv, tangentZ;
-    double q[3], side;   // dPatPoint: the point a pattern reads there, and its normal's side sign
+    double q[3], qn[3], qcurv;   // dPatIn: the point, normal and curvature a pattern reads there
 };
 bool cudaHitProbe(const Scene& scene, const DevHitProbeRay* rays, int n, DevHitProbeOut* out);
 

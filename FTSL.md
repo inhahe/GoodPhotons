@@ -546,8 +546,10 @@ the surface shows one value). `nx ny nz`, `curv` and `cavity` are those of the s
 shaded — the normal facing the viewer, a bulge positive, the hemisphere in front of it — on
 an opaque surface, where light leaves on the side it arrived and the triangles' winding,
 which shading two-sided hides, does not matter. On a surface light can **cross** — a
-`dielectric` (plain or coated), `half_mirror`, `filter`, `translucent`, or a `mix` /
-`layered` with such a part — they are the surface's own side's,
+`dielectric` (plain or coated), `halfmirror`, `filter`, `translucent`, a `thinfilm` or
+`multilayer` that light enters somewhere in the band (not one on an absorbing substrate or
+with an absorbing layer throughout), or a `mix` / `layered` with such a part — they are the
+surface's own side's,
 whichever way the ray came, so light crossing it either way sees the same pattern (otherwise
 the forward, backward and bidirectional modes integrate different things there). The rule is
 the surface's material's: in such a mix the patterns of its opaque parts read the own side

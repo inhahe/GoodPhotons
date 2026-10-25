@@ -15,6 +15,12 @@ surface and a tilt down darkens it.
      vertex normals outward), and must use +1 too. Checked against the path tracer: the map darkens
      or brightens the sphere's front, against a plain sphere beside it, the same way in the preview
      as in mode R.
+  3. SEEN FROM BEHIND. A quad wearing a map tilted along T, RGB (0.8, 0.5, 0.9), i.e.
+     n = (0.6, 0, 0.8), seen from in front with the sun off to -T, and from behind with the sun
+     off to +T -- the same view turned half round. A bump seen from behind is the same bump, so the
+     map turns the quad's normal from the sun in both (darker than the plain quad); a frame built
+     about the ray-facing normal mirrors the tilt along T from behind and turns it toward the sun
+     (brighter). Checked in mode R on both devices and in both previews.
 Comparisons are within one image, so each renderer's own exposure cancels. Exits 1 on any failure.
 """
 import argparse
@@ -63,6 +69,21 @@ def write_inputs(d):
                 ['camera "c" { eye 0 0 6  look_at 0 0 0  up 0 1 0  fov_y 25  film { res 400 200 } }'] + common +
                 ['sphere { center -0.6 0 0  radius 0.5  material m }',
                  'sphere { center 0.6 0 0  radius 0.5  material plain }'])
+    # 3) seen from behind: the top-left quad alone (u grows with x, so T = +x), tilted along T
+    Image.fromarray(np.full((W, W, 3), np.round(np.array((0.8, 0.5, 0.9)) * 255), np.uint8)).save(os.path.join(d, "tiltT.ppm"))
+    write_lines(os.path.join(d, "tquad.obj"), [
+        "v -1.1 0.05 0", "v -0.1 0.05 0", "v -0.1 1.05 0", "v -1.1 1.05 0",
+        "vt 0 0", "vt 1 0", "vt 1 1", "vt 0 1", "vn 0 0 1",
+        "f 1/1/1 2/2/1 3/3/1", "f 1/1/1 3/3/1 4/4/1"])
+    for view, eye, sun in (("front", "0 0 6", "-0.8 0 0.6"), ("back", "0 0 -6", "0.8 0 -0.6")):
+        write_lines(os.path.join(d, "behind_%s.ftsl" % view), [
+            'camera "c" { eye %s  look_at 0 0 0  up 0 1 0  fov_y 25  film { res 200 200 } }' % eye,
+            'texture "nt" { file "%s/tiltT.ppm"  encoding linear  filter bilinear  wrap repeat }' % d,
+            'material "mt" { type diffuse reflect 0.3  normal_map texture:nt }',
+            'material "plain" { type diffuse reflect 0.3 }',
+            'light sun { dir %s  angle 0.53  spd blackbody 5800  intensity 1e-13 }' % sun,
+            'mesh "q" { file "%s/tquad.obj"  material mt  uv use_mesh }' % d,
+            'mesh "r" { file "%s/ref.obj"  material plain }' % d])
 
 
 def run(exe, scene, out, args):
@@ -131,6 +152,20 @@ def main():
         ok &= good
         print("sphere, %s preview: the map makes its front %.2f of the plain sphere's, the path tracer %.2f  %s"
               % (name.upper(), eff[name], eff["traced"], "ok" if good else "FAIL (the preview tilts it the other way)"))
+    # 3) seen from behind: the mapped quad over the plain one, in front (it spans x 0.09-0.46 of
+    #    the frame) and from behind (the view turned round: x 0.54-0.91)
+    for name, args in (("cpu preview", ["-raster", "-device", "cpu"]), ("gpu preview", ["-raster", "-device", "gpu"]),
+                       ("cpu mode R", ["-mode", "R", "-device", "cpu", "-spp", "64"]),
+                       ("gpu mode R", ["-mode", "R", "-device", "gpu", "-spp", "64"])):
+        tag = name.replace(" ", "_")
+        f = run(a.exe, d + "/behind_front.ftsl", "%s/behind_front_%s.png" % (d, tag), args)
+        b = run(a.exe, d + "/behind_back.ftsl", "%s/behind_back_%s.png" % (d, tag), args)
+        ef = box(f, 0.13, 0.42, 0.16, 0.43) / max(1e-9, box(f, 0.40, 0.60, 0.58, 0.85))
+        eb = box(b, 0.58, 0.87, 0.16, 0.43) / max(1e-9, box(b, 0.40, 0.60, 0.58, 0.85))
+        good = ef < 0.9 and eb < 0.9
+        ok &= good
+        print("seen from behind, %s: the map makes the quad %.2f of the plain one in front, %.2f from behind  %s"
+              % (name, ef, eb, "ok" if good else "FAIL (from behind the bump is mirrored along T)"))
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

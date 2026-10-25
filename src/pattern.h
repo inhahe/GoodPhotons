@@ -519,7 +519,7 @@ struct PatCtx {
     double nx = 0, ny = 0, nz = 0;// surface normal
     double r = 0;                 // radius |p|
     double u = 0, v = 0;          // surface UV (mesh interpolated or native-primitive wrap)
-    double curv = 0;              // mean curvature, 1/length, signed toward the shaded side (O3)
+    double curv = 0;              // mean curvature, 1/length, signed toward the side nx ny nz face (O3)
     double cavity = 0;            // blocked fraction of a short hemispherical probe, [0,1] (O3 s2)
     double fw = 0;                // shading footprint: world-space patch diameter, 0 = unknown (O8 s2)
     double t = 0;                 // flyby timeline in [0,1] (camera_curve record tracks only)

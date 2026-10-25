@@ -3371,8 +3371,9 @@ static bool checkPatternNudge() {
     }
     // The normal and curvature a pattern sees (Material::patOwnSide): on an opaque surface the
     // shaded side's, which flip with the side the ray came from; on one light can cross (a
-    // dielectric here) the surface's own, the same from either side -- in a mix with such a
-    // part too (set by Scene::finalizePatternSides from the materials' types).
+    // dielectric here; a thin film entered somewhere in the band, not one on a substrate that
+    // absorbs throughout) the surface's own, the same from either side -- in a mix with such a
+    // part too (set by Scene::finalizePatternSides from the materials).
     // The rule is the surface's, decided at the hit (Scene::markPatSide): a pattern read after
     // the hit's material became an opaque part's -- a mix resolved, as a GPU BDPT vertex keeps
     // it -- follows it too.
@@ -3382,24 +3383,30 @@ static bool checkPatternNudge() {
         compilePatternExpr("ny", nyProg, err);
         compilePatternExpr("curv", curvProg, err);
         Scene sm;
-        sm.mats.resize(4);
+        sm.mats.resize(7);
         sm.mats[0].type = MatType::Diffuse;
         sm.mats[1].type = MatType::Dielectric;
         sm.mats[2].type = MatType::Mix;
         sm.mats[2].mixChildren = {0, 1};
         sm.mats[3].type = MatType::Mix;
         sm.mats[3].mixChildren = {0};
+        sm.mats[4].type = MatType::ThinFilm;                        // on a clear substrate
+        sm.mats[5].type = MatType::ThinFilm;                        // on a metal
+        sm.mats[5].substrateK = constantSpectrum(3.0);
+        sm.mats[6].type = MatType::ThinFilm;                        // a substrate clear only in the red
+        sm.mats[6].substrateK = [](double L) { return L < 620.0 ? 3.0 : 0.0; };
         sm.finalizePatternSides();
         auto at = [&](int mat, bool fromBelow, const std::vector<PatNode>& prog, int readAs) {
             Hit h;
             h.valid = true; h.p = Vec3(0.3, 0, 0.7); h.ng = Vec3(0, 1, 0); h.matId = mat;
             h.n = Vec3(0, fromBelow ? -1.0 : 1.0, 0); h.curv = fromBelow ? -0.5 : 0.5;
+            h.back = fromBelow;   // as the intersector turned n
             sm.markPatSide(h);
             h.matId = readAs;
             return patternEval(prog.data(), (int)prog.size(), patCtxFromHit(sm, h));
         };
-        for (int mat : {0, 1, 2, 3}) {
-            const bool own = (mat == 1 || mat == 2);
+        for (int mat : {0, 1, 2, 3, 4, 5, 6}) {
+            const bool own = (mat == 1 || mat == 2 || mat == 4 || mat == 6);
             for (const auto* prog : {&nyProg, &curvProg})
                 for (int readAs : {mat, 0}) {
                     const double top = at(mat, false, *prog, readAs), below = at(mat, true, *prog, readAs);
@@ -3491,14 +3498,17 @@ static bool checkPatternNudge() {
 // one record across candidates, so a field an intersector leaves alone keeps a farther
 // candidate's value: a pattern hair sized by a sky dome's reach, a sphere tinted by a mesh's
 // vertex colours, a triangle treated as a strand. Each intersector here is handed a record
-// full of another primitive's values. (Host only; the device intersectors mirror these.)
+// full of another primitive's values. (Host only; -checkdevhits holds the device's to these.)
+//
+// junkHit: such a record -- every field an intersector owns set to what none of these writes,
+// a ray from behind among them.
+static Hit junkHit() {
+    Hit h;
+    h.t = 1e30; h.matId = -7; h.pscale = 777.0; h.fiberRadius = 0.5; h.hasVcol = true; h.back = true;
+    h.tangent = Vec3(0, 0, 9); h.bitangentSign = -1.0; h.curv = 99.0;
+    return h;
+}
 static bool checkHitFieldsWritten() {
-    auto junk = []() {
-        Hit h;
-        h.t = 1e30; h.pscale = 777.0; h.fiberRadius = 0.5; h.hasVcol = true;
-        h.tangent = Vec3(0, 0, 9); h.bitangentSign = -1.0; h.curv = 99.0;
-        return h;
-    };
     int bad = 0;
     auto expect = [&](const char* what, bool good) {
         if (good) return;
@@ -3507,24 +3517,24 @@ static bool checkHitFieldsWritten() {
     };
     const Ray down{Vec3(0.1, 3, 0.2), Vec3(0, -1, 0)};
     {
-        Hit h = junk();
+        Hit h = junkHit();
         const Sphere s{Vec3(0, 0, 0), 0.5, 0};
         expect("a sphere", intersectSphere(down, s, 1e-9, h) && h.pscale == 0.5 && h.fiberRadius == 0.0 &&
-                           !h.hasVcol);
+                           !h.hasVcol && !h.back);
     }
     {
-        Hit h = junk();
+        Hit h = junkHit();
         Tri t{Vec3(-1, 0, -1), Vec3(-1, 0, 1), Vec3(1, 0, 1), 0, -1, {}};
         t.finalize();
         expect("a triangle", intersectTri(down, t, 1e-9, h) && h.pscale == t.reach && h.fiberRadius == 0.0 &&
-                             !h.hasVcol);
+                             !h.hasVcol && !h.back);
     }
     {
-        Hit h = junk();
+        Hit h = junkHit();
         CurveSeg cs;
         cs.p0 = Vec3(-1, 0, 0); cs.p1 = Vec3(1, 0, 0); cs.r0 = cs.r1 = 0.5;
         expect("a curve", intersectCurveSeg(makeCurveRay(down.d), down, cs, 1e-9, h) && h.pscale == 1.5 &&
-                          !h.hasVcol);
+                          !h.hasVcol && !h.back);
     }
     {
         ftsl::Loaded L;
@@ -3536,10 +3546,11 @@ static bool checkHitFieldsWritten() {
             "light area { origin -0.5 2.5 -0.5  u 1 0 0  v 0 0 1  normal 0 -1 0  spd preset:bb6500 }\n"
             "camera \"c\" { eye 0 2 3  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n",
             "<checkpatops>", L, e);
-        Hit h = junk();
+        Hit h = junkHit();
         expect("an isosurface", loaded && L.scene.implicits.size() == 1 &&
                                 intersectImplicit(down, L.scene.implicits[0], 1e-9, h) && h.pscale == 0.0 &&
-                                h.fiberRadius == 0.0 && !h.hasVcol && h.tangent.z == 0.0 && h.bitangentSign == 1.0);
+                                h.fiberRadius == 0.0 && !h.hasVcol && !h.back && h.tangent.z == 0.0 &&
+                                h.bitangentSign == 1.0);
     }
     std::printf("[checkpatops] reused hit record: every intersector writes every field it owns %s\n",
                 bad ? "FAIL" : "ok");
@@ -3669,18 +3680,22 @@ static int checkPatOps() {
 
 // -checkdevhits: the device's intersectors, closestHit and pattern inputs against the host's.
 //
-// The GPU traces in float with its own intersectors -- twins of the host's, kept in step by
-// hand, and until this check held to them only by renders. Here both trace the same rays
-// through one scene: spheres, quads and isosurfaces, each opaque and glass, a curve, and a
-// smooth-normalled mesh placed by mesh_instance; rays from either side of every surface, from
-// 3 km off, and into the instance's silhouette band (where the shading normal has turned away
-// from a ray the face still meets from the front). For each hit the validity, material, t,
-// point, normals, whether patterns see the surface's own side (Hit::patOwnSide), the pattern
-// hair's scale (pscale),
-// curvature, strand radius, vertex colour, and the point and normal side a pattern reads there
-// (patCtxFromHit / dPatPoint) must agree, within float. And each device intersector alone,
-// handed a record full of another primitive's values -- the closest-hit loops reuse one record
-// across candidates -- must leave every field it owns as its host twin does.
+// The GPU traces in float with its own intersectors, twins of the host's. Here both trace the
+// same rays through one scene: spheres, quads and isosurfaces, each opaque and glass, a curve,
+// a normal-mapped glass quad, and a smooth-normalled mesh placed by mesh_instance -- once, and
+// once tilted and squashed to a tenth of its height; rays from either side of every surface,
+// from 3 km off, and into the instances' silhouette bands (where the shading normal has turned
+// away from a ray the face still meets from the front). For each hit the validity, material,
+// t, point, normals, the side the ray came from (Hit::back), whether patterns see the
+// surface's own side (Hit::patOwnSide), the pattern hair's scale (pscale), curvature, strand
+// radius, vertex colour, and the point, normal and curvature a pattern reads there
+// (patCtxFromHit / dPatIn) must agree, within float. Each device intersector alone, handed a
+// record full of another primitive's values -- the closest-hit loops reuse one record across
+// candidates -- must leave every field it owns as its host twin does. And on the host: `back`
+// is the side the ray met ng from on every hit, even where the squashed instance has turned
+// an interpolated normal across its face's plane, so n and ng no longer tell it; and a
+// normal-mapped surface's normal seen from behind is its normal from the front, negated.
+static long ftraceCurrentPid();
 static int checkDevHits() {
 #ifndef HAVE_CUDA
     std::printf("[checkdevhits] built without CUDA -- SKIPPED\n");
@@ -3692,53 +3707,84 @@ static int checkDevHits() {
         std::printf("[checkdevhits] PASS (skipped)\n");
         return 0;
     }
-    // A coarse UV sphere with outward vertex normals: smooth shading, so its facets near a
-    // silhouette carry the band.
-    std::string objPath = (std::filesystem::temp_directory_path() /
-                           ("ftrace_checkdevhits_" + std::to_string((unsigned long long)std::time(nullptr)) + ".obj"))
-                              .string();
-    for (char& ch : objPath) if (ch == '\\') ch = '/';
-    {
-        std::FILE* f = std::fopen(objPath.c_str(), "w");
-        if (!f) { std::printf("[checkdevhits] cannot write %s FAIL\n", objPath.c_str()); return 1; }
+    // Scratch inputs, named for this process: a coarse UV sphere with outward vertex normals
+    // (smooth shading, so its facets near a silhouette carry the band), the same tilted in the
+    // file -- so the instance's squash, applied first, is oblique to its poles and turns
+    // normals near its horizon across their faces' planes -- and a constant normal map tilted
+    // along both tangent axes, RGB (0.8, 0.65, 0.9).
+    std::string base;
+    try {
+        base = (std::filesystem::temp_directory_path() / ("ftrace_checkdevhits_" + std::to_string(ftraceCurrentPid())))
+                   .string();
+    } catch (const std::exception& e) {
+        std::printf("[checkdevhits] no temp directory: %s FAIL\n", e.what());
+        return 1;
+    }
+    for (char& ch : base) if (ch == '\\') ch = '/';
+    const std::string objPath = base + ".obj", tiltPath = base + "_tilt.obj", nmPath = base + "_nm.ppm";
+    auto writeDome = [&](const std::string& path, double tilt) {
+        std::FILE* f = std::fopen(path.c_str(), "w");
+        if (!f) return false;
         const int nu = 10, nv = 7;
+        const double c = std::cos(tilt), s = std::sin(tilt);
         for (int j = 0; j <= nv; ++j)
             for (int i = 0; i < nu; ++i) {
                 const double th = PI * j / nv, ph = 2.0 * PI * i / nu;
-                const double x = std::sin(th) * std::cos(ph), y = std::cos(th), z = std::sin(th) * std::sin(ph);
+                const double x = std::sin(th) * std::cos(ph), y0 = std::cos(th), z0 = std::sin(th) * std::sin(ph);
+                const double y = c * y0 - s * z0, z = s * y0 + c * z0;   // about x
                 std::fprintf(f, "v %.17g %.17g %.17g\nvn %.17g %.17g %.17g\n", x, y, z, x, y, z);
             }
         auto id = [&](int j, int i) { return j * nu + (i % nu) + 1; };
         for (int j = 0; j < nv; ++j)
             for (int i = 0; i < nu; ++i) {
-                const int a = id(j, i), b = id(j, i + 1), c = id(j + 1, i + 1), d = id(j + 1, i);
-                if (j > 0) std::fprintf(f, "f %d//%d %d//%d %d//%d\n", a, a, c, c, b, b);
-                if (j < nv - 1) std::fprintf(f, "f %d//%d %d//%d %d//%d\n", a, a, d, d, c, c);
+                const int a = id(j, i), b = id(j, i + 1), cc = id(j + 1, i + 1), d = id(j + 1, i);
+                if (j > 0) std::fprintf(f, "f %d//%d %d//%d %d//%d\n", a, a, cc, cc, b, b);
+                if (j < nv - 1) std::fprintf(f, "f %d//%d %d//%d %d//%d\n", a, a, d, d, cc, cc);
             }
         std::fclose(f);
+        return true;
+    };
+    auto writeNormalMap = [&]() {
+        std::FILE* f = std::fopen(nmPath.c_str(), "wb");
+        if (!f) return false;
+        std::fprintf(f, "P6\n4 4\n255\n");
+        const unsigned char px[3] = {204, 166, 230};
+        for (int k = 0; k < 16; ++k) std::fwrite(px, 1, 3, f);
+        std::fclose(f);
+        return true;
+    };
+    if (!writeDome(objPath, 0.0) || !writeDome(tiltPath, 0.7) || !writeNormalMap()) {
+        std::printf("[checkdevhits] cannot write the scratch inputs at %s* FAIL\n", base.c_str());
+        return 1;
     }
     const std::string src =
         "scene { units meters }\n"
+        "texture \"nm\" { file \"" + nmPath + "\"  encoding linear }\n"
         "material \"opaque\" { type diffuse reflect 0.5 }\n"
         "material \"glass\"  { type dielectric ior glass:BK7 }\n"
+        "material \"glassnm\" { type dielectric ior glass:BK7  normal_map texture:nm }\n"
         "sphere { center 0 0 0  radius 0.5  material opaque }\n"
         "sphere { center 2 0 0  radius 0.5  material glass }\n"
         "quad { origin -0.5 -1 4  u 1 0 0  v 0 0 1  material opaque }\n"
         "quad { origin 1.5 -1 4  u 1 0 0  v 0 0 1  material glass }\n"
+        "quad { origin 3.5 -1 4  u 1 0 0  v 0 0 1  material glassnm }\n"
         "isosurface { material opaque  sphere { center 0 2 0  radius 0.5 } }\n"
         "isosurface { material glass  sphere { center 2 2 0  radius 0.5 } }\n"
         "curve { material opaque  basis linear  radius 0.2  point -0.8 -2 0  point 0.8 -2 0 }\n"
         "mesh_asset \"dome\" { file \"" + objPath + "\"  material opaque }\n"
+        "mesh_asset \"tilted\" { file \"" + tiltPath + "\"  material glass }\n"
         "mesh_instance { of \"dome\"  scale 0.7  rotate 20 -30 10  translate 5 0 0 }\n"
+        "mesh_instance { of \"tilted\"  scale 1 0.1 1  translate 5 3 0 }\n"
         "light area { origin 20 20 20  u 0.1 0 0  v 0 0 0.1  normal 0 -1 0  spd preset:bb6500 }\n"
         "camera \"c\" { eye 0 0 10  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n";
     ftsl::Loaded L;
     std::string err;
     const bool loaded = ftsl::loadSource(src, "<checkdevhits>", L, err);
-    std::remove(objPath.c_str());
+    for (const std::string* p : {&objPath, &tiltPath, &nmPath}) std::remove(p->c_str());
     const Scene& sc = L.scene;
+    const int nQuadTris = 6;   // the quads' tris come first, then the lamp's
     if (!loaded || sc.spheres.size() != 2 || sc.implicits.size() != 2 || sc.curveSegs.empty() ||
-        sc.instances.size() != 1 || sc.blasList.size() != 1 || sc.tris.size() < 4) {   // the quads, then the lamp's
+        sc.instances.size() != 2 || sc.blasList.size() != 2 || (int)sc.tris.size() < nQuadTris + 2) {
         std::printf("[checkdevhits] the scene did not load as written (%zu spheres, %zu isosurfaces, %zu curve "
                     "segments, %zu instances, %zu tris) %s FAIL\n", sc.spheres.size(), sc.implicits.size(),
                     sc.curveSegs.size(), sc.instances.size(), sc.tris.size(), err.c_str());
@@ -3774,38 +3820,43 @@ static int checkDevHits() {
             add(c + farOff + Vec3(uni(), uni(), uni()), aim - (c + farOff));    // from 3 km
         }
     }
-    // The quads, facing down (u x v): from below (front) and from above (behind).
-    for (const double qx : {0.0, 2.0})
+    // The quads, facing down (u x v): from below (front) and from above (behind), in pairs aimed
+    // at one point.
+    const size_t quadRays = rays.size();
+    for (const double qx : {0.0, 2.0, 4.0})
         for (int k = 0; k < 16; ++k) {
             const Vec3 p(qx - 0.4 + 0.8 * uni(), -1.0, 4.1 + 0.8 * uni());
             const Vec3 d = normalize(Vec3(uni() - 0.5, 1.0, uni() - 0.5));
             add(p - d * 2.0, d);
             add(p + d * 2.0, d * -1.0);
         }
-    // The instance: its silhouette band (as -checktrinormal S1b builds it, carried to the world),
-    // and rays from all round.
-    const MeshInstance& inst = sc.instances[0];
-    for (const Tri& t : sc.blasList[0].tris) {
-        const Vec3 gnf = (dot(t.gn, t.n0 + t.n1 + t.n2) < 0.0) ? t.gn * -1.0 : t.gn;
-        const Vec3 V[3] = {t.v0, t.v1, t.v2}, N[3] = {t.n0, t.n1, t.n2};
-        for (int i = 0; i < 3; ++i) {
-            const Vec3 p = V[i] * 0.9 + V[(i + 1) % 3] * 0.05 + V[(i + 2) % 3] * 0.05;
-            const Vec3 ns = normalize(N[i] * 0.9 + N[(i + 1) % 3] * 0.05 + N[(i + 2) % 3] * 0.05);
-            const Vec3 dv = ns - gnf;
-            if (dot(dv, dv) < 1e-12) continue;
-            const Vec3 d = normalize(dv);
-            if (!(dot(d, gnf) < -0.05) || !(dot(d, ns) > 0.0)) continue;
-            add(inst.toWorld.apply(p - d * 2.0), inst.toWorld.applyDir(d));
+    // The instances: their silhouette bands (as -checktrinormal S1b builds them, carried to the
+    // world), and rays from all round.
+    for (size_t k = 0; k < sc.instances.size(); ++k) {
+        const MeshInstance& inst = sc.instances[k];
+        for (const Tri& t : sc.blasList[inst.blasId].tris) {
+            const Vec3 gnf = (dot(t.gn, t.n0 + t.n1 + t.n2) < 0.0) ? t.gn * -1.0 : t.gn;
+            const Vec3 V[3] = {t.v0, t.v1, t.v2}, N[3] = {t.n0, t.n1, t.n2};
+            for (int i = 0; i < 3; ++i) {
+                const Vec3 p = V[i] * 0.9 + V[(i + 1) % 3] * 0.05 + V[(i + 2) % 3] * 0.05;
+                const Vec3 ns = normalize(N[i] * 0.9 + N[(i + 1) % 3] * 0.05 + N[(i + 2) % 3] * 0.05);
+                const Vec3 dv = ns - gnf;
+                if (dot(dv, dv) < 1e-12) continue;
+                const Vec3 d = normalize(dv);
+                if (!(dot(d, gnf) < -0.05) || !(dot(d, ns) > 0.0)) continue;
+                add(inst.toWorld.apply(p - d * 2.0), inst.toWorld.applyDir(d));
+            }
         }
-    }
-    for (int k = 0; k < 48; ++k) {
-        const Vec3 d = dirRand();
-        add(Vec3(5, 0, 0) + Vec3(uni() - 0.5, uni() - 0.5, uni() - 0.5) * 0.6 - d * 3.0, d);
+        const Vec3 at = inst.toWorld.apply(Vec3(0, 0, 0));
+        for (int j = 0; j < 48; ++j) {
+            const Vec3 d = dirRand();
+            add(at + Vec3(uni() - 0.5, (uni() - 0.5) * (k ? 0.1 : 1.0), uni() - 0.5) * 0.6 - d * 3.0, d);
+        }
     }
     const size_t nClosest = rays.size();
     // Each intersector alone, on a record full of another primitive's values.
     for (int i = 0; i < 2; ++i) add(sc.spheres[i].c + Vec3(0.1, 3, 0.2), Vec3(0, -1, 0), 0, i);
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < nQuadTris; ++i) {
         const Tri& t = sc.tris[i];
         const Vec3 c = (t.v0 + t.v1 + t.v2) * (1.0 / 3.0);
         add(c + Vec3(0.05, 2, 0.03), Vec3(0, -1, 0), 1, i);
@@ -3819,18 +3870,14 @@ static int checkDevHits() {
         return 1;
     }
 
-    auto junk = []() {
-        Hit h;
-        h.t = 1e30; h.matId = -7; h.pscale = 777.0; h.fiberRadius = 0.5; h.hasVcol = true;
-        h.tangent = Vec3(0, 0, 9); h.bitangentSign = -1.0; h.curv = 99.0;
-        return h;
-    };
-    const char* fieldName[] = {"validity", "material", "own-side flag", "t", "point", "shading normal",
+    const char* fieldName[] = {"validity", "material", "back", "own-side flag", "t", "point", "shading normal",
                                "geometric normal", "pscale", "curvature", "strand radius", "vertex colour",
-                               "tangent", "pattern height", "pattern side"};
+                               "tangent", "pattern height", "pattern normal"};
     const int nField = (int)(sizeof(fieldName) / sizeof(fieldName[0]));
     std::vector<int> badField(nField, 0);
-    int hits = 0, backHits = 0, ownBack = 0;
+    // Host-side: hits whose `back` is not the side the ray met ng from; hits where n against ng
+    // would have told it wrong (the squashed instance must make some, or it tests nothing).
+    int hits = 0, backHits = 0, ownBack = 0, backOff = 0, proxyOff = 0;
     auto vdot = [](const double* a, const Vec3& b) { return a[0] * b.x + a[1] * b.y + a[2] * b.z; };
     auto vdist = [](const double* a, const Vec3& b) {
         return std::sqrt((a[0] - b.x) * (a[0] - b.x) + (a[1] - b.y) * (a[1] - b.y) + (a[2] - b.z) * (a[2] - b.z));
@@ -3842,7 +3889,7 @@ static int checkDevHits() {
         if (q.kind < 0) {
             h = sc.closestHit(r, 1e-6);
         } else {
-            h = junk();
+            h = junkHit();
             switch (q.kind) {
                 case 0: intersectSphere(r, sc.spheres[q.index], 1e-6, h); break;
                 case 1: intersectTri(r, sc.tris[q.index], 1e-6, h); break;
@@ -3852,25 +3899,32 @@ static int checkDevHits() {
             }
         }
         const DevHitProbeOut& o = dev[i];
-        bool b[14] = {};
+        bool b[15] = {};
         b[0] = (o.valid != 0) != h.valid;
         if (h.valid && o.valid) {
             ++hits;
             const bool closest = q.kind < 0;
             b[1] = o.matId != h.matId;
-            b[2] = closest && ((o.patOwnSide != 0) != h.patOwnSide);
-            b[3] = std::fabs(o.t - h.t) > 1e-4 * std::max(1.0, h.t);
+            b[2] = (o.back != 0) != h.back;
+            b[3] = closest && ((o.patOwnSide != 0) != h.patOwnSide);
+            b[4] = std::fabs(o.t - h.t) > 1e-4 * std::max(1.0, h.t);
             // A float ray is only known to a few ulps of its reach, so the two may land that far
             // apart ALONG the surface (from 3 km, ~1e-4); off it is the pattern test's business.
             const double rayUlps = 4.8e-7 * (length(r.o) + h.t);
-            b[4] = vdist(o.p, h.p) > 2e-5 * std::max(1.0, length(h.p)) + rayUlps;
-            b[5] = vdot(o.n, h.n) < 0.999;
-            b[6] = vdot(o.ng, h.ng) < 0.999;
-            b[7] = std::fabs(o.pscale - h.pscale) > 1e-5 * std::max(1.0, h.pscale);
-            b[8] = std::fabs(o.curv - h.curv) > 1e-3 * std::max(1.0, std::fabs(h.curv));
-            b[9] = std::fabs(o.fiberRadius - h.fiberRadius) > 1e-6 * std::max(1.0, h.fiberRadius);
-            b[10] = (o.vcol >= 0) != h.hasVcol;
-            b[11] = !closest && std::fabs(o.tangentZ - h.tangent.z) > 1e-4;
+            b[5] = vdist(o.p, h.p) > 2e-5 * std::max(1.0, length(h.p)) + rayUlps;
+            b[6] = vdot(o.n, h.n) < 0.999;
+            b[7] = vdot(o.ng, h.ng) < 0.999;
+            b[8] = std::fabs(o.pscale - h.pscale) > 1e-5 * std::max(1.0, h.pscale);
+            b[9] = std::fabs(o.curv - h.curv) > 1e-3 * std::max(1.0, std::fabs(h.curv));
+            b[10] = std::fabs(o.fiberRadius - h.fiberRadius) > 1e-6 * std::max(1.0, h.fiberRadius);
+            b[11] = (o.vcol >= 0) != h.hasVcol;
+            b[12] = !closest && std::fabs(o.tangentZ - h.tangent.z) > 1e-4;
+            if (closest) {
+                const bool fromBehind = dot(r.d, h.ng) > 0.0;
+                backOff += (h.back != fromBehind) ? 1 : 0;
+                proxyOff += ((dot(h.n, h.ng) < 0.0) != h.back) ? 1 : 0;
+                if (fromBehind) { ++backHits; if (h.patOwnSide) ++ownBack; }
+            }
             if (h.matId >= 0 && h.matId < (int)sc.mats.size()) {
                 const PatCtx c = patCtxFromHit(sc, h);
                 // The height above the surface the pattern reads at: the device's must match the
@@ -3885,9 +3939,9 @@ static int checkDevHits() {
                     const double ti = in.valid ? in.t : 1e30, to = out.valid ? out.t : 1e30;
                     return ti <= to ? ti : -to;
                 };
-                b[12] = std::fabs(height(Vec3(o.q[0], o.q[1], o.q[2])) - height(Vec3(c.x, c.y, c.z))) > 0.25 * hair;
-                b[13] = closest && (o.side < 0.0) != h.patOwnSide;
-                if (closest && dot(r.d, h.ng) > 0.0) { ++backHits; if (h.patOwnSide) ++ownBack; }
+                b[13] = std::fabs(height(Vec3(o.q[0], o.q[1], o.q[2])) - height(Vec3(c.x, c.y, c.z))) > 0.25 * hair;
+                b[14] = vdot(o.qn, Vec3(c.nx, c.ny, c.nz)) < 0.999 ||
+                        std::fabs(o.qcurv - c.curv) > 1e-3 * std::max(1.0, std::fabs(c.curv));
             }
         }
         for (int f = 0; f < nField; ++f) {
@@ -3905,10 +3959,34 @@ static int checkDevHits() {
         if (badField[f])
             std::printf("[checkdevhits] %-16s differs on %d of %zu rays FAIL\n", fieldName[f], badField[f], rays.size());
     }
-    const bool covered = hits > (int)(rays.size() / 2) && backHits > 40 && ownBack > 10;
+    // The normal-mapped quad's ray pairs (the third quad's, after the first two's 64 rays), from
+    // in front and from behind at one point: the normal from behind is the front's, negated --
+    // the bump is the same bump -- and the map really tilts it.
+    int nmBad = 0, nmTilted = 0, nmPairs = 0;
+    for (size_t k = quadRays + 64; k + 1 < quadRays + 96; k += 2) {
+        const DevHitProbeRay& qf = rays[k];
+        const DevHitProbeRay& qb = rays[k + 1];
+        const Hit hf = sc.closestHit(Ray{Vec3(qf.o[0], qf.o[1], qf.o[2]), Vec3(qf.d[0], qf.d[1], qf.d[2])}, 1e-6);
+        const Hit hb = sc.closestHit(Ray{Vec3(qb.o[0], qb.o[1], qb.o[2]), Vec3(qb.d[0], qb.d[1], qb.d[2])}, 1e-6);
+        if (!hf.valid || !hb.valid || hf.back || !hb.back) { ++nmBad; continue; }
+        ++nmPairs;
+        nmBad += dot(hf.n, hb.n) > -0.999999 ? 1 : 0;
+        nmTilted += dot(hf.n, hf.ng) < 0.99 ? 1 : 0;   // from in front, n starts as ng
+    }
+    if (backOff)
+        std::printf("[checkdevhits] host: `back` is not the side the ray met ng from on %d hits FAIL\n", backOff);
+    if (nmBad || nmTilted < nmPairs || nmPairs < 12)
+        std::printf("[checkdevhits] host: the normal-mapped quad's normal from behind is not its front one negated "
+                    "on %d of %d pairs (%d tilted by the map) FAIL\n", nmBad, nmPairs, nmTilted);
+    bad += backOff + nmBad + (nmTilted < nmPairs || nmPairs < 12 ? 1 : 0);
+    const bool covered = hits > (int)(rays.size() / 2) && backHits > 40 && ownBack > 10 && proxyOff > 0;
+    if (proxyOff == 0)
+        std::printf("[checkdevhits] the squashed instance turned no normal across its face: n against ng never "
+                    "misreads the side, so `back` is not tested where it must be FAIL\n");
     std::printf("[checkdevhits] %zu rays (%zu through closestHit, %zu through one intersector on a reused record), "
-                "%d hit, %d from behind (%d on glass): %d field mismatches %s\n",
-                rays.size(), nClosest, rays.size() - nClosest, hits, backHits, ownBack, bad,
+                "%d hit, %d from behind (%d on glass), %d where n against ng would misread the side, %d "
+                "normal-map pairs: %d mismatches %s\n",
+                rays.size(), nClosest, rays.size() - nClosest, hits, backHits, ownBack, proxyOff, nmPairs, bad,
                 bad == 0 && covered ? "ok" : "FAIL");
     if (!covered) std::printf("[checkdevhits] too few hits to mean anything FAIL\n");
     std::printf("[checkdevhits] %s\n", bad == 0 && covered ? "PASS" : "FAIL");
@@ -9643,7 +9721,9 @@ static int checkCavity() {
     // matId 0 throughout: §10 exercises the per-material gate, and the probe is only
     // reached through a material that declares it reads `cavity`.
     auto hitAt2 = [](const Vec3& p, const Vec3& n, const Vec3& ng) {
-        Hit h; h.valid = true; h.t = 1.0; h.p = p; h.n = n; h.ng = ng; h.matId = 0; return h;
+        Hit h; h.valid = true; h.t = 1.0; h.p = p; h.n = n; h.ng = ng; h.matId = 0;
+        h.back = dot(n, ng) < 0.0;   // as an intersector turning n to the ray would have it
+        return h;
     };
     auto hitAt = [&](const Vec3& p, const Vec3& n) { return hitAt2(p, n, n); };
 
@@ -10009,6 +10089,17 @@ static int checkCavity() {
         };
         ok &= chk("S11 opaque, from below: the probe looks down", fromBelow(false), 0.0, 0.0);
         ok &= chk("S11 crossable, from below: the probe looks up", fromBelow(true), 1.0 - 0.25, 5e-3);
+        // §12: the side probed is the one the ray arrived on (Hit::back), not where n points --
+        // a normal map can tip n across the plane. From above, with n tipped below it: up.
+        auto tipped = [&](bool own) {
+            s.mats[0].patOwnSide = own;
+            Hit h = hitAt2(Vec3{0, 0, 0}, normalize(Vec3{0, -0.1, 1}), Vec3{0, 1, 0});
+            h.back = false;
+            s.markPatSide(h);
+            return patCtxFromHit(s, h).cavity;
+        };
+        ok &= chk("S12 opaque, n tipped across: the probe looks up", tipped(false), 1.0 - 0.25, 5e-3);
+        ok &= chk("S12 crossable, n tipped across: the probe looks up", tipped(true), 1.0 - 0.25, 5e-3);
         s.mats[0].patOwnSide = false;
     }
 

@@ -3194,20 +3194,30 @@ struct Scene {
     void finalizeTris() { build(); }   // kept for existing call sites
 
     // Material::patOwnSide for every material: light can cross it -- a dielectric, plain or
-    // coated, a half mirror, a filter, a translucent -- or it is a mix or layered stack with
-    // such a part (a layered stack whose bodies are opaque returns light on the side it came).
-    // A part is never a mix or layered stack itself (the loader refuses one), so its type
-    // decides.
+    // coated, a half mirror, a filter, a translucent, a thin film or multilayer stack that is
+    // entered somewhere in the band (on an absorbing substrate, or with an absorbing layer, it
+    // never is: Material::coatOpaque) -- or it is a mix or layered stack with such a part (a
+    // layered stack whose bodies are opaque returns light on the side it came). A part is
+    // never a mix or layered stack itself (the loader refuses one), so it decides alone.
     void finalizePatternSides() {
-        auto crosses = [](MatType t) {
-            return t == MatType::Dielectric || t == MatType::ThinFilm || t == MatType::Multilayer ||
-                   t == MatType::HalfMirror || t == MatType::Filter || t == MatType::DiffuseTransmit;
+        auto crosses = [](const Material& m) {
+            switch (m.type) {
+                case MatType::Dielectric: case MatType::HalfMirror: case MatType::Filter:
+                case MatType::DiffuseTransmit:
+                    return true;
+                case MatType::ThinFilm: case MatType::Multilayer:
+                    for (double L = LAMBDA_MIN; L <= LAMBDA_MAX; L += 1.0)
+                        if (!m.coatOpaque(L)) return true;
+                    return false;
+                default:
+                    return false;
+            }
         };
         for (auto& m : mats) {
-            bool own = crosses(m.type);
+            bool own = crosses(m);
             if (m.type == MatType::Mix || m.type == MatType::Layered)
                 for (int c : m.mixChildren)
-                    if (c >= 0 && c < (int)mats.size() && crosses(mats[c].type)) own = true;
+                    if (c >= 0 && c < (int)mats.size() && crosses(mats[c])) own = true;
             m.patOwnSide = own;
         }
     }
@@ -3431,8 +3441,12 @@ struct Scene {
     }
 
     // Perturb the shading normal by a bound tangent-space normal map (C6). Builds a
-    // TBN frame from the (ray-oriented) shading normal and the hit's surface tangent,
-    // rotates the sampled tangent-space normal into world, and replaces h.n. A no-op
+    // TBN frame from the shading normal on the surface's own side and the hit's surface
+    // tangent, rotates the sampled tangent-space normal into world, and turns the result
+    // to the ray: a bump seen from behind is the same bump, so its normal there is the
+    // front one negated. (About the ray-facing normal the frame's normal and bitangent
+    // would flip and its tangent would not, mirroring the bump along T from behind: light
+    // crossing a normal-mapped pane would meet a different surface each way.) A no-op
     // unless the hit's material carries a valid normalTex. Applied at the single
     // closestHit choke point so every CPU renderer (backward, forward, BDPT, VCM,
     // SPPM, photon map, GRIN) sees the perturbed normal identically.
@@ -3443,7 +3457,8 @@ struct Scene {
         const Texture& tx = textures[m.normalTex];
         if (!tx.valid()) return;
         Vec3 tn = tx.sampleNormalTS(h.u, h.v);          // tangent-space normal
-        Vec3 N = h.n;                                   // oriented against the ray
+        const double own = h.back ? -1.0 : 1.0;
+        const Vec3 N = h.n * own;                       // on the surface's own side
         Vec3 T = h.tangent - N * dot(N, h.tangent);     // re-orthogonalize per-hit
         double tl = std::sqrt(dot(T, T));
         if (tl < 1e-9) return;                          // degenerate frame: leave n as-is
@@ -3452,7 +3467,7 @@ struct Scene {
         double s = m.normalStrength;
         Vec3 pert = T * (tn.x * s) + B * (tn.y * s) + N * tn.z;
         double pl = std::sqrt(dot(pert, pert));
-        if (pl > 1e-12) h.n = pert * (1.0 / pl);
+        if (pl > 1e-12) h.n = pert * (own / pl);        // and back to the ray's side
     }
 
     // `skipHair` makes fibers INVISIBLE to the closest-hit query, the same way
@@ -3541,16 +3556,15 @@ struct Scene {
                 [&](int lp, double& tm) { leaf(noHairPrim[lp], tm); }, stats);
         else
             bvh.traverseClosest(r, tmin, tMax, leaf, stats);
-        markPatSide(h);   // before the normal map tips n
+        markPatSide(h);
         applyNormalMap(h);
         return h;
     }
 
-    // Hit::patOwnSide for a hit whose n the intersector turned to face the ray: from behind ng,
-    // onto a surface (its own material, h.matId here) light can cross.
+    // Hit::patOwnSide: the surface's own material (h.matId here, before any mix resolves) lets
+    // light cross it.
     void markPatSide(Hit& h) const {
-        h.patOwnSide = h.valid && dot(h.n, h.ng) < 0.0 && h.matId >= 0 && h.matId < (int)mats.size() &&
-                       mats[h.matId].patOwnSide;
+        h.patOwnSide = h.valid && h.matId >= 0 && h.matId < (int)mats.size() && mats[h.matId].patOwnSide;
     }
 
     // Is anything blocking the segment from o toward dir, before maxDist?
@@ -3926,7 +3940,7 @@ struct Scene {
                 h = lh;
             }
         }
-        markPatSide(h);   // before the normal map tips n
+        markPatSide(h);
         applyNormalMap(h);
         return h;
     }
@@ -4057,15 +4071,15 @@ inline void bindPatScene(PatCtx& c, const Scene& s) {
 // the point, and that is a cosine-weighted integral over the hemisphere. It also puts
 // samples where the geometry actually occludes rather than wasting them near the
 // grazing ring.
-// `up`, when given, is the hemisphere's axis instead (patCtxFromHit passes the surface's own
-// side for a surface light can cross).
-inline double cavityAt(const Scene& scene, const Hit& h, const Vec3* up = nullptr) {
+inline double cavityAt(const Scene& scene, const Hit& h) {
     const int N = scene.cavitySamples;
     if (N <= 0 || scene.cavityRadius <= 0.0) return 0.0;
-    // Probe about the GEOMETRIC normal on the shaded side: using the shading normal
-    // would let an interpolated normal tilt the hemisphere into the surface on a
-    // coarse mesh and self-report occlusion that is not there.
-    const Vec3 n = up ? *up : orientedGeoN(h);
+    // Probe about the GEOMETRIC normal: using the shading normal would let an interpolated
+    // normal tilt the hemisphere into the surface on a coarse mesh and self-report occlusion
+    // that is not there. On the side being shaded -- the side the intersector decided, which
+    // a normal map tipping n across the plane does not change -- except on a surface light
+    // can cross, which is probed on its own side, ng's, from either side (patCtxFromHit).
+    const Vec3 n = (h.back && !h.patOwnSide) ? h.ng * -1.0 : h.ng;
     Vec3 t, b;
     onb(n, t, b);
     // Offset along the normal by a hair to avoid re-hitting the surface we sit on.
@@ -4100,7 +4114,7 @@ inline double cavityAt(const Scene& scene, const Hit& h, const Vec3* up = nullpt
 // the side it arrived, so the shaded side is reciprocal already, and the winding -- which
 // nothing else there shows, under two-sided shading -- does not decide what `ny` reads.
 inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
-    const bool own = h.patOwnSide;   // decided at the hit, with the surface's material (markPatSide)
+    const bool own = h.back && h.patOwnSide;   // turn the normal and curvature to ng's side
     // `cavity` is filled here rather than by the intersector because it needs the whole
     // scene, and cached on the Hit because one shading point builds several PatCtxs.
     // Doubly gated — scene-wide (one compare for the overwhelming majority of scenes,
@@ -4110,7 +4124,7 @@ inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
     if (scene.needsCavity && !h.cavityDone &&
         h.matId >= 0 && h.matId < (int)scene.mats.size() &&
         scene.mats[h.matId].readsCavity) {
-        h.cavity = own ? cavityAt(scene, h, &h.ng) : cavityAt(scene, h);
+        h.cavity = cavityAt(scene, h);
         h.cavityDone = true;
     }
     Vec3 q;

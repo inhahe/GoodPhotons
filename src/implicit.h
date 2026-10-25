@@ -414,7 +414,8 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
     auto writeHit = [&](double th, const Vec3& p, const Vec3& ng) -> bool {
         hit.t = th; hit.p = p; hit.valid = true;
         hit.ng = ng;
-        hit.n  = (dot(r.d, ng) < 0.0) ? ng : -ng;
+        hit.back = !(dot(r.d, ng) < 0.0);
+        hit.n  = hit.back ? -ng : ng;
         hit.matId = im.matId; hit.sensorId = -1;
         if (im.uvProj != UvProjection::None) {
             const Aabb& b = im.uvBoundsSet ? im.uvBounds : im.bounds;

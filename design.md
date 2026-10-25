@@ -7305,21 +7305,35 @@ as the one at fault.
     cavity a pattern sees (`nx`/`ny`/`nz`/`curv`/`cavity`) follow the same idea only where it
     matters (0.400.0): on a surface light can cross (`Material::patOwnSide`, set by
     `Scene::finalizePatternSides`: a dielectric plain or coated, half mirror, filter,
-    translucent, or a mix / layered stack with such a part -- a part is never a stack itself,
-    the loader refuses one) they are the surface's own side's whenever the ray came from behind; elsewhere the
-    shaded side's. Decided once per hit, at the closest-hit choke points (`Scene::markPatSide`
-    and the device closestHit set `Hit::patOwnSide` / `DHit::patOwnSide`), before normal
-    mapping tips n and with the surface's own material -- the rule is the surface's, so every
-    pattern on it follows it, a mix's opaque part's too. That is why it rides on the hit
-    rather than being looked up at each read: the host keeps the mix's matId on a hit whose
-    mix resolved to a part, but a GPU BDPT / VCM vertex holds the part's, and a connection
-    rebuilds its hit from the vertex (`DVertex::patOwnSide`, `DVcmLV::patOwnSide` carry it).
+    translucent, a thin film or multilayer stack entered somewhere in the band -- not one on
+    an absorbing substrate, `Material::coatOpaque` -- or a mix / layered stack with such a part;
+    a part is never a stack itself, the loader refuses one) they are the surface's own side's
+    whenever the ray came from behind, and its cavity is probed about ng from either side;
+    elsewhere the shaded side's. Two bits on the hit carry it. `Hit::back` / `DHit::back` is
+    the side the ray came from, written by every intersector, which decides it exactly (a
+    triangle's from its face normal): n against ng cannot tell it after a normal map has
+    tipped n across the plane, nor under a non-uniform instance scale, whose inverse transpose
+    keeps the side of a direction (dot(d, n)) but not of one normal against another, and so can
+    turn an interpolated normal across its face's plane. `Hit::patOwnSide` / `DHit::patOwnSide`
+    is the surface's material's flag, set at the closest-hit choke points (`Scene::markPatSide`,
+    the device closestHit) with the surface's own material -- the rule is the surface's, so
+    every pattern on it follows it, a mix's opaque part's too. Both ride on the hit rather than
+    being looked up at each read: the host keeps the mix's matId on a hit whose mix resolved to
+    a part, but a GPU BDPT / VCM vertex holds the part's, and a connection rebuilds its hit from
+    the vertex (`DVertex::back` / `patOwnSide`, `DVcmLV::back` / `patOwnSide` carry them).
     An opaque surface returns light on the side it
     arrived, so the shaded side is reciprocal there, and two-sided shading means the winding
     -- which the default `quad` points down -- must not decide what `ny` reads; on a surface
-    light crosses the winding already decides inside from outside. The previews take it per
-    triangle from the triangle's own material (`PTri::patOwnSide`), not from the part whose
-    payload a mix bakes onto it, and turn the normal on a triangle the eye sees from behind.
+    light crosses the winding already decides inside from outside. The previews take the flag
+    per triangle from the triangle's own material (`PTri::patOwnSide`, a byte of the GPU
+    DPTri's flag word), not from the part whose payload a mix bakes onto it, and "from behind"
+    from the per-triangle decision two-sided shading makes (`raster::seenFromBehind`, the GPU's
+    kSlotBack). Normal maps are built about the surface's own normal and turned to the ray
+    after, in all four (`applyNormalMap`, `dApplyNormalMap`, both previews; 0.400.1): a bump
+    seen from behind is the same bump, so its normal there is the front one negated -- about
+    the ray-facing normal the bitangent flipped and the tangent did not, mirroring the bump
+    along T, so light crossing a normal-mapped pane met a different surface each way and a
+    pattern's own-side normal differed with the side.
     Sites: host `patCtxFromHit` (every host pattern read at a hit),
     `emitterPatMulAt` (a point the emitter sampler drew, along nOut -- the side a one-sided
     emitter's ng faces -- with the hair sized by the patch it was drawn on, which
@@ -7328,8 +7342,9 @@ as the one at fault.
     point, as MIS needs. A mesh light's `EmitTri::nrm` is turned to its vertex normals'
     side as intersectTri turns ng, so the two also agree on which side emits, and
     `emit_orient auto` judges a shell inward or outward by those same oriented normals) and
-    the rasterizer's `ctx()`; device `dPatPoint` at every site that builds a pattern point
-    from a `DHit`, `dEmitterPatMulAt`, and raster_cuda's `dRasterPatPoint`. The previews
+    the rasterizer's `ctx()`; device `dPatIn` (the point, normal and curvature together, so no
+    site can skip the side rule) at every site that reads a pattern at a `DHit`,
+    `dEmitterPatMulAt`, and raster_cuda's `dRasterPatPoint`. The previews
     compute the face normal (turned to the vertex normals' sum) and reach per pixel, once,
     from the source triangle: baking them per triangle cost 32 B a triangle on the host
     (gigabytes on a fur preview) and went stale where the N-D viewer moves vertices on the
@@ -7387,18 +7402,25 @@ as the one at fault.
     the step); and, for the side rule, a floor facing up with a square facing down over it
     under `step(0, ny)`, opaque and in three mixes light can cross (one baking its opaque part
     into the preview, one whose opaque part carries the pattern), in modes R and D and the preview -- one frame,
-    since the preview meters each frame for itself. `pattern_gen::checker` and loom's two checkers had their walls shifted a
+    since the preview meters each frame for itself. tools/check_normalmap_frame.py case 3 shows
+    a quad mapped along T from in front and from behind, under the sun mirrored with the view,
+    in mode R on both devices and in both previews: the bump darkens it both ways.
+    `pattern_gen::checker` and loom's two checkers had their walls shifted a
     thousandth of a cell (0.398.1-0.399.7); on a wall the nudge carries toward its lower
     cell, that read the shifted cell near the origin and the nudged one farther out -- a
     ring -- so it went in 0.399.8. Two load-time probes that warned of a pattern splitting a
     surface (0.399.3's, then `warnPatternsSplitBySteps` in 0.399.6) went when the nudge made
     what they looked for impossible.
   * **The GPU's intersectors are held to the CPU's** by `-checkdevhits` (`cudaHitProbe`,
-    kernel `kHitProbe`): one small scene with every primitive kind, opaque and glass, and an
-    instanced smooth mesh; rays from either side, from 3 km and into the instance's silhouette
-    band; every field of every hit compared (the point within the float ray's own precision,
-    the pattern's read point as a height above the host's surface), and each device intersector
-    alone on a record full of another primitive's values. A float ray is itself only known to
+    kernel `kHitProbe`): one small scene with every primitive kind, opaque and glass, a
+    normal-mapped glass quad, and a smooth mesh instanced twice, once tilted and squashed to a
+    tenth of its height; rays from either side, from 3 km and into the instances' silhouette
+    bands; every field of every hit compared (the point within the float ray's own precision,
+    the pattern's read point as a height above the host's surface, its normal and curvature),
+    and each device intersector alone on a record full of another primitive's values. On the
+    host it also holds `back` to the side the ray met ng from on every hit -- the squashed
+    instance must turn some normal across its face, or the check fails as testing nothing --
+    and a normal-mapped surface's normal from behind to its front one, negated. A float ray is itself only known to
     a few ulps of its reach, so from 3 km the two devices meet a surface ~1e-4 apart along it;
     the check measures the read point's height above the host's surface by casting from it
     along the normal both ways, which no shift along the surface (nor a far isosurface's
@@ -7406,7 +7428,7 @@ as the one at fault.
   * **A hit record is reused across candidates.** The closest-hit loops (host and device) hand
     one Hit/DHit to every primitive they test; each intersector that accepts writes every field
     a hit on its primitive owns -- `pscale`, the tangent frame, `fiberRadius`, the vertex
-    colour (`hasVcol` / `vcol`), `curv` -- since a field left alone keeps a farther candidate's:
+    colour (`hasVcol` / `vcol`), `curv`, `back` -- since a field left alone keeps a farther candidate's:
     an isosurface's pattern hair sized by a sky dome's reach, a sphere tinted by a mesh's vertex
     colours, a triangle treated as a strand by the hair exit offset. `DHit::vcol` also defaults
     to -1, so an unwritten one never indexes the colour table. `-checkpatops` hands each host

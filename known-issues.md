@@ -168,6 +168,34 @@ the hair is 2e-6 of the triangle's reach (its farthest vertex from the origin, `
 baked at upload, `Hit::pscale` on the host), some 17 float ulps of the coordinates the hit was
 computed from. CHECKER-ON-BOUNDARY above has the measurements.
 
+## OPEN (2026-10-25, 0.400.1): ORIENTEDGEON-TIPPED — the shaded-side geometric normal is read off a normal-mapped n
+
+`orientedGeoN(h)` (geometry.h) turns ng to the side `h.n` points, and `h.n` is the shading
+normal *after* the normal map. Where a strong map tips n across the surface's plane, or a
+non-uniform instance scale turns an interpolated normal more than 90 degrees from its face's
+(see `Hit::back`), it returns the side the ray did not come from. Its callers -- ray-spawn
+offsets (`h.p + orientedGeoN(h) * 1e-6` in backward.h's NEE and media transmittance),
+`shadowTerminatorG`, render.h's camera splats -- then offset into the surface or judge the
+terminator against the wrong side. Not seen in any scene; a map at strength 1 keeps n's
+normal component positive. Proper fix: `orientedGeoN` from `h.back` (`back ? -ng : ng`), which
+every intersector now records, and its device twin likewise -- but the fur volume's synthetic
+fiber hit (backward.h `vh`) sets n without an intersector, so it must set `back` too, and every
+hand-built hit in the self-checks with it. `cavityAt` already uses `back` (0.400.1).
+
+## DONE (2026-10-25, 0.400.1): NORMALMAP-BACK-MIRROR — a normal-mapped surface seen from behind showed its bumps mirrored along the tangent
+
+`applyNormalMap`, `dApplyNormalMap` and both previews built the TBN frame about the
+ray-facing shading normal. From behind that normal and the bitangent `cross(N, T)` flip and the
+tangent does not, so the perturbed normal came out `T tx - B ty - N tz` instead of the front's
+`T tx + B ty + N tz` negated: the tilt along T mirrored. A two-sided normal-mapped surface lit
+from behind shaded as a different surface, light crossing a normal-mapped pane met a different
+normal each way (non-reciprocal), and a crossable surface's own-side pattern normal (0.400.0)
+differed with the side. Now all four build the frame about the shading normal on the surface's
+own side and turn the result to the ray (`Hit::back` says which side that is). Found by the
+Opus review of 0.400.0. `-checkdevhits` holds a normal-mapped glass quad's normal from behind to
+its front one negated (and the GPU's to the CPU's); tools/check_normalmap_frame.py case 3 renders
+a quad mapped along T from in front and behind in mode R on both devices and both previews.
+
 ## DONE (2026-10-25, 0.400.0): PATTERN-NORMAL-SIDE — the normal, curvature and cavity a pattern sees differed with the side a transmissive surface is crossed from
 
 `patCtxFromHit` handed patterns the shading normal turned to face the ray (`nx ny nz`), the
@@ -176,12 +204,15 @@ of the viewer (`cavity`). On a surface light can cross, a pattern reading them t
 value for light crossing one way than the other, so forward, backward and bidirectional modes
 integrated different things and BDPT/VCM's MIS combined them. Decided with the user: they now
 take the surface's own side (the side ng faces) on a surface light can cross --
-`Material::patOwnSide`: a dielectric plain or coated, half mirror, filter, translucent, or a mix
-/ layered stack with such a part -- whenever the ray came from behind. Decided once
-per hit, with the surface's own material, at the closest-hit choke points (`Hit::patOwnSide`,
-before the normal map can tip n), so every pattern on the surface follows it: a mix's opaque
-part's too, and on a GPU BDPT / VCM connection, which rebuilds the hit from a vertex holding the
-part's material. Not everywhere: on an opaque surface light leaves on the side it arrived, so the
+`Material::patOwnSide`: a dielectric plain or coated, half mirror, filter, translucent, a thin
+film or multilayer stack light enters (0.400.1: not one on an absorbing substrate), or a mix /
+layered stack with such a part -- whenever the ray came from behind (`Hit::back`, which every
+intersector records since 0.400.1: n against ng misreads it after a normal map or under a
+non-uniform instance scale). The material's flag is set on the hit once, with the surface's
+own material, at the closest-hit choke points (`Hit::patOwnSide`), so every pattern on the
+surface follows it: a mix's opaque part's too, and on a GPU BDPT / VCM connection, which
+rebuilds the hit from a vertex holding the part's material. A crossable surface's cavity is
+probed about ng from either side. Not everywhere: on an opaque surface light leaves on the side it arrived, so the
 shaded side is already reciprocal, and with two-sided shading the winding -- the default `quad`
 faces down -- would otherwise decide what `ny` reads on every floor. CPU and GPU tracers and
 both previews (each preview triangle carries its own material's flag, not that of the part whose
