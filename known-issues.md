@@ -190,25 +190,60 @@ read at hb on a translucent see the normal it sees at h (0.400.4: and its curvat
 `otherSide` / `dOtherSide` turn n, curv and back together). Bit-identical on scenes where
 nothing tips n (13 renders, both devices, modes R, D, B and J, a normal-mapped wall among
 them), and on a squashed smooth dome lit from above (its lamp lies where its tipped hits' n
-faces away). NOT covered: BSDF continuations -- see CONTINUATION-TIPPED.
-
-## OPEN (2026-10-25, 0.400.4): CONTINUATION-TIPPED — at a hit whose shading normal is tipped across the surface, BSDF continuations leak light from behind
-
-Where n is tipped across the surface's plane (see ORIENTEDGEON-TIPPED: a normal-map texel with
-blue below 0.5, a non-uniform instance scale of a smooth mesh), a continuation sampled about n
-(`cosineHemisphere(h.n)` and the glossy lobes, host and device) heads into the surface about
-half the time, and the host also spawns every continuation along n (`Ray{h.p + h.n * 1e-6, wo}`,
-some 40 sites in backward.h, render.h, photonmap_render.h, sppm_render.h; the device offsets
-along ng toward wo, `dOffsetAlong`). Such a ray travels behind the surface and brings back light
-from there. Only NEE is protected (the terminator's geometric step). Pre-existing: the classic
-shading-normal problem, here at its extreme. Proper fix: treat a continuation whose direction
-lies on the far geometric side of a reflecting surface as absorbed (PBRT's choice -- it loses the
-energy of that sample, where letting it through leaks), and spawn host continuations along ng
-toward the outgoing direction as the device does; both behind a bit-identity check on scenes
-where nothing tips n. Not done in 0.400.4: it touches every host integrator's continuation
-sites, and which of absorption or leak a tipped normal should cost is the user's call.
+faces away). BSDF continuations: see CONTINUATION-LEAK.
 Found by the Opus review of 0.400.1; -checkdevhits holds orientedGeoN to the ray's side on
 every hit and the device's dShadedNg to it.
+
+## OPEN (2026-10-25, 0.400.5): J-MERGE-PROXIMITY — modes J and U merge photons from a surface closer than the merge radius
+
+A surface merge (J's `dSurfMergeAt` and its host twin in bdpt.h, the VCM gathers) takes every
+stored photon within the merge radius of the camera vertex, whatever surface it lies on. A
+second surface closer than the radius -- the far face of a thin slab, a lamp or a floor tucked
+under a sheet -- contributes photons that arrived from directions the vertex's BSDF accepts:
+light leaks across the gap. Found while building tools/check_shading_leak.py: a sheet with a
+lamp 5 cm under it (the merge radius auto-sized to 0.28 m in that scene) read 8-18% of its lit
+brightness on top in mode J, and exactly 0 with `-nojsurf` or with the lamp 0.4 m down. The
+check now keeps its lamp beyond the radius, so it measures the shading-normal leak alone. The
+host photon map guards against this by comparing the photon's stored normal with the hit's
+(`dot(ph.n, h.n) < 0.5`); J's DSurfPhoton stores no normal. Proper fix: store the deposit's
+geometric normal (DSurfPhoton is 48 B; a packed normal adds 4-6) and reject a photon whose
+surface faces away from the vertex's, or flatten the gather to a disc about the vertex's
+tangent plane -- the second costs no storage but darkens tightly curved surfaces, whose photons
+leave the plane within the radius. Pre-existing: the classic proximity bias of photon mapping,
+shrinking as the radius does over iterations (-vcmalpha).
+
+## DONE (2026-10-25, 0.400.5): CONTINUATION-LEAK — light leaked through surfaces whose shading normal leans away from them, in the bidirectional modes and at tipped normals
+
+A continuation sampled about a shading normal -- `cosineHemisphere(h.n)`, the glossy lobes, a
+mirror or a half mirror's reflection about n, a dielectric's reflection or refraction about its
+shading `nl` -- can land on the far side of the true surface: the thin wedge between the shading
+and the geometric plane on a smooth or normal-mapped surface, most of the lobe where n is tipped
+across the plane. Such a ray travels behind the surface and brings back light from there. Where it
+started decided whether it leaked: the host's backward and forward walks spawned along n, so
+below a merely smoothed surface the ray re-hit the surface it left (no leak, a stray extra bounce)
+and only a tipped n put the origin behind it; the BDPT/VCM walks and the device spawn on the side
+the ray travels to, so they leaked there too. Measured (tools/check_shading_leak.py, an opaque
+sheet lit only from below, its top against the same sheet lit from above): before, with a lamp
+below, mode D 11-29% on smooth and normal-mapped sheets and 7-8x on a tipped one, mode J 4-31%
+and 4-7x, mode U 10-40% and 1.3-3.3x, mode R on the CPU 31% on the tipped sheet; a floor lit
+under the sheet showed it in mode R on the GPU too (1.2% mapped, 2.2x tipped). And with the
+continuations absorbed modes J and U kept up to 28% on the smooth and mapped sheets and 2.4x on
+the tipped one, through MERGES: on a zero-thickness sheet the photons of its underside lie
+within the merge radius of the top, and a tilted or tipped shading normal let the camera BSDF
+take them as reflections.
+
+Decided with the user: absorb. Every walk ends a continuation whose direction lies on different
+sides of the shading plane and the true surface (geometry.h `crossesSurface`, `continueAlong`,
+whose host spawn origin also moves to ng where n is tipped; device `dCrossesSurface`; the BDPT
+and VCM walks' `aboutNs` flag; the dielectric interface steps test the side their reflection or
+refraction lands on), as Cycles discards such samples -- it loses that sample's energy where
+letting it through leaks. A pass-through and a grating's orders (built about ng) are exempt.
+Absorbing without renormalizing leaves every other direction's density, and so MIS, as it was.
+Every surface merge (J's `dSurfMergeAt` and its host twin, both VCM gathers) rejects a photon
+whose incoming direction crosses the surface the same way. Cost, on tools/check_bitid.py's
+scenes: flat geometry, curves and isosurfaces byte-identical in every mode on both devices; the
+smooth and normal-mapped scenes' means move -0.42% to +0.03%. After: no leak in any mode, R, D, B,
+J and U, on any of the three sheets.
 
 ## DONE (2026-10-25, 0.400.1-0.400.2): NORMALMAP-BACK-MIRROR — a normal-mapped surface seen from behind showed one of its relief's slopes mirrored
 

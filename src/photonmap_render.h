@@ -1283,7 +1283,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             }
             case MatType::Mirror: {
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
-                ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                if (!continueAlong(h, reflect(ray.d, h.n), ray)) return L;   // across the surface
                 break;
             }
             case MatType::Glossy: {
@@ -1306,7 +1306,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                     gmis.from = h.p;
                     gmis.n = h.n;
                 }
-                ray = Ray{h.p + h.n * 1e-6, o};
+                if (!continueAlong(h, o, ray)) return L;
                 break;
             }
             case MatType::Dielectric:
@@ -1324,7 +1324,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             }
             case MatType::HalfMirror: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
-                if (rng.uniform() < r) ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                if (rng.uniform() < r) { if (!continueAlong(h, reflect(ray.d, h.n), ray)) return L; }
                 else                   ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 break;
             }
@@ -1368,7 +1368,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             }
             default: {                                   // Grating: approx reflect
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
-                ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                if (!continueAlong(h, reflect(ray.d, h.n), ray)) return L;   // across the surface
                 break;
             }
         }
@@ -1615,7 +1615,8 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     //     NEE direct term above is not double-counted.
                     Vec3 fg{0, 0, 0};
                     for (int k = 0; k < fgRays; ++k) {
-                        Ray gr{h.p + h.n * 1e-6, cosineHemisphere(h.n, rng)};
+                        Ray gr;   // a gather ray across the surface gathers nothing
+                        if (!continueAlong(h, cosineHemisphere(h.n, rng), gr)) continue;
                         fg += photonGatherSub(scene, pm, gr, rng, diffraction, maxBounce,
                                               lambda, invPdfL, norm, h, m,
                                               causOn ? pmC : nullptr, normC);
@@ -1666,7 +1667,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 thr *= r;
                 sthr.mul([&](double L) { return clamp01(reflectSlot(scene, m, h, L)); }, r);
-                ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                if (!continueAlong(h, reflect(ray.d, h.n), ray)) return L;   // across the surface
                 break;
             }
             case MatType::Glossy: {
@@ -1704,7 +1705,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     gmis.from = h.p;
                     gmis.n = h.n;
                 }
-                ray = Ray{h.p + h.n * 1e-6, o};
+                if (!continueAlong(h, o, ray)) return L;
                 break;
             }
             case MatType::Dielectric:
@@ -1730,7 +1731,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             case MatType::HalfMirror: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 const bool refl = rng.uniform() < r;
-                if (refl) ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                if (refl) { if (!continueAlong(h, reflect(ray.d, h.n), ray)) return L; }
                 else      ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 // SPECGATHER: the coin at each photon's wavelength -- a coloured half mirror
                 // reflects each wavelength by its own reflectance.
@@ -1841,7 +1842,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 thr *= r;
                 sthr.mul([&](double Lw) { return clamp01(reflectSlot(scene, m, h, Lw)); }, r);
-                ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                if (!continueAlong(h, reflect(ray.d, h.n), ray)) return L;   // across the surface
                 break;
             }
         }

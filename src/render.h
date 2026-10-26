@@ -2506,7 +2506,7 @@ struct Renderer {
                 // beta unchanged. Unbiased and caps path length naturally.
                 if (rng.uniform() >= r) { e.absorbed += beta; return false; }
                 Vec3 o = reflect(ray.d, h.n);
-                ray = Ray{h.p + h.n * 1e-6, o};
+                if (!continueAlong(h, o, ray)) { e.absorbed += beta; return false; }   // across the surface
                 return true;
             }
             case MatType::Grating: {
@@ -2526,7 +2526,7 @@ struct Renderer {
                 double r = clamp01(reflectSlot(scene, m, h, lambda)); // reflect probability
                 if (rng.uniform() < r) {
                     Vec3 o = reflect(ray.d, h.n);
-                    ray = Ray{h.p + h.n * 1e-6, o};
+                    if (!continueAlong(h, o, ray)) { e.absorbed += beta; return false; }
                 } else {
                     ray = Ray{h.p + ray.d * 1e-6, ray.d}; // transmit straight
                 }
@@ -2551,7 +2551,7 @@ struct Renderer {
                 if (rng.uniform() >= r) { e.absorbed += beta; return false; }
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0) { e.absorbed += beta; return false; } // below surface
-                ray = Ray{h.p + h.n * 1e-6, o};
+                if (!continueAlong(h, o, ray)) { e.absorbed += beta; return false; }
                 return true;
             }
             case MatType::Fluorescent: {
@@ -2574,7 +2574,7 @@ struct Renderer {
                 lambda = fr.lambdaOut;              // Stokes-shifted on Reemit
                 Vec3 wo = cosineHemisphere(h.n, rng);
                 beta *= shadingAdjointCorr(wi, wo, h.n, ngo);   // Veach adjoint (1 when Ns==Ng)
-                ray = Ray{h.p + h.n * 1e-6, wo};
+                if (!continueAlong(h, wo, ray)) { e.absorbed += beta; return false; }
                 return true;                        // beta otherwise unchanged (see above)
             }
             case MatType::Hair: {
@@ -3450,7 +3450,7 @@ struct Renderer {
                     double cr = materialRoughness(scene, cm, h);
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), cr, rng);
                     if (dot(o, h.n) <= 0) { e.absorbed += beta; return; }
-                    ray = Ray{h.p + h.n * 1e-6, o};
+                    if (!continueAlong(h, o, ray)) { e.absorbed += beta; return; }
                     // A clearcoat reflection is a mirror lobe: it focuses when tight (the
                     // highlight a polished coat throws IS a caustic), scatters when rough.
                     (cr <= kCausticGlossRoughness ? sawFocus : sawScatter) = true;
@@ -3629,7 +3629,7 @@ struct Renderer {
                         }
                         Vec3 wo = cosineHemisphere(h.n, rng);
                         beta *= shadingAdjointCorr(wi, wo, h.n, ngo);
-                        ray = Ray{h.p + h.n * 1e-6, wo}; continue;
+                        if (!continueAlong(h, wo, ray)) { e.absorbed += beta; return; } continue;
                     } else if (u < sum) {
                         if (achroPath || foldS > 0) {
                             if (rhoT > 0.0) foldApply(rhoT, foldTr, foldK, foldS);
@@ -3637,7 +3637,7 @@ struct Renderer {
                         }
                         Vec3 wo = cosineHemisphere(Vec3{-h.n.x, -h.n.y, -h.n.z}, rng);
                         beta *= shadingAdjointCorr(wi, wo, h.n, ngo);
-                        ray = Ray{h.p - h.n * 1e-6, wo}; continue;
+                        if (!continueAlong(h, wo, ray)) { e.absorbed += beta; return; } continue;
                     }
                     e.absorbed += beta; return;
                 }
@@ -3692,7 +3692,7 @@ struct Renderer {
                     }
                     Vec3 wo = cosineHemisphere(h.n, rng);
                     beta *= shadingAdjointCorr(wi, wo, h.n, ngo);   // Veach adjoint (1 when Ns==Ng)
-                    ray = Ray{h.p + h.n * 1e-6, wo};
+                    if (!continueAlong(h, wo, ray)) { e.absorbed += beta; return; }
                     continue;
                 }
             }
@@ -3959,7 +3959,7 @@ struct Renderer {
                     double cr = materialRoughness(scene, cm, h);
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), cr, rng);
                     if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }
-                    ray = Ray{h.p + h.n * 1e-6, o};
+                    if (!continueAlong(h, o, ray)) { e.absorbed += activeSum(); return; }
                     (cr <= kCausticGlossRoughness ? sawFocus : sawScatter) = true;  // see scalar twin
                     continue;
                 }
@@ -4024,7 +4024,7 @@ struct Renderer {
                         Vec3 wo = cosineHemisphere(h.n, rng);
                         double corr = shadingAdjointCorr(wi, wo, h.n, ngo);
                         for (int i = 0; i < nUp; ++i) beta[i] *= corr;
-                        ray = Ray{h.p + h.n * 1e-6, wo}; continue;
+                        if (!continueAlong(h, wo, ray)) { e.absorbed += activeSum(); return; } continue;
                     } else if (uu < sumHero) {                    // transmit (back)
                         for (int i = 0; i < nUp; ++i) {
                             double w = rhoT[i] / qT;
@@ -4034,7 +4034,7 @@ struct Renderer {
                         Vec3 wo = cosineHemisphere(Vec3{-h.n.x, -h.n.y, -h.n.z}, rng);
                         double corr = shadingAdjointCorr(wi, wo, h.n, ngo);
                         for (int i = 0; i < nUp; ++i) beta[i] *= corr;
-                        ray = Ray{h.p - h.n * 1e-6, wo}; continue;
+                        if (!continueAlong(h, wo, ray)) { e.absorbed += activeSum(); return; } continue;
                     }
                     e.absorbed += activeSum(); return;
                 }
@@ -4066,13 +4066,13 @@ struct Renderer {
                         beta[i] *= w;
                     }
                     if (m.type == MatType::Mirror) {
-                        ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                        if (!continueAlong(h, reflect(ray.d, h.n), ray)) { e.absorbed += activeSum(); return; }
                     } else if (m.type == MatType::Filter) {
                         ray = Ray{h.p + ray.d * 1e-6, ray.d};      // direction unchanged
                     } else {
                         Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                         if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }  // below surface
-                        ray = Ray{h.p + h.n * 1e-6, o};
+                        if (!continueAlong(h, o, ray)) { e.absorbed += activeSum(); return; }
                     }
                     continue;
                 }
@@ -4168,7 +4168,7 @@ struct Renderer {
                     Vec3 wo = cosineHemisphere(h.n, rng);
                     double corr = shadingAdjointCorr(wi, wo, h.n, ngo);
                     for (int i = 0; i < nUp; ++i) beta[i] *= corr;
-                    ray = Ray{h.p + h.n * 1e-6, wo};
+                    if (!continueAlong(h, wo, ray)) { e.absorbed += activeSum(); return; }
                     continue;
                 }
             }
@@ -4274,7 +4274,8 @@ struct Renderer {
     // pass-through) -- what stepFactorAt gives at any other, and `prob` the branch's probability
     // alone (the same, short of the radiance factor); `extMat` the material whose index
     // the far side had (-1: air, or the flat model -- index 1); `absorbed` when an opaque coating
-    // or substrate took the ray (the walk ends there).
+    // or substrate took the ray, or the direction the shading normal chose lies on the wrong side
+    // of the true surface (crossesSurface) -- the walk ends there.
     struct InterfaceStep {
         Ray ray;
         double scale = 1.0;
@@ -4349,6 +4350,7 @@ struct Renderer {
             if (whitted) st.whittedWeight = o.R;
             else if (rng.uniform() >= o.R) { st.absorbed = true; return st; }
             const Vec3 out = normalize(reflect(d, o.nl));
+            if (!(dot(out, h.ng) > 0.0)) { st.absorbed = true; return st; }   // below the true surface (it entered: from ng's side)
             st.ray = Ray{h.p + out * 1e-6, out};
             st.factor = st.prob = o.R;
             return st;
@@ -4372,6 +4374,12 @@ struct Renderer {
                 if (st.refracted ? (dot(pert, o.nl) < 0.0) : (dot(pert, o.nl) > 0.0)) out = pert;
             }
         }
+        // A direction the shading normal `nl` chose on the wrong side of the true surface -- a
+        // reflection below it, a refraction back to the side it came from -- would travel inside
+        // the geometry (crossesSurface): absorbed, as every walk absorbs a continuation that
+        // crosses the surface. (The ray came from the side ng faces iff it is entering.)
+        const double sideOut = dot(out, h.ng) * (st.entering ? 1.0 : -1.0);   // > 0: the ray's side
+        if (st.refracted ? !(sideOut < 0.0) : !(sideOut > 0.0)) { st.absorbed = true; return st; }
         st.ray = Ray{h.p + out * 1e-6, out};
         st.factor = branchFactor(o, st.refracted);
         st.prob = branchProb(o, st.refracted);

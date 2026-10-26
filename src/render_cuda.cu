@@ -3496,6 +3496,16 @@ __device__ static inline DHit dOtherSide(const DHit& h) {
     o.back = !h.back;
     return o;
 }
+// Host twin crossesSurface: does a direction sampled about the shading normal `ns` lie on the
+// other side of the true surface (`ngo`, its geometric normal on the side being shaded) than of
+// the shading plane? Every walk absorbs such a continuation (the host twin says why). The
+// device's spawn origins already lie on the side the direction leaves on (dOffsetAlong).
+__device__ static inline bool dCrossesSurface(const DVec3& w, const DVec3& ns, const DVec3& ngo) {
+    return (dot(w, ns) > (Real)0) != (dot(w, ngo) > (Real)0);
+}
+__device__ static inline bool dCrossesSurface(const DHit& h, const DVec3& w) {
+    return dCrossesSurface(w, h.n, dShadedNg(h));
+}
 
 // ---- implicit field evaluation (device twin of implicit.h) ----------------
 // smin/smax (Inigo Quilez quadratic blend) — filleted CSG / metaball merge.
@@ -5090,7 +5100,9 @@ __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, con
         if (!o.entering) return false;
         if (whittedWeight) *whittedWeight = (double)o.R;
         else if (rng.uniform() >= o.R) return false;
-        outD = normalize(reflectv(d, o.nl)); outO = dOffsetAlong(h.p, h.ng, outD);
+        outD = normalize(reflectv(d, o.nl));
+        if (!(dot(outD, h.ng) > (Real)0)) return false;   // below the true surface (it entered: from ng's side)
+        outO = dOffsetAlong(h.p, h.ng, outD);
         if (rec) rec->factor = rec->prob = (double)o.R;
         return true;
     }
@@ -5114,6 +5126,10 @@ __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, con
             if (refracted ? (dot(pert, o.nl) < 0) : (dot(pert, o.nl) > 0)) out = pert;
         }
     }
+    // A direction the shading normal chose on the wrong side of the true surface is absorbed
+    // (host twin interfaceStep says why).
+    const Real sideOut = dot(out, h.ng) * (entering ? (Real)1 : (Real)-1);   // > 0: the ray's side
+    if (refracted ? !(sideOut < (Real)0) : !(sideOut > (Real)0)) return false;
     if (radianceScale && refracted) *radianceScale = (double)(o.eta * o.eta);
     if (rec) {
         rec->refracted = refracted;
@@ -10558,7 +10574,7 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
     } else if (m.type == D_MIRROR) {
         Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
-        DVec3 o = reflectv(rd, h.n); rd = o; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE;
+        DVec3 o = reflectv(rd, h.n); if (dCrossesSurface(h, o)) { eAbsorbed += beta; return WF_TERMINATE; } rd = o; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE;
     } else if (m.type == D_GRATING) {
         Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -10567,7 +10583,7 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         ro = nro; rd = nrd; return WF_CONTINUE;
     } else if (m.type == D_HALFMIRROR) {
         Real r = clamp01(dReflectSlot(sc, m, h, lambda));
-        if (rng.uniform() < r) { DVec3 o = reflectv(rd, h.n); rd = o; ro = dOffsetAlong(h.p, h.ng, rd); }
+        if (rng.uniform() < r) { DVec3 o = reflectv(rd, h.n); if (dCrossesSurface(h, o)) { eAbsorbed += beta; return WF_TERMINATE; } rd = o; ro = dOffsetAlong(h.p, h.ng, rd); }
         else { ro = dOffsetAlong(h.p, h.ng, rd); }
         return WF_CONTINUE;
     } else if (m.type == D_FILTER) {
@@ -10583,7 +10599,7 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
         DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
         if (dot(o, h.n) <= 0) { eAbsorbed += beta; return WF_TERMINATE; }
-        rd = o; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE;
+        if (dCrossesSurface(h, o)) { eAbsorbed += beta; return WF_TERMINATE; } rd = o; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE;
     } else if (m.type == D_FLUORESCENT) {
         // Two competing channels: elastic diffuse reflection (albedo rho, wavelength
         // preserved) and dye excitation (prob aEff = min(eps, 1-rho) so the channels
@@ -10621,7 +10637,7 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         }
         { DVec3 wo = cosineHemisphere(h.n, rng);
           beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo);   // Veach adjoint (1 when ns==ng)
-          rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE; }
+          if (dCrossesSurface(h, wo)) { eAbsorbed += beta; return WF_TERMINATE; } rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE; }
     } else if (m.type == D_HAIR) {
         // Split out (__noinline__) so its fat double-precision frame is only paid on an
         // actual hair hit — see the comment on interactHair.
@@ -11020,8 +11036,8 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // Analog scatter: reflect (prob rhoR), transmit (prob rhoT), else absorb — beta
         // unchanged on a scatter (like the diffuse case), plus the adjoint correction.
         Real u = rng.uniform();
-        if (u < rhoR)      { DVec3 wo = cosineHemisphere(h.n, rng); beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo); rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE; }
-        else if (u < sum)  { DVec3 wo = cosineHemisphere(nb,  rng); beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo); rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE; }
+        if (u < rhoR)      { DVec3 wo = cosineHemisphere(h.n, rng); beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo); if (dCrossesSurface(h, wo)) { eAbsorbed += beta; return WF_TERMINATE; } rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE; }
+        else if (u < sum)  { DVec3 wo = cosineHemisphere(nb,  rng); beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo); if (dCrossesSurface(h, wo)) { eAbsorbed += beta; return WF_TERMINATE; } rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE; }
         eAbsorbed += beta; return WF_TERMINATE;
     } else {
         // Diffuse (texture-sampled reflectance when the material binds a texture).
@@ -11036,7 +11052,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         if (rng.uniform() >= rho) { eAbsorbed += beta; return WF_TERMINATE; }
         { DVec3 wo = cosineHemisphere(h.n, rng);
           beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo);   // Veach adjoint (1 when ns==ng)
-          rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE; }
+          if (dCrossesSurface(h, wo)) { eAbsorbed += beta; return WF_TERMINATE; } rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE; }
     }
 }
 
@@ -11398,7 +11414,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
             DVec3 wo = cosineHemisphere(h.n, rng);
             Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
             for (int i = 0; i < nUp; ++i) beta[i] *= corr;
-            rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE;
+            if (dCrossesSurface(h, wo)) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; } rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE;
         } else if (uu < sumHero) {
             for (int i = 0; i < nUp; ++i) {
                 Real w = rhoT[i] / qT;
@@ -11408,7 +11424,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
             DVec3 wo = cosineHemisphere(nb, rng);
             Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
             for (int i = 0; i < nUp; ++i) beta[i] *= corr;
-            rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE;
+            if (dCrossesSurface(h, wo)) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; } rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE;
         }
         for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i];
         return WF_TERMINATE;
@@ -11438,13 +11454,13 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
             beta[i] *= w;
         }
         if (m.type == D_MIRROR) {
-            DVec3 o = reflectv(rd, h.n); rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
+            DVec3 o = reflectv(rd, h.n); if (dCrossesSurface(h, o)) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; } rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
         } else if (m.type == D_FILTER) {
             ro = dOffsetAlong(h.p, h.ng, rd);   // straight through, direction unchanged
         } else {
             DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
             if (dot(o, h.n) <= 0) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
-            rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
+            if (dCrossesSurface(h, o)) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; } rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
         }
         return WF_CONTINUE;
     }
@@ -11492,7 +11508,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     DVec3 wo = cosineHemisphere(h.n, rng);
     Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
     for (int i = 0; i < nUp; ++i) beta[i] *= corr;
-    rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE;
+    if (dCrossesSurface(h, wo)) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; } rd = wo; ro = dOffsetAlong(h.p, h.ng, rd); return WF_CONTINUE;
 }
 
 // Full hero photon: emit, then bounce until termination. While the secondaries are alive
@@ -14054,7 +14070,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             // converges at 1 spp where Russian roulette needs tens.
             if (whitted) { if (!dWhittedAttenuate(thr, (double)r, dLocalN2(sc, stk, lambda))) return false; }
             else if (rng.uniform() >= r) return false;   // RR absorb
-            rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; return true;
+            { const DVec3 rr = reflectv(rd, h.n); if (dCrossesSurface(h, rr)) return false; rd = rr; } ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; return true;
         }
         case D_GRATING: {
             Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
@@ -14078,9 +14094,9 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                 const bool refl = (r >= (Real)0.5);
                 if (!dWhittedAttenuate(thr, refl ? (double)r : 1.0 - (double)r,
                                        dLocalN2(sc, stk, lambda))) return false;
-                if (refl) { rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); }
+                if (refl) { { const DVec3 rr = reflectv(rd, h.n); if (dCrossesSurface(h, rr)) return false; rd = rr; } ro = dOffsetAlong(h.p, h.ng, rd); }
                 else      { ro = dOffsetAlong(h.p, h.ng, rd); }
-            } else if (rng.uniform() < r) { rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); }
+            } else if (rng.uniform() < r) { { const DVec3 rr = reflectv(rd, h.n); if (dCrossesSurface(h, rr)) return false; rd = rr; } ro = dOffsetAlong(h.p, h.ng, rd); }
             else                          { ro = dOffsetAlong(h.p, h.ng, rd); }
             specularArrival = true; return true;
         }
@@ -14122,7 +14138,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                     gm->from = h.p;
                     gm->n = h.n;
                 }
-                rd = o; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; return true;
+                if (dCrossesSurface(h, o)) return false; rd = o; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; return true;
             }
             if (rng.uniform() >= r) return false;
             DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
@@ -14132,7 +14148,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                 gm->from = h.p;
                 gm->n = h.n;
             }
-            rd = o; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; return true;
+            if (dCrossesSurface(h, o)) return false; rd = o; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; return true;
         }
         case D_DIFFUSETRANSMIT: {
             // Two-lobe Lambertian (device twin of backward.h DiffuseTransmit): NEE the
@@ -14169,8 +14185,8 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             }
             if (directOnly) return false;            // Whitted: no diffuse indirect
             Real u = rng.uniform();
-            if (u < rhoR)     { DVec3 wOut = cosineHemisphere(h.n, rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI; rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; return true; }
-            else if (u < sum) { DVec3 wOut = cosineHemisphere(nb,  rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, nb )) / DPI; rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; return true; }
+            if (u < rhoR)     { DVec3 wOut = cosineHemisphere(h.n, rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI; if (dCrossesSurface(h, wOut)) return false; rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; return true; }
+            else if (u < sum) { DVec3 wOut = cosineHemisphere(nb,  rng); contBsdfPdf = fmax(0.0, (double)dot(wOut, nb )) / DPI; if (dCrossesSurface(h, wOut)) return false; rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; return true; }
             return false;                            // absorbed
         }
         case D_FLUORESCENT: {
@@ -14228,7 +14244,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             if (u < rhoEl) {                                                  // elastic continuation
                 DVec3 wOut = cosineHemisphere(h.n, rng);
                 contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-                rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd);
+                if (dCrossesSurface(h, wOut)) return false; rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd);
                 specularArrival = false; return true;
             } else if (u < rhoEl + pF) {                                      // fluoro (wavelength-switched)
                 thr *= wFluo / pF;
@@ -14236,7 +14252,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                 invPdfLambda = invPdfIn;
                 DVec3 wOut = cosineHemisphere(h.n, rng);
                 contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-                rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd);
+                if (dCrossesSurface(h, wOut)) return false; rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd);
                 specularArrival = false; return true;
             }
             return false;                                                     // absorbed / terminated
@@ -14279,7 +14295,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             if (rng.uniform() >= rho) return false; // RR on albedo
             DVec3 wOut = cosineHemisphere(h.n, rng);
             contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-            rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; return true;
+            if (dCrossesSurface(h, wOut)) return false; rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; return true;
         }
     }
 }
@@ -14797,12 +14813,12 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     for (int i = 0; i < nUp; ++i) thr[i] *= (double)rhoR[i] / (double)qR;
                     DVec3 wOut = cosineHemisphere(h.n, rng);
                     contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-                    rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
+                    if (dCrossesSurface(h, wOut)) return; rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
                 } else if (u < sumHero) {                          // transmit (back)
                     for (int i = 0; i < nUp; ++i) thr[i] *= (double)rhoT[i] / (double)qT;
                     DVec3 wOut = cosineHemisphere(nb, rng);
                     contBsdfPdf = fmax(0.0, (double)dot(wOut, nb)) / DPI;
-                    rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
+                    if (dCrossesSurface(h, wOut)) return; rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
                 }
                 return;                                            // absorbed
             }
@@ -14849,7 +14865,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     for (int i = 0; i < nUp; ++i) thr[i] *= (double)c[i] / q;
                 }
                 if (mp->type == D_MIRROR) {
-                    rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd);
+                    { const DVec3 rr = reflectv(rd, h.n); if (dCrossesSurface(h, rr)) return; rd = rr; } ro = dOffsetAlong(h.p, h.ng, rd);
                 } else if (mp->type == D_FILTER) {
                     ro = dOffsetAlong(h.p, h.ng, rd);                       // direction unchanged
                 } else if (whitted) {
@@ -14860,14 +14876,14 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     if (sc.bkGlossyNee)   // the other half of the weight -- see the scalar twin
                         { gmis.pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
                           gmis.from = h.p; gmis.n = h.n; }
-                    rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
+                    if (dCrossesSurface(h, o)) return; rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
                 } else {
                     DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
                     if (dot(o, h.n) <= 0) return;
                     if (sc.bkGlossyNee)      // the other half of the weight, for what `o` hits
                         { gmis.pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
                           gmis.from = h.p; gmis.n = h.n; }
-                    rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
+                    if (dCrossesSurface(h, o)) return; rd = o; ro = dOffsetAlong(h.p, h.ng, rd);
                 }
                 specularArrival = true;
                 break;
@@ -15022,7 +15038,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 for (int i = 0; i < nUp; ++i) thr[i] *= (double)rho[i] / (double)q;
                 DVec3 wOut = cosineHemisphere(h.n, rng);
                 contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-                rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
+                if (dCrossesSurface(h, wOut)) return; rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
             }
         }
     }
@@ -15416,7 +15432,8 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
         switch (mp->type) {
             case D_DIELECTRIC: {
                 DVec3 nro, nrd; double rs = 1.0;
-                dDielectricStep(sc, *mp, h, rd, LREP_RGB, rng, stk, nro, nrd, nullptr, &rs);
+                if (!dDielectricStep(sc, *mp, h, rd, LREP_RGB, rng, stk, nro, nrd, nullptr, &rs))
+                    return L;                            // a direction across the true surface
                 beta = beta * (Real)rs;                  // radiance across the interface
                 ro = nro; rd = nrd; specularArrival = true; break;
             }
@@ -15424,11 +15441,11 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                 Real q = rgbLuma(mp->rgbAlbedo);
                 if (q <= (Real)0 || rng.uniform() >= (double)q) return L;
                 beta = hadamard(beta, mp->rgbAlbedo) / q;
-                rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; break;
+                { const DVec3 rr = reflectv(rd, h.n); if (dCrossesSurface(h, rr)) return L; rd = rr; } ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; break;
             }
             case D_HALFMIRROR: {
                 Real r = clamp01(rgbLuma(mp->rgbAlbedo));
-                if (rng.uniform() < (double)r) { rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); }
+                if (rng.uniform() < (double)r) { { const DVec3 rr = reflectv(rd, h.n); if (dCrossesSurface(h, rr)) return L; rd = rr; } ro = dOffsetAlong(h.p, h.ng, rd); }
                 else                           { ro = dOffsetAlong(h.p, h.ng, rd); }
                 specularArrival = true; break;
             }
@@ -15444,7 +15461,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
                 if (dot(o, h.n) <= 0) return L;
                 beta = hadamard(beta, mp->rgbAlbedo) / q;
-                rd = o; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; break;
+                if (dCrossesSurface(h, o)) return L; rd = o; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; break;
             }
             case D_DIFFUSETRANSMIT: {
                 DVec3 rhoR = clampRgb01(mp->rgbAlbedo);
@@ -15464,12 +15481,12 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                     beta = hadamard(beta, rhoR) / pR;
                     DVec3 wOut = cosineHemisphere(h.n, rng);
                     contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-                    rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
+                    if (dCrossesSurface(h, wOut)) return L; rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
                 } else if (u < pR + pT) {
                     beta = hadamard(beta, rhoT) / pT;
                     DVec3 wOut = cosineHemisphere(nb, rng);
                     contBsdfPdf = fmax(0.0, (double)dot(wOut, nb)) / DPI;
-                    rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
+                    if (dCrossesSurface(h, wOut)) return L; rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
                 }
                 return L;                                   // absorbed
             }
@@ -15485,7 +15502,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                 beta = hadamard(beta, rho) / q;
                 DVec3 wOut = cosineHemisphere(h.n, rng);
                 contBsdfPdf = fmax(0.0, (double)dot(wOut, h.n)) / DPI;
-                rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
+                if (dCrossesSurface(h, wOut)) return L; rd = wOut; ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = false; break;
             }
         }
     }
@@ -16052,6 +16069,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         if (ddot(dwo, dwo) == 0.0) return;
         DVec3 wo = normalize(dwo);
         DVec3 wi; double pdfW = 0, pdfRevW = 0, betaFactor = 0; int delta = 0; bool terminate = false;
+        bool aboutNs = false;   // wi was sampled about the shading normal (dCrossesSurface applies)
         // Mirror / Filter are delta but choose their continuation WITHOUT consulting λ,
         // so the secondaries can ride through them; they set keepBundle to opt out of
         // the `if (delta) nUp = 1` collapse below (device twin of bdpt.h).
@@ -16139,7 +16157,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             }
             case D_DIFFUSE:
             case D_FLUORESCENT: {
-                wi = cosineHemisphere(path[cur].ns, rng);
+                wi = cosineHemisphere(path[cur].ns, rng); aboutNs = true;
                 if (dot(wi, path[cur].ns) <= 0) { terminate = true; break; }
                 double rho = clamp01(dDiffuseRho(sc, *mp, h, lambda, jrun ? &jbS : nullptr));   // per-hit (tex/pat/record)
                 pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
@@ -16152,7 +16170,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             }
             case D_GLOSSY: {
                 DVec3 mdir = reflectv(rd, path[cur].ns);   // rd == -wo (incoming dir)
-                wi = sampleGlossy(mdir, dMatRoughness(sc, *mp, h), rng);   // per-hit roughness
+                wi = sampleGlossy(mdir, dMatRoughness(sc, *mp, h), rng); aboutNs = true;   // per-hit roughness
                 if (dot(wi, path[cur].ns) <= 0) { terminate = true; break; }
                 double r = clamp01(dReflectSlot(sc, *mp, h, lambda, jrun ? &jbS : nullptr));      // per-hit reflect
                 pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
@@ -16181,6 +16199,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 const bool reflLobe = (rng.uniform() < rhoR / tot);
                 if (reflLobe) wi = cosineHemisphere(path[cur].ns, rng);
                 else          wi = cosineHemisphere(nb, rng);
+                aboutNs = true;
                 pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
                 pdfRevW = dBsdfPdf(sc, path[cur], wi, wo, lambda);
                 if (pdfW <= 0) { terminate = true; break; }
@@ -16200,7 +16219,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             }
             case D_MIRROR: {
                 double r = clamp01(specLookup(mp->reflect, lambda));
-                wi = reflectv(rd, path[cur].ns); betaFactor = r; delta = 1;
+                wi = reflectv(rd, path[cur].ns); betaFactor = r; delta = 1; aboutNs = true;
                 // Mirror direction is λ-independent: keep the bundle, reweight per-λ.
                 keepBundle = true; secChromatic = true;
                 for (int i = 0; i + 1 < nUp; ++i)
@@ -16224,7 +16243,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             }
             case D_HALFMIRROR: {
                 double r = clamp01(specLookup(mp->reflect, lambda));
-                if (rng.uniform() < r) { wi = reflectv(rd, path[cur].ns); jHmRefl = true; } else wi = rd;
+                if (rng.uniform() < r) { wi = reflectv(rd, path[cur].ns); jHmRefl = true; aboutNs = true; } else wi = rd;
                 betaFactor = 1.0; delta = 1;
                 break;
             }
@@ -16267,6 +16286,8 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             }
             default: terminate = true; break;
         }
+        // A lobe sampled about ns that lands across the true surface ends the walk (host twin).
+        if (aboutNs && !terminate && dCrossesSurface(wi, path[cur].ns, dVertexGeoN(path[cur]))) terminate = true;
         // Kill the walk only when EVERY live wavelength is dead: the hero's own factor can
         // legitimately be 0 while a secondary's is not (gel filter, saturated spectral
         // reflectance), and dropping the bundle there biases low. nUp == 1 -> empty loop ->
@@ -17165,6 +17186,10 @@ __device__ static void dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const 
             const DSurfPhoton& ph = sm.pts[idx];
             const DVec3 dd{vk.p.x - ph.p.x, vk.p.y - ph.p.y, vk.p.z - ph.p.z};
             if (ddot(dd, dd) > r2) continue;
+            // A photon that arrived from the other side of the true surface than the shading
+            // plane says (a thin sheet's other face; a tilted or tipped normal) is no reflection
+            // here: the merge would leak it through (host twin crossesSurface).
+            if (dCrossesSurface(ph.wo, vk.ns, ngo)) continue;
             const DSurfMis& lm = sm.mis[ph.misIdx];
             const Real lam = (Real)ph.lambda;
             double fCam = dBsdfF(sc, vk, woCam, ph.wo, lam);
@@ -17826,13 +17851,13 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
         switch (m.type) {                                // specular walk (monochromatic)
             case D_MIRROR: {
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
-                rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
+                { const DVec3 rr = reflectv(rd, h.n); if (dCrossesSurface(h, rr)) return; rd = rr; } ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_GLOSSY: {
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
                 if (dot(o, h.n) <= 0) return;
-                rd = o; ro = dOffsetAlong(h.p, h.ng, rd); break;
+                if (dCrossesSurface(h, o)) return; rd = o; ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_DIELECTRIC:
             case D_THINFILM:
@@ -17845,7 +17870,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             }
             case D_HALFMIRROR: {
                 Real r = clamp01(dReflectSlot(sc, m, h, lambda));
-                if (rng.uniform() < r) { rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); }
+                if (rng.uniform() < r) { { const DVec3 rr = reflectv(rd, h.n); if (dCrossesSurface(h, rr)) return; rd = rr; } ro = dOffsetAlong(h.p, h.ng, rd); }
                 else                   { ro = dOffsetAlong(h.p, h.ng, rd); }
                 break;
             }
@@ -17887,7 +17912,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             }
             default: {                                   // Grating: approx reflect
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
-                rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
+                { const DVec3 rr = reflectv(rd, h.n); if (dCrossesSurface(h, rr)) return; rd = rr; } ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
         }
         specularSeen = nullHere ? specularSeenIn : true;   // only specular cases reach here; a pass-through inherits
@@ -18371,6 +18396,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 double fx = 0.0, fy = 0.0, fz = 0.0;
                 for (int k = 0; k < fgRays; ++k) {
                     DVec3 grd = cosineHemisphere(h.n, rng);
+                    if (dCrossesSurface(h, grd)) continue;   // across the surface: gathers nothing
                     DVec3 gro = dOffsetAlong(h.p, h.ng, grd);
                     double sx, sy, sz;
                     dPhotonGatherSub(sc, pm, pmC, diffraction, gro, grd, lambda, invPdfL, h, m, rng, sx, sy, sz);
@@ -18455,7 +18481,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     thr *= rC;
                     dSpecFold(sthr, sc, m, h, rC, false);   // SPECGATHER
                 }
-                rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
+                { const DVec3 rr = reflectv(rd, h.n); if (dCrossesSurface(h, rr)) return; rd = rr; } ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_GLOSSY: {
                 // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX (GLOSSY-NEE, 0.340.0). The host
@@ -18497,7 +18523,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     gmis.from = h.p;
                     gmis.n    = h.n;
                 }
-                rd = o; ro = dOffsetAlong(h.p, h.ng, rd); break;
+                if (dCrossesSurface(h, o)) return; rd = o; ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_DIELECTRIC:
             case D_THINFILM:
@@ -18518,7 +18544,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             case D_HALFMIRROR: {
                 Real r = clamp01(dReflectSlot(sc, m, h, lambda));
                 const bool refl = rng.uniform() < r;
-                if (refl) { rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); }
+                if (refl) { { const DVec3 rr = reflectv(rd, h.n); if (dCrossesSurface(h, rr)) return; rd = rr; } ro = dOffsetAlong(h.p, h.ng, rd); }
                 else      { ro = dOffsetAlong(h.p, h.ng, rd); }
                 // SPECGATHER: the coin at each photon's wavelength (host twin).
                 const double pc = refl ? (double)r : 1.0 - (double)r;
@@ -18590,7 +18616,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     thr *= rC;
                     dSpecFold(sthr, sc, m, h, rC, false);   // SPECGATHER
                 }
-                rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
+                { const DVec3 rr = reflectv(rd, h.n); if (dCrossesSurface(h, rr)) return; rd = rr; } ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
         }
         if (thr <= 0.0) return;
@@ -18813,13 +18839,13 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         switch (m.type) {                                // specular walk (monochromatic)
             case D_MIRROR: {
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
-                rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
+                { const DVec3 rr = reflectv(rd, h.n); if (dCrossesSurface(h, rr)) return; rd = rr; } ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_GLOSSY: {
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
                 if (dot(o, h.n) <= 0) return;
-                rd = o; ro = dOffsetAlong(h.p, h.ng, rd); break;
+                if (dCrossesSurface(h, o)) return; rd = o; ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             case D_DIELECTRIC:
             case D_THINFILM:
@@ -18832,7 +18858,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
             }
             case D_HALFMIRROR: {
                 Real r = clamp01(dReflectSlot(sc, m, h, lambda));
-                if (rng.uniform() < r) { rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); }
+                if (rng.uniform() < r) { { const DVec3 rr = reflectv(rd, h.n); if (dCrossesSurface(h, rr)) return; rd = rr; } ro = dOffsetAlong(h.p, h.ng, rd); }
                 else                   { ro = dOffsetAlong(h.p, h.ng, rd); }
                 break;
             }
@@ -18842,7 +18868,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
             }
             default: {                                   // Grating: approx reflect
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
-                rd = reflectv(rd, h.n); ro = dOffsetAlong(h.p, h.ng, rd); break;
+                { const DVec3 rr = reflectv(rd, h.n); if (dCrossesSurface(h, rr)) return; rd = rr; } ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
         }
         if (thr <= 0.0) return;
@@ -19117,13 +19143,14 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
     DVec3 wo = normalize(rd * (Real)(-1));
     wi = DVec3(0, 0, 0); betaFactor = 0; pdfW = 0; pdfRevW = 0; cosThetaOut = 0;
     delta = false; terminate = false;
+    bool aboutNs = false;   // wi was sampled about the shading normal (dCrossesSurface applies)
     const int nSec = (secF && lamAll && nUp > 1) ? nUp - 1 : 0;   // secondaries to fill
     if (secChromatic) *secChromatic = false;
     if (keepBundle)   *keepBundle = false;
     switch (m.type) {
         case D_DIFFUSE:
         case D_FLUORESCENT: {
-            wi = cosineHemisphere(ns, rng);
+            wi = cosineHemisphere(ns, rng); aboutNs = true;
             if (dot(wi, ns) <= 0) { terminate = true; break; }
             double rho = clamp01(dDiffuseRho(sc, m, h, lambda));
             pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
@@ -19138,7 +19165,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
         }
         case D_GLOSSY: {
             DVec3 mdir = reflectv(rd, ns);
-            wi = sampleGlossy(mdir, dMatRoughness(sc, m, h), rng);
+            wi = sampleGlossy(mdir, dMatRoughness(sc, m, h), rng); aboutNs = true;
             if (dot(wi, ns) <= 0) { terminate = true; break; }
             double r = clamp01(dReflectSlot(sc, m, h, lambda));
             pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
@@ -19162,6 +19189,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             const bool reflLobe = (rng.uniform() * tot < rhoR);
             if (reflLobe) wi = cosineHemisphere(ns, rng);
             else          wi = cosineHemisphere(ns * (Real)-1, rng);
+            aboutNs = true;
             pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
             pdfRevW = dBsdfPdf(sc, vt, wi, wo, lambda);
             betaFactor = tot;
@@ -19214,7 +19242,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
         }
         case D_MIRROR: {
             double r = clamp01(dReflectSlot(sc, m, h, lambda));
-            wi = reflectv(rd, ns); betaFactor = r; delta = true;
+            wi = reflectv(rd, ns); betaFactor = r; delta = true; aboutNs = true;
             // The mirror direction is the same for every λ, so the bundle survives; only the
             // reflectance is per-λ (cf. Glossy, the rough version of this).
             if (nSec) {
@@ -19235,7 +19263,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
         }
         case D_HALFMIRROR: {
             double r = clamp01(dReflectSlot(sc, m, h, lambda));
-            if (rng.uniform() < r) wi = reflectv(rd, ns); else wi = rd;
+            if (rng.uniform() < r) { wi = reflectv(rd, ns); aboutNs = true; } else wi = rd;
             betaFactor = 1.0; delta = true;
             break;
         }
@@ -19264,6 +19292,8 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
         }
         default: terminate = true; break;
     }
+    // A lobe sampled about ns that lands across the true surface ends the walk (host twin).
+    if (aboutNs && !terminate && dCrossesSurface(h, wi)) terminate = true;
     if (!terminate) cosThetaOut = fabs(ddot(wi, ns));
 }
 
@@ -20087,6 +20117,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                               if (ddot(d, d) > r2) continue;
                               if (edges + lv.edges > ctx.maxDepth) continue;
                               DVec3 wMerge = lv.wo;
+                              if (dCrossesSurface(h, wMerge)) continue;   // from across the surface (dSurfMergeAt)
                               Real lam = (Real)lv.lambda;
                               // A MERGE crosses paths, so the two ends carry DIFFERENT bundles
                               // and there is no shared λ set. The estimate therefore stays keyed

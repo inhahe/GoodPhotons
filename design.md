@@ -7320,8 +7320,18 @@ as the one at fault.
     terminator (which takes the plain geometric step where n is tipped, cos(Ng, Ns) <= 0), the
     Veach adjoint, the cavity probe -- so one hit has one side; a copy seen from the other
     side (the transmit lobe's back hemisphere) is made by `otherSide` / `dOtherSide`, which turn
-    n, curv and back together. BSDF continuations still sample and (on the host) spawn about n:
-    known-issues CONTINUATION-TIPPED. `Hit::patOwnSide` / `DHit::patOwnSide`
+    n, curv and back together. BSDF continuations (0.400.5): a direction sampled about the
+    shading normal that lies on the other side of the true surface than of the shading plane
+    is absorbed in every walk (`crossesSurface` / `continueAlong` on the host -- whose spawn
+    origin also moves to ng where n is tipped -- `dCrossesSurface` on the device, an `aboutNs`
+    flag in the BDPT and VCM walks, the dielectric interface steps' own test of the side their
+    reflection or refraction lands on); a pass-through and a grating's orders (built about ng)
+    are no such direction. Absorbing without renormalizing leaves MIS as it was. A surface merge
+    (J's `dSurfMergeAt` and its host twin, both VCM gathers) rejects a photon whose incoming
+    direction crosses the surface the same way: on a zero-thickness sheet the photons of its
+    other face lie within the merge radius, and a tilted or tipped shading normal let the
+    BSDF take them as reflections.
+    `Hit::patOwnSide` / `DHit::patOwnSide`
     is the surface's material's flag, set at the closest-hit choke points (`Scene::markPatSide`,
     the device closestHit) with the surface's own material -- the rule is the surface's, so
     every pattern on it follows it, a mix's opaque part's too. Both ride on the hit rather than

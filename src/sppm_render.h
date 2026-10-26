@@ -166,7 +166,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 return;
             case MatType::Mirror: {
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
-                ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                if (!continueAlong(h, reflect(ray.d, h.n), ray)) return;   // across the surface
                 break;
             }
             case MatType::Glossy: {
@@ -188,7 +188,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                     gmis.from = h.p;
                     gmis.n = h.n;
                 }
-                ray = Ray{h.p + h.n * 1e-6, o};
+                if (!continueAlong(h, o, ray)) return;
                 break;
             }
             case MatType::Dielectric:
@@ -206,7 +206,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             }
             case MatType::HalfMirror: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
-                if (rng.uniform() < r) ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                if (rng.uniform() < r) { if (!continueAlong(h, reflect(ray.d, h.n), ray)) return; }
                 else                   ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 break;
             }
@@ -243,7 +243,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             }
             default: {
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
-                ray = Ray{h.p + h.n * 1e-6, reflect(ray.d, h.n)};
+                if (!continueAlong(h, reflect(ray.d, h.n), ray)) return;   // across the surface
                 break;
             }
         }

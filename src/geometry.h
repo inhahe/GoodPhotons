@@ -286,6 +286,31 @@ inline Hit otherSide(const Hit& h) {
     return o;
 }
 
+// Does a direction `w` sampled about the shading normal `ns` -- a reflection lobe about ns, a
+// transmission lobe about -ns -- lie on the other side of the true surface (`ngo`: its geometric
+// normal on the side being shaded) than of the shading plane? Such a continuation would travel
+// inside the geometry and bring back light from behind it (the shading-normal problem), so every
+// walk absorbs it, as Cycles discards such samples: it contributes nothing, where letting it
+// through leaks. Smoothed and normal-mapped normals leave a thin wedge of such directions; a
+// normal tipped across the surface's plane (Hit::back says why that happens), most of its lobe.
+// Absorbing without renormalizing leaves every other direction's density -- and so MIS -- as it
+// was. Not for a pass-through (the incoming direction straight on), which no lobe sampled.
+inline bool crossesSurface(const Vec3& w, const Vec3& ns, const Vec3& ngo) {
+    return (dot(w, ns) > 0.0) != (dot(w, ngo) > 0.0);
+}
+
+// The continuation from hit h along `wo`, sampled about h.n: false where it crosses the surface
+// (crossesSurface) -- the caller absorbs it -- else `ray`, its origin nudged 1e-6 off the surface
+// toward the side wo leaves on: along n, or along ng where n has been tipped across the plane
+// (an origin along a tipped n would start behind the surface).
+inline bool continueAlong(const Hit& h, const Vec3& wo, Ray& ray) {
+    const Vec3 ngo = orientedGeoN(h);
+    if (crossesSurface(wo, h.n, ngo)) return false;
+    const Vec3 off = (dot(h.n, ngo) > 0.0) ? h.n : ngo;
+    ray = Ray{h.p + off * (dot(wo, off) > 0.0 ? 1e-6 : -1e-6), wo};
+    return true;
+}
+
 // Veach shading-normal ADJOINT correction factor (Veach §5.3; PBRT
 // `CorrectShadingNormal`, importance/light-transport mode). A BSDF evaluated with
 // an interpolated *shading* normal `ns` instead of the true *geometric* normal `ng`

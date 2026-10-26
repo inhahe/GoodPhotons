@@ -3394,8 +3394,13 @@ is faithful in **all** render modes: the backward reference `R`, and the forward
 tracers `A/B/C/D/M/S/U` (CPU and GPU), which apply Veach's shading-normal adjoint
 correction so the light/particle transport smooth-shades to match the reference.
 Light connections are clamped to the geometric hemisphere so a smoothed normal never
-leaks light through the true back face, and the terminator where light grazes off is
-softened (Chiang et al. 2019) so low-poly smooth meshes show a smooth shadow gradient
+leaks light through the true back face -- and so are bounces: a direction sampled about a
+smoothed or normal-mapped normal that lies on the far side of the true surface is absorbed
+in every mode, as Cycles does, and modes `J` and `U` merge no photon that arrived from the
+far side (since 0.400.5; before, modes `D`, `J` and `U` let such light through, and `R`
+in places, above all where a normal map tipped the normal past the surface: a sheet lit only from below showed
+up to 40% of its lit brightness on top; the cost is the energy of those few grazing samples)
+-- and the terminator where light grazes off is softened (Chiang et al. 2019) so low-poly smooth meshes show a smooth shadow gradient
 instead of hard facet slivers — applied uniformly to every mode including `R`. Flat
 meshes are unaffected — both the correction and the softening are exactly a no-op when
 the shading and geometric normals coincide.)

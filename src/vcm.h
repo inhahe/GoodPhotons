@@ -350,13 +350,14 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
     const Vec3 wo = normalize(rayDir * -1.0);
     wi = Vec3{0, 0, 0}; betaFactor = 0.0; pdfW = 0.0; pdfRevW = 0.0; cosThetaOut = 0.0;
     delta = false; terminate = false;
+    bool aboutNs = false;   // wi was sampled about the shading normal (crossesSurface applies)
     const int nSec = (secF && lamAll && nUp > 1) ? nUp - 1 : 0;   // secondaries to fill
     if (secChromatic) *secChromatic = false;
     if (keepBundle)   *keepBundle = false;
     switch (mp->type) {
         case MatType::Diffuse:
         case MatType::Fluorescent: {
-            wi = cosineHemisphere(ns, rng);
+            wi = cosineHemisphere(ns, rng); aboutNs = true;
             if (dot(wi, ns) <= 0) { terminate = true; break; }
             double rho = clamp01(diffuseReflectance(scene, *mp, h, lambda));
             pdfW = bsdfPdf(*mp, ns, wo, wi, lambda, scene, &h);
@@ -371,7 +372,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
         }
         case MatType::Glossy: {
             Vec3 mdir = reflect(rayDir, ns);
-            wi = sampleGlossy(mdir, materialRoughness(scene, *mp, h), rng);
+            wi = sampleGlossy(mdir, materialRoughness(scene, *mp, h), rng); aboutNs = true;
             if (dot(wi, ns) <= 0) { terminate = true; break; }
             double r = clamp01(reflectSlot(scene, *mp, h, lambda));
             pdfW = bsdfPdf(*mp, ns, wo, wi, lambda, scene, &h);
@@ -395,6 +396,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             const bool reflLobe = (rng.uniform() * tot < rhoR);
             if (reflLobe) wi = cosineHemisphere(ns, rng);
             else          wi = cosineHemisphere(ns * -1.0, rng);
+            aboutNs = true;
             pdfW = bsdfPdf(*mp, ns, wo, wi, lambda, scene, &h);
             pdfRevW = bsdfPdf(*mp, ns, wi, wo, lambda, scene, &h);
             betaFactor = tot;
@@ -459,7 +461,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
         }
         case MatType::Mirror: {
             double r = clamp01(reflectSlot(scene, *mp, h, lambda));
-            wi = reflect(rayDir, ns); betaFactor = r; delta = true;
+            wi = reflect(rayDir, ns); betaFactor = r; delta = true; aboutNs = true;
             // The mirror direction is the same for every λ, so the bundle survives; only
             // the reflectance is per-λ (cf. Glossy, the rough version of this).
             if (nSec) {
@@ -482,7 +484,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
         }
         case MatType::HalfMirror: {
             double r = clamp01(reflectSlot(scene, *mp, h, lambda));
-            if (rng.uniform() < r) wi = reflect(rayDir, ns);
+            if (rng.uniform() < r) { wi = reflect(rayDir, ns); aboutNs = true; }
             else                   wi = rayDir;
             betaFactor = 1.0; delta = true;
             break;
@@ -507,11 +509,13 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             if (r <= 0) { terminate = true; break; }
             bool absorbedG; Ray nr = mats.gratingDiffract(*mp, h, rayDir, lambda, rng, absorbedG);
             if (absorbedG) { terminate = true; break; }
-            wi = nr.d; betaFactor = r; delta = true;
+            wi = nr.d; betaFactor = r; delta = true;   // orders about ng: never across
             break;
         }
         default: terminate = true; break;
     }
+    // A lobe sampled about ns that lands across the true surface ends the walk (crossesSurface).
+    if (aboutNs && !terminate && crossesSurface(wi, ns, orientedGeoN(h))) terminate = true;
     if (!terminate) cosThetaOut = std::fabs(dot(wi, ns));
 }
 
@@ -1237,6 +1241,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     // Measured: opaque hair 2.79x mode R with this merge, 1.029x without.
                     if (lv.mat && lv.mat->type == MatType::Hair) return;
                     Vec3 wMerge = lv.wo;                                // incident illumination dir
+                    if (crossesSurface(wMerge, h.n, orientedGeoN(h))) return;   // from across the true surface
                     // camera BSDF evaluated at the light vertex's wavelength (XYZ estimate).
                     double lam = (double)lv.lambda;
                     double fCam = bsdfF(*mp, h.n, wo, wMerge, lam, scene, &h);

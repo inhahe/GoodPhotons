@@ -1332,6 +1332,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // past them; only their per-λ reflectance/transmittance differs. Those set
         // `keepBundle` to opt out of the `if (delta) nUp = 1` collapse below.
         bool delta = false, terminate = false, keepBundle = false;
+        bool aboutNs = false;   // wi was sampled about the shading normal (crossesSurface applies)
         bool collapse = false;   // a connectible vertex whose continuation goes on with the hero alone
         // THE SPECTRAL-CLAIM RULE, surface half (see the medium half above, and render.h's
         // foldWorthIt / foldApply — ONE rule, because both tracers fill the same beam bank).
@@ -1355,7 +1356,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         switch (mp->type) {
             case MatType::Diffuse:
             case MatType::Fluorescent: {              // elastic base only (see header)
-                wi = cosineHemisphere(cur.ns, rng);
+                wi = cosineHemisphere(cur.ns, rng); aboutNs = true;
                 if (dot(wi, cur.ns) <= 0) { terminate = true; break; }
                 double rho = clamp01(diffuseReflectance(scene, *mp, h, lambda));
                 pdfW = bsdfPdf(*mp, cur.ns, wo, wi, lambda, scene, &h);
@@ -1389,7 +1390,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             }
             case MatType::Glossy: {
                 Vec3 mdir = reflect(ray.d, cur.ns);   // ray.d == -wo (incoming dir)
-                wi = sampleGlossy(mdir, materialRoughness(scene, *mp, h), rng);
+                wi = sampleGlossy(mdir, materialRoughness(scene, *mp, h), rng); aboutNs = true;
                 if (dot(wi, cur.ns) <= 0) { terminate = true; break; }
                 double r = clamp01(reflectSlot(scene, *mp, h, lambda));
                 // FOLD-GLOSSY (0.260.1): the lobe's direction is wavelength-free, so the claim
@@ -1463,6 +1464,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 }
                 if (reflLobe) wi = cosineHemisphere(cur.ns, rng);          // reflect
                 else          wi = cosineHemisphere(cur.ns * -1.0, rng);   // transmit
+                aboutNs = true;
                 pdfW    = bsdfPdf(*mp, cur.ns, wo, wi, lambda, scene, &h);
                 pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
                 betaFactor = tot;                     // f*cos/pdf = rhoR+rhoT
@@ -1578,7 +1580,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             }
             case MatType::Mirror: {
                 double r = clamp01(reflectSlot(scene, *mp, h, lambda));
-                wi = reflect(ray.d, cur.ns);
+                wi = reflect(ray.d, cur.ns); aboutNs = true;
                 betaFactor = r; delta = true;
                 // The mirror direction is the same for every λ, so the bundle survives;
                 // only the reflectance is per-λ (cf. Glossy, the rough version of this).
@@ -1608,7 +1610,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             }
             case MatType::HalfMirror: {
                 double r = clamp01(reflectSlot(scene, *mp, h, lambda));
-                if (rng.uniform() < r) { wi = reflect(ray.d, cur.ns); jHmRefl = true; }
+                if (rng.uniform() < r) { wi = reflect(ray.d, cur.ns); jHmRefl = true; aboutNs = true; }
                 else                   wi = ray.d;    // transmit straight
                 betaFactor = 1.0; delta = true;
                 break;
@@ -1634,7 +1636,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 Ray nr = mats.gratingDiffract(*mp, h, ray.d, lambda, rng, absorbedG, nullptr,
                                               jsw ? &pickG : nullptr);
                 if (absorbedG) { terminate = true; break; }
-                wi = nr.d; betaFactor = r; delta = true;
+                wi = nr.d; betaFactor = r; delta = true;   // orders about ng: never across
                 // JSPEC: the order's probability is 1/(1+|m|) over the orders that propagate,
                 // which depends on lambda, and so does the reflectance: at another wavelength
                 // the same order carries r(lam) * wsum(lambda) / wsum(lam), or nothing where it
@@ -1659,6 +1661,8 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             }
             default: terminate = true; break;
         }
+        // A lobe sampled about ns that lands across the true surface ends the walk (crossesSurface).
+        if (aboutNs && !terminate && crossesSurface(wi, cur.ns, vertexGeoN(cur))) terminate = true;
         // Kill the walk only when EVERY live wavelength is dead. The hero's own factor can
         // legitimately be 0 while a secondary's is not (a gel filter, a saturated spectral
         // reflectance), and dropping the whole bundle there biases the estimate low — it
@@ -4789,6 +4793,9 @@ struct BdptRenderer {
                                     const SurfPhoton& ph = photons->pts[(size_t)idx];
                                     const SurfMis* lm = photons->misOf((size_t)idx);
                                     if (!lm) return;      // no weight: refuse (see misOf)
+                                    // A photon from across the true surface (a thin sheet's
+                                    // other face; a tilted or tipped normal): no merge.
+                                    if (crossesSurface(ph.wo, vk.ns, ngo)) return;
                                     const double lam = (double)ph.lambda;
                                     double fCam = bsdfF(*vk.mat, vk.ns, woCam, ph.wo, lam,
                                                         scene, &vk.hit);
