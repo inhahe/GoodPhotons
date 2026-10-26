@@ -351,10 +351,9 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
     wi = Vec3{0, 0, 0}; betaFactor = 0.0; pdfW = 0.0; pdfRevW = 0.0; cosThetaOut = 0.0;
     delta = false; terminate = false;
     // What wi is, for leavesWrongSide: a reflection unless the case says otherwise (bdpt.h's
-    // randomWalk): Transmit for a lobe drawn through the surface, `freeSide` for a direction no
-    // lobe drew about the shading normal.
+    // randomWalk): Transmit for a lobe drawn through the surface, Free for a direction no lobe
+    // drew about the shading normal.
     Lobe lobe = Lobe::Reflect;
-    bool freeSide = false;
     const int nSec = (secF && lamAll && nUp > 1) ? nUp - 1 : 0;   // secondaries to fill
     if (secChromatic) *secChromatic = false;
     if (keepBundle)   *keepBundle = false;
@@ -431,7 +430,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
                                          rng.uniform(), rng.uniform(), pdfH, fv);
             if (!(pdfH > 0.0) || !(fv > 0.0)) { terminate = true; break; }
-            wi = hair::toWorld(hs.fr, wl); freeSide = true;
+            wi = hair::toWorld(hs.fr, wl); lobe = Lobe::Free;
             // A coverage pass-through returns EXACTLY -wo: the ray was never intercepted.
             // The vertex stays stored/connectible (a fiber below opacity 1 is a MIXED BSDF
             // and connections evaluate o*f_scatter, as mode R's NEE does), but the SAMPLED
@@ -483,19 +482,19 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             const Renderer::InterfaceStep st =
                 mats.interfaceStep(scene, *mp, h, rayDir, lambda, rng, stk, transport);
             if (st.absorbed) { terminate = true; break; }
-            wi = st.ray.d; betaFactor = st.scale; delta = true; freeSide = true;   // about ng
+            wi = st.ray.d; betaFactor = st.scale; delta = true; lobe = Lobe::Free;   // about ng
             break;
         }
         case MatType::HalfMirror: {
             double r = clamp01(reflectSlot(scene, *mp, h, lambda));
             if (rng.uniform() < r) wi = reflect(rayDir, ns);
-            else                   { wi = rayDir; freeSide = true; }
+            else                   { wi = rayDir; lobe = Lobe::Free; }
             betaFactor = 1.0; delta = true;
             break;
         }
         case MatType::Filter: {
             double t = clamp01(transmitSlot(scene, *mp, h, lambda));
-            wi = rayDir; betaFactor = t; delta = true; freeSide = true;   // t <= 0 -> caller's max test
+            wi = rayDir; betaFactor = t; delta = true; lobe = Lobe::Free;   // t <= 0 -> caller's max test
             // Straight-through for every λ, so the bundle survives — and a gel filter is
             // exactly where the per-λ transmittance spread is largest, i.e. the case that
             // benefits most from NOT de-heroing, AND the case that forces the absolute
@@ -513,13 +512,13 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             if (r <= 0) { terminate = true; break; }
             bool absorbedG; Ray nr = mats.gratingDiffract(*mp, h, rayDir, lambda, rng, absorbedG);
             if (absorbedG) { terminate = true; break; }
-            wi = nr.d; betaFactor = r; delta = true; freeSide = true;   // orders about ng
+            wi = nr.d; betaFactor = r; delta = true; lobe = Lobe::Free;   // orders about ng
             break;
         }
         default: terminate = true; break;
     }
     // A lobe that leaves on the wrong side of the true surface ends the walk (leavesWrongSide).
-    if (!terminate && !freeSide && leavesWrongSide(wi, orientedGeoN(h), lobe)) terminate = true;
+    if (!terminate && leavesWrongSide(wi, orientedGeoN(h), lobe)) terminate = true;
     if (!terminate) cosThetaOut = std::fabs(dot(wi, ns));
 }
 
@@ -1235,6 +1234,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
             // groom read 0.40 of modes R and B; 3 000 strands 0.99 (0.364.0).
             if (ctx.vmNorm > 0.0 && mp->type != MatType::Hair) {
                 Vec3 mergeXYZ{0, 0, 0};
+                const Vec3 ngoCam = orientedGeoN(h);
+                const bool camTwoSided = isTwoSidedMat(*mp);   // for mergeFromBehind
                 grid.query(lightVerts, h.p, ctx.radius, [&](int idx) {
                     const LightVertex& lv = lightVerts[idx];
                     if (edges + lv.edges > ctx.maxDepth) return;        // merged path too long
@@ -1245,7 +1246,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     // Measured: opaque hair 2.79x mode R with this merge, 1.029x without.
                     if (lv.mat && lv.mat->type == MatType::Hair) return;
                     Vec3 wMerge = lv.wo;                                // incident illumination dir
-                    if (mergeAcrossSurface(wo, wMerge, h.n, orientedGeoN(h))) return;   // from across the true surface
+                    if (mergeFromBehind(camTwoSided, wMerge, ngoCam)) return;
                     // camera BSDF evaluated at the light vertex's wavelength (XYZ estimate).
                     double lam = (double)lv.lambda;
                     double fCam = bsdfF(*mp, h.n, wo, wMerge, lam, scene, &h);
@@ -1269,7 +1270,6 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     // Gather-side shading-normal correction (cos_s/cos_g at the merge point):
                     // rebalances the geometric-cosine density estimate onto the shading cosine
                     // so a smooth mesh merges smoothly like mode R. 1 when h.n==h.ng (flat).
-                    Vec3 ngoCam = orientedGeoN(h);
                     const double gcorr = vmGatherCorr(wMerge, h.n, ngoCam);
                     fCam *= gcorr;
                     // The merge MIS weight is built from λ-independent densities, evaluated

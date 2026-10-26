@@ -218,7 +218,7 @@ def compare(out, a, b, tol, log):
         px = np.any(x != y, axis=-1)
         rel = float((np.abs(y - x) / np.maximum(np.abs(x), 1e-6)).max())
         mean = (y.sum() - x.sum()) / max(abs(x.sum()), 1e-30)
-        tag = n[:-4].split("_", 1)[1]                    # "flat_M_gpu.pfm" -> "M_gpu"
+        tag = "_".join(n[:-4].rsplit("_", 2)[-2:])         # "flat_M_gpu.pfm" -> "M_gpu"
         allowed = max(tol if tag.endswith("_gpu") else 0.0, NONDET_FLOOR.get(tag, 0.0))
         if rel <= allowed:
             log("  %-22s within %.0e: %d of %d pixels, largest change %.3g of the pixel"

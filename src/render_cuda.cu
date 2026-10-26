@@ -3500,8 +3500,9 @@ __device__ static inline DHit dOtherSide(const DHit& h) {
 // decides the side of the true surface it must leave on -- a reflection back to the side the ray
 // arrived from (`ngo`, dShadedNg), a transmission through to the other. Every walk absorbs one
 // that leaves on the wrong side.
-enum DLobe { DL_REFLECT, DL_TRANSMIT };
+enum DLobe { DL_REFLECT, DL_TRANSMIT, DL_FREE };
 __device__ static inline bool dLeavesWrongSide(const DVec3& w, const DVec3& ngo, DLobe lobe) {
+    if (lobe == DL_FREE) return false;
     const Real c = dot(w, ngo);
     return (lobe == DL_REFLECT) ? !(c > (Real)0) : !(c < (Real)0);
 }
@@ -3517,13 +3518,6 @@ __device__ static inline bool dContinueAlong(const DHit& h, DVec3 w, DLobe lobe,
     rd = w;
     ro = dOffsetAlong(h.p, h.ng, w);
     return true;
-}
-// Host twin mergeAcrossSurface: does the BSDF about `ns` read the merge pair (`wo` toward the
-// camera side, `wi` toward the photon's origin) as a reflection where the true surface (`ngo`, on
-// the camera's side) makes it a transmission, or the reverse? Such a photon is not merged.
-__device__ static inline bool dMergeAcrossSurface(const DVec3& wo, const DVec3& wi,
-                                                  const DVec3& ns, const DVec3& ngo) {
-    return ((dot(wo, ns) > (Real)0) == (dot(wi, ns) > (Real)0)) != (dot(wi, ngo) > (Real)0);
 }
 
 // ---- implicit field evaluation (device twin of implicit.h) ----------------
@@ -5290,6 +5284,11 @@ __device__ static Real dShadowTerminatorG(const DVec3& wi, const DVec3& ns, cons
     Real g = cosNgWi / denom;
     if (g >= (Real)1) return (Real)1;                  // fully lit -> no darkening
     return g * g * ((Real)1 - g) + g;                  // Chiang cubic: -g^3 + g^2 + g
+}
+// Host twin mergeFromBehind (geometry.h says why): a one-sided camera vertex merges no photon from
+// behind its true surface (`ngo`, on the camera's side); a two-sided one refuses none.
+__device__ static inline bool dMergeFromBehind(bool twoSided, const DVec3& wi, const DVec3& ngo) {
+    return !twoSided && !(dot(wi, ngo) > (Real)0);
 }
 __device__ static void connect(const DScene& sc, const DCamera& cam, double* film, double* hits,
                                const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
@@ -11012,6 +11011,9 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         mptr = &sc.mats[child]; matIndex = child;
     }
     const DMaterial& m = *mptr;
+    // A light block's own surface ends the photon (host twin tracePhoton): it reflects nothing,
+    // and a photon deposited there would be gathered by every other surface within the radius.
+    if (m.matReflectsNothing) { eAbsorbed += beta; return WF_TERMINATE; }
     if (m.type == D_DIELECTRIC || m.type == D_THINFILM || m.type == D_MULTILAYER ||
         m.type == D_MIRROR || m.type == D_GRATING || m.type == D_HALFMIRROR ||
         m.type == D_FILTER || m.type == D_GLOSSY || m.type == D_FLUORESCENT ||
@@ -11038,7 +11040,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         DVec3 ngo = dShadedNg(h);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
         // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path
-        if (!m.matReflectsNothing) depositPhoton(cs, h.p, ngo, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
+        depositPhoton(cs, h.p, ngo, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
         if (pathC) pathC->bits |= PV_BIT_SCATTER;   // past here it is diffuse indirect light
         // Both lobes get the adjoint correction; |cos| in the factor makes it lobe-agnostic,
         // so h.n / ngo serve the transmit lobe too (nb = -h.n is used only for the splat side).
@@ -11058,7 +11060,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         DVec3 ngo = dShadedNg(h);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
         // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path
-        if (!m.matReflectsNothing) depositPhoton(cs, h.p, ngo, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
+        depositPhoton(cs, h.p, ngo, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
         if (pathC) pathC->bits |= PV_BIT_SCATTER;   // past here it is diffuse indirect light
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
         camSpecularSplatAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
@@ -11382,6 +11384,10 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         mptr = &sc.mats[child]; matIndex = child;
     }
     const DMaterial& m = *mptr;
+    if (m.matReflectsNothing) {                     // a light block's own surface (shadeStep)
+        for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i];
+        return WF_TERMINATE;
+    }
 
     if (m.type == D_DIFFUSETRANSMIT) {
         Real rhoR[hero::kHeroMax], rhoT[hero::kHeroMax];
@@ -11395,7 +11401,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         DVec3 ngo = dShadedNg(h);
         DVec3 wiPrev = -rd;
         { const bool caus = dPathIsCaustic(pathC);
-          if (!m.matReflectsNothing) for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngo, beta[i], lam[i], caus);
+          for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngo, beta[i], lam[i], caus);
           if (pathC) pathC->bits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
         if (camMode == CAM_A || camMode == CAM_B) {
             splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rhoR, nUp, rng);
@@ -11499,7 +11505,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     DVec3 ngo = dShadedNg(h);
     DVec3 wiPrev = -rd;
     { const bool caus = dPathIsCaustic(pathC);
-      if (!m.matReflectsNothing) for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngo, beta[i], lam[i], caus);
+      for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngo, beta[i], lam[i], caus);
       if (pathC) pathC->bits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
     if (camMode == CAM_A || camMode == CAM_B) {
         splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rho, nUp, rng);
@@ -16085,10 +16091,9 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         DVec3 wo = normalize(dwo);
         DVec3 wi; double pdfW = 0, pdfRevW = 0, betaFactor = 0; int delta = 0; bool terminate = false;
         // What wi is, for dLeavesWrongSide (host twin randomWalk): a reflection unless the case
-        // says otherwise -- DL_TRANSMIT for a lobe drawn through the surface, `freeSide` for a
+        // says otherwise -- DL_TRANSMIT for a lobe drawn through the surface, DL_FREE for a
         // direction no lobe drew about the shading normal.
         DLobe lobe = DL_REFLECT;
-        bool freeSide = false;
         // Mirror / Filter are delta but choose their continuation WITHOUT consulting λ,
         // so the secondaries can ride through them; they set keepBundle to opt out of
         // the `if (delta) nUp = 1` collapse below (device twin of bdpt.h).
@@ -16119,7 +16124,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 const double u0 = rng.uniform(), u1 = rng.uniform(), u2 = rng.uniform(), u3 = rng.uniform();
                 const dhair::V3 wl = dhair::sample(hs.b, hs.woLocal, u0, u1, u2, u3, pdfH, fv);
                 if (!(pdfH > 0.0) || !(fv > 0.0)) { terminate = true; break; }
-                wi = dhair::toWorld(hs.fr, wl); freeSide = true;
+                wi = dhair::toWorld(hs.fr, wl); lobe = DL_FREE;
                 const bool passThru = (wl.x == -hs.woLocal.x && wl.y == -hs.woLocal.y &&
                                        wl.z == -hs.woLocal.z);
                 pdfW    = pdfH;
@@ -16253,7 +16258,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 DVec3 nro, nrd; double rs = 1.0;
                 if (!dDielectricStep(sc, *mp, h, rd, lambda, rng, stk, nro, nrd, nullptr,
                                      importance ? nullptr : &rs, jrun ? &jSt : nullptr)) { terminate = true; break; }
-                wi = nrd; betaFactor = rs; delta = 1; freeSide = true;   // about ng
+                wi = nrd; betaFactor = rs; delta = 1; lobe = DL_FREE;   // about ng
                 // -jdispall: a dispersive refraction opens the window (host twin randomWalk).
                 if (jrun && c_jDispAll && jSt.refracted &&
                     fabs((double)specLookup(mp->ior, (Real)DLMIN) - (double)specLookup(mp->ior, (Real)DLMAX)) > 1e-9)
@@ -16262,14 +16267,14 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             }
             case D_HALFMIRROR: {
                 double r = clamp01(specLookup(mp->reflect, lambda));
-                if (rng.uniform() < r) { wi = reflectv(rd, path[cur].ns); jHmRefl = true; } else { wi = rd; freeSide = true; }
+                if (rng.uniform() < r) { wi = reflectv(rd, path[cur].ns); jHmRefl = true; } else { wi = rd; lobe = DL_FREE; }
                 betaFactor = 1.0; delta = 1;
                 break;
             }
             case D_FILTER: {
                 // Colored gel filter: straight-through delta, throughput ×= T(lambda).
                 double t = clamp01(dTransmitSlot(sc, *mp, h, lambda, jrun ? &tpS : nullptr));
-                wi = rd; betaFactor = t; delta = 1; freeSide = true;
+                wi = rd; betaFactor = t; delta = 1; lobe = DL_FREE;
                 // Straight-through for every λ: keep the bundle, reweight per-λ. This is
                 // the case with the widest per-λ spread (a Wratten gel is 0 over most of
                 // the spectrum), and the reason secF is absolute rather than a ratio.
@@ -16284,7 +16289,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 DVec3 nro, nrd; int pickG = 0;
                 if (!gratingDiffract(*mp, h, rd, lambda, diffraction, rng, nro, nrd, nullptr,
                                      jrun ? &pickG : nullptr)) { terminate = true; break; }
-                wi = nrd; betaFactor = r; delta = 1; freeSide = true;   // orders about ng
+                wi = nrd; betaFactor = r; delta = 1; lobe = DL_FREE;   // orders about ng
                 // JSPEC (host twin randomWalk): the order at every bin, r(lam) / wsum(lam), 0
                 // where it is evanescent; any order but 0 opens the dispersive window.
                 if (jrun) {
@@ -16306,7 +16311,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             default: terminate = true; break;
         }
         // A lobe that leaves on the wrong side of the true surface ends the walk (host twin).
-        if (!terminate && !freeSide && dLeavesWrongSide(wi, dVertexGeoN(path[cur]), lobe)) terminate = true;
+        if (!terminate && dLeavesWrongSide(wi, dVertexGeoN(path[cur]), lobe)) terminate = true;
         // Kill the walk only when EVERY live wavelength is dead: the hero's own factor can
         // legitimately be 0 while a secondary's is not (gel filter, saturated spectral
         // reflectance), and dropping the bundle there biases low. nUp == 1 -> empty loop ->
@@ -17196,6 +17201,7 @@ __device__ static void dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const 
     const int iy = (int)fmin(fmax(floor(((double)vk.p.y - (double)sm.lo.y) / (double)sm.cell), 0.0), (double)(sm.ny - 1));
     const int iz = (int)fmin(fmax(floor(((double)vk.p.z - (double)sm.lo.z) / (double)sm.cell), 0.0), (double)(sm.nz - 1));
     const DVec3 ngo = dVertexGeoN(vk);
+    const bool vkTwoSided = dTwoSidedType(sc.mats[vk.matId].type);   // for dMergeFromBehind
     for (int dz = -1; dz <= 1; ++dz) { const int cz = iz + dz; if (cz < 0 || cz >= sm.nz) continue;
     for (int dy = -1; dy <= 1; ++dy) { const int cy = iy + dy; if (cy < 0 || cy >= sm.ny) continue;
     for (int dx = -1; dx <= 1; ++dx) { const int cx = ix + dx; if (cx < 0 || cx >= sm.nx) continue;
@@ -17205,9 +17211,7 @@ __device__ static void dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const 
             const DSurfPhoton& ph = sm.pts[idx];
             const DVec3 dd{vk.p.x - ph.p.x, vk.p.y - ph.p.y, vk.p.z - ph.p.z};
             if (ddot(dd, dd) > r2) continue;
-            // A photon from across the true surface (a thin sheet's other face, read by a tilted
-            // or tipped normal): no merge (host twin mergeAcrossSurface).
-            if (dMergeAcrossSurface(woCam, ph.wo, vk.ns, ngo)) continue;
+            if (dMergeFromBehind(vkTwoSided, ph.wo, ngo)) continue;   // host twin mergeFromBehind
             const DSurfMis& lm = sm.mis[ph.misIdx];
             const Real lam = (Real)ph.lambda;
             double fCam = dBsdfF(sc, vk, woCam, ph.wo, lam);
@@ -17809,13 +17813,14 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
         bool nullHere = false;
         hairArrival = false;
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
+            const DVec3 gn = dShadedNg(h);   // the true normal, as the photons carry it
             // Density estimate at y, folding the visible-point reflectance per photon wavelength.
             float gx = 0.f, gy = 0.f, gz = 0.f;
             dPmNeighborhood(pm, h.p, [&](int k) {
                 const DGatherPhoton& ph = pm.photons[k];
                 DVec3 d = h.p - ph.pos;
                 if (dot(d, d) > r2) return;
-                if (dot(ph.n, dShadedNg(h)) < (Real)0.5) return;
+                if (dot(ph.n, gn) < (Real)0.5) return;
                 float rhoY = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
                 float rhoV = (float)dDiffuseRho(sc, visMat, visHit, (Real)ph.lambda);
                 float w = rhoY * rhoV;
@@ -17827,7 +17832,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             // (DGatherPhoton), so the correction multiplies the sum rather than a normalisation.
             if (sc.gatherArea) {
                 const double ms = dGatherAreaScale(sc.gaBias,
-                    dGatherCoverage(sc, h.p, dShadedNg(h), (Real)sqrt((double)r2), rng, sc.gatherArea,
+                    dGatherCoverage(sc, h.p, gn, (Real)sqrt((double)r2), rng, sc.gatherArea,
                                     h.fiberRadius));
                 gx = (float)((double)gx * ms);
                 gy = (float)((double)gy * ms);
@@ -17837,14 +17842,14 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 // The caustic map gathers at its own PER-QUERY radius (dPmAdaptiveRadius).
                 // pX/pY/pZ carry the fold for the map's fixed radius, so rescale the sum by
                 // the area ratio r^2/r_q^2 rather than re-folding every record.
-                const Real rq  = dPmAdaptiveRadius(pmC, h.p, dShadedNg(h));
+                const Real rq  = dPmAdaptiveRadius(pmC, h.p, gn);
                 const Real r2q = rq * rq;
                 float cx = 0.f, cy = 0.f, cz = 0.f;
                 dPmNeighborhood(pmC, h.p, [&](int k) {
                     const DGatherPhoton& ph = pmC.photons[k];
                     DVec3 d = h.p - ph.pos;
                     if (dot(d, d) > r2q) return;
-                    if (dot(ph.n, dShadedNg(h)) < (Real)0.5) return;
+                    if (dot(ph.n, gn) < (Real)0.5) return;
                     float rhoY = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
                     float rhoV = (float)dDiffuseRho(sc, visMat, visHit, (Real)ph.lambda);
                     float w = rhoY * rhoV;
@@ -17856,7 +17861,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 // on that map's rq. One shared coverage would be cheaper and wrong.
                 double cs = 1.0;
                 if (sc.gatherArea)
-                    cs = dGatherAreaScale(sc.gaBias, dGatherCoverage(sc, h.p, dShadedNg(h), rq, rng, sc.gatherArea,
+                    cs = dGatherAreaScale(sc.gaBias, dGatherCoverage(sc, h.p, gn, rq, rng, sc.gatherArea,
                                                           h.fiberRadius));
                 gx += cx * (float)(aw * cs);
                 gy += cy * (float)(aw * cs);
@@ -18397,6 +18402,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         const DGlossyMis gmisIn = gmis;   // a hair pass-through puts it back
         gmis.clear();
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
+            const DVec3 gn = dShadedNg(h);   // the true normal, as the photons carry it
             if (fgRays > 0 && m.type == D_DIFFUSE) {
                 // Jensen final gather (device twin of photonGather's fgRays branch): decouples
                 // the directly-seen surface's sharpness from the gather radius by moving the
@@ -18436,7 +18442,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 const DGatherPhoton& ph = pm.photons[k];
                 DVec3 d = h.p - ph.pos;
                 if (dot(d, d) > r2) return;
-                if (dot(ph.n, dShadedNg(h)) < (Real)0.5) return;   // reject cross-surface leakage
+                if (dot(ph.n, gn) < (Real)0.5) return;   // reject cross-surface leakage
                 // SPECGATHER: the walk's reflectances belong at THIS photon's wavelength,
                 // not the camera's. Exactly 1.0 when every one of them was flat.
                 float rho = (float)(dDiffuseRho(sc, m, h, (Real)ph.lambda)
@@ -18451,7 +18457,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             // (DGatherPhoton), so the correction multiplies the sum rather than a normalisation.
             if (sc.gatherArea) {
                 const double ms = dGatherAreaScale(sc.gaBias,
-                    dGatherCoverage(sc, h.p, dShadedNg(h), (Real)sqrt((double)r2), rng, sc.gatherArea,
+                    dGatherCoverage(sc, h.p, gn, (Real)sqrt((double)r2), rng, sc.gatherArea,
                                     h.fiberRadius));
                 gx = (float)((double)gx * ms);
                 gy = (float)((double)gy * ms);
@@ -18461,14 +18467,14 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             // header comment and dPmAdaptiveRadius). The area ratio r^2/r_q^2 corrects the
             // fixed-radius normalisation already folded into pX/pY/pZ.
             if (causOn) {
-                const Real rq  = dPmAdaptiveRadius(pmC, h.p, dShadedNg(h));
+                const Real rq  = dPmAdaptiveRadius(pmC, h.p, gn);
                 const Real r2q = rq * rq;
                 float cx = 0.f, cy = 0.f, cz = 0.f;
                 dPmNeighborhood(pmC, h.p, [&](int k) {
                     const DGatherPhoton& ph = pmC.photons[k];
                     DVec3 d = h.p - ph.pos;
                     if (dot(d, d) > r2q) return;
-                    if (dot(ph.n, dShadedNg(h)) < (Real)0.5) return;
+                    if (dot(ph.n, gn) < (Real)0.5) return;
                     // SPECGATHER: the walk's reflectances belong at THIS photon's wavelength,
                     // not the camera's. Exactly 1.0 when every one of them was flat.
                     float rho = (float)(dDiffuseRho(sc, m, h, (Real)ph.lambda)
@@ -18483,7 +18489,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 // on that map's rq. One shared coverage would be cheaper and wrong.
                 double cs = 1.0;
                 if (sc.gatherArea)
-                    cs = dGatherAreaScale(sc.gaBias, dGatherCoverage(sc, h.p, dShadedNg(h), rq, rng, sc.gatherArea,
+                    cs = dGatherAreaScale(sc.gaBias, dGatherCoverage(sc, h.p, gn, rq, rng, sc.gatherArea,
                                                           h.fiberRadius));
                 gx += cx * (float)(aw * cs);
                 gy += cy * (float)(aw * cs);
@@ -18950,6 +18956,7 @@ __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, i
         if (!st.vpValid[pix]) continue;
         const DHit h = st.vpHit[pix];
         const DMaterial& m = sc.mats[h.matId];           // parent matId, matching CPU SPPM
+        const DVec3 gn = dShadedNg(h);                  // the true normal, as the photons carry it
         double R = st.radius[pix];
         Real r2 = (Real)(R * R);
         float gx = 0.f, gy = 0.f, gz = 0.f;
@@ -18958,7 +18965,7 @@ __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, i
             const DGatherPhoton& ph = pm.photons[k];
             DVec3 d = h.p - ph.pos;
             if (dot(d, d) > r2) return;
-            if (dot(ph.n, dShadedNg(h)) < (Real)0.5) return;   // reject cross-surface leakage
+            if (dot(ph.n, gn) < (Real)0.5) return;   // another surface's photon
             float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
             gx += rho * ph.pX;
             gy += rho * ph.pY;
@@ -18985,7 +18992,7 @@ __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, i
                                  + 0x5851F42D4C957F2DULL;
             DRng grng; grng.seedUnit(s, seedBase + 23);
             const double cs = dGatherAreaScale(sc.gaBias,
-                dGatherCoverage(sc, h.p, dShadedNg(h), (Real)R, grng, sc.gatherArea));
+                dGatherCoverage(sc, h.p, gn, (Real)R, grng, sc.gatherArea));
             gx = (float)((double)gx * cs);
             gy = (float)((double)gy * cs);
             gz = (float)((double)gz * cs);
@@ -19163,7 +19170,6 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
     delta = false; terminate = false;
     // What wi is, for dLeavesWrongSide: a reflection unless the case says otherwise (dRandomWalk).
     DLobe lobe = DL_REFLECT;
-    bool freeSide = false;
     const int nSec = (secF && lamAll && nUp > 1) ? nUp - 1 : 0;   // secondaries to fill
     if (secChromatic) *secChromatic = false;
     if (keepBundle)   *keepBundle = false;
@@ -19238,7 +19244,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             const double u0 = rng.uniform(), u1 = rng.uniform(), u2 = rng.uniform(), u3 = rng.uniform();
             const dhair::V3 wl = dhair::sample(hs.b, hs.woLocal, u0, u1, u2, u3, pdfH, fv);
             if (!(pdfH > 0.0) || !(fv > 0.0)) { terminate = true; break; }
-            wi = dhair::toWorld(hs.fr, wl); freeSide = true;
+            wi = dhair::toWorld(hs.fr, wl); lobe = DL_FREE;
             const bool passThru = (wl.x == -hs.woLocal.x && wl.y == -hs.woLocal.y &&
                                    wl.z == -hs.woLocal.z);
             pdfW    = pdfH;
@@ -19278,18 +19284,18 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             DVec3 nro, nrd;
             if (!dDielectricStep(sc, m, h, rd, lambda, rng, stk, nro, nrd, nullptr,
                                  radianceScale)) { terminate = true; break; }
-            wi = nrd; betaFactor = 1.0; delta = true; freeSide = true;   // about ng
+            wi = nrd; betaFactor = 1.0; delta = true; lobe = DL_FREE;   // about ng
             break;
         }
         case D_HALFMIRROR: {
             double r = clamp01(dReflectSlot(sc, m, h, lambda));
-            if (rng.uniform() < r) wi = reflectv(rd, ns); else { wi = rd; freeSide = true; }
+            if (rng.uniform() < r) wi = reflectv(rd, ns); else { wi = rd; lobe = DL_FREE; }
             betaFactor = 1.0; delta = true;
             break;
         }
         case D_FILTER: {
             double t = clamp01(dTransmitSlot(sc, m, h, lambda));
-            wi = rd; betaFactor = t; delta = true; freeSide = true;   // t <= 0 -> caller's max test
+            wi = rd; betaFactor = t; delta = true; lobe = DL_FREE;   // t <= 0 -> caller's max test
             // Straight-through for every λ, so the bundle survives — and a gel filter is
             // exactly where the per-λ transmittance spread is largest, i.e. the case that
             // benefits most from NOT de-heroing, AND the case that forces the absolute
@@ -19307,13 +19313,13 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             if (r <= 0) { terminate = true; break; }
             DVec3 nro, nrd;
             if (!gratingDiffract(m, h, rd, lambda, diffraction, rng, nro, nrd)) { terminate = true; break; }
-            wi = nrd; betaFactor = r; delta = true; freeSide = true;   // orders about ng
+            wi = nrd; betaFactor = r; delta = true; lobe = DL_FREE;   // orders about ng
             break;
         }
         default: terminate = true; break;
     }
     // A lobe that leaves on the wrong side of the true surface ends the walk (host twin).
-    if (!terminate && !freeSide && dLeavesWrongSide(h, wi, lobe)) terminate = true;
+    if (!terminate && dLeavesWrongSide(h, wi, lobe)) terminate = true;
     if (!terminate) cosThetaOut = fabs(ddot(wi, ns));
 }
 
@@ -20137,7 +20143,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                               if (ddot(d, d) > r2) continue;
                               if (edges + lv.edges > ctx.maxDepth) continue;
                               DVec3 wMerge = lv.wo;
-                              if (dMergeAcrossSurface(wo, wMerge, h.n, dShadedNg(h))) continue;   // from across the surface (dSurfMergeAt)
+                              if (dMergeFromBehind(dTwoSidedType(mp->type), wMerge, ngoCam))
+                                  continue;   // host twin mergeFromBehind
                               Real lam = (Real)lv.lambda;
                               // A MERGE crosses paths, so the two ends carry DIFFERENT bundles
                               // and there is no shared λ set. The estimate therefore stays keyed

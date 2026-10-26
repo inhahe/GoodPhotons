@@ -1334,9 +1334,8 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         bool delta = false, terminate = false, keepBundle = false;
         // What wi is, for leavesWrongSide: a reflection unless the case says otherwise -- a lobe
         // drawn through the surface sets Transmit, and a direction no lobe drew about the shading
-        // normal (a pass-through; a dielectric's, a grating's or a fiber's) sets `freeSide`.
+        // normal (a pass-through; a dielectric's, a grating's or a fiber's) sets Free.
         Lobe lobe = Lobe::Reflect;
-        bool freeSide = false;
         bool collapse = false;   // a connectible vertex whose continuation goes on with the hero alone
         // THE SPECTRAL-CLAIM RULE, surface half (see the medium half above, and render.h's
         // foldWorthIt / foldApply — ONE rule, because both tracers fill the same beam bank).
@@ -1495,7 +1494,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
                                              rng.uniform(), rng.uniform(), pdfH, fv, &la);
                 if (!(pdfH > 0.0) || !(fv > 0.0)) { terminate = true; break; }
-                wi = hair::toWorld(hs.fr, wl); freeSide = true;
+                wi = hair::toWorld(hs.fr, wl); lobe = Lobe::Free;
                 // A coverage pass-through returns EXACTLY -wo: the ray was never intercepted.
                 // That is a DELTA vertex in this file's own sense -- it carries the chain but
                 // cannot be connected to, because its outgoing direction is fixed and its pdf
@@ -1601,7 +1600,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 const Renderer::InterfaceStep st =
                     mats.interfaceStep(scene, *mp, h, ray.d, lambda, rng, stk, transport);
                 if (st.absorbed) { terminate = true; break; }
-                wi = st.ray.d; betaFactor = st.scale; delta = true; freeSide = true;   // about ng
+                wi = st.ray.d; betaFactor = st.scale; delta = true; lobe = Lobe::Free;   // about ng
                 if (jsw) {
                     jSt = st; jHaveSt = true;
                     // -jdispall: a refraction whose index varies over the band leaves a path that
@@ -1615,14 +1614,14 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             case MatType::HalfMirror: {
                 double r = clamp01(reflectSlot(scene, *mp, h, lambda));
                 if (rng.uniform() < r) { wi = reflect(ray.d, cur.ns); jHmRefl = true; }
-                else                   { wi = ray.d; freeSide = true; }   // transmit straight
+                else                   { wi = ray.d; lobe = Lobe::Free; }   // transmit straight
                 betaFactor = 1.0; delta = true;
                 break;
             }
             case MatType::Filter: {
                 // Colored gel filter: straight-through delta, throughput ×= T(lambda).
                 double t = clamp01(transmitSlot(scene, *mp, h, lambda));
-                wi = ray.d; betaFactor = t; delta = true; freeSide = true;   // direction unchanged
+                wi = ray.d; betaFactor = t; delta = true; lobe = Lobe::Free;   // direction unchanged
                 // Straight-through for every λ, so the bundle survives; a gel filter is
                 // exactly where the per-λ transmittance spread is largest, so this is
                 // the case that benefits most from NOT de-heroing — AND the case that
@@ -1640,7 +1639,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 Ray nr = mats.gratingDiffract(*mp, h, ray.d, lambda, rng, absorbedG, nullptr,
                                               jsw ? &pickG : nullptr);
                 if (absorbedG) { terminate = true; break; }
-                wi = nr.d; betaFactor = r; delta = true; freeSide = true;   // orders about ng
+                wi = nr.d; betaFactor = r; delta = true; lobe = Lobe::Free;   // orders about ng
                 // JSPEC: the order's probability is 1/(1+|m|) over the orders that propagate,
                 // which depends on lambda, and so does the reflectance: at another wavelength
                 // the same order carries r(lam) * wsum(lambda) / wsum(lam), or nothing where it
@@ -1666,7 +1665,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             default: terminate = true; break;
         }
         // A lobe that leaves on the wrong side of the true surface ends the walk (leavesWrongSide).
-        if (!terminate && !freeSide && leavesWrongSide(wi, vertexGeoN(cur), lobe)) terminate = true;
+        if (!terminate && leavesWrongSide(wi, vertexGeoN(cur), lobe)) terminate = true;
         // Kill the walk only when EVERY live wavelength is dead. The hero's own factor can
         // legitimately be 0 while a secondary's is not (a gel filter, a saturated spectral
         // reflectance), and dropping the whole bundle there biases the estimate low — it
@@ -4793,6 +4792,7 @@ struct BdptRenderer {
                                 sw.camVert      = k;
                                 sw.maxDepth     = maxDepth;
                                 const Vec3 ngo = vertexGeoN(vk);
+                                const bool vkTwoSided = isTwoSidedMat(*vk.mat);   // mergeFromBehind
                                 const JSpec* vkSpec =
                                     (jSpecOn && (size_t)k < jsw.vert.size() && jsw.vert[(size_t)k].on())
                                         ? &jsw.vert[(size_t)k] : nullptr;
@@ -4801,9 +4801,7 @@ struct BdptRenderer {
                                     const SurfPhoton& ph = photons->pts[(size_t)idx];
                                     const SurfMis* lm = photons->misOf((size_t)idx);
                                     if (!lm) return;      // no weight: refuse (see misOf)
-                                    // A photon from across the true surface (a thin sheet's
-                                    // other face, read by a tilted or tipped normal): no merge.
-                                    if (mergeAcrossSurface(woCam, ph.wo, vk.ns, ngo)) return;
+                                    if (mergeFromBehind(vkTwoSided, ph.wo, ngo)) return;
                                     const double lam = (double)ph.lambda;
                                     double fCam = bsdfF(*vk.mat, vk.ns, woCam, ph.wo, lam,
                                                         scene, &vk.hit);

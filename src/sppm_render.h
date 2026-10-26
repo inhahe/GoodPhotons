@@ -309,10 +309,11 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                 if (!P.vpValid) continue;
                 const Hit& h = P.vpHit;
                 const Material& m = scene.mats[h.matId];
+                const Vec3 gn = orientedGeoN(h);   // the true normal, as the photons carry it
                 double M = 0.0;          // photons found this pass
                 Vec3   phi{0, 0, 0};     // local flux sum (XYZ, per-photon wavelength)
                 pm.queryR(h.p, P.radius, [&](const Photon& ph, double, int k) {
-                    if (dot(ph.n, orientedGeoN(h)) < 0.5) return;   // another surface's photon
+                    if (dot(ph.n, gn) < 0.5) return;   // another surface's photon
                     double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                     double f = rho * (1.0 / PI);
                     phi += pm.cie[k] * (f * (double)ph.power);        // == cie(lambda_p), precomputed
@@ -343,7 +344,7 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                     grng.seed(((uint64_t)y << 20) ^ (uint64_t)x,
                               0x9e3779b97f4a7c15ULL ^ (uint64_t)st.passes);
                     phi = phi * gatherAreaScale(
-                        gatherCoverage(scene, h.p, orientedGeoN(h), P.radius, grng, gaM, h.matId,
+                        gatherCoverage(scene, h.p, gn, P.radius, grng, gaM, h.matId,
                                        h.fiberRadius));
                 }
                 // Progressive radius / flux update (shared-statistics PPM).

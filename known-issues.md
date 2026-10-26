@@ -197,9 +197,9 @@ every hit and the device's dShadedNg to it.
 ## OPEN (2026-10-26): MERGE-PROXIMITY — a density estimate gathers photons from every surface within its radius; mode M's adaptive radius makes that a large leak
 
 Every photon gather (mode M's `queryR`, S's, U's VCM merge, J's surface merge) takes the photons
-within a sphere of its radius, whatever surface they lie on. Its only filter is a normal test
-(M: `dot(ph.n, h.n) >= 0.5`; J and U: the crossing test of 0.400.5), which a second surface
-facing the same way passes: a table top gathers the floor's photons once the radius exceeds its
+within a sphere of its radius, whatever surface they lie on. Its only filter is a facing test
+(M and S: `dot(ph.n, n) >= 0.5` on true normals since 0.400.7; J and U: `mergeFromBehind`),
+which a second surface facing the same way passes: a table top gathers the floor's photons once the radius exceeds its
 height. Mode M's density-adaptive radius (`-pmauto`, the default) grows to hold `-pmcount`
 photons, and in a sparsely lit scene it outgrows the gaps between surfaces. Measured on an
 opaque 2 m sheet 0.5 m over a lit floor, lamp hidden under the sheet (to reproduce: the
@@ -289,10 +289,11 @@ what the sampler drew instead (geometry.h `Lobe`, `leavesWrongSide`, `continueAl
 arrived from, a transmission through; the BDPT and VCM walks test every lobe as a reflection
 unless the case says it transmits or drew no lobe about n (a pass-through, a dielectric's or a
 grating's direction, built about ng, a fiber's). Every surface merge (J's `dSurfMergeAt` and its
-host twin, both VCM gathers) rejects a photon where the BSDF about n reads the pair (camera,
-photon) otherwise than the true surface does (`mergeAcrossSurface`), which 0.400.5's test
-missed for a camera below n's plane. The 0.400.5 dielectric side tests were dropped: inert,
-the steps build about ng. Cost, on tools/check_bitid.py's scenes (0.400.5): flat geometry, curves
+host twin, both VCM gathers) refuses a photon from behind a one-sided surface, where a connection
+takes no light either, and none at a two-sided one, whose connections take both sides
+(`mergeFromBehind`); 0.400.5's test, which compared the two planes, let a photon from behind
+through when the camera sat below n's plane. The 0.400.5 dielectric side tests were dropped:
+inert, the steps build about ng. Cost, on tools/check_bitid.py's scenes (0.400.5): flat geometry, curves
 and isosurfaces byte-identical in modes R, D, B and J on both devices; the smooth and
 normal-mapped scenes' means move -0.42% to +0.03%. After 0.400.7: no leak in any mode on any of
 the sheets or mirrors.

@@ -7337,17 +7337,21 @@ as the one at fault.
     disagrees with it about the side; `DLobe` / `dLeavesWrongSide` / `dContinueAlong` on the
     device; in the BDPT and VCM walks a `lobe` that defaults to a tested reflection, with a
     transmission lobe saying so and a direction no lobe drew about n -- a pass-through, a
-    dielectric's or a grating's, both built about ng, a fiber's -- marked `freeSide`). The
+    dielectric's or a grating's, both built about ng, a fiber's -- marked `Free`). The
     side of the shading plane cannot stand in for the lobe: a mirror reflection about a tilted
     n of a ray that arrived below n's plane lies below that plane too, and in 0.400.5 such
     reflections went through the mirror (61 % of the light behind it at a grazing view).
     Absorbing without renormalizing leaves MIS as it was. A surface merge (J's `dSurfMergeAt`
-    and its host twin, both VCM gathers) rejects a photon where the BSDF about n reads the pair
-    (camera, photon) as a reflection and the true surface makes it a transmission, or the
-    reverse (`mergeAcrossSurface`): on a zero-thickness sheet the photons of its other face lie
-    within the merge radius. Modes M and S store each photon with the true normal on the side
-    it arrived from and gather, size their adaptive radius and measure their footprint against
-    the gather point's (0.400.7, map format `FTPMP10`): with shading normals a normal map tilted
+    and its host twin, both VCM gathers) refuses a photon from behind a one-sided surface
+    (`mergeFromBehind` / `dMergeFromBehind`) -- where a connection takes no light either -- so
+    the photons of a zero-thickness sheet's other face, which lie within the merge radius, are
+    not taken for reflections; a two-sided surface refuses none, as its connections accept
+    both sides. Only the support: the terminator softening belongs to connections, which a
+    merge is not (folding it in darkened J and U by 0.9 % on a normal-mapped scene), and a test
+    comparing the BSDF's reading of the pair with the true surface's would drop, at a
+    translucent vertex, paths the connections still make. Modes M and S store each photon with
+    the true normal on the side it arrived from and gather, size their adaptive radius and
+    measure their footprint against the gather point's (0.400.7, map format `FTPMP10`): with shading normals a normal map tilted
     past 60 degrees made a sheet's two faces agree, and the top read 2.5-5x its lit brightness
     from its underside's photons.
     `Hit::patOwnSide` / `DHit::patOwnSide`
@@ -8976,8 +8980,8 @@ as the one at fault.
   to D or R, the rest to R); the fallback is R where it renders everything the camera needs, else
   B, which renders every feature, projection and lens -- so every camera has one
   (`fallbackModeFor` exits with an internal error should a change to B's scope break that),
-  though its lens image leaves a mirror or glass seen directly through the lens black, which
-  the fallback's notice says. A
+  though it leaves some specular surfaces seen directly black (a glass or mirror mesh, rough
+  specular; through a physical lens every mirror and glass), which the fallback's notice says. A
   strip removes only what the camera's mode lacks and only what no camera of the run renders
   (`keepFire`/`keepGrin`, computed over the selected cameras), because every camera renders the
   one shared `Scene`; a camera that falls back keeps every strippable feature, so a run in which

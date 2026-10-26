@@ -1250,7 +1250,10 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 // in which case 1/(pi r_q^2 N) is recomputed for this query's own radius.
                 auto est = [&](const PhotonMap& M, double normFixed, double& nrmOut) {
                     MStatTimer _t(&mStats().surfNs, &mStats().surfN);
-                    const double rq = M.adaptiveRadius(h.p, orientedGeoN(h));
+                    // The true normal, as the photons carry it (depositPhoton): one for the
+                    // radius, the coverage and the photon test alike.
+                    const Vec3 gn = orientedGeoN(h);
+                    const double rq = M.adaptiveRadius(h.p, gn);
                     nrmOut = normFixed;
                     if (rq != M.radius) {
                         const double a = PI * rq * rq;
@@ -1262,11 +1265,11 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                     // leaves nrmOut untouched, so every existing render is bit-identical.
                     if (const int gaM = gatherAreaSamples())
                         nrmOut *= gatherAreaScale(
-                            gatherCoverage(scene, h.p, orientedGeoN(h), rq, rng, gaM, h.matId,
+                            gatherCoverage(scene, h.p, gn, rq, rng, gaM, h.matId,
                                            h.fiberRadius));
                     Vec3 g{0, 0, 0};
                     M.queryR(h.p, rq, [&](const Photon& ph, double, int k) {
-                        if (dot(ph.n, orientedGeoN(h)) < 0.5) return;    // another surface's photon
+                        if (dot(ph.n, gn) < 0.5) return;    // another surface's photon
                         double rhoY = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                         double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, ph.lambda));
                         double f = rhoY * (1.0 / PI);
@@ -1633,7 +1636,10 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 // see the twin in photonGatherSub and PhotonMap::adaptiveRadius.
                 auto est = [&](const PhotonMap& M, double normFixed, double& nrmOut) {
                     MStatTimer _t(&mStats().surfNs, &mStats().surfN);
-                    const double rq = M.adaptiveRadius(h.p, orientedGeoN(h));
+                    // The true normal, as the photons carry it (depositPhoton): one for the
+                    // radius, the coverage and the photon test alike.
+                    const Vec3 gn = orientedGeoN(h);
+                    const double rq = M.adaptiveRadius(h.p, gn);
                     nrmOut = normFixed;
                     if (rq != M.radius) {
                         const double a = PI * rq * rq;
@@ -1645,11 +1651,11 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     // leaves nrmOut untouched, so every existing render is bit-identical.
                     if (const int gaM = gatherAreaSamples())
                         nrmOut *= gatherAreaScale(
-                            gatherCoverage(scene, h.p, orientedGeoN(h), rq, rng, gaM, h.matId,
+                            gatherCoverage(scene, h.p, gn, rq, rng, gaM, h.matId,
                                            h.fiberRadius));
                     Vec3 g{0, 0, 0};
                     M.queryR(h.p, rq, [&](const Photon& ph, double, int k) {
-                        if (dot(ph.n, orientedGeoN(h)) < 0.5) return;    // another surface's photon
+                        if (dot(ph.n, gn) < 0.5) return;    // another surface's photon
                         double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                         double f = rho * (1.0 / PI);
                         // SPECGATHER: the walk's reflectances belong at THIS photon's wavelength,

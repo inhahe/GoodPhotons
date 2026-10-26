@@ -19,8 +19,9 @@
 //      wrote nothing at all.
 //
 // Format. `FTPMP10\n` (0.400.7) is `FTPMP09\n` with each surface photon's `n` the TRUE normal on
-// the side it arrived from, and no photon on a light block's own surface; an older file loads
-// and gathers as it was saved (shading normals, lamp photons), and the loader says so.
+// the side it arrived from, and no photon on a light block's own surface. An older file still
+// loads, its photons' shading normals compared with the gather's true one and its lamp photons
+// kept -- not quite the render it was saved from -- and the loader says so.
 // `FTPMP09\n` = header, surface block, beam block, CAUSTIC block; its beam record is the
 // live PhotonBeam with chord PROVENANCE valid (srcEm / surf, 0.312.0). `FTPMP08\n` = the same
 // width with those two fields unset (the loader resets them to "unknown"). `FTPMP07\n`,
@@ -277,11 +278,6 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
     ok = ok && std::fread(en, sizeof en, 1, f) == 1;
     ok = ok && std::fread(&nPh, sizeof nPh, 1, f) == 1;
     if (!ok) { std::fprintf(stderr, "[loadmap] %s truncated header; ignoring\n", path); std::fclose(f); return false; }
-    if (!v10)
-        std::fprintf(stderr, "[loadmap] %s was traced before 0.400.7: its surface photons carry "
-                             "shading normals and include those that landed on a light's own "
-                             "surface, and it gathers as it did then (known-issues "
-                             "J-LAMP-PHOTONS); re-run with -savemap to refresh it.\n", path);
     if (g != guard) {
         std::fprintf(stderr, "[loadmap] %s was built for a different scene; ignoring\n", path);
         std::fclose(f); return false;
@@ -493,5 +489,12 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
     std::fclose(f);
     pm.nEmitted = nEmitted;
     e.emitted += en[0]; e.absorbed += en[1]; e.sensor += en[2]; e.escaped += en[3]; e.residual += en[4];
+    if (!v10)
+        std::fprintf(stderr, "[loadmap] %s was traced before 0.400.7: its surface photons carry "
+                             "shading normals, which this build's gather compares with the true "
+                             "one (a steeply normal-mapped surface can lose its own photons), and "
+                             "include those that landed on a light's own surface (known-issues "
+                             "PMAP-FAR-FACE, J-LAMP-PHOTONS); re-run with -savemap to refresh it.\n",
+                     path);
     return true;
 }

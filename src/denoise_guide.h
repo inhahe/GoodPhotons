@@ -151,7 +151,7 @@ inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& al
         if (m.reflectsNothing) {                // a lamp seen directly: a flat white patch
             alb = alb + tint; nrm = nrm + h.n; return;
         }
-        // Follows the reflection, as the render's walks do; false where they absorb it (a
+        // Follows the reflection about n, as the render's walks do; false where they absorb it (a
         // reflection about a tilted or tipped n that leaves behind the surface): black there.
         auto mirror = [&](const Vec3& tintHere) {
             tint = mul(tint, tintHere);
@@ -177,9 +177,15 @@ inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& al
                 continue;
             }
             case MatType::Mirror:
-            case MatType::Grating:              // the zero order: the reflected image
                 if (!mirror(rgbOf([&](double L) { return reflectSlot(scene, m, h, L); }))) { nrm = nrm + h.n; return; }
                 continue;
+            case MatType::Grating: {            // the zero order: the reflected image
+                // About the true normal, as gratingDiffract builds its orders: never behind it.
+                tint = mul(tint, rgbOf([&](double L) { return reflectSlot(scene, m, h, L); }));
+                const Vec3 g = orientedGeoN(h);
+                ray = Ray{h.p + g * 1e-6, normalize(reflect(ray.d, g))};
+                continue;
+            }
             case MatType::HalfMirror: {
                 // A beam splitter reflects with probability `reflect`: take the larger branch.
                 if (reflectSlot(scene, m, h, kGuideLambda) >= 0.5) {
@@ -195,7 +201,12 @@ inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& al
                 continue;
             case MatType::Glossy:
                 if (materialRoughness(scene, m, h) < kMirrorRoughness) {
-                    if (!mirror(rgbOf([&](double L) { return reflectSlot(scene, m, h, L); }))) { nrm = nrm + h.n; return; }
+                    // The render's glossy walks end a lobe below n's plane before the true
+                    // surface is asked (`dot(o, h.n) <= 0`): black there too.
+                    if (!(dot(reflect(ray.d, h.n), h.n) > 0.0) ||
+                        !mirror(rgbOf([&](double L) { return reflectSlot(scene, m, h, L); }))) {
+                        nrm = nrm + h.n; return;
+                    }
                     continue;
                 }
                 break;

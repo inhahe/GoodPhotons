@@ -289,8 +289,10 @@ inline Hit otherSide(const Hit& h) {
 // What a sampled continuation is, which decides the side of the true surface it must leave on: a
 // reflection goes back to the side the ray arrived from, a transmission through to the other.
 // Only the sampler knows which it drew. The shading normal cannot tell: a mirror reflection about
-// a tilted n of a ray that arrived below n's plane lies below that plane as well.
-enum class Lobe { Reflect, Transmit };
+// a tilted n of a ray that arrived below n's plane lies below that plane as well. `Free` is a
+// direction no lobe drew about n -- a pass-through, a dielectric's or a grating's (built about the
+// true normal), a fiber's -- which leavesWrongSide never rejects.
+enum class Lobe { Reflect, Transmit, Free };
 
 // Does `w`, drawn as a `lobe` at a hit whose true normal on the arrival side is `ngo`
 // (orientedGeoN), leave on the wrong side of the true surface? A smoothed or normal-mapped normal
@@ -298,10 +300,9 @@ enum class Lobe { Reflect, Transmit };
 // that happens) most of it. Such a continuation would travel inside the geometry and bring back
 // light from behind it, so every walk absorbs it, as Cycles discards such samples: it contributes
 // nothing, where letting it through leaks. Absorbing without renormalizing leaves every other
-// direction's density, and so MIS, as it was. Not for a pass-through (the incoming direction
-// straight on), which no lobe drew, nor for a dielectric's or a grating's directions, which are
-// built about the true normal.
+// direction's density, and so MIS, as it was. Never true of a `Free` direction.
 inline bool leavesWrongSide(const Vec3& w, const Vec3& ngo, Lobe lobe) {
+    if (lobe == Lobe::Free) return false;
     const double c = dot(w, ngo);
     return (lobe == Lobe::Reflect) ? !(c > 0.0) : !(c < 0.0);
 }
@@ -317,17 +318,6 @@ inline bool continueAlong(const Hit& h, const Vec3& w, Lobe lobe, Ray& ray) {
     const Vec3 off = nAgrees ? h.n : ngo;
     ray = Ray{h.p + off * (dot(w, off) > 0.0 ? 1e-6 : -1e-6), w};
     return true;
-}
-
-// A photon merged at a camera vertex: `wo` toward the camera side, `wi` toward where the photon
-// came from, `ns` the shading normal the BSDF is evaluated about, `ngo` the true normal on the
-// camera's side. Does the BSDF read the pair as a reflection where the true surface makes it a
-// transmission, or the reverse? The camera arrived from ngo's side, so the pair is a true
-// reflection iff wi lies there too. Such a photon came from across the surface -- on a
-// zero-thickness sheet the photons of the far face lie within the merge radius of the near one --
-// and is not merged.
-inline bool mergeAcrossSurface(const Vec3& wo, const Vec3& wi, const Vec3& ns, const Vec3& ngo) {
-    return ((dot(wo, ns) > 0.0) == (dot(wi, ns) > 0.0)) != (dot(wi, ngo) > 0.0);
 }
 
 // Veach shading-normal ADJOINT correction factor (Veach §5.3; PBRT
@@ -398,6 +388,18 @@ inline double shadowTerminatorG(const Vec3& wi, const Vec3& ns, const Vec3& ng) 
     double g = cosNgWi / denom;
     if (g >= 1.0) return 1.0;                      // fully lit -> no darkening
     return g * g * (1.0 - g) + g;                  // Chiang cubic: -g^3 + g^2 + g
+}
+
+// Does a merge refuse a photon arriving along `wi` at a camera vertex whose true normal on the
+// camera's side is `ngo`? A one-sided surface takes no light from behind itself -- a connection
+// there takes none either (shadowTerminatorG is 0 behind the true surface) -- while the photons of
+// a zero-thickness sheet's other face lie within the merge radius, and a tilted or tipped shading
+// normal would let the BSDF take them for reflections. A two-sided one (`twoSided`: isTwoSidedMat)
+// takes light from both sides, as its connections do, so it refuses none. Only the support: the
+// terminator's softening belongs to a connection, which a merge, like a sampled continuation, is
+// not.
+inline bool mergeFromBehind(bool twoSided, const Vec3& wi, const Vec3& ngo) {
+    return !twoSided && !(dot(wi, ngo) > 0.0);
 }
 
 // Watertight ray-triangle intersection (Woop, Benthin, Wald & Áfra, "Watertight

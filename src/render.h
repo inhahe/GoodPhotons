@@ -567,7 +567,7 @@ struct Renderer {
     // NOT stored: the density estimate is Lambertian, so no gather has ever read it. Callers
     // store nothing on a light block's own surface (reflectsNothing): no gather there sees
     // anything, and every other surface within the radius would take it (known-issues
-    // J-LAMP-PHOTONS).
+    // J-LAMP-PHOTONS): the photon walks end there before any deposit.
     // `caustic` routes the record to the caustic bank when one is bound (see above), and
     // applies this photon's caustic MIS weight — 1.0 unless a dedicated caustic pass is
     // running alongside, in which case the two passes share the deposit between them.
@@ -3474,6 +3474,10 @@ struct Renderer {
                 matp = &scene.mats[child];
             }
             const Material& m = *matp;
+            // A light block's own surface ends the photon, as vcm.h's light walk does: it
+            // reflects nothing, and a photon deposited there would be gathered by every other
+            // surface within the radius (known-issues J-LAMP-PHOTONS).
+            if (m.reflectsNothing) { e.absorbed += beta; return; }
             // Specular/glossy vertices skip the camera connection (delta or
             // near-delta BSDF -> ~zero connection pdf; the SDS limitation).
             switch (m.type) {
@@ -3613,7 +3617,7 @@ struct Renderer {
                     Vec3 ngo = orientedGeoN(h);
                     Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
                     // Photon-map deposit: incident flux at this translucent vertex.
-                    if (!m.reflectsNothing) depositPhoton(h.p, ngo, lambda, beta, sawFocus && !sawScatter);
+                    depositPhoton(h.p, ngo, lambda, beta, sawFocus && !sawScatter);
                     sawScatter = true;   // whatever leaves this vertex is diffuse indirect light
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, wi, lambda, beta, rhoR, rng);
@@ -3680,7 +3684,7 @@ struct Renderer {
                     // Photon-map deposit: incident flux at this diffuse vertex. Stored
                     // BEFORE the Russian-roulette reflect/absorb so the record captures
                     // the arriving power (direct on the first hit, indirect thereafter).
-                    if (!m.reflectsNothing) depositPhoton(h.p, ngo, lambda, beta, sawFocus && !sawScatter);
+                    depositPhoton(h.p, ngo, lambda, beta, sawFocus && !sawScatter);
                     sawScatter = true;   // whatever leaves this vertex is diffuse indirect light
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lambda, beta, rho, rng);
@@ -3979,6 +3983,7 @@ struct Renderer {
                 matp = &scene.mats[child];
             }
             const Material& m = *matp;
+            if (m.reflectsNothing) { e.absorbed += activeSum(); return; }   // see tracePhoton
 
             switch (m.type) {
                 case MatType::DiffuseTransmit: {
@@ -3999,7 +4004,7 @@ struct Renderer {
                     {
                         const bool caus = sawFocus && !sawScatter;
                         for (int i = 0; i < nUp; ++i)
-                            if (!m.reflectsNothing) depositPhoton(h.p, ngo, lam[i], beta[i], caus);
+                            depositPhoton(h.p, ngo, lam[i], beta[i], caus);
                         sawScatter = true;   // past a diffuse vertex it is indirect light
                     }
                     if (nCam > 0 && !forwardCatch) {
@@ -4149,7 +4154,7 @@ struct Renderer {
                     {
                         const bool caus = sawFocus && !sawScatter;
                         for (int i = 0; i < nUp; ++i)
-                            if (!m.reflectsNothing) depositPhoton(h.p, ngo, lam[i], beta[i], caus);
+                            depositPhoton(h.p, ngo, lam[i], beta[i], caus);
                         sawScatter = true;   // past a diffuse vertex it is indirect light
                     }
                     if (nCam > 0 && !forwardCatch) {
