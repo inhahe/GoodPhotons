@@ -131,6 +131,28 @@ def tile_stats(a, b, n=4):
     return m, e
 
 
+def tile_stats_k(imgs, n=4):
+    """tile_stats over any number k >= 2 of seed images: the per-tile mean and its standard error,
+    the larger of the estimate from the k tile means (k - 1 degrees of freedom) and the per-pixel
+    one. Two seeds give the tile-means estimate one degree of freedom, which comes out several
+    times too small often enough to fake a 5-sigma tile where the noise is correlated across
+    pixels (a forward layer's splats, a fog's glow) and the per-pixel estimate is blind to it:
+    there, render more seeds."""
+    k = len(imgs)
+    if k < 2:
+        raise ValueError("tile_stats_k needs two seeds or more")
+    h, w = imgs[0].shape
+    m = np.zeros((n, n)); e = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            ts = np.stack([x[h * i // n:h * (i + 1) // n, w * j // n:w * (j + 1) // n] for x in imgs])
+            means = ts.reshape(k, -1).mean(axis=1)
+            m[i, j] = means.mean()
+            per_px = np.sqrt((ts.var(axis=0, ddof=1) / k).sum()) / ts[0].size
+            e[i, j] = max(means.std(ddof=1) / np.sqrt(k), per_px)
+    return m, e
+
+
 def tile_verdict(x1, x0, rel, z_max=5.0):
     """Compare two tile_stats (mean, standard error) pairs: the ratio x1 / x0 per tile, the
     z-scores (0 on a tile under 2 % of x0's brightest, too dark to carry information), and the

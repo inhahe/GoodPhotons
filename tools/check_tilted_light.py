@@ -27,7 +27,8 @@ plane, and its flux is Le * area * pi * (1 + cos t) / 2 for a lean of t.
    same prediction (mirror_selfie's fill is written that way).
 
 2. Fog. The aimed light over a box of fog on a floor, the same 4 x 4 tiles compared between
-   every strategy and mode R on the host: the volume's light sampling and the forward tracer's
+   every strategy and mode R on the host, four seeds each (FOG_SEEDS: the forward layers'
+   noise is correlated across pixels): the volume's light sampling and the forward tracer's
    births are separate code from the surface paths part 1 measures. Modes W (single scattering
    only, so meant to differ), U and S (surfaces only) and A (a thin-lens sensor, on its own
    exposure scale) sit this part out.
@@ -46,7 +47,13 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
-from check_glossy_nee_media import render_seeds, tile_stats, tile_verdict  # noqa: E402
+from check_glossy_nee_media import render_seeds, tile_stats, tile_stats_k, tile_verdict  # noqa: E402
+
+# The fog part's seeds. Its forward and composite layers splat each photon across many pixels,
+# so their noise is correlated and only the spread of the tile means measures it; two seeds give
+# that one degree of freedom, which faked a 5-sigma tile in mode P on the device (a 5.6 % tile
+# that doubling the photons shrank to 1.9 %). Four give it three.
+FOG_SEEDS = (1, 2, 3, 4)
 
 NL = chr(10)
 RES = (64, 48)
@@ -205,8 +212,9 @@ def main():
     # The fog's reference is always mode R on the host, rendered here whatever --modes holds;
     # mode R's own host run below reuses it (same seeds and arguments) rather than scoring it
     # against itself.
-    fog_ref = tile_stats(*render_seeds(a.exe, d, "fog_aimed.ftsl", "fog_aimed_R",
-                                       ["-mode", "R", "-n", str(a.n)], "cpu", a.spp))
+    fog_ref = tile_stats_k(render_seeds(a.exe, d, "fog_aimed.ftsl", "fog_aimed_R",
+                                        ["-mode", "R", "-n", str(a.n)], "cpu", a.spp,
+                                        seeds=FOG_SEEDS))
     for dev in devices:
         for m in a.modes:
             label = "mode %s, %s" % (m, "device" if dev == "gpu" else "host")
@@ -236,8 +244,8 @@ def main():
             if m in NO_FOG or (m == "R" and dev == "cpu"):
                 continue
             fog = render_seeds(a.exe, d, "fog_aimed.ftsl", "fog_aimed_" + tag,
-                               args + MODE_ARGS.get(m, []), dev, a.spp)
-            r, z, bad = tile_verdict(tile_stats(*fog), fog_ref, a.tol)
+                               args + MODE_ARGS.get(m, []), dev, a.spp, seeds=FOG_SEEDS)
+            r, z, bad = tile_verdict(tile_stats_k(fog), fog_ref, a.tol)
             report(not bad.any(), "%s, fog: against mode R on the host; %s"
                    % (label, worst(r, z)))
     print("PASS" if ok else "FAILED")
