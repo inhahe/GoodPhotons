@@ -8952,12 +8952,15 @@ as the one at fault.
   checks in `modeFeatureUnsupported` -- so the refusal, the fallback, the strip and the error's
   advice cannot disagree. (Mode U refuses any medium and mode S one that absorbs or scatters,
   `Medium::attenuates`; both modes check again at render time, which a built-in scene or one
-  with no camera block reaches without passing this policy.) A physical-lens camera is first routed to a lens-forming mode
-  (`lensRoutedMode`: R, or D/J); the fallback is the first of R and B that renders everything the
-  camera needs, lens included (`fallbackModeFor`; none for a fire beside a GRIN medium seen
-  through a lens, which then errors). A strip removes only what the camera's mode lacks and only what no camera of the run
-  renders (`keepFire`/`keepGrin`, computed over the selected cameras), because every camera
-  renders the one shared `Scene`. The exposure meter resolves each camera's mode with the same
+  with no camera block reaches without passing this policy.) A physical-lens camera is first
+  routed to a lens-forming mode (`lensRoutedMode`: R, D, J, A, B, C and V keep their own, P goes
+  to D or R, the rest to R); the fallback is R where it renders everything the camera needs, else
+  B, which renders every feature, projection and lens -- so every camera has one
+  (`fallbackModeFor` exits with an internal error should a change to B's scope break that). A
+  strip removes only what the camera's mode lacks and only what no camera of the run renders
+  (`keepFire`/`keepGrin`, computed over the selected cameras), because every camera renders the
+  one shared `Scene`; a camera that falls back keeps every strippable feature, so a run in which
+  one camera falls back strips nothing. The exposure meter resolves each camera's mode with the same
   functions (`renderedMode`), after the run loop applied the policy.
 - **`rng.h`** — Pcg32 + `seedUnit(rng, unitIndex, salt)` splitmix64 mixing:
   **every work unit (photon or pixel-sample) seeds its own stream**, so results are

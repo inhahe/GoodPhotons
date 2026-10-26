@@ -17484,7 +17484,7 @@ static bool modeRendersGrin(char mode) { return mode != 'D' && mode != 'J' && mo
 // wavelength at the point a single-wavelength camera ray found, exact only while that point
 // is wavelength-independent; a dispersive lens moves it per wavelength, so they would average
 // its colour fringes away.
-static bool modeFormsLensImage(char mode) {
+static constexpr bool modeFormsLensImage(char mode) {
     return mode == 'R' || mode == 'D' || mode == 'J' || mode == 'A' || mode == 'B' || mode == 'C' ||
            mode == 'V';
 }
@@ -17585,15 +17585,18 @@ static const char* sceneModeUnsupported(const ftsl::Loaded& L, char cliMode) {
     return nullptr;
 }
 
-// The -on-unsupported fallback: the first of R (the backward reference, which renders all that
-// BDPT and VCM refuse) and B (the forward tracer, which renders a fire) that renders everything
-// the camera needs, a lens included. 0 when neither does -- a fire beside a GRIN medium, seen
-// through a physical lens.
-static char fallbackModeFor(const Scene& scene, int projection, bool lens) {
-    for (char m : {'R', 'B'})
-        if ((!lens || modeFormsLensImage(m)) && !modeFeatureUnsupported(scene, m, projection))
-            return m;
-    return 0;
+// The -on-unsupported fallback: R (the backward reference, which renders all that BDPT and VCM
+// refuse) where it renders everything the camera needs, else B (the forward tracer). Both form a
+// lens image (modeFormsLensImage), and B renders every feature and projection, so every camera
+// has a fallback -- an invariant resolveCameraModes and renderedMode rely on, kept here out loud.
+static char fallbackModeFor(const Scene& scene, int projection) {
+    static_assert(modeFormsLensImage('R') && modeFormsLensImage('B'), "fallbacks form lens images");
+    if (!modeFeatureUnsupported(scene, 'R', projection)) return 'R';
+    if (const char* r = modeFeatureUnsupported(scene, 'B', projection)) {
+        std::fprintf(stderr, "internal error: mode B, every camera's last fallback, refuses %s\n", r);
+        std::exit(3);
+    }
+    return 'B';
 }
 
 // Every mode that renders what the camera needs, "A/B/C" style, for the refusal's advice.
@@ -17613,8 +17616,7 @@ static std::string modesThatRender(const Scene& scene, int projection, bool lens
 static char renderedMode(const Scene& scene, char mode, int projection, bool lens) {
     if (lens) mode = lensRoutedMode(scene, mode);
     if (!modeFeatureUnsupported(scene, mode, projection)) return mode;
-    const char f = fallbackModeFor(scene, projection, lens);
-    return f ? f : mode;
+    return fallbackModeFor(scene, projection);
 }
 
 // Best-effort feature stripping for `-on-unsupported strip`. Two features are strippable: GRIN
@@ -17647,8 +17649,8 @@ static bool stripFixes(Scene& scene, char mode, int projection, bool keepFire, b
 struct CamRequest { char mode; int projection; bool lens; const char* name; };
 
 // The `-on-unsupported` policy for every camera of a run at once. Fills `out` with the mode each
-// renders in, may strip features from `scene`, and prints what it did. False when some camera must
-// not render: the error policy, or no mode renders what it needs.
+// renders in, may strip features from `scene`, and prints what it did. False under the error
+// policy when some camera cannot render the scene in its mode (every camera has a fallback).
 //
 // A strip removes a feature from the one Scene every camera renders, so it is decided for all of
 // them together. A feature is kept when some camera ends in a mode that renders it: its own mode
@@ -17672,10 +17674,7 @@ static bool resolveCameraModes(Scene& scene, const std::vector<CamRequest>& cams
                 const CamRequest& c = cams[i];
                 char m = c.mode;
                 strip[i] = why[i] && stripFixes(scene, m, c.projection, keepFire, keepGrin);
-                if (why[i] && !strip[i]) {
-                    m = fallbackModeFor(scene, c.projection, c.lens);
-                    if (!m) continue;               // this camera fails; it renders nothing
-                }
+                if (why[i] && !strip[i]) m = fallbackModeFor(scene, c.projection);
                 kf |= modeRendersVolumeEmission(m);
                 kg |= modeRendersGrin(m);
             }
@@ -17695,29 +17694,16 @@ static bool resolveCameraModes(Scene& scene, const std::vector<CamRequest>& cams
                         "anyway.\n", c.name, why[i], c.mode);
             continue;
         }
-        // The strips the other cameras needed can leave this camera's scene renderable in its own
-        // mode (one that had no fallback, so kept nothing): `why` was judged before them.
-        if (removed && !modeFeatureUnsupported(scene, c.mode, c.projection)) {
-            std::printf("[on-unsupported=strip] camera '%s': %s, stripped for the other cameras; "
-                        "rendering in mode %c.\n", c.name, why[i], c.mode);
-            continue;
-        }
-        const char fallback = fallbackModeFor(scene, c.projection, c.lens);
-        if (g_onUnsupported == OnUnsupported::Error || !fallback) {
-            const std::string ok = modesThatRender(scene, c.projection, c.lens);
-            if (ok.empty())
-                std::fprintf(stderr, "[mode %c] camera '%s' uses %s, and no mode renders that "
-                                     "through a physical lens; drop the lens%s.\n", c.mode, c.name,
-                             why[i], g_onUnsupported == OnUnsupported::Strip
-                                      ? " (strip could not remove it: another camera renders it)"
-                                      : ", or pass -on-unsupported strip");
-            else
-                std::fprintf(stderr, "[mode %c] camera '%s' uses %s, which that mode can't "
-                                     "render; use mode %s, add a prefer{}/else{} fallback, or "
-                                     "pass -on-unsupported fallback|strip.\n", c.mode, c.name,
-                             why[i], ok.c_str());
+        // Not stripped: it falls back. (No strip can have made its own mode renderable: its
+        // fallback, R or B, renders every strippable feature, so the run keeps them all.)
+        if (g_onUnsupported == OnUnsupported::Error) {
+            std::fprintf(stderr, "[mode %c] camera '%s' uses %s, which that mode can't render; use "
+                                 "mode %s, add a prefer{}/else{} fallback, or pass -on-unsupported "
+                                 "fallback|strip.\n", c.mode, c.name, why[i],
+                         modesThatRender(scene, c.projection, c.lens).c_str());
             return false;
         }
+        const char fallback = fallbackModeFor(scene, c.projection);
         const char* kind = fallback == 'B' ? "forward light tracer" : "backward reference";
         if (g_onUnsupported == OnUnsupported::Strip)
             std::printf("[on-unsupported=strip] camera '%s': cannot strip %s for mode %c (another "

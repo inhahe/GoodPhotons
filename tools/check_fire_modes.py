@@ -23,14 +23,15 @@ and requires:
      which renders the fire, so the other must not strip it either (both images keep their fire);
   9. a fisheye camera in mode A (one rectilinear thin lens) falls back under `fallback`, and the
      refusal's advice names only the modes that render it, B and R;
- 10. a prefer{} branch whose lens camera cannot render -- routed to R, which refuses a fire
+ 10. a prefer{} branch whose lens camera cannot render -- in mode R, which refuses a fire
      beside a GRIN medium -- yields to the else{} branch, rather than being kept and aborting;
  11. `-no-media` drops the fire with the medium it is made of: mode R renders the scene black
      (its only light gone), where until 0.377.3 the fire's sampling still indexed the dropped
      medium (undefined behaviour: a crash, or the fire drawn from freed memory);
- 12. under `strip`, a lens camera in mode R that cannot render a fire beside a GRIN medium, and
-     has no fallback, renders in mode R once a mode-M camera's strip has removed the fire -- and
-     says so; until 0.377.3 it reported that it could not strip, and fell back to R;
+ 12. under `strip`, a lens camera in mode R that cannot render a fire beside a GRIN medium falls
+     back to mode B, which forms the lens image (since 0.394.0: every camera has a fallback), and
+     its fallback keeps the fire for the run -- the mode-M camera falls back too rather than strip
+     a fire the other renders, and both images show it;
  13. mode W's `-ambient` fills a floor the fire alone lights (its scale counts the fire as a
      light); until 0.377.3 it was zero there, so `-ambient 0.3` changed nothing;
  14. a fire that emits nothing (`emission_scale 0`) is smoke, said so at load: mode M renders it
@@ -106,7 +107,7 @@ def main():
         "firefish.ftsl": ['camera "cam" { %s  projection fisheye  mode A }' % view],
         # A GRIN medium away from the view: mode R then refuses the fire beside it.
         "firepref.ftsl": ['prefer {',
-                          '    camera "cam" { %s  mode B  lens { preset achromat  focal 50  fstop 2.8 } }'
+                          '    camera "cam" { %s  mode R  lens { preset achromat  focal 50  fstop 2.8 } }'
                           % view,
                           '} else {',
                           '    camera "cam" { %s  mode B }' % view,
@@ -117,7 +118,7 @@ def main():
         "firefloor.ftsl": ['camera "cam" { %s }' % view,
                            'material "floor" { type diffuse  reflect 0.6 }',
                            'quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material floor }'],
-        # The same GRIN medium; the lens camera has no fallback, the mode-M one strips the fire.
+        # The same GRIN medium; the lens camera falls back to B, so the mode-M one cannot strip.
         "firestrip.ftsl": ['camera "a" { %s  mode R  lens { preset achromat  focal 50  fstop 2.8 } }'
                            % view,
                            'camera "m" { %s  mode M }' % view,
@@ -236,13 +237,18 @@ def main():
     ok &= good
     print("%s: a prefer branch whose lens camera cannot render yields to else (exit %d, mean %s)"
           % ("ok" if good else "FAIL", rc, mean))
-    rc, log, _ = run("stripother", ["-on-unsupported", "strip"], scene="firestrip.ftsl",
-                     out="stripother_a")
-    good = (rc == 0 and "camera 'a': volumetric emission" in log and
-            "stripped for the other cameras; rendering in mode R" in log and "cannot strip" not in log)
+    pm = os.path.join(d, "stripother_m.pfm")   # run() clears only the `out` camera's image
+    if os.path.exists(pm):
+        os.remove(pm)
+    rc, log, ma = run("stripother", ["-on-unsupported", "strip"], scene="firestrip.ftsl",
+                      out="stripother_a")
+    mm = read_pfm_mean(pm) if rc == 0 and os.path.exists(pm) else None
+    good = (rc == 0 and "camera 'a': cannot strip" in log and "camera 'm': cannot strip" in log and
+            log.count("-> mode B") == 2 and "stripped" not in log and
+            ma is not None and mm is not None and ma > 0.0 and mm > 0.0)
     ok &= good
-    print("%s: a camera the other cameras' strips made renderable says so (exit %d)" % (
-        "ok" if good else "FAIL", rc))
+    print("%s: a lens camera no strip fixes falls back to B, and the run keeps its fire "
+          "(exit %d, means a %s, m %s)" % ("ok" if good else "FAIL", rc, ma, mm))
     if not good:
         print(log[-1200:])
     rc0, _, m0 = run("amb0", ["-mode", "W"], scene="firefloor.ftsl")

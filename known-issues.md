@@ -2044,7 +2044,9 @@ Fable (xhigh) found the fire's fiber clearance and the sampler cost as well, and
 - **STRIP-OTHER.** Under `-on-unsupported strip`, a camera with no fallback (a lens camera in mode R,
   a fire beside a GRIN medium) whose feature another camera's strip removed was judged on the scene
   before the strips: it said it could not strip and "fell back" to its own mode. It is re-judged
-  after them (`tools/check_fire_modes.py`, case 12).
+  after them (`tools/check_fire_modes.py`, case 12). Moot since 0.394.0: mode B forms a lens
+  image, so every camera has a fallback, and one that falls back keeps every strippable feature;
+  the re-judging branch was removed on 2026-10-26 and case 12 checks the fallback instead.
 - **AMBIENT-FIRE.** Mode W's `-ambient` (and `-gi-clamp`) scale, `Scene::ambientRef`, counted the
   emitters alone, so in a fire-lit scene it was zero (nothing added, without a word) or
   mis-scaled. A fire counts as a light of geometric weight 4 pi V^(2/3), normalised by `camG`
