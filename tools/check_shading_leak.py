@@ -7,10 +7,12 @@ away from the true surface can land on the surface's other side, travel inside o
 geometry, and bring back light from there. Every walk absorbs such a continuation
 (geometry.h crossesSurface). This renders an opaque horizontal sheet, seen from above, lit
 ONLY from below -- no path brings that light to its top side except through it -- against
-the same sheet lit from above, which sets the scale. Lit from below two ways: by a lamp, wide
-and close, so a continuation that dips just under the sheet reaches it too; and by a floor a
-lamp hidden under the sheet lights, so a continuation that crosses brings back what the floor's
-own light sampling finds there -- the path a kernel that lights by NEE alone follows:
+the same sheet lit from above, which sets the scale. Lit from below three ways: by a lamp, wide
+and close, so a continuation that dips just under the sheet reaches it too; by a floor a lamp
+hidden under the sheet lights, so a continuation that crosses brings back what the floor's own
+light sampling finds there -- the path a kernel that lights by NEE alone follows; and by the
+same with the lamp 5 cm under the sheet, within the merge radius of modes J and U, where a
+photon stored on the lamp itself was merged by the sheet (bdpt.h surfMergeSite). The sheets:
 
   mapped   a quad under a ripple normal map tilting its normal up to about 40 degrees;
   tipped   the same under a map tilting it past 90 degrees (texels with blue below 0.5), so
@@ -86,12 +88,15 @@ def scenes(out):
     # Below: wide and close, so even a continuation that dips just under the sheet finds it.
     lamps = {"below": 'light area { origin -10 -0.3 -10  u 20 0 0  v 0 0 20  normal 0 1 0  spd preset:bb6500  power 10000 }\n',
              # a lit floor below instead: a crossing continuation brings back what a lamp under
-             # the sheet lights there (paths a kernel lighting by NEE alone also follow). The
-             # lamp sits farther below the sheet than mode J's merge radius (0.28 here): closer,
-             # J merges photons from it across the gap whatever the shading normal does -- a
-             # different defect (known-issues J-MERGE-PROXIMITY).
+             # the sheet lights there (paths a kernel lighting by NEE alone also follow).
              "floor": ('quad { origin -10 -0.8 -10  u 0 0 20  v 20 0 0  material lit }\n'
                        'light area { origin -0.3 -0.4 -0.3  u 0 0 0.6  v 0.6 0 0  normal 0 -1 0  spd preset:bb6500  power 200 }\n'),
+             # the same lamp 5 cm under the sheet, well within the merge radius (0.28 here): the
+             # light the floor sends back up lands on the lamp's back face, and a photon stored
+             # there was merged by the sheet's top in mode J, whatever its shading normal
+             # (known-issues J-LAMP-PHOTONS).
+             "near": ('quad { origin -10 -0.5 -10  u 0 0 20  v 20 0 0  material lit }\n'
+                      'light area { origin -0.3 -0.05 -0.3  u 0 0 0.6  v 0.6 0 0  normal 0 -1 0  spd preset:bb6500  power 200 }\n'),
              # off to the side, out of the camera's view, aimed at the sheet
              "above":'light area { origin 1.2 1.2 -0.6  u 0 0 1.2  v 0.6 0 0  normal -0.6 -0.8 0  spd preset:bb6500  power 50 }\n'}
     quad = 'quad { origin -1 0 -1  u 0 0 2  v 2 0 0  material m }\n'          # faces up (u x v)
@@ -132,7 +137,7 @@ def main():
     for tag, args in MODES:
         for name in ("mapped", "tipped", "smooth"):
             top = {}
-            for side in ("below", "floor", "above"):
+            for side in ("below", "floor", "near", "above"):
                 png = os.path.join(out, "%s_%s_%s.png" % (name, side, tag))
                 for stale in (png, png[:-4] + ".pfm"):
                     if os.path.exists(stale):
@@ -146,9 +151,9 @@ def main():
                 img = read_pfm(png[:-4] + ".pfm")
                 h, w = img.shape
                 top[side] = float(img[h // 4: 3 * h // 4, w // 4: 3 * w // 4].mean())   # the sheet's middle
-            if len(top) < 3:
+            if len(top) < 4:
                 continue
-            for side in ("below", "floor"):
+            for side in ("below", "floor", "near"):
                 ratio = top[side] / max(top["above"], 1e-30)
                 good = top["above"] > 0 and ratio < 1e-3
                 ok &= good

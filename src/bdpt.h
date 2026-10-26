@@ -2273,8 +2273,14 @@ inline bool surfMergeSite(const Vertex& v) {
     // camera vertex IS a disc; on a strand a radius wide the disc is mostly empty space, so a
     // DIFFUSE curve -- a coat of `type diffuse` fur, grass, wire -- read 0.80 of mode R through the
     // merges. `hit.fiberRadius > 0` is set by curve intersection and nothing else (curve.h).
+    //
+    // NOR ON A LIGHT BLOCK'S OWN SURFACE (`reflectsNothing`), where VCM stores no light vertex
+    // and mode M deposits nothing either. A merge there contributes nothing (it reflects
+    // nothing), but a photon stored there is gathered by every OTHER surface within the radius:
+    // a sheet 5-20 cm above a downward lamp over a lit floor read 14-40% of its lit brightness
+    // on top, from photons the floor sent back onto the lamp's back face.
     return v.type == VType::Surface && !v.delta && v.mat && isConnectibleMat(*v.mat) &&
-           !isFiberMat(*v.mat) && !(v.hit.fiberRadius > 0.0);
+           !v.mat->reflectsNothing && !isFiberMat(*v.mat) && !(v.hit.fiberRadius > 0.0);
 }
 inline double mergeEtaPrimeSurf(const Vertex& v, double pLight) {
     if (!surfMergeSite(v)) return 0.0;

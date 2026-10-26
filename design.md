@@ -5421,6 +5421,15 @@ as the one at fault.
   actually landed, so there is no ray to march and **no RNG draw** — which keeps "merges off ==
   mode `D` bit-for-bit" true for free.
 
+  **Where a photon may lie is one predicate**, `surfMergeSite` (`dSurfMergeSite` on the device),
+  read by the store, the gather and the merge's MIS η term alike, so a site one of them counts and
+  another ignores cannot arise: a non-delta connectible surface vertex, not on a strand or any curve
+  (VCM-THIN-CURVES), and not on a light block's own surface (`reflectsNothing`, 0.400.6). A merge
+  there contributes nothing, but a photon stored there is gathered by every other surface within
+  the radius -- a sheet 5-20 cm over a downward lamp read 14-40 % of its lit brightness through
+  the photons the floor sent back onto the lamp's back face (known-issues J-LAMP-PHOTONS). VCM
+  stores no light vertex there and mode `M` deposits nothing, for the same reason.
+
   **The radius shrinks per light-side epoch, and that is a correctness property, not a tuning
   knob.** `main.cpp`'s `surfRadiusFor(epoch)` applies Georgiev/SmallVCM's schedule
   `r_e = r_0·(e+1)^((α−1)/2)` under the same `-vcmalpha` mode `U` uses, mode `J`'s refresh epoch

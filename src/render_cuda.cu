@@ -11977,10 +11977,13 @@ __device__ static inline bool dConnectibleType(int tp) {
 // so a diffuse curve (a coat of `type diffuse` fur, grass, wire) read 0.80 of mode R. `fiberR > 0`
 // is set for every curve hit and nothing else (the walk copies DHit::fiberRadius). One predicate
 // gates the store, the gather and the MIS eta terms, so the exclusion is consistent by construction.
+// Nor on a light block's own surface (matReflectsNothing): a photon stored there is gathered by
+// every other surface within the radius (bdpt.h).
 __device__ static inline bool dSurfMergeSite(const DScene& sc, const DVertex& v) {
     if (v.type != BV_SURFACE || v.delta || v.matId < 0) return false;
-    const int tp = sc.mats[v.matId].type;
-    return dConnectibleType(tp) && tp != D_HAIR && !(v.fiberR > (Real)0);
+    const DMaterial& m = sc.mats[v.matId];
+    return dConnectibleType(m.type) && m.type != D_HAIR && !m.matReflectsNothing &&
+           !(v.fiberR > (Real)0);
 }
 
 // bdpt.h connOrigin / connFiberStep twins for a BDPT vertex (dFiberConnOrigin / dFiberStep take a

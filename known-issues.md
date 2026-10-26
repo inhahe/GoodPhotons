@@ -194,23 +194,41 @@ faces away). BSDF continuations: see CONTINUATION-LEAK.
 Found by the Opus review of 0.400.1; -checkdevhits holds orientedGeoN to the ray's side on
 every hit and the device's dShadedNg to it.
 
-## OPEN (2026-10-25, 0.400.5): J-MERGE-PROXIMITY — modes J and U merge photons from a surface closer than the merge radius
+## OPEN (2026-10-26): MERGE-PROXIMITY — a density estimate gathers photons from every surface within its radius; mode M's adaptive radius makes that a large leak
 
-A surface merge (J's `dSurfMergeAt` and its host twin in bdpt.h, the VCM gathers) takes every
-stored photon within the merge radius of the camera vertex, whatever surface it lies on. A
-second surface closer than the radius -- the far face of a thin slab, a lamp or a floor tucked
-under a sheet -- contributes photons that arrived from directions the vertex's BSDF accepts:
-light leaks across the gap. Found while building tools/check_shading_leak.py: a sheet with a
-lamp 5 cm under it (the merge radius auto-sized to 0.28 m in that scene) read 8-18% of its lit
-brightness on top in mode J, and exactly 0 with `-nojsurf` or with the lamp 0.4 m down. The
-check now keeps its lamp beyond the radius, so it measures the shading-normal leak alone. The
-host photon map guards against this by comparing the photon's stored normal with the hit's
-(`dot(ph.n, h.n) < 0.5`); J's DSurfPhoton stores no normal. Proper fix: store the deposit's
-geometric normal (DSurfPhoton is 48 B; a packed normal adds 4-6) and reject a photon whose
-surface faces away from the vertex's, or flatten the gather to a disc about the vertex's
-tangent plane -- the second costs no storage but darkens tightly curved surfaces, whose photons
-leave the plane within the radius. Pre-existing: the classic proximity bias of photon mapping,
-shrinking as the radius does over iterations (-vcmalpha).
+Every photon gather (mode M's `queryR`, S's, U's VCM merge, J's surface merge) takes the photons
+within a sphere of its radius, whatever surface they lie on. Its only filter is a normal test
+(M: `dot(ph.n, h.n) >= 0.5`; J and U: the crossing test of 0.400.5), which a second surface
+facing the same way passes: a table top gathers the floor's photons once the radius exceeds its
+height. Mode M's density-adaptive radius (`-pmauto`, the default) grows to hold `-pmcount`
+photons, and in a sparsely lit scene it outgrows the gaps between surfaces. Measured on an
+opaque 2 m sheet 0.5 m over a lit floor, lamp hidden under the sheet (to reproduce: the
+check_shading_leak "floor" scene with the floor at y = -0.5): the radius grew 0.28 -> 1.13 m and
+the sheet's top read **21x** its brightness lit from above, where mode R reads 0; `-nopmauto`
+(0.28 m) and `-pmcount 20` both read 0. Proper fix: reject a photon off the gather point's
+tangent plane -- `|dot(ph.p - x, n_x)|` above a tolerance -- where the tolerance follows the
+surface's own bending so a curved surface keeps its photons: on a smooth surface a photon at
+distance d whose normal is turned by theta from n_x lies about d*sin(theta)/2 off the plane, so
+accept up to `tau*r + c*d*sin(theta)` (c a safety factor near 1). Mode M stores `ph.n`; U's light
+vertices carry `ng`; J's DSurfPhoton (48 B) needs a packed normal. Check against
+tools/check_bitid.py, and on a corner scene (the classic proximity bias brightens corners and
+darkens edges: both should move toward mode R).
+
+## DONE (2026-10-26, 0.400.6): J-LAMP-PHOTONS — mode J stored photons on a light block's own surface, and every surface within the merge radius merged them
+
+Found while building tools/check_shading_leak.py in 0.400.5 and logged then as J-MERGE-PROXIMITY,
+with the wrong cause: a sheet 5-20 cm over a downward lamp, over a lit floor, read 14-40 % of
+its lit brightness on top in mode J (flat, smooth or normal-mapped alike), 0 in mode U, and 0
+with the lamp 0.4 m down, with no floor, or with the lamp moved out from under the measured
+area. A `light area` is two real triangles (`reflectsNothing`): J's walk records a vertex where a
+light subpath strikes one, and `surfMergeSite` accepted it, so the photons the floor sent back
+onto the lamp's back face were stored there and gathered by the sheet above. VCM stores no light
+vertex there and mode M deposits nothing. `surfMergeSite` / `dSurfMergeSite` now refuse a light
+block's surface; the one predicate gates the store, the gather and the MIS eta term, and a merge
+there contributed nothing anyway (it reflects nothing). check_shading_leak's "near" lighting is
+the regression case (all six J cases failed on 0.400.5); check_bitid's 24 cases stay
+byte-identical. Not the proximity bias proper (MERGE-PROXIMITY, above): mode J's starting radius
+is fixed and shrinks.
 
 ## DONE (2026-10-25, 0.400.5): CONTINUATION-LEAK — light leaked through surfaces whose shading normal leans away from them, in the bidirectional modes and at tipped normals
 
