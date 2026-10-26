@@ -2266,7 +2266,7 @@ struct BackwardRenderer {
                 // deterministic preview converges at 1 spp where RR needs tens.
                 if (whitted) { if (!wAtt(r)) return false; }
                 else if (rng.uniform() >= r) return false;      // RR absorb
-                if (!continueAlong(h, reflect(ray.d, h.n), ray)) return false;   // across the surface
+                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return false;   // across the surface
                 specularArrival = true; return true;
             }
             case MatType::Grating: {
@@ -2296,9 +2296,9 @@ struct BackwardRenderer {
                     const bool refl = (r >= 0.5);
                     if (!wAtt(refl ? r : 1.0 - r)) return false;
                     if (!refl) ray = Ray{h.p + ray.d * 1e-6, ray.d};
-                    else if (!continueAlong(h, reflect(ray.d, h.n), ray)) return false;
+                    else if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return false;
                 } else if (rng.uniform() < r) {
-                    if (!continueAlong(h, reflect(ray.d, h.n), ray)) return false;
+                    if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return false;
                 } else ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 specularArrival = true; return true;
             }
@@ -2363,7 +2363,7 @@ struct BackwardRenderer {
                         gm->from = h.p;
                         gm->n = h.n;
                     }
-                    if (!continueAlong(h, o, ray)) return false;
+                    if (!continueAlong(h, o, Lobe::Reflect, ray)) return false;
                     specularArrival = true; return true;
                 }
                 if (rng.uniform() >= r) return false;
@@ -2375,7 +2375,7 @@ struct BackwardRenderer {
                     gm->from = h.p;
                     gm->n = h.n;
                 }
-                if (!continueAlong(h, o, ray)) return false;
+                if (!continueAlong(h, o, Lobe::Reflect, ray)) return false;
                 specularArrival = true; return true;
             }
             case MatType::Fluorescent: {
@@ -2440,7 +2440,7 @@ struct BackwardRenderer {
                 if (u < rhoEl) {                             // elastic continuation
                     Vec3 wOut = cosineHemisphere(h.n, rng);
                     contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
-                    if (!continueAlong(h, wOut, ray)) return false;
+                    if (!continueAlong(h, wOut, Lobe::Reflect, ray)) return false;
                     specularArrival = false; return true;
                 } else if (u < rhoEl + pF) {                 // fluoro (wavelength-switched)
                     thr *= wFluo / pF;
@@ -2448,7 +2448,7 @@ struct BackwardRenderer {
                     invPdfLambda = invPdfIn;
                     Vec3 wOut = cosineHemisphere(h.n, rng);
                     contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
-                    if (!continueAlong(h, wOut, ray)) return false;
+                    if (!continueAlong(h, wOut, Lobe::Reflect, ray)) return false;
                     specularArrival = false; return true;
                 }
                 return false;                                // absorbed / terminated
@@ -2567,12 +2567,12 @@ struct BackwardRenderer {
                 if (u < rhoR) {                          // reflect continuation (front)
                     Vec3 wOut = cosineHemisphere(h.n, rng);
                     contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
-                    if (!continueAlong(h, wOut, ray)) return false;
+                    if (!continueAlong(h, wOut, Lobe::Reflect, ray)) return false;
                     specularArrival = false; return true;
                 } else if (u < sum) {                    // transmit continuation (back)
                     Vec3 wOut = cosineHemisphere(-h.n, rng);
                     contBsdfPdf = std::max(0.0, dot(wOut, -h.n)) / PI;
-                    if (!continueAlong(h, wOut, ray)) return false;
+                    if (!continueAlong(h, wOut, Lobe::Transmit, ray)) return false;
                     specularArrival = false; return true;
                 }
                 return false;                            // absorbed / terminated
@@ -2594,7 +2594,7 @@ struct BackwardRenderer {
                 if (rng.uniform() >= rho) return false;
                 Vec3 wOut = cosineHemisphere(h.n, rng);
                 contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
-                if (!continueAlong(h, wOut, ray)) return false;
+                if (!continueAlong(h, wOut, Lobe::Reflect, ray)) return false;
                 specularArrival = false; return true;
             }
         }
@@ -2856,7 +2856,7 @@ struct BackwardRenderer {
                         Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
                                                   materialRoughness(scene, cm, h), gi.sIdx, b);
                         if (dot(o, h.n) <= 0) return L;
-                        if (!continueAlong(h, o, ray)) return L;
+                        if (!continueAlong(h, o, Lobe::Reflect, ray)) return L;
                         specularArrival = true;
                         gmis.clear();      // the sheen does no NEE: its arrival is unweighted
                         continue;
@@ -2869,7 +2869,7 @@ struct BackwardRenderer {
                 if (rng.uniform() < R) {
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, cm, h), rng);
                     if (dot(o, h.n) <= 0) return L;
-                    if (!continueAlong(h, o, ray)) return L;
+                    if (!continueAlong(h, o, Lobe::Reflect, ray)) return L;
                     specularArrival = true;
                     // The sheen does no NEE, so what it reaches counts at full weight: an earlier
                     // glossy bounce's MIS record must not outlive it (interactMaterial, which
@@ -3353,7 +3353,7 @@ struct BackwardRenderer {
                                  : sampleGlossy(reflect(ray.d, h.n),
                                                 materialRoughness(scene, cm, h), rng);
                     if (dot(o, h.n) <= 0) { finish(); return; }
-                    if (!continueAlong(h, o, ray)) { finish(); return; }
+                    if (!continueAlong(h, o, Lobe::Reflect, ray)) { finish(); return; }
                     specularArrival = true;
                     gmis.clear();                // no NEE here: see the scalar twin
                     continue;
@@ -3440,13 +3440,13 @@ struct BackwardRenderer {
                         for (int i = 0; i < nUp; ++i) thr[i] *= rhoR[i] / qR;
                         Vec3 wOut = cosineHemisphere(h.n, rng);
                         contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
-                        if (!continueAlong(h, wOut, ray)) { finish(); return; }
+                        if (!continueAlong(h, wOut, Lobe::Reflect, ray)) { finish(); return; }
                         specularArrival = false; break;
                     } else if (u < sumHero) {                    // transmit (back)
                         for (int i = 0; i < nUp; ++i) thr[i] *= rhoT[i] / qT;
                         Vec3 wOut = cosineHemisphere(-h.n, rng);
                         contBsdfPdf = std::max(0.0, dot(wOut, -h.n)) / PI;
-                        if (!continueAlong(h, wOut, ray)) { finish(); return; }
+                        if (!continueAlong(h, wOut, Lobe::Transmit, ray)) { finish(); return; }
                         specularArrival = false; break;
                     }
                     finish(); return;                            // absorbed
@@ -3496,7 +3496,7 @@ struct BackwardRenderer {
                         for (int i = 0; i < nUp; ++i) thr[i] *= c[i] / q;
                     }
                     if (m.type == MatType::Mirror) {
-                        if (!continueAlong(h, reflect(ray.d, h.n), ray)) { finish(); return; }
+                        if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) { finish(); return; }
                     } else if (m.type == MatType::Filter) {
                         ray = Ray{h.p + ray.d * 1e-6, ray.d};       // direction unchanged
                     } else if (whitted) {
@@ -3509,7 +3509,7 @@ struct BackwardRenderer {
                             gmis.from = h.p;
                             gmis.n = h.n;
                         }
-                        if (!continueAlong(h, o, ray)) { finish(); return; }
+                        if (!continueAlong(h, o, Lobe::Reflect, ray)) { finish(); return; }
                     } else {
                         Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                         if (dot(o, h.n) <= 0) { finish(); return; }
@@ -3518,7 +3518,7 @@ struct BackwardRenderer {
                             gmis.from = h.p;
                             gmis.n = h.n;
                         }
-                        if (!continueAlong(h, o, ray)) { finish(); return; }
+                        if (!continueAlong(h, o, Lobe::Reflect, ray)) { finish(); return; }
                     }
                     specularArrival = true;
                     break;
@@ -3806,7 +3806,7 @@ struct BackwardRenderer {
                     for (int i = 0; i < nUp; ++i) thr[i] *= rho[i] / q;   // bounded reweight
                     Vec3 wOut = cosineHemisphere(h.n, rng);
                     contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
-                    if (!continueAlong(h, wOut, ray)) { finish(); return; }
+                    if (!continueAlong(h, wOut, Lobe::Reflect, ray)) { finish(); return; }
                     specularArrival = false; break;
                 }
             }

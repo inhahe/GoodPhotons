@@ -475,7 +475,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
             GaDiagMat& g = gaDiag()[matId];
             if (!(h.valid && h.t <= 2.0 * r))          g.miss.fetch_add(1, std::memory_order_relaxed);
             else {
-                if (dot(h.n, n) < 0.5) g.reject.fetch_add(1, std::memory_order_relaxed);
+                if (dot(orientedGeoN(h), n) < 0.5) g.reject.fetch_add(1, std::memory_order_relaxed);
                 else                   g.accept.fetch_add(1, std::memory_order_relaxed);
                 // Depth below the tangent plane, over ANY hit (accepted or rejected) -- the
                 // question is where the geometry is, not which way it faces.
@@ -484,10 +484,11 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 if (depth > 0.25) g.deep.fetch_add(1, std::memory_order_relaxed);
             }
         }
-        // Same 60-degree acceptance the photon query uses (dot(ph.n, h.n) < 0.5 rejects), so the
-        // footprint and the estimator agree on what surface is "here".
+        // Same 60-degree acceptance the photon query uses (dot(ph.n, n) < 0.5 rejects, both the
+        // true normal on the side the light arrives from), so the footprint and the estimator
+        // agree on what surface is "here".
         if (h.valid && h.t <= 2.0 * r) {
-            const double c = dot(h.n, n);
+            const double c = dot(orientedGeoN(h), n);
             // THE PROJECTION JACOBIAN, and it is not a refinement -- without it the correction
             // overshoots badly on exactly the geometry it is for. The probe samples uniformly in
             // the TANGENT PLANE, so it measures PROJECTED area; the estimator needs SURFACE
@@ -1249,7 +1250,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 // in which case 1/(pi r_q^2 N) is recomputed for this query's own radius.
                 auto est = [&](const PhotonMap& M, double normFixed, double& nrmOut) {
                     MStatTimer _t(&mStats().surfNs, &mStats().surfN);
-                    const double rq = M.adaptiveRadius(h.p, h.n);
+                    const double rq = M.adaptiveRadius(h.p, orientedGeoN(h));
                     nrmOut = normFixed;
                     if (rq != M.radius) {
                         const double a = PI * rq * rq;
@@ -1261,11 +1262,11 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                     // leaves nrmOut untouched, so every existing render is bit-identical.
                     if (const int gaM = gatherAreaSamples())
                         nrmOut *= gatherAreaScale(
-                            gatherCoverage(scene, h.p, h.n, rq, rng, gaM, h.matId,
+                            gatherCoverage(scene, h.p, orientedGeoN(h), rq, rng, gaM, h.matId,
                                            h.fiberRadius));
                     Vec3 g{0, 0, 0};
                     M.queryR(h.p, rq, [&](const Photon& ph, double, int k) {
-                        if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
+                        if (dot(ph.n, orientedGeoN(h)) < 0.5) return;    // another surface's photon
                         double rhoY = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                         double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, ph.lambda));
                         double f = rhoY * (1.0 / PI);
@@ -1283,7 +1284,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             }
             case MatType::Mirror: {
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
-                if (!continueAlong(h, reflect(ray.d, h.n), ray)) return L;   // across the surface
+                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return L;   // across the surface
                 break;
             }
             case MatType::Glossy: {
@@ -1306,7 +1307,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                     gmis.from = h.p;
                     gmis.n = h.n;
                 }
-                if (!continueAlong(h, o, ray)) return L;
+                if (!continueAlong(h, o, Lobe::Reflect, ray)) return L;
                 break;
             }
             case MatType::Dielectric:
@@ -1324,7 +1325,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             }
             case MatType::HalfMirror: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
-                if (rng.uniform() < r) { if (!continueAlong(h, reflect(ray.d, h.n), ray)) return L; }
+                if (rng.uniform() < r) { if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return L; }
                 else                   ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 break;
             }
@@ -1368,7 +1369,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             }
             default: {                                   // Grating: approx reflect
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
-                if (!continueAlong(h, reflect(ray.d, h.n), ray)) return L;   // across the surface
+                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return L;   // across the surface
                 break;
             }
         }
@@ -1616,7 +1617,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     Vec3 fg{0, 0, 0};
                     for (int k = 0; k < fgRays; ++k) {
                         Ray gr;   // a gather ray across the surface gathers nothing
-                        if (!continueAlong(h, cosineHemisphere(h.n, rng), gr)) continue;
+                        if (!continueAlong(h, cosineHemisphere(h.n, rng), Lobe::Reflect, gr)) continue;
                         fg += photonGatherSub(scene, pm, gr, rng, diffraction, maxBounce,
                                               lambda, invPdfL, norm, h, m,
                                               causOn ? pmC : nullptr, normC);
@@ -1632,7 +1633,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 // see the twin in photonGatherSub and PhotonMap::adaptiveRadius.
                 auto est = [&](const PhotonMap& M, double normFixed, double& nrmOut) {
                     MStatTimer _t(&mStats().surfNs, &mStats().surfN);
-                    const double rq = M.adaptiveRadius(h.p, h.n);
+                    const double rq = M.adaptiveRadius(h.p, orientedGeoN(h));
                     nrmOut = normFixed;
                     if (rq != M.radius) {
                         const double a = PI * rq * rq;
@@ -1644,11 +1645,11 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     // leaves nrmOut untouched, so every existing render is bit-identical.
                     if (const int gaM = gatherAreaSamples())
                         nrmOut *= gatherAreaScale(
-                            gatherCoverage(scene, h.p, h.n, rq, rng, gaM, h.matId,
+                            gatherCoverage(scene, h.p, orientedGeoN(h), rq, rng, gaM, h.matId,
                                            h.fiberRadius));
                     Vec3 g{0, 0, 0};
                     M.queryR(h.p, rq, [&](const Photon& ph, double, int k) {
-                        if (dot(ph.n, h.n) < 0.5) return;    // reject cross-surface leakage
+                        if (dot(ph.n, orientedGeoN(h)) < 0.5) return;    // another surface's photon
                         double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                         double f = rho * (1.0 / PI);
                         // SPECGATHER: the walk's reflectances belong at THIS photon's wavelength,
@@ -1667,7 +1668,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 thr *= r;
                 sthr.mul([&](double L) { return clamp01(reflectSlot(scene, m, h, L)); }, r);
-                if (!continueAlong(h, reflect(ray.d, h.n), ray)) return L;   // across the surface
+                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return L;   // across the surface
                 break;
             }
             case MatType::Glossy: {
@@ -1705,7 +1706,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     gmis.from = h.p;
                     gmis.n = h.n;
                 }
-                if (!continueAlong(h, o, ray)) return L;
+                if (!continueAlong(h, o, Lobe::Reflect, ray)) return L;
                 break;
             }
             case MatType::Dielectric:
@@ -1731,7 +1732,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             case MatType::HalfMirror: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 const bool refl = rng.uniform() < r;
-                if (refl) { if (!continueAlong(h, reflect(ray.d, h.n), ray)) return L; }
+                if (refl) { if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return L; }
                 else      ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 // SPECGATHER: the coin at each photon's wavelength -- a coloured half mirror
                 // reflects each wavelength by its own reflectance.
@@ -1842,7 +1843,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 thr *= r;
                 sthr.mul([&](double Lw) { return clamp01(reflectSlot(scene, m, h, Lw)); }, r);
-                if (!continueAlong(h, reflect(ray.d, h.n), ray)) return L;   // across the surface
+                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return L;   // across the surface
                 break;
             }
         }

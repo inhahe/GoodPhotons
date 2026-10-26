@@ -1332,7 +1332,11 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // past them; only their per-λ reflectance/transmittance differs. Those set
         // `keepBundle` to opt out of the `if (delta) nUp = 1` collapse below.
         bool delta = false, terminate = false, keepBundle = false;
-        bool aboutNs = false;   // wi was sampled about the shading normal (crossesSurface applies)
+        // What wi is, for leavesWrongSide: a reflection unless the case says otherwise -- a lobe
+        // drawn through the surface sets Transmit, and a direction no lobe drew about the shading
+        // normal (a pass-through; a dielectric's, a grating's or a fiber's) sets `freeSide`.
+        Lobe lobe = Lobe::Reflect;
+        bool freeSide = false;
         bool collapse = false;   // a connectible vertex whose continuation goes on with the hero alone
         // THE SPECTRAL-CLAIM RULE, surface half (see the medium half above, and render.h's
         // foldWorthIt / foldApply — ONE rule, because both tracers fill the same beam bank).
@@ -1356,7 +1360,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         switch (mp->type) {
             case MatType::Diffuse:
             case MatType::Fluorescent: {              // elastic base only (see header)
-                wi = cosineHemisphere(cur.ns, rng); aboutNs = true;
+                wi = cosineHemisphere(cur.ns, rng);
                 if (dot(wi, cur.ns) <= 0) { terminate = true; break; }
                 double rho = clamp01(diffuseReflectance(scene, *mp, h, lambda));
                 pdfW = bsdfPdf(*mp, cur.ns, wo, wi, lambda, scene, &h);
@@ -1390,7 +1394,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             }
             case MatType::Glossy: {
                 Vec3 mdir = reflect(ray.d, cur.ns);   // ray.d == -wo (incoming dir)
-                wi = sampleGlossy(mdir, materialRoughness(scene, *mp, h), rng); aboutNs = true;
+                wi = sampleGlossy(mdir, materialRoughness(scene, *mp, h), rng);
                 if (dot(wi, cur.ns) <= 0) { terminate = true; break; }
                 double r = clamp01(reflectSlot(scene, *mp, h, lambda));
                 // FOLD-GLOSSY (0.260.1): the lobe's direction is wavelength-free, so the claim
@@ -1464,7 +1468,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 }
                 if (reflLobe) wi = cosineHemisphere(cur.ns, rng);          // reflect
                 else          wi = cosineHemisphere(cur.ns * -1.0, rng);   // transmit
-                aboutNs = true;
+                if (!reflLobe) lobe = Lobe::Transmit;
                 pdfW    = bsdfPdf(*mp, cur.ns, wo, wi, lambda, scene, &h);
                 pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
                 betaFactor = tot;                     // f*cos/pdf = rhoR+rhoT
@@ -1491,7 +1495,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
                                              rng.uniform(), rng.uniform(), pdfH, fv, &la);
                 if (!(pdfH > 0.0) || !(fv > 0.0)) { terminate = true; break; }
-                wi = hair::toWorld(hs.fr, wl);
+                wi = hair::toWorld(hs.fr, wl); freeSide = true;
                 // A coverage pass-through returns EXACTLY -wo: the ray was never intercepted.
                 // That is a DELTA vertex in this file's own sense -- it carries the chain but
                 // cannot be connected to, because its outgoing direction is fixed and its pdf
@@ -1580,7 +1584,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             }
             case MatType::Mirror: {
                 double r = clamp01(reflectSlot(scene, *mp, h, lambda));
-                wi = reflect(ray.d, cur.ns); aboutNs = true;
+                wi = reflect(ray.d, cur.ns);
                 betaFactor = r; delta = true;
                 // The mirror direction is the same for every λ, so the bundle survives;
                 // only the reflectance is per-λ (cf. Glossy, the rough version of this).
@@ -1597,7 +1601,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 const Renderer::InterfaceStep st =
                     mats.interfaceStep(scene, *mp, h, ray.d, lambda, rng, stk, transport);
                 if (st.absorbed) { terminate = true; break; }
-                wi = st.ray.d; betaFactor = st.scale; delta = true;
+                wi = st.ray.d; betaFactor = st.scale; delta = true; freeSide = true;   // about ng
                 if (jsw) {
                     jSt = st; jHaveSt = true;
                     // -jdispall: a refraction whose index varies over the band leaves a path that
@@ -1610,15 +1614,15 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             }
             case MatType::HalfMirror: {
                 double r = clamp01(reflectSlot(scene, *mp, h, lambda));
-                if (rng.uniform() < r) { wi = reflect(ray.d, cur.ns); jHmRefl = true; aboutNs = true; }
-                else                   wi = ray.d;    // transmit straight
+                if (rng.uniform() < r) { wi = reflect(ray.d, cur.ns); jHmRefl = true; }
+                else                   { wi = ray.d; freeSide = true; }   // transmit straight
                 betaFactor = 1.0; delta = true;
                 break;
             }
             case MatType::Filter: {
                 // Colored gel filter: straight-through delta, throughput ×= T(lambda).
                 double t = clamp01(transmitSlot(scene, *mp, h, lambda));
-                wi = ray.d; betaFactor = t; delta = true;   // direction unchanged
+                wi = ray.d; betaFactor = t; delta = true; freeSide = true;   // direction unchanged
                 // Straight-through for every λ, so the bundle survives; a gel filter is
                 // exactly where the per-λ transmittance spread is largest, so this is
                 // the case that benefits most from NOT de-heroing — AND the case that
@@ -1636,7 +1640,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 Ray nr = mats.gratingDiffract(*mp, h, ray.d, lambda, rng, absorbedG, nullptr,
                                               jsw ? &pickG : nullptr);
                 if (absorbedG) { terminate = true; break; }
-                wi = nr.d; betaFactor = r; delta = true;   // orders about ng: never across
+                wi = nr.d; betaFactor = r; delta = true; freeSide = true;   // orders about ng
                 // JSPEC: the order's probability is 1/(1+|m|) over the orders that propagate,
                 // which depends on lambda, and so does the reflectance: at another wavelength
                 // the same order carries r(lam) * wsum(lambda) / wsum(lam), or nothing where it
@@ -1661,8 +1665,8 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             }
             default: terminate = true; break;
         }
-        // A lobe sampled about ns that lands across the true surface ends the walk (crossesSurface).
-        if (aboutNs && !terminate && crossesSurface(wi, cur.ns, vertexGeoN(cur))) terminate = true;
+        // A lobe that leaves on the wrong side of the true surface ends the walk (leavesWrongSide).
+        if (!terminate && !freeSide && leavesWrongSide(wi, vertexGeoN(cur), lobe)) terminate = true;
         // Kill the walk only when EVERY live wavelength is dead. The hero's own factor can
         // legitimately be 0 while a secondary's is not (a gel filter, a saturated spectral
         // reflectance), and dropping the whole bundle there biases the estimate low — it
@@ -2274,11 +2278,9 @@ inline bool surfMergeSite(const Vertex& v) {
     // DIFFUSE curve -- a coat of `type diffuse` fur, grass, wire -- read 0.80 of mode R through the
     // merges. `hit.fiberRadius > 0` is set by curve intersection and nothing else (curve.h).
     //
-    // NOR ON A LIGHT BLOCK'S OWN SURFACE (`reflectsNothing`), where VCM stores no light vertex
-    // and mode M deposits nothing either. A merge there contributes nothing (it reflects
-    // nothing), but a photon stored there is gathered by every OTHER surface within the radius:
-    // a sheet 5-20 cm above a downward lamp over a lit floor read 14-40% of its lit brightness
-    // on top, from photons the floor sent back onto the lamp's back face.
+    // NOR ON A LIGHT BLOCK'S OWN SURFACE (`reflectsNothing`). A merge there contributes nothing,
+    // since it reflects nothing, but a photon stored there would be gathered by every OTHER
+    // surface within the radius (known-issues J-LAMP-PHOTONS).
     return v.type == VType::Surface && !v.delta && v.mat && isConnectibleMat(*v.mat) &&
            !v.mat->reflectsNothing && !isFiberMat(*v.mat) && !(v.hit.fiberRadius > 0.0);
 }
@@ -4800,8 +4802,8 @@ struct BdptRenderer {
                                     const SurfMis* lm = photons->misOf((size_t)idx);
                                     if (!lm) return;      // no weight: refuse (see misOf)
                                     // A photon from across the true surface (a thin sheet's
-                                    // other face; a tilted or tipped normal): no merge.
-                                    if (crossesSurface(ph.wo, vk.ns, ngo)) return;
+                                    // other face, read by a tilted or tipped normal): no merge.
+                                    if (mergeAcrossSurface(woCam, ph.wo, vk.ns, ngo)) return;
                                     const double lam = (double)ph.lambda;
                                     double fCam = bsdfF(*vk.mat, vk.ns, woCam, ph.wo, lam,
                                                         scene, &vk.hit);

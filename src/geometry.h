@@ -286,29 +286,48 @@ inline Hit otherSide(const Hit& h) {
     return o;
 }
 
-// Does a direction `w` sampled about the shading normal `ns` -- a reflection lobe about ns, a
-// transmission lobe about -ns -- lie on the other side of the true surface (`ngo`: its geometric
-// normal on the side being shaded) than of the shading plane? Such a continuation would travel
-// inside the geometry and bring back light from behind it (the shading-normal problem), so every
-// walk absorbs it, as Cycles discards such samples: it contributes nothing, where letting it
-// through leaks. Smoothed and normal-mapped normals leave a thin wedge of such directions; a
-// normal tipped across the surface's plane (Hit::back says why that happens), most of its lobe.
-// Absorbing without renormalizing leaves every other direction's density -- and so MIS -- as it
-// was. Not for a pass-through (the incoming direction straight on), which no lobe sampled.
-inline bool crossesSurface(const Vec3& w, const Vec3& ns, const Vec3& ngo) {
-    return (dot(w, ns) > 0.0) != (dot(w, ngo) > 0.0);
+// What a sampled continuation is, which decides the side of the true surface it must leave on: a
+// reflection goes back to the side the ray arrived from, a transmission through to the other.
+// Only the sampler knows which it drew. The shading normal cannot tell: a mirror reflection about
+// a tilted n of a ray that arrived below n's plane lies below that plane as well.
+enum class Lobe { Reflect, Transmit };
+
+// Does `w`, drawn as a `lobe` at a hit whose true normal on the arrival side is `ngo`
+// (orientedGeoN), leave on the wrong side of the true surface? A smoothed or normal-mapped normal
+// puts a thin wedge of each lobe there, and a normal tipped across the plane (Hit::back says why
+// that happens) most of it. Such a continuation would travel inside the geometry and bring back
+// light from behind it, so every walk absorbs it, as Cycles discards such samples: it contributes
+// nothing, where letting it through leaks. Absorbing without renormalizing leaves every other
+// direction's density, and so MIS, as it was. Not for a pass-through (the incoming direction
+// straight on), which no lobe drew, nor for a dielectric's or a grating's directions, which are
+// built about the true normal.
+inline bool leavesWrongSide(const Vec3& w, const Vec3& ngo, Lobe lobe) {
+    const double c = dot(w, ngo);
+    return (lobe == Lobe::Reflect) ? !(c > 0.0) : !(c < 0.0);
 }
 
-// The continuation from hit h along `wo`, sampled about h.n: false where it crosses the surface
-// (crossesSurface) -- the caller absorbs it -- else `ray`, its origin nudged 1e-6 off the surface
-// toward the side wo leaves on: along n, or along ng where n has been tipped across the plane
-// (an origin along a tipped n would start behind the surface).
-inline bool continueAlong(const Hit& h, const Vec3& wo, Ray& ray) {
+// The continuation from hit h along `w`, drawn as a `lobe`: false where it leaves on the wrong
+// side (leavesWrongSide) -- the caller absorbs it -- else `ray`, its origin nudged 1e-6 off the
+// surface toward the side w leaves on: along n where n and the true normal agree about that side,
+// else along the true normal (an origin along n would start behind the surface).
+inline bool continueAlong(const Hit& h, const Vec3& w, Lobe lobe, Ray& ray) {
     const Vec3 ngo = orientedGeoN(h);
-    if (crossesSurface(wo, h.n, ngo)) return false;
-    const Vec3 off = (dot(h.n, ngo) > 0.0) ? h.n : ngo;
-    ray = Ray{h.p + off * (dot(wo, off) > 0.0 ? 1e-6 : -1e-6), wo};
+    if (leavesWrongSide(w, ngo, lobe)) return false;
+    const bool nAgrees = dot(h.n, ngo) > 0.0 && (dot(w, h.n) > 0.0) == (dot(w, ngo) > 0.0);
+    const Vec3 off = nAgrees ? h.n : ngo;
+    ray = Ray{h.p + off * (dot(w, off) > 0.0 ? 1e-6 : -1e-6), w};
     return true;
+}
+
+// A photon merged at a camera vertex: `wo` toward the camera side, `wi` toward where the photon
+// came from, `ns` the shading normal the BSDF is evaluated about, `ngo` the true normal on the
+// camera's side. Does the BSDF read the pair as a reflection where the true surface makes it a
+// transmission, or the reverse? The camera arrived from ngo's side, so the pair is a true
+// reflection iff wi lies there too. Such a photon came from across the surface -- on a
+// zero-thickness sheet the photons of the far face lie within the merge radius of the near one --
+// and is not merged.
+inline bool mergeAcrossSurface(const Vec3& wo, const Vec3& wi, const Vec3& ns, const Vec3& ngo) {
+    return ((dot(wo, ns) > 0.0) == (dot(wi, ns) > 0.0)) != (dot(wi, ngo) > 0.0);
 }
 
 // Veach shading-normal ADJOINT correction factor (Veach §5.3; PBRT

@@ -151,10 +151,11 @@ inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& al
         if (m.reflectsNothing) {                // a lamp seen directly: a flat white patch
             alb = alb + tint; nrm = nrm + h.n; return;
         }
+        // Follows the reflection, as the render's walks do; false where they absorb it (a
+        // reflection about a tilted or tipped n that leaves behind the surface): black there.
         auto mirror = [&](const Vec3& tintHere) {
             tint = mul(tint, tintHere);
-            const Vec3 out = normalize(reflect(ray.d, h.n));
-            ray = Ray{h.p + h.n * 1e-6, out};
+            return continueAlong(h, normalize(reflect(ray.d, h.n)), Lobe::Reflect, ray);
         };
         auto passStraight = [&]() { ray = Ray{h.p + ray.d * 1e-6, ray.d}; };
         switch (m.type) {
@@ -177,12 +178,15 @@ inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& al
             }
             case MatType::Mirror:
             case MatType::Grating:              // the zero order: the reflected image
-                mirror(rgbOf([&](double L) { return reflectSlot(scene, m, h, L); }));
+                if (!mirror(rgbOf([&](double L) { return reflectSlot(scene, m, h, L); }))) { nrm = nrm + h.n; return; }
                 continue;
             case MatType::HalfMirror: {
                 // A beam splitter reflects with probability `reflect`: take the larger branch.
-                if (reflectSlot(scene, m, h, kGuideLambda) >= 0.5) mirror(Vec3{1, 1, 1});
-                else passStraight();
+                if (reflectSlot(scene, m, h, kGuideLambda) >= 0.5) {
+                    if (!mirror(Vec3{1, 1, 1})) { nrm = nrm + h.n; return; }
+                } else {
+                    passStraight();
+                }
                 continue;
             }
             case MatType::Filter:               // a gel: straight through, tinted
@@ -191,7 +195,7 @@ inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& al
                 continue;
             case MatType::Glossy:
                 if (materialRoughness(scene, m, h) < kMirrorRoughness) {
-                    mirror(rgbOf([&](double L) { return reflectSlot(scene, m, h, L); }));
+                    if (!mirror(rgbOf([&](double L) { return reflectSlot(scene, m, h, L); }))) { nrm = nrm + h.n; return; }
                     continue;
                 }
                 break;

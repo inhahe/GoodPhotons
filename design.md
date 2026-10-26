@@ -5428,7 +5428,7 @@ as the one at fault.
   there contributes nothing, but a photon stored there is gathered by every other surface within
   the radius -- a sheet 5-20 cm over a downward lamp read 14-40 % of its lit brightness through
   the photons the floor sent back onto the lamp's back face (known-issues J-LAMP-PHOTONS). VCM
-  stores no light vertex there and mode `M` deposits nothing, for the same reason.
+  stores no light vertex there, and since 0.400.7 modes `M` and `S` deposit none either.
 
   **The radius shrinks per light-side epoch, and that is a correctness property, not a tuning
   knob.** `main.cpp`'s `surfRadiusFor(epoch)` applies Georgiev/SmallVCM's schedule
@@ -7329,17 +7329,27 @@ as the one at fault.
     terminator (which takes the plain geometric step where n is tipped, cos(Ng, Ns) <= 0), the
     Veach adjoint, the cavity probe -- so one hit has one side; a copy seen from the other
     side (the transmit lobe's back hemisphere) is made by `otherSide` / `dOtherSide`, which turn
-    n, curv and back together. BSDF continuations (0.400.5): a direction sampled about the
-    shading normal that lies on the other side of the true surface than of the shading plane
-    is absorbed in every walk (`crossesSurface` / `continueAlong` on the host -- whose spawn
-    origin also moves to ng where n is tipped -- `dCrossesSurface` on the device, an `aboutNs`
-    flag in the BDPT and VCM walks, the dielectric interface steps' own test of the side their
-    reflection or refraction lands on); a pass-through and a grating's orders (built about ng)
-    are no such direction. Absorbing without renormalizing leaves MIS as it was. A surface merge
-    (J's `dSurfMergeAt` and its host twin, both VCM gathers) rejects a photon whose incoming
-    direction crosses the surface the same way: on a zero-thickness sheet the photons of its
-    other face lie within the merge radius, and a tilted or tipped shading normal let the
-    BSDF take them as reflections.
+    n, curv and back together. BSDF continuations (0.400.5, reworked in 0.400.7): every walk
+    absorbs a continuation that leaves on the wrong side of the true surface -- a reflection
+    that does not go back to the side the ray arrived from, a transmission that does not go
+    through. Only the sampler knows which it drew, so each site names it (`Lobe` /
+    `leavesWrongSide` / `continueAlong` on the host, whose spawn origin moves to ng where n
+    disagrees with it about the side; `DLobe` / `dLeavesWrongSide` / `dContinueAlong` on the
+    device; in the BDPT and VCM walks a `lobe` that defaults to a tested reflection, with a
+    transmission lobe saying so and a direction no lobe drew about n -- a pass-through, a
+    dielectric's or a grating's, both built about ng, a fiber's -- marked `freeSide`). The
+    side of the shading plane cannot stand in for the lobe: a mirror reflection about a tilted
+    n of a ray that arrived below n's plane lies below that plane too, and in 0.400.5 such
+    reflections went through the mirror (61 % of the light behind it at a grazing view).
+    Absorbing without renormalizing leaves MIS as it was. A surface merge (J's `dSurfMergeAt`
+    and its host twin, both VCM gathers) rejects a photon where the BSDF about n reads the pair
+    (camera, photon) as a reflection and the true surface makes it a transmission, or the
+    reverse (`mergeAcrossSurface`): on a zero-thickness sheet the photons of its other face lie
+    within the merge radius. Modes M and S store each photon with the true normal on the side
+    it arrived from and gather, size their adaptive radius and measure their footprint against
+    the gather point's (0.400.7, map format `FTPMP10`): with shading normals a normal map tilted
+    past 60 degrees made a sheet's two faces agree, and the top read 2.5-5x its lit brightness
+    from its underside's photons.
     `Hit::patOwnSide` / `DHit::patOwnSide`
     is the surface's material's flag, set at the closest-hit choke points (`Scene::markPatSide`,
     the device closestHit) with the surface's own material -- the rule is the surface's, so
@@ -8965,7 +8975,9 @@ as the one at fault.
   routed to a lens-forming mode (`lensRoutedMode`: R, D, J, A, B, C and V keep their own, P goes
   to D or R, the rest to R); the fallback is R where it renders everything the camera needs, else
   B, which renders every feature, projection and lens -- so every camera has one
-  (`fallbackModeFor` exits with an internal error should a change to B's scope break that). A
+  (`fallbackModeFor` exits with an internal error should a change to B's scope break that),
+  though its lens image leaves a mirror or glass seen directly through the lens black, which
+  the fallback's notice says. A
   strip removes only what the camera's mode lacks and only what no camera of the run renders
   (`keepFire`/`keepGrin`, computed over the selected cameras), because every camera renders the
   one shared `Scene`; a camera that falls back keeps every strippable feature, so a run in which
@@ -10812,8 +10824,8 @@ A refactor, a performance change or a fix meant to touch only one case should le
 render bit-identical, and the only proof is to look. `check_bitid.py run --before <old ftrace.exe>`
 renders a fixed set of scenes it writes itself -- flat geometry and analytic spheres in every
 basic material, a normal-mapped wall and translucent panel, a smooth mesh and a squashed
-instance of it (normals turned across their faces), curve tubes and an isosurface -- in modes R
-and D on both devices, B and J on the GPU, with the old executable twice (a case that is not
+instance of it (normals turned across their faces), curve tubes and an isosurface -- in modes R,
+D, B, J, U, M and S on both devices, with the old executable twice (a case that is not
 deterministic proves nothing, and is reported) and then the new one, and compares the HDR output
 byte for byte. `--tol <rel>` passes a case within a relative tolerance -- for the GPU, whose
 kernels a change merely re-compiles can differ in the last bits (instruction scheduling, fused

@@ -166,7 +166,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 return;
             case MatType::Mirror: {
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
-                if (!continueAlong(h, reflect(ray.d, h.n), ray)) return;   // across the surface
+                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return;   // across the surface
                 break;
             }
             case MatType::Glossy: {
@@ -188,7 +188,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                     gmis.from = h.p;
                     gmis.n = h.n;
                 }
-                if (!continueAlong(h, o, ray)) return;
+                if (!continueAlong(h, o, Lobe::Reflect, ray)) return;
                 break;
             }
             case MatType::Dielectric:
@@ -206,7 +206,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             }
             case MatType::HalfMirror: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
-                if (rng.uniform() < r) { if (!continueAlong(h, reflect(ray.d, h.n), ray)) return; }
+                if (rng.uniform() < r) { if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return; }
                 else                   ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 break;
             }
@@ -243,7 +243,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             }
             default: {
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
-                if (!continueAlong(h, reflect(ray.d, h.n), ray)) return;   // across the surface
+                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return;   // across the surface
                 break;
             }
         }
@@ -312,7 +312,7 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                 double M = 0.0;          // photons found this pass
                 Vec3   phi{0, 0, 0};     // local flux sum (XYZ, per-photon wavelength)
                 pm.queryR(h.p, P.radius, [&](const Photon& ph, double, int k) {
-                    if (dot(ph.n, h.n) < 0.5) return;   // reject cross-surface leakage
+                    if (dot(ph.n, orientedGeoN(h)) < 0.5) return;   // another surface's photon
                     double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                     double f = rho * (1.0 / PI);
                     phi += pm.cie[k] * (f * (double)ph.power);        // == cie(lambda_p), precomputed
@@ -343,7 +343,7 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                     grng.seed(((uint64_t)y << 20) ^ (uint64_t)x,
                               0x9e3779b97f4a7c15ULL ^ (uint64_t)st.passes);
                     phi = phi * gatherAreaScale(
-                        gatherCoverage(scene, h.p, h.n, P.radius, grng, gaM, h.matId,
+                        gatherCoverage(scene, h.p, orientedGeoN(h), P.radius, grng, gaM, h.matId,
                                        h.fiberRadius));
                 }
                 // Progressive radius / flux update (shared-statistics PPM).

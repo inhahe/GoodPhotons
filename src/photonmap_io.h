@@ -18,7 +18,10 @@
 //      path, the two flags were silently mutually exclusive — `-savemap -beams` exited 0 and
 //      wrote nothing at all.
 //
-// Format. `FTPMP09\n` = header, surface block, beam block, CAUSTIC block; its beam record is the
+// Format. `FTPMP10\n` (0.400.7) is `FTPMP09\n` with each surface photon's `n` the TRUE normal on
+// the side it arrived from, and no photon on a light block's own surface; an older file loads
+// and gathers as it was saved (shading normals, lamp photons), and the loader says so.
+// `FTPMP09\n` = header, surface block, beam block, CAUSTIC block; its beam record is the
 // live PhotonBeam with chord PROVENANCE valid (srcEm / surf, 0.312.0). `FTPMP08\n` = the same
 // width with those two fields unset (the loader resets them to "unknown"). `FTPMP07\n`,
 // `FTPMP06\n`, `FTPMP05\n` and `FTPMP04\n` have the same block layout but successively NARROWER
@@ -176,7 +179,7 @@ inline bool savePhotonMap(const char* path, const PhotonMap& pm,
     // photon trace, so a crash or a full disk mid-write must leave the previous one whole.
     const bool ok = filereplace::writeReplacing(path, [&](std::ostream& o) -> bool {
         auto put = [&](const void* p, std::size_t n) { o.write((const char*)p, (std::streamsize)n); };
-        const char magic[8] = {'F','T','P','M','P','0','9','\n'};
+        const char magic[8] = {'F','T','P','M','P','1','0','\n'};
         long long nPh = (long long)pm.photons.size();
         double en[5] = {e.emitted, e.absorbed, e.sensor, e.escaped, e.residual};
         put(magic, 8);
@@ -239,7 +242,8 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
     char magic[8] = {0};
     long long nEmitted = 0, nPh = 0; double en[5] = {0,0,0,0,0}; uint64_t g = 0;
     bool ok = std::fread(magic, 1, 8, f) == 8;
-    const bool v9 = ok && std::memcmp(magic, "FTPMP09\n", 8) == 0;
+    const bool v10 = ok && std::memcmp(magic, "FTPMP10\n", 8) == 0;
+    const bool v9 = v10 || (ok && std::memcmp(magic, "FTPMP09\n", 8) == 0);  // v10 = v9 + true normals
     const bool v8 = v9 || (ok && std::memcmp(magic, "FTPMP08\n", 8) == 0);   // v9 = v8 + provenance
     const bool v7 = v8 || (ok && std::memcmp(magic, "FTPMP07\n", 8) == 0);   // v8 ⊃ v7 blocks
     const bool v6 = v7 || (ok && std::memcmp(magic, "FTPMP06\n", 8) == 0);   // v7 ⊃ v6 blocks
@@ -273,6 +277,11 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
     ok = ok && std::fread(en, sizeof en, 1, f) == 1;
     ok = ok && std::fread(&nPh, sizeof nPh, 1, f) == 1;
     if (!ok) { std::fprintf(stderr, "[loadmap] %s truncated header; ignoring\n", path); std::fclose(f); return false; }
+    if (!v10)
+        std::fprintf(stderr, "[loadmap] %s was traced before 0.400.7: its surface photons carry "
+                             "shading normals and include those that landed on a light's own "
+                             "surface, and it gathers as it did then (known-issues "
+                             "J-LAMP-PHOTONS); re-run with -savemap to refresh it.\n", path);
     if (g != guard) {
         std::fprintf(stderr, "[loadmap] %s was built for a different scene; ignoring\n", path);
         std::fclose(f); return false;

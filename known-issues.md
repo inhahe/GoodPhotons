@@ -212,9 +212,14 @@ distance d whose normal is turned by theta from n_x lies about d*sin(theta)/2 of
 accept up to `tau*r + c*d*sin(theta)` (c a safety factor near 1). Mode M stores `ph.n`; U's light
 vertices carry `ng`; J's DSurfPhoton (48 B) needs a packed normal. Check against
 tools/check_bitid.py, and on a corner scene (the classic proximity bias brightens corners and
-darkens edges: both should move toward mode R).
+darkens edges: both should move toward mode R). Modes M and S complicate it: their footprint
+correction (M-GATHERAREA, on by default) divides by the same-facing surface area of EVERY layer
+in the ball, deliberately -- stacked cloth, a fur coat's layers -- so in the measurement above
+it counted the floor's area too, and the plane test has to move the footprint's layer test with
+it, or the two describe different regions. And dropping the deeper layers changes how M renders
+a fur coat or folded cloth: measure fur_creature and gallery_rain against mode R before choosing.
 
-## DONE (2026-10-26, 0.400.6): J-LAMP-PHOTONS — mode J stored photons on a light block's own surface, and every surface within the merge radius merged them
+## DONE (2026-10-26, 0.400.6-0.400.7): J-LAMP-PHOTONS — modes J, M and S stored photons on a light block's own surface, and every surface within the radius gathered them
 
 Found while building tools/check_shading_leak.py in 0.400.5 and logged then as J-MERGE-PROXIMITY,
 with the wrong cause: a sheet 5-20 cm over a downward lamp, over a lit floor, read 14-40 % of
@@ -223,18 +228,38 @@ with the lamp 0.4 m down, with no floor, or with the lamp moved out from under t
 area. A `light area` is two real triangles (`reflectsNothing`): J's walk records a vertex where a
 light subpath strikes one, and `surfMergeSite` accepted it, so the photons the floor sent back
 onto the lamp's back face were stored there and gathered by the sheet above. VCM stores no light
-vertex there and mode M deposits nothing. `surfMergeSite` / `dSurfMergeSite` now refuse a light
+vertex there. `surfMergeSite` / `dSurfMergeSite` now refuse a light
 block's surface; the one predicate gates the store, the gather and the MIS eta term, and a merge
 there contributed nothing anyway (it reflects nothing). check_shading_leak's "near" lighting is
 the regression case (all six J cases failed on 0.400.5); check_bitid's 24 cases stay
 byte-identical. Not the proximity bias proper (MERGE-PROXIMITY, above): mode J's starting radius
 is fixed and shrinks.
 
+0.400.6 said mode M deposited nothing there. It did: render.h's photon walks, which feed modes M
+and S, deposit at every diffuse hit, a lamp's black quad included, and the extended check (M and
+S added, M at its fixed radius) read 57-63 % on the same "near" sheets in both modes, both
+devices. 0.400.7: the four host and four device deposit sites skip a light block's surface (the
+photon still dies there by roulette, so no random draw moves). Saved maps from before carry
+the lamp photons; the loader says so (`FTPMP10`).
+
+## DONE (2026-10-26, 0.400.7): PMAP-FAR-FACE — modes M and S gathered a sheet's other face under a strongly tilted normal map
+
+Found by the Opus review of 0.400.5-0.400.6 and confirmed by the extended check_shading_leak:
+modes M and S kept a photon when `dot(ph.n, h.n) >= 0.5`, both SHADING normals. Under a normal map
+tilting more than 60 degrees the two faces of a zero-thickness sheet agree there (their dot is
+`-cos 2 theta`), so the top of the "tipped" sheet gathered its underside's photons: 2.5-5.4x its
+lit brightness, both modes, both devices. Now a photon carries the TRUE normal on the side it
+arrived from (`depositPhoton(h.p, ngo, ...)`), and the photon test, the adaptive radius and the
+footprint coverage all take the gather point's true normal (`orientedGeoN` / `dShadedNg`) -- one
+normal for all three, as the coverage's own comment demands, and the true tangent plane for the
+footprint's disc, which had tilted with the normal map. Flat geometry is unchanged. Map format
+`FTPMP10`.
+
 ## DONE (2026-10-25, 0.400.5): CONTINUATION-LEAK — light leaked through surfaces whose shading normal leans away from them, in the bidirectional modes and at tipped normals
 
 A continuation sampled about a shading normal -- `cosineHemisphere(h.n)`, the glossy lobes, a
-mirror or a half mirror's reflection about n, a dielectric's reflection or refraction about its
-shading `nl` -- can land on the far side of the true surface: the thin wedge between the shading
+mirror or a half mirror's reflection about n (a dielectric's are built about ng: never) -- can
+land on the far side of the true surface: the thin wedge between the shading
 and the geometric plane on a smooth or normal-mapped surface, most of the lobe where n is tipped
 across the plane. Such a ray travels behind the surface and brings back light from there. Where it
 started decided whether it leaked: the host's backward and forward walks spawned along n, so
@@ -250,18 +275,27 @@ the tipped one, through MERGES: on a zero-thickness sheet the photons of its und
 within the merge radius of the top, and a tilted or tipped shading normal let the camera BSDF
 take them as reflections.
 
-Decided with the user: absorb. Every walk ends a continuation whose direction lies on different
-sides of the shading plane and the true surface (geometry.h `crossesSurface`, `continueAlong`,
-whose host spawn origin also moves to ng where n is tipped; device `dCrossesSurface`; the BDPT
-and VCM walks' `aboutNs` flag; the dielectric interface steps test the side their reflection or
-refraction lands on), as Cycles discards such samples -- it loses that sample's energy where
-letting it through leaks. A pass-through and a grating's orders (built about ng) are exempt.
-Absorbing without renormalizing leaves every other direction's density, and so MIS, as it was.
-Every surface merge (J's `dSurfMergeAt` and its host twin, both VCM gathers) rejects a photon
-whose incoming direction crosses the surface the same way. Cost, on tools/check_bitid.py's
-scenes: flat geometry, curves and isosurfaces byte-identical in every mode on both devices; the
-smooth and normal-mapped scenes' means move -0.42% to +0.03%. After: no leak in any mode, R, D, B,
-J and U, on any of the three sheets.
+Decided with the user: absorb, as Cycles discards such samples -- it loses that sample's energy
+where letting it through leaks. Absorbing without renormalizing leaves every other direction's
+density, and so MIS, as it was. 0.400.5 judged a continuation by whether it lay on the same side
+of the shading plane and of the true surface; the Opus review of 0.400.5-0.400.6 found that
+wrong for a mirror: a reflection about a tilted n of a ray that arrived below n's plane lies below
+both planes, passed, and went through the mirror -- and the host now started it behind the
+surface, where before it had re-hit the mirror. Measured on 0.400.6 (check_shading_leak's
+grazing mirrors over a hidden lamp): 61 % of the lamp's brightness through a normal-mapped
+mirror, 13 % through a smooth one, in modes R, D, J, U, M and S on both devices. 0.400.7 asks
+what the sampler drew instead (geometry.h `Lobe`, `leavesWrongSide`, `continueAlong`; device
+`DLobe`, `dLeavesWrongSide`, `dContinueAlong`): a reflection must go back to the side the ray
+arrived from, a transmission through; the BDPT and VCM walks test every lobe as a reflection
+unless the case says it transmits or drew no lobe about n (a pass-through, a dielectric's or a
+grating's direction, built about ng, a fiber's). Every surface merge (J's `dSurfMergeAt` and its
+host twin, both VCM gathers) rejects a photon where the BSDF about n reads the pair (camera,
+photon) otherwise than the true surface does (`mergeAcrossSurface`), which 0.400.5's test
+missed for a camera below n's plane. The 0.400.5 dielectric side tests were dropped: inert,
+the steps build about ng. Cost, on tools/check_bitid.py's scenes (0.400.5): flat geometry, curves
+and isosurfaces byte-identical in modes R, D, B and J on both devices; the smooth and
+normal-mapped scenes' means move -0.42% to +0.03%. After 0.400.7: no leak in any mode on any of
+the sheets or mirrors.
 
 ## DONE (2026-10-25, 0.400.1-0.400.2): NORMALMAP-BACK-MIRROR — a normal-mapped surface seen from behind showed one of its relief's slopes mirrored
 

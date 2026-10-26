@@ -12,8 +12,9 @@ ftrace.exe, so copy the old binary aside before rebuilding (e.g. to scraps/ftrac
 first executable `run` renders every case twice: a case whose two renders differ is not
 deterministic and proves nothing, and is reported so.
 
-The cases are scenes this script writes into <out>/scenes, each rendered in modes R and D on the
-CPU and the GPU, B (forward) and J on the GPU, at a few samples:
+The cases are scenes this script writes into <out>/scenes, each rendered on the CPU and the GPU
+in modes R and D, B (forward), J and U (the bidirectional merges), M and S (the photon maps), at
+a few samples:
   flat     quads and analytic spheres -- diffuse, glossy, mirror, glass, translucent, a mix --
            whose shading and geometric normals coincide;
   mapped   a normal-mapped wall and a normal-mapped translucent panel, lit at a grazing angle;
@@ -24,11 +25,13 @@ CPU and the GPU, B (forward) and J on the GPU, at a few samples:
 
 `compare` prints, per case, "identical", or how it differs: the pixels that changed, the
 largest change relative to the pixel, and the change of the image's mean. --tol <rel> passes
-a case whose every pixel is within that relative tolerance: a GPU kernel the change only
-re-compiled can differ in the last bits (instruction scheduling, fused multiply-adds) while
-the CPU stays bit-identical -- that is the place for it, 1e-3 say, never for the CPU. A
-change meant to alter some renders shows up here as differing cases, with the mean change
-to judge them by. Exits 0 when every case is identical (or within --tol), 1 otherwise.
+a GPU case whose every pixel is within that relative tolerance: a GPU kernel the change only
+re-compiled can differ in the last bits (instruction scheduling, fused multiply-adds) -- 1e-3,
+say. The CPU cases are always held to bit identity. GPU modes M and S are not bit-deterministic
+at all (atomic deposits), so they are always judged at a floor of 1e-4 (NONDET_FLOOR), the
+determinism pass included. A change meant to alter some renders shows up here as differing
+cases, with the mean change to judge them by. Exits 0 when every case is identical (or within
+its tolerance), 1 otherwise.
 """
 import argparse
 import os
@@ -44,9 +47,21 @@ MODES = [  # (tag, ftrace arguments)
     ("R_gpu", ["-mode", "R", "-spp", "16", "-device", "gpu"]),
     ("D_cpu", ["-mode", "D", "-spp", "2", "-device", "cpu"]),
     ("D_gpu", ["-mode", "D", "-spp", "8", "-device", "gpu"]),
+    ("B_cpu", ["-mode", "B", "-n", "200000", "-device", "cpu"]),
     ("B_gpu", ["-mode", "B", "-n", "1000000", "-device", "gpu"]),
+    ("J_cpu", ["-mode", "J", "-spp", "1", "-device", "cpu"]),
     ("J_gpu", ["-mode", "J", "-spp", "2", "-device", "gpu"]),
+    ("U_cpu", ["-mode", "U", "-spp", "2", "-device", "cpu"]),
+    ("U_gpu", ["-mode", "U", "-spp", "4", "-device", "gpu"]),
+    ("M_cpu", ["-mode", "M", "-n", "200000", "-spp", "2", "-device", "cpu"]),
+    ("M_gpu", ["-mode", "M", "-n", "200000", "-spp", "2", "-device", "gpu"]),
+    ("S_cpu", ["-mode", "S", "-spp", "2", "-device", "cpu"]),
+    ("S_gpu", ["-mode", "S", "-spp", "2", "-device", "gpu"]),
 ]
+# GPU modes M and S deposit their photons through atomics, so their order -- and the last bits of
+# every sum over them -- varies from run to run: one build differs from itself there by up to a
+# few 1e-5 of a pixel. Those cases are judged at this relative floor, in the determinism pass too.
+NONDET_FLOOR = {"M_gpu": 1e-4, "S_gpu": 1e-4}
 
 
 def write(path, text):
@@ -203,8 +218,11 @@ def compare(out, a, b, tol, log):
         px = np.any(x != y, axis=-1)
         rel = float((np.abs(y - x) / np.maximum(np.abs(x), 1e-6)).max())
         mean = (y.sum() - x.sum()) / max(abs(x.sum()), 1e-30)
-        if rel <= tol:
-            log("  %-22s within --tol: %d of %d pixels, largest change %.3g of the pixel" % (n[:-4], int(px.sum()), px.size, rel))
+        tag = n[:-4].split("_", 1)[1]                    # "flat_M_gpu.pfm" -> "M_gpu"
+        allowed = max(tol if tag.endswith("_gpu") else 0.0, NONDET_FLOOR.get(tag, 0.0))
+        if rel <= allowed:
+            log("  %-22s within %.0e: %d of %d pixels, largest change %.3g of the pixel"
+                % (n[:-4], allowed, int(px.sum()), px.size, rel))
             continue
         ok = False
         log("  %-22s differs: %d of %d pixels, largest change %.3g of the pixel, mean %+.3f%% FAIL"

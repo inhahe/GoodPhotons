@@ -55,7 +55,7 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
     // gathered from and the footprint collapses to zero. One extra trace fixes that: find the
     // surface at `p` and, if its `ng` opposes the gather normal, flip the whole comparison for
     // this gather. Then a signed test means "faces the same way as the surface I am standing
-    // on", which is exactly what the photon query's `dot(ph.n, h.n) >= 0.5` means and is
+    // on", which is exactly what the photon query's `dot(ph.n, n) >= 0.5` means and is
     // independent of how the scene was authored.
     //
     // Signed (rather than |dot|) is what stops a CLOSED SOLID being counted twice: its far
@@ -91,7 +91,7 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
                                   /*skipCamHidden=*/true);
             if (!h.valid || h.t > span) break;
             // THE FACING TEST MUST BE THE PHOTON QUERY'S, EXACTLY. That query keeps a photon
-            // when `dot(ph.n, h.n) >= 0.5` — SIGNED, against consistently-oriented normals —
+            // when `dot(ph.n, n) >= 0.5` — SIGNED, against consistently-oriented normals —
             // so a back face is rejected and contributes no photons. The first version of
             // this loop used `fabs(dot(h.n, n))`, which is wrong twice over: `Hit::n` is
             // oriented AGAINST the ray, so its sign carries no information here, and the

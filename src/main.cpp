@@ -17589,6 +17589,8 @@ static const char* sceneModeUnsupported(const ftsl::Loaded& L, char cliMode) {
 // refuse) where it renders everything the camera needs, else B (the forward tracer). Both form a
 // lens image (modeFormsLensImage), and B renders every feature and projection, so every camera
 // has a fallback -- an invariant resolveCameraModes and renderedMode rely on, kept here out loud.
+// (B's lens image leaves a mirror or glass seen directly through the lens black, which the
+// fallback's notice says.)
 static char fallbackModeFor(const Scene& scene, int projection) {
     static_assert(modeFormsLensImage('R') && modeFormsLensImage('B'), "fallbacks form lens images");
     if (!modeFeatureUnsupported(scene, 'R', projection)) return 'R';
@@ -17704,7 +17706,10 @@ static bool resolveCameraModes(Scene& scene, const std::vector<CamRequest>& cams
             return false;
         }
         const char fallback = fallbackModeFor(scene, c.projection);
-        const char* kind = fallback == 'B' ? "forward light tracer" : "backward reference";
+        const char* kind = fallback != 'B' ? "backward reference"
+                         : c.lens ? "forward light tracer; a mirror or glass seen directly through "
+                                    "the lens renders black in it"
+                                  : "forward light tracer";
         if (g_onUnsupported == OnUnsupported::Strip)
             std::printf("[on-unsupported=strip] camera '%s': cannot strip %s for mode %c (another "
                         "camera renders it, or the mode lacks more than a strip removes) -> mode "

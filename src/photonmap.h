@@ -49,13 +49,15 @@ inline constexpr double kCausticGlossRoughness = 0.15;
 // passed the distance test. The deposit POSITION deliberately lives in a separate
 // `PhotonMap::pos` array (see below); this struct is what `pos[k]` indexes into.
 //
-// `n` (shading normal) is here for cross-surface leak rejection; a pure Lambertian
+// `n` (the true normal on the side the photon arrived from) is here for cross-surface leak
+// rejection -- the true one, so a photon on a sheet's other face can never pass for this one's,
+// however a normal map tilts the shading normals; a pure Lambertian
 // estimate only needs power/lambda. There is no `wi`: the incident direction was stored
 // for years and never read by any gather (the estimate is Lambertian, so it only needs
 // the normal), which cost 24 dead bytes on every one of what can be tens of millions of
 // records. Don't re-add a field here without a reader — see the size note below.
 struct Photon {
-    Vec3  n;          // shading normal at the deposit surface (unit)
+    Vec3  n;          // true normal at the deposit, on the side the photon came from (unit)
     float power;      // monochromatic power (beta) carried by this photon
     float lambda;     // wavelength (nm)
 };
