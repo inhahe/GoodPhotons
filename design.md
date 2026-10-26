@@ -10784,6 +10784,22 @@ User-facing rules: REFERENCE.md → *How long output is kept*. Regression check:
 `tools/check_clean_outputs.py`. The settle cache is pruned by `settle_scene.py` itself
 (below), not here.
 
+## Proving a change changes nothing (`tools/check_bitid.py`)
+
+A refactor, a performance change or a fix meant to touch only one case should leave every other
+render bit-identical, and the only proof is to look. `check_bitid.py run --before <old ftrace.exe>`
+renders a fixed set of scenes it writes itself -- flat geometry and analytic spheres in every
+basic material, a normal-mapped wall and translucent panel, a smooth mesh and a squashed
+instance of it (normals turned across their faces), curve tubes and an isosurface -- in modes R
+and D on both devices, B and J on the GPU, with the old executable twice (a case that is not
+deterministic proves nothing, and is reported) and then the new one, and compares the HDR output
+byte for byte. `--tol <rel>` passes a case within a relative tolerance -- for the GPU, whose
+kernels a change merely re-compiles can differ in the last bits (instruction scheduling, fused
+multiply-adds) while the CPU stays bit-identical; a change meant to alter some renders shows
+them as differing cases, each with its mean change. build.bat replaces ftrace.exe, so the old
+binary is copied aside first (it runs from anywhere: no DLLs beside it). `render <label>` and
+`compare <a> <b>` are the halves. Output in png/check_bitid/<label>/.
+
 ## Scene-authoring tools (`tools/`)
 
 - **`settle.py`** — rests a *single* object on a surface by lowering it vertically.
