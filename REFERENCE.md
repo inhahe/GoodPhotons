@@ -2805,10 +2805,10 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
   for `water`, `ice`, `acrylic`/PMMA, `polycarbonate`, and constant indices for
   xenon gas: `xenon`/`Xe` at STP, `xenon-lamp` for a running short-arc lamp's fill.
   The lead crystals:
-  - `tableware-crystal`/`LLF1` matches cut-crystal glassware. EU "lead crystal" needs
-    at least 24 % PbO and n_D ≥ 1.545, which lands near Schott LLF1 (n_d 1.548,
-    V_d 45.8). Use it to match a real decanter or wine glass.
-  - `crystal`/`lead-crystal`/`F2` is the denser Schott F2 (n_d 1.620, V_d 36.4), with
+  - `tableware-crystal`/`lead-crystal`/`LLF1` matches cut-crystal glassware. EU "lead
+    crystal" needs at least 24 % PbO and n_D ≥ 1.545, which lands near Schott LLF1
+    (n_d 1.548, V_d 45.8). Use it to match a real decanter or wine glass.
+  - `crystal`/`F2` is the denser Schott F2 (n_d 1.620, V_d 36.4), with
     1.4× LLF1's F-to-C spread, so its caustics carry more colour. The gallery's
     caustic pieces are cut from it.
 - **`metal:<name>`** — measured metal reflectance: `Au`/`gold`, `Ag`/`silver`,

@@ -157,8 +157,8 @@ lowercased stem matches, plus any `# aliases:` the file declares — so dropping
 file into a category directory adds a preset with **no rebuild**. See `data/README.md`.
 
 **`glass:<name>` dispersion curves** (refractive index vs λ, `data/glass/*.glass`
-dispersion coefficients): `BK7`/`crown`, `SF10`/`flint`, `crystal`/`lead-crystal`/`F2`
-(dense lead crystal), `tableware-crystal`/`LLF1` (glassware lead crystal),
+dispersion coefficients): `BK7`/`crown`, `SF10`/`flint`, `crystal`/`F2` (dense lead
+crystal), `tableware-crystal`/`lead-crystal`/`LLF1` (glassware lead crystal),
 `silica`/`fused-silica`/`quartz`, `sapphire`, `diamond`, `water`, `ice`, `acrylic`/`pmma`,
 `polycarbonate`/`pc`, `xenon`/`Xe`, `xenon-lamp`. Sellmeier for the glasses/crystals,
 Cauchy fits for water/ice/plastics, a constant for the xenon gas fills.

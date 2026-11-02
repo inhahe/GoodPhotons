@@ -223,8 +223,8 @@ A spectrum expression appears after `spd`, `reflect`, `ior`, `absorb`, `emit`,
 
 ### 3.1 `glass:<name>` IOR curves
 
-`BK7`/`crown`, `SF10`/`flint`, `crystal`/`lead-crystal`/`F2`/`leadglass` (dense lead
-crystal), `tableware-crystal`/`LLF1` (glassware lead crystal),
+`BK7`/`crown`, `SF10`/`flint`, `crystal`/`F2`/`leadglass` (dense lead crystal),
+`tableware-crystal`/`lead-crystal`/`LLF1` (glassware lead crystal),
 `silica`/`fused-silica`/`quartz`, `sapphire`, `diamond`, `water`, `ice`,
 `acrylic`/`pmma`, `polycarbonate`/`pc`, `xenon`/`Xe` (gas at STP),
 `xenon-lamp`/`xenon-arc`/`xenon-operating` (a running short-arc lamp's fill).
