@@ -19,8 +19,8 @@ Writes small Mitsuba scenes, converts each, and checks:
   - `intIOR` (named or numeric) is read as `int_ior`, and `toWorld` places the sensor;
   - a diffuse BSDF's `diffuseReflectance` is read as its reflectance;
   - a conductor with no `material` is copper, 0.6's default (3's is a perfect mirror);
-  - an `alphaV` given alone is anisotropic against Mitsuba's default 0.1, and flagged;
-  - an `<srgb>` colour, and a '#rrggbb' one, is decoded to linear;
+  - an `alphaV` given alone (which Mitsuba rejects) is taken against 0.1, and flagged;
+  - an `<srgb>` colour, '#rrggbb' or not, is decoded to linear; an `<rgb>` '#rrggbb' is not;
   - a `<default>` parameter keeps its camelCase name, so `$fovDeg` still substitutes.
 
   BSDFs:
@@ -33,11 +33,15 @@ Writes small Mitsuba scenes, converts each, and checks:
     has no `metal:` for are each flagged; a known one (Au) is not.
 
   Lights, each at Mitsuba's own magnitude so they keep their ratios:
-  - an rgb emitter becomes `rgbillum`; a `<float>` radiance passes through; a blackbody, in
-    0.6's form and in 3's, becomes its Planck curve per nanometre; no radiance becomes 1,
-    flagged;
+  - an rgb emitter becomes `rgbillum`, and so, as white, does a bare number: a `<float>`, a
+    one-value spectrum, 3's d65 with a scale, and a missing radiance (1, flagged); a
+    textured radiance is flagged as dropped; a blackbody, in 0.6's form ("3000K") and in
+    3's, becomes its Planck curve per nanometre;
   - a point emitter becomes an all-round `light spot` of the same intensity, and a spot
-    emitter a `light spot` of its cutoff and beam width, aimed along its to_world;
+    emitter a `light spot` of its cutoff and beam width, aimed along its to_world (one that
+    leaves it no direction is flagged and aimed down);
+  - a sphere's center and radius are placed by its to_world;
+  - an irregular sampled spectrum becomes a `table`;
   - a directional emitter becomes a `light sun` whose `dir` points back up its direction;
   - a point or vector given as `value="x, y, z"` reads the same as one given by x/y/z;
   - a cube area emitter becomes six `light area` faces, each facing out of the cube;
@@ -49,7 +53,8 @@ Writes small Mitsuba scenes, converts each, and checks:
 
   Mesh placement: a `to_world` of scale, rotations and translation places the mesh's points
   where Mitsuba does, through FTSL's scale / Euler `rotate` / translate, including at gimbal
-  lock and beside it in a 4x4 rounded to 7 decimals; a shear and a mirror are each flagged.
+  lock, beside it in a 4x4 rounded to 7 decimals, and with each step spelled `value=`; a
+  shear and a mirror are each flagged.
 
   Cameras: a perspective sensor becomes a `mode R` camera; a thinlens one becomes mode A and,
   beside glass some shape uses, is flagged (glass merely defined is not).
@@ -114,6 +119,9 @@ def nearlock_matrix():
 
 
 PLACEMENTS.append(('nearlock', [('matrix', nearlock_matrix())], None))
+# The same kinds of step in Mitsuba 3's `value="x, y, z"` spelling ('=' marks it in xml_ops).
+PLACEMENTS.append(('valueform', [('scale=', (2, 1, 0.5)), ('rotate=', (0, 1, 0, 45)),
+                                 ('translate=', (-1, 3, 4))], None))
 
 
 def srgb_decode(x):
@@ -201,6 +209,7 @@ def mitsuba_place(ops, p):
     """Where Mitsuba's <transform> children `ops`, applied in document order, put point p."""
     x = list(p)
     for op, a in ops:
+        op = op.rstrip('=')
         if op == 'scale':
             x = [x[i] * a[i] for i in range(3)]
         elif op == 'translate':
@@ -242,6 +251,10 @@ def xml_ops(ops):
     for op, a in ops:
         if op == 'rotate':
             out.append(f'<rotate x="{a[0]}" y="{a[1]}" z="{a[2]}" angle="{a[3]}"/>')
+        elif op == 'rotate=':
+            out.append(f'<rotate value="{a[0]}, {a[1]}, {a[2]}" angle="{a[3]}"/>')
+        elif op.endswith('='):
+            out.append(f'<{op[:-1]} value="{a[0]}, {a[1]}, {a[2]}"/>')
         elif op == 'matrix':
             out.append(f'<matrix value="{" ".join(repr(v) for v in a)}"/>')
         else:
@@ -285,7 +298,8 @@ def scene_v06():
             + sphere(4, '<bsdf type="roughconductor" id="v06_alphav"><string name="material" value="Au"/>'
                         '<float name="alphaV" value="0.4"/></bsdf>') + '\n'
             + sphere(5, '<bsdf type="diffuse" id="v06_srgb"><srgb name="reflectance" value="0.5, 0.5, 0.5"/></bsdf>') + '\n'
-            + sphere(6, '<bsdf type="diffuse" id="v06_hex"><srgb name="reflectance" value="#ffcc88"/></bsdf>')
+            + sphere(6, '<bsdf type="diffuse" id="v06_hex"><srgb name="reflectance" value="#ffcc88"/></bsdf>') + '\n'
+            + sphere(7, '<bsdf type="diffuse" id="v06_rgbhex"><rgb name="reflectance" value="#808080"/></bsdf>')
             + '\n</scene>\n')
 
 
@@ -315,11 +329,21 @@ def scene_bsdfs(ply):
         '<rgb name="irradiance" value="2, 2, 2"/></emitter>',
         '  <emitter type="spot"><transform name="to_world"><lookat origin="0, 4, 0" target="0, 0, 0" up="0, 0, 1"/>'
         '</transform><float name="cutoff_angle" value="30"/><rgb name="intensity" value="5, 5, 5"/></emitter>',
+        '  <emitter type="spot"><transform name="to_world"><scale value="0"/></transform>'
+        '<rgb name="intensity" value="1, 1, 1"/></emitter>',
+        '  <shape type="sphere"><point name="center" value="0, 0, 0"/><float name="radius" value="1"/>'
+        '<transform name="to_world"><scale value="2"/><translate x="5" y="0" z="0"/></transform>'
+        '<bsdf type="diffuse" id="placed_sphere"/></shape>',
+        sphere(10, '<bsdf type="diffuse" id="sampled"><spectrum type="irregular" name="reflectance">'
+                   '<string name="wavelengths" value="400, 700"/><string name="values" value="0.2, 0.8"/>'
+                   '</spectrum></bsdf>'),
     ]
     for x, emitter in ((10, '<float name="radiance" value="5"/>'),
-                       (12, '<blackbody name="radiance" temperature="3000" scale="2"/>'),
+                       (12, '<blackbody name="radiance" temperature="3000K" scale="2"/>'),
                        (14, '<spectrum type="blackbody" name="radiance"><float name="temperature" value="3000"/></spectrum>'),
-                       (16, '')):
+                       (16, ''),
+                       (18, '<spectrum type="d65" name="radiance"><float name="scale" value="20"/></spectrum>'),
+                       (20, '<texture name="radiance" type="bitmap"><string name="filename" value="glow.png"/></texture>')):
         parts.append(f'  <shape type="rectangle"><transform name="to_world"><translate x="{x}" y="0" z="0"/>'
                      f'</transform><emitter type="area">{emitter}</emitter></shape>')
     return '<scene version="3.0.0">\n' + SENSOR + ENV + '\n'.join(parts) + '\n</scene>\n'
@@ -493,10 +517,12 @@ def main():
                          ('v06_conductor', 'mirror  reflect metal:Cu'),
                          ('v06_alphav', f"glossy  reflect metal:Au  roughness {roughness_for(0.25, 2):.6g}"),
                          ('v06_srgb', 'diffuse  reflect rgb ' + g6([srgb_decode(0.5)] * 3)),
-                         ('v06_hex', 'diffuse  reflect rgb ' + g6(srgb_decode(v / 255) for v in (0xff, 0xcc, 0x88))))
+                         ('v06_hex', 'diffuse  reflect rgb ' + g6(srgb_decode(v / 255) for v in (0xff, 0xcc, 0x88))),
+                         ('v06_rgbhex', 'diffuse  reflect rgb ' + g6([0x80 / 255] * 3)))
         ] + [
-            (warned(out, "'v06_alphav': anisotropic alpha_u 0.1 / alpha_v 0.4"),
-             "0.6: alphaV alone left no # WARN that it is anisotropic"),
+            (warned(out, "'v06_alphav': only one of alpha_u/alpha_v given")
+             and warned(out, "'v06_alphav': anisotropic alpha_u 0.1 / alpha_v 0.4"),
+             "0.6: alphaV alone left no # WARN that Mitsuba rejects it, or that it is anisotropic"),
             (bool(re.search(r'^\s*eye 3 1 6\s', out, re.M)), "0.6: toWorld did not place the sensor at (3, 1, 6)"),
             (bool(re.search(r'^\s*fov_y 40\s*$', out, re.M)), "0.6: $fovDeg did not substitute into the sensor's fov"),
         ], fails)
@@ -551,20 +577,29 @@ def main():
             (mats.get('_default_emit') == 'diffuse  reflect 0.7  emit rgbillum 1 0.5 0.2'
              and emit is not None and emit.group(1) == '_default_emit',
              f"ply emitter: material {mats.get('_default_emit')!r}, or no mesh line bound to it"),
-            ('light spot { origin 1 3 1  dir 0 -1 0  inner_angle 180  outer_angle 180  spd 100 }' in out,
-             "a point light (position by value=, intensity 100) did not become an all-round spot of spd 100"),
+            ('light spot { origin 1 3 1  dir 0 -1 0  inner_angle 180  outer_angle 180  spd rgbillum 100 100 100 }' in out,
+             "a point light (position by value=, intensity 100) did not become an all-round white spot of 100"),
+            (warned(out, 'spot emitter whose to_world leaves it no direction') and ' dir 0 0 0 ' not in out,
+             "a spot with a degenerate to_world got no direction or no # WARN"),
+            ('sphere { center 5 0 0  radius 2  material placed_sphere }' in out,
+             "a sphere's center and radius were not placed by its to_world (expected radius 2 at x 5)"),
+            (mats.get('sampled') == 'diffuse  reflect table { 400:0.2 700:0.8 }',
+             f"an irregular spectrum came out as {mats.get('sampled')!r}"),
             ('light spot { origin 0 4 0  dir 0 -1 0  inner_angle 22.5  outer_angle 30  spd rgbillum 5 5 5 }' in out,
              "a spot (cutoff 30, aimed down) did not become light spot 22.5/30 aimed down"),
             (sun is not None and floats(sun.group(1)) == [0, 1, 0] and sun.group(2) == 'rgbillum 2 2 2',
              f"directional value=(0,-1,0), irradiance 2 came out as {sun.group(0) if sun else None!r}"),
-            (area_spd(10) == '5', f"area radiance <float> 5 came out as {area_spd(10)!r}"),
+            (area_spd(10) == 'rgbillum 5 5 5', f"area radiance <float> 5 came out as {area_spd(10)!r}"),
             (close(at550(area_spd(12)), 2 * planck_nm(550, 3000)),
-             f"0.6 blackbody 3000 K x2 came out as {at550(area_spd(12))} at 550 nm, "
+             f"0.6 blackbody 3000K x2 came out as {at550(area_spd(12))} at 550 nm, "
              f"not {2 * planck_nm(550, 3000):.6g} W/(m^2 sr nm)"),
             (close(at550(area_spd(14)), planck_nm(550, 3000)),
              f"3's <spectrum type=blackbody> 3000 K came out as {at550(area_spd(14))} at 550 nm"),
-            (area_spd(16) == '1' and warned(out, 'area emitter has no radiance'),
+            (area_spd(16) == 'rgbillum 1 1 1' and warned(out, 'area emitter has no radiance'),
              f"an area emitter with no radiance came out as {area_spd(16)!r} or left no # WARN"),
+            (area_spd(18) == 'rgbillum 20 20 20', f"3's d65 x20 radiance came out as {area_spd(18)!r}"),
+            (area_spd(20) == 'rgbillum 1 1 1' and warned(out, 'area emitter: its textured radiance dropped'),
+             f"a textured radiance came out as {area_spd(20)!r} or was not flagged as a dropped texture"),
             (warned(out, "missing.serialized") and 'file "missing.serialized"' not in out,
              "a .serialized mesh was written out or left no # WARN"),
         ], fails)

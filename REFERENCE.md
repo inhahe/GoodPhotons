@@ -5953,8 +5953,9 @@ dielectric is matched to its transmitted lobe, which carries most of its light a
 far narrower (0.42 `alpha` at n 1.5), so its reflection comes out the sharper.
 
 Emitters become FTSL lights at Mitsuba's own magnitude, so lights keep their brightness
-relative to one another: an RGB value becomes `rgbillum`, and a blackbody its Planck
-curve tabulated per nanometre, Mitsuba's unit (FTSL's own `blackbody` is per metre).
+relative to one another: an RGB value becomes `rgbillum`, a bare number (or `d65`
+scale) the white `rgbillum v v v` Mitsuba makes of it, and a blackbody its Planck curve
+tabulated per nanometre, Mitsuba's unit (FTSL's own `blackbody` is per metre).
 `point` becomes an all-round `light spot` (an exact point light), `spot` a `light spot`
 of its cutoff and beam width, and `directional` a `light sun` 0.53° across. An
 `envmap`'s `to_world` is flagged rather than carried, since an FTSL env turns only about
@@ -5963,7 +5964,7 @@ of its cutoff and beam width, and `directional` a `light sun` 0.53° across. An
 Euler `rotate` and `translate` exactly, and a shear or mirror is flagged. An area
 emitter on any shape becomes a light: on a mesh, an emissive copy of its material, so it
 lights the scene as a mesh light. RGB reflectances ride FTSL's Jakob–Hanika upsampling
-(a 0.6 `srgb` or `#rrggbb` colour decoded to linear first), and measured spectra pass
+(a 0.6 `srgb` colour, `#rrggbb` or not, decoded to linear first), and measured spectra pass
 through losslessly. A dielectric's `int_ior` may be a number or any of
 Mitsuba's named materials: `bk7`, `water`, `water ice`, `fused quartz`, `acrylic
 glass` and `diamond` become the matching dispersive `glass:`, and the rest (`pyrex`,
