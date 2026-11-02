@@ -72,6 +72,24 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-11-02, 0.400.8): BLACK-PIXELS-ONCE — one GPU mode-R render had pure-black pixels that four reruns did not
+
+One render of the scene `tools/check_mitsuba_import.py` writes to
+`scraps/check_mitsuba_import/bsdfs.ftsl` (64 × 64, its own `mode R` camera, GPU, `-time 8`) came
+out with pure-black (0, 0, 0) pixels, beside a brightest of (255, 243, 203) and 32 distinct
+colours. Under that scene's uniform `light env` nothing in view should be black: the camera sees
+the environment, three mirror spheres and the edge of an emissive triangle. Four renders of the
+same file straight after (one at 480 × 480, three at 64 × 64) had no pixel darker than
+(232, 215, 204). `getpixel` and `get_flattened_data` read the PNGs alike, so the black was in the
+file, not in the measurement. The image was deleted before the anomaly was noticed, so where the
+pixels sat is unknown.
+
+To re-validate: run `python tools/check_mitsuba_import.py`, which rewrites the scene (the
+generator is tracked, so the repro is too), then render `bsdfs.ftsl` repeatedly and scan each PNG
+for pixels whose channel sum is under 60. If it recurs, keep the image and its `.ftbuf`, note
+where the pixels sit, and look for NaN in the HDR film: a NaN sample clamped to black would look
+exactly like this.
+
 ## DONE (2026-10-24, 0.399.0): PUPIL-DEFENSIVE — a crossing the pupil tables missed was light the aimed samplers could never draw
 
 The tables' regions are found by tracing, and a traced region cannot be proven to hold every
