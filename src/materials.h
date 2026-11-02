@@ -43,7 +43,8 @@ inline bool parseMatType(const std::string& t, MatType& out) {
 // bundle groups several spectral envelopes plus intrinsic scalars under one name:
 //   type <matType>                     required
 //   reflect|emit|ior|absorb|transmit|substrate_k  <spectrum expr>   (token resolver)
-//   roughness|film_ior|film_thickness  <number>
+//   film_ior                           <spectrum expr>, or a bare number
+//   roughness|film_thickness           <number>
 //   layer <n> <k> <thickness_nm>       one per stack layer (accumulates, outer first)
 // Spectrum-valued fields accept the same primitive vocabulary as the scene language
 // (`const N`, `metal:Au`, `glass:BK7`, `reflectance:leaf`, `file:...`, `blackbody K`,
@@ -70,7 +71,10 @@ inline bool resolveMaterialBundle(const std::string& name, Material& out) {
         else if (f.key == "transmit")     spec(a, m.transmit);
         else if (f.key == "substrate_k")  spec(a, m.substrateK);
         else if (f.key == "roughness"      && !a.empty()) m.roughness     = num(a[0]);
-        else if (f.key == "film_ior"       && !a.empty()) m.filmIor       = num(a[0]);
+        else if (f.key == "film_ior" && !a.empty()) {
+            if (a.size() == 1 && speclib::isNumberTok(a[0])) m.filmIor = constantSpectrum(num(a[0]));
+            else spec(a, m.filmIor);
+        }
         else if (f.key == "film_thickness" && !a.empty()) m.filmThickness = num(a[0]);
         else if (f.key == "layer" && a.size() >= 3) {
             m.layerN.push_back(num(a[0]));

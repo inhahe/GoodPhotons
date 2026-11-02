@@ -457,7 +457,8 @@ struct DMaterial {
     // clamped to <= 1 per wavelength at shade time. Device twin of Material::transmit.
     DSpec  transmit;
     double roughness;
-    double filmIor, filmThickness;
+    DSpec  filmIor;                          // thin-film coating index, dispersive or not
+    double filmThickness;
     // Spatially-varying diffuse albedo: index into DScene::textures (-1 = use the
     // constant `reflect` spectrum). When >=0 the diffuse/fluoro elastic reflectance
     // is sampled from the texture at the hit (u,v) instead of specLookup(reflect).
@@ -5021,7 +5022,7 @@ __device__ static DInterfaceOptics dInterfaceOptics(const DScene& sc, const DMat
         if (!o.entering) return o;                       // inside the absorbing body: absorbed
         const Real ks = specLookup(m.substrateK, L);
         o.R = (m.type == D_THINFILM)
-            ? thinFilmReflectance(extIor, (Real)m.filmIor, ns, ks, dMatFilmThickness(sc, m, h),
+            ? thinFilmReflectance(extIor, specLookup(m.filmIor, L), ns, ks, dMatFilmThickness(sc, m, h),
                                   o.cosI, L)
             : multilayerReflectance(extIor, o.cosI, L, m.layerN, m.layerK, m.layerThick,
                                     m.layerCount, ns, ks);
@@ -5033,7 +5034,7 @@ __device__ static DInterfaceOptics dInterfaceOptics(const DScene& sc, const DMat
     if (sin2t > 1) { o.tir = true; o.R = (Real)1; return o; }
     o.cosT = sqrt((Real)1 - sin2t);
     if (m.type == D_THINFILM) {
-        o.R = thinFilmReflectance(n1, (Real)m.filmIor, n2, (Real)0, dMatFilmThickness(sc, m, h),
+        o.R = thinFilmReflectance(n1, specLookup(m.filmIor, L), n2, (Real)0, dMatFilmThickness(sc, m, h),
                                   o.cosI, L);
     } else if (m.type == D_MULTILAYER) {
         o.R = o.entering
@@ -5307,7 +5308,7 @@ __device__ static Real dIridescenceR(const DScene& sc, const DMaterial& m, const
     if (m.iridescence == 0) return (Real)1;
     const Real ns = specLookup(m.ior, lambda), ks = specLookup(m.substrateK, lambda);
     if (m.iridescence == 1)
-        return thinFilmReflectance((Real)1, (Real)m.filmIor, ns, ks,
+        return thinFilmReflectance((Real)1, specLookup(m.filmIor, lambda), ns, ks,
                                    h ? dMatFilmThickness(sc, m, *h) : (Real)m.filmThickness,
                                    cosH, lambda);
     return multilayerReflectance((Real)1, cosH, lambda, m.layerN, m.layerK, m.layerThick,
@@ -9704,7 +9705,7 @@ __device__ static double dLayeredCoatReflectance(const DScene& sc, const DMateri
         const Real th = dMatFilmThickness(sc, m, h);
         if (thOut) *thOut = th;
         const Real ns = specLookup(m.ior, lambda);
-        return (double)clamp01(thinFilmReflectance((Real)1, (Real)m.filmIor, ns, (Real)0,
+        return (double)clamp01(thinFilmReflectance((Real)1, specLookup(m.filmIor, lambda), ns, (Real)0,
                                                    th, (Real)cosI, lambda));
     }
     const double n1 = 1.0, n2 = (double)specLookup(m.ior, lambda);   // Fresnel dielectric
@@ -9751,7 +9752,7 @@ __device__ static double dCoatRAtJ(const DMaterial& m, double cosI, Real th, Rea
     if (m.coatModel == 2) return (double)clamp01((Real)m.coatSpecular);
     if (m.coatModel == 1) {
         const Real ns = specLookup(m.ior, lambda);
-        return (double)clamp01(thinFilmReflectance((Real)1, (Real)m.filmIor, ns, (Real)0,
+        return (double)clamp01(thinFilmReflectance((Real)1, specLookup(m.filmIor, lambda), ns, (Real)0,
                                                    th, (Real)cosI, lambda));
     }
     const double n1 = 1.0, n2 = (double)specLookup(m.ior, lambda);
@@ -21702,7 +21703,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             d.fluoInCdfOffset = 0; d.fluoInCdfN = 0; d.fluoInCdfStep = 1.0;
         }
         d.roughness = m.roughness;
-        d.filmIor = m.filmIor; d.filmThickness = m.filmThickness;
+        bakeSpec(m.filmIor, d.filmIor, up);
+        d.filmThickness = m.filmThickness;
         d.roughnessTex = m.roughnessTex;
         d.filmThicknessTex = m.filmThicknessTex;
         d.normalTex = m.normalTex;

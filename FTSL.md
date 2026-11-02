@@ -227,7 +227,10 @@ A spectrum expression appears after `spd`, `reflect`, `ior`, `absorb`, `emit`,
 `tableware-crystal`/`lead-crystal`/`LLF1` (glassware lead crystal),
 `silica`/`fused-silica`/`quartz`, `sapphire`, `diamond`, `water`, `ice`,
 `acrylic`/`pmma`, `polycarbonate`/`pc`, `xenon`/`Xe` (gas at STP),
-`xenon-lamp`/`xenon-arc`/`xenon-operating` (a running short-arc lamp's fill).
+`xenon-lamp`/`xenon-arc`/`xenon-operating` (a running short-arc lamp's fill),
+`cubic-zirconia`/`cz`/`zirconia` (the fake diamond, measured: n_d 2.15, fire 0.060),
+`titania`/`tio2` (titanium dioxide as a thin film, measured: 2.92 at 360 nm, 2.44 at 550 --
+the index for a titania coating's `film_ior`).
 
 ### 3.2 `metal:<name>` reflectances
 
@@ -1234,10 +1237,14 @@ Fills a complete material; a few knobs may be overridden afterward
 - **Metals** (glossy, roughness 0.05): every `metal:` name — `gold`, `silver`,
   `copper`, `aluminium`, `chromium`/`chrome`, `brass` (also `Au`/`Ag`/`Cu`/… ).
 - **Glass** (dielectric): `glass` (=BK7) and every `glass:` name (`BK7`, `SF10`,
-  `diamond`, `water`, …).
+  `diamond`, `water`, …) -- among them the gems `diamond`, `cubic-zirconia`/`cz` (the fake
+  diamond) and `sapphire`.
 - **Structural colour**: `soap-bubble`/`bubble`, `oil-slick`/`oil`,
   `anodized-ti`/`anodized-titanium`, `morpho`, `beetle`/`jewel-beetle`,
   `nacre`/`mother-of-pearl`.
+- **Titania-coated stones**: `titania-coating`/`titania-rhinestone` (lead-crystal glass under
+  a 250 nm titania film: cyan to violet with the angle) and `titania-cz` (a cubic-zirconia
+  fake diamond under 60 nm, for surface sparkle). Set `film_thickness` for another colour.
 
 ### 7.2 `type <kind>`
 
@@ -1250,7 +1257,7 @@ Fills a complete material; a few knobs may be overridden afterward
 | `glossy` | `reflect <spec>`(0.9) or `reflect pattern:<n>`/`reflect_map`; `roughness <r>`(0.2) or `roughness pattern:/texture:<n>` |
 | `filter` | `transmit <spec>`(0.5) — a colored gel / Wratten filter: a thin non-scattering absorber. A ray passes straight through (no reflection, no refraction) and survives with probability T(λ). Feed T from a measured curve (`transmit filter:red-25`, `transmit file:…csv`) or a primitive (`transmit gaussian center=630 sigma=25`); `transmit pattern:<n>` / `transmit_map` vary it across the surface. |
 | `dielectric` | `ior <spec>`(BK7); `roughness`(0)/map; `absorb <spec>`(0) Beer-Lambert tint per metre |
-| `thinfilm` | `ior`(1.5); `film_ior`(1.30); `film_thickness <nm>`(300)/`film_thickness_map`; `substrate_k <spec>`(0). With a clear substrate (`substrate_k` 0) this is the surface of a body of index `ior`, coated: the ray refracts in and is then inside that body, as with `dielectric`, so give it a closed shape. A free-standing film (a soap film, a bubble's wall) has air on both sides: `ior 1`. `roughness <r>`(none) or `roughness pattern:/texture:<n>` on an **opaque** film (`substrate_k` > 0 at every wavelength) makes a rough interference reflector: the `glossy` lobe of that roughness, weighted by the film's reflectance at the half-vector's angle, which every mode renders, the forward ones included; `reflect`(1) tints it. A clear film with a `roughness` is an error. |
+| `thinfilm` | `ior`(1.5); `film_ior <spec>`(1.30) -- a number, or a dispersive index such as `glass:titania`; `film_thickness <nm>`(300)/`film_thickness_map`; `substrate_k <spec>`(0). With a clear substrate (`substrate_k` 0) this is the surface of a body of index `ior`, coated: the ray refracts in and is then inside that body, as with `dielectric`, so give it a closed shape. A free-standing film (a soap film, a bubble's wall) has air on both sides: `ior 1`. `roughness <r>`(none) or `roughness pattern:/texture:<n>` on an **opaque** film (`substrate_k` > 0 at every wavelength) makes a rough interference reflector: the `glossy` lobe of that roughness, weighted by the film's reflectance at the half-vector's angle, which every mode renders, the forward ones included; `reflect`(1) tints it. A clear film with a `roughness` is an error. |
 | `grating` | `reflect`(0.9); `groove_spacing <nm>`(1000); `groove_dir <x y z>`(0,1,0); `max_order`(3) |
 | `fluorescent` | `reflect`(0.1); `absorb <spec>`; `emit <spec>`; `yield`(1) |
 | `hair` | fiber BCSDF for `curve`/`fur` strands (Marschner R/TT/TRT, Chiang form). `reflect <spec>`(0.3) — the colour you want the *coat* to be, inverted into an interior absorption, **not** a Lambertian albedo; `sigma_a <spec>` — that absorption directly, in 1/(fiber radius), and it **wins** over `reflect` when present; `eta`(1.55); `beta_m`(0.3) longitudinal roughness; `beta_n`(0.3) azimuthal roughness; `alpha`(2.0) cuticle scale tilt in **degrees**. The scattering **medulla** (Yan et al. 2017), which is what makes fur read as fur rather than hair: `medulla`(0) is κ, the core radius as a fraction of the fiber's, and 0 leaves a solid cylinder and makes the rest inert; `medulla_sigma_s`(0); `medulla_sigma_a`(0); `medulla_g`(0) core anisotropy. `preset <species>` loads a measured fiber — `bobcat cat deer dog mouse rabbit raccoon redfox springbok human` — as **defaults**, so any key written alongside it still wins. See REFERENCE.md § Hair and fur fibers. |
@@ -1352,6 +1359,7 @@ material "carpaint" {
         roughness 0.05            # glossy coat lobe; map allowed
         ior glass:BK7             # coat index (fresnel/thinfilm)
         film_ior 1.30  film_thickness 300  film_thickness_map texture:t   # thinfilm coat
+                                  # (film_ior a spectrum too: glass:titania is a titania coat)
         specular 0.05             # flat reflectance (manual model)
         absorb rgb 400 2600 5200  # TINTED lacquer: sigma_a inside the layer, 1/m
         depth 0.0001              # layer thickness in METRES (needed by `absorb`)
@@ -1675,12 +1683,13 @@ reader's context.
 
 | kind | properties |
 |---|---|
-| spectral | `reflect`, `transmit`, `emit`, `ior`, `absorb` |
-| scalar | `roughness`, `film_thickness`, `film_ior`, `groove_spacing`, `yield` |
+| spectral | `reflect`, `transmit`, `emit`, `ior`, `absorb`, `film_ior` |
+| scalar | `roughness`, `film_thickness`, `groove_spacing`, `yield` |
 
 Cross-slot reads are legal within a kind — `reflect src.transmit` is fine, since what has
 to match is the property's *type*, not its name. Mixing kinds (`reflect src.roughness`) is
-a load error naming both.
+a load error naming both. One exception: `film_ior`, a scalar slot until 0.402.0, still
+takes a scalar (a property or a record's scalar channel) as a constant index.
 
 A property reference carries **both halves** of the slot it reads: the base spectrum *and*
 its per-hit pattern. If the reading material also writes its own `<slot>_map`, the two are

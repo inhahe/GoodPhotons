@@ -2066,7 +2066,7 @@ Declared with `material "name" { type <type> … }`.
 | `halfmirror` | Lossless beamsplitter; `reflect` is the reflect probability (default 0.5 = 50/50). A spectral `reflect` gives a wavelength-dependent (dichroic) split | `reflect` |
 | `filter` | Colored **gel / Wratten filter**: a thin non-scattering absorber. Light passes straight through (no reflection or refraction), surviving with probability `transmit`(λ) — the per-wavelength transmittance T(λ) ∈ [0,1] — and is absorbed otherwise. Like clear glass it isn't lit directly; you see its effect on whatever is behind it | `transmit` (spectrum: `filter:<name>`, `file:<path>`, or a primitive like `gaussian`; also `pattern:<name>` / `transmit_map` for a transmittance that varies across the gel) |
 | `glossy` | Rough microfacet reflector | `reflect`, `roughness` (constant or `texture:<name>` map) |
-| `thinfilm` | Single-layer interference (iridescence). With `roughness` on an opaque substrate, a **rough** interference reflector — see below | `ior`, `film_ior`, `film_thickness` (nm), `film_thickness_map texture:<name>`, `substrate_k`, `roughness` |
+| `thinfilm` | Single-layer interference (iridescence). With `roughness` on an opaque substrate, a **rough** interference reflector — see below | `ior`, `film_ior` (a number, or a dispersive index such as `glass:titania`), `film_thickness` (nm), `film_thickness_map texture:<name>`, `substrate_k`, `roughness` |
 | `multilayer` | N-layer Abelès transfer-matrix stack. With `roughness` on an opaque stack, a **rough** interference reflector — see below | `ior`, `substrate_k`, repeated `layer <n> <k> <nm>`, `roughness` |
 | `grating` | Reflective diffraction grating | `reflect`, `groove_spacing` (nm), `groove_dir`, `max_order` |
 | `fluorescent` | Stokes-shifted fluorescence. **Note `emit` means something different here:** on a fluorescent it is the *reradiation* spectrum — the SHAPE of the Stokes-shifted emission band, normalised by its own integral — **not** self-emission, so a fluorescent surface is never a light. (`emit_map` is therefore rejected on a fluorescent: a reradiation profile isn't a surface pattern.) For a surface that both fluoresces and glows on its own, use a `mix` of a `fluorescent` and an emissive `diffuse` | `reflect` (elastic base lobe), `absorb` (excitation band), `emit` (reradiation band), `yield` (quantum yield ≤ 1) |
@@ -2081,10 +2081,15 @@ Declared with `material "name" { type <type> … }`.
   `chromium`/`chrome`/`Cr`, `brass`.
 - **Glasses** (dispersive `dielectric`): `glass` (=BK7), plus every `glass:<name>`
   below (`BK7`/`crown`, `SF10`/`flint`, `crystal`, `tableware-crystal`, `silica`,
-  `sapphire`, `diamond`, `water`, `ice`, `acrylic`, `polycarbonate`).
+  `sapphire`, `diamond`, `cubic-zirconia`, `water`, `ice`, `acrylic`, `polycarbonate`,
+  `titania`).
+- **Gems** (the same glass presets, by name): `diamond`; `cubic-zirconia`/`cz`/`zirconia`,
+  the fake diamond (measured: n_d 2.15, and fire 0.060 to diamond's 0.044, so it throws more
+  colour than a diamond does); `sapphire`. Coated: `titania-cz` (below).
 - **Iridescent / structural colour** (thin-film or multilayer stacks): `soap-bubble`,
   `oil-slick`, `anodized-ti`/`anodized-titanium`, `morpho`, `beetle`/`jewel-beetle`,
-  `nacre`/`mother-of-pearl`.
+  `nacre`/`mother-of-pearl`; titania-coated stones `titania-coating` (a rhinestone) and
+  `titania-cz` (a fake diamond), below.
 
 Each iridescent preset is a **bundle file** (`data/material/<name>.material`) that
 groups the material's several spectral envelopes (`ior`, `substrate_k`) and its tuned
@@ -2113,6 +2118,46 @@ transmits has no rough form here. `roughness` takes a constant, a `pattern:` or 
 `texture:`, as on `glossy`, and `reflect` (default 1) tints the lobe. The raster preview
 draws it in the colour the coating shows face-on, which does not shift with angle there.
 Not on the GPU's fast `-rgb` path, which falls back to the spectral one.
+
+**Titania coatings (0.402.0).** Titania, titanium dioxide, is the high-index film coated on
+rhinestones and fake diamonds for extra sparkle and colour, and on iridescent art glass.
+`glass:titania` (alias `tio2`) is its measured index as a thin film (amorphous TiO2, Siefke et
+al. 2016), strongly dispersive: 2.92 at 360 nm, 2.44 at 550, 2.34 at 830. Since 0.402.0
+`film_ior` takes a spectrum, so a film can be dispersive, and each wavelength then interferes
+at its own index. A coated stone is a `thinfilm` whose `ior` is the stone's: it refracts
+through the stone as any dielectric does, with the stone's own dispersion, and the film decides
+what its surface reflects.
+
+What the coating does, and what it does not: it raises the surface reflection (bare
+rhinestone glass reflects 4.7 % face-on, under a 60 nm titania film 34 %) and, at most
+thicknesses, colours it, the colour turning from facet to facet with the angle. It does not
+make the stone refract more or throw more fire: those come from the stone's index and
+dispersion, inside it, which a film a few hundred nanometres thick does not change.
+
+    # 1. A titania-coated rhinestone (lead-crystal glass, 250 nm film: cyan, blue, violet)
+    material "stone" { preset titania-coating }
+    material "gold-stone" { preset titania-coating  film_thickness 80 }
+
+    # 2. A coated fake diamond: cubic zirconia under 60 nm of titania (22 % instead of 13 %)
+    material "cz" { preset titania-cz }
+
+    # 3. Any stone, any thickness: a deep-blue coated quartz ("mystic" quartz)
+    material "mystic-quartz" { type thinfilm  ior glass:quartz
+                               film_ior glass:titania  film_thickness 130 }
+
+    # 4. A titania coat over an opaque material: `layered`, with a thin-film coat
+    material "coated-paint" { type layered
+        coat { reflectance thinfilm  ior 1.5  film_ior glass:titania  film_thickness 250 }
+        layer "red-paint" 1 }
+
+Film thickness on glass, face-on: 60 nm a bright neutral mirror (the most sparkle, no colour),
+80 nm gold, 100 nm pink, 130 nm deep blue, 160 nm green, 250 nm cyan turning violet. On cubic
+zirconia (`glass:cubic-zirconia`, alias `cz`, measured: n_d 2.15, fire 0.060 against diamond's
+0.044) the two indices are close, so the film brightens (13 % → 22 % at 60 nm) and only tints
+(pink, pale cyan) at other thicknesses. On diamond (2.42) titania (2.44) does almost
+nothing at all: a film shows only where its index differs from the stone's. The film's own absorption (k 0.03 at 360 nm, under
+0.001 above 400 nm) is not carried. `layer` rows in a `multilayer` still take a constant
+index, so a TiO2/SiO2 dichroic stack uses titania's index at one wavelength (2.44 at 550 nm).
 
 **Translucency (dielectrics).** Beyond perfectly clear glass, a `dielectric` supports
 two physically-motivated translucency controls (both compose with dispersion):
@@ -2835,8 +2880,10 @@ Anywhere a spectrum is expected (`spd`, `reflect`, `ior`, …) you can write:
   (the tails are held flat, not extrapolated).
 - **`glass:<name>`** — dispersive index via Sellmeier: `BK7`/crown, `SF10`/flint,
   `silica`/fused-silica, `sapphire`, `diamond`, two lead crystals, plus Cauchy fits
-  for `water`, `ice`, `acrylic`/PMMA, `polycarbonate`, and constant indices for
-  xenon gas: `xenon`/`Xe` at STP, `xenon-lamp` for a running short-arc lamp's fill.
+  for `water`, `ice`, `acrylic`/PMMA, `polycarbonate`, constant indices for
+  xenon gas: `xenon`/`Xe` at STP, `xenon-lamp` for a running short-arc lamp's fill, and
+  measured tables for `cubic-zirconia`/`cz`, the fake diamond, and `titania`/`TiO2`,
+  titanium dioxide as a thin film, the coating (see *Titania coatings* under Materials).
   The lead crystals:
   - `tableware-crystal`/`lead-crystal`/`LLF1` matches cut-crystal glassware. EU "lead
     crystal" needs at least 24 % PbO and n_D ≥ 1.545, which lands near Schott LLF1

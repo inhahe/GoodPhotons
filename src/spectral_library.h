@@ -150,6 +150,9 @@ inline bool loadCurve(const std::string& category, const std::string& name, Spec
 //   form sellmeier / B b1 b2 b3 / C c1 c2 c3      -> sellmeier(B..,C..)
 //   form cauchy     / A a / B b                    -> cauchy(a, b)
 //   form constant   / n 1.5                        -> iorConstant(n)
+//   form table      / one `<nm> <n>` row per line  -> tabulatedSpectrum (a measured index with no
+//                                                     formula that fits it, e.g. near an
+//                                                     absorption edge; at least two rows)
 inline bool loadGlass(const std::string& name, Spectrum& out) {
     std::string path;
     if (!findFile("glass", name, path)) return false;
@@ -160,11 +163,20 @@ inline bool loadGlass(const std::string& name, Spectrum& out) {
     if (!f) return false;
     std::string form, line;
     std::vector<double> B, C, A, N;
+    std::vector<std::pair<double, double>> rows;   // form table: (nm, n)
     while (std::getline(f, line)) {
         auto h = line.find('#'); if (h != std::string::npos) line.erase(h);
         std::istringstream ss(line); std::string key;
         if (!(ss >> key)) continue;
         if (key == "form") { ss >> form; continue; }
+        if (form == "table") {
+            char* end = nullptr;
+            const double nm = std::strtod(key.c_str(), &end);
+            double n;
+            if (end == key.c_str() || *end || !(ss >> n)) return false;   // a malformed row
+            rows.emplace_back(nm, n);
+            continue;
+        }
         std::vector<double>* dst = (key == "B") ? &B : (key == "C") ? &C
                                  : (key == "A") ? &A : (key == "n") ? &N : nullptr;
         if (dst) { double v; while (ss >> v) dst->push_back(v); }
@@ -176,6 +188,8 @@ inline bool loadGlass(const std::string& name, Spectrum& out) {
         s = cauchy(A[0], B[0]);
     else if (form == "constant" && N.size() >= 1)
         s = iorConstant(N[0]);
+    else if (form == "table" && rows.size() >= 2)
+        s = tabulatedSpectrum(std::move(rows));
     else return false;
     cache[path] = s; out = s; return true;
 }

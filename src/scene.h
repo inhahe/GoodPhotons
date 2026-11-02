@@ -272,8 +272,9 @@ struct Material {
     }
 
     // --- Thin-film / iridescence (MatType::ThinFilm) ------------------------
-    // A thin dielectric coating of index filmIor and thickness filmThickness (in
-    // nanometres) over a substrate whose index is `ior`. Interference between the
+    // A thin dielectric coating of index filmIor (a spectrum: a constant, or a dispersive film
+    // such as glass:titania) and thickness filmThickness (in nanometres) over a substrate whose
+    // index is `ior`. Interference between the
     // two coating interfaces yields an angle/wavelength-dependent reflectance
     // (structural colour). With a transparent (real-index) substrate, transport is
     // lossless specular reflect-or-refract, exactly like Dielectric. `substrateK` is
@@ -283,7 +284,7 @@ struct Material {
     // film reflects the interference fraction R and the transmitted rest is absorbed
     // (no refracted ray). Default 0 -> the exact lossless behaviour is preserved
     // bit-for-bit.
-    double filmIor = 1.30;                      // coating refractive index n1
+    Spectrum filmIor = constantSpectrum(1.30);  // coating refractive index n1(lambda)
     double filmThickness = 300.0;              // coating thickness in nanometres
     Spectrum substrateK = constantSpectrum(0.0); // substrate extinction kappa (0 = transparent)
 

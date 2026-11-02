@@ -1,0 +1,13 @@
+# A fake diamond, coated: cubic zirconia (glass:cubic-zirconia, n_d 2.15, fire 0.060) under a
+# 60 nm film of titania (glass:titania, 2.44 at 550 nm). 60 nm is a quarter wave in the film,
+# where its reflections add: the facets reflect 22 % face-on instead of bare CZ's 13 %, with no
+# colour -- the brighter surface sparkle such a coating is for. The stone's refraction and fire
+# are its own; the film does not change them. Titania and CZ are close in index, so a thicker
+# film only tints: pink at 100 and 200 nm, pale cyan at 150. For a coloured "mystic" look use
+# glass, where the contrast is larger (preset titania-coating). A clear coating: the stone
+# refracts, so give it a closed shape.
+# aliases: titania-coated-cz coated-cz
+type thinfilm
+ior            glass:cubic-zirconia
+film_ior       glass:titania
+film_thickness 60

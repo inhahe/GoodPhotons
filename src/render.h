@@ -259,7 +259,7 @@ inline FluoroResult fluoroInteract(const Material& m, double lambdaIn, Pcg32& rn
 // Interface (coat) reflectance for a MatType::Layered surface at a hit. Returns the
 // unpolarised power reflectance R in [0,1] used as the reflect-vs-enter probability:
 //   coatModel 2 (manual): the constant coatSpecular (angle/wavelength independent).
-//   coatModel 1 (thinfilm): thin-film Airy R with film index filmIor over the body's
+//   coatModel 1 (thinfilm): thin-film Airy R with film index filmIor(lambda) over the body's
 //     effective index m.ior(lambda) — iridescent coat (transparent, so 1-R enters).
 //   coatModel 0 (fresnel): plain dielectric Fresnel from m.ior(lambda) at cosI.
 // Shared by the forward and backward tracers so both split the photon identically.
@@ -272,7 +272,7 @@ inline double layeredCoatReflectance(const Scene& scene, const Material& m, cons
     if (m.coatModel == 1) {                          // thin-film Airy coat
         double thickness = materialFilmThickness(scene, m, h);
         double ns = m.ior(lambda);                   // effective index below the film
-        return clamp01(thinFilmReflectance(1.0, m.filmIor, ns, 0.0, thickness, cosI, lambda));
+        return clamp01(thinFilmReflectance(1.0, m.filmIor(lambda), ns, 0.0, thickness, cosI, lambda));
     }
     double n1 = 1.0, n2 = m.ior(lambda);             // Fresnel dielectric
     double eta = n1 / n2;
@@ -4211,7 +4211,7 @@ struct Renderer {
             if (!o.entering) return o;                  // inside the absorbing body: absorbed
             const double ks = m.substrateK(L);
             o.R = (m.type == MatType::ThinFilm)
-                ? thinFilmReflectance(extIor, m.filmIor, ns, ks, materialFilmThickness(scene, m, h),
+                ? thinFilmReflectance(extIor, m.filmIor(L), ns, ks, materialFilmThickness(scene, m, h),
                                       o.cosI, L)
                 : multilayerReflectance(extIor, o.cosI, L, m.layerN.data(), m.layerK.data(),
                                         m.layerThick.data(), nL, ns, ks);
@@ -4226,7 +4226,7 @@ struct Renderer {
         if (m.type == MatType::ThinFilm) {
             // Incidence medium, film, transmission medium: reciprocal, so a ray entering and one
             // leaving see the same R.
-            o.R = thinFilmReflectance(n1, m.filmIor, n2, 0.0, materialFilmThickness(scene, m, h),
+            o.R = thinFilmReflectance(n1, m.filmIor(L), n2, 0.0, materialFilmThickness(scene, m, h),
                                       o.cosI, L);
         } else if (m.type == MatType::Multilayer) {
             // From the incidence side: a ray leaving (inside the substrate) meets the layers in

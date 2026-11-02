@@ -2462,15 +2462,15 @@ private:
             if (refuseTex(sm.filmThicknessTex)) return true;
             out.scalar = sm.filmThickness;  out.pat = sm.filmThicknessPat;
         } else if (slot == "film_ior") {
-            out.scalar = sm.filmIor;
+            out.spectral = true; out.spec = sm.filmIor;
         } else if (slot == "groove_spacing") {
             out.scalar = sm.grooveSpacing;
         } else if (slot == "yield") {
             out.scalar = sm.fluoYield;
         } else {
             fail("material property '" + tok + "': material '" + head + "' has no property '" +
-                 slot + "' (spectral: reflect, transmit, emit, ior, absorb; scalar: roughness, "
-                 "film_thickness, film_ior, groove_spacing, yield)");
+                 slot + "' (spectral: reflect, transmit, emit, ior, absorb, film_ior; scalar: "
+                 "roughness, film_thickness, groove_spacing, yield)");
             return true;
         }
         out.ok = true;
@@ -2964,11 +2964,41 @@ private:
         return evalSpectrum(s->val);
     }
 
+    // `film_ior`: a coating's index, a spectrum -- a number, or a dispersive film such as
+    // `glass:titania`. A SCALAR reference (a record's scalar channel, another material's scalar
+    // property) is taken too, as a constant index -- a film's index is often authored as one
+    // number -- which spectrumParam alone would refuse.
+    Spectrum filmIorParam(const Block& b, Spectrum dflt) {
+        const Stmt* s = find(b, "film_ior");
+        if (!s || s->val.words.empty()) return dflt;
+        const std::string& w = s->val.words[0];
+        const size_t dot = w.find('.');
+        if (s->val.words.size() == 1 && dot != std::string::npos && !isNumber(w)) {
+            const std::string head = w.substr(0, dot);
+            bool scalar = false;
+            if (auto rit = recordIndex_.find(head);
+                rit != recordIndex_.end() && records_ && rit->second < (int)records_->size()) {
+                const std::string rest = w.substr(dot + 1);
+                const Record& rec = (*records_)[rit->second];
+                const int ci = rec.channelIndex(rest.substr(0, rest.find_first_of("[(")));
+                scalar = ci >= 0 && rec.channels[ci].kind == ChanKind::Scalar;
+            } else {
+                MatProp mp;
+                if (materialPropRef(w, mp)) {
+                    if (!mp.ok) return dflt;                     // fail() already set
+                    scalar = !mp.spectral;
+                }
+            }
+            if (scalar) return constantSpectrum(dblParam(b, "film_ior", 1.30));
+        }
+        return spectrumParam(b, "film_ior", dflt);
+    }
+
     // Records stage 5a: scalar-slot reader that also accepts a constant record channel
     // ref (`RECORD.channel[i]` / `RECORD.channel(const)`) — the scalar analogue of
     // spectrumParam. Absent key -> default; a plain number -> that number; a token whose
     // head names a record -> recordConstScalarRef (which fills the value or sets fail).
-    // This is the chokepoint that gives material scalar slots (roughness, film_ior, …)
+    // This is the chokepoint that gives material scalar slots (roughness, film_thickness, …)
     // record-ref support without each call site knowing about records.
     double dblParam(const Block& b, const char* key, double dflt) {
         const Stmt* s = find(b, key);
@@ -2988,7 +3018,7 @@ private:
             double rv;
             if (recordConstScalarRef(w0, rv)) return rv;             // record ref (or a fail was set)
             // §3.2 per-property access at a scalar slot: `roughness gold.roughness`,
-            // `film_ior coat.film_ior`. A pattern-carrying source is refused here rather
+            // `film_thickness coat.film_thickness`. A pattern-carrying source is refused here rather
             // than dropped — the slots that CAN hold a per-hit pattern try
             // bindScalarPattern first (which takes the pattern), so reaching dblParam
             // with one in hand means this particular slot has nowhere to put it.
@@ -4831,7 +4861,7 @@ private:
                     !bindScalarTexture(b, "roughness", m.roughnessTex))
                     m.roughness = dblParam(b, "roughness", m.roughness);
             }
-            if (find(b, "film_ior"))       m.filmIor       = dblParam(b, "film_ior", m.filmIor);
+            if (find(b, "film_ior"))       m.filmIor       = filmIorParam(b, m.filmIor);
             if (find(b, "film_thickness")) m.filmThickness = dblParam(b, "film_thickness", m.filmThickness);
             if (!bindScalarPattern(b, "film_thickness_map", m.filmThicknessPat))
                 bindScalarTexture(b, "film_thickness_map", m.filmThicknessTex);
@@ -4907,7 +4937,7 @@ private:
         } else if (type == "thinfilm") {
             m.type = MatType::ThinFilm;
             m.ior = spectrumParam(b, "ior", iorConstant(1.5));
-            m.filmIor = dblParam(b, "film_ior", 1.30);
+            m.filmIor = filmIorParam(b, constantSpectrum(1.30));
             // `film_thickness <nm>` is the peak/scale; `film_thickness_map texture:<n>`
             // binds a 0..1 profile scaled by it (spatially-varying iridescence, §9.4).
             m.filmThickness = dblParam(b, "film_thickness", 300.0);
@@ -5069,7 +5099,7 @@ private:
             // Fresnel/thinfilm read the coat index from `ior` (coat over body index
             // m.ior); manual uses a flat specular fraction.
             if (find(cb, "ior")) m.ior = spectrumParam(cb, "ior", m.ior);
-            m.filmIor = dblOf(cb, "film_ior", 1.30);
+            m.filmIor = filmIorParam(cb, constantSpectrum(1.30));
             m.filmThickness = dblOf(cb, "film_thickness", 300.0);
             bindScalarTexture(cb, "film_thickness_map", m.filmThicknessTex);
             if (m.coatModel == 2) m.coatSpecular = dblOf(cb, "specular", 0.05);

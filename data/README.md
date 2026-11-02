@@ -30,6 +30,8 @@ it contains no algorithm.
   - `form sellmeier` + `B b1 b2 b3` + `C c1 c2 c3`  → `sellmeier(B…,C…)`
   - `form cauchy` + `A a` + `B b`                    → `cauchy(a,b)`
   - `form constant` + `n 1.5`                        → `iorConstant(n)`
+  - `form table` + one `<nm> <n>` row per line       → `tabulatedSpectrum` (a measured index
+    no formula fits, such as `titania.glass` near its absorption edge; at least two rows)
 - **Bundle files** (`.material`, `.light`, categories `material/`, `light/`): a
   *composite asset* that groups several spectral envelopes plus intrinsic scalars
   under one name — because a single material/light genuinely owns more than one curve
@@ -40,7 +42,8 @@ it contains no algorithm.
   scene language** — `const N`, `metal:Au`, `glass:BK7`, `reflectance:leaf`,
   `illuminant:f2`, `file:<path>`, `blackbody K`, `ior N`, `gaussian center=… sigma=…`
   — so a bundle field just references a library primitive. Material bundles also take
-  `type <matType>`, `roughness`/`film_ior`/`film_thickness` scalars, and repeatable
+  `type <matType>`, `roughness`/`film_thickness` scalars, `film_ior` (a number or a spectrum
+  expression, e.g. `glass:titania`), and repeatable
   `layer <n> <k> <thickness_nm>` rows (outer first) for multilayer stacks. Light
   bundles currently take one `spd <expr>` (plus a light-only `led-white <warm>` /
   `led-cct <K>` / gas-discharge model vocabulary). Interpreted by

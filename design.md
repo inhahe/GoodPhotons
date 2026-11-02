@@ -9913,6 +9913,30 @@ The device material holds at most `D_MAXLAYERS` (16) layers. `cudaForwardSupport
 device gate (backward, BDPT, VCM, photon map, SPPM) goes through `cudaForwardSupported`, so a
 deeper stack falls back to the CPU in every mode, as a specular one always did.
 
+## A dispersive film index, and titania (0.402.0)
+
+`Material::filmIor` is a `Spectrum` (it was a `double`), and `DMaterial::filmIor` a `DSpec`, so a
+thin film's index can vary with wavelength the way its substrate's (`ior`) always could. Every
+reader evaluates it at the wavelength it already holds: `interfaceOptics` (the specular
+coating), `layeredCoatReflectance` (a `layered` coat's `reflectance thinfilm`),
+`coatingReflectance` (the rough reflector, the raster tint), and their device twins. A
+constant film reads back the same double from both, so a scene with a numeric `film_ior`
+renders bit-identically. The parse goes through `ftsl.h filmIorParam`: a spectrum, or, since
+the slot was scalar until now, a scalar reference (another material's scalar property, a
+record's scalar channel) as a constant; `film_ior` moved to the spectral property kind.
+
+The motivating index is `glass:titania` (`data/glass/titania.glass`), TiO2 as a thin film —
+the coating on rhinestones and fake diamonds (presets `titania-coating`, `titania-cz`, the
+latter over the new measured `glass:cubic-zirconia`), on art glass, the oxide on anodized
+titanium. A coated stone is a clear-substrate `thinfilm` whose `ior` is the stone's, so the
+body refracts with its own dispersion and the film sets only the surface reflection. Near its
+absorption edge (3.2 eV, under 400 nm) no Sellmeier or Cauchy form fits it
+(a two-term Sellmeier misses by 0.04-0.07), so `.glass` files gained `form table`: measured
+`<nm> <n>` rows through `tabulatedSpectrum`. The film's own extinction (k 0.03 at 360 nm) is
+not carried; `thinFilmReflectance` takes a real film index. Multilayer `layer` rows stay
+constant (`layerN` / `layerK` are per-layer doubles, and the device holds them in fixed
+arrays): a dispersive layer would need a spectrum per layer on both backends.
+
 ## Watertight raster coverage (shared by both backends, 0.98.2)
 
 Both rasterizers decide pixel coverage with **canonical edge functions**, so a pixel lying

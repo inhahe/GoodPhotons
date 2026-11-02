@@ -155,7 +155,8 @@ inline double multilayerReflectance(double n0, double cosI, double lambda,
 inline double coatingReflectance(const Material& m, double thickness, double lambda, double cosI) {
     if (m.iridescence == 0) return 1.0;
     const double ns = m.ior(lambda), ks = m.substrateK(lambda);
-    if (m.iridescence == 1) return thinFilmReflectance(1.0, m.filmIor, ns, ks, thickness, cosI, lambda);
+    if (m.iridescence == 1)
+        return thinFilmReflectance(1.0, m.filmIor(lambda), ns, ks, thickness, cosI, lambda);
     return multilayerReflectance(1.0, cosI, lambda, m.layerN.data(), m.layerK.data(),
                                  m.layerThick.data(), (int)m.layerN.size(), ns, ks);
 }

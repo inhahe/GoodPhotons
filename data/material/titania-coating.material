@@ -1,0 +1,14 @@
+# A rhinestone: lead-crystal glass (LLF1, the glass of cut-crystal jewellery) coated with a film of
+# titania, titanium dioxide, the way coated stones are given their sparkle and colour. The film's
+# index is the measured, dispersive glass:titania (2.92 at 360 nm, 2.44 at 550, 2.34 at 830).
+# A coating does not change how the stone refracts or how much fire it throws -- both come from
+# the glass inside -- it changes what the surface reflects: bare, this glass reflects 4.7 % face-on.
+# At 250 nm the film reflects cyan face-on, blue at 30 degrees and violet past 50, so the colour
+# changes from facet to facet. Other thicknesses, face-on: 60 nm a bright neutral mirror (34 %, the
+# most sparkle, no colour); 80 nm gold; 100 nm pink; 130 nm deep blue; 160 nm green. Set
+# `film_thickness` to choose. A clear coating: the stone refracts, so give it a closed shape.
+# aliases: titania-glass titania-rhinestone tio2-coating
+type thinfilm
+ior            glass:lead-crystal
+film_ior       glass:titania
+film_thickness 250

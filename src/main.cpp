@@ -396,7 +396,7 @@ static Scene buildCornell(int res, char mode, const Spectrum& lightSpd,
     s.mats.push_back(makeFluoroMaterial());                                              // 6 (fluorescent)
     Material film;  film.type = MatType::ThinFilm;
     film.ior = iorConstant(1.5);                // dispersion-free glass-like substrate
-    film.filmIor = filmIor; film.filmThickness = filmThickness;
+    film.filmIor = constantSpectrum(filmIor); film.filmThickness = filmThickness;
     s.mats.push_back(film);                                                              // 7 (thin film)
 
     addQuad(s, {0,0,0},{1,0,0},{1,0,1},{0,0,1}, 0);            // floor
@@ -12078,7 +12078,7 @@ static int checkProp() {
         if (loadMats("material \"src\" { type thinfilm  film_ior 1.42  film_thickness 275 }\n"
                      "material \"probe\" { type thinfilm  film_ior src.film_ior  "
                      "film_thickness src.film_thickness }", A)) {
-            chk("film_ior read back", std::fabs(probeOf(A).filmIor - 1.42) < 1e-12);
+            chk("film_ior read back", std::fabs(probeOf(A).filmIor(550.0) - 1.42) < 1e-12);
             chk("film_thickness read back", std::fabs(probeOf(A).filmThickness - 275.0) < 1e-12);
         } else ok = false;
     }
