@@ -12082,6 +12082,29 @@ static int checkProp() {
             chk("film_thickness read back", std::fabs(probeOf(A).filmThickness - 275.0) < 1e-12);
         } else ok = false;
     }
+    // The film index is spectral, but its scalar forms still read both ways: a scalar property as
+    // a constant index, and a constant index at a scalar slot.
+    {
+        ftsl::Loaded A;
+        if (loadMats("material \"src\" { type thinfilm  film_ior 1.42  film_thickness 275 }\n"
+                     "material \"probe\" { type thinfilm  film_ior src.film_thickness  "
+                     "film_thickness src.film_ior }", A)) {
+            chk("a scalar property as a constant film index",
+                std::fabs(probeOf(A).filmIor(400.0) - 275.0) < 1e-12 &&
+                std::fabs(probeOf(A).filmIor(700.0) - 275.0) < 1e-12);
+            chk("a constant film index at a scalar slot",
+                std::fabs(probeOf(A).filmThickness - 1.42) < 1e-12);
+        } else ok = false;
+    }
+    // Any spectrum form is a film index, a block-valued `table { }` included.
+    {
+        ftsl::Loaded A;
+        if (loadMats("material \"probe\" { type thinfilm  film_ior table { 400:2.6 700:2.4 } }", A)) {
+            chk("a table film index is read",
+                std::fabs(probeOf(A).filmIor(400.0) - 2.6) < 1e-9 &&
+                std::fabs(probeOf(A).filmIor(700.0) - 2.4) < 1e-9);
+        } else ok = false;
+    }
     // A pattern-driven scalar property carries its pattern through the reference.
     {
         ftsl::Loaded A, B;
@@ -12529,9 +12552,16 @@ static int checkArray() {
         mustReject("a per-hit table is refused at a load-time SPECTRAL slot",
             iorCall.c_str(), "fixed at load time");
         const std::string filmCall = gramp +
-            "material \"probe\" { type thinfilm  film_ior grid:g(u) }";
+            "material \"probe\" { type thinfilm  film_thickness grid:g(u) }";
         mustReject("a per-hit table is refused at a load-time SCALAR slot",
             filmCall.c_str(), "fixed at load time");
+        const std::string filmIorCall = gramp +
+            "material \"probe\" { type thinfilm  film_ior grid:g(u) }";
+        mustReject("a per-hit table is refused at the film index, a load-time spectrum",
+            filmIorCall.c_str(), "fixed at load time");
+        mustReject("a film index that reaches zero is refused, not rendered as NaN",
+            "material \"probe\" { type thinfilm  film_ior table { 400:1.5 700:0 } }",
+            "must be positive");
         const std::string bare = gramp + "material \"probe\" { type diffuse  reflect grid:g }";
         mustReject("naming a table without sampling it is refused, not defaulted",
             bare.c_str(), "does not sample it");

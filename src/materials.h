@@ -71,10 +71,7 @@ inline bool resolveMaterialBundle(const std::string& name, Material& out) {
         else if (f.key == "transmit")     spec(a, m.transmit);
         else if (f.key == "substrate_k")  spec(a, m.substrateK);
         else if (f.key == "roughness"      && !a.empty()) m.roughness     = num(a[0]);
-        else if (f.key == "film_ior" && !a.empty()) {
-            if (a.size() == 1 && speclib::isNumberTok(a[0])) m.filmIor = constantSpectrum(num(a[0]));
-            else spec(a, m.filmIor);
-        }
+        else if (f.key == "film_ior")     spec(a, m.filmIor);
         else if (f.key == "film_thickness" && !a.empty()) m.filmThickness = num(a[0]);
         else if (f.key == "layer" && a.size() >= 3) {
             m.layerN.push_back(num(a[0]));

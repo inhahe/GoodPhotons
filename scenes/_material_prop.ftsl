@@ -34,7 +34,8 @@
 # cancels the lighting profile.  Each identity pair is placed in the same row for that
 # reason.
 #
-# The SCALAR arm (`roughness src.roughness`, `film_ior`, `film_thickness`) is deliberately
+# The SCALAR arm (`roughness src.roughness`, `film_thickness`, and `film_ior` -- a spectral
+# property, read as a number where it is constant) is deliberately
 # NOT in this image: a glossy/thinfilm tile under these two grazing strip lights renders
 # essentially black, so a tile pair would assert nothing.  `ftrace -checkprop` pins the
 # scalar arm exactly instead — it compares loaded scenes field-by-field, which is a

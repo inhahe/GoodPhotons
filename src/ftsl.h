@@ -2964,34 +2964,64 @@ private:
         return evalSpectrum(s->val);
     }
 
-    // `film_ior`: a coating's index, a spectrum -- a number, or a dispersive film such as
-    // `glass:titania`. A SCALAR reference (a record's scalar channel, another material's scalar
-    // property) is taken too, as a constant index -- a film's index is often authored as one
-    // number -- which spectrumParam alone would refuse.
+    // `film_ior`: a coating's index, a spectrum -- a number, a dispersive film such as
+    // `glass:titania`, any spectrum form (`table { ... }` included). A SCALAR reference (a record's
+    // scalar channel, another material's scalar property) is taken too, as a constant index -- a
+    // film's index is often authored as one number -- which spectrumParam alone would refuse. The
+    // index must be positive at every wavelength (the Airy film needs n1 > 0), else a load error.
     Spectrum filmIorParam(const Block& b, Spectrum dflt) {
         const Stmt* s = find(b, "film_ior");
-        if (!s || s->val.words.empty()) return dflt;
-        const std::string& w = s->val.words[0];
-        const size_t dot = w.find('.');
-        if (s->val.words.size() == 1 && dot != std::string::npos && !isNumber(w)) {
-            const std::string head = w.substr(0, dot);
-            bool scalar = false;
-            if (auto rit = recordIndex_.find(head);
-                rit != recordIndex_.end() && records_ && rit->second < (int)records_->size()) {
-                const std::string rest = w.substr(dot + 1);
-                const Record& rec = (*records_)[rit->second];
-                const int ci = rec.channelIndex(rest.substr(0, rest.find_first_of("[(")));
-                scalar = ci >= 0 && rec.channels[ci].kind == ChanKind::Scalar;
-            } else {
-                MatProp mp;
-                if (materialPropRef(w, mp)) {
-                    if (!mp.ok) return dflt;                     // fail() already set
-                    scalar = !mp.spectral;
+        if (!s) return dflt;
+        Spectrum out = dflt;
+        bool done = false;
+        if (s->val.words.size() == 1) {
+            const std::string& w = s->val.words[0];
+            const size_t dot = w.find('.');
+            if (dot != std::string::npos && !isNumber(w)) {
+                const std::string head = w.substr(0, dot);
+                bool scalar = false;
+                if (auto rit = recordIndex_.find(head);
+                    rit != recordIndex_.end() && records_ && rit->second < (int)records_->size()) {
+                    const Record& rec = (*records_)[rit->second];
+                    const int ci = rec.channelIndex(recordRefChannel(w.substr(dot + 1)));
+                    scalar = ci >= 0 && rec.channels[ci].kind == ChanKind::Scalar;
+                } else {
+                    MatProp mp;
+                    if (materialPropRef(w, mp)) {
+                        if (!mp.ok) return dflt;                 // fail() already set
+                        scalar = !mp.spectral;
+                    }
                 }
+                if (scalar) { out = constantSpectrum(dblParam(b, "film_ior", 1.30)); done = true; }
             }
-            if (scalar) return constantSpectrum(dblParam(b, "film_ior", 1.30));
         }
-        return spectrumParam(b, "film_ior", dflt);
+        if (!done) out = spectrumParam(b, "film_ior", dflt);
+        double lowest = 1e30, lowestAt = 0.0;
+        for (double L = LAMBDA_MIN; L <= LAMBDA_MAX; L += 5.0) {
+            const double n = out(L);
+            if (!(n > 0.0)) {
+                fail("material '" + b.name + "': `film_ior` must be positive at every wavelength, and is " +
+                     std::to_string(n) + " at " + std::to_string((int)L) + " nm");
+                return dflt;
+            }
+            if (n < lowest) { lowest = n; lowestAt = L; }
+        }
+        // Below the air outside it a film totally reflects inside itself, which thinFilmReflectance
+        // takes as a perfect mirror: legal, and almost never what an index under 1 was meant as.
+        if (lowest < 1.0)
+            std::fprintf(stderr, "[ftsl] warning: material '%s': `film_ior` falls to %.3f at %d nm, "
+                         "below air's 1, where the film reflects everything\n",
+                         b.name.c_str(), lowest, (int)lowestAt);
+        return out;
+    }
+
+    // The channel a record reference's tail names -- `channel[i]`, `channel(c)` or `channel` --
+    // read as recordConstScalarRef and recordConstSpectrumRef read it: a stop selector first.
+    static std::string recordRefChannel(const std::string& rest) {
+        const size_t lb = rest.find('[');
+        if (lb != std::string::npos) return rest.substr(0, lb);
+        const size_t lp = rest.find('(');
+        return lp != std::string::npos ? rest.substr(0, lp) : rest;
     }
 
     // Records stage 5a: scalar-slot reader that also accepts a constant record channel
@@ -3025,6 +3055,18 @@ private:
             MatProp mp;
             if (materialPropRef(w0, mp)) {
                 if (!mp.ok) return dflt;                             // fail() already set
+                // A film's index is spectral, but one authored as a number reads as that number
+                // at a scalar slot, as every film index could before it could be dispersive.
+                if (mp.spectral && mp.slot == "film_ior") {
+                    const double v = mp.spec(550.0);
+                    bool flat = true;
+                    for (double L = LAMBDA_MIN; L <= LAMBDA_MAX && flat; L += 5.0)
+                        flat = mp.spec(L) == v;
+                    if (flat) return v;
+                    fail(std::string(key) + " " + w0 + ": '" + mp.slot + "' varies with "
+                         "wavelength, but this slot takes one number");
+                    return dflt;
+                }
                 if (mp.spectral) {
                     fail(std::string(key) + " " + w0 + ": '" + mp.slot + "' is a spectral "
                          "property, but this slot takes a scalar");
@@ -5196,6 +5238,7 @@ private:
         // already, and parsing it twice would compose a referenced pattern into reflectPat twice.
         if (!find(b, "reflect") && !find(b, "reflect_map")) m.reflect = constantSpectrum(1.0);
         else if (parse) m.reflect = reflectParam(b, m, constantSpectrum(1.0));
+        else if (!find(b, "reflect")) m.reflect = constantSpectrum(1.0);   // keep the map's pattern
         return true;
     }
 

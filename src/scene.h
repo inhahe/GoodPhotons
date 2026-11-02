@@ -50,8 +50,8 @@ enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescen
 // Materials mode P's camera-side layer draws when they are a pixel's first hit, because the
 // forward splat sees them badly or not at all: a delta BSDF has no connection to the pinhole
 // (the SDS limitation), so the forward light tracer renders it BLACK from the camera. Glossy is
-// here too although modes A and B splat a rough one through its lobe since 0.401.0 (render.h
-// glossySplats): a sharp lobe converges slowly that way, and the camera side does it far better.
+// here too although modes A and B splat a rough one through its lobe (render.h glossySplats): a
+// sharp lobe converges slowly that way, and the camera side does it far better.
 // Diffuse and Fluorescent connect in model B, so they are NOT specular-side.
 inline bool isSpecularType(MatType t) {
     return t == MatType::Dielectric || t == MatType::Mirror ||
