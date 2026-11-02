@@ -47,11 +47,12 @@ inline void reset() { total = 0; }
 // uploaded material.
 enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescent, ThinFilm, Grating, Mix, Multilayer, Layered, DiffuseTransmit, Filter, Hair };
 
-// Materials whose last-vertex-before-camera cannot connect to the pinhole in
-// model B (a delta or near-delta BSDF has ~zero connection pdf): the forward
-// light tracer renders them BLACK from the camera (the SDS limitation). The
-// camera-side ray path (mode P) is what fills these pixels in. Diffuse and
-// Fluorescent connect in model B, so they are NOT specular-side.
+// Materials mode P's camera-side layer draws when they are a pixel's first hit, because the
+// forward splat sees them badly or not at all: a delta BSDF has no connection to the pinhole
+// (the SDS limitation), so the forward light tracer renders it BLACK from the camera. Glossy is
+// here too although modes A and B splat a rough one through its lobe since 0.401.0 (render.h
+// glossySplats): a sharp lobe converges slowly that way, and the camera side does it far better.
+// Diffuse and Fluorescent connect in model B, so they are NOT specular-side.
 inline bool isSpecularType(MatType t) {
     return t == MatType::Dielectric || t == MatType::Mirror ||
            t == MatType::HalfMirror || t == MatType::ThinFilm ||

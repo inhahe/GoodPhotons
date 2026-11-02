@@ -1119,7 +1119,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             double w = (k < m.mixWeights.size()) ? m.mixWeights[k] : 0.0;
             w = (w < 0.0) ? 0.0 : (w > 1.0 ? 1.0 : w);
             if (!(w > 0.0)) continue;
-            const Vec3 cf0 = spectrumToLinearRgb(cm.reflect);   // the lobe's true F0 (not the 0.7 ghost)
+            const Vec3 cf0 = reflectRgb(cm);   // the lobe's true F0 (not the 0.7 ghost)
             matSh[i].rough    = previewRough(cm.roughness);
             matSh[i].f0       = Vec3{cf0.x * w, cf0.y * w, cf0.z * w};
             matSh[i].roughPat = cm.roughnessPat;

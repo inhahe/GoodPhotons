@@ -530,6 +530,10 @@ struct DMaterial {
     int    coatModel;
     double coatSpecular;
     int    coatChild;
+    // 1 on that synthetic coat lobe, 0 on every other material. The host shades a coat inline
+    // (tracePhoton's Layered branch) and splats no coat sheen to the camera, so the device's
+    // forward splat must not take this lobe for an ordinary rough glossy (dGlossySplats).
+    int    coatLobe;
     double coatFdr;      // internal diffuse Fresnel of the coat above this body, 0 if none
     // A2: absorption inside the coat LAYER. coatAbsorb is sigma_a (1/m); the two path lengths
     // fold the layer depth and the cone geometry in at scene-build time, so shading pays two
@@ -5349,10 +5353,11 @@ struct DGlossySplat {
 };
 // Twin of glossySplats: a glossy lobe with a finite value splats in the forward modes. The one
 // without, roughness pinned at 0 with nothing to vary it, is the analytic planar-mirror
-// connection's (dIsPlanarMirrorMat), and splatting it too would count it twice.
+// connection's (dIsPlanarMirrorMat), and splatting it too would count it twice. A layered
+// material's synthetic coat lobe (coatLobe) does not splat either: the host splats no coat.
+__device__ static inline bool dIsPlanarMirrorMat(const DMaterial& m);
 __device__ static inline bool dGlossySplats(const DMaterial& m) {
-    return m.type == D_GLOSSY &&
-           !(m.roughness <= 0.0 && m.roughnessTex < 0 && m.roughnessPat < 0);
+    return m.type == D_GLOSSY && !m.coatLobe && !dIsPlanarMirrorMat(m);
 }
 
 // `gs` (optional): a glossy vertex, whose f replaces rho/pi toward the camera (DGlossySplat).
@@ -12654,15 +12659,7 @@ __device__ static inline double dBsdfFAdjoint(const DScene& sc, const DVertex& v
 // the same number by a shorter route.
 __device__ static inline double dGlossyFHit(const DScene& sc, const DMaterial& m, const DHit& h,
                                             const DVec3& wo, const DVec3& wi, Real lambda) {
-    const double cosWi = ddot(wi, h.n), cosWo = ddot(wo, h.n);
-    if (cosWi <= 0 || cosWo <= 0) return 0.0;
-    double r = clamp01(dReflectSlot(sc, m, h, lambda));
-    if (m.iridescence) r *= (double)dIridescenceR(sc, m, &h, lambda, dHalfVectorCos(wo, wi));
-    const double e = dGlossyExp((double)dMatRoughness(sc, m, h));
-    const DVec3 mdir = reflectv(wo * (Real)(-1), h.n);
-    const double cosLobe = ddot(wi, mdir);
-    if (cosLobe <= 0) return 0.0;
-    return r * ((e + 1.0) / (2.0 * DPI) * pow(cosLobe, e)) / cosWi;
+    return dGlossyF(sc, m, h, h.n, wo, wi, lambda);
 }
 __device__ static inline double dGlossyPdfHit(const DScene& sc, const DMaterial& m, const DHit& h,
                                               const DVec3& wo, const DVec3& wi) {
@@ -21725,6 +21722,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.coatModel = m.coatModel;          // D_LAYERED coat (filled out below)
         d.coatSpecular = m.coatSpecular;
         d.coatChild = -1;                   // filled by the coat-synthesis loop after this bake
+        d.coatLobe = 0;
         d.coatFdr   = m.coatFdr;            // >0 on a body copy under a coat (scene.h coatedAlbedo)
         bakeSpec(m.coatAbsorb, d.coatAbsorb, up);   // A2: sigma_a inside the coat layer, 1/m
         d.coatPathIo = m.coatPathIo;
@@ -21863,6 +21861,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         coat.reflectPat = -1;
         coat.mixCount = 0;
         coat.coatChild = -1;
+        coat.coatLobe = 1;
         coat.matIsLight = 0;
         coat.matReflectsNothing = 0;
         coat.emitPat = -1;

@@ -295,9 +295,13 @@ inline double glossyExponent(double roughness) {
 // The interference reflectance an iridescent Glossy (Material::iridescence) weights its lobe
 // by, at `lambda`, for light meeting the coating at the cosine `cosH`: the angle each direction
 // of the pair makes with their half-vector, i.e. at the microfacet that reflects one into the
-// other. Symmetric in the pair, so the BSDF stays reciprocal; as roughness goes to 0 the
-// half-vector becomes the normal and this becomes the specular coating's own reflectance. The
-// incident medium is air. 1 on a plain glossy. `h` (may be null) supplies a mapped thickness.
+// other. Symmetric in the pair, so the factor is the same whichever side the light is on; as
+// roughness goes to 0 the half-vector becomes the normal and this becomes the specular
+// coating's own reflectance, as the coating shows from its front in air. Two differences from
+// the specular coating remain: the incident medium is always air (the specular one takes the
+// medium around it), and the rough lobe is two-sided, like every Glossy (the specular one,
+// being opaque, is black from inside its body). 1 on a plain glossy. `h` (may be null)
+// supplies a mapped thickness.
 inline double iridescenceR(const Scene& scene, const Material& m, const Hit* h, double lambda,
                            double cosH) {
     if (m.iridescence == 0) return 1.0;

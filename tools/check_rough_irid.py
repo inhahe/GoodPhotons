@@ -9,9 +9,9 @@ A box lit by a ceiling panel holds three spheres: a plain rough `glossy`, a roug
 the rough interference reflectors of 0.401.0, glossy lobes weighted by the coating's reflectance at
 the half-vector (Material::iridescence). Each sphere's mean colour, over the pixels that see it
 first (an analytic ray cast of the camera, eroded from the rim), is held per channel against
-mode R on the CPU, in modes A, B, D and M on the CPU and A, B, D, M and R on the GPU. Until
-0.401.0 a rough glossy was black in modes A and B (the forward splat knew only the Lambertian
-lobe); the stacks did not exist. Modes B, R and D run twice, the second time with `-heroc 1`, for
+mode R on the CPU, in modes A, B, D and M on the CPU and A, B, D, M and R on the GPU -- the
+forward modes A and B included, where a rough glossy is visible only through the camera splat's
+glossy lobe (render.h GlossySplat). Modes B, R and D run twice, the second time with `-heroc 1`, for
 the walks that carry one wavelength. Mode U is left out: its merges read the camera path's colours
 at the camera's wavelength, which washes any coloured glossy (known-issues VCM-SPEC). So is mode J:
 its walk is mode D's, and its surface merges on these small curved glossy spheres are too noisy to
@@ -29,7 +29,11 @@ bias of its own that predates the spheres (known-issues MODEM-GPU-OFFSET), so it
 judged against its own background. Drop that once the offset is fixed.
 
 It also requires a CLEAR coating given a `roughness` (a soap film) to be refused at load, with
-the message saying why.
+the message saying why, and the same film given `roughness 0` -- the specular coating, as with no
+roughness at all -- to load. And it requires mode B to render a `layered` car-paint sphere the
+same on the GPU as on the CPU (sphere mean per channel, 5 standard errors and 3 %): the device
+gives a layered coat a synthetic glossy lobe, which must not take the glossy camera splat the
+host never gives a coat (known-issues FWD-GLOSSY-INDIRECT).
 Exits 1 on any failure.
 """
 import argparse
@@ -69,12 +73,17 @@ SCENE_A = SCENE.replace("fov_y %g  film" % FOV, "fov_y %g  aperture 0.001  focus
 assert SCENE_A != SCENE
 CLEAR = NL.join([
     "scene { units meters }",
-    'material "soap" { preset soap-bubble  roughness 0.2 }',
+    'material "soap" { preset soap-bubble  roughness %s }',
     "sphere { center 0 0.4 0  radius 0.4  material soap }",
     "light area { origin -0.4 2.9 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  spd preset:bb6500"
     "  power 60 }",
     'camera "c" { eye 0 1.2 4  look_at 0 0.6 0  up 0 1 0  fov_y 45  film { res 32 24 } }',
 ]) + NL
+COAT = SCENE.replace('material "glossy" { type glossy reflect 0.8  roughness 0.2 }',
+                     'material "base" { type diffuse reflect rgb 0.6 0.05 0.05 }' + NL +
+                     'material "glossy" { type layered  ior 1.5  coat { roughness 0.05 }'
+                     '  layer "base" 1 }')
+assert COAT != SCENE
 REF = ("R_cpu", ["-mode", "R", "-device", "cpu", "-spp", "4096"])
 CASES = [   # the A cases render SCENE_A, through the lens
     ("A_cpu", ["-mode", "A", "-device", "cpu", "-n", "120000000"]),
@@ -181,13 +190,31 @@ def main():
     ok = True
 
     clear = os.path.join(out, "clear.ftsl")
-    with open(clear, "w", encoding="utf-8", newline="") as f:
-        f.write(CLEAR)
-    p = subprocess.run([exe, "-in", clear, "-parseonly"], capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
-    refused = p.returncode != 0 and "needs an opaque" in p.stdout + p.stderr
-    print("clear coating with a roughness: %s" % ("refused" if refused else "ACCEPTED -- FAIL"))
-    ok &= refused
+    for rough, want in (("0.2", False), ("0", True)):
+        with open(clear, "w", encoding="utf-8", newline="") as f:
+            f.write(CLEAR % rough)
+        p = subprocess.run([exe, "-in", clear, "-parseonly"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        loaded = p.returncode == 0
+        good = loaded if want else ("needs an opaque" in p.stdout + p.stderr and not loaded)
+        print("clear coating, roughness %s: %s%s" % (rough, "loads" if loaded else "refused",
+                                                    "" if good else " -- FAIL"))
+        ok &= good
+
+    if not a.no_gpu and (not a.only or "coat" in a.only.split(",")):
+        coat = os.path.join(out, "coat.ftsl")
+        with open(coat, "w", encoding="utf-8", newline="") as f:
+            f.write(COAT)
+        m = masks()[0][1]                    # the first sphere, now car paint
+        args = ["-mode", "B", "-n", "60000000"]
+        mc = stats(render(exe, out, coat, "coat_B_cpu", args + ["-device", "cpu"]), m)
+        mg = stats(render(exe, out, coat, "coat_B_gpu", args + ["-device", "gpu"]), m)
+        ratio = mg[0] / np.maximum(mc[0], 1e-30)
+        z = np.abs(mg[0] - mc[0]) / np.maximum(np.hypot(mg[1], mc[1]), 1e-30)
+        bad = (z > 5.0) & (np.abs(ratio - 1.0) > 0.03)
+        ok &= not bad.any()
+        print("coat   car-paint sphere, mode B, GPU / CPU %s%s"
+              % (" ".join("%.3f" % x for x in ratio), " FAIL" if bad.any() else ""))
 
     scene, scene_a = os.path.join(out, "spheres.ftsl"), os.path.join(out, "spheres_lens.ftsl")
     for path, text in ((scene, SCENE), (scene_a, SCENE_A)):

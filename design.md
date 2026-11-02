@@ -9882,7 +9882,12 @@ direction the connection found — `glossyF(ns, wc, wl)`, the pair swapped as
 splat a glossy vertex **before** sampling its continuation, on the same terms a diffuse vertex
 does (`!forwardCatch`, every camera). `glossySplats(m)` excludes the roughness-0 glossy, which
 `isPlanarMirrorMat` gives to the analytic mirror connection (a delta has no splat, and taking
-both would count it twice). Mode `P` is unaffected: it assigns a pixel to the forward layer by
+both would count it twice), and the device's `dGlossySplats` the synthetic coat lobe a layered
+material is given on upload (`DMaterial::coatLobe`): the host shades a coat inline in
+tracePhoton's Layered branch and splats no sheen, so neither backend images a clearcoat's
+highlight in A/B. A glossy vertex takes only the direct splat, not the closed-form mirror and
+glass-sphere connections (`camSpecularSplatAll`), which build their weight from a Lambertian
+`rho/pi`; a rough reflector seen in a mirror is black in B (known-issues FWD-GLOSSY-INDIRECT). Mode `P` is unaffected: it assigns a pixel to the forward layer by
 its first-hit material, so a glossy first hit is still the backward layer's.
 
 **Rough interference reflector (`Material::iridescence`).** An opaque `thinfilm` or
@@ -9895,6 +9900,9 @@ direction into the other, it is symmetric in the pair (so the BSDF stays recipro
 adjoint is the same function swapped), and as roughness → 0 it becomes the normal's angle, so
 the rough material converges on the smooth coating. Only opaque coatings qualify — `coatOpaque`
 at every 5 nm — because the transmitted half of a clear one would need its own rough lobe.
+Where it differs from the smooth coating it converges to: it is two-sided (every Glossy is; the
+smooth opaque coating is black from inside its body), and its incident medium is always air
+(`interfaceOptics` takes the exterior medium's index, which the glossy sites do not track).
 
 Where it reaches each estimator:
 

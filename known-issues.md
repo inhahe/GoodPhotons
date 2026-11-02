@@ -98,6 +98,41 @@ merges do. **Or retire mode U:** REFERENCE.md already says mode U is to be retir
 `-jsurf` has been on by default on both backends since 0.263.1; mode J already reads its merges
 at the right wavelength.
 
+## OPEN (2026-11-02, 0.401.0): FWD-GLOSSY-INDIRECT — modes A and B splat a rough reflector only where it is seen directly
+
+Since 0.401.0 a rough glossy photon vertex splats to the camera through its lobe (render.h
+`glossySplats`), but only directly: the closed-form mirror and glass-sphere connections
+(`camSpecularSplatAll` / `...Hero`, the device's twins), which every diffuse vertex takes, build
+their weight from a Lambertian `rho/pi` and are not given the glossy record. So a rough metal or
+rough interference reflector seen in a flat mirror or through a glass sphere is black in mode B
+while it renders seen directly. Likewise a `layered` material's clearcoat sheen is splatted on
+neither backend (the host shades the coat inline before the material switch; the device's
+synthetic coat lobe is excluded by `DMaterial::coatLobe` to match). **Proper fix:** pass the
+`GlossySplat` into the specular connectors, evaluating `f` toward the first specular point
+instead of `rho/pi`, on both backends; and splat the coat term deterministically at a layered
+vertex (`R(theta) * lobe`, both backends), validated against modes R and D on a car-paint scene,
+whose coat sheen is defined by `bsdf_eval.h`'s layered term.
+
+## OPEN (2026-11-02, 0.401.0): ROUGH-IRID-AIR — a rough interference reflector always interferes against air
+
+`iridescenceR` (render.h) and `dIridescenceR` take the incident medium as n0 = 1, where the smooth
+coating (`interfaceOptics`) uses the exterior medium's index from the priority stack. Under water
+or inside another dielectric the rough coating's hue is that of the coating in air. The glossy
+sites do not carry the medium stack's exterior index. **Proper fix:** thread the exterior index
+into the glossy sampling and evaluation sites (the photon walks and the backward walks have the
+stack; the BSDF evaluators would take it as an argument).
+
+## OPEN (2026-11-02, 0.401.0, tech debt): GLOSSY-SAMPLE-SITES — the interference factor is applied by hand at every glossy sampler
+
+An iridescent glossy's direction is drawn from the plain lobe and its weight multiplied by
+`iridescenceR` at the half-vector afterwards, at about a dozen host and a dozen device sites
+(forward and hero photon walks, backward and Whitted, BDPT and VCM walks, the photon-map and SPPM
+camera walks, JSPEC). A new glossy sampler that forgets the factor renders an iridescent glossy
+as plain white. **Proper fix:** one shared "sample the glossy lobe" helper per backend returning
+(direction, per-wavelength weight) that carries `reflect * R`; the sites differ in how they take
+a weight (multiply, roulette, roulette on a bundle's max), so it returns the weight and leaves
+that choice to them. Check plain glossy's images bit-identical with tools/check_bitid.py.
+
 ## OPEN (2026-11-02, 0.400.8): MODEM-GPU-OFFSET — GPU mode M reads a Cornell box's walls 1-3 % bright, bluest, where the CPU's mode M is exact
 
 Found validating 0.401.0's rough interference reflectors. Over the pixels that see no sphere:

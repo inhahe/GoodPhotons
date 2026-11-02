@@ -1472,7 +1472,10 @@ metal presets, and the rough interference reflectors (`thinfilm` / `multilayer` 
 `roughness`). Since 0.401.0, on the CPU and the GPU, in modes `A` and `B`; until then such
 a surface was black there, which is why a scene with rough metal looked different in `B`
 than in `R`. (A sharp lobe still converges slowly this way — the splat is a light-tracing
-estimate of a highlight — so a near-mirror is better seen in `R` or `D`.)
+estimate of a highlight — so a near-mirror is better seen in `R` or `D`.) Only the direct view
+is splatted: a rough reflector seen **in a mirror or through a glass sphere** (the closed-form
+connections above, which a diffuse vertex takes) is still black in `B`, and so is a `layered`
+material's clearcoat sheen (its body is not).
 
 **Still black in `B`, by design:** a glass or mirror **mesh** (only world-space triangles
 grouped into planes, and analytic spheres, are collected — an instanced/BLAS mirror is
@@ -2115,7 +2118,11 @@ BSDF, so every mode renders it, mode `B` and `A` included, on the CPU and the GP
 `roughness 0` (or none) keeps the specular coating. A **clear** coating (a soap film, an
 oil slick on water, a dichroic filter) refuses a `roughness` with an error, since what it
 transmits has no rough form here. `roughness` takes a constant, a `pattern:` or a
-`texture:`, as on `glossy`, and `reflect` (default 1) tints the lobe. The raster preview
+`texture:`, as on `glossy`, and `reflect` (default 1) tints the lobe. Unlike the smooth
+coating, the rough one is two-sided, as every `glossy` is: an open sheet shows its colour from
+behind too, where the smooth, opaque coating is black from inside. And it always takes the
+medium outside it to be air, where the smooth one interferes against the medium it sits in (a
+`priority` water body, say). The raster preview
 draws it in the colour the coating shows face-on, which does not shift with angle there.
 Not on the GPU's fast `-rgb` path, which falls back to the spectral one.
 

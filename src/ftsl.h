@@ -5169,8 +5169,9 @@ private:
     // iridescenceR). Unlike the specular coating it has a finite BSDF, so it renders in every
     // mode, the forward ones included. `reflect` (default 1) tints it. A transparent coating has
     // no rough form here (its transmitted lobe would need one too), so that is refused; roughness
-    // 0 leaves the specular coating as it was. `parse`: read `roughness` here, for an explicit
-    // `type`; a preset's override has read it already. False after a reported failure.
+    // 0 leaves the specular coating as it was, clear or not. `parse`: read `roughness` and
+    // `reflect` here, for an explicit `type`; a preset's overrides have read both already. False
+    // after a reported failure.
     bool roughenInterference(const Block& b, Material& m, bool parse) {
         if ((m.type != MatType::ThinFilm && m.type != MatType::Multilayer) || !find(b, "roughness"))
             return true;
@@ -5179,6 +5180,7 @@ private:
             else if (bindScalarTexture(b, "roughness", m.roughnessTex)) m.roughness = 0.2;
             else m.roughness = dblParam(b, "roughness", 0.0);
         }
+        if (m.roughnessPat < 0 && m.roughnessTex < 0 && !(m.roughness > 0.0)) return true;
         for (double L = LAMBDA_MIN; L <= LAMBDA_MAX; L += 5.0)
             if (!m.coatOpaque(L)) {
                 fail("material '" + b.name + "': `roughness` needs an opaque " +
@@ -5188,11 +5190,12 @@ private:
                      " nm; a transparent coating has no rough form");
                 return false;
             }
-        if (m.roughnessPat < 0 && m.roughnessTex < 0 && !(m.roughness > 0.0)) return true;
         m.iridescence = (m.type == MatType::ThinFilm) ? 1 : 2;
         m.type = MatType::Glossy;
-        m.reflect = (find(b, "reflect") || find(b, "reflect_map"))
-                        ? reflectParam(b, m, constantSpectrum(1.0)) : constantSpectrum(1.0);
+        // `reflect` tints the lobe, white unless authored. A preset's overrides have parsed it
+        // already, and parsing it twice would compose a referenced pattern into reflectPat twice.
+        if (!find(b, "reflect") && !find(b, "reflect_map")) m.reflect = constantSpectrum(1.0);
+        else if (parse) m.reflect = reflectParam(b, m, constantSpectrum(1.0));
         return true;
     }
 
