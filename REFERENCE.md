@@ -5929,8 +5929,11 @@ one-line "retired … ignoring" notice and do nothing.
 
 ```
 python tools/mitsuba_to_ftsl.py scene.xml scene.ftsl
-ftrace -in scene.ftsl -mode D -o out.png
+ftrace -in scene.ftsl -mode R -o out.png
 ```
+
+(Mode `D` renders an import too, unless it has a `constant` or `envmap` emitter: those
+become an environment light, which mode `D` refuses.)
 
 Mitsuba is also a spectral, physically-based renderer, so most constructs map
 almost 1:1: the `perspective`/`thinlens` sensor → an FTSL `camera` (`thinlens`
@@ -5939,9 +5942,13 @@ becomes mode `A` with aperture + focus), `diffuse`/`conductor`/`roughconductor`/
 and `area`/`constant`/`envmap` emitters → FTSL lights. `rectangle`, `cube`,
 `sphere`, and `obj` shapes are supported (with full `to_world` transforms); RGB
 reflectances ride FTSL's Jakob–Hanika upsampling and measured/blackbody spectra
-pass through losslessly. Constructs outside FTSL's scope (rough transmission,
-bump/normal maps, `.ply`/`.serialized` meshes, mesh area-emitters) degrade to a
-documented approximation and are flagged with `# WARN:` comments in the output.
+pass through losslessly. A dielectric's `int_ior` may be a number or any of
+Mitsuba's named materials: `bk7`, `water`, `water ice`, `fused quartz`, `acrylic
+glass` and `diamond` become the matching dispersive `glass:`, and the rest (`pyrex`,
+`amber`, `pet`, `ethanol`, the gases, …) keep Mitsuba's own constant index.
+Constructs outside FTSL's scope (rough transmission, bump/normal maps,
+`.ply`/`.serialized` meshes, mesh area-emitters) degrade to a documented
+approximation and are flagged with `# WARN:` comments in the output.
 Since **Blender can export directly to Mitsuba XML** (via the `mitsuba-blender`
 add-on), this doubles as a Blender → FTSL path.
 

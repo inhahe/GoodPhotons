@@ -134,10 +134,23 @@ def sub(s, defaults):
     return s
 
 # ------------------------------------------------------------------- spectra
-NAMED_IOR = {  # Mitsuba named IOR -> FTSL glass: dispersion (closest available)
-    'bk7':'BK7','water':'water','diamond':'diamond','acrylic glass':'acrylic',
-    'polycarbonate':'polycarbonate','fused quartz':'silica','silica':'silica',
-    'sapphire':'sapphire','pyrex':'BK7','air':None,'vacuum':None,
+# Every named IOR Mitsuba accepts (include/mitsuba/render/ior.h, the same table in 0.6 and
+# 3), as an FTSL `ior` expression: the library's dispersive glass where it holds the same
+# material, else Mitsuba's own constant, so the import refracts as the source scene did.
+# Pyrex is a borosilicate but not BK7 (n 1.47 against 1.517), so it keeps its constant.
+NAMED_IOR = {
+    'vacuum': 'ior 1',                      'helium': 'ior 1.000036',
+    'hydrogen': 'ior 1.000132',             'air': 'ior 1.000277',
+    'carbon dioxide': 'ior 1.00045',        'water': 'ior glass:water',
+    'acetone': 'ior 1.36',                  'ethanol': 'ior 1.361',
+    'carbon tetrachloride': 'ior 1.461',    'glycerol': 'ior 1.4729',
+    'benzene': 'ior 1.501',                 'silicone oil': 'ior 1.52045',
+    'bromine': 'ior 1.661',                 'water ice': 'ior glass:ice',
+    'fused quartz': 'ior glass:silica',     'pyrex': 'ior 1.47',
+    'acrylic glass': 'ior glass:acrylic',   'polypropylene': 'ior 1.49',
+    'bk7': 'ior glass:BK7',                 'sodium chloride': 'ior 1.544',
+    'amber': 'ior 1.55',                    'pet': 'ior 1.575',
+    'diamond': 'ior glass:diamond',
 }
 
 def spectrum_from_node(node, defaults):
@@ -193,13 +206,18 @@ def get_string(elem, name, defaults):
     return None
 
 def get_ior(elem, name, default, defaults):
-    """int_ior/ext_ior can be a named material or a float -> FTSL glass:/ior expr."""
+    """The FTSL `ior ...` expression for the BSDF property `name` (int_ior/ext_ior), or
+    `default` (also an `ior ...` expression) when it is absent. Mitsuba takes a number or a
+    material name from NAMED_IOR; a name outside it gets `default` and a warning, so the
+    output still parses."""
     for c in elem:
         if c.get('name') == name:
             if c.tag == 'string':
                 nm = sub(c.get('value'), defaults).lower()
-                g = NAMED_IOR.get(nm)
-                return f"glass:{g}" if g else None
+                if nm in NAMED_IOR:
+                    return NAMED_IOR[nm]
+                warn(f"unknown named IOR '{nm}' -> {default}")
+                return default
             if c.tag in ('float','integer'):
                 return f"ior {fnum(float(sub(c.get('value'), defaults)))}"
     return default
