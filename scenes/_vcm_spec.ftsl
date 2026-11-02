@@ -1,0 +1,21 @@
+# VCM-SPEC repro (known-issues.md): coloured rough glossy spheres in a Cornell box. Mode U's
+# merges read the camera path's colours at the camera's wavelength, so the spheres' colours
+# wash out against mode R (0.400.8: the green sphere R +24 %, G -15 %, B +25 %).
+scene { units meters }
+material "white" { type diffuse reflect 0.7 }
+material "red"   { type diffuse reflect rgb 0.7 0.1 0.1 }
+material "green" { type diffuse reflect rgb 0.1 0.7 0.1 }
+material "gloss" { type glossy reflect 0.8  roughness 0.2 }
+material "green_gloss" { type glossy reflect rgb 0.1 0.7 0.1  roughness 0.2 }
+material "blue_gloss" { type glossy reflect rgb 0.1 0.2 0.8  roughness 0.15 }
+material "orange_gloss" { type glossy reflect rgb 0.8 0.5 0.1  roughness 0.3 }
+sphere { center -1 0.4 -0.5  radius 0.4  material gloss }
+sphere { center 0 0.4 0  radius 0.4  material green_gloss }
+sphere { center 1 0.4 -0.5  radius 0.4  material blue_gloss }
+sphere { center 0.6 0.25 0.8  radius 0.25  material orange_gloss }
+quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }
+quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material white }
+quad { origin -2 0 -2  u 0 3 0  v 0 0 4  material red }
+quad { origin 2 0 -2  u 0 0 4  v 0 3 0  material green }
+light area { origin -0.4 2.9 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  spd preset:bb6500  power 60 }
+camera "c" { eye 0 1.2 4  look_at 0 0.6 0  up 0 1 0  fov_y 45  film { res 192 144 } }

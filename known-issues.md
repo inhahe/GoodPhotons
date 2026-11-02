@@ -72,6 +72,50 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-11-02, 0.400.8): VCM-SPEC — mode U's merges read the camera path's colours at the camera's wavelength, so a coloured surface seen before a merge washes out
+
+Mode J had this bug and lost it in 0.386.1 (JSPEC, design.md); mode U never got the fix. A merge
+pairs the camera subpath, which ran at the camera sample's wavelength λ_c, with photons traced
+separately at their own wavelengths λ_p. Every spectral factor the camera walk met before the
+merge vertex (a coloured glossy's reflectance, a coloured wall's albedo, an interference coating)
+sits in the scalar throughput at λ_c, so the merge computes f(λ_c) · Σ L_p CIE(λ_p) where it owes
+Σ f(λ_p) L_p CIE(λ_p). The colour decorrelates from the light it filters and drifts toward grey.
+
+Measured on `scenes/_vcm_spec.ftsl` (coloured rough glossy spheres in a Cornell box), 0.400.8,
+CPU, mode U at 600 spp against mode R at 3000, sphere means per channel: green sphere R 1.24 /
+G 0.85 / B 1.25, blue sphere 1.77 / 1.17 / 0.92, orange sphere 0.89 / 0.94 / 1.64, the neutral
+sphere within 1 %, and the walls' blue +2 %. The GPU's mode U carries the same bug: on the
+spheres `tools/check_rough_irid.py` renders (0.401.0) it agreed with the CPU's to about 1 % per
+channel, and both read the beetle sphere G 0.88 / B 1.11 against mode R. The rough interference reflectors of 0.401.0
+show it the most strongly, since their whole colour is a spectral factor, which is why
+`tools/check_rough_irid.py` leaves mode U out.
+
+**Proper fix:** carry the camera walk's spectral factors on the JSPEC grid (`JSpec` / `JSpecRun`
+in beamgather.h, `DJSpec` on the device) through `vcm.h`'s camera subpath and the device VCM
+camera kernel, and read them at each merged photon's wavelength, exactly as mode J's point
+merges do. **Or retire mode U:** REFERENCE.md already says mode U is to be retired once
+`-jsurf` (mode J's surface merges, the same estimator under one MIS weight) was validated, and
+`-jsurf` has been on by default on both backends since 0.263.1; mode J already reads its merges
+at the right wavelength.
+
+## OPEN (2026-11-02, 0.400.8): MODEM-GPU-OFFSET — GPU mode M reads a Cornell box's walls 1-3 % bright, bluest, where the CPU's mode M is exact
+
+Found validating 0.401.0's rough interference reflectors. Over the pixels that see no sphere:
+
+| build, scene | GPU mode M against | R | G | B |
+|---|---|---|---|---|
+| 0.400.8, `scenes/_vcm_spec.ftsl` (192 × 144, 512 spp, two seeds) | CPU mode M | +0.3 % | +0.8 % | +3.1 % |
+| 0.401.0, `tools/check_rough_irid.py`'s box (128 × 96, 512 spp, two seeds) | CPU mode R | +1.7 % | +2.5 % | +2.6 % |
+
+The CPU's mode M reads the same walls within 0.1 % of mode R, and the two seeds of each GPU
+render agree to better than 0.1 %, so this is a bias of the device path, not noise. A sphere
+reflecting those walls inherits it, which is why `check_rough_irid.py` judges GPU mode M's
+spheres against its own background rather than absolutely. Not investigated yet. Suspects, in
+the order to try them: the device gather's footprint or radius (M-GATHERAREA, `-pmauto`) against
+the host's, at the box's edges and corners (a map with `-nopmauto` on both backends separates
+it); the device spectral carrier (`DSpecThr`) on the coloured walls' upsampled spectra (a grey
+box would clear it); the device caustic map.
+
 ## OPEN (2026-11-02, 0.400.8): BLACK-PIXELS-ONCE — one GPU mode-R render had pure-black pixels that four reruns did not
 
 One render of the scene `tools/check_mitsuba_import.py` writes to
