@@ -297,6 +297,15 @@ struct Material {
     // nanometres. Layer 0 is the outermost (nearest the incident medium).
     std::vector<double> layerN, layerK, layerThick;
 
+    // --- A ROUGH interference reflector (Glossy with iridescence) -----------
+    // An opaque thin film (1) or multilayer stack (2) authored with a `roughness`, which the
+    // loader turns into a Glossy whose lobe is weighted by the coating's interference
+    // reflectance at the microfacet angle (render.h iridescenceR), read from the film / stack
+    // fields above. 0 on every other material, a glossy lobe then weighted by `reflect` alone.
+    // Unlike the specular coating it stands in for, it has a finite BSDF, so it connects in
+    // every mode, the forward camera splat included.
+    int iridescence = 0;
+
     // A coating that takes the transmitted light instead of passing it into a body: a thin film
     // or multilayer stack on an absorbing substrate, or a stack with an absorbing layer, at
     // `lambda`. Such a surface reflects or absorbs, is never entered, and so is no medium

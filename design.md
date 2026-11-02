@@ -9854,8 +9854,9 @@ black); **pinhole only** (`lensMode` / `forwardCatch` return early, so `A`/`C` a
 unchanged); flat mirrors must be authored as world-space triangles (an instanced/BLAS
 mirror is not collected, and beyond `kMaxMirrorPlanes` the surplus planes are dropped);
 only a `halfmirror`'s *reflected* leg is built, so what lies behind a beamsplitter is still
-a delta transmission and stays black; rough specular is not a delta and needs a real
-estimator. Use `P`/`D`/`R`/`M`/`S`/`U` for those.
+a delta transmission and stays black; frosted glass is not a delta and needs a real
+estimator. Use `P`/`D`/`R`/`M`/`S`/`U` for those. A rough *reflector* has one: the glossy
+splat, next section.
 
 **Test scenes.** `scenes/_mirror_fwd.ftsl` (flat panel), `scenes/_mirror_sphere_fwd.ftsl`
 (mirror ball) and `scenes/_mirror_mats_fwd.ftsl` (one panel each of `mirror`, `halfmirror`
@@ -9865,6 +9866,52 @@ regressed connector shows up as black rather than as a subtle level shift. Meter
 `-hdr` + `scraps/cmp_pfm.py`, comparing each mirror's pixel box against a mirror-free patch
 of the same frame — mode `B` and mode `R` carry a systematic ~0.6–1 % offset everywhere, so
 the mirror-free patch, not 1.0, is the number the mirror box has to match.
+
+## Glossy camera splats, and the rough interference reflector (0.401.0)
+
+**Glossy splats.** Until 0.401.0 the forward splat (`connect` and its lens / hero variants,
+`camSplat`, `camSplatAll`, `camSplatHero`, `camSplatAllHero`; on the device `connect*`,
+`splatSurfaceAll`, `splatSurfaceAllHero`) knew one BSDF, the Lambertian `ρ/π`, and
+`tracePhoton` called it only at diffuse vertices — so a rough `glossy` seen directly was
+**black** in modes `A`/`B`, though its lobe has a finite density toward any camera. Each of
+those functions now takes an optional `const GlossySplat*` (`DGlossySplat` on the device):
+null keeps the Lambertian expression exactly as it was (bit-identical, checked with
+`check_bitid`), and a record evaluates the vertex's **adjoint** glossy BSDF toward the
+direction the connection found — `glossyF(ns, wc, wl)`, the pair swapped as
+`bsdfFAdjoint` swaps it. `tracePhoton` (CPU), `interactSpecular` and `shadeStepHero` (GPU)
+splat a glossy vertex **before** sampling its continuation, on the same terms a diffuse vertex
+does (`!forwardCatch`, every camera). `glossySplats(m)` excludes the roughness-0 glossy, which
+`isPlanarMirrorMat` gives to the analytic mirror connection (a delta has no splat, and taking
+both would count it twice). Mode `P` is unaffected: it assigns a pixel to the forward layer by
+its first-hit material, so a glossy first hit is still the backward layer's.
+
+**Rough interference reflector (`Material::iridescence`).** An opaque `thinfilm` or
+`multilayer` given a `roughness` (`ftsl.h roughenInterference`) becomes a `Glossy` with
+`iridescence` 1 (film) or 2 (stack), `reflect` 1 unless authored: the glossy lobe weighted per
+wavelength by the coating's reflectance at the **half-vector** cosine, `R(λ, |wo + wi| / 2)`
+(`iridescenceR` → `interference.h coatingReflectance`; device `dIridescenceR`). The
+half-vector angle is the microfacet model's: it is the angle at the facet that reflects one
+direction into the other, it is symmetric in the pair (so the BSDF stays reciprocal and the
+adjoint is the same function swapped), and as roughness → 0 it becomes the normal's angle, so
+the rough material converges on the smooth coating. Only opaque coatings qualify — `coatOpaque`
+at every 5 nm — because the transmitted half of a clear one would need its own rough lobe.
+
+Where it reaches each estimator:
+
+| Site | What it does with `R` |
+|---|---|
+| `glossyF` / `dGlossyF` / `dGlossyFHit` (every BSDF evaluation: NEE, MIS, BDPT connections, the splat) | multiplies the lobe's `r` |
+| Sampling sites (forward `interactPhotonSpecular`, backward, BDPT / VCM walks, photon-map and SPPM camera walks, both backends) | the direction is drawn from the plain lobe, then the throughput is multiplied by `R` (or survives a roulette on it, in the forward photon walk where the weight must stay 1) |
+| Hero bundles (forward `shadeStepHero`, backward hero) | one direction for the bundle, `R` per member; the forward walk's roulette is on the bundle's largest `R`, the rest reweighted |
+| Spectral fold, JSPEC (`bdpt.h`) | an iridescent vertex retires the fold (`FK_DeclineGlossy`): `R` is wavelength-divergent; JSPEC's per-λ factor includes `R` |
+| Denoiser guides (`denoise_guide.h`) | the albedo and mirror-tint guides take `R` at the view cosine |
+| Raster preview (`raster.h reflectRgb`) | one tint, `R` at normal incidence |
+| `-rgb` (`cudaBackwardRGBSupported`) | out of scope: falls back to the spectral backward |
+
+The device material holds at most `D_MAXLAYERS` (16) layers. `cudaForwardSupported`'s
+`oversizedMultilayer` counts an `iridescence == 2` glossy as a multilayer, and every other
+device gate (backward, BDPT, VCM, photon map, SPPM) goes through `cudaForwardSupported`, so a
+deeper stack falls back to the CPU in every mode, as a specular one always did.
 
 ## Watertight raster coverage (shared by both backends, 0.98.2)
 

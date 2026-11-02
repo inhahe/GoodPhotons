@@ -378,6 +378,10 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             wi = sampleGlossy(mdir, materialRoughness(scene, *mp, h), rng);
             if (dot(wi, ns) <= 0) { terminate = true; break; }
             double r = clamp01(reflectSlot(scene, *mp, h, lambda));
+            // An iridescent lobe's interference reflectance at the sampled pair's half-vector
+            // (render.h iridescenceR): bsdfF's r for this pair.
+            const double cH = mp->iridescence ? halfVectorCos(wo, wi) : 1.0;
+            if (mp->iridescence) r *= iridescenceR(scene, *mp, &h, lambda, cH);
             pdfW = bsdfPdf(*mp, ns, wo, wi, lambda, scene, &h);
             pdfRevW = bsdfPdf(*mp, ns, wi, wo, lambda, scene, &h);
             betaFactor = r;
@@ -387,8 +391,10 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             // reflectance differs per λ.
             if (nSec) {
                 *secChromatic = true;
-                for (int i = 0; i < nSec; ++i)
+                for (int i = 0; i < nSec; ++i) {
                     secF[i] = clamp01(reflectSlot(scene, *mp, h, lamAll[i + 1]));
+                    if (mp->iridescence) secF[i] *= iridescenceR(scene, *mp, &h, lamAll[i + 1], cH);
+                }
             }
             break;
         }

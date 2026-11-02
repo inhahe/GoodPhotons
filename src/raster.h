@@ -56,6 +56,7 @@
 #include "camera.h"
 #include "color.h"
 #include "isomesh.h"
+#include "interference.h"   // a rough interference reflector's preview tint
 
 namespace raster {
 
@@ -302,6 +303,15 @@ inline Vec3 clearTintOf(const Material& m) {
     return clamp01(raw * (1.0 / mx));             // hue only; magnitude stays with clarity
 }
 
+// A material's `reflect` as linear sRGB. A rough interference reflector's is tinted by its
+// coating as seen face-on: the preview has one colour per material, where the render's shifts
+// with the angle.
+inline Vec3 reflectRgb(const Material& m) {
+    if (!m.iridescence) return spectrumToLinearRgb(m.reflect);
+    return spectrumToLinearRgb(
+        [&m](double l) { return m.reflect(l) * coatingReflectance(m, m.filmThickness, l, 1.0); });
+}
+
 inline Vec3 materialColor(const Material& m, bool& emissive) {
     emissive = m.isLight;
     if (m.isLight) {
@@ -309,7 +319,7 @@ inline Vec3 materialColor(const Material& m, bool& emissive) {
         double mx = std::max({c.x, c.y, c.z, 1e-6});
         return c * (1.0 / mx);   // normalise to a bright, correctly-tinted glow
     }
-    Vec3 albedo = spectrumToLinearRgb(m.reflect);
+    Vec3 albedo = reflectRgb(m);
     double lum = 0.2126 * albedo.x + 0.7152 * albedo.y + 0.0722 * albedo.z;
     if (isSpecularType(m.type)) {
         if (m.type == MatType::Mirror) {
@@ -1011,7 +1021,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
         if (!m.isLight && (m.type == MatType::Glossy || m.type == MatType::Mirror)) {
             const bool mirror = (m.type == MatType::Mirror);
             s.rough    = mirror ? 0.02 : previewRough(m.roughness);
-            s.color    = spectrumToLinearRgb(m.reflect);
+            s.color    = reflectRgb(m);
             s.roughPat = mirror ? -1 : m.roughnessPat;
             s.roughTex = mirror ? -1 : m.roughnessTex;
         }

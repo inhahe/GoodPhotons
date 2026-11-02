@@ -183,6 +183,9 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0.0) return;
+                // An iridescent lobe's interference reflectance at the pair's half-vector.
+                if (m.iridescence)
+                    thr *= iridescenceR(scene, m, &h, lambda, halfVectorCos(ray.d * -1.0, o));
                 if (gneeOn) {
                     gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
                     gmis.from = h.p;

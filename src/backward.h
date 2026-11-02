@@ -2358,6 +2358,10 @@ struct BackwardRenderer {
                     Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
                                               materialRoughness(scene, m, h), gi.sIdx, gi.bounce);
                     if (dot(o, h.n) <= 0) return false;
+                    // An iridescent lobe's interference reflectance at the pair's half-vector.
+                    if (m.iridescence &&
+                        !wAtt(iridescenceR(scene, m, &h, lambda, halfVectorCos(ray.d * -1.0, o))))
+                        return false;
                     if (gm) {
                         gm->pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
                         gm->from = h.p;
@@ -2369,6 +2373,10 @@ struct BackwardRenderer {
                 if (rng.uniform() >= r) return false;
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0) return false;
+                // An iridescent lobe's interference reflectance, at the half-vector of the pair
+                // it now knows (f * cos / pdf = r * R, which bsdfF carries for the NEE above).
+                if (m.iridescence)
+                    thr *= iridescenceR(scene, m, &h, lambda, halfVectorCos(ray.d * -1.0, o));
                 // The other half of the weight, for whatever this direction goes on to hit.
                 if (gm) {
                     gm->pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
@@ -3504,6 +3512,10 @@ struct BackwardRenderer {
                         Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
                                                   materialRoughness(scene, m, h), gi.sIdx, b);
                         if (dot(o, h.n) <= 0) { finish(); return; }
+                        if (m.iridescence) {   // interference reflectance at the half-vector, per λ
+                            const double cH = halfVectorCos(ray.d * -1.0, o);
+                            for (int i = 0; i < nUp; ++i) thr[i] *= iridescenceR(scene, m, &h, lam[i], cH);
+                        }
                         if (glossyNee) {   // the other half of the weight -- see the scalar twin
                             gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lam[0], scene, &h);
                             gmis.from = h.p;
@@ -3513,6 +3525,10 @@ struct BackwardRenderer {
                     } else {
                         Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                         if (dot(o, h.n) <= 0) { finish(); return; }
+                        if (m.iridescence) {   // interference reflectance at the half-vector, per λ
+                            const double cH = halfVectorCos(ray.d * -1.0, o);
+                            for (int i = 0; i < nUp; ++i) thr[i] *= iridescenceR(scene, m, &h, lam[i], cH);
+                        }
                         if (glossyNee) {
                             gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lam[0], scene, &h);
                             gmis.from = h.p;

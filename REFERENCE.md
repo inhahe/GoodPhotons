@@ -974,9 +974,12 @@ that converges to the same physical image.
   the connection can be solved in closed form**. Two families now are — see
   **[Analytic specular connections](#analytic-specular-connections-what-mode-b-can-image-directly)**
   below: a **smooth mirror** (flat panel or sphere, including `halfmirror` and
-  roughness-0 `glossy`) and a **smooth dielectric sphere**. Everything else specular —
-  a glass *mesh*, a rough specular surface, a mirror seen inside another mirror —
-  still renders black; use `P`, `D`, or `R` for those. Best default
+  roughness-0 `glossy`) and a **smooth dielectric sphere**. A **rough** reflector —
+  `glossy` with `roughness` above 0, a metal preset, a rough `thinfilm` / `multilayer`
+  (below) — is no delta, so it is splatted like a diffuse vertex, through its own lobe
+  (since 0.401.0; before that it was black here too). Everything else specular — a glass
+  *mesh*, frosted glass, a mirror seen inside another mirror — still renders black; use
+  `P`, `D`, or `R` for those. Best default
   for diffuse and caustic-heavy scenes. In an *absolute-EV* scene an authored
   `fstop`/`lens` still sets exposure here — the pinhole has no depth of field, but it
   applies the camera-equation light-gathering term `(π/4)/N²`, so f/2 is exactly four
@@ -1462,10 +1465,19 @@ form** instead of sampled, and then it is drawn exactly. Mode `B` does this for:
 So a mirrored wall, the room reflected in it, and lights that are only visible *in* the
 reflection now render in mode `B` — on both the CPU and the GPU, which agree.
 
+A **rough** reflector needs no closed form: its lobe has a finite density toward any
+direction, so every photon that reaches it is splatted to the camera through the lobe,
+exactly as a diffuse vertex is through its `ρ/π` — `glossy` at `roughness` above 0, the
+metal presets, and the rough interference reflectors (`thinfilm` / `multilayer` with a
+`roughness`). Since 0.401.0, on the CPU and the GPU, in modes `A` and `B`; until then such
+a surface was black there, which is why a scene with rough metal looked different in `B`
+than in `R`. (A sharp lobe still converges slowly this way — the splat is a light-tracing
+estimate of a highlight — so a near-mirror is better seen in `R` or `D`.)
+
 **Still black in `B`, by design:** a glass or mirror **mesh** (only world-space triangles
 grouped into planes, and analytic spheres, are collected — an instanced/BLAS mirror is
-not, and at most 64 distinct mirror planes are, largest-area first), a **rough** specular
-surface (it is no longer a delta, so it needs a real estimator), the **transmitted** side
+not, and at most 64 distinct mirror planes are, largest-area first), **frosted** glass
+(a rough dielectric: no longer a delta, so it needs a real estimator), the **transmitted** side
 of a `halfmirror` (only its reflected leg is built, so whatever is behind a beamsplitter
 stays black), and **more than one specular vertex** in a row — a mirror seen *inside*
 another mirror, or glass in front of a mirror. Fog *inside* a dielectric shell is the
@@ -2054,8 +2066,8 @@ Declared with `material "name" { type <type> … }`.
 | `halfmirror` | Lossless beamsplitter; `reflect` is the reflect probability (default 0.5 = 50/50). A spectral `reflect` gives a wavelength-dependent (dichroic) split | `reflect` |
 | `filter` | Colored **gel / Wratten filter**: a thin non-scattering absorber. Light passes straight through (no reflection or refraction), surviving with probability `transmit`(λ) — the per-wavelength transmittance T(λ) ∈ [0,1] — and is absorbed otherwise. Like clear glass it isn't lit directly; you see its effect on whatever is behind it | `transmit` (spectrum: `filter:<name>`, `file:<path>`, or a primitive like `gaussian`; also `pattern:<name>` / `transmit_map` for a transmittance that varies across the gel) |
 | `glossy` | Rough microfacet reflector | `reflect`, `roughness` (constant or `texture:<name>` map) |
-| `thinfilm` | Single-layer interference (iridescence) | `ior`, `film_ior`, `film_thickness` (nm), `film_thickness_map texture:<name>`, `substrate_k` |
-| `multilayer` | N-layer Abelès transfer-matrix stack | `ior`, `substrate_k`, repeated `layer <n> <k> <nm>` |
+| `thinfilm` | Single-layer interference (iridescence). With `roughness` on an opaque substrate, a **rough** interference reflector — see below | `ior`, `film_ior`, `film_thickness` (nm), `film_thickness_map texture:<name>`, `substrate_k`, `roughness` |
+| `multilayer` | N-layer Abelès transfer-matrix stack. With `roughness` on an opaque stack, a **rough** interference reflector — see below | `ior`, `substrate_k`, repeated `layer <n> <k> <nm>`, `roughness` |
 | `grating` | Reflective diffraction grating | `reflect`, `groove_spacing` (nm), `groove_dir`, `max_order` |
 | `fluorescent` | Stokes-shifted fluorescence. **Note `emit` means something different here:** on a fluorescent it is the *reradiation* spectrum — the SHAPE of the Stokes-shifted emission band, normalised by its own integral — **not** self-emission, so a fluorescent surface is never a light. (`emit_map` is therefore rejected on a fluorescent: a reradiation profile isn't a surface pattern.) For a surface that both fluoresces and glows on its own, use a `mix` of a `fluorescent` and an emissive `diffuse` | `reflect` (elastic base lobe), `absorb` (excitation band), `emit` (reradiation band), `yield` (quantum yield ≤ 1) |
 | `hair` | **Fiber BCSDF** for hair / fur strands (Marschner R + TT + TRT, Chiang importance-sampled form, plus Yan's scattering medulla) — a scattering model for a translucent dielectric *cylinder*, not a surface. Meant for `curve` / `fur` geometry. See [Hair and fur fibers](#hair-and-fur-fibers-hair) below | `preset <species>` (a measured fur — everything below defaults from it); `reflect` (the colour you want the coat to be — inverted into an absorption, **not** a Lambertian albedo), or `sigma_a` (the absorption directly, which wins if present); `eta`, `beta_m`, `beta_n` (longitudinal / azimuthal roughness), `alpha` (cuticle tilt, degrees); `medulla` (κ), `medulla_sigma_s`, `medulla_sigma_a`, `medulla_g` |
@@ -2080,6 +2092,27 @@ film/stack geometry (`film_thickness`/`film_ior` or `layer <n> <k> <nm>` rows) u
 one name — so new structural-colour materials drop in with **no rebuild**. Metals and
 glasses need no file: a bare `metal:`/`glass:` name resolves by the generic convention
 above. (The interference math stays native; only the parameters are data.)
+
+**Rough interference reflectors (`roughness` on a `thinfilm` / `multilayer`, 0.401.0).**
+A thin film or a stack is a perfect specular interface, which no forward camera can see
+directly (above, *Analytic specular connections*). An **opaque** one — on an absorbing
+substrate (`substrate_k` > 0) or with an absorbing layer — is in nature usually a rough
+reflector instead: a beetle's elytra, anodized or heat-tinted metal, a pigeon's neck. Give
+it a `roughness` and it becomes one: the `glossy` lobe of that roughness, weighted at each
+wavelength by the coating's reflectance **at the half-vector's angle**, `R(λ, cos θh)`, so
+the colour still shifts with angle the way the smooth coating's does. The lobe is a real
+BSDF, so every mode renders it, mode `B` and `A` included, on the CPU and the GPU.
+
+    material "beetle-rough" { preset beetle  roughness 0.2 }
+    material "blue-ti" { type thinfilm  ior 2.5  substrate_k 3.0
+                         film_ior 2.30  film_thickness 85  roughness 0.15 }
+
+`roughness 0` (or none) keeps the specular coating. A **clear** coating (a soap film, an
+oil slick on water, a dichroic filter) refuses a `roughness` with an error, since what it
+transmits has no rough form here. `roughness` takes a constant, a `pattern:` or a
+`texture:`, as on `glossy`, and `reflect` (default 1) tints the lobe. The raster preview
+draws it in the colour the coating shows face-on, which does not shift with angle there.
+Not on the GPU's fast `-rgb` path, which falls back to the spectral one.
 
 **Translucency (dielectrics).** Beyond perfectly clear glass, a `dielectric` supports
 two physically-motivated translucency controls (both compose with dispersion):

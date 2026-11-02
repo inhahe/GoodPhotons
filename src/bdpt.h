@@ -1396,10 +1396,17 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 wi = sampleGlossy(mdir, materialRoughness(scene, *mp, h), rng);
                 if (dot(wi, cur.ns) <= 0) { terminate = true; break; }
                 double r = clamp01(reflectSlot(scene, *mp, h, lambda));
+                // An iridescent lobe's interference reflectance, at the half-vector of the pair
+                // just sampled (render.h iridescenceR) -- bsdfF's r for this pair.
+                const double cH = mp->iridescence ? halfVectorCos(wo, wi) : 1.0;
+                if (mp->iridescence) r *= iridescenceR(scene, *mp, &h, lambda, cH);
                 // FOLD-GLOSSY (0.260.1): the lobe's direction is wavelength-free, so the claim
                 // survives; the albedo is folded exactly as Diffuse's is above (render.h's
-                // tracePhoton does the same -- one PhotonBeam bank, one rule).
-                if (achroPath) {
+                // tracePhoton does the same -- one PhotonBeam bank, one rule). Not an iridescent
+                // albedo, which depends on the sampled direction: it retires, as in tracePhoton.
+                if (achroPath && mp->iridescence) {
+                    fldWhy = FK_DeclineGlossy;
+                } else if (achroPath) {
                     fldK = foldEm ? foldEm->foldN : 0;
                     for (int k = 0; k < fldK + specN; ++k) {
                         const double lk = (k < fldK) ? foldEm->foldLam[k] : bs->lam[k - fldK];
@@ -1419,8 +1426,10 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 // direction and only the reflectance differs per λ. (The unidirectional
                 // hero tracers de-hero here instead — see known-issues.md.)
                 secChromatic = true;
-                for (int i = 0; i + 1 < nUp; ++i)
+                for (int i = 0; i + 1 < nUp; ++i) {
                     secF[i] = clamp01(reflectSlot(scene, *mp, h, hb.lam[i + 1]));
+                    if (mp->iridescence) secF[i] *= iridescenceR(scene, *mp, &h, hb.lam[i + 1], cH);
+                }
                 break;
             }
             case MatType::DiffuseTransmit: {
@@ -1692,10 +1701,15 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                     jr.mul([&](double L) { return clamp01(diffuseReflectance(scene, *mp, h, L)); },
                            betaFactor, false);
                     break;
-                case MatType::Glossy:          // f*cos/pdf = r: the reflect slot IS the factor
-                    jr.mul([&](double L) { return clamp01(reflectSlot(scene, *mp, h, L)); },
+                case MatType::Glossy: {        // f*cos/pdf = r: the reflect slot IS the factor,
+                    // times an iridescent lobe's interference reflectance at the sampled pair
+                    const double cHj = halfVectorCos(wo, wi);
+                    jr.mul([&](double L) {
+                               double r = clamp01(reflectSlot(scene, *mp, h, L));
+                               return mp->iridescence ? r * iridescenceR(scene, *mp, &h, L, cHj) : r; },
                            betaFactor, false);
                     break;
+                }
                 case MatType::DiffuseTransmit: {   // the lobe's albedo over the lambda one
                     const bool reflJ = dot(wi, cur.ns) > 0.0;
                     double rR0, rT0; diffuseTransmitAlbedos(*mp, lambda, scene, &h, rR0, rT0);

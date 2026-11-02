@@ -29,12 +29,7 @@
 
 namespace bdpt {
 
-// Power-cosine glossy exponent, matching render.h's sampleGlossy exactly.
-inline double glossyExponent(double roughness) {
-    double rr = roughness < 1e-3 ? 1e-3 : roughness;
-    double e = 2.0 / (rr * rr) - 2.0;
-    return e < 0 ? 0 : e;
-}
+using ::glossyExponent;   // render.h, beside the glossy lobe's sampler and evaluator
 
 // Is this material a connectible (non-delta) surface for BDPT? Diffuse and Glossy
 // have a finite BSDF value we can evaluate on an arbitrary connection direction;
@@ -120,20 +115,10 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
             double rho = clamp01(m.reflect(lambda));
             return rho / PI;
         }
-        case MatType::Glossy: {
-            if (cosWi <= 0 || cosWo <= 0) return 0.0;
-            double r = hitForTex ? clamp01(reflectSlot(scene, m, *hitForTex, lambda))
-                                 : clamp01(m.reflect(lambda));
-            double e = glossyExponent(hitForTex ? materialRoughness(scene, m, *hitForTex)
-                                                : m.roughness);
-            // Mirror direction of the outgoing ray about ns, as render.h forms it:
-            // sampleGlossy lobes around reflect(rayDir, n) with rayDir = -wo.
-            Vec3 mdir = reflect(wo * -1.0, ns);
-            double cosLobe = dot(wi, mdir);
-            if (cosLobe <= 0) return 0.0;
-            double lobe = (e + 1.0) / (2.0 * PI) * std::pow(cosLobe, e);
-            return r * lobe / cosWi;   // denom = sampled-direction cosine (see header)
-        }
+        case MatType::Glossy:
+            // r * lobe / cos(wi), the denominator the sampled direction's cosine (see header);
+            // r carries an iridescent glossy's interference reflectance (render.h glossyF).
+            return glossyF(scene, m, hitForTex, ns, wo, wi, lambda);
         case MatType::DiffuseTransmit: {
             // Two-sided Lambertian: same-hemisphere pair (wo,wi) -> reflect albedo,
             // opposite hemispheres -> transmit albedo. Symmetric in wo<->wi.

@@ -30047,7 +30047,8 @@ correctly on **both** backends.
   show colour only through what they reflect/transmit. In a closed pinhole (mode B)
   box with nothing bright around them they read near-black — expected forward-tracer
   behaviour (same as the existing `mirror`/`glossy`/`dielectric` types); use mode A,
-  an environment light, or surrounding geometry to see them. Their reflectance data
+  an environment light, or surrounding geometry to see them. *(Since 0.401.0 a metal given a `roughness` above 0
+  is splatted through its lobe in modes `A`/`B`, so it is no longer black there.)* Their reflectance data
   is correct (verified by putting the same `metal:` spectra on a diffuse surface).
 - **Proper fix (remaining):** three offline generators exist — `tools/csv_to_table.py`
   (generic CSV→`table`), `tools/ri_nk_to_reflectance.py` (refractiveindex.info
@@ -31762,7 +31763,9 @@ offender.
    **exactly 0.000000 at every roughness** in this scene, while its diffuse tile matches mode `R`
    to 0.14 %. That is not a new bug but a *documented* one: forward `A`/`B`/`C` cannot splat a
    specular-first pixel to a pinhole (`REFERENCE.md`: "specular-first still black — the analytic
-   connections are pinhole-only", "rough specular … still black"). Mode `M` does shade it, to
+   connections are pinhole-only", "rough specular … still black"). *(Gone since 0.401.0: modes `A`/`B`
+   splat a rough glossy vertex through its lobe, so that tile is no longer black there; only a
+   roughness-0 glossy still depends on the analytic connection.)* Mode `M` does shade it, to
    within 0.3 %. Mode `D` shades it but reads **high and increasingly so with roughness** — see
    the entry below.
 2. *"previews as pure black, even at high `-spp`"* — **the `-spp` clause is backwards.** Pure black

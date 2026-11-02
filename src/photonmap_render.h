@@ -1305,6 +1305,9 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0.0) return L;
+                // An iridescent lobe's interference reflectance at the pair's half-vector.
+                if (m.iridescence)
+                    thr *= iridescenceR(scene, m, &h, lambda, halfVectorCos(ray.d * -1.0, o));
                 if (gneeOn) {
                     gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
                     gmis.from = h.p;
@@ -1707,6 +1710,16 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 sthr.mul([&](double Lw) { return clamp01(reflectSlot(scene, m, h, Lw)); }, r);
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0.0) return L;
+                // An iridescent lobe's interference reflectance at the pair's half-vector, into
+                // the scalar and the spectral throughput alike. Where it is 0 at the walk's own
+                // wavelength the path carries nothing (and sthr's ratio would divide by it).
+                if (m.iridescence) {
+                    const double cH = halfVectorCos(ray.d * -1.0, o);
+                    const double Rh = iridescenceR(scene, m, &h, lambda, cH);
+                    if (!(Rh > 0.0)) return L;
+                    thr *= Rh;
+                    sthr.mul([&](double Lw) { return iridescenceR(scene, m, &h, Lw, cH); }, Rh);
+                }
                 if (gneeOn) {
                     gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
                     gmis.from = h.p;

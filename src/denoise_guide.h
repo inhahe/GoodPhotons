@@ -202,9 +202,12 @@ inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& al
             case MatType::Glossy:
                 if (materialRoughness(scene, m, h) < kMirrorRoughness) {
                     // The render's glossy walks end a lobe below n's plane before the true
-                    // surface is asked (`dot(o, h.n) <= 0`): black there too.
+                    // surface is asked (`dot(o, h.n) <= 0`): black there too. An iridescent
+                    // lobe tints by its interference reflectance at the mirror direction.
+                    const double cv = clamp01(-dot(ray.d, h.n));
                     if (!(dot(reflect(ray.d, h.n), h.n) > 0.0) ||
-                        !mirror(rgbOf([&](double L) { return reflectSlot(scene, m, h, L); }))) {
+                        !mirror(rgbOf([&](double L) {
+                            return reflectSlot(scene, m, h, L) * iridescenceR(scene, m, &h, L, cv); }))) {
                         nrm = nrm + h.n; return;
                     }
                     continue;
@@ -214,9 +217,12 @@ inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& al
                 break;
         }
         // A surface with a texture of its own: its colour is the guide.
+        // An iridescent glossy's colour is its interference reflectance, here at the view angle.
+        const double cvA = clamp01(-dot(ray.d, h.n));
         Vec3 a = rgbOf([&](double L) {
             double r = diffuseReflectance(scene, m, h, L);
             if (m.type == MatType::DiffuseTransmit) r += transmitSlot(scene, m, h, L);
+            if (m.iridescence) r *= iridescenceR(scene, m, &h, L, cvA);
             return r;
         });
         alb = alb + mul(tint, a);

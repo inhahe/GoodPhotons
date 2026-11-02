@@ -506,6 +506,10 @@ struct DMaterial {
     // substrate is ior + substrateK (spectral). layer 0 is outermost.
     int    layerCount;
     double layerN[D_MAXLAYERS], layerK[D_MAXLAYERS], layerThick[D_MAXLAYERS];
+    // A ROUGH interference reflector (D_GLOSSY with iridescence 1 thin film / 2 multilayer):
+    // the lobe is weighted by the coating's reflectance at the microfacet angle, from the film /
+    // stack fields above (dIridescenceR). 0 on every other material. Host twin Material::iridescence.
+    int    iridescence;
     double grooveSpacing;
     DVec3  grooveDir;
     int    gratingMaxOrder;
@@ -5290,9 +5294,71 @@ __device__ static Real dShadowTerminatorG(const DVec3& wi, const DVec3& ns, cons
 __device__ static inline bool dMergeFromBehind(bool twoSided, const DVec3& wi, const DVec3& ngo) {
     return !twoSided && !(dot(wi, ngo) > (Real)0);
 }
+// ---- The glossy lobe, and a rough interference reflector (host twins in render.h) ----------
+struct DJBase;
+__device__ static Real dReflectSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda,
+                                    DJBase* shp);
+__device__ static inline double dGlossyExp(double roughness);
+// Twin of iridescenceR: the interference reflectance an iridescent D_GLOSSY weights its lobe by,
+// for light meeting the coating at `cosH` (each direction's cosine with the pair's half-vector),
+// incident medium air. 1 on a plain glossy. `h` (may be null) supplies a mapped film thickness.
+__device__ static Real dIridescenceR(const DScene& sc, const DMaterial& m, const DHit* h,
+                                     Real lambda, Real cosH) {
+    if (m.iridescence == 0) return (Real)1;
+    const Real ns = specLookup(m.ior, lambda), ks = specLookup(m.substrateK, lambda);
+    if (m.iridescence == 1)
+        return thinFilmReflectance((Real)1, (Real)m.filmIor, ns, ks,
+                                   h ? dMatFilmThickness(sc, m, *h) : (Real)m.filmThickness,
+                                   cosH, lambda);
+    return multilayerReflectance((Real)1, cosH, lambda, m.layerN, m.layerK, m.layerThick,
+                                 m.layerCount, ns, ks);
+}
+// Twin of halfVectorCos: each unit direction's cosine with their half-vector, |a + b| / 2.
+__device__ static inline Real dHalfVectorCos(const DVec3& a, const DVec3& b) {
+    const Real c = (Real)0.5 * length(a + b);
+    return c < (Real)1 ? c : (Real)1;
+}
+// Twin of glossyF: r * lobe / cos(wi), the lobe mirrored about wo, r the reflect slot times an
+// iridescent glossy's interference reflectance; 0 unless both lie above `ns` and wi in the lobe.
+// Double, as dBsdfF is.
+__device__ static double dGlossyF(const DScene& sc, const DMaterial& m, const DHit& h,
+                                  const DVec3& ns, const DVec3& wo, const DVec3& wi, Real lambda) {
+    const double cosWi = ddot(wi, ns), cosWo = ddot(wo, ns);
+    if (cosWi <= 0 || cosWo <= 0) return 0.0;
+    double r = clamp01(dReflectSlot(sc, m, h, lambda, nullptr));
+    if (m.iridescence) r *= (double)dIridescenceR(sc, m, &h, lambda, dHalfVectorCos(wo, wi));
+    const double e = dGlossyExp((double)dMatRoughness(sc, m, h));
+    const DVec3 mdir = reflectv(wo * (Real)(-1), ns);
+    const double cosLobe = ddot(wi, mdir);
+    if (cosLobe <= 0) return 0.0;
+    const double lobe = (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
+    return r * lobe / cosWi;
+}
+// A glossy photon vertex's camera splat (host twin GlossySplat): the splats evaluate the ADJOINT
+// lobe toward the camera point they find, which is dGlossyF with the pair swapped.
+struct DGlossySplat {
+    const DScene*    sc;
+    const DMaterial* m;
+    const DHit*      h;
+    DVec3 ns;   // shading normal
+    DVec3 wl;   // toward the previous, light-side vertex
+    __device__ Real f(const DVec3& wc, Real lambda) const {
+        return (Real)dGlossyF(*sc, *m, *h, ns, wc, wl, lambda);
+    }
+};
+// Twin of glossySplats: a glossy lobe with a finite value splats in the forward modes. The one
+// without, roughness pinned at 0 with nothing to vary it, is the analytic planar-mirror
+// connection's (dIsPlanarMirrorMat), and splatting it too would count it twice.
+__device__ static inline bool dGlossySplats(const DMaterial& m) {
+    return m.type == D_GLOSSY &&
+           !(m.roughness <= 0.0 && m.roughnessTex < 0 && m.roughnessPat < 0);
+}
+
+// `gs` (optional): a glossy vertex, whose f replaces rho/pi toward the camera (DGlossySplat).
 __device__ static void connect(const DScene& sc, const DCamera& cam, double* film, double* hits,
                                const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
-                               Real lambda, Real beta, Real rho, DRng& rng) {
+                               Real lambda, Real beta, Real rho, DRng& rng,
+                               const DGlossySplat* gs = nullptr) {
     DVec3 toCam = cam.eye - p;
     Real dist = length(toCam);
     DVec3 wdir = toCam / dist;
@@ -5308,7 +5374,7 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
     if (occludedTo(sc, dOffsetAlong(p, ng, wdir), p + wdir * dist, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
-    Real f = rho / (Real)DPI;
+    Real f = gs ? gs->f(wdir, lambda) : rho / (Real)DPI;
     // Projection-general splat: contrib = beta*f*cosSurf*corr / (dist^2 * pixelSolidAngle).
     // For a rectilinear lens pixelSolidAngle = pixelPlaneArea*cosCam^3, recovering the
     // classic 1/(A_pix cos^4) form; fisheye/panoramic uses the remapped solid angle.
@@ -5356,7 +5422,8 @@ __device__ static void connectVolume(const DScene& sc, const DMedium& med, const
 __device__ static void connectLensPhysical(const DScene& sc, const DCamera& cam, double* film,
                                            double* hits, const DVec3& p, const DVec3& n,
                                            const DVec3& ng, const DVec3& wi, Real lambda,
-                                           Real beta, Real rho, DRng& rng, const DVec3* plane) {
+                                           Real beta, Real rho, DRng& rng, const DVec3* plane,
+                                           const DGlossySplat* gs = nullptr) {   // see connect
     const double u1 = rng.uniform(), u2 = rng.uniform();
     DLensEntry le;
     if (!dLensEntry(cam, p, u1, u2, le)) return;
@@ -5371,8 +5438,8 @@ __device__ static void connectLensPhysical(const DScene& sc, const DCamera& cam,
     if (!dLensEntryImage(cam, le, lambda, px, py, wgt)) return;
     if (occludedTo(sc, dOffsetAlong(p, ng, wdir), le.Y, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;
     const Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
-    Real contrib = (Real)((double)beta * ((double)rho / DPI) * (double)cosSurf * (double)corr *
-                          wgt * (double)stG);
+    Real contrib = (Real)((double)beta * (gs ? (double)gs->f(wdir, lambda) : (double)rho / DPI) *
+                          (double)cosSurf * (double)corr * wgt * (double)stG);
     if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, (Real)le.dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
@@ -5398,7 +5465,8 @@ __device__ static void connectLensHeroPhysical(const DScene& sc, const DCamera& 
                                                double* hits, const DVec3& p, const DVec3& n,
                                                const DVec3& ng, const DVec3& wi, const Real* lam,
                                                const Real* beta, const Real* rho, int nUp,
-                                               DRng& rng, const DVec3* plane) {
+                                               DRng& rng, const DVec3* plane,
+                                               const DGlossySplat* gs = nullptr) {   // see connect
     const double u1 = rng.uniform(), u2 = rng.uniform();
     DLensEntry le;
     if (!dLensEntry(cam, p, u1, u2, le)) return;
@@ -5421,8 +5489,9 @@ __device__ static void connectLensHeroPhysical(const DScene& sc, const DCamera& 
     const Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     for (int i = 0; i < nUp; ++i) {
         if (!ok[i]) continue;
-        Real contrib = (Real)((double)beta[i] * ((double)rho[i] / DPI) * (double)cosSurf *
-                              (double)corr * wg[i] * (double)stG);
+        Real contrib = (Real)((double)beta[i] *
+                              (gs ? (double)gs->f(wdir, lam[i]) : (double)rho[i] / DPI) *
+                              (double)cosSurf * (double)corr * wg[i] * (double)stG);
         if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, (Real)dist, lam[i], rng);
         filmAdd(film, hits, cam.resX, px[i], py[i], lam[i], contrib);
     }
@@ -5430,8 +5499,9 @@ __device__ static void connectLensHeroPhysical(const DScene& sc, const DCamera& 
 __device__ static void connectLens(const DScene& sc, const DCamera& cam, double* film, double* hits,
                                    const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
                                    Real lambda, Real beta, Real rho, DRng& rng,
-                                   const DVec3* plane = nullptr) {
-    if (cam.hasLens) { connectLensPhysical(sc, cam, film, hits, p, n, ng, wi, lambda, beta, rho, rng, plane); return; }
+                                   const DVec3* plane = nullptr,
+                                   const DGlossySplat* gs = nullptr) {   // see connect
+    if (cam.hasLens) { connectLensPhysical(sc, cam, film, hits, p, n, ng, wi, lambda, beta, rho, rng, plane, gs); return; }
     Real R  = (Real)cam.apertureR;
     Real rr = R * sqrt(rng.uniform());
     Real a  = (Real)(2.0 * DPI) * rng.uniform();
@@ -5453,7 +5523,8 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     if (!cam.lensImage(A, wdir, px, py)) return;
     if (occludedTo(sc, dOffsetAlong(p, ng, wdir), p + wdir * dist, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);   // Veach adjoint (1 when ns==ng)
-    Real contrib = beta * rho * cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG;
+    Real contrib = beta * (gs ? (Real)DPI * gs->f(wdir, lambda) : rho) * cosSurf * corr * cosLens *
+                   (R * R) / (dist * dist) * stG;
     // ABSOLUTE-SCALE NORMALISER (A/C <-> B unification) — CPU twin: render.h connectLens.
     // Divide the pupil FLUX deposited in the cell by the physical cell area
     // A_cell = pixelPlaneArea()*filmDist^2 to turn it into film IRRADIANCE, matching
@@ -8051,14 +8122,15 @@ __device__ static void splatSurfaceAll(const DScene& sc, const DCamSet& cs, int 
                                         const DVec3& p, const DVec3& n, const DVec3& ng,
                                         const DVec3& wi, Real lambda,
                                         Real beta, Real rho, DRng& rng,
-                                        const DVec3* plane = nullptr) {
+                                        const DVec3* plane = nullptr,
+                                        const DGlossySplat* gs = nullptr) {   // see connect
     for (int c = 0; c < cs.nCam; ++c) {
         if (camMode == CAM_B && !cs.cams[c].hasLens) {
             if (plane && ddot(*plane, cs.cams[c].eye - p) <= (Real)0) continue;
-            connect(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng);
+            connect(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng, gs);
         } else if (dLensCam(camMode, cs.cams[c])) {
             connectLens(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng,
-                        plane);
+                        plane, gs);
         }
     }
 }
@@ -10607,10 +10679,23 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         ro = dOffsetAlong(h.p, h.ng, rd);   // straight through, direction unchanged
         return WF_CONTINUE;
     } else if (m.type == D_GLOSSY) {
+        // A lobe with a finite value splats to the camera as a diffuse vertex does, with the
+        // glossy BSDF toward it, at the arriving beta (host twin: tracePhoton's Glossy case).
+        if ((camMode == CAM_A || camMode == CAM_B) && dGlossySplats(m)) {
+            const DVec3 wl = -rd;
+            const DGlossySplat gsp{&sc, &m, &h, h.n, wl};
+            splatSurfaceAll(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lambda, beta, (Real)0, rng,
+                            nullptr, &gsp);
+        }
         Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
         DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
         if (dot(o, h.n) <= 0) { eAbsorbed += beta; return WF_TERMINATE; }
+        // An iridescent lobe's interference reflectance, known only now that the pair is: a
+        // second roulette, beta unchanged (host twin interactPhotonSpecular).
+        if (m.iridescence &&
+            rng.uniform() >= dIridescenceR(sc, m, &h, lambda, dHalfVectorCos(-rd, o)))
+            { eAbsorbed += beta; return WF_TERMINATE; }
         if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) { eAbsorbed += beta; return WF_TERMINATE; } return WF_CONTINUE;
     } else if (m.type == D_FLUORESCENT) {
         // Two competing channels: elastic diffuse reflection (albedo rho, wavelength
@@ -11085,7 +11170,8 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
 // (draws no RNG). Per-λ ordering matches connect().
 __device__ static void connectHero(const DScene& sc, const DCamera& cam, double* film, double* hits,
         const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
-        const Real* lam, const Real* beta, const Real* rho, int nUp, DRng& rng) {
+        const Real* lam, const Real* beta, const Real* rho, int nUp, DRng& rng,
+        const DGlossySplat* gs = nullptr) {                               // see connect
     DVec3 toCam = cam.eye - p;
     Real dist = length(toCam);
     DVec3 wdir = toCam / dist;
@@ -11100,7 +11186,7 @@ __device__ static void connectHero(const DScene& sc, const DCamera& cam, double*
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real geo = cosSurf * corr / (Real)((double)dist2 * solidAngle) * stG;
     for (int i = 0; i < nUp; ++i) {
-        Real contrib = beta[i] * (rho[i] / (Real)DPI) * geo;
+        Real contrib = beta[i] * (gs ? gs->f(wdir, lam[i]) : rho[i] / (Real)DPI) * geo;
         if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lam[i], rng);
         filmAdd(film, hits, cam.resX, px, py, lam[i], contrib);
     }
@@ -11112,9 +11198,11 @@ __device__ static void connectHero(const DScene& sc, const DCamera& cam, double*
 __device__ static void connectLensHero(const DScene& sc, const DCamera& cam, double* film, double* hits,
         const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
         const Real* lam, const Real* beta, const Real* rho, int nUp, DRng& rng,
-        const DVec3* plane = nullptr) {                                   // see connectLens
+        const DVec3* plane = nullptr,
+        const DGlossySplat* gs = nullptr) {                               // see connectLens
     if (cam.hasLens) {
-        connectLensHeroPhysical(sc, cam, film, hits, p, n, ng, wi, lam, beta, rho, nUp, rng, plane);
+        connectLensHeroPhysical(sc, cam, film, hits, p, n, ng, wi, lam, beta, rho, nUp, rng, plane,
+                                gs);
         return;
     }
     Real R  = (Real)cam.apertureR;
@@ -11139,7 +11227,7 @@ __device__ static void connectLensHero(const DScene& sc, const DCamera& cam, dou
     Real cellNorm = (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
     Real geo = cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG * cellNorm;
     for (int i = 0; i < nUp; ++i) {
-        Real contrib = beta[i] * rho[i] * geo;
+        Real contrib = beta[i] * (gs ? (Real)DPI * gs->f(wdir, lam[i]) : rho[i]) * geo;
         if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lam[i], rng);
         filmAdd(film, hits, cam.resX, px, py, lam[i], contrib);
     }
@@ -11149,14 +11237,16 @@ __device__ static void connectLensHero(const DScene& sc, const DCamera& cam, dou
 __device__ static void splatSurfaceAllHero(const DScene& sc, const DCamSet& cs, int camMode,
         const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
         const Real* lam, const Real* beta, const Real* rho, int nUp, DRng& rng,
-        const DVec3* plane = nullptr) {                                   // see splatSurfaceAll
+        const DVec3* plane = nullptr,
+        const DGlossySplat* gs = nullptr) {                               // see splatSurfaceAll
     for (int c = 0; c < cs.nCam; ++c) {
         if (camMode == CAM_B && !cs.cams[c].hasLens) {
             if (plane && ddot(*plane, cs.cams[c].eye - p) <= (Real)0) continue;
-            connectHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp, rng);
+            connectHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp, rng,
+                        gs);
         } else if (dLensCam(camMode, cs.cams[c])) {
             connectLensHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp,
-                            rng, plane);
+                            rng, plane, gs);
         }
     }
 }
@@ -11451,14 +11541,21 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
 
     if (m.type == D_MIRROR || m.type == D_FILTER || m.type == D_GLOSSY) {
         if (pathC) pathC->bits |= dPhotonVertexBit(sc, m, h);   // caustic split
-        // ACHROMATIC delta lobes (device twin of render.h's Mirror/Filter/Glossy hero case):
-        // specular — so no camera connect, exactly like the scalar path — but the outgoing
-        // DIRECTION does not depend on λ, so the bundle keeps riding and only the per-λ
+        // ACHROMATIC lobes (device twin of render.h's Mirror/Filter/Glossy hero case): the
+        // outgoing DIRECTION does not depend on λ, so the bundle keeps riding and only the per-λ
         // coefficient differs. The scalar lobe survives by ANALOG Russian roulette on its
         // coefficient; rolling that coin on the hero alone would kill live secondaries
         // whenever c_hero == 0 (a Wratten gel is 0 over most of the spectrum) AND amplify by
         // c_i/c_hero, so the survival probability is the MAX over live λ and survivors
-        // reweight by c_i/q <= 1.
+        // reweight by c_i/q <= 1. A mirror and a filter are delta, with no camera connect, as
+        // in the scalar path; a glossy lobe with a finite value splats first, as its does.
+        if ((camMode == CAM_A || camMode == CAM_B) && dGlossySplats(m)) {
+            const DVec3 wl = -rd;
+            const DGlossySplat gsp{&sc, &m, &h, h.n, wl};
+            Real unused[hero::kHeroMax] = {};
+            splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lam, beta, unused, nUp,
+                                rng, nullptr, &gsp);
+        }
         Real c[hero::kHeroMax];
         Real q = (Real)0;
         for (int i = 0; i < nUp; ++i) {
@@ -11479,6 +11576,23 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         } else {
             DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
             if (dot(o, h.n) <= 0) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
+            if (m.iridescence) {
+                // The interference reflectance at the pair's half-vector, per λ, by the same
+                // roulette-on-the-max and bounded reweight as above (host twin).
+                const Real cH = dHalfVectorCos(-rd, o);
+                Real R[hero::kHeroMax];
+                Real qR = (Real)0;
+                for (int i = 0; i < nUp; ++i) {
+                    R[i] = dIridescenceR(sc, m, &h, lam[i], cH);
+                    if (R[i] > qR) qR = R[i];
+                }
+                if (rng.uniform() >= qR) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
+                for (int i = 0; i < nUp; ++i) {
+                    Real w = R[i] / qR;
+                    eAbsorbed += (double)beta[i] * (double)((Real)1 - w);
+                    beta[i] *= w;
+                }
+            }
             if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
         }
         return WF_CONTINUE;
@@ -12171,15 +12285,9 @@ __device__ static double dBsdfF(const DScene& sc, const DVertex& vt,
         double rho = clamp01(dDiffuseRho(sc, m, h, lambda));
         return rho / DPI;
     } else if (m.type == D_GLOSSY) {
-        if (cosWi <= 0 || cosWo <= 0) return 0.0;
+        // r * lobe / cos(wi); r carries an iridescent lobe's interference reflectance (dGlossyF).
         DHit h = dVertHit(vt);
-        double r = clamp01(dReflectSlot(sc, m, h, lambda));
-        double e = dGlossyExp((double)dMatRoughness(sc, m, h));
-        DVec3 mdir = reflectv(wo * (Real)(-1), ns);
-        double cosLobe = ddot(wi, mdir);
-        if (cosLobe <= 0) return 0.0;
-        double lobe = (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
-        return r * lobe / cosWi;
+        return dGlossyF(sc, m, h, ns, wo, wi, lambda);
     } else if (m.type == D_DIFFUSETRANSMIT) {
         // Two-sided Lambertian: same-hemisphere pair -> reflect albedo, opposite -> transmit.
         DHit h = dVertHit(vt);
@@ -12547,7 +12655,8 @@ __device__ static inline double dGlossyFHit(const DScene& sc, const DMaterial& m
                                             const DVec3& wo, const DVec3& wi, Real lambda) {
     const double cosWi = ddot(wi, h.n), cosWo = ddot(wo, h.n);
     if (cosWi <= 0 || cosWo <= 0) return 0.0;
-    const double r = clamp01(dReflectSlot(sc, m, h, lambda));
+    double r = clamp01(dReflectSlot(sc, m, h, lambda));
+    if (m.iridescence) r *= (double)dIridescenceR(sc, m, &h, lambda, dHalfVectorCos(wo, wi));
     const double e = dGlossyExp((double)dMatRoughness(sc, m, h));
     const DVec3 mdir = reflectv(wo * (Real)(-1), h.n);
     const double cosLobe = ddot(wi, mdir);
@@ -14155,6 +14264,11 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                 DVec3 o = dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h),
                                             gi.sIdx, gi.bounce);
                 if (dot(o, h.n) <= 0) return false;
+                // An iridescent lobe's interference reflectance at the pair's half-vector.
+                if (mp->iridescence &&
+                    !dWhittedAttenuate(thr, (double)dIridescenceR(sc, *mp, &h, lambda,
+                                                                  dHalfVectorCos(rd * (Real)(-1), o)),
+                                       dLocalN2(sc, stk, lambda))) return false;
                 if (gm) {
                     gm->pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
                     gm->from = h.p;
@@ -14165,6 +14279,9 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             if (rng.uniform() >= r) return false;
             DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
             if (dot(o, h.n) <= 0) return false;
+            // An iridescent lobe's interference reflectance at the pair's half-vector (the NEE
+            // above carries it inside dGlossyFHit).
+            if (mp->iridescence) thr *= dIridescenceR(sc, *mp, &h, lambda, dHalfVectorCos(rd * (Real)(-1), o));
             if (gm) {                    // the other half of the weight, for whatever `o` hits
                 gm->pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
                 gm->from = h.p;
@@ -14895,6 +15012,10 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     DVec3 o = dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h),
                                                 gi.sIdx, b);
                     if (dot(o, h.n) <= 0) return;
+                    if (mp->iridescence) {   // interference reflectance at the half-vector, per λ
+                        const Real cH = dHalfVectorCos(rd * (Real)(-1), o);
+                        for (int i = 0; i < nUp; ++i) thr[i] *= (double)dIridescenceR(sc, *mp, &h, lam[i], cH);
+                    }
                     if (sc.bkGlossyNee)   // the other half of the weight -- see the scalar twin
                         { gmis.pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
                           gmis.from = h.p; gmis.n = h.n; }
@@ -14902,6 +15023,10 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 } else {
                     DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
                     if (dot(o, h.n) <= 0) return;
+                    if (mp->iridescence) {   // interference reflectance at the half-vector, per λ
+                        const Real cH = dHalfVectorCos(rd * (Real)(-1), o);
+                        for (int i = 0; i < nUp; ++i) thr[i] *= (double)dIridescenceR(sc, *mp, &h, lam[i], cH);
+                    }
                     if (sc.bkGlossyNee)      // the other half of the weight, for what `o` hits
                         { gmis.pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
                           gmis.from = h.p; gmis.n = h.n; }
@@ -16197,6 +16322,10 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 wi = sampleGlossy(mdir, dMatRoughness(sc, *mp, h), rng);   // per-hit roughness
                 if (dot(wi, path[cur].ns) <= 0) { terminate = true; break; }
                 double r = clamp01(dReflectSlot(sc, *mp, h, lambda, jrun ? &jbS : nullptr));      // per-hit reflect
+                // An iridescent lobe's interference reflectance at the sampled pair's half-vector
+                // (dIridescenceR): dBsdfF's r for this pair. Host twin bdpt.h randomWalk.
+                const Real cH = mp->iridescence ? dHalfVectorCos(wo, wi) : (Real)1;
+                if (mp->iridescence) r *= (double)dIridescenceR(sc, *mp, &h, lambda, cH);
                 pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
                 pdfRevW = dBsdfPdf(sc, path[cur], wi, wo, lambda);
                 betaFactor = r;
@@ -16206,8 +16335,10 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 // and only the reflectance differs per λ. (The unidirectional hero tracers
                 // de-hero here instead — see known-issues.md.)
                 secChromatic = true;
-                for (int i = 0; i + 1 < nUp; ++i)
+                for (int i = 0; i + 1 < nUp; ++i) {
                     secF[i] = clamp01(dReflectSlot(sc, *mp, h, hb.lam[i + 1]));
+                    if (mp->iridescence) secF[i] *= dIridescenceR(sc, *mp, &h, hb.lam[i + 1], cH);
+                }
                 break;
             }
             case D_DIFFUSETRANSMIT: {
@@ -16330,7 +16461,11 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 case D_FLUORESCENT:
                 case D_GLOSSY: {
                     const bool dif = (mp->type != D_GLOSSY);
-                    auto fJ = [&](double L) { return dJSlotAt(sc, *mp, jbS, L, dif); };
+                    // ...times an iridescent lobe's interference reflectance at the sampled pair.
+                    const Real cHj = mp->iridescence ? dHalfVectorCos(wo, wi) : (Real)1;
+                    auto fJ = [&](double L) {
+                        const double v = dJSlotAt(sc, *mp, jbS, L, dif);
+                        return mp->iridescence ? v * (double)dIridescenceR(sc, *mp, &h, (Real)L, cHj) : v; };
                     jrun->mul(fJ, fJ((double)lambda), false);
                     break;
                 }
@@ -17880,6 +18015,8 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
                 if (dot(o, h.n) <= 0) return;
+                // An iridescent lobe's interference reflectance at the pair's half-vector.
+                if (m.iridescence) thr *= (double)dIridescenceR(sc, m, &h, lambda, dHalfVectorCos(-rd, o));
                 if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return; break;
             }
             case D_DIELECTRIC:
@@ -18542,6 +18679,17 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 }
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
                 if (dot(o, h.n) <= 0) return;
+                // An iridescent lobe's interference reflectance at the pair's half-vector, into the
+                // scalar and the spectral throughput alike; where it is 0 at the walk's own
+                // wavelength the path carries nothing (and sthr's ratio would divide by it).
+                // Host twin photonmap_render.h.
+                if (m.iridescence) {
+                    const Real cH = dHalfVectorCos(-rd, o);
+                    const double Rh = (double)dIridescenceR(sc, m, &h, lambda, cH);
+                    if (!(Rh > 0.0)) return;
+                    thr *= Rh;
+                    sthr.mul(sc, [&](double Lw) { return (double)dIridescenceR(sc, m, &h, (Real)Lw, cH); }, Rh);
+                }
                 if (sc.bkGlossyNee) {                       // the lobe's own density, for the weight above
                     gmis.pdf  = dGlossyPdfHit(sc, m, h, rd * (Real)(-1), o);
                     gmis.from = h.p;
@@ -18869,6 +19017,8 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
                 if (dot(o, h.n) <= 0) return;
+                // An iridescent lobe's interference reflectance at the pair's half-vector.
+                if (m.iridescence) thr *= (double)dIridescenceR(sc, m, &h, lambda, dHalfVectorCos(-rd, o));
                 if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return; break;
             }
             case D_DIELECTRIC:
@@ -19194,6 +19344,10 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             wi = sampleGlossy(mdir, dMatRoughness(sc, m, h), rng);
             if (dot(wi, ns) <= 0) { terminate = true; break; }
             double r = clamp01(dReflectSlot(sc, m, h, lambda));
+            // An iridescent lobe's interference reflectance at the sampled pair's half-vector:
+            // dBsdfF's r for this pair. Host twin vcm.h.
+            const Real cH = m.iridescence ? dHalfVectorCos(wo, wi) : (Real)1;
+            if (m.iridescence) r *= (double)dIridescenceR(sc, m, &h, lambda, cH);
             pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
             pdfRevW = dBsdfPdf(sc, vt, wi, wo, lambda);
             betaFactor = r;
@@ -19203,8 +19357,10 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             // reflectance differs per λ.
             if (nSec) {
                 *secChromatic = true;
-                for (int i = 0; i < nSec; ++i)
+                for (int i = 0; i < nSec; ++i) {
                     secF[i] = clamp01(dReflectSlot(sc, m, h, lamAll[i + 1]));
+                    if (m.iridescence) secF[i] *= dIridescenceR(sc, m, &h, lamAll[i + 1], cH);
+                }
             }
             break;
         }
@@ -21038,7 +21194,8 @@ bool cudaForwardSupported(const Scene& scene) {
     // branch samples for the Stokes shift — so neither forces a CPU fallback here.)
     auto oversizedMultilayer = [&](int matId) {
         return matId >= 0 && matId < (int)scene.mats.size() &&
-               scene.mats[matId].type == MatType::Multilayer &&
+               (scene.mats[matId].type == MatType::Multilayer ||
+                scene.mats[matId].iridescence == 2) &&       // a rough multilayer too
                (int)scene.mats[matId].layerN.size() > D_MAXLAYERS;
     };
     // Indexed-spectral palette maps (§9.3) resolve per-texel to an arbitrary named
@@ -21550,6 +21707,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.filmThicknessTex = m.filmThicknessTex;
         d.normalTex = m.normalTex;
         d.normalStrength = m.normalStrength;
+        d.iridescence = m.iridescence;
         d.layerCount = (int)m.layerN.size();
         if (d.layerCount > D_MAXLAYERS) d.layerCount = D_MAXLAYERS;
         for (int k = 0; k < d.layerCount; ++k) {
@@ -24424,6 +24582,7 @@ bool cudaBackwardRGBSupported(const Scene& scene, const Camera& cam) {
                 break;                                              // handled by bkRadianceRGB
             default: return false;                                  // dispersion/thin-film/etc -> spectral
         }
+        if (m.iridescence) return false;                            // a rough thin film / stack, ditto
         if (m.reflectTex >= 0) return false;                        // textured albedo not baked to RGB
         if (m.reflectPat >= 0) return false;                        // pattern-modulated albedo, ditto
         if (m.transmitPat >= 0) return false;                       // pattern-modulated transmittance, ditto

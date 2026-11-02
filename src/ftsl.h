@@ -4838,6 +4838,7 @@ private:
             if (find(b, "reflect") || find(b, "reflect_map"))
                 m.reflect = reflectParam(b, m, m.reflect);
             if (find(b, "ior"))            m.ior           = spectrumParam(b, "ior", m.ior);
+            if (!roughenInterference(b, m, /*parse=*/false)) return m;
             checkSlotPatsSupported(b, m);
             return m;
         }
@@ -5084,6 +5085,7 @@ private:
         } else {
             fail("unknown material type '" + type + "'");
         }
+        if (!roughenInterference(b, m, /*parse=*/true)) return m;
         checkSlotPatsSupported(b, m);
         // Nested-dielectric priority (§ nested dielectrics): `priority <N>` — integer,
         // higher wins where dielectric solids overlap. Common to every material type
@@ -5129,6 +5131,39 @@ private:
         // 1). The shading normal is perturbed at closestHit via the surface TBN frame.
         bindNormalTexture(b, m, L);
         return m;
+    }
+
+    // `roughness` on an OPAQUE thin film or multilayer -- an absorbing substrate or layer, at
+    // every wavelength -- makes a rough interference reflector: a Glossy whose lobe the coating's
+    // interference reflectance weights at the microfacet angle (Material::iridescence, render.h
+    // iridescenceR). Unlike the specular coating it has a finite BSDF, so it renders in every
+    // mode, the forward ones included. `reflect` (default 1) tints it. A transparent coating has
+    // no rough form here (its transmitted lobe would need one too), so that is refused; roughness
+    // 0 leaves the specular coating as it was. `parse`: read `roughness` here, for an explicit
+    // `type`; a preset's override has read it already. False after a reported failure.
+    bool roughenInterference(const Block& b, Material& m, bool parse) {
+        if ((m.type != MatType::ThinFilm && m.type != MatType::Multilayer) || !find(b, "roughness"))
+            return true;
+        if (parse) {
+            if (bindScalarPattern(b, "roughness", m.roughnessPat)) m.roughness = 0.2;
+            else if (bindScalarTexture(b, "roughness", m.roughnessTex)) m.roughness = 0.2;
+            else m.roughness = dblParam(b, "roughness", 0.0);
+        }
+        for (double L = LAMBDA_MIN; L <= LAMBDA_MAX; L += 5.0)
+            if (!m.coatOpaque(L)) {
+                fail("material '" + b.name + "': `roughness` needs an opaque " +
+                     (m.type == MatType::ThinFilm ? "thin film" : "multilayer") +
+                     " -- an absorbing substrate (`substrate_k` > 0) or an absorbing layer -- "
+                     "and this one lets light through near " + std::to_string((int)L) +
+                     " nm; a transparent coating has no rough form");
+                return false;
+            }
+        if (m.roughnessPat < 0 && m.roughnessTex < 0 && !(m.roughness > 0.0)) return true;
+        m.iridescence = (m.type == MatType::ThinFilm) ? 1 : 2;
+        m.type = MatType::Glossy;
+        m.reflect = (find(b, "reflect") || find(b, "reflect_map"))
+                        ? reflectParam(b, m, constantSpectrum(1.0)) : constantSpectrum(1.0);
+        return true;
     }
 
     // Bind a `normal_map texture:<name> [strength <s>]` on a material (C6). The value

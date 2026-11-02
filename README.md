@@ -129,8 +129,9 @@ argument for standing a groom in a hall of polished objects.*
   lens** (real glass prescription: depth of field, vignetting, spherical &
   chromatic aberration all emergent), plus fisheye/panoramic projections.
 - **Rich material set** — dielectrics with real glass dispersion, metals from
-  measured data, rough microfacet, thin-film & multilayer interference,
-  diffraction gratings, fluorescence, and stochastic mixes.
+  measured data, rough microfacet, thin-film & multilayer interference (smooth, or
+  rough: a beetle shell, anodized titanium), diffraction gratings, fluorescence, and
+  stochastic mixes.
 - **Wave-optical effects** — thin-film Airy interference, Abelès multilayer
   stacks, and reflective diffraction gratings.
 - **Curve / fiber primitive** — `curve` strands for hair, fur, grass, wire and
