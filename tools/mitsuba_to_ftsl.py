@@ -84,6 +84,7 @@ def xform_vec(m, v):
 
 # ------------------------------------------------------------------- small vec ops
 def vsub(a,b): return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]
+def vdot(a,b): return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
 def vcross(a,b): return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]
 def vlen(a): return math.sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2])
 def vnorm(a):
@@ -172,14 +173,50 @@ LIBRARY_GLASS = {
     'acrylic glass': 'acrylic', 'bk7': 'BK7', 'diamond': 'diamond',
 }
 
+def get_xyz(elem, tag, name, defaults):
+    """The <`tag` name="`name`"> child of `elem` (a point or vector) as [x, y, z], from its
+    `value="x, y, z"` or its x/y/z attributes, or None when there is no such child."""
+    for c in elem:
+        if c.tag == tag and c.get('name') == name:
+            if c.get('value') is not None:
+                v = parse_floats(sub(c.get('value'), defaults))
+                return (v * 3)[:3] if len(v) == 1 else v[:3]
+            return [float(sub(c.get(k, '0'), defaults)) for k in 'xyz']
+    return None
+
+def linear_rgb(node, defaults):
+    """An <rgb> or <srgb> node's colour as linear [r, g, b]. Mitsuba 0.6's srgb, and any
+    '#rrggbb' value, is display-encoded, so it is decoded by the sRGB curve."""
+    val = sub(node.get('value'), defaults).strip()
+    if val.startswith('#'):
+        c = [int(val[i:i+2], 16) / 255.0 for i in (1, 3, 5)]
+        encoded = True
+    else:
+        c = parse_floats(val)
+        if len(c) == 1: c = c*3
+        encoded = node.tag == 'srgb'
+    if encoded:
+        c = [x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4 for x in c]
+    return c[:3]
+
+def planck_table(T, scale=1.0, lo=360, hi=830, step=5):
+    """A blackbody at `T` kelvin, times `scale`, as an FTSL `table` in Mitsuba's unit,
+    W / (m^2 sr nm), sampled every `step` nm over the converted scene's spectral range."""
+    h, c, k = 6.62607015e-34, 2.99792458e8, 1.380649e-23
+    pairs = []
+    for nm in range(lo, hi + 1, step):
+        lam = nm * 1e-9
+        b = 2 * h * c * c / lam ** 5 / math.expm1(h * c / (lam * k * T)) * 1e-9 * scale
+        pairs.append(f"{nm}:{b:.6g}")
+    return "table { " + " ".join(pairs) + " }"
+
 def spectrum_from_node(node, defaults):
     """Turn a <rgb>/<spectrum>/<blackbody> child into an FTSL spectrum expression."""
     if node is None: return None
     tag = node.tag
     val = sub(node.get('value'), defaults)
     if tag == 'rgb' or tag == 'srgb':
-        c = parse_floats(val)
-        if len(c) == 1: c = c*3
+        c = linear_rgb(node, defaults)
         return f"rgb {fnum(c[0])} {fnum(c[1])} {fnum(c[2])}"
     if tag == 'blackbody':
         t = sub(node.get('temperature','6500'), defaults)
@@ -246,28 +283,39 @@ def get_ior(elem, name, default, defaults):
     g = LIBRARY_GLASS.get(nm)
     return (f"ior glass:{g}" if g else f"ior {MITSUBA_IOR[nm]!r}"), MITSUBA_IOR[nm]
 
-def ftsl_roughness(bsdf, name, defaults):
+PHONG_HW = math.sqrt(math.log(2))           # Phong lobe half-width per unit FTSL roughness
+BECKMANN_HW = math.sqrt(math.log(2))        # half-vector half-width per unit alpha
+GGX_HW = math.sqrt(math.sqrt(2) - 1)
+
+def ftsl_roughness(bsdf, name, defaults, spread=2.0):
     """(FTSL `roughness`, Mitsuba alpha) for the microfacet BSDF `bsdf` (material `name`).
 
-    Matched by lobe width. FTSL's glossy lobe, which a dielectric's frosting also uses, is a
-    Phong lobe of exponent 2/r^2 - 2 about the mirror direction: half-width 0.833 r. Mitsuba's
-    alpha sets the half-vector distribution, whose width a reflection doubles: 1.665 alpha for
-    Beckmann (its default, and what 0.6's Phong reduces to), 1.287 alpha for GGX. So r is
-    2 alpha, or 1.55 alpha for GGX, capped at FTSL's 1. An anisotropic alpha_u/alpha_v pair is
-    averaged, with a warning."""
+    Matched by lobe width. FTSL's glossy lobe, which a dielectric's frosting also puts about
+    its refracted ray, is a Phong lobe of exponent 2/r^2 - 2: half-width PHONG_HW * r.
+    Mitsuba's alpha sets the half-vector distribution, half-width BECKMANN_HW * alpha (its
+    default, and what 0.6's Phong reduces to) or GGX_HW * alpha, and the outgoing ray turns
+    `spread` times as fast as the half-vector: 2 for a reflection, 1 - 1/eta entering a
+    refraction and eta - 1 leaving it. So r = spread * alpha for Beckmann (0.773 of that for
+    GGX), capped at 1. An anisotropic alpha_u/alpha_v pair is averaged, and an alpha this
+    cannot read (a texture) becomes Mitsuba's default 0.1; both with a warning."""
     a = get_float(bsdf, 'alpha', None, defaults)
     if a is None:
         au = get_float(bsdf, 'alpha_u', None, defaults)
-        av = get_float(bsdf, 'alpha_v', au, defaults)
-        if au is None:
-            a = 0.1   # Mitsuba's default
-        else:
+        av = get_float(bsdf, 'alpha_v', None, defaults)
+        if au is not None or av is not None:
+            au = 0.1 if au is None else au   # Mitsuba's default for the one not given
+            av = 0.1 if av is None else av
             a = 0.5 * (au + av)
             if abs(au - av) > 1e-9:
                 warn(f"'{name}': anisotropic alpha_u {fnum(au)} / alpha_v {fnum(av)} -> "
                      f"isotropic alpha {fnum(a)}")
-    k = 1.55 if (get_string(bsdf, 'distribution', defaults) or '').lower() == 'ggx' else 2.0
-    return min(max(k * a, 0.0), 1.0), a
+        else:
+            a = 0.1
+            if any(c.get('name') in ('alpha', 'alpha_u', 'alpha_v') for c in bsdf):
+                warn(f"'{name}': a textured alpha -> Mitsuba's default 0.1")
+    ggx = (get_string(bsdf, 'distribution', defaults) or '').lower() == 'ggx'
+    r = spread * (GGX_HW if ggx else BECKMANN_HW) / PHONG_HW * a
+    return min(max(r, 0.0), 1.0), a
 
 # ------------------------------------------------------------------- BSDF -> material
 CONDUCTOR_METAL = {  # Mitsuba conductor material -> FTSL metal:
@@ -395,10 +443,15 @@ class Converter:
                          f"index outside a dielectric from the dielectric enclosing it, so "
                          f"model the outside medium as a dielectric of its own")
             if btype == 'roughdielectric':
-                r, a = ftsl_roughness(bsdf, name, self.defaults)
+                # Matched to the transmitted lobe, which carries most of glass's light: the
+                # mean of its widths entering and leaving. The reflected lobe comes out narrower.
+                eta = n_in / ext
+                r, a = ftsl_roughness(bsdf, name, self.defaults,
+                                      spread=(abs(1 - 1 / eta) + abs(eta - 1)) / 2)
                 body += f"  roughness {fnum(r)}"
-                warn(f"roughdielectric '{name}': alpha {fnum(a)} -> roughness {fnum(r)}, a "
-                     f"glossy lobe about the reflected and refracted rays, not a microfacet BTDF")
+                warn(f"roughdielectric '{name}': alpha {fnum(a)} -> roughness {fnum(r)}, as wide "
+                     f"as its transmitted lobe; FTSL frosts with one glossy lobe about both rays, "
+                     f"so its reflection is the narrower")
         elif btype in ('plastic', 'roughplastic'):
             diff = self.reflectance_expr(bsdf, 'diffuse_reflectance', '0.5', name)
             r = ftsl_roughness(bsdf, name, self.defaults)[0] if btype == 'roughplastic' else 0.05
@@ -421,25 +474,37 @@ class Converter:
 
         return self.add_material(name, body)
 
-    def emitter_spd(self, emitter, name, scale=1.0):
-        """The FTSL `spd` for the emitter property `name` (radiance, irradiance, intensity),
-        times `scale`. An rgb value becomes `rgbillum`, FTSL's emission upsampling, at its own
-        magnitude, so lights keep their brightness relative to one another; `rgb` would read
-        it as a 0..1 reflectance. Any other spectrum passes through, and cannot be scaled: a
-        `scale` other than 1 is then dropped with a warning."""
+    def emitter_spd(self, emitter, name):
+        """The FTSL `spd` for the emitter property `name` (radiance, irradiance, intensity), at
+        Mitsuba's own magnitude, so lights keep their brightness relative to one another. An
+        rgb value becomes `rgbillum`, FTSL's emission upsampling (`rgb` would read it as a 0..1
+        reflectance); a number or a sampled spectrum passes through; a blackbody becomes its
+        Planck curve tabulated per nanometre, Mitsuba's unit (FTSL's own `blackbody` is per
+        metre, 1e9 brighter). An absent value is Mitsuba's default, 1."""
         node = None
         for c in emitter:
-            if c.tag in ('rgb','srgb','spectrum','blackbody') and (c.get('name') == name or c.get('name') is None):
+            if c.tag in ('rgb','srgb','spectrum','blackbody','float') and \
+                    (c.get('name') == name or (c.get('name') is None and c.tag != 'float')):
                 node = c; break
-        if node is not None and node.tag in ('rgb','srgb'):
-            c = parse_floats(sub(node.get('value'), self.defaults))
-            if len(c) == 1: c = c*3
-            return "rgbillum " + " ".join(fnum(x * scale) for x in c[:3])
-        s = spectrum_from_node(node, self.defaults) if node is not None else None
-        if abs(scale - 1.0) > 1e-12:
-            warn(f"{emitter.get('type')} emitter: its {name} is not rgb, so its x{fnum(scale)} "
-                 f"brightness conversion was dropped")
-        return s if s is not None else 'blackbody 6500'
+        if node is None:
+            warn(f"{emitter.get('type')} emitter has no {name} -> Mitsuba's default, 1")
+            return '1'
+        if node.tag in ('rgb','srgb'):
+            return "rgbillum " + " ".join(fnum(x) for x in linear_rgb(node, self.defaults))
+        if node.tag == 'float':
+            return fnum(float(sub(node.get('value'), self.defaults)))
+        if node.tag == 'blackbody' or node.get('type') == 'blackbody':
+            # 0.6: <blackbody temperature= scale=>; 3: <spectrum type="blackbody"> + <float>s
+            t = node.get('temperature') or next((c.get('value') for c in node
+                                                 if c.get('name') == 'temperature'), '6500')
+            scale = node.get('scale') or next((c.get('value') for c in node
+                                               if c.get('name') == 'scale'), '1')
+            return planck_table(float(sub(t, self.defaults)), float(sub(scale, self.defaults)))
+        s = spectrum_from_node(node, self.defaults)
+        if s is None:
+            warn(f"{emitter.get('type')} emitter: its {name} could not be read -> 1")
+            return '1'
+        return s
 
     # --- shapes / emitters --------------------------------------------------
     def resolve_shape_material(self, shape):
@@ -489,12 +554,8 @@ class Converter:
                         f"quad {{ origin {v3(o)}  u {v3(u)}  v {v3(v)}  material {mat} }}")
         elif stype == 'sphere':
             # center/radius from explicit props or from the transform of the unit sphere
-            center = None; radius = None
-            for c in shape:
-                if c.tag == 'point' and c.get('name') == 'center':
-                    center = [float(c.get('x',0)), float(c.get('y',0)), float(c.get('z',0))]
-                if c.tag == 'float' and c.get('name') == 'radius':
-                    radius = float(sub(c.get('value'), self.defaults))
+            center = get_xyz(shape, 'point', 'center', self.defaults)
+            radius = get_float(shape, 'radius', None, self.defaults)
             if center is None: center = xform_point(M, [0,0,0])
             if radius is None:
                 radius = vlen(vsub(xform_point(M, [1,0,0]), xform_point(M, [0,0,0])))
@@ -545,22 +606,21 @@ class Converter:
         line = f'mesh {{ file "{fn}"  material {mat}  translate {v3(t)}'
         if any(abs(x - 1) > 1e-6 for x in s):
             line += f"  scale {fnum(s[0])}" if max(s) - min(s) < 1e-6 * max(s) else f"  scale {v3(s)}"
-        dot = lambda a, b: a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
-        if max(abs(dot(R[0], R[1])), abs(dot(R[0], R[2])), abs(dot(R[1], R[2]))) > 1e-6:
-            warn(f"mesh '{fn}' (material {mat}): to_world shears it, which a mesh's scale/rotate/translate "
-                 f"cannot express -> placed approximately, without the shear")
-        if dot(vcross(R[0], R[1]), R[2]) < 0:
-            warn(f"mesh '{fn}' (material {mat}): to_world mirrors it, which a mesh's scale/rotate/translate "
-                 f"cannot express -> placed unmirrored")
+        if max(abs(vdot(R[0], R[1])), abs(vdot(R[0], R[2])), abs(vdot(R[1], R[2]))) > 1e-6:
+            warn(f"mesh '{fn}' (material {mat}): to_world shears it, which a mesh's "
+                 f"scale/rotate/translate cannot express -> placed approximately, without the shear")
+        if vdot(vcross(R[0], R[1]), R[2]) < 0:
+            warn(f"mesh '{fn}' (material {mat}): to_world mirrors it, which a mesh's "
+                 f"scale/rotate/translate cannot express -> placed unmirrored")
             R[0] = [-x for x in R[0]]
-        # R = Rz(g) Ry(b) Rx(a): m20 = -sin b, (m21, m22) = cos b (sin a, cos a),
-        # (m10, m00) = cos b (sin g, cos g); at cos b = 0 only a - g or a + g is defined.
-        m20 = max(-1.0, min(1.0, R[0][2]))
-        b = math.asin(-m20)
-        if abs(m20) < 1 - 1e-12:
-            a = math.atan2(R[1][2], R[2][2]); g = math.atan2(R[0][1], R[0][0])
-        else:
-            a = 0.0; g = math.atan2(-R[1][0], R[1][1])
+        # R = Rz(g) Ry(b) Rx(a): m20 = -sin b, (m21, m22) = cos b (sin a, cos a). Near cos b = 0
+        # only a combination of a and g is defined, and entries of size cos b are mostly the
+        # matrix's own rounding; so b is taken from its whole column, and g, given a, from
+        # entries of size 1 -- the first column of R Rx(-a), which is (-sin g, cos g, 0).
+        b = math.atan2(-R[0][2], math.hypot(R[0][0], R[0][1]))
+        a = math.atan2(R[1][2], R[2][2]) if math.hypot(R[1][2], R[2][2]) > 1e-9 else 0.0
+        sa, ca = math.sin(a), math.cos(a)
+        g = math.atan2(sa * R[2][0] - ca * R[1][0], ca * R[1][1] - sa * R[2][1])
         rot = [math.degrees(x) for x in (a, b, g)]
         rot = [0.0 if abs(x) < 1e-9 else x for x in rot]
         if any(rot):
@@ -633,28 +693,34 @@ class Converter:
         elif etype == 'envmap':
             fn = get_string(emitter, 'filename', self.defaults) or 'env.hdr'
             scale = get_float(emitter, 'scale', 1.0, self.defaults)
+            if any(abs(x - y) > 1e-9 for x, y in zip(M, mat_identity())):
+                warn(f"envmap '{fn}': to_world dropped - an FTSL env turns only about +y, by "
+                     f"its `rotate`; set that by hand")
             self.add_light(f'light env {{ file "{fn}"  intensity {fnum(scale)} }}')
-        elif etype == 'point':
-            # Mitsuba's intensity is per steradian; a sphere light of radius r and radiance L
-            # sends L * pi r^2 per steradian, so L = intensity / (pi r^2).
-            r = 0.02
-            warn(f"point emitter -> FTSL has no point light; a sphere light of radius {r}")
-            pos = None
-            for c in emitter:
-                if c.tag == 'point' and c.get('name') == 'position':
-                    pos = [float(sub(c.get(k, '0'), self.defaults)) for k in 'xyz']
-            if pos is None: pos = xform_point(M, [0,0,0])
-            spd = self.emitter_spd(emitter, 'intensity', 1.0 / (math.pi * r * r))
-            self.add_light(f"light sphere {{ center {v3(pos)}  radius {fnum(r)}  spd {spd} }}")
+        elif etype in ('point', 'spot'):
+            # A spot whose cone is the whole sphere is an exact point light, and a spot's
+            # spd is, like Mitsuba's intensity, per steradian. Both aim along to_world's +z.
+            pos = get_xyz(emitter, 'point', 'position', self.defaults) or xform_point(M, [0,0,0])
+            spd = self.emitter_spd(emitter, 'intensity')
+            if etype == 'point':
+                inner = outer = 180.0
+                d = [0.0, -1.0, 0.0]
+            else:
+                outer = get_float(emitter, 'cutoff_angle', 20.0, self.defaults)
+                inner = get_float(emitter, 'beam_width', 0.75 * outer, self.defaults)
+                d = vnorm(xform_vec(M, [0,0,1]))
+                warn(f"spot emitter -> light spot {fnum(inner)}/{fnum(outer)} deg, whose edge "
+                     f"falls off smoothly in cosine where Mitsuba's falls linearly in angle")
+            self.add_light(f"light spot {{ origin {v3(pos)}  dir {v3(d)}  inner_angle "
+                           f"{fnum(inner)}  outer_angle {fnum(outer)}  spd {spd} }}")
         elif etype == 'directional':
             # Mitsuba's direction is the one light travels, and its irradiance falls on a
             # surface facing it, as a sun's `spd` does; a sun's `dir` points back at the sun.
-            d = None
-            for c in emitter:
-                if c.tag == 'vector' and c.get('name') == 'direction':
-                    d = [float(sub(c.get(k, '0'), self.defaults)) for k in 'xyz']
-            if d is None: d = xform_vec(M, [0,0,1])
-            d = vnorm(d)
+            d = vnorm(get_xyz(emitter, 'vector', 'direction', self.defaults)
+                      or xform_vec(M, [0,0,1]))
+            if vlen(d) == 0:
+                warn("directional emitter with a zero direction -> straight down")
+                d = [0.0, -1.0, 0.0]
             spd = self.emitter_spd(emitter, 'irradiance')
             warn("directional emitter -> light sun 0.53 deg across (FTSL's sun needs a size; "
                  "Mitsuba's has none, so its shadows were hard)")
@@ -705,10 +771,22 @@ class Converter:
                 self.handle_scene_emitter(c)
         if self.thinlens and any(self.materials[m].startswith(('type dielectric', 'type mirror',
                                                                'type halfmirror'))
-                                 for m in self.mat_order):
+                                 for m in self.used_materials()):
             warn("thinlens sensor -> mode A, whose depth of field only the forward modes "
                  "render, and which shows glass and mirrors seen directly as black; pass "
                  "`-mode R` to see them, in focus everywhere")
+
+    def used_materials(self):
+        """The materials some geometry is bound to, and the layers of any mix among them."""
+        todo = {m for g in self.geometry for m in re.findall(r'\bmaterial (\S+)', g)}
+        used = set()
+        while todo:
+            m = todo.pop()
+            if m in used or m not in self.materials:
+                continue
+            used.add(m)
+            todo |= set(re.findall(r'layer "([^"]+)"', self.materials[m]))
+        return used
 
     def emit(self):
         out = []
@@ -745,6 +823,8 @@ def v3(a):
 def main():
     if len(sys.argv) < 2:
         print(__doc__); sys.exit(1)
+    # Warnings quote the scene's own names; a Windows console's code page cannot hold them all.
+    sys.stderr.reconfigure(errors='replace')
     inp = sys.argv[1]
     outp = sys.argv[2] if len(sys.argv) > 2 else os.path.splitext(inp)[0] + '.ftsl'
     tree = ET.parse(inp)
@@ -764,7 +844,7 @@ def main():
         sys.stderr.write(f"[mitsuba_to_ftsl] {len(uniqw)} warning(s):\n")
         for w in uniqw:
             sys.stderr.write(f"  - {w}\n")
-    with open(outp, 'w') as f:
+    with open(outp, 'w', encoding='utf-8', newline='') as f:   # ftrace reads UTF-8
         f.write(text)
     sys.stderr.write(f"[mitsuba_to_ftsl] wrote {outp}  "
                      f"({len(conv.mat_order)} materials, {len(conv.geometry)} geo/light, "

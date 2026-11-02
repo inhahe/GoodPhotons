@@ -30591,8 +30591,9 @@ estimator, so it would return exactly the noise mode W exists to remove.
   - **Landed 2026-11-02** (review follow-ups, c692cab..): every named `int_ior`;
     0.6 property names; rough transmission; `thindielectric`; `.ply`; mesh and cube
     area emitters; mesh rotation as Euler `rotate`; `directional` → `light sun`;
-    emitter brightness kept relative (`rgbillum`); roughness matched by lobe width;
-    perspective cameras in mode R.
+    emitter brightness kept relative (`rgbillum`, blackbodies per nm); roughness matched
+    by lobe width; perspective cameras in mode R; `point` and `spot` as `light spot`;
+    `value=` vectors; 0.6 `srgb`; UTF-8 output.
   - **Known approximations (flagged with `# WARN:` in output):** plastic/roughplastic
     → glossy (diffuse+specular coat merged); roughdielectric → dielectric `roughness`,
     a glossy lobe about the reflected and refracted rays rather than a microfacet BTDF;
@@ -30601,15 +30602,19 @@ estimator, so it would return exactly the noise mode W exists to remove.
     `.serialized` meshes skipped; a mesh `to_world` that shears or mirrors placed
     approximately; `ext_ior` dropped (FTSL takes the outside index from the enclosing
     dielectric); a dielectric's `specular_*` tint, a conductor's `eta`/`k`, and conductor
-    materials with no `metal:` file dropped; `directional` → a 0.53° sun; `point` → a
-    2 cm sphere light, whose brightness scales only from an rgb intensity; an emitter on
-    a `blendbsdf` mesh → a black diffuse emitter; a `thinlens` camera stays mode A, which
+    materials with no `metal:` file dropped; `directional` → a 0.53° sun; `spot`'s edge
+    falls off smoothly in cosine rather than linearly in angle; an `envmap`'s `to_world`
+    dropped (an FTSL env turns only about +y); a rough dielectric's lobe matched to its
+    transmission, so its reflection is narrower than Mitsuba's; an emitter on a
+    `blendbsdf` mesh → a black diffuse emitter; a `thinlens` camera stays mode A, which
     shows glass and mirrors seen directly as black.
   - **Possible follow-ups:** bump/normal maps → FTSL `normal_map`; a dielectric's
     `specular_transmittance` → an `absorb` approximation; conductor `eta`/`k` → a
     reflectance by the Fresnel equations, and `metal:` files for more of Mitsuba's ~40
     conductor presets; reading `.serialized`; emission on a `blendbsdf` mesh keeping its
-    blend (once `emit` on a `mix` is verified to show on a direct hit).
+    blend (once `emit` on a `mix` is verified to show on a direct hit); an `envmap`
+    `to_world` that is a turn about +y carried as the env's `rotate` (once Mitsuba's and
+    FTSL's lat-long origins are compared).
 - **POV-Ray: DECLINED (2026-07-11), rationale logged.** The SDL is genuinely nice
   (programmable, exact CSG, implicit `isosurface`), but a poor fit here: (1) faithful
   parsing = writing a Turing-complete interpreter (macros/loops/functions), far more

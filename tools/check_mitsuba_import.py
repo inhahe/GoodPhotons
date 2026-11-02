@@ -19,31 +19,40 @@ Writes small Mitsuba scenes, converts each, and checks:
   - `intIOR` (named or numeric) is read as `int_ior`, and `toWorld` places the sensor;
   - a diffuse BSDF's `diffuseReflectance` is read as its reflectance;
   - a conductor with no `material` is copper, 0.6's default (3's is a perfect mirror);
+  - an `alphaV` given alone is anisotropic against Mitsuba's default 0.1, and flagged;
+  - an `<srgb>` colour, and a '#rrggbb' one, is decoded to linear;
   - a `<default>` parameter keeps its camelCase name, so `$fovDeg` still substitutes.
 
   BSDFs:
-  - a microfacet alpha becomes the `roughness` of matching lobe width: 2 alpha for Beckmann,
-    1.55 alpha for GGX, capped at 1; an anisotropic alpha_u/alpha_v is averaged and flagged;
+  - a microfacet alpha becomes the `roughness` of matching lobe width, worked out here from
+    the distributions' half-widths: a reflection's lobe for a conductor or plastic, the
+    transmitted lobe (mean of entering and leaving) for a rough dielectric; capped at 1;
+    an anisotropic alpha_u/alpha_v is averaged and a textured alpha read as 0.1, both flagged;
   - thindielectric becomes a `halfmirror` reflecting a sheet's 2R/(1+R) at normal incidence;
   - a dielectric's specular_transmittance, a conductor's eta/k, and a conductor material FTSL
     has no `metal:` for are each flagged; a known one (Au) is not.
 
-  Lights:
-  - an rgb emitter becomes `rgbillum` at its own magnitude, so lights keep their ratios;
-  - a point emitter becomes a sphere light whose radiance is intensity / (pi r^2);
+  Lights, each at Mitsuba's own magnitude so they keep their ratios:
+  - an rgb emitter becomes `rgbillum`; a `<float>` radiance passes through; a blackbody, in
+    0.6's form and in 3's, becomes its Planck curve per nanometre; no radiance becomes 1,
+    flagged;
+  - a point emitter becomes an all-round `light spot` of the same intensity, and a spot
+    emitter a `light spot` of its cutoff and beam width, aimed along its to_world;
   - a directional emitter becomes a `light sun` whose `dir` points back up its direction;
+  - a point or vector given as `value="x, y, z"` reads the same as one given by x/y/z;
   - a cube area emitter becomes six `light area` faces, each facing out of the cube;
   - a .ply mesh area emitter is loaded as a mesh under an emissive copy of its material,
     one copy shared by meshes that glow alike, and lights a scene alone, without the
     converter's fallback light;
-  - a .serialized mesh is skipped with a `# WARN:` rather than written for ftrace to fail on.
+  - a .serialized mesh is skipped with a `# WARN:` rather than written for ftrace to fail on;
+  - an envmap's to_world, which FTSL cannot carry, is flagged.
 
   Mesh placement: a `to_world` of scale, rotations and translation places the mesh's points
-  where Mitsuba does, through FTSL's scale / Euler `rotate` / translate; a shear and a mirror
-  are each flagged.
+  where Mitsuba does, through FTSL's scale / Euler `rotate` / translate, including at gimbal
+  lock and beside it in a 4x4 rounded to 7 decimals; a shear and a mirror are each flagged.
 
   Cameras: a perspective sensor becomes a `mode R` camera; a thinlens one becomes mode A and,
-  beside glass, is flagged.
+  beside glass some shape uses, is flagged (glass merely defined is not).
 
   Every scene: `ftrace -parseonly`, run from the repo root so it reads the same data/ the
   check does, loads the result with no unknown key and no unknown glass.
@@ -91,6 +100,39 @@ PLACEMENTS = [
     ('sheared', [('rotate', (0, 0, 1, 45)), ('scale', (2, 1, 1))], 'shears'),
     ('mirrored', [('scale', (-1, 1, 1))], 'mirrors'),
 ]
+
+
+def nearlock_matrix():
+    """Ry(89.9999 deg) after Rx(30 deg), then up 2, as an exporter writes the 4x4 (row-major,
+    7 decimals): next to gimbal lock, where the entries of size cos(89.9999 deg) = 1.7e-6
+    are mostly that rounding."""
+    b, a = math.radians(89.9999), math.radians(30)
+    ry = [[math.cos(b), 0, math.sin(b)], [0, 1, 0], [-math.sin(b), 0, math.cos(b)]]
+    rx = [[1, 0, 0], [0, math.cos(a), -math.sin(a)], [0, math.sin(a), math.cos(a)]]
+    m = [[sum(ry[i][k] * rx[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+    return [round(v, 7) for v in m[0] + [0] + m[1] + [2] + m[2] + [0] + [0, 0, 0, 1]]
+
+
+PLACEMENTS.append(('nearlock', [('matrix', nearlock_matrix())], None))
+
+
+def srgb_decode(x):
+    return x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
+
+
+def planck_nm(nm, t):
+    """Blackbody radiance at `nm` nanometres and `t` kelvin, in W / (m^2 sr nm)."""
+    h, c, k = 6.62607015e-34, 2.99792458e8, 1.380649e-23
+    lam = nm * 1e-9
+    return 2 * h * c * c / lam ** 5 / (math.exp(h * c / (lam * k * t)) - 1) * 1e-9
+
+
+def roughness_for(alpha, spread, ggx=False):
+    """The FTSL roughness whose Phong lobe is as wide as a microfacet lobe of `alpha` whose
+    outgoing ray turns `spread` times as fast as its half-vector."""
+    phong = math.sqrt(math.log(2))
+    hw = math.sqrt(math.sqrt(2) - 1) if ggx else math.sqrt(math.log(2))
+    return min(1.0, spread * hw / phong * alpha)
 
 
 def glass_files():
@@ -170,6 +212,8 @@ def mitsuba_place(ops, p):
             kx = [k[1] * x[2] - k[2] * x[1], k[2] * x[0] - k[0] * x[2], k[0] * x[1] - k[1] * x[0]]
             kd = sum(k[i] * x[i] for i in range(3))
             x = [x[i] * c + kx[i] * s + k[i] * kd * (1 - c) for i in range(3)]
+        elif op == 'matrix':   # 4x4, row-major
+            x = [sum(a[r * 4 + j] * x[j] for j in range(3)) + a[r * 4 + 3] for r in range(3)]
     return x
 
 
@@ -198,6 +242,8 @@ def xml_ops(ops):
     for op, a in ops:
         if op == 'rotate':
             out.append(f'<rotate x="{a[0]}" y="{a[1]}" z="{a[2]}" angle="{a[3]}"/>')
+        elif op == 'matrix':
+            out.append(f'<matrix value="{" ".join(repr(v) for v in a)}"/>')
         else:
             out.append(f'<{op} x="{a[0]}" y="{a[1]}" z="{a[2]}"/>')
     return ''.join(out)
@@ -235,7 +281,11 @@ def scene_v06():
             + sphere(0, '<bsdf type="dielectric" id="v06_named"><string name="intIOR" value="water"/></bsdf>') + '\n'
             + sphere(1, '<bsdf type="dielectric" id="v06_numeric"><float name="intIOR" value="2.4"/></bsdf>') + '\n'
             + sphere(2, '<bsdf type="diffuse" id="v06_diffuse"><rgb name="diffuseReflectance" value="0.2, 0.4, 0.6"/></bsdf>') + '\n'
-            + sphere(3, '<bsdf type="conductor" id="v06_conductor"/>')
+            + sphere(3, '<bsdf type="conductor" id="v06_conductor"/>') + '\n'
+            + sphere(4, '<bsdf type="roughconductor" id="v06_alphav"><string name="material" value="Au"/>'
+                        '<float name="alphaV" value="0.4"/></bsdf>') + '\n'
+            + sphere(5, '<bsdf type="diffuse" id="v06_srgb"><srgb name="reflectance" value="0.5, 0.5, 0.5"/></bsdf>') + '\n'
+            + sphere(6, '<bsdf type="diffuse" id="v06_hex"><srgb name="reflectance" value="#ffcc88"/></bsdf>')
             + '\n</scene>\n')
 
 
@@ -253,15 +303,25 @@ def scene_bsdfs(ply):
         sphere(7, '<bsdf type="conductor" id="gold"><string name="material" value="Au"/></bsdf>'),
         sphere(8, '<bsdf type="conductor" id="etak"><rgb name="eta" value="0.2, 0.9, 1.1"/>'
                   '<rgb name="k" value="3.9, 2.4, 2.2"/></bsdf>'),
+        sphere(9, '<bsdf type="roughconductor" id="texalpha"><string name="material" value="Au"/>'
+                  '<texture name="alpha" type="bitmap"><string name="filename" value="r.png"/></texture></bsdf>'),
         '  <shape type="cube"><transform name="to_world"><scale value="0.5"/><translate x="5" y="2" z="1"/></transform>'
         '<emitter type="area"><rgb name="radiance" value="50, 25, 10"/></emitter></shape>',
         f'  <shape type="ply"><string name="filename" value="{ply}"/>'
         '<emitter type="area"><rgb name="radiance" value="1, 0.5, 0.2"/></emitter></shape>',
         '  <shape type="serialized"><string name="filename" value="missing.serialized"/></shape>',
-        '  <emitter type="point"><point name="position" x="1" y="3" z="1"/><rgb name="intensity" value="1, 2, 3"/></emitter>',
-        '  <emitter type="directional"><vector name="direction" x="0" y="-1" z="0"/>'
+        '  <emitter type="point"><point name="position" value="1, 3, 1"/><spectrum name="intensity" value="100"/></emitter>',
+        '  <emitter type="directional"><vector name="direction" value="0, -1, 0"/>'
         '<rgb name="irradiance" value="2, 2, 2"/></emitter>',
+        '  <emitter type="spot"><transform name="to_world"><lookat origin="0, 4, 0" target="0, 0, 0" up="0, 0, 1"/>'
+        '</transform><float name="cutoff_angle" value="30"/><rgb name="intensity" value="5, 5, 5"/></emitter>',
     ]
+    for x, emitter in ((10, '<float name="radiance" value="5"/>'),
+                       (12, '<blackbody name="radiance" temperature="3000" scale="2"/>'),
+                       (14, '<spectrum type="blackbody" name="radiance"><float name="temperature" value="3000"/></spectrum>'),
+                       (16, '')):
+        parts.append(f'  <shape type="rectangle"><transform name="to_world"><translate x="{x}" y="0" z="0"/>'
+                     f'</transform><emitter type="area">{emitter}</emitter></shape>')
     return '<scene version="3.0.0">\n' + SENSOR + ENV + '\n'.join(parts) + '\n</scene>\n'
 
 
@@ -279,14 +339,23 @@ def scene_meshes(ply):
     return '<scene version="3.0.0">\n' + SENSOR + '\n'.join(parts) + '\n</scene>\n'
 
 
-def scene_thinlens():
+def scene_thinlens(used=True):
+    """A thinlens camera beside glass: in view when `used`, else only defined, unbound."""
+    glass = (sphere(0, '<bsdf type="dielectric" id="glass"/>') if used else
+             '  <bsdf type="dielectric" id="glass"/>\n' + sphere(0, '<bsdf type="diffuse" id="matte"/>'))
     return ('<scene version="3.0.0">\n'
             '  <sensor type="thinlens"><float name="fov" value="40"/><float name="aperture_radius" value="0.05"/>'
             '<float name="focus_distance" value="3"/>\n'
             '    <transform name="to_world"><lookat origin="0, 1, 6" target="0, 0, 0" up="0, 1, 0"/></transform>\n'
             '    <film type="hdrfilm"><integer name="width" value="64"/><integer name="height" value="64"/></film>\n'
             '  </sensor>\n' + ENV
-            + sphere(0, '<bsdf type="dielectric" id="glass"/>') + '\n</scene>\n')
+            + glass + '\n</scene>\n')
+
+
+def scene_envmap():
+    return ('<scene version="3.0.0">\n' + SENSOR
+            + '  <emitter type="envmap"><string name="filename" value="sky.exr"/>'
+            '<transform name="to_world"><rotate y="1" angle="90"/></transform></emitter>\n</scene>\n')
 
 
 # --- checking ------------------------------------------------------------------------------
@@ -294,9 +363,10 @@ def warned(out, text):
     return any(line.startswith('# WARN:') and text in line for line in out.splitlines())
 
 
-def convert(a, name, xml_text, fails, mode='R'):
-    """Write `xml_text`, convert it, check it loads and its camera is in `mode`; return
-    (FTSL text, ftrace's -parseonly log), or (None, '') when the converter fails."""
+def convert(a, name, xml_text, fails, mode='R', load=True):
+    """Write `xml_text`, convert it, check its camera is in `mode` and, if `load`, that ftrace
+    loads it; return (FTSL text, ftrace's -parseonly log), or (None, '') when the converter
+    fails. (`load` is off for a scene that names an image which does not exist.)"""
     xml = os.path.join(a.out, name + '.xml')
     ftsl = os.path.join(a.out, name + '.ftsl')
     with open(xml, 'w', encoding='utf-8', newline='') as f:
@@ -308,14 +378,16 @@ def convert(a, name, xml_text, fails, mode='R'):
         return None, ''
     with open(ftsl, encoding='utf-8') as f:
         out = f.read()
-    r = subprocess.run([a.exe, ftsl, '-parseonly'], capture_output=True, text=True,
-                       encoding='utf-8', errors='replace', cwd=ROOT)
-    log = r.stdout + r.stderr
-    if r.returncode != 0:
-        fails.append(f"{name}: ftrace -parseonly exited {r.returncode}: {log.strip()}")
-    for line in log.splitlines():
-        if 'unknown key' in line or 'unknown glass' in line:
-            fails.append(f"{name}: ftrace: {line.strip()}")
+    log = ''
+    if load:
+        r = subprocess.run([a.exe, ftsl, '-parseonly'], capture_output=True, text=True,
+                           encoding='utf-8', errors='replace', cwd=ROOT)
+        log = r.stdout + r.stderr
+        if r.returncode != 0:
+            fails.append(f"{name}: ftrace -parseonly exited {r.returncode}: {log.strip()}")
+        for line in log.splitlines():
+            if 'unknown key' in line or 'unknown glass' in line:
+                fails.append(f"{name}: ftrace: {line.strip()}")
     if not re.search(rf'^\s*(aperture .*  )?mode {mode}\s*$', out, re.M):
         fails.append(f"{name}: the sensor did not become a mode {mode} camera")
     return out, log
@@ -412,13 +484,19 @@ def main():
     out, _ = convert(a, 'v06', scene_v06(), fails)
     if out is not None:
         mats = materials(out)
+        g6 = lambda xs: ' '.join(f"{x:.6g}" for x in xs)
         expect_all('0.6 scene', [
             (mats.get(b) == w, f"0.6: {b} came out as {mats.get(b)!r}, not {w!r}")
             for b, w in (('v06_named', 'dielectric  ior glass:water'),
                          ('v06_numeric', 'dielectric  ior 2.4'),
                          ('v06_diffuse', 'diffuse  reflect rgb 0.2 0.4 0.6'),
-                         ('v06_conductor', 'mirror  reflect metal:Cu'))
+                         ('v06_conductor', 'mirror  reflect metal:Cu'),
+                         ('v06_alphav', f"glossy  reflect metal:Au  roughness {roughness_for(0.25, 2):.6g}"),
+                         ('v06_srgb', 'diffuse  reflect rgb ' + g6([srgb_decode(0.5)] * 3)),
+                         ('v06_hex', 'diffuse  reflect rgb ' + g6(srgb_decode(v / 255) for v in (0xff, 0xcc, 0x88))))
         ] + [
+            (warned(out, "'v06_alphav': anisotropic alpha_u 0.1 / alpha_v 0.4"),
+             "0.6: alphaV alone left no # WARN that it is anisotropic"),
             (bool(re.search(r'^\s*eye 3 1 6\s', out, re.M)), "0.6: toWorld did not place the sensor at (3, 1, 6)"),
             (bool(re.search(r'^\s*fov_y 40\s*$', out, re.M)), "0.6: $fovDeg did not substitute into the sensor's fov"),
         ], fails)
@@ -429,17 +507,24 @@ def main():
         eta = MITSUBA_IOR['bk7'] / MITSUBA_IOR['air']
         r0 = ((eta - 1) / (eta + 1)) ** 2
         want_thin = 2 * r0 / (1 + r0)
-        rough = lambda bid: (lambda m: float(m.group(1)) if m else None)(
-            re.search(r'roughness (\S+)$', mats.get(bid, '')))
+        through = (abs(1 - 1 / eta) + abs(eta - 1)) / 2   # mean transmitted spread, in and out
+
+        def rough(bid):
+            m = re.search(r'roughness (\S+)$', mats.get(bid, ''))
+            return float(m.group(1)) if m else None
         thin = re.fullmatch(r'halfmirror\s+reflect (\S+)', mats.get('thin', ''))
+        want_r, want_g = roughness_for(0.3, through), roughness_for(0.3, through, ggx=True)
         expect_all('bsdfs', [
-            (mats.get('rough', '').startswith('dielectric  ior glass:BK7') and close(rough('rough'), 0.6)
-             and warned(out, "'rough': alpha 0.3 -> roughness 0.6"),
-             f"roughdielectric Beckmann alpha 0.3 came out as {mats.get('rough')!r}, not roughness 0.6"),
-            (close(rough('rough_ggx'), 0.465), f"GGX alpha 0.3 came out as {mats.get('rough_ggx')!r}, not roughness 0.465"),
-            (close(rough('aniso'), 0.3) and warned(out, "'aniso': anisotropic alpha_u 0.2 / alpha_v 0.1"),
+            (mats.get('rough', '').startswith('dielectric  ior glass:BK7') and close(rough('rough'), want_r)
+             and warned(out, "'rough': alpha 0.3 -> roughness"),
+             f"roughdielectric Beckmann alpha 0.3 came out as {mats.get('rough')!r}, not roughness {want_r:.6g}"),
+            (close(rough('rough_ggx'), want_g),
+             f"GGX alpha 0.3 came out as {mats.get('rough_ggx')!r}, not roughness {want_g:.6g}"),
+            (close(rough('aniso'), roughness_for(0.15, 2)) and warned(out, "'aniso': anisotropic alpha_u 0.2 / alpha_v 0.1"),
              f"alpha_u 0.2 / alpha_v 0.1 came out as {mats.get('aniso')!r} or left no # WARN"),
             (close(rough('capped'), 1.0), f"alpha 0.7 came out as {mats.get('capped')!r}, not capped at 1"),
+            (close(rough('texalpha'), roughness_for(0.1, 2)) and warned(out, "'texalpha': a textured alpha"),
+             f"a textured alpha came out as {mats.get('texalpha')!r} or left no # WARN"),
             (bool(thin) and close(float(thin.group(1)), want_thin),
              f"thindielectric came out as {mats.get('thin')!r}, not halfmirror reflect {want_thin:.6f}"),
             (warned(out, "'tinted': specular_transmittance dropped"), "dielectric specular_transmittance left no # WARN"),
@@ -450,21 +535,36 @@ def main():
             (warned(out, "'etak': eta/k dropped"), "conductor eta/k left no # WARN"),
         ], fails)
 
-        cube_spd = set(re.findall(r'^light area \{ origin 4\.5 .*spd (.*) \}$', out, re.M)) | \
-            set(re.findall(r'^light area \{ origin 5\.5 .*spd (.*) \}$', out, re.M))
-        pt = re.search(r'^light sphere \{ center 1 3 1  radius (\S+)  spd rgbillum (\S+ \S+ \S+) \}$', out, re.M)
-        k = 1 / (math.pi * float(pt.group(1)) ** 2) if pt else None
+        cube_spd = set(re.findall(r'^light area \{ origin (?:4\.5|5\.5) .*spd (.*) \}$', out, re.M))
         sun = re.search(r'^light sun \{ dir (\S+ \S+ \S+)  spd (.*) \}$', out, re.M)
         emit = re.search(r'^mesh \{ file "' + re.escape(ply) + r'"  material (\S+)\b', out, re.M)
+
+        def area_spd(x0):   # the rectangle emitter translated to x0 has its origin at x0 - 1
+            m = re.search(rf'^light area \{{ origin {x0 - 1} -1 0 .*  spd (.*) \}}$', out, re.M)
+            return m.group(1) if m else None
+
+        def at550(spd):
+            m = re.search(r'\b550:(\S+)', spd or '')
+            return float(m.group(1)) if m else None
         expect_all('lights', [
             (cube_spd == {'rgbillum 50 25 10'}, f"cube emitter radiance 50 25 10 came out as {cube_spd}"),
             (mats.get('_default_emit') == 'diffuse  reflect 0.7  emit rgbillum 1 0.5 0.2'
              and emit is not None and emit.group(1) == '_default_emit',
              f"ply emitter: material {mats.get('_default_emit')!r}, or no mesh line bound to it"),
-            (pt is not None and all(close(x, w * k, 1e-4) for x, w in zip(floats(pt.group(2)), (1, 2, 3))),
-             f"point intensity 1 2 3 came out as {pt.group(0) if pt else None!r}, not radiance intensity/(pi r^2)"),
+            ('light spot { origin 1 3 1  dir 0 -1 0  inner_angle 180  outer_angle 180  spd 100 }' in out,
+             "a point light (position by value=, intensity 100) did not become an all-round spot of spd 100"),
+            ('light spot { origin 0 4 0  dir 0 -1 0  inner_angle 22.5  outer_angle 30  spd rgbillum 5 5 5 }' in out,
+             "a spot (cutoff 30, aimed down) did not become light spot 22.5/30 aimed down"),
             (sun is not None and floats(sun.group(1)) == [0, 1, 0] and sun.group(2) == 'rgbillum 2 2 2',
-             f"directional (0,-1,0), irradiance 2 came out as {sun.group(0) if sun else None!r}"),
+             f"directional value=(0,-1,0), irradiance 2 came out as {sun.group(0) if sun else None!r}"),
+            (area_spd(10) == '5', f"area radiance <float> 5 came out as {area_spd(10)!r}"),
+            (close(at550(area_spd(12)), 2 * planck_nm(550, 3000)),
+             f"0.6 blackbody 3000 K x2 came out as {at550(area_spd(12))} at 550 nm, "
+             f"not {2 * planck_nm(550, 3000):.6g} W/(m^2 sr nm)"),
+            (close(at550(area_spd(14)), planck_nm(550, 3000)),
+             f"3's <spectrum type=blackbody> 3000 K came out as {at550(area_spd(14))} at 550 nm"),
+            (area_spd(16) == '1' and warned(out, 'area emitter has no radiance'),
+             f"an area emitter with no radiance came out as {area_spd(16)!r} or left no # WARN"),
             (warned(out, "missing.serialized") and 'file "missing.serialized"' not in out,
              "a .serialized mesh was written out or left no # WARN"),
         ], fails)
@@ -497,9 +597,14 @@ def main():
         expect_all('meshes', expect, fails)
 
     out, _ = convert(a, 'thinlens', scene_thinlens(), fails, mode='A')
-    if out is not None:
-        expect_all('thinlens', [
+    unused, _ = convert(a, 'thinlens_unused', scene_thinlens(used=False), fails, mode='A')
+    env, _ = convert(a, 'envmap', scene_envmap(), fails, load=False)
+    if out is not None and unused is not None and env is not None:
+        expect_all('thinlens, envmap', [
             (warned(out, 'thinlens sensor -> mode A'), "a thinlens camera beside glass left no # WARN"),
+            (not warned(unused, 'thinlens sensor -> mode A'),
+             "a thinlens camera was warned about glass that no shape uses"),
+            (warned(env, "envmap 'sky.exr': to_world dropped"), "a rotated envmap left no # WARN"),
         ], fails)
 
     for f_ in fails:

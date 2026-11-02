@@ -5947,17 +5947,24 @@ almost 1:1: the `perspective`/`thinlens` sensor → an FTSL `camera`;
 `diffuse`/`conductor`/`roughconductor`/`dielectric`/`roughdielectric`/`plastic` BSDFs →
 `diffuse`/`mirror`/`glossy`/`dielectric` materials, and a `thindielectric` → a
 `halfmirror` reflecting the sheet's normal-incidence reflectance. A microfacet `alpha`
-becomes the `roughness` whose lobe is as wide: 2 `alpha` for Beckmann, Mitsuba's
-default, and 1.55 `alpha` for GGX, capped at 1. Emitters become FTSL lights: an RGB
-value becomes `rgbillum` at its own magnitude, so lights keep their brightness relative
-to one another; `point` becomes a 2 cm sphere light of radiance intensity / (π r²), and
-`directional` a `light sun` 0.53° across. `rectangle`, `cube`, `sphere`, `obj` and `ply`
-shapes are supported with their `to_world` transforms: a mesh's scale, rotation and
-translation become its `scale`, Euler `rotate` and `translate` exactly, and a shear or
-mirror is flagged. An area emitter on any shape becomes a light: on a mesh, an emissive
-copy of its material, so it lights the scene as a mesh light. RGB reflectances ride
-FTSL's Jakob–Hanika upsampling and measured/blackbody spectra pass through losslessly.
-A dielectric's `int_ior` may be a number or any of
+becomes the `roughness` whose lobe is as wide: 2 `alpha` for a Beckmann reflection
+(Mitsuba's default distribution; 0.77 of that for GGX), capped at 1. A rough
+dielectric is matched to its transmitted lobe, which carries most of its light and is
+far narrower (0.42 `alpha` at n 1.5), so its reflection comes out the sharper.
+
+Emitters become FTSL lights at Mitsuba's own magnitude, so lights keep their brightness
+relative to one another: an RGB value becomes `rgbillum`, and a blackbody its Planck
+curve tabulated per nanometre, Mitsuba's unit (FTSL's own `blackbody` is per metre).
+`point` becomes an all-round `light spot` (an exact point light), `spot` a `light spot`
+of its cutoff and beam width, and `directional` a `light sun` 0.53° across. An
+`envmap`'s `to_world` is flagged rather than carried, since an FTSL env turns only about
++y. `rectangle`, `cube`, `sphere`, `obj` and `ply` shapes are supported with their
+`to_world` transforms: a mesh's scale, rotation and translation become its `scale`,
+Euler `rotate` and `translate` exactly, and a shear or mirror is flagged. An area
+emitter on any shape becomes a light: on a mesh, an emissive copy of its material, so it
+lights the scene as a mesh light. RGB reflectances ride FTSL's Jakob–Hanika upsampling
+(a 0.6 `srgb` or `#rrggbb` colour decoded to linear first), and measured spectra pass
+through losslessly. A dielectric's `int_ior` may be a number or any of
 Mitsuba's named materials: `bk7`, `water`, `water ice`, `fused quartz`, `acrylic
 glass` and `diamond` become the matching dispersive `glass:`, and the rest (`pyrex`,
 `amber`, `pet`, `ethanol`, the gases, …) keep Mitsuba's own constant index.
