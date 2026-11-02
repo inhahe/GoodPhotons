@@ -111,6 +111,13 @@ inline double thinFilmReflectance(double n0, double n1, double n2, double k2,
 // stack product M, closed with the substrate admittance, gives r = (eta0 B - C) /
 // (eta0 B + C) and R = |r|^2, averaged over the two polarisations. `reversed` reads the layers
 // last to first, for a ray meeting the stack from its substrate side.
+//
+// The matrix above, with +i off its diagonal, belongs to the convention in which an absorbing
+// medium's index is n - ik (Macleod's), so kL and ks enter with that sign and each admittance
+// takes the root with Im(q) <= 0, the one whose field decays. With n + ik instead (Airy's
+// convention, thinFilmReflectance's) an absorbing layer amplifies: a thick chromium layer gave R
+// far above 1, clamped to 1, where it must tend to bulk chromium. A lossless stack reads the same
+// either way (every imaginary part is zero).
 inline double multilayerReflectance(double n0, double cosI, double lambda,
                                     const double* nL, const double* kL,
                                     const double* dL, int nLayers,
@@ -125,9 +132,9 @@ inline double multilayerReflectance(double n0, double cosI, double lambda,
         cd M00(1, 0), M01(0, 0), M10(0, 0), M11(1, 0);   // identity
         for (int jj = 0; jj < nLayers; ++jj) {
             const int j = reversed ? nLayers - 1 - jj : jj;
-            cd nj(nL[j], kL[j]);
+            cd nj(nL[j], -kL[j]);                  // n - ik: see the note above
             cd qj = std::sqrt(nj * nj - cd(n0s, 0.0));
-            if (qj.imag() < 0.0) qj = -qj;
+            if (qj.imag() > 0.0) qj = -qj;          // the decaying branch in that convention
             cd eta = admit(nj * nj, qj, pPol);
             cd delta = cd(2.0 * PI * dL[j] / lambda, 0.0) * qj;
             cd c = std::cos(delta), s = std::sin(delta);
@@ -136,9 +143,9 @@ inline double multilayerReflectance(double n0, double cosI, double lambda,
             cd n10 = M10 * L00 + M11 * L10, n11 = M10 * L01 + M11 * L11;
             M00 = n00; M01 = n01; M10 = n10; M11 = n11;
         }
-        cd nsub(ns, ks);
+        cd nsub(ns, -ks);
         cd qs = std::sqrt(nsub * nsub - cd(n0s, 0.0));
-        if (qs.imag() < 0.0) qs = -qs;
+        if (qs.imag() > 0.0) qs = -qs;
         cd etaS = admit(nsub * nsub, qs, pPol);
         cd eta0 = pPol ? cd(n0 * n0 / q0, 0.0) : cd(q0, 0.0);
         cd B = M00 + M01 * etaS;

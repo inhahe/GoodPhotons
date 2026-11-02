@@ -4733,7 +4733,10 @@ static int checkThinFilm() {
 // layer over a lossless substrate — this is the strong correctness anchor for
 // the N-layer material. Also checks (b) a symmetric quarter-wave dielectric
 // mirror is highly reflective at its design wavelength, and (c) energy stays in
-// [0,1] over a full angle/wavelength sweep of a multi-layer stack.
+// [0,1] over a full angle/wavelength sweep of a multi-layer stack. With absorption: (d) a single
+// lossless layer over an ABSORBING substrate reduces to the absorbing Airy form too, and (e) a
+// thick absorbing layer reflects as the bulk metal does. (c) alone cannot catch an absorbing
+// layer that amplifies, because the result is clamped to [0,1]; (d) and (e) can.
 static int checkMultilayer() {
     const double n0 = 1.0, n1 = 1.30, n2 = 1.50, d = 300.0;
 
@@ -4774,13 +4777,39 @@ static int checkMultilayer() {
         }
     bool passC = inRange;
 
-    bool pass = passA && passB && passC;
+    // (d) one lossless layer over titanium (2.5 + 3.0i) == the absorbing Airy form, swept.
+    double maxDiffD = 0.0;
+    for (double lam = 380.0; lam <= 720.0; lam += 2.0)
+        for (double ci = 0.05; ci <= 1.0; ci += 0.05) {
+            double nL[1] = { 2.30 }, kL[1] = { 0.0 }, dL[1] = { 85.0 };
+            double Rml = multilayerReflectance(1.0, ci, lam, nL, kL, dL, 1, 2.5, 3.0);
+            double Rtf = thinFilmReflectance(1.0, 2.30, 2.5, 3.0, 85.0, ci, lam);
+            maxDiffD = std::max(maxDiffD, std::fabs(Rml - Rtf));
+        }
+    bool passD = maxDiffD < 1e-9;
+
+    // (e) chromium (3.18 + 3.33i) 300 nm thick on glass: no light comes back from the glass, so
+    //     the stack reflects as bulk chromium, which an empty stack over a chromium substrate gives.
+    double maxDiffE = 0.0;
+    for (double ci = 0.05; ci <= 1.0; ci += 0.05) {
+        double nL[1] = { 3.18 }, kL[1] = { 3.33 }, dL[1] = { 300.0 };
+        double Rlayer = multilayerReflectance(1.0, ci, 550.0, nL, kL, dL, 1, 1.52, 0.0);
+        double Rbulk  = multilayerReflectance(1.0, ci, 550.0, nL, kL, dL, 0, 3.18, 3.33);
+        maxDiffE = std::max(maxDiffE, std::fabs(Rlayer - Rbulk));
+    }
+    bool passE = maxDiffE < 1e-6;
+
+    bool pass = passA && passB && passC && passD && passE;
     std::printf("[checkmultilayer] single-layer vs Airy: max|dR|=%.3e  (%s)\n",
                 maxDiff, passA ? "match" : "MISMATCH");
     std::printf("[checkmultilayer] quarter-wave Bragg stack R@%.0fnm=%.4f  (%s)\n",
                 lam0, Rdesign, passB ? "high-reflect" : "TOO LOW");
     std::printf("[checkmultilayer] Bragg-stack sweep range: [%.4f, %.4f]  (%s)\n",
                 rmin, rmax, passC ? "in [0,1]" : "OUT OF RANGE");
+    std::printf("[checkmultilayer] single layer on an absorbing substrate vs Airy: max|dR|=%.3e  (%s)\n",
+                maxDiffD, passD ? "match" : "MISMATCH");
+    std::printf("[checkmultilayer] thick absorbing layer vs the bulk metal: max|dR|=%.3e  (%s)\n",
+                maxDiffE, passE ? "match" : "MISMATCH");
     std::printf("[checkmultilayer] %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

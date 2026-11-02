@@ -98,6 +98,19 @@ merges do. **Or retire mode U:** REFERENCE.md already says mode U is to be retir
 `-jsurf` has been on by default on both backends since 0.263.1; mode J already reads its merges
 at the right wavelength.
 
+## DONE (2026-11-02, 0.403.0): MULTILAYER-ABSORB-SIGN — a multilayer stack with anything absorbing in it computed the wrong reflectance
+
+`multilayerReflectance` (host and device) paired its characteristic matrix, which wants an
+absorbing index written n - ik, with indices written n + ik. Lossless stacks were exact, and
+`-checkmultilayer` tested only those. An absorbing layer amplified instead of absorbing (R clamped
+to 1: a chromium-flake colour-shift paint could not be built at all), and a lossless stack over an
+absorbing substrate had that substrate's reflection phase conjugated, so its colour was wrong:
+the `beetle` preset reflected 0.04 / 0.78 / 0.76 at 450 / 550 / 650 nm where 0.07 / 0.68 / 0.83
+is right. Found building the `chameleon` preset, whose Cr / MgF2 / Al flake reflected ~100 % at
+every wavelength. Fixed by writing the index n - ik and taking the decaying root on both
+backends; `-checkmultilayer` gained the two cases that catch it (design.md, "The Abelès matrix's
+sign convention"). Anything rendered with an absorbing stack before 0.403.0 changes colour.
+
 ## OPEN (2026-11-02, 0.401.0): FWD-GLOSSY-INDIRECT — modes A and B splat a rough reflector only where it is seen directly
 
 Since 0.401.0 a rough glossy photon vertex splats to the camera through its lobe (render.h

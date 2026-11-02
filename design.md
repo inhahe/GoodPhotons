@@ -9921,6 +9921,21 @@ The device material holds at most `D_MAXLAYERS` (16) layers. `cudaForwardSupport
 device gate (backward, BDPT, VCM, photon map, SPPM) goes through `cudaForwardSupported`, so a
 deeper stack falls back to the CPU in every mode, as a specular one always did.
 
+## The Abelès matrix's sign convention (0.403.0)
+
+`multilayerReflectance` (interference.h, and its device twin) builds each layer's characteristic
+matrix with +i off the diagonal, which is the convention in which an absorbing index is n - ik
+(Macleod's). It was fed n + ik, Airy's convention, the one `thinFilmReflectance` uses with its
+`e^{+i phi}` round trip. A lossless stack cannot tell the two apart, which is why every check
+passed; an absorbing layer under the wrong one amplifies (a 300 nm chromium layer on glass gave
+R ~ 1.8, clamped to 1, against bulk chromium's 0.555), and a lossless stack over an absorbing
+substrate meets that substrate's reflection with its phase conjugated (85 nm of n 2.30 on
+titanium: 0.07 at 550 nm against the Airy film's 0.54). Since 0.403.0 both backends write the
+index n - ik and take the Im(q) <= 0 root (`csqrtLow_` on the device). `-checkmultilayer` now
+holds a film over an absorbing substrate to the Airy form and a thick absorbing layer to the bulk
+metal; its old range test could not see the bug, the result being clamped. The `beetle` and
+`morpho` presets, both on absorbing backings, changed colour; `nacre` (lossless) did not.
+
 ## A dispersive film index, and titania (0.402.0)
 
 `Material::filmIor` is a `Spectrum` (it was a `double`), and `DMaterial::filmIor` a `DSpec`, so a

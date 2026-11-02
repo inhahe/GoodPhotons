@@ -3334,6 +3334,15 @@ __device__ static inline DCplx csqrt_(DCplx z) {  // principal root, then force 
     DCplx s(re, im);
     return s.im < 0 ? DCplx(-s.re, -s.im) : s;
 }
+// The principal root, then the one with Im <= 0: the decaying branch when an absorbing index
+// is written n - ik (multilayerReflectance's convention; host twin in interference.h).
+__device__ static inline DCplx csqrtLow_(DCplx z) {
+    Real r = sqrt(z.re * z.re + z.im * z.im);
+    Real re = sqrt(fmax((Real)0, (Real)0.5 * (r + z.re)));
+    Real im = sqrt(fmax((Real)0, (Real)0.5 * (r - z.re)));
+    if (z.im < 0) im = -im;
+    return im > 0 ? DCplx(-re, -im) : DCplx(re, im);
+}
 __device__ static inline DCplx crmul(Real a, DCplx b) { return DCplx(a * b.re, a * b.im); }
 __device__ static inline DCplx cimul(DCplx a) { return DCplx(-a.im, a.re); }  // i*a
 __device__ static inline DCplx ccos_(DCplx z) {  // cos(a+bi) = cos a cosh b - i sin a sinh b
@@ -3346,7 +3355,8 @@ __device__ static inline DCplx csin_(DCplx z) {  // sin(a+bi) = sin a cosh b + i
 // Multilayer stack reflectance (Abeles characteristic matrix; port of render.h
 // multilayerReflectance). nL/kL/dL are the per-layer index/extinction/thickness,
 // nLayers entries; substrate ns + i*ks. Returns R in [0,1]. `reversed` reads the layers last to
-// first, for a ray meeting the stack from its substrate side.
+// first, for a ray meeting the stack from its substrate side. The matrix's convention writes an
+// absorbing index n - ik, with the Im(q) <= 0 root (csqrtLow_): see the host twin's note.
 __device__ static Real multilayerReflectance(Real n0, Real cosI, Real lambda,
                                              const double* nL, const double* kL,
                                              const double* dL, int nLayers,
@@ -3361,8 +3371,8 @@ __device__ static Real multilayerReflectance(Real n0, Real cosI, Real lambda,
         DCplx M00(1, 0), M01(0, 0), M10(0, 0), M11(1, 0);
         for (int jj = 0; jj < nLayers; ++jj) {
             const int j = reversed ? nLayers - 1 - jj : jj;
-            DCplx nj((Real)nL[j], (Real)kL[j]);
-            DCplx qj = csqrt_(csub(cmul(nj, nj), DCplx(n0s, 0)));
+            DCplx nj((Real)nL[j], -(Real)kL[j]);
+            DCplx qj = csqrtLow_(csub(cmul(nj, nj), DCplx(n0s, 0)));
             DCplx eta = pPol ? cdiv(cmul(nj, nj), qj) : qj;
             DCplx delta = crmul((Real)(2.0 * DPI * dL[j] / (double)lambda), qj);
             DCplx c = ccos_(delta), s = csin_(delta);
@@ -3373,8 +3383,8 @@ __device__ static Real multilayerReflectance(Real n0, Real cosI, Real lambda,
             DCplx n11 = cadd(cmul(M10, L01), cmul(M11, L11));
             M00 = n00; M01 = n01; M10 = n10; M11 = n11;
         }
-        DCplx nsub(ns, ks);
-        DCplx qs = csqrt_(csub(cmul(nsub, nsub), DCplx(n0s, 0)));
+        DCplx nsub(ns, -ks);
+        DCplx qs = csqrtLow_(csub(cmul(nsub, nsub), DCplx(n0s, 0)));
         DCplx etaS = pPol ? cdiv(cmul(nsub, nsub), qs) : qs;
         DCplx eta0 = pPol ? DCplx(n0 * n0 / q0, 0) : DCplx(q0, 0);
         DCplx B = cadd(M00, cmul(M01, etaS));
