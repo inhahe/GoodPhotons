@@ -30582,23 +30582,34 @@ estimator, so it would return exactly the noise mode W exists to remove.
   0.6/2/3 is also a spectral PBR renderer, so the mapping is nearly 1:1
   (perspective/thinlens sensor → camera, diffuse/conductor/roughconductor/
   dielectric/plastic/blendbsdf → materials, area/constant/envmap/point/directional
-  emitters → lights, rectangle/cube/sphere/obj shapes with full `to_world`
+  emitters → lights, rectangle/cube/sphere/obj/ply shapes with their `to_world`
   transforms, `<ref>`/`<default>` resolution). Validated on a converted Cornell
   scene (glass + gold spheres, colored walls, area light) rendering correctly in
   modes B and D. **Because Blender exports to Mitsuba XML via `mitsuba-blender`,
-  this is also the Blender→FTSL path.**
-  - **Known approximations (flagged with `# WARN:` in output):** roughdielectric →
-    smooth dielectric (no rough transmission in FTSL); plastic/roughplastic →
-    glossy (diffuse+specular coat merged); bumpmap/normalmap dropped to base BSDF;
-    mask opacity ignored; `.ply`/`.serialized` meshes emitted as `mesh` lines but
-    ftrace's loader is OBJ-only (convert first); mesh `to_world` with
-    rotation/shear only partly expressible (translate+scale + euler). (Mesh
-    area-emitters *do* now have an FTSL equivalent — a `mesh` bound to an `emit`
-    material, since 0.186.0 — so the exporter could emit that instead of dropping the
-    emission; not yet wired up.)
-  - **Possible follow-ups:** map `.ply` via an auto OBJ conversion; emissive-mesh
-    support (needs an emissive-triangle light primitive in the core); rough
-    transmission material.
+  this is also the Blender→FTSL path.** `tools/check_mitsuba_import.py` is its
+  regression check.
+  - **Landed 2026-11-02** (review follow-ups, c692cab..): every named `int_ior`;
+    0.6 property names; rough transmission; `thindielectric`; `.ply`; mesh and cube
+    area emitters; mesh rotation as Euler `rotate`; `directional` → `light sun`;
+    emitter brightness kept relative (`rgbillum`); roughness matched by lobe width;
+    perspective cameras in mode R.
+  - **Known approximations (flagged with `# WARN:` in output):** plastic/roughplastic
+    → glossy (diffuse+specular coat merged); roughdielectric → dielectric `roughness`,
+    a glossy lobe about the reflected and refracted rays rather than a microfacet BTDF;
+    thindielectric → `halfmirror` at its normal-incidence reflectance; anisotropic
+    alpha averaged; bumpmap/normalmap dropped to base BSDF; mask opacity ignored;
+    `.serialized` meshes skipped; a mesh `to_world` that shears or mirrors placed
+    approximately; `ext_ior` dropped (FTSL takes the outside index from the enclosing
+    dielectric); a dielectric's `specular_*` tint, a conductor's `eta`/`k`, and conductor
+    materials with no `metal:` file dropped; `directional` → a 0.53° sun; `point` → a
+    2 cm sphere light, whose brightness scales only from an rgb intensity; an emitter on
+    a `blendbsdf` mesh → a black diffuse emitter; a `thinlens` camera stays mode A, which
+    shows glass and mirrors seen directly as black.
+  - **Possible follow-ups:** bump/normal maps → FTSL `normal_map`; a dielectric's
+    `specular_transmittance` → an `absorb` approximation; conductor `eta`/`k` → a
+    reflectance by the Fresnel equations, and `metal:` files for more of Mitsuba's ~40
+    conductor presets; reading `.serialized`; emission on a `blendbsdf` mesh keeping its
+    blend (once `emit` on a `mix` is verified to show on a direct hit).
 - **POV-Ray: DECLINED (2026-07-11), rationale logged.** The SDL is genuinely nice
   (programmable, exact CSG, implicit `isosurface`), but a poor fit here: (1) faithful
   parsing = writing a Turing-complete interpreter (macros/loops/functions), far more

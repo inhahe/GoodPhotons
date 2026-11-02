@@ -5933,24 +5933,31 @@ ftrace -in scene.ftsl -o out.png
 ```
 
 A `perspective` sensor becomes a mode `R` camera (backward path tracing, as Mitsuba
-renders) and a `thinlens` one a mode `A` camera with its aperture and focus. Leave
-`-mode` off, since it overrides every camera's mode. (Mode `D` refuses an import with a
-`constant`, `envmap` or `directional` emitter, which become environment and collimated
-lights.) A 0.6 scene's camelCase names (`toWorld`, `intIOR`, `diffuseReflectance`) are
-read the way Mitsuba's own parser upgrades them.
+renders), so leave `-mode` off: it overrides every camera's mode. A `thinlens` sensor
+becomes a mode `A` camera with its aperture and focus, since only the forward modes
+render that depth of field; they show glass and mirrors seen directly as black, so the
+converter flags a thin lens beside them, and `-mode R` shows them, in focus everywhere.
+(Mode `D` refuses an import with a `constant` or `envmap` emitter, which become
+environment lights.) A 0.6 scene's camelCase names (`toWorld`, `intIOR`,
+`diffuseReflectance`) are read the way Mitsuba's own parser upgrades them, and its
+conductor defaults to copper, as 0.6's did.
 
 Mitsuba is also a spectral, physically-based renderer, so most constructs map
 almost 1:1: the `perspective`/`thinlens` sensor → an FTSL `camera`;
 `diffuse`/`conductor`/`roughconductor`/`dielectric`/`roughdielectric`/`plastic` BSDFs →
-`diffuse`/`mirror`/`glossy`/`dielectric` materials (a `roughdielectric`'s `alpha`
-becomes the dielectric's `roughness`), and a `thindielectric` → a `halfmirror`
-reflecting the sheet's normal-incidence reflectance; `area`/`constant`/`envmap`/
-`point`/`directional` emitters → FTSL lights. `rectangle`, `cube`, `sphere`, `obj` and
-`ply` shapes are supported with their `to_world` transforms (a mesh keeps translation
-and scale; a rotation is flagged), and an area emitter on any of them becomes a light:
-on a mesh, an emissive copy of its material, so it lights the scene as a mesh light.
-RGB reflectances ride FTSL's Jakob–Hanika upsampling and measured/blackbody spectra
-pass through losslessly. A dielectric's `int_ior` may be a number or any of
+`diffuse`/`mirror`/`glossy`/`dielectric` materials, and a `thindielectric` → a
+`halfmirror` reflecting the sheet's normal-incidence reflectance. A microfacet `alpha`
+becomes the `roughness` whose lobe is as wide: 2 `alpha` for Beckmann, Mitsuba's
+default, and 1.55 `alpha` for GGX, capped at 1. Emitters become FTSL lights: an RGB
+value becomes `rgbillum` at its own magnitude, so lights keep their brightness relative
+to one another; `point` becomes a 2 cm sphere light of radiance intensity / (π r²), and
+`directional` a `light sun` 0.53° across. `rectangle`, `cube`, `sphere`, `obj` and `ply`
+shapes are supported with their `to_world` transforms: a mesh's scale, rotation and
+translation become its `scale`, Euler `rotate` and `translate` exactly, and a shear or
+mirror is flagged. An area emitter on any shape becomes a light: on a mesh, an emissive
+copy of its material, so it lights the scene as a mesh light. RGB reflectances ride
+FTSL's Jakob–Hanika upsampling and measured/blackbody spectra pass through losslessly.
+A dielectric's `int_ior` may be a number or any of
 Mitsuba's named materials: `bk7`, `water`, `water ice`, `fused quartz`, `acrylic
 glass` and `diamond` become the matching dispersive `glass:`, and the rest (`pyrex`,
 `amber`, `pet`, `ethanol`, the gases, …) keep Mitsuba's own constant index.

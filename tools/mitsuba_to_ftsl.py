@@ -172,11 +172,6 @@ LIBRARY_GLASS = {
     'acrylic glass': 'acrylic', 'bk7': 'BK7', 'diamond': 'diamond',
 }
 
-def named_ior(nm):
-    """The FTSL `ior ...` expression for Mitsuba's named material `nm` (a MITSUBA_IOR key)."""
-    g = LIBRARY_GLASS.get(nm)
-    return f"ior glass:{g}" if g else f"ior {fnum(MITSUBA_IOR[nm])}"
-
 def spectrum_from_node(node, defaults):
     """Turn a <rgb>/<spectrum>/<blackbody> child into an FTSL spectrum expression."""
     if node is None: return None
@@ -230,37 +225,49 @@ def get_string(elem, name, defaults):
     return None
 
 def get_ior(elem, name, default, defaults):
-    """The FTSL `ior ...` expression for the BSDF property `name` (int_ior), or `default`
-    (also an `ior ...` expression) when it is absent. Mitsuba takes a number or a material
-    name from MITSUBA_IOR; a name outside it gets `default` and a warning, so the output
-    still parses."""
+    """The BSDF property `name` (int_ior or ext_ior) as a pair: the FTSL `ior ...` expression
+    for it, and the index Mitsuba itself uses. Mitsuba takes a number or a MITSUBA_IOR name;
+    `default`, a MITSUBA_IOR name, stands in when the property is absent, and when it names
+    nothing Mitsuba knows (with a warning, so the output still parses). Constants are written
+    with every digit Mitsuba's table has: a gas's n - 1 lives in the sixth."""
+    nm = default
     for c in elem:
         if c.get('name') == name:
+            if c.tag in ('float', 'integer'):
+                x = float(sub(c.get('value'), defaults))
+                return f"ior {x!r}", x
             if c.tag == 'string':
-                nm = sub(c.get('value'), defaults).lower()
-                if nm in MITSUBA_IOR:
-                    return named_ior(nm)
-                warn(f"unknown named IOR '{nm}' -> {default}")
-                return default
-            if c.tag in ('float','integer'):
-                return f"ior {fnum(float(sub(c.get('value'), defaults)))}"
-    return default
+                given = sub(c.get('value'), defaults).lower()
+                if given in MITSUBA_IOR:
+                    nm = given
+                else:
+                    warn(f"unknown named IOR '{given}' -> {default}")
+            break
+    g = LIBRARY_GLASS.get(nm)
+    return (f"ior glass:{g}" if g else f"ior {MITSUBA_IOR[nm]!r}"), MITSUBA_IOR[nm]
 
-def mitsuba_ior(elem, name, default, defaults):
-    """The index Mitsuba itself uses for the BSDF property `name` (a number, or a MITSUBA_IOR
-    name), or `default` (a number) when it is absent; a name outside MITSUBA_IOR also gets
-    `default`, with a warning."""
-    for c in elem:
-        if c.get('name') == name:
-            if c.tag == 'string':
-                nm = sub(c.get('value'), defaults).lower()
-                if nm in MITSUBA_IOR:
-                    return MITSUBA_IOR[nm]
-                warn(f"unknown named IOR '{nm}' -> {fnum(default)}")
-                return default
-            if c.tag in ('float','integer'):
-                return float(sub(c.get('value'), defaults))
-    return default
+def ftsl_roughness(bsdf, name, defaults):
+    """(FTSL `roughness`, Mitsuba alpha) for the microfacet BSDF `bsdf` (material `name`).
+
+    Matched by lobe width. FTSL's glossy lobe, which a dielectric's frosting also uses, is a
+    Phong lobe of exponent 2/r^2 - 2 about the mirror direction: half-width 0.833 r. Mitsuba's
+    alpha sets the half-vector distribution, whose width a reflection doubles: 1.665 alpha for
+    Beckmann (its default, and what 0.6's Phong reduces to), 1.287 alpha for GGX. So r is
+    2 alpha, or 1.55 alpha for GGX, capped at FTSL's 1. An anisotropic alpha_u/alpha_v pair is
+    averaged, with a warning."""
+    a = get_float(bsdf, 'alpha', None, defaults)
+    if a is None:
+        au = get_float(bsdf, 'alpha_u', None, defaults)
+        av = get_float(bsdf, 'alpha_v', au, defaults)
+        if au is None:
+            a = 0.1   # Mitsuba's default
+        else:
+            a = 0.5 * (au + av)
+            if abs(au - av) > 1e-9:
+                warn(f"'{name}': anisotropic alpha_u {fnum(au)} / alpha_v {fnum(av)} -> "
+                     f"isotropic alpha {fnum(a)}")
+    k = 1.55 if (get_string(bsdf, 'distribution', defaults) or '').lower() == 'ggx' else 2.0
+    return min(max(k * a, 0.0), 1.0), a
 
 # ------------------------------------------------------------------- BSDF -> material
 CONDUCTOR_METAL = {  # Mitsuba conductor material -> FTSL metal:
@@ -278,6 +285,14 @@ class Converter:
         self.cameras = []       # list of FTSL camera blocks
         self.anon_count = 0
         self.defaults = {}
+        self.legacy = False     # a Mitsuba 0.x scene (set by convert)
+        self.has_light = False  # set by add_light and emissive
+        self.thinlens = False   # a thinlens sensor became a mode A camera
+        self.emissive_of = {}   # (material, spd) -> its emissive copy
+
+    def add_light(self, line):
+        self.geometry.append(line)
+        self.has_light = True
 
     def uniq(self, base):
         base = base or 'mat'
@@ -341,7 +356,9 @@ class Converter:
             refl = self.reflectance_expr(bsdf, 'reflectance', '0.5', name)
             body = f"type diffuse  reflect {refl}"
         elif btype in ('conductor', 'roughconductor'):
-            mat = (get_string(bsdf, 'material', self.defaults) or 'none').lower()
+            # Mitsuba 0.x defaulted a conductor to copper; 2 and later to a perfect mirror.
+            mat = (get_string(bsdf, 'material', self.defaults)
+                   or ('cu' if self.legacy else 'none')).lower()
             metal = CONDUCTOR_METAL.get(mat)
             refl = f"metal:{metal}" if metal else \
                    (first_child_spectrum(bsdf, 'specular_reflectance', self.defaults) or '0.9')
@@ -350,12 +367,13 @@ class Converter:
             if any(c.get('name') in ('eta', 'k') for c in bsdf):
                 warn(f"{btype} '{name}': eta/k dropped -> reflect {refl}")
             if btype == 'roughconductor':
-                a = get_float(bsdf, 'alpha', 0.1, self.defaults)
-                body = f"type glossy  reflect {refl}  roughness {fnum(min(max(a,0),1))}"
+                r, _ = ftsl_roughness(bsdf, name, self.defaults)
+                body = f"type glossy  reflect {refl}  roughness {fnum(r)}"
             else:
                 body = f"type mirror  reflect {refl}"
         elif btype in ('dielectric', 'roughdielectric', 'thindielectric'):
-            ext = mitsuba_ior(bsdf, 'ext_ior', MITSUBA_IOR['air'], self.defaults)
+            ior, n_in = get_ior(bsdf, 'int_ior', 'bk7', self.defaults)
+            _, ext = get_ior(bsdf, 'ext_ior', 'air', self.defaults)
             for tint in ('specular_reflectance', 'specular_transmittance'):
                 if any(c.get('name') == tint for c in bsdf):
                     warn(f"{btype} '{name}': {tint} dropped - an FTSL dielectric's interface "
@@ -364,28 +382,27 @@ class Converter:
                 # A sheet with no thickness: light crosses undeviated, and what it reflects is
                 # both faces' Fresnel with every inter-reflection, 2R/(1+R), taken here at
                 # normal incidence -- a lossless beamsplitter, which is FTSL's halfmirror.
-                eta = mitsuba_ior(bsdf, 'int_ior', MITSUBA_IOR['bk7'], self.defaults) / ext
+                eta = n_in / ext
                 r0 = ((eta - 1) / (eta + 1)) ** 2
                 refl = 2 * r0 / (1 + r0)
                 body = f"type halfmirror  reflect {fnum(refl)}"
                 warn(f"thindielectric '{name}' -> halfmirror reflecting {fnum(refl)}, the "
                      f"sheet's normal-incidence reflectance (no rise toward grazing)")
             else:
-                ior = get_ior(bsdf, 'int_ior', 'ior glass:BK7', self.defaults)
                 body = f"type dielectric  {ior}"
                 if abs(ext - 1.0) > 1e-3:   # Mitsuba's default is air
                     warn(f"{btype} '{name}': ext_ior {fnum(ext)} dropped - FTSL takes the "
                          f"index outside a dielectric from the dielectric enclosing it, so "
                          f"model the outside medium as a dielectric of its own")
             if btype == 'roughdielectric':
-                a = get_float(bsdf, 'alpha', 0.1, self.defaults)
-                body += f"  roughness {fnum(min(max(a, 0), 1))}"
-                warn(f"roughdielectric '{name}': alpha {fnum(a)} -> dielectric roughness, a "
+                r, a = ftsl_roughness(bsdf, name, self.defaults)
+                body += f"  roughness {fnum(r)}"
+                warn(f"roughdielectric '{name}': alpha {fnum(a)} -> roughness {fnum(r)}, a "
                      f"glossy lobe about the reflected and refracted rays, not a microfacet BTDF")
         elif btype in ('plastic', 'roughplastic'):
             diff = self.reflectance_expr(bsdf, 'diffuse_reflectance', '0.5', name)
-            a = get_float(bsdf, 'alpha', 0.1, self.defaults) if btype == 'roughplastic' else 0.05
-            body = f"type glossy  reflect {diff}  roughness {fnum(min(max(a,0),1))}"
+            r = ftsl_roughness(bsdf, name, self.defaults)[0] if btype == 'roughplastic' else 0.05
+            body = f"type glossy  reflect {diff}  roughness {fnum(r)}"
             warn(f"{btype} -> glossy approximation (diffuse+specular coat merged)")
         elif btype == 'blendbsdf':
             kids = bsdf.findall('bsdf')
@@ -404,11 +421,12 @@ class Converter:
 
         return self.add_material(name, body)
 
-    def emitter_spd(self, emitter, name):
-        """Emitter radiance -> FTSL spd. rgb radiance is unbounded in Mitsuba, but FTSL's
-        `rgb` upsamples a [0,1] *reflectance*, so normalize an rgb emitter to max=1 to keep
-        its hue (absolute brightness is handled by auto-exposure in relative mode)."""
-        # find the radiance node to inspect its raw form
+    def emitter_spd(self, emitter, name, scale=1.0):
+        """The FTSL `spd` for the emitter property `name` (radiance, irradiance, intensity),
+        times `scale`. An rgb value becomes `rgbillum`, FTSL's emission upsampling, at its own
+        magnitude, so lights keep their brightness relative to one another; `rgb` would read
+        it as a 0..1 reflectance. Any other spectrum passes through, and cannot be scaled: a
+        `scale` other than 1 is then dropped with a warning."""
         node = None
         for c in emitter:
             if c.tag in ('rgb','srgb','spectrum','blackbody') and (c.get('name') == name or c.get('name') is None):
@@ -416,12 +434,11 @@ class Converter:
         if node is not None and node.tag in ('rgb','srgb'):
             c = parse_floats(sub(node.get('value'), self.defaults))
             if len(c) == 1: c = c*3
-            m = max(c)
-            if m > 1.0:
-                c = [x/m for x in c]
-                warn("rgb emitter radiance normalized to max=1 (brightness set by auto-exposure)")
-            return f"rgb {fnum(c[0])} {fnum(c[1])} {fnum(c[2])}"
+            return "rgbillum " + " ".join(fnum(x * scale) for x in c[:3])
         s = spectrum_from_node(node, self.defaults) if node is not None else None
+        if abs(scale - 1.0) > 1e-12:
+            warn(f"{emitter.get('type')} emitter: its {name} is not rgb, so its x{fnum(scale)} "
+                 f"brightness conversion was dropped")
         return s if s is not None else 'blackbody 6500'
 
     # --- shapes / emitters --------------------------------------------------
@@ -454,7 +471,7 @@ class Converter:
             pv = xform_point(M, [-1,1,0])
             u = vsub(pu, o); v = vsub(pv, o)
             if is_light:
-                self.geometry.append(
+                self.add_light(
                     f"light area {{ origin {v3(o)}  u {v3(u)}  v {v3(v)}  spd {spd} }}")
             else:
                 mat = self.resolve_shape_material(shape) or self.default_mat()
@@ -463,7 +480,7 @@ class Converter:
         elif stype == 'cube':
             if is_light:   # six area lights, as a rectangle emitter becomes one
                 for o, u, v in cube_faces(M):
-                    self.geometry.append(
+                    self.add_light(
                         f"light area {{ origin {v3(o)}  u {v3(u)}  v {v3(v)}  spd {spd} }}")
             else:
                 mat = self.resolve_shape_material(shape) or self.default_mat()
@@ -482,7 +499,7 @@ class Converter:
             if radius is None:
                 radius = vlen(vsub(xform_point(M, [1,0,0]), xform_point(M, [0,0,0])))
             if is_light:
-                self.geometry.append(
+                self.add_light(
                     f"light sphere {{ center {v3(center)}  radius {fnum(radius)}  spd {spd} }}")
             else:
                 mat = self.resolve_shape_material(shape) or self.default_mat()
@@ -503,34 +520,53 @@ class Converter:
 
     def emissive(self, mat, spd):
         """The name of a copy of material `mat` that also radiates `spd`, which makes the mesh
-        bound to it an area light. A copy, so other shapes sharing `mat` stay dark."""
-        body = self.materials[mat]
-        if '\n' in body:   # a mix; `emit` belongs on one plain material
-            warn(f"area emitter on mix material '{mat}' -> black diffuse emitter")
-            body = 'type diffuse  reflect 0'
-        return self.add_material(self.uniq(mat + '_emit'), f"{body}  emit {spd}")
+        bound to it an area light. A copy, so other shapes sharing `mat` stay dark; one per
+        (material, spd), so meshes that glow alike share it."""
+        key = (mat, spd)
+        if key not in self.emissive_of:
+            body = self.materials[mat]
+            if '\n' in body:   # a mix; `emit` belongs on one plain material
+                warn(f"area emitter on mix material '{mat}' -> black diffuse emitter")
+                body = 'type diffuse  reflect 0'
+            self.emissive_of[key] = self.add_material(self.uniq(mat + '_emit'),
+                                                      f"{body}  emit {spd}")
+        self.has_light = True
+        return self.emissive_of[key]
 
     def emit_mesh(self, fn, mat, M):
-        # Decompose M into translate + (approx) uniform scale + note if rotated/sheared.
+        """Append a `mesh` line placing the file `fn` by Mitsuba's `to_world` M. FTSL places a
+        mesh by a per-axis scale, then rotate (Euler degrees, R = Rz.Ry.Rx), then translate,
+        which is exactly an M whose linear part has orthogonal columns and does not mirror. A
+        shear or a mirror is flagged and placed approximately."""
         t = xform_point(M, [0,0,0])
-        sx = vlen(xform_vec(M, [1,0,0])); sy = vlen(xform_vec(M, [0,1,0])); sz = vlen(xform_vec(M, [0,0,1]))
+        cols = [xform_vec(M, e) for e in ([1,0,0], [0,1,0], [0,0,1])]
+        s = [vlen(c) for c in cols]
+        R = [vnorm(c) for c in cols]               # R[j] is column j: m[row][j] = R[j][row]
         line = f'mesh {{ file "{fn}"  material {mat}  translate {v3(t)}'
-        if abs(sx-1)>1e-6 or abs(sy-1)>1e-6 or abs(sz-1)>1e-6:
-            if abs(sx-sy)<1e-4 and abs(sy-sz)<1e-4:
-                line += f"  scale {fnum(sx)}"
-            else:
-                line += f"  scale {fnum(sx)} {fnum(sy)} {fnum(sz)}"
-        # rotation/shear can't be expressed by mesh translate/scale alone
-        if self.has_rotation(M):
-            warn(f"mesh '{fn}' has a rotation/shear in to_world; ftrace mesh supports only "
-                 f"translate+scale (+euler rotate) - rotation approximated as dropped")
+        if any(abs(x - 1) > 1e-6 for x in s):
+            line += f"  scale {fnum(s[0])}" if max(s) - min(s) < 1e-6 * max(s) else f"  scale {v3(s)}"
+        dot = lambda a, b: a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
+        if max(abs(dot(R[0], R[1])), abs(dot(R[0], R[2])), abs(dot(R[1], R[2]))) > 1e-6:
+            warn(f"mesh '{fn}' (material {mat}): to_world shears it, which a mesh's scale/rotate/translate "
+                 f"cannot express -> placed approximately, without the shear")
+        if dot(vcross(R[0], R[1]), R[2]) < 0:
+            warn(f"mesh '{fn}' (material {mat}): to_world mirrors it, which a mesh's scale/rotate/translate "
+                 f"cannot express -> placed unmirrored")
+            R[0] = [-x for x in R[0]]
+        # R = Rz(g) Ry(b) Rx(a): m20 = -sin b, (m21, m22) = cos b (sin a, cos a),
+        # (m10, m00) = cos b (sin g, cos g); at cos b = 0 only a - g or a + g is defined.
+        m20 = max(-1.0, min(1.0, R[0][2]))
+        b = math.asin(-m20)
+        if abs(m20) < 1 - 1e-12:
+            a = math.atan2(R[1][2], R[2][2]); g = math.atan2(R[0][1], R[0][0])
+        else:
+            a = 0.0; g = math.atan2(-R[1][0], R[1][1])
+        rot = [math.degrees(x) for x in (a, b, g)]
+        rot = [0.0 if abs(x) < 1e-9 else x for x in rot]
+        if any(rot):
+            line += f"  rotate {v3(rot)}"
         line += " }"
         self.geometry.append(line)
-
-    def has_rotation(self, M):
-        # off-diagonal of the upper-left 3x3 (after removing scale) far from 0 => rotated
-        cols = [vnorm(xform_vec(M,[1,0,0])), vnorm(xform_vec(M,[0,1,0])), vnorm(xform_vec(M,[0,0,1]))]
-        return abs(cols[0][1])>1e-3 or abs(cols[0][2])>1e-3 or abs(cols[1][0])>1e-3
 
     def default_mat(self):
         if '_default' not in self.materials:
@@ -564,6 +600,7 @@ class Converter:
             ap = get_float(sensor, 'aperture_radius', 0.0, self.defaults)
             focus = get_float(sensor, 'focus_distance', 0.0, self.defaults)
             lines.append(f"    aperture {fnum(ap)}  focus {fnum(focus)}  mode A")
+            self.thinlens = True
         else:   # backward path tracing, as Mitsuba renders; B would leave glass seen directly black
             lines.append(f"    mode R")
         lines.append(f"    film {{ res {w} {h} }}")
@@ -588,31 +625,40 @@ class Converter:
     # --- top-level emitters (env / constant) --------------------------------
     def handle_scene_emitter(self, emitter):
         etype = emitter.get('type')
+        tnode = next((c for c in emitter if c.tag == 'transform' and c.get('name') == 'to_world'), None)
+        M = parse_transform(tnode, self.defaults) if tnode is not None else mat_identity()
         if etype == 'constant':
             spd = self.emitter_spd(emitter, 'radiance')
-            self.geometry.append(f"light env {{ spd {spd} }}")
+            self.add_light(f"light env {{ spd {spd} }}")
         elif etype == 'envmap':
             fn = get_string(emitter, 'filename', self.defaults) or 'env.hdr'
             scale = get_float(emitter, 'scale', 1.0, self.defaults)
-            self.geometry.append(f'light env {{ file "{fn}"  intensity {fnum(scale)} }}')
+            self.add_light(f'light env {{ file "{fn}"  intensity {fnum(scale)} }}')
         elif etype == 'point':
-            warn("point emitter -> FTSL has no point light; approximated as a small sphere light")
+            # Mitsuba's intensity is per steradian; a sphere light of radius r and radiance L
+            # sends L * pi r^2 per steradian, so L = intensity / (pi r^2).
+            r = 0.02
+            warn(f"point emitter -> FTSL has no point light; a sphere light of radius {r}")
             pos = None
             for c in emitter:
                 if c.tag == 'point' and c.get('name') == 'position':
-                    pos = [float(c.get('x',0)), float(c.get('y',0)), float(c.get('z',0))]
-            if pos is None: pos = [0,1,0]
-            spd = first_child_spectrum(emitter, 'intensity', self.defaults) or 'blackbody 6500'
-            self.geometry.append(f"light sphere {{ center {v3(pos)}  radius 0.02  spd {spd} }}")
+                    pos = [float(sub(c.get(k, '0'), self.defaults)) for k in 'xyz']
+            if pos is None: pos = xform_point(M, [0,0,0])
+            spd = self.emitter_spd(emitter, 'intensity', 1.0 / (math.pi * r * r))
+            self.add_light(f"light sphere {{ center {v3(pos)}  radius {fnum(r)}  spd {spd} }}")
         elif etype == 'directional':
-            warn("directional emitter -> collimated light")
+            # Mitsuba's direction is the one light travels, and its irradiance falls on a
+            # surface facing it, as a sun's `spd` does; a sun's `dir` points back at the sun.
             d = None
             for c in emitter:
                 if c.tag == 'vector' and c.get('name') == 'direction':
-                    d = [float(c.get('x',0)), float(c.get('y',0)), float(c.get('z',0))]
-            if d is None: d = [0,0,-1]
-            spd = first_child_spectrum(emitter, 'irradiance', self.defaults) or 'blackbody 6500'
-            self.geometry.append(f"light collimated {{ dir {v3(d)}  spd {spd} }}")
+                    d = [float(sub(c.get(k, '0'), self.defaults)) for k in 'xyz']
+            if d is None: d = xform_vec(M, [0,0,1])
+            d = vnorm(d)
+            spd = self.emitter_spd(emitter, 'irradiance')
+            warn("directional emitter -> light sun 0.53 deg across (FTSL's sun needs a size; "
+                 "Mitsuba's has none, so its shadows were hard)")
+            self.add_light(f"light sun {{ dir {v3([0.0 - x for x in d])}  spd {spd} }}")   # no -0
         else:
             warn(f"unsupported scene emitter '{etype}' -> skipped")
 
@@ -623,10 +669,11 @@ class Converter:
         (src/core/parser.cpp upgrade_from_v1), so the rest of the converter reads one naming:
         a camelCase name becomes snake_case (toWorld -> to_world, intIOR -> int_ior), and a
         diffuse BSDF's diffuse_reflectance becomes reflectance. <default> names are left
-        alone: they are the scene's own `$name` parameters, not properties."""
+        alone: they are the scene's own `$name` parameters, not properties. Returns whether
+        the scene is 0.x, whose remaining differences are defaults (a conductor's, say)."""
         ver = root.get('version', '').split('.')[0]
         if not ver.isdigit() or int(ver) >= 2:
-            return
+            return False
         snake = lambda s: re.sub(r'(?<=[a-z])[A-Z]+', lambda m: '_' + m.group(0).lower(), s)
         for e in root.iter():
             if e.tag != 'default' and e.get('name') is not None:
@@ -636,9 +683,10 @@ class Converter:
                 for c in b:
                     if c.get('name') == 'diffuse_reflectance':
                         c.set('name', 'reflectance')
+        return True
 
     def convert(self, root):
-        self.upgrade_from_v1(root)
+        self.legacy = self.upgrade_from_v1(root)
         # <default name=.. value=..> substitution table
         for c in root:
             if c.tag == 'default':
@@ -655,6 +703,12 @@ class Converter:
                 self.handle_sensor(c)
             elif c.tag == 'emitter':
                 self.handle_scene_emitter(c)
+        if self.thinlens and any(self.materials[m].startswith(('type dielectric', 'type mirror',
+                                                               'type halfmirror'))
+                                 for m in self.mat_order):
+            warn("thinlens sensor -> mode A, whose depth of field only the forward modes "
+                 "render, and which shows glass and mirrors seen directly as black; pass "
+                 "`-mode R` to see them, in focus everywhere")
 
     def emit(self):
         out = []
@@ -674,10 +728,7 @@ class Converter:
         for g in self.geometry:
             out.append(g)
         out.append("")
-        # An emissive mesh is a light too: its material is made by emissive(), only for one.
-        lit = (any(g.startswith('light ') for g in self.geometry)
-               or any('  emit ' in b for b in self.materials.values()))
-        if not lit:
+        if not self.has_light:
             out.append("# WARN: no lights found in source scene; adding a fallback so it renders")
             out.append("light area { origin -0.5 2 -0.5  u 1 0 0  v 0 0 1  normal 0 -1 0  spd preset:d65 }")
             out.append("")
