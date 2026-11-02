@@ -16,7 +16,7 @@ Unsupported constructs are skipped with a `# WARN:` comment in the output and a 
 on stderr, so the result always parses. Coverage is the common subset an exported
 scene uses; exotic BSDFs/shapes degrade to a documented approximation.
 """
-import sys, os, math
+import sys, os, math, re
 import xml.etree.ElementTree as ET
 
 # --------------------------------------------------------------------------- utils
@@ -134,24 +134,30 @@ def sub(s, defaults):
     return s
 
 # ------------------------------------------------------------------- spectra
-# Every named IOR Mitsuba accepts (include/mitsuba/render/ior.h, the same table in 0.6 and
-# 3), as an FTSL `ior` expression: the library's dispersive glass where it holds the same
-# material, else Mitsuba's own constant, so the import refracts as the source scene did.
-# Pyrex is a borosilicate but not BK7 (n 1.47 against 1.517), so it keeps its constant.
-NAMED_IOR = {
-    'vacuum': 'ior 1',                      'helium': 'ior 1.000036',
-    'hydrogen': 'ior 1.000132',             'air': 'ior 1.000277',
-    'carbon dioxide': 'ior 1.00045',        'water': 'ior glass:water',
-    'acetone': 'ior 1.36',                  'ethanol': 'ior 1.361',
-    'carbon tetrachloride': 'ior 1.461',    'glycerol': 'ior 1.4729',
-    'benzene': 'ior 1.501',                 'silicone oil': 'ior 1.52045',
-    'bromine': 'ior 1.661',                 'water ice': 'ior glass:ice',
-    'fused quartz': 'ior glass:silica',     'pyrex': 'ior 1.47',
-    'acrylic glass': 'ior glass:acrylic',   'polypropylene': 'ior 1.49',
-    'bk7': 'ior glass:BK7',                 'sodium chloride': 'ior 1.544',
-    'amber': 'ior 1.55',                    'pet': 'ior 1.575',
-    'diamond': 'ior glass:diamond',
+# Every named IOR Mitsuba accepts (include/mitsuba/render/ior.h, the same table in 0.6 and 3).
+MITSUBA_IOR = {
+    'vacuum': 1.0,          'helium': 1.000036,     'hydrogen': 1.000132,
+    'air': 1.000277,        'carbon dioxide': 1.00045,
+    'water': 1.3330,        'acetone': 1.36,        'ethanol': 1.361,
+    'carbon tetrachloride': 1.461,  'glycerol': 1.4729,     'benzene': 1.501,
+    'silicone oil': 1.52045,        'bromine': 1.661,       'water ice': 1.31,
+    'fused quartz': 1.458,  'pyrex': 1.470,         'acrylic glass': 1.49,
+    'polypropylene': 1.49,  'bk7': 1.5046,          'sodium chloride': 1.544,
+    'amber': 1.55,          'pet': 1.5750,          'diamond': 2.419,
 }
+# The names the glass library holds as the same material import as that DISPERSIVE glass, not
+# as Mitsuba's constant: a deliberate upgrade, so a Mitsuba diamond gains the fire a constant
+# index cannot give it (and bk7 moves from Mitsuba's 1.5046 to the catalogue's n_d 1.5168).
+# Pyrex is a borosilicate but not BK7 (1.47 against 1.517), so it keeps its constant.
+LIBRARY_GLASS = {
+    'water': 'water', 'water ice': 'ice', 'fused quartz': 'silica',
+    'acrylic glass': 'acrylic', 'bk7': 'BK7', 'diamond': 'diamond',
+}
+
+def named_ior(nm):
+    """The FTSL `ior ...` expression for Mitsuba's named material `nm` (a MITSUBA_IOR key)."""
+    g = LIBRARY_GLASS.get(nm)
+    return f"ior glass:{g}" if g else f"ior {fnum(MITSUBA_IOR[nm])}"
 
 def spectrum_from_node(node, defaults):
     """Turn a <rgb>/<spectrum>/<blackbody> child into an FTSL spectrum expression."""
@@ -206,21 +212,32 @@ def get_string(elem, name, defaults):
     return None
 
 def get_ior(elem, name, default, defaults):
-    """The FTSL `ior ...` expression for the BSDF property `name` (int_ior/ext_ior), or
-    `default` (also an `ior ...` expression) when it is absent. Mitsuba takes a number or a
-    material name from NAMED_IOR; a name outside it gets `default` and a warning, so the
-    output still parses."""
+    """The FTSL `ior ...` expression for the BSDF property `name` (int_ior), or `default`
+    (also an `ior ...` expression) when it is absent. Mitsuba takes a number or a material
+    name from MITSUBA_IOR; a name outside it gets `default` and a warning, so the output
+    still parses."""
     for c in elem:
         if c.get('name') == name:
             if c.tag == 'string':
                 nm = sub(c.get('value'), defaults).lower()
-                if nm in NAMED_IOR:
-                    return NAMED_IOR[nm]
+                if nm in MITSUBA_IOR:
+                    return named_ior(nm)
                 warn(f"unknown named IOR '{nm}' -> {default}")
                 return default
             if c.tag in ('float','integer'):
                 return f"ior {fnum(float(sub(c.get('value'), defaults)))}"
     return default
+
+def mitsuba_ior(elem, name, defaults):
+    """The index Mitsuba itself uses for the BSDF property `name` (a number, or a MITSUBA_IOR
+    name), or None when the property is absent or names nothing Mitsuba knows."""
+    for c in elem:
+        if c.get('name') == name:
+            if c.tag == 'string':
+                return MITSUBA_IOR.get(sub(c.get('value'), defaults).lower())
+            if c.tag in ('float','integer'):
+                return float(sub(c.get('value'), defaults))
+    return None
 
 # ------------------------------------------------------------------- BSDF -> material
 CONDUCTOR_METAL = {  # Mitsuba conductor material -> FTSL metal:
@@ -313,6 +330,11 @@ class Converter:
         elif btype in ('dielectric', 'roughdielectric', 'thindielectric'):
             ior = get_ior(bsdf, 'int_ior', 'ior glass:BK7', self.defaults)
             body = f"type dielectric  {ior}"
+            ext = mitsuba_ior(bsdf, 'ext_ior', self.defaults)
+            if ext is not None and abs(ext - 1.0) > 1e-3:   # Mitsuba's default is air
+                warn(f"{btype} '{name}': ext_ior {fnum(ext)} dropped - FTSL takes the index "
+                     f"outside a dielectric from the dielectric enclosing it, so model the "
+                     f"outside medium as a dielectric of its own")
             if btype == 'roughdielectric':
                 warn("roughdielectric -> smooth dielectric (no rough transmission in FTSL)")
         elif btype in ('plastic', 'roughplastic'):
@@ -497,8 +519,8 @@ class Converter:
             ap = get_float(sensor, 'aperture_radius', 0.0, self.defaults)
             focus = get_float(sensor, 'focus_distance', 0.0, self.defaults)
             lines.append(f"    aperture {fnum(ap)}  focus {fnum(focus)}  mode A")
-        else:
-            lines.append(f"    mode B")
+        else:   # backward path tracing, as Mitsuba renders; B would leave glass seen directly black
+            lines.append(f"    mode R")
         lines.append(f"    film {{ res {w} {h} }}")
         lines.append("}")
         self.cameras.append("\n".join(lines))
@@ -550,7 +572,28 @@ class Converter:
             warn(f"unsupported scene emitter '{etype}' -> skipped")
 
     # --- driver -------------------------------------------------------------
+    @staticmethod
+    def upgrade_from_v1(root):
+        """Rename a Mitsuba 0.x scene's properties in place, as Mitsuba's own parser does
+        (src/core/parser.cpp upgrade_from_v1), so the rest of the converter reads one naming:
+        a camelCase name becomes snake_case (toWorld -> to_world, intIOR -> int_ior), and a
+        diffuse BSDF's diffuse_reflectance becomes reflectance. <default> names are left
+        alone: they are the scene's own `$name` parameters, not properties."""
+        ver = root.get('version', '').split('.')[0]
+        if not ver.isdigit() or int(ver) >= 2:
+            return
+        snake = lambda s: re.sub(r'(?<=[a-z])[A-Z]+', lambda m: '_' + m.group(0).lower(), s)
+        for e in root.iter():
+            if e.tag != 'default' and e.get('name') is not None:
+                e.set('name', snake(e.get('name')))
+        for b in root.iter('bsdf'):
+            if b.get('type') == 'diffuse':
+                for c in b:
+                    if c.get('name') == 'diffuse_reflectance':
+                        c.set('name', 'reflectance')
+
     def convert(self, root):
+        self.upgrade_from_v1(root)
         # <default name=.. value=..> substitution table
         for c in root:
             if c.tag == 'default':
@@ -594,7 +637,7 @@ class Converter:
             out.append(cam)
         if not self.cameras:
             out.append('# WARN: no sensor found; adding a default camera')
-            out.append('camera "cam" { eye 0 1 4  look_at 0 1 0  up 0 1 0  fov_y 45  mode B  film { res 512 512 } }')
+            out.append('camera "cam" { eye 0 1 4  look_at 0 1 0  up 0 1 0  fov_y 45  mode R  film { res 512 512 } }')
         return "\n".join(out) + "\n"
 
 def v3(a):

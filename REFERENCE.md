@@ -5929,15 +5929,19 @@ one-line "retired … ignoring" notice and do nothing.
 
 ```
 python tools/mitsuba_to_ftsl.py scene.xml scene.ftsl
-ftrace -in scene.ftsl -mode R -o out.png
+ftrace -in scene.ftsl -o out.png
 ```
 
-(Mode `D` renders an import too, unless it has a `constant` or `envmap` emitter: those
-become an environment light, which mode `D` refuses.)
+A `perspective` sensor becomes a mode `R` camera (backward path tracing, as Mitsuba
+renders) and a `thinlens` one a mode `A` camera with its aperture and focus. Leave
+`-mode` off, since it overrides every camera's mode. (Mode `D` refuses an import with a
+`constant`, `envmap` or `directional` emitter, which become environment and collimated
+lights.) A 0.6 scene's camelCase names (`toWorld`, `intIOR`, `diffuseReflectance`) are
+read the way Mitsuba's own parser upgrades them.
 
 Mitsuba is also a spectral, physically-based renderer, so most constructs map
-almost 1:1: the `perspective`/`thinlens` sensor → an FTSL `camera` (`thinlens`
-becomes mode `A` with aperture + focus), `diffuse`/`conductor`/`roughconductor`/
+almost 1:1: the `perspective`/`thinlens` sensor → an FTSL `camera`,
+`diffuse`/`conductor`/`roughconductor`/
 `dielectric`/`plastic` BSDFs → `diffuse`/`mirror`/`glossy`/`dielectric` materials,
 and `area`/`constant`/`envmap` emitters → FTSL lights. `rectangle`, `cube`,
 `sphere`, and `obj` shapes are supported (with full `to_world` transforms); RGB
@@ -5946,6 +5950,8 @@ pass through losslessly. A dielectric's `int_ior` may be a number or any of
 Mitsuba's named materials: `bk7`, `water`, `water ice`, `fused quartz`, `acrylic
 glass` and `diamond` become the matching dispersive `glass:`, and the rest (`pyrex`,
 `amber`, `pet`, `ethanol`, the gases, …) keep Mitsuba's own constant index.
+`ext_ior` is not carried over, since FTSL takes the index outside a dielectric from the
+dielectric enclosing it; one other than air is flagged, to model that medium instead.
 Constructs outside FTSL's scope (rough transmission, bump/normal maps,
 `.ply`/`.serialized` meshes, mesh area-emitters) degrade to a documented
 approximation and are flagged with `# WARN:` comments in the output.
