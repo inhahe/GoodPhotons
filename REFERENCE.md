@@ -5940,21 +5940,26 @@ lights.) A 0.6 scene's camelCase names (`toWorld`, `intIOR`, `diffuseReflectance
 read the way Mitsuba's own parser upgrades them.
 
 Mitsuba is also a spectral, physically-based renderer, so most constructs map
-almost 1:1: the `perspective`/`thinlens` sensor → an FTSL `camera`,
-`diffuse`/`conductor`/`roughconductor`/
-`dielectric`/`plastic` BSDFs → `diffuse`/`mirror`/`glossy`/`dielectric` materials,
-and `area`/`constant`/`envmap` emitters → FTSL lights. `rectangle`, `cube`,
-`sphere`, and `obj` shapes are supported (with full `to_world` transforms); RGB
-reflectances ride FTSL's Jakob–Hanika upsampling and measured/blackbody spectra
+almost 1:1: the `perspective`/`thinlens` sensor → an FTSL `camera`;
+`diffuse`/`conductor`/`roughconductor`/`dielectric`/`roughdielectric`/`plastic` BSDFs →
+`diffuse`/`mirror`/`glossy`/`dielectric` materials (a `roughdielectric`'s `alpha`
+becomes the dielectric's `roughness`), and a `thindielectric` → a `halfmirror`
+reflecting the sheet's normal-incidence reflectance; `area`/`constant`/`envmap`/
+`point`/`directional` emitters → FTSL lights. `rectangle`, `cube`, `sphere`, `obj` and
+`ply` shapes are supported with their `to_world` transforms (a mesh keeps translation
+and scale; a rotation is flagged), and an area emitter on any of them becomes a light:
+on a mesh, an emissive copy of its material, so it lights the scene as a mesh light.
+RGB reflectances ride FTSL's Jakob–Hanika upsampling and measured/blackbody spectra
 pass through losslessly. A dielectric's `int_ior` may be a number or any of
 Mitsuba's named materials: `bk7`, `water`, `water ice`, `fused quartz`, `acrylic
 glass` and `diamond` become the matching dispersive `glass:`, and the rest (`pyrex`,
 `amber`, `pet`, `ethanol`, the gases, …) keep Mitsuba's own constant index.
 `ext_ior` is not carried over, since FTSL takes the index outside a dielectric from the
 dielectric enclosing it; one other than air is flagged, to model that medium instead.
-Constructs outside FTSL's scope (rough transmission, bump/normal maps,
-`.ply`/`.serialized` meshes, mesh area-emitters) degrade to a documented
-approximation and are flagged with `# WARN:` comments in the output.
+What the converter does not translate (bump/normal maps, `.serialized` meshes, a
+dielectric's `specular_transmittance` tint, a conductor `material` FTSL has no `metal:`
+for, …) degrades to a documented approximation flagged with a `# WARN:` comment in the
+output.
 Since **Blender can export directly to Mitsuba XML** (via the `mitsuba-blender`
 add-on), this doubles as a Blender → FTSL path.
 

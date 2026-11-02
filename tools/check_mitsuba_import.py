@@ -19,6 +19,16 @@ Writes small Mitsuba scenes, converts each, and checks:
   - a diffuse BSDF's `diffuseReflectance` is read as its reflectance;
   - a `<default>` parameter keeps its camelCase name, so `$fovDeg` still substitutes.
 
+  BSDFs and emitters:
+  - roughdielectric's alpha becomes the dielectric's `roughness`, with a `# WARN:`;
+  - thindielectric becomes a `halfmirror` reflecting a sheet's 2R/(1+R) at normal incidence;
+  - a dielectric's specular_transmittance, a conductor's eta/k, and a conductor material FTSL
+    has no `metal:` for are each flagged; a known one (Au) is not;
+  - a cube area emitter becomes six `light area` faces, each facing out of the cube;
+  - a .ply mesh area emitter is loaded as a mesh under an emissive copy of its material, and
+    lights a scene alone, without the converter's fallback light;
+  - a .serialized mesh is skipped with a `# WARN:` rather than written for ftrace to fail on.
+
   Every scene: a perspective sensor becomes a `mode R` camera, and `ftrace -parseonly`, run
   from the repo root so it reads the same data/ the check does, loads the result with no
   unknown key and no unknown glass.
@@ -150,8 +160,63 @@ def scene_v06():
             + '\n</scene>\n')
 
 
+PLY = ('ply\nformat ascii 1.0\nelement vertex 3\nproperty float x\nproperty float y\n'
+       'property float z\nelement face 1\nproperty list uchar int vertex_indices\nend_header\n'
+       '0 0 0\n1 0 0\n0 1 0\n3 0 1 2\n')
+
+
+def scene_bsdfs(ply):
+    parts = [
+        sphere(0, '<bsdf type="roughdielectric" id="rough"><float name="alpha" value="0.3"/></bsdf>'),
+        sphere(1, '<bsdf type="thindielectric" id="thin"/>'),
+        sphere(2, '<bsdf type="dielectric" id="tinted"><rgb name="specular_transmittance" value="0.6, 0.8, 1"/></bsdf>'),
+        sphere(3, '<bsdf type="conductor" id="tungsten"><string name="material" value="W"/></bsdf>'),
+        sphere(4, '<bsdf type="conductor" id="gold"><string name="material" value="Au"/></bsdf>'),
+        sphere(5, '<bsdf type="conductor" id="etak"><rgb name="eta" value="0.2, 0.9, 1.1"/>'
+                  '<rgb name="k" value="3.9, 2.4, 2.2"/></bsdf>'),
+        '  <shape type="cube"><transform name="to_world"><scale value="0.5"/><translate x="5" y="2" z="1"/></transform>'
+        '<emitter type="area"><rgb name="radiance" value="1, 1, 1"/></emitter></shape>',
+        f'  <shape type="ply"><string name="filename" value="{ply}"/>'
+        '<emitter type="area"><rgb name="radiance" value="1, 0.5, 0.2"/></emitter></shape>',
+        '  <shape type="serialized"><string name="filename" value="missing.serialized"/></shape>',
+    ]
+    return '<scene version="3.0.0">\n' + SENSOR + '\n'.join(parts) + '\n</scene>\n'
+
+
+def scene_meshlight(ply):
+    """Lit by nothing but an emissive mesh."""
+    return ('<scene version="3.0.0">\n' + SENSOR.split('  <emitter')[0]
+            + sphere(0, '<bsdf type="diffuse" id="floor"/>') + '\n'
+            + f'  <shape type="ply"><string name="filename" value="{ply}"/>'
+            '<emitter type="area"><rgb name="radiance" value="1, 1, 1"/></emitter></shape>\n</scene>\n')
+
+
+def check_cube_lights(out, fails):
+    """Six `light area` faces whose u x v points away from the cube's centre (5, 2, 1)."""
+    faces = re.findall(r'^light area \{ origin (\S+ \S+ \S+)  u (\S+ \S+ \S+)  v (\S+ \S+ \S+)  spd', out, re.M)
+    faces = [[[float(x) for x in g.split()] for g in f] for f in faces]
+    cube = [f for f in faces if abs(f[0][0] - 5) <= 0.5 + 1e-9]
+    if len(cube) != 6:
+        fails.append(f"cube emitter: {len(cube)} light area faces, not 6")
+        return
+    inward = 0
+    for o, u, v in cube:
+        n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]]
+        mid = [o[i] + 0.5 * (u[i] + v[i]) for i in range(3)]
+        if sum(n[i] * (mid[i] - (5, 2, 1)[i]) for i in range(3)) <= 0:
+            fails.append(f"cube emitter: face at {mid} faces into the cube")
+            inward += 1
+    if not inward:
+        print("  ok  cube emitter        six light area faces, all facing out")
+
+
+def warned(out, text):
+    return any(line.startswith('# WARN:') and text in line for line in out.splitlines())
+
+
 def convert(a, name, xml_text, fails):
-    """Write `xml_text`, convert it, check it loads; return the FTSL text or None."""
+    """Write `xml_text`, convert it, check it loads; return (FTSL text, ftrace's -parseonly
+    log), or (None, '') when the converter fails."""
     xml = os.path.join(a.out, name + '.xml')
     ftsl = os.path.join(a.out, name + '.ftsl')
     with open(xml, 'w', encoding='utf-8', newline='') as f:
@@ -160,7 +225,7 @@ def convert(a, name, xml_text, fails):
                        capture_output=True, text=True, encoding='utf-8')
     if r.returncode != 0:
         fails.append(f"{name}: the converter exited {r.returncode}: {(r.stdout + r.stderr).strip()}")
-        return None
+        return None, ''
     with open(ftsl, encoding='utf-8') as f:
         out = f.read()
     r = subprocess.run([a.exe, ftsl, '-parseonly'], capture_output=True, text=True,
@@ -173,7 +238,7 @@ def convert(a, name, xml_text, fails):
             fails.append(f"{name}: ftrace: {line.strip()}")
     if not re.search(r'^\s*mode R\s*$', out, re.M):
         fails.append(f"{name}: the perspective sensor did not become a mode R camera")
-    return out
+    return out, log
 
 
 def materials(out):
@@ -190,7 +255,7 @@ def main():
     fails = []
     glasses = glass_files()
 
-    out = convert(a, 'iors', scene_v3(), fails)
+    out, _ = convert(a, 'iors', scene_v3(), fails)
     if out is not None:
         mats = materials(out)
         diel = {k: v[len('dielectric'):].strip() for k, v in mats.items() if v.startswith('dielectric')}
@@ -223,7 +288,7 @@ def main():
         if "'ext_air': ext_ior" in out:
             fails.append("ext_ior air (Mitsuba's default) was warned about")
 
-    out = convert(a, 'v06', scene_v06(), fails)
+    out, _ = convert(a, 'v06', scene_v06(), fails)
     if out is not None:
         mats = materials(out)
         for bid, want in (('v06_named', 'dielectric  ior glass:water'),
@@ -237,6 +302,50 @@ def main():
             fails.append("0.6: toWorld did not place the sensor at (3, 1, 6)")
         if not re.search(r'^\s*fov_y 40\s*$', out, re.M):
             fails.append("0.6: $fovDeg did not substitute into the sensor's fov")
+
+    ply = os.path.join(a.out, 'tri.ply').replace(os.sep, '/')
+    with open(ply, 'w', encoding='ascii', newline='') as f:
+        f.write(PLY)
+    out, _ = convert(a, 'bsdfs', scene_bsdfs(ply), fails)
+    if out is not None:
+        mats = materials(out)
+        eta = MITSUBA_IOR['bk7'] / MITSUBA_IOR['air']
+        r0 = ((eta - 1) / (eta + 1)) ** 2
+        want_thin = 2 * r0 / (1 + r0)
+        thin = re.fullmatch(r'halfmirror\s+reflect (\S+)', mats.get('thin', ''))
+        expect = [
+            (mats.get('rough') == 'dielectric  ior glass:BK7  roughness 0.3' and warned(out, "'rough': alpha 0.3"),
+             f"roughdielectric alpha 0.3 came out as {mats.get('rough')!r}"),
+            (bool(thin) and abs(float(thin.group(1)) - want_thin) < 1e-5,
+             f"thindielectric came out as {mats.get('thin')!r}, not halfmirror reflect {want_thin:.6f}"),
+            (warned(out, "'tinted': specular_transmittance dropped"),
+             "dielectric specular_transmittance left no # WARN"),
+            (mats.get('tungsten') == 'mirror  reflect 0.9' and warned(out, "conductor material 'w'"),
+             f"conductor W came out as {mats.get('tungsten')!r} or left no # WARN"),
+            (mats.get('gold') == 'mirror  reflect metal:Au' and not warned(out, "material 'au'"),
+             f"conductor Au came out as {mats.get('gold')!r} or was warned about"),
+            (warned(out, "'etak': eta/k dropped"), "conductor eta/k left no # WARN"),
+            (mats.get('_default_emit') == 'diffuse  reflect 0.7  emit rgb 1 0.5 0.2'
+             and re.search(rf'^mesh {{ file "{re.escape(ply)}"  material _default_emit\b', out, re.M),
+             f"ply emitter: material {mats.get('_default_emit')!r}, or no mesh line bound to it"),
+            (warned(out, "missing.serialized") and 'file "missing.serialized"' not in out,
+             "a .serialized mesh was written out or left no # WARN"),
+        ]
+        for ok, msg in expect:
+            if not ok:
+                fails.append(msg)
+        print(f"  ok  bsdfs/emitters      {sum(bool(ok) for ok, _ in expect)} of {len(expect)}")
+        check_cube_lights(out, fails)
+
+    out, log = convert(a, 'meshlight', scene_meshlight(ply), fails)
+    if out is not None:
+        if warned(out, 'no lights found'):
+            fails.append("a scene lit only by an emissive mesh got the fallback light")
+        m = re.search(r'(\d+) emitters', log)
+        if not m or int(m.group(1)) < 1:
+            fails.append(f"ftrace loads the emissive-mesh scene with no emitter: {log.strip()}")
+        else:
+            print(f"  ok  emissive mesh       lights the scene alone ({m.group(1)} emitter)")
 
     for f_ in fails:
         print('FAIL:', f_)
