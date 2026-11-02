@@ -81,11 +81,14 @@ name that matches no preset likewise errors; only the built-in default resolves.
 ## Present data
 
 ### `glass/*.glass` — dispersion coefficients
-BK7 (`crown`), SF10 (`flint`), fused-silica (`silica`/`quartz`), sapphire, diamond,
-water, ice, acrylic (`pmma`), polycarbonate (`pc`). Schott catalog & Malitson/Peter
-Sellmeier fits for the crystalline glasses; two-term Cauchy fits for the weakly-
-dispersive materials (water/ice/plastics). Verified `n_d`: BK7 1.5168, SF10 1.7283,
-water 1.333.
+BK7 (`crown`), SF10 (`flint`), crystal (Schott F2: `lead-crystal`/`F2`/`leadglass`),
+LLF1 (`tableware-crystal`), fused-silica (`silica`/`quartz`), sapphire, diamond,
+water, ice, acrylic (`pmma`), polycarbonate (`pc`), xenon (`Xe`, gas at STP),
+xenon-lamp (`xenon-arc`/`xenon-operating`, a running lamp's fill). Schott catalog &
+Malitson/Peter Sellmeier fits for the crystalline glasses; two-term Cauchy fits for the
+weakly-dispersive materials (water/ice/plastics); constants for the xenon gas, whose
+dispersion is negligible. Verified `n_d`: BK7 1.5168, LLF1 1.5481, crystal 1.6200,
+SF10 1.7283, water 1.333.
 
 ### `metal/*.csv` — normal-incidence reflectance R(λ)
 Au (`gold`), Ag (`silver`), Cu (`copper`), Al (`aluminium`/`aluminum`), Cr

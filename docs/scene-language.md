@@ -157,9 +157,11 @@ lowercased stem matches, plus any `# aliases:` the file declares — so dropping
 file into a category directory adds a preset with **no rebuild**. See `data/README.md`.
 
 **`glass:<name>` dispersion curves** (refractive index vs λ, `data/glass/*.glass`
-dispersion coefficients): `BK7`/`crown`, `SF10`/`flint`, `silica`/`fused-silica`/`quartz`,
-`sapphire`, `diamond`, `water`, `ice`, `acrylic`/`pmma`, `polycarbonate`/`pc`. Sellmeier
-for the glasses/crystals, Cauchy fits for water/ice/plastics.
+dispersion coefficients): `BK7`/`crown`, `SF10`/`flint`, `crystal`/`lead-crystal`/`F2`
+(dense lead crystal), `tableware-crystal`/`LLF1` (glassware lead crystal),
+`silica`/`fused-silica`/`quartz`, `sapphire`, `diamond`, `water`, `ice`, `acrylic`/`pmma`,
+`polycarbonate`/`pc`, `xenon`/`Xe`, `xenon-lamp`. Sellmeier for the glasses/crystals,
+Cauchy fits for water/ice/plastics, a constant for the xenon gas fills.
 
 **`metal:<name>` reflectances** (normal-incidence R(λ) from measured complex index,
 `data/metal/*.csv`): `Au`/`gold`, `Ag`/`silver`, `Cu`/`copper`, `Al`/`aluminium`,
@@ -323,7 +325,7 @@ material "film"   { preset soap-bubble  film_thickness 300 }
 | Preset name(s) | Expands to | Notes |
 |---|---|---|
 | `gold`, `silver`, `copper`, `aluminium`/`aluminum`, `chrome`, `brass` | `glossy` + `metal:<name>` reflectance, `roughness 0.05` | measured normal-incidence reflectance; **specular — reflects its surroundings, so it needs an environment/other geometry to look right (near-black in an empty pinhole box; use mode A or an env light)** |
-| `glass`, `crown`, `flint`, `water`, `diamond`, `sapphire`, `silica`/`fused-silica`/`quartz`, `acrylic`/`pmma`, `polycarbonate`/`pc`, `ice` | `dielectric` + `glass:<name>` IOR | real dispersion (Sellmeier/Cauchy); `glass` = BK7 crown |
+| `glass`, `crown`, `flint`, `crystal`, `tableware-crystal`, `water`, `diamond`, `sapphire`, `silica`/`fused-silica`/`quartz`, `acrylic`/`pmma`, `polycarbonate`/`pc`, `ice` | `dielectric` + `glass:<name>` IOR | real dispersion (Sellmeier/Cauchy); `glass` = BK7 crown; `crystal` = dense F2, `tableware-crystal` = glassware LLF1 |
 | `soap-bubble`/`bubble` | `thinfilm`, 1.33 film / 380 nm, transparent | classic reflected-only interference film |
 | `oil-slick`/`oil` | `thinfilm`, 1.47 film / 320 nm, absorbing substrate | opaque oil-on-asphalt sheen |
 | `anodized-ti`/`anodized-titanium` | `thinfilm`, TiO₂ 2.30 / 250 nm on Ti | anodised-metal structural colour |
