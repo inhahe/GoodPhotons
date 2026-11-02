@@ -9936,10 +9936,15 @@ holds a film over an absorbing substrate to the Airy form and a thick absorbing 
 metal; its old range test could not see the bug, the result being clamped. The `beetle` and
 `morpho` presets, both on absorbing backings, changed colour; `nacre` (lossless) did not.
 
-A bundle may now carry a `roughness` for a thin film or stack (`materials.h roughenCoating`, which
-the scene language's `roughenInterference` also calls), so a preset can be a rough interference
-reflector by default: `chameleon`, Cr / MgF2 / Al flakes. A scene's `roughness 0` turns such a
-preset back into the specular coating.
+A bundle may now carry a `roughness` for a thin film or stack, so a preset can be a rough
+interference reflector by default: `chameleon`, Cr / MgF2 / Al flakes. The bundle loader does not
+convert anything; it reports what the bundle set (`materials.h PresetNotes`: a roughness, a
+reflect), and the scene loader's `roughenInterference` converts once, with the scene's overrides
+applied, so a scene's `roughness 0` simply leaves the specular stack and a clear coating with a
+bundle roughness gets the same "needs an opaque film" error as one written in a scene.
+`coatingIndicesOk` holds every coating's indices physical, whoever set them: a film index above 0
+at every wavelength, each layer's n above 0 and k not below 0 (a negative k is gain in the Abeles
+convention).
 
 ## A dispersive film index, and titania (0.402.0)
 

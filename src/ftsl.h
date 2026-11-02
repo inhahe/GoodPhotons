@@ -2529,8 +2529,10 @@ private:
             return true;
         };
         // Stop selector: `channel[i]`.
-        size_t lb = rest.find('[');
-        if (lb != std::string::npos) {
+        const std::string chanName = recordRefChannel(rest);
+        const char form = chanName.size() < rest.size() ? rest[chanName.size()] : '\0';  // '[', '(', none
+        const size_t lb = chanName.size();
+        if (form == '[') {
             size_t rb = rest.rfind(']');
             std::string idxs = (rb != std::string::npos && rb > lb) ? rest.substr(lb + 1, rb - lb - 1) : "";
             if (idxs.empty() || !isNumber(idxs)) { fail("record ref '" + tok + "': bad stop selector"); return true; }
@@ -2545,8 +2547,8 @@ private:
             return true;
         }
         // Sample form: `channel(c)` with a constant driver c.
-        size_t lp = rest.find('(');
-        if (lp != std::string::npos) {
+        const size_t lp = chanName.size();
+        if (form == '(') {
             size_t rp = rest.rfind(')');
             if (rp == std::string::npos || rp <= lp) { fail("record ref '" + tok + "': malformed `channel(constant)`"); return true; }
             std::string cexpr = rest.substr(lp + 1, rp - lp - 1);
@@ -2595,8 +2597,10 @@ private:
         };
         auto stopIsConst = [&](const RecStop& st) { return !patternHasFreeVars(st.expr); };
         // Stop selector: `channel[i]`.
-        size_t lb = rest.find('[');
-        if (lb != std::string::npos) {
+        const std::string chanName = recordRefChannel(rest);
+        const char form = chanName.size() < rest.size() ? rest[chanName.size()] : '\0';  // '[', '(', none
+        const size_t lb = chanName.size();
+        if (form == '[') {
             size_t rb = rest.rfind(']');
             std::string idxs = (rb != std::string::npos && rb > lb) ? rest.substr(lb + 1, rb - lb - 1) : "";
             if (idxs.empty() || !isNumber(idxs)) { fail("record ref '" + tok + "': bad stop selector"); return true; }
@@ -2617,8 +2621,8 @@ private:
             return true;
         }
         // Sample form: `channel(c)` with a constant driver c.
-        size_t lp = rest.find('(');
-        if (lp != std::string::npos) {
+        const size_t lp = chanName.size();
+        if (form == '(') {
             size_t rp = rest.rfind(')');
             if (rp == std::string::npos || rp <= lp) { fail("record ref '" + tok + "': malformed `channel(constant)`"); return true; }
             std::string cexpr = rest.substr(lp + 1, rp - lp - 1);
@@ -2969,30 +2973,41 @@ private:
     // scalar channel, another material's scalar property) is taken too, as a constant index -- a
     // film's index is often authored as one number -- which spectrumParam alone would refuse. The
     // index must be positive at every wavelength (the Airy film needs n1 > 0), else a load error.
-    Spectrum filmIorParam(const Block& b, Spectrum dflt) {
+    // `b`: the block holding `film_ior` (a material's, or its `coat { }`); `name`: the material.
+    Spectrum filmIorParam(const Block& b, const std::string& name, Spectrum dflt) {
         const Stmt* s = find(b, "film_ior");
         if (!s) return dflt;
-        Spectrum out = dflt;
+        Spectrum out;
         bool done = false;
         if (s->val.words.size() == 1) {
             const std::string& w = s->val.words[0];
             const size_t dot = w.find('.');
             if (dot != std::string::npos && !isNumber(w)) {
-                const std::string head = w.substr(0, dot);
-                bool scalar = false;
-                if (auto rit = recordIndex_.find(head);
+                if (auto rit = recordIndex_.find(w.substr(0, dot));
                     rit != recordIndex_.end() && records_ && rit->second < (int)records_->size()) {
                     const Record& rec = (*records_)[rit->second];
                     const int ci = rec.channelIndex(recordRefChannel(w.substr(dot + 1)));
-                    scalar = ci >= 0 && rec.channels[ci].kind == ChanKind::Scalar;
+                    if (ci >= 0 && rec.channels[ci].kind == ChanKind::Scalar) {
+                        double v = 0.0;
+                        recordConstScalarRef(w, v);              // fills v, or sets fail()
+                        out = constantSpectrum(v);
+                        done = true;
+                    }
                 } else {
                     MatProp mp;
                     if (materialPropRef(w, mp)) {
                         if (!mp.ok) return dflt;                 // fail() already set
-                        scalar = !mp.spectral;
+                        if (!mp.spectral) {
+                            if (mp.pat >= 0) {
+                                fail("material '" + name + "': `film_ior " + w + "`: '" + mp.slot +
+                                     "' carries a per-hit pattern, which a film index cannot apply");
+                                return dflt;
+                            }
+                            out = constantSpectrum(mp.scalar);
+                            done = true;
+                        }
                     }
                 }
-                if (scalar) { out = constantSpectrum(dblParam(b, "film_ior", 1.30)); done = true; }
             }
         }
         if (!done) out = spectrumParam(b, "film_ior", dflt);
@@ -3000,23 +3015,26 @@ private:
         for (double L = LAMBDA_MIN; L <= LAMBDA_MAX; L += 5.0) {
             const double n = out(L);
             if (!(n > 0.0)) {
-                fail("material '" + b.name + "': `film_ior` must be positive at every wavelength, and is " +
+                fail("material '" + name + "': `film_ior` must be positive at every wavelength, and is " +
                      std::to_string(n) + " at " + std::to_string((int)L) + " nm");
                 return dflt;
             }
             if (n < lowest) { lowest = n; lowestAt = L; }
         }
-        // Below the air outside it a film totally reflects inside itself, which thinFilmReflectance
-        // takes as a perfect mirror: legal, and almost never what an index under 1 was meant as.
+        // A film of lower index than the air outside it totally reflects light meeting it beyond
+        // the critical angle, asin(n), which thinFilmReflectance returns as R = 1: legal, and
+        // seldom what an index under 1 was meant to be.
         if (lowest < 1.0)
             std::fprintf(stderr, "[ftsl] warning: material '%s': `film_ior` falls to %.3f at %d nm, "
-                         "below air's 1, where the film reflects everything\n",
-                         b.name.c_str(), lowest, (int)lowestAt);
+                         "below air's 1: light meeting the film more than %.0f degrees from its "
+                         "normal is reflected entirely\n", name.c_str(), lowest, (int)lowestAt,
+                         std::asin(lowest) * 180.0 / 3.14159265358979323846);
         return out;
     }
 
     // The channel a record reference's tail names -- `channel[i]`, `channel(c)` or `channel` --
-    // read as recordConstScalarRef and recordConstSpectrumRef read it: a stop selector first.
+    // a stop selector taking precedence. recordConstScalarRef, recordConstSpectrumRef and
+    // filmIorParam all read the channel through this.
     static std::string recordRefChannel(const std::string& rest) {
         const size_t lb = rest.find('[');
         if (lb != std::string::npos) return rest.substr(0, lb);
@@ -3055,8 +3073,8 @@ private:
             MatProp mp;
             if (materialPropRef(w0, mp)) {
                 if (!mp.ok) return dflt;                             // fail() already set
-                // A film's index is spectral, but one authored as a number reads as that number
-                // at a scalar slot, as every film index could before it could be dispersive.
+                // A film's index is spectral, but a constant one reads as its number at a scalar
+                // slot; a dispersive one has no single number to give.
                 if (mp.spectral && mp.slot == "film_ior") {
                     const double v = mp.spec(550.0);
                     bool flat = true;
@@ -4897,20 +4915,22 @@ private:
                      "' — the measured species are " + known);
                 return m;
             }
-            if (!resolveMaterialPreset(pname, m)) { fail("unknown material preset '" + pname + "'"); return m; }
+            PresetNotes notes;
+            if (!resolveMaterialPreset(pname, m, &notes)) { fail("unknown material preset '" + pname + "'"); return m; }
             if (find(b, "roughness")) {
                 if (!bindScalarPattern(b, "roughness", m.roughnessPat) &&
                     !bindScalarTexture(b, "roughness", m.roughnessTex))
                     m.roughness = dblParam(b, "roughness", m.roughness);
             }
-            if (find(b, "film_ior"))       m.filmIor       = filmIorParam(b, m.filmIor);
+            if (find(b, "film_ior"))       m.filmIor       = filmIorParam(b, b.name, m.filmIor);
             if (find(b, "film_thickness")) m.filmThickness = dblParam(b, "film_thickness", m.filmThickness);
             if (!bindScalarPattern(b, "film_thickness_map", m.filmThicknessPat))
                 bindScalarTexture(b, "film_thickness_map", m.filmThicknessTex);
             if (find(b, "reflect") || find(b, "reflect_map"))
                 m.reflect = reflectParam(b, m, m.reflect);
             if (find(b, "ior"))            m.ior           = spectrumParam(b, "ior", m.ior);
-            if (!roughenInterference(b, m, /*parse=*/false)) return m;
+            if (!coatingIndicesOk(b.name, m)) return m;
+            if (!roughenInterference(b, m, /*parse=*/false, &notes)) return m;
             checkSlotPatsSupported(b, m);
             return m;
         }
@@ -4979,7 +4999,7 @@ private:
         } else if (type == "thinfilm") {
             m.type = MatType::ThinFilm;
             m.ior = spectrumParam(b, "ior", iorConstant(1.5));
-            m.filmIor = filmIorParam(b, constantSpectrum(1.30));
+            m.filmIor = filmIorParam(b, b.name, constantSpectrum(1.30));
             // `film_thickness <nm>` is the peak/scale; `film_thickness_map texture:<n>`
             // binds a 0..1 profile scaled by it (spatially-varying iridescence, §9.4).
             m.filmThickness = dblParam(b, "film_thickness", 300.0);
@@ -5098,6 +5118,7 @@ private:
                 m.layerThick.push_back(num(s.val.words[2]));
             }
             if (m.layerN.empty()) { fail("multilayer material has no 'layer' entries"); return m; }
+            if (!coatingIndicesOk(b.name, m)) return m;
         } else if (type == "mix") {
             // Stochastic mix of named child materials. Children are resolved to
             // indices in a second pass (they may be declared later in the file);
@@ -5141,7 +5162,7 @@ private:
             // Fresnel/thinfilm read the coat index from `ior` (coat over body index
             // m.ior); manual uses a flat specular fraction.
             if (find(cb, "ior")) m.ior = spectrumParam(cb, "ior", m.ior);
-            m.filmIor = filmIorParam(cb, constantSpectrum(1.30));
+            m.filmIor = filmIorParam(cb, b.name, constantSpectrum(1.30));
             m.filmThickness = dblOf(cb, "film_thickness", 300.0);
             bindScalarTexture(cb, "film_thickness_map", m.filmThicknessTex);
             if (m.coatModel == 2) m.coatSpecular = dblOf(cb, "specular", 0.05);
@@ -5213,17 +5234,12 @@ private:
     // no rough form here (its transmitted lobe would need one too), so that is refused; roughness
     // 0 leaves the specular coating as it was, clear or not. `parse`: read `roughness` and
     // `reflect` here, for an explicit `type`; a preset's overrides have read both already. False
-    // after a reported failure.
-    bool roughenInterference(const Block& b, Material& m, bool parse) {
-        // A preset that is rough already (its bundle set a roughness), given `roughness 0`: back
-        // to the specular coating, as `roughness 0` means on any coating.
-        if (!parse && m.iridescence && find(b, "roughness") && m.roughnessPat < 0 &&
-            m.roughnessTex < 0 && !(m.roughness > 0.0)) {
-            m.type = (m.iridescence == 1) ? MatType::ThinFilm : MatType::Multilayer;
-            m.iridescence = 0;
-            return true;
-        }
-        if ((m.type != MatType::ThinFilm && m.type != MatType::Multilayer) || !find(b, "roughness"))
+    // after a reported failure. `notes` (a preset's): whether its bundle set a roughness, which
+    // counts as the scene's, and a reflect.
+    bool roughenInterference(const Block& b, Material& m, bool parse,
+                             const PresetNotes* notes = nullptr) {
+        const bool rough = find(b, "roughness") || (notes && notes->roughness);
+        if ((m.type != MatType::ThinFilm && m.type != MatType::Multilayer) || !rough)
             return true;
         if (parse) {
             if (bindScalarPattern(b, "roughness", m.roughnessPat)) m.roughness = 0.2;
@@ -5231,21 +5247,47 @@ private:
             else m.roughness = dblParam(b, "roughness", 0.0);
         }
         if (m.roughnessPat < 0 && m.roughnessTex < 0 && !(m.roughness > 0.0)) return true;
-        const bool film = m.type == MatType::ThinFilm;
-        double clearAt;
-        if (!roughenCoating(m, clearAt)) {
-            fail("material '" + b.name + "': `roughness` needs an opaque " +
-                 (film ? "thin film" : "multilayer") +
-                 " -- an absorbing substrate (`substrate_k` > 0) or an absorbing layer -- "
-                 "and this one lets light through near " + std::to_string((int)clearAt) +
-                 " nm; a transparent coating has no rough form");
-            return false;
-        }
-        // `reflect` tints the lobe, white unless authored. A preset's overrides have parsed it
-        // already, and parsing it twice would compose a referenced pattern into reflectPat twice.
-        if (!find(b, "reflect") && !find(b, "reflect_map")) m.reflect = constantSpectrum(1.0);
-        else if (parse) m.reflect = reflectParam(b, m, constantSpectrum(1.0));
-        else if (!find(b, "reflect")) m.reflect = constantSpectrum(1.0);   // keep the map's pattern
+        for (double L = LAMBDA_MIN; L <= LAMBDA_MAX; L += 5.0)
+            if (!m.coatOpaque(L)) {
+                fail("material '" + b.name + "': `roughness` needs an opaque " +
+                     (m.type == MatType::ThinFilm ? "thin film" : "multilayer") +
+                     " -- an absorbing substrate (`substrate_k` > 0) or an absorbing layer -- "
+                     "and this one lets light through near " + std::to_string((int)L) +
+                     " nm; a transparent coating has no rough form");
+                return false;
+            }
+        m.iridescence = (m.type == MatType::ThinFilm) ? 1 : 2;
+        m.type = MatType::Glossy;
+        // `reflect` tints the lobe, white unless authored. A preset's overrides have parsed the
+        // scene's already, and parsing it twice would compose a referenced pattern into reflectPat
+        // twice; with no `reflect` from the scene or the bundle, the base is white (a
+        // `reflect_map`'s pattern stays).
+        if (parse) m.reflect = reflectParam(b, m, constantSpectrum(1.0));
+        else if (!find(b, "reflect") && !(notes && notes->reflect)) m.reflect = constantSpectrum(1.0);
+        return true;
+    }
+
+    // A coating's indices must be physical: a thin film's index above 0 at every wavelength (the
+    // Airy film divides by it), each stack layer's n above 0 and k not below 0 (a negative k is
+    // gain in the Abeles matrix's convention). Checked whatever set them: a scene, a bundle, a
+    // misread number. `name`: the material, for the message. False after a reported failure.
+    bool coatingIndicesOk(const std::string& name, const Material& m) {
+        if (m.type == MatType::ThinFilm)
+            for (double L = LAMBDA_MIN; L <= LAMBDA_MAX; L += 5.0)
+                if (!(m.filmIor(L) > 0.0)) {
+                    fail("material '" + name + "': the film index must be positive at every "
+                         "wavelength, and is " + std::to_string(m.filmIor(L)) + " at " +
+                         std::to_string((int)L) + " nm");
+                    return false;
+                }
+        if (m.type == MatType::Multilayer)
+            for (size_t j = 0; j < m.layerN.size(); ++j)
+                if (!(m.layerN[j] > 0.0) || !(m.layerK[j] >= 0.0)) {
+                    fail("material '" + name + "': layer " + std::to_string(j) + " has n " +
+                         std::to_string(m.layerN[j]) + " and k " + std::to_string(m.layerK[j]) +
+                         "; a layer needs n > 0 and k >= 0");
+                    return false;
+                }
         return true;
     }
 

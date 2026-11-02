@@ -114,10 +114,10 @@ inline double thinFilmReflectance(double n0, double n1, double n2, double k2,
 //
 // The matrix above, with +i off its diagonal, belongs to the convention in which an absorbing
 // medium's index is n - ik (Macleod's), so kL and ks enter with that sign and each admittance
-// takes the root with Im(q) <= 0, the one whose field decays. With n + ik instead (Airy's
-// convention, thinFilmReflectance's) an absorbing layer amplifies: a thick chromium layer gave R
-// far above 1, clamped to 1, where it must tend to bulk chromium. A lossless stack reads the same
-// either way (every imaginary part is zero).
+// takes the root with Im(q) <= 0, the one whose field decays. Fed n + ik instead (Airy's
+// convention, thinFilmReflectance's), an absorbing layer would amplify and an absorbing
+// substrate's reflection would take a conjugated phase. A lossless stack reads the same either
+// way (every imaginary part is zero).
 inline double multilayerReflectance(double n0, double cosI, double lambda,
                                     const double* nL, const double* kL,
                                     const double* dL, int nLayers,

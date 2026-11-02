@@ -4,8 +4,10 @@ reflector renders the same in every mode.
     D:/python314/python.exe -u tools/check_rough_irid.py [--out <dir>] [--exe ftrace.exe]
                                                           [--no-gpu] [--only B_cpu,D_gpu,...]
 
-A box lit by a ceiling panel holds three spheres: a plain rough `glossy`, a rough beetle stack (a
-`multilayer` given a `roughness`) and a rough anodized-titanium film (a `thinfilm` given one) --
+A box lit by a ceiling panel holds four spheres: a plain rough `glossy`, a rough beetle stack (a
+`multilayer` given a `roughness`, over an absorbing substrate), a rough anodized-titanium film (a
+`thinfilm` given one) and `preset chameleon` (a stack with an absorbing layer, rough by its own
+bundle) --
 the rough interference reflectors of 0.401.0, glossy lobes weighted by the coating's reflectance at
 the half-vector (Material::iridescence). Each sphere's mean colour, over the pixels that see it
 first (an analytic ray cast of the camera, eroded from the rim), is held per channel against
@@ -17,7 +19,9 @@ at the camera's wavelength, which washes any coloured glossy (known-issues VCM-S
 its walk is mode D's, and its surface merges on these small curved glossy spheres are too noisy to
 resolve a bias at a check's budget (at 1102 spp its sphere means still scattered by 5-12 %, the CPU
 and GPU in opposite directions). A sphere channel fails when it differs from the reference by more
-than 5 standard errors (two seeds each) AND by more than 3 %.
+than 5 standard errors (two seeds each) AND by more than 3 % -- of the channel, or of a tenth of
+the sphere's total where the channel is smaller (the chameleon's saturated colour leaves a linear
+sRGB channel near zero, even below it).
 
 Mode A renders the same box through a 1 mm thin lens focused on the spheres. It records film
 irradiance, not radiance: the camera equation scales it, and natural vignetting (cos^4 of the
@@ -49,7 +53,7 @@ W, H = 128, 96
 EYE, LOOK, FOV = (0.0, 1.2, 4.0), (0.0, 0.6, 0.0), 45.0
 STACK = "  ".join(["layer 1.75 0 85.7  layer 1.35 0 111.1"] * 6)
 SPHERES = [("glossy", (-1.0, 0.4, -0.5), 0.4), ("beetle", (0.0, 0.4, 0.0), 0.4),
-           ("titanium", (1.0, 0.4, -0.5), 0.4)]
+           ("titanium", (1.0, 0.4, -0.5), 0.4), ("chameleon", (0.6, 0.25, 0.8), 0.25)]
 SCENE = NL.join([
     "scene { units meters }",
     'material "white" { type diffuse reflect 0.7 }',
@@ -59,6 +63,7 @@ SCENE = NL.join([
     'material "beetle" { type multilayer  ior 1.6  substrate_k 0.4  %s  roughness 0.2 }' % STACK,
     'material "titanium" { type thinfilm  ior 2.5  substrate_k 3.0  film_ior 2.30'
     '  film_thickness 85  roughness 0.15 }',
+    'material "chameleon" { preset chameleon }',
 ] + ["sphere { center %g %g %g  radius %g  material %s }" % (c + (r, n)) for n, c, r in SPHERES] + [
     "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }",
     "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material white }",
@@ -168,6 +173,14 @@ def render(exe, out, scene, tag, args, seeds=(1, 2)):
     return imgs
 
 
+def deviation(m1, m0):
+    """Each channel's m1 against the reference m0, as 1 + the difference over a scale: the channel
+    itself, but at least a tenth of the region's total. A saturated colour can put a linear sRGB
+    channel near zero or below it (out of gamut), where a plain ratio means nothing."""
+    scale = np.maximum(np.abs(m0), 0.1 * np.abs(m0).sum())
+    return 1.0 + (m1 - m0) / np.maximum(scale, 1e-30)
+
+
 def stats(imgs, m):
     """The mean colour over mask `m` of the seeds' average, and its standard error per channel:
     the larger of the estimate from the seed means and the per-pixel one."""
@@ -209,7 +222,7 @@ def main():
         args = ["-mode", "B", "-n", "60000000"]
         mc = stats(render(exe, out, coat, "coat_B_cpu", args + ["-device", "cpu"]), m)
         mg = stats(render(exe, out, coat, "coat_B_gpu", args + ["-device", "gpu"]), m)
-        ratio = mg[0] / np.maximum(mc[0], 1e-30)
+        ratio = deviation(mg[0], mc[0])
         z = np.abs(mg[0] - mc[0]) / np.maximum(np.hypot(mg[1], mc[1]), 1e-30)
         bad = (z > 5.0) & (np.abs(ratio - 1.0) > 0.03)
         ok &= not bad.any()
@@ -243,7 +256,7 @@ def main():
             if rescale and name == "rest":
                 continue           # matched by construction
             m1, e1 = stats(imgs, m)
-            ratio = m1 / np.maximum(m0, 1e-30)
+            ratio = deviation(m1, m0)
             z = np.abs(m1 - m0) / np.maximum(np.hypot(e1, e0), 1e-30)
             bad = (z > 5.0) & (np.abs(ratio - 1.0) > 0.03)
             ok &= not bad.any()

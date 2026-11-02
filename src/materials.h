@@ -38,18 +38,10 @@ inline bool parseMatType(const std::string& t, MatType& out) {
     return true;
 }
 
-// A thin film or stack as a rough interference reflector (Material::iridescence): a Glossy whose
-// lobe the coating's reflectance weights at the microfacet angle (render.h iridescenceR). Only an
-// opaque coating has that form (Material::coatOpaque, sampled every 5 nm; a clear one would need a
-// rough transmitted lobe too). Returns false, leaving `m` as it was and the first wavelength the
-// coating lets light through at in `clearAt`, when it is not opaque.
-inline bool roughenCoating(Material& m, double& clearAt) {
-    for (double L = LAMBDA_MIN; L <= LAMBDA_MAX; L += 5.0)
-        if (!m.coatOpaque(L)) { clearAt = L; return false; }
-    m.iridescence = (m.type == MatType::ThinFilm) ? 1 : 2;
-    m.type = MatType::Glossy;
-    return true;
-}
+// What a bundle said about itself that the Material alone does not record: whether it set a
+// `roughness` and a `reflect`. ftsl.h roughenInterference needs both to make a rough interference
+// reflector of a thin-film or multilayer preset, as it does of a scene's own coating.
+struct PresetNotes { bool roughness = false, reflect = false; };
 
 // --- Whole-material recipe bundles ------------------------------------------
 // Interpret a data/material/<name>.material manifest into a complete Material. A
@@ -59,12 +51,13 @@ inline bool roughenCoating(Material& m, double& clearAt) {
 //   film_ior                           <spectrum expr>, or a bare number
 //   roughness|film_thickness           <number>
 //   layer <n> <k> <thickness_nm>       one per stack layer (accumulates, outer first)
-// A `roughness` above 0 on a thinfilm or multilayer makes it the rough interference reflector
-// (roughenCoating), as a scene's `roughness` does; `reflect` then defaults to white.
+// A `roughness` above 0 on a thinfilm or multilayer makes it a rough interference reflector, as a
+// scene's `roughness` does; the scene loader does that, told by `notes` (may be null).
 // Spectrum-valued fields accept the same primitive vocabulary as the scene language
 // (`const N`, `metal:Au`, `glass:BK7`, `reflectance:leaf`, `file:...`, `blackbody K`,
 // `ior N`, `gaussian …`). Returns true and fills `out` when a bundle file exists.
-inline bool resolveMaterialBundle(const std::string& name, Material& out) {
+inline bool resolveMaterialBundle(const std::string& name, Material& out,
+                                  PresetNotes* notes = nullptr) {
     speclib::Bundle b;
     if (!speclib::loadBundle("material", name, b)) return false;
     Material m;
@@ -96,12 +89,7 @@ inline bool resolveMaterialBundle(const std::string& name, Material& out) {
         // Unknown keys are ignored (forward-compatible with future material fields).
     }
     if (!haveType) return false;
-    if (haveRough && m.roughness > 0.0 &&
-        (m.type == MatType::ThinFilm || m.type == MatType::Multilayer)) {
-        double clearAt;
-        if (!roughenCoating(m, clearAt)) return false;   // a clear coating: a broken bundle
-        if (!haveReflect) m.reflect = constantSpectrum(1.0);
-    }
+    if (notes) { notes->roughness = haveRough; notes->reflect = haveReflect; }
     out = m; return true;
 }
 
@@ -114,8 +102,9 @@ inline bool resolveMaterialBundle(const std::string& name, Material& out) {
 //      name -> clear Dielectric with its dispersion (`glass` aliases to BK7).
 // Returns true and sets `out` on a known name. (Common knobs — roughness, film
 // thickness/index, reflect, ior — may still be overridden by the caller afterwards.)
-inline bool resolveMaterialPreset(const std::string& name, Material& out) {
-    if (resolveMaterialBundle(name, out)) return true;
+inline bool resolveMaterialPreset(const std::string& name, Material& out,
+                                  PresetNotes* notes = nullptr) {
+    if (resolveMaterialBundle(name, out, notes)) return true;
     Material m;
     Spectrum s;
     // Polished metals -> glossy with the measured reflectance tint.

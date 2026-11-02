@@ -12125,6 +12125,26 @@ static int checkProp() {
                 std::fabs(probeOf(A).filmThickness - 1.42) < 1e-12);
         } else ok = false;
     }
+    // A bundle's own roughness makes its stack a rough interference reflector; a scene's roughness
+    // replaces it, `roughness 0` included (the specular stack); a scene's reflect tints the lobe.
+    {
+        ftsl::Loaded A, B, C, D;
+        if (loadMats("material \"probe\" { preset chameleon }", A) &&
+            loadMats("material \"probe\" { preset chameleon  roughness 0 }", B) &&
+            loadMats("material \"probe\" { preset chameleon  roughness 0.4 }", C) &&
+            loadMats("material \"probe\" { preset chameleon  reflect 0.5 }", D)) {
+            chk("a bundle's roughness: a rough stack, white",
+                probeOf(A).type == MatType::Glossy && probeOf(A).iridescence == 2 &&
+                std::fabs(probeOf(A).roughness - 0.2) < 1e-12 &&
+                std::fabs(probeOf(A).reflect(550.0) - 1.0) < 1e-12);
+            chk("a scene's roughness 0: the specular stack",
+                probeOf(B).type == MatType::Multilayer && probeOf(B).iridescence == 0);
+            chk("a scene's roughness replaces the bundle's",
+                probeOf(C).type == MatType::Glossy && std::fabs(probeOf(C).roughness - 0.4) < 1e-12);
+            chk("a scene's reflect tints the rough stack",
+                probeOf(D).type == MatType::Glossy && std::fabs(probeOf(D).reflect(550.0) - 0.5) < 1e-12);
+        } else ok = false;
+    }
     // Any spectrum form is a film index, a block-valued `table { }` included.
     {
         ftsl::Loaded A;
@@ -12591,6 +12611,10 @@ static int checkArray() {
         mustReject("a film index that reaches zero is refused, not rendered as NaN",
             "material \"probe\" { type thinfilm  film_ior table { 400:1.5 700:0 } }",
             "must be positive");
+        mustReject("a stack layer of index 0 (or a misread number) is refused",
+            "material \"probe\" { type multilayer  layer 0 0 100 }", "a layer needs n > 0");
+        mustReject("a stack layer with negative extinction, which is gain, is refused",
+            "material \"probe\" { type multilayer  layer 1.5 -0.1 100 }", "a layer needs n > 0");
         const std::string bare = gramp + "material \"probe\" { type diffuse  reflect grid:g }";
         mustReject("naming a table without sampling it is refused, not defaulted",
             bare.c_str(), "does not sample it");
