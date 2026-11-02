@@ -5215,6 +5215,14 @@ private:
     // `reflect` here, for an explicit `type`; a preset's overrides have read both already. False
     // after a reported failure.
     bool roughenInterference(const Block& b, Material& m, bool parse) {
+        // A preset that is rough already (its bundle set a roughness), given `roughness 0`: back
+        // to the specular coating, as `roughness 0` means on any coating.
+        if (!parse && m.iridescence && find(b, "roughness") && m.roughnessPat < 0 &&
+            m.roughnessTex < 0 && !(m.roughness > 0.0)) {
+            m.type = (m.iridescence == 1) ? MatType::ThinFilm : MatType::Multilayer;
+            m.iridescence = 0;
+            return true;
+        }
         if ((m.type != MatType::ThinFilm && m.type != MatType::Multilayer) || !find(b, "roughness"))
             return true;
         if (parse) {
@@ -5223,17 +5231,16 @@ private:
             else m.roughness = dblParam(b, "roughness", 0.0);
         }
         if (m.roughnessPat < 0 && m.roughnessTex < 0 && !(m.roughness > 0.0)) return true;
-        for (double L = LAMBDA_MIN; L <= LAMBDA_MAX; L += 5.0)
-            if (!m.coatOpaque(L)) {
-                fail("material '" + b.name + "': `roughness` needs an opaque " +
-                     (m.type == MatType::ThinFilm ? "thin film" : "multilayer") +
-                     " -- an absorbing substrate (`substrate_k` > 0) or an absorbing layer -- "
-                     "and this one lets light through near " + std::to_string((int)L) +
-                     " nm; a transparent coating has no rough form");
-                return false;
-            }
-        m.iridescence = (m.type == MatType::ThinFilm) ? 1 : 2;
-        m.type = MatType::Glossy;
+        const bool film = m.type == MatType::ThinFilm;
+        double clearAt;
+        if (!roughenCoating(m, clearAt)) {
+            fail("material '" + b.name + "': `roughness` needs an opaque " +
+                 (film ? "thin film" : "multilayer") +
+                 " -- an absorbing substrate (`substrate_k` > 0) or an absorbing layer -- "
+                 "and this one lets light through near " + std::to_string((int)clearAt) +
+                 " nm; a transparent coating has no rough form");
+            return false;
+        }
         // `reflect` tints the lobe, white unless authored. A preset's overrides have parsed it
         // already, and parsing it twice would compose a referenced pattern into reflectPat twice.
         if (!find(b, "reflect") && !find(b, "reflect_map")) m.reflect = constantSpectrum(1.0);

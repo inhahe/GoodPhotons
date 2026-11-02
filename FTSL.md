@@ -1242,6 +1242,8 @@ Fills a complete material; a few knobs may be overridden afterward
 - **Structural colour**: `soap-bubble`/`bubble`, `oil-slick`/`oil`,
   `anodized-ti`/`anodized-titanium`, `morpho`, `beetle`/`jewel-beetle`,
   `nacre`/`mother-of-pearl`.
+- **Colour-shift paint**: `chameleon`/`colorshift` (Cr / MgF2 / Al flakes as a rough reflector:
+  lime green → teal → blue → violet with the angle).
 - **Titania-coated stones**: `titania-coating`/`titania-rhinestone` (lead-crystal glass under
   a 250 nm titania film: cyan to violet with the angle) and `titania-cz` (a cubic-zirconia
   fake diamond under 60 nm, for surface sparkle). Set `film_thickness` for another colour.

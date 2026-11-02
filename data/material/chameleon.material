@@ -1,0 +1,19 @@
+# Chameleon (colour-shift) car paint.
+# aliases: colorshift color-shift chromaflair chameleon-paint
+# The paint's flakes are each a Fabry-Perot stack: a 6 nm semi-transparent chromium absorber over
+# a 380 nm magnesium fluoride spacer (n 1.38) on an aluminium mirror, the ChromaFlair design. The
+# low-index spacer is what makes the colour flop so far with angle: lime green face-on, teal at 30
+# degrees, blue at 50, violet past 65. Other spacers: 300 nm violet to copper, 340 cyan to purple,
+# 420 orange-gold to green to blue, 460 a full sweep magenta to copper to green to cyan. The flakes
+# lie roughly flat in the paint, which the 0.2 roughness stands for; the paint is a rough
+# interference reflector, so every mode, forward mode B included, renders it. Indices at 550 nm
+# (Cr Johnson & Christy 1974, Al McPeak et al. 2015, CC0 via refractiveindex.info): against the
+# measured dispersive indices the colours differ by a few percent of hue. Real flakes sit in a
+# binder (n about 1.5) under a clear coat; here they meet air, and the coat's own highlight is
+# not modelled.
+type multilayer
+ior         const 0.79
+substrate_k const 5.85
+layer 3.18 3.33 6
+layer 1.38 0.0 380
+roughness 0.2

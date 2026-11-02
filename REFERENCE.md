@@ -2092,7 +2092,9 @@ Declared with `material "name" { type <type> … }`.
 - **Iridescent / structural colour** (thin-film or multilayer stacks): `soap-bubble`,
   `oil-slick`, `anodized-ti`/`anodized-titanium`, `morpho`, `beetle`/`jewel-beetle`,
   `nacre`/`mother-of-pearl`; titania-coated stones `titania-coating` (a rhinestone) and
-  `titania-cz` (a fake diamond), below.
+  `titania-cz` (a fake diamond), below; and `chameleon`/`colorshift`, colour-shift car paint:
+  flakes of chromium (6 nm) / magnesium fluoride (380 nm) / aluminium, a rough reflector whose
+  colour swings lime green → teal → blue → violet with the angle (its file lists other spacers).
 
 Each iridescent preset is a **bundle file** (`data/material/<name>.material`) that
 groups the material's several spectral envelopes (`ior`, `substrate_k`) and its tuned
@@ -2113,9 +2115,13 @@ BSDF, so every mode renders it, mode `B` and `A` included, on the CPU and the GP
 
     material "beetle-rough" { preset beetle  roughness 0.2 }
     material "blue-ti" { type thinfilm  ior 2.5  substrate_k 3.0
-                         film_ior 2.30  film_thickness 85  roughness 0.15 }
+                         film_ior 2.30  film_thickness 50  roughness 0.15 }
+    material "paint" { preset chameleon }          # colour-shift car paint, rough already
 
-`roughness 0` (or none) keeps the specular coating. A **clear** coating (a soap film, an
+`roughness 0` (or none) keeps the specular coating; a preset can carry a roughness of its own
+(`chameleon` does), which a scene's `roughness` replaces, `roughness 0` included. Anodized
+titanium's colour runs with the film, n 2.30 on the metal: about 20-30 nm bronze, 40 purple, 50
+deep blue, 60-70 light blue, 85 silver-blue, 120 gold. A **clear** coating (a soap film, an
 oil slick on water, a dichroic filter) refuses a `roughness` with an error, since what it
 transmits has no rough form here. `roughness` takes a constant, a `pattern:` or a
 `texture:`, as on `glossy`, and `reflect` (default 1) tints the lobe. Unlike the smooth

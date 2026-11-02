@@ -42,7 +42,8 @@ it contains no algorithm.
   scene language** — `const N`, `metal:Au`, `glass:BK7`, `reflectance:leaf`,
   `illuminant:f2`, `file:<path>`, `blackbody K`, `ior N`, `gaussian center=… sigma=…`
   — so a bundle field just references a library primitive. Material bundles also take
-  `type <matType>`, `roughness`/`film_thickness` scalars, `film_ior` (a number or a spectrum
+  `type <matType>`, `roughness`/`film_thickness` scalars (a `roughness` above 0 on a
+  `thinfilm` or `multilayer` makes it a rough interference reflector, as in a scene), `film_ior` (a number or a spectrum
   expression, e.g. `glass:titania`), and repeatable
   `layer <n> <k> <thickness_nm>` rows (outer first) for multilayer stacks. Light
   bundles currently take one `spd <expr>` (plus a light-only `led-white <warm>` /

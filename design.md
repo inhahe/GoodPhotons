@@ -9936,6 +9936,11 @@ holds a film over an absorbing substrate to the Airy form and a thick absorbing 
 metal; its old range test could not see the bug, the result being clamped. The `beetle` and
 `morpho` presets, both on absorbing backings, changed colour; `nacre` (lossless) did not.
 
+A bundle may now carry a `roughness` for a thin film or stack (`materials.h roughenCoating`, which
+the scene language's `roughenInterference` also calls), so a preset can be a rough interference
+reflector by default: `chameleon`, Cr / MgF2 / Al flakes. A scene's `roughness 0` turns such a
+preset back into the specular coating.
+
 ## A dispersive film index, and titania (0.402.0)
 
 `Material::filmIor` is a `Spectrum` (it was a `double`), and `DMaterial::filmIor` a `DSpec`, so a
