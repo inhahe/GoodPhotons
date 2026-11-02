@@ -2645,7 +2645,8 @@ half-angles in degrees with a smoothstep penumbra between inner and outer.
 irradiance** (the light hitting a surface facing the sun), so widening `angle` softens
 the penumbra without changing the exposure. `power`/`lumens` are refused (a distant
 light's flux depends on the scene's cross-section, not the light) — use `intensity`.
-Like `spot`/`env`, `sun` is not connectible in modes `D`/`U`, which refuse the scene.
+Modes `D`, `U` and `J` connect it (and a `spot`) like any other light; the lights they
+refuse are `env` and `collimated`.
 
 The default rectangular `area` light also accepts an **emission profile** over its
 surface — `spd pattern:<n>` (the pattern *is* the profile, greyscale) or
