@@ -32498,8 +32498,8 @@ Three further conclusions:
 
 4. **A round brilliant LOSES**, which is a surprise given the trade cut it for "fire". Built as
    an intersection of half-spaces (1 table + 16 girdle + 8 crown bezels at 34.5 deg + 8 pavilion
-   mains at 40.75 deg) it scores 0.092 spread, because a 40.75 deg pavilion sits just past
-   crystal's 40.2 deg critical angle and **total-internally-reflects** — it throws the fire back
+   mains at 40.75 deg) it scores 0.092 spread, because a 40.75 deg pavilion is past
+   crystal's 38.1 deg critical angle and **total-internally-reflects** — it throws the fire back
    up at the viewer, not down at the table. Sweeping the pavilion to 20/25/30/35 deg does not
    recover it.
 5. **The lattice cannot be rescued by reshaping its outer boundary.** Clipping the solid gyroid
@@ -32651,8 +32651,7 @@ conclusion 6. Swept on float at drop 0.35 (`k` = tan of the cone's half-angle; `
 one-sided TIR cliff past 45 deg. The core also **switches sides**, +0.63 z at k=0.70 to -0.61 z
 at k=1.20, crossing near the null: the ring focus is passing through infinity there (the
 constant prism deviation sweeping past the drop distance), which is what empties the 2x bar,
-not the critical angle. 40.4 deg landing on crystal's 40.2 deg critical angle is a coincidence
-worth naming precisely so nobody re-derives the wrong mechanism from it. Shallower cones are
+not the critical angle (crystal's is 38.1 deg, not 40.4). Shallower cones are
 also **short-range only**: `vcone0.70` at drop 0.80 and 1.10, and `vcone0.60` at 0.80, all read
 0.00% coverage.
 

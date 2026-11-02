@@ -8491,7 +8491,7 @@ as the one at fault.
       The orb is the scene's brightest ball-lens caustic *and* one of its whitest — fan 0.94 on
       a 9 cm patch is real, organised and negligible, which is the whole reason the axicon was
       added. Three results are worth keeping. A **round brilliant loses**, because a 40.75°
-      pavilion sits just past crystal's 40.2° critical angle and total-internally-reflects the
+      pavilion is past crystal's 38.1° critical angle and total-internally-reflects the
       fire back up at the viewer instead of down at the table (sweeping the pavilion to 20–35°
       does not recover it) — and its one-time "spread win" of 0.092 was purely a clamp artifact:
       on float it is 0.047 with too few cells to `fan`-test. **The lattice cannot be rescued by
@@ -8588,7 +8588,7 @@ as the one at fault.
       table meets the cone at the wrong incidence. Three crown geometries all read 0.01–0.02 %
       coverage, i.e. *no caustic*. That is the cut working as designed: a brilliant throws its
       fire **up at the viewer**, and flint makes that worse than crystal (critical angle 35.4°
-      against 40.2°), so the flint recut moves *away* from a gem cut, not toward one.
+      against 38.1°), so the flint recut moves *away* from a gem cut, not toward one.
 
       **Confirmed in the finished frame, not just in the rig**, at matched convergence
       (`-device cpu`, 800×450, control 324 spp / 5.56 % noise against girdled 305 spp /
@@ -8638,8 +8638,8 @@ as the one at fault.
       one-sided cliff past 45° as was once written. Across the null the caustic core also
       **switches sides**, +0.63 z at k = 0.70 to −0.61 z at k = 1.20: the ring focus is passing
       through infinity there (the constant prism deviation sweeping past the drop distance),
-      which is what empties the 2× bar. 40.4° landing on crystal's 40.2° critical angle is a
-      coincidence, and worth naming as one so the wrong mechanism is not re-derived from it.
+      which is what empties the 2× bar. (Nor does the null sit at crystal's critical angle,
+      which is 38.1°.)
       Shallow cones are also short-range only — `vcone0.70` at drop 0.80 and 1.10 and
       `vcone0.60` at 0.80 all read 0.00 % coverage.
     - **An axicon's caustic barely walks with height, and lands beside the piece rather than
