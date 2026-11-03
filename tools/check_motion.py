@@ -19,7 +19,8 @@ cube whose keys scale and shear it together. It requires:
     errors or 3 %. The blur must be real: the blurred and instant frames differ in many blocks.
     The same scene authored in centimetres blurs the same.
   * An instantaneous shutter away from the instant (`shutter_open t  shutter_close t`) renders the
-    static scene at t, for three t, the same block test.
+    static scene at t, for three t, the same block test -- with a ball added that orbits two whole
+    turns on each side of the instant, which the keys must not lose.
   * Mode W blurs too, deterministically (two runs agree byte for byte, and differ from the
     instant).
   * `-checkbvh` passes on a scene of moving triangles and spheres -- every other ray at a random
@@ -27,10 +28,10 @@ cube whose keys scale and shear it together. It requires:
   * Under a shutter, `-device gpu` says mode R stays on the CPU, and mode B says it renders the
     instant.
   * The loader refuses, with a message naming why: a `motion` block with no `motion_interval`; one
-    with a single key; `translate` beside `motion`; an isosurface or an emissive mesh in a moving
-    group; fur on, or a medium bounded by, a moving object; an interval that excludes the
-    instant; `shutter_close` before `shutter_open`. And it builds a sphere its keys stretch as a
-    mesh, as it does one an uneven static scale stretches.
+    with a single key; `translate` beside `motion`; fur on, or a medium bounded by, a moving
+    object; an interval that excludes the instant; `shutter_close` before `shutter_open`. It keeps
+    an isosurface and an emissive mesh in a moving group at the instant, saying so, and builds a
+    sphere its keys stretch as a mesh, as it does one an uneven static scale stretches.
 Exits 1 on any failure.
 """
 import argparse
@@ -66,6 +67,10 @@ STRETCH = [dict(translate=(0.15, 0.12, -0.9)),
 # whose default probe radius is sized by those bounds.
 FLY = [dict(translate=(-0.5, 1.6, -1.2)), dict(translate=(-0.5, 1.6, -1.2)),
        dict(translate=(60.0, 1.6, -1.2))]
+# A ball orbiting its group's axis, two whole turns each side of the instant: a stretch between
+# breaks whose midpoint equals the blend of its ends, so only a split by turn can follow it (used
+# by the sharp-at-a-time tests).
+TWIRL = [dict(translate=(0.55, 1.25, -1.0)), dict(translate=(0.55, 1.25, -1.0), rotate=(0, 0, 1440))]
 FIELDS = (("translate", (0, 0, 0)), ("rotate", (0, 0, 0)), ("scale", (1, 1, 1)), ("shear", (0, 0, 0)))
 
 
@@ -111,7 +116,7 @@ def cube(h, m, k):
     ])
 
 
-def scene(u=None, shutter=None, units="meters", extras=False):
+def scene(u=None, shutter=None, units="meters", extras=False, twirl=False):
     """The box scene: its groups moving when u is None, else held at u. `shutter` is
     (open, close) in frames; `units` "centimeters" writes every length 100 times larger."""
     k = {"meters": 1.0, "centimeters": 100.0}[units]
@@ -136,6 +141,9 @@ def scene(u=None, shutter=None, units="meters", extras=False):
         'camera "c" { eye %s  look_at %s  up 0 1 0  fov_y 40  %sfilm { res %d %d } }'
         % (L(0, 1.0, 4.2), L(0, 0.5, 0), cam, W, H),
     ]
+    if twirl:
+        lines.append("group { %s  sphere { center %s  radius %r  material red } }"
+                     % (xf(TWIRL, u, k), L(0.45, 0, 0), 0.15 * k))
     if extras:
         # The floor's albedo follows `cavity`, whose default probe radius is a share of the
         # scene's size -- which a mover's sweep must not change.
@@ -176,9 +184,6 @@ REFUSED = [
     ("translate beside motion",
      "group { translate 1 0 0  motion { key { translate 0 0 0 } key { translate 1 0 0 } }  "
      "sphere { center 0 0 0  radius 0.1 material w } }", "beside a `motion` block", True),
-    ("an isosurface in a moving group",
-     "group { motion { key { translate 0 0 0 } key { translate 1 0 0 } }  isosurface { material w  "
-     "sphere { radius 0.2 } } }", "not supported yet", True),
     ("fur on a moving object",
      'group { motion { key { translate 0 0 0 } key { translate 1 0 0 } }  sphere "ball" { center 0 0 '
      '0  radius 0.2  material w } }' + NL + 'fur "coat" { on "ball"  material w  count 10  length 0.02 }',
@@ -188,10 +193,16 @@ REFUSED = [
      '0  radius 0.2  material w } }' + NL +
      'medium { sigma_t 1  albedo 0.9  bounds { object "ball" } }',
      "cannot follow a moving object", True),
-    ("an emissive surface in a moving group",
+]
+# (what stays at the instant, the scene, the warning it must print) -- loaded, not refused
+STILL = [
+    ("an isosurface in a moving group",
+     "group { motion { key { translate 0 0 0 } key { translate 1 0 0 } }  isosurface { material w  "
+     "sphere { radius 0.2 } } }", "an isosurface in a moving group stays where it is"),
+    ("an emissive mesh in a moving group",
      'material "glow" { type diffuse reflect 0.0  emit blackbody 5200 }' + NL +
      'group { motion { key { translate 0 0 0 } key { translate 1 0 0 } }  mesh "m" { file "%(obj)s"'
-     "  material glow } }", "emissive surface in a moving group", True),
+     "  material glow } }", "an emissive surface in a moving group stays where it is"),
 ]
 LIGHT = ("light area { origin -0.4 2.9 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  spd preset:bb6500"
          "  power 60 }")
@@ -284,6 +295,13 @@ def main():
         rc, log = run([exe, "-in", p, "-parseonly"])
         verdict("refuses " + name, rc != 0 and phrase in log,
                 "" if rc != 0 and phrase in log else log.strip()[-300:])
+    for name, body, phrase in STILL:
+        p = os.path.join(out, "still.ftsl")
+        write(p, NL.join(["scene { units meters  motion_interval -0.5 0.5 }", base,
+                          body % {"obj": obj.replace(chr(92), "/")}]) + NL)
+        rc, log = run([exe, "-in", p, "-parseonly"])
+        good = rc == 0 and phrase in log
+        verdict("keeps %s at the instant, saying so" % name, good, "" if good else log.strip()[-300:])
     p = os.path.join(out, "uneven.ftsl")
     write(p, NL.join(["scene { units meters  motion_interval -0.5 0.5 }", base, UNEVEN]) + NL)
     rc, log = run([exe, "-in", p, "-parseonly"])
@@ -369,8 +387,8 @@ def main():
     # --- an instantaneous shutter away from the instant: the scene exactly as written there ---
     for t in (-0.35, 0.1, 0.4):
         sharp, still_t = os.path.join(out, "sharp.ftsl"), os.path.join(out, "sharp_static.ftsl")
-        write(sharp, scene(shutter=(t, t)))
-        write(still_t, scene(u=t + 0.5))
+        write(sharp, scene(shutter=(t, t), twirl=True))
+        write(still_t, scene(u=t + 0.5, twirl=True))
         sa = [lum(render(exe, out, sharp, "sharp_s%d" % s, ["-mode", "R", "-device", "cpu",
                                                              "-spp", "256"], seed=s)[0]) for s in (1, 2)]
         sb = [lum(render(exe, out, still_t, "sharp_static_s%d" % s, ["-mode", "R", "-device", "cpu",

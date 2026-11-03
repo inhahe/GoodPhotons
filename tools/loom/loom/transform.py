@@ -212,10 +212,11 @@ class Transform:
 
         With ``ctx.motion``, a transform whose value changes over the motion interval is
         written as a ``motion { key { … } … }`` block, one key per motion key; one that holds
-        still is written as before. A rotation's keys are unwrapped -- shifted by whole turns
-        outward from the instant's key so neighbours differ by at most half a turn -- because
-        ftrace turns through the angle between keys, and an angle that wraps from 359 to 1
-        between two keys would otherwise spin the long way round."""
+        still is written as before. A rotation's keys follow the angle continuously from the
+        instant's key outward (:meth:`_rotation_keys`), because ftrace turns through the angle
+        between keys: an angle a periodic signal folds from 359 back to 1 would otherwise spin
+        the long way round, and one that really turns 250 degrees between keys must not be read
+        as a fold."""
         vals = self._values(ctx.clock, ctx.cache)
         if not vals:
             return inner
@@ -224,11 +225,9 @@ class Transform:
             keys = [self._values(c, k) for c, k in ctx.key_clocks()]
             text = [[(kw, fmt3(v)) for kw, v in key] for key in keys]
             if any(t != text[0] for t in text):
-                anchor = ctx.motion.instant_key()
                 for f, (kw, _) in enumerate(vals):
                     if kw == "rotate":
-                        unwrapped = unwrap_degrees([key[f][1] for key in keys], anchor)
-                        for key, r in zip(keys, unwrapped):
+                        for key, r in zip(keys, self._rotation_keys(ctx)):
                             key[f] = (kw, r)
                 head = ["    motion {"] + [
                     "        key { %s }" % "  ".join("%s %s" % (kw, fmt3(v)) for kw, v in key)
@@ -239,17 +238,30 @@ class Transform:
         lines.append("}")
         return "\n".join(lines)
 
+    # Sub-steps per key interval over which a rotation is followed: a periodic signal's fold
+    # (a jump of a whole turn) shows inside one sub-step, while a real turn spreads over all of
+    # them, so each sub-step's change is folded to within half a turn and summed. A spin is read
+    # right up to 180 * _ROT_SUBSTEPS degrees between keys.
+    _ROT_SUBSTEPS = 16
 
-def unwrap_degrees(angles: Sequence[Tuple[float, float, float]],
-                   anchor: int) -> List[Tuple[float, float, float]]:
-    """Euler angles in degrees, one triple per key, each component shifted by whole turns so
-    that neighbouring keys differ by at most half a turn, the key at ``anchor`` left as it is."""
-    out = [list(a) for a in angles]
-    for step in (1, -1):
-        k = anchor + step
-        while 0 <= k < len(out):
-            for i in range(3):
-                prev = out[k - step][i]
-                out[k][i] += 360.0 * round((prev - out[k][i]) / 360.0)
-            k += step
-    return [tuple(a) for a in out]
+    def _rotation_keys(self, ctx: EmitCtx) -> List[Tuple[float, float, float]]:
+        """The rotation at each of ``ctx.motion``'s keys, the instant's as evaluated and each
+        other followed continuously from its neighbour nearer the instant."""
+        offs = ctx.motion.offsets()
+        anchor = ctx.motion.instant_key()
+        raw = lambda d: vec3(self.rotate, *ctx.offset_clock(d))
+        out: List[Optional[List[float]]] = [None] * len(offs)
+        out[anchor] = list(raw(offs[anchor]))
+        for step in (1, -1):
+            k = anchor
+            while 0 <= k + step < len(offs):
+                val, prev = list(out[k]), raw(offs[k])
+                for j in range(1, self._ROT_SUBSTEPS + 1):
+                    r = raw(offs[k] + (offs[k + step] - offs[k]) * j / self._ROT_SUBSTEPS)
+                    for i in range(3):
+                        dlt = r[i] - prev[i]
+                        val[i] += dlt - 360.0 * round(dlt / 360.0)
+                    prev = r
+                out[k + step] = val
+                k += step
+        return [tuple(v) for v in out]

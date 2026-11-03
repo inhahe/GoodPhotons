@@ -72,6 +72,19 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-11-03, 0.405.1): NONASCII-PATH — ftrace cannot open a scene or write an image at a path outside the ANSI code page's reach
+
+`ftrace -in "png/shot zoë test/x.ftsl" -o …` fails at once with `error: No mapping for the Unicode
+character exists in the target multi-byte code page.` (0.403.1 too: not new). `main(argc, argv)`
+receives the ANSI-code-page argv, and somewhere a path is converted between that and UTF-16 or
+UTF-8 with a mapping that throws. Found while testing `-shot`, whose launcher now carries such a
+path through intact (UTF-16, `CommandLineToArgvW`) only for the frame's own ftrace to fail on it.
+Reproduce: the command above from PowerShell. Proper fix: give ftrace.exe an application
+manifest with `<activeCodePage>UTF-8</activeCodePage>` (Windows 10 1903+), so argv and every
+narrow API speak UTF-8, then audit the `std::filesystem::path(std::string)` / `.string()` sites
+for UTF-8 (`u8path`, `u8string`); or read argv as UTF-16 (`wmain`) and keep paths as
+`std::filesystem::path` throughout.
+
 ## OPEN (2026-11-03, 0.404.0): MOTION-SWEEP — a moving primitive is boxed over its whole motion, so a fast mover slows every ray near its sweep
 
 `Scene::collectPrimBoxes` gives each moving triangle and sphere the union of its boxes at every

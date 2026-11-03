@@ -3098,10 +3098,10 @@ size.)
 - **Nested groups compose:** a group inside a moving group moves with it, and may have keys of its
   own.
 - **What may move (so far):** `sphere`, `quad`, `triangle` and `mesh` children. A sphere the keys
-  scale unevenly is built as a smooth mesh, as an uneven static `scale` builds it. A moving group
-  refuses an `isosurface`, a `curve`, a `mesh_instance` and an emissive mesh (a registered light:
-  its light is sampled where it sits at the instant), each by name; a `light` in it stays where
-  it is at the instant, with a warning. What finds an object by name — `fur { on }` and `bald`, a
+  scale unevenly is built as a smooth mesh, as an uneven static `scale` builds it. An `isosurface`,
+  a `curve`, a `mesh_instance`, an emissive mesh (a registered light, whose light is sampled
+  where it sits at the instant) and a `light` in a moving group stay where they are at the
+  instant, with one warning per kind: they cannot move yet. What finds an object by name — `fur { on }` and `bald`, a
   medium's `bounds { object }`, `settle { collide }` — refuses one in a moving group, which it
   could not follow. A procedural `pattern` reads world position, so it stays in place while the surface
   carrying it moves through it — as it does from one frame of an animation to the next; UV

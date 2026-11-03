@@ -193,6 +193,8 @@ struct CudaSceneHold;      // render_cuda.h; named in signatures a CPU-only buil
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX               // keep std::min/std::max (windows.h else macro-clobbers them)
 #include <windows.h>          // -preview: enable ANSI VT processing in a plain console
+#include <shellapi.h>         // -shot: CommandLineToArgvW
+#pragma comment(lib, "shell32.lib")
 #include <psapi.h>            // ftalloc's memStat hook: this process's own commit charge
 #endif
 
@@ -28465,72 +28467,97 @@ static int runServe(int argc, char** argv, int inValPos) {
 // what it rendered) and start no other.
 static int runShot(int argc, char** argv, int at) {
 #ifdef _WIN32
-    if (at + 1 >= argc || argv[at + 1][0] == '-') {
+    (void)argv;
+    // The arguments as the shell passed them, in UTF-16: argv is in the ANSI code page, which
+    // loses whatever it cannot spell (a user named Zoë, a CJK path) before we ever see it.
+    int wargc = 0;
+    LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (!wargv || wargc != argc) {
+        if (wargv) LocalFree(wargv);
+        std::fprintf(stderr, "error: -shot cannot read its own command line\n");
+        return 1;
+    }
+    struct FreeArgs { LPWSTR* a; ~FreeArgs() { LocalFree(a); } } freeArgs{wargv};
+    if (at + 1 >= argc || wargv[at + 1][0] == L'-') {
         std::fprintf(stderr, "error: -shot needs a loom scene .py\n");
         return 1;
     }
-    const std::string scenePy = argv[at + 1];
+    const std::wstring scenePy = wargv[at + 1];
     // ftrace flag -> (loom.shot flag, values it takes).
-    struct ShotFlag { const char* ours; const char* theirs; int values; };
+    struct ShotFlag { const wchar_t* ours; const wchar_t* theirs; int values; };
     static const ShotFlag kShot[] = {
-        {"-frames", "--range", 2},   {"-shot-length", "--frames", 1}, {"-fps", "--fps", 1},
-        {"-open", "--open", 0},      {"-loop", "--loop", 0},          {"-shutter", "--shutter", 2},
-        {"-motion", "--motion", 3},  {"-no-motion", "--no-motion", 0}, {"-name", "--name", 1},
-        {"-outdir", "--outdir", 1},  {"-mp4", "--mp4", 0},            {"-func", "--func", 1},
-        {"-no-window", "--no-window", 0},
+        {L"-frames", L"--range", 2},   {L"-shot-length", L"--frames", 1}, {L"-fps", L"--fps", 1},
+        {L"-open", L"--open", 0},      {L"-loop", L"--loop", 0},          {L"-shutter", L"--shutter", 2},
+        {L"-motion", L"--motion", 3},  {L"-no-motion", L"--no-motion", 0}, {L"-name", L"--name", 1},
+        {L"-outdir", L"--outdir", 1},  {L"-mp4", L"--mp4", 0},            {L"-func", L"--func", 1},
+        {L"-no-window", L"--no-window", 0},
     };
-    std::vector<std::string> shotArgs, renderArgs;
+    std::vector<std::wstring> shotArgs, renderArgs;
     for (int i = 1; i < argc; ++i) {
         if (i == at) { ++i; continue; }                 // -shot and its scene
-        if (!std::strcmp(argv[i], "--")) continue;      // loom.shot's separator; ours is implicit
+        const std::wstring a = wargv[i];
+        if (a == L"--") continue;                       // loom.shot's separator; ours is implicit
         const ShotFlag* f = nullptr;
-        for (const ShotFlag& s : kShot) if (!std::strcmp(argv[i], s.ours)) { f = &s; break; }
-        if (!f) { renderArgs.push_back(argv[i]); continue; }
+        for (const ShotFlag& s : kShot) if (a == s.ours) { f = &s; break; }
+        if (!f) {
+            if (a == L"-in" || a == L"-o") {
+                std::fprintf(stderr, "error: -shot names each frame's scene and image itself; drop "
+                                     "%ls (-outdir and -name place the frames)\n", a.c_str());
+                return 1;
+            }
+            renderArgs.push_back(a);
+            continue;
+        }
         if (i + f->values >= argc) {
-            std::fprintf(stderr, "error: %s needs %d value(s)\n", f->ours, f->values);
+            std::fprintf(stderr, "error: %ls needs %d value(s)\n", f->ours, f->values);
             return 1;
         }
         shotArgs.push_back(f->theirs);
-        for (int k = 0; k < f->values; ++k) shotArgs.push_back(argv[++i]);
+        for (int k = 0; k < f->values; ++k) shotArgs.push_back(wargv[++i]);
     }
-    for (const std::string& a : renderArgs)
-        if (a == "-in" || a == "-o") {
-            std::fprintf(stderr, "error: -shot names each frame's scene and image itself; drop %s "
-                                 "(-outdir and -name place the frames)\n", a.c_str());
-            return 1;
-        }
-    wchar_t exeBuf[MAX_PATH * 4];
-    const DWORD n = GetModuleFileNameW(nullptr, exeBuf, (DWORD)(sizeof exeBuf / sizeof exeBuf[0]));
-    if (n == 0 || n >= sizeof exeBuf / sizeof exeBuf[0]) {
+    std::vector<wchar_t> exeBuf(32768);
+    const DWORD n = GetModuleFileNameW(nullptr, exeBuf.data(), (DWORD)exeBuf.size());
+    if (n == 0 || n >= exeBuf.size()) {
         std::fprintf(stderr, "error: -shot cannot find its own executable\n");
         return 1;
     }
-    const std::filesystem::path exePath(std::wstring(exeBuf, n));
-    const std::filesystem::path stopFile =
-        std::filesystem::temp_directory_path() / ("ftrace_shot_" + std::to_string(ftraceCurrentPid()) + ".stop");
+    const std::filesystem::path exePath(std::wstring(exeBuf.data(), n));
     std::error_code ec;
+    const std::filesystem::path tmp = std::filesystem::temp_directory_path(ec);
+    if (ec) {
+        std::fprintf(stderr, "error: -shot needs a temp directory for its stop file\n");
+        return 1;
+    }
+    const std::filesystem::path stopFile =
+        tmp / (L"ftrace_shot_" + std::to_wstring(ftraceCurrentPid()) + L".stop");
     std::filesystem::remove(stopFile, ec);
 
-    // Each argument quoted for CreateProcess's command-line parser (a backslash run is
-    // literal unless it precedes a quote, which this never writes: none of these end in one).
-    auto quote = [](const std::string& a) {
-        if (!a.empty() && a.find_first_of(" \t\"") == std::string::npos) return a;
-        std::string q = "\"";
-        for (char c : a) { if (c == '"') q += "\\\""; else q += c; }
-        return q + "\"";
+    // One argument quoted the way CommandLineToArgvW (and so Python) reads it back: a run of
+    // backslashes is literal except before a quote, where each is doubled -- and a closing
+    // quote follows the argument, so a trailing run is doubled too.
+    auto quote = [](const std::wstring& a) {
+        if (!a.empty() && a.find_first_of(L" \t\"") == std::wstring::npos) return a;
+        std::wstring q = L"\"";
+        size_t slashes = 0;
+        for (wchar_t c : a) {
+            if (c == L'\\') { ++slashes; continue; }
+            q.append(c == L'"' ? 2 * slashes + 1 : slashes, L'\\');
+            slashes = 0;
+            q.push_back(c);
+        }
+        q.append(2 * slashes, L'\\');
+        return q + L"\"";
     };
-    std::string cmd = "python -X utf8 -u -m loom.shot " + quote(scenePy) +
-                      " --ftrace " + quote(exePath.string()) + " --stop-file " + quote(stopFile.string());
-    for (const std::string& a : shotArgs) cmd += " " + quote(a);
-    cmd += " --";
-    for (const std::string& a : renderArgs) cmd += " " + quote(a);
-    std::printf("[shot] %s\n", cmd.c_str());
+    std::wstring cmd = L"python -X utf8 -u -m loom.shot " + quote(scenePy) +
+                       L" --ftrace " + quote(exePath.wstring()) + L" --stop-file " + quote(stopFile.wstring());
+    for (const std::wstring& a : shotArgs) cmd += L" " + quote(a);
+    cmd += L" --";
+    for (const std::wstring& a : renderArgs) cmd += L" " + quote(a);
+    std::printf("[shot] %ls\n", cmd.c_str());
     std::fflush(stdout);
 
-    std::wstring loomPath = exePath.parent_path().wstring() + L"\\tools\\loom";
-    std::wstring env = loomlink::childEnvBlock(loomPath);
-    std::wstring wcmd = loomlink::utf8ToWide(cmd);
-    std::vector<wchar_t> mutcmd(wcmd.begin(), wcmd.end());
+    std::wstring env = loomlink::childEnvBlock(exePath.parent_path().wstring() + L"\\tools\\loom");
+    std::vector<wchar_t> mutcmd(cmd.begin(), cmd.end());
     mutcmd.push_back(L'\0');
     STARTUPINFOW si{};
     si.cb = sizeof si;
@@ -28542,7 +28569,14 @@ static int runShot(int argc, char** argv, int at) {
         return 1;
     }
     CloseHandle(pi.hThread);
-    stopChannelStart("shot " + scenePy);
+    {   // listed by a bare `ftrace -stop`, as UTF-8
+        const int len = WideCharToMultiByte(CP_UTF8, 0, scenePy.c_str(), (int)scenePy.size(),
+                                            nullptr, 0, nullptr, nullptr);
+        std::string u8((size_t)std::max(len, 0), '\0');
+        if (len > 0) WideCharToMultiByte(CP_UTF8, 0, scenePy.c_str(), (int)scenePy.size(),
+                                         &u8[0], len, nullptr, nullptr);
+        stopChannelStart("shot " + u8);
+    }
     bool told = false;
     while (WaitForSingleObject(pi.hProcess, 250) == WAIT_TIMEOUT) {
         if (!told && g_extStopRequested.load()) {

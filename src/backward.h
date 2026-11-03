@@ -565,7 +565,7 @@ struct BackwardRenderer {
             Vec3 wi = em.sampleCone(-em.beamDir, u1, u2);
             // `dist` before `response`, not after: a dual-scattering response walks the
             // shadow segment itself and so needs its length. Nothing else reads it here.
-            dist = length(scene.sceneCenter - h.p) + scene.sceneRadius;   // to the scene exit
+            dist = scene.exitDistance(h.p);   // to the scene exit
             double cosSurf, stG;
             if (!response(wi, cosSurf, stG)) return false;
             if (blocked(wi, dist, 0.0)) return false;
@@ -1548,7 +1548,7 @@ struct BackwardRenderer {
             // Distant sun: a cone-sampled direction (pdf 1/Omega), shadowed to the scene exit.
             const double s1 = rng.uniform(), s2 = rng.uniform();
             wi = em.sampleCone(-em.beamDir, s1, s2);
-            dist = length(scene.sceneCenter - p) + scene.sceneRadius;
+            dist = scene.exitDistance(p);
             shorten = 0.0;
             geom = em.spotOmega;
         } else {
@@ -1622,7 +1622,7 @@ struct BackwardRenderer {
             // would light a coat's sunlit side by the full model and its sky-lit side by a
             // bare fiber. And there is no MIS partner here (`dualScatter` ends the path, so
             // nothing samples the BCSDF), which is exactly why wMis is 1.
-            farDist = length(scene.sceneCenter - h.p) + scene.sceneRadius;
+            farDist = scene.exitDistance(h.p);
             bool dualBlocked = false;
             cosSurf = PI * hairDualResponse(*dctx, *hs, h, wi, farDist, dualBlocked);
             stG = 1.0; wMis = 1.0;
@@ -1630,7 +1630,7 @@ struct BackwardRenderer {
         }
         double pdfBsdf = 0.0;
         if (!dirResponse(scene, h, wi, hs, nb, cosSurf, stG, pdfBsdf)) return false;
-        farDist = length(scene.sceneCenter - h.p) + scene.sceneRadius;
+        farDist = scene.exitDistance(h.p);
         if (hs) {
             // Aggregate fiber: coat transmittance instead of strand geometry, and only walls
             // occlude. Same substitution as emitterGeom — see the comments there.
@@ -1810,7 +1810,7 @@ struct BackwardRenderer {
         double pdfW = 0.0;
         const Vec3 wi = scene.sampleEnvDir(rng, pdfW);
         if (!(pdfW > 0.0)) return;
-        const double farDist = length(scene.sceneCenter - h.p) + scene.sceneRadius;
+        const double farDist = scene.exitDistance(h.p);
         // envGeom's strand shadow ray. Never an aggregate fiber's: `hs` comes from hairShadeAt,
         // and an aggregate collision leaves the bundle (furInteract) before any fiber vertex.
         double vis = scene.shadowTransmittance(h.p + wi * 1e-6, wi, farDist, 1e-6,
@@ -1847,7 +1847,7 @@ struct BackwardRenderer {
         double pdfW;
         Vec3 wi = scene.sampleEnvDir(rng, pdfW);
         if (pdfW <= 0.0) return 0.0;
-        double farDist = length(scene.sceneCenter - p) + scene.sceneRadius;
+        double farDist = scene.exitDistance(p);
         const double vis = scene.shadowTransmittance(p + wi * 1e-6, wi, farDist);
         if (!(vis > 0.0)) return 0.0;
         double Lenv = scene.envRadiance(wi, lambda);
@@ -2139,7 +2139,7 @@ struct BackwardRenderer {
         double pdfW = 0.0;
         const Vec3 wi = scene.sampleEnvDir(rng, pdfW);
         if (!(pdfW > 0.0)) return;
-        const double farDist = length(scene.sceneCenter - p) + scene.sceneRadius;
+        const double farDist = scene.exitDistance(p);
         const double vis = scene.shadowTransmittance(p + wi * 1e-6, wi, farDist);
         if (!(vis > 0.0)) return;
         const double T = mediaTr(scene, p + wi * 1e-6, wi, farDist, lam[0], rng);

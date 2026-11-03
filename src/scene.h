@@ -2333,6 +2333,18 @@ struct Scene {
     // The same box the sphere is the circumsphere of (lo > hi until build()). Kept since
     // 0.368.0 for the raster preview's box-projected reflections (raster::deriveLight).
     Vec3 sceneBoxLo{1, 1, 1}, sceneBoxHi{-1, -1, -1};
+    // The bounding sphere of everything a path at a time of its own may meet: the scene's
+    // widened by every moving primitive's whole motion (build()). Equal to sceneCenter /
+    // sceneRadius in a scene where nothing moves.
+    Vec3 sweptCenter{0, 0, 0};
+    double sweptRadius = 0.0;
+    // How far a ray from p must go to leave everything it could hit: to the scene's bounding
+    // sphere, or -- for a path with a time (g_motionU), which may meet a mover outside it --
+    // the swept one. The far end of shadow rays to the sun and the sky.
+    double exitDistance(const Vec3& p) const {
+        if (g_motionU >= 0.0 && hasMotion()) return length(sweptCenter - p) + sweptRadius;
+        return length(sceneCenter - p) + sceneRadius;
+    }
     Vec3 envXYZ{0, 0, 0};
     std::shared_ptr<EnvMap> envMap;   // image-based env (null => constant env)
     // Number of EmitterShape::Sun emitters, recounted by finalizeEmitters(). Every
@@ -3255,6 +3267,14 @@ struct Scene {
                     b.expand(md.bmin);
                     b.expand(md.bmax);
                 }
+            // What a path at a time of its own may still meet: the instant's bounds widened by the
+            // BVH root, which boxes every moving primitive over its whole motion (exitDistance).
+            Aabb swept = b;
+            if (hasMotion() && !bvh.nodes.empty()) swept.expand(bvh.nodes[0].box);
+            if (swept.lo.x <= swept.hi.x) {
+                sweptCenter = swept.center();
+                sweptRadius = length(swept.hi - swept.lo) * 0.5 * 1.0001;
+            }
             if (b.lo.x <= b.hi.x) {
                 sceneCenter = b.center();
                 sceneRadius = length(b.hi - b.lo) * 0.5 * 1.0001; // tiny margin

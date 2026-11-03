@@ -13,7 +13,7 @@ override:
     SHUTTER = (-0.25, 0.25)   # the camera's shutter, frames  (--shutter O C)
     MOTION = Motion((-0.5, 0.5), 5)                           (--motion A B KEYS)
 
-A shutter brings motion keys: without ``MOTION`` / ``--motion`` the keys span the shutter and
+A shutter (from the flag, ``SHUTTER``, or the ``Camera`` the file builds) brings motion keys: without ``MOTION`` / ``--motion`` the keys span the shutter and
 the instant (``(-0.5, 0.5)`` for a shutter inside it) with enough of them to land one on the
 instant. Frames go to ``png/<name>/`` (``--outdir``), each frame's ``.ftsl`` beside its image,
 and a frame whose checkpoint already holds the requested ``-spp`` is skipped, so rerunning the
@@ -90,6 +90,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     shutter = tuple(a.shutter) if a.shutter else getattr(module, "SHUTTER", None)
 
     scene = build_scene(build)
+    if shutter is None:
+        shutter = getattr(scene.camera, "shutter", None)   # one the file set on its Camera
     if shutter is not None:
         if not hasattr(scene.camera, "shutter"):
             ap.error(f"a shutter needs a loom Camera; this scene's camera is a "

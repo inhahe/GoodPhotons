@@ -2089,8 +2089,8 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
   frame's instant`. `-radcache` is switched off under a blur (a cell would mix every time in the
   shutter).
 - **What can move so far:** spheres (as a mesh where the keys stretch one), quads, triangles and
-  meshes. A moving group refuses an isosurface, a curve, a `mesh_instance` and an emissive mesh; a
-  light in one stays at the instant, with a warning.
+  meshes. An isosurface, a curve, a `mesh_instance`, an emissive mesh and a
+  light in a moving group stay at the instant, with a warning.
 - **Cost:** a moving triangle is boxed over its whole motion in the BVH, so a fast mover — a
   spinning wheel above all — makes every ray near its sweep test it; each test moves it to the
   path's time first.

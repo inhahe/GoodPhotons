@@ -9956,13 +9956,13 @@ instant pose to its pose at that key. Every child of the group shares the set; `
 consumer that reads `Scene::tris` (light sampling, mirror planes, the GPU upload, the raster)
 sees the instant, exactly as a static scene with those transforms would show it.
 
-- **Keys are placed at load** (`ftsl.h addGroup`, `refineMotion`), at explicit times
+- **Keys are placed at load** (`ftsl.h addGroup`, `moveChildren`), at explicit times
   (`Scene::motionT`). The authored keys are translate / rotate / scale / shear parameters,
   interpolated as written so a turn arcs. A set has a key at every authored key, every key of a
   moving parent's set and the instant — so `motionAt(set, u0)` is the instant pose, and no
   kink of the parent's falls between keys — and more by bisection wherever blending two
-  neighbours strays from the exact transform by over 1e-3 of a unit cube under it (a 5° turn;
-  a scale times a shear), at most 1025 keys. Between keys the transform is blended entry by entry
+  neighbours strays from the exact transform by over 1e-3 of the movers' size (a 5° turn; a
+  scale times a shear), at most 1025 keys. Between keys the transform is blended entry by entry
   (`keyedAffineAt`), so every point moves in a straight line from key to key: that is what makes
   the union of a primitive's key boxes bound it at every time (`collectPrimBoxes`). The keys are
   authored lengths and move metres, so each key's translation is scaled by the unit (`L_`).
@@ -9989,11 +9989,43 @@ sees the instant, exactly as a static scene with those transforms would show it.
 - **Where blur is not yet carried, the shutter is closed**, so no estimator mixes times: the
   camera loop in `main.cpp` closes it for every mode but R (mode P's backward half would
   otherwise blur alone), `backwardOnGpuOk` keeps a blurred mode R off the GPU, and `-radcache` is
-  off under a blur. Loader refusals keep the rest honest: registered emitters (an emissive mesh:
-  light sampling reads the instant), isosurfaces, curves and instances in a moving group; lights
-  there stay at the instant with a warning. A sphere the keys scale unevenly is tessellated
+  off under a blur. What cannot move yet stays put and says so (`stillWarning`): registered
+  emitters (an emissive mesh: light sampling reads the instant), isosurfaces, curves, instances
+  and lights in a moving group stay at the instant, so nothing mixes a moved surface with an
+  unmoved sampler. Keys are made after a group's children are built (`moveChildren`), so the
+  refinement tolerance is 1e-3 of the movers' own bounding-box diagonal, in metres, measured on
+  its corners; each stretch between breaks is first cut to turn at most 90° (so a whole turn
+  cannot hide between two keys whose blend equals the midpoint), and the key budget is spent a
+  round at a time, worst stretch first. A nested group composes its parent's exact motion
+  (`MotionChain`), not the parent's keys. A sphere the keys scale unevenly is tessellated
   (`sphereAsMesh_`), as an uneven static scale already tessellates it, so `sphereAt` may take the
   radius from the blended transform's mean column length.
+
+## Shots: `ftrace -shot` and `loom.shot` (0.405.0)
+
+A shot is three processes deep. `ftrace -shot scene.py …` (`main.cpp runShot`, before any scene
+or CUDA work) translates its ftrace-spelled shot flags into `python -m loom.shot` flags, puts
+everything else after `--` for the frames, and starts Python with `tools/loom` on `PYTHONPATH`
+(`loomlink::childEnvBlock`). It builds that command line from the UTF-16 arguments
+(`CommandLineToArgvW`), quoted for `CommandLineToArgvW` to read back, so no path depends on the
+ANSI code page. `loom.shot` (`tools/loom/loom/shot.py`) owns the timeline: it loads the file's
+`build` contract, takes `FRAMES` / `FPS` / `LOOP` / `SHUTTER` / `MOTION` from it unless the flags
+say otherwise (a shutter on the built `Camera` counts), and calls `drive.render_range`, which
+writes each frame's `.ftsl` and runs the same ftrace binary on it, one process per frame. A frame
+whose checkpoint holds the target `-spp` and has no `.stopped` marker is skipped, so the same
+command resumes the shot.
+
+**Stopping crosses the processes by file.** `runShot` joins the stop channel like a render; when
+`ftrace -stop <its pid>` arrives it writes `<temp>/ftrace_shot_<pid>.stop`, which `render_range`
+(`_run_frame`) polls: it runs `ftrace -stop <frame pid>` on the frame in progress, which writes
+its image and checkpoint, marks it `<png>.stopped`, and starts no other frame. Nothing in the
+chain is ever killed: on Ctrl-C (which the console delivers to the frame too) `_run_frame` waits
+for the frame to finish instead of letting `subprocess.run` terminate it.
+
+**Why a process per frame:** measured, a GPU render's process start and CUDA context cost 0.6 s,
+small beside a frame. One process per shot (`-serve` extended with a per-frame output and resume)
+would keep the context, the asset cache and one live window; it is ROADMAP 11's open item, and
+the temporal denoiser does not need it (each frame's guides can be saved).
 
 ## A dispersive film index, and titania (0.402.0)
 

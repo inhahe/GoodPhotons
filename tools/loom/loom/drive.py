@@ -25,7 +25,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -245,7 +244,9 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
     the whole run; each attempt resumes from the checkpoint, so nothing is redone.
     A frame that fails every attempt still raises.
     """
-    outdir = Path(outdir) if outdir is not None else default_outdir(name)
+    # Absolute: the scenes are written from this process's cwd, and each frame's ftrace runs in
+    # the repo root, so a relative directory would name two different places.
+    outdir = (Path(outdir) if outdir is not None else default_outdir(name)).resolve()
     ftrace = Path(ftrace) if ftrace is not None else find_ftrace()
     ftsl_paths = emit_frames(scene, frames, outdir, name, fps=fps, loop=loop, motion=motion,
                              frame_range=frame_range)
@@ -260,12 +261,14 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
     pngs: List[Path] = []
     for i, fp in enumerate(ftsl_paths):
         png = fp.with_suffix(".png")
-        tag = f"[loom] frame {i + 1}/{len(ftsl_paths)}"
+        k = (frame_range[0] if frame_range is not None else 0) + i   # its place on the timeline
+        tag = f"[loom] frame {k + 1}/{frames}"
         if stop is not None and stop.exists():
             print(f"{tag}: stop requested -- not starting it", flush=True)
             return pngs
         have = checkpoint_spp(png) if want is not None else None
-        if skip_existing and png.is_file() and png.stat().st_size > 0:
+        stopped_mark = Path(str(png) + ".stopped")   # left by a stop: the frame is not done
+        if skip_existing and png.is_file() and png.stat().st_size > 0 and not stopped_mark.exists():
             if want is None or (have is not None and have >= want):
                 print(f"{tag}: {png.name} done, skipping", flush=True)
                 pngs.append(png)
@@ -277,7 +280,7 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
         # knows the frame's place in the sequence; the live window's title shows it.
         cmd = [str(ftrace), "-in", str(fp), "-o", str(png),
                "-interval", f"{interval:g}", "-checkpoint", *budget,
-               "-frame-label", f"frame {i + 1}/{len(ftsl_paths)}"]
+               "-frame-label", f"frame {k + 1}/{frames}"]
         if window:
             cmd.append("-window")
         cmd.extend(extra_args)
@@ -306,15 +309,16 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
             print(f"{tag}"
                   f"{f' (attempt {attempt + 1}/{retries + 1})' if attempt else ''}: "
                   f"{' '.join(run)}", flush=True)
-            if stop is None:
-                rc = subprocess.run(run, cwd=str(repo_root())).returncode
-            else:
-                rc, stopped = _run_stoppable(run, ftrace, stop)
-                if stopped:
-                    print(f"{tag}: stop requested -- {png.name} keeps what it rendered; "
-                          f"no further frames", flush=True)
-                    return pngs
+            rc, stopped = _run_frame(run, ftrace, stop)
+            if stopped:
+                stopped_mark.write_text("stopped before it finished; a rerun resumes it\n",
+                                        encoding="utf-8")
+                print(f"{tag}: stop requested -- {png.name} keeps what it rendered; "
+                      f"no further frames", flush=True)
+                return pngs
             if rc == 0:
+                if stopped_mark.exists():
+                    stopped_mark.unlink()
                 break
             if attempt == retries:
                 raise RuntimeError(f"ftrace failed on {fp} (exit {rc}) after "
@@ -323,23 +327,39 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
         pngs.append(png)
     if stabilize:
         stabilize_exposure(pngs, anchor_file=outdir / f"{name}_exposure_anchor.txt",
-                           develop_args=_develop_args(extra_args))
+                           develop_args=_develop_args(extra_args), ftrace=ftrace)
     return pngs
 
 
-def _run_stoppable(cmd: Sequence[str], ftrace: Path, stop: Path) -> Tuple[int, bool]:
-    """Run one frame's ftrace, watching for ``stop``: when it appears, ask that render to stop
-    cleanly (``ftrace -stop <pid>``, never a kill) and wait for it. Returns (exit code,
-    whether a stop was requested)."""
+def _run_frame(cmd: Sequence[str], ftrace: Path,
+               stop: Optional[Path]) -> Tuple[int, bool]:
+    """Run one frame's ftrace and wait for it; returns (exit code, whether it was stopped).
+
+    It is never killed. When ``stop`` appears it is asked to stop cleanly (``ftrace -stop``:
+    it writes its image and checkpoint, then exits). On Ctrl-C -- which the console hands
+    ftrace too, and which it answers the same way -- this waits for it to finish rather than
+    letting :func:`subprocess.run` terminate it a quarter second later, mid-way through its
+    CUDA teardown and checkpoint, then reports the frame as stopped and passes the Ctrl-C on.
+    """
     p = subprocess.Popen(list(cmd), cwd=str(repo_root()))
-    while True:
-        try:
-            return p.wait(timeout=0.25), False
-        except subprocess.TimeoutExpired:
-            pass
-        if stop.exists():
-            subprocess.run([str(ftrace), "-stop", str(p.pid)], cwd=str(repo_root()))
-            return p.wait(), True
+    try:
+        while True:
+            try:
+                return p.wait(timeout=0.25), False
+            except subprocess.TimeoutExpired:
+                pass
+            if stop is not None and stop.exists():
+                subprocess.run([str(ftrace), "-stop", str(p.pid)], cwd=str(repo_root()))
+                return p.wait(), True
+    except KeyboardInterrupt:
+        print("[loom] Ctrl-C: waiting for ftrace to write its image and checkpoint", flush=True)
+        while True:
+            try:
+                p.wait()
+                break
+            except KeyboardInterrupt:
+                continue
+        raise
 
 
 # ftrace prints exactly one of these per image write; the number is the auto-exposure
@@ -361,7 +381,8 @@ def _frame_anchor(ftrace: Path, ftbuf: Path, png: Path,
 def stabilize_exposure(pngs: Sequence[os.PathLike], *,
                        anchor_file: Optional[os.PathLike] = None,
                        quiet: bool = False,
-                       develop_args: Sequence[str] = ()) -> Optional[float]:
+                       develop_args: Sequence[str] = (),
+                       ftrace: Optional[os.PathLike] = None) -> Optional[float]:
     """Re-develop a rendered sequence through ONE shared auto-exposure anchor.
 
     A loom sequence is rendered one ftrace process per frame, so every frame picks its
@@ -391,10 +412,13 @@ def stabilize_exposure(pngs: Sequence[os.PathLike], *,
     arguments: ``-denoise`` and its knobs, ``-ev``), passed to every re-develop so a
     frame is developed the way it was rendered.
 
+    ``ftrace`` is the binary that rendered them (default :func:`find_ftrace`), so they are
+    developed by the build that wrote them.
+
     Returns the chosen anchor, or ``None`` if no checkpoint was usable (a sequence
     rendered without ``-checkpoint`` cannot be re-developed, and is left alone).
     """
-    ftrace = find_ftrace()
+    ftrace = Path(ftrace) if ftrace is not None else find_ftrace()
     frames = [Path(p) for p in pngs]
     pairs = [(p, Path(str(p) + ".ftbuf")) for p in frames]
     usable = [(p, b) for p, b in pairs if b.is_file()]

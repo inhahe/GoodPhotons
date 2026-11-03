@@ -23,7 +23,6 @@ from loom import (  # noqa: E402
 )
 from loom.ftsl_emit import EmitCtx  # noqa: E402
 from loom.scene import emit_element  # noqa: E402
-from loom.transform import unwrap_degrees  # noqa: E402
 
 
 def _emit(el, clock, motion=None) -> str:
@@ -81,11 +80,16 @@ def test_rotation_keys_unwrap_across_the_loop_seam():
     assert ys == pytest.approx([-22.5, 0.0, 22.5])
 
 
-def test_unwrap_keeps_the_instant_and_steps_by_less_than_half_a_turn():
-    got = unwrap_degrees([(350, 0, 0), (10, 0, 0), (30, 0, 0), (50, 0, 0)], anchor=1)
-    assert [a[0] for a in got] == [-10, 10, 30, 50]
-    got = unwrap_degrees([(170, 0, 0), (-170, 0, 0)], anchor=0)
-    assert got[1][0] == 190
+def test_a_fast_spin_keeps_its_direction():
+    # 1000 degrees a frame on an open 48-frame shot: 250 degrees between neighbouring keys, which
+    # folding each key to within half a turn of the last would read as -110 -- a slow spin the
+    # wrong way round.
+    g = Group(Sphere((0, 0, 0), 0.2, "m"),
+              rotate=vec(0.0, TimeFn(lambda t: 47000.0 * t, periodic=False), 0.0))
+    clock = Clock.at_frame(10, 48, loop=False)
+    ys = [float(k.split()[2]) for k in _keys(_emit(g, clock, Motion((-0.5, 0.5), 5)))]
+    steps = [b - a for a, b in zip(ys, ys[1:])]
+    assert steps == pytest.approx([250.0] * 4, rel=1e-4)
 
 
 def test_moving_sphere_rides_a_keyed_group():

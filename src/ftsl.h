@@ -6633,16 +6633,20 @@ private:
     bool routeWarnedLight_ = false, routeWarnedInst_ = false;
     // The world transform, at each motion key, of the moving group being built (empty outside
     // one): a nested group composes its own transform with it (addGroup).
-    // A group's world transform at keys: increasing times through the motion interval (fractions,
-    // the first 0 and the last 1) and the transform at each.
-    struct TimedKeys {
-        std::vector<double> t;
-        std::vector<Affine> w;
-        bool empty() const { return t.empty(); }
-        Affine at(double u) const { return keyedAffineAt(w.data(), t.data(), (int)t.size(), u); }
+    // The moving group being built, as its children see it (not moving outside one): its exact
+    // world transform at any fraction of the motion interval -- every ancestor's authored keys
+    // interpolated as written and composed -- the times where that may kink (every authored
+    // key's, and the instant), how fast it can turn (degrees per unit of the interval, summed
+    // over the chain: refinement splits finer than that, so no whole turn hides between keys),
+    // and whether it can scale or shear a child unevenly.
+    struct MotionChain {
+        std::function<Affine(double)> at;
+        std::vector<double> breaks;
+        double turnRate = 0.0;
+        bool uneven = false;
+        bool moving() const { return (bool)at; }
     };
-    TimedKeys motionWorld_;
-    bool movingLightWarned_ = false;
+    MotionChain motionChain_;
     bool sphereAsMesh_ = false;   // the moving group being built scales its children unevenly
     // Named objects built in a moving group. What finds an object by name -- fur `on` and
     // `bald`, a medium's `bounds { object }` -- reads where it sits at the instant, so it refuses
@@ -6753,7 +6757,8 @@ private:
     bool addGroup(const Block& b, Loaded& L, const Affine& parentXf, bool& haveLight) {
         // A `motion { key { <transform> } key { ... } }` block gives the group's transform at keys
         // spread evenly over the scene's motion_interval (ROADMAP 11). Each child is built at the
-        // frame's instant, as a static group's would be, and then given the keys (applyMotion).
+        // frame's instant, as a static group's would be, and then the group's moving children
+        // get one shared set of keys (moveChildren).
         std::vector<XfParams> ownKeys;
         if (const Stmt* mo = find(b, "motion"); mo && mo->val.block) {
             for (const char* k : {"translate", "rotate", "scale", "shear"})
@@ -6775,7 +6780,7 @@ private:
             fail("group: `motion` takes a block of `key { ... }` blocks");
             return false;
         }
-        const bool moving = !ownKeys.empty() || !motionWorld_.empty();
+        const bool moving = !ownKeys.empty() || motionChain_.moving();
         if (moving && !(L.scene.motionB > L.scene.motionA)) {
             fail("a `motion` block needs the scene's `motion_interval a b` (scene { ... })");
             return false;
@@ -6783,50 +6788,49 @@ private:
         const double u0 = L.scene.motionU(0.0);   // the frame's instant
         const Affine ownStatic = ownKeys.empty() ? xfOf(xfParamsOf(b)) : Affine{};
         const Affine world = parentXf.compose(ownKeys.empty() ? ownStatic : xfOf(xfParamsAt(ownKeys, u0)));
-        // This group's world transform at its keys (none: it does not move). A key goes wherever
-        // the exact motion may kink -- every key of the parent's, every authored key of its own --
-        // and at the instant, which therefore is a key, exactly `world`; between those, keys are
-        // added by bisection wherever blending the two neighbours (as the renderer will) strays
-        // from the exact transform: the parent's keys blended, the group's own interpolated as
-        // written, so a turn arcs and a scale times a shear stays a product (refineMotion).
-        TimedKeys worldKeys;
+        // What this group's children see: its exact motion, composed onto the parent's.
+        MotionChain chain;
         if (moving) {
-            const auto exact = [&](double u) {
-                const Affine P = motionWorld_.empty() ? parentXf : motionWorld_.at(u);
+            const MotionChain parent = motionChain_;
+            chain.at = [parent, parentXf, ownKeys, ownStatic](double u) {
+                const Affine P = parent.moving() ? parent.at(u) : parentXf;
                 return P.compose(ownKeys.empty() ? ownStatic : xfOf(xfParamsAt(ownKeys, u)));
             };
-            std::vector<double> ts = {0.0, 1.0, u0};
-            ts.insert(ts.end(), motionWorld_.t.begin(), motionWorld_.t.end());
+            chain.breaks = {0.0, 1.0, u0};
+            chain.breaks.insert(chain.breaks.end(), parent.breaks.begin(), parent.breaks.end());
             for (size_t k = 1; k + 1 < ownKeys.size(); ++k)
-                ts.push_back((double)k / (double)(ownKeys.size() - 1));
-            std::sort(ts.begin(), ts.end());
-            ts.erase(std::unique(ts.begin(), ts.end()), ts.end());
-            refineMotion(ts, exact, worldKeys);
+                chain.breaks.push_back((double)k / (double)(ownKeys.size() - 1));
+            std::sort(chain.breaks.begin(), chain.breaks.end());
+            chain.breaks.erase(std::unique(chain.breaks.begin(), chain.breaks.end()), chain.breaks.end());
+            chain.turnRate = parent.turnRate;
+            chain.uneven = parent.uneven;
+            for (size_t k = 0; k + 1 < ownKeys.size(); ++k) {
+                const Vec3 d = ownKeys[k + 1].rot - ownKeys[k].rot;
+                chain.turnRate = std::max(chain.turnRate, parent.turnRate +
+                    (std::fabs(d.x) + std::fabs(d.y) + std::fabs(d.z)) * (double)(ownKeys.size() - 1));
+            }
+            for (const XfParams& p : ownKeys)
+                if (p.scl.x != p.scl.y || p.scl.y != p.scl.z || p.shr.x != 0.0 || p.shr.y != 0.0 ||
+                    p.shr.z != 0.0)
+                    chain.uneven = true;
         }
-        struct Restore { TimedKeys& slot; TimedKeys saved;
-                         ~Restore() { slot = std::move(saved); } } restore{motionWorld_, motionWorld_};
-        motionWorld_ = worldKeys;
-        // A sphere this group's keys would scale unevenly is built as a mesh, as an uneven static
-        // scale builds it (addSphere): an analytic sphere cannot become an ellipsoid.
+        struct Restore { MotionChain& slot; MotionChain saved;
+                         ~Restore() { slot = std::move(saved); } } restore{motionChain_, motionChain_};
+        motionChain_ = chain;
+        // A sphere this group's motion could scale unevenly is built as a mesh, as an uneven
+        // static scale builds it (addSphere): an analytic sphere cannot become an ellipsoid.
         struct FlagRestore { bool& slot; bool saved; ~FlagRestore() { slot = saved; } }
             restoreMesh{sphereAsMesh_, sphereAsMesh_};
-        sphereAsMesh_ = false;
-        if (moving && std::fabs(world.det()) >= 1e-30) {
-            const Affine inv = world.inverse();
-            for (const Affine& w : worldKeys.w) {
-                bool nonUniform = false;
-                w.compose(inv).uniformScale(nonUniform);
-                if (nonUniform) { sphereAsMesh_ = true; break; }
-            }
-        }
-        // A child that is not itself a group gets the keys here, all of this group's children one
-        // shared set (made with the first); a nested group gets them through motionWorld_.
-        int motionSet = -1;
+        sphereAsMesh_ = moving && chain.uneven;
+        // The primitives this group's own children add, to move together once all are built.
+        std::vector<std::pair<PrimMark, PrimMark>> movers;
         const auto child = [&](const Block& cb, auto&& add) {
             const PrimMark mk = primMark(L);
             if (!routed(cb, L, add)) return false;
-            if (moving && !cb.name.empty()) movingNames_.insert(cb.name);
-            return !moving || applyMotion(mk, worldKeys, world, motionSet, L);
+            if (!moving) return true;
+            if (!cb.name.empty()) movingNames_.insert(cb.name);
+            movers.push_back({mk, primMark(L)});
+            return true;
         };
         for (const auto& s : b.stmts) {
             const Block* cb = s.val.block.get();
@@ -6840,122 +6844,148 @@ private:
             else if (s.key == "isosurface") { if (!child(*cb, [&] { return addIsosurface(*cb, L, world); })) return false; }
             else if (s.key == "curve")    { if (!child(*cb, [&] { return addCurve(*cb, L, world); })) return false; }
             else if (s.key == "light") {
-                if (moving && !movingLightWarned_) {
-                    movingLightWarned_ = true;
-                    std::fprintf(stderr, "[ftsl] warning: a light in a moving group stays where it is at "
-                                         "the frame's instant (moving lights come later, ROADMAP 11)\n");
-                }
+                if (moving) stillWarning("a light");
                 if (!addLight(*cb, L, (cb->type == "light" ? std::string() : cb->type), world)) return false;
                 haveLight = true;
             }
             else if (s.key == "group")    { if (!routed(*cb, L, [&] { return addGroup(*cb, L, world, haveLight); })) return false; }
             else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, mesh_instance, isosurface, curve, light, group)"); return false; }
         }
-        return true;
+        return !moving || moveChildren(movers, chain, world, L);
+    }
+
+    // Say once per kind that something in a moving group stays where it is at the instant.
+    std::set<std::string> stillWarned_;
+    void stillWarning(const std::string& what) {
+        if (!stillWarned_.insert(what).second) return;
+        std::fprintf(stderr, "[ftsl] warning: %s in a moving group stays where it is at the frame's "
+                             "instant -- it cannot move yet (ROADMAP 11)\n", what.c_str());
     }
 
     // How far blending two neighbouring keys may stray from the exact motion between them, as a
-    // fraction of the size of a unit cube under the transform: blending two keys 5 degrees of turn
-    // apart strays 1e-3 of the radius.
+    // fraction of the diagonal of the moving children's bounding box: blending two keys 5 degrees
+    // of turn apart strays 1e-3 of the radius about the pivot.
     static constexpr double kMotionTol = 1e-3;
+    // The most a stretch between two keys may turn before refinement starts, so that no whole
+    // turn hides between two keys whose blend matches the midpoint (0 and 720 degrees do).
+    static constexpr double kMotionSplitDeg = 90.0;
     // The most keys a group's motion gets: every moving primitive's bounds visit each key, so
-    // this bounds the BVH build's cost. A motion that would need more keeps its breakpoints and
-    // is bisected only this far, and the loader says so.
+    // this bounds the BVH build's cost. Past it the worst stretches are split first, and the
+    // loader says so.
     static constexpr size_t kMotionMaxKeys = 1025;
 
-    // Keys at the times `ts` (sorted, from 0 to 1) and, between them, wherever `exact`'s
-    // transform at the midpoint of two neighbouring keys differs from their blend by more than
-    // kMotionTol (each half bisected again in turn), into `out`.
-    template <class F>
-    void refineMotion(const std::vector<double>& ts, const F& exact, TimedKeys& out) {
-        // The unit cube about the group's origin, in its own frame, as the probe of how far a
-        // transform carries things: its corners and its centre.
-        static const Vec3 kProbe[9] = {{-1, -1, -1}, {1, -1, -1}, {-1, 1, -1}, {1, 1, -1},
-                                       {-1, -1, 1},  {1, -1, 1},  {-1, 1, 1},  {1, 1, 1}, {0, 0, 0}};
-        const auto strays = [&](const Affine& m, const Affine& blend) {
-            double err = 0.0, size = 0.0;
-            const Vec3 o = m.apply(kProbe[8]);
-            for (const Vec3& p : kProbe) {
-                err = std::max(err, length(m.apply(p) - blend.apply(p)));
-                size = std::max(size, length(m.apply(p) - o));
+    // Give the triangles and spheres the group's own children added (`movers`) the group's keys:
+    // each the transform, in metres, from the instant (`instant`, which built them) to the group
+    // at that time. Keys go at every time the motion may kink (`chain.breaks`, the instant
+    // among them), then between them wherever blending two neighbours strays from the exact
+    // motion by more than kMotionTol of the movers' size, measured on the corners of their
+    // bounding box. Kinds that cannot move yet stay at the instant, with a warning.
+    bool moveChildren(const std::vector<std::pair<PrimMark, PrimMark>>& movers,
+                      const MotionChain& chain, const Affine& instant, Loaded& L) {
+        Scene& S = L.scene;
+        std::vector<std::pair<size_t, size_t>> tris, sphs;   // [first, end) ranges to move
+        Aabb box;
+        for (const auto& [a, z] : movers) {
+            if (z.implicits > a.implicits) stillWarning("an isosurface");
+            if (z.curveSegs > a.curveSegs) stillWarning("a curve");
+            if (z.instances > a.instances) stillWarning("a mesh_instance");
+            if (z.emitters > a.emitters) {
+                // Its light is sampled from where it sits at the instant, so it must stay there.
+                stillWarning("an emissive surface");
+                continue;
             }
-            return err > kMotionTol * (size > 0.0 ? size : 1.0);
+            if (z.tris > a.tris) tris.push_back({a.tris, z.tris});
+            if (z.spheres > a.spheres) sphs.push_back({a.spheres, z.spheres});
+            for (size_t i = a.tris; i < z.tris; ++i) {
+                box.expand(S.tris[i].v0); box.expand(S.tris[i].v1); box.expand(S.tris[i].v2);
+            }
+            for (size_t i = a.spheres; i < z.spheres; ++i) {
+                const Sphere& s = S.spheres[i];
+                box.expand(s.c - Vec3{s.r, s.r, s.r}); box.expand(s.c + Vec3{s.r, s.r, s.r});
+            }
+        }
+        if (tris.empty() && sphs.empty()) return true;
+        if (std::fabs(instant.det()) < 1e-30) {
+            fail("a moving group's transform is singular (zero scale) at the frame's instant, so "
+                 "its children cannot be built there: keep the scale off zero at time 0");
+            return false;
+        }
+        const Affine inv = instant.inverse();
+        const double lenUnit = L_;
+        // The keys are authored lengths; the vertices they move are metres (P), so the move's
+        // translation is too. Its linear part, a ratio, is the same in either.
+        const auto D = [&](double u) { Affine d = chain.at(u).compose(inv); d.t = d.t * lenUnit; return d; };
+        Vec3 probe[8];
+        for (int c = 0; c < 8; ++c)
+            probe[c] = Vec3{(c & 1) ? box.hi.x : box.lo.x, (c & 2) ? box.hi.y : box.lo.y,
+                            (c & 4) ? box.hi.z : box.lo.z};
+        const double tol = kMotionTol * std::max(length(box.hi - box.lo), 1e-9);
+        const auto err = [&](const Affine& exact, const Affine& blend) {
+            double e = 0.0;
+            for (const Vec3& p : probe) e = std::max(e, length(exact.apply(p) - blend.apply(p)));
+            return e;
         };
+        // Every break, each stretch first cut so it turns no more than kMotionSplitDeg.
+        std::vector<double> ts;
+        for (size_t i = 0; i + 1 < chain.breaks.size(); ++i) {
+            const double a = chain.breaks[i], z = chain.breaks[i + 1];
+            const int n = std::max(1, (int)std::ceil(chain.turnRate * (z - a) / kMotionSplitDeg));
+            for (int k = 0; k < n; ++k) ts.push_back(a + (z - a) * k / n);
+        }
+        ts.push_back(chain.breaks.back());
+        std::vector<double> kt(ts);
+        std::vector<Affine> kw;
+        for (double u : kt) kw.push_back(D(u));
+        // Then bisect, a round at a time, every stretch whose blend strays -- the worst first when
+        // the keys run out, so the budget goes where the motion needs it.
         bool capped = false;
-        std::function<void(double, const Affine&, double, const Affine&, int)> split =
-            [&](double a, const Affine& wa, double b, const Affine& wb, int depth) {
-                const double m = 0.5 * (a + b);
-                const Affine wm = exact(m);
-                if (!strays(wm, wa.lerp(wb, 0.5))) return;
-                if (depth >= 16 || out.t.size() + 2 > kMotionMaxKeys) { capped = true; return; }
-                split(a, wa, m, wm, depth + 1);
-                out.t.push_back(m); out.w.push_back(wm);
-                split(m, wm, b, wb, depth + 1);
-            };
-        out.t.push_back(ts[0]); out.w.push_back(exact(ts[0]));
-        for (size_t i = 1; i < ts.size(); ++i) {
-            const Affine wb = exact(ts[i]);
-            split(out.t.back(), Affine(out.w.back()), ts[i], wb, 0);
-            out.t.push_back(ts[i]); out.w.push_back(wb);
+        for (int round = 0; round < 24; ++round) {
+            struct Cut { size_t at; double e, u; Affine w; };
+            std::vector<Cut> cuts;
+            for (size_t i = 0; i + 1 < kt.size(); ++i) {
+                const double m = 0.5 * (kt[i] + kt[i + 1]);
+                const Affine wm = D(m);
+                const double e = err(wm, kw[i].lerp(kw[i + 1], 0.5));
+                if (e > tol) cuts.push_back({i, e, m, wm});
+            }
+            if (cuts.empty()) break;
+            const size_t room = kMotionMaxKeys > kt.size() ? kMotionMaxKeys - kt.size() : 0;
+            if (cuts.size() > room) {
+                capped = true;
+                std::sort(cuts.begin(), cuts.end(), [](const Cut& x, const Cut& y) { return x.e > y.e; });
+                cuts.resize(room);
+                std::sort(cuts.begin(), cuts.end(), [](const Cut& x, const Cut& y) { return x.at < y.at; });
+            }
+            if (cuts.empty()) break;
+            std::vector<double> nt;
+            std::vector<Affine> nw;
+            size_t c = 0;
+            for (size_t i = 0; i < kt.size(); ++i) {
+                nt.push_back(kt[i]); nw.push_back(kw[i]);
+                if (c < cuts.size() && cuts[c].at == i) { nt.push_back(cuts[c].u); nw.push_back(cuts[c].w); ++c; }
+            }
+            kt.swap(nt); kw.swap(nw);
         }
         if (capped)
             std::fprintf(stderr, "[ftsl] warning: a group's motion needs more than %zu keys to follow "
                                  "closely; it is blended more coarsely than %.1g of its size\n",
                          kMotionMaxKeys, kMotionTol);
-    }
-
-    // Give the primitives added since `mk` -- built with `instant`, the group's world transform
-    // at the frame's instant -- the group's keys: each the transform from the instant to the
-    // group at that key. The group's one set is made on its first moving child (`set`, -1 until
-    // then). Kinds that cannot move yet are refused by name.
-    bool applyMotion(const PrimMark& mk, const TimedKeys& worldKeys, const Affine& instant,
-                     int& set, Loaded& L) {
-        Scene& S = L.scene;
-        if (S.implicits.size() > mk.implicits || S.curveSegs.size() > mk.curveSegs ||
-            S.instances.size() > mk.instances) {
-            fail("motion keys reach only meshes, quads, triangles and spheres so far: an isosurface, "
-                 "curve or mesh_instance in a moving group is not supported yet (ROADMAP 11)");
-            return false;
-        }
-        if (S.emitters.size() > mk.emitters) {
-            // Its light is sampled from where it sits at the instant, so a path that saw it
-            // somewhere else would be weighed against the wrong surface.
-            fail("an emissive surface in a moving group is not supported yet (ROADMAP 11): give it "
-                 "no emission, or move it out of the group");
-            return false;
-        }
-        if (S.tris.size() == mk.tris && S.spheres.size() == mk.spheres) return true;
-        if (set < 0) {
-            if (std::fabs(instant.det()) < 1e-30) {
-                fail("a moving group's transform is singular (zero scale) at the frame's instant, so "
-                     "its children cannot be built there: keep the scale off zero at time 0");
-                return false;
-            }
-            const Affine inv = instant.inverse();
-            set = (int)S.motionSets.size();
-            S.motionSets.push_back(MotionKeys{(int)worldKeys.t.size(), (int)S.motionXf.size()});
-            for (size_t k = 0; k < worldKeys.t.size(); ++k) {
-                Affine d = worldKeys.w[k].compose(inv);
-                // The keys are authored lengths; the vertices they move are metres (P), so the
-                // move's translation is too. Its linear part, a ratio, is the same in either.
-                d.t = d.t * L_;
-                S.motionXf.push_back(d);
-                S.motionT.push_back(worldKeys.t[k]);
-            }
-        }
-        if (S.spheres.size() > mk.spheres) {
-            const MotionKeys& keys = S.motionSets[(size_t)set];
-            for (int k = 0; k < keys.keys; ++k) {
+        const int set = (int)S.motionSets.size();
+        S.motionSets.push_back(MotionKeys{(int)kt.size(), (int)S.motionXf.size()});
+        for (size_t k = 0; k < kt.size(); ++k) {
+            if (!sphs.empty()) {
                 bool nonUniform = false;
-                S.motionXf[(size_t)(keys.first + k)].uniformScale(nonUniform);
+                kw[k].uniformScale(nonUniform);
                 if (nonUniform) {   // addGroup builds such a sphere as a mesh (sphereAsMesh_)
                     fail("internal: an analytic sphere in a group whose motion scales it unevenly");
                     return false;
                 }
             }
+            S.motionXf.push_back(kw[k]);
+            S.motionT.push_back(kt[k]);
         }
-        for (size_t i = mk.tris; i < S.tris.size(); ++i) S.tris[i].motion = set;
-        for (size_t i = mk.spheres; i < S.spheres.size(); ++i) S.spheres[i].motion = set;
+        for (const auto& [a, z] : tris) for (size_t i = a; i < z; ++i) S.tris[i].motion = set;
+        for (const auto& [a, z] : sphs) for (size_t i = a; i < z; ++i) S.spheres[i].motion = set;
         return true;
     }
 

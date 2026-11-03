@@ -128,16 +128,17 @@ class EmitCtx:
         """
         if self.motion is None:
             return [(self.clock, self.cache)]
+        return [self.offset_clock(d) for d in self.motion.offsets()]
+
+    def offset_clock(self, d: float) -> Tuple[Clock, Optional[Cache]]:
+        """The clock ``d`` frames from this frame's instant (see :meth:`key_clocks`), and a
+        cache to evaluate with there: the frame's own at ``d == 0``, else a scope of its own."""
         c = self.clock
+        if d == 0.0:
+            return c, self.cache
         step = (1.0 / c.frames) if c.loop else (1.0 / (c.frames - 1) if c.frames > 1 else 1.0)
-        out: List[Tuple[Clock, Optional[Cache]]] = []
-        for d in self.motion.offsets():
-            if d == 0.0:
-                out.append((c, self.cache))
-                continue
-            kc = Clock(t=c.t + d * step, frame=c.frame, frames=c.frames, fps=c.fps, loop=c.loop)
-            out.append((kc, self.cache.scope(("motion-key", d)) if self.cache is not None else None))
-        return out
+        kc = Clock(t=c.t + d * step, frame=c.frame, frames=c.frames, fps=c.fps, loop=c.loop)
+        return kc, (self.cache.scope(("motion-key", d)) if self.cache is not None else None)
 
     def asset_path(self, name: str, ext: str) -> Path:
         import tempfile
