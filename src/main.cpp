@@ -14950,7 +14950,7 @@ static void buildFurFields(const Scene& scene) {
 // longer fall back — these two option gates are now the ONLY reasons a fur scene leaves
 // the GPU backward path.)
 static bool backwardOnGpuOk(const Scene& scene, const Camera& cam) {
-    if (scene.hasMotion() && cam.hasShutter()) return false;   // motion blur: CPU only so far
+    if (cam.seesMotion(scene)) return false;   // motion blur: CPU only so far
     if (g_furVolume && g_furVolData.valid()) return false;
     if (g_dualScatter)
         for (const auto& m : scene.mats)
@@ -15674,7 +15674,7 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
     // what makes the preview get cheaper as you look around.
     // Not under motion blur: a cell's value would mix every time in the shutter, and a path at one
     // time would read radiance from the others.
-    const bool blurred = scene.hasMotion() && cam.hasShutter();
+    const bool blurred = cam.seesMotion(scene);
     if (g_radCache && blurred) {
         static bool said = false;
         if (!said) { said = true; std::printf("[radcache] off: motion blur renders without the radiance cache\n"); }
@@ -17028,7 +17028,8 @@ struct Checkpoint {
 
 // A cheap identity hash so a resume refuses to blend photons from a different scene,
 // mode, or resolution into the saved film (which would silently corrupt the result).
-static uint64_t checkpointGuard(const Scene& scene, char mode, int res, int resY) {
+static uint64_t checkpointGuard(const Scene& scene, char mode, int res, int resY,
+                                const Camera* cam = nullptr) {
     uint64_t h = 14695981039346656037ULL;                 // FNV-1a offset basis
     auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ULL; };
     mix((uint64_t)scene.tris.size());
@@ -17038,14 +17039,18 @@ static uint64_t checkpointGuard(const Scene& scene, char mode, int res, int resY
     mix((uint64_t)(unsigned char)mode);
     mix((uint64_t)(unsigned)res);
     mix((uint64_t)(unsigned)resY);
-    // Only a moving scene mixes these, so every static scene keeps the guard its sidecars hold.
+    // Only a moving scene mixes these, so every static scene keeps the guard its sidecars hold:
+    // every key of every motion set, and the shutter of a camera that sees the motion.
     if (scene.hasMotion()) {
+        auto mixD = [&](double d) { uint64_t v; std::memcpy(&v, &d, sizeof v); mix(v); };
         mix((uint64_t)scene.motionXf.size());
-        for (const Affine& D : scene.motionXf) {
-            uint64_t v; std::memcpy(&v, &D.t.x, sizeof v); mix(v);
-            std::memcpy(&v, &D.t.y, sizeof v); mix(v);
-            std::memcpy(&v, &D.t.z, sizeof v); mix(v);
+        for (size_t k = 0; k < scene.motionXf.size(); ++k) {
+            const Affine& D = scene.motionXf[k];
+            for (double m : D.m) mixD(m);
+            mixD(D.t.x); mixD(D.t.y); mixD(D.t.z);
+            mixD(scene.motionT[k]);
         }
+        if (cam && cam->seesMotion(scene)) { mixD(cam->shutterOpen); mixD(cam->shutterClose); }
     }
     return h;
 }
@@ -18818,7 +18823,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             const bool bwOk = g_whitted
                             ? cudaBackwardWhittedSupported(scene, cam, whittedOpts)
                             : backwardOnGpuOk(scene, cam);
-            const bool blurOnCpu = scene.hasMotion() && cam.hasShutter();
+            const bool blurOnCpu = cam.seesMotion(scene);
             if (!bwOk || blurOnCpu) {
                 const char* why = blurOnCpu
                     ? "motion blur (a camera shutter on a moving scene) renders on the CPU so far"
@@ -19058,7 +19063,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
                                  timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
                                  renderChunked, res, resY, resume, ckpt,
-                                 checkpointGuard(scene, mode, res, resY), mode);
+                                 checkpointGuard(scene, mode, res, resY, &cam), mode);
     }
 
     // --- Validation (mode V) ---
@@ -19133,7 +19138,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
                                  timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
                                  renderChunked, res, resY, resume, ckpt,
-                                 checkpointGuard(scene, mode, res, resY), mode);
+                                 checkpointGuard(scene, mode, res, resY, &cam), mode);
     }
 
     // --- UPBP (mode J) — BDPT connections MIS-combined with photon-beam merges ------
@@ -19955,7 +19960,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         return runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
                                  timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
                                  renderChunked, res, resY, resume, ckpt,
-                                 checkpointGuard(scene, mode, res, resY), mode);
+                                 checkpointGuard(scene, mode, res, resY, &cam), mode);
     }
 
     // --- Photon-mapped final gather (mode M) — ROADMAP item 1 ---------------------
@@ -20160,7 +20165,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             const auto out = runSppProgressive(outPath, spp, manualExposure, exposureAnchor, scene.absolute,
                                          timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
                                          renderChunked, res, resY, resume, mCkpt,
-                                         checkpointGuard(scene, mode, res, resY), mode);
+                                         checkpointGuard(scene, mode, res, resY, &cam), mode);
             mStats().report(std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - tM0).count());
             gaDiagReport(scene);          // FTRACE_GADIAG=1; silent otherwise
@@ -20366,7 +20371,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         return runCompositeProgressive(scene, cam, res, resY, N, spp, nThreads, diffraction,
                                        useGpu, wavefront, outPath, manualExposure, exposureAnchor,
                                        timeBudgetSec, noiseTarget, runForever, intervalSec, preview,
-                                       resume, ckpt, checkpointGuard(scene, mode, res, resY));
+                                       resume, ckpt, checkpointGuard(scene, mode, res, resY, &cam));
     }
 
     // --- Forward camera models A/B/C ---------------------------------------
@@ -20379,7 +20384,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // resume can't double-count it).
     const bool progressive = timeBudgetSec > 0.0 || runForever || noiseTarget > 0.0;   // batch loop modes
     const bool wantCheckpoint = resume || progressive || wantCheckpointFlag;
-    const uint64_t guard = checkpointGuard(scene, mode, res, resY);
+    const uint64_t guard = checkpointGuard(scene, mode, res, resY, &cam);
     const std::string backend = useGpu ? std::string("GPU")
                                        : (std::to_string(nThreads) + " CPU threads");
 
@@ -23863,14 +23868,14 @@ static int run(int argc, char** argv) {
             // Motion blur reaches mode R (and W) only so far (ROADMAP 11): any other mode renders
             // the frame's instant, its shutter closed here so no half of it (mode P's backward
             // part, say) blurs while the rest does not.
-            if (scene.hasMotion() && c.hasShutter() && cmode != 'R') {
+            if (c.seesMotion(scene) && cmode != 'R') {
                 static uint64_t saidFor = 0;   // once per scene, not per frame of a path
                 if (saidFor != scene.generation) {
                     saidFor = scene.generation;
                     std::printf("[motion] camera '%s': mode %c renders the frame's instant -- only "
-                                "mode R (and W) blurs motion so far\n", cs->name.c_str(), cmode);
+                                "mode R (and W) sees motion so far\n", cs->name.c_str(), cmode);
                 }
-                c.shutterClose = c.shutterOpen;
+                c.shutterOpen = c.shutterClose = 0.0;
             }
             // Exposure-lock group: a global -exposure-lock forces one shared anchor
             // (group 0) across every camera; otherwise a per-path `exposure_lock`

@@ -82,7 +82,23 @@ passes the wheel tests most of its triangles, each moved to the ray's time first
 `motion { key { rotate 0 0 0 } key { rotate 0 0 90 } }`, mode R under a shutter, against the same
 scene without one. Proper fix: split the BVH in time where the swept boxes overlap badly (Embree's
 MSMBlur, Grünschloß et al. 2011), so a ray at time t descends only into the nodes of its time
-segment. Not done in stage A: it only costs speed, and the blur's other stages come first.
+segment. Not done in stage A: it only costs speed, and the blur's other stages come first. Two
+smaller costs on the same path (review of 0.404.0): `Scene::intersectMovingTri` blends the set's
+transform afresh for every candidate although a path's time and set are fixed (a per-thread
+(set, u) -> D cache would hoist it), and the any-hit queries (`occluded`, `shadowTransmittance`)
+rebuild the whole moved triangle just to return a bool (they could return after `triCross`).
+
+## OPEN (2026-11-03, 0.404.1): MOTION-SPHERE-UV — an analytic sphere's UV map does not turn with its group
+
+A `Sphere` is a centre and a radius: it has no orientation, so its equirectangular UVs and
+tangent frame are fixed in world axes. A static `rotate` on its group already leaves the map
+unturned, and under motion keys a turning textured ball travels but does not spin, and its
+texture does not blur round it (`Scene::sphereAt`). Reproduce: a textured `sphere` in
+`group { motion { key { rotate 0 0 0 } key { rotate 0 180 0 } } … }` under a shutter. Proper fix:
+give `Sphere` a frame (a rotation, set from its group's transform at load and moved by
+`motionAt`), read by the sphere's UV and tangent code on both devices — which changes how a
+statically rotated textured sphere renders too, so it wants its own version bump and check.
+Until then: tessellate the sphere (an uneven scale does it, or a mesh).
 
 ## OPEN (2026-11-03, 0.404.0): MOTION-PATTERN-SPACE — a procedural pattern stays put while the surface carrying it moves
 

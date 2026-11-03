@@ -244,6 +244,11 @@ inline Images render(const Scene& scene, const Camera& cam, int W, int H, int si
     g.clean = !cam.hasLens();
     Renderer rr;
     const double inv = 1.0 / ((double)side * side);
+    // Under motion blur each guide ray sees the scene at its own time in the shutter, stratified
+    // over the pixel's rays, so the guides smear as the image does: a sharp guide would hand the
+    // denoiser edges the image does not have. Drawn after the subpixel jitter, so a scene the
+    // camera sees still draws exactly what it drew before.
+    const bool timed = cam.seesMotion(scene);
     const bool ok = ft::parallelFor((size_t)H, 1, [&](size_t row) {
         const int py = (int)row;
         for (int px = 0; px < W; ++px) {
@@ -254,6 +259,9 @@ inline Images render(const Scene& scene, const Camera& cam, int W, int H, int si
             for (int sy = 0; sy < side; ++sy)
                 for (int sx = 0; sx < side; ++sx) {
                     const double jx = (sx + rng.uniform()) / side, jy = (sy + rng.uniform()) / side;
+                    const double ts = timed ? ((sy * side + sx) + rng.uniform()) / ((double)side * side)
+                                            : 0.0;
+                    const MotionTimeScope at(timed ? scene.motionU(cam.shutterTime(ts)) : -1.0);
                     Ray ray;
                     if (cam.hasLens()) {
                         double w = 0.0;

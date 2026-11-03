@@ -2069,7 +2069,7 @@ camera "c" { eye 0 1 4  look_at 0 0.4 0  shutter_open -0.25  shutter_close 0.25 
 ```
 
 Each camera path then sees the scene at one time drawn evenly over `[shutter_open,
-shutter_close]` — every bounce, shadow ray and probe of that path at the same time — so whatever
+shutter_close]` (equal values: the scene sharp at that one time) — every bounce, shadow ray and probe of that path at the same time — so whatever
 moves in that span smears along its motion, exactly as the average of the frames at every time
 in the shutter would. A pixel's samples spread their times evenly over the shutter (a radical
 inverse, rotated per pixel), so a blur grains less than random times would; mode `W` gives every

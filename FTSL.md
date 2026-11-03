@@ -3087,7 +3087,10 @@ at two or more `key`s, spread evenly over the scene's `motion_interval` (§2); e
 same four statements a group does. Between keys the transform is interpolated **as written** —
 translate, rotate (degrees), scale and shear each linearly — so a key turning 90° turns through
 the arc rather than cutting across it, and `rotate 0 0 0` → `rotate 0 720 0` is two whole turns.
-Before the first key and after the last, the group holds still.
+Before the first key and after the last, the group holds still. (ftrace keeps every authored key,
+every key of a moving parent and the instant as keys of its own, and adds keys in between wherever
+blending two of them would stray from the motion as written by more than 0.1% of the group's
+size.)
 
 - **The scene a render sees is the group at the frame's instant (time 0).** A camera without a
   shutter renders exactly that — byte for byte the scene with each group's transform at 0 written
@@ -3099,9 +3102,12 @@ Before the first key and after the last, the group holds still.
   refuses an `isosurface`, a `curve`, a `mesh_instance` and an emissive mesh (a registered light:
   its light is sampled where it sits at the instant), each by name; a `light` in it stays where
   it is at the instant, with a warning. What finds an object by name — `fur { on }` and `bald`, a
-  medium's `bounds { object }` — refuses one in a moving group, which it could not follow. A procedural `pattern` reads world position, so it stays in place while the surface
+  medium's `bounds { object }`, `settle { collide }` — refuses one in a moving group, which it
+  could not follow. A procedural `pattern` reads world position, so it stays in place while the surface
   carrying it moves through it — as it does from one frame of an animation to the next; UV
-  textures, vertex colours and per-vertex data move with the surface.
+  textures, vertex colours and per-vertex data move with the surface — except on an analytic
+  `sphere`, whose UV map is fixed in world orientation (as it is under a static `rotate`): it
+  travels with the sphere but does not turn with it; tessellate it (a mesh) to turn a textured ball.
 - **Which modes blur:** mode R (and W) on the CPU. On `-device gpu` a blurred mode R stays on the
   CPU and says so; every other mode renders the frame's instant and prints one note (ROADMAP 11
   lists the rest).
@@ -3139,7 +3145,7 @@ camera "cam" {
 | `lens <mm>` | — | focal length; sets fov_y = 2·atan(filmH/2f); overrides `fov_y` |
 | `fstop <N>` | — | aperture radius = focal/2N; seats film at image distance for A/C DoF |
 | `zoom <x>` | 1 | multiplies focal length (x>1 tele/narrower) |
-| `shutter_open <t>` / `shutter_close <t>` | 0 / 0 | the shutter, in frames relative to the frame's instant: each camera path sees the scene at one time drawn evenly from `[open, close]`, so whatever moves in that span (§13.1) blurs. Equal (the default) is an instantaneous shutter. `close` before `open` is an error. A 180° shutter at 24 fps is `-0.25 0.25`. Not the film's `shutter`, which only scales exposure |
+| `shutter_open <t>` / `shutter_close <t>` | 0 / 0 | the shutter, in frames relative to the frame's instant: each camera path sees the scene at one time drawn evenly from `[open, close]`, so whatever moves in that span (§13.1) blurs. Equal values are an instantaneous shutter at that time: both 0 (the default) is the frame's instant, `shutter_open 0.3  shutter_close 0.3` the scene sharp 0.3 frames later. `close` before `open` is an error. A 180° shutter at 24 fps is `-0.25 0.25`. Not the film's `shutter`, which only scales exposure |
 
 ### 14.2 `film { … }`
 

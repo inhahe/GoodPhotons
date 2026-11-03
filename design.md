@@ -9956,13 +9956,19 @@ instant pose to its pose at that key. Every child of the group shares the set; `
 consumer that reads `Scene::tris` (light sampling, mirror planes, the GPU upload, the raster)
 sees the instant, exactly as a static scene with those transforms would show it.
 
-- **Keys are resampled at load** (`ftsl.h addGroup`). The authored keys are translate / rotate /
-  scale / shear parameters, interpolated as written so a turn arcs; the set holds them sampled
-  until no step turns more than 5° (at most 256 steps), and a moving parent's set is composed in
-  at the finer of the two spacings. Between set entries the transform is blended entry by entry
-  (`Affine::lerp`), so every point moves in a straight line from key to key: that is what makes
-  the union of a primitive's key boxes bound it at every time (`collectPrimBoxes`), and the 5°
-  step what keeps the blend within 0.1% of the arc.
+- **Keys are placed at load** (`ftsl.h addGroup`, `refineMotion`), at explicit times
+  (`Scene::motionT`). The authored keys are translate / rotate / scale / shear parameters,
+  interpolated as written so a turn arcs. A set has a key at every authored key, every key of a
+  moving parent's set and the instant — so `motionAt(set, u0)` is the instant pose, and no
+  kink of the parent's falls between keys — and more by bisection wherever blending two
+  neighbours strays from the exact transform by over 1e-3 of a unit cube under it (a 5° turn;
+  a scale times a shear), at most 1025 keys. Between keys the transform is blended entry by entry
+  (`keyedAffineAt`), so every point moves in a straight line from key to key: that is what makes
+  the union of a primitive's key boxes bound it at every time (`collectPrimBoxes`). The keys are
+  authored lengths and move metres, so each key's translation is scaled by the unit (`L_`).
+- **A moving scene is bounded at its instant** (`Scene::build`: the prims' unswept boxes, which
+  is the static scene's BVH root exactly), so `sceneCenter` / `sceneRadius` — the environment's
+  emission disk, the default cavity radius — do not move when something gets keys.
 - **A path's time is thread-local** (`geometry.h g_motionU`, a fraction of the interval, negative
   for "the instant"), set for the whole path by `MotionTimeScope`. The scene's query leaves
   (`closestHit`, `occluded`, `shadowTransmittance`, their variants, the linear reference) test a
@@ -9975,7 +9981,11 @@ sees the instant, exactly as a static scene with those transforms would show it.
   draws each path's time off `shutterU`: a radical inverse in base 79 (the first prime no other
   lattice takes) over the pixel's sample index, rotated per pixel by a salted stream — stratified
   within a pixel, decorrelated across pixels — or by 0.5 for every pixel in mode W, which stays
-  deterministic. The main rng draws exactly what it draws without blur.
+  deterministic. The main rng draws exactly what it draws without blur. Equal open and close
+  times are a sharp frame at that time; `Camera::seesMotion(scene)` is the one test every gate
+  asks. The `-oidn` guide pass gives each guide ray a time of its own (stratified over the
+  pixel's rays), so the guides blur as the image does; the resume guard mixes every key and the
+  shutter.
 - **Where blur is not yet carried, the shutter is closed**, so no estimator mixes times: the
   camera loop in `main.cpp` closes it for every mode but R (mode P's backward half would
   otherwise blur alone), `backwardOnGpuOk` keeps a blurred mode R off the GPU, and `-radcache` is

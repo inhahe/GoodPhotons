@@ -193,9 +193,25 @@ struct MotionTimeScope {
     MotionTimeScope& operator=(const MotionTimeScope&) = delete;
 };
 
-// A moving group's keys: `keys` (at least 2) transforms, spread evenly over the scene's motion
-// interval, starting at `first` in Scene::motionXf.
+// A moving group's keys: `keys` (at least 2) transforms at increasing times through the scene's
+// motion interval (fractions, the first 0 and the last 1), starting at `first` in
+// Scene::motionXf / motionT.
 struct MotionKeys { int keys = 0; int first = 0; };
+
+// The transform at the fraction u of the motion interval, of `n` (>= 2) keys at the increasing
+// times `t` (t[0] = 0, t[n-1] = 1): the two keys bracketing u blended entry by entry (Affine::
+// lerp), so a point moves in a straight line from key to key; u is clamped to [0, 1]. A u
+// exactly on a key's time gives that key exactly.
+inline Affine keyedAffineAt(const Affine* keys, const double* t, int n, double u) {
+    if (!(u > 0.0)) return keys[0];
+    if (u >= 1.0) return keys[n - 1];
+    int lo = 0, hi = n - 1;                 // t[lo] <= u < t[hi]
+    while (hi - lo > 1) {
+        const int mid = (lo + hi) / 2;
+        if (t[mid] <= u) lo = mid; else hi = mid;
+    }
+    return keys[lo].lerp(keys[hi], (u - t[lo]) / (t[hi] - t[lo]));
+}
 
 // The pair of keys bracketing the fraction u of the motion interval, and how far between them u
 // lies: keys i and i + 1, fraction f in [0, 1]. u is clamped to [0, 1].

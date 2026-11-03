@@ -93,10 +93,19 @@ struct Camera {
     double frustumShiftX = 0.0;
 
     // The shutter, in frames relative to the frame's instant (ROADMAP 11): each path the camera
-    // starts is given a time drawn uniformly from [shutterOpen, shutterClose], so whatever moves
-    // in that span blurs. Equal (the default) is an instantaneous shutter -- the frame's instant.
+    // starts is given a time drawn evenly from [shutterOpen, shutterClose], so whatever moves in
+    // that span blurs. Equal values are an instantaneous shutter at that time -- both 0 (the
+    // default) the frame's instant, which every primitive's own fields already hold.
     double shutterOpen = 0.0, shutterClose = 0.0;
-    bool hasShutter() const { return shutterClose > shutterOpen; }
+    // Whether the shutter asks for anything but the instant.
+    bool timed() const { return shutterOpen != 0.0 || shutterClose != 0.0; }
+    // The time, in frames, a fraction s in [0, 1) of the way through the shutter.
+    double shutterTime(double s) const { return shutterOpen + (shutterClose - shutterOpen) * s; }
+    // Whether this camera sees `scene` at times other than the instant: the one test every
+    // estimator, device gate and cache gate asks before tracing a path at a time of its own.
+    template <class SceneT> bool seesMotion(const SceneT& scene) const {
+        return timed() && scene.hasMotion();
+    }
 
     // Optional physical multi-element lens (the "mesh-lens" camera). When set, the
     // backward reference tracer (mode R) generates rays by tracing them from the film

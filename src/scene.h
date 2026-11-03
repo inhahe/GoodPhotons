@@ -1617,14 +1617,16 @@ struct Scene {
     double motionA = 0.0, motionB = 0.0;
     // A moving group's keys, one set per group, shared by every primitive in it:
     // motionSets[Tri::motion or Sphere::motion] names `keys` consecutive transforms in motionXf,
-    // each taking the primitive from where it sits at the frame's instant (its own fields) to
-    // where it is at that key. Between keys the transform is blended entry by entry
-    // (Affine::lerp), so every point moves in a straight line from key to key -- which is what
-    // lets the union of a primitive's key boxes bound it at every time (collectPrimBoxes). The
-    // loader spaces the keys closely enough that a rotation arcs rather than cutting the chord
-    // (addGroup).
+    // at the times (fractions of the motion interval) in motionT, each taking the primitive from
+    // where it sits at the frame's instant (its own fields) to where it is at that key. Between
+    // keys the transform is blended entry by entry (keyedAffineAt), so every point moves in a
+    // straight line from key to key -- which is what lets the union of a primitive's key boxes
+    // bound it at every time (collectPrimBoxes). The loader places keys at every authored key,
+    // every parent key and the instant, and between them wherever blending would stray from the
+    // exact motion (addGroup).
     std::vector<MotionKeys> motionSets;
     std::vector<Affine>     motionXf;
+    std::vector<double>     motionT;
     bool hasMotion() const { return !motionSets.empty(); }
     // A time in frames (relative to the frame's instant) as the fraction of the motion interval
     // g_motionU holds, clamped to it.
@@ -1636,10 +1638,7 @@ struct Scene {
     // Motion set `set`'s transform at the fraction u of the motion interval.
     Affine motionAt(int set, double u) const {
         const MotionKeys& mk = motionSets[(size_t)set];
-        int i; double f;
-        motionBracket(mk.keys, u, i, f);
-        const Affine& a = motionXf[(size_t)(mk.first + i)];
-        return a.lerp(motionXf[(size_t)(mk.first + i) + 1], f);
+        return keyedAffineAt(&motionXf[(size_t)mk.first], &motionT[(size_t)mk.first], mk.keys, u);
     }
     // Triangle `t` carried by the transform D: vertices and normals moved, everything else (UVs,
     // material, colour) its own, and the derived fields (gn, tangent, curvature, reach)
@@ -3221,7 +3220,17 @@ struct Scene {
         // the env phase-space weight envGeom = 4*PI^2*R^2.
         {
             Aabb b;
-            if (!bvh.nodes.empty()) b = bvh.nodes[0].box;
+            // A moving scene is bounded where it sits at the instant, as the same scene held
+            // still would be: the BVH root covers every primitive's whole motion, and taking it
+            // would move the scene's centre and radius -- and with them the environment's
+            // emission disk, the default cavity radius -- as soon as anything got keys.
+            if (hasMotion()) {
+                std::vector<Aabb> still;
+                collectPrimBoxes(still, /*dropHair=*/false, nullptr, /*swept=*/false);
+                for (const Aabb& x : still) b.expand(x);
+            } else if (!bvh.nodes.empty()) {
+                b = bvh.nodes[0].box;
+            }
             // Geometry summarised into a medium and deleted (a `-fur-volume` coat) is still
             // physically there — it just isn't traced. Put its extent back so the bounding
             // sphere, and therefore environment emission, is the one the strands would have
@@ -3386,7 +3395,9 @@ struct Scene {
     // With `dropHair`, hair curve segments are omitted and `remap` (required) receives, for
     // each box kept, the GLOBAL prim index it came from — so the caller can decode a leaf
     // from the filtered tree with the unfiltered arithmetic.
-    void collectPrimBoxes(std::vector<Aabb>& boxes, bool dropHair, std::vector<int>* remap) const {
+    // `swept` false boxes a moving primitive where it sits at the instant, not over its motion.
+    void collectPrimBoxes(std::vector<Aabb>& boxes, bool dropHair, std::vector<int>* remap,
+                          bool swept = true) const {
         const double pad = 1e-6;       // avoid zero-thickness slabs on flat prims
         boxes.clear();
         boxes.reserve(tris.size() + spheres.size() + implicits.size() +
@@ -3398,7 +3409,7 @@ struct Scene {
         // its every position is a blend of two keyed ones and lies in the union of their boxes.
         for (const auto& t : tris) {
             Aabb b; b.expand(t.v0); b.expand(t.v1); b.expand(t.v2);
-            if (t.motion >= 0) {
+            if (swept && t.motion >= 0) {
                 const MotionKeys& mk = motionSets[(size_t)t.motion];
                 for (int k = 0; k < mk.keys; ++k) {
                     const Affine& D = motionXf[(size_t)(mk.first + k)];
@@ -3410,7 +3421,7 @@ struct Scene {
         }
         for (const auto& s : spheres) {
             Aabb b; b.expand(s.c - Vec3{s.r, s.r, s.r}); b.expand(s.c + Vec3{s.r, s.r, s.r});
-            if (s.motion >= 0) {
+            if (swept && s.motion >= 0) {
                 // Between keys the radius is at most the blend of the keys' (a blended matrix's
                 // column is no longer than the blend of the columns' lengths), so these suffice.
                 const MotionKeys& mk = motionSets[(size_t)s.motion];

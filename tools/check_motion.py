@@ -2,18 +2,24 @@
 
     D:/python314/python.exe -u tools/check_motion.py [--out <dir>] [--exe ftrace.exe] [--no-gpu]
 
-A box lit by a ceiling panel holds three moving groups: a sphere sliding left to right, a cube
-turning a quarter turn about y, and a nested pair -- a group rising, holding a group that turns
--- over the scene's `motion_interval -0.5 0.5`. It requires:
+A box lit by a ceiling panel holds four moving groups over the scene's `motion_interval -0.5 0.5`:
+a sphere sliding left to right, a cube turning a quarter turn about y, a nested pair -- a group
+that rises and then, from the instant on, moves sideways, holding a group that turns -- and a
+cube whose keys scale and shear it together. It requires:
 
   * Without a shutter, the moving scene renders BYTE FOR BYTE what a static scene holding each
-    group at the frame's instant renders (mode R on the CPU, and on the GPU unless --no-gpu): the
-    keys change nothing but the bounds the BVH is built from.
+    group at the frame's instant renders (mode R on the CPU, and on the GPU unless --no-gpu), even
+    with a ball whose motion reaches 60 m off the stage, on a floor whose albedo follows `cavity`
+    (whose default probe radius is a share of the scene's size): the keys change nothing but the
+    bounds the BVH is built from, and the scene's own bounds stay its instant's.
   * With `shutter_open -0.5  shutter_close 0.5`, mode R renders the average over the shutter of
     the static scenes: held against the mean of 32 static renders at evenly spaced times (the
-    groups' transforms there written out as plain translate/rotate, interpolated as the loader
-    interpolates keys), over 8x8-pixel blocks of luminance, each within 5 standard errors or
-    3 %. The blur must be real: the blurred and instant frames differ in many blocks.
+    groups' transforms there written out as plain translate/rotate/scale/shear, interpolated as
+    the loader interpolates keys), over 8x8-pixel blocks of luminance, each within 5 standard
+    errors or 3 %. The blur must be real: the blurred and instant frames differ in many blocks.
+    The same scene authored in centimetres blurs the same.
+  * An instantaneous shutter away from the instant (`shutter_open t  shutter_close t`) renders the
+    static scene at t, for three t, the same block test.
   * Mode W blurs too, deterministically (two runs agree byte for byte, and differ from the
     instant).
   * `-checkbvh` passes on a scene of moving triangles and spheres -- every other ray at a random
@@ -42,66 +48,103 @@ SPP = 1024                   # blurred mode R, per seed
 TIMES = 32                   # static instants averaged for the reference
 SPP_T = 64                   # per instant, per seed
 
-# The three moving groups' keys at u = 0 and u = 1 of the motion interval [-0.5, 0.5]. Each key is
-# (translate, rotate); the loader interpolates these linearly in between.
-SLIDE = (((-0.8, 0.35, 0.3), (0, 0, 0)), ((0.8, 0.35, 0.3), (0, 0, 0)))
-TURN = (((0.9, 0.3, -0.5), (0, 0, 0)), ((0.9, 0.3, -0.5), (0, 90, 0)))
-RISE = (((-0.9, 0.0, -0.4), (0, 0, 0)), ((-0.9, 0.5, -0.4), (0, 0, 0)))
-SPIN = (((0, 0.3, 0), (0, 0, 0)), ((0, 0.3, 0), (0, 0, 60)))
-
-
-def lerp3(a, b, f):
-    return tuple(x + (y - x) * f for x, y in zip(a, b))
+# The moving groups, each a list of keys spread evenly over the motion interval [-0.5, 0.5]; a key
+# sets translate / rotate / scale / shear, and the loader interpolates each linearly between keys.
+SLIDE = [dict(translate=(-0.8, 0.35, 0.3)), dict(translate=(0.8, 0.35, 0.3))]
+TURN = [dict(translate=(0.9, 0.3, -0.5)), dict(translate=(0.9, 0.3, -0.5), rotate=(0, 90, 0))]
+# A parent that kinks at the instant -- up, then sideways -- holding a child that turns at its own
+# pace: the child's keys must still include the parent's kink and the instant.
+RISE = [dict(translate=(-0.9, 0.0, -0.4)), dict(translate=(-0.9, 0.4, -0.4)),
+        dict(translate=(-0.5, 0.45, -0.4))]
+SPIN = [dict(translate=(0, 0.3, 0)), dict(translate=(0, 0.3, 0), rotate=(0, 0, 15))]
+# Scale and shear changing together: their product is not linear, so blending two keys is not
+# the transform as written in between.
+STRETCH = [dict(translate=(0.15, 0.12, -0.9)),
+           dict(translate=(0.15, 0.12, -0.9), scale=(1.8, 1.8, 1.8), shear=(0.8, 0, 0))]
+# Extras for the instant test: a ball that waits, then flies far off the stage -- the moving
+# scene's sweep reaching well past the static one's bounds -- over a floor read through `cavity`,
+# whose default probe radius is sized by those bounds.
+FLY = [dict(translate=(-0.5, 1.6, -1.2)), dict(translate=(-0.5, 1.6, -1.2)),
+       dict(translate=(60.0, 1.6, -1.2))]
+FIELDS = (("translate", (0, 0, 0)), ("rotate", (0, 0, 0)), ("scale", (1, 1, 1)), ("shear", (0, 0, 0)))
 
 
 def at(keys, u):
-    (t0, r0), (t1, r1) = keys
-    return lerp3(t0, t1, u), lerp3(r0, r1, u)
+    """The group's fields at u in [0, 1], interpolated linearly between its evenly spread keys."""
+    s = min(max(u, 0.0), 1.0) * (len(keys) - 1)
+    i = min(int(s), len(keys) - 2)
+    f = s - i
+    out = {}
+    for name, dflt in FIELDS:
+        a, b = keys[i].get(name, dflt), keys[i + 1].get(name, dflt)
+        out[name] = tuple(x + (y - x) * f for x, y in zip(a, b))
+    return out
 
 
-def v3(v):
-    return " ".join(repr(float(x)) for x in v)
+def v3(v, k=1.0):
+    return " ".join(repr(float(x) * k) for x in v)
 
 
-def xf(keys, u):
+def fields(d, k):
+    """A key's statements; translate is a length (times the unit factor k), the rest are not."""
+    return "  ".join("%s %s" % (n, v3(d.get(n, dflt), k if n == "translate" else 1.0))
+                     for n, dflt in FIELDS if n in d or n == "translate")
+
+
+def xf(keys, u, k):
     """The group transform at u, or its motion block when u is None."""
     if u is None:
-        return "motion { %s }" % "  ".join("key { translate %s  rotate %s }" % (v3(t), v3(r))
-                                          for t, r in keys)
-    t, r = at(keys, u)
-    return "translate %s  rotate %s" % (v3(t), v3(r))
+        return "motion { %s }" % "  ".join("key { %s }" % fields(key, k) for key in keys)
+    return fields(at(keys, u), k)
 
 
-CUBE = NL.join([
-    "quad { origin -0.25 -0.25  0.25  u 0.5 0 0  v 0 0.5 0  material %(m)s }",
-    "quad { origin  0.25 -0.25 -0.25  u -0.5 0 0  v 0 0.5 0  material %(m)s }",
-    "quad { origin -0.25 -0.25 -0.25  u 0 0 0.5  v 0 0.5 0  material %(m)s }",
-    "quad { origin  0.25 -0.25  0.25  u 0 0 -0.5  v 0 0.5 0  material %(m)s }",
-    "quad { origin -0.25  0.25  0.25  u 0.5 0 0  v 0 0 -0.5  material %(m)s }",
-    "quad { origin -0.25 -0.25 -0.25  u 0.5 0 0  v 0 0 0.5  material %(m)s }",
-])
-
-
-def scene(u=None, shutter=False, interval=True):
-    """The box scene: its groups moving when u is None, else held at u."""
-    cam = "shutter_open -0.5  shutter_close 0.5  " if shutter else ""
+def cube(h, m, k):
+    """Six quads: a cube of half-size h about the origin, in material m, lengths times k."""
+    f = lambda *xs: " ".join(repr(x * h * k) for x in xs)
     return NL.join([
-        "scene { units meters%s }" % ("  motion_interval -0.5 0.5" if interval else ""),
+        "quad { origin %s  u %s  v %s  material %s }" % (f(-1, -1, 1), f(2, 0, 0), f(0, 2, 0), m),
+        "quad { origin %s  u %s  v %s  material %s }" % (f(1, -1, -1), f(-2, 0, 0), f(0, 2, 0), m),
+        "quad { origin %s  u %s  v %s  material %s }" % (f(-1, -1, -1), f(0, 0, 2), f(0, 2, 0), m),
+        "quad { origin %s  u %s  v %s  material %s }" % (f(1, -1, 1), f(0, 0, -2), f(0, 2, 0), m),
+        "quad { origin %s  u %s  v %s  material %s }" % (f(-1, 1, 1), f(2, 0, 0), f(0, 0, -2), m),
+        "quad { origin %s  u %s  v %s  material %s }" % (f(-1, -1, -1), f(2, 0, 0), f(0, 0, 2), m),
+    ])
+
+
+def scene(u=None, shutter=None, units="meters", extras=False):
+    """The box scene: its groups moving when u is None, else held at u. `shutter` is
+    (open, close) in frames; `units` "centimeters" writes every length 100 times larger."""
+    k = {"meters": 1.0, "centimeters": 100.0}[units]
+    L = lambda *xs: " ".join(repr(x * k) for x in xs)
+    cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
+    lines = [
+        "scene { units %s  motion_interval -0.5 0.5 }" % units,
         'material "white" { type diffuse reflect 0.7 }',
         'material "red"   { type diffuse reflect rgb 0.7 0.15 0.1 }',
         'material "blue"  { type diffuse reflect rgb 0.1 0.2 0.7 }',
+        'material "green" { type diffuse reflect rgb 0.15 0.6 0.2 }',
         'material "gold"  { type glossy reflect rgb 0.9 0.7 0.3  roughness 0.15 }',
-        "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }",
-        "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material white }",
-        "light area { origin -0.4 2.9 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  spd preset:bb6500"
-        "  power 60 }",
-        "group { %s  sphere { center 0 0 0  radius 0.3  material gold } }" % xf(SLIDE, u),
-        "group { %s  %s }" % (xf(TURN, u), CUBE % {"m": "red"}),
-        "group { %s  group { %s  %s } }" % (xf(RISE, u), xf(SPIN, u),
-                                            CUBE.replace("0.25", "0.18") % {"m": "blue"}),
-        'camera "c" { eye 0 1.0 4.2  look_at 0 0.5 0  up 0 1 0  fov_y 40  %sfilm { res %d %d } }'
-        % (cam, W, H),
-    ]) + NL
+        "quad { origin %s  u %s  v %s  material %s }" % (L(-2, 0, -2), L(0, 0, 4), L(4, 0, 0),
+                                                          "cavfloor" if extras else "white"),
+        "quad { origin %s  u %s  v %s  material white }" % (L(-2, 0, -2), L(4, 0, 0), L(0, 3, 0)),
+        "light area { origin %s  u %s  v %s  normal 0 -1 0  spd preset:bb6500  power 60 }"
+        % (L(-0.4, 2.9, -0.4), L(0.8, 0, 0), L(0, 0, 0.8)),
+        "group { %s  sphere { center 0 0 0  radius %r  material gold } }" % (xf(SLIDE, u, k), 0.3 * k),
+        "group { %s  %s }" % (xf(TURN, u, k), cube(0.25, "red", k)),
+        "group { %s  group { %s  %s } }" % (xf(RISE, u, k), xf(SPIN, u, k), cube(0.18, "blue", k)),
+        "group { %s  %s }" % (xf(STRETCH, u, k), cube(0.1, "green", k)),
+        'camera "c" { eye %s  look_at %s  up 0 1 0  fov_y 40  %sfilm { res %d %d } }'
+        % (L(0, 1.0, 4.2), L(0, 0.5, 0), cam, W, H),
+    ]
+    if extras:
+        # The floor's albedo follows `cavity`, whose default probe radius is a share of the
+        # scene's size -- which a mover's sweep must not change.
+        lines += ['pattern "cav" { expr "0.25 + 0.6 * cavity" }',
+                  'material "cavfloor" { type diffuse reflect pattern:cav }',
+                  "light env { spd preset:d65 }",
+                  "group { %s  sphere { center 0 0 0  radius %r  material gold } }"
+                  % (xf(FLY, u, k), 0.15 * k)]
+    return NL.join(lines) + NL
 
 
 def bvh_scene():
@@ -271,14 +314,18 @@ def main():
     blurred = os.path.join(out, "blurred.ftsl")
     write(moving, scene())
     write(static0, scene(u=0.5))
-    write(blurred, scene(shutter=True))
+    write(blurred, scene(shutter=(-0.5, 0.5)))
 
-    # --- no shutter: byte for byte the static scene at the instant ---
+    # --- no shutter: byte for byte the static scene at the instant, even with a mover whose
+    # sweep reaches far past the stage, under an environment light sized by the scene's bounds ---
     devices = [("cpu", False)] + ([] if a.no_gpu else [("gpu", True)])
+    moving_x, static_x = os.path.join(out, "moving_x.ftsl"), os.path.join(out, "static_x.ftsl")
+    write(moving_x, scene(extras=True))
+    write(static_x, scene(u=0.5, extras=True))
     for dev, gpu in devices:
         args = ["-mode", "R", "-device", dev, "-spp", "16"]
-        _, raw_m, _ = render(exe, out, moving, "instant_moving_" + dev, args, want_gpu=gpu)
-        _, raw_s, _ = render(exe, out, static0, "instant_static_" + dev, args, want_gpu=gpu)
+        _, raw_m, _ = render(exe, out, moving_x, "instant_moving_" + dev, args, want_gpu=gpu)
+        _, raw_s, _ = render(exe, out, static_x, "instant_static_" + dev, args, want_gpu=gpu)
         verdict("no shutter = static scene at the instant (mode R %s)" % dev.upper(), raw_m == raw_s)
 
     # --- blurred mode R = the average of static instants over the shutter ---
@@ -306,6 +353,36 @@ def main():
     still = blocks(lum(render(exe, out, static0, "instant_ref", args)[0]))
     moved = (np.abs(mb - still) / np.maximum(still, 1e-3 * still.max()) > 0.10).sum()
     verdict("the blur is there (blocks off the instant by > 10%)", moved >= 8, "%d blocks" % moved)
+
+    # --- the same blur authored in centimetres: the keys move metres, as the vertices are ---
+    blurred_cm = os.path.join(out, "blurred_cm.ftsl")
+    write(blurred_cm, scene(shutter=(-0.5, 0.5), units="centimeters"))
+    bc = [lum(render(exe, out, blurred_cm, "blur_cm_s%d" % s, args, seed=s)[0]) for s in (1, 2)]
+    mc = blocks((bc[0] + bc[1]) / 2)
+    err = np.hypot(block_err(lb[0], lb[1]), block_err(bc[0], bc[1]))
+    z = np.abs(mc - mb) / np.maximum(err, 1e-30)
+    rel = np.abs(mc - mb) / np.maximum(np.abs(mb), 1e-3 * np.abs(mb).max())
+    bad = (z > 5.0) & (rel > 0.03)
+    verdict("the blur authored in centimetres = in metres", not bad.any(),
+            "worst block z %.1f rel %.3f; %d blocks out" % (z.max(), rel.max(), bad.sum()))
+
+    # --- an instantaneous shutter away from the instant: the scene exactly as written there ---
+    for t in (-0.35, 0.1, 0.4):
+        sharp, still_t = os.path.join(out, "sharp.ftsl"), os.path.join(out, "sharp_static.ftsl")
+        write(sharp, scene(shutter=(t, t)))
+        write(still_t, scene(u=t + 0.5))
+        sa = [lum(render(exe, out, sharp, "sharp_s%d" % s, ["-mode", "R", "-device", "cpu",
+                                                             "-spp", "256"], seed=s)[0]) for s in (1, 2)]
+        sb = [lum(render(exe, out, still_t, "sharp_static_s%d" % s, ["-mode", "R", "-device", "cpu",
+                                                                     "-spp", "256"], seed=s)[0])
+              for s in (1, 2)]
+        ma, ms = blocks((sa[0] + sa[1]) / 2), blocks((sb[0] + sb[1]) / 2)
+        err = np.hypot(block_err(sa[0], sa[1]), block_err(sb[0], sb[1]))
+        z = np.abs(ma - ms) / np.maximum(err, 1e-30)
+        rel = np.abs(ma - ms) / np.maximum(np.abs(ms), 1e-3 * np.abs(ms).max())
+        bad = (z > 5.0) & (rel > 0.03)
+        verdict("shutter %g..%g = the scene as written at %g" % (t, t, t), not bad.any(),
+                "worst block z %.1f rel %.3f; %d blocks out" % (z.max(), rel.max(), bad.sum()))
 
     # --- mode W: blurred, deterministically ---
     wargs = ["-mode", "W", "-device", "cpu", "-spp", "64"]

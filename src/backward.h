@@ -4005,7 +4005,7 @@ struct BackwardRenderer {
         // set for everything the path traces -- its bounces, shadow rays, probes -- through
         // g_motionU. The time comes off its own lattice and its own salted stream, so the main
         // rng draws exactly what it draws without blur.
-        const bool blur = scene.hasMotion() && cam.hasShutter();
+        const bool blur = cam.seesMotion(scene);
         for (int py = y0; py < y1; ++py) {
             for (int px = 0; px < film.resX; ++px) {
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)film.resX + (uint64_t)px;
@@ -4018,8 +4018,7 @@ struct BackwardRenderer {
                 for (long long s = 0; s < spp; ++s) {
                     const uint64_t sIdx = sampleBase + (uint64_t)s;   // absolute sample index
                     const MotionTimeScope pathTime(
-                        blur ? scene.motionU(cam.shutterOpen + (cam.shutterClose - cam.shutterOpen) *
-                                                                   shutterU(sIdx, tPhase))
+                        blur ? scene.motionU(cam.shutterTime(shutterU(sIdx, tPhase)))
                              : -1.0);
                     Pcg32 rng;
                     seedUnit(rng, sIdx * nPix + pixIdx, 0xD1B54A32D192ED03ULL);

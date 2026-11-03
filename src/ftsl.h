@@ -1352,6 +1352,7 @@ public:
                 if (st.key == "collide") {
                     st.used = true;
                     if (st.val.words.empty()) { fail("settle: `collide` needs a mesh-group name"); return false; }
+                    if (movingRefused(st.val.words[0], "settle `collide`")) return false;
                     sp.collide.push_back(st.val.words[0]);
                 }
         }
@@ -6632,7 +6633,15 @@ private:
     bool routeWarnedLight_ = false, routeWarnedInst_ = false;
     // The world transform, at each motion key, of the moving group being built (empty outside
     // one): a nested group composes its own transform with it (addGroup).
-    std::vector<Affine> motionWorld_;
+    // A group's world transform at keys: increasing times through the motion interval (fractions,
+    // the first 0 and the last 1) and the transform at each.
+    struct TimedKeys {
+        std::vector<double> t;
+        std::vector<Affine> w;
+        bool empty() const { return t.empty(); }
+        Affine at(double u) const { return keyedAffineAt(w.data(), t.data(), (int)t.size(), u); }
+    };
+    TimedKeys motionWorld_;
     bool movingLightWarned_ = false;
     bool sphereAsMesh_ = false;   // the moving group being built scales its children unevenly
     // Named objects built in a moving group. What finds an object by name -- fur `on` and
@@ -6774,33 +6783,27 @@ private:
         const double u0 = L.scene.motionU(0.0);   // the frame's instant
         const Affine ownStatic = ownKeys.empty() ? xfOf(xfParamsOf(b)) : Affine{};
         const Affine world = parentXf.compose(ownKeys.empty() ? ownStatic : xfOf(xfParamsAt(ownKeys, u0)));
-        // This group's world transform at each of its keys (empty: it does not move). The
-        // parent's keys are blended, which is how the parent moves between them; the group's own
-        // are its authored transforms interpolated, so a rotation turns through its angle. Keys go
-        // at the finer of the two spacings, and the own spacing is refined until no step turns
-        // more than kMotionStepDeg, so blending neighbouring keys stays close to the arc.
-        std::vector<Affine> worldKeys;
+        // This group's world transform at its keys (none: it does not move). A key goes wherever
+        // the exact motion may kink -- every key of the parent's, every authored key of its own --
+        // and at the instant, which therefore is a key, exactly `world`; between those, keys are
+        // added by bisection wherever blending the two neighbours (as the renderer will) strays
+        // from the exact transform: the parent's keys blended, the group's own interpolated as
+        // written, so a turn arcs and a scale times a shear stays a product (refineMotion).
+        TimedKeys worldKeys;
         if (moving) {
-            size_t K = motionWorld_.empty() ? 2 : motionWorld_.size();
-            if (!ownKeys.empty()) {
-                double turn = 0.0;   // the most any one authored step turns, summed over the axes
-                for (size_t k = 0; k + 1 < ownKeys.size(); ++k) {
-                    const Vec3 d = ownKeys[k + 1].rot - ownKeys[k].rot;
-                    turn = std::max(turn, std::fabs(d.x) + std::fabs(d.y) + std::fabs(d.z));
-                }
-                const size_t steps = ownKeys.size() - 1;
-                size_t sub = (size_t)std::ceil(turn / kMotionStepDeg);
-                sub = std::clamp<size_t>(sub, 1, std::max<size_t>(1, kMotionMaxSteps / steps));
-                K = std::max(K, steps * sub + 1);
-            }
-            for (size_t k = 0; k < K; ++k) {
-                const double u = (double)k / (double)(K - 1);
-                const Affine P = motionWorld_.empty() ? parentXf : keyedAffineAt(motionWorld_, u);
-                const Affine Lk = ownKeys.empty() ? ownStatic : xfOf(xfParamsAt(ownKeys, u));
-                worldKeys.push_back(P.compose(Lk));
-            }
+            const auto exact = [&](double u) {
+                const Affine P = motionWorld_.empty() ? parentXf : motionWorld_.at(u);
+                return P.compose(ownKeys.empty() ? ownStatic : xfOf(xfParamsAt(ownKeys, u)));
+            };
+            std::vector<double> ts = {0.0, 1.0, u0};
+            ts.insert(ts.end(), motionWorld_.t.begin(), motionWorld_.t.end());
+            for (size_t k = 1; k + 1 < ownKeys.size(); ++k)
+                ts.push_back((double)k / (double)(ownKeys.size() - 1));
+            std::sort(ts.begin(), ts.end());
+            ts.erase(std::unique(ts.begin(), ts.end()), ts.end());
+            refineMotion(ts, exact, worldKeys);
         }
-        struct Restore { std::vector<Affine>& slot; std::vector<Affine> saved;
+        struct Restore { TimedKeys& slot; TimedKeys saved;
                          ~Restore() { slot = std::move(saved); } } restore{motionWorld_, motionWorld_};
         motionWorld_ = worldKeys;
         // A sphere this group's keys would scale unevenly is built as a mesh, as an uneven static
@@ -6810,7 +6813,7 @@ private:
         sphereAsMesh_ = false;
         if (moving && std::fabs(world.det()) >= 1e-30) {
             const Affine inv = world.inverse();
-            for (const Affine& w : worldKeys) {
+            for (const Affine& w : worldKeys.w) {
                 bool nonUniform = false;
                 w.compose(inv).uniformScale(nonUniform);
                 if (nonUniform) { sphereAsMesh_ = true; break; }
@@ -6851,25 +6854,61 @@ private:
         return true;
     }
 
-    // The most a group's own keys may turn between neighbouring resampled keys, in degrees summed
-    // over the axes: blending two keys 5 degrees apart cuts the arc by at most 0.1% of the radius.
-    static constexpr double kMotionStepDeg = 5.0;
-    // The most keys a group's own motion is resampled to: every moving primitive's bounds visit
-    // each key, so this bounds the BVH build's cost (a group turning faster steps further).
-    static constexpr size_t kMotionMaxSteps = 256;
+    // How far blending two neighbouring keys may stray from the exact motion between them, as a
+    // fraction of the size of a unit cube under the transform: blending two keys 5 degrees of turn
+    // apart strays 1e-3 of the radius.
+    static constexpr double kMotionTol = 1e-3;
+    // The most keys a group's motion gets: every moving primitive's bounds visit each key, so
+    // this bounds the BVH build's cost. A motion that would need more keeps its breakpoints and
+    // is bisected only this far, and the loader says so.
+    static constexpr size_t kMotionMaxKeys = 1025;
 
-    // The transform at the fraction u of the motion interval of evenly spread `keys` (>= 2).
-    static Affine keyedAffineAt(const std::vector<Affine>& keys, double u) {
-        int i; double f;
-        motionBracket((int)keys.size(), u, i, f);
-        return keys[(size_t)i].lerp(keys[(size_t)i + 1], f);
+    // Keys at the times `ts` (sorted, from 0 to 1) and, between them, wherever `exact`'s
+    // transform at the midpoint of two neighbouring keys differs from their blend by more than
+    // kMotionTol (each half bisected again in turn), into `out`.
+    template <class F>
+    void refineMotion(const std::vector<double>& ts, const F& exact, TimedKeys& out) {
+        // The unit cube about the group's origin, in its own frame, as the probe of how far a
+        // transform carries things: its corners and its centre.
+        static const Vec3 kProbe[9] = {{-1, -1, -1}, {1, -1, -1}, {-1, 1, -1}, {1, 1, -1},
+                                       {-1, -1, 1},  {1, -1, 1},  {-1, 1, 1},  {1, 1, 1}, {0, 0, 0}};
+        const auto strays = [&](const Affine& m, const Affine& blend) {
+            double err = 0.0, size = 0.0;
+            const Vec3 o = m.apply(kProbe[8]);
+            for (const Vec3& p : kProbe) {
+                err = std::max(err, length(m.apply(p) - blend.apply(p)));
+                size = std::max(size, length(m.apply(p) - o));
+            }
+            return err > kMotionTol * (size > 0.0 ? size : 1.0);
+        };
+        bool capped = false;
+        std::function<void(double, const Affine&, double, const Affine&, int)> split =
+            [&](double a, const Affine& wa, double b, const Affine& wb, int depth) {
+                const double m = 0.5 * (a + b);
+                const Affine wm = exact(m);
+                if (!strays(wm, wa.lerp(wb, 0.5))) return;
+                if (depth >= 16 || out.t.size() + 2 > kMotionMaxKeys) { capped = true; return; }
+                split(a, wa, m, wm, depth + 1);
+                out.t.push_back(m); out.w.push_back(wm);
+                split(m, wm, b, wb, depth + 1);
+            };
+        out.t.push_back(ts[0]); out.w.push_back(exact(ts[0]));
+        for (size_t i = 1; i < ts.size(); ++i) {
+            const Affine wb = exact(ts[i]);
+            split(out.t.back(), Affine(out.w.back()), ts[i], wb, 0);
+            out.t.push_back(ts[i]); out.w.push_back(wb);
+        }
+        if (capped)
+            std::fprintf(stderr, "[ftsl] warning: a group's motion needs more than %zu keys to follow "
+                                 "closely; it is blended more coarsely than %.1g of its size\n",
+                         kMotionMaxKeys, kMotionTol);
     }
 
     // Give the primitives added since `mk` -- built with `instant`, the group's world transform
     // at the frame's instant -- the group's keys: each the transform from the instant to the
     // group at that key. The group's one set is made on its first moving child (`set`, -1 until
     // then). Kinds that cannot move yet are refused by name.
-    bool applyMotion(const PrimMark& mk, const std::vector<Affine>& worldKeys, const Affine& instant,
+    bool applyMotion(const PrimMark& mk, const TimedKeys& worldKeys, const Affine& instant,
                      int& set, Loaded& L) {
         Scene& S = L.scene;
         if (S.implicits.size() > mk.implicits || S.curveSegs.size() > mk.curveSegs ||
@@ -6894,8 +6933,15 @@ private:
             }
             const Affine inv = instant.inverse();
             set = (int)S.motionSets.size();
-            S.motionSets.push_back(MotionKeys{(int)worldKeys.size(), (int)S.motionXf.size()});
-            for (const Affine& w : worldKeys) S.motionXf.push_back(w.compose(inv));
+            S.motionSets.push_back(MotionKeys{(int)worldKeys.t.size(), (int)S.motionXf.size()});
+            for (size_t k = 0; k < worldKeys.t.size(); ++k) {
+                Affine d = worldKeys.w[k].compose(inv);
+                // The keys are authored lengths; the vertices they move are metres (P), so the
+                // move's translation is too. Its linear part, a ratio, is the same in either.
+                d.t = d.t * L_;
+                S.motionXf.push_back(d);
+                S.motionT.push_back(worldKeys.t[k]);
+            }
         }
         if (S.spheres.size() > mk.spheres) {
             const MotionKeys& keys = S.motionSets[(size_t)set];
