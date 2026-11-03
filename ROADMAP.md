@@ -656,3 +656,55 @@ evaluated exactly at any time in the shutter, making them the easiest deforming 
 
 **Start order:** 1 and 2 in parallel → 3 → 4 → 5 (OptiX first; OIDN 3 when it ships; temporal
 `-denoise` alongside).
+
+### Decided (2026-11-03): loom as a first-class shot source, native deformers
+
+The user asked for motion blur, an optional temporal ("motion") denoiser offering every strategy,
+true animation with loom first class, and mesh deformation by distance falloff, radial basis
+functions and an elastic surface. Decisions taken with the user:
+
+- **Loom runs beside ftrace, not inside it.** ftrace renders a whole shot from a loom `.py`
+  (`ftrace -shot shot.py -frames A B`), holding one loom process over the `loomlink::Link`
+  transport the viewer and `-anim` already use (newline JSON, binary `ftmesh` blobs), and asking
+  it for each frame's scene *with its motion keys*. One ftrace process for the shot: one GPU
+  context and upload cache, and the frame-to-frame state a temporal denoiser needs. Embedding
+  CPython was rejected: it ties ftrace.exe to one Python and NumPy build and lets a Python crash
+  take the render down, for gains (latency, zero-copy) that do not matter — loom emits a frame in
+  0.4 ms and 2.8 KB (`jumping_jack`, measured). fastpy is not a dependency: there is nothing to
+  speed up, and a fastpy-compiled loom would be an executable the same pipe can talk to.
+- **Deformers are native to ftrace** (FTSL operators on a mesh, CPU and later GPU), with loom
+  animating their handles: they must be evaluated at every motion key on the same base mesh (motion
+  blur needs vertex correspondence) and on 100k+-vertex meshes.
+- **Elastic comes in both forms.** *Quasi-static* (as-rigid-as-possible: the surface follows its
+  handles like rubber, no momentum) is a pure function of the handles at a time, so frames stay
+  independent and blur stays exact. *Dynamic* (inertia, jiggle, overshoot) is a simulation stepped
+  through time; it is baked once, in frame order, into a cache the frames then read, so a frame
+  stays independently renderable once the cache exists.
+- **Temporal denoising offers every available strategy**, chosen by flag: OptiX's temporal model
+  (now), our own SVGF-style temporal accumulation in front of `-denoise`, and OIDN 3's temporal
+  model when it ships (still unreleased 2026-11-03: GitHub's latest is 2.5.1, the one ftrace
+  uses). A comparison shot scores each against a converged reference, on error and on
+  frame-to-frame flicker.
+
+**The time model.** Times are in *frames*, relative to the frame's own instant (0). A scene's
+moving objects carry **motion keys** spread evenly over the scene's `motion_interval a b`
+(Arnold's convention: each object chooses its own key count, at least 2), and geometry moves
+linearly between adjacent keys. A camera's opt-in `shutter_open` / `shutter_close` (default: no
+blur; `film { shutter }` stays an exposure multiplier, so every existing scene renders
+bit-identically) sets the times paths are drawn from. Each path — camera path, light path, BDPT
+subpath pair — draws **one time**, from its own salted stream so a scene without motion draws
+nothing and is unchanged, and every vertex and connection of the path is evaluated at it.
+
+**FTSL** (grammar to FTSL.md when built): a `motion { key { … } key { … } }` block on a `group`,
+a `mesh_instance` or a `camera`, each `key` holding what that block's keys vary — a transform for a
+group or an instance, a pose for a camera — and on a `mesh`, keys naming same-topology vertex
+sources (`file`, or a loom `blob`). Baked group children (triangles, spheres, curves, lights) turn
+into per-vertex motion; an instance keeps one BLAS and interpolates its transform per ray.
+
+**Build order:** (A) motion keys in the scene core, swept bounds in the BVH, CPU closest-hit /
+occlusion at a path's time, the camera shutter, and the loom shot protocol emitting keys; (B)
+motion blur through every estimator, CPU then GPU, with the routes that share light-side data
+across paths of different times (photon maps, beams, VCM merges, shared multi-camera passes)
+either carrying time or refusing; (C) motion vectors and depth in the guide pass; (D) the
+temporal denoisers and their comparison; (E) the deformers: falloff, RBF, quasi-static elastic,
+dynamic elastic with its cache.
