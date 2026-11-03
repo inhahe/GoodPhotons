@@ -30,6 +30,7 @@ from typing import List, Optional, Sequence
 
 from .signals.core import Clock, Cache
 from .scene import Scene
+from .ftsl_emit import Motion
 
 
 def repo_root() -> Path:
@@ -153,13 +154,17 @@ def _develop_args(extra_args: Sequence[str]) -> List[str]:
 
 
 def emit_frames(scene: Scene, frames: int, outdir: os.PathLike, name: str,
-                *, fps: float = 30.0, loop: bool = True) -> List[Path]:
+                *, fps: float = 30.0, loop: bool = True,
+                motion: Optional[Motion] = None) -> List[Path]:
     """Emit ``frames`` ``.ftsl`` files; return their paths.
 
     ``loop=True`` (default) maps frames onto a closed loop (``t=(k % frames)/
     frames``) so frame ``frames`` would equal frame 0 — a seamless cycle.
     ``loop=False`` maps them onto an **open** timeline (``t=k/(frames-1)``,
     endpoints distinct) — a one-shot animation (DESIGN.md §11.6).
+
+    ``motion`` gives each frame motion keys (:meth:`Scene.emit`), for a camera ``shutter``
+    to blur.
     """
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -169,7 +174,7 @@ def emit_frames(scene: Scene, frames: int, outdir: os.PathLike, name: str,
     for k in range(frames):
         clock = Clock.at_frame(k, frames, fps, loop=loop)
         tag = f"{k:0{width}d}"
-        text = scene.emit(clock, Cache(), assets_dir=outdir, tag=tag)
+        text = scene.emit(clock, Cache(), assets_dir=outdir, tag=tag, motion=motion)
         p = outdir / f"{name}{k:0{width}d}.ftsl"
         p.write_text(text, encoding="utf-8")
         paths.append(p)
@@ -182,9 +187,12 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
                  noise: Optional[float] = None, time_s: Optional[float] = None,
                  n: Optional[int] = None, loop: bool = True,
                  skip_existing: bool = False, retries: int = 2,
-                 stabilize: bool = True,
+                 stabilize: bool = True, motion: Optional[Motion] = None,
                  extra_args: Sequence[str] = ()) -> List[Path]:
     """Emit and render a frame range; return the rendered PNG paths.
+
+    ``motion`` (a :class:`~loom.ftsl_emit.Motion`) writes each frame with motion keys, so a
+    camera given a ``shutter`` renders it motion-blurred — in mode R, the mode that blurs.
 
     ``loop=True`` (default) renders a **seamless closed loop**; ``loop=False``
     renders an **open** one-shot timeline with distinct endpoints (§11.6).
@@ -216,7 +224,7 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
     """
     outdir = Path(outdir) if outdir is not None else default_outdir(name)
     ftrace = find_ftrace()
-    ftsl_paths = emit_frames(scene, frames, outdir, name, fps=fps, loop=loop)
+    ftsl_paths = emit_frames(scene, frames, outdir, name, fps=fps, loop=loop, motion=motion)
     budget = _budget_args(noise, time_s, n)
     want = _target_spp(extra_args)
     if skip_existing and want is None:
@@ -392,15 +400,26 @@ def render_still(scene: Scene, *, t: float = 0.0, name: str = "loom_still",
                  outdir: Optional[os.PathLike] = None,
                  interval: float = 5.0, noise: Optional[float] = None,
                  time_s: Optional[float] = None, n: Optional[int] = None,
-                 hold: bool = True, extra_args: Sequence[str] = ()) -> Path:
-    """Render a single frame at phase ``t`` with a held live window (per rules)."""
+                 hold: bool = True, motion: Optional[Motion] = None,
+                 frames: Optional[int] = None, loop: bool = True,
+                 extra_args: Sequence[str] = ()) -> Path:
+    """Render a single frame at phase ``t`` with a held live window (per rules).
+
+    ``motion`` gives it motion keys (see :func:`render_range`); a key's distance from the
+    instant is in frames, so it needs the animation's ``frames`` (and ``loop``) to know how far
+    one frame moves the phase."""
     outdir = Path(outdir) if outdir is not None else default_outdir(name)
     outdir.mkdir(parents=True, exist_ok=True)
     scene.check_cycles()
     ftrace = find_ftrace()
-    clock = Clock(t=t, frame=0, frames=1, fps=30.0)
+    if motion is not None and frames is None:
+        raise ValueError("render_still(motion=...) needs frames=: a motion key's offset is in "
+                         "frames, and one frame's step in phase depends on the frame count")
+    clock = (Clock(t=t, frame=0, frames=1, fps=30.0) if frames is None else
+             Clock(t=t, frame=int(round(t * (frames if loop else frames - 1))), frames=frames,
+                   fps=30.0, loop=loop))
     fp = outdir / f"{name}.ftsl"
-    fp.write_text(scene.emit(clock, Cache(), assets_dir=outdir, tag=""),
+    fp.write_text(scene.emit(clock, Cache(), assets_dir=outdir, tag="", motion=motion),
                   encoding="utf-8")
     png = fp.with_suffix(".png")
     cmd = [str(ftrace), "-in", str(fp), "-o", str(png),

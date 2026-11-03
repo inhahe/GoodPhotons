@@ -19,7 +19,7 @@ from .signals.core import Signal, Clock, Cache, Const, detect_signal_cycle
 from .signals.vector import VecSignal
 from .interp import LoopCurve
 from .data import PointPath
-from .ftsl_emit import EmitCtx, num, vec3, fmt, fmt3, value_token, site_node
+from .ftsl_emit import EmitCtx, Motion, num, vec3, fmt, fmt3, value_token, site_node
 from . import sweep as _sweep
 
 
@@ -645,9 +645,33 @@ class Sphere(Element):
         return out
 
     def emit(self, ctx: EmitCtx) -> str:
-        c = vec3(self.center, ctx.clock, ctx.cache)
-        r = num(self.radius, ctx.clock, ctx.cache)
-        return f'sphere {{ center {fmt3(c)}  radius {fmt(r)}  material "{self.material}" }}'
+        return keyed_sphere(lambda c, k: vec3(self.center, c, k),
+                            lambda c, k: num(self.radius, c, k), self.material, ctx)
+
+
+def keyed_sphere(center_at, radius_at, material: str, ctx: EmitCtx) -> str:
+    """One ``sphere { }`` whose centre and radius are ``center_at(clock, cache)`` and
+    ``radius_at(clock, cache)``.
+
+    With ``ctx.motion`` and a sphere that moves or grows within the interval, it is written at
+    the origin with its instant radius inside a ``group`` whose motion keys translate it to each
+    key's centre and scale it to each key's radius -- the form ftrace can blur. A sphere that
+    holds still, or has no motion keys to give, is written as before.
+    """
+    c0, r0 = center_at(ctx.clock, ctx.cache), radius_at(ctx.clock, ctx.cache)
+    still = f'sphere {{ center {fmt3(c0)}  radius {fmt(r0)}  material "{material}" }}'
+    if ctx.motion is None or r0 <= 0.0:
+        return still
+    keys = [(center_at(c, k), radius_at(c, k)) for c, k in ctx.key_clocks()]
+    text = [(fmt3(c), fmt(r)) for c, r in keys]
+    if all(t == text[0] for t in text):
+        return still
+    grows = any(fmt(r) != fmt(r0) for _, r in keys)
+    body = "  ".join(
+        "key { translate %s%s }" % (fmt3(c), ("  scale %s" % fmt(r / r0)) if grows else "")
+        for c, r in keys)
+    return (f"group {{ motion {{ {body} }}\n"
+            f'    sphere {{ center 0 0 0  radius {fmt(r0)}  material "{material}" }}\n}}')
 
 
 class Beads(Element):
@@ -679,12 +703,11 @@ class Beads(Element):
         return out
 
     def emit(self, ctx: EmitCtx) -> str:
-        r = num(self.radius, ctx.clock, ctx.cache)
         lines: List[str] = []
         for k in range(self.count):
-            p = self.curve.sample(k / self.count, ctx.clock, ctx.cache)
-            lines.append(
-                f'sphere {{ center {fmt3(p)}  radius {fmt(r)}  material "{self.material}" }}')
+            u = k / self.count
+            lines.append(keyed_sphere(lambda c, kc, u=u: self.curve.sample(u, c, kc),
+                                      lambda c, kc: num(self.radius, c, kc), self.material, ctx))
         return "\n".join(lines)
 
 
@@ -1328,7 +1351,16 @@ class Light(Element):
 class Camera(Element):
     def __init__(self, eye, look_at, up=(0, 1, 0), fov_y=40.0,
                  mode: str = "R", res: Tuple[int, int] = (480, 480),
-                 name: str = "cam") -> None:
+                 name: str = "cam", shutter: Optional[Tuple[float, float]] = None) -> None:
+        """``shutter=(open, close)``, in frames around the frame's instant, holds the shutter
+        open over that span: what moves in it blurs, given the scene's motion keys
+        (``Scene.emit(motion=...)``) and a mode that blurs (R). ``(-0.25, 0.25)`` is a
+        180-degree shutter. The camera itself is placed at the instant."""
+        if shutter is not None:
+            shutter = (float(shutter[0]), float(shutter[1]))
+            if shutter[1] < shutter[0]:
+                raise ValueError(f"Camera shutter closes before it opens: {shutter}")
+        self.shutter = shutter
         self.eye = VecSignal.of(eye) if not isinstance(eye, VecSignal) else eye
         self.look_at = VecSignal.of(look_at) if not isinstance(look_at, VecSignal) else look_at
         self.up = VecSignal.of(up) if not isinstance(up, VecSignal) else up
@@ -1348,9 +1380,12 @@ class Camera(Element):
         la = vec3(self.look_at, ctx.clock, ctx.cache)
         up = vec3(self.up, ctx.clock, ctx.cache)
         fov = num(self.fov_y, ctx.clock, ctx.cache)
+        sh = (f'    shutter_open {fmt(self.shutter[0])}  shutter_close {fmt(self.shutter[1])}\n'
+              if self.shutter is not None else '')
         return (f'{self.name} = camera {{\n'
                 f'    eye {fmt3(e)}  look_at {fmt3(la)}  up {fmt3(up)}  fov_y {fmt(fov)}\n'
                 f'    mode {self.mode}\n'
+                f'{sh}'
                 f'    film {{ res {self.res[0]} {self.res[1]} }}\n'
                 f'}}')
 
@@ -1635,8 +1670,14 @@ class Scene:
 
     def emit(self, clock: Clock, cache: Optional[Cache] = None, *,
              assets_dir: Optional["Path"] = None, tag: str = "",
-             mesh_format: str = "obj", mesh_sink: Optional[dict] = None) -> str:
+             mesh_format: str = "obj", mesh_sink: Optional[dict] = None,
+             motion: Optional[Motion] = None) -> str:
         """Serialise the scene to ftsl source at ``clock``.
+
+        ``motion``, a :class:`~loom.ftsl_emit.Motion`, writes the scene's ``motion_interval``
+        and gives every transform and sphere that moves within it motion keys, so a camera
+        with a ``shutter`` renders the frame motion-blurred (ftrace mode R). Without it every
+        element is written at the frame's instant, as before.
 
         ``mesh_format`` selects how file-backed meshes are written — ``"obj"`` for a
         portable, readable artifact, ``"ftmesh"`` for the binary format the live
@@ -1645,9 +1686,12 @@ class Scene:
         bytes directly.  See :class:`~loom.ftsl_emit.EmitCtx`.
         """
         ctx = EmitCtx(clock=clock, cache=cache, assets_dir=assets_dir, tag=tag,
-                      mesh_format=mesh_format, mesh_sink=mesh_sink)
+                      mesh_format=mesh_format, mesh_sink=mesh_sink, motion=motion)
         lo, hi, step = self.spectral
-        header = f"scene {{ units {self.units}  spectral {fmt(lo)} {fmt(hi)} {fmt(step)} }}"
+        mi = (f"  motion_interval {fmt(motion.interval[0])} {fmt(motion.interval[1])}"
+              if motion is not None else "")
+        header = (f"scene {{ units {self.units}  spectral {fmt(lo)} {fmt(hi)} {fmt(step)}"
+                  f"{mi} }}")
         blocks = [header, ""]
         for sp in self.spectra:
             blocks.append(sp.emit(ctx))

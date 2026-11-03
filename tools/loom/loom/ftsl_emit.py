@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 from .signals.core import Signal, Clock, Cache, Number, lower_axsignal
 from .signals.vector import VecSignal
@@ -31,6 +31,52 @@ def site_node(x):
     if isinstance(x, (Signal, VecSignal)):
         return x
     return lower_axsignal(x)
+
+
+@dataclass(frozen=True)
+class Motion:
+    """Motion keys for each emitted frame (ftrace ROADMAP 11): ``keys`` sample times spread
+    evenly over ``interval``, in frames around the frame's own instant (0).
+
+    With a ``Motion`` the emitter writes the scene's ``motion_interval`` and gives every
+    transform (and sphere) that moves within the interval a ``motion { key { … } … }`` block,
+    each key the value at its time; a camera's ``shutter`` then picks the part of the interval a
+    frame blurs over. ftrace interpolates between keys linearly (a rotation by its angle), so
+    more keys follow a curved or accelerating motion more closely.
+
+    The instant must fall on a key, so the scene a render without a shutter sees is exactly
+    the frame's own: ``(-0.5, 0.5)`` with an odd key count, or ``(0, 1)`` with any.
+    """
+
+    interval: Tuple[float, float] = (-0.5, 0.5)
+    keys: int = 5
+
+    def __post_init__(self) -> None:
+        a, b = (float(self.interval[0]), float(self.interval[1]))
+        object.__setattr__(self, "interval", (a, b))
+        if not b > a:
+            raise ValueError(f"Motion interval needs b > a, got {self.interval}")
+        if not (a <= 0.0 <= b):
+            raise ValueError(f"Motion interval must contain the frame's instant 0, got {self.interval}")
+        if int(self.keys) < 2:
+            raise ValueError(f"Motion needs at least 2 keys, got {self.keys}")
+        object.__setattr__(self, "keys", int(self.keys))
+        s = -a / (b - a) * (self.keys - 1)
+        if abs(s - round(s)) > 1e-9:
+            raise ValueError(
+                f"Motion: the instant 0 falls between keys of {self.keys} spread over "
+                f"{self.interval}; pick a key count that lands one on it")
+
+    def offsets(self) -> Tuple[float, ...]:
+        """Each key's time, in frames from the frame's instant."""
+        a, b = self.interval
+        n = self.keys - 1
+        return tuple(a + (b - a) * k / n for k in range(self.keys))
+
+    def instant_key(self) -> int:
+        """The index of the key at the frame's instant."""
+        a, b = self.interval
+        return int(round(-a / (b - a) * (self.keys - 1)))
 
 
 @dataclass
@@ -69,6 +115,29 @@ class EmitCtx:
     tag: str = ""
     mesh_format: str = "obj"
     mesh_sink: Optional[dict] = None
+    motion: Optional[Motion] = None
+
+    def key_clocks(self) -> List[Tuple[Clock, Optional[Cache]]]:
+        """The clock, and a cache to evaluate with, at each of :attr:`motion`'s keys.
+
+        A key ``d`` frames from the instant sits ``d`` frame-steps along the timeline from this
+        frame's phase, *without* wrapping a looping timeline into ``[0, 1)``: the last frame's
+        later keys run past 1 rather than jumping back to 0, so a ``t * 360`` spin keeps turning
+        instead of reversing. Each key gets its own cache scope (the cache is keyed by frame,
+        and every key shares the frame's); the instant's key is the frame's own clock and cache.
+        """
+        if self.motion is None:
+            return [(self.clock, self.cache)]
+        c = self.clock
+        step = (1.0 / c.frames) if c.loop else (1.0 / (c.frames - 1) if c.frames > 1 else 1.0)
+        out: List[Tuple[Clock, Optional[Cache]]] = []
+        for d in self.motion.offsets():
+            if d == 0.0:
+                out.append((c, self.cache))
+                continue
+            kc = Clock(t=c.t + d * step, frame=c.frame, frames=c.frames, fps=c.fps, loop=c.loop)
+            out.append((kc, self.cache.scope(("motion-key", d)) if self.cache is not None else None))
+        return out
 
     def asset_path(self, name: str, ext: str) -> Path:
         import tempfile

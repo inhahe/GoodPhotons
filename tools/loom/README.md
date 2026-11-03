@@ -151,6 +151,27 @@ Two things to know if the loop must be **seamless**:
   `frames` *is* frame 0 and is correctly left out — the encoders emit exactly one
   frame per input, never duplicating one at the seam.
 
+### Motion blur
+
+```python
+from loom import Camera, Motion, render_range
+
+cam = Camera(eye=(0, 1, 4), look_at=(0, 0.4, 0), mode="R", shutter=(-0.25, 0.25))   # 180°
+pngs = render_range(scene, frames=96, name="myshot", loop=False, motion=Motion((-0.5, 0.5), 5),
+                    extra_args=["-spp", "256"])
+```
+
+`motion=` writes each frame with motion keys: every `Transform` (and `Group`) and every
+`Sphere` / `Beads` sphere that moves within the interval becomes a `motion { key { … } … }`
+block sampled at the `Motion`'s times around the frame — a rotation unwrapped so it turns the
+short way between keys — and the scene gets ftrace's `motion_interval`. Whatever holds still is
+written exactly as without it. The camera's `shutter` then picks the span a frame blurs over;
+ftrace blurs it in mode R (and W) on the CPU (ftrace's `REFERENCE.md`, *Motion blur*). Swept,
+isosurface and strand meshes are written at the frame's instant: their vertices move, which
+needs per-vertex motion keys (ftrace ROADMAP 11 stage E). The instant must fall on a key —
+`Motion` refuses a count that misses it — so a frame rendered without a shutter is the same
+frame as before.
+
 ### Reading `.ftsl` back
 
 `loom.grammar.reader` goes the other way — text to elements — for editing an existing

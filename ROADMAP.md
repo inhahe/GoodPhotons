@@ -715,6 +715,9 @@ the CPU (design.md → *Motion keys and the shutter*; `tools/check_motion.py`). 
 the plan above, both for the better: a group's keys are **one shared transform set** per group
 rather than per-vertex copies (memory per group, not per vertex × key), and the authored keys are
 interpolated as translate/rotate/scale/shear and resampled every 5° of turn, so a rotation arcs.
-Per-vertex motion remains the route for deforming meshes (stage E, and mesh keys). Still open in
-A: the loom shot protocol. Open for B: blur in every other mode and on the GPU, moving instances,
+Per-vertex motion remains the route for deforming meshes (stage E, and mesh keys). **Loom emits
+keys (done):** `Motion` / `Scene.emit(motion=)` / `render_range(motion=)` sample every moving
+transform and sphere at the keys around each frame (rotations unwrapped), and `Camera(shutter=)`
+writes the shutter. Still open in A: `ftrace -shot`, one ftrace process rendering a whole loom
+shot over `loomlink` (the temporal denoiser of stage D needs it). Open for B: blur in every other mode and on the GPU, moving instances,
 curves, isosurfaces, emissive meshes and lights, and camera motion keys.

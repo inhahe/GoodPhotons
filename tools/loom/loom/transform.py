@@ -30,7 +30,7 @@ the fast analytic path), so squashed and skewed spheres just work.
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Sequence, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 from .signals.core import Signal, Number, Sin, Cos, as_signal
 from .signals.vector import VecSignal
@@ -197,25 +197,59 @@ class Transform:
         return [x, y, z]
 
     # ---- ftsl emission (geometry) ------------------------------------------
+    def _values(self, clock, cache) -> List[Tuple[str, Tuple[float, float, float]]]:
+        """(ftsl keyword, value) for each field this transform sets, at ``clock``."""
+        out: List[Tuple[str, Tuple[float, float, float]]] = []
+        for kw, v in (("translate", self.translate), ("rotate", self.rotate),
+                      ("scale", self.scale), ("shear", self.skew)):
+            if v is not None:
+                out.append((kw, vec3(v, clock, cache)))
+        return out
+
     def wrap(self, inner: str, ctx: EmitCtx) -> str:
         """Wrap an element's emitted block(s) in an ftsl ``group { … }`` carrying
-        this transform.  Returns ``inner`` unchanged when the transform is identity."""
-        clock, cache = ctx.clock, ctx.cache
-        stmts: List[str] = []
-        if self.translate is not None:
-            stmts.append(f"translate {fmt3(vec3(self.translate, clock, cache))}")
-        if self.rotate is not None:
-            stmts.append(f"rotate {fmt3(vec3(self.rotate, clock, cache))}")
-        if self.scale is not None:
-            stmts.append(f"scale {fmt3(vec3(self.scale, clock, cache))}")
-        if self.skew is not None:
-            stmts.append(f"shear {fmt3(vec3(self.skew, clock, cache))}")
-        if not stmts:
+        this transform.  Returns ``inner`` unchanged when the transform is identity.
+
+        With ``ctx.motion``, a transform whose value changes over the motion interval is
+        written as a ``motion { key { … } … }`` block, one key per motion key; one that holds
+        still is written as before. A rotation's keys are unwrapped -- shifted by whole turns
+        outward from the instant's key so neighbours differ by at most half a turn -- because
+        ftrace turns through the angle between keys, and an angle that wraps from 359 to 1
+        between two keys would otherwise spin the long way round."""
+        vals = self._values(ctx.clock, ctx.cache)
+        if not vals:
             return inner
-        lines = ["group {"]
-        for s in stmts:
-            lines.append("    " + s)
+        head = ["    %s %s" % (kw, fmt3(v)) for kw, v in vals]
+        if ctx.motion is not None:
+            keys = [self._values(c, k) for c, k in ctx.key_clocks()]
+            text = [[(kw, fmt3(v)) for kw, v in key] for key in keys]
+            if any(t != text[0] for t in text):
+                anchor = ctx.motion.instant_key()
+                for f, (kw, _) in enumerate(vals):
+                    if kw == "rotate":
+                        unwrapped = unwrap_degrees([key[f][1] for key in keys], anchor)
+                        for key, r in zip(keys, unwrapped):
+                            key[f] = (kw, r)
+                head = ["    motion {"] + [
+                    "        key { %s }" % "  ".join("%s %s" % (kw, fmt3(v)) for kw, v in key)
+                    for key in keys] + ["    }"]
+        lines = ["group {"] + head
         for block in inner.split("\n"):
             lines.append("    " + block if block else block)
         lines.append("}")
         return "\n".join(lines)
+
+
+def unwrap_degrees(angles: Sequence[Tuple[float, float, float]],
+                   anchor: int) -> List[Tuple[float, float, float]]:
+    """Euler angles in degrees, one triple per key, each component shifted by whole turns so
+    that neighbouring keys differ by at most half a turn, the key at ``anchor`` left as it is."""
+    out = [list(a) for a in angles]
+    for step in (1, -1):
+        k = anchor + step
+        while 0 <= k < len(out):
+            for i in range(3):
+                prev = out[k - step][i]
+                out[k][i] += 360.0 * round((prev - out[k][i]) / 360.0)
+            k += step
+    return [tuple(a) for a in out]

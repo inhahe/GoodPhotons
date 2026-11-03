@@ -644,6 +644,8 @@ The same `Transform` doubles as a **dataset placement transform** via
 `Transform.inverse_apply` (see §6): a `Grid`/`Scatter` carrying one is sampled by
 inverse-mapping the world query into the dataset's local frame.
 
+**Motion keys (2026-11-03).** With a `Motion` (`ftsl_emit.py`; `Scene.emit(motion=)`, `render_range(motion=)`), `EmitCtx.key_clocks()` gives the clock at each key -- the frame's phase plus the key's offset times one frame's step, *not* folded back into `[0, 1)` on a loop, each key with its own cache scope -- and `Transform.wrap` / `keyed_sphere` sample there. A value that differs at any key (as written, to 6 digits) becomes a `motion { key { ... } }` block; one that does not is written exactly as before. Rotation keys are unwrapped outward from the instant's key (`unwrap_degrees`), because ftrace interpolates the angle and a periodic spin folds 360 back to 0. A moving sphere is written at the origin inside a keyed group (translate, and scale when its radius changes), which is the only form ftrace can move. Vertex-animated meshes stay at the instant until ftrace has per-vertex keys (its ROADMAP 11 stage E).
+
 ---
 
 ## 8. Layer 5 — Scene + serialization

@@ -35,6 +35,7 @@ from .scene import (
     NamedSpectrum, Upsample,
 )
 from .transform import Transform
+from .ftsl_emit import Motion
 from .mcubes import mesh_field
 from .vdbio import (
     write_vdb, read_vdb, read_vdb_grids, bake_field, write_volume, VolumeGrid,
@@ -142,7 +143,7 @@ __all__ = [
     "gyroid_n", "schwarz_p_n", "schwarz_d_n", "neovius_n",
     "pov", "PovFn", "POV_FUNCS", "POV_ND_GENERALIZABLE", "POV_PARAMS", "pov_params",
     "nd_field_expr", "nd_field_eval", "nd_grad_bound_xi",
-    "render_range", "render_still", "emit_frames", "assemble_gif",
+    "render_range", "render_still", "emit_frames", "assemble_gif", "Motion",
     "assemble_gif_ffmpeg", "assemble_gif_gifski", "assemble_mp4", "find_ftrace",
     "find_gifski", "stabilize_exposure",
     "PreviewServer", "preview_range",

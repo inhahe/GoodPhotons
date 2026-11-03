@@ -2075,7 +2075,10 @@ in the shutter would. A pixel's samples spread their times evenly over the shutt
 inverse, rotated per pixel), so a blur grains less than random times would; mode `W` gives every
 pixel the same times, and stays noise-free. Keys interpolate translate, rotate, scale and shear
 as written, so a quarter turn arcs; nested groups compose. The full syntax and its limits are in
-[FTSL.md §13.1](FTSL.md#131-motion--a-moving-group-motion-blur).
+[FTSL.md §13.1](FTSL.md#131-motion--a-moving-group-motion-blur). **Loom writes the keys for an
+animation:** `render_range(scene, …, motion=Motion((-0.5, 0.5), 5))` with a `Camera(…,
+shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame its keys
+([tools/loom/README.md](tools/loom/README.md), *Motion blur*).
 
 - **Without a shutter nothing changes:** the scene renders the groups at the frame's instant, byte
   for byte the static scene with those transforms written out, on every mode and device.
