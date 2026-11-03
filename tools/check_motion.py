@@ -21,6 +21,9 @@ cube whose keys scale and shear it together. It requires:
   * An instantaneous shutter away from the instant (`shutter_open t  shutter_close t`) renders the
     static scene at t, for three t, the same block test -- with a ball added that orbits two whole
     turns on each side of the instant, which the keys must not lose.
+  * A procedural pattern travels with its moving object: a striped ball held sharp late in the
+    shutter equals the static ball there with its world-space stripes shifted by its travel
+    (4x4 blocks, the same test).
   * Mode W blurs too, deterministically (two runs agree byte for byte, and differ from the
     instant).
   * `-checkbvh` passes on a scene of moving triangles and spheres -- every other ray at a random
@@ -184,6 +187,27 @@ def still_scene(obj, u=None, shutter=None):
     lines.append('camera "c" { eye 0 1.0 4.2  look_at 0 0.5 0  up 0 1 0  fov_y 40  %sfilm { res %d %d } }'
                  % (cam, W, H))
     return NL.join(lines) + NL
+
+
+def stripe_scene(u=None, shutter=None, shift=0.0):
+    """A ball striped by a world-space pattern, sliding left to right. Moving (u None), its
+    stripes must travel with it; held at u with the pattern shifted by `shift` in x, the static
+    equivalent of that."""
+    keys = [dict(translate=(-0.6, 0.45, 0.2)), dict(translate=(0.6, 0.45, 0.2))]
+    cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
+    return NL.join([
+        "scene { units meters  motion_interval -0.5 0.5 }",
+        'material "white" { type diffuse reflect 0.7 }',
+        'pattern "stripes" { expr "0.5 + 0.4 * sin(25 * (x - %r))" }' % shift,
+        'material "striped" { type diffuse reflect pattern:stripes }',
+        "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }",
+        "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material white }",
+        "light area { origin -0.4 2.9 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  spd preset:bb6500"
+        "  power 60 }",
+        "group { %s  sphere { center 0 0 0  radius 0.35  material striped } }" % xf(keys, u, 1.0),
+        'camera "c" { eye 0 1.0 4.2  look_at 0 0.5 0  up 0 1 0  fov_y 40  %sfilm { res %d %d } }'
+        % (cam, W, H),
+    ]) + NL
 
 
 def bvh_scene():
@@ -455,6 +479,23 @@ def main():
         bad = (z > 5.0) & (rel > 0.03)
         verdict("shutter %g..%g = the scene as written at %g" % (t, t, t), not bad.any(),
                 "worst block z %.1f rel %.3f; %d blocks out" % (z.max(), rel.max(), bad.sum()))
+
+    # --- a pattern travels with its moving object: held sharp at u = 0.9 the ball has slid 0.48
+    # m, and its stripes with it ---
+    sharp, ref = os.path.join(out, "stripe_sharp.ftsl"), os.path.join(out, "stripe_ref.ftsl")
+    write(sharp, stripe_scene(shutter=(0.4, 0.4)))
+    write(ref, stripe_scene(u=0.9, shift=-0.6 + 1.2 * 0.9 - 0.0))
+    pa = [lum(render(exe, out, sharp, "stripe_sharp_s%d" % s, ["-mode", "R", "-device", "cpu",
+                                                               "-spp", "256"], seed=s)[0]) for s in (1, 2)]
+    pb = [lum(render(exe, out, ref, "stripe_ref_s%d" % s, ["-mode", "R", "-device", "cpu",
+                                                           "-spp", "256"], seed=s)[0]) for s in (1, 2)]
+    ma, mr = blocks((pa[0] + pa[1]) / 2, 4), blocks((pb[0] + pb[1]) / 2, 4)
+    err = np.hypot(block_err(pa[0], pa[1], 4), block_err(pb[0], pb[1], 4))
+    z = np.abs(ma - mr) / np.maximum(err, 1e-30)
+    rel = np.abs(ma - mr) / np.maximum(np.abs(mr), 1e-3 * np.abs(mr).max())
+    bad = (z > 5.0) & (rel > 0.03)
+    verdict("a pattern travels with its moving object", not bad.any(),
+            "worst block z %.1f rel %.3f; %d blocks out" % (z.max(), rel.max(), bad.sum()))
 
     # --- mode W: blurred, deterministically ---
     wargs = ["-mode", "W", "-device", "cpu", "-spp", "64"]

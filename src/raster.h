@@ -1220,10 +1220,16 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
         };
         for (int iv = 0; iv < SV; ++iv)
             for (int iu = 0; iu < SU; ++iu) {
+                // d: the direction in the sphere's own axes, which the UV is read in; w: in the
+                // world, where its vertices and normals go (the same when it is not turned).
                 Vec3 d00 = sp(iu, iv),   d10 = sp(iu + 1, iv);
                 Vec3 d01 = sp(iu, iv+1), d11 = sp(iu + 1, iv + 1);
-                Vec3 v00 = s.c + d00 * s.r, v10 = s.c + d10 * s.r;
-                Vec3 v01 = s.c + d01 * s.r, v11 = s.c + d11 * s.r;
+                const auto world = [&s](const Vec3& d) {
+                    return s.turned ? s.ax * d.x + s.ay * d.y + s.az * d.z : d;
+                };
+                const Vec3 w00 = world(d00), w10 = world(d10), w01 = world(d01), w11 = world(d11);
+                Vec3 v00 = s.c + w00 * s.r, v10 = s.c + w10 * s.r;
+                Vec3 v01 = s.c + w01 * s.r, v11 = s.c + w11 * s.r;
                 // Seam fix: u = 0.5 + atan2(z,x)/2pi wraps from 1 to 0 at phi = pi (the column
                 // that crosses -x, not the last one). Where a quad's u span wraps, add a turn to
                 // its low side so the interpolated span stays monotonic (the texture repeats).
@@ -1232,10 +1238,10 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
                 if (umax - std::min({uv00.x, uv01.x, uv10.x, uv11.x}) > 0.5)
                     for (Vec3* q : {&uv00, &uv01, &uv10, &uv11})
                         if (umax - q->x > 0.5) q->x += 1.0;
-                PTri a; a.p0 = v00; a.p1 = v01; a.p2 = v11; a.n0 = d00; a.n1 = d01; a.n2 = d11;
+                PTri a; a.p0 = v00; a.p1 = v01; a.p2 = v11; a.n0 = w00; a.n1 = w01; a.n2 = w11;
                 applyMat(a, s.matId);
                 a.uv0 = uv00; a.uv1 = uv01; a.uv2 = uv11;
-                PTri b; b.p0 = v00; b.p1 = v11; b.p2 = v10; b.n0 = d00; b.n1 = d11; b.n2 = d10;
+                PTri b; b.p0 = v00; b.p1 = v11; b.p2 = v10; b.n0 = w00; b.n1 = w11; b.n2 = w10;
                 applyMat(b, s.matId);
                 b.uv0 = uv00; b.uv1 = uv11; b.uv2 = uv10;
                 out.push_back(a); out.push_back(b);

@@ -683,7 +683,8 @@ struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; in
                  double curvature;                       // O3 per-face mean curvature (Tri::finalize)
                  int vcol;                               // Tri::vcol -> DScene::vertColors, or -1
                  Real reach; };                          // farthest vertex's distance (Hit::pscale)
-struct DSphere { DVec3 c; double r; int matId; };
+// ax/ay/az: the sphere's own axes (Sphere::ax..), read only when `turned`.
+struct DSphere { DVec3 c; double r; int matId; int turned; DVec3 ax, ay, az; };
 // One round cone of a curve/fiber strand — the device twin of CurveSeg (curve.h). The host
 // record is already a POD in exactly this shape; only the scalar type narrows to Real.
 struct DCurveSeg { DVec3 p0, p1; Real r0, r1; int matId; float u0, u1; };
@@ -4179,14 +4180,18 @@ __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const D
     // O3: analytic 1/R, negated from inside — mirrors the host intersectSphere.
     hit.curv = (s.r > 1e-12) ? (Real)((sFlipped ? -1.0 : 1.0) / s.r) : (Real)0;
     hit.matId = s.matId; hit.sensorId = -1;
-    // Equirectangular (lat/long) UV so spheres can be textured (mirrors host).
-    Real ny = ng.y < (Real)-1 ? (Real)-1 : (ng.y > (Real)1 ? (Real)1 : ng.y);
-    hit.u = (Real)0.5 + atan2(ng.z, ng.x) / (Real)(2.0 * DPI);
+    // Equirectangular (lat/long) UV so spheres can be textured, in the sphere's own axes when
+    // it has been turned (mirrors host).
+    const DVec3 nl = s.turned ? DVec3{dot(ng, s.ax), dot(ng, s.ay), dot(ng, s.az)} : ng;
+    Real ny = nl.y < (Real)-1 ? (Real)-1 : (nl.y > (Real)1 ? (Real)1 : nl.y);
+    hit.u = (Real)0.5 + atan2(nl.z, nl.x) / (Real)(2.0 * DPI);
     hit.v = (Real)0.5 - asin(ny) / (Real)DPI;
     // Longitude (east) tangent d/du, mirroring the host sphere path (C6).
-    DVec3 tg{-ng.z, (Real)0, ng.x};
+    DVec3 tg{-nl.z, (Real)0, nl.x};
+    if (s.turned) tg = s.ax * tg.x + s.ay * tg.y + s.az * tg.z;
     Real tgl = sqrt(dot(tg, tg));
-    hit.tangent = (tgl > (Real)1e-9) ? tg * ((Real)1 / tgl) : DVec3{(Real)1, (Real)0, (Real)0};
+    hit.tangent = (tgl > (Real)1e-9) ? tg * ((Real)1 / tgl)
+                                     : (s.turned ? s.ax : DVec3{(Real)1, (Real)0, (Real)0});
     hit.bitangentSign = (Real)1;
     hit.fiberRadius = (Real)0; hit.vcol = -1; hit.vb0 = hit.vb1 = (Real)0;   // reused record
     return true;
@@ -21191,6 +21196,9 @@ static int deviceEmitterShapeCode(EmitterShape s) {
 }
 
 bool cudaForwardSupported(const Scene& scene) {
+    // Object-space patterns (`pattern_space object`) are read on the host only so far: every
+    // device path renders such a scene on the CPU rather than read its patterns in world space.
+    if (!scene.patFrames.empty()) return false;
     // Implicit surfaces (isosurface / CSG / metaballs) are now sphere-traced on the
     // device too (DImplicit + intersectImplicit); their materials are checked by the
     // same `unsupported()` gate as tri/sphere materials below.
@@ -21471,6 +21479,10 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     for (size_t i = 0; i < scene.spheres.size(); ++i) {
         const Sphere& s = scene.spheres[i]; DSphere& d = sph[i];
         d.c = {s.c.x, s.c.y, s.c.z}; d.r = s.r; d.matId = s.matId;
+        d.turned = s.turned ? 1 : 0;
+        d.ax = {(Real)s.ax.x, (Real)s.ax.y, (Real)s.ax.z};
+        d.ay = {(Real)s.ay.x, (Real)s.ay.y, (Real)s.ay.z};
+        d.az = {(Real)s.az.x, (Real)s.az.y, (Real)s.az.z};
     }
     // Flat mirror surfaces, grouped per plane by Scene::buildMirrorPlanes (which the host
     // already ran inside Scene::build). A straight field-for-field copy: the device solves

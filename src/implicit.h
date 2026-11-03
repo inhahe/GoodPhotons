@@ -437,6 +437,7 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
         hit.curv = 0.0;
         hit.tangent = Vec3{1, 0, 0}; hit.bitangentSign = 1.0;
         hit.fiberRadius = 0.0; hit.hasVcol = false; hit.pscale = 0.0;
+        hit.motionSet = -1; hit.patFrame = -1;
         return true;
     };
 

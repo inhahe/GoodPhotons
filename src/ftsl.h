@@ -5444,7 +5444,18 @@ private:
         }
         Vec3 wc = P(xf.apply(c));
         double wr = Len(r) * s;
-        L.scene.spheres.push_back(Sphere{wc, wr, id});
+        Sphere sp{wc, wr, id};
+        // Its axes: the group's rotation (the transform without its uniform scale), so a
+        // texture turns with the sphere. Left the world's when the group does not turn it.
+        const double inv = s > 0.0 ? 1.0 / s : 1.0;
+        const Vec3 ax = xf.applyDir(Vec3{1, 0, 0}) * inv, ay = xf.applyDir(Vec3{0, 1, 0}) * inv,
+                   az = xf.applyDir(Vec3{0, 0, 1}) * inv;
+        if (!(ax.x == 1.0 && ax.y == 0.0 && ax.z == 0.0 && ay.x == 0.0 && ay.y == 1.0 && ay.z == 0.0 &&
+              az.x == 0.0 && az.y == 0.0 && az.z == 1.0)) {
+            sp.ax = normalize(ax); sp.ay = normalize(ay); sp.az = normalize(az);
+            sp.turned = true;
+        }
+        L.scene.spheres.push_back(sp);
         if (!b.name.empty()) sphereByName_[b.name] = NamedSphere{wc, wr};
         return true;
     }
@@ -6645,6 +6656,7 @@ private:
         bool moving() const { return (bool)at; }
     };
     MotionChain motionChain_;
+    int patFrame_ = -1;   // the pattern frame the group being built gives its children, or -1
     bool sphereAsMesh_ = false;   // the moving group being built scales its children unevenly
     // Named objects built in a moving group. What finds an object by name -- fur `on` and
     // `bald`, a medium's `bounds { object }` -- reads where it sits at the instant, so it refuses
@@ -6819,6 +6831,29 @@ private:
         struct Restore { MotionChain& slot; MotionChain saved;
                          ~Restore() { slot = std::move(saved); } } restore{motionChain_, motionChain_};
         motionChain_ = chain;
+        // `pattern_space object` reads its children's patterns in this group's own space (authored
+        // units, at the frame's instant); `world`, the default, in world space. Inherited.
+        struct FrameRestore { int& slot; int saved; ~FrameRestore() { slot = saved; } }
+            restoreFrame{patFrame_, patFrame_};
+        if (const Stmt* ps = find(b, "pattern_space")) {
+            const std::string v = ps->val.words.empty() ? std::string() : ps->val.words[0];
+            if (v == "object") {
+                Affine toWorld = world;   // the group's space -> world metres (P)
+                for (double& m : toWorld.m) m *= L_;
+                toWorld.t = toWorld.t * L_;
+                if (std::fabs(toWorld.det()) < 1e-30) {
+                    fail("group: `pattern_space object` on a group whose transform is singular");
+                    return false;
+                }
+                patFrame_ = (int)L.scene.patFrames.size();
+                L.scene.patFrames.push_back(Scene::PatFrame{toWorld.inverse(), toWorld});
+            } else if (v == "world") {
+                patFrame_ = -1;
+            } else {
+                fail("group: `pattern_space` takes object or world");
+                return false;
+            }
+        }
         // A sphere this group's motion could scale unevenly is built as a mesh, as an uneven
         // static scale builds it (addSphere): an analytic sphere cannot become an ellipsoid.
         struct FlagRestore { bool& slot; bool saved; ~FlagRestore() { slot = saved; } }
@@ -6829,6 +6864,11 @@ private:
         const auto child = [&](const Block& cb, auto&& add) {
             const PrimMark mk = primMark(L);
             if (!routed(cb, L, add)) return false;
+            if (patFrame_ >= 0) {
+                for (size_t i = mk.tris; i < L.scene.tris.size(); ++i) L.scene.tris[i].patFrame = patFrame_;
+                for (size_t i = mk.spheres; i < L.scene.spheres.size(); ++i) L.scene.spheres[i].patFrame = patFrame_;
+                for (size_t i = mk.emitters; i < L.scene.emitters.size(); ++i) L.scene.emitters[i].patFrame = patFrame_;
+            }
             if (!moving) return true;
             if (!cb.name.empty()) movingNames_.insert(cb.name);
             movers.push_back({mk, primMark(L)});

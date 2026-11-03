@@ -322,6 +322,7 @@ inline bool intersectCurveSeg(const CurveRay& cr, const Ray& r, const CurveSeg& 
     const Vec3 p = r.o + r.d * t;
     hit.p = p;
     hit.pscale = std::max(std::sqrt(dot(s.p0, s.p0)) + s.r0, std::sqrt(dot(s.p1, s.p1)) + s.r1);
+    hit.motionSet = -1; hit.patFrame = -1;
     hit.matId = s.matId;
     hit.sensorId = -1;
     hit.fieldVal = 0.0;

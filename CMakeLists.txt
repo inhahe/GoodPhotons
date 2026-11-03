@@ -73,6 +73,11 @@ target_include_directories(ftrace PRIVATE src src/gpda src/third_party/imgui src
 # change -- dirty all twenty-odd TUs including the 18k-line render_cuda.cu: a full rebuild
 # for a one-line change. Now a bump recompiles version.cpp and relinks.
 target_sources(ftrace PRIVATE src/version.cpp)
+# The process code page is UTF-8 (src/ftrace.manifest), so any path can be named on the command
+# line and in a scene. MSVC's linker merges a .manifest source into the embedded manifest.
+if(MSVC)
+    target_sources(ftrace PRIVATE src/ftrace.manifest)
+endif()
 set_source_files_properties(src/version.cpp PROPERTIES
     COMPILE_DEFINITIONS "FTRACE_VERSION=\"${FTRACE_VERSION}\"")
 # Host TUs compile in parallel: MSBuild's CL task runs one cl.exe with /MP over the dirty

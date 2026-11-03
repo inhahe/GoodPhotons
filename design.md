@@ -9964,11 +9964,24 @@ sees the instant, exactly as a static scene with those transforms would show it.
   bisection wherever blending two neighbours strays from the exact transform by over 1e-3 of
   the movers' size (a 5° turn; a scale times a shear), at most 1025 keys. Between keys the transform is blended entry by entry
   (`keyedAffineAt`), so every point moves in a straight line from key to key: that is what makes
-  the union of a primitive's key boxes bound it at every time (`collectPrimBoxes`). The keys are
+  the union of a primitive's key boxes within a stretch of time bound it there (`buildTimedTrees`). The keys are
   authored lengths and move metres, so each key's translation is scaled by the unit (`L_`).
-- **A moving scene is bounded at its instant** (`Scene::build`: the prims' unswept boxes, which
-  is the static scene's BVH root exactly), so `sceneCenter` / `sceneRadius` — the environment's
-  emission disk, the default cavity radius — do not move when something gets keys.
+- **Two kinds of tree.** `bvh` (and `bvhNoHair`) box every primitive where it sits at the instant —
+  exactly the tree the scene held still would build — so every query without a time and the GPU
+  walk it unchanged, and the scene is bounded there (`sceneCenter` / `sceneRadius`: the
+  environment's disk, the default cavity radius). A query with a time (`timedQuery`) walks
+  `bvhStill`, the primitives that do not move, then `bvhMove[k]`, the moving ones boxed over the
+  k-th of 16 stretches of the interval only (`traverseWorldClosest` / `traverseWorldAny`), so a
+  fast mover costs a ray only near where it is then. `sweptRadius` (their union) is how far a
+  timed shadow ray to the sun or sky must reach (`exitDistance`); a medium's transmittance along
+  it keeps the scene's own (`mediaExitDistance`).
+- **What a moving surface carries.** A hit records the motion set it came from (`Hit::motionSet`),
+  and `patCtxFromHit` reads its patterns at the point carried back to the instant, so a texture
+  travels with its object. An analytic sphere has axes (`Sphere::ax/ay/az`, set from its group's
+  rotation, turned by `sphereAt`; device twin in `DSphere`) its UV is read in. A group's
+  `pattern_space object` adds a pattern frame (`Scene::patFrames`: world-at-instant to the group's
+  own space, and back) its children's hits, and its emitters' sampled points, read patterns in —
+  host only, so `cudaForwardSupported` sends such a scene to the CPU.
 - **A path's time is thread-local** (`geometry.h g_motionU`, a fraction of the interval, negative
   for "the instant"), set for the whole path by `MotionTimeScope`. The scene's query leaves
   (`closestHit`, `occluded`, `shadowTransmittance`, their variants, the linear reference) test a

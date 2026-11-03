@@ -72,7 +72,9 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
-## OPEN (2026-11-03, 0.405.1): NONASCII-PATH — ftrace cannot open a scene or write an image at a path outside the ANSI code page's reach
+## FIXED (2026-11-03, 0.406.0; opened 2026-11-03, 0.405.1): NONASCII-PATH — ftrace cannot open a scene or write an image at a path outside the ANSI code page's reach
+
+**Fixed in 0.406.0:** ftrace.exe embeds a manifest (`src/ftrace.manifest`) that makes its process code page UTF-8, so argv and every narrow-string file API speak UTF-8; `tools/check_object_frames.py` renders a scene at `zoë 山/x.ftsl`.
 
 `ftrace -in "png/shot zoë test/x.ftsl" -o …` fails at once with `error: No mapping for the Unicode
 character exists in the target multi-byte code page.` (0.403.1 too: not new). `main(argc, argv)`
@@ -85,7 +87,9 @@ narrow API speak UTF-8, then audit the `std::filesystem::path(std::string)` / `.
 for UTF-8 (`u8path`, `u8string`); or read argv as UTF-16 (`wmain`) and keep paths as
 `std::filesystem::path` throughout.
 
-## OPEN (2026-11-03, 0.404.0): MOTION-SWEEP — a moving primitive is boxed over its whole motion, so a fast mover slows every ray near its sweep
+## FIXED (2026-11-03, 0.406.0; opened 2026-11-03, 0.404.0): MOTION-SWEEP — a moving primitive is boxed over its whole motion, so a fast mover slows every ray near its sweep
+
+**Fixed in 0.406.0:** `bvh` boxes every primitive at the instant; a query with a time walks the still primitives' tree and a tree of the moving ones boxed over its sixteenth of the interval only (`Scene::buildTimedTrees`, `traverseWorldClosest` / `traverseWorldAny`). The two smaller costs below remain (the per-candidate blend, the any-hit rebuild).
 
 `Scene::collectPrimBoxes` gives each moving triangle and sphere the union of its boxes at every
 key — correct at every time, and tight for a slow mover. A fast one is not: a wheel turning a
@@ -101,7 +105,9 @@ transform afresh for every candidate although a path's time and set are fixed (a
 (set, u) -> D cache would hoist it), and the any-hit queries (`occluded`, `shadowTransmittance`)
 rebuild the whole moved triangle just to return a bool (they could return after `triCross`).
 
-## OPEN (2026-11-03, 0.404.1): MOTION-SPHERE-UV — an analytic sphere's UV map does not turn with its group
+## FIXED (2026-11-03, 0.406.0; opened 2026-11-03, 0.404.1): MOTION-SPHERE-UV — an analytic sphere's UV map does not turn with its group
+
+**Fixed in 0.406.0:** a `Sphere` has axes (`ax/ay/az`, `turned`) set from its group's rotation and turned by `sphereAt`, read by its UV and tangent on the host, the device (`DSphere`) and the raster preview. A statically rotated textured sphere now renders turned, as intended.
 
 A `Sphere` is a centre and a radius: it has no orientation, so its equirectangular UVs and
 tangent frame are fixed in world axes. A static `rotate` on its group already leaves the map
@@ -113,7 +119,9 @@ give `Sphere` a frame (a rotation, set from its group's transform at load and mo
 statically rotated textured sphere renders too, so it wants its own version bump and check.
 Until then: tessellate the sphere (an uneven scale does it, or a mesh).
 
-## OPEN (2026-11-03, 0.404.0): MOTION-PATTERN-SPACE — a procedural pattern stays put while the surface carrying it moves
+## FIXED (2026-11-03, 0.406.0; opened 2026-11-03, 0.404.0): MOTION-PATTERN-SPACE — a procedural pattern stays put while the surface carrying it moves
+
+**Fixed in 0.406.0:** a hit on a moving primitive records its motion set, and its patterns are read at the point carried back to the instant; `group { pattern_space object }` reads a group's patterns (and its emitters' emission patterns) in its own space, so they stay on it from frame to frame. Object-space patterns are host-only for now: such a scene renders on the CPU when the GPU is asked for.
 
 Patterns read the hit's world position (`Hit::p`), as they do in a static scene, so a moving
 group's marble or noise slides through it: under a shutter, the pattern on a moving object does

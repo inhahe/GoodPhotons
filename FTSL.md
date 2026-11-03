@@ -3061,6 +3061,16 @@ group {
 }
 ```
 
+**`pattern_space object`** (or `world`, the default; inherited by nested groups) reads the
+procedural patterns of the group's children in the group's own space — authored units, at the
+frame's instant — instead of in world space, so a pattern stays on its object however the group
+is placed: a marble ball keeps its veins as it rolls from frame to frame. Emission patterns on
+its emitters are read the same way, so a light sampled and a light seen agree. CPU only so far:
+a scene that uses it renders on the CPU when asked for the GPU, and says so.
+
+An analytic `sphere` in a rotated group wears its lat-long UV turned with the group (since
+0.406.0; before, the map stayed in world orientation).
+
 A group's transform composes with its parent's (parent applied last) and is baked
 into every child at load time (no runtime scene graph). Allowed children: `sphere`,
 `quad`, `triangle`, `mesh`, `mesh_instance`, `isosurface`, `curve`, `light`, nested `group`. A light anywhere in the tree
@@ -3103,11 +3113,12 @@ size.)
   where it sits at the instant) and a `light` in a moving group stay where they are at the
   instant, with one warning per kind: they cannot move yet. What finds an object by name — `fur { on }` and `bald`, a
   medium's `bounds { object }`, `settle { collide }` — refuses one in a moving group, which it
-  could not follow. A procedural `pattern` reads world position, so it stays in place while the surface
-  carrying it moves through it — as it does from one frame of an animation to the next; UV
-  textures, vertex colours and per-vertex data move with the surface — except on an analytic
-  `sphere`, whose UV map is fixed in world orientation (as it is under a static `rotate`): it
-  travels with the sphere but does not turn with it; tessellate it (a mesh) to turn a textured ball.
+  could not follow. **Textures travel with what moves:** a procedural `pattern` on a moving
+  surface is read where that surface point sits at the frame's instant, so it smears with the
+  object through the shutter; UV textures, vertex colours and per-vertex data move with the
+  surface, and an analytic `sphere`'s UV map turns with its keys. For a pattern that also stays on
+  its object from one frame of an animation to the next, give the group `pattern_space object`
+  (§13).
 - **Which modes blur:** mode R (and W) on the CPU. On `-device gpu` a blurred mode R stays on the
   CPU and says so; every other mode renders the frame's instant and prints one note (ROADMAP 11
   lists the rest).

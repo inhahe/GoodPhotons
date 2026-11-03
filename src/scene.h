@@ -1027,6 +1027,9 @@ struct Emitter {
     double aimNorm = PI;
     double area = 0.0;
     EmitterShape shape = EmitterShape::Quad;
+    // The pattern frame its emission pattern is read in (Scene::patFrames), or -1: world space --
+    // the frame its triangles' hits read theirs in, so a light sampled and a light hit agree.
+    int patFrame = -1;
     // Index into Scene::mats of the emissive material on this light's GEOMETRY
     // (area/sphere lights add both an emitter and a matching emissive surface), or
     // -1 for lights with no geometry (spot/env/collimated). BDPT needs this to map a
@@ -1627,6 +1630,12 @@ struct Scene {
     std::vector<MotionKeys> motionSets;
     std::vector<Affine>     motionXf;
     std::vector<double>     motionT;
+    // Pattern frames (`group { pattern_space object }`): for each, the map from world space at
+    // the frame's instant into the group's own space (authored units) its patterns are read in,
+    // and its inverse, whose transpose carries a normal there. Tri::patFrame / Sphere::patFrame
+    // index them.
+    struct PatFrame { Affine toObj, toWorld; };
+    std::vector<PatFrame> patFrames;
     bool hasMotion() const { return !motionSets.empty(); }
     // A time in frames (relative to the frame's instant) as the fraction of the motion interval
     // g_motionU holds, clamped to it.
@@ -1666,9 +1675,15 @@ struct Scene {
     Sphere sphereAt(const Sphere& s, double u) const {
         const Affine D = motionAt(s.motion, u);
         bool nonUniform = false;   // the loader keeps a moving sphere's keys uniform in scale
+        const double sc = D.uniformScale(nonUniform);
         Sphere o = s;
         o.c = D.apply(s.c);
-        o.r = s.r * D.uniformScale(nonUniform);
+        o.r = s.r * sc;
+        // Its axes turn with it, so its texture does (a blend of two rotations is not quite one:
+        // each axis is renormalised).
+        o.ax = normalize(D.applyDir(s.ax)); o.ay = normalize(D.applyDir(s.ay));
+        o.az = normalize(D.applyDir(s.az));
+        o.turned = true;
         return o;
     }
     // intersectTri / intersectSphere against a primitive as the current path sees it: itself,
@@ -1691,11 +1706,15 @@ struct Scene {
         TriCrossing x;
         if (!triCross(sh, r, D.apply(t.v0), D.apply(t.v1), D.apply(t.v2), tmin, h.t, x)) return false;
         const Tri tt = movedTri(t, D);
-        return intersectTri(sh, r, tt, tmin, h, vcolData());
+        if (!intersectTri(sh, r, tt, tmin, h, vcolData())) return false;
+        h.motionSet = t.motion;
+        return true;
     }
     FT_NOINLINE bool intersectMovingSphere(const Ray& r, const Sphere& s, double tmin, Hit& h) const {
         const Sphere ss = sphereAt(s, g_motionU);
-        return intersectSphere(r, ss, tmin, h);
+        if (!intersectSphere(r, ss, tmin, h)) return false;
+        h.motionSet = s.motion;
+        return true;
     }
 
     // Per-vertex COLOURS, three linear-RGB floats per entry, indexed by Tri::vcol (which
@@ -3215,6 +3234,125 @@ struct Scene {
     Bvh bvhNoHair;
     std::vector<int> noHairPrim;
 
+    // ---- Timed traversal (motion blur, ROADMAP 11) ----
+    // `bvh` and `bvhNoHair` box every primitive where it sits at the frame's instant -- for a
+    // moving scene exactly the tree the same scene held still would build -- so every query
+    // without a time, and the GPU, walks them as before. A query WITH a time (g_motionU >= 0)
+    // walks the tree of the primitives that do not move, then the tree of the moving ones for
+    // the path's time segment: each of kMotionSegments trees boxes a moving primitive over that
+    // stretch of the interval only, so a fast mover costs a ray near where it is then, not along
+    // its whole sweep. Indices are mapped back to global primitive numbers (stillPrim, movePrim).
+    static constexpr int kMotionSegments = 16;
+    Bvh bvhStill, bvhStillNoHair;
+    std::vector<int> stillPrim, stillNoHairPrim;
+    std::vector<Bvh> bvhMove;
+    std::vector<std::vector<int>> movePrim;
+    bool timedQuery() const { return g_motionU >= 0.0 && !bvhMove.empty(); }
+    int motionSegment() const {
+        const int k = (int)(g_motionU * kMotionSegments);
+        return k < 0 ? 0 : (k >= kMotionSegments ? kMotionSegments - 1 : k);
+    }
+    // The nearest-hit walk every world query makes: leaf(globalPrim, tMax&) as Bvh::traverseClosest.
+    template <class LeafFn>
+    void traverseWorldClosest(const Ray& r, double tmin, double& tMax, LeafFn&& leaf,
+                              TraversalStats* stats, bool skipHair) const {
+        if (timedQuery()) {
+            const bool nh = skipHair && hasNoHairBvh();
+            const Bvh& still = nh ? bvhStillNoHair : bvhStill;
+            const std::vector<int>& sp = nh ? stillNoHairPrim : stillPrim;
+            still.traverseClosest(r, tmin, tMax, [&](int lp, double& tm) { leaf(sp[lp], tm); }, stats);
+            const int k = motionSegment();
+            const std::vector<int>& mp = movePrim[(size_t)k];
+            bvhMove[(size_t)k].traverseClosest(r, tmin, tMax,
+                                               [&](int lp, double& tm) { leaf(mp[lp], tm); }, stats);
+            return;
+        }
+        if (skipHair && hasNoHairBvh())
+            bvhNoHair.traverseClosest(r, tmin, tMax,
+                [&](int lp, double& tm) { leaf(noHairPrim[lp], tm); }, stats);
+        else
+            bvh.traverseClosest(r, tmin, tMax, leaf, stats);
+    }
+    // The any-hit walk: leaf(globalPrim) -> blocked, as Bvh::traverseAny.
+    template <class LeafFn>
+    bool traverseWorldAny(const Ray& r, double tmin, double tMax, LeafFn&& leaf,
+                          bool skipHair = false) const {
+        if (timedQuery()) {
+            const bool nh = skipHair && hasNoHairBvh();
+            const Bvh& still = nh ? bvhStillNoHair : bvhStill;
+            const std::vector<int>& sp = nh ? stillNoHairPrim : stillPrim;
+            if (still.traverseAny(r, tmin, tMax, [&](int lp) { return leaf(sp[lp]); })) return true;
+            const int k = motionSegment();
+            const std::vector<int>& mp = movePrim[(size_t)k];
+            return bvhMove[(size_t)k].traverseAny(r, tmin, tMax, [&](int lp) { return leaf(mp[lp]); });
+        }
+        if (skipHair && hasNoHairBvh())
+            return bvhNoHair.traverseAny(r, tmin, tMax, [&](int lp) { return leaf(noHairPrim[lp]); });
+        return bvh.traverseAny(r, tmin, tMax, leaf);
+    }
+    // A moving primitive's box over the fraction [ua, ub] of the motion interval: its keys inside
+    // it and the blends at its two ends, which bound it there since it moves linearly between keys.
+    template <class AddPoints>
+    void motionWindow(int set, double ua, double ub, AddPoints&& add) const {
+        const MotionKeys& mk = motionSets[(size_t)set];
+        add(motionAt(set, ua));
+        add(motionAt(set, ub));
+        for (int k = 0; k < mk.keys; ++k) {
+            const double t = motionT[(size_t)(mk.first + k)];
+            if (t > ua && t < ub) add(motionXf[(size_t)(mk.first + k)]);
+        }
+    }
+    // Build the still tree (or its no-hair twin) and, with `moving`, the moving trees.
+    void buildTimedTrees(bool noHair, bool moving) {
+        std::vector<Aabb> all;
+        std::vector<int> allPrim;
+        collectPrimBoxes(all, noHair, &allPrim);
+        const int nT = (int)tris.size(), nS = (int)spheres.size();
+        const auto moves = [&](int g) {
+            return (g < nT && tris[(size_t)g].motion >= 0) ||
+                   (g >= nT && g < nT + nS && spheres[(size_t)(g - nT)].motion >= 0);
+        };
+        std::vector<Aabb> boxes;
+        std::vector<int>& sp = noHair ? stillNoHairPrim : stillPrim;
+        sp.clear();
+        for (size_t i = 0; i < all.size(); ++i)
+            if (!moves(allPrim[i])) { boxes.push_back(all[i]); sp.push_back(allPrim[i]); }
+        (noHair ? bvhStillNoHair : bvhStill) = Bvh{};
+        (noHair ? bvhStillNoHair : bvhStill).build(boxes);
+        if (!moving) return;
+        bvhMove.assign(kMotionSegments, Bvh{});
+        movePrim.assign(kMotionSegments, {});
+        const double pad = 1e-6;   // as collectPrimBoxes pads a triangle
+        for (int k = 0; k < kMotionSegments; ++k) {
+            const double ua = (double)k / kMotionSegments, ub = (double)(k + 1) / kMotionSegments;
+            boxes.clear();
+            std::vector<int>& mp = movePrim[(size_t)k];
+            for (int i = 0; i < nT; ++i) {
+                const Tri& t = tris[(size_t)i];
+                if (t.motion < 0) continue;
+                Aabb b;
+                motionWindow(t.motion, ua, ub, [&](const Affine& D) {
+                    b.expand(D.apply(t.v0)); b.expand(D.apply(t.v1)); b.expand(D.apply(t.v2));
+                });
+                b.lo = b.lo - Vec3{pad, pad, pad}; b.hi = b.hi + Vec3{pad, pad, pad};
+                boxes.push_back(b); mp.push_back(i);
+            }
+            for (int i = 0; i < nS; ++i) {
+                const Sphere& sp1 = spheres[(size_t)i];
+                if (sp1.motion < 0) continue;
+                Aabb b;
+                motionWindow(sp1.motion, ua, ub, [&](const Affine& D) {
+                    bool nonUniform = false;
+                    const Vec3 c = D.apply(sp1.c);
+                    const double rr = sp1.r * D.uniformScale(nonUniform);
+                    b.expand(c - Vec3{rr, rr, rr}); b.expand(c + Vec3{rr, rr, rr});
+                });
+                boxes.push_back(b); mp.push_back(nT + i);
+            }
+            bvhMove[(size_t)k].build(boxes);
+        }
+    }
+
     // World bounds of geometry that was DELETED before the tree was built (dropHairCurves).
     // The scene bounding sphere is derived from the BVH root box, which sizes environment
     // photon emission — so without this a coat replaced by a medium would shrink the sphere
@@ -3236,17 +3374,11 @@ struct Scene {
         // the env phase-space weight envGeom = 4*PI^2*R^2.
         {
             Aabb b;
-            // A moving scene is bounded where it sits at the instant, as the same scene held
-            // still would be: the BVH root covers every primitive's whole motion, and taking it
-            // would move the scene's centre and radius -- and with them the environment's
-            // emission disk, the default cavity radius -- as soon as anything got keys.
-            if (hasMotion()) {
-                std::vector<Aabb> still;
-                collectPrimBoxes(still, /*dropHair=*/false, nullptr, /*swept=*/false);
-                for (const Aabb& x : still) b.expand(x);
-            } else if (!bvh.nodes.empty()) {
-                b = bvh.nodes[0].box;
-            }
+            // A moving scene is bounded where it sits at the instant (`bvh` boxes it there), as the
+            // same scene held still would be: bounds taken over the motion would move the scene's
+            // centre and radius -- and with them the environment's emission disk, the default
+            // cavity radius -- as soon as anything got keys.
+            if (!bvh.nodes.empty()) b = bvh.nodes[0].box;
             // Geometry summarised into a medium and deleted (a `-fur-volume` coat) is still
             // physically there — it just isn't traced. Put its extent back so the bounding
             // sphere, and therefore environment emission, is the one the strands would have
@@ -3274,7 +3406,8 @@ struct Scene {
             // What a path at a time of its own may still meet: the instant's bounds widened by the
             // BVH root, which boxes every moving primitive over its whole motion (exitDistance).
             Aabb swept = b;
-            if (hasMotion() && !bvh.nodes.empty()) swept.expand(bvh.nodes[0].box);
+            for (const Bvh& mv : bvhMove)
+                if (!mv.nodes.empty()) swept.expand(mv.nodes[0].box);
             if (swept.lo.x <= swept.hi.x) {
                 sweptCenter = swept.center();
                 sweptRadius = length(swept.hi - swept.lo) * 0.5 * 1.0001;
@@ -3419,9 +3552,9 @@ struct Scene {
     // With `dropHair`, hair curve segments are omitted and `remap` (required) receives, for
     // each box kept, the GLOBAL prim index it came from — so the caller can decode a leaf
     // from the filtered tree with the unfiltered arithmetic.
-    // `swept` false boxes a moving primitive where it sits at the instant, not over its motion.
-    void collectPrimBoxes(std::vector<Aabb>& boxes, bool dropHair, std::vector<int>* remap,
-                          bool swept = true) const {
+    // A moving primitive is boxed where it sits at the frame's instant; the trees a query with a
+    // time walks box it over its motion (buildTimedTrees).
+    void collectPrimBoxes(std::vector<Aabb>& boxes, bool dropHair, std::vector<int>* remap) const {
         const double pad = 1e-6;       // avoid zero-thickness slabs on flat prims
         boxes.clear();
         boxes.reserve(tris.size() + spheres.size() + implicits.size() +
@@ -3429,34 +3562,13 @@ struct Scene {
         if (remap) { remap->clear(); remap->reserve(boxes.capacity()); }
         int g = 0;                     // running GLOBAL prim index
         const auto keep = [&](const Aabb& b) { boxes.push_back(b); if (remap) remap->push_back(g); };
-        // A moving primitive's box covers it at every key; between two keys it moves linearly, so
-        // its every position is a blend of two keyed ones and lies in the union of their boxes.
         for (const auto& t : tris) {
             Aabb b; b.expand(t.v0); b.expand(t.v1); b.expand(t.v2);
-            if (swept && t.motion >= 0) {
-                const MotionKeys& mk = motionSets[(size_t)t.motion];
-                for (int k = 0; k < mk.keys; ++k) {
-                    const Affine& D = motionXf[(size_t)(mk.first + k)];
-                    b.expand(D.apply(t.v0)); b.expand(D.apply(t.v1)); b.expand(D.apply(t.v2));
-                }
-            }
             b.lo = b.lo - Vec3{pad, pad, pad}; b.hi = b.hi + Vec3{pad, pad, pad};
             keep(b); ++g;
         }
         for (const auto& s : spheres) {
             Aabb b; b.expand(s.c - Vec3{s.r, s.r, s.r}); b.expand(s.c + Vec3{s.r, s.r, s.r});
-            if (swept && s.motion >= 0) {
-                // Between keys the radius is at most the blend of the keys' (a blended matrix's
-                // column is no longer than the blend of the columns' lengths), so these suffice.
-                const MotionKeys& mk = motionSets[(size_t)s.motion];
-                for (int k = 0; k < mk.keys; ++k) {
-                    const Affine& D = motionXf[(size_t)(mk.first + k)];
-                    bool nonUniform = false;
-                    const Vec3 c = D.apply(s.c);
-                    const double r = s.r * D.uniformScale(nonUniform);
-                    b.expand(c - Vec3{r, r, r}); b.expand(c + Vec3{r, r, r});
-                }
-            }
             keep(b); ++g;
         }
         for (const auto& im : implicits) { keep(im.bounds); ++g; }
@@ -3487,6 +3599,8 @@ struct Scene {
         std::vector<Aabb> boxes;
         collectPrimBoxes(boxes, /*dropHair=*/false, nullptr);
         bvh.build(boxes);
+        bvhStill = Bvh{}; stillPrim.clear(); bvhMove.clear(); movePrim.clear();
+        if (hasMotion()) buildTimedTrees(/*noHair=*/false, /*moving=*/true);
     }
 
     // Build the second tree, the one `skipHair` queries traverse. Opt-in (main.cpp calls it
@@ -3517,6 +3631,8 @@ struct Scene {
         std::vector<Aabb> boxes;
         collectPrimBoxes(boxes, /*dropHair=*/true, &noHairPrim);
         bvhNoHair.build(boxes);
+        bvhStillNoHair = Bvh{}; stillNoHairPrim.clear();
+        if (hasMotion()) buildTimedTrees(/*noHair=*/true, /*moving=*/false);
     }
     bool hasNoHairBvh() const { return !noHairPrim.empty() && !bvhNoHair.nodes.empty(); }
 
@@ -3716,11 +3832,7 @@ struct Scene {
                 }
             }
         };
-        if (skipHair && hasNoHairBvh())
-            bvhNoHair.traverseClosest(r, tmin, tMax,
-                [&](int lp, double& tm) { leaf(noHairPrim[lp], tm); }, stats);
-        else
-            bvh.traverseClosest(r, tmin, tMax, leaf, stats);
+        traverseWorldClosest(r, tmin, tMax, leaf, stats, skipHair);
         markPatSide(h);
         applyNormalMap(h);
         return h;
@@ -3759,7 +3871,7 @@ struct Scene {
         const auto hidden = [&](int matId) {
             return camHide && matId >= 0 && matId < (int)mats.size() && mats[matId].hideCamera;
         };
-        return bvh.traverseAny(r, tmin, seg, [&](int prim) {
+        return traverseWorldAny(r, tmin, seg, [&](int prim) {
             Hit h; h.t = seg;
             if (prim < (int)nT)             { const Tri& t = tris[prim];
                                               return !hidden(t.matId) && intersectTriNow(sh, r, t, tmin, h); }
@@ -3807,7 +3919,7 @@ struct Scene {
             return camHide && matId >= 0 && matId < (int)mats.size() && mats[matId].hideCamera;
         };
         double T = 1.0;
-        const bool hardBlock = bvh.traverseAny(r, tmin, seg, [&](int prim) -> bool {
+        const bool hardBlock = traverseWorldAny(r, tmin, seg, [&](int prim) -> bool {
             Hit h; h.t = seg;
             if (prim < (int)nT)             return !hidden(tris[prim].matId) && intersectTriNow(sh, r, tris[prim], tmin, h);
             if (prim < (int)(nT + nS))      return !hidden(spheres[prim - nT].matId) && intersectSphereNow(r, spheres[prim - nT], tmin, h);
@@ -3912,9 +4024,7 @@ struct Scene {
         // rejects every fiber it reaches can never early-out inside a coat, so on `bvh` this
         // walks the whole coat before concluding "not blocked". On the filtered tree it walks
         // only the geometry that can actually block.
-        if (hasNoHairBvh())
-            return bvhNoHair.traverseAny(r, tmin, seg, [&](int lp) { return leaf(noHairPrim[lp]); });
-        return bvh.traverseAny(r, tmin, seg, leaf);
+        return traverseWorldAny(r, tmin, seg, leaf, /*skipHair=*/true);
     }
 
     // Like occluded(), but a shadow ray through a COAT does not stop at the first strand:
@@ -3959,7 +4069,7 @@ struct Scene {
         const CurveRay cray = nC ? makeCurveRay(r.d) : CurveRay{};
         const PatTables tabs = patTables();
         int crossed = 0;
-        const bool blocked = bvh.traverseAny(r, tmin, seg, [&](int prim) {
+        const bool blocked = traverseWorldAny(r, tmin, seg, [&](int prim) {
             Hit h; h.t = seg;
             if (prim < (int)nT)             return intersectTriNow(sh, r, tris[prim], tmin, h);
             if (prim < (int)(nT + nS))      return intersectSphereNow(r, spheres[prim - nT], tmin, h);
@@ -4294,8 +4404,22 @@ inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
     }
     Vec3 q;
     patNudgedPoint(h.p.x, h.p.y, h.p.z, h.ng.x, h.ng.y, h.ng.z, h.pscale, q.x, q.y, q.z);
-    PatCtx c = makePatCtx(q, h.fieldVal, own ? h.n * -1.0 : h.n, h.u, h.v, own ? -h.curv : h.curv,
-                          h.cavity, h.fw);
+    Vec3 n = own ? h.n * -1.0 : h.n;
+    // A moving primitive's patterns read the point carried back to the frame's instant, so the
+    // texture travels with it through the shutter rather than the surface sliding through it.
+    if (h.motionSet >= 0 && g_motionU >= 0.0) {
+        const Affine D = scene.motionAt(h.motionSet, g_motionU);
+        q = D.inverse().apply(q);
+        n = normalize(D.applyDirTranspose(n));   // a normal maps by the inverse transpose
+    }
+    // And a primitive in a `pattern_space object` group reads them in that group's own space,
+    // so they stay on it however it is placed -- from frame to frame of an animation too.
+    if (h.patFrame >= 0) {
+        const Scene::PatFrame& f = scene.patFrames[(size_t)h.patFrame];
+        q = f.toObj.apply(q);
+        n = normalize(f.toWorld.applyDirTranspose(n));
+    }
+    PatCtx c = makePatCtx(q, h.fieldVal, n, h.u, h.v, own ? -h.curv : h.curv, h.cavity, h.fw);
     bindPatScene(c, scene);
     return c;
 }
@@ -4455,7 +4579,13 @@ inline double emitterPatMulAt(const Scene& scene, const Emitter& em,
     if (em.emitPat < 0 || em.emitPat >= (int)scene.patterns.size()) return 1.0;
     Vec3 q;
     patNudgedPoint(y.x, y.y, y.z, nOut.x, nOut.y, nOut.z, reach, q.x, q.y, q.z);
-    PatCtx c = makePatCtx(q, 0.0, nOut, uu, vv);
+    Vec3 n = nOut;
+    if (em.patFrame >= 0) {   // as patCtxFromHit reads the same surface's hits
+        const Scene::PatFrame& f = scene.patFrames[(size_t)em.patFrame];
+        q = f.toObj.apply(q);
+        n = normalize(f.toWorld.applyDirTranspose(n));
+    }
+    PatCtx c = makePatCtx(q, 0.0, n, uu, vv);
     bindPatScene(c, scene);
     double p = scene.patterns[em.emitPat].eval(c);
     return p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p);

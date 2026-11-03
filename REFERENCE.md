@@ -2090,10 +2090,13 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
   shutter).
 - **What can move so far:** spheres (as a mesh where the keys stretch one), quads, triangles and
   meshes. An isosurface, a curve, a `mesh_instance`, an emissive mesh and a
-  light in a moving group stay at the instant, with a warning.
-- **Cost:** a moving triangle is boxed over its whole motion in the BVH, so a fast mover — a
-  spinning wheel above all — makes every ray near its sweep test it; each test moves it to the
-  path's time first.
+  light in a moving group stay at the instant, with a warning. A procedural pattern on a moving
+  surface travels with it (it is read where the point sits at the frame's instant), and a
+  sphere's UV turns with its keys; `pattern_space object` on a group keeps its patterns on it
+  from frame to frame too (FTSL §13).
+- **Cost:** a path's rays walk the still geometry's tree and a tree of the moving geometry boxed
+  over just its sixteenth of the shutter, so a fast mover — a spinning wheel — costs a ray only
+  near where it is at that time; a render without a shutter walks the scene's ordinary tree.
 
 ---
 

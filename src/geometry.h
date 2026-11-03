@@ -113,6 +113,8 @@ struct Tri {
     // The vertices and normals above are the triangle at the frame's own instant; the keys
     // carry it across the scene's motion interval (Scene::triAt).
     int motion = -1;
+    // The pattern frame its patterns are read in (Scene::patFrames), or -1: world space.
+    int patFrame = -1;
     // triReach of the vertices, baked here for the hit to copy (Hit::pscale).
     double reach = 0.0;
     void finalize() {
@@ -174,6 +176,13 @@ struct Sphere {
     Vec3 c; double r = 1.0;
     int matId = 0;
     int motion = -1;   // Scene::motionSets index, or -1; c and r are the frame's instant (Scene::sphereAt)
+    // The sphere's own axes, in world space (orthonormal): its lat-long UV and tangent are read
+    // in them, so a sphere in a rotated group -- or turned by its motion keys -- wears its
+    // texture turned with it. `turned` false means they are the world's, and keeps the plain
+    // world-axis path, bit for bit.
+    Vec3 ax{1, 0, 0}, ay{0, 1, 0}, az{0, 0, 1};
+    bool turned = false;
+    int patFrame = -1;   // the pattern frame its patterns are read in (Scene::patFrames), or -1
 };
 
 // Where the current path is in time, as a fraction of the scene's motion interval (0 at its
@@ -268,6 +277,12 @@ struct Hit {
     // choke points, with the surface's own material -- the rule is the surface's, so a mix
     // that later resolves to an opaque part keeps it for that part's patterns too.
     bool patOwnSide = false;
+    // Where the hit's patterns are read (Scene::patCtxFromHit): the motion set of the moving
+    // primitive it is on, or -1 -- its patterns read the point carried back to the frame's
+    // instant, so a texture travels with its object -- and the pattern frame of the primitive,
+    // or -1 for world space. Every intersector writes both (the record is reused).
+    int motionSet = -1;
+    int patFrame = -1;
     // Barycentric-interpolated per-vertex colour at the hit (linear RGB), when the
     // triangle carried one. Resolved by the intersector, which is the only place that
     // has both the triangle and the barycentrics; everything downstream reads it off the
@@ -570,6 +585,7 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     // b0 v0 + b1 v1 + b2 v2: the b's need not sum to exactly 1, which breaks the exactness.)
     hit.t = t; hit.p = tri.v0 + (tri.v1 - tri.v0) * b1 + (tri.v2 - tri.v0) * b2; hit.valid = true;
     hit.pscale = tri.reach;
+    hit.motionSet = -1; hit.patFrame = tri.patFrame;
     hit.matId = tri.matId; hit.sensorId = tri.sensorId;
     // Barycentric-interpolated UV and shading normal (matches the old M-T convention:
     // b0,b1,b2 == w0,u,v).
@@ -654,6 +670,7 @@ inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit
     // |r|: the quadratic only sees r^2, so a negative radius traces as its absolute value.
     hit.p = s.c + ng * std::fabs(s.r);
     hit.pscale = std::sqrt(dot(s.c, s.c)) + std::fabs(s.r);
+    hit.motionSet = -1; hit.patFrame = s.patFrame;
     hit.ng = ng;
     bool sFlipped = !(dot(r.d, ng) < 0.0);
     hit.n = sFlipped ? -ng : ng;
@@ -662,15 +679,18 @@ inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit
     // inside (a room-sized sphere is concave to anything standing in it).
     hit.curv = (s.r > 1e-12) ? ((sFlipped ? -1.0 : 1.0) / s.r) : 0.0;
     hit.matId = s.matId; hit.sensorId = -1;
-    // Equirectangular (lat/long) UV so spheres can be textured (globes, eyeballs).
-    hit.u = 0.5 + std::atan2(ng.z, ng.x) / (2.0 * PI);
-    hit.v = 0.5 - std::asin(std::clamp(ng.y, -1.0, 1.0)) / PI;
+    // Equirectangular (lat/long) UV so spheres can be textured (globes, eyeballs), in the
+    // sphere's own axes (Sphere::ax/ay/az) when it has been turned.
+    const Vec3 nl = s.turned ? Vec3{dot(ng, s.ax), dot(ng, s.ay), dot(ng, s.az)} : ng;
+    hit.u = 0.5 + std::atan2(nl.z, nl.x) / (2.0 * PI);
+    hit.v = 0.5 - std::asin(std::clamp(nl.y, -1.0, 1.0)) / PI;
     // Tangent = the east-pointing longitude direction d/du (C6). d/du of the
     // equirectangular map is proportional to (-sin, 0, cos) of the longitude, i.e.
-    // perpendicular to both world-up and the normal; degenerates to +x at the poles.
-    Vec3 T{-ng.z, 0.0, ng.x};
+    // perpendicular to both the sphere's up and the normal; degenerates to its +x at the poles.
+    Vec3 T{-nl.z, 0.0, nl.x};
+    if (s.turned) T = s.ax * T.x + s.ay * T.y + s.az * T.z;
     double tl = std::sqrt(dot(T, T));
-    hit.tangent = (tl > 1e-9) ? T * (1.0 / tl) : Vec3{1, 0, 0};
+    hit.tangent = (tl > 1e-9) ? T * (1.0 / tl) : (s.turned ? s.ax : Vec3{1, 0, 0});
     hit.bitangentSign = 1.0;
     hit.fiberRadius = 0.0; hit.hasVcol = false;   // `hit` is a reused record: not a strand, no colours
     return true;
