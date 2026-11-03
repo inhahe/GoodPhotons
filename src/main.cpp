@@ -16077,6 +16077,9 @@ static void compareFilms(const Film& fwd, long long Nfwd, const Film& ref, long 
 // and returns -- while a second Ctrl-C restores the default handler and force-quits.
 // A sig_atomic_t flag is the only state a signal handler may touch portably.
 static volatile std::sig_atomic_t g_stopRequested = 0;
+// -stop-exit <code>: the exit code of a render ended early by -stop or Ctrl-C (0: the usual 0),
+// so a driver can tell a part-rendered image from a finished one (loom's render_range).
+static int g_stopExitCode = 0;
 static void onInterrupt(int sig) {
     if (g_stopRequested) { std::signal(sig, SIG_DFL); std::raise(sig); return; }
     g_stopRequested = 1;
@@ -21284,6 +21287,7 @@ static void printHelp(const char* prog) {
 "  -stop [<pid>|all]     ask a RUNNING ftrace to finish cleanly (image + checkpoint\n"
 "                        written, CUDA torn down) instead of killing it; bare -stop\n"
 "                        lists running renders. Never force-kill a CUDA render.\n"
+"  -stop-exit <code>     exit with <code> (not 0) when -stop or Ctrl-C ends this render early\n"
 "\n"
 "Raster preview & interactive explore (no light transport):\n"
 "  -raster               fast solid-shaded preview; -raster-gpu = GPU isosurface preview\n"
@@ -22330,6 +22334,7 @@ static int run(int argc, char** argv) {
             if (framesLo < 0 || framesHi < framesLo) { std::fprintf(stderr, "error: -frames needs A B with 0 <= A <= B\n"); return 1; }
         }
         else if (!std::strcmp(argv[i], "-frame-label") && i + 1 < argc) g_frameLabelCli = argv[++i];
+        else if (!std::strcmp(argv[i], "-stop-exit") && i + 1 < argc) g_stopExitCode = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-view") && i + 1 < argc) {
             // Ad-hoc preview/render camera: EX,EY,EZ/LX,LY,LZ[/FOV] (',' and '/'
             // are interchangeable separators). Renders and previews just this
@@ -28465,6 +28470,9 @@ static int runServe(int argc, char** argv, int inValPos) {
 // every other argument goes to each frame's render. `ftrace -stop <this pid>` ends the shot
 // cleanly: the stop file tells the runner to stop the frame in progress (with -stop, so it keeps
 // what it rendered) and start no other.
+#ifdef _WIN32
+static BOOL WINAPI shotIgnoreCtrlC(DWORD type) { return type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT; }
+#endif
 static int runShot(int argc, char** argv, int at) {
 #ifdef _WIN32
     (void)argv;
@@ -28553,7 +28561,16 @@ static int runShot(int argc, char** argv, int at) {
     for (const std::wstring& a : shotArgs) cmd += L" " + quote(a);
     cmd += L" --";
     for (const std::wstring& a : renderArgs) cmd += L" " + quote(a);
-    std::printf("[shot] %ls\n", cmd.c_str());
+    // UTF-8 for the console enableAnsiTerminal set up, and for whatever reads our output.
+    const auto toU8 = [](const std::wstring& w) {
+        const int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0,
+                                            nullptr, nullptr);
+        std::string u8((size_t)std::max(len, 0), ' ');
+        if (len > 0) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &u8[0], len,
+                                         nullptr, nullptr);
+        return u8;
+    };
+    std::printf("[shot] %s\n", toU8(cmd).c_str());
     std::fflush(stdout);
 
     std::wstring env = loomlink::childEnvBlock(exePath.parent_path().wstring() + L"\\tools\\loom");
@@ -28569,14 +28586,11 @@ static int runShot(int argc, char** argv, int at) {
         return 1;
     }
     CloseHandle(pi.hThread);
-    {   // listed by a bare `ftrace -stop`, as UTF-8
-        const int len = WideCharToMultiByte(CP_UTF8, 0, scenePy.c_str(), (int)scenePy.size(),
-                                            nullptr, 0, nullptr, nullptr);
-        std::string u8((size_t)std::max(len, 0), '\0');
-        if (len > 0) WideCharToMultiByte(CP_UTF8, 0, scenePy.c_str(), (int)scenePy.size(),
-                                         &u8[0], len, nullptr, nullptr);
-        stopChannelStart("shot " + u8);
-    }
+    // Ctrl-C reaches the runner and the frame's ftrace too, and they end cleanly -- the frame
+    // writing its image and checkpoint -- so this one waits for them instead of dying first and
+    // handing the console back while they are still writing.
+    SetConsoleCtrlHandler(shotIgnoreCtrlC, TRUE);
+    stopChannelStart("shot " + toU8(scenePy));   // listed by a bare `ftrace -stop`
     bool told = false;
     while (WaitForSingleObject(pi.hProcess, 250) == WAIT_TIMEOUT) {
         if (!told && g_extStopRequested.load()) {
@@ -28789,6 +28803,7 @@ int main(int argc, char** argv) {
                              (outPath ? outPath : "(default output)"));
         }
         rc = serve ? runServe(argc, argv, inValPos) : run(argc, argv);
+        if (rc == 0 && g_stopExitCode != 0 && g_stopRequested) rc = g_stopExitCode;
     } catch (const std::bad_alloc&) {
         // std::bad_alloc::what() is the bare string "bad allocation", which names neither
         // the buffer nor its size nor the flag that sized it — so a render that died here

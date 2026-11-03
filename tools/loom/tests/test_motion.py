@@ -92,6 +92,17 @@ def test_a_fast_spin_keeps_its_direction():
     assert steps == pytest.approx([250.0] * 4, rel=1e-4)
 
 
+def test_a_spin_in_step_with_the_keys_still_moves():
+    # A whole turn between neighbouring keys (1440 degrees a frame, keys a quarter-frame apart):
+    # every key reads the same angle, yet the wheel turns, and must blur.
+    g = Group(Sphere((0, 0, 0), 0.2, "m"),
+              rotate=vec(0.0, TimeFn(lambda t: 1440.0 * 8 * t), 0.0))
+    txt = _emit(g, Clock.at_frame(3, 8), Motion((-0.5, 0.5), 5))
+    ys = [float(k.split()[2]) for k in _keys(txt)]
+    assert len(ys) == 5
+    assert [b - a for a, b in zip(ys, ys[1:])] == pytest.approx([360.0] * 4, rel=1e-4)
+
+
 def test_moving_sphere_rides_a_keyed_group():
     s = Sphere(vec(TimeFn(lambda t: 8.0 * t, periodic=False), 0.5, 0.0), 0.25, "m")
     txt = _emit(s, Clock.at_frame(2, 9, loop=False), Motion((-0.5, 0.5), 3))

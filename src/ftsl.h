@@ -6631,8 +6631,6 @@ private:
     std::map<std::pair<int, int>, int> routeClone_;
     std::vector<char> routeIsClone_;   // by material id: made by routedMat for an object or group
     bool routeWarnedLight_ = false, routeWarnedInst_ = false;
-    // The world transform, at each motion key, of the moving group being built (empty outside
-    // one): a nested group composes its own transform with it (addGroup).
     // The moving group being built, as its children see it (not moving outside one): its exact
     // world transform at any fraction of the motion interval -- every ancestor's authored keys
     // interpolated as written and composed -- the times where that may kink (every authored
@@ -6803,7 +6801,11 @@ private:
             std::sort(chain.breaks.begin(), chain.breaks.end());
             chain.breaks.erase(std::unique(chain.breaks.begin(), chain.breaks.end()), chain.breaks.end());
             chain.turnRate = parent.turnRate;
-            chain.uneven = parent.uneven;
+            // Uneven if any key scales or shears unevenly, or a static ancestor does: turning
+            // inside an uneven scale is no similarity either.
+            bool parentUneven = false;
+            parentXf.uniformScale(parentUneven);
+            chain.uneven = parent.uneven || parentUneven;
             for (size_t k = 0; k + 1 < ownKeys.size(); ++k) {
                 const Vec3 d = ownKeys[k + 1].rot - ownKeys[k].rot;
                 chain.turnRate = std::max(chain.turnRate, parent.turnRate +
@@ -6925,28 +6927,42 @@ private:
             for (const Vec3& p : probe) e = std::max(e, length(exact.apply(p) - blend.apply(p)));
             return e;
         };
-        // Every break, each stretch first cut so it turns no more than kMotionSplitDeg.
-        std::vector<double> ts;
+        // Every break, each stretch first cut so it turns no more than kMotionSplitDeg -- within
+        // the key budget: a spin too fast for it gets its cuts in proportion to each stretch.
+        bool capped = false;
+        std::vector<double> want(chain.breaks.size() - 1);
+        double total = 0.0;
+        for (size_t i = 0; i + 1 < chain.breaks.size(); ++i) {
+            const double turn = chain.turnRate * (chain.breaks[i + 1] - chain.breaks[i]);
+            want[i] = std::max(1.0, std::ceil(std::min(turn / kMotionSplitDeg, 1e9)));
+            total += want[i];
+        }
+        const double budget = (double)(kMotionMaxKeys - 1);
+        if (total > budget) capped = true;
+        std::vector<double> kt;
         for (size_t i = 0; i + 1 < chain.breaks.size(); ++i) {
             const double a = chain.breaks[i], z = chain.breaks[i + 1];
-            const int n = std::max(1, (int)std::ceil(chain.turnRate * (z - a) / kMotionSplitDeg));
-            for (int k = 0; k < n; ++k) ts.push_back(a + (z - a) * k / n);
+            const int n = (int)std::max(1.0, total > budget ? std::floor(want[i] * budget / total)
+                                                            : want[i]);
+            for (int k = 0; k < n; ++k) kt.push_back(a + (z - a) * k / n);
         }
-        ts.push_back(chain.breaks.back());
-        std::vector<double> kt(ts);
+        kt.push_back(chain.breaks.back());
         std::vector<Affine> kw;
         for (double u : kt) kw.push_back(D(u));
         // Then bisect, a round at a time, every stretch whose blend strays -- the worst first when
-        // the keys run out, so the budget goes where the motion needs it.
-        bool capped = false;
+        // the keys run out, so the budget goes where the motion needs it. A stretch that passed
+        // keeps its two keys, so it passes again: only the halves of a split are tested anew.
+        std::vector<char> open(kt.size() - 1, 1);
         for (int round = 0; round < 24; ++round) {
             struct Cut { size_t at; double e, u; Affine w; };
             std::vector<Cut> cuts;
             for (size_t i = 0; i + 1 < kt.size(); ++i) {
+                if (!open[i]) continue;
                 const double m = 0.5 * (kt[i] + kt[i + 1]);
                 const Affine wm = D(m);
                 const double e = err(wm, kw[i].lerp(kw[i + 1], 0.5));
                 if (e > tol) cuts.push_back({i, e, m, wm});
+                else open[i] = 0;
             }
             if (cuts.empty()) break;
             const size_t room = kMotionMaxKeys > kt.size() ? kMotionMaxKeys - kt.size() : 0;
@@ -6959,12 +6975,19 @@ private:
             if (cuts.empty()) break;
             std::vector<double> nt;
             std::vector<Affine> nw;
+            std::vector<char> no;
             size_t c = 0;
             for (size_t i = 0; i < kt.size(); ++i) {
                 nt.push_back(kt[i]); nw.push_back(kw[i]);
-                if (c < cuts.size() && cuts[c].at == i) { nt.push_back(cuts[c].u); nw.push_back(cuts[c].w); ++c; }
+                if (i + 1 == kt.size()) break;
+                if (c < cuts.size() && cuts[c].at == i) {
+                    nt.push_back(cuts[c].u); nw.push_back(cuts[c].w); ++c;
+                    no.push_back(1); no.push_back(1);          // both halves are tested next round
+                } else {
+                    no.push_back(open[i]);                     // a stretch the cap left uncut stays open
+                }
             }
-            kt.swap(nt); kw.swap(nw);
+            kt.swap(nt); kw.swap(nw); open.swap(no);
         }
         if (capped)
             std::fprintf(stderr, "[ftsl] warning: a group's motion needs more than %zu keys to follow "

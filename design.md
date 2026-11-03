@@ -9958,11 +9958,11 @@ sees the instant, exactly as a static scene with those transforms would show it.
 
 - **Keys are placed at load** (`ftsl.h addGroup`, `moveChildren`), at explicit times
   (`Scene::motionT`). The authored keys are translate / rotate / scale / shear parameters,
-  interpolated as written so a turn arcs. A set has a key at every authored key, every key of a
-  moving parent's set and the instant — so `motionAt(set, u0)` is the instant pose, and no
-  kink of the parent's falls between keys — and more by bisection wherever blending two
-  neighbours strays from the exact transform by over 1e-3 of the movers' size (a 5° turn; a
-  scale times a shear), at most 1025 keys. Between keys the transform is blended entry by entry
+  interpolated as written so a turn arcs. A set has a key at every authored key of the group and
+  of every moving ancestor (`MotionChain::breaks`) and at the instant — so `motionAt(set, u0)`
+  is the instant pose, and no kink falls between keys — then, after a turn pre-split, more by
+  bisection wherever blending two neighbours strays from the exact transform by over 1e-3 of
+  the movers' size (a 5° turn; a scale times a shear), at most 1025 keys. Between keys the transform is blended entry by entry
   (`keyedAffineAt`), so every point moves in a straight line from key to key: that is what makes
   the union of a primitive's key boxes bound it at every time (`collectPrimBoxes`). The keys are
   authored lengths and move metres, so each key's translation is scaled by the unit (`L_`).

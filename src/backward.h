@@ -1587,7 +1587,8 @@ struct BackwardRenderer {
         // stopped short of it (Scene::shadowTransmittanceTo), as emitterGeom's ray is.
         const double vis = scene.shadowTransmittanceTo(p + wi * 1e-6, p + wi * dist, shorten);
         if (!(vis > 0.0)) return false;
-        geom *= vis * mediaTr(scene, p + wi * 1e-6, wi, dist, lambda, rng);
+        const double medDist = (em.shape == EmitterShape::Sun) ? scene.mediaExitDistance(p) : dist;
+        geom *= vis * mediaTr(scene, p + wi * 1e-6, wi, medDist, lambda, rng);
         return geom > 0.0;
     }
 
@@ -1711,7 +1712,7 @@ struct BackwardRenderer {
         if (!(fVal > 0.0)) return 0.0;
         double contrib = fVal * Lenv * cosSurf * invPdfLambda / pdfW * wMis * stG;
         if (!scene.media.empty())        // media attenuation out to the scene exit
-            contrib *= mediaTr(scene, h.p + orientedGeoN(h) * 1e-6, wi, farDist, lambda, rng);
+            contrib *= mediaTr(scene, h.p + orientedGeoN(h) * 1e-6, wi, scene.mediaExitDistance(h.p), lambda, rng);
         return contrib;
     }
 
@@ -1726,7 +1727,7 @@ struct BackwardRenderer {
                      nullptr, nullptr, nb)) return;
         // Flat-extinction media only (renderRows' gate): one estimate for the whole bundle.
         if (!scene.media.empty())
-            cosSurf *= mediaTr(scene, h.p + orientedGeoN(h) * 1e-6, wi, farDist, lam[0], rng);
+            cosSurf *= mediaTr(scene, h.p + orientedGeoN(h) * 1e-6, wi, scene.mediaExitDistance(h.p), lam[0], rng);
         for (int i = 0; i < nUp; ++i) {
             double Lenv = scene.envRadiance(wi, lam[i]);
             if (Lenv <= 0.0) continue;
@@ -1817,7 +1818,7 @@ struct BackwardRenderer {
                                                hairExitOffset(hs[0], h.n, wi));
         if (!(vis > 0.0)) return;
         if (!scene.media.empty())
-            vis *= mediaTr(scene, h.p + orientedGeoN(h) * 1e-6, wi, farDist, lam[0], rng);
+            vis *= mediaTr(scene, h.p + orientedGeoN(h) * 1e-6, wi, scene.mediaExitDistance(h.p), lam[0], rng);
         if (!(vis > 0.0)) return;
         const Vec3 wl = hair::toLocal(hs[0].fr, wi);
         double resp[hero::kHeroMax], pdfJ[hero::kHeroMax];
@@ -1855,7 +1856,7 @@ struct BackwardRenderer {
         double phase  = med.phaseValue(dot(wIn, wi), lambda);   // == BSDF pdf here
         double albedo = med.albedo(lambda);
         double wMis   = pdfW / (pdfW + phase);          // balance heuristic
-        double T = mediaTr(scene, p + wi * 1e-6, wi, farDist, lambda, rng);
+        double T = mediaTr(scene, p + wi * 1e-6, wi, scene.mediaExitDistance(p), lambda, rng);
         return albedo * phase * Lenv * invPdfLambda / pdfW * wMis * T * vis;
     }
 
@@ -2142,7 +2143,7 @@ struct BackwardRenderer {
         const double farDist = scene.exitDistance(p);
         const double vis = scene.shadowTransmittance(p + wi * 1e-6, wi, farDist);
         if (!(vis > 0.0)) return;
-        const double T = mediaTr(scene, p + wi * 1e-6, wi, farDist, lam[0], rng);
+        const double T = mediaTr(scene, p + wi * 1e-6, wi, scene.mediaExitDistance(p), lam[0], rng);
         if (!(T > 0.0)) return;
         const double cosT = dot(wIn, wi);
         double ph[hero::kHeroMax], num = 0.0, den = 0.0;

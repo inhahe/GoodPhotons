@@ -1621,9 +1621,9 @@ struct Scene {
     // where it sits at the frame's instant (its own fields) to where it is at that key. Between
     // keys the transform is blended entry by entry (keyedAffineAt), so every point moves in a
     // straight line from key to key -- which is what lets the union of a primitive's key boxes
-    // bound it at every time (collectPrimBoxes). The loader places keys at every authored key,
-    // every parent key and the instant, and between them wherever blending would stray from the
-    // exact motion (addGroup).
+    // bound it at every time (collectPrimBoxes). The loader places keys at every authored key of
+    // the group and its moving ancestors and at the instant, and between them wherever blending
+    // would stray from the exact motion (ftsl.h moveChildren).
     std::vector<MotionKeys> motionSets;
     std::vector<Affine>     motionXf;
     std::vector<double>     motionT;
@@ -2343,8 +2343,12 @@ struct Scene {
     // the swept one. The far end of shadow rays to the sun and the sky.
     double exitDistance(const Vec3& p) const {
         if (g_motionU >= 0.0 && hasMotion()) return length(sweptCenter - p) + sweptRadius;
-        return length(sceneCenter - p) + sceneRadius;
+        return mediaExitDistance(p);
     }
+    // The far end of a medium's transmittance along a ray to the sun or the sky: the scene's own
+    // bounding sphere at every time, since no medium moves -- integrating an unbounded haze out
+    // to a mover's sweep would dim the whole frame the moment a shutter opens.
+    double mediaExitDistance(const Vec3& p) const { return length(sceneCenter - p) + sceneRadius; }
     Vec3 envXYZ{0, 0, 0};
     std::shared_ptr<EnvMap> envMap;   // image-based env (null => constant env)
     // Number of EmitterShape::Sun emitters, recounted by finalizeEmitters(). Every

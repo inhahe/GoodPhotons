@@ -267,9 +267,14 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
             print(f"{tag}: stop requested -- not starting it", flush=True)
             return pngs
         have = checkpoint_spp(png) if want is not None else None
-        stopped_mark = Path(str(png) + ".stopped")   # left by a stop: the frame is not done
-        if skip_existing and png.is_file() and png.stat().st_size > 0 and not stopped_mark.exists():
-            if want is None or (have is not None and have >= want):
+        # Left by a stop or a Ctrl-C: the frame is not done. An -spp budget does not need it --
+        # the checkpoint's own count says whether the frame finished -- but a -noise or -time
+        # one has nothing else to go by.
+        stopped_mark = Path(str(png) + ".stopped")
+        if skip_existing and png.is_file() and png.stat().st_size > 0:
+            if (have is not None and have >= want) if want is not None else not stopped_mark.exists():
+                if stopped_mark.exists():
+                    stopped_mark.unlink()
                 print(f"{tag}: {png.name} done, skipping", flush=True)
                 pngs.append(png)
                 continue
@@ -278,9 +283,11 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
                   f"re-rendering", flush=True)
         # -frame-label: each frame is its own ftrace process and scene file, so only this loop
         # knows the frame's place in the sequence; the live window's title shows it.
+        # -stop-exit: a frame ended early by -stop or Ctrl-C -- the shot's stop, or a stop aimed
+        # at the frame itself -- exits with _STOPPED rather than 0, so it is never taken for done.
         cmd = [str(ftrace), "-in", str(fp), "-o", str(png),
                "-interval", f"{interval:g}", "-checkpoint", *budget,
-               "-frame-label", f"frame {k + 1}/{frames}"]
+               "-frame-label", f"frame {k + 1}/{frames}", "-stop-exit", str(_STOPPED)]
         if window:
             cmd.append("-window")
         cmd.extend(extra_args)
@@ -309,8 +316,13 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
             print(f"{tag}"
                   f"{f' (attempt {attempt + 1}/{retries + 1})' if attempt else ''}: "
                   f"{' '.join(run)}", flush=True)
-            rc, stopped = _run_frame(run, ftrace, stop)
-            if stopped:
+            try:
+                rc, stopped = _run_frame(run, ftrace, stop)
+            except KeyboardInterrupt:
+                stopped_mark.write_text("interrupted before it finished; a rerun resumes it\n",
+                                        encoding="utf-8")
+                raise
+            if stopped or rc == _STOPPED:
                 stopped_mark.write_text("stopped before it finished; a rerun resumes it\n",
                                         encoding="utf-8")
                 print(f"{tag}: stop requested -- {png.name} keeps what it rendered; "
@@ -331,6 +343,10 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
     return pngs
 
 
+# The exit code render_range asks a frame's ftrace to use when it is stopped early (-stop-exit).
+_STOPPED = 75
+
+
 def _run_frame(cmd: Sequence[str], ftrace: Path,
                stop: Optional[Path]) -> Tuple[int, bool]:
     """Run one frame's ftrace and wait for it; returns (exit code, whether it was stopped).
@@ -339,7 +355,7 @@ def _run_frame(cmd: Sequence[str], ftrace: Path,
     it writes its image and checkpoint, then exits). On Ctrl-C -- which the console hands
     ftrace too, and which it answers the same way -- this waits for it to finish rather than
     letting :func:`subprocess.run` terminate it a quarter second later, mid-way through its
-    CUDA teardown and checkpoint, then reports the frame as stopped and passes the Ctrl-C on.
+    CUDA teardown and checkpoint, then passes the Ctrl-C on (the caller marks the frame).
     """
     p = subprocess.Popen(list(cmd), cwd=str(repo_root()))
     try:

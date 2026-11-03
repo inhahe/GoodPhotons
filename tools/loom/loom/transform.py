@@ -32,7 +32,7 @@ from __future__ import annotations
 import math
 from typing import List, Optional, Sequence, Tuple, Union
 
-from .signals.core import Signal, Number, Sin, Cos, as_signal
+from .signals.core import Signal, Number, Sin, Cos, Const, as_signal
 from .signals.vector import VecSignal
 from .ftsl_emit import EmitCtx, vec3, fmt3
 
@@ -223,12 +223,14 @@ class Transform:
         head = ["    %s %s" % (kw, fmt3(v)) for kw, v in vals]
         if ctx.motion is not None:
             keys = [self._values(c, k) for c, k in ctx.key_clocks()]
+            # Follow a rotation that varies before asking whether anything moves: one turning a
+            # whole turn between keys reads the same angle at every key, and must still move.
+            if self.rotate is not None and not all(isinstance(c, Const) for c in self.rotate.components):
+                f = [kw for kw, _ in vals].index("rotate")
+                for key, r in zip(keys, self._rotation_keys(ctx)):
+                    key[f] = ("rotate", r)
             text = [[(kw, fmt3(v)) for kw, v in key] for key in keys]
             if any(t != text[0] for t in text):
-                for f, (kw, _) in enumerate(vals):
-                    if kw == "rotate":
-                        for key, r in zip(keys, self._rotation_keys(ctx)):
-                            key[f] = (kw, r)
                 head = ["    motion {"] + [
                     "        key { %s }" % "  ".join("%s %s" % (kw, fmt3(v)) for kw, v in key)
                     for key in keys] + ["    }"]

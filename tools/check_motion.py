@@ -30,8 +30,9 @@ cube whose keys scale and shear it together. It requires:
   * The loader refuses, with a message naming why: a `motion` block with no `motion_interval`; one
     with a single key; `translate` beside `motion`; fur on, or a medium bounded by, a moving
     object; an interval that excludes the instant; `shutter_close` before `shutter_open`. It keeps
-    an isosurface and an emissive mesh in a moving group at the instant, saying so, and builds a
-    sphere its keys stretch as a mesh, as it does one an uneven static scale stretches.
+    an isosurface and an emissive mesh in a moving group at the instant, saying so -- and a render
+    held sharp late in the shutter shows them there while their sibling ball has moved -- and builds
+    a sphere its keys stretch as a mesh, as it does one an uneven static scale stretches.
 Exits 1 on any failure.
 """
 import argparse
@@ -155,6 +156,36 @@ def scene(u=None, shutter=None, units="meters", extras=False, twirl=False):
     return NL.join(lines) + NL
 
 
+def still_scene(obj, u=None, shutter=None):
+    """A moving group holding a ball, an emissive triangle and an isosurface ball: the ball moves,
+    the other two stay at the instant. With `u`, the static equivalent: the ball held at u and the
+    other two at the instant (u = 0.5)."""
+    keys = [dict(translate=(-0.6, 0.45, 0.2)), dict(translate=(0.6, 0.45, 0.2))]
+    ball = "sphere { center 0 0 0  radius 0.25  material gold }"
+    still = ('mesh "glow_tri" { file "%s"  material glow  translate -0.2 0.45 0  scale 2 }  '
+             "isosurface { material blue  sphere { center 0.3 0.6 0  radius 0.15 } }" % obj)
+    cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
+    lines = [
+        "scene { units meters  motion_interval -0.5 0.5 }",
+        'material "white" { type diffuse reflect 0.7 }',
+        'material "blue"  { type diffuse reflect rgb 0.1 0.2 0.7 }',
+        'material "gold"  { type glossy reflect rgb 0.9 0.7 0.3  roughness 0.15 }',
+        'material "glow"  { type diffuse reflect 0.0  emit blackbody 5200 }',
+        "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }",
+        "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material white }",
+        "light area { origin -0.4 2.9 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  spd preset:bb6500"
+        "  power 60 }",
+    ]
+    if u is None:
+        lines.append("group { %s  %s  %s }" % (xf(keys, None, 1.0), ball, still))
+    else:
+        lines.append("group { %s  %s }" % (xf(keys, u, 1.0), ball))
+        lines.append("group { %s  %s }" % (xf(keys, 0.5, 1.0), still))
+    lines.append('camera "c" { eye 0 1.0 4.2  look_at 0 0.5 0  up 0 1 0  fov_y 40  %sfilm { res %d %d } }'
+                 % (cam, W, H))
+    return NL.join(lines) + NL
+
+
 def bvh_scene():
     """Many small moving primitives inside the unit cube -checkbvh fires its rays through."""
     rng = np.random.default_rng(7)
@@ -210,6 +241,10 @@ LIGHT = ("light area { origin -0.4 2.9 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0
 # tessellated mesh -- an analytic sphere cannot become an ellipsoid.
 UNEVEN = ("group { motion { key { scale 1 } key { scale 1 } key { scale 1 2 1 } }  sphere { center "
           "0 0 0  radius 0.1  material w } }")
+# The same, the unevenness from a static ancestor: turning inside `scale 1 2 1` (undone below the
+# turn, so the sphere is round at the instant) is no similarity.
+UNEVEN_ANCESTOR = ("group { scale 1 2 1  group { motion { key { rotate 0 0 -45 } key { rotate 0 0 45 } }  "
+                   "group { scale 1 0.5 1  sphere { center 0 0 0  radius 0.1  material w } } } }")
 
 
 def write(path, text):
@@ -302,12 +337,31 @@ def main():
         rc, log = run([exe, "-in", p, "-parseonly"])
         good = rc == 0 and phrase in log
         verdict("keeps %s at the instant, saying so" % name, good, "" if good else log.strip()[-300:])
-    p = os.path.join(out, "uneven.ftsl")
-    write(p, NL.join(["scene { units meters  motion_interval -0.5 0.5 }", base, UNEVEN]) + NL)
-    rc, log = run([exe, "-in", p, "-parseonly"])
-    m = re.search(r"(\d+) spheres, (\d+) tris", log)
-    good = rc == 0 and m is not None and int(m.group(1)) == 0 and int(m.group(2)) > 100
-    verdict("a sphere its keys stretch loads as a mesh", good, "" if good else log.strip()[-300:])
+    # ...and render so: held sharp late in the shutter, the ball has moved and the triangle and
+    # the isosurface have not.
+    objf = obj.replace(chr(92), "/")
+    sharp, ref = os.path.join(out, "still_sharp.ftsl"), os.path.join(out, "still_ref.ftsl")
+    write(sharp, still_scene(objf, shutter=(0.4, 0.4)))
+    write(ref, still_scene(objf, u=0.9))
+    ra = [lum(render(exe, out, sharp, "still_sharp_s%d" % s, ["-mode", "R", "-device", "cpu",
+                                                              "-spp", "256"], seed=s)[0]) for s in (1, 2)]
+    rb = [lum(render(exe, out, ref, "still_ref_s%d" % s, ["-mode", "R", "-device", "cpu",
+                                                          "-spp", "256"], seed=s)[0]) for s in (1, 2)]
+    ma, mr = blocks((ra[0] + ra[1]) / 2), blocks((rb[0] + rb[1]) / 2)
+    err = np.hypot(block_err(ra[0], ra[1]), block_err(rb[0], rb[1]))
+    z = np.abs(ma - mr) / np.maximum(err, 1e-30)
+    rel = np.abs(ma - mr) / np.maximum(np.abs(mr), 1e-3 * np.abs(mr).max())
+    bad = (z > 5.0) & (rel > 0.03)
+    verdict("the kinds that cannot move stay; their siblings move", not bad.any(),
+            "worst block z %.1f rel %.3f; %d blocks out" % (z.max(), rel.max(), bad.sum()))
+    for name, body in (("a sphere its keys stretch loads as a mesh", UNEVEN),
+                       ("a sphere turning inside an uneven scale loads as a mesh", UNEVEN_ANCESTOR)):
+        p = os.path.join(out, "uneven.ftsl")
+        write(p, NL.join(["scene { units meters  motion_interval -0.5 0.5 }", base, body]) + NL)
+        rc, log = run([exe, "-in", p, "-parseonly"])
+        m = re.search(r"(\d+) spheres, (\d+) tris", log)
+        good = rc == 0 and m is not None and int(m.group(1)) == 0 and int(m.group(2)) > 100
+        verdict(name, good, "" if good else log.strip()[-300:])
     for name, sc, cam, phrase in (
             ("refuses an interval that excludes the instant", "motion_interval 0.2 1", "",
              "motion_interval"),
