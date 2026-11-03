@@ -21335,6 +21335,9 @@ static void printHelp(const char* prog) {
 "  -review <base>        play a rendered frame sequence on the live window\n"
 "  -export-mesh <o.obj> [-mesh-res N] [-mesh-adaptive]   isosurface -> mesh\n"
 "  -serve                resident loop: re-render scene paths streamed on stdin\n"
+"  -shot <scene.py>      render a loom file as a shot, every frame (loom.shot runs it):\n"
+"                        -frames A B, -shot-length N, -fps F, -open|-loop, -shutter O C,\n"
+"                        -motion A B KEYS, -no-motion, -name, -outdir, -mp4, -func, -no-window\n"
 "  -viewer <s.json>      open the loom native viewer on a scene-introspection sidecar\n"
 "  -loom <scene.py>      with -viewer: re-derive geometry live from this loom build\n"
 "  -play                 with -viewer: open with the clock already playing\n"
@@ -28452,6 +28455,117 @@ static int runServe(int argc, char** argv, int inValPos) {
     return rc;
 }
 
+// `ftrace -shot <scene.py> [shot flags] [render flags]` (ROADMAP 11): render a loom file as a
+// shot. loom's shot runner (`python -m loom.shot`, tools/loom/loom/shot.py) owns the timeline --
+// it builds each frame's scene, with motion keys when there is a shutter, and renders it with
+// THIS binary, resuming a frame whose checkpoint is complete -- so this only translates the
+// command line and waits. The shot flags are ours, spelled the ftrace way, and go to the runner;
+// every other argument goes to each frame's render. `ftrace -stop <this pid>` ends the shot
+// cleanly: the stop file tells the runner to stop the frame in progress (with -stop, so it keeps
+// what it rendered) and start no other.
+static int runShot(int argc, char** argv, int at) {
+#ifdef _WIN32
+    if (at + 1 >= argc || argv[at + 1][0] == '-') {
+        std::fprintf(stderr, "error: -shot needs a loom scene .py\n");
+        return 1;
+    }
+    const std::string scenePy = argv[at + 1];
+    // ftrace flag -> (loom.shot flag, values it takes).
+    struct ShotFlag { const char* ours; const char* theirs; int values; };
+    static const ShotFlag kShot[] = {
+        {"-frames", "--range", 2},   {"-shot-length", "--frames", 1}, {"-fps", "--fps", 1},
+        {"-open", "--open", 0},      {"-loop", "--loop", 0},          {"-shutter", "--shutter", 2},
+        {"-motion", "--motion", 3},  {"-no-motion", "--no-motion", 0}, {"-name", "--name", 1},
+        {"-outdir", "--outdir", 1},  {"-mp4", "--mp4", 0},            {"-func", "--func", 1},
+        {"-no-window", "--no-window", 0},
+    };
+    std::vector<std::string> shotArgs, renderArgs;
+    for (int i = 1; i < argc; ++i) {
+        if (i == at) { ++i; continue; }                 // -shot and its scene
+        if (!std::strcmp(argv[i], "--")) continue;      // loom.shot's separator; ours is implicit
+        const ShotFlag* f = nullptr;
+        for (const ShotFlag& s : kShot) if (!std::strcmp(argv[i], s.ours)) { f = &s; break; }
+        if (!f) { renderArgs.push_back(argv[i]); continue; }
+        if (i + f->values >= argc) {
+            std::fprintf(stderr, "error: %s needs %d value(s)\n", f->ours, f->values);
+            return 1;
+        }
+        shotArgs.push_back(f->theirs);
+        for (int k = 0; k < f->values; ++k) shotArgs.push_back(argv[++i]);
+    }
+    for (const std::string& a : renderArgs)
+        if (a == "-in" || a == "-o") {
+            std::fprintf(stderr, "error: -shot names each frame's scene and image itself; drop %s "
+                                 "(-outdir and -name place the frames)\n", a.c_str());
+            return 1;
+        }
+    wchar_t exeBuf[MAX_PATH * 4];
+    const DWORD n = GetModuleFileNameW(nullptr, exeBuf, (DWORD)(sizeof exeBuf / sizeof exeBuf[0]));
+    if (n == 0 || n >= sizeof exeBuf / sizeof exeBuf[0]) {
+        std::fprintf(stderr, "error: -shot cannot find its own executable\n");
+        return 1;
+    }
+    const std::filesystem::path exePath(std::wstring(exeBuf, n));
+    const std::filesystem::path stopFile =
+        std::filesystem::temp_directory_path() / ("ftrace_shot_" + std::to_string(ftraceCurrentPid()) + ".stop");
+    std::error_code ec;
+    std::filesystem::remove(stopFile, ec);
+
+    // Each argument quoted for CreateProcess's command-line parser (a backslash run is
+    // literal unless it precedes a quote, which this never writes: none of these end in one).
+    auto quote = [](const std::string& a) {
+        if (!a.empty() && a.find_first_of(" \t\"") == std::string::npos) return a;
+        std::string q = "\"";
+        for (char c : a) { if (c == '"') q += "\\\""; else q += c; }
+        return q + "\"";
+    };
+    std::string cmd = "python -X utf8 -u -m loom.shot " + quote(scenePy) +
+                      " --ftrace " + quote(exePath.string()) + " --stop-file " + quote(stopFile.string());
+    for (const std::string& a : shotArgs) cmd += " " + quote(a);
+    cmd += " --";
+    for (const std::string& a : renderArgs) cmd += " " + quote(a);
+    std::printf("[shot] %s\n", cmd.c_str());
+    std::fflush(stdout);
+
+    std::wstring loomPath = exePath.parent_path().wstring() + L"\\tools\\loom";
+    std::wstring env = loomlink::childEnvBlock(loomPath);
+    std::wstring wcmd = loomlink::utf8ToWide(cmd);
+    std::vector<wchar_t> mutcmd(wcmd.begin(), wcmd.end());
+    mutcmd.push_back(L'\0');
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, mutcmd.data(), nullptr, nullptr, TRUE, CREATE_UNICODE_ENVIRONMENT,
+                        (LPVOID)env.data(), nullptr, &si, &pi)) {
+        std::fprintf(stderr, "error: cannot start the shot runner (error %lu) -- is python on PATH?\n",
+                     GetLastError());
+        return 1;
+    }
+    CloseHandle(pi.hThread);
+    stopChannelStart("shot " + scenePy);
+    bool told = false;
+    while (WaitForSingleObject(pi.hProcess, 250) == WAIT_TIMEOUT) {
+        if (!told && g_extStopRequested.load()) {
+            told = true;
+            std::ofstream(stopFile) << "stop\n";
+            std::printf("[shot] stopping: the frame in progress keeps what it rendered, no "
+                        "further frame starts\n");
+            std::fflush(stdout);
+        }
+    }
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    stopChannelEnd();
+    std::filesystem::remove(stopFile, ec);
+    return (int)code;
+#else
+    (void)argc; (void)argv; (void)at;
+    std::fprintf(stderr, "error: -shot is Windows-only so far\n");
+    return 1;
+#endif
+}
+
 // Thin wrapper: turn a fatal configuration error (e.g. an explicit `file:`/`glass:`/
 // `illuminant:` reference whose target is missing or malformed — thrown by the
 // spectral-library resolver) into a clean message + non-zero exit, instead of a
@@ -28510,6 +28624,10 @@ int main(int argc, char** argv) {
         const char* who = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[i + 1] : nullptr;
         return runStopCommand(who);
     }
+    // `-shot <scene.py>`: hand the whole shot to loom's runner, which calls back into this
+    // binary per frame (runShot). Like -stop, it needs no scene, window or CUDA context here.
+    for (int i = 1; i < argc; ++i)
+        if (!std::strcmp(argv[i], "-shot")) return runShot(argc, argv, i);
     // Let the LOAD-TIME parallel-for (src/parallel.h) see the same stop flag the render
     // loops poll. g_stopRequested is a file-static volatile sig_atomic_t -- a signal
     // handler writes it, and parallel.h can't name it -- so it is handed over as a probe

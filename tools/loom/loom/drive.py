@@ -25,8 +25,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 from .signals.core import Clock, Cache
 from .scene import Scene
@@ -63,6 +64,11 @@ def _budget_args(noise: Optional[float], time_s: Optional[float],
     if n is not None:
         return ["-n", str(int(n))]
     return ["-noise", "3"]  # sensible default: stop at 3% graininess
+
+
+# The ftrace flags that set a render's budget themselves: given one, a caller that chose no
+# budget of its own gets none added (render_range's `-noise 3` default would ride beside it).
+_BUDGET_FLAGS = {"-spp", "-noise", "-time", "-n", "-forever"}
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +161,8 @@ def _develop_args(extra_args: Sequence[str]) -> List[str]:
 
 def emit_frames(scene: Scene, frames: int, outdir: os.PathLike, name: str,
                 *, fps: float = 30.0, loop: bool = True,
-                motion: Optional[Motion] = None) -> List[Path]:
+                motion: Optional[Motion] = None,
+                frame_range: Optional[Tuple[int, int]] = None) -> List[Path]:
     """Emit ``frames`` ``.ftsl`` files; return their paths.
 
     ``loop=True`` (default) maps frames onto a closed loop (``t=(k % frames)/
@@ -164,14 +171,18 @@ def emit_frames(scene: Scene, frames: int, outdir: os.PathLike, name: str,
     endpoints distinct) — a one-shot animation (DESIGN.md §11.6).
 
     ``motion`` gives each frame motion keys (:meth:`Scene.emit`), for a camera ``shutter``
-    to blur.
+    to blur. ``frame_range=(first, last)`` (inclusive) emits only those frames of the
+    ``frames``-long timeline.
     """
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     scene.check_cycles()
     width = max(3, len(str(frames - 1)))
     paths: List[Path] = []
-    for k in range(frames):
+    first, last = frame_range if frame_range is not None else (0, frames - 1)
+    if not (0 <= first <= last < frames):
+        raise ValueError(f"frame_range {frame_range} is outside the {frames}-frame timeline")
+    for k in range(first, last + 1):
         clock = Clock.at_frame(k, frames, fps, loop=loop)
         tag = f"{k:0{width}d}"
         text = scene.emit(clock, Cache(), assets_dir=outdir, tag=tag, motion=motion)
@@ -188,11 +199,23 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
                  n: Optional[int] = None, loop: bool = True,
                  skip_existing: bool = False, retries: int = 2,
                  stabilize: bool = True, motion: Optional[Motion] = None,
+                 frame_range: Optional[Tuple[int, int]] = None,
+                 ftrace: Optional[os.PathLike] = None,
+                 stop_file: Optional[os.PathLike] = None,
                  extra_args: Sequence[str] = ()) -> List[Path]:
     """Emit and render a frame range; return the rendered PNG paths.
 
     ``motion`` (a :class:`~loom.ftsl_emit.Motion`) writes each frame with motion keys, so a
     camera given a ``shutter`` renders it motion-blurred — in mode R, the mode that blurs.
+    ``frame_range=(first, last)`` renders only those frames (inclusive) of the timeline;
+    ``ftrace`` names the binary (default :func:`find_ftrace`). When no budget is given
+    (``noise``/``time_s``/``n``) and ``extra_args`` sets one (``-spp``, ``-noise``, …), none
+    is added beside it.
+
+    ``stop_file``: when that file appears, the frame being rendered is stopped cleanly
+    (``ftrace -stop``: it writes its image and checkpoint) and no further frame starts; the
+    frames finished so far are returned. ``python -m loom.shot`` uses it to let
+    ``ftrace -stop`` reach a whole shot.
 
     ``loop=True`` (default) renders a **seamless closed loop**; ``loop=False``
     renders an **open** one-shot timeline with distinct endpoints (§11.6).
@@ -223,9 +246,13 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
     A frame that fails every attempt still raises.
     """
     outdir = Path(outdir) if outdir is not None else default_outdir(name)
-    ftrace = find_ftrace()
-    ftsl_paths = emit_frames(scene, frames, outdir, name, fps=fps, loop=loop, motion=motion)
-    budget = _budget_args(noise, time_s, n)
+    ftrace = Path(ftrace) if ftrace is not None else find_ftrace()
+    ftsl_paths = emit_frames(scene, frames, outdir, name, fps=fps, loop=loop, motion=motion,
+                             frame_range=frame_range)
+    own = noise is None and time_s is None and n is None
+    budget = ([] if own and any(a in _BUDGET_FLAGS for a in extra_args)
+              else _budget_args(noise, time_s, n))
+    stop = Path(stop_file) if stop_file is not None else None
     want = _target_spp(extra_args)
     if skip_existing and want is None:
         print("[loom] note: budget is not -spp based, so a resume cannot verify that an "
@@ -234,6 +261,9 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
     for i, fp in enumerate(ftsl_paths):
         png = fp.with_suffix(".png")
         tag = f"[loom] frame {i + 1}/{len(ftsl_paths)}"
+        if stop is not None and stop.exists():
+            print(f"{tag}: stop requested -- not starting it", flush=True)
+            return pngs
         have = checkpoint_spp(png) if want is not None else None
         if skip_existing and png.is_file() and png.stat().st_size > 0:
             if want is None or (have is not None and have >= want):
@@ -276,18 +306,40 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
             print(f"{tag}"
                   f"{f' (attempt {attempt + 1}/{retries + 1})' if attempt else ''}: "
                   f"{' '.join(run)}", flush=True)
-            r = subprocess.run(run, cwd=str(repo_root()))
-            if r.returncode == 0:
+            if stop is None:
+                rc = subprocess.run(run, cwd=str(repo_root())).returncode
+            else:
+                rc, stopped = _run_stoppable(run, ftrace, stop)
+                if stopped:
+                    print(f"{tag}: stop requested -- {png.name} keeps what it rendered; "
+                          f"no further frames", flush=True)
+                    return pngs
+            if rc == 0:
                 break
             if attempt == retries:
-                raise RuntimeError(f"ftrace failed on {fp} (exit {r.returncode}) after "
+                raise RuntimeError(f"ftrace failed on {fp} (exit {rc}) after "
                                    f"{retries + 1} attempts")
-            print(f"{tag}: exit {r.returncode}, retrying", flush=True)
+            print(f"{tag}: exit {rc}, retrying", flush=True)
         pngs.append(png)
     if stabilize:
         stabilize_exposure(pngs, anchor_file=outdir / f"{name}_exposure_anchor.txt",
                            develop_args=_develop_args(extra_args))
     return pngs
+
+
+def _run_stoppable(cmd: Sequence[str], ftrace: Path, stop: Path) -> Tuple[int, bool]:
+    """Run one frame's ftrace, watching for ``stop``: when it appears, ask that render to stop
+    cleanly (``ftrace -stop <pid>``, never a kill) and wait for it. Returns (exit code,
+    whether a stop was requested)."""
+    p = subprocess.Popen(list(cmd), cwd=str(repo_root()))
+    while True:
+        try:
+            return p.wait(timeout=0.25), False
+        except subprocess.TimeoutExpired:
+            pass
+        if stop.exists():
+            subprocess.run([str(ftrace), "-stop", str(p.pid)], cwd=str(repo_root()))
+            return p.wait(), True
 
 
 # ftrace prints exactly one of these per image write; the number is the auto-exposure

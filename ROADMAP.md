@@ -718,6 +718,10 @@ interpolated as translate/rotate/scale/shear and resampled every 5° of turn, so
 Per-vertex motion remains the route for deforming meshes (stage E, and mesh keys). **Loom emits
 keys (done):** `Motion` / `Scene.emit(motion=)` / `render_range(motion=)` sample every moving
 transform and sphere at the keys around each frame (rotations unwrapped), and `Camera(shutter=)`
-writes the shutter. Still open in A: `ftrace -shot`, one ftrace process rendering a whole loom
-shot over `loomlink` (the temporal denoiser of stage D needs it). Open for B: blur in every other mode and on the GPU, moving instances,
+writes the shutter. **`ftrace -shot` (0.405.0, done):** it hands a loom file's timeline to
+`python -m loom.shot`, which renders each frame with the same binary (resumable, stoppable with
+`ftrace -stop`). Each frame is its own process, about 0.6 s of start-up measured; rendering a
+shot in one process (extending `-serve` with a per-frame output and resume, keeping the GPU
+context, the asset cache and one live window) is open — the temporal denoiser of stage D can
+work either way, from each frame's saved guides. Open for B: blur in every other mode and on the GPU, moving instances,
 curves, isosurfaces, emissive meshes and lights, and camera motion keys.

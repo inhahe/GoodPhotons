@@ -172,6 +172,25 @@ needs per-vertex motion keys (ftrace ROADMAP 11 stage E). The instant must fall 
 `Motion` refuses a count that misses it — so a frame rendered without a shutter is the same
 frame as before.
 
+### Shots
+
+```
+ftrace -shot tools/loom/examples/motion_shot.py -mp4 -spp 256          # from ftrace
+python -m loom.shot tools/loom/examples/motion_shot.py --mp4 -- -spp 256   # the same, from loom
+```
+
+`loom.shot` renders a loom file as a shot: it loads the file's `build(clock=None, **params)`
+(the viewer's contract; `--func` picks another, e.g. an example's `build_scene`), reads the
+timeline from module constants the flags override — `FRAMES` (`--frames`), `FPS` (`--fps`),
+`LOOP` (`--open` / `--loop`), `SHUTTER` (`--shutter O C`), `MOTION` (`--motion A B KEYS`) —
+and calls `render_range` with `skip_existing`, so rerunning the command resumes. A shutter
+brings motion keys (by default spanning it and the frame's instant). `--range A B` renders part
+of the timeline; `--mp4` assembles the video when the whole timeline is rendered. Everything
+after `--` goes to ftrace for every frame, each of which also gets `-window-min`. `ftrace -shot`
+spells the same flags the ftrace way (`-frames A B`, `-shutter O C`, `-mp4`, …; ftrace's
+`REFERENCE.md`, `-shot`) and turns `ftrace -stop <its pid>` into a clean end: the frame in
+progress is stopped with `-stop` and keeps what it rendered, and no other frame starts.
+
 ### Reading `.ftsl` back
 
 `loom.grammar.reader` goes the other way — text to elements — for editing an existing
