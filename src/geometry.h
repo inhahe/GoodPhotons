@@ -109,6 +109,10 @@ struct Tri {
     // pre-fitted coefficients would be: it is the colour that varies linearly across a
     // face, not the sigmoid coefficients that reproduce it.
     int vcol = -1;
+    // Motion keys, as an index into Scene::motionSets, or -1 for a triangle that does not move.
+    // The vertices and normals above are the triangle at the frame's own instant; the keys
+    // carry it across the scene's motion interval (Scene::triAt).
+    int motion = -1;
     // triReach of the vertices, baked here for the hit to copy (Hit::pscale).
     double reach = 0.0;
     void finalize() {
@@ -169,7 +173,38 @@ struct Tri {
 struct Sphere {
     Vec3 c; double r = 1.0;
     int matId = 0;
+    int motion = -1;   // Scene::motionSets index, or -1; c and r are the frame's instant (Scene::sphereAt)
 };
+
+// Where the current path is in time, as a fraction of the scene's motion interval (0 at its
+// start, 1 at its end), or negative for "the frame's instant", which is what every primitive's
+// own fields hold. Set per path by MotionTimeScope; read by Scene's queries (closestHit,
+// occluded, shadowTransmittance) whenever a primitive carries motion keys. Thread-local because
+// a CPU thread traces one path at a time and every query of that path must see its time, while
+// the ~200 query sites stay as they are.
+inline thread_local double g_motionU = -1.0;
+
+// Sets g_motionU for the lifetime of the scope (one path), restoring the previous value after.
+struct MotionTimeScope {
+    double prev;
+    explicit MotionTimeScope(double u) : prev(g_motionU) { g_motionU = u; }
+    ~MotionTimeScope() { g_motionU = prev; }
+    MotionTimeScope(const MotionTimeScope&) = delete;
+    MotionTimeScope& operator=(const MotionTimeScope&) = delete;
+};
+
+// A moving group's keys: `keys` (at least 2) transforms, spread evenly over the scene's motion
+// interval, starting at `first` in Scene::motionXf.
+struct MotionKeys { int keys = 0; int first = 0; };
+
+// The pair of keys bracketing the fraction u of the motion interval, and how far between them u
+// lies: keys i and i + 1, fraction f in [0, 1]. u is clamped to [0, 1].
+inline void motionBracket(int keys, double u, int& i, double& f) {
+    const double s = (u < 0.0 ? 0.0 : (u > 1.0 ? 1.0 : u)) * (keys - 1);
+    i = (int)s;
+    if (i > keys - 2) i = keys - 2;
+    f = s - i;
+}
 
 struct Hit {
     double t = DBL_MAX;
@@ -436,13 +471,28 @@ inline TriShear makeTriShear(const Vec3& d) {
     return s;
 }
 
-// Watertight test using a precomputed per-ray shear. Callers in a BVH leaf loop should
-// build the shear once (makeTriShear(lr.d)) and pass it here for every triangle.
-inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
-                         double tmin, Hit& hit, const float* vertColorTable = nullptr) {
+// Inlining control for the hot intersection path: FT_FORCEINLINE for what a BVH leaf must not
+// call, FT_NOINLINE for a rare branch kept out of it so the common one stays small.
+#if defined(_MSC_VER)
+#define FT_FORCEINLINE __forceinline
+#define FT_NOINLINE __declspec(noinline)
+#else
+#define FT_FORCEINLINE inline __attribute__((always_inline))
+#define FT_NOINLINE __attribute__((noinline))
+#endif
+
+// Where a ray crosses a triangle: the distance along it, and the barycentric weights of the
+// triangle's v0, v1, v2 there.
+struct TriCrossing { double t, b0, b1, b2; };
+
+// The watertight test's geometric half: whether the ray meets the triangle (v0, v1, v2) at a
+// distance in [tmin, tmax), and if so where. intersectTri builds its hit on this; a moving
+// triangle is tested by it before being rebuilt at the path's time (Scene::intersectTriNow).
+FT_FORCEINLINE bool triCross(const TriShear& sh, const Ray& r, const Vec3& v0, const Vec3& v1,
+                     const Vec3& v2, double tmin, double tmax, TriCrossing& x) {
     const int kx = sh.kx, ky = sh.ky, kz = sh.kz;
     // Triangle vertices relative to the ray origin.
-    Vec3 A = tri.v0 - r.o, B = tri.v1 - r.o, C = tri.v2 - r.o;
+    Vec3 A = v0 - r.o, B = v1 - r.o, C = v2 - r.o;
     // Shear + scale so the ray direction becomes the +z axis; keep the xy of each vertex.
     double Ax = A[kx] - sh.Sx * A[kz], Ay = A[ky] - sh.Sy * A[kz];
     double Bx = B[kx] - sh.Sx * B[kz], By = B[ky] - sh.Sy * B[kz];
@@ -482,8 +532,19 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     double T = U * (sh.Sz * A[kz]) + V * (sh.Sz * B[kz]) + W * (sh.Sz * C[kz]);
     double invDet = 1.0 / det;
     double t = T * invDet;
-    if (t < tmin || t >= hit.t) return false;
-    double b0 = U * invDet, b1 = V * invDet, b2 = W * invDet;   // barycentric of v0,v1,v2
+    if (t < tmin || t >= tmax) return false;
+    x.t = t;
+    x.b0 = U * invDet; x.b1 = V * invDet; x.b2 = W * invDet;   // barycentric of v0,v1,v2
+    return true;
+}
+
+// Watertight test using a precomputed per-ray shear. Callers in a BVH leaf loop should
+// build the shear once (makeTriShear(lr.d)) and pass it here for every triangle.
+inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
+                         double tmin, Hit& hit, const float* vertColorTable = nullptr) {
+    TriCrossing x;
+    if (!triCross(sh, r, tri.v0, tri.v1, tri.v2, tmin, hit.t, x)) return false;
+    const double t = x.t, b0 = x.b0, b1 = x.b1, b2 = x.b2;
     // The hit point from the triangle's own vertices, v0 + b1 (v1 - v0) + b2 (v2 - v0), not
     // from the ray (o + d t): on a surface lying at x, y or z = c every hit then has exactly
     // c there -- the edge differences are exactly 0 -- so a pattern that steps at c (a

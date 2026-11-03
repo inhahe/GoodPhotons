@@ -92,6 +92,12 @@ struct Camera {
     // 0 (the default) keeps every non-stereo render byte-for-byte identical.
     double frustumShiftX = 0.0;
 
+    // The shutter, in frames relative to the frame's instant (ROADMAP 11): each path the camera
+    // starts is given a time drawn uniformly from [shutterOpen, shutterClose], so whatever moves
+    // in that span blurs. Equal (the default) is an instantaneous shutter -- the frame's instant.
+    double shutterOpen = 0.0, shutterClose = 0.0;
+    bool hasShutter() const { return shutterClose > shutterOpen; }
+
     // Optional physical multi-element lens (the "mesh-lens" camera). When set, the
     // backward reference tracer (mode R) generates rays by tracing them from the film
     // out through the real glass interfaces (genLensRay), superseding the analytic

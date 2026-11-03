@@ -26,6 +26,7 @@ Three neighbouring documents cover what this one only summarises:
   - [Radiance cache (`-radcache`) — mode `R`, CPU](#radiance-cache--radcache--mode-r-cpu)
   - [Backends & performance (`-device`, `-wavefront`)](#backends--performance--device--wavefront)
 - [Cameras](#cameras)
+  - [Motion blur (`shutter_open` / `shutter_close`, group `motion`)](#motion-blur-shutter_open--shutter_close-group-motion)
 - [Materials](#materials)
   - [Hair and fur fibers (`hair`)](#hair-and-fur-fibers-hair)
     - [The medulla — what makes fur not hair](#the-medulla--what-makes-fur-not-hair)
@@ -2053,6 +2054,41 @@ without cropping, while a mismatched aspect crops. It does not model inter-eleme
 flare/ghosting or shaped-iris bokeh. On the GPU it inherits its mode's scope (no
 env/collimated lights or fluorescence; any number of lens surfaces); outside that scope it falls
 back to the CPU automatically.
+
+### Motion blur (`shutter_open` / `shutter_close`, group `motion`)
+
+A group can move over a frame — `motion { key { … } key { … } … }` in place of its transform,
+the keys spread evenly over the scene's `motion_interval a b` (in frames, around the frame's
+instant 0) — and a camera can hold its shutter open over part of that span:
+
+```
+scene { units meters  motion_interval -0.5 0.5 }
+group { motion { key { translate -0.8 0.3 0 }  key { translate 0.8 0.3 0  rotate 0 90 0 } }
+        mesh "car" { … } }
+camera "c" { eye 0 1 4  look_at 0 0.4 0  shutter_open -0.25  shutter_close 0.25 }   # 180° at 24 fps
+```
+
+Each camera path then sees the scene at one time drawn evenly over `[shutter_open,
+shutter_close]` — every bounce, shadow ray and probe of that path at the same time — so whatever
+moves in that span smears along its motion, exactly as the average of the frames at every time
+in the shutter would. A pixel's samples spread their times evenly over the shutter (a radical
+inverse, rotated per pixel), so a blur grains less than random times would; mode `W` gives every
+pixel the same times, and stays noise-free. Keys interpolate translate, rotate, scale and shear
+as written, so a quarter turn arcs; nested groups compose. The full syntax and its limits are in
+[FTSL.md §13.1](FTSL.md#131-motion--a-moving-group-motion-blur).
+
+- **Without a shutter nothing changes:** the scene renders the groups at the frame's instant, byte
+  for byte the static scene with those transforms written out, on every mode and device.
+- **Mode `R` (and `W`) blur, on the CPU.** `-device gpu` keeps a blurred mode `R` on the CPU and
+  says so; every other mode renders the frame's instant and prints `[motion] … renders the
+  frame's instant`. `-radcache` is switched off under a blur (a cell would mix every time in the
+  shutter).
+- **What can move so far:** spheres (as a mesh where the keys stretch one), quads, triangles and
+  meshes. A moving group refuses an isosurface, a curve, a `mesh_instance` and an emissive mesh; a
+  light in one stays at the instant, with a warning.
+- **Cost:** a moving triangle is boxed over its whole motion in the BVH, so a fast mover — a
+  spinning wheel above all — makes every ray near its sweep test it; each test moves it to the
+  path's time first.
 
 ---
 

@@ -185,6 +185,7 @@ scene { units meters  spectral 360 830 1 }
 | `spectral` | `<lo> <hi> <binWidth>` | `360 830 1` | only the **bin width** is applied; the engine range is fixed at 360–830 nm (a warning prints if `lo/hi` differ) |
 | `default_mode` | a mode letter (`A`/`B`/`C`/`D`/`U`/`M`/`R`/`W`/`P`/…) | *(none)* | the render mode used when nothing else picks one. Resolution order: `-mode` (CLI) → a camera's own `mode` → `default_mode` → built-in `B`. `W` is not a transport mode of its own — the loader rewrites it to `R` and switches on the deterministic Whitted estimators for the whole run (a CLI `-mode` still overrides it) |
 | `fps` | `<n>` | *(none)* | default playback rate for flyby animations, read by assembly tooling (e.g. `showcase_flyby.py` when `--fps` is omitted). Overridable per-flyby with `fps <n>` on the `camera_curve`/`camera_path`/`camera_orbit` block. Playback hint only — does not affect rendering |
+| `motion_interval` | `<a> <b>` (frames) | *(none)* | the span, in frames relative to the frame's own instant (0), over which every group's `motion` keys are spread evenly (§13.1). Must contain 0, with `b > a`: `-0.5 0.5` centres the keys on the frame, `0 1` starts them there. Required by any `motion` block |
 | `cavity_radius` | `<len>` | 2% of the scene's AABB diagonal | reach of the `cavity` pattern probe (§6.1). Enclosure has no intrinsic scale, so this *is* the look; the derived default is a starting point and prints a line saying so. Ignored unless some material reads `cavity` |
 | `cavity_samples` | `<n>` | `16` | probe rays per shading point for `cavity`. The direction set is deterministic, so this also caps the number of distinct values the variable can take |
 
@@ -3062,9 +3063,48 @@ group {
 
 A group's transform composes with its parent's (parent applied last) and is baked
 into every child at load time (no runtime scene graph). Allowed children: `sphere`,
-`quad`, `triangle`, `mesh`, `light`, nested `group`. A light anywhere in the tree
+`quad`, `triangle`, `mesh`, `mesh_instance`, `isosurface`, `curve`, `light`, nested `group`. A light anywhere in the tree
 satisfies the "scene needs a light" check. A group's `mode D` / `mode J` applies to every child
 that has no `mode` of its own (§16.1).
+
+### 13.1 `motion` — a moving group (motion blur)
+
+```
+scene { units meters  motion_interval -0.5 0.5 }     # keys spread over half a frame either side
+group {
+    motion {
+        key { translate -0.8 0.3 0 }                   # at -0.5 frames
+        key { translate  0   0.3 0  rotate 0 45 0 }    # at  0
+        key { translate  0.8 0.3 0  rotate 0 90 0 }    # at +0.5
+    }
+    mesh "car" { … }
+}
+camera "c" { …  shutter_open -0.25  shutter_close 0.25 }   # §14.1: what the frame blurs over
+```
+
+A `motion` block in place of the group's `translate`/`rotate`/`scale`/`shear` gives its transform
+at two or more `key`s, spread evenly over the scene's `motion_interval` (§2); each `key` takes the
+same four statements a group does. Between keys the transform is interpolated **as written** —
+translate, rotate (degrees), scale and shear each linearly — so a key turning 90° turns through
+the arc rather than cutting across it, and `rotate 0 0 0` → `rotate 0 720 0` is two whole turns.
+Before the first key and after the last, the group holds still.
+
+- **The scene a render sees is the group at the frame's instant (time 0).** A camera without a
+  shutter renders exactly that — byte for byte the scene with each group's transform at 0 written
+  out — on every mode and device. Blur comes only from a camera's shutter (§14.1).
+- **Nested groups compose:** a group inside a moving group moves with it, and may have keys of its
+  own.
+- **What may move (so far):** `sphere`, `quad`, `triangle` and `mesh` children. A sphere the keys
+  scale unevenly is built as a smooth mesh, as an uneven static `scale` builds it. A moving group
+  refuses an `isosurface`, a `curve`, a `mesh_instance` and an emissive mesh (a registered light:
+  its light is sampled where it sits at the instant), each by name; a `light` in it stays where
+  it is at the instant, with a warning. What finds an object by name — `fur { on }` and `bald`, a
+  medium's `bounds { object }` — refuses one in a moving group, which it could not follow. A procedural `pattern` reads world position, so it stays in place while the surface
+  carrying it moves through it — as it does from one frame of an animation to the next; UV
+  textures, vertex colours and per-vertex data move with the surface.
+- **Which modes blur:** mode R (and W) on the CPU. On `-device gpu` a blurred mode R stays on the
+  CPU and says so; every other mode renders the frame's instant and prints one note (ROADMAP 11
+  lists the rest).
 
 ---
 
@@ -3099,6 +3139,7 @@ camera "cam" {
 | `lens <mm>` | — | focal length; sets fov_y = 2·atan(filmH/2f); overrides `fov_y` |
 | `fstop <N>` | — | aperture radius = focal/2N; seats film at image distance for A/C DoF |
 | `zoom <x>` | 1 | multiplies focal length (x>1 tele/narrower) |
+| `shutter_open <t>` / `shutter_close <t>` | 0 / 0 | the shutter, in frames relative to the frame's instant: each camera path sees the scene at one time drawn evenly from `[open, close]`, so whatever moves in that span (§13.1) blurs. Equal (the default) is an instantaneous shutter. `close` before `open` is an error. A 180° shutter at 24 fps is `-0.25 0.25`. Not the film's `shutter`, which only scales exposure |
 
 ### 14.2 `film { … }`
 

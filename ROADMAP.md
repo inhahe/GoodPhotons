@@ -708,3 +708,13 @@ across paths of different times (photon maps, beams, VCM merges, shared multi-ca
 either carrying time or refusing; (C) motion vectors and depth in the guide pass; (D) the
 temporal denoisers and their comparison; (E) the deformers: falloff, RBF, quasi-static elastic,
 dynamic elastic with its cache.
+
+**Stage A, scene core (0.404.0, done):** `scene { motion_interval a b }`, a group's
+`motion { key { … } … }`, a camera's `shutter_open` / `shutter_close`, and blur in mode R and W on
+the CPU (design.md → *Motion keys and the shutter*; `tools/check_motion.py`). Two departures from
+the plan above, both for the better: a group's keys are **one shared transform set** per group
+rather than per-vertex copies (memory per group, not per vertex × key), and the authored keys are
+interpolated as translate/rotate/scale/shear and resampled every 5° of turn, so a rotation arcs.
+Per-vertex motion remains the route for deforming meshes (stage E, and mesh keys). Still open in
+A: the loom shot protocol. Open for B: blur in every other mode and on the GPU, moving instances,
+curves, isosurfaces, emissive meshes and lights, and camera motion keys.

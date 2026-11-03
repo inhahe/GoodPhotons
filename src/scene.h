@@ -1610,6 +1610,95 @@ struct Scene {
     std::vector<Blas> blasList;        // shared instanced mesh assets (local space)
     std::vector<MeshInstance> instances; // placements of blasList into the world
     std::vector<MeshGroup> meshGroups;   // named mesh objects (for -check-watertight)
+
+    // ---- Motion (ROADMAP 11) ----
+    // The interval, in frames relative to the frame's own instant, over which moving primitives'
+    // keys are spread evenly (`scene { motion_interval a b }`); a == b when the scene has none.
+    double motionA = 0.0, motionB = 0.0;
+    // A moving group's keys, one set per group, shared by every primitive in it:
+    // motionSets[Tri::motion or Sphere::motion] names `keys` consecutive transforms in motionXf,
+    // each taking the primitive from where it sits at the frame's instant (its own fields) to
+    // where it is at that key. Between keys the transform is blended entry by entry
+    // (Affine::lerp), so every point moves in a straight line from key to key -- which is what
+    // lets the union of a primitive's key boxes bound it at every time (collectPrimBoxes). The
+    // loader spaces the keys closely enough that a rotation arcs rather than cutting the chord
+    // (addGroup).
+    std::vector<MotionKeys> motionSets;
+    std::vector<Affine>     motionXf;
+    bool hasMotion() const { return !motionSets.empty(); }
+    // A time in frames (relative to the frame's instant) as the fraction of the motion interval
+    // g_motionU holds, clamped to it.
+    double motionU(double frames) const {
+        if (!(motionB > motionA)) return 0.0;
+        const double u = (frames - motionA) / (motionB - motionA);
+        return u < 0.0 ? 0.0 : (u > 1.0 ? 1.0 : u);
+    }
+    // Motion set `set`'s transform at the fraction u of the motion interval.
+    Affine motionAt(int set, double u) const {
+        const MotionKeys& mk = motionSets[(size_t)set];
+        int i; double f;
+        motionBracket(mk.keys, u, i, f);
+        const Affine& a = motionXf[(size_t)(mk.first + i)];
+        return a.lerp(motionXf[(size_t)(mk.first + i) + 1], f);
+    }
+    // Triangle `t` carried by the transform D: vertices and normals moved, everything else (UVs,
+    // material, colour) its own, and the derived fields (gn, tangent, curvature, reach)
+    // recomputed from the moved vertices.
+    static Tri movedTri(const Tri& t, const Affine& D) {
+        Tri o = t;
+        o.v0 = D.apply(t.v0);
+        o.v1 = D.apply(t.v1);
+        o.v2 = D.apply(t.v2);
+        // Normals map by the inverse transpose. A normal of zero ("none supplied" -- only before
+        // Scene::build has fallen it back to the face normal) stays zero for finalize to fill.
+        const Affine inv = D.inverse();
+        const auto nrm = [&inv](const Vec3& n) {
+            if (dot(n, n) < 1e-24) return Vec3{};
+            const Vec3 m = inv.applyDirTranspose(n);
+            return m * (1.0 / std::sqrt(dot(m, m)));
+        };
+        o.n0 = nrm(t.n0);
+        o.n1 = nrm(t.n1);
+        o.n2 = nrm(t.n2);
+        o.finalize();
+        return o;
+    }
+    Tri triAt(const Tri& t, double u) const { return movedTri(t, motionAt(t.motion, u)); }
+    Sphere sphereAt(const Sphere& s, double u) const {
+        const Affine D = motionAt(s.motion, u);
+        bool nonUniform = false;   // the loader keeps a moving sphere's keys uniform in scale
+        Sphere o = s;
+        o.c = D.apply(s.c);
+        o.r = s.r * D.uniformScale(nonUniform);
+        return o;
+    }
+    // intersectTri / intersectSphere against a primitive as the current path sees it: itself,
+    // unless it moves and the path has a time (g_motionU >= 0), then it at that time. A static
+    // primitive pays one integer compare. The moving case lives out of line (FT_NOINLINE), so
+    // these stay small enough to inline into every BVH leaf as the plain tests did.
+    bool intersectTriNow(const TriShear& sh, const Ray& r, const Tri& t, double tmin, Hit& h) const {
+        if (t.motion < 0 || g_motionU < 0.0) return intersectTri(sh, r, t, tmin, h, vcolData());
+        return intersectMovingTri(sh, r, t, tmin, h);
+    }
+    bool intersectSphereNow(const Ray& r, const Sphere& s, double tmin, Hit& h) const {
+        if (s.motion < 0 || g_motionU < 0.0) return intersectSphere(r, s, tmin, h);
+        return intersectMovingSphere(r, s, tmin, h);
+    }
+    // A moving triangle at the path's time: tested by its moved vertices alone first, and
+    // rebuilt in full only when the ray meets it nearer than the hit so far.
+    FT_NOINLINE bool intersectMovingTri(const TriShear& sh, const Ray& r, const Tri& t, double tmin,
+                                        Hit& h) const {
+        const Affine D = motionAt(t.motion, g_motionU);
+        TriCrossing x;
+        if (!triCross(sh, r, D.apply(t.v0), D.apply(t.v1), D.apply(t.v2), tmin, h.t, x)) return false;
+        const Tri tt = movedTri(t, D);
+        return intersectTri(sh, r, tt, tmin, h, vcolData());
+    }
+    FT_NOINLINE bool intersectMovingSphere(const Ray& r, const Sphere& s, double tmin, Hit& h) const {
+        const Sphere ss = sphereAt(s, g_motionU);
+        return intersectSphere(r, ss, tmin, h);
+    }
+
     // Per-vertex COLOURS, three linear-RGB floats per entry, indexed by Tri::vcol (which
     // names the first of the triangle's three consecutive entries). Empty for the
     // overwhelming majority of scenes; see Tri::vcol for why this is a side table.
@@ -3305,13 +3394,34 @@ struct Scene {
         if (remap) { remap->clear(); remap->reserve(boxes.capacity()); }
         int g = 0;                     // running GLOBAL prim index
         const auto keep = [&](const Aabb& b) { boxes.push_back(b); if (remap) remap->push_back(g); };
+        // A moving primitive's box covers it at every key; between two keys it moves linearly, so
+        // its every position is a blend of two keyed ones and lies in the union of their boxes.
         for (const auto& t : tris) {
             Aabb b; b.expand(t.v0); b.expand(t.v1); b.expand(t.v2);
+            if (t.motion >= 0) {
+                const MotionKeys& mk = motionSets[(size_t)t.motion];
+                for (int k = 0; k < mk.keys; ++k) {
+                    const Affine& D = motionXf[(size_t)(mk.first + k)];
+                    b.expand(D.apply(t.v0)); b.expand(D.apply(t.v1)); b.expand(D.apply(t.v2));
+                }
+            }
             b.lo = b.lo - Vec3{pad, pad, pad}; b.hi = b.hi + Vec3{pad, pad, pad};
             keep(b); ++g;
         }
         for (const auto& s : spheres) {
             Aabb b; b.expand(s.c - Vec3{s.r, s.r, s.r}); b.expand(s.c + Vec3{s.r, s.r, s.r});
+            if (s.motion >= 0) {
+                // Between keys the radius is at most the blend of the keys' (a blended matrix's
+                // column is no longer than the blend of the columns' lengths), so these suffice.
+                const MotionKeys& mk = motionSets[(size_t)s.motion];
+                for (int k = 0; k < mk.keys; ++k) {
+                    const Affine& D = motionXf[(size_t)(mk.first + k)];
+                    bool nonUniform = false;
+                    const Vec3 c = D.apply(s.c);
+                    const double r = s.r * D.uniformScale(nonUniform);
+                    b.expand(c - Vec3{r, r, r}); b.expand(c + Vec3{r, r, r});
+                }
+            }
             keep(b); ++g;
         }
         for (const auto& im : implicits) { keep(im.bounds); ++g; }
@@ -3544,10 +3654,10 @@ struct Scene {
         const auto leaf = [&](int prim, double& tm) {
             if (prim < (int)nT)            { const Tri& t = tris[prim];
                                              if (hidden(t.matId)) return;
-                                             if (intersectTri(sh, r, t, tmin, h, vcolData())) tm = h.t; }
+                                             if (intersectTriNow(sh, r, t, tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS)){ const Sphere& s = spheres[prim - nT];
                                              if (hidden(s.matId)) return;
-                                             if (intersectSphere(r, s, tmin, h)) tm = h.t; }
+                                             if (intersectSphereNow(r, s, tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS + nI)) { const Implicit& im = implicits[prim - nT - nS];
                                              if (hidden(im.matId)) return;
                                              if (intersectImplicit(r, im, tmin, h, &tabs)) tm = h.t; }
@@ -3617,9 +3727,9 @@ struct Scene {
         return bvh.traverseAny(r, tmin, seg, [&](int prim) {
             Hit h; h.t = seg;
             if (prim < (int)nT)             { const Tri& t = tris[prim];
-                                              return !hidden(t.matId) && intersectTri(sh, r, t, tmin, h, vcolData()); }
+                                              return !hidden(t.matId) && intersectTriNow(sh, r, t, tmin, h); }
             if (prim < (int)(nT + nS))      { const Sphere& s = spheres[prim - nT];
-                                              return !hidden(s.matId) && intersectSphere(r, s, tmin, h); }
+                                              return !hidden(s.matId) && intersectSphereNow(r, s, tmin, h); }
             if (prim < (int)(nT + nS + nI)) { const Implicit& im = implicits[prim - nT - nS];
                                               return !hidden(im.matId) &&
                                                      intersectImplicit(r, im, tmin, h, &tabs, /*anyHit=*/true); }
@@ -3664,8 +3774,8 @@ struct Scene {
         double T = 1.0;
         const bool hardBlock = bvh.traverseAny(r, tmin, seg, [&](int prim) -> bool {
             Hit h; h.t = seg;
-            if (prim < (int)nT)             return !hidden(tris[prim].matId) && intersectTri(sh, r, tris[prim], tmin, h, vcolData());
-            if (prim < (int)(nT + nS))      return !hidden(spheres[prim - nT].matId) && intersectSphere(r, spheres[prim - nT], tmin, h);
+            if (prim < (int)nT)             return !hidden(tris[prim].matId) && intersectTriNow(sh, r, tris[prim], tmin, h);
+            if (prim < (int)(nT + nS))      return !hidden(spheres[prim - nT].matId) && intersectSphereNow(r, spheres[prim - nT], tmin, h);
             if (prim < (int)(nT + nS + nI)) return !hidden(implicits[prim - nT - nS].matId) && intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, true);
             if (prim < (int)(nT + nS + nI + nC)) {
                 const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
@@ -3748,8 +3858,8 @@ struct Scene {
         const PatTables tabs = patTables();
         const auto leaf = [&](int prim) {
             Hit h; h.t = seg;
-            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h, vcolData());
-            if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
+            if (prim < (int)nT)             return intersectTriNow(sh, r, tris[prim], tmin, h);
+            if (prim < (int)(nT + nS))      return intersectSphereNow(r, spheres[prim - nT], tmin, h);
             if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
             if (prim < (int)(nT + nS + nI + nC)) {
                 // A curve, but not necessarily a FIBER: grass and wire are curves too, and a
@@ -3816,8 +3926,8 @@ struct Scene {
         int crossed = 0;
         const bool blocked = bvh.traverseAny(r, tmin, seg, [&](int prim) {
             Hit h; h.t = seg;
-            if (prim < (int)nT)             return intersectTri(sh, r, tris[prim], tmin, h, vcolData());
-            if (prim < (int)(nT + nS))      return intersectSphere(r, spheres[prim - nT], tmin, h);
+            if (prim < (int)nT)             return intersectTriNow(sh, r, tris[prim], tmin, h);
+            if (prim < (int)(nT + nS))      return intersectSphereNow(r, spheres[prim - nT], tmin, h);
             if (prim < (int)(nT + nS + nI))
                 return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
             if (prim < (int)(nT + nS + nI + nC)) {
@@ -3939,8 +4049,8 @@ struct Scene {
     Hit closestHitLinear(const Ray& r, double tmin = 1e-6) const {
         Hit h;
         const TriShear sh = makeTriShear(r.d);
-        for (const auto& t : tris)     intersectTri(sh, r, t, tmin, h, vcolData());
-        for (const auto& s : spheres)  intersectSphere(r, s, tmin, h);
+        for (const auto& t : tris)     intersectTriNow(sh, r, t, tmin, h);
+        for (const auto& s : spheres)  intersectSphereNow(r, s, tmin, h);
         const PatTables tabs = patTables();
         for (const auto& im : implicits) intersectImplicit(r, im, tmin, h, &tabs);
         // Curve segments are part of the reference too. Omitting them did not make

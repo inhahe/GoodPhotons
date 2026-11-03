@@ -9946,6 +9946,45 @@ bundle roughness gets the same "needs an opaque film" error as one written in a 
 at every wavelength, each layer's n above 0 and k not below 0 (a negative k is gain in the Abeles
 convention).
 
+## Motion keys and the shutter (ROADMAP 11 stage A, 0.404.0)
+
+The scene stays a flat list of world-space primitives, each holding itself at the frame's
+**instant** (time 0). A moving group adds one **motion set** (`Scene::motionSets` / `motionXf`):
+K transforms, evenly spread over the scene's `motion_interval`, each taking a child from its
+instant pose to its pose at that key. Every child of the group shares the set; `Tri::motion` /
+`Sphere::motion` index it (-1: static). So nothing that does not ask about time changes — every
+consumer that reads `Scene::tris` (light sampling, mirror planes, the GPU upload, the raster)
+sees the instant, exactly as a static scene with those transforms would show it.
+
+- **Keys are resampled at load** (`ftsl.h addGroup`). The authored keys are translate / rotate /
+  scale / shear parameters, interpolated as written so a turn arcs; the set holds them sampled
+  until no step turns more than 5° (at most 256 steps), and a moving parent's set is composed in
+  at the finer of the two spacings. Between set entries the transform is blended entry by entry
+  (`Affine::lerp`), so every point moves in a straight line from key to key: that is what makes
+  the union of a primitive's key boxes bound it at every time (`collectPrimBoxes`), and the 5°
+  step what keeps the blend within 0.1% of the arc.
+- **A path's time is thread-local** (`geometry.h g_motionU`, a fraction of the interval, negative
+  for "the instant"), set for the whole path by `MotionTimeScope`. The scene's query leaves
+  (`closestHit`, `occluded`, `shadowTransmittance`, their variants, the linear reference) test a
+  moving primitive through `intersectTriNow` / `intersectSphereNow`: a static one pays one integer
+  compare; a moving triangle is tested by its moved vertices (`triCross`, the watertight test's
+  geometric half, shared with `intersectTri`) and rebuilt in full (`movedTri`: normals by the
+  inverse transpose, then `finalize`) only when the ray meets it nearer than the hit so far.
+  Instances (BLAS) cannot move yet, so the BLAS leaves are untouched.
+- **The shutter is the camera's** (`Camera::shutterOpen/Close`, frames). Mode R's `renderRows`
+  draws each path's time off `shutterU`: a radical inverse in base 79 (the first prime no other
+  lattice takes) over the pixel's sample index, rotated per pixel by a salted stream — stratified
+  within a pixel, decorrelated across pixels — or by 0.5 for every pixel in mode W, which stays
+  deterministic. The main rng draws exactly what it draws without blur.
+- **Where blur is not yet carried, the shutter is closed**, so no estimator mixes times: the
+  camera loop in `main.cpp` closes it for every mode but R (mode P's backward half would
+  otherwise blur alone), `backwardOnGpuOk` keeps a blurred mode R off the GPU, and `-radcache` is
+  off under a blur. Loader refusals keep the rest honest: registered emitters (an emissive mesh:
+  light sampling reads the instant), isosurfaces, curves and instances in a moving group; lights
+  there stay at the instant with a warning. A sphere the keys scale unevenly is tessellated
+  (`sphereAsMesh_`), as an uneven static scale already tessellates it, so `sphereAt` may take the
+  radius from the blended transform's mean column length.
+
 ## A dispersive film index, and titania (0.402.0)
 
 `Material::filmIor` is a `Spectrum` (it was a `double`), and `DMaterial::filmIor` a `DSpec`, so a

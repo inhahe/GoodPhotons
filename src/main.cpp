@@ -506,6 +506,9 @@ static int checkBvh(const Scene& scene, long long rays) {
         double rr = std::sqrt(std::max(0.0, 1 - z * z));
         Vec3 d = normalize(Vec3{rr * std::cos(phi), rr * std::sin(phi), z});
         Ray r{o, d};
+        // A moving scene is checked across its motion interval -- every other ray at a random
+        // time, the rest at the instant -- so the swept boxes are held to the moved primitives.
+        const MotionTimeScope at(scene.hasMotion() && (i & 1) ? rng.uniform() : -1.0);
         Hit a = scene.closestHit(r);
         Hit b = scene.closestHitLinear(r);
         bool ok = (a.valid == b.valid) &&
@@ -14947,6 +14950,7 @@ static void buildFurFields(const Scene& scene) {
 // longer fall back — these two option gates are now the ONLY reasons a fur scene leaves
 // the GPU backward path.)
 static bool backwardOnGpuOk(const Scene& scene, const Camera& cam) {
+    if (scene.hasMotion() && cam.hasShutter()) return false;   // motion blur: CPU only so far
     if (g_furVolume && g_furVolData.valid()) return false;
     if (g_dualScatter)
         for (const auto& m : scene.mats)
@@ -15668,7 +15672,14 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
     // does not depend on how the OS scheduled the threads. `into != nullptr` is the
     // interactive viewer's band-at-a-time preview; it shares the same table, which is exactly
     // what makes the preview get cheaper as you look around.
-    const bool rcOn = g_radCache && !(g_whitted || forceWhitted) && !g_directOnly;
+    // Not under motion blur: a cell's value would mix every time in the shutter, and a path at one
+    // time would read radiance from the others.
+    const bool blurred = scene.hasMotion() && cam.hasShutter();
+    if (g_radCache && blurred) {
+        static bool said = false;
+        if (!said) { said = true; std::printf("[radcache] off: motion blur renders without the radiance cache\n"); }
+    }
+    const bool rcOn = g_radCache && !(g_whitted || forceWhitted) && !g_directOnly && !blurred;
     std::vector<RadCacheBank> rcBanks(rcOn ? nThreads : 0);
     if (rcOn) {
         if (!g_radianceCache.ready()) g_radianceCache.init(g_radCacheCells);
@@ -17027,6 +17038,15 @@ static uint64_t checkpointGuard(const Scene& scene, char mode, int res, int resY
     mix((uint64_t)(unsigned char)mode);
     mix((uint64_t)(unsigned)res);
     mix((uint64_t)(unsigned)resY);
+    // Only a moving scene mixes these, so every static scene keeps the guard its sidecars hold.
+    if (scene.hasMotion()) {
+        mix((uint64_t)scene.motionXf.size());
+        for (const Affine& D : scene.motionXf) {
+            uint64_t v; std::memcpy(&v, &D.t.x, sizeof v); mix(v);
+            std::memcpy(&v, &D.t.y, sizeof v); mix(v);
+            std::memcpy(&v, &D.t.z, sizeof v); mix(v);
+        }
+    }
     return h;
 }
 
@@ -18798,8 +18818,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             const bool bwOk = g_whitted
                             ? cudaBackwardWhittedSupported(scene, cam, whittedOpts)
                             : backwardOnGpuOk(scene, cam);
-            if (!bwOk) {
-                const char* why = g_whitted
+            const bool blurOnCpu = scene.hasMotion() && cam.hasShutter();
+            if (!bwOk || blurOnCpu) {
+                const char* why = blurOnCpu
+                    ? "motion blur (a camera shutter on a moving scene) renders on the CPU so far"
+                    : g_whitted
                     ? "mode W scene is outside the deterministic GPU scope (-gi, or a "
                       "backward-GPU-unsupported feature)"
                     : "scene has a backward-GPU-unsupported feature "
@@ -23779,6 +23802,7 @@ static int run(int argc, char** argv) {
             c.lookAt(cs->eye, cs->look, cs->up, cs->fov, cresX, cresY);
             c.setProjection(cs->projection);   // rectilinear (default) or a fisheye/panoramic lens
             c.apertureR = cs->aperture;
+            c.shutterOpen = cs->shutterOpen; c.shutterClose = cs->shutterClose;
             if (cs->filmDist_m > 0.0) { c.filmDist = cs->filmDist_m; c.lensF = cs->lensF_m; }  // physical-optics (lens/fstop): film at image distance, real focal
             else                      { c.setFocus(cs->focus); }                                // legacy unit-film camera
             char cmode = effModeCam(*cs);
@@ -23836,6 +23860,18 @@ static int run(int argc, char** argv) {
             // above): its routed mode, or the mode it falls back to -- before anything below
             // reads the mode (the aperture term is mode B's).
             cmode = resolved[si];
+            // Motion blur reaches mode R (and W) only so far (ROADMAP 11): any other mode renders
+            // the frame's instant, its shutter closed here so no half of it (mode P's backward
+            // part, say) blurs while the rest does not.
+            if (scene.hasMotion() && c.hasShutter() && cmode != 'R') {
+                static uint64_t saidFor = 0;   // once per scene, not per frame of a path
+                if (saidFor != scene.generation) {
+                    saidFor = scene.generation;
+                    std::printf("[motion] camera '%s': mode %c renders the frame's instant -- only "
+                                "mode R (and W) blurs motion so far\n", cs->name.c_str(), cmode);
+                }
+                c.shutterClose = c.shutterOpen;
+            }
             // Exposure-lock group: a global -exposure-lock forces one shared anchor
             // (group 0) across every camera; otherwise a per-path `exposure_lock`
             // locks only that path's frames (group = its pathGroup); -1 = per-frame.
@@ -24220,6 +24256,7 @@ static int run(int argc, char** argv) {
             m.mode = (ci < renderedOf.size() && renderedOf[ci])
                          ? renderedOf[ci]
                          : renderedMode(scene, effModeCam(cs), cs.projection, cs.lens != nullptr);
+            if (m.mode == 'R') { m.cam.shutterOpen = cs.shutterOpen; m.cam.shutterClose = cs.shutterClose; }
             if (cs.lens) { m.cam.lens = cs.lens; m.cam.prepareLensPupil(); }
             m.name = cs.name;
             return m;

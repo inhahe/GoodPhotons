@@ -72,6 +72,29 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-11-03, 0.404.0): MOTION-SWEEP — a moving primitive is boxed over its whole motion, so a fast mover slows every ray near its sweep
+
+`Scene::collectPrimBoxes` gives each moving triangle and sphere the union of its boxes at every
+key — correct at every time, and tight for a slow mover. A fast one is not: a wheel turning a
+quarter turn per frame boxes each of its triangles over a quarter of the rim, so every ray that
+passes the wheel tests most of its triangles, each moved to the ray's time first
+(`Scene::intersectTriNow`). Reproduce: a 100k-triangle wheel in a group with
+`motion { key { rotate 0 0 0 } key { rotate 0 0 90 } }`, mode R under a shutter, against the same
+scene without one. Proper fix: split the BVH in time where the swept boxes overlap badly (Embree's
+MSMBlur, Grünschloß et al. 2011), so a ray at time t descends only into the nodes of its time
+segment. Not done in stage A: it only costs speed, and the blur's other stages come first.
+
+## OPEN (2026-11-03, 0.404.0): MOTION-PATTERN-SPACE — a procedural pattern stays put while the surface carrying it moves
+
+Patterns read the hit's world position (`Hit::p`), as they do in a static scene, so a moving
+group's marble or noise slides through it: under a shutter, the pattern on a moving object does
+not smear with it. It matches the per-frame semantics (an animation's frames, each a static scene
+with the group moved, show the same thing), and UV textures, vertex colours and per-vertex data do
+move with the surface. Proper fix: an object-space pattern coordinate — the hit carried back to
+the instant by the inverse of its motion transform (`Scene::motionAt`), with the same choice
+offered to static groups (`space object`), so a pattern can stick to its object in an animation
+too.
+
 ## OPEN (2026-11-02, 0.400.8): VCM-SPEC — mode U's merges read the camera path's colours at the camera's wavelength, so a coloured surface seen before a merge washes out
 
 Mode J had this bug and lost it in 0.386.1 (JSPEC, design.md); mode U never got the fix. A merge

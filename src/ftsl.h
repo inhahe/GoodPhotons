@@ -54,6 +54,7 @@
 #include <vector>
 #include <memory>
 #include <unordered_map>
+#include <set>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -774,6 +775,11 @@ struct CamSpec {
     double iso = 0.0, shutter = 0.0, exposure = 0.0;
     // Resolved exposure compensation (<= 0 => neutral auto-expose). Filled at load.
     double exposureMul = 0.0;
+    // Motion blur (ROADMAP 11): the span of the frame, in frames relative to its own instant,
+    // that the shutter is open over; each path draws its time from it. open == close (the
+    // default, both 0) is no blur: the frame's instant. Unrelated to `film { shutter }`, which
+    // stays an exposure factor.
+    double shutterOpen = 0.0, shutterClose = 0.0;
 
     // Exposure-lock across a `camera_path` (Phase 3a intermediate win): frames of a
     // path that authored `exposure_lock` share ONE auto-exposure anchor, so a dolly/
@@ -1068,6 +1074,19 @@ public:
             if (!dm.empty()) L.defaultMode = normMode(dm, L);
             double dfps = dblOf(b, "fps", 0.0);
             if (dfps > 0.0) L.defaultFps = dfps;
+            // `motion_interval a b`: the span, in frames relative to the frame's own instant,
+            // over which every `motion { key ... }` block spreads its keys evenly (ROADMAP 11).
+            if (const Stmt* mi = find(b, "motion_interval")) {
+                if (mi->val.words.size() != 2) { fail("`motion_interval` takes two times, a b (frames)"); return false; }
+                const double a = num(mi->val.words[0]), bb = num(mi->val.words[1]);
+                if (!(bb > a)) { fail("`motion_interval a b` needs b > a"); return false; }
+                if (!(a <= 0.0 && bb >= 0.0)) {
+                    fail("`motion_interval` must contain the frame's instant, 0: the keyed geometry is "
+                         "also what every render without motion blur shows");
+                    return false;
+                }
+                L.scene.motionA = a; L.scene.motionB = bb;
+            }
             // `cavity` probe settings (O3 stage 2). The radius is an authored LENGTH, so
             // it goes through the unit scale like every other length. Left unset it stays
             // 0 here and is derived from the scene bounds after build (see
@@ -5416,7 +5435,7 @@ private:
         // quadric the analytic primitive can't represent, so tessellate it into a
         // smooth-normal mesh baked through the affine instead of failing.
         bool nonUniform = false; double s = xf.uniformScale(nonUniform);
-        if (nonUniform) {
+        if (nonUniform || sphereAsMesh_) {   // sphereAsMesh_: its motion keys scale it unevenly
             addTessellatedSphere(L, xf, c, r, id);
             // (A tessellated sphere has no analytic center/radius, so it is not
             // registered in sphereByName_ — it can't serve as an analytic fog bound.)
@@ -5833,6 +5852,7 @@ private:
         // the call site, one statement before it is used.
         FurSurface surf;
         size_t triFirst = 0, triCount = 0;
+        if (movingRefused(on, "fur `on`")) return false;
         auto sph = sphereByName_.find(on);
         auto tri = triRangeByName_.find(on);
         if (sph != sphereByName_.end()) {
@@ -5951,6 +5971,7 @@ private:
             const auto& w = s.val.words;
             FurSpec::BaldZone z;
             if (!w.empty() && !isNumber(w[0])) {
+                if (movingRefused(w[0], "fur `bald`")) return false;
                 auto bs = sphereByName_.find(w[0]);
                 if (bs == sphereByName_.end()) {
                     fail("fur '" + sp.name + "' bald \"" + w[0] + "\" names no sphere in the scene "
@@ -6598,16 +6619,32 @@ private:
     }
     // Where the primitive pools stood before an object was added, so its own primitives can be
     // found afterwards whatever kind it turned out to be (a mesh file can hold many materials).
-    struct PrimMark { size_t tris, spheres, implicits, curves, curveSegs, instances; };
+    struct PrimMark { size_t tris, spheres, implicits, curves, curveSegs, instances, emitters; };
     static PrimMark primMark(const Loaded& L) {
         return {L.scene.tris.size(), L.scene.spheres.size(), L.scene.implicits.size(),
-                L.scene.curves.size(), L.scene.curveSegs.size(), L.scene.instances.size()};
+                L.scene.curves.size(), L.scene.curveSegs.size(), L.scene.instances.size(),
+                L.scene.emitters.size()};
     }
     // (material, route) -> the routed copy. A copy is a whole Material, so every renderer reads
     // it exactly as it reads the original; only `route` differs.
     std::map<std::pair<int, int>, int> routeClone_;
     std::vector<char> routeIsClone_;   // by material id: made by routedMat for an object or group
     bool routeWarnedLight_ = false, routeWarnedInst_ = false;
+    // The world transform, at each motion key, of the moving group being built (empty outside
+    // one): a nested group composes its own transform with it (addGroup).
+    std::vector<Affine> motionWorld_;
+    bool movingLightWarned_ = false;
+    bool sphereAsMesh_ = false;   // the moving group being built scales its children unevenly
+    // Named objects built in a moving group. What finds an object by name -- fur `on` and
+    // `bald`, a medium's `bounds { object }` -- reads where it sits at the instant, so it refuses
+    // one of these rather than stay behind while it moves (movingRefused).
+    std::set<std::string> movingNames_;
+    bool movingRefused(const std::string& name, const char* who) {
+        if (!movingNames_.count(name)) return false;
+        fail(std::string(who) + " \"" + name + "\": it is in a moving group, and " + who +
+             " cannot follow a moving object yet (ROADMAP 11)");
+        return true;
+    }
     // The material an object (or group, or a tagged material's mix) tagged `route` should shade
     // with: a copy of `id` routed `route`, or `id` itself where a more specific tag got there
     // first. A copy an object's own tag made is kept when its group's tag comes through (`id` is
@@ -6705,52 +6742,227 @@ private:
     // cost). Nested groups recurse; a light anywhere in the tree sets haveLight.
     // See known-issues.md for the deferred true-instancing (shared-geometry) path.
     bool addGroup(const Block& b, Loaded& L, const Affine& parentXf, bool& haveLight) {
-        Vec3 tr{0, 0, 0}, rot{0, 0, 0}, scl{1, 1, 1};
-        vec3Of(b, "translate", tr);
-        vec3Of(b, "rotate", rot);
-        const Stmt* sc = find(b, "scale");
-        if (sc) {
-            if (sc->val.words.size() >= 3)
-                scl = {num(sc->val.words[0]), num(sc->val.words[1]), num(sc->val.words[2])};
-            else if (!sc->val.words.empty()) {
-                double k = num(sc->val.words[0]); scl = {k, k, k};
+        // A `motion { key { <transform> } key { ... } }` block gives the group's transform at keys
+        // spread evenly over the scene's motion_interval (ROADMAP 11). Each child is built at the
+        // frame's instant, as a static group's would be, and then given the keys (applyMotion).
+        std::vector<XfParams> ownKeys;
+        if (const Stmt* mo = find(b, "motion"); mo && mo->val.block) {
+            for (const char* k : {"translate", "rotate", "scale", "shear"})
+                if (find(b, k)) {
+                    fail(std::string("group: `") + k + "` beside a `motion` block -- the transform "
+                         "goes in each `key`");
+                    return false;
+                }
+            for (const auto& ks : mo->val.block->stmts) {
+                if (ks.key != "key" || !ks.val.block) {
+                    fail("group `motion`: only `key { ... }` blocks belong in it");
+                    return false;
+                }
+                ks.used = true;
+                ownKeys.push_back(xfParamsOf(*ks.val.block));
+            }
+            if (ownKeys.size() < 2) { fail("group `motion`: give at least two `key` blocks"); return false; }
+        } else if (mo) {
+            fail("group: `motion` takes a block of `key { ... }` blocks");
+            return false;
+        }
+        const bool moving = !ownKeys.empty() || !motionWorld_.empty();
+        if (moving && !(L.scene.motionB > L.scene.motionA)) {
+            fail("a `motion` block needs the scene's `motion_interval a b` (scene { ... })");
+            return false;
+        }
+        const double u0 = L.scene.motionU(0.0);   // the frame's instant
+        const Affine ownStatic = ownKeys.empty() ? xfOf(xfParamsOf(b)) : Affine{};
+        const Affine world = parentXf.compose(ownKeys.empty() ? ownStatic : xfOf(xfParamsAt(ownKeys, u0)));
+        // This group's world transform at each of its keys (empty: it does not move). The
+        // parent's keys are blended, which is how the parent moves between them; the group's own
+        // are its authored transforms interpolated, so a rotation turns through its angle. Keys go
+        // at the finer of the two spacings, and the own spacing is refined until no step turns
+        // more than kMotionStepDeg, so blending neighbouring keys stays close to the arc.
+        std::vector<Affine> worldKeys;
+        if (moving) {
+            size_t K = motionWorld_.empty() ? 2 : motionWorld_.size();
+            if (!ownKeys.empty()) {
+                double turn = 0.0;   // the most any one authored step turns, summed over the axes
+                for (size_t k = 0; k + 1 < ownKeys.size(); ++k) {
+                    const Vec3 d = ownKeys[k + 1].rot - ownKeys[k].rot;
+                    turn = std::max(turn, std::fabs(d.x) + std::fabs(d.y) + std::fabs(d.z));
+                }
+                const size_t steps = ownKeys.size() - 1;
+                size_t sub = (size_t)std::ceil(turn / kMotionStepDeg);
+                sub = std::clamp<size_t>(sub, 1, std::max<size_t>(1, kMotionMaxSteps / steps));
+                K = std::max(K, steps * sub + 1);
+            }
+            for (size_t k = 0; k < K; ++k) {
+                const double u = (double)k / (double)(K - 1);
+                const Affine P = motionWorld_.empty() ? parentXf : keyedAffineAt(motionWorld_, u);
+                const Affine Lk = ownKeys.empty() ? ownStatic : xfOf(xfParamsAt(ownKeys, u));
+                worldKeys.push_back(P.compose(Lk));
             }
         }
-        // `shear a b c` (all optional, default 0) is a unit-diagonal upper-triangular
-        // shear applied in the group's LOCAL frame (innermost, before scale/rotate):
-        //   x' = x + a*y + b*z    y' = y + c*z    z' = z
-        // so a shears X along Y, b shears X along Z, c shears Y along Z. It composes
-        // as world = parent ∘ TRS ∘ Shear. Analytic spheres reject any shear (they
-        // would become ellipsoids, see addSphere); meshes/quads/triangles take it.
-        Vec3 shr{0, 0, 0};
-        vec3Of(b, "shear", shr);
-        Affine localXf = affineFromTRS(tr, rot, scl);
-        if (shr.x != 0.0 || shr.y != 0.0 || shr.z != 0.0) {
-            Affine sh;                 // identity, then fill the strict-upper triangle
-            sh.m[1] = shr.x;           // x += a*y
-            sh.m[2] = shr.y;           // x += b*z
-            sh.m[5] = shr.z;           // y += c*z
-            localXf = localXf.compose(sh);   // apply shear first, then scale/rotate
+        struct Restore { std::vector<Affine>& slot; std::vector<Affine> saved;
+                         ~Restore() { slot = std::move(saved); } } restore{motionWorld_, motionWorld_};
+        motionWorld_ = worldKeys;
+        // A sphere this group's keys would scale unevenly is built as a mesh, as an uneven static
+        // scale builds it (addSphere): an analytic sphere cannot become an ellipsoid.
+        struct FlagRestore { bool& slot; bool saved; ~FlagRestore() { slot = saved; } }
+            restoreMesh{sphereAsMesh_, sphereAsMesh_};
+        sphereAsMesh_ = false;
+        if (moving && std::fabs(world.det()) >= 1e-30) {
+            const Affine inv = world.inverse();
+            for (const Affine& w : worldKeys) {
+                bool nonUniform = false;
+                w.compose(inv).uniformScale(nonUniform);
+                if (nonUniform) { sphereAsMesh_ = true; break; }
+            }
         }
-        Affine world = parentXf.compose(localXf);
-        // Child primitives are nested brace blocks; the transform-only statements
-        // (translate/rotate/scale) carry no block and are skipped here.
+        // A child that is not itself a group gets the keys here, all of this group's children one
+        // shared set (made with the first); a nested group gets them through motionWorld_.
+        int motionSet = -1;
+        const auto child = [&](const Block& cb, auto&& add) {
+            const PrimMark mk = primMark(L);
+            if (!routed(cb, L, add)) return false;
+            if (moving && !cb.name.empty()) movingNames_.insert(cb.name);
+            return !moving || applyMotion(mk, worldKeys, world, motionSet, L);
+        };
         for (const auto& s : b.stmts) {
             const Block* cb = s.val.block.get();
-            if (!cb) continue;
+            if (!cb || s.key == "motion") continue;
             s.used = true;   // a child block: dispatched below, or rejected by name
-            if      (s.key == "sphere")   { if (!routed(*cb, L, [&] { return addSphere(*cb, L, world); })) return false; }
-            else if (s.key == "quad")     { if (!routed(*cb, L, [&] { return addQuad(*cb, L, world); })) return false; }
-            else if (s.key == "triangle") { if (!routed(*cb, L, [&] { return addTriangle(*cb, L, world); })) return false; }
-            else if (s.key == "mesh")     { if (!routed(*cb, L, [&] { return addMesh(*cb, L, world); })) return false; }
-            else if (s.key == "mesh_instance") { if (!routed(*cb, L, [&] { return addMeshInstance(*cb, L, world); })) return false; }
-            else if (s.key == "isosurface") { if (!routed(*cb, L, [&] { return addIsosurface(*cb, L, world); })) return false; }
-            else if (s.key == "curve")    { if (!routed(*cb, L, [&] { return addCurve(*cb, L, world); })) return false; }
-            else if (s.key == "light")    { if (!addLight(*cb, L, (cb->type == "light" ? std::string() : cb->type), world)) return false; haveLight = true; }
+            if      (s.key == "sphere")   { if (!child(*cb, [&] { return addSphere(*cb, L, world); })) return false; }
+            else if (s.key == "quad")     { if (!child(*cb, [&] { return addQuad(*cb, L, world); })) return false; }
+            else if (s.key == "triangle") { if (!child(*cb, [&] { return addTriangle(*cb, L, world); })) return false; }
+            else if (s.key == "mesh")     { if (!child(*cb, [&] { return addMesh(*cb, L, world); })) return false; }
+            else if (s.key == "mesh_instance") { if (!child(*cb, [&] { return addMeshInstance(*cb, L, world); })) return false; }
+            else if (s.key == "isosurface") { if (!child(*cb, [&] { return addIsosurface(*cb, L, world); })) return false; }
+            else if (s.key == "curve")    { if (!child(*cb, [&] { return addCurve(*cb, L, world); })) return false; }
+            else if (s.key == "light") {
+                if (moving && !movingLightWarned_) {
+                    movingLightWarned_ = true;
+                    std::fprintf(stderr, "[ftsl] warning: a light in a moving group stays where it is at "
+                                         "the frame's instant (moving lights come later, ROADMAP 11)\n");
+                }
+                if (!addLight(*cb, L, (cb->type == "light" ? std::string() : cb->type), world)) return false;
+                haveLight = true;
+            }
             else if (s.key == "group")    { if (!routed(*cb, L, [&] { return addGroup(*cb, L, world, haveLight); })) return false; }
             else { fail("unknown block '" + s.key + "' inside group (allowed: sphere, quad, triangle, mesh, mesh_instance, isosurface, curve, light, group)"); return false; }
         }
         return true;
+    }
+
+    // The most a group's own keys may turn between neighbouring resampled keys, in degrees summed
+    // over the axes: blending two keys 5 degrees apart cuts the arc by at most 0.1% of the radius.
+    static constexpr double kMotionStepDeg = 5.0;
+    // The most keys a group's own motion is resampled to: every moving primitive's bounds visit
+    // each key, so this bounds the BVH build's cost (a group turning faster steps further).
+    static constexpr size_t kMotionMaxSteps = 256;
+
+    // The transform at the fraction u of the motion interval of evenly spread `keys` (>= 2).
+    static Affine keyedAffineAt(const std::vector<Affine>& keys, double u) {
+        int i; double f;
+        motionBracket((int)keys.size(), u, i, f);
+        return keys[(size_t)i].lerp(keys[(size_t)i + 1], f);
+    }
+
+    // Give the primitives added since `mk` -- built with `instant`, the group's world transform
+    // at the frame's instant -- the group's keys: each the transform from the instant to the
+    // group at that key. The group's one set is made on its first moving child (`set`, -1 until
+    // then). Kinds that cannot move yet are refused by name.
+    bool applyMotion(const PrimMark& mk, const std::vector<Affine>& worldKeys, const Affine& instant,
+                     int& set, Loaded& L) {
+        Scene& S = L.scene;
+        if (S.implicits.size() > mk.implicits || S.curveSegs.size() > mk.curveSegs ||
+            S.instances.size() > mk.instances) {
+            fail("motion keys reach only meshes, quads, triangles and spheres so far: an isosurface, "
+                 "curve or mesh_instance in a moving group is not supported yet (ROADMAP 11)");
+            return false;
+        }
+        if (S.emitters.size() > mk.emitters) {
+            // Its light is sampled from where it sits at the instant, so a path that saw it
+            // somewhere else would be weighed against the wrong surface.
+            fail("an emissive surface in a moving group is not supported yet (ROADMAP 11): give it "
+                 "no emission, or move it out of the group");
+            return false;
+        }
+        if (S.tris.size() == mk.tris && S.spheres.size() == mk.spheres) return true;
+        if (set < 0) {
+            if (std::fabs(instant.det()) < 1e-30) {
+                fail("a moving group's transform is singular (zero scale) at the frame's instant, so "
+                     "its children cannot be built there: keep the scale off zero at time 0");
+                return false;
+            }
+            const Affine inv = instant.inverse();
+            set = (int)S.motionSets.size();
+            S.motionSets.push_back(MotionKeys{(int)worldKeys.size(), (int)S.motionXf.size()});
+            for (const Affine& w : worldKeys) S.motionXf.push_back(w.compose(inv));
+        }
+        if (S.spheres.size() > mk.spheres) {
+            const MotionKeys& keys = S.motionSets[(size_t)set];
+            for (int k = 0; k < keys.keys; ++k) {
+                bool nonUniform = false;
+                S.motionXf[(size_t)(keys.first + k)].uniformScale(nonUniform);
+                if (nonUniform) {   // addGroup builds such a sphere as a mesh (sphereAsMesh_)
+                    fail("internal: an analytic sphere in a group whose motion scales it unevenly");
+                    return false;
+                }
+            }
+        }
+        for (size_t i = mk.tris; i < S.tris.size(); ++i) S.tris[i].motion = set;
+        for (size_t i = mk.spheres; i < S.spheres.size(); ++i) S.spheres[i].motion = set;
+        return true;
+    }
+
+    // A group's (or a motion key's) own transform as written: translate, rotate (degrees about
+    // x, y, z), scale and shear.
+    struct XfParams { Vec3 tr{0, 0, 0}, rot{0, 0, 0}, scl{1, 1, 1}, shr{0, 0, 0}; };
+    XfParams xfParamsOf(const Block& b) {
+        XfParams p;
+        vec3Of(b, "translate", p.tr);
+        vec3Of(b, "rotate", p.rot);
+        const Stmt* sc = find(b, "scale");
+        if (sc) {
+            if (sc->val.words.size() >= 3)
+                p.scl = {num(sc->val.words[0]), num(sc->val.words[1]), num(sc->val.words[2])};
+            else if (!sc->val.words.empty()) {
+                double k = num(sc->val.words[0]); p.scl = {k, k, k};
+            }
+        }
+        vec3Of(b, "shear", p.shr);
+        return p;
+    }
+    // Evenly spread keys' parameters at the fraction u of the motion interval, each interpolated
+    // linearly between the two keys bracketing it.
+    static XfParams xfParamsAt(const std::vector<XfParams>& keys, double u) {
+        int i; double f;
+        motionBracket((int)keys.size(), u, i, f);
+        const XfParams& a = keys[(size_t)i];
+        const XfParams& c = keys[(size_t)i + 1];
+        XfParams p;
+        p.tr  = a.tr  + (c.tr  - a.tr)  * f;
+        p.rot = a.rot + (c.rot - a.rot) * f;
+        p.scl = a.scl + (c.scl - a.scl) * f;
+        p.shr = a.shr + (c.shr - a.shr) * f;
+        return p;
+    }
+    // The transform the parameters make: world = TRS ∘ Shear.
+    //
+    // `shear a b c` (all optional, default 0) is a unit-diagonal upper-triangular
+    // shear applied in the group's LOCAL frame (innermost, before scale/rotate):
+    //   x' = x + a*y + b*z    y' = y + c*z    z' = z
+    // so a shears X along Y, b shears X along Z, c shears Y along Z. It composes
+    // as world = parent ∘ TRS ∘ Shear. Analytic spheres reject any shear (they
+    // would become ellipsoids, see addSphere); meshes/quads/triangles take it.
+    static Affine xfOf(const XfParams& p) {
+        Affine localXf = affineFromTRS(p.tr, p.rot, p.scl);
+        if (p.shr.x != 0.0 || p.shr.y != 0.0 || p.shr.z != 0.0) {
+            Affine sh;                 // identity, then fill the strict-upper triangle
+            sh.m[1] = p.shr.x;         // x += a*y
+            sh.m[2] = p.shr.y;         // x += b*z
+            sh.m[5] = p.shr.z;         // y += c*z
+            localXf = localXf.compose(sh);   // apply shear first, then scale/rotate
+        }
+        return localXf;
     }
 
     // ---- isosurface / metaballs / (smooth) CSG ----
@@ -7583,6 +7795,7 @@ private:
             //                   trilinear sample of it, so the fog takes the imported
             //                   silhouette. `voxels <n>` sets the longest-axis resolution.
             if (const std::string onm = strOf(bb, "object"); !onm.empty()) {
+                if (movingRefused(onm, "medium `bounds { object }`")) return false;
                 // `feather` softens a baked occupancy LATTICE, which only the mesh branch
                 // produces — a sphere and an isosurface are carved analytically per point and
                 // have no lattice to erode. Say that, rather than letting the generic
@@ -8191,6 +8404,13 @@ private:
                 hasPreset = true;
                 cs.filmW_mm = preset.filmW_mm; cs.filmH_mm = preset.filmH_mm;
             }
+        }
+        // Motion blur's shutter interval, in frames about the frame's instant (ROADMAP 11).
+        cs.shutterOpen  = dblOf(b, "shutter_open", 0.0);
+        cs.shutterClose = dblOf(b, "shutter_close", 0.0);
+        if (cs.shutterClose < cs.shutterOpen) {
+            fail("camera '" + cs.name + "': `shutter_close` comes before `shutter_open`");
+            return false;
         }
         const Stmt* film = find(b, "film");
         if (film && film->val.block) {

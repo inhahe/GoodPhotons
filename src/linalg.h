@@ -71,6 +71,11 @@ struct Affine {
         r.t = apply(c.t);   // M*c.t + t
         return r;
     }
+    // Determinant of the linear part: zero when the map flattens space (a zero scale).
+    double det() const {
+        return m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) +
+               m[2] * (m[3] * m[7] - m[4] * m[6]);
+    }
     // Inverse affine: (M,t)^-1 = (M^-1, -M^-1 t). Returns identity if the linear
     // part is singular (degenerate scale). Used to turn a primitive's local->world
     // transform into the world->local map an SDF leaf stores.
@@ -88,6 +93,17 @@ struct Affine {
         r.t = Vec3{-(r.m[0] * t.x + r.m[1] * t.y + r.m[2] * t.z),
                    -(r.m[3] * t.x + r.m[4] * t.y + r.m[5] * t.z),
                    -(r.m[6] * t.x + r.m[7] * t.y + r.m[8] * t.z)};
+        return r;
+    }
+
+    // The affine a fraction `f` of the way from *this to `b`, entry by entry: what a point
+    // carried by both transforms passes through when it moves in a straight line between
+    // them -- the interpolation motion keys use (Scene::triAt), so a vertex transformed by
+    // the blend lands exactly where linearly interpolating its two keyed positions puts it.
+    Affine lerp(const Affine& b, double f) const {
+        Affine r;
+        for (int i = 0; i < 9; ++i) r.m[i] = m[i] + (b.m[i] - m[i]) * f;
+        r.t = t + (b.t - t) * f;
         return r;
     }
 

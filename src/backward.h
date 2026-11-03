@@ -708,6 +708,15 @@ struct BackwardRenderer {
     // The bundle's / scalar path's base wavelength coordinate; a third, decorrelated
     // radical inverse so λ placement does not lock to the subpixel position.
     static double whittedLambdaU(uint64_t idx) { return rot05(radicalInverseScr(5, idx)); }
+    // The shutter-time coordinate of sample `idx`, rotated by `phase` (Cranley-Patterson): a
+    // pixel's samples spread evenly over the shutter instead of clumping by chance. Base 79 is
+    // the first prime no other lattice here takes (2..73 above and below). Mode W passes the
+    // same phase to every pixel (0.5: sample 0 at mid-shutter), so it stays noise-free; mode R
+    // a random one per pixel, so neighbouring pixels do not blur in lockstep.
+    static double shutterU(uint64_t idx, double phase) {
+        const double x = radicalInverseScr(79, idx) + phase;
+        return (x >= 1.0) ? x - 1.0 : x;
+    }
 
     // The two Cranley-Patterson phases of the one-bounce-gather lattice (see giGatherHero),
     // from the ABSOLUTE sample index. Bases 7 and 11 collide with neither the subpixel
@@ -3992,11 +4001,26 @@ struct BackwardRenderer {
         // emitted power per nm joins g, the emitters' (finalizeCameraSpectrum).
         const bool fire = !scene.emissiveVolumes.empty();
         std::vector<double> baseBuf((size_t)nBase * (size_t)(useHero ? C : 1));
+        // Motion blur (ROADMAP 11): each camera path sees the scene at one time in the shutter,
+        // set for everything the path traces -- its bounces, shadow rays, probes -- through
+        // g_motionU. The time comes off its own lattice and its own salted stream, so the main
+        // rng draws exactly what it draws without blur.
+        const bool blur = scene.hasMotion() && cam.hasShutter();
         for (int py = y0; py < y1; ++py) {
             for (int px = 0; px < film.resX; ++px) {
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)film.resX + (uint64_t)px;
+                double tPhase = 0.5;
+                if (blur && !whitted) {
+                    Pcg32 trng;
+                    seedUnit(trng, pixIdx, 0x7F4A7C159E3779B9ULL);
+                    tPhase = trng.uniform();
+                }
                 for (long long s = 0; s < spp; ++s) {
                     const uint64_t sIdx = sampleBase + (uint64_t)s;   // absolute sample index
+                    const MotionTimeScope pathTime(
+                        blur ? scene.motionU(cam.shutterOpen + (cam.shutterClose - cam.shutterOpen) *
+                                                                   shutterU(sIdx, tPhase))
+                             : -1.0);
                     Pcg32 rng;
                     seedUnit(rng, sIdx * nPix + pixIdx, 0xD1B54A32D192ED03ULL);
                     if (useHero) {

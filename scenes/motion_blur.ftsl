@@ -1,0 +1,51 @@
+# Motion blur (ROADMAP 11 stage A): three moving groups under a half-frame shutter.
+#   ftrace -in scenes/motion_blur.ftsl -mode R -spp 512 -window-min -keepwindow -o png/motion_blur.png
+# Without the camera's shutter_open / shutter_close the same scene renders the frame's instant.
+scene { units meters  motion_interval -0.5 0.5 }
+
+material "floor" { type diffuse reflect 0.6 }
+material "wall"  { type diffuse reflect 0.7 }
+material "red"   { type diffuse reflect rgb 0.75 0.12 0.08 }
+material "blue"  { type diffuse reflect rgb 0.10 0.22 0.75 }
+material "gold"  { type glossy reflect rgb 0.95 0.72 0.30  roughness 0.12 }
+
+quad { origin -3 0 -2  u 0 0 5  v 6 0 0  material floor }
+quad { origin -3 0 -2  u 6 0 0  v 0 3 0  material wall }
+light area { origin -0.6 2.9 -0.2  u 1.2 0 0  v 0 0 1.2  normal 0 -1 0  spd preset:bb6500  power 400 }
+
+# A sphere sliding left to right across the frame.
+group {
+    motion { key { translate -0.9 0.32 0.4 }  key { translate 0.9 0.32 0.4 } }
+    sphere { center 0 0 0  radius 0.3  material gold }
+}
+
+# A cube turning a quarter turn about y: the keys interpolate the angle, so its corners arc.
+group {
+    motion { key { translate 1.05 0.3 -0.5 }  key { translate 1.05 0.3 -0.5  rotate 0 90 0 } }
+    quad { origin -0.25 -0.25  0.25  u 0.5 0 0  v 0 0.5 0  material red }
+    quad { origin  0.25 -0.25 -0.25  u -0.5 0 0  v 0 0.5 0  material red }
+    quad { origin -0.25 -0.25 -0.25  u 0 0 0.5  v 0 0.5 0  material red }
+    quad { origin  0.25 -0.25  0.25  u 0 0 -0.5  v 0 0.5 0  material red }
+    quad { origin -0.25  0.25  0.25  u 0.5 0 0  v 0 0 -0.5  material red }
+    quad { origin -0.25 -0.25 -0.25  u 0.5 0 0  v 0 0 0.5  material red }
+}
+
+# Nested: a group rising, holding a group that spins about z -- the two motions compose.
+group {
+    motion { key { translate -1.1 0.0 -0.4 }  key { translate -1.1 0.5 -0.4 } }
+    group {
+        motion { key { translate 0 0.3 0 }  key { translate 0 0.3 0  rotate 0 0 60 } }
+        quad { origin -0.18 -0.18  0.18  u 0.36 0 0  v 0 0.36 0  material blue }
+        quad { origin  0.18 -0.18 -0.18  u -0.36 0 0  v 0 0.36 0  material blue }
+        quad { origin -0.18 -0.18 -0.18  u 0 0 0.36  v 0 0.36 0  material blue }
+        quad { origin  0.18 -0.18  0.18  u 0 0 -0.36  v 0 0.36 0  material blue }
+        quad { origin -0.18  0.18  0.18  u 0.36 0 0  v 0 0 -0.36  material blue }
+        quad { origin -0.18 -0.18 -0.18  u 0.36 0 0  v 0 0 0.36  material blue }
+    }
+}
+
+camera "c" {
+    eye 0 1.0 4.2  look_at 0 0.45 0  up 0 1 0  fov_y 38
+    shutter_open -0.5  shutter_close 0.5
+    film { res 640 400 }
+}
