@@ -9996,7 +9996,15 @@ sees the instant, exactly as a static scene with those transforms would show it.
   compare; a moving triangle is tested by its moved vertices (`triCross`, the watertight test's
   geometric half, shared with `intersectTri`) and rebuilt in full (`movedTri`: normals by the
   inverse transpose, then `finalize`) only when the ray meets it nearer than the hit so far.
-  Instances (BLAS) cannot move yet, so the BLAS leaves are untouched.
+  An isosurface, curve segment or instance (0.409.0; `intersectImplicitNow`,
+  `intersectCurveNow`, `intersectInstanceNow`/`occludedInstanceNow`) is met where it sits at
+  the instant: the ray is carried back through the inverse of its motion at the path's time
+  (`rayToInstant` — an affine map keeps the parameter t), and the hit carried out again
+  (`hitToMoved`: point, normals by the inverse transpose, tangent, handedness, curvature and
+  fibre radius by the mean scale, coordinate reach). An isosurface's march steps along a unit
+  direction, so its carried ray is renormalised and its t scaled to match. The BLAS leaves are
+  untouched: a moving instance moves as a whole. `buildMoveTrees` boxes these three kinds by
+  their instant box carried by each transform's eight corners.
 - **The shutter is the camera's** (`Camera::shutterOpen/Close`, frames). Mode R's `renderRows`
   draws each path's time off `shutterU`: a radical inverse in base 79 (the first prime no other
   lattice takes) over the pixel's sample index, rotated per pixel by a salted stream — stratified
@@ -10038,10 +10046,9 @@ sees the instant, exactly as a static scene with those transforms would show it.
   backward half would otherwise blur alone). The device renders the instant only, so
   `runRender`'s device choice, the shared forward group and the exposure meter keep a blurred
   camera on the CPU, and `-radcache` is off under a blur. What cannot move yet stays put and
-  says so (`stillWarning`): registered
-  emitters (an emissive mesh: light sampling reads the instant), isosurfaces, curves, instances
-  and lights in a moving group stay at the instant, so nothing mixes a moved surface with an
-  unmoved sampler. Keys are made after a group's children are built (`moveChildren`), so the
+  says so (`stillWarning`): registered emitters (an emissive mesh: light sampling reads the
+  instant) and lights in a moving group stay at the instant, so nothing mixes a moved surface
+  with an unmoved sampler. Keys are made after a group's children are built (`moveChildren`), so the
   refinement tolerance is 1e-3 of the movers' own bounding-box diagonal, in metres, measured on
   its corners; each stretch between breaks is first cut to turn at most 90° (so a whole turn
   cannot hide between two keys whose blend equals the midpoint), and the key budget is spent a

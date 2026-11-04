@@ -26,8 +26,10 @@ cube whose keys scale and shear it together. It requires:
     (4x4 blocks, the same test).
   * Mode W blurs too, deterministically (two runs agree byte for byte, and differ from the
     instant).
-  * `-checkbvh` passes on a scene of moving triangles and spheres -- every other ray at a random
-    time, so the swept bounds are held to the moved primitives.
+  * `-checkbvh` passes on a scene of moving triangles, spheres, isosurfaces, curves and mesh
+    instances -- every other ray at a random time, so the swept bounds are held to the moved
+    primitives. An isosurface, a curve and an instance in a group that moves, turns and grows,
+    held sharp at two times, render as the static group written out there.
   * Blurred modes D (BDPT) and B (forward light tracing) on the CPU agree with blurred mode R.
     So do two mode B cameras with the shutter rendered beside a third without it (one flight per
     shutter, on any device), the third staying sharp; and the sky mode B sees directly behind a
@@ -44,8 +46,8 @@ cube whose keys scale and shear it together. It requires:
   * The loader refuses, with a message naming why: a `motion` block with no `motion_interval`; one
     with a single key; `translate` beside `motion`; fur on, or a medium bounded by, a moving
     object; an interval that excludes the instant; `shutter_close` before `shutter_open`. It keeps
-    an isosurface and an emissive mesh in a moving group at the instant, saying so -- and a render
-    held sharp late in the shutter shows them there while their sibling ball has moved -- and builds
+    an emissive mesh in a moving group at the instant, saying so -- and a render held sharp late
+    in the shutter shows it there while its sibling balls (one an isosurface) have moved -- and builds
     a sphere its keys stretch as a mesh, as it does one an uneven static scale stretches.
 Exits 1 on any failure.
 """
@@ -87,6 +89,12 @@ FLY = [dict(translate=(-0.5, 1.6, -1.2)), dict(translate=(-0.5, 1.6, -1.2)),
 # by the sharp-at-a-time tests).
 TWIRL = [dict(translate=(0.55, 1.25, -1.0)), dict(translate=(0.55, 1.25, -1.0), rotate=(0, 0, 1440))]
 FIELDS = (("translate", (0, 0, 0)), ("rotate", (0, 0, 0)), ("scale", (1, 1, 1)), ("shear", (0, 0, 0)))
+# A cube of half-size 1 about the origin, for mesh_instance.
+CUBE_OBJ = NL.join(["v %d %d %d" % (x, y, z) for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)] +
+                   ["f 1 3 4 2", "f 5 6 8 7", "f 1 2 6 5", "f 3 7 8 4", "f 1 5 7 3", "f 2 4 8 6"]) + NL
+# A group that moves, turns and grows, holding an isosurface ball, a tube and a cube instance.
+KINDS = [dict(translate=(-0.5, 0.5, 0.0), rotate=(0, -40, 0), scale=(0.8, 0.8, 0.8)),
+         dict(translate=(0.5, 0.6, 0.0), rotate=(0, 50, 20), scale=(1.2, 1.2, 1.2))]
 # A dark ball sweeping across an open sky: the forward modes add the sky they see directly by a
 # camera-side pass of their own, which must see the ball where each time in the shutter has it.
 SWEEP = [dict(translate=(-0.9, 0.9, 0)), dict(translate=(0.9, 0.9, 0))]
@@ -187,14 +195,36 @@ def sky_scene(shutter):
     ]) + NL
 
 
+def kinds_scene(cube_obj, u=None, shutter=None):
+    """The KINDS group over the box's floor, moving, or held at u."""
+    cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
+    body = ("isosurface { material blue  sphere { center -0.25 0 0  radius 0.15 } }  "
+            "curve { material red  basis linear  radius 0.05  point 0 -0.2 0  point 0.1 0.25 0.1 }  "
+            'mesh_instance { of "cube"  translate 0.3 0 0  rotate 0 30 0  scale 0.12  material green }')
+    return NL.join([
+        "scene { units meters  motion_interval -0.5 0.5 }",
+        'material "white" { type diffuse reflect 0.7 }',
+        'material "red"   { type diffuse reflect rgb 0.7 0.15 0.1 }',
+        'material "blue"  { type diffuse reflect rgb 0.1 0.2 0.7 }',
+        'material "green" { type diffuse reflect rgb 0.15 0.6 0.2 }',
+        'mesh_asset "cube" { file "%s"  material white }' % cube_obj,
+        "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }",
+        "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material white }",
+        LIGHT,
+        "group { %s  %s }" % (xf(KINDS, u, 1.0), body),
+        'camera "c" { eye 0 1.0 4.2  look_at 0 0.5 0  up 0 1 0  fov_y 40  %sfilm { res %d %d } }'
+        % (cam, W, H),
+    ]) + NL
+
+
 def still_scene(obj, u=None, shutter=None):
-    """A moving group holding a ball, an emissive triangle and an isosurface ball: the ball moves,
-    the other two stay at the instant. With `u`, the static equivalent: the ball held at u and the
-    other two at the instant (u = 0.5)."""
+    """A moving group holding a ball, an isosurface ball and an emissive triangle: the two balls
+    move, the triangle stays at the instant. With `u`, the static equivalent: the balls held at u
+    and the triangle at the instant (u = 0.5)."""
     keys = [dict(translate=(-0.6, 0.45, 0.2)), dict(translate=(0.6, 0.45, 0.2))]
-    ball = "sphere { center 0 0 0  radius 0.25  material gold }"
-    still = ('mesh "glow_tri" { file "%s"  material glow  translate -0.2 0.45 0  scale 2 }  '
-             "isosurface { material blue  sphere { center 0.3 0.6 0  radius 0.15 } }" % obj)
+    ball = ("sphere { center 0 0 0  radius 0.25  material gold }  "
+            "isosurface { material blue  sphere { center 0.3 0.15 0  radius 0.15 } }")
+    still = 'mesh "glow_tri" { file "%s"  material glow  translate -0.2 0.45 0  scale 2 }' % obj
     cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
     lines = [
         "scene { units meters  motion_interval -0.5 0.5 }",
@@ -238,19 +268,29 @@ def stripe_scene(u=None, shutter=None, shift=0.0):
     ]) + NL
 
 
-def bvh_scene():
-    """Many small moving primitives inside the unit cube -checkbvh fires its rays through."""
+# The moving kinds -checkbvh fires its rays through: spheres keep still axes, the rest also turn.
+BVH_KINDS = ["sphere { center 0 0 0  radius 0.03  material w }",
+             "quad { origin -0.05 -0.05 0  u 0.1 0 0  v 0 0.1 0  material w }",
+             "isosurface { material w  sphere { radius 0.04 } }",
+             "curve { material w  basis linear  radius 0.01  point -0.05 0 0  point 0.05 0.02 0 }",
+             'mesh_instance { of "cube"  scale 0.04 }']
+
+
+def bvh_scene(cube_obj):
+    """Many small moving primitives of every kind inside the unit cube -checkbvh fires its rays
+    through."""
     rng = np.random.default_rng(7)
     out = ["scene { units meters  motion_interval -0.5 0.5 }",
-           'material "w" { type diffuse reflect 0.5 }']
-    for k in range(40):
+           'material "w" { type diffuse reflect 0.5 }',
+           'mesh_asset "cube" { file "%s"  material w }' % cube_obj]
+    for k in range(60):
         a, b = rng.uniform(0.1, 0.9, 3), rng.uniform(0.1, 0.9, 3)
         r0, r1 = rng.uniform(-90, 90, 3), rng.uniform(-90, 90, 3)
-        body = ("sphere { center 0 0 0  radius 0.03  material w }" if k % 2 else
-                "quad { origin -0.05 -0.05 0  u 0.1 0 0  v 0 0.1 0  material w }")
+        kind = k % len(BVH_KINDS)
+        turn = kind != 0
         out.append("group { motion { key { translate %s  rotate %s }  key { translate %s  "
-                   "rotate %s } }  %s }" % (v3(a), v3(r0 if k % 2 == 0 else (0, 0, 0)), v3(b),
-                                            v3(r1 if k % 2 == 0 else (0, 0, 0)), body))
+                   "rotate %s } }  %s }" % (v3(a), v3(r0 if turn else (0, 0, 0)), v3(b),
+                                            v3(r1 if turn else (0, 0, 0)), BVH_KINDS[kind]))
     out.append("light area { origin 0.4 2 0.4  u 0.2 0 0  v 0 0 0.2  normal 0 -1 0  power 10 }")
     out.append('camera "c" { eye 0.5 0.5 3  look_at 0.5 0.5 0.5  up 0 1 0  fov_y 40 }')
     return NL.join(out) + NL
@@ -279,9 +319,6 @@ REFUSED = [
 ]
 # (what stays at the instant, the scene, the warning it must print) -- loaded, not refused
 STILL = [
-    ("an isosurface in a moving group",
-     "group { motion { key { translate 0 0 0 } key { translate 1 0 0 } }  isosurface { material w  "
-     "sphere { radius 0.2 } } }", "an isosurface in a moving group stays where it is"),
     ("an emissive mesh in a moving group",
      'material "glow" { type diffuse reflect 0.0  emit blackbody 5200 }' + NL +
      'group { motion { key { translate 0 0 0 } key { translate 1 0 0 } }  mesh "m" { file "%(obj)s"'
@@ -374,6 +411,8 @@ def main():
     base = 'material "w" { type diffuse reflect 0.5 }' + NL + LIGHT
     obj = os.path.join(out, "tri.obj")
     write(obj, "v 0 0 0" + NL + "v 0.2 0 0" + NL + "v 0 0.2 0" + NL + "f 1 2 3" + NL)
+    cube_obj = os.path.join(out, "cube.obj").replace(chr(92), "/")
+    write(cube_obj, CUBE_OBJ)
     for name, body, phrase, interval in REFUSED:
         p = os.path.join(out, "refuse.ftsl")
         write(p, NL.join(["scene { units meters%s }" % ("  motion_interval -0.5 0.5" if interval
@@ -406,6 +445,17 @@ def main():
     bad = (z > 5.0) & (rel > 0.03)
     verdict("the kinds that cannot move stay; their siblings move", not bad.any(),
             "worst block z %.1f rel %.3f; %d blocks out" % (z.max(), rel.max(), bad.sum()))
+    # An isosurface, a curve and an instance move, turn and grow with their group: held sharp at
+    # a time, they are the static group written out there.
+    for t in (-0.35, 0.4):
+        sharp, ref = os.path.join(out, "kinds_sharp.ftsl"), os.path.join(out, "kinds_ref.ftsl")
+        write(sharp, kinds_scene(cube_obj, shutter=(t, t)))
+        write(ref, kinds_scene(cube_obj, u=t + 0.5))
+        args = ["-mode", "R", "-device", "cpu", "-spp", "256"]
+        ka = [lum(render(exe, out, sharp, "kinds_sharp_s%d" % s, args, seed=s)[0]) for s in (1, 2)]
+        kb = [lum(render(exe, out, ref, "kinds_ref_s%d" % s, args, seed=s)[0]) for s in (1, 2)]
+        good, detail = agree(ka, kb)
+        verdict("an isosurface, a curve and an instance move (sharp at %g)" % t, good, detail)
     for name, body in (("a sphere its keys stretch loads as a mesh", UNEVEN),
                        ("a sphere turning inside an uneven scale loads as a mesh", UNEVEN_ANCESTOR)):
         p = os.path.join(out, "uneven.ftsl")
@@ -429,7 +479,7 @@ def main():
 
     # --- -checkbvh across the motion interval ---
     p = os.path.join(out, "bvh.ftsl")
-    write(p, bvh_scene())
+    write(p, bvh_scene(cube_obj))
     rc, log = run([exe, "-in", p, "-checkbvh"])
     verdict("-checkbvh on moving primitives", rc == 0 and "PASS" in log,
             [l for l in log.splitlines() if "checkbvh" in l][-1:][0] if "checkbvh" in log else log[-300:])
@@ -502,6 +552,11 @@ def main():
     imgs = {}
     for s in (1, 2):
         png = os.path.join(out, "multi_s%d.png" % s)
+        for c in "acd":
+            for ext in (".png", ".pfm"):
+                f = png[:-4] + "_" + c + ext
+                if os.path.exists(f):
+                    os.remove(f)
         rc, log = run([exe, "-in", multi, "-seed", str(s), "-hdr", "-no-meter", "-o", png,
                        "-mode", "B", "-n", "40000000"] + (["-device", "cpu"] if a.no_gpu else []))
         if rc != 0:

@@ -1445,6 +1445,7 @@ struct Blas {
 
 struct MeshInstance {
     int patFrame = -1;   // the pattern frame its patterns are read in (Scene::patFrames), or -1
+    int motion = -1;     // its motion set (Scene::motionSets), or -1: it holds still
     int blasId = -1;
     Affine toWorld = Affine::identity();   // local -> world
     Affine toLocal = Affine::identity();   // world -> local (= toWorld.inverse())
@@ -1739,6 +1740,104 @@ struct Scene {
                                 normalize(D.applyDir(base[2]))};
         sphereSurfaceUV(h, h.ng, turned);
         h.motionSet = s.motion;
+        return true;
+    }
+
+    // An isosurface, a curve segment or an instance as the current path sees it, as
+    // intersectTriNow does a triangle. One that moves is met where it sits at the instant, by
+    // the ray carried back there through the inverse of its motion at the path's time -- an
+    // affine map keeps the ray's parameter t, so the hit's t stands -- and its hit is carried out
+    // again (hitToMoved).
+    bool intersectImplicitNow(const Ray& r, const Implicit& im, double tmin, Hit& h,
+                              const PatTables* tabs, bool anyHit = false) const {
+        if (im.motion < 0 || g_motionU < 0.0) return intersectImplicit(r, im, tmin, h, tabs, anyHit);
+        return intersectMovingImplicit(r, im, tmin, h, tabs, anyHit);
+    }
+    bool intersectCurveNow(const CurveRay& cray, const Ray& r, const CurveSeg& cs, double tmin,
+                           Hit& h, bool anyHit = false) const {
+        if (cs.motion < 0 || g_motionU < 0.0) return intersectCurveSeg(cray, r, cs, tmin, h, anyHit);
+        return intersectMovingCurve(r, cs, tmin, h, anyHit);
+    }
+    // An instance's nearest hit nearer than h.t, written to h in world space.
+    bool intersectInstanceNow(const Ray& r, const MeshInstance& inst, double tmin, Hit& h,
+                              const float* vcol) const {
+        if (inst.motion < 0 || g_motionU < 0.0) return intersectInstance(r, inst, tmin, h, vcol);
+        const Ray lr = rayToInstant(motionNowInverse(inst.motion), r);
+        if (!intersectInstance(lr, inst, tmin, h, vcol)) return false;
+        hitToMoved(motionNow(inst.motion), motionNowInverse(inst.motion), inst.motion, h);
+        return true;
+    }
+    bool occludedInstanceNow(const Ray& r, const MeshInstance& inst, double tmin, double seg,
+                             const float* vcol) const {
+        if (inst.motion < 0 || g_motionU < 0.0) return occludedInstance(r, inst, tmin, seg, vcol);
+        return occludedInstance(rayToInstant(motionNowInverse(inst.motion), r), inst, tmin, seg, vcol);
+    }
+    bool intersectInstance(const Ray& r, const MeshInstance& inst, double tmin, Hit& h,
+                           const float* vcol) const {
+        Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
+        Hit lh; lh.t = h.t;                    // running world tMax == local tMax
+        if (!blasList[inst.blasId].intersectLocal(lr, tmin, lh, vcol)) return false;
+        instanceHitToWorld(inst, lh);
+        h = lh;
+        return true;
+    }
+    bool occludedInstance(const Ray& r, const MeshInstance& inst, double tmin, double seg,
+                          const float* vcol) const {
+        Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
+        return blasList[inst.blasId].occludedLocal(lr, tmin, seg, vcol);   // world seg == local seg
+    }
+    // `r` carried back to the instant by Dinv: the same parameter t names the same point.
+    static Ray rayToInstant(const Affine& Dinv, const Ray& r) {
+        Ray lr = r;
+        lr.o = Dinv.apply(r.o);
+        lr.d = Dinv.applyDir(r.d);
+        return lr;
+    }
+    // A hit found where a mover sits at the instant, carried out to where the motion D (Dinv its
+    // inverse) has it at the path's time: the point, the normals by the inverse transpose, the
+    // tangent, the frame's handedness, the curvature and fibre radius by D's mean scale, the
+    // coordinate reach (Hit::pscale) by D's size; and the set, so patterns read the point back
+    // at the instant (patCtxFromHit).
+    static void hitToMoved(const Affine& D, const Affine& Dinv, int set, Hit& h) {
+        h.p = D.apply(h.p);
+        h.n = normalize(Dinv.applyDirTranspose(h.n));
+        h.ng = normalize(Dinv.applyDirTranspose(h.ng));
+        const Vec3 wt = D.applyDir(h.tangent);
+        const double wl = std::sqrt(dot(wt, wt));
+        if (wl > 1e-12) h.tangent = wt * (1.0 / wl);
+        const double det = D.det();
+        if (det < 0.0) h.bitangentSign = -h.bitangentSign;
+        const double s = std::cbrt(std::fabs(det));
+        if (s > 0.0) h.curv /= s;
+        h.fiberRadius *= s;
+        double f2 = 0.0;
+        for (double m : D.m) f2 += m * m;
+        h.pscale = std::sqrt(f2) * h.pscale + length(D.t);
+        h.motionSet = set;
+    }
+    // A moving isosurface. Its march steps in distance along a unit direction, so the ray carried
+    // back is renormalised and its parameters scaled to match (k: instant length per unit t).
+    FT_NOINLINE bool intersectMovingImplicit(const Ray& r, const Implicit& im, double tmin, Hit& h,
+                                             const PatTables* tabs, bool anyHit) const {
+        const Affine Dinv = motionNowInverse(im.motion);
+        Ray lr = rayToInstant(Dinv, r);
+        const double k = length(lr.d);
+        if (!(k > 0.0)) return false;
+        lr.d = lr.d * (1.0 / k);
+        Hit lh = h;
+        lh.t = h.t * k;
+        if (!intersectImplicit(lr, im, tmin * k, lh, tabs, anyHit)) return false;
+        lh.t /= k;
+        if (!anyHit) hitToMoved(motionNow(im.motion), Dinv, im.motion, lh);
+        h = lh;
+        return true;
+    }
+    FT_NOINLINE bool intersectMovingCurve(const Ray& r, const CurveSeg& cs, double tmin, Hit& h,
+                                          bool anyHit) const {
+        const Affine Dinv = motionNowInverse(cs.motion);
+        const Ray lr = rayToInstant(Dinv, r);
+        if (!intersectCurveSeg(makeCurveRay(lr.d), lr, cs, tmin, h, anyHit)) return false;
+        if (!anyHit) hitToMoved(motionNow(cs.motion), Dinv, cs.motion, h);
         return true;
     }
 
@@ -3325,11 +3424,21 @@ struct Scene {
         tree = Bvh{};
         tree.build(boxes);
     }
-    // Whether global primitive `g` moves (a triangle or sphere with keys).
+    // Whether global primitive `g` moves (has keys).
     bool primMoves(int g) const {
-        const int nT = (int)tris.size(), nS = (int)spheres.size();
-        return (g < nT && tris[(size_t)g].motion >= 0) ||
-               (g >= nT && g < nT + nS && spheres[(size_t)(g - nT)].motion >= 0);
+        return primMotion(g) >= 0;
+    }
+    // Global primitive `g`'s motion set, or -1.
+    int primMotion(int g) const {
+        if (g < (int)tris.size()) return tris[(size_t)g].motion;
+        g -= (int)tris.size();
+        if (g < (int)spheres.size()) return spheres[(size_t)g].motion;
+        g -= (int)spheres.size();
+        if (g < (int)implicits.size()) return implicits[(size_t)g].motion;
+        g -= (int)implicits.size();
+        if (g < (int)curveSegs.size()) return curveSegs[(size_t)g].motion;
+        g -= (int)curveSegs.size();
+        return g < (int)instances.size() ? instances[(size_t)g].motion : -1;
     }
     // The nearest-hit walk every world query makes: leaf(globalPrim, tMax&) as Bvh::traverseClosest.
     template <class LeafFn>
@@ -3392,11 +3501,33 @@ struct Scene {
     // kMaxMotionSegments (a slow drift needs one, a spinning wheel all of them).
     void buildMoveTrees() {
         const int nT = (int)tris.size(), nS = (int)spheres.size();
+        // Isosurfaces, curve segments and instances are boxed by their instant box carried by
+        // each transform (its eight corners): an affine image of the box holds the moved shape.
+        std::vector<Aabb> allBox;
+        std::vector<int> others;   // their global numbers
+        for (int g = nT + nS; g < (int)(tris.size() + spheres.size() + implicits.size() +
+                                        curveSegs.size() + instances.size()); ++g)
+            if (primMotion(g) >= 0) others.push_back(g);
+        if (!others.empty()) collectPrimBoxes(allBox, /*dropHair=*/false, nullptr);
+        const auto carried = [](const Aabb& b, const Affine& D, Aabb& into) {
+            for (int c = 0; c < 8; ++c)
+                into.expand(D.apply(Vec3{(c & 1) ? b.hi.x : b.lo.x, (c & 2) ? b.hi.y : b.lo.y,
+                                         (c & 4) ? b.hi.z : b.lo.z}));
+        };
         double ratio = 1.0;
         {
             int movT = 0, movS = 0;
             for (const Tri& t : tris) movT += (t.motion >= 0);
             for (const Sphere& sp : spheres) movS += (sp.motion >= 0);
+            const int strideO = std::max(1, (int)others.size() / 2048);
+            for (size_t j = 0; j < others.size(); j += (size_t)strideO) {
+                const Aabb& still = allBox[(size_t)others[j]];
+                const MotionKeys& mk = motionSets[(size_t)primMotion(others[j])];
+                Aabb sweep;
+                for (int k = 0; k < mk.keys; ++k) carried(still, motionXf[(size_t)(mk.first + k)], sweep);
+                const double size = length(still.hi - still.lo);
+                if (size > 1e-9) ratio = std::max(ratio, std::min(length(sweep.hi - sweep.lo) / size, 1e6));
+            }
             const int strideT = std::max(1, movT / 2048), strideS = std::max(1, movS / 2048);
             int seen = 0;
             for (int i = 0; i < nT; ++i) {
@@ -3422,8 +3553,9 @@ struct Scene {
                 if (sp.r > 1e-9)
                     ratio = std::max(ratio, std::min((length(sweep.hi - sweep.lo) + 2.0 * sp.r) / (2.0 * sp.r), 1e6));
             }
-            useStillTree_ = 2 * (size_t)(movT + movS) > tris.size() + spheres.size() + implicits.size() +
-                                                        curveSegs.size() + instances.size();
+            useStillTree_ = 2 * ((size_t)(movT + movS) + others.size()) >
+                            tris.size() + spheres.size() + implicits.size() + curveSegs.size() +
+                            instances.size();
         }
         motionSegments_ = (int)std::min(std::ceil(ratio), (double)kMaxMotionSegments);
         if (useStillTree_) buildStillTree(false);
@@ -3468,6 +3600,11 @@ struct Scene {
                     b.expand(c - Vec3{rr, rr, rr}); b.expand(c + Vec3{rr, rr, rr});
                 }
                 boxes.push_back(b); mp.push_back(nT + i);
+            }
+            for (int g : others) {
+                Aabb b;
+                for (const Affine& D : windows[(size_t)primMotion(g)]) carried(allBox[(size_t)g], D, b);
+                boxes.push_back(b); mp.push_back(g);
             }
             bvhMove[(size_t)k].build(boxes);
         }
@@ -3932,12 +4069,12 @@ struct Scene {
                                              if (intersectSphereNow(r, s, tmin, h)) tm = h.t; }
             else if (prim < (int)(nT + nS + nI)) { const Implicit& im = implicits[prim - nT - nS];
                                              if (hidden(im.matId)) return;
-                                             if (intersectImplicit(r, im, tmin, h, &tabs)) tm = h.t; }
+                                             if (intersectImplicitNow(r, im, tmin, h, &tabs)) tm = h.t; }
             else if (prim < (int)(nT + nS + nI + nC)) {
                 const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
                 if (skipHair && isHairCurve(cs)) return;
                 if (hidden(cs.matId)) return;
-                if (intersectCurveSeg(cray, r, cs, curveMin(r, tmin), h)) tm = h.t;
+                if (intersectCurveNow(cray, r, cs, curveMin(r, tmin), h)) tm = h.t;
             }
             else {
                 // Instanced meshes are NOT covered: their materials live per-BLAS-triangle,
@@ -3945,12 +4082,7 @@ struct Scene {
                 // `light area`'s two world tris) is ever instanced. If a future `hide_camera`
                 // on a mesh block needs it, the test belongs inside Blas::intersectLocal.
                 const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
-                Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
-                Hit lh; lh.t = h.t;                    // running world tMax == local tMax
-                if (blasList[inst.blasId].intersectLocal(lr, tmin, lh, vcolData())) {
-                    instanceHitToWorld(inst, lh);
-                    h = lh; tm = h.t;
-                }
+                if (intersectInstanceNow(r, inst, tmin, h, vcolData())) tm = h.t;
             }
         };
         traverseWorldClosest(r, tmin, tMax, leaf, stats, skipHair);
@@ -4000,14 +4132,12 @@ struct Scene {
                                               return !hidden(s.matId) && intersectSphereNow(r, s, tmin, h); }
             if (prim < (int)(nT + nS + nI)) { const Implicit& im = implicits[prim - nT - nS];
                                               return !hidden(im.matId) &&
-                                                     intersectImplicit(r, im, tmin, h, &tabs, /*anyHit=*/true); }
+                                                     intersectImplicitNow(r, im, tmin, h, &tabs, /*anyHit=*/true); }
             if (prim < (int)(nT + nS + nI + nC)) {
                 const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
-                return !hidden(cs.matId) && intersectCurveSeg(cray, r, cs, curveMin(r, tmin), h, /*anyHit=*/true);
+                return !hidden(cs.matId) && intersectCurveNow(cray, r, cs, curveMin(r, tmin), h, /*anyHit=*/true);
             }
-            const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
-            Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
-            return blasList[inst.blasId].occludedLocal(lr, tmin, seg, vcolData());  // world seg == local seg
+            return occludedInstanceNow(r, instances[prim - nT - nS - nI - nC], tmin, seg, vcolData());
         });
     }
 
@@ -4044,26 +4174,24 @@ struct Scene {
             Hit h; h.t = seg;
             if (prim < (int)nT)             return !hidden(tris[prim].matId) && intersectTriNow(sh, r, tris[prim], tmin, h);
             if (prim < (int)(nT + nS))      return !hidden(spheres[prim - nT].matId) && intersectSphereNow(r, spheres[prim - nT], tmin, h);
-            if (prim < (int)(nT + nS + nI)) return !hidden(implicits[prim - nT - nS].matId) && intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, true);
+            if (prim < (int)(nT + nS + nI)) return !hidden(implicits[prim - nT - nS].matId) && intersectImplicitNow(r, implicits[prim - nT - nS], tmin, h, &tabs, true);
             if (prim < (int)(nT + nS + nI + nC)) {
                 const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
                 const Material& cm = mats[(size_t)cs.matId];
                 const bool soft = (cm.type == MatType::Hair) &&
                                   (cm.hairOpacity < 1.0 || cm.hairOpacityPat >= 0);
                 if (hidden(cs.matId)) return false;
-                if (!soft) return intersectCurveSeg(cray, r, cs, curveMin(r, tmin), h, true);
+                if (!soft) return intersectCurveNow(cray, r, cs, curveMin(r, tmin), h, true);
                 // A transparent fiber: resolve the hit fully (anyHit skips the surface
                 // parameters a bound opacity pattern needs) and attenuate rather than block.
-                if (!intersectCurveSeg(cray, r, cs, curveMin(r, tmin), h, false)) return false;
+                if (!intersectCurveNow(cray, r, cs, curveMin(r, tmin), h, false)) return false;
                 double op = cm.hairOpacity;
                 if (cm.hairOpacityPat >= 0) op *= slotPatMul(*this, cm.hairOpacityPat, h);
                 op = op < 0.0 ? 0.0 : (op > 1.0 ? 1.0 : op);
                 T *= (1.0 - op);
                 return T <= 1e-4;          // effectively opaque: stop walking
             }
-            const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
-            Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
-            return blasList[inst.blasId].occludedLocal(lr, tmin, seg, vcolData());
+            return occludedInstanceNow(r, instances[prim - nT - nS - nI - nC], tmin, seg, vcolData());
         });
         return hardBlock ? 0.0 : T;
     }
@@ -4128,18 +4256,16 @@ struct Scene {
             Hit h; h.t = seg;
             if (prim < (int)nT)             return intersectTriNow(sh, r, tris[prim], tmin, h);
             if (prim < (int)(nT + nS))      return intersectSphereNow(r, spheres[prim - nT], tmin, h);
-            if (prim < (int)(nT + nS + nI)) return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
+            if (prim < (int)(nT + nS + nI)) return intersectImplicitNow(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
             if (prim < (int)(nT + nS + nI + nC)) {
                 // A curve, but not necessarily a FIBER: grass and wire are curves too, and a
                 // curve whose material is not Hair is ordinary opaque geometry that must
                 // still block. Only the ones the grid summarises are skipped.
                 const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
                 if (isHairCurve(cs)) return false;
-                return intersectCurveSeg(cray, r, cs, curveMin(r, tmin), h, /*anyHit=*/true);
+                return intersectCurveNow(cray, r, cs, curveMin(r, tmin), h, /*anyHit=*/true);
             }
-            const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
-            Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
-            return blasList[inst.blasId].occludedLocal(lr, tmin, seg);
+            return occludedInstanceNow(r, instances[prim - nT - nS - nI - nC], tmin, seg, nullptr);
         };
         // The no-hair tree matters MORE here than in closestHit: an any-hit query that
         // rejects every fiber it reaches can never early-out inside a coat, so on `bvh` this
@@ -4195,19 +4321,17 @@ struct Scene {
             if (prim < (int)nT)             return intersectTriNow(sh, r, tris[prim], tmin, h);
             if (prim < (int)(nT + nS))      return intersectSphereNow(r, spheres[prim - nT], tmin, h);
             if (prim < (int)(nT + nS + nI))
-                return intersectImplicit(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
+                return intersectImplicitNow(r, implicits[prim - nT - nS], tmin, h, &tabs, /*anyHit=*/true);
             if (prim < (int)(nT + nS + nI + nC)) {
                 // A fiber: full hit data, since the model needs the axis and the impact
                 // parameter, not just "something is there".
-                if (!intersectCurveSeg(cray, r, curveSegs[prim - nT - nS - nI], curveMin(r, tmin), h)) return false;
+                if (!intersectCurveNow(cray, r, curveSegs[prim - nT - nS - nI], curveMin(r, tmin), h)) return false;
                 if (h.matId < 0 || h.matId >= (int)mats.size()) return true;
                 if (mats[h.matId].type != MatType::Hair || h.fiberRadius <= 0.0) return true;
                 if (crossed < maxCrossings) { ++crossed; onFiber(h); }
                 return false;                                  // keep going through the coat
             }
-            const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
-            Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
-            return blasList[inst.blasId].occludedLocal(lr, tmin, seg);
+            return occludedInstanceNow(r, instances[prim - nT - nS - nI - nC], tmin, seg, nullptr);
         });
         return !blocked;
     }
@@ -4318,7 +4442,7 @@ struct Scene {
         for (const auto& t : tris)     intersectTriNow(sh, r, t, tmin, h);
         for (const auto& s : spheres)  intersectSphereNow(r, s, tmin, h);
         const PatTables tabs = patTables();
-        for (const auto& im : implicits) intersectImplicit(r, im, tmin, h, &tabs);
+        for (const auto& im : implicits) intersectImplicitNow(r, im, tmin, h, &tabs);
         // Curve segments are part of the reference too. Omitting them did not make
         // `-checkbvh` weaker, it made it WRONG: the BVH found every strand the linear
         // scan couldn't, so the cross-check reported thousands of "mismatches" on any
@@ -4326,16 +4450,9 @@ struct Scene {
         // have been invisible in the noise.
         if (!curveSegs.empty()) {
             const CurveRay cray = makeCurveRay(r.d);
-            for (const auto& cs : curveSegs) intersectCurveSeg(cray, r, cs, curveMin(r, tmin), h);
+            for (const auto& cs : curveSegs) intersectCurveNow(cray, r, cs, curveMin(r, tmin), h);
         }
-        for (const auto& inst : instances) {
-            Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
-            Hit lh; lh.t = h.t;
-            if (blasList[inst.blasId].intersectLocal(lr, tmin, lh)) {
-                instanceHitToWorld(inst, lh);
-                h = lh;
-            }
-        }
+        for (const auto& inst : instances) intersectInstanceNow(r, inst, tmin, h, nullptr);
         markPatSide(h);
         applyNormalMap(h);
         return h;

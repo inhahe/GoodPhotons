@@ -89,7 +89,8 @@ struct CurveSeg {
     int    curveId = -1;            // owning strand (diagnostics; future per-strand data)
     float  u0 = 0.0f, u1 = 1.0f;    // curve parameter at p0/p1 — the hit's texture `u`
     int    patFrame = -1;           // the pattern frame its patterns are read in (Scene::patFrames)
-    int    spare_ = 0;              // named, so the record has no padding: -checkfur memcmp's it
+    int    motion = -1;             // its motion set (Scene::motionSets), or -1: it holds still.
+                                    // Fills what was padding, which -checkfur's memcmp needs gone
 };
 
 // One authored strand: a contiguous run of the scene's flat CurveSeg pool.

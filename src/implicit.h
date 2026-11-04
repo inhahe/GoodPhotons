@@ -235,6 +235,7 @@ enum class Container : int { Box = 0, Sphere = 1 };
 // ---------------------------------------------------------------------------
 struct Implicit {
     int patFrame = -1;   // the pattern frame its patterns are read in (Scene::patFrames), or -1
+    int motion = -1;     // its motion set (Scene::motionSets), or -1: it holds still
     std::vector<FieldNode> nodes;   // postfix field expression
     std::vector<PatNode> exprNodes; // shared pool backing FieldOp::Expr leaves (f(x,y,z))
     std::string name;               // authored ftsl block name (used to name -export-mesh groups)

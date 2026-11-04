@@ -6933,21 +6933,20 @@ private:
     // loader says so.
     static constexpr size_t kMotionMaxKeys = 1025;
 
-    // Give the triangles and spheres the group's own children added (`movers`) the group's keys:
-    // each the transform, in metres, from the instant (`instant`, which built them) to the group
-    // at that time. Keys go at every time the motion may kink (`chain.breaks`, the instant
-    // among them), then between them wherever blending two neighbours strays from the exact
-    // motion by more than kMotionTol of the movers' size, measured on the corners of their
-    // bounding box. Kinds that cannot move yet stay at the instant, with a warning.
+    // Give the primitives the group's own children added (`movers`) the group's keys: each the
+    // transform, in metres, from the instant (`instant`, which built them) to the group at that
+    // time. Keys go at every time the motion may kink (`chain.breaks`, the instant among them),
+    // then between them wherever blending two neighbours strays from the exact motion by more
+    // than kMotionTol of the movers' size, measured on the corners of their bounding box. Kinds
+    // that cannot move yet stay at the instant, with a warning.
     bool moveChildren(const std::vector<std::pair<PrimMark, PrimMark>>& movers,
                       const MotionChain& chain, const Affine& instant, Loaded& L) {
         Scene& S = L.scene;
-        std::vector<std::pair<size_t, size_t>> tris, sphs;   // [first, end) ranges to move
+        // [first, end) ranges to move, of triangles, spheres, isosurfaces, curve segments and
+        // instances.
+        std::vector<std::pair<size_t, size_t>> tris, sphs, imps, segs, insts;
         Aabb box;
         for (const auto& [a, z] : movers) {
-            if (z.implicits > a.implicits) stillWarning("an isosurface");
-            if (z.curveSegs > a.curveSegs) stillWarning("a curve");
-            if (z.instances > a.instances) stillWarning("a mesh_instance");
             if (z.emitters > a.emitters) {
                 // Its light is sampled from where it sits at the instant, so it must stay there.
                 stillWarning("an emissive surface");
@@ -6955,6 +6954,9 @@ private:
             }
             if (z.tris > a.tris) tris.push_back({a.tris, z.tris});
             if (z.spheres > a.spheres) sphs.push_back({a.spheres, z.spheres});
+            if (z.implicits > a.implicits) imps.push_back({a.implicits, z.implicits});
+            if (z.curveSegs > a.curveSegs) segs.push_back({a.curveSegs, z.curveSegs});
+            if (z.instances > a.instances) insts.push_back({a.instances, z.instances});
             for (size_t i = a.tris; i < z.tris; ++i) {
                 box.expand(S.tris[i].v0); box.expand(S.tris[i].v1); box.expand(S.tris[i].v2);
             }
@@ -6962,8 +6964,17 @@ private:
                 const Sphere& s = S.spheres[i];
                 box.expand(s.c - Vec3{s.r, s.r, s.r}); box.expand(s.c + Vec3{s.r, s.r, s.r});
             }
+            for (size_t i = a.implicits; i < z.implicits; ++i) box.expand(S.implicits[i].bounds);
+            for (size_t i = a.curveSegs; i < z.curveSegs; ++i) box.expand(curveSegBounds(S.curveSegs[i]));
+            for (size_t i = a.instances; i < z.instances; ++i) {
+                const MeshInstance& inst = S.instances[i];
+                for (const Tri& t : S.blasList[(size_t)inst.blasId].tris) {
+                    box.expand(inst.toWorld.apply(t.v0)); box.expand(inst.toWorld.apply(t.v1));
+                    box.expand(inst.toWorld.apply(t.v2));
+                }
+            }
         }
-        if (tris.empty() && sphs.empty()) return true;
+        if (tris.empty() && sphs.empty() && imps.empty() && segs.empty() && insts.empty()) return true;
         if (std::fabs(instant.det()) < 1e-30) {
             fail("a moving group's transform is singular (zero scale) at the frame's instant, so "
                  "its children cannot be built there: keep the scale off zero at time 0");
@@ -7066,6 +7077,9 @@ private:
         }
         for (const auto& [a, z] : tris) for (size_t i = a; i < z; ++i) S.tris[i].motion = set;
         for (const auto& [a, z] : sphs) for (size_t i = a; i < z; ++i) S.spheres[i].motion = set;
+        for (const auto& [a, z] : imps) for (size_t i = a; i < z; ++i) S.implicits[i].motion = set;
+        for (const auto& [a, z] : segs) for (size_t i = a; i < z; ++i) S.curveSegs[i].motion = set;
+        for (const auto& [a, z] : insts) for (size_t i = a; i < z; ++i) S.instances[i].motion = set;
         return true;
     }
 

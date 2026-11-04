@@ -731,6 +731,7 @@ multi-camera flights group cameras by shutter, and the exposure meter blurs as t
 Modes M, S, U, J and P still render the instant (they share photons or merges across paths, or
 classify pixels at the instant), as does the GPU. *Camera motion (0.408.0, done):* a camera's
 `motion { key { eye look_at up fov_y } }`, and every frame of a camera path with a shutter
-keyed from a Catmull-Rom through the path's frames; loom writes a moving `Camera`'s keys. Open:
-moving lights, emissive meshes, curves, isosurfaces and instances; M/S/U/J with time carried
+keyed from a Catmull-Rom through the path's frames; loom writes a moving `Camera`'s keys.
+*Moving isosurfaces, curves and mesh instances (0.409.0, done):* the ray carried back to the
+instant, the hit carried out. Open: moving lights and emissive meshes; M/S/U/J with time carried
 into the light side; the GPU.

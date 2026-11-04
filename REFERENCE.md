@@ -2102,8 +2102,8 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
   frame along the path, from a smooth curve through its frames' poses (no `motion_interval`
   needed). Without a shutter a keyed camera renders exactly the still camera at its keys'
   instant. Loom writes a moving `Camera`'s keys with the scene's (`render_range(motion=…)`).
-- **What can move so far:** spheres (as a mesh where the keys stretch one), quads, triangles and
-  meshes. An isosurface, a curve, a `mesh_instance`, an emissive mesh and a
+- **What can move so far:** spheres (as a mesh where the keys stretch one), quads, triangles,
+  meshes, and since 0.409.0 isosurfaces, curves and `mesh_instance`s. An emissive mesh and a
   light in a moving group stay at the instant, with a warning. A procedural pattern on a moving
   surface travels with it (it is read where the point sits at the frame's instant), and a
   sphere's UV turns with its keys; `pattern_space object` on a group keeps its patterns on it

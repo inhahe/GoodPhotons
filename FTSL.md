@@ -3109,11 +3109,11 @@ size.)
   out — on every mode and device. Blur comes only from a camera's shutter (§14.1).
 - **Nested groups compose:** a group inside a moving group moves with it, and may have keys of its
   own.
-- **What may move (so far):** `sphere`, `quad`, `triangle` and `mesh` children. A sphere the keys
-  scale unevenly is built as a smooth mesh, as an uneven static `scale` builds it. An `isosurface`,
-  a `curve`, a `mesh_instance`, an emissive mesh (a registered light, whose light is sampled
-  where it sits at the instant) and a `light` in a moving group stay where they are at the
-  instant, with one warning per kind: they cannot move yet. What finds an object by name — `fur { on }` and `bald`, a
+- **What may move (so far):** `sphere`, `quad`, `triangle`, `mesh`, `isosurface`, `curve` and
+  `mesh_instance` children (the last three since 0.409.0). A sphere the keys scale unevenly is
+  built as a smooth mesh, as an uneven static `scale` builds it. An emissive mesh (a registered
+  light, whose light is sampled where it sits at the instant) and a `light` in a moving group
+  stay where they are at the instant, with one warning per kind: they cannot move yet. What finds an object by name — `fur { on }` and `bald`, a
   medium's `bounds { object }`, `settle { collide }` — refuses one in a moving group, which it
   could not follow. **Textures travel with what moves:** a procedural `pattern` on a moving
   surface is read where that surface point sits at the frame's instant, so it smears with the
