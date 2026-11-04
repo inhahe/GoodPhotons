@@ -2068,11 +2068,13 @@ group { motion { key { translate -0.8 0.3 0 }  key { translate 0.8 0.3 0  rotate
 camera "c" { eye 0 1 4  look_at 0 0.4 0  shutter_open -0.25  shutter_close 0.25 }   # 180° at 24 fps
 ```
 
-Each camera path then sees the scene at one time drawn evenly over `[shutter_open,
-shutter_close]` (equal values: the scene sharp at that one time) — every bounce, shadow ray and probe of that path at the same time — so whatever
+Each camera path (or, in a forward mode, each photon) then sees the scene at one time drawn evenly
+over `[shutter_open, shutter_close]` (equal values: the scene sharp at that one time) — every
+bounce, shadow ray and probe of that path at the same time — so whatever
 moves in that span smears along its motion, exactly as the average of the frames at every time
-in the shutter would. A pixel's samples spread their times evenly over the shutter (a radical
-inverse, rotated per pixel), so a blur grains less than random times would; mode `W` gives every
+in the shutter would. In mode `R` a pixel's samples spread their times evenly over the shutter (a
+radical inverse, rotated per pixel), so a blur grains less than random times would (other modes
+draw each path's or photon's time at random); mode `W` gives every
 pixel the same times, and stays noise-free. Keys interpolate translate, rotate, scale and shear
 as written, so a quarter turn arcs; nested groups compose. The full syntax and its limits are in
 [FTSL.md §13.1](FTSL.md#131-motion--a-moving-group-motion-blur). **Loom writes the keys for an
@@ -2084,10 +2086,16 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
 
 - **Without a shutter nothing changes:** the scene renders the groups at the frame's instant, byte
   for byte the static scene with those transforms written out, on every mode and device.
-- **Mode `R` (and `W`) blur, on the CPU.** `-device gpu` keeps a blurred mode `R` on the CPU and
-  says so; every other mode renders the frame's instant and prints `[motion] … renders the
-  frame's instant`. `-radcache` is switched off under a blur (a cell would mix every time in the
-  shutter).
+- **Modes `R` (and `W`), `D`, `A`, `B` and `C` blur, on the CPU.** In mode `D` a sample's eye and
+  light subpaths and every connection between them share one time; in modes `A`, `B` and `C` each
+  photon, and its splat to the camera, has its own. `-device gpu` keeps a blurred render on the
+  CPU and says so (`[device] motion blur … renders on the CPU so far`), and its exposure meter
+  too. Modes `M`, `S`, `U`, `J` and `P` render the frame's instant and print `[motion] … renders
+  the frame's instant`: the first four share photons or merges across paths, which paths at
+  different times cannot share, and `P` picks each pixel's estimator at the instant.
+  `-radcache` is switched off under a blur (a cell would mix every time in the shutter). The sky
+  a forward mode sees directly blurs behind a mover as mode `R`'s does. Several mode `A` or `B`
+  cameras rendered together share one forward flight per shutter.
 - **What can move so far:** spheres (as a mesh where the keys stretch one), quads, triangles and
   meshes. An isosurface, a curve, a `mesh_instance`, an emissive mesh and a
   light in a moving group stay at the instant, with a warning. A procedural pattern on a moving

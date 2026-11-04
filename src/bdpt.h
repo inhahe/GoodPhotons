@@ -4355,6 +4355,7 @@ struct BdptRenderer {
         // wavelength (JSpec, beamgather.h). Only the merges read it; the walk draws nothing extra,
         // so the paths are the ones it always took. FTRACE_JSPEC=0 turns it off for A/B runs.
         const bool jSpecOn = (mergeOn || surfOn) && jSpecEnabled();
+        const bool blurD = cam.seesMotion(scene) && !mergeOn && !surfOn;
         if (jSpecOn) jsw.trSpec = anyMediumSigmaTChromatic(scene);
         // FTRACE_J_HALF (diagnostic): 1 = connections only, 2 = merges only. Deliberately
         // does NOT touch the merge constants — both halves keep the SAME MIS weights they
@@ -4390,8 +4391,13 @@ struct BdptRenderer {
                     for (int sub = 0; sub < nSub; ++sub) {
                     const bool allowD = sub < kD, allowJ = sub < kJ;
                     Pcg32 rng;
-                    seedUnit(rng, (sub == 0) ? gBase : (mix64(gBase * 0xD1B54A32D192ED03ULL + (uint64_t)sub) >> 1),
-                             0x8CB92BA72F3D8DD7ULL);
+                    const uint64_t unit = (sub == 0) ? gBase : (mix64(gBase * 0xD1B54A32D192ED03ULL + (uint64_t)sub) >> 1);
+                    seedUnit(rng, unit, 0x8CB92BA72F3D8DD7ULL);
+                    // Motion blur (ROADMAP 11): the eye and light subpaths of this sample, and
+                    // every connection between them, at one time in the shutter. Mode J's merges
+                    // reach light vertices of other samples, so it renders the instant.
+                    const MotionTimeScope pathTime(
+                        blurD ? scene.motionU(cam.shutterTime(unitTime(unit, 0x3C6EF372FE94F82BULL))) : -1.0);
                     HeroBundle hb;
                     // The wavelengths come from the illuminant's density, the fires' emission
                     // included (Scene::camSampler; without a fire it is emitSampler), so a fire

@@ -28,7 +28,11 @@ cube whose keys scale and shear it together. It requires:
     instant).
   * `-checkbvh` passes on a scene of moving triangles and spheres -- every other ray at a random
     time, so the swept bounds are held to the moved primitives.
-  * Under a shutter, `-device gpu` says mode R stays on the CPU, and mode B says it renders the
+  * Blurred modes D (BDPT) and B (forward light tracing) on the CPU agree with blurred mode R.
+    So do two mode B cameras with the shutter rendered beside a third without it (one flight per
+    shutter, on any device), the third staying sharp; and the sky mode B sees directly behind a
+    dark ball sweeping across it.
+  * Under a shutter, `-device gpu` says mode R stays on the CPU, and mode M says it renders the
     instant.
   * The loader refuses, with a message naming why: a `motion` block with no `motion_interval`; one
     with a single key; `translate` beside `motion`; fur on, or a medium bounded by, a moving
@@ -76,6 +80,9 @@ FLY = [dict(translate=(-0.5, 1.6, -1.2)), dict(translate=(-0.5, 1.6, -1.2)),
 # by the sharp-at-a-time tests).
 TWIRL = [dict(translate=(0.55, 1.25, -1.0)), dict(translate=(0.55, 1.25, -1.0), rotate=(0, 0, 1440))]
 FIELDS = (("translate", (0, 0, 0)), ("rotate", (0, 0, 0)), ("scale", (1, 1, 1)), ("shear", (0, 0, 0)))
+# A dark ball sweeping across an open sky: the forward modes add the sky they see directly by a
+# camera-side pass of their own, which must see the ball where each time in the shutter has it.
+SWEEP = [dict(translate=(-0.9, 0.9, 0)), dict(translate=(0.9, 0.9, 0))]
 
 
 def at(keys, u):
@@ -157,6 +164,20 @@ def scene(u=None, shutter=None, units="meters", extras=False, twirl=False):
                   "group { %s  sphere { center 0 0 0  radius %r  material gold } }"
                   % (xf(FLY, u, k), 0.15 * k)]
     return NL.join(lines) + NL
+
+
+def sky_scene(shutter):
+    """The SWEEP ball over a floor under an environment light, nothing behind it but sky."""
+    return NL.join([
+        "scene { units meters  motion_interval -0.5 0.5 }",
+        'material "white" { type diffuse reflect 0.6 }',
+        'material "dark" { type diffuse reflect 0.1 }',
+        "light env { spd preset:d65 }",
+        "quad { origin -3 0 -3  u 0 0 6  v 6 0 0  material white }",
+        "group { %s  sphere { center 0 0 0  radius 0.3  material dark } }" % xf(SWEEP, None, 1.0),
+        'camera "c" { eye 0 0.8 3.5  look_at 0 0.8 0  up 0 1 0  fov_y 40  '
+        'shutter_open %r  shutter_close %r  film { res %d %d } }' % (shutter + (W, H)),
+    ]) + NL
 
 
 def still_scene(obj, u=None, shutter=None):
@@ -450,6 +471,64 @@ def main():
     moved = (np.abs(mb - still) / np.maximum(still, 1e-3 * still.max()) > 0.10).sum()
     verdict("the blur is there (blocks off the instant by > 10%)", moved >= 8, "%d blocks" % moved)
 
+    # --- the other modes that blur agree with mode R: BDPT (a time per path pair) and the
+    # forward light tracer (a time per photon, its camera splat at the same time) ---
+    for mode, margs in (("D", ["-spp", "256"]), ("B", ["-n", "40000000"])):
+        bm = [lum(render(exe, out, blurred, "blur_%s_s%d" % (mode, s),
+                         ["-mode", mode, "-device", "cpu"] + margs, seed=s)[0]) for s in (1, 2)]
+        mm = blocks((bm[0] + bm[1]) / 2)
+        err = np.hypot(block_err(lb[0], lb[1]), block_err(bm[0], bm[1]))
+        z = np.abs(mm - mb) / np.maximum(err, 1e-30)
+        rel = np.abs(mm - mb) / np.maximum(np.abs(mb), 1e-3 * np.abs(mb).max())
+        bad = (z > 5.0) & (rel > 0.05)
+        verdict("blurred mode %s = blurred mode R (8x8 blocks)" % mode, not bad.any(),
+                "worst block z %.1f rel %.3f; %d blocks out" % (z.max(), rel.max(), bad.sum()))
+
+    # --- several mode B cameras in one run: two with the shutter share a flight and both blur,
+    # one without it (declared first) renders apart and stays sharp. On any device. ---
+    text = open(blurred, encoding="utf-8").read()
+    cam_c = [l for l in text.splitlines() if l.startswith('camera "c"')][0]
+    cam_d = cam_c.replace('camera "c"', 'camera "d"')
+    cam_a = re.sub(r"shutter_open \S+  shutter_close \S+  ", "", cam_c.replace('camera "c"', 'camera "a"'))
+    multi = os.path.join(out, "blurred_multi.ftsl")
+    write(multi, text.replace(cam_c, NL.join([cam_a, cam_c, cam_d])))
+    imgs = {}
+    for s in (1, 2):
+        png = os.path.join(out, "multi_s%d.png" % s)
+        rc, log = run([exe, "-in", multi, "-seed", str(s), "-hdr", "-no-meter", "-o", png,
+                       "-mode", "B", "-n", "40000000"] + (["-device", "cpu"] if a.no_gpu else []))
+        if rc != 0:
+            print(log[-2000:])
+            raise SystemExit("render failed: " + multi)
+        for c in "acd":
+            imgs.setdefault(c, []).append(lum(read_pfm(png[:-4] + "_%s.pfm" % c)))
+    for c in "cd":
+        mm = blocks((imgs[c][0] + imgs[c][1]) / 2)
+        err = np.hypot(block_err(lb[0], lb[1]), block_err(imgs[c][0], imgs[c][1]))
+        z = np.abs(mm - mb) / np.maximum(err, 1e-30)
+        rel = np.abs(mm - mb) / np.maximum(np.abs(mb), 1e-3 * np.abs(mb).max())
+        bad = (z > 5.0) & (rel > 0.05)
+        verdict("... shared mode B flight, camera %s = blurred mode R" % c, not bad.any(),
+                "worst block z %.1f rel %.3f; %d blocks out" % (z.max(), rel.max(), bad.sum()))
+    sharp_a = blocks((imgs["a"][0] + imgs["a"][1]) / 2)
+    off = (np.abs(sharp_a - still) / np.maximum(still, 1e-3 * still.max()) > 0.10).sum()
+    verdict("... and the camera without a shutter stays sharp", off < 4, "%d blocks off the instant" % off)
+
+    # --- the sky a forward mode sees directly blurs behind a mover as mode R's does ---
+    sky = os.path.join(out, "sky.ftsl")
+    write(sky, sky_scene((-0.5, 0.5)))
+    sr = [lum(render(exe, out, sky, "sky_R_s%d" % s, ["-mode", "R", "-device", "cpu", "-spp", "512"],
+                     seed=s)[0]) for s in (1, 2)]
+    sbm = [lum(render(exe, out, sky, "sky_B_s%d" % s, ["-mode", "B", "-device", "cpu", "-n", "40000000"],
+                      seed=s)[0]) for s in (1, 2)]
+    mr, mbs = blocks((sr[0] + sr[1]) / 2), blocks((sbm[0] + sbm[1]) / 2)
+    err = np.hypot(block_err(sr[0], sr[1]), block_err(sbm[0], sbm[1]))
+    z = np.abs(mbs - mr) / np.maximum(err, 1e-30)
+    rel = np.abs(mbs - mr) / np.maximum(np.abs(mr), 1e-3 * np.abs(mr).max())
+    bad = (z > 5.0) & (rel > 0.05)
+    verdict("blurred mode B's sky behind a mover = mode R's", not bad.any(),
+            "worst block z %.1f rel %.3f; %d blocks out" % (z.max(), rel.max(), bad.sum()))
+
     # --- the same blur authored in centimetres: the keys move metres, as the vertices are ---
     blurred_cm = os.path.join(out, "blurred_cm.ftsl")
     write(blurred_cm, scene(shutter=(-0.5, 0.5), units="centimeters"))
@@ -510,9 +589,9 @@ def main():
                        "-o", os.path.join(out, "gate.png")])
         verdict("-device gpu under a shutter says it stays on the CPU",
                 rc == 0 and "renders on the CPU so far" in log, log.strip()[-300:] if rc else "")
-    rc, log = run([exe, "-in", blurred, "-mode", "B", "-device", "cpu", "-n", "100000", "-no-meter",
-                   "-o", os.path.join(out, "modeb.png")])
-    verdict("mode B under a shutter says it renders the instant",
+    rc, log = run([exe, "-in", blurred, "-mode", "M", "-device", "cpu", "-n", "100000", "-no-meter",
+                   "-o", os.path.join(out, "modem.png")])
+    verdict("mode M under a shutter says it renders the instant",
             rc == 0 and "renders the frame's instant" in log, log.strip()[-300:] if rc else "")
 
     print("PASS" if ok else "FAIL")

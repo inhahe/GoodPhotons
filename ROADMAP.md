@@ -723,5 +723,12 @@ writes the shutter. **`ftrace -shot` (0.405.0, done):** it hands a loom file's t
 `ftrace -stop`). Each frame is its own process, about 0.6 s of start-up measured; rendering a
 shot in one process (extending `-serve` with a per-frame output and resume, keeping the GPU
 context, the asset cache and one live window) is open — the temporal denoiser of stage D can
-work either way, from each frame's saved guides. Open for B: blur in every other mode and on the GPU, moving instances,
-curves, isosurfaces, emissive meshes and lights, and camera motion keys.
+work either way, from each frame's saved guides.
+
+**Stage B, in progress.** *Modes D, A, B and C (0.407.0, done):* each BDPT sample and each forward
+photon draws one time, the analytic specular connections follow their sphere or plane, shared
+multi-camera flights group cameras by shutter, and the exposure meter blurs as the render does.
+Modes M, S, U, J and P still render the instant (they share photons or merges across paths, or
+classify pixels at the instant), as does the GPU. Open: camera motion keys; moving lights,
+emissive meshes, curves, isosurfaces and instances; M/S/U/J with time carried into the light
+side; the GPU.

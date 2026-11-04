@@ -10006,10 +10006,27 @@ sees the instant, exactly as a static scene with those transforms would show it.
   asks. The `-oidn` guide pass gives each guide ray a time of its own (stratified over the
   pixel's rays), so the guides blur as the image does; the resume guard mixes every key and the
   shutter.
+- **Modes D, A, B and C draw a time per path** (stage B, 0.407.0) with `unitTime(unit, salt)`
+  (`rng.h`): a uniform off a stream of its own keyed by the path's unit — BDPT's sample unit, a
+  forward photon's absolute index — so the path's own stream draws what it drew without blur.
+  In mode D the eye and light subpaths and every connection share the sample's time; in the
+  forward modes the photon and its splat do. The analytic specular connections read their
+  sphere and plane at the path's time (`Scene::sphereNow`, `mirrorPlaneNow`; a plane whose
+  faces move differently records `mixed` and is skipped under a time). The sky a forward mode
+  sees directly is a camera-side pass of its own (`addEnvBackground`); under a blur it goes
+  through `addEnvBackgroundSampled`, the lens pass's cache and growing sample count, each sample
+  at its own time (a rotated radical inverse in base 3), so the sky shows behind a mover for the
+  part of the shutter it is uncovered. A shared forward flight (`renderForwardShared`) draws one
+  time per photon for all its cameras, so `run` builds one flight per shutter (`joinFlight`;
+  cameras that see nothing move share regardless), and a flight in which any camera sees
+  motion flies on the CPU.
 - **Where blur is not yet carried, the shutter is closed**, so no estimator mixes times: the
-  camera loop in `main.cpp` closes it for every mode but R (mode P's backward half would
-  otherwise blur alone), `backwardOnGpuOk` keeps a blurred mode R off the GPU, and `-radcache` is
-  off under a blur. What cannot move yet stays put and says so (`stillWarning`): registered
+  camera loop in `main.cpp` closes it for modes M, S, U and J (which share photons or merges
+  across paths) and P (whose per-pixel classification is made at the instant, and whose
+  backward half would otherwise blur alone). The device renders the instant only, so
+  `runRender`'s device choice, the shared forward group and the exposure meter keep a blurred
+  camera on the CPU, and `-radcache` is off under a blur. What cannot move yet stays put and
+  says so (`stillWarning`): registered
   emitters (an emissive mesh: light sampling reads the instant), isosurfaces, curves, instances
   and lights in a moving group stay at the instant, so nothing mixes a moved surface with an
   unmoved sampler. Keys are made after a group's children are built (`moveChildren`), so the

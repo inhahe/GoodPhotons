@@ -2947,8 +2947,38 @@ struct Scene {
         Vec3   lo{0, 0, 0};     // AABB of the member faces — a cheap reject before the
         Vec3   hi{0, 0, 0};     // BVH query that confirms the mirror is really there
         double area = 0.0;      // total face area (used to rank when capping the list)
+        // The motion set its member faces share (-1: none moves), or `mixed` when they move
+        // differently -- then a path with a time cannot use the plane (mirrorPlaneNow).
+        int  motionSet = -1;
+        bool mixed = false;
     };
     std::vector<MirrorPlane> mirrorPlanes;
+    // A mirror plane as a path at its own time sees it (g_motionU): carried by its members'
+    // motion, or false when they move differently (the connection is then not made).
+    bool mirrorPlaneNow(const MirrorPlane& mp, MirrorPlane& out) const {
+        out = mp;
+        if (g_motionU < 0.0 || mp.motionSet < 0) return !(mp.mixed && g_motionU >= 0.0);
+        if (mp.mixed) return false;
+        const Affine D = motionNow(mp.motionSet);
+        out.n = normalize(D.applyNormal(mp.n));
+        out.d = dot(out.n, D.apply(mp.n * mp.d));
+        Aabb b;
+        for (int c = 0; c < 8; ++c)
+            b.expand(D.apply(Vec3{(c & 1) ? mp.hi.x : mp.lo.x, (c & 2) ? mp.hi.y : mp.lo.y,
+                                  (c & 4) ? mp.hi.z : mp.lo.z}));
+        out.lo = b.lo; out.hi = b.hi;
+        return true;
+    }
+    // A sphere as a path at its own time sees it: moved by its keys, or itself.
+    Sphere sphereNow(const Sphere& s) const {
+        if (s.motion < 0 || g_motionU < 0.0) return s;
+        const Affine D = motionNow(s.motion);
+        bool nonUniform = false;
+        Sphere o = s;
+        o.c = D.apply(s.c);
+        o.r = s.r * D.uniformScale(nonUniform);
+        return o;
+    }
 
     // Index lists over `spheres` for the per-vertex specular camera connections
     // (render.h camSpecularSplatAllVtxN): which spheres are smooth dielectrics (the
@@ -3024,11 +3054,13 @@ struct Scene {
                 MirrorPlane mp;
                 mp.n = n; mp.d = d;
                 mp.lo = t.v0; mp.hi = t.v0;
+                mp.motionSet = t.motion;
                 mirrorPlanes.push_back(mp);
             } else {
                 idx = it->second;
             }
             MirrorPlane& mp = mirrorPlanes[(size_t)idx];
+            if (t.motion != mp.motionSet) mp.mixed = true;
             for (const Vec3& v : {t.v0, t.v1, t.v2}) {
                 mp.lo.x = std::min(mp.lo.x, v.x); mp.hi.x = std::max(mp.hi.x, v.x);
                 mp.lo.y = std::min(mp.lo.y, v.y); mp.hi.y = std::max(mp.hi.y, v.y);

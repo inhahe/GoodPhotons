@@ -3121,9 +3121,14 @@ size.)
   surface, and an analytic `sphere`'s UV map turns with its keys. For a pattern that also stays on
   its object from one frame of an animation to the next, give the group `pattern_space object`
   (§13).
-- **Which modes blur:** mode R (and W) on the CPU. On `-device gpu` a blurred mode R stays on the
-  CPU and says so; every other mode renders the frame's instant and prints one note (ROADMAP 11
-  lists the rest).
+- **Which modes blur:** modes R (and W), D, A, B and C, on the CPU. On `-device gpu` a blurred
+  render stays on the CPU and says so. Modes M, S, U, J and P render the frame's instant and print
+  one note: the first four share light data across paths (photon maps, merges), which paths at
+  different times cannot share, and P chooses each pixel's estimator from where things stand at
+  the instant (ROADMAP 11 lists the rest). In mode B a connection through a glass or mirror
+  sphere follows the sphere, and one through a mirror plane follows the plane, unless its faces
+  move differently (then that connection is skipped under a shutter). Several mode A or B
+  cameras rendered together share one forward flight per shutter.
 
 ---
 

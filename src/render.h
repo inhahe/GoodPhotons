@@ -2354,7 +2354,7 @@ struct Renderer {
             for (int i = 0; i < nUp; ++i) {
                 SpecVtx vi = vt; vi.weight = w[i];
                 for (int si : scene.dielSphereIdx) {
-                    const Sphere& S = scene.spheres[(size_t)si];
+                    const Sphere S = scene.sphereNow(scene.spheres[(size_t)si]);
                     const Material& gm = scene.mats[S.matId];
                     const double ng = gm.ior(lam[i]);
                     for (int c = 0; c < nCam; ++c)
@@ -2366,17 +2366,20 @@ struct Renderer {
         }
         // Mirrors. Achromatic geometry, so one solve serves the whole hero bundle.
         for (int si : scene.mirrorSphereIdx) {
-            const Sphere& S = scene.spheres[(size_t)si];
+            const Sphere S = scene.sphereNow(scene.spheres[(size_t)si]);
             for (int c = 0; c < nCam; ++c)
                 if (cams[c].cam && cams[c].film && !cams[c].cam->hasLens())
                     connectSpecularSphereMirror(scene, *cams[c].cam, *cams[c].film, S,
                                                 p, vt, lam, beta, w, nUp, rng);
         }
-        for (const Scene::MirrorPlane& mp : scene.mirrorPlanes)
+        for (const Scene::MirrorPlane& mp0 : scene.mirrorPlanes) {
+            Scene::MirrorPlane mp;
+            if (!scene.mirrorPlaneNow(mp0, mp)) continue;   // members moving differently
             for (int c = 0; c < nCam; ++c)
                 if (cams[c].cam && cams[c].film && !cams[c].cam->hasLens())
                     connectSpecularPlane(scene, *cams[c].cam, *cams[c].film, mp,
                                          p, vt, lam, beta, w, nUp, rng);
+        }
     }
     void camSpecularSplatAllVtx(const Scene& scene, const CamTarget* cams, int nCam,
                                 const Vec3& p, const SpecVtx& vt, double lambda,

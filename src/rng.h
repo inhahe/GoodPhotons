@@ -128,6 +128,17 @@ struct RngSaltScope {
 // The global salt folds into `salt`, not into `k`: `salt` is the per-ESTIMATOR
 // constant, so salting it moves every estimator's stream by the same offset and keeps
 // the families disjoint from one another exactly as they were.
+inline void seedUnit(Pcg32& rng, uint64_t k, uint64_t salt);
+
+// A uniform draw in [0, 1) for unit `k` of the family `salt`, off its own stream: a path's
+// shutter time (ROADMAP 11), drawn without touching the stream the path itself uses, so a render
+// that draws no time draws exactly what it drew before.
+inline double unitTime(uint64_t k, uint64_t salt) {
+    Pcg32 t;
+    seedUnit(t, k, salt);
+    return t.uniform();
+}
+
 inline void seedUnit(Pcg32& rng, uint64_t k, uint64_t salt) {
     salt ^= g_rngSalt;
     rng.seed(mix64(k ^ salt), mix64(k + salt));

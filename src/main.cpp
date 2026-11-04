@@ -15412,11 +15412,20 @@ static void thinFilmSwatch(double n1, double n2) {
 // stratified at any K). The sums are kept for the last four cameras that asked (least
 // recently used evicted), since a render adds the sky to every interval write and a
 // multi-camera render writes its cameras in turn.
-static void addEnvBackgroundLens(Film& film, const Scene& scene, const Camera& cam, long long N) {
+// The same pass UNDER MOTION BLUR (Camera::seesMotion), with or without a lens: the sky behind a
+// moving object shows for the part of the shutter the object leaves it uncovered, so each sample
+// also has a time of its own in the shutter -- a radical inverse in base 3 over k (base 2 already
+// spaces the wavelengths), rotated per pixel -- at which the scene is seen. A pinhole's sample is
+// a ray through a random point of the pixel and the sky's XYZ there: with many samples a pixel
+// takes the sky over its area, where addEnvBackground's one ray takes it at the centre.
+static void addEnvBackgroundSampled(Film& film, const Scene& scene, const Camera& cam, long long N) {
     constexpr double kLo = 360.0, kHi = 830.0;
+    const bool lensed = cam.hasLens(), blur = cam.seesMotion(scene);
     struct Cache {
         const LensSystem* lens = nullptr;
         Vec3 eye, w, u;
+        double shutterOpen = 0.0, shutterClose = 0.0;
+        uint64_t generation = 0;
         int rx = 0, ry = 0;
         long long K = 0;                 // samples per pixel in `sum`
         unsigned long long used = 0;     // last use, for eviction
@@ -15432,7 +15441,9 @@ static void addEnvBackgroundLens(Film& film, const Scene& scene, const Camera& c
         return c.lens == cam.lens.get() && c.rx == rx && c.ry == ry &&
                c.eye.x == cam.eye.x && c.eye.y == cam.eye.y && c.eye.z == cam.eye.z &&
                c.w.x == cam.w.x && c.w.y == cam.w.y && c.w.z == cam.w.z &&
-               c.u.x == cam.u.x && c.u.y == cam.u.y && c.u.z == cam.u.z;
+               c.u.x == cam.u.x && c.u.y == cam.u.y && c.u.z == cam.u.z &&
+               c.shutterOpen == cam.shutterOpen && c.shutterClose == cam.shutterClose &&
+               c.generation == scene.generation;
     };
     Cache* hit = nullptr;
     for (Cache& c : slots) if (same(c)) { hit = &c; break; }
@@ -15442,6 +15453,8 @@ static void addEnvBackgroundLens(Film& film, const Scene& scene, const Camera& c
         for (Cache& c : slots) if (c.used < hit->used) hit = &c;   // an empty slot has used == 0
         hit->lens = cam.lens.get(); hit->rx = rx; hit->ry = ry;
         hit->eye = cam.eye; hit->w = cam.w; hit->u = cam.u;
+        hit->shutterOpen = cam.shutterOpen; hit->shutterClose = cam.shutterClose;
+        hit->generation = scene.generation;
         hit->K = 0;
         hit->sum.assign((size_t)rx * (size_t)ry, Vec3{0, 0, 0});
     }
@@ -15459,10 +15472,29 @@ static void addEnvBackgroundLens(Film& film, const Scene& scene, const Camera& c
                 Pcg32 rot;
                 seedUnit(rot, pix, 0x5EC7A11E5C0FFEEULL);
                 const double off = rot.uniform();
+                const double offT = blur ? rot.uniform() : 0.0;
                 Pcg32 rng;
                 seedUnit(rng, pix, 0xB6C0FFEEULL ^ ((uint64_t)k0 * 0x9E3779B97F4A7C15ULL));
                 Vec3 acc{0, 0, 0};
                 for (long long k = k0; k < k1; ++k) {
+                    double tU = offT;            // radical inverse in base 3, rotated per pixel
+                    if (blur) {
+                        for (double f = 1.0 / 3.0, kk = (double)k; kk >= 1.0; f /= 3.0) {
+                            tU += f * std::fmod(kk, 3.0); kk = std::floor(kk / 3.0);
+                        }
+                        tU -= std::floor(tU);
+                    }
+                    const MotionTimeScope at(blur ? scene.motionU(cam.shutterTime(tU)) : -1.0);
+                    if (!lensed) {
+                        const double jx = rng.uniform(), jy = rng.uniform();
+                        const Ray r = cam.genRay(px, (int)py, jx, jy);
+                        const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false,
+                                                       /*skipCamHidden=*/true);
+                        if (h.valid) continue;
+                        if (haveEnv) acc += scene.envXYZForDir(r.d);
+                        if (haveSun) acc += scene.sunXYZForDir(r.d);
+                        continue;
+                    }
                     double u = off;              // van der Corput in base 2, rotated per pixel
                     for (double f = 0.5, kk = (double)k; kk >= 1.0; f *= 0.5) {
                         const double bit = std::fmod(kk, 2.0);
@@ -15502,7 +15534,7 @@ static void addEnvBackgroundLens(Film& film, const Scene& scene, const Camera& c
 static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, long long N) {
     const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
     if (!haveEnv && !haveSun) return;
-    if (cam.hasLens()) { addEnvBackgroundLens(film, scene, cam, N); return; }
+    if (cam.hasLens() || cam.seesMotion(scene)) { addEnvBackgroundSampled(film, scene, cam, N); return; }
     for (int py = 0; py < film.resY; ++py)
         for (int px = 0; px < film.resX; ++px) {
             Ray r = cam.genRay(px, py, 0.5, 0.5);
@@ -15563,8 +15595,13 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
         Film* sensorFilm = useCamera ? nullptr : &films[tid];
         const Camera* camPtr = useCamera ? cam : nullptr;
         Film* camFilm = useCamera ? &films[tid] : nullptr;
+        // Motion blur (ROADMAP 11): each photon, and its splat to the camera, at one time in the
+        // shutter, drawn off its own stream.
+        const bool blur = cam && cam->seesMotion(scene);
         for (long long i = lo; i < hi; ++i) {
             seedUnit(rng, seedBase + (uint64_t)i, 0x9E3779B97F4A7C15ULL);
+            const MotionTimeScope at(blur ? scene.motionU(cam->shutterTime(
+                unitTime(seedBase + (uint64_t)i, 0x3C6EF372FE94F82BULL))) : -1.0);
             r.tracePhoton(scene, camPtr, sensorFilm, camFilm, rng, reports[tid]);
         }
     };
@@ -15624,8 +15661,15 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
         std::vector<CamTarget> targets(nc);
         for (int c = 0; c < nc; ++c) { targets[c].cam = &cams[c]; targets[c].film = &films[tid][c]; }
+        // One time per photon for every camera: a caller hands this only cameras that share one
+        // shutter or that see nothing move (run's `joinFlight`), so a photon is drawn a time
+        // off cams[0]'s shutter when any of them sees motion.
+        bool blur = false;
+        for (int c = 0; c < nc; ++c) blur = blur || cams[c].seesMotion(scene);
         for (long long i = lo; i < hi; ++i) {
             seedUnit(rng, seedBase + (uint64_t)i, 0x9E3779B97F4A7C15ULL);
+            const MotionTimeScope at(blur ? scene.motionU(cams[0].shutterTime(
+                unitTime(seedBase + (uint64_t)i, 0x3C6EF372FE94F82BULL))) : -1.0);
             r.tracePhoton(scene, targets.data(), nc, /*sensorFilm*/nullptr, rng, reports[tid]);
         }
     };
@@ -18803,6 +18847,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         if (!cudaAvailable()) {
             if (wantGpu) std::fprintf(stderr, "[device] no CUDA device found; using CPU\n");
             else         std::printf("[device] auto -> CPU (no CUDA device found)\n");
+        } else if (cam.seesMotion(scene)) {
+            const char* why = "motion blur (a camera shutter on a moving scene) renders on the CPU so far";
+            if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
+            else         std::printf("[device] auto -> CPU (%s)\n", why);
         } else if (gpuBdptMode) {
             // Modes D and J share this (stricter) GPU support check: BDPT scope only — mode J
             // is the same megakernel with the merges switched on, so anything mode D can run
@@ -18834,11 +18882,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             const bool bwOk = g_whitted
                             ? cudaBackwardWhittedSupported(scene, cam, whittedOpts)
                             : backwardOnGpuOk(scene, cam);
-            const bool blurOnCpu = cam.seesMotion(scene);
-            if (!bwOk || blurOnCpu) {
-                const char* why = blurOnCpu
-                    ? "motion blur (a camera shutter on a moving scene) renders on the CPU so far"
-                    : scene.hasObjectSpacePatterns() ? kObjectSpaceWhy
+            if (!bwOk) {
+                const char* why = scene.hasObjectSpacePatterns() ? kObjectSpaceWhy
                     : g_whitted
                     ? "mode W scene is outside the deterministic GPU scope (-gi, or a "
                       "backward-GPU-unsupported feature)"
@@ -23882,15 +23927,16 @@ static int run(int argc, char** argv) {
             // above): its routed mode, or the mode it falls back to -- before anything below
             // reads the mode (the aperture term is mode B's).
             cmode = resolved[si];
-            // Motion blur reaches mode R (and W) only so far (ROADMAP 11): any other mode renders
-            // the frame's instant, its shutter closed here so no half of it (mode P's backward
-            // part, say) blurs while the rest does not.
-            if (c.seesMotion(scene) && cmode != 'R') {
+            // Motion blur reaches modes R (and W), D, A, B and C so far (ROADMAP 11): a mode whose
+            // estimator shares light data across paths (M, S, U, J), or picks per pixel from a
+            // classification made at the instant (P), renders the frame's instant, its shutter
+            // closed here so no part of it blurs while the rest does not.
+            if (c.seesMotion(scene) && !std::strchr("RDABC", cmode)) {
                 static uint64_t saidFor = 0;   // once per scene, not per frame of a path
                 if (saidFor != scene.generation) {
                     saidFor = scene.generation;
                     std::printf("[motion] camera '%s': mode %c renders the frame's instant -- only "
-                                "mode R (and W) sees motion so far\n", cs->name.c_str(), cmode);
+                                "modes R, W, D, A, B and C see motion so far\n", cs->name.c_str(), cmode);
                 }
                 c.shutterOpen = c.shutterClose = 0.0;
             }
@@ -24278,7 +24324,7 @@ static int run(int argc, char** argv) {
             m.mode = (ci < renderedOf.size() && renderedOf[ci])
                          ? renderedOf[ci]
                          : renderedMode(scene, effModeCam(cs), cs.projection, cs.lens != nullptr);
-            if (m.mode == 'R') { m.cam.shutterOpen = cs.shutterOpen; m.cam.shutterClose = cs.shutterClose; }
+            if (std::strchr("RDABC", m.mode)) { m.cam.shutterOpen = cs.shutterOpen; m.cam.shutterClose = cs.shutterClose; }
             if (cs.lens) { m.cam.lens = cs.lens; m.cam.prepareLensPupil(); }
             m.name = cs.name;
             return m;
@@ -26958,6 +27004,8 @@ static int run(int argc, char** argv) {
         const long long meterN   = std::clamp((long long)W * H * 40LL, 500000LL, 4000000LL);
         const long long meterSpp = 16;
         const char mode = mc.mode;      // already the rendered mode (renderedMode)
+        // The device renders the instant only, so a blurred frame meters on the CPU, as it renders.
+        const bool onDevice = meterGpu && !mc.cam.seesMotion(scene);
         Film mf; double eAuto = 0.0;
         switch (mode) {
             case 'A': case 'B': case 'C': {
@@ -26965,7 +27013,7 @@ static int run(int argc, char** argv) {
                 // renderForward self-gates on cudaForwardSupported and falls back to CPU.
                 mf = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
                                    /*forwardCatch*/mode == 'C', /*lensMode*/mode == 'A',
-                                   /*useCamera*/true, e, diffraction, /*useGpu*/meterGpu);
+                                   /*useCamera*/true, e, diffraction, /*useGpu*/onDevice);
                 // Mode C's film already holds the sky: its env photons thread the pupil and are
                 // caught. The render gates this pass on !forwardCatch; the meter did not, and so
                 // metered C's sky twice (0.370.0).
@@ -26976,7 +27024,7 @@ static int run(int argc, char** argv) {
             case 'R': {
                 bool onGpu = false;
 #ifdef HAVE_CUDA
-                if (meterGpu && backwardOnGpuOk(scene, mc.cam)) {
+                if (onDevice && backwardOnGpuOk(scene, mc.cam)) {
                     mf = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
                                             g_maxBounceOverride, g_directOnly, g_heroC);
                     onGpu = true;
@@ -26995,7 +27043,7 @@ static int run(int argc, char** argv) {
             case 'D': case 'J': {
                 bool onGpu = false;
 #ifdef HAVE_CUDA
-                if (meterGpu && cudaBdptSupported(scene)) {
+                if (onDevice && cudaBdptSupported(scene)) {
                     mf = renderBdptCuda(scene, mc.cam, W, H, meterSpp, /*maxDepth*/8, diffraction);
                     onGpu = true;
                 }
@@ -27053,11 +27101,11 @@ static int run(int argc, char** argv) {
                 CompositeClass cc = classifyComposite(scene, mc.cam, W, H);
                 EnergyReport e;
                 Film fwd = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
-                                         false, false, true, e, diffraction, meterGpu);
+                                         false, false, true, e, diffraction, onDevice);
                 Film ref;
                 bool refGpu = false;
 #ifdef HAVE_CUDA
-                if (meterGpu && backwardOnGpuOk(scene, mc.cam)) {
+                if (onDevice && backwardOnGpuOk(scene, mc.cam)) {
                     ref = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
                                              g_maxBounceOverride, g_directOnly, g_heroC);
                     refGpu = true;
@@ -27073,7 +27121,7 @@ static int run(int argc, char** argv) {
             default: {   // S/U/V and any future mode: general forward mode-B light-trace
                 EnergyReport e;
                 mf = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
-                                   false, false, true, e, diffraction, meterGpu);
+                                   false, false, true, e, diffraction, onDevice);
                 addEnvBackground(mf, scene, mc.cam, meterN);
                 eAuto = autoExposureOf(filmToLinear(mf, (double)meterN));
                 break;
@@ -27292,7 +27340,20 @@ static int run(int argc, char** argv) {
         for (const RenderCam& rc : toRender)
             if (rc.mode == 'M' && rc.cam.hasLens()) budgetedGpuM = false;
 #endif
-    std::vector<int> groupB, groupA, groupM, restIdx;
+    // Shared forward flights, mode B's and mode A's. A flight draws one shutter time per photon for
+    // all its cameras, so cameras share one only when they share a shutter, or when neither sees
+    // anything move: one flight per shutter.
+    std::vector<std::vector<int>> groupsB, groupsA;
+    auto joinFlight = [&](std::vector<std::vector<int>>& flights, int i) {
+        const Camera& c = toRender[(size_t)i].cam;
+        for (std::vector<int>& f : flights) {
+            const Camera& c0 = toRender[(size_t)f[0]].cam;
+            if ((c.shutterOpen == c0.shutterOpen && c.shutterClose == c0.shutterClose) ||
+                (!c.seesMotion(scene) && !c0.seesMotion(scene))) { f.push_back(i); return; }
+        }
+        flights.push_back({i});
+    };
+    std::vector<int> groupM, restIdx;
     bool mModeBudgeted = false;   // a mode-M camera dropped from groupM by the budget test
     for (int i = 0; i < (int)toRender.size(); ++i) {
         const RenderCam& rc = toRender[i];
@@ -27303,8 +27364,8 @@ static int run(int argc, char** argv) {
         // exposure-locked camera_path animation is still rendered un-shared so its frames
         // don't all carry the same fixed noise realisation).
         bool base = (rc.expGroup < 0);
-        if (base && rc.mode == 'B')                                           groupB.push_back(i);
-        else if (base && rc.mode == 'A' && rc.cam.projection == CAM_RECTILINEAR) groupA.push_back(i);
+        if (base && rc.mode == 'B')                                           joinFlight(groupsB, i);
+        else if (base && rc.mode == 'A' && rc.cam.projection == CAM_RECTILINEAR) joinFlight(groupsA, i);
         // Mode M (photon map): the map is view-INDEPENDENT, so build it once and gather
         // every camera from it — the flythrough win. Unlike A/B sharing (which reuses one
         // photon *flight* and so imposes the same fixed noise on every frame), the mode-M
@@ -27367,10 +27428,15 @@ static int run(int argc, char** argv) {
     // path (models A/B still get the GPU there via renderForwardCuda).
     // ... and that fold-back is exactly where -beams stops applying, so say so rather than
     // no-op silently (see warnBeamsNeedsCameras).
-    if (groupB.size() < 2) { warnBeamsNeedsCameras(scene, g_beamGather, 'B', (int)groupB.size());
-                             for (int i : groupB) restIdx.push_back(i); groupB.clear(); }
-    if (groupA.size() < 2) { warnBeamsNeedsCameras(scene, g_beamGather, 'A', (int)groupA.size());
-                             for (int i : groupA) restIdx.push_back(i); groupA.clear(); }
+    for (auto* flights : {&groupsB, &groupsA}) {
+        const char m = (flights == &groupsB) ? 'B' : 'A';
+        for (std::vector<int>& f : *flights)
+            if (f.size() < 2) {
+                warnBeamsNeedsCameras(scene, g_beamGather, m, (int)f.size());
+                for (int i : f) restIdx.push_back(i);
+                f.clear();
+            }
+    }
     // Mode M is different: the per-camera fallback is CPU-only, so the shared photon-map path
     // is the ONLY GPU route for mode M and it handles a single camera fine. Keep even one
     // plain mode-M camera here so `-camera #N`/`near=`/name can aim the live window at one
@@ -27420,6 +27486,20 @@ static int run(int argc, char** argv) {
 
         const bool progressive   = timeBudgetSec > 0.0 || runForever || noiseTarget > 0.0;
         const bool wantCheckpoint = resume || progressive || wantCheckpointFlag;
+        // The device renders the instant only, so a flight in which any camera sees motion flies
+        // on the CPU (ROADMAP 11).
+        bool groupGpu = false;
+#ifdef HAVE_CUDA
+        groupGpu = useGpuForward;
+        if (groupGpu && std::any_of(cams.begin(), cams.end(),
+                                    [&](const Camera& c) { return c.seesMotion(scene); })) {
+            groupGpu = false;
+            const char* why = "motion blur (a camera shutter on a moving scene) renders on the CPU so far";
+            if (!std::strcmp(device, "gpu")) std::fprintf(stderr, "[device] %s; using CPU\n", why);
+            else                             std::printf("[device] auto -> CPU (%s)\n", why);
+        }
+#endif
+        (void)groupGpu;
 
         // Resume: load every camera's sidecar. A shared flight can only resume as a whole
         // (all cameras must be at the same photon count), so any missing / mismatched /
@@ -27450,13 +27530,13 @@ static int run(int argc, char** argv) {
 
         const std::string backend =
 #ifdef HAVE_CUDA
-            useGpuForward ? std::string(cudaDeviceName()) :
+            groupGpu ? std::string(cudaDeviceName()) :
 #endif
             (std::to_string(nThreads) + " CPU threads");
         // The shared group never passes through runRender, whose device stamp is the only
         // other one -- so without this a whole shared flight ran with no device on the title.
 #ifdef HAVE_CUDA
-        g_windowBackend = backendLabel(useGpuForward, nThreads);
+        g_windowBackend = backendLabel(groupGpu, nThreads);
 #else
         g_windowBackend = backendLabel(false, nThreads);
 #endif
@@ -27475,7 +27555,7 @@ static int run(int argc, char** argv) {
         // multi-camera groups). Films/energy are downloaded only when the host actually
         // needs them (syncAcc: interval writes, window refresh, final). On -resume the
         // checkpoint films seed the device accumulators so downloads are full totals.
-        SharedGpuSession* gses = useGpuForward
+        SharedGpuSession* gses = groupGpu
             ? sharedForwardGpuBegin(scene, cams, rxs, rys, groupMode, wavefront, g_heroC,
                                     g_beamGather, (accN > 0) ? &acc : nullptr,
                                     (accN > 0) ? &accE : nullptr)
@@ -27704,8 +27784,8 @@ static int run(int argc, char** argv) {
                         accE.absorbed / accE.emitted, accE.sensor / accE.emitted, accE.escaped / accE.emitted,
                         accE.residual / accE.emitted, tot / accE.emitted);
     };
-    runSharedGroup(groupB, 'B');
-    runSharedGroup(groupA, 'A');
+    for (const std::vector<int>& f : groupsB) runSharedGroup(f, 'B');
+    for (const std::vector<int>& f : groupsA) runSharedGroup(f, 'A');
 
     // Shared photon-map pass (mode M): build ONE view-independent map, gather every
     // camera from it. This is where the photon map pays off over per-camera backward
