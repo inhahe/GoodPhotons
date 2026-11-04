@@ -6898,13 +6898,13 @@ private:
             else if (s.key == "isosurface") { if (!child(*cb, [&] { return addIsosurface(*cb, L, world); })) return false; }
             else if (s.key == "curve")    { if (!child(*cb, [&] { return addCurve(*cb, L, world); })) return false; }
             else if (s.key == "light") {
-                if (moving) stillWarning("a light");
                 const PrimMark lm = primMark(L);
                 if (!addLight(*cb, L, (cb->type == "light" ? std::string() : cb->type), world)) return false;
                 if (patFrame_ >= 0) {   // its panel and its emission pattern read the group's space
                     for (size_t i = lm.tris; i < L.scene.tris.size(); ++i) L.scene.tris[i].patFrame = patFrame_;
                     for (size_t i = lm.emitters; i < L.scene.emitters.size(); ++i) L.scene.emitters[i].patFrame = patFrame_;
                 }
+                if (moving) movers.push_back({lm, primMark(L)});   // its panel and its light move
                 haveLight = true;
             }
             else if (s.key == "group")    { if (!routed(*cb, L, [&] { return addGroup(*cb, L, world, haveLight); })) return false; }
@@ -6946,10 +6946,21 @@ private:
         // instances.
         std::vector<std::pair<size_t, size_t>> tris, sphs, imps, segs, insts;
         Aabb box;
+        // A child that adds lights moves only if they all can: no sky or sun (they are not
+        // anywhere), no aimed panel, and -- known once the keys are made, below -- rigid keys.
+        std::vector<std::pair<PrimMark, PrimMark>> lit;   // children with lights, not yet moved
         for (const auto& [a, z] : movers) {
             if (z.emitters > a.emitters) {
-                // Its light is sampled from where it sits at the instant, so it must stay there.
-                stillWarning("an emissive surface");
+                bool can = true;
+                for (size_t i = a.emitters; i < z.emitters; ++i) {
+                    const Emitter& e = S.emitters[i];
+                    if (e.shape == EmitterShape::Env || e.shape == EmitterShape::Sun) {
+                        stillWarning("a sun or sky light"); can = false;
+                    } else if (e.normalTilted) {
+                        stillWarning("an aimed area light"); can = false;
+                    }
+                }
+                if (can) lit.push_back({a, z});
                 continue;
             }
             if (z.tris > a.tris) tris.push_back({a.tris, z.tris});
@@ -6974,7 +6985,18 @@ private:
                 }
             }
         }
-        if (tris.empty() && sphs.empty() && imps.empty() && segs.empty() && insts.empty()) return true;
+        for (const auto& [a, z] : lit) {   // their extent shapes the keys like any other mover's
+            for (size_t i = a.tris; i < z.tris; ++i) {
+                box.expand(S.tris[i].v0); box.expand(S.tris[i].v1); box.expand(S.tris[i].v2);
+            }
+            for (size_t i = a.spheres; i < z.spheres; ++i) {
+                const Sphere& s = S.spheres[i];
+                box.expand(s.c - Vec3{s.r, s.r, s.r}); box.expand(s.c + Vec3{s.r, s.r, s.r});
+            }
+            for (size_t i = a.emitters; i < z.emitters; ++i) box.expand(S.emitters[i].origin);
+        }
+        if (tris.empty() && sphs.empty() && imps.empty() && segs.empty() && insts.empty() && lit.empty())
+            return true;
         if (std::fabs(instant.det()) < 1e-30) {
             fail("a moving group's transform is singular (zero scale) at the frame's instant, so "
                  "its children cannot be built there: keep the scale off zero at time 0");
@@ -7080,6 +7102,32 @@ private:
         for (const auto& [a, z] : imps) for (size_t i = a; i < z; ++i) S.implicits[i].motion = set;
         for (const auto& [a, z] : segs) for (size_t i = a; i < z; ++i) S.curveSegs[i].motion = set;
         for (const auto& [a, z] : insts) for (size_t i = a; i < z; ++i) S.instances[i].motion = set;
+        // Lights move only rigidly, so that every length, area and angle of them stands and each
+        // is sampled where it sits at the instant (Scene::lightPointNow): with keys that scale or
+        // shear, a child that adds lights stays at the instant, its surfaces with it.
+        bool rigid = true;
+        for (const Affine& w : kw) {
+            for (int r = 0; r < 3 && rigid; ++r)
+                for (int c = 0; c < 3 && rigid; ++c) {
+                    double d = 0.0;   // (M^T M)[r][c]
+                    for (int k = 0; k < 3; ++k) d += w.m[k * 3 + r] * w.m[k * 3 + c];
+                    if (std::fabs(d - (r == c ? 1.0 : 0.0)) > 1e-9) rigid = false;
+                }
+            if (!rigid) break;
+        }
+        if (!lit.empty() && !rigid && stillWarned_.insert("a light scaled").second)
+            std::fprintf(stderr, "[ftsl] warning: a light in a moving group whose keys scale or shear it "
+                                 "stays where it is at the frame's instant, with its surface -- a light "
+                                 "moves only rigidly (ROADMAP 11)\n");
+        for (const auto& [a, z] : lit) {
+            if (!rigid) continue;
+            for (size_t i = a.tris; i < z.tris; ++i) S.tris[i].motion = set;
+            for (size_t i = a.spheres; i < z.spheres; ++i) S.spheres[i].motion = set;
+            for (size_t i = a.implicits; i < z.implicits; ++i) S.implicits[i].motion = set;
+            for (size_t i = a.curveSegs; i < z.curveSegs; ++i) S.curveSegs[i].motion = set;
+            for (size_t i = a.instances; i < z.instances; ++i) S.instances[i].motion = set;
+            for (size_t i = a.emitters; i < z.emitters; ++i) S.emitters[i].motion = set;
+        }
         return true;
     }
 

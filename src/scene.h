@@ -1030,6 +1030,10 @@ struct Emitter {
     // The pattern frame its emission pattern is read in (Scene::patFrames), or -1: world space --
     // the frame its triangles' hits read theirs in, so a light sampled and a light hit agree.
     int patFrame = -1;
+    // Its motion set (Scene::motionSets), or -1: it holds still. A light moves only rigidly (the
+    // loader keeps one its keys would scale or shear at the instant), so every length, area and
+    // angle of it stands at every time (Scene::lightPointNow and its kin).
+    int motion = -1;
     // Index into Scene::mats of the emissive material on this light's GEOMETRY
     // (area/sphere lights add both an emitter and a matching emissive surface), or
     // -1 for lights with no geometry (spot/env/collimated). BDPT needs this to map a
@@ -1821,6 +1825,21 @@ struct Scene {
         h.pscale = std::sqrt(f2) * h.pscale + length(D.t);
         h.motionSet = set;
     }
+    // A light as the current path sees it. It moves only rigidly (Emitter::motion), so it is
+    // sampled where it sits at the instant -- a shading point carried there first -- and the
+    // sample carried out: points by its motion at the path's time, directions and normals by
+    // that motion's rotation. Each is the identity for a still light or a path without a time.
+    bool lightMoves(const Emitter& em) const { return em.motion >= 0 && g_motionU >= 0.0; }
+    Vec3 lightPointNow(const Emitter& em, const Vec3& p) const {
+        return lightMoves(em) ? motionNow(em.motion).apply(p) : p;
+    }
+    Vec3 lightDirNow(const Emitter& em, const Vec3& d) const {
+        return lightMoves(em) ? motionNow(em.motion).applyDir(d) : d;
+    }
+    Vec3 lightPointThen(const Emitter& em, const Vec3& p) const {   // into the instant
+        return lightMoves(em) ? motionNowInverse(em.motion).apply(p) : p;
+    }
+
     // A moving isosurface. Its march steps in distance along a unit direction, so the ray carried
     // back is renormalised and its parameters scaled to match (k: instant length per unit t).
     FT_NOINLINE bool intersectMovingImplicit(const Ray& r, const Implicit& im, double tmin, Hit& h,
@@ -3304,41 +3323,82 @@ struct Scene {
         return true;
     }
 
+    // The light tree a path with a time walks when a light moves (ROADMAP 11): each moving light
+    // bounded over its whole motion and its normals over every direction, since the traversal may
+    // give a light probability zero exactly where its bounds prove it dark. `built` only when a
+    // light moves; every other query walks the instant's tree above, so a render without a
+    // shutter selects its lights exactly as the still scene does.
+    struct LightTreeTimed {
+        std::vector<LightTreeNode> nodes;
+        std::vector<int> always, parent, leaf;
+        int root = -1;
+        bool built = false;
+    };
+    LightTreeTimed lightTreeTimed;
+
     void buildLightTree() {
-        lightTree.clear();
-        lightTreeAlways.clear();
-        lightTreeParent.clear();
-        lightTreeLeaf.clear();
-        lightTreeRoot = -1;
+        buildLightTreeInto(false, lightTree, lightTreeAlways, lightTreeParent, lightTreeLeaf, lightTreeRoot);
+        lightTreeTimed = LightTreeTimed{};
+        for (const Emitter& e : emitters) lightTreeTimed.built = lightTreeTimed.built || e.motion >= 0;
+        if (lightTreeTimed.built)
+            buildLightTreeInto(true, lightTreeTimed.nodes, lightTreeTimed.always, lightTreeTimed.parent,
+                               lightTreeTimed.leaf, lightTreeTimed.root);
+    }
+    // Build one light tree into the given arrays; `timed` bounds a moving light over its motion.
+    void buildLightTreeInto(bool timed, std::vector<LightTreeNode>& tree, std::vector<int>& always,
+                            std::vector<int>& parent, std::vector<int>& leaf, int& root) const {
+        tree.clear();
+        always.clear();
+        parent.clear();
+        leaf.clear();
+        root = -1;
         std::vector<LtEmitterBound> items;
         items.reserve(emitters.size());
         for (size_t i = 0; i < emitters.size(); ++i) {
             LtEmitterBound b{};
-            if (lightTreeBoundOf(emitters[i], (int)i, b)) items.push_back(b);
-            else if (emitters[i].shape != EmitterShape::Env)
-                lightTreeAlways.push_back((int)i);    // suns / beams: always connected
+            if (lightTreeBoundOf(emitters[i], (int)i, b)) {
+                if (timed && emitters[i].motion >= 0) sweepLightBound(emitters[i], b);
+                items.push_back(b);
+            } else if (emitters[i].shape != EmitterShape::Env)
+                always.push_back((int)i);    // suns / beams: always connected
         }
         // One tree-eligible emitter is not worth a tree — the traversal would just
         // return it with pdf 1 after burning a stack push, and keeping the old path
         // there is what preserves bit-identical single-light images.
         if (items.size() < 2) {
-            for (const auto& b : items) lightTreeAlways.push_back(b.emitter);
-            std::sort(lightTreeAlways.begin(), lightTreeAlways.end());
+            for (const auto& b : items) always.push_back(b.emitter);
+            std::sort(always.begin(), always.end());
             return;
         }
-        lightTreeRoot = ltBuild(items, lightTree);
-        std::sort(lightTreeAlways.begin(), lightTreeAlways.end());
+        root = ltBuild(items, tree);
+        std::sort(always.begin(), always.end());
         // The reverse indices. A leaf's `emitter` is its own key, so both fall out of one
         // pass with no extra bookkeeping in the recursive builder.
-        lightTreeParent.assign(lightTree.size(), -1);
-        lightTreeLeaf.assign(emitters.size(), -1);
-        for (size_t i = 0; i < lightTree.size(); ++i) {
-            const LightTreeNode& nd = lightTree[i];
-            if (nd.left  >= 0) lightTreeParent[(size_t)nd.left]  = (int)i;
-            if (nd.right >= 0) lightTreeParent[(size_t)nd.right] = (int)i;
-            if (nd.emitter >= 0 && (size_t)nd.emitter < lightTreeLeaf.size())
-                lightTreeLeaf[(size_t)nd.emitter] = (int)i;
+        parent.assign(tree.size(), -1);
+        leaf.assign(emitters.size(), -1);
+        for (size_t i = 0; i < tree.size(); ++i) {
+            const LightTreeNode& nd = tree[i];
+            if (nd.left  >= 0) parent[(size_t)nd.left]  = (int)i;
+            if (nd.right >= 0) parent[(size_t)nd.right] = (int)i;
+            if (nd.emitter >= 0 && (size_t)nd.emitter < leaf.size())
+                leaf[(size_t)nd.emitter] = (int)i;
         }
+    }
+    // A moving light's bound over its whole motion: its box carried by every key (it moves
+    // linearly between keys, so their boxes hold it) and normals that may point anywhere.
+    void sweepLightBound(const Emitter& e, LtEmitterBound& b) const {
+        const MotionKeys& mk = motionSets[(size_t)e.motion];
+        Aabb box;
+        for (int c = 0; c < 8; ++c) {
+            const Vec3 p{(c & 1) ? b.bmax[0] : b.bmin[0], (c & 2) ? b.bmax[1] : b.bmin[1],
+                         (c & 4) ? b.bmax[2] : b.bmin[2]};
+            box.expand(p);
+            for (int k = 0; k < mk.keys; ++k) box.expand(motionXf[(size_t)(mk.first + k)].apply(p));
+        }
+        b.bmin[0] = box.lo.x; b.bmin[1] = box.lo.y; b.bmin[2] = box.lo.z;
+        b.bmax[0] = box.hi.x; b.bmax[1] = box.hi.y; b.bmax[2] = box.hi.z;
+        b.cosThetaO = -1.0;
+        b.axis[0] = 0.0; b.axis[1] = 0.0; b.axis[2] = 1.0;
     }
 
     // Select an emitter index for the power-weighted CDF. For a single emitter
@@ -4866,13 +4926,21 @@ inline double emitterPatMulAt(const Scene& scene, const Emitter& em,
 // write `Le = em.spdFn(lambda) * invPdfLambda * pmul`. 1.0 whenever no pattern is bound,
 // which is every scene that does not use the feature — those keep bit-identical draws
 // (samplePoint's uv outputs are the only extra work and they do not touch the RNG).
+// A moving light is sampled where it sits at the instant -- its pattern read there, where it
+// travels with the light -- and the point carried out (Scene::lightPointNow).
 inline double emitterSamplePoint(const Scene& scene, const Emitter& em,
                                  double u1, double u2, Vec3& y, Vec3& nOut) {
-    if (em.emitPat < 0) { em.samplePoint(u1, u2, y, nOut); return 1.0; }
-    double uu = 0.0, vv = 0.0;
-    double reach = 0.0;
-    em.samplePoint(u1, u2, y, nOut, &uu, &vv, &reach);
-    return emitterPatMulAt(scene, em, y, nOut, uu, vv, reach);
+    double pmul = 1.0;
+    if (em.emitPat < 0) {
+        em.samplePoint(u1, u2, y, nOut);
+    } else {
+        double uu = 0.0, vv = 0.0;
+        double reach = 0.0;
+        em.samplePoint(u1, u2, y, nOut, &uu, &vv, &reach);
+        pmul = emitterPatMulAt(scene, em, y, nOut, uu, vv, reach);
+    }
+    if (scene.lightMoves(em)) { y = scene.lightPointNow(em, y); nOut = scene.lightDirNow(em, nOut); }
+    return pmul;
 }
 
 // Evaluate a bound scalar pattern at the hit (index checked). Returns the pattern

@@ -2744,13 +2744,14 @@ struct Renderer {
             // Point spot: sample a direction uniformly in the outer cone, then
             // reweight beta by falloff*(Omega_outer/Omega_eff) so the emitted
             // distribution matches the smoothstep intensity profile (analog MC).
-            origin = em.origin;
+            origin = scene.lightPointNow(em, em.origin);
             double ct = em.spotCosOuter + u1 * (1.0 - em.spotCosOuter);
             double st = std::sqrt(std::max(0.0, 1.0 - ct * ct));
             double phi = 2.0 * PI * u2;
             Vec3 t, b; onb(em.beamDir, t, b);
-            dir = t * (st * std::cos(phi)) + b * (st * std::sin(phi)) + em.beamDir * ct;
-            emitN = em.beamDir;
+            dir = scene.lightDirNow(em, t * (st * std::cos(phi)) + b * (st * std::sin(phi)) +
+                                        em.beamDir * ct);
+            emitN = scene.lightDirNow(em, em.beamDir);
             double omegaOuter = 2.0 * PI * (1.0 - em.spotCosOuter);
             spotW = spotFalloff(ct, em.spotCosInner, em.spotCosOuter) * omegaOuter / em.spotOmega;
         } else if (em.shape == EmitterShape::Env) {
@@ -2805,7 +2806,7 @@ struct Renderer {
             // returns this point's `emit pattern:` factor — 1.0 (and a bit-identical
             // call) when the emitter carries no pattern.
             emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN);
-            if (em.collimated) dir = em.beamDir;
+            if (em.collimated) dir = scene.lightDirNow(em, em.beamDir);
             else if (em.normalTilted) {             // an aimed quad: intensity-proportional
                 double pdfAim = 0.0;
                 dir = em.sampleAimDir(rng, pdfAim);
@@ -3714,13 +3715,14 @@ struct Renderer {
         double envPdfW = 0.0;
         double emitPatW = 1.0;                   // `emit pattern:` factor at the sampled point
         if (em.shape == EmitterShape::Spot) {
-            origin = em.origin;
+            origin = scene.lightPointNow(em, em.origin);
             double ct = em.spotCosOuter + u1 * (1.0 - em.spotCosOuter);
             double st = std::sqrt(std::max(0.0, 1.0 - ct * ct));
             double phi = 2.0 * PI * u2;
             Vec3 t, b; onb(em.beamDir, t, b);
-            dir = t * (st * std::cos(phi)) + b * (st * std::sin(phi)) + em.beamDir * ct;
-            emitN = em.beamDir;
+            dir = scene.lightDirNow(em, t * (st * std::cos(phi)) + b * (st * std::sin(phi)) +
+                                        em.beamDir * ct);
+            emitN = scene.lightDirNow(em, em.beamDir);
             double omegaOuter = 2.0 * PI * (1.0 - em.spotCosOuter);
             spotW = spotFalloff(ct, em.spotCosInner, em.spotCosOuter) * omegaOuter / em.spotOmega;
         } else if (em.shape == EmitterShape::Env) {
@@ -3757,7 +3759,7 @@ struct Renderer {
             emitN = dir;
         } else {
             emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN);
-            if (em.collimated) dir = em.beamDir;
+            if (em.collimated) dir = scene.lightDirNow(em, em.beamDir);
             else if (em.normalTilted) {             // an aimed quad -- see the scalar tracer
                 double pdfAim = 0.0;
                 dir = em.sampleAimDir(rng, pdfAim);

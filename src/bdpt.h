@@ -1950,12 +1950,13 @@ inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Render
         pdfPos = sunOriginPdf(scene, em, x, y) / dot(dir, em.beamDir);   // per area across the ray
         if (!(pdfPos > 0.0)) return 0;
     } else {
-        org = em.origin;
+        org = scene.lightPointNow(em, em.origin);
     }
     // Spot: the smoothstep penumbra scales the emitted intensity. Sun: no falloff.
     double fall = isSun ? 1.0
                         : spotFalloff(dot(dir, em.beamDir), em.spotCosInner, em.spotCosOuter);
     if (fall <= 0.0) return 0;
+    dir = scene.lightDirNow(em, dir);                 // a moving spot turns its cone
     double Le = em.spdFn(lambda) * invPdfLambda * fall;
     double LeSec[hero::kHeroMax - 1] = {0};
     double mxLe = Le;
@@ -3710,13 +3711,14 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             if (em.shape == EmitterShape::Spot) {
                 // Point spot: the connection point is deterministic (delta position); the
                 // smoothstep penumbra weights the intensity toward this receiver.
-                Vec3 toL = em.origin - pt.p; double dist2 = dot(toL, toL);
+                y = scene.lightPointNow(em, em.origin);
+                Vec3 toL = y - pt.p; double dist2 = dot(toL, toL);
                 if (dist2 <= 0.0) return 0.0;
                 dist = std::sqrt(dist2); wi = toL / dist;
-                double fall = spotFalloff(dot(wi * -1.0, em.beamDir),
+                double fall = spotFalloff(dot(wi * -1.0, scene.lightDirNow(em, em.beamDir)),
                                           em.spotCosInner, em.spotCosOuter);
                 if (fall <= 0.0) return 0.0;           // outside the cone
-                y = em.origin; nOut = wi * -1.0;
+                nOut = wi * -1.0;
                 Wgeom = fall / (dist2 * pdfChoice);    // spdFn is an INTENSITY (W/sr)
             } else if (em.shape == EmitterShape::Sun) {
                 // Distant sun: sample a direction inside the solar cone (pdfW = 1/Omega) and

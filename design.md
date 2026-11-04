@@ -10058,9 +10058,22 @@ sees the instant, exactly as a static scene with those transforms would show it.
   meter asks the same helper. The device renders the instant only, so `runRender`'s device
   choice, `renderForward`'s own device gate, the shared forward group and the exposure meter
   keep a blurred camera on the CPU (`kMotionCpuWhy`), and `-radcache` is off under a blur. What cannot move yet stays put and
-  says so (`stillWarning`): registered emitters (an emissive mesh: light sampling reads the
-  instant) and lights in a moving group stay at the instant, so nothing mixes a moved surface
-  with an unmoved sampler. Keys are made after a group's children are built (`moveChildren`), so the
+  says so (`stillWarning`): a sun or sky, an aimed area light, and any light whose keys would
+  scale or shear it stay at the instant with their surfaces, so nothing mixes a moved surface
+  with an unmoved sampler.
+- **Lights move rigidly** (0.410.0; `Emitter::motion`). Rigid motion keeps every length, area and
+  angle of a light, so each sampler runs where the light sits at the instant and only its inputs
+  and outputs are carried: `emitterSamplePoint` carries its point and normal out
+  (`Scene::lightPointNow`, `lightDirNow`); a sphere's cone and a tube's visible arc are sampled
+  toward the shading point carried in (`lightPointThen`) and their outputs carried out; a spot's
+  origin and axis are carried, and its sampled emission direction turned after its falloff is
+  read in the instant's frame. Every density (area, solid angle, selection) is unchanged, so the
+  MIS weights stay exact. The light tree can give a light probability zero where its bounds
+  prove it dark, so a path with a time walks a second tree (`Scene::lightTreeTimed`) in which a
+  moving light's box holds its every key and its normals may point anywhere; the instant's tree
+  serves every other query, so a render without a shutter selects as the still scene does.
+  `moveChildren` keys a child's lights with its surfaces once the keys are known rigid
+  (MᵀM = I for every key's linear part). Keys are made after a group's children are built (`moveChildren`), so the
   refinement tolerance is 1e-3 of the movers' own bounding-box diagonal, in metres, measured on
   its corners; each stretch between breaks is first cut to turn at most 90° (so a whole turn
   cannot hide between two keys whose blend equals the midpoint), and the key budget is spent a

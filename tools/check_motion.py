@@ -29,7 +29,9 @@ cube whose keys scale and shear it together. It requires:
   * `-checkbvh` passes on a scene of moving triangles, spheres, isosurfaces, curves and mesh
     instances -- every other ray at a random time, so the swept bounds are held to the moved
     primitives. An isosurface, a curve and an instance in a group that moves, turns and grows,
-    held sharp at two times, render as the static group written out there.
+    held sharp at two times, render as the static group written out there; so does a group of
+    lights that moves and turns (an area panel, a glowing ball, a spot, a tube, an emissive
+    triangle), in modes R, B and D.
   * A ball whose sweep runs far past the instant's bounding sphere is lit by the sky (mode B) and
     by a low sun (mode B), and shadows the floor in that sun (mode D), as in blurred mode R. A
     shared flight resumes its own shutter's sidecar and refuses one rendered with another.
@@ -49,8 +51,9 @@ cube whose keys scale and shear it together. It requires:
   * The loader refuses, with a message naming why: a `motion` block with no `motion_interval`; one
     with a single key; `translate` beside `motion`; fur on, or a medium bounded by, a moving
     object; an interval that excludes the instant; `shutter_close` before `shutter_open`. It keeps
-    an emissive mesh in a moving group at the instant, saying so -- and a render held sharp late
-    in the shutter shows it there while its sibling balls (one an isosurface) have moved -- and builds
+    an aimed area light in a moving group, and a light its keys scale, at the instant, saying so --
+    and a render held sharp late in the shutter shows the aimed light there while its sibling
+    balls (one an isosurface) have moved -- and builds
     a sphere its keys stretch as a mesh, as it does one an uneven static scale stretches.
 Exits 1 on any failure.
 """
@@ -237,14 +240,47 @@ def reach_scene(light, shutter=(-0.5, 0.5)):
     ]) + NL
 
 
+# A group that moves and turns (rigidly, as a light must), holding an area panel, a glowing ball,
+# a spot, a tube and an emissive triangle.
+LIGHTS = [dict(translate=(-0.5, 1.7, 0.0), rotate=(0, -30, 0)),
+          dict(translate=(0.5, 1.5, 0.2), rotate=(0, 40, 10))]
+
+
+def lights_scene(obj, u=None, shutter=None):
+    """The LIGHTS group in the box, moving, or held at u: it lights the box alone."""
+    cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
+    body = ("light area { origin -0.15 0 -0.15  u 0.3 0 0  v 0 0 0.3  normal 0 -1 0  "
+            "spd preset:bb6500  power 25 }  "
+            "light sphere { center 0.45 -0.1 0  radius 0.06  spd preset:bb5000  power 12 }  "
+            "light spot { origin -0.45 0 0  dir 0.4 -1 0.2  inner_angle 15  outer_angle 30  "
+            "spd preset:bb6500  power 12 }  "
+            "light cylinder { center 0 -0.2 -0.3  axis 1 0 0  length 0.4  radius 0.02  "
+            "spd preset:bb4000  power 8 }  "
+            'mesh "glow_tri" { file "%s"  material glow  translate 0.1 -0.3 0.35  rotate 90 0 0  scale 1.5 }'
+            % obj)
+    return NL.join([
+        "scene { units meters  motion_interval -0.5 0.5 }",
+        'material "white" { type diffuse reflect 0.7 }',
+        'material "red"   { type diffuse reflect rgb 0.7 0.15 0.1 }',
+        'material "glow"  { type diffuse reflect 0.0  emit blackbody 5200 }',
+        "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }",
+        "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material white }",
+        "quad { origin -2 0 -2  u 0 3 0  v 0 0 4  material red }",
+        "group { %s  %s }" % (xf(LIGHTS, u, 1.0), body),
+        'camera "c" { eye 0 1.0 4.2  look_at 0 0.7 0  up 0 1 0  fov_y 45  %sfilm { res %d %d } }'
+        % (cam, W, H),
+    ]) + NL
+
+
 def still_scene(obj, u=None, shutter=None):
-    """A moving group holding a ball, an isosurface ball and an emissive triangle: the two balls
-    move, the triangle stays at the instant. With `u`, the static equivalent: the balls held at u
-    and the triangle at the instant (u = 0.5)."""
+    """A moving group holding a ball, an isosurface ball and an aimed area light: the two balls
+    move, the light (which cannot) stays at the instant. With `u`, the static equivalent: the
+    balls held at u and the light at the instant (u = 0.5)."""
     keys = [dict(translate=(-0.6, 0.45, 0.2)), dict(translate=(0.6, 0.45, 0.2))]
     ball = ("sphere { center 0 0 0  radius 0.25  material gold }  "
             "isosurface { material blue  sphere { center 0.3 0.15 0  radius 0.15 } }")
-    still = 'mesh "glow_tri" { file "%s"  material glow  translate -0.2 0.45 0  scale 2 }' % obj
+    still = ("light area { origin -0.3 0.6 -0.2  u 0.3 0 0  v 0 0 0.3  normal 0.4 -1 0  "
+             "spd preset:bb5200  power 15 }")
     cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
     lines = [
         "scene { units meters  motion_interval -0.5 0.5 }",
@@ -339,10 +375,13 @@ REFUSED = [
 ]
 # (what stays at the instant, the scene, the warning it must print) -- loaded, not refused
 STILL = [
-    ("an emissive mesh in a moving group",
-     'material "glow" { type diffuse reflect 0.0  emit blackbody 5200 }' + NL +
-     'group { motion { key { translate 0 0 0 } key { translate 1 0 0 } }  mesh "m" { file "%(obj)s"'
-     "  material glow } }", "an emissive surface in a moving group stays where it is"),
+    ("an aimed area light in a moving group",
+     "group { motion { key { translate 0 0 0 } key { translate 1 0 0 } }  light area { origin 0 1 0  "
+     "u 0.2 0 0  v 0 0 0.2  normal 0.5 -1 0  spd preset:bb6500  power 5 } }",
+     "an aimed area light in a moving group stays where it is"),
+    ("a light its keys scale",
+     "group { motion { key { scale 1 } key { scale 1.5 } }  light sphere { center 0 1 0  radius 0.05  "
+     "spd preset:bb6500  power 5 } }", "whose keys scale or shear it stays where it is"),
 ]
 LIGHT = ("light area { origin -0.4 2.9 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  spd preset:bb6500"
          "  power 60 }")
@@ -465,6 +504,19 @@ def main():
     bad = (z > 5.0) & (rel > 0.03)
     verdict("the kinds that cannot move stay; their siblings move", not bad.any(),
             "worst block z %.1f rel %.3f; %d blocks out" % (z.max(), rel.max(), bad.sum()))
+    # Lights move with their group -- an area panel, a glowing ball, a spot, a tube and an
+    # emissive triangle -- in every mode that blurs: held sharp at a time, the scene is the static
+    # group written out there.
+    for t in (-0.3, 0.35):
+        sharp, ref = os.path.join(out, "lights_sharp.ftsl"), os.path.join(out, "lights_ref.ftsl")
+        write(sharp, lights_scene(objf, shutter=(t, t)))
+        write(ref, lights_scene(objf, u=t + 0.5))
+        for mode, margs in (("R", ["-spp", "512"]), ("B", ["-n", "40000000"]), ("D", ["-spp", "256"])):
+            args = ["-mode", mode, "-device", "cpu"] + margs
+            la = [lum(render(exe, out, sharp, "lights_sharp_s%d" % s, args, seed=s)[0]) for s in (1, 2)]
+            lb = [lum(render(exe, out, ref, "lights_ref_s%d" % s, args, seed=s)[0]) for s in (1, 2)]
+            good, detail = agree(la, lb, 0.05)
+            verdict("lights move with their group (mode %s, sharp at %g)" % (mode, t), good, detail)
     # An isosurface, a curve and an instance move, turn and grow with their group: held sharp at
     # a time, they are the static group written out there.
     for t in (-0.35, 0.4):

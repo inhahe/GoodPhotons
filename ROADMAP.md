@@ -733,5 +733,6 @@ classify pixels at the instant), as does the GPU. *Camera motion (0.408.0, done)
 `motion { key { eye look_at up fov_y } }`, and every frame of a camera path with a shutter
 keyed from a Catmull-Rom through the path's frames; loom writes a moving `Camera`'s keys.
 *Moving isosurfaces, curves and mesh instances (0.409.0, done):* the ray carried back to the
-instant, the hit carried out. Open: moving lights and emissive meshes; M/S/U/J with time carried
-into the light side; the GPU.
+instant, the hit carried out. *Moving lights and emissive meshes (0.410.0, done):* rigid only,
+sampled at the instant and carried out, with a timed light tree. Open: lights that scale over
+the shutter, aimed area lights; M/S/U/J with time carried into the light side; the GPU.

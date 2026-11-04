@@ -540,13 +540,14 @@ struct BackwardRenderer {
         if (em.shape == EmitterShape::Spot) {
             // Point spot: deterministic connect to the light point, weighted by the
             // cone falloff toward the surface (peak intensity/SPD = 1). No rng draw.
-            Vec3 toL = em.origin - h.p;
+            Vec3 toL = scene.lightPointNow(em, em.origin) - h.p;
             double dist2 = dot(toL, toL);
             dist = std::sqrt(dist2);
             Vec3 wi = toL / dist;
             double cosSurf, stG;
             if (!response(wi, cosSurf, stG)) return false;
-            double fall = spotFalloff(dot(-wi, em.beamDir), em.spotCosInner, em.spotCosOuter);
+            double fall = spotFalloff(dot(-wi, scene.lightDirNow(em, em.beamDir)), em.spotCosInner,
+                                      em.spotCosOuter);
             if (fall <= 0) return false;
             if (blocked(wi, dist, 2e-6)) return false;
             w = fall * cosSurf / dist2 * stG * vis;          // I(w)/dist^2 (× BRDF & SPD by caller)
@@ -581,16 +582,24 @@ struct BackwardRenderer {
         // solid-angle measure, so the cosLight/dist^2/area area-measure Jacobian is
         // replaced by 1/pdfW. Quads (and a receiver inside a sphere) keep the uniform
         // area-measure estimator.
+        // A moving light is sampled toward the shading point carried to where the light sits at
+        // the instant, and the sample carried out (Scene::lightPointNow).
+        const Vec3 pL = scene.lightPointThen(em, h.p);
         bool coneSampled = (em.shape == EmitterShape::Sphere) &&
-                           em.sampleSphereCone(h.p, u1, u2, y, nLight, wi, dist, pdfW);
+                           em.sampleSphereCone(pL, u1, u2, y, nLight, wi, dist, pdfW);
         // Cylinder: importance-sample only the front-facing lateral arc toward `h.p`
         // (area measure). Every draw is front-facing, so effArea = 1/pdfArea (the
         // visible area) replaces em.area and no samples land on the back side.
         double effArea = em.area, pdfAreaCyl = 0.0;
         bool cylVisible = !coneSampled && em.shape == EmitterShape::Cylinder &&
                           !em.caps &&   // capped tubes: uniform samplePoint covers the caps too
-                          em.sampleCylinderVisible(h.p, u1, u2, y, nLight, pdfAreaCyl);
+                          em.sampleCylinderVisible(pL, u1, u2, y, nLight, pdfAreaCyl);
         if (cylVisible) effArea = 1.0 / pdfAreaCyl;
+        if ((coneSampled || cylVisible) && scene.lightMoves(em)) {
+            y = scene.lightPointNow(em, y);
+            nLight = scene.lightDirNow(em, nLight);
+            wi = scene.lightDirNow(em, wi);
+        }
         if (coneSampled) {
             double cosSurf, stG;
             if (!response(wi, cosSurf, stG)) return false;
@@ -889,14 +898,18 @@ struct BackwardRenderer {
                              Pcg32& rng) const {
         EmitterDraw d;
         const int nEm = (int)scene.emitters.size();
+        // A path with a time walks the tree that bounds the moving lights over their motion.
+        const bool tt = g_motionU >= 0.0 && scene.lightTreeTimed.built;
+        const std::vector<LightTreeNode>& tree = tt ? scene.lightTreeTimed.nodes : scene.lightTree;
+        const int root = tt ? scene.lightTreeTimed.root : scene.lightTreeRoot;
         // Mode W wants its deterministic G x G grid on every light and has no variance to
         // trade away, so it always takes the exact path.
-        if (!lightTree || whitted || scene.lightTreeRoot < 0 || scene.lightTree.empty()) {
+        if (!lightTree || whitted || root < 0 || tree.empty()) {
             d.all = true; d.n = nEm; return d;
         }
         // Emitters with no usable spatial bound (a distant sun) are outside the tree and
         // are always connected, exactly as before.
-        for (int e : scene.lightTreeAlways) {
+        for (int e : (tt ? scene.lightTreeTimed.always : scene.lightTreeAlways)) {
             if (d.n >= kMaxLightPick) break;
             d.s[d.n++] = LtSample{e, 1.0};
         }
@@ -907,7 +920,7 @@ struct BackwardRenderer {
             double nn[3] = {0, 0, 0};
             if (nrm) { nn[0] = nrm->x; nn[1] = nrm->y; nn[2] = nrm->z; }
             bool limited = false;
-            d.n += ltSample(scene.lightTree.data(), scene.lightTreeRoot, pp, nn,
+            d.n += ltSample(tree.data(), root, pp, nn,
                             nrm != nullptr, lightSplit, budget, d.s + d.n, rng, &limited);
             d.selExact = !limited;
         }
@@ -929,24 +942,28 @@ struct BackwardRenderer {
     // 0 means "not MIS-covered": an emitter past the always-list prefix pickEmitters reaches, or
     // one the walk proves is never selected. Both halves read that as full weight to the lobe.
     double lightSelPdf(const Scene& scene, int e, const Vec3& p, const Vec3& n) const {
-        if (!lightTree || whitted || scene.lightTreeRoot < 0 || scene.lightTree.empty())
+        const bool tt = g_motionU >= 0.0 && scene.lightTreeTimed.built;   // as pickEmitters
+        const std::vector<LightTreeNode>& tree = tt ? scene.lightTreeTimed.nodes : scene.lightTree;
+        const int root = tt ? scene.lightTreeTimed.root : scene.lightTreeRoot;
+        const std::vector<int>& always = tt ? scene.lightTreeTimed.always : scene.lightTreeAlways;
+        const std::vector<int>& parent = tt ? scene.lightTreeTimed.parent : scene.lightTreeParent;
+        const std::vector<int>& leaf = tt ? scene.lightTreeTimed.leaf : scene.lightTreeLeaf;
+        if (!lightTree || whitted || root < 0 || tree.empty())
             return 1.0;                                   // EmitterDraw::all -- every light, pdf 1
         // Only the PREFIX pickEmitters actually draws: it breaks out of the always-loop at
         // kMaxLightPick, so an emitter past that point is never connected, and treating it as
         // covered would down-weight a hit that nothing paid for.
         int n0 = 0;
-        for (int a : scene.lightTreeAlways) {
+        for (int a : always) {
             if (n0 >= kMaxLightPick) break;
             if (a == e) return 1.0;
             ++n0;
         }
         if (lightSamples <= 0 || n0 >= kMaxLightPick) return 0.0;   // no budget left for the tree
-        if (e < 0 || e >= (int)scene.lightTreeLeaf.size()) return 0.0;
+        if (e < 0 || e >= (int)leaf.size()) return 0.0;
         const double pp[3] = {p.x, p.y, p.z};
         const double nn[3] = {n.x, n.y, n.z};
-        return ltSelectPdf(scene.lightTree.data(), scene.lightTreeRoot,
-                           scene.lightTreeParent.data(), scene.lightTreeLeaf[e],
-                           pp, nn, true, lightSplit);
+        return ltSelectPdf(tree.data(), root, parent.data(), leaf[e], pp, nn, true, lightSplit);
     }
 
     // An evaluable, non-Lambertian lobe at a NEE vertex (today: MatType::Glossy). `wo` points
@@ -1006,7 +1023,7 @@ struct BackwardRenderer {
                 // error: the NEE side connects either way, so a wrong (or zero) density here
                 // hands the hit full weight and DOUBLE COUNTS the light.
                 if (em.caps) break;
-                const double va = em.cylinderVisibleArea(from);
+                const double va = em.cylinderVisibleArea(scene.lightPointThen(em, from));
                 if (!(va > 0.0)) return 0.0;
                 if (!hitP || !hitN) return 0.0;
                 const Vec3 d = *hitP - from;
@@ -1016,7 +1033,7 @@ struct BackwardRenderer {
                 return dist2 / (va * cosLight);
             }
             case EmitterShape::Sphere: {
-                const Vec3 toC = em.origin - from;
+                const Vec3 toC = em.origin - scene.lightPointThen(em, from);
                 const double dc2 = dot(toC, toC), r2 = em.radius * em.radius;
                 if (dc2 <= r2) break;                         // inside: area-sampled, fall through
                 const double cosMax = std::sqrt(std::max(0.0, 1.0 - r2 / dc2));
@@ -1537,11 +1554,12 @@ struct BackwardRenderer {
         double dist = 0.0, shorten = 2e-6;
         if (em.shape == EmitterShape::Spot) {
             // Point spot: no surface cosine at a volume vertex, cone falloff only.
-            const Vec3 toL = em.origin - p;
+            const Vec3 toL = scene.lightPointNow(em, em.origin) - p;
             const double dist2 = dot(toL, toL);
             dist = std::sqrt(dist2);
             wi = toL / dist;
-            const double fall = spotFalloff(dot(-wi, em.beamDir), em.spotCosInner, em.spotCosOuter);
+            const double fall = spotFalloff(dot(-wi, scene.lightDirNow(em, em.beamDir)),
+                                            em.spotCosInner, em.spotCosOuter);
             if (fall <= 0) return false;
             geom = fall / dist2;
         } else if (em.shape == EmitterShape::Sun) {
@@ -1555,14 +1573,20 @@ struct BackwardRenderer {
             const double u1 = rng.uniform(), u2 = rng.uniform();
             Vec3 y, nLight;
             double pdfW = 0.0;
+            const Vec3 pL = scene.lightPointThen(em, p);   // as emitterGeom's
             const bool coneSampled = (em.shape == EmitterShape::Sphere) &&
-                                     em.sampleSphereCone(p, u1, u2, y, nLight, wi, dist, pdfW);
+                                     em.sampleSphereCone(pL, u1, u2, y, nLight, wi, dist, pdfW);
             // Cylinder: front-facing lateral-arc sampling (area measure) toward `p`.
             double effArea = em.area, pdfAreaCyl = 0.0;
             const bool cylVisible = !coneSampled && em.shape == EmitterShape::Cylinder &&
                                     !em.caps &&   // capped tubes: uniform samplePoint covers the caps too
-                                    em.sampleCylinderVisible(p, u1, u2, y, nLight, pdfAreaCyl);
+                                    em.sampleCylinderVisible(pL, u1, u2, y, nLight, pdfAreaCyl);
             if (cylVisible) effArea = 1.0 / pdfAreaCyl;
+            if ((coneSampled || cylVisible) && scene.lightMoves(em)) {
+                y = scene.lightPointNow(em, y);
+                nLight = scene.lightDirNow(em, nLight);
+                wi = scene.lightDirNow(em, wi);
+            }
             if (coneSampled) {
                 geom = 1.0 / pdfW;                         // solid-angle measure
             } else {

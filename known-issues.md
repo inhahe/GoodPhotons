@@ -87,6 +87,24 @@ narrow API speak UTF-8, then audit the `std::filesystem::path(std::string)` / `.
 for UTF-8 (`u8path`, `u8string`); or read argv as UTF-16 (`wmain`) and keep paths as
 `std::filesystem::path` throughout.
 
+## OPEN (2026-11-03, 0.410.0): MOTION-LIGHT-RIGID — a light that its keys would scale or shear, an aimed area light, and a sun or sky in a moving group stay at the instant
+
+Lights move since 0.410.0, but only rigidly (`Emitter::motion`, `Scene::lightPointNow`): under a
+rigid motion every length, area and angle of a light stands, so each sampler runs where the
+light sits at the instant and only its inputs and outputs are carried, and every density stays
+exact. Three kinds are kept at the instant, with their surfaces, and the loader warns once per
+kind (`moveChildren`):
+- a light in a group whose keys scale or shear it over the shutter. Reproduce: `group { motion {
+  key { scale 1 } key { scale 1.5 } }  light sphere { … } }`. Proper fix: carry the area
+  Jacobian `|det D| |D^-T n|` into each light's sampled density (or fold it into the returned
+  weight, keeping the MIS densities consistent) and, for spheres, cones and spots, the solid
+  angle's change under a scale.
+- an aimed area light (a `normal` that leans). Its `aimCos` / `aimDirPdf` / `sampleAimDir` /
+  `aimRadiance` / `nGeom` would need the query direction carried into the instant's frame and
+  the sampled one carried out, at about ten sites.
+- a sun or sky in a moving group: they are not anywhere, and turning their direction with the
+  group is a different feature (a rotating environment).
+
 ## FIXED (2026-11-03, 0.406.0; opened 2026-11-03, 0.404.0): MOTION-SWEEP — a moving primitive is boxed over its whole motion, so a fast mover slows every ray near its sweep
 
 **Fixed in 0.406.0:** `bvh` boxes every primitive at the instant; a query with a time walks `bvh` past its movers (a tree of the rest when movers dominate) and a tree of the moving ones boxed over its stretch of the interval only, 1 to 16 stretches as the movers' travel calls for (`Scene::buildMoveTrees`, `traverseWorldClosest` / `traverseWorldAny`). Of the two smaller costs below, the per-candidate blend is now cached per thread (`Scene::motionNow`); the any-hit rebuild remains.
