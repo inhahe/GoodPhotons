@@ -28,11 +28,37 @@ enum CameraProjection {
     CAM_RECTILINEAR = 0, CAM_EQUIDISTANT, CAM_EQUISOLID, CAM_STEREOGRAPHIC, CAM_ORTHOGRAPHIC
 };
 
-// Where a camera stands and looks at one time: what Camera::lookAt takes (ROADMAP 11).
-struct CameraPose { Vec3 eye, look, up; double fovY = 40.0; };
+// The photographic controls a camera's thin lens is derived from at one time (ftsl's
+// deriveCameraOptics): Camera::applyThinLens turns them, with the pose's fov, into apertureR,
+// lensF and filmDist -- so a zoom at a fixed f-number widens and narrows the aperture with the
+// focal length, and a rack of focus moves the focal plane.
+struct ThinLens {
+    // A physical-optics camera (an f-number or a `lens <mm>`): the film at the image distance and
+    // the lens the real focal length, which the fov and the film height give. Else the legacy
+    // camera: the film a unit behind the aperture, the lens focusing it at `focus`.
+    bool   physical = false;
+    double fstop = 0.0;      // the f-number, or 0: `aperture` is the radius
+    double aperture = 0.02;  // the aperture radius (metres) where no f-number sets it
+    double focus = 0.0;      // the focus distance (metres); 0 is infinity (physical) or no lens
+    double filmHmm = 24.0;   // the film's height (mm), which ties the fov to the focal length
+};
+// Where a camera stands and looks at one time: what Camera::lookAt takes (ROADMAP 11), and, when
+// `lensKeyed`, its thin lens there (a camera whose lens holds still keeps its own).
+struct CameraPose {
+    Vec3 eye, look, up;
+    double fovY = 40.0;
+    bool lensKeyed = false;
+    ThinLens lens;
+};
+// Whether two poses' lenses differ.
+inline bool lensDiffers(const ThinLens& a, const ThinLens& b) {
+    return a.physical != b.physical || a.fstop != b.fstop || a.aperture != b.aperture ||
+           a.focus != b.focus || a.filmHmm != b.filmHmm;
+}
 // A moving camera's poses: `keys` at times spread evenly over [a, b] frames (relative to the
-// frame's instant), each of eye, look-at point, up and fov_y blended linearly between neighbours
-// and held before a and after b. One key holds the camera at that pose through any shutter.
+// frame's instant), each of eye, look-at point, up, fov_y and a keyed lens's f-number, aperture
+// and focus blended linearly between neighbours and held before a and after b. One key holds the
+// camera at that pose through any shutter. Every key or none has `lensKeyed`.
 struct CameraMotion {
     double a = 0.0, b = 0.0;
     std::vector<CameraPose> keys;
@@ -46,8 +72,16 @@ struct CameraMotion {
         const double f = s - (double)i;
         const CameraPose& A = keys[(size_t)i];
         const CameraPose& B = keys[(size_t)i + 1];
-        return CameraPose{A.eye + (B.eye - A.eye) * f, A.look + (B.look - A.look) * f,
-                          A.up + (B.up - A.up) * f, A.fovY + (B.fovY - A.fovY) * f};
+        CameraPose p{A.eye + (B.eye - A.eye) * f, A.look + (B.look - A.look) * f,
+                     A.up + (B.up - A.up) * f, A.fovY + (B.fovY - A.fovY) * f};
+        if (A.lensKeyed) {
+            p.lensKeyed = true;
+            p.lens = A.lens;
+            p.lens.fstop = A.lens.fstop + (B.lens.fstop - A.lens.fstop) * f;
+            p.lens.aperture = A.lens.aperture + (B.lens.aperture - A.lens.aperture) * f;
+            p.lens.focus = A.lens.focus + (B.lens.focus - A.lens.focus) * f;
+        }
+        return p;
     }
 };
 
@@ -146,10 +180,28 @@ struct Camera {
     // This camera at `frames` (relative to the frame's instant): `out`, a copy of this camera,
     // takes the pose there -- eye, axes and fields of view -- and keeps everything else.
     void poseAt(double frames, Camera& out) const { posedAs(motion->at(frames), out); }
-    // `out`, a copy of this camera, at pose `p` (with a stereo eye's offset kept).
+    // `out`, a copy of this camera, at pose `p` (with a stereo eye's offset kept), and with the
+    // pose's thin lens when it carries one.
     void posedAs(const CameraPose& p, Camera& out) const {
         out.lookAt(p.eye, p.look, p.up, p.fovY, film.resX, film.resY);
         if (eyeShiftU != 0.0) out.eye = out.eye + out.u * eyeShiftU;
+        if (p.lensKeyed) out.applyThinLens(p.fovY, p.lens);
+    }
+    // The thin lens of controls `t` at a vertical fov of `fovYDeg` (ftsl's deriveCameraOptics,
+    // from the fov the focal length resolves to): apertureR, lensF and filmDist.
+    void applyThinLens(double fovYDeg, const ThinLens& t) {
+        if (!t.physical) {
+            apertureR = t.aperture;
+            filmDist = 1.0;
+            setFocus(t.focus);
+            return;
+        }
+        const double th = std::tan(0.5 * fovYDeg * 3.141592653589793 / 180.0);
+        const double f = (th > 1e-9) ? t.filmHmm / (2.0 * th) / 1000.0 : 0.0;   // metres
+        if (!(f > 0.0)) return;
+        apertureR = (t.fstop > 0.0) ? f / (2.0 * t.fstop) : t.aperture;
+        filmDist = (t.focus > f) ? 1.0 / (1.0 / f - 1.0 / t.focus) : f;
+        lensF = f;
     }
 
     // Optional physical multi-element lens (the "mesh-lens" camera). When set, the

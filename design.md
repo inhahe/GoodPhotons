@@ -10108,8 +10108,16 @@ sees the instant, exactly as a static scene with those transforms would show it.
   every frame of a camera path with a shutter, from a uniform Catmull-Rom through the frames'
   poses over the frame's own shutter (`keyPathFrames`; a frame is a frame apart in time, so
   frame i at time t is the path at i + t). Keys that all agree are no motion. The resume guard
-  mixes the keys. A key's `fov_y` changes the view only; the aperture and focus stay the
-  instant's (known-issues MOTION-ZOOM-APERTURE).
+  mixes the keys. **The thin lens moves too** (0.424.0): a pose carries the lens's controls
+  (`CameraPose::lens`, a `ThinLens`: physical or not, f-number, aperture radius, focus, film
+  height) when they change over the keys -- a key's `focus`, `fstop` or `aperture`
+  (`keyCameraLens`), a physical-optics camera's fov (its focal length, which the aperture follows
+  at a fixed f-number), or a camera_curve's per-frame optics (`keyPathFrames`, linearly between
+  frames so an f-number cannot overshoot) -- and `Camera::applyThinLens` derives apertureR, lensF
+  and filmDist from them at the pose's fov, as `deriveCameraOptics` does at load; the device's
+  `dPoseCamera` likewise (`DCamKey`'s fstop / aperture / focus, `DCamera::lensKeyed`). A lens that
+  holds still is no pose's (`lensKeyed` false), so its renders are as before; the camera at the
+  instant takes the keys' lens there (`setCamSpecLens`).
 - **The modes that share light data across paths take one time a pass** (0.414.0): photons,
   beams and merges serve many paths, which must then share their time. `g_passMotionU`
   (geometry.h) is a pass's time, set by `PassTimeScope` on the thread that starts the pass and

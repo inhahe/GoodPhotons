@@ -736,7 +736,7 @@ scene keeps M's and S's maps timeless and poses each gather sample. *Mode P (0.4
 done):* each backward sample is split by its own first hit at its own time, and no pixel is
 classified. Only V renders the instant now, and the GPU. *Camera motion (0.408.0, done):* a camera's
 `motion { key { eye look_at up fov_y } }`, and every frame of a camera path with a shutter
-keyed from a Catmull-Rom through the path's frames; loom writes a moving `Camera`'s keys.
+keyed from a Catmull-Rom through the path's frames; loom writes a moving `Camera`'s keys. *The camera's lens (0.424.0, done):* a zoom at a fixed f-number keeps its f-number across the shutter, and keys rack the focus, f-number and aperture.
 *Moving isosurfaces, curves and mesh instances (0.409.0, done):* the ray carried back to the
 instant, the hit carried out. *Moving lights and emissive meshes (0.410.0, done):* rigid only,
 sampled at the instant and carried out, with a timed light tree. *The GPU, modes R and W

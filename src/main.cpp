@@ -15008,9 +15008,24 @@ static void buildFurFields(const Scene& scene, bool timed) {
 // the device-selection notes name that reason rather than the generic lists.
 static const char* const kObjectSpaceWhy =
     "object-space patterns (pattern_space object) are read on the CPU only so far";
+// A camera's thin lens from its spec (`c` posed already): the authored aperture (or the
+// f-number's), the film at the image distance and the real focal length for a physical-optics
+// camera (an `fstop` or `lens <mm>`), else a unit film focused at `focus` -- and for a camera whose
+// motion keys carry a lens (CameraPose::lensKeyed), the keys' at the instant, as its pose is.
+static void setCamSpecLens(Camera& c, const ftsl::CamSpec& cs) {
+    c.apertureR = cs.aperture;
+    if (cs.filmDist_m > 0.0) { c.filmDist = cs.filmDist_m; c.lensF = cs.lensF_m; }
+    else                     { c.setFocus(cs.focus); }
+    if (cs.motion && !cs.motion->keys.empty() && cs.motion->keys[0].lensKeyed) {
+        const CameraPose now = cs.motion->at(0.0);
+        c.applyThinLens(now.fovY, now.lens);
+    }
+}
+
 // Motion blur on the device (ROADMAP 11): cudaBlurUnsupported names the modes it carries and says
-// why any other blurred render stays on the CPU; every device gate under a blur asks it. A shared
-// forward flight is the one case it cannot see from the mode.
+// why one would stay on the CPU; every device gate under a blur asks it. A shared forward flight,
+// and a moving scene's mode-M camera the run's routing keeps apart (mBlurApart), are the cases it
+// cannot see from the mode.
 static const char* const kSharedFlightBlurWhy =
     "a shared forward flight that blurs renders on the CPU so far (the device blurs one camera at a time)";
 #ifdef HAVE_CUDA
@@ -24321,12 +24336,10 @@ static int run(int argc, char** argv) {
             Camera c;
             c.lookAt(cs->eye, cs->look, cs->up, cs->fov, cresX, cresY);
             c.setProjection(cs->projection);   // rectilinear (default) or a fisheye/panoramic lens
-            c.apertureR = cs->aperture;
             c.shutterOpen = cs->shutterOpen; c.shutterClose = cs->shutterClose;
             c.motion = cs->motion;
             c.frameNeighbours = cs->frameNeighbours;
-            if (cs->filmDist_m > 0.0) { c.filmDist = cs->filmDist_m; c.lensF = cs->lensF_m; }  // physical-optics (lens/fstop): film at image distance, real focal
-            else                      { c.setFocus(cs->focus); }                                // legacy unit-film camera
+            setCamSpecLens(c, *cs);
             char cmode = effModeCam(*cs);
             if (cs->lens) {
                 // Physical multi-element lens. Mode R traces camera rays film->scene through
@@ -24768,9 +24781,7 @@ static int run(int argc, char** argv) {
             m.resY = resFromCli ? (resYCli > 0 ? resYCli : res) : (cs.resY > 0 ? cs.resY : m.res);
             m.cam.lookAt(cs.eye, cs.look, cs.up, cs.fov, m.res, m.resY);
             m.cam.setProjection(cs.projection);
-            m.cam.apertureR = cs.aperture;
-            if (cs.filmDist_m > 0.0) { m.cam.filmDist = cs.filmDist_m; m.cam.lensF = cs.lensF_m; }
-            else                     { m.cam.setFocus(cs.focus); }
+            setCamSpecLens(m.cam, cs);
             // The mode the render itself uses (a fire metered in a fire-blind mode would anchor
             // a different picture): the run's own verdict for a camera it renders, and for a
             // frame of the path it does not render, the same routing and fallback on the scene

@@ -942,6 +942,7 @@ def main():
     p_split_tests(exe, out, verdict, not a.no_gpu)
     j_empty_test(exe, out, verdict)
     camera_tests(exe, out, verdict, devices)
+    lens_tests(exe, out, verdict, devices)
     if not a.no_gpu:
         meter_m_test(exe, out, verdict)
         m_epoch_tests(exe, out, verdict)
@@ -1276,6 +1277,64 @@ def keyed_camera(shutter=None, extra=""):
     keys = "  ".join("key { eye %s  look_at %s  fov_y %r }" % (v3(k["eye"]), v3(k["look"]), k["fov"])
                      for k in CAM_KEYS)
     return ('camera "c" { up 0 1 0  %s%smotion { %s }  film { res %d %d } }' % (sh, extra, keys, W, H))
+
+
+def lens_tests(exe, out, verdict, devices):
+    """The camera's thin lens across its shutter (MOTION-ZOOM-APERTURE), in mode A at f/1.4 on a
+    60 x 45 mm film, so the box 4 m off is defocused by pixels: a zoom at a fixed f-number, whose
+    aperture and film distance follow the focal length (about 5 pixels of defocus at 26 degrees
+    and 1 at 54, focused at 0.9 m), and a rack of focus from 0.6 m to 6 m (3 pixels to sharp), each
+    against the mean of its instants -- a still camera with that time's fov and focus, its lens
+    derived by the loader. They used to keep the instant's aperture, film distance and focus at
+    every time."""
+    still = scene(u=0.5)
+    cam = ('camera "c" { eye 0 1.0 4.2  look_at 0 0.5 0  up 0 1 0  fstop 1.4  %s  '
+           'film { res %d %d  size 60 45 } }')
+    sh = "shutter_open -0.5  shutter_close 0.5"
+    cases = [("zoom", "focus 0.9  %s  motion { key { fov_y 26 } key { fov_y 54 } }" % sh,
+              lambda u: "fov_y %r  focus 0.9" % (26.0 + 28.0 * u)),
+             ("rack", "fov_y 40  %s  motion { key { focus 0.6 } key { focus 6 } }" % sh,
+              lambda u: "fov_y 40  focus %r" % (0.6 + 5.4 * u))]
+    T, N = 16, 40000000
+    for name, keyed, at in cases:
+        pb = os.path.join(out, "lens_%s.ftsl" % name)
+        write(pb, with_camera(still, cam % (keyed, W, H)))
+        pt = os.path.join(out, "lens_%s_t.ftsl" % name)
+        for dev, gpu in devices:
+            args = ["-mode", "A", "-device", dev]
+            blur = [lum(render(exe, out, pb, "lens_%s_%s_s%d" % (name, dev, s), args + ["-n", str(N)], seed=s,
+                               want_gpu=gpu)[0]) for s in (1, 2)]
+            mean = [np.zeros((H, W)), np.zeros((H, W))]
+            for j in range(T):
+                write(pt, with_camera(still, cam % (at((j + 0.5) / T), W, H)))
+                for s in (1, 2):
+                    mean[s - 1] += lum(render(exe, out, pt, "lens_%s_t_%s_s%d" % (name, dev, s),
+                                              args + ["-n", str(N // T)], seed=100 * j + s,
+                                              want_gpu=gpu)[0]) / T
+            good, detail = agree(blur, mean, 0.05)
+            verdict("a %s across the shutter blurs as the mean of its instants (mode A, %s)"
+                    % ("zoom at f/1.4" if name == "zoom" else "rack of focus", dev.upper()), good, detail)
+
+    # --- no shutter: a camera whose keys rack its lens is the still camera at their instant ---
+    pk, ps = os.path.join(out, "lens_keyed.ftsl"), os.path.join(out, "lens_still.ftsl")
+    write(pk, with_camera(still, cam % ("fov_y 40  motion { key { focus 2 } key { focus 6 } }", W, H)))
+    write(ps, with_camera(still, cam % ("fov_y 40  focus 4", W, H)))
+    args = ["-mode", "A", "-device", "cpu", "-n", "2000000"]
+    _, raw_k, _ = render(exe, out, pk, "lens_keyed", args)
+    _, raw_s, _ = render(exe, out, ps, "lens_still", args)
+    verdict("no shutter: a camera whose keys rack its focus = the still one at their instant", raw_k == raw_s)
+
+    # --- a key may set only what the camera's lens lets it ---
+    for what, text, says in (
+            ("fstop on a camera without one", 'camera "c" { eye 0 1.0 4.2  look_at 0 0.5 0  up 0 1 0  '
+             "motion { key { fstop 2 } key { fstop 4 } }  film { res %d %d } }" % (W, H), "`fstop` needs"),
+            ("aperture on a camera an fstop sets", cam % ("motion { key { aperture 0.01 } key { aperture 0.02 } }",
+                                                             W, H), "`aperture` needs")):
+        p = os.path.join(out, "lens_refuse.ftsl")
+        write(p, with_camera(still, text))
+        rc, log = run([exe, "-in", p, "-mode", "A", "-device", "cpu", "-n", "1000", "-no-meter",
+                       "-o", os.path.join(out, "lens_refuse.png")])
+        verdict("refuses a key's %s" % what, rc != 0 and says in log, log.strip()[-200:] if rc == 0 else "")
 
 
 def camera_tests(exe, out, verdict, devices):

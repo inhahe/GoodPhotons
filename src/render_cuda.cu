@@ -1663,7 +1663,8 @@ struct DLensSystem {
     double exitZ, exitDRho;
 };
 
-struct DCamKey { DVec3 eye, look, up; double fovY; };   // CameraPose's twin
+// CameraPose's twin; a keyed lens's controls (ThinLens's) when the camera's lensKeyed.
+struct DCamKey { DVec3 eye, look, up; double fovY; double fstop, aperture, focus; };
 struct DCamera {
     DVec3  eye, u, v, w;
     double tanHalfX, tanHalfY;
@@ -1686,6 +1687,10 @@ struct DCamera {
     // pose above at every time.
     const struct DCamKey* keys; int nKeys;
     double keyA, keyB, eyeShiftU;
+    // Whether the keys carry the thin lens (CameraPose::lensKeyed), and its controls that every
+    // key shares (ThinLens::physical, filmHmm): posing then derives apertureR, lensF and filmDist.
+    int    lensKeyed, lensPhysical;
+    double lensFilmHmm;
     HD double imagePlaneArea() const { return 4.0 * tanHalfX * tanHalfY; }
     // Per-pixel image-plane area: connect() splats one photon into one pixel, so the
     // pinhole importance normalises by a single pixel's area (see camera.h). This
@@ -4214,6 +4219,9 @@ __device__ __noinline__ static void dPoseCamera(const DCamera& cam, double frame
         k.look = A.look + (B.look - A.look) * f;
         k.up = A.up + (B.up - A.up) * f;
         k.fovY = A.fovY + (B.fovY - A.fovY) * (double)f;
+        k.fstop = A.fstop + (B.fstop - A.fstop) * (double)f;
+        k.aperture = A.aperture + (B.aperture - A.aperture) * (double)f;
+        k.focus = A.focus + (B.focus - A.focus) * (double)f;
     }
     out.eye = k.eye;
     out.w = normalize(k.look - k.eye);
@@ -4224,6 +4232,20 @@ __device__ __noinline__ static void dPoseCamera(const DCamera& cam, double frame
     out.halfFovY = 0.5 * k.fovY * 3.141592653589793 / 180.0;
     out.rEdge = dProjRadius(cam.projection, out.halfFovY);
     if (cam.eyeShiftU != 0.0) out.eye = out.eye + out.u * (Real)cam.eyeShiftU;
+    if (cam.lensKeyed) {   // host twin Camera::applyThinLens
+        if (!cam.lensPhysical) {
+            out.apertureR = k.aperture;
+            out.filmDist = 1.0;
+            out.lensF = k.focus > 0.0 ? 1.0 / (1.0 / k.focus + 1.0) : 0.0;   // Camera::setFocus
+        } else {
+            const double f = out.tanHalfY > 1e-9 ? cam.lensFilmHmm / (2.0 * out.tanHalfY) / 1000.0 : 0.0;
+            if (f > 0.0) {
+                out.apertureR = k.fstop > 0.0 ? f / (2.0 * k.fstop) : k.aperture;
+                out.filmDist = k.focus > f ? 1.0 / (1.0 / f - 1.0 / k.focus) : f;
+                out.lensF = f;
+            }
+        }
+    }
 }
 // The path's time at `frames` (frames from the instant), set for its queries when the scene moves:
 // in the motion interval, clamped to it (host twin Scene::motionU).
@@ -23723,7 +23745,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
 // A baked camera for a pass or an epoch that takes one time, already posed there: it keeps no
 // time of its own (no shutter, no keys), so no kernel can pose it again or move the scene to a
 // sample's time (dSetCameraTime, dPoseCameraAtSample).
-static void pinToPass(gpu::DCamera& dc) { dc.blur = 0; dc.keys = nullptr; dc.nKeys = 0; }
+static void pinToPass(gpu::DCamera& dc) { dc.blur = 0; dc.keys = nullptr; dc.nKeys = 0; dc.lensKeyed = 0; }
 // The baked camera `dc` posed at `tFrames` frames on the host (Camera::poseAt) and pinned there,
 // for a pass or an epoch that takes one time.
 static gpu::DCamera posedBaked(const gpu::DCamera& dc, const Camera& cam, double tFrames) {
@@ -23738,6 +23760,7 @@ static gpu::DCamera posedBaked(const gpu::DCamera& dc, const Camera& cam, double
     out.w = {c.w.x, c.w.y, c.w.z};
     out.tanHalfX = c.tanHalfX; out.tanHalfY = c.tanHalfY;
     out.halfFovY = c.halfFovY; out.rEdge = c.rEdge;
+    out.apertureR = c.apertureR; out.filmDist = c.filmDist; out.lensF = c.lensF;
     return out;
 }
 // A pass's time at `tFrames` for the device's queries (DMotion::passU): in the interval, or -1
@@ -23765,15 +23788,23 @@ static gpu::DCamera bakeCamera(const Scene& scene, const Camera& cam, int resX, 
     dc.timeSalt = 0x7F4A7C159E3779B9ULL ^ g_rngSalt;   // BackwardRenderer::renderRows' phase stream
     dc.keys = nullptr; dc.nKeys = 0; dc.keyA = dc.keyB = 0.0;
     dc.eyeShiftU = cam.eyeShiftU;
+    dc.lensKeyed = dc.lensPhysical = 0; dc.lensFilmHmm = 24.0;
     if (dc.blur && cam.moves()) {
         std::vector<DCamKey> keys;
         for (const CameraPose& p : cam.motion->keys)
             keys.push_back(DCamKey{{(Real)p.eye.x, (Real)p.eye.y, (Real)p.eye.z},
                                    {(Real)p.look.x, (Real)p.look.y, (Real)p.look.z},
-                                   {(Real)p.up.x, (Real)p.up.y, (Real)p.up.z}, p.fovY});
+                                   {(Real)p.up.x, (Real)p.up.y, (Real)p.up.z}, p.fovY,
+                                   p.lens.fstop, p.lens.aperture, p.lens.focus});
         dc.keys = (const DCamKey*)up.keep(uploadVec(keys));
         dc.nKeys = (int)keys.size();
         dc.keyA = cam.motion->a; dc.keyB = cam.motion->b;
+        const CameraPose& k0 = cam.motion->keys[0];
+        if (k0.lensKeyed) {
+            dc.lensKeyed = 1;
+            dc.lensPhysical = k0.lens.physical ? 1 : 0;
+            dc.lensFilmHmm = k0.lens.filmHmm;
+        }
     }
     dc.eye = {cam.eye.x, cam.eye.y, cam.eye.z};
     dc.u = {cam.u.x, cam.u.y, cam.u.z};

@@ -766,6 +766,19 @@ struct CamSpec {
     // so the f-number produces true depth of field in the catch modes (A/C). Both 0
     // => legacy camera (unit film distance, lens synthesised from `focus` by setFocus).
     double filmDist_m = 0.0, lensF_m = 0.0;
+    // The f-number the optics were derived from (0: none, `aperture` is the authored radius).
+    double fstop = 0.0;
+    // The controls of the thin lens above, for a pose that re-derives it at another fov
+    // (CameraPose::lens).
+    ThinLens thinLens() const {
+        ThinLens t;
+        t.physical = filmDist_m > 0.0;
+        t.fstop = fstop;
+        t.aperture = aperture;
+        t.focus = focus;
+        t.filmHmm = filmH_mm > 0.0 ? filmH_mm : 24.0;
+        return t;
+    }
     // Photographic exposure controls. The film's radiometric scale is not absolute,
     // so images are always auto-exposed (99th-percentile anchor); these act as an
     // exposure *compensation* on top of that anchor:
@@ -9027,6 +9040,7 @@ private:
         const double DEG = 3.141592653589793 / 180.0;
         if (zoom <= 0.0) zoom = 1.0;
         cs.zoom = zoom;
+        cs.fstop = fstopN > 0.0 ? fstopN : 0.0;
         double focalMM;
         if (lensMM > 0.0) focalMM = lensMM;
         else { double th = std::tan(0.5 * fovDeg * DEG); focalMM = (th > 1e-9) ? hmm / (2.0 * th) : 0.0; }
@@ -9363,10 +9377,12 @@ private:
     }
 
     // ---- camera ----
-    // A camera's `motion { key { eye ... look_at ... up ... fov_y ... } ... }`: its pose at keys
-    // spread evenly over the scene's motion_interval (ROADMAP 11), each blended linearly to the
-    // next. What a key leaves out is the camera's own statement. The camera's own pose becomes the
-    // keys' at the frame's instant; `keyFov` says which keys gave a fov_y of their own.
+    // A camera's `motion { key { eye ... look_at ... up ... fov_y ... focus ... fstop ... aperture
+    // ... } ... }`: its pose and its thin lens at keys spread evenly over the scene's
+    // motion_interval (ROADMAP 11), each blended linearly to the next. What a key leaves out is the
+    // camera's own statement. The camera's own pose becomes the keys' at the frame's instant (its
+    // lens too, in main.cpp); `keyFov` says which keys gave a fov_y of their own, `keyLens` what
+    // each set of the lens (keyCameraLens).
     // A keyed camera's pose `frames` from the instant: an estimate of the neighbouring frame's, for
     // motion vectors. From the interval's end on that side (or the other, when the interval stops
     // at the instant): when `frames` is a whole number n of that end's time, the camera's rigid
@@ -9422,13 +9438,71 @@ private:
             const CameraPose& q = keys[0];
             if (p.eye.x != q.eye.x || p.eye.y != q.eye.y || p.eye.z != q.eye.z ||
                 p.look.x != q.look.x || p.look.y != q.look.y || p.look.z != q.look.z ||
-                p.up.x != q.up.x || p.up.y != q.up.y || p.up.z != q.up.z || p.fovY != q.fovY)
+                p.up.x != q.up.x || p.up.y != q.up.y || p.up.z != q.up.z || p.fovY != q.fovY ||
+                (p.lensKeyed && lensDiffers(p.lens, q.lens)))
                 return true;
         }
         return false;
     }
+    // What a camera motion key sets of the thin lens: each of its focus, f-number and aperture
+    // radius, or the camera's own where it is silent (has* false).
+    struct KeyLens {
+        bool hasFocus = false, hasFstop = false, hasAperture = false;
+        double focus = 0.0, fstop = 0.0, aperture = 0.0;
+        bool any() const { return hasFocus || hasFstop || hasAperture; }
+    };
+    // A camera's `motion` keys (readCameraMotion's) once its lens is resolved: each key's thin lens
+    // (CameraPose::lens), from `keyLens` over the camera's own, when the lens changes over the keys
+    // -- a key racking its focus, f-number or aperture, or a key's fov zooming a physical-optics
+    // camera, whose aperture and film distance follow the focal length. False (the camera refused)
+    // where a key sets what the camera's lens does not let it.
+    bool keyCameraLens(CamSpec& cs, CameraMotion& m, const std::vector<KeyLens>& keyLens) {
+        const std::string who = "camera '" + cs.name + "': a motion key's ";
+        const ThinLens own = cs.thinLens();
+        bool any = false;
+        for (const KeyLens& k : keyLens) any = any || k.any();
+        if (any && cs.lens) {
+            fail(who + "`focus`, `fstop` or `aperture` cannot change a camera with a `lens { }` block");
+            return false;
+        }
+        std::vector<ThinLens> lenses;
+        bool varies = false;
+        for (size_t i = 0; i < m.keys.size(); ++i) {
+            const KeyLens& k = keyLens[i];
+            ThinLens t = own;
+            if (k.hasFstop) {
+                if (!own.physical || !(k.fstop > 0.0)) {
+                    fail(who + "`fstop` needs a positive f-number, on a camera with an `fstop` or a "
+                               "`lens <mm>` of its own");
+                    return false;
+                }
+                t.fstop = k.fstop;
+            }
+            if (k.hasAperture) {
+                if (own.fstop > 0.0 || k.aperture < 0.0) {
+                    fail(who + "`aperture` needs a radius of 0 or more, on a camera no `fstop` sets "
+                               "the aperture of");
+                    return false;
+                }
+                t.aperture = k.aperture;
+            }
+            if (k.hasFocus) {
+                if (k.focus < 0.0) { fail(who + "`focus` cannot be negative"); return false; }
+                t.focus = k.focus;
+            }
+            lenses.push_back(t);
+            varies = varies || lensDiffers(t, own) || (own.physical && m.keys[i].fovY != cs.fov);
+        }
+        if (varies)
+            for (size_t i = 0; i < m.keys.size(); ++i) {
+                m.keys[i].lensKeyed = true;
+                m.keys[i].lens = lenses[i];
+            }
+        return true;
+    }
     bool readCameraMotion(const Block& b, Loaded& L, CamSpec& cs,
-                          std::shared_ptr<CameraMotion>& out, std::vector<char>& keyFov) {
+                          std::shared_ptr<CameraMotion>& out, std::vector<char>& keyFov,
+                          std::vector<KeyLens>& keyLens) {
         const Stmt* mo = find(b, "motion");
         if (!mo) return true;
         const std::string who = "camera '" + cs.name + "': ";
@@ -9453,13 +9527,17 @@ private:
             if (vec3Of(kb, "up", v))      p.up = v;          // a direction: unscaled
             keyFov.push_back(find(kb, "fov_y") ? 1 : 0);
             p.fovY = dblOf(kb, "fov_y", cs.fov);
+            KeyLens kl;   // lengths: authored units
+            if (find(kb, "focus"))    { kl.hasFocus = true;    kl.focus = Len(dblOf(kb, "focus", 0.0)); }
+            if (find(kb, "fstop"))    { kl.hasFstop = true;    kl.fstop = dblOf(kb, "fstop", 0.0); }
+            if (find(kb, "aperture")) { kl.hasAperture = true; kl.aperture = Len(dblOf(kb, "aperture", 0.0)); }
+            keyLens.push_back(kl);
             m->keys.push_back(p);
         }
         if (m->keys.size() < 2) { fail(who + "give `motion` at least two `key` blocks"); return false; }
         const CameraPose now = m->at(0.0);
         cs.eye = now.eye; cs.look = now.look; cs.up = now.up; cs.fov = now.fovY;
-        if (!posesMove(m->keys)) return true;   // keys that agree: a still camera there
-        out = std::move(m);
+        out = std::move(m);   // addCamera drops keys that all agree, once their lenses are known
         return true;
     }
 
@@ -9473,7 +9551,8 @@ private:
         cs.focus = Len(dblOf(b, "focus", 0.0));
         std::shared_ptr<CameraMotion> motion;
         std::vector<char> keyFov;
-        if (!readCameraMotion(b, L, cs, motion, keyFov)) return false;
+        std::vector<KeyLens> keyLens;
+        if (!readCameraMotion(b, L, cs, motion, keyFov, keyLens)) return false;
         const double fovKeyed = cs.fov;               // the keys' fov_y at the instant
         if (!readFilmExposure(b, cs)) return false;   // film{res,size/format,iso,...}, lens, fstop, zoom
         if (!readProjection(b, cs)) return false;     // projection/fisheye
@@ -9492,9 +9571,12 @@ private:
             // own fov_y when it was read.
             if (!anyFov)
                 for (CameraPose& p : motion->keys) p.fovY = cs.fov;
-            cs.frameNeighbours = std::make_shared<const std::array<CameraPose, 2>>(
-                std::array<CameraPose, 2>{posePastKeys(*motion, -1.0), posePastKeys(*motion, 1.0)});
-            cs.motion = std::move(motion);
+            if (!keyCameraLens(cs, *motion, keyLens)) return false;
+            if (posesMove(motion->keys)) {   // keys that all agree: a still camera there
+                cs.frameNeighbours = std::make_shared<const std::array<CameraPose, 2>>(
+                    std::array<CameraPose, 2>{posePastKeys(*motion, -1.0), posePastKeys(*motion, 1.0)});
+                cs.motion = std::move(motion);
+            }
         }
         std::string md = strOf(b, "mode");
         if (!md.empty()) cs.mode = normMode(md, L);
@@ -9577,11 +9659,25 @@ private:
     void keyPathFrames(Loaded& L, size_t first, bool closed) {
         const long long n = (long long)(L.cameras.size() - first);
         if (n < 2) return;
+        // Whether the frames' thin lens changes along the path (a camera_curve's fstop_at, focus_at
+        // or zoom_at; a physical-optics camera's fov, whose focal length the aperture follows):
+        // then each pose carries its frame's (CameraPose::lens), else none does.
+        bool lensVaries = false;
+        {
+            const CamSpec& c0 = L.cameras[first];
+            const ThinLens t0 = c0.thinLens();
+            for (long long j = 1; j < n && !lensVaries; ++j) {
+                const CamSpec& c = L.cameras[first + (size_t)j];
+                lensVaries = lensDiffers(c.thinLens(), t0) || (t0.physical && c.fov != c0.fov);
+            }
+        }
         // Frame j's own pose: wrapped round a closed path, held at an open one's ends.
         auto poseOf = [&](long long j) {
             j = closed ? ((j % n) + n) % n : std::min(std::max(j, 0LL), n - 1);
             const CamSpec& c = L.cameras[first + (size_t)j];
-            return CameraPose{c.eye, c.look, c.up, c.fov};
+            CameraPose p{c.eye, c.look, c.up, c.fov};
+            if (lensVaries) { p.lensKeyed = true; p.lens = c.thinLens(); }
+            return p;
         };
         // Every frame's neighbours, for motion vectors (Camera::frameNeighbours), shutter or not:
         // an open path's ends neighbour themselves.
@@ -9601,8 +9697,17 @@ private:
             const long long j = (long long)fl;
             const double f = x - fl;
             const CameraPose a = poseOf(j - 1), b2 = poseOf(j), c = poseOf(j + 1), d = poseOf(j + 2);
-            return CameraPose{crV(a.eye, b2.eye, c.eye, d.eye, f), crV(a.look, b2.look, c.look, d.look, f),
-                              crV(a.up, b2.up, c.up, d.up, f), cr(a.fovY, b2.fovY, c.fovY, d.fovY, f)};
+            CameraPose p{crV(a.eye, b2.eye, c.eye, d.eye, f), crV(a.look, b2.look, c.look, d.look, f),
+                         crV(a.up, b2.up, c.up, d.up, f), cr(a.fovY, b2.fovY, c.fovY, d.fovY, f)};
+            if (lensVaries) {
+                // linearly between the two frames: a spline could carry an f-number past zero
+                p.lensKeyed = true;
+                p.lens = b2.lens;
+                p.lens.fstop = b2.lens.fstop + (c.lens.fstop - b2.lens.fstop) * f;
+                p.lens.aperture = b2.lens.aperture + (c.lens.aperture - b2.lens.aperture) * f;
+                p.lens.focus = b2.lens.focus + (c.lens.focus - b2.lens.focus) * f;
+            }
+            return p;
         };
         for (long long i = 0; i < n; ++i) {
             CamSpec& cs = L.cameras[first + (size_t)i];

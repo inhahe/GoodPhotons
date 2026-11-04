@@ -181,7 +181,9 @@ starts just short of the mover, and the NEE leg counts `mediaExitDistance` from 
 domain for every estimator -- clipping an unbounded medium to the instant's sphere inside
 `mediaTr` and the free-flight samplers -- would end both (review of 51eb7ef..af7de14).
 
-## OPEN (2026-11-03, 0.410.1): MOTION-ZOOM-APERTURE — a camera's zoom across the shutter keeps the instant's aperture and focus
+## FIXED (2026-11-04, 0.424.0; opened 2026-11-03, 0.410.1): MOTION-ZOOM-APERTURE — a camera's zoom across the shutter keeps the instant's aperture and focus
+
+**Fixed in 0.424.0:** a pose carries the thin lens's controls when they change (`CameraPose::lens`), and posing derives the aperture, focal length and film distance from them at the pose's fov (`Camera::applyThinLens`, the device's `dPoseCamera`). Keys may set `focus`, `fstop` and `aperture`; a camera_curve's per-frame optics key its frames' shutters. check_motion's zoom tests compare a blurred zoom in mode A against the mean of its instants, on both devices.
 
 A camera's motion keys carry `fov_y` (and a camera path's frames carry theirs), but the thin
 lens behind it — `apertureR`, `lensF`, `filmDist`, derived once by `deriveCameraOptics` from the
