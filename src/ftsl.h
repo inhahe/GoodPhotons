@@ -784,6 +784,8 @@ struct CamSpec {
     // frame of a camera path with a shutter, the path's poses about the frame (keyPathFrames).
     // Null when the camera stands still; eye/look/up/fov above are its pose at the instant.
     std::shared_ptr<const CameraMotion> motion;
+    // Its pose a frame before and a frame after, for motion vectors (Camera::frameNeighbours).
+    std::shared_ptr<const std::array<CameraPose, 2>> frameNeighbours;
 
     // Exposure-lock across a `camera_path` (Phase 3a intermediate win): frames of a
     // path that authored `exposure_lock` share ONE auto-exposure anchor, so a dolly/
@@ -8894,6 +8896,19 @@ private:
     // spread evenly over the scene's motion_interval (ROADMAP 11), each blended linearly to the
     // next. What a key leaves out is the camera's own statement. The camera's own pose becomes the
     // keys' at the frame's instant; `keyFov` says which keys gave a fov_y of their own.
+    // A keyed camera's pose `frames` from the instant, carried linearly past the interval's end on
+    // that side from the instant's pose (or past the other end, when the interval stops at the
+    // instant): an estimate of the neighbouring frame's, for motion vectors.
+    static CameraPose posePastKeys(const CameraMotion& m, double frames) {
+        const CameraPose now = m.at(0.0);
+        double end = frames < 0.0 ? m.a : m.b;
+        if (end == 0.0) end = frames < 0.0 ? m.b : m.a;
+        if (end == 0.0) return now;
+        const CameraPose e = m.at(end);
+        const double f = frames / end;
+        return CameraPose{now.eye + (e.eye - now.eye) * f, now.look + (e.look - now.look) * f,
+                          now.up + (e.up - now.up) * f, now.fovY + (e.fovY - now.fovY) * f};
+    }
     // Whether any of `keys` differs from the first: keys that all agree are a camera standing still
     // (no motion, so nothing it renders asks for a time).
     static bool posesMove(const std::vector<CameraPose>& keys) {
@@ -8971,6 +8986,8 @@ private:
             // own fov_y when it was read.
             if (!anyFov)
                 for (CameraPose& p : motion->keys) p.fovY = cs.fov;
+            cs.frameNeighbours = std::make_shared<const std::array<CameraPose, 2>>(
+                std::array<CameraPose, 2>{posePastKeys(*motion, -1.0), posePastKeys(*motion, 1.0)});
             cs.motion = std::move(motion);
         }
         std::string md = strOf(b, "mode");
@@ -9054,6 +9071,17 @@ private:
     void keyPathFrames(Loaded& L, size_t first, bool closed) {
         const long long n = (long long)(L.cameras.size() - first);
         if (n < 2) return;
+        // Every frame's neighbours, for motion vectors (Camera::frameNeighbours), shutter or not:
+        // an open path's ends neighbour themselves.
+        for (long long i = 0; i < n; ++i) {
+            const auto at = [&](long long j) {
+                j = closed ? ((j % n) + n) % n : std::min(std::max(j, 0LL), n - 1);
+                const CamSpec& c = L.cameras[first + (size_t)j];
+                return CameraPose{c.eye, c.look, c.up, c.fov};
+            };
+            L.cameras[first + (size_t)i].frameNeighbours =
+                std::make_shared<const std::array<CameraPose, 2>>(std::array<CameraPose, 2>{at(i - 1), at(i + 1)});
+        }
         auto poseOf = [&](long long j) {
             j = closed ? ((j % n) + n) % n : std::min(std::max(j, 0LL), n - 1);
             const CamSpec& c = L.cameras[first + (size_t)j];

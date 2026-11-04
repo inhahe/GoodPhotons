@@ -6788,6 +6788,16 @@ as the one at fault.
     are ignored. 16 stratified rays a pixel (`-oidn-guide-spp`), so they are antialiased like
     the box-filtered film. Deterministic, hence passed as `cleanAux`, and world-space so a
     static surface's guide holds still across a flyby. 0.6–2.8 s a 960x540 frame on the CPU.
+  - **Reprojection images** (ROADMAP 11 stage C, 0.411.0; `dguide::motionAovs`): from one ray
+    through each pixel's centre at the frame's instant (traced at the instant as a time, so a
+    moving primitive's hit names its motion set), the depth along the camera's axis, the world
+    position, where that point sat a frame earlier (`framePoint`: its keys, carried a frame out
+    linearly past the motion interval's end on that side), and its motion vectors a frame back
+    and forward in pixels, projected (`Camera::projectF`) by the camera a frame away
+    (`Camera::frameNeighbours`: a camera path's neighbouring frames, `keyPathFrames`; a keyed
+    camera's keys carried a frame out, `posePastKeys`). Written by `-write-aovs` (or
+    `-oidn-write-guides`) through `GuideScope::writeGuideFiles`; `-write-aovs` alone renders the
+    guide pass without publishing it to the denoiser. What a temporal denoiser reprojects with.
   - **Plumbing.** `runRender` holds a `GuideScope` for its camera: it renders the guides on
     entry, publishes them (`setGuide`) and withdraws them on exit. `filmToLinear` — the one
     reduction behind the PNG, the `-hdr` PFM and the live window — runs `oidnApply`, which uses

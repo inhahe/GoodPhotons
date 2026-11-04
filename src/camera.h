@@ -8,6 +8,7 @@
 #pragma once
 #include <cmath>
 #include <cstdlib>
+#include <array>
 #include <memory>
 #include <vector>
 #include "geometry.h"
@@ -128,6 +129,10 @@ struct Camera {
     // The camera's own motion keys, or null for a camera that stands still. Its eye, u, v, w and
     // fields of view are its pose at the frame's instant; a path at another time asks poseAt.
     std::shared_ptr<const CameraMotion> motion;
+    // Where the camera stands a frame before and a frame after this one (ROADMAP 11 stage C), for
+    // motion vectors only -- nothing renders with them: a camera path's neighbouring frames, or a
+    // keyed camera's keys carried a frame out. Null: the same pose as this frame.
+    std::shared_ptr<const std::array<CameraPose, 2>> frameNeighbours;
     // A stereo eye's offset along u from the pose's eye (frustumShiftX's partner), so each eye
     // of a moving camera keeps its place beside it.
     double eyeShiftU = 0.0;
@@ -140,8 +145,9 @@ struct Camera {
     }
     // This camera at `frames` (relative to the frame's instant): `out`, a copy of this camera,
     // takes the pose there -- eye, axes and fields of view -- and keeps everything else.
-    void poseAt(double frames, Camera& out) const {
-        const CameraPose p = motion->at(frames);
+    void poseAt(double frames, Camera& out) const { posedAs(motion->at(frames), out); }
+    // `out`, a copy of this camera, at pose `p` (with a stereo eye's offset kept).
+    void posedAs(const CameraPose& p, Camera& out) const {
         out.lookAt(p.eye, p.look, p.up, p.fovY, film.resX, film.resY);
         if (eyeShiftU != 0.0) out.eye = out.eye + out.u * eyeShiftU;
     }
@@ -221,6 +227,32 @@ struct Camera {
 
     // Project a world point to raster. Returns false if behind camera or off-film.
     // On success sets px,py and cosCam = cosine between forward and eye->point.
+    // Where world point `p` lands on the film, in continuous pixel coordinates (x right, y up,
+    // a pixel's centre at its index + 0.5), on or off the film. False when it cannot be imaged:
+    // behind a rectilinear camera, or on its axis's far side for a fisheye that cannot see there.
+    bool projectF(const Vec3& p, double& fx, double& fy) const {
+        const Vec3 d = p - eye;
+        const double cz = dot(d, w);
+        double ix, iy;
+        if (projection == CAM_RECTILINEAR) {
+            if (cz <= 1e-12) return false;
+            ix = (dot(d, u) / cz) / tanHalfX - frustumShiftX;
+            iy = (dot(d, v) / cz) / tanHalfY;
+        } else {
+            const double len = std::sqrt(dot(d, d));
+            if (len < 1e-12) return false;
+            double c = cz / len;
+            c = c < -1.0 ? -1.0 : (c > 1.0 ? 1.0 : c);
+            const double rho = projRadius(projection, std::acos(c)) / rEdge;
+            const double ru = dot(d, u), rv = dot(d, v), rd = std::sqrt(ru * ru + rv * rv);
+            ix = rd < 1e-12 ? 0.0 : rho * ru / rd;
+            iy = rd < 1e-12 ? 0.0 : rho * rv / rd;
+        }
+        fx = (ix * 0.5 + 0.5) * film.resX;
+        fy = (iy * 0.5 + 0.5) * film.resY;
+        return true;
+    }
+
     bool project(const Vec3& p, int& px, int& py, double& cosCam, double& dist2) const {
         Vec3 d = p - eye;
         double cz = dot(d, w);

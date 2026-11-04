@@ -736,3 +736,9 @@ keyed from a Catmull-Rom through the path's frames; loom writes a moving `Camera
 instant, the hit carried out. *Moving lights and emissive meshes (0.410.0, done):* rigid only,
 sampled at the instant and carried out, with a timed light tree. Open: lights that scale over
 the shutter, aimed area lights; M/S/U/J with time carried into the light side; the GPU.
+
+**Stage C, motion vectors and depth (0.411.0, done):** `-write-aovs` writes the guide pass's
+albedo and normal and, from one ray through each pixel's centre at the frame's instant, depth,
+world position, the point's position a frame earlier, and its motion vectors a frame back and
+forward (each point carried by its own keys, seen by the camera a frame away: a path's
+neighbouring frame or a keyed camera's keys carried out). `tools/check_aovs.py`.

@@ -13132,6 +13132,10 @@ static bool            g_oidn            = false;
 static bool            g_oidnGuides      = true;    // -oidn-noguides: denoise the colour alone
 static int             g_oidnGuideSide   = 4;       // -oidn-guide-spp n: sqrt(n) rays a side per pixel
 static bool            g_oidnWriteGuides = false;   // -oidn-write-guides: the guides as PFMs beside -o
+// -write-aovs: the guide pass's images as PFMs beside -o, denoised or not (ROADMAP 11 stage C):
+// albedo, normal, depth, world position (now and a frame earlier) and the motion vectors a frame
+// back and forward.
+static bool            g_writeAovs = false;
 static oidnrt::Options g_oidnOpts;
 static bool            g_oidnDeviceSet   = false;   // -oidn-device given; else it follows -device
 
@@ -13161,6 +13165,7 @@ static int parseOidnFlag(int argc, char** argv, int& i) {
     if      (!std::strcmp(a, "-oidn"))              {}
     else if (!std::strcmp(a, "-oidn-noguides"))     g_oidnGuides = false;
     else if (!std::strcmp(a, "-oidn-write-guides")) g_oidnWriteGuides = true;
+    else if (!std::strcmp(a, "-write-aovs")) g_writeAovs = true;
     else if (i + 1 >= argc)                         return 0;
     else if (!std::strcmp(a, "-oidn-guide-spp")) {
         const int n = std::atoi(argv[++i]);
@@ -13471,7 +13476,17 @@ static std::string pfmPathFor(const std::string& path) {
 struct GuideScope {
     GuideScope(const Scene& scene, const Camera& cam, int W, int H, char mode,
                const std::string& outPath) {
-        if (!g_oidn || !g_oidnGuides) return;
+        const bool denoise = g_oidn && g_oidnGuides;
+        if (!denoise && !g_writeAovs) return;
+        // -write-aovs alone, or a mode the denoiser takes no guides for: the images, written and
+        // not published.
+        if (!denoise || mode == 'A' || mode == 'C') {
+            if (g_writeAovs) {
+                auto g = dguide::render(scene, cam, W, H, g_oidnGuideSide);
+                if (g.W > 0) writeGuideFiles(g, W, H, outPath);
+            }
+            if (!denoise) return;
+        }
         if (mode == 'A' || mode == 'C') {
             static bool said = false;
             if (!said) {
@@ -13488,30 +13503,41 @@ struct GuideScope {
                     g_oidnGuideSide * g_oidnGuideSide,
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
                     g->clean ? "" : " -- the lens pupil is sampled, so they are not marked clean");
-        if (g_oidnWriteGuides) {
-            const std::string stem = pfmPathFor(outPath).substr(0, pfmPathFor(outPath).size() - 4);
-            for (const auto& [suffix, img] : {std::pair<const char*, const std::vector<Vec3>*>
-                                                  {".albedo.pfm", &g->albedo},
-                                              {".normal.pfm", &g->normal}}) {
-                const std::string p = stem + suffix;
-                if (writePfm(p, W, H, *img)) std::printf("wrote %s\n", p.c_str());
-                else std::fprintf(stderr, "warning: could not write %s\n", p.c_str());
-            }
-            // A PFM has nowhere to say its guides are noisy, and -topng -oidn-guides must not
-            // then treat them as clean: a marker beside them says so (and its absence, clean).
-            const std::string noisy = stem + ".guides-noisy.txt";
-            if (!g->clean) {
-                std::ofstream mk(noisy);
-                mk << "The guides beside this file were traced through a physical lens, whose "
-                      "pupil is sampled: they are not noise-free, and -topng -oidn-guides denoises "
-                      "against them with OIDN's cleanAux off.\n";
-            } else {
-                std::error_code ec;
-                std::filesystem::remove(noisy, ec);   // a stale one from an earlier lens render
-            }
-        }
+        if (g_oidnWriteGuides || g_writeAovs) writeGuideFiles(*g, W, H, outPath);
         setGuide(std::move(g));
         active = true;
+    }
+    // The guides as PFMs beside `outPath`: <stem>.albedo/.normal/.depth/.position/.prevposition/
+    // .motion/.motionfwd.pfm (depth in all three channels; a motion vector's x, y and 0).
+    static void writeGuideFiles(const dguide::Images& g, int W, int H, const std::string& outPath) {
+        const std::string stem = pfmPathFor(outPath).substr(0, pfmPathFor(outPath).size() - 4);
+        std::vector<Vec3> depth3(g.depth.size());
+        for (size_t i = 0; i < g.depth.size(); ++i) depth3[i] = Vec3{g.depth[i], g.depth[i], g.depth[i]};
+        for (const auto& [suffix, img] : {std::pair<const char*, const std::vector<Vec3>*>
+                                              {".albedo.pfm", &g.albedo},
+                                          {".normal.pfm", &g.normal},
+                                          {".depth.pfm", &depth3},
+                                          {".position.pfm", &g.position},
+                                          {".prevposition.pfm", &g.prevPosition},
+                                          {".motion.pfm", &g.motionBack},
+                                          {".motionfwd.pfm", &g.motionFwd}}) {
+            if (img->size() != (size_t)W * (size_t)H) continue;
+            const std::string p = stem + suffix;
+            if (writePfm(p, W, H, *img)) std::printf("wrote %s\n", p.c_str());
+            else std::fprintf(stderr, "warning: could not write %s\n", p.c_str());
+        }
+        // A PFM has nowhere to say its guides are noisy, and -topng -oidn-guides must not
+        // then treat them as clean: a marker beside them says so (and its absence, clean).
+        const std::string noisy = stem + ".guides-noisy.txt";
+        if (!g.clean) {
+            std::ofstream mk(noisy);
+            mk << "The guides beside this file were traced through a physical lens, whose "
+                  "pupil is sampled: they are not noise-free, and -topng -oidn-guides denoises "
+                  "against them with OIDN's cleanAux off.\n";
+        } else {
+            std::error_code ec;
+            std::filesystem::remove(noisy, ec);   // a stale one from an earlier lens render
+        }
     }
     ~GuideScope() { if (active) setGuide(nullptr); }
     GuideScope(const GuideScope&) = delete;
@@ -21427,6 +21453,8 @@ static void printHelp(const char* prog) {
 "                        With -denoise too: firefly clamp, then OIDN, then the chroma filter\n"
 "  -oidn-noguides        denoise the colour alone (implies -oidn)\n"
 "  -oidn-guide-spp <n>   guide rays per pixel, rounded to a square (default 16)\n"
+"  -write-aovs           write the guide pass's images beside -o, denoised or not: <out>.albedo,\n"
+"                        .normal, .depth, .position, .prevposition, .motion, .motionfwd.pfm\n"
 "  -oidn-write-guides    also write <out>.albedo.pfm / <out>.normal.pfm (implies -oidn);\n"
 "                        -topng -oidn-guides <stem> re-develops a checkpoint with them\n"
 "  -oidn-quality <q>     high | balanced | fast (default high)\n"
@@ -23980,6 +24008,7 @@ static int run(int argc, char** argv) {
             c.apertureR = cs->aperture;
             c.shutterOpen = cs->shutterOpen; c.shutterClose = cs->shutterClose;
             c.motion = cs->motion;
+            c.frameNeighbours = cs->frameNeighbours;
             if (cs->filmDist_m > 0.0) { c.filmDist = cs->filmDist_m; c.lensF = cs->lensF_m; }  // physical-optics (lens/fstop): film at image distance, real focal
             else                      { c.setFocus(cs->focus); }                                // legacy unit-film camera
             char cmode = effModeCam(*cs);
@@ -27730,7 +27759,7 @@ static int run(int argc, char** argv) {
                     std::printf("[camera] '%s' (mode %c, %dx%d) -> %s\n",
                                 rc.name.c_str(), groupMode, rc.res, rc.resY, op.c_str());
                 std::unique_ptr<GuideScope> guides;
-                if (final && g_oidn)
+                if (final && (g_oidn || g_writeAovs))
                     guides = std::make_unique<GuideScope>(scene, rc.cam, rc.res, rc.resY, groupMode, op);
                 if (!writeFilm(op.c_str(), disp, (double)accN, rc.exposure, quiet, nullptr, scene.absolute))
                     sharedWriteFail = true;

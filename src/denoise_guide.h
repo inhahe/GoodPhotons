@@ -59,6 +59,19 @@ struct Images {
     int W = 0, H = 0;
     std::vector<Vec3> albedo;   // linear sRGB in [0,1]
     std::vector<Vec3> normal;   // world-space shading normal, averaged over the pixel
+    // What a temporal denoiser reprojects with (ROADMAP 11 stage C), from one ray through the
+    // pixel's centre at the frame's instant -- a point, not an average across an edge:
+    //   depth       the surface's distance along the camera's axis; 0 where the ray meets nothing
+    //   position    its world position (0 where nothing)
+    //   prevPosition  where that point sat a frame earlier (carried by its keys), for a
+    //               temporal denoiser to tell its own history from another surface's
+    //   motionBack  where it sits a frame earlier, in this image's pixels, minus where it sits
+    //   motionFwd   ... a frame later. Pixels: x right, y up (the film's rows, bottom first); z 0.
+    // A point is carried a frame out by its own motion keys and seen by the camera a frame before
+    // or after (Camera::frameNeighbours); a pixel that meets nothing moves with the sky, as the
+    // camera turns.
+    std::vector<float> depth;
+    std::vector<Vec3> position, prevPosition, motionBack, motionFwd;
     bool clean = true;          // deterministic (see the header comment)
     // What the denoiser is handed, made once by seal(): the two images as float RGB rows,
     // UPRIGHT (row 0 = the top of the image; the film is stored bottom-up), and an id unique
@@ -231,6 +244,61 @@ inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& al
     }
 }
 
+// Where point `p0`, at the frame's instant on a primitive of motion set `set` (-1: still), sits
+// `frames` frames out: carried by its keys, linearly past the motion interval's end on that side
+// (or past the other end, when the interval stops at the instant). An estimate beyond the
+// interval, as a frame's own keys are all it knows of its neighbours.
+inline Vec3 framePoint(const Scene& scene, int set, const Vec3& p0, double frames) {
+    if (set < 0 || !(scene.motionB > scene.motionA)) return p0;
+    double end = frames < 0.0 ? scene.motionA : scene.motionB;
+    if (end == 0.0) end = frames < 0.0 ? scene.motionB : scene.motionA;
+    if (end == 0.0) return p0;
+    const Vec3 pe = scene.motionAt(set, scene.motionU(end)).apply(p0);
+    return p0 + (pe - p0) * (frames / end);
+}
+
+// The centre-ray half of the guides (Images::depth and on). False if a stop was requested.
+inline bool motionAovs(const Scene& scene, const Camera& cam, int W, int H, Images& g) {
+    const size_t N = (size_t)W * (size_t)H;
+    g.depth.assign(N, 0.0f);
+    g.position.assign(N, Vec3{0, 0, 0});
+    g.prevPosition.assign(N, Vec3{0, 0, 0});
+    g.motionBack.assign(N, Vec3{0, 0, 0});
+    g.motionFwd.assign(N, Vec3{0, 0, 0});
+    Camera prev = cam, next = cam;
+    if (cam.frameNeighbours) {
+        cam.posedAs((*cam.frameNeighbours)[0], prev);
+        cam.posedAs((*cam.frameNeighbours)[1], next);
+    }
+    // At the instant as a time (the moving primitives' own path), so a hit names its motion set.
+    const double u0 = scene.hasMotion() ? scene.motionU(0.0) : -1.0;
+    return ft::parallelFor((size_t)H, 1, [&](size_t row) {
+        const MotionTimeScope at(u0);
+        const int py = (int)row;
+        for (int px = 0; px < W; ++px) {
+            const size_t i = (size_t)py * W + px;
+            const Ray r = cam.genRay(px, py, 0.5, 0.5);
+            const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
+            Vec3 pB, pF;
+            if (h.valid) {
+                g.depth[i] = (float)dot(h.p - cam.eye, cam.w);
+                g.position[i] = h.p;
+                pB = framePoint(scene, h.motionSet, h.p, -1.0);
+                pF = framePoint(scene, h.motionSet, h.p, 1.0);
+                g.prevPosition[i] = pB;
+            } else {
+                // The sky: a direction, seen from wherever the camera stands.
+                pB = prev.eye + r.d * 1e9;
+                pF = next.eye + r.d * 1e9;
+            }
+            const double cx = px + 0.5, cy = py + 0.5;
+            double fx, fy;
+            if (prev.projectF(pB, fx, fy)) g.motionBack[i] = Vec3{fx - cx, fy - cy, 0.0};
+            if (next.projectF(pF, fx, fy)) g.motionFwd[i] = Vec3{fx - cx, fy - cy, 0.0};
+        }
+    });
+}
+
 // The guides for `cam` at W x H, in the film's row order (row 0 = the bottom of the image,
 // as Camera::genRay counts). `side`^2 stratified rays per pixel. Returns an empty Images
 // (W == 0) if a stop was requested part-way.
@@ -280,6 +348,7 @@ inline Images render(const Scene& scene, const Camera& cam, int W, int H, int si
         }
     });
     if (!ok) return Images{};
+    if (!motionAovs(scene, cam, W, H, g)) return Images{};
     g.W = W; g.H = H;
     seal(g);
     return g;
