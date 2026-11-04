@@ -55,6 +55,7 @@
 #include "bsdf_eval.h"    // bsdfF / bsdfPdf — the evaluable half, shared with backward.h
 #include "photonbeams.h"  // BeamMap — mode J (UPBP) merges camera rays against photon beams
 #include "surfmerge.h"    // SurfMap — mode J's OTHER merge kind, the point x point (VCM's VM)
+#include "gatherplane.h"  // nearGatherPlane — which stored vertices a merge keeps (MERGE-PROXIMITY)
 #include "beamgather.h"   // gatherPhotonBeamsW — the Beam x Ray estimator, with a MIS hook
 #include "parallel.h"          // ft::stopRequested — cooperative -stop inside mode J's beam pass
 #include "render_progress.h"   // StageProgress — deposit progress for the live window/title
@@ -2818,6 +2819,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                         SurfPhoton ph;
                         ph.p      = path[u].p;
                         ph.wo     = dPrev;                 // unit, toward the previous vertex
+                        ph.nx = (float)path[u].ng.x; ph.ny = (float)path[u].ng.y; ph.nz = (float)path[u].ng.z;
                         ph.lambda = (float)hb.lam[0];
                         ph.beta   = (float)path[u].beta;
                         ph.cx = (float)cieX(ph.lambda);
@@ -4850,6 +4852,9 @@ struct BdptRenderer {
                                     const SurfPhoton& ph = photons->pts[(size_t)idx];
                                     const SurfMis* lm = photons->misOf((size_t)idx);
                                     if (!lm) return;      // no weight: refuse (see misOf)
+                                    // another surface's photon, off this one's tangent plane
+                                    if (!nearGatherPlane(vk.p, ngo, ph.p, Vec3{ph.nx, ph.ny, ph.nz},
+                                                         1e-3 * photons->radius)) return;
                                     if (mergeFromBehind(vkTwoSided, ph.wo, ngo)) return;
                                     const double lam = (double)ph.lambda;
                                     double fCam = bsdfF(*vk.mat, vk.ns, woCam, ph.wo, lam,

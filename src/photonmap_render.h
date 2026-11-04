@@ -350,7 +350,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
         // reported footprint 0.0000 on a solid marble cap, which is impossible.
         bool incomplete = false;
         const double raw = gatherFootprintArea(scene, p, n, r, gaGeomDisc(), gaGeomLayers(),
-                                               &incomplete);
+                                               gatherBandSlack(r, fiberR), &incomplete);
         if (!incomplete) {
         const double cov = raw / denom;
         // THE COVERAGE MUST BE BOUNDED AWAY FROM ZERO. The estimate divides by it, and a
@@ -456,6 +456,24 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 h.t += tAcc;
                 if (h.t > 2.0 * r) break;                               // past the window: a miss
                 const Material* pm = (h.matId >= 0 && h.matId < (int)scene.mats.size()) ? &scene.mats[h.matId] : nullptr;
+                // A face off the gather's tangent-plane band (withinGatherBand at the photon test's
+                // slack, so none on a curve) is another surface's: on through one above the band -- a
+                // shelf over the floor point -- and none of this surface under the probe once below
+                // it. Not a hair strand: it holds no photon, and its opacity coin below says whether
+                // it covers the disc.
+                if (!(pm && pm->type == MatType::Hair && h.fiberRadius > 0.0)) {
+                    const double dzH = r - h.t;
+                    if (!withinGatherBand(std::fabs(dzH), rr * rr + dzH * dzH, dot(orientedGeoN(h), n),
+                                          gatherBandSlack(r, fiberR))) {
+                        if (dzH > 0.0) {
+                            tAcc = h.t;
+                            pr = Ray{h.p + pr.d * 1e-9, pr.d};
+                            continue;
+                        }
+                        h.valid = false;
+                        break;
+                    }
+                }
                 // On through a face that holds no photon -- but only one above the plane: a face ON
                 // it (a glass box standing on the floor, coplanar with it) is the surface's own
                 // height, and passing it would skip the surface beside it.
@@ -1254,7 +1272,8 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                     // The true normal, as the photons carry it (depositPhoton): one for the
                     // radius, the coverage and the photon test alike.
                     const Vec3 gn = orientedGeoN(h);
-                    const double rq = M.adaptiveRadius(h.p, gn);
+                    const double slack = M.gatherSlack(h.fiberRadius);
+                    const double rq = M.adaptiveRadius(h.p, gn, slack);
                     nrmOut = normFixed;
                     if (rq != M.radius) {
                         const double a = PI * rq * rq;
@@ -1270,7 +1289,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                                            h.fiberRadius));
                     Vec3 g{0, 0, 0};
                     M.queryR(h.p, rq, [&](const Photon& ph, double, int k) {
-                        if (dot(ph.n, gn) < 0.5) return;    // another surface's photon
+                        if (!onGatherSurface(h.p, gn, M.pos[k], ph.n, slack)) return;   // another surface's
                         double rhoY = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                         double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, ph.lambda));
                         double f = rhoY * (1.0 / PI);
@@ -1643,7 +1662,8 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                     // The true normal, as the photons carry it (depositPhoton): one for the
                     // radius, the coverage and the photon test alike.
                     const Vec3 gn = orientedGeoN(h);
-                    const double rq = M.adaptiveRadius(h.p, gn);
+                    const double slack = M.gatherSlack(h.fiberRadius);
+                    const double rq = M.adaptiveRadius(h.p, gn, slack);
                     nrmOut = normFixed;
                     if (rq != M.radius) {
                         const double a = PI * rq * rq;
@@ -1659,7 +1679,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                                            h.fiberRadius));
                     Vec3 g{0, 0, 0};
                     M.queryR(h.p, rq, [&](const Photon& ph, double, int k) {
-                        if (dot(ph.n, gn) < 0.5) return;    // another surface's photon
+                        if (!onGatherSurface(h.p, gn, M.pos[k], ph.n, slack)) return;   // another surface's
                         double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                         double f = rho * (1.0 / PI);
                         // SPECGATHER: the walk's reflectances belong at THIS photon's wavelength,

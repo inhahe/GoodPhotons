@@ -32,9 +32,9 @@ about n points down through the mirror. With nothing above it to reflect, the im
 under 1/1000 of the same view with the mirror taken away (the lamp seen directly).
 
 In modes R, D, J, U, M and S on the CPU and the GPU, and B (forward) on the GPU. Mode M runs at
-its fixed radius (-nopmauto): its adaptive one outgrows the gap to the floor below and gathers
-the floor's own photons (known-issues MERGE-PROXIMITY), which is not what this checks. Exits 0
-when every case holds, 1 otherwise.
+its adaptive radius, which outgrows the gap to the lit floor below the sheet: every gather keeps
+only the photons near its own surface's tangent plane (known-issues MERGE-PROXIMITY), so the
+floor's own photons must not reach the sheet's top. Exits 0 when every case holds, 1 otherwise.
 """
 import argparse
 import os
@@ -54,8 +54,8 @@ MODES = [("R_cpu", ["-mode", "R", "-spp", "16", "-device", "cpu"]),
          ("J_gpu", ["-mode", "J", "-spp", "4", "-device", "gpu"]),
          ("U_cpu", ["-mode", "U", "-spp", "2", "-device", "cpu"]),
          ("U_gpu", ["-mode", "U", "-spp", "4", "-device", "gpu"]),
-         ("M_cpu", ["-mode", "M", "-nopmauto", "-n", "1000000", "-spp", "4", "-device", "cpu"]),
-         ("M_gpu", ["-mode", "M", "-nopmauto", "-n", "1000000", "-spp", "4", "-device", "gpu"]),
+         ("M_cpu", ["-mode", "M", "-n", "1000000", "-spp", "4", "-device", "cpu"]),
+         ("M_gpu", ["-mode", "M", "-n", "1000000", "-spp", "4", "-device", "gpu"]),
          ("S_cpu", ["-mode", "S", "-spp", "2", "-device", "cpu"]),
          ("S_gpu", ["-mode", "S", "-spp", "4", "-device", "gpu"])]
 

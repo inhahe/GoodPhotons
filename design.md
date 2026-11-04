@@ -5563,8 +5563,11 @@ as the one at fault.
   diffuse-transmitting and fluorescent surfaces and the compounds and fibers that may be one;
   0.381.6-0.381.7; a face ON the plane is the surface's own height and counts) and through a fiber
   with the probability its opacity leaves it absent -- accepted
-  on the same 60-degree test the photon query uses, and weighted by `1/cos(tilt)` because the
-  probe samples PROJECTED area while the estimator needs SURFACE area. `gatherCoverage` /
+  on the same test the photon query uses (facing within 60 degrees, and in the tangent-plane band
+  below), and weighted by `1/cos(tilt)` because the
+  probe samples PROJECTED area while the estimator needs SURFACE area. A face off the band above
+  the plane is another surface's, and the probe goes on through it; one off it below ends the
+  probe as a miss. `gatherCoverage` /
   `gatherAreaScale` in `photonmap_render.h`, device twin `dGatherCoverage` in `render_cuda.cu`.
   Each map's coverage is taken at that map's radius and scales that map's estimate alone: the
   caustic map gathers at its own per-query radius, so the main map's correction must not reach it
@@ -5572,6 +5575,25 @@ as the one at fault.
   applies it to each pass's flux BEFORE it enters `tau` — coverage belongs to
   the radius actually gathered at, and SPPM shrinks its radius every pass, so a single coverage
   measured at the final radius would misprice every earlier one.
+
+  **Which photons a gather keeps** (0.431.0, MERGE-PROXIMITY; `gatherplane.h`, device twins
+  `dWithinGatherBand` and kin). A gather takes the photons in a ball, so a second surface inside it
+  -- the floor under a table top, once mode M's adaptive radius outgrows the table's height --
+  lent its light to the first (a sheet lit only from below read 21x its top lit from above). Every
+  gather (modes M and S: `onGatherSurface`; U and J, whose stored normals are not oriented to a
+  side: `nearGatherPlane`) keeps a photon only near its tangent plane: off it by at most
+  (0.1 + sin theta) times its distance d, theta the angle between the two normals, plus a rounding
+  slack of a thousandth of the radius (the map's own in mode M, so the adaptive radius's count and
+  the sum see one population). A smooth surface bends about d sin(theta)/2 off its tangent plane over
+  d, so curved and faceted surfaces keep their photons; a parallel surface above or below does not.
+  A gather point on a curve (`fiberRadius > 0`: `type diffuse` fur, grass, wire) takes no band
+  (`gatherBandSlack`): a strand far thinner than the radius has no tangent plane at that scale, and
+  the photons around it lie on its neighbours, which the band would drop while the estimate still
+  divides by the whole disc (modes M, S and U; J never merges at a curve vertex, `surfMergeSite`).
+  The footprint (above) and the adaptive radius take the same test, at the same slack. Mode J's
+  stored photon carries its normal for it (`SurfPhoton::n*`, the device's packed
+  `DSurfPhoton::nOct`). Checks: `tools/check_shading_leak.py` (a sheet over a lit floor), `tools/check_fur_gather.py`
+  (a diffuse fur coat).
 
   **An analytic clip was the obvious design and is the wrong one here:** clipping same-facing
   primitives to the disc is exact for triangles and impossible for fur, isosurfaces and CSG

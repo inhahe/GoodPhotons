@@ -80,34 +80,37 @@ commit.
 Wrong images in the modes most used come first, then the build, then speed, then debt and scope.
 Each names the section its line is in.
 
-1. **MERGE-PROXIMITY** (4.2) — every photon gather (M, S, U, J) takes photons from any surface in
-   its radius: a table top gathers the floor's light.
+1. ~~**MERGE-PROXIMITY** (4.2) — every photon gather (M, S, U, J) takes photons from any surface in
+   its radius: a table top gathers the floor's light.~~ Done, 0.431.0.
 2. **HAZE-SUN-B** (4.2) — mode B lights an unbounded sunlit haze at 0.16 of mode R.
 3. **VCM-SPEC** and **SPPM-SPECTRAL** (4.2) — modes U and S merge at the camera's wavelength, so a
    coloured surface seen before a merge washes out (the fix mode J got in 0.386.1, JSPEC).
-4. **MODEM-GPU-CORNER** (4.2) — GPU mode M reads a box's corner 15 % bright.
-5. **VCOL-BDPT-GPU** (4.2) — GPU modes D and J connect to a vertex-coloured mesh without its colours.
-6. **MODEM-BEAM-CARRIER**, **JSPEC-GAPS**' rest and **MODEM-REDPASS** (4.2) — mode M's beams, and
+4. **MODEM-GPU-CORNER** and **MODEM-COMPOTE-NAN** (4.2) — GPU mode M reads a box's corner 15 %
+   bright, and writes NaN pixels on gallery_rain's gem compote.
+5. **CURVE-GATHER** (4.2) — modes M, S and U read a coat of diffuse fur at 0.7-2.4 of mode R; never
+   gather at a curve vertex, as mode J does.
+6. **VCOL-BDPT-GPU** (4.2) — GPU modes D and J connect to a vertex-coloured mesh without its colours.
+7. **MODEM-BEAM-CARRIER**, **JSPEC-GAPS**' rest and **MODEM-REDPASS** (4.2) — mode M's beams, and
    mode J's last camera-side factors, at the camera's wavelength.
-7. **UPBP-BEAM-RADIUS** with **J-FOG-REALCAM** (4.3) — mode J's beam kernel never shrinks: fog 1-4 %
+8. **UPBP-BEAM-RADIUS** with **J-FOG-REALCAM** (4.3) — mode J's beam kernel never shrinks: fog 1-4 %
    low, never converging.
-8. **GLTF-ROUGHNESS-MAP** and **GLTF-MAP-MEAN-GUTTERS** (4.2) — glTF imports rougher than glTF means,
+9. **GLTF-ROUGHNESS-MAP** and **GLTF-MAP-MEAN-GUTTERS** (4.2) — glTF imports rougher than glTF means,
    and their mean metalness and roughness counting the atlas gutters.
-9. **FWD-GLOSSY-INDIRECT** (4.2) — modes A and B leave a rough reflector black in a mirror or
-   through glass.
-10. **CPU-ONLY-BUILD** (4.4) — a build without CUDA does not compile.
-11. **BLUR-EPOCH-COST** (4.5) — a blurred clock-budgeted mode M or J spends its clock rebuilding.
-12. **UPBP-W-CHROMATIC** (4.3) — mode J's beam weight mixes two wavelengths in a chromatic medium.
-13. **FEATHER-IS-A-THRESHOLD** (4.2) — `feather` shrinks a cloud instead of ramping it; the fix
+10. **FWD-GLOSSY-INDIRECT** (4.2) — modes A and B leave a rough reflector black in a mirror or
+    through glass.
+11. **CPU-ONLY-BUILD** (4.4) — a build without CUDA does not compile.
+12. **BLUR-EPOCH-COST** (4.5) — a blurred clock-budgeted mode M or J spends its clock rebuilding.
+13. **UPBP-W-CHROMATIC** (4.3) — mode J's beam weight mixes two wavelengths in a chromatic medium.
+14. **FEATHER-IS-A-THRESHOLD** (4.2) — `feather` shrinks a cloud instead of ramping it; the fix
     changes `gallery_rain`'s cloud edges, so show the user before it lands.
-14. **GLOSSY-SAMPLE-SITES** (4.4) — the interference factor applied by hand at two dozen sites.
-15. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.
-16. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
-17. **P-HEROSPLIT-FIRST**, **ROUGH-IRID-AIR** (4.3) — narrow estimator gaps.
-18. **REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.
-19. **BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.
-20. **DEFORM-LIMITS**, **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
-21. **BLACK-PIXELS-ONCE** (4.2) — one render's black pixels, never reproduced.
+15. **GLOSSY-SAMPLE-SITES** (4.4) — the interference factor applied by hand at two dozen sites.
+16. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.
+17. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
+18. **P-HEROSPLIT-FIRST**, **ROUGH-IRID-AIR** (4.3) — narrow estimator gaps.
+19. **REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.
+20. **BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.
+21. **DEFORM-LIMITS**, **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
+22. **BLACK-PIXELS-ONCE** (4.2) — one render's black pixels, never reproduced.
 
 Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever touches its entries.
 
@@ -135,12 +138,16 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 ### 4.2 Wrong, missing or silent output
 
-- [ ] **MERGE-PROXIMITY** — a density estimate gathers photons from every surface within its radius
-  (only a facing test filters them); mode M's adaptive radius makes that a large leak.
+- [x] **MERGE-PROXIMITY** (0.431.0) — every gather keeps only the photons near its tangent plane
+  (`gatherplane.h`), except on a curve; mode M's sheet lit from below read 21x, now 0.
 - [ ] **HAZE-SUN-B** — mode B lights an unbounded sunlit haze at 0.163 of mode R, its floor 0.846.
 - [ ] **VCM-SPEC** — mode U's merges read the camera path's colours at the camera's wavelength.
 - [ ] **MODEM-GPU-CORNER** — GPU mode M reads one corner of a box 15 % bright (and two smaller
   one-block residuals).
+- [ ] **CURVE-GATHER** — modes M, S and U misread a coat of `type diffuse` curves
+  (`tools/check_fur_gather.py`), M's two backends differently; VCM-THIN-CURVES is its mode-U half.
+- [ ] **MODEM-COMPOTE-NAN** — GPU mode M writes ~125 NaN pixels on gallery_rain's gem compote at
+  320 x 180.
 - [ ] **VCOL-BDPT-GPU** — GPU modes D/J shade a vertex-coloured mesh without its colour in every
   connection (`DVertex` does not carry `vcol`).
 - [ ] **MODEM-BEAM-CARRIER** — mode M's beam gather reads the camera's spectral factors at its

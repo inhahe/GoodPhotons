@@ -332,7 +332,7 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                 double M = 0.0;          // photons found this pass
                 Vec3   phi{0, 0, 0};     // local flux sum (XYZ, per-photon wavelength)
                 pm.queryR(h.p, P.radius, [&](const Photon& ph, double, int k) {
-                    if (dot(ph.n, gn) < 0.5) return;   // another surface's photon
+                    if (!onGatherSurface(h.p, gn, pm.pos[k], ph.n, gatherBandSlack(P.radius, h.fiberRadius))) return;   // another surface's
                     double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                     double f = rho * (1.0 / PI);
                     phi += pm.cie[k] * (f * (double)ph.power);        // == cie(lambda_p), precomputed

@@ -26,6 +26,7 @@
 #include <utility>
 #include <thread>
 #include "linalg.h"
+#include "gatherplane.h"   // onGatherSurface: which photons a gather keeps
 #include "color.h"
 #include "allocreport.h"   // OOM that names the buffer, its size and the flag that sizes it
 
@@ -61,6 +62,7 @@ struct Photon {
     float power;      // monochromatic power (beta) carried by this photon
     float lambda;     // wavelength (nm)
 };
+
 
 // A per-thread deposit bank: the split (position, payload) pair that a photon pass appends
 // to, mirroring PhotonMap's own split layout so the concatenation into the map is a plain
@@ -431,6 +433,9 @@ struct PhotonMap {
     // `radius` of p. `index` addresses the photon's row in photons[] / cie[].
     template <class F>
     void query(const Vec3& p, F&& fn) const { queryR(p, radius, std::forward<F>(fn)); }
+    // The slack of this map's plane test (onGatherSurface) for a gather point on a curve of radius
+    // `fiberR` (0 off one): one value for the adaptive radius's count and the gather's sum.
+    double gatherSlack(double fiberR) const { return gatherBandSlack(radius, fiberR); }
 
     // Same, but with an explicit query radius `r`. The 3x3x3 cell neighbourhood only
     // covers radii up to the grid cell size, so the CALLER MUST ensure r <= cellSize
@@ -495,13 +500,15 @@ struct PhotonMap {
     // Take the tightest shell that still holds k, then interpolate inside it under the local
     // uniform-density assumption (count grows as r^2): r_q^2 = r_i^2 * k / C_i.
     //
-    // The normal test is applied HERE and not only in the caller's sum, deliberately. Counting
-    // a wall's photons while gathering the floor beside it would shrink the radius for a
-    // population the sum then rejects, and the estimate is divided by pi*r_q^2 either way — so
-    // the mismatch would print a dark seam along every surface junction.
+    // The surface test (onGatherSurface: facing, and near the tangent plane) is applied HERE and
+    // not only in the caller's sum, deliberately. Counting a wall's photons while gathering the
+    // floor beside it would shrink the radius for a population the sum then rejects, and the
+    // estimate is divided by pi*r_q^2 either way — so the mismatch would print a dark seam along
+    // every surface junction.
     static const int kAdaptBins = 16;   // covers r down to r * 2^-8 = r/256
 
-    double adaptiveRadius(const Vec3& p, const Vec3& n) const {
+    // `slack`: the gather's own plane-test slack (gatherSlack), which its sum must use too.
+    double adaptiveRadius(const Vec3& p, const Vec3& n, double slack) const {
         if (kGather <= 0.0 || photons.empty() || radius <= 0.0) return radius;
         int hist[kAdaptBins] = {0};
         const double r2 = radius * radius;
@@ -518,7 +525,7 @@ struct PhotonMap {
                         Vec3 d = p - pp[k];
                         const double d2 = dot(d, d);
                         if (d2 > r2) continue;
-                        if (dot(photons[k].n, n) < 0.5) continue;
+                        if (!onGatherSurface(p, n, pp[k], photons[k].n, slack)) continue;
                         // Shell index: t in (2^-(i+1), 2^-i] -> i. ilogb(t) is the exponent e
                         // with t = m*2^e, m in [1,2), so i = -e-1. d2 == 0 lands in the
                         // innermost shell (ilogb(0) is FP_ILOGB0, clamped below).

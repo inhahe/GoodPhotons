@@ -72,6 +72,38 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-11-04, 0.431.0): CURVE-GATHER — modes M, S and U misread a coat of `type diffuse` curves, and M's two backends disagree on it
+
+`tools/check_fur_gather.py` (a 0.07 m ball in `type diffuse` fur at fur_creature's 450 000
+strands per m², 0.4 mm strands, under a ceiling panel; 96 x 72) reads the coat, against mode R on
+the GPU, at **M 0.871 (CPU) / 0.711 (GPU), S 1.446 / 1.330, U 2.356 / 2.100**; two seeds agree
+to 3 %, and 0.430.2 reads the same (but GPU S, 3.057: below). The check holds each to its
+recorded value, so it guards the values rather than vouching for them. Mode J reads about 1 on
+diffuse curves: since 0.385.0 it never merges at a curve vertex (VCM-THIN-CURVES, whose mode-U
+half this is, on a denser coat: 150 sparse curves read 0.80 there).
+A density estimate at a point on a strand divides the photons of its ball by a disc's area, and
+the ball holds a slab of strands, not a disc of surface: U, with no footprint correction, reads
+the overfill (2x); M's correction and its fiber gate (M-GATHERAREA, `gaFiberSkip`) leave it dark,
+and differently on the two backends, which must agree whatever the bias. GPU S read 3.057 until
+0.431.0, when its footprint began to take the gather point's fiber radius as the CPU's does (the
+fiber gate had never fired there).
+Proper fix: do what mode J does, for every mode: never gather at a curve vertex. Treat a diffuse
+curve as M and S treat a hair strand (light it by NEE, continue the path, gather where it lands)
+and give U's light store, merge and dVC/dVM recursions the same predicate (`surfMergeSite`).
+Then re-record check_fur_gather's values, which should all move to about 1.
+
+## OPEN (2026-11-04, 0.430.2): MODEM-COMPOTE-NAN — GPU mode M writes NaN pixels on gallery_rain's gem compote
+
+`ftrace -in scenes/gallery_rain.ftsl -mode M -device gpu -spp 32 -n 8000000 -seed 1 -r 320 180`
+writes 124 pixels whose every channel is NaN (126 with `-seed 2`; none infinite), almost all of
+them on the gem compote's ruby bowl (lower right: rows 84-165, columns 180-301 of the 320 x 180
+frame) and a few on the glass ball and the gem sphere. Mode R on the same frame writes none, and
+0.430.2 and 0.431.0 write the same 124, so it predates MERGE-PROXIMITY. The bowl is a nested
+dielectric (`priority`) holding twelve SF10 stones (dispersive): a camera path through it is
+the likely carrier, a refraction or a spectral factor going 0/0 in the GPU mode-M walk. Not yet
+tried: the CPU (`-device cpu`), `-nopmauto`, `-beams`. Reproduce with the command above and
+count `~isfinite` in the `.pfm`. Found while measuring MERGE-PROXIMITY.
+
 ## FIXED (2026-11-03, 0.406.0; opened 2026-11-03, 0.405.1): NONASCII-PATH — ftrace cannot open a scene or write an image at a path outside the ANSI code page's reach
 
 **Fixed in 0.406.0:** ftrace.exe embeds a manifest (`src/ftrace.manifest`) that makes its process code page UTF-8, so argv and every narrow-string file API speak UTF-8; `tools/check_object_frames.py` renders a scene at `zoë 山/x.ftsl`.
@@ -588,7 +620,34 @@ faces away). BSDF continuations: see CONTINUATION-LEAK.
 Found by the Opus review of 0.400.1; -checkdevhits holds orientedGeoN to the ray's side on
 every hit and the device's dShadedNg to it.
 
-## OPEN (2026-10-26): MERGE-PROXIMITY — a density estimate gathers photons from every surface within its radius; mode M's adaptive radius makes that a large leak
+## FIXED (2026-11-04, 0.431.0; opened 2026-10-26): MERGE-PROXIMITY — a density estimate gathers photons from every surface within its radius; mode M's adaptive radius makes that a large leak
+
+**Fixed in 0.431.0** as proposed below (`src/gatherplane.h`; device twins in `render_cuda.cu`).
+Every gather, modes M, S, U and J on both backends, keeps a photon only within
+(0.1 + sin theta) d + r/1000 of its tangent plane. The plane test also covers mode M's adaptive
+radius count, the probe footprint and the geometric one. Mode J's stored photon carries its
+normal, packed into 32 bits on the device. A gather point on a curve takes no band
+(`gatherBandSlack`): a strand far thinner than the radius has no tangent plane at that scale,
+and with the band there the coat of `tools/check_fur_gather.py` lost a fifth to two fifths of its
+light in modes M, S and U (fur_creature in mode M: up to 30 % darker against mode R).
+Measured, GPU mode M against mode R:
+- `tools/check_shading_leak.py`: the "near" sheets, 18.8-22x on 0.430.2, read 0; all 143 cases
+  pass, and mode M now runs at its adaptive radius.
+- fur_creature (240 x 180): 0.9664 -> 0.9663 of R over the frame; 2 of 660 blocks moved by more
+  than 2 %.
+- gallery_rain (320 x 180): 1.9923 -> 1.9894. Mode M without `-beams` ignores the fog, hence 2x.
+  29 of 880 blocks moved, 13 of them toward R:
+  - the 3-D Julia at the far left, which read 13-62 % bright, moved toward R by up to 0.20;
+  - Alice's dress, already 14-33 % dark (M-GATHERAREA's cloth residual, which the overcount had
+    partly hidden), went 2-7 points darker;
+  - the fur creature's blocks moved both ways.
+- check_bitid against 0.430.2: the mapped and smooth cases are unchanged (GPU M and S within
+  1e-3). In flat and shapes, modes M, S, U and J differ in 1-27 pixels on the CPU (means within
+  0.012 %), and in more on the GPU, whose M and S are not bit-deterministic. GPU S on shapes
+  moved −0.145 %: its curve tubes now take the fiber gate (below).
+- The device's mode S now gives its footprint the gather point's fiber radius, as the host's
+  does. Its fiber gate had never fired there, so GPU S read check_fur_gather's coat at 3.06 of
+  mode R against the CPU's 1.45; it now reads 1.33 (CURVE-GATHER).
 
 Every photon gather (mode M's `queryR`, S's, U's VCM merge, J's surface merge) takes the photons
 within a sphere of its radius, whatever surface they lie on. Its only filter is a facing test

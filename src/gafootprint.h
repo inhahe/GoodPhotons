@@ -4,6 +4,7 @@
 // including the other.
 #include <vector>
 #include <cmath>
+#include "gatherplane.h"
 
 // The geometric footprint: same-facing surface area inside the gather ball, measured from
 // the GEOMETRY rather than inferred from a photon statistic.
@@ -31,11 +32,14 @@
 // surface area than the disc cell it came from. The facing test is SIGNED and calibrated
 // per gather (see below), so `cos` is positive wherever a layer is accepted.
 //
+// `slack` is the gather's plane-test slack (gatherBandSlack), so a layer counts where the
+// photon test would keep a photon on it.
+//
 // `incomplete` (optional) is set when a ray hit the layer cap, i.e. the chord held more
 // surfaces than were counted, so the area is an under-count and the caller should not
 // divide by it.
 inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
-                                  double r, int kDisc, int maxLayers,
+                                  double r, int kDisc, int maxLayers, double slack,
                                   bool* incomplete = nullptr) {
     if (incomplete) *incomplete = false;
     if (!(r > 0.0) || kDisc < 1) return 0.0;
@@ -109,7 +113,10 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             // opposes and drops out, stacked thin shells all agree and are all counted, and an
             // authored quad works whichever way its `u x v` happens to point.
             const double c = dot(h.ng, n) * orient;
-            if (c >= 0.5) area += cellArea / c;   // same-facing: what the photon query keeps
+            // Same-facing and in the tangent-plane band: what the photon query keeps.
+            const Vec3 dh = h.p - p;
+            if (c >= 0.5 && withinGatherBand(std::fabs(dot(dh, n)), dot(dh, dh), c, slack))
+                area += cellArea / c;
             t0 = h.t + eps;
         }
         if (layers >= maxLayers && incomplete) *incomplete = true;

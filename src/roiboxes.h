@@ -373,7 +373,7 @@ inline int gaFpAreaReport(const Scene& sc, const Camera& cam, int resX, int resY
             if (!h.valid || h.matId < 0 || h.matId >= (int)st.size()) continue;
             bool incomplete = false;
             const double a = gatherFootprintArea(sc, h.p, orientedGeoN(h), r, kDisc, maxLayers,
-                                                 &incomplete) / denom;
+                                                 gatherBandSlack(r, h.fiberRadius), &incomplete) / denom;
             Stat& s = st[h.matId];
             ++s.n; if (incomplete) ++s.inc;
             s.sum += a;
