@@ -3900,7 +3900,7 @@ static int checkDevHits() {
         } else {
             h = junkHit();
             switch (q.kind) {
-                case 0: intersectSphere(r, sc.spheres[q.index], 1e-6, h); break;
+                case 0: intersectSphere(r, sc.spheres[q.index], 1e-6, h, sc.sphereAxesOf(sc.spheres[q.index])); break;
                 case 1: intersectTri(r, sc.tris[q.index], 1e-6, h); break;
                 case 2: intersectCurveSeg(makeCurveRay(r.d), r, sc.curveSegs[q.index], 1e-6, h); break;
                 case 3: intersectImplicit(r, sc.implicits[q.index], 1e-6, h); break;
@@ -14951,6 +14951,15 @@ static void buildFurFields(const Scene& scene) {
 // (§P3 landed the single-fiber BCSDF on the device in 0.181.0, so plain hair scenes no
 // longer fall back — these two option gates are now the ONLY reasons a fur scene leaves
 // the GPU backward path.)
+// Object-space patterns (`pattern_space object`) are read on the host only so far, so a scene
+// that has them renders on the CPU (cudaForwardSupported refuses it); the device-selection notes
+// name that reason rather than the generic lists.
+static bool objectSpacePatterns(const Scene& scene) {
+    return !scene.patFrames.empty() && !scene.patterns.empty();
+}
+static const char* const kObjectSpaceWhy =
+    "object-space patterns (pattern_space object) are read on the CPU only so far";
+
 static bool backwardOnGpuOk(const Scene& scene, const Camera& cam) {
     if (cam.seesMotion(scene)) return false;   // motion blur: CPU only so far
     if (g_furVolume && g_furVolData.valid()) return false;
@@ -18804,7 +18813,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // kernel traces camera rays out through it (dGenLensRay, as GPU mode R does) and
             // the light image into it (dLensConnect).
             if (!cudaBdptSupported(scene)) {
-                const char* why = "scene has a BDPT-GPU-unsupported feature "
+                const char* why = objectSpacePatterns(scene) ? kObjectSpaceWhy : "scene has a BDPT-GPU-unsupported feature "
                                   "(GRIN media, env/collimated light, an emissive 'fire' volume, or a "
                                   "GPU-unsupported material: layered, indexed-palette, "
                                   "oversized multilayer/mix)";
@@ -18832,6 +18841,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (!bwOk || blurOnCpu) {
                 const char* why = blurOnCpu
                     ? "motion blur (a camera shutter on a moving scene) renders on the CPU so far"
+                    : objectSpacePatterns(scene) ? kObjectSpaceWhy
                     : g_whitted
                     ? "mode W scene is outside the deterministic GPU scope (-gi, or a "
                       "backward-GPU-unsupported feature)"
@@ -18856,7 +18866,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             }
         } else if (!cudaForwardSupported(scene)) {
-            const char* why = "GPU-unsupported feature (layered material, indexed "
+            const char* why = objectSpacePatterns(scene) ? kObjectSpaceWhy : "GPU-unsupported feature (layered material, indexed "
                               "palette, parametric record, oversized multilayer/mix "
                               "material, or an emissive 'fire' volume)";
             if (wantGpu) std::fprintf(stderr, "[device] scene has a %s; using CPU\n", why);
@@ -28663,6 +28673,23 @@ int main(int argc, char** argv) {
             if (!dir.empty() && std::filesystem::is_directory(dir, ec))
                 assetbytes::setExeDir(dir.string());
         }
+        // A path inside an asset file that is not UTF-8 is in the user's legacy ANSI code page
+        // (this process's is UTF-8): read it there (assetbytes::resolve).
+        assetbytes::legacyPathDecoder() = [](const std::string& raw) -> std::string {
+            wchar_t cpName[8] = {};
+            UINT cp = 1252;
+            if (GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_IDEFAULTANSICODEPAGE, cpName, 8) > 0)
+                cp = (UINT)_wtoi(cpName);
+            const int wn = MultiByteToWideChar(cp, 0, raw.data(), (int)raw.size(), nullptr, 0);
+            if (wn <= 0) return raw;
+            std::wstring w((size_t)wn, L' ');
+            MultiByteToWideChar(cp, 0, raw.data(), (int)raw.size(), &w[0], wn);
+            const int un = WideCharToMultiByte(CP_UTF8, 0, w.data(), wn, nullptr, 0, nullptr, nullptr);
+            if (un <= 0) return raw;
+            std::string u((size_t)un, ' ');
+            WideCharToMultiByte(CP_UTF8, 0, w.data(), wn, &u[0], un, nullptr, nullptr);
+            return u;
+        };
     }
     // `-stop [<pid>|all]`: talk to ALREADY-RUNNING renders and exit. Handled before
     // anything else so it works from a bare command line -- it loads no scene, opens

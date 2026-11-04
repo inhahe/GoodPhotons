@@ -8,6 +8,8 @@
   * `pattern_space object` reads a group's patterns in its own space: a striped ball in a group
     moved 0.3 m along x renders as the same ball with its world-space stripes shifted by 0.3 m;
     and such a scene asked for the GPU says it stays on the CPU.
+  * The same turned half round, scaled, in millimetres and reading the normal; and on an
+    isosurface. A sphere that falls back to a mesh wears its UV where the analytic one does.
   * A scene and its image at a path outside any one code page (Latin, Han) open and write.
 Each image test compares 4x4-pixel blocks of luminance, two seeds each: within 5 standard errors
 or 3 %. Exits 1 on any failure.
@@ -26,20 +28,24 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
 
 
-def scene(group, pattern, extra=""):
+def scene(group, pattern, extra="", units="meters", body=None):
+    """A ball (or `body`) in `group`, its reflectance `pattern`; lengths in `units`."""
+    k = {"meters": 1.0, "millimeters": 1000.0}[units]
+    L = lambda *xs: " ".join(repr(x * k) for x in xs)
+    body = body or "sphere { center 0 0 0  radius %r  material pat }" % (0.45 * k)
     return NL.join([
-        "scene { units meters }",
+        "scene { units %s }" % units,
         'material "white" { type diffuse reflect 0.7 }',
         'pattern "p" { expr "%s" }' % pattern,
         'material "pat" { type diffuse reflect pattern:p }',
-        "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }",
-        "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material white }",
-        "light area { origin -0.4 2.9 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  spd preset:bb6500"
-        "  power 60 }",
-        "group { %s  sphere { center 0 0 0  radius 0.45  material pat } }" % group,
+        "quad { origin %s  u %s  v %s  material white }" % (L(-2, 0, -2), L(0, 0, 4), L(4, 0, 0)),
+        "quad { origin %s  u %s  v %s  material white }" % (L(-2, 0, -2), L(4, 0, 0), L(0, 3, 0)),
+        "light area { origin %s  u %s  v %s  normal 0 -1 0  spd preset:bb6500  power 60 }"
+        % (L(-0.4, 2.9, -0.4), L(0.8, 0, 0), L(0, 0, 0.8)),
+        "group { %s  %s }" % (group, body),
         extra,
-        'camera "c" { eye 0 1.0 4.2  look_at 0 0.5 0  up 0 1 0  fov_y 40  film { res %d %d } }'
-        % (W, H),
+        'camera "c" { eye %s  look_at %s  up 0 1 0  fov_y 40  film { res %d %d } }'
+        % (L(0, 1.0, 4.2), L(0, 0.5, 0), W, H),
     ]) + NL
 
 
@@ -97,11 +103,34 @@ def main():
                             ["-mode", "R", "-device", dev, "-spp", "128"])
         verdict("a sphere's UV turns with its group (mode R %s)" % dev.upper(), good, detail)
 
+    # A sphere that falls back to a mesh (a scale a hair off uniform) wears its UV where the
+    # analytic one does.
+    good, detail = same(exe, out, "uv_mesh", scene("translate 0 0.45 0  rotate 0 30 0", half % "u"),
+                        scene("translate 0 0.45 0  rotate 0 30 0  scale 1 1.0001 1", half % "u"),
+                        ["-mode", "R", "-device", "cpu", "-spp", "128"])
+    verdict("a sphere built as a mesh wears its UV as the analytic one", good, detail)
+
     stripes = "0.5 + 0.4 * sin(25 * %s)"
     obj = scene("translate 0.3 0.45 0  pattern_space object", stripes % "x")
     world = scene("translate 0.3 0.45 0", stripes % "(x - 0.3)")
-    good, detail = same(exe, out, "patspace", obj, world, ["-mode", "R", "-device", "cpu", "-spp", "128"])
+    cpu = ["-mode", "R", "-device", "cpu", "-spp", "128"]
+    good, detail = same(exe, out, "patspace", obj, world, cpu)
     verdict("pattern_space object reads the group's own space", good, detail)
+    # Turned half round, scaled twice, in millimetres, and reading the normal: object x is
+    # -(1000 x - 300) / 2 and object nx is -nx.
+    turned_obj = scene("translate 300 450 0  rotate 0 180 0  scale 2  pattern_space object",
+                       "0.5 + 0.3 * sin(0.05 * x) + 0.15 * nx", units="millimeters",
+                       body="sphere { center 0 0 0  radius 225  material pat }")
+    turned_world = scene("translate 300 450 0  rotate 0 180 0  scale 2",
+                         "0.5 + 0.3 * sin(0.05 * (-(1000 * x - 300) / 2)) - 0.15 * nx",
+                         units="millimeters", body="sphere { center 0 0 0  radius 225  material pat }")
+    good, detail = same(exe, out, "patspace_turned", turned_obj, turned_world, cpu)
+    verdict("... turned, scaled, in mm, with its normal", good, detail)
+    iso = "isosurface { material pat  sphere { radius 0.45 } }"
+    good, detail = same(exe, out, "patspace_iso",
+                        scene("translate 0.3 0.45 0  pattern_space object", stripes % "x", body=iso),
+                        scene("translate 0.3 0.45 0", stripes % "(x - 0.3)", body=iso), cpu)
+    verdict("... on an isosurface", good, detail)
     if not a.no_gpu:
         p = os.path.join(out, "patspace_a.ftsl")
         _, log = render(exe, p, os.path.join(out, "patspace_gpu.png"),

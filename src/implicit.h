@@ -234,6 +234,7 @@ enum class Container : int { Box = 0, Sphere = 1 };
 // The primitive.
 // ---------------------------------------------------------------------------
 struct Implicit {
+    int patFrame = -1;   // the pattern frame its patterns are read in (Scene::patFrames), or -1
     std::vector<FieldNode> nodes;   // postfix field expression
     std::vector<PatNode> exprNodes; // shared pool backing FieldOp::Expr leaves (f(x,y,z))
     std::string name;               // authored ftsl block name (used to name -export-mesh groups)
@@ -437,7 +438,7 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
         hit.curv = 0.0;
         hit.tangent = Vec3{1, 0, 0}; hit.bitangentSign = 1.0;
         hit.fiberRadius = 0.0; hit.hasVcol = false; hit.pscale = 0.0;
-        hit.motionSet = -1; hit.patFrame = -1;
+        hit.motionSet = -1; hit.patFrame = im.patFrame;
         return true;
     };
 

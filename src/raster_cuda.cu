@@ -1782,6 +1782,12 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
               const ::Scene* scene) {
     const std::vector<raster::PTri>& tris = geom.tris;
     if (!available() || tris.empty()) return nullptr;
+    // Object-space patterns (`pattern_space object`) are read by the CPU preview only so far.
+    if (scene && !scene->patFrames.empty() && !scene->patterns.empty()) {
+        std::fprintf(stderr, "[raster] object-space patterns (pattern_space object) are previewed "
+                             "on the CPU so far\n");
+        return nullptr;
+    }
     Scene* sc = new Scene();
     sc->nTris = (int)tris.size();
     sc->radius = (float)(geom.radius > 0.0 ? geom.radius : 1.0);   // path-length scale

@@ -3065,8 +3065,10 @@ group {
 procedural patterns of the group's children in the group's own space — authored units, at the
 frame's instant — instead of in world space, so a pattern stays on its object however the group
 is placed: a marble ball keeps its veins as it rolls from frame to frame. Emission patterns on
-its emitters are read the same way, so a light sampled and a light seen agree. CPU only so far:
-a scene that uses it renders on the CPU when asked for the GPU, and says so.
+its emitters are read the same way, so a light sampled and a light seen agree; it reaches every
+kind of child — meshes, spheres, isosurfaces, curves, instances, lights — and the footprint `fw`
+and the curvature `curv` a pattern reads are in the group's units too. CPU only so far (the
+preview too): a scene that uses it renders on the CPU when asked for the GPU, and says so.
 
 An analytic `sphere` in a rotated group wears its lat-long UV turned with the group (since
 0.406.0; before, the map stayed in world orientation).

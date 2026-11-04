@@ -683,8 +683,8 @@ struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; in
                  double curvature;                       // O3 per-face mean curvature (Tri::finalize)
                  int vcol;                               // Tri::vcol -> DScene::vertColors, or -1
                  Real reach; };                          // farthest vertex's distance (Hit::pscale)
-// ax/ay/az: the sphere's own axes (Sphere::ax..), read only when `turned`.
-struct DSphere { DVec3 c; double r; int matId; int turned; DVec3 ax, ay, az; };
+// frame: the sphere's own axes, three DVec3 at DScene::sphAxes + 3*frame, or -1 (Sphere::frame).
+struct DSphere { DVec3 c; double r; int matId; int frame; };
 // One round cone of a curve/fiber strand — the device twin of CurveSeg (curve.h). The host
 // record is already a POD in exactly this shape; only the scalar type narrows to Real.
 struct DCurveSeg { DVec3 p0, p1; Real r0, r1; int matId; float u0, u1; };
@@ -1271,6 +1271,7 @@ struct DScene {
     PatSlice     ndSlice;     // -nd: the 3-D slice of N-space fields are evaluated on
     const DTri*      tris;  int nTris;
     const DSphere*   sph;   int nSph;
+    const DVec3*     sphAxes;   // turned spheres' axes, three per DSphere::frame
     // Flat mirror surfaces (Scene::mirrorPlanes, uploaded verbatim): one entry per
     // coplanar group of mirror-material triangles, capped at Scene::kMaxMirrorPlanes.
     // Read ONLY by the forward specular camera connection (dConnectSpecularPlane), which
@@ -4141,8 +4142,10 @@ __device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const 
     hit.fiberRadius = (Real)0;                 // `hit` is a reused record: not a strand
     return true;
 }
+// `axes`: the sphere's own (DScene::sphAxes + 3*frame), or null for the world's -- needed only
+// where the hit's UV and tangent are read; an occlusion test may pass null.
 __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const DSphere& s,
-                                        Real tmin, DHit& hit) {
+                                        Real tmin, DHit& hit, const DVec3* axes = nullptr) {
     // NUMERICALLY STABLE ray/sphere (Ray Tracing Gems ch. 7). The textbook
     // disc = b^2 - 4ac catastrophically cancels once the sphere is far away relative to its
     // radius: both terms are O(dist^2) and the difference is O(radius^2), so in fp32 the
@@ -4182,17 +4185,18 @@ __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const D
     hit.matId = s.matId; hit.sensorId = -1;
     // Equirectangular (lat/long) UV so spheres can be textured, in the sphere's own axes when
     // it has been turned (mirrors host).
-    const DVec3 nl = s.turned ? DVec3{dot(ng, s.ax), dot(ng, s.ay), dot(ng, s.az)} : ng;
+    const DVec3 nl = axes ? DVec3{dot(ng, axes[0]), dot(ng, axes[1]), dot(ng, axes[2])} : ng;
     Real ny = nl.y < (Real)-1 ? (Real)-1 : (nl.y > (Real)1 ? (Real)1 : nl.y);
     hit.u = (Real)0.5 + atan2(nl.z, nl.x) / (Real)(2.0 * DPI);
     hit.v = (Real)0.5 - asin(ny) / (Real)DPI;
     // Longitude (east) tangent d/du, mirroring the host sphere path (C6).
     DVec3 tg{-nl.z, (Real)0, nl.x};
-    if (s.turned) tg = s.ax * tg.x + s.ay * tg.y + s.az * tg.z;
+    if (axes) tg = axes[0] * tg.x + axes[1] * tg.y + axes[2] * tg.z;
     Real tgl = sqrt(dot(tg, tg));
     hit.tangent = (tgl > (Real)1e-9) ? tg * ((Real)1 / tgl)
-                                     : (s.turned ? s.ax : DVec3{(Real)1, (Real)0, (Real)0});
-    hit.bitangentSign = (Real)1;
+                                     : (axes ? axes[0] : DVec3{(Real)1, (Real)0, (Real)0});
+    // A mirrored frame turns the bitangent, as on the host (sphereSurfaceUV).
+    hit.bitangentSign = (axes && dot(cross(axes[0], axes[1]), axes[2]) < (Real)0) ? (Real)-1 : (Real)1;
     hit.fiberRadius = (Real)0; hit.vcol = -1; hit.vb0 = hit.vb1 = (Real)0;   // reused record
     return true;
 }
@@ -4543,7 +4547,7 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
                 if (prim < sc.nTris)              { const DTri& t = sc.tris[prim];
                                                     if (!hidden(t.matId) && intersectTri(sh, ro, rd, t, tmin, h)) { tMax = h.t; hInst = -1; } }
                 else if (prim < sc.nTris + sc.nSph){ const DSphere& s = sc.sph[prim - sc.nTris];
-                                                    if (!hidden(s.matId) && intersectSphere(ro, rd, s, tmin, h)) { tMax = h.t; hInst = -1; } }
+                                                    if (!hidden(s.matId) && intersectSphere(ro, rd, s, tmin, h, s.frame >= 0 ? sc.sphAxes + 3 * s.frame : nullptr)) { tMax = h.t; hInst = -1; } }
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits) { const DImplicit& im = sc.implicits[prim - sc.nTris - sc.nSph];
                                                     if (!hidden(im.matId) && intersectImplicit(sc, im, ro, rd, tmin, h)) { tMax = h.t; hInst = -1; } }
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs) { const DCurveSeg& cs = sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits];
@@ -20741,7 +20745,8 @@ __global__ static void kHitProbe(DScene sc, const DevHitProbeRay* rays, int n, D
         h.tangent = DVec3{(Real)0, (Real)0, (Real)9}; h.bitangentSign = (Real)-1; h.curv = (Real)99;
         const Real tmin = (Real)1e-6;
         switch (q.kind) {
-            case 0: intersectSphere(ro, rd, sc.sph[q.index], tmin, h); break;
+            case 0: { const DSphere& s = sc.sph[q.index];
+                      intersectSphere(ro, rd, s, tmin, h, s.frame >= 0 ? sc.sphAxes + 3 * s.frame : nullptr); break; }
             case 1: intersectTri(makeTriShear(rd), ro, rd, sc.tris[q.index], tmin, h); break;
             case 2: intersectCurveSeg(makeCurveRay(rd), ro, rd, sc.curveSegs[q.index], tmin, h); break;
             case 3: intersectImplicit(sc, sc.implicits[q.index], ro, rd, tmin, h); break;
@@ -21198,7 +21203,7 @@ static int deviceEmitterShapeCode(EmitterShape s) {
 bool cudaForwardSupported(const Scene& scene) {
     // Object-space patterns (`pattern_space object`) are read on the host only so far: every
     // device path renders such a scene on the CPU rather than read its patterns in world space.
-    if (!scene.patFrames.empty()) return false;
+    if (!scene.patFrames.empty() && !scene.patterns.empty()) return false;
     // Implicit surfaces (isosurface / CSG / metaballs) are now sphere-traced on the
     // device too (DImplicit + intersectImplicit); their materials are checked by the
     // same `unsupported()` gate as tri/sphere materials below.
@@ -21479,11 +21484,11 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     for (size_t i = 0; i < scene.spheres.size(); ++i) {
         const Sphere& s = scene.spheres[i]; DSphere& d = sph[i];
         d.c = {s.c.x, s.c.y, s.c.z}; d.r = s.r; d.matId = s.matId;
-        d.turned = s.turned ? 1 : 0;
-        d.ax = {(Real)s.ax.x, (Real)s.ax.y, (Real)s.ax.z};
-        d.ay = {(Real)s.ay.x, (Real)s.ay.y, (Real)s.ay.z};
-        d.az = {(Real)s.az.x, (Real)s.az.y, (Real)s.az.z};
+        d.frame = s.frame;
     }
+    std::vector<DVec3> sphAxes;
+    for (const Scene::SphereAxes& a : scene.sphereAxes)
+        for (const Vec3& v : {a.ax, a.ay, a.az}) sphAxes.push_back(DVec3{(Real)v.x, (Real)v.y, (Real)v.z});
     // Flat mirror surfaces, grouped per plane by Scene::buildMirrorPlanes (which the host
     // already ran inside Scene::build). A straight field-for-field copy: the device solves
     // the reflection in the same doubles the host does, so there is nothing to narrow.
@@ -22156,6 +22161,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.ndSlice = scene.ndSlice;   // by value: 40 doubles, read by every field sample
     sc.tris = d_tris; sc.nTris = (int)tris.size();
     sc.sph = d_sph;   sc.nSph = (int)sph.size();
+    sc.sphAxes = sphAxes.empty() ? nullptr : (const DVec3*)keep(uploadVec(sphAxes));
     sc.mirrorPlanes = d_mirp; sc.nMirrorPlanes = (int)mirrorPlanes.size();
     sc.dielSph   = d_dielSph;   sc.nDielSph   = (int)scene.dielSphereIdx.size();
     sc.mirrorSph = d_mirrorSph; sc.nMirrorSph = (int)scene.mirrorSphereIdx.size();

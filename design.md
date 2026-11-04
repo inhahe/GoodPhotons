@@ -9970,18 +9970,25 @@ sees the instant, exactly as a static scene with those transforms would show it.
   exactly the tree the scene held still would build — so every query without a time and the GPU
   walk it unchanged, and the scene is bounded there (`sceneCenter` / `sceneRadius`: the
   environment's disk, the default cavity radius). A query with a time (`timedQuery`) walks
-  `bvhStill`, the primitives that do not move, then `bvhMove[k]`, the moving ones boxed over the
-  k-th of 16 stretches of the interval only (`traverseWorldClosest` / `traverseWorldAny`), so a
-  fast mover costs a ray only near where it is then. `sweptRadius` (their union) is how far a
+  `bvh` skipping the movers it holds at the instant, then `bvhMove[k]`, the moving ones boxed over
+  the k-th stretch of the interval only (`traverseWorldClosest` / `traverseWorldAny`), so a fast
+  mover costs a ray only near where it is then. The stretch count (`motionSegments_`, 1 to 16)
+  follows how far a sample of movers sweeps against its own size, and each set's transforms over
+  a stretch are gathered once (`buildMoveTrees`). `sweptRadius` (their union) is how far a
   timed shadow ray to the sun or sky must reach (`exitDistance`); a medium's transmittance along
   it keeps the scene's own (`mediaExitDistance`).
 - **What a moving surface carries.** A hit records the motion set it came from (`Hit::motionSet`),
   and `patCtxFromHit` reads its patterns at the point carried back to the instant, so a texture
-  travels with its object. An analytic sphere has axes (`Sphere::ax/ay/az`, set from its group's
-  rotation, turned by `sphereAt`; device twin in `DSphere`) its UV is read in. A group's
+  travels with its object. An analytic sphere may have axes (`Sphere::frame` into `Scene::sphereAxes`,
+  set from its group's rotation; turned by its motion only on a hit, `intersectMovingSphere`;
+  device twin `DScene::sphAxes`) its UV, tangent and bitangent handedness are read in
+  (`sphereSurfaceUV`); a sphere built as a mesh wears its UV where the analytic one does. A group's
   `pattern_space object` adds a pattern frame (`Scene::patFrames`: world-at-instant to the group's
-  own space, and back) its children's hits, and its emitters' sampled points, read patterns in —
-  host only, so `cudaForwardSupported` sends such a scene to the CPU.
+  own space, and back) its children's hits — triangles, spheres, isosurfaces, curves, instances,
+  lights — and its emitters' sampled points read patterns in, with `fw` and `curv` in its units;
+  host and CPU preview only, so `cudaForwardSupported` and the GPU raster send such a scene to the
+  CPU and say why. The process code page is UTF-8 (`src/ftrace.manifest`); a path in an asset
+  file that is not valid UTF-8 is re-read in the user's legacy code page (`assetbytes::resolve`).
 - **A path's time is thread-local** (`geometry.h g_motionU`, a fraction of the interval, negative
   for "the instant"), set for the whole path by `MotionTimeScope`. The scene's query leaves
   (`closestHit`, `occluded`, `shadowTransmittance`, their variants, the linear reference) test a

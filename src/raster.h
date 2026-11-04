@@ -111,6 +111,7 @@ struct PMix {
 // One preview triangle: world-space positions + per-vertex world normals + the material
 // payload it was baked with (inherited, so `t.color` / `t.tex` still read as before).
 struct PTri : PShade {
+    int patFrame = -1;   // the pattern frame of the primitive it came from (Scene::patFrames)
     Vec3 p0, p1, p2;
     Vec3 n0, n1, n2;
     // Per-vertex texture coordinates (u in .x, v in .y). Only meaningful when tex >= 0.
@@ -1198,6 +1199,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
         p.uv0 = t.uv0; p.uv1 = t.uv1; p.uv2 = t.uv2;
         p.tanSign = previewTanSign(t, 1.0);
         copyVcol(p, t);
+        p.patFrame = t.patFrame;
         out.push_back(p);
     }
 
@@ -1224,8 +1226,9 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
                 // world, where its vertices and normals go (the same when it is not turned).
                 Vec3 d00 = sp(iu, iv),   d10 = sp(iu + 1, iv);
                 Vec3 d01 = sp(iu, iv+1), d11 = sp(iu + 1, iv + 1);
-                const auto world = [&s](const Vec3& d) {
-                    return s.turned ? s.ax * d.x + s.ay * d.y + s.az * d.z : d;
+                const Vec3* ax = sc.sphereAxesOf(s);
+                const auto world = [ax](const Vec3& d) {
+                    return ax ? ax[0] * d.x + ax[1] * d.y + ax[2] * d.z : d;
                 };
                 const Vec3 w00 = world(d00), w10 = world(d10), w01 = world(d01), w11 = world(d11);
                 Vec3 v00 = s.c + w00 * s.r, v10 = s.c + w10 * s.r;
@@ -1241,9 +1244,11 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
                 PTri a; a.p0 = v00; a.p1 = v01; a.p2 = v11; a.n0 = w00; a.n1 = w01; a.n2 = w11;
                 applyMat(a, s.matId);
                 a.uv0 = uv00; a.uv1 = uv01; a.uv2 = uv11;
+                a.patFrame = s.patFrame;
                 PTri b; b.p0 = v00; b.p1 = v11; b.p2 = v10; b.n0 = w00; b.n1 = w11; b.n2 = w10;
                 applyMat(b, s.matId);
                 b.uv0 = uv00; b.uv1 = uv11; b.uv2 = uv10;
+                b.patFrame = s.patFrame;
                 out.push_back(a); out.push_back(b);
             }
     }
@@ -2655,8 +2660,16 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                     // the eye on a triangle seen from behind), or on a surface light can cross
                     // the surface's own side's, as patCtxFromHit has it.
                     const bool own = pt.patOwnSide && seenFromBehind(pt, cam.eye);
-                    pc = makePatCtx(q, 0.0, own ? N0 * -1.0 : N0, g.uv[i].x, g.uv[i].y, 0.0, 0.0,
-                                    patShadingFootprint(fwPerDist, dist, cs));
+                    Vec3 pn = own ? N0 * -1.0 : N0;
+                    double pfw = patShadingFootprint(fwPerDist, dist, cs);
+                    if (pt.patFrame >= 0) {   // as patCtxFromHit reads the traced hit
+                        const Scene::PatFrame& f = scenePtr->patFrames[(size_t)pt.patFrame];
+                        q = f.toObj.apply(q);
+                        pn = normalize(f.toWorld.applyDirTranspose(pn));
+                        bool nonUniform = false;
+                        pfw *= f.toObj.uniformScale(nonUniform);
+                    }
+                    pc = makePatCtx(q, 0.0, pn, g.uv[i].x, g.uv[i].y, 0.0, 0.0, pfw);
                     bindPatScene(pc, *scenePtr);
                     pcReady = true;
                 }

@@ -176,14 +176,15 @@ struct Sphere {
     Vec3 c; double r = 1.0;
     int matId = 0;
     int motion = -1;   // Scene::motionSets index, or -1; c and r are the frame's instant (Scene::sphereAt)
-    // The sphere's own axes, in world space (orthonormal): its lat-long UV and tangent are read
-    // in them, so a sphere in a rotated group -- or turned by its motion keys -- wears its
-    // texture turned with it. `turned` false means they are the world's, and keeps the plain
-    // world-axis path, bit for bit.
-    Vec3 ax{1, 0, 0}, ay{0, 1, 0}, az{0, 0, 1};
-    bool turned = false;
     int patFrame = -1;   // the pattern frame its patterns are read in (Scene::patFrames), or -1
+    // Its own axes, as an index of three consecutive world-space unit vectors in
+    // Scene::sphereAxes, or -1: the world's. Its lat-long UV and tangent are read in them, so a
+    // sphere in a rotated group -- or turned by its motion keys -- wears its texture turned with
+    // it. A side table, not inline: the record sits in every BVH leaf test, and nearly every
+    // sphere is unturned.
+    int frame = -1;
 };
+
 
 // Where the current path is in time, as a fraction of the scene's motion interval (0 at its
 // start, 1 at its end), or negative for "the frame's instant", which is what every primitive's
@@ -651,7 +652,28 @@ inline bool intersectTri(const Ray& r, const Tri& tri, double tmin, Hit& hit,
     return intersectTri(makeTriShear(r.d), r, tri, tmin, hit, vertColorTable);
 }
 
-inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit) {
+// A hit's lat-long UV, tangent and bitangent handedness on a sphere, from its outward unit
+// normal `ng`, read in the sphere's axes (three consecutive unit vectors) or the world's
+// (`axes` null). A mirrored frame (left-handed axes) turns the bitangent, as a mirrored
+// instance does (MeshInstance::handSign), so a normal map keeps its v slope.
+inline void sphereSurfaceUV(Hit& hit, const Vec3& ng, const Vec3* axes) {
+    // Equirectangular (lat/long) UV so spheres can be textured (globes, eyeballs).
+    const Vec3 nl = axes ? Vec3{dot(ng, axes[0]), dot(ng, axes[1]), dot(ng, axes[2])} : ng;
+    hit.u = 0.5 + std::atan2(nl.z, nl.x) / (2.0 * PI);
+    hit.v = 0.5 - std::asin(std::clamp(nl.y, -1.0, 1.0)) / PI;
+    // Tangent = the east-pointing longitude direction d/du (C6). d/du of the
+    // equirectangular map is proportional to (-sin, 0, cos) of the longitude, i.e.
+    // perpendicular to both the sphere's up and the normal; degenerates to its +x at the poles.
+    Vec3 T{-nl.z, 0.0, nl.x};
+    if (axes) T = axes[0] * T.x + axes[1] * T.y + axes[2] * T.z;
+    double tl = std::sqrt(dot(T, T));
+    hit.tangent = (tl > 1e-9) ? T * (1.0 / tl) : (axes ? axes[0] : Vec3{1, 0, 0});
+    hit.bitangentSign = (axes && dot(cross(axes[0], axes[1]), axes[2]) < 0.0) ? -1.0 : 1.0;
+}
+
+// `axes`: the sphere's own (Scene::sphereAxesOf), or null for the world's.
+inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit,
+                            const Vec3* axes = nullptr) {
     Vec3 oc = r.o - s.c;
     double a = dot(r.d, r.d);
     double b = 2.0 * dot(oc, r.d);
@@ -679,19 +701,7 @@ inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit
     // inside (a room-sized sphere is concave to anything standing in it).
     hit.curv = (s.r > 1e-12) ? ((sFlipped ? -1.0 : 1.0) / s.r) : 0.0;
     hit.matId = s.matId; hit.sensorId = -1;
-    // Equirectangular (lat/long) UV so spheres can be textured (globes, eyeballs), in the
-    // sphere's own axes (Sphere::ax/ay/az) when it has been turned.
-    const Vec3 nl = s.turned ? Vec3{dot(ng, s.ax), dot(ng, s.ay), dot(ng, s.az)} : ng;
-    hit.u = 0.5 + std::atan2(nl.z, nl.x) / (2.0 * PI);
-    hit.v = 0.5 - std::asin(std::clamp(nl.y, -1.0, 1.0)) / PI;
-    // Tangent = the east-pointing longitude direction d/du (C6). d/du of the
-    // equirectangular map is proportional to (-sin, 0, cos) of the longitude, i.e.
-    // perpendicular to both the sphere's up and the normal; degenerates to its +x at the poles.
-    Vec3 T{-nl.z, 0.0, nl.x};
-    if (s.turned) T = s.ax * T.x + s.ay * T.y + s.az * T.z;
-    double tl = std::sqrt(dot(T, T));
-    hit.tangent = (tl > 1e-9) ? T * (1.0 / tl) : (s.turned ? s.ax : Vec3{1, 0, 0});
-    hit.bitangentSign = 1.0;
+    sphereSurfaceUV(hit, ng, axes);
     hit.fiberRadius = 0.0; hit.hasVcol = false;   // `hit` is a reused record: not a strand, no colours
     return true;
 }

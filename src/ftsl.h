@@ -5407,7 +5407,12 @@ private:
         };
         auto pos = [&](const Vec3& d) { return P(xf.apply(c + d * r)); };
         auto nrm = [&](const Vec3& d) { return normalize(xf.applyNormal(d)); };
-        auto uv  = [&](int i, int j) { return Vec3{(double)j / nlon, (double)i / nlat, 0.0}; };
+        // u as the analytic sphere reads it (0.5 + atan2(z, x) / 2pi: the seam at -x, half way
+        // round), so a sphere that falls back to a mesh wears its texture where the analytic one
+        // would; `jq` is the quad's column, so a quad never straddles the seam.
+        auto uv  = [&](int i, int j, int jq) {
+            return Vec3{(double)j / nlon + (2 * jq < nlon ? 0.5 : -0.5), (double)i / nlat, 0.0};
+        };
         for (int i = 0; i < nlat; ++i) {
             for (int j = 0; j < nlon; ++j) {
                 Vec3 d00 = dirOf(i, j),     d01 = dirOf(i, j + 1);
@@ -5415,13 +5420,13 @@ private:
                 if (i != 0) {                       // skip degenerate north-pole tri
                     Tri t{pos(d00), pos(d10), pos(d11), id, -1, {}};
                     t.n0 = nrm(d00); t.n1 = nrm(d10); t.n2 = nrm(d11);
-                    t.uv0 = uv(i, j); t.uv1 = uv(i + 1, j); t.uv2 = uv(i + 1, j + 1);
+                    t.uv0 = uv(i, j, j); t.uv1 = uv(i + 1, j, j); t.uv2 = uv(i + 1, j + 1, j);
                     L.scene.tris.push_back(t);
                 }
                 if (i != nlat - 1) {                // skip degenerate south-pole tri
                     Tri t{pos(d00), pos(d11), pos(d01), id, -1, {}};
                     t.n0 = nrm(d00); t.n1 = nrm(d11); t.n2 = nrm(d01);
-                    t.uv0 = uv(i, j); t.uv1 = uv(i + 1, j + 1); t.uv2 = uv(i, j + 1);
+                    t.uv0 = uv(i, j, j); t.uv1 = uv(i + 1, j + 1, j); t.uv2 = uv(i, j + 1, j);
                     L.scene.tris.push_back(t);
                 }
             }
@@ -5452,8 +5457,8 @@ private:
                    az = xf.applyDir(Vec3{0, 0, 1}) * inv;
         if (!(ax.x == 1.0 && ax.y == 0.0 && ax.z == 0.0 && ay.x == 0.0 && ay.y == 1.0 && ay.z == 0.0 &&
               az.x == 0.0 && az.y == 0.0 && az.z == 1.0)) {
-            sp.ax = normalize(ax); sp.ay = normalize(ay); sp.az = normalize(az);
-            sp.turned = true;
+            sp.frame = (int)L.scene.sphereAxes.size();
+            L.scene.sphereAxes.push_back(Scene::SphereAxes{normalize(ax), normalize(ay), normalize(az)});
         }
         L.scene.spheres.push_back(sp);
         if (!b.name.empty()) sphereByName_[b.name] = NamedSphere{wc, wr};
@@ -6868,6 +6873,9 @@ private:
                 for (size_t i = mk.tris; i < L.scene.tris.size(); ++i) L.scene.tris[i].patFrame = patFrame_;
                 for (size_t i = mk.spheres; i < L.scene.spheres.size(); ++i) L.scene.spheres[i].patFrame = patFrame_;
                 for (size_t i = mk.emitters; i < L.scene.emitters.size(); ++i) L.scene.emitters[i].patFrame = patFrame_;
+                for (size_t i = mk.implicits; i < L.scene.implicits.size(); ++i) L.scene.implicits[i].patFrame = patFrame_;
+                for (size_t i = mk.curveSegs; i < L.scene.curveSegs.size(); ++i) L.scene.curveSegs[i].patFrame = patFrame_;
+                for (size_t i = mk.instances; i < L.scene.instances.size(); ++i) L.scene.instances[i].patFrame = patFrame_;
             }
             if (!moving) return true;
             if (!cb.name.empty()) movingNames_.insert(cb.name);
@@ -6887,7 +6895,12 @@ private:
             else if (s.key == "curve")    { if (!child(*cb, [&] { return addCurve(*cb, L, world); })) return false; }
             else if (s.key == "light") {
                 if (moving) stillWarning("a light");
+                const PrimMark lm = primMark(L);
                 if (!addLight(*cb, L, (cb->type == "light" ? std::string() : cb->type), world)) return false;
+                if (patFrame_ >= 0) {   // its panel and its emission pattern read the group's space
+                    for (size_t i = lm.tris; i < L.scene.tris.size(); ++i) L.scene.tris[i].patFrame = patFrame_;
+                    for (size_t i = lm.emitters; i < L.scene.emitters.size(); ++i) L.scene.emitters[i].patFrame = patFrame_;
+                }
                 haveLight = true;
             }
             else if (s.key == "group")    { if (!routed(*cb, L, [&] { return addGroup(*cb, L, world, haveLight); })) return false; }

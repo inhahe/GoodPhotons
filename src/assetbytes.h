@@ -178,9 +178,30 @@ inline std::vector<std::string> searchRoots() {
 
 // The path to actually open for an authored asset reference. Absolute paths and
 // paths that already exist are returned untouched; see the comment above for order.
+// A path read out of an asset file need not be UTF-8: an exporter on Windows may have written it
+// in the user's legacy ANSI code page, while this process's own is UTF-8 (src/ftrace.manifest).
+// resolve() re-reads a path that is not valid UTF-8 through this decoder, which main.cpp sets
+// (it needs <windows.h>); null leaves such a path as it is.
+using LegacyPathDecoder = std::string (*)(const std::string&);
+inline LegacyPathDecoder& legacyPathDecoder() { static LegacyPathDecoder f = nullptr; return f; }
+inline bool validUtf8(const std::string& s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char c = (unsigned char)s[i];
+        // How many continuation bytes this lead byte announces (-1: not a lead byte).
+        const int n = c < 0x80 ? 0 : (c >> 5) == 0x6 ? 1 : (c >> 4) == 0xE ? 2 : (c >> 3) == 0x1E ? 3 : -1;
+        if (n < 0 || i + (size_t)n >= s.size() + (n == 0 ? 1 : 0)) return false;
+        for (int k = 1; k <= n; ++k)
+            if (((unsigned char)s[i + (size_t)k] >> 6) != 0x2) return false;
+        i += (size_t)n + 1;
+    }
+    return true;
+}
+
 inline std::string resolve(const std::string& path) {
     namespace fs = std::filesystem;
     if (path.empty()) return path;
+    if (!validUtf8(path) && legacyPathDecoder()) return resolve(legacyPathDecoder()(path));
     std::error_code ec;
     if (toPath(path).is_absolute()) return path;
     for (const std::string& root : searchRoots()) {
