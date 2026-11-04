@@ -1076,6 +1076,32 @@ def p_split_tests(exe, out, verdict, gpu=False):
     r = float(np.mean([x[fur].mean() for x in dual]) / np.mean([x[fur].mean() for x in ref]))
     verdict("blurred mode P, fur before a mirror, with -dual-scatter = without", abs(r - 1) < 0.1,
             "%.4f of without" % r)
+    p_sun_test(exe, out, verdict, gpu)
+
+
+def p_sun_test(exe, out, verdict, gpu):
+    """Blurred mode P with a sun and no sky, its disc in view: an escape into the sun is the camera
+    side's, which must carry it, the blurred forward layer drawing no sky. It was filed to the
+    diffuse-first film, which only fits the scale, and the disc was missing (Fable's review of
+    0.423.0)."""
+    text = NL.join([
+        "scene { units meters  motion_interval -0.5 0.5 }",
+        'material "w" { type diffuse reflect 0.6 }',
+        "light sun { dir 0 0.15 -1  angle 4  spd preset:d65 }",
+        "quad { origin -6 0 -12  u 0 0 16  v 12 0 0  material w }",
+        "group { %s  sphere { center 0 0 0  radius 0.3  material w } }" % xf(SLIDE, None, 1.0),
+        'camera "c" { eye 0 0.6 3  look_at 0 0.7 -10  up 0 1 0  fov_y 40  shutter_open -0.5  '
+        'shutter_close 0.5  film { res %d %d } }' % (W, H)]) + NL
+    psun = os.path.join(out, "psun.ftsl")
+    write(psun, text)
+    rr = [lum(render(exe, out, psun, "psun_R_s%d" % s, ["-mode", "R", "-device", "cpu", "-spp", "256"],
+                     seed=s)[0]) for s in (1, 2)]
+    for dev in ("cpu", "gpu") if gpu else ("cpu",):
+        rp = [lum(render(exe, out, psun, "psun_P_%s_s%d" % (dev, s),
+                         ["-mode", "P", "-device", dev, "-spp", "128", "-n", "4000000"], seed=s,
+                         want_gpu=dev == "gpu")[0]) for s in (1, 2)]
+        good, detail = agree(rp, rr, 0.10)
+        verdict("blurred mode P sees a sun with no sky (%s)" % dev.upper(), good, detail)
 
 
 def j_empty_test(exe, out, verdict):

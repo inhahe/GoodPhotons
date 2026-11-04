@@ -4082,12 +4082,14 @@ struct BackwardRenderer {
         // specular-first one when its path's first event (GiCtx::first, which the path writes as
         // it goes) is a specular-side surface or the sky: classifyComposite's rule for a pixel's
         // centre ray, per sample. A scatter in a medium before any surface is the forward
-        // layer's, which splats the medium's in-scatter itself.
+        // layer's, which splats the medium's in-scatter itself. The sky is the camera side's
+        // where there is one to see, an env or a sun: the blurred forward layer draws neither.
         int firstEv = -1;
         int* const firstOut = specFirstFilm ? &firstEv : nullptr;
+        const bool skySeen = scene.envIndex >= 0 || scene.sunCount > 0;
         const auto filmFor = [&]() -> Film& {
             if (!specFirstFilm) return film;
-            const bool spec = firstEv == kFirstSpec || (firstEv == kFirstSky && scene.envIndex >= 0);
+            const bool spec = firstEv == kFirstSpec || (firstEv == kFirstSky && skySeen);
             return spec ? *specFirstFilm : film;
         };
         for (int py = y0; py < y1; ++py) {

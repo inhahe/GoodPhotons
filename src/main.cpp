@@ -15013,6 +15013,13 @@ static const char* const kObjectSpaceWhy =
 // forward flight is the one case it cannot see from the mode.
 static const char* const kSharedFlightBlurWhy =
     "a shared forward flight that blurs renders on the CPU so far (the device blurs one camera at a time)";
+#ifdef HAVE_CUDA
+// The line every device choice prints when a render takes the GPU: `-device auto` or `gpu`, the
+// card, and what of the render runs there (`suffix`, "" for all of it).
+static void printDeviceGpu(bool wantAuto, const char* suffix = "") {
+    std::printf("[device] %s -> GPU: %s%s\n", wantAuto ? "auto" : "gpu", cudaDeviceName(), suffix);
+}
+#endif
 // The spp target a time / noise / forever budget renders against (runSppProgressive): no real
 // total, only a cap that keeps pixel * sppTotal seed indices well inside int64. A renderer that
 // splits its target into parts asks for it, since a share of it is no share of the render.
@@ -19153,8 +19160,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
                 useGpu = true;
-                std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu",
-                            cudaDeviceName());
+                printDeviceGpu(wantAuto);
             }
         } else if (gpuBackwardMode) {
             // Mode R has its own GPU support check: the backward reference megakernel
@@ -19181,8 +19187,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             } else {
                 useGpu = true;
-                std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu",
-                            cudaDeviceName());
+                printDeviceGpu(wantAuto);
             }
         } else if (!gpuForwardMode) {
             // Modes M (shared/flyby gather), S (SPPM) and U (VCM) run their OWN device gating
@@ -19207,8 +19212,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 pSuffix = backwardOnGpuOk(scene, cam)
                         ? " (forward + camera-side layers)"
                         : " (forward layer; camera-side stays CPU — outside backward-GPU scope)";
-            std::printf("[device] %s -> GPU: %s%s\n", wantAuto ? "auto" : "gpu",
-                        cudaDeviceName(), pSuffix);
+            printDeviceGpu(wantAuto, pSuffix);
         }
 #else
         if (wantGpu)
@@ -20647,7 +20651,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                                      effMaxBounce(), g_heroC);
                 if (sess) {
                     // The device line every other mode prints (runRender leaves S's to it).
-                    std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu", cudaDeviceName());
+                    printDeviceGpu(wantAuto);
                     std::printf("mode S: SPPM on %s — %lld photons/pass, R0=%.4g, alpha=%.2f "
                                 "at %dx%d (light=%s) ...\n",
                                 cudaDeviceName(), N, R0, g_sppmAlpha, res, resY, lightLabel);
@@ -20671,9 +20675,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 }
                 std::fprintf(stderr, "[device] SPPM GPU session failed to start; using CPU\n");
             } else if (wantGpu) {
-                const char* why = cam.hasLens()        ? "a physical-lens camera (pinhole only)"
-                                : cam.seesMotion(scene) ? cudaBlurUnsupported(scene, cam, 'S')
-                                : !cudaAvailable()     ? "no CUDA device found"
+                const char* blurWhy = cam.seesMotion(scene) ? cudaBlurUnsupported(scene, cam, 'S') : nullptr;
+                const char* why = cam.hasLens()    ? "a physical-lens camera (pinhole only)"
+                                : blurWhy          ? blurWhy
+                                : !cudaAvailable() ? "no CUDA device found"
                                 : "a GPU-unsupported scene feature";
                 std::fprintf(stderr, "[device] mode S GPU path unavailable (%s); using CPU\n", why);
             }
@@ -20746,7 +20751,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                                    vcmHeroC);
                 if (sess) {
                     // The device line every other mode prints (runRender leaves U's to it).
-                    std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu", cudaDeviceName());
+                    printDeviceGpu(wantAuto);
                     std::printf("mode U: VCM/UPS on %s — connections + merging, R0=%.4g, "
                                 "alpha=%.2f at %dx%d (max-bounce %d, light=%s, %s) ...\n",
                                 cudaDeviceName(), R0, g_vcmAlpha, res, resY, maxBounce, lightLabel,
@@ -20776,9 +20781,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 }
                 std::fprintf(stderr, "[device] VCM GPU session failed to start; using CPU\n");
             } else if (wantGpu) {
-                const char* why = cam.hasLens()        ? "a physical-lens camera (pinhole only)"
-                                : cam.seesMotion(scene) ? cudaBlurUnsupported(scene, cam, 'U')
-                                : !cudaAvailable()     ? "no CUDA device found"
+                const char* blurWhy = cam.seesMotion(scene) ? cudaBlurUnsupported(scene, cam, 'U') : nullptr;
+                const char* why = cam.hasLens()    ? "a physical-lens camera (pinhole only)"
+                                : blurWhy          ? blurWhy
+                                : !cudaAvailable() ? "no CUDA device found"
                                 : "a GPU-unsupported scene feature";
                 std::fprintf(stderr, "[device] mode U GPU path unavailable (%s); using CPU\n", why);
             }
@@ -28383,7 +28389,7 @@ static int run(int argc, char** argv) {
                 std::vector<Camera> cams; std::vector<int> rxs, rys;
                 for (int i : idx) { cams.push_back(toRender[i].cam); rxs.push_back(toRender[i].res); rys.push_back(toRender[i].resY); }
                 // The device line every other mode prints (runRender leaves M's to this path).
-                std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu", cudaDeviceName());
+                printDeviceGpu(wantAuto);
                 std::printf("[camera] shared photon map (mode M) on %s: %zu cameras, %lld "
                             "photons, radius %.4g (light=%s)%s ...\n",
                             cudaDeviceName(), cams.size(), N, radius, lightLabel,

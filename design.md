@@ -10132,7 +10132,8 @@ sees the instant, exactly as a static scene with those transforms would show it.
 - **Mode P under a blur** (0.415.0) does not classify pixels: no pixel is wholly one kind over
   the shutter. The backward layer splits each sample by its own path's first event at its own
   time (`BackwardRenderer::specFirstFilm`; the path writes it as it goes through `GiCtx::first`,
-  so no ray is traced twice): a non-sensor surface of a specular type, or the sky, is the
+  so no ray is traced twice): a non-sensor surface of a specular type, or the sky (an env or a
+  sun; since 0.423.2 a sun alone too, which the forward pass does not draw either), is the
   backward layer's (classifyComposite's rule); a diffuse or composite surface, or a scatter in a
   medium or a fur coat before any surface, the forward one's, whose medium vertices splat their
   in-scatter (a fur coverage pass-through is no event). The composite is the
@@ -10295,7 +10296,7 @@ sees the instant, exactly as a static scene with those transforms would show it.
   its camera path's first event (`s_dFirstEv`, a slot per thread that `bkRadiance` and
   `bkRadianceHeroLoop` write at depth 0 -- `dNoteFirst` at a medium scatter (other) or an escape
   (sky), `dNoteFirstSurface` on the hit's own material, `dUnnoteFirst` at a fibre's pass-through;
-  `dFirstFilm` picks the film, the sky's only in an env scene, as `filmFor` does). kBackward sets
+  `dFirstFilm` picks the film, the sky's wherever there is a sky or a sun to see, as `filmFor` does: the blurred forward layer draws neither). kBackward sets
   the slot per sample when it splits and to `kDFirstOff` otherwise, so an unsplit render notes
   nothing. The forward layer is `renderForwardCuda`'s `pSplit` (`DCamSet::pSplit`): no analytic
   specular connection (`camSpecularSplatAllVtxN`) and no glossy splat on a surface whose own

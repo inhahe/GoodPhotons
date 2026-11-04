@@ -15045,7 +15045,7 @@ __device__ static inline void dUnnoteFirst(bool noted) {
 __device__ static inline double* dFirstFilm(const DScene& sc, double* film, double* filmSpec) {
     if (!filmSpec) return film;
     const int f = s_dFirstEv[threadIdx.x];
-    return (f == kDFirstSpec || (f == kDFirstSky && sc.envIndex >= 0)) ? filmSpec : film;
+    return (f == kDFirstSpec || (f == kDFirstSky && (sc.envIndex >= 0 || sc.sunCount > 0))) ? filmSpec : film;
 }
 
 // ---- the deterministic one-bounce gather (N3c) ----------------------------------------
@@ -23937,18 +23937,12 @@ static gpu::DCamSet makeCamSet(DUpload& up, const std::vector<gpu::DCamera>& hca
         if (c.blur) { cs.blur = 1; cs.shOpen = c.shOpen; cs.shClose = c.shClose; break; }
     // ...which every camera that blurs must share: a photon takes one time for all of them.
     for (const DCamera& c : hcams)
-        if (c.blur && (c.shOpen != cs.shOpen || c.shClose != cs.shClose)) {
-            std::fprintf(stderr, "internal error: a device camera set holds cameras with different "
-                                 "shutters\n");
-            std::exit(3);
-        }
+        if (c.blur && (c.shOpen != cs.shOpen || c.shClose != cs.shClose))
+            throw std::logic_error("makeCamSet: a device camera set holds cameras with different shutters");
     for (const DCamera& c : hcams) cs.camMoves = cs.camMoves || (c.blur && c.nKeys > 0);
     return cs;
 }
 
-// Host driver for the wavefront backend. Allocates the SoA photon pool, seeds it, then
-// runs extend/shade passes until every slot has drained the N-photon budget. Writes into
-// the same d_film / d_hits / d_energy buffers as the megakernel path.
 // The wavefront pool's persistent slot count for an N-photon trace.
 static int wavefrontSlots(long long N) {
     const int W = (int)((N < (1 << 20)) ? N : (1 << 20));
@@ -23968,6 +23962,9 @@ static int forwardHeroC(int heroC, bool media, bool grin) {
 static bool forwardRunsWavefront(bool wavefront, int effHeroC, bool beams) {
     return wavefront && effHeroC == 1 && !beams;
 }
+// Host driver for the wavefront backend. Allocates the SoA photon pool, seeds it, then
+// runs extend/shade passes until every slot has drained the N-photon budget. Writes into
+// the same d_film / d_hits / d_energy buffers as the megakernel path.
 static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
                            long long N, int diffraction, unsigned long long kseed,
                            int maxBounce, int camModeInt) {
@@ -25816,6 +25813,9 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
                         Film* specOut) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
+    // The split's second film, allocated before any early return, so a caller always gets both
+    // films at the render's size (empty of light when nothing rendered).
+    if (specOut) { *specOut = Film{}; specOut->resX = resX; specOut->resY = resY; specOut->alloc(); }
     if (!cudaAvailable() || !cudaBackwardSupported(scene, cam)) return out;
     if (whitted && !cudaBackwardWhittedSupported(scene, cam, *whitted)) return out;
 
@@ -25886,7 +25886,6 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     if (!prog || !prog->report) { launch(spp, sppBase); download(out); }   // single-shot
     else gpuSppChunks(spp, *prog, out, launch, download);
     if (specOut) {
-        specOut->resX = resX; specOut->resY = resY; specOut->alloc();
         CUDA_CHECK(cudaMemcpy(film.data(), d_filmSpec, film.size() * sizeof(double), cudaMemcpyDeviceToHost));
         for (size_t i = 0; i < npix; ++i)
             specOut->xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
