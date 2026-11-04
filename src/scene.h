@@ -1833,8 +1833,10 @@ struct Scene {
     Vec3 lightPointNow(const Emitter& em, const Vec3& p) const {
         return lightMoves(em) ? motionNow(em.motion).apply(p) : p;
     }
+    // `d` a unit direction or normal: between two keys the motion is their blend, which shrinks
+    // what it turns, so the carried vector is made unit again.
     Vec3 lightDirNow(const Emitter& em, const Vec3& d) const {
-        return lightMoves(em) ? motionNow(em.motion).applyDir(d) : d;
+        return lightMoves(em) ? normalize(motionNow(em.motion).applyDir(d)) : d;
     }
     Vec3 lightPointThen(const Emitter& em, const Vec3& p) const {   // into the instant
         return lightMoves(em) ? motionNowInverse(em.motion).apply(p) : p;
@@ -2519,6 +2521,32 @@ struct Scene {
     double exitDistance(const Vec3& p) const {
         if (sweptQuery()) return length(sweptCenter - p) + sweptRadius;
         return mediaExitDistance(p);
+    }
+    // Where a sky or sun photon starting at `origin` on its entry disc, travelling `dir`, starts
+    // meeting media; false to drop it. With a time in a moving scene that disc is the swept one
+    // (lightRadius()), wider than the instant's and further out, and the haze the still scene's
+    // photons never reach is not the scene's (see mediaExitDistance). A photon entering through
+    // the instant's disc is carried to that disc's plane, sceneRadius upstream of the centre,
+    // where a still scene's photon starts. One entering outside it is there only for movers that
+    // stray out of the instant's sphere: it crosses no haze before the first thing it meets, and
+    // is dropped when it meets nothing -- unless `mayDrop` is false (a BDPT subpath, which MIS
+    // weighs as a strategy and so may not vanish), when it is left as it is. Either stops just
+    // short of something in its way. Everywhere else `origin` is left as it is.
+    bool skyEntryPastHaze(Vec3& origin, const Vec3& dir, bool mayDrop = true) const {
+        if (media.empty() || !sweptQuery() || !(sweptReach > sceneRadius)) return true;
+        const Vec3 off = origin - sceneCenter;
+        const double along = dot(off, dir);
+        const Vec3 lat = off - dir * along;
+        const bool outside = dot(lat, lat) > sceneRadius * sceneRadius;
+        const double toPlane = -along - sceneRadius;
+        if (outside && !mayDrop) return true;
+        if (!outside && !(toPlane > 0.0)) return true;
+        const Hit h = closestHit(Ray{origin, dir}, 0.0);
+        const double back = 1e-3 * sceneRadius;   // haze that short a way is none to speak of
+        if (outside && !h.valid) return false;
+        const double t = (h.valid && (outside || h.t < toPlane)) ? std::max(0.0, h.t - back) : toPlane;
+        origin = origin + dir * t;
+        return true;
     }
     // The far end of a medium's transmittance along a ray to the sun or the sky: the scene's own
     // bounding sphere at every time, since no medium moves -- integrating an unbounded haze out

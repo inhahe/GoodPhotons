@@ -2819,6 +2819,9 @@ struct Renderer {
         // only measures the sample (no RNG draw, so every existing render stays
         // bit-for-bit) and stores the caustic MIS weight.
         if (!applyCausticAim(scene, &em, origin, dir, emitN, spotW, rng)) return;
+        if ((em.shape == EmitterShape::Env || em.shape == EmitterShape::Sun) &&
+            !scene.skyEntryPastHaze(origin, dir))   // a blur's wider disc
+            return;
         double pdfL = 0.0;
         // Drawn through sampleAt rather than sample() so the SAME uniform variate can seed the
         // stratified secondaries below. `sample()` is literally `sampleAt(rng.uniform(), pdf)`,
@@ -3769,6 +3772,9 @@ struct Renderer {
         // Aimed caustic emission — see the scalar tracer. Before `base *= spotW` for the
         // same reason (the aimed pass recomputes spotW).
         if (!applyCausticAim(scene, &em, origin, dir, emitN, spotW, rng)) return;
+        if ((em.shape == EmitterShape::Env || em.shape == EmitterShape::Sun) &&
+            !scene.skyEntryPastHaze(origin, dir))   // a blur's wider disc
+            return;
 
         // Hero + stratified secondary wavelengths from this emitter's SPD (hero.h policy 1:
         // one base draw, C-1 wrapped strata). The hero must have a valid pdf; a dead

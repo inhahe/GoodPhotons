@@ -1982,7 +1982,13 @@ inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Render
     double betaWalk = Le * invP;
     double betaWalkSec[hero::kHeroMax - 1];
     for (int i = 0; i + 1 < hb.C; ++i) betaWalkSec[i] = LeSec[i] * invP;
-    Ray ray{org, dir};
+    // The walk starts where the scene's media do (Scene::skyEntryPastHaze: a blur's wider sun
+    // disc is out past them); the vertex stays on the disc, where its densities are measured.
+    // The ray is never dropped here: every subpath stays a strategy MIS weighs, so one that
+    // enters outside the instant's disc and meets nothing walks the haze as it always did.
+    Vec3 walkFrom = org;
+    if (isSun) scene.skyEntryPastHaze(walkFrom, dir, /*mayDrop*/false);
+    Ray ray{walkFrom, dir};
     // Spectral-claim birth (see BeamSpectral). `fall` and the cone pdf are
     // wavelength-independent, so a spot or a sun starts the walk with the claim intact for
     // exactly the same reason an area light does, and `spdFn(lambda) * invPdfLambda` is the
@@ -3680,6 +3686,10 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         // A distant sun has no finite light point: the shadow ray runs all the way to the
         // scene exit, so it must NOT be shortened by the usual endpoint epsilon.
         double occlEps = 2e-6;
+        // How far the connection crosses media: to the light, or for the sun to the instant's
+        // sphere (mediaExitDistance) -- haze past it is not the scene's, however far a blur's
+        // sweep pushes the geometry's exit out.
+        double medDist = -1.0;
         if (pick.fire >= 0) {
             // A point of the fire, drawn as a light subpath's origin is (fireOriginSample), so
             // its density is the one every MIS ratio already carries; it emits j(x, λ) alike in
@@ -3726,6 +3736,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                 // at infinity — so Wgeom is just Omega/pdfChoice and spdFn is a radiance.
                 wi = em.sampleCone(em.beamDir * -1.0, u1, u2);
                 dist = scene.exitDistance(pt.p);   // the swept sphere's, for a path with a time
+                medDist = scene.mediaExitDistance(pt.p);
                 occlEps = 0.0;
                 y = pt.p + wi * dist; nOut = wi * -1.0;
                 Wgeom = em.spotOmega / pdfChoice;
@@ -3797,7 +3808,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                              connFiberStep(pt, wi))) return 0.0;   // hard block: see t=1
         const double vis = 1.0;
         // Hero transmittance, shared by the bundle (flat extinction; see the t==1 branch).
-        double Tr = mats.mediaTransmittance(scene, pt.p, wi, dist, lambda, rng) * vis;
+        double Tr = mats.mediaTransmittance(scene, pt.p, wi, medDist >= 0.0 ? medDist : dist, lambda, rng) * vis;
         double G = std::fabs(cosSurf) * Wgeom;
         L = pt.beta * f * Le * G * Tr * stG;
         for (int i = 0; i + 1 < nUp; ++i)

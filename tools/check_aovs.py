@@ -3,7 +3,8 @@
     D:/python314/python.exe -u tools/check_aovs.py [--out <dir>] [--exe ftrace.exe]
 
   * `-write-aovs` writes <out>.albedo, .normal, .depth, .position, .prevposition, .motion and
-    .motionfwd.pfm, without -oidn.
+    .motionfwd.pfm, without -oidn, and leaves the render itself byte for byte as it is without it;
+    `-oidn -oidn-write-guides` alone writes the albedo and normal guides and none of the AOVs.
   * Depth and position agree with each other and with the camera: every pixel that meets a
     surface has a position that projects back onto its own centre, and a depth that is that
     position's distance along the camera's axis.
@@ -11,6 +12,8 @@
     pixels the vector a frame back is the projection of the hit point carried 0.4 m back, minus
     the pixel's centre, and the one a frame forward the same 0.4 m ahead, and its prevposition is
     the hit point 0.4 m back; a floor pixel far from the ball holds still (0, and where it sits).
+  * A face turning a quarter turn a frame sat a quarter turn back a frame earlier (its keys' half-
+    frame turn applied twice).
   * The middle frame of a camera path sees the still box move with the neighbouring frames'
     cameras: each pixel's backward vector is its world position projected by the previous frame's
     camera, minus the pixel's centre (and forward, by the next).
@@ -116,6 +119,29 @@ def main():
         f.write(box(ball, still_camera()))
     aov, guides = render(exe, p, os.path.join(out, "slide.png"))
     verdict("-write-aovs writes the seven images without -oidn", guides)
+    # ... and denoises nothing: the render is the one made without it, byte for byte.
+    plain = os.path.join(out, "slide_plain.png")
+    q = subprocess.run([exe, "-in", p, "-mode", "R", "-device", "cpu", "-spp", "1", "-no-meter", "-hdr",
+                        "-o", plain], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    q2 = subprocess.run([exe, "-in", p, "-mode", "R", "-device", "cpu", "-spp", "1", "-no-meter", "-hdr",
+                         "-write-aovs", "-o", os.path.join(out, "slide_aovs.png")], capture_output=True,
+                        text=True, encoding="utf-8", errors="replace")
+    same = (q.returncode == 0 and q2.returncode == 0 and
+            open(plain[:-4] + ".pfm", "rb").read() == open(os.path.join(out, "slide_aovs.pfm"), "rb").read())
+    verdict("... and leaves the render as it is (no -oidn)", same)
+    # -oidn-write-guides alone writes the denoiser's two guides, not the AOVs (when OIDN is here).
+    stem = os.path.join(out, "slide_guides")
+    for suf in (".albedo.pfm", ".depth.pfm"):
+        if os.path.exists(stem + suf):
+            os.remove(stem + suf)
+    q = subprocess.run([exe, "-in", p, "-mode", "R", "-device", "cpu", "-spp", "1", "-no-meter", "-oidn",
+                        "-oidn-write-guides", "-o", stem + ".png"], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    if q.returncode == 0:
+        verdict("-oidn-write-guides alone writes the two guides, no AOVs",
+                os.path.exists(stem + ".albedo.pfm") and not os.path.exists(stem + ".depth.pfm"))
+    else:
+        print("(OIDN not available here: -oidn-write-guides skipped)")
     cam = Cam(EYE)
     depth, pos = aov["depth"][..., 0], aov["position"]
     hit = depth > 0
@@ -141,6 +167,22 @@ def main():
     still = np.abs(aov["motion"][fl][:2]).max() + np.abs(aov["motionfwd"][fl][:2]).max()
     still += np.abs(aov["prevposition"][fl] - pos[fl]).max()
     verdict("... and the still floor's are zero (it sat where it sits)", still < 1e-6, "%.2g" % still)
+
+    # --- a cube turning a quarter turn a frame: a frame earlier, its points sat a quarter turn
+    # back about its axis (the half-frame turn applied twice, not a chord) ---
+    spin = ("group { motion { key { translate 0 0.5 0  rotate 0 -45 0 } key { translate 0 0.5 0  rotate 0 45 0 } }  "
+            "quad { origin -0.3 -0.3 0.3  u 0.6 0 0  v 0 0.6 0  material gold } }")
+    p = os.path.join(out, "spin.ftsl")
+    with open(p, "w", encoding="utf-8", newline="") as f:
+        f.write(box(spin, still_camera()))
+    aov, _ = render(exe, p, os.path.join(out, "spin.png"))
+    on = ((aov["depth"][..., 0] > 0) & (np.abs(aov["position"][..., 2] - 0.3) < 1e-6) &
+          (aov["position"][..., 1] > 0.1))                                   # the turning face
+    q = aov["position"][on] - np.array([0.0, 0.5, 0.0])
+    back = np.stack([-q[:, 2], q[:, 1], q[:, 0]], -1) + np.array([0.0, 0.5, 0.0])   # -90 about y
+    se = np.abs(aov["prevposition"][on] - back).max() if on.any() else 1.0
+    verdict("a turning face sat a quarter turn back a frame earlier", on.any() and se < 1e-5,
+            "worst %.2g m over %d pixels" % (se, on.sum()))
 
     # --- a camera path's middle frame ---
     path = ('camera_path "fly" { look_at %r %r %r  up 0 1 0  fov_y %r  frames 3  film { res %d %d }'

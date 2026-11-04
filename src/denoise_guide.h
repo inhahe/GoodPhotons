@@ -245,16 +245,24 @@ inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& al
 }
 
 // Where point `p0`, at the frame's instant on a primitive of motion set `set` (-1: still), sits
-// `frames` frames out: carried by its keys, linearly past the motion interval's end on that side
-// (or past the other end, when the interval stops at the instant). An estimate beyond the
-// interval, as a frame's own keys are all it knows of its neighbours.
+// `frames` frames out, from the motion interval's end on that side (or the other end, when the
+// interval stops at the instant): when `frames` is a whole number n of that end's time, its
+// motion from the instant applied n times -- exact for a steady motion, turning included, as a
+// rolling wheel's is -- and otherwise carried linearly past it. An estimate beyond the interval,
+// as a frame's own keys are all it knows of its neighbours.
 inline Vec3 framePoint(const Scene& scene, int set, const Vec3& p0, double frames) {
     if (set < 0 || !(scene.motionB > scene.motionA)) return p0;
     double end = frames < 0.0 ? scene.motionA : scene.motionB;
     if (end == 0.0) end = frames < 0.0 ? scene.motionB : scene.motionA;
     if (end == 0.0) return p0;
-    const Vec3 pe = scene.motionAt(set, scene.motionU(end)).apply(p0);
-    return p0 + (pe - p0) * (frames / end);
+    const Affine D = scene.motionAt(set, scene.motionU(end));
+    const double ratio = frames / end, n = std::round(ratio);
+    if (n >= 1.0 && n <= 16.0 && std::fabs(ratio - n) < 1e-9) {
+        Vec3 p = p0;
+        for (int i = 0; i < (int)n; ++i) p = D.apply(p);
+        return p;
+    }
+    return p0 + (D.apply(p0) - p0) * ratio;
 }
 
 // The centre-ray half of the guides (Images::depth and on). False if a stop was requested.
@@ -300,9 +308,10 @@ inline bool motionAovs(const Scene& scene, const Camera& cam, int W, int H, Imag
 }
 
 // The guides for `cam` at W x H, in the film's row order (row 0 = the bottom of the image,
-// as Camera::genRay counts). `side`^2 stratified rays per pixel. Returns an empty Images
-// (W == 0) if a stop was requested part-way.
-inline Images render(const Scene& scene, const Camera& cam, int W, int H, int side) {
+// as Camera::genRay counts). `side`^2 stratified rays per pixel; `aovs`: the centre-ray half
+// too (depth and on), else those stay empty. Returns an empty Images (W == 0) if a stop was
+// requested part-way.
+inline Images render(const Scene& scene, const Camera& cam, int W, int H, int side, bool aovs) {
     Images g;
     if (W <= 0 || H <= 0) return g;
     side = std::max(1, side);
@@ -348,7 +357,7 @@ inline Images render(const Scene& scene, const Camera& cam, int W, int H, int si
         }
     });
     if (!ok) return Images{};
-    if (!motionAovs(scene, cam, W, H, g)) return Images{};
+    if (aovs && !motionAovs(scene, cam, W, H, g)) return Images{};
     g.W = W; g.H = H;
     seal(g);
     return g;

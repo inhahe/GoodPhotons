@@ -55,6 +55,13 @@
 #include "bsdf_eval.h" // bdpt::bsdfF / bsdfPdf — the evaluable BSDF, for glossy NEE
 
 struct BackwardRenderer {
+    // How far a shadow ray from `p` to emitter `em`, `dist` long, crosses media: the whole way,
+    // except to the sun -- which `dist` reaches past everything the ray could hit, out to a
+    // blur's swept sphere -- only to the instant's sphere (Scene::mediaExitDistance).
+    static double sunMediaDist(const Scene& scene, const Emitter& em, const Vec3& p, double dist) {
+        return em.shape == EmitterShape::Sun ? scene.mediaExitDistance(p) : dist;
+    }
+
     // --- Participating media: the WHOLE `scene.media` vector, superposed ----------------
     // Until v0.254.0 every media term in this file went through `Scene::backwardMedium()`,
     // which is literally `scene.media.front()` treated as an UNBOUNDED HOMOGENEOUS haze —
@@ -598,7 +605,7 @@ struct BackwardRenderer {
         if ((coneSampled || cylVisible) && scene.lightMoves(em)) {
             y = scene.lightPointNow(em, y);
             nLight = scene.lightDirNow(em, nLight);
-            wi = scene.lightDirNow(em, wi);
+            if (coneSampled) wi = scene.lightDirNow(em, wi);   // the tube's comes from y below
         }
         if (coneSampled) {
             double cosSurf, stG;
@@ -1192,7 +1199,8 @@ struct BackwardRenderer {
                 // vector and each medium's own bounds/density field (see mediaTr). The
                 // shadow ray starts at the same offset point `blocked` used, so the two
                 // measure the same segment.
-                if (med) contrib *= mediaTr(scene, h.p + ngo * 1e-6, wiConn, dist, lambda, rng);
+                if (med) contrib *= mediaTr(scene, h.p + ngo * 1e-6, wiConn, sunMediaDist(scene, em, h.p, dist),
+                                            lambda, rng);
                 acc += contrib;
             }
             // selW is 1 on the exact path, so this multiply is a no-op there (and the
@@ -1396,7 +1404,7 @@ struct BackwardRenderer {
                 // gate), so one transmittance estimate serves every wavelength. A vacuum scene
                 // skips it without touching the rng.
                 if (!scene.media.empty())
-                    ws *= mediaTr(scene, h.p + ngo * 1e-6, wiConn, dist, lam[0], rng);
+                    ws *= mediaTr(scene, h.p + ngo * 1e-6, wiConn, sunMediaDist(scene, em, h.p, dist), lam[0], rng);
                 // GLOSSY-NEE. The lobe's GEOMETRY is wavelength-free -- which is the same fact
                 // that lets the bundle survive a glossy vertex at all -- so the balance-heuristic
                 // weight is computed once and shared, and only the coefficient inside bsdfF
@@ -1585,7 +1593,7 @@ struct BackwardRenderer {
             if ((coneSampled || cylVisible) && scene.lightMoves(em)) {
                 y = scene.lightPointNow(em, y);
                 nLight = scene.lightDirNow(em, nLight);
-                wi = scene.lightDirNow(em, wi);
+                if (coneSampled) wi = scene.lightDirNow(em, wi);   // the tube's comes from y below
             }
             if (coneSampled) {
                 geom = 1.0 / pdfW;                         // solid-angle measure
@@ -1611,8 +1619,7 @@ struct BackwardRenderer {
         // stopped short of it (Scene::shadowTransmittanceTo), as emitterGeom's ray is.
         const double vis = scene.shadowTransmittanceTo(p + wi * 1e-6, p + wi * dist, shorten);
         if (!(vis > 0.0)) return false;
-        const double medDist = (em.shape == EmitterShape::Sun) ? scene.mediaExitDistance(p) : dist;
-        geom *= vis * mediaTr(scene, p + wi * 1e-6, wi, medDist, lambda, rng);
+        geom *= vis * mediaTr(scene, p + wi * 1e-6, wi, sunMediaDist(scene, em, p, dist), lambda, rng);
         return geom > 0.0;
     }
 
@@ -1791,7 +1798,7 @@ struct BackwardRenderer {
                              /*hairUnit=*/true)) continue;
             // The bundle rides only through media whose extinction is the same at every
             // wavelength (renderRows' gate), so one transmittance estimate serves all of it.
-            if (med) w *= mediaTr(scene, h.p + ngo * 1e-6, wiConn, dist, lam[0], rng);
+            if (med) w *= mediaTr(scene, h.p + ngo * 1e-6, wiConn, sunMediaDist(scene, em, h.p, dist), lam[0], rng);
             w *= selW;
             if (!(w > 0.0)) continue;
             const Vec3 wl = hair::toLocal(hs[0].fr, wiConn);

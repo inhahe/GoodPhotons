@@ -225,8 +225,6 @@ struct Camera {
     // after lookAt (which sets halfFovY) so authored fisheye lenses take effect.
     void setProjection(int p) { projection = p; rEdge = projRadius(p, halfFovY); }
 
-    // Project a world point to raster. Returns false if behind camera or off-film.
-    // On success sets px,py and cosCam = cosine between forward and eye->point.
     // Where world point `p` lands on the film, in continuous pixel coordinates (x right, y up,
     // a pixel's centre at its index + 0.5), on or off the film. False when it cannot be imaged:
     // behind a rectilinear camera, or on its axis's far side for a fisheye that cannot see there.
@@ -253,6 +251,8 @@ struct Camera {
         return true;
     }
 
+    // Project a world point to raster. Returns false if behind camera or off-film.
+    // On success sets px,py and cosCam = cosine between forward and eye->point.
     bool project(const Vec3& p, int& px, int& py, double& cosCam, double& dist2) const {
         Vec3 d = p - eye;
         double cz = dot(d, w);

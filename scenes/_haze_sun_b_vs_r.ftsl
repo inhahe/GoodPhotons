@@ -1,0 +1,7 @@
+scene { units meters  motion_interval -0.5 0.5 }
+material "w" { type diffuse reflect 0.6 }
+light sun { dir 0.3 1 0.2  angle 0.53  spd preset:d65 }
+medium { sigma_t 0.04  albedo 0.5 }
+quad { origin -1 0 -1  u 0 0 2  v 2 0 0  material w }
+
+camera "c" { eye 0 1.6 2.2  look_at 0 0 0  up 0 1 0  fov_y 45  film { res 96 72 } }

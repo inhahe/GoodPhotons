@@ -51,7 +51,12 @@ cube whose keys scale and shear it together. It requires:
     render as the key writing it); a keyed camera without a shutter, rendered in a flight beside
     one that blurs, stays sharp; a moving camera keeps `-radcache` in a still scene; keys that all
     agree are a still camera (it renders on the GPU); and `-fur-volume` steps aside for a coat
-    whose strands move.
+    whose strands move -- and keeps one seen only at the instant.
+  * A spot on its group's pivot, turning 30 degrees across the shutter, lights the middle of its
+    sweep along a wall as brightly as the rest, and off the pivot needs no more keys than the
+    budget. Keys whose only mover is a light they would scale are no motion at all. Haze under a
+    sweep far wider than the scene lights the floor as it does without the shutter (modes R, D
+    and B). The blurred sky mode B sees in a batch with under one sample a pixel is all there.
   * The loader refuses, with a message naming why: a `motion` block with no `motion_interval`; one
     with a single key; `translate` beside `motion`; fur on, or a medium bounded by, a moving
     object; an interval that excludes the instant; `shutter_close` before `shutter_open`. It keeps
@@ -783,9 +788,105 @@ def main():
     verdict("mode M under a shutter says it renders the instant",
             rc == 0 and "renders the frame's instant" in log, log.strip()[-300:] if rc else "")
 
+    light_and_haze_tests(exe, out, verdict, hair)
     camera_tests(exe, out, verdict, devices)
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
+
+
+def light_and_haze_tests(exe, out, verdict, hair):
+    """A moving light's turn, a scene whose keys move nothing, a coat seen only at the instant,
+    haze under a wide sweep, and the forward sky in a small batch."""
+    # A spot on its group's pivot turning 30 degrees across the shutter sweeps its beam along a
+    # wall: every time lights the wall alike, so the streak is as bright mid-way as near its ends.
+    def spot_scene(spot_at, shutter=(-0.5, 0.5)):
+        return NL.join([
+            "scene { units meters  motion_interval -0.5 0.5 }",
+            'material "w" { type diffuse reflect 0.7 }',
+            "quad { origin 2 -1 -2  u 0 3 0  v 0 0 4  material w }",
+            "group { motion { key { translate 0 1 0  rotate 0 -15 0 } key { translate 0 1 0  rotate 0 15 0 } }  "
+            "light spot { origin %r 0 0  dir 1 0 0  inner_angle 3  outer_angle 5  spd preset:bb6500  power 20 } }"
+            % spot_at,
+            'camera "c" { eye -1 1 0  look_at 2 1 0  up 0 1 0  fov_y 50  shutter_open %r  shutter_close %r  '
+            'film { res %d %d } }' % (shutter + (W, H))]) + NL
+    p = os.path.join(out, "spot_turn.ftsl")
+    write(p, spot_scene(0.0))
+    img = lum(render(exe, out, p, "spot_turn", ["-mode", "R", "-device", "cpu", "-spp", "256"])[0])
+    row = img[H // 2 - 2:H // 2 + 3].mean(axis=0)              # across the streak, along z
+    lit = row > 0.2 * row.max()
+    span = np.nonzero(lit)[0]
+    if len(span) > 4:
+        inner = row[span[0] + (span[-1] - span[0]) // 4: span[-1] - (span[-1] - span[0]) // 4 + 1]
+        good = inner.min() > 0.6 * inner.max()
+        detail = "the streak's middle half dips to %.2f of its peak" % (inner.min() / inner.max())
+    else:
+        good, detail = False, "no streak"
+    verdict("a spot turning on its pivot lights its whole sweep", good, detail)
+    p = os.path.join(out, "spot_off.ftsl")
+    write(p, spot_scene(0.5))
+    rc, log = run([exe, "-in", p, "-parseonly"])
+    verdict("... and off its pivot needs no more keys than it has", rc == 0 and "keys to follow" not in log,
+            "" if rc == 0 and "keys to follow" not in log else log.strip()[-300:])
+
+    # Keys that move nothing (the only mover a light they would scale): no motion in the scene,
+    # so mode M under a shutter has no blur to say it drops.
+    p = os.path.join(out, "nomotion.ftsl")
+    write(p, NL.join(["scene { units meters  motion_interval -0.5 0.5 }", 'material "w" { type diffuse reflect 0.5 }',
+                      "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material w }",
+                      STILL[1][1],
+                      'camera "c" { eye 0 1 3  look_at 0 0.5 0  up 0 1 0  fov_y 40  shutter_open -0.5  '
+                      'shutter_close 0.5  film { res 32 24 } }']) + NL)
+    rc, log = run([exe, "-in", p, "-mode", "M", "-device", "cpu", "-n", "20000", "-no-meter",
+                   "-o", os.path.join(out, "nomotion.png")])
+    verdict("keys that move nothing are no motion", rc == 0 and "renders the frame's instant" not in log,
+            log.strip()[-300:] if rc else "")
+
+    # A moving coat seen only at the instant keeps -fur-volume.
+    with open(hair, encoding="utf-8") as f:
+        txt = f.read()
+    p = os.path.join(out, "hair_instant.ftsl")
+    write(p, txt.replace("shutter_open -0.5  shutter_close 0.5  ", ""))
+    rc, log = run([exe, "-in", p, "-mode", "R", "-device", "cpu", "-spp", "1", "-fur-volume", "-no-meter",
+                   "-o", os.path.join(out, "hair_instant.png")])
+    verdict("-fur-volume keeps a moving coat seen at the instant", rc == 0 and "the coat moves" not in log,
+            log.strip()[-300:] if rc or "the coat moves" in log else "")
+
+    # Haze under a sweep far wider than the scene: the sun lights the floor through the scene's
+    # haze alone, blurred or not -- in BDPT's sun connections and the forward photons alike.
+    def haze_scene(shutter):
+        cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
+        return NL.join([
+            "scene { units meters  motion_interval -0.5 0.5 }",
+            'material "w" { type diffuse reflect 0.6 }',
+            "light sun { dir 0.3 1 0.2  angle 0.53  spd preset:d65 }",
+            "medium { sigma_t 0.04  albedo 0.5 }",
+            "quad { origin -1 0 -1  u 0 0 2  v 2 0 0  material w }",
+            "group { motion { key { translate -25 0.3 0 } key { translate 25 0.3 0 } }  "
+            "sphere { center 0 0 0  radius 0.05  material w } }",
+            'camera "c" { eye 0 1.6 2.2  look_at 0 0 0  up 0 1 0  fov_y 45  %sfilm { res %d %d } }'
+            % (cam, W, H)]) + NL
+    pb, ps = os.path.join(out, "haze_blur.ftsl"), os.path.join(out, "haze_still.ftsl")
+    write(pb, haze_scene((-0.5, 0.5)))
+    write(ps, haze_scene(None))
+    for mode, margs in (("R", ["-spp", "128"]), ("D", ["-spp", "128"]), ("B", ["-n", "20000000"])):
+        args = ["-mode", mode, "-device", "cpu"] + margs
+        hb = [lum(render(exe, out, pb, "haze_blur_%s_s%d" % (mode, s), args, seed=s)[0]) for s in (1, 2)]
+        hs = [lum(render(exe, out, ps, "haze_still_%s_s%d" % (mode, s), args, seed=s)[0]) for s in (1, 2)]
+        floor = slice(H // 3, H)                                  # the floor, below the horizon of haze
+        rb, rs = (hb[0] + hb[1])[floor].mean(), (hs[0] + hs[1])[floor].mean()
+        verdict("a sweep past the scene leaves its haze as it is (mode %s)" % mode, abs(rb / rs - 1) < 0.03,
+                "blurred floor %.4f of the still one's" % (rb / rs))
+
+    # The blurred forward sky in a batch with under one sample a pixel to spare: each pixel's one
+    # sample is taken with that chance and weighted up by it, so the sky is still all there.
+    sky = os.path.join(out, "sky.ftsl")
+    sr = [lum(render(exe, out, sky, "sky_R_s%d" % s, ["-mode", "R", "-device", "cpu", "-spp", "64"],
+                     seed=s)[0]) for s in (1, 2)]
+    sb = [lum(render(exe, out, sky, "sky_Bsmall_s%d" % s, ["-mode", "B", "-device", "cpu", "-n", "30000"],
+                     seed=s)[0]) for s in range(1, 9)]
+    top = slice(0, H // 6)                                        # sky alone
+    r = np.mean([x[top].mean() for x in sb]) / np.mean([x[top].mean() for x in sr])
+    verdict("a small batch's blurred sky is all there (mode B)", abs(r - 1) < 0.03, "%.4f of mode R's" % r)
 
 
 def agree(a, b, rel_tol=0.03):

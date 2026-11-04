@@ -7001,8 +7001,25 @@ private:
                 const Sphere& s = S.spheres[i];
                 box.expand(s.c - Vec3{s.r, s.r, s.r}); box.expand(s.c + Vec3{s.r, s.r, s.r});
             }
-            for (size_t i = a.emitters; i < z.emitters; ++i) box.expand(S.emitters[i].origin);
         }
+        // A light's probes: its origin and a cross of three arms about it, its own size long, so
+        // the keys follow its turn as well as its place -- a spot on the pivot turns its beam,
+        // which a probe at its origin alone never sees. A light of no size (a spot, a point) gets
+        // arms half the group's other extent, or one authored unit when the group has none.
+        const bool sized = box.hi.x >= box.lo.x && length(box.hi - box.lo) > 0.0;
+        const double armOf0 = sized ? 0.5 * length(box.hi - box.lo) : L_;
+        for (const auto& [a, z] : lit)
+            for (size_t i = a.emitters; i < z.emitters; ++i) {
+                const Emitter& em = S.emitters[i];
+                double arm = std::max({em.radius, length(em.u), length(em.v)});
+                if (!(arm > 0.0)) arm = armOf0;
+                box.expand(em.origin);
+                for (int ax = 0; ax < 3; ++ax) {
+                    Vec3 d{0, 0, 0};
+                    (&d.x)[ax] = arm;
+                    box.expand(em.origin + d); box.expand(em.origin - d);
+                }
+            }
         if (tris.empty() && sphs.empty() && imps.empty() && segs.empty() && insts.empty() && lit.empty())
             return true;
         if (std::fabs(instant.det()) < 1e-30) {
@@ -7091,6 +7108,27 @@ private:
             std::fprintf(stderr, "[ftsl] warning: a group's motion needs more than %zu keys to follow "
                                  "closely; it is blended more coarsely than %.1g of its size\n",
                          kMotionMaxKeys, kMotionTol);
+        // Lights move only rigidly, so that every length, area and angle of them stands and each
+        // is sampled where it sits at the instant (Scene::lightPointNow): with keys that scale or
+        // shear, a child that adds lights stays at the instant, its surfaces with it.
+        bool rigid = true;
+        for (const Affine& w : kw) {
+            for (int r = 0; r < 3 && rigid; ++r)
+                for (int c = 0; c < 3 && rigid; ++c) {
+                    double d = 0.0;   // (M^T M)[r][c]
+                    for (int k = 0; k < 3; ++k) d += w.m[k * 3 + r] * w.m[k * 3 + c];
+                    if (std::fabs(d - (r == c ? 1.0 : 0.0)) > 1e-9) rigid = false;
+                }
+            if (!rigid) break;
+        }
+        if (!lit.empty() && !rigid && stillWarned_.insert("a light scaled").second)
+            std::fprintf(stderr, "[ftsl] warning: a light in a moving group whose keys scale or shear it "
+                                 "stays where it is at the frame's instant, with its surface -- a light "
+                                 "moves only rigidly (ROADMAP 11)\n");
+        // Nothing takes the keys (every mover a light they would scale): no set, so a scene where
+        // nothing moves is not one with motion.
+        if (tris.empty() && sphs.empty() && imps.empty() && segs.empty() && insts.empty() && !rigid)
+            return true;
         const int set = (int)S.motionSets.size();
         S.motionSets.push_back(MotionKeys{(int)kt.size(), (int)S.motionXf.size()});
         for (size_t k = 0; k < kt.size(); ++k) {
@@ -7110,23 +7148,6 @@ private:
         for (const auto& [a, z] : imps) for (size_t i = a; i < z; ++i) S.implicits[i].motion = set;
         for (const auto& [a, z] : segs) for (size_t i = a; i < z; ++i) S.curveSegs[i].motion = set;
         for (const auto& [a, z] : insts) for (size_t i = a; i < z; ++i) S.instances[i].motion = set;
-        // Lights move only rigidly, so that every length, area and angle of them stands and each
-        // is sampled where it sits at the instant (Scene::lightPointNow): with keys that scale or
-        // shear, a child that adds lights stays at the instant, its surfaces with it.
-        bool rigid = true;
-        for (const Affine& w : kw) {
-            for (int r = 0; r < 3 && rigid; ++r)
-                for (int c = 0; c < 3 && rigid; ++c) {
-                    double d = 0.0;   // (M^T M)[r][c]
-                    for (int k = 0; k < 3; ++k) d += w.m[k * 3 + r] * w.m[k * 3 + c];
-                    if (std::fabs(d - (r == c ? 1.0 : 0.0)) > 1e-9) rigid = false;
-                }
-            if (!rigid) break;
-        }
-        if (!lit.empty() && !rigid && stillWarned_.insert("a light scaled").second)
-            std::fprintf(stderr, "[ftsl] warning: a light in a moving group whose keys scale or shear it "
-                                 "stays where it is at the frame's instant, with its surface -- a light "
-                                 "moves only rigidly (ROADMAP 11)\n");
         for (const auto& [a, z] : lit) {
             if (!rigid) continue;
             for (size_t i = a.tris; i < z.tris; ++i) S.tris[i].motion = set;
@@ -8896,16 +8917,41 @@ private:
     // spread evenly over the scene's motion_interval (ROADMAP 11), each blended linearly to the
     // next. What a key leaves out is the camera's own statement. The camera's own pose becomes the
     // keys' at the frame's instant; `keyFov` says which keys gave a fov_y of their own.
-    // A keyed camera's pose `frames` from the instant, carried linearly past the interval's end on
-    // that side from the instant's pose (or past the other end, when the interval stops at the
-    // instant): an estimate of the neighbouring frame's, for motion vectors.
+    // A keyed camera's pose `frames` from the instant: an estimate of the neighbouring frame's, for
+    // motion vectors. From the interval's end on that side (or the other, when the interval stops
+    // at the instant): when `frames` is a whole number n of that end's time, the camera's rigid
+    // move from the instant to it repeated n times -- exact for a steady move, an orbit's turn
+    // included -- and otherwise carried linearly past it; its fov linearly either way.
     static CameraPose posePastKeys(const CameraMotion& m, double frames) {
         const CameraPose now = m.at(0.0);
         double end = frames < 0.0 ? m.a : m.b;
         if (end == 0.0) end = frames < 0.0 ? m.b : m.a;
         if (end == 0.0) return now;
         const CameraPose e = m.at(end);
-        const double f = frames / end;
+        const double f = frames / end, n = std::round(f);
+        if (n >= 1.0 && n <= 16.0 && std::fabs(f - n) < 1e-9) {
+            // The camera's frame (right, up, forward) at a pose, and the rigid move between two.
+            const auto axes = [](const CameraPose& p, Vec3 (&ax)[3]) {
+                ax[2] = normalize(p.look - p.eye);
+                ax[0] = normalize(cross(ax[2], p.up));
+                ax[1] = cross(ax[0], ax[2]);
+            };
+            Vec3 a0[3], a1[3];
+            axes(now, a0);
+            axes(e, a1);
+            // R takes a0 to a1: R v = sum_k a1[k] (a0[k] . v)
+            const auto rot = [&](const Vec3& v) {
+                return a1[0] * dot(a0[0], v) + a1[1] * dot(a0[1], v) + a1[2] * dot(a0[2], v);
+            };
+            CameraPose p = now;
+            for (int i = 0; i < (int)n; ++i) {
+                p.eye = rot(p.eye - now.eye) + e.eye;   // the move that took now to e, from p
+                p.look = rot(p.look - now.eye) + e.eye;
+                p.up = rot(p.up);
+            }
+            p.fovY = now.fovY + (e.fovY - now.fovY) * f;
+            return p;
+        }
         return CameraPose{now.eye + (e.eye - now.eye) * f, now.look + (e.look - now.look) * f,
                           now.up + (e.up - now.up) * f, now.fovY + (e.fovY - now.fovY) * f};
     }
@@ -9071,22 +9117,17 @@ private:
     void keyPathFrames(Loaded& L, size_t first, bool closed) {
         const long long n = (long long)(L.cameras.size() - first);
         if (n < 2) return;
-        // Every frame's neighbours, for motion vectors (Camera::frameNeighbours), shutter or not:
-        // an open path's ends neighbour themselves.
-        for (long long i = 0; i < n; ++i) {
-            const auto at = [&](long long j) {
-                j = closed ? ((j % n) + n) % n : std::min(std::max(j, 0LL), n - 1);
-                const CamSpec& c = L.cameras[first + (size_t)j];
-                return CameraPose{c.eye, c.look, c.up, c.fov};
-            };
-            L.cameras[first + (size_t)i].frameNeighbours =
-                std::make_shared<const std::array<CameraPose, 2>>(std::array<CameraPose, 2>{at(i - 1), at(i + 1)});
-        }
+        // Frame j's own pose: wrapped round a closed path, held at an open one's ends.
         auto poseOf = [&](long long j) {
             j = closed ? ((j % n) + n) % n : std::min(std::max(j, 0LL), n - 1);
             const CamSpec& c = L.cameras[first + (size_t)j];
             return CameraPose{c.eye, c.look, c.up, c.fov};
         };
+        // Every frame's neighbours, for motion vectors (Camera::frameNeighbours), shutter or not:
+        // an open path's ends neighbour themselves.
+        for (long long i = 0; i < n; ++i)
+            L.cameras[first + (size_t)i].frameNeighbours = std::make_shared<const std::array<CameraPose, 2>>(
+                std::array<CameraPose, 2>{poseOf(i - 1), poseOf(i + 1)});
         auto cr = [](double p0, double p1, double p2, double p3, double f) {
             return 0.5 * (2.0 * p1 + (p2 - p0) * f + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * f * f +
                           (3.0 * p1 - p0 - 3.0 * p2 + p3) * f * f * f);

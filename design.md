@@ -6791,13 +6791,15 @@ as the one at fault.
   - **Reprojection images** (ROADMAP 11 stage C, 0.411.0; `dguide::motionAovs`): from one ray
     through each pixel's centre at the frame's instant (traced at the instant as a time, so a
     moving primitive's hit names its motion set), the depth along the camera's axis, the world
-    position, where that point sat a frame earlier (`framePoint`: its keys, carried a frame out
-    linearly past the motion interval's end on that side), and its motion vectors a frame back
-    and forward in pixels, projected (`Camera::projectF`) by the camera a frame away
-    (`Camera::frameNeighbours`: a camera path's neighbouring frames, `keyPathFrames`; a keyed
-    camera's keys carried a frame out, `posePastKeys`). Written by `-write-aovs` (or
-    `-oidn-write-guides`) through `GuideScope::writeGuideFiles`; `-write-aovs` alone renders the
-    guide pass without publishing it to the denoiser. What a temporal denoiser reprojects with.
+    position, where that point sat a frame earlier (`framePoint`: its motion from the instant to
+    the interval's end on that side, applied as many times as a frame holds of it -- exact for a
+    steady motion, a turn included -- or carried linearly past it when that is no whole number),
+    and its motion vectors a frame back and forward in pixels, projected (`Camera::projectF`) by
+    the camera a frame away (`Camera::frameNeighbours`: a camera path's neighbouring frames,
+    `keyPathFrames`; a keyed camera's keys carried a frame out the same way, `posePastKeys`).
+    Made and written only for `-write-aovs`, through `GuideScope::writeGuideFiles`, and dropped
+    once written (the denoiser reads none of them); `-write-aovs` without `-oidn` renders the
+    guide pass without publishing it. What a temporal denoiser reprojects with.
   - **Plumbing.** `runRender` holds a `GuideScope` for its camera: it renders the guides on
     entry, publishes them (`setGuide`) and withdraws them on exit. `filmToLinear` — the one
     reduction behind the PNG, the `-hdr` PFM and the live window — runs `oidnApply`, which uses
@@ -9986,7 +9988,8 @@ sees the instant, exactly as a static scene with those transforms would show it.
   follows how far a sample of movers sweeps against its own size, and each set's transforms over
   a stretch are gathered once (`buildMoveTrees`). `sweptRadius` (their union) is how far a
   timed shadow ray to the sun or sky must reach (`exitDistance`); a medium's transmittance along
-  it keeps the scene's own (`mediaExitDistance`).
+  it keeps the scene's own (`mediaExitDistance`) -- in mode R's surface and medium NEE alike
+  (`BackwardRenderer::sunMediaDist`) and in BDPT's sun connection (`medDist`).
 - **What a moving surface carries.** A hit records the motion set it came from (`Hit::motionSet`),
   and `patCtxFromHit` reads its patterns at the point carried back to the instant, so a texture
   travels with its object. An analytic sphere may have axes (`Sphere::frame` into `Scene::sphereAxes`,
@@ -10022,8 +10025,9 @@ sees the instant, exactly as a static scene with those transforms would show it.
   deterministic. The main rng draws exactly what it draws without blur. Equal open and close
   times are a sharp frame at that time; `Camera::seesMotion(scene)` is the one test every gate
   asks. The `-oidn` guide pass gives each guide ray a time of its own (stratified over the
-  pixel's rays), so the guides blur as the image does; the resume guard mixes every key and the
-  shutter.
+  pixel's rays), so the guides blur as the image does; the resume guard mixes every key, which
+  primitives and lights each set moves, a version of how a blur is estimated (`kMotionGuard`,
+  raised when what a sidecar holds changes), and the shutter.
 - **Modes D, A, B and C draw a time per path** (stage B, 0.407.0) with `unitTime(unit, salt)`
   (`rng.h`): a uniform off a stream of its own keyed by the path's unit — BDPT's sample unit, a
   forward photon's absolute index — so the path's own stream draws what it drew without blur.
@@ -10034,10 +10038,11 @@ sees the instant, exactly as a static scene with those transforms would show it.
   sees directly is a camera-side pass of its own (`addEnvBackground`, at each write). Under a
   blur that pass skips the camera: each forward thread draws its band of the sky into its own
   batch film instead (`addBlurredSkyRows`), K samples a pixel at times of their own (rotated per
-  pixel and batch), K a sixteenth of a photon per pixel per camera sharing the batch, 1 to 64 —
-  so the sky shows behind a mover for the part of the shutter it is uncovered, converges as the
-  film does, costs at most a sixteenth of the photons or a ray a pixel per batch, and needs no
-  cache (one keyed by camera thrashed under a many-camera flight). A shared forward flight
+  pixel and batch), K a sixteenth of a photon per pixel per camera sharing the batch, at most 64;
+  under one, each pixel takes its one sample with that chance, weighted up by it — so the sky
+  shows behind a mover for the part of the shutter it is uncovered, converges as the film does,
+  costs a sixteenth of the photons however small the batch, and needs no cache (one keyed by
+  camera thrashed under a many-camera flight). A shared forward flight
   (`renderForwardShared`) draws one time per photon for all its cameras, so `run` builds one
   flight per shutter (`joinFlight`; cameras that see nothing move share regardless; the
   function stops with an internal error on any other mix), a flight in which any camera sees
@@ -10048,7 +10053,12 @@ sees the instant, exactly as a static scene with those transforms would show it.
   grows to hold the swept one (`Scene::lightRadius`, `sweptReach`), the forward photon's power
   scales by the disc's area (`lightScale()^2`, folded into `spotW`), BDPT's sun disc and its
   densities (`sampleSunOrigin`, `sunOriginPdf`, `sunOriginPdfAlong`, `vertexPdfLight`) widen
-  with it, and BDPT's sun shadow ray runs to `exitDistance`, as mode R's does.
+  with it, and BDPT's sun shadow ray runs to `exitDistance`, as mode R's does. The haze those
+  wider, further discs would add is not the scene's (`Scene::skyEntryPastHaze`): a photon or sun
+  subpath entering through the instant's disc starts meeting media on that disc's plane, where a
+  still scene's starts; a forward photon entering outside it crosses no haze before the first
+  thing it meets and is dropped if it meets nothing (a BDPT subpath, a strategy MIS weighs, is
+  left as it is).
 - **The camera moves by keys of its own** (0.408.0): `Camera::motion` (a `CameraMotion`: poses
   — eye, look-at point, up, fov — at keys spread evenly over [a, b] frames, blended linearly by
   `CameraMotion::at`). Its eye, axes and fields of view stay its pose at the instant, which is
@@ -10075,7 +10085,10 @@ sees the instant, exactly as a static scene with those transforms would show it.
   keep a blurred camera on the CPU (`kMotionCpuWhy`), and `-radcache` is off under a blur. What cannot move yet stays put and
   says so (`stillWarning`): a sun or sky, an aimed area light, and any light whose keys would
   scale or shear it stay at the instant with their surfaces, so nothing mixes a moved surface
-  with an unmoved sampler.
+  with an unmoved sampler. A coat whose strands move is traced as strands when some camera
+  may see it at another time (`anyCameraTimed`: a shutter open in a mode that blurs), since
+  `-fur-volume`'s and `-dual-grid`'s fields hold it at the instant only; seen only at the
+  instant, it keeps them.
 - **Lights move rigidly** (0.410.0; `Emitter::motion`). Rigid motion keeps every length, area and
   angle of a light, so each sampler runs where the light sits at the instant and only its inputs
   and outputs are carried: `emitterSamplePoint` carries its point and normal out
@@ -10088,9 +10101,13 @@ sees the instant, exactly as a static scene with those transforms would show it.
   moving light's box holds its every key and its normals may point anywhere; the instant's tree
   serves every other query, so a render without a shutter selects as the still scene does.
   `moveChildren` keys a child's lights with its surfaces once the keys are known rigid
-  (MᵀM = I for every key's linear part). Keys are made after a group's children are built (`moveChildren`), so the
+  (MᵀM = I for every key's linear part), and makes no set at all when nothing would take it.
+  Between keys the blend shrinks what it turns, so `lightDirNow` makes a carried direction unit
+  again. Keys are made after a group's children are built (`moveChildren`), so the
   refinement tolerance is 1e-3 of the movers' own bounding-box diagonal, in metres, measured on
-  its corners; each stretch between breaks is first cut to turn at most 90° (so a whole turn
+  its corners -- a light adding its origin and a cross of three arms about it, its own size long
+  (half the group's other extent for a light of none, or one authored unit), so a spot turning on
+  its pivot is refined too; each stretch between breaks is first cut to turn at most 90° (so a whole turn
   cannot hide between two keys whose blend equals the midpoint), and the key budget is spent a
   round at a time, worst stretch first. A nested group composes its parent's exact motion
   (`MotionChain`), not the parent's keys. A sphere the keys scale unevenly is tessellated

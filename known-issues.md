@@ -87,6 +87,25 @@ narrow API speak UTF-8, then audit the `std::filesystem::path(std::string)` / `.
 for UTF-8 (`u8path`, `u8string`); or read argv as UTF-16 (`wmain`) and keep paths as
 `std::filesystem::path` throughout.
 
+## OPEN (2026-11-03, 0.411.1): HAZE-SUN-B — mode B lights an unbounded sunlit haze far dimmer than mode R
+
+`scenes/_haze_sun_b_vs_r.ftsl` (a 2 m floor under a high sun in `medium { sigma_t 0.04  albedo
+0.5 }`, no bounds; 96x72): mode B's floor converges to **0.846** of mode R's, and the haze seen
+over the floor (the top sixth of the frame) to **0.163**. Converged, not noise: 20 M and 80 M
+photons give the same ratios, and without the medium mode B's floor is 0.9998 of mode R's. Found
+while testing a blur's wide sweep (check_motion's haze case compares each mode with itself
+blurred and still, so it passes). Not motion: the scene above holds still. Reproduce:
+`ftrace -in scenes/_haze_sun_b_vs_r.ftsl -mode B -device cpu -n 20000000 -hdr -o png/hb.png`
+and `-mode R -spp 512` beside it, then compare the floor's and the top rows' means. Where to look:
+the two modes take different domains for an unbounded haze -- mode R integrates a sun or sky
+leg's haze to the instant's sphere (`Scene::mediaExitDistance`, from the point outward), while
+forward photons start on the entry disc's plane and fly through the haze unboundedly, splatting
+each medium collision to the camera. Mode D agrees with R here (1.012), so the forward side is the
+suspect: its camera splat from medium vertices, or how far it lets the haze reach. Proper fix:
+one domain for the unbounded haze in every mode (the slab beyond the entry disc's plane is the
+natural one, since that is where the photons start), and a check that modes R, D and B agree on
+this scene.
+
 ## OPEN (2026-11-03, 0.410.1): MOTION-ZOOM-APERTURE — a camera's zoom across the shutter keeps the instant's aperture and focus
 
 A camera's motion keys carry `fov_y` (and a camera path's frames carry theirs), but the thin

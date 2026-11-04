@@ -13156,16 +13156,19 @@ static void setGuide(std::shared_ptr<const dguide::Images> g) {
 
 // The -oidn flags, shared like parseDenoiseFlag's: `-oidn`, `-oidn-noguides`,
 // `-oidn-write-guides`, `-oidn-guide-spp <n>`, `-oidn-quality high|balanced|fast`,
-// `-oidn-device auto|cpu|cuda`. Each turns -oidn on. Returns 1 if argv[i] was one of them
-// (leaving `i` on its last token), 0 if not, and -1 -- the reason printed -- for a value it does
-// not know, which the caller must treat as fatal: a misspelt quality must not quietly become a
-// 30-hour flyby at the default. Returned, not exited, so under -serve it ends one frame.
+// `-oidn-device auto|cpu|cuda`, each of which turns -oidn on, and `-write-aovs` (the guide pass's
+// images, which does not: it lives here so -serve re-reads it with the rest). Returns 1 if
+// argv[i] was one of them (leaving `i` on its last token), 0 if not, and -1 -- the reason
+// printed -- for a value it does not know, which the caller must treat as fatal: a misspelt
+// quality must not quietly become a 30-hour flyby at the default. Returned, not exited, so under -serve it ends one frame.
 static int parseOidnFlag(int argc, char** argv, int& i) {
     const char* a = argv[i];
+    // -write-aovs writes the guide pass's images and denoises nothing: the one flag here that
+    // does not turn -oidn on.
+    if (!std::strcmp(a, "-write-aovs")) { g_writeAovs = true; return 1; }
     if      (!std::strcmp(a, "-oidn"))              {}
     else if (!std::strcmp(a, "-oidn-noguides"))     g_oidnGuides = false;
     else if (!std::strcmp(a, "-oidn-write-guides")) g_oidnWriteGuides = true;
-    else if (!std::strcmp(a, "-write-aovs")) g_writeAovs = true;
     else if (i + 1 >= argc)                         return 0;
     else if (!std::strcmp(a, "-oidn-guide-spp")) {
         const int n = std::atoi(argv[++i]);
@@ -13482,7 +13485,7 @@ struct GuideScope {
         // not published.
         if (!denoise || mode == 'A' || mode == 'C') {
             if (g_writeAovs) {
-                auto g = dguide::render(scene, cam, W, H, g_oidnGuideSide);
+                auto g = dguide::render(scene, cam, W, H, g_oidnGuideSide, /*aovs*/true);
                 if (g.W > 0) writeGuideFiles(g, W, H, outPath);
             }
             if (!denoise) return;
@@ -13497,13 +13500,18 @@ struct GuideScope {
             return;
         }
         const auto t0 = std::chrono::steady_clock::now();
-        auto g = std::make_shared<dguide::Images>(dguide::render(scene, cam, W, H, g_oidnGuideSide));
+        // The centre-ray half (depth and on) only to be written: the denoiser reads none of it.
+        auto g = std::make_shared<dguide::Images>(dguide::render(scene, cam, W, H, g_oidnGuideSide,
+                                                                 g_writeAovs));
         if (g->W == 0) return;                      // a stop arrived while they rendered
         std::printf("[oidn] guides for %dx%d (%d rays/pixel) in %.2f s%s\n", W, H,
                     g_oidnGuideSide * g_oidnGuideSide,
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
                     g->clean ? "" : " -- the lens pupil is sampled, so they are not marked clean");
         if (g_oidnWriteGuides || g_writeAovs) writeGuideFiles(*g, W, H, outPath);
+        for (auto* v : {&g->position, &g->prevPosition, &g->motionBack, &g->motionFwd})
+            std::vector<Vec3>().swap(*v);           // written: not held for the render's length
+        std::vector<float>().swap(g->depth);
         setGuide(std::move(g));
         active = true;
     }
@@ -14916,12 +14924,15 @@ static bool parseFurFlag(int argc, char** argv, int& i) {
 // about to be deleted and this is therefore the last moment they exist; or main's normal
 // setup, when they are not. `g_furFieldsBuilt` is what makes those two mutually exclusive.
 static bool g_furFieldsBuilt = false;
-static void buildFurFields(const Scene& scene) {
+// `timed`: whether anything may render the scene at a time other than the instant
+// (anyCameraTimed).
+static void buildFurFields(const Scene& scene, bool timed) {
     if (g_furFieldsBuilt) return;
     g_furFieldsBuilt = true;
     // The fields hold the strands where they sit at the instant, and a medium does not move: a
-    // coat whose strands move is traced as strands (ROADMAP 11), its options said to be ignored.
-    if (g_furVolume || g_dualGrid) {
+    // coat whose strands move, seen at other times, is traced as strands (ROADMAP 11), its
+    // options said to be ignored. Seen at the instant alone, the fields hold it exactly.
+    if ((g_furVolume || g_dualGrid) && timed) {
         for (const CurveSeg& cs : scene.curveSegs)
             if (cs.motion >= 0 && cs.matId >= 0 && cs.matId < (int)scene.mats.size() &&
                 scene.mats[(size_t)cs.matId].type == MatType::Hair) {
@@ -14997,6 +15008,17 @@ static const char* const kMotionCpuWhy =
 // Whether mode `m` carries motion blur: each of its paths, or photons, is one time in the
 // shutter. Any other mode renders the frame's instant (run closes the shutter for it).
 static bool modeSeesMotion(char m) { return m != 0 && std::strchr("RDABC", m) != nullptr; }
+// Whether any camera of `L` may render at a time other than the instant: its shutter open, in a
+// mode that carries motion blur -- `cliMode` when -mode gave one, else the camera's own or the
+// scene's (a camera with none counts: the default mode is not known here).
+static bool anyCameraTimed(const ftsl::Loaded& L, char cliMode) {
+    const char fallback = L.defaultMode ? L.defaultMode : L.mode;
+    for (const auto& c : L.cameras) {
+        const char m = cliMode ? cliMode : (c.mode ? c.mode : fallback);
+        if ((c.shutterOpen != 0.0 || c.shutterClose != 0.0) && (m == 0 || modeSeesMotion(m))) return true;
+    }
+    return false;
+}
 
 #ifdef HAVE_CUDA
 // cudaBackwardSupported, plus the two things it cannot see (both RENDER OPTIONS, not scene
@@ -15584,9 +15606,10 @@ static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, 
 // the pixel and -- through a physical lens -- a wavelength and pupil point of its own, worth the
 // batch's N photons between them. Batches draw independent samples, so the sky converges as the
 // film accumulates and is as complete as its photons wherever a render stops. K is a sixteenth of
-// a photon per pixel per camera sharing the batch, from 1 to 64: the sky costs at most a
-// sixteenth of the batch's photons, or one ray a pixel. Rows [y0, y1) only, so each forward
-// thread draws its own band into its own film.
+// a photon per pixel per camera sharing the batch, at most 64; where that is under one, each pixel
+// takes its one sample with that chance, weighted up by it. So the sky costs a sixteenth of the
+// batch's photons however small the batch. Rows [y0, y1) only, so each forward thread draws its
+// own band into its own film.
 static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam, long long N,
                               int nCamsSharing, uint64_t seedBase, int y0, int y1) {
     constexpr double kLo = 360.0, kHi = 830.0;
@@ -15594,8 +15617,10 @@ static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam,
     if ((!haveEnv && !haveSun) || N <= 0 || y0 >= y1) return;
     const int rx = film.resX, ry = film.resY;
     const double perPixel = (double)N / ((double)rx * (double)ry * (double)std::max(1, nCamsSharing));
-    const int K = (int)std::clamp(perPixel / 16.0, 1.0, 64.0);
-    const double share = (double)N / (double)K;
+    const double want = perPixel / 16.0;
+    const int K = (int)std::clamp(want, 1.0, 64.0);
+    const double chance = std::min(1.0, want);    // a pixel's chance of its one sample, under one
+    const double share = (double)N / ((double)K * chance);
     const bool lensed = cam.hasLens();
     PosedCamera posed(cam, true);       // a moving camera, at each sample's time
     for (int py = y0; py < y1; ++py)
@@ -15603,6 +15628,7 @@ static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam,
             const uint64_t pix = (uint64_t)py * (uint64_t)rx + (uint64_t)px;
             Pcg32 rng;
             seedUnit(rng, pix, 0x51C7B1D5EEDF00DULL ^ mix64(seedBase + 1));
+            if (chance < 1.0 && !(rng.uniform() < chance)) continue;
             const double offT = rng.uniform();
             Vec3 acc{0, 0, 0};
             for (int k = 0; k < K; ++k) {
@@ -17221,10 +17247,23 @@ static uint64_t checkpointGuard(const Scene& scene, char mode, int res, int resY
     mix((uint64_t)(unsigned char)mode);
     mix((uint64_t)(unsigned)res);
     mix((uint64_t)(unsigned)resY);
-    // Only motion mixes these, so every still render keeps the guard its sidecars hold: every key
-    // of every motion set, the shutter of a camera that sees motion, and a moving camera's keys.
+    // Only motion mixes these, so every still render keeps the guard its sidecars hold: how a
+    // blur is estimated (kMotionGuard, raised whenever that changes what a sidecar holds), every
+    // key of every motion set and what each moves, the shutter of a camera that sees motion, and
+    // a moving camera's keys.
     auto mixD = [&](double d) { uint64_t v; std::memcpy(&v, &d, sizeof v); mix(v); };
     if (scene.hasMotion()) {
+        // 2: the blurred forward sky is in the film, and lights move with their groups (0.410).
+        constexpr uint64_t kMotionGuard = 2;
+        mix(kMotionGuard);
+        const auto members = [&](const auto& prims) {
+            uint64_t n = 0, s = 0;
+            for (size_t i = 0; i < prims.size(); ++i)
+                if (prims[i].motion >= 0) { ++n; s += (uint64_t)(prims[i].motion + 1) * (uint64_t)(i + 1); }
+            mix(n); mix(s);
+        };
+        members(scene.tris); members(scene.spheres); members(scene.implicits);
+        members(scene.curveSegs); members(scene.instances); members(scene.emitters);
         mix((uint64_t)scene.motionXf.size());
         for (size_t k = 0; k < scene.motionXf.size(); ++k) {
             const Affine& D = scene.motionXf[k];
@@ -22045,7 +22084,7 @@ static int run(int argc, char** argv) {
                 return;
             }
             // Last moment the fibers exist: take the summary off them, then delete them.
-            buildFurFields(L.scene);
+            buildFurFields(L.scene, anyCameraTimed(L, cliModePrescan));
             if (!g_furVolData.valid()) return;      // no hair, or the fit failed -- nothing to drop
             const size_t before = L.scene.curveSegs.size();
             const auto t0 = std::chrono::steady_clock::now();
@@ -23523,7 +23562,7 @@ static int run(int argc, char** argv) {
     // every CurveSeg -- a scene with no fur, or a run without -dual-scatter, must not pay.
     // Both flags want the SAME field, so they share one build at the larger budget.
     {
-        buildFurFields(scene);
+        buildFurFields(scene, anyCameraTimed(ftslScene, cliModePrescan));
 
         // The second BVH, the one every `skipHair` query traverses. Needed by anything that
         // makes fibers invisible to a ray: the -fur-volume / -fur-lod far tier (closestHit)
