@@ -15007,10 +15007,11 @@ static void buildFurFields(const Scene& scene, bool timed) {
 // the device-selection notes name that reason rather than the generic lists.
 static const char* const kObjectSpaceWhy =
     "object-space patterns (pattern_space object) are read on the CPU only so far";
-// Motion blur is traced on the host only so far (ROADMAP 11): the device renders the frame's
-// instant, so every device gate asks Camera::seesMotion, and the notes give this reason.
+// Motion blur on the device is modes R and W only so far (ROADMAP 11; cudaBlurUnsupported says
+// what else keeps them on the CPU): every other mode's device gate asks Camera::seesMotion, and
+// its note gives this reason.
 static const char* const kMotionCpuWhy =
-    "motion blur (a shutter on something that moves) renders on the CPU so far";
+    "motion blur in this mode renders on the CPU so far (the device blurs modes R and W)";
 // Whether mode `m` carries motion blur: each of its paths, or photons, is one time in the
 // shutter. Any other mode renders the frame's instant (run closes the shutter for it).
 static bool modeSeesMotion(char m) { return m != 0 && std::strchr("RDABCMSUJP", m) != nullptr; }
@@ -15039,7 +15040,7 @@ static bool anyCameraTimed(const ftsl::Loaded& L) {
 // longer fall back — these two option gates are now the ONLY reasons a fur scene leaves
 // the GPU backward path.)
 static bool backwardOnGpuOk(const Scene& scene, const Camera& cam) {
-    if (cam.seesMotion(scene)) return false;   // motion blur: CPU only so far
+    if (cam.seesMotion(scene) && cudaBlurUnsupported(scene, cam, g_whitted ? 'W' : 'R')) return false;
     if (g_furVolume && g_furVolData.valid()) return false;
     if (g_dualScatter)
         for (const auto& m : scene.mats)
@@ -19088,9 +19089,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         if (!cudaAvailable()) {
             if (wantGpu) std::fprintf(stderr, "[device] no CUDA device found; using CPU\n");
             else         std::printf("[device] auto -> CPU (no CUDA device found)\n");
-        } else if (cam.seesMotion(scene)) {
-            if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", kMotionCpuWhy);
-            else         std::printf("[device] auto -> CPU (%s)\n", kMotionCpuWhy);
+        } else if (const char* mwhy = !cam.seesMotion(scene) ? nullptr
+                                      : !gpuBackwardMode ? kMotionCpuWhy
+                                      : cudaBlurUnsupported(scene, cam, g_whitted ? 'W' : 'R')) {
+            if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", mwhy);
+            else         std::printf("[device] auto -> CPU (%s)\n", mwhy);
         } else if (gpuBdptMode) {
             // Modes D and J share this (stricter) GPU support check: BDPT scope only — mode J
             // is the same megakernel with the merges switched on, so anything mode D can run

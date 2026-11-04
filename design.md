@@ -10173,6 +10173,38 @@ sees the instant, exactly as a static scene with those transforms would show it.
   (`sphereAsMesh_`), as an uneven static scale already tessellates it, so `sphereAt` may take the
   radius from the blended transform's mean column length.
 
+### Motion blur on the device (0.418.0: modes R and W)
+
+- **The path's time** is a slot per thread in shared memory (`s_dMotionU`, `dMotionU`), the
+  device twin of the thread-local `g_motionU`, so the ~37 query sites need no argument. Every
+  launch is 1-D with at most 256 threads a block. Every kernel that takes a `DScene` clears its
+  slot first (`D_MOTION_CLEAR`: shared memory holds whatever the last block left); a kernel that
+  blurs sets it per path. Nothing reads it unless the scene moves (`dTimed`: `sc.mo.sets` and a
+  time), so a still scene's kernels behave as before.
+- **The motion data** (`DMotion`, by value in `DScene`, uploaded by `uploadMotion` whenever the
+  scene has motion sets or vertex keys): the sets' affine keys and times, each primitive kind's
+  set, the deforming triangles' vertex keys, `primMoves` by global primitive number, the
+  movers' segment trees (`Scene::bvhMove`, concatenated, their leaves naming global
+  primitives), the interval and the swept bounds.
+- **Timed queries**: `closestHit`, `occluded` and `shadowTransmittance` walk the instant's tree
+  skipping the movers (and go on even when the ray misses its root box), then the segment
+  tree of the time (`dTimedClosest` / `dTimedAny`). A moving or deforming triangle is crossed at
+  its corners first (`dTriCross`, the half of `intersectTri` it shares) and rebuilt in full
+  (`dFinalizeTri`, `Tri::finalize`'s twin) only on a nearer crossing; a sphere is moved; an
+  isosurface, a curve or an instance is met by the ray carried to the instant and its hit
+  carried out (`dHitToMoved`). A query keeps one set's motion and inverse (`DMotionNow`).
+  `DHit` carries `motionSet` / `deformTri` / `deformB1/B2`, and `dPatIn` reads a mover's
+  patterns where it sat at the instant, as `patCtxFromHit` does. Shadow rays to the sun and the
+  sky run to the swept sphere (`dExitDistance`).
+- **Mode R/W**: `kBackward` / `kBackwardRGB` draw each sample's time as `renderRows` does
+  (`dSetCameraTime`: the base-79 shutter lattice rotated by the pixel's phase, 0.5 in mode W)
+  and pose a moving camera there (`dPoseCamera`, `DCamera::keys`). A moving light
+  (`DEmitter::motion`) is sampled where it sits at the instant -- the device samples area
+  lights uniformly in area, which a rigid motion keeps -- and the sample carried out
+  (`dLightNow`; a spot's point and beam too), in the surface, volume and RGB NEE; a path with a
+  time selects lights by the timed tree (`dLightTreeOf`, Scene::lightTreeTimed).
+  `cudaBlurUnsupported` names what keeps a blurred render on the CPU: another mode.
+
 ## Deformers (ROADMAP 11 stage E, 0.413.0)
 
 A mesh's `deform falloff | rbf | elastic { handle { … } … }` blocks move the triangles its block
@@ -10196,7 +10228,8 @@ coordinates and before the mesh light, the watertight record and the fog bound r
   box it by `deformBox` (its corners at a stretch's ends and at every key between), since it moves
   linearly between keys. `Scene::hasMotion` counts vertex keys, the resume guard mixes them, the
   guide pass carries its points a frame out by their barycentrics (`deformedFramePoint`), and
-  `-export-tris` writes them at any time. The device sees the instant (stage B's rule).
+  `-export-tris` writes them at any time. The device carries them as it does rigid movers
+  (below, *Motion blur on the device*).
 - **The deformers** (`deform.h`): `falloff` adds each handle's move times a C2 profile of the
   distance over its radius; `rbf` solves the dense system of a radial kernel plus an affine part
   over the principal axes the handles truly spread along (`symEigen3`), so coplanar handles on a

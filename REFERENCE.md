@@ -2098,9 +2098,11 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
   least 64 times over the render for this, `-beamfreeze` or not, and a mode `J` camera shares no
   realization with another. A camera moving through a still scene leaves the `M` and `S` maps
   timeless, and each sample poses the camera at its own time; `U` and `J`, whose light paths are
-  traced for the camera, still take one time a pass or an epoch. `-device gpu` keeps a blurred
-  render on the CPU and says so (`[device] motion blur … renders on the CPU so far`), and its
-  exposure meter too. Mode `P` splits each backward sample by its own first hit at its own time
+  traced for the camera, still take one time a pass or an epoch. **On the GPU** (since 0.418.0)
+  modes `R` and `W` blur, with every primitive kind moving (rigid keys and deformers), the
+  camera and the lights too, each camera path at its own time; any other mode keeps a blurred
+  render on the CPU and says why (`[device] … renders on the CPU so far`), and the
+  exposure meter stays on the CPU under a blur. Mode `P` splits each backward sample by its own first hit at its own time
   (specular or sky to the backward layer, the rest to the forward one), where the still render
   splits whole pixels by the instant. `V`, which runs `B` beside `R`, renders the frame's instant
   and prints `[motion] … renders the frame's instant`.

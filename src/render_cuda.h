@@ -404,6 +404,12 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
 // Image-based env, collimated beams and GRIN media fall back to the CPU tracer.
 bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 
+// Motion blur on the device (ROADMAP 11): for a camera that sees motion (Camera::seesMotion),
+// rendering in `mode`, null when the device can carry the blur, else why it renders on the CPU.
+// So far modes R and W: every primitive kind moves (rigid keys and deformers), and the camera
+// and the lights may, each camera path at its own time in the shutter.
+const char* cudaBlurUnsupported(const Scene& scene, const Camera& cam, char mode);
+
 // ---- Mode W (deterministic Whitted / POV-Ray-style preview) ----------------------------
 // Device twin of BackwardRenderer's mode-W fields (src/backward.h). Passing a non-null
 // WhittedOpts to renderBackwardCuda replaces every stochastic estimator on the backward

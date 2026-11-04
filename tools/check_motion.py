@@ -39,14 +39,16 @@ cube whose keys scale and shear it together. It requires:
     So do two mode B cameras with the shutter rendered beside a third without it (one flight per
     shutter, on any device), the third staying sharp; and the sky mode B sees directly behind a
     dark ball sweeping across it.
-  * Under a shutter, `-device gpu` says mode R stays on the CPU, and mode V says it renders the
-    instant. Modes M and J (an epoch at a time), S and U (a pass at a time) blur, agreeing with
+  * Blurred mode R on the GPU agrees with blurred mode R on the CPU: the box; an isosurface, a
+    curve and an instance moving; a mover beyond the instant's bounds under the sky and under the
+    sun; a pattern travelling with its object; moving lights of every shape; a moving camera. Mode D asked for the GPU under a
+    shutter says it stays on the CPU, and mode V says it renders the instant. Modes M and J (an epoch at a time), S and U (a pass at a time) blur, agreeing with
     blurred mode R within their density estimates' bias, and follow a moving camera as mode R
     does; so does mode P, its backward samples split by their own first hit.
   * The camera's own motion, in the box held still: a camera with `motion` keys and no shutter
     renders byte for byte the still camera at its keys' instant (CPU, and GPU); with the shutter,
-    the mean of 32 renders from its poses through it (mode R; modes D and B agree with mode R),
-    and asked for the GPU it says it stays on the CPU. The middle frame of a straight, even
+    the mean of 32 renders from its poses through it (mode R; modes D and B agree with mode R, and
+    mode R on the GPU with mode R on the CPU). The middle frame of a straight, even
     `camera_path` with a shutter blurs as the mean of the eyes half a frame either side. The
     loader refuses camera keys without a `motion_interval`, a single key, and a key's `fov_y` on
     a camera whose `lens` sets its view. A key without `fov_y` keeps the camera's own (the same
@@ -798,11 +800,32 @@ def main():
     _, w0, _ = render(exe, out, moving, "instant_W", wargs)
     verdict("mode W blurs, the same on every run", w1 == w2 and w1 != w0)
 
-    # --- the notes a shutter brings ---
+    # --- blurred mode R on the GPU = on the CPU ---
     if not a.no_gpu:
-        rc, log = run([exe, "-in", blurred, "-mode", "R", "-device", "gpu", "-spp", "1", "-no-meter",
+        gpu_cases = [("the box", blurred, 256)]
+        pk = os.path.join(out, "gpu_kinds.ftsl")
+        write(pk, kinds_scene(cube_obj, shutter=(-0.5, 0.5)))
+        gpu_cases.append(("an isosurface, a curve and an instance", pk, 256))
+        for nm, light in (("sky", "light env { spd preset:d65 }"),
+                          ("sun", "light sun { dir 1 0.3 0  angle 0.53  spd preset:d65 }")):
+            pr = os.path.join(out, "gpu_reach_%s.ftsl" % nm)
+            write(pr, reach_scene(light))
+            gpu_cases.append(("a mover past the instant's bounds, in the %s" % nm, pr, 512))
+        ps = os.path.join(out, "gpu_stripe.ftsl")
+        write(ps, stripe_scene(shutter=(-0.5, 0.5)))
+        gpu_cases.append(("a pattern travelling with its object", ps, 256))
+        pl = os.path.join(out, "gpu_lights.ftsl")
+        write(pl, lights_scene(obj.replace(chr(92), "/"), shutter=(-0.5, 0.5)))
+        gpu_cases.append(("moving lights of every shape", pl, 512))
+        for nm, path, spp in gpu_cases:
+            rargs = lambda dev: ["-mode", "R", "-device", dev, "-spp", str(spp)]
+            g = [lum(render(exe, out, path, "gpu_R_%d" % s, rargs("gpu"), seed=s, want_gpu=True)[0]) for s in (1, 2)]
+            c = [lum(render(exe, out, path, "cpu_R_%d" % s, rargs("cpu"), seed=s)[0]) for s in (1, 2)]
+            good, detail = agree(g, c)
+            verdict("blurred mode R on the GPU = on the CPU: " + nm, good, detail)
+        rc, log = run([exe, "-in", blurred, "-mode", "D", "-device", "gpu", "-spp", "1", "-no-meter",
                        "-o", os.path.join(out, "gate.png")])
-        verdict("-device gpu under a shutter says it stays on the CPU",
+        verdict("-device gpu under a shutter says mode D stays on the CPU",
                 rc == 0 and "renders on the CPU so far" in log, log.strip()[-300:] if rc else "")
     rc, log = run([exe, "-in", blurred, "-mode", "V", "-device", "cpu", "-spp", "1", "-n", "100000", "-no-meter",
                    "-o", os.path.join(out, "modev.png")])
@@ -991,10 +1014,10 @@ def camera_tests(exe, out, verdict, devices):
         good, detail = agree(bm, blur, tol)
         verdict("... mode %s = mode R" % mode, good, detail)
     if len(devices) > 1:
-        rc, log = run([exe, "-in", moving, "-mode", "R", "-device", "gpu", "-spp", "1", "-no-meter",
-                       "-o", os.path.join(out, "cam_gate.png")])
-        verdict("... and asked for the GPU, says it stays on the CPU",
-                rc == 0 and "renders on the CPU so far" in log, log.strip()[-300:] if rc else "")
+        g = [lum(render(exe, out, moving, "cam_blur_gpu_s%d" % s, ["-mode", "R", "-device", "gpu", "-spp", str(SPP)],
+                        seed=s, want_gpu=True)[0]) for s in (1, 2)]
+        good, detail = agree(g, blur)
+        verdict("... mode R on the GPU = on the CPU", good, detail)
 
     # --- a camera path's frame blurs along the path: frames a frame apart on a straight line at
     # an even pace, so the middle frame's shutter sweeps its eye linearly half a frame each way ---

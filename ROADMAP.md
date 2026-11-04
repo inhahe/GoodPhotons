@@ -738,8 +738,10 @@ classified. Only V renders the instant now, and the GPU. *Camera motion (0.408.0
 keyed from a Catmull-Rom through the path's frames; loom writes a moving `Camera`'s keys.
 *Moving isosurfaces, curves and mesh instances (0.409.0, done):* the ray carried back to the
 instant, the hit carried out. *Moving lights and emissive meshes (0.410.0, done):* rigid only,
-sampled at the instant and carried out, with a timed light tree. Open: lights that scale over
-the shutter, aimed area lights; the GPU.
+sampled at the instant and carried out, with a timed light tree. *The GPU, modes R and W
+(0.418.0, done):* every primitive kind moving (rigid keys, deformers, riding groups), the camera
+and the lights too, each path at its own time; agrees with the CPU block for block. Open: lights
+that scale over the shutter, aimed area lights; on the GPU, the other modes.
 
 **Stage C, motion vectors and depth (0.411.0, done):** `-write-aovs` writes the guide pass's
 albedo and normal and, from one ray through each pixel's centre at the frame's instant, depth,

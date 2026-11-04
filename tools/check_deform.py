@@ -38,6 +38,8 @@ Each case loads a scene with `ftrace -export-tris` (no render) and reads the tri
     be. A fin a deformer folds exactly flat at a key renders as one folding a hair short of it
     (no normal is taken from a collapsed face).
   * Blurred mode B sees a mirror sheet a deformer lifts and lowers as mode R does.
+  * On the GPU (where there is one), a waving mesh riding a moving group renders blurred as it
+    does on the CPU.
   * Handle keys that all agree are no motion.
   * The dynamic elastic, further: under a motion interval it has keys though its handles have
     none; a bake of an unchanged shot keeps every record; one after a frame's handle target
@@ -381,9 +383,10 @@ def main():
     slide = 'deform rbf { handle { at 0 0 0  motion { key { to -0.2 0 0 } key { to 0 0 0 } key { to 0.2 0 0 } } } }'
     floor = 'quad { origin -3 -0.5 -3  u 0 0 6  v 6 0 0  material m }'
     light = 'light area { origin -0.5 2.5 -0.5  u 1 0 0  v 0 0 1  normal 0 -1 0  spd preset:bb6500  power 40 }'
-    def render(body, name, spp, extra=(), shutter=True, mode="R", eye="0 3 4", look="0 0 0"):
-        """`body` rendered in `mode` (`spp` samples, or photons in mode B) to <out>/<name>; its
-        HDR stem, or None."""
+    def render(body, name, spp, extra=(), shutter=True, mode="R", eye="0 3 4", look="0 0 0",
+               device="cpu", seed=3, log=None):
+        """`body` rendered in `mode` (`spp` samples, or photons in mode B) on `device` to
+        <out>/<name>; its HDR stem, or None. `log`, a list, gets the render's output."""
         cam = ('camera "c" { eye %s  look_at %s  up 0 1 0  fov_y 40  %sfilm { res 80 60 } }'
                % (eye, look, "shutter_open -0.5  shutter_close 0.5  " if shutter else ""))
         p = os.path.join(out, name + ".ftsl")
@@ -392,9 +395,11 @@ def main():
                              'material "m" { type diffuse reflect 0.6 }', floor, light, body, cam]) + NL)
         png = os.path.join(out, name + ".png")
         budget = ["-n", str(spp)] if mode == "B" else ["-spp", str(spp)]
-        r = subprocess.run([c.exe, "-in", p, "-mode", mode, "-device", "cpu", *budget, "-seed", "3",
+        r = subprocess.run([c.exe, "-in", p, "-mode", mode, "-device", device, *budget, "-seed", str(seed),
                             "-hdr", "-no-meter", "-o", png] + list(extra),
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if log is not None:
+            log.append(r.stdout + r.stderr)
         if r.returncode != 0:
             print((r.stdout + r.stderr)[-1200:])
             return None
@@ -433,6 +438,17 @@ def main():
         rel = np.abs(b - still).mean() / still.mean()
         c.verdict("a group's slide undone by a deformer renders as the still mesh", rel < 0.01,
                   "mean diff %.4f of the still render" % rel)
+    # On the GPU as on the CPU (where there is one): a waving mesh riding a moving group, blurred.
+    ride_wave = ride % mesh(grid, wave)
+    logs = []
+    sg = [render(ride_wave, "gpu_ride_%d" % s, 256, device="gpu", seed=s, log=logs) for s in (1, 2)]
+    if all(x is not None for x in sg) and all("-> GPU" in l for l in logs):
+        sc_ = [render(ride_wave, "cpu_ride_%d" % s, 256, seed=s) for s in (1, 2)]
+        from check_motion import agree, lum
+        good, detail = agree([lum(read_pfm(x + ".pfm")) for x in sg], [lum(read_pfm(x + ".pfm")) for x in sc_])
+        c.verdict("a waving mesh riding a moving group, blurred, renders on the GPU as on the CPU", good, detail)
+    else:
+        print("(no GPU here: the GPU's deforming-mesh case is skipped)")
     pattern_tests(c, grid, render)
     mirror_test(c, grid, render)
 

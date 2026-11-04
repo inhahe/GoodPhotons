@@ -690,6 +690,34 @@ struct DSphere { DVec3 c; double r; int matId; int frame; };
 struct DCurveSeg { DVec3 p0, p1; Real r0, r1; int matId; float u0, u1; };
 struct DNode   { DVec3 lo, hi; int left, right, first, count; };
 
+// ---- Motion blur (ROADMAP 11): the device twin of Scene's motion data ----
+// An affine (Affine's twin: world = m*p + t, row-major) and a motion set's keys.
+struct DAff { double m[9], t[3]; };
+struct DMotionSet { int keys, first; };   // Scene::MotionKeys: `keys` affines from motionXf[first]
+// Everything a timed query reads. `sets` null: the scene holds still, and nothing here is read.
+// The per-kind motion arrays name each primitive's set (-1: still); `triVkeys` a deforming
+// triangle's (offset into vertexKeys, key count), null when nothing deforms. `primMoves` marks
+// the movers by global primitive number (the BVH's), which a timed walk of `nodes` skips; the
+// segment trees (Scene::bvhMove) hold them over each stretch of the interval, their leaves
+// naming global primitives directly (`segPrim`). `motionA`/`motionB`: the scene's interval.
+struct DMotion {
+    const DAff* xf; const double* T; const DMotionSet* sets; int nSets;
+    const int* triMotion; const int* sphMotion; const int* impMotion; const int* curveMotion;
+    const int* instMotion;
+    const int2* triVkeys; const DVec3* vertexKeys;
+    const unsigned char* primMoves;
+    int nSeg; const int* segRoot; const DNode* segNodes; const int* segPrim;
+    double motionA, motionB;
+    // The bounding sphere of everything a path with a time may meet (Scene::sweptCenter /
+    // sweptRadius), and the radius about sceneCenter that holds it (Scene::sweptReach).
+    DVec3 sweptCenter; double sweptRadius, sweptReach;
+    // The light tree a path with a time selects by when a light moves (Scene::lightTreeTimed: a
+    // moving light's bound swept over its motion). ltNodes null: there is none (no light moves).
+    const LightTreeNode* ltNodes; int ltRoot;
+    const int* ltAlways; int nLtAlways;
+    const int* ltParent; const int* ltLeaf; int nLtLeaf;
+};
+
 // One flat mirror SURFACE (device twin of Scene::MirrorPlane), i.e. the set of coplanar
 // mirror-material triangles sharing a plane, collapsed to that plane plus the AABB of its
 // members. The forward camera connection reflects a photon vertex in this plane
@@ -1013,6 +1041,9 @@ struct DEmitter {
     // ACHROMATIC-PATH BEAMS (photonbeams.h): this emitter's SPD-weighted mean CIE, i.e. the
     // expectation of CIE(lambda) under its own emission sampler. Host twin: Emitter::cieMean.
     DVec3  cieMean;
+    // Its motion set (Emitter::motion), or -1: a light moves only rigidly, so it is sampled where
+    // it sits at the instant and the sample carried to the path's time (dLightNow).
+    int    motion;
 };
 
 // PBRT's IsDeltaLight (device twin of bdpt.h isDeltaEmitter): this emitter's emission
@@ -1469,7 +1500,31 @@ struct DScene {
     // unfiltered — which is what stochastic mode R wants, since jittering over the pixel
     // already averages the footprint.
     double bkFwPerDist;
+    // Motion blur: the scene's motion data (mo.sets null in a still scene). A query reads its
+    // path's time from the thread's slot (dMotionU) only when the scene moves.
+    DMotion mo;
 };
+
+// The current path's time, as a fraction of the motion interval, or negative for the frame's
+// instant: the device twin of g_motionU, a slot per thread in shared memory, so the query sites
+// stay as they are, as on the host. Every launch is 1-D with at most kMotionSlots threads a
+// block; every kernel clears its slot first (D_MOTION_CLEAR), since shared memory starts as
+// whatever the last block left, and one that blurs sets it per path.
+constexpr int kMotionSlots = 256;
+__shared__ float s_dMotionU[kMotionSlots];
+__device__ static inline float dMotionU() { return s_dMotionU[threadIdx.x]; }
+__device__ static inline void dSetMotionU(float u) { s_dMotionU[threadIdx.x] = u; }
+#define D_MOTION_CLEAR() dSetMotionU(-1.0f)
+// Whether a query must look at time: the scene moves and the path has one (host twin
+// Scene::sweptQuery as well as timedQuery).
+__device__ static inline bool dTimed(const DScene& sc) { return sc.mo.sets && dMotionU() >= 0.0f; }
+// How far a ray from p must go to leave everything it could meet (host twin Scene::exitDistance):
+// the scene's bounding sphere, or for a path with a time the swept one -- the far end of shadow
+// rays to the sun and the sky.
+__device__ static inline double dExitDistance(const DScene& sc, const DVec3& p) {
+    if (dTimed(sc)) return (double)length(sc.mo.sweptCenter - p) + sc.mo.sweptRadius;
+    return (double)length(sc.sceneCenter - p) + sc.sceneRadius;
+}
 
 // Everything the pattern VM (dPatternEval) needs beyond the scalar variables: the
 // SCENE-OWNED sample tables a pattern expression can reach into. The struct itself is
@@ -1563,6 +1618,7 @@ struct DLensSystem {
     double exitZ, exitDRho;
 };
 
+struct DCamKey { DVec3 eye, look, up; double fovY; };   // CameraPose's twin
 struct DCamera {
     DVec3  eye, u, v, w;
     double tanHalfX, tanHalfY;
@@ -1575,6 +1631,16 @@ struct DCamera {
     int    projection;
     double halfFovY, rEdge;
     double frustumShiftX;   // off-axis stereo shear (normalised view units); 0 = on-axis
+    // Motion blur: whether a path takes a time in the shutter [shOpen, shClose] (frames from the
+    // instant), and the salt of the per-pixel time phase's stream (seedUnit's, `-seed` in it).
+    int    blur;
+    double shOpen, shClose;
+    unsigned long long timeSalt;
+    // A camera that moves itself (Camera::motion): its `nKeys` poses spread evenly over
+    // [keyA, keyB] frames, and the stereo eye's shift along u (Camera::eyeShiftU). nKeys 0: the
+    // pose above at every time.
+    const struct DCamKey* keys; int nKeys;
+    double keyA, keyB, eyeShiftU;
     HD double imagePlaneArea() const { return 4.0 * tanHalfX * tanHalfY; }
     // Per-pixel image-plane area: connect() splats one photon into one pixel, so the
     // pinhole importance normalises by a single pixel's area (see camera.h). This
@@ -3501,10 +3567,17 @@ struct DHit {
     // triangle, sphere and curve intersectors and the instance mapping; 0 (the point's own
     // distance stands in) elsewhere.
     Real pscale = (Real)0;
+    // Where a hit with a time reads its patterns (host twins Hit::motionSet / deformTri /
+    // deformB1/B2): the moving primitive's motion set, or the deforming triangle and the
+    // intersector's barycentrics of its v1 and v2 -- dPatIn carries the point back to the
+    // instant through them. -1 for a still primitive, or a hit without a time; written only by
+    // the timed intersectors, so they default.
+    int motionSet = -1, deformTri = -1;
+    Real deformB1 = (Real)0, deformB2 = (Real)0;
 };
 #if FTRACE_GPU_FP32
 // Held in every kernel's registers or local memory and in the wavefront state arrays.
-static_assert(sizeof(DHit) == 112, "DHit changed size");
+static_assert(sizeof(DHit) == 128, "DHit changed size");
 #endif
 // The geometric normal on the side being shaded: the side the ray came from (host twin
 // orientedGeoN, which says why it is not read off n).
@@ -4078,10 +4151,68 @@ __device__ static inline DTriShear makeTriShear(const DVec3& d) {
     s.Sz = (Real)1  / d[s.kz];
     return s;
 }
-__device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const DVec3& rd,
-                                     const DTri& tri, Real tmin, DHit& hit) {
+// A camera path's time (host twin of renderRows' draw): sample `sIdx` of pixel `pix` on the
+// shutter lattice (base 79, rotated by the pixel's own phase -- a fixed 0.5 in mode W, so it
+// stays noise-free), mapped through the shutter into the motion interval and set for the path.
+// The camera posed at `frames` (host twins CameraMotion::at, Camera::posedAs and lookAt): its keys
+// blended about the time, the frame built on them, the stereo eye shifted along u.
+__device__ static void dPoseCamera(const DCamera& cam, double frames, DCamera& out) {
+    out = cam;
+    const int n = cam.nKeys;
+    DCamKey k = cam.keys[0];
+    if (n >= 2 && cam.keyB > cam.keyA) {
+        double s = (frames - cam.keyA) / (cam.keyB - cam.keyA) * (double)(n - 1);
+        s = s < 0.0 ? 0.0 : (s > (double)(n - 1) ? (double)(n - 1) : s);
+        const int i = (int)s < n - 2 ? (int)s : n - 2;
+        const Real f = (Real)(s - (double)i);
+        const DCamKey& A = cam.keys[i];
+        const DCamKey& B = cam.keys[i + 1];
+        k.eye = A.eye + (B.eye - A.eye) * f;
+        k.look = A.look + (B.look - A.look) * f;
+        k.up = A.up + (B.up - A.up) * f;
+        k.fovY = A.fovY + (B.fovY - A.fovY) * (double)f;
+    }
+    out.eye = k.eye;
+    out.w = normalize(k.look - k.eye);
+    out.u = normalize(cross(out.w, k.up));
+    out.v = cross(out.u, out.w);
+    out.tanHalfY = tan(0.5 * k.fovY * 3.141592653589793 / 180.0);
+    out.tanHalfX = out.tanHalfY * (double)cam.resX / (double)cam.resY;
+    out.halfFovY = 0.5 * k.fovY * 3.141592653589793 / 180.0;
+    out.rEdge = dProjRadius(cam.projection, out.halfFovY);
+    if (cam.eyeShiftU != 0.0) out.eye = out.eye + out.u * (Real)cam.eyeShiftU;
+}
+// A camera path's time and pose: dSetCameraTime, and `posed` the camera there (the camera
+// itself when it holds still or the path has no time).
+__device__ static inline void dSetCameraTime(const DScene& sc, const DCamera& cam, unsigned long long pix,
+                                             unsigned long long sIdx, bool whitted, DCamera* posed);
+__device__ static inline void dSetCameraTime(const DScene& sc, const DCamera& cam, unsigned long long pix,
+                                             unsigned long long sIdx, bool whitted) {
+    dSetCameraTime(sc, cam, pix, sIdx, whitted, nullptr);
+}
+__device__ static inline void dSetCameraTime(const DScene& sc, const DCamera& cam, unsigned long long pix,
+                                             unsigned long long sIdx, bool whitted, DCamera* posed) {
+    if (!cam.blur) return;
+    double phase = 0.5;
+    if (!whitted) { DRng tr; tr.seedUnit(pix, cam.timeSalt); phase = (double)tr.uniform(); }
+    double x = dRadicalInverseScr(79, sIdx) + phase;
+    if (x >= 1.0) x -= 1.0;
+    const double frames = cam.shOpen + (cam.shClose - cam.shOpen) * x;
+    if (sc.mo.sets) {
+        double u = (frames - sc.mo.motionA) / (sc.mo.motionB - sc.mo.motionA);
+        u = u < 0.0 ? 0.0 : (u > 1.0 ? 1.0 : u);
+        dSetMotionU((float)u);
+    }
+    if (posed && cam.nKeys > 0) dPoseCamera(cam, frames, *posed);
+}
+// The watertight crossing of the ray with the triangle (p0, p1, p2) nearer than tmax: its t and
+// barycentrics. The shared half of intersectTri (host twin triCross), which a moving or deforming
+// triangle runs on its corners at the path's time before it is rebuilt in full.
+__device__ static inline bool dTriCross(const DTriShear& sh, const DVec3& ro, const DVec3& p0,
+                                        const DVec3& p1, const DVec3& p2, Real tmin, Real tmax,
+                                        Real& tOut, Real& b0, Real& b1, Real& b2) {
     const int kx = sh.kx, ky = sh.ky, kz = sh.kz;
-    DVec3 A = tri.v0 - ro, B = tri.v1 - ro, C = tri.v2 - ro;
+    DVec3 A = p0 - ro, B = p1 - ro, C = p2 - ro;
     Real Ax = A[kx] - sh.Sx * A[kz], Ay = A[ky] - sh.Sy * A[kz];
     Real Bx = B[kx] - sh.Sx * B[kz], By = B[ky] - sh.Sy * B[kz];
     Real Cx = C[kx] - sh.Sx * C[kz], Cy = C[ky] - sh.Sy * C[kz];
@@ -4108,8 +4239,14 @@ __device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const 
     Real T = U * (sh.Sz * A[kz]) + V * (sh.Sz * B[kz]) + W * (sh.Sz * C[kz]);
     Real invDet = (Real)1 / det;
     Real t = T * invDet;
-    if (t < tmin || t >= hit.t) return false;
-    Real b0 = U * invDet, b1 = V * invDet, b2 = W * invDet;   // barycentric of v0,v1,v2
+    if (t < tmin || t >= tmax) return false;
+    tOut = t;
+    b0 = U * invDet; b1 = V * invDet; b2 = W * invDet;   // barycentric of p0, p1, p2
+    return true;
+}
+// Fill `hit` from triangle `tri`, which the ray met at t with barycentrics b0, b1, b2.
+__device__ static inline void dTriFill(const DVec3& rd, const DTri& tri, Real t, Real b0, Real b1,
+                                       Real b2, DHit& hit) {
     // From the vertices, not the ray (host twin intersectTri says why).
     hit.t = t; hit.p = tri.v0 + (tri.v1 - tri.v0) * b1 + (tri.v2 - tri.v0) * b2; hit.valid = true;
     hit.pscale = tri.reach;
@@ -4140,6 +4277,12 @@ __device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const 
     hit.curv = (Real)(flipped ? -tri.curvature : tri.curvature);
     hit.vcol = tri.vcol; hit.vb0 = b0; hit.vb1 = b1;
     hit.fiberRadius = (Real)0;                 // `hit` is a reused record: not a strand
+}
+__device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const DVec3& rd,
+                                     const DTri& tri, Real tmin, DHit& hit) {
+    Real t, b0, b1, b2;
+    if (!dTriCross(sh, ro, tri.v0, tri.v1, tri.v2, tmin, hit.t, t, b0, b1, b2)) return false;
+    dTriFill(rd, tri, t, b0, b1, b2, hit);
     return true;
 }
 // `axes`: the sphere's own (DScene::sphAxes + 3*frame), or null for the world's -- needed only
@@ -4492,6 +4635,354 @@ __device__ static void instanceHitToWorld(const DInstance& inst, DHit& lh) {
     if (inst.matOverride >= 0) lh.matId = inst.matOverride;
 }
 
+// ---- Timed intersection (motion blur, ROADMAP 11): the device twins of Scene's *Now ----
+// Motion set `set`'s transform at fraction u of the interval (host keyedAffineAt): the blend of
+// the two keys about u, entry by entry.
+__device__ static void dMotionAt(const DMotion& mo, int set, double u, DAff& D) {
+    const DMotionSet ms = mo.sets[set];
+    const DAff* K = mo.xf + ms.first;
+    const double* T = mo.T + ms.first;
+    if (!(u > 0.0)) { D = K[0]; return; }
+    if (u >= 1.0) { D = K[ms.keys - 1]; return; }
+    int lo = 0, hi = ms.keys - 1;                  // T[lo] <= u < T[hi]
+    while (hi - lo > 1) {
+        const int mid = (lo + hi) / 2;
+        if (T[mid] <= u) lo = mid; else hi = mid;
+    }
+    const double f = (u - T[lo]) / (T[hi] - T[lo]);
+    for (int i = 0; i < 9; ++i) D.m[i] = K[lo].m[i] + (K[hi].m[i] - K[lo].m[i]) * f;
+    for (int i = 0; i < 3; ++i) D.t[i] = K[lo].t[i] + (K[hi].t[i] - K[lo].t[i]) * f;
+}
+__device__ static inline double dAffDet(const DAff& a) {
+    const double* m = a.m;
+    return m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) +
+           m[2] * (m[3] * m[7] - m[4] * m[6]);
+}
+// Affine::inverse's twin (the identity where the linear part is singular).
+__device__ static void dAffInverse(const DAff& a, DAff& r) {
+    const double* m = a.m;
+    const double det = dAffDet(a);
+    for (int i = 0; i < 9; ++i) r.m[i] = (i % 4 == 0) ? 1.0 : 0.0;
+    r.t[0] = r.t[1] = r.t[2] = 0.0;
+    if (fabs(det) < 1e-30) return;
+    const double id = 1.0 / det;
+    r.m[0] = (m[4] * m[8] - m[5] * m[7]) * id; r.m[1] = (m[2] * m[7] - m[1] * m[8]) * id;
+    r.m[2] = (m[1] * m[5] - m[2] * m[4]) * id; r.m[3] = (m[5] * m[6] - m[3] * m[8]) * id;
+    r.m[4] = (m[0] * m[8] - m[2] * m[6]) * id; r.m[5] = (m[2] * m[3] - m[0] * m[5]) * id;
+    r.m[6] = (m[3] * m[7] - m[4] * m[6]) * id; r.m[7] = (m[1] * m[6] - m[0] * m[7]) * id;
+    r.m[8] = (m[0] * m[4] - m[1] * m[3]) * id;
+    for (int i = 0; i < 3; ++i)
+        r.t[i] = -(r.m[i * 3] * a.t[0] + r.m[i * 3 + 1] * a.t[1] + r.m[i * 3 + 2] * a.t[2]);
+}
+// M^T v (Affine::applyDirTranspose): a normal carried by the map whose inverse is `a`.
+__device__ static inline DVec3 dAffDirT(const DAff& a, const DVec3& v) {
+    const double* m = a.m;
+    return DVec3((Real)(m[0] * v.x + m[3] * v.y + m[6] * v.z), (Real)(m[1] * v.x + m[4] * v.y + m[7] * v.z),
+                 (Real)(m[2] * v.x + m[5] * v.y + m[8] * v.z));
+}
+// Affine::uniformScale's mean of the column norms.
+__device__ static inline double dAffScale(const DAff& a) {
+    const double* m = a.m;
+    return (sqrt(m[0] * m[0] + m[3] * m[3] + m[6] * m[6]) + sqrt(m[1] * m[1] + m[4] * m[4] + m[7] * m[7]) +
+            sqrt(m[2] * m[2] + m[5] * m[5] + m[8] * m[8])) / 3.0;
+}
+// The motion of one set at the path's time, and its inverse, made once per query and kept while
+// the movers it meets share the set (the host keeps it per thread: Scene::motionCache).
+struct DMotionNow {
+    int set = -1; bool inv = false;
+    DAff D, Di;
+    __device__ const DAff& at(const DScene& sc, int s) {
+        if (s != set) { dMotionAt(sc.mo, s, (double)dMotionU(), D); set = s; inv = false; }
+        return D;
+    }
+    __device__ const DAff& inverse(const DScene& sc, int s) {
+        at(sc, s);
+        if (!inv) { dAffInverse(D, Di); inv = true; }
+        return Di;
+    }
+};
+// A light as the current path sees it (host twins Scene::lightMoves / lightPointNow / lightDirNow):
+// whether it moves at the path's time, and its motion there. A light moves only rigidly, so a
+// sample taken where it sits at the instant -- a point, a normal, a direction -- is carried out
+// by D: points by D, directions by its linear part made unit again (a blend of two rotations
+// shrinks what it turns).
+__device__ static inline bool dLightNow(const DScene& sc, const DEmitter& em, DAff& D) {
+    if (em.motion < 0 || !dTimed(sc)) return false;
+    dMotionAt(sc.mo, em.motion, (double)dMotionU(), D);
+    return true;
+}
+__device__ static inline DVec3 dLightDir(const DAff& D, const DVec3& d) { return normalize(affDir(D.m, d)); }
+// Tri::finalize's twin: the face normal, reach, tangent frame and curvature of a triangle
+// rebuilt at a time (its corner normals falling back to the face's where zero).
+__device__ static void dFinalizeTri(DTri& t) {
+    const DVec3 e1 = t.v1 - t.v0, e2 = t.v2 - t.v0;
+    t.gn = normalize(cross(e1, e2));
+    t.reach = (Real)sqrt(fmax((double)dot(t.v0, t.v0), fmax((double)dot(t.v1, t.v1), (double)dot(t.v2, t.v2))));
+    if (dot(t.n0, t.n0) < (Real)1e-12) t.n0 = t.gn;
+    if (dot(t.n1, t.n1) < (Real)1e-12) t.n1 = t.gn;
+    if (dot(t.n2, t.n2) < (Real)1e-12) t.n2 = t.gn;
+    const double du1 = t.uv1.x - t.uv0.x, dv1 = t.uv1.y - t.uv0.y;
+    const double du2 = t.uv2.x - t.uv0.x, dv2 = t.uv2.y - t.uv0.y;
+    const double det = du1 * dv2 - du2 * dv1;
+    DVec3 bb;
+    if (fabs(det) > 1e-20) {
+        const Real r = (Real)(1.0 / det);
+        DVec3 T = (e1 * (Real)dv2 - e2 * (Real)dv1) * r;
+        const DVec3 B = (e2 * (Real)du1 - e1 * (Real)du2) * r;
+        T = T - t.gn * dot(t.gn, T);
+        const Real tl = sqrt(dot(T, T));
+        if (tl > (Real)1e-12) {
+            t.tangent = T * ((Real)1 / tl);
+            t.bitangentSign = (dot(cross(t.gn, t.tangent), B) < 0) ? -1.0 : 1.0;
+        } else { onb(t.gn, t.tangent, bb); t.bitangentSign = 1.0; }
+    } else { onb(t.gn, t.tangent, bb); t.bitangentSign = 1.0; }
+    const DVec3 dn1 = t.n1 - t.n0, dn2 = t.n2 - t.n0;
+    const double gA = dot(e1, e1), gB = dot(e1, e2), gC = dot(e2, e2);
+    const double gdet = gA * gC - gB * gB;
+    t.curvature = gdet > 1e-24 ? 0.5 * (gC * dot(e1, dn1) - gB * dot(e2, dn1) - gB * dot(e1, dn2) +
+                                        gA * dot(e2, dn2)) / gdet
+                               : 0.0;
+}
+// A deforming triangle's corners at fraction u, and with `n` its corner normals (renormalised,
+// zero staying zero), carried by its motion set when it has one and `carried` (host twin
+// Scene::deformedCorners).
+__device__ static void dDeformedCorners(const DScene& sc, int tri, double u, DVec3* p, DVec3* n,
+                                        DMotionNow* mc, bool carried = true) {
+    const int2 vk = sc.mo.triVkeys[tri];
+    const double s = (u < 0.0 ? 0.0 : (u > 1.0 ? 1.0 : u)) * (vk.y - 1);   // motionBracket
+    int i = (int)s;
+    if (i > vk.y - 2) i = vk.y - 2;
+    const Real f = (Real)(s - i);
+    const DVec3* a = sc.mo.vertexKeys + (size_t)vk.x + (size_t)i * 6;
+    for (int c = 0; c < 3; ++c) p[c] = a[c] + (a[c + 6] - a[c]) * f;
+    if (n)
+        for (int c = 0; c < 3; ++c) {
+            const DVec3 m = a[c + 3] + (a[c + 9] - a[c + 3]) * f;
+            const Real l2 = dot(m, m);
+            n[c] = l2 > (Real)1e-24 ? m * ((Real)1 / sqrt(l2)) : DVec3((Real)0, (Real)0, (Real)0);
+        }
+    const int set = sc.mo.triMotion ? sc.mo.triMotion[tri] : -1;
+    if (!carried || set < 0) return;
+    DMotionNow local;
+    DMotionNow& m = mc ? *mc : local;
+    DAff Du;
+    const DAff* D = &Du;
+    if (mc && (float)u == dMotionU()) D = &m.at(sc, set);
+    else dMotionAt(sc.mo, set, u, Du);
+    for (int c = 0; c < 3; ++c) p[c] = affPoint(D->m, D->t, p[c]);
+    if (!n) return;
+    DAff Di;
+    dAffInverse(*D, Di);
+    for (int c = 0; c < 3; ++c)
+        if (dot(n[c], n[c]) > (Real)0) n[c] = normalize(dAffDirT(Di, n[c]));
+}
+// A moving or deforming triangle (global index `i`) at the path's time (host twins
+// intersectMovingTri / intersectDeformingTri): its corners tested first, the triangle rebuilt in
+// full only on a nearer crossing. `anyHit`: the crossing alone.
+__device__ static bool dIntersectTriNow(const DScene& sc, const DTriShear& sh, const DVec3& ro,
+                                        const DVec3& rd, int i, Real tmin, DHit& h, DMotionNow& mc,
+                                        bool anyHit) {
+    const DTri& t0 = sc.tris[i];
+    const bool deforms = sc.mo.triVkeys && sc.mo.triVkeys[i].x >= 0;
+    const int set = sc.mo.triMotion ? sc.mo.triMotion[i] : -1;
+    const double u = (double)dMotionU();
+    DVec3 p[3], n[3];
+    if (deforms) {
+        dDeformedCorners(sc, i, u, p, anyHit ? nullptr : n, &mc);
+    } else {
+        const DAff& D = mc.at(sc, set);
+        p[0] = affPoint(D.m, D.t, t0.v0); p[1] = affPoint(D.m, D.t, t0.v1); p[2] = affPoint(D.m, D.t, t0.v2);
+    }
+    Real t, b0, b1, b2;
+    if (!dTriCross(sh, ro, p[0], p[1], p[2], tmin, h.t, t, b0, b1, b2)) return false;
+    if (anyHit) { h.t = t; h.valid = true; return true; }
+    DTri tt = t0;
+    tt.v0 = p[0]; tt.v1 = p[1]; tt.v2 = p[2];
+    if (deforms) {
+        tt.n0 = n[0]; tt.n1 = n[1]; tt.n2 = n[2];
+    } else {                                   // normals by the inverse transpose
+        const DAff& Di = mc.inverse(sc, set);
+        tt.n0 = normalize(dAffDirT(Di, t0.n0)); tt.n1 = normalize(dAffDirT(Di, t0.n1));
+        tt.n2 = normalize(dAffDirT(Di, t0.n2));
+    }
+    dFinalizeTri(tt);
+    dTriFill(rd, tt, t, b0, b1, b2, h);
+    h.motionSet = deforms ? -1 : set;
+    h.deformTri = deforms ? i : -1;
+    h.deformB1 = b1; h.deformB2 = b2;
+    return true;
+}
+// A hit met where a mover sits at the instant, carried out by its motion D (Di its inverse)
+// to where the path's time has it (host twin Scene::hitToMoved).
+__device__ static void dHitToMoved(const DAff& D, const DAff& Di, int set, DHit& h) {
+    h.p = affPoint(D.m, D.t, h.p);
+    h.n = normalize(dAffDirT(Di, h.n));
+    h.ng = normalize(dAffDirT(Di, h.ng));
+    const DVec3 wt = affDir(D.m, h.tangent);
+    const Real wl = sqrt(dot(wt, wt));
+    if (wl > (Real)1e-12) h.tangent = wt * ((Real)1 / wl);
+    const double det = dAffDet(D);
+    if (det < 0.0) h.bitangentSign = -h.bitangentSign;
+    const double s = cbrt(fabs(det));
+    if (s > 0.0) h.curv = (Real)((double)h.curv / s);
+    h.fiberRadius = (Real)((double)h.fiberRadius * s);
+    double f2 = 0.0;
+    for (int k = 0; k < 9; ++k) f2 += D.m[k] * D.m[k];
+    h.pscale = (Real)(sqrt(f2) * (double)h.pscale +
+                      sqrt(D.t[0] * D.t[0] + D.t[1] * D.t[1] + D.t[2] * D.t[2]));
+    h.motionSet = set;
+    h.deformTri = -1;
+}
+// Any other moving primitive (global number `prim`, of kind sphere, isosurface, curve segment or
+// instance) at the path's time: a sphere moved (its radius by the motion's mean scale, its axes
+// turned); the rest met at the instant by the ray carried back there (an affine map keeps the
+// ray's t), its hit carried out again (host twins intersectMoving* / intersectInstanceNow).
+__device__ static bool dIntersectOtherNow(const DScene& sc, const DVec3& ro, const DVec3& rd, int prim,
+                                          Real tmin, Real curveTmin, DHit& h, DMotionNow& mc, bool anyHit) {
+    int k = prim - sc.nTris;
+    if (k < sc.nSph) {
+        const DSphere& s0 = sc.sph[k];
+        const int set = sc.mo.sphMotion[k];
+        const DAff& D = mc.at(sc, set);
+        DSphere s = s0;
+        s.c = affPoint(D.m, D.t, s0.c);
+        s.r = s0.r * dAffScale(D);
+        if (anyHit) return intersectSphere(ro, rd, s, tmin, h);
+        const DVec3 world[3] = {DVec3(1, 0, 0), DVec3(0, 1, 0), DVec3(0, 0, 1)};
+        const DVec3* base = s0.frame >= 0 ? sc.sphAxes + 3 * s0.frame : world;
+        const DVec3 ax[3] = {normalize(affDir(D.m, base[0])), normalize(affDir(D.m, base[1])),
+                             normalize(affDir(D.m, base[2]))};
+        if (!intersectSphere(ro, rd, s, tmin, h, ax)) return false;
+        h.motionSet = set; h.deformTri = -1;
+        return true;
+    }
+    k -= sc.nSph;
+    int set;
+    if (k < sc.nImplicits) set = sc.mo.impMotion[k];
+    else if (k < sc.nImplicits + sc.nCurveSegs) set = sc.mo.curveMotion[k - sc.nImplicits];
+    else set = sc.mo.instMotion[k - sc.nImplicits - sc.nCurveSegs];
+    const DAff& Di = mc.inverse(sc, set);
+    const DVec3 lro = affPoint(Di.m, Di.t, ro), lrd = affDir(Di.m, rd);
+    bool hit;
+    if (k < sc.nImplicits) {
+        hit = intersectImplicit(sc, sc.implicits[k], lro, lrd, tmin, h, anyHit);
+    } else if (k < sc.nImplicits + sc.nCurveSegs) {
+        hit = intersectCurveSeg(makeCurveRay(lrd), lro, lrd, sc.curveSegs[k - sc.nImplicits],
+                                fmaxf((float)tmin, (float)curveTmin), h, anyHit);
+    } else {
+        const DInstance& inst = sc.instances[k - sc.nImplicits - sc.nCurveSegs];
+        const DVec3 iro = affPoint(inst.Lm, inst.Lt, lro), ird = affDir(inst.Lm, lrd);
+        if (anyHit) return blasOccluded(sc, inst, iro, ird, tmin, h.t);
+        DHit lh; lh.t = h.t; lh.valid = false;
+        if (!blasClosest(sc, inst, iro, ird, tmin, lh)) return false;
+        instanceHitToWorld(inst, lh);
+        h = lh;
+        hit = true;
+    }
+    if (!hit) return false;
+    if (!anyHit) dHitToMoved(mc.D, Di, set, h);
+    return true;
+}
+// A primitive's material by global number, or -1 for an instance (whose materials are per BLAS
+// triangle: the camera-hide test skips them, as the static walks do).
+__device__ static inline int dPrimMat(const DScene& sc, int prim) {
+    if (prim < sc.nTris) return sc.tris[prim].matId;
+    prim -= sc.nTris;
+    if (prim < sc.nSph) return sc.sph[prim].matId;
+    prim -= sc.nSph;
+    if (prim < sc.nImplicits) return sc.implicits[prim].matId;
+    prim -= sc.nImplicits;
+    if (prim < sc.nCurveSegs) return sc.curveSegs[prim].matId;
+    return -1;
+}
+// The segment tree of the path's time: the movers boxed over its stretch of the interval.
+__device__ static inline int dMotionSegRoot(const DScene& sc) {
+    int k = (int)(dMotionU() * (float)sc.mo.nSeg);
+    k = k < 0 ? 0 : (k >= sc.mo.nSeg ? sc.mo.nSeg - 1 : k);
+    return sc.mo.segRoot[k];
+}
+// The movers' nearest hit nearer than tMax, written to h (world space); true if one was found.
+__device__ static bool dTimedClosest(const DScene& sc, const DVec3& ro, const DVec3& rd, const DVec3& invD,
+                                     const DTriShear& sh, Real tmin, Real curveTmin, Real& tMax, DHit& h,
+                                     bool camHideOn) {
+    const int root = dMotionSegRoot(sc);
+    if (root < 0) return false;
+    const DNode* N = sc.mo.segNodes;
+    DMotionNow mc;
+    bool found = false;
+    int stack[64]; Real tStack[64]; int sp = 0;
+    Real tRoot;
+    if (!boxHit(N[root], ro, invD, tmin, tMax, tRoot)) return false;
+    stack[0] = root; tStack[0] = tRoot; sp = 1;
+    while (sp) {
+        --sp;
+        if (tStack[sp] > tMax) continue;
+        const DNode& n = N[stack[sp]];
+        if (n.count > 0) {
+            for (int i = 0; i < n.count; ++i) {
+                const int prim = sc.mo.segPrim[n.first + i];
+                if (camHideOn) {
+                    const int matId = dPrimMat(sc, prim);
+                    if (matId >= 0 && sc.mats[matId].hideCamera != 0) continue;
+                }
+                const bool got = prim < sc.nTris ? dIntersectTriNow(sc, sh, ro, rd, prim, tmin, h, mc, false)
+                                                 : dIntersectOtherNow(sc, ro, rd, prim, tmin, curveTmin, h, mc, false);
+                if (got) { tMax = h.t; found = true; }
+            }
+        } else {
+            Real tL, tR;
+            const bool hL = boxHit(N[n.left], ro, invD, tmin, tMax, tL);
+            const bool hR = boxHit(N[n.right], ro, invD, tmin, tMax, tR);
+            if (hL && hR) {
+                if (tL <= tR) { stack[sp] = n.right; tStack[sp] = tR; ++sp; stack[sp] = n.left; tStack[sp] = tL; ++sp; }
+                else          { stack[sp] = n.left;  tStack[sp] = tL; ++sp; stack[sp] = n.right; tStack[sp] = tR; ++sp; }
+            } else if (hL) { stack[sp] = n.left;  tStack[sp] = tL; ++sp; }
+            else if (hR)   { stack[sp] = n.right; tStack[sp] = tR; ++sp; }
+        }
+    }
+    return found;
+}
+// Whether any mover blocks the segment before tMax. `soft`, when given, takes a fibre whose
+// opacity is below 1 (shadowTransmittance's rule) and returns whether it is one, its hit filled
+// in to attenuate by, instead of blocking.
+template <class Soft>
+__device__ static bool dTimedAny(const DScene& sc, const DVec3& o, const DVec3& dir, const DVec3& invD,
+                                 const DTriShear& sh, Real tmin, Real curveTmin, Real tMax, bool camHideOn,
+                                 Soft&& soft) {
+    const int root = dMotionSegRoot(sc);
+    if (root < 0) return false;
+    const DNode* N = sc.mo.segNodes;
+    DMotionNow mc;
+    Real tRoot;
+    if (!boxHit(N[root], o, invD, tmin, tMax, tRoot)) return false;
+    int stack[64]; int sp = 0; stack[sp++] = root;
+    while (sp) {
+        const DNode& n = N[stack[--sp]];
+        if (n.count > 0) {
+            for (int i = 0; i < n.count; ++i) {
+                const int prim = sc.mo.segPrim[n.first + i];
+                if (camHideOn) {
+                    const int matId = dPrimMat(sc, prim);
+                    if (matId >= 0 && sc.mats[matId].hideCamera != 0) continue;
+                }
+                DHit h; h.t = tMax; h.valid = false;
+                if (prim < sc.nTris) {
+                    if (dIntersectTriNow(sc, sh, o, dir, prim, tmin, h, mc, true)) return true;
+                } else if (soft(prim, h, mc)) {
+                    continue;                                   // a soft fibre attenuated instead
+                } else if (dIntersectOtherNow(sc, o, dir, prim, tmin, curveTmin, h, mc, true)) {
+                    return true;
+                }
+            }
+        } else {
+            Real tc;
+            if (boxHit(N[n.left],  o, invD, tmin, tMax, tc)) stack[sp++] = n.left;
+            if (boxHit(N[n.right], o, invD, tmin, tMax, tc)) stack[sp++] = n.right;
+        }
+    }
+    return false;
+}
+
 // `tCap` bounds the search: only hits with t < tCap are found (h.t and the traversal
 // tMax both start there, so every primitive/box test prunes against it — a caller that
 // only cares about "anything within d?" skips nearly the whole tree). Default BIG keeps
@@ -4532,11 +5023,15 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
     // traversal compares t alone (local t is world t), so the closest is mapped to world space
     // once, after it, in double (instanceHitToWorld) rather than at every closer instance hit.
     int hInst = -1;
+    // A query with a time walks the tree skipping the movers it holds at the instant, then the
+    // movers' tree for the time (host twin traverseWorldClosest).
+    const bool timed = dTimed(sc);
+    const unsigned char* skip = timed ? sc.mo.primMoves : nullptr;
     // Push-time slab tests + pop-time scalar prune (see blasClosest).
     int stack[64]; Real tStack[64]; int sp = 0;
     Real tRoot;
-    if (!boxHit(sc.nodes[0], ro, invD, tmin, tMax, tRoot)) return h;
-    stack[0] = 0; tStack[0] = tRoot; sp = 1;
+    if (boxHit(sc.nodes[0], ro, invD, tmin, tMax, tRoot)) { stack[0] = 0; tStack[0] = tRoot; sp = 1; }
+    else if (!timed) return h;
     while (sp) {
         --sp;
         if (tStack[sp] > tMax) continue;
@@ -4544,6 +5039,7 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = sc.primIdx[n.first + i];
+                if (skip && skip[prim]) continue;
                 if (prim < sc.nTris)              { const DTri& t = sc.tris[prim];
                                                     if (!hidden(t.matId) && intersectTri(sh, ro, rd, t, tmin, h)) { tMax = h.t; hInst = -1; } }
                 else if (prim < sc.nTris + sc.nSph){ const DSphere& s = sc.sph[prim - sc.nTris];
@@ -4579,6 +5075,8 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
             else if (hR)   { stack[sp] = n.right; tStack[sp] = tR; ++sp; }
         }
     }
+    if (timed && dTimedClosest(sc, ro, rd, invD, sh, tmin, curveTmin, tMax, h, camHideOn))
+        hInst = -1;                                // a mover's hit, in world space already
     if (hInst >= 0) instanceHitToWorld(sc.instances[hInst], h);
     h.patOwnSide = h.valid && h.matId >= 0 && sc.mats[h.matId].patOwnSide;   // host twin Scene::markPatSide
     dApplyNormalMap(sc, h);   // C6: perturb shading normal by a bound normal map
@@ -4773,15 +5271,19 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
     const DTriShear sh = makeTriShear(dir);
     const DCurveRay cray = sc.nCurveSegs ? makeCurveRay(dir) : DCurveRay{DVec3{(Real)0,(Real)0,(Real)1}, (Real)1};
     Real tMax = maxDist - tmin;
+    const bool timed = dTimed(sc);
+    const unsigned char* skip = timed ? sc.mo.primMoves : nullptr;
     // tMax is fixed for the whole walk: push-time tests suffice (see blasOccluded).
     Real tRoot;
-    if (!boxHit(sc.nodes[0], o, invD, tmin, tMax, tRoot)) return false;
-    int stack[64]; int sp = 0; stack[sp++] = 0;
+    int stack[64]; int sp = 0;
+    if (boxHit(sc.nodes[0], o, invD, tmin, tMax, tRoot)) stack[sp++] = 0;
+    else if (!timed) return false;
     while (sp) {
         const DNode& n = sc.nodes[stack[--sp]];
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = sc.primIdx[n.first + i];
+                if (skip && skip[prim]) continue;
                 DHit h; h.t = tMax; h.valid = false;
                 bool blocked;
                 if (prim < sc.nTris)                              { const DTri& t = sc.tris[prim];
@@ -4810,7 +5312,8 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
             if (boxHit(sc.nodes[n.right], o, invD, tmin, tMax, tc)) stack[sp++] = n.right;
         }
     }
-    return false;
+    return timed && dTimedAny(sc, o, dir, invD, sh, tmin, curveTmin, tMax, camHideOn,
+                              [](int, DHit&, DMotionNow&) { return false; });
 }
 
 // Fraction of a shadow ray that SURVIVES to maxDist: 1 clear, 0 blocked, in between when it
@@ -4826,15 +5329,19 @@ __device__ static Real shadowTransmittance(const DScene& sc, const DVec3& o, con
     const DTriShear sh = makeTriShear(dir);
     const DCurveRay cray = sc.nCurveSegs ? makeCurveRay(dir) : DCurveRay{DVec3{(Real)0,(Real)0,(Real)1}, (Real)1};
     Real tMax = maxDist - tmin;
+    const bool timed = dTimed(sc);
+    const unsigned char* skip = timed ? sc.mo.primMoves : nullptr;
     Real tRoot;
-    if (!boxHit(sc.nodes[0], o, invD, tmin, tMax, tRoot)) return (Real)1;
     double T = 1.0;
-    int stack[64]; int sp = 0; stack[sp++] = 0;
+    int stack[64]; int sp = 0;
+    if (boxHit(sc.nodes[0], o, invD, tmin, tMax, tRoot)) stack[sp++] = 0;
+    else if (!timed) return (Real)1;
     while (sp) {
         const DNode& n = sc.nodes[stack[--sp]];
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = sc.primIdx[n.first + i];
+                if (skip && skip[prim]) continue;
                 DHit h; h.t = tMax; h.valid = false;
                 bool blocked;
                 if (prim < sc.nTris)                              { blocked = intersectTri(sh, o, dir, sc.tris[prim], tmin, h); }
@@ -4867,6 +5374,19 @@ __device__ static Real shadowTransmittance(const DScene& sc, const DVec3& o, con
             if (boxHit(sc.nodes[n.left],  o, invD, tmin, tMax, tc)) stack[sp++] = n.left;
             if (boxHit(sc.nodes[n.right], o, invD, tmin, tMax, tc)) stack[sp++] = n.right;
         }
+    }
+    if (timed) {
+        // A moving fibre whose opacity is below 1 attenuates, as a still one does above.
+        const auto soft = [&](int prim, DHit& h, DMotionNow& mc) -> bool {
+            const int k = prim - sc.nTris - sc.nSph - sc.nImplicits;
+            if (k < 0 || k >= sc.nCurveSegs) return false;
+            const DMaterial& cm = sc.mats[sc.curveSegs[k].matId];
+            if (!(cm.type == D_HAIR && (cm.hairOpacity < 1.0 || cm.hairOpacityPat >= 0))) return false;
+            if (dIntersectOtherNow(sc, o, dir, prim, tmin, curveTmin, h, mc, false))
+                T *= (1.0 - dHairOpacityAt(sc, cm, h));
+            return true;
+        };
+        if (dTimedAny(sc, o, dir, invD, sh, tmin, curveTmin, tMax, false, soft) || T <= 1e-4) return (Real)0;
     }
     return (Real)T;
 }
@@ -8019,6 +8539,7 @@ struct DQBeamTr0 {
 // (see DBeamRec::tr0). `pStart` is the CSR of parents over the sub-beam array.
 __global__ void kBeamTr0(DScene sc, const DBeamRec* beams, float* tr0, const int* pStart, int nP,
                          unsigned long long salt) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < nP; j += gridDim.x * blockDim.x) {
         const int i0 = pStart[j], i1 = pStart[j + 1];
         if (i1 <= i0) continue;
@@ -8042,6 +8563,7 @@ __device__ __noinline__ static void dBeamHitEvalSpill(const DScene& sc, const DB
 }
 
 __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm, int resX, DCamera cam) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     const int nS = min(*q.nSegs, q.segCap);
     const DPatEnv env = dPatEnvOf(sc);
     for (int si = blockIdx.x * blockDim.x + threadIdx.x; si < nS; si += gridDim.x * blockDim.x) {
@@ -8104,6 +8626,7 @@ __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm,
 }
 
 __global__ void kWfBeamEval(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm, int resX, DCamera cam) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     const int nH = min(*q.nHits, q.hitCap);
     const DPatEnv env = dPatEnvOf(sc);
     for (int hi = blockIdx.x * blockDim.x + threadIdx.x; hi < nH; hi += gridDim.x * blockDim.x) {
@@ -9553,16 +10076,58 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
 // off the surface along h.ng (pattern.h patNudgedPoint says why) -- and its distance r from
 // the origin, and the normal and curvature, turned to ng's side where the ray came from behind
 // a surface light can cross. Every pattern read at a DHit takes them from here, so none can
-// skip the side rule.
-struct DPatIn { double x, y, z, r, nx, ny, nz, curv; };
-__device__ static inline DPatIn dPatIn(const DHit& h) {
+// skip the side rule. A hit with a time on a mover reads them where it sat at the frame's
+// instant, so a texture travels with its object (host twin patCtxFromHit's motion branches):
+// a deforming triangle by the hit's barycentrics on the instant's face, nudged off it as a hit
+// there would be, its normal by the inverse transpose of the map from the face now to the face
+// then; a rigid mover by the inverse of its motion. The footprint `fw` and the curvature are
+// lengths at the instant too.
+struct DPatIn { double x, y, z, r, nx, ny, nz, curv, fw; };
+__device__ static DPatIn dPatIn(const DScene& sc, const DHit& h) {
     DPatIn in;
-    patNudgedPoint((double)h.p.x, (double)h.p.y, (double)h.p.z, (double)h.ng.x, (double)h.ng.y, (double)h.ng.z,
-                   (double)h.pscale, in.x, in.y, in.z);
-    in.r = sqrt(in.x * in.x + in.y * in.y + in.z * in.z);
     const double s = (h.back && h.patOwnSide) ? -1.0 : 1.0;
     in.nx = s * (double)h.n.x; in.ny = s * (double)h.n.y; in.nz = s * (double)h.n.z;
     in.curv = s * (double)h.curv;
+    in.fw = (double)h.fw;
+    const bool timed = dTimed(sc);
+    if (timed && h.deformTri >= 0) {
+        const DTri& t = sc.tris[h.deformTri];
+        DVec3 c[3];
+        dDeformedCorners(sc, h.deformTri, (double)dMotionU(), c, nullptr, nullptr);
+        const DVec3 e1 = c[1] - c[0], e2 = c[2] - c[0], E1 = t.v1 - t.v0, E2 = t.v2 - t.v0;
+        const DVec3 fNow = cross(e1, e2), fThen = cross(E1, E2);
+        const DVec3 pThen = t.v0 + E1 * h.deformB1 + E2 * h.deformB2;
+        const DVec3 ngThen = dot(h.ng, fNow) < (Real)0 ? -t.gn : t.gn;
+        patNudgedPoint((double)pThen.x, (double)pThen.y, (double)pThen.z, (double)ngThen.x, (double)ngThen.y,
+                       (double)ngThen.z, (double)t.reach, in.x, in.y, in.z);
+        const double aNow = (double)length(fNow), aThen = (double)length(fThen);
+        if (aNow > 0.0 && aThen > 0.0) {
+            const DVec3 nNow = fNow * (Real)(1.0 / aNow), nThen = fThen * (Real)(1.0 / aThen);
+            const DVec3 d1 = cross(E2, nThen) * (Real)(1.0 / aThen), d2 = cross(nThen, E1) * (Real)(1.0 / aThen);
+            const DVec3 n0((Real)in.nx, (Real)in.ny, (Real)in.nz);
+            const DVec3 n1 = normalize(d1 * dot(n0, e1) + d2 * dot(n0, e2) + nThen * dot(n0, nNow));
+            in.nx = n1.x; in.ny = n1.y; in.nz = n1.z;
+            const double k = sqrt(aThen / aNow);
+            in.fw *= k;
+            if (k > 0.0) in.curv /= k;
+        }
+    } else {
+        patNudgedPoint((double)h.p.x, (double)h.p.y, (double)h.p.z, (double)h.ng.x, (double)h.ng.y,
+                       (double)h.ng.z, (double)h.pscale, in.x, in.y, in.z);
+        if (timed && h.motionSet >= 0) {
+            DAff D, Di;
+            dMotionAt(sc.mo, h.motionSet, (double)dMotionU(), D);
+            dAffInverse(D, Di);
+            const DVec3 q = affPoint(Di.m, Di.t, DVec3((Real)in.x, (Real)in.y, (Real)in.z));
+            in.x = q.x; in.y = q.y; in.z = q.z;
+            const DVec3 n1 = normalize(dAffDirT(D, DVec3((Real)in.nx, (Real)in.ny, (Real)in.nz)));
+            in.nx = n1.x; in.ny = n1.y; in.nz = n1.z;
+            const double k = dAffScale(Di);            // lengths at the instant
+            in.fw *= k;
+            if (k > 0.0) in.curv /= k;
+        }
+    }
+    in.r = sqrt(in.x * in.x + in.y * in.y + in.z * in.z);
     return in;
 }
 // Evaluate a bound pattern at a hit (device twin of patternScalarAt/patCtxFromHit).
@@ -9570,9 +10135,9 @@ __device__ static inline DPatIn dPatIn(const DHit& h) {
 // the `f` variable is 0 at surfaces on both backends.
 __device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit& h) {
     const DPattern& p = sc.patterns[pat];
-    const DPatIn in = dPatIn(h);
+    const DPatIn in = dPatIn(sc, h);
     return dPatternEval(sc.patNodes + p.off, p.n, in.x, in.y, in.z, 0.0, in.nx, in.ny, in.nz, in.r, h.u, h.v,
-                        in.curv, dCavityOf(sc, h), h.fw, dPatEnvOf(sc));
+                        in.curv, dCavityOf(sc, h), in.fw, dPatEnvOf(sc));
 }
 
 // Fritsch-Carlson monotone-cubic tangent at node k (device twin of recFCTangent).
@@ -9589,9 +10154,9 @@ __device__ static double dRecFCTangent(const double* pos, const double* sec, int
 // Evaluate one scalar-record stop's per-hit expression program at the hit.
 __device__ static double dRecStopVal(const DScene& sc, const DRecScalarStop& s, const DHit& h) {
     if (s.exprN <= 0) return 0.0;
-    const DPatIn in = dPatIn(h);
+    const DPatIn in = dPatIn(sc, h);
     return dPatternEval(sc.recDrivers + s.exprOff, s.exprN, in.x, in.y, in.z, 0.0, in.nx, in.ny, in.nz, in.r,
-                        h.u, h.v, in.curv, dCavityOf(sc, h), h.fw, dPatEnvOf(sc));
+                        h.u, h.v, in.curv, dCavityOf(sc, h), in.fw, dPatEnvOf(sc));
 }
 // Sample a scalar record channel at driver position `d` (device twin of recSampleScalar):
 // evaluate each stop's per-hit expression, then interpolate by the record's interp mode.
@@ -9636,15 +10201,15 @@ __device__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, co
     if (m.recRoughMode < 0) return false;
     double v;
     if (m.recRoughMode == 0) {                             // direct scalar expression
-        const DPatIn in = dPatIn(h);
+        const DPatIn in = dPatIn(sc, h);
         v = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN, in.x, in.y, in.z, 0.0,
-                         in.nx, in.ny, in.nz, in.r, h.u, h.v, in.curv, dCavityOf(sc, h), h.fw, dPatEnvOf(sc));
+                         in.nx, in.ny, in.nz, in.r, h.u, h.v, in.curv, dCavityOf(sc, h), in.fw, dPatEnvOf(sc));
     } else if (m.recRoughMode == 1) {                      // constant selStop (one stop, per-hit)
         v = dRecStopVal(sc, sc.recScalarStops[m.recRoughStopOff], h);
     } else {                                               // per-hit driven
-        const DPatIn in = dPatIn(h);
+        const DPatIn in = dPatIn(sc, h);
         double d = dPatternEval(sc.recDrivers + m.recRoughDrvOff, m.recRoughDrvN, in.x, in.y, in.z, 0.0,
-                                in.nx, in.ny, in.nz, in.r, h.u, h.v, in.curv, dCavityOf(sc, h), h.fw, dPatEnvOf(sc));
+                                in.nx, in.ny, in.nz, in.r, h.u, h.v, in.curv, dCavityOf(sc, h), in.fw, dPatEnvOf(sc));
         v = dRecSampleScalar(sc, sc.recScalarStops + m.recRoughStopOff, m.recRoughStopN,
                              m.recRoughInterp, h, d);
     }
@@ -9830,9 +10395,9 @@ __device__ static Real dRecReflAt(const double* coeff, int N, double lo, double 
 __device__ static bool dRecordReflect(const DScene& sc, const DMaterial& m,
                                       const DHit& h, Real lambda, Real& out, double* dOut = nullptr) {
     if (m.recReflDriven != 1) return false;
-    const DPatIn in = dPatIn(h);
+    const DPatIn in = dPatIn(sc, h);
     double d = dPatternEval(sc.recDrivers + m.recReflDrvOff, m.recReflDrvN, in.x, in.y, in.z, 0.0,
-                            in.nx, in.ny, in.nz, in.r, h.u, h.v, in.curv, dCavityOf(sc, h), h.fw, dPatEnvOf(sc));
+                            in.nx, in.ny, in.nz, in.r, h.u, h.v, in.curv, dCavityOf(sc, h), in.fw, dPatEnvOf(sc));
     if (dOut) *dOut = d;                                                     // JSPEC shape
     out = dRecReflAt(sc.recCoeff + m.recReflOff, REC_LUT_N,
                      (double)m.recReflLo, (double)m.recReflHi, d, lambda);
@@ -11717,6 +12282,7 @@ __device__ static void traceHeroPhoton(const DScene& sc, const DCamSet& cs, int 
 __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
                        long long N, int diffraction, unsigned long long seedBase, int maxBounce,
                        int camMode, int heroC, int perPhotonSeed) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     DRng rng; rng.seedUnit((unsigned long long)g, seedBase);
@@ -11882,6 +12448,7 @@ __device__ static bool wfSpawn(const DScene& sc, const DCamSet& cs,
 __global__ void kWfInit(DScene sc, DCamSet cs, double* energy,
                         WFState st, long long N, int W, unsigned long long* dispatched,
                         int* liveCount, unsigned long long seedBase, int camMode) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     int slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= W) return;
     DRng rng; rng.seedUnit((unsigned long long)slot, seedBase);
@@ -11895,6 +12462,7 @@ __global__ void kWfInit(DScene sc, DCamSet cs, double* energy,
 // gradient-index region first (writing the bent ro/rd back so kWfShade sees them) — exactly
 // as the megakernel marches before closestHit. Non-GRIN scenes skip it (bit-identical).
 __global__ void kWfExtend(DScene sc, WFState st, int W) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     int slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= W || !st.alive[slot]) return;
     st.gmMed[slot] = -1; st.gmArc[slot] = 0;
@@ -11919,6 +12487,7 @@ __global__ void kWfExtend(DScene sc, WFState st, int W) {
 __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
                          WFState st, int W, long long N, int diffraction, int maxBounce,
                          unsigned long long* dispatched, int* liveCount, int camMode) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     int slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= W || !st.alive[slot]) return;
     DRng rng = st.rng[slot];
@@ -12946,22 +13515,36 @@ __device__ static void dFireNee(const DScene& sc, const DVec3& x, const Real* la
         if (thr[i] > 0.0 && f[i] > 0.0 && E[i] > 0.0) L[i] += thr[i] * invPdf[i] * f[i] * E[i] / den;
 }
 
+// The light tree a vertex selects by (host twin: pickEmitters' `tt`): the timed one for a path
+// with a time when a light moves, else the instant's.
+struct DLightTreeRef {
+    const LightTreeNode* nodes; int root;
+    const int* always; int nAlways;
+    const int* parent; const int* leaf; int nLeaf;
+};
+__device__ static inline DLightTreeRef dLightTreeOf(const DScene& sc) {
+    if (sc.mo.ltNodes && dTimed(sc))
+        return DLightTreeRef{sc.mo.ltNodes, sc.mo.ltRoot, sc.mo.ltAlways, sc.mo.nLtAlways,
+                             sc.mo.ltParent, sc.mo.ltLeaf, sc.mo.nLtLeaf};
+    return DLightTreeRef{sc.lightTree, sc.lightTreeRoot, sc.lightTreeAlways, sc.nLightTreeAlways,
+                         sc.lightTreeParent, sc.lightTreeLeaf, sc.nLightTreeLeaf};
+}
 // Host twin: BackwardRenderer::lightSelPdf -- the probability dPickEmitters SELECTS emitter `e`
 // at vertex (p, n). Both halves of the glossy MIS weight call this, so they cannot disagree; the
 // ESTIMATOR keeps ltSample's own exact pdf. See the host comment for why leaving the factor out
 // is unbiased and measurably noisier.
 __device__ static inline double dLightSelPdf(const DScene& sc, int e, const DVec3& p,
                                              const DVec3& nrm) {
-    if (!sc.bkLightTree || sc.bkWhitted || sc.lightTreeRoot < 0 || !sc.lightTree) return 1.0;
+    const DLightTreeRef lt = dLightTreeOf(sc);
+    if (!sc.bkLightTree || sc.bkWhitted || lt.root < 0 || !lt.nodes) return 1.0;
     // Only the prefix dPickEmitters draws (it stops at kDMaxLightPick) -- host twin's note.
-    const int nAlw = (sc.nLightTreeAlways < kDMaxLightPick) ? sc.nLightTreeAlways : kDMaxLightPick;
-    for (int i = 0; i < nAlw; ++i) if (sc.lightTreeAlways[i] == e) return 1.0;
+    const int nAlw = (lt.nAlways < kDMaxLightPick) ? lt.nAlways : kDMaxLightPick;
+    for (int i = 0; i < nAlw; ++i) if (lt.always[i] == e) return 1.0;
     if (sc.bkLightSamples <= 0 || nAlw >= kDMaxLightPick) return 0.0;
-    if (!sc.lightTreeParent || !sc.lightTreeLeaf || e < 0 || e >= sc.nLightTreeLeaf) return 0.0;
+    if (!lt.parent || !lt.leaf || e < 0 || e >= lt.nLeaf) return 0.0;
     const double pp[3] = {(double)p.x, (double)p.y, (double)p.z};
     const double nn[3] = {(double)nrm.x, (double)nrm.y, (double)nrm.z};
-    return ltSelectPdf<32>(sc.lightTree, sc.lightTreeRoot, sc.lightTreeParent,
-                           sc.lightTreeLeaf[e], pp, nn, true, (double)sc.bkLightSplit);
+    return ltSelectPdf<32>(lt.nodes, lt.root, lt.parent, lt.leaf[e], pp, nn, true, (double)sc.bkLightSplit);
 }
 
 // Host twin: BackwardRenderer::lightPdfW -- the density that WOULD have produced direction `wi`
@@ -13099,8 +13682,13 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     if (em.shape == 2) {
         // Point spot (device twin of emitterGeom's spot branch): deterministic connect
         // to the light point, cone falloff toward the surface, no rng draw. Peak
-        // intensity/SPD = 1; the falloff scales it toward the cone edge.
-        DVec3 toL = em.origin - h.p;
+        // intensity/SPD = 1; the falloff scales it toward the cone edge. A moving spot's point
+        // and beam are where its motion has them at the path's time.
+        DAff Dl;
+        const bool moving = dLightNow(sc, em, Dl);
+        const DVec3 org = moving ? affPoint(Dl.m, Dl.t, em.origin) : em.origin;
+        const DVec3 beam = moving ? dLightDir(Dl, em.beamDir) : em.beamDir;
+        DVec3 toL = org - h.p;
         g.dist2 = dot(toL, toL);
         g.dist  = sqrt(g.dist2);
         g.wi = toL / g.dist;
@@ -13113,7 +13701,7 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
             g.stG = dShadowTerminatorG(g.wi, h.n, ngo);
             if (g.stG <= (Real)0) return false;
         }
-        g.fall = (Real)spotFalloff(dot(g.wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
+        g.fall = (Real)spotFalloff(dot(g.wi * (Real)(-1), beam), em.spotCosInner, em.spotCosOuter);
         if (g.fall <= (Real)0) return false;
         vis = hs ? bkHairTransmittance(sc, h, *hs, g.wi, g.dist)
                  : shadowTransmittanceTo(sc, dOffsetAlong(h.p, h.ng, g.wi), h.p + g.wi * g.dist,
@@ -13140,7 +13728,7 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
             g.stG = dShadowTerminatorG(g.wi, h.n, ngo);
             if (g.stG <= (Real)0) return false;
         }
-        g.dist = (Real)((double)length(sc.sceneCenter - h.p) + sc.sceneRadius);
+        g.dist = (Real)(dExitDistance(sc, h.p));
         g.dist2 = g.dist * g.dist;
         vis = hs ? bkHairTransmittance(sc, h, *hs, g.wi, g.dist)
                  : shadowTransmittance(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi, g.dist);
@@ -13158,6 +13746,11 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     // emission-on-hit factor at the same surface point — which keeps the MIS pair
     // consistent (host twin: backward.h emitterGeom).
     double epat = dEmitterSamplePointPat(sc, em, (double)u1, (double)u2, y, nL);
+    {   // a moving light: sampled where it sits at the instant (uniform in area, which its
+        // rigid motion keeps), the sample carried to the path's time
+        DAff Dl;
+        if (dLightNow(sc, em, Dl)) { y = affPoint(Dl.m, Dl.t, y); nL = dLightDir(Dl, nL); }
+    }
     DVec3 toL = y - h.p;
     g.dist2 = dot(toL, toL);
     g.dist = sqrt(g.dist2);
@@ -13233,11 +13826,12 @@ struct DEmitterDraw {
 __device__ static void dPickEmitters(const DScene& sc, const DVec3& p, const DVec3* nrm,
                                      DRng& rng, DEmitterDraw& d) {
     d.n = 0; d.all = false; d.selExact = true;
-    if (!sc.bkLightTree || sc.bkWhitted || sc.lightTreeRoot < 0 || !sc.lightTree) {
+    const DLightTreeRef lt = dLightTreeOf(sc);
+    if (!sc.bkLightTree || sc.bkWhitted || lt.root < 0 || !lt.nodes) {
         d.all = true; d.n = sc.nEmitters; return;
     }
-    for (int i = 0; i < sc.nLightTreeAlways && d.n < kDMaxLightPick; ++i) {
-        d.s[d.n].emitter = sc.lightTreeAlways[i];
+    for (int i = 0; i < lt.nAlways && d.n < kDMaxLightPick; ++i) {
+        d.s[d.n].emitter = lt.always[i];
         d.s[d.n].pdf = 1.0;
         ++d.n;
     }
@@ -13249,7 +13843,7 @@ __device__ static void dPickEmitters(const DScene& sc, const DVec3& p, const DVe
         if (nrm) { nn[0] = (double)nrm->x; nn[1] = (double)nrm->y; nn[2] = (double)nrm->z; }
         bool limited = false;
         d.n += ltSample<DRng, kDMaxLightPick + 2>(
-                   sc.lightTree, sc.lightTreeRoot, pp, nn, nrm != nullptr,
+                   lt.nodes, lt.root, pp, nn, nrm != nullptr,
                    sc.bkLightSplit, budget, d.s + d.n, rng, &limited);
         d.selExact = !limited;
     }
@@ -13573,12 +14167,14 @@ __device__ __noinline__ static void bkNeeVolumeHero(const DScene& sc, const DMed
         double geom;    // all but the albedo, phase and spectrum: shared by the bundle
         if (em.shape == 2) {
             // Point spot (device twin of volumeEmitterGeom's spot branch): no surface cosine,
-            // cone falloff only.
-            const DVec3 toL = em.origin - p;
+            // cone falloff only; a moving one where its motion has it at the path's time.
+            DAff Dl;
+            const bool moving = dLightNow(sc, em, Dl);
+            const DVec3 toL = (moving ? affPoint(Dl.m, Dl.t, em.origin) : em.origin) - p;
             const Real dist2 = dot(toL, toL);
             dist = sqrt(dist2);
             wi = toL / dist;
-            const Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), em.beamDir),
+            const Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), moving ? dLightDir(Dl, em.beamDir) : em.beamDir),
                                                 em.spotCosInner, em.spotCosOuter);
             if (fall <= (Real)0) continue;
             // A fiber of `opacity` below 1 attenuates the shadow ray (host twin volumeEmitterGeom).
@@ -13590,7 +14186,7 @@ __device__ __noinline__ static void bkNeeVolumeHero(const DScene& sc, const DMed
             // so 1/pdfW = Omega), no surface cosine, transmittance out to the scene exit.
             const double s1 = (double)rng.uniform(), s2 = (double)rng.uniform();
             wi = dSunSampleCone(em, em.beamDir * (Real)(-1), s1, s2);
-            dist = (Real)((double)length(sc.sceneCenter - p) + sc.sceneRadius);
+            dist = (Real)(dExitDistance(sc, p));
             const Real vis = shadowTransmittance(sc, p + wi * RAY_EPS, wi, dist);
             if (!(vis > (Real)0)) continue;
             geom = em.spotOmega * (double)vis;
@@ -13599,6 +14195,10 @@ __device__ __noinline__ static void bkNeeVolumeHero(const DScene& sc, const DMed
             DVec3 y, nL;
             // Also returns the sampled point's emission-pattern factor (1.0 when unpatterned).
             const double epat = dEmitterSamplePointPat(sc, em, (double)u1, (double)u2, y, nL);
+            {
+                DAff Dl;
+                if (dLightNow(sc, em, Dl)) { y = affPoint(Dl.m, Dl.t, y); nL = dLightDir(Dl, nL); }
+            }
             const DVec3 toL = y - p;
             const Real dist2 = dot(toL, toL);
             dist = sqrt(dist2);
@@ -13682,7 +14282,7 @@ __device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkE
         g.cosSurf = (Real)DPI * dHairFCos(*hs, g.wi);
         if (!(g.cosSurf > (Real)0)) return false;
         g.stG = (Real)1;
-        g.farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
+        g.farDist = dExitDistance(sc, h.p);
         const Real off = dHairExitOffset(*hs, h.n, g.wi);
         {   // Partial, not yes/no: hair below opacity 1 attenuates the sky rather than
             // hiding it. Folded into cosSurf, which every caller already multiplies by.
@@ -13700,7 +14300,7 @@ __device__ static bool bkEnvGeom(const DScene& sc, const DHit& h, DRng& rng, BkE
     DVec3 ngo = dShadedNg(h);
     g.stG = dShadowTerminatorG(g.wi, h.n, ngo);             // Chiang soft terminator (1 if flat)
     if (g.stG <= (Real)0) return false;                     // behind true geometry: hard shadow
-    g.farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
+    g.farDist = dExitDistance(sc, h.p);
     {   // see the fiber branch above: a transparent coat between a surface and the sky
         // attenuates it instead of blocking it
         const Real vis = shadowTransmittance(sc, dOffsetAlong(h.p, h.ng, g.wi), g.wi,
@@ -13788,7 +14388,7 @@ __device__ __noinline__ static void bkNeeEnvVolumeHero(const DScene& sc, const D
     DVec3 wi; double pdfW;
     const bool imageEnv = (sc.env.scale != nullptr);
     if (!dSampleEnvDir(sc, rng, wi, pdfW)) return;
-    const double farDist = (double)length(sc.sceneCenter - p) + sc.sceneRadius;
+    const double farDist = dExitDistance(sc, p);
     const Real envVis = shadowTransmittance(sc, p + wi * RAY_EPS, wi, (Real)farDist);
     if (!(envVis > (Real)0)) return;
     const double T = (double)dMediaTransmittance(sc, p, wi, (Real)farDist, lam[0], rng);
@@ -13952,7 +14552,7 @@ __device__ static void bkNeeEnvHeroHair(const DScene& sc, const DHit& h, const D
     DVec3 wi; double pdfW;
     const bool imageEnv = (sc.env.scale != nullptr);
     if (!dSampleEnvDir(sc, rng, wi, pdfW)) return;
-    const double farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
+    const double farDist = dExitDistance(sc, h.p);
     // bkEnvGeom's fiber shadow ray: past the strand's own body, through strands of opacity below 1.
     double vis = (double)shadowTransmittance(sc, h.p + wi * (Real)RAY_EPS, wi, (Real)farDist,
                                              RAY_EPS, dHairExitOffset(hs0, h.n, wi));
@@ -15326,6 +15926,7 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
                           long long totalSamples, long long chunkSpp, long long sppTotal,
                           long long sampleBase, int resX,
                           int diffraction, unsigned long long seedBase, int heroC) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     for (long long idx = g; idx < totalSamples; idx += G) {
@@ -15343,6 +15944,8 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
         const unsigned long long sIdx =
             (unsigned long long)(sampleBase + (idx - pix * chunkSpp));
         const bool whitted = (sc.bkWhitted != 0);
+        DCamera camT = cam;                    // posed at the sample's time when it moves
+        dSetCameraTime(sc, cam, (unsigned long long)pix, sIdx, whitted, &camT);
 
         if (heroC > 1) {
             // One stratified base draw -> hero + C-1 secondary wavelengths, all from the
@@ -15372,7 +15975,7 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
             Real jx, jy;
             if (whitted) { double u1, u2; dWhittedSample(sIdx, u1, u2); jx = (Real)u1; jy = (Real)u2; }
             else         { jx = rng.uniform(); jy = rng.uniform(); }
-            dGenRay(cam, px, py, jx, jy, hro, hrd);
+            dGenRay(camT, px, py, jx, jy, hro, hrd);
             double Lh[hero::kHeroMax];
             // DGiCtx carries the ABSOLUTE sample index down the path, which rotates every
             // deterministic lattice (glossy lobe, gather directions) by it — so, exactly like
@@ -15407,13 +16010,13 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
             Real jx = rng.uniform(), jy = rng.uniform();
             Real u1 = rng.uniform(), u2 = rng.uniform();
             Real wl = 0;
-            if (!dGenLensRay(cam, px, py, jx, jy, u1, u2, lambda, ro, rd, wl)) continue;  // vignetted
+            if (!dGenLensRay(camT, px, py, jx, jy, u1, u2, lambda, ro, rd, wl)) continue;  // vignetted
             wLens = (double)wl;
         } else {
             Real jx, jy;
             if (whitted) { double s1, s2; dWhittedSample(sIdx, s1, s2); jx = (Real)s1; jy = (Real)s2; }
             else         { jx = rng.uniform(); jy = rng.uniform(); }
-            dGenRay(cam, px, py, jx, jy, ro, rd);
+            dGenRay(camT, px, py, jx, jy, ro, rd);
         }
         double Lval = bkRadiance<0>(sc, diffraction, ro, rd, lambda, invPdfLambda, rng,
                                     DGiCtx{0, sIdx, 0});
@@ -15454,7 +16057,10 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;  // collimated beams / env (env: bkNeeEnvRGB)
         if (em.shape == 2) {                           // point spot
-            DVec3 toL = em.origin - h.p;
+            DAff Dl;
+            const bool moving = dLightNow(sc, em, Dl);
+            const DVec3 beam = moving ? dLightDir(Dl, em.beamDir) : em.beamDir;
+            DVec3 toL = (moving ? affPoint(Dl.m, Dl.t, em.origin) : em.origin) - h.p;
             Real dist2 = dot(toL, toL);
             Real dist  = sqrt(dist2);
             DVec3 wi = toL / dist;
@@ -15462,7 +16068,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
             if (cosSurf <= (Real)0) continue;
             Real stG = dShadowTerminatorG(wi, h.n, ngo0);
             if (stG <= (Real)0) continue;
-            Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), em.beamDir), em.spotCosInner, em.spotCosOuter);
+            Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), beam), em.spotCosInner, em.spotCosOuter);
             if (fall <= (Real)0) continue;
             if (occludedTo(sc, dOffsetAlong(h.p, h.ng, wi), h.p + wi * dist, 2 * RAY_EPS)) continue;
             total = total + hadamard(f * (fall * cosSurf / dist2 * stG * selWr), em.rgbEmit);
@@ -15475,7 +16081,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
             if (cosSurf <= (Real)0) continue;
             Real stG = dShadowTerminatorG(wi, h.n, ngo0);
             if (stG <= (Real)0) continue;
-            Real dist = (Real)((double)length(sc.sceneCenter - h.p) + sc.sceneRadius);
+            Real dist = (Real)(dExitDistance(sc, h.p));
             if (occluded(sc, dOffsetAlong(h.p, h.ng, wi), wi, dist)) continue;
             total = total + hadamard(f * (Real)((double)(cosSurf * stG) * em.spotOmega * selW), em.rgbEmit);
             continue;
@@ -15485,6 +16091,10 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         // Also returns the sampled point's emission-pattern factor (1.0 when unpatterned).
         // The pattern is achromatic, so it scales the baked RGB radiance directly.
         double epat = dEmitterSamplePointPat(sc, em, (double)u1, (double)u2, y, nL);
+        {
+            DAff Dl;
+            if (dLightNow(sc, em, Dl)) { y = affPoint(Dl.m, Dl.t, y); nL = dLightDir(Dl, nL); }
+        }
         DVec3 toL = y - h.p;
         Real dist2 = dot(toL, toL);
         Real dist = sqrt(dist2);
@@ -15519,7 +16129,7 @@ __device__ static DVec3 bkNeeEnvRGB(const DScene& sc, const DHit& h, const DVec3
     DVec3 ngo = dShadedNg(h);
     Real stG = dShadowTerminatorG(wi, h.n, ngo);
     if (stG <= (Real)0) return DVec3(0, 0, 0);
-    double farDist = (double)length(sc.sceneCenter - h.p) + sc.sceneRadius;
+    double farDist = dExitDistance(sc, h.p);
     if (occluded(sc, dOffsetAlong(h.p, h.ng, wi), wi, (Real)farDist)) return DVec3(0, 0, 0);
     double pdfBsdf = (double)cosSurf / DPI;
     double wMis = pdfW / (pdfW + pdfBsdf);
@@ -15680,6 +16290,7 @@ __global__ void kBackwardRGB(DScene sc, DCamera cam, double* film, double* hits,
                              long long totalSamples, long long chunkSpp, long long sppTotal,
                              long long sampleBase, int resX,
                              int diffraction, unsigned long long seedBase) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     for (long long idx = g; idx < totalSamples; idx += G) {
@@ -15688,6 +16299,9 @@ __global__ void kBackwardRGB(DScene sc, DCamera cam, double* film, double* hits,
         DRng rng; rng.seedUnit((unsigned long long)gidx, seedBase);
         int px = (int)(pix % resX);
         int py = (int)(pix / resX);
+        DCamera camT = cam;
+        dSetCameraTime(sc, cam, (unsigned long long)pix,
+                       (unsigned long long)(sampleBase + (idx - pix * chunkSpp)), false, &camT);
 
         DVec3 ro, rd;
         double wLens = 1.0;
@@ -15695,11 +16309,11 @@ __global__ void kBackwardRGB(DScene sc, DCamera cam, double* film, double* hits,
             Real jx = rng.uniform(), jy = rng.uniform();
             Real u1 = rng.uniform(), u2 = rng.uniform();
             Real wl = 0;
-            if (!dGenLensRay(cam, px, py, jx, jy, u1, u2, LREP_RGB, ro, rd, wl)) continue;  // vignetted
+            if (!dGenLensRay(camT, px, py, jx, jy, u1, u2, LREP_RGB, ro, rd, wl)) continue;  // vignetted
             wLens = (double)wl;
         } else {
             Real jx = rng.uniform(), jy = rng.uniform();
-            dGenRay(cam, px, py, jx, jy, ro, rd);
+            dGenRay(camT, px, py, jx, jy, ro, rd);
         }
         DVec3 Lrgb = bkRadianceRGB(sc, diffraction, ro, rd, rng);
         DVec3 xyz = dRgbToXyz(Lrgb * (Real)wLens);
@@ -15804,6 +16418,7 @@ __global__ void kIsoPreview(DScene sc, DCamera cam, DPreviewLight pl,
                             const int* matTex, const double* matTri,
                             double* accum, float* zbuf, unsigned char* emis,
                             int W, int H, DVec3 bg, double emisBoost, int camHide) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     int total = W * H;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
          idx += gridDim.x * blockDim.x) {
@@ -17088,7 +17703,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             // shadow-ray it out of the scene. No 1/dist^2 and no cosLight — the source is
             // at infinity — so Wgeom is just Omega/pdfChoice and emitSpd is a radiance.
             wi = dSunSampleCone(em, em.beamDir * (Real)-1, (double)u1, (double)u2);
-            dist = (double)length(sc.sceneCenter - pt.p) + sc.sceneRadius;
+            dist = dExitDistance(sc, pt.p);
             occlEps = 0.0;
             y = pt.p + wi * (Real)dist; nOut = wi * (Real)(-1);
             Wgeom = em.spotOmega / pdfChoice;
@@ -17429,6 +18044,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                       long long sampleBase, int resX, int maxDepth,
                       int diffraction, unsigned long long seedBase, int heroC,
                       DBeamMap bm, DSurfMap sm, DWfQueue wq, long long idxBegin, long long idxEnd) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     enum { SECN = (NS > 0 ? NS : 1), MAXV = BDPT_MAXV_OF(MAXD),
            SEGN = (MERGE ? BDPT_MAXV_OF(MAXD) : 1) };
     // `bm.beams == nullptr` is the dispatcher's own "-nobeams / empty map" signal, so this
@@ -18150,7 +18766,7 @@ __device__ static void dSunNeeMarch(const DScene& sc, const DVec3& oc, const DVe
                 if (em.shape != 6 || !(em.spotOmega > 0.0)) continue;
                 const double s1 = (double)rng.uniform(), s2 = (double)rng.uniform();
                 const DVec3 wi = dSunSampleCone(em, em.beamDir * (Real)(-1), s1, s2);   // toward the sun
-                const Real dist = (Real)((double)length(sc.sceneCenter - p) + sc.sceneRadius);
+                const Real dist = (Real)(dExitDistance(sc, p));
                 if (occluded(sc, p + wi * RAY_EPS, wi, dist)) continue;
                 const double Tsun = (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
                 if (!(Tsun > 0.0)) continue;
@@ -18837,6 +19453,7 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, D
                         long long chunkSpp, long long sppTotal,
                         long long sampleBase, int resX, int diffraction, int fgRays,
                         unsigned long long seedBase) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     int poll = 0;
@@ -19081,6 +19698,7 @@ struct DSppmState {
 // direct term. One thread per pixel. Seeds mirror kBackward/kGather (global sample index).
 __global__ void kSppmVisiblePoint(DScene sc, DCamera cam, DSppmState st, int resX, int resY,
                                   int maxBounce, unsigned long long seedBase, long long passIdx) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     long long npix = (long long)resX * resY;
@@ -19116,6 +19734,7 @@ __global__ void kSppmVisiblePoint(DScene sc, DCamera cam, DSppmState st, int res
 // per-pixel radius and are applied at resolve), so phi? += rho(lambda_p) * p?.
 __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, int resY,
                             double alpha, unsigned long long seedBase, long long passIdx) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     long long npix = (long long)resX * resY;
@@ -19512,6 +20131,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                            int* lvCount, double* splat,
                            Real* lamBuf, double* invLamBuf, int resX, int resY, int vcmCap,
                            long long nPaths, unsigned long long seedBase, long long passIdx) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     constexpr int SECN = (NS > 0) ? NS : 1;
     const int C = (NS > 0) ? heroC : 1;
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -19859,6 +20479,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                             double* accum, const Real* lamBuf, const double* invLamBuf,
                             int resX, int resY, long long nLight, unsigned long long seedBase,
                             long long passIdx) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     constexpr int SECN = (NS > 0) ? NS : 1;
     const int C = (NS > 0) ? heroC : 1;
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -20731,6 +21352,7 @@ __global__ static void kPatOpProbe(const PatNode* prog, const PatNodeF* progF,
 // The intersectors are the renderer's own; the record handed to one alone is full of another
 // primitive's values, which every field it owns must overwrite.
 __global__ static void kHitProbe(DScene sc, const DevHitProbeRay* rays, int n, DevHitProbeOut* out) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const DevHitProbeRay& q = rays[i];
@@ -20765,7 +21387,7 @@ __global__ static void kHitProbe(DScene sc, const DevHitProbeRay* rays, int n, D
     const DVec3 sng = dShadedNg(h);
     o.sng[0] = sng.x; o.sng[1] = sng.y; o.sng[2] = sng.z;
     if (h.valid && h.matId >= 0) {
-        const DPatIn in = dPatIn(h);
+        const DPatIn in = dPatIn(sc, h);
         o.q[0] = in.x; o.q[1] = in.y; o.q[2] = in.z;
         o.qn[0] = in.nx; o.qn[1] = in.ny; o.qn[2] = in.nz; o.qcurv = in.curv;
         o.cavity = dCavityOf(sc, h);
@@ -20810,6 +21432,7 @@ template <int MAXD>
 __global__ void __launch_bounds__(128, 4)
 kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
              long long nPaths, unsigned long long seedBase, DJSurfOut out) {
+    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     enum { MAXV = BDPT_MAXV_OF(MAXD) };
     if (maxDepth > MAXD) maxDepth = MAXD;
     const DPatEnv env = dPatEnvOf(sc);
@@ -21436,6 +22059,110 @@ static void bakeSpec(const Spectrum& s, gpu::DSpec& d, DUpload& up) {
     if (id) up.knots.emplace(key, DUpload::Knots{d.kx, d.ky, d.kb, d.kn});
 }
 
+// Motion blur (ROADMAP 11): the scene's motion sets, its primitives' sets and vertex keys, and
+// its movers' segment trees (Scene::bvhMove, each leaf naming global primitives), into
+// up.sc.mo. A still scene uploads nothing (mo.sets stays null, and no query looks at time).
+static void uploadMotion(const Scene& scene, DUpload& up) {
+    using namespace gpu;
+    DMotion& mo = up.sc.mo;
+    mo = DMotion{};
+    if (scene.motionSets.empty() && scene.vertexKeys.empty()) return;
+    auto keep = [&](void* p) { if (p) up.frees.push_back(p); return p; };
+    // A set with no keys never happens, but a deforming scene may have no set at all: one
+    // identity key keeps `sets` non-null, the marker that the scene moves.
+    std::vector<DAff> xf;
+    std::vector<double> T;
+    std::vector<DMotionSet> sets;
+    for (const MotionKeys& mk : scene.motionSets) sets.push_back(DMotionSet{mk.keys, mk.first});
+    for (size_t k = 0; k < scene.motionXf.size(); ++k) {
+        DAff a;
+        for (int i = 0; i < 9; ++i) a.m[i] = scene.motionXf[k].m[i];
+        a.t[0] = scene.motionXf[k].t.x; a.t[1] = scene.motionXf[k].t.y; a.t[2] = scene.motionXf[k].t.z;
+        xf.push_back(a);
+        T.push_back(scene.motionT[k]);
+    }
+    if (sets.empty()) {
+        DAff id{};
+        id.m[0] = id.m[4] = id.m[8] = 1.0;
+        xf.push_back(id); T.push_back(0.0);
+        sets.push_back(DMotionSet{1, 0});
+    }
+    mo.xf = (const DAff*)keep(uploadVec(xf));
+    mo.T = (const double*)keep(uploadVec(T));
+    mo.sets = (const DMotionSet*)keep(uploadVec(sets));
+    mo.nSets = (int)sets.size();
+    // Each kind's sets, and the movers by global number (the BVH's [tris | spheres | implicits |
+    // curve segments | instances]).
+    const size_t nT = scene.tris.size(), nS = scene.spheres.size(), nI = scene.implicits.size(),
+                 nC = scene.curveSegs.size(), nN = scene.instances.size();
+    std::vector<unsigned char> moves(nT + nS + nI + nC + nN, 0);
+    std::vector<int> tm(nT), sm(nS), im(nI), cm(nC), nm(nN);
+    std::vector<int2> vk;
+    if (!scene.vertexKeys.empty()) vk.assign(nT, make_int2(-1, 0));
+    for (size_t i = 0; i < nT; ++i) {
+        const Tri& t = scene.tris[i];
+        tm[i] = t.motion;
+        if (!vk.empty() && t.vkeys >= 0) vk[i] = make_int2(t.vkeys, t.vkeyCount);
+        moves[i] = (t.motion >= 0 || t.vkeys >= 0) ? 1 : 0;
+    }
+    for (size_t i = 0; i < nS; ++i) { sm[i] = scene.spheres[i].motion; moves[nT + i] = sm[i] >= 0; }
+    for (size_t i = 0; i < nI; ++i) { im[i] = scene.implicits[i].motion; moves[nT + nS + i] = im[i] >= 0; }
+    for (size_t i = 0; i < nC; ++i) { cm[i] = scene.curveSegs[i].motion; moves[nT + nS + nI + i] = cm[i] >= 0; }
+    for (size_t i = 0; i < nN; ++i) { nm[i] = scene.instances[i].motion; moves[nT + nS + nI + nC + i] = nm[i] >= 0; }
+    mo.triMotion = tm.empty() ? nullptr : (const int*)keep(uploadVec(tm));
+    mo.sphMotion = sm.empty() ? nullptr : (const int*)keep(uploadVec(sm));
+    mo.impMotion = im.empty() ? nullptr : (const int*)keep(uploadVec(im));
+    mo.curveMotion = cm.empty() ? nullptr : (const int*)keep(uploadVec(cm));
+    mo.instMotion = nm.empty() ? nullptr : (const int*)keep(uploadVec(nm));
+    mo.primMoves = moves.empty() ? nullptr : (const unsigned char*)keep(uploadVec(moves));
+    if (!vk.empty()) {
+        std::vector<DVec3> keys(scene.vertexKeys.size());
+        for (size_t i = 0; i < keys.size(); ++i)
+            keys[i] = {(Real)scene.vertexKeys[i].x, (Real)scene.vertexKeys[i].y, (Real)scene.vertexKeys[i].z};
+        mo.triVkeys = (const int2*)keep(uploadVec(vk));
+        mo.vertexKeys = (const DVec3*)keep(uploadVec(keys));
+    }
+    // The segment trees, concatenated: children by absolute node index, leaves into segPrim.
+    std::vector<int> roots;
+    std::vector<DNode> nodes;
+    std::vector<int> prims;
+    for (size_t k = 0; k < scene.bvhMove.size(); ++k) {
+        const Bvh& b = scene.bvhMove[k];
+        const int nodeOff = (int)nodes.size(), primOff = (int)prims.size();
+        roots.push_back(b.nodes.empty() ? -1 : nodeOff);
+        for (const BvhNode& n : b.nodes) {
+            DNode d;
+            d.lo = {n.box.lo.x, n.box.lo.y, n.box.lo.z};
+            d.hi = {n.box.hi.x, n.box.hi.y, n.box.hi.z};
+            d.count = n.count;
+            d.left = n.count > 0 ? n.left : n.left + nodeOff;
+            d.right = n.count > 0 ? n.right : n.right + nodeOff;
+            d.first = n.count > 0 ? n.first + primOff : n.first;
+            nodes.push_back(d);
+        }
+        for (int lp : b.primIdx) prims.push_back(scene.movePrim[k][(size_t)lp]);
+    }
+    mo.nSeg = (int)roots.size();
+    mo.segRoot = roots.empty() ? nullptr : (const int*)keep(uploadVec(roots));
+    mo.segNodes = nodes.empty() ? nullptr : (const DNode*)keep(uploadVec(nodes));
+    mo.segPrim = prims.empty() ? nullptr : (const int*)keep(uploadVec(prims));
+    mo.motionA = scene.motionA;
+    mo.motionB = scene.motionB;
+    mo.sweptCenter = {(Real)scene.sweptCenter.x, (Real)scene.sweptCenter.y, (Real)scene.sweptCenter.z};
+    mo.sweptRadius = scene.sweptRadius;
+    mo.sweptReach = scene.sweptReach;
+    const Scene::LightTreeTimed& lt = scene.lightTreeTimed;
+    if (lt.built && !lt.nodes.empty()) {
+        mo.ltNodes = (const LightTreeNode*)keep(uploadVec(lt.nodes));
+        mo.ltRoot = lt.root;
+        mo.ltAlways = lt.always.empty() ? nullptr : (const int*)keep(uploadVec(lt.always));
+        mo.nLtAlways = (int)lt.always.size();
+        mo.ltParent = lt.parent.empty() ? nullptr : (const int*)keep(uploadVec(lt.parent));
+        mo.ltLeaf = lt.leaf.empty() ? nullptr : (const int*)keep(uploadVec(lt.leaf));
+        mo.nLtLeaf = (int)lt.leaf.size();
+    }
+}
+
 // Bake the std::function Scene into POD device tables and upload them (camera-
 // independent). Every cudaMalloc'd pointer is recorded in up.frees; call freeUpload(up)
 // when done. The camera is baked separately (bakeCamera) so one baked scene can serve a
@@ -22021,6 +22748,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         bakeSpec(e.spdFn, de.emitSpd, up);       // BDPT: baked emission SPD for Le(lambda)
         { Vec3 le = rgbbake::emitToRgb(e.spdFn); de.rgbEmit = {le.x, le.y, le.z}; }  // fast RGB backward
         de.cieMean = {e.cieMean.x, e.cieMean.y, e.cieMean.z};   // achromatic-path beam fold
+        de.motion = e.motion;
         cdfAll.insert(cdfAll.end(), e.spd.cdf.begin(), e.spd.cdf.end());
         dems.push_back(de);
     }
@@ -22174,6 +22902,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.curveSegs = d_curves; sc.nCurveSegs = (int)curveSegs.size();
     sc.instances = d_inst; sc.nInstances = (int)dinst.size();
     sc.blas = d_blas; sc.blasNodes = d_blasN; sc.blasPrim = d_blasP; sc.blasTris = d_blasT;
+    uploadMotion(scene, up);
     sc.patNodes = d_pnodes; sc.patterns = d_pat; sc.nPatterns = (int)dpat.size();
     sc.recCoeff = d_recCoeff; sc.recDrivers = d_recDrv; sc.recScalarStops = d_recStops;
     sc.emitters = d_ems; sc.nEmitters = (int)dems.size();
@@ -22526,9 +23255,26 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
 // Bake one Camera into a POD DCamera for the given film resolution. Any device memory
 // (the realistic-lens index tables) is recorded in up.frees. Split out of the scene
 // bake so a multi-camera shared pass can bake N cameras against one uploaded scene.
-static gpu::DCamera bakeCamera(const Scene& /*scene*/, const Camera& cam, int resX, int resY, DUpload& up) {
+static gpu::DCamera bakeCamera(const Scene& scene, const Camera& cam, int resX, int resY, DUpload& up) {
     using namespace gpu;
     DCamera dc{};
+    // Motion blur: the shutter, when the camera sees motion (Camera::seesMotion: the scene moves,
+    // or the camera does), and a moving camera's keys, so a path is posed at its own time.
+    dc.blur = cam.seesMotion(scene) ? 1 : 0;
+    dc.shOpen = cam.shutterOpen; dc.shClose = cam.shutterClose;
+    dc.timeSalt = 0x7F4A7C159E3779B9ULL ^ g_rngSalt;   // BackwardRenderer::renderRows' phase stream
+    dc.keys = nullptr; dc.nKeys = 0; dc.keyA = dc.keyB = 0.0;
+    dc.eyeShiftU = cam.eyeShiftU;
+    if (dc.blur && cam.moves()) {
+        std::vector<DCamKey> keys;
+        for (const CameraPose& p : cam.motion->keys)
+            keys.push_back(DCamKey{{(Real)p.eye.x, (Real)p.eye.y, (Real)p.eye.z},
+                                   {(Real)p.look.x, (Real)p.look.y, (Real)p.look.z},
+                                   {(Real)p.up.x, (Real)p.up.y, (Real)p.up.z}, p.fovY});
+        dc.keys = (const DCamKey*)up.keep(uploadVec(keys));
+        dc.nKeys = (int)keys.size();
+        dc.keyA = cam.motion->a; dc.keyB = cam.motion->b;
+    }
     dc.eye = {cam.eye.x, cam.eye.y, cam.eye.z};
     dc.u = {cam.u.x, cam.u.y, cam.u.z};
     dc.v = {cam.v.x, cam.v.y, cam.v.z};
@@ -24465,6 +25211,12 @@ size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
 }
 
 // --------------------- backward reference (mode R) host ----------------------
+
+const char* cudaBlurUnsupported(const Scene& /*scene*/, const Camera& /*cam*/, char mode) {
+    if (mode != 'R' && mode != 'W')
+        return "motion blur in this mode renders on the CPU so far (the device blurs modes R and W)";
+    return nullptr;
+}
 
 bool cudaBackwardSupported(const Scene& scene, const Camera& cam) {
     // GPU mode R renders what the forward path can bake (cudaForwardSupported) with the
