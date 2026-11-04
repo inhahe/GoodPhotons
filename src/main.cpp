@@ -15008,11 +15008,11 @@ static void buildFurFields(const Scene& scene, bool timed) {
 // the device-selection notes name that reason rather than the generic lists.
 static const char* const kObjectSpaceWhy =
     "object-space patterns (pattern_space object) are read on the CPU only so far";
-// Motion blur on the device is modes R, W and D only so far (ROADMAP 11; cudaBlurUnsupported
-// says what else keeps them on the CPU): every other mode's device gate asks Camera::seesMotion,
-// and its note gives this reason.
+// Motion blur on the device is modes R, W, D, A, B and C only so far (ROADMAP 11;
+// cudaBlurUnsupported says what else keeps them on the CPU): every other mode's device gate asks
+// Camera::seesMotion, and its note gives this reason.
 static const char* const kMotionCpuWhy =
-    "motion blur in this mode renders on the CPU so far (the device blurs modes R, W and D)";
+    "motion blur in this mode renders on the CPU so far (the device blurs modes R, W, D, A, B and C)";
 // The spp target a time / noise / forever budget renders against (runSppProgressive): no real
 // total, only a cap that keeps pixel * sppTotal seed indices well inside int64. A renderer that
 // splits its target into parts asks for it, since a share of it is no share of the render.
@@ -15692,10 +15692,29 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
     // brute-force catch (C), and the finite-lens next-event splat (A). Fluorescent
     // scenes fall back to the CPU (the reradiation sampler is not ported). `wavefront`
     // selects the streaming backend over the default megakernel (same physics/energy).
-    // The device renders the instant only, so a camera that sees motion stays here (kMotionCpuWhy).
-    if (useGpu && cam && !cam->seesMotion(scene) && cudaAvailable() && cudaForwardSupported(scene)) {
-        char camMode = lensMode ? 'A' : forwardCatch ? 'C' : 'B';
-        return renderForwardCuda(scene, *cam, resX, resY, N, eOut, diffraction, camMode, seedBase, wavefront, g_heroC);
+    // Under a blur the device times each photon (cudaBlurUnsupported says when it cannot), and
+    // the sky the camera sees directly is drawn here meanwhile, as the CPU threads below draw it
+    // (addBlurredSkyRows; mode C catches the sky's photons instead). Mode P's blurred split
+    // (pSplit) stays on the CPU: its forward pass skips the splats the camera side draws.
+    const char camModeG = lensMode ? 'A' : forwardCatch ? 'C' : 'B';
+    const bool blurG = cam && cam->seesMotion(scene);
+    if (useGpu && cam && (!blurG || (!pSplit && !cudaBlurUnsupported(scene, *cam, camModeG))) &&
+        cudaAvailable() && cudaForwardSupported(scene)) {
+        if (!blurG || forwardCatch)
+            return renderForwardCuda(scene, *cam, resX, resY, N, eOut, diffraction, camModeG, seedBase,
+                                     wavefront, g_heroC);
+        Film sky; sky.resX = resX; sky.resY = resY; sky.alloc();
+        std::vector<std::thread> skyPool;      // disjoint row bands of one film
+        for (int t = 0; t < nThreads; ++t)
+            skyPool.emplace_back([&, t] {
+                addBlurredSkyRows(sky, scene, *cam, N, 1, seedBase, (int)((long long)resY * t / nThreads),
+                                  (int)((long long)resY * (t + 1) / nThreads));
+            });
+        Film out = renderForwardCuda(scene, *cam, resX, resY, N, eOut, diffraction, camModeG, seedBase,
+                                     wavefront, g_heroC);
+        for (auto& th : skyPool) th.join();
+        out.merge(sky);
+        return out;
     }
 #else
     (void)useGpu; (void)wavefront;
@@ -19102,7 +19121,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             else         std::printf("[device] auto -> CPU (no CUDA device found)\n");
         } else if (const char* mwhy = !cam.seesMotion(scene) ? nullptr
                                       : gpuBackwardMode ? cudaBlurUnsupported(scene, cam, g_whitted ? 'W' : 'R')
-                                      : gpuBdptMode ? cudaBlurUnsupported(scene, cam, mode)
+                                      : (gpuBdptMode || gpuForwardMode) ? cudaBlurUnsupported(scene, cam, mode)
                                       : kMotionCpuWhy) {
             if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", mwhy);
             else         std::printf("[device] auto -> CPU (%s)\n", mwhy);

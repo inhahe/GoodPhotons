@@ -10146,9 +10146,10 @@ sees the instant, exactly as a static scene with those transforms would show it.
 - **Where blur is not yet carried, the shutter is closed**, so no estimator mixes times: the
   camera loop in `main.cpp` closes it for every mode `modeSeesMotion` does not name — V
   (which compares B against R) — and the exposure
-  meter asks the same helper. The device renders the instant only, so `runRender`'s device
-  choice, `renderForward`'s own device gate, the shared forward group and the exposure meter
-  keep a blurred camera on the CPU (`kMotionCpuWhy`), and `-radcache` is off under a blur. What cannot move yet stays put and
+  meter asks the same helper. The device blurs some modes (*Motion blur on the device*, below);
+  for the rest `runRender`'s device choice, `renderForward`'s own device gate, the shared
+  forward group and the exposure meter keep a blurred camera on the CPU (`kMotionCpuWhy`,
+  `cudaBlurUnsupported`), and `-radcache` is off under a blur. What cannot move yet stays put and
   says so (`stillWarning`): a sun or sky, an aimed area light, and any light whose keys would
   scale or shear it stay at the instant with their surfaces, so nothing mixes a moved surface
   with an unmoved sampler. A coat whose strands move is traced as strands when some camera
@@ -10181,7 +10182,7 @@ sees the instant, exactly as a static scene with those transforms would show it.
   (`sphereAsMesh_`), as an uneven static scale already tessellates it, so `sphereAt` may take the
   radius from the blended transform's mean column length.
 
-### Motion blur on the device (0.418.0: modes R and W; 0.419.0: mode D)
+### Motion blur on the device (0.418.0: modes R and W; 0.419.0: D; 0.420.0: A, B and C)
 
 - **The path's time** is a slot per thread in shared memory (`s_dMotionU`, `dMotionU`), the
   device twin of the thread-local `g_motionU`, so the ~37 query sites need no argument. Every
@@ -10211,7 +10212,9 @@ sees the instant, exactly as a static scene with those transforms would show it.
   lights uniformly in area, which a rigid motion keeps -- and the sample carried out
   (`dLightCarry`; a spot's point and beam too), in the surface, volume and RGB NEE; a path with a
   time selects lights by the timed tree (`dLightTreeOf`, Scene::lightTreeTimed).
-  `cudaBlurUnsupported` names what keeps a blurred render on the CPU: another mode.
+  `cudaBlurUnsupported` names what keeps a blurred render on the CPU: another mode (so far M,
+  S, U, J and P), or -- in `renderForward` and run's shared group -- a shared forward flight or
+  mode P's blurred split.
 - **Mode D** (0.419.0): `kBdptT` (MERGE false) draws each sample's time off its own stream
   (`dSetPathTime`, the stream `timeSalt ^ BDPT's`) and poses the camera there, which the eye
   subpath, the light subpath's walk and every connection's t = 1 splat take. A moving light's
@@ -10224,6 +10227,29 @@ sees the instant, exactly as a static scene with those transforms would show it.
   one that holds still is read where the launch put it, the kernel's `cam` being
   `__grid_constant__` so its address can be taken without a per-thread copy. Mode J's camera pass
   (MERGE) keeps the instant: its epochs' time is the host's (g_passMotionU), not yet the device's.
+- **Modes A, B and C** (0.420.0): one camera (a blurred shared flight flies on the CPU). Each
+  photon draws its time at birth (`dPhotonTimeX`, the photon's budget index off the launch's
+  seed `^` the host's salt; `dSetPhotonTime` sets it for its queries and, at the birth, poses
+  the thread's moving cameras there): `kTrace` per photon, the wavefront pool per slot
+  (`WFState::timeX`, drawn in `wfSpawn` and set again by `kWfExtend` and `kWfShade`). The birth is renderForward's:
+  a moving light's point, normal and drawn direction carried out (`dLightCarry`,
+  `dLightCarry2`: a spot's direction and axis, a beam's direction), the sky's and the sun's
+  discs widened to the swept sphere with the power scaled by their area (`dLightScale`
+  squared), and a sky or sun photon started where the scene's haze does or dropped
+  (`dSkyEntryPastHaze`, `mayDrop`). A camera that blurs and moves is posed once a photon, into
+  the thread's own copy of the set's cameras (`DCamSet::cam`: `cams` then holds one copy per
+  thread of the launch, `camStride` apart, which `launchForward` allocates; a still render's
+  stride is 0, so its splats read the camera as they always did), and every splat reads it
+  there (the surface, fibre, volume, emission and hero splats, mode C's catch through the
+  pinhole or the lens). Posing at each splat instead, through a reference that might name a
+  local copy, made every splat's camera reads generic and slowed a still mode B render by
+  12 %. The analytic connections meet each glass or mirror
+  sphere where it is (`dSphereNow`) and each mirror plane carried by its members' motion
+  (`dMirrorPlaneNow`), a mixed plane by its parts (`DMotion::mirrorParts`, `mirrorDeformPart`,
+  `mirrorPartBoxes`: a deforming part's plane through its reference face at the time, boxed by
+  its key boxes), each claiming only a hit on its own faces (`dMirrorClaims`). The sky the
+  camera sees directly is drawn on the host while the device traces (`renderForward`: the CPU's
+  `addBlurredSkyRows` over row bands of one film, merged into the device's).
 - **The haze ends at the instant's sphere** (0.419.0), as on the host: a shadow ray to the sun or
   the sky runs to `dExitDistance` (for a path with a time, the swept sphere), but crosses media
   only to `dMediaExitDistance` (Scene::mediaExitDistance) -- in the surface, volume, fibre and

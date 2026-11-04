@@ -744,8 +744,11 @@ sampled at the instant and carried out, with a timed light tree. *The GPU, modes
 and the lights too, each path at its own time; agrees with the CPU block for block. *Mode D on the
 GPU (0.419.0, done):* each sample's subpaths at one time, a moving light's subpath carried out,
 the sun's disc widened to the swept bounds and its walk started at the scene's haze; the device's
-haze now ends at the instant's sphere, as the host's does. Open: lights that scale over the shutter, aimed area
-lights; on the GPU, modes A, B, C, M, S, U, J and P.
+haze now ends at the instant's sphere, as the host's does. *Modes A, B and C on the GPU (0.420.0,
+done):* each photon and its splats at one time, a moving camera posed per splat, moving mirrors
+and glass met where they are (a mixed mirror plane by its parts), the blurred sky drawn on the
+host meanwhile. Open: lights that scale over the shutter, aimed area lights; on the GPU, modes M,
+S, U, J and P, and a blurred shared forward flight.
 
 **Stage C, motion vectors and depth (0.411.0, done):** `-write-aovs` writes the guide pass's
 albedo and normal and, from one ray through each pixel's centre at the frame's instant, depth,

@@ -694,6 +694,7 @@ struct DNode   { DVec3 lo, hi; int left, right, first, count; };
 // An affine (Affine's twin: world = m*p + t, row-major) and a motion set's keys.
 struct DAff { double m[9], t[3]; };
 struct DMotionSet { int keys, first; };   // Scene::MotionKeys: `keys` affines from motionXf[first]
+struct DMirrorPlane;
 // Everything a timed query reads. `sets` null: the scene holds still, and nothing here is read.
 // The per-kind motion arrays name each primitive's set (-1: still); `triVkeys` a deforming
 // triangle's (offset into vertexKeys, key count), null when nothing deforms. `primMoves` marks
@@ -716,6 +717,11 @@ struct DMotion {
     const LightTreeNode* ltNodes; int ltRoot;
     const int* ltAlways; int nLtAlways;
     const int* ltParent; const int* ltLeaf; int nLtLeaf;
+    // The mixed mirror planes' parts, which a path with a time uses in their place
+    // (Scene::mirrorPlaneParts), each deforming mirror face's part (mirrorDeformPart: null
+    // without one) and the parts' boxes at each key (mirrorPartBoxes: lo then hi, 6 doubles).
+    const DMirrorPlane* mirrorParts; int nMirrorParts;
+    const int* mirrorDeformPart; const double* mirrorPartBoxes;
 };
 
 // One flat mirror SURFACE (device twin of Scene::MirrorPlane), i.e. the set of coplanar
@@ -728,6 +734,10 @@ struct DMirrorPlane {
     double d;               // plane equation: dot(n, x) == d
     double lox, loy, loz;   // AABB of the member faces — a cheap reject before the
     double hix, hiy, hiz;   // closestHit that confirms the mirror really is there
+    // Motion (Scene::MirrorPlane's): the members' shared motion set (-1: still); `mixed`, whose
+    // parts serve a path with a time; and for a part, its deforming reference face, its id in
+    // mirrorDeformPart and its first key box in mirrorPartBoxes.
+    int motionSet, mixed, part, deformTri, partId, keyBoxes;
 };
 
 // Two-level BVH for instancing (device twin of scene.h Blas / MeshInstance). A DBlas
@@ -4750,6 +4760,21 @@ __device__ static inline void dLightCarry(const DScene& sc, const DEmitter& em, 
         p = r.p; d = r.d;
     }
 }
+// The same with a second direction (a photon's: its emission direction and the light's axis).
+struct DPointDir2 { DVec3 p, d1, d2; };
+__device__ __noinline__ static DPointDir2 dLightCarry2Out(const DScene& sc, int set, DVec3 p, DVec3 d1,
+                                                         DVec3 d2) {
+    DAff D;
+    dMotionAt(sc.mo, set, (double)dMotionU(), D);
+    return DPointDir2{affPoint(D.m, D.t, p), normalize(affDir(D.m, d1)), normalize(affDir(D.m, d2))};
+}
+__device__ static inline void dLightCarry2(const DScene& sc, const DEmitter& em, DVec3& p, DVec3& d1,
+                                           DVec3& d2) {
+    if (em.motion >= 0 && dTimed(sc)) {
+        const DPointDir2 r = dLightCarry2Out(sc, em.motion, p, d1, d2);
+        p = r.p; d1 = r.d1; d2 = r.d2;
+    }
+}
 // Tri::finalize's twin: the face normal, reach, tangent frame and curvature of a triangle
 // rebuilt at a time (its corner normals falling back to the face's where zero).
 __device__ static void dFinalizeTri(DTri& t) {
@@ -7146,10 +7171,25 @@ struct DAimMap {
 };
 
 struct DCamSet {
-    const DCamera* cams;      // nCam cameras
+    // The nCam cameras -- or, under a blur with a camera that moves, each thread's nCam cameras
+    // posed at its photon's time (camStride == nCam: thread t's are cams[t * nCam ..]). Read them
+    // through cam(c), which a still render resolves to cams[c].
+    const DCamera* cams;
     double* const* films;     // nCam film buffers  (XYZ*3 doubles each)
     double* const* hits;      // nCam per-pixel hit-count buffers
     int nCam;
+    // Motion blur (dPhotonTimeX / dSetPhotonTime): whether each photon takes a time, in the one
+    // shutter every camera of a blurred set shares; and for a camera that moves, the per-thread
+    // stride above, the cameras as baked (baseCams) and where each thread poses its own (poseOut,
+    // the same buffer as cams).
+    int blur = 0;
+    double shOpen = 0.0, shClose = 0.0;
+    int camStride = 0;
+    const DCamera* baseCams = nullptr;
+    DCamera* poseOut = nullptr;
+    __device__ const DCamera& cam(int c) const {
+        return cams[(size_t)camStride * (blockIdx.x * blockDim.x + threadIdx.x) + c];
+    }
     // Photon-map deposit (mode M forward pass). When depCount != nullptr the forward
     // tracer appends a photon record at every diffuse / diffuse-transmit vertex (device
     // twin of Renderer::depositPhoton) instead of / in addition to splatting: the pass
@@ -7206,6 +7246,39 @@ struct DCamSet {
         return beamOrderMax == 0 || (nDone + 2) <= beamOrderMax;
     }
 };
+
+// Motion blur in the forward modes (host twin renderForward): each photon, and every splat it
+// makes, at one time in the shutter, drawn off a stream of its own keyed by the photon's unit, so
+// its transport stream draws what it drew without blur. The set's cameras share one shutter (a
+// blurred forward render on the device has one camera). dPhotonTimeX is the photon's shutter
+// fraction, or -1 when its cameras see no motion; dSetPhotonTime sets it for the photon's queries
+// and, with `pose`, poses this thread's moving cameras there (DCamSet::cam) -- at the photon's
+// birth; a later stage of the same photon finds them posed.
+__device__ static inline float dPhotonTimeX(const DCamSet& cs, unsigned long long unit,
+                                            unsigned long long seed) {
+    if (!cs.blur) return -1.0f;
+    DRng tr;
+    tr.seedUnit(unit, seed ^ 0x3C6EF372FE94F82BULL);
+    return (float)tr.uniform();
+}
+__device__ __noinline__ static void dPosePhotonCameras(const DCamSet& cs, double frames) {
+    DCamera* mine = cs.poseOut + (size_t)cs.camStride * (blockIdx.x * blockDim.x + threadIdx.x);
+    for (int c = 0; c < cs.nCam; ++c) {
+        const DCamera& b = cs.baseCams[c];
+        if (b.blur && b.nKeys > 0) dPoseCamera(b, frames, mine[c]);
+        else mine[c] = b;
+    }
+}
+__device__ static inline void dSetPhotonTime(const DScene& sc, const DCamSet& cs, float x, bool pose) {
+    if (x < 0.0f) return;
+    const double frames = cs.shOpen + (cs.shClose - cs.shOpen) * (double)x;
+    if (sc.mo.sets) {                                  // dSetPathTime's, from the set's shutter
+        double u = (frames - sc.mo.motionA) / (sc.mo.motionB - sc.mo.motionA);
+        u = u < 0.0 ? 0.0 : (u > 1.0 ? 1.0 : u);
+        dSetMotionU((float)u);
+    }
+    if (pose && cs.camStride > 0) dPosePhotonCameras(cs, frames);
+}
 
 // Gather-tuned photon record: what the mode-M density-estimate kernel actually reads.
 // The deposit-side DPhoton carries (pos, n, power, lambda); the gather used to weight
@@ -8746,11 +8819,12 @@ __device__ static void splatSurfaceAll(const DScene& sc, const DCamSet& cs, int 
                                         const DVec3* plane = nullptr,
                                         const DGlossySplat* gs = nullptr) {   // see connect
     for (int c = 0; c < cs.nCam; ++c) {
-        if (camMode == CAM_B && !cs.cams[c].hasLens) {
-            if (plane && ddot(*plane, cs.cams[c].eye - p) <= (Real)0) continue;
-            connect(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng, gs);
-        } else if (dLensCam(camMode, cs.cams[c])) {
-            connectLens(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng,
+        const DCamera& cc = cs.cam(c);
+        if (camMode == CAM_B && !cc.hasLens) {
+            if (plane && ddot(*plane, cc.eye - p) <= (Real)0) continue;
+            connect(sc, cc, cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng, gs);
+        } else if (dLensCam(camMode, cc)) {
+            connectLens(sc, cc, cs.films[c], cs.hits[c], p, n, ng, wi, lambda, beta, rho, rng,
                         plane, gs);
         }
     }
@@ -8762,8 +8836,9 @@ __device__ static void splatSurfaceAllHair(const DScene& sc, const DCamSet& cs, 
                                            const DVec3& p, const DVec3& n, const DHairShade& hs,
                                            Real lambda, Real beta, DRng& rng) {
     for (int c = 0; c < cs.nCam; ++c) {
-        if (camMode == CAM_B && !cs.cams[c].hasLens) connectHair(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, hs, lambda, beta, rng);
-        else if (dLensCam(camMode, cs.cams[c])) connectLensHair(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, hs, lambda, beta, rng);
+        const DCamera& cc = cs.cam(c);
+        if (camMode == CAM_B && !cc.hasLens) connectHair(sc, cc, cs.films[c], cs.hits[c], p, n, hs, lambda, beta, rng);
+        else if (dLensCam(camMode, cc)) connectLensHair(sc, cc, cs.films[c], cs.hits[c], p, n, hs, lambda, beta, rng);
     }
 }
 // Append a photon record at a diffuse / translucent vertex (device twin of
@@ -8908,8 +8983,9 @@ __device__ static void splatVolumeAll(const DScene& sc, const DMedium& med, cons
                                        int camMode, const DVec3& p, const DVec3& wIn, Real lambda,
                                        Real beta, DRng& rng) {
     for (int c = 0; c < cs.nCam; ++c) {
-        if (camMode == CAM_B && !cs.cams[c].hasLens) connectVolume(sc, med, cs.cams[c], cs.films[c], cs.hits[c], p, wIn, lambda, beta, rng);
-        else if (dLensCam(camMode, cs.cams[c])) connectLensVolume(sc, med, cs.cams[c], cs.films[c], cs.hits[c], p, wIn, lambda, beta, rng);
+        const DCamera& cc = cs.cam(c);
+        if (camMode == CAM_B && !cc.hasLens) connectVolume(sc, med, cc, cs.films[c], cs.hits[c], p, wIn, lambda, beta, rng);
+        else if (dLensCam(camMode, cc)) connectLensVolume(sc, med, cc, cs.films[c], cs.hits[c], p, wIn, lambda, beta, rng);
     }
 }
 
@@ -8962,8 +9038,9 @@ __device__ static void connectEmissionLensVolume(const DScene& sc, const DCamera
 __device__ static void camSplatEmissionAll(const DScene& sc, const DCamSet& cs, int camMode,
                                             const DVec3& p, Real lambda, Real beta, DRng& rng) {
     for (int c = 0; c < cs.nCam; ++c) {
-        if (camMode == CAM_B && !cs.cams[c].hasLens) connectEmissionVolume(sc, cs.cams[c], cs.films[c], cs.hits[c], p, lambda, beta, rng);
-        else if (dLensCam(camMode, cs.cams[c])) connectEmissionLensVolume(sc, cs.cams[c], cs.films[c], cs.hits[c], p, lambda, beta, rng);
+        const DCamera& cc = cs.cam(c);
+        if (camMode == CAM_B && !cc.hasLens) connectEmissionVolume(sc, cc, cs.films[c], cs.hits[c], p, lambda, beta, rng);
+        else if (dLensCam(camMode, cc)) connectEmissionLensVolume(sc, cc, cs.films[c], cs.hits[c], p, lambda, beta, rng);
     }
 }
 
@@ -9435,6 +9512,106 @@ __device__ static bool dReflectOffSphere(const D3& o, const D3& d, const DSphere
     return true;
 }
 
+// A specular sphere as a path at its own time sees it (host twin Scene::sphereNow): sphere `k`
+// itself, or `tmp` filled with it moved by its keys -- the centre carried, the radius by the
+// motion's mean scale, as dIntersectOtherNow moves it.
+__device__ static const DSphere& dSphereNow(const DScene& sc, int k, DSphere& tmp) {
+    const DSphere& s0 = sc.sph[k];
+    if (!sc.mo.sphMotion || sc.mo.sphMotion[k] < 0 || !dTimed(sc)) return s0;
+    DAff D;
+    dMotionAt(sc.mo, sc.mo.sphMotion[k], (double)dMotionU(), D);
+    tmp = s0;
+    tmp.c = affPoint(D.m, D.t, s0.c);
+    tmp.r = s0.r * dAffScale(D);
+    return tmp;
+}
+// A mirror plane as a path at its own time sees it (host twin Scene::mirrorPlaneNow): `mp` itself,
+// or `tmp` filled with it carried by its members' motion -- or null for a mixed plane (its parts
+// serve), a part at the instant, or a deforming face collapsed at that time.
+__device__ __noinline__ static const DMirrorPlane* dMirrorPlaneNow(const DScene& sc, const DMirrorPlane& mp,
+                                                                 DMirrorPlane& tmp) {
+    if (!dTimed(sc)) return mp.part ? nullptr : &mp;
+    if (mp.mixed) return nullptr;
+    if (mp.deformTri >= 0) {
+        // The plane through its reference face at the path's time; the box, the members' at the
+        // two keys about it (each vertex moves between its keys' places), carried by the face's
+        // motion when it rides a moving group.
+        const double u = (double)dMotionU();
+        DVec3 c[3];
+        DMotionNow mc;
+        dDeformedCorners(sc, mp.deformTri, u, c, nullptr, &mc);
+        const D3 a(c[0]), e1 = D3(c[1]) - a, e2 = D3(c[2]) - a;
+        const D3 f{e1.y * e2.z - e1.z * e2.y, e1.z * e2.x - e1.x * e2.z, e1.x * e2.y - e1.y * e2.x};
+        const double l = d3len(f);
+        if (!(l > 0.0)) return nullptr;
+        tmp = mp;
+        tmp.nx = f.x / l; tmp.ny = f.y / l; tmp.nz = f.z / l;
+        tmp.d = tmp.nx * a.x + tmp.ny * a.y + tmp.nz * a.z;
+        const int2 vk = sc.mo.triVkeys[mp.deformTri];
+        const double sk = (u < 0.0 ? 0.0 : (u > 1.0 ? 1.0 : u)) * (vk.y - 1);   // motionBracket
+        int i = (int)sk;
+        if (i > vk.y - 2) i = vk.y - 2;
+        if (i < 0) i = 0;
+        const double* b0 = sc.mo.mirrorPartBoxes + 6 * (mp.keyBoxes + i);
+        const double* b1 = b0 + 6;
+        double lo[3], hi[3];
+        for (int j = 0; j < 3; ++j) { lo[j] = fmin(b0[j], b1[j]); hi[j] = fmax(b0[3 + j], b1[3 + j]); }
+        const int set = sc.mo.triMotion ? sc.mo.triMotion[mp.deformTri] : -1;
+        if (set >= 0) {                  // in a moving group: the box carried by its motion now
+            const DAff& D = mc.at(sc, set);
+            double nlo[3] = {1e300, 1e300, 1e300}, nhi[3] = {-1e300, -1e300, -1e300};
+            for (int k = 0; k < 8; ++k) {
+                const double x = (k & 1) ? hi[0] : lo[0], y = (k & 2) ? hi[1] : lo[1], z = (k & 4) ? hi[2] : lo[2];
+                for (int j = 0; j < 3; ++j) {
+                    const double v = D.m[3 * j] * x + D.m[3 * j + 1] * y + D.m[3 * j + 2] * z + D.t[j];
+                    nlo[j] = fmin(nlo[j], v); nhi[j] = fmax(nhi[j], v);
+                }
+            }
+            for (int j = 0; j < 3; ++j) { lo[j] = nlo[j]; hi[j] = nhi[j]; }
+        }
+        const double ex = hi[0] - lo[0], ey = hi[1] - lo[1], ez = hi[2] - lo[2];
+        const double pad = 1e-6 * (1.0 + sqrt(ex * ex + ey * ey + ez * ez));
+        tmp.lox = lo[0] - pad; tmp.loy = lo[1] - pad; tmp.loz = lo[2] - pad;
+        tmp.hix = hi[0] + pad; tmp.hiy = hi[1] + pad; tmp.hiz = hi[2] + pad;
+        return &tmp;
+    }
+    if (mp.motionSet < 0) return &mp;
+    DAff D, Di;
+    dMotionAt(sc.mo, mp.motionSet, (double)dMotionU(), D);
+    dAffInverse(D, Di);
+    // The normal by the inverse transpose; the plane through the carried foot of the normal.
+    double nx = Di.m[0] * mp.nx + Di.m[3] * mp.ny + Di.m[6] * mp.nz;
+    double ny = Di.m[1] * mp.nx + Di.m[4] * mp.ny + Di.m[7] * mp.nz;
+    double nz = Di.m[2] * mp.nx + Di.m[5] * mp.ny + Di.m[8] * mp.nz;
+    const double nl = sqrt(nx * nx + ny * ny + nz * nz);
+    nx /= nl; ny /= nl; nz /= nl;
+    const double fx = mp.nx * mp.d, fy = mp.ny * mp.d, fz = mp.nz * mp.d;
+    const double px = D.m[0] * fx + D.m[1] * fy + D.m[2] * fz + D.t[0];
+    const double py = D.m[3] * fx + D.m[4] * fy + D.m[5] * fz + D.t[1];
+    const double pz = D.m[6] * fx + D.m[7] * fy + D.m[8] * fz + D.t[2];
+    tmp = mp;
+    tmp.nx = nx; tmp.ny = ny; tmp.nz = nz;
+    tmp.d = nx * px + ny * py + nz * pz;
+    double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+    for (int k = 0; k < 8; ++k) {                   // the box carried (expandCarried)
+        const double x = (k & 1) ? mp.hix : mp.lox, y = (k & 2) ? mp.hiy : mp.loy, z = (k & 4) ? mp.hiz : mp.loz;
+        for (int j = 0; j < 3; ++j) {
+            const double v = D.m[3 * j] * x + D.m[3 * j + 1] * y + D.m[3 * j + 2] * z + D.t[j];
+            lo[j] = fmin(lo[j], v); hi[j] = fmax(hi[j], v);
+        }
+    }
+    tmp.lox = lo[0]; tmp.loy = lo[1]; tmp.loz = lo[2];
+    tmp.hix = hi[0]; tmp.hiy = hi[1]; tmp.hiz = hi[2];
+    return &tmp;
+}
+// Whether the eye-side hit `h` of a connection through `mp` is on `mp`'s own faces (host twin
+// Scene::mirrorClaims): a part's plane can coincide with another part's.
+__device__ static bool dMirrorClaims(const DScene& sc, const DMirrorPlane& mp, const DHit& h) {
+    if (!mp.part) return true;
+    if (mp.deformTri >= 0)
+        return h.deformTri >= 0 && sc.mo.mirrorDeformPart && sc.mo.mirrorDeformPart[h.deformTri] == mp.partId;
+    return h.deformTri < 0 && h.motionSet == mp.motionSet;
+}
 // Is the surface the eye actually sees along the connection's eye-side leg the mirror we
 // solved the geometry for? One traversal settles BOTH questions the connection needs —
 // "is there really mirror material at that spot" (containment inside the authored panel,
@@ -9518,7 +9695,8 @@ __device__ static void dConnectSpecularPlane(const DScene& sc, const DCamera& ca
     // pass and neither draws RNG, so the order is unobservable.
     if (occludedTo(sc, dOffsetAlong(p.toR(), wP.toR(), wP.toR()), p.toR() + wP.toR() * dP, 2e-6)) return;
     DHit hm;
-    if (!dMirrorSeenAt(sc, eye, D3(0,0,0) - wRE, dE, hm)) return;
+    // ...and the hit must be on this plane's own faces: a part's plane can coincide with another's.
+    if (!dMirrorSeenAt(sc, eye, D3(0,0,0) - wRE, dE, hm) || !dMirrorClaims(sc, mp, hm)) return;
 
     dSplatMirrorLegs(sc, cam, film, hits, sc.mats[hm.matId], hm, px, py, omega,
                      p, wP, dP, R, wRE, dE, D, shape, lam, beta, w, nUp, rng);
@@ -9678,29 +9856,41 @@ __device__ static void camSpecularSplatAllVtxN(const DScene& sc, const DCamSet& 
         for (int i = 0; i < nUp; ++i) {
             DSpecVtx vi = vt; vi.weight = (double)w[i]; vi.lambda = lam[i];
             for (int k = 0; k < sc.nDielSph; ++k) {
-                const DSphere& S = sc.sph[sc.dielSph[k]];
+                DSphere moved;                         // the sphere, and the camera, at the path's time
+                const DSphere& S = dSphereNow(sc, sc.dielSph[k], moved);
                 const DMaterial& gm = sc.mats[S.matId];
                 double ng = (double)specLookup(gm.ior, lam[i]);
                 for (int c = 0; c < cs.nCam; ++c)
-                    if (!cs.cams[c].hasLens)   // a physical lens has no pinhole to aim at
-                        dConnectSpecularSphere(sc, cs.cams[c], cs.films[c], cs.hits[c], S, gm, ng,
-                                           pd, vi, lam[i], (double)beta[i], rng);
+                    if (!cs.cam(c).hasLens)   // a physical lens has no pinhole to aim at
+                        dConnectSpecularSphere(sc, cs.cam(c), cs.films[c], cs.hits[c], S, gm, ng,
+                                               pd, vi, lam[i], (double)beta[i], rng);
             }
         }
     }
     // Mirrors. Achromatic geometry, so one solve serves the whole hero bundle.
     for (int k = 0; k < sc.nMirrorSph; ++k) {
-        const DSphere& S = sc.sph[sc.mirrorSph[k]];
+        DSphere moved;
+        const DSphere& S = dSphereNow(sc, sc.mirrorSph[k], moved);
         for (int c = 0; c < cs.nCam; ++c)
-            if (!cs.cams[c].hasLens)   // a physical lens has no pinhole to aim at
-                dConnectSpecularSphereMirror(sc, cs.cams[c], cs.films[c], cs.hits[c], S,
-                                         pd, vt, lam, beta, w, nUp, rng);
+            if (!cs.cam(c).hasLens)   // a physical lens has no pinhole to aim at
+                dConnectSpecularSphereMirror(sc, cs.cam(c), cs.films[c], cs.hits[c], S,
+                                             pd, vt, lam, beta, w, nUp, rng);
     }
-    for (int mi = 0; mi < sc.nMirrorPlanes; ++mi)
-        for (int c = 0; c < cs.nCam; ++c)
-            if (!cs.cams[c].hasLens)   // a physical lens has no pinhole to aim at
-                dConnectSpecularPlane(sc, cs.cams[c], cs.films[c], cs.hits[c],
-                                  sc.mirrorPlanes[mi], pd, vt, lam, beta, w, nUp, rng);
+    // The planes, at the path's time; one whose faces move differently or deform (mixed) by
+    // its parts, each moving as one (host twin camSpecularSplatAllVtxN).
+    for (int list = 0; list < 2; ++list) {
+        const DMirrorPlane* planes = list == 0 ? sc.mirrorPlanes : sc.mo.mirrorParts;
+        const int nPlanes = list == 0 ? sc.nMirrorPlanes : (dTimed(sc) ? sc.mo.nMirrorParts : 0);
+        for (int mi = 0; mi < nPlanes; ++mi) {
+            DMirrorPlane movedP;
+            const DMirrorPlane* mp = sc.mo.sets ? dMirrorPlaneNow(sc, planes[mi], movedP) : &planes[mi];
+            if (!mp) continue;                      // a mixed plane: its parts serve
+            for (int c = 0; c < cs.nCam; ++c)
+                if (!cs.cam(c).hasLens)   // a physical lens has no pinhole to aim at
+                    dConnectSpecularPlane(sc, cs.cam(c), cs.films[c], cs.hits[c],
+                                          *mp, pd, vt, lam, beta, w, nUp, rng);
+        }
+    }
 }
 __device__ static void camSpecularSplatAllVtx(const DScene& sc, const DCamSet& cs, int camMode,
                                               const D3& pd, const DSpecVtx& vt, Real lambda,
@@ -11094,6 +11284,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         DVec3 t, b; onb(em.beamDir, t, b);
         dir = t * (Real)(st * cos(phi)) + b * (Real)(st * sin(phi)) + em.beamDir * (Real)ct;
         emitN = em.beamDir;
+        dLightCarry2(sc, em, origin, dir, emitN);   // a moving spot, at the photon's time
         double omegaOuter = 2.0 * 3.14159265358979323846 * (1.0 - em.spotCosOuter);
         spotW = (Real)(spotFalloff(ct, em.spotCosInner, em.spotCosOuter) * omegaOuter / em.spotOmega);
     } else if (em.shape == 3) {
@@ -11115,11 +11306,15 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
             double phi = 2.0 * 3.14159265358979323846 * (double)u2;
             dir = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
         }
+        // A photon with a time in a moving scene enters through a disc wide enough for the
+        // movers' sweep, its power scaled by the disc's area (dLightRadius; host twin render.h).
+        const double R = dLightRadius(sc);
+        spotW = (Real)(dLightScale(sc) * dLightScale(sc));
         DVec3 t, b; onb(dir, t, b);
-        double rdd = sc.sceneRadius * sqrt((double)rng.uniform());
+        double rdd = R * sqrt((double)rng.uniform());
         double pd = 2.0 * 3.14159265358979323846 * (double)rng.uniform();
         DVec3 disk = t * (Real)(rdd * cos(pd)) + b * (Real)(rdd * sin(pd));
-        origin = sc.sceneCenter - dir * (Real)sc.sceneRadius + disk;
+        origin = sc.sceneCenter - dir * (Real)R + disk;
         emitN = dir;
     } else if (em.shape == 6) {
         // Distant directional sun (device twin of render.h). Sample the travel direction
@@ -11129,22 +11324,29 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         // than one in ~10^5. The joint pdf 1/(Omega*pi*R^2) is exactly 1/envGeom, so
         // beta = emitIntegral*envGeom is analog with no reweight.
         dir = dSunSampleCone(em, em.beamDir, (double)u1, (double)u2);
+        const double R = dLightRadius(sc);                    // as the env's, above
+        spotW = (Real)(dLightScale(sc) * dLightScale(sc));
         DVec3 t, b; onb(dir, t, b);
-        double rdd = sc.sceneRadius * sqrt((double)rng.uniform());
+        double rdd = R * sqrt((double)rng.uniform());
         double pd = 2.0 * 3.14159265358979323846 * (double)rng.uniform();
-        origin = sc.sceneCenter - dir * (Real)sc.sceneRadius
+        origin = sc.sceneCenter - dir * (Real)R
                + t * (Real)(rdd * cos(pd)) + b * (Real)(rdd * sin(pd));
         emitN = dir;
     } else {
         // quad: constant normal; sphere: surface point. Also returns this point's
-        // `emit pattern:` factor — 1.0 (and a bit-identical draw) when unpatterned.
+        // `emit pattern:` factor — 1.0 (and a bit-identical draw) when unpatterned. A moving
+        // light's point and normal (and a beam's direction) are carried to the photon's time
+        // before its direction is drawn about them; an aimed one never moves.
         emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, origin, emitN);
-        if (em.collimated) dir = em.beamDir;
-        else if (em.normalTilted) {                // an aimed quad: intensity-proportional
-            double pdfAim = 0.0;
-            dir = dSampleAimDir(em, rng, pdfAim);
-            if (!(pdfAim > 0.0)) return false;
-        } else dir = cosineHemisphere(emitN, rng);
+        if (em.collimated) { dir = em.beamDir; dLightCarry2(sc, em, origin, emitN, dir); }
+        else {
+            dLightCarry(sc, em, origin, emitN);
+            if (em.normalTilted) {                 // an aimed quad: intensity-proportional
+                double pdfAim = 0.0;
+                dir = dSampleAimDir(em, rng, pdfAim);
+                if (!(pdfAim > 0.0)) return false;
+            } else dir = cosineHemisphere(emitN, rng);
+        }
     }
     // Aimed caustic emission (causticaim.h). Placed here, after the shape branch has produced
     // an ordinary sample and BEFORE `beta *= spotW`, because the aimed pass resamples the
@@ -11156,6 +11358,8 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         if (!dApplyCausticAim(sc, cs, &em, origin, dir, emitN, spotW, rng, wv)) return false;
         if (causticW) *causticW = wv;
     }
+    if ((em.shape == 3 || em.shape == 6) && !dSkyEntryPastHaze(sc, origin, dir, true))
+        return false;                                // a blur's wider disc (host twin render.h)
     Real pdfL = 0;
     // The variate is drawn explicitly rather than inside sampleLambda so the spectral bundle
     // below can stratify from the SAME u (hero sampling, hero.h). Bit-identical: sampleLambda
@@ -11573,7 +11777,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         int px, py;
         // Model C never shares a trace (it consumes the photon), so nCam==1 here. A physical
         // lens catches what enters its front element and reaches the sensor (dLensCatch).
-        const DCamera& cc = cs.cams[0];
+        const DCamera& cc = cs.cam(0);
         const int lc = cc.hasLens ? dLensCatch(cc, ro, rd, dEvent, lambda, px, py) : DLENS_MISSED;
         if (lc == DLENS_ABSORBED) { eAbsorbed += beta; return WF_TERMINATE; }
         if (cc.hasLens ? lc == DLENS_CAUGHT : cc.catchPhoton(ro, rd, dEvent, px, py)) {
@@ -11581,14 +11785,14 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
             // on the SAME absolute scale as A/B (per-camera constant; auto-exposed
             // scenes unaffected).
             Real cCell = cc.hasLens ? (Real)dLensCellNorm(cc)
-                                    : (Real)1 / (Real)(cs.cams[0].pixelPlaneArea() * cs.cams[0].filmDist * cs.cams[0].filmDist);
+                                    : (Real)1 / (Real)(cc.pixelPlaneArea() * cc.filmDist * cc.filmDist);
             // an env photon's first flight is the env SEEN: bilinear (PV_BIT_ENVFIRST)
             Real seen = (Real)1;
             if (pathC && (pathC->bits & PV_BIT_ENVFIRST)) {
                 const double Ln = dEnvRadiance(sc.env, -rd, lambda);
                 seen = (Ln > 0.0) ? (Real)(dEnvRadianceSeen(sc.env, -rd, lambda) / Ln) : (Real)0;
             }
-            filmAdd(cs.films[0], cs.hits[0], cs.cams[0].resX, px, py, lambda, beta * seen * cCell);
+            filmAdd(cs.films[0], cs.hits[0], cc.resX, px, py, lambda, beta * seen * cCell);
             eSensor += beta * seen; return WF_TERMINATE;
         }
     }
@@ -11653,11 +11857,13 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
             DVec3 xc = ro + rd * tC;
             Real betaC = (aC > 0) ? betaPre * exp(-aC * tC) : betaPre;
             const DMedium& smc = sc.media[whichC];
-            if (dLensCam(camMode, cs.cams[c])) connectLensVolume(sc, smc, cs.cams[c], cs.films[c], cs.hits[c], xc, rd, lambda, betaC, *crng);
-            else                  connectVolume(sc, smc, cs.cams[c], cs.films[c], cs.hits[c], xc, rd, lambda, betaC, *crng);
+            const DCamera& cc = cs.cam(c);
+            if (dLensCam(camMode, cc)) connectLensVolume(sc, smc, cc, cs.films[c], cs.hits[c], xc, rd, lambda, betaC, *crng);
+            else                  connectVolume(sc, smc, cc, cs.films[c], cs.hits[c], xc, rd, lambda, betaC, *crng);
             // Per-camera specular volume splat (fog seen through a smooth sphere caustic):
             // a 1-camera slice of the set so the "All" helper targets only camera c.
-            DCamSet cs1 = cs; cs1.nCam = 1; cs1.cams = &cs.cams[c]; cs1.films = &cs.films[c]; cs1.hits = &cs.hits[c];
+            DCamSet cs1 = cs; cs1.nCam = 1; cs1.cams = &cc; cs1.camStride = 0;
+            cs1.films = &cs.films[c]; cs1.hits = &cs.hits[c];
             camSpecularSplatVolumeAll(sc, smc, cs1, camMode, xc, rd, lambda, betaC, *crng);
         }
         // Mode M: store the crossing itself, so every camera of a flyby can gather from it
@@ -11904,12 +12110,13 @@ __device__ static void splatSurfaceAllHero(const DScene& sc, const DCamSet& cs, 
         const DVec3* plane = nullptr,
         const DGlossySplat* gs = nullptr) {                               // see splatSurfaceAll
     for (int c = 0; c < cs.nCam; ++c) {
-        if (camMode == CAM_B && !cs.cams[c].hasLens) {
-            if (plane && ddot(*plane, cs.cams[c].eye - p) <= (Real)0) continue;
-            connectHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp, rng,
+        const DCamera& cc = cs.cam(c);
+        if (camMode == CAM_B && !cc.hasLens) {
+            if (plane && ddot(*plane, cc.eye - p) <= (Real)0) continue;
+            connectHero(sc, cc, cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp, rng,
                         gs);
-        } else if (dLensCam(camMode, cs.cams[c])) {
-            connectLensHero(sc, cs.cams[c], cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp,
+        } else if (dLensCam(camMode, cc)) {
+            connectLensHero(sc, cc, cs.films[c], cs.hits[c], p, n, ng, wi, lam, beta, rho, nUp,
                             rng, plane, gs);
         }
     }
@@ -11961,6 +12168,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
         DVec3 t, b; onb(em.beamDir, t, b);
         dir = t * (Real)(st * cos(phi)) + b * (Real)(st * sin(phi)) + em.beamDir * (Real)ct;
         emitN = em.beamDir;
+        dLightCarry2(sc, em, origin, dir, emitN);   // a moving spot, at the photon's time
         double omegaOuter = 2.0 * 3.14159265358979323846 * (1.0 - em.spotCosOuter);
         spotW = (Real)(spotFalloff(ct, em.spotCosInner, em.spotCosOuter) * omegaOuter / em.spotOmega);
     } else if (em.shape == 3) {
@@ -11974,28 +12182,35 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
             double phi = 2.0 * 3.14159265358979323846 * (double)u2;
             dir = DVec3{(Real)(sr * cos(phi)), (Real)(sr * sin(phi)), (Real)z};
         }
+        const double R = dLightRadius(sc);            // a blur's swept disc -- see genPhoton
+        spotW = (Real)(dLightScale(sc) * dLightScale(sc));
         DVec3 t, b; onb(dir, t, b);
-        double rdd = sc.sceneRadius * sqrt((double)rng.uniform());
+        double rdd = R * sqrt((double)rng.uniform());
         double pd = 2.0 * 3.14159265358979323846 * (double)rng.uniform();
         DVec3 disk = t * (Real)(rdd * cos(pd)) + b * (Real)(rdd * sin(pd));
-        origin = sc.sceneCenter - dir * (Real)sc.sceneRadius + disk;
+        origin = sc.sceneCenter - dir * (Real)R + disk;
         emitN = dir;
     } else if (em.shape == 6) {                       // distant sun — see genPhoton
         dir = dSunSampleCone(em, em.beamDir, (double)u1, (double)u2);
+        const double R = dLightRadius(sc);
+        spotW = (Real)(dLightScale(sc) * dLightScale(sc));
         DVec3 t, b; onb(dir, t, b);
-        double rdd = sc.sceneRadius * sqrt((double)rng.uniform());
+        double rdd = R * sqrt((double)rng.uniform());
         double pd = 2.0 * 3.14159265358979323846 * (double)rng.uniform();
-        origin = sc.sceneCenter - dir * (Real)sc.sceneRadius
+        origin = sc.sceneCenter - dir * (Real)R
                + t * (Real)(rdd * cos(pd)) + b * (Real)(rdd * sin(pd));
         emitN = dir;
     } else {
         emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, origin, emitN);
-        if (em.collimated) dir = em.beamDir;
-        else if (em.normalTilted) {                // an aimed quad: intensity-proportional
-            double pdfAim = 0.0;
-            dir = dSampleAimDir(em, rng, pdfAim);
-            if (!(pdfAim > 0.0)) return false;
-        } else dir = cosineHemisphere(emitN, rng);
+        if (em.collimated) { dir = em.beamDir; dLightCarry2(sc, em, origin, emitN, dir); }
+        else {
+            dLightCarry(sc, em, origin, emitN);        // a moving light -- see genPhoton
+            if (em.normalTilted) {                 // an aimed quad: intensity-proportional
+                double pdfAim = 0.0;
+                dir = dSampleAimDir(em, rng, pdfAim);
+                if (!(pdfAim > 0.0)) return false;
+            } else dir = cosineHemisphere(emitN, rng);
+        }
     }
     // Aimed caustic emission — see the scalar genPhoton. Before `base *= spotW` for the same
     // reason (the aimed pass recomputes spotW).
@@ -12004,6 +12219,8 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
         if (!dApplyCausticAim(sc, cs, &em, origin, dir, emitN, spotW, rng, wv)) return false;
         if (causticW) *causticW = wv;
     }
+    if ((em.shape == 3 || em.shape == 6) && !dSkyEntryPastHaze(sc, origin, dir, true))
+        return false;                                // a blur's wider disc -- see genPhoton
 
     // Hero + stratified secondaries from this emitter's SPD (one base draw, C-1 wrapped
     // strata). The hero must have a valid pdf; a dead secondary simply carries beta 0.
@@ -12071,8 +12288,8 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     // every live wavelength; inside, each is traced to its own cell and one the lens clips is
     // absorbed by it. A photon that enters ends there; one that misses flies on (host twin in
     // render.h).
-    if (camMode == CAM_C && cs.cams[0].hasLens) {
-        const DCamera& cc = cs.cams[0];
+    if (camMode == CAM_C && cs.cam(0).hasLens) {
+        const DCamera& cc = cs.cam(0);
         int pxs[hero::kHeroMax], pys[hero::kHeroMax];
         bool hitL[hero::kHeroMax];
         D3 lo, ld;
@@ -12097,8 +12314,9 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         }
     } else if (camMode == CAM_C) {
         int px, py;
-        if (cs.cams[0].catchPhoton(ro, rd, dEvent, px, py)) {
-            Real cCell = (Real)1 / (Real)(cs.cams[0].pixelPlaneArea() * cs.cams[0].filmDist * cs.cams[0].filmDist);
+        const DCamera& cc = cs.cam(0);
+        if (cc.catchPhoton(ro, rd, dEvent, px, py)) {
+            Real cCell = (Real)1 / (Real)(cc.pixelPlaneArea() * cc.filmDist * cc.filmDist);
             const bool envSeen = pathC && (pathC->bits & PV_BIT_ENVFIRST);   // the env SEEN: bilinear
             DEnvTaps tp;
             if (envSeen) tp = dEnvTaps(sc.env, -rd);
@@ -12108,7 +12326,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
                     const double Ln = dEnvRadiance(sc.env, -rd, lam[i]);
                     seen = (Ln > 0.0) ? (Real)(dEnvRadianceAt(sc.env, tp, lam[i]) / Ln) : (Real)0;
                 }
-                filmAdd(cs.films[0], cs.hits[0], cs.cams[0].resX, px, py, lam[i], beta[i] * seen * cCell);
+                filmAdd(cs.films[0], cs.hits[0], cc.resX, px, py, lam[i], beta[i] * seen * cCell);
                 eSensor += (double)(beta[i] * seen);
             }
             return WF_TERMINATE;
@@ -12370,6 +12588,7 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
         // of the launch geometry. GPU-VARIANCE measured the two at the same variance.
         if (perPhotonSeed)
             rng.seedUnit((unsigned long long)i, seedBase);
+        dSetPhotonTime(sc, cs, dPhotonTimeX(cs, (unsigned long long)i, seedBase), true);   // motion blur
         if (heroC > 1) {
             // Hero-wavelength path: one BVH walk carries C stratified wavelengths, halving
             // chromatic noise. De-heros to the single-λ shadeStep at a dispersive interface.
@@ -12485,6 +12704,9 @@ struct WFState {
     // A fiber's exit clearance for the next hop, for CURVE primitives only (interactHair):
     // produced by kWfShade, consumed by the next kWfExtend.
     Real* curveTmin;
+    // Motion blur: the photon's shutter fraction (dPhotonTimeX; -1 without blur), drawn at
+    // birth and set again by every stage that traces or splats it.
+    float* timeX;
 };
 
 // Claim photon budget and emit fresh photons into `slot` until one is successfully
@@ -12495,10 +12717,16 @@ struct WFState {
 // caller marks the slot dead). Emitted energy accrues into energy[0].
 __device__ static bool wfSpawn(const DScene& sc, const DCamSet& cs,
                                double* energy, int camMode, long long N,
-                               unsigned long long* dispatched, WFState st, int slot, DRng& rng) {
+                               unsigned long long* dispatched, WFState st, int slot, DRng& rng,
+                               unsigned long long seed) {
     for (;;) {
         unsigned long long idx = atomicAdd(dispatched, 1ULL);
         if (idx >= (unsigned long long)N) return false;
+        // The photon's time, before its birth splats (dPhotonTimeX: keyed by the budget index,
+        // off the launch's seed), kept with the slot for the stages that follow.
+        const float tx = dPhotonTimeX(cs, idx, seed);
+        dSetPhotonTime(sc, cs, tx, true);
+        st.timeX[slot] = tx;
         DVec3 ro, rd; Real beta, lambda; double eEm = 0;
         Real bornCausticW = (Real)1;
         int emW = -1;
@@ -12526,7 +12754,7 @@ __global__ void kWfInit(DScene sc, DCamSet cs, double* energy,
     int slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= W) return;
     DRng rng; rng.seedUnit((unsigned long long)slot, seedBase);
-    bool live = wfSpawn(sc, cs, energy, camMode, N, dispatched, st, slot, rng);
+    bool live = wfSpawn(sc, cs, energy, camMode, N, dispatched, st, slot, rng, seedBase);
     st.rng[slot] = rng;
     if (live) atomicAdd(liveCount, 1);
     else st.alive[slot] = 0;
@@ -12535,10 +12763,11 @@ __global__ void kWfInit(DScene sc, DCamSet cs, double* energy,
 // Extend: one closestHit per live slot. For GRIN scenes, bend the slot's ray through any
 // gradient-index region first (writing the bent ro/rd back so kWfShade sees them) — exactly
 // as the megakernel marches before closestHit. Non-GRIN scenes skip it (bit-identical).
-__global__ void kWfExtend(DScene sc, WFState st, int W) {
+__global__ void kWfExtend(DScene sc, DCamSet cs, WFState st, int W) {
     D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     int slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= W || !st.alive[slot]) return;
+    dSetPhotonTime(sc, cs, st.timeX[slot], false);   // the photon's own time (motion blur)
     st.gmMed[slot] = -1; st.gmArc[slot] = 0;
     if (sc.hasGrin) {
         DVec3 ro = st.ro[slot], rd = st.rd[slot];
@@ -12560,10 +12789,12 @@ __global__ void kWfExtend(DScene sc, WFState st, int W) {
 // Shade: advance each live slot by one bounce; regenerate on termination / bounce cap.
 __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
                          WFState st, int W, long long N, int diffraction, int maxBounce,
-                         unsigned long long* dispatched, int* liveCount, int camMode) {
+                         unsigned long long* dispatched, int* liveCount, int camMode,
+                         unsigned long long seedBase) {
     D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     int slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= W || !st.alive[slot]) return;
+    dSetPhotonTime(sc, cs, st.timeX[slot], false);   // the photon's own time (motion blur)
     DRng rng = st.rng[slot];
     DVec3 ro = st.ro[slot], rd = st.rd[slot];
     Real beta = st.beta[slot], lambda = st.lambda[slot];
@@ -12603,7 +12834,7 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
         return;
     }
     // Path finished: regenerate this slot from the remaining budget (compaction).
-    bool live = wfSpawn(sc, cs, energy, camMode, N, dispatched, st, slot, rng);
+    bool live = wfSpawn(sc, cs, energy, camMode, N, dispatched, st, slot, rng, seedBase);
     st.rng[slot] = rng;
     if (!live) { st.alive[slot] = 0; atomicSub(liveCount, 1); }
 }
@@ -22260,6 +22491,27 @@ static void uploadMotion(const Scene& scene, DUpload& up) {
         mo.ltLeaf = lt.leaf.empty() ? nullptr : (const int*)keep(uploadVec(lt.leaf));
         mo.nLtLeaf = (int)lt.leaf.size();
     }
+    if (!scene.mirrorPlaneParts.empty()) {
+        std::vector<DMirrorPlane> parts(scene.mirrorPlaneParts.size());
+        for (size_t i = 0; i < parts.size(); ++i) {
+            const Scene::MirrorPlane& m = scene.mirrorPlaneParts[i]; DMirrorPlane& d = parts[i];
+            d.nx = m.n.x; d.ny = m.n.y; d.nz = m.n.z; d.d = m.d;
+            d.lox = m.lo.x; d.loy = m.lo.y; d.loz = m.lo.z;
+            d.hix = m.hi.x; d.hiy = m.hi.y; d.hiz = m.hi.z;
+            d.motionSet = m.motionSet; d.mixed = m.mixed ? 1 : 0; d.part = m.part ? 1 : 0;
+            d.deformTri = m.deformTri; d.partId = m.partId; d.keyBoxes = m.keyBoxes;
+        }
+        mo.mirrorParts = (const DMirrorPlane*)keep(uploadVec(parts));
+        mo.nMirrorParts = (int)parts.size();
+    }
+    if (!scene.mirrorDeformPart.empty())
+        mo.mirrorDeformPart = (const int*)keep(uploadVec(scene.mirrorDeformPart));
+    if (!scene.mirrorPartBoxes.empty()) {
+        std::vector<double> boxes;
+        for (const Aabb& b : scene.mirrorPartBoxes)
+            for (double v : {b.lo.x, b.lo.y, b.lo.z, b.hi.x, b.hi.y, b.hi.z}) boxes.push_back(v);
+        mo.mirrorPartBoxes = (const double*)keep(uploadVec(boxes));
+    }
 }
 
 // Bake the std::function Scene into POD device tables and upload them (camera-
@@ -22324,6 +22576,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.nx = m.n.x; d.ny = m.n.y; d.nz = m.n.z; d.d = m.d;
         d.lox = m.lo.x; d.loy = m.lo.y; d.loz = m.lo.z;
         d.hix = m.hi.x; d.hiy = m.hi.y; d.hiz = m.hi.z;
+        d.motionSet = m.motionSet; d.mixed = m.mixed ? 1 : 0; d.part = m.part ? 1 : 0;
+        d.deformTri = m.deformTri; d.partId = m.partId; d.keyBoxes = m.keyBoxes;
     }
     // Curve / fiber round cones. The host CurveSeg is already a flat POD in this exact
     // shape (curve.h says so, and this is what it was for), so the bake is a straight
@@ -23529,19 +23783,28 @@ static gpu::DCamSet makeCamSet(DUpload& up, const std::vector<gpu::DCamera>& hca
     cs.cams  = (const DCamera*)up.keep(uploadVec(hcams));
     cs.films = (double* const*)up.keep(uploadVec(films));
     cs.hits  = (double* const*)up.keep(uploadVec(hits));
+    // Motion blur: the shutter of the cameras that blur, which a set shares (the host gates any
+    // other mix off the device), so each photon takes one time for all of them.
+    cs.baseCams = cs.cams;
+    for (const DCamera& c : hcams)
+        if (c.blur) { cs.blur = 1; cs.shOpen = c.shOpen; cs.shClose = c.shClose; break; }
     return cs;
 }
 
 // Host driver for the wavefront backend. Allocates the SoA photon pool, seeds it, then
 // runs extend/shade passes until every slot has drained the N-photon budget. Writes into
 // the same d_film / d_hits / d_energy buffers as the megakernel path.
+// The wavefront pool's persistent slot count for an N-photon trace.
+static int wavefrontSlots(long long N) {
+    const int W = (int)((N < (1 << 20)) ? N : (1 << 20));
+    return W < 1 ? 1 : W;
+}
 static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
                            long long N, int diffraction, unsigned long long kseed,
                            int maxBounce, int camModeInt) {
     using namespace gpu;
     if (N <= 0) return;
-    int W = (int)((N < (1 << 20)) ? N : (1 << 20));   // persistent slot count
-    if (W < 1) W = 1;
+    const int W = wavefrontSlots(N);   // persistent slot count
 
     WFState st;
     CUDA_CHECK(cudaMalloc(&st.ro,     (size_t)W * sizeof(DVec3)));
@@ -23559,6 +23822,7 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     CUDA_CHECK(cudaMalloc(&st.gmArc,  (size_t)W * sizeof(Real)));   // extend -> shade
     CUDA_CHECK(cudaMalloc(&st.pathC, (size_t)W * sizeof(DPathCaustic)));  // caustic path state
     CUDA_CHECK(cudaMalloc(&st.curveTmin, (size_t)W * sizeof(Real)));     // fiber exit, shade -> extend
+    CUDA_CHECK(cudaMalloc(&st.timeX, (size_t)W * sizeof(float)));         // the photon's time, all stages
     CUDA_CHECK(cudaMemset(st.alive, 0, (size_t)W * sizeof(int)));
 
     unsigned long long* d_dispatched = nullptr;
@@ -23581,9 +23845,9 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     // generous slack over that bound and never triggers in normal operation.
     long long maxPasses = (N / W + 2) * (long long)(maxBounce + 1) + 16;
     for (long long pass = 0; pass < maxPasses; ++pass) {
-        kWfExtend<<<gb, bs>>>(up.sc, st, W);
+        kWfExtend<<<gb, bs>>>(up.sc, cs, st, W);
         kWfShade<<<gb, bs>>>(up.sc, cs, d_energy, st, W, N,
-                             diffraction, maxBounce, d_dispatched, d_live, camModeInt);
+                             diffraction, maxBounce, d_dispatched, d_live, camModeInt, kseed);
         cudaCheckKernel("wavefront-pass");
         int live = 0;
         CUDA_CHECK(cudaMemcpy(&live, d_live, sizeof(int), cudaMemcpyDeviceToHost));
@@ -23593,7 +23857,7 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     cudaFree(st.ro); cudaFree(st.rd); cudaFree(st.beta); cudaFree(st.lambda);
     cudaFree(st.rng); cudaFree(st.bounce); cudaFree(st.alive);
     cudaFree(st.stkMat); cudaFree(st.stkPri); cudaFree(st.stkN); cudaFree(st.hit);
-    cudaFree(st.gmMed); cudaFree(st.gmArc); cudaFree(st.pathC); cudaFree(st.curveTmin);
+    cudaFree(st.gmMed); cudaFree(st.gmArc); cudaFree(st.pathC); cudaFree(st.curveTmin); cudaFree(st.timeX);
     cudaFree(d_dispatched); cudaFree(d_live);
 }
 
@@ -23616,22 +23880,39 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
     if (heroC > 1 && up.sc.mediaN == 0 && !up.sc.hasGrin) {
         effHeroC = (heroC > hero::kHeroMax) ? hero::kHeroMax : heroC;
     }
-    if (wavefront && effHeroC == 1 && !cs.beamsOn()) {
+    const bool wf = wavefront && effHeroC == 1 && !cs.beamsOn();
+    // A moving camera under a blur: each thread poses its own copy of the set's cameras at its
+    // photon's time (DCamSet::cam), one per thread of the launch -- the wavefront's slots, or
+    // the megakernel's grid.
+    const int kBlockSize = 128, kNumBlocks = 2048;   // the megakernel's ~262k threads
+    DCamSet csRun = cs;
+    DCamera* d_posed = nullptr;
+    if (cs.blur && cs.nCam > 0) {
+        std::vector<DCamera> base((size_t)cs.nCam);
+        CUDA_CHECK(cudaMemcpy(base.data(), cs.cams, base.size() * sizeof(DCamera), cudaMemcpyDeviceToHost));
+        bool moves = false;
+        for (const DCamera& c : base) moves = moves || (c.blur && c.nKeys > 0);
+        if (moves) {
+            const long long threads = wf ? wavefrontSlots(N) : (long long)kBlockSize * kNumBlocks;
+            CUDA_CHECK(cudaMalloc(&d_posed, (size_t)threads * cs.nCam * sizeof(DCamera)));
+            csRun.cams = d_posed; csRun.poseOut = d_posed; csRun.camStride = cs.nCam;
+        }
+    }
+    if (wf) {
         // Streaming backend: identical physics, path-regeneration scheduling. Same
         // maxBounce (32) and camera mode/set as the megakernel. (Hero AND photon-beams
         // force the megakernel — the wavefront pool carries no per-photon beam RNG stream.)
-        wavefrontTrace(up, cs, d_energy, N, diffraction ? 1 : 0, kseed, 32, camModeInt);
+        wavefrontTrace(up, csRun, d_energy, N, diffraction ? 1 : 0, kseed, 32, camModeInt);
     } else {
-        int blockSize = 128;
-        int numBlocks = 2048;          // ~262k threads, grid-stride over N photons
         static const int perPhotonSeed = [] {
             const char* e = std::getenv("FTRACE_GPU_PHOTONSEED");
             return (e && *e) ? std::atoi(e) : 0;
         }();
-        kTrace<<<numBlocks, blockSize>>>(up.sc, cs, d_energy, N, diffraction ? 1 : 0,
-                                         kseed, 32, camModeInt, effHeroC, perPhotonSeed);
+        kTrace<<<kNumBlocks, kBlockSize>>>(up.sc, csRun, d_energy, N, diffraction ? 1 : 0,
+                                           kseed, 32, camModeInt, effHeroC, perPhotonSeed);
     }
     cudaCheckKernel("forward");
+    if (d_posed) cudaFree(d_posed);
 }
 
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
@@ -25312,8 +25593,8 @@ size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
 // --------------------- backward reference (mode R) host ----------------------
 
 const char* cudaBlurUnsupported(const Scene& /*scene*/, const Camera& /*cam*/, char mode) {
-    if (mode != 'R' && mode != 'W' && mode != 'D')
-        return "motion blur in this mode renders on the CPU so far (the device blurs modes R, W and D)";
+    if (mode == 0 || !std::strchr("RWDABC", mode))
+        return "motion blur in this mode renders on the CPU so far (the device blurs modes R, W, D, A, B and C)";
     return nullptr;
 }
 

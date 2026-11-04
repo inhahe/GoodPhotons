@@ -406,9 +406,10 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 
 // Motion blur on the device (ROADMAP 11): for a camera that sees motion (Camera::seesMotion),
 // rendering in `mode`, null when the device can carry the blur, else why it renders on the CPU.
-// So far modes R, W and D: every primitive kind moves (rigid keys and deformers), and the camera
-// and the lights may, each camera path (mode D: each sample's two subpaths) at its own time in
-// the shutter.
+// So far modes R, W, D, A, B and C: every primitive kind moves (rigid keys and deformers), and the
+// camera and the lights may, each camera path (mode D: each sample's two subpaths; A, B and C:
+// each photon and its splats) at its own time in the shutter. A blurred forward render on the
+// device has one camera: a shared flight that blurs flies on the CPU.
 const char* cudaBlurUnsupported(const Scene& scene, const Camera& cam, char mode);
 
 // ---- Mode W (deterministic Whitted / POV-Ray-style preview) ----------------------------

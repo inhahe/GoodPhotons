@@ -37,7 +37,8 @@ Each case loads a scene with `ftrace -export-tris` (no render) and reads the tri
     rbf turns 90 degrees reads the instant's, each rendering exactly as the constant it should
     be. A fin a deformer folds exactly flat at a key renders as one folding a hair short of it
     (no normal is taken from a collapsed face).
-  * Blurred mode B sees a mirror sheet a deformer lifts and lowers as mode R does.
+  * Blurred mode B sees a mirror sheet a deformer lifts and lowers as mode R does, on the CPU and
+    on the GPU.
   * On the GPU (where there is one), a waving mesh riding a moving group renders blurred as it
     does on the CPU.
   * Handle keys that all agree are no motion.
@@ -599,8 +600,8 @@ def pattern_tests(c, grid, render):
 def mirror_test(c, grid, render):
     """A mirror sheet an rbf lifts and lowers through the shutter, under a lit sphere: blurred mode
     B, whose mirror connection must follow the sheet at each photon's time, agrees with blurred
-    mode R over the sphere's reflection. (Taken as the still sheet, the connection found no mirror
-    there: 0.16 of mode R.)"""
+    mode R over the sphere's reflection, on the CPU and (where there is one) on the GPU. (Taken as
+    the still sheet, the connection found no mirror there: 0.16 of mode R.)"""
     body = NL.join(['material "mir" { type mirror }', 'sphere { center 0 0.8 -0.4  radius 0.3  material m }',
                     'mesh "mirror" { file "%s"  material mir  deform rbf { handle { at 0 0 0  motion { '
                     'key { to 0 -0.25 0 } key { to 0 0 0 } key { to 0 0.25 0 } } } } }' % grid])
@@ -613,6 +614,14 @@ def mirror_test(c, grid, render):
     ratio = float(lb[30:50, 20:60].sum() / lr[30:50, 20:60].sum())   # the reflection, in the sheet
     c.verdict("blurred mode B sees a moving mirror as mode R does", abs(ratio - 1) < 0.1,
               "the reflection %.3f of mode R's" % ratio)
+    logs = []
+    sg = render(body, "mirror_B_gpu", 40000000, mode="B", device="gpu", log=logs, **eye)
+    if sg is not None and all("-> GPU" in l for l in logs):
+        lg = read_pfm(sg + ".pfm").mean(axis=-1)
+        ratio = float(lg[30:50, 20:60].sum() / lr[30:50, 20:60].sum())
+        c.verdict("... and on the GPU", abs(ratio - 1) < 0.1, "the reflection %.3f of mode R's" % ratio)
+    else:
+        print("(no GPU here: the GPU's moving-mirror case is skipped)")
 
 
 DYN_FRAMES = 40

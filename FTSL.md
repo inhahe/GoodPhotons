@@ -3212,9 +3212,10 @@ size.)
   its object from one frame of an animation to the next, give the group `pattern_space object`
   (§13).
 - **Which modes blur:** every mode but V, on the CPU: R (and W), D, A, B and C, M, S, U and J
-  since 0.414.0, and P since 0.415.0. On the GPU modes R and W (since 0.418.0) and D (since
-  0.419.0), with every primitive kind, the camera and the lights moving; any other blurred render
-  stays on the CPU and says why. M, S, U and J share light data across paths, so in a moving scene each of their epochs (M, J) or passes (S, U) is
+  since 0.414.0, and P since 0.415.0. On the GPU modes R and W (since 0.418.0), D (since
+  0.419.0) and A, B and C (since 0.420.0, one camera at a time: a shared flight that blurs flies
+  on the CPU), with every primitive kind, the camera and the lights moving; any other blurred
+  render stays on the CPU and says why. M, S, U and J share light data across paths, so in a moving scene each of their epochs (M, J) or passes (S, U) is
   rendered at one time, spread evenly over the shutter, and their average is the blur. Modes M
   and J then redraw their light side for every 64th of a fixed `-spp` (every sample, under 64),
   or every few samples under `-time`, `-noise` or `-forever`, even under `-beamfreeze`, and a

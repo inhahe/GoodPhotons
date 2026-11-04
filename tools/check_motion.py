@@ -43,8 +43,13 @@ cube whose keys scale and shear it together. It requires:
     curve and an instance moving; a mover beyond the instant's bounds under the sky and under the
     sun; a pattern travelling with its object; moving lights of every shape; a moving camera. So
     does blurred mode D on the GPU with mode D on the CPU (the sky aside: mode D renders no
-    environment light, on either device). Mode B asked for the GPU under a shutter says it stays on the CPU, and mode
-    V says it renders the instant.
+    environment light, on either device). So does blurred mode B on the GPU with mode B on the CPU
+    in every one of those cases and with moving mirrors and glass (a mirror panel sliding and
+    turning, a mirror tile whose halves move apart, a glass ball and a mirror ball crossing the
+    room), and the box on the wavefront backend; blurred mode A on the GPU
+    with mode A on the CPU (the box, the moving lights), and blurred mode C on the GPU, through a
+    wide aperture, with mode A on the GPU. Mode P asked for the GPU under a shutter says it stays
+    on the CPU, and mode V says it renders the instant.
   * Modes M and J (an epoch at a time), S and U (a pass at a time) blur, agreeing with
     blurred mode R within their density estimates' bias, and follow a moving camera as mode R
     does; so does mode P, its backward samples split by their own path's first event -- also with
@@ -53,7 +58,7 @@ cube whose keys scale and shear it together. It requires:
   * The camera's own motion, in the box held still: a camera with `motion` keys and no shutter
     renders byte for byte the still camera at its keys' instant (CPU, and GPU); with the shutter,
     the mean of 32 renders from its poses through it (mode R; modes D and B agree with mode R, and
-    mode R on the GPU with mode R on the CPU). The middle frame of a straight, even
+    mode R on the GPU with mode R on the CPU, modes D and B on the GPU with mode R). The middle frame of a straight, even
     `camera_path` with a shutter blurs as the mean of the eyes half a frame either side. The
     loader refuses camera keys without a `motion_interval`, a single key, and a key's `fov_y` on
     a camera whose `lens` sets its view. A key without `fov_y` keeps the camera's own (the same
@@ -65,7 +70,7 @@ cube whose keys scale and shear it together. It requires:
     sweep along a wall as brightly as the rest, and off the pivot needs no more keys than the
     budget. Keys whose only mover is a light they would scale are no motion at all. Haze under a
     sweep far wider than the scene lights the floor as it does without the shutter (modes R, D
-    and B; on the GPU modes R, under the sun and the sky, and D). The blurred sky mode B sees in a batch with under one sample a pixel is all there.
+    and B; on the GPU modes R and B, under the sun and the sky, and D). The blurred sky mode B sees in a batch with under one sample a pixel is all there.
   * The loader refuses, with a message naming why: a `motion` block with no `motion_interval`; one
     with a single key; `translate` beside `motion`; fur on, or a medium bounded by, a moving
     object; an interval that excludes the instant; `shutter_close` before `shutter_open`. It keeps
@@ -255,6 +260,34 @@ def reach_scene(light, shutter=(-0.5, 0.5)):
         "group { %s  sphere { center 0 0 0  radius 0.45  material gold } }" % xf(keys, None, 1.0),
         'camera "c" { eye 0 1.2 6  look_at 0 0.4 0  up 0 1 0  fov_y 45  '
         'shutter_open %r  shutter_close %r  film { res %d %d } }' % (shutter + (W, H)),
+    ]) + NL
+
+
+def specular_scene(shutter=(-0.5, 0.5)):
+    """Mirrors and glass that move, for mode B's analytic camera connections, which must meet each
+    where it is at the photon's time: a mirror panel on the back wall sliding and turning, a mirror
+    floor tile whose two halves move apart (one plane of faces moving differently -- a mixed plane,
+    met by its parts), and a glass ball and a mirror ball crossing the room."""
+    cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
+    return NL.join([
+        "scene { units meters  motion_interval -0.5 0.5 }",
+        'material "white" { type diffuse reflect 0.6 }',
+        'material "red"   { type diffuse reflect rgb 0.7 0.15 0.1 }',
+        'material "mir"   { type mirror }',
+        'material "glass" { type dielectric ior 1.5 }',
+        "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }",
+        "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material red }",
+        "light area { origin -0.4 2.9 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  spd preset:bb6500  power 60 }",
+        "group { motion { key { translate -0.3 0 0  rotate 0 -8 0 } key { translate 0.3 0 0  rotate 0 8 0 } }  "
+        "quad { origin -0.6 0.4 -1.95  u 1.2 0 0  v 0 1.2 0  material mir } }",
+        "group { motion { key { translate 0 0 -0.2 } key { translate 0 0 0.2 } }  "
+        "quad { origin -1.5 0.002 0.2  u 0 0 0.8  v 0.7 0 0  material mir } }",
+        "quad { origin -0.8 0.002 0.2  u 0 0 0.8  v 0.7 0 0  material mir }",
+        "group { motion { key { translate -0.6 0.45 0.3 } key { translate 0.6 0.45 0.3 } }  "
+        "sphere { center 0 0 0  radius 0.3  material glass } }",
+        "group { motion { key { translate 0.9 0.35 -0.9 } key { translate 0.9 0.35 0.0 } }  "
+        "sphere { center 0 0 0  radius 0.25  material mir } }",
+        'camera "c" { eye 0 1.2 4.2  look_at 0 0.5 0  up 0 1 0  fov_y 45  %sfilm { res %d %d } }' % (cam, W, H),
     ]) + NL
 
 
@@ -841,9 +874,49 @@ def main():
             c = [lum(render(exe, out, path, "cpu_D_%d" % s, dargs("cpu"), seed=s)[0]) for s in (1, 2)]
             good, detail = agree(g, c)
             verdict("blurred mode D on the GPU = on the CPU: " + nm, good, detail)
-        rc, log = run([exe, "-in", blurred, "-mode", "B", "-device", "gpu", "-n", "100000", "-no-meter",
-                       "-o", os.path.join(out, "gate.png")])
-        verdict("-device gpu under a shutter says mode B stays on the CPU",
+        # Modes A, B and C on the GPU (0.420.0): each photon and its splats at one time. Mode B
+        # against mode B on the CPU over every GPU case (the hero megakernel), and the box on the
+        # wavefront backend; mode A on the box and the moving lights; mode C, through an
+        # aperture wide enough to catch photons, against mode A on the GPU.
+        for nm, path, _spp in gpu_cases:
+            bargs = lambda dev: ["-mode", "B", "-device", dev, "-n", "40000000"]
+            g = [lum(render(exe, out, path, "gpu_B_%d" % s, bargs("gpu"), seed=s, want_gpu=True)[0]) for s in (1, 2)]
+            c = [lum(render(exe, out, path, "cpu_B_%d" % s, bargs("cpu"), seed=s)[0]) for s in (1, 2)]
+            good, detail = agree(g, c)
+            verdict("blurred mode B on the GPU = on the CPU: " + nm, good, detail)
+            if nm == "the box":
+                cpu_box_b = c
+        pm = os.path.join(out, "gpu_specular.ftsl")
+        write(pm, specular_scene())
+        bargs = lambda dev: ["-mode", "B", "-device", dev, "-n", "40000000"]
+        g = [lum(render(exe, out, pm, "gpu_Bs_%d" % s, bargs("gpu"), seed=s, want_gpu=True)[0]) for s in (1, 2)]
+        c = [lum(render(exe, out, pm, "cpu_Bs_%d" % s, bargs("cpu"), seed=s)[0]) for s in (1, 2)]
+        good, detail = agree(g, c)
+        verdict("blurred mode B on the GPU = on the CPU: moving mirrors and glass", good, detail)
+        g = [lum(render(exe, out, blurred, "gpu_Bwf_%d" % s, ["-mode", "B", "-device", "gpu", "-n", "40000000",
+                                                              "-wavefront"], seed=s, want_gpu=True)[0])
+             for s in (1, 2)]
+        good, detail = agree(g, cpu_box_b)
+        verdict("... and on the wavefront backend: the box", good, detail)
+        for nm, path, _spp in [c_ for c_ in gpu_cases if c_[0] in ("the box", "moving lights of every shape")]:
+            aargs = lambda dev: ["-mode", "A", "-device", dev, "-n", "40000000"]
+            g = [lum(render(exe, out, path, "gpu_A_%d" % s, aargs("gpu"), seed=s, want_gpu=True)[0]) for s in (1, 2)]
+            c = [lum(render(exe, out, path, "cpu_A_%d" % s, aargs("cpu"), seed=s)[0]) for s in (1, 2)]
+            good, detail = agree(g, c)
+            verdict("blurred mode A on the GPU = on the CPU: " + nm, good, detail)
+        wide = os.path.join(out, "gpu_wide.ftsl")
+        with open(blurred, encoding="utf-8") as f:
+            txt = f.read()
+        write(wide, txt.replace("film {", "aperture 0.25  focus 4.4  film {"))
+        g = [lum(render(exe, out, wide, "gpu_C_%d" % s, ["-mode", "C", "-device", "gpu", "-n", "2000000000"],
+                        seed=s, want_gpu=True)[0]) for s in (1, 2)]
+        c = [lum(render(exe, out, wide, "gpu_Aw_%d" % s, ["-mode", "A", "-device", "gpu", "-n", "40000000"],
+                        seed=s, want_gpu=True)[0]) for s in (1, 2)]
+        good, detail = agree(g, c, 0.05)
+        verdict("blurred mode C on the GPU = mode A on the GPU (a wide aperture)", good, detail)
+        rc, log = run([exe, "-in", blurred, "-mode", "P", "-device", "gpu", "-spp", "1", "-n", "100000",
+                       "-no-meter", "-o", os.path.join(out, "gate.png")])
+        verdict("-device gpu under a shutter says mode P stays on the CPU",
                 rc == 0 and "renders on the CPU so far" in log, log.strip()[-300:] if rc else "")
     rc, log = run([exe, "-in", blurred, "-mode", "V", "-device", "cpu", "-spp", "1", "-n", "100000", "-no-meter",
                    "-o", os.path.join(out, "modev.png")])
@@ -995,7 +1068,8 @@ def light_and_haze_tests(exe, out, verdict, hair, gpu):
              ("B", "cpu", pb, ps, ["-n", "20000000"])]
     if gpu:
         cases += [("R", "gpu", pb, ps, ["-spp", "128"]), ("R", "gpu", sky_b, sky_s, ["-spp", "128"]),
-                  ("D", "gpu", pb, ps, ["-spp", "128"])]
+                  ("D", "gpu", pb, ps, ["-spp", "128"]), ("B", "gpu", pb, ps, ["-n", "20000000"]),
+                  ("B", "gpu", sky_b, sky_s, ["-n", "20000000"])]
     for mode, dev, blur_p, still_p, margs in cases:
         args = ["-mode", mode, "-device", dev] + margs
         what = os.path.basename(blur_p)[:-10]
@@ -1110,6 +1184,10 @@ def camera_tests(exe, out, verdict, devices):
                         seed=s, want_gpu=True)[0]) for s in (1, 2)]
         good, detail = agree(g, blur, 0.05)
         verdict("... mode D on the GPU = mode R", good, detail)
+        g = [lum(render(exe, out, moving, "cam_blur_gpuB_s%d" % s, ["-mode", "B", "-device", "gpu", "-n", "40000000"],
+                        seed=s, want_gpu=True)[0]) for s in (1, 2)]
+        good, detail = agree(g, blur, 0.05)
+        verdict("... mode B on the GPU = mode R", good, detail)
 
     # --- a camera path's frame blurs along the path: frames a frame apart on a straight line at
     # an even pace, so the middle frame's shutter sweeps its eye linearly half a frame each way ---
