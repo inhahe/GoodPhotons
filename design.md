@@ -10199,6 +10199,21 @@ sees the instant, exactly as a static scene with those transforms would show it.
   the rigid carry, for a light whose keys do not scale it, so such scenes render as before.
   Device twins: `DMotionSet::shape`, `dLightAreaScale`, `dLightCarryNormal`; the device NEE folds
   the area into `BkNeeGeom::G`, which every caller weighs by `em.area`.
+- **Glowing meshes that deform** (0.427.0; `Emitter::deforms`, `EmitTri::tri`). The sampler still
+  picks a triangle by the instant's areas and a point on it by its barycentrics, which it reports
+  (`Emitter::samplePoint`'s `meshTriOut` / `baryOut`); `Scene::deformedEmitPoint` puts the point
+  on that triangle as its vertex keys have it at the path's time (`deformedCorners`, carried by
+  any group motion), its face normal turned to the side the instant's faces, and reports the
+  triangle's area growth J = |c| / |c0|. Choosing by the instant's areas and putting the point
+  on the triangle then is a density of 1 / (area · J) over the surface at that time, so J stands
+  where `lightAreaScale` stands for a light that scales: `emitterSamplePoint(scene, ...)`
+  returns it to every sampler (`areaScaleOut`), and a hit on the light reads its own from the hit's
+  `deformTri` (`lightAreaScaleAt`), in every density both sides of each MIS weight use. The timed
+  light tree boxes such a light by every corner at every key, each carried by every motion key.
+  `emit_orient flip` swaps the keys' corners 1 and 2, and their normals, with the triangle's.
+  Device twins: `DEmitter::deforms`, `DEmitTri::tri`, `dEmitterSamplePoint` (the sample, its
+  carry or deformation and its area growth in one call), `dDeformedEmitOut`, `dLightAreaScaleAt`;
+  BDPT's vertex keeps the growth about it (`DVertex::areaScale`), having no hit to read it from.
 - **Lights move rigidly** (0.410.0; `Emitter::motion`). Rigid motion keeps every length, area and
   angle of a light, so each sampler runs where the light sits at the instant and only its inputs
   and outputs are carried: `emitterSamplePoint` carries its point and normal out
@@ -10429,9 +10444,9 @@ coordinates and before the mesh light, the watertight record and the fog bound r
   applied to a point of the box); a mirror part's box at a time is its keys' box carried by the
   set; parts group only faces of one set (an affine map keeps a plane a plane, so the keys alone
   decide coplanarity).
-- **Limits kept on purpose.** A glowing deforming mesh keeps its instant's shape, warned, since a
-  light moves only rigidly and `emit_orient` may yet turn its corners; fur and settle refuse to
-  follow it (`movingNames_`).
+- **Limits kept on purpose.** Fur and settle refuse to follow a deforming mesh (`movingNames_`).
+  A glowing one lights the scene from its shape at each time (above, *Glowing meshes that
+  deform*).
 - **loom** (`tools/loom/loom/deform.py`): `DeformedMesh(file, [Falloff | Rbf | Elastic])` with
   `Handle(at, to=signal, radius)` emits the blocks, a moving handle's `to` sampled at each motion
   key (and written plain when every key agrees); `Elastic(dynamic=Dynamics(…))` writes the

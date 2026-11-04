@@ -65,27 +65,12 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from check_motion import read_pfm  # noqa: E402
+from check_motion import grid_obj, read_pfm  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
 LIGHT = 'light area { origin -0.5 3 -0.5  u 1 0 0  v 0 0 1  normal 0 -1 0  spd preset:bb6500  power 40 }'
 LIGHT_TRIS = 2       # the light's quad, written after the mesh: the export's last two triangles
-
-
-def grid_obj(path, n=21, size=2.0):
-    """An n x n vertex grid in the xz plane (y = 0), `size` across, centred on the origin."""
-    lines = []
-    for j in range(n):
-        for i in range(n):
-            lines.append("v %r 0 %r" % (-size / 2 + size * i / (n - 1), -size / 2 + size * j / (n - 1)))
-    for j in range(n - 1):
-        for i in range(n - 1):
-            a = j * n + i + 1
-            lines.append("f %d %d %d" % (a, a + n, a + 1))
-            lines.append("f %d %d %d" % (a + 1, a + n, a + n + 1))
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write(NL.join(lines) + NL)
 
 
 def bar_obj(path, segs=20, length=2.0, w=0.2):

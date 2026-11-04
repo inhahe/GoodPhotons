@@ -602,9 +602,10 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         }
         nOut = dir;
     } else {
-        emitScale = emitterSamplePoint(scene, em, u1, u2, y, nOut);
+        double areaScale = 1.0;   // its area at the pass's time about the point
+        emitScale = emitterSamplePoint(scene, em, u1, u2, y, nOut, &areaScale);
         if (em.area <= 0.0) return;
-        pdfPos = 1.0 / (em.area * scene.lightAreaScale(em, nOut));   // over its area at the pass's time
+        pdfPos = 1.0 / (em.area * areaScale);
         if (em.normalTilted) {                       // an aimed quad: intensity-proportional
             dir = scene.sampleAimDirNow(em, rng, pdfDirW);
             nOut = scene.aimFaceNow(em);             // the face, for the offset and the measure
@@ -984,7 +985,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     if (em && em->area > 0.0 && scene.totalPower > 0.0 && edges >= 2) {
                         double pdfChoice = em->power / scene.totalPower;
                         // its area at the pass's time (Scene::lightAreaScale: 1 unless its keys scale it)
-                        const double areaNow = em->area * scene.lightAreaScale(*em, h.ng);
+                        const double areaNow = em->area * scene.lightAreaScaleAt(*em, h.ng, h.deformTri);
                         double directPdfA = pdfChoice / areaNow;          // area pdf of the point
                         // JOINT emission density: position x direction x pick -- exactly what
                         // traceLightSubpath generates every light path with (pdfPos*pdfDirW*
@@ -1081,7 +1082,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                         }
                     } else {
                         Vec3 yL, nL;
-                        epat = emitterSamplePoint(scene, em, u1, u2, yL, nL);
+                        double areaScale = 1.0;   // its area at the pass's time about the point
+                        epat = emitterSamplePoint(scene, em, u1, u2, yL, nL, &areaScale);
                         Vec3 toL = yL - h.p; dist2 = dot(toL, toL);
                         if (dist2 > 1e-12 && em.area > 0.0) {
                             distL = std::sqrt(dist2); wi = toL / distL;
@@ -1092,7 +1094,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                                                          : dot(nL, wi * -1.0);
                             const double aimR = em.normalTilted ? scene.aimRadianceNow(em, wi * -1.0) : 1.0;
                             if (cosAtLight > 0.0 && aimR > 0.0) {   // emitter stays one-sided
-                                double invArea = 1.0 / (em.area * scene.lightAreaScale(em, nL));   // at the pass's time
+                                double invArea = 1.0 / (em.area * areaScale);   // at the pass's time
                                 directPdfW = invArea * dist2 / cosAtLight;   // (no pickProb)
                                 emissionPdfW = em.normalTilted               // (no pickProb)
                                     ? invArea * scene.aimDirPdfNow(em, wi * -1.0)

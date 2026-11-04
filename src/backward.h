@@ -653,8 +653,9 @@ struct BackwardRenderer {
         // surface point — which is what keeps the MIS pair consistent.
         double epat = 1.0;
         if (!cylVisible) {
-            epat = emitterSamplePoint(scene, em, u1, u2, y, nLight);
-            effArea *= scene.lightAreaScale(em, nLight);   // its area at the path's time (1 unscaled)
+            double areaScale = 1.0;   // its area at the path's time (1 unchanged)
+            epat = emitterSamplePoint(scene, em, u1, u2, y, nLight, &areaScale);
+            effArea *= areaScale;
         }
         Vec3 toL = y - h.p;
         double dist2 = dot(toL, toL);
@@ -1038,15 +1039,17 @@ struct BackwardRenderer {
     // The CYLINDER's visible-arc sampling (sampleCylinderVisible) narrows the area measure to
     // the front-facing arc; reproducing that here needs its pdf_A, which is not exposed, so a
     // cylinder emitter reports 0 and keeps today's estimator. Logged with the entry.
+    // `deformTri`: the hit's deforming triangle (Hit::deformTri), whose area at the path's time
+    // a deforming mesh light's density is over.
     double lightPdfW(const Scene& scene, int e, const Vec3& from, const Vec3& fromN,
-                     const Vec3& wi, const Vec3* hitP, const Vec3* hitN) const {
+                     const Vec3& wi, const Vec3* hitP, const Vec3* hitN, int deformTri = -1) const {
         const double selP = lightSelPdf(scene, e, from, fromN);
         if (!(selP > 0.0)) return 0.0;
-        return lightPdfWShape(scene, e, from, wi, hitP, hitN) * selP;
+        return lightPdfWShape(scene, e, from, wi, hitP, hitN, deformTri) * selP;
     }
     // The per-emitter half: the density of sampling `wi` GIVEN that this emitter was chosen.
     double lightPdfWShape(const Scene& scene, int e, const Vec3& from, const Vec3& wi,
-                          const Vec3* hitP, const Vec3* hitN) const {
+                          const Vec3* hitP, const Vec3* hitN, int deformTri = -1) const {
         if (e < 0 || e >= (int)scene.emitters.size()) return 0.0;
         const Emitter& em = scene.emitters[e];
         if (em.collimated) return 0.0;                       // not area-samplable at all
@@ -1088,7 +1091,7 @@ struct BackwardRenderer {
         const double dist2 = dot(d, d);
         const double cosLight = dot(*hitN, -wi);
         if (!(dist2 > 0.0) || !(cosLight > 0.0)) return 0.0;
-        return dist2 / (em.area * scene.lightAreaScale(em, *hitN) * cosLight);   // its area now
+        return dist2 / (em.area * scene.lightAreaScaleAt(em, *hitN, deformTri) * cosLight);   // its area now
     }
 
     // Index of the emitter that owns an emissive surface material, or -1. Scene::emitterForMat
@@ -1127,9 +1130,9 @@ struct BackwardRenderer {
     // Balance-heuristic weight for an emitter reached by the CONTINUATION. 1 when the vertex
     // it left was not a MIS'd glossy bounce, or when the light is not MIS-covered.
     double glossyHitWeight(const Scene& scene, const GlossyMis& gm, int e, const Vec3& wi,
-                           const Vec3* hitP, const Vec3* hitN) const {
+                           const Vec3* hitP, const Vec3* hitN, int deformTri = -1) const {
         if (!(gm.pdf > 0.0)) return 1.0;
-        const double pL = lightPdfW(scene, e, gm.from, gm.n, wi, hitP, hitN);
+        const double pL = lightPdfW(scene, e, gm.from, gm.n, wi, hitP, hitN, deformTri);
         if (!(pL > 0.0)) return 1.0;
         const double sum = gm.pdf + pL;
         return (sum > 0.0) ? gm.pdf / sum : 1.0;
@@ -1643,8 +1646,9 @@ struct BackwardRenderer {
                 // emission-pattern factor (1 when unpatterned)
                 double epat = 1.0;
                 if (!cylVisible) {
-                    epat = emitterSamplePoint(scene, em, u1, u2, y, nLight);
-                    effArea *= scene.lightAreaScale(em, nLight);   // its area at the path's time
+                    double areaScale = 1.0;   // its area at the path's time
+                    epat = emitterSamplePoint(scene, em, u1, u2, y, nLight, &areaScale);
+                    effArea *= areaScale;
                 }
                 const Vec3 toL = y - p;
                 const double dist2 = dot(toL, toL);
@@ -2994,7 +2998,7 @@ struct BackwardRenderer {
                 double wMis = 1.0;
                 if (gmis.pdf > 0.0)
                     wMis = glossyHitWeight(scene, gmis, emitterIndexOfResolved(scene, m),
-                                           ray.d, &h.p, &h.n);
+                                           ray.d, &h.p, &h.n, h.deformTri);
                 L += thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfLambda * wMis;
             }
 
@@ -3480,7 +3484,7 @@ struct BackwardRenderer {
                 // old expression) unless the last bounce was a MIS'd glossy one.
                 if (gmis.pdf > 0.0)
                     ep *= glossyHitWeight(scene, gmis, emitterIndexOfResolved(scene, m),
-                                          ray.d, &h.p, &h.n);
+                                          ray.d, &h.p, &h.n, h.deformTri);
                 for (int i = 0; i < nUp; ++i)
                     L[i] += thr[i] * m.emit(lam[i]) * ep * invPdf[i];
             }

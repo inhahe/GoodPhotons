@@ -1916,8 +1916,9 @@ handle holding still, so they make nothing move. Each deformer is then
 evaluated at every key on the same rest mesh, so every vertex has a path of its own through the
 shutter, and a camera with a shutter blurs the deformation exactly (§13.1). A deforming mesh in
 a moving `group` (§13.1) rides the group's motion: at each time its deformed shape is carried by
-the group's transform at that time. A glowing mesh keeps its instant's shape at every time, with
-a warning, since a light moves only rigidly.
+the group's transform at that time. A glowing mesh lights the scene from its shape at each time:
+a light path, a photon or a shadow ray aimed at it finds it where the keys have it then, and
+its power grows and shrinks with its area (its radiance is the material's).
 
 **Dynamic elastic.** `deform elastic { dynamic { … } … }` gives the surface inertia: it lags
 behind its handles, overshoots and settles. That is a simulation stepped through time, so it is

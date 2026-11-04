@@ -755,7 +755,9 @@ the one map, each sample posed. *Mode P on the GPU (0.423.0, done):* the backwar
 sample by its own first event into two films, the forward layer makes no splat the camera side
 draws. *Aimed area lights (0.425.0, done):* an aimed panel moves, its face and lean turning with
 it in every estimator. *Lights that scale (0.426.0, done):* under a similarity every light, under
-any affine a flat panel or an emissive mesh, its area carried in every density. Open: an uneven
+any affine a flat panel or an emissive mesh, its area carried in every density. *Deforming glowing
+meshes (0.427.0, done):* each light sample taken on its triangle as the keys have it at the path's
+time, the triangle's area then in every density, on both devices. Open: an uneven
 stretch of a sphere, tube, spot, beam or aimed light; on the GPU, a blurred shared forward
 flight, and a moving scene's shared mode M map.
 
@@ -786,5 +788,5 @@ is baked through a shot by `-bake-elastic`, frame by frame into a cache each fra
 resumed bake writes byte for byte what one bake writes. loom's `DeformedMesh` / `Falloff` / `Rbf`
 / `Elastic(dynamic=Dynamics(…))` animate the handles, and its shot runner bakes before it
 renders. `tools/check_deform.py`. Since 0.417.0 handles are in the mesh's own coordinates, and a
-deforming mesh rides any group, a moving one too. Not yet: the deformers on the GPU (a blurred
-deforming mesh renders on the CPU, as every blur does), and a glowing one blurring.
+deforming mesh rides any group, a moving one too. Since 0.418.0 the GPU renders them, and since
+0.427.0 a glowing one lights the scene from its shape at each time.

@@ -31,7 +31,9 @@ cube whose keys scale and shear it together. It requires:
     primitives. An isosurface, a curve and an instance in a group that moves, turns and grows,
     held sharp at two times, render as the static group written out there; so does a group of
     lights that moves and turns (an area panel, a glowing ball, a spot, a tube, an emissive
-    triangle), in modes R, B and D.
+    triangle), in modes R, B and D. So does a glowing sheet a keyed deformer grows as it slides,
+    flipped by `emit_orient` to radiate down (its still twin the sheet scaled and moved by its own
+    transform), in every mode on both devices.
   * A ball whose sweep runs far past the instant's bounding sphere is lit by the sky (mode B) and
     by a low sun (mode B), and shadows the floor in that sun (mode D), as in blurred mode R. A
     shared flight resumes its own shutter's sidecar and refuses one rendered with another.
@@ -295,8 +297,8 @@ def specular_scene(shutter=(-0.5, 0.5)):
     ]) + NL
 
 
-# A group that moves and turns (rigidly, as a light must), holding an area panel, a glowing ball,
-# a spot, a tube, an emissive triangle and an aimed panel (its normal leaning off its face).
+# A group that moves and turns, holding an area panel, a glowing ball, a spot, a tube, an emissive
+# triangle and an aimed panel (its normal leaning off its face).
 LIGHTS = [dict(translate=(-0.5, 1.7, 0.0), rotate=(0, -30, 0)),
           dict(translate=(0.5, 1.5, 0.2), rotate=(0, 40, 10))]
 
@@ -394,6 +396,41 @@ def scaled_lights_scene(obj, kind, u=None, shutter=None):
         "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }",
         "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material white }",
         "group { %s  %s }" % (xf(keys, u, 1.0), body),
+        'camera "c" { eye 0 1.0 4.2  look_at 0 0.7 0  up 0 1 0  fov_y 45  %sfilm { res %d %d } }'
+        % (cam, W, H),
+    ]) + NL
+
+
+# A glowing sheet a keyed deformer grows 0.6 to 1.5 times as it slides 0.8 m: eight rbf handles
+# at the corners of a box about it, each taken by the same scale and slide, so every corner of the
+# sheet is (the affine part of an rbf, check_deform).
+GLOW_S, GLOW_X = (0.6, 1.5), (-0.4, 0.4)
+
+
+def glow_deform_scene(grid, u=None, shutter=None):
+    """The deforming glowing sheet (GLOW_S, GLOW_X) over a floor, radiating down, the scene's only
+    light; or held still at u, the sheet scaled and moved there by its own transform."""
+    cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
+    def at(u):   # the sheet's scale and slide at fraction u of the interval
+        return GLOW_S[0] + (GLOW_S[1] - GLOW_S[0]) * u, GLOW_X[0] + (GLOW_X[1] - GLOW_X[0]) * u
+    if u is None:
+        def to(p, k):   # handle corner p at the k-th of three keys, the middle one the instant's
+            s, x = at(k / 2.0)
+            return "key { to %r %r %r }" % (s * p[0] + x, s * p[1], s * p[2])
+        corners = [(x, y, z) for x in (-0.5, 0.5) for y in (-0.5, 0.5) for z in (-0.5, 0.5)]
+        handles = "  ".join("handle { at %r %r %r  motion { %s } }" % (p + (" ".join(to(p, k) for k in range(3)),))
+                            for p in corners)
+        shape = "deform rbf { kernel triharmonic  %s }" % handles
+    else:
+        shape = "scale %r  translate %r 0 0" % at(u)
+    return NL.join([
+        "scene { units meters  motion_interval -0.5 0.5 }",
+        'material "white" { type diffuse reflect 0.7 }',
+        'material "glow"  { type diffuse reflect 0.0  emit blackbody 5200 }',
+        "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }",
+        "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material white }",
+        'group { translate 0 1.5 0  mesh "glow" { file "%s"  material glow  emit_orient flip  %s } }'
+        % (grid, shape),
         'camera "c" { eye 0 1.0 4.2  look_at 0 0.7 0  up 0 1 0  fov_y 45  %sfilm { res %d %d } }'
         % (cam, W, H),
     ]) + NL
@@ -522,6 +559,21 @@ UNEVEN_ANCESTOR = ("group { scale 1 2 1  group { motion { key { rotate 0 0 -45 }
                    "group { scale 1 0.5 1  sphere { center 0 0 0  radius 0.1  material w } } } }")
 
 
+def grid_obj(path, n=21, size=2.0):
+    """An n x n vertex grid in the xz plane (y = 0), `size` across, centred on the origin."""
+    lines = []
+    for j in range(n):
+        for i in range(n):
+            lines.append("v %r 0 %r" % (-size / 2 + size * i / (n - 1), -size / 2 + size * j / (n - 1)))
+    for j in range(n - 1):
+        for i in range(n - 1):
+            a = j * n + i + 1
+            lines.append("f %d %d %d" % (a, a + n, a + 1))
+            lines.append("f %d %d %d" % (a + 1, a + n, a + n + 1))
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(NL.join(lines) + NL)
+
+
 def write(path, text):
     with open(path, "w", encoding="utf-8", newline="") as f:
         f.write(text)
@@ -646,13 +698,20 @@ def main():
                        # M at 8 M photons: at 2 M a dark block reads 5 sigma off from map to map.
                        ("J", "gpu", ["-spp", "256", "-jsurf", "-beamepochs", "64"]),
                        ("M", "gpu", ["-spp", "128", "-n", "8000000"])]
+    # A glowing sheet that deforms, in every mode on both devices, D on the GPU too: its light
+    # samples on its triangles as they are at the time, their area then in every density.
+    gridf = os.path.join(out, "glow_grid.obj").replace(chr(92), "/")
+    grid_obj(gridf, n=9, size=1.0)
+    glow_modes = lone_modes + ([] if a.no_gpu else [("D", "gpu", ["-spp", "256"])])
     held = ([(t, "lights", lambda u=None, shutter=None: lights_scene(objf, u, shutter), light_modes)
              for t in (-0.3, 0.35)] + [(0.35, "three lights alone", lone_lights_scene, lone_modes)] +
             # lights their keys scale, their radiance kept and their area grown
             [(t, "lights their keys grow", lambda u=None, shutter=None: scaled_lights_scene(objf, "grow", u, shutter),
               lone_modes) for t in (-0.35, 0.4)] +
             [(0.4, "flat lights their keys stretch", lambda u=None, shutter=None: scaled_lights_scene(objf, "warp", u, shutter),
-              lone_modes)])
+              lone_modes)] +
+            [(t, "a deforming glowing mesh", lambda u=None, shutter=None: glow_deform_scene(gridf, u, shutter),
+              glow_modes) for t in (-0.35, 0.4)])
     for t, what, make, modes in held:
         sharp, ref = os.path.join(out, "lights_sharp.ftsl"), os.path.join(out, "lights_ref.ftsl")
         write(sharp, make(shutter=(t, t)))

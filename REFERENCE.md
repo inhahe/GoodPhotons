@@ -3687,8 +3687,9 @@ rides the group's motion, deformed.
 **Animated and blurred.** A handle's `to` may be keyed (`motion { key { to … } … }` over the
 scene's `motion_interval`). Every deformer is then evaluated at every key on the same rest
 mesh, and each triangle carries its corners at each key, so a camera with a shutter blurs the
-deformation exactly. The guide pass (`-write-aovs`) carries a deforming surface's motion
-vectors. loom animates the handles: `DeformedMesh(file, [Elastic([Handle(at, to=signal,
+deformation exactly. A glowing mesh lights the scene from its shape at each time, on the CPU and
+the GPU (since 0.427.0), its power following its area. The guide pass (`-write-aovs`) carries a
+deforming surface's motion vectors. loom animates the handles: `DeformedMesh(file, [Elastic([Handle(at, to=signal,
 radius=r)])])`.
 
 **Dynamic elastic.** `deform elastic { dynamic { cache "…_%04d.ftec"  frame N  mass …  stiffness …

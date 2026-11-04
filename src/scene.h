@@ -1002,6 +1002,8 @@ struct EmitTri {
     // Only read when an emission pattern is bound; stored as uv0 + the two uv edges to
     // mirror the v0/e1/e2 layout above.
     Vec3 uv0{0, 0, 0}, uvE1{1, 0, 0}, uvE2{1, 1, 0};
+    // The source triangle (Scene::tris), whose vertex keys a deforming emitter's sample reads.
+    int tri = -1;
 };
 
 struct Emitter {
@@ -1110,6 +1112,9 @@ struct Emitter {
     double foldLam[kFoldBins] = {};
     int    foldN = 0;
     std::vector<EmitTri> meshTris; // Mesh: per-triangle area CDF for uniform sampling
+    // Mesh: some of its triangles deform (Tri::vkeys), so a sample at a time is taken on the
+    // triangle as its keys have it then (Scene::deformedEmitPoint).
+    bool deforms = false;
     EmissionSampler spd;      // for forward per-emitter lambda importance sampling
     Spectrum spdFn = constantSpectrum(0.0); // raw SPD, for backward per-lambda eval
     double emitIntegral = 0.0;
@@ -1197,8 +1202,12 @@ struct Emitter {
     // `reachOut`, when given, receives the reach of the patch the point lies on -- the scale a
     // hit there sizes its pattern hair by (Hit::pscale), so a sampled point reads an emission
     // pattern where a hit on it does.
+    // `meshTriOut` / `baryOut` (a Mesh's): which of meshTris the point is on and its barycentrics
+    // there (b1, b2), so it can be put on that triangle as it deforms (Scene::deformedEmitPoint).
     void samplePoint(double u1, double u2, Vec3& y, Vec3& nOut,
-                     double* uuOut = nullptr, double* vvOut = nullptr, double* reachOut = nullptr) const {
+                     double* uuOut = nullptr, double* vvOut = nullptr, double* reachOut = nullptr,
+                     int* meshTriOut = nullptr, double* baryOut = nullptr) const {
+        if (meshTriOut) *meshTriOut = -1;
         if (uuOut) *uuOut = 0.0;
         if (vvOut) *vvOut = 0.0;
         if (reachOut) *reachOut = 0.0;
@@ -1267,6 +1276,7 @@ struct Emitter {
             y = t.v0 + t.e1 * b1 + t.e2 * b2;
             nOut = t.nrm;
             if (reachOut) *reachOut = t.reach;
+            if (meshTriOut) { *meshTriOut = (int)lo; baryOut[0] = b1; baryOut[1] = b2; }
             // Same barycentric weights the ray-hit path uses, so a bound emission
             // pattern reads identically from either side of the transport.
             if (uuOut) *uuOut = t.uv0.x + t.uvE1.x * b1 + t.uvE2.x * b2;
@@ -1942,6 +1952,41 @@ struct Scene {
         bool nonUniform = false;
         n = normalize(D.applyDir(n));
         y = D.apply(em.origin) + n * (em.radius * D.uniformScale(nonUniform));
+    }
+    // A deforming mesh light's sample at the path's time: triangle `k` of its meshTris as its
+    // keys have it then (deformedCorners, carried by any group motion), the point at the sample's
+    // barycentrics (b1, b2), its face normal turned to the side the instant's is, and how much the
+    // triangle's area has grown (`areaScale`). False, `y` and `n` untouched, where it does not
+    // deform or the path has no time.
+    bool deformedEmitPoint(const Emitter& em, int k, double b1, double b2, Vec3& y, Vec3& n,
+                           double& areaScale) const {
+        if (!em.deforms || g_motionU < 0.0 || k < 0) return false;
+        const EmitTri& et = em.meshTris[(size_t)k];
+        if (et.tri < 0 || tris[(size_t)et.tri].vkeys < 0) return false;
+        Vec3 p[3];
+        deformedCorners(tris[(size_t)et.tri], g_motionU, p);
+        const Vec3 e1 = p[1] - p[0], e2 = p[2] - p[0];
+        const Vec3 c = cross(e1, e2), c0 = cross(et.e1, et.e2);
+        const double l = length(c), l0 = length(c0);
+        if (!(l > 0.0) || !(l0 > 0.0)) return false;
+        y = p[0] + e1 * b1 + e2 * b2;
+        n = c * ((dot(c0, et.nrm) >= 0.0 ? 1.0 : -1.0) / l);
+        areaScale = l / l0;
+        return true;
+    }
+    // How much a light's area has grown about a hit on it at the path's time: its deforming
+    // triangle's (Hit::deformTri, the triangle's area now over the instant's), else
+    // lightAreaScale about the hit's normal.
+    double lightAreaScaleAt(const Emitter& em, const Vec3& nNow, int deformTri) const {
+        if (deformTri >= 0 && g_motionU >= 0.0) {
+            const Tri& t = tris[(size_t)deformTri];
+            Vec3 p[3];
+            deformedCorners(t, g_motionU, p);
+            const double l = length(cross(p[1] - p[0], p[2] - p[0]));
+            const double l0 = length(cross(t.v1 - t.v0, t.v2 - t.v0));
+            return (l > 0.0 && l0 > 0.0) ? l / l0 : 1.0;
+        }
+        return lightAreaScale(em, nNow);
     }
     // An AIMED quad (Emitter::normalTilted) as the current path sees it: its face and its lean turn
     // with it, so each reading takes `w` (the unit direction leaving the patch, at the path's time)
@@ -2832,6 +2877,8 @@ struct Scene {
             // report the same (u,v) the ray-hit path interpolates — required for an
             // emission pattern to agree across NEE and emission-on-hit.
             et.uv0 = t.uv0; et.uvE1 = t.uv1 - t.uv0; et.uvE2 = t.uv2 - t.uv0;
+            et.tri = (int)i;
+            e.deforms = e.deforms || t.vkeys >= 0;
             e.meshTris.push_back(et);
         }
         if (e.meshTris.empty() || total <= 0.0) return; // nothing emissive
@@ -3612,7 +3659,7 @@ struct Scene {
     void buildLightTree() {
         buildLightTreeInto(false, lightTree, lightTreeAlways, lightTreeParent, lightTreeLeaf, lightTreeRoot);
         lightTreeTimed = LightTreeTimed{};
-        for (const Emitter& e : emitters) lightTreeTimed.built = lightTreeTimed.built || e.motion >= 0;
+        for (const Emitter& e : emitters) lightTreeTimed.built = lightTreeTimed.built || e.motion >= 0 || e.deforms;
         if (lightTreeTimed.built)
             buildLightTreeInto(true, lightTreeTimed.nodes, lightTreeTimed.always, lightTreeTimed.parent,
                                lightTreeTimed.leaf, lightTreeTimed.root);
@@ -3630,7 +3677,7 @@ struct Scene {
         for (size_t i = 0; i < emitters.size(); ++i) {
             LtEmitterBound b{};
             if (lightTreeBoundOf(emitters[i], (int)i, b)) {
-                if (timed && emitters[i].motion >= 0) sweepLightBound(emitters[i], b);
+                if (timed && (emitters[i].motion >= 0 || emitters[i].deforms)) sweepLightBound(emitters[i], b);
                 items.push_back(b);
             } else if (emitters[i].shape != EmitterShape::Env)
                 always.push_back((int)i);    // suns / beams: always connected
@@ -3660,14 +3707,34 @@ struct Scene {
     // A moving light's bound over its whole motion: its box carried by every key (it moves
     // linearly between keys, so their boxes hold it) and normals that may point anywhere.
     void sweepLightBound(const Emitter& e, LtEmitterBound& b) const {
-        const MotionKeys& mk = motionSets[(size_t)e.motion];
         Aabb box;
-        for (int c = 0; c < 8; ++c) {
-            const Vec3 p{(c & 1) ? b.bmax[0] : b.bmin[0], (c & 2) ? b.bmax[1] : b.bmin[1],
-                         (c & 4) ? b.bmax[2] : b.bmin[2]};
-            box.expand(p);
-            for (int k = 0; k < mk.keys; ++k) box.expand(motionXf[(size_t)(mk.first + k)].apply(p));
+        if (e.motion >= 0) {
+            const MotionKeys& mk = motionSets[(size_t)e.motion];
+            for (int c = 0; c < 8; ++c) {
+                const Vec3 p{(c & 1) ? b.bmax[0] : b.bmin[0], (c & 2) ? b.bmax[1] : b.bmin[1],
+                             (c & 4) ? b.bmax[2] : b.bmin[2]};
+                box.expand(p);
+                for (int k = 0; k < mk.keys; ++k) box.expand(motionXf[(size_t)(mk.first + k)].apply(p));
+            }
+        } else {
+            box.expand(Vec3{b.bmin[0], b.bmin[1], b.bmin[2]});
+            box.expand(Vec3{b.bmax[0], b.bmax[1], b.bmax[2]});
         }
+        // A deforming mesh light: every corner at every one of its triangles' keys, each carried by
+        // every key of the triangle's group motion -- a point between keys is a convex blend of these.
+        if (e.deforms)
+            for (const EmitTri& et : e.meshTris) {
+                if (et.tri < 0) continue;
+                const Tri& t = tris[(size_t)et.tri];
+                if (t.vkeys < 0) continue;
+                for (int k = 0; k < t.vkeyCount; ++k)
+                    for (int c = 0; c < 3; ++c) {
+                        const Vec3& v = vertexKeys[(size_t)t.vkeys + (size_t)k * 6 + (size_t)c];
+                        if (t.motion < 0) { box.expand(v); continue; }
+                        const MotionKeys& mt = motionSets[(size_t)t.motion];
+                        for (int j = 0; j < mt.keys; ++j) box.expand(motionXf[(size_t)(mt.first + j)].apply(v));
+                    }
+            }
         b.bmin[0] = box.lo.x; b.bmin[1] = box.lo.y; b.bmin[2] = box.lo.z;
         b.bmax[0] = box.hi.x; b.bmax[1] = box.hi.y; b.bmax[2] = box.hi.z;
         b.cosThetaO = -1.0;
@@ -5267,22 +5334,35 @@ inline double emitterPatMulAt(const Scene& scene, const Emitter& em,
 // which is every scene that does not use the feature — those keep bit-identical draws
 // (samplePoint's uv outputs are the only extra work and they do not touch the RNG).
 // A moving light is sampled where it sits at the instant -- its pattern read there, where it
-// travels with the light -- and the point carried out (Scene::lightPointNow).
+// travels with the light -- and the point carried out (Scene::lightPointNow); a deforming mesh
+// light's on its triangle as the keys have it then (Scene::deformedEmitPoint). `areaScaleOut`,
+// when given, receives how much the light's area has grown about the point at the path's time
+// (1 for one that does not change size): what its area densities divide by, its photons' power
+// multiplies by.
 inline double emitterSamplePoint(const Scene& scene, const Emitter& em,
-                                 double u1, double u2, Vec3& y, Vec3& nOut) {
+                                 double u1, double u2, Vec3& y, Vec3& nOut,
+                                 double* areaScaleOut = nullptr) {
     double pmul = 1.0;
+    const bool deform = em.deforms && g_motionU >= 0.0;
+    int mt = -1;
+    double bary[2] = {0.0, 0.0};
     if (em.emitPat < 0) {
-        em.samplePoint(u1, u2, y, nOut);
+        em.samplePoint(u1, u2, y, nOut, nullptr, nullptr, nullptr, deform ? &mt : nullptr, bary);
     } else {
         double uu = 0.0, vv = 0.0;
         double reach = 0.0;
-        em.samplePoint(u1, u2, y, nOut, &uu, &vv, &reach);
+        em.samplePoint(u1, u2, y, nOut, &uu, &vv, &reach, deform ? &mt : nullptr, bary);
         pmul = emitterPatMulAt(scene, em, y, nOut, uu, vv, reach);
     }
-    if (scene.lightMoves(em)) {
+    double J = 1.0;
+    if (deform && scene.deformedEmitPoint(em, mt, bary[0], bary[1], y, nOut, J)) {
+        // on its triangle as it is at the path's time
+    } else if (scene.lightMoves(em)) {
         if (em.shape == EmitterShape::Sphere) scene.lightSpherePointNow(em, y, nOut);   // on its moved surface
         else { y = scene.lightPointNow(em, y); nOut = scene.lightNormalNow(em, nOut); }
+        J = scene.lightAreaScale(em, nOut);
     }
+    if (areaScaleOut) *areaScaleOut = J;
     return pmul;
 }
 

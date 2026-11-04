@@ -147,15 +147,16 @@ on the epoch index (`surfRadiusFor`), which must then count rebuilds, not sample
 
 ## OPEN (2026-11-03, 0.413.0): DEFORM-LIMITS — what a deforming mesh cannot do yet
 
-Each is refused or warned at load, never rendered wrong:
+Refused at load, never rendered wrong:
 
-- **A glowing mesh** keeps its instant's shape at every time, with a warning: its light sampler
-  (`addMeshLight`'s area CDF) is the instant's, and `emit_orient` reverses windings after the
-  deformers run. Proper fix: sample a deforming emitter at the path's time (rebuild the chosen
-  triangle from its keys, its area at that time in the pdf), and reverse the keys' corner
-  order with the triangle's.
 - **A dynamic elastic must be first** in its mesh's stack (its rest is the mesh as loaded).
   Proper fix: bake the deformers before it into the record as its moving rest.
+- FIXED (0.427.0): **a glowing mesh** kept its instant's shape at every time, warned. Each light
+  sample is now taken on its triangle as the keys have it at the path's time
+  (`Scene::deformedEmitPoint`; the device's `dDeformedEmitOut`), the triangle's area then in every
+  density (`lightAreaScaleAt`, from the hit's `deformTri`), on both devices; `emit_orient flip`
+  reverses the keys' corners with the triangle's. check_motion: the sheet held sharp at two times
+  in every mode, against its still twin there.
 
 ## OPEN (2026-11-03, 0.411.1): HAZE-SUN-B — mode B lights an unbounded sunlit haze far dimmer than mode R
 

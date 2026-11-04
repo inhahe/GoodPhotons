@@ -639,8 +639,8 @@ inline double vertexPdfLightOrigin(const Scene& scene, const Vertex& cur) {
     if (isDeltaEmitter(*cur.light)) return 0.0;      // delta position / direction
     if (cur.light->area <= 0.0) return 0.0;
     double pdfChoice = bdptPickPdf(scene, cur.light, -1);
-    // its area at the path's time (Scene::lightAreaScale: 1 unless its keys scale it)
-    return pdfChoice / (cur.light->area * scene.lightAreaScale(*cur.light, cur.ng));
+    // its area at the path's time (Scene::lightAreaScaleAt: 1 unless it scales or deforms)
+    return pdfChoice / (cur.light->area * scene.lightAreaScaleAt(*cur.light, cur.ng, cur.hit.deformTri));
 }
 
 // --- Random walk -----------------------------------------------------------------
@@ -2078,7 +2078,8 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     // pdf below stays 1/area and pdfChoice stays power-weighted, exactly as the eye
     // subpath's s=0/s=1 MIS terms assume — so the estimator is unchanged apart from the
     // radiance itself. Vertex::emitPatW carries the same factor for those MIS terms.
-    double emitPatW = emitterSamplePoint(scene, em, u1, u2, y, nOut);
+    double areaScale = 1.0;   // its area at the path's time about the point (1 unchanged)
+    double emitPatW = emitterSamplePoint(scene, em, u1, u2, y, nOut, &areaScale);
     double Le = em.spdFn(lambda) * invPdfLambda * emitPatW;   // emitted radiance at lambda
     // The bundle's other wavelengths: a subpath dark at the hero alone still carries them (the
     // walk goes on while any wavelength lives), as deltaLightSubpath's does.
@@ -2093,7 +2094,7 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     double pdfChoice = pick.pdf;
     // over its area at the path's time (Scene::lightAreaScale: 1 unless its keys scale it; an aimed
     // panel moves only by similarities, whose scale is the same about any normal)
-    double pdfPos = (em.area > 0.0) ? 1.0 / (em.area * scene.lightAreaScale(em, nOut)) : 0.0;
+    double pdfPos = (em.area > 0.0) ? 1.0 / (em.area * areaScale) : 0.0;
     if (pdfPos <= 0.0) return 0;
 
     Vertex L0;
@@ -3748,7 +3749,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             } else {
                 // Pattern factor at the sampled point (1.0 without a pattern). It scales Le
                 // below, never pdfA — see generateLightSubpath for why that stays unbiased.
-                emitPatW = emitterSamplePoint(scene, em, u1, u2, y, nOut);
+                double areaScale = 1.0;   // its area at the path's time about the point
+                emitPatW = emitterSamplePoint(scene, em, u1, u2, y, nOut, &areaScale);
                 Vec3 toL = y - pt.p; double dist2 = dot(toL, toL);
                 if (dist2 <= 0.0) return 0.0;
                 dist = std::sqrt(dist2); wi = toL / dist;
@@ -3756,7 +3758,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                 double cosLight = em.normalTilted ? scene.aimCosNow(em, wi * -1.0) : dot(nOut, wi * -1.0);
                 if (cosLight <= 0.0) return 0.0;       // emitter stays one-sided
                 if (em.area <= 0.0) return 0.0;
-                areaNow = em.area * scene.lightAreaScale(em, nOut);
+                areaNow = em.area * areaScale;
                 Wgeom = cosLight * areaNow / (dist2 * pdfChoice);   // == cosLight/(d^2 * pdfA)
                 if (em.normalTilted) nOut = scene.aimFaceNow(em);   // the vertex carries the face (see L0)
             }

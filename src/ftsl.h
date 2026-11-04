@@ -6446,19 +6446,9 @@ private:
             if (dot(n0, n0) < 1e-24) return Vec3{0, 0, 0};          // none authored: finalize's face normal
             return normalize(turn(nRest[(size_t)vi], keyN[(size_t)k][(size_t)vi], n0));
         };
-        // A glowing mesh keeps the instant's shape at every time: a light moves only rigidly
-        // (its sampler is the instant's), and `emit_orient` may yet turn its corners around.
-        bool keyed = K > 1;
-        for (size_t t = triStart; t < triEnd && keyed; ++t) {
-            const int m = S.tris[t].matId;
-            if (m >= 0 && m < (int)S.mats.size() && S.mats[(size_t)m].isLight) {
-                keyed = false;
-                if (stillWarned_.insert("a glowing deforming mesh").second)
-                    std::fprintf(stderr, "[ftsl] warning: a glowing mesh's deformers shape it at the frame's "
-                                         "instant only -- a light moves only rigidly, so it does not blur "
-                                         "(ROADMAP 11)\n");
-            }
-        }
+        // A glowing mesh's samples are taken on its triangles as they deform (Scene::
+        // deformedEmitPoint), and `emit_orient` turns the keys' corners around with the triangle's.
+        const bool keyed = K > 1;
         for (size_t t = triStart; t < triEnd; ++t) {
             Tri& tr = S.tris[t];
             const Tri orig = tr;
@@ -6833,6 +6823,15 @@ private:
                 if (eoStr == "flip" || autoFlip) {
                     for (size_t t = triStart; t < triEnd; ++t) {
                         Tri& tr = L.scene.tris[t];
+                        // A deforming triangle's keys (corners, then normals, at each key) turn
+                        // with it, so its winding and its normals agree at every time.
+                        if (tr.vkeys >= 0)
+                            for (int k = 0; k < tr.vkeyCount; ++k) {
+                                Vec3* key = &L.scene.vertexKeys[(size_t)tr.vkeys + (size_t)k * 6];
+                                std::swap(key[1], key[2]);
+                                std::swap(key[4], key[5]);
+                                for (int c = 3; c < 6; ++c) key[c] = key[c] * -1.0;
+                            }
                         std::swap(tr.v1, tr.v2);
                         std::swap(tr.uv1, tr.uv2);
                         std::swap(tr.n1, tr.n2);

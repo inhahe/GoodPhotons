@@ -2822,10 +2822,9 @@ struct Renderer {
             // quad: constant normal; sphere: surface point. emitterSamplePoint also
             // returns this point's `emit pattern:` factor — 1.0 (and a bit-identical
             // call) when the emitter carries no pattern.
-            emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN);
-            // A light its keys scale emits from its area at the photon's time: the power it was
-            // chosen by, the instant's, grows with it (Scene::lightAreaScale; 1 unscaled).
-            spotW = scene.lightAreaScale(em, emitN);
+            // A light its keys scale, or a mesh light that deforms, emits from its area at the
+            // photon's time: the power it was chosen by, the instant's, grows with it (1 unchanged).
+            emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN, &spotW);
             if (em.collimated) dir = scene.lightDirNow(em, em.beamDir);
             else if (em.normalTilted) {             // an aimed quad: intensity-proportional
                 double pdfAim = 0.0;
@@ -3783,8 +3782,7 @@ struct Renderer {
                    + t * (rd * std::cos(pd)) + b * (rd * std::sin(pd));
             emitN = dir;
         } else {
-            emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN);
-            spotW = scene.lightAreaScale(em, emitN);   // its area at the photon's time (scalar tracer)
+            emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN, &spotW);   // its area now (scalar tracer)
             if (em.collimated) dir = scene.lightDirNow(em, em.beamDir);
             else if (em.normalTilted) {             // an aimed quad -- see the scalar tracer
                 double pdfAim = 0.0;
