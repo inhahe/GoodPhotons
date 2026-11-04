@@ -18485,7 +18485,7 @@ static int runCompositeProgressive(
     std::printf("mode P: forward+camera-side composite, target %lld photons / %lld spp "
                 "at %dx%d on %s (light=%s)%s ...\n",
                 acc.N + Nreq, acc.spp + sppReq, res, resY,   // -resume adds to what it loaded
-                useGpu ? "GPU" : (std::to_string(nThreads) + " threads").c_str(),
+                (useGpu && !blurP) ? "GPU" : (std::to_string(nThreads) + " threads").c_str(),   // a blur splits on the CPU
                 scene.envIndex >= 0 ? "env" : "lit",
                 (resume && (acc.N > 0 || acc.spp > 0)) ? " [resuming]" : "");
 
@@ -20258,7 +20258,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     if (stopNow) { stopAll = true; return true; }
                     if (nFixed) return false;       // a fixed epoch runs its whole share
                     // A blurred moving scene's clock epoch (a budget has no total to split) ends
-                    // after a few samples, so the shutter is sampled by many epochs.
+                    // after a few samples, so the shutter is sampled by many epochs
+                    // (known-issues BLUR-EPOCH-COST).
                     if (blurEpochsJ) return sppDone >= 4;
                     // Not a stop — just the end of this epoch, so the next one draws a new map.
                     return std::chrono::duration<double>(clk::now() - tEpoch).count() >= epochSec;
@@ -20501,9 +20502,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             long long sppAll = 0;
             bool stopAll = false;
             uint64_t epoch = 0;
-            // Under a blur, how many samples an epoch may take: enough epochs to sample the shutter
-            // -- a 64th of a fixed budget, or under a clock, which has no total to split, a few
+            // Under a blur, how many samples an epoch takes: enough epochs to sample the shutter --
+            // a 64th of a fixed budget, or under a clock, which has no total to split, a few
             // samples, so the shutter is sampled by many epochs (as mode J's clock epochs are).
+            // known-issues BLUR-EPOCH-COST: a light side dear to rebuild then takes much of the clock.
             const long long blurEpochSpp = sppTarget >= kUnboundedSpp ? 4
                                                                     : std::max(1LL, sppTarget / kBlurEpochs);
             if (blurEpochs) epochSaltOff = prog ? (uint64_t)prog->sampleBase : 0ull;

@@ -2096,7 +2096,8 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
   their epochs (`M`, `J`) or passes (`S`, `U`) is therefore rendered at one time, spread evenly
   over the shutter, and their average is the blur. Modes `M` and `J` redraw their light side for
   this every 64th of a fixed `-spp` (every sample, below 64 spp), or every few samples under
-  `-time`, `-noise` or `-forever`, `-beamfreeze` or not (mode `J` takes `-beamepochs` above 64,
+  `-time`, `-noise` or `-forever` (a light side dear to rebuild then takes much of the clock),
+  `-beamfreeze` or not (mode `J` takes `-beamepochs` above 64,
   and says so when it raises one below), and a mode `J` camera shares no realization with
   another. A camera moving through a still scene leaves the `M` and `S` maps
   timeless, and each sample poses the camera at its own time; `U` and `J`, whose light paths are

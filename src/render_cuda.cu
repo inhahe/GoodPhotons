@@ -4190,8 +4190,9 @@ __device__ static inline DTriShear makeTriShear(const DVec3& d) {
 // stays noise-free), mapped through the shutter into the motion interval and set for the path.
 // The camera posed at `frames` (host twins CameraMotion::at, Camera::posedAs and lookAt): its keys
 // blended about the time, the frame built on them, the stereo eye shifted along u.
-__device__ __noinline__ static void dPoseCamera(const DCamera& cam, double frames, DCamera& out) {
-    out = cam;
+__device__ __noinline__ static void dPoseCamera(const DCamera& cam, double frames, DCamera& out,
+                                                bool whole = true) {
+    if (whole) out = cam;   // else `out` already holds cam's every field but the pose's
     const int n = cam.nKeys;
     DCamKey k = cam.keys[0];
     if (n >= 2 && cam.keyB > cam.keyA) {
@@ -7193,6 +7194,7 @@ struct DCamSet {
     int camStride = 0;
     const DCamera* baseCams = nullptr;
     DCamera* poseOut = nullptr;
+    int camMoves = 0;          // a camera of the set blurs and moves (host-side knowledge)
     __device__ const DCamera& cam(int c) const {
         return cams[(size_t)camStride * (blockIdx.x * blockDim.x + threadIdx.x) + c];
     }
@@ -7267,12 +7269,18 @@ __device__ static inline float dPhotonTimeX(const DCamSet& cs, unsigned long lon
     tr.seedUnit(unit, seed ^ 0x3C6EF372FE94F82BULL);
     return (float)tr.uniform();
 }
+// This thread's copies of the set's cameras, seeded from the baked ones once a launch
+// (dSeedPhotonCameras); a photon then rewrites only a moving camera's pose (dPosePhotonCameras).
+__device__ static void dSeedPhotonCameras(const DCamSet& cs) {
+    if (cs.camStride <= 0) return;
+    DCamera* mine = cs.poseOut + (size_t)cs.camStride * (blockIdx.x * blockDim.x + threadIdx.x);
+    for (int c = 0; c < cs.nCam; ++c) mine[c] = cs.baseCams[c];
+}
 __device__ __noinline__ static void dPosePhotonCameras(const DCamSet& cs, double frames) {
     DCamera* mine = cs.poseOut + (size_t)cs.camStride * (blockIdx.x * blockDim.x + threadIdx.x);
     for (int c = 0; c < cs.nCam; ++c) {
         const DCamera& b = cs.baseCams[c];
-        if (b.blur && b.nKeys > 0) dPoseCamera(b, frames, mine[c]);
-        else mine[c] = b;
+        if (b.blur && b.nKeys > 0) dPoseCamera(b, frames, mine[c], /*whole=*/false);
     }
 }
 __device__ static inline void dSetPhotonTime(const DScene& sc, const DCamSet& cs, float x, bool pose) {
@@ -12581,6 +12589,7 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
                        long long N, int diffraction, unsigned long long seedBase, int maxBounce,
                        int camMode, int heroC, int perPhotonSeed) {
     D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    dSeedPhotonCameras(cs);   // a moving camera: this thread's own copies, posed per photon
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     DRng rng; rng.seedUnit((unsigned long long)g, seedBase);
@@ -12759,6 +12768,7 @@ __global__ void kWfInit(DScene sc, DCamSet cs, double* energy,
     D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     int slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= W) return;
+    dSeedPhotonCameras(cs);   // a moving camera: this slot's own copies, posed per photon
     DRng rng; rng.seedUnit((unsigned long long)slot, seedBase);
     bool live = wfSpawn(sc, cs, energy, camMode, N, dispatched, st, slot, rng, seedBase);
     st.rng[slot] = rng;
@@ -23795,6 +23805,7 @@ static gpu::DCamSet makeCamSet(DUpload& up, const std::vector<gpu::DCamera>& hca
     cs.baseCams = cs.cams;
     for (const DCamera& c : hcams)
         if (c.blur) { cs.blur = 1; cs.shOpen = c.shOpen; cs.shClose = c.shClose; break; }
+    for (const DCamera& c : hcams) cs.camMoves = cs.camMoves || (c.blur && c.nKeys > 0);
     return cs;
 }
 
@@ -23894,16 +23905,10 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
     const int kBlockSize = 128, kNumBlocks = 2048;   // the megakernel's ~262k threads
     DCamSet csRun = cs;
     DCamera* d_posed = nullptr;
-    if (cs.blur && cs.nCam > 0) {
-        std::vector<DCamera> base((size_t)cs.nCam);
-        CUDA_CHECK(cudaMemcpy(base.data(), cs.cams, base.size() * sizeof(DCamera), cudaMemcpyDeviceToHost));
-        bool moves = false;
-        for (const DCamera& c : base) moves = moves || (c.blur && c.nKeys > 0);
-        if (moves) {
-            const long long threads = wf ? wavefrontSlots(N) : (long long)kBlockSize * kNumBlocks;
-            CUDA_CHECK(cudaMalloc(&d_posed, (size_t)threads * cs.nCam * sizeof(DCamera)));
-            csRun.cams = d_posed; csRun.poseOut = d_posed; csRun.camStride = cs.nCam;
-        }
+    if (cs.camMoves && cs.nCam > 0) {
+        const long long threads = wf ? wavefrontSlots(N) : (long long)kBlockSize * kNumBlocks;
+        CUDA_CHECK(cudaMalloc(&d_posed, (size_t)threads * cs.nCam * sizeof(DCamera)));
+        csRun.cams = d_posed; csRun.poseOut = d_posed; csRun.camStride = cs.nCam;
     }
     if (wf) {
         // Streaming backend: identical physics, path-regeneration scheduling. Same

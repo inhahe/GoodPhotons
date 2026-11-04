@@ -98,6 +98,29 @@ and a glossy child (mode B alone agreed with R). Found by check_motion's new blu
 which saw the same excess. `forwardScale` now takes the ratio of the films' sums, which has no
 such term; mode V's comparison reports its scale the same way.
 
+## OPEN (2026-11-04, 0.420.2): BLUR-EPOCH-COST — a blurred clock epoch of mode M or J rebuilds its light side every 4 samples
+
+Under a blur of a moving scene, modes M and J render each epoch at one time in the shutter, so
+the epochs' average is the blur and many epochs must sample it. With a fixed `-spp` an epoch is a
+64th of it. Under `-time`, `-noise` or `-forever`, which have no total to split, an epoch ends
+after 4 samples (`blurEpochSpp` in mode M, `blurEpochsJ` in mode J's `inner.report`, main.cpp),
+whatever the light side cost to rebuild. A dear one (millions of photons, a big beam map) then
+takes much of the clock in rebuilds, and a `-time` render reaches far fewer samples than it
+would without the shutter (Fable's review of 0.420.0).
+
+Bounding the rebuilds' share instead was tried and measured wrong. Sizing the epoch by
+`-beamrefresh`, or ending it once it had gathered as long as it rebuilt, ran a short `-noise`
+render of check_motion's box in 1 to 8 epochs. It then blurred too coarsely: mode M 1 to 4
+blocks off blurred mode R, J 5 to 8, where the 4-sample rule passes. The noise estimate cannot
+see that error, since the samples of one epoch share its time.
+
+Proper fix: make each epoch's light side cheaper rather than the epochs fewer. In mode M at its
+fixed radius (`rebuildPhotonMapAt`), a map of N/k photons is the same estimator at k times the
+variance, so k epochs of N/k photons each average to what one of N gives. Under a clock blur,
+size each epoch's photon count so its rebuild costs about what its 4 samples' gather does, the
+map normalised by its own nEmitted. Mode J's beams likewise, though its surface radius shrinks
+on the epoch index (`surfRadiusFor`), which must then count rebuilds, not samples.
+
 ## OPEN (2026-11-03, 0.413.0): DEFORM-LIMITS — what a deforming mesh cannot do yet
 
 Each is refused or warned at load, never rendered wrong:

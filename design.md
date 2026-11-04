@@ -10118,8 +10118,12 @@ sees the instant, exactly as a static scene with those transforms would show it.
   mode U's `vcmPass` each take their pass count's time and pose the camera there. Mode M times
   each epoch (`atEpoch`: light side and gather), ending an epoch after a 64th of the samples so
   the shutter is sampled, and sets `-beamfreeze` aside. Mode J times each realization in
-  `realize` (`atEpochJ`), on 64 fixed epochs of a fixed `-spp` or the clock's under a budget, and
-  shares none across cameras. A camera moving over a still scene leaves M's and S's maps
+  `realize` (`atEpochJ`), on 64 fixed epochs of a fixed `-spp`, and shares none across cameras.
+  Under a clock (`-time`, `-noise`, `-forever`: no total to split) an epoch of either ends after 4
+  samples, so many epochs sample the shutter -- which a light side dear to rebuild pays for in
+  rebuilds (known-issues BLUR-EPOCH-COST). Any rule that bounds the rebuilds' share instead (an
+  epoch sized by `-beamrefresh`, or one gathering as long as it rebuilt) ran 1 to 8 epochs of a
+  short `-noise` render, which then blurred too coarsely, the noise estimate blind to it. A camera moving over a still scene leaves M's and S's maps
   timeless: their gathers pose each sample (`renderPhotonCamera`, `sppmPass`'s camera worker),
   and a shared mode M map still serves several such cameras, gathered on the CPU. U and J take
   one time a pass or epoch even then, because their light subpaths are traced for the camera
@@ -10239,8 +10243,10 @@ sees the instant, exactly as a static scene with those transforms would show it.
   squared), and a sky or sun photon started where the scene's haze does or dropped
   (`dSkyEntryPastHaze`, `mayDrop`). A camera that blurs and moves is posed once a photon, into
   the thread's own copy of the set's cameras (`DCamSet::cam`: `cams` then holds one copy per
-  thread of the launch, `camStride` apart, which `launchForward` allocates; a still render's
-  stride is 0, so its splats read the camera as they always did), and every splat reads it
+  thread of the launch, `camStride` apart, which `launchForward` allocates when the host's
+  `DCamSet::camMoves` says one moves; each thread seeds its copies once a launch and a photon
+  rewrites only the pose; a still render's stride is 0, so its splats read the camera as they
+  always did), and every splat reads it
   there (the surface, fibre, volume, emission and hero splats, mode C's catch through the
   pinhole or the lens). Posing at each splat instead, through a reference that might name a
   local copy, made every splat's camera reads generic and slowed a still mode B render by
