@@ -10289,7 +10289,7 @@ sees the instant, exactly as a static scene with those transforms would show it.
 - **The cold paths are out of line** (`__noinline__`: the timed walks, the deforming corners, the
   camera pose, a light's carry, the walk to the haze), as the host's twins are (FT_NOINLINE): a
   still render never calls them. A cold helper that changes the caller's values takes and
-  returns them by value (`dLightCarryOut`, `dSkyEntryPastHazeOut`): a reference into an
+  returns them by value (`dLightCarry2Out`, `dSkyEntryPastHazeOut`): a reference into an
   out-of-line call holds the caller's variable in memory for the whole caller.
 
 ## Deformers (ROADMAP 11 stage E, 0.413.0)

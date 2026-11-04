@@ -412,6 +412,10 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 // of S and U and each epoch of J at one time. A blurred forward render on the device has one
 // camera: a shared flight that blurs flies on the CPU.
 const char* cudaBlurUnsupported(const Scene& scene, const Camera& cam, char mode);
+// Device memory a blurred forward render (modes A, B and C) of a camera that moves takes for its
+// per-thread posed copies of the camera (DCamSet::cam): one a thread of the megakernel's grid, or
+// one a slot of the wavefront's pool for an N-photon trace -- for the VRAM preflight.
+size_t cudaForwardPosedCameraBytes(bool wavefront, long long N);
 
 // ---- Mode W (deterministic Whitted / POV-Ray-style preview) ----------------------------
 // Device twin of BackwardRenderer's mode-W fields (src/backward.h). Passing a non-null

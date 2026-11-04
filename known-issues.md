@@ -98,6 +98,28 @@ and a glossy child (mode B alone agreed with R). Found by check_motion's new blu
 which saw the same excess. `forwardScale` now takes the ratio of the films' sums, which has no
 such term; mode V's comparison reports its scale the same way.
 
+## OPEN (2026-11-04, 0.422.1): P-HEROSPLIT-FIRST — blurred mode P under -herosplit files a sample by the hero's first event alone
+
+Blurred mode P files each backward sample by its path's first event
+(`BackwardRenderer::GiCtx::first`): a specular surface or the sky to the backward layer, a
+diffuse one, a medium scatter or a fibre to the forward one, a fibre's coverage pass-through
+being no event. Under `-herosplit` with `-dual-scatter` or `-direct-only`, a fibre's hair case
+falls through to the dispersive group (`radianceHero`), where each secondary wavelength becomes
+a sub-path of its own and draws its own coverage coin, but the sample has one first-event slot,
+which only the hero's coin sets. Where the hero is intercepted and a secondary passes through
+to a mirror or the sky, that wavelength's light is filed to the forward layer, which does not
+carry it; where the hero passes through and a secondary is intercepted, that secondary's fibre
+light is counted by both layers. At opacity p a secondary disagrees with the hero on about
+2p(1-p) of the fibre hits (Opus's review of 0.420.0).
+
+Not measured against mode R: `-dual-scatter` approximates a fibre's multiple scattering in the
+backward tracer while P's forward layer transports it in full, so blurred P and blurred R
+disagree under it even without a shutter (fur before a mirror: 0.974 still, 0.962 blurred). The
+same render without `-herosplit` matches R (1.0065).
+
+Proper fix: give each wavelength of a split sample its own first event (a slot per sub-path in
+`GiCtx`) and file each wavelength's radiance by its own, in `specFirstFilm`'s accumulation.
+
 ## OPEN (2026-11-04, 0.420.2): BLUR-EPOCH-COST — a blurred clock epoch of mode M or J rebuilds its light side every 4 samples
 
 Under a blur of a moving scene, modes M and J render each epoch at one time in the shutter, so

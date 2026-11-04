@@ -15705,6 +15705,12 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
                                      wavefront, g_heroC);
         Film sky; sky.resX = resX; sky.resY = resY; sky.alloc();
         std::vector<std::thread> skyPool;      // disjoint row bands of one film
+        // Joined on every way out, the device call's exceptions included: a joinable thread's
+        // destructor would terminate the process instead of letting the error reach run().
+        struct JoinAll {
+            std::vector<std::thread>& pool;
+            ~JoinAll() { for (auto& th : pool) if (th.joinable()) th.join(); }
+        } joinSky{skyPool};
         for (int t = 0; t < nThreads; ++t)
             skyPool.emplace_back([&, t] {
                 addBlurredSkyRows(sky, scene, *cam, N, 1, seedBase, (int)((long long)resY * t / nThreads),
@@ -19249,7 +19255,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // Headroom on top of the local-memory reservation for the scene upload, the
             // film buffers and the driver's own context. The film pair is known exactly
             // (two double3 images); 256 MB covers the rest with room to spare.
-            const size_t film   = (size_t)res * resY * 3 * sizeof(double) * 2;
+            // A blurred forward render of a moving camera: each thread's posed copy of it.
+            const size_t film   = (size_t)res * resY * 3 * sizeof(double) * 2 +
+                                  ((gpuForwardMode && cam.seesMotion(scene) && cam.moves())
+                                       ? cudaForwardPosedCameraBytes(wavefront, N) : 0);
             const size_t needAll = needLocal - reused + film + (size_t)256 * 1024 * 1024;
             const double toGB = 1.0 / (1024.0 * 1024.0 * 1024.0);
             // Always say what the card looks like. This one line is what turns "the render

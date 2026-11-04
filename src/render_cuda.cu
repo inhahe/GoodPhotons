@@ -4224,13 +4224,17 @@ __device__ __noinline__ static void dPoseCamera(const DCamera& cam, double frame
 }
 // A path's time at shutter fraction `x`: set for every query of the path (in the motion interval,
 // when the scene moves), and `posed` the camera there when it moves itself.
+// The path's time at `frames` (frames from the instant), set for its queries when the scene moves:
+// in the motion interval, clamped to it (host twin Scene::motionU).
+__device__ static inline void dSetFramesTime(const DScene& sc, double frames) {
+    if (!sc.mo.sets) return;
+    double u = (frames - sc.mo.motionA) / (sc.mo.motionB - sc.mo.motionA);
+    u = u < 0.0 ? 0.0 : (u > 1.0 ? 1.0 : u);
+    dSetMotionU((float)u);
+}
 __device__ static inline void dSetPathTime(const DScene& sc, const DCamera& cam, double x, DCamera* posed) {
     const double frames = cam.shOpen + (cam.shClose - cam.shOpen) * x;
-    if (sc.mo.sets) {
-        double u = (frames - sc.mo.motionA) / (sc.mo.motionB - sc.mo.motionA);
-        u = u < 0.0 ? 0.0 : (u > 1.0 ? 1.0 : u);
-        dSetMotionU((float)u);
-    }
+    dSetFramesTime(sc, frames);
     if (posed && cam.nKeys > 0) dPoseCamera(cam, frames, *posed);
 }
 // A camera path's time (sample sIdx of pixel pix), set for the path's queries; true with `posed`
@@ -4756,19 +4760,8 @@ struct DMotionNow {
 // carrying itself is out of line, as the timed walks are, and takes and returns its point and
 // direction by value: a reference into an out-of-line call would hold the caller's p and d in
 // memory for the whole caller.
-struct DPointDir { DVec3 p, d; };
-__device__ __noinline__ static DPointDir dLightCarryOut(const DScene& sc, int set, DVec3 p, DVec3 d) {
-    DAff D;
-    dMotionAt(sc.mo, set, (double)dMotionU(), D);
-    return DPointDir{affPoint(D.m, D.t, p), normalize(affDir(D.m, d))};
-}
-__device__ static inline void dLightCarry(const DScene& sc, const DEmitter& em, DVec3& p, DVec3& d) {
-    if (em.motion >= 0 && dTimed(sc)) {
-        const DPointDir r = dLightCarryOut(sc, em.motion, p, d);
-        p = r.p; d = r.d;
-    }
-}
-// The same with a second direction (a photon's: its emission direction and the light's axis).
+// dLightCarry2 carries a second direction as well (a photon's: its emission direction and the
+// light's axis); dLightCarry is it with one.
 struct DPointDir2 { DVec3 p, d1, d2; };
 __device__ __noinline__ static DPointDir2 dLightCarry2Out(const DScene& sc, int set, DVec3 p, DVec3 d1,
                                                          DVec3 d2) {
@@ -4781,6 +4774,12 @@ __device__ static inline void dLightCarry2(const DScene& sc, const DEmitter& em,
     if (em.motion >= 0 && dTimed(sc)) {
         const DPointDir2 r = dLightCarry2Out(sc, em.motion, p, d1, d2);
         p = r.p; d1 = r.d1; d2 = r.d2;
+    }
+}
+__device__ static inline void dLightCarry(const DScene& sc, const DEmitter& em, DVec3& p, DVec3& d) {
+    if (em.motion >= 0 && dTimed(sc)) {
+        const DPointDir2 r = dLightCarry2Out(sc, em.motion, p, d, d);
+        p = r.p; d = r.d1;
     }
 }
 // Tri::finalize's twin: the face normal, reach, tangent frame and curvature of a triangle
@@ -4908,6 +4907,14 @@ __device__ static void dHitToMoved(const DAff& D, const DAff& Di, int set, DHit&
     h.motionSet = set;
     h.deformTri = -1;
 }
+// Sphere `s0` moved by D (host twin Scene::movedSphere): its centre carried, its radius by the
+// motion's mean scale. (Its axes, which only a hit's UV reads, are turned by the caller.)
+__device__ static inline DSphere dMovedSphere(const DSphere& s0, const DAff& D) {
+    DSphere s = s0;
+    s.c = affPoint(D.m, D.t, s0.c);
+    s.r = s0.r * dAffScale(D);
+    return s;
+}
 // Any other moving primitive (global number `prim`, of kind sphere, isosurface, curve segment or
 // instance) at the path's time: a sphere moved (its radius by the motion's mean scale, its axes
 // turned); the rest met at the instant by the ray carried back there (an affine map keeps the
@@ -4919,9 +4926,7 @@ __device__ static bool dIntersectOtherNow(const DScene& sc, const DVec3& ro, con
         const DSphere& s0 = sc.sph[k];
         const int set = sc.mo.sphMotion[k];
         const DAff& D = mc.at(sc, set);
-        DSphere s = s0;
-        s.c = affPoint(D.m, D.t, s0.c);
-        s.r = s0.r * dAffScale(D);
+        const DSphere s = dMovedSphere(s0, D);
         if (anyHit) return intersectSphere(ro, rd, s, tmin, h);
         const DVec3 world[3] = {DVec3(1, 0, 0), DVec3(0, 1, 0), DVec3(0, 0, 1)};
         const DVec3* base = s0.frame >= 0 ? sc.sphAxes + 3 * s0.frame : world;
@@ -7291,11 +7296,7 @@ __device__ __noinline__ static void dPosePhotonCameras(const DCamSet& cs, double
 __device__ static inline void dSetPhotonTime(const DScene& sc, const DCamSet& cs, float x, bool pose) {
     if (x < 0.0f) return;
     const double frames = cs.shOpen + (cs.shClose - cs.shOpen) * (double)x;
-    if (sc.mo.sets) {                                  // dSetPathTime's, from the set's shutter
-        double u = (frames - sc.mo.motionA) / (sc.mo.motionB - sc.mo.motionA);
-        u = u < 0.0 ? 0.0 : (u > 1.0 ? 1.0 : u);
-        dSetMotionU((float)u);
-    }
+    dSetFramesTime(sc, frames);                        // in the set's one shutter
     if (pose && cs.camStride > 0) dPosePhotonCameras(cs, frames);
 }
 
@@ -7662,7 +7663,7 @@ __device__ static inline void dSunAimProject(const DVec3& t, const DVec3& b, int
 // the way; outside it the light crosses no haze before the first thing it meets, and is dropped
 // (`mayDrop`) when it meets nothing -- a BDPT subpath, which MIS weighs as a strategy, never is.
 // The walk to the haze is out of line (a still scene, or one with no media, never takes it), and
-// takes and returns the origin by value for the reason dLightCarryOut does.
+// takes and returns the origin by value for the reason dLightCarry2Out does.
 struct DSkyEntry { DVec3 origin; bool keep; };
 __device__ __noinline__ static DSkyEntry dSkyEntryPastHazeOut(const DScene& sc, DVec3 origin, DVec3 dir,
                                                              bool mayDrop) {
@@ -9531,6 +9532,19 @@ __device__ static bool dReflectOffSphere(const D3& o, const D3& d, const DSphere
     return true;
 }
 
+// The box [lo, hi] carried by D, in place (host twin expandCarried): the box of its eight corners
+// carried.
+__device__ static void dExpandCarried(const DAff& D, double* lo, double* hi) {
+    double nlo[3] = {1e300, 1e300, 1e300}, nhi[3] = {-1e300, -1e300, -1e300};
+    for (int k = 0; k < 8; ++k) {
+        const double x = (k & 1) ? hi[0] : lo[0], y = (k & 2) ? hi[1] : lo[1], z = (k & 4) ? hi[2] : lo[2];
+        for (int j = 0; j < 3; ++j) {
+            const double v = D.m[3 * j] * x + D.m[3 * j + 1] * y + D.m[3 * j + 2] * z + D.t[j];
+            nlo[j] = fmin(nlo[j], v); nhi[j] = fmax(nhi[j], v);
+        }
+    }
+    for (int j = 0; j < 3; ++j) { lo[j] = nlo[j]; hi[j] = nhi[j]; }
+}
 // A specular sphere as a path at its own time sees it (host twin Scene::sphereNow): sphere `k`
 // itself, or `tmp` filled with it moved by its keys -- the centre carried, the radius by the
 // motion's mean scale, as dIntersectOtherNow moves it.
@@ -9539,9 +9553,7 @@ __device__ static const DSphere& dSphereNow(const DScene& sc, int k, DSphere& tm
     if (!sc.mo.sphMotion || sc.mo.sphMotion[k] < 0 || !dTimed(sc)) return s0;
     DAff D;
     dMotionAt(sc.mo, sc.mo.sphMotion[k], (double)dMotionU(), D);
-    tmp = s0;
-    tmp.c = affPoint(D.m, D.t, s0.c);
-    tmp.r = s0.r * dAffScale(D);
+    tmp = dMovedSphere(s0, D);
     return tmp;
 }
 // A mirror plane as a path at its own time sees it (host twin Scene::mirrorPlaneNow): `mp` itself,
@@ -9576,18 +9588,7 @@ __device__ __noinline__ static const DMirrorPlane* dMirrorPlaneNow(const DScene&
         double lo[3], hi[3];
         for (int j = 0; j < 3; ++j) { lo[j] = fmin(b0[j], b1[j]); hi[j] = fmax(b0[3 + j], b1[3 + j]); }
         const int set = sc.mo.triMotion ? sc.mo.triMotion[mp.deformTri] : -1;
-        if (set >= 0) {                  // in a moving group: the box carried by its motion now
-            const DAff& D = mc.at(sc, set);
-            double nlo[3] = {1e300, 1e300, 1e300}, nhi[3] = {-1e300, -1e300, -1e300};
-            for (int k = 0; k < 8; ++k) {
-                const double x = (k & 1) ? hi[0] : lo[0], y = (k & 2) ? hi[1] : lo[1], z = (k & 4) ? hi[2] : lo[2];
-                for (int j = 0; j < 3; ++j) {
-                    const double v = D.m[3 * j] * x + D.m[3 * j + 1] * y + D.m[3 * j + 2] * z + D.t[j];
-                    nlo[j] = fmin(nlo[j], v); nhi[j] = fmax(nhi[j], v);
-                }
-            }
-            for (int j = 0; j < 3; ++j) { lo[j] = nlo[j]; hi[j] = nhi[j]; }
-        }
+        if (set >= 0) dExpandCarried(mc.at(sc, set), lo, hi);   // in a moving group: carried by it now
         const double ex = hi[0] - lo[0], ey = hi[1] - lo[1], ez = hi[2] - lo[2];
         const double pad = 1e-6 * (1.0 + sqrt(ex * ex + ey * ey + ez * ez));
         tmp.lox = lo[0] - pad; tmp.loy = lo[1] - pad; tmp.loz = lo[2] - pad;
@@ -9611,14 +9612,8 @@ __device__ __noinline__ static const DMirrorPlane* dMirrorPlaneNow(const DScene&
     tmp = mp;
     tmp.nx = nx; tmp.ny = ny; tmp.nz = nz;
     tmp.d = nx * px + ny * py + nz * pz;
-    double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
-    for (int k = 0; k < 8; ++k) {                   // the box carried (expandCarried)
-        const double x = (k & 1) ? mp.hix : mp.lox, y = (k & 2) ? mp.hiy : mp.loy, z = (k & 4) ? mp.hiz : mp.loz;
-        for (int j = 0; j < 3; ++j) {
-            const double v = D.m[3 * j] * x + D.m[3 * j + 1] * y + D.m[3 * j + 2] * z + D.t[j];
-            lo[j] = fmin(lo[j], v); hi[j] = fmax(hi[j], v);
-        }
-    }
+    double lo[3] = {mp.lox, mp.loy, mp.loz}, hi[3] = {mp.hix, mp.hiy, mp.hiz};
+    dExpandCarried(D, lo, hi);
     tmp.lox = lo[0]; tmp.loy = lo[1]; tmp.loz = lo[2];
     tmp.hix = hi[0]; tmp.hiy = hi[1]; tmp.hiz = hi[2];
     return &tmp;
@@ -23857,6 +23852,13 @@ static gpu::DCamSet makeCamSet(DUpload& up, const std::vector<gpu::DCamera>& hca
     cs.baseCams = cs.cams;
     for (const DCamera& c : hcams)
         if (c.blur) { cs.blur = 1; cs.shOpen = c.shOpen; cs.shClose = c.shClose; break; }
+    // ...which every camera that blurs must share: a photon takes one time for all of them.
+    for (const DCamera& c : hcams)
+        if (c.blur && (c.shOpen != cs.shOpen || c.shClose != cs.shClose)) {
+            std::fprintf(stderr, "internal error: a device camera set holds cameras with different "
+                                 "shutters\n");
+            std::exit(3);
+        }
     for (const DCamera& c : hcams) cs.camMoves = cs.camMoves || (c.blur && c.nKeys > 0);
     return cs;
 }
@@ -23954,7 +23956,8 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
     // A moving camera under a blur: each thread poses its own copy of the set's cameras at its
     // photon's time (DCamSet::cam), one per thread of the launch -- the wavefront's slots, or
     // the megakernel's grid.
-    const int kBlockSize = 128, kNumBlocks = 2048;   // the megakernel's ~262k threads
+    const int kBlockSize = 128, kNumBlocks = 2048;   // the megakernel's ~262k threads (and
+                                                     // cudaForwardPosedCameraBytes')
     DCamSet csRun = cs;
     DCamera* d_posed = nullptr;
     if (cs.camMoves && cs.nCam > 0) {
@@ -25658,6 +25661,11 @@ size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
 }
 
 // --------------------- backward reference (mode R) host ----------------------
+
+size_t cudaForwardPosedCameraBytes(bool wavefront, long long N) {
+    const long long threads = wavefront ? (long long)wavefrontSlots(N) : 128LL * 2048LL;   // launchForward's
+    return (size_t)threads * sizeof(gpu::DCamera);
+}
 
 const char* cudaBlurUnsupported(const Scene& /*scene*/, const Camera& /*cam*/, char mode) {
     if (mode == 0 || !std::strchr("RWDABCSUJM", mode))

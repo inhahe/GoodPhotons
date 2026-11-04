@@ -3475,6 +3475,14 @@ struct BackwardRenderer {
                 // it back (gmisIn).
                 const GlossyMis gmisIn = gmis;
                 gmis.clear();
+                // A coverage pass-through (a fibre the ray passes straight through) is no vertex: it
+                // keeps the last real vertex's MIS record, is refunded its bounce (capped: 256 is far
+                // above anything real fur hands back), and is not the path's first event.
+                const auto passedThrough = [&]() {
+                    gmis = gmisIn;
+                    if (nullSteps < 256) { --b; ++nullSteps; }
+                    unnoteFirst(gi, firstHere);
+                };
 
             switch (m.type) {
                 case MatType::DiffuseTransmit: {
@@ -3677,11 +3685,7 @@ struct BackwardRenderer {
                         const Vec3 wOut = hair::toWorld(hsB[0].fr, wl);
                         ray = Ray{h.p + wOut * 1e-9, wOut, hairExitOffset(hsB[0], h.n, wOut)};
                         if (passThru) {
-                            // A null interaction: transparent to the MIS of the last REAL vertex,
-                            // and it refunds its bounce (see the scalar Hair case).
-                            gmis = gmisIn;
-                            if (nullSteps < 256) { --b; ++nullSteps; }
-                            unnoteFirst(gi, firstHere);   // passed through: not the first event
+                            passedThrough();
                         } else {
                             // The env-escape MIS partner: the bundle's mixture density for wOut, the
                             // same pbar neeEnvHeroHair weighed against (sum r_old p_j / sum r_old).
@@ -3764,9 +3768,7 @@ struct BackwardRenderer {
                         if (!interactMaterial(scene, m, h, mats, ray, lam[0], invPdf[0], thr[0],
                                               L[0], specularArrival, contBsdfPdf, stk, rng,
                                               spdCache, gi, nullptr, &heroNull)) { finish(); return; }
-                        if (heroNull) gmis = gmisIn;
-                        if (heroNull && nullSteps < 256) { --b; ++nullSteps; }
-                        if (heroNull) unnoteFirst(gi, firstHere);   // passed through: not the first event
+                        if (heroNull) passedThrough();
                         break;
                     }
                     // Default policy: terminate secondaries, then run the shared scalar
@@ -3776,9 +3778,7 @@ struct BackwardRenderer {
                     if (!interactMaterial(scene, m, h, mats, ray, lam[0], invPdf[0], thr[0], L[0],
                                           specularArrival, contBsdfPdf, stk, rng, spdCache, gi,
                                           nullptr, &heroNull2)) { finish(); return; }
-                    if (heroNull2) gmis = gmisIn;
-                    if (heroNull2 && nullSteps < 256) { --b; ++nullSteps; }
-                    if (heroNull2) unnoteFirst(gi, firstHere);   // passed through: not the first event
+                    if (heroNull2) passedThrough();
                     break;
                 }
                 case MatType::Diffuse:

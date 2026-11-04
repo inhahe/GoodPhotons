@@ -59,7 +59,8 @@ cube whose keys scale and shear it together. It requires:
   * The camera's own motion, in the box held still: a camera with `motion` keys and no shutter
     renders byte for byte the still camera at its keys' instant (CPU, and GPU); with the shutter,
     the mean of 32 renders from its poses through it (mode R; modes D and B agree with mode R, and
-    mode R on the GPU with mode R on the CPU, modes D and B on the GPU with mode R). The middle frame of a straight, even
+    mode R on the GPU with mode R on the CPU, modes D and B on the GPU, B on the wavefront too,
+    with mode R). The middle frame of a straight, even
     `camera_path` with a shutter blurs as the mean of the eyes half a frame either side. The
     loader refuses camera keys without a `motion_interval`, a single key, and a key's `fov_y` on
     a camera whose `lens` sets its view. A key without `fov_y` keeps the camera's own (the same
@@ -904,9 +905,11 @@ def main():
         c = [lum(render(exe, out, pm, "cpu_Bs_%d" % s, bargs("cpu"), seed=s)[0]) for s in (1, 2)]
         good, detail = agree(g, c)
         verdict("blurred mode B on the GPU = on the CPU: moving mirrors and glass", good, detail)
+        # The wavefront serves the scalar path only (the hero bundle runs the megakernel), so
+        # -heroc 1, or the case would never leave the megakernel.
         g = [lum(render(exe, out, blurred, "gpu_Bwf_%d" % s, ["-mode", "B", "-device", "gpu", "-n", "40000000",
-                                                              "-wavefront"], seed=s, want_gpu=True)[0])
-             for s in (1, 2)]
+                                                              "-wavefront", "-heroc", "1"], seed=s,
+                        want_gpu=True)[0]) for s in (1, 2)]
         good, detail = agree(g, cpu_box_b)
         verdict("... and on the wavefront backend: the box", good, detail)
         for nm, path, _spp in [c_ for c_ in gpu_cases if c_[0] in ("the box", "moving lights of every shape")]:
@@ -1226,6 +1229,11 @@ def camera_tests(exe, out, verdict, devices):
                         seed=s, want_gpu=True)[0]) for s in (1, 2)]
         good, detail = agree(g, blur, 0.05)
         verdict("... mode B on the GPU = mode R", good, detail)
+        g = [lum(render(exe, out, moving, "cam_blur_gpuBwf_s%d" % s, ["-mode", "B", "-device", "gpu", "-n", "40000000",
+                                                                    "-wavefront", "-heroc", "1"],
+                        seed=s, want_gpu=True)[0]) for s in (1, 2)]
+        good, detail = agree(g, blur, 0.05)
+        verdict("... and on the wavefront backend", good, detail)
         for mode, margs, tol in (("M", ["-spp", "128", "-n", "2000000"], 0.10),
                                  ("S", ["-spp", "128", "-n", "200000"], 0.15), ("U", ["-spp", "256"], 0.10),
                                  ("J", ["-spp", "128", "-jsurf"], 0.10)):
