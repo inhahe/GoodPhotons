@@ -98,6 +98,21 @@ and a glossy child (mode B alone agreed with R). Found by check_motion's new blu
 which saw the same excess. `forwardScale` now takes the ratio of the films' sums, which has no
 such term; mode V's comparison reports its scale the same way.
 
+## OPEN (2026-11-04, 0.429.1): RADCACHE-BATCHES — under -radcache a fixed budget's CPU batches follow its samples, not the clock
+
+The CPU's radiance cache (`-radcache`) advances at the end of each backward call, merging the
+call's deposits, so where the calls are cut is part of the realization. Mode R's `cpuSppChunks`
+and (since 0.429.1) mode P's `runCompositeProgressive` therefore give a fixed budget a schedule
+of its samples alone -- 1, 9, then the rest in 62 even batches -- so one seed renders one image.
+The cost (Fable's review of 0.429.1): a batch can then run far longer than the clock would cut it
+(48 spp of a 3000-spp 1080p render), so `-interval` writes, window repaints, the status line and
+`ftrace -stop` land only at batch ends -- a stop can outlast its 120 s and report FAILED -- and a
+`-resume` draws a schedule of its own, so a stopped and resumed render is not the uninterrupted
+one. Proper fix: advance the cache at absolute sample counts (the boundaries of that schedule,
+whatever the calls), so a call that crosses one updates there and any batching renders the same
+image; its deposits since the last boundary then belong in the checkpoint beside the table
+(`writeRadCacheSection`), for a resume to continue them.
+
 ## OPEN (2026-11-04, 0.422.1): P-HEROSPLIT-FIRST — blurred mode P under -herosplit files a sample by the hero's first event alone
 
 Blurred mode P files each backward sample by its path's first event

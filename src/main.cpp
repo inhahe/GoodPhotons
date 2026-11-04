@@ -28399,8 +28399,14 @@ static int run(int argc, char** argv) {
     // Shared photon-map pass (mode M): build ONE view-independent map, gather every
     // camera from it. This is where the photon map pays off over per-camera backward
     // tracing — the (expensive) forward photon flight amortizes across all frames.
-    auto runSharedPhotonMap = [&](const std::vector<int>& idx) {
+    // `apartNo` / `apartOf`: this camera's place among those gathered apart (groupMApart), 1-based,
+    // or 0 for the run's shared group -- its title-bar frame, and whether the notices every camera
+    // would repeat are printed (the first only). The aimed caustic map is the scene's alone, so the
+    // calls build it once (aimCache).
+    struct AimCache { bool ready = false; caim::AimMap map; long long nAimed = 0; } aimCache;
+    auto runSharedPhotonMap = [&](const std::vector<int>& idx, int apartNo = 0, int apartOf = 0) {
         if (idx.empty() || g_stopRequested) return;
+        const bool firstCall = apartNo <= 1;
         g_windowMode = modeLabel('M');   // title bar shows the shared photon-map mode
         // Device: CPU until the GPU branch below claims it. This path never reaches
         // runRender's stamp either, so it names its own device -- and its own frame: a
@@ -28408,21 +28414,24 @@ static int run(int argc, char** argv) {
         g_windowBackend = backendLabel(false, nThreads);
         // One camera: its label now. Several: blank through the deposit and map build, which
         // serve every frame; each gathered frame stamps its own label.
-        g_windowFrame   = (idx.size() == 1) ? frameLabel(toRender[idx[0]], 1, 1) : std::string();
+        g_windowFrame   = (idx.size() == 1) ? frameLabel(toRender[idx[0]], std::max(1, apartNo), std::max(1, apartOf))
+                                            : std::string();
         double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                               : scene.sceneRadius * g_pmRadiusFactor;
         // Photon beams (the view-independent volume cache). Decided — and warned about —
         // before the GPU branch below, since that branch has no beam gather and would
         // otherwise drop a media scene's volume without a word.
         const bool wantBeams = g_beamGather && !scene.media.empty();
-        warnModeMMedia(scene, wantBeams);
-        warnBeamsGrinMedia(scene, wantBeams);
+        if (firstCall) {
+            warnModeMMedia(scene, wantBeams);
+            warnBeamsGrinMedia(scene, wantBeams);
+        }
         // -resume / -checkpoint no longer disqualify a mode-M camera from this shared path
         // (they used to, which silently cost the render the entire GPU backend — see
         // known-issues.md). They are still INERT for mode M, so say so here: runRender's
         // matching warning is on the branch we no longer take, and a flag that quietly does
         // nothing is worse than one that says it does nothing.
-        if (resume || wantCheckpointFlag)
+        if (firstCall && (resume || wantCheckpointFlag))
             std::fprintf(stderr,
                 "[render] -checkpoint/-resume: the SHARED mode-M path needs no sidecar and\n"
                 "         ignores them. It writes each frame the instant that frame's gather\n"
@@ -28658,10 +28667,12 @@ static int run(int argc, char** argv) {
                 // Aimed caustic emission (-causticn), the exact twin of the CPU call below.
                 // Skipped when the map is being LOADED: -loadmap replays a stored deposit, so
                 // there is no emission pass for a second sampler to join.
-                long long nAimedGpu = 0;
-                const caim::AimMap aimMapGpu =
-                    g_pmapLoad.empty() ? buildAimMap(scene, N, nAimedGpu, "[camera]")
-                                       : caim::AimMap{};
+                if (!aimCache.ready) {
+                    if (g_pmapLoad.empty()) aimCache.map = buildAimMap(scene, N, aimCache.nAimed, "[camera]");
+                    aimCache.ready = true;
+                }
+                const caim::AimMap& aimMapGpu = aimCache.map;
+                const long long nAimedGpu = aimCache.nAimed;
                 // One realization of the light side plus `sppWant` camera samples gathered
                 // from it. The whole device pass — scene upload, deposit, map builds, beam
                 // BVH, gather, teardown — lives in here, which is what makes the epoch loop
@@ -29090,7 +29101,8 @@ static int run(int argc, char** argv) {
         gaDiagReport(scene);
     };
     runSharedPhotonMap(groupM);
-    for (int i : groupMApart) runSharedPhotonMap(std::vector<int>{i});
+    for (size_t k = 0; k < groupMApart.size(); ++k)
+        runSharedPhotonMap(std::vector<int>{groupMApart[k]}, (int)k + 1, (int)groupMApart.size());
 
     // What this batch's cameras share (BatchCache): mode J's light side where every camera
     // would draw the same one, and the device copy of the scene. Declared here rather than as a

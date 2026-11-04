@@ -6862,24 +6862,7 @@ private:
                                      b.name.empty() ? "(unnamed)" : ("'" + b.name + "'").c_str());
                 }
             }
-            if (find(b, "power") || find(b, "lumens")) {
-                // Total front-facing area of the range → power law geomW = area*PI.
-                double area = 0.0;
-                for (size_t t = triStart; t < triEnd; ++t) {
-                    const Tri& tr = L.scene.tris[t];
-                    area += 0.5 * length(cross(tr.v1 - tr.v0, tr.v2 - tr.v0));
-                }
-                Spectrum scaled = absPower(b, L.scene.mats[id].emit, area * PI, L);
-                Material clone = L.scene.mats[id];
-                clone.emit = scaled;
-                int newId = (int)L.scene.mats.size();
-                L.scene.mats.push_back(std::move(clone));
-                for (size_t t = triStart; t < triEnd; ++t) L.scene.tris[t].matId = newId;
-                L.scene.addMeshLight(triStart, triEnd - triStart, scaled, binWidth_, newId);
-            } else {
-                L.scene.addMeshLight(triStart, triEnd - triStart,
-                                     L.scene.mats[id].emit, binWidth_, id);
-            }
+            addMeshEmitter(b, L, triStart, triEnd, id, /*own*/false);
         }
         // Record the loaded mesh's world AABB for object-name fog bounds. This is no
         // longer the *shape* of such a bound — `bounds { object "..." }` solid-voxelizes
@@ -8128,19 +8111,56 @@ private:
         return true;
     }
 
-    // A sphere or tube light built as the emissive triangles [t0, end) of material `id` (addLight):
-    // its `power` or `lumens` taken over their area, the radiance given to the material, the
-    // triangles registered as a mesh light.
-    bool addLightMesh(const Block& b, Loaded& L, const Spectrum& spd, size_t t0, int id) {
-        double area = 0.0;
-        for (size_t i = t0; i < L.scene.tris.size(); ++i) {
-            const Tri& tr = L.scene.tris[i];
-            area += 0.5 * length(cross(tr.v1 - tr.v0, tr.v2 - tr.v0));
+    // Triangles [t0, t1) of the emissive material `id` as a mesh light (Scene::addMeshLight): the
+    // block's `power` or `lumens`, if it gives one, taken over their area (absPower) into the
+    // material's radiance. A material others may share (`own` false: a mesh block's) is cloned for
+    // these triangles first, so its other users keep theirs; a sphere or tube light's is its own.
+    void addMeshEmitter(const Block& b, Loaded& L, size_t t0, size_t t1, int id, bool own) {
+        if (find(b, "power") || find(b, "lumens")) {
+            double area = 0.0;   // the range's whole area: power law geomW = area * PI
+            for (size_t i = t0; i < t1; ++i) {
+                const Tri& tr = L.scene.tris[i];
+                area += 0.5 * length(cross(tr.v1 - tr.v0, tr.v2 - tr.v0));
+            }
+            const Spectrum scaled = absPower(b, L.scene.mats[(size_t)id].emit, area * PI, L);
+            if (!own) {
+                Material clone = L.scene.mats[(size_t)id];
+                id = (int)L.scene.mats.size();
+                L.scene.mats.push_back(std::move(clone));
+                for (size_t i = t0; i < t1; ++i) L.scene.tris[i].matId = id;
+            }
+            L.scene.mats[(size_t)id].emit = scaled;
         }
-        const Spectrum emit = absPower(b, spd, area * PI, L);
-        L.scene.mats[(size_t)id].emit = emit;
-        L.scene.addMeshLight(t0, L.scene.tris.size() - t0, emit, binWidth_, id);
-        return true;
+        L.scene.addMeshLight(t0, t1 - t0, L.scene.mats[(size_t)id].emit, binWidth_, id);
+    }
+
+    // A tube's wall, and with `caps` its end discs, as `segs`-sided triangles of material `id`
+    // wound outward: `base` the base cap's centre, `axis` from it to the top's, (t, bt) the radial
+    // frame and `rad` the radius, all in the frame the corners are built in, `at` placing a corner
+    // in the scene. With `nrm` (`smooth`), each corner gets the frame's radial or axial normal
+    // carried by it.
+    template <class At, class Nrm>
+    void addTubeTris(Loaded& L, int id, int segs, bool caps, const Vec3& base, const Vec3& axis,
+                     const Vec3& t, const Vec3& bt, double rad, At at, Nrm nrm, bool smooth) {
+        const Vec3 au = normalize(axis), top = base + axis;
+        auto push = [&](const Vec3& p0, const Vec3& p1, const Vec3& p2, const Vec3& n0, const Vec3& n1,
+                        const Vec3& n2) {
+            Tri tr{at(p0), at(p1), at(p2), id, -1, {}};
+            if (smooth) { tr.n0 = nrm(n0); tr.n1 = nrm(n1); tr.n2 = nrm(n2); }
+            L.scene.tris.push_back(tr);
+        };
+        for (int i = 0; i < segs; ++i) {
+            const double a0 = 2.0 * PI * i / segs, a1 = 2.0 * PI * (i + 1) / segs;
+            const Vec3 r0 = t * std::cos(a0) + bt * std::sin(a0), r1 = t * std::cos(a1) + bt * std::sin(a1);
+            const Vec3 b0 = base + r0 * rad, b1 = base + r1 * rad;
+            const Vec3 p0 = b0 + axis, p1 = b1 + axis;
+            push(b0, b1, p1, r0, r1, r1);
+            push(b0, p1, p0, r0, r1, r0);
+            if (caps) {   // the base's fan facing -axis (b1, b0, centre), the top's +axis (p0, p1, centre)
+                push(b1, b0, base, au * -1.0, au * -1.0, au * -1.0);
+                push(p0, p1, top, au, au, au);
+            }
+        }
     }
 
     // Each `light` block registers one Emitter. Multiple light blocks accumulate;
@@ -8206,11 +8226,13 @@ private:
             // and any affine motion both take (Scene::addMeshLight), as addSphere tessellates
             // such a sphere.
             if (nonUniform || sphereAsMesh_) {
-                Material lm; lm.reflect = constantSpectrum(0.0); lm.isLight = true; lm.reflectsNothing = true;
+                Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
+                lm.reflectsNothing = true;
                 const int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
                 const size_t t0 = L.scene.tris.size();
                 addTessellatedSphere(L, xf, c, radiusOf(b, "sphere light", 0.1), id);
-                return addLightMesh(b, L, spd, t0, id);
+                addMeshEmitter(b, L, t0, L.scene.tris.size(), id, /*own*/true);
+                return true;
             }
             double rad = Len(radiusOf(b, "sphere light", 0.1)) * s;
             Vec3 cw = P(xf.apply(c));
@@ -8243,34 +8265,18 @@ private:
             // unevenly (sphereAsMesh_) one at some time: the same wall (and caps) as an emissive
             // mesh, built where the group puts it, its normals by the inverse transpose.
             if (nonUniform || sphereAsMesh_) {
-                Material lm; lm.reflect = constantSpectrum(0.0); lm.isLight = true; lm.reflectsNothing = true;
+                Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
+                lm.reflectsNothing = true;
                 const int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
                 const size_t t0 = L.scene.tris.size();
                 const double lenL = dblOf(b, "length", 0.5), radL = radiusOf(b, "cylinder light", 0.05);
                 const Vec3 au = normalize(dir);
                 Vec3 t, bt; onb(au, t, bt);
-                const Vec3 base = c - au * (lenL * 0.5);
-                auto at = [&](const Vec3& p) { return P(xf.apply(p)); };
-                auto nrm = [&](const Vec3& n) { return normalize(xf.applyNormal(n)); };
-                auto tri = [&](const Vec3& p0, const Vec3& p1, const Vec3& p2, const Vec3& n0, const Vec3& n1,
-                               const Vec3& n2) {
-                    Tri tr{at(p0), at(p1), at(p2), id, -1, {}};
-                    tr.n0 = nrm(n0); tr.n1 = nrm(n1); tr.n2 = nrm(n2);
-                    L.scene.tris.push_back(tr);
-                };
-                for (int i = 0; i < segs; ++i) {
-                    const double a0 = 2.0 * PI * i / segs, a1 = 2.0 * PI * (i + 1) / segs;
-                    const Vec3 r0 = t * std::cos(a0) + bt * std::sin(a0), r1 = t * std::cos(a1) + bt * std::sin(a1);
-                    const Vec3 b0 = base + r0 * radL, b1 = base + r1 * radL;
-                    const Vec3 p0 = b0 + au * lenL, p1 = b1 + au * lenL;
-                    tri(b0, b1, p1, r0, r1, r1);   // outward winding, as the wall below
-                    tri(b0, p1, p0, r0, r1, r0);
-                    if (caps) {
-                        tri(b1, b0, base, au * -1.0, au * -1.0, au * -1.0);
-                        tri(p0, p1, base + au * lenL, au, au, au);
-                    }
-                }
-                return addLightMesh(b, L, spd, t0, id);
+                addTubeTris(L, id, segs, caps, c - au * (lenL * 0.5), au * lenL, t, bt, radL,
+                            [&](const Vec3& p) { return P(xf.apply(p)); },
+                            [&](const Vec3& n) { return normalize(xf.applyNormal(n)); }, /*smooth*/true);
+                addMeshEmitter(b, L, t0, L.scene.tris.size(), id, /*own*/true);
+                return true;
             }
             double len = Len(dblOf(b, "length", 0.5)) * s;
             double rad = Len(radiusOf(b, "cylinder light", 0.05)) * s;
@@ -8284,22 +8290,8 @@ private:
             // Tessellate the lateral wall. onb(normalize(axisW),...) here matches the
             // basis addCylinderLight computes, so facets align with the sampled radius.
             Vec3 au = normalize(axisW); Vec3 t, bt; onb(au, t, bt);
-            Vec3 topW = baseW + axisW;                          // top-cap center
-            for (int i = 0; i < segs; ++i) {
-                double a0 = 2.0 * PI * i / segs, a1 = 2.0 * PI * (i + 1) / segs;
-                Vec3 r0 = t * std::cos(a0) + bt * std::sin(a0);
-                Vec3 r1 = t * std::cos(a1) + bt * std::sin(a1);
-                Vec3 b0 = baseW + r0 * rad, b1 = baseW + r1 * rad;
-                Vec3 p0 = b0 + axisW, p1 = b1 + axisW;
-                L.scene.tris.push_back(Tri{b0, b1, p1, id, -1, {}});   // outward winding
-                L.scene.tris.push_back(Tri{b0, p1, p0, id, -1, {}});
-                if (caps) {
-                    // Emissive end-disc fans: base normal -au (winding b1,b0,center),
-                    // top normal +au (winding p0,p1,center).
-                    L.scene.tris.push_back(Tri{b1, b0, baseW, id, -1, {}});
-                    L.scene.tris.push_back(Tri{p0, p1, topW, id, -1, {}});
-                }
-            }
+            addTubeTris(L, id, segs, caps, baseW, axisW, t, bt, rad, [](const Vec3& p) { return p; },
+                        [](const Vec3& n) { return n; }, /*smooth*/false);
             L.scene.addCylinderLight(baseW, axisW, rad, spd, binWidth_, /*matId*/id, caps);
             return true;
         }

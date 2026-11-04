@@ -10226,7 +10226,11 @@ sees the instant, exactly as a static scene with those transforms would show it.
   normal -- the face the NEE side measures a light by, a mesh light's `EmitTri::nrm`, not a smooth
   mesh's shading normal -- and its deforming triangle), so no caller can drop a part. A light with
   no area at a path's time (a triangle collapsed, keys that flatten it: J = 0) emits nothing then,
-  `emitterSamplePoint` zeroing its radiance and leaving its densities finite. The timed
+  `emitterSamplePoint` zeroing its radiance and leaving its densities finite. A triangle with no
+  area at the instant that deforms is chosen by its mean area over its keys
+  (`Scene::deformSelectArea2`), and its J measured against that, on the sampler and the hit side
+  alike, so a light keyed through a point at the instant still lights the scene at other times (a
+  path without a time that draws it reads no area and no emission). The timed
   light tree boxes such a light by every corner at every key, each carried by every motion key.
   `emit_orient flip` swaps the keys' corners 1 and 2, and their normals, with the triangle's.
   Device twins: `DEmitter::deforms`, `DEmitTri::tri`, `dEmitterSamplePoint` (the sample, its

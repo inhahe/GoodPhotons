@@ -430,12 +430,18 @@ GLOW_S, GLOW_X = (0.6, 1.5), (-0.4, 0.4)
 def glow_deform_scene(grid, u=None, shutter=None, scales=GLOW_S, glossy=False, strip=False):
     """The deforming glowing sheet (GLOW_S, GLOW_X) over a floor, radiating down, the scene's only
     light; or held still at u, the sheet scaled and moved there by its own transform. `scales`: its
-    scale at the interval's ends; `glossy`: the floor a rough mirror, so the glossy bounces' MIS
+    scale at the interval's ends, or at its start, the instant and its end (three: piecewise
+    linear between them, so it can pass through a point at the instant); `glossy`: the floor a
+    rough mirror, so the glossy bounces' MIS
     weighs its hits; `strip`: a `shape_only` mesh loaded before it, whose triangles are stripped
     from the scene, renumbering the sheet's."""
     cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
     def at(u):   # the sheet's scale and slide at fraction u of the interval
-        return scales[0] + (scales[1] - scales[0]) * u, GLOW_X[0] + (GLOW_X[1] - GLOW_X[0]) * u
+        x = GLOW_X[0] + (GLOW_X[1] - GLOW_X[0]) * u
+        if len(scales) == 2:
+            return scales[0] + (scales[1] - scales[0]) * u, x
+        k = 0 if u <= 0.5 else 1
+        return scales[k] + (scales[k + 1] - scales[k]) * (u - 0.5 * k) / 0.5, x
     if u is None:
         def to(p, k):   # handle corner p at the k-th of three keys, the middle one the instant's
             s, x = at(k / 2.0)
@@ -756,6 +762,12 @@ def main():
               lambda u=None, shutter=None: glow_deform_scene(gridf, u, shutter, strip=True),
               [m for m in glow_modes if (m[0], m[1]) in (("R", "cpu"), ("B", "cpu"), ("R", "gpu"), ("B", "gpu"),
                                                          ("D", "gpu"))])] +
+            # ... passing through a point at the instant: its triangles, with no area then, chosen by
+            # their keys' mean area
+            [(0.4, "a deforming glowing mesh flat at the instant",
+              lambda u=None, shutter=None: glow_deform_scene(gridf, u, shutter, scales=(0.8, 0.0, 1.2)),
+              [m for m in glow_modes if (m[0], m[1]) in (("R", "cpu"), ("B", "cpu"), ("D", "cpu"), ("R", "gpu"),
+                                                         ("B", "gpu"), ("D", "gpu"))])] +
             # ... over a rough mirror, grown 2.5 times since the instant: the glossy bounces' MIS
             # weighs each hit on it by its area then, as their NEE does
             [(0.4, "a deforming glowing mesh over a rough mirror",

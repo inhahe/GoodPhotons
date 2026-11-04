@@ -1948,24 +1948,48 @@ struct Scene {
         n = normalize(D.applyDir(n));
         return D.apply(em.origin) + n * (em.radius * D.uniformScale(nonUniform));
     }
+    // A deforming triangle's doubled area as a light chooses it when it has none at the instant:
+    // its mean over the triangle's keys, unmoved (any positive weight serves, as long as the
+    // sampler and the hit side measure a sample's area growth against the same one).
+    double deformSelectArea2(const Tri& t) const {
+        if (t.vkeys < 0 || t.vkeyCount < 1) return 0.0;
+        double sum = 0.0;
+        for (int k = 0; k < t.vkeyCount; ++k) {
+            const Vec3* q = &vertexKeys[(size_t)t.vkeys + (size_t)k * 6];
+            sum += length(cross(q[1] - q[0], q[2] - q[0]));
+        }
+        return sum / (double)t.vkeyCount;
+    }
     // A deforming mesh light's sample at the path's time: triangle `k` of its meshTris as its
     // keys have it then (deformedCorners, carried by any group motion), the point at the sample's
     // barycentrics (b1, b2), its face normal turned to the side the instant's is, and how much the
     // triangle's area has grown (`areaScale`: 0 where it has collapsed then, its normal then the
-    // instant's). False, `y` and `n` untouched, where it does not deform or the path has no time.
+    // instant's). One with no area at the instant has its growth measured against the area it is
+    // chosen by (deformSelectArea2), its normal turned to its corner normals' side then. False,
+    // `y` and `n` untouched, where it does not deform or the path has no time.
     bool deformedEmitPoint(const Emitter& em, int k, double b1, double b2, Vec3& y, Vec3& n,
                            double& areaScale) const {
         if (!em.deforms || g_motionU < 0.0 || k < 0) return false;
         const EmitTri& et = em.meshTris[(size_t)k];
         if (et.tri < 0 || tris[(size_t)et.tri].vkeys < 0) return false;
-        Vec3 p[3];
-        deformedCorners(tris[(size_t)et.tri], g_motionU, p);
+        const Tri& t = tris[(size_t)et.tri];
+        Vec3 p[3], nk[3];
+        const Vec3 c0 = cross(et.e1, et.e2);
+        double l0 = length(c0);
+        const bool flat = !(l0 > 0.0);   // no area at the instant: chosen by deformSelectArea2
+        if (flat) {
+            l0 = deformSelectArea2(t);
+            if (!(l0 > 0.0)) return false;
+            deformedCorners(t, g_motionU, p, nk);
+        } else {
+            deformedCorners(t, g_motionU, p);
+        }
         const Vec3 e1 = p[1] - p[0], e2 = p[2] - p[0];
-        const Vec3 c = cross(e1, e2), c0 = cross(et.e1, et.e2);
-        const double l = length(c), l0 = length(c0);
-        if (!(l0 > 0.0)) return false;
+        const Vec3 c = cross(e1, e2);
+        const double l = length(c);
         y = p[0] + e1 * b1 + e2 * b2;
-        n = (l > 0.0) ? c * ((dot(c0, et.nrm) >= 0.0 ? 1.0 : -1.0) / l) : et.nrm;
+        const double toward = flat ? dot(c, nk[0] + nk[1] + nk[2]) : dot(c0, et.nrm);
+        n = (l > 0.0) ? c * ((toward >= 0.0 ? 1.0 : -1.0) / l) : et.nrm;
         areaScale = l / l0;
         return true;
     }
@@ -1980,7 +2004,8 @@ struct Scene {
             Vec3 p[3];
             deformedCorners(t, g_motionU, p);
             const double l = length(cross(p[1] - p[0], p[2] - p[0]));
-            const double l0 = length(cross(t.v1 - t.v0, t.v2 - t.v0));
+            double l0 = length(cross(t.v1 - t.v0, t.v2 - t.v0));
+            if (!(l0 > 0.0)) l0 = deformSelectArea2(t);   // as the sampler chose it
             if (l0 > 0.0) J = l / l0;
         } else {
             J = lightAreaScale(em, nNow);
@@ -2861,6 +2886,11 @@ struct Scene {
             Vec3 e1 = t.v1 - t.v0, e2 = t.v2 - t.v0;
             Vec3 nc = cross(e1, e2);
             double a = 0.5 * length(nc);
+            // A triangle with no area at the instant: skipped, unless it deforms, when its keys
+            // give it area at other times -- then chosen by its mean area over them
+            // (deformSelectArea2), which its samples' area growth is measured against.
+            const bool flat = !(a > 0.0);
+            if (flat && t.vkeys >= 0) a = 0.5 * deformSelectArea2(t);
             if (a <= 0.0) continue;               // skip degenerate triangles
             total += a;
             EmitTri et;
@@ -2868,8 +2898,13 @@ struct Scene {
             // The face normal turned to the vertex normals' side, as intersectTri turns a hit's
             // ng: one-sided emission is judged against it here (NEE, emission from a sample)
             // and against h.ng on a hit, so the two must agree on which side emits -- for a
-            // mesh wound against its normals, the winding alone does not.
+            // mesh wound against its normals, the winding alone does not. (A flat one's is its
+            // corner normals', a sample at the instant emitting nothing.)
             et.nrm = faceNormalToward(t.v0, t.v1, t.v2, t.n0 + t.n1 + t.n2);
+            if (flat) {
+                const Vec3 ns = t.n0 + t.n1 + t.n2;
+                et.nrm = dot(ns, ns) > 0.0 ? normalize(ns) : Vec3{0, 1, 0};
+            }
             et.reach = triReach(t.v0, t.v1, t.v2);
             et.cumArea = total;
             // Carry the source triangle's UVs as uv0 + edges, so a sampled point can
@@ -5342,7 +5377,7 @@ inline double emitterSamplePoint(const Scene& scene, const Emitter& em,
                                  double u1, double u2, Vec3& y, Vec3& nOut,
                                  double* areaScaleOut = nullptr) {
     double pmul = 1.0;
-    const bool deform = em.deforms && g_motionU >= 0.0;
+    const bool deform = em.deforms;
     int mt = -1;
     double bary[2] = {0.0, 0.0};
     if (em.emitPat < 0) {
@@ -5356,6 +5391,8 @@ inline double emitterSamplePoint(const Scene& scene, const Emitter& em,
     double J = 1.0;
     if (deform && scene.deformedEmitPoint(em, mt, bary[0], bary[1], y, nOut, J)) {
         // on its triangle as it is at the path's time
+    } else if (mt >= 0 && !(length(cross(em.meshTris[(size_t)mt].e1, em.meshTris[(size_t)mt].e2)) > 0.0)) {
+        J = 0.0;   // a triangle with no area at the instant, drawn by a path without a time
     } else if (scene.lightMoves(em)) {
         if (em.shape == EmitterShape::Sphere) y = scene.lightSpherePointNow(em, nOut);   // on its moved surface
         else { y = scene.lightPointNow(em, y); nOut = scene.lightNormalNow(em, nOut); }

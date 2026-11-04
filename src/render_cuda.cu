@@ -4884,10 +4884,10 @@ __device__ static inline bool dLightScales(const DScene& sc, const DEmitter& em)
 // of the moved sphere along it -- the point carried itself would leave that sphere between keys. A
 // flat light's normal goes by the inverse transpose where the keys stretch unevenly, any other's as
 // dLightCarry carries a direction. J: |det D| / |D^T n| about the carried normal (s^2 under a
-// similarity, 0 where the keys flatten it), 1 under rigid keys or unless `wantJ`.
+// similarity, 0 where the keys flatten it), 1 under rigid keys.
 struct DLightNow { DVec3 p, n; double J; };
 __device__ __noinline__ static DLightNow dLightSampleNowOut(const DScene& sc, int set, bool ball, DVec3 c,
-                                                            double r, DVec3 p, DVec3 n, bool wantJ) {
+                                                            double r, DVec3 p, DVec3 n) {
     DAff D;
     dMotionAt(sc.mo, set, (double)dMotionU(), D);
     const int shape = sc.mo.sets[set].shape;
@@ -4905,7 +4905,7 @@ __device__ __noinline__ static DLightNow dLightSampleNowOut(const DScene& sc, in
         o.n = normalize(affDir(D.m, n));
     }
     o.J = 1.0;
-    if (wantJ && shape != kMotionRigid) {
+    if (shape != kMotionRigid) {
         const double l = (double)length(dAffDirT(D, o.n));
         o.J = l > 0.0 ? fabs(dAffDet(D)) / l : 0.0;
     }
@@ -4995,20 +4995,41 @@ __device__ __noinline__ static void dDeformedCorners(const DScene& sc, int tri, 
 // in J how much the triangle's area has grown (0 where it has collapsed then, its normal then the
 // instant's). `ok` 0 where the triangle does not deform. Out of line, as the timed walks are.
 struct DEmitNow { DVec3 y, n; double J; int ok; };
+// A deforming triangle's doubled area as a light chooses it when it has none at the instant (host
+// twin Scene::deformSelectArea2): its mean over the triangle's keys, unmoved.
+__device__ static double dDeformSelectArea2(const DScene& sc, int tri) {
+    const int2 vk = sc.mo.triVkeys[tri];
+    if (vk.x < 0 || vk.y < 1) return 0.0;
+    double sum = 0.0;
+    for (int k = 0; k < vk.y; ++k) {
+        const DVec3* q = sc.mo.vertexKeys + (size_t)vk.x + (size_t)k * 6;
+        sum += (double)length(cross(q[1] - q[0], q[2] - q[0]));
+    }
+    return sum / (double)vk.y;
+}
 __device__ __noinline__ static DEmitNow dDeformedEmitOut(const DScene& sc, const DEmitTri* et, double b1,
                                                          double b2) {
     DEmitNow r;
     r.ok = 0;
     const int tri = et->tri;
     if (tri < 0 || !sc.mo.triVkeys || sc.mo.triVkeys[tri].x < 0) return r;
-    DVec3 p[3];
-    dDeformedCorners(sc, tri, (double)dMotionU(), p, nullptr, nullptr);
+    DVec3 p[3], nk[3];
+    const DVec3 c0 = cross(et->e1, et->e2);
+    double l0 = (double)length(c0);
+    const bool flat = !(l0 > 0.0);   // no area at the instant: chosen by dDeformSelectArea2
+    if (flat) {
+        l0 = dDeformSelectArea2(sc, tri);
+        if (!(l0 > 0.0)) return r;
+        dDeformedCorners(sc, tri, (double)dMotionU(), p, nk, nullptr);
+    } else {
+        dDeformedCorners(sc, tri, (double)dMotionU(), p, nullptr, nullptr);
+    }
     const DVec3 e1 = p[1] - p[0], e2 = p[2] - p[0];
-    const DVec3 c = cross(e1, e2), c0 = cross(et->e1, et->e2);
-    const double l = (double)length(c), l0 = (double)length(c0);
-    if (!(l0 > 0.0)) return r;
+    const DVec3 c = cross(e1, e2);
+    const double l = (double)length(c);
     r.y = p[0] + e1 * (Real)b1 + e2 * (Real)b2;
-    r.n = (l > 0.0) ? c * (Real)(((double)dot(c0, et->nrm) >= 0.0 ? 1.0 : -1.0) / l) : et->nrm;
+    const double toward = flat ? (double)dot(c, nk[0] + nk[1] + nk[2]) : (double)dot(c0, et->nrm);
+    r.n = (l > 0.0) ? c * (Real)((toward >= 0.0 ? 1.0 : -1.0) / l) : et->nrm;
     r.J = l / l0;
     r.ok = 1;
     return r;
@@ -5020,7 +5041,8 @@ __device__ __noinline__ static double dDeformedAreaScaleOut(const DScene& sc, in
     dDeformedCorners(sc, tri, (double)dMotionU(), p, nullptr, nullptr);
     const DTri& t = sc.tris[tri];
     const double l = (double)length(cross(p[1] - p[0], p[2] - p[0]));
-    const double l0 = (double)length(cross(t.v1 - t.v0, t.v2 - t.v0));
+    double l0 = (double)length(cross(t.v1 - t.v0, t.v2 - t.v0));
+    if (!(l0 > 0.0)) l0 = dDeformSelectArea2(sc, tri);   // as the sampler chose it
     return (l > 0.0 && l0 > 0.0) ? l / l0 : 1.0;
 }
 // How much a light's area has grown about a hit on it at the path's time (host twin
@@ -11069,7 +11091,7 @@ __device__ static double dEmitterPatMulAt(const DScene& sc, const DEmitter& em,
 __device__ static double dEmitterSamplePoint(const DScene& sc, const DEmitter& em,
                                              double u1, double u2,
                                              DVec3& y, DVec3& nOut, double* areaScaleOut = nullptr) {
-    const bool deform = em.deforms && dTimed(sc);
+    const bool deform = em.deforms;   // its triangle wanted, timed or not (a flat one, below)
     int mt = -1;
     double bary[2] = {0.0, 0.0};
     double pmul = 1.0;
@@ -11082,13 +11104,14 @@ __device__ static double dEmitterSamplePoint(const DScene& sc, const DEmitter& e
     }
     double J = 1.0;
     bool placed = false;
-    if (mt >= 0) {
+    if (mt >= 0 && dTimed(sc)) {
         const DEmitNow r = dDeformedEmitOut(sc, em.meshTris + mt, bary[0], bary[1]);
         if (r.ok) { y = r.y; nOut = r.n; J = r.J; placed = true; }
+    } else if (mt >= 0 && !((double)length(cross(em.meshTris[mt].e1, em.meshTris[mt].e2)) > 0.0)) {
+        J = 0.0; placed = true;   // a triangle with no area at the instant, drawn by a path without a time
     }
     if (!placed && em.motion >= 0 && dTimed(sc)) {
-        const DLightNow r = dLightSampleNowOut(sc, em.motion, em.shape == 1, em.origin, em.radius, y, nOut,
-                                               areaScaleOut != nullptr);
+        const DLightNow r = dLightSampleNowOut(sc, em.motion, em.shape == 1, em.origin, em.radius, y, nOut);
         y = r.p; nOut = r.n; J = r.J;
     }
     // No area at the path's time (a triangle collapsed, keys that flatten it): it emits nothing
@@ -24314,6 +24337,9 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
         // force the megakernel — the wavefront pool carries no per-photon beam RNG stream.)
         wavefrontTrace(up, csRun, d_energy, N, diffraction ? 1 : 0, kseed, 32, camModeInt);
     } else {
+        // FTRACE_GPU_PHOTONSEED=1: per-photon seeding (GPU-VARIANCE's A/B arm) for the launches that
+        // seed per thread -- modes A, B and C's own renders. Stable seeding (mode P's batches, mode
+        // M's deposit) seeds per photon whatever it says.
         static const int perPhotonSeed = [] {
             const char* e = std::getenv("FTRACE_GPU_PHOTONSEED");
             return (e && *e) ? std::atoi(e) : 0;
