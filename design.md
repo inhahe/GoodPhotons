@@ -10181,7 +10181,7 @@ sees the instant, exactly as a static scene with those transforms would show it.
   (`sphereAsMesh_`), as an uneven static scale already tessellates it, so `sphereAt` may take the
   radius from the blended transform's mean column length.
 
-### Motion blur on the device (0.418.0: modes R and W)
+### Motion blur on the device (0.418.0: modes R and W; 0.419.0: mode D)
 
 - **The path's time** is a slot per thread in shared memory (`s_dMotionU`, `dMotionU`), the
   device twin of the thread-local `g_motionU`, so the ~37 query sites need no argument. Every
@@ -10209,9 +10209,32 @@ sees the instant, exactly as a static scene with those transforms would show it.
   and pose a moving camera there (`dPoseCamera`, `DCamera::keys`). A moving light
   (`DEmitter::motion`) is sampled where it sits at the instant -- the device samples area
   lights uniformly in area, which a rigid motion keeps -- and the sample carried out
-  (`dLightNow`; a spot's point and beam too), in the surface, volume and RGB NEE; a path with a
+  (`dLightCarry`; a spot's point and beam too), in the surface, volume and RGB NEE; a path with a
   time selects lights by the timed tree (`dLightTreeOf`, Scene::lightTreeTimed).
   `cudaBlurUnsupported` names what keeps a blurred render on the CPU: another mode.
+- **Mode D** (0.419.0): `kBdptT` (MERGE false) draws each sample's time off its own stream
+  (`dSetPathTime`, the stream `timeSalt ^ BDPT's`) and poses the camera there, which the eye
+  subpath, the light subpath's walk and every connection's t = 1 splat take. A moving light's
+  subpath starts where its motion has it (`dLightCarry`: the area sample, a spot's point and its
+  cone), and so does the s = 1 connection's; the sun's subpath disc and its densities widen to
+  the swept sphere (`dLightRadius` / `dLightScale`: `dSampleSunOrigin`, `dSunOriginPdf`,
+  `dSunOriginPdfAlong`, `dVertexPdfLightF`), and a sun subpath's walk starts where the scene's
+  haze does (`dSkyEntryPastHaze`, Scene::skyEntryPastHaze's twin; its vertex stays on the disc,
+  where its densities are measured). The camera is copied and posed only when it moves (`camT`):
+  one that holds still is read where the launch put it, the kernel's `cam` being
+  `__grid_constant__` so its address can be taken without a per-thread copy. Mode J's camera pass
+  (MERGE) keeps the instant: its epochs' time is the host's (g_passMotionU), not yet the device's.
+- **The haze ends at the instant's sphere** (0.419.0), as on the host: a shadow ray to the sun or
+  the sky runs to `dExitDistance` (for a path with a time, the swept sphere), but crosses media
+  only to `dMediaExitDistance` (Scene::mediaExitDistance) -- in the surface, volume, fibre and
+  hero NEE (`BkNeeGeom::medDist`), the sky's NEE, BDPT's sun connection and mode J's camera-ray
+  sun march. Until then the device integrated an unbounded haze out to the movers' sweep, and
+  blurred mode R on the GPU lit a hazy floor at 39 % of its still self under a wide sweep.
+- **The cold paths are out of line** (`__noinline__`: the timed walks, the deforming corners, the
+  camera pose, a light's carry, the walk to the haze), as the host's twins are (FT_NOINLINE): a
+  still render never calls them. A cold helper that changes the caller's values takes and
+  returns them by value (`dLightCarryOut`, `dSkyEntryPastHazeOut`): a reference into an
+  out-of-line call holds the caller's variable in memory for the whole caller.
 
 ## Deformers (ROADMAP 11 stage E, 0.413.0)
 

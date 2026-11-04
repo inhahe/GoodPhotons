@@ -15008,11 +15008,11 @@ static void buildFurFields(const Scene& scene, bool timed) {
 // the device-selection notes name that reason rather than the generic lists.
 static const char* const kObjectSpaceWhy =
     "object-space patterns (pattern_space object) are read on the CPU only so far";
-// Motion blur on the device is modes R and W only so far (ROADMAP 11; cudaBlurUnsupported says
-// what else keeps them on the CPU): every other mode's device gate asks Camera::seesMotion, and
-// its note gives this reason.
+// Motion blur on the device is modes R, W and D only so far (ROADMAP 11; cudaBlurUnsupported
+// says what else keeps them on the CPU): every other mode's device gate asks Camera::seesMotion,
+// and its note gives this reason.
 static const char* const kMotionCpuWhy =
-    "motion blur in this mode renders on the CPU so far (the device blurs modes R and W)";
+    "motion blur in this mode renders on the CPU so far (the device blurs modes R, W and D)";
 // The spp target a time / noise / forever budget renders against (runSppProgressive): no real
 // total, only a cap that keeps pixel * sppTotal seed indices well inside int64. A renderer that
 // splits its target into parts asks for it, since a share of it is no share of the render.
@@ -19101,8 +19101,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (wantGpu) std::fprintf(stderr, "[device] no CUDA device found; using CPU\n");
             else         std::printf("[device] auto -> CPU (no CUDA device found)\n");
         } else if (const char* mwhy = !cam.seesMotion(scene) ? nullptr
-                                      : !gpuBackwardMode ? kMotionCpuWhy
-                                      : cudaBlurUnsupported(scene, cam, g_whitted ? 'W' : 'R')) {
+                                      : gpuBackwardMode ? cudaBlurUnsupported(scene, cam, g_whitted ? 'W' : 'R')
+                                      : gpuBdptMode ? cudaBlurUnsupported(scene, cam, mode)
+                                      : kMotionCpuWhy) {
             if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", mwhy);
             else         std::printf("[device] auto -> CPU (%s)\n", mwhy);
         } else if (gpuBdptMode) {

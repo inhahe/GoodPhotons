@@ -741,8 +741,11 @@ keyed from a Catmull-Rom through the path's frames; loom writes a moving `Camera
 instant, the hit carried out. *Moving lights and emissive meshes (0.410.0, done):* rigid only,
 sampled at the instant and carried out, with a timed light tree. *The GPU, modes R and W
 (0.418.0, done):* every primitive kind moving (rigid keys, deformers, riding groups), the camera
-and the lights too, each path at its own time; agrees with the CPU block for block. Open: lights
-that scale over the shutter, aimed area lights; on the GPU, the other modes.
+and the lights too, each path at its own time; agrees with the CPU block for block. *Mode D on the
+GPU (0.419.0, done):* each sample's subpaths at one time, a moving light's subpath carried out,
+the sun's disc widened to the swept bounds and its walk started at the scene's haze; the device's
+haze now ends at the instant's sphere, as the host's does. Open: lights that scale over the shutter, aimed area
+lights; on the GPU, modes A, B, C, M, S, U, J and P.
 
 **Stage C, motion vectors and depth (0.411.0, done):** `-write-aovs` writes the guide pass's
 albedo and normal and, from one ray through each pixel's centre at the frame's instant, depth,

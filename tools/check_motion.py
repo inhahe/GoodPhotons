@@ -41,8 +41,11 @@ cube whose keys scale and shear it together. It requires:
     dark ball sweeping across it.
   * Blurred mode R on the GPU agrees with blurred mode R on the CPU: the box; an isosurface, a
     curve and an instance moving; a mover beyond the instant's bounds under the sky and under the
-    sun; a pattern travelling with its object; moving lights of every shape; a moving camera. Mode D asked for the GPU under a
-    shutter says it stays on the CPU, and mode V says it renders the instant. Modes M and J (an epoch at a time), S and U (a pass at a time) blur, agreeing with
+    sun; a pattern travelling with its object; moving lights of every shape; a moving camera. So
+    does blurred mode D on the GPU with mode D on the CPU (the sky aside: mode D renders no
+    environment light, on either device). Mode B asked for the GPU under a shutter says it stays on the CPU, and mode
+    V says it renders the instant.
+  * Modes M and J (an epoch at a time), S and U (a pass at a time) blur, agreeing with
     blurred mode R within their density estimates' bias, and follow a moving camera as mode R
     does; so does mode P, its backward samples split by their own path's first event -- also with
     fog in front of a mirror, and on a floor of a mix of a diffuse and a glossy child. Mode M under
@@ -62,7 +65,7 @@ cube whose keys scale and shear it together. It requires:
     sweep along a wall as brightly as the rest, and off the pivot needs no more keys than the
     budget. Keys whose only mover is a light they would scale are no motion at all. Haze under a
     sweep far wider than the scene lights the floor as it does without the shutter (modes R, D
-    and B). The blurred sky mode B sees in a batch with under one sample a pixel is all there.
+    and B; on the GPU modes R, under the sun and the sky, and D). The blurred sky mode B sees in a batch with under one sample a pixel is all there.
   * The loader refuses, with a message naming why: a `motion` block with no `motion_interval`; one
     with a single key; `translate` beside `motion`; fur on, or a medium bounded by, a moving
     object; an interval that excludes the instant; `shutter_close` before `shutter_open`. It keeps
@@ -830,16 +833,24 @@ def main():
             c = [lum(render(exe, out, path, "cpu_R_%d" % s, rargs("cpu"), seed=s)[0]) for s in (1, 2)]
             good, detail = agree(g, c)
             verdict("blurred mode R on the GPU = on the CPU: " + nm, good, detail)
-        rc, log = run([exe, "-in", blurred, "-mode", "D", "-device", "gpu", "-spp", "1", "-no-meter",
+        # Mode D on the GPU (0.419.0): each sample's two subpaths at one time, against mode D on
+        # the CPU (BDPT with a moving light, a sun reaching a mover past the instant's bounds).
+        for nm, path, spp in [c_ for c_ in gpu_cases if "sky" not in c_[0]]:
+            dargs = lambda dev: ["-mode", "D", "-device", dev, "-spp", str(spp)]
+            g = [lum(render(exe, out, path, "gpu_D_%d" % s, dargs("gpu"), seed=s, want_gpu=True)[0]) for s in (1, 2)]
+            c = [lum(render(exe, out, path, "cpu_D_%d" % s, dargs("cpu"), seed=s)[0]) for s in (1, 2)]
+            good, detail = agree(g, c)
+            verdict("blurred mode D on the GPU = on the CPU: " + nm, good, detail)
+        rc, log = run([exe, "-in", blurred, "-mode", "B", "-device", "gpu", "-n", "100000", "-no-meter",
                        "-o", os.path.join(out, "gate.png")])
-        verdict("-device gpu under a shutter says mode D stays on the CPU",
+        verdict("-device gpu under a shutter says mode B stays on the CPU",
                 rc == 0 and "renders on the CPU so far" in log, log.strip()[-300:] if rc else "")
     rc, log = run([exe, "-in", blurred, "-mode", "V", "-device", "cpu", "-spp", "1", "-n", "100000", "-no-meter",
                    "-o", os.path.join(out, "modev.png")])
     verdict("mode V under a shutter says it renders the instant",
             rc == 0 and "renders the frame's instant" in log, log.strip()[-300:] if rc else "")
 
-    light_and_haze_tests(exe, out, verdict, hair)
+    light_and_haze_tests(exe, out, verdict, hair, not a.no_gpu)
     p_split_tests(exe, out, verdict)
     j_empty_test(exe, out, verdict)
     camera_tests(exe, out, verdict, devices)
@@ -902,9 +913,9 @@ def j_empty_test(exe, out, verdict):
     verdict("blurred mode J with an empty surface map = blurred mode R", good, detail)
 
 
-def light_and_haze_tests(exe, out, verdict, hair):
+def light_and_haze_tests(exe, out, verdict, hair, gpu):
     """A moving light's turn, a scene whose keys move nothing, a coat seen only at the instant,
-    haze under a wide sweep, and the forward sky in a small batch."""
+    haze under a wide sweep (on the GPU too, when `gpu`), and the forward sky in a small batch."""
     # A spot on its group's pivot turning 30 degrees across the shutter sweeps its beam along a
     # wall: every time lights the wall alike, so the streak is as bright mid-way as near its ends.
     def spot_scene(spot_at, shutter=(-0.5, 0.5)):
@@ -960,13 +971,14 @@ def light_and_haze_tests(exe, out, verdict, hair):
             log.strip()[-300:] if rc or "the coat moves" in log else "")
 
     # Haze under a sweep far wider than the scene: the sun lights the floor through the scene's
-    # haze alone, blurred or not -- in BDPT's sun connections and the forward photons alike.
-    def haze_scene(shutter):
+    # haze alone, blurred or not -- in BDPT's sun connections and the forward photons alike, and
+    # on the GPU in modes R and D (the sky too, in mode R).
+    def haze_scene(shutter, light="light sun { dir 0.3 1 0.2  angle 0.53  spd preset:d65 }"):
         cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
         return NL.join([
             "scene { units meters  motion_interval -0.5 0.5 }",
             'material "w" { type diffuse reflect 0.6 }',
-            "light sun { dir 0.3 1 0.2  angle 0.53  spd preset:d65 }",
+            light,
             "medium { sigma_t 0.04  albedo 0.5 }",
             "quad { origin -1 0 -1  u 0 0 2  v 2 0 0  material w }",
             "group { motion { key { translate -25 0.3 0 } key { translate 25 0.3 0 } }  "
@@ -976,14 +988,26 @@ def light_and_haze_tests(exe, out, verdict, hair):
     pb, ps = os.path.join(out, "haze_blur.ftsl"), os.path.join(out, "haze_still.ftsl")
     write(pb, haze_scene((-0.5, 0.5)))
     write(ps, haze_scene(None))
-    for mode, margs in (("R", ["-spp", "128"]), ("D", ["-spp", "128"]), ("B", ["-n", "20000000"])):
-        args = ["-mode", mode, "-device", "cpu"] + margs
-        hb = [lum(render(exe, out, pb, "haze_blur_%s_s%d" % (mode, s), args, seed=s)[0]) for s in (1, 2)]
-        hs = [lum(render(exe, out, ps, "haze_still_%s_s%d" % (mode, s), args, seed=s)[0]) for s in (1, 2)]
+    sky_b, sky_s = os.path.join(out, "haze_sky_blur.ftsl"), os.path.join(out, "haze_sky_still.ftsl")
+    write(sky_b, haze_scene((-0.5, 0.5), "light env { spd preset:d65 }"))
+    write(sky_s, haze_scene(None, "light env { spd preset:d65 }"))
+    cases = [("R", "cpu", pb, ps, ["-spp", "128"]), ("D", "cpu", pb, ps, ["-spp", "128"]),
+             ("B", "cpu", pb, ps, ["-n", "20000000"])]
+    if gpu:
+        cases += [("R", "gpu", pb, ps, ["-spp", "128"]), ("R", "gpu", sky_b, sky_s, ["-spp", "128"]),
+                  ("D", "gpu", pb, ps, ["-spp", "128"])]
+    for mode, dev, blur_p, still_p, margs in cases:
+        args = ["-mode", mode, "-device", dev] + margs
+        what = os.path.basename(blur_p)[:-10]
+        hb = [lum(render(exe, out, blur_p, "%s_blur_%s_%s_s%d" % (what, mode, dev, s), args, seed=s,
+                         want_gpu=dev == "gpu")[0]) for s in (1, 2)]
+        hs = [lum(render(exe, out, still_p, "%s_still_%s_%s_s%d" % (what, mode, dev, s), args, seed=s,
+                         want_gpu=dev == "gpu")[0]) for s in (1, 2)]
         floor = slice(H // 3, H)                                  # the floor, below the horizon of haze
         rb, rs = (hb[0] + hb[1])[floor].mean(), (hs[0] + hs[1])[floor].mean()
-        verdict("a sweep past the scene leaves its haze as it is (mode %s)" % mode, abs(rb / rs - 1) < 0.03,
-                "blurred floor %.4f of the still one's" % (rb / rs))
+        verdict("a sweep past the scene leaves its haze as it is (mode %s%s%s)"
+                % (mode, " on the GPU" if dev == "gpu" else "", ", the sky" if blur_p == sky_b else ""),
+                abs(rb / rs - 1) < 0.03, "blurred floor %.4f of the still one's" % (rb / rs))
 
     # The blurred forward sky in a batch with under one sample a pixel to spare: each pixel's one
     # sample is taken with that chance and weighted up by it, so the sky is still all there.
@@ -1082,6 +1106,10 @@ def camera_tests(exe, out, verdict, devices):
                         seed=s, want_gpu=True)[0]) for s in (1, 2)]
         good, detail = agree(g, blur)
         verdict("... mode R on the GPU = on the CPU", good, detail)
+        g = [lum(render(exe, out, moving, "cam_blur_gpuD_s%d" % s, ["-mode", "D", "-device", "gpu", "-spp", "256"],
+                        seed=s, want_gpu=True)[0]) for s in (1, 2)]
+        good, detail = agree(g, blur, 0.05)
+        verdict("... mode D on the GPU = mode R", good, detail)
 
     # --- a camera path's frame blurs along the path: frames a frame apart on a straight line at
     # an even pace, so the middle frame's shutter sweeps its eye linearly half a frame each way ---

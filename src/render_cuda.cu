@@ -1042,7 +1042,7 @@ struct DEmitter {
     // expectation of CIE(lambda) under its own emission sampler. Host twin: Emitter::cieMean.
     DVec3  cieMean;
     // Its motion set (Emitter::motion), or -1: a light moves only rigidly, so it is sampled where
-    // it sits at the instant and the sample carried to the path's time (dLightNow).
+    // it sits at the instant and the sample carried to the path's time (dLightCarry).
     int    motion;
 };
 
@@ -1518,11 +1518,29 @@ __device__ static inline void dSetMotionU(float u) { s_dMotionU[threadIdx.x] = u
 // Whether a query must look at time: the scene moves and the path has one (host twin
 // Scene::sweptQuery as well as timedQuery).
 __device__ static inline bool dTimed(const DScene& sc) { return sc.mo.sets && dMotionU() >= 0.0f; }
+// The radius of the sphere about sceneCenter the sky's and the suns' light enters through, for the
+// current path (host twin Scene::lightRadius): the scene's own, or for a path with a time the one
+// that holds the movers' sweep; and that over the scene's own (Scene::lightScale), which a quantity
+// sized by the scene's sphere -- the sun's disc -- scales by.
+__device__ static inline double dLightRadius(const DScene& sc) {
+    return dTimed(sc) ? sc.mo.sweptReach : sc.sceneRadius;
+}
+__device__ static inline double dLightScale(const DScene& sc) {
+    return (dTimed(sc) && sc.sceneRadius > 0.0) ? sc.mo.sweptReach / sc.sceneRadius : 1.0;
+}
 // How far a ray from p must go to leave everything it could meet (host twin Scene::exitDistance):
 // the scene's bounding sphere, or for a path with a time the swept one -- the far end of shadow
 // rays to the sun and the sky.
+__device__ static inline double dMediaExitDistance(const DScene& sc, const DVec3& p);
 __device__ static inline double dExitDistance(const DScene& sc, const DVec3& p) {
     if (dTimed(sc)) return (double)length(sc.mo.sweptCenter - p) + sc.mo.sweptRadius;
+    return dMediaExitDistance(sc, p);
+}
+// The far end of a medium's transmittance along a ray to the sun or the sky (host twin
+// Scene::mediaExitDistance): the scene's own bounding sphere at every time, since no medium
+// moves -- integrating an unbounded haze out to a mover's sweep would dim the whole frame the
+// moment a shutter opens.
+__device__ static inline double dMediaExitDistance(const DScene& sc, const DVec3& p) {
     return (double)length(sc.sceneCenter - p) + sc.sceneRadius;
 }
 
@@ -4156,7 +4174,7 @@ __device__ static inline DTriShear makeTriShear(const DVec3& d) {
 // stays noise-free), mapped through the shutter into the motion interval and set for the path.
 // The camera posed at `frames` (host twins CameraMotion::at, Camera::posedAs and lookAt): its keys
 // blended about the time, the frame built on them, the stereo eye shifted along u.
-__device__ static void dPoseCamera(const DCamera& cam, double frames, DCamera& out) {
+__device__ __noinline__ static void dPoseCamera(const DCamera& cam, double frames, DCamera& out) {
     out = cam;
     const int n = cam.nKeys;
     DCamKey k = cam.keys[0];
@@ -4182,6 +4200,17 @@ __device__ static void dPoseCamera(const DCamera& cam, double frames, DCamera& o
     out.rEdge = dProjRadius(cam.projection, out.halfFovY);
     if (cam.eyeShiftU != 0.0) out.eye = out.eye + out.u * (Real)cam.eyeShiftU;
 }
+// A path's time at shutter fraction `x`: set for every query of the path (in the motion interval,
+// when the scene moves), and `posed` the camera there when it moves itself.
+__device__ static inline void dSetPathTime(const DScene& sc, const DCamera& cam, double x, DCamera* posed) {
+    const double frames = cam.shOpen + (cam.shClose - cam.shOpen) * x;
+    if (sc.mo.sets) {
+        double u = (frames - sc.mo.motionA) / (sc.mo.motionB - sc.mo.motionA);
+        u = u < 0.0 ? 0.0 : (u > 1.0 ? 1.0 : u);
+        dSetMotionU((float)u);
+    }
+    if (posed && cam.nKeys > 0) dPoseCamera(cam, frames, *posed);
+}
 // A camera path's time and pose: dSetCameraTime, and `posed` the camera there (the camera
 // itself when it holds still or the path has no time).
 __device__ static inline void dSetCameraTime(const DScene& sc, const DCamera& cam, unsigned long long pix,
@@ -4197,13 +4226,7 @@ __device__ static inline void dSetCameraTime(const DScene& sc, const DCamera& ca
     if (!whitted) { DRng tr; tr.seedUnit(pix, cam.timeSalt); phase = (double)tr.uniform(); }
     double x = dRadicalInverseScr(79, sIdx) + phase;
     if (x >= 1.0) x -= 1.0;
-    const double frames = cam.shOpen + (cam.shClose - cam.shOpen) * x;
-    if (sc.mo.sets) {
-        double u = (frames - sc.mo.motionA) / (sc.mo.motionB - sc.mo.motionA);
-        u = u < 0.0 ? 0.0 : (u > 1.0 ? 1.0 : u);
-        dSetMotionU((float)u);
-    }
-    if (posed && cam.nKeys > 0) dPoseCamera(cam, frames, *posed);
+    dSetPathTime(sc, cam, x, posed);
 }
 // The watertight crossing of the ray with the triangle (p0, p1, p2) nearer than tmax: its t and
 // barycentrics. The shared half of intersectTri (host twin triCross), which a moving or deforming
@@ -4636,6 +4659,10 @@ __device__ static void instanceHitToWorld(const DInstance& inst, DHit& lh) {
 }
 
 // ---- Timed intersection (motion blur, ROADMAP 11): the device twins of Scene's *Now ----
+// The timed walks, the deforming corners and the camera pose are out of line (__noinline__): a still
+// scene never calls them, and inlined into every query and kernel they cost the still renders' hot
+// code its registers and layout (the host keeps its twins out of line, FT_NOINLINE, for the same
+// reason).
 // Motion set `set`'s transform at fraction u of the interval (host keyedAffineAt): the blend of
 // the two keys about u, entry by entry.
 __device__ static void dMotionAt(const DMotion& mo, int set, double u, DAff& D) {
@@ -4705,13 +4732,24 @@ struct DMotionNow {
 // whether it moves at the path's time, and its motion there. A light moves only rigidly, so a
 // sample taken where it sits at the instant -- a point, a normal, a direction -- is carried out
 // by D: points by D, directions by its linear part made unit again (a blend of two rotations
-// shrinks what it turns).
-__device__ static inline bool dLightNow(const DScene& sc, const DEmitter& em, DAff& D) {
-    if (em.motion < 0 || !dTimed(sc)) return false;
-    dMotionAt(sc.mo, em.motion, (double)dMotionU(), D);
-    return true;
+// shrinks what it turns). dLightCarry carries the point `p` and the unit direction `d` a sample
+// took at the instant (a spot's origin and beam, an area sample's point and normal) to where the
+// light has them at the path's time, and leaves them for a still light or a path with none. The
+// carrying itself is out of line, as the timed walks are, and takes and returns its point and
+// direction by value: a reference into an out-of-line call would hold the caller's p and d in
+// memory for the whole caller.
+struct DPointDir { DVec3 p, d; };
+__device__ __noinline__ static DPointDir dLightCarryOut(const DScene& sc, int set, DVec3 p, DVec3 d) {
+    DAff D;
+    dMotionAt(sc.mo, set, (double)dMotionU(), D);
+    return DPointDir{affPoint(D.m, D.t, p), normalize(affDir(D.m, d))};
 }
-__device__ static inline DVec3 dLightDir(const DAff& D, const DVec3& d) { return normalize(affDir(D.m, d)); }
+__device__ static inline void dLightCarry(const DScene& sc, const DEmitter& em, DVec3& p, DVec3& d) {
+    if (em.motion >= 0 && dTimed(sc)) {
+        const DPointDir r = dLightCarryOut(sc, em.motion, p, d);
+        p = r.p; d = r.d;
+    }
+}
 // Tri::finalize's twin: the face normal, reach, tangent frame and curvature of a triangle
 // rebuilt at a time (its corner normals falling back to the face's where zero).
 __device__ static void dFinalizeTri(DTri& t) {
@@ -4746,7 +4784,7 @@ __device__ static void dFinalizeTri(DTri& t) {
 // A deforming triangle's corners at fraction u, and with `n` its corner normals (renormalised,
 // zero staying zero), carried by its motion set when it has one and `carried` (host twin
 // Scene::deformedCorners).
-__device__ static void dDeformedCorners(const DScene& sc, int tri, double u, DVec3* p, DVec3* n,
+__device__ __noinline__ static void dDeformedCorners(const DScene& sc, int tri, double u, DVec3* p, DVec3* n,
                                         DMotionNow* mc, bool carried = true) {
     const int2 vk = sc.mo.triVkeys[tri];
     const double s = (u < 0.0 ? 0.0 : (u > 1.0 ? 1.0 : u)) * (vk.y - 1);   // motionBracket
@@ -4902,7 +4940,7 @@ __device__ static inline int dMotionSegRoot(const DScene& sc) {
     return sc.mo.segRoot[k];
 }
 // The movers' nearest hit nearer than tMax, written to h (world space); true if one was found.
-__device__ static bool dTimedClosest(const DScene& sc, const DVec3& ro, const DVec3& rd, const DVec3& invD,
+__device__ __noinline__ static bool dTimedClosest(const DScene& sc, const DVec3& ro, const DVec3& rd, const DVec3& invD,
                                      const DTriShear& sh, Real tmin, Real curveTmin, Real& tMax, DHit& h,
                                      bool camHideOn) {
     const int root = dMotionSegRoot(sc);
@@ -4946,7 +4984,7 @@ __device__ static bool dTimedClosest(const DScene& sc, const DVec3& ro, const DV
 // opacity is below 1 (shadowTransmittance's rule) and returns whether it is one, its hit filled
 // in to attenuate by, instead of blocking.
 template <class Soft>
-__device__ static bool dTimedAny(const DScene& sc, const DVec3& o, const DVec3& dir, const DVec3& invD,
+__device__ __noinline__ static bool dTimedAny(const DScene& sc, const DVec3& o, const DVec3& dir, const DVec3& invD,
                                  const DTriShear& sh, Real tmin, Real curveTmin, Real tMax, bool camHideOn,
                                  Soft&& soft) {
     const int root = dMotionSegRoot(sc);
@@ -7524,6 +7562,39 @@ __device__ static inline void dSunAimProject(const DVec3& t, const DVec3& b, int
     cx = (double)dot(w, t);
     cy = (double)dot(w, b);
 }
+// Where a sky or sun photon, or a sun light subpath, starting at `origin` on its entry disc and
+// travelling `dir`, starts meeting media; false to drop it (host twin Scene::skyEntryPastHaze,
+// where the reasoning lives). For a path with a time in a moving scene whose movers stray past the
+// instant's sphere the disc is the swept one, further out than the haze a still scene's light
+// crosses: through the instant's disc the start moves to that disc's plane, short of anything in
+// the way; outside it the light crosses no haze before the first thing it meets, and is dropped
+// (`mayDrop`) when it meets nothing -- a BDPT subpath, which MIS weighs as a strategy, never is.
+// The walk to the haze is out of line (a still scene, or one with no media, never takes it), and
+// takes and returns the origin by value for the reason dLightCarryOut does.
+struct DSkyEntry { DVec3 origin; bool keep; };
+__device__ __noinline__ static DSkyEntry dSkyEntryPastHazeOut(const DScene& sc, DVec3 origin, DVec3 dir,
+                                                             bool mayDrop) {
+    const DVec3 off = origin - sc.sceneCenter;
+    const double along = (double)dot(off, dir);
+    const DVec3 lat = off - dir * (Real)along;
+    const bool outside = (double)dot(lat, lat) > sc.sceneRadius * sc.sceneRadius;
+    const double toPlane = -along - sc.sceneRadius;
+    if (outside && !mayDrop) return DSkyEntry{origin, true};
+    if (!outside && !(toPlane > 0.0)) return DSkyEntry{origin, true};
+    if (!outside && !occluded(sc, origin, dir, (Real)toPlane, (Real)0))   // nothing upstream
+        return DSkyEntry{origin + dir * (Real)toPlane, true};
+    const DHit h = closestHit(sc, origin, dir, (Real)0);
+    if (outside && !h.valid) return DSkyEntry{origin, false};
+    const double back = 1e-3 * sc.sceneRadius;   // haze that short a way is none to speak of
+    const double t = (h.valid && (outside || (double)h.t < toPlane)) ? fmax(0.0, (double)h.t - back) : toPlane;
+    return DSkyEntry{origin + dir * (Real)t, true};
+}
+__device__ static inline bool dSkyEntryPastHaze(const DScene& sc, DVec3& origin, const DVec3& dir, bool mayDrop) {
+    if (sc.mediaN <= 0 || !dTimed(sc) || !(sc.mo.sweptReach > sc.sceneRadius)) return true;
+    const DSkyEntry e = dSkyEntryPastHazeOut(sc, origin, dir, mayDrop);
+    origin = e.origin;
+    return e.keep;
+}
 // Host twin bdpt::sampleSunOrigin, and drawn the same way: the origin of a sun light subpath, and
 // in (x, y) its disc coordinates for dSunOriginPdf.
 __device__ static DVec3 dSampleSunOrigin(const DScene& sc, const DEmitter& em, DRng& rng,
@@ -7543,16 +7614,18 @@ __device__ static DVec3 dSampleSunOrigin(const DScene& sc, const DEmitter& em, D
         x = cx + rr * cos(phi);
         y = cy + rr * sin(phi);
     } else {
-        const double rr = em.sunDiscR * sqrt((double)rng.uniform()), phi = 2.0 * DPI * (double)rng.uniform();
+        const double rr = em.sunDiscR * dLightScale(sc) * sqrt((double)rng.uniform()),
+                     phi = 2.0 * DPI * (double)rng.uniform();
         x = rr * cos(phi);
         y = rr * sin(phi);
     }
-    return sc.sceneCenter + t * (Real)x + b * (Real)y - em.beamDir * (Real)sc.sceneRadius;
+    return sc.sceneCenter + t * (Real)x + b * (Real)y - em.beamDir * (Real)dLightRadius(sc);
 }
 // Host twin bdpt::sunOriginPdf: the sun's origin density per unit area of the disc at disc
-// coordinates (x, y), 0 off the disc and every target.
-__device__ static double dSunOriginPdf(const DEmitter& em, double x, double y) {
-    const double Rd = em.sunDiscR;
+// coordinates (x, y), 0 off the disc and every target. For a path with a time the disc is widened
+// with the light's sphere (dLightScale).
+__device__ static double dSunOriginPdf(const DScene& sc, const DEmitter& em, double x, double y) {
+    const double Rd = em.sunDiscR * dLightScale(sc);
     const bool onDisc = (x * x + y * y <= Rd * Rd);
     if (!dSunAimOn()) return onDisc ? 1.0 / (DPI * Rd * Rd) : 0.0;
     double p = onDisc ? (1.0 - c_sunAimF) / (DPI * Rd * Rd) : 0.0;
@@ -7570,7 +7643,7 @@ __device__ static double dSunOriginPdf(const DEmitter& em, double x, double y) {
 // it would have started from. All in double: the disc is a scene radius upstream.
 __device__ static double dSunOriginPdfAlong(const DScene& sc, const DEmitter& em,
                                             const DVec3& curP, const DVec3& nextP) {
-    const double R = sc.sceneRadius;
+    const double R = dLightRadius(sc);
     double wx = (double)nextP.x - (double)curP.x, wy = (double)nextP.y - (double)curP.y,
            wz = (double)nextP.z - (double)curP.z;
     const double L = sqrt(wx * wx + wy * wy + wz * wz);
@@ -7591,7 +7664,7 @@ __device__ static double dSunOriginPdfAlong(const DScene& sc, const DEmitter& em
     DVec3 t, b; onb(em.beamDir, t, b);
     const double x = ox * (double)t.x + oy * (double)t.y + oz * (double)t.z;
     const double y = ox * (double)b.x + oy * (double)b.y + oz * (double)b.z;
-    return dSunOriginPdf(em, x, y) / cw;                // per area across the ray (host twin)
+    return dSunOriginPdf(sc, em, x, y) / cw;            // per area across the ray (host twin)
 }
 // Host twin bdpt::mergeLightDensity: the light-side density a merge's weight reads at a site
 // whose light-side neighbour is `fromDelta`, with a delta bounce's 0 read as 1 (MODE-J-SDS,
@@ -12992,7 +13065,7 @@ __device__ static float dVertexPdfLightF(const DScene& sc, const DVertex& cur, c
                                                                      : nullptr;
     float pdf;
     if (em && dIsInfiniteEmitter(*em)) {
-        float R = (float)sc.sceneRadius;
+        float R = (float)dLightRadius(sc);   // the light's sphere, widened for a path with a time
         if (R <= 0.f) return 0.f;
         if (em->shape == 6)                           // planar, over the sun's disc (host twin)
             pdf = (float)dSunOriginPdfAlong(sc, *em, cur.p, next.p);
@@ -13637,6 +13710,12 @@ struct BkNeeGeom {
     // device's own density and not a copy of the host's -- which is correct: MIS only requires
     // each side to report the density IT used.
     Real  pdfW;
+    // How far the shadow ray from `p` crosses media (host twin BackwardRenderer::sunMediaDist):
+    // the whole way, except to the sun, whose `dist` runs past everything the ray could meet --
+    // out to a blur's swept sphere -- and whose haze ends at the instant's sphere.
+    __device__ Real medDist(const DScene& sc, const DVec3& p) const {
+        return sun ? (Real)dMediaExitDistance(sc, p) : dist;
+    }
 };
 // Does this emitter consume its two sample coordinates? A collimated beam and a point-spot
 // are deterministic connections and draw nothing; every area shape (and the sun's cone)
@@ -13685,10 +13764,8 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
         // to the light point, cone falloff toward the surface, no rng draw. Peak
         // intensity/SPD = 1; the falloff scales it toward the cone edge. A moving spot's point
         // and beam are where its motion has them at the path's time.
-        DAff Dl;
-        const bool moving = dLightNow(sc, em, Dl);
-        const DVec3 org = moving ? affPoint(Dl.m, Dl.t, em.origin) : em.origin;
-        const DVec3 beam = moving ? dLightDir(Dl, em.beamDir) : em.beamDir;
+        DVec3 org = em.origin, beam = em.beamDir;
+        dLightCarry(sc, em, org, beam);
         DVec3 toL = org - h.p;
         g.dist2 = dot(toL, toL);
         g.dist  = sqrt(g.dist2);
@@ -13747,11 +13824,9 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     // emission-on-hit factor at the same surface point — which keeps the MIS pair
     // consistent (host twin: backward.h emitterGeom).
     double epat = dEmitterSamplePointPat(sc, em, (double)u1, (double)u2, y, nL);
-    {   // a moving light: sampled where it sits at the instant (uniform in area, which its
-        // rigid motion keeps), the sample carried to the path's time
-        DAff Dl;
-        if (dLightNow(sc, em, Dl)) { y = affPoint(Dl.m, Dl.t, y); nL = dLightDir(Dl, nL); }
-    }
+    // a moving light: sampled where it sits at the instant (uniform in area, which its rigid
+    // motion keeps), the sample carried to the path's time
+    dLightCarry(sc, em, y, nL);
     DVec3 toL = y - h.p;
     g.dist2 = dot(toL, toL);
     g.dist = sqrt(g.dist2);
@@ -13938,7 +14013,7 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
             // Matches the forward connectVolume / device volume-NEE transmittance so
             // surface direct light agrees between the forward and backward estimators.
             if (sc.mediaN > 0)
-                contrib *= (double)dMediaTransmittance(sc, h.p, g.wi, g.dist, lambda, rng);
+                contrib *= (double)dMediaTransmittance(sc, h.p, g.wi, g.medDist(sc, h.p), lambda, rng);
             acc += contrib;
         }
         total += ((nS > 1) ? acc / (double)nS : acc) * selW;
@@ -14024,7 +14099,7 @@ __device__ static void bkNeeLightSpecGlossy(const DScene& sc, const DHit& h, con
         const int KK = (K < DSPECNEE_MAXK) ? K : DSPECNEE_MAXK;
         for (int i = 0; i < KK; ++i) Tr[i] = 1.0;
         if (sc.mediaN > 0)
-            dMediaTransmittanceSpec(sc, h.p, g.wi, g.dist, lam, KK, Tr, rng);
+            dMediaTransmittanceSpec(sc, h.p, g.wi, g.medDist(sc, h.p), lam, KK, Tr, rng);
         for (int i = 0; i < KK; ++i) {
             const double f = dGlossyFHit(sc, *nb.m, h, nb.wo, g.wi, lam[i]);
             if (!(f > 0.0)) continue;
@@ -14078,7 +14153,7 @@ __device__ __noinline__ static void bkNeeLightHero(const DScene& sc, const DHit&
             // touching the rng, and its factor of exactly 1 below changes no bit.
             double tm = 1.0;
             if (sc.mediaN > 0) {
-                tm = (double)dMediaTransmittance(sc, h.p, g.wi, g.dist, lam[0], rng);
+                tm = (double)dMediaTransmittance(sc, h.p, g.wi, g.medDist(sc, h.p), lam[0], rng);
                 if (!(tm > 0.0)) continue;
             }
             // GLOSSY-NEE: the lobe geometry -- and therefore the balance-heuristic weight -- is
@@ -14169,14 +14244,13 @@ __device__ __noinline__ static void bkNeeVolumeHero(const DScene& sc, const DMed
         if (em.shape == 2) {
             // Point spot (device twin of volumeEmitterGeom's spot branch): no surface cosine,
             // cone falloff only; a moving one where its motion has it at the path's time.
-            DAff Dl;
-            const bool moving = dLightNow(sc, em, Dl);
-            const DVec3 toL = (moving ? affPoint(Dl.m, Dl.t, em.origin) : em.origin) - p;
+            DVec3 org = em.origin, beam = em.beamDir;
+            dLightCarry(sc, em, org, beam);
+            const DVec3 toL = org - p;
             const Real dist2 = dot(toL, toL);
             dist = sqrt(dist2);
             wi = toL / dist;
-            const Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), moving ? dLightDir(Dl, em.beamDir) : em.beamDir),
-                                                em.spotCosInner, em.spotCosOuter);
+            const Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), beam), em.spotCosInner, em.spotCosOuter);
             if (fall <= (Real)0) continue;
             // A fiber of `opacity` below 1 attenuates the shadow ray (host twin volumeEmitterGeom).
             const Real vis = shadowTransmittanceTo(sc, p + wi * RAY_EPS, p + wi * dist, 2 * RAY_EPS);
@@ -14196,10 +14270,7 @@ __device__ __noinline__ static void bkNeeVolumeHero(const DScene& sc, const DMed
             DVec3 y, nL;
             // Also returns the sampled point's emission-pattern factor (1.0 when unpatterned).
             const double epat = dEmitterSamplePointPat(sc, em, (double)u1, (double)u2, y, nL);
-            {
-                DAff Dl;
-                if (dLightNow(sc, em, Dl)) { y = affPoint(Dl.m, Dl.t, y); nL = dLightDir(Dl, nL); }
-            }
+            dLightCarry(sc, em, y, nL);
             const DVec3 toL = y - p;
             const Real dist2 = dot(toL, toL);
             dist = sqrt(dist2);
@@ -14213,7 +14284,8 @@ __device__ __noinline__ static void bkNeeVolumeHero(const DScene& sc, const DMed
             if (!(vis > (Real)0)) continue;
             geom = (double)cosLight / (double)dist2 * (double)em.area * (double)vis * epat;
         }
-        geom *= (double)dMediaTransmittance(sc, p, wi, dist, lam[0], rng) * selW;
+        geom *= (double)dMediaTransmittance(sc, p, wi, em.shape == 6 ? (Real)dMediaExitDistance(sc, p) : dist,
+                                            lam[0], rng) * selW;
         if (!(geom > 0.0)) continue;
         const Real cosT = dot(wIn, wi);
         for (int i = 0; i < nUp; ++i) {
@@ -14336,7 +14408,7 @@ __device__ static double bkNeeEnv(const DScene& sc, const DHit& h, Real rho,
     double contrib = fVal * Lenv * (double)g.cosSurf * invPdfLambda / g.pdfW
                      * g.wMis * (double)g.stG;
     if (sc.mediaN > 0)                                      // Beer-Lambert to the scene exit
-        contrib *= (double)dMediaTransmittance(sc, h.p, g.wi, (Real)g.farDist, lambda, rng);
+        contrib *= (double)dMediaTransmittance(sc, h.p, g.wi, (Real)dMediaExitDistance(sc, h.p), lambda, rng);
     return contrib;
 }
 
@@ -14352,7 +14424,7 @@ __device__ __noinline__ static void bkNeeEnvHero(const DScene& sc, const DHit& h
     if (!bkEnvGeom(sc, h, rng, g, nullptr, nb)) return;
     double tm = 1.0;                  // a vacuum scene: no rng draw, and a factor of exactly 1
     if (sc.mediaN > 0) {
-        tm = (double)dMediaTransmittance(sc, h.p, g.wi, (Real)g.farDist, lam[0], rng);
+        tm = (double)dMediaTransmittance(sc, h.p, g.wi, (Real)dMediaExitDistance(sc, h.p), lam[0], rng);
         if (!(tm > 0.0)) return;
     }
     const bool imageEnv = (sc.env.scale != nullptr);
@@ -14392,7 +14464,7 @@ __device__ __noinline__ static void bkNeeEnvVolumeHero(const DScene& sc, const D
     const double farDist = dExitDistance(sc, p);
     const Real envVis = shadowTransmittance(sc, p + wi * RAY_EPS, wi, (Real)farDist);
     if (!(envVis > (Real)0)) return;
-    const double T = (double)dMediaTransmittance(sc, p, wi, (Real)farDist, lam[0], rng);
+    const double T = (double)dMediaTransmittance(sc, p, wi, (Real)dMediaExitDistance(sc, p), lam[0], rng);
     if (!(T > 0.0)) return;
     const Real cosT = dot(wIn, wi);
     double ph[hero::kHeroMax], num = 0.0, den = 0.0;
@@ -14508,7 +14580,7 @@ __device__ static void bkNeeLightHeroHair(const DScene& sc, const DHit& h, const
         double w = g.sun ? (double)g.wSun
                  : g.spot ? (double)g.fall / (double)g.dist2
                  : (double)g.G * (double)em.area;
-        if (sc.mediaN > 0) w *= (double)dMediaTransmittance(sc, h.p, g.wi, g.dist, lam[0], rng);
+        if (sc.mediaN > 0) w *= (double)dMediaTransmittance(sc, h.p, g.wi, g.medDist(sc, h.p), lam[0], rng);
         w *= selW;
         if (!(w > 0.0)) continue;
         const dhair::V3 wl = dhair::toLocal(hs0.fr, g.wi);
@@ -14559,7 +14631,7 @@ __device__ static void bkNeeEnvHeroHair(const DScene& sc, const DHit& h, const D
                                              RAY_EPS, dHairExitOffset(hs0, h.n, wi));
     if (!(vis > 0.0)) return;
     if (sc.mediaN > 0) {
-        vis *= (double)dMediaTransmittance(sc, h.p, wi, (Real)farDist, lam[0], rng);
+        vis *= (double)dMediaTransmittance(sc, h.p, wi, (Real)dMediaExitDistance(sc, h.p), lam[0], rng);
         if (!(vis > 0.0)) return;
     }
     const dhair::V3 wl = dhair::toLocal(hs0.fr, wi);
@@ -16058,10 +16130,9 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         const DEmitter& em = sc.emitters[k];
         if (em.collimated || em.shape == 3) continue;  // collimated beams / env (env: bkNeeEnvRGB)
         if (em.shape == 2) {                           // point spot
-            DAff Dl;
-            const bool moving = dLightNow(sc, em, Dl);
-            const DVec3 beam = moving ? dLightDir(Dl, em.beamDir) : em.beamDir;
-            DVec3 toL = (moving ? affPoint(Dl.m, Dl.t, em.origin) : em.origin) - h.p;
+            DVec3 org = em.origin, beam = em.beamDir;
+            dLightCarry(sc, em, org, beam);
+            DVec3 toL = org - h.p;
             Real dist2 = dot(toL, toL);
             Real dist  = sqrt(dist2);
             DVec3 wi = toL / dist;
@@ -16092,10 +16163,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         // Also returns the sampled point's emission-pattern factor (1.0 when unpatterned).
         // The pattern is achromatic, so it scales the baked RGB radiance directly.
         double epat = dEmitterSamplePointPat(sc, em, (double)u1, (double)u2, y, nL);
-        {
-            DAff Dl;
-            if (dLightNow(sc, em, Dl)) { y = affPoint(Dl.m, Dl.t, y); nL = dLightDir(Dl, nL); }
-        }
+        dLightCarry(sc, em, y, nL);
         DVec3 toL = y - h.p;
         Real dist2 = dot(toL, toL);
         Real dist = sqrt(dist2);
@@ -17298,7 +17366,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
             if (sc.sceneRadius <= 0.0) return 0;
             double x, y;
             org = dSampleSunOrigin(sc, em, rng, x, y);
-            pdfPosD = dSunOriginPdf(em, x, y) / (double)ddot(dir, em.beamDir);   // across the ray
+            pdfPosD = dSunOriginPdf(sc, em, x, y) / (double)ddot(dir, em.beamDir);   // across the ray
             if (!(pdfPosD > 0.0)) return 0;
         } else {
             org = em.origin;
@@ -17307,6 +17375,8 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
         double fall = isSun ? 1.0
                             : spotFalloff(ddot(dir, em.beamDir), em.spotCosInner, em.spotCosOuter);
         if (fall <= 0.0) return 0;
+        // a moving spot: its point, and its cone (drawn about the instant's beam), carried out
+        if (!isSun) dLightCarry(sc, em, org, dir);
         double LeD = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * fall;
         double LeSecD[BDPT_NSEC], mxLeD = LeD;
         for (int i = 0; i + 1 < hb.C; ++i) {
@@ -17333,7 +17403,11 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
         double betaWalkD = LeD * invP;
         double betaWalkSecD[BDPT_NSEC];
         for (int i = 0; i + 1 < hb.C; ++i) betaWalkSecD[i] = LeSecD[i] * invP;
-        dRandomWalk(sc, cam, diffraction, org, dir, betaWalkD, pdfDirD, hb, maxDepth - 1, rng,
+        // The walk starts where the scene's media do (dSkyEntryPastHaze: a blur's wider sun disc is
+        // out past them); the vertex stays on the disc, where its densities are measured.
+        DVec3 walkFrom = org;
+        if (isSun) dSkyEntryPastHaze(sc, walkFrom, dir, /*mayDrop=*/false);
+        dRandomWalk(sc, cam, diffraction, walkFrom, dir, betaWalkD, pdfDirD, hb, maxDepth - 1, rng,
                     path, pathSec, secStride, maxV, nD, true, betaWalkSecD, hb.C);
         // Infinite-light density patch (PBRT): the first scene vertex was given a
         // solid-angle density converted with 1/dist^2 from the fictitious disc point, but
@@ -17352,6 +17426,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     // when the emitter is unpatterned). It scales the emitted radiance the subpath starts
     // with, exactly as the emission-on-hit side scales the s=0 strategy's radiance.
     double emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, y, nOut);
+    dLightCarry(sc, em, y, nOut);   // a moving light: sampled where it sits at the instant, carried out
     double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * emitPatW;
     // The bundle's other wavelengths: a subpath dark at the hero alone still carries them (the
     // walk goes on while any wavelength lives), as the spot / sun branch's does. Host twin:
@@ -17688,16 +17763,19 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         // A distant sun has no finite light point: the shadow ray runs all the way to the
         // scene exit, so it must NOT be shortened by the usual endpoint epsilon.
         double occlEps = 2e-6;
+        double medDist = -1.0;   // how far the connection crosses media, when not `dist` (the sun)
         if (em.shape == 2) {
             // Point spot: the connection point is deterministic (delta position); the
             // smoothstep penumbra weights the intensity toward this receiver.
-            DVec3 toL = em.origin - pt.p; double dist2 = ddot(toL, toL);
+            DVec3 org = em.origin, beam = em.beamDir;
+            dLightCarry(sc, em, org, beam);              // a moving spot, where it is at the path's time
+            DVec3 toL = org - pt.p; double dist2 = ddot(toL, toL);
             if (dist2 <= 0.0) return 0.0;
             dist = sqrt(dist2); wi = toL * (Real)(1.0 / dist);
-            double fall = spotFalloff(ddot(wi * (Real)(-1), em.beamDir),
+            double fall = spotFalloff(ddot(wi * (Real)(-1), beam),
                                       em.spotCosInner, em.spotCosOuter);
             if (fall <= 0.0) return 0.0;               // outside the cone
-            y = em.origin; nOut = wi * (Real)(-1);
+            y = org; nOut = wi * (Real)(-1);
             Wgeom = fall / (dist2 * pdfChoice);        // emitSpd is an INTENSITY (W/sr)
         } else if (em.shape == 6) {
             // Distant sun: sample a direction inside the solar cone (pdfW = 1/Omega) and
@@ -17705,6 +17783,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             // at infinity — so Wgeom is just Omega/pdfChoice and emitSpd is a radiance.
             wi = dSunSampleCone(em, em.beamDir * (Real)-1, (double)u1, (double)u2);
             dist = dExitDistance(sc, pt.p);
+            medDist = dMediaExitDistance(sc, pt.p);   // the haze ends at the instant's sphere
             occlEps = 0.0;
             y = pt.p + wi * (Real)dist; nOut = wi * (Real)(-1);
             Wgeom = em.spotOmega / pdfChoice;
@@ -17713,6 +17792,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             // sees; s=0 applies the pointwise-equal emission-on-hit factor, which is what
             // keeps the two MIS-combined strategies consistent.
             emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, y, nOut);
+            dLightCarry(sc, em, y, nOut);
             DVec3 toL = y - pt.p; double dist2 = ddot(toL, toL);
             if (dist2 <= 0.0) return 0.0;
             dist = sqrt(dist2); wi = toL * (Real)(1.0 / dist);
@@ -17782,7 +17862,9 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             if (!(mxF > 0.0)) return 0.0;
         }
         // Hero-only transmittance (exactly 1 whenever nUp > 1; see the t==1 branch).
-        double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc, pt.p, wi, (Real)dist, lambda, rng) : 1.0;
+        double Tr = (sc.mediaN > 0) ? (double)dMediaTransmittance(sc, pt.p, wi,
+                                                                  (Real)(medDist >= 0.0 ? medDist : dist),
+                                                                  lambda, rng) : 1.0;
         double G = fabs(cosSurf) * Wgeom;
         L = pt.beta * f * Le * G * Tr;
         for (int i = 0; i + 1 < nUp; ++i)
@@ -18040,7 +18122,7 @@ __device__ static void dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const 
 // nothing to merge.
 template <int NS, int MAXD, bool MERGE, bool STRAT>
 __global__ void __launch_bounds__(128, 3)
-kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
+kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* splatFilm,
                       long long totalSamples, long long chunkSpp, long long sppTotal,
                       long long sampleBase, int resX, int maxDepth,
                       int diffraction, unsigned long long seedBase, int heroC,
@@ -18102,6 +18184,21 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
             : (long long)(dMix64((unsigned long long)gidxBase * 0xD1B54A32D192ED03ull + (unsigned long long)sub) >> 1);
         const bool allowD = sub < kD, allowJ = sub < kJ;
         DRng rng; rng.seedUnit((unsigned long long)gidx, seedBase);
+        // Motion blur (mode D; host twin BdptRenderer::renderRows' blurD): the sample's subpaths and
+        // every connection between them at one time in the shutter, off a stream of its own, with
+        // the camera posed there when it moves (camT). A camera that holds still is read where it
+        // is, in the launch's constant parameters (__grid_constant__ lets its address be taken
+        // without a per-thread copy).
+        DCamera camT;
+        const DCamera* camP = &cam;
+        if (!MERGE && cam.blur) {
+            DRng tr;
+            tr.seedUnit((unsigned long long)gidx, cam.timeSalt ^ 0x3C6EF372FE94F82BULL);
+            const bool moves = cam.nKeys > 0;
+            dSetPathTime(sc, cam, (double)tr.uniform(), moves ? &camT : nullptr);
+            if (moves) camP = &camT;
+        }
+        const DCamera& camS = *camP;
 
         // Hero + C-1 stratified secondaries from ONE base uniform (u + i/C wrapped into
         // [0,1)), pushed through the same inverse-CDF the scalar path uses. The hero must
@@ -18139,12 +18236,12 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
         DEscape esc; esc.escaped = 0; esc.beta = 0.0; esc.nUp = 1;
         // maxDepth + 2 eye vertices, so s = 0 can make a path of every depth it is weighted for
         // (host twin: BdptRenderer::renderRows).
-        int nE = dGenCameraSubpath(sc, cam, diffraction, px, py, hb, maxDepth + 2, rng, eye, eyeSec, NS, MAXV,
+        int nE = dGenCameraSubpath(sc, camS, diffraction, px, py, hb, maxDepth + 2, rng, eye, eyeSec, NS, MAXV,
                                    (sc.sunCount > 0) ? &esc : nullptr,
                                    wantSegs ? segs : nullptr, wantSegs ? &nSegs : nullptr,
                                    wantSegs ? (int)SEGN : 0, jSpecOn ? &jrun : nullptr,
                                    (jSpecOn && kappaSurf > 0.0) ? vspec : nullptr);
-        int nL = dGenLightSubpath(sc, cam, diffraction, hb, maxDepth + 1, rng, light, lightSec, NS, MAXV);
+        int nL = dGenLightSubpath(sc, camS, diffraction, hb, maxDepth + 1, rng, light, lightSec, NS, MAXV);
 
         // PER-OBJECT ROUTE (0.386.0; see c_routeOn). routeR: the route of every path this camera
         // subpath makes with t >= 2, which all share its leading chain eye[1..fIdx]. prefJ bit k
@@ -18225,7 +18322,7 @@ kBdptT(DScene sc, DCamera cam, double* camFilm, double* splatFilm,
                     if (rt != 1) { if (!allowD) continue; mkST = 0.0; ksST = 0.0; wST = wD; }
                     else         { if (!allowJ) continue; wST = wJ; }
                 }
-                double c = (c_jHalf == 2) ? 0.0 : dConnectBDPT(sc, cam, light, eye, lightSec, eyeSec, NS,
+                double c = (c_jHalf == 2) ? 0.0 : dConnectBDPT(sc, camS, light, eye, lightSec, eyeSec, NS,
                                         s, t, hb, rng, spx, spy, isSplat, Lsec, nUpConn,
                                         mkST, ksST);
                 if (wST != 1.0) { c *= wST; for (int i = 0; i + 1 < nUpConn; ++i) Lsec[i] *= wST; }
@@ -18769,7 +18866,8 @@ __device__ static void dSunNeeMarch(const DScene& sc, const DVec3& oc, const DVe
                 const DVec3 wi = dSunSampleCone(em, em.beamDir * (Real)(-1), s1, s2);   // toward the sun
                 const Real dist = (Real)(dExitDistance(sc, p));
                 if (occluded(sc, p + wi * RAY_EPS, wi, dist)) continue;
-                const double Tsun = (double)dMediaTransmittance(sc, p, wi, dist, lambda, rng);
+                const double Tsun = (double)dMediaTransmittance(sc, p, wi, (Real)dMediaExitDistance(sc, p),
+                                                                lambda, rng);
                 if (!(Tsun > 0.0)) continue;
                 // Light travels along -wi and leaves toward the camera along -dc: the same argument
                 // the beam gather hands the phase (dot(b.d, -dc)).
@@ -20204,7 +20302,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 if (sc.sceneRadius <= 0.0) continue;
                 double x, yy;
                 y = dSampleSunOrigin(sc, em, rng, x, yy);
-                pdfPos = dSunOriginPdf(em, x, yy) / (double)ddot(dir, em.beamDir);   // across the ray
+                pdfPos = dSunOriginPdf(sc, em, x, yy) / (double)ddot(dir, em.beamDir);   // across the ray
             } else {
                 y = em.origin;                             // delta position: pdfPos == 1
                 emitScale = spotFalloff(ddot(dir, em.beamDir), em.spotCosInner, em.spotCosOuter);
@@ -25214,8 +25312,8 @@ size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
 // --------------------- backward reference (mode R) host ----------------------
 
 const char* cudaBlurUnsupported(const Scene& /*scene*/, const Camera& /*cam*/, char mode) {
-    if (mode != 'R' && mode != 'W')
-        return "motion blur in this mode renders on the CPU so far (the device blurs modes R and W)";
+    if (mode != 'R' && mode != 'W' && mode != 'D')
+        return "motion blur in this mode renders on the CPU so far (the device blurs modes R, W and D)";
     return nullptr;
 }
 
