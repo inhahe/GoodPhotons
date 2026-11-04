@@ -6800,6 +6800,31 @@ as the one at fault.
     Made and written only for `-write-aovs`, through `GuideScope::writeGuideFiles`, and dropped
     once written (the denoiser reads none of them); `-write-aovs` without `-oidn` renders the
     guide pass without publishing it. What a temporal denoiser reprojects with.
+- **`-denoise-shot`** (ROADMAP 11 stage D, 0.412.0; `main.cpp runDenoiseShot`): a rendered shot's
+  frames, read as their PFM and their reprojection images, denoised in order and written as
+  PNG + PFM at one exposure. It is dispatched beside `-serve`, so main's OIDN and CUDA teardown
+  runs after it. Methods:
+  - `svgf`: `temporal.h`'s `Svgf`, which keeps the history (illumination, luminance moments,
+    length, and the previous frame's position, normal and depth). Albedo is demodulated. A
+    history tap is accepted where the previous frame's world position lies within 2 % of the
+    depth of the point's position a frame earlier (`prevposition`) and the normals agree. The
+    reprojected history is then clamped to the frame's own 3x3 same-surface mean ± 0.75 σ (not in
+    the paper: without it a still floor kept the light it had before a moving ball's contact
+    shadow reached it), and the share of luminance the clamp took off shortens the history and
+    its moments (anti-lag). Blending goes as 1/n while young, at least α after. Variance is
+    temporal from four frames, spatial before. Three à-trous passes follow (five, the paper's
+    real-time count, bled light into that shadow), the first feeding the next frame's history.
+    `-passes`, `-alpha` and `-clamp` override the tuned values.
+  - `optix`: `optix_denoise.cpp`, the OptiX TEMPORAL_AOV model. Its flow is our backward vector
+    negated (`flowMulX/Y = -1`); internal guide layers and the previous output are swapped each
+    frame. It is built only when CMake finds the OptiX headers in `external/optix-dev`
+    (HAVE_OPTIX). They are not vendored, because their licence allows redistributing binaries,
+    not the headers. OptiX itself is reached through the driver (`optixInit`), and the CUDA
+    context it makes is torn down by main (`g_optixUsedCuda`).
+  - `oidn`: `oidnrt::denoise`, frame by frame.
+  - `none`.
+  `tools/temporal_compare.py` scores them on one shot: error and flicker against a converged
+  reference, plus a side-by-side video.
   - **Plumbing.** `runRender` holds a `GuideScope` for its camera: it renders the guides on
     entry, publishes them (`setGuide`) and withdraws them on exit. `filmToLinear` — the one
     reduction behind the PNG, the `-hdr` PFM and the live window — runs `oidnApply`, which uses

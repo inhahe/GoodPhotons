@@ -174,6 +174,10 @@
 #include "denoise.h"            // -denoise: luma/chroma a-trous filter for MC speckle
 #include "denoise_guide.h"      // -oidn: the albedo/normal guide images the learned denoiser reads
 #include "oidn_rt.h"            // -oidn: Intel Open Image Denoise, loaded at run time
+#include "temporal.h"           // -denoise-shot svgf: the SVGF-style temporal accumulator
+#ifdef HAVE_OPTIX
+#include "optix_denoise.h"      // -denoise-shot optix: OptiX's temporal denoiser
+#endif
 #include "viewer_gui.h"         // -viewer: loom native viewer host (Dear ImGui + Win32/D3D11)
 #include "fur_grid.h"           // -checkfurgrid / -dual-grid: voxel fiber density + orientation grid
 #include "fur_volume.h"         // -checkfurvol: aggregate fiber scattering (P2 stage 2)
@@ -13132,6 +13136,8 @@ static bool            g_oidn            = false;
 static bool            g_oidnGuides      = true;    // -oidn-noguides: denoise the colour alone
 static int             g_oidnGuideSide   = 4;       // -oidn-guide-spp n: sqrt(n) rays a side per pixel
 static bool            g_oidnWriteGuides = false;   // -oidn-write-guides: the guides as PFMs beside -o
+// -denoise-shot optix made a CUDA context of its own (main's teardown then runs for it).
+static bool            g_optixUsedCuda = false;
 // -write-aovs: the guide pass's images as PFMs beside -o, denoised or not (ROADMAP 11 stage C):
 // albedo, normal, depth, world position (now and a frame earlier) and the motion vectors a frame
 // back and forward.
@@ -21492,6 +21498,9 @@ static void printHelp(const char* prog) {
 "                        With -denoise too: firefly clamp, then OIDN, then the chroma filter\n"
 "  -oidn-noguides        denoise the colour alone (implies -oidn)\n"
 "  -oidn-guide-spp <n>   guide rays per pixel, rounded to a square (default 16)\n"
+"  -denoise-shot <svgf|optix|oidn|none> <in%%04d.pfm> <out%%04d.png> <first> <last> [-exposure <e>]\n"
+"                        denoise a shot rendered with -hdr -write-aovs, frame by frame in order;\n"
+"                        svgf: [-passes <n>] (3) [-alpha <a>] (0.2) [-clamp <g>] (0.75, 0 off)\n"
 "  -write-aovs           write the guide pass's images beside -o, denoised or not: <out>.albedo,\n"
 "                        .normal, .depth, .position, .prevposition, .motion, .motionfwd.pfm\n"
 "  -oidn-write-guides    also write <out>.albedo.pfm / <out>.normal.pfm (implies -oidn);\n"
@@ -28737,6 +28746,183 @@ static int runServe(int argc, char** argv, int inValPos) {
     return rc;
 }
 
+// --- -denoise-shot: a rendered shot's frames, denoised in order (ROADMAP 11 stage D) ----------
+// `ftrace -denoise-shot <method> <in> <out> <first> <last> [-exposure <e>]` reads frame k's render
+// <in>%k (a scene-linear PFM: render with -hdr) and the guide pass beside it (-write-aovs:
+// <stem>.albedo/.normal/.depth/.position/.prevposition/.motion.pfm), denoises it, and writes
+// <out>%k (a PNG) with its PFM beside it. <in> and <out> hold one printf integer (`%04d`). Methods:
+//   svgf   the SVGF-style temporal accumulator (temporal.h)
+//   optix  OptiX's temporal denoiser (optix_denoise.h; built in when its headers were found)
+//   oidn   Open Image Denoise, each frame alone (no history: the spatial baseline)
+//   none   the frames as they are
+// Every frame's PNG is developed at one exposure -- `-exposure <e>`, the multiplier the PNG's sRGB
+// encoding sees, or else the first frame's auto-exposure -- so the shot cannot flicker through it.
+// `-passes`, `-alpha` and `-clamp` override svgf's tuned SvgfOptions; -oidn-quality and
+// -oidn-device set oidn's; any other option is refused.
+
+// `pat` with frame number `k` in its one integer conversion, or false (err set) for a pattern
+// that has none, more than one, or any other conversion.
+static bool shotFramePath(const std::string& pat, long long k, std::string& out, std::string& err) {
+    int convs = 0;
+    for (size_t i = 0; i < pat.size(); ++i) {
+        if (pat[i] != '%') continue;
+        if (i + 1 < pat.size() && pat[i + 1] == '%') { ++i; continue; }
+        size_t j = i + 1;
+        while (j < pat.size() && (std::isdigit((unsigned char)pat[j]) || pat[j] == '0')) ++j;
+        if (j >= pat.size() || pat[j] != 'd') { err = "'" + pat + "' has a conversion other than %d"; return false; }
+        ++convs;
+    }
+    if (convs != 1) { err = "'" + pat + "' needs exactly one frame number (%d, %04d, ...)"; return false; }
+    std::vector<char> buf(pat.size() + 32);
+    std::snprintf(buf.data(), buf.size(), pat.c_str(), (int)k);
+    out = buf.data();
+    return true;
+}
+
+static int runDenoiseShot(int argc, char** argv, int at) {
+    if (at + 5 >= argc) {
+        std::fprintf(stderr, "error: -denoise-shot <svgf|optix|oidn|none> <in%%04d.pfm> <out%%04d.png> "
+                             "<first> <last> [-exposure <e>] [-passes <n>] [-alpha <a>] [-clamp <g>]\n");
+        return 2;
+    }
+    const std::string method = argv[at + 1], inPat = argv[at + 2], outPat = argv[at + 3];
+    const long long first = std::atoll(argv[at + 4]), last = std::atoll(argv[at + 5]);
+    double exposure = 0.0;
+    temporal::SvgfOptions so;
+    for (int i = at + 6; i < argc; ++i) {
+        const auto num = [&](double lo, double hi, double& v) {
+            char* end = nullptr;
+            if (i + 1 < argc) v = std::strtod(argv[i + 1], &end);
+            if (i + 1 >= argc || !end || *end || !(v >= lo && v <= hi)) {
+                std::fprintf(stderr, "error: -denoise-shot: %s takes a number from %g to %g\n", argv[i], lo, hi);
+                return false;
+            }
+            ++i;
+            return true;
+        };
+        double v = 0.0;
+        if (!std::strcmp(argv[i], "-exposure")) {
+            if (!num(1e-30, 1e30, exposure)) return 2;
+        } else if (!std::strcmp(argv[i], "-passes")) {
+            if (!num(0, 10, v)) return 2;
+            so.iterations = (int)v;
+        } else if (!std::strcmp(argv[i], "-alpha")) {
+            if (!num(0.01, 1, v)) return 2;
+            so.alpha = so.alphaMoments = v;
+        } else if (!std::strcmp(argv[i], "-clamp")) {
+            if (!num(0, 100, v)) return 2;
+            so.clampGamma = v;
+            if (v == 0.0) so.clampRadius = 0;
+        } else {
+            const int r = parseOidnFlag(argc, argv, i);   // -oidn-quality, -oidn-device: for oidn
+            if (r < 0) return 2;
+            if (r == 0) {
+                std::fprintf(stderr, "error: -denoise-shot: unknown option '%s'\n", argv[i]);
+                return 2;
+            }
+        }
+    }
+    if (method != "svgf" && method != "optix" && method != "oidn" && method != "none") {
+        std::fprintf(stderr, "error: -denoise-shot: unknown method '%s' (svgf, optix, oidn, none)\n",
+                     method.c_str());
+        return 2;
+    }
+#ifndef HAVE_OPTIX
+    if (method == "optix") {
+        std::fprintf(stderr, "error: -denoise-shot optix: this ftrace was built without the OptiX "
+                             "headers (github.com/NVIDIA/optix-dev, in external/optix-dev)\n");
+        return 2;
+    }
+#else
+    optixdn::Temporal optix;
+#endif
+    if (method == "oidn" && !oidnStartup()) return 2;
+    temporal::Svgf svgf(so);
+    double anchor = exposure;   // the PNGs' one exposure, once known
+    for (long long k = first; k <= last && !g_stopRequested; ++k) {
+        std::string in, out, err;
+        if (!shotFramePath(inPat, k, in, err) || !shotFramePath(outPat, k, out, err)) {
+            std::fprintf(stderr, "error: -denoise-shot: %s\n", err.c_str());
+            return 2;
+        }
+        const std::string stem = pfmPathFor(in).substr(0, pfmPathFor(in).size() - 4);
+        temporal::Frame f;
+        int w = 0, h = 0;
+        std::vector<Vec3> depth3;
+        const auto need = [&](const std::string& path, std::vector<Vec3>& img) {
+            int iw = 0, ih = 0;
+            if (!readPfm(path, iw, ih, img, err)) return false;
+            if ((w || h) && (iw != w || ih != h)) { err = path + " is not the render's size"; return false; }
+            w = iw; h = ih;
+            return true;
+        };
+        if (!need(pfmPathFor(in), f.color)) {
+            std::fprintf(stderr, "error: -denoise-shot: %s\n", err.c_str());
+            return 2;
+        }
+        const bool guides = method != "none";
+        if (guides && (!need(stem + ".albedo.pfm", f.albedo) || !need(stem + ".normal.pfm", f.normal) ||
+                       (method != "oidn" &&
+                        (!need(stem + ".depth.pfm", depth3) || !need(stem + ".position.pfm", f.position) ||
+                         !need(stem + ".prevposition.pfm", f.prevPosition) ||
+                         !need(stem + ".motion.pfm", f.motionBack))))) {
+            std::fprintf(stderr, "error: -denoise-shot: %s (render the frames with -hdr -write-aovs)\n",
+                         err.c_str());
+            return 2;
+        }
+        f.W = w; f.H = h;
+        f.depth.resize(depth3.size());
+        for (size_t i = 0; i < depth3.size(); ++i) f.depth[i] = (float)depth3[i].x;
+        const size_t N = (size_t)w * (size_t)h;
+        std::vector<Vec3> lin;
+        const auto floats = [&](const std::vector<Vec3>& v, int comps) {
+            std::vector<float> o(v.size() * (size_t)comps);
+            for (size_t i = 0; i < v.size(); ++i)
+                for (int c = 0; c < comps; ++c) o[i * comps + c] = (float)(&v[i].x)[c];
+            return o;
+        };
+        if (method == "svgf") {
+            lin = svgf.process(f);
+        } else if (method == "none") {
+            lin = f.color;
+        } else {
+            std::vector<float> col = floats(f.color, 3), alb = floats(f.albedo, 3), nrm = floats(f.normal, 3);
+            bool ok = false;
+            if (method == "oidn") {
+                ok = oidnrt::denoise(col.data(), alb.data(), nrm.data(), w, h, /*cleanAux*/true,
+                                     /*auxKey*/0, g_oidnOpts, err);
+            }
+#ifdef HAVE_OPTIX
+            else {
+                std::vector<float> mv = floats(f.motionBack, 2);
+                ok = optix.denoise(col.data(), alb.data(), nrm.data(), mv.data(), w, h, err);
+            }
+#endif
+            if (!ok) {
+                std::fprintf(stderr, "error: -denoise-shot %s: %s\n", method.c_str(), err.c_str());
+                return 2;
+            }
+            lin.resize(N);
+            for (size_t i = 0; i < N; ++i) lin[i] = Vec3{col[3 * i], col[3 * i + 1], col[3 * i + 2]};
+        }
+        Film shape;
+        shape.resX = w; shape.resY = h;
+        double eAuto = 0.0, used = 0.0;
+        const std::vector<uint8_t> img = filmToRgb8(shape, 1.0, 0.0, /*absolute*/false, &anchor, &eAuto,
+                                                    &used, nullptr, nullptr, &lin);
+        if (!writeImage(out, w, h, img) || !writePfm(pfmPathFor(out), w, h, lin)) {
+            std::fprintf(stderr, "error: -denoise-shot: could not write %s\n", out.c_str());
+            return 2;
+        }
+        std::printf("[denoise-shot] %s: frame %lld -> %s (exposure %.4g)\n", method.c_str(), k, out.c_str(),
+                    used);
+    }
+#ifdef HAVE_OPTIX
+    g_optixUsedCuda = optixdn::usedCuda();
+#endif
+    return g_stopRequested ? 1 : 0;
+}
+
 // `ftrace -shot <scene.py> [shot flags] [render flags]` (ROADMAP 11): render a loom file as a
 // shot. loom's shot runner (`python -m loom.shot`, tools/loom/loom/shot.py) owns the timeline --
 // it builds each frame's scene, with motion keys when there is a shutter, and renders it with
@@ -29098,7 +29284,11 @@ int main(int argc, char** argv) {
             stopChannelStart(std::string(inPath ? inPath : "(no -in)") + " -> " +
                              (outPath ? outPath : "(default output)"));
         }
-        rc = serve ? runServe(argc, argv, inValPos) : run(argc, argv);
+        int denoiseShotAt = 0;
+        for (int i = 1; i < argc && !denoiseShotAt; ++i)
+            if (!std::strcmp(argv[i], "-denoise-shot")) denoiseShotAt = i;
+        rc = denoiseShotAt ? runDenoiseShot(argc, argv, denoiseShotAt)
+           : serve ? runServe(argc, argv, inValPos) : run(argc, argv);
         if (rc == 0 && g_stopExitCode != 0 && g_stopRequested) rc = g_stopExitCode;
     } catch (const std::bad_alloc&) {
         // std::bad_alloc::what() is the bare string "bad allocation", which names neither
@@ -29179,7 +29369,7 @@ int main(int argc, char** argv) {
     // `-device cpu -oidn`) -- otherwise OIDN's context is the one the driver reaps after exit.
     const bool oidnOnGpu = oidnrt::shutdown();
 #ifdef HAVE_CUDA
-    cudaGracefulShutdown(oidnOnGpu);
+    cudaGracefulShutdown(oidnOnGpu || g_optixUsedCuda);
 #else
     (void)oidnOnGpu;
 #endif

@@ -742,3 +742,14 @@ albedo and normal and, from one ray through each pixel's centre at the frame's i
 world position, the point's position a frame earlier, and its motion vectors a frame back and
 forward (each point carried by its own keys, seen by the camera a frame away: a path's
 neighbouring frame or a keyed camera's keys carried out). `tools/check_aovs.py`.
+
+**Stage D, temporal denoisers (0.412.0, done):** `-denoise-shot svgf|optix|oidn|none` over a shot
+rendered with `-hdr -write-aovs`. The methods are an SVGF-style accumulator (`temporal.h`),
+OptiX's TEMPORAL_AOV model (built in when the OptiX headers are in `external/optix-dev`), and OIDN
+frame by frame. `tools/temporal_compare.py` is the comparison shot (error and flicker against a
+converged reference): on its 24 frames at 8 spp, OIDN 0.0031 / 0.039, OptiX 0.0055 / 0.039, SVGF
+0.0082 / 0.032, the noisy shot 0.086 / 0.270. SVGF needed two things the paper does not have: a
+history clamp, so a still floor kept no ghost of the light it had before a rolling ball's contact
+shadow reached it, and three à-trous passes where real time takes five. Without them it scored
+0.0206. OIDN 3's temporal model is still unreleased (2.5.1 is the latest, checked 2026-11-03); it
+joins as a method when it ships.

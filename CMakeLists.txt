@@ -157,6 +157,22 @@ if(CMAKE_CUDA_COMPILER)
         COMMENT "Checking .cu header dependencies (MSBuild CudaCompile does not)")
 
     target_compile_definitions(ftrace PRIVATE HAVE_CUDA=1)
+    # OptiX's temporal denoiser (`-denoise-shot optix`, ROADMAP 11 stage D). OptiX itself is in the
+    # display driver; building against it needs only NVIDIA's headers (github.com/NVIDIA/optix-dev),
+    # fetched into external/optix-dev and not vendored -- their licence lets binaries built with
+    # them be redistributed, not the headers. Found there (or at FTRACE_OPTIX_INCLUDE), the denoiser
+    # is built in; absent, ftrace builds without it and says so when asked for it.
+    set(FTRACE_OPTIX_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/external/optix-dev/include" CACHE PATH
+        "OptiX headers (optix.h), for -denoise-shot optix")
+    if(EXISTS "${FTRACE_OPTIX_INCLUDE}/optix.h")
+        target_sources(ftrace PRIVATE src/optix_denoise.cpp)
+        target_include_directories(ftrace PRIVATE "${FTRACE_OPTIX_INCLUDE}"
+                                                  ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_compile_definitions(ftrace PRIVATE HAVE_OPTIX=1)
+        message(STATUS "OptiX headers: ${FTRACE_OPTIX_INCLUDE} (-denoise-shot optix)")
+    else()
+        message(STATUS "OptiX headers not found (${FTRACE_OPTIX_INCLUDE}): -denoise-shot optix is off")
+    endif()
     # Emit source line-number info in device code (nvcc -lineinfo). This is
     # essentially free at runtime (unlike -G, which disables optimisation) and
     # lets compute-sanitizer / cuda-gdb map GPU faults back to file:line — the

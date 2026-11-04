@@ -72,6 +72,7 @@ Three neighbouring documents cover what this one only summarises:
   - [Elapsed times and ETAs](#elapsed-times-and-etas)
   - [Denoising (`-denoise`)](#denoising--denoise)
   - [Learned denoising (`-oidn`)](#learned-denoising--oidn)
+  - [Temporal denoising of a shot (`-denoise-shot`)](#temporal-denoising-of-a-shot--denoise-shot)
 
 ---
 
@@ -6379,6 +6380,7 @@ survive exactly.
 | `-r <res>` / `-r <W> <H>` | Output resolution (overrides scene default); one value = square, two = non-square film |
 | `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension). Missing parent directories are created before the render starts (reported as `[out] created output directory …`), so a render aimed at a fresh `png/<series>/` subdir can't be traced to completion and then lost at write time. Mode `V` produces a *pair* of images (the two independent estimates it cross-checks) and writes them as `<out>_forward` / `<out>_backward` beside the given path |
 | `-topng <in> <out.png> [-ev <c>] [-exposure-anchor <v\|file>] [-hdr] [-denoise …] [-oidn … [-oidn-guides <stem>]]` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); `-ev` re-develops a `.ftbuf` brighter/darker, `-exposure-anchor` develops it at a **shared** gain so a whole sequence of checkpoints can be re-developed flicker-free, `-hdr` writes the developed linear image as a PFM too, the `-denoise` flags filter its chroma first, and `-oidn` denoises it (with a render's saved guides via `-oidn-guides`; see **Learned denoising**). Any other flag is an error. See **Output** |
+| `-denoise-shot <svgf\|optix\|oidn\|none> <in%04d.pfm> <out%04d.png> <first> <last> [-exposure <e>] [-passes <n>] [-alpha <a>] [-clamp <g>]` | Denoise a shot's frames in order, each against the history of those before it (no rendering): frames rendered with `-hdr -write-aovs`. See **Temporal denoising of a shot** under **Output** |
 | `-review <base>` | Play a directory of already-rendered frames (`<base><digits>.<ext>`, e.g. `png/swoop/swoop`) on the live window/timeline — scrub/Play, re-time by painting speed, and Save a re-paced copy (no rendering); see the fly-viewer section |
 | `-shot <scene.py>` | **Render a loom file as a shot** (ROADMAP 11). Hands the timeline to loom's shot runner (`python -m loom.shot`, [tools/loom/README.md](tools/loom/README.md) → *Shots*), which builds each frame's scene from the file's `build` contract — with motion keys when there is a shutter — and renders it with this binary into `png/<name>/` (the frame's `.ftsl` beside its image), skipping a frame whose checkpoint already holds the requested `-spp`, so rerunning the command resumes the shot. Shot flags: `-frames A B` (render only those frames), `-shot-length N` (frames in the timeline; else the file's `FRAMES`), `-fps F`, `-open` / `-loop`, `-shutter O C` (the camera's shutter, frames; else the file's `SHUTTER`), `-motion A B KEYS` (else keys spanning the shutter), `-no-motion`, `-name`, `-outdir`, `-mp4` (assemble `<name>.mp4`), `-func NAME` (another build callable), `-no-window`. Every other flag goes to each frame's render (`-spp`, `-mode`, …); each frame also gets `-window-min`. `ftrace -stop <pid>` on the shot stops the frame in progress cleanly (it keeps its image and checkpoint) and starts no other. Each frame is its own ftrace process (about 0.6 s of start-up each). |
 | `-serve` | **Resident preview server.** With `-serve -in <scene.ftsl> [flags…]`, ftrace does *not* exit after one render: it keeps the process — and with it the live window, CUDA context, and spectral/spectral-upsampling tables — resident, and re-renders whenever a new scene path arrives on **stdin** (one path per line), reusing all the other flags (`-mode`/`-n`/`-r`/`-window`/`-o`/…) with only `-in` swapped per frame. Line protocol: prints `[serve] ready` once, then `[serve] done <path>` after each frame; `quit`/`exit`/EOF ends the loop (`[serve] shutdown`). This skips the per-frame cost of process spawn + window/CUDA/table init — the dominant fixed overhead for cheap preview frames — so an external driver (e.g. loom's `PreviewServer`) can stream an animation into a single window that updates in place. Scope: resident-process reuse only; each frame is still a full independent render (no delta/geometry caching yet) and the window keeps the first frame's resolution for the session. |
@@ -7178,3 +7180,56 @@ Things to know:
 - **With `-denoise` as well**, the order is: firefly clamp, OIDN, chroma filter. The chroma filter
   after OIDN tames single-wavelength streaks a learned denoiser keeps as detail (the coloured photon
   beams of mode `J` at low samples); elsewhere it changes little.
+
+### Temporal denoising of a shot (`-denoise-shot`)
+
+A frame denoised alone keeps its own residual noise, which differs from the next frame's: the
+shot flickers. A temporal denoiser denoises each frame against the history of the frames before
+it, reprojected through motion vectors (since 0.412.0). Render the shot's frames with `-hdr
+-write-aovs` (the scene-linear PFM and the guide pass beside it: albedo, normal, depth, position,
+the position a frame earlier, motion vectors — see `-write-aovs`), then:
+
+```
+ftrace -denoise-shot svgf png/shot/f%04d.pfm png/shot_svgf/f%04d.png 0 47
+```
+
+It reads frame k's `<in>`, with the guides beside it, for every k from first to last in order. It
+writes `<out>` as a PNG, with its PFM beside it. Each pattern holds one printf integer (`%04d`).
+Methods:
+
+| method | what it is |
+|---|---|
+| `svgf` | ftrace's own SVGF-style temporal accumulator (Schied et al. 2017; `src/temporal.h`). It filters the illumination, with the albedo divided out and multiplied back. Each pixel's history is the previous frame's at the place its surface sat a frame earlier, read only from taps that *are* that surface (their world position and normal agree); a disocclusion starts afresh. The history is clamped to this frame's local spread of light, so a still surface a shadow crosses keeps no ghost of the light it had, and what the clamp took off shortens the history. Colour and luminance moments are blended with the new frame's share at least 0.2. An à-trous filter then follows, stopping at depth, normal and luminance edges, the last scaled by the local variance. Runs on the CPU |
+| `optix` | NVIDIA OptiX's temporal denoiser (`OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV`), guided by albedo, normal and the motion vectors, each frame denoised against the previous result. It needs an NVIDIA GPU and a driver with OptiX, and an ftrace built against the OptiX headers. The build finds them in `external/optix-dev` ([NVIDIA/optix-dev](https://github.com/NVIDIA/optix-dev), cloned there; not part of the repository), and without them this method says so |
+| `oidn` | Open Image Denoise, each frame alone: the spatial baseline (`-oidn`'s denoiser, guided) |
+| `none` | the frames as they are, developed alike |
+
+Every frame's PNG is developed at one exposure: `-exposure <e>` (the multiplier its sRGB encoding
+sees), or else the first frame's auto-exposure. The shot therefore cannot flicker through its
+exposure. `svgf` takes three more options, for a shot unlike the one it was tuned on:
+
+| option | default | what it sets |
+|---|---|---|
+| `-passes <n>` | 3 | à-trous passes (0–10). Each doubles the filter's reach: more for noisier frames or a larger image, fewer to keep detail |
+| `-alpha <a>` | 0.2 | the new frame's least share of a converged history (0.01–1). Lower converges further and lags more; 1 keeps no history |
+| `-clamp <g>` | 0.75 | how far, in local standard deviations, the history may stray from the frame's own light before it is pulled in; `0` turns the clamp off |
+
+The `-oidn-quality` and `-oidn-device` options set `oidn`'s denoiser. Any other option is an
+error. OIDN 3's temporal model, announced for the second half of 2026, is not released yet
+(its latest is 2.5.1); it will join as a method when it is.
+
+`tools/temporal_compare.py` scores the methods on one shot: a striped ball rolling across a
+checkered floor while the camera dollies past, rendered noisy and as a converged reference. It
+reports each method's error (relMSE against the reference) and flicker (how far its frame-to-frame
+change strays from the reference's), and writes the side-by-side `compare.mp4`. Its default shot
+(24 frames, 160x120, 8 spp; 0.412.0):
+
+| method | error | flicker |
+|---|---|---|
+| none | 0.086 | 0.270 |
+| `oidn` | 0.0031 | 0.039 |
+| `optix` | 0.0055 | 0.039 |
+| `svgf` | 0.0082 | 0.032 |
+
+So OIDN frame by frame has the least error, and `svgf` the steadiest shot. Which one to use depends
+on whether a frame's detail or the shot's steadiness shows more.
