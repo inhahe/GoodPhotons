@@ -307,7 +307,39 @@ as plain white. **Proper fix:** one shared "sample the glossy lobe" helper per b
 a weight (multiply, roulette, roulette on a bundle's max), so it returns the weight and leaves
 that choice to them. Check plain glossy's images bit-identical with tools/check_bitid.py.
 
-## OPEN (2026-11-02, 0.400.8): MODEM-GPU-OFFSET — GPU mode M reads a Cornell box's walls 1-3 % bright, bluest, where the CPU's mode M is exact
+## OPEN (2026-11-04, 0.422.0): MODEM-GPU-CORNER — GPU mode M reads one corner of a box 15 % bright
+
+On check_motion's box held still (`scene(u=0.8)`, 96 x 72, 128 spp, -n 2000000, two seeds), GPU
+mode M matches CPU mode M over the frame (0.9998) but for one 8x8 block, the right wall's upper
+corner (row 3, column 10), which reads 1.15 of the CPU's, with the aimed caustic pass on or off
+and with -nopmadaptive. Suspect: the device gather's footprint or radius at a box's edges and
+corners (M-GATHERAREA, the first suspect MODEM-GPU-OFFSET listed, below); a map with -nopmauto
+on both devices did not clear it. To narrow: the same box with the corner's walls only, the
+gather radius halved on both devices.
+
+Two smaller residuals of the same comparison at 256 spp, each one block. The box held at the
+instant reads 1.032 at row 8, column 4 (the floor's front edge, z 3.6, so under the 5-sigma line
+there); a moving camera over that box, blurred, shows the same block at 1.037 (z 8.1). And the
+moving box, blurred (64 timed epochs on both devices, the same epoch times), reads 1.032 at row
+5, column 5, under the gold sphere, where the still box reads 1.005: a residual of the blurred
+device path, possibly of the aimed caustic pass, whose aim map is built at the instant while
+the sphere moves. check_motion's criterion (blurred GPU mode M against blurred mode R, 10 %)
+passes.
+
+## DONE (2026-11-04, 0.422.0): MODEM-GPU-OFFSET — the device's hero photons deposited their caustics at full weight
+
+**Cause, and fix.** The device's hero-wavelength photon path (`shadeStepHero`, the deposit pass's
+default wherever there are no media) deposited a caustic photon without the aimed caustic pass's
+MIS weight (`dPathCausticW`), which the scalar path carries. Both the main pass and the aimed
+pass then put their caustic photons in at full weight, so the caustic term was counted about
+twice. On check_motion's box held still (a gold glossy sphere, 128 spp, -n 2000000), GPU mode M
+read 4.4 % bright over the whole frame and up to 26 % near the caustics, where with
+`-causticn off` it matched CPU mode M (1.0004). With the weight carried, the default render
+matches too (0.9998). One corner block of that box (the right wall's upper corner, row 3,
+column 10 of 8x8 blocks) still reads 15 % bright on the GPU with the aimed pass on or off:
+the first suspect below, the device gather at a box's edges and corners, is still open there.
+
+The original report:
 
 Found validating 0.401.0's rough interference reflectors. Over the pixels that see no sphere:
 

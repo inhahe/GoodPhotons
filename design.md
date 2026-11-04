@@ -10188,7 +10188,7 @@ sees the instant, exactly as a static scene with those transforms would show it.
   (`sphereAsMesh_`), as an uneven static scale already tessellates it, so `sphereAt` may take the
   radius from the blended transform's mean column length.
 
-### Motion blur on the device (0.418.0: modes R and W; 0.419.0: D; 0.420.0: A, B and C; 0.421.0: S, U and J)
+### Motion blur on the device (0.418.0: modes R and W; 0.419.0: D; 0.420.0: A, B and C; 0.421.0: S, U and J; 0.422.0: M)
 
 - **The path's time** is a slot per thread in shared memory (`s_dMotionU`, `dMotionU`), the
   device twin of the thread-local `g_motionU`, so the ~37 query sites need no argument. Every
@@ -10270,6 +10270,16 @@ sees the instant, exactly as a static scene with those transforms would show it.
   posed (`camEpochJ`): it reads `g_passMotionU` into the scene, which the device light pass for
   the surface map shares. The S and U sessions now print the `[device] … -> GPU` line the other
   modes do.
+- **Mode M** (0.422.0): the device path is the shared photon map (`runSharedPhotonMap`,
+  `renderPhotonMapSharedCuda`). A camera moving over a still scene gathers from its one timeless
+  map, each sample posed (`kGather` calls `dSetCameraTime`, as `kBackward` does), in a group of
+  any size. A moving scene needs epochs, each at one time: run routes the run's one mode-M camera
+  there (`gpuBlurM`, no lens), and the device refresh loop times each epoch (`atEpochM`: the
+  host's PassTimeScope, the camera posed and baked with its shutter closed so the gather takes
+  the epoch's time; `renderPhotonMapSharedCuda` reads `g_passMotionU` into the scene), a 64th of
+  a fixed `-spp` or 4 samples under a clock, `-beamfreeze` set aside. Several cameras of a moving
+  scene, or a saved or loaded map, gather on the CPU and say why. The shared path prints the
+  `[device] … -> GPU` line the other modes do.
 - **The haze ends at the instant's sphere** (0.419.0), as on the host: a shadow ray to the sun or
   the sky runs to `dExitDistance` (for a path with a time, the swept sphere), but crosses media
   only to `dMediaExitDistance` (Scene::mediaExitDistance) -- in the surface, volume, fibre and

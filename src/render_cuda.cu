@@ -11150,7 +11150,10 @@ __device__ static bool dApplyCausticAim(const DScene& sc, const DCamSet& cs,
         // nothing to aim: rho stays 1
     } else if (distant) {
         DVec3 t, b; onb(dir, t, b);
-        const DVec3 base = sc.sceneCenter - dir * (Real)sc.sceneRadius;
+        // The photon's disc: the scene's sphere, or for a path with a time the one that holds the
+        // movers' sweep (dLightRadius; host twin Scene::lightRadius), as genPhoton drew it on.
+        const double Rl = dLightRadius(sc);
+        const DVec3 base = sc.sceneCenter - dir * (Real)Rl;
         if (!(am.sumR2 > 0.0)) return true;
         double x, y;
         if (am.aimed) {
@@ -11163,7 +11166,7 @@ __device__ static bool dApplyCausticAim(const DScene& sc, const DCamSet& cs,
             const DVec3 off = origin - base;
             x = (double)dot(off, t); y = (double)dot(off, b);
         }
-        const double R = sc.sceneRadius;
+        const double R = Rl;
         // Outside the disc the emitter delivers nothing at all, so p_u = 0 and the whole
         // contribution is zero — not a lost sample, a zero one. (Reachable only from the aimed
         // pass, and only when a target's bounding sphere pokes past the scene's own.)
@@ -12392,7 +12395,9 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         DVec3 ngo = dShadedNg(h);
         DVec3 wiPrev = -rd;
         { const bool caus = dPathIsCaustic(pathC);
-          for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngo, beta[i], lam[i], caus);
+          // ...with the aimed caustic pass's MIS weight, as the scalar deposits carry it.
+          const Real cw = dPathCausticW(pathC);
+          for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngo, beta[i], lam[i], caus, cw);
           if (pathC) pathC->bits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
         if (camMode == CAM_A || camMode == CAM_B) {
             splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rhoR, nUp, rng);
@@ -12520,7 +12525,9 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     DVec3 ngo = dShadedNg(h);
     DVec3 wiPrev = -rd;
     { const bool caus = dPathIsCaustic(pathC);
-      for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngo, beta[i], lam[i], caus);
+      // ...with the aimed caustic pass's MIS weight, as the scalar deposits carry it.
+      const Real cw = dPathCausticW(pathC);
+      for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngo, beta[i], lam[i], caus, cw);
       if (pathC) pathC->bits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
     if (camMode == CAM_A || camMode == CAM_B) {
         splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rho, nUp, rng);
@@ -19799,7 +19806,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
 // renderPhotonMapSharedCuda for the 11x that cost before the floor was tied to this.
 static constexpr int kGatherGrid  = 2048;
 static constexpr int kGatherBlock = 128;
-__global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, DCamera cam,
+__global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, const __grid_constant__ DCamera cam,
                         double* film, double* hits,
                         long long idxBase, long long idxEnd,
                         long long chunkSpp, long long sppTotal,
@@ -19869,7 +19876,14 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, D
 
         DVec3 ro, rd;
         Real jx = rng.uniform(), jy = rng.uniform();
-        dGenRay(cam, px, py, jx, jy, ro, rd);            // pinhole only (lens cams gated to CPU)
+        // A camera moving over a still scene (host twin renderPhotonCamera): the map is timeless,
+        // and each sample poses the camera at its own time, as mode R's do. An epoch of a moving
+        // scene arrives with its camera posed and no shutter (the host's refresh loop).
+        DCamera camT;
+        const DCamera& camS = dSetCameraTime(sc, cam, (unsigned long long)pix,
+                                             (unsigned long long)(sampleBase + (idx - pix * chunkSpp)), false,
+                                             &camT) ? camT : cam;
+        dGenRay(camS, px, py, jx, jy, ro, rd);           // pinhole only (lens cams gated to CPU)
 
         double oX, oY, oZ;
         dPhotonGather(sc, pm, pmC, diffraction, ro, rd, lambda, invPdfL, rng, fgRays,
@@ -25646,9 +25660,8 @@ size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
 // --------------------- backward reference (mode R) host ----------------------
 
 const char* cudaBlurUnsupported(const Scene& /*scene*/, const Camera& /*cam*/, char mode) {
-    if (mode == 0 || !std::strchr("RWDABCSUJ", mode))
-        return "motion blur in this mode renders on the CPU so far (the device blurs modes R, W, D, A, B, C, S, "
-               "U and J)";
+    if (mode == 0 || !std::strchr("RWDABCSUJM", mode))
+        return "motion blur in this mode renders on the CPU so far (the device blurs every mode but P and V)";
     return nullptr;
 }
 
@@ -26171,6 +26184,9 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
 
     DUpload up;
     buildUploadScene(scene, up);
+    // A blurred moving scene's epoch (the host's refresh loop, under its PassTimeScope): the
+    // deposit, the maps and the gather all at its one time.
+    up.sc.mo.passU = (g_passMotionU >= 0.0 && scene.hasMotion()) ? (float)g_passMotionU : -1.0f;
 
     // Staging-chunk size for the host<->device photon copies (deposit download AND grid
     // upload below). Streaming the deposits in blocks (instead of one giant transfer) means

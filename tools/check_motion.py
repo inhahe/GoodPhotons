@@ -52,7 +52,7 @@ cube whose keys scale and shear it together. It requires:
     on the CPU, and mode V says it renders the instant.
   * Modes M and J (an epoch at a time), S and U (a pass at a time) blur, agreeing with
     blurred mode R within their density estimates' bias, and follow a moving camera as mode R
-    does -- S, U and J on the GPU too; so does mode P, its backward samples split by their own path's first event -- also with
+    does -- M, S, U and J on the GPU too; so does mode P, its backward samples split by their own path's first event -- also with
     fog in front of a mirror, and on a floor of a mix of a diffuse and a glossy child; and fur in
     front of a mirror renders the same under -dual-scatter as without. Mode M under
     a -noise budget blurs too, and mode J whose surface map comes back empty blurs as mode D does.
@@ -692,7 +692,9 @@ def main():
                     ("U", "U", ["-spp", "256"], "cpu"), ("J", "J", ["-spp", "128", "-jsurf"], "cpu"),
                     ("P", "P", ["-spp", "256", "-n", "20000000"], "cpu")]
     if not a.no_gpu:
-        shared_cases += [("S on the GPU", "S", ["-spp", "128", "-n", "200000"], "gpu"),
+        shared_cases += [("M on the GPU", "M", ["-spp", "128", "-n", "2000000"], "gpu"),
+                         ("M under -noise on the GPU", "M", ["-noise", "6.25", "-n", "2000000"], "gpu"),
+                         ("S on the GPU", "S", ["-spp", "128", "-n", "200000"], "gpu"),
                          ("U on the GPU", "U", ["-spp", "256"], "gpu"),
                          ("J on the GPU", "J", ["-spp", "128", "-jsurf"], "gpu")]
     for label, mode, margs, dev in shared_cases:
@@ -1224,7 +1226,8 @@ def camera_tests(exe, out, verdict, devices):
                         seed=s, want_gpu=True)[0]) for s in (1, 2)]
         good, detail = agree(g, blur, 0.05)
         verdict("... mode B on the GPU = mode R", good, detail)
-        for mode, margs, tol in (("S", ["-spp", "128", "-n", "200000"], 0.15), ("U", ["-spp", "256"], 0.10),
+        for mode, margs, tol in (("M", ["-spp", "128", "-n", "2000000"], 0.10),
+                                 ("S", ["-spp", "128", "-n", "200000"], 0.15), ("U", ["-spp", "256"], 0.10),
                                  ("J", ["-spp", "128", "-jsurf"], 0.10)):
             g = [lum(render(exe, out, moving, "cam_blur_gpu%s_s%d" % (mode, s),
                             ["-mode", mode, "-device", "gpu"] + margs, seed=s, want_gpu=True)[0]) for s in (1, 2)]

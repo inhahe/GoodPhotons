@@ -130,8 +130,7 @@ argument for standing a groom in a hall of polished objects.*
   chromatic aberration all emergent), plus fisheye/panoramic projections.
 - **Motion blur** — a group's `motion { key { … } … }` moves it over the frame (turns arc, nested
   groups compose) and a camera's `shutter_open` / `shutter_close` blurs it, each camera path at
-  its own time. Every mode but `V` blurs on the CPU, and modes `R`, `W`, `D`, `A`, `B`, `C`, `S`,
-  `U` and `J` on the GPU;
+  its own time. Every mode but `V` blurs on the CPU, and every mode but `P` and `V` on the GPU;
   without a shutter a scene renders byte for byte as before. See REFERENCE.md, *Motion blur*.
 - **Rich material set** — dielectrics with real glass dispersion, metals from
   measured data, rough microfacet, thin-film & multilayer interference (smooth, or

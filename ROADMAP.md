@@ -749,8 +749,10 @@ done):* each photon and its splats at one time, a moving camera posed per splat,
 and glass met where they are (a mixed mirror plane by its parts), the blurred sky drawn on the
 host meanwhile. *Modes S, U and J on the GPU (0.421.0, done):* each pass (S, U) or epoch (J) at
 one time, carried to the device in the scene (`DMotion::passU`), the camera posed there; a still
-scene's moving camera in S posed per pixel. Open: lights that scale over the shutter, aimed area
-lights; on the GPU, modes M and P, and a blurred shared forward flight.
+scene's moving camera in S posed per pixel. *Mode M on the GPU (0.422.0, done):* a moving scene's
+lone camera in the device refresh loop's timed epochs; a camera moving over a still scene gathers
+the one map, each sample posed. Open: lights that scale over the shutter, aimed area lights; on
+the GPU, mode P's split, a blurred shared forward flight, and a moving scene's shared mode M map.
 
 **Stage C, motion vectors and depth (0.411.0, done):** `-write-aovs` writes the guide pass's
 albedo and normal and, from one ray through each pixel's centre at the frame's instant, depth,
