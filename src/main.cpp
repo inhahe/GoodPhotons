@@ -18529,7 +18529,7 @@ static int runCompositeProgressive(
     bool writeOk = true;
     bool metNoise = false;
     bool metTime  = false;      // which budget ended it — reported in the window title
-    long long batchSpp = 1;   // adapts toward ~0.5 s of combined work per iteration
+    long long batchSpp = 1;   // the samples (and their share of photons) one iteration takes
 
     // Compositing is split from persisting so the live window can repaint on its own
     // (much faster) cadence without also rewriting the PNG and the dual-film sidecar —
@@ -18603,13 +18603,22 @@ static int runCompositeProgressive(
                                    (uint64_t)acc.spp);
             acc.ref.merge(r); acc.spp += dSpp;
         }
-        // Adapt the batch toward ~0.5 s so early frames appear fast and overhead stays low.
-        double dt = std::chrono::duration<double>(clk::now() - tb).count();
-        if (dt > 1e-4) {
-            long long next = (long long)((double)batchSpp * (0.5 / dt));
-            if (next < 1) next = 1;
-            if (next > batchSpp * 8 + 1) next = batchSpp * 8 + 1;
-            batchSpp = next;
+        // The next batch. Under a clock, adapted toward ~0.5 s so early frames appear fast and
+        // overhead stays low. A fixed budget doubles its batches up to a sixteenth of the budget
+        // instead, whatever the clock says: the device draws its photon and sample streams per
+        // batch, so a schedule that followed the clock would give each run of the same seed
+        // another image (the host's streams are per photon and per sample, so it has the same image
+        // either way).
+        if (!budgeted) {
+            batchSpp = std::min(batchSpp * 2, std::max(1LL, sppReq / 16));
+        } else {
+            double dt = std::chrono::duration<double>(clk::now() - tb).count();
+            if (dt > 1e-4) {
+                long long next = (long long)((double)batchSpp * (0.5 / dt));
+                if (next < 1) next = 1;
+                if (next > batchSpp * 8 + 1) next = batchSpp * 8 + 1;
+                batchSpp = next;
+            }
         }
 
         double elapsed   = std::chrono::duration<double>(clk::now() - t0).count();

@@ -1048,11 +1048,18 @@ def p_split_tests(exe, out, verdict, gpu=False):
         good, detail = agree(rp, rr, 0.10)
         verdict("blurred mode P = blurred mode R: " + name, good, detail)
         if gpu:
-            rg = [lum(render(exe, out, ps, "psplit_Pg_s%d" % s, ["-mode", "P", "-device", "gpu", "-spp", "256",
-                                                                  "-n", "20000000"], seed=s, want_gpu=True)[0])
-                  for s in (1, 2)]
+            pg = ["-mode", "P", "-device", "gpu", "-spp", "256", "-n", "20000000"]
+            rg = [lum(render(exe, out, ps, "psplit_Pg_s%d" % s, pg, seed=s, want_gpu=True)[0]) for s in (1, 2)]
             good, detail = agree(rg, rr, 0.10)
             verdict("... and on the GPU", good, detail)
+            if floor == "mx":
+                # A fixed budget's batches follow a fixed schedule, so the device draws the same
+                # streams each run: the same seed, the same image. Batches sized by the clock
+                # gave two runs of one seed images 1.5 % apart here (0.424.0).
+                again = lum(render(exe, out, ps, "psplit_Pg_again", pg, seed=1, want_gpu=True)[0])
+                d = float(np.abs(again - rg[0]).max() / max(float(np.abs(rg[0]).max()), 1e-300))
+                verdict("... and one seed renders one image on the GPU", d < 1e-9,
+                        "largest difference %.3g of the peak" % d)
     strands = [("curve { material h  basis linear  radius 0.004  point %.3f 0.25 0.6  point %.3f 1.15 0.6 }"
                 % (x, x)) for x in np.arange(-0.4, 0.401, 0.02)]
     text = NL.join([
