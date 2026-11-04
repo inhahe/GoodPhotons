@@ -14495,6 +14495,16 @@ static void warnBeamsGrinMedia(const Scene& scene, bool beamsOn) {
 // multiple-scatter image that merely looks like a beams render, which is exactly the mistake
 // that made the mode-M beam gather look 20x too dark when it was in fact agreeing with its
 // reference. Say so instead.
+// ...and when the cameras are there but fly apart: a shared flight holds only cameras with one
+// shutter (run's joinFlight), so a camera with a shutter of its own renders alone, without -beams.
+static void warnBeamsApart(const Scene& scene, bool beamsOn, char mode, int nApart) {
+    if (!beamsOn || scene.media.empty() || nApart <= 0) return;
+    std::fprintf(stderr,
+        "[mode %c] warning: -beams needs cameras that share a forward flight, and cameras share one\n"
+        "         only with the same shutter: %d camera(s) with a shutter of its own render apart,\n"
+        "         without -beams.\n", mode, nApart);
+}
+
 static void warnBeamsNeedsCameras(const Scene& scene, bool beamsOn, char mode, int nCam) {
     if (!beamsOn || scene.media.empty() || nCam != 1) return;   // 0 = no camera of this mode
     if (mode != 'A' && mode != 'B' && mode != 'C') return;
@@ -14942,6 +14952,13 @@ static void buildFurFields(const Scene& scene) {
 // the device-selection notes name that reason rather than the generic lists.
 static const char* const kObjectSpaceWhy =
     "object-space patterns (pattern_space object) are read on the CPU only so far";
+// Motion blur is traced on the host only so far (ROADMAP 11): the device renders the frame's
+// instant, so every device gate asks Camera::seesMotion, and the notes give this reason.
+static const char* const kMotionCpuWhy =
+    "motion blur (a shutter on something that moves) renders on the CPU so far";
+// Whether mode `m` carries motion blur: each of its paths, or photons, is one time in the
+// shutter. Any other mode renders the frame's instant (run closes the shutter for it).
+static bool modeSeesMotion(char m) { return m != 0 && std::strchr("RDABC", m) != nullptr; }
 
 #ifdef HAVE_CUDA
 // cudaBackwardSupported, plus the two things it cannot see (both RENDER OPTIONS, not scene
@@ -15412,21 +15429,11 @@ static void thinFilmSwatch(double n1, double n2) {
 // stratified at any K). The sums are kept for the last four cameras that asked (least
 // recently used evicted), since a render adds the sky to every interval write and a
 // multi-camera render writes its cameras in turn.
-// The same pass UNDER MOTION BLUR (Camera::seesMotion), with or without a lens: the sky behind a
-// moving object shows for the part of the shutter the object leaves it uncovered, so each sample
-// also has a time of its own in the shutter -- a radical inverse in base 3 over k (base 2 already
-// spaces the wavelengths), rotated per pixel -- at which the scene is seen. A pinhole's sample is
-// a ray through a random point of the pixel and the sky's XYZ there: with many samples a pixel
-// takes the sky over its area, where addEnvBackground's one ray takes it at the centre.
-static void addEnvBackgroundSampled(Film& film, const Scene& scene, const Camera& cam, long long N) {
+static void addEnvBackgroundLens(Film& film, const Scene& scene, const Camera& cam, long long N) {
     constexpr double kLo = 360.0, kHi = 830.0;
-    const bool lensed = cam.hasLens(), blur = cam.seesMotion(scene);
     struct Cache {
         const LensSystem* lens = nullptr;
         Vec3 eye, w, u;
-        double shutterOpen = 0.0, shutterClose = 0.0;
-        const CameraMotion* motion = nullptr;
-        uint64_t generation = 0;
         int rx = 0, ry = 0;
         long long K = 0;                 // samples per pixel in `sum`
         unsigned long long used = 0;     // last use, for eviction
@@ -15442,9 +15449,7 @@ static void addEnvBackgroundSampled(Film& film, const Scene& scene, const Camera
         return c.lens == cam.lens.get() && c.rx == rx && c.ry == ry &&
                c.eye.x == cam.eye.x && c.eye.y == cam.eye.y && c.eye.z == cam.eye.z &&
                c.w.x == cam.w.x && c.w.y == cam.w.y && c.w.z == cam.w.z &&
-               c.u.x == cam.u.x && c.u.y == cam.u.y && c.u.z == cam.u.z &&
-               c.shutterOpen == cam.shutterOpen && c.shutterClose == cam.shutterClose &&
-               c.motion == cam.motion.get() && c.generation == scene.generation;
+               c.u.x == cam.u.x && c.u.y == cam.u.y && c.u.z == cam.u.z;
     };
     Cache* hit = nullptr;
     for (Cache& c : slots) if (same(c)) { hit = &c; break; }
@@ -15454,9 +15459,6 @@ static void addEnvBackgroundSampled(Film& film, const Scene& scene, const Camera
         for (Cache& c : slots) if (c.used < hit->used) hit = &c;   // an empty slot has used == 0
         hit->lens = cam.lens.get(); hit->rx = rx; hit->ry = ry;
         hit->eye = cam.eye; hit->w = cam.w; hit->u = cam.u;
-        hit->shutterOpen = cam.shutterOpen; hit->shutterClose = cam.shutterClose;
-        hit->motion = cam.motion.get();
-        hit->generation = scene.generation;
         hit->K = 0;
         hit->sum.assign((size_t)rx * (size_t)ry, Vec3{0, 0, 0});
     }
@@ -15468,40 +15470,16 @@ static void addEnvBackgroundSampled(Film& film, const Scene& scene, const Camera
         const long long k0 = cache.K, k1 = want;
         const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
         std::vector<Vec3> add((size_t)rx * (size_t)ry, Vec3{0, 0, 0});
-        const bool camMoves = blur && cam.moves();
         const bool done = ft::parallelFor((size_t)ry, 1, [&](size_t py) {
-            Camera camT;                     // a moving camera, posed at each sample's time
-            if (camMoves) camT = cam;
             for (int px = 0; px < rx; ++px) {
                 const uint64_t pix = (uint64_t)py * (uint64_t)rx + (uint64_t)px;
                 Pcg32 rot;
                 seedUnit(rot, pix, 0x5EC7A11E5C0FFEEULL);
                 const double off = rot.uniform();
-                const double offT = blur ? rot.uniform() : 0.0;
                 Pcg32 rng;
                 seedUnit(rng, pix, 0xB6C0FFEEULL ^ ((uint64_t)k0 * 0x9E3779B97F4A7C15ULL));
                 Vec3 acc{0, 0, 0};
                 for (long long k = k0; k < k1; ++k) {
-                    double tU = offT;            // radical inverse in base 3, rotated per pixel
-                    if (blur) {
-                        for (double f = 1.0 / 3.0, kk = (double)k; kk >= 1.0; f /= 3.0) {
-                            tU += f * std::fmod(kk, 3.0); kk = std::floor(kk / 3.0);
-                        }
-                        tU -= std::floor(tU);
-                    }
-                    const MotionTimeScope at(blur ? scene.motionU(cam.shutterTime(tU)) : -1.0);
-                    if (camMoves) cam.poseAt(cam.shutterTime(tU), camT);
-                    const Camera& cp = camMoves ? camT : cam;
-                    if (!lensed) {
-                        const double jx = rng.uniform(), jy = rng.uniform();
-                        const Ray r = cp.genRay(px, (int)py, jx, jy);
-                        const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false,
-                                                       /*skipCamHidden=*/true);
-                        if (h.valid) continue;
-                        if (haveEnv) acc += scene.envXYZForDir(r.d);
-                        if (haveSun) acc += scene.sunXYZForDir(r.d);
-                        continue;
-                    }
                     double u = off;              // van der Corput in base 2, rotated per pixel
                     for (double f = 0.5, kk = (double)k; kk >= 1.0; f *= 0.5) {
                         const double bit = std::fmod(kk, 2.0);
@@ -15510,8 +15488,8 @@ static void addEnvBackgroundSampled(Film& film, const Scene& scene, const Camera
                     u -= std::floor(u);
                     const double lambda = kLo + (kHi - kLo) * u;
                     Ray r; double wLens = 0.0;
-                    if (!cp.genLensRay(px, (int)py, rng.uniform(), rng.uniform(), rng.uniform(),
-                                       rng.uniform(), lambda, r, wLens) || !(wLens > 0.0)) continue;
+                    if (!cam.genLensRay(px, (int)py, rng.uniform(), rng.uniform(), rng.uniform(),
+                                        rng.uniform(), lambda, r, wLens) || !(wLens > 0.0)) continue;
                     const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false,
                                                    /*skipCamHidden=*/true);
                     if (h.valid) continue;
@@ -15541,7 +15519,10 @@ static void addEnvBackgroundSampled(Film& film, const Scene& scene, const Camera
 static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, long long N) {
     const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
     if (!haveEnv && !haveSun) return;
-    if (cam.hasLens() || cam.seesMotion(scene)) { addEnvBackgroundSampled(film, scene, cam, N); return; }
+    // Under a blur the forward pass drew it into the film already, batch by batch, each sample at
+    // a time of its own (addBlurredSkyRows).
+    if (cam.seesMotion(scene)) return;
+    if (cam.hasLens()) { addEnvBackgroundLens(film, scene, cam, N); return; }
     for (int py = 0; py < film.resY; ++py)
         for (int px = 0; px < film.resX; ++px) {
             Ray r = cam.genRay(px, py, 0.5, 0.5);
@@ -15555,6 +15536,70 @@ static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, 
                 if (haveSun) bg += scene.sunXYZForDir(r.d);
                 film.add(px, py, bg * (double)N);
             }
+        }
+}
+
+// The sky a forward camera sees directly UNDER MOTION BLUR, drawn into one batch's film instead of
+// added at each write (addEnvBackground skips such a camera): what shows of the sky behind a
+// moving object depends on the time, so each pixel takes K samples, each at a time of its own in
+// the shutter (stratified, rotated per pixel and per batch by `seedBase`), at a point of its own in
+// the pixel and -- through a physical lens -- a wavelength and pupil point of its own, worth the
+// batch's N photons between them. Batches draw independent samples, so the sky converges as the
+// film accumulates and is as complete as its photons wherever a render stops. K is a sixteenth of
+// a photon per pixel per camera sharing the batch, from 1 to 64: the sky costs at most a
+// sixteenth of the batch's photons, or one ray a pixel. Rows [y0, y1) only, so each forward
+// thread draws its own band into its own film.
+static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam, long long N,
+                              int nCamsSharing, uint64_t seedBase, int y0, int y1) {
+    constexpr double kLo = 360.0, kHi = 830.0;
+    const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
+    if ((!haveEnv && !haveSun) || N <= 0 || y0 >= y1) return;
+    const int rx = film.resX, ry = film.resY;
+    const double perPixel = (double)N / ((double)rx * (double)ry * (double)std::max(1, nCamsSharing));
+    const int K = (int)std::clamp(perPixel / 16.0, 1.0, 64.0);
+    const double share = (double)N / (double)K;
+    const bool lensed = cam.hasLens(), camMoves = cam.moves();
+    Camera camT;                        // a moving camera, posed at each sample's time
+    if (camMoves) camT = cam;
+    for (int py = y0; py < y1; ++py)
+        for (int px = 0; px < rx; ++px) {
+            const uint64_t pix = (uint64_t)py * (uint64_t)rx + (uint64_t)px;
+            Pcg32 rng;
+            seedUnit(rng, pix, 0x51C7B1D5EEDF00DULL ^ mix64(seedBase + 1));
+            const double offT = rng.uniform();
+            Vec3 acc{0, 0, 0};
+            for (int k = 0; k < K; ++k) {
+                double tU = offT + (double)k / (double)K;
+                tU -= std::floor(tU);
+                const double tFrames = cam.shutterTime(tU);
+                const MotionTimeScope at(scene.motionU(tFrames));
+                if (camMoves) cam.poseAt(tFrames, camT);
+                const Camera& cp = camMoves ? camT : cam;
+                const double jx = rng.uniform(), jy = rng.uniform();
+                Ray r;
+                double w = 1.0, lambda = 0.0;
+                if (lensed) {
+                    lambda = kLo + (kHi - kLo) * rng.uniform();
+                    const double u1 = rng.uniform(), u2 = rng.uniform();
+                    if (!cp.genLensRay(px, py, jx, jy, u1, u2, lambda, r, w) || !(w > 0.0)) continue;
+                } else {
+                    r = cp.genRay(px, py, jx, jy);
+                }
+                // A camera ray, so a `hide_camera` flat lets the sky through (Material::hideCamera).
+                if (scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true).valid)
+                    continue;
+                if (!lensed) {
+                    if (haveEnv) acc += scene.envXYZForDir(r.d);
+                    if (haveSun) acc += scene.sunXYZForDir(r.d);
+                    continue;
+                }
+                double L = 0.0;
+                if (haveEnv) L += scene.envRadianceSeen(r.d, lambda);
+                if (haveSun) L += scene.sunRadiance(r.d, lambda);
+                if (L > 0.0)
+                    acc += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * w * (kHi - kLo));
+            }
+            if (acc.x != 0.0 || acc.y != 0.0 || acc.z != 0.0) film.add(px, py, acc * share);
         }
 }
 
@@ -15575,7 +15620,8 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
     // brute-force catch (C), and the finite-lens next-event splat (A). Fluorescent
     // scenes fall back to the CPU (the reradiation sampler is not ported). `wavefront`
     // selects the streaming backend over the default megakernel (same physics/energy).
-    if (useGpu && cam && cudaAvailable() && cudaForwardSupported(scene)) {
+    // The device renders the instant only, so a camera that sees motion stays here (kMotionCpuWhy).
+    if (useGpu && cam && !cam->seesMotion(scene) && cudaAvailable() && cudaForwardSupported(scene)) {
         char camMode = lensMode ? 'A' : forwardCatch ? 'C' : 'B';
         return renderForwardCuda(scene, *cam, resX, resY, N, eOut, diffraction, camMode, seedBase, wavefront, g_heroC);
     }
@@ -15616,6 +15662,12 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
             if (camMoves) cam->poseAt(tFrames, camT);
             r.tracePhoton(scene, camMoves ? &camT : camPtr, sensorFilm, camFilm, rng, reports[tid]);
         }
+        // ...and, under a blur, this thread's band of the sky the camera sees directly (mode C
+        // catches the sky's photons through its pupil instead).
+        if (blur && camFilm && !forwardCatch)
+            addBlurredSkyRows(*camFilm, scene, *cam, N, 1, seedBase,
+                              (int)((long long)resY * tid / nThreads),
+                              (int)((long long)resY * (tid + 1) / nThreads));
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
@@ -15651,6 +15703,15 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
                                              unsigned long long seedBase = 0,
                                              bool beamGather = false) {
     int nc = (int)cams.size();
+    // One time per photon serves every camera only when they share a shutter or see nothing move
+    // (run's joinFlight groups them so); any other flight would render cameras at wrong times.
+    for (int c = 1; c < nc; ++c)
+        if ((cams[c].seesMotion(scene) || cams[0].seesMotion(scene)) &&
+            (cams[c].shutterOpen != cams[0].shutterOpen || cams[c].shutterClose != cams[0].shutterClose)) {
+            std::fprintf(stderr, "internal error: a shared forward flight holds cameras with different "
+                                 "shutters\n");
+            std::exit(3);
+        }
     // Per-thread × per-camera films (each thread accumulates into its own copies to
     // avoid shared-pixel races; merged per camera at the end).
     std::vector<std::vector<Film>> films(nThreads, std::vector<Film>(nc));
@@ -15694,6 +15755,12 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
                     if (cams[c].moves()) cams[c].poseAt(tFrames, posed[(size_t)c]);
             r.tracePhoton(scene, targets.data(), nc, /*sensorFilm*/nullptr, rng, reports[tid]);
         }
+        // ...and, under a blur, this thread's band of each camera's directly seen sky.
+        for (int c = 0; c < nc && blur; ++c)
+            if (cams[c].seesMotion(scene))
+                addBlurredSkyRows(films[tid][c], scene, cams[c], N, nc, seedBase,
+                                  (int)((long long)resY[c] * tid / nThreads),
+                                  (int)((long long)resY[c] * (tid + 1) / nThreads));
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
@@ -18879,9 +18946,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (wantGpu) std::fprintf(stderr, "[device] no CUDA device found; using CPU\n");
             else         std::printf("[device] auto -> CPU (no CUDA device found)\n");
         } else if (cam.seesMotion(scene)) {
-            const char* why = "motion blur (a camera shutter on a moving scene) renders on the CPU so far";
-            if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
-            else         std::printf("[device] auto -> CPU (%s)\n", why);
+            if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", kMotionCpuWhy);
+            else         std::printf("[device] auto -> CPU (%s)\n", kMotionCpuWhy);
         } else if (gpuBdptMode) {
             // Modes D and J share this (stricter) GPU support check: BDPT scope only — mode J
             // is the same megakernel with the merges switched on, so anything mode D can run
@@ -23963,7 +24029,7 @@ static int run(int argc, char** argv) {
             // estimator shares light data across paths (M, S, U, J), or picks per pixel from a
             // classification made at the instant (P), renders the frame's instant, its shutter
             // closed here so no part of it blurs while the rest does not.
-            if (c.seesMotion(scene) && !std::strchr("RDABC", cmode)) {
+            if (c.seesMotion(scene) && !modeSeesMotion(cmode)) {
                 static uint64_t saidFor = 0;   // once per scene, not per frame of a path
                 if (saidFor != scene.generation) {
                     saidFor = scene.generation;
@@ -24357,7 +24423,7 @@ static int run(int argc, char** argv) {
             m.mode = (ci < renderedOf.size() && renderedOf[ci])
                          ? renderedOf[ci]
                          : renderedMode(scene, effModeCam(cs), cs.projection, cs.lens != nullptr);
-            if (std::strchr("RDABC", m.mode)) {
+            if (modeSeesMotion(m.mode)) {
                 m.cam.shutterOpen = cs.shutterOpen; m.cam.shutterClose = cs.shutterClose;
                 m.cam.motion = cs.motion;
             }
@@ -27466,9 +27532,12 @@ static int run(int argc, char** argv) {
     // no-op silently (see warnBeamsNeedsCameras).
     for (auto* flights : {&groupsB, &groupsA}) {
         const char m = (flights == &groupsB) ? 'B' : 'A';
+        size_t total = 0, apart = 0;
+        for (const std::vector<int>& f : *flights) { total += f.size(); apart += (f.size() == 1); }
+        if (total == 1) warnBeamsNeedsCameras(scene, g_beamGather, m, 1);
+        else if (apart > 0) warnBeamsApart(scene, g_beamGather, m, (int)apart);
         for (std::vector<int>& f : *flights)
             if (f.size() < 2) {
-                warnBeamsNeedsCameras(scene, g_beamGather, m, (int)f.size());
                 for (int i : f) restIdx.push_back(i);
                 f.clear();
             }
@@ -27530,9 +27599,8 @@ static int run(int argc, char** argv) {
         if (groupGpu && std::any_of(cams.begin(), cams.end(),
                                     [&](const Camera& c) { return c.seesMotion(scene); })) {
             groupGpu = false;
-            const char* why = "motion blur (a camera shutter on a moving scene) renders on the CPU so far";
-            if (!std::strcmp(device, "gpu")) std::fprintf(stderr, "[device] %s; using CPU\n", why);
-            else                             std::printf("[device] auto -> CPU (%s)\n", why);
+            if (!std::strcmp(device, "gpu")) std::fprintf(stderr, "[device] %s; using CPU\n", kMotionCpuWhy);
+            else                             std::printf("[device] auto -> CPU (%s)\n", kMotionCpuWhy);
         }
 #endif
         (void)groupGpu;
@@ -27544,7 +27612,7 @@ static int run(int argc, char** argv) {
             std::vector<Checkpoint> cks(nc);
             bool ok = true; long long n0 = -1;
             for (int c = 0; c < nc && ok; ++c) {
-                uint64_t g = checkpointGuard(scene, groupMode, rxs[c], rys[c]);
+                uint64_t g = checkpointGuard(scene, groupMode, rxs[c], rys[c], &cams[c]);
                 if (!readCheckpoint(outFor(toRender[idx[c]].name), rxs[c], rys[c], g, groupMode, cks[c])) ok = false;
                 else if (n0 < 0) n0 = cks[c].N;
                 else if (cks[c].N != n0) ok = false;
@@ -27652,7 +27720,7 @@ static int run(int argc, char** argv) {
                     sharedWriteFail = true;
                 if (wantCheckpoint) {
                     Checkpoint ck; ck.film = acc[c]; ck.N = accN; ck.energy = accE;
-                    if (!writeCheckpoint(op, ck, checkpointGuard(scene, groupMode, rxs[c], rys[c]), groupMode))
+                    if (!writeCheckpoint(op, ck, checkpointGuard(scene, groupMode, rxs[c], rys[c], &cams[c]), groupMode))
                         std::fprintf(stderr, "[checkpoint] could not write %s\n", checkpointPath(op).c_str());
                 }
             }

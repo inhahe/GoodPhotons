@@ -10021,13 +10021,24 @@ sees the instant, exactly as a static scene with those transforms would show it.
   forward modes the photon and its splat do. The analytic specular connections read their
   sphere and plane at the path's time (`Scene::sphereNow`, `mirrorPlaneNow`; a plane whose
   faces move differently records `mixed` and is skipped under a time). The sky a forward mode
-  sees directly is a camera-side pass of its own (`addEnvBackground`); under a blur it goes
-  through `addEnvBackgroundSampled`, the lens pass's cache and growing sample count, each sample
-  at its own time (a rotated radical inverse in base 3), so the sky shows behind a mover for the
-  part of the shutter it is uncovered. A shared forward flight (`renderForwardShared`) draws one
-  time per photon for all its cameras, so `run` builds one flight per shutter (`joinFlight`;
-  cameras that see nothing move share regardless), and a flight in which any camera sees
-  motion flies on the CPU.
+  sees directly is a camera-side pass of its own (`addEnvBackground`, at each write). Under a
+  blur that pass skips the camera: each forward thread draws its band of the sky into its own
+  batch film instead (`addBlurredSkyRows`), K samples a pixel at times of their own (rotated per
+  pixel and batch), K a sixteenth of a photon per pixel per camera sharing the batch, 1 to 64 —
+  so the sky shows behind a mover for the part of the shutter it is uncovered, converges as the
+  film does, costs at most a sixteenth of the photons or a ray a pixel per batch, and needs no
+  cache (one keyed by camera thrashed under a many-camera flight). A shared forward flight
+  (`renderForwardShared`) draws one time per photon for all its cameras, so `run` builds one
+  flight per shutter (`joinFlight`; cameras that see nothing move share regardless; the
+  function stops with an internal error on any other mix), a flight in which any camera sees
+  motion flies on the CPU, and its resume guard mixes each camera's shutter.
+- **Light from the sky and the suns reaches a mover outside the instant's bounds.** The env's
+  and the suns' photons and BDPT light subpaths enter through a disc sized by the scene's
+  bounding sphere; for a path with a time in a moving scene that sphere (about the same centre)
+  grows to hold the swept one (`Scene::lightRadius`, `sweptReach`), the forward photon's power
+  scales by the disc's area (`lightScale()^2`, folded into `spotW`), BDPT's sun disc and its
+  densities (`sampleSunOrigin`, `sunOriginPdf`, `sunOriginPdfAlong`, `vertexPdfLight`) widen
+  with it, and BDPT's sun shadow ray runs to `exitDistance`, as mode R's does.
 - **The camera moves by keys of its own** (0.408.0): `Camera::motion` (a `CameraMotion`: poses
   — eye, look-at point, up, fov — at keys spread evenly over [a, b] frames, blended linearly by
   `CameraMotion::at`). Its eye, axes and fields of view stay its pose at the instant, which is
@@ -10041,11 +10052,12 @@ sees the instant, exactly as a static scene with those transforms would show it.
   frame's own shutter (`keyPathFrames`; a frame is a frame apart in time, so frame i at time t
   is the path at i + t). The resume guard mixes the keys.
 - **Where blur is not yet carried, the shutter is closed**, so no estimator mixes times: the
-  camera loop in `main.cpp` closes it for modes M, S, U and J (which share photons or merges
-  across paths) and P (whose per-pixel classification is made at the instant, and whose
-  backward half would otherwise blur alone). The device renders the instant only, so
-  `runRender`'s device choice, the shared forward group and the exposure meter keep a blurred
-  camera on the CPU, and `-radcache` is off under a blur. What cannot move yet stays put and
+  camera loop in `main.cpp` closes it for every mode `modeSeesMotion` does not name — M, S, U
+  and J (which share photons or merges across paths), P (whose per-pixel classification is made
+  at the instant, and whose backward half would otherwise blur alone), V — and the exposure
+  meter asks the same helper. The device renders the instant only, so `runRender`'s device
+  choice, `renderForward`'s own device gate, the shared forward group and the exposure meter
+  keep a blurred camera on the CPU (`kMotionCpuWhy`), and `-radcache` is off under a blur. What cannot move yet stays put and
   says so (`stillWarning`): registered emitters (an emissive mesh: light sampling reads the
   instant) and lights in a moving group stay at the instant, so nothing mixes a moved surface
   with an unmoved sampler. Keys are made after a group's children are built (`moveChildren`), so the

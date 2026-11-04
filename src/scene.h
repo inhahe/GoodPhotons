@@ -1724,12 +1724,18 @@ struct Scene {
         h.motionSet = t.motion;
         return true;
     }
+    // Sphere `s` carried by D: its centre moved, its radius scaled by D's (uniform) scale -- the
+    // loader builds a sphere its keys scale unevenly as a mesh.
+    static Sphere movedSphere(const Sphere& s, const Affine& D) {
+        bool nonUniform = false;
+        Sphere o = s;
+        o.c = D.apply(s.c);
+        o.r = s.r * D.uniformScale(nonUniform);
+        return o;
+    }
     FT_NOINLINE bool intersectMovingSphere(const Ray& r, const Sphere& s, double tmin, Hit& h) const {
         const Affine D = motionNow(s.motion);
-        bool nonUniform = false;
-        Sphere ss = s;
-        ss.c = D.apply(s.c);
-        ss.r = s.r * D.uniformScale(nonUniform);
+        const Sphere ss = movedSphere(s, D);
         if (!intersectSphere(r, ss, tmin, h)) return false;
         // Only now, on a hit: its axes turned with it, so its texture does (a blend of two
         // rotations is not quite one, so each is renormalised).
@@ -2481,11 +2487,26 @@ struct Scene {
     // sceneRadius in a scene where nothing moves.
     Vec3 sweptCenter{0, 0, 0};
     double sweptRadius = 0.0;
+    // The radius of the sphere about sceneCenter that holds the swept one: what the sky's and the
+    // suns' entry discs reach to for a path with a time (lightRadius).
+    double sweptReach = 0.0;
+    // Whether the current path has a time in a moving scene, and so may meet a mover outside the
+    // instant's bounding sphere.
+    bool sweptQuery() const { return g_motionU >= 0.0 && hasMotion(); }
+    // The radius of the sphere about sceneCenter the sky's and the suns' light enters the scene
+    // through, for the current path: the scene's own, or for a path with a time in a moving scene
+    // one that holds the movers' sweep -- so a mover outside the instant's sphere is still lit.
+    // A quantity sized by the scene's sphere (an entry disc, a phase-space weight) scales by
+    // lightScale().
+    double lightRadius() const { return sweptQuery() ? sweptReach : sceneRadius; }
+    double lightScale() const {
+        return (sweptQuery() && sceneRadius > 0.0) ? sweptReach / sceneRadius : 1.0;
+    }
     // How far a ray from p must go to leave everything it could hit: to the scene's bounding
     // sphere, or -- for a path with a time (g_motionU), which may meet a mover outside it --
     // the swept one. The far end of shadow rays to the sun and the sky.
     double exitDistance(const Vec3& p) const {
-        if (g_motionU >= 0.0 && hasMotion()) return length(sweptCenter - p) + sweptRadius;
+        if (sweptQuery()) return length(sweptCenter - p) + sweptRadius;
         return mediaExitDistance(p);
     }
     // The far end of a medium's transmittance along a ray to the sun or the sky: the scene's own
@@ -3052,31 +3073,30 @@ struct Scene {
         bool mixed = false;
     };
     std::vector<MirrorPlane> mirrorPlanes;
-    // A mirror plane as a path at its own time sees it (g_motionU): carried by its members'
-    // motion, or false when they move differently (the connection is then not made).
-    bool mirrorPlaneNow(const MirrorPlane& mp, MirrorPlane& out) const {
-        out = mp;
-        if (g_motionU < 0.0 || mp.motionSet < 0) return !(mp.mixed && g_motionU >= 0.0);
-        if (mp.mixed) return false;
+    // A mirror plane as a path at its own time (g_motionU) sees it: `mp` itself, or `tmp` filled
+    // with it carried by its members' motion -- or null when they move differently (the
+    // connection is then not made).
+    const MirrorPlane* mirrorPlaneNow(const MirrorPlane& mp, MirrorPlane& tmp) const {
+        if (g_motionU < 0.0) return &mp;
+        if (mp.mixed) return nullptr;
+        if (mp.motionSet < 0) return &mp;
         const Affine D = motionNow(mp.motionSet);
-        out.n = normalize(D.applyNormal(mp.n));
-        out.d = dot(out.n, D.apply(mp.n * mp.d));
+        tmp = mp;
+        tmp.n = normalize(motionNowInverse(mp.motionSet).applyDirTranspose(mp.n));
+        tmp.d = dot(tmp.n, D.apply(mp.n * mp.d));
         Aabb b;
         for (int c = 0; c < 8; ++c)
             b.expand(D.apply(Vec3{(c & 1) ? mp.hi.x : mp.lo.x, (c & 2) ? mp.hi.y : mp.lo.y,
                                   (c & 4) ? mp.hi.z : mp.lo.z}));
-        out.lo = b.lo; out.hi = b.hi;
-        return true;
+        tmp.lo = b.lo; tmp.hi = b.hi;
+        return &tmp;
     }
-    // A sphere as a path at its own time sees it: moved by its keys, or itself.
-    Sphere sphereNow(const Sphere& s) const {
+    // A sphere as a path at its own time sees it: `s` itself, or `tmp` filled with it moved by
+    // its keys.
+    const Sphere& sphereNow(const Sphere& s, Sphere& tmp) const {
         if (s.motion < 0 || g_motionU < 0.0) return s;
-        const Affine D = motionNow(s.motion);
-        bool nonUniform = false;
-        Sphere o = s;
-        o.c = D.apply(s.c);
-        o.r = s.r * D.uniformScale(nonUniform);
-        return o;
+        tmp = movedSphere(s, motionNow(s.motion));
+        return tmp;
     }
 
     // Index lists over `spheres` for the per-vertex specular camera connections
@@ -3673,6 +3693,7 @@ struct Scene {
                 sceneCenter = b.center();
                 sceneRadius = length(b.hi - b.lo) * 0.5 * 1.0001; // tiny margin
                 sceneBoxLo = b.lo; sceneBoxHi = b.hi;
+                sweptReach = std::max(sceneRadius, length(sweptCenter - sceneCenter) + sweptRadius);
             } else {
                 // NOTHING to bound -- an environment (or a sun) and a camera, e.g. an HDR opened to
                 // look at. R = 0 gave the env (and a sun) zero phase-space weight, hence zero power,
@@ -3681,6 +3702,7 @@ struct Scene {
                 // be positive for the emitters' power and the wavelength CDF built from it.
                 sceneCenter = Vec3{0, 0, 0};
                 sceneRadius = 1.0;
+                sweptReach = 1.0;
             }
         }
         // Distant suns are sized by the same bounding sphere: a photon is born on a

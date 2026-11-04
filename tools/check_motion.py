@@ -30,6 +30,9 @@ cube whose keys scale and shear it together. It requires:
     instances -- every other ray at a random time, so the swept bounds are held to the moved
     primitives. An isosurface, a curve and an instance in a group that moves, turns and grows,
     held sharp at two times, render as the static group written out there.
+  * A ball whose sweep runs far past the instant's bounding sphere is lit by the sky (mode B) and
+    by a low sun (mode B), and shadows the floor in that sun (mode D), as in blurred mode R. A
+    shared flight resumes its own shutter's sidecar and refuses one rendered with another.
   * Blurred modes D (BDPT) and B (forward light tracing) on the CPU agree with blurred mode R.
     So do two mode B cameras with the shutter rendered beside a third without it (one flight per
     shutter, on any device), the third staying sharp; and the sky mode B sees directly behind a
@@ -214,6 +217,23 @@ def kinds_scene(cube_obj, u=None, shutter=None):
         "group { %s  %s }" % (xf(KINDS, u, 1.0), body),
         'camera "c" { eye 0 1.0 4.2  look_at 0 0.5 0  up 0 1 0  fov_y 40  %sfilm { res %d %d } }'
         % (cam, W, H),
+    ]) + NL
+
+
+def reach_scene(light, shutter=(-0.5, 0.5)):
+    """A big ball whose sweep runs far past the instant's bounding sphere (a small floor, the ball
+    over it at the instant), lit by `light` alone: the sky's or the sun's light must reach it
+    there, and its shadow must fall back on the floor."""
+    keys = [dict(translate=(-1.8, 0.45, 0.0)), dict(translate=(1.8, 0.45, 0.0))]
+    return NL.join([
+        "scene { units meters  motion_interval -0.5 0.5 }",
+        'material "white" { type diffuse reflect 0.6 }',
+        'material "gold"  { type diffuse reflect rgb 0.8 0.6 0.2 }',
+        light,
+        "quad { origin -0.3 0 -0.3  u 0 0 0.6  v 0.6 0 0  material white }",
+        "group { %s  sphere { center 0 0 0  radius 0.45  material gold } }" % xf(keys, None, 1.0),
+        'camera "c" { eye 0 1.2 6  look_at 0 0.4 0  up 0 1 0  fov_y 45  '
+        'shutter_open %r  shutter_close %r  film { res %d %d } }' % (shutter + (W, H)),
     ]) + NL
 
 
@@ -590,6 +610,42 @@ def main():
     bad = (z > 5.0) & (rel > 0.05)
     verdict("blurred mode B's sky behind a mover = mode R's", not bad.any(),
             "worst block z %.1f rel %.3f; %d blocks out" % (z.max(), rel.max(), bad.sum()))
+
+    # --- a mover whose sweep leaves the instant's bounding sphere is still lit by the sky in the
+    # forward modes, and still shadows a sunlit floor in BDPT: their light enters through a sphere
+    # that holds the sweep ---
+    # (Under the sun mode R needs more samples: the ends of the sweep, nearly empty blocks, are
+    # reached only by times near the ends of the shutter.)
+    sun = "light sun { dir 1 0.3 0  angle 0.53  spd preset:d65 }"   # low, from +x
+    for name, light, rspp, mode, margs in (
+            ("the sky lights a mover outside the instant's bounds (mode B)",
+             "light env { spd preset:d65 }", 512, "B", ["-n", "40000000"]),
+            ("... the sun does (mode B)", sun, 2048, "B", ["-n", "40000000"]),
+            ("... and its shadow falls in the sun (mode D)", sun, 2048, "D", ["-spp", "512"])):
+        pr = os.path.join(out, "reach.ftsl")
+        write(pr, reach_scene(light))
+        rr = [lum(render(exe, out, pr, "reach_R_s%d" % s, ["-mode", "R", "-device", "cpu", "-spp",
+                                                           str(rspp)], seed=s)[0]) for s in (1, 2)]
+        rm = [lum(render(exe, out, pr, "reach_%s_s%d" % (mode, s), ["-mode", mode, "-device", "cpu"] + margs,
+                         seed=s)[0]) for s in (1, 2)]
+        good, detail = agree(rm, rr, 0.05)
+        verdict(name, good, detail)
+
+    # --- a shared flight resumes only a sidecar rendered with the same shutters ---
+    pc = os.path.join(out, "resume_multi.ftsl")
+    for shutter, phrase in (((-0.5, 0.5), None), ((-0.5, 0.5), True), ((-0.25, 0.25), False)):
+        write(pc, scene(shutter=shutter).replace('camera "c"', 'camera "e" { eye 0.3 1.0 4.2  look_at 0 0.5 0  '
+                                                 'up 0 1 0  fov_y 40  shutter_open %r  shutter_close %r  '
+                                                 'film { res %d %d } }' % (shutter + (W, H)) + NL + 'camera "c"'))
+        rargs = [exe, "-in", pc, "-mode", "B", "-device", "cpu", "-n", "300000", "-checkpoint", "-no-meter",
+                 "-o", os.path.join(out, "resume_multi.png")]
+        rc, log = run(rargs + (["-resume"] if phrase is not None else []))
+        if phrase is None:
+            continue
+        loaded = "loaded shared model-B group" in log
+        verdict("a shared flight resumes its own shutter's sidecar" if phrase else
+                "... and not one rendered with another shutter", rc == 0 and loaded == phrase,
+                "" if rc == 0 and loaded == phrase else log.strip()[-300:])
 
     # --- the same blur authored in centimetres: the keys move metres, as the vertices are ---
     blurred_cm = os.path.join(out, "blurred_cm.ftsl")

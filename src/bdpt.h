@@ -500,20 +500,22 @@ inline Vec3 sampleSunOrigin(const Scene& scene, const Emitter& em, Pcg32& rng, d
         x = dot(g_sunAim.w[j], t) + rr * std::cos(phi);
         y = dot(g_sunAim.w[j], b) + rr * std::sin(phi);
     } else {
-        const double rr = em.sunDiscR * std::sqrt(rng.uniform()), phi = 2.0 * PI * rng.uniform();
+        const double rr = em.sunDiscR * scene.lightScale() * std::sqrt(rng.uniform());
+        const double phi = 2.0 * PI * rng.uniform();
         x = rr * std::cos(phi);
         y = rr * std::sin(phi);
     }
-    return scene.sceneCenter + t * x + b * y - em.beamDir * scene.sceneRadius;
+    return scene.sceneCenter + t * x + b * y - em.beamDir * scene.lightRadius();
 }
 
 // The sun's origin density per unit area OF THE DISC at disc coordinates (x, y) (see
 // sampleSunOrigin): with the aim off 1/(pi Rd^2) on the disc and 0 off it. A ray's density per
 // unit area across ITS OWN direction w is this over w.n (n = beamDir): a ray tilted from the
 // beam crosses disc area dA with cross-section dA (w.n), so the estimator owes that factor
-// wherever the ray-space density is meant (deltaLightSubpath, sunOriginPdfAlong).
-inline double sunOriginPdf(const Emitter& em, double x, double y) {
-    const double Rd = em.sunDiscR;
+// wherever the ray-space density is meant (deltaLightSubpath, sunOriginPdfAlong). For a path with
+// a time in a moving scene the disc is widened with the light's sphere (Scene::lightScale).
+inline double sunOriginPdf(const Scene& scene, const Emitter& em, double x, double y) {
+    const double Rd = em.sunDiscR * scene.lightScale();
     const bool onDisc = (x * x + y * y <= Rd * Rd);
     if (!g_sunAim.on()) return onDisc ? 1.0 / (PI * Rd * Rd) : 0.0;
     double p = onDisc ? (1.0 - g_sunAim.f) / (PI * Rd * Rd) : 0.0;
@@ -537,13 +539,13 @@ inline double sunOriginPdfAlong(const Scene& scene, const Emitter& em, const Vec
     const Vec3& n = em.beamDir;
     const double cw = dot(w, n);
     if (!(cw > 0.0)) return 0.0;
-    const Vec3 p0 = scene.sceneCenter - n * scene.sceneRadius;
+    const Vec3 p0 = scene.sceneCenter - n * scene.lightRadius();
     const double ax = dot(p - p0, n);              // how far downstream of the disc plane
     if (!(ax > 0.0)) return 0.0;
     const Vec3 q = p - w * (ax / cw);
     Vec3 t, b; onb(n, t, b);
     const Vec3 o = q - scene.sceneCenter;
-    return sunOriginPdf(em, dot(o, t), dot(o, b)) / cw;
+    return sunOriginPdf(scene, em, dot(o, t), dot(o, b)) / cw;
 }
 
 // Emission directional density at a light vertex `cur` toward `next`, area measure
@@ -567,7 +569,7 @@ inline double vertexPdfLight(const Scene& scene, const Vertex& cur, const Vertex
     if (cur.fire >= 0) {
         pdf = invD2 / (4.0 * PI);                    // a fire emits alike in every direction
     } else if (cur.light && isInfiniteEmitter(*cur.light)) {
-        double R = scene.sceneRadius;
+        double R = scene.lightRadius();
         if (R <= 0.0) return 0.0;
         pdf = (cur.light->shape == EmitterShape::Sun)
                 ? sunOriginPdfAlong(scene, *cur.light, next.p, w)   // planar, over the sun's disc
@@ -1945,7 +1947,7 @@ inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Render
         if (scene.sceneRadius <= 0.0) return 0;
         double x, y;
         org = sampleSunOrigin(scene, em, rng, x, y);
-        pdfPos = sunOriginPdf(em, x, y) / dot(dir, em.beamDir);   // per area across the ray
+        pdfPos = sunOriginPdf(scene, em, x, y) / dot(dir, em.beamDir);   // per area across the ray
         if (!(pdfPos > 0.0)) return 0;
     } else {
         org = em.origin;
@@ -2854,7 +2856,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                     const Emitter& se = *path[0].light;
                     Vec3 st, sb; onb(se.beamDir, st, sb);
                     const Vec3 so = path[0].p - scene.sceneCenter;
-                    m.pdfPlanar = (float)(sunOriginPdf(se, dot(so, st), dot(so, sb)) /
+                    m.pdfPlanar = (float)(sunOriginPdf(scene, se, dot(so, st), dot(so, sb)) /
                                           dot(sg.d, se.beamDir));   // across the beam
                 }
                 // cos / pdfFwd, the merge-independent half of pdfRev*(y_{s-1})/pdfFwd(y_{s-1}):
@@ -3721,7 +3723,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                 // shadow-ray it out of the scene. No 1/dist^2 and no cosLight — the source is
                 // at infinity — so Wgeom is just Omega/pdfChoice and spdFn is a radiance.
                 wi = em.sampleCone(em.beamDir * -1.0, u1, u2);
-                dist = length(scene.sceneCenter - pt.p) + scene.sceneRadius;
+                dist = scene.exitDistance(pt.p);   // the swept sphere's, for a path with a time
                 occlEps = 0.0;
                 y = pt.p + wi * dist; nOut = wi * -1.0;
                 Wgeom = em.spotOmega / pdfChoice;

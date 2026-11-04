@@ -2090,12 +2090,15 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
   light subpaths and every connection between them share one time; in modes `A`, `B` and `C` each
   photon, and its splat to the camera, has its own. `-device gpu` keeps a blurred render on the
   CPU and says so (`[device] motion blur … renders on the CPU so far`), and its exposure meter
-  too. Modes `M`, `S`, `U`, `J` and `P` render the frame's instant and print `[motion] … renders
-  the frame's instant`: the first four share photons or merges across paths, which paths at
-  different times cannot share, and `P` picks each pixel's estimator at the instant.
+  too. Every other mode renders the frame's instant and prints `[motion] … renders the frame's
+  instant`: `M`, `S`, `U` and `J` share photons or merges across paths, which paths at different
+  times cannot share, `P` picks each pixel's estimator at the instant, and `V` runs `B` beside `R`.
   `-radcache` is switched off under a blur (a cell would mix every time in the shutter). The sky
-  a forward mode sees directly blurs behind a mover as mode `R`'s does. Several mode `A` or `B`
-  cameras rendered together share one forward flight per shutter.
+  a forward mode sees directly blurs behind a mover as mode `R`'s does: it is drawn into each
+  batch of photons, a few samples a pixel at times of their own, so it converges with the
+  render. Light from the sky and the sun reaches a mover even where its sweep leaves the
+  scene's bounds at the instant. Several mode `A` or `B` cameras rendered together share one
+  forward flight per shutter.
 - **The camera can move too** (0.408.0): `camera { … motion { key { eye … look_at … up …
   fov_y … } key { … } } }` keys its pose over the `motion_interval` as a group's keys its
   transform, and a `camera_path`, `camera_orbit` or `camera_curve` with a shutter blurs each

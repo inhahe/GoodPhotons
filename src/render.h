@@ -550,7 +550,7 @@ struct Renderer {
         } else if (distant) {
             // --- upstream origin disc -------------------------------------------------
             Vec3 t, b; onb(dir, t, b);
-            const Vec3 base = scene.sceneCenter - dir * scene.sceneRadius;
+            const Vec3 base = scene.sceneCenter - dir * scene.lightRadius();   // the photon's disc
             const caim::DiscAim da = caim::discAim(*aimMap);
             if (!(da.sumR2 > 0.0)) return true;
             double x, y;
@@ -563,7 +563,7 @@ struct Renderer {
                 const Vec3 off = origin - base;
                 x = dot(off, t); y = dot(off, b);
             }
-            const double R = scene.sceneRadius;
+            const double R = scene.lightRadius();
             if (x * x + y * y > R * R) {
                 // Outside the disc the emitter delivers nothing at all, so p_u = 0 and the
                 // whole contribution is zero — not a lost sample, a zero one. (Reachable
@@ -2354,7 +2354,8 @@ struct Renderer {
             for (int i = 0; i < nUp; ++i) {
                 SpecVtx vi = vt; vi.weight = w[i];
                 for (int si : scene.dielSphereIdx) {
-                    const Sphere S = scene.sphereNow(scene.spheres[(size_t)si]);
+                    Sphere moved;
+                    const Sphere& S = scene.sphereNow(scene.spheres[(size_t)si], moved);
                     const Material& gm = scene.mats[S.matId];
                     const double ng = gm.ior(lam[i]);
                     for (int c = 0; c < nCam; ++c)
@@ -2366,18 +2367,20 @@ struct Renderer {
         }
         // Mirrors. Achromatic geometry, so one solve serves the whole hero bundle.
         for (int si : scene.mirrorSphereIdx) {
-            const Sphere S = scene.sphereNow(scene.spheres[(size_t)si]);
+            Sphere moved;
+            const Sphere& S = scene.sphereNow(scene.spheres[(size_t)si], moved);
             for (int c = 0; c < nCam; ++c)
                 if (cams[c].cam && cams[c].film && !cams[c].cam->hasLens())
                     connectSpecularSphereMirror(scene, *cams[c].cam, *cams[c].film, S,
                                                 p, vt, lam, beta, w, nUp, rng);
         }
         for (const Scene::MirrorPlane& mp0 : scene.mirrorPlanes) {
-            Scene::MirrorPlane mp;
-            if (!scene.mirrorPlaneNow(mp0, mp)) continue;   // members moving differently
+            Scene::MirrorPlane moved;
+            const Scene::MirrorPlane* mp = scene.mirrorPlaneNow(mp0, moved);
+            if (!mp) continue;                              // members moving differently
             for (int c = 0; c < nCam; ++c)
                 if (cams[c].cam && cams[c].film && !cams[c].cam->hasLens())
-                    connectSpecularPlane(scene, *cams[c].cam, *cams[c].film, mp,
+                    connectSpecularPlane(scene, *cams[c].cam, *cams[c].film, *mp,
                                          p, vt, lam, beta, w, nUp, rng);
         }
     }
@@ -2771,11 +2774,15 @@ struct Renderer {
             } else {
                 dir = uniformSphere(u1, u2);
             }
+            // A photon with a time in a moving scene enters through a disc wide enough for the
+            // movers' sweep, its power scaled by the disc's area (Scene::lightRadius).
+            const double R = scene.lightRadius();
+            spotW = scene.lightScale() * scene.lightScale();
             Vec3 t, b; onb(dir, t, b);
-            double rd = scene.sceneRadius * std::sqrt(rng.uniform());
+            double rd = R * std::sqrt(rng.uniform());
             double pd = 2.0 * PI * rng.uniform();
             Vec3 disk = t * (rd * std::cos(pd)) + b * (rd * std::sin(pd));
-            origin = scene.sceneCenter - dir * scene.sceneRadius + disk;
+            origin = scene.sceneCenter - dir * R + disk;
             emitN = dir;
         } else if (em.shape == EmitterShape::Sun) {
             // Distant directional sun. Sample the travel direction inside the solar
@@ -2785,10 +2792,12 @@ struct Renderer {
             // scene rather than one in ~10^5. The joint pdf 1/(Omega*pi*R^2) is exactly
             // 1/envGeom, so beta = emitIntegral*envGeom is analog with no reweight.
             dir = em.sampleCone(em.beamDir, u1, u2);
+            const double R = scene.lightRadius();             // as the env's, above
+            spotW = scene.lightScale() * scene.lightScale();
             Vec3 t, b; onb(dir, t, b);
-            double rd = scene.sceneRadius * std::sqrt(rng.uniform());
+            double rd = R * std::sqrt(rng.uniform());
             double pd = 2.0 * PI * rng.uniform();
-            origin = scene.sceneCenter - dir * scene.sceneRadius
+            origin = scene.sceneCenter - dir * R
                    + t * (rd * std::cos(pd)) + b * (rd * std::sin(pd));
             emitN = dir;
         } else {
@@ -3725,19 +3734,25 @@ struct Renderer {
             } else {
                 dir = uniformSphere(u1, u2);
             }
+            // A photon with a time in a moving scene enters through a disc wide enough for the
+            // movers' sweep, its power scaled by the disc's area (Scene::lightRadius).
+            const double R = scene.lightRadius();
+            spotW = scene.lightScale() * scene.lightScale();
             Vec3 t, b; onb(dir, t, b);
-            double rd = scene.sceneRadius * std::sqrt(rng.uniform());
+            double rd = R * std::sqrt(rng.uniform());
             double pd = 2.0 * PI * rng.uniform();
             Vec3 disk = t * (rd * std::cos(pd)) + b * (rd * std::sin(pd));
-            origin = scene.sceneCenter - dir * scene.sceneRadius + disk;
+            origin = scene.sceneCenter - dir * R + disk;
             emitN = dir;
         } else if (em.shape == EmitterShape::Sun) {
             // Distant directional sun — see the scalar tracer for the pdf argument.
             dir = em.sampleCone(em.beamDir, u1, u2);
+            const double R = scene.lightRadius();             // as the env's, above
+            spotW = scene.lightScale() * scene.lightScale();
             Vec3 t, b; onb(dir, t, b);
-            double rd = scene.sceneRadius * std::sqrt(rng.uniform());
+            double rd = R * std::sqrt(rng.uniform());
             double pd = 2.0 * PI * rng.uniform();
-            origin = scene.sceneCenter - dir * scene.sceneRadius
+            origin = scene.sceneCenter - dir * R
                    + t * (rd * std::cos(pd)) + b * (rd * std::sin(pd));
             emitN = dir;
         } else {
