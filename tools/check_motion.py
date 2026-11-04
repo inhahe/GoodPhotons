@@ -75,13 +75,14 @@ cube whose keys scale and shear it together. It requires:
     sweep along a wall as brightly as the rest, and off the pivot needs no more keys than the
     budget. Keys whose only mover is a light they would stretch unevenly are no motion at all.
     Lights scale with their group (a uniform scale for every kind, an uneven stretch and shear for
-    a flat panel and an emissive mesh), their radiance kept and their area grown. Haze under a
+    a flat panel and an emissive mesh, and for a ball and a tube round at the instant, which are
+    built as emissive meshes), their radiance kept and their area grown. Haze under a
     sweep far wider than the scene lights the floor as it does without the shutter (modes R, D
     and B; on the GPU modes R and B, under the sun and the sky, and D). The blurred sky mode B sees in a batch with under one sample a pixel is all there.
   * The loader refuses, with a message naming why: a `motion` block with no `motion_interval`; one
     with a single key; `translate` beside `motion`; fur on, or a medium bounded by, a moving
     object; an interval that excludes the instant; `shutter_close` before `shutter_open`. It keeps
-    a sun in a moving group, and a sphere light its keys stretch unevenly, at the instant, saying so -- and a render
+    a sun in a moving group, and a spot its keys stretch unevenly, at the instant, saying so -- and a render
     held sharp late in the shutter shows the sun's shadows where the instant has them while its
     sibling balls (one an isosurface) have moved -- and builds
     a sphere its keys stretch as a mesh, as it does one an uneven static scale stretches.
@@ -365,12 +366,16 @@ GROW = [dict(translate=(-0.4, 1.5, 0.0), rotate=(0, -20, 0), scale=(0.6, 0.6, 0.
         dict(translate=(0.4, 1.6, 0.2), rotate=(0, 30, 10), scale=(1.5, 1.5, 1.5))]
 WARP = [dict(translate=(-0.4, 1.5, 0.0)),
         dict(translate=(0.4, 1.5, 0.2), rotate=(0, 25, 0), scale=(1.6, 0.7, 1.2), shear=(0.3, 0, 0))]
+# Round at the instant (the middle key), stretched and sheared either side of it.
+STRETCH = [dict(translate=(-0.4, 1.5, 0.0), scale=(0.7, 1.3, 1.0)), dict(translate=(0.0, 1.55, 0.1)),
+           dict(translate=(0.4, 1.6, 0.2), rotate=(0, 25, 0), scale=(1.5, 0.7, 1.2), shear=(0.3, 0, 0))]
 
 
 def scaled_lights_scene(obj, kind, u=None, shutter=None):
     """Lights in a group its keys scale, moving, or held at u: `kind` "grow" (GROW, a similarity) holds
     every kind of light -- a panel, a ball, a tube, a spot, an aimed panel and an emissive triangle;
-    "warp" (WARP, any affine) a panel and an emissive triangle, the kinds it can carry. Each light
+    "warp" (WARP, any affine) a panel and an emissive triangle; "stretch" (STRETCH) a panel, a ball
+    and a tube, round at the instant and built as emissive meshes for the keys. Each light
     is given its radiance (no `power`, which would hold its flux at the instant's), so held still
     at a time it is the same light as the moving one there."""
     cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
@@ -387,6 +392,13 @@ def scaled_lights_scene(obj, kind, u=None, shutter=None):
             "light area { origin 0.25 0.1 0.25  u 0.2 0 0  v 0 0 0.2  normal 0.6 -1 0.3  spd preset:bb5600 }",
             tri])
         keys = GROW
+    elif kind == "stretch":
+        body = "  ".join([
+            panel,
+            "light sphere { center 0.3 -0.1 0  radius 0.08  spd preset:bb5000 }",
+            "light cylinder { center -0.2 -0.2 -0.3  axis 1 0 0.3  length 0.4  radius 0.03  caps on  "
+            "spd preset:bb4000 }"])
+        keys = STRETCH
     else:
         body = "  ".join([panel, tri])
         keys = WARP
@@ -543,10 +555,9 @@ STILL = [
      "group { motion { key { translate 0 0 0 } key { translate 1 0 0 } }  light sun { dir 0.3 1 0.2  "
      "angle 1  spd preset:d65 } }",
      "a sun or sky light in a moving group stays where it is"),
-    # round at the instant (the middle key), as a sphere light must be to load, stretched after it
-    ("a sphere light its keys stretch unevenly",
-     "group { motion { key { scale 1 } key { scale 1 } key { scale 1.5 1 1 } }  light sphere { center 0 1 0  "
-     "radius 0.05  spd preset:bb6500  power 5 } }", "whose keys stretch it unevenly stays where it is"),
+    ("a spot light its keys stretch unevenly",
+     "group { motion { key { scale 1 } key { scale 1 } key { scale 1.5 1 1 } }  light spot { origin 0 1 0  "
+     "dir 0 -1 0  spd preset:bb6500  power 5 } }", "whose keys stretch it unevenly stays where it is"),
 ]
 LIGHT = ("light area { origin -0.4 2.9 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  spd preset:bb6500"
          "  power 60 }")
@@ -711,6 +722,9 @@ def main():
               lone_modes) for t in (-0.35, 0.4)] +
             [(0.4, "flat lights their keys stretch", lambda u=None, shutter=None: scaled_lights_scene(objf, "warp", u, shutter),
               lone_modes)] +
+            # a ball and a tube its keys stretch, round at the instant: emissive meshes
+            [(0.4, "a ball and a tube their keys stretch", lambda u=None, shutter=None: scaled_lights_scene(objf, "stretch", u, shutter),
+              lone_modes)] +
             [(t, "a deforming glowing mesh", lambda u=None, shutter=None: glow_deform_scene(gridf, u, shutter),
               glow_modes) for t in (-0.35, 0.4)])
     for t, what, make, modes in held:
@@ -747,6 +761,17 @@ def main():
         rc, log = run([exe, "-in", p, "-parseonly"])
         m = re.search(r"(\d+) spheres, (\d+) tris", log)
         good = rc == 0 and m is not None and int(m.group(1)) == 0 and int(m.group(2)) > 100
+        verdict(name, good, "" if good else log.strip()[-300:])
+    # A ball or tube light an uneven static scale stretches: an emissive mesh, beside the base's panel.
+    for name, light in (("a sphere light an uneven scale stretches loads as an emissive mesh",
+                         "light sphere { center 0 1 0  radius 0.1  spd preset:bb6500  power 5 }"),
+                        ("a tube light an uneven scale stretches loads as an emissive mesh",
+                         "light cylinder { center 0 1 0  axis 1 0 0  length 0.4  radius 0.03  spd preset:bb6500  power 5 }")):
+        p = os.path.join(out, "uneven_light.ftsl")
+        write(p, NL.join(["scene { units meters }", base, "group { scale 1 2 1.5  shear 0.3 0 0  %s }" % light]) + NL)
+        rc, log = run([exe, "-in", p, "-parseonly"])
+        m = re.search(r"(\d+) emitters, (\d+) spheres, (\d+) tris", log)
+        good = rc == 0 and m is not None and int(m.group(1)) == 2 and int(m.group(2)) == 0 and int(m.group(3)) > 50
         verdict(name, good, "" if good else log.strip()[-300:])
     for name, sc, cam, phrase in (
             ("refuses an interval that excludes the instant", "motion_interval 0.2 1", "",
@@ -1345,7 +1370,7 @@ def light_and_haze_tests(exe, out, verdict, hair, gpu):
     verdict("... and off its pivot needs no more keys than it has", rc == 0 and "keys to follow" not in log,
             "" if rc == 0 and "keys to follow" not in log else log.strip()[-300:])
 
-    # Keys that move nothing (the only mover a light they would stretch unevenly): no motion in the scene,
+    # Keys that move nothing (the only mover a spot they would stretch unevenly): no motion in the scene,
     # so mode V under a shutter has no blur to say it drops.
     p = os.path.join(out, "nomotion.ftsl")
     write(p, NL.join(["scene { units meters  motion_interval -0.5 0.5 }", 'material "w" { type diffuse reflect 0.5 }',

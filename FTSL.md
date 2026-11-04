@@ -2740,6 +2740,12 @@ scene to fixed-exposure output (`power` wins if both given). Env lights reject
 `caps on`/`true`/`yes` closes the cylinder (emissive end discs). `spot` angles are
 half-angles in degrees with a smoothstep penumbra between inner and outer.
 
+A `sphere` or `cylinder` light under an uneven `scale` or a shear is an ellipsoid or an elliptic
+tube (since 0.428.0; it was refused): it is built as an emissive mesh, the sphere tessellated as
+§8.1's is and the tube from its `segments`, and `power` or `lumens` is its flux over that surface.
+So is one in a moving `group` whose keys stretch it so at some time (§13.1), which then moves as
+an emissive mesh does.
+
 `sun` is an infinitely-distant directional light — a disc of angular **diameter**
 `angle` degrees whose rays arrive parallel. `spd` is the **perpendicular spectral
 irradiance** (the light hitting a surface facing the sun), so widening `angle` softens
@@ -3204,8 +3210,9 @@ size.)
   with its group, lit and lighting as it goes, in every mode that blurs. A light moves only
   rigidly, or (since 0.426.0) under keys that scale it: any light under a uniform scale, and a
   flat panel or an emissive mesh under an uneven stretch or a shear, each keeping its radiance (a
-  `power` is its flux at the frame's instant, so a light that grows emits more). A sphere, tube,
-  spot, beam or aimed panel its keys stretch unevenly stays at the instant, its surface with it,
+  `power` is its flux at the frame's instant, so a light that grows emits more). A sphere or tube
+  light its keys stretch unevenly is built as an emissive mesh (§11) and moves as one (since
+  0.428.0). A spot, beam or aimed panel its keys stretch unevenly stays at the instant, its surface with it,
   and so does a sun or sky in a moving group — each with one warning. An aimed area light (one
   whose `normal` leans) moves since 0.425.0, its lean turning with it. What finds an object by name — `fur { on }` and `bald`, a
   medium's `bounds { object }`, `settle { collide }` — refuses one in a moving group, which it

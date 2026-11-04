@@ -2148,7 +2148,8 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
   0.425.0 aimed area panels, whose lean turns with them. Since 0.426.0 a light also scales with
   its group: any light under a uniform scale, and a flat panel or an emissive mesh under an
   uneven stretch or a shear. It keeps its radiance, so a light that grows emits more (a `power`
-  is its flux at the frame's instant). A sphere, tube, spot, beam or aimed panel its keys stretch
+  is its flux at the frame's instant). A ball or tube light its keys stretch unevenly is built as
+  an emissive mesh, and moves as one (since 0.428.0). A spot, beam or aimed panel its keys stretch
   unevenly stays at the instant, as does a sun or sky, each with a warning. A procedural pattern on a moving
   surface travels with it (it is read where the point sits at the frame's instant), and a
   sphere's UV turns with its keys; `pattern_space object` on a group keeps its patterns on it
@@ -3233,8 +3234,8 @@ per-path carrier is left unqualified here.
 | Subtype | Description | Key parameters |
 |---|---|---|
 | *(default)* area | Rectangular area light | `origin`, `u`, `v`, `normal`, `spd`, `hide_camera` |
-| `sphere` | Spherical area light | `center`, `radius`, `spd` |
-| `cylinder` | Cylindrical tube light | `center`, `axis`, `length`, `radius`, `caps`, `spd` |
+| `sphere` | Spherical area light (an ellipsoid under an uneven scale: an emissive mesh) | `center`, `radius`, `spd` |
+| `cylinder` | Cylindrical tube light (elliptic under an uneven scale: an emissive mesh) | `center`, `axis`, `length`, `radius`, `caps`, `spd` |
 | `spot` | Cone spotlight with penumbra | `origin`, `dir`, `inner_angle`, `outer_angle`, `spd` |
 | `collimated` | Parallel beam (3 cm pencil, ×enclosing group scale), centered on `origin` | `origin`, `dir`, `spd` |
 | `sun` | Distant directional sun (parallel beam over the whole scene, soft-edged disc) | `elevation` + `azimuth` (or `dir`), `angle`, `spd`, `intensity` |

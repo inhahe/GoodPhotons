@@ -757,8 +757,9 @@ draws. *Aimed area lights (0.425.0, done):* an aimed panel moves, its face and l
 it in every estimator. *Lights that scale (0.426.0, done):* under a similarity every light, under
 any affine a flat panel or an emissive mesh, its area carried in every density. *Deforming glowing
 meshes (0.427.0, done):* each light sample taken on its triangle as the keys have it at the path's
-time, the triangle's area then in every density, on both devices. Open: an uneven
-stretch of a sphere, tube, spot, beam or aimed light; on the GPU, a blurred shared forward
+time, the triangle's area then in every density, on both devices. *Stretched balls and tubes
+(0.428.0, done):* a sphere or tube light an uneven scale or its keys stretch is an emissive mesh.
+Open: an uneven stretch of a spot, beam or aimed light; on the GPU, a blurred shared forward
 flight, and a moving scene's shared mode M map.
 
 **Stage C, motion vectors and depth (0.411.0, done):** `-write-aovs` writes the guide pass's

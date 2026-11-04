@@ -10174,7 +10174,7 @@ sees the instant, exactly as a static scene with those transforms would show it.
   that is not the run's lone mode-M camera with a map of its own (`mBlurApart` in the camera
   routing: shared with other mode-M cameras, `-savemap` / `-loadmap`, or `-preview`'s CPU
   driver). `-radcache` is off under a blur. What cannot move yet stays put and
-  says so (`stillWarning`): a sun or sky, and a sphere, tube, spot, beam or aimed light whose
+  says so (`stillWarning`): a sun or sky, and a spot, beam or aimed light whose
   keys stretch it unevenly, stay at the instant with their surfaces, so nothing mixes a moved surface
   with an unmoved sampler. A coat whose strands move is traced as strands when some camera
   may see it at another time (`anyCameraTimed`: any camera with an open shutter, in whatever
@@ -10184,7 +10184,10 @@ sees the instant, exactly as a static scene with those transforms would show it.
 - **Lights that scale** (0.426.0; `MotionKeys::shape`). `moveChildren` classes a set's keys as
   rigid, similarities (MᵀM = s²I each) or any affine, and moves a child's lights if each can
   under them: every light under similarities, only a flat panel (not aimed, not a beam) or an
-  emissive mesh under any affine. A light keeps its radiance and its samplers still run at the
+  emissive mesh under any affine. A ball or tube light such keys would stretch is built as an
+  emissive mesh (0.428.0; `addLight` under `sphereAsMesh_`, its tessellation `addSphere`'s and its
+  wall's with smooth normals, `power` over the mesh's area: `addLightMesh`), as one an uneven
+  static scale stretches is, so it moves with them. A light keeps its radiance and its samplers still run at the
   instant; what they measure is carried: an area by `Scene::lightAreaScale` (|det D| / |Dᵀ n|
   about the carried normal n, s² under a similarity) -- in every area density (backward NEE, the
   emission-on-hit density, BDPT's light origin, its s = 1 connection, VCM's light subpath and

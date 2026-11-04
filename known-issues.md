@@ -214,15 +214,18 @@ Fixed by putting a moving ball's sample on its moved surface, `Scene::lightSpher
 carried normal from the moved centre, at the moved radius), and the device's alike
 (`dLightSphereOut`); the lone-lights test now holds a turning ball.
 
-## OPEN (2026-11-03, 0.410.0): MOTION-LIGHT-RIGID — a sphere, tube, spot, beam or aimed light its keys stretch unevenly, and a sun or sky in a moving group, stay at the instant
+## OPEN (2026-11-03, 0.410.0): MOTION-LIGHT-RIGID — a spot, beam or aimed light its keys stretch unevenly, and a sun or sky in a moving group, stay at the instant
 
 **Lights that scale move since 0.426.0** (`MotionKeys::shape`, `Scene::lightAreaScale`): every
 light under keys that scale it uniformly, and a flat panel or an emissive mesh under any affine
 (an uneven stretch, a shear), each keeping its radiance with its area carried in every density
-and photon power. What stays: a sphere, tube, spot, beam or aimed panel under an uneven stretch
-(its shape stops being one its sampler knows: an ellipsoid, an elliptic tube, a skewed cone).
-Proper fix: build a stretched sphere or tube light as an emissive mesh, as a stretched sphere
-already loads as a mesh, and give a spot's cone and an aim a frame the stretch carries.
+and photon power. **A stretched ball or tube light moves since 0.428.0:** it is built as an
+emissive mesh (an ellipsoid, an elliptic tube), as a stretched sphere already loaded as a mesh,
+under an uneven static scale too, which had been refused. What stays: a spot, beam or aimed panel
+under an uneven stretch (a skewed cone, a sheared beam, an aim its face no longer frames). Proper
+fix: give a spot's cone, a beam's direction and an aim a frame the stretch carries -- the query
+direction taken back by D^-1, the sampled one out by D, each density divided by the direction
+map's Jacobian |det D| / |D w|^3.
 
 **An aimed area light moves since 0.425.0** (`Scene::aimCosNow` and kin; the third kind below,
 kept for the record). That change also found mode U leaving moving lights at the instant: the

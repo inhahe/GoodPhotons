@@ -7595,7 +7595,8 @@ private:
         }
         // A child's lights move if every one of them can under these keys: any light under rigid
         // keys or similarities (a sun or sky never, above), and under any other affine a flat
-        // light only -- a panel that does not aim or fire a beam, or an emissive mesh. A child
+        // light only -- a panel that does not aim or fire a beam, or an emissive mesh, which a
+        // sphere or tube light such keys stretch is built as (addLight, sphereAsMesh_). A child
         // that cannot stays at the instant, its surfaces with it.
         auto lightCan = [&](const Emitter& e) {
             if (shape != kMotionAffine) return true;
@@ -7609,10 +7610,10 @@ private:
                 if (!lightCan(S.emitters[i])) litMoves[k] = 0;
             anyLitMoves = anyLitMoves || litMoves[k];
             if (!litMoves[k] && stillWarned_.insert("a light stretched").second)
-                std::fprintf(stderr, "[ftsl] warning: a sphere, tube, spot, beam or aimed light in a moving group "
-                                     "whose keys stretch it unevenly stays where it is at the frame's instant, "
-                                     "with its surface -- under such keys only a flat panel or an emissive mesh "
-                                     "moves (ROADMAP 11)\n");
+                std::fprintf(stderr, "[ftsl] warning: a spot, beam or aimed light in a moving group whose keys "
+                                     "stretch it unevenly stays where it is at the frame's instant, with its "
+                                     "surface -- under such keys a panel, a ball, a tube and an emissive mesh "
+                                     "move (ROADMAP 11)\n");
         }
         // Nothing takes the keys (every mover a light they would stretch): no set, so a scene where
         // nothing moves is not one with motion.
@@ -8122,6 +8123,21 @@ private:
         return true;
     }
 
+    // A sphere or tube light built as the emissive triangles [t0, end) of material `id` (addLight):
+    // its `power` or `lumens` taken over their area, the radiance given to the material, the
+    // triangles registered as a mesh light.
+    bool addLightMesh(const Block& b, Loaded& L, const Spectrum& spd, size_t t0, int id) {
+        double area = 0.0;
+        for (size_t i = t0; i < L.scene.tris.size(); ++i) {
+            const Tri& tr = L.scene.tris[i];
+            area += 0.5 * length(cross(tr.v1 - tr.v0, tr.v2 - tr.v0));
+        }
+        const Spectrum emit = absPower(b, spd, area * PI, L);
+        L.scene.mats[(size_t)id].emit = emit;
+        L.scene.addMeshLight(t0, L.scene.tris.size() - t0, emit, binWidth_, id);
+        return true;
+    }
+
     // Each `light` block registers one Emitter. Multiple light blocks accumulate;
     // the forward tracer selects among them power-weighted and the backward
     // reference sums over them (see scene.h / render.h / backward.h).
@@ -8179,8 +8195,18 @@ private:
             // Spherical area light: a glowing ball. Also add an emissive sphere to
             // geometry so photons that strike it are absorbed and it is visible in
             // the photon-catch camera modes (mirrors the area-light quad below).
-            if (nonUniform) { fail("sphere light under non-uniform scale would be an ellipsoid; use uniform scale"); return false; }
             Vec3 c{0.5, 0.7, 0.5}; vec3Of(b, "center", c);
+            // An uneven scale makes it an ellipsoid, and a moving group whose keys scale it
+            // unevenly (sphereAsMesh_) one at some time: an emissive mesh, which a light sampler
+            // and any affine motion both take (Scene::addMeshLight), as addSphere tessellates
+            // such a sphere.
+            if (nonUniform || sphereAsMesh_) {
+                Material lm; lm.reflect = constantSpectrum(0.0); lm.isLight = true; lm.reflectsNothing = true;
+                const int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
+                const size_t t0 = L.scene.tris.size();
+                addTessellatedSphere(L, xf, c, radiusOf(b, "sphere light", 0.1), id);
+                return addLightMesh(b, L, spd, t0, id);
+            }
             double rad = Len(radiusOf(b, "sphere light", 0.1)) * s;
             Vec3 cw = P(xf.apply(c));
             spd = absPower(b, spd, (4.0 * PI * rad * rad) * PI, L);
@@ -8202,15 +8228,47 @@ private:
             // light drops an emissive sphere into geometry). `center` is the tube
             // midpoint, `axis` its direction (default +Y), `length`/`radius` its size,
             // and `segments` (default 48) the wall tessellation fineness.
-            if (nonUniform) { fail("cylinder light under non-uniform scale would be an elliptic cylinder; use uniform scale"); return false; }
             Vec3 c{0.5, 0.5, 0.5}; vec3Of(b, "center", c);
             Vec3 dir{0, 1, 0}; vec3Of(b, "axis", dir);
-            double len = Len(dblOf(b, "length", 0.5)) * s;
-            double rad = Len(radiusOf(b, "cylinder light", 0.05)) * s;
             int segs = (int)dblOf(b, "segments", 48.0);
             if (segs < 3) segs = 3;
             std::string capsStr = strOf(b, "caps", "off");
             bool caps = (capsStr == "on" || capsStr == "true" || capsStr == "yes");
+            // An uneven scale makes it an elliptic tube, and a moving group whose keys scale it
+            // unevenly (sphereAsMesh_) one at some time: the same wall (and caps) as an emissive
+            // mesh, built where the group puts it, its normals by the inverse transpose.
+            if (nonUniform || sphereAsMesh_) {
+                Material lm; lm.reflect = constantSpectrum(0.0); lm.isLight = true; lm.reflectsNothing = true;
+                const int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
+                const size_t t0 = L.scene.tris.size();
+                const double lenL = dblOf(b, "length", 0.5), radL = radiusOf(b, "cylinder light", 0.05);
+                const Vec3 au = normalize(dir);
+                Vec3 t, bt; onb(au, t, bt);
+                const Vec3 base = c - au * (lenL * 0.5);
+                auto at = [&](const Vec3& p) { return P(xf.apply(p)); };
+                auto nrm = [&](const Vec3& n) { return normalize(xf.applyNormal(n)); };
+                auto tri = [&](const Vec3& p0, const Vec3& p1, const Vec3& p2, const Vec3& n0, const Vec3& n1,
+                               const Vec3& n2) {
+                    Tri tr{at(p0), at(p1), at(p2), id, -1, {}};
+                    tr.n0 = nrm(n0); tr.n1 = nrm(n1); tr.n2 = nrm(n2);
+                    L.scene.tris.push_back(tr);
+                };
+                for (int i = 0; i < segs; ++i) {
+                    const double a0 = 2.0 * PI * i / segs, a1 = 2.0 * PI * (i + 1) / segs;
+                    const Vec3 r0 = t * std::cos(a0) + bt * std::sin(a0), r1 = t * std::cos(a1) + bt * std::sin(a1);
+                    const Vec3 b0 = base + r0 * radL, b1 = base + r1 * radL;
+                    const Vec3 p0 = b0 + au * lenL, p1 = b1 + au * lenL;
+                    tri(b0, b1, p1, r0, r1, r1);   // outward winding, as the wall below
+                    tri(b0, p1, p0, r0, r1, r0);
+                    if (caps) {
+                        tri(b1, b0, base, au * -1.0, au * -1.0, au * -1.0);
+                        tri(p0, p1, base + au * lenL, au, au, au);
+                    }
+                }
+                return addLightMesh(b, L, spd, t0, id);
+            }
+            double len = Len(dblOf(b, "length", 0.5)) * s;
+            double rad = Len(radiusOf(b, "cylinder light", 0.05)) * s;
             double cylArea = 2.0 * PI * rad * len + (caps ? 2.0 * PI * rad * rad : 0.0);
             spd = absPower(b, spd, cylArea * PI, L);
             Vec3 axisW = normalize(xf.applyDir(dir)) * len;   // world axis vector (|.| = len)
