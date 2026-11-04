@@ -3192,11 +3192,17 @@ size.)
   surface, and an analytic `sphere`'s UV map turns with its keys. For a pattern that also stays on
   its object from one frame of an animation to the next, give the group `pattern_space object`
   (§13).
-- **Which modes blur:** modes R (and W), D, A, B and C, on the CPU. On `-device gpu` a blurred
-  render stays on the CPU and says so. Every other mode renders the frame's instant and prints one
-  note: M, S, U and J share light data across paths (photon maps, merges), which paths at
-  different times cannot share, P chooses each pixel's estimator from where things stand at the
-  instant, and V renders P's two halves (ROADMAP 11 lists the rest). In mode B a connection through a glass or mirror
+- **Which modes blur:** modes R (and W), D, A, B and C, and M, S, U and J (since 0.414.0), on
+  the CPU. On `-device gpu` a blurred render stays on the CPU and says so. M, S, U and J share
+  light data across paths, so in a moving scene each of their epochs (M, J) or passes (S, U) is
+  rendered at one time, spread evenly over the shutter, and their average is the blur. Modes M
+  and J then redraw their light side at least 64 times over the render, even under
+  `-beamfreeze`, and a mode J camera shares no realization with another camera. A camera moving
+  through a still scene keeps the maps of M and S timeless, and each sample poses the camera at
+  its own time. Modes U and J still take one time a pass or an epoch, since their light paths are
+  traced for the camera. Mode P renders the frame's instant and prints one note: it chooses each pixel's
+  estimator from where things stand at the instant. V renders P's two halves (ROADMAP 11 lists
+  the rest). In mode B a connection through a glass or mirror
   sphere follows the sphere, and one through a mirror plane follows the plane, unless its faces
   move differently (then that connection is skipped under a shutter). Several mode A or B
   cameras rendered together share one forward flight per shutter.

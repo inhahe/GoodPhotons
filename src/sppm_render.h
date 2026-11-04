@@ -266,17 +266,32 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
     // the whole of the flag for mode `S` (0 by default, so XOR is the identity).
     passSeed ^= g_rngSalt;
     const int W = st.resX, H = st.resY;
+    // Motion blur (ROADMAP 11). A moving scene's pass -- visible points, photons and gather -- is
+    // at one time, stratified over the passes (passTime), the camera posed there: the passes'
+    // average integrates the shutter, as SPPM averages every other dimension. A moving camera
+    // over a still scene leaves the photons timeless and poses each pixel's ray at its own time.
+    const bool passTimed = cam.timed() && scene.hasMotion();
+    const double tPass = passTimed ? cam.shutterTime(passTime((uint64_t)st.passes, 0x2545F4914F6CDD1DULL)) : 0.0;
+    const PassTimeScope passAt(passTimed ? scene.motionU(tPass) : -1.0);
+    Camera camAt = cam;
+    if (passTimed && cam.moves()) cam.poseAt(tPass, camAt);
+    const bool perPixel = !passTimed && cam.timed() && cam.moves();
 
     // (1) Camera pass — fresh visible point + direct sample per pixel this pass.
     {
         auto camWorker = [&](int tid) {
+            const MotionTimeScope at(g_passMotionU);
+            PosedCamera posed(camAt, perPixel);
             Pcg32 rng; rng.seed(passSeed * 0x9E3779B97F4A7C15ULL + (uint64_t)tid * 2 + 23,
                                 0xA24BAED4963EE407ULL ^ (uint64_t)tid ^ (passSeed << 1));
             int y0 = H * tid / nThreads, y1 = H * (tid + 1) / nThreads;
             for (int y = y0; y < y1; ++y)
                 for (int x = 0; x < W; ++x) {
                     SPPMPixel& P = st.px[(size_t)y * W + x];
-                    Ray ray = cam.genRay(x, y, rng.uniform(), rng.uniform());
+                    const Camera& c = perPixel ? posed.at(cam.shutterTime(unitTime(
+                                          ((uint64_t)st.passes << 32) ^ ((uint64_t)y * W + x), 0x6C62272E07BB0142ULL)))
+                                               : camAt;
+                    Ray ray = c.genRay(x, y, rng.uniform(), rng.uniform());
                     Vec3 directL;
                     sppmVisiblePoint(scene, ray, rng, diffraction, maxBounce,
                                      P.vpHit, P.vpThr, P.vpValid, directL);
@@ -305,6 +320,7 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
 
     // (3) Gather + progressive update, parallel over pixels (each pixel is independent).
     auto gatherWorker = [&](int tid) {
+        const MotionTimeScope at(g_passMotionU);   // the visible points' patterns, at their time
         int y0 = H * tid / nThreads, y1 = H * (tid + 1) / nThreads;
         for (int y = y0; y < y1; ++y)
             for (int x = 0; x < W; ++x) {

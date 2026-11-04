@@ -15013,7 +15013,7 @@ static const char* const kMotionCpuWhy =
     "motion blur (a shutter on something that moves) renders on the CPU so far";
 // Whether mode `m` carries motion blur: each of its paths, or photons, is one time in the
 // shutter. Any other mode renders the frame's instant (run closes the shutter for it).
-static bool modeSeesMotion(char m) { return m != 0 && std::strchr("RDABC", m) != nullptr; }
+static bool modeSeesMotion(char m) { return m != 0 && std::strchr("RDABCMSUJ", m) != nullptr; }
 // Whether any camera of `L` may render at a time other than the instant: its shutter open.
 // Which mode it renders in is not asked -- a lens, a routing or -on-unsupported may change it
 // after this -- so a shutter counts in any mode; at worst a mode that closes it keeps strands it
@@ -19520,13 +19520,40 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // A frame of a flight is one of a sequence whatever this run renders of it, so a frame
         // re-rendered alone (`-frames 9 9`) draws the realizations its neighbours did.
         const bool budgetedJ = timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever;
+        // Motion blur (ROADMAP 11): each light-side realization, and the samples rendered against
+        // it, at one time (passTime over the epochs, the camera posed there) -- kBlurEpochsJ fixed
+        // epochs of a fixed -spp, or the clock's under a budget, each then capped to a few samples
+        // -- so the epochs' average integrates the shutter. Nothing is shared across cameras then,
+        // and -beamfreeze is set aside. A moving camera over a still scene too: the light pass
+        // traces its subpaths for the camera (their merge weights are the camera's), so a sample
+        // posed elsewhere would weigh its merges against another camera's -- measured, 10 blocks
+        // off mode R where the still camera's render is 2.
+        const bool blurEpochsJ = cam.seesMotion(scene) && (wantBeams || wantSurf);
+        constexpr long long kBlurEpochsJ = 64;
+        Camera camEpochJ = cam;
+        std::unique_ptr<PassTimeScope> epochTimeJ;
+        const auto atEpochJ = [&](uint64_t e, uint64_t saltOff) {
+            if (!blurEpochsJ) return;
+            const double t = cam.shutterTime(passTime(e, 0x2F2B0F8D2C6B1B03ULL ^ saltOff));
+            epochTimeJ.reset();
+            epochTimeJ = std::make_unique<PassTimeScope>(scene.motionU(t));
+            camEpochJ = cam;
+            if (cam.moves()) cam.poseAt(t, camEpochJ);
+        };
+        const bool othersWouldShare = batch && (batch->framesDJ > 1 || g_beamFreeze);
+        if (blurEpochsJ && (g_beamFreeze || othersWouldShare))
+            std::printf("mode J: under a blur each light side is one time in the shutter, so it is "
+                        "redrawn every epoch%s%s\n",
+                        g_beamFreeze ? " (-beamfreeze set aside)" : "",
+                        othersWouldShare ? ", and no camera shares another's" : "");
         const bool inFlight  = batch && batch->flightN > 1;
         const bool perSample = g_beamEpochs == kBeamEpochsSpp || (g_beamEpochs == 0 && inFlight);
         const bool epochsAsked  = g_beamEpochs > 0 || perSample;
-        const bool epochsWanted = epochsAsked && !g_beamFreeze && !budgetedJ && (wantBeams || wantSurf);
-        const bool shareFrozen = batch && g_beamFreeze;
+        const bool epochsWanted = ((epochsAsked && !g_beamFreeze) || blurEpochsJ) && !budgetedJ &&
+                                  (wantBeams || wantSurf);
+        const bool shareFrozen = batch && g_beamFreeze && !blurEpochsJ;
         // Kept only where another camera of the batch will render them.
-        const bool shareEpochs = batch && batch->framesDJ > 1 && epochsWanted;
+        const bool shareEpochs = batch && batch->framesDJ > 1 && epochsWanted && !blurEpochsJ;
         BatchCache jlocal;
         BatchCache& jlc = (shareFrozen || shareEpochs) ? *batch : jlocal;
         BeamMap&       bmap = jlc.bmap;
@@ -19649,7 +19676,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 // necessarily epoch 1.
                 const bool firstRedraw = !refreshSaid;
                 refreshSaid = true;
-                if (firstRedraw && fixedEpochsOn)
+                if (firstRedraw && blurEpochsJ)
+                    std::printf("mode J: light-side refresh — redrawing %lld subpaths for each epoch, "
+                                "each at its own time in the shutter, and averaging them ...\n", Nepoch);
+                else if (firstRedraw && fixedEpochsOn)
                     std::printf("mode J: light-side refresh — redrawing %lld subpaths under the "
                                 "fixed salt of each epoch and averaging the realizations "
                                 "(-beamepochs) ...\n", Nepoch);
@@ -19797,6 +19827,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 }
             }
             const auto tb = std::chrono::steady_clock::now();
+            atEpochJ(e, saltOff);   // under a blur, the realization's (and its samples') time
             buildLightSide(e, saltOff);
             const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tb).count();
             curB = &bmap; curS = &smap;
@@ -19877,13 +19908,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // `dMisWeight` takes `mergeKappa` AND `kappaSurf`, and there is no such gate (nor
             // was there one at the time this was written -- `g_jSurfExplicit` was never read).
             // `photonsPtr` below is what carries the surface map to the device.
-            if (useGpu) return renderBdptCuda(scene, cam, res, resY, sppTarget, maxDepth,
+            if (useGpu) return renderBdptCuda(scene, camEpochJ, res, resY, sppTarget, maxDepth,
                                               diffraction, p, g_heroC, beamsPtr, &stageProg,
                                               photonsPtr, held);
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
-                    return renderBdpt(scene, cam, res, resY, c, nThreads, maxDepth,
+                    return renderBdpt(scene, camEpochJ, res, resY, c, nThreads, maxDepth,
                                       diffraction, off, beamsPtr, photonsPtr);
                 });
         };
@@ -19918,7 +19949,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         }
         // The batch's epoch note, once (or once per render for a single camera, whose cache is
         // its own). One realization per sample is announced when its K is known (renderChunked).
-        if (fixedEpochs && !perSample && !jlc.epochsSaid) {
+        if (fixedEpochs && !perSample && !blurEpochsJ && !jlc.epochsSaid) {
             jlc.epochsSaid = true;
             const long long nEp = wholeEpochs(spp, g_beamEpochs);
             std::printf("mode J: -beamepochs %d: each camera's samples split into %lld equal "
@@ -19962,7 +19993,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 #else
             const CudaSceneHold* const held = nullptr;
 #endif
-            if ((!beamsPtr && !photonsPtr) || g_beamFreeze || !prog || !prog->report)
+            if ((!beamsPtr && !photonsPtr) || (g_beamFreeze && !blurEpochsJ) || !prog || !prog->report)
                 return renderEpoch(sppTarget, prog, held);
             using clk = std::chrono::steady_clock;
             Film acc; acc.resX = res; acc.resY = resY; acc.alloc();
@@ -19986,7 +20017,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             long long nFixed = 0;
             bool decideK = false;
             if (fixedEpochs) {
-                if (!perSample)          nFixed = std::min<long long>(g_beamEpochs, total);
+                if (blurEpochsJ)         nFixed = std::min<long long>(kBlurEpochsJ, total);
+                else if (!perSample)     nFixed = std::min<long long>(g_beamEpochs, total);
                 else if (jlc.autoK > 0)  nFixed = std::min<long long>(jlc.autoK, total);
                 else {
                     nFixed  = total;
@@ -19997,7 +20029,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             }
             if (nFixed) nFixed = wholeEpochs(total, nFixed);
             long long epLen = nFixed ? (total + nFixed - 1) / nFixed : 0;
-            if (fixedEpochs && perSample && !jlc.epochsSaid) {
+            if (fixedEpochs && perSample && !blurEpochsJ && !jlc.epochsSaid) {
                 jlc.epochsSaid = true;
                 std::printf("mode J: one light-side realization per sample (K = %lld%s)%s: every "
                             "camera renders the same ones, so the light-side noise holds still from "
@@ -20105,6 +20137,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     reportSec += std::chrono::duration<double>(clk::now() - tRep).count();
                     if (stopNow) { stopAll = true; return true; }
                     if (nFixed) return false;       // a fixed epoch runs its whole share
+                    // A blurred moving scene's clock epoch (a budget has no total to split) ends
+                    // after a few samples, so the shutter is sampled by many epochs.
+                    if (blurEpochsJ) return sppDone >= 4;
                     // Not a stop — just the end of this epoch, so the next one draws a new map.
                     return std::chrono::duration<double>(clk::now() - tEpoch).count() >= epochSec;
                 };
@@ -20234,6 +20269,27 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // rebuildPhotonMapAt for why re-adapting per epoch would not be.
         const double radius0 = radius;
         double radiusC = 0.0, kGatherC = 0.0;
+        // Motion blur of a moving scene (ROADMAP 11): each epoch's light side and gather are at
+        // one time (passTime over the epochs, the camera posed there), so the epochs' average
+        // integrates the shutter -- which needs epochs enough to sample it: at most
+        // kBlurEpochs-th of the samples each. A moving camera over a still scene needs none of
+        // this: its maps are timeless, and the gather poses each sample (renderPhotonCamera).
+        const bool blurEpochs = cam.seesMotion(scene) && scene.hasMotion();
+        constexpr long long kBlurEpochs = 64;
+        Camera camEpoch = cam;
+        uint64_t epochSaltOff = 0;
+        std::unique_ptr<PassTimeScope> epochTime;
+        const auto atEpoch = [&](uint64_t epoch) {
+            if (!blurEpochs) return;
+            const double t = cam.shutterTime(passTime(epoch, 0x7FB5D329728EA185ULL ^ epochSaltOff));
+            epochTime.reset();
+            epochTime = std::make_unique<PassTimeScope>(scene.motionU(t));
+            camEpoch = cam;
+            if (cam.moves()) cam.poseAt(t, camEpoch);
+        };
+        if (blurEpochs && g_beamFreeze)
+            std::printf("mode M: -beamfreeze is set aside under a blur of a moving scene: each light "
+                        "side is one time in the shutter, so the epochs must refresh\n");
         // THE LIGHT SIDE AS A FUNCTION OF THE EPOCH, rather than a one-off (0.252.0). This is
         // the same fix mode J got in 0.247.0 (UPBP-THICK), applied to the mode that needed it
         // at least as badly — see g_beamFreeze and known-issues.md "M-FROZEN".
@@ -20294,6 +20350,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                              /*quiet*/!first, &scene);
             }
         };
+        atEpoch(0);
         buildLightSide(0);
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("mode M: deposited %zu photons from %lld emitted in %s; "
@@ -20306,7 +20363,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         auto renderEpoch = [&](long long sppTarget, const SppProgress* p) -> Film {
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
-                    return renderPhotonCamera(scene, cam, res, resY, pm, c, nThreads,
+                    return renderPhotonCamera(scene, camEpoch, res, resY, pm, c, nThreads,
                                               diffraction, effMaxBounce(), off, g_pmFinalGather,
                                               wantBeams ? &bmap : nullptr,
                                               g_pmCaustics ? &pmC : nullptr);
@@ -20318,16 +20375,20 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // ones, via `sampleBase`; and the outer reporter must always see the WHOLE film so the
         // live image, the noise estimate and the checkpoint stay in terms of total spp).
         auto renderChunked = [&](long long sppTarget, const SppProgress* prog) -> Film {
-            if (g_beamFreeze || !prog || !prog->report) return renderEpoch(sppTarget, prog);
+            if (!blurEpochs && (g_beamFreeze || !prog || !prog->report)) return renderEpoch(sppTarget, prog);
             using clk = std::chrono::steady_clock;
             Film acc; acc.resX = res; acc.resY = resY; acc.alloc();
             long long sppAll = 0;
             bool stopAll = false;
             uint64_t epoch = 0;
+            // Under a blur, how many samples an epoch may take: enough epochs to sample the shutter.
+            const long long blurEpochSpp = std::max(1LL, sppTarget / kBlurEpochs);
+            if (blurEpochs) epochSaltOff = prog ? (uint64_t)prog->sampleBase : 0ull;
             for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
                 double rebuildSec = 0.0;
-                if (epoch > 0) {
+                if (epoch > 0 || (blurEpochs && epochSaltOff)) {
                     auto tr = clk::now();
+                    atEpoch(epoch);
                     buildLightSide(epoch, prog ? (uint64_t)prog->sampleBase : 0ull);
                     rebuildSec = std::chrono::duration<double>(clk::now() - tr).count();
                     // A refresh that came back empty would leave the gather pointing at empty
@@ -20367,7 +20428,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 double epochSec = 0.0;
                 long long epochSpp = 0;
                 SppProgress inner;
-                inner.sampleBase = prog->sampleBase + sppAll;
+                inner.sampleBase = (prog ? prog->sampleBase : 0) + sppAll;
                 inner.report = [&](const Film& f, long long sppDone, bool final) -> bool {
                     if (epochSec <= 0.0) {
                         const double setupSec =
@@ -20378,11 +20439,17 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     epochSpp = sppDone;
                     Film comb = f; comb.merge(acc);
                     const long long tot = sppAll + sppDone;
-                    if (prog->report(comb, tot, final && tot >= sppTarget)) { stopAll = true; return true; }
-                    // Not a stop — just the end of this epoch, so the next one draws new maps.
+                    if (prog && prog->report && prog->report(comb, tot, final && tot >= sppTarget)) {
+                        stopAll = true;
+                        return true;
+                    }
+                    // Not a stop — just the end of this epoch, so the next one draws new maps (at
+                    // its own time, under a blur, once this one has its share of the samples).
+                    if (blurEpochs) return sppDone >= blurEpochSpp;
                     return std::chrono::duration<double>(clk::now() - tEpoch).count() >= epochSec;
                 };
-                Film f = renderEpoch(sppTarget - sppAll, &inner);
+                Film f = renderEpoch(blurEpochs ? std::min(sppTarget - sppAll, blurEpochSpp) : sppTarget - sppAll,
+                                     &inner);
                 if (epochSpp <= 0) break;      // produced nothing; refreshing again cannot help
                 acc.merge(f);
                 sppAll += epochSpp;
@@ -20435,7 +20502,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         {
             const bool wantGpu  = !std::strcmp(device, "gpu");
             const bool wantAuto = !std::strcmp(device, "auto");
-            if ((wantGpu || wantAuto) && !cam.hasLens() &&
+            if ((wantGpu || wantAuto) && !cam.hasLens() && !cam.seesMotion(scene) &&
                 cudaAvailable() && cudaSppmSupported(scene)) {
                 SppmSession* sess = sppmSessionBegin(scene, cam, res, resY, R0, diffraction,
                                                      effMaxBounce(), g_heroC);
@@ -20464,6 +20531,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 std::fprintf(stderr, "[device] SPPM GPU session failed to start; using CPU\n");
             } else if (wantGpu) {
                 const char* why = cam.hasLens()        ? "a physical-lens camera (pinhole only)"
+                                : cam.seesMotion(scene) ? kMotionCpuWhy
                                 : !cudaAvailable()     ? "no CUDA device found"
                                 : "a GPU-unsupported scene feature";
                 std::fprintf(stderr, "[device] mode S GPU path unavailable (%s); using CPU\n", why);
@@ -20530,7 +20598,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         {
             const bool wantGpu  = !std::strcmp(device, "gpu");
             const bool wantAuto = !std::strcmp(device, "auto");
-            if ((wantGpu || wantAuto) && !cam.hasLens() &&
+            if ((wantGpu || wantAuto) && !cam.hasLens() && !cam.seesMotion(scene) &&
                 cudaAvailable() && cudaVcmSupported(scene)) {
                 VcmSession* sess = vcmSessionBegin(scene, cam, res, resY, diffraction, maxEdges,
                                                    vcmHeroC);
@@ -20565,6 +20633,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 std::fprintf(stderr, "[device] VCM GPU session failed to start; using CPU\n");
             } else if (wantGpu) {
                 const char* why = cam.hasLens()        ? "a physical-lens camera (pinhole only)"
+                                : cam.seesMotion(scene) ? kMotionCpuWhy
                                 : !cudaAvailable()     ? "no CUDA device found"
                                 : "a GPU-unsupported scene feature";
                 std::fprintf(stderr, "[device] mode U GPU path unavailable (%s); using CPU\n", why);
@@ -24163,16 +24232,16 @@ static int run(int argc, char** argv) {
             // above): its routed mode, or the mode it falls back to -- before anything below
             // reads the mode (the aperture term is mode B's).
             cmode = resolved[si];
-            // Motion blur reaches modes R (and W), D, A, B and C so far (ROADMAP 11): a mode whose
-            // estimator shares light data across paths (M, S, U, J), or picks per pixel from a
-            // classification made at the instant (P), renders the frame's instant, its shutter
-            // closed here so no part of it blurs while the rest does not.
+            // Motion blur reaches modes R (and W), D, A, B, C, M, S, U and J so far (ROADMAP 11;
+            // M, S, U and J an epoch or pass at a time): mode P, which picks per pixel from a
+            // classification made at the instant, renders the frame's instant, its shutter closed
+            // here so no part of it blurs while the rest does not.
             if (c.seesMotion(scene) && !modeSeesMotion(cmode)) {
                 static uint64_t saidFor = 0;   // once per scene, not per frame of a path
                 if (saidFor != scene.generation) {
                     saidFor = scene.generation;
                     std::printf("[motion] camera '%s': mode %c renders the frame's instant -- only "
-                                "modes R, W, D, A, B and C see motion so far\n", cs->name.c_str(), cmode);
+                                "modes R, W, D, A, B, C, M, S, U and J see motion so far\n", cs->name.c_str(), cmode);
                 }
                 c.shutterOpen = c.shutterClose = 0.0;
             }
@@ -27578,7 +27647,7 @@ static int run(int argc, char** argv) {
                    cudaAvailable() && cudaPhotonMapSupported(scene);
     if (budgetedGpuM)
         for (const RenderCam& rc : toRender)
-            if (rc.mode == 'M' && rc.cam.hasLens()) budgetedGpuM = false;
+            if (rc.mode == 'M' && (rc.cam.hasLens() || rc.cam.seesMotion(scene))) budgetedGpuM = false;
 #endif
     // Shared forward flights, mode B's and mode A's. A flight draws one shutter time per photon for
     // all its cameras, so cameras share one only when they share a shutter, or when neither sees
@@ -27616,7 +27685,8 @@ static int run(int argc, char** argv) {
         // gather is an independent backward pass per camera, so frames don't share noise —
         // only the underlying radiance solution. That makes it safe to share even across
         // exposure-locked camera_path frames, so it isn't gated on `expGroup < 0`.
-        else if (rc.mode == 'M' && (plainRender || budgetedGpuM))            groupM.push_back(i);
+        else if (rc.mode == 'M' && (plainRender || budgetedGpuM) &&
+                 !(rc.cam.seesMotion(scene) && scene.hasMotion()))              groupM.push_back(i);
         else {
             // A mode-M camera reaching here under a budget is the silent-CPU case warned
             // about below. Lens cameras are excluded because they would never have had the
@@ -28096,8 +28166,13 @@ static int run(int argc, char** argv) {
         {
             const bool wantGpu  = !std::strcmp(device, "gpu");
             const bool wantAuto = !std::strcmp(device, "auto");
-            bool allPinhole = true;
-            for (int i : idx) if (toRender[i].cam.hasLens()) allPinhole = false;
+            bool allPinhole = true, anyBlur = false;
+            for (int i : idx) {
+                if (toRender[i].cam.hasLens()) allPinhole = false;
+                if (toRender[i].cam.seesMotion(scene)) anyBlur = true;
+            }
+            if (anyBlur && (wantGpu || wantAuto))
+                std::printf("[device] shared photon map: gathering on the CPU (%s)\n", kMotionCpuWhy);
             // -beams runs on the device now, deposit AND gather, with NO backend carve-out.
             // There deliberately is no GRIN fallback here: a gradient-index photon travels a
             // curve and so has no straight chord to store, but the CPU refuses that deposit on
@@ -28105,7 +28180,7 @@ static int run(int argc, char** argv) {
             // the per-medium `grin()` skip). Falling back would therefore buy a much slower
             // render of the *identical* image, which is a worse answer, not a safer one. The
             // user is told what is actually happening by warnBeamsGrinMedia() instead.
-            if ((wantGpu || wantAuto) && allPinhole &&
+            if ((wantGpu || wantAuto) && allPinhole && !anyBlur &&
                 cudaAvailable() && cudaPhotonMapSupported(scene)) {
                 volCacheHostGather() = true;    // 0.310.0: the device gather marches the cache too
                 g_windowBackend = backendLabel(true, nThreads);   // the title names the card

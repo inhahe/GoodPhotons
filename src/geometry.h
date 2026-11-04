@@ -200,6 +200,13 @@ struct Sphere {
 // the ~200 query sites stay as they are.
 inline thread_local double g_motionU = -1.0;
 
+// A whole pass's time, for the estimators that share light data across paths (photon maps,
+// SPPM, VCM's merges): under a blur of a moving scene each pass -- an epoch of mode M, a pass of
+// modes S and U -- is rendered at one time, and averaging the passes integrates the shutter. The
+// caller sets it before the pass's workers start and clears it after (PassTimeScope); each
+// worker opens a MotionTimeScope at it. Negative: no pass time.
+inline double g_passMotionU = -1.0;
+
 // Sets g_motionU for the lifetime of the scope (one path), restoring the previous value after.
 struct MotionTimeScope {
     double prev;
@@ -207,6 +214,15 @@ struct MotionTimeScope {
     ~MotionTimeScope() { g_motionU = prev; }
     MotionTimeScope(const MotionTimeScope&) = delete;
     MotionTimeScope& operator=(const MotionTimeScope&) = delete;
+};
+
+// Sets g_passMotionU for a pass (on the thread that starts its workers), clearing it after.
+struct PassTimeScope {
+    double prev;
+    explicit PassTimeScope(double u) : prev(g_passMotionU) { g_passMotionU = u; }
+    ~PassTimeScope() { g_passMotionU = prev; }
+    PassTimeScope(const PassTimeScope&) = delete;
+    PassTimeScope& operator=(const PassTimeScope&) = delete;
 };
 
 // A moving group's keys: `keys` (at least 2) transforms at increasing times through the scene's

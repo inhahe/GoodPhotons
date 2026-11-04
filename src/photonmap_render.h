@@ -784,6 +784,7 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
     std::atomic<long long> tracedTotal{0};
 
     auto worker = [&](int tid, bool aimed) {
+        const MotionTimeScope passAt(g_passMotionU);   // a blurred pass's one time, if any
         Renderer r; r.diffraction = diffraction; r.maxBounce = photonMaxBounce();
         if (aimed) {
             // Caustic-only pass: no global deposits (the global map is the main pass's and
@@ -1888,7 +1889,13 @@ inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, 
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     std::vector<Film> bands(nThreads);
     const uint64_t nPix = (uint64_t)resX * (uint64_t)resY;
+    // Under a blur: a moving scene's pass is at one time (g_passMotionU, the camera already posed
+    // there by the caller); a still scene seen by a moving camera keeps its maps timeless, and
+    // each sample poses the camera at a time of its own, as mode R does.
+    const bool perSample = cam.timed() && cam.moves() && g_passMotionU < 0.0;
     auto worker = [&](int tid) {
+        const MotionTimeScope passAt(g_passMotionU);
+        PosedCamera posed(cam, perSample);
         Film& f = bands[tid]; f.resX = resX; f.resY = resY; f.alloc();
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
         for (int py = y0; py < y1; ++py) {
@@ -1907,9 +1914,11 @@ inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, 
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)resX + (uint64_t)px;
                 for (long long s = 0; s < spp; ++s) {
                     Pcg32 rng;
-                    seedUnit(rng, (sampleBase + (uint64_t)s) * nPix + pixIdx,
-                             0xA24BAED4963EE407ULL);
-                    Ray ray = cam.genRay(px, py, rng.uniform(), rng.uniform());
+                    const uint64_t unit = (sampleBase + (uint64_t)s) * nPix + pixIdx;
+                    seedUnit(rng, unit, 0xA24BAED4963EE407ULL);
+                    const Camera& c = perSample ? posed.at(cam.shutterTime(unitTime(unit, 0x5851F42D4C957F2DULL)))
+                                                : cam;
+                    Ray ray = c.genRay(px, py, rng.uniform(), rng.uniform());
                     // STRATIFIED hero wavelength over this chunk's samples (0.314.0; device twin
                     // and the reasoning: kGather in render_cuda.cu). Per chunk rather than over
                     // the whole render because the chunk is all this call can see, and a chunk

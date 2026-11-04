@@ -10103,10 +10103,25 @@ sees the instant, exactly as a static scene with those transforms would show it.
   frame i at time t is the path at i + t). Keys that all agree are no motion. The resume guard
   mixes the keys. A key's `fov_y` changes the view only; the aperture and focus stay the
   instant's (known-issues MOTION-ZOOM-APERTURE).
+- **The modes that share light data across paths take one time a pass** (0.414.0): photons,
+  beams and merges serve many paths, which must then share their time. `g_passMotionU`
+  (geometry.h) is a pass's time, set by `PassTimeScope` on the thread that starts the pass and
+  opened by every worker as its `MotionTimeScope`; `passTime(k)` (rng.h, a rotated base-2
+  radical inverse) spreads any first k passes evenly over the shutter. Mode S's `sppmPass` and
+  mode U's `vcmPass` each take their pass count's time and pose the camera there. Mode M times
+  each epoch (`atEpoch`: light side and gather), ending an epoch after a 64th of the samples so
+  the shutter is sampled, and sets `-beamfreeze` aside. Mode J times each realization in
+  `realize` (`atEpochJ`), on 64 fixed epochs of a fixed `-spp` or the clock's under a budget, and
+  shares none across cameras. A camera moving over a still scene leaves M's and S's maps
+  timeless: their gathers pose each sample (`renderPhotonCamera`, `sppmPass`'s camera worker),
+  and a shared mode M map still serves several such cameras, gathered on the CPU. U and J take
+  one time a pass or epoch even then, because their light subpaths are traced for the camera
+  and their merges are weighted against it. Measured: J posed per sample read 10 blocks off mode
+  R, against 0 posed per epoch. The GPU sessions of S, U and M step aside under a blur.
 - **Where blur is not yet carried, the shutter is closed**, so no estimator mixes times: the
-  camera loop in `main.cpp` closes it for every mode `modeSeesMotion` does not name — M, S, U
-  and J (which share photons or merges across paths), P (whose per-pixel classification is made
-  at the instant, and whose backward half would otherwise blur alone), V — and the exposure
+  camera loop in `main.cpp` closes it for every mode `modeSeesMotion` does not name — P
+  (whose per-pixel classification is made at the instant, and whose backward half would
+  otherwise blur alone), V — and the exposure
   meter asks the same helper. The device renders the instant only, so `runRender`'s device
   choice, `renderForward`'s own device gate, the shared forward group and the exposure meter
   keep a blurred camera on the CPU (`kMotionCpuWhy`), and `-radcache` is off under a blur. What cannot move yet stays put and

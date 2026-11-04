@@ -39,8 +39,10 @@ cube whose keys scale and shear it together. It requires:
     So do two mode B cameras with the shutter rendered beside a third without it (one flight per
     shutter, on any device), the third staying sharp; and the sky mode B sees directly behind a
     dark ball sweeping across it.
-  * Under a shutter, `-device gpu` says mode R stays on the CPU, and mode M says it renders the
-    instant.
+  * Under a shutter, `-device gpu` says mode R stays on the CPU, and mode P says it renders the
+    instant. Modes M and J (an epoch at a time), S and U (a pass at a time) blur, agreeing with
+    blurred mode R within their density estimates' bias, and follow a moving camera as mode R
+    does.
   * The camera's own motion, in the box held still: a camera with `motion` keys and no shutter
     renders byte for byte the still camera at its keys' instant (CPU, and GPU); with the shutter,
     the mean of 32 renders from its poses through it (mode R; modes D and B agree with mode R),
@@ -637,6 +639,24 @@ def main():
         verdict("blurred mode %s = blurred mode R (8x8 blocks)" % mode, not bad.any(),
                 "worst block z %.1f rel %.3f; %d blocks out" % (z.max(), rel.max(), bad.sum()))
 
+    # --- the modes that share light data across paths blur too, each epoch (M) or pass (S, U) at
+    # one time: against blurred mode R, within their own bias (a density estimate's radius), and
+    # the blur really there ---
+    for mode, margs in (("M", ["-spp", "128", "-n", "2000000"]), ("S", ["-spp", "128", "-n", "200000"]),
+                        ("U", ["-spp", "256"]), ("J", ["-spp", "128", "-jsurf"])):
+        bm = [lum(render(exe, out, blurred, "blur_%s_s%d" % (mode, s),
+                         ["-mode", mode, "-device", "cpu"] + margs, seed=s)[0]) for s in (1, 2)]
+        mm = blocks((bm[0] + bm[1]) / 2)
+        err = np.hypot(block_err(lb[0], lb[1]), block_err(bm[0], bm[1]))
+        z = np.abs(mm - mb) / np.maximum(err, 1e-30)
+        rel = np.abs(mm - mb) / np.maximum(np.abs(mb), 1e-3 * np.abs(mb).max())
+        bad = (z > 5.0) & (rel > 0.10)
+        inst = blocks(lum(render(exe, out, static0, "instant_%s" % mode, ["-mode", mode, "-device", "cpu"] + margs)[0]))
+        moved = (np.abs(mm - inst) / np.maximum(inst, 1e-3 * inst.max()) > 0.10).sum()
+        verdict("blurred mode %s = blurred mode R, and blurs" % mode, not bad.any() and moved >= 8,
+                "worst block z %.1f rel %.3f; %d blocks out; %d blocks off the instant" %
+                (z.max(), rel.max(), bad.sum(), moved))
+
     # --- several mode B cameras in one run: two with the shutter share a flight and both blur,
     # one without it (declared first) renders apart and stays sharp. On any device. ---
     text = open(blurred, encoding="utf-8").read()
@@ -783,9 +803,9 @@ def main():
                        "-o", os.path.join(out, "gate.png")])
         verdict("-device gpu under a shutter says it stays on the CPU",
                 rc == 0 and "renders on the CPU so far" in log, log.strip()[-300:] if rc else "")
-    rc, log = run([exe, "-in", blurred, "-mode", "M", "-device", "cpu", "-n", "100000", "-no-meter",
-                   "-o", os.path.join(out, "modem.png")])
-    verdict("mode M under a shutter says it renders the instant",
+    rc, log = run([exe, "-in", blurred, "-mode", "P", "-device", "cpu", "-spp", "1", "-no-meter",
+                   "-o", os.path.join(out, "modep.png")])
+    verdict("mode P under a shutter says it renders the instant",
             rc == 0 and "renders the frame's instant" in log, log.strip()[-300:] if rc else "")
 
     light_and_haze_tests(exe, out, verdict, hair)
@@ -829,14 +849,14 @@ def light_and_haze_tests(exe, out, verdict, hair):
             "" if rc == 0 and "keys to follow" not in log else log.strip()[-300:])
 
     # Keys that move nothing (the only mover a light they would scale): no motion in the scene,
-    # so mode M under a shutter has no blur to say it drops.
+    # so mode P under a shutter has no blur to say it drops.
     p = os.path.join(out, "nomotion.ftsl")
     write(p, NL.join(["scene { units meters  motion_interval -0.5 0.5 }", 'material "w" { type diffuse reflect 0.5 }',
                       "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material w }",
                       STILL[1][1],
                       'camera "c" { eye 0 1 3  look_at 0 0.5 0  up 0 1 0  fov_y 40  shutter_open -0.5  '
                       'shutter_close 0.5  film { res 32 24 } }']) + NL)
-    rc, log = run([exe, "-in", p, "-mode", "M", "-device", "cpu", "-n", "20000", "-no-meter",
+    rc, log = run([exe, "-in", p, "-mode", "P", "-device", "cpu", "-spp", "1", "-no-meter",
                    "-o", os.path.join(out, "nomotion.png")])
     verdict("keys that move nothing are no motion", rc == 0 and "renders the frame's instant" not in log,
             log.strip()[-300:] if rc else "")
@@ -959,10 +979,15 @@ def camera_tests(exe, out, verdict, devices):
                                       "-spp", str(SPP_T)], seed=100 * j + s)[0]) / TIMES
     good, detail = agree(blur, mean)
     verdict("a moving camera blurs as the mean of its poses (mode R)", good, detail)
-    for mode, margs in (("D", ["-spp", "256"]), ("B", ["-n", "40000000"])):
+    for mode, margs, tol in (("D", ["-spp", "256"], 0.05), ("B", ["-n", "40000000"], 0.05),
+                             ("M", ["-spp", "128", "-n", "2000000"], 0.10),
+                             # SPPM's own density bias: 12.3 % in one block of this scene with the
+                             # camera still (S against R, 128 passes), 10.5 % blurred
+                             ("S", ["-spp", "128", "-n", "200000"], 0.15), ("U", ["-spp", "256"], 0.10),
+                             ("J", ["-spp", "128", "-jsurf"], 0.10)):
         bm = [lum(render(exe, out, moving, "cam_blur_%s_s%d" % (mode, s),
                          ["-mode", mode, "-device", "cpu"] + margs, seed=s)[0]) for s in (1, 2)]
-        good, detail = agree(bm, blur, 0.05)
+        good, detail = agree(bm, blur, tol)
         verdict("... mode %s = mode R" % mode, good, detail)
     if len(devices) > 1:
         rc, log = run([exe, "-in", moving, "-mode", "R", "-device", "gpu", "-spp", "1", "-no-meter",

@@ -1342,10 +1342,21 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
 // INDEX and shared by light path p and camera path p, so the vertex-connection strategies
 // stay exact per-λ; merging, which crosses paths, is keyed on the light vertex's own
 // wavelengths (see traceCameraSubpath).
-inline void vcmPass(const Scene& scene, const Camera& cam, VcmState& st, double radius,
+inline void vcmPass(const Scene& scene, const Camera& cam0, VcmState& st, double radius,
                     int nThreads, bool diffraction, int maxDepth, uint64_t passSeed,
                     int heroC = 1) {
     if (nThreads < 1) nThreads = 1;
+    // Motion blur (ROADMAP 11): the whole pass -- both subpaths, their connections and merges --
+    // at one time, stratified over the passes (passTime), the camera posed there. The light pass
+    // connects to the camera too, so even a camera moving over a still scene takes one time a
+    // pass: every strategy of a pass then sees one camera, and the passes' average integrates
+    // the shutter.
+    const bool passTimed = cam0.seesMotion(scene);
+    const double tPass = passTimed ? cam0.shutterTime(passTime((uint64_t)st.passes, 0x1B873593CC9E2D51ULL)) : 0.0;
+    const PassTimeScope passAt(passTimed && scene.hasMotion() ? scene.motionU(tPass) : -1.0);
+    Camera camAt = cam0;
+    if (passTimed && cam0.moves()) cam0.poseAt(tPass, camAt);
+    const Camera& cam = camAt;
     // `-seed`: every stream in this pass descends from `passSeed`, so salting it once here
     // is the whole of the flag for mode `U` (0 by default, so XOR is the identity).
     passSeed ^= g_rngSalt;
@@ -1391,6 +1402,7 @@ inline void vcmPass(const Scene& scene, const Camera& cam, VcmState& st, double 
     std::vector<std::vector<Vec3>> tSplat(nThreads);
     {
         auto lightWorker = [&](int tid) {
+            const MotionTimeScope at(g_passMotionU);
             Renderer mats; mats.diffraction = diffraction;
             Pcg32 rng; rng.seed(passSeed * 0x9E3779B97F4A7C15ULL + (uint64_t)tid * 2 + 101,
                                 0xD1B54A32D192ED03ULL ^ ((uint64_t)tid << 7) ^ (passSeed << 1));
@@ -1445,6 +1457,7 @@ inline void vcmPass(const Scene& scene, const Camera& cam, VcmState& st, double 
     // (3) Camera pass — one camera subpath per pixel; accumulate all camera-side strategies.
     {
         auto camWorker = [&](int tid) {
+            const MotionTimeScope at(g_passMotionU);
             Renderer mats; mats.diffraction = diffraction;
             Pcg32 rng; rng.seed(passSeed * 0xA24BAED4963EE407ULL + (uint64_t)tid * 2 + 211,
                                 0xC2B2AE3D27D4EB4FULL ^ ((uint64_t)tid << 9) ^ (passSeed << 2));

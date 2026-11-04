@@ -2595,6 +2595,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     const int  beamSpecC   = beamSpecOK ? pbeams::gSpecC : 1;
 
     auto worker = [&](int tid, long long total, uint64_t salt, bool pilot) {
+        const MotionTimeScope passAt(g_passMotionU);   // a blurred epoch's one time, if any
         Renderer mats; mats.diffraction = diffraction;
         mats.beamDeposit = &banks[(size_t)tid];
         mats.beamAchroOK = beamAchroOK;
@@ -4370,7 +4371,11 @@ struct BdptRenderer {
         // wavelength (JSpec, beamgather.h). Only the merges read it; the walk draws nothing extra,
         // so the paths are the ones it always took. FTRACE_JSPEC=0 turns it off for A/B runs.
         const bool jSpecOn = (mergeOn || surfOn) && jSpecEnabled();
-        const bool blurD = cam0.seesMotion(scene) && !mergeOn && !surfOn;
+        // Motion blur (ROADMAP 11): each sample's subpaths at one time of their own. Mode J's
+        // merges render an epoch at a time instead (their light side is traced for one camera at
+        // one time): the caller poses cam0 at the epoch's time and sets g_passMotionU, which every
+        // sample takes.
+        const bool blurD = cam0.seesMotion(scene) && g_passMotionU < 0.0 && !mergeOn && !surfOn;
         PosedCamera posed(cam0, blurD);   // a moving camera, at each sample's time
         if (jSpecOn) jsw.trSpec = anyMediumSigmaTChromatic(scene);
         // FTRACE_J_HALF (diagnostic): 1 = connections only, 2 = merges only. Deliberately
@@ -4410,11 +4415,10 @@ struct BdptRenderer {
                     const uint64_t unit = (sub == 0) ? gBase : (mix64(gBase * 0xD1B54A32D192ED03ULL + (uint64_t)sub) >> 1);
                     seedUnit(rng, unit, 0x8CB92BA72F3D8DD7ULL);
                     // Motion blur (ROADMAP 11): the eye and light subpaths of this sample, and
-                    // every connection between them, at one time in the shutter. Mode J's merges
-                    // reach light vertices of other samples, so it renders the instant.
+                    // every connection between them, at one time in the shutter (or the epoch's).
                     const double tFrames =
                         blurD ? cam0.shutterTime(unitTime(unit, 0x3C6EF372FE94F82BULL)) : 0.0;
-                    const MotionTimeScope pathTime(blurD ? scene.motionU(tFrames) : -1.0);
+                    const MotionTimeScope pathTime(blurD ? scene.motionU(tFrames) : g_passMotionU);
                     const Camera& cam = posed.at(tFrames);
                     HeroBundle hb;
                     // The wavelengths come from the illuminant's density, the fires' emission

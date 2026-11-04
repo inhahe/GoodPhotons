@@ -144,6 +144,22 @@ inline void seedUnit(Pcg32& rng, uint64_t k, uint64_t salt) {
     rng.seed(mix64(k ^ salt), mix64(k + salt));
 }
 
+// The shutter fraction, in [0, 1), of the k-th pass of a render whose passes each take one time
+// (photon-map epochs, SPPM and VCM passes): the base-2 radical inverse of k, so any first n passes
+// spread over the shutter as evenly as n points can, rotated by an offset of its own (`salt`,
+// with `-seed`'s) so two realizations do not share their times.
+inline double passTime(uint64_t k, uint64_t salt) {
+    uint64_t b = k;
+    b = (b << 32) | (b >> 32);
+    b = ((b & 0x0000FFFF0000FFFFULL) << 16) | ((b & 0xFFFF0000FFFF0000ULL) >> 16);
+    b = ((b & 0x00FF00FF00FF00FFULL) << 8) | ((b & 0xFF00FF00FF00FF00ULL) >> 8);
+    b = ((b & 0x0F0F0F0F0F0F0F0FULL) << 4) | ((b & 0xF0F0F0F0F0F0F0F0ULL) >> 4);
+    b = ((b & 0x3333333333333333ULL) << 2) | ((b & 0xCCCCCCCCCCCCCCCCULL) >> 2);
+    b = ((b & 0x5555555555555555ULL) << 1) | ((b & 0xAAAAAAAAAAAAAAAAULL) >> 1);
+    double u = (double)(b >> 11) * (1.0 / 9007199254740992.0) + unitTime(0, salt);
+    return u - std::floor(u);
+}
+
 // A unit direction uniform over the sphere, from two uniforms: u1 sets z, u2 the azimuth.
 // pdf = 1/(4 pi).
 inline Vec3 uniformSphere(double u1, double u2) {

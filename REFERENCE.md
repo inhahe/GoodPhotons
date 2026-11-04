@@ -2088,13 +2088,20 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
 
 - **Without a shutter nothing changes:** the scene renders the groups at the frame's instant, byte
   for byte the static scene with those transforms written out, on every mode and device.
-- **Modes `R` (and `W`), `D`, `A`, `B` and `C` blur, on the CPU.** In mode `D` a sample's eye and
-  light subpaths and every connection between them share one time; in modes `A`, `B` and `C` each
-  photon, and its splat to the camera, has its own. `-device gpu` keeps a blurred render on the
-  CPU and says so (`[device] motion blur … renders on the CPU so far`), and its exposure meter
-  too. Every other mode renders the frame's instant and prints `[motion] … renders the frame's
-  instant`: `M`, `S`, `U` and `J` share photons or merges across paths, which paths at different
-  times cannot share, `P` picks each pixel's estimator at the instant, and `V` runs `B` beside `R`.
+- **Modes `R` (and `W`), `D`, `A`, `B`, `C`, `M`, `S`, `U` and `J` blur, on the CPU.** In mode
+  `D` a sample's eye and light subpaths and every connection between them share one time; in
+  modes `A`, `B` and `C` each photon, and its splat to the camera, has its own. `M`, `S`, `U` and
+  `J` share photons, beams or merges across paths (since 0.414.0). In a moving scene each of
+  their epochs (`M`, `J`) or passes (`S`, `U`) is therefore rendered at one time, spread evenly
+  over the shutter, and their average is the blur. Modes `M` and `J` redraw their light side at
+  least 64 times over the render for this, `-beamfreeze` or not, and a mode `J` camera shares no
+  realization with another. A camera moving through a still scene leaves the `M` and `S` maps
+  timeless, and each sample poses the camera at its own time; `U` and `J`, whose light paths are
+  traced for the camera, still take one time a pass or an epoch. `-device gpu` keeps a blurred
+  render on the CPU and says so (`[device] motion blur … renders on the CPU so far`), and its
+  exposure meter too. Mode `P` renders the frame's instant and prints `[motion] … renders the
+  frame's instant`, since it picks each pixel's estimator at the instant; `V` runs `B` beside
+  `R`.
   `-radcache` is switched off under a blur (a cell would mix every time in the shutter). The sky
   a forward mode sees directly blurs behind a mover as mode `R`'s does: it is drawn into each
   batch of photons, a few samples a pixel at times of their own, so it converges with the
