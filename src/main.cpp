@@ -15695,14 +15695,14 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
     // Under a blur the device times each photon (cudaBlurUnsupported says when it cannot), and
     // the sky the camera sees directly is drawn here meanwhile, as the CPU threads below draw it
     // (addBlurredSkyRows; mode C catches the sky's photons instead). Mode P's blurred split
-    // (pSplit) stays on the CPU: its forward pass skips the splats the camera side draws.
+    // (pSplit) skips the splats the camera side draws, and its sky, which the camera side has.
     const char camModeG = lensMode ? 'A' : forwardCatch ? 'C' : 'B';
     const bool blurG = cam && cam->seesMotion(scene);
-    if (useGpu && cam && (!blurG || (!pSplit && !cudaBlurUnsupported(scene, *cam, camModeG))) &&
+    if (useGpu && cam && (!blurG || !cudaBlurUnsupported(scene, *cam, pSplit ? 'P' : camModeG)) &&
         cudaAvailable() && cudaForwardSupported(scene)) {
-        if (!blurG || forwardCatch)
+        if (!blurG || forwardCatch || pSplit)
             return renderForwardCuda(scene, *cam, resX, resY, N, eOut, diffraction, camModeG, seedBase,
-                                     wavefront, g_heroC);
+                                     wavefront, g_heroC, pSplit);
         Film sky; sky.resX = resX; sky.resY = resY; sky.alloc();
         std::vector<std::thread> skyPool;      // disjoint row bands of one film
         // Joined on every way out, the device call's exceptions included: a joinable thread's
@@ -18470,7 +18470,8 @@ static int runCompositeProgressive(
     // of the instant's per-pixel classification; the sky comes from the backward misses.
     const bool blurP = cam.seesMotion(scene);
 #ifdef HAVE_CUDA
-    const bool gpuBackward = useGpu && !blurP && backwardOnGpuOk(scene, cam);
+    const bool gpuBackward = useGpu && (!blurP || !cudaBlurUnsupported(scene, cam, 'P')) &&
+                             backwardOnGpuOk(scene, cam);
 #else
     const bool gpuBackward = false;
 #endif
@@ -18491,7 +18492,7 @@ static int runCompositeProgressive(
     std::printf("mode P: forward+camera-side composite, target %lld photons / %lld spp "
                 "at %dx%d on %s (light=%s)%s ...\n",
                 acc.N + Nreq, acc.spp + sppReq, res, resY,   // -resume adds to what it loaded
-                (useGpu && !blurP) ? "GPU" : (std::to_string(nThreads) + " threads").c_str(),   // a blur splits on the CPU
+                useGpu ? "GPU" : (std::to_string(nThreads) + " threads").c_str(),
                 scene.envIndex >= 0 ? "env" : "lit",
                 (resume && (acc.N > 0 || acc.spp > 0)) ? " [resuming]" : "");
 
@@ -18563,8 +18564,11 @@ static int runCompositeProgressive(
                 // rather than replaying [0, dSpp) on top of what acc already holds.
                 SppProgress bp; bp.sampleBase = acc.spp;
                 bp.report = [](const Film&, long long, bool) { return false; };
+                Film sp;
                 r = renderBackwardCuda(scene, cam, res, resY, dSpp, diffraction, &bp,
-                                       g_maxBounceOverride, g_directOnly, g_heroC);
+                                       g_maxBounceOverride, g_directOnly, g_heroC, nullptr,
+                                       blurP ? &sp : nullptr);
+                if (blurP) acc.spec.merge(sp);
             } else
 #endif
             if (blurP) {

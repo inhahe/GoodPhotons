@@ -2103,7 +2103,8 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
   timeless, and each sample poses the camera at its own time; `U` and `J`, whose light paths are
   traced for the camera, still take one time a pass or an epoch. **On the GPU** modes `R` and
   `W` (since 0.418.0), `D` (since 0.419.0), `A`, `B` and `C` (since 0.420.0), `S`, `U` and `J`
-  (since 0.421.0), and `M` (since 0.422.0) blur, with every primitive kind moving (rigid keys and
+  (since 0.421.0), `M` (since 0.422.0) and `P` (since 0.423.0: both layers, the backward one
+  split by each sample's first event) blur, with every primitive kind moving (rigid keys and
   deformers), the
   camera and the lights too, each camera path (in mode `D`, each sample's two subpaths; in `A`,
   `B` and `C`, each photon and its splats, mirrors and glass met where they are) at its own time,

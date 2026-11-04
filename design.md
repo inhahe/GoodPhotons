@@ -10188,7 +10188,7 @@ sees the instant, exactly as a static scene with those transforms would show it.
   (`sphereAsMesh_`), as an uneven static scale already tessellates it, so `sphereAt` may take the
   radius from the blended transform's mean column length.
 
-### Motion blur on the device (0.418.0: modes R and W; 0.419.0: D; 0.420.0: A, B and C; 0.421.0: S, U and J; 0.422.0: M)
+### Motion blur on the device (0.418.0: modes R and W; 0.419.0: D; 0.420.0: A, B and C; 0.421.0: S, U and J; 0.422.0: M; 0.423.0: P)
 
 - **The path's time** is a slot per thread in shared memory (`s_dMotionU`, `dMotionU`), the
   device twin of the thread-local `g_motionU`, so the ~37 query sites need no argument. Every
@@ -10280,6 +10280,17 @@ sees the instant, exactly as a static scene with those transforms would show it.
   a fixed `-spp` or 4 samples under a clock, `-beamfreeze` set aside. Several cameras of a moving
   scene, or a saved or loaded map, gather on the CPU and say why. The shared path prints the
   `[device] … -> GPU` line the other modes do.
+- **Mode P** (0.423.0): both layers on the device, as on the host. The backward layer is
+  `kBackward` with a second film (`renderBackwardCuda`'s `specOut`): each sample files itself by
+  its camera path's first event (`s_dFirstEv`, a slot per thread that `bkRadiance` and
+  `bkRadianceHeroLoop` write at depth 0 -- `dNoteFirst` at a medium scatter (other) or an escape
+  (sky), `dNoteFirstSurface` on the hit's own material, `dUnnoteFirst` at a fibre's pass-through;
+  `dFirstFilm` picks the film, the sky's only in an env scene, as `filmFor` does). kBackward sets
+  the slot per sample when it splits and to `kDFirstOff` otherwise, so an unsplit render notes
+  nothing. The forward layer is `renderForwardCuda`'s `pSplit` (`DCamSet::pSplit`): no analytic
+  specular connection (`camSpecularSplatAllVtxN`) and no glossy splat on a surface whose own
+  material is a specular type (`dIsSpecularType`, isSpecularType's twin), and no blurred sky,
+  which the camera side holds.
 - **The haze ends at the instant's sphere** (0.419.0), as on the host: a shadow ray to the sun or
   the sky runs to `dExitDistance` (for a path with a time, the swept sphere), but crosses media
   only to `dMediaExitDistance` (Scene::mediaExitDistance) -- in the surface, volume, fibre and

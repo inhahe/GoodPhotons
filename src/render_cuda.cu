@@ -381,6 +381,12 @@ HD static inline Real clamp01(Real x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
 // cudaForwardSupported), but the placeholder keeps D_DIFFUSETRANSMIT aligned at index 11.
 enum { D_DIFFUSE=0, D_DIELECTRIC, D_MIRROR, D_HALFMIRROR, D_GLOSSY, D_FLUORESCENT, D_THINFILM,
        D_GRATING, D_MIX, D_MULTILAYER, D_LAYERED, D_DIFFUSETRANSMIT, D_FILTER, D_HAIR };
+// The materials mode P's camera-side layer draws when they are a first hit (host twin
+// isSpecularType, scene.h, where the reasoning lives).
+__host__ __device__ static inline bool dIsSpecularType(int t) {
+    return t == D_DIELECTRIC || t == D_MIRROR || t == D_HALFMIRROR || t == D_THINFILM ||
+           t == D_GLOSSY || t == D_GRATING || t == D_MULTILAYER || t == D_FILTER;
+}
 
 // Maximum child lobes in a Mix material on the GPU. Scenes whose mix materials
 // exceed this fall back to the CPU forward tracer (cudaForwardSupported).
@@ -7205,6 +7211,10 @@ struct DCamSet {
     const DCamera* baseCams = nullptr;
     DCamera* poseOut = nullptr;
     int camMoves = 0;          // a camera of the set blurs and moves (host-side knowledge)
+    // Mode P's blurred split (host twin Renderer::specularSideSplats false): no splat the camera
+    // side draws -- no analytic connection through a mirror or glass, and no glossy lobe's on a
+    // surface whose own material is a specular type.
+    int pSplit = 0;
     __device__ const DCamera& cam(int c) const {
         return cams[(size_t)camStride * (blockIdx.x * blockDim.x + threadIdx.x) + c];
     }
@@ -9862,6 +9872,7 @@ __device__ static void camSpecularSplatAllVtxN(const DScene& sc, const DCamSet& 
         const D3& pd, const DSpecVtx& vt, const Real* lam, const Real* beta, const Real* w,
         int nUp, DRng& rng) {
     if (camMode != CAM_B) return;
+    if (cs.pSplit) return;                          // mode P's blurred split: the camera side's
     // sc.dielSph / sc.mirrorSph are the ascending indices of the qualifying spheres
     // (host-precomputed with the same predicates the loops below used to test inline),
     // so iteration — and therefore film accumulation — order is unchanged bit for bit,
@@ -11566,7 +11577,8 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
     } else if (m.type == D_GLOSSY) {
         // A lobe with a finite value splats to the camera as a diffuse vertex does, with the
         // glossy BSDF toward it, at the arriving beta (host twin: tracePhoton's Glossy case).
-        if ((camMode == CAM_A || camMode == CAM_B) && dGlossySplats(m)) {
+        if ((camMode == CAM_A || camMode == CAM_B) && dGlossySplats(m) &&
+            !(cs.pSplit && dIsSpecularType(sc.mats[h.matId].type))) {   // P's split: the camera side's
             const DVec3 wl = -rd;
             const DGlossySplat gsp{&sc, &m, &h, h.n, wl};
             splatSurfaceAll(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lambda, beta, (Real)0, rng,
@@ -12450,7 +12462,8 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         // c_i/c_hero, so the survival probability is the MAX over live λ and survivors
         // reweight by c_i/q <= 1. A mirror and a filter are delta, with no camera connect, as
         // in the scalar path; a glossy lobe with a finite value splats first, as its does.
-        if ((camMode == CAM_A || camMode == CAM_B) && dGlossySplats(m)) {
+        if ((camMode == CAM_A || camMode == CAM_B) && dGlossySplats(m) &&
+            !(cs.pSplit && dIsSpecularType(sc.mats[h.matId].type))) {   // P's split: the camera side's
             const DVec3 wl = -rd;
             const DGlossySplat gsp{&sc, &m, &h, h.n, wl};
             Real unused[hero::kHeroMax] = {};
@@ -14993,6 +15006,34 @@ struct DGiCtx {
     int bounce = 0;
 };
 
+// Mode P's blurred split on the device (host twins BackwardRenderer::GiCtx::first, noteFirst,
+// renderRows' filmFor): a camera path's first event, written once at depth 0 -- the sky, a
+// specular-side surface (a non-sensor surface whose own material is a specular type), or anything
+// else (a diffuse or composite surface, a scatter in a medium); a fibre's coverage pass-through is
+// no event. A slot per thread, as the path's time is: kBackward sets it to kDFirstUnset per sample
+// when it splits and to kDFirstOff otherwise, which no path overwrites.
+constexpr int kDFirstSky = 0, kDFirstSpec = 1, kDFirstOther = 2, kDFirstUnset = -1, kDFirstOff = -2;
+__shared__ signed char s_dFirstEv[kMotionSlots];
+__device__ static inline void dNoteFirst(const DGiCtx& gi, int kind) {
+    if (gi.depth == 0 && s_dFirstEv[threadIdx.x] == kDFirstUnset) s_dFirstEv[threadIdx.x] = (signed char)kind;
+}
+// A surface's kind, and whether it was written: a tentative note, which a pass-through takes back.
+__device__ static inline bool dNoteFirstSurface(const DScene& sc, const DGiCtx& gi, const DHit& h) {
+    if (!(gi.depth == 0 && s_dFirstEv[threadIdx.x] == kDFirstUnset)) return false;
+    s_dFirstEv[threadIdx.x] = (signed char)((h.sensorId < 0 && dIsSpecularType(sc.mats[h.matId].type))
+                                                ? kDFirstSpec : kDFirstOther);
+    return true;
+}
+__device__ static inline void dUnnoteFirst(bool noted) {
+    if (noted) s_dFirstEv[threadIdx.x] = (signed char)kDFirstUnset;
+}
+// The film a sample of a split render goes to, by its first event (renderRows' filmFor).
+__device__ static inline double* dFirstFilm(const DScene& sc, double* film, double* filmSpec) {
+    if (!filmSpec) return film;
+    const int f = s_dFirstEv[threadIdx.x];
+    return (f == kDFirstSpec || (f == kDFirstSky && sc.envIndex >= 0)) ? filmSpec : film;
+}
+
 // ---- the deterministic one-bounce gather (N3c) ----------------------------------------
 // A gather is MUTUAL recursion between the tracers and the gather helpers, so both halves
 // are declared here and defined below. The recursion is bounded at COMPILE time by the
@@ -15482,6 +15523,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             // `gmed.hit` = the free flight collided ON the curve, at ro (tMed = 0).
             Real tMed = 0; int whichMed = gmed.which;
             if (gmed.hit || dMediaSampleCollision(sc, ro, rd, dSurf, lambda, rng, tMed, whichMed)) {
+                dNoteFirst(gi, kDFirstOther);
                 DVec3 p = ro + rd * tMed;
                 // A scatter is a real vertex that never reaches bkInteract, where the glossy MIS
                 // record is cleared: left set, it would weigh this vertex's sky escape with the
@@ -15508,6 +15550,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             }
         }
         if (!h.valid) {                                // escaped the scene
+            dNoteFirst(gi, kDFirstSky);
             // Environment radiance from the escape direction (constant env ignores the
             // direction). Full weight on a camera/specular arrival (directly-viewed sky);
             // MIS-weighted (balance heuristic) on a diffuse/volume arrival against the
@@ -15556,6 +15599,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
             if (a > 0) thr *= exp(-(double)a * (double)h.t);
         }
+        const bool firstHere = dNoteFirstSurface(sc, gi, h);
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
         if (dIsCompound(mp->type)) {                       // resolve the mix to a child material
@@ -15592,6 +15636,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                                       rng, gi, gmp, &nullEvt, &curveTmin))
             return L;                                   // path terminated in the interaction
         if (nullEvt && nullSteps < 256) { --b; ++nullSteps; }
+        if (nullEvt) dUnnoteFirst(firstHere);           // passed through: not the first event
     }
     return L;
 }
@@ -15729,6 +15774,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
             Real tMed = 0; int whichMed = -1;
             if (dMediaSampleCollisionOutOfLine(sc, ro, rd, h.valid ? h.t : (Real)1e30, lam[0],
                                                rng, tMed, whichMed)) {
+                dNoteFirst(gi, kDFirstOther);
                 // A scatter is a vertex the material switch never sees, so the glossy MIS state of
                 // an earlier glossy bounce must not outlive it (see the scalar twin).
                 gmis.clear();
@@ -15754,6 +15800,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         }
 
         if (!h.valid) {                                // escaped: env radiance per λ
+            dNoteFirst(gi, kDFirstSky);
             if (sc.envIndex >= 0) {
                 const bool imageEnv = (sc.env.scale != nullptr);
                 double wMis = 1.0;
@@ -15790,6 +15837,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
             return;
         }
 
+        const bool firstHere = dNoteFirstSurface(sc, gi, h);
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
         if (dIsCompound(mp->type)) {                       // resolve the mix to a child material
@@ -15993,6 +16041,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     if (r == 2) {               // a coverage pass-through is no vertex
                         gmis = gmisIn;
                         if (nullStepsH < 256) { --b; ++nullStepsH; }
+                        dUnnoteFirst(firstHere);  // ...and not the first event
                     }
                     break;
                 }
@@ -16066,6 +16115,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                         return;
                     if (heroNull) gmis = gmisIn;
                     if (heroNull && nullStepsH < 256) { --b; ++nullStepsH; }
+                    if (heroNull) dUnnoteFirst(firstHere);
                     break;
                 }
                 }
@@ -16091,6 +16141,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     return;
                 if (heroNull2) gmis = gmisIn;
                 if (heroNull2 && nullStepsH < 256) { --b; ++nullStepsH; }
+                if (heroNull2) dUnnoteFirst(firstHere);
                 break;
             }
             case D_DIFFUSE:
@@ -16249,10 +16300,13 @@ __device__ static double bkGiGather(const DScene& sc, int diffraction, const DHi
 // runs the classic single-λ estimator bit-for-bit (the host gates heroC to 1 whenever the
 // scene has a medium whose extinction varies with λ, GRIN or a physical lens, which
 // bkRadianceHero does not cover).
+// `filmSpec`, when non-null (mode P's blurred split), takes each sample whose first event is a
+// specular-side surface or the sky (an env scene's), `film` the rest (host twin renderRows'
+// filmFor); `hits` counts every sample.
 __global__ void kBackward(DScene sc, const __grid_constant__ DCamera cam, double* film, double* hits,
                           long long totalSamples, long long chunkSpp, long long sppTotal,
                           long long sampleBase, int resX,
-                          int diffraction, unsigned long long seedBase, int heroC) {
+                          int diffraction, unsigned long long seedBase, int heroC, double* filmSpec) {
     D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
@@ -16304,16 +16358,18 @@ __global__ void kBackward(DScene sc, const __grid_constant__ DCamera cam, double
             else         { jx = rng.uniform(); jy = rng.uniform(); }
             dGenRay(camS, px, py, jx, jy, hro, hrd);
             double Lh[hero::kHeroMax];
+            s_dFirstEv[threadIdx.x] = (signed char)(filmSpec ? kDFirstUnset : kDFirstOff);
             // DGiCtx carries the ABSOLUTE sample index down the path, which rotates every
             // deterministic lattice (glossy lobe, gather directions) by it — so, exactly like
             // the subpixel and wavelength lattices, they are progressive and chunk-independent.
             bkRadianceHero<0>(sc, diffraction, hro, hrd, lam, invPdf, heroC, Lh, rng,
                               DGiCtx{0, sIdx, 0});
+            double* const to = dFirstFilm(sc, film, filmSpec);
             for (int i = 0; i < heroC; ++i) {
                 double w = Lh[i] * filmW[i] / (double)heroC;
-                atomicAdd(&film[o + 0], (double)cieX(lam[i]) * w);
-                atomicAdd(&film[o + 1], (double)cieY(lam[i]) * w);
-                atomicAdd(&film[o + 2], (double)cieZ(lam[i]) * w);
+                atomicAdd(&to[o + 0], (double)cieX(lam[i]) * w);
+                atomicAdd(&to[o + 1], (double)cieY(lam[i]) * w);
+                atomicAdd(&to[o + 2], (double)cieZ(lam[i]) * w);
             }
             if (hits) atomicAdd(&hits[(size_t)py * resX + px], 1.0);
             continue;
@@ -16345,12 +16401,14 @@ __global__ void kBackward(DScene sc, const __grid_constant__ DCamera cam, double
             else         { jx = rng.uniform(); jy = rng.uniform(); }
             dGenRay(camS, px, py, jx, jy, ro, rd);
         }
+        s_dFirstEv[threadIdx.x] = (signed char)(filmSpec ? kDFirstUnset : kDFirstOff);
         double Lval = bkRadiance<0>(sc, diffraction, ro, rd, lambda, invPdfLambda, rng,
                                     DGiCtx{0, sIdx, 0});
         double w = Lval * wLens * filmWl;
-        atomicAdd(&film[o + 0], (double)cieX(lambda) * w);
-        atomicAdd(&film[o + 1], (double)cieY(lambda) * w);
-        atomicAdd(&film[o + 2], (double)cieZ(lambda) * w);
+        double* const to = dFirstFilm(sc, film, filmSpec);
+        atomicAdd(&to[o + 0], (double)cieX(lambda) * w);
+        atomicAdd(&to[o + 1], (double)cieY(lambda) * w);
+        atomicAdd(&to[o + 2], (double)cieZ(lambda) * w);
         if (hits) atomicAdd(&hits[(size_t)py * resX + px], 1.0);
     }
 }
@@ -23984,7 +24042,8 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
 
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                        long long N, EnergyReport& eOut, bool diffraction,
-                       char camMode, unsigned long long seedBase, bool wavefront, int heroC) {
+                       char camMode, unsigned long long seedBase, bool wavefront, int heroC,
+                       bool pSplit) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaForwardSupported(scene)) return out;
@@ -24007,6 +24066,7 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY
     std::vector<DCamera> hc{ up.dc };
     std::vector<double*> fp{ d_film }, hp{ d_hits };
     DCamSet cs = makeCamSet(up, hc, fp, hp);
+    cs.pSplit = pSplit ? 1 : 0;
     launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt, heroC);
 
     // --- download ---
@@ -25668,8 +25728,8 @@ size_t cudaForwardPosedCameraBytes(bool wavefront, long long N) {
 }
 
 const char* cudaBlurUnsupported(const Scene& /*scene*/, const Camera& /*cam*/, char mode) {
-    if (mode == 0 || !std::strchr("RWDABCSUJM", mode))
-        return "motion blur in this mode renders on the CPU so far (the device blurs every mode but P and V)";
+    if (mode == 0 || !std::strchr("RWDABCSUJMP", mode))
+        return "motion blur in this mode renders on the CPU so far (the device blurs every mode but V)";
     return nullptr;
 }
 
@@ -25717,7 +25777,8 @@ bool cudaBackwardWhittedSupported(const Scene& scene, const Camera& cam,
 
 Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         long long spp, bool diffraction, const SppProgress* prog,
-                        int maxBounce, bool directOnly, int heroC, const WhittedOpts* whitted) {
+                        int maxBounce, bool directOnly, int heroC, const WhittedOpts* whitted,
+                        Film* specOut) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaBackwardSupported(scene, cam)) return out;
@@ -25751,6 +25812,12 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     double* d_hits = nullptr; CUDA_CHECK(cudaMalloc(&d_hits, npix * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_film, 0, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_hits, 0, npix * sizeof(double)));
+    // Mode P's blurred split: the specular-first samples' film (kBackward's filmSpec).
+    double* d_filmSpec = nullptr;
+    if (specOut) {
+        CUDA_CHECK(cudaMalloc(&d_filmSpec, npix * 3 * sizeof(double)));
+        CUDA_CHECK(cudaMemset(d_filmSpec, 0, npix * 3 * sizeof(double)));
+    }
     // Resume (mode R / W disk resume). Fresh samples carry ABSOLUTE indices
     // [sppBase, sppBase + spp), so the kernel's stride must be the FINAL total, not just
     // this invocation's request — otherwise `pix * sppTotal + sampleBase` walks off the
@@ -25777,12 +25844,19 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     auto launch = [&](long long c, long long base) {
         long long totalSamples = (long long)npix * c;
         kBackward<<<2048, 128>>>(up.sc, up.dc, d_film, d_hits, totalSamples, c, sppTotal, base, resX,
-                                 diffraction ? 1 : 0, seed, effHeroC);
+                                 diffraction ? 1 : 0, seed, effHeroC, d_filmSpec);
         cudaCheckKernel("backward");
     };
 
     if (!prog || !prog->report) { launch(spp, sppBase); download(out); }   // single-shot
     else gpuSppChunks(spp, *prog, out, launch, download);
+    if (specOut) {
+        specOut->resX = resX; specOut->resY = resY; specOut->alloc();
+        CUDA_CHECK(cudaMemcpy(film.data(), d_filmSpec, film.size() * sizeof(double), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < npix; ++i)
+            specOut->xyz[i] = Vec3(film[i * 3 + 0], film[i * 3 + 1], film[i * 3 + 2]);
+        cudaFree(d_filmSpec);
+    }
 
     freeUpload(up);
     cudaFree(d_film); cudaFree(d_hits);

@@ -86,10 +86,12 @@ bool cudaForwardSupported(const Scene& scene);
 // chromatic noise. It requires no participating media / GRIN (gated on the device) and
 // forces the megakernel backend (hero physics is not in the wavefront scheduler); heroC<=1
 // reproduces the original single-λ stream bit-for-bit.
+// `pSplit`: mode P's blurred split -- the forward layer makes no splat the camera side draws (no
+// analytic specular connection, no glossy lobe's on a specular-type surface; DCamSet::pSplit).
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                        long long N, EnergyReport& eOut, bool diffraction,
                        char camMode, unsigned long long seedBase = 0,
-                       bool wavefront = false, int heroC = 1);
+                       bool wavefront = false, int heroC = 1, bool pSplit = false);
 
 // GPU multi-camera shared forward trace (models A and B — the device twin of the CPU
 // renderForwardShared). Traces ONE set of N photons and splats each vertex to ALL
@@ -478,11 +480,13 @@ bool cudaBackwardWhittedSupported(const Scene& scene, const Camera& cam,
 // Note the "independent noise realization" caveat above does NOT apply in mode W: it has no
 // noise, so the CPU and GPU images agree up to device fp32 precision and the intersection
 // epsilon, with no structural difference.
+// `specOut`, when non-null (mode P's blurred split), receives the samples whose own first event is
+// a specular-side surface or the sky (an env scene's); the returned film holds the rest.
 Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         long long spp, bool diffraction,
                         const SppProgress* prog = nullptr,
                         int maxBounce = 32, bool directOnly = false, int heroC = 1,
-                        const WhittedOpts* whitted = nullptr);
+                        const WhittedOpts* whitted = nullptr, Film* specOut = nullptr);
 
 // True if this scene + camera can be rendered by the FAST RGB backward megakernel
 // (mode R `-rgb`, Option B in gpu-backward-fast.md): the reduced non-spectral tracer

@@ -751,8 +751,10 @@ host meanwhile. *Modes S, U and J on the GPU (0.421.0, done):* each pass (S, U) 
 one time, carried to the device in the scene (`DMotion::passU`), the camera posed there; a still
 scene's moving camera in S posed per pixel. *Mode M on the GPU (0.422.0, done):* a moving scene's
 lone camera in the device refresh loop's timed epochs; a camera moving over a still scene gathers
-the one map, each sample posed. Open: lights that scale over the shutter, aimed area lights; on
-the GPU, mode P's split, a blurred shared forward flight, and a moving scene's shared mode M map.
+the one map, each sample posed. *Mode P on the GPU (0.423.0, done):* the backward layer files each
+sample by its own first event into two films, the forward layer makes no splat the camera side
+draws. Open: lights that scale over the shutter, aimed area lights; on the GPU, a blurred shared
+forward flight, and a moving scene's shared mode M map.
 
 **Stage C, motion vectors and depth (0.411.0, done):** `-write-aovs` writes the guide pass's
 albedo and normal and, from one ray through each pixel's centre at the frame's instant, depth,

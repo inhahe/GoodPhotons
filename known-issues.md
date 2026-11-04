@@ -348,6 +348,13 @@ device path, possibly of the aimed caustic pass, whose aim map is built at the i
 the sphere moves. check_motion's criterion (blurred GPU mode M against blurred mode R, 10 %)
 passes.
 
+And a whole-frame one: check_bitid's `flat` scene (quads and analytic spheres, one of each
+material), mode M at 64 spp, -n 2000000, two seeds, reads 0.993 of CPU mode M on the GPU with the
+aimed caustic pass on (0.9926) or off (0.9932), the CPU's own seeds 0.4 % apart. Before
+MODEM-GPU-OFFSET's fix the GPU read 1.0105 with the pass on (its double-counted caustics) and the
+same 0.9932 with it off, which is how check_bitid saw that fix: `flat_M_gpu` 1.68 % darker
+against 0.418.1.
+
 ## DONE (2026-11-04, 0.422.0): MODEM-GPU-OFFSET — the device's hero photons deposited their caustics at full weight
 
 **Cause, and fix.** The device's hero-wavelength photon path (`shadeStepHero`, the deposit pass's

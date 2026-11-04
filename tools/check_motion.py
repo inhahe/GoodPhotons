@@ -48,11 +48,11 @@ cube whose keys scale and shear it together. It requires:
     turning, a mirror tile whose halves move apart, a glass ball and a mirror ball crossing the
     room), and the box on the wavefront backend; blurred mode A on the GPU
     with mode A on the CPU (the box, the moving lights), and blurred mode C on the GPU, through a
-    wide aperture, with mode A on the GPU. Mode P asked for the GPU under a shutter says it stays
-    on the CPU, and mode V says it renders the instant.
+    wide aperture, with mode A on the GPU. A blurred shared mode B flight asked for the GPU says it
+    stays on the CPU, and mode V says it renders the instant.
   * Modes M and J (an epoch at a time), S and U (a pass at a time) blur, agreeing with
     blurred mode R within their density estimates' bias, and follow a moving camera as mode R
-    does -- M, S, U and J on the GPU too; so does mode P, its backward samples split by their own path's first event -- also with
+    does -- M, S, U, J and P on the GPU too; so does mode P, its backward samples split by their own path's first event -- also with
     fog in front of a mirror, and on a floor of a mix of a diffuse and a glossy child; and fur in
     front of a mirror renders the same under -dual-scatter as without. Mode M under
     a -noise budget blurs too, and mode J whose surface map comes back empty blurs as mode D does.
@@ -697,7 +697,8 @@ def main():
                          ("M under -noise on the GPU", "M", ["-noise", "6.25", "-n", "2000000"], "gpu"),
                          ("S on the GPU", "S", ["-spp", "128", "-n", "200000"], "gpu"),
                          ("U on the GPU", "U", ["-spp", "256"], "gpu"),
-                         ("J on the GPU", "J", ["-spp", "128", "-jsurf"], "gpu")]
+                         ("J on the GPU", "J", ["-spp", "128", "-jsurf"], "gpu"),
+                         ("P on the GPU", "P", ["-spp", "256", "-n", "20000000"], "gpu")]
     for label, mode, margs, dev in shared_cases:
         tag = label.replace(" ", "_").replace("-", "")
         gpu = dev == "gpu"
@@ -928,9 +929,9 @@ def main():
                         seed=s, want_gpu=True)[0]) for s in (1, 2)]
         good, detail = agree(g, c, 0.05)
         verdict("blurred mode C on the GPU = mode A on the GPU (a wide aperture)", good, detail)
-        rc, log = run([exe, "-in", blurred, "-mode", "P", "-device", "gpu", "-spp", "1", "-n", "100000",
+        rc, log = run([exe, "-in", multi, "-mode", "B", "-device", "gpu", "-n", "100000",
                        "-no-meter", "-o", os.path.join(out, "gate.png")])
-        verdict("-device gpu under a shutter says mode P stays on the CPU",
+        verdict("-device gpu with a blurred shared flight says it stays on the CPU",
                 rc == 0 and "renders on the CPU so far" in log, log.strip()[-300:] if rc else "")
     rc, log = run([exe, "-in", blurred, "-mode", "V", "-device", "cpu", "-spp", "1", "-n", "100000", "-no-meter",
                    "-o", os.path.join(out, "modev.png")])
@@ -938,14 +939,14 @@ def main():
             rc == 0 and "renders the frame's instant" in log, log.strip()[-300:] if rc else "")
 
     light_and_haze_tests(exe, out, verdict, hair, not a.no_gpu)
-    p_split_tests(exe, out, verdict)
+    p_split_tests(exe, out, verdict, not a.no_gpu)
     j_empty_test(exe, out, verdict)
     camera_tests(exe, out, verdict, devices)
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 
 
-def p_split_tests(exe, out, verdict):
+def p_split_tests(exe, out, verdict, gpu=False):
     """Blurred mode P against blurred mode R where its split must file each sample by its path's
     first event: fog in front of a mirror (a sample scattered in the fog is the forward layer's,
     which splats the fog itself, so the backward layer must not count it too), and a floor of a
@@ -978,6 +979,12 @@ def p_split_tests(exe, out, verdict):
                                                              "-n", "20000000"], seed=s)[0]) for s in (1, 2)]
         good, detail = agree(rp, rr, 0.10)
         verdict("blurred mode P = blurred mode R: " + name, good, detail)
+        if gpu:
+            rg = [lum(render(exe, out, ps, "psplit_Pg_s%d" % s, ["-mode", "P", "-device", "gpu", "-spp", "256",
+                                                                  "-n", "20000000"], seed=s, want_gpu=True)[0])
+                  for s in (1, 2)]
+            good, detail = agree(rg, rr, 0.10)
+            verdict("... and on the GPU", good, detail)
     strands = [("curve { material h  basis linear  radius 0.004  point %.3f 0.25 0.6  point %.3f 1.15 0.6 }"
                 % (x, x)) for x in np.arange(-0.4, 0.401, 0.02)]
     text = NL.join([
@@ -1236,7 +1243,8 @@ def camera_tests(exe, out, verdict, devices):
         verdict("... and on the wavefront backend", good, detail)
         for mode, margs, tol in (("M", ["-spp", "128", "-n", "2000000"], 0.10),
                                  ("S", ["-spp", "128", "-n", "200000"], 0.15), ("U", ["-spp", "256"], 0.10),
-                                 ("J", ["-spp", "128", "-jsurf"], 0.10)):
+                                 ("J", ["-spp", "128", "-jsurf"], 0.10),
+                                 ("P", ["-spp", "256", "-n", "20000000"], 0.05)):
             g = [lum(render(exe, out, moving, "cam_blur_gpu%s_s%d" % (mode, s),
                             ["-mode", mode, "-device", "gpu"] + margs, seed=s, want_gpu=True)[0]) for s in (1, 2)]
             good, detail = agree(g, blur, tol)
