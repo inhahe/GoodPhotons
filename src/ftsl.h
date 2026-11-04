@@ -6147,7 +6147,18 @@ private:
     // triangles keep the instant's shape (which must be a key) and get the others as vertex keys
     // (Tri::vkeys), in the scene at the instant. In a moving group the group's motion set then
     // carries those (Scene::deformedCorners).
-    bool applyDeformers(const Block& b, Loaded& L, size_t triStart, const Affine& xf) {
+    // Whether a mesh block carries a dynamic elastic (`deform elastic { dynamic { ... } }`).
+    static bool hasDynamicElastic(const Block& b) {
+        for (const auto& st : b.stmts)
+            if (st.key == "deform" && st.val.block && st.val.block->type == "elastic")
+                for (const auto& d : st.val.block->stmts)
+                    if (d.key == "dynamic") return true;
+        return false;
+    }
+    // `exactOwn`, when given, is the same triangles loaded unplaced: the mesh's own coordinates
+    // exactly, which a dynamic elastic's cache key needs.
+    bool applyDeformers(const Block& b, Loaded& L, size_t triStart, const Affine& xf,
+                        const std::vector<Tri>* exactOwn = nullptr) {
         struct Hd { Vec3 at; double radius = 0.0; std::vector<Vec3> to; };
         // A dynamic elastic's `dynamic { ... }` (elastic_cache.h).
         struct Dyn { bool on = false; elastic::Params P; std::string cache; long long frame = 0; };
@@ -6290,13 +6301,14 @@ private:
         // Weld the triangles' corners into shared vertices (by exact position).
         std::vector<Vec3> rest;
         std::vector<std::array<int, 3>> corner(triEnd - triStart);
+        std::vector<std::pair<size_t, int>> firstCorner;   // each vertex's first corner (tri, corner)
         {
             std::map<std::array<double, 3>, int> at;
             for (size_t t = triStart; t < triEnd; ++t)
                 for (int c = 0; c < 3; ++c) {
                     const Vec3& p = c == 0 ? S.tris[t].v0 : (c == 1 ? S.tris[t].v1 : S.tris[t].v2);
                     auto [it, fresh] = at.insert({{p.x, p.y, p.z}, (int)rest.size()});
-                    if (fresh) rest.push_back(p);
+                    if (fresh) { rest.push_back(p); firstCorner.push_back({t - triStart, c}); }
                     corner[t - triStart][(size_t)c] = it->second;
                 }
         }
@@ -6304,13 +6316,25 @@ private:
         // The deformers work in the mesh's own coordinates (`own`); each vertex's move there is
         // taken back to the scene by xf's linear part, so a vertex that does not move keeps its
         // scene position exactly.
-        if (!(std::fabs(xf.det()) > 1e-300)) {
-            fail("mesh: a deforming mesh's transform is singular (a scale of zero)");
+        if (!(std::fabs(xf.det()) >= 1e-30)) {   // Affine::inverse's own threshold
+            fail("mesh: a deforming mesh's transform is singular (a scale of zero, or nearly)");
             return false;
         }
         const Affine toOwn = xf.inverse();
         std::vector<Vec3> own(rest.size());
-        for (size_t i = 0; i < rest.size(); ++i) own[i] = toOwn.apply(rest[i]);
+        if (exactOwn && exactOwn->size() != triEnd - triStart) {
+            std::fprintf(stderr, "[ftsl] warning: mesh \"%s\": its unplaced load gave another triangle count; "
+                                 "a dynamic elastic's cache key then follows its placement\n", b.name.c_str());
+            exactOwn = nullptr;
+        }
+        for (size_t i = 0; i < rest.size(); ++i) {
+            if (exactOwn) {
+                const Tri& t = (*exactOwn)[firstCorner[i].first];
+                own[i] = firstCorner[i].second == 0 ? t.v0 : (firstCorner[i].second == 1 ? t.v1 : t.v2);
+            } else {
+                own[i] = toOwn.apply(rest[i]);
+            }
+        }
         // A dynamic elastic is simulated through the shot rather than solved at each key, so its
         // rest is the mesh as loaded: it comes first. Its keys come from its cache record --
         // or, baking, from the simulation that record continues.
@@ -6557,8 +6581,11 @@ private:
         std::string imErr;
         const int importMetal = importMetalOf(b, ext, file, imErr);
         if (importMetal == -2) { fail("mesh: " + imErr); return false; }
+        // The file's triangles into `into`, placed by `x`. `main`: the mesh itself (its materials
+        // imported, its glTF sections kept); otherwise a positions-only second load (below).
+        const auto loadFile = [&](Scene& into, const Affine& x, bool main) -> bool {
         if (ext == ".gltf" || ext == ".glb") {
-            bool importMats = (strOf(b, "import_materials") != "no");
+            bool importMats = main && (strOf(b, "import_materials") != "no");
             // `skip_material <substr>[,<substr>…]` (glTF/GLB only), repeatable: drop
             // every primitive whose glTF material name contains one of these, matched
             // case-insensitively. Asset-store models routinely bundle a ground plane
@@ -6570,8 +6597,8 @@ private:
             std::string gerr;
             {
                 detail::AssetTimer _at;
-                if (loadGltf(L.scene, file.c_str(), id, xf, importMats, gerr, skipMats,
-                             keepSectionsRef() ? &gltfSecs : nullptr, importMetal) == 0
+                if (loadGltf(into, file.c_str(), id, x, importMats, gerr, skipMats,
+                             (main && keepSectionsRef()) ? &gltfSecs : nullptr, importMetal) == 0
                     && !gerr.empty()) {
                     fail("mesh: " + gerr); return false;
                 }
@@ -6584,8 +6611,8 @@ private:
                 detail::AssetTimer _at;
                 // FBX imports its materials by default, like the OBJ (.mtl) and glTF
                 // paths; `import_materials no` opts out of all three.
-                if (loadFbx(L.scene, file.c_str(), id, xf, loadUV, ferr,
-                            strOf(b, "import_materials") != "no") == 0 && !ferr.empty()) {
+                if (loadFbx(into, file.c_str(), id, x, loadUV, ferr,
+                            main && strOf(b, "import_materials") != "no") == 0 && !ferr.empty()) {
                     fail("mesh: " + ferr); return false;
                 }
             }
@@ -6606,14 +6633,14 @@ private:
                 const std::string* mb = assetBytes(file);
                 int n = 0;
                 if (ext == ".ply")
-                    n = mb ? loadPlyBytes(L.scene, *mb, file.c_str(), id, xf, loadUV, merr,
+                    n = mb ? loadPlyBytes(into, *mb, file.c_str(), id, x, loadUV, merr,
                                           uvProj, uvAxis, creaseAngleDeg)
-                           : loadPly(L.scene, file.c_str(), id, xf, loadUV, merr,
+                           : loadPly(into, file.c_str(), id, x, loadUV, merr,
                                      uvProj, uvAxis, creaseAngleDeg);
                 else
-                    n = mb ? loadStlBytes(L.scene, *mb, file.c_str(), id, xf, merr,
+                    n = mb ? loadStlBytes(into, *mb, file.c_str(), id, x, merr,
                                           uvProj, uvAxis, creaseAngleDeg)
-                           : loadStl(L.scene, file.c_str(), id, xf, merr,
+                           : loadStl(into, file.c_str(), id, x, merr,
                                      uvProj, uvAxis, creaseAngleDeg);
                 if (n == 0) { fail("mesh: " + (merr.empty() ? "no triangles loaded" : merr)); return false; }
             }
@@ -6634,9 +6661,9 @@ private:
             {
                 detail::AssetTimer _at;
                 const std::string* mb = assetBytes(file);
-                int n = mb ? loadFtmeshBytes(L.scene, *mb, file.c_str(), id, xf, loadUV,
+                int n = mb ? loadFtmeshBytes(into, *mb, file.c_str(), id, x, loadUV,
                                              merr, uvProj, uvAxis, creaseAngleDeg)
-                           : loadFtmesh(L.scene, file.c_str(), id, xf, loadUV, merr,
+                           : loadFtmesh(into, file.c_str(), id, x, loadUV, merr,
                                         uvProj, uvAxis, creaseAngleDeg);
                 if (n == 0 && !merr.empty()) { fail("mesh: " + merr); return false; }
             }
@@ -6652,16 +6679,16 @@ private:
             }
             {
                 detail::AssetTimer _at;
-                const MtlResolver* res = useNames ? &resolver : nullptr;
+                const MtlResolver* res = (useNames && main) ? &resolver : nullptr;
                 // OBJ now imports its companion .mtl by default, the same way the
                 // glTF path imports its materials; `import_materials no` opts out of both.
-                const bool objImportMats = (strOf(b, "import_materials") != "no");
+                const bool objImportMats = main && (strOf(b, "import_materials") != "no");
                 int n = 0;
                 if (const std::string* mb = assetBytes(file))
-                    n = loadObjBytes(L.scene, *mb, file.c_str(), id, xf, loadUV, res,
+                    n = loadObjBytes(into, *mb, file.c_str(), id, x, loadUV, res,
                                      uvProj, uvAxis, creaseAngleDeg, objImportMats);
                 else
-                    n = loadObj(L.scene, file.c_str(), id, xf, loadUV, res,
+                    n = loadObj(into, file.c_str(), id, x, loadUV, res,
                                 uvProj, uvAxis, creaseAngleDeg, objImportMats);
                 // A mesh that loaded nothing is an error, not an empty object. This
                 // return value used to be discarded, which is precisely how an
@@ -6679,7 +6706,20 @@ private:
                 }
             }
         }
-        if (!applyDeformers(b, L, triStart, xf)) return false;
+            return true;
+        };
+        if (!loadFile(L.scene, xf, true)) return false;
+        // A dynamic elastic's cache key is its mesh in its own coordinates, which must not depend
+        // on where the mesh is placed: they come from the file loaded again, unplaced, rather
+        // than from the placed triangles carried back (whose rounding follows the placement).
+        Scene ownScene;
+        const std::vector<Tri>* exactOwn = nullptr;
+        if (hasDynamicElastic(b)) {
+            ownScene.mats = L.scene.mats;              // the loaders read the mesh's material by id
+            if (!loadFile(ownScene, Affine::identity(), false)) return false;
+            exactOwn = &ownScene.tris;
+        }
+        if (!applyDeformers(b, L, triStart, xf, exactOwn)) return false;
         // Record the object as a named mesh group (for -check-watertight): the range of
         // world triangles this block just appended. Unnamed blocks get a synthesized
         // "mesh#N" label so the report can still point at them.

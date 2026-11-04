@@ -293,7 +293,27 @@ struct BackwardRenderer {
         // a path that half-believed in the strands would test visibility against geometry
         // its own vertices were not built from. See pickFurTier().
         unsigned char furTier = 0;
+        // Where the camera path's first event is written (kFirst*), once, at depth 0, or null:
+        // mode P's blurred split files each sample by it (renderRows' filmFor). A gather ray or a
+        // re-entry inherits the pointer but writes nothing (depth, or the slot already set).
+        int* first = nullptr;
     };
+    // A camera path's first event: the sky (it escaped), a specular-side surface (the rule
+    // classifyComposite applies to a pixel: a non-sensor surface whose own material is a
+    // specular type), or anything else -- a diffuse or composite surface, or a scatter in a
+    // medium or a fur coat before any surface. A fur coverage pass-through is no event.
+    static constexpr int kFirstSky = 0, kFirstSpec = 1, kFirstOther = 2;
+    static void noteFirst(const GiCtx& gi, int kind) {
+        if (gi.first && gi.depth == 0 && *gi.first < 0) *gi.first = kind;
+    }
+    // A surface's kind, and whether it was written: a tentative note, which a pass-through
+    // takes back (unnoteFirst).
+    static bool noteFirstSurface(const Scene& scene, const GiCtx& gi, const Hit& h) {
+        if (!(gi.first && gi.depth == 0 && *gi.first < 0)) return false;
+        *gi.first = (h.sensorId < 0 && isSpecularType(scene.mats[h.matId].type)) ? kFirstSpec : kFirstOther;
+        return true;
+    }
+    static void unnoteFirst(const GiCtx& gi, bool noted) { if (noted) *gi.first = -1; }
 
     // One direction of the fixed gather lattice: point `j` of an `n`-point Fibonacci
     // spiral on the WHOLE sphere, Cranley-Patterson-rotated by (p1, p2).
@@ -2793,6 +2813,7 @@ struct BackwardRenderer {
                     Renderer::sampleMediaCollision(scene, ray.o, ray.d, dSurf, lambda, rng,
                                                    tMed, which);
                 if (hitMed) {
+                    noteFirst(gi, kFirstOther);
                     const Medium& med = scene.media[which];
                     Vec3 p = ray.o + ray.d * tMed;
                     // A scatter never reaches interactMaterial, which is where the glossy MIS
@@ -2820,6 +2841,7 @@ struct BackwardRenderer {
             // The fur collision itself (furInteract): the Hair case with the hit INVENTED
             // rather than found. Beer-Lambert over the leg first, as the fog branch does.
             if (fl.hit) {
+                noteFirst(gi, kFirstOther);
                 { double a = curAbsorb(lambda); if (a > 0.0) thr *= std::exp(-a * fl.t); }
                 gmis.clear();          // a vertex interactMaterial never sees (see the fog branch)
                 if (!furInteract(scene, fl, ray, lambda, invPdfLambda, thr, L,
@@ -2845,6 +2867,7 @@ struct BackwardRenderer {
             }
 
             if (!h.valid) {
+                noteFirst(gi, kFirstSky);
                 if (scene.envIndex >= 0 && specularArrival && !(gmis.pdf > 0.0)) {
                     // Delta chain (the camera ray itself, or through mirrors / clear glass):
                     // nothing connected for it, weight 1 -- so this is the env as SEEN, and
@@ -2878,6 +2901,7 @@ struct BackwardRenderer {
                 if (gi.depth && ambient > 0.0) L += thr * ambient;
                 return L;
             }
+            const bool firstHere = noteFirstSurface(scene, gi, h);
             const Material* mp = &scene.mats[h.matId];
             // Stochastic mix: resolve to a child material (or terminate on the
             // leftover absorption slice) before the switch, mirroring the forward
@@ -2958,6 +2982,7 @@ struct BackwardRenderer {
             // NULL INTERACTION: refund the bounce. The cap bounds the worst case in fur dense
             // enough to keep handing back steps; 256 is far above anything real fur produces.
             if (nullEvt && nullSteps < 256) { --b; ++nullSteps; }
+            if (nullEvt) unnoteFirst(gi, firstHere);   // passed through: not the first event
         }
         return L;
     }
@@ -3171,6 +3196,7 @@ struct BackwardRenderer {
                 double tMed = 0.0; int which = -1;
                 if (Renderer::sampleMediaCollision(scene, ray.o, ray.d, dSurf, lam[0], rng,
                                                    tMed, which)) {
+                    noteFirst(gi, kFirstOther);
                     const Medium& med = scene.media[which];
                     const Vec3 p = ray.o + ray.d * tMed;
                     {   const int mi = stk.topMat();          // Beer-Lambert over a leg in glass
@@ -3249,6 +3275,7 @@ struct BackwardRenderer {
             // it terminates the secondaries, boosts the hero, and runs the shared scalar
             // interaction on it -- so no aggregate fiber ever reaches a bundle NEE.
             if (fl.hit) {
+                noteFirst(gi, kFirstOther);
                 deHero();
                 gmis.clear();          // a vertex the material switch never sees (see above)
                 if (!furInteract(scene, fl, ray, lam[0], invPdf[0], thr[0], L[0],
@@ -3260,6 +3287,7 @@ struct BackwardRenderer {
             }
 
             if (!h.valid) {              // env-miss (full weight on specular arrival, else MIS)
+                noteFirst(gi, kFirstSky);
                 if (scene.envIndex >= 0) {
                     if (specularArrival && !(gmis.pdf > 0.0)) {
                         // the env as SEEN (weight 1): bilinear, taps taken once for all lambdas
@@ -3300,6 +3328,7 @@ struct BackwardRenderer {
                 finish(); return;
             }
 
+            const bool firstHere = noteFirstSurface(scene, gi, h);
             const Material* mp = &scene.mats[h.matId];
             if (mp->type == MatType::Mix) {
                 int child = whitted ? mixResolveDominant(scene, *mp, h)
@@ -3652,6 +3681,7 @@ struct BackwardRenderer {
                             // and it refunds its bounce (see the scalar Hair case).
                             gmis = gmisIn;
                             if (nullSteps < 256) { --b; ++nullSteps; }
+                            unnoteFirst(gi, firstHere);   // passed through: not the first event
                         } else {
                             // The env-escape MIS partner: the bundle's mixture density for wOut, the
                             // same pbar neeEnvHeroHair weighed against (sum r_old p_j / sum r_old).
@@ -4047,13 +4077,15 @@ struct BackwardRenderer {
         const bool blur = cam0.seesMotion(scene);
         PosedCamera posed(cam0, blur);
         // Which film a sample's light goes to: `film`, or -- splitting for mode P -- the
-        // specular-first one when the camera ray's first hit is specular or the sky (the rule
-        // classifyComposite applies to a pixel's centre ray).
-        const auto filmFor = [&](const Ray& r) -> Film& {
+        // specular-first one when its path's first event (GiCtx::first, which the path writes as
+        // it goes) is a specular-side surface or the sky: classifyComposite's rule for a pixel's
+        // centre ray, per sample. A scatter in a medium before any surface is the forward
+        // layer's, which splats the medium's in-scatter itself.
+        int firstEv = -1;
+        int* const firstOut = specFirstFilm ? &firstEv : nullptr;
+        const auto filmFor = [&]() -> Film& {
             if (!specFirstFilm) return film;
-            const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
-            const bool spec = !h.valid ? scene.envIndex >= 0
-                                       : (h.sensorId < 0 && isSpecularType(scene.mats[h.matId].type));
+            const bool spec = firstEv == kFirstSpec || (firstEv == kFirstSky && scene.envIndex >= 0);
             return spec ? *specFirstFilm : film;
         };
         for (int py = y0; py < y1; ++py) {
@@ -4118,9 +4150,11 @@ struct BackwardRenderer {
                         // rotates its direction lattice by it -- so, exactly like the
                         // subpixel and wavelength lattices, the gather is progressive and
                         // independent of how the budget was chunked.
-                        radianceHero(scene, ray, lamA, invA, C, Lh, rng, &spdCache,
-                                     GiCtx{0, sIdx});
-                        Film& to = filmFor(ray);
+                        firstEv = -1;
+                        GiCtx gi0{0, sIdx};
+                        gi0.first = firstOut;
+                        radianceHero(scene, ray, lamA, invA, C, Lh, rng, &spdCache, gi0);
+                        Film& to = filmFor();
                         for (int i = 0; i < C; ++i)
                             to.add(px, py, Vec3(cieX(lamA[i]), cieY(lamA[i]), cieZ(lamA[i]))
                                            * (Lh[i] * filmA[i] / C));
@@ -4159,18 +4193,22 @@ struct BackwardRenderer {
                         Ray ray; double wLens = 0.0;
                         if (!cam.genLensRay(px, py, jx, jy, u1, u2, lambda, ray, wLens))
                             continue;                       // clipped by an element / the stop
-                        double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache,
-                                            GiCtx{0, sIdx});
-                        filmFor(ray).add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens * filmW));
+                        firstEv = -1;
+                        GiCtx gi0{0, sIdx};
+                        gi0.first = firstOut;
+                        double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache, gi0);
+                        filmFor().add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens * filmW));
                         continue;
                     }
                     double sjx, sjy;
                     if (whitted) whittedSample(sIdx, sjx, sjy);
                     else { sjx = rng.uniform(); sjy = rng.uniform(); }
                     Ray ray = cam.genRay(px, py, sjx, sjy);
-                    double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache,
-                                        GiCtx{0, sIdx});
-                    filmFor(ray).add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * filmW));
+                    firstEv = -1;
+                    GiCtx gi0{0, sIdx};
+                    gi0.first = firstOut;
+                    double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache, gi0);
+                    filmFor().add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * filmW));
                 }
             }
         }

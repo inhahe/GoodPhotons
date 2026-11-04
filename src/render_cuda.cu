@@ -10097,10 +10097,11 @@ __device__ static DPatIn dPatIn(const DScene& sc, const DHit& h) {
         const DVec3 e1 = c[1] - c[0], e2 = c[2] - c[0], E1 = t.v1 - t.v0, E2 = t.v2 - t.v0;
         const DVec3 fNow = cross(e1, e2), fThen = cross(E1, E2);
         const DVec3 pThen = t.v0 + E1 * h.deformB1 + E2 * h.deformB2;
-        const DVec3 ngThen = dot(h.ng, fNow) < (Real)0 ? -t.gn : t.gn;
+        const double aNow = (double)length(fNow), aThen = (double)length(fThen);
+        // A face of no area at the instant has no normal there: nudged along the hit's own.
+        const DVec3 ngThen = !(aThen > 0.0) ? h.ng : dot(h.ng, fNow) < (Real)0 ? -t.gn : t.gn;
         patNudgedPoint((double)pThen.x, (double)pThen.y, (double)pThen.z, (double)ngThen.x, (double)ngThen.y,
                        (double)ngThen.z, (double)t.reach, in.x, in.y, in.z);
-        const double aNow = (double)length(fNow), aThen = (double)length(fThen);
         if (aNow > 0.0 && aThen > 0.0) {
             const DVec3 nNow = fNow * (Real)(1.0 / aNow), nThen = fThen * (Real)(1.0 / aThen);
             const DVec3 d1 = cross(E2, nThen) * (Real)(1.0 / aThen), d2 = cross(nThen, E1) * (Real)(1.0 / aThen);

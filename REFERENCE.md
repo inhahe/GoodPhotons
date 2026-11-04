@@ -2094,17 +2094,20 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
   modes `A`, `B` and `C` each photon, and its splat to the camera, has its own. `M`, `S`, `U` and
   `J` share photons, beams or merges across paths (since 0.414.0). In a moving scene each of
   their epochs (`M`, `J`) or passes (`S`, `U`) is therefore rendered at one time, spread evenly
-  over the shutter, and their average is the blur. Modes `M` and `J` redraw their light side at
-  least 64 times over the render for this, `-beamfreeze` or not, and a mode `J` camera shares no
-  realization with another. A camera moving through a still scene leaves the `M` and `S` maps
+  over the shutter, and their average is the blur. Modes `M` and `J` redraw their light side for
+  this every 64th of a fixed `-spp` (every sample, below 64 spp), or every few samples under
+  `-time`, `-noise` or `-forever`, `-beamfreeze` or not (mode `J` takes `-beamepochs` above 64,
+  and says so when it raises one below), and a mode `J` camera shares no realization with
+  another. A camera moving through a still scene leaves the `M` and `S` maps
   timeless, and each sample poses the camera at its own time; `U` and `J`, whose light paths are
   traced for the camera, still take one time a pass or an epoch. **On the GPU** (since 0.418.0)
   modes `R` and `W` blur, with every primitive kind moving (rigid keys and deformers), the
   camera and the lights too, each camera path at its own time; any other mode keeps a blurred
   render on the CPU and says why (`[device] … renders on the CPU so far`), and the
-  exposure meter stays on the CPU under a blur. Mode `P` splits each backward sample by its own first hit at its own time
-  (specular or sky to the backward layer, the rest to the forward one), where the still render
-  splits whole pixels by the instant. `V`, which runs `B` beside `R`, renders the frame's instant
+  exposure meter stays on the CPU under a blur. Mode `P` splits each backward sample by its own
+  path's first event at its own time (a specular surface or the sky to the backward layer; a
+  diffuse or composite surface, or a scatter in a medium before any surface, to the forward
+  one), where the still render splits whole pixels by the instant. `V`, which runs `B` beside `R`, renders the frame's instant
   and prints `[motion] … renders the frame's instant`.
   `-radcache` is switched off under a blur (a cell would mix every time in the shutter). The sky
   a forward mode sees directly blurs behind a mover as mode `R`'s does: it is drawn into each

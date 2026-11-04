@@ -3216,15 +3216,18 @@ size.)
   primitive kind, the camera and the lights moving; any other blurred render stays on the CPU
   and says why. M, S, U and J share light data across paths, so in a moving scene each of their epochs (M, J) or passes (S, U) is
   rendered at one time, spread evenly over the shutter, and their average is the blur. Modes M
-  and J then redraw their light side at least 64 times over the render, even under
-  `-beamfreeze`, and a mode J camera shares no realization with another camera. A camera moving
+  and J then redraw their light side for every 64th of a fixed `-spp` (every sample, under 64),
+  or every few samples under `-time`, `-noise` or `-forever`, even under `-beamfreeze`, and a
+  mode J camera shares no realization with another camera. A camera moving
   through a still scene keeps the maps of M and S timeless, and each sample poses the camera at
   its own time. Modes U and J still take one time a pass or an epoch, since their light paths are
-  traced for the camera. Mode P splits each backward sample by its own first hit at its own time, instead of
-  splitting pixels by the instant. V, which compares B against R, renders the frame's instant
-  and prints one note (ROADMAP 11 lists the rest). In mode B a connection through a glass or mirror
-  sphere follows the sphere, and one through a mirror plane follows the plane, unless its faces
-  move differently (then that connection is skipped under a shutter). Several mode A or B
+  traced for the camera. Mode P splits each backward sample by its own path's first event at
+  its own time (a specular surface or the sky to the backward layer; a diffuse surface, or a
+  scatter in a medium before any surface, to the forward one), instead of splitting pixels by
+  the instant. V, which compares B against R, renders the frame's instant and prints one note
+  (ROADMAP 11 lists the rest). In mode B a connection through a glass or mirror sphere follows
+  the sphere, and one through a mirror plane follows the plane; a plane whose faces move
+  differently, or deform, is taken by its parts that move as one (since 0.416.0). Several mode A or B
   cameras rendered together share one forward flight per shutter.
 
 ---

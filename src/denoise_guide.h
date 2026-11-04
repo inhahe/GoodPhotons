@@ -271,7 +271,8 @@ inline Vec3 framePoint(const Scene& scene, int set, const Vec3& p0, double frame
 // Where point `p0`, at the frame's instant on deforming triangle `t`, sits `frames` frames out:
 // the same barycentrics on the triangle there, its corners carried from the instant to the motion
 // interval's end on that side (or the other, when the interval stops at the instant) and linearly
-// past it -- a deforming surface has no motion to repeat.
+// past it -- a deformation has no motion to repeat -- and then, for a mesh riding a moving group,
+// carried by the group's motion as its rigid children are (framePoint).
 inline Vec3 deformedFramePoint(const Scene& scene, const Tri& t, const Vec3& p0, double frames) {
     if (!(scene.motionB > scene.motionA)) return p0;
     double end = frames < 0.0 ? scene.motionA : scene.motionB;
@@ -284,9 +285,9 @@ inline Vec3 deformedFramePoint(const Scene& scene, const Tri& t, const Vec3& p0,
     const double b2 = (d11 * dot(d, e2) - d12 * dot(d, e1)) / den;
     const double ue = scene.motionU(end);
     Vec3 c[3];
-    scene.deformedCorners(t, ue, c);
+    scene.deformedCorners(t, ue, c, nullptr, /*carried*/false);   // in the group as at the instant
     const Vec3 pe = c[0] * (1.0 - b1 - b2) + c[1] * b1 + c[2] * b2;
-    return p0 + (pe - p0) * (frames / end);
+    return framePoint(scene, t.motion, p0 + (pe - p0) * (frames / end), frames);
 }
 
 // The centre-ray half of the guides (Images::depth and on). False if a stop was requested.

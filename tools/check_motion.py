@@ -44,7 +44,9 @@ cube whose keys scale and shear it together. It requires:
     sun; a pattern travelling with its object; moving lights of every shape; a moving camera. Mode D asked for the GPU under a
     shutter says it stays on the CPU, and mode V says it renders the instant. Modes M and J (an epoch at a time), S and U (a pass at a time) blur, agreeing with
     blurred mode R within their density estimates' bias, and follow a moving camera as mode R
-    does; so does mode P, its backward samples split by their own first hit.
+    does; so does mode P, its backward samples split by their own path's first event -- also with
+    fog in front of a mirror, and on a floor of a mix of a diffuse and a glossy child. Mode M under
+    a -noise budget blurs too, and mode J whose surface map comes back empty blurs as mode D does.
   * The camera's own motion, in the box held still: a camera with `motion` keys and no shutter
     renders byte for byte the still camera at its keys' instant (CPU, and GPU); with the shutter,
     the mean of 32 renders from its poses through it (mode R; modes D and B agree with mode R, and
@@ -644,19 +646,24 @@ def main():
     # --- the modes that share light data across paths blur too, each epoch (M) or pass (S, U) at
     # one time: against blurred mode R, within their own bias (a density estimate's radius), and
     # the blur really there ---
-    for mode, margs in (("M", ["-spp", "128", "-n", "2000000"]), ("S", ["-spp", "128", "-n", "200000"]),
-                        ("U", ["-spp", "256"]), ("J", ["-spp", "128", "-jsurf"]),
-                        ("P", ["-spp", "256", "-n", "20000000"])):
-        bm = [lum(render(exe, out, blurred, "blur_%s_s%d" % (mode, s),
+    # (Mode M under a -noise budget, which has no total to split, ends an epoch every few samples:
+    # it rendered the whole frame in its first epoch, one time, before.)
+    for label, mode, margs in (("M", "M", ["-spp", "128", "-n", "2000000"]),
+                               ("M under -noise", "M", ["-noise", "6.25", "-n", "2000000"]),
+                               ("S", "S", ["-spp", "128", "-n", "200000"]),
+                               ("U", "U", ["-spp", "256"]), ("J", "J", ["-spp", "128", "-jsurf"]),
+                               ("P", "P", ["-spp", "256", "-n", "20000000"])):
+        tag = label.replace(" ", "_").replace("-", "")
+        bm = [lum(render(exe, out, blurred, "blur_%s_s%d" % (tag, s),
                          ["-mode", mode, "-device", "cpu"] + margs, seed=s)[0]) for s in (1, 2)]
         mm = blocks((bm[0] + bm[1]) / 2)
         err = np.hypot(block_err(lb[0], lb[1]), block_err(bm[0], bm[1]))
         z = np.abs(mm - mb) / np.maximum(err, 1e-30)
         rel = np.abs(mm - mb) / np.maximum(np.abs(mb), 1e-3 * np.abs(mb).max())
         bad = (z > 5.0) & (rel > 0.10)
-        inst = blocks(lum(render(exe, out, static0, "instant_%s" % mode, ["-mode", mode, "-device", "cpu"] + margs)[0]))
+        inst = blocks(lum(render(exe, out, static0, "instant_%s" % tag, ["-mode", mode, "-device", "cpu"] + margs)[0]))
         moved = (np.abs(mm - inst) / np.maximum(inst, 1e-3 * inst.max()) > 0.10).sum()
-        verdict("blurred mode %s = blurred mode R, and blurs" % mode, not bad.any() and moved >= 8,
+        verdict("blurred mode %s = blurred mode R, and blurs" % label, not bad.any() and moved >= 8,
                 "worst block z %.1f rel %.3f; %d blocks out; %d blocks off the instant" %
                 (z.max(), rel.max(), bad.sum(), moved))
 
@@ -833,9 +840,66 @@ def main():
             rc == 0 and "renders the frame's instant" in log, log.strip()[-300:] if rc else "")
 
     light_and_haze_tests(exe, out, verdict, hair)
+    p_split_tests(exe, out, verdict)
+    j_empty_test(exe, out, verdict)
     camera_tests(exe, out, verdict, devices)
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
+
+
+def p_split_tests(exe, out, verdict):
+    """Blurred mode P against blurred mode R where its split must file each sample by its path's
+    first event: fog in front of a mirror (a sample scattered in the fog is the forward layer's,
+    which splats the fog itself: it was counted twice before), and a floor of a mix of a diffuse
+    and a glossy child (the glossy child is the forward layer's, the mix being no specular type:
+    it was lost before)."""
+    for name, extra, floor in (
+            ("fog in front of a mirror", "medium { sigma_t 0.15  albedo 0.8 }", "white"),
+            ("a mix of a diffuse and a glossy child", "", "mx")):
+        text = NL.join([
+            "scene { units meters  motion_interval -0.5 0.5 }",
+            'material "white" { type diffuse reflect 0.7 }',
+            'material "gold"  { type glossy reflect rgb 0.9 0.7 0.3  roughness 0.25 }',
+            'material "mx" { type mix  layer "white" 0.5  layer "gold" 0.5 }',
+            'material "mir" { type mirror }',
+            "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material %s }" % floor,
+            "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material mir }",
+            "light area { origin -0.4 2.9 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  spd preset:bb6500  power 60 }",
+            "group { %s  sphere { center 0 0 0  radius 0.3  material white } }" % xf(SLIDE, None, 1.0),
+            extra,
+            'camera "c" { eye 0 1.0 4.2  look_at 0 0.5 0  up 0 1 0  fov_y 40  shutter_open -0.5  '
+            'shutter_close 0.5  film { res %d %d } }' % (W, H)]) + NL
+        ps = os.path.join(out, "psplit.ftsl")
+        write(ps, text)
+        rr = [lum(render(exe, out, ps, "psplit_R_s%d" % s, ["-mode", "R", "-device", "cpu", "-spp", "512"],
+                         seed=s)[0]) for s in (1, 2)]
+        rp = [lum(render(exe, out, ps, "psplit_P_s%d" % s, ["-mode", "P", "-device", "cpu", "-spp", "256",
+                                                             "-n", "20000000"], seed=s)[0]) for s in (1, 2)]
+        good, detail = agree(rp, rr, 0.10)
+        verdict("blurred mode P = blurred mode R: " + name, good, detail)
+
+
+def j_empty_test(exe, out, verdict):
+    """Blurred mode J whose surface map comes back empty -- every surface a mirror, so no light
+    subpath stores a photon -- is mode D exactly, and blurs as mode D does, each sample at its own
+    time. (It took the first epoch's time and pose, and rendered sharp, before: 11 blocks out.)"""
+    text = NL.join([
+        "scene { units meters  motion_interval -0.5 0.5 }",
+        'material "mir" { type mirror }',
+        "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material mir }",
+        "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material mir }",
+        "light area { origin -0.4 2.9 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  spd preset:bb6500  power 60 }",
+        "group { %s  sphere { center 0 0 0  radius 0.3  material mir } }" % xf(SLIDE, None, 1.0),
+        'camera "c" { eye 0 1.0 4.2  look_at 0 0.5 0  up 0 1 0  fov_y 40  shutter_open -0.5  '
+        'shutter_close 0.5  film { res %d %d } }' % (W, H)]) + NL
+    pj = os.path.join(out, "j_empty.ftsl")
+    write(pj, text)
+    rr = [lum(render(exe, out, pj, "j_empty_R_s%d" % s, ["-mode", "R", "-device", "cpu", "-spp", "256"],
+                     seed=s)[0]) for s in (1, 2)]
+    rj = [lum(render(exe, out, pj, "j_empty_J_s%d" % s, ["-mode", "J", "-device", "cpu", "-spp", "128", "-jsurf"],
+                     seed=s)[0]) for s in (1, 2)]
+    good, detail = agree(rj, rr, 0.10)
+    verdict("blurred mode J with an empty surface map = blurred mode R", good, detail)
 
 
 def light_and_haze_tests(exe, out, verdict, hair):

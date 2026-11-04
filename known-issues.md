@@ -87,6 +87,17 @@ narrow API speak UTF-8, then audit the `std::filesystem::path(std::string)` / `.
 for UTF-8 (`u8path`, `u8string`); or read argv as UTF-16 (`wmain`) and keep paths as
 `std::filesystem::path` throughout.
 
+## FIXED (2026-11-04, 0.418.1): P-SCALE-NOISE — mode P too bright where its backward reference is noisy
+
+Mode P scales its forward film to radiance by `s`, fitted against its backward film over the
+diffuse-side pixels. It took the least-squares slope `sum(F.R)/sum(R.R)`, and noise in R (the
+regressor) shrinks that slope by R's relative variance, so `F/s` came out too bright by as much:
+on a floor lit through a mirror wall, where the backward estimate of the mirrored light is noisy,
+still mode P was 2-6 % above mode R on a white floor and 10-15 % on a floor of a mix of a diffuse
+and a glossy child (mode B alone agreed with R). Found by check_motion's new blurred-P tests,
+which saw the same excess. `forwardScale` now takes the ratio of the films' sums, which has no
+such term; mode V's comparison reports its scale the same way.
+
 ## OPEN (2026-11-03, 0.413.0): DEFORM-LIMITS — what a deforming mesh cannot do yet
 
 Each is refused or warned at load, never rendered wrong:

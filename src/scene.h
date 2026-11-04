@@ -1597,6 +1597,14 @@ inline double coatTirSecant(double n) {
 // Forward declaration: shadowTransmittance() below needs the pattern evaluator, which is
 // defined far below this class.
 struct Scene;
+
+// `into` widened to hold box `b` carried by the affine `D`: its eight corners' images, whose box
+// holds the image of every point of `b` (an affine map takes the box's hull to theirs).
+inline void expandCarried(Aabb& into, const Aabb& b, const Affine& D) {
+    for (int c = 0; c < 8; ++c)
+        into.expand(D.apply(Vec3{(c & 1) ? b.hi.x : b.lo.x, (c & 2) ? b.hi.y : b.lo.y,
+                                 (c & 4) ? b.hi.z : b.lo.z}));
+}
 inline double slotPatMul(const Scene& scene, int pat, const Hit& h);
 
 struct Scene {
@@ -3213,11 +3221,8 @@ struct Scene {
             b.expand(mirrorPartBoxes[(size_t)(mp.keyBoxes + i + 1)].lo);
             b.expand(mirrorPartBoxes[(size_t)(mp.keyBoxes + i + 1)].hi);
             if (t.motion >= 0) {          // in a moving group: the box carried by its motion now
-                const Affine D = motionNow(t.motion);
                 Aabb m;
-                for (int k = 0; k < 8; ++k)
-                    m.expand(D.apply(Vec3{(k & 1) ? b.hi.x : b.lo.x, (k & 2) ? b.hi.y : b.lo.y,
-                                          (k & 4) ? b.hi.z : b.lo.z}));
+                expandCarried(m, b, motionNow(t.motion));
                 b = m;
             }
             const double pad = 1e-6 * (1.0 + length(b.hi - b.lo));
@@ -3230,10 +3235,9 @@ struct Scene {
         tmp = mp;
         tmp.n = normalize(motionNowInverse(mp.motionSet).applyDirTranspose(mp.n));
         tmp.d = dot(tmp.n, D.apply(mp.n * mp.d));
-        Aabb b;
-        for (int c = 0; c < 8; ++c)
-            b.expand(D.apply(Vec3{(c & 1) ? mp.hi.x : mp.lo.x, (c & 2) ? mp.hi.y : mp.lo.y,
-                                  (c & 4) ? mp.hi.z : mp.lo.z}));
+        Aabb box, b;
+        box.lo = mp.lo; box.hi = mp.hi;
+        expandCarried(b, box, D);
         tmp.lo = b.lo; tmp.hi = b.hi;
         return &tmp;
     }
@@ -3739,10 +3743,7 @@ struct Scene {
         }
         if (!window) return b;
         Aabb moved;
-        for (const Affine& D : *window)
-            for (int c = 0; c < 8; ++c)
-                moved.expand(D.apply(Vec3{(c & 1) ? b.hi.x : b.lo.x, (c & 2) ? b.hi.y : b.lo.y,
-                                          (c & 4) ? b.hi.z : b.lo.z}));
+        for (const Affine& D : *window) expandCarried(moved, b, D);
         return moved;
     }
     // Global primitive `g`'s motion set, or -1.
@@ -3825,11 +3826,6 @@ struct Scene {
         for (int g = nT + nS; g < (int)(tris.size() + spheres.size() + implicits.size() +
                                         curveSegs.size() + instances.size()); ++g)
             if (primMotion(g) >= 0) { others.push_back(g); otherBox.push_back(otherPrimBox(g)); }
-        const auto carried = [](const Aabb& b, const Affine& D, Aabb& into) {
-            for (int c = 0; c < 8; ++c)
-                into.expand(D.apply(Vec3{(c & 1) ? b.hi.x : b.lo.x, (c & 2) ? b.hi.y : b.lo.y,
-                                         (c & 4) ? b.hi.z : b.lo.z}));
-        };
         double ratio = 1.0;
         {
             int movT = 0, movS = 0;
@@ -3840,7 +3836,7 @@ struct Scene {
                 const Aabb& still = otherBox[j];
                 const MotionKeys& mk = motionSets[(size_t)primMotion(others[j])];
                 Aabb sweep;
-                for (int k = 0; k < mk.keys; ++k) carried(still, motionXf[(size_t)(mk.first + k)], sweep);
+                for (int k = 0; k < mk.keys; ++k) expandCarried(sweep, still, motionXf[(size_t)(mk.first + k)]);
                 const double size = length(still.hi - still.lo);
                 if (size > 1e-9) ratio = std::max(ratio, std::min(length(sweep.hi - sweep.lo) / size, 1e6));
             }
@@ -3930,7 +3926,7 @@ struct Scene {
             }
             for (size_t j = 0; j < others.size(); ++j) {
                 Aabb b;
-                for (const Affine& D : windows[(size_t)primMotion(others[j])]) carried(otherBox[j], D, b);
+                for (const Affine& D : windows[(size_t)primMotion(others[j])]) expandCarried(b, otherBox[j], D);
                 boxes.push_back(b); mp.push_back(others[j]);
             }
             bvhMove[(size_t)k].build(boxes);
@@ -5000,9 +4996,11 @@ inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
         // intersectTri takes a hit by, nudged off it as a hit there would be -- along its face
         // normal, on the side h.ng is on now.
         const Vec3 pThen = t.v0 + E1 * h.deformB1 + E2 * h.deformB2;
-        const Vec3 ngThen = dot(h.ng, fNow) < 0.0 ? t.gn * -1.0 : t.gn;
-        patNudgedPoint(pThen.x, pThen.y, pThen.z, ngThen.x, ngThen.y, ngThen.z, t.reach, q.x, q.y, q.z);
         const double aNow = length(fNow), aThen = length(fThen);
+        // A face of no area at the instant has no normal there (t.gn is NaN): nudged along the
+        // hit's own instead.
+        const Vec3 ngThen = !(aThen > 0.0) ? h.ng : dot(h.ng, fNow) < 0.0 ? t.gn * -1.0 : t.gn;
+        patNudgedPoint(pThen.x, pThen.y, pThen.z, ngThen.x, ngThen.y, ngThen.z, t.reach, q.x, q.y, q.z);
         if (aNow > 0.0 && aThen > 0.0) {
             // The normal by the inverse transpose of the linear map taking the face's edges now
             // to its edges then, and its unit normal now to its unit normal then: n's parts along

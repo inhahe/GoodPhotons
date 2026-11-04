@@ -730,7 +730,8 @@ photon draws one time, the analytic specular connections follow their sphere or 
 multi-camera flights group cameras by shutter, and the exposure meter blurs as the render does.
 *Modes M, S, U and J (0.414.0, done):* they share photons, beams or merges across paths, so
 each of their passes (S, U) or epochs (M, J) takes one time spread over the shutter
-(`g_passMotionU`, `passTime`). M and J take at least 64 epochs. A camera moving over a still
+(`g_passMotionU`, `passTime`). M and J take an epoch a 64th of a fixed -spp (or a sample,
+under 64), or a few samples under a clock. A camera moving over a still
 scene keeps M's and S's maps timeless and poses each gather sample. *Mode P (0.415.0,
 done):* each backward sample is split by its own first hit at its own time, and no pixel is
 classified. Only V renders the instant now, and the GPU. *Camera motion (0.408.0, done):* a camera's

@@ -10126,14 +10126,22 @@ sees the instant, exactly as a static scene with those transforms would show it.
   and their merges are weighted against it. Measured: J posed per sample read 10 blocks off mode
   R, against 0 posed per epoch. The GPU sessions of S, U and M step aside under a blur.
 - **Mode P under a blur** (0.415.0) does not classify pixels: no pixel is wholly one kind over
-  the shutter. The backward layer splits each sample by its own camera ray's first hit at its
-  own time (`BackwardRenderer::specFirstFilm`, classifyComposite's rule). The composite is the
-  forward film over its scale, fitted against the diffuse-first backward film over every pixel,
-  plus the specular-first one, the sky among it (`compositeSplitFilms`). The forward pass
+  the shutter. The backward layer splits each sample by its own path's first event at its own
+  time (`BackwardRenderer::specFirstFilm`; the path writes it as it goes through `GiCtx::first`,
+  so no ray is traced twice): a non-sensor surface of a specular type, or the sky, is the
+  backward layer's (classifyComposite's rule); a diffuse or composite surface, or a scatter in a
+  medium or a fur coat before any surface, the forward one's, whose medium vertices splat their
+  in-scatter (a fur coverage pass-through is no event). The composite is the
+  forward film over its scale, the ratio of its sum to the diffuse-first backward film's over
+  every pixel (`forwardScale`, which the still composite and mode V's comparison use too: the
+  least-squares slope they used to take is shrunk by the backward film's noise), plus the
+  specular-first one, the sky among it (`compositeSplitFilms`). The forward pass
   (`renderForward(pSplit)`) draws no sky, and makes no camera splat at a vertex the camera side
-  draws -- a glossy lobe, or the analytic connections through a mirror or glass sphere or off a
-  mirror plane (`Renderer::specularSideSplats`) -- since the backward layer takes every sample
-  whose first hit is one of those, and the two would count that light twice. The sidecar
+  draws -- a glossy lobe on a surface whose own material is a specular type (a mix's glossy
+  child stays: the mix is the forward layer's), or the analytic connections through a mirror or
+  glass sphere or off a mirror plane (`Renderer::specularSideSplats`) -- since the backward layer
+  takes every sample whose first event is one of those, and the two would count that light
+  twice. The sidecar
   carries the third film (`FTPCM03`).
 - **Where blur is not yet carried, the shutter is closed**, so no estimator mixes times: the
   camera loop in `main.cpp` closes it for every mode `modeSeesMotion` does not name — V

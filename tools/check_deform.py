@@ -44,7 +44,13 @@ Each case loads a scene with `ftrace -export-tris` (no render) and reads the tri
   * The dynamic elastic, further: under a motion interval it has keys though its handles have
     none; a bake of an unchanged shot keeps every record; one after a frame's handle target
     changes re-simulates from that frame on, and a render of it before then is refused;
-    `ftrace -stop` stops a bake cleanly.
+    `ftrace -stop` stops a bake cleanly; a shot whose mesh a translate places differently every
+    frame bakes, and writes byte for byte the unplaced shot's records (its cache key is the mesh
+    in its own coordinates, exactly).
+  * The guide pass of a deforming mesh riding a turning group: where its deformer moves nothing,
+    its prevposition is its rigid twin's, carried by the group's motion rather than along a chord.
+  * A face a deformer collapses at the instant: a pattern read on it at another time is finite (it
+    renders as one collapsing a hair short of it).
   * Errors: an unknown deformer, keyed handles with different counts, an elastic handle that
     holds nothing, a falloff handle with no radius, a dynamic elastic's own `iterations`.
 Exits 1 on any failure.
@@ -416,6 +422,25 @@ def main():
         e = np.abs(prev[on] - (pos[on] - np.array([0.4, 0, 0]))).max() if on.any() else 1.0
         c.verdict("the guide pass: a deforming surface sat where its keys put it", on.any() and e < 1e-6,
                   "worst %.2g m over %d pixels" % (e, on.sum()))
+    # Riding a turning group, where its falloff moves nothing (beyond the handle's radius), a
+    # deforming mesh's prevposition is its rigid twin's: carried by the group's motion, not along
+    # a chord to the interval's end.
+    turn = ("group { motion { key { rotate 0 -20 0 } key { rotate 0 0 0 } key { rotate 0 20 0 } }  %s }")
+    local = ("deform falloff { handle { at 0 0 0  radius 0.3  motion { key { to 0 -0.1 0 } key { to 0 0 0 } "
+             "key { to 0 0.1 0 } } } }")
+    sdef = render(turn % mesh(grid, local), "aov_turn_def", 1, ["-write-aovs"])
+    srig = render(turn % mesh(grid, ""), "aov_turn_rig", 1, ["-write-aovs"])
+    if sdef is None or srig is None:
+        c.verdict("the guide pass renders a deforming mesh in a turning group", False)
+    else:
+        pd, pr = read_pfm(sdef + ".prevposition.pfm"), read_pfm(srig + ".prevposition.pfm")
+        pos = read_pfm(srig + ".position.pfm")
+        hit = read_pfm(srig + ".depth.pfm")[..., 0] > 0
+        far = hit & (np.abs(pos[..., 1]) < 1e-6) & (np.hypot(pos[..., 0], pos[..., 2]) > 0.45) & \
+              (np.abs(pos[..., 0]) < 0.9) & (np.abs(pos[..., 2]) < 0.9)
+        e = float(np.abs(pd[far] - pr[far]).max()) if far.any() else 1.0
+        c.verdict("... and riding a turning group, it is carried as its rigid twin is", far.any() and e < 1e-5,
+                  "worst %.2g m over %d pixels" % (e, far.sum()))
     sd = render(mesh(grid, slide), "blur_deform", 256)
     sg = render('group { motion { key { translate -0.2 0 0 } key { translate 0 0 0 } key { translate 0.2 0 0 } }  %s }'
                 % mesh(grid, ""), "blur_group", 256)
@@ -557,6 +582,18 @@ def pattern_tests(c, grid, render):
                 'motion { key { to %s } key { to 0 0.5 -0.5 } key { to 0 1 -0.75 } } } } }' % (fin_obj, first))
     same_render(c, "a fin a deformer folds flat at a key renders as one folding a hair short",
                 render(fin("0 0 -0.25"), "fin", 64, **eye), render(fin("0 0.001 -0.251"), "fin_ref", 64, **eye), 5e-4)
+    # The same fin folded flat at the instant (the middle key), under a pattern of its position:
+    # read at another time, the point is nudged along the hit's own normal, the instant's face
+    # having none (it was NaN, and its samples were dropped).
+    pat = NL.join(['pattern "px" { expr "0.2 + 0.6 * step(0.0, sin(9 * x + 3 * y))" }',
+                   'material "pm" { type diffuse  reflect pattern:px }'])
+
+    def fin_mid(mid):
+        return (pat + NL + 'mesh "s" { file "%s"  material pm  deform falloff { handle { at 0 0.5 -0.5  radius 0.5  '
+                'motion { key { to 0 0.5 -0.5 } key { to %s } key { to 0 1 -0.75 } } } } }' % (fin_obj, mid))
+    same_render(c, "... and folded flat at the instant, its pattern at other times is finite",
+                render(fin_mid("0 0 -0.25"), "fin_mid", 64, **eye),
+                render(fin_mid("0 0.001 -0.251"), "fin_mid_ref", 64, **eye), 5e-3)
 
 
 def mirror_test(c, grid, render):
@@ -597,10 +634,10 @@ def dynamic_tests(c, bar, rbar):
         os.remove(os.path.join(shot, f))
     cache = os.path.join(shot, "bar_%04d.ftec").replace(chr(92), "/")
 
-    def frame_scene(k, stiff=DYN_STIFF, name="f%04d", up=None, cache=cache, interval=False):
-        body = ('mesh "bar" { file "%s"  material m  deform elastic { dynamic { cache "%s"  frame %d  '
+    def frame_scene(k, stiff=DYN_STIFF, name="f%04d", up=None, cache=cache, interval=False, place=""):
+        body = ('mesh "bar" { file "%s"  material m  %s  deform elastic { dynamic { cache "%s"  frame %d  '
                 'mass 1  stiffness %r  damping 0.9 }  handle { at 0 0 0  to 0 %r 0  radius 0.25 } } }'
-                % (bar, cache, k, stiff, lift(k) if up is None else up))
+                % (bar, place, cache, k, stiff, lift(k) if up is None else up))
         p = os.path.join(shot, (name % k) + ".ftsl")
         head = "scene { units meters%s }" % ("  motion_interval -0.5 0.5" if interval else "")
         with open(p, "w", encoding="utf-8", newline="") as f:
@@ -684,6 +721,20 @@ def dynamic_tests(c, bar, rbar):
               and baked == DYN_FRAMES - 20 and same_before and tip(20)[0] is not None,
               "%d kept, %d baked" % (kept, baked))
     frame_scene(20)
+
+    # Placed by a translate that differs every frame, the bar bakes (its cache key is its mesh in
+    # its own coordinates, exactly: carried back from the placed triangles, their rounding followed
+    # the placement, and frame 1 found frame 0's record "baked for another mesh"), and its records
+    # are the unplaced shot's byte for byte.
+    pcache = os.path.join(shot, "pbar_%04d.ftec").replace(chr(92), "/")
+    for k in range(8):
+        frame_scene(k, name="p%04d", cache=pcache, place="translate %r 0.1 0" % (0.1 * k + 0.3))
+    rc, log = bake(0, 7, name="p%04d")
+    after = records()
+    same = rc == 0 and all(open(os.path.join(shot, "pbar_%04d.ftec" % k), "rb").read() == after["bar_%04d.ftec" % k]
+                           for k in range(8))
+    c.verdict("... placed differently every frame, it bakes the unplaced shot's records", same,
+              log.strip().splitlines()[-1][:100] if rc else "")
 
     # Under a motion interval the elastic has keys of its own, though its handles have none: the
     # bar, still ringing at frame 6, is somewhere else at each end of the frame.

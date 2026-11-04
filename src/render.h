@@ -401,11 +401,15 @@ struct Renderer {
     int maxBounce = 32;          // hard safety cap; Russian roulette normally
                                  // terminates paths well before this.
     // Off for mode P's blurred split (runCompositeProgressive): no camera splat at a vertex the
-    // camera side draws -- a glossy lobe (glossySplats), or the analytic connections through a
-    // mirror or glass sphere or off a mirror plane (camSpecularSplatAllVtxN) -- since there the
-    // backward layer takes every sample whose first hit is specular-side (isSpecularType), and
-    // the two would count that light twice. The still composite needs no such switch: it drops
-    // the forward film on a specular-side pixel wholesale.
+    // camera side draws -- a glossy lobe on a surface whose own material is specular-side
+    // (isSpecularType of the hit's material, not of the child a mix resolves to: a mix's
+    // glossy child is the forward layer's, as the backward layer files its samples), and the
+    // analytic connections through a mirror or glass sphere or off a mirror plane
+    // (camSpecularSplatAllVtxN) -- since the backward layer takes every sample whose first
+    // event is a specular-side surface or the sky (BackwardRenderer::specFirstFilm), and the two
+    // would count that light twice. A medium vertex's in-scatter stays: a sample scattered in a
+    // medium before any surface is the forward layer's. The still composite needs no such
+    // switch: it drops the forward film on a specular-side pixel wholesale.
     bool specularSideSplats = true;
     bool forwardCatch = false;   // model C: catch photons that physically fly through
                                  // the aperture (brute-force oracle, no connect/splat).
@@ -3509,7 +3513,8 @@ struct Renderer {
                     // A glossy lobe with a finite value (glossySplats) splats to the camera as a
                     // diffuse vertex does, with the glossy BSDF toward it; the arriving beta, so
                     // before the roulette below.
-                    if (nCam > 0 && !forwardCatch && specularSideSplats && glossySplats(m)) {
+                    if (nCam > 0 && !forwardCatch && glossySplats(m) &&
+                        (specularSideSplats || !isSpecularType(scene.mats[h.matId].type))) {
                         const Vec3 wl{-ray.d.x, -ray.d.y, -ray.d.z};
                         const GlossySplat gsp{&scene, &m, &h, h.n, wl};
                         camSplatAll(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lambda, beta,
@@ -4074,7 +4079,8 @@ struct Renderer {
                     // over live λ and survivors reweight by c_i/q <= 1. A mirror and a filter are
                     // delta lobes, with no camera connect, as in the scalar path; a glossy lobe
                     // with a finite value splats first, as the scalar path's does.
-                    if (nCam > 0 && !forwardCatch && specularSideSplats && glossySplats(m)) {
+                    if (nCam > 0 && !forwardCatch && glossySplats(m) &&
+                        (specularSideSplats || !isSpecularType(scene.mats[h.matId].type))) {
                         const Vec3 wl{-ray.d.x, -ray.d.y, -ray.d.z};
                         const GlossySplat gsp{&scene, &m, &h, h.n, wl};
                         double unused[hero::kHeroMax] = {};

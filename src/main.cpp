@@ -141,6 +141,7 @@
 #include <atomic>              // -stop: cross-thread flags for the external stop channel
 #include <mutex>               // guards the live-window title (the deposit monitor re-titles)
 #include <filesystem>          // -review: scan a directory of rendered frames
+#include <optional>
 #include <ctime>               // -checkdevhits: a temp file name
 
 #include "version.h"          // ftraceVersion(): the repo-root VERSION string, baked into one tiny TU
@@ -15012,6 +15013,10 @@ static const char* const kObjectSpaceWhy =
 // its note gives this reason.
 static const char* const kMotionCpuWhy =
     "motion blur in this mode renders on the CPU so far (the device blurs modes R and W)";
+// The spp target a time / noise / forever budget renders against (runSppProgressive): no real
+// total, only a cap that keeps pixel * sppTotal seed indices well inside int64. A renderer that
+// splits its target into parts asks for it, since a share of it is no share of the render.
+static constexpr long long kUnboundedSpp = 1'000'000'000LL;
 // Whether mode `m` carries motion blur: each of its paths, or photons, is one time in the
 // shutter. Any other mode renders the frame's instant (run closes the shutter for it).
 static bool modeSeesMotion(char m) { return m != 0 && std::strchr("RDABCMSUJP", m) != nullptr; }
@@ -16187,6 +16192,25 @@ static CompositeClass classifyComposite(const Scene& scene, const Camera& cam,
     return cc;
 }
 
+// Mode P's forward->radiance scale s (forward film F over N photons ~ s * backward film R over
+// spp), over the pixels `cls` marks DIFF (every pixel when null): the ratio of the two films'
+// sums, F's over R's. Not the least-squares slope sum(F.R)/sum(R.R): R is a noisy estimate, and
+// noise in the regressor shrinks that slope by R's relative variance (sum R^2 gains it, sum F.R
+// does not), so F/s came out too bright by as much -- 10 % on a floor lit through a mirror, where
+// the backward estimate of that light is noisy. A ratio of sums carries no such term.
+static double forwardScale(const Film& fwd, double invF, const Film& ref, double invR,
+                           const std::vector<char>* cls) {
+    double sf = 0.0, sr = 0.0;
+    for (size_t i = 0; i < fwd.xyz.size(); ++i) {
+        if (cls && (*cls)[i] != 0) continue;   // CompositeClass::DIFF
+        const Vec3 f = fwd.xyz[i] * invF, rv = ref.xyz[i] * invR;
+        sf += f.x + f.y + f.z;
+        sr += rv.x + rv.y + rv.z;
+    }
+    const double s = sr > 0.0 ? sf / sr : 1.0;
+    return s > 0.0 ? s : 1.0;
+}
+
 // Composite the accumulated forward (SUM over N photons) and backward (SUM over spp)
 // films into one true-radiance image using the fixed classification `cc`. Fits the
 // forward->backward scale s over the DIFF pixels, then blends: forward F/(N*s) on DIFF,
@@ -16198,16 +16222,7 @@ static Film compositeFromFilms(const Film& fwd, long long N, const Film& ref, lo
     const double invF = 1.0 / (double)N, invR = 1.0 / (double)spp;
     const auto& cls = cc.cls;
 
-    // Best-fit forward->backward scale over the DIFF pixels only: Fval ~ s*Rval,
-    // so s = sum(Fval.Rval)/sum(Rval.Rval) (same convention as compareFilms).
-    double sfr = 0, srr = 0;
-    for (size_t i = 0; i < cls.size(); ++i) {
-        if (cls[i] != CC::DIFF) continue;
-        Vec3 f = fwd.xyz[i] * invF, rv = ref.xyz[i] * invR;
-        sfr += dot(f, rv); srr += dot(rv, rv);
-    }
-    double s = (srr > 0) ? sfr / srr : 1.0;
-    if (s <= 0) s = 1.0;
+    double s = forwardScale(fwd, invF, ref, invR, &cls);
 
     double num = 0, den = 0;
     for (size_t i = 0; i < cls.size(); ++i) {
@@ -16242,13 +16257,7 @@ static Film compositeFromFilms(const Film& fwd, long long N, const Film& ref, lo
 static Film compositeSplitFilms(const Film& fwd, long long N, const Film& refDiff, const Film& spec,
                                 long long spp, bool verbose) {
     const double invF = 1.0 / (double)N, invR = 1.0 / (double)spp;
-    double sfr = 0, srr = 0;
-    for (size_t i = 0; i < fwd.xyz.size(); ++i) {
-        const Vec3 f = fwd.xyz[i] * invF, rv = refDiff.xyz[i] * invR;
-        sfr += dot(f, rv); srr += dot(rv, rv);
-    }
-    double s = (srr > 0) ? sfr / srr : 1.0;
-    if (s <= 0) s = 1.0;
+    const double s = forwardScale(fwd, invF, refDiff, invR, nullptr);
     Film comp; comp.resX = fwd.resX; comp.resY = fwd.resY; comp.alloc();
     for (size_t i = 0; i < fwd.xyz.size(); ++i) {
         comp.xyz[i] = fwd.xyz[i] * (invF / s) + spec.xyz[i] * invR;
@@ -16266,13 +16275,15 @@ static Film compositeSplitFilms(const Film& fwd, long long N, const Film& refDif
 // or structured residual flags a bug.
 static void compareFilms(const Film& fwd, long long Nfwd, const Film& ref, long long spp) {
     const double invF = 1.0 / (double)Nfwd, invR = 1.0 / (double)spp;
-    double sfr = 0, srr = 0, sff = 0;
+    double sff = 0;
     size_t n = fwd.xyz.size();
     for (size_t i = 0; i < n; ++i) {
-        Vec3 f = fwd.xyz[i] * invF, r = ref.xyz[i] * invR;
-        sfr += dot(f, r); srr += dot(r, r); sff += dot(f, f);
+        Vec3 f = fwd.xyz[i] * invF;
+        sff += dot(f, f);
     }
-    double s = (srr > 0) ? sfr / srr : 0.0;
+    // The scale by the ratio of the films' sums, which noise in the backward film does not bias
+    // (forwardScale says why the least-squares slope it replaced did).
+    const double s = forwardScale(fwd, invF, ref, invR, nullptr);
     double num = 0;
     std::vector<double> perPix(n, 0.0);
     for (size_t i = 0; i < n; ++i) {
@@ -18232,7 +18243,7 @@ static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX,
 // models: a periodic image rewrite (crash-safe), a status line (or -preview ANSI
 // thumbnail) every `intervalSec`, a ~noise% estimate, and clean Ctrl-C / -time / -noise /
 // -forever stopping. `sppReq` is the requested spp; when a time/noise/forever budget is
-// set the target is opened up (UNBOUNDED_SPP) and the stop is driven by the budget. The
+// set the target is opened up (kUnboundedSpp) and the stop is driven by the budget. The
 // display divides the SUM film by the spp completed, so brightness is constant and only
 // graininess falls as more samples land. Returns the process exit code (0 ok, 1 on a
 // write failure).
@@ -18249,9 +18260,8 @@ static int runSppProgressive(
     // A time/noise/forever budget renders "until the budget", so open the spp target to a
     // large-but-safe cap (keeps pixel*sppTotal seed indices well inside int64). A plain
     // fixed-spp render just targets sppReq and still shows progress along the way.
-    const long long UNBOUNDED_SPP = 1'000'000'000LL;
     const bool budgeted = (timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever);
-    const long long sppTarget = budgeted ? UNBOUNDED_SPP : sppReq;
+    const long long sppTarget = budgeted ? kUnboundedSpp : sppReq;
     if (intervalSec <= 0.0) intervalSec = 15.0;
 
     // --- disk resume (mode R / D): reload a saved SUM film + spp count from the .ftbuf
@@ -18436,8 +18446,9 @@ static int runCompositeProgressive(
     const bool gpuBackward = false;
 #endif
 
-    // View-dependent first-hit classification: computed once, reused every pass.
-    CompositeClass cc = classifyComposite(scene, cam, res, resY);
+    // View-dependent first-hit classification: computed once, reused every pass. A blur splits
+    // each sample by its own first event instead, and composes without it.
+    const CompositeClass cc = blurP ? CompositeClass{} : classifyComposite(scene, cam, res, resY);
 
     CompositeCheckpoint acc;
     acc.fwd.resX = res; acc.fwd.resY = resY; acc.fwd.alloc();
@@ -19594,12 +19605,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         const bool blurEpochsJ = cam.seesMotion(scene) && (wantBeams || wantSurf);
         constexpr long long kBlurEpochsJ = 64;
         Camera camEpochJ = cam;
-        std::unique_ptr<PassTimeScope> epochTimeJ;
+        // The epoch's pass time: emplace ends the last epoch's scope before it opens this one's.
+        std::optional<PassTimeScope> epochTimeJ;
         const auto atEpochJ = [&](uint64_t e, uint64_t saltOff) {
             if (!blurEpochsJ) return;
             const double t = cam.shutterTime(passTime(e, 0x2F2B0F8D2C6B1B03ULL ^ saltOff));
-            epochTimeJ.reset();
-            epochTimeJ = std::make_unique<PassTimeScope>(scene.motionU(t));
+            epochTimeJ.emplace(scene.motionU(t));
             camEpochJ = cam;
             if (cam.moves()) cam.poseAt(t, camEpochJ);
         };
@@ -19782,7 +19793,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // for the whole run — the picture the user is watching is still perfectly valid.
             if (first) liveWindowPlaceholder(res, resY, "tracing light subpaths\xE2\x80\xA6");
             auto tp0 = std::chrono::steady_clock::now();
-            bdpt::traceLightBeamPass(scene, cam, Nepoch, nThreads, maxDepth, diffraction,
+            // For the camera posed at the epoch's time (camEpochJ), which its merges are weighed
+            // against -- the light side is traced for the camera it serves.
+            bdpt::traceLightBeamPass(scene, camEpochJ, Nepoch, nThreads, maxDepth, diffraction,
                                      bmap, &stageProg, jreq, &jbb,
                                      wantSurf ? &smap : nullptr);
             bmap.salt = g_rngSalt;   // this realization's salt (saltScope above), for kBeamTr0
@@ -20056,6 +20069,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 #else
             const CudaSceneHold* const held = nullptr;
 #endif
+            if (!beamsPtr && !photonsPtr && blurEpochsJ) {
+                // No map: mode D exactly, so it blurs as mode D does, each sample at its own time
+                // -- not at the first epoch's, where realize left the pass time and the camera.
+                epochTimeJ.reset();
+                camEpochJ = cam;
+            }
             if ((!beamsPtr && !photonsPtr) || (g_beamFreeze && !blurEpochsJ) || !prog || !prog->report)
                 return renderEpoch(sppTarget, prog, held);
             using clk = std::chrono::steady_clock;
@@ -20080,7 +20099,20 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             long long nFixed = 0;
             bool decideK = false;
             if (fixedEpochs) {
-                if (blurEpochsJ)         nFixed = std::min<long long>(kBlurEpochsJ, total);
+                if (blurEpochsJ) {
+                    // Each light side is one time in the shutter: at least kBlurEpochsJ of them
+                    // sample it, and -beamepochs may ask for more (`spp`: one a sample), not fewer.
+                    long long want = kBlurEpochsJ;
+                    if (perSample) want = std::max<long long>(want, total);
+                    else if (g_beamEpochs > 0) want = std::max<long long>(want, (long long)g_beamEpochs);
+                    nFixed = std::min<long long>(want, total);
+                    if (g_beamEpochs > 0 && !perSample && g_beamEpochs < kBlurEpochsJ && !jlc.epochsSaid) {
+                        jlc.epochsSaid = true;
+                        std::printf("mode J: -beamepochs %lld is raised to %lld under a blur: each light "
+                                    "side is one time in the shutter, and that many sample it\n",
+                                    (long long)g_beamEpochs, nFixed);
+                    }
+                }
                 else if (!perSample)     nFixed = std::min<long long>(g_beamEpochs, total);
                 else if (jlc.autoK > 0)  nFixed = std::min<long long>(jlc.autoK, total);
                 else {
@@ -20341,12 +20373,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         constexpr long long kBlurEpochs = 64;
         Camera camEpoch = cam;
         uint64_t epochSaltOff = 0;
-        std::unique_ptr<PassTimeScope> epochTime;
+        // The epoch's pass time: emplace ends the last epoch's scope before it opens this one's.
+        std::optional<PassTimeScope> epochTime;
         const auto atEpoch = [&](uint64_t epoch) {
             if (!blurEpochs) return;
             const double t = cam.shutterTime(passTime(epoch, 0x7FB5D329728EA185ULL ^ epochSaltOff));
-            epochTime.reset();
-            epochTime = std::make_unique<PassTimeScope>(scene.motionU(t));
+            epochTime.emplace(scene.motionU(t));
             camEpoch = cam;
             if (cam.moves()) cam.poseAt(t, camEpoch);
         };
@@ -20444,8 +20476,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             long long sppAll = 0;
             bool stopAll = false;
             uint64_t epoch = 0;
-            // Under a blur, how many samples an epoch may take: enough epochs to sample the shutter.
-            const long long blurEpochSpp = std::max(1LL, sppTarget / kBlurEpochs);
+            // Under a blur, how many samples an epoch may take: enough epochs to sample the shutter
+            // -- a 64th of a fixed budget, or under a clock, which has no total to split, a few
+            // samples, so the shutter is sampled by many epochs (as mode J's clock epochs are).
+            const long long blurEpochSpp = sppTarget >= kUnboundedSpp ? 4
+                                                                    : std::max(1LL, sppTarget / kBlurEpochs);
             if (blurEpochs) epochSaltOff = prog ? (uint64_t)prog->sampleBase : 0ull;
             for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
                 double rebuildSec = 0.0;
@@ -27752,8 +27787,10 @@ static int run(int argc, char** argv) {
         else {
             // A mode-M camera reaching here under a budget is the silent-CPU case warned
             // about below. Lens cameras are excluded because they would never have had the
-            // device anyway, so saying they lost it would be false.
-            if (rc.mode == 'M' && !rc.cam.hasLens()) mModeBudgeted = true;
+            // device anyway, so saying they lost it would be false; so is a blurred camera of a
+            // moving scene, which is here for its blur and says so (kMotionCpuWhy).
+            if (rc.mode == 'M' && !rc.cam.hasLens() && !(rc.cam.seesMotion(scene) && scene.hasMotion()))
+                mModeBudgeted = true;
             restIdx.push_back(i);
         }
     }
@@ -28947,6 +28984,13 @@ static int runBakeElastic(int argc, char** argv, int at) {
     }
     for (int i = 1; i + 1 < argc; ++i)
         if (!std::strcmp(argv[i], "-stop-exit")) g_stopExitCode = std::atoi(argv[i + 1]);
+    // Ctrl-C asks for the stop a render's does (onInterrupt); each frame's load is a process group
+    // of its own (below), so the console's Ctrl-C reaches this process alone, which passes it on.
+    struct SigGuard {
+        void (*prev)(int);
+        SigGuard() : prev(std::signal(SIGINT, onInterrupt)) {}
+        ~SigGuard() { std::signal(SIGINT, prev); }
+    } sigGuard;
     const std::string pat = argv[at + 1];
     char* e1 = nullptr;
     char* e2 = nullptr;
@@ -28979,23 +29023,31 @@ static int runBakeElastic(int argc, char** argv, int at) {
         STARTUPINFOW si{};
         si.cb = sizeof si;
         PROCESS_INFORMATION pi{};
-        if (!CreateProcessW(nullptr, mut.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+        if (!CreateProcessW(nullptr, mut.data(), nullptr, nullptr, TRUE, CREATE_NEW_PROCESS_GROUP, nullptr,
+                            nullptr, &si, &pi)) {
             std::fprintf(stderr, "error: -bake-elastic: cannot start frame %lld's load (error %lu)\n", k,
                          GetLastError());
             return 1;
         }
         CloseHandle(pi.hThread);
         // The frame's load is a process of its own, so a stop aimed at this one is passed on to
-        // it through the same channel `ftrace -stop` uses (its <pid>.stop sentinel).
-        std::filesystem::path sentinel;
-        while (WaitForSingleObject(pi.hProcess, 100) == WAIT_TIMEOUT)
-            if (g_stopRequested && sentinel.empty()) {
+        // it through the same channel `ftrace -stop` uses: its <pid>.stop sentinel, written again
+        // until it answers with its .ack -- a child not yet listening clears a sentinel it finds
+        // at its start, taking it for a dead process's.
+        std::filesystem::path sentinel, ack;
+        bool acked = false;
+        while (WaitForSingleObject(pi.hProcess, 100) == WAIT_TIMEOUT) {
+            if (!g_stopRequested || acked) continue;
+            if (sentinel.empty()) {
                 const std::filesystem::path dir = stopChannelDir();
                 if (dir.empty()) break;
                 sentinel = dir / (std::to_string((long)pi.dwProcessId) + ".stop");
-                std::ofstream s(sentinel);
-                s << "stop\n";
+                ack = dir / (std::to_string((long)pi.dwProcessId) + ".ack");
             }
+            std::error_code ec;
+            if (std::filesystem::exists(ack, ec)) { acked = true; continue; }
+            if (!std::filesystem::exists(sentinel, ec)) { std::ofstream st(sentinel); st << "stop\n"; }
+        }
         WaitForSingleObject(pi.hProcess, INFINITE);
         if (!sentinel.empty()) { std::error_code ec; std::filesystem::remove(sentinel, ec); }   // if unread
         DWORD code = 1;
