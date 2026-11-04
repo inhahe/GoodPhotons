@@ -4824,6 +4824,40 @@ __device__ static inline void dLightCarry(const DScene& sc, const DEmitter& em, 
         p = r.p; d = r.d1;
     }
 }
+// A unit direction carried out (`out`) or back to the instant (host twins Scene::lightDirNow /
+// lightDirThen), out of line and by value as dLightCarry2Out is.
+__device__ __noinline__ static DVec3 dLightDirOut(const DScene& sc, int set, DVec3 d, bool out) {
+    DAff D;
+    dMotionAt(sc.mo, set, (double)dMotionU(), D);
+    if (out) return normalize(affDir(D.m, d));
+    DAff Di;
+    dAffInverse(D, Di);
+    return normalize(affDir(Di.m, d));
+}
+__device__ static inline DVec3 dLightDirNow(const DScene& sc, const DEmitter& em, const DVec3& d) {
+    return (em.motion >= 0 && dTimed(sc)) ? dLightDirOut(sc, em.motion, d, true) : d;
+}
+__device__ static inline DVec3 dLightDirThen(const DScene& sc, const DEmitter& em, const DVec3& d) {
+    return (em.motion >= 0 && dTimed(sc)) ? dLightDirOut(sc, em.motion, d, false) : d;
+}
+// An AIMED quad as the current path sees it (host twins Scene::aimFaceNow, aimCosNow,
+// aimRadianceNow, aimDirPdfNow, sampleAimDirNow): its face and lean turn with it, so a reading
+// takes `w` back to the instant first, and a direction it draws is carried out.
+__device__ static inline DVec3 dAimFaceNow(const DScene& sc, const DEmitter& em) {
+    return dLightDirNow(sc, em, em.nGeom);
+}
+__device__ static inline Real dAimCosNow(const DScene& sc, const DEmitter& em, const DVec3& w) {
+    return dAimCos(em, dLightDirThen(sc, em, w));
+}
+__device__ static inline Real dAimRadianceNow(const DScene& sc, const DEmitter& em, const DVec3& w) {
+    return dAimRadiance(em, dLightDirThen(sc, em, w));
+}
+__device__ static inline double dAimDirPdfNow(const DScene& sc, const DEmitter& em, const DVec3& w) {
+    return dAimDirPdf(em, dLightDirThen(sc, em, w));
+}
+__device__ static inline DVec3 dSampleAimDirNow(const DScene& sc, const DEmitter& em, DRng& rng, double& pdfW) {
+    return dLightDirNow(sc, em, dSampleAimDir(em, rng, pdfW));
+}
 // Tri::finalize's twin: the face normal, reach, tangent frame and curvature of a triangle
 // rebuilt at a time (its corner normals falling back to the face's where zero).
 __device__ static void dFinalizeTri(DTri& t) {
@@ -10891,7 +10925,7 @@ __device__ static double dEmitPatMul(const DScene& sc, int emitPat, const DHit& 
 __device__ static double dEmitHitScale(const DScene& sc, int emitPat, int li, const DHit& h,
                                        const DVec3& wo) {
     double s = dEmitPatMul(sc, emitPat, h);
-    if (li >= 0 && sc.emitters[li].normalTilted) s *= (double)dAimRadiance(sc.emitters[li], wo);
+    if (li >= 0 && sc.emitters[li].normalTilted) s *= (double)dAimRadianceNow(sc, sc.emitters[li], wo);
     return s;
 }
 
@@ -11225,23 +11259,23 @@ __device__ static bool dApplyCausticAim(const DScene& sc, const DCamSet& cs,
                                 (double)rng.uniform(), (double)rng.uniform(), w))
                 return true;
             dir = w;
-            if (em && em->shape == 2) {                       // spot
-                const double ct = (double)dot(dir, em->beamDir);
+            if (em && em->shape == 2) {                       // spot, its axis now (emitN)
+                const double ct = (double)dot(dir, emitN);
                 if (ct <= em->spotCosOuter) return false;      // outside the cone: p_u = 0
                 const double omegaOuter = 2.0 * DPI * (1.0 - em->spotCosOuter);
                 spotW = (Real)(spotFalloff(ct, em->spotCosInner, em->spotCosOuter)
                                * omegaOuter / em->spotOmega);
-            } else if (em && (em->normalTilted ? dAimCos(*em, dir) <= (Real)0
+            } else if (em && (em->normalTilted ? dAimCosNow(sc, *em, dir) <= (Real)0
                                                : (double)dot(dir, emitN) <= 0.0)) {
                 return false;                                  // below the horizon: p_u = 0
             }
         }
         double pu;
         if (em && em->shape == 2) {
-            const double ct = (double)dot(dir, em->beamDir);
+            const double ct = (double)dot(dir, emitN);
             pu = (ct > em->spotCosOuter) ? 1.0 / (2.0 * DPI * (1.0 - em->spotCosOuter)) : 0.0;
         } else if (em && em->normalTilted) {
-            pu = dAimDirPdf(*em, dir);                         // an aimed quad (DEmitter::nGeom)
+            pu = dAimDirPdfNow(sc, *em, dir);                  // an aimed quad (DEmitter::nGeom)
         } else if (em) {
             const double c = (double)dot(dir, emitN);
             pu = (c > 0.0) ? c / DPI : 0.0;                    // cosine hemisphere
@@ -11400,14 +11434,14 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         // quad: constant normal; sphere: surface point. Also returns this point's
         // `emit pattern:` factor — 1.0 (and a bit-identical draw) when unpatterned. A moving
         // light's point and normal (and a beam's direction) are carried to the photon's time
-        // before its direction is drawn about them; an aimed one never moves.
+        // before its direction is drawn about them (an aimed one's, drawn at the instant, after).
         emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, origin, emitN);
         if (em.collimated) { dir = em.beamDir; dLightCarry2(sc, em, origin, emitN, dir); }
         else {
             dLightCarry(sc, em, origin, emitN);
             if (em.normalTilted) {                 // an aimed quad: intensity-proportional
                 double pdfAim = 0.0;
-                dir = dSampleAimDir(em, rng, pdfAim);
+                dir = dSampleAimDirNow(sc, em, rng, pdfAim);
                 if (!(pdfAim > 0.0)) return false;
             } else dir = cosineHemisphere(emitN, rng);
         }
@@ -11509,7 +11543,8 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         // An aimed quad: rho = PI/aimNorm about the aim, gated by its face (host twin in
         // Renderer::tracePhoton).
         const Real rhoE = em.normalTilted ? (Real)(DPI / em.aimNorm) : (Real)1;
-        const DVec3* plane = em.normalTilted ? &em.nGeom : nullptr;
+        const DVec3 face = em.normalTilted ? dAimFaceNow(sc, em) : DVec3{0, 0, 0};
+        const DVec3* plane = em.normalTilted ? &face : nullptr;
         splatSurfaceAll(sc, cs, camMode, origin, emitN, emitN, emitN, lambda, beta, rhoE, rng, plane);
         camSpecularSplatAll(sc, cs, camMode, origin, emitN, lambda, beta, rhoE, rng, plane);
     }
@@ -12272,7 +12307,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
             dLightCarry(sc, em, origin, emitN);        // a moving light -- see genPhoton
             if (em.normalTilted) {                 // an aimed quad: intensity-proportional
                 double pdfAim = 0.0;
-                dir = dSampleAimDir(em, rng, pdfAim);
+                dir = dSampleAimDirNow(sc, em, rng, pdfAim);
                 if (!(pdfAim > 0.0)) return false;
             } else dir = cosineHemisphere(emitN, rng);
         }
@@ -12322,7 +12357,8 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
     // direct term). No-op for mode C (splat helpers skip it) and the mode-M deposit pass (nCam==0).
     if (em.shape != 2 && em.shape != 3 && em.shape != 6) {
         const Real rhoE = em.normalTilted ? (Real)(DPI / em.aimNorm) : (Real)1;   // aimed quad
-        const DVec3* plane = em.normalTilted ? &em.nGeom : nullptr;
+        const DVec3 face = em.normalTilted ? dAimFaceNow(sc, em) : DVec3{0, 0, 0};
+        const DVec3* plane = em.normalTilted ? &face : nullptr;
         Real rhoOne[hero::kHeroMax]; for (int i = 0; i < nUp; ++i) rhoOne[i] = rhoE;
         splatSurfaceAllHero(sc, cs, camMode, origin, emitN, emitN, emitN, lam, beta, rhoOne, nUp, rng,
                             plane);
@@ -13381,7 +13417,7 @@ __device__ static float dVertexPdfLightF(const DScene& sc, const DVertex& cur, c
     } else if (cur.lightIdx >= 0 && sc.emitters[cur.lightIdx].normalTilted) {
         // An aimed quad, at its subpath start or where an eye path hit it (host twin
         // bdpt.h vertexPdfLight): the density its emission sampler draws `wn` with.
-        const float pAim = (float)dAimDirPdf(sc.emitters[cur.lightIdx], wn);
+        const float pAim = (float)dAimDirPdfNow(sc, sc.emitters[cur.lightIdx], wn);
         if (!(pAim > 0.f)) return 0.f;
         pdf = pAim * invD2;
     } else {
@@ -13463,7 +13499,7 @@ __device__ static double dVertexLe(const DScene& sc, const DVertex& v, const DVe
     if (ddot(v.ng, w) <= 0.0) return 0.0;
     if (v.lightIdx >= 0 && sc.emitters[v.lightIdx].normalTilted)    // an aimed quad
         return (double)specLookup(*eSpd, lambda) * invPdfLambda * (double)v.emitPatW
-             * (double)dAimRadiance(sc.emitters[v.lightIdx], w);
+             * (double)dAimRadianceNow(sc, sc.emitters[v.lightIdx], w);
     return (double)specLookup(*eSpd, lambda) * invPdfLambda * (double)v.emitPatW;
 }
 // Emitter that owns an emissive surface material (mirrors Scene::emitterForMat).
@@ -14153,8 +14189,8 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     // backward.h's emitterGeom; both are cosLight, bit for bit, for an untilted light.
     double cosGeo = (double)cosLight;
     if (em.normalTilted) {
-        cosGeo = (double)ddot(em.nGeom, g.wi * (Real)(-1));
-        cosLight = dAimCos(em, g.wi * (Real)(-1));
+        cosGeo = (double)ddot(dAimFaceNow(sc, em), g.wi * (Real)(-1));
+        cosLight = dAimCosNow(sc, em, g.wi * (Real)(-1));
     }
     if (cosLight <= 0 || !(cosGeo > 0.0)) return false;
     // To the sampled POINT (shadowTransmittanceTo): re-aimed from the moved origin and stopped
@@ -14580,7 +14616,7 @@ __device__ __noinline__ static void bkNeeVolumeHero(const DScene& sc, const DMed
             wi = toL / dist;
             // One-sided; an AIMED quad emits Le * aimCos per unit area toward the vertex
             // (bkEmitterGeom; host twin volumeEmitterGeom). No surface cosine at a volume vertex.
-            const Real cosLight = em.normalTilted ? dAimCos(em, wi * (Real)(-1))
+            const Real cosLight = em.normalTilted ? dAimCosNow(sc, em, wi * (Real)(-1))
                                                   : dot(nL, wi * (Real)(-1));
             if (cosLight <= 0) continue;
             const Real vis = shadowTransmittanceTo(sc, p + wi * RAY_EPS, p + wi * dist, 2 * RAY_EPS);
@@ -16521,7 +16557,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         Real stG = dShadowTerminatorG(wi, h.n, ngo0);
         if (stG <= (Real)0) continue;
         // One-sided; an AIMED quad emits Le * aimCos per unit area (bkEmitterGeom).
-        Real cosLight = em.normalTilted ? dAimCos(em, -wi) : dot(nL, -wi);
+        Real cosLight = em.normalTilted ? dAimCosNow(sc, em, -wi) : dot(nL, -wi);
         if (cosLight <= 0) continue;
         if (occludedTo(sc, dOffsetAlong(h.p, h.ng, wi), h.p + wi * dist, 2 * RAY_EPS)) continue;
         Real G = cosSurf * cosLight / dist2;
@@ -17792,7 +17828,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     DVertex L0;
     // An aimed quad's vertex carries its FACE (DEmitter::nGeom), which every density conversion
     // at it measures; nOut is its aim. Host twin bdpt.h generateLightSubpath.
-    const DVec3 nFace = em.normalTilted ? em.nGeom : nOut;
+    const DVec3 nFace = em.normalTilted ? dAimFaceNow(sc, em) : nOut;
     L0.type = BV_LIGHT; L0.p = y; L0.ns = nFace; L0.ng = nFace;
     L0.beta = Le; L0.pdfFwd = pdfChoice * pdfPos; L0.pdfRev = 0; L0.delta = 0;
     L0.matId = em.matId; L0.lightIdx = ei;
@@ -17805,8 +17841,8 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     DVec3 dir;
     double cosLight, pdfDir;
     if (em.normalTilted) {                       // an aimed quad: intensity-proportional
-        dir = dSampleAimDir(em, rng, pdfDir);
-        cosLight = (double)dAimCos(em, dir);     // Le(dir) * cos_geom = Le * aimCos
+        dir = dSampleAimDirNow(sc, em, rng, pdfDir);
+        cosLight = (double)dAimCosNow(sc, em, dir);   // Le(dir) * cos_geom = Le * aimCos
         if (!(pdfDir > 0.0) || cosLight <= 0.0) return 1;
     } else {
         dir = cosineHemisphere(nOut, rng);
@@ -18146,12 +18182,12 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             if (dist2 <= 0.0) return 0.0;
             dist = sqrt(dist2); wi = toL * (Real)(1.0 / dist);
             // One-sided; an aimed quad sends Le * aimCos per unit area (host twin connectBDPT).
-            double cosLight = em.normalTilted ? (double)dAimCos(em, wi * (Real)(-1))
+            double cosLight = em.normalTilted ? (double)dAimCosNow(sc, em, wi * (Real)(-1))
                                               : ddot(nOut, wi * (Real)(-1));
             if (cosLight <= 0.0) return 0.0;           // emitter stays one-sided
             if (em.area <= 0.0) return 0.0;
             Wgeom = cosLight * em.area / (dist2 * pdfChoice);   // == cosLight/(d^2 * pdfA)
-            if (em.normalTilted) nOut = em.nGeom;      // the vertex carries the face (see L0)
+            if (em.normalTilted) nOut = dAimFaceNow(sc, em);   // the vertex carries the face (see L0)
         }
         nUp = pt.nUp;
         double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * emitPatW;
@@ -20672,9 +20708,12 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 y = dSampleSunOrigin(sc, em, rng, x, yy);
                 pdfPos = dSunOriginPdf(sc, em, x, yy) / (double)ddot(dir, em.beamDir);   // across the ray
             } else {
-                y = em.origin;                             // delta position: pdfPos == 1
+                // Delta position (pdfPos == 1): where the spot is at the pass's time, the cone
+                // drawn about its beam at the instant and turned with it (host twin vcm.h).
+                y = em.origin;
                 emitScale = spotFalloff(ddot(dir, em.beamDir), em.spotCosInner, em.spotCosOuter);
                 if (emitScale <= 0.0) continue;
+                dLightCarry(sc, em, y, dir);
             }
             nOut = dir;
         } else {
@@ -20682,13 +20721,14 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             // unpatterned) scales the radiance the light subpath starts with — the MIS pdfs
             // are untouched, exactly as in dGenLightSubpath.
             emitScale = dEmitterSamplePointPat(sc, em, u1, u2, y, nOut);
+            dLightCarry(sc, em, y, nOut);            // a moving light, at the pass's time
             if (em.area <= 0.0) continue;
             pdfPos = 1.0 / em.area;
             if (em.normalTilted) {                   // an aimed quad: intensity-proportional
-                dir = dSampleAimDir(em, rng, pdfDirW);
-                nOut = em.nGeom;                     // the face, for the offset and the measure
+                dir = dSampleAimDirNow(sc, em, rng, pdfDirW);
+                nOut = dAimFaceNow(sc, em);          // the face, for the offset and the measure
                 emitCos = ddot(nOut, dir);
-                emitLeCos = (double)dAimCos(em, dir);
+                emitLeCos = (double)dAimCosNow(sc, em, dir);
                 if (!(pdfDirW > 0.0) || emitCos <= 0.0 || emitLeCos <= 0.0) continue;
             } else {
                 dir = cosineHemisphere(nOut, rng);
@@ -21107,7 +21147,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                             double pdfChoice = em.power / sc.totalPower;
                             double directPdfA = pdfChoice / em.area;
                             double emissionPdfW = em.normalTilted       // joint density (see vcm.h)
-                                ? pdfChoice * dAimDirPdf(em, wo) / em.area
+                                ? pdfChoice * dAimDirPdfNow(sc, em, wo) / em.area
                                 : pdfChoice * cosLight / (DPI * em.area);
                             double wCamera = directPdfA * dVCM + emissionPdfW * dVC;
                             misW = 1.0 / (1.0 + wCamera);
@@ -21160,10 +21200,13 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                             // The penumbra weights the INTENSITY toward this receiver (it is a
                             // radiance factor, never a density — folding it into a pdf would
                             // break the light subpath's matching dVCM).
-                            DVec3 toL = em.origin - h.p; dist2 = ddot(toL, toL);
+                            // where the spot is at the pass's time, its beam turned with it
+                            DVec3 org = em.origin, beam = em.beamDir;
+                            dLightCarry(sc, em, org, beam);
+                            DVec3 toL = org - h.p; dist2 = ddot(toL, toL);
                             if (dist2 > 1e-12) {
                                 distL = sqrt(dist2); wiL = toL * (Real)(1.0 / distL);
-                                epat = spotFalloff(ddot(wiL * (Real)-1, em.beamDir),
+                                epat = spotFalloff(ddot(wiL * (Real)-1, beam),
                                                    em.spotCosInner, em.spotCosOuter);
                                 double coneSolid = 2.0 * DPI * (1.0 - em.spotCosOuter);
                                 if (epat > 0.0 && coneSolid > 0.0) {
@@ -21195,21 +21238,22 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                             DVec3 yL, nL;
                             // Sampled point's emission-pattern factor (1.0 when unpatterned).
                             epat = dEmitterSamplePointPat(sc, em, u1, u2, yL, nL);
+                            dLightCarry(sc, em, yL, nL);   // a moving light, at the pass's time
                             DVec3 toL = yL - h.p; dist2 = ddot(toL, toL);
                             if (dist2 > 1e-12 && em.area > 0.0) {
                                 distL = sqrt(dist2); wiL = toL * (Real)(1.0 / distL);
                                 // An aimed quad (host twin vcm.h): the face's cosine is the
                                 // measure, the aimed density the emission's, and its radiance
                                 // factor scales Le alone, as `epat` does.
-                                cosAtLight = em.normalTilted ? ddot(em.nGeom, wiL * (Real)-1)
+                                cosAtLight = em.normalTilted ? ddot(dAimFaceNow(sc, em), wiL * (Real)-1)
                                                              : ddot(nL, wiL * (Real)-1);
                                 const double aimR = em.normalTilted
-                                    ? (double)dAimRadiance(em, wiL * (Real)-1) : 1.0;
+                                    ? (double)dAimRadianceNow(sc, em, wiL * (Real)-1) : 1.0;
                                 if (cosAtLight > 0.0 && aimR > 0.0) {   // emitter stays one-sided
                                     double invArea = 1.0 / em.area;
                                     neeDirectPdfW = invArea * dist2 / cosAtLight;
                                     neeEmissionPdfW = em.normalTilted
-                                        ? invArea * dAimDirPdf(em, wiL * (Real)-1)
+                                        ? invArea * dAimDirPdfNow(sc, em, wiL * (Real)-1)
                                         : invArea * cosAtLight / DPI;
                                     if (em.normalTilted) epat *= aimR;
                                     geomOk = true;

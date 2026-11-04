@@ -593,9 +593,12 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
             y = bdpt::sampleSunOrigin(scene, em, rng, x, yy);
             pdfPos = bdpt::sunOriginPdf(scene, em, x, yy) / dot(dir, em.beamDir);   // across the ray
         } else {
-            y = em.origin;                                 // delta position: pdfPos == 1
+            // Delta position (pdfPos == 1): where the spot is at the pass's time, the cone drawn
+            // about its beam at the instant and turned with it (a rigid turn keeps the falloff).
+            y = scene.lightPointNow(em, em.origin);
             emitScale = spotFalloff(dot(dir, em.beamDir), em.spotCosInner, em.spotCosOuter);
             if (emitScale <= 0.0) return;
+            dir = scene.lightDirNow(em, dir);
         }
         nOut = dir;
     } else {
@@ -603,10 +606,10 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         if (em.area <= 0.0) return;
         pdfPos = 1.0 / em.area;
         if (em.normalTilted) {                       // an aimed quad: intensity-proportional
-            dir = em.sampleAimDir(rng, pdfDirW);
-            nOut = em.nGeom;                         // the face, for the offset and the measure
+            dir = scene.sampleAimDirNow(em, rng, pdfDirW);
+            nOut = scene.aimFaceNow(em);             // the face, for the offset and the measure
             emitCos = dot(nOut, dir);
-            emitLeCos = em.aimCos(dir);
+            emitLeCos = scene.aimCosNow(em, dir);
             if (!(pdfDirW > 0.0) || emitCos <= 0.0 || emitLeCos <= 0.0) return;
         } else {
             dir = cosineHemisphere(nOut, rng);
@@ -990,7 +993,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                         // splat and the merge kept theirs: +4.4 % over mode R on a bare
                         // floor+sphere scene, and +24 % on skin whose NEE fur blocks (0.363.0).
                         double emissionPdfW = em->normalTilted        // an aimed quad
-                            ? pdfChoice * em->aimDirPdf(wo) / em->area
+                            ? pdfChoice * scene.aimDirPdfNow(*em, wo) / em->area
                             : pdfChoice * cosLight / (PI * em->area);
                         double wCamera = Mis(directPdfA) * dVCM + Mis(emissionPdfW) * dVC;
                         misW = 1.0 / (1.0 + wCamera);
@@ -1039,10 +1042,11 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                         // The penumbra weights the intensity toward this receiver (it is a
                         // radiance factor, never a density — folding it into a pdf would
                         // break the light subpath's matching dVCM).
-                        Vec3 toL = em.origin - h.p; dist2 = dot(toL, toL);
+                        // where the spot is at the path's time, its beam turned with it
+                        Vec3 toL = scene.lightPointNow(em, em.origin) - h.p; dist2 = dot(toL, toL);
                         if (dist2 > 1e-12) {
                             distL = std::sqrt(dist2); wi = toL / distL;
-                            epat = spotFalloff(dot(wi * -1.0, em.beamDir),
+                            epat = spotFalloff(dot(wi * -1.0, scene.lightDirNow(em, em.beamDir)),
                                                em.spotCosInner, em.spotCosOuter);
                             double coneSolid = 2.0 * PI * (1.0 - em.spotCosOuter);
                             if (epat > 0.0 && coneSolid > 0.0) {
@@ -1082,14 +1086,14 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                             // An aimed quad (Emitter::nGeom): the face's cosine is the
                             // measure, the aimed density the emission's, and its radiance
                             // factor scales Le alone, as `epat` does.
-                            cosAtLight = em.normalTilted ? dot(em.nGeom, wi * -1.0)
+                            cosAtLight = em.normalTilted ? dot(scene.aimFaceNow(em), wi * -1.0)
                                                          : dot(nL, wi * -1.0);
-                            const double aimR = em.normalTilted ? em.aimRadiance(wi * -1.0) : 1.0;
+                            const double aimR = em.normalTilted ? scene.aimRadianceNow(em, wi * -1.0) : 1.0;
                             if (cosAtLight > 0.0 && aimR > 0.0) {   // emitter stays one-sided
                                 double invArea = 1.0 / em.area;
                                 directPdfW = invArea * dist2 / cosAtLight;   // (no pickProb)
                                 emissionPdfW = em.normalTilted               // (no pickProb)
-                                    ? invArea * em.aimDirPdf(wi * -1.0)
+                                    ? invArea * scene.aimDirPdfNow(em, wi * -1.0)
                                     : invArea * cosAtLight / PI;
                                 if (em.normalTilted) epat *= aimR;
                                 geomOk = true;

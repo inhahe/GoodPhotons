@@ -3202,8 +3202,8 @@ size.)
   0.410.0): a `light` of any kind but `sun` and `env`, and an emissive mesh, moves and turns
   with its group, lit and lighting as it goes, in every mode that blurs. A light moves only
   rigidly: one whose keys would scale or shear it over the shutter stays at the instant, its
-  surface with it, and so do an aimed area light (one whose `normal` leans) and a sun or sky in a
-  moving group — each with one warning. What finds an object by name — `fur { on }` and `bald`, a
+  surface with it, and so does a sun or sky in a moving group — each with one warning. An aimed
+  area light (one whose `normal` leans) moves since 0.425.0, its lean turning with it. What finds an object by name — `fur { on }` and `bald`, a
   medium's `bounds { object }`, `settle { collide }` — refuses one in a moving group, which it
   could not follow. **Textures travel with what moves:** a procedural `pattern` on a moving
   surface is read where that surface point sits at the frame's instant, so it smears with the

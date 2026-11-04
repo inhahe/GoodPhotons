@@ -753,7 +753,8 @@ scene's moving camera in S posed per pixel. *Mode M on the GPU (0.422.0, done):*
 lone camera in the device refresh loop's timed epochs; a camera moving over a still scene gathers
 the one map, each sample posed. *Mode P on the GPU (0.423.0, done):* the backward layer files each
 sample by its own first event into two films, the forward layer makes no splat the camera side
-draws. Open: lights that scale over the shutter, aimed area lights; on the GPU, a blurred shared
+draws. *Aimed area lights (0.425.0, done):* an aimed panel moves, its face and lean turning with
+it in every estimator. Open: lights that scale over the shutter; on the GPU, a blurred shared
 forward flight, and a moving scene's shared mode M map.
 
 **Stage C, motion vectors and depth (0.411.0, done):** `-write-aovs` writes the guide pass's

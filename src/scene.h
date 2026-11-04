@@ -1900,6 +1900,22 @@ struct Scene {
     Vec3 lightPointThen(const Emitter& em, const Vec3& p) const {   // into the instant
         return lightMoves(em) ? motionNowInverse(em.motion).apply(p) : p;
     }
+    Vec3 lightDirThen(const Emitter& em, const Vec3& d) const {     // into the instant, made unit
+        return lightMoves(em) ? normalize(motionNowInverse(em.motion).applyDir(d)) : d;
+    }
+    // An AIMED quad (Emitter::normalTilted) as the current path sees it: its face and its lean turn
+    // with it, so each reading takes `w` (the unit direction leaving the patch, at the path's time)
+    // back to the instant first, and a direction it draws is carried out. Emitter's own readings
+    // for a still light or a path without a time.
+    Vec3 aimFaceNow(const Emitter& em) const { return lightDirNow(em, em.nGeom); }
+    double aimCosNow(const Emitter& em, const Vec3& w) const { return em.aimCos(lightDirThen(em, w)); }
+    double aimRadianceNow(const Emitter& em, const Vec3& w) const {
+        return em.aimRadiance(lightDirThen(em, w));
+    }
+    double aimDirPdfNow(const Emitter& em, const Vec3& w) const { return em.aimDirPdf(lightDirThen(em, w)); }
+    Vec3 sampleAimDirNow(const Emitter& em, Pcg32& rng, double& pdfW) const {
+        return lightDirNow(em, em.sampleAimDir(rng, pdfW));
+    }
 
     // A moving isosurface (its march measures steps by the ray direction's own length, so the
     // carried ray needs no renormalising).
@@ -2799,11 +2815,12 @@ struct Scene {
     // path. Filled by finalizeEmitters.
     std::vector<int> aimOfMat;
     // What a ray leaving an emissive surface of material `matId` toward `w` carries, as a
-    // multiple of the material's Le: Emitter::aimRadiance for an aimed quad's surface, 1 for
-    // every other. Readers call it only when aimOfMat is non-empty.
+    // multiple of the material's Le: the aimed quad's radiance (aimRadianceNow: at the path's
+    // time) for an aimed quad's surface, 1 for every other. Readers call it only when aimOfMat is
+    // non-empty.
     double aimedEmission(int matId, const Vec3& w) const {
         if (matId < 0 || matId >= (int)aimOfMat.size() || aimOfMat[(size_t)matId] < 0) return 1.0;
-        return emitters[(size_t)aimOfMat[(size_t)matId]].aimRadiance(w);
+        return aimRadianceNow(emitters[(size_t)aimOfMat[(size_t)matId]], w);
     }
 
     // Register a spotlight: a point at `pos` radiating into a cone about unit

@@ -10174,8 +10174,8 @@ sees the instant, exactly as a static scene with those transforms would show it.
   that is not the run's lone mode-M camera with a map of its own (`mBlurApart` in the camera
   routing: shared with other mode-M cameras, `-savemap` / `-loadmap`, or `-preview`'s CPU
   driver). `-radcache` is off under a blur. What cannot move yet stays put and
-  says so (`stillWarning`): a sun or sky, an aimed area light, and any light whose keys would
-  scale or shear it stay at the instant with their surfaces, so nothing mixes a moved surface
+  says so (`stillWarning`): a sun or sky, and any light whose keys would scale or shear it,
+  stay at the instant with their surfaces, so nothing mixes a moved surface
   with an unmoved sampler. A coat whose strands move is traced as strands when some camera
   may see it at another time (`anyCameraTimed`: any camera with an open shutter, in whatever
   mode -- a lens, a routing or -on-unsupported may yet change that), since
@@ -10187,8 +10187,14 @@ sees the instant, exactly as a static scene with those transforms would show it.
   (`Scene::lightPointNow`, `lightDirNow`); a sphere's cone and a tube's visible arc are sampled
   toward the shading point carried in (`lightPointThen`) and their outputs carried out; a spot's
   origin and axis are carried, and its sampled emission direction turned after its falloff is
-  read in the instant's frame. Every density (area, solid angle, selection) is unchanged, so the
-  MIS weights stay exact. The light tree can give a light probability zero where its bounds
+  read in the instant's frame. An aimed panel (0.425.0) reads its lean in the instant's frame too:
+  `Scene::aimCosNow`, `aimRadianceNow` and `aimDirPdfNow` take the direction back to the instant
+  (`lightDirThen`), `sampleAimDirNow` carries its draw out, and `aimFaceNow` is its face carried
+  (device twins `dAim*Now`, `dLightDirNow` / `dLightDirThen`). Every density (area, solid angle,
+  selection) is unchanged, so the MIS weights stay exact. Mode U carries its lights as every
+  other estimator does, on both devices: the host's light subpath and connection carry a spot,
+  and the device's `kVcmLightT` and `kVcmCameraT` every light (`dLightCarry`), which until
+  0.425.0 they did not. The light tree can give a light probability zero where its bounds
   prove it dark, so a path with a time walks a second tree (`Scene::lightTreeTimed`) in which a
   moving light's box holds its every key and its normals may point anywhere; the instant's tree
   serves every other query, so a render without a shutter selects as the still scene does.

@@ -76,9 +76,9 @@ cube whose keys scale and shear it together. It requires:
   * The loader refuses, with a message naming why: a `motion` block with no `motion_interval`; one
     with a single key; `translate` beside `motion`; fur on, or a medium bounded by, a moving
     object; an interval that excludes the instant; `shutter_close` before `shutter_open`. It keeps
-    an aimed area light in a moving group, and a light its keys scale, at the instant, saying so --
-    and a render held sharp late in the shutter shows the aimed light there while its sibling
-    balls (one an isosurface) have moved -- and builds
+    a sun in a moving group, and a light its keys scale, at the instant, saying so -- and a render
+    held sharp late in the shutter shows the sun's shadows where the instant has them while its
+    sibling balls (one an isosurface) have moved -- and builds
     a sphere its keys stretch as a mesh, as it does one an uneven static scale stretches.
 Exits 1 on any failure.
 """
@@ -294,7 +294,7 @@ def specular_scene(shutter=(-0.5, 0.5)):
 
 
 # A group that moves and turns (rigidly, as a light must), holding an area panel, a glowing ball,
-# a spot, a tube and an emissive triangle.
+# a spot, a tube, an emissive triangle and an aimed panel (its normal leaning off its face).
 LIGHTS = [dict(translate=(-0.5, 1.7, 0.0), rotate=(0, -30, 0)),
           dict(translate=(0.5, 1.5, 0.2), rotate=(0, 40, 10))]
 
@@ -309,6 +309,8 @@ def lights_scene(obj, u=None, shutter=None):
             "spd preset:bb6500  power 12 }  "
             "light cylinder { center 0 -0.2 -0.3  axis 1 0 0  length 0.4  radius 0.02  "
             "spd preset:bb4000  power 8 }  "
+            "light area { origin 0.25 0.1 0.25  u 0.2 0 0  v 0 0 0.2  normal 0.6 -1 0.3  "
+            "spd preset:bb5600  power 10 }  "
             'mesh "glow_tri" { file "%s"  material glow  translate 0.1 -0.3 0.35  rotate 90 0 0  scale 1.5 }'
             % obj)
     return NL.join([
@@ -325,15 +327,38 @@ def lights_scene(obj, u=None, shutter=None):
     ]) + NL
 
 
+# A group that slides 1.6 m and turns, holding an aimed panel and a spot, the scene's only lights:
+# where either is at a time is most of what the floor and the wall show.
+LONE = [dict(translate=(-0.8, 1.6, 0.0), rotate=(0, -25, 0)),
+        dict(translate=(0.8, 1.4, 0.3), rotate=(0, 35, 8))]
+
+
+def lone_lights_scene(u=None, shutter=None):
+    """An aimed panel and a spot alone in the LONE group, moving, or held at u."""
+    cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
+    body = ("light area { origin -0.15 0 -0.15  u 0.3 0 0  v 0 0 0.3  normal 0.7 -1 0.2  "
+            "spd preset:bb5600  power 25 }  "
+            "light spot { origin 0.3 0 0  dir 0.3 -1 -0.4  inner_angle 15  outer_angle 25  "
+            "spd preset:bb6500  power 15 }")
+    return NL.join([
+        "scene { units meters  motion_interval -0.5 0.5 }",
+        'material "white" { type diffuse reflect 0.7 }',
+        "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }",
+        "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material white }",
+        "group { %s  %s }" % (xf(LONE, u, 1.0), body),
+        'camera "c" { eye 0 1.0 4.2  look_at 0 0.7 0  up 0 1 0  fov_y 45  %sfilm { res %d %d } }'
+        % (cam, W, H),
+    ]) + NL
+
+
 def still_scene(obj, u=None, shutter=None):
-    """A moving group holding a ball, an isosurface ball and an aimed area light: the two balls
-    move, the light (which cannot) stays at the instant. With `u`, the static equivalent: the
-    balls held at u and the light at the instant (u = 0.5)."""
+    """A moving group holding a ball, an isosurface ball and a sun: the two balls move, the sun
+    (which cannot: it is not anywhere) stays at the instant. With `u`, the static equivalent: the
+    balls held at u and the sun outside the group."""
     keys = [dict(translate=(-0.6, 0.45, 0.2)), dict(translate=(0.6, 0.45, 0.2))]
     ball = ("sphere { center 0 0 0  radius 0.25  material gold }  "
             "isosurface { material blue  sphere { center 0.3 0.15 0  radius 0.15 } }")
-    still = ("light area { origin -0.3 0.6 -0.2  u 0.3 0 0  v 0 0 0.3  normal 0.4 -1 0  "
-             "spd preset:bb5200  power 15 }")
+    still = "light sun { dir 0.4 1 0.3  angle 2  spd preset:d65 }"
     cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
     lines = [
         "scene { units meters  motion_interval -0.5 0.5 }",
@@ -428,10 +453,10 @@ REFUSED = [
 ]
 # (what stays at the instant, the scene, the warning it must print) -- loaded, not refused
 STILL = [
-    ("an aimed area light in a moving group",
-     "group { motion { key { translate 0 0 0 } key { translate 1 0 0 } }  light area { origin 0 1 0  "
-     "u 0.2 0 0  v 0 0 0.2  normal 0.5 -1 0  spd preset:bb6500  power 5 } }",
-     "an aimed area light in a moving group stays where it is"),
+    ("a sun in a moving group",
+     "group { motion { key { translate 0 0 0 } key { translate 1 0 0 } }  light sun { dir 0.3 1 0.2  "
+     "angle 1  spd preset:d65 } }",
+     "a sun or sky light in a moving group stays where it is"),
     ("a light its keys scale",
      "group { motion { key { scale 1 } key { scale 1.5 } }  light sphere { center 0 1 0  radius 0.05  "
      "spd preset:bb6500  power 5 } }", "whose keys scale or shear it stays where it is"),
@@ -557,19 +582,38 @@ def main():
     bad = (z > 5.0) & (rel > 0.03)
     verdict("the kinds that cannot move stay; their siblings move", not bad.any(),
             "worst block z %.1f rel %.3f; %d blocks out" % (z.max(), rel.max(), bad.sum()))
-    # Lights move with their group -- an area panel, a glowing ball, a spot, a tube and an
-    # emissive triangle -- in every mode that blurs: held sharp at a time, the scene is the static
-    # group written out there.
-    for t in (-0.3, 0.35):
+    # Lights move with their group -- an area panel, a glowing ball, a spot, a tube, an emissive
+    # triangle and an aimed panel -- in every mode that blurs: held sharp at a time, the scene is
+    # the static group written out there. And an aimed panel and a spot alone, sliding far, in
+    # every mode on both devices: modes U and S take the time a pass, and U's light paths and
+    # connections carry each light there (mode U's spot stayed at the instant on the CPU, and
+    # every light did on the GPU, until 0.425.0, as an aimed panel did in every mode).
+    light_modes = [("R", "cpu", ["-spp", "512"]), ("B", "cpu", ["-n", "40000000"]), ("D", "cpu", ["-spp", "256"])]
+    lone_modes = light_modes + [("U", "cpu", ["-spp", "256"]), ("S", "cpu", ["-spp", "128", "-n", "200000"])]
+    if not a.no_gpu:
+        lone_modes += [("R", "gpu", ["-spp", "512"]), ("B", "gpu", ["-n", "40000000"]),
+                       ("U", "gpu", ["-spp", "256"]), ("S", "gpu", ["-spp", "128", "-n", "200000"]),
+                       # M at 8 M photons: at 2 M a near-black corner block of a map that sparse
+                       # reads 5 sigma off from map to map
+                       ("J", "gpu", ["-spp", "128", "-jsurf"]), ("M", "gpu", ["-spp", "128", "-n", "8000000"])]
+    held = [(t, "lights", lambda u=None, shutter=None: lights_scene(objf, u, shutter), light_modes)
+            for t in (-0.3, 0.35)] + [(0.35, "two lights alone", lone_lights_scene, lone_modes)]
+    for t, what, make, modes in held:
         sharp, ref = os.path.join(out, "lights_sharp.ftsl"), os.path.join(out, "lights_ref.ftsl")
-        write(sharp, lights_scene(objf, shutter=(t, t)))
-        write(ref, lights_scene(objf, u=t + 0.5))
-        for mode, margs in (("R", ["-spp", "512"]), ("B", ["-n", "40000000"]), ("D", ["-spp", "256"])):
-            args = ["-mode", mode, "-device", "cpu"] + margs
-            la = [lum(render(exe, out, sharp, "lights_sharp_s%d" % s, args, seed=s)[0]) for s in (1, 2)]
-            lb = [lum(render(exe, out, ref, "lights_ref_s%d" % s, args, seed=s)[0]) for s in (1, 2)]
-            good, detail = agree(la, lb, 0.05)
-            verdict("lights move with their group (mode %s, sharp at %g)" % (mode, t), good, detail)
+        write(sharp, make(shutter=(t, t)))
+        write(ref, make(u=t + 0.5))
+        for mode, dev, margs in modes:
+            args = ["-mode", mode, "-device", dev] + margs
+            gpu = dev == "gpu"
+            la = [lum(render(exe, out, sharp, "lights_sharp_s%d" % s, args, seed=s, want_gpu=gpu)[0])
+                  for s in (1, 2)]
+            lb = [lum(render(exe, out, ref, "lights_ref_s%d" % s, args, seed=s, want_gpu=gpu)[0])
+                  for s in (1, 2)]
+            # the merging and density modes' blocks are noisier (their tolerances elsewhere here)
+            tol = {"S": 0.15, "M": 0.10, "J": 0.10, "U": 0.10}.get(mode, 0.05)
+            good, detail = agree(la, lb, tol)
+            verdict("%s move with their group (mode %s%s, sharp at %g)"
+                    % (what, mode, " on the GPU" if gpu else "", t), good, detail)
     # An isosurface, a curve and an instance move, turn and grow with their group: held sharp at
     # a time, they are the static group written out there.
     for t in (-0.35, 0.4):

@@ -653,7 +653,7 @@ struct BackwardRenderer {
         // Le * aimCos -- the emitter-side cosine of G -- while the area -> solid-angle MEASURE is
         // the patch's own cos_geom. For an untilted light both are cosLight, bit for bit.
         double cosGeo = cosLight;
-        if (em.normalTilted) { cosGeo = dot(em.nGeom, wi * -1.0); cosLight = em.aimCos(wi * -1.0); }
+        if (em.normalTilted) { cosGeo = dot(scene.aimFaceNow(em), wi * -1.0); cosLight = scene.aimCosNow(em, wi * -1.0); }
         if (cosLight <= 0 || !(cosGeo > 0.0)) return false;   // tested first: a dual-scattering
         double cosSurf, stG;                             // response is a shadow WALK, and
         if (!response(wi, cosSurf, stG)) return false;    // a back-facing sample is free to skip
@@ -1628,7 +1628,7 @@ struct BackwardRenderer {
                 wi = toL / dist;
                 // The light is one-sided, and an AIMED quad emits Le * aimCos per unit area toward
                 // the vertex (see emitterGeom). The same expression unless the light is tilted.
-                const double cosLight = em.normalTilted ? em.aimCos(wi * -1.0) : dot(nLight, -wi);
+                const double cosLight = em.normalTilted ? scene.aimCosNow(em, wi * -1.0) : dot(nLight, -wi);
                 if (cosLight <= 0) return false;
                 geom = cosLight / dist2 * effArea;         // no surface cosine at a volume vertex
                 if (epat != 1.0) geom *= epat;

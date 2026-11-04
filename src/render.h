@@ -596,22 +596,22 @@ struct Renderer {
                     return true;
                 dir = w;
                 if (em && em->shape == EmitterShape::Spot) {
-                    const double ct = dot(dir, em->beamDir);
+                    const double ct = dot(dir, scene.lightDirNow(*em, em->beamDir));   // the axis now
                     if (ct <= em->spotCosOuter) return false;     // outside the cone: p_u = 0
                     const double omegaOuter = 2.0 * PI * (1.0 - em->spotCosOuter);
                     spotW = spotFalloff(ct, em->spotCosInner, em->spotCosOuter)
                           * omegaOuter / em->spotOmega;
-                } else if (em && (em->normalTilted ? em->aimCos(dir) <= 0.0
+                } else if (em && (em->normalTilted ? scene.aimCosNow(*em, dir) <= 0.0
                                                    : dot(dir, emitN) <= 0.0)) {
                     return false;                                 // below the horizon: p_u = 0
                 }
             }
             double pu;
             if (em && em->shape == EmitterShape::Spot) {
-                const double ct = dot(dir, em->beamDir);
+                const double ct = dot(dir, scene.lightDirNow(*em, em->beamDir));
                 pu = (ct > em->spotCosOuter) ? 1.0 / (2.0 * PI * (1.0 - em->spotCosOuter)) : 0.0;
             } else if (em && em->normalTilted) {
-                pu = em->aimDirPdf(dir);                          // an aimed quad (Emitter::nGeom)
+                pu = scene.aimDirPdfNow(*em, dir);                // an aimed quad (Emitter::nGeom)
             } else if (em) {
                 const double c = dot(dir, emitN);
                 pu = (c > 0.0) ? c / PI : 0.0;                    // cosine hemisphere
@@ -2826,7 +2826,7 @@ struct Renderer {
             if (em.collimated) dir = scene.lightDirNow(em, em.beamDir);
             else if (em.normalTilted) {             // an aimed quad: intensity-proportional
                 double pdfAim = 0.0;
-                dir = em.sampleAimDir(rng, pdfAim);
+                dir = scene.sampleAimDirNow(em, rng, pdfAim);
                 if (!(pdfAim > 0.0)) return;
             } else dir = cosineHemisphere(emitN, rng);
         }
@@ -2943,7 +2943,8 @@ struct Renderer {
             // rho/PI * cos(emitN) becomes aimCos / aimNorm -- rho = PI/aimNorm about the aim --
             // and nothing reaches a camera or a mirror behind the face.
             const double rhoE = em.normalTilted ? PI / em.aimNorm : 1.0;
-            const Vec3* plane = em.normalTilted ? &em.nGeom : nullptr;
+            const Vec3 face = em.normalTilted ? scene.aimFaceNow(em) : Vec3{0, 0, 0};
+            const Vec3* plane = em.normalTilted ? &face : nullptr;
             camSplatAll(scene, cams, nCam, origin, emitN, emitN, emitN, lambda, beta, rhoE, rng, plane);
             camSpecularSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, rhoE, rng, plane);
         }
@@ -3783,7 +3784,7 @@ struct Renderer {
             if (em.collimated) dir = scene.lightDirNow(em, em.beamDir);
             else if (em.normalTilted) {             // an aimed quad -- see the scalar tracer
                 double pdfAim = 0.0;
-                dir = em.sampleAimDir(rng, pdfAim);
+                dir = scene.sampleAimDirNow(em, rng, pdfAim);
                 if (!(pdfAim > 0.0)) return;
             } else dir = cosineHemisphere(emitN, rng);
         }
@@ -3826,7 +3827,8 @@ struct Renderer {
             em.shape != EmitterShape::Sun) {
             // An aimed quad: rho = PI/aimNorm about the aim, gated by its face (scalar tracer).
             const double rhoE = em.normalTilted ? PI / em.aimNorm : 1.0;
-            const Vec3* plane = em.normalTilted ? &em.nGeom : nullptr;
+            const Vec3 face = em.normalTilted ? scene.aimFaceNow(em) : Vec3{0, 0, 0};
+            const Vec3* plane = em.normalTilted ? &face : nullptr;
             double rhoOne[hero::kHeroMax]; for (int i = 0; i < C; ++i) rhoOne[i] = rhoE;
             camSplatAllHero(scene, cams, nCam, origin, emitN, emitN, emitN, lam, beta, rhoOne, C, rng,
                             plane);

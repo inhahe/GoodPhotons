@@ -196,21 +196,29 @@ Proper fix: carry the optics in `CameraPose` (the focal length, aperture radius 
 distance, or the f-number and focus to re-derive them from) and have `Camera::poseAt` set them;
 `keyPathFrames` would then blend them from the frames' own.
 
-## OPEN (2026-11-03, 0.410.0): MOTION-LIGHT-RIGID — a light that its keys would scale or shear, an aimed area light, and a sun or sky in a moving group stay at the instant
+## OPEN (2026-11-03, 0.410.0): MOTION-LIGHT-RIGID — a light that its keys would scale or shear, and a sun or sky in a moving group stay at the instant
+
+**An aimed area light moves since 0.425.0** (`Scene::aimCosNow` and kin; the third kind below,
+kept for the record). That change also found mode U leaving moving lights at the instant: the
+host's VCM light subpath and connection read a spot's origin and beam at the instant, and the
+device's VCM kernels (`kVcmLightT`, `kVcmCameraT`) carried no light at all, so GPU mode U, which
+blurs since 0.421.0, lit a moving scene from where its lights sat at the instant. Both now carry
+them, and check_motion's moving-lights test runs modes U and S (both devices) and J and M (the
+GPU) too, where it had run R, B and D.
 
 Lights move since 0.410.0, but only rigidly (`Emitter::motion`, `Scene::lightPointNow`): under a
 rigid motion every length, area and angle of a light stands, so each sampler runs where the
 light sits at the instant and only its inputs and outputs are carried, and every density stays
-exact. Three kinds are kept at the instant, with their surfaces, and the loader warns once per
+exact. These kinds are kept at the instant, with their surfaces, and the loader warns once per
 kind (`moveChildren`):
 - a light in a group whose keys scale or shear it over the shutter. Reproduce: `group { motion {
   key { scale 1 } key { scale 1.5 } }  light sphere { … } }`. Proper fix: carry the area
   Jacobian `|det D| |D^-T n|` into each light's sampled density (or fold it into the returned
   weight, keeping the MIS densities consistent) and, for spheres, cones and spots, the solid
   angle's change under a scale.
-- an aimed area light (a `normal` that leans). Its `aimCos` / `aimDirPdf` / `sampleAimDir` /
-  `aimRadiance` / `nGeom` would need the query direction carried into the instant's frame and
-  the sampled one carried out, at about ten sites.
+- (DONE in 0.425.0) an aimed area light (a `normal` that leans). Its `aimCos` / `aimDirPdf` /
+  `sampleAimDir` / `aimRadiance` / `nGeom` needed the query direction carried into the instant's
+  frame and the sampled one carried out, at about ten sites on each device.
 - a sun or sky in a moving group: they are not anywhere, and turning their direction with the
   group is a different feature (a rotating environment).
 

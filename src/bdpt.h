@@ -336,11 +336,11 @@ struct Vertex {
     }
     // Emitted radiance (single wavelength) leaving this vertex toward direction w,
     // if it is (or sits on) a light. 0 otherwise or if w is on the unlit side.
-    double Le(const Vec3& w, double lambda, double invPdfLambda) const {
+    double Le(const Scene& scene, const Vec3& w, double lambda, double invPdfLambda) const {
         if (!mat || !mat->isLight) return 0.0;
         if (dot(ng, w) <= 0.0) return 0.0;           // one-sided emitter
-        if (light && light->normalTilted)            // an aimed quad (Emitter::nGeom)
-            return mat->emit(lambda) * invPdfLambda * emitPatW * light->aimRadiance(w);
+        if (light && light->normalTilted)            // an aimed quad (Emitter::nGeom), at the path's time
+            return mat->emit(lambda) * invPdfLambda * emitPatW * scene.aimRadianceNow(*light, w);
         return mat->emit(lambda) * invPdfLambda * emitPatW;
     }
     bool isLightVertex() const {
@@ -579,7 +579,7 @@ inline double vertexPdfLight(const Scene& scene, const Vertex& cur, const Vertex
         if (solid <= 0.0) return 0.0;
         pdf = (1.0 / solid) * invD2;                 // uniform in the outer cone
     } else if (cur.light && cur.light->normalTilted) {
-        const double pAim = cur.light->aimDirPdf(w); // an aimed quad (Emitter::nGeom)
+        const double pAim = scene.aimDirPdfNow(*cur.light, w);   // an aimed quad (Emitter::nGeom)
         if (!(pAim > 0.0)) return 0.0;
         pdf = pAim * invD2;
     } else {
@@ -2096,7 +2096,7 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     Vertex L0;
     // An aimed quad's vertex carries its FACE (Emitter::nGeom) -- what every density
     // conversion at it measures -- and samplePoint's nOut is its aim.
-    const Vec3 nFace = em.normalTilted ? em.nGeom : nOut;
+    const Vec3 nFace = em.normalTilted ? scene.aimFaceNow(em) : nOut;
     L0.type = VType::Light; L0.p = y; L0.ns = nFace; L0.ng = nFace;
     L0.light = &em; L0.matId = em.matId;
     L0.mat = (em.matId >= 0) ? &scene.mats[em.matId] : nullptr;
@@ -2114,8 +2114,8 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     Vec3 dir;
     double cosLight, pdfDir;
     if (em.normalTilted) {                            // an aimed quad: intensity-proportional
-        dir = em.sampleAimDir(rng, pdfDir);
-        cosLight = em.aimCos(dir);                    // Le(dir) * cos_geom = Le * aimCos
+        dir = scene.sampleAimDirNow(em, rng, pdfDir);
+        cosLight = scene.aimCosNow(em, dir);          // Le(dir) * cos_geom = Le * aimCos
         if (!(pdfDir > 0.0) || cosLight <= 0.0) return 1;
     } else {
         dir = cosineHemisphere(nOut, rng);
@@ -3552,13 +3552,13 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         Vec3 dwo = eye[t - 2].p - pt.p;          // degeneracy guard: normalize(0) is NaN
         if (dot(dwo, dwo) == 0.0) return 0.0;
         Vec3 wo = normalize(dwo);
-        double Le = pt.Le(wo, lambda, invPdfLambda);
+        double Le = pt.Le(scene, wo, lambda, invPdfLambda);
         nUp = pt.nUp;
         // The hero may legitimately be black where a secondary is not, so the early-out
         // tests the max over the live wavelengths (identical to `Le <= 0` when nUp==1).
         double LeSec[hero::kHeroMax - 1] = {0}, mxLe = Le;
         for (int i = 0; i + 1 < nUp; ++i) {
-            LeSec[i] = pt.Le(wo, hb.lam[i + 1], hb.invPdf[i + 1]);
+            LeSec[i] = pt.Le(scene, wo, hb.lam[i + 1], hb.invPdf[i + 1]);
             if (LeSec[i] > mxLe) mxLe = LeSec[i];
         }
         if (!(mxLe > 0.0)) return 0.0;
@@ -3749,11 +3749,11 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                 if (dist2 <= 0.0) return 0.0;
                 dist = std::sqrt(dist2); wi = toL / dist;
                 // One-sided; an aimed quad sends Le * aimCos per unit area (Emitter::nGeom).
-                double cosLight = em.normalTilted ? em.aimCos(wi * -1.0) : dot(nOut, wi * -1.0);
+                double cosLight = em.normalTilted ? scene.aimCosNow(em, wi * -1.0) : dot(nOut, wi * -1.0);
                 if (cosLight <= 0.0) return 0.0;       // emitter stays one-sided
                 if (em.area <= 0.0) return 0.0;
                 Wgeom = cosLight * em.area / (dist2 * pdfChoice);   // == cosLight/(d^2 * pdfA)
-                if (em.normalTilted) nOut = em.nGeom;  // the vertex carries the face (see L0)
+                if (em.normalTilted) nOut = scene.aimFaceNow(em);   // the vertex carries the face (see L0)
             }
             // The emitter was CHOSEN at the hero wavelength; only its emitted radiance is
             // re-evaluated per-λ (the pdf stays hero-driven, as everywhere else).
