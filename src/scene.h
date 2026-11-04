@@ -2541,6 +2541,10 @@ struct Scene {
         const double toPlane = -along - sceneRadius;
         if (outside && !mayDrop) return true;
         if (!outside && !(toPlane > 0.0)) return true;
+        if (!outside && !occluded(origin, dir, toPlane, 0.0)) {   // the usual case: nothing upstream
+            origin = origin + dir * toPlane;
+            return true;
+        }
         const Hit h = closestHit(Ray{origin, dir}, 0.0);
         const double back = 1e-3 * sceneRadius;   // haze that short a way is none to speak of
         if (outside && !h.valid) return false;

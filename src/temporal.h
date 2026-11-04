@@ -19,7 +19,8 @@
 //      new frame's share 1/n while the history is young (n frames long) and at least `alpha`
 //      after, so the history converges and still follows lighting that changes. The variance --
 //      of the accumulated mean, what the filter smooths -- comes from the moments over the
-//      history's length once four frames have accumulated, and from a 7x7 neighbourhood before.
+//      history's length once four frames have accumulated, and before that from the pixel's own
+//      surface in a 7x7 neighbourhood.
 //   4. An a-trous wavelet filter (5x5 B3-spline, steps 1, 2, 4, ...) smooths the accumulated
 //      illumination, its weights stopping at depth, normal and luminance edges -- the last scaled
 //      by the local standard deviation, so a pixel whose history is converged keeps its detail.
@@ -72,8 +73,9 @@ class Svgf {
 public:
     explicit Svgf(SvgfOptions o = SvgfOptions{}) : opt_(o) {}
 
-    // Denoise `f`, the shot's next frame, reading and then updating the history.
-    std::vector<Vec3> process(const Frame& f) {
+    // Denoise `f`, the shot's next frame, into `out`, reading and then updating the history. False
+    // when a stop arrived part-way: `out` and the history are then not to be used.
+    bool process(const Frame& f, std::vector<Vec3>& out) {
         const int W = f.W, H = f.H;
         const size_t N = (size_t)W * (size_t)H;
         if (W != W_ || H != H_) reset(W, H);
@@ -90,7 +92,7 @@ public:
         if (opt_.clampRadius > 0 && havePrev_) {
             boxLo.resize(N); boxHi.resize(N);
             const int r = opt_.clampRadius;
-            ft::parallelFor((size_t)H, 1, [&](size_t row) {
+            if (!ft::parallelFor((size_t)H, 1, [&](size_t row) {
                 const int py = (int)row;
                 for (int px = 0; px < W; ++px) {
                     const size_t i = (size_t)py * W + px;
@@ -114,12 +116,13 @@ public:
                     boxLo[i] = mu - sd * opt_.clampGamma;
                     boxHi[i] = mu + sd * opt_.clampGamma;
                 }
-            });
+            }))
+                return false;
         }
         // 2-3. Reproject and accumulate.
         std::vector<Vec3> acc(N);
         std::vector<double> m1(N), m2(N), len(N), var(N);
-        ft::parallelFor((size_t)H, 1, [&](size_t row) {
+        if (!ft::parallelFor((size_t)H, 1, [&](size_t row) {
             const int py = (int)row;
             for (int px = 0; px < W; ++px) {
                 const size_t i = (size_t)py * W + px;
@@ -179,9 +182,11 @@ public:
                     acc[i] = illum[i]; m1[i] = l; m2[i] = l * l; len[i] = 1.0;
                 }
             }
-        });
-        // The variance: temporal from four frames on, else spatial over a 7x7 neighbourhood.
-        ft::parallelFor((size_t)H, 1, [&](size_t row) {
+        }))
+            return false;
+        // The variance: temporal from four frames on, else spatial over the pixel's own surface in
+        // a 7x7 neighbourhood (the contrast with another surface beside it is no noise).
+        if (!ft::parallelFor((size_t)H, 1, [&](size_t row) {
             const int py = (int)row;
             for (int px = 0; px < W; ++px) {
                 const size_t i = (size_t)py * W + px;
@@ -199,17 +204,18 @@ public:
                         const int x = px + dx, y = py + dy;
                         if (x < 0 || y < 0 || x >= W || y >= H) continue;
                         const size_t j = (size_t)y * W + x;
-                        if ((f.depth[j] > 0.0f) != (f.depth[i] > 0.0f)) continue;
+                        if (!sameSurface(f, i, j)) continue;
                         s1 += m1[j]; s2 += m2[j]; ws += 1.0;
                     }
                 var[i] = ws > 0.0 ? std::max(0.0, s2 / ws - (s1 / ws) * (s1 / ws)) / len[i] : 0.0;
             }
-        });
+        }))
+            return false;
         // 4. The a-trous passes.
         std::vector<Vec3> cur = acc, nxt(N);
         std::vector<double> v = var, vn(N);
         for (int it = 0; it < opt_.iterations; ++it) {
-            atrous(f, 1 << it, cur, v, nxt, vn);
+            if (!atrous(f, 1 << it, cur, v, nxt, vn)) return false;
             std::swap(cur, nxt);
             std::swap(v, vn);
             if (it == 0) histIllum_ = cur;   // the history the next frame reads
@@ -219,10 +225,10 @@ public:
         prevPosition_ = f.position; prevNormal_ = f.normal; prevDepth_ = f.depth;
         havePrev_ = true;
         // Remodulate.
-        std::vector<Vec3> out(N);
+        out.resize(N);
         for (size_t i = 0; i < N; ++i)
             out[i] = Vec3{cur[i].x * alb[i].x, cur[i].y * alb[i].y, cur[i].z * alb[i].z};
-        return out;
+        return true;
     }
 
 private:
@@ -242,12 +248,13 @@ private:
         prevPosition_.clear(); prevNormal_.clear(); prevDepth_.clear();
     }
 
-    // One a-trous pass at `step` pixels: `in`/`var` filtered into `out`/`varOut`.
-    void atrous(const Frame& f, int step, const std::vector<Vec3>& in, const std::vector<double>& var,
+    // One a-trous pass at `step` pixels: `in`/`var` filtered into `out`/`varOut`. False if a stop
+    // arrived part-way.
+    bool atrous(const Frame& f, int step, const std::vector<Vec3>& in, const std::vector<double>& var,
                 std::vector<Vec3>& out, std::vector<double>& varOut) const {
         const int W = f.W, H = f.H;
         static const double kH[5] = {1.0 / 16, 1.0 / 4, 3.0 / 8, 1.0 / 4, 1.0 / 16};
-        ft::parallelFor((size_t)H, 1, [&](size_t row) {
+        return ft::parallelFor((size_t)H, 1, [&](size_t row) {
             const int py = (int)row;
             for (int px = 0; px < W; ++px) {
                 const size_t i = (size_t)py * W + px;

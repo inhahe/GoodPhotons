@@ -247,8 +247,8 @@ inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& al
 // Where point `p0`, at the frame's instant on a primitive of motion set `set` (-1: still), sits
 // `frames` frames out, from the motion interval's end on that side (or the other end, when the
 // interval stops at the instant): when `frames` is a whole number n of that end's time, its
-// motion from the instant applied n times -- exact for a steady motion, turning included, as a
-// rolling wheel's is -- and otherwise carried linearly past it. An estimate beyond the interval,
+// motion from the instant applied n times (its inverse, for a negative n) -- exact for a steady
+// motion, turning included, as a rolling wheel's is -- and otherwise carried linearly past it. An estimate beyond the interval,
 // as a frame's own keys are all it knows of its neighbours.
 inline Vec3 framePoint(const Scene& scene, int set, const Vec3& p0, double frames) {
     if (set < 0 || !(scene.motionB > scene.motionA)) return p0;
@@ -257,9 +257,12 @@ inline Vec3 framePoint(const Scene& scene, int set, const Vec3& p0, double frame
     if (end == 0.0) return p0;
     const Affine D = scene.motionAt(set, scene.motionU(end));
     const double ratio = frames / end, n = std::round(ratio);
-    if (n >= 1.0 && n <= 16.0 && std::fabs(ratio - n) < 1e-9) {
+    if (std::fabs(n) >= 1.0 && std::fabs(n) <= 16.0 && std::fabs(ratio - n) < 1e-9) {
+        // A negative count -- a frame back over an interval that ends at the instant on that side
+        // -- applies the motion's inverse.
+        const Affine M = n > 0.0 ? D : D.inverse();
         Vec3 p = p0;
-        for (int i = 0; i < (int)n; ++i) p = D.apply(p);
+        for (int i = 0; i < (int)std::fabs(n); ++i) p = M.apply(p);
         return p;
     }
     return p0 + (D.apply(p0) - p0) * ratio;

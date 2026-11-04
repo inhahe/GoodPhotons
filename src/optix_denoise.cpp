@@ -1,4 +1,7 @@
 // OptiX's temporal denoiser: see optix_denoise.h.
+// The normal guide is world space: optix_types.h says so for every model but the legacy LDR/HDR
+// ones, and NVIDIA recommends it for them all on R535+ drivers (optix_host.h's older note asking
+// camera space of the temporal models predates that).
 #ifndef NOMINMAX
 #define NOMINMAX   // optix_stubs.h brings <windows.h>, whose min/max macros would eat std::max
 #endif

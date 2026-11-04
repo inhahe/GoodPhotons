@@ -7162,7 +7162,7 @@ OIDN supports it (about 10 ms a 960×540 frame on an RTX 4090), else on the CPU.
 | `-oidn-noguides` | denoise the colour alone (implies `-oidn`) |
 | `-oidn-guide-spp <n>` | guide rays per pixel, rounded to a square (default 16) |
 | `-oidn-write-guides` | also write each camera's guides beside `-o`: `<out>.albedo.pfm`, `<out>.normal.pfm` (normals in −1…1); with `-write-aovs`, the AOVs below too. Implies `-oidn`. Guides traced through a physical lens are not noise-free, and get a `<out>.guides-noisy.txt` beside them so `-topng` does not treat them as clean |
-| `-write-aovs` | write the guide pass's images beside `-o` whether or not anything is denoised (since 0.411.0), for a temporal denoiser or a compositor: `.albedo.pfm`, `.normal.pfm`, and from one ray through each pixel's centre at the frame's instant `.depth.pfm` (distance along the camera's axis, in all three channels; 0 where nothing is met), `.position.pfm` (world position), `.prevposition.pfm` (where that point sat a frame earlier, carried by its motion keys), `.motion.pfm` and `.motionfwd.pfm` (in pixels, where the point sits a frame earlier / later in this image minus where it sits: x right, y up, z 0). A point moves by its keys, carried a frame out linearly from the motion interval's ends; the camera a frame away is a camera path's neighbouring frame, or a keyed camera's keys carried a frame out; a pixel that meets nothing moves with the sky as the camera turns. Through a physical lens these come from a pinhole at the same pose |
+| `-write-aovs` | write the guide pass's images beside `-o` whether or not anything is denoised (since 0.411.0), for a temporal denoiser or a compositor: `.albedo.pfm`, `.normal.pfm`, and from one ray through each pixel's centre at the frame's instant `.depth.pfm` (distance along the camera's axis, in all three channels; 0 where nothing is met), `.position.pfm` (world position), `.prevposition.pfm` (where that point sat a frame earlier, carried by its motion keys), `.motion.pfm` and `.motionfwd.pfm` (in pixels, where the point sits a frame earlier / later in this image minus where it sits: x right, y up, z 0). A point moves by its keys, carried a frame out from the motion interval's end on that side -- its motion there repeated (or undone) as many times as a frame holds of it, exact for a steady motion, a turn included, and linear past it otherwise; the camera a frame away is a camera path's neighbouring frame, or a keyed camera's keys carried a frame out; a pixel that meets nothing moves with the sky as the camera turns. Through a physical lens these come from a pinhole at the same pose |
 | `-oidn-guides <stem>` | `-topng` only: develop with the guides in `<stem>.albedo.pfm` / `<stem>.normal.pfm` |
 | `-oidn-quality high\|balanced\|fast` | OIDN's quality mode (default `high`) |
 | `-oidn-device auto\|cpu\|cuda` | which OIDN device (default `auto`: the GPU if OIDN supports it — but the CPU under `-device cpu`, which is often chosen to keep off a busy GPU) |
@@ -7215,7 +7215,11 @@ exposure. `svgf` takes three more options, for a shot unlike the one it was tune
 | `-clamp <g>` | 0.75 | how far, in local standard deviations, the history may stray from the frame's own light before it is pulled in; `0` turns the clamp off |
 
 The `-oidn-quality` and `-oidn-device` options set `oidn`'s denoiser. Any other option is an
-error. OIDN 3's temporal model, announced for the second half of 2026, is not released yet
+error, and so is anything before `-denoise-shot` on the command line. It makes the output's
+directory, refuses an output whose PNG or PFM would overwrite the render it denoises, and, when
+stopped part-way through a frame (`ftrace -stop`), writes nothing of that frame. A shot rendered
+through a physical lens has noisy guides (the `.guides-noisy.txt` beside them says so), and
+`oidn` then does not treat them as clean. OIDN 3's temporal model, announced for the second half of 2026, is not released yet
 (its latest is 2.5.1); it will join as a method when it is.
 
 `tools/temporal_compare.py` scores the methods on one shot: a striped ball rolling across a

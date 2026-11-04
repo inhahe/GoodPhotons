@@ -8929,7 +8929,7 @@ private:
         if (end == 0.0) return now;
         const CameraPose e = m.at(end);
         const double f = frames / end, n = std::round(f);
-        if (n >= 1.0 && n <= 16.0 && std::fabs(f - n) < 1e-9) {
+        if (std::fabs(n) >= 1.0 && std::fabs(n) <= 16.0 && std::fabs(f - n) < 1e-9) {
             // The camera's frame (right, up, forward) at a pose, and the rigid move between two.
             const auto axes = [](const CameraPose& p, Vec3 (&ax)[3]) {
                 ax[2] = normalize(p.look - p.eye);
@@ -8943,11 +8943,21 @@ private:
             const auto rot = [&](const Vec3& v) {
                 return a1[0] * dot(a0[0], v) + a1[1] * dot(a0[1], v) + a1[2] * dot(a0[2], v);
             };
+            // R^-1 v = sum_k a0[k] (a1[k] . v): the move back, for a negative n
+            const auto unrot = [&](const Vec3& v) {
+                return a0[0] * dot(a1[0], v) + a0[1] * dot(a1[1], v) + a0[2] * dot(a1[2], v);
+            };
             CameraPose p = now;
-            for (int i = 0; i < (int)n; ++i) {
-                p.eye = rot(p.eye - now.eye) + e.eye;   // the move that took now to e, from p
-                p.look = rot(p.look - now.eye) + e.eye;
-                p.up = rot(p.up);
+            for (int i = 0; i < (int)std::fabs(n); ++i) {
+                if (n > 0.0) {
+                    p.eye = rot(p.eye - now.eye) + e.eye;   // the move that took now to e, from p
+                    p.look = rot(p.look - now.eye) + e.eye;
+                    p.up = rot(p.up);
+                } else {
+                    p.eye = unrot(p.eye - e.eye) + now.eye;   // ... and back
+                    p.look = unrot(p.look - e.eye) + now.eye;
+                    p.up = unrot(p.up);
+                }
             }
             p.fovY = now.fovY + (e.fovY - now.fovY) * f;
             return p;

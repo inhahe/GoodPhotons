@@ -10,8 +10,10 @@
     (`-clamp 0`).
   * `svgf`'s history converges: on the same shot held still, its last frame's error is under half
     its first's, while the noisy frames' stays where it was.
-  * -denoise-shot refuses a pattern with no frame number and an option it does not know, and
-    names -write-aovs when a frame's guides are missing.
+  * -denoise-shot refuses a pattern with no frame number, an option it does not know, an output
+    that would overwrite the render it denoises (leaving the render as it was), a frame range it
+    cannot read, and options before it; makes the output's directory; and names -write-aovs when
+    a frame's guides are missing.
 Exits 1 on any failure.
 """
 import argparse
@@ -98,6 +100,24 @@ def main():
                        encoding="utf-8", errors="replace")
     verdict("refuses an option it does not know", p.returncode != 0 and "-pases" in p.stderr,
             p.stderr.strip()[-200:])
+    noisy = os.path.join(moving, "noisy", "f%04d.pfm")
+    for name, cmd, phrase in (
+            ("refuses to overwrite the render it denoises",
+             ["-denoise-shot", "svgf", noisy, os.path.join(moving, "noisy", "f%04d.png"), "0", "1"], "overwrite"),
+            ("refuses a frame range it cannot read", ["-denoise-shot", "svgf", noisy, os.path.join(out, "x%04d.png"),
+                                                      "0", "4o"], "frame numbers"),
+            ("refuses options before it", ["-exposure", "2", "-denoise-shot", "svgf", noisy,
+                                            os.path.join(out, "x%04d.png"), "0", "1"], "comes first")):
+        before = open(os.path.join(moving, "noisy", "f0000.pfm"), "rb").read()
+        p = subprocess.run([exe] + cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        kept = open(os.path.join(moving, "noisy", "f0000.pfm"), "rb").read() == before
+        verdict(name, p.returncode != 0 and phrase in p.stderr and kept, p.stderr.strip()[-160:])
+    fresh = os.path.join(out, "made", "here")
+    shutil.rmtree(os.path.join(out, "made"), ignore_errors=True)
+    p = subprocess.run([exe, "-denoise-shot", "none", noisy, os.path.join(fresh, "f%04d.png"), "0", "0"],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    verdict("makes the output's directory", p.returncode == 0 and os.path.exists(os.path.join(fresh, "f0000.png")),
+            (p.stdout + p.stderr).strip()[-160:])
     bare = os.path.join(out, "bare")
     os.makedirs(bare, exist_ok=True)
     shutil.copy(os.path.join(moving, "noisy", "f0000.pfm"), os.path.join(bare, "f0000.pfm"))

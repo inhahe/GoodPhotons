@@ -104,7 +104,12 @@ each medium collision to the camera. Mode D agrees with R here (1.012), so the f
 suspect: its camera splat from medium vertices, or how far it lets the haze reach. Proper fix:
 one domain for the unbounded haze in every mode (the slab beyond the entry disc's plane is the
 natural one, since that is where the photons start), and a check that modes R, D and B agree on
-this scene.
+this scene. Under a blur the strategies disagree once more, for a mover outside the instant's
+sphere: a BDPT sun subpath entering outside the instant's disc walks the haze from the swept disc
+(it may not be dropped or shortened alone, being a strategy MIS weighs), a forward photon there
+starts just short of the mover, and the NEE leg counts `mediaExitDistance` from the mover. One
+domain for every estimator -- clipping an unbounded medium to the instant's sphere inside
+`mediaTr` and the free-flight samplers -- would end both (review of 51eb7ef..af7de14).
 
 ## OPEN (2026-11-03, 0.410.1): MOTION-ZOOM-APERTURE — a camera's zoom across the shutter keeps the instant's aperture and focus
 

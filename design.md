@@ -6803,7 +6803,9 @@ as the one at fault.
 - **`-denoise-shot`** (ROADMAP 11 stage D, 0.412.0; `main.cpp runDenoiseShot`): a rendered shot's
   frames, read as their PFM and their reprojection images, denoised in order and written as
   PNG + PFM at one exposure. It is dispatched beside `-serve`, so main's OIDN and CUDA teardown
-  runs after it. Methods:
+  runs after it; it must come first on the command line, refuses a frame range it cannot read and
+  an output that would overwrite the render it denoises, makes the output's directory, and on a
+  stop part-way through a frame writes nothing of it (`Svgf::process` returns false). Methods:
   - `svgf`: `temporal.h`'s `Svgf`, which keeps the history (illumination, luminance moments,
     length, and the previous frame's position, normal and depth). Albedo is demodulated. A
     history tap is accepted where the previous frame's world position lies within 2 % of the
@@ -10111,7 +10113,8 @@ sees the instant, exactly as a static scene with those transforms would show it.
   says so (`stillWarning`): a sun or sky, an aimed area light, and any light whose keys would
   scale or shear it stay at the instant with their surfaces, so nothing mixes a moved surface
   with an unmoved sampler. A coat whose strands move is traced as strands when some camera
-  may see it at another time (`anyCameraTimed`: a shutter open in a mode that blurs), since
+  may see it at another time (`anyCameraTimed`: any camera with an open shutter, in whatever
+  mode -- a lens, a routing or -on-unsupported may yet change that), since
   `-fur-volume`'s and `-dual-grid`'s fields hold it at the instant only; seen only at the
   instant, it keeps them.
 - **Lights move rigidly** (0.410.0; `Emitter::motion`). Rigid motion keeps every length, area and

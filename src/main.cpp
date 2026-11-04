@@ -15014,15 +15014,13 @@ static const char* const kMotionCpuWhy =
 // Whether mode `m` carries motion blur: each of its paths, or photons, is one time in the
 // shutter. Any other mode renders the frame's instant (run closes the shutter for it).
 static bool modeSeesMotion(char m) { return m != 0 && std::strchr("RDABC", m) != nullptr; }
-// Whether any camera of `L` may render at a time other than the instant: its shutter open, in a
-// mode that carries motion blur -- `cliMode` when -mode gave one, else the camera's own or the
-// scene's (a camera with none counts: the default mode is not known here).
-static bool anyCameraTimed(const ftsl::Loaded& L, char cliMode) {
-    const char fallback = L.defaultMode ? L.defaultMode : L.mode;
-    for (const auto& c : L.cameras) {
-        const char m = cliMode ? cliMode : (c.mode ? c.mode : fallback);
-        if ((c.shutterOpen != 0.0 || c.shutterClose != 0.0) && (m == 0 || modeSeesMotion(m))) return true;
-    }
+// Whether any camera of `L` may render at a time other than the instant: its shutter open.
+// Which mode it renders in is not asked -- a lens, a routing or -on-unsupported may change it
+// after this -- so a shutter counts in any mode; at worst a mode that closes it keeps strands it
+// could have summarised.
+static bool anyCameraTimed(const ftsl::Loaded& L) {
+    for (const auto& c : L.cameras)
+        if (c.shutterOpen != 0.0 || c.shutterClose != 0.0) return true;
     return false;
 }
 
@@ -22093,7 +22091,7 @@ static int run(int argc, char** argv) {
                 return;
             }
             // Last moment the fibers exist: take the summary off them, then delete them.
-            buildFurFields(L.scene, anyCameraTimed(L, cliModePrescan));
+            buildFurFields(L.scene, anyCameraTimed(L));
             if (!g_furVolData.valid()) return;      // no hair, or the fit failed -- nothing to drop
             const size_t before = L.scene.curveSegs.size();
             const auto t0 = std::chrono::steady_clock::now();
@@ -23571,7 +23569,7 @@ static int run(int argc, char** argv) {
     // every CurveSeg -- a scene with no fur, or a run without -dual-scatter, must not pay.
     // Both flags want the SAME field, so they share one build at the larger budget.
     {
-        buildFurFields(scene, anyCameraTimed(ftslScene, cliModePrescan));
+        buildFurFields(scene, anyCameraTimed(ftslScene));
 
         // The second BVH, the one every `skipHair` query traverses. Needed by anything that
         // makes fibers invisible to a ray: the -fur-volume / -fur-lod far tier (closestHit)
@@ -28785,8 +28783,20 @@ static int runDenoiseShot(int argc, char** argv, int at) {
                              "<first> <last> [-exposure <e>] [-passes <n>] [-alpha <a>] [-clamp <g>]\n");
         return 2;
     }
+    if (at != 1) {
+        std::fprintf(stderr, "error: -denoise-shot comes first: ftrace -denoise-shot <method> <in> <out> "
+                             "<first> <last> [options] -- '%s' before it would be ignored\n", argv[1]);
+        return 2;
+    }
     const std::string method = argv[at + 1], inPat = argv[at + 2], outPat = argv[at + 3];
-    const long long first = std::atoll(argv[at + 4]), last = std::atoll(argv[at + 5]);
+    char* e1 = nullptr;
+    char* e2 = nullptr;
+    const long long first = std::strtoll(argv[at + 4], &e1, 10), last = std::strtoll(argv[at + 5], &e2, 10);
+    if (!e1 || *e1 || !e2 || *e2 || last < first) {
+        std::fprintf(stderr, "error: -denoise-shot: <first> <last> are frame numbers, first <= last (got '%s' '%s')\n",
+                     argv[at + 4], argv[at + 5]);
+        return 2;
+    }
     double exposure = 0.0;
     temporal::SvgfOptions so;
     for (int i = at + 6; i < argc; ++i) {
@@ -28813,13 +28823,11 @@ static int runDenoiseShot(int argc, char** argv, int at) {
             if (!num(0, 100, v)) return 2;
             so.clampGamma = v;
             if (v == 0.0) so.clampRadius = 0;
+        } else if (!std::strcmp(argv[i], "-oidn-quality") || !std::strcmp(argv[i], "-oidn-device")) {
+            if (parseOidnFlag(argc, argv, i) != 1) return 2;   // oidn's settings
         } else {
-            const int r = parseOidnFlag(argc, argv, i);   // -oidn-quality, -oidn-device: for oidn
-            if (r < 0) return 2;
-            if (r == 0) {
-                std::fprintf(stderr, "error: -denoise-shot: unknown option '%s'\n", argv[i]);
-                return 2;
-            }
+            std::fprintf(stderr, "error: -denoise-shot: unknown option '%s'\n", argv[i]);
+            return 2;
         }
     }
     if (method != "svgf" && method != "optix" && method != "oidn" && method != "none") {
@@ -28835,6 +28843,8 @@ static int runDenoiseShot(int argc, char** argv, int at) {
     }
 #else
     optixdn::Temporal optix;
+    // On every way out, error or not: main tears down the CUDA context OptiX made.
+    struct NoteOptixCuda { ~NoteOptixCuda() { if (optixdn::usedCuda()) g_optixUsedCuda = true; } } noteOptixCuda;
 #endif
     if (method == "oidn" && !oidnStartup()) return 2;
     temporal::Svgf svgf(so);
@@ -28844,6 +28854,27 @@ static int runDenoiseShot(int argc, char** argv, int at) {
         if (!shotFramePath(inPat, k, in, err) || !shotFramePath(outPat, k, out, err)) {
             std::fprintf(stderr, "error: -denoise-shot: %s\n", err.c_str());
             return 2;
+        }
+        // The denoised frame must not land on the render it is made from.
+        const auto same = [](const std::string& a, const std::string& b) {
+            std::error_code ec;
+            std::wstring x = std::filesystem::absolute(std::filesystem::u8path(a), ec).lexically_normal().wstring();
+            std::wstring y = std::filesystem::absolute(std::filesystem::u8path(b), ec).lexically_normal().wstring();
+#ifdef _WIN32
+            for (std::wstring* z : {&x, &y})
+                for (wchar_t& c : *z) c = (wchar_t)::towlower((wint_t)c);
+#endif
+            return x == y;
+        };
+        if (same(pfmPathFor(out), pfmPathFor(in)) || same(out, pfmPathFor(in))) {
+            std::fprintf(stderr, "error: -denoise-shot: %s would overwrite the render it denoises (%s): give "
+                                 "the output another name or directory\n", out.c_str(), pfmPathFor(in).c_str());
+            return 2;
+        }
+        {
+            std::error_code ec;
+            const std::filesystem::path dir = std::filesystem::u8path(out).parent_path();
+            if (!dir.empty()) std::filesystem::create_directories(dir, ec);
         }
         const std::string stem = pfmPathFor(in).substr(0, pfmPathFor(in).size() - 4);
         temporal::Frame f;
@@ -28882,15 +28913,21 @@ static int runDenoiseShot(int argc, char** argv, int at) {
             return o;
         };
         if (method == "svgf") {
-            lin = svgf.process(f);
+            if (!svgf.process(f, lin)) {
+                std::printf("[denoise-shot] stopped during frame %lld: it is not written\n", k);
+                return 1;
+            }
         } else if (method == "none") {
             lin = f.color;
         } else {
             std::vector<float> col = floats(f.color, 3), alb = floats(f.albedo, 3), nrm = floats(f.normal, 3);
             bool ok = false;
             if (method == "oidn") {
-                ok = oidnrt::denoise(col.data(), alb.data(), nrm.data(), w, h, /*cleanAux*/true,
-                                     /*auxKey*/0, g_oidnOpts, err);
+                // Guides traced through a physical lens carry its pupil's noise (writeGuideFiles'
+                // marker says so), and OIDN must not take them for clean.
+                std::error_code ec;
+                const bool clean = !std::filesystem::exists(std::filesystem::u8path(stem + ".guides-noisy.txt"), ec);
+                ok = oidnrt::denoise(col.data(), alb.data(), nrm.data(), w, h, clean, /*auxKey*/0, g_oidnOpts, err);
             }
 #ifdef HAVE_OPTIX
             else {
@@ -28917,9 +28954,6 @@ static int runDenoiseShot(int argc, char** argv, int at) {
         std::printf("[denoise-shot] %s: frame %lld -> %s (exposure %.4g)\n", method.c_str(), k, out.c_str(),
                     used);
     }
-#ifdef HAVE_OPTIX
-    g_optixUsedCuda = optixdn::usedCuda();
-#endif
     return g_stopRequested ? 1 : 0;
 }
 

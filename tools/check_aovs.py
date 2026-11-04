@@ -13,7 +13,8 @@
     the pixel's centre, and the one a frame forward the same 0.4 m ahead, and its prevposition is
     the hit point 0.4 m back; a floor pixel far from the ball holds still (0, and where it sits).
   * A face turning a quarter turn a frame sat a quarter turn back a frame earlier (its keys' half-
-    frame turn applied twice).
+    frame turn applied twice) -- and over a one-sided interval (0 0.5), the half-frame turn undone
+    twice.
   * The middle frame of a camera path sees the still box move with the neighbouring frames'
     cameras: each pixel's backward vector is its world position projected by the previous frame's
     camera, minus the pixel's centre (and forward, by the next).
@@ -35,9 +36,9 @@ W, H = 80, 60
 EYE, LOOK, UP, FOV = (0.0, 1.0, 4.2), (0.0, 0.5, 0.0), (0.0, 1.0, 0.0), 40.0
 
 
-def box(extra, camera):
+def box(extra, camera, interval="-0.5 0.5"):
     return NL.join([
-        "scene { units meters  motion_interval -0.5 0.5 }",
+        "scene { units meters  motion_interval %s }" % interval,
         'material "white" { type diffuse reflect 0.7 }',
         'material "gold"  { type diffuse reflect rgb 0.8 0.6 0.2 }',
         "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }",
@@ -170,19 +171,23 @@ def main():
 
     # --- a cube turning a quarter turn a frame: a frame earlier, its points sat a quarter turn
     # back about its axis (the half-frame turn applied twice, not a chord) ---
-    spin = ("group { motion { key { translate 0 0.5 0  rotate 0 -45 0 } key { translate 0 0.5 0  rotate 0 45 0 } }  "
-            "quad { origin -0.3 -0.3 0.3  u 0.6 0 0  v 0 0.6 0  material gold } }")
-    p = os.path.join(out, "spin.ftsl")
-    with open(p, "w", encoding="utf-8", newline="") as f:
-        f.write(box(spin, still_camera()))
-    aov, _ = render(exe, p, os.path.join(out, "spin.png"))
-    on = ((aov["depth"][..., 0] > 0) & (np.abs(aov["position"][..., 2] - 0.3) < 1e-6) &
-          (aov["position"][..., 1] > 0.1))                                   # the turning face
-    q = aov["position"][on] - np.array([0.0, 0.5, 0.0])
-    back = np.stack([-q[:, 2], q[:, 1], q[:, 0]], -1) + np.array([0.0, 0.5, 0.0])   # -90 about y
-    se = np.abs(aov["prevposition"][on] - back).max() if on.any() else 1.0
-    verdict("a turning face sat a quarter turn back a frame earlier", on.any() and se < 1e-5,
-            "worst %.2g m over %d pixels" % (se, on.sum()))
+    # The same over a one-sided interval (0 to half a frame): a frame back is then the half-frame
+    # turn undone twice.
+    for tag, interval, k0, k1, label in (
+            ("spin", "-0.5 0.5", -45, 45, "a turning face sat a quarter turn back a frame earlier"),
+            ("spin1", "0 0.5", 0, 45, "... and over a one-sided interval, the turn undone")):
+        spin = ("group { motion { key { translate 0 0.5 0  rotate 0 %d 0 } key { translate 0 0.5 0  rotate 0 %d 0 } }  "
+                "quad { origin -0.3 -0.3 0.3  u 0.6 0 0  v 0 0.6 0  material gold } }" % (k0, k1))
+        p = os.path.join(out, tag + ".ftsl")
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            f.write(box(spin, still_camera(), interval))
+        aov, _ = render(exe, p, os.path.join(out, tag + ".png"))
+        on = ((aov["depth"][..., 0] > 0) & (np.abs(aov["position"][..., 2] - 0.3) < 1e-6) &
+              (aov["position"][..., 1] > 0.1))                                   # the turning face
+        q = aov["position"][on] - np.array([0.0, 0.5, 0.0])
+        back = np.stack([-q[:, 2], q[:, 1], q[:, 0]], -1) + np.array([0.0, 0.5, 0.0])   # -90 about y
+        se = np.abs(aov["prevposition"][on] - back).max() if on.any() else 1.0
+        verdict(label, on.any() and se < 1e-5, "worst %.2g m over %d pixels" % (se, on.sum()))
 
     # --- a camera path's middle frame ---
     path = ('camera_path "fly" { look_at %r %r %r  up 0 1 0  fov_y %r  frames 3  film { res %d %d }'
