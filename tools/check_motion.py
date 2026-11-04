@@ -52,8 +52,9 @@ cube whose keys scale and shear it together. It requires:
     turning, a mirror tile whose halves move apart, a glass ball and a mirror ball crossing the
     room), and the box on the wavefront backend; blurred mode A on the GPU
     with mode A on the CPU (the box, the moving lights), and blurred mode C on the GPU, through a
-    wide aperture, with mode A on the GPU. A blurred shared mode B flight asked for the GPU says it
-    stays on the CPU, and mode V says it renders the instant.
+    wide aperture, with mode A on the GPU. A blurred shared mode B flight flies on the GPU (its two
+    cameras agreeing with blurred mode R, the test above, on the default device), and mode V says
+    it renders the instant.
   * Modes M and J (an epoch at a time), S and U (a pass at a time) blur, agreeing with
     blurred mode R within their density estimates' bias, and follow a moving camera as mode R
     does -- M, S, U, J and P on the GPU too, where they (and B and D) blur moving lights (an aimed
@@ -1180,8 +1181,9 @@ def main():
                 verdict("blurred mode %s on the GPU = mode R on the CPU: %s" % (mode, nm), good, detail)
         rc, log = run([exe, "-in", multi, "-mode", "B", "-device", "gpu", "-n", "100000",
                        "-no-meter", "-o", os.path.join(out, "gate.png")])
-        verdict("-device gpu with a blurred shared flight says it stays on the CPU",
-                rc == 0 and "renders on the CPU so far" in log, log.strip()[-300:] if rc else "")
+        verdict("-device gpu flies a blurred shared flight on the GPU",
+                rc == 0 and "shared model-B pass" in log and "CPU threads" not in log and "using CPU" not in log,
+                log.strip()[-300:] if rc else "")
     rc, log = run([exe, "-in", blurred, "-mode", "V", "-device", "cpu", "-spp", "1", "-n", "100000", "-no-meter",
                    "-o", os.path.join(out, "modev.png")])
     verdict("mode V under a shutter says it renders the instant",

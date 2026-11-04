@@ -15023,11 +15023,9 @@ static void setCamSpecLens(Camera& c, const ftsl::CamSpec& cs) {
 }
 
 // Motion blur on the device (ROADMAP 11): cudaBlurUnsupported names the modes it carries and says
-// why one would stay on the CPU; every device gate under a blur asks it. A shared forward flight,
-// and a moving scene's mode-M camera the run's routing keeps apart (mBlurApart), are the cases it
-// cannot see from the mode.
-static const char* const kSharedFlightBlurWhy =
-    "a shared forward flight that blurs renders on the CPU so far (the device blurs one camera at a time)";
+// why one would stay on the CPU; every device gate under a blur asks it. A moving scene's mode-M
+// camera the run's routing cannot gather alone (mBlurApart) is the case it cannot see from the
+// mode.
 #ifdef HAVE_CUDA
 // The line every device choice prints when a render takes the GPU: `-device auto` or `gpu`, the
 // card, and what of the render runs there (`suffix`, "" for all of it).
@@ -28065,16 +28063,20 @@ static int run(int argc, char** argv) {
 
         const bool progressive   = timeBudgetSec > 0.0 || runForever || noiseTarget > 0.0;
         const bool wantCheckpoint = resume || progressive || wantCheckpointFlag;
-        // The device renders the instant only, so a flight in which any camera sees motion flies
-        // on the CPU (ROADMAP 11).
+        // Under a blur the device times each photon and poses every camera of the flight there (the
+        // flight's cameras share one shutter: joinFlight), and the sky each camera sees directly is
+        // drawn on the host meanwhile (addBlurredSkyRows, as renderForward draws one camera's).
+        const bool blurGroup = std::any_of(cams.begin(), cams.end(),
+                                           [&](const Camera& c) { return c.seesMotion(scene); });
         bool groupGpu = false;
 #ifdef HAVE_CUDA
         groupGpu = useGpuForward;
-        if (groupGpu && std::any_of(cams.begin(), cams.end(),
-                                    [&](const Camera& c) { return c.seesMotion(scene); })) {
-            groupGpu = false;
-            if (!std::strcmp(device, "gpu")) std::fprintf(stderr, "[device] %s; using CPU\n", kSharedFlightBlurWhy);
-            else                             std::printf("[device] auto -> CPU (%s)\n", kSharedFlightBlurWhy);
+        if (groupGpu && blurGroup) {
+            if (const char* why = cudaBlurUnsupported(scene, cams[0], groupMode)) {
+                groupGpu = false;
+                if (!std::strcmp(device, "gpu")) std::fprintf(stderr, "[device] %s; using CPU\n", why);
+                else                             std::printf("[device] auto -> CPU (%s)\n", why);
+            }
         }
 #endif
         (void)groupGpu;
@@ -28139,6 +28141,14 @@ static int run(int argc, char** argv) {
                                     (accN > 0) ? &accE : nullptr)
             : nullptr;
         bool accFresh = true;   // do host acc[]/accE match the device accumulators?
+        // Under a blur, each camera's directly seen sky, drawn on the host beside the device's
+        // photons: running totals, added to what the device holds when it is pulled (syncAcc).
+        std::vector<Film> skyAcc;
+        if (gses && blurGroup)
+            for (int c = 0; c < nc; ++c) {
+                skyAcc.emplace_back(); skyAcc.back().resX = rxs[c]; skyAcc.back().resY = rys[c];
+                skyAcc.back().alloc();
+            }
 #endif
 
         // One accumulation chunk of `batchN` photons across the whole group.
@@ -28148,6 +28158,19 @@ static int run(int argc, char** argv) {
                 // Resident path: launch and go. seedBase = cumulative photon count, same
                 // stream convention as the CPU path / the old per-batch wrapper.
                 sharedForwardGpuBatch(gses, batchN, (unsigned long long)accN, diffraction);
+                // ... each camera's sky meanwhile, a band of rows a thread, as the CPU flight
+                // draws it (its share of the flight's photons, at the batch's seed)
+                for (int c = 0; c < (int)skyAcc.size(); ++c) {
+                    if (!cams[c].seesMotion(scene)) continue;
+                    std::vector<std::thread> pool;
+                    for (int t = 0; t < nThreads; ++t)
+                        pool.emplace_back([&, c, t] {
+                            addBlurredSkyRows(skyAcc[c], scene, cams[c], batchN, nc, (uint64_t)accN,
+                                              (int)((long long)rys[c] * t / nThreads),
+                                              (int)((long long)rys[c] * (t + 1) / nThreads));
+                        });
+                    for (auto& th : pool) th.join();
+                }
                 accN += batchN;
                 accFresh = false;
                 return;
@@ -28167,7 +28190,11 @@ static int run(int argc, char** argv) {
         // where runBatch merges host-side; no-op when already fresh).
         auto syncAcc = [&] {
 #ifdef HAVE_CUDA
-            if (gses && !accFresh) { sharedForwardGpuDownload(gses, acc, accE); accFresh = true; }
+            if (gses && !accFresh) {
+                sharedForwardGpuDownload(gses, acc, accE);   // the device's totals, replacing
+                for (int c = 0; c < (int)skyAcc.size(); ++c) acc[c].merge(skyAcc[c]);
+                accFresh = true;
+            }
 #endif
         };
 
@@ -28264,7 +28291,11 @@ static int run(int argc, char** argv) {
                         // a bare -noise poll between intervals fetches ONLY camera 0's
                         // hits (npix doubles) instead of every film.
                         if (wantStatus || wantWinPre || stopped || timeUp) syncAcc();
-                        else sharedForwardGpuHits0(gses, acc[0].hits);
+                        else {
+                            sharedForwardGpuHits0(gses, acc[0].hits);
+                            if (!skyAcc.empty())   // the sky's, as syncAcc adds them
+                                for (size_t i = 0; i < acc[0].hits.size(); ++i) acc[0].hits[i] += skyAcc[0].hits[i];
+                        }
                     }
 #endif
                     double sumHits = 0.0; long long lit = 0;

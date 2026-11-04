@@ -10079,8 +10079,12 @@ sees the instant, exactly as a static scene with those transforms would show it.
   camera thrashed under a many-camera flight). A shared forward flight
   (`renderForwardShared`) draws one time per photon for all its cameras, so `run` builds one
   flight per shutter (`joinFlight`; cameras that see nothing move share regardless; the
-  function stops with an internal error on any other mix), a flight in which any camera sees
-  motion flies on the CPU, and its resume guard mixes each camera's shutter.
+  function stops with an internal error on any other mix), and its resume guard mixes each
+  camera's shutter. On the GPU (0.430.0) the device session's camera set times each photon in the
+  flight's one shutter and poses every moving camera there (`makeCamSet`, as for one camera), and
+  `runSharedGroup` draws each camera's directly seen sky on the host per batch (`skyAcc`, the CPU
+  flight's `addBlurredSkyRows` share), added to the device's totals when they are pulled
+  (`syncAcc`).
 - **Light from the sky and the suns reaches a mover outside the instant's bounds.** The env's
   and the suns' photons and BDPT light subpaths enter through a disc sized by the scene's
   bounding sphere; for a path with a time in a moving scene that sphere (about the same centre)
@@ -10176,9 +10180,9 @@ sees the instant, exactly as a static scene with those transforms would show it.
   meter asks the same helper. The device blurs every mode it renders (*Motion blur on the
   device*, below); `runRender`'s device choice, `renderForward`'s own device gate, the S, U and M
   sessions and the exposure meter each ask `cudaBlurUnsupported`, which would name a mode the
-  device could not blur. Two routings keep a blurred render on the CPU and say why themselves: a
-  blurred shared forward flight (`kSharedFlightBlurWhy`), and a mode-M camera of a moving scene
-  the device cannot gather alone (`mBlurApart` in the camera routing: `-savemap` / `-loadmap`,
+  device could not blur (a shared forward flight asks it of its first camera). One routing keeps
+  a blurred render on the CPU and says why itself: a mode-M camera of a moving scene the device
+  cannot gather alone (`mBlurApart` in the camera routing: `-savemap` / `-loadmap`,
   `-preview`'s CPU driver, or a budget over several mode-M cameras). `-radcache` is off under a blur. What cannot move yet stays put and
   says so (`stillWarning`): a sun or sky, and a spot, beam or aimed light whose
   keys stretch it unevenly, stay at the instant with their surfaces, so nothing mixes a moved surface
