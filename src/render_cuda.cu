@@ -4196,9 +4196,6 @@ __device__ static inline DTriShear makeTriShear(const DVec3& d) {
     s.Sz = (Real)1  / d[s.kz];
     return s;
 }
-// A camera path's time (host twin of renderRows' draw): sample `sIdx` of pixel `pix` on the
-// shutter lattice (base 79, rotated by the pixel's own phase -- a fixed 0.5 in mode W, so it
-// stays noise-free), mapped through the shutter into the motion interval and set for the path.
 // The camera posed at `frames` (host twins CameraMotion::at, Camera::posedAs and lookAt): its keys
 // blended about the time, the frame built on them, the stereo eye shifted along u.
 __device__ __noinline__ static void dPoseCamera(const DCamera& cam, double frames, DCamera& out,
@@ -4228,8 +4225,6 @@ __device__ __noinline__ static void dPoseCamera(const DCamera& cam, double frame
     out.rEdge = dProjRadius(cam.projection, out.halfFovY);
     if (cam.eyeShiftU != 0.0) out.eye = out.eye + out.u * (Real)cam.eyeShiftU;
 }
-// A path's time at shutter fraction `x`: set for every query of the path (in the motion interval,
-// when the scene moves), and `posed` the camera there when it moves itself.
 // The path's time at `frames` (frames from the instant), set for its queries when the scene moves:
 // in the motion interval, clamped to it (host twin Scene::motionU).
 __device__ static inline void dSetFramesTime(const DScene& sc, double frames) {
@@ -4238,10 +4233,23 @@ __device__ static inline void dSetFramesTime(const DScene& sc, double frames) {
     u = u < 0.0 ? 0.0 : (u > 1.0 ? 1.0 : u);
     dSetMotionU((float)u);
 }
+// A path's time at shutter fraction `x`: set for every query of the path (in the motion interval,
+// when the scene moves), and `posed` the camera there when it moves itself.
 __device__ static inline void dSetPathTime(const DScene& sc, const DCamera& cam, double x, DCamera* posed) {
     const double frames = cam.shOpen + (cam.shClose - cam.shOpen) * x;
     dSetFramesTime(sc, frames);
     if (posed && cam.nKeys > 0) dPoseCamera(cam, frames, *posed);
+}
+// Sample sIdx of pixel pix's fraction of the way through the shutter (host twin
+// BackwardRenderer::renderRows): a scrambled base-79 lattice, rotated by the pixel's own phase
+// (a fixed 0.5 for mode W, so it stays noise-free).
+__device__ static inline double dCameraShutterX(const DCamera& cam, unsigned long long pix,
+                                                unsigned long long sIdx, bool whitted) {
+    double phase = 0.5;
+    if (!whitted) { DRng tr; tr.seedUnit(pix, cam.timeSalt); phase = (double)tr.uniform(); }
+    double x = dRadicalInverseScr(79, sIdx) + phase;
+    if (x >= 1.0) x -= 1.0;
+    return x;
 }
 // A camera path's time (sample sIdx of pixel pix), set for the path's queries; true with `posed`
 // the camera there when it moves itself, false (`posed` untouched) when it holds still or the path
@@ -4249,12 +4257,18 @@ __device__ static inline void dSetPathTime(const DScene& sc, const DCamera& cam,
 __device__ static inline bool dSetCameraTime(const DScene& sc, const DCamera& cam, unsigned long long pix,
                                              unsigned long long sIdx, bool whitted, DCamera* posed) {
     if (!cam.blur) return false;
-    double phase = 0.5;
-    if (!whitted) { DRng tr; tr.seedUnit(pix, cam.timeSalt); phase = (double)tr.uniform(); }
-    double x = dRadicalInverseScr(79, sIdx) + phase;
-    if (x >= 1.0) x -= 1.0;
-    dSetPathTime(sc, cam, x, posed);
+    dSetPathTime(sc, cam, dCameraShutterX(cam, pix, sIdx, whitted), posed);
     return posed && cam.nKeys > 0;
+}
+// The camera alone posed at sample sIdx of pixel pix's time, the scene's left where it is: for a
+// gather from a map that has one time of its own (mode M's, timeless over a still scene). True
+// with `posed` set when the camera moves under its shutter, false (`posed` untouched) otherwise.
+__device__ static inline bool dPoseCameraAtSample(const DCamera& cam, unsigned long long pix,
+                                                  unsigned long long sIdx, DCamera& posed) {
+    if (!cam.blur || cam.nKeys <= 0) return false;
+    const double x = dCameraShutterX(cam, pix, sIdx, false);
+    dPoseCamera(cam, cam.shOpen + (cam.shClose - cam.shOpen) * x, posed);
+    return true;
 }
 // The watertight crossing of the ray with the triangle (p0, p1, p2) nearer than tmax: its t and
 // barycentrics. The shared half of intersectTri (host twin triCross), which a moving or deforming
@@ -8715,7 +8729,7 @@ struct DQBeamTr0 {
 // (see DBeamRec::tr0). `pStart` is the CSR of parents over the sub-beam array.
 __global__ void kBeamTr0(DScene sc, const DBeamRec* beams, float* tr0, const int* pStart, int nP,
                          unsigned long long salt) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < nP; j += gridDim.x * blockDim.x) {
         const int i0 = pStart[j], i1 = pStart[j + 1];
         if (i1 <= i0) continue;
@@ -8739,7 +8753,7 @@ __device__ __noinline__ static void dBeamHitEvalSpill(const DScene& sc, const DB
 }
 
 __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm, int resX, DCamera cam) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     const int nS = min(*q.nSegs, q.segCap);
     const DPatEnv env = dPatEnvOf(sc);
     for (int si = blockIdx.x * blockDim.x + threadIdx.x; si < nS; si += gridDim.x * blockDim.x) {
@@ -8802,7 +8816,7 @@ __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm,
 }
 
 __global__ void kWfBeamEval(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm, int resX, DCamera cam) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     const int nH = min(*q.nHits, q.hitCap);
     const DPatEnv env = dPatEnvOf(sc);
     for (int hi = blockIdx.x * blockDim.x + threadIdx.x; hi < nH; hi += gridDim.x * blockDim.x) {
@@ -12608,7 +12622,7 @@ __device__ static void traceHeroPhoton(const DScene& sc, const DCamSet& cs, int 
 __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
                        long long N, int diffraction, unsigned long long seedBase, int maxBounce,
                        int camMode, int heroC, int perPhotonSeed) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     dSeedPhotonCameras(cs);   // a moving camera: this thread's own copies, posed per photon
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
@@ -12785,7 +12799,7 @@ __device__ static bool wfSpawn(const DScene& sc, const DCamSet& cs,
 __global__ void kWfInit(DScene sc, DCamSet cs, double* energy,
                         WFState st, long long N, int W, unsigned long long* dispatched,
                         int* liveCount, unsigned long long seedBase, int camMode) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     int slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= W) return;
     dSeedPhotonCameras(cs);   // a moving camera: this slot's own copies, posed per photon
@@ -12800,7 +12814,7 @@ __global__ void kWfInit(DScene sc, DCamSet cs, double* energy,
 // gradient-index region first (writing the bent ro/rd back so kWfShade sees them) — exactly
 // as the megakernel marches before closestHit. Non-GRIN scenes skip it (bit-identical).
 __global__ void kWfExtend(DScene sc, DCamSet cs, WFState st, int W) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     int slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= W || !st.alive[slot]) return;
     dSetPhotonTime(sc, cs, st.timeX[slot], false);   // the photon's own time (motion blur)
@@ -12827,7 +12841,7 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
                          WFState st, int W, long long N, int diffraction, int maxBounce,
                          unsigned long long* dispatched, int* liveCount, int camMode,
                          unsigned long long seedBase) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     int slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= W || !st.alive[slot]) return;
     dSetPhotonTime(sc, cs, st.timeX[slot], false);   // the photon's own time (motion blur)
@@ -16307,7 +16321,7 @@ __global__ void kBackward(DScene sc, const __grid_constant__ DCamera cam, double
                           long long totalSamples, long long chunkSpp, long long sppTotal,
                           long long sampleBase, int resX,
                           int diffraction, unsigned long long seedBase, int heroC, double* filmSpec) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     for (long long idx = g; idx < totalSamples; idx += G) {
@@ -16671,7 +16685,7 @@ __global__ void kBackwardRGB(DScene sc, const __grid_constant__ DCamera cam, dou
                              long long totalSamples, long long chunkSpp, long long sppTotal,
                              long long sampleBase, int resX,
                              int diffraction, unsigned long long seedBase) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     for (long long idx = g; idx < totalSamples; idx += G) {
@@ -16800,7 +16814,7 @@ __global__ void kIsoPreview(DScene sc, DCamera cam, DPreviewLight pl,
                             const int* matTex, const double* matTri,
                             double* accum, float* zbuf, unsigned char* emis,
                             int W, int H, DVec3 bg, double emisBoost, int camHide) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     int total = W * H;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
          idx += gridDim.x * blockDim.x) {
@@ -18440,7 +18454,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                       long long sampleBase, int resX, int maxDepth,
                       int diffraction, unsigned long long seedBase, int heroC,
                       DBeamMap bm, DSurfMap sm, DWfQueue wq, long long idxBegin, long long idxEnd) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     enum { SECN = (NS > 0 ? NS : 1), MAXV = BDPT_MAXV_OF(MAXD),
            SEGN = (MERGE ? BDPT_MAXV_OF(MAXD) : 1) };
     // `bm.beams == nullptr` is the dispatcher's own "-nobeams / empty map" signal, so this
@@ -19865,7 +19879,7 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, c
                         long long chunkSpp, long long sppTotal,
                         long long sampleBase, int resX, int diffraction, int fgRays,
                         unsigned long long seedBase) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     int poll = 0;
@@ -19929,13 +19943,13 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, c
 
         DVec3 ro, rd;
         Real jx = rng.uniform(), jy = rng.uniform();
-        // A camera moving over a still scene (host twin renderPhotonCamera): the map is timeless,
-        // and each sample poses the camera at its own time, as mode R's do. An epoch of a moving
-        // scene arrives with its camera posed and no shutter (the host's refresh loop).
+        // A moving camera (host twin renderPhotonCamera): each sample poses the camera at its own
+        // time, as mode R's do, and the scene stays at the map's -- timeless over a still scene,
+        // the instant under a meter's map of a moving one. An epoch of a moving scene arrives with
+        // its camera posed and no time of its own (renderPhotonMapSharedCuda).
         DCamera camT;
-        const DCamera& camS = dSetCameraTime(sc, cam, (unsigned long long)pix,
-                                             (unsigned long long)(sampleBase + (idx - pix * chunkSpp)), false,
-                                             &camT) ? camT : cam;
+        const DCamera& camS = dPoseCameraAtSample(cam, (unsigned long long)pix, (unsigned long long)sIdx, camT)
+                            ? camT : cam;
         dGenRay(camS, px, py, jx, jy, ro, rd);           // pinhole only (lens cams gated to CPU)
 
         double oX, oY, oZ;
@@ -20118,7 +20132,7 @@ struct DSppmState {
 __global__ void kSppmVisiblePoint(DScene sc, const __grid_constant__ DCamera cam, DSppmState st, int resX,
                                   int resY, int maxBounce, unsigned long long seedBase, long long passIdx,
                                   int perPixel) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     long long npix = (long long)resX * resY;
@@ -20165,7 +20179,7 @@ __global__ void kSppmVisiblePoint(DScene sc, const __grid_constant__ DCamera cam
 // per-pixel radius and are applied at resolve), so phi? += rho(lambda_p) * p?.
 __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, int resY,
                             double alpha, unsigned long long seedBase, long long passIdx) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
     long long npix = (long long)resX * resY;
@@ -20562,7 +20576,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                            int* lvCount, double* splat,
                            Real* lamBuf, double* invLamBuf, int resX, int resY, int vcmCap,
                            long long nPaths, unsigned long long seedBase, long long passIdx) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     constexpr int SECN = (NS > 0) ? NS : 1;
     const int C = (NS > 0) ? heroC : 1;
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -20910,7 +20924,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                             double* accum, const Real* lamBuf, const double* invLamBuf,
                             int resX, int resY, long long nLight, unsigned long long seedBase,
                             long long passIdx) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     constexpr int SECN = (NS > 0) ? NS : 1;
     const int C = (NS > 0) ? heroC : 1;
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -21783,7 +21797,7 @@ __global__ static void kPatOpProbe(const PatNode* prog, const PatNodeF* progF,
 // The intersectors are the renderer's own; the record handed to one alone is full of another
 // primitive's values, which every field it owns must overwrite.
 __global__ static void kHitProbe(DScene sc, const DevHitProbeRay* rays, int n, DevHitProbeOut* out) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const DevHitProbeRay& q = rays[i];
@@ -21863,7 +21877,7 @@ template <int MAXD>
 __global__ void __launch_bounds__(128, 4)
 kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
              long long nPaths, unsigned long long seedBase, DJSurfOut out) {
-    D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
+    D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     enum { MAXV = BDPT_MAXV_OF(MAXD) };
     if (maxDepth > MAXD) maxDepth = MAXD;
     const DPatEnv env = dPatEnvOf(sc);
@@ -23706,13 +23720,15 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     cudaCheckKernel("sphScanInit");
 }
 
-// Bake one Camera into a POD DCamera for the given film resolution. Any device memory
-// (the realistic-lens index tables) is recorded in up.frees. Split out of the scene
-// bake so a multi-camera shared pass can bake N cameras against one uploaded scene.
-// The baked camera `dc` posed at `tFrames` frames on the host (Camera::poseAt), for a pass or an
-// epoch that takes one time: only the pose changes. `dc` itself for a camera that holds still.
+// A baked camera for a pass or an epoch that takes one time, already posed there: it keeps no
+// time of its own (no shutter, no keys), so no kernel can pose it again or move the scene to a
+// sample's time (dSetCameraTime, dPoseCameraAtSample).
+static void pinToPass(gpu::DCamera& dc) { dc.blur = 0; dc.keys = nullptr; dc.nKeys = 0; }
+// The baked camera `dc` posed at `tFrames` frames on the host (Camera::poseAt) and pinned there,
+// for a pass or an epoch that takes one time.
 static gpu::DCamera posedBaked(const gpu::DCamera& dc, const Camera& cam, double tFrames) {
     gpu::DCamera out = dc;
+    pinToPass(out);
     if (!cam.moves()) return out;
     Camera c = cam;
     cam.poseAt(tFrames, c);
@@ -23729,7 +23745,16 @@ static gpu::DCamera posedBaked(const gpu::DCamera& dc, const Camera& cam, double
 static float devicePassU(const Scene& scene, double tFrames) {
     return scene.hasMotion() ? (float)scene.motionU(tFrames) : -1.0f;
 }
+// The host's pass time (g_passMotionU, under a PassTimeScope) for the device's queries: an epoch
+// of mode J or mode M over a moving scene, its camera posed there by the host. -1 when none is set
+// or the scene holds still.
+static float hostPassU(const Scene& scene) {
+    return (g_passMotionU >= 0.0 && scene.hasMotion()) ? (float)g_passMotionU : -1.0f;
+}
 
+// Bake one Camera into a POD DCamera for the given film resolution. Any device memory
+// (the realistic-lens index tables) is recorded in up.frees. Split out of the scene
+// bake so a multi-camera shared pass can bake N cameras against one uploaded scene.
 static gpu::DCamera bakeCamera(const Scene& scene, const Camera& cam, int resX, int resY, DUpload& up) {
     using namespace gpu;
     DCamera dc{};
@@ -23929,6 +23954,20 @@ static int wavefrontSlots(long long N) {
     const int W = (int)((N < (1 << 20)) ? N : (1 << 20));
     return W < 1 ? 1 : W;
 }
+// The forward megakernel's grid (launchForward's kTrace): ~262k threads.
+static constexpr int kFwdBlockSize = 128, kFwdNumBlocks = 2048;
+// The hero bundle a forward trace carries for `heroC` asked: none (1) through participating media
+// or GRIN bending, where the geometry is not the same for every wavelength between dispersive
+// events.
+static int forwardHeroC(int heroC, bool media, bool grin) {
+    if (heroC <= 1 || media || grin) return 1;
+    return heroC > hero::kHeroMax ? hero::kHeroMax : heroC;
+}
+// Whether a forward trace runs on the wavefront backend: asked for, and nothing the megakernel
+// alone carries -- the hero bundle, or photon beams (the pool carries no per-photon beam stream).
+static bool forwardRunsWavefront(bool wavefront, int effHeroC, bool beams) {
+    return wavefront && effHeroC == 1 && !beams;
+}
 static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
                            long long N, int diffraction, unsigned long long kseed,
                            int maxBounce, int camModeInt) {
@@ -24003,23 +24042,16 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
     unsigned long long kseed = (0x9e3779b97f4a7c15ULL + seedBase * 0x9e3779b97f4a7c15ULL)
                              ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
     // Hero-wavelength sampling shares one BVH walk across C stratified wavelengths, cutting
-    // chromatic noise. It is only physical without participating media / GRIN bending (the
-    // geometry must be wavelength-independent between dispersive events), and it lives ONLY
-    // in the megakernel — so gate on the scene and force the megakernel when hero is active.
-    int effHeroC = 1;
-    if (heroC > 1 && up.sc.mediaN == 0 && !up.sc.hasGrin) {
-        effHeroC = (heroC > hero::kHeroMax) ? hero::kHeroMax : heroC;
-    }
-    const bool wf = wavefront && effHeroC == 1 && !cs.beamsOn();
+    // chromatic noise. It lives ONLY in the megakernel, so the megakernel runs when it is on.
+    const int effHeroC = forwardHeroC(heroC, up.sc.mediaN != 0, up.sc.hasGrin != 0);
+    const bool wf = forwardRunsWavefront(wavefront, effHeroC, cs.beamsOn());
     // A moving camera under a blur: each thread poses its own copy of the set's cameras at its
     // photon's time (DCamSet::cam), one per thread of the launch -- the wavefront's slots, or
-    // the megakernel's grid.
-    const int kBlockSize = 128, kNumBlocks = 2048;   // the megakernel's ~262k threads (and
-                                                     // cudaForwardPosedCameraBytes')
+    // the megakernel's grid (cudaForwardPosedCameraBytes counts the same).
     DCamSet csRun = cs;
     DCamera* d_posed = nullptr;
     if (cs.camMoves && cs.nCam > 0) {
-        const long long threads = wf ? wavefrontSlots(N) : (long long)kBlockSize * kNumBlocks;
+        const long long threads = wf ? wavefrontSlots(N) : (long long)kFwdBlockSize * kFwdNumBlocks;
         CUDA_CHECK(cudaMalloc(&d_posed, (size_t)threads * cs.nCam * sizeof(DCamera)));
         csRun.cams = d_posed; csRun.poseOut = d_posed; csRun.camStride = cs.nCam;
     }
@@ -24033,7 +24065,7 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
             const char* e = std::getenv("FTRACE_GPU_PHOTONSEED");
             return (e && *e) ? std::atoi(e) : 0;
         }();
-        kTrace<<<kNumBlocks, kBlockSize>>>(up.sc, csRun, d_energy, N, diffraction ? 1 : 0,
+        kTrace<<<kFwdNumBlocks, kFwdBlockSize>>>(up.sc, csRun, d_energy, N, diffraction ? 1 : 0,
                                            kseed, 32, camModeInt, effHeroC, perPhotonSeed);
     }
     cudaCheckKernel("forward");
@@ -25139,7 +25171,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     }
     // Mode J under a blur: its epoch is one time (the host's PassTimeScope, atEpochJ), which the
     // light subpaths and the camera pass take; mode D's paths take their own (g_passMotionU < 0).
-    up.sc.mo.passU = (g_passMotionU >= 0.0 && scene.hasMotion()) ? (float)g_passMotionU : -1.0f;
+    up.sc.mo.passU = hostPassU(scene);
     // The aimed sun (MODE-J-SDS, 0.387.0): before the first light subpath of this render, which
     // in mode J is the device light pass below, ahead of the per-render J constants.
     uploadSunAim();
@@ -25722,8 +25754,11 @@ size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
 
 // --------------------- backward reference (mode R) host ----------------------
 
-size_t cudaForwardPosedCameraBytes(bool wavefront, long long N) {
-    const long long threads = wavefront ? (long long)wavefrontSlots(N) : 128LL * 2048LL;   // launchForward's
+size_t cudaForwardPosedCameraBytes(const Scene& scene, bool wavefront, int heroC, long long N) {
+    // launchForward's choice for renderForwardCuda's one camera, which carries no beams
+    const int effHeroC = forwardHeroC(heroC, !scene.media.empty(), grin::sceneHasGrin(scene));
+    const long long threads = forwardRunsWavefront(wavefront, effHeroC, false)
+                            ? (long long)wavefrontSlots(N) : (long long)kFwdBlockSize * kFwdNumBlocks;
     return (size_t)threads * sizeof(gpu::DCamera);
 }
 
@@ -26257,7 +26292,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             int fgRays, double autoK, BeamPass* beams,
                                             const StageProgress* stage, double causticK,
                                             const caim::AimMap* aim, long long nAimed,
-                                            double causticAdaptK, PmRadiiPin* pin) {
+                                            double causticAdaptK, PmRadiiPin* pin,
+                                            const CudaSceneHold* held) {
     using namespace gpu;
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
@@ -26265,10 +26301,19 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     if (nc == 0 || !cudaAvailable() || !cudaPhotonMapSupported(scene)) return out;
 
     DUpload up;
-    buildUploadScene(scene, up);
+    if (held) {
+        // A hold of another scene would gather that scene's geometry under this one's lights
+        // and materials: refuse it rather than mix them.
+        if (!cudaSceneHoldFits(held, scene))
+            throw std::logic_error("renderPhotonMapSharedCuda: the held device scene is not the "
+                                   "scene being rendered");
+        up.sc = held->up.sc;
+    } else {
+        buildUploadScene(scene, up);
+    }
     // A blurred moving scene's epoch (the host's refresh loop, under its PassTimeScope): the
     // deposit, the maps and the gather all at its one time.
-    up.sc.mo.passU = (g_passMotionU >= 0.0 && scene.hasMotion()) ? (float)g_passMotionU : -1.0f;
+    up.sc.mo.passU = hostPassU(scene);
 
     // Staging-chunk size for the host<->device photon copies (deposit download AND grid
     // upload below). Streaming the deposits in blocks (instead of one giant transfer) means
@@ -27055,6 +27100,9 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         // from inside the loop, so without this the flag is invisible on the first iteration.
         if (ft::stopRequested()) { stopped = true; break; }
         DCamera hc = bakeCamera(scene, cams[c], resX[c], resY[c], up);
+        // An epoch of a moving scene: the host posed the camera at the epoch's time, which the
+        // gather takes too (a camera moving over a still scene keeps its own, kGather).
+        if (up.sc.mo.passU >= 0.0f) pinToPass(hc);
         const size_t npix = (size_t)resX[c] * resY[c];
         double* d_film = nullptr; CUDA_CHECK(cudaMalloc(&d_film, npix * 3 * sizeof(double)));
         double* d_hits = nullptr; CUDA_CHECK(cudaMalloc(&d_hits, npix * sizeof(double)));

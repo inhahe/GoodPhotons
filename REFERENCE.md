@@ -2110,10 +2110,14 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
   `B` and `C`, each photon and its splats, mirrors and glass met where they are) at its own time,
   and each pass of `S` and `U` and each epoch of `J` and `M` at one, as on the CPU (a mode `M`
   render of a moving scene takes the device for its one mode-`M` camera; a camera moving over a
-  still scene gathers its one map on the device, each sample posed); a shared forward flight
-  that blurs flies on the CPU, and any other mode keeps a blurred render on the CPU and
-  says why (`[device] … renders on the CPU so far`). The exposure meter meters a frame where it
-  will render. Mode `P` splits each backward sample by its own
+  still scene gathers its one map on the device, each sample posed). Two blurred renders stay
+  on the CPU and say why (`[device] …; using CPU`): a shared forward flight, and a mode-`M`
+  camera of a moving scene that shares the run's map with other mode-`M` cameras, or has
+  `-savemap`, `-loadmap` or `-preview`. Under a blur the device's mode-`M` epochs, a few
+  samples each, write the image on the `-interval` cadence and at the end. The exposure meter
+  meters a blurred frame on the device when the device renders it; a mode-`M` group's batched
+  meter gathers on the device in any case, from a map of the frame's instant, as the CPU's
+  meter does. Mode `P` splits each backward sample by its own
   path's first event at its own time (a specular surface or the sky to the backward layer; a
   diffuse or composite surface, or a scatter in a medium before any surface, to the forward
   one), where the still render splits whole pixels by the instant. `V`, which runs `B` beside `R`, renders the frame's instant

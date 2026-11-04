@@ -19262,7 +19262,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // A blurred forward render of a moving camera: each thread's posed copy of it.
             const size_t film   = (size_t)res * resY * 3 * sizeof(double) * 2 +
                                   ((gpuForwardMode && cam.seesMotion(scene) && cam.moves())
-                                       ? cudaForwardPosedCameraBytes(wavefront, N) : 0);
+                                       ? cudaForwardPosedCameraBytes(scene, wavefront, g_heroC, N) : 0);
             const size_t needAll = needLocal - reused + film + (size_t)256 * 1024 * 1024;
             const double toGB = 1.0 / (1024.0 * 1024.0 * 1024.0);
             // Always say what the card looks like. This one line is what turns "the render
@@ -27785,7 +27785,12 @@ static int run(int argc, char** argv) {
     //     forward pass across every frame -- and refreshing it would both destroy that and hand
     //     consecutive frames different realizations, which is flicker, not convergence.
     int mModeCams = 0;
-    for (const RenderCam& rc : toRender) if (rc.mode == 'M') ++mModeCams;
+    bool mBlurMoving = false;   // a mode-M camera blurs a moving scene
+    for (const RenderCam& rc : toRender)
+        if (rc.mode == 'M') {
+            ++mModeCams;
+            mBlurMoving = mBlurMoving || (rc.cam.seesMotion(scene) && scene.hasMotion());
+        }
     // A blurred mode-M camera of a moving scene the device can serve: the run's one mode-M camera,
     // which the shared path's refresh loop renders as epochs, each at one time (a camera moving
     // over a still scene needs no such care: its map is timeless and the device gather poses each
@@ -27798,8 +27803,11 @@ static int run(int argc, char** argv) {
 #endif
     bool budgetedGpuM = false;
 #ifdef HAVE_CUDA
+    // -beamfreeze would hold the refresh loop the budget needs at one epoch, but under a blur of a
+    // moving scene the loop sets it aside (each epoch is one time in the shutter).
     budgetedGpuM = (timeBudgetSec > 0.0 || runForever || noiseTarget > 0.0) &&
-                   mModeCams == 1 && !g_beamFreeze && g_pmapLoad.empty() && g_pmapSave.empty() &&
+                   mModeCams == 1 && (!g_beamFreeze || mBlurMoving) &&
+                   g_pmapLoad.empty() && g_pmapSave.empty() &&
                    (!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
                    cudaAvailable() && cudaPhotonMapSupported(scene);
     if (budgetedGpuM)
@@ -27826,6 +27834,7 @@ static int run(int argc, char** argv) {
     };
     std::vector<int> groupM, restIdx;
     bool mModeBudgeted = false;   // a mode-M camera dropped from groupM by the budget test
+    bool mBlurApart = false;      // ... or one blurring a moving scene, which the device gathers alone
     for (int i = 0; i < (int)toRender.size(); ++i) {
         const RenderCam& rc = toRender[i];
         // Forward A/B sharing no longer requires `plainRender`: the shared pass itself
@@ -27847,16 +27856,34 @@ static int run(int argc, char** argv) {
                  (!(rc.cam.seesMotion(scene) && scene.hasMotion()) || (gpuBlurM && !rc.cam.hasLens())))
                                                                                 groupM.push_back(i);
         else {
-            // A mode-M camera reaching here under a budget is the silent-CPU case warned
-            // about below. Lens cameras are excluded because they would never have had the
-            // device anyway, so saying they lost it would be false; so is a camera that sees
-            // motion (a moving scene, or its own), which is here for its blur and says so
-            // (cudaBlurUnsupported).
-            if (rc.mode == 'M' && !rc.cam.hasLens() && !rc.cam.seesMotion(scene))
-                mModeBudgeted = true;
+            // A mode-M camera reaching here is the silent-CPU case warned about below: under a
+            // budget, or blurring a moving scene, whose map the device builds for one camera
+            // alone. Lens cameras are excluded because they would never have had the device
+            // anyway, so saying they lost it would be false. (A camera moving over a still scene
+            // gathers from the one timeless map, so it is here only for the budget.)
+            if (rc.mode == 'M' && !rc.cam.hasLens()) {
+                if (rc.cam.seesMotion(scene) && scene.hasMotion()) mBlurApart = true;
+                else                                                mModeBudgeted = true;
+            }
             restIdx.push_back(i);
         }
     }
+#ifdef HAVE_CUDA
+    if (mBlurApart && (!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
+        cudaAvailable() && cudaPhotonMapSupported(scene)) {
+        // The device renders a moving scene's blur in mode M as epochs of its refresh loop, each
+        // map at one time, which only a lone mode-M camera with a map of its own runs.
+        const char* why = mModeCams > 1
+            ? "a moving scene's blurred mode-M map is gathered on the device only for the run's one "
+              "mode-M camera, and this run's share one"
+            : (!g_pmapLoad.empty() || !g_pmapSave.empty())
+            ? "a moving scene's blurred mode-M map is redrawn at each time in the shutter, which a "
+              "-savemap or -loadmap map is not"
+            : "the single-camera -preview driver of mode M is CPU-only";
+        if (!std::strcmp(device, "gpu")) std::fprintf(stderr, "[device] %s; using CPU\n", why);
+        else                             std::printf("[device] auto -> CPU (%s)\n", why);
+    }
+#endif
     // SAY SO WHEN THE BUDGET COSTS THE DEVICE. This is the same trap `-checkpoint` fell into
     // above, with one difference that makes it harder to notice: `-checkpoint` was IGNORED by
     // mode M, so the fix was simply to stop letting an ignored flag matter. A wall-clock /
@@ -28336,10 +28363,10 @@ static int run(int argc, char** argv) {
             // Under a blur: a camera moving over a still scene gathers from the one timeless map,
             // each sample posed (kGather); a moving scene's lone camera runs the refresh loop
             // below as epochs, each at one time (host twin: runRender's mode-M epochs).
+            // (A moving scene's camera that the device cannot render so never joins this group:
+            // the routing said why, mBlurApart.)
             const bool blurEpochsM = anyBlur && scene.hasMotion();
             const char* blurWhy = !anyBlur ? nullptr : cudaBlurUnsupported(scene, toRender[idx[0]].cam, 'M');
-            if (!blurWhy && blurEpochsM && (idx.size() != 1 || !g_pmapLoad.empty() || !g_pmapSave.empty()))
-                blurWhy = "a moving scene's shared or saved photon map renders on the CPU so far";
             if (blurWhy && (wantGpu || wantAuto))
                 std::printf("[device] shared photon map: gathering on the CPU (%s)\n", blurWhy);
             // -beams runs on the device now, deposit AND gather, with NO backend carve-out.
@@ -28463,6 +28490,11 @@ static int run(int argc, char** argv) {
                             std::printf("[camera] '%s' (mode M/GPU, %dx%d) -> %s\n",
                                         rc.name.c_str(), rc.res, rc.resY, op.c_str());
                         double* anchor = (rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
+                        // A running average between epochs is exposed by the anchor, if the meter
+                        // found one, but must not set it: an unmetered group's anchor is the
+                        // finished frame's, not a few samples' at one time in the shutter.
+                        double provisional = anchor ? *anchor : 0.0;
+                        if (midEpoch && anchor) anchor = &provisional;
                         // The film is a SUM over the samples that actually landed. A frame an
                         // `ftrace -stop` interrupted holds fewer than `spp` of them, so
                         // normalising by `spp` here wrote it darkened by exactly the fraction
@@ -28557,6 +28589,12 @@ static int run(int argc, char** argv) {
                                 "device photon path has no bounce-limit parameter, so this render "
                                 "uses the built-in cap. Use -device cpu for a bounce-limited "
                                 "mode-M render.\n", g_maxBounceOverride);
+                // The refresh loop's device copy of the scene, which its passes share (cudaHoldScene):
+                // null, each pass uploading its own, otherwise.
+                struct HoldScene {
+                    CudaSceneHold* h = nullptr;
+                    ~HoldScene() { cudaReleaseScene(h); }
+                } sceneHold;
                 auto runPass = [&](long long sppWant, const SppProgress* p,
                                    const std::function<bool(int, const Film&, long long)>* onF,
                                    PmRadiiPin* pin) {
@@ -28571,7 +28609,7 @@ static int run(int argc, char** argv) {
                                               &aimMapGpu, nAimedGpu,
                                               g_pmAdaptive ? (g_pmAdaptiveK > 0.0 ? g_pmAdaptiveK
                                                                                   : -1.0) : 0.0,
-                                              pin);
+                                              pin, sceneHold.h);
                 };
                 // ---------------------------------------------------------------------------
                 // THE LIGHT-SIDE REFRESH, ON THE DEVICE, FOR A LONE CAMERA (0.253.0).
@@ -28611,8 +28649,8 @@ static int run(int argc, char** argv) {
                     std::printf("mode M: -beamfreeze is set aside under a blur of a moving scene: each light "
                                 "side is one time in the shutter, so the epochs must refresh\n");
                 // A moving scene's epoch: its light side and gather at one time, stratified over the
-                // epochs, the camera posed there and baked without a shutter (so the gather takes the
-                // epoch's time rather than one of its own).
+                // epochs, the camera posed there (and pinned there by the device, so the gather takes
+                // the epoch's time rather than one of its own).
                 const Camera blurCam = cams[0];
                 std::optional<PassTimeScope> epochTimeM;
                 auto atEpochM = [&](uint64_t epoch) {
@@ -28621,9 +28659,11 @@ static int run(int argc, char** argv) {
                     epochTimeM.emplace(scene.motionU(t));
                     Camera c = blurCam;
                     if (blurCam.moves()) blurCam.poseAt(t, c);
-                    c.shutterOpen = c.shutterClose = 0.0;
                     cams[0] = c;
                 };
+                // The device copy of the scene, kept across the epochs: each would upload it again
+                // otherwise, and a blur's epochs are many and short.
+                if (refreshGpu) sceneHold.h = cudaHoldScene(scene);
                 guidesFor(0);
                 struct DropGuides {   // after the gather, on every way out of it
                     std::unique_ptr<GuideScope>& g; ~DropGuides() { g.reset(); }
@@ -28635,6 +28675,8 @@ static int run(int argc, char** argv) {
                     Film acc; acc.resX = rxs[0]; acc.resY = rys[0]; acc.alloc();
                     Film epochFilm;
                     long long sppAll = 0, epochSpp = 0;
+                    long long written = 0;                  // the samples the image on disk holds
+                    auto lastWrite = clk::now();
                     bool stopAll = false;
                     // Captures this epoch's finished film. The device path MOVES its film out
                     // after calling onFrame (so a flythrough runs in one frame of host RAM), so
@@ -28687,7 +28729,12 @@ static int run(int argc, char** argv) {
                             // and appending a second epoch's beams to a first epoch's tree is
                             // the one failure mode here that would look like a working render.
                             bmapGpu = BeamMap{};
-                            if (lightEpoch == 1)
+                            if (lightEpoch == 1 && blurEpochsM)
+                                std::printf("[camera] motion blur — redrawing %lld photons at a "
+                                            "new time in the shutter every %lld spp and averaging "
+                                            "the epochs, which is the blur ...\n",
+                                            N, blurEpochSpp);
+                            else if (lightEpoch == 1)
                                 std::printf("[camera] light-side refresh — redrawing %lld "
                                             "photons under a fresh salt every ~%.0f%% of the "
                                             "wall clock and averaging the realizations, so the "
@@ -28739,12 +28786,23 @@ static int run(int argc, char** argv) {
                         sppAll += epochSpp;
                         epochFilm = Film{};
                         // Crash-safe: write the running average after every epoch, exactly as
-                        // the un-refreshed path writes after its one and only gather.
+                        // the un-refreshed path writes after its one and only gather -- a
+                        // blur's on the -interval cadence instead, its epochs being a few
+                        // samples each, and the last one whatever the clock says.
                         midEpoch = (sppAll < sppCap) && !stopAll && !ft::stopRequested()
                                    && !budgetSpent();
-                        if (writeFrame(0, acc, sppAll)) stopAll = true;
+                        const bool writeDue = !blurEpochsM || !midEpoch ||
+                            std::chrono::duration<double>(clk::now() - lastWrite).count() >= intervalSec;
+                        if (writeDue) {
+                            if (writeFrame(0, acc, sppAll)) stopAll = true;
+                            lastWrite = clk::now();
+                            written = sppAll;
+                        }
                         midEpoch = false;
                     }
+                    // A blur's last epoch was not written when the loop ended between epochs (a
+                    // stop, or the clock): the image is the average so far.
+                    if (sppAll > 0 && written != sppAll && writeFrame(0, acc, sppAll)) stopAll = true;
                     g_gpuQuietRebuild = false;
                     if (lightEpoch > 1)
                         std::printf("[camera] averaged %llu independent light-side realizations "

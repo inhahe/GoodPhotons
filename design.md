@@ -10150,12 +10150,14 @@ sees the instant, exactly as a static scene with those transforms would show it.
 - **Where blur is not yet carried, the shutter is closed**, so no estimator mixes times: the
   camera loop in `main.cpp` closes it for every mode `modeSeesMotion` does not name — V
   (which compares B against R) — and the exposure
-  meter asks the same helper. The device blurs some modes (*Motion blur on the device*, below);
-  for the rest `runRender`'s device choice, `renderForward`'s own device gate, the S, U and M
-  sessions and the exposure meter (which meters a frame where it renders) keep a blurred camera on
-  the CPU, each asking
-  `cudaBlurUnsupported` (the one source of the reason; a blurred shared forward flight says
-  `kSharedFlightBlurWhy`), and `-radcache` is off under a blur. What cannot move yet stays put and
+  meter asks the same helper. The device blurs every mode it renders (*Motion blur on the
+  device*, below); `runRender`'s device choice, `renderForward`'s own device gate, the S, U and M
+  sessions and the exposure meter each ask `cudaBlurUnsupported`, which would name a mode the
+  device could not blur. Two routings keep a blurred render on the CPU and say why themselves: a
+  blurred shared forward flight (`kSharedFlightBlurWhy`), and a mode-M camera of a moving scene
+  that is not the run's lone mode-M camera with a map of its own (`mBlurApart` in the camera
+  routing: shared with other mode-M cameras, `-savemap` / `-loadmap`, or `-preview`'s CPU
+  driver). `-radcache` is off under a blur. What cannot move yet stays put and
   says so (`stillWarning`): a sun or sky, an aimed area light, and any light whose keys would
   scale or shear it stay at the instant with their surfaces, so nothing mixes a moved surface
   with an unmoved sampler. A coat whose strands move is traced as strands when some camera
@@ -10218,9 +10220,8 @@ sees the instant, exactly as a static scene with those transforms would show it.
   lights uniformly in area, which a rigid motion keeps -- and the sample carried out
   (`dLightCarry`; a spot's point and beam too), in the surface, volume and RGB NEE; a path with a
   time selects lights by the timed tree (`dLightTreeOf`, Scene::lightTreeTimed).
-  `cudaBlurUnsupported` names what keeps a blurred render on the CPU: another mode (so far M,
-  S, U, J and P), or -- in `renderForward` and run's shared group -- a shared forward flight or
-  mode P's blurred split.
+  `cudaBlurUnsupported` names a mode the device cannot blur: since 0.423.0 none it renders (V
+  renders its instant).
 - **Mode D** (0.419.0): `kBdptT` (MERGE false) draws each sample's time off its own stream
   (`dSetPathTime`, the stream `timeSalt ^ BDPT's`) and poses the camera there, which the eye
   subpath, the light subpath's walk and every connection's t = 1 splat take. A moving light's
@@ -10232,7 +10233,7 @@ sees the instant, exactly as a static scene with those transforms would show it.
   where its densities are measured). The camera is copied and posed only when it moves (`camT`):
   one that holds still is read where the launch put it, the kernel's `cam` being
   `__grid_constant__` so its address can be taken without a per-thread copy. Mode J's camera pass
-  (MERGE) keeps the instant: its epochs' time is the host's (g_passMotionU), not yet the device's.
+  (MERGE) takes its epoch's one time, the host's (g_passMotionU), and never draws its own.
 - **Modes A, B and C** (0.420.0): one camera (a blurred shared flight flies on the CPU). Each
   photon draws its time at birth (`dPhotonTimeX`, the photon's budget index off the launch's
   seed `^` the host's salt; `dSetPhotonTime` sets it for its queries and, at the birth, poses
@@ -10264,22 +10265,31 @@ sees the instant, exactly as a static scene with those transforms would show it.
   `kBdptT` without merges, the forward photons) then sets its own. The sessions keep the host
   camera and scene: `sppmSessionPass` and `vcmSessionPass` take their pass's time (`passTime`, the
   host's salts) and pose the camera on the host (`posedBaked`: Camera::poseAt into the baked
-  camera's pose fields); a moving camera over a still scene in S poses each pixel on the device
+  camera's pose fields, the camera pinned there -- `pinToPass` clears its shutter and keys, so
+  no kernel can pose it again or move the scene to a sample's time); a moving camera over a
+  still scene in S poses each pixel on the device
   instead (`kSppmVisiblePoint`'s `perPixel`, a stream keyed by the pass and the pixel). Mode J's
   camera pass is `renderBdptCuda` under the host epoch's PassTimeScope, with the camera already
-  posed (`camEpochJ`): it reads `g_passMotionU` into the scene, which the device light pass for
-  the surface map shares. The S and U sessions now print the `[device] … -> GPU` line the other
+  posed (`camEpochJ`, which `kBdptT`'s MERGE pass never re-poses): it reads `g_passMotionU` into
+  the scene (`hostPassU`), which the device light pass for the surface map shares. The S and U sessions now print the `[device] … -> GPU` line the other
   modes do.
 - **Mode M** (0.422.0): the device path is the shared photon map (`runSharedPhotonMap`,
   `renderPhotonMapSharedCuda`). A camera moving over a still scene gathers from its one timeless
-  map, each sample posed (`kGather` calls `dSetCameraTime`, as `kBackward` does), in a group of
-  any size. A moving scene needs epochs, each at one time: run routes the run's one mode-M camera
-  there (`gpuBlurM`, no lens), and the device refresh loop times each epoch (`atEpochM`: the
-  host's PassTimeScope, the camera posed and baked with its shutter closed so the gather takes
-  the epoch's time; `renderPhotonMapSharedCuda` reads `g_passMotionU` into the scene), a 64th of
-  a fixed `-spp` or 4 samples under a clock, `-beamfreeze` set aside. Several cameras of a moving
-  scene, or a saved or loaded map, gather on the CPU and say why. The shared path prints the
-  `[device] … -> GPU` line the other modes do.
+  map, each sample posed (`kGather`'s `dPoseCameraAtSample`: the camera alone, on `kBackward`'s
+  lattice; the scene stays at the map's time, as renderPhotonCamera's does -- so the batched
+  exposure meter of a moving scene, which has no epoch, gathers its map of the instant, as the
+  CPU's meter does), in a group of any size. A moving scene needs epochs, each at one time: run
+  routes the run's one mode-M camera there (`gpuBlurM`, no lens), and the device refresh loop
+  times each epoch (`atEpochM`: the host's PassTimeScope, the camera posed on the host;
+  `renderPhotonMapSharedCuda` reads `g_passMotionU` into the scene, `hostPassU`, and pins the
+  baked camera there, `pinToPass`), a 64th of a fixed `-spp` or 4 samples under a clock,
+  `-beamfreeze` set aside (and not costing a budgeted render the device, `budgetedGpuM`). The
+  loop's epochs share one device copy of the scene (`cudaHoldScene`, `sceneHold`), and a blur's
+  write the running average on the `-interval` cadence and after the last; a write between
+  epochs never sets an exposure-locked group's anchor (`writeFrame`'s `provisional`). Several
+  cameras of a moving scene, a saved or loaded map, or `-preview`'s CPU driver gather on the CPU
+  and say why (`mBlurApart`). The shared path prints the `[device] … -> GPU` line the other modes
+  do.
 - **Mode P** (0.423.0): both layers on the device, as on the host. The backward layer is
   `kBackward` with a second film (`renderBackwardCuda`'s `specOut`): each sample files itself by
   its camera path's first event (`s_dFirstEv`, a slot per thread that `bkRadiance` and

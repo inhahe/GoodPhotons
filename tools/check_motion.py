@@ -942,8 +942,75 @@ def main():
     p_split_tests(exe, out, verdict, not a.no_gpu)
     j_empty_test(exe, out, verdict)
     camera_tests(exe, out, verdict, devices)
+    if not a.no_gpu:
+        meter_m_test(exe, out, verdict)
+        m_epoch_tests(exe, out, verdict)
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
+
+
+def meter_m_test(exe, out, verdict):
+    """A moving scene's mode-M group on the GPU: an exposure-locked camera path with a shutter over a
+    white ball that slides the frame's width. Its frames render on the CPU (the device blurs a
+    moving scene's map for a lone camera only), which the run says; and its batched GPU exposure
+    meter meters what the CPU's meter does, a map of the frame's instant with the camera posed per
+    sample. The device's gather used to move the scene to each sample's time in that map of the
+    instant, so the ball read dark and the anchor was 4.1 times the CPU's."""
+    path = os.path.join(out, "meter_m.ftsl")
+    write(path, NL.join([
+        "scene { units meters  motion_interval -0.5 0.5 }",
+        'material "white" { type diffuse reflect 0.9 }',
+        'material "dark"  { type diffuse reflect 0.1 }',
+        "quad { origin -3 0 -3  u 0 0 6  v 6 0 0  material dark }",
+        "quad { origin -3 0 -2  u 6 0 0  v 0 4 0  material dark }",
+        # no `power`: the frames are auto-exposed, so the meter's anchor sets their exposure
+        "light area { origin -0.4 2.9 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  spd preset:bb6500 }",
+        "group { motion { key { translate -0.9 0.5 0.3 } key { translate 0.9 0.5 0.3 } }  "
+        "sphere { center 0 0 0  radius 0.45  material white } }",
+        'camera_path "p" { look_at 0 0.5 0  up 0 1 0  fov_y 40  frames 2  shutter_open -0.5  '
+        "shutter_close 0.5  film { res %d %d }  exposure_lock average" % (W, H),
+        "key 0 0 1.0 4.2",
+        "key 1 0.1 1.0 4.2",
+        "}"]) + NL)
+    # A meter's anchor (a 99th percentile of 16 samples a pixel) varies some 7 % from seed to seed:
+    # the mean of three on each device, against a 15 % tolerance.
+    anchors, logs = {"gpu": [], "cpu": []}, {}
+    for dev in ("gpu", "cpu"):
+        for s in (1, 2, 3):
+            cmd = [exe, "-in", path, "-mode", "M", "-device", dev, "-spp", "2", "-n", "100000",
+                   "-seed", str(s), "-o", os.path.join(out, "meter_m_%s.png" % dev)]
+            rc, log = run(cmd)
+            found = re.findall(r"\[meter\] exposure lock: group 0 meters [^\n]*\(anchor ([0-9.eE+-]+)\)", log)
+            if rc != 0 or not found:
+                print(log[-2000:])
+                raise SystemExit("metering failed (exit %d): %s" % (rc, " ".join(cmd)))
+            if dev == "gpu" and "metering on" not in log:
+                raise SystemExit("the meter did not run on the GPU: " + " ".join(cmd))
+            anchors[dev].append(float(found[-1]))
+            logs[dev] = log
+    verdict("-device gpu with a moving scene's mode-M group says its frames gather on the CPU",
+            "this run's share one; using CPU" in logs["gpu"])
+    r = np.mean(anchors["gpu"]) / np.mean(anchors["cpu"])
+    verdict("... and its batched GPU meter meters as the CPU's does", abs(r - 1) < 0.15,
+            "anchor %.4f of the CPU's" % r)
+
+
+def m_epoch_tests(exe, out, verdict):
+    """The device's blurred mode-M epochs of the moving box: a 64th of -spp each, so -spp 64 is 64
+    epochs, which write the image on the -interval cadence and at the end rather than after each
+    (it was 64 writes); and under a clock -beamfreeze, which the epochs set aside, leaves the render
+    on the device (it went to the CPU)."""
+    path = os.path.join(out, "m_epochs.ftsl")
+    write(path, scene(shutter=(-0.5, 0.5)))
+    rc, log = run([exe, "-in", path, "-mode", "M", "-device", "gpu", "-spp", "64", "-n", "200000",
+                   "-interval", "100000", "-no-meter", "-o", os.path.join(out, "m_epochs.png")])
+    writes = len(re.findall(r"^wrote ", log, re.M))
+    verdict("blurred mode M on the GPU writes on the -interval cadence, not every epoch",
+            rc == 0 and "-> GPU" in log and writes == 1, "%d writes" % writes)
+    rc, log = run([exe, "-in", path, "-mode", "M", "-device", "gpu", "-time", "4", "-beamfreeze", "-n", "200000",
+                   "-no-meter", "-o", os.path.join(out, "m_epochs_t.png")])
+    verdict("... and under a clock with -beamfreeze it stays on the GPU", rc == 0 and "-> GPU" in log,
+            log.strip()[-300:] if rc else "")
 
 
 def p_split_tests(exe, out, verdict, gpu=False):

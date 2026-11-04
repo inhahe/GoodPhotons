@@ -285,6 +285,9 @@ struct PmRadiiPin {
 // (g_gpuQuietRebuild — the refresh-epoch narration gate — lives in render_progress.h, because
 // mode J's epoch loop sets it from code that is not inside #ifdef HAVE_CUDA.)
 
+// `held`, when non-null, is cudaHoldScene's copy of this same `scene` (below): the call gathers
+// against it instead of uploading the scene itself, as the refresh loop's epochs do.
+struct CudaSceneHold;
 std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vector<Camera>& cams,
                                             const std::vector<int>& resX, const std::vector<int>& resY,
                                             long long N, double radius, EnergyReport& eOut,
@@ -299,7 +302,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             const caim::AimMap* aim = nullptr,
                                             long long nAimed = 0,
                                             double causticAdaptK = 0.0,
-                                            PmRadiiPin* pin = nullptr);
+                                            PmRadiiPin* pin = nullptr,
+                                            const CudaSceneHold* held = nullptr);
 
 // True if this scene can be rendered by the GPU BDPT megakernel (mode D). Stricter
 // than cudaForwardSupported: also requires no participating media and only area/sphere/
@@ -408,16 +412,19 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 
 // Motion blur on the device (ROADMAP 11): for a camera that sees motion (Camera::seesMotion),
 // rendering in `mode`, null when the device can carry the blur, else why it renders on the CPU.
-// So far modes R, W, D, A, B, C, S, U and J: every primitive kind moves (rigid keys and
-// deformers), and the camera and the lights may, each camera path (mode D: each sample's two
-// subpaths; A, B and C: each photon and its splats) at its own time in the shutter, and each pass
-// of S and U and each epoch of J at one time. A blurred forward render on the device has one
-// camera: a shared flight that blurs flies on the CPU.
+// Every mode but V: every primitive kind moves (rigid keys and deformers), and the camera and the
+// lights may, each camera path (mode D: each sample's two subpaths; A, B and C: each photon and its
+// splats) at its own time in the shutter, and each pass of S and U and each epoch of J and M at one
+// time. Where the run's routing, not the mode, keeps a blurred render off the device -- a shared
+// forward flight (kSharedFlightBlurWhy), a moving scene's shared or saved mode-M map -- main.cpp
+// says so itself.
 const char* cudaBlurUnsupported(const Scene& scene, const Camera& cam, char mode);
-// Device memory a blurred forward render (modes A, B and C) of a camera that moves takes for its
-// per-thread posed copies of the camera (DCamSet::cam): one a thread of the megakernel's grid, or
-// one a slot of the wavefront's pool for an N-photon trace -- for the VRAM preflight.
-size_t cudaForwardPosedCameraBytes(bool wavefront, long long N);
+// Device memory a blurred single-camera forward render (modes A, B and C) of a camera that moves
+// takes for its per-thread posed copies of the camera (DCamSet::cam), on the backend
+// renderForwardCuda will run (`wavefront` asked, `heroC` the hero bundle asked): one a thread of
+// the megakernel's grid, or one a slot of the wavefront's pool for an N-photon trace -- for the
+// VRAM preflight.
+size_t cudaForwardPosedCameraBytes(const Scene& scene, bool wavefront, int heroC, long long N);
 
 // ---- Mode W (deterministic Whitted / POV-Ray-style preview) ----------------------------
 // Device twin of BackwardRenderer's mode-W fields (src/backward.h). Passing a non-null

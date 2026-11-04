@@ -128,7 +128,9 @@ the epochs' average is the blur and many epochs must sample it. With a fixed `-s
 after 4 samples (`blurEpochSpp` in mode M, `blurEpochsJ` in mode J's `inner.report`, main.cpp),
 whatever the light side cost to rebuild. A dear one (millions of photons, a big beam map) then
 takes much of the clock in rebuilds, and a `-time` render reaches far fewer samples than it
-would without the shutter (Fable's review of 0.420.0).
+would without the shutter (Fable's review of 0.420.0). The scene's upload is no longer part of
+that on the device: since 0.423.1 mode M's epochs share one device copy of it (`cudaHoldScene`),
+as mode J's already did; the deposit, the map builds and the beam BVH remain per epoch.
 
 Bounding the rebuilds' share instead was tried and measured wrong. Sizing the epoch by
 `-beamrefresh`, or ending it once it had gathered as long as it rebuilt, ran a short `-noise`
