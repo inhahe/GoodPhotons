@@ -2102,13 +2102,14 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
   another. A camera moving through a still scene leaves the `M` and `S` maps
   timeless, and each sample poses the camera at its own time; `U` and `J`, whose light paths are
   traced for the camera, still take one time a pass or an epoch. **On the GPU** modes `R` and
-  `W` (since 0.418.0), `D` (since 0.419.0) and `A`, `B` and `C` (since 0.420.0) blur, with every
-  primitive kind moving (rigid keys and deformers), the camera and the lights too, each camera
-  path (in mode `D`, each sample's two subpaths; in `A`, `B` and `C`, each photon and its splats,
-  mirrors and glass met where they are) at its own time; a shared forward flight that blurs
-  flies on the CPU, and any other mode keeps a blurred render on the CPU and says why
-  (`[device] … renders on the CPU so far`), and the exposure meter stays on the CPU under a
-  blur. Mode `P` splits each backward sample by its own
+  `W` (since 0.418.0), `D` (since 0.419.0), `A`, `B` and `C` (since 0.420.0), and `S`, `U` and
+  `J` (since 0.421.0) blur, with every primitive kind moving (rigid keys and deformers), the
+  camera and the lights too, each camera path (in mode `D`, each sample's two subpaths; in `A`,
+  `B` and `C`, each photon and its splats, mirrors and glass met where they are) at its own time,
+  and each pass of `S` and `U` and each epoch of `J` at one, as on the CPU; a shared forward
+  flight that blurs flies on the CPU, and any other mode keeps a blurred render on the CPU and
+  says why (`[device] … renders on the CPU so far`). The exposure meter meters a frame where it
+  will render. Mode `P` splits each backward sample by its own
   path's first event at its own time (a specular surface or the sky to the backward layer; a
   diffuse or composite surface, or a scatter in a medium before any surface, to the forward
   one), where the still render splits whole pixels by the instant. `V`, which runs `B` beside `R`, renders the frame's instant

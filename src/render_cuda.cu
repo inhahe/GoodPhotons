@@ -722,6 +722,10 @@ struct DMotion {
     // without one) and the parts' boxes at each key (mirrorPartBoxes: lo then hi, 6 doubles).
     const DMirrorPlane* mirrorParts; int nMirrorParts;
     const int* mirrorDeformPart; const double* mirrorPartBoxes;
+    // The launch's pass time, in the interval (-1: the instant): a pass or an epoch of a mode that
+    // shares light data across paths (S, U, M, J) is at one time, which every kernel of the pass
+    // starts its threads at (D_MOTION_CLEAR) -- set by the host per launch.
+    float passU = -1.0f;
 };
 
 // One flat mirror SURFACE (device twin of Scene::MirrorPlane), i.e. the set of coplanar
@@ -1519,9 +1523,10 @@ struct DScene {
 // instant: the device twin of g_motionU, a slot per thread in shared memory, so the query sites
 // stay as they are, as on the host. Every launch of a kernel that takes a DScene is 1-D with at
 // most kMotionSlots threads a block -- D_MOTION_CLEAR traps any other launch shape rather than
-// let threads share a slot or index past the array -- and every such kernel clears its slot
-// first (D_MOTION_CLEAR), since shared memory starts as whatever the last block left; one that
-// blurs sets it per path.
+// let threads share a slot or index past the array -- and every such kernel sets its slot first
+// (D_MOTION_CLEAR, from `sc`), since shared memory starts as whatever the last block left: to the
+// launch's pass time (DMotion::passU, -1 but for a pass that takes one time); one that blurs per
+// path sets it per path.
 constexpr int kMotionSlots = 256;
 __shared__ float s_dMotionU[kMotionSlots];
 __device__ static inline float dMotionU() { return s_dMotionU[threadIdx.x]; }
@@ -1529,7 +1534,7 @@ __device__ static inline void dSetMotionU(float u) { s_dMotionU[threadIdx.x] = u
 #define D_MOTION_CLEAR()                                                                        \
     do {                                                                                        \
         if (blockDim.x > (unsigned)kMotionSlots || blockDim.y != 1 || blockDim.z != 1) __trap(); \
-        dSetMotionU(-1.0f);                                                                     \
+        dSetMotionU(sc.mo.passU);                                                               \
     } while (0)
 // Whether a query must look at time: the scene moves and the path has one (host twin
 // Scene::sweptQuery as well as timedQuery).
@@ -20043,8 +20048,9 @@ struct DSppmState {
 
 // Phase 1: resample each pixel's camera visible point for this pass and accumulate its
 // direct term. One thread per pixel. Seeds mirror kBackward/kGather (global sample index).
-__global__ void kSppmVisiblePoint(DScene sc, DCamera cam, DSppmState st, int resX, int resY,
-                                  int maxBounce, unsigned long long seedBase, long long passIdx) {
+__global__ void kSppmVisiblePoint(DScene sc, const __grid_constant__ DCamera cam, DSppmState st, int resX,
+                                  int resY, int maxBounce, unsigned long long seedBase, long long passIdx,
+                                  int perPixel) {
     D_MOTION_CLEAR();   // this thread's time: the instant until a path sets one
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long G = (long long)gridDim.x * blockDim.x;
@@ -20064,7 +20070,18 @@ __global__ void kSppmVisiblePoint(DScene sc, DCamera cam, DSppmState st, int res
 
         DVec3 ro, rd;
         Real jx = rng.uniform(), jy = rng.uniform();
-        dGenRay(cam, px, py, jx, jy, ro, rd);            // pinhole only (lens cams gated to CPU)
+        // A moving camera over a still scene (`perPixel`; host twin sppmPass): each pixel's ray at
+        // a time of its own, off a stream keyed by the pass and the pixel; else the pass's camera.
+        DCamera posed;
+        const DCamera* cp = &cam;
+        if (perPixel) {
+            DRng tr;
+            tr.seedUnit(((unsigned long long)passIdx << 32) ^ (unsigned long long)pix,
+                        seedBase ^ 0x6C62272E07BB0142ULL);
+            dPoseCamera(cam, cam.shOpen + (cam.shClose - cam.shOpen) * (double)tr.uniform(), posed);
+            cp = &posed;
+        }
+        dGenRay(*cp, px, py, jx, jy, ro, rd);            // pinhole only (lens cams gated to CPU)
 
         DHit vp; double thr = 0.0; bool valid = false; double dX, dY, dZ;
         dSppmVisiblePoint(sc, ro, rd, lambda, invPdfL, rng, maxBounce, vp, thr, valid, dX, dY, dZ);
@@ -23625,6 +23642,27 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
 // Bake one Camera into a POD DCamera for the given film resolution. Any device memory
 // (the realistic-lens index tables) is recorded in up.frees. Split out of the scene
 // bake so a multi-camera shared pass can bake N cameras against one uploaded scene.
+// The baked camera `dc` posed at `tFrames` frames on the host (Camera::poseAt), for a pass or an
+// epoch that takes one time: only the pose changes. `dc` itself for a camera that holds still.
+static gpu::DCamera posedBaked(const gpu::DCamera& dc, const Camera& cam, double tFrames) {
+    gpu::DCamera out = dc;
+    if (!cam.moves()) return out;
+    Camera c = cam;
+    cam.poseAt(tFrames, c);
+    out.eye = {c.eye.x, c.eye.y, c.eye.z};
+    out.u = {c.u.x, c.u.y, c.u.z};
+    out.v = {c.v.x, c.v.y, c.v.z};
+    out.w = {c.w.x, c.w.y, c.w.z};
+    out.tanHalfX = c.tanHalfX; out.tanHalfY = c.tanHalfY;
+    out.halfFovY = c.halfFovY; out.rEdge = c.rEdge;
+    return out;
+}
+// A pass's time at `tFrames` for the device's queries (DMotion::passU): in the interval, or -1
+// when the scene holds still.
+static float devicePassU(const Scene& scene, double tFrames) {
+    return scene.hasMotion() ? (float)scene.motionU(tFrames) : -1.0f;
+}
+
 static gpu::DCamera bakeCamera(const Scene& scene, const Camera& cam, int resX, int resY, DUpload& up) {
     using namespace gpu;
     DCamera dc{};
@@ -25022,6 +25060,9 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     } else {
         buildUpload(scene, cam, resX, resY, up);
     }
+    // Mode J under a blur: its epoch is one time (the host's PassTimeScope, atEpochJ), which the
+    // light subpaths and the camera pass take; mode D's paths take their own (g_passMotionU < 0).
+    up.sc.mo.passU = (g_passMotionU >= 0.0 && scene.hasMotion()) ? (float)g_passMotionU : -1.0f;
     // The aimed sun (MODE-J-SDS, 0.387.0): before the first light subpath of this render, which
     // in mode J is the device light pass below, ahead of the per-render J constants.
     uploadSunAim();
@@ -25605,8 +25646,9 @@ size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
 // --------------------- backward reference (mode R) host ----------------------
 
 const char* cudaBlurUnsupported(const Scene& /*scene*/, const Camera& /*cam*/, char mode) {
-    if (mode == 0 || !std::strchr("RWDABC", mode))
-        return "motion blur in this mode renders on the CPU so far (the device blurs modes R, W, D, A, B and C)";
+    if (mode == 0 || !std::strchr("RWDABCSUJ", mode))
+        return "motion blur in this mode renders on the CPU so far (the device blurs modes R, W, D, A, B, C, S, "
+               "U and J)";
     return nullptr;
 }
 
@@ -27196,6 +27238,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
 struct SppmSession {
     DUpload up;
     gpu::DCamera cam{};
+    const Scene* scene = nullptr;   // for a blurred pass's time and pose (sppmSessionPass)
+    Camera hostCam;
     int resX = 0, resY = 0;
     size_t npix = 0;
     bool diffraction = false;
@@ -27234,6 +27278,7 @@ SppmSession* sppmSessionBegin(const Scene& scene, const Camera& cam, int resX, i
     s->diffraction = diffraction; s->maxBounce = (maxBounce > 0) ? maxBounce : 32; s->heroC = heroC;
     buildUploadScene(scene, s->up);
     s->cam = bakeCamera(scene, cam, resX, resY, s->up);
+    s->scene = &scene; s->hostCam = cam;
     const size_t np = s->npix;
     CUDA_CHECK(cudaMalloc(&s->st.tau,       np * 3 * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&s->st.directSum, np * 3 * sizeof(double)));
@@ -27265,8 +27310,17 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
     unsigned long long vpSeed = 0xA24BAED4963EE407ULL
                               ^ ((unsigned long long)(passIdx + 1) * 0x9E3779B97F4A7C15ULL)
                               ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
-    kSppmVisiblePoint<<<2048, 128>>>(s->up.sc, s->cam, s->st, s->resX, s->resY,
-                                     s->maxBounce, vpSeed, passIdx + 1);
+    // Motion blur (host twin sppmPass): a moving scene's pass -- visible points, photons and
+    // gather -- at one time, stratified over the passes, the camera posed there; a moving camera
+    // over a still scene leaves the photons timeless and poses each pixel's ray at its own time.
+    const Camera& hc = s->hostCam;
+    const bool passTimed = hc.timed() && s->scene->hasMotion();
+    const double tPass = passTimed ? hc.shutterTime(passTime((uint64_t)passIdx, 0x2545F4914F6CDD1DULL)) : 0.0;
+    s->up.sc.mo.passU = passTimed ? devicePassU(*s->scene, tPass) : -1.0f;
+    const DCamera camPass = passTimed ? posedBaked(s->cam, hc, tPass) : s->cam;
+    const int perPixel = (!passTimed && hc.timed() && hc.moves()) ? 1 : 0;
+    kSppmVisiblePoint<<<2048, 128>>>(s->up.sc, camPass, s->st, s->resX, s->resY,
+                                     s->maxBounce, vpSeed, passIdx + 1, perPixel);
     cudaCheckKernel("sppm-visible-point");
 
     // (2) Forward deposit into a bounded, PERSISTENT grow-only device buffer (photonsPerPass
@@ -27454,6 +27508,8 @@ void sppmSessionEnd(SppmSession* s) {
 struct VcmSession {
     DUpload up;
     gpu::DCamera cam{};
+    const Scene* scene = nullptr;   // for a blurred pass's time and pose (vcmSessionPass)
+    Camera hostCam;
     int resX = 0, resY = 0;
     size_t npix = 0;
     int  diffraction = 0;
@@ -27524,6 +27580,7 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
     s->vcmCap = s->maxDepth - 1;
     buildUploadScene(scene, s->up);
     s->cam = bakeCamera(scene, cam, resX, resY, s->up);
+    s->scene = &scene; s->hostCam = cam;
     const size_t np = s->npix;
     size_t budget = (size_t)768 << 20;
     {
@@ -27604,6 +27661,14 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
 void vcmSessionPass(VcmSession* s, double radius) {
     using namespace gpu;
     const long long passIdx = s->passes;                 // 0-based index of THIS pass
+    // Motion blur (host twin vcmPass): the whole pass -- both subpaths, their connections and
+    // merges -- at one time, stratified over the passes, the camera posed there, even for a camera
+    // moving over a still scene, since the light pass connects to the camera too.
+    const Camera& hc = s->hostCam;
+    const bool passTimed = hc.seesMotion(*s->scene);
+    const double tPass = passTimed ? hc.shutterTime(passTime((uint64_t)passIdx, 0x1B873593CC9E2D51ULL)) : 0.0;
+    s->up.sc.mo.passU = passTimed ? devicePassU(*s->scene, tPass) : -1.0f;
+    const DCamera camPass = passTimed ? posedBaked(s->cam, hc, tPass) : s->cam;
     const int W = s->resX, H = s->resY;
     const size_t np = s->npix, nl = s->nLight;
     if (radius <= 0.0) radius = 1e-6;
@@ -27617,7 +27682,7 @@ void vcmSessionPass(VcmSession* s, double radius) {
     ctx.misVcWeight = (etaVCM > 0.0) ? 1.0 / etaVCM : 0.0;
     ctx.misVmWeight = etaVCM;
     ctx.vmNorm      = (etaVCM > 0.0) ? 1.0 / etaVCM : 0.0;
-    ctx.imagePlaneDist = (double)W / (2.0 * s->cam.tanHalfX);
+    ctx.imagePlaneDist = (double)W / (2.0 * camPass.tanHalfX);
     ctx.maxDepth = s->maxDepth;
 
     // (1) Light pass — zero the per-pass splat, then trace nLight light subpaths.
@@ -27627,13 +27692,13 @@ void vcmSessionPass(VcmSession* s, double radius) {
                              ^ ((unsigned long long)(passIdx + 1) * 0x9E3779B97F4A7C15ULL)
                              ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
     if (s->secStride > 0)
-        kVcmLightT<BDPT_NSEC><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx,
+        kVcmLightT<BDPT_NSEC><<<2048, 128>>>(s->up.sc, camPass, s->diffraction, ctx,
                                  s->d_lvSlab, s->d_lvSecSlab, s->secStride, s->heroC,
                                  s->d_lvCount, s->d_splat,
                                  s->d_lamBuf, s->d_invLam, W, H, s->vcmCap, (long long)nl,
                                  seedL, passIdx);
     else
-        kVcmLightT<0><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx,
+        kVcmLightT<0><<<2048, 128>>>(s->up.sc, camPass, s->diffraction, ctx,
                                  s->d_lvSlab, nullptr, 0, 1,
                                  s->d_lvCount, s->d_splat,
                                  s->d_lamBuf, s->d_invLam, W, H, s->vcmCap, (long long)nl,
@@ -27723,12 +27788,12 @@ void vcmSessionPass(VcmSession* s, double radius) {
                              ^ ((unsigned long long)(passIdx + 1) * 0xA24BAED4963EE407ULL)
                              ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
     if (s->secStride > 0)
-        kVcmCameraT<BDPT_NSEC><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx, grid,
+        kVcmCameraT<BDPT_NSEC><<<2048, 128>>>(s->up.sc, camPass, s->diffraction, ctx, grid,
                               (nLV > 0) ? s->d_lvSecCompact : nullptr, s->secStride, s->heroC,
                               s->d_pathBegin, s->d_pathEnd, s->d_splat, s->d_accum,
                               s->d_lamBuf, s->d_invLam, W, H, (long long)nl, seedC, passIdx);
     else
-        kVcmCameraT<0><<<2048, 128>>>(s->up.sc, s->cam, s->diffraction, ctx, grid,
+        kVcmCameraT<0><<<2048, 128>>>(s->up.sc, camPass, s->diffraction, ctx, grid,
                               nullptr, 0, 1,
                               s->d_pathBegin, s->d_pathEnd, s->d_splat, s->d_accum,
                               s->d_lamBuf, s->d_invLam, W, H, (long long)nl, seedC, passIdx);

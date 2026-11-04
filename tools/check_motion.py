@@ -52,7 +52,7 @@ cube whose keys scale and shear it together. It requires:
     on the CPU, and mode V says it renders the instant.
   * Modes M and J (an epoch at a time), S and U (a pass at a time) blur, agreeing with
     blurred mode R within their density estimates' bias, and follow a moving camera as mode R
-    does; so does mode P, its backward samples split by their own path's first event -- also with
+    does -- S, U and J on the GPU too; so does mode P, its backward samples split by their own path's first event -- also with
     fog in front of a mirror, and on a floor of a mix of a diffuse and a glossy child; and fur in
     front of a mirror renders the same under -dual-scatter as without. Mode M under
     a -noise budget blurs too, and mode J whose surface map comes back empty blurs as mode D does.
@@ -685,20 +685,28 @@ def main():
     # the blur really there ---
     # (Mode M under a -noise budget, which has no total to split, ends an epoch every few samples,
     # so its shutter is sampled by many epochs too.)
-    for label, mode, margs in (("M", "M", ["-spp", "128", "-n", "2000000"]),
-                               ("M under -noise", "M", ["-noise", "6.25", "-n", "2000000"]),
-                               ("S", "S", ["-spp", "128", "-n", "200000"]),
-                               ("U", "U", ["-spp", "256"]), ("J", "J", ["-spp", "128", "-jsurf"]),
-                               ("P", "P", ["-spp", "256", "-n", "20000000"])):
+    # On the GPU too (0.421.0): S and U a pass, and J's camera pass an epoch, at one time.
+    shared_cases = [("M", "M", ["-spp", "128", "-n", "2000000"], "cpu"),
+                    ("M under -noise", "M", ["-noise", "6.25", "-n", "2000000"], "cpu"),
+                    ("S", "S", ["-spp", "128", "-n", "200000"], "cpu"),
+                    ("U", "U", ["-spp", "256"], "cpu"), ("J", "J", ["-spp", "128", "-jsurf"], "cpu"),
+                    ("P", "P", ["-spp", "256", "-n", "20000000"], "cpu")]
+    if not a.no_gpu:
+        shared_cases += [("S on the GPU", "S", ["-spp", "128", "-n", "200000"], "gpu"),
+                         ("U on the GPU", "U", ["-spp", "256"], "gpu"),
+                         ("J on the GPU", "J", ["-spp", "128", "-jsurf"], "gpu")]
+    for label, mode, margs, dev in shared_cases:
         tag = label.replace(" ", "_").replace("-", "")
+        gpu = dev == "gpu"
         bm = [lum(render(exe, out, blurred, "blur_%s_s%d" % (tag, s),
-                         ["-mode", mode, "-device", "cpu"] + margs, seed=s)[0]) for s in (1, 2)]
+                         ["-mode", mode, "-device", dev] + margs, seed=s, want_gpu=gpu)[0]) for s in (1, 2)]
         mm = blocks((bm[0] + bm[1]) / 2)
         err = np.hypot(block_err(lb[0], lb[1]), block_err(bm[0], bm[1]))
         z = np.abs(mm - mb) / np.maximum(err, 1e-30)
         rel = np.abs(mm - mb) / np.maximum(np.abs(mb), 1e-3 * np.abs(mb).max())
         bad = (z > 5.0) & (rel > 0.10)
-        inst = blocks(lum(render(exe, out, static0, "instant_%s" % tag, ["-mode", mode, "-device", "cpu"] + margs)[0]))
+        inst = blocks(lum(render(exe, out, static0, "instant_%s" % tag, ["-mode", mode, "-device", dev] + margs,
+                                 want_gpu=gpu)[0]))
         moved = (np.abs(mm - inst) / np.maximum(inst, 1e-3 * inst.max()) > 0.10).sum()
         verdict("blurred mode %s = blurred mode R, and blurs" % label, not bad.any() and moved >= 8,
                 "worst block z %.1f rel %.3f; %d blocks out; %d blocks off the instant" %
@@ -1216,6 +1224,12 @@ def camera_tests(exe, out, verdict, devices):
                         seed=s, want_gpu=True)[0]) for s in (1, 2)]
         good, detail = agree(g, blur, 0.05)
         verdict("... mode B on the GPU = mode R", good, detail)
+        for mode, margs, tol in (("S", ["-spp", "128", "-n", "200000"], 0.15), ("U", ["-spp", "256"], 0.10),
+                                 ("J", ["-spp", "128", "-jsurf"], 0.10)):
+            g = [lum(render(exe, out, moving, "cam_blur_gpu%s_s%d" % (mode, s),
+                            ["-mode", mode, "-device", "gpu"] + margs, seed=s, want_gpu=True)[0]) for s in (1, 2)]
+            good, detail = agree(g, blur, tol)
+            verdict("... mode %s on the GPU = mode R" % mode, good, detail)
 
     # --- a camera path's frame blurs along the path: frames a frame apart on a straight line at
     # an even pace, so the middle frame's shutter sweeps its eye linearly half a frame each way ---

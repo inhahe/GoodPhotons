@@ -10152,7 +10152,8 @@ sees the instant, exactly as a static scene with those transforms would show it.
   (which compares B against R) — and the exposure
   meter asks the same helper. The device blurs some modes (*Motion blur on the device*, below);
   for the rest `runRender`'s device choice, `renderForward`'s own device gate, the S, U and M
-  sessions and the exposure meter keep a blurred camera on the CPU, each asking
+  sessions and the exposure meter (which meters a frame where it renders) keep a blurred camera on
+  the CPU, each asking
   `cudaBlurUnsupported` (the one source of the reason; a blurred shared forward flight says
   `kSharedFlightBlurWhy`), and `-radcache` is off under a blur. What cannot move yet stays put and
   says so (`stillWarning`): a sun or sky, an aimed area light, and any light whose keys would
@@ -10187,7 +10188,7 @@ sees the instant, exactly as a static scene with those transforms would show it.
   (`sphereAsMesh_`), as an uneven static scale already tessellates it, so `sphereAt` may take the
   radius from the blended transform's mean column length.
 
-### Motion blur on the device (0.418.0: modes R and W; 0.419.0: D; 0.420.0: A, B and C)
+### Motion blur on the device (0.418.0: modes R and W; 0.419.0: D; 0.420.0: A, B and C; 0.421.0: S, U and J)
 
 - **The path's time** is a slot per thread in shared memory (`s_dMotionU`, `dMotionU`), the
   device twin of the thread-local `g_motionU`, so the ~37 query sites need no argument. Every
@@ -10257,6 +10258,18 @@ sees the instant, exactly as a static scene with those transforms would show it.
   its key boxes), each claiming only a hit on its own faces (`dMirrorClaims`). The sky the
   camera sees directly is drawn on the host while the device traces (`renderForward`: the CPU's
   `addBlurredSkyRows` over row bands of one film, merged into the device's).
+- **Modes S, U and J** (0.421.0): a pass (S, U) or an epoch (J) is at one time, as on the host.
+  The time reaches the device in the scene (`DMotion::passU`, -1 for the instant), which every
+  kernel's `D_MOTION_CLEAR` starts its threads at; a kernel that blurs per path (`kBackward`,
+  `kBdptT` without merges, the forward photons) then sets its own. The sessions keep the host
+  camera and scene: `sppmSessionPass` and `vcmSessionPass` take their pass's time (`passTime`, the
+  host's salts) and pose the camera on the host (`posedBaked`: Camera::poseAt into the baked
+  camera's pose fields); a moving camera over a still scene in S poses each pixel on the device
+  instead (`kSppmVisiblePoint`'s `perPixel`, a stream keyed by the pass and the pixel). Mode J's
+  camera pass is `renderBdptCuda` under the host epoch's PassTimeScope, with the camera already
+  posed (`camEpochJ`): it reads `g_passMotionU` into the scene, which the device light pass for
+  the surface map shares. The S and U sessions now print the `[device] … -> GPU` line the other
+  modes do.
 - **The haze ends at the instant's sphere** (0.419.0), as on the host: a shadow ray to the sun or
   the sky runs to `dExitDistance` (for a path with a time, the swept sphere), but crosses media
   only to `dMediaExitDistance` (Scene::mediaExitDistance) -- in the surface, volume, fibre and

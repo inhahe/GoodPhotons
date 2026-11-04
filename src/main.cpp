@@ -20627,11 +20627,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         {
             const bool wantGpu  = !std::strcmp(device, "gpu");
             const bool wantAuto = !std::strcmp(device, "auto");
-            if ((wantGpu || wantAuto) && !cam.hasLens() && !cam.seesMotion(scene) &&
+            if ((wantGpu || wantAuto) && !cam.hasLens() &&
+                (!cam.seesMotion(scene) || !cudaBlurUnsupported(scene, cam, 'S')) &&
                 cudaAvailable() && cudaSppmSupported(scene)) {
                 SppmSession* sess = sppmSessionBegin(scene, cam, res, resY, R0, diffraction,
                                                      effMaxBounce(), g_heroC);
                 if (sess) {
+                    // The device line every other mode prints (runRender leaves S's to it).
+                    std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu", cudaDeviceName());
                     std::printf("mode S: SPPM on %s — %lld photons/pass, R0=%.4g, alpha=%.2f "
                                 "at %dx%d (light=%s) ...\n",
                                 cudaDeviceName(), N, R0, g_sppmAlpha, res, resY, lightLabel);
@@ -20723,11 +20726,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         {
             const bool wantGpu  = !std::strcmp(device, "gpu");
             const bool wantAuto = !std::strcmp(device, "auto");
-            if ((wantGpu || wantAuto) && !cam.hasLens() && !cam.seesMotion(scene) &&
+            if ((wantGpu || wantAuto) && !cam.hasLens() &&
+                (!cam.seesMotion(scene) || !cudaBlurUnsupported(scene, cam, 'U')) &&
                 cudaAvailable() && cudaVcmSupported(scene)) {
                 VcmSession* sess = vcmSessionBegin(scene, cam, res, resY, diffraction, maxEdges,
                                                    vcmHeroC);
                 if (sess) {
+                    // The device line every other mode prints (runRender leaves U's to it).
+                    std::printf("[device] %s -> GPU: %s\n", wantAuto ? "auto" : "gpu", cudaDeviceName());
                     std::printf("mode U: VCM/UPS on %s — connections + merging, R0=%.4g, "
                                 "alpha=%.2f at %dx%d (max-bounce %d, light=%s, %s) ...\n",
                                 cudaDeviceName(), R0, g_vcmAlpha, res, resY, maxBounce, lightLabel,
