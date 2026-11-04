@@ -2108,12 +2108,13 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
   deformers), the
   camera and the lights too, each camera path (in mode `D`, each sample's two subpaths; in `A`,
   `B` and `C`, each photon and its splats, mirrors and glass met where they are) at its own time,
-  and each pass of `S` and `U` and each epoch of `J` and `M` at one, as on the CPU (a mode `M`
-  render of a moving scene takes the device for its one mode-`M` camera; a camera moving over a
-  still scene gathers its one map on the device, each sample posed). Two blurred renders stay
+  and each pass of `S` and `U` and each epoch of `J` and `M` at one, as on the CPU (in a moving
+  scene each blurred mode-`M` camera gathers on the device alone, its maps redrawn at times of
+  its own shutter, several of them one after another since 0.429.0; a camera moving over a still
+  scene gathers the run's one map on the device, each sample posed). Two blurred renders stay
   on the CPU and say why (`[device] …; using CPU`): a shared forward flight, and a mode-`M`
-  camera of a moving scene that shares the run's map with other mode-`M` cameras, or has
-  `-savemap`, `-loadmap` or `-preview`. Under a blur the device's mode-`M` epochs, a few
+  camera of a moving scene with `-savemap`, `-loadmap` or `-preview`, or under a budget beside
+  other mode-`M` cameras. Under a blur the device's mode-`M` epochs, a few
   samples each, write the image on the `-interval` cadence and at the end. The exposure meter
   meters a blurred frame on the device when the device renders it; a mode-`M` group's batched
   meter gathers on the device in any case, from a map of the frame's instant, as the CPU's

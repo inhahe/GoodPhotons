@@ -27835,13 +27835,14 @@ static int run(int argc, char** argv) {
             ++mModeCams;
             mBlurMoving = mBlurMoving || (rc.cam.seesMotion(scene) && scene.hasMotion());
         }
-    // A blurred mode-M camera of a moving scene the device can serve: the run's one mode-M camera,
-    // which the shared path's refresh loop renders as epochs, each at one time (a camera moving
-    // over a still scene needs no such care: its map is timeless and the device gather poses each
-    // sample, whatever the group).
+    // Whether the device can serve a blurred mode-M camera of a moving scene: each such camera alone
+    // (groupMApart), through the shared path's refresh loop as epochs, each at one time of its own
+    // shutter, as runRender's mode-M epochs render each apart on the CPU. (A camera moving over a
+    // still scene needs no such care: its map is timeless and the device gather poses each sample,
+    // whatever the group.)
     bool gpuBlurM = false;
 #ifdef HAVE_CUDA
-    gpuBlurM = mModeCams == 1 && g_pmapLoad.empty() && g_pmapSave.empty() &&
+    gpuBlurM = g_pmapLoad.empty() && g_pmapSave.empty() &&
                (!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
                cudaAvailable() && cudaPhotonMapSupported(scene) && !cudaBlurUnsupported(scene, Camera{}, 'M');
 #endif
@@ -27876,9 +27877,9 @@ static int run(int argc, char** argv) {
         }
         flights.push_back({i});
     };
-    std::vector<int> groupM, restIdx;
+    std::vector<int> groupM, groupMApart, restIdx;
     bool mModeBudgeted = false;   // a mode-M camera dropped from groupM by the budget test
-    bool mBlurApart = false;      // ... or one blurring a moving scene, which the device gathers alone
+    bool mBlurApart = false;      // ... or one blurring a moving scene the device cannot take alone
     for (int i = 0; i < (int)toRender.size(); ++i) {
         const RenderCam& rc = toRender[i];
         // Forward A/B sharing no longer requires `plainRender`: the shared pass itself
@@ -27896,9 +27897,12 @@ static int run(int argc, char** argv) {
         // gather is an independent backward pass per camera, so frames don't share noise —
         // only the underlying radiance solution. That makes it safe to share even across
         // exposure-locked camera_path frames, so it isn't gated on `expGroup < 0`.
-        else if (rc.mode == 'M' && (plainRender || budgetedGpuM) &&
-                 (!(rc.cam.seesMotion(scene) && scene.hasMotion()) || (gpuBlurM && !rc.cam.hasLens())))
+        else if (rc.mode == 'M' && (plainRender || budgetedGpuM) && !(rc.cam.seesMotion(scene) && scene.hasMotion()))
                                                                                 groupM.push_back(i);
+        // Blurring a moving scene: its maps are redrawn at times of its own shutter, so it gathers
+        // alone (runSharedPhotonMap over it by itself, below).
+        else if (rc.mode == 'M' && (plainRender || budgetedGpuM) && gpuBlurM && !rc.cam.hasLens())
+                                                                                groupMApart.push_back(i);
         else {
             // A mode-M camera reaching here is the silent-CPU case warned about below: under a
             // budget, or blurring a moving scene, whose map the device builds for one camera
@@ -27916,14 +27920,16 @@ static int run(int argc, char** argv) {
     if (mBlurApart && (!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
         cudaAvailable() && cudaPhotonMapSupported(scene)) {
         // The device renders a moving scene's blur in mode M as epochs of its refresh loop, each
-        // map at one time, which only a lone mode-M camera with a map of its own runs.
-        const char* why = mModeCams > 1
-            ? "a moving scene's blurred mode-M map is gathered on the device only for the run's one "
-              "mode-M camera, and this run's share one"
+        // map at one time, each camera with maps of its own.
+        const char* blurWhy = cudaBlurUnsupported(scene, Camera{}, 'M');
+        const char* why = blurWhy ? blurWhy
             : (!g_pmapLoad.empty() || !g_pmapSave.empty())
             ? "a moving scene's blurred mode-M map is redrawn at each time in the shutter, which a "
               "-savemap or -loadmap map is not"
-            : "the single-camera -preview driver of mode M is CPU-only";
+            : preview
+            ? "the single-camera -preview driver of mode M is CPU-only"
+            : "a budgeted render of several mode-M cameras, or of one beside a lens camera, is on "
+              "the single-camera progressive driver, which is CPU-only";
         if (!std::strcmp(device, "gpu")) std::fprintf(stderr, "[device] %s; using CPU\n", why);
         else                             std::printf("[device] auto -> CPU (%s)\n", why);
     }
@@ -29030,6 +29036,7 @@ static int run(int argc, char** argv) {
         gaDiagReport(scene);
     };
     runSharedPhotonMap(groupM);
+    for (int i : groupMApart) runSharedPhotonMap(std::vector<int>{i});
 
     // What this batch's cameras share (BatchCache): mode J's light side where every camera
     // would draw the same one, and the device copy of the scene. Declared here rather than as a

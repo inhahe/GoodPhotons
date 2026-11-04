@@ -759,8 +759,9 @@ any affine a flat panel or an emissive mesh, its area carried in every density. 
 meshes (0.427.0, done):* each light sample taken on its triangle as the keys have it at the path's
 time, the triangle's area then in every density, on both devices. *Stretched balls and tubes
 (0.428.0, done):* a sphere or tube light an uneven scale or its keys stretch is an emissive mesh.
-Open: an uneven stretch of a spot, beam or aimed light; on the GPU, a blurred shared forward
-flight, and a moving scene's shared mode M map.
+*Several mode-M cameras of a moving scene on the GPU (0.429.0, done):* each gathers alone, its
+maps redrawn at times of its own shutter. Open: an uneven stretch of a spot, beam or aimed light;
+on the GPU, a blurred shared forward flight.
 
 **Stage C, motion vectors and depth (0.411.0, done):** `-write-aovs` writes the guide pass's
 albedo and normal and, from one ray through each pixel's centre at the frame's instant, depth,

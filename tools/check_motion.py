@@ -1154,8 +1154,8 @@ def main():
 
 def meter_m_test(exe, out, verdict):
     """A moving scene's mode-M group on the GPU: an exposure-locked camera path with a shutter over a
-    white ball that slides the frame's width. Its frames render on the CPU (the device blurs a
-    moving scene's map for a lone camera only), which the run says; and its batched GPU exposure
+    white ball that slides the frame's width. Each of its frames gathers on the GPU alone, its maps
+    redrawn at times of its own shutter (as the CPU renders each apart); and its batched GPU exposure
     meter meters what the CPU's meter does, a map of the frame's instant with the camera posed per
     sample. A gather that moved the scene to each sample's time in that map of the instant would
     read the ball dark and anchor the frames several times too bright."""
@@ -1191,8 +1191,9 @@ def meter_m_test(exe, out, verdict):
                 raise SystemExit("the meter did not run on the GPU: " + " ".join(cmd))
             anchors[dev].append(float(found[-1]))
             logs[dev] = log
-    verdict("-device gpu with a moving scene's mode-M group says its frames gather on the CPU",
-            "this run's share one; using CPU" in logs["gpu"])
+    maps = logs["gpu"].count("shared photon map (mode M) on")
+    verdict("-device gpu gathers each frame of a moving scene's mode-M path on the GPU, alone",
+            maps == 2 and "using CPU" not in logs["gpu"], "%d device gathers" % maps)
     r = np.mean(anchors["gpu"]) / np.mean(anchors["cpu"])
     verdict("... and its batched GPU meter meters as the CPU's does", abs(r - 1) < 0.15,
             "anchor %.4f of the CPU's" % r)
