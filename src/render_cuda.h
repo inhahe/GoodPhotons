@@ -88,10 +88,14 @@ bool cudaForwardSupported(const Scene& scene);
 // reproduces the original single-λ stream bit-for-bit.
 // `pSplit`: mode P's blurred split -- the forward layer makes no splat the camera side draws (no
 // analytic specular connection, no glossy lobe's on a specular-type surface; DCamSet::pSplit).
+// `stableSeed`: each photon's stream from its absolute index (`seedBase` the photons before this
+// call), so a render split into calls anywhere traces the same photons (mode P's batches); it
+// runs on the megakernel.
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                        long long N, EnergyReport& eOut, bool diffraction,
                        char camMode, unsigned long long seedBase = 0,
-                       bool wavefront = false, int heroC = 1, bool pSplit = false);
+                       bool wavefront = false, int heroC = 1, bool pSplit = false,
+                       bool stableSeed = false);
 
 // GPU multi-camera shared forward trace (models A and B — the device twin of the CPU
 // renderForwardShared). Traces ONE set of N photons and splats each vertex to ALL

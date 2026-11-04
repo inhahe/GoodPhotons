@@ -505,9 +505,10 @@ STILL = [
      "group { motion { key { translate 0 0 0 } key { translate 1 0 0 } }  light sun { dir 0.3 1 0.2  "
      "angle 1  spd preset:d65 } }",
      "a sun or sky light in a moving group stays where it is"),
+    # round at the instant (the middle key), as a sphere light must be to load, stretched after it
     ("a sphere light its keys stretch unevenly",
-     "group { motion { key { scale 1 } key { scale 1.5 1 1 } }  light sphere { center 0 1 0  radius 0.05  "
-     "spd preset:bb6500  power 5 } }", "whose keys stretch it unevenly stays where it is"),
+     "group { motion { key { scale 1 } key { scale 1 } key { scale 1.5 1 1 } }  light sphere { center 0 1 0  "
+     "radius 0.05  spd preset:bb6500  power 5 } }", "whose keys stretch it unevenly stays where it is"),
 ]
 LIGHT = ("light area { origin -0.4 2.9 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  spd preset:bb6500"
          "  power 60 }")
@@ -634,8 +635,7 @@ def main():
     # triangle and an aimed panel -- in every mode that blurs: held sharp at a time, the scene is
     # the static group written out there. And an aimed panel and a spot alone, sliding far, in
     # every mode on both devices: modes U and S take the time a pass, and U's light paths and
-    # connections carry each light there (mode U's spot stayed at the instant on the CPU, and
-    # every light did on the GPU, until 0.425.0, as an aimed panel did in every mode).
+    # connections carry each light there.
     light_modes = [("R", "cpu", ["-spp", "512"]), ("B", "cpu", ["-n", "40000000"]), ("D", "cpu", ["-spp", "256"])]
     lone_modes = light_modes + [("U", "cpu", ["-spp", "256"]), ("S", "cpu", ["-spp", "128", "-n", "200000"])]
     if not a.no_gpu:
@@ -785,7 +785,7 @@ def main():
     # the blur really there ---
     # (Mode M under a -noise budget, which has no total to split, ends an epoch every few samples,
     # so its shutter is sampled by many epochs too.)
-    # On the GPU too (0.421.0): S and U a pass, and J's camera pass an epoch, at one time.
+    # On the GPU too: S and U a pass, and J's camera pass an epoch, at one time.
     shared_cases = [("M", "M", ["-spp", "128", "-n", "2000000"], "cpu"),
                     ("M under -noise", "M", ["-noise", "6.25", "-n", "2000000"], "cpu"),
                     ("S", "S", ["-spp", "128", "-n", "200000"], "cpu"),
@@ -978,7 +978,7 @@ def main():
             c = [lum(render(exe, out, path, "cpu_R_%d" % s, rargs("cpu"), seed=s)[0]) for s in (1, 2)]
             good, detail = agree(g, c)
             verdict("blurred mode R on the GPU = on the CPU: " + nm, good, detail)
-        # Mode D on the GPU (0.419.0): each sample's two subpaths at one time, against mode D on
+        # Mode D on the GPU: each sample's two subpaths at one time, against mode D on
         # the CPU (BDPT with a moving light, a sun reaching a mover past the instant's bounds).
         for nm, path, spp in [c_ for c_ in gpu_cases if "sky" not in c_[0]]:
             dargs = lambda dev: ["-mode", "D", "-device", dev, "-spp", str(spp)]
@@ -986,7 +986,7 @@ def main():
             c = [lum(render(exe, out, path, "cpu_D_%d" % s, dargs("cpu"), seed=s)[0]) for s in (1, 2)]
             good, detail = agree(g, c)
             verdict("blurred mode D on the GPU = on the CPU: " + nm, good, detail)
-        # Modes A, B and C on the GPU (0.420.0): each photon and its splats at one time. Mode B
+        # Modes A, B and C on the GPU: each photon and its splats at one time. Mode B
         # against mode B on the CPU over every GPU case (the hero megakernel), and the box on the
         # wavefront backend; mode A on the box and the moving lights; mode C, through an
         # aperture wide enough to catch photons, against mode A on the GPU.
@@ -1054,8 +1054,8 @@ def meter_m_test(exe, out, verdict):
     white ball that slides the frame's width. Its frames render on the CPU (the device blurs a
     moving scene's map for a lone camera only), which the run says; and its batched GPU exposure
     meter meters what the CPU's meter does, a map of the frame's instant with the camera posed per
-    sample. The device's gather used to move the scene to each sample's time in that map of the
-    instant, so the ball read dark and the anchor was 4.1 times the CPU's."""
+    sample. A gather that moved the scene to each sample's time in that map of the instant would
+    read the ball dark and anchor the frames several times too bright."""
     path = os.path.join(out, "meter_m.ftsl")
     write(path, NL.join([
         "scene { units meters  motion_interval -0.5 0.5 }",
@@ -1098,8 +1098,8 @@ def meter_m_test(exe, out, verdict):
 def m_epoch_tests(exe, out, verdict):
     """The device's blurred mode-M epochs of the moving box: a 64th of -spp each, so -spp 64 is 64
     epochs, which write the image on the -interval cadence and at the end rather than after each
-    (it was 64 writes); and under a clock -beamfreeze, which the epochs set aside, leaves the render
-    on the device (it went to the CPU)."""
+    (one write); and under a clock -beamfreeze, which the epochs set aside, leaves the render on the
+    device."""
     path = os.path.join(out, "m_epochs.ftsl")
     write(path, scene(shutter=(-0.5, 0.5)))
     rc, log = run([exe, "-in", path, "-mode", "M", "-device", "gpu", "-spp", "64", "-n", "200000",
@@ -1152,9 +1152,8 @@ def p_split_tests(exe, out, verdict, gpu=False):
             good, detail = agree(rg, rr, 0.10)
             verdict("... and on the GPU", good, detail)
             if floor == "mx":
-                # A fixed budget's batches follow a fixed schedule, so the device draws the same
-                # streams each run: the same seed, the same image. Batches sized by the clock
-                # gave two runs of one seed images 1.5 % apart here (0.424.0).
+                # The device draws its streams by photon and by sample, whatever the batches,
+                # so the same seed gives the same image however the clock sized them.
                 again = lum(render(exe, out, ps, "psplit_Pg_again", pg, seed=1, want_gpu=True)[0])
                 d = float(np.abs(again - rg[0]).max() / max(float(np.abs(rg[0]).max()), 1e-300))
                 verdict("... and one seed renders one image on the GPU", d < 1e-9,
@@ -1188,9 +1187,9 @@ def p_split_tests(exe, out, verdict, gpu=False):
 
 def p_sun_test(exe, out, verdict, gpu):
     """Blurred mode P with a sun and no sky, its disc in view: an escape into the sun is the camera
-    side's, which must carry it, the blurred forward layer drawing no sky. It was filed to the
-    diffuse-first film, which only fits the scale, and the disc was missing (Fable's review of
-    0.423.0)."""
+    side's, which must carry it, the blurred forward layer drawing no sky: filed to the
+    diffuse-first film, which only fits the scale, the disc would be missing and the scale fit to
+    it."""
     text = NL.join([
         "scene { units meters  motion_interval -0.5 0.5 }",
         'material "w" { type diffuse reflect 0.6 }',
@@ -1391,8 +1390,8 @@ def lens_tests(exe, out, verdict, devices):
     aperture and film distance follow the focal length (about 5 pixels of defocus at 26 degrees
     and 1 at 54, focused at 0.9 m), and a rack of focus from 0.6 m to 6 m (3 pixels to sharp), each
     against the mean of its instants -- a still camera with that time's fov and focus, its lens
-    derived by the loader. They used to keep the instant's aperture, film distance and focus at
-    every time."""
+    derived by the loader. A lens held at the instant's aperture, film distance and focus would
+    defocus the zoom's ends and the rack wrongly."""
     still = scene(u=0.5)
     cam = ('camera "c" { eye 0 1.0 4.2  look_at 0 0.5 0  up 0 1 0  fstop 1.4  %s  '
            'film { res %d %d  size 60 45 } }')
@@ -1400,7 +1399,10 @@ def lens_tests(exe, out, verdict, devices):
     cases = [("zoom", "focus 0.9  %s  motion { key { fov_y 26 } key { fov_y 54 } }" % sh,
               lambda u: "fov_y %r  focus 0.9" % (26.0 + 28.0 * u)),
              ("rack", "fov_y 40  %s  motion { key { focus 0.6 } key { focus 6 } }" % sh,
-              lambda u: "fov_y 40  focus %r" % (0.6 + 5.4 * u))]
+              lambda u: "fov_y 40  focus %r" % (1.0 / (1.0 / 0.6 + (1.0 / 6.0 - 1.0 / 0.6) * u))),
+             # from infinity (focus 0) in to 0.7 m: blended in diopters, the instants' focus 0.7 / u
+             ("rack in", "fov_y 40  %s  motion { key { focus 0 } key { focus 0.7 } }" % sh,
+              lambda u: "fov_y 40  focus %r" % (0.7 / u))]
     T, N = 16, 40000000
     for name, keyed, at in cases:
         pb = os.path.join(out, "lens_%s.ftsl" % name)
@@ -1419,21 +1421,45 @@ def lens_tests(exe, out, verdict, devices):
                                               want_gpu=gpu)[0]) / T
             good, detail = agree(blur, mean, 0.05)
             verdict("a %s across the shutter blurs as the mean of its instants (mode A, %s)"
-                    % ("zoom at f/1.4" if name == "zoom" else "rack of focus", dev.upper()), good, detail)
+                    % ({"zoom": "zoom at f/1.4", "rack": "rack of focus",
+                        "rack in": "rack of focus in from infinity"}[name], dev.upper()), good, detail)
 
     # --- no shutter: a camera whose keys rack its lens is the still camera at their instant ---
     pk, ps = os.path.join(out, "lens_keyed.ftsl"), os.path.join(out, "lens_still.ftsl")
     write(pk, with_camera(still, cam % ("fov_y 40  motion { key { focus 2 } key { focus 6 } }", W, H)))
-    write(ps, with_camera(still, cam % ("fov_y 40  focus 4", W, H)))
+    # their instant halfway between them in diopters, in the loader's own arithmetic (lerpLens)
+    mid = 1.0 / (1.0 / 2.0 + (1.0 / 6.0 - 1.0 / 2.0) * 0.5)
+    write(ps, with_camera(still, cam % ("fov_y 40  focus %r" % mid, W, H)))
     args = ["-mode", "A", "-device", "cpu", "-n", "2000000"]
     _, raw_k, _ = render(exe, out, pk, "lens_keyed", args)
     _, raw_s, _ = render(exe, out, ps, "lens_still", args)
     verdict("no shutter: a camera whose keys rack its focus = the still one at their instant", raw_k == raw_s)
+    # keys that all agree on a lens: the camera's own is theirs
+    write(pk, with_camera(still, cam % ("fov_y 40  focus 3  motion { key { focus 5 } key { focus 5 } }", W, H)))
+    write(ps, with_camera(still, cam % ("fov_y 40  focus 5", W, H)))
+    _, raw_k, _ = render(exe, out, pk, "lens_agree", args)
+    _, raw_s, _ = render(exe, out, ps, "lens_agree_still", args)
+    verdict("keys that agree on a focus give the camera theirs", raw_k == raw_s)
+    # a camera_path's frame that zooms at an f-number has that focal length's lens, as a still camera
+    pp = os.path.join(out, "lens_path.ftsl")
+    write(pp, with_camera(still, NL.join([
+        'camera_path "zp" { look_at 0 0.5 0  up 0 1 0  fov_y 40  fstop 1.4  focus 0.9  frames 3  '
+        "film { res %d %d  size 60 45 }" % (W, H), "key 0 0 1.0 4.2 26", "key 1 0 1.0 4.2 54", "}"])))
+    write(ps, with_camera(still, cam % ("fov_y 54  focus 0.9", W, H)))
+    _, raw_k, _ = render(exe, out, pp, "lens_path", args + ["-camera", "zp2"])
+    _, raw_s, _ = render(exe, out, ps, "lens_path_still", args)
+    verdict("a camera path's zoomed frame has its focal length's lens", raw_k == raw_s)
 
     # --- a key may set only what the camera's lens lets it ---
     for what, text, says in (
             ("fstop on a camera without one", 'camera "c" { eye 0 1.0 4.2  look_at 0 0.5 0  up 0 1 0  '
              "motion { key { fstop 2 } key { fstop 4 } }  film { res %d %d } }" % (W, H), "`fstop` needs"),
+            ("fstop on a lens camera with no f-number", 'camera "c" { eye 0 1.0 4.2  look_at 0 0.5 0  up 0 1 0  '
+             "lens 50  motion { key { eye 0 1.0 4.2 } key { fstop 4 } }  film { res %d %d } }" % (W, H),
+             "`fstop` needs"),
+            ("focus on a camera with no lens", 'camera "c" { eye 0 1.0 4.2  look_at 0 0.5 0  up 0 1 0  '
+             "motion { key { eye 0 1.0 4.2 } key { focus 2 } }  film { res %d %d } }" % (W, H),
+             "`focus` cannot blend"),
             ("aperture on a camera an fstop sets", cam % ("motion { key { aperture 0.01 } key { aperture 0.02 } }",
                                                              W, H), "`aperture` needs")):
         p = os.path.join(out, "lens_refuse.ftsl")

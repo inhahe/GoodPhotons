@@ -55,10 +55,26 @@ inline bool lensDiffers(const ThinLens& a, const ThinLens& b) {
     return a.physical != b.physical || a.fstop != b.fstop || a.aperture != b.aperture ||
            a.focus != b.focus || a.filmHmm != b.filmHmm;
 }
+// The lens a fraction `f` of the way from `a` to `b` (two poses' or two frames', which share
+// `physical` and `filmHmm`): the f-number and the aperture linearly, the focus in diopters (1 /
+// focus, 0 for infinity), so a rack toward infinity sweeps the planes between rather than crawling
+// out from the lens. A focus the two share is kept as it is.
+inline ThinLens lerpLens(const ThinLens& a, const ThinLens& b, double f) {
+    ThinLens t = a;
+    t.fstop = a.fstop + (b.fstop - a.fstop) * f;
+    t.aperture = a.aperture + (b.aperture - a.aperture) * f;
+    if (a.focus != b.focus) {
+        const double da = a.focus > 0.0 ? 1.0 / a.focus : 0.0, db = b.focus > 0.0 ? 1.0 / b.focus : 0.0;
+        const double d = da + (db - da) * f;
+        t.focus = d > 0.0 ? 1.0 / d : 0.0;
+    }
+    return t;
+}
 // A moving camera's poses: `keys` at times spread evenly over [a, b] frames (relative to the
-// frame's instant), each of eye, look-at point, up, fov_y and a keyed lens's f-number, aperture
-// and focus blended linearly between neighbours and held before a and after b. One key holds the
-// camera at that pose through any shutter. Every key or none has `lensKeyed`.
+// frame's instant), each of eye, look-at point, up and fov_y blended linearly between neighbours,
+// a keyed lens by lerpLens, and held before a and after b. One key holds the camera at that pose
+// through any shutter. Every key or none has `lensKeyed`, with one `physical` and `filmHmm`
+// (lensKeysAgree).
 struct CameraMotion {
     double a = 0.0, b = 0.0;
     std::vector<CameraPose> keys;
@@ -76,12 +92,18 @@ struct CameraMotion {
                      A.up + (B.up - A.up) * f, A.fovY + (B.fovY - A.fovY) * f};
         if (A.lensKeyed) {
             p.lensKeyed = true;
-            p.lens = A.lens;
-            p.lens.fstop = A.lens.fstop + (B.lens.fstop - A.lens.fstop) * f;
-            p.lens.aperture = A.lens.aperture + (B.lens.aperture - A.lens.aperture) * f;
-            p.lens.focus = A.lens.focus + (B.lens.focus - A.lens.focus) * f;
+            p.lens = lerpLens(A.lens, B.lens, f);
         }
         return p;
+    }
+    // Whether the keys keep their lens invariant: every key or none lens-keyed, all of one
+    // `physical` and `filmHmm` (what `at` and the device's keys read off the first key).
+    bool lensKeysAgree() const {
+        for (const CameraPose& k : keys)
+            if (k.lensKeyed != keys[0].lensKeyed ||
+                (k.lensKeyed && (k.lens.physical != keys[0].lens.physical || k.lens.filmHmm != keys[0].lens.filmHmm)))
+                return false;
+        return true;
     }
 };
 
@@ -196,7 +218,8 @@ struct Camera {
             setFocus(t.focus);
             return;
         }
-        const double th = std::tan(0.5 * fovYDeg * 3.141592653589793 / 180.0);
+        // as deriveCameraOptics computes it, to the bit
+        const double th = std::tan(0.5 * fovYDeg * (3.141592653589793 / 180.0));
         const double f = (th > 1e-9) ? t.filmHmm / (2.0 * th) / 1000.0 : 0.0;   // metres
         if (!(f > 0.0)) return;
         apertureR = (t.fstop > 0.0) ? f / (2.0 * t.fstop) : t.aperture;

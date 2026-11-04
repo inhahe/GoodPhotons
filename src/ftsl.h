@@ -7414,7 +7414,7 @@ private:
         Aabb box;
         // A child that adds lights moves only if they all can: no sky or sun (they are not
         // anywhere), and -- known once the keys are made, below -- rigid keys. (An aimed panel
-        // moves since 0.425.0: its face and lean turn with it, Scene::aimCosNow and kin.)
+        // moves: its face and lean turn with it, Scene::aimCosNow and kin.)
         std::vector<std::pair<PrimMark, PrimMark>> lit;   // children with lights, not yet moved
         for (const auto& [a, z] : movers) {
             if (z.emitters > a.emitters) {
@@ -9482,8 +9482,9 @@ private:
     // A camera's `motion` keys (readCameraMotion's) once its lens is resolved: each key's thin lens
     // (CameraPose::lens), from `keyLens` over the camera's own, when the lens changes over the keys
     // -- a key racking its focus, f-number or aperture, or a key's fov zooming a physical-optics
-    // camera, whose aperture and film distance follow the focal length. False (the camera refused)
-    // where a key sets what the camera's lens does not let it.
+    // camera, whose aperture and film distance follow the focal length. Keys that all agree on a
+    // lens the camera does not have give the camera theirs (applyThinLensTo), as their pose is. False
+    // (the camera refused) where a key sets what the camera's lens does not let it.
     bool keyCameraLens(CamSpec& cs, CameraMotion& m, const std::vector<KeyLens>& keyLens) {
         const std::string who = "camera '" + cs.name + "': a motion key's ";
         const ThinLens own = cs.thinLens();
@@ -9494,14 +9495,15 @@ private:
             return false;
         }
         std::vector<ThinLens> lenses;
-        bool varies = false;
         for (size_t i = 0; i < m.keys.size(); ++i) {
             const KeyLens& k = keyLens[i];
             ThinLens t = own;
             if (k.hasFstop) {
-                if (!own.physical || !(k.fstop > 0.0)) {
-                    fail(who + "`fstop` needs a positive f-number, on a camera with an `fstop` or a "
-                               "`lens <mm>` of its own");
+                // A key that leaves its f-number out keeps the camera's, so the camera needs one:
+                // an f-number of 0 is no f-number at all (the aperture is its radius), which no
+                // blend can pass through.
+                if (!(own.fstop > 0.0) || !(k.fstop > 0.0)) {
+                    fail(who + "`fstop` needs a positive f-number, on a camera with an `fstop` of its own");
                     return false;
                 }
                 t.fstop = k.fstop;
@@ -9519,14 +9521,50 @@ private:
                 t.focus = k.focus;
             }
             lenses.push_back(t);
-            varies = varies || lensDiffers(t, own) || (own.physical && m.keys[i].fovY != cs.fov);
         }
-        if (varies)
+        // A camera without a physical lens takes focus 0 for no lens at all, a camera obscura,
+        // which no blend toward a focus reaches; a physical one takes it for infinity, which the
+        // diopter blend does (lerpLens).
+        if (!own.physical) {
+            bool none = false, some = false;
+            for (const ThinLens& t : lenses) { none = none || !(t.focus > 0.0); some = some || t.focus > 0.0; }
+            if (none && some) {
+                fail(who + "`focus` cannot blend with a key whose focus is 0, which on a camera with no "
+                           "`fstop` or `lens <mm>` is no lens at all: give every key, or the camera, a focus");
+                return false;
+            }
+        }
+        bool varies = false;   // the lens changes from key to key
+        for (size_t i = 0; i < lenses.size(); ++i)
+            varies = varies || lensDiffers(lenses[i], lenses[0]) ||
+                     (own.physical && m.keys[i].fovY != m.keys[0].fovY);
+        if (varies) {
             for (size_t i = 0; i < m.keys.size(); ++i) {
                 m.keys[i].lensKeyed = true;
                 m.keys[i].lens = lenses[i];
             }
+        } else if (lensDiffers(lenses[0], own)) {
+            applyThinLensTo(cs, lenses[0]);   // keys that agree: the camera's own lens is theirs
+        }
+        if (!m.lensKeysAgree()) {
+            fail("internal: camera '" + cs.name + "': its motion keys do not share a lens");
+            return false;
+        }
         return true;
+    }
+    // A camera spec's thin lens set from the controls `t` at its own fov (Camera::applyThinLens's
+    // twin on the spec: deriveCameraOptics' result for those controls).
+    static void applyThinLensTo(CamSpec& cs, const ThinLens& t) {
+        cs.fstop = t.fstop;
+        cs.focus = t.focus;
+        if (!t.physical) { cs.aperture = t.aperture; return; }
+        const double th = std::tan(0.5 * cs.fov * (3.141592653589793 / 180.0));   // as deriveCameraOptics
+        const double f = (th > 1e-9) ? t.filmHmm / (2.0 * th) / 1000.0 : 0.0;
+        if (!(f > 0.0)) return;
+        cs.focal = f;
+        cs.aperture = (t.fstop > 0.0) ? f / (2.0 * t.fstop) : t.aperture;
+        cs.filmDist_m = (t.focus > f) ? 1.0 / (1.0 / f - 1.0 / t.focus) : f;
+        cs.lensF_m = f;
     }
     bool readCameraMotion(const Block& b, Loaded& L, CamSpec& cs,
                           std::shared_ptr<CameraMotion>& out, std::vector<char>& keyFov,
@@ -9728,12 +9766,9 @@ private:
             CameraPose p{crV(a.eye, b2.eye, c.eye, d.eye, f), crV(a.look, b2.look, c.look, d.look, f),
                          crV(a.up, b2.up, c.up, d.up, f), cr(a.fovY, b2.fovY, c.fovY, d.fovY, f)};
             if (lensVaries) {
-                // linearly between the two frames: a spline could carry an f-number past zero
+                // between the two frames alone (lerpLens): a spline could carry an f-number past zero
                 p.lensKeyed = true;
-                p.lens = b2.lens;
-                p.lens.fstop = b2.lens.fstop + (c.lens.fstop - b2.lens.fstop) * f;
-                p.lens.aperture = b2.lens.aperture + (c.lens.aperture - b2.lens.aperture) * f;
-                p.lens.focus = b2.lens.focus + (c.lens.focus - b2.lens.focus) * f;
+                p.lens = lerpLens(b2.lens, c.lens, f);
             }
             return p;
         };
@@ -9832,6 +9867,9 @@ private:
                 if (refHalf < 0.0) refHalf = di * std::tan(0.5 * cs.fov * DEG);   // anchor on frame 0
                 if (di > 1e-9) cs.fov = 2.0 * std::atan(refHalf / di) / DEG;
             }
+            // A physical-optics camera's lens follows the frame's focal length, as a camera_curve's
+            // does: its f-number holds, its aperture and film distance change with the zoom.
+            if (cs.filmDist_m > 0.0 && cs.fov != shared.fov) applyThinLensTo(cs, cs.thinLens());
             char num5[8]; std::snprintf(num5, sizeof(num5), "%0*d", pad, i);
             cs.name = base + num5;
             cs.pathGroup = pathGroup;

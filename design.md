@@ -10137,13 +10137,13 @@ sees the instant, exactly as a static scene with those transforms would show it.
   one time a pass or epoch even then, because their light subpaths are traced for the camera
   and their merges are weighted against it. Measured: J posed per sample read 10 blocks off mode
   R, against 0 posed per epoch. The GPU sessions of S, U and M step aside under a blur.
-- **Mode P's batches** (`runCompositeProgressive`, 0.424.1): under a clock (`-time`, `-noise`,
-  `-forever`) each batch is sized toward half a second; a fixed `-n` / `-spp` doubles its batches
-  from 1 spp up to a sixteenth of `-spp`, whatever the clock says. The device draws its photon and
-  sample streams per batch (a forward launch's threads from its seed base, a backward launch's
-  from its sample base), so batches that followed the clock gave each run of one seed another
-  GPU image (1.5 % apart on check_motion's mix floor); the host's streams are per photon and per
-  sample, so its image is the same either way.
+- **Mode P's batches** (`runCompositeProgressive`): each batch is sized toward half a second,
+  so early frames appear fast and a stop or a save lands soon. Both layers draw each photon and
+  each sample by its absolute index, so where the clock ends a batch changes nothing in the image:
+  the host always does, and the device does through `renderForwardCuda`'s `stableSeed` (each
+  photon seeded from its absolute index under one seed, on the megakernel) and
+  `SppProgress::sampleStride` (the backward samples at a fixed stride between pixels, no seed mixed
+  from the batch's base). One seed renders one image on either device.
 - **Mode P under a blur** (0.415.0) does not classify pixels: no pixel is wholly one kind over
   the shutter. The backward layer splits each sample by its own path's first event at its own
   time (`BackwardRenderer::specFirstFilm`; the path writes it as it goes through `GiCtx::first`,

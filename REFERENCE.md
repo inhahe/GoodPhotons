@@ -2138,7 +2138,10 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
   `aperture`, and a zoom at a fixed `fstop` (a key's `fov_y`, or a `camera_curve`'s `fov_at` /
   `zoom_at`) widens and narrows the aperture with the focal length, so modes `A` and `C` defocus
   as the f-number says at every time in the shutter. A `camera_curve`'s `fstop_at` and
-  `focus_at` rack the lens across each frame's shutter too, from frame to frame.
+  `focus_at` rack the lens across each frame's shutter too, from frame to frame. A
+  `camera_path` with an `fstop` or `lens <mm>` whose frames zoom (per-key `fov`, `dolly_zoom`)
+  gives each frame the lens of its own focal length at the path's f-number, as a `camera_curve`
+  does (since 0.426.1; it kept the path's lens at every frame).
 - **What can move so far:** spheres (as a mesh where the keys stretch one), quads, triangles,
   meshes, and since 0.409.0 isosurfaces, curves and `mesh_instance`s. Since 0.410.0 lights move
   too — area panels, spheres, tubes, spots, collimated beams and emissive meshes, and since

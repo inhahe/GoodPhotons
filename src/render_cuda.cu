@@ -4221,7 +4221,12 @@ __device__ __noinline__ static void dPoseCamera(const DCamera& cam, double frame
         k.fovY = A.fovY + (B.fovY - A.fovY) * (double)f;
         k.fstop = A.fstop + (B.fstop - A.fstop) * (double)f;
         k.aperture = A.aperture + (B.aperture - A.aperture) * (double)f;
-        k.focus = A.focus + (B.focus - A.focus) * (double)f;
+        k.focus = A.focus;
+        if (A.focus != B.focus) {   // in diopters, 0 for infinity (host twin lerpLens)
+            const double da = A.focus > 0.0 ? 1.0 / A.focus : 0.0, db = B.focus > 0.0 ? 1.0 / B.focus : 0.0;
+            const double d = da + (db - da) * (double)f;
+            k.focus = d > 0.0 ? 1.0 / d : 0.0;
+        }
     }
     out.eye = k.eye;
     out.w = normalize(k.look - k.eye);
@@ -12730,7 +12735,7 @@ __device__ static void traceHeroPhoton(const DScene& sc, const DCamSet& cs, int 
 
 __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
                        long long N, int diffraction, unsigned long long seedBase, int maxBounce,
-                       int camMode, int heroC, int perPhotonSeed) {
+                       int camMode, int heroC, int perPhotonSeed, long long photonBase) {
     D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     dSeedPhotonCameras(cs);   // a moving camera: this thread's own copies, posed per photon
     long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -12740,13 +12745,16 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
     double eEmitted = 0, eAbsorbed = 0, eSensor = 0, eEscaped = 0, eResidual = 0;
 
     for (long long i = g; i < N; i += G) {
-        // PER-PHOTON SEEDING (FTRACE_GPU_PHOTONSEED=1, a GPU-VARIANCE experiment). The default
-        // above seeds once per THREAD and runs that thread's photons along one stream; this
-        // seeds each photon from its absolute index instead, which makes the deposit independent
-        // of the launch geometry. GPU-VARIANCE measured the two at the same variance.
+        // PER-PHOTON SEEDING (launchForward's stable seeding, or FTRACE_GPU_PHOTONSEED=1). The
+        // default above seeds once per THREAD and runs that thread's photons along one stream;
+        // this seeds each photon from its index -- absolute, `photonBase` on, under stable
+        // seeding -- which makes the trace independent of the launch geometry and of how a
+        // render's photons are split into launches. GPU-VARIANCE measured the two at the same
+        // variance.
+        const unsigned long long photonIdx = (unsigned long long)(photonBase + i);
         if (perPhotonSeed)
-            rng.seedUnit((unsigned long long)i, seedBase);
-        dSetPhotonTime(sc, cs, dPhotonTimeX(cs, (unsigned long long)i, seedBase), true);   // motion blur
+            rng.seedUnit(photonIdx, seedBase);
+        dSetPhotonTime(sc, cs, dPhotonTimeX(cs, photonIdx, seedBase), true);   // motion blur
         if (heroC > 1) {
             // Hero-wavelength path: one BVH walk carries C stratified wavelengths, halving
             // chromatic noise. De-heros to the single-λ shadeStep at a dispersive interface.
@@ -14241,9 +14249,10 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     // cosine of G), while the area -> solid-angle MEASURE is the patch's own cos_geom. Host twin
     // backward.h's emitterGeom; both are cosLight, bit for bit, for an untilted light.
     double cosGeo = (double)cosLight;
-    if (em.normalTilted) {
-        cosGeo = (double)ddot(dAimFaceNow(sc, em), g.wi * (Real)(-1));
-        cosLight = dAimCosNow(sc, em, g.wi * (Real)(-1));
+    if (em.normalTilted) {   // read in the instant's frame, the direction carried back once
+        const DVec3 wInst = dLightDirThen(sc, em, g.wi * (Real)(-1));
+        cosGeo = (double)ddot(em.nGeom, wInst);
+        cosLight = dAimCos(em, wInst);
     }
     if (cosLight <= 0 || !(cosGeo > 0.0)) return false;
     // To the sampled POINT (shadowTransmittanceTo): re-aimed from the moved origin and stopped
@@ -21305,15 +21314,18 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                 // An aimed quad (host twin vcm.h): the face's cosine is the
                                 // measure, the aimed density the emission's, and its radiance
                                 // factor scales Le alone, as `epat` does.
-                                cosAtLight = em.normalTilted ? ddot(dAimFaceNow(sc, em), wiL * (Real)-1)
+                                // an aimed quad's readings in the instant's frame, the direction
+                                // carried back once (dLightDirThen)
+                                const DVec3 wInst = em.normalTilted ? dLightDirThen(sc, em, wiL * (Real)-1)
+                                                                    : wiL * (Real)-1;
+                                cosAtLight = em.normalTilted ? ddot(em.nGeom, wInst)
                                                              : ddot(nL, wiL * (Real)-1);
-                                const double aimR = em.normalTilted
-                                    ? (double)dAimRadianceNow(sc, em, wiL * (Real)-1) : 1.0;
+                                const double aimR = em.normalTilted ? (double)dAimRadiance(em, wInst) : 1.0;
                                 if (cosAtLight > 0.0 && aimR > 0.0) {   // emitter stays one-sided
                                     double invArea = 1.0 / (em.area * dLightAreaScale(sc, em, nL));   // at the pass's time
                                     neeDirectPdfW = invArea * dist2 / cosAtLight;
                                     neeEmissionPdfW = em.normalTilted
-                                        ? invArea * dAimDirPdfNow(sc, em, wiL * (Real)-1)
+                                        ? invArea * dAimDirPdf(em, wInst)
                                         : invArea * cosAtLight / DPI;
                                     if (em.normalTilted) epat *= aimR;
                                     geomOk = true;
@@ -23904,6 +23916,8 @@ static gpu::DCamera bakeCamera(const Scene& scene, const Camera& cam, int resX, 
         dc.nKeys = (int)keys.size();
         dc.keyA = cam.motion->a; dc.keyB = cam.motion->b;
         const CameraPose& k0 = cam.motion->keys[0];
+        if (!cam.motion->lensKeysAgree())   // the flags below are the first key's for every key
+            throw std::logic_error("bakeCamera: a camera's motion keys do not share a lens");
         if (k0.lensKeyed) {
             dc.lensKeyed = 1;
             dc.lensPhysical = k0.lens.physical ? 1 : 0;
@@ -24165,18 +24179,22 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
 // Launch the forward trace (megakernel or wavefront backend) over the baked scene `up`
 // and camera set `cs`, accumulating into cs.films/cs.hits and d_energy. Shared by the
 // single-camera and multi-camera drivers so the launch/seeding logic lives in one place.
+// `stableSeed`: each photon's stream from its absolute index (seedBase, the photons before this
+// launch, on) under one seed, so a render's photons draw the same streams however they are split
+// into launches (mode P's batches); on the megakernel, the one backend that seeds per photon.
 static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
                           long long N, bool diffraction, unsigned long long seedBase,
-                          bool wavefront, int camModeInt, int heroC) {
+                          bool wavefront, int camModeInt, int heroC, bool stableSeed = false) {
     using namespace gpu;
     // seedBase==0 keeps the original single-shot seed exactly; each accumulation chunk
-    // passes a distinct cumulative-photon offset for an independent stream.
-    unsigned long long kseed = (0x9e3779b97f4a7c15ULL + seedBase * 0x9e3779b97f4a7c15ULL)
+    // passes a distinct cumulative-photon offset for an independent stream -- or, seeding
+    // stably, its photons' absolute indices start there under the single-shot seed.
+    unsigned long long kseed = (0x9e3779b97f4a7c15ULL + (stableSeed ? 0ULL : seedBase) * 0x9e3779b97f4a7c15ULL)
                              ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
     // Hero-wavelength sampling shares one BVH walk across C stratified wavelengths, cutting
     // chromatic noise. It lives ONLY in the megakernel, so the megakernel runs when it is on.
     const int effHeroC = forwardHeroC(heroC, up.sc.mediaN != 0, up.sc.hasGrin != 0);
-    const bool wf = forwardRunsWavefront(wavefront, effHeroC, cs.beamsOn());
+    const bool wf = forwardRunsWavefront(wavefront, effHeroC, cs.beamsOn()) && !stableSeed;
     // A moving camera under a blur: each thread poses its own copy of the set's cameras at its
     // photon's time (DCamSet::cam), one per thread of the launch -- the wavefront's slots, or
     // the megakernel's grid (cudaForwardPosedCameraBytes counts the same).
@@ -24198,7 +24216,9 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
             return (e && *e) ? std::atoi(e) : 0;
         }();
         kTrace<<<kFwdNumBlocks, kFwdBlockSize>>>(up.sc, csRun, d_energy, N, diffraction ? 1 : 0,
-                                           kseed, 32, camModeInt, effHeroC, perPhotonSeed);
+                                           kseed, 32, camModeInt, effHeroC,
+                                           stableSeed ? 1 : perPhotonSeed,
+                                           stableSeed ? (long long)seedBase : 0LL);
     }
     cudaCheckKernel("forward");
     if (d_posed) cudaFree(d_posed);
@@ -24207,7 +24227,7 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                        long long N, EnergyReport& eOut, bool diffraction,
                        char camMode, unsigned long long seedBase, bool wavefront, int heroC,
-                       bool pSplit) {
+                       bool pSplit, bool stableSeed) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaForwardSupported(scene)) return out;
@@ -24231,7 +24251,7 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY
     std::vector<double*> fp{ d_film }, hp{ d_hits };
     DCamSet cs = makeCamSet(up, hc, fp, hp);
     cs.pSplit = pSplit ? 1 : 0;
-    launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt, heroC);
+    launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt, heroC, stableSeed);
 
     // --- download ---
     std::vector<double> film(npix * 3);
@@ -25993,15 +26013,18 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     // this invocation's request — otherwise `pix * sppTotal + sampleBase` walks off the
     // end of its pixel's slot and aliases into the next pixel's seed range.
     const long long sppBase  = prog ? (long long)prog->sampleBase : 0;
-    const long long sppTotal = sppBase + spp;
+    // A caller's fixed stride (SppProgress::sampleStride: mode P's batches) indexes every sample
+    // absolutely, so its stream is the same however the render is split into calls.
+    const bool fixedStride = prog && prog->sampleStride > 0;
+    const long long sppTotal = fixedStride ? prog->sampleStride : sppBase + spp;
     // Mode W is a deterministic quadrature: its lattice is a function of the absolute
     // sample index alone, so a resumed frame must be BIT-IDENTICAL to an uninterrupted one
     // and the seed base has to stay put. The Monte-Carlo modes instead mix the loaded
     // sample count in, because there `pix * sppTotal + sampleBase` can (rarely) collide
     // with a stream the checkpointed samples already drew, and two correlated samples are
-    // worse than a decorrelated stream.
+    // worse than a decorrelated stream -- but a fixed stride never collides, so it mixes nothing.
     const unsigned long long seed = 0x9e3779b97f4a7c15ULL
-        ^ ((prog && !whitted) ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL)
+        ^ ((prog && !whitted && !fixedStride) ? (unsigned long long)prog->sampleBase * 0x9E3779B97F4A7C15ULL : 0ULL)
         ^ g_rngSalt;   // `-seed`; 0 by default, so XOR is a no-op
 
     std::vector<double> film(npix * 3);

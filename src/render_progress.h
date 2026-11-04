@@ -32,6 +32,12 @@ struct SppProgress {
     // RNG seed (CPU: added to the per-chunk seed offset; GPU: mixed into the seed base)
     // so the continued samples are decorrelated from the loaded ones. 0 = fresh render.
     long long sampleBase = 0;
+
+    // A render split into calls wherever the caller likes, which must draw the same samples
+    // however it is split (mode P's batches): > 0 gives the device's samples this fixed stride
+    // between pixels, each sample its absolute index, and no seed mixed from `sampleBase`, so a
+    // sample's stream depends on its pixel and its index alone. 0: the call's own total.
+    long long sampleStride = 0;
 };
 
 // Progress through a phase that has NO pixels yet.

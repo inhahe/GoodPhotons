@@ -15704,11 +15704,14 @@ static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam,
 // several accumulation passes (a wall-clock time budget, or resuming a saved film)
 // draws statistically-independent photons each pass; pass the cumulative photon
 // count already traced. seedBase==0 reproduces the original single-shot streams
-// bit-for-bit, so a plain `-n` render is unchanged.
+// bit-for-bit, so a plain `-n` render is unchanged. `stableSeed`: on the device too, each
+// photon's stream from its absolute index, so a render split into calls anywhere traces the same
+// photons (the host's are so always): mode P's batches.
 static Film renderForward(const Scene& scene, const Camera* cam, int resX, int resY, long long N,
                           int nThreads, bool forwardCatch, bool lensMode, bool useCamera,
                           EnergyReport& eOut, bool diffraction = true, bool useGpu = false,
-                          uint64_t seedBase = 0, bool wavefront = false, bool pSplit = false) {
+                          uint64_t seedBase = 0, bool wavefront = false, bool pSplit = false,
+                          bool stableSeed = false) {
 #ifdef HAVE_CUDA
     // GPU path covers all three finite-lens camera models: the pinhole splat (B), the
     // brute-force catch (C), and the finite-lens next-event splat (A). Fluorescent
@@ -15724,7 +15727,7 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
         cudaAvailable() && cudaForwardSupported(scene)) {
         if (!blurG || forwardCatch || pSplit)
             return renderForwardCuda(scene, *cam, resX, resY, N, eOut, diffraction, camModeG, seedBase,
-                                     wavefront, g_heroC, pSplit);
+                                     wavefront, g_heroC, pSplit, stableSeed);
         Film sky; sky.resX = resX; sky.resY = resY; sky.alloc();
         std::vector<std::thread> skyPool;      // disjoint row bands of one film
         // Joined on every way out, the device call's exceptions included: a joinable thread's
@@ -17374,10 +17377,15 @@ static uint64_t checkpointGuard(const Scene& scene, char mode, int res, int resY
         mixD(cam->shutterOpen); mixD(cam->shutterClose);
         if (cam->moves()) {
             mixD(cam->motion->a); mixD(cam->motion->b);
-            for (const CameraPose& p : cam->motion->keys)
+            for (const CameraPose& p : cam->motion->keys) {
                 for (double d : {p.eye.x, p.eye.y, p.eye.z, p.look.x, p.look.y, p.look.z,
                                  p.up.x, p.up.y, p.up.z, p.fovY})
                     mixD(d);
+                if (p.lensKeyed)   // a keyed lens racks or zooms the camera too
+                    for (double d : {p.lens.physical ? 1.0 : 0.0, p.lens.fstop, p.lens.aperture,
+                                     p.lens.focus, p.lens.filmHmm})
+                        mixD(d);
+            }
         }
     }
     return h;
@@ -18529,7 +18537,7 @@ static int runCompositeProgressive(
     bool writeOk = true;
     bool metNoise = false;
     bool metTime  = false;      // which budget ended it — reported in the window title
-    long long batchSpp = 1;   // the samples (and their share of photons) one iteration takes
+    long long batchSpp = 1;   // adapts toward ~0.5 s of combined work per iteration
 
     // Compositing is split from persisting so the live window can repaint on its own
     // (much faster) cadence without also rewriting the PNG and the dual-film sidecar —
@@ -18571,7 +18579,7 @@ static int runCompositeProgressive(
             Film f = renderForward(scene, &cam, res, resY, dN, nThreads,
                                    /*forwardCatch*/false, /*lensMode*/false, /*useCamera*/true,
                                    e, diffraction, useGpu, (uint64_t)acc.N, wavefront,
-                                   /*pSplit*/blurP);
+                                   /*pSplit*/blurP, /*stableSeed*/true);
             acc.fwd.merge(f); acc.N += dN;
             acc.energy.emitted += e.emitted; acc.energy.absorbed += e.absorbed;
             acc.energy.sensor  += e.sensor;  acc.energy.escaped  += e.escaped;
@@ -18585,6 +18593,7 @@ static int runCompositeProgressive(
                 // continues the sequence (and, in mode W, the deterministic lattice)
                 // rather than replaying [0, dSpp) on top of what acc already holds.
                 SppProgress bp; bp.sampleBase = acc.spp;
+                bp.sampleStride = kUnboundedSpp;   // each sample by its absolute index (see batchSpp)
                 bp.report = [](const Film&, long long, bool) { return false; };
                 Film sp;
                 r = renderBackwardCuda(scene, cam, res, resY, dSpp, diffraction, &bp,
@@ -18603,15 +18612,11 @@ static int runCompositeProgressive(
                                    (uint64_t)acc.spp);
             acc.ref.merge(r); acc.spp += dSpp;
         }
-        // The next batch. Under a clock, adapted toward ~0.5 s so early frames appear fast and
-        // overhead stays low. A fixed budget doubles its batches up to a sixteenth of the budget
-        // instead, whatever the clock says: the device draws its photon and sample streams per
-        // batch, so a schedule that followed the clock would give each run of the same seed
-        // another image (the host's streams are per photon and per sample, so it has the same image
-        // either way).
-        if (!budgeted) {
-            batchSpp = std::min(batchSpp * 2, std::max(1LL, sppReq / 16));
-        } else {
+        // The next batch, adapted toward ~0.5 s so early frames appear fast, a stop or a save
+        // lands soon, and overhead stays low. Both layers draw each photon and each sample by its
+        // absolute index (stableSeed, sampleStride; the host always does), so where the clock ends a
+        // batch changes nothing in the image: one seed, one image.
+        {
             double dt = std::chrono::duration<double>(clk::now() - tb).count();
             if (dt > 1e-4) {
                 long long next = (long long)((double)batchSpp * (0.5 / dt));
@@ -24438,6 +24443,19 @@ static int run(int argc, char** argv) {
                 double N = c.lensF / (2.0 * c.apertureR);           // f-number = focal / (2·apertureR)
                 if (N > 0.0) {
                     double camEq = (PI / 4.0) / (N * N);            // (π/4)/N² image-side irradiance factor
+                    // A lens its keys rack (CameraPose::lensKeyed) over an open shutter: the factor's
+                    // mean over the shutter, as the exposure averages it (64 stratified times).
+                    if (c.timed() && c.moves() && c.motion->keys[0].lensKeyed) {
+                        constexpr int kT = 64;
+                        double sum = 0.0;
+                        Camera posed = c;
+                        for (int k = 0; k < kT; ++k) {
+                            c.poseAt(c.shutterTime((k + 0.5) / kT), posed);
+                            const double Nk = posed.apertureR > 0.0 ? posed.lensF / (2.0 * posed.apertureR) : 0.0;
+                            if (Nk > 0.0) sum += (PI / 4.0) / (Nk * Nk);
+                        }
+                        camEq = sum / kT;
+                    }
                     cexp = (cexp > 0.0 ? cexp : 1.0) * camEq;
                 }
             }
