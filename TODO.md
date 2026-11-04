@@ -82,7 +82,8 @@ Each names the section its line is in.
 
 1. ~~**MERGE-PROXIMITY** (4.2) — every photon gather (M, S, U, J) takes photons from any surface in
    its radius: a table top gathers the floor's light.~~ Done, 0.431.0.
-2. **HAZE-SUN-B** (4.2) — mode B lights an unbounded sunlit haze at 0.16 of mode R.
+2. **HAZE-SUN-B** (4.2) — mode B lights an unbounded sunlit haze at 0.16 of mode R. **Waiting on
+   the user (4.1):** modes R, D and J agree, and only a choice of domain can bring B to them.
 3. **VCM-SPEC** and **SPPM-SPECTRAL** (4.2) — modes U and S merge at the camera's wavelength, so a
    coloured surface seen before a merge washes out (the fix mode J got in 0.386.1, JSPEC).
 4. **MODEM-GPU-CORNER** and **MODEM-COMPOTE-NAN** (4.2) — GPU mode M reads a box's corner 15 %
@@ -131,6 +132,15 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **COMPOTE-NO-CAUSTIC** — under the 20° sun the gem compote's ruby bowl absorbs the light that
   made its caustic under the old 45° sun, and no cap fixes it: move the compote, change the bowl,
   or accept it?
+- [ ] **HAZE-SUN-B** — which haze does an unbounded medium under a sun hold? A forward mode starts
+  its sun photons on the disc the scene's bounding sphere casts, so mode B lights only the haze in
+  that cylinder, while modes R, D and J light it all the way out along each camera ray. On
+  `scenes/_haze_sun_b_vs_r.ftsl` (0.431.0, against mode R): haze over the floor D 1.008, J 0.981,
+  B 0.144; the floor D 1.015, J 1.025, B 0.910. (a) Clip an unbounded medium to a sphere around
+  the scene and its cameras in every mode: all agree, but R, D and J lose the haze glow wherever
+  the camera looks past the scene. (b) Keep R, D and J as they are, and have the forward modes
+  warn at load that they light an unbounded haze only near the scene. Recommended: (b), since the
+  three that agree are the modes scenes are rendered with.
 - [ ] **GLOW-LIGHT-MODES** — a glow with no emitter lights nothing in R/M/S/B, part of itself in
   D/J, all of itself in U; mode P runs away on it (x368). The fix is to register emitters for
   emissive analytic primitives (4.6's first line), which makes `gallery_rain`'s grid lines light

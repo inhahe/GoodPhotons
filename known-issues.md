@@ -233,6 +233,12 @@ starts just short of the mover, and the NEE leg counts `mediaExitDistance` from 
 domain for every estimator -- clipping an unbounded medium to the instant's sphere inside
 `mediaTr` and the free-flight samplers -- would end both (review of 51eb7ef..af7de14).
 
+Re-measured on 0.431.0 (GPU, against mode R at 1024 spp): mode J agrees too (haze 0.981, floor
+1.025), and mode B reads 0.144 and 0.910. So the three modes scenes are rendered with agree, and one
+domain for every mode would change all three to suit the one that cannot light the haze it never
+emits into. That is now a decision for the user (TODO.md 4.1): clip in every mode, or keep R, D and
+J and have the forward modes warn that they light an unbounded haze only near the scene.
+
 ## FIXED (2026-11-04, 0.424.0; opened 2026-11-03, 0.410.1): MOTION-ZOOM-APERTURE — a camera's zoom across the shutter keeps the instant's aperture and focus
 
 **Fixed in 0.424.0:** a pose carries the thin lens's controls when they change (`CameraPose::lens`), and posing derives the aperture, focal length and film distance from them at the pose's fov (`Camera::applyThinLens`, the device's `dPoseCamera`). Keys may set `focus`, `fstop` and `aperture`; a camera_curve's per-frame optics key its frames' shutters. check_motion's zoom tests compare a blurred zoom in mode A against the mean of its instants, on both devices.
