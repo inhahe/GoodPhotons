@@ -1372,14 +1372,14 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
                     if (!degen0) {   // pole rings collapse the quad to a single fan triangle
                         PTri t; t.p0 = p00; t.p1 = p01; t.p2 = p11;
                         t.n0 = n00; t.n1 = n01; t.n2 = n11;
-                        applyMat(t, s.matId);
+                        applyMat(t, s.matId); t.patFrame = s.patFrame;
                         t.uv0 = uv00; t.uv1 = uv01; t.uv2 = uv11;
                         out.push_back(t);
                     }
                     if (!degen1) {
                         PTri t; t.p0 = p00; t.p1 = p11; t.p2 = p10;
                         t.n0 = n00; t.n1 = n11; t.n2 = n10;
-                        applyMat(t, s.matId);
+                        applyMat(t, s.matId); t.patFrame = s.patFrame;
                         t.uv0 = uv00; t.uv1 = uv11; t.uv2 = uv10;
                         out.push_back(t);
                     }
@@ -1460,6 +1460,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             // smear texel (0,0) over the whole surface.
             PTri proto;
             applyMat(proto, im.matId);
+            proto.patFrame = im.patFrame;
             const bool projUV = (im.uvProj != UvProjection::None);
             // A UV-sampled skin needs a projection; a triplanar one does not.
             if (proto.tex >= 0 && proto.triplanarScale <= 0.0 && !projUV) proto.tex = -1;
@@ -1518,6 +1519,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
         for (const auto& t : bl.tris) {
             int matId = (inst.matOverride >= 0) ? inst.matOverride : t.matId;
             PTri p;
+            p.patFrame = inst.patFrame;
             p.p0 = inst.toWorld.apply(t.v0);
             p.p1 = inst.toWorld.apply(t.v1);
             p.p2 = inst.toWorld.apply(t.v2);

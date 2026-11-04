@@ -10,7 +10,9 @@
     and such a scene asked for the GPU says it stays on the CPU.
   * The same turned half round, scaled, in millimetres and reading the normal; and on an
     isosurface. A sphere that falls back to a mesh wears its UV where the analytic one does.
-  * A scene and its image at a path outside any one code page (Latin, Han) open and write.
+  * ... and on a curve and on a light panel's emission (seen, and sampled).
+  * A scene and its image at a path outside any one code page (Latin, Han) open and write, and a
+    texture named in a scene file in a legacy code page (cp1252) opens.
 Each image test compares 4x4-pixel blocks of luminance, two seeds each: within 5 standard errors
 or 3 %. Exits 1 on any failure.
 """
@@ -131,6 +133,19 @@ def main():
                         scene("translate 0.3 0.45 0  pattern_space object", stripes % "x", body=iso),
                         scene("translate 0.3 0.45 0", stripes % "(x - 0.3)", body=iso), cpu)
     verdict("... on an isosurface", good, detail)
+    tube = "curve { material pat  basis linear  radius 0.1  point -0.45 0 0  point 0.45 0 0 }"
+    good, detail = same(exe, out, "patspace_curve",
+                        scene("translate 0.3 0.45 0  pattern_space object", stripes % "x", body=tube),
+                        scene("translate 0.3 0.45 0", stripes % "(x - 0.3)", body=tube), cpu)
+    verdict("... on a curve", good, detail)
+    # A light panel facing the camera, its emission striped by the pattern: in the group's space
+    # both where it is seen and where it is sampled from.
+    panel = ("light area { origin -0.4 -0.3 0.3  u 0.8 0 0  v 0 0.6 0  normal 0 0 1  "
+             "spd preset:bb6500  spd_map pattern:p  power 20 }")
+    good, detail = same(exe, out, "patspace_light",
+                        scene("translate 0.3 0.45 0  pattern_space object", stripes % "x", body=panel),
+                        scene("translate 0.3 0.45 0", stripes % "(x - 0.3)", body=panel), cpu)
+    verdict("... on a light's emission", good, detail)
     if not a.no_gpu:
         p = os.path.join(out, "patspace_a.ftsl")
         _, log = render(exe, p, os.path.join(out, "patspace_gpu.png"),
@@ -146,6 +161,29 @@ def main():
                        text=True, encoding="utf-8", errors="replace")
     good = q.returncode == 0 and os.path.exists(png)
     verdict("a scene and image at a non-ASCII path", good, "" if good else (q.stdout + q.stderr)[-300:])
+
+    # A texture named in the file in a legacy code page (cp1252 "caf\xe9"), the file on disk named
+    # in UTF-8: the path is re-read in the system's legacy code page.
+    try:
+        from PIL import Image
+        dl = os.path.join(out, "legacy")
+        os.makedirs(dl, exist_ok=True)
+        Image.new("RGB", (4, 4), (200, 40, 30)).save(os.path.join(dl, "caf" + chr(0xE9) + ".png"))
+        text = scene("translate 0 0.45 0", "0.5").replace(
+            'material "pat" { type diffuse reflect pattern:p }',
+            'texture "t" { file "caf' + chr(0xE9) + '.png" }' + NL +
+            'material "pat" { type diffuse reflect texture:t }')
+        pl = os.path.join(dl, "legacy.ftsl")
+        with open(pl, "wb") as f:
+            f.write(text.encode("cp1252"))
+        q = subprocess.run([exe, "-in", pl, "-o", os.path.join(dl, "legacy.png"), "-spp", "1",
+                            "-no-meter"], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace")
+        good = q.returncode == 0 and os.path.exists(os.path.join(dl, "legacy.png"))
+        verdict("a texture named in a legacy code page inside a scene", good,
+                "" if good else (q.stdout + q.stderr).strip()[-300:])
+    except ImportError:
+        print("(legacy code page test skipped: needs Pillow)")
 
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1

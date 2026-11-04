@@ -111,7 +111,7 @@ struct Tri {
     int vcol = -1;
     // Motion keys, as an index into Scene::motionSets, or -1 for a triangle that does not move.
     // The vertices and normals above are the triangle at the frame's own instant; the keys
-    // carry it across the scene's motion interval (Scene::triAt).
+    // carry it across the scene's motion interval (Scene::movedTri).
     int motion = -1;
     // The pattern frame its patterns are read in (Scene::patFrames), or -1: world space.
     int patFrame = -1;
@@ -175,7 +175,7 @@ struct Tri {
 struct Sphere {
     Vec3 c; double r = 1.0;
     int matId = 0;
-    int motion = -1;   // Scene::motionSets index, or -1; c and r are the frame's instant (Scene::sphereAt)
+    int motion = -1;   // Scene::motionSets index, or -1; c and r are the frame's instant (Scene::intersectMovingSphere)
     int patFrame = -1;   // the pattern frame its patterns are read in (Scene::patFrames), or -1
     // Its own axes, as an index of three consecutive world-space unit vectors in
     // Scene::sphereAxes, or -1: the world's. Its lat-long UV and tangent are read in them, so a

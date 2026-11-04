@@ -21203,7 +21203,7 @@ static int deviceEmitterShapeCode(EmitterShape s) {
 bool cudaForwardSupported(const Scene& scene) {
     // Object-space patterns (`pattern_space object`) are read on the host only so far: every
     // device path renders such a scene on the CPU rather than read its patterns in world space.
-    if (!scene.patFrames.empty() && !scene.patterns.empty()) return false;
+    if (scene.hasObjectSpacePatterns()) return false;
     // Implicit surfaces (isosurface / CSG / metaballs) are now sphere-traced on the
     // device too (DImplicit + intersectImplicit); their materials are checked by the
     // same `unsupported()` gate as tri/sphere materials below.

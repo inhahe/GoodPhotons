@@ -83,12 +83,13 @@ inline int curveSpanCount(CurveBasis b, int n) {
 // primitive is authored with today, and explicitly a thing to shrink (float positions,
 // per-curve matId, a 16-bit u) when the aggregate-BSDF LOD work makes those counts real.
 struct CurveSeg {
-    int patFrame = -1;   // the pattern frame its patterns are read in (Scene::patFrames), or -1
     Vec3   p0, p1;                  // world-space segment endpoints
     double r0 = 0.001, r1 = 0.001;  // world radius at each end
     int    matId = 0;
     int    curveId = -1;            // owning strand (diagnostics; future per-strand data)
     float  u0 = 0.0f, u1 = 1.0f;    // curve parameter at p0/p1 — the hit's texture `u`
+    int    patFrame = -1;           // the pattern frame its patterns are read in (Scene::patFrames)
+    int    spare_ = 0;              // named, so the record has no padding: -checkfur memcmp's it
 };
 
 // One authored strand: a contiguous run of the scene's flat CurveSeg pool.

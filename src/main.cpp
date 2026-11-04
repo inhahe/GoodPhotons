@@ -14937,6 +14937,12 @@ static void buildFurFields(const Scene& scene) {
                     "build a far tier from\n");
 }
 
+// Object-space patterns (`pattern_space object`) are read on the host only so far, so a scene
+// that has them renders on the CPU (Scene::hasObjectSpacePatterns, which every device gate asks);
+// the device-selection notes name that reason rather than the generic lists.
+static const char* const kObjectSpaceWhy =
+    "object-space patterns (pattern_space object) are read on the CPU only so far";
+
 #ifdef HAVE_CUDA
 // cudaBackwardSupported, plus the two things it cannot see (both RENDER OPTIONS, not scene
 // properties):
@@ -14951,15 +14957,6 @@ static void buildFurFields(const Scene& scene) {
 // (§P3 landed the single-fiber BCSDF on the device in 0.181.0, so plain hair scenes no
 // longer fall back — these two option gates are now the ONLY reasons a fur scene leaves
 // the GPU backward path.)
-// Object-space patterns (`pattern_space object`) are read on the host only so far, so a scene
-// that has them renders on the CPU (cudaForwardSupported refuses it); the device-selection notes
-// name that reason rather than the generic lists.
-static bool objectSpacePatterns(const Scene& scene) {
-    return !scene.patFrames.empty() && !scene.patterns.empty();
-}
-static const char* const kObjectSpaceWhy =
-    "object-space patterns (pattern_space object) are read on the CPU only so far";
-
 static bool backwardOnGpuOk(const Scene& scene, const Camera& cam) {
     if (cam.seesMotion(scene)) return false;   // motion blur: CPU only so far
     if (g_furVolume && g_furVolData.valid()) return false;
@@ -18813,7 +18810,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // kernel traces camera rays out through it (dGenLensRay, as GPU mode R does) and
             // the light image into it (dLensConnect).
             if (!cudaBdptSupported(scene)) {
-                const char* why = objectSpacePatterns(scene) ? kObjectSpaceWhy : "scene has a BDPT-GPU-unsupported feature "
+                const char* why = scene.hasObjectSpacePatterns() ? kObjectSpaceWhy : "scene has a BDPT-GPU-unsupported feature "
                                   "(GRIN media, env/collimated light, an emissive 'fire' volume, or a "
                                   "GPU-unsupported material: layered, indexed-palette, "
                                   "oversized multilayer/mix)";
@@ -18841,7 +18838,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (!bwOk || blurOnCpu) {
                 const char* why = blurOnCpu
                     ? "motion blur (a camera shutter on a moving scene) renders on the CPU so far"
-                    : objectSpacePatterns(scene) ? kObjectSpaceWhy
+                    : scene.hasObjectSpacePatterns() ? kObjectSpaceWhy
                     : g_whitted
                     ? "mode W scene is outside the deterministic GPU scope (-gi, or a "
                       "backward-GPU-unsupported feature)"
@@ -18866,10 +18863,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 else         std::printf("[device] auto -> CPU (%s)\n", why);
             }
         } else if (!cudaForwardSupported(scene)) {
-            const char* why = objectSpacePatterns(scene) ? kObjectSpaceWhy : "GPU-unsupported feature (layered material, indexed "
+            const char* why = scene.hasObjectSpacePatterns() ? kObjectSpaceWhy : "the scene has a GPU-unsupported feature (layered material, indexed "
                               "palette, parametric record, oversized multilayer/mix "
                               "material, or an emissive 'fire' volume)";
-            if (wantGpu) std::fprintf(stderr, "[device] scene has a %s; using CPU\n", why);
+            if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", why);
             else         std::printf("[device] auto -> CPU (%s)\n", why);
         } else {
             useGpu = true;
@@ -28678,8 +28675,12 @@ int main(int argc, char** argv) {
         assetbytes::legacyPathDecoder() = [](const std::string& raw) -> std::string {
             wchar_t cpName[8] = {};
             UINT cp = 1252;
-            if (GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_IDEFAULTANSICODEPAGE, cpName, 8) > 0)
+            // The code page non-Unicode programs write in: the SYSTEM locale's ("language for
+            // non-Unicode programs"), not the user's format locale. 0 there means the locale has
+            // none (Unicode-only), so there is nothing to re-read.
+            if (GetLocaleInfoEx(LOCALE_NAME_SYSTEM_DEFAULT, LOCALE_IDEFAULTANSICODEPAGE, cpName, 8) > 0)
                 cp = (UINT)_wtoi(cpName);
+            if (cp == 0 || cp == CP_UTF8) return raw;
             const int wn = MultiByteToWideChar(cp, 0, raw.data(), (int)raw.size(), nullptr, 0);
             if (wn <= 0) return raw;
             std::wstring w((size_t)wn, L' ');

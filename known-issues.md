@@ -89,7 +89,7 @@ for UTF-8 (`u8path`, `u8string`); or read argv as UTF-16 (`wmain`) and keep path
 
 ## FIXED (2026-11-03, 0.406.0; opened 2026-11-03, 0.404.0): MOTION-SWEEP — a moving primitive is boxed over its whole motion, so a fast mover slows every ray near its sweep
 
-**Fixed in 0.406.0:** `bvh` boxes every primitive at the instant; a query with a time walks the still primitives' tree and a tree of the moving ones boxed over its sixteenth of the interval only (`Scene::buildTimedTrees`, `traverseWorldClosest` / `traverseWorldAny`). The two smaller costs below remain (the per-candidate blend, the any-hit rebuild).
+**Fixed in 0.406.0:** `bvh` boxes every primitive at the instant; a query with a time walks `bvh` past its movers (a tree of the rest when movers dominate) and a tree of the moving ones boxed over its stretch of the interval only, 1 to 16 stretches as the movers' travel calls for (`Scene::buildMoveTrees`, `traverseWorldClosest` / `traverseWorldAny`). Of the two smaller costs below, the per-candidate blend is now cached per thread (`Scene::motionNow`); the any-hit rebuild remains.
 
 `Scene::collectPrimBoxes` gives each moving triangle and sphere the union of its boxes at every
 key — correct at every time, and tight for a slow mover. A fast one is not: a wheel turning a

@@ -1783,7 +1783,7 @@ Scene* upload(const raster::PreviewGeom& geom, const raster::PreviewLight& light
     const std::vector<raster::PTri>& tris = geom.tris;
     if (!available() || tris.empty()) return nullptr;
     // Object-space patterns (`pattern_space object`) are read by the CPU preview only so far.
-    if (scene && !scene->patFrames.empty() && !scene->patterns.empty()) {
+    if (scene && scene->hasObjectSpacePatterns()) {
         std::fprintf(stderr, "[raster] object-space patterns (pattern_space object) are previewed "
                              "on the CPU so far\n");
         return nullptr;

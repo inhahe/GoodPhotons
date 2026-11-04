@@ -184,24 +184,57 @@ inline std::vector<std::string> searchRoots() {
 // (it needs <windows.h>); null leaves such a path as it is.
 using LegacyPathDecoder = std::string (*)(const std::string&);
 inline LegacyPathDecoder& legacyPathDecoder() { static LegacyPathDecoder f = nullptr; return f; }
+// Whether `s` is well-formed UTF-8: no overlong forms, no surrogates, nothing past U+10FFFF.
 inline bool validUtf8(const std::string& s) {
     size_t i = 0;
     while (i < s.size()) {
         const unsigned char c = (unsigned char)s[i];
-        // How many continuation bytes this lead byte announces (-1: not a lead byte).
-        const int n = c < 0x80 ? 0 : (c >> 5) == 0x6 ? 1 : (c >> 4) == 0xE ? 2 : (c >> 3) == 0x1E ? 3 : -1;
-        if (n < 0 || i + (size_t)n >= s.size() + (n == 0 ? 1 : 0)) return false;
-        for (int k = 1; k <= n; ++k)
-            if (((unsigned char)s[i + (size_t)k] >> 6) != 0x2) return false;
+        int n; unsigned cp, lo;
+        if (c < 0x80) { ++i; continue; }
+        else if ((c >> 5) == 0x6) { n = 1; cp = c & 0x1F; lo = 0x80; }
+        else if ((c >> 4) == 0xE) { n = 2; cp = c & 0x0F; lo = 0x800; }
+        else if ((c >> 3) == 0x1E) { n = 3; cp = c & 0x07; lo = 0x10000; }
+        else return false;
+        if (i + (size_t)n >= s.size()) return false;
+        for (int k = 1; k <= n; ++k) {
+            const unsigned char d = (unsigned char)s[i + (size_t)k];
+            if ((d >> 6) != 0x2) return false;
+            cp = (cp << 6) | (d & 0x3F);
+        }
+        if (cp < lo || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return false;
         i += (size_t)n + 1;
     }
     return true;
+}
+// `path` with every component that is not UTF-8 re-read through legacyPathDecoder(): a loader
+// joins a name read out of a file onto a directory that is UTF-8, so only that name is legacy.
+inline std::string decodeLegacyComponents(const std::string& path) {
+    if (!legacyPathDecoder()) return path;
+    std::string out, part;
+    const auto flush = [&]() {
+        if (!part.empty() && !validUtf8(part)) {
+            const std::string d = legacyPathDecoder()(part);
+            out += validUtf8(d) ? d : part;
+        } else {
+            out += part;
+        }
+        part.clear();
+    };
+    for (char ch : path) {
+        if (ch == '/' || ch == (char)92) { flush(); out += ch; }
+        else part += ch;
+    }
+    flush();
+    return out;
 }
 
 inline std::string resolve(const std::string& path) {
     namespace fs = std::filesystem;
     if (path.empty()) return path;
-    if (!validUtf8(path) && legacyPathDecoder()) return resolve(legacyPathDecoder()(path));
+    if (!validUtf8(path)) {   // decoded once: what still is not UTF-8 is left as it is
+        const std::string d = decodeLegacyComponents(path);
+        if (d != path && validUtf8(d)) return resolve(d);
+    }
     std::error_code ec;
     if (toPath(path).is_absolute()) return path;
     for (const std::string& root : searchRoots()) {

@@ -2094,9 +2094,11 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
   surface travels with it (it is read where the point sits at the frame's instant), and a
   sphere's UV turns with its keys; `pattern_space object` on a group keeps its patterns on it
   from frame to frame too (FTSL §13).
-- **Cost:** a path's rays walk the still geometry's tree and a tree of the moving geometry boxed
-  over just its sixteenth of the shutter, so a fast mover — a spinning wheel — costs a ray only
-  near where it is at that time; a render without a shutter walks the scene's ordinary tree.
+- **Cost:** a path's rays walk the scene's tree past its moving geometry (or, when movers are most
+  of the scene, a tree of the rest) and a tree of the moving geometry boxed over just its stretch
+  of the shutter — 1 to 16 stretches, as many as the movers' travel calls for — so a fast mover
+  (a spinning wheel) costs a ray only near where it is at that time; a render without a shutter
+  walks the scene's ordinary tree.
 
 ---
 
