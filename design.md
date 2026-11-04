@@ -10118,10 +10118,19 @@ sees the instant, exactly as a static scene with those transforms would show it.
   one time a pass or epoch even then, because their light subpaths are traced for the camera
   and their merges are weighted against it. Measured: J posed per sample read 10 blocks off mode
   R, against 0 posed per epoch. The GPU sessions of S, U and M step aside under a blur.
+- **Mode P under a blur** (0.415.0) does not classify pixels: no pixel is wholly one kind over
+  the shutter. The backward layer splits each sample by its own camera ray's first hit at its
+  own time (`BackwardRenderer::specFirstFilm`, classifyComposite's rule). The composite is the
+  forward film over its scale, fitted against the diffuse-first backward film over every pixel,
+  plus the specular-first one, the sky among it (`compositeSplitFilms`). The forward pass
+  (`renderForward(pSplit)`) draws no sky, and makes no camera splat at a vertex the camera side
+  draws -- a glossy lobe, or the analytic connections through a mirror or glass sphere or off a
+  mirror plane (`Renderer::specularSideSplats`) -- since the backward layer takes every sample
+  whose first hit is one of those, and the two would count that light twice. The sidecar
+  carries the third film (`FTPCM03`).
 - **Where blur is not yet carried, the shutter is closed**, so no estimator mixes times: the
-  camera loop in `main.cpp` closes it for every mode `modeSeesMotion` does not name — P
-  (whose per-pixel classification is made at the instant, and whose backward half would
-  otherwise blur alone), V — and the exposure
+  camera loop in `main.cpp` closes it for every mode `modeSeesMotion` does not name — V
+  (which compares B against R) — and the exposure
   meter asks the same helper. The device renders the instant only, so `runRender`'s device
   choice, `renderForward`'s own device gate, the shared forward group and the exposure meter
   keep a blurred camera on the CPU (`kMotionCpuWhy`), and `-radcache` is off under a blur. What cannot move yet stays put and

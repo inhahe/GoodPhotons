@@ -3989,6 +3989,13 @@ struct BackwardRenderer {
     // checkpointed count). Each (pixel, absolute sample) pair seeds its own RNG
     // stream via seedUnit(), so the rendered realization is independent of the
     // chunk split, the row banding, and the thread count.
+    // Mode P under a blur (runCompositeProgressive): when set, a sample whose camera ray first meets
+    // a specular surface, or misses into the sky, lands here instead of in `film` -- so the
+    // specular-first part of each pixel is split off sample by sample, at each sample's own time,
+    // where the still composite splits whole pixels by the instant's centre ray. Same size as
+    // `film`; each thread writes only its own rows, as in `film`.
+    Film* specFirstFilm = nullptr;
+
     void renderRows(const Scene& scene, const Camera& cam0, Film& film,
                     int y0, int y1, long long spp, unsigned long long sampleBase) const {
         const int C = heroC;
@@ -4039,6 +4046,16 @@ struct BackwardRenderer {
         // rng draws exactly what it draws without blur. A moving camera is posed at that time too.
         const bool blur = cam0.seesMotion(scene);
         PosedCamera posed(cam0, blur);
+        // Which film a sample's light goes to: `film`, or -- splitting for mode P -- the
+        // specular-first one when the camera ray's first hit is specular or the sky (the rule
+        // classifyComposite applies to a pixel's centre ray).
+        const auto filmFor = [&](const Ray& r) -> Film& {
+            if (!specFirstFilm) return film;
+            const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
+            const bool spec = !h.valid ? scene.envIndex >= 0
+                                       : (h.sensorId < 0 && isSpecularType(scene.mats[h.matId].type));
+            return spec ? *specFirstFilm : film;
+        };
         for (int py = y0; py < y1; ++py) {
             for (int px = 0; px < film.resX; ++px) {
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)film.resX + (uint64_t)px;
@@ -4103,9 +4120,10 @@ struct BackwardRenderer {
                         // independent of how the budget was chunked.
                         radianceHero(scene, ray, lamA, invA, C, Lh, rng, &spdCache,
                                      GiCtx{0, sIdx});
+                        Film& to = filmFor(ray);
                         for (int i = 0; i < C; ++i)
-                            film.add(px, py, Vec3(cieX(lamA[i]), cieY(lamA[i]), cieZ(lamA[i]))
-                                             * (Lh[i] * filmA[i] / C));
+                            to.add(px, py, Vec3(cieX(lamA[i]), cieY(lamA[i]), cieZ(lamA[i]))
+                                           * (Lh[i] * filmA[i] / C));
                         continue;
                     }
                     // Sample lambda from the illuminant times a visible-band window, as the
@@ -4143,7 +4161,7 @@ struct BackwardRenderer {
                             continue;                       // clipped by an element / the stop
                         double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache,
                                             GiCtx{0, sIdx});
-                        film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens * filmW));
+                        filmFor(ray).add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens * filmW));
                         continue;
                     }
                     double sjx, sjy;
@@ -4152,7 +4170,7 @@ struct BackwardRenderer {
                     Ray ray = cam.genRay(px, py, sjx, sjy);
                     double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache,
                                         GiCtx{0, sIdx});
-                    film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * filmW));
+                    filmFor(ray).add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * filmW));
                 }
             }
         }

@@ -39,10 +39,10 @@ cube whose keys scale and shear it together. It requires:
     So do two mode B cameras with the shutter rendered beside a third without it (one flight per
     shutter, on any device), the third staying sharp; and the sky mode B sees directly behind a
     dark ball sweeping across it.
-  * Under a shutter, `-device gpu` says mode R stays on the CPU, and mode P says it renders the
+  * Under a shutter, `-device gpu` says mode R stays on the CPU, and mode V says it renders the
     instant. Modes M and J (an epoch at a time), S and U (a pass at a time) blur, agreeing with
     blurred mode R within their density estimates' bias, and follow a moving camera as mode R
-    does.
+    does; so does mode P, its backward samples split by their own first hit.
   * The camera's own motion, in the box held still: a camera with `motion` keys and no shutter
     renders byte for byte the still camera at its keys' instant (CPU, and GPU); with the shutter,
     the mean of 32 renders from its poses through it (mode R; modes D and B agree with mode R),
@@ -643,7 +643,8 @@ def main():
     # one time: against blurred mode R, within their own bias (a density estimate's radius), and
     # the blur really there ---
     for mode, margs in (("M", ["-spp", "128", "-n", "2000000"]), ("S", ["-spp", "128", "-n", "200000"]),
-                        ("U", ["-spp", "256"]), ("J", ["-spp", "128", "-jsurf"])):
+                        ("U", ["-spp", "256"]), ("J", ["-spp", "128", "-jsurf"]),
+                        ("P", ["-spp", "256", "-n", "20000000"])):
         bm = [lum(render(exe, out, blurred, "blur_%s_s%d" % (mode, s),
                          ["-mode", mode, "-device", "cpu"] + margs, seed=s)[0]) for s in (1, 2)]
         mm = blocks((bm[0] + bm[1]) / 2)
@@ -803,9 +804,9 @@ def main():
                        "-o", os.path.join(out, "gate.png")])
         verdict("-device gpu under a shutter says it stays on the CPU",
                 rc == 0 and "renders on the CPU so far" in log, log.strip()[-300:] if rc else "")
-    rc, log = run([exe, "-in", blurred, "-mode", "P", "-device", "cpu", "-spp", "1", "-no-meter",
-                   "-o", os.path.join(out, "modep.png")])
-    verdict("mode P under a shutter says it renders the instant",
+    rc, log = run([exe, "-in", blurred, "-mode", "V", "-device", "cpu", "-spp", "1", "-n", "100000", "-no-meter",
+                   "-o", os.path.join(out, "modev.png")])
+    verdict("mode V under a shutter says it renders the instant",
             rc == 0 and "renders the frame's instant" in log, log.strip()[-300:] if rc else "")
 
     light_and_haze_tests(exe, out, verdict, hair)
@@ -849,14 +850,14 @@ def light_and_haze_tests(exe, out, verdict, hair):
             "" if rc == 0 and "keys to follow" not in log else log.strip()[-300:])
 
     # Keys that move nothing (the only mover a light they would scale): no motion in the scene,
-    # so mode P under a shutter has no blur to say it drops.
+    # so mode V under a shutter has no blur to say it drops.
     p = os.path.join(out, "nomotion.ftsl")
     write(p, NL.join(["scene { units meters  motion_interval -0.5 0.5 }", 'material "w" { type diffuse reflect 0.5 }',
                       "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material w }",
                       STILL[1][1],
                       'camera "c" { eye 0 1 3  look_at 0 0.5 0  up 0 1 0  fov_y 40  shutter_open -0.5  '
                       'shutter_close 0.5  film { res 32 24 } }']) + NL)
-    rc, log = run([exe, "-in", p, "-mode", "P", "-device", "cpu", "-spp", "1", "-no-meter",
+    rc, log = run([exe, "-in", p, "-mode", "V", "-device", "cpu", "-spp", "1", "-n", "100000", "-no-meter",
                    "-o", os.path.join(out, "nomotion.png")])
     verdict("keys that move nothing are no motion", rc == 0 and "renders the frame's instant" not in log,
             log.strip()[-300:] if rc else "")
@@ -984,7 +985,7 @@ def camera_tests(exe, out, verdict, devices):
                              # SPPM's own density bias: 12.3 % in one block of this scene with the
                              # camera still (S against R, 128 passes), 10.5 % blurred
                              ("S", ["-spp", "128", "-n", "200000"], 0.15), ("U", ["-spp", "256"], 0.10),
-                             ("J", ["-spp", "128", "-jsurf"], 0.10)):
+                             ("J", ["-spp", "128", "-jsurf"], 0.10), ("P", ["-spp", "256", "-n", "20000000"], 0.05)):
         bm = [lum(render(exe, out, moving, "cam_blur_%s_s%d" % (mode, s),
                          ["-mode", mode, "-device", "cpu"] + margs, seed=s)[0]) for s in (1, 2)]
         good, detail = agree(bm, blur, tol)

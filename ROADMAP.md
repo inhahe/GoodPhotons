@@ -731,15 +731,15 @@ multi-camera flights group cameras by shutter, and the exposure meter blurs as t
 *Modes M, S, U and J (0.414.0, done):* they share photons, beams or merges across paths, so
 each of their passes (S, U) or epochs (M, J) takes one time spread over the shutter
 (`g_passMotionU`, `passTime`). M and J take at least 64 epochs. A camera moving over a still
-scene keeps M's and S's maps timeless and poses each gather sample. Mode P still renders the
-instant: it classifies pixels at the instant, and blurring it means routing each backward
-sample by its own first hit, not the pixel's. The GPU also renders the instant. *Camera motion (0.408.0, done):* a camera's
+scene keeps M's and S's maps timeless and poses each gather sample. *Mode P (0.415.0,
+done):* each backward sample is split by its own first hit at its own time, and no pixel is
+classified. Only V renders the instant now, and the GPU. *Camera motion (0.408.0, done):* a camera's
 `motion { key { eye look_at up fov_y } }`, and every frame of a camera path with a shutter
 keyed from a Catmull-Rom through the path's frames; loom writes a moving `Camera`'s keys.
 *Moving isosurfaces, curves and mesh instances (0.409.0, done):* the ray carried back to the
 instant, the hit carried out. *Moving lights and emissive meshes (0.410.0, done):* rigid only,
 sampled at the instant and carried out, with a timed light tree. Open: lights that scale over
-the shutter, aimed area lights; mode P; the GPU.
+the shutter, aimed area lights; the GPU.
 
 **Stage C, motion vectors and depth (0.411.0, done):** `-write-aovs` writes the guide pass's
 albedo and normal and, from one ray through each pixel's centre at the frame's instant, depth,

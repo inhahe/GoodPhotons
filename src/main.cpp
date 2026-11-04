@@ -15013,7 +15013,7 @@ static const char* const kMotionCpuWhy =
     "motion blur (a shutter on something that moves) renders on the CPU so far";
 // Whether mode `m` carries motion blur: each of its paths, or photons, is one time in the
 // shutter. Any other mode renders the frame's instant (run closes the shutter for it).
-static bool modeSeesMotion(char m) { return m != 0 && std::strchr("RDABCMSUJ", m) != nullptr; }
+static bool modeSeesMotion(char m) { return m != 0 && std::strchr("RDABCMSUJP", m) != nullptr; }
 // Whether any camera of `L` may render at a time other than the instant: its shutter open.
 // Which mode it renders in is not asked -- a lens, a routing or -on-unsupported may change it
 // after this -- so a shutter counts in any mode; at worst a mode that closes it keeps strands it
@@ -15680,7 +15680,7 @@ static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam,
 static Film renderForward(const Scene& scene, const Camera* cam, int resX, int resY, long long N,
                           int nThreads, bool forwardCatch, bool lensMode, bool useCamera,
                           EnergyReport& eOut, bool diffraction = true, bool useGpu = false,
-                          uint64_t seedBase = 0, bool wavefront = false) {
+                          uint64_t seedBase = 0, bool wavefront = false, bool pSplit = false) {
 #ifdef HAVE_CUDA
     // GPU path covers all three finite-lens camera models: the pinhole splat (B), the
     // brute-force catch (C), and the finite-lens next-event splat (A). Fluorescent
@@ -15704,6 +15704,7 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
     const bool heroOn = (g_heroC > 1) && scene.media.empty() && !grin::sceneHasGrin(scene);
     auto worker = [&](int tid) {
         Renderer r; r.forwardCatch = forwardCatch; r.lensMode = lensMode; r.diffraction = diffraction;
+        r.specularSideSplats = !pSplit;   // mode P's blurred split: the camera side draws those
         r.useHero = heroOn; r.heroC = g_heroC;
         if (g_maxBounceOverride >= 1) r.maxBounce = g_maxBounceOverride;
         // Photon i draws from its own stream keyed by the ABSOLUTE photon index
@@ -15729,7 +15730,7 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
         }
         // ...and, under a blur, this thread's band of the sky the camera sees directly (mode C
         // catches the sky's photons through its pupil instead).
-        if (blur && camFilm && !forwardCatch)
+        if (blur && camFilm && !forwardCatch && !pSplit)
             addBlurredSkyRows(*camFilm, scene, *cam, N, 1, seedBase,
                               (int)((long long)resY * tid / nThreads),
                               (int)((long long)resY * (tid + 1) / nThreads));
@@ -15865,7 +15866,8 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
 static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int resY,
                            long long spp, int nThreads, bool diffraction = true,
                            unsigned long long sampleBase = 0, bool forceWhitted = false,
-                           Film* into = nullptr, int rowBegin = 0, int rowEnd = -1) {
+                           Film* into = nullptr, int rowBegin = 0, int rowEnd = -1,
+                           Film* specFirst = nullptr) {
     Film out;
     if (!into) { out.resX = resX; out.resY = resY; out.alloc(); }
     Film& film = into ? *into : out;
@@ -16005,6 +16007,7 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
     };
     auto worker = [&](int tid) {
         BackwardRenderer br = makeBr();
+        br.specFirstFilm = specFirst;   // mode P's blurred split (BackwardRenderer::specFirstFilm)
         if (rcOn) br.radBank = &rcBanks[tid];
         int y0 = bandLo + bandN * tid / nThreads, y1 = bandLo + bandN * (tid + 1) / nThreads;
         br.renderRows(scene, cam, film, y0, y1, spp, sampleBase);
@@ -16226,6 +16229,32 @@ static Film compositeFromFilms(const Film& fwd, long long N, const Film& ref, lo
             std::printf("[composite] env background on %lld escaped (sky) pixels\n", cc.nSky);
         std::printf("[composite] diffuse-side residual (forward/s vs backward) rel RMSE=%.4f\n", rmse);
     }
+    return comp;
+}
+
+// Mode P's composite under a blur: no pixel is wholly one kind, so the backward samples were split
+// by their own first hit at their own time (BackwardRenderer::specFirstFilm). The image is the
+// forward film over the forward->radiance scale s -- fitted against the backward diffuse-first
+// film over every pixel, the two measuring the same light -- plus the backward specular-first
+// film, the sky among it. Exact in expectation, where the still composite's per-pixel split
+// assigns a silhouette pixel wholesale.
+static Film compositeSplitFilms(const Film& fwd, long long N, const Film& refDiff, const Film& spec,
+                                long long spp, bool verbose) {
+    const double invF = 1.0 / (double)N, invR = 1.0 / (double)spp;
+    double sfr = 0, srr = 0;
+    for (size_t i = 0; i < fwd.xyz.size(); ++i) {
+        const Vec3 f = fwd.xyz[i] * invF, rv = refDiff.xyz[i] * invR;
+        sfr += dot(f, rv); srr += dot(rv, rv);
+    }
+    double s = (srr > 0) ? sfr / srr : 1.0;
+    if (s <= 0) s = 1.0;
+    Film comp; comp.resX = fwd.resX; comp.resY = fwd.resY; comp.alloc();
+    for (size_t i = 0; i < fwd.xyz.size(); ++i) {
+        comp.xyz[i] = fwd.xyz[i] * (invF / s) + spec.xyz[i] * invR;
+    }
+    if (verbose)
+        std::printf("[composite] blurred: forward->radiance scale s=%.6g; the specular-first part "
+                    "split off sample by sample\n", s);
     return comp;
 }
 
@@ -17527,7 +17556,11 @@ static bool readCheckpoint(const std::string& outPath, int res, int resY, uint64
 // "FTBUF01\n" format so a stale/mismatched sidecar can never be misread.
 struct CompositeCheckpoint {
     Film fwd;                 // SUM over N photons (forward model-B layer)
-    Film ref;                 // SUM over spp (backward camera-side layer)
+    Film ref;                 // SUM over spp (backward camera-side layer; under a blur, its
+                              // diffuse-first samples only)
+    Film spec;                // under a blur: the backward samples whose first hit was specular
+                              // or the sky (BackwardRenderer::specFirstFilm); else unallocated
+    bool split = false;       // `spec` is in use (a blurred render; sidecar FTPCM03)
     long long N = 0;          // cumulative forward photons in `fwd`
     long long spp = 0;        // cumulative backward samples in `ref`
     EnergyReport energy;      // cumulative forward energy tally
@@ -17536,7 +17569,7 @@ struct CompositeCheckpoint {
 static bool writeCompositeCheckpoint(const std::string& outPath, const CompositeCheckpoint& c,
                                      uint64_t guard) {
     return filereplace::writeReplacing(checkpointPath(outPath), [&](std::ostream& o) -> bool {
-        const char magic[8] = {'F','T','P','C','M','0','2','\n'};
+        const char magic[8] = {'F','T','P','C','M','0', c.split ? '3' : '2','\n'};
         int32_t rx = c.fwd.resX, ry = c.fwd.resY;
         o.write(magic, 8);
         o.write((const char*)&rx, 4); o.write((const char*)&ry, 4);
@@ -17549,6 +17582,10 @@ static bool writeCompositeCheckpoint(const std::string& outPath, const Composite
         o.write((const char*)c.fwd.hits.data(), c.fwd.hits.size() * sizeof(double));
         o.write((const char*)c.ref.xyz.data(), c.ref.xyz.size() * sizeof(Vec3));
         o.write((const char*)c.ref.hits.data(), c.ref.hits.size() * sizeof(double));
+        if (c.split) {
+            o.write((const char*)c.spec.xyz.data(), c.spec.xyz.size() * sizeof(Vec3));
+            o.write((const char*)c.spec.hits.data(), c.spec.hits.size() * sizeof(double));
+        }
         if (!writeRadCacheSection(o)) return false;   // mode P's backward layer reads the cache too
         writeVersionTrailer(o);
         return (bool)o;
@@ -17561,7 +17598,8 @@ static bool readCompositeCheckpoint(const std::string& outPath, int res, int res
     if (!in) return false;
     char magic[8];
     in.read(magic, 8);
-    if (!in || std::memcmp(magic, "FTPCM02\n", 8) != 0) {
+    const bool split = in && std::memcmp(magic, "FTPCM03\n", 8) == 0;
+    if (!in || (!split && std::memcmp(magic, "FTPCM02\n", 8) != 0)) {
         std::fprintf(stderr, "[resume] %s is not a recognised composite checkpoint; ignoring\n",
                      checkpointPath(outPath).c_str());
         return false;
@@ -17573,7 +17611,7 @@ static bool readCompositeCheckpoint(const std::string& outPath, int res, int res
     uint64_t g = 0; in.read((char*)&g, 8);
     if (!in) { std::fprintf(stderr, "[resume] composite checkpoint %s truncated; starting fresh\n",
                             checkpointPath(outPath).c_str()); return false; }
-    if (rx != res || ry != resY || g != guard) {
+    if (rx != res || ry != resY || g != guard || split != c.split) {
         std::fprintf(stderr, "[resume] composite checkpoint %s does not match this render "
                              "(scene/resolution differ); starting fresh\n",
                      checkpointPath(outPath).c_str());
@@ -17581,7 +17619,8 @@ static bool readCompositeCheckpoint(const std::string& outPath, int res, int res
     }
     // As readCheckpoint: `c` is the caller's live accumulator, so a truncated body is caught
     // from the file size before anything is written to it.
-    const std::streamoff body = 2 * (std::streamoff)rx * ry * (std::streamoff)(sizeof(Vec3) + sizeof(double));
+    const std::streamoff body = (split ? 3 : 2) * (std::streamoff)rx * ry *
+                                (std::streamoff)(sizeof(Vec3) + sizeof(double));
     if (!checkpointHasBytes(in, body)) {
         std::fprintf(stderr, "[resume] composite checkpoint %s truncated; starting fresh\n",
                      checkpointPath(outPath).c_str());
@@ -17593,8 +17632,13 @@ static bool readCompositeCheckpoint(const std::string& outPath, int res, int res
     in.read((char*)c.fwd.hits.data(), c.fwd.hits.size() * sizeof(double));
     in.read((char*)c.ref.xyz.data(), c.ref.xyz.size() * sizeof(Vec3));
     in.read((char*)c.ref.hits.data(), c.ref.hits.size() * sizeof(double));
+    if (split) {
+        c.spec.resX = rx; c.spec.resY = ry; c.spec.alloc();
+        in.read((char*)c.spec.xyz.data(), c.spec.xyz.size() * sizeof(Vec3));
+        in.read((char*)c.spec.hits.data(), c.spec.hits.size() * sizeof(double));
+    }
     if (!in) {                        // an I/O error after the size check: leave `c` empty
-        c.fwd.alloc(); c.ref.alloc(); c.N = 0; c.spp = 0; c.energy = {};
+        c.fwd.alloc(); c.ref.alloc(); if (split) c.spec.alloc(); c.N = 0; c.spp = 0; c.energy = {};
         std::fprintf(stderr, "[resume] composite checkpoint %s could not be read; starting fresh\n",
                      checkpointPath(outPath).c_str());
         return false;
@@ -18381,8 +18425,12 @@ static int runCompositeProgressive(
     const long long Nreq   = (N   > 0) ? N   : 2'000'000;
     const long long sppReq = (spp > 0) ? spp : 64;
     const double perSpp = (double)Nreq / (double)sppReq;
+    // Motion blur (ROADMAP 11): no pixel is wholly one kind over the shutter, so the backward
+    // layer splits each sample by its own first hit at its own time (compositeSplitFilms) instead
+    // of the instant's per-pixel classification; the sky comes from the backward misses.
+    const bool blurP = cam.seesMotion(scene);
 #ifdef HAVE_CUDA
-    const bool gpuBackward = useGpu && backwardOnGpuOk(scene, cam);
+    const bool gpuBackward = useGpu && !blurP && backwardOnGpuOk(scene, cam);
 #else
     const bool gpuBackward = false;
 #endif
@@ -18393,6 +18441,8 @@ static int runCompositeProgressive(
     CompositeCheckpoint acc;
     acc.fwd.resX = res; acc.fwd.resY = resY; acc.fwd.alloc();
     acc.ref.resX = res; acc.ref.resY = resY; acc.ref.alloc();
+    acc.split = blurP;
+    if (blurP) { acc.spec.resX = res; acc.spec.resY = resY; acc.spec.alloc(); }
     if (resume && readCompositeCheckpoint(outPath, res, resY, guard, acc))
         std::printf("[resume] loaded %s: %lld photons + %lld spp accumulated so far\n",
                     checkpointPath(outPath).c_str(), acc.N, acc.spp);
@@ -18421,6 +18471,9 @@ static int runCompositeProgressive(
     // (much faster) cadence without also rewriting the PNG and the dual-film sidecar —
     // see g_windowIntervalSec.
     auto compose = [&](bool done) {
+        if (blurP)
+            return compositeSplitFilms(acc.fwd, std::max(acc.N, 1LL), acc.ref, acc.spec,
+                                       std::max(acc.spp, 1LL), /*verbose*/done);
         return compositeFromFilms(acc.fwd, std::max(acc.N, 1LL), acc.ref,
                                   std::max(acc.spp, 1LL), cc, envScene, /*verbose*/done);
     };
@@ -18453,7 +18506,8 @@ static int runCompositeProgressive(
             EnergyReport e;
             Film f = renderForward(scene, &cam, res, resY, dN, nThreads,
                                    /*forwardCatch*/false, /*lensMode*/false, /*useCamera*/true,
-                                   e, diffraction, useGpu, (uint64_t)acc.N, wavefront);
+                                   e, diffraction, useGpu, (uint64_t)acc.N, wavefront,
+                                   /*pSplit*/blurP);
             acc.fwd.merge(f); acc.N += dN;
             acc.energy.emitted += e.emitted; acc.energy.absorbed += e.absorbed;
             acc.energy.sensor  += e.sensor;  acc.energy.escaped  += e.escaped;
@@ -18472,6 +18526,12 @@ static int runCompositeProgressive(
                                        g_maxBounceOverride, g_directOnly, g_heroC);
             } else
 #endif
+            if (blurP) {
+                Film sp; sp.resX = res; sp.resY = resY; sp.alloc();
+                r = renderBackward(scene, cam, res, resY, dSpp, nThreads, diffraction,
+                                   (uint64_t)acc.spp, false, nullptr, 0, -1, &sp);
+                acc.spec.merge(sp);
+            } else
                 r = renderBackward(scene, cam, res, resY, dSpp, nThreads, diffraction,
                                    (uint64_t)acc.spp);
             acc.ref.merge(r); acc.spp += dSpp;
@@ -24232,16 +24292,15 @@ static int run(int argc, char** argv) {
             // above): its routed mode, or the mode it falls back to -- before anything below
             // reads the mode (the aperture term is mode B's).
             cmode = resolved[si];
-            // Motion blur reaches modes R (and W), D, A, B, C, M, S, U and J so far (ROADMAP 11;
-            // M, S, U and J an epoch or pass at a time): mode P, which picks per pixel from a
-            // classification made at the instant, renders the frame's instant, its shutter closed
-            // here so no part of it blurs while the rest does not.
+            // Motion blur reaches every mode on the CPU but V (ROADMAP 11; M, S, U and J an epoch
+            // or pass at a time, P split per sample): V, which compares B against R, renders the
+            // frame's instant, its shutter closed here.
             if (c.seesMotion(scene) && !modeSeesMotion(cmode)) {
                 static uint64_t saidFor = 0;   // once per scene, not per frame of a path
                 if (saidFor != scene.generation) {
                     saidFor = scene.generation;
                     std::printf("[motion] camera '%s': mode %c renders the frame's instant -- only "
-                                "modes R, W, D, A, B, C, M, S, U and J see motion so far\n", cs->name.c_str(), cmode);
+                                "every mode but V sees motion so far\n", cs->name.c_str(), cmode);
                 }
                 c.shutterOpen = c.shutterClose = 0.0;
             }
