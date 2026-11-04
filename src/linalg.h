@@ -72,6 +72,15 @@ struct Affine {
         return r;
     }
     // Determinant of the linear part: zero when the map flattens space (a zero scale).
+    // The cofactor matrix applied to `n`: det(M) M^-T n, defined whether or not M is invertible --
+    // how M carries a surface's normal and scales its area (|cof(M) n| for a unit normal n), even
+    // where M flattens space. Columns c0..c2: cof(M) = [c1 x c2, c2 x c0, c0 x c1].
+    Vec3 applyCofactor(const Vec3& n) const {
+        const Vec3 c0{m[0], m[3], m[6]}, c1{m[1], m[4], m[7]}, c2{m[2], m[5], m[8]};
+        const Vec3 a = cross(c1, c2), b = cross(c2, c0), c = cross(c0, c1);
+        return Vec3{a.x * n.x + b.x * n.y + c.x * n.z, a.y * n.x + b.y * n.y + c.y * n.z,
+                    a.z * n.x + b.z * n.y + c.z * n.z};
+    }
     double det() const {
         return m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) +
                m[2] * (m[3] * m[7] - m[4] * m[6]);

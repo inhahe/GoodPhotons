@@ -1536,6 +1536,12 @@ public:
             for (size_t t = g.triStart; t < end; ++t) { if (!drop[t]) { drop[t] = 1; ++dropped; } }
         }
         if (dropped == 0) return;
+        for (const Emitter& e : L.scene.emitters)   // before anything is renumbered
+            for (const EmitTri& et : e.meshTris)
+                if (et.tri >= 0 && (size_t)et.tri < drop.size() && drop[(size_t)et.tri]) {
+                    fail("internal: a mesh light's triangle was stripped as shape_only");
+                    return;
+                }
         // Prefix count of removed triangles, so each surviving group's new triStart is
         // just its old one minus however many were removed before it.
         std::vector<size_t> removedBefore(L.scene.tris.size() + 1, 0);
@@ -1547,11 +1553,9 @@ public:
             g.triStart -= removedBefore[std::min(g.triStart, L.scene.tris.size())];
         }
         for (Emitter& e : L.scene.emitters)
-            for (EmitTri& et : e.meshTris) {
-                if (et.tri < 0 || (size_t)et.tri >= L.scene.tris.size()) continue;
-                if (drop[(size_t)et.tri]) { fail("internal: a mesh light's triangle was stripped as shape_only"); return; }
-                et.tri -= (int)removedBefore[(size_t)et.tri];
-            }
+            for (EmitTri& et : e.meshTris)
+                if (et.tri >= 0 && (size_t)et.tri < L.scene.tris.size())
+                    et.tri -= (int)removedBefore[(size_t)et.tri];
         std::vector<Tri> kept;
         kept.reserve(L.scene.tris.size() - dropped);
         for (size_t t = 0; t < L.scene.tris.size(); ++t)
@@ -8111,6 +8115,14 @@ private:
         return true;
     }
 
+    // A sphere or tube light's own surface: black, emitting `spd`, reflecting nothing. Its id.
+    int lightMaterial(Loaded& L, const Spectrum& spd) {
+        Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
+        lm.reflectsNothing = true;
+        L.scene.mats.push_back(lm);
+        return (int)L.scene.mats.size() - 1;
+    }
+
     // Triangles [t0, t1) of the emissive material `id` as a mesh light (Scene::addMeshLight): the
     // block's `power` or `lumens`, if it gives one, taken over their area (absPower) into the
     // material's radiance. A material others may share (`own` false: a mesh block's) is cloned for
@@ -8226,9 +8238,7 @@ private:
             // and any affine motion both take (Scene::addMeshLight), as addSphere tessellates
             // such a sphere.
             if (nonUniform || sphereAsMesh_) {
-                Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
-                lm.reflectsNothing = true;
-                const int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
+                const int id = lightMaterial(L, spd);
                 const size_t t0 = L.scene.tris.size();
                 addTessellatedSphere(L, xf, c, radiusOf(b, "sphere light", 0.1), id);
                 addMeshEmitter(b, L, t0, L.scene.tris.size(), id, /*own*/true);
@@ -8237,9 +8247,7 @@ private:
             double rad = Len(radiusOf(b, "sphere light", 0.1)) * s;
             Vec3 cw = P(xf.apply(c));
             spd = absPower(b, spd, (4.0 * PI * rad * rad) * PI, L);
-            Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
-            lm.reflectsNothing = true;
-            int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
+            const int id = lightMaterial(L, spd);
             L.scene.spheres.push_back(Sphere{cw, rad, id});
             L.scene.addSphereLight(cw, rad, spd, binWidth_, /*matId*/id);
             return true;
@@ -8265,9 +8273,7 @@ private:
             // unevenly (sphereAsMesh_) one at some time: the same wall (and caps) as an emissive
             // mesh, built where the group puts it, its normals by the inverse transpose.
             if (nonUniform || sphereAsMesh_) {
-                Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
-                lm.reflectsNothing = true;
-                const int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
+                const int id = lightMaterial(L, spd);
                 const size_t t0 = L.scene.tris.size();
                 const double lenL = dblOf(b, "length", 0.5), radL = radiusOf(b, "cylinder light", 0.05);
                 const Vec3 au = normalize(dir);
@@ -8284,9 +8290,7 @@ private:
             spd = absPower(b, spd, cylArea * PI, L);
             Vec3 axisW = normalize(xf.applyDir(dir)) * len;   // world axis vector (|.| = len)
             Vec3 baseW = P(xf.apply(c)) - axisW * 0.5;        // base-cap center
-            Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
-            lm.reflectsNothing = true;
-            int id = (int)L.scene.mats.size(); L.scene.mats.push_back(lm);
+            const int id = lightMaterial(L, spd);
             // Tessellate the lateral wall. onb(normalize(axisW),...) here matches the
             // basis addCylinderLight computes, so facets align with the sampled radius.
             Vec3 au = normalize(axisW); Vec3 t, bt; onb(au, t, bt);

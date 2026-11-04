@@ -1927,14 +1927,16 @@ struct Scene {
         return normalize(motionNowInverse(em.motion).applyDirTranspose(n));
     }
     // How much the light's area grows at the path's time about a point whose normal there is
-    // `nNow` (unit): |det D| / |D^T nNow|, s^2 under a similarity of scale s; 0 where the keys
-    // flatten it. An area density at the instant divides by it, a photon's power multiplies by
-    // it (emitterSamplePoint turns a 0 into no emission).
+    // `nNow` (unit): |det D| / |D^T nNow|, s^2 under a similarity of scale s, 0 where the keys
+    // flatten it in its own plane. Where D flattens space along the light's normal (D^T nNow = 0:
+    // the light lies in the plane D keeps), |cof(D) nNow|, the area the light keeps there. An area
+    // density at the instant divides by it, a photon's power multiplies by it (emitterSamplePoint
+    // turns a 0 into no emission).
     double lightAreaScale(const Emitter& em, const Vec3& nNow) const {
         if (!lightScales(em)) return 1.0;
         const Affine& D = motionNow(em.motion);
         const double l = length(D.applyDirTranspose(nNow));
-        return l > 0.0 ? std::fabs(D.det()) / l : 0.0;
+        return l > 0.0 ? std::fabs(D.det()) / l : length(D.applyCofactor(nNow));
     }
     // A sphere light's sample at the path's time (it moves), on the sphere its geometry is then
     // (movedSphere: the centre carried, the radius by the motion's mean scale): `n`, its unit

@@ -10082,9 +10082,12 @@ sees the instant, exactly as a static scene with those transforms would show it.
   function stops with an internal error on any other mix), and its resume guard mixes each
   camera's shutter. On the GPU (0.430.0) the device session's camera set times each photon in the
   flight's one shutter and poses every moving camera there (`makeCamSet`, as for one camera), and
-  `runSharedGroup` draws each camera's directly seen sky on the host per batch (`skyAcc`, the CPU
-  flight's `addBlurredSkyRows` share), added to the device's totals when they are pulled
-  (`syncAcc`).
+  `runSharedGroup` draws each blurring camera's directly seen sky on the host while the device
+  traces the batch (`skyAcc`, the CPU flight's `addBlurredSkyRows` share; none without a sky or
+  sun), added to the device's totals whenever they are pulled (`pullDevice`). The posed copies --
+  every camera for every thread -- live in one buffer for the session (`SharedGpuSession::d_posed`,
+  grown by `launchForward`), which `sharedForwardGpuBegin` refuses to make past half the device's
+  free memory: the flight then flies on the CPU, saying so.
 - **Light from the sky and the suns reaches a mover outside the instant's bounds.** The env's
   and the suns' photons and BDPT light subpaths enter through a disc sized by the scene's
   bounding sphere; for a path with a time in a moving scene that sphere (about the same centre)
@@ -10199,7 +10202,8 @@ sees the instant, exactly as a static scene with those transforms would show it.
   wall's with smooth normals, `power` over the mesh's area: `addLightMesh`), as one an uneven
   static scale stretches is, so it moves with them. A light keeps its radiance and its samplers still run at the
   instant; what they measure is carried: an area by `Scene::lightAreaScale` (|det D| / |Dᵀ n|
-  about the carried normal n, s² under a similarity) -- in every area density (backward NEE, the
+  about the carried normal n, s² under a similarity; where a singular key flattens space along the
+  light's normal, so that is 0 / 0, |cof(D) n| -- `Affine::applyCofactor`, the area the light keeps) -- in every area density (backward NEE, the
   emission-on-hit density, BDPT's light origin, its s = 1 connection, VCM's light subpath and
   connection and its emission MIS) and every photon's power (render.h's `spotW`) -- and a flat
   light's normal by the inverse transpose (`lightNormalNow`) under an uneven stretch. A ball's

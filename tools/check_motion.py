@@ -36,6 +36,7 @@ cube whose keys scale and shear it together. It requires:
     transform), in every mode on both devices -- also loaded after a `shape_only` mesh, whose
     stripped triangles renumber its own, and over a rough mirror, where the glossy bounces' MIS
     weighs it at its area then -- and one grown from nothing lights nothing at the interval's start.
+    A panel whose key flattens space along its normal (a singular key) lights the room as before.
   * A ball whose sweep runs far past the instant's bounding sphere is lit by the sky (mode B) and
     by a low sun (mode B), and shadows the floor in that sun (mode D), as in blurred mode R. A
     shared flight resumes its own shutter's sidecar and refuses one rendered with another.
@@ -803,6 +804,26 @@ def main():
         r = lit[-0.5] / max(lit[0.4], 1e-300)
         verdict("a light with no area at a time lights nothing then (mode %s%s)" % (mode, " on the GPU" if dev == "gpu" else ""),
                 r < 1e-6 and np.isfinite(lit[-0.5]), "%.3g of its light at 0.4" % r)
+    # A panel at its group's y = 0 whose last key flattens y (`scale 1 0 1`): a singular key that
+    # leaves the panel as it is, so held sharp there it lights the room as its still twin does
+    # (its area growth by the cofactor, where |det D| / |D^T n| is 0 / 0).
+    panel = "light area { origin -0.3 0 -0.3  u 0.6 0 0  v 0 0 0.6  normal 0 -1 0  spd preset:bb6500 }"
+    for nm, body, cam in (("sharp", "group { translate 0 1.5 0  group { motion { key { scale 1 1 1 } key { scale 1 1 1 } "
+                                    "key { scale 1 0 1 } }  %s } }" % panel, "shutter_open 0.5  shutter_close 0.5  "),
+                          ("ref", "group { translate 0 1.5 0  %s }" % panel, "")):
+        write(os.path.join(out, "flatkey_%s.ftsl" % nm), NL.join([
+            "scene { units meters  motion_interval -0.5 0.5 }", 'material "white" { type diffuse reflect 0.7 }',
+            "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }", "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material white }",
+            body, 'camera "c" { eye 0 1.0 4.2  look_at 0 0.7 0  up 0 1 0  fov_y 45  %sfilm { res %d %d } }' % (cam, W, H)]) + NL)
+    for mode, dev, margs in [m for m in glow_modes if (m[0], m[1]) in (("R", "cpu"), ("B", "cpu"), ("R", "gpu"), ("B", "gpu"))]:
+        args = ["-mode", mode, "-device", dev] + margs
+        la = [lum(render(exe, out, os.path.join(out, "flatkey_sharp.ftsl"), "flatkey_sharp_s%d" % s, args, seed=s,
+                         want_gpu=dev == "gpu")[0]) for s in (1, 2)]
+        lb = [lum(render(exe, out, os.path.join(out, "flatkey_ref.ftsl"), "flatkey_ref_s%d" % s, args, seed=s,
+                         want_gpu=dev == "gpu")[0]) for s in (1, 2)]
+        good, detail = agree(la, lb)
+        verdict("a panel its key flattens along its normal lights as before (mode %s%s)"
+                % (mode, " on the GPU" if dev == "gpu" else ""), good, detail)
     # An isosurface, a curve and an instance move, turn and grow with their group: held sharp at
     # a time, they are the static group written out there.
     for t in (-0.35, 0.4):
@@ -1231,19 +1252,32 @@ def split_tests(exe, out, verdict):
     write(p, scene(u=0.5))
     args = ["-mode", "P", "-device", "gpu", "-spp", "64", "-n", "8000000"]
     held = render(exe, out, p, "split_held", args, want_gpu=True)[0]
-    os.environ["FTRACE_NOHOLD"] = "1"
-    try:
-        unheld = render(exe, out, p, "split_unheld", args, want_gpu=True)[0]
-    finally:
-        del os.environ["FTRACE_NOHOLD"]
+    unheld = render_env(exe, out, p, "split_unheld", args, {"FTRACE_NOHOLD": "1"})
     d = np.abs(held - unheld).max() / max(np.abs(unheld).max(), 1e-300)
     verdict("mode P on the GPU, the scene held across batches = uploaded each", d < 1e-4,
             "largest change %.3g of the brightest pixel" % d)
-    args = ["-mode", "M", "-device", "gpu", "-spp", "16", "-n", "30000000"]
-    a, b = (render(exe, out, p, "split_dep_%d" % k, args, want_gpu=True)[0] for k in (1, 2))
+    # the deposit cut into chunks of 1 M photons and of 3 M (FTRACE_DEPOSIT_CHUNK), not the clock's
+    args = ["-mode", "M", "-device", "gpu", "-spp", "16", "-n", "12000000"]
+    a, b = (render_env(exe, out, p, "split_dep_%d" % k, args, {"FTRACE_DEPOSIT_CHUNK": str(k * 1000000)})
+            for k in (1, 3))
     d = np.abs(a - b).max() / max(np.abs(b).max(), 1e-300)
-    verdict("GPU mode M: one seed, one photon map, however the clock cuts its deposit", d < 1e-4,
+    verdict("GPU mode M: one seed, one photon map, however its deposit is cut", d < 1e-4,
             "largest change %.3g of the brightest pixel" % d)
+
+
+def render_env(exe, out, path, tag, args, env):
+    """render() on the GPU under extra environment variables, each restored after (or removed, if
+    it was not set)."""
+    saved = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    try:
+        return render(exe, out, path, tag, args, want_gpu=True)[0]
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def meter_m_test(exe, out, verdict):

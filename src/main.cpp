@@ -194,6 +194,10 @@
 #include "raster_cuda.h"   // GPU preview rasterizer (device twin of raster::renderFrame)
 #endif
 struct CudaSceneHold;      // render_cuda.h; named in signatures a CPU-only build compiles too
+#ifdef HAVE_CUDA
+// A device copy of a scene kept across calls (cudaHoldScene), released with its owner.
+using SceneHoldPtr = std::unique_ptr<CudaSceneHold, void (*)(CudaSceneHold*)>;
+#endif
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX               // keep std::min/std::max (windows.h else macro-clobbers them)
@@ -18506,16 +18510,11 @@ static int runCompositeProgressive(
 #endif
     // The device copy of the scene, kept across the batches: each of their device calls would
     // upload it again otherwise, which on a heavy scene can cost more than the batch's samples.
-    struct HoldScene {
-        CudaSceneHold* h = nullptr;
-        ~HoldScene() {
 #ifdef HAVE_CUDA
-            cudaReleaseScene(h);
-#endif
-        }
-    } hold;
-#ifdef HAVE_CUDA
-    if (useGpu || gpuBackward) hold.h = cudaHoldScene(scene);
+    const SceneHoldPtr hold((useGpu || gpuBackward) ? cudaHoldScene(scene) : nullptr, cudaReleaseScene);
+    const CudaSceneHold* const held = hold.get();
+#else
+    const CudaSceneHold* const held = nullptr;
 #endif
     // The CPU's radiance cache advances at the end of each backward batch, so there the batches
     // are part of the realization: under -radcache a fixed budget keeps a schedule of its own
@@ -18597,7 +18596,7 @@ static int runCompositeProgressive(
             Film f = renderForward(scene, &cam, res, resY, dN, nThreads,
                                    /*forwardCatch*/false, /*lensMode*/false, /*useCamera*/true,
                                    e, diffraction, useGpu, (uint64_t)acc.N, wavefront,
-                                   /*pSplit*/blurP, /*stableSeed*/true, hold.h);
+                                   /*pSplit*/blurP, /*stableSeed*/true, held);
             acc.fwd.merge(f); acc.N += dN;
             acc.energy.emitted += e.emitted; acc.energy.absorbed += e.absorbed;
             acc.energy.sensor  += e.sensor;  acc.energy.escaped  += e.escaped;
@@ -18616,7 +18615,7 @@ static int runCompositeProgressive(
                 Film sp;
                 r = renderBackwardCuda(scene, cam, res, resY, dSpp, diffraction, &bp,
                                        g_maxBounceOverride, g_directOnly, g_heroC, nullptr,
-                                       blurP ? &sp : nullptr, hold.h);
+                                       blurP ? &sp : nullptr, held);
                 if (blurP) acc.spec.merge(sp);
             } else
 #endif
@@ -28108,6 +28107,22 @@ static int run(int argc, char** argv) {
             }
         }
 
+#ifdef HAVE_CUDA
+        // Resident GPU session for the whole group render: the scene and every camera are
+        // baked/uploaded ONCE and the per-camera films accumulate on the device, so each
+        // batch below is a bare kernel launch instead of a full upload/download round trip
+        // (the old per-batch renderForwardSharedCuda wrapper dominated wall-clock on
+        // multi-camera groups). Films/energy are downloaded only when the host actually
+        // needs them (syncAcc: interval writes, window refresh, final). On -resume the
+        // checkpoint films seed the device accumulators so downloads are full totals.
+        SharedGpuSession* gses = groupGpu
+            ? sharedForwardGpuBegin(scene, cams, rxs, rys, groupMode, wavefront, g_heroC,
+                                    g_beamGather, (accN > 0) ? &acc : nullptr,
+                                    (accN > 0) ? &accE : nullptr)
+            : nullptr;
+        // A session the device refused (it says why) flies on the CPU.
+        if (groupGpu && !gses) groupGpu = false;
+#endif
         const std::string backend =
 #ifdef HAVE_CUDA
             groupGpu ? std::string(cudaDeviceName()) :
@@ -28128,27 +28143,31 @@ static int run(int argc, char** argv) {
         g_windowFrame = sharedFrame;
 
 #ifdef HAVE_CUDA
-        // Resident GPU session for the whole group render: the scene and every camera are
-        // baked/uploaded ONCE and the per-camera films accumulate on the device, so each
-        // batch below is a bare kernel launch instead of a full upload/download round trip
-        // (the old per-batch renderForwardSharedCuda wrapper dominated wall-clock on
-        // multi-camera groups). Films/energy are downloaded only when the host actually
-        // needs them (syncAcc: interval writes, window refresh, final). On -resume the
-        // checkpoint films seed the device accumulators so downloads are full totals.
-        SharedGpuSession* gses = groupGpu
-            ? sharedForwardGpuBegin(scene, cams, rxs, rys, groupMode, wavefront, g_heroC,
-                                    g_beamGather, (accN > 0) ? &acc : nullptr,
-                                    (accN > 0) ? &accE : nullptr)
-            : nullptr;
         bool accFresh = true;   // do host acc[]/accE match the device accumulators?
-        // Under a blur, each camera's directly seen sky, drawn on the host beside the device's
-        // photons: running totals, added to what the device holds when it is pulled (syncAcc).
+        // Under a blur, the directly seen sky of each camera that blurs, drawn on the host beside
+        // the device's photons: running totals, added to what the device holds whenever it is
+        // pulled (pullDevice). Empty where the scene has no sky or sun, or the camera sees nothing
+        // move.
         std::vector<Film> skyAcc;
-        if (gses && blurGroup)
-            for (int c = 0; c < nc; ++c) {
-                skyAcc.emplace_back(); skyAcc.back().resX = rxs[c]; skyAcc.back().resY = rys[c];
-                skyAcc.back().alloc();
+        const bool skyOnHost = gses && blurGroup && (scene.envIndex >= 0 || scene.sunCount > 0);
+        if (skyOnHost) {
+            skyAcc.resize(nc);
+            for (int c = 0; c < nc; ++c)
+                if (cams[c].seesMotion(scene)) {
+                    skyAcc[c].resX = rxs[c]; skyAcc[c].resY = rys[c]; skyAcc[c].alloc();
+                }
+        }
+        // The device's running totals into acc[]/accE -- or with `hitsOnly`, camera 0's hits alone
+        // (the status line's quick path) -- each with the host's sky added.
+        auto pullDevice = [&](bool hitsOnly) {
+            if (hitsOnly) sharedForwardGpuHits0(gses, acc[0].hits);
+            else          sharedForwardGpuDownload(gses, acc, accE);   // replacing
+            for (int c = 0; c < (int)skyAcc.size(); ++c) {
+                if (skyAcc[c].xyz.empty() || (hitsOnly && c > 0)) continue;
+                if (hitsOnly) for (size_t i = 0; i < acc[0].hits.size(); ++i) acc[0].hits[i] += skyAcc[0].hits[i];
+                else          acc[c].merge(skyAcc[c]);
             }
+        };
 #endif
 
         // One accumulation chunk of `batchN` photons across the whole group.
@@ -28156,21 +28175,26 @@ static int run(int argc, char** argv) {
 #ifdef HAVE_CUDA
             if (gses) {
                 // Resident path: launch and go. seedBase = cumulative photon count, same
-                // stream convention as the CPU path / the old per-batch wrapper.
+                // stream convention as the CPU path / the old per-batch wrapper. Each blurring
+                // camera's sky is drawn meanwhile, a band of rows a thread across them all, as the
+                // CPU flight draws it (its share of the flight's photons, at the batch's seed).
+                std::vector<std::thread> skyPool;
+                // Joined on every way out, the device call's exceptions included (renderForward's).
+                struct JoinAll {
+                    std::vector<std::thread>& pool;
+                    ~JoinAll() { for (auto& th : pool) if (th.joinable()) th.join(); }
+                } joinSky{skyPool};
+                const uint64_t skySeed = (uint64_t)accN;
+                for (int t = 0; t < nThreads && !skyAcc.empty(); ++t)
+                    skyPool.emplace_back([&, t] {
+                        for (int c = 0; c < (int)skyAcc.size(); ++c)
+                            if (!skyAcc[c].xyz.empty())
+                                addBlurredSkyRows(skyAcc[c], scene, cams[c], batchN, nc, skySeed,
+                                                  (int)((long long)rys[c] * t / nThreads),
+                                                  (int)((long long)rys[c] * (t + 1) / nThreads));
+                    });
                 sharedForwardGpuBatch(gses, batchN, (unsigned long long)accN, diffraction);
-                // ... each camera's sky meanwhile, a band of rows a thread, as the CPU flight
-                // draws it (its share of the flight's photons, at the batch's seed)
-                for (int c = 0; c < (int)skyAcc.size(); ++c) {
-                    if (!cams[c].seesMotion(scene)) continue;
-                    std::vector<std::thread> pool;
-                    for (int t = 0; t < nThreads; ++t)
-                        pool.emplace_back([&, c, t] {
-                            addBlurredSkyRows(skyAcc[c], scene, cams[c], batchN, nc, (uint64_t)accN,
-                                              (int)((long long)rys[c] * t / nThreads),
-                                              (int)((long long)rys[c] * (t + 1) / nThreads));
-                        });
-                    for (auto& th : pool) th.join();
-                }
+                for (auto& th : skyPool) th.join();
                 accN += batchN;
                 accFresh = false;
                 return;
@@ -28190,11 +28214,7 @@ static int run(int argc, char** argv) {
         // where runBatch merges host-side; no-op when already fresh).
         auto syncAcc = [&] {
 #ifdef HAVE_CUDA
-            if (gses && !accFresh) {
-                sharedForwardGpuDownload(gses, acc, accE);   // the device's totals, replacing
-                for (int c = 0; c < (int)skyAcc.size(); ++c) acc[c].merge(skyAcc[c]);
-                accFresh = true;
-            }
+            if (gses && !accFresh) { pullDevice(false); accFresh = true; }
 #endif
         };
 
@@ -28291,11 +28311,7 @@ static int run(int argc, char** argv) {
                         // a bare -noise poll between intervals fetches ONLY camera 0's
                         // hits (npix doubles) instead of every film.
                         if (wantStatus || wantWinPre || stopped || timeUp) syncAcc();
-                        else {
-                            sharedForwardGpuHits0(gses, acc[0].hits);
-                            if (!skyAcc.empty())   // the sky's, as syncAcc adds them
-                                for (size_t i = 0; i < acc[0].hits.size(); ++i) acc[0].hits[i] += skyAcc[0].hits[i];
-                        }
+                        else pullDevice(true);
                     }
 #endif
                     double sumHits = 0.0; long long lit = 0;
@@ -28404,6 +28420,11 @@ static int run(int argc, char** argv) {
     // would repeat are printed (the first only). The aimed caustic map is the scene's alone, so the
     // calls build it once (aimCache).
     struct AimCache { bool ready = false; caim::AimMap map; long long nAimed = 0; } aimCache;
+#ifdef HAVE_CUDA
+    // The device copy of the scene its refresh loops share, kept across the calls too (the scene
+    // is one), and released once the last has gathered (below).
+    SceneHoldPtr refreshHold(nullptr, cudaReleaseScene);
+#endif
     auto runSharedPhotonMap = [&](const std::vector<int>& idx, int apartNo = 0, int apartOf = 0) {
         if (idx.empty() || g_stopRequested) return;
         const bool firstCall = apartNo <= 1;
@@ -28707,12 +28728,8 @@ static int run(int argc, char** argv) {
                                 "device photon path has no bounce-limit parameter, so this render "
                                 "uses the built-in cap. Use -device cpu for a bounce-limited "
                                 "mode-M render.\n", g_maxBounceOverride);
-                // The refresh loop's device copy of the scene, which its passes share (cudaHoldScene):
+                // The refresh loop's device copy of the scene, which its passes share (refreshHold):
                 // null, each pass uploading its own, otherwise.
-                struct HoldScene {
-                    CudaSceneHold* h = nullptr;
-                    ~HoldScene() { cudaReleaseScene(h); }
-                } sceneHold;
                 auto runPass = [&](long long sppWant, const SppProgress* p,
                                    const std::function<bool(int, const Film&, long long)>* onF,
                                    PmRadiiPin* pin) {
@@ -28727,7 +28744,7 @@ static int run(int argc, char** argv) {
                                               &aimMapGpu, nAimedGpu,
                                               g_pmAdaptive ? (g_pmAdaptiveK > 0.0 ? g_pmAdaptiveK
                                                                                   : -1.0) : 0.0,
-                                              pin, sceneHold.h);
+                                              pin, refreshHold.get());
                 };
                 // ---------------------------------------------------------------------------
                 // THE LIGHT-SIDE REFRESH, ON THE DEVICE, FOR A LONE CAMERA (0.253.0).
@@ -28781,7 +28798,7 @@ static int run(int argc, char** argv) {
                 };
                 // The device copy of the scene, kept across the epochs: each would upload it again
                 // otherwise, and a blur's epochs are many and short.
-                if (refreshGpu) sceneHold.h = cudaHoldScene(scene);
+                if (refreshGpu && !refreshHold) refreshHold.reset(cudaHoldScene(scene));
                 guidesFor(0);
                 struct DropGuides {   // after the gather, on every way out of it
                     std::unique_ptr<GuideScope>& g; ~DropGuides() { g.reset(); }
@@ -29103,6 +29120,9 @@ static int run(int argc, char** argv) {
     runSharedPhotonMap(groupM);
     for (size_t k = 0; k < groupMApart.size(); ++k)
         runSharedPhotonMap(std::vector<int>{groupMApart[k]}, (int)k + 1, (int)groupMApart.size());
+#ifdef HAVE_CUDA
+    refreshHold.reset();   // the cameras that follow render their own scenes' copies
+#endif
 
     // What this batch's cameras share (BatchCache): mode J's light side where every camera
     // would draw the same one, and the device copy of the scene. Declared here rather than as a

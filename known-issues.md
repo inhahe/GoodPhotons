@@ -158,7 +158,11 @@ fixed radius (`rebuildPhotonMapAt`), a map of N/k photons is the same estimator 
 variance, so k epochs of N/k photons each average to what one of N gives. Under a clock blur,
 size each epoch's photon count so its rebuild costs about what its 4 samples' gather does, the
 map normalised by its own nEmitted. Mode J's beams likewise, though its surface radius shrinks
-on the epoch index (`surfRadiusFor`), which must then count rebuilds, not samples.
+on the epoch index (`surfRadiusFor`), which must then count rebuilds, not samples. One more catch
+(found sizing it, 0.430.1): mode M's caustic map is rebuilt at its pinned radius but with a fixed
+neighbour count (`rebuildCausticMapAt(pmC, radiusC, kGatherC)` on the CPU), so a map of fewer
+photons would gather its caustics over a wider radius, a bias the main map's fixed radius does
+not have; its count must scale with the epoch's photons too (or its radius be pinned alone).
 
 ## OPEN (2026-11-03, 0.413.0): DEFORM-LIMITS — what a deforming mesh cannot do yet
 

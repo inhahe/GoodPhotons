@@ -4780,6 +4780,17 @@ __device__ static void dAffInverse(const DAff& a, DAff& r) {
         r.t[i] = -(r.m[i * 3] * a.t[0] + r.m[i * 3 + 1] * a.t[1] + r.m[i * 3 + 2] * a.t[2]);
 }
 // M^T v (Affine::applyDirTranspose): a normal carried by the map whose inverse is `a`.
+// Affine::applyCofactor's twin: det(M) M^-T n, defined for a singular M too.
+__device__ static inline DVec3 dAffCofactor(const DAff& a, const DVec3& n) {
+    const double* m = a.m;
+    const double c0[3] = {m[0], m[3], m[6]}, c1[3] = {m[1], m[4], m[7]}, c2[3] = {m[2], m[5], m[8]};
+    const double A[3] = {c1[1] * c2[2] - c1[2] * c2[1], c1[2] * c2[0] - c1[0] * c2[2], c1[0] * c2[1] - c1[1] * c2[0]};
+    const double B[3] = {c2[1] * c0[2] - c2[2] * c0[1], c2[2] * c0[0] - c2[0] * c0[2], c2[0] * c0[1] - c2[1] * c0[0]};
+    const double C[3] = {c0[1] * c1[2] - c0[2] * c1[1], c0[2] * c1[0] - c0[0] * c1[2], c0[0] * c1[1] - c0[1] * c1[0]};
+    const double x = n.x, y = n.y, z = n.z;
+    return DVec3{(Real)(A[0] * x + B[0] * y + C[0] * z), (Real)(A[1] * x + B[1] * y + C[1] * z),
+                 (Real)(A[2] * x + B[2] * y + C[2] * z)};
+}
 __device__ static inline DVec3 dAffDirT(const DAff& a, const DVec3& v) {
     const double* m = a.m;
     return DVec3((Real)(m[0] * v.x + m[3] * v.y + m[6] * v.z), (Real)(m[1] * v.x + m[4] * v.y + m[7] * v.z),
@@ -4907,7 +4918,7 @@ __device__ __noinline__ static DLightNow dLightSampleNowOut(const DScene& sc, in
     o.J = 1.0;
     if (shape != kMotionRigid) {
         const double l = (double)length(dAffDirT(D, o.n));
-        o.J = l > 0.0 ? fabs(dAffDet(D)) / l : 0.0;
+        o.J = l > 0.0 ? fabs(dAffDet(D)) / l : (double)length(dAffCofactor(D, o.n));   // Scene::lightAreaScale
     }
     return o;
 }
@@ -4918,7 +4929,7 @@ __device__ __noinline__ static double dLightAreaScaleOut(const DScene& sc, int s
     DAff D;
     dMotionAt(sc.mo, set, (double)dMotionU(), D);
     const double l = (double)length(dAffDirT(D, nNow));
-    return l > 0.0 ? fabs(dAffDet(D)) / l : 0.0;
+    return l > 0.0 ? fabs(dAffDet(D)) / l : (double)length(dAffCofactor(D, nNow));   // Scene::lightAreaScale
 }
 __device__ static inline double dLightAreaScale(const DScene& sc, const DEmitter& em, const DVec3& nNow) {
     return dLightScales(sc, em) ? dLightAreaScaleOut(sc, em.motion, nNow) : 1.0;
@@ -24308,9 +24319,13 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
 // launch, on) under one seed, so a render's photons draw the same streams however they are split
 // into launches (mode P's batches, mode M's clock-sized deposit chunks); on the megakernel, the
 // one backend that seeds per photon.
+// `posedKeep` / `posedCapKeep`: a buffer the caller keeps across launches for a moving camera set's
+// posed copies (a session's), grown here as a launch needs, in DCameras; null, a launch allocates
+// and frees its own.
 static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
                           long long N, bool diffraction, unsigned long long seedBase,
-                          bool wavefront, int camModeInt, int heroC, bool stableSeed = false) {
+                          bool wavefront, int camModeInt, int heroC, bool stableSeed = false,
+                          gpu::DCamera** posedKeep = nullptr, size_t* posedCapKeep = nullptr) {
     using namespace gpu;
     // seedBase==0 keeps the original single-shot seed exactly; each accumulation chunk
     // passes a distinct cumulative-photon offset for an independent stream -- or, seeding
@@ -24328,8 +24343,20 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
     DCamera* d_posed = nullptr;
     if (cs.camMoves && cs.nCam > 0) {
         const long long threads = wf ? wavefrontSlots(N) : (long long)kFwdBlockSize * kFwdNumBlocks;
-        CUDA_CHECK(cudaMalloc(&d_posed, (size_t)threads * cs.nCam * sizeof(DCamera)));
-        csRun.cams = d_posed; csRun.poseOut = d_posed; csRun.camStride = cs.nCam;
+        const size_t need = (size_t)threads * cs.nCam;
+        if (posedKeep) {
+            if (*posedCapKeep < need) {
+                if (*posedKeep) cudaFree(*posedKeep);
+                *posedKeep = nullptr; *posedCapKeep = 0;
+                CUDA_CHECK(cudaMalloc(posedKeep, need * sizeof(DCamera)));
+                *posedCapKeep = need;
+            }
+            csRun.cams = *posedKeep; csRun.poseOut = *posedKeep;
+        } else {
+            CUDA_CHECK(cudaMalloc(&d_posed, need * sizeof(DCamera)));
+            csRun.cams = d_posed; csRun.poseOut = d_posed;
+        }
+        csRun.camStride = cs.nCam;
     }
     if (wf) {
         // Streaming backend: identical physics, path-regeneration scheduling. Same
@@ -24413,6 +24440,8 @@ struct SharedGpuSession {
     std::vector<double*> d_films, d_hits;   // resident per-camera accumulators
     std::vector<size_t>  npix;
     double* d_energy = nullptr;             // resident 5-counter energy tally
+    gpu::DCamera* d_posed = nullptr;        // a moving camera set's posed copies (launchForward)
+    size_t posedCap = 0;                    // ...in DCameras
     gpu::DCamSet cs{};
     int  camModeInt = 0;
     bool wavefront = false;
@@ -24476,6 +24505,27 @@ SharedGpuSession* sharedForwardGpuBegin(const Scene& scene,
     // participating medium present (the device gates the per-step branch on the same).
     s->cs.beamGather = beamGather && nc > 1 && !scene.media.empty();
     s->cs.beamOrderMax = pbeams::gOrderMax;   // -beams-order (host twin: Renderer::beamOrderMax)
+    // A moving camera set, under a blur: every thread poses its own copy of every camera at its
+    // photon's time, a buffer of threads x cameras that a big flight can make larger than the card
+    // has free. Made once for the session, here, where the flight can still fly on the CPU.
+    if (s->cs.camMoves) {
+        const int effHeroC = forwardHeroC(heroC, s->up.sc.mediaN != 0, s->up.sc.hasGrin != 0);
+        const long long threads = forwardRunsWavefront(wavefront, effHeroC, s->cs.beamsOn())
+                                ? (long long)wavefrontSlots(1ll << 40) : (long long)kFwdBlockSize * kFwdNumBlocks;
+        const size_t need = (size_t)threads * (size_t)nc;
+        size_t freeB = 0, totalB = 0;
+        cudaMemGetInfo(&freeB, &totalB);
+        if (need * sizeof(DCamera) > freeB / 2 || cudaMalloc(&s->d_posed, need * sizeof(DCamera)) != cudaSuccess) {
+            cudaGetLastError();
+            s->d_posed = nullptr;
+            std::fprintf(stderr, "[device] a blurred shared flight poses its %d cameras at each photon's time in "
+                                 "%.2f GB of device memory, more than half the %.2f GB free; using CPU\n",
+                         nc, (double)(need * sizeof(DCamera)) / 1e9, (double)freeB / 1e9);
+            sharedForwardGpuEnd(s);
+            return nullptr;
+        }
+        s->posedCap = need;
+    }
     return s;
 }
 
@@ -24483,7 +24533,7 @@ void sharedForwardGpuBatch(SharedGpuSession* s, long long N,
                            unsigned long long seedBase, bool diffraction) {
     if (!s || N <= 0) return;
     launchForward(s->up, s->cs, s->d_energy, N, diffraction, seedBase,
-                  s->wavefront, s->camModeInt, s->heroC);
+                  s->wavefront, s->camModeInt, s->heroC, false, &s->d_posed, &s->posedCap);
 }
 
 void sharedForwardGpuHits0(SharedGpuSession* s, std::vector<double>& hits) {
@@ -24515,6 +24565,7 @@ void sharedForwardGpuEnd(SharedGpuSession* s) {
     freeUpload(s->up);
     for (int c = 0; c < s->nc; ++c) { cudaFree(s->d_films[c]); cudaFree(s->d_hits[c]); }
     cudaFree(s->d_energy);
+    if (s->d_posed) cudaFree(s->d_posed);
     delete s;
 }
 
@@ -26848,7 +26899,13 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         stage->report(label, 0, Nq, nullptr, 0.0);
         // 1 M is small enough to be a sub-second probe on any card that can run this at all,
         // and large enough to keep ~262 k threads busy rather than measuring launch latency.
-        long long chunk = (Nq < (1ll << 20)) ? Nq : (1ll << 20);
+        // FTRACE_DEPOSIT_CHUNK=K pins every chunk to K photons instead (determinism triage: one
+        // seed must deposit one map whatever the chunks).
+        static const long long forcedChunk = [] {
+            const char* e = std::getenv("FTRACE_DEPOSIT_CHUNK");
+            return (e && *e) ? std::atoll(e) : 0LL;
+        }();
+        long long chunk = forcedChunk > 0 ? forcedChunk : ((Nq < (1ll << 20)) ? Nq : (1ll << 20));
         for (long long off = 0; off < Nq; ) {
             const long long cs2 = (off + chunk <= Nq) ? chunk : (Nq - off);
             const auto t0 = std::chrono::steady_clock::now();
@@ -26865,7 +26922,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             // Retarget ~1 s of work, but never shrink below the probe (a chunk that keeps
             // halving turns the deposit into launch overhead) and never grow more than 4x at
             // a step (one anomalously fast chunk must not produce a 10-minute next one).
-            if (sec > 1e-4) {
+            if (forcedChunk <= 0 && sec > 1e-4) {
                 double want = (double)cs2 / sec;              // photons/s -> photons per 1 s
                 if (want > 4.0 * (double)chunk) want = 4.0 * (double)chunk;
                 chunk = (long long)want;
