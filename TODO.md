@@ -70,10 +70,46 @@ measurement. A test that says "this instrument cannot answer this question" is t
 ## 4. Everything open in `known-issues.md` that should be fixed
 
 Listed 2026-10-16 from an entry-by-entry read of `known-issues.md` (its 2026-09-10 audit is the last
-time every entry was checked against the code). **Not started: the user asked for the list first.**
+time every entry was checked against the code); the entries opened since, to 2026-11-04, added then.
 Each line names its entry by ID or by a phrase of its heading, so `grep` finds it; the entry has the
 detail. Mark a line `[x]` with the version when it is fixed, and mark the entry DONE in the same
 commit.
+
+### 4.0 Order of work (2026-11-04: the user asked for them most important first)
+
+Wrong images in the modes most used come first, then the build, then speed, then debt and scope.
+Each names the section its line is in.
+
+1. **MERGE-PROXIMITY** (4.2) — every photon gather (M, S, U, J) takes photons from any surface in
+   its radius: a table top gathers the floor's light.
+2. **HAZE-SUN-B** (4.2) — mode B lights an unbounded sunlit haze at 0.16 of mode R.
+3. **VCM-SPEC** and **SPPM-SPECTRAL** (4.2) — modes U and S merge at the camera's wavelength, so a
+   coloured surface seen before a merge washes out (the fix mode J got in 0.386.1, JSPEC).
+4. **MODEM-GPU-CORNER** (4.2) — GPU mode M reads a box's corner 15 % bright.
+5. **VCOL-BDPT-GPU** (4.2) — GPU modes D and J connect to a vertex-coloured mesh without its colours.
+6. **MODEM-BEAM-CARRIER**, **JSPEC-GAPS**' rest and **MODEM-REDPASS** (4.2) — mode M's beams, and
+   mode J's last camera-side factors, at the camera's wavelength.
+7. **UPBP-BEAM-RADIUS** with **J-FOG-REALCAM** (4.3) — mode J's beam kernel never shrinks: fog 1-4 %
+   low, never converging.
+8. **GLTF-ROUGHNESS-MAP** and **GLTF-MAP-MEAN-GUTTERS** (4.2) — glTF imports rougher than glTF means,
+   and their mean metalness and roughness counting the atlas gutters.
+9. **FWD-GLOSSY-INDIRECT** (4.2) — modes A and B leave a rough reflector black in a mirror or
+   through glass.
+10. **CPU-ONLY-BUILD** (4.4) — a build without CUDA does not compile.
+11. **BLUR-EPOCH-COST** (4.5) — a blurred clock-budgeted mode M or J spends its clock rebuilding.
+12. **UPBP-W-CHROMATIC** (4.3) — mode J's beam weight mixes two wavelengths in a chromatic medium.
+13. **FEATHER-IS-A-THRESHOLD** (4.2) — `feather` shrinks a cloud instead of ramping it; the fix
+    changes `gallery_rain`'s cloud edges, so show the user before it lands.
+14. **GLOSSY-SAMPLE-SITES** (4.4) — the interference factor applied by hand at two dozen sites.
+15. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.
+16. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
+17. **P-HEROSPLIT-FIRST**, **ROUGH-IRID-AIR** (4.3) — narrow estimator gaps.
+18. **REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.
+19. **BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.
+20. **DEFORM-LIMITS**, **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
+21. **BLACK-PIXELS-ONCE** (4.2) — one render's black pixels, never reproduced.
+
+Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever touches its entries.
 
 ### 4.1 Decisions the user owes (each blocks its fix)
 
@@ -89,12 +125,36 @@ commit.
   now refuses the three).
 - [x] **Rendering a scene without `-camera` also renders its 600-frame flyby** — left to judgement;
   stills by default, paths by name (0.383.0).
+- [ ] **COMPOTE-NO-CAUSTIC** — under the 20° sun the gem compote's ruby bowl absorbs the light that
+  made its caustic under the old 45° sun, and no cap fixes it: move the compote, change the bowl,
+  or accept it?
 - [ ] **GLOW-LIGHT-MODES** — a glow with no emitter lights nothing in R/M/S/B, part of itself in
   D/J, all of itself in U; mode P runs away on it (x368). The fix is to register emitters for
   emissive analytic primitives (4.6's first line), which makes `gallery_rain`'s grid lines light
   the scene: does the grid keep glowing unlit (a material flag), or does the scene get rebalanced?
 
 ### 4.2 Wrong, missing or silent output
+
+- [ ] **MERGE-PROXIMITY** — a density estimate gathers photons from every surface within its radius
+  (only a facing test filters them); mode M's adaptive radius makes that a large leak.
+- [ ] **HAZE-SUN-B** — mode B lights an unbounded sunlit haze at 0.163 of mode R, its floor 0.846.
+- [ ] **VCM-SPEC** — mode U's merges read the camera path's colours at the camera's wavelength.
+- [ ] **MODEM-GPU-CORNER** — GPU mode M reads one corner of a box 15 % bright (and two smaller
+  one-block residuals).
+- [ ] **VCOL-BDPT-GPU** — GPU modes D/J shade a vertex-coloured mesh without its colour in every
+  connection (`DVertex` does not carry `vcol`).
+- [ ] **MODEM-BEAM-CARRIER** — mode M's beam gather reads the camera's spectral factors at its
+  wavelength.
+- [ ] **JSPEC-GAPS**, its still-open list — `aGlassCam` in the gather, support where a factor is
+  zero at the camera's wavelength, dispersive refraction without `-jdispall`.
+- [ ] **MODEM-REDPASS** — mode M reads a fog lit through a red-pass glass 8 % low in green.
+- [ ] **FWD-GLOSSY-INDIRECT** — modes A and B splat a rough reflector only where it is seen directly
+  (and a layered clearcoat's sheen on neither backend).
+- [ ] **GLTF-MAP-MEAN-GUTTERS** — the importer's mean metalness and roughness count the atlas's
+  gutters.
+- [ ] **FEATHER-IS-A-THRESHOLD** — a mesh-bound medium's `feather` shrinks the silhouette instead of
+  ramping the density.
+- [ ] **BLACK-PIXELS-ONCE** — one GPU mode-R render had pure-black pixels four reruns did not.
 
 - [ ] **D-SILENT-EXIT** — one host mode-D render ended with no output and no image during a CUDA
   build; 13 reruns clean. The checks now print the exit code; reproduce under memory pressure.
@@ -125,8 +185,9 @@ commit.
 - [ ] **"`cavity` reads 0 in BOTH preview rasterizers"** — not mechanical.
 - [ ] **"mode `W` is NOT noise-free at `-spp 1` when the scene has a medium"** — the fog term is
   still a Monte-Carlo free flight.
-- [ ] **"freshly CMake-configured build dirs produce a GPU-silently-dead ftrace.exe"** — black
-  renders with no CUDA error; affects every fresh clone.
+- [x] **"freshly CMake-configured build dirs produce a GPU-silently-dead ftrace.exe"** (0.385.0) —
+  the host STL's float `copysign` compiled to a device function returning 0; `build.bat` runs the
+  device probe after every build.
 - [ ] **"Headless-spawned `-window` render on gallery.ftsl hangs with no output"** — to investigate
   (compare CLAUDE.md's note on the sandbox's non-interactive window station).
 - [ ] **"`scenes/gallery_settled.ftsl` OOMs — but ONLY when the 600-frame flyby is in the camera
@@ -152,6 +213,14 @@ commit.
 - [ ] **"`python -m loom.viewer` prints a runpy double-import RuntimeWarning"** (cosmetic).
 
 ### 4.3 Estimator approximations and accuracy debt
+
+- [ ] **UPBP-BEAM-RADIUS** — mode J's beam kernel never shrinks, so its O(r) blur bias never goes
+  away; **J-FOG-REALCAM** (realcam in fog 2-4 % low) is the same blur, larger.
+- [ ] **UPBP-W-CHROMATIC** — in a chromatic medium a beam merge's weight mixes two wavelengths and
+  the frame tilts in colour.
+- [ ] **P-HEROSPLIT-FIRST** — blurred mode P under `-herosplit` files a sample by the hero's first
+  event alone.
+- [ ] **ROUGH-IRID-AIR** — a rough interference reflector always interferes against air.
 
 - [ ] **BDPT-MIS-TR** — mode D's MIS weights take every connection edge's transmittance as 1 in a
   medium.
@@ -180,6 +249,12 @@ commit.
   1669x-peaked connection residual in shared BDPT machinery. Characterised, no fix proposed yet.
 
 ### 4.4 Tech debt
+
+- [ ] **CPU-ONLY-BUILD** — a build without CUDA does not compile (`main.cpp` names device-only types
+  outside `#ifdef HAVE_CUDA`).
+- [ ] **GLOSSY-SAMPLE-SITES** — the interference factor is applied by hand at every glossy sampler.
+- [ ] **REMAP0-IMPOSSIBLE** — the MIS sums read a zero density as a delta's, whatever made it zero
+  (only the sun's is special-cased).
 
 - [ ] **GPU-STACK-DRIFT** — every kernel's stack reservation moves when unrelated device code changes.
 - [ ] **SLAB-DDA-COPIES** — the box clip and the grid walk are written out several times.
@@ -210,6 +285,15 @@ commit.
 
 ### 4.5 Performance
 
+- [ ] **BLUR-EPOCH-COST** — a blurred clock epoch of mode M or J rebuilds its light side every 4
+  samples (the entry's catch: mode M's caustic map rebuilds at a fixed neighbour count).
+- [ ] **JSPEC-CARRIER-SIZE** — every mode-J GPU thread reserves a 120-byte spectral carrier per
+  segment and per eye vertex, chromatic scene or not.
+- [ ] **RADCACHE-BATCHES** — under `-radcache` a fixed budget's CPU batches follow its samples, not
+  the clock: `-stop` and the periodic writes wait, and a resume reschedules.
+- [ ] **BEAMEPOCHS-CHUNK-PIN** — `-beamepochs` pins the GPU chunks to 1 spp, which costs a cheap
+  scene.
+
 - [ ] **FIRE-NEE-STRATA-COST** — one fire light sample costs up to 32 traversals.
 - [ ] **Fire births** (EMISSIVE-VOLUME-SILENT's efficiency debt) — drawn uniformly over the box;
   drawing them from mode R's emission grid (`EmissiveVolume::cellW`) makes beta nearly constant.
@@ -229,6 +313,12 @@ commit.
   again.
 
 ### 4.6 Missing features and scoped follow-ups
+
+- [ ] **DEFORM-LIMITS** — a dynamic elastic must be first in its mesh's stack.
+- [ ] **MOTION-LIGHT-RIGID** — a spot, beam or aimed light its keys stretch unevenly, and a sun or
+  sky in a moving group, stay at the instant.
+- [ ] **PER-OBJECT-MODES** — emissive surfaces and bare mesh instances cannot be tagged; only D and
+  J route (U and the unidirectional modes are separate renderers).
 
 - [ ] **An emissive `quad` / isosurface / CSG solid glows but does not illuminate** (two entries:
   "KNOWN LIMITATION" and "LIMITATION (2026-08-02)") — register emitters for them. Waits on the
