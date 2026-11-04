@@ -10001,8 +10001,8 @@ sees the instant, exactly as a static scene with those transforms would show it.
   the instant: the ray is carried back through the inverse of its motion at the path's time
   (`rayToInstant` — an affine map keeps the parameter t), and the hit carried out again
   (`hitToMoved`: point, normals by the inverse transpose, tangent, handedness, curvature and
-  fibre radius by the mean scale, coordinate reach). An isosurface's march steps along a unit
-  direction, so its carried ray is renormalised and its t scaled to match. The BLAS leaves are
+  fibre radius by the mean scale, coordinate reach). An isosurface's march measures its steps by
+  the ray direction's own length, so a carried ray needs no renormalising. The BLAS leaves are
   untouched: a moving instance moves as a whole. `buildMoveTrees` boxes these three kinds by
   their instant box carried by each transform's eight corners.
 - **The shutter is the camera's** (`Camera::shutterOpen/Close`, frames). Mode R's `renderRows`
@@ -10042,15 +10042,20 @@ sees the instant, exactly as a static scene with those transforms would show it.
 - **The camera moves by keys of its own** (0.408.0): `Camera::motion` (a `CameraMotion`: poses
   — eye, look-at point, up, fov — at keys spread evenly over [a, b] frames, blended linearly by
   `CameraMotion::at`). Its eye, axes and fields of view stay its pose at the instant, which is
-  what everything outside a path's own time reads; a path at a time poses a per-thread copy
-  (`Camera::poseAt`, a `lookAt` at the blended pose plus a stereo eye's `eyeShiftU`) and hands
-  that copy to whatever it calls — mode R's ray, BDPT's subpaths and connections, a photon's
-  splats, the guide pass, the forward sky. `seesMotion` is true for a moving camera even in a
-  still scene. The loader fills it from a camera's `motion { key { … } }` over the scene's
-  interval (`readCameraMotion`; the instant's pose is the keys' there), or, for every frame of
-  a camera path with a shutter, from a uniform Catmull-Rom through the frames' poses over the
-  frame's own shutter (`keyPathFrames`; a frame is a frame apart in time, so frame i at time t
-  is the path at i + t). The resume guard mixes the keys.
+  what everything outside a path's own time reads; a path at a time asks a per-thread
+  `PosedCamera` (camera.h) for the camera at its time — the camera itself, or, when the
+  renderer's paths have times and the camera moves, a copy posed by `Camera::poseAt` (a
+  `lookAt` at the blended pose plus a stereo eye's `eyeShiftU`) — and hands that to whatever it
+  calls: mode R's ray, BDPT's subpaths and connections, a photon's splats (in a shared flight
+  only the cameras that see motion are posed), the guide pass, the forward sky. `seesMotion` is
+  true for a moving camera even in a still scene, but `-radcache` stays on there (only a moving
+  scene mixes times in a cell). The loader fills it from a camera's `motion { key { … } }` over
+  the scene's interval (`readCameraMotion`; the instant's pose is the keys' there), or, for
+  every frame of a camera path with a shutter, from a uniform Catmull-Rom through the frames'
+  poses over the frame's own shutter (`keyPathFrames`; a frame is a frame apart in time, so
+  frame i at time t is the path at i + t). Keys that all agree are no motion. The resume guard
+  mixes the keys. A key's `fov_y` changes the view only; the aperture and focus stay the
+  instant's (known-issues MOTION-ZOOM-APERTURE).
 - **Where blur is not yet carried, the shutter is closed**, so no estimator mixes times: the
   camera loop in `main.cpp` closes it for every mode `modeSeesMotion` does not name — M, S, U
   and J (which share photons or merges across paths), P (whose per-pixel classification is made

@@ -14893,6 +14893,18 @@ static bool g_furFieldsBuilt = false;
 static void buildFurFields(const Scene& scene) {
     if (g_furFieldsBuilt) return;
     g_furFieldsBuilt = true;
+    // The fields hold the strands where they sit at the instant, and a medium does not move: a
+    // coat whose strands move is traced as strands (ROADMAP 11), its options said to be ignored.
+    if (g_furVolume || g_dualGrid) {
+        for (const CurveSeg& cs : scene.curveSegs)
+            if (cs.motion >= 0 && cs.matId >= 0 && cs.matId < (int)scene.mats.size() &&
+                scene.mats[(size_t)cs.matId].type == MatType::Hair) {
+                std::printf("[ignore] %s: the coat moves, and its density fields could only hold it "
+                            "at the frame's instant -- traced as strands instead\n",
+                            g_furVolume ? "-fur-volume" : "-dual-grid");
+                return;
+            }
+    }
     const bool gridForDual = g_dualGrid && g_dualScatter;
     if (g_dualGrid && !g_dualScatter)
         std::printf("[ignore] -dual-grid does nothing without -dual-scatter (it only "
@@ -15558,9 +15570,8 @@ static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam,
     const double perPixel = (double)N / ((double)rx * (double)ry * (double)std::max(1, nCamsSharing));
     const int K = (int)std::clamp(perPixel / 16.0, 1.0, 64.0);
     const double share = (double)N / (double)K;
-    const bool lensed = cam.hasLens(), camMoves = cam.moves();
-    Camera camT;                        // a moving camera, posed at each sample's time
-    if (camMoves) camT = cam;
+    const bool lensed = cam.hasLens();
+    PosedCamera posed(cam, true);       // a moving camera, at each sample's time
     for (int py = y0; py < y1; ++py)
         for (int px = 0; px < rx; ++px) {
             const uint64_t pix = (uint64_t)py * (uint64_t)rx + (uint64_t)px;
@@ -15573,8 +15584,7 @@ static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam,
                 tU -= std::floor(tU);
                 const double tFrames = cam.shutterTime(tU);
                 const MotionTimeScope at(scene.motionU(tFrames));
-                if (camMoves) cam.poseAt(tFrames, camT);
-                const Camera& cp = camMoves ? camT : cam;
+                const Camera& cp = posed.at(tFrames);
                 const double jx = rng.uniform(), jy = rng.uniform();
                 Ray r;
                 double w = 1.0, lambda = 0.0;
@@ -15651,16 +15661,15 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
         // Motion blur (ROADMAP 11): each photon, and its splat to the camera, at one time in the
         // shutter, drawn off its own stream -- a moving camera posed there on this thread's copy.
         const bool blur = cam && cam->seesMotion(scene);
-        const bool camMoves = blur && camPtr && cam->moves();
-        Camera camT;
-        if (camMoves) camT = *cam;
+        static const Camera kNoCamera;   // both arms lvalues: `posed` keeps a pointer
+        PosedCamera posed(cam ? *cam : kNoCamera, blur && camPtr);
         for (long long i = lo; i < hi; ++i) {
             seedUnit(rng, seedBase + (uint64_t)i, 0x9E3779B97F4A7C15ULL);
             const double tFrames = blur ? cam->shutterTime(
                 unitTime(seedBase + (uint64_t)i, 0x3C6EF372FE94F82BULL)) : 0.0;
             const MotionTimeScope at(blur ? scene.motionU(tFrames) : -1.0);
-            if (camMoves) cam->poseAt(tFrames, camT);
-            r.tracePhoton(scene, camMoves ? &camT : camPtr, sensorFilm, camFilm, rng, reports[tid]);
+            r.tracePhoton(scene, posed.moves() ? &posed.at(tFrames) : camPtr, sensorFilm, camFilm,
+                          rng, reports[tid]);
         }
         // ...and, under a blur, this thread's band of the sky the camera sees directly (mode C
         // catches the sky's photons through its pupil instead).
@@ -15705,13 +15714,14 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
     int nc = (int)cams.size();
     // One time per photon serves every camera only when they share a shutter or see nothing move
     // (run's joinFlight groups them so); any other flight would render cameras at wrong times.
-    for (int c = 1; c < nc; ++c)
-        if ((cams[c].seesMotion(scene) || cams[0].seesMotion(scene)) &&
-            (cams[c].shutterOpen != cams[0].shutterOpen || cams[c].shutterClose != cams[0].shutterClose)) {
-            std::fprintf(stderr, "internal error: a shared forward flight holds cameras with different "
-                                 "shutters\n");
-            std::exit(3);
-        }
+    for (int c = 0; c < nc; ++c)
+        for (int d = c + 1; d < nc; ++d)
+            if ((cams[c].seesMotion(scene) || cams[d].seesMotion(scene)) &&
+                (cams[c].shutterOpen != cams[d].shutterOpen || cams[c].shutterClose != cams[d].shutterClose)) {
+                std::fprintf(stderr, "internal error: a shared forward flight holds cameras with "
+                                     "different shutters\n");
+                std::exit(3);
+            }
     // Per-thread × per-camera films (each thread accumulates into its own copies to
     // avoid shared-pixel races; merged per camera at the end).
     std::vector<std::vector<Film>> films(nThreads, std::vector<Film>(nc));
@@ -15734,16 +15744,17 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
         std::vector<CamTarget> targets(nc);
         for (int c = 0; c < nc; ++c) { targets[c].cam = &cams[c]; targets[c].film = &films[tid][c]; }
-        std::vector<Camera> posed;   // this thread's copies of the moving cameras, posed per photon
         // One time per photon for every camera: a caller hands this only cameras that share one
         // shutter or that see nothing move (run's `joinFlight`), so a photon is drawn a time
-        // off cams[0]'s shutter when any of them sees motion.
+        // off cams[0]'s shutter when any of them sees motion -- and only a camera that sees
+        // motion is posed at it (one without a shutter renders its instant).
         bool blur = false, anyMoves = false;
         for (int c = 0; c < nc; ++c) blur = blur || cams[c].seesMotion(scene);
-        if (blur) {
-            posed = cams;
-            for (int c = 0; c < nc; ++c)
-                if (cams[c].moves()) { targets[c].cam = &posed[(size_t)c]; anyMoves = true; }
+        std::vector<PosedCamera> posed;   // this thread's, one per camera
+        posed.reserve((size_t)nc);
+        for (int c = 0; c < nc; ++c) {
+            posed.emplace_back(cams[c], cams[c].seesMotion(scene));
+            anyMoves = anyMoves || posed.back().moves();
         }
         for (long long i = lo; i < hi; ++i) {
             seedUnit(rng, seedBase + (uint64_t)i, 0x9E3779B97F4A7C15ULL);
@@ -15752,7 +15763,7 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
             const MotionTimeScope at(blur ? scene.motionU(tFrames) : -1.0);
             if (anyMoves)
                 for (int c = 0; c < nc; ++c)
-                    if (cams[c].moves()) cams[c].poseAt(tFrames, posed[(size_t)c]);
+                    if (posed[(size_t)c].moves()) targets[c].cam = &posed[(size_t)c].at(tFrames);
             r.tracePhoton(scene, targets.data(), nc, /*sensorFilm*/nullptr, rng, reports[tid]);
         }
         // ...and, under a blur, this thread's band of each camera's directly seen sky.
@@ -15813,9 +15824,10 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
     // does not depend on how the OS scheduled the threads. `into != nullptr` is the
     // interactive viewer's band-at-a-time preview; it shares the same table, which is exactly
     // what makes the preview get cheaper as you look around.
-    // Not under motion blur: a cell's value would mix every time in the shutter, and a path at one
-    // time would read radiance from the others.
-    const bool blurred = cam.seesMotion(scene);
+    // Not under motion blur of the scene: a cell's value would mix every time in the shutter, and
+    // a path at one time would read radiance from the others. A camera moving through a still
+    // scene changes nothing a cell holds.
+    const bool blurred = cam.timed() && scene.hasMotion();
     if (g_radCache && blurred) {
         static bool said = false;
         if (!said) { said = true; std::printf("[radcache] off: motion blur renders without the radiance cache\n"); }
@@ -27449,9 +27461,13 @@ static int run(int argc, char** argv) {
     auto joinFlight = [&](std::vector<std::vector<int>>& flights, int i) {
         const Camera& c = toRender[(size_t)i].cam;
         for (std::vector<int>& f : flights) {
-            const Camera& c0 = toRender[(size_t)f[0]].cam;
-            if ((c.shutterOpen == c0.shutterOpen && c.shutterClose == c0.shutterClose) ||
-                (!c.seesMotion(scene) && !c0.seesMotion(scene))) { f.push_back(i); return; }
+            bool fits = true;   // with every member, not only the first
+            for (int j : f) {
+                const Camera& m = toRender[(size_t)j].cam;
+                fits = fits && ((c.shutterOpen == m.shutterOpen && c.shutterClose == m.shutterClose) ||
+                                (!c.seesMotion(scene) && !m.seesMotion(scene)));
+            }
+            if (fits) { f.push_back(i); return; }
         }
         flights.push_back({i});
     };

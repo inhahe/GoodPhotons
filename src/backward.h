@@ -4029,12 +4029,9 @@ struct BackwardRenderer {
         // Motion blur (ROADMAP 11): each camera path sees the scene at one time in the shutter,
         // set for everything the path traces -- its bounces, shadow rays, probes -- through
         // g_motionU. The time comes off its own lattice and its own salted stream, so the main
-        // rng draws exactly what it draws without blur. A moving camera is posed at that time too
-        // (camT, this call's own copy).
+        // rng draws exactly what it draws without blur. A moving camera is posed at that time too.
         const bool blur = cam0.seesMotion(scene);
-        const bool camMoves = blur && cam0.moves();
-        Camera camT;
-        if (camMoves) camT = cam0;
+        PosedCamera posed(cam0, blur);
         for (int py = y0; py < y1; ++py) {
             for (int px = 0; px < film.resX; ++px) {
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)film.resX + (uint64_t)px;
@@ -4048,8 +4045,7 @@ struct BackwardRenderer {
                     const uint64_t sIdx = sampleBase + (uint64_t)s;   // absolute sample index
                     const double tFrames = blur ? cam0.shutterTime(shutterU(sIdx, tPhase)) : 0.0;
                     const MotionTimeScope pathTime(blur ? scene.motionU(tFrames) : -1.0);
-                    if (camMoves) cam0.poseAt(tFrames, camT);
-                    const Camera& cam = camMoves ? camT : cam0;
+                    const Camera& cam = posed.at(tFrames);
                     Pcg32 rng;
                     seedUnit(rng, sIdx * nPix + pixIdx, 0xD1B54A32D192ED03ULL);
                     if (useHero) {

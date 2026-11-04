@@ -47,7 +47,11 @@ cube whose keys scale and shear it together. It requires:
     and asked for the GPU it says it stays on the CPU. The middle frame of a straight, even
     `camera_path` with a shutter blurs as the mean of the eyes half a frame either side. The
     loader refuses camera keys without a `motion_interval`, a single key, and a key's `fov_y` on
-    a camera whose `lens` sets its view.
+    a camera whose `lens` sets its view. A key without `fov_y` keeps the camera's own (the same
+    render as the key writing it); a keyed camera without a shutter, rendered in a flight beside
+    one that blurs, stays sharp; a moving camera keeps `-radcache` in a still scene; keys that all
+    agree are a still camera (it renders on the GPU); and `-fur-volume` steps aside for a coat
+    whose strands move.
   * The loader refuses, with a message naming why: a `motion` block with no `motion_interval`; one
     with a single key; `translate` beside `motion`; fur on, or a medium bounded by, a moving
     object; an interval that excludes the instant; `shutter_close` before `shutter_open`. It keeps
@@ -549,6 +553,21 @@ def main():
         rc, log = run([exe, "-in", p, "-parseonly"])
         verdict(name, rc != 0 and phrase in log, "" if rc != 0 and phrase in log else log.strip()[-300:])
 
+    # --- a moving coat cannot be summarised by the still density fields: -fur-volume steps aside ---
+    hair = os.path.join(out, "hair.ftsl")
+    write(hair, NL.join([
+        "scene { units meters  motion_interval -0.5 0.5 }",
+        'material "h" { type hair  sigma_a 0.02  beta_m 0.35  beta_n 0.35  alpha 3.0 }',
+        LIGHT,
+        "group { motion { key { translate 0 0 0 } key { translate 0.3 0 0 } }  curve { material h  "
+        "basis linear  radius 0.003  point 0 0.4 0  point 0.05 0.8 0 } }",
+        'camera "c" { eye 0 0.6 2  look_at 0 0.6 0  up 0 1 0  fov_y 30  shutter_open -0.5  '
+        'shutter_close 0.5  film { res 32 32 } }']) + NL)
+    rc, log = run([exe, "-in", hair, "-mode", "R", "-device", "cpu", "-spp", "1", "-fur-volume", "-no-meter",
+                   "-o", os.path.join(out, "hair.png")])
+    verdict("-fur-volume steps aside for a moving coat, saying so",
+            rc == 0 and "the coat moves" in log, "" if rc == 0 and "the coat moves" in log else log.strip()[-300:])
+
     # --- -checkbvh across the motion interval ---
     p = os.path.join(out, "bvh.ftsl")
     write(p, bvh_scene(cube_obj))
@@ -869,6 +888,63 @@ def camera_tests(exe, out, verdict, devices):
                                     "-spp", str(SPP_T)], seed=100 * j + s)[0]) / TIMES
     good, detail = agree(fb, fm)
     verdict("a camera path's frame blurs along its path", good, detail)
+
+    # --- a key that sets no fov_y keeps the camera's own: the same render as the key setting it ---
+    keys_part = ('camera "c" { up 0 1 0  fov_y 40  shutter_open -0.5  shutter_close 0.5  motion { '
+                 'key { eye %s  look_at %s  fov_y 30 }  key { eye %s  look_at %s%s } }  film { res %d %d } }')
+    ka = (v3(CAM_KEYS[0]["eye"]), v3(CAM_KEYS[0]["look"]), v3(CAM_KEYS[1]["eye"]), v3(CAM_KEYS[1]["look"]))
+    pa, pb = os.path.join(out, "cam_fov_a.ftsl"), os.path.join(out, "cam_fov_b.ftsl")
+    write(pa, with_camera(still, keys_part % (ka + ("", W, H))))
+    write(pb, with_camera(still, keys_part % (ka + ("  fov_y 40", W, H))))
+    fargs = ["-mode", "R", "-device", "cpu", "-spp", "16"]
+    _, raw_a, _ = render(exe, out, pa, "cam_fov_a", fargs)
+    _, raw_b, _ = render(exe, out, pb, "cam_fov_b", fargs)
+    verdict("a key without fov_y keeps the camera's own", raw_a == raw_b)
+
+    # --- in a flight with a blurring camera, a keyed camera without a shutter stays sharp ---
+    mixed = os.path.join(out, "cam_mixed.ftsl")
+    cams = NL.join(['camera "s" { eye 0 1.0 4.2  look_at 0 0.5 0  up 0 1 0  fov_y 40  shutter_open -0.5  '
+                    'shutter_close 0.5  film { res %d %d } }' % (W, H),
+                    keyed_camera().replace('camera "c"', 'camera "k"'),
+                    keyed_camera((-0.5, 0.5)).replace('camera "c"', 'camera "m"')])
+    write(mixed, with_camera(still, cams))
+    alone = os.path.join(out, "cam_alone.ftsl")
+    write(alone, with_camera(still, still_camera(cam_pose(0.5))))
+    km, ka2 = [], []
+    for sd in (1, 2):
+        png = os.path.join(out, "cam_mixed_s%d.png" % sd)
+        for c in "skm":
+            for ext in (".png", ".pfm"):
+                f = png[:-4] + "_" + c + ext
+                if os.path.exists(f):
+                    os.remove(f)
+        rc, log = run([exe, "-in", mixed, "-seed", str(sd), "-hdr", "-no-meter", "-o", png, "-mode", "B",
+                       "-device", "cpu", "-n", "40000000"])
+        if rc != 0:
+            print(log[-2000:])
+            raise SystemExit("render failed: " + mixed)
+        km.append(lum(read_pfm(png[:-4] + "_k.pfm")))
+        ka2.append(lum(render(exe, out, alone, "cam_alone_s%d" % sd, ["-mode", "B", "-device", "cpu", "-n",
+                                                                      "40000000"], seed=sd)[0]))
+    good, detail = agree(km, ka2, 0.05)
+    verdict("... a keyed camera without a shutter stays sharp beside one that blurs", good, detail)
+
+    # --- a camera moving through a still scene keeps -radcache, and keys that agree are no
+    # motion: such a camera renders on the GPU ---
+    rc, log = run([exe, "-in", moving, "-mode", "R", "-device", "cpu", "-spp", "4", "-radcache", "-no-meter",
+                   "-o", os.path.join(out, "cam_radcache.png")])
+    verdict("... and keeps -radcache in a still scene", rc == 0 and "[radcache] off" not in log,
+            "" if rc == 0 and "[radcache] off" not in log else log.strip()[-300:])
+    if len(devices) > 1:
+        agree_keys = ('camera "c" { up 0 1 0  fov_y 40  shutter_open -0.5  shutter_close 0.5  motion { '
+                      'key { eye 0 1 4.2  look_at 0 0.5 0 }  key { eye 0 1 4.2  look_at 0 0.5 0 } }  '
+                      'film { res %d %d } }' % (W, H))
+        pk = os.path.join(out, "cam_agree.ftsl")
+        write(pk, with_camera(still, agree_keys))
+        rc, log = run([exe, "-in", pk, "-mode", "R", "-device", "gpu", "-spp", "1", "-no-meter",
+                       "-o", os.path.join(out, "cam_agree.png")])
+        verdict("keys that agree are a still camera (it renders on the GPU)",
+                rc == 0 and "-> GPU" in log, "" if rc == 0 and "-> GPU" in log else log.strip()[-300:])
 
     # --- what the loader refuses ---
     for name, sc, cam, phrase in (

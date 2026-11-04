@@ -249,11 +249,9 @@ inline Images render(const Scene& scene, const Camera& cam, int W, int H, int si
     // denoiser edges the image does not have. Drawn after the subpixel jitter, so a scene the
     // camera sees still draws exactly what it drew before.
     const bool timed = cam.seesMotion(scene);
-    const bool camMoves = timed && cam.moves();
     const bool ok = ft::parallelFor((size_t)H, 1, [&](size_t row) {
         const int py = (int)row;
-        Camera camT;                       // a moving camera, posed at each guide ray's time
-        if (camMoves) camT = cam;
+        PosedCamera posed(cam, timed);     // a moving camera, at each guide ray's time
         for (int px = 0; px < W; ++px) {
             const size_t i = (size_t)py * W + px;
             Pcg32 rng;
@@ -265,8 +263,7 @@ inline Images render(const Scene& scene, const Camera& cam, int W, int H, int si
                     const double ts = timed ? ((sy * side + sx) + rng.uniform()) / ((double)side * side)
                                             : 0.0;
                     const MotionTimeScope at(timed ? scene.motionU(cam.shutterTime(ts)) : -1.0);
-                    if (camMoves) cam.poseAt(cam.shutterTime(ts), camT);
-                    const Camera& c = camMoves ? camT : cam;
+                    const Camera& c = posed.at(cam.shutterTime(ts));
                     Ray ray;
                     if (c.hasLens()) {
                         double w = 0.0;

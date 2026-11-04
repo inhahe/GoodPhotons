@@ -4360,10 +4360,7 @@ struct BdptRenderer {
         // so the paths are the ones it always took. FTRACE_JSPEC=0 turns it off for A/B runs.
         const bool jSpecOn = (mergeOn || surfOn) && jSpecEnabled();
         const bool blurD = cam0.seesMotion(scene) && !mergeOn && !surfOn;
-        // A moving camera is posed at each sample's time on this call's own copy.
-        const bool camMoves = blurD && cam0.moves();
-        Camera camT;
-        if (camMoves) camT = cam0;
+        PosedCamera posed(cam0, blurD);   // a moving camera, at each sample's time
         if (jSpecOn) jsw.trSpec = anyMediumSigmaTChromatic(scene);
         // FTRACE_J_HALF (diagnostic): 1 = connections only, 2 = merges only. Deliberately
         // does NOT touch the merge constants — both halves keep the SAME MIS weights they
@@ -4407,8 +4404,7 @@ struct BdptRenderer {
                     const double tFrames =
                         blurD ? cam0.shutterTime(unitTime(unit, 0x3C6EF372FE94F82BULL)) : 0.0;
                     const MotionTimeScope pathTime(blurD ? scene.motionU(tFrames) : -1.0);
-                    if (camMoves) cam0.poseAt(tFrames, camT);
-                    const Camera& cam = camMoves ? camT : cam0;
+                    const Camera& cam = posed.at(tFrames);
                     HeroBundle hb;
                     // The wavelengths come from the illuminant's density, the fires' emission
                     // included (Scene::camSampler; without a fire it is emitSampler), so a fire

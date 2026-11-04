@@ -1840,21 +1840,13 @@ struct Scene {
         return lightMoves(em) ? motionNowInverse(em.motion).apply(p) : p;
     }
 
-    // A moving isosurface. Its march steps in distance along a unit direction, so the ray carried
-    // back is renormalised and its parameters scaled to match (k: instant length per unit t).
+    // A moving isosurface (its march measures steps by the ray direction's own length, so the
+    // carried ray needs no renormalising).
     FT_NOINLINE bool intersectMovingImplicit(const Ray& r, const Implicit& im, double tmin, Hit& h,
                                              const PatTables* tabs, bool anyHit) const {
         const Affine Dinv = motionNowInverse(im.motion);
-        Ray lr = rayToInstant(Dinv, r);
-        const double k = length(lr.d);
-        if (!(k > 0.0)) return false;
-        lr.d = lr.d * (1.0 / k);
-        Hit lh = h;
-        lh.t = h.t * k;
-        if (!intersectImplicit(lr, im, tmin * k, lh, tabs, anyHit)) return false;
-        lh.t /= k;
-        if (!anyHit) hitToMoved(motionNow(im.motion), Dinv, im.motion, lh);
-        h = lh;
+        if (!intersectImplicit(rayToInstant(Dinv, r), im, tmin, h, tabs, anyHit)) return false;
+        if (!anyHit) hitToMoved(motionNow(im.motion), Dinv, im.motion, h);
         return true;
     }
     FT_NOINLINE bool intersectMovingCurve(const Ray& r, const CurveSeg& cs, double tmin, Hit& h,
@@ -3583,12 +3575,11 @@ struct Scene {
         const int nT = (int)tris.size(), nS = (int)spheres.size();
         // Isosurfaces, curve segments and instances are boxed by their instant box carried by
         // each transform (its eight corners): an affine image of the box holds the moved shape.
-        std::vector<Aabb> allBox;
         std::vector<int> others;   // their global numbers
+        std::vector<Aabb> otherBox;   // and their instant boxes
         for (int g = nT + nS; g < (int)(tris.size() + spheres.size() + implicits.size() +
                                         curveSegs.size() + instances.size()); ++g)
-            if (primMotion(g) >= 0) others.push_back(g);
-        if (!others.empty()) collectPrimBoxes(allBox, /*dropHair=*/false, nullptr);
+            if (primMotion(g) >= 0) { others.push_back(g); otherBox.push_back(otherPrimBox(g)); }
         const auto carried = [](const Aabb& b, const Affine& D, Aabb& into) {
             for (int c = 0; c < 8; ++c)
                 into.expand(D.apply(Vec3{(c & 1) ? b.hi.x : b.lo.x, (c & 2) ? b.hi.y : b.lo.y,
@@ -3601,7 +3592,7 @@ struct Scene {
             for (const Sphere& sp : spheres) movS += (sp.motion >= 0);
             const int strideO = std::max(1, (int)others.size() / 2048);
             for (size_t j = 0; j < others.size(); j += (size_t)strideO) {
-                const Aabb& still = allBox[(size_t)others[j]];
+                const Aabb& still = otherBox[j];
                 const MotionKeys& mk = motionSets[(size_t)primMotion(others[j])];
                 Aabb sweep;
                 for (int k = 0; k < mk.keys; ++k) carried(still, motionXf[(size_t)(mk.first + k)], sweep);
@@ -3681,10 +3672,10 @@ struct Scene {
                 }
                 boxes.push_back(b); mp.push_back(nT + i);
             }
-            for (int g : others) {
+            for (size_t j = 0; j < others.size(); ++j) {
                 Aabb b;
-                for (const Affine& D : windows[(size_t)primMotion(g)]) carried(allBox[(size_t)g], D, b);
-                boxes.push_back(b); mp.push_back(g);
+                for (const Affine& D : windows[(size_t)primMotion(others[j])]) carried(otherBox[j], D, b);
+                boxes.push_back(b); mp.push_back(others[j]);
             }
             bvhMove[(size_t)k].build(boxes);
         }
@@ -3921,17 +3912,28 @@ struct Scene {
         // One TLAS leaf per instance: the BLAS's local bounding box transformed into
         // world space (union of its 8 transformed corners — the tightest world AABB
         // of a rotated box short of re-bounding the actual triangles).
-        for (const auto& inst : instances) {
-            const Aabb& lb = blasList[inst.blasId].localBounds;
-            Aabb wb;
-            for (int c = 0; c < 8; ++c) {
-                Vec3 corner{ (c & 1) ? lb.hi.x : lb.lo.x,
-                             (c & 2) ? lb.hi.y : lb.lo.y,
-                             (c & 4) ? lb.hi.z : lb.lo.z };
-                wb.expand(inst.toWorld.apply(corner));
-            }
-            keep(wb); ++g;
-        }
+        for (const auto& inst : instances) { keep(instanceBox(inst)); ++g; }
+    }
+    // An instance's world box at the instant: its asset's local box carried by toWorld (the union
+    // of the 8 carried corners -- the tightest box of a turned box short of re-bounding its
+    // triangles).
+    Aabb instanceBox(const MeshInstance& inst) const {
+        const Aabb& lb = blasList[(size_t)inst.blasId].localBounds;
+        Aabb wb;
+        for (int c = 0; c < 8; ++c)
+            wb.expand(inst.toWorld.apply(Vec3{(c & 1) ? lb.hi.x : lb.lo.x, (c & 2) ? lb.hi.y : lb.lo.y,
+                                              (c & 4) ? lb.hi.z : lb.lo.z}));
+        return wb;
+    }
+    // Global primitive `g`'s box at the instant, for an isosurface, a curve segment or an instance
+    // (as collectPrimBoxes boxes it).
+    Aabb otherPrimBox(int g) const {
+        g -= (int)(tris.size() + spheres.size());
+        if (g < (int)implicits.size()) return implicits[(size_t)g].bounds;
+        g -= (int)implicits.size();
+        if (g < (int)curveSegs.size()) return curveSegBounds(curveSegs[(size_t)g]);
+        g -= (int)curveSegs.size();
+        return instanceBox(instances[(size_t)g]);
     }
 
     void buildBvh() {

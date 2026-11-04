@@ -87,6 +87,19 @@ narrow API speak UTF-8, then audit the `std::filesystem::path(std::string)` / `.
 for UTF-8 (`u8path`, `u8string`); or read argv as UTF-16 (`wmain`) and keep paths as
 `std::filesystem::path` throughout.
 
+## OPEN (2026-11-03, 0.410.1): MOTION-ZOOM-APERTURE — a camera's zoom across the shutter keeps the instant's aperture and focus
+
+A camera's motion keys carry `fov_y` (and a camera path's frames carry theirs), but the thin
+lens behind it — `apertureR`, `lensF`, `filmDist`, derived once by `deriveCameraOptics` from the
+instant's fov, `fstop` and `focus` — is the instant's at every time. So a zoom at a fixed
+f-number does not widen and narrow its aperture with the focal length, and depth of field in
+modes A and C matches no f-number through most of the shutter. A camera_curve's `fstop_at`,
+`focus_at` and `zoom_at` tracks hold each frame's value over its shutter too. Reproduce:
+`camera { fstop 2.8  motion { key { fov_y 20 } key { fov_y 60 } } }` in mode A, with a shutter.
+Proper fix: carry the optics in `CameraPose` (the focal length, aperture radius and focus
+distance, or the f-number and focus to re-derive them from) and have `Camera::poseAt` set them;
+`keyPathFrames` would then blend them from the frames' own.
+
 ## OPEN (2026-11-03, 0.410.0): MOTION-LIGHT-RIGID — a light that its keys would scale or shear, an aimed area light, and a sun or sky in a moving group stay at the instant
 
 Lights move since 0.410.0, but only rigidly (`Emitter::motion`, `Scene::lightPointNow`): under a

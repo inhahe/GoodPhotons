@@ -804,3 +804,25 @@ struct Camera {
         return lensImage(P, ray.d, px, py);
     }
 };
+
+// A camera as each path sees it (ROADMAP 11): the camera itself, or -- for paths that have times
+// and a camera that moves -- a copy of its own posed at each path's time. Each renderer holds
+// one per thread and asks it once per path.
+class PosedCamera {
+public:
+    // `timed`: whether this renderer's paths have times for this camera (it sees motion, in a
+    // mode that carries it).
+    PosedCamera(const Camera& c, bool timed) : base_(&c), moves_(timed && c.moves()) {
+        if (moves_) copy_ = c;
+    }
+    const Camera& at(double frames) {
+        if (!moves_) return *base_;
+        base_->poseAt(frames, copy_);
+        return copy_;
+    }
+    bool moves() const { return moves_; }
+private:
+    const Camera* base_;
+    bool moves_;
+    Camera copy_;
+};

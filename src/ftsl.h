@@ -6945,6 +6945,7 @@ private:
         // [first, end) ranges to move, of triangles, spheres, isosurfaces, curve segments and
         // instances.
         std::vector<std::pair<size_t, size_t>> tris, sphs, imps, segs, insts;
+        std::vector<Aabb> blasBox;   // instanced assets' local boxes, as needed
         Aabb box;
         // A child that adds lights moves only if they all can: no sky or sun (they are not
         // anywhere), no aimed panel, and -- known once the keys are made, below -- rigid keys.
@@ -6979,10 +6980,15 @@ private:
             for (size_t i = a.curveSegs; i < z.curveSegs; ++i) box.expand(curveSegBounds(S.curveSegs[i]));
             for (size_t i = a.instances; i < z.instances; ++i) {
                 const MeshInstance& inst = S.instances[i];
-                for (const Tri& t : S.blasList[(size_t)inst.blasId].tris) {
-                    box.expand(inst.toWorld.apply(t.v0)); box.expand(inst.toWorld.apply(t.v1));
-                    box.expand(inst.toWorld.apply(t.v2));
-                }
+                if (blasBox.size() < S.blasList.size()) blasBox.resize(S.blasList.size());
+                Aabb& lb = blasBox[(size_t)inst.blasId];   // the asset's local box, made once
+                if (!(lb.lo.x <= lb.hi.x))
+                    for (const Tri& t : S.blasList[(size_t)inst.blasId].tris) {
+                        lb.expand(t.v0); lb.expand(t.v1); lb.expand(t.v2);
+                    }
+                for (int c = 0; c < 8; ++c)
+                    box.expand(inst.toWorld.apply(Vec3{(c & 1) ? lb.hi.x : lb.lo.x, (c & 2) ? lb.hi.y : lb.lo.y,
+                                                       (c & 4) ? lb.hi.z : lb.lo.z}));
             }
         }
         for (const auto& [a, z] : lit) {   // their extent shapes the keys like any other mover's
@@ -8888,6 +8894,18 @@ private:
     // spread evenly over the scene's motion_interval (ROADMAP 11), each blended linearly to the
     // next. What a key leaves out is the camera's own statement. The camera's own pose becomes the
     // keys' at the frame's instant; `keyFov` says which keys gave a fov_y of their own.
+    // Whether any of `keys` differs from the first: keys that all agree are a camera standing still
+    // (no motion, so nothing it renders asks for a time).
+    static bool posesMove(const std::vector<CameraPose>& keys) {
+        for (const CameraPose& p : keys) {
+            const CameraPose& q = keys[0];
+            if (p.eye.x != q.eye.x || p.eye.y != q.eye.y || p.eye.z != q.eye.z ||
+                p.look.x != q.look.x || p.look.y != q.look.y || p.look.z != q.look.z ||
+                p.up.x != q.up.x || p.up.y != q.up.y || p.up.z != q.up.z || p.fovY != q.fovY)
+                return true;
+        }
+        return false;
+    }
     bool readCameraMotion(const Block& b, Loaded& L, CamSpec& cs,
                           std::shared_ptr<CameraMotion>& out, std::vector<char>& keyFov) {
         const Stmt* mo = find(b, "motion");
@@ -8919,6 +8937,7 @@ private:
         if (m->keys.size() < 2) { fail(who + "give `motion` at least two `key` blocks"); return false; }
         const CameraPose now = m->at(0.0);
         cs.eye = now.eye; cs.look = now.look; cs.up = now.up; cs.fov = now.fovY;
+        if (!posesMove(m->keys)) return true;   // keys that agree: a still camera there
         out = std::move(m);
         return true;
     }
@@ -8947,8 +8966,11 @@ private:
                      "view its lens sets (`lens <mm>`, `zoom`, a preset or a `lens { }` block)");
                 return false;
             }
-            for (size_t k = 0; k < motion->keys.size(); ++k)
-                if (!keyFov[k]) motion->keys[k].fovY = cs.fov;
+            // With no key setting it, every key takes the view the camera's statements (a lens
+            // among them) resolved to; a key that sets none beside one that does kept the camera's
+            // own fov_y when it was read.
+            if (!anyFov)
+                for (CameraPose& p : motion->keys) p.fovY = cs.fov;
             cs.motion = std::move(motion);
         }
         std::string md = strOf(b, "mode");
@@ -9063,7 +9085,9 @@ private:
             for (int k = 0; k < K; ++k)
                 m->keys.push_back(poseAtFrame((double)i + (K == 1 ? cs.shutterOpen
                                                                 : cs.shutterOpen + span * k / (K - 1))));
-            cs.motion = std::move(m);
+            // A path that holds still over this frame's shutter is no motion, unless its one key
+            // is an instantaneous shutter away from the instant (a sharp frame at another time).
+            if (K > 1 ? posesMove(m->keys) : cs.shutterOpen != 0.0) cs.motion = std::move(m);
         }
     }
 
