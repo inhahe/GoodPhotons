@@ -39,6 +39,7 @@ Three neighbouring documents cover what this one only summarises:
   - [Spectral representation vs. other renderers](#spectral-representation-vs-other-renderers)
 - [Lights](#lights)
 - [Geometry](#geometry)
+  - [Deforming a mesh (`deform`)](#deforming-a-mesh-deform)
   - [Curves and fibers (`curve`)](#curves-and-fibers-curve)
   - [Grooms (`fur`)](#grooms-fur)
   - [Implicit surfaces (`isosurface`)](#implicit-surfaces-isosurface)
@@ -3626,6 +3627,42 @@ GPU: the guarantee needs the edge functions' two products to stay *unfused*, and
 default fused multiply-add was silently breaking the antisymmetry, so a mesh edge that landed
 dead on a column of pixel centres let the background through. See `known-issues.md`.)
 
+### Deforming a mesh (`deform`)
+
+A `mesh` may carry `deform falloff`, `deform rbf` and `deform elastic` blocks (since 0.413.0;
+grammar in [FTSL.md §8.4.1](FTSL.md)). Each moves the vertices it loaded by **handles**: points
+on the rest mesh moved to targets. They apply in order, each to the last one's output.
+
+- **`falloff`** moves the vertices within each handle's `radius` by its move, faded by a
+  profile of the distance. It's local, cheap and predictable, but it stretches.
+- **`rbf`** is the smooth field that takes every handle's point exactly to its target. Handles
+  moved by one rotation or scale move the mesh exactly so. It's good for broad, smooth shape
+  changes driven by a few points.
+- **`elastic`** holds each handle's vertices at their targets and lets the rest follow like
+  rubber, keeping every patch as rigid as the handles allow (as-rigid-as-possible). A bar bent
+  by its tip curls rather than stretching: on `tools/check_deform.py`'s bar its worst edge strain
+  is a third of falloff's for the same move.
+
+**Animated and blurred.** A handle's `to` may be keyed (`motion { key { to … } … }` over the
+scene's `motion_interval`). Every deformer is then evaluated at every key on the same rest
+mesh, and each triangle carries its corners at each key, so a camera with a shutter blurs the
+deformation exactly. The guide pass (`-write-aovs`) carries a deforming surface's motion
+vectors. loom animates the handles: `DeformedMesh(file, [Elastic([Handle(at, to=signal,
+radius=r)])])`.
+
+**Dynamic elastic.** `deform elastic { dynamic { cache "…_%04d.ftec"  frame N  mass …  stiffness …
+damping … } … }` adds inertia, so the surface lags, overshoots and settles. It is a simulation,
+so a shot is baked once in frame order: `ftrace -bake-elastic <scene%04d.ftsl> <first> <last>`
+writes a record per frame, and each frame renders from its own record. A bake can resume from
+any frame whose predecessor's record exists, and a resumed bake writes byte for byte what one
+bake writes. A frame not yet baked, or baked for another mesh or settings, says so and does not
+render. loom's shot runner bakes on its own before rendering when the scene has one
+(`Elastic(…, dynamic=Dynamics(…))`).
+
+`-export-tris <file.obj>` writes the scene's triangles as loaded (every transform and deformer
+applied) and exits, and `-export-tris-at <frames>` writes them at another time in the shutter.
+It's useful for checking a deformation, or for taking one into another tool.
+
 ### Curves and fibers (`curve`)
 
 A `curve` is a **strand**: control points plus a radius, for hair, fur, grass, wire,
@@ -6380,6 +6417,8 @@ survive exactly.
 | `-r <res>` / `-r <W> <H>` | Output resolution (overrides scene default); one value = square, two = non-square film |
 | `-o <path>` | Output image (`.png` / `.jpg` / `.ppm` by extension). Missing parent directories are created before the render starts (reported as `[out] created output directory …`), so a render aimed at a fresh `png/<series>/` subdir can't be traced to completion and then lost at write time. Mode `V` produces a *pair* of images (the two independent estimates it cross-checks) and writes them as `<out>_forward` / `<out>_backward` beside the given path |
 | `-topng <in> <out.png> [-ev <c>] [-exposure-anchor <v\|file>] [-hdr] [-denoise …] [-oidn … [-oidn-guides <stem>]]` | Convert an existing `.ppm` or `.ftbuf` to a 24-bit PNG (no rendering); `-ev` re-develops a `.ftbuf` brighter/darker, `-exposure-anchor` develops it at a **shared** gain so a whole sequence of checkpoints can be re-developed flicker-free, `-hdr` writes the developed linear image as a PFM too, the `-denoise` flags filter its chroma first, and `-oidn` denoises it (with a render's saved guides via `-oidn-guides`; see **Learned denoising**). Any other flag is an error. See **Output** |
+| `-bake-elastic <scene%04d.ftsl> <first> <last>` | Simulate a shot's dynamic elastics (`deform elastic { dynamic { … } }`) in frame order, writing each frame's cache record; no rendering. See **Deforming a mesh** under **Geometry** |
+| `-export-tris <file.obj>` (and `-export-tris-at <frames>`) | Write the scene's triangles as loaded — every transform and deformer applied — as an OBJ, at the frame's instant or at a time in frames from it, then exit (no render). Instanced assets' triangles are not included |
 | `-denoise-shot <svgf\|optix\|oidn\|none> <in%04d.pfm> <out%04d.png> <first> <last> [-exposure <e>] [-passes <n>] [-alpha <a>] [-clamp <g>]` | Denoise a shot's frames in order, each against the history of those before it (no rendering): frames rendered with `-hdr -write-aovs`. See **Temporal denoising of a shot** under **Output** |
 | `-review <base>` | Play a directory of already-rendered frames (`<base><digits>.<ext>`, e.g. `png/swoop/swoop`) on the live window/timeline — scrub/Play, re-time by painting speed, and Save a re-paced copy (no rendering); see the fly-viewer section |
 | `-shot <scene.py>` | **Render a loom file as a shot** (ROADMAP 11). Hands the timeline to loom's shot runner (`python -m loom.shot`, [tools/loom/README.md](tools/loom/README.md) → *Shots*), which builds each frame's scene from the file's `build` contract — with motion keys when there is a shutter — and renders it with this binary into `png/<name>/` (the frame's `.ftsl` beside its image), skipping a frame whose checkpoint already holds the requested `-spp`, so rerunning the command resumes the shot. Shot flags: `-frames A B` (render only those frames), `-shot-length N` (frames in the timeline; else the file's `FRAMES`), `-fps F`, `-open` / `-loop`, `-shutter O C` (the camera's shutter, frames; else the file's `SHUTTER`), `-motion A B KEYS` (else keys spanning the shutter), `-no-motion`, `-name`, `-outdir`, `-mp4` (assemble `<name>.mp4`), `-func NAME` (another build callable), `-no-window`. Every other flag goes to each frame's render (`-spp`, `-mode`, …); each frame also gets `-window-min`. `ftrace -stop <pid>` on the shot stops the frame in progress cleanly (it keeps its image and checkpoint) and starts no other. Each frame is its own ftrace process (about 0.6 s of start-up each). |

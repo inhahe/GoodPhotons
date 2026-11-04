@@ -1,0 +1,261 @@
+// The dynamic elastic (ROADMAP 11 stage E): an as-rigid-as-possible surface with inertia,
+// stepped through a shot in frame order and kept, frame by frame, in a cache the frames read.
+//
+// `deform elastic { dynamic { cache "png/shot/jelly_%04d.ftec"  frame 12 ... } handle { ... } }`
+// on a mesh. `ftrace -bake-elastic <scene%04d.ftsl> <first> <last>` loads each frame's scene in
+// order; at a dynamic elastic the loader then continues the simulation from the frame before's
+// record (or from rest, the handles' first targets solved quasi-statically, when there is none),
+// through the frame's motion keys, and writes the frame's record. A render reads its frame's
+// record and takes the mesh at each key from it: frames stay independently renderable once baked,
+// and a bake resumes from any frame whose predecessor's record exists.
+//
+// The step is implicit (projective-dynamics style): the inertial guess y = x + h v, then the
+// ARAP energy plus (mass / (stiffness h^2)) * sum of m_i |x_i - y_i|^2 minimised by
+// deform::Arap::solve, the handles' vertices held at their targets; the velocity is the step's
+// move over h, less `damping` of it per second. h is in seconds (frames / fps), so `mass` and
+// `stiffness` are a material's: a larger mesh of one material wobbles more slowly, as it should.
+//
+// A record holds the mesh at each of its frame's keys and the state at its last key (positions,
+// velocities, the held vertices' targets), in float32, and the key of everything it was baked
+// from (rest mesh, handles, settings): a record baked for something else is refused. The state a
+// bake carries from one frame to the next is the record's own, rounded to float32, so a bake run
+// in one go and one resumed part-way write the same files.
+#pragma once
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+#include "deform.h"
+#include "geometry.h"
+
+namespace elastic {
+
+// Whether this process is baking (`-bake-elastic`): the loader then simulates and writes records
+// rather than reading them.
+inline bool g_baking = false;
+
+struct Params {
+    double mass = 1.0;        // per unit area
+    // The wobble's frequency grows as sqrt(stiffness / mass) and falls with the mesh's size: at
+    // the defaults a 2 m bar rings at about 2 Hz, and 2e5 makes it about 6 Hz.
+    double stiffness = 2.0e4; // the ARAP energy's weight
+    double damping = 0.9;     // the share of velocity lost per second
+    double fps = 24.0;        // frames per second: a frame's length in time
+    int substeps = 8;         // steps per frame
+    int iterations = 8;       // ARAP rounds per step
+};
+
+struct Record {
+    uint64_t key = 0;                       // what it was baked from (see keyOf)
+    long long frame = 0;
+    std::vector<double> times;              // its keys' times, frames from its instant
+    std::vector<std::vector<Vec3>> pos;     // the mesh at each key
+    std::vector<Vec3> vel;                  // the velocities at its last key, m/s
+    std::vector<Vec3> target;               // the held vertices' targets at its last key
+};
+
+// FNV-1a over bytes, for the record's key.
+struct Hasher {
+    uint64_t h = 14695981039346656037ULL;
+    void bytes(const void* p, size_t n) {
+        const unsigned char* c = (const unsigned char*)p;
+        for (size_t i = 0; i < n; ++i) h = (h ^ c[i]) * 1099511628211ULL;
+    }
+    void d(double v) { bytes(&v, sizeof v); }
+    void i(long long v) { bytes(&v, sizeof v); }
+};
+
+// The key of a dynamic elastic: its rest mesh, its triangles, which vertices each handle holds,
+// and its settings. Targets are not in it -- they are what changes from frame to frame.
+inline uint64_t keyOf(const std::vector<Vec3>& rest, const std::vector<std::array<int, 3>>& tris,
+                      const std::vector<char>& held, const Params& P) {
+    Hasher h;
+    h.i((long long)rest.size());
+    for (const Vec3& v : rest) { h.d(v.x); h.d(v.y); h.d(v.z); }
+    h.i((long long)tris.size());
+    for (const auto& t : tris) { h.i(t[0]); h.i(t[1]); h.i(t[2]); }
+    h.bytes(held.data(), held.size());
+    h.d(P.mass); h.d(P.stiffness); h.d(P.damping); h.d(P.fps); h.i(P.substeps); h.i(P.iterations);
+    return h.h;
+}
+
+// `pat` with frame number `k` in its one integer conversion (%d, %04d, ...), or false for a
+// pattern with none, more than one, or another conversion.
+inline bool framePath(const std::string& pat, long long k, std::string& out) {
+    int convs = 0;
+    for (size_t i = 0; i < pat.size(); ++i) {
+        if (pat[i] != '%') continue;
+        if (i + 1 < pat.size() && pat[i + 1] == '%') { ++i; continue; }
+        size_t j = i + 1;
+        while (j < pat.size() && pat[j] >= '0' && pat[j] <= '9') ++j;
+        if (j >= pat.size() || pat[j] != 'd') return false;
+        ++convs;
+    }
+    if (convs != 1) return false;
+    std::vector<char> buf(pat.size() + 32);
+    std::snprintf(buf.data(), buf.size(), pat.c_str(), (int)k);
+    out = buf.data();
+    return true;
+}
+
+inline Vec3 f32(const Vec3& v) { return Vec3{(double)(float)v.x, (double)(float)v.y, (double)(float)v.z}; }
+
+// ---- the file ----------------------------------------------------------------------------
+// "FTEC", u32 version 1, u64 key, i64 frame, u32 vertices, u32 keys, f64 times[keys],
+// f32 xyz pos[keys][vertices], f32 xyz vel[vertices], f32 xyz target[vertices].
+inline bool write(const std::string& path, const Record& r, std::string& err) {
+    const std::string tmp = path + ".part";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) { err = "cannot write " + tmp; return false; }
+    const uint32_t ver = 1, nv = (uint32_t)r.vel.size(), nk = (uint32_t)r.times.size();
+    const int64_t fr = r.frame;
+    bool ok = std::fwrite("FTEC", 1, 4, f) == 4 && std::fwrite(&ver, 4, 1, f) == 1 &&
+              std::fwrite(&r.key, 8, 1, f) == 1 && std::fwrite(&fr, 8, 1, f) == 1 &&
+              std::fwrite(&nv, 4, 1, f) == 1 && std::fwrite(&nk, 4, 1, f) == 1 &&
+              std::fwrite(r.times.data(), 8, nk, f) == nk;
+    std::vector<float> buf((size_t)nv * 3);
+    const auto put = [&](const std::vector<Vec3>& v) {
+        for (size_t i = 0; i < nv; ++i) { buf[3 * i] = (float)v[i].x; buf[3 * i + 1] = (float)v[i].y; buf[3 * i + 2] = (float)v[i].z; }
+        return std::fwrite(buf.data(), sizeof(float), buf.size(), f) == buf.size();
+    };
+    for (uint32_t k = 0; ok && k < nk; ++k) ok = put(r.pos[k]);
+    ok = ok && put(r.vel) && put(r.target);
+    ok = (std::fclose(f) == 0) && ok;
+    if (!ok) { std::remove(tmp.c_str()); err = "writing " + path + " failed"; return false; }
+    std::remove(path.c_str());
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) { err = "cannot rename " + tmp + " to " + path; return false; }
+    return true;
+}
+
+// False with `err` empty when the file does not exist, else with the reason it is unreadable.
+inline bool read(const std::string& path, Record& r, std::string& err) {
+    err.clear();
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char magic[4];
+    uint32_t ver = 0, nv = 0, nk = 0;
+    int64_t fr = 0;
+    bool ok = std::fread(magic, 1, 4, f) == 4 && !std::memcmp(magic, "FTEC", 4) &&
+              std::fread(&ver, 4, 1, f) == 1 && ver == 1 && std::fread(&r.key, 8, 1, f) == 1 &&
+              std::fread(&fr, 8, 1, f) == 1 && std::fread(&nv, 4, 1, f) == 1 &&
+              std::fread(&nk, 4, 1, f) == 1 && nk >= 1 && nk <= 4096 && nv <= 100000000u;
+    if (ok) {
+        r.frame = fr;
+        r.times.resize(nk);
+        ok = std::fread(r.times.data(), 8, nk, f) == nk;
+    }
+    std::vector<float> buf((size_t)nv * 3);
+    const auto get = [&](std::vector<Vec3>& v) {
+        if (std::fread(buf.data(), sizeof(float), buf.size(), f) != buf.size()) return false;
+        v.resize(nv);
+        for (size_t i = 0; i < nv; ++i) v[i] = Vec3{buf[3 * i], buf[3 * i + 1], buf[3 * i + 2]};
+        return true;
+    };
+    if (ok) {
+        r.pos.resize(nk);
+        for (uint32_t k = 0; ok && k < nk; ++k) ok = get(r.pos[k]);
+        ok = ok && get(r.vel) && get(r.target);
+    }
+    std::fclose(f);
+    if (!ok) err = path + " is not an elastic cache record (or is truncated)";
+    return ok;
+}
+
+// ---- the simulation ----------------------------------------------------------------------
+// Advance `x`, `v` by `h` seconds towards the held vertices' targets `tgt`: one implicit step.
+// False if a stop arrived part-way.
+[[nodiscard]] inline bool step(const deform::Arap& arap, const std::vector<char>& held, const std::vector<Vec3>& tgt,
+                 double h, const Params& P, std::vector<Vec3>& x, std::vector<Vec3>& v) {
+    const size_t n = x.size();
+    std::vector<Vec3> y(n), xn(n);
+    for (size_t i = 0; i < n; ++i) y[i] = x[i] + v[i] * h;
+    xn = y;
+    if (!arap.solve(held, tgt, xn, P.iterations, P.mass / (P.stiffness * h * h), &y)) return false;
+    const double keep = std::pow(std::max(0.0, 1.0 - P.damping), h);
+    for (size_t i = 0; i < n; ++i) {
+        v[i] = (xn[i] - x[i]) * (keep / h);
+        x[i] = xn[i];
+    }
+    return true;
+}
+
+// Run from state (`x`, `v`, targets `t0`) at absolute time `a` (frames) to `b`, the targets moving
+// linearly to `t1`, in about P.substeps steps a frame. False if a stop arrived part-way.
+[[nodiscard]] inline bool run(const deform::Arap& arap, const std::vector<char>& held, const std::vector<Vec3>& t0,
+                const std::vector<Vec3>& t1, double a, double b, const Params& P,
+                std::vector<Vec3>& x, std::vector<Vec3>& v) {
+    if (!(b > a)) return true;
+    const int n = std::max(1, (int)std::lround((b - a) * P.substeps));
+    const double h = (b - a) / n / P.fps;
+    std::vector<Vec3> tgt(t0.size());
+    for (int s = 1; s <= n; ++s) {
+        const double f = (double)s / n;
+        for (size_t i = 0; i < tgt.size(); ++i) tgt[i] = t0[i] + (t1[i] - t0[i]) * f;
+        if (!step(arap, held, tgt, h, P, x, v)) return false;
+    }
+    return true;
+}
+
+// Bake one frame: `rest` and `tris` the mesh, `held` the handles' vertices, `targets[k]` their
+// targets at each of the frame's keys (`times`, frames from its instant), `prev` the frame
+// before's record or null. Fills `out`; false (`err`) when the frames' intervals overlap.
+inline bool bakeFrame(const std::vector<Vec3>& rest, const std::vector<std::array<int, 3>>& tris,
+                      const std::vector<char>& held, const std::vector<std::vector<Vec3>>& targets,
+                      const std::vector<double>& times, long long frame, const Params& P,
+                      const Record* prev, Record& out, std::string& err) {
+    deform::Arap arap;
+    arap.build(rest, tris);
+    const size_t K = times.size();
+    std::vector<Vec3> x, v;
+    std::vector<Vec3> lastT;
+    double t = (double)frame + times[0];
+    if (prev) {
+        const double tPrev = (double)prev->frame + prev->times.back();
+        if (tPrev > t + 1e-9) {
+            err = "frame " + std::to_string(frame) + "'s keys begin before frame " +
+                  std::to_string(prev->frame) + "'s end: a dynamic elastic needs a motion interval no "
+                  "longer than a frame (-0.5 0.5, say)";
+            return false;
+        }
+        x = prev->pos.back();
+        v = prev->vel;
+        lastT = prev->target;
+        if (!run(arap, held, lastT, targets[0], tPrev, t, P, x, v)) {   // the gap between frames, if any
+            err = "stopped by request";
+            return false;
+        }
+    } else {
+        // From rest, still: the handles' first targets, met quasi-statically.
+        x = rest;
+        if (!arap.solve(held, targets[0], x, std::max(1, P.iterations * 4), 0.0, nullptr, /*fromRest*/true)) {
+            err = "stopped by request";
+            return false;
+        }
+        v.assign(rest.size(), Vec3{0, 0, 0});
+    }
+    out = Record{};
+    out.frame = frame;
+    out.times = times;
+    out.pos.resize(K);
+    out.pos[0] = x;
+    for (size_t k = 1; k < K; ++k) {
+        if (!run(arap, held, targets[k - 1], targets[k], (double)frame + times[k - 1], (double)frame + times[k],
+                 P, x, v)) {
+            err = "stopped by request";
+            return false;
+        }
+        out.pos[k] = x;
+    }
+    // Rounded as the file keeps it, so a bake resumed from the file continues from the same state.
+    for (auto& p : out.pos) for (Vec3& q : p) q = f32(q);
+    out.vel.resize(v.size());
+    for (size_t i = 0; i < v.size(); ++i) out.vel[i] = f32(v[i]);
+    out.target.resize(targets[K - 1].size());
+    for (size_t i = 0; i < out.target.size(); ++i) out.target[i] = f32(targets[K - 1][i]);
+    return true;
+}
+
+}  // namespace elastic

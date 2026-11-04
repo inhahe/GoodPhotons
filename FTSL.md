@@ -1878,6 +1878,74 @@ A **planar** emissive mesh is never touched by `auto` (its signed volume is ~0),
 splitting an enclosure into one `mesh` block per flat face also works — `tools/furnace_rig.py`
 does that — though `emit_orient keep` is now the direct way to say it.
 
+#### 8.4.1 `deform` — moving a mesh's vertices by handles (since 0.413.0)
+
+A `mesh` may carry `deform` blocks. Each moves the vertices the block loaded, in order, each one
+working on the last one's output. A **handle** is a point `at` on the rest mesh moved `to` a
+target. Both are in scene coordinates, with the mesh's own `translate` / `rotate` / `scale`
+already applied. A handle with no `to` holds still.
+
+```
+mesh "bar" { file "meshes/bar.obj"  material rubber
+    deform falloff { profile smooth                      # smooth (default) | linear | gaussian
+        handle { at 1 0 0  to 1 0.4 0  radius 0.6 } }
+    deform rbf { kernel biharmonic                       # | triharmonic | gaussian | multiquadric
+        handle { at 0 0 0 }  handle { at 2 0 0  to 2.1 0.2 0 } }
+    deform elastic { iterations 30
+        handle { at 0 0 0  radius 0.12 }                 # the root, held
+        handle { at 2 0 0  to 1.7 0.8 0  radius 0.12 } } # the tip, bent up
+}
+```
+
+| deformer | what it does |
+|---|---|
+| `falloff` | each handle moves the vertices within its `radius` by its own move, weighted by `profile` of the distance (1 at the handle, 0 at the rim, smooth there for `smooth` and `gaussian`); the handles' moves add |
+| `rbf` | the smooth displacement field that takes every handle's point exactly to its target: a radial-basis interpolant (`kernel`; `eps` is the width of `gaussian` and `multiquadric`) plus an affine part over the space the handles span. So handles moved by one rotation, scale or shear move the mesh exactly so, on a flat sheet too |
+| `elastic` | as-rigid-as-possible (Sorkine & Alexa 2007): each handle holds the vertices within its `radius` at its move, and the rest of the surface follows like rubber, every vertex's neighbourhood kept as close to a rotation of its rest shape as the handles allow. `iterations` (default 30) rounds of local rotations and a global solve |
+
+The mesh's corners are welded by position first, so a seam with split normals or UVs moves as
+one. Each corner's authored normal turns with its vertex's normal.
+
+**Motion blur.** A handle whose target changes across the frame gives `to` in `motion { key { to
+x y z } … }`, spread evenly over the scene's `motion_interval` (§2) with one key at the frame's
+instant. Every keyed handle of a mesh needs the same number of keys. Each deformer is then
+evaluated at every key on the same rest mesh, so every vertex has a path of its own through the
+shutter, and a camera with a shutter blurs the deformation exactly (§13.1). A deforming mesh
+cannot sit inside a moving `group`: move it with its handles instead. A glowing mesh keeps its
+instant's shape at every time, with a warning, since a light moves only rigidly.
+
+**Dynamic elastic.** `deform elastic { dynamic { … } … }` gives the surface inertia: it lags
+behind its handles, overshoots and settles. That is a simulation stepped through time, so it is
+baked once, in frame order, into a cache each frame then reads. Each frame is still renderable on
+its own once the cache exists.
+
+```
+deform elastic {
+    dynamic { cache "png/shot/jelly_%04d.ftec"  frame 12        # this scene is frame 12 of the shot
+              mass 1  stiffness 20000  damping 0.9  fps 24  substeps 8  iterations 8 }
+    handle { at 0 0 0  to 0 0.3 0  radius 0.12 } }
+```
+
+| key | default | meaning |
+|---|---|---|
+| `cache` | *(required)* | where the frames' records go, with one frame number in it (`%04d`) |
+| `frame` | *(required)* | which frame of the shot this scene is |
+| `mass` | 1 | per unit area |
+| `stiffness` | 20000 | how firmly the surface keeps its shape. The wobble's frequency grows as √(stiffness / mass) and falls with the mesh's size: at the defaults a 2 m bar rings at about 2 Hz, and 2e5 makes it about 6 Hz |
+| `damping` | 0.9 | the share of its velocity it loses per second (0–1): 0.9 settles in a second or two, lower rings on |
+| `fps` | 24 | frames per second, so the simulation steps in seconds. A larger mesh of the same material wobbles more slowly, as a real one does |
+| `substeps` | 8 | simulation steps per frame |
+| `iterations` | 8 | as-rigid-as-possible rounds per step |
+
+`ftrace -bake-elastic <scene%04d.ftsl> <first> <last>` loads each frame's scene in order. At each
+dynamic elastic it continues the simulation from the frame before's record, or from rest when
+there is none, through the frame's motion keys, and writes the frame's record. A bake resumed
+part-way writes byte for byte what one bake writes. A frame with no record, or one baked for
+another mesh, handles or settings, refuses to load and says so. A dynamic elastic must be its
+mesh's first deformer, and a frame's motion interval may span at most one frame (`-0.5 0.5`, say).
+loom's `DeformedMesh` / `Elastic(dynamic=Dynamics(…))` writes all this, and its shot runner bakes
+before it renders.
+
 ### 8.5 `mesh_asset` + `mesh_instance` — instancing (two-level BVH)
 
 A `mesh` bakes its triangles into the scene, so ten copies cost ten triangle

@@ -250,6 +250,16 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
     ftrace = Path(ftrace) if ftrace is not None else find_ftrace()
     ftsl_paths = emit_frames(scene, frames, outdir, name, fps=fps, loop=loop, motion=motion,
                              frame_range=frame_range)
+    # A dynamic elastic is simulated through the shot once, in frame order, before any frame
+    # renders (ftrace -bake-elastic writes each frame's cache record; the frames read them).
+    from .deform import needs_elastic_bake
+    if needs_elastic_bake(scene.elements):
+        first, last = frame_range if frame_range is not None else (0, frames - 1)
+        width = max(3, len(str(frames - 1)))
+        pattern = (outdir / f"{name}%0{width}d.ftsl").as_posix()
+        print(f"[loom] baking the dynamic elastics over frames {first}..{last}", flush=True)
+        if subprocess.run([str(ftrace), "-bake-elastic", pattern, str(first), str(last)]).returncode != 0:
+            raise RuntimeError("ftrace -bake-elastic failed (see its output above)")
     own = noise is None and time_s is None and n is None
     budget = ([] if own and any(a in _BUDGET_FLAGS for a in extra_args)
               else _budget_args(noise, time_s, n))

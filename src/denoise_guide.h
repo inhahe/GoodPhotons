@@ -268,6 +268,26 @@ inline Vec3 framePoint(const Scene& scene, int set, const Vec3& p0, double frame
     return p0 + (D.apply(p0) - p0) * ratio;
 }
 
+// Where point `p0`, at the frame's instant on deforming triangle `t`, sits `frames` frames out:
+// the same barycentrics on the triangle there, its corners carried from the instant to the motion
+// interval's end on that side (or the other, when the interval stops at the instant) and linearly
+// past it -- a deforming surface has no motion to repeat.
+inline Vec3 deformedFramePoint(const Scene& scene, const Tri& t, const Vec3& p0, double frames) {
+    if (!(scene.motionB > scene.motionA)) return p0;
+    double end = frames < 0.0 ? scene.motionA : scene.motionB;
+    if (end == 0.0) end = frames < 0.0 ? scene.motionB : scene.motionA;
+    if (end == 0.0) return p0;
+    const Vec3 e1 = t.v1 - t.v0, e2 = t.v2 - t.v0, d = p0 - t.v0;
+    const double d11 = dot(e1, e1), d12 = dot(e1, e2), d22 = dot(e2, e2), den = d11 * d22 - d12 * d12;
+    if (!(den > 0.0)) return p0;
+    const double b1 = (d22 * dot(d, e1) - d12 * dot(d, e2)) / den;
+    const double b2 = (d11 * dot(d, e2) - d12 * dot(d, e1)) / den;
+    const double ue = scene.motionU(end);
+    const Vec3 pe = scene.deformedAt(t, 0, ue) * (1.0 - b1 - b2) + scene.deformedAt(t, 1, ue) * b1 +
+                    scene.deformedAt(t, 2, ue) * b2;
+    return p0 + (pe - p0) * (frames / end);
+}
+
 // The centre-ray half of the guides (Images::depth and on). False if a stop was requested.
 inline bool motionAovs(const Scene& scene, const Camera& cam, int W, int H, Images& g) {
     const size_t N = (size_t)W * (size_t)H;
@@ -294,8 +314,14 @@ inline bool motionAovs(const Scene& scene, const Camera& cam, int W, int H, Imag
             if (h.valid) {
                 g.depth[i] = (float)dot(h.p - cam.eye, cam.w);
                 g.position[i] = h.p;
-                pB = framePoint(scene, h.motionSet, h.p, -1.0);
-                pF = framePoint(scene, h.motionSet, h.p, 1.0);
+                if (h.deformTri >= 0) {
+                    const Tri& t = scene.tris[(size_t)h.deformTri];
+                    pB = deformedFramePoint(scene, t, h.p, -1.0);
+                    pF = deformedFramePoint(scene, t, h.p, 1.0);
+                } else {
+                    pB = framePoint(scene, h.motionSet, h.p, -1.0);
+                    pF = framePoint(scene, h.motionSet, h.p, 1.0);
+                }
                 g.prevPosition[i] = pB;
             } else {
                 // The sky: a direction, seen from wherever the camera stands.

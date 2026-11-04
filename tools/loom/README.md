@@ -87,6 +87,7 @@ tools/loom/
 │   │                 re-emits the scene, so the bound variables move in the viewport, bindable from a panel row)
 │   ├── material.py  function-driven materials (waves/checker/rings/blobs, mixes)
 │   ├── scene.py     Scene / Camera / Material / Texture (image skins) / geometry / Volume media (all animatable)
+│   ├── deform.py    DeformedMesh: a mesh file moved by ftrace's deformers (falloff / rbf / elastic, dynamic baked)
 │   ├── transform.py per-object Transform (translate/rotate/scale/skew, animatable) → ftsl group{}; dataset inverse-map
 │   ├── canvas.py    2-D canvas (motion graphics: markers, strokes)
 │   ├── audio.py     procedural audio: one sample-buffer back-end → WAV (offline)
@@ -169,10 +170,32 @@ written exactly as without it. A `Camera` whose eye, look-at point, up or fov mo
 of its own the same way, so its own motion blurs too. The camera's `shutter` then picks the
 span a frame blurs over; ftrace blurs it in modes R, W, D, A, B and C on the CPU (ftrace's
 `REFERENCE.md`, *Motion blur*). Swept,
-isosurface and strand meshes are written at the frame's instant: their vertices move, which
-needs per-vertex motion keys (ftrace ROADMAP 11 stage E). The instant must fall on a key —
+isosurface and strand meshes are written at the frame's instant: their vertices move, and loom
+re-meshes them each frame with no correspondence between keys; a mesh whose vertices should
+blur is a `DeformedMesh` (below). The instant must fall on a key —
 `Motion` refuses a count that misses it — so a frame rendered without a shutter is the same
 frame as before.
+
+### Deforming a mesh
+
+```python
+from loom import DeformedMesh, Handle, Elastic, Dynamics, Falloff, vec, Sine
+
+tip = vec(2.0, Sine(cycles=1, amp=0.3), 0.0)
+scene.add(DeformedMesh("meshes/bar.obj", [
+    Elastic([Handle((0, 0, 0), radius=0.25),            # the root, clamped
+             Handle((2, 0, 0), to=tip, radius=0.15)],   # the tip, waved
+            dynamic=Dynamics(mass=1, stiffness=2e4, damping=0.9)),  # with inertia: baked
+], material="rubber", name="bar"))
+```
+
+ftrace moves the vertices itself (its `deform` blocks, FTSL.md §8.4.1), so loom animates only
+the handles: `Falloff`, `Rbf` and `Elastic` (as-rigid-as-possible), stacked in order. With
+`motion=` a moving handle gets a `to` per motion key, and a shutter blurs the deformation
+exactly. `Elastic(dynamic=Dynamics(...))` gives the surface inertia, so it lags, overshoots and
+settles. That is a simulation, so `render_range` (and so `loom.shot` / `ftrace -shot`) first runs
+`ftrace -bake-elastic` over the frames it emitted, then renders them from the cache it wrote
+beside them. A handle's `at` is in scene coordinates, the mesh's transform applied.
 
 ### Shots
 

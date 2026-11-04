@@ -753,3 +753,16 @@ history clamp, so a still floor kept no ghost of the light it had before a rolli
 shadow reached it, and three à-trous passes where real time takes five. Without them it scored
 0.0206. OIDN 3's temporal model is still unreleased (2.5.1 is the latest, checked 2026-11-03); it
 joins as a method when it ships.
+
+**Stage E, deformers (0.413.0, done):** a mesh's `deform falloff | rbf | elastic { handle { … } }`
+blocks (FTSL.md §8.4.1; `deform.h`, `ftsl.h applyDeformers`), evaluated at every motion key on the
+same rest mesh, so each triangle carries its corners at each key (`Tri::vkeys`,
+`Scene::vertexKeys`) and the shutter blurs the deformation exactly. The guide pass and
+`-export-tris` carry it too. The rbf's affine part spans the handles' own principal axes, so
+handles on a flat sheet are well posed. The dynamic elastic (ARAP with inertia, `elastic_cache.h`)
+is baked through a shot by `-bake-elastic`, frame by frame into a cache each frame reads. A
+resumed bake writes byte for byte what one bake writes. loom's `DeformedMesh` / `Falloff` / `Rbf`
+/ `Elastic(dynamic=Dynamics(…))` animate the handles, and its shot runner bakes before it
+renders. `tools/check_deform.py`. Not yet: the deformers on the GPU (a blurred deforming mesh
+renders on the CPU, as every blur does), a deforming mesh inside a moving group, and a glowing
+one blurring.

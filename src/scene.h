@@ -1636,6 +1636,10 @@ struct Scene {
     std::vector<MotionKeys> motionSets;
     std::vector<Affine>     motionXf;
     std::vector<double>     motionT;
+    // Deforming triangles' shapes at their keys (Tri::vkeys): a deformer moves each vertex on a
+    // path of its own, which no transform shared by a group can carry. Each triangle moves
+    // linearly between its keys, corner by corner, so the keys' boxes over a stretch bound it.
+    std::vector<Vec3>       vertexKeys;
     // Pattern frames (`group { pattern_space object }`): for each, the map from world space at
     // the frame's instant into the group's own space (authored units) its patterns are read in,
     // and its inverse, whose transpose carries a normal there. Tri::patFrame / Sphere::patFrame
@@ -1650,7 +1654,7 @@ struct Scene {
     const Vec3* sphereAxesOf(const Sphere& s) const {
         return s.frame >= 0 ? &sphereAxes[(size_t)s.frame].ax : nullptr;
     }
-    bool hasMotion() const { return !motionSets.empty(); }
+    bool hasMotion() const { return !motionSets.empty() || !vertexKeys.empty(); }
     // A time in frames (relative to the frame's instant) as the fraction of the motion interval
     // g_motionU holds, clamped to it.
     double motionU(double frames) const {
@@ -1709,8 +1713,33 @@ struct Scene {
     // primitive pays one integer compare. The moving case lives out of line (FT_NOINLINE), so
     // these stay small enough to inline into every BVH leaf as the plain tests did.
     bool intersectTriNow(const TriShear& sh, const Ray& r, const Tri& t, double tmin, Hit& h) const {
-        if (t.motion < 0 || g_motionU < 0.0) return intersectTri(sh, r, t, tmin, h, vcolData());
+        if ((t.motion < 0 && t.vkeys < 0) || g_motionU < 0.0) return intersectTri(sh, r, t, tmin, h, vcolData());
+        if (t.vkeys >= 0) return intersectDeformingTri(sh, r, t, tmin, h);
         return intersectMovingTri(sh, r, t, tmin, h);
+    }
+    // A deforming triangle's corner (0-2) or normal (3-5) at fraction u of the motion interval:
+    // blended between the keys about u.
+    Vec3 deformedAt(const Tri& t, int k, double u) const {
+        int i; double f;
+        motionBracket(t.vkeyCount, u, i, f);
+        const Vec3* a = &vertexKeys[(size_t)t.vkeys + (size_t)i * 6];
+        return a[k] + (a[k + 6] - a[k]) * f;
+    }
+    // A deforming triangle at the path's time: tested by its blended corners alone first, and
+    // rebuilt in full -- normals blended too -- only when the ray meets it nearer than the hit.
+    FT_NOINLINE bool intersectDeformingTri(const TriShear& sh, const Ray& r, const Tri& t, double tmin,
+                                           Hit& h) const {
+        const double u = g_motionU;
+        const Vec3 p0 = deformedAt(t, 0, u), p1 = deformedAt(t, 1, u), p2 = deformedAt(t, 2, u);
+        TriCrossing x;
+        if (!triCross(sh, r, p0, p1, p2, tmin, h.t, x)) return false;
+        Tri tt = t;
+        tt.v0 = p0; tt.v1 = p1; tt.v2 = p2;
+        tt.n0 = deformedAt(t, 3, u); tt.n1 = deformedAt(t, 4, u); tt.n2 = deformedAt(t, 5, u);
+        tt.finalize();
+        if (!intersectTri(sh, r, tt, tmin, h, vcolData())) return false;
+        h.deformTri = (int)(&t - tris.data());
+        return true;
     }
     bool intersectSphereNow(const Ray& r, const Sphere& s, double tmin, Hit& h) const {
         if (s.motion < 0 || g_motionU < 0.0) return intersectSphere(r, s, tmin, h, sphereAxesOf(s));
@@ -3530,7 +3559,19 @@ struct Scene {
     }
     // Whether global primitive `g` moves (has keys).
     bool primMoves(int g) const {
-        return primMotion(g) >= 0;
+        return primMotion(g) >= 0 || (g < (int)tris.size() && tris[(size_t)g].vkeys >= 0);
+    }
+    // A deforming triangle's box over the stretch [ua, ub] of the interval: its corners at both
+    // ends and at every key between (it moves linearly between keys).
+    Aabb deformBox(const Tri& t, double ua, double ub) const {
+        Aabb b;
+        for (int c = 0; c < 3; ++c) { b.expand(deformedAt(t, c, ua)); b.expand(deformedAt(t, c, ub)); }
+        for (int k = 1; k + 1 < t.vkeyCount; ++k) {
+            const double tk = (double)k / (double)(t.vkeyCount - 1);
+            if (tk > ua && tk < ub)
+                for (int c = 0; c < 3; ++c) b.expand(vertexKeys[(size_t)t.vkeys + (size_t)k * 6 + (size_t)c]);
+        }
+        return b;
     }
     // Global primitive `g`'s motion set, or -1.
     int primMotion(int g) const {
@@ -3620,7 +3661,7 @@ struct Scene {
         double ratio = 1.0;
         {
             int movT = 0, movS = 0;
-            for (const Tri& t : tris) movT += (t.motion >= 0);
+            for (const Tri& t : tris) movT += (t.motion >= 0 || t.vkeys >= 0);
             for (const Sphere& sp : spheres) movS += (sp.motion >= 0);
             const int strideO = std::max(1, (int)others.size() / 2048);
             for (size_t j = 0; j < others.size(); j += (size_t)strideO) {
@@ -3635,13 +3676,17 @@ struct Scene {
             int seen = 0;
             for (int i = 0; i < nT; ++i) {
                 const Tri& t = tris[(size_t)i];
-                if (t.motion < 0 || (seen++ % strideT) != 0) continue;
+                if ((t.motion < 0 && t.vkeys < 0) || (seen++ % strideT) != 0) continue;
                 Aabb still, sweep;
                 still.expand(t.v0); still.expand(t.v1); still.expand(t.v2);
-                const MotionKeys& mk = motionSets[(size_t)t.motion];
-                for (int k = 0; k < mk.keys; ++k) {
-                    const Affine& D = motionXf[(size_t)(mk.first + k)];
-                    sweep.expand(D.apply(t.v0)); sweep.expand(D.apply(t.v1)); sweep.expand(D.apply(t.v2));
+                if (t.vkeys >= 0) {
+                    sweep = deformBox(t, 0.0, 1.0);
+                } else {
+                    const MotionKeys& mk = motionSets[(size_t)t.motion];
+                    for (int k = 0; k < mk.keys; ++k) {
+                        const Affine& D = motionXf[(size_t)(mk.first + k)];
+                        sweep.expand(D.apply(t.v0)); sweep.expand(D.apply(t.v1)); sweep.expand(D.apply(t.v2));
+                    }
                 }
                 const double size = length(still.hi - still.lo);
                 if (size > 1e-9) ratio = std::max(ratio, std::min(length(sweep.hi - sweep.lo) / size, 1e6));
@@ -3684,11 +3729,13 @@ struct Scene {
             std::vector<int>& mp = movePrim[(size_t)k];
             for (int i = 0; i < nT; ++i) {
                 const Tri& t = tris[(size_t)i];
-                if (t.motion < 0) continue;
+                if (t.motion < 0 && t.vkeys < 0) continue;
                 Aabb b;
-                for (const Affine& D : windows[(size_t)t.motion]) {
-                    b.expand(D.apply(t.v0)); b.expand(D.apply(t.v1)); b.expand(D.apply(t.v2));
-                }
+                if (t.vkeys >= 0) b = deformBox(t, ua, ub);
+                else
+                    for (const Affine& D : windows[(size_t)t.motion]) {
+                        b.expand(D.apply(t.v0)); b.expand(D.apply(t.v1)); b.expand(D.apply(t.v2));
+                    }
                 b.lo = b.lo - Vec3{pad, pad, pad}; b.hi = b.hi + Vec3{pad, pad, pad};
                 boxes.push_back(b); mp.push_back(i);
             }
@@ -4763,7 +4810,30 @@ inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
     // A moving primitive's patterns read the point carried back to the frame's instant, so the
     // texture travels with it through the shutter rather than the surface sliding through it.
     // One shading point builds several contexts, so the path's inverse is kept per thread.
-    if (h.motionSet >= 0 && g_motionU >= 0.0) {
+    if (h.deformTri >= 0 && g_motionU >= 0.0) {
+        // A deforming triangle: the point's barycentrics on the triangle where it is now, read on
+        // the triangle where it sat at the instant; the normal turned from one face to the other,
+        // and the footprint and curvature scaled by the change of the face's size.
+        const Tri& t = scene.tris[(size_t)h.deformTri];
+        const Vec3 p0 = scene.deformedAt(t, 0, g_motionU), p1 = scene.deformedAt(t, 1, g_motionU),
+                   p2 = scene.deformedAt(t, 2, g_motionU);
+        const Vec3 e1 = p1 - p0, e2 = p2 - p0, d = q - p0;
+        const double d11 = dot(e1, e1), d12 = dot(e1, e2), d22 = dot(e2, e2);
+        const double den = d11 * d22 - d12 * d12;
+        if (den > 0.0) {
+            const double b1 = (d22 * dot(d, e1) - d12 * dot(d, e2)) / den;
+            const double b2 = (d11 * dot(d, e2) - d12 * dot(d, e1)) / den;
+            q = t.v0 * (1.0 - b1 - b2) + t.v1 * b1 + t.v2 * b2;
+            const Vec3 fNow = cross(e1, e2), fThen = cross(t.v1 - t.v0, t.v2 - t.v0);
+            const double aNow = length(fNow), aThen = length(fThen);
+            if (aNow > 0.0 && aThen > 0.0) {
+                n = normalize(n - fNow * (dot(n, fNow) / (aNow * aNow)) + fThen * (dot(n, fNow) / (aNow * aThen)));
+                const double k = std::sqrt(aThen / aNow);
+                fw *= k;
+                if (k > 0.0) curv /= k;
+            }
+        }
+    } else if (h.motionSet >= 0 && g_motionU >= 0.0) {
         const Affine D = scene.motionNow(h.motionSet), Dinv = scene.motionNowInverse(h.motionSet);
         q = Dinv.apply(q);
         n = normalize(D.applyDirTranspose(n));   // a normal maps by the inverse transpose

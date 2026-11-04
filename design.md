@@ -10142,6 +10142,62 @@ sees the instant, exactly as a static scene with those transforms would show it.
   (`sphereAsMesh_`), as an uneven static scale already tessellates it, so `sphereAt` may take the
   radius from the blended transform's mean column length.
 
+## Deformers (ROADMAP 11 stage E, 0.413.0)
+
+A mesh's `deform falloff | rbf | elastic { handle { … } … }` blocks move the triangles its block
+just added (`ftsl.h applyDeformers`, called in `addMesh` after the triangles are in scene
+coordinates and before the mesh light, the watertight record and the fog bound read them).
+
+- **One rest mesh, every key.** The corners are welded by exact position into shared vertices;
+  the stack (each deformer on the last one's output) is evaluated at every motion key of the
+  handles' (`motion { key { to … } }`, all keyed handles with one count, one key on the instant)
+  on that rest mesh, so every vertex has a path of its own and the keys stay in correspondence.
+  The triangles keep the instant's shape (`Tri::v0..n2`, which everything that asks no time
+  reads); with more than one key each triangle points into `Scene::vertexKeys`
+  (`Tri::vkeys`/`vkeyCount`: per key its three corners, then three normals, keys evenly over the
+  interval). A corner's authored normal is turned by the rotation taking its vertex's rest normal
+  to its normal at the key (area-weighted vertex normals).
+- **At a path's time** (`Scene::intersectTriNow` → `intersectDeformingTri`) a deforming triangle is
+  tested by its corners blended between the two keys about the time (`deformedAt`) and rebuilt in
+  full (normals blended, `finalize`) only when the ray meets it nearer than the hit; the hit
+  records it (`Hit::deformTri`) so `patCtxFromHit` reads its patterns at the point's barycentrics
+  on the instant's triangle. `primMoves` counts it a mover; `buildMoveTrees` and the sweep sample
+  box it by `deformBox` (its corners at a stretch's ends and at every key between), since it moves
+  linearly between keys. `Scene::hasMotion` counts vertex keys, the resume guard mixes them, the
+  guide pass carries its points a frame out by their barycentrics (`deformedFramePoint`), and
+  `-export-tris` writes them at any time. The device sees the instant (stage B's rule).
+- **The deformers** (`deform.h`): `falloff` adds each handle's move times a C2 profile of the
+  distance over its radius; `rbf` solves the dense system of a radial kernel plus an affine part
+  over the principal axes the handles truly spread along (`symEigen3`), so coplanar handles on a
+  sheet are well posed and an affine move of the handles is reproduced exactly; `elastic` is
+  ARAP (`deform::Arap`: cotangent weights clamped above zero, local closest rotations by a Jacobi
+  SVD, global solve by Jacobi-preconditioned CG warm-started from the last round, the handles'
+  vertices held at their targets; every per-vertex pass over fixed blocks of vertices in parallel,
+  each block's share of a sum gathered then summed in block order, so a result is the same on any
+  machine -- which a resumed bake's byte-for-byte match needs).
+- **The dynamic elastic** (`elastic_cache.h`) is ARAP with inertia stepped in seconds (frames /
+  fps): each step minimises ARAP plus mass/(stiffness h²)·Σ mᵢ|xᵢ − yᵢ|² about the inertial guess
+  y = x + h v (`Arap::solve`'s inertia term), damping the velocity by (1 − damping)^h. It is the
+  only deformer with state, so it is baked: `-bake-elastic` runs each frame's scene, in order, as
+  its own `-in … -parseonly -elastic-bake` process (`elastic::g_baking`), and at the dynamic
+  elastic the loader reads the frame before's record (or starts at rest, the first targets met
+  quasi-statically), runs through any gap between the frames' intervals and then key to key
+  (targets blended linearly), and writes this frame's record: the mesh at each key, and the last
+  key's positions, velocities and targets, in float32, keyed by an FNV hash of the rest mesh,
+  triangles, held vertices and settings. The state a frame continues from is always the record
+  as stored, so a resumed bake writes byte for byte what one bake writes. A render reads its
+  record (refusing one keyed for anything else) and takes the keys from it. It must be the
+  stack's first deformer (its rest is the mesh as loaded).
+- **Limits kept on purpose.** A deforming mesh in a moving group is refused (its keys would have
+  to compose two motions per vertex); a glowing one keeps its instant's shape, warned, since a
+  light moves only rigidly and `emit_orient` may yet turn its corners; fur and settle refuse to
+  follow it (`movingNames_`).
+- **loom** (`tools/loom/loom/deform.py`): `DeformedMesh(file, [Falloff | Rbf | Elastic])` with
+  `Handle(at, to=signal, radius)` emits the blocks, a moving handle's `to` sampled at each motion
+  key; `Elastic(dynamic=Dynamics(…))` writes the `dynamic` block with the frame number and a cache
+  beside the frames, and `render_range` runs `-bake-elastic` over the frames it emitted before
+  rendering them (`needs_elastic_bake`).
+
 ## Shots: `ftrace -shot` and `loom.shot` (0.405.0)
 
 A shot is three processes deep. `ftrace -shot scene.py …` (`main.cpp runShot`, before any scene

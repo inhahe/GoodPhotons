@@ -17268,6 +17268,8 @@ static uint64_t checkpointGuard(const Scene& scene, char mode, int res, int resY
         };
         members(scene.tris); members(scene.spheres); members(scene.implicits);
         members(scene.curveSegs); members(scene.instances); members(scene.emitters);
+        mix((uint64_t)scene.vertexKeys.size());
+        for (const Vec3& v : scene.vertexKeys) { mixD(v.x); mixD(v.y); mixD(v.z); }
         mix((uint64_t)scene.motionXf.size());
         for (size_t k = 0; k < scene.motionXf.size(); ++k) {
             const Affine& D = scene.motionXf[k];
@@ -21575,6 +21577,10 @@ static void printHelp(const char* prog) {
 "                         -denoise and its knobs filter a .ftbuf's chroma first)\n"
 "  -review <base>        play a rendered frame sequence on the live window\n"
 "  -export-mesh <o.obj> [-mesh-res N] [-mesh-adaptive]   isosurface -> mesh\n"
+"  -bake-elastic <scene%%04d.ftsl> <first> <last>   simulate a shot's dynamic elastics in frame\n"
+"                        order, writing each frame's cache record (deform elastic { dynamic })\n"
+"  -export-tris <o.obj> [-export-tris-at <frames>]   the scene's triangles as loaded (deformed,\n"
+"                        every transform applied), at the instant or at a time; no render\n"
 "  -serve                resident loop: re-render scene paths streamed on stdin\n"
 "  -shot <scene.py>      render a loom file as a shot, every frame (loom.shot runs it):\n"
 "                        -frames A B, -shot-length N, -fps F, -open|-loop, -shutter O C,\n"
@@ -21783,6 +21789,9 @@ static int run(int argc, char** argv) {
     const char* meshPath = nullptr;
     double meshScale = 1.0;
     const char* exportMeshPath = nullptr;  // -export-mesh <file.obj>: isosurface -> mesh
+    const char* exportTrisPath = nullptr;  // -export-tris <file.obj>: the scene's triangles, as loaded
+    double exportTrisAt = 0.0;             // -export-tris-at <frames>: ... at that time
+    bool   exportTrisTimed = false;
     int    exportMeshRes = 128;            // -mesh-res <N>: cells along longest bounds axis
     bool   exportMeshAdaptive = false;     // -mesh-adaptive: curvature-driven QEM decimation
     double exportMeshDecimate = 0.5;       // -mesh-decimate <f>: keep this fraction of triangles
@@ -21924,6 +21933,10 @@ static int run(int argc, char** argv) {
     bool parseOnly = false;
     for (int i = 1; i < argc; ++i)
         if (!std::strcmp(argv[i], "-parseonly")) { parseOnly = true; break; }
+    // -elastic-bake (what -bake-elastic runs each frame with): a dynamic elastic simulates and
+    // writes its frame's cache record as the scene loads, rather than reading it.
+    for (int i = 1; i < argc; ++i)
+        if (!std::strcmp(argv[i], "-elastic-bake")) elastic::g_baking = true;
     // Positional scene / mesh file: `ftrace scene.ftsl` or `ftrace model.glb` (e.g. a
     // double-click / drag-drop) with no -in. Accept a bare token that ends in a scene
     // extension (loaded directly) OR a mesh extension (.obj/.gltf/.glb/.fbx/.stl/.ply —
@@ -23004,6 +23017,12 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-nd-crease") && i + 1 < argc) ndCfg.creaseDeg = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-nd-budget") && i + 1 < argc) ndBudget = (size_t)std::max(0LL, std::atoll(argv[++i]));
         else if (!std::strcmp(argv[i], "-nd-export") && i + 1 < argc) ndExportPath = argv[++i];
+        else if (!std::strcmp(argv[i], "-elastic-bake")) {}   // prescanned above
+        else if (!std::strcmp(argv[i], "-export-tris") && i + 1 < argc) exportTrisPath = argv[++i];
+        else if (!std::strcmp(argv[i], "-export-tris-at") && i + 1 < argc) {
+            exportTrisAt = std::atof(argv[++i]);
+            exportTrisTimed = true;
+        }
         else if (!std::strcmp(argv[i], "-legacy-parser") ||
                  !std::strcmp(argv[i], "-validate-grammar")) {
             std::fprintf(stderr, "ftrace: %s was retired in 0.79.0 — the shared grammar "
@@ -23739,6 +23758,38 @@ static int run(int argc, char** argv) {
             std::printf("[check-airtight] %d of %zu isosurface(s) are NOT airtight (see above).\n",
                         failures, scene.implicits.size());
         return failures ? 1 : 0;
+    }
+
+    // -export-tris <file.obj> [-export-tris-at <frames>]: the scene's triangles as the loader
+    // left them -- every transform, deformer and settle applied -- at the frame's instant, or at a
+    // time in frames from it with each moving or deforming one carried there, as an OBJ with a
+    // vertex per corner, in the order they were loaded. Then exit, rendering nothing. Instanced
+    // assets' triangles are not among them.
+    if (exportTrisPath) {
+        std::FILE* f = std::fopen(exportTrisPath, "wb");
+        if (!f) {
+            std::fprintf(stderr, "error: -export-tris: cannot write %s\n", exportTrisPath);
+            return 1;
+        }
+        const double u = (exportTrisTimed && scene.hasMotion()) ? scene.motionU(exportTrisAt) : -1.0;
+        const MotionTimeScope at(u);
+        std::fprintf(f, "# ftrace %s -export-tris%s\n", ftraceVersion(), exportTrisTimed ? " (at a time)" : "");
+        for (const Tri& t : scene.tris) {
+            Vec3 c[3] = {t.v0, t.v1, t.v2};
+            if (u >= 0.0 && t.vkeys >= 0) {
+                for (int k = 0; k < 3; ++k) c[k] = scene.deformedAt(t, k, u);
+            } else if (u >= 0.0 && t.motion >= 0) {
+                const Affine D = scene.motionNow(t.motion);
+                for (Vec3& p : c) p = D.apply(p);
+            }
+            for (const Vec3& p : c) std::fprintf(f, "v %.17g %.17g %.17g\n", p.x, p.y, p.z);
+        }
+        for (size_t i = 0; i < scene.tris.size(); ++i)
+            std::fprintf(f, "f %zu %zu %zu\n", 3 * i + 1, 3 * i + 2, 3 * i + 3);
+        const bool ok = std::fclose(f) == 0;
+        if (ok) std::printf("wrote %s (%zu triangles)\n", exportTrisPath, scene.tris.size());
+        else std::fprintf(stderr, "error: -export-tris: writing %s failed\n", exportTrisPath);
+        return ok ? 0 : 1;
     }
 
     // -export-mesh <file.obj>: polygonise every isosurface in the scene into a
@@ -28744,6 +28795,73 @@ static int runServe(int argc, char** argv, int inValPos) {
     return rc;
 }
 
+// --- -bake-elastic: a shot's dynamic elastics, simulated in frame order (ROADMAP 11 stage E) ---
+// `ftrace -bake-elastic <scene%04d.ftsl> <first> <last>` loads frame k's scene, for k from first to
+// last in order, as `-in <it> -parseonly -elastic-bake` -- a process of its own each, so a frame's
+// load leaves nothing behind for the next -- and every dynamic elastic in it continues its
+// simulation from the frame before's cache record and writes its own (elastic_cache.h). Stops at
+// the first frame that fails, and between frames on `ftrace -stop`.
+static int runBakeElastic(int argc, char** argv, int at) {
+    if (at + 3 >= argc) {
+        std::fprintf(stderr, "error: -bake-elastic <scene%%04d.ftsl> <first> <last>\n");
+        return 2;
+    }
+    const std::string pat = argv[at + 1];
+    char* e1 = nullptr;
+    char* e2 = nullptr;
+    const long long first = std::strtoll(argv[at + 2], &e1, 10), last = std::strtoll(argv[at + 3], &e2, 10);
+    if (!e1 || *e1 || !e2 || *e2 || last < first) {
+        std::fprintf(stderr, "error: -bake-elastic: <first> <last> are frame numbers, first <= last\n");
+        return 2;
+    }
+    for (long long k = first; k <= last; ++k) {
+        if (g_stopRequested) {
+            std::printf("[elastic] stopped before frame %lld\n", k);
+            return 1;
+        }
+        std::string path;
+        if (!elastic::framePath(pat, k, path)) {
+            std::fprintf(stderr, "error: -bake-elastic: '%s' needs exactly one frame number (%%d, %%04d, ...)\n",
+                         pat.c_str());
+            return 2;
+        }
+        std::fflush(stdout);
+#ifdef _WIN32
+        wchar_t self[MAX_PATH * 4];
+        if (!GetModuleFileNameW(nullptr, self, (DWORD)(sizeof self / sizeof self[0]))) {
+            std::fprintf(stderr, "error: -bake-elastic: cannot find this ftrace.exe\n");
+            return 1;
+        }
+        std::wstring cmd = L"\"" + std::wstring(self) + L"\" -in \"" + loomlink::utf8ToWide(path) + L"\" -parseonly -elastic-bake";
+        std::vector<wchar_t> mut(cmd.begin(), cmd.end());
+        mut.push_back(L'\0');
+        STARTUPINFOW si{};
+        si.cb = sizeof si;
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessW(nullptr, mut.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+            std::fprintf(stderr, "error: -bake-elastic: cannot start frame %lld's load (error %lu)\n", k,
+                         GetLastError());
+            return 1;
+        }
+        CloseHandle(pi.hThread);
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD code = 1;
+        GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hProcess);
+        const int rc = (int)code;
+#else
+        const int rc = std::system(("\"" + std::string(argv[0]) + "\" -in \"" + path + "\" -parseonly -elastic-bake").c_str());
+#endif
+        if (rc != 0) {
+            std::fprintf(stderr, "error: -bake-elastic: frame %lld (%s) failed; frames before it are baked\n", k,
+                         path.c_str());
+            return 1;
+        }
+    }
+    std::printf("[elastic] baked frames %lld..%lld\n", first, last);
+    return 0;
+}
+
 // --- -denoise-shot: a rendered shot's frames, denoised in order (ROADMAP 11 stage D) ----------
 // `ftrace -denoise-shot <method> <in> <out> <first> <last> [-exposure <e>]` reads frame k's render
 // <in>%k (a scene-linear PFM: render with -hdr) and the guide pass beside it (-write-aovs:
@@ -29318,10 +29436,13 @@ int main(int argc, char** argv) {
             stopChannelStart(std::string(inPath ? inPath : "(no -in)") + " -> " +
                              (outPath ? outPath : "(default output)"));
         }
-        int denoiseShotAt = 0;
-        for (int i = 1; i < argc && !denoiseShotAt; ++i)
+        int denoiseShotAt = 0, bakeElasticAt = 0;
+        for (int i = 1; i < argc && !denoiseShotAt && !bakeElasticAt; ++i) {
             if (!std::strcmp(argv[i], "-denoise-shot")) denoiseShotAt = i;
+            if (!std::strcmp(argv[i], "-bake-elastic")) bakeElasticAt = i;
+        }
         rc = denoiseShotAt ? runDenoiseShot(argc, argv, denoiseShotAt)
+           : bakeElasticAt ? runBakeElastic(argc, argv, bakeElasticAt)
            : serve ? runServe(argc, argv, inValPos) : run(argc, argv);
         if (rc == 0 && g_stopExitCode != 0 && g_stopRequested) rc = g_stopExitCode;
     } catch (const std::bad_alloc&) {

@@ -87,6 +87,21 @@ narrow API speak UTF-8, then audit the `std::filesystem::path(std::string)` / `.
 for UTF-8 (`u8path`, `u8string`); or read argv as UTF-16 (`wmain`) and keep paths as
 `std::filesystem::path` throughout.
 
+## OPEN (2026-11-03, 0.413.0): DEFORM-LIMITS — what a deforming mesh cannot do yet
+
+Each is refused or warned at load, never rendered wrong:
+
+- **Inside a moving `group`** it is refused ("move it with its handles' keys instead"). Proper
+  fix: compose the group's motion into each vertex key at load (the group's transform at the
+  key's time applied to the deformed key), so the triangle needs vertex keys only.
+- **A glowing mesh** keeps its instant's shape at every time, with a warning: its light sampler
+  (`addMeshLight`'s area CDF) is the instant's, and `emit_orient` reverses windings after the
+  deformers run. Proper fix: sample a deforming emitter at the path's time (rebuild the chosen
+  triangle from its keys, its area at that time in the pdf), and reverse the keys' corner
+  order with the triangle's.
+- **A dynamic elastic must be first** in its mesh's stack (its rest is the mesh as loaded).
+  Proper fix: bake the deformers before it into the record as its moving rest.
+
 ## OPEN (2026-11-03, 0.411.1): HAZE-SUN-B — mode B lights an unbounded sunlit haze far dimmer than mode R
 
 `scenes/_haze_sun_b_vs_r.ftsl` (a 2 m floor under a high sun in `medium { sigma_t 0.04  albedo

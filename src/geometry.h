@@ -115,6 +115,12 @@ struct Tri {
     int motion = -1;
     // The pattern frame its patterns are read in (Scene::patFrames), or -1: world space.
     int patFrame = -1;
+    // A deforming triangle (ROADMAP 11 stage E): an offset into Scene::vertexKeys, where its shape
+    // at each of its `vkeyCount` keys -- spread evenly over the motion interval -- is kept, its
+    // three corners and then its three normals, six entries a key; or -1. The fields above are
+    // its shape at the frame's instant, which is one of the keys.
+    int vkeys = -1;
+    int vkeyCount = 0;
     // triReach of the vertices, baked here for the hit to copy (Hit::pscale).
     double reach = 0.0;
     void finalize() {
@@ -283,6 +289,9 @@ struct Hit {
     // instant, so a texture travels with its object -- and the pattern frame of the primitive,
     // or -1 for world space. Every intersector writes both (the record is reused).
     int motionSet = -1;
+    // The deforming triangle a hit with a time is on (Tri::vkeys), or -1: its patterns read the
+    // point carried back to where it sat at the instant by its barycentrics (patCtxFromHit).
+    int deformTri = -1;
     int patFrame = -1;
     // Barycentric-interpolated per-vertex colour at the hit (linear RGB), when the
     // triangle carried one. Resolved by the intersector, which is the only place that
@@ -586,7 +595,7 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     // b0 v0 + b1 v1 + b2 v2: the b's need not sum to exactly 1, which breaks the exactness.)
     hit.t = t; hit.p = tri.v0 + (tri.v1 - tri.v0) * b1 + (tri.v2 - tri.v0) * b2; hit.valid = true;
     hit.pscale = tri.reach;
-    hit.motionSet = -1; hit.patFrame = tri.patFrame;
+    hit.motionSet = -1; hit.deformTri = -1; hit.patFrame = tri.patFrame;
     hit.matId = tri.matId; hit.sensorId = tri.sensorId;
     // Barycentric-interpolated UV and shading normal (matches the old M-T convention:
     // b0,b1,b2 == w0,u,v).
@@ -692,7 +701,7 @@ inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit
     // |r|: the quadratic only sees r^2, so a negative radius traces as its absolute value.
     hit.p = s.c + ng * std::fabs(s.r);
     hit.pscale = std::sqrt(dot(s.c, s.c)) + std::fabs(s.r);
-    hit.motionSet = -1; hit.patFrame = s.patFrame;
+    hit.motionSet = -1; hit.deformTri = -1; hit.patFrame = s.patFrame;
     hit.ng = ng;
     bool sFlipped = !(dot(r.d, ng) < 0.0);
     hit.n = sFlipped ? -ng : ng;

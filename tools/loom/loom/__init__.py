@@ -35,6 +35,7 @@ from .scene import (
     NamedSpectrum, Upsample,
 )
 from .transform import Transform
+from .deform import DeformedMesh, Handle, Falloff, Rbf, Elastic, Dynamics
 from .ftsl_emit import Motion
 from .mcubes import mesh_field
 from .vdbio import (
@@ -123,6 +124,7 @@ __all__ = [
     "Record", "RecordChannel", "RecordStop",
     "parse_ladder", "emit_ladder", "ladder_shape",
     "SweptMesh", "IsoMesh", "ribbon", "tube", "blob", "fan", "Volume",
+    "DeformedMesh", "Handle", "Falloff", "Rbf", "Elastic", "Dynamics",
     "Strand", "strand", "hair",
     "mesh_field",
     "write_vdb", "read_vdb", "read_vdb_grids", "bake_field", "write_volume",

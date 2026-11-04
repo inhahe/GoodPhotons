@@ -74,6 +74,8 @@
 #include "fbx.h"
 #include "upsample.h"
 #include "fur.h"         // `fur { }` groom generator — scatters `curve` strands (TODO §P1)
+#include "deform.h"      // a mesh's `deform` blocks: falloff, rbf, elastic (ROADMAP 11 stage E)
+#include "elastic_cache.h"   // ... the dynamic elastic, baked through a shot
 #include "settle.h"      // hair settling — the load-time relaxation over the flattened strands
 #include "hair.h"        // hair::Species — the measured fur presets `material { type hair }` names
 #include "parallel.h"    // ft::stopRequested — cooperative `-stop` during a long load
@@ -6041,6 +6043,357 @@ private:
         return true;
     }
 
+    // A dynamic elastic's mesh at each of the frame's K keys, into `out`: read from its cache record
+    // for frame `frame` (`cache` with the frame number in it) -- or, under -bake-elastic
+    // (elastic::g_baking), simulated on from the frame before's record, or from rest when there is
+    // none, and written as this frame's. `nh` handles, `handle(i)` each, holding the vertices of
+    // `rest` within their radius.
+    template <class HandleAt>
+    bool dynamicElastic(size_t nh, HandleAt handle, const elastic::Params& P, const std::string& cache,
+                        long long frame, const std::vector<Vec3>& rest,
+                        const std::vector<std::array<int, 3>>& tris, int K, const Scene& S,
+                        std::vector<std::vector<Vec3>>& out) {
+        std::vector<char> held(rest.size(), 0);
+        std::vector<std::vector<Vec3>> targets((size_t)K, rest);
+        for (size_t hi = 0; hi < nh; ++hi) {
+            const auto& h = handle(hi);
+            int n = 0;
+            for (size_t i = 0; i < rest.size(); ++i)
+                if (length(rest[i] - h.at) <= h.radius) {
+                    held[i] = 1;
+                    ++n;
+                    for (int k = 0; k < K; ++k)
+                        targets[(size_t)k][i] = rest[i] + (h.to[h.to.size() > 1 ? (size_t)k : 0] - h.at);
+                }
+            if (n == 0) {
+                fail("deform elastic: a handle holds no vertex within its radius (raise `radius`)");
+                return false;
+            }
+        }
+        std::vector<double> times((size_t)K, 0.0);
+        for (int k = 0; k < K && K > 1; ++k) times[(size_t)k] = S.motionA + (S.motionB - S.motionA) * k / (K - 1);
+        const uint64_t key = elastic::keyOf(rest, tris, held, P);
+        std::string path, err;
+        elastic::framePath(cache, frame, path);
+        elastic::Record rec;
+        if (elastic::g_baking) {
+            std::string prevPath;
+            elastic::framePath(cache, frame - 1, prevPath);
+            elastic::Record prev;
+            const elastic::Record* pp = nullptr;
+            if (elastic::read(prevPath, prev, err)) {
+                if (prev.key != key) {
+                    fail("deform elastic: " + prevPath + " was baked for another mesh, handles or settings -- "
+                         "delete it, or bake the shot from its first frame");
+                    return false;
+                }
+                pp = &prev;
+            } else if (!err.empty()) {
+                fail("deform elastic: " + err);
+                return false;
+            } else {
+                std::printf("[elastic] frame %lld: no record for frame %lld -- starting at rest\n", frame, frame - 1);
+            }
+            if (!elastic::bakeFrame(rest, tris, held, targets, times, frame, P, pp, rec, err)) {
+                fail("deform elastic: " + err);
+                return false;
+            }
+            rec.key = key;
+            if (!elastic::write(path, rec, err)) { fail("deform elastic: " + err); return false; }
+            std::printf("[elastic] baked frame %lld (%zu vertices, %d keys) -> %s\n", frame, rest.size(), K,
+                        path.c_str());
+        } else {
+            if (!elastic::read(path, rec, err)) {
+                fail(err.empty() ? "deform elastic: no cache record " + path + " -- bake the shot first "
+                                   "(ftrace -bake-elastic <scene%04d.ftsl> <first> <last>)"
+                                 : "deform elastic: " + err);
+                return false;
+            }
+            bool same = rec.key == key && rec.frame == frame && rec.times.size() == (size_t)K;
+            for (int k = 0; same && k < K; ++k) same = std::fabs(rec.times[(size_t)k] - times[(size_t)k]) < 1e-9;
+            if (!same) {
+                fail("deform elastic: " + path + " was baked for another mesh, handles, settings or keys -- "
+                     "bake the shot again");
+                return false;
+            }
+        }
+        out = std::move(rec.pos);
+        return true;
+    }
+
+    // ---- deformers (ROADMAP 11 stage E) ----
+    // A mesh's `deform falloff|rbf|elastic { ... handle { at  to  radius } ... }` blocks, applied in
+    // order to the triangles it just added (from `triStart`), in scene coordinates. A handle's `to`
+    // may be keyed -- `motion { key { to x y z } ... }`, spread evenly over the motion interval --
+    // and then every deformer is evaluated at every key on the same rest mesh: the triangles keep
+    // the instant's shape (which must be a key) and get the others as vertex keys (Tri::vkeys).
+    bool applyDeformers(const Block& b, Loaded& L, size_t triStart) {
+        struct Hd { Vec3 at; double radius = 0.0; std::vector<Vec3> to; };
+        // A dynamic elastic's `dynamic { ... }` (elastic_cache.h).
+        struct Dyn { bool on = false; elastic::Params P; std::string cache; long long frame = 0; };
+        struct Dk { std::string kind; const Block* blk; std::vector<Hd> hs; Dyn dyn; };
+        std::vector<Dk> stack;
+        for (const auto& s : b.stmts) {
+            if (s.key != "deform") continue;
+            s.used = true;
+            if (!s.val.block) { fail("mesh: `deform` takes a block: deform falloff|rbf|elastic { ... }"); return false; }
+            const Block& db = *s.val.block;
+            Dk d;
+            d.kind = db.type;
+            d.blk = &db;
+            if (d.kind != "falloff" && d.kind != "rbf" && d.kind != "elastic") {
+                fail("mesh: unknown deformer '" + d.kind + "' (falloff, rbf, elastic)");
+                return false;
+            }
+            for (const auto& hs : db.stmts) {
+                if (hs.key != "handle") continue;
+                hs.used = true;
+                if (!hs.val.block) { fail("deform: `handle` takes a block { at x y z  to x y z  radius r }"); return false; }
+                const Block& hb = *hs.val.block;
+                Hd h;
+                Vec3 v;
+                if (!vec3Of(hb, "at", v)) { fail("deform: a handle needs `at x y z`"); return false; }
+                h.at = P(v);
+                h.radius = Len(dblOf(hb, "radius", 0.0));
+                if (const Stmt* mo = find(hb, "motion"); mo && mo->val.block) {
+                    for (const auto& ks : mo->val.block->stmts) {
+                        if (ks.key != "key" || !ks.val.block) { fail("deform: only `key { to x y z }` belongs in a handle's motion"); return false; }
+                        ks.used = true;
+                        if (!vec3Of(*ks.val.block, "to", v)) { fail("deform: a handle's key needs `to x y z`"); return false; }
+                        h.to.push_back(P(v));
+                    }
+                    if (h.to.size() < 2) { fail("deform: give a handle's motion at least two keys"); return false; }
+                } else {
+                    if (find(hb, "to") && !vec3Of(hb, "to", v)) {
+                        fail("deform: a handle's `to` needs three numbers, x y z");
+                        return false;
+                    }
+                    h.to.push_back(find(hb, "to") ? P(v) : h.at);
+                }
+                d.hs.push_back(h);
+            }
+            if (d.hs.empty()) { fail("deform " + d.kind + ": give it at least one `handle`"); return false; }
+            if (const Stmt* dy = find(db, "dynamic"); dy) {
+                dy->used = true;
+                if (d.kind != "elastic") { fail("deform " + d.kind + ": only an elastic is dynamic"); return false; }
+                if (!dy->val.block) {
+                    fail("deform elastic: `dynamic` takes a block { cache \"jelly_%04d.ftec\"  frame N ... }");
+                    return false;
+                }
+                const Block& yb = *dy->val.block;
+                Dyn& y = d.dyn;
+                y.on = true;
+                y.cache = strOf(yb, "cache");
+                if (y.cache.empty() || !find(yb, "frame")) {
+                    fail("deform elastic: a dynamic elastic needs `cache \"<path with %04d>\"` and `frame N`, "
+                         "the shot's frame this scene is");
+                    return false;
+                }
+                y.frame = (long long)std::llround(dblOf(yb, "frame", 0.0));
+                y.P.mass = dblOf(yb, "mass", y.P.mass);
+                y.P.stiffness = dblOf(yb, "stiffness", y.P.stiffness);
+                y.P.damping = dblOf(yb, "damping", y.P.damping);
+                y.P.fps = dblOf(yb, "fps", y.P.fps);
+                y.P.substeps = (int)dblOf(yb, "substeps", y.P.substeps);
+                y.P.iterations = (int)dblOf(yb, "iterations", y.P.iterations);
+                if (!(y.P.mass > 0.0) || !(y.P.stiffness > 0.0) || !(y.P.damping >= 0.0 && y.P.damping <= 1.0) ||
+                    !(y.P.fps > 0.0) || y.P.substeps < 1 || y.P.iterations < 1) {
+                    fail("deform elastic: dynamic needs mass, stiffness and fps above 0, damping from 0 to 1, "
+                         "and substeps and iterations of 1 or more");
+                    return false;
+                }
+                std::string probe;
+                if (!elastic::framePath(y.cache, y.frame, probe)) {
+                    fail("deform elastic: `cache` needs exactly one frame number in it (%d, %04d, ...)");
+                    return false;
+                }
+            }
+            stack.push_back(std::move(d));
+        }
+        if (stack.empty()) return true;
+        Scene& S = L.scene;
+        const size_t triEnd = S.tris.size();
+        if (motionChain_.moving()) {
+            fail("mesh: a deforming mesh in a moving group -- move it with its handles' keys instead");
+            return false;
+        }
+        // The keys: every keyed handle has the same count, spread evenly over the interval.
+        int K = 1;
+        for (const Dk& d : stack)
+            for (const Hd& h : d.hs)
+                if (h.to.size() > 1) {
+                    if (K > 1 && (int)h.to.size() != K) {
+                        fail("deform: every keyed handle of a mesh needs the same number of keys");
+                        return false;
+                    }
+                    K = (int)h.to.size();
+                }
+        int kNow = 0;   // the key at the frame's instant
+        if (K > 1) {
+            if (!(S.motionB > S.motionA)) {
+                fail("deform: a keyed handle needs the scene's `motion_interval a b` (scene { ... })");
+                return false;
+            }
+            const double j = S.motionU(0.0) * (K - 1);
+            kNow = (int)std::lround(j);
+            if (std::fabs(j - kNow) > 1e-9) {
+                fail("deform: a handle's keys must put one at the frame's instant (an odd count over "
+                     "an interval centred on it, say)");
+                return false;
+            }
+        }
+        // Weld the triangles' corners into shared vertices (by exact position).
+        std::vector<Vec3> rest;
+        std::vector<std::array<int, 3>> corner(triEnd - triStart);
+        {
+            std::map<std::array<double, 3>, int> at;
+            for (size_t t = triStart; t < triEnd; ++t)
+                for (int c = 0; c < 3; ++c) {
+                    const Vec3& p = c == 0 ? S.tris[t].v0 : (c == 1 ? S.tris[t].v1 : S.tris[t].v2);
+                    auto [it, fresh] = at.insert({{p.x, p.y, p.z}, (int)rest.size()});
+                    if (fresh) rest.push_back(p);
+                    corner[t - triStart][(size_t)c] = it->second;
+                }
+        }
+        std::vector<std::array<int, 3>> tris(corner);
+        // A dynamic elastic is simulated through the shot rather than solved at each key, so its
+        // rest is the mesh as loaded: it comes first. Its keys come from its cache record --
+        // or, baking, from the simulation that record continues.
+        std::vector<std::vector<Vec3>> dynPos;
+        for (size_t di = 1; di < stack.size(); ++di)
+            if (stack[di].dyn.on) {
+                fail("deform elastic: a dynamic elastic must be a mesh's first deformer (it moves the mesh as "
+                     "loaded; others may follow it)");
+                return false;
+            }
+        if (stack[0].dyn.on && !dynamicElastic(stack[0].hs.size(), [&](size_t i) -> const Hd& { return stack[0].hs[i]; },
+                                               stack[0].dyn.P, stack[0].dyn.cache, stack[0].dyn.frame, rest, tris, K,
+                                               S, dynPos))
+            return false;
+        // The stack at key k: every deformer in order, each on the last one's output.
+        std::vector<std::vector<Vec3>> keyPos((size_t)K);
+        for (int k = 0; k < K; ++k) {
+            std::vector<Vec3> p = rest;
+            for (const Dk& d : stack) {
+                if (d.dyn.on) { p = dynPos[(size_t)k]; continue; }
+                std::vector<deform::Handle> hs;
+                for (const Hd& h : d.hs) hs.push_back({h.at, h.to[h.to.size() > 1 ? (size_t)k : 0], h.radius});
+                if (d.kind == "falloff") {
+                    const std::string pr = strOf(*d.blk, "profile", "smooth");
+                    const deform::Profile prof = pr == "linear" ? deform::Profile::Linear
+                                               : pr == "gaussian" ? deform::Profile::Gaussian : deform::Profile::Smooth;
+                    if (pr != "smooth" && pr != "linear" && pr != "gaussian") {
+                        fail("deform falloff: profile smooth, linear or gaussian"); return false;
+                    }
+                    deform::falloff(p, hs, prof);
+                } else if (d.kind == "rbf") {
+                    const std::string kn = strOf(*d.blk, "kernel", "biharmonic");
+                    const deform::Kernel ker = kn == "triharmonic" ? deform::Kernel::Triharmonic
+                                             : kn == "gaussian" ? deform::Kernel::Gaussian
+                                             : kn == "multiquadric" ? deform::Kernel::Multiquadric
+                                             : deform::Kernel::Biharmonic;
+                    if (kn != "biharmonic" && kn != "triharmonic" && kn != "gaussian" && kn != "multiquadric") {
+                        fail("deform rbf: kernel biharmonic, triharmonic, gaussian or multiquadric"); return false;
+                    }
+                    std::string err;
+                    if (!deform::rbf(p, hs, ker, Len(dblOf(*d.blk, "eps", 1.0)), err)) { fail("deform rbf: " + err); return false; }
+                } else {
+                    // Elastic: each handle holds the vertices within its radius, carried by its move;
+                    // the rest follows as rigidly as it can.
+                    deform::Arap arap;
+                    arap.build(p, tris);
+                    std::vector<char> held(p.size(), 0);
+                    std::vector<Vec3> target = p;
+                    for (const deform::Handle& h : hs) {
+                        int n = 0;
+                        for (size_t i = 0; i < p.size(); ++i)
+                            if (length(p[i] - h.at) <= h.radius) {
+                                held[i] = 1; target[i] = p[i] + (h.to - h.at); ++n;
+                            }
+                        if (n == 0) {
+                            fail("deform elastic: a handle holds no vertex within its radius (raise `radius`)");
+                            return false;
+                        }
+                    }
+                    std::vector<Vec3> x = p;
+                    if (!arap.solve(held, target, x, std::max(1, (int)dblOf(*d.blk, "iterations", 30.0)), 0.0,
+                                    nullptr, /*fromRest*/true)) {
+                        if (!stopped()) fail("deform elastic: its solve was interrupted");
+                        return false;
+                    }
+                    p = std::move(x);
+                }
+            }
+            keyPos[(size_t)k] = std::move(p);
+        }
+        // Vertex normals (area-weighted) of the rest mesh and of each key's, to turn the corners'
+        // own normals by: a corner keeps its offset from its vertex's normal as the surface bends.
+        const auto vnormals = [&](const std::vector<Vec3>& p) {
+            std::vector<Vec3> n(p.size(), Vec3{0, 0, 0});
+            for (const auto& t : tris) {
+                const Vec3 f = cross(p[(size_t)t[1]] - p[(size_t)t[0]], p[(size_t)t[2]] - p[(size_t)t[0]]);
+                for (int c = 0; c < 3; ++c) n[(size_t)t[(size_t)c]] = n[(size_t)t[(size_t)c]] + f;
+            }
+            for (Vec3& v : n) { const double l = length(v); v = l > 0.0 ? v * (1.0 / l) : Vec3{0, 0, 1}; }
+            return n;
+        };
+        const std::vector<Vec3> nRest = vnormals(rest);
+        // Turn v by the rotation that takes unit a to unit b (Rodrigues).
+        const auto turn = [](const Vec3& a, const Vec3& b, const Vec3& v) {
+            const Vec3 k = cross(a, b);
+            const double c = dot(a, b);
+            if (c < -0.999999) return v * -1.0;
+            return v + cross(k, v) + cross(k, cross(k, v)) * (1.0 / (1.0 + c));
+        };
+        std::vector<std::vector<Vec3>> keyN((size_t)K);
+        for (int k = 0; k < K; ++k) keyN[(size_t)k] = vnormals(keyPos[(size_t)k]);
+        const auto cornerNormal = [&](const Tri& t0, int c, int vi, int k) {
+            const Vec3& n0 = c == 0 ? t0.n0 : (c == 1 ? t0.n1 : t0.n2);
+            if (dot(n0, n0) < 1e-24) return Vec3{0, 0, 0};          // none authored: finalize's face normal
+            return normalize(turn(nRest[(size_t)vi], keyN[(size_t)k][(size_t)vi], n0));
+        };
+        // A glowing mesh keeps the instant's shape at every time: a light moves only rigidly
+        // (its sampler is the instant's), and `emit_orient` may yet turn its corners around.
+        bool keyed = K > 1;
+        for (size_t t = triStart; t < triEnd && keyed; ++t) {
+            const int m = S.tris[t].matId;
+            if (m >= 0 && m < (int)S.mats.size() && S.mats[(size_t)m].isLight) {
+                keyed = false;
+                if (stillWarned_.insert("a glowing deforming mesh").second)
+                    std::fprintf(stderr, "[ftsl] warning: a glowing mesh's deformers shape it at the frame's "
+                                         "instant only -- a light moves only rigidly, so it does not blur "
+                                         "(ROADMAP 11)\n");
+            }
+        }
+        for (size_t t = triStart; t < triEnd; ++t) {
+            Tri& tr = S.tris[t];
+            const Tri orig = tr;
+            const auto& vc = corner[t - triStart];
+            if (keyed) {
+                tr.vkeys = (int)S.vertexKeys.size();
+                tr.vkeyCount = K;
+                for (int k = 0; k < K; ++k) {
+                    for (int c = 0; c < 3; ++c) S.vertexKeys.push_back(keyPos[(size_t)k][(size_t)vc[(size_t)c]]);
+                    for (int c = 0; c < 3; ++c) {
+                        Vec3 n = cornerNormal(orig, c, vc[(size_t)c], k);
+                        if (dot(n, n) < 1e-24)
+                            n = normalize(cross(keyPos[(size_t)k][(size_t)vc[1]] - keyPos[(size_t)k][(size_t)vc[0]],
+                                                keyPos[(size_t)k][(size_t)vc[2]] - keyPos[(size_t)k][(size_t)vc[0]]));
+                        S.vertexKeys.push_back(n);
+                    }
+                }
+            }
+            tr.v0 = keyPos[(size_t)kNow][(size_t)vc[0]];
+            tr.v1 = keyPos[(size_t)kNow][(size_t)vc[1]];
+            tr.v2 = keyPos[(size_t)kNow][(size_t)vc[2]];
+            tr.n0 = cornerNormal(orig, 0, vc[0], kNow);
+            tr.n1 = cornerNormal(orig, 1, vc[1], kNow);
+            tr.n2 = cornerNormal(orig, 2, vc[2], kNow);
+        }
+        if (keyed && !b.name.empty()) movingNames_.insert(b.name);   // fur / settle cannot follow it
+        return true;
+    }
+
     bool addMesh(const Block& b, Loaded& L, const Affine& parentXf = Affine::identity()) {
         std::string file = strOf(b, "file");
         if (file.empty()) { fail("mesh needs a file"); return false; }
@@ -6274,6 +6627,7 @@ private:
                 }
             }
         }
+        if (!applyDeformers(b, L, triStart)) return false;
         // Record the object as a named mesh group (for -check-watertight): the range of
         // world triangles this block just appended. Unnamed blocks get a synthesized
         // "mesh#N" label so the report can still point at them.
