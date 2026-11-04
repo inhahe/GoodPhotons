@@ -1519,12 +1519,11 @@ public:
     // mesh's geometry) and before Scene::build(), so the stripped triangles never reach
     // the BVH: they are neither intersected nor drawn, and cost nothing at render time.
     //
-    // Safety of renumbering: Scene::tris is referenced by INDEX only through
-    // MeshGroup::triStart/triCount, which this function fixes up. Mesh area lights COPY
-    // their triangles into Emitter::meshTris (Scene::addMeshLight) rather than keeping a
-    // range, and `shape_only` is refused on an emissive material anyway; materials are
-    // referenced per-triangle by id, not by position. Everything else that indexes tris
-    // (the BVH, hit records) is built later.
+    // Safety of renumbering: Scene::tris is referenced by INDEX through MeshGroup::triStart/
+    // triCount and a mesh light's EmitTri::tri (the triangle whose vertex keys a deforming one
+    // reads), which this function fixes up; `shape_only` is refused on an emissive material, so
+    // no light's triangle is among those stripped. Materials are referenced per-triangle by id,
+    // not by position. Everything else that indexes tris (the BVH, hit records) is built later.
     void stripShapeOnlyMeshes(Loaded& L) {
         if (shapeOnlyGroups_.empty() || keepShapeOnlyRef()) return;
         // Mark the doomed triangles by group so one linear compaction handles any number
@@ -1547,6 +1546,12 @@ public:
             if (g.shapeOnly) { g.triStart = 0; g.triCount = 0; continue; }
             g.triStart -= removedBefore[std::min(g.triStart, L.scene.tris.size())];
         }
+        for (Emitter& e : L.scene.emitters)
+            for (EmitTri& et : e.meshTris) {
+                if (et.tri < 0 || (size_t)et.tri >= L.scene.tris.size()) continue;
+                if (drop[(size_t)et.tri]) { fail("internal: a mesh light's triangle was stripped as shape_only"); return; }
+                et.tri -= (int)removedBefore[(size_t)et.tri];
+            }
         std::vector<Tri> kept;
         kept.reserve(L.scene.tris.size() - dropped);
         for (size_t t = 0; t < L.scene.tris.size(); ++t)

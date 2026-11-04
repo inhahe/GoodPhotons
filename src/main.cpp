@@ -15706,12 +15706,13 @@ static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam,
 // count already traced. seedBase==0 reproduces the original single-shot streams
 // bit-for-bit, so a plain `-n` render is unchanged. `stableSeed`: on the device too, each
 // photon's stream from its absolute index, so a render split into calls anywhere traces the same
-// photons (the host's are so always): mode P's batches.
+// photons (the host's are so always): mode P's batches. `held`: the device copy of the scene a
+// caller keeps across its calls (cudaHoldScene), or null.
 static Film renderForward(const Scene& scene, const Camera* cam, int resX, int resY, long long N,
                           int nThreads, bool forwardCatch, bool lensMode, bool useCamera,
                           EnergyReport& eOut, bool diffraction = true, bool useGpu = false,
                           uint64_t seedBase = 0, bool wavefront = false, bool pSplit = false,
-                          bool stableSeed = false) {
+                          bool stableSeed = false, const CudaSceneHold* held = nullptr) {
 #ifdef HAVE_CUDA
     // GPU path covers all three finite-lens camera models: the pinhole splat (B), the
     // brute-force catch (C), and the finite-lens next-event splat (A). Fluorescent
@@ -15727,7 +15728,7 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
         cudaAvailable() && cudaForwardSupported(scene)) {
         if (!blurG || forwardCatch || pSplit)
             return renderForwardCuda(scene, *cam, resX, resY, N, eOut, diffraction, camModeG, seedBase,
-                                     wavefront, g_heroC, pSplit, stableSeed);
+                                     wavefront, g_heroC, pSplit, stableSeed, held);
         Film sky; sky.resX = resX; sky.resY = resY; sky.alloc();
         std::vector<std::thread> skyPool;      // disjoint row bands of one film
         // Joined on every way out, the device call's exceptions included: a joinable thread's
@@ -15742,13 +15743,13 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
                                   (int)((long long)resY * (t + 1) / nThreads));
             });
         Film out = renderForwardCuda(scene, *cam, resX, resY, N, eOut, diffraction, camModeG, seedBase,
-                                     wavefront, g_heroC);
+                                     wavefront, g_heroC, false, false, held);
         for (auto& th : skyPool) th.join();
         out.merge(sky);
         return out;
     }
 #else
-    (void)useGpu; (void)wavefront;
+    (void)useGpu; (void)wavefront; (void)held;
 #endif
     std::vector<Film> films(nThreads);
     std::vector<EnergyReport> reports(nThreads);
@@ -18505,6 +18506,25 @@ static int runCompositeProgressive(
 #else
     const bool gpuBackward = false;
 #endif
+    // The device copy of the scene, kept across the batches: each of their device calls would
+    // upload it again otherwise, which on a heavy scene can cost more than the batch's samples.
+    struct HoldScene {
+        CudaSceneHold* h = nullptr;
+        ~HoldScene() {
+#ifdef HAVE_CUDA
+            cudaReleaseScene(h);
+#endif
+        }
+    } hold;
+#ifdef HAVE_CUDA
+    if (useGpu || gpuBackward) hold.h = cudaHoldScene(scene);
+#endif
+    // The CPU's radiance cache advances at the end of each backward batch, so there the batches
+    // are part of the realization: under -radcache a fixed budget keeps a schedule of its own
+    // samples alone, as cpuSppChunks does (1, 9, then an even split into 62 batches), not the
+    // clock's.
+    const bool fixedSchedule = !budgeted && g_radCache && !gpuBackward;
+    long long batchIndex = 0;
 
     // View-dependent first-hit classification: computed once, reused every pass. A blur splits
     // each sample by its own first event instead, and composes without it.
@@ -18579,7 +18599,7 @@ static int runCompositeProgressive(
             Film f = renderForward(scene, &cam, res, resY, dN, nThreads,
                                    /*forwardCatch*/false, /*lensMode*/false, /*useCamera*/true,
                                    e, diffraction, useGpu, (uint64_t)acc.N, wavefront,
-                                   /*pSplit*/blurP, /*stableSeed*/true);
+                                   /*pSplit*/blurP, /*stableSeed*/true, hold.h);
             acc.fwd.merge(f); acc.N += dN;
             acc.energy.emitted += e.emitted; acc.energy.absorbed += e.absorbed;
             acc.energy.sensor  += e.sensor;  acc.energy.escaped  += e.escaped;
@@ -18598,7 +18618,7 @@ static int runCompositeProgressive(
                 Film sp;
                 r = renderBackwardCuda(scene, cam, res, resY, dSpp, diffraction, &bp,
                                        g_maxBounceOverride, g_directOnly, g_heroC, nullptr,
-                                       blurP ? &sp : nullptr);
+                                       blurP ? &sp : nullptr, hold.h);
                 if (blurP) acc.spec.merge(sp);
             } else
 #endif
@@ -18616,7 +18636,10 @@ static int runCompositeProgressive(
         // lands soon, and overhead stays low. Both layers draw each photon and each sample by its
         // absolute index (stableSeed, sampleStride; the host always does), so where the clock ends a
         // batch changes nothing in the image: one seed, one image.
-        {
+        ++batchIndex;
+        if (fixedSchedule) {
+            batchSpp = batchIndex == 1 ? 9 : std::max(1LL, (sppReq - 10 + 61) / 62);
+        } else {
             double dt = std::chrono::duration<double>(clk::now() - tb).count();
             if (dt > 1e-4) {
                 long long next = (long long)((double)batchSpp * (0.5 / dt));

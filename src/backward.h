@@ -1029,7 +1029,7 @@ struct BackwardRenderer {
     // Returns 0 where the pair is not MIS-covered (an emitter the NEE side skips, a delta
     // light, a degenerate geometry), which the callers read as "full weight".
     //
-    //   Sun     cone-sampled, pdf 1/spotOmega inside the cone (`hitP` unused: it is at infinity)
+    //   Sun     cone-sampled, pdf 1/spotOmega inside the cone (no hit: it is at infinity)
     //   Sphere  cone-sampled toward the visible cap when the receiver is outside it, so
     //           1/(2 PI (1-cosMax)) with sin^2(max) = r^2/d^2 — the same expression
     //           sampleSphereCone returns. A receiver INSIDE the sphere falls back to area
@@ -1039,17 +1039,19 @@ struct BackwardRenderer {
     // The CYLINDER's visible-arc sampling (sampleCylinderVisible) narrows the area measure to
     // the front-facing arc; reproducing that here needs its pdf_A, which is not exposed, so a
     // cylinder emitter reports 0 and keeps today's estimator. Logged with the entry.
-    // `deformTri`: the hit's deforming triangle (Hit::deformTri), whose area at the path's time
-    // a deforming mesh light's density is over.
+    // `hit`: the hit on the light, null for one at infinity (a sun). Its geometric normal is the
+    // face the NEE side measures the light by (a mesh light's EmitTri::nrm, a panel's face, never
+    // a smooth mesh's shading normal), and its deforming triangle (Hit::deformTri) the one whose
+    // area at the path's time a deforming mesh light's density is over.
     double lightPdfW(const Scene& scene, int e, const Vec3& from, const Vec3& fromN,
-                     const Vec3& wi, const Vec3* hitP, const Vec3* hitN, int deformTri = -1) const {
+                     const Vec3& wi, const Hit* hit) const {
         const double selP = lightSelPdf(scene, e, from, fromN);
         if (!(selP > 0.0)) return 0.0;
-        return lightPdfWShape(scene, e, from, wi, hitP, hitN, deformTri) * selP;
+        return lightPdfWShape(scene, e, from, wi, hit) * selP;
     }
     // The per-emitter half: the density of sampling `wi` GIVEN that this emitter was chosen.
     double lightPdfWShape(const Scene& scene, int e, const Vec3& from, const Vec3& wi,
-                          const Vec3* hitP, const Vec3* hitN, int deformTri = -1) const {
+                          const Hit* hit) const {
         if (e < 0 || e >= (int)scene.emitters.size()) return 0.0;
         const Emitter& em = scene.emitters[e];
         if (em.collimated) return 0.0;                       // not area-samplable at all
@@ -1065,14 +1067,14 @@ struct BackwardRenderer {
                 // error: the NEE side connects either way, so a wrong (or zero) density here
                 // hands the hit full weight and DOUBLE COUNTS the light.
                 if (em.caps) break;
-                if (!hitP || !hitN) return 0.0;
+                if (!hit) return 0.0;
                 // the visible arc at the instant, grown as a light its keys scale (1 unscaled)
                 const double va = em.cylinderVisibleArea(scene.lightPointThen(em, from)) *
-                                  scene.lightAreaScale(em, *hitN);
+                                  scene.lightAreaScale(em, hit->ng);
                 if (!(va > 0.0)) return 0.0;
-                const Vec3 d = *hitP - from;
+                const Vec3 d = hit->p - from;
                 const double dist2 = dot(d, d);
-                const double cosLight = dot(*hitN, -wi);
+                const double cosLight = dot(hit->ng, -wi);
                 if (!(dist2 > 0.0) || !(cosLight > 0.0)) return 0.0;
                 return dist2 / (va * cosLight);
             }
@@ -1086,12 +1088,12 @@ struct BackwardRenderer {
             }
             default: break;
         }
-        if (!hitP || !hitN || em.area <= 0.0) return 0.0;     // area measure needs the point
-        const Vec3 d = *hitP - from;
+        if (!hit || em.area <= 0.0) return 0.0;               // area measure needs the point
+        const Vec3 d = hit->p - from;
         const double dist2 = dot(d, d);
-        const double cosLight = dot(*hitN, -wi);
+        const double cosLight = dot(hit->ng, -wi);
         if (!(dist2 > 0.0) || !(cosLight > 0.0)) return 0.0;
-        return dist2 / (em.area * scene.lightAreaScaleAt(em, *hitN, deformTri) * cosLight);   // its area now
+        return dist2 / (em.area * scene.lightAreaScaleAt(em, hit->ng, hit->deformTri) * cosLight);   // its area now
     }
 
     // Index of the emitter that owns an emissive surface material, or -1. Scene::emitterForMat
@@ -1122,17 +1124,18 @@ struct BackwardRenderer {
         for (size_t i = 0; i < scene.emitters.size(); ++i) {
             const Emitter& e = scene.emitters[i];
             if (e.shape != EmitterShape::Sun || !e.inCone(d)) continue;
-            Lsun += e.spdFn(lambda) * glossyHitWeight(scene, gm, (int)i, d, nullptr, nullptr);
+            Lsun += e.spdFn(lambda) * glossyHitWeight(scene, gm, (int)i, d, nullptr);
         }
         return Lsun;
     }
 
     // Balance-heuristic weight for an emitter reached by the CONTINUATION. 1 when the vertex
     // it left was not a MIS'd glossy bounce, or when the light is not MIS-covered.
+    // `hit`: as lightPdfW's.
     double glossyHitWeight(const Scene& scene, const GlossyMis& gm, int e, const Vec3& wi,
-                           const Vec3* hitP, const Vec3* hitN, int deformTri = -1) const {
+                           const Hit* hit) const {
         if (!(gm.pdf > 0.0)) return 1.0;
-        const double pL = lightPdfW(scene, e, gm.from, gm.n, wi, hitP, hitN, deformTri);
+        const double pL = lightPdfW(scene, e, gm.from, gm.n, wi, hit);
         if (!(pL > 0.0)) return 1.0;
         const double sum = gm.pdf + pL;
         return (sum > 0.0) ? gm.pdf / sum : 1.0;
@@ -2997,8 +3000,7 @@ struct BackwardRenderer {
                 // already connected to this same emitter.
                 double wMis = 1.0;
                 if (gmis.pdf > 0.0)
-                    wMis = glossyHitWeight(scene, gmis, emitterIndexOfResolved(scene, m),
-                                           ray.d, &h.p, &h.n, h.deformTri);
+                    wMis = glossyHitWeight(scene, gmis, emitterIndexOfResolved(scene, m), ray.d, &h);
                 L += thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfLambda * wMis;
             }
 
@@ -3483,8 +3485,7 @@ struct BackwardRenderer {
                 // The lobe-sampling half of the glossy MIS weight; 1 (and bit-identical to the
                 // old expression) unless the last bounce was a MIS'd glossy one.
                 if (gmis.pdf > 0.0)
-                    ep *= glossyHitWeight(scene, gmis, emitterIndexOfResolved(scene, m),
-                                          ray.d, &h.p, &h.n, h.deformTri);
+                    ep *= glossyHitWeight(scene, gmis, emitterIndexOfResolved(scene, m), ray.d, &h);
                 for (int i = 0; i < nUp; ++i)
                     L[i] += thr[i] * m.emit(lam[i]) * ep * invPdf[i];
             }

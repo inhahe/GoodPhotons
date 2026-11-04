@@ -19,6 +19,7 @@
 #include "render.h"   // EnergyReport, Film
 #include "render_progress.h"   // SppProgress (chunked progress for modes R/D)
 namespace bdpt { struct SurfMap; }   // surfmerge.h: mode J's point x point merge map
+struct CudaSceneHold;                 // cudaHoldScene, below: a device copy of a scene kept across calls
 
 // True if a usable CUDA device is present (driver + at least one device). Cheap to
 // call; result is cached after the first query.
@@ -90,12 +91,13 @@ bool cudaForwardSupported(const Scene& scene);
 // analytic specular connection, no glossy lobe's on a specular-type surface; DCamSet::pSplit).
 // `stableSeed`: each photon's stream from its absolute index (`seedBase` the photons before this
 // call), so a render split into calls anywhere traces the same photons (mode P's batches); it
-// runs on the megakernel.
+// runs on the megakernel. `held`, when non-null, is cudaHoldScene's copy of this same `scene`: the
+// call renders against it instead of uploading the scene itself (mode P's batches).
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                        long long N, EnergyReport& eOut, bool diffraction,
                        char camMode, unsigned long long seedBase = 0,
                        bool wavefront = false, int heroC = 1, bool pSplit = false,
-                       bool stableSeed = false);
+                       bool stableSeed = false, const CudaSceneHold* held = nullptr);
 
 // GPU multi-camera shared forward trace (models A and B — the device twin of the CPU
 // renderForwardShared). Traces ONE set of N photons and splats each vertex to ALL
@@ -493,11 +495,13 @@ bool cudaBackwardWhittedSupported(const Scene& scene, const Camera& cam,
 // epsilon, with no structural difference.
 // `specOut`, when non-null (mode P's blurred split), receives the samples whose own first event is
 // a specular-side surface or the sky (an env scene's); the returned film holds the rest.
+// `held`: as renderForwardCuda's.
 Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         long long spp, bool diffraction,
                         const SppProgress* prog = nullptr,
                         int maxBounce = 32, bool directOnly = false, int heroC = 1,
-                        const WhittedOpts* whitted = nullptr, Film* specOut = nullptr);
+                        const WhittedOpts* whitted = nullptr, Film* specOut = nullptr,
+                        const CudaSceneHold* held = nullptr);
 
 // True if this scene + camera can be rendered by the FAST RGB backward megakernel
 // (mode R `-rgb`, Option B in gpu-backward-fast.md): the reduced non-spectral tracer

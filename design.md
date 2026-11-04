@@ -10143,7 +10143,14 @@ sees the instant, exactly as a static scene with those transforms would show it.
   the host always does, and the device does through `renderForwardCuda`'s `stableSeed` (each
   photon seeded from its absolute index under one seed, on the megakernel) and
   `SppProgress::sampleStride` (the backward samples at a fixed stride between pixels, no seed mixed
-  from the batch's base). One seed renders one image on either device.
+  from the batch's base). One seed renders one image on either device. The one exception is the
+  CPU's `-radcache`, which advances at each backward batch's end: under it a fixed budget takes a
+  schedule of its samples alone (`fixedSchedule`: 1, 9, then an even split into 62, as
+  `cpuSppChunks`'s). The batches share one device copy of the scene (`cudaHoldScene`;
+  `renderForwardCuda` and `renderBackwardCuda` take it, as `renderBdptCuda` and the shared photon
+  map do, through `sceneOrHeld`), so a heavy scene's upload is paid once, not twice a batch. Mode
+  M's device deposit seeds its clock-sized chunks the same way (`depositLaunch`, `stableSeed`):
+  one seed, one map, and its count-only pass and the fill after it deposit the same photons.
 - **Mode P under a blur** (0.415.0) does not classify pixels: no pixel is wholly one kind over
   the shutter. The backward layer splits each sample by its own path's first event at its own
   time (`BackwardRenderer::specFirstFilm`; the path writes it as it goes through `GiCtx::first`,
@@ -10210,7 +10217,12 @@ sees the instant, exactly as a static scene with those transforms would show it.
   on the triangle then is a density of 1 / (area · J) over the surface at that time, so J stands
   where `lightAreaScale` stands for a light that scales: `emitterSamplePoint(scene, ...)`
   returns it to every sampler (`areaScaleOut`), and a hit on the light reads its own from the hit's
-  `deformTri` (`lightAreaScaleAt`), in every density both sides of each MIS weight use. The timed
+  `deformTri` (`lightAreaScaleAt`), in every density both sides of each MIS weight use. The glossy
+  bounces' weight takes the whole hit (`glossyHitWeight`, `lightPdfW`: its point, its geometric
+  normal -- the face the NEE side measures a light by, a mesh light's `EmitTri::nrm`, not a smooth
+  mesh's shading normal -- and its deforming triangle), so no caller can drop a part. A light with
+  no area at a path's time (a triangle collapsed, keys that flatten it: J = 0) emits nothing then,
+  `emitterSamplePoint` zeroing its radiance and leaving its densities finite. The timed
   light tree boxes such a light by every corner at every key, each carried by every motion key.
   `emit_orient flip` swaps the keys' corners 1 and 2, and their normals, with the triangle's.
   Device twins: `DEmitter::deforms`, `DEmitTri::tri`, `dEmitterSamplePoint` (the sample, its

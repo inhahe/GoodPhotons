@@ -33,7 +33,9 @@ cube whose keys scale and shear it together. It requires:
     lights that moves and turns (an area panel, a glowing ball, a spot, a tube, an emissive
     triangle), in modes R, B and D. So does a glowing sheet a keyed deformer grows as it slides,
     flipped by `emit_orient` to radiate down (its still twin the sheet scaled and moved by its own
-    transform), in every mode on both devices.
+    transform), in every mode on both devices -- also loaded after a `shape_only` mesh, whose
+    stripped triangles renumber its own, and over a rough mirror, where the glossy bounces' MIS
+    weighs it at its area then -- and one grown from nothing lights nothing at the interval's start.
   * A ball whose sweep runs far past the instant's bounding sphere is lit by the sky (mode B) and
     by a low sun (mode B), and shadows the floor in that sun (mode D), as in blurred mode R. A
     shared flight resumes its own shutter's sidecar and refuses one rendered with another.
@@ -86,6 +88,9 @@ cube whose keys scale and shear it together. It requires:
     held sharp late in the shutter shows the sun's shadows where the instant has them while its
     sibling balls (one an isosurface) have moved -- and builds
     a sphere its keys stretch as a mesh, as it does one an uneven static scale stretches.
+  * Mode P on the GPU with the scene held on the device across its batches renders what it renders
+    uploading it for each, and GPU mode M's chunked photon deposit is one map per seed; mode P
+    under -radcache on the CPU renders one image per seed.
 Exits 1 on any failure.
 """
 import argparse
@@ -93,6 +98,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 import numpy as np
 
@@ -420,12 +426,15 @@ def scaled_lights_scene(obj, kind, u=None, shutter=None):
 GLOW_S, GLOW_X = (0.6, 1.5), (-0.4, 0.4)
 
 
-def glow_deform_scene(grid, u=None, shutter=None):
+def glow_deform_scene(grid, u=None, shutter=None, scales=GLOW_S, glossy=False, strip=False):
     """The deforming glowing sheet (GLOW_S, GLOW_X) over a floor, radiating down, the scene's only
-    light; or held still at u, the sheet scaled and moved there by its own transform."""
+    light; or held still at u, the sheet scaled and moved there by its own transform. `scales`: its
+    scale at the interval's ends; `glossy`: the floor a rough mirror, so the glossy bounces' MIS
+    weighs its hits; `strip`: a `shape_only` mesh loaded before it, whose triangles are stripped
+    from the scene, renumbering the sheet's."""
     cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
     def at(u):   # the sheet's scale and slide at fraction u of the interval
-        return GLOW_S[0] + (GLOW_S[1] - GLOW_S[0]) * u, GLOW_X[0] + (GLOW_X[1] - GLOW_X[0]) * u
+        return scales[0] + (scales[1] - scales[0]) * u, GLOW_X[0] + (GLOW_X[1] - GLOW_X[0]) * u
     if u is None:
         def to(p, k):   # handle corner p at the k-th of three keys, the middle one the instant's
             s, x = at(k / 2.0)
@@ -440,7 +449,9 @@ def glow_deform_scene(grid, u=None, shutter=None):
         "scene { units meters  motion_interval -0.5 0.5 }",
         'material "white" { type diffuse reflect 0.7 }',
         'material "glow"  { type diffuse reflect 0.0  emit blackbody 5200 }',
-        "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }",
+        'material "gloss" { type glossy reflect 0.7  roughness 0.25 }',
+        ('mesh "proxy" { file "%s"  material white  shape_only yes }' % grid) if strip else "",
+        "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material %s }" % ("gloss" if glossy else "white"),
         "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material white }",
         'group { translate 0 1.5 0  mesh "glow" { file "%s"  material glow  emit_orient flip  %s } }'
         % (grid, shape),
@@ -606,13 +617,25 @@ def read_pfm(path):
     return data[::-1].astype(np.float64)
 
 
+def remove(f):
+    """Delete `f` if it exists, waiting out another process (a scanner, an indexer) that holds it
+    open for a moment: the run's last render of that name must not be read in place of the next."""
+    for _ in range(40):
+        try:
+            if os.path.exists(f):
+                os.remove(f)
+            return
+        except PermissionError:
+            time.sleep(0.25)
+    os.remove(f)
+
+
 def render(exe, out, path, tag, args, seed=1, want_gpu=False):
     """Render `path` to <out>/<tag>.png; returns (HDR image, raw PFM bytes, log)."""
     png = os.path.join(out, tag + ".png")
     pfm = png[:-4] + ".pfm"
     for f in (png, pfm):
-        if os.path.exists(f):
-            os.remove(f)
+        remove(f)
     cmd = [exe, "-in", path, "-seed", str(seed), "-hdr", "-no-meter", "-o", png] + args
     rc, log = run(cmd)
     if rc != 0 or not os.path.exists(pfm):
@@ -726,7 +749,18 @@ def main():
             [(0.4, "a ball and a tube their keys stretch", lambda u=None, shutter=None: scaled_lights_scene(objf, "stretch", u, shutter),
               lone_modes)] +
             [(t, "a deforming glowing mesh", lambda u=None, shutter=None: glow_deform_scene(gridf, u, shutter),
-              glow_modes) for t in (-0.35, 0.4)])
+              glow_modes) for t in (-0.35, 0.4)] +
+            # ... loaded after a shape_only mesh, whose stripped triangles renumber the sheet's
+            [(0.4, "a deforming glowing mesh after a shape_only one",
+              lambda u=None, shutter=None: glow_deform_scene(gridf, u, shutter, strip=True),
+              [m for m in glow_modes if (m[0], m[1]) in (("R", "cpu"), ("B", "cpu"), ("R", "gpu"), ("B", "gpu"),
+                                                         ("D", "gpu"))])] +
+            # ... over a rough mirror, grown 2.5 times since the instant: the glossy bounces' MIS
+            # weighs each hit on it by its area then, as their NEE does
+            [(0.4, "a deforming glowing mesh over a rough mirror",
+              lambda u=None, shutter=None: glow_deform_scene(gridf, u, shutter, scales=(0.3, 2.0), glossy=True),
+              [("M", "cpu", ["-spp", "128", "-n", "8000000"])] +
+              [m for m in glow_modes if (m[0], m[1]) in (("S", "cpu"), ("R", "cpu"), ("M", "gpu"), ("S", "gpu"))])])
     for t, what, make, modes in held:
         sharp, ref = os.path.join(out, "lights_sharp.ftsl"), os.path.join(out, "lights_ref.ftsl")
         write(sharp, make(shutter=(t, t)))
@@ -743,6 +777,19 @@ def main():
             good, detail = agree(la, lb, tol)
             verdict("%s move with their group (mode %s%s, sharp at %g)"
                     % (what, mode, " on the GPU" if gpu else "", t), good, detail)
+    # A glowing sheet grown from nothing: at the interval's start it has no area, so it lights
+    # nothing then (rather than the instant's sheet, or a division by its zero area).
+    for mode, dev, margs in [m for m in glow_modes if m[0] in ("R", "B", "D", "U")]:
+        args = ["-mode", mode, "-device", dev] + margs
+        lit = {}
+        for t in (-0.5, 0.4):
+            p = os.path.join(out, "zero_area.ftsl")
+            write(p, glow_deform_scene(gridf, shutter=(t, t), scales=(0.0, 1.5)))
+            img = render(exe, out, p, "zero_area_%g" % t, args, want_gpu=dev == "gpu")[0]
+            lit[t] = float(np.abs(lum(img)).mean())
+        r = lit[-0.5] / max(lit[0.4], 1e-300)
+        verdict("a light with no area at a time lights nothing then (mode %s%s)" % (mode, " on the GPU" if dev == "gpu" else ""),
+                r < 1e-6 and np.isfinite(lit[-0.5]), "%.3g of its light at 0.4" % r)
     # An isosurface, a curve and an instance move, turn and grow with their group: held sharp at
     # a time, they are the static group written out there.
     for t in (-0.35, 0.4):
@@ -1142,14 +1189,47 @@ def main():
 
     light_and_haze_tests(exe, out, verdict, hair, not a.no_gpu)
     p_split_tests(exe, out, verdict, not a.no_gpu)
+    # Mode P under -radcache on the CPU, whose cache advances at each backward batch's end: a
+    # fixed budget's batches follow its samples, not the clock (some 60 of them here, enough for the
+    # cache to cut paths short), so one seed renders one image.
+    p = os.path.join(out, "radcache_box.ftsl")
+    write(p, scene(u=0.5))
+    raws = [render(exe, out, p, "radcache_%d" % k, ["-mode", "P", "-device", "cpu", "-radcache", "-spp", "3000",
+                                                     "-n", "600000000"])[1] for k in (1, 2)]
+    verdict("mode P under -radcache on the CPU: one seed, one image", raws[0] == raws[1])
     j_empty_test(exe, out, verdict)
     camera_tests(exe, out, verdict, devices)
     lens_tests(exe, out, verdict, devices)
     if not a.no_gpu:
         meter_m_test(exe, out, verdict)
         m_epoch_tests(exe, out, verdict)
+        split_tests(exe, out, verdict)
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
+
+
+def split_tests(exe, out, verdict):
+    """Renders the device splits into calls or chunks, the still box: mode P with the scene held
+    on the device across its batches renders what it renders uploading it for each
+    (FTRACE_NOHOLD=1), and GPU mode M's photon map, deposited in chunks the clock sizes, is one map
+    per seed (each photon seeded from its absolute index)."""
+    p = os.path.join(out, "split_box.ftsl")
+    write(p, scene(u=0.5))
+    args = ["-mode", "P", "-device", "gpu", "-spp", "64", "-n", "8000000"]
+    held = render(exe, out, p, "split_held", args, want_gpu=True)[0]
+    os.environ["FTRACE_NOHOLD"] = "1"
+    try:
+        unheld = render(exe, out, p, "split_unheld", args, want_gpu=True)[0]
+    finally:
+        del os.environ["FTRACE_NOHOLD"]
+    d = np.abs(held - unheld).max() / max(np.abs(unheld).max(), 1e-300)
+    verdict("mode P on the GPU, the scene held across batches = uploaded each", d < 1e-4,
+            "largest change %.3g of the brightest pixel" % d)
+    args = ["-mode", "M", "-device", "gpu", "-spp", "16", "-n", "30000000"]
+    a, b = (render(exe, out, p, "split_dep_%d" % k, args, want_gpu=True)[0] for k in (1, 2))
+    d = np.abs(a - b).max() / max(np.abs(b).max(), 1e-300)
+    verdict("GPU mode M: one seed, one photon map, however the clock cuts its deposit", d < 1e-4,
+            "largest change %.3g of the brightest pixel" % d)
 
 
 def meter_m_test(exe, out, verdict):

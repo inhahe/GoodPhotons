@@ -2854,7 +2854,7 @@ struct Renderer {
         // emitter class carries grandTotal (carry-total split, see above).
         beta = !scene.emissiveVolumes.empty() ? grandTotal
              : ((scene.emitters.size() == 1) ? em.power : scene.totalPower);
-        beta *= spotW;   // exactly 1.0 for non-spot emitters (no bit change)
+        beta *= spotW;   // 1 for a still, unscaled area light (a spot's reweight, a light's growth)
         // Image env: replace the flat power with the directional estimator. The base
         // beta carries the mean env power; multiply by L(dir,lambda)/(4pi*pdfW*mean)
         // so the photon represents the radiance actually arriving from `dir`. (No-op

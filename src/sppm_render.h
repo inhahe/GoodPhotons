@@ -142,7 +142,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 const double wMis = (gmis.pdf > 0.0)
                     ? bwNee.glossyHitWeight(scene, gmis,
                                             BackwardRenderer::emitterIndexOfResolved(scene, m),
-                                            ray.d, &h.p, &h.n)
+                                            ray.d, &h)
                     : 1.0;
                 directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                            * (thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfL * wMis);

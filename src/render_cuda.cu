@@ -4877,42 +4877,48 @@ __device__ static inline DVec3 dSampleAimDirNow(const DScene& sc, const DEmitter
 __device__ static inline bool dLightScales(const DScene& sc, const DEmitter& em) {
     return em.motion >= 0 && dTimed(sc) && sc.mo.sets[em.motion].shape != kMotionRigid;
 }
-// An area sample's point and unit normal carried to the path's time: as dLightCarry, but the normal
-// by the inverse transpose where the keys stretch unevenly (a flat light's only).
-__device__ __noinline__ static DPointDir2 dLightCarryNormalOut(const DScene& sc, int set, DVec3 p, DVec3 n) {
-    DAff D, Di;
-    dMotionAt(sc.mo, set, (double)dMotionU(), D);
-    dAffInverse(D, Di);
-    return DPointDir2{affPoint(D.m, D.t, p), normalize(dAffDirT(Di, n)), n};
-}
-// A sphere light's sample on the sphere its geometry is at the path's time (host twin
-// Scene::lightSpherePointNow; dMovedSphere): its unit normal `n` carried, the point of the moved
-// sphere along it -- the point carried itself would leave that sphere between keys.
-__device__ __noinline__ static DPointDir2 dLightSphereOut(const DScene& sc, int set, DVec3 c, double r, DVec3 n) {
+// A moving light's area sample (point `p`, unit normal `n`, at the instant) at the path's time, and
+// how much its area has grown there, from one evaluation of the motion (host twins
+// Scene::lightPointNow, lightNormalNow, lightSpherePointNow, lightAreaScale). A ball's (`ball`,
+// centre `c`, radius `r`) is put on its moved surface (dMovedSphere): its normal carried, the point
+// of the moved sphere along it -- the point carried itself would leave that sphere between keys. A
+// flat light's normal goes by the inverse transpose where the keys stretch unevenly, any other's as
+// dLightCarry carries a direction. J: |det D| / |D^T n| about the carried normal (s^2 under a
+// similarity, 0 where the keys flatten it), 1 under rigid keys or unless `wantJ`.
+struct DLightNow { DVec3 p, n; double J; };
+__device__ __noinline__ static DLightNow dLightSampleNowOut(const DScene& sc, int set, bool ball, DVec3 c,
+                                                            double r, DVec3 p, DVec3 n, bool wantJ) {
     DAff D;
     dMotionAt(sc.mo, set, (double)dMotionU(), D);
-    const DVec3 nn = normalize(affDir(D.m, n));
-    return DPointDir2{affPoint(D.m, D.t, c) + nn * (Real)(r * dAffScale(D)), nn, nn};
-}
-__device__ static inline void dLightCarryNormal(const DScene& sc, const DEmitter& em, DVec3& p, DVec3& n) {
-    if (!(em.motion >= 0 && dTimed(sc))) return;
-    if (em.shape == 1) {   // a ball: on its moved surface
-        const DPointDir2 r = dLightSphereOut(sc, em.motion, em.origin, em.radius, n);
-        p = r.p; n = r.d1;
-    } else if (sc.mo.sets[em.motion].shape == kMotionAffine) {
-        const DPointDir2 r = dLightCarryNormalOut(sc, em.motion, p, n);
-        p = r.p; n = r.d1;
+    const int shape = sc.mo.sets[set].shape;
+    DLightNow o;
+    if (ball) {
+        o.n = normalize(affDir(D.m, n));
+        o.p = affPoint(D.m, D.t, c) + o.n * (Real)(r * dAffScale(D));
+    } else if (shape == kMotionAffine) {
+        DAff Di;
+        dAffInverse(D, Di);
+        o.p = affPoint(D.m, D.t, p);
+        o.n = normalize(dAffDirT(Di, n));
     } else {
-        dLightCarry(sc, em, p, n);
+        o.p = affPoint(D.m, D.t, p);
+        o.n = normalize(affDir(D.m, n));
     }
+    o.J = 1.0;
+    if (wantJ && shape != kMotionRigid) {
+        const double l = (double)length(dAffDirT(D, o.n));
+        o.J = l > 0.0 ? fabs(dAffDet(D)) / l : 0.0;
+    }
+    return o;
 }
 // How much the light's area grows at the path's time about a point whose unit normal there is
-// `nNow`: |det D| / |D^T nNow| (s^2 under a similarity); 1 for a light its keys do not scale.
+// `nNow`: |det D| / |D^T nNow| (s^2 under a similarity, 0 where the keys flatten it); 1 for a light
+// its keys do not scale. The hit side's (dLightAreaScaleAt); a sample's comes with its carry.
 __device__ __noinline__ static double dLightAreaScaleOut(const DScene& sc, int set, DVec3 nNow) {
     DAff D;
     dMotionAt(sc.mo, set, (double)dMotionU(), D);
     const double l = (double)length(dAffDirT(D, nNow));
-    return l > 0.0 ? fabs(dAffDet(D)) / l : 1.0;
+    return l > 0.0 ? fabs(dAffDet(D)) / l : 0.0;
 }
 __device__ static inline double dLightAreaScale(const DScene& sc, const DEmitter& em, const DVec3& nNow) {
     return dLightScales(sc, em) ? dLightAreaScaleOut(sc, em.motion, nNow) : 1.0;
@@ -4986,8 +4992,8 @@ __device__ __noinline__ static void dDeformedCorners(const DScene& sc, int tri, 
 // A deforming mesh light's sample at the path's time (host twin Scene::deformedEmitPoint): its
 // triangle `et` as the keys have it then (dDeformedCorners, carried by any group motion), the point
 // at the sample's barycentrics (b1, b2), its face normal turned to the side the instant's is, and
-// in J how much the triangle's area has grown. `ok` 0 where the triangle does not deform or has
-// collapsed. Out of line, as the timed walks are.
+// in J how much the triangle's area has grown (0 where it has collapsed then, its normal then the
+// instant's). `ok` 0 where the triangle does not deform. Out of line, as the timed walks are.
 struct DEmitNow { DVec3 y, n; double J; int ok; };
 __device__ __noinline__ static DEmitNow dDeformedEmitOut(const DScene& sc, const DEmitTri* et, double b1,
                                                          double b2) {
@@ -5000,9 +5006,9 @@ __device__ __noinline__ static DEmitNow dDeformedEmitOut(const DScene& sc, const
     const DVec3 e1 = p[1] - p[0], e2 = p[2] - p[0];
     const DVec3 c = cross(e1, e2), c0 = cross(et->e1, et->e2);
     const double l = (double)length(c), l0 = (double)length(c0);
-    if (!(l > 0.0) || !(l0 > 0.0)) return r;
+    if (!(l0 > 0.0)) return r;
     r.y = p[0] + e1 * (Real)b1 + e2 * (Real)b2;
-    r.n = c * (Real)(((double)dot(c0, et->nrm) >= 0.0 ? 1.0 : -1.0) / l);
+    r.n = (l > 0.0) ? c * (Real)(((double)dot(c0, et->nrm) >= 0.0 ? 1.0 : -1.0) / l) : et->nrm;
     r.J = l / l0;
     r.ok = 1;
     return r;
@@ -5019,11 +5025,12 @@ __device__ __noinline__ static double dDeformedAreaScaleOut(const DScene& sc, in
 }
 // How much a light's area has grown about a hit on it at the path's time (host twin
 // Scene::lightAreaScaleAt): its deforming triangle's (DHit::deformTri), else dLightAreaScale about
-// the hit's normal.
+// the hit's normal. A light with no area then has no hit on it, so a 0 (rounding's) reads as 1.
 __device__ static inline double dLightAreaScaleAt(const DScene& sc, const DEmitter& em, const DVec3& nNow,
                                                   int deformTri) {
-    if (deformTri >= 0 && dTimed(sc)) return dDeformedAreaScaleOut(sc, deformTri);
-    return dLightAreaScale(sc, em, nNow);
+    const double J = (deformTri >= 0 && dTimed(sc)) ? dDeformedAreaScaleOut(sc, deformTri)
+                                                    : dLightAreaScale(sc, em, nNow);
+    return J > 0.0 ? J : 1.0;
 }
 // A moving or deforming triangle (global index `i`) at the path's time (host twins
 // intersectMovingTri / intersectDeformingTri): its corners tested first, the triangle rebuilt in
@@ -11054,7 +11061,7 @@ __device__ static double dEmitterPatMulAt(const DScene& sc, const DEmitter& em,
 // that does not use the feature — those keep bit-identical draws, since the uv outputs are
 // the only extra work and they do not touch the RNG.
 // A moving light is sampled where it sits at the instant -- its pattern read there, where it
-// travels with the light -- and the point and normal carried out (dLightCarryNormal); a deforming
+// travels with the light -- and the point and normal carried out (dLightSampleNowOut); a deforming
 // mesh light's put on its triangle as the keys have it then (dDeformedEmitOut). `areaScaleOut`,
 // when given, receives how much the light's area has grown about the point at the path's time
 // (1 for one that does not change size): what its area densities divide by, its photons' power
@@ -11073,16 +11080,21 @@ __device__ static double dEmitterSamplePoint(const DScene& sc, const DEmitter& e
         emitterSamplePoint(em, u1, u2, y, nOut, &uu, &vv, &reach, deform ? &mt : nullptr, bary);
         pmul = dEmitterPatMulAt(sc, em, y, nOut, uu, vv, reach);
     }
+    double J = 1.0;
+    bool placed = false;
     if (mt >= 0) {
         const DEmitNow r = dDeformedEmitOut(sc, em.meshTris + mt, bary[0], bary[1]);
-        if (r.ok) {
-            y = r.y; nOut = r.n;
-            if (areaScaleOut) *areaScaleOut = r.J;
-            return pmul;
-        }
+        if (r.ok) { y = r.y; nOut = r.n; J = r.J; placed = true; }
     }
-    dLightCarryNormal(sc, em, y, nOut);
-    if (areaScaleOut) *areaScaleOut = dLightAreaScale(sc, em, nOut);
+    if (!placed && em.motion >= 0 && dTimed(sc)) {
+        const DLightNow r = dLightSampleNowOut(sc, em.motion, em.shape == 1, em.origin, em.radius, y, nOut,
+                                               areaScaleOut != nullptr);
+        y = r.p; nOut = r.n; J = r.J;
+    }
+    // No area at the path's time (a triangle collapsed, keys that flatten it): it emits nothing
+    // then, its densities left finite.
+    if (!(J > 0.0)) { J = 1.0; pmul = 0.0; }
+    if (areaScaleOut) *areaScaleOut = J;
     return pmul;
 }
 
@@ -11494,7 +11506,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     if (emOut) *emOut = ei;
     Real u1 = rng.uniform(), u2 = rng.uniform();
     DVec3 origin, emitN, dir;
-    Real spotW = (Real)1;                            // spot direction reweight (else 1)
+    Real spotW = (Real)1;   // a spot's direction reweight, or an area light's growth at the photon's time
     bool envImage = false; double envPdfW = 0.0;     // image env: reweight below
     double emitPatW = 1.0;                           // `emit pattern:` factor at the point
     if (em.shape == 2) {
@@ -11597,7 +11609,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     // grandTotal (host twin: render.h). Otherwise the ordinary emitter scaling.
     beta = (Real)((sc.emissiveVolN > 0) ? grandTotal
                   : ((sc.nEmitters == 1) ? em.power : sc.totalPower));
-    beta *= spotW;                                   // exactly 1 for non-spot
+    beta *= spotW;          // 1 for a still, unscaled area light
     // Image env: reweight so the photon carries the radiance actually arriving
     // from `dir`, = L(dir,lambda)/(4pi*envPdfW*avgSpd(lambda)). The shared
     // illuminant in L and avgSpd cancels, leaving the per-texel JH ratio.
@@ -14098,11 +14110,10 @@ __device__ static inline double dLightSelPdf(const DScene& sc, int e, const DVec
 //
 // The device samples spheres and cylinders by uniform AREA (bkEmitterGeom), unlike the host's
 // cone / visible-arc importance sampling, so the area form below is the right one for BOTH here.
-// `deformTri`: the hit's deforming triangle (DHit::deformTri), whose area at the path's time a
-// deforming mesh light's density is over.
+// `hit`: the hit on the light, null for a sun (host twin lightPdfW says why its geometric normal,
+// and its deforming triangle).
 __device__ static inline double dLightPdfWShape(const DScene& sc, int e, const DVec3& from,
-                                                const DVec3& wi, const DVec3* hitP,
-                                                const DVec3* hitN, int deformTri = -1) {
+                                                const DVec3& wi, const DHit* hit) {
     if (e < 0 || e >= sc.nEmitters) return 0.0;
     const DEmitter& em = sc.emitters[e];
     if (em.collimated) return 0.0;
@@ -14111,29 +14122,28 @@ __device__ static inline double dLightPdfWShape(const DScene& sc, int e, const D
         return (em.spotOmega > 0) ? 1.0 / (double)em.spotOmega : 0.0;
     }
     if (em.shape == 2 || em.shape == 3) return 0.0;            // Spot (delta) / Env (own MIS)
-    if (!hitP || !hitN || !(em.area > 0)) return 0.0;
-    const DVec3 d = *hitP - from;
+    if (!hit || !(em.area > 0)) return 0.0;
+    const DVec3 d = hit->p - from;
     const double dist2 = (double)ddot(d, d);
-    const double cosLight = (double)ddot(*hitN, wi * (Real)(-1));
+    const double cosLight = (double)ddot(hit->ng, wi * (Real)(-1));
     if (!(dist2 > 0.0) || !(cosLight > 0.0)) return 0.0;
-    return dist2 / ((double)em.area * dLightAreaScaleAt(sc, em, *hitN, deformTri) * cosLight);   // its area now
+    return dist2 / ((double)em.area * dLightAreaScaleAt(sc, em, hit->ng, hit->deformTri) * cosLight);   // its area now
 }
 // ...and the whole NEE density: p_select * p_light. Host twin: lightPdfW.
 __device__ static inline double dLightPdfWAt(const DScene& sc, int e, const DVec3& from,
                                              const DVec3& fromN, const DVec3& wi,
-                                             const DVec3* hitP, const DVec3* hitN, int deformTri = -1) {
+                                             const DHit* hit) {
     const double selP = dLightSelPdf(sc, e, from, fromN);
     if (!(selP > 0.0)) return 0.0;
-    return dLightPdfWShape(sc, e, from, wi, hitP, hitN, deformTri) * selP;
+    return dLightPdfWShape(sc, e, from, wi, hit) * selP;
 }
 
 // Balance-heuristic weight for an emitter reached by the CONTINUATION; 1 when the previous
 // bounce was not a MIS'd glossy one, or when the light is not covered.
 __device__ static inline double dGlossyHitWeight(const DScene& sc, const DGlossyMis& gm, int e,
-                                                 const DVec3& wi, const DVec3* hitP,
-                                                 const DVec3* hitN, int deformTri = -1) {
+                                                 const DVec3& wi, const DHit* hit) {
     if (!(gm.pdf > 0.0)) return 1.0;
-    const double pL = dLightPdfWAt(sc, e, gm.from, gm.n, wi, hitP, hitN, deformTri);
+    const double pL = dLightPdfWAt(sc, e, gm.from, gm.n, wi, hit);
     if (!(pL > 0.0)) return 1.0;
     const double sum = gm.pdf + pL;
     return (sum > 0.0) ? gm.pdf / sum : 1.0;
@@ -14149,7 +14159,7 @@ __device__ static inline double dSunRadianceMis(const DScene& sc, const DGlossyM
     for (int i = 0; i < sc.nEmitters; ++i) {
         const DEmitter& em = sc.emitters[i];
         if (em.shape != 6 || !dInSunCone(em, d)) continue;
-        L += (double)specLookup(em.emitSpd, lambda) * dGlossyHitWeight(sc, gm, i, d, nullptr, nullptr);
+        L += (double)specLookup(em.emitSpd, lambda) * dGlossyHitWeight(sc, gm, i, d, nullptr);
     }
     return L;
 }
@@ -15835,7 +15845,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 // GLOSSY-NEE's lobe-sampling half; 1 -- and this expression bit-identical to
                 // its pre-0.266 form -- unless the previous bounce was a MIS'd glossy one.
                 double wMis = (gmis.pdf > 0.0)
-                    ? dGlossyHitWeight(sc, gmis, li, rd, &h.p, &h.n, h.deformTri) : 1.0;
+                    ? dGlossyHitWeight(sc, gmis, li, rd, &h) : 1.0;
                 L += thr * (double)specLookup(*eSpd, lambda) * invPdfLambda
                          * dEmitHitScale(sc, mp->emitPat, li, h, rd * (Real)(-1)) * wMis;
             }
@@ -16088,7 +16098,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
             if (eSpd) {
                 double ep = dEmitHitScale(sc, mp->emitPat, li, h, rd * (Real)(-1));
                 if (gmis.pdf > 0.0)          // GLOSSY-NEE, as in the scalar loop
-                    ep *= dGlossyHitWeight(sc, gmis, li, rd, &h.p, &h.n, h.deformTri);
+                    ep *= dGlossyHitWeight(sc, gmis, li, rd, &h);
                 for (int i = 0; i < nUp; ++i)
                     L[i] += thr[i] * (double)specLookup(*eSpd, lam[i]) * invPdf[i] * ep;
             }
@@ -19782,7 +19792,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 // already connected to this light, the two strategies are balance-weighted so
                 // the emitter is not counted twice (host twin: photonGather).
                 const double wMis = (gmis.pdf > 0.0)
-                                  ? dGlossyHitWeight(sc, gmis, li, rd, &h.p, &h.n, h.deformTri) : 1.0;
+                                  ? dGlossyHitWeight(sc, gmis, li, rd, &h) : 1.0;
                 double e = (double)specLookup(*eSpd, lambda) * thr * invPdfL * wMis
                          * dEmitHitScale(sc, m.emitPat, li, h, rd * (Real)(-1));    // pattern and aim at this hit
                 oX += (double)cieX(lambda) * e;
@@ -23405,8 +23415,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
                 dtris[i].uv0  = {(Real)s.uv0.x,  (Real)s.uv0.y,  (Real)s.uv0.z};
                 dtris[i].uvE1 = {(Real)s.uvE1.x, (Real)s.uvE1.y, (Real)s.uvE1.z};
                 dtris[i].uvE2 = {(Real)s.uvE2.x, (Real)s.uvE2.y, (Real)s.uvE2.z};
+                dtris[i].tri = s.tri;
             }
-            for (size_t i = 0; i < e.meshTris.size(); ++i) dtris[i].tri = e.meshTris[i].tri;
             de.meshTris = (const DEmitTri*)keep(uploadVec(dtris));
             de.meshTriN = (int)dtris.size();
         }
@@ -24102,6 +24112,16 @@ bool cudaSceneHoldFits(const CudaSceneHold* held, const Scene& scene) {
     return held && held->scene == &scene && held->generation == scene.generation &&
            held->buildCount == scene.buildCount;
 }
+// The scene half of a device call's upload: `held`'s copy (cudaHoldScene's, of this same scene)
+// when given, else this call's own. A hold of another scene would render its geometry under this
+// one's lights and materials, so `who` (the call) refuses it. The copy is a POD of device
+// pointers: the call's own changes to up.sc stay its own, and freeing `up` frees none of the hold.
+static void sceneOrHeld(const Scene& scene, const CudaSceneHold* held, DUpload& up, const char* who) {
+    if (!held) { buildUploadScene(scene, up); return; }
+    if (!cudaSceneHoldFits(held, scene))
+        throw std::logic_error(std::string(who) + ": the held device scene is not the scene being rendered");
+    up.sc = held->up.sc;
+}
 static double g_lastBdptOverheadSec = 0.0;
 double cudaLastBdptOverheadSec() { return g_lastBdptOverheadSec; }
 CudaSceneHold* cudaHoldScene(const Scene& scene) {
@@ -24263,7 +24283,8 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
 // single-camera and multi-camera drivers so the launch/seeding logic lives in one place.
 // `stableSeed`: each photon's stream from its absolute index (seedBase, the photons before this
 // launch, on) under one seed, so a render's photons draw the same streams however they are split
-// into launches (mode P's batches); on the megakernel, the one backend that seeds per photon.
+// into launches (mode P's batches, mode M's clock-sized deposit chunks); on the megakernel, the
+// one backend that seeds per photon.
 static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
                           long long N, bool diffraction, unsigned long long seedBase,
                           bool wavefront, int camModeInt, int heroC, bool stableSeed = false) {
@@ -24309,13 +24330,14 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                        long long N, EnergyReport& eOut, bool diffraction,
                        char camMode, unsigned long long seedBase, bool wavefront, int heroC,
-                       bool pSplit, bool stableSeed) {
+                       bool pSplit, bool stableSeed, const CudaSceneHold* held) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaForwardSupported(scene)) return out;
 
     DUpload up;
-    buildUpload(scene, cam, resX, resY, up);
+    sceneOrHeld(scene, held, up, "renderForwardCuda");
+    up.dc = bakeCamera(scene, cam, resX, resY, up);
 
     const size_t npix = (size_t)resX * resY;
     double* d_film = nullptr;   CUDA_CHECK(cudaMalloc(&d_film, npix * 3 * sizeof(double)));
@@ -25392,17 +25414,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     if (maxDepth > BDPT_DEEPDEPTH) maxDepth = BDPT_DEEPDEPTH;   // device array bound
 
     DUpload up;
-    if (held) {
-        // A hold of another scene would render that scene's geometry under this one's camera,
-        // lights and materials: refuse it rather than mix them.
-        if (!cudaSceneHoldFits(held, scene))
-            throw std::logic_error("renderBdptCuda: the held device scene is not the scene "
-                                   "being rendered");
-        up.sc = held->up.sc;
-        up.dc = bakeCamera(scene, cam, resX, resY, up);
-    } else {
-        buildUpload(scene, cam, resX, resY, up);
-    }
+    sceneOrHeld(scene, held, up, "renderBdptCuda");
+    up.dc = bakeCamera(scene, cam, resX, resY, up);
     // Mode J under a blur: its epoch is one time (the host's PassTimeScope, atEpochJ), which the
     // light subpaths and the camera pass take; mode D's paths take their own (g_passMotionU < 0).
     up.sc.mo.passU = hostPassU(scene);
@@ -26047,7 +26060,7 @@ bool cudaBackwardWhittedSupported(const Scene& scene, const Camera& cam,
 Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         long long spp, bool diffraction, const SppProgress* prog,
                         int maxBounce, bool directOnly, int heroC, const WhittedOpts* whitted,
-                        Film* specOut) {
+                        Film* specOut, const CudaSceneHold* held) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     // The split's second film, allocated before any early return, so a caller always gets both
@@ -26057,7 +26070,8 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
     if (whitted && !cudaBackwardWhittedSupported(scene, cam, *whitted)) return out;
 
     DUpload up;
-    buildUpload(scene, cam, resX, resY, up);
+    sceneOrHeld(scene, held, up, "renderBackwardCuda");
+    up.dc = bakeCamera(scene, cam, resX, resY, up);
     if (maxBounce >= 1) up.sc.bkMaxBounce = maxBounce;   // Stage 3: -max-bounce cap
     up.sc.bkDirectOnly = directOnly ? 1 : 0;             // Stage 3: -direct-only (Whitted)
     if (whitted) {                                       // -mode W deterministic preview
@@ -26540,16 +26554,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     if (nc == 0 || !cudaAvailable() || !cudaPhotonMapSupported(scene)) return out;
 
     DUpload up;
-    if (held) {
-        // A hold of another scene would gather that scene's geometry under this one's lights
-        // and materials: refuse it rather than mix them.
-        if (!cudaSceneHoldFits(held, scene))
-            throw std::logic_error("renderPhotonMapSharedCuda: the held device scene is not the "
-                                   "scene being rendered");
-        up.sc = held->up.sc;
-    } else {
-        buildUploadScene(scene, up);
-    }
+    sceneOrHeld(scene, held, up, "renderPhotonMapSharedCuda");
     // A blurred moving scene's epoch (the host's refresh loop, under its PassTimeScope): the
     // deposit, the maps and the gather all at its one time.
     up.sc.mo.passU = hostPassU(scene);
@@ -26806,9 +26811,12 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             cs.beamAchroOK = pbeams::gAchro && beamSpectralOK(scene);
         }
         (aimedPass ? aimEmitted : depEmitted) = Nq;
+        // Each photon's stream from its absolute index (stableSeed), so the chunks the clock cuts
+        // below draw the photons one launch draws: one seed, one map, and a count-only pass and the
+        // fill after it deposit the same photons.
         if (!splitDeposit) {
             launchForward(up, cs, eBuf, Nq, diffraction, seed0, /*wavefront*/false,
-                          CAM_B, heroC);
+                          CAM_B, heroC, /*stableSeed*/true);
             return;
         }
         stage->report(label, 0, Nq, nullptr, 0.0);
@@ -26819,7 +26827,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             const long long cs2 = (off + chunk <= Nq) ? chunk : (Nq - off);
             const auto t0 = std::chrono::steady_clock::now();
             launchForward(up, cs, eBuf, cs2, diffraction, seed0 + (unsigned long long)off,
-                          /*wavefront*/false, CAM_B, heroC);
+                          /*wavefront*/false, CAM_B, heroC, /*stableSeed*/true);
             CUDA_CHECK(cudaDeviceSynchronize());   // the launch is async; time the WORK
             const double sec = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t0).count();

@@ -1924,22 +1924,17 @@ struct Scene {
     // similarity, by the inverse transpose under any other affine.
     Vec3 lightNormalNow(const Emitter& em, const Vec3& n) const {
         if (!lightMoves(em) || motionSets[(size_t)em.motion].shape != kMotionAffine) return lightDirNow(em, n);
-        const Affine& Di = motionNowInverse(em.motion);
-        return normalize(Vec3{Di.m[0] * n.x + Di.m[3] * n.y + Di.m[6] * n.z,
-                              Di.m[1] * n.x + Di.m[4] * n.y + Di.m[7] * n.z,
-                              Di.m[2] * n.x + Di.m[5] * n.y + Di.m[8] * n.z});
+        return normalize(motionNowInverse(em.motion).applyDirTranspose(n));
     }
     // How much the light's area grows at the path's time about a point whose normal there is
-    // `nNow` (unit): |det D| / |D^T nNow|, s^2 under a similarity of scale s. An area density at
-    // the instant divides by it, a photon's power multiplies by it.
+    // `nNow` (unit): |det D| / |D^T nNow|, s^2 under a similarity of scale s; 0 where the keys
+    // flatten it. An area density at the instant divides by it, a photon's power multiplies by
+    // it (emitterSamplePoint turns a 0 into no emission).
     double lightAreaScale(const Emitter& em, const Vec3& nNow) const {
         if (!lightScales(em)) return 1.0;
         const Affine& D = motionNow(em.motion);
-        const Vec3 tn{D.m[0] * nNow.x + D.m[3] * nNow.y + D.m[6] * nNow.z,
-                      D.m[1] * nNow.x + D.m[4] * nNow.y + D.m[7] * nNow.z,
-                      D.m[2] * nNow.x + D.m[5] * nNow.y + D.m[8] * nNow.z};
-        const double l = length(tn);
-        return l > 0.0 ? std::fabs(D.det()) / l : 1.0;
+        const double l = length(D.applyDirTranspose(nNow));
+        return l > 0.0 ? std::fabs(D.det()) / l : 0.0;
     }
     // A sphere light's sample at the path's time (it moves), on the sphere its geometry is then
     // (movedSphere: the centre carried, the radius by the motion's mean scale): `n`, its unit
@@ -1956,8 +1951,8 @@ struct Scene {
     // A deforming mesh light's sample at the path's time: triangle `k` of its meshTris as its
     // keys have it then (deformedCorners, carried by any group motion), the point at the sample's
     // barycentrics (b1, b2), its face normal turned to the side the instant's is, and how much the
-    // triangle's area has grown (`areaScale`). False, `y` and `n` untouched, where it does not
-    // deform or the path has no time.
+    // triangle's area has grown (`areaScale`: 0 where it has collapsed then, its normal then the
+    // instant's). False, `y` and `n` untouched, where it does not deform or the path has no time.
     bool deformedEmitPoint(const Emitter& em, int k, double b1, double b2, Vec3& y, Vec3& n,
                            double& areaScale) const {
         if (!em.deforms || g_motionU < 0.0 || k < 0) return false;
@@ -1968,25 +1963,29 @@ struct Scene {
         const Vec3 e1 = p[1] - p[0], e2 = p[2] - p[0];
         const Vec3 c = cross(e1, e2), c0 = cross(et.e1, et.e2);
         const double l = length(c), l0 = length(c0);
-        if (!(l > 0.0) || !(l0 > 0.0)) return false;
+        if (!(l0 > 0.0)) return false;
         y = p[0] + e1 * b1 + e2 * b2;
-        n = c * ((dot(c0, et.nrm) >= 0.0 ? 1.0 : -1.0) / l);
+        n = (l > 0.0) ? c * ((dot(c0, et.nrm) >= 0.0 ? 1.0 : -1.0) / l) : et.nrm;
         areaScale = l / l0;
         return true;
     }
     // How much a light's area has grown about a hit on it at the path's time: its deforming
     // triangle's (Hit::deformTri, the triangle's area now over the instant's), else
-    // lightAreaScale about the hit's normal.
+    // lightAreaScale about the hit's normal. A light with no area then has no hit on it, so a 0
+    // (rounding's) reads as 1, keeping the density finite.
     double lightAreaScaleAt(const Emitter& em, const Vec3& nNow, int deformTri) const {
+        double J = 1.0;
         if (deformTri >= 0 && g_motionU >= 0.0) {
             const Tri& t = tris[(size_t)deformTri];
             Vec3 p[3];
             deformedCorners(t, g_motionU, p);
             const double l = length(cross(p[1] - p[0], p[2] - p[0]));
             const double l0 = length(cross(t.v1 - t.v0, t.v2 - t.v0));
-            return (l > 0.0 && l0 > 0.0) ? l / l0 : 1.0;
+            if (l0 > 0.0) J = l / l0;
+        } else {
+            J = lightAreaScale(em, nNow);
         }
-        return lightAreaScale(em, nNow);
+        return J > 0.0 ? J : 1.0;
     }
     // An AIMED quad (Emitter::normalTilted) as the current path sees it: its face and its lean turn
     // with it, so each reading takes `w` (the unit direction leaving the patch, at the path's time)
@@ -5362,6 +5361,9 @@ inline double emitterSamplePoint(const Scene& scene, const Emitter& em,
         else { y = scene.lightPointNow(em, y); nOut = scene.lightNormalNow(em, nOut); }
         J = scene.lightAreaScale(em, nOut);
     }
+    // No area at the path's time (a triangle collapsed, keys that flatten it): it emits nothing
+    // then, its densities left finite.
+    if (!(J > 0.0)) { J = 1.0; pmul = 0.0; }
     if (areaScaleOut) *areaScaleOut = J;
     return pmul;
 }
