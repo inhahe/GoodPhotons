@@ -402,10 +402,12 @@ gather radius halved on both devices.
 Two smaller residuals of the same comparison at 256 spp, each one block. The box held at the
 instant reads 1.032 at row 8, column 4 (the floor's front edge, z 3.6, so under the 5-sigma line
 there); a moving camera over that box, blurred, shows the same block at 1.037 (z 8.1). And the
-moving box, blurred (64 timed epochs on both devices, the same epoch times), reads 1.032 at row
-5, column 5, under the gold sphere, where the still box reads 1.005: a residual of the blurred
-device path, possibly of the aimed caustic pass, whose aim map is built at the instant while
-the sphere moves. check_motion's criterion (blurred GPU mode M against blurred mode R, 10 %)
+moving box, blurred (64 timed epochs on both devices), reads 1.032 at row 5, column 5, under the
+gold sphere, where the still box reads 1.005: a residual of the blurred device path, possibly of
+the aimed caustic pass, whose aim map is built at the instant while the sphere moves. That one
+was measured before 0.427.1, when the device's epochs took random times rather than the CPU's
+stratified ones (their time set inside the epoch's salt), which alone moves a frame by a few
+per cent: measure it again before chasing it. check_motion's criterion (blurred GPU mode M against blurred mode R, 10 %)
 passes.
 
 And a whole-frame one: check_bitid's `flat` scene (quads and analytic spheres, one of each
