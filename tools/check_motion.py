@@ -53,7 +53,8 @@ cube whose keys scale and shear it together. It requires:
   * Modes M and J (an epoch at a time), S and U (a pass at a time) blur, agreeing with
     blurred mode R within their density estimates' bias, and follow a moving camera as mode R
     does; so does mode P, its backward samples split by their own path's first event -- also with
-    fog in front of a mirror, and on a floor of a mix of a diffuse and a glossy child. Mode M under
+    fog in front of a mirror, and on a floor of a mix of a diffuse and a glossy child; and fur in
+    front of a mirror renders the same under -dual-scatter as without. Mode M under
     a -noise budget blurs too, and mode J whose surface map comes back empty blurs as mode D does.
   * The camera's own motion, in the box held still: a camera with `motion` keys and no shutter
     renders byte for byte the still camera at its keys' instant (CPU, and GPU); with the shutter,
@@ -682,8 +683,8 @@ def main():
     # --- the modes that share light data across paths blur too, each epoch (M) or pass (S, U) at
     # one time: against blurred mode R, within their own bias (a density estimate's radius), and
     # the blur really there ---
-    # (Mode M under a -noise budget, which has no total to split, ends an epoch every few samples:
-    # it rendered the whole frame in its first epoch, one time, before.)
+    # (Mode M under a -noise budget, which has no total to split, ends an epoch every few samples,
+    # so its shutter is sampled by many epochs too.)
     for label, mode, margs in (("M", "M", ["-spp", "128", "-n", "2000000"]),
                                ("M under -noise", "M", ["-noise", "6.25", "-n", "2000000"]),
                                ("S", "S", ["-spp", "128", "-n", "200000"]),
@@ -934,9 +935,12 @@ def main():
 def p_split_tests(exe, out, verdict):
     """Blurred mode P against blurred mode R where its split must file each sample by its path's
     first event: fog in front of a mirror (a sample scattered in the fog is the forward layer's,
-    which splats the fog itself: it was counted twice before), and a floor of a mix of a diffuse
-    and a glossy child (the glossy child is the forward layer's, the mix being no specular type:
-    it was lost before)."""
+    which splats the fog itself, so the backward layer must not count it too), and a floor of a
+    mix of a diffuse and a glossy child (the glossy child is the forward layer's, the mix being
+    no specular type, so neither layer may skip it). And fur of opacity below 1 in front of a
+    mirror that shows the light, under -dual-scatter, whose hair case takes the hero path's
+    dispersive group: a coverage pass-through there is no first event, or the mirror light seen
+    through the gaps would be filed to the forward layer, which does not carry it."""
     for name, extra, floor in (
             ("fog in front of a mirror", "medium { sigma_t 0.15  albedo 0.8 }", "white"),
             ("a mix of a diffuse and a glossy child", "", "mx")):
@@ -961,12 +965,36 @@ def p_split_tests(exe, out, verdict):
                                                              "-n", "20000000"], seed=s)[0]) for s in (1, 2)]
         good, detail = agree(rp, rr, 0.10)
         verdict("blurred mode P = blurred mode R: " + name, good, detail)
+    strands = [("curve { material h  basis linear  radius 0.004  point %.3f 0.25 0.6  point %.3f 1.15 0.6 }"
+                % (x, x)) for x in np.arange(-0.4, 0.401, 0.02)]
+    text = NL.join([
+        "scene { units meters  motion_interval -0.5 0.5 }",
+        'material "w" { type diffuse reflect 0.6 }',
+        'material "mir" { type mirror }',
+        'material "h" { type hair  sigma_a 0.6  beta_m 0.3  beta_n 0.3  alpha 2.0  opacity 0.3 }',
+        "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material w }",
+        "quad { origin -1 0.1 -0.5  u 2 0 0  v 0 1.4 0  material mir }",
+        "light area { origin -0.3 1.2 2.4  u 0.6 0 0  v 0 0.4 0  normal 0 0 -1  spd preset:bb6500  power 80 }",
+        "group { motion { key { translate 1.2 0.2 0 } key { translate 1.4 0.2 0 } }  "
+        "sphere { center 0 0 0  radius 0.1  material w } }",
+    ] + strands + [
+        'camera "c" { eye 0 0.75 2.2  look_at 0 0.7 0  up 0 1 0  fov_y 30  shutter_open -0.5  '
+        'shutter_close 0.5  film { res 64 48 } }']) + NL
+    pf = os.path.join(out, "pfur.ftsl")
+    write(pf, text)
+    pargs = ["-mode", "P", "-device", "cpu", "-spp", "256", "-n", "4000000"]
+    ref = [lum(render(exe, out, pf, "pfur_s%d" % s, pargs, seed=s)[0]) for s in (1, 2)]
+    dual = [lum(render(exe, out, pf, "pfur_dual_s%d" % s, pargs + ["-dual-scatter"], seed=s)[0]) for s in (1, 2)]
+    fur = (slice(10, 40), slice(16, 48))                          # over the fur, the mirror behind
+    r = float(np.mean([x[fur].mean() for x in dual]) / np.mean([x[fur].mean() for x in ref]))
+    verdict("blurred mode P, fur before a mirror, with -dual-scatter = without", abs(r - 1) < 0.1,
+            "%.4f of without" % r)
 
 
 def j_empty_test(exe, out, verdict):
     """Blurred mode J whose surface map comes back empty -- every surface a mirror, so no light
     subpath stores a photon -- is mode D exactly, and blurs as mode D does, each sample at its own
-    time. (It took the first epoch's time and pose, and rendered sharp, before: 11 blocks out.)"""
+    time (not the first epoch's alone)."""
     text = NL.join([
         "scene { units meters  motion_interval -0.5 0.5 }",
         'material "mir" { type mirror }',

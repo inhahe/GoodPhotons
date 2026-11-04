@@ -53,6 +53,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <map>
 #include <set>
@@ -6712,12 +6713,13 @@ private:
         // A dynamic elastic's cache key is its mesh in its own coordinates, which must not depend
         // on where the mesh is placed: they come from the file loaded again, unplaced, rather
         // than from the placed triangles carried back (whose rounding follows the placement).
-        Scene ownScene;
+        std::optional<Scene> ownScene;                 // built only for a dynamic elastic
         const std::vector<Tri>* exactOwn = nullptr;
         if (hasDynamicElastic(b)) {
-            ownScene.mats = L.scene.mats;              // the loaders read the mesh's material by id
-            if (!loadFile(ownScene, Affine::identity(), false)) return false;
-            exactOwn = &ownScene.tris;
+            ownScene.emplace();
+            ownScene->mats = L.scene.mats;             // the loaders read the mesh's material by id
+            if (!loadFile(*ownScene, Affine::identity(), false)) return false;
+            exactOwn = &ownScene->tris;
         }
         if (!applyDeformers(b, L, triStart, xf, exactOwn)) return false;
         // Record the object as a named mesh group (for -check-watertight): the range of

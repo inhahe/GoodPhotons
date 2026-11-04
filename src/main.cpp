@@ -4,7 +4,7 @@
 //   -mode B : pinhole camera outside the box, light-tracing splat (default)
 //   -mode C : finite-aperture forward catch (thin-lens depth of field)
 //   -mode R : backward path-traced reference (independent validation)
-//   -mode V : validate — run B and R and report the best-fit residual
+//   -mode V : validate — run B and R, scale one to the other, and report the residual
 //   -mode P : forward + camera-side composite — model B for diffuse-first pixels
 //             (and caustics), a backward camera-side ray path for specular/coated
 //             surfaces (which model B alone leaves black). See renderComposite.
@@ -15008,11 +15008,11 @@ static void buildFurFields(const Scene& scene, bool timed) {
 // the device-selection notes name that reason rather than the generic lists.
 static const char* const kObjectSpaceWhy =
     "object-space patterns (pattern_space object) are read on the CPU only so far";
-// Motion blur on the device is modes R, W, D, A, B and C only so far (ROADMAP 11;
-// cudaBlurUnsupported says what else keeps them on the CPU): every other mode's device gate asks
-// Camera::seesMotion, and its note gives this reason.
-static const char* const kMotionCpuWhy =
-    "motion blur in this mode renders on the CPU so far (the device blurs modes R, W, D, A, B and C)";
+// Motion blur on the device (ROADMAP 11): cudaBlurUnsupported names the modes it carries and says
+// why any other blurred render stays on the CPU; every device gate under a blur asks it. A shared
+// forward flight is the one case it cannot see from the mode.
+static const char* const kSharedFlightBlurWhy =
+    "a shared forward flight that blurs renders on the CPU so far (the device blurs one camera at a time)";
 // The spp target a time / noise / forever budget renders against (runSppProgressive): no real
 // total, only a cap that keeps pixel * sppTotal seed indices well inside int64. A renderer that
 // splits its target into parts asks for it, since a share of it is no share of the render.
@@ -16166,8 +16166,8 @@ static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY
 // wins on L(S)*D*E caustics while camera-side wins on directly-viewed E*S* paths.
 //
 // The forward film measures radiance x a single global constant s (the model-B
-// camera measurement convention). We recover s by best-fit against the backward
-// radiance over the diffuse-side pixels (where both estimators agree), then convert
+// camera measurement convention). We recover s against the backward radiance over the
+// diffuse-side pixels (where both estimators agree; forwardScale), then convert
 // forward to radiance as F/(N*s) and drop in the backward radiance R/spp on the
 // specular-side pixels. The result is one true-radiance image.
 //
@@ -16215,13 +16215,19 @@ static CompositeClass classifyComposite(const Scene& scene, const Camera& cam,
 // spp), over the pixels `cls` marks DIFF (every pixel when null): the ratio of the two films'
 // sums, F's over R's. Not the least-squares slope sum(F.R)/sum(R.R): R is a noisy estimate, and
 // noise in the regressor shrinks that slope by R's relative variance (sum R^2 gains it, sum F.R
-// does not), so F/s came out too bright by as much -- 10 % on a floor lit through a mirror, where
-// the backward estimate of that light is noisy. A ratio of sums carries no such term.
+// does not), which leaves F/s too bright wherever the backward estimate is noisy. A ratio of
+// sums carries no such term.
 static double forwardScale(const Film& fwd, double invF, const Film& ref, double invR,
                            const std::vector<char>* cls) {
+    if (ref.xyz.size() != fwd.xyz.size() || (cls && cls->size() != fwd.xyz.size())) {
+        std::fprintf(stderr, "internal error: mode P's films and classification differ in size "
+                             "(%zu, %zu, %zu pixels)\n", fwd.xyz.size(), ref.xyz.size(),
+                     cls ? cls->size() : fwd.xyz.size());
+        std::exit(3);
+    }
     double sf = 0.0, sr = 0.0;
     for (size_t i = 0; i < fwd.xyz.size(); ++i) {
-        if (cls && (*cls)[i] != 0) continue;   // CompositeClass::DIFF
+        if (cls && (*cls)[i] != CompositeClass::DIFF) continue;
         const Vec3 f = fwd.xyz[i] * invF, rv = ref.xyz[i] * invR;
         sf += f.x + f.y + f.z;
         sr += rv.x + rv.y + rv.z;
@@ -16288,9 +16294,9 @@ static Film compositeSplitFilms(const Film& fwd, long long N, const Film& refDif
 }
 
 // Compare forward vs backward films in raw linear-XYZ radiance. Because the two
-// estimators measure the same image under different conventions, we solve for the
-// single best-fit scale s (backward -> forward) and report the relative RMSE of
-// the residual. A small RMSE validates the forward transport/camera math; a large
+// estimators measure the same image under different conventions, we scale the backward
+// film to the forward one by s, the ratio of their sums (forwardScale), and report the
+// relative RMSE of the residual. A small RMSE validates the forward transport/camera math; a large
 // or structured residual flags a bug.
 static void compareFilms(const Film& fwd, long long Nfwd, const Film& ref, long long spp) {
     const double invF = 1.0 / (double)Nfwd, invR = 1.0 / (double)spp;
@@ -16300,8 +16306,6 @@ static void compareFilms(const Film& fwd, long long Nfwd, const Film& ref, long 
         Vec3 f = fwd.xyz[i] * invF;
         sff += dot(f, f);
     }
-    // The scale by the ratio of the films' sums, which noise in the backward film does not bias
-    // (forwardScale says why the least-squares slope it replaced did).
     const double s = forwardScale(fwd, invF, ref, invR, nullptr);
     double num = 0;
     std::vector<double> perPix(n, 0.0);
@@ -16327,7 +16331,7 @@ static void compareFilms(const Film& fwd, long long Nfwd, const Film& ref, long 
     double bulkNum = num - topSum;
     double bulkRmse = (sff > 0) ? std::sqrt(bulkNum / sff) : 0.0;
     bool pass = (rmse < 0.05) || (concentration > 0.5 && bulkRmse < 0.05);
-    std::printf("[validate] best-fit scale (backward->forward) = %.6g\n", s);
+    std::printf("[validate] scale (backward->forward, ratio of sums) = %.6g\n", s);
     std::printf("[validate] relative RMSE after scale = %.3f%%  (full) / %.3f%% (bulk, ex. top-1%%)\n",
                 100.0 * rmse, 100.0 * bulkRmse);
     std::printf("[validate] residual concentration: top-1%% pixels hold %.1f%% of it (%s)\n",
@@ -19121,8 +19125,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             else         std::printf("[device] auto -> CPU (no CUDA device found)\n");
         } else if (const char* mwhy = !cam.seesMotion(scene) ? nullptr
                                       : gpuBackwardMode ? cudaBlurUnsupported(scene, cam, g_whitted ? 'W' : 'R')
-                                      : (gpuBdptMode || gpuForwardMode) ? cudaBlurUnsupported(scene, cam, mode)
-                                      : kMotionCpuWhy) {
+                                      : cudaBlurUnsupported(scene, cam, mode)) {
             if (wantGpu) std::fprintf(stderr, "[device] %s; using CPU\n", mwhy);
             else         std::printf("[device] auto -> CPU (%s)\n", mwhy);
         } else if (gpuBdptMode) {
@@ -20126,12 +20129,6 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     if (perSample) want = std::max<long long>(want, total);
                     else if (g_beamEpochs > 0) want = std::max<long long>(want, (long long)g_beamEpochs);
                     nFixed = std::min<long long>(want, total);
-                    if (g_beamEpochs > 0 && !perSample && g_beamEpochs < kBlurEpochsJ && !jlc.epochsSaid) {
-                        jlc.epochsSaid = true;
-                        std::printf("mode J: -beamepochs %lld is raised to %lld under a blur: each light "
-                                    "side is one time in the shutter, and that many sample it\n",
-                                    (long long)g_beamEpochs, nFixed);
-                    }
                 }
                 else if (!perSample)     nFixed = std::min<long long>(g_beamEpochs, total);
                 else if (jlc.autoK > 0)  nFixed = std::min<long long>(jlc.autoK, total);
@@ -20143,6 +20140,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 nFixed = std::max(1LL, nFixed);
             }
             if (nFixed) nFixed = wholeEpochs(total, nFixed);
+            // Said once the count is the one laid out, and only when the blur raised it.
+            if (fixedEpochs && blurEpochsJ && g_beamEpochs > 0 && !perSample && nFixed > g_beamEpochs &&
+                !jlc.epochsSaid) {
+                jlc.epochsSaid = true;
+                std::printf("mode J: -beamepochs %lld is raised to %lld under a blur: each light "
+                            "side is one time in the shutter, and that many sample it\n",
+                            (long long)g_beamEpochs, nFixed);
+            }
             long long epLen = nFixed ? (total + nFixed - 1) / nFixed : 0;
             if (fixedEpochs && perSample && !blurEpochsJ && !jlc.epochsSaid) {
                 jlc.epochsSaid = true;
@@ -20649,7 +20654,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 std::fprintf(stderr, "[device] SPPM GPU session failed to start; using CPU\n");
             } else if (wantGpu) {
                 const char* why = cam.hasLens()        ? "a physical-lens camera (pinhole only)"
-                                : cam.seesMotion(scene) ? kMotionCpuWhy
+                                : cam.seesMotion(scene) ? cudaBlurUnsupported(scene, cam, 'S')
                                 : !cudaAvailable()     ? "no CUDA device found"
                                 : "a GPU-unsupported scene feature";
                 std::fprintf(stderr, "[device] mode S GPU path unavailable (%s); using CPU\n", why);
@@ -20751,7 +20756,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 std::fprintf(stderr, "[device] VCM GPU session failed to start; using CPU\n");
             } else if (wantGpu) {
                 const char* why = cam.hasLens()        ? "a physical-lens camera (pinhole only)"
-                                : cam.seesMotion(scene) ? kMotionCpuWhy
+                                : cam.seesMotion(scene) ? cudaBlurUnsupported(scene, cam, 'U')
                                 : !cudaAvailable()     ? "no CUDA device found"
                                 : "a GPU-unsupported scene feature";
                 std::fprintf(stderr, "[device] mode U GPU path unavailable (%s); using CPU\n", why);
@@ -27430,8 +27435,12 @@ static int run(int argc, char** argv) {
         const long long meterN   = std::clamp((long long)W * H * 40LL, 500000LL, 4000000LL);
         const long long meterSpp = 16;
         const char mode = mc.mode;      // already the rendered mode (renderedMode)
-        // The device renders the instant only, so a blurred frame meters on the CPU, as it renders.
-        const bool onDevice = meterGpu && !mc.cam.seesMotion(scene);
+        // A blurred frame meters where it renders: on the device in the modes that blur there.
+#ifdef HAVE_CUDA
+        const bool onDevice = meterGpu && (!mc.cam.seesMotion(scene) || !cudaBlurUnsupported(scene, mc.cam, mode));
+#else
+        const bool onDevice = meterGpu;
+#endif
         Film mf; double eAuto = 0.0;
         switch (mode) {
             case 'A': case 'B': case 'C': {
@@ -27807,9 +27816,10 @@ static int run(int argc, char** argv) {
         else {
             // A mode-M camera reaching here under a budget is the silent-CPU case warned
             // about below. Lens cameras are excluded because they would never have had the
-            // device anyway, so saying they lost it would be false; so is a blurred camera of a
-            // moving scene, which is here for its blur and says so (kMotionCpuWhy).
-            if (rc.mode == 'M' && !rc.cam.hasLens() && !(rc.cam.seesMotion(scene) && scene.hasMotion()))
+            // device anyway, so saying they lost it would be false; so is a camera that sees
+            // motion (a moving scene, or its own), which is here for its blur and says so
+            // (cudaBlurUnsupported).
+            if (rc.mode == 'M' && !rc.cam.hasLens() && !rc.cam.seesMotion(scene))
                 mModeBudgeted = true;
             restIdx.push_back(i);
         }
@@ -27930,8 +27940,8 @@ static int run(int argc, char** argv) {
         if (groupGpu && std::any_of(cams.begin(), cams.end(),
                                     [&](const Camera& c) { return c.seesMotion(scene); })) {
             groupGpu = false;
-            if (!std::strcmp(device, "gpu")) std::fprintf(stderr, "[device] %s; using CPU\n", kMotionCpuWhy);
-            else                             std::printf("[device] auto -> CPU (%s)\n", kMotionCpuWhy);
+            if (!std::strcmp(device, "gpu")) std::fprintf(stderr, "[device] %s; using CPU\n", kSharedFlightBlurWhy);
+            else                             std::printf("[device] auto -> CPU (%s)\n", kSharedFlightBlurWhy);
         }
 #endif
         (void)groupGpu;
@@ -28291,7 +28301,8 @@ static int run(int argc, char** argv) {
                 if (toRender[i].cam.seesMotion(scene)) anyBlur = true;
             }
             if (anyBlur && (wantGpu || wantAuto))
-                std::printf("[device] shared photon map: gathering on the CPU (%s)\n", kMotionCpuWhy);
+                std::printf("[device] shared photon map: gathering on the CPU (%s)\n",
+                            cudaBlurUnsupported(scene, toRender[idx[0]].cam, 'M'));
             // -beams runs on the device now, deposit AND gather, with NO backend carve-out.
             // There deliberately is no GRIN fallback here: a gradient-index photon travels a
             // curve and so has no straight chord to store, but the CPU refuses that deposit on

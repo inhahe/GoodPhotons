@@ -468,13 +468,12 @@ def main():
     ride_wave = ride % mesh(grid, wave)
     logs = []
     sg = [render(ride_wave, "gpu_ride_%d" % s, 256, device="gpu", seed=s, log=logs) for s in (1, 2)]
-    if all(x is not None for x in sg) and all("-> GPU" in l for l in logs):
+    what = "a waving mesh riding a moving group, blurred, renders on the GPU as on the CPU"
+    if gpu_verdict(c, what, sg, logs, "deforming-mesh"):
         sc_ = [render(ride_wave, "cpu_ride_%d" % s, 256, seed=s) for s in (1, 2)]
         from check_motion import agree, lum
         good, detail = agree([lum(read_pfm(x + ".pfm")) for x in sg], [lum(read_pfm(x + ".pfm")) for x in sc_])
-        c.verdict("a waving mesh riding a moving group, blurred, renders on the GPU as on the CPU", good, detail)
-    else:
-        print("(no GPU here: the GPU's deforming-mesh case is skipped)")
+        c.verdict(what, good, detail)
     pattern_tests(c, grid, render)
     mirror_test(c, grid, render)
 
@@ -585,7 +584,7 @@ def pattern_tests(c, grid, render):
                 render(fin("0 0 -0.25"), "fin", 64, **eye), render(fin("0 0.001 -0.251"), "fin_ref", 64, **eye), 5e-4)
     # The same fin folded flat at the instant (the middle key), under a pattern of its position:
     # read at another time, the point is nudged along the hit's own normal, the instant's face
-    # having none (it was NaN, and its samples were dropped).
+    # having none, so every sample there stays finite.
     pat = NL.join(['pattern "px" { expr "0.2 + 0.6 * step(0.0, sin(9 * x + 3 * y))" }',
                    'material "pm" { type diffuse  reflect pattern:px }'])
 
@@ -595,6 +594,19 @@ def pattern_tests(c, grid, render):
     same_render(c, "... and folded flat at the instant, its pattern at other times is finite",
                 render(fin_mid("0 0 -0.25"), "fin_mid", 64, **eye),
                 render(fin_mid("0 0.001 -0.251"), "fin_mid_ref", 64, **eye), 5e-3)
+
+
+def gpu_verdict(c, what, stems, logs, case):
+    """Whether a GPU case's renders (`stems`, their `logs`) ran on the GPU, so their comparison
+    can follow. With no CUDA device in this build or machine the case is skipped; a render that
+    failed, or that fell back to the CPU anyway, fails it."""
+    if any("no CUDA device" in l or "built without CUDA" in l for l in logs):
+        print("(no GPU here: the GPU's %s case is skipped)" % case)
+        return False
+    if any(x is None for x in stems) or not all("-> GPU" in l for l in logs):
+        c.verdict(what, False, "a GPU render failed or ran on the CPU")
+        return False
+    return True
 
 
 def mirror_test(c, grid, render):
@@ -616,12 +628,10 @@ def mirror_test(c, grid, render):
               "the reflection %.3f of mode R's" % ratio)
     logs = []
     sg = render(body, "mirror_B_gpu", 40000000, mode="B", device="gpu", log=logs, **eye)
-    if sg is not None and all("-> GPU" in l for l in logs):
+    if gpu_verdict(c, "... and on the GPU", [sg], logs, "moving-mirror"):
         lg = read_pfm(sg + ".pfm").mean(axis=-1)
         ratio = float(lg[30:50, 20:60].sum() / lr[30:50, 20:60].sum())
         c.verdict("... and on the GPU", abs(ratio - 1) < 0.1, "the reflection %.3f of mode R's" % ratio)
-    else:
-        print("(no GPU here: the GPU's moving-mirror case is skipped)")
 
 
 DYN_FRAMES = 40

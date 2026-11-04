@@ -10147,9 +10147,10 @@ sees the instant, exactly as a static scene with those transforms would show it.
   camera loop in `main.cpp` closes it for every mode `modeSeesMotion` does not name — V
   (which compares B against R) — and the exposure
   meter asks the same helper. The device blurs some modes (*Motion blur on the device*, below);
-  for the rest `runRender`'s device choice, `renderForward`'s own device gate, the shared
-  forward group and the exposure meter keep a blurred camera on the CPU (`kMotionCpuWhy`,
-  `cudaBlurUnsupported`), and `-radcache` is off under a blur. What cannot move yet stays put and
+  for the rest `runRender`'s device choice, `renderForward`'s own device gate, the S, U and M
+  sessions and the exposure meter keep a blurred camera on the CPU, each asking
+  `cudaBlurUnsupported` (the one source of the reason; a blurred shared forward flight says
+  `kSharedFlightBlurWhy`), and `-radcache` is off under a blur. What cannot move yet stays put and
   says so (`stillWarning`): a sun or sky, an aimed area light, and any light whose keys would
   scale or shear it stay at the instant with their surfaces, so nothing mixes a moved surface
   with an unmoved sampler. A coat whose strands move is traced as strands when some camera

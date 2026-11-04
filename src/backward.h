@@ -3766,6 +3766,7 @@ struct BackwardRenderer {
                                               spdCache, gi, nullptr, &heroNull)) { finish(); return; }
                         if (heroNull) gmis = gmisIn;
                         if (heroNull && nullSteps < 256) { --b; ++nullSteps; }
+                        if (heroNull) unnoteFirst(gi, firstHere);   // passed through: not the first event
                         break;
                     }
                     // Default policy: terminate secondaries, then run the shared scalar
@@ -3777,6 +3778,7 @@ struct BackwardRenderer {
                                           nullptr, &heroNull2)) { finish(); return; }
                     if (heroNull2) gmis = gmisIn;
                     if (heroNull2 && nullSteps < 256) { --b; ++nullSteps; }
+                    if (heroNull2) unnoteFirst(gi, firstHere);   // passed through: not the first event
                     break;
                 }
                 case MatType::Diffuse:

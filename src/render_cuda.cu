@@ -1517,14 +1517,20 @@ struct DScene {
 
 // The current path's time, as a fraction of the motion interval, or negative for the frame's
 // instant: the device twin of g_motionU, a slot per thread in shared memory, so the query sites
-// stay as they are, as on the host. Every launch is 1-D with at most kMotionSlots threads a
-// block; every kernel clears its slot first (D_MOTION_CLEAR), since shared memory starts as
-// whatever the last block left, and one that blurs sets it per path.
+// stay as they are, as on the host. Every launch of a kernel that takes a DScene is 1-D with at
+// most kMotionSlots threads a block -- D_MOTION_CLEAR traps any other launch shape rather than
+// let threads share a slot or index past the array -- and every such kernel clears its slot
+// first (D_MOTION_CLEAR), since shared memory starts as whatever the last block left; one that
+// blurs sets it per path.
 constexpr int kMotionSlots = 256;
 __shared__ float s_dMotionU[kMotionSlots];
 __device__ static inline float dMotionU() { return s_dMotionU[threadIdx.x]; }
 __device__ static inline void dSetMotionU(float u) { s_dMotionU[threadIdx.x] = u; }
-#define D_MOTION_CLEAR() dSetMotionU(-1.0f)
+#define D_MOTION_CLEAR()                                                                        \
+    do {                                                                                        \
+        if (blockDim.x > (unsigned)kMotionSlots || blockDim.y != 1 || blockDim.z != 1) __trap(); \
+        dSetMotionU(-1.0f);                                                                     \
+    } while (0)
 // Whether a query must look at time: the scene moves and the path has one (host twin
 // Scene::sweptQuery as well as timedQuery).
 __device__ static inline bool dTimed(const DScene& sc) { return sc.mo.sets && dMotionU() >= 0.0f; }
@@ -4221,22 +4227,18 @@ __device__ static inline void dSetPathTime(const DScene& sc, const DCamera& cam,
     }
     if (posed && cam.nKeys > 0) dPoseCamera(cam, frames, *posed);
 }
-// A camera path's time and pose: dSetCameraTime, and `posed` the camera there (the camera
-// itself when it holds still or the path has no time).
-__device__ static inline void dSetCameraTime(const DScene& sc, const DCamera& cam, unsigned long long pix,
-                                             unsigned long long sIdx, bool whitted, DCamera* posed);
-__device__ static inline void dSetCameraTime(const DScene& sc, const DCamera& cam, unsigned long long pix,
-                                             unsigned long long sIdx, bool whitted) {
-    dSetCameraTime(sc, cam, pix, sIdx, whitted, nullptr);
-}
-__device__ static inline void dSetCameraTime(const DScene& sc, const DCamera& cam, unsigned long long pix,
+// A camera path's time (sample sIdx of pixel pix), set for the path's queries; true with `posed`
+// the camera there when it moves itself, false (`posed` untouched) when it holds still or the path
+// takes no time -- so a kernel reads a still camera where the launch put it.
+__device__ static inline bool dSetCameraTime(const DScene& sc, const DCamera& cam, unsigned long long pix,
                                              unsigned long long sIdx, bool whitted, DCamera* posed) {
-    if (!cam.blur) return;
+    if (!cam.blur) return false;
     double phase = 0.5;
     if (!whitted) { DRng tr; tr.seedUnit(pix, cam.timeSalt); phase = (double)tr.uniform(); }
     double x = dRadicalInverseScr(79, sIdx) + phase;
     if (x >= 1.0) x -= 1.0;
     dSetPathTime(sc, cam, x, posed);
+    return posed && cam.nKeys > 0;
 }
 // The watertight crossing of the ray with the triangle (p0, p1, p2) nearer than tmax: its t and
 // barycentrics. The shared half of intersectTri (host twin triCross), which a moving or deforming
@@ -4834,10 +4836,12 @@ __device__ __noinline__ static void dDeformedCorners(const DScene& sc, int tri, 
     else dMotionAt(sc.mo, set, u, Du);
     for (int c = 0; c < 3; ++c) p[c] = affPoint(D->m, D->t, p[c]);
     if (!n) return;
-    DAff Di;
-    dAffInverse(*D, Di);
+    DAff DiL;
+    const DAff* Di = &DiL;
+    if (D != &Du) Di = &m.inverse(sc, set);   // the query's, made once for the set
+    else dAffInverse(Du, DiL);
     for (int c = 0; c < 3; ++c)
-        if (dot(n[c], n[c]) > (Real)0) n[c] = normalize(dAffDirT(Di, n[c]));
+        if (dot(n[c], n[c]) > (Real)0) n[c] = normalize(dAffDirT(*Di, n[c]));
 }
 // A moving or deforming triangle (global index `i`) at the path's time (host twins
 // intersectMovingTri / intersectDeformingTri): its corners tested first, the triangle rebuilt in
@@ -4851,7 +4855,7 @@ __device__ static bool dIntersectTriNow(const DScene& sc, const DTriShear& sh, c
     const double u = (double)dMotionU();
     DVec3 p[3], n[3];
     if (deforms) {
-        dDeformedCorners(sc, i, u, p, anyHit ? nullptr : n, &mc);
+        dDeformedCorners(sc, i, u, p, nullptr, &mc);   // the normals once it crosses nearer (below)
     } else {
         const DAff& D = mc.at(sc, set);
         p[0] = affPoint(D.m, D.t, t0.v0); p[1] = affPoint(D.m, D.t, t0.v1); p[2] = affPoint(D.m, D.t, t0.v2);
@@ -4860,10 +4864,12 @@ __device__ static bool dIntersectTriNow(const DScene& sc, const DTriShear& sh, c
     if (!dTriCross(sh, ro, p[0], p[1], p[2], tmin, h.t, t, b0, b1, b2)) return false;
     if (anyHit) { h.t = t; h.valid = true; return true; }
     DTri tt = t0;
-    tt.v0 = p[0]; tt.v1 = p[1]; tt.v2 = p[2];
     if (deforms) {
+        dDeformedCorners(sc, i, u, p, n, &mc);     // the same corners, and their normals
         tt.n0 = n[0]; tt.n1 = n[1]; tt.n2 = n[2];
-    } else {                                   // normals by the inverse transpose
+    }
+    tt.v0 = p[0]; tt.v1 = p[1]; tt.v2 = p[2];
+    if (!deforms) {                            // normals by the inverse transpose
         const DAff& Di = mc.inverse(sc, set);
         tt.n0 = normalize(dAffDirT(Di, t0.n0)); tt.n1 = normalize(dAffDirT(Di, t0.n1));
         tt.n2 = normalize(dAffDirT(Di, t0.n2));
@@ -16226,7 +16232,7 @@ __device__ static double bkGiGather(const DScene& sc, int diffraction, const DHi
 // runs the classic single-λ estimator bit-for-bit (the host gates heroC to 1 whenever the
 // scene has a medium whose extinction varies with λ, GRIN or a physical lens, which
 // bkRadianceHero does not cover).
-__global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
+__global__ void kBackward(DScene sc, const __grid_constant__ DCamera cam, double* film, double* hits,
                           long long totalSamples, long long chunkSpp, long long sppTotal,
                           long long sampleBase, int resX,
                           int diffraction, unsigned long long seedBase, int heroC) {
@@ -16248,8 +16254,8 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
         const unsigned long long sIdx =
             (unsigned long long)(sampleBase + (idx - pix * chunkSpp));
         const bool whitted = (sc.bkWhitted != 0);
-        DCamera camT = cam;                    // posed at the sample's time when it moves
-        dSetCameraTime(sc, cam, (unsigned long long)pix, sIdx, whitted, &camT);
+        DCamera camT;                          // posed at the sample's time when it moves
+        const DCamera& camS = dSetCameraTime(sc, cam, (unsigned long long)pix, sIdx, whitted, &camT) ? camT : cam;
 
         if (heroC > 1) {
             // One stratified base draw -> hero + C-1 secondary wavelengths, all from the
@@ -16279,7 +16285,7 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
             Real jx, jy;
             if (whitted) { double u1, u2; dWhittedSample(sIdx, u1, u2); jx = (Real)u1; jy = (Real)u2; }
             else         { jx = rng.uniform(); jy = rng.uniform(); }
-            dGenRay(camT, px, py, jx, jy, hro, hrd);
+            dGenRay(camS, px, py, jx, jy, hro, hrd);
             double Lh[hero::kHeroMax];
             // DGiCtx carries the ABSOLUTE sample index down the path, which rotates every
             // deterministic lattice (glossy lobe, gather directions) by it — so, exactly like
@@ -16314,13 +16320,13 @@ __global__ void kBackward(DScene sc, DCamera cam, double* film, double* hits,
             Real jx = rng.uniform(), jy = rng.uniform();
             Real u1 = rng.uniform(), u2 = rng.uniform();
             Real wl = 0;
-            if (!dGenLensRay(camT, px, py, jx, jy, u1, u2, lambda, ro, rd, wl)) continue;  // vignetted
+            if (!dGenLensRay(camS, px, py, jx, jy, u1, u2, lambda, ro, rd, wl)) continue;  // vignetted
             wLens = (double)wl;
         } else {
             Real jx, jy;
             if (whitted) { double s1, s2; dWhittedSample(sIdx, s1, s2); jx = (Real)s1; jy = (Real)s2; }
             else         { jx = rng.uniform(); jy = rng.uniform(); }
-            dGenRay(camT, px, py, jx, jy, ro, rd);
+            dGenRay(camS, px, py, jx, jy, ro, rd);
         }
         double Lval = bkRadiance<0>(sc, diffraction, ro, rd, lambda, invPdfLambda, rng,
                                     DGiCtx{0, sIdx, 0});
@@ -16586,7 +16592,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
 // kBackward, but each sample does ONE colour walk and deposits the linear-RGB radiance
 // (converted to XYZ) into the film. The specular interfaces use a fixed representative
 // wavelength (LREP_RGB); the camera lens ray uses it too (RGB drops lens dispersion).
-__global__ void kBackwardRGB(DScene sc, DCamera cam, double* film, double* hits,
+__global__ void kBackwardRGB(DScene sc, const __grid_constant__ DCamera cam, double* film, double* hits,
                              long long totalSamples, long long chunkSpp, long long sppTotal,
                              long long sampleBase, int resX,
                              int diffraction, unsigned long long seedBase) {
@@ -16599,9 +16605,10 @@ __global__ void kBackwardRGB(DScene sc, DCamera cam, double* film, double* hits,
         DRng rng; rng.seedUnit((unsigned long long)gidx, seedBase);
         int px = (int)(pix % resX);
         int py = (int)(pix / resX);
-        DCamera camT = cam;
-        dSetCameraTime(sc, cam, (unsigned long long)pix,
-                       (unsigned long long)(sampleBase + (idx - pix * chunkSpp)), false, &camT);
+        DCamera camT;                          // posed at the sample's time when it moves
+        const DCamera& camS = dSetCameraTime(sc, cam, (unsigned long long)pix,
+                                             (unsigned long long)(sampleBase + (idx - pix * chunkSpp)), false,
+                                             &camT) ? camT : cam;
 
         DVec3 ro, rd;
         double wLens = 1.0;
@@ -16609,11 +16616,11 @@ __global__ void kBackwardRGB(DScene sc, DCamera cam, double* film, double* hits,
             Real jx = rng.uniform(), jy = rng.uniform();
             Real u1 = rng.uniform(), u2 = rng.uniform();
             Real wl = 0;
-            if (!dGenLensRay(camT, px, py, jx, jy, u1, u2, LREP_RGB, ro, rd, wl)) continue;  // vignetted
+            if (!dGenLensRay(camS, px, py, jx, jy, u1, u2, LREP_RGB, ro, rd, wl)) continue;  // vignetted
             wLens = (double)wl;
         } else {
             Real jx = rng.uniform(), jy = rng.uniform();
-            dGenRay(camT, px, py, jx, jy, ro, rd);
+            dGenRay(camS, px, py, jx, jy, ro, rd);
         }
         DVec3 Lrgb = bkRadianceRGB(sc, diffraction, ro, rd, rng);
         DVec3 xyz = dRgbToXyz(Lrgb * (Real)wLens);
