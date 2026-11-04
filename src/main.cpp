@@ -23906,7 +23906,7 @@ static int run(int argc, char** argv) {
         for (const Tri& t : scene.tris) {
             Vec3 c[3] = {t.v0, t.v1, t.v2};
             if (u >= 0.0 && t.vkeys >= 0) {
-                for (int k = 0; k < 3; ++k) c[k] = scene.deformedAt(t, k, u);
+                scene.deformedCorners(t, u, c);
             } else if (u >= 0.0 && t.motion >= 0) {
                 const Affine D = scene.motionNow(t.motion);
                 for (Vec3& p : c) p = D.apply(p);
@@ -28933,13 +28933,17 @@ static int runServe(int argc, char** argv, int inValPos) {
 // `ftrace -bake-elastic <scene%04d.ftsl> <first> <last>` loads frame k's scene, for k from first to
 // last in order, as `-in <it> -parseonly -elastic-bake` -- a process of its own each, so a frame's
 // load leaves nothing behind for the next -- and every dynamic elastic in it continues its
-// simulation from the frame before's cache record and writes its own (elastic_cache.h). Stops at
-// the first frame that fails, and between frames on `ftrace -stop`.
+// simulation from the frame before's cache record and writes its own (elastic_cache.h), or keeps
+// a record already simulated from exactly this. Stops at the first frame that fails. A stop
+// (`ftrace -stop`, Ctrl-C) is passed on to the frame being baked, which abandons that frame's
+// record; the bake then exits as a stopped render does (0, or `-stop-exit <code>`).
 static int runBakeElastic(int argc, char** argv, int at) {
     if (at + 3 >= argc) {
         std::fprintf(stderr, "error: -bake-elastic <scene%%04d.ftsl> <first> <last>\n");
         return 2;
     }
+    for (int i = 1; i + 1 < argc; ++i)
+        if (!std::strcmp(argv[i], "-stop-exit")) g_stopExitCode = std::atoi(argv[i + 1]);
     const std::string pat = argv[at + 1];
     char* e1 = nullptr;
     char* e2 = nullptr;
@@ -28950,8 +28954,8 @@ static int runBakeElastic(int argc, char** argv, int at) {
     }
     for (long long k = first; k <= last; ++k) {
         if (g_stopRequested) {
-            std::printf("[elastic] stopped before frame %lld\n", k);
-            return 1;
+            std::printf("[elastic] stopped before frame %lld; frames before it are baked\n", k);
+            return 0;
         }
         std::string path;
         if (!elastic::framePath(pat, k, path)) {
@@ -28978,7 +28982,19 @@ static int runBakeElastic(int argc, char** argv, int at) {
             return 1;
         }
         CloseHandle(pi.hThread);
+        // The frame's load is a process of its own, so a stop aimed at this one is passed on to
+        // it through the same channel `ftrace -stop` uses (its <pid>.stop sentinel).
+        std::filesystem::path sentinel;
+        while (WaitForSingleObject(pi.hProcess, 100) == WAIT_TIMEOUT)
+            if (g_stopRequested && sentinel.empty()) {
+                const std::filesystem::path dir = stopChannelDir();
+                if (dir.empty()) break;
+                sentinel = dir / (std::to_string((long)pi.dwProcessId) + ".stop");
+                std::ofstream s(sentinel);
+                s << "stop\n";
+            }
         WaitForSingleObject(pi.hProcess, INFINITE);
+        if (!sentinel.empty()) { std::error_code ec; std::filesystem::remove(sentinel, ec); }   // if unread
         DWORD code = 1;
         GetExitCodeProcess(pi.hProcess, &code);
         CloseHandle(pi.hProcess);
@@ -28986,6 +29002,10 @@ static int runBakeElastic(int argc, char** argv, int at) {
 #else
         const int rc = std::system(("\"" + std::string(argv[0]) + "\" -in \"" + path + "\" -parseonly -elastic-bake").c_str());
 #endif
+        if (g_stopRequested) {
+            std::printf("[elastic] stopped during frame %lld; frames before it are baked\n", k);
+            return 0;
+        }
         if (rc != 0) {
             std::fprintf(stderr, "error: -bake-elastic: frame %lld (%s) failed; frames before it are baked\n", k,
                          path.c_str());

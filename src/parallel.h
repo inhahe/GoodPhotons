@@ -19,6 +19,10 @@
 // until the first render chunk boundary. See setStopProbe below.
 #pragma once
 #include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <functional>
+#include <mutex>
 #include <thread>
 #include <vector>
 #include <algorithm>
@@ -57,39 +61,121 @@ inline bool stopRequested() {
 // than 2*grain items runs inline. fn must be safe to call concurrently for distinct i.
 // Returns true if every i ran; false if a stop was requested and the remaining range
 // was abandoned (see above — the output is then partial and must be thrown away).
+namespace detail {
+// The loop on the caller's thread alone, still chunked to poll the stop flag.
+template <class Fn>
+inline bool serialFor(size_t n, size_t grain, Fn& fn) {
+    for (size_t b = 0; b < n; b += grain) {
+        if (stopRequested()) return false;
+        size_t e = std::min(n, b + grain);
+        for (size_t i = b; i < e; ++i) fn(i);
+    }
+    return true;
+}
+// One worker's share: chunks claimed from `cursor` until the range or a stop runs out.
+template <class Fn>
+inline void cursorWorker(size_t n, size_t grain, Fn& fn, std::atomic<size_t>& cursor,
+                         std::atomic<bool>& cancelled) {
+    for (;;) {
+        // Poll before claiming work, so a stop drains the cursor: every worker
+        // finishes at most the chunk it already holds and then returns, which
+        // bounds the stop latency at one chunk rather than the whole range.
+        if (stopRequested()) { cancelled.store(true, std::memory_order_relaxed); return; }
+        size_t b = cursor.fetch_add(grain, std::memory_order_relaxed);
+        if (b >= n) return;
+        size_t e = std::min(n, b + grain);
+        for (size_t i = b; i < e; ++i) fn(i);
+    }
+}
+}  // namespace detail
+
 template <class Fn>
 [[nodiscard]] inline bool parallelFor(size_t n, size_t grain, Fn&& fn) {
     if (grain == 0) grain = 1;
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 4;
-    if (n < 2 * grain || hw < 2) {                 // too small to be worth a thread
-        for (size_t b = 0; b < n; b += grain) {    // still chunked, to poll the stop flag
-            if (stopRequested()) return false;
-            size_t e = std::min(n, b + grain);
-            for (size_t i = b; i < e; ++i) fn(i);
-        }
-        return true;
-    }
+    if (n < 2 * grain || hw < 2) return detail::serialFor(n, grain, fn);   // not worth a thread
     unsigned nt = (unsigned)std::min<size_t>(hw, (n + grain - 1) / grain);
     std::atomic<size_t> cursor{0};
     std::atomic<bool> cancelled{false};
     std::vector<std::thread> pool;
     pool.reserve(nt - 1);
-    auto worker = [&] {
-        for (;;) {
-            // Poll before claiming work, so a stop drains the cursor: every worker
-            // finishes at most the chunk it already holds and then returns, which
-            // bounds the stop latency at one chunk rather than the whole range.
-            if (stopRequested()) { cancelled.store(true, std::memory_order_relaxed); return; }
-            size_t b = cursor.fetch_add(grain, std::memory_order_relaxed);
-            if (b >= n) return;
-            size_t e = std::min(n, b + grain);
-            for (size_t i = b; i < e; ++i) fn(i);
-        }
-    };
+    auto worker = [&] { detail::cursorWorker(n, grain, fn, cursor, cancelled); };
     for (unsigned t = 0; t + 1 < nt; ++t) pool.emplace_back(worker);
     worker();                                       // the caller is a worker too
     for (auto& t : pool) t.join();
+    return !cancelled.load(std::memory_order_relaxed);
+}
+
+// A persistent band pool: N workers that sleep on a condition variable and execute one
+// broadcast job at a time (each worker gets its own index and derives its slice), so a pass
+// costs one notify_all and N wakeups rather than N thread creations. For loops run over and
+// over: the rasterizer's frame pipeline runs seven parallel passes back to back every frame
+// (raster.h; with plain std::thread that was ~7*N creations per frame, several milliseconds,
+// and scheduler jitter that showed directly in -raster-bench's min-to-median spread), and a
+// solver runs a few each iteration (parallelFor below). Not nestable (run() must not be called
+// from inside a job), nor to be run from two threads at once.
+class BandPool {
+public:
+    explicit BandPool(int n) : nW_(n < 1 ? 1 : n) {
+        workers_.reserve(nW_);
+        for (int i = 0; i < nW_; ++i)
+            workers_.emplace_back([this, i] {
+                uint64_t seen = 0;
+                std::unique_lock<std::mutex> lk(m_);
+                for (;;) {
+                    cvJob_.wait(lk, [&] { return quit_ || gen_ != seen; });
+                    if (quit_) return;
+                    seen = gen_;
+                    const std::function<void(int)>* j = job_;
+                    lk.unlock();
+                    (*j)(i);
+                    lk.lock();
+                    if (--pending_ == 0) cvDone_.notify_one();
+                }
+            });
+    }
+    ~BandPool() {
+        { std::lock_guard<std::mutex> lk(m_); quit_ = true; }
+        cvJob_.notify_all();
+        for (auto& t : workers_) t.join();
+    }
+    BandPool(const BandPool&) = delete;
+    BandPool& operator=(const BandPool&) = delete;
+    int size() const { return nW_; }
+    // Run body(workerIndex) on every worker and wait for all of them.
+    void run(const std::function<void(int)>& body) {
+        std::unique_lock<std::mutex> lk(m_);
+        job_ = &body;
+        pending_ = nW_;
+        ++gen_;
+        cvJob_.notify_all();
+        cvDone_.wait(lk, [&] { return pending_ == 0; });
+        job_ = nullptr;
+    }
+
+private:
+    std::vector<std::thread>       workers_;
+    std::mutex                     m_;
+    std::condition_variable        cvJob_, cvDone_;
+    const std::function<void(int)>* job_ = nullptr;
+    uint64_t                       gen_ = 0;
+    int                            pending_ = 0;
+    int                            nW_ = 1;
+    bool                           quit_ = false;
+};
+
+// parallelFor on `pool`'s workers rather than on threads made for the call: the same chunks,
+// cursor and stop polling, for a loop run so often that making and joining its threads would
+// cost more than its work. The caller waits.
+template <class Fn>
+[[nodiscard]] inline bool parallelFor(BandPool& pool, size_t n, size_t grain, Fn&& fn) {
+    if (grain == 0) grain = 1;
+    if (n < 2 * grain || pool.size() < 2) return detail::serialFor(n, grain, fn);
+    std::atomic<size_t> cursor{0};
+    std::atomic<bool> cancelled{false};
+    const std::function<void(int)> body = [&](int) { detail::cursorWorker(n, grain, fn, cursor, cancelled); };
+    pool.run(body);
     return !cancelled.load(std::memory_order_relaxed);
 }
 

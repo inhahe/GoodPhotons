@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <memory>
 #include <climits>
+#include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 #include <stdexcept>
@@ -1717,28 +1718,39 @@ struct Scene {
         if (t.vkeys >= 0) return intersectDeformingTri(sh, r, t, tmin, h);
         return intersectMovingTri(sh, r, t, tmin, h);
     }
-    // A deforming triangle's corner (0-2) or normal (3-5) at fraction u of the motion interval:
-    // blended between the keys about u.
-    Vec3 deformedAt(const Tri& t, int k, double u) const {
+    // A deforming triangle's corners at fraction u of the motion interval, into p[0..2], and with
+    // `n` its corner normals: blended between the keys about u, a blended normal renormalised
+    // (zero, where a corner has none authored, stays zero for Tri::finalize's face normal).
+    void deformedCorners(const Tri& t, double u, Vec3* p, Vec3* n = nullptr) const {
         int i; double f;
         motionBracket(t.vkeyCount, u, i, f);
         const Vec3* a = &vertexKeys[(size_t)t.vkeys + (size_t)i * 6];
-        return a[k] + (a[k + 6] - a[k]) * f;
+        for (int c = 0; c < 3; ++c) p[c] = a[c] + (a[c + 6] - a[c]) * f;
+        if (!n) return;
+        for (int c = 0; c < 3; ++c) {
+            const Vec3 m = a[c + 3] + (a[c + 9] - a[c + 3]) * f;
+            const double l2 = dot(m, m);
+            n[c] = l2 > 1e-24 ? m * (1.0 / std::sqrt(l2)) : Vec3{0, 0, 0};
+        }
     }
     // A deforming triangle at the path's time: tested by its blended corners alone first, and
     // rebuilt in full -- normals blended too -- only when the ray meets it nearer than the hit.
     FT_NOINLINE bool intersectDeformingTri(const TriShear& sh, const Ray& r, const Tri& t, double tmin,
                                            Hit& h) const {
-        const double u = g_motionU;
-        const Vec3 p0 = deformedAt(t, 0, u), p1 = deformedAt(t, 1, u), p2 = deformedAt(t, 2, u);
+        Vec3 p[3];
+        deformedCorners(t, g_motionU, p);
         TriCrossing x;
-        if (!triCross(sh, r, p0, p1, p2, tmin, h.t, x)) return false;
+        if (!triCross(sh, r, p[0], p[1], p[2], tmin, h.t, x)) return false;
         Tri tt = t;
-        tt.v0 = p0; tt.v1 = p1; tt.v2 = p2;
-        tt.n0 = deformedAt(t, 3, u); tt.n1 = deformedAt(t, 4, u); tt.n2 = deformedAt(t, 5, u);
+        Vec3 n[3];
+        deformedCorners(t, g_motionU, p, n);
+        tt.v0 = p[0]; tt.v1 = p[1]; tt.v2 = p[2];
+        tt.n0 = n[0]; tt.n1 = n[1]; tt.n2 = n[2];
         tt.finalize();
         if (!intersectTri(sh, r, tt, tmin, h, vcolData())) return false;
         h.deformTri = (int)(&t - tris.data());
+        h.deformB1 = x.b1;   // intersectTri's own: the same crossing of the same corners
+        h.deformB2 = x.b2;
         return true;
     }
     bool intersectSphereNow(const Ray& r, const Sphere& s, double tmin, Hit& h) const {
@@ -3140,17 +3152,61 @@ struct Scene {
         Vec3   hi{0, 0, 0};     // BVH query that confirms the mirror is really there
         double area = 0.0;      // total face area (used to rank when capping the list)
         // The motion set its member faces share (-1: none moves), or `mixed` when they move
-        // differently -- then a path with a time cannot use the plane (mirrorPlaneNow).
+        // differently or deform -- then a path with a time uses its parts instead
+        // (mirrorPlaneParts).
         int  motionSet = -1;
         bool mixed = false;
+        // A part (mirrorPlaneParts): the members of a mixed plane that move as one -- those of
+        // one motion set, or deforming faces that stay in one plane at every time (`deformTri`
+        // one of them, whose corners give the plane; `partId` names them in mirrorDeformPart, and
+        // `keyBoxes` their box at each key in mirrorPartBoxes). It claims a hit on its own
+        // members alone (mirrorClaims), since its plane can coincide with another part's.
+        bool part = false;
+        int  deformTri = -1;
+        int  partId = -1;
+        int  keyBoxes = -1;
     };
     std::vector<MirrorPlane> mirrorPlanes;
+    // The mixed planes' parts, which a path with a time uses in their place.
+    std::vector<MirrorPlane> mirrorPlaneParts;
+    // Each deforming mirror face's part (MirrorPlane::partId), or -1; empty without one.
+    std::vector<int> mirrorDeformPart;
+    std::vector<Aabb> mirrorPartBoxes;
+    // Whether the eye-side hit `h` of a connection through `mp` is on `mp`'s own faces.
+    bool mirrorClaims(const MirrorPlane& mp, const Hit& h) const {
+        if (!mp.part) return true;
+        if (mp.deformTri >= 0)
+            return h.deformTri >= 0 && mirrorDeformPart[(size_t)h.deformTri] == mp.partId;
+        return h.deformTri < 0 && h.motionSet == mp.motionSet;
+    }
     // A mirror plane as a path at its own time (g_motionU) sees it: `mp` itself, or `tmp` filled
-    // with it carried by its members' motion -- or null when they move differently (the
-    // connection is then not made).
+    // with it carried by its members' motion -- or null for a mixed plane (its parts serve) or a
+    // deforming face collapsed at that time.
     const MirrorPlane* mirrorPlaneNow(const MirrorPlane& mp, MirrorPlane& tmp) const {
-        if (g_motionU < 0.0) return &mp;
+        if (g_motionU < 0.0) return mp.part ? nullptr : &mp;
         if (mp.mixed) return nullptr;
+        if (mp.deformTri >= 0) {
+            // The plane through its reference face at the path's time; the box, the members'
+            // at the two keys about it (each vertex moves between its keys' places).
+            const Tri& t = tris[(size_t)mp.deformTri];
+            Vec3 c[3];
+            deformedCorners(t, g_motionU, c);
+            const Vec3 f = cross(c[1] - c[0], c[2] - c[0]);
+            const double l = length(f);
+            if (!(l > 0.0)) return nullptr;
+            tmp = mp;
+            tmp.n = f * (1.0 / l);
+            tmp.d = dot(tmp.n, c[0]);
+            int i; double fr;
+            motionBracket(t.vkeyCount, g_motionU, i, fr);
+            Aabb b = mirrorPartBoxes[(size_t)(mp.keyBoxes + i)];
+            b.expand(mirrorPartBoxes[(size_t)(mp.keyBoxes + i + 1)].lo);
+            b.expand(mirrorPartBoxes[(size_t)(mp.keyBoxes + i + 1)].hi);
+            const double pad = 1e-6 * (1.0 + length(b.hi - b.lo));
+            tmp.lo = b.lo - Vec3{pad, pad, pad};
+            tmp.hi = b.hi + Vec3{pad, pad, pad};
+            return &tmp;
+        }
         if (mp.motionSet < 0) return &mp;
         const Affine D = motionNow(mp.motionSet);
         tmp = mp;
@@ -3201,6 +3257,8 @@ struct Scene {
             if (isPlanarMirrorMat(mats[m]))          mirrorSphereIdx.push_back(i);
         }
         mirrorPlanes.clear();
+        mirrorDeformPart.clear();
+        mirrorPartBoxes.clear();
         // Quantised plane key, so the two tris of a quad (identical gn and offset) and
         // any coplanar neighbours land in one bucket. The tolerance is deliberately
         // coarse relative to double precision: faces meant to be coplanar are authored
@@ -3220,6 +3278,8 @@ struct Scene {
             }
         };
         std::unordered_map<Key, int, KeyHash, KeyEq> byPlane;
+        mirrorPlaneParts.clear();
+        std::vector<std::vector<int>> members;   // each plane's faces, for a mixed one's parts
         for (const Tri& t : tris) {
             if (t.matId < 0 || t.matId >= (int)mats.size()) continue;
             if (!isPlanarMirrorMat(mats[t.matId])) continue;
@@ -3247,11 +3307,13 @@ struct Scene {
                 mp.lo = t.v0; mp.hi = t.v0;
                 mp.motionSet = t.motion;
                 mirrorPlanes.push_back(mp);
+                members.emplace_back();
             } else {
                 idx = it->second;
             }
             MirrorPlane& mp = mirrorPlanes[(size_t)idx];
-            if (t.motion != mp.motionSet) mp.mixed = true;
+            if (t.motion != mp.motionSet || t.vkeys >= 0) mp.mixed = true;
+            members[(size_t)idx].push_back((int)(&t - tris.data()));
             for (const Vec3& v : {t.v0, t.v1, t.v2}) {
                 mp.lo.x = std::min(mp.lo.x, v.x); mp.hi.x = std::max(mp.hi.x, v.x);
                 mp.lo.y = std::min(mp.lo.y, v.y); mp.hi.y = std::max(mp.hi.y, v.y);
@@ -3259,18 +3321,95 @@ struct Scene {
             }
             mp.area += 0.5 * length(cross(t.v1 - t.v0, t.v2 - t.v0));
         }
-        if ((int)mirrorPlanes.size() > kMaxMirrorPlanes) {
-            std::sort(mirrorPlanes.begin(), mirrorPlanes.end(),
-                      [](const MirrorPlane& a, const MirrorPlane& b) { return a.area > b.area; });
-            mirrorPlanes.resize(kMaxMirrorPlanes);
+        // A mixed plane's parts: its faces of each motion set (the still ones among them), and
+        // its deforming faces in groups that stay in one plane at every time -- a sheet a
+        // deformer slides or turns is one part, a sheet it bends a part a face.
+        // A face joins a group when its corners lie in the plane of the group's first face at
+        // four times across each stretch between keys: corners moving linearly between keys
+        // leave four points out of a plane by a cubic in the time, which is then zero
+        // throughout, so the group stays in one plane at every time.
+        const auto inPlaneThroughout = [&](const Tri& ref, const Tri& t) {
+            if (t.vkeyCount != ref.vkeyCount) return false;
+            for (int k = 0; k + 1 < ref.vkeyCount; ++k)
+                for (int j = 0; j < 4; ++j) {
+                    const double u = (k + j / 3.0) / (double)(ref.vkeyCount - 1);
+                    Vec3 a[3], b[3];
+                    deformedCorners(ref, u, a);
+                    deformedCorners(t, u, b);
+                    const Vec3 f = cross(a[1] - a[0], a[2] - a[0]);
+                    const double l = length(f);
+                    if (!(l > 0.0)) return false;
+                    const double tol = 1e-9 * (1.0 + std::max(ref.reach, t.reach));
+                    for (const Vec3& v : b)
+                        if (std::fabs(dot(f, v - a[0])) / l > tol) return false;
+                }
+            return true;
+        };
+        int nextPart = 0;
+        for (size_t idx = 0; idx < mirrorPlanes.size(); ++idx) {
+            if (!mirrorPlanes[idx].mixed) continue;
+            std::unordered_map<int, size_t> bySet;
+            std::vector<size_t> bending;   // this plane's deforming parts
+            for (int ti : members[idx]) {
+                const Tri& t = tris[(size_t)ti];
+                size_t pi = SIZE_MAX;
+                if (t.vkeys < 0) {
+                    if (const auto it = bySet.find(t.motion); it != bySet.end()) pi = it->second;
+                } else {
+                    // The last few groups only: a mesh's faces come in order, so a face's group is
+                    // a recent one, and a mirror that truly bends (a group a face) stays linear.
+                    for (size_t b = bending.size(); b-- > 0 && b + 8 >= bending.size();)
+                        if (inPlaneThroughout(tris[(size_t)mirrorPlaneParts[bending[b]].deformTri], t)) {
+                            pi = bending[b];
+                            break;
+                        }
+                }
+                if (pi == SIZE_MAX) {
+                    MirrorPlane part = mirrorPlanes[idx];
+                    part.mixed = false; part.part = true; part.area = 0.0;
+                    part.motionSet = t.vkeys >= 0 ? -1 : t.motion;
+                    part.lo = part.hi = t.v0;
+                    if (t.vkeys >= 0) {
+                        part.deformTri = ti;
+                        part.partId = nextPart++;
+                        part.keyBoxes = (int)mirrorPartBoxes.size();
+                        mirrorPartBoxes.resize(mirrorPartBoxes.size() + (size_t)t.vkeyCount);
+                    }
+                    pi = mirrorPlaneParts.size();
+                    mirrorPlaneParts.push_back(part);
+                    if (t.vkeys < 0) bySet[t.motion] = pi; else bending.push_back(pi);
+                }
+                MirrorPlane& part = mirrorPlaneParts[pi];
+                if (t.vkeys >= 0) {
+                    if (mirrorDeformPart.empty()) mirrorDeformPart.assign(tris.size(), -1);
+                    mirrorDeformPart[(size_t)ti] = part.partId;
+                    for (int k = 0; k < t.vkeyCount; ++k)
+                        for (int cnr = 0; cnr < 3; ++cnr)
+                            mirrorPartBoxes[(size_t)(part.keyBoxes + k)].expand(
+                                vertexKeys[(size_t)t.vkeys + (size_t)k * 6 + (size_t)cnr]);
+                }
+                for (const Vec3& v : {t.v0, t.v1, t.v2}) {
+                    part.lo.x = std::min(part.lo.x, v.x); part.hi.x = std::max(part.hi.x, v.x);
+                    part.lo.y = std::min(part.lo.y, v.y); part.hi.y = std::max(part.hi.y, v.y);
+                    part.lo.z = std::min(part.lo.z, v.z); part.hi.z = std::max(part.hi.z, v.z);
+                }
+                part.area += 0.5 * length(cross(t.v1 - t.v0, t.v2 - t.v0));
+            }
         }
+        for (std::vector<MirrorPlane>* list : {&mirrorPlanes, &mirrorPlaneParts})
+            if ((int)list->size() > kMaxMirrorPlanes) {
+                std::sort(list->begin(), list->end(),
+                          [](const MirrorPlane& a, const MirrorPlane& b) { return a.area > b.area; });
+                list->resize(kMaxMirrorPlanes);
+            }
         // Pad the reject box by a hair so a reflection point landing exactly on an edge
         // is not thrown away by rounding (the BVH query is the authoritative test).
-        for (MirrorPlane& mp : mirrorPlanes) {
-            const double pad = 1e-6 * (1.0 + length(mp.hi - mp.lo));
-            mp.lo = mp.lo - Vec3{pad, pad, pad};
-            mp.hi = mp.hi + Vec3{pad, pad, pad};
-        }
+        for (std::vector<MirrorPlane>* list : {&mirrorPlanes, &mirrorPlaneParts})
+            for (MirrorPlane& mp : *list) {
+                const double pad = 1e-6 * (1.0 + length(mp.hi - mp.lo));
+                mp.lo = mp.lo - Vec3{pad, pad, pad};
+                mp.hi = mp.hi + Vec3{pad, pad, pad};
+            }
     }
 
     // ---- light BVH (Conty & Kulla) ------------------------------------------
@@ -3565,7 +3704,11 @@ struct Scene {
     // ends and at every key between (it moves linearly between keys).
     Aabb deformBox(const Tri& t, double ua, double ub) const {
         Aabb b;
-        for (int c = 0; c < 3; ++c) { b.expand(deformedAt(t, c, ua)); b.expand(deformedAt(t, c, ub)); }
+        Vec3 p[3];
+        for (double u : {ua, ub}) {
+            deformedCorners(t, u, p);
+            for (const Vec3& v : p) b.expand(v);
+        }
         for (int k = 1; k + 1 < t.vkeyCount; ++k) {
             const double tk = (double)k / (double)(t.vkeyCount - 1);
             if (tk > ua && tk < ub)
@@ -4812,26 +4955,30 @@ inline PatCtx patCtxFromHit(const Scene& scene, const Hit& h) {
     // One shading point builds several contexts, so the path's inverse is kept per thread.
     if (h.deformTri >= 0 && g_motionU >= 0.0) {
         // A deforming triangle: the point's barycentrics on the triangle where it is now, read on
-        // the triangle where it sat at the instant; the normal turned from one face to the other,
-        // and the footprint and curvature scaled by the change of the face's size.
+        // the triangle where it sat at the instant; the normal carried from one face to the
+        // other, and the footprint and curvature scaled by the change of the face's size.
         const Tri& t = scene.tris[(size_t)h.deformTri];
-        const Vec3 p0 = scene.deformedAt(t, 0, g_motionU), p1 = scene.deformedAt(t, 1, g_motionU),
-                   p2 = scene.deformedAt(t, 2, g_motionU);
-        const Vec3 e1 = p1 - p0, e2 = p2 - p0, d = q - p0;
-        const double d11 = dot(e1, e1), d12 = dot(e1, e2), d22 = dot(e2, e2);
-        const double den = d11 * d22 - d12 * d12;
-        if (den > 0.0) {
-            const double b1 = (d22 * dot(d, e1) - d12 * dot(d, e2)) / den;
-            const double b2 = (d11 * dot(d, e2) - d12 * dot(d, e1)) / den;
-            q = t.v0 * (1.0 - b1 - b2) + t.v1 * b1 + t.v2 * b2;
-            const Vec3 fNow = cross(e1, e2), fThen = cross(t.v1 - t.v0, t.v2 - t.v0);
-            const double aNow = length(fNow), aThen = length(fThen);
-            if (aNow > 0.0 && aThen > 0.0) {
-                n = normalize(n - fNow * (dot(n, fNow) / (aNow * aNow)) + fThen * (dot(n, fNow) / (aNow * aThen)));
-                const double k = std::sqrt(aThen / aNow);
-                fw *= k;
-                if (k > 0.0) curv /= k;
-            }
+        Vec3 c[3];
+        scene.deformedCorners(t, g_motionU, c);
+        const Vec3 e1 = c[1] - c[0], e2 = c[2] - c[0], E1 = t.v1 - t.v0, E2 = t.v2 - t.v0;
+        const Vec3 fNow = cross(e1, e2), fThen = cross(E1, E2);
+        // The point: the hit's own barycentrics on the instant's triangle, by the same edge form
+        // intersectTri takes a hit by, nudged off it as a hit there would be -- along its face
+        // normal, on the side h.ng is on now.
+        const Vec3 pThen = t.v0 + E1 * h.deformB1 + E2 * h.deformB2;
+        const Vec3 ngThen = dot(h.ng, fNow) < 0.0 ? t.gn * -1.0 : t.gn;
+        patNudgedPoint(pThen.x, pThen.y, pThen.z, ngThen.x, ngThen.y, ngThen.z, t.reach, q.x, q.y, q.z);
+        const double aNow = length(fNow), aThen = length(fThen);
+        if (aNow > 0.0 && aThen > 0.0) {
+            // The normal by the inverse transpose of the linear map taking the face's edges now
+            // to its edges then, and its unit normal now to its unit normal then: n's parts along
+            // e1, e2 and the face normal, read against the dual basis of (E1, E2, the normal then).
+            const Vec3 nNow = fNow * (1.0 / aNow), nThen = fThen * (1.0 / aThen);
+            const Vec3 d1 = cross(E2, nThen) * (1.0 / aThen), d2 = cross(nThen, E1) * (1.0 / aThen);
+            n = normalize(d1 * dot(n, e1) + d2 * dot(n, e2) + nThen * dot(n, nNow));
+            const double k = std::sqrt(aThen / aNow);
+            fw *= k;
+            if (k > 0.0) curv /= k;
         }
     } else if (h.motionSet >= 0 && g_motionU >= 0.0) {
         const Affine D = scene.motionNow(h.motionSet), Dinv = scene.motionNowInverse(h.motionSet);

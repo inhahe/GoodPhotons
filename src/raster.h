@@ -1618,63 +1618,7 @@ struct GBuffer {
     std::vector<Vec3>    vcol;
 };
 
-// A persistent band pool: N workers that sleep on a condition variable and execute one
-// broadcast job at a time (each worker gets its own index and derives its slice). The
-// frame pipeline runs SEVEN parallel passes back to back (project, zbuf clear, raster,
-// shade, two exposure-anchor scans, tonemap); with plain std::thread that was ~7*N
-// thread creations PER FRAME — several milliseconds of pure spawn cost plus scheduler
-// jitter that showed up directly as the min-to-median spread in -raster-bench. Here a
-// pass costs one notify_all and N wakeups instead. Not nestable (run() must not be
-// called from inside a job), which the strictly sequential pass structure guarantees.
-class BandPool {
-public:
-    explicit BandPool(int n) : nW_(n < 1 ? 1 : n) {
-        workers_.reserve(nW_);
-        for (int i = 0; i < nW_; ++i)
-            workers_.emplace_back([this, i] {
-                uint64_t seen = 0;
-                std::unique_lock<std::mutex> lk(m_);
-                for (;;) {
-                    cvJob_.wait(lk, [&] { return quit_ || gen_ != seen; });
-                    if (quit_) return;
-                    seen = gen_;
-                    const std::function<void(int)>* j = job_;
-                    lk.unlock();
-                    (*j)(i);
-                    lk.lock();
-                    if (--pending_ == 0) cvDone_.notify_one();
-                }
-            });
-    }
-    ~BandPool() {
-        { std::lock_guard<std::mutex> lk(m_); quit_ = true; }
-        cvJob_.notify_all();
-        for (auto& t : workers_) t.join();
-    }
-    BandPool(const BandPool&) = delete;
-    BandPool& operator=(const BandPool&) = delete;
-    int size() const { return nW_; }
-    // Run body(workerIndex) on every worker and wait for all of them.
-    void run(const std::function<void(int)>& body) {
-        std::unique_lock<std::mutex> lk(m_);
-        job_ = &body;
-        pending_ = nW_;
-        ++gen_;
-        cvJob_.notify_all();
-        cvDone_.wait(lk, [&] { return pending_ == 0; });
-        job_ = nullptr;
-    }
-
-private:
-    std::vector<std::thread>       workers_;
-    std::mutex                     m_;
-    std::condition_variable        cvJob_, cvDone_;
-    const std::function<void(int)>* job_ = nullptr;
-    uint64_t                       gen_ = 0;
-    int                            pending_ = 0;
-    int                            nW_ = 1;
-    bool                           quit_ = false;
-};
+using ft::BandPool;   // parallel.h: the persistent workers the frame passes run on
 
 // Frame-to-frame scratch for renderFrame. The G-buffer alone is ~85 bytes per pixel
 // (~100 MB at 1280x960 counting the HDR accumulator), so allocating and value-filling it

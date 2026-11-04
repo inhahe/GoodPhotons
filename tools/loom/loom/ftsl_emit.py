@@ -8,7 +8,7 @@ uses these to turn a snapshot into a ``.ftsl`` string per frame.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple, Union
 
@@ -116,6 +116,8 @@ class EmitCtx:
     mesh_format: str = "obj"
     mesh_sink: Optional[dict] = None
     motion: Optional[Motion] = None
+    # The dynamic elastics' cache paths this frame has emitted, so two meshes cannot share one.
+    elastic_caches: set = field(default_factory=set)
 
     def key_clocks(self) -> List[Tuple[Clock, Optional[Cache]]]:
         """The clock, and a cache to evaluate with, at each of :attr:`motion`'s keys.

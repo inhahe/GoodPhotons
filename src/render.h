@@ -2206,7 +2206,7 @@ struct Renderer {
         // tests must pass and neither draws RNG, so the order is unobservable.
         if (scene.occluded(p + wP * 1e-6, wP, dP - 2e-6)) return;
         Hit hm;
-        if (!mirrorSeenAt(scene, eye, -wRE, dE, hm)) return;
+        if (!mirrorSeenAt(scene, eye, -wRE, dE, hm) || !scene.mirrorClaims(mp, hm)) return;
 
         splatMirrorLegs(scene, film, scene.mats[hm.matId], hm, px, py, omega,
                         p, wP, dP, R, wRE, dE, D, shape, lam, beta, w, nUp, rng);
@@ -2382,14 +2382,19 @@ struct Renderer {
                     connectSpecularSphereMirror(scene, *cams[c].cam, *cams[c].film, S,
                                                 p, vt, lam, beta, w, nUp, rng);
         }
-        for (const Scene::MirrorPlane& mp0 : scene.mirrorPlanes) {
-            Scene::MirrorPlane moved;
-            const Scene::MirrorPlane* mp = scene.mirrorPlaneNow(mp0, moved);
-            if (!mp) continue;                              // members moving differently
-            for (int c = 0; c < nCam; ++c)
-                if (cams[c].cam && cams[c].film && !cams[c].cam->hasLens())
-                    connectSpecularPlane(scene, *cams[c].cam, *cams[c].film, *mp,
-                                         p, vt, lam, beta, w, nUp, rng);
+        // A path with a time takes a mixed plane (faces moving differently, or deforming) by
+        // its parts, each moving as one.
+        for (const auto* list : {&scene.mirrorPlanes, &scene.mirrorPlaneParts}) {
+            if (list == &scene.mirrorPlaneParts && g_motionU < 0.0) break;
+            for (const Scene::MirrorPlane& mp0 : *list) {
+                Scene::MirrorPlane moved;
+                const Scene::MirrorPlane* mp = scene.mirrorPlaneNow(mp0, moved);
+                if (!mp) continue;                          // a mixed plane: its parts serve
+                for (int c = 0; c < nCam; ++c)
+                    if (cams[c].cam && cams[c].film && !cams[c].cam->hasLens())
+                        connectSpecularPlane(scene, *cams[c].cam, *cams[c].film, *mp,
+                                             p, vt, lam, beta, w, nUp, rng);
+            }
         }
     }
     void camSpecularSplatAllVtx(const Scene& scene, const CamTarget* cams, int nCam,

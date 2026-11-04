@@ -5,9 +5,11 @@
 // on a mesh. `ftrace -bake-elastic <scene%04d.ftsl> <first> <last>` loads each frame's scene in
 // order; at a dynamic elastic the loader then continues the simulation from the frame before's
 // record (or from rest, the handles' first targets solved quasi-statically, when there is none),
-// through the frame's motion keys, and writes the frame's record. A render reads its frame's
-// record and takes the mesh at each key from it: frames stay independently renderable once baked,
-// and a bake resumes from any frame whose predecessor's record exists.
+// through the frame's motion keys, and writes the frame's record -- unless the record there was
+// simulated from exactly this (chainKeyOf: the record before's chain, this frame's mesh, handles,
+// path and keys), when it is kept. So a bake over the whole shot re-simulates from the first frame
+// that changed, and only from there. A render reads its frame's record and takes the mesh at each
+// key from it: frames stay independently renderable once baked.
 //
 // The step is implicit (projective-dynamics style): the inertial guess y = x + h v, then the
 // ARAP energy plus (mass / (stiffness h^2)) * sum of m_i |x_i - y_i|^2 minimised by
@@ -16,10 +18,12 @@
 // `stiffness` are a material's: a larger mesh of one material wobbles more slowly, as it should.
 //
 // A record holds the mesh at each of its frame's keys and the state at its last key (positions,
-// velocities, the held vertices' targets), in float32, and the key of everything it was baked
-// from (rest mesh, handles, settings): a record baked for something else is refused. The state a
-// bake carries from one frame to the next is the record's own, rounded to float32, so a bake run
-// in one go and one resumed part-way write the same files.
+// velocities, the held vertices' targets), in float32, the key of everything it was baked from
+// (rest mesh, handles, settings), of the path its frame's handles take over its keys, and of its
+// whole history (chainKey): a render refuses a record baked for another mesh, handles, path or
+// keys of its own frame. (It cannot see a change to an earlier frame's scene: the bake can.) The
+// state a bake carries from one frame to the next is the record's own, rounded to float32, so a
+// bake run in one go and one resumed part-way write the same files.
 #pragma once
 #include <algorithm>
 #include <cmath>
@@ -50,6 +54,8 @@ struct Params {
 
 struct Record {
     uint64_t key = 0;                       // what it was baked from (see keyOf)
+    uint64_t pathKey = 0;                   // the handles' path over its keys (see pathKeyOf)
+    uint64_t chainKey = 0;                  // all it was simulated from (see chainKeyOf)
     long long frame = 0;
     std::vector<double> times;              // its keys' times, frames from its instant
     std::vector<std::vector<Vec3>> pos;     // the mesh at each key
@@ -82,6 +88,35 @@ inline uint64_t keyOf(const std::vector<Vec3>& rest, const std::vector<std::arra
     return h.h;
 }
 
+inline Vec3 f32(const Vec3& v) { return Vec3{(double)(float)v.x, (double)(float)v.y, (double)(float)v.z}; }
+
+// The key of a frame's handles' path: the held vertices' targets at each of its keys, as the
+// record keeps them (float32). Not in keyOf, since it changes from frame to frame: a render
+// compares its own frame's (a change to an earlier frame's handles needs that frame re-baked,
+// and the frames after it).
+inline uint64_t pathKeyOf(const std::vector<char>& held, const std::vector<std::vector<Vec3>>& targets) {
+    Hasher h;
+    h.i((long long)targets.size());
+    for (const auto& tk : targets)
+        for (size_t i = 0; i < tk.size(); ++i)
+            if (held[i]) { const Vec3 q = f32(tk[i]); h.d(q.x); h.d(q.y); h.d(q.z); }
+    return h.h;
+}
+
+// The key of everything a record was simulated from: the record before's chain key (0 for one
+// started at rest), and this frame's key, path, number and key times. A bake leaves a record whose
+// chain key still matches alone, so a rerun re-simulates from the first frame that changed.
+inline uint64_t chainKeyOf(uint64_t prevChain, uint64_t key, uint64_t pathKey, long long frame,
+                           const std::vector<double>& times) {
+    Hasher h;
+    h.bytes(&prevChain, sizeof prevChain);
+    h.bytes(&key, sizeof key);
+    h.bytes(&pathKey, sizeof pathKey);
+    h.i(frame);
+    for (double t : times) h.d(t);
+    return h.h;
+}
+
 // `pat` with frame number `k` in its one integer conversion (%d, %04d, ...), or false for a
 // pattern with none, more than one, or another conversion.
 inline bool framePath(const std::string& pat, long long k, std::string& out) {
@@ -101,19 +136,20 @@ inline bool framePath(const std::string& pat, long long k, std::string& out) {
     return true;
 }
 
-inline Vec3 f32(const Vec3& v) { return Vec3{(double)(float)v.x, (double)(float)v.y, (double)(float)v.z}; }
-
 // ---- the file ----------------------------------------------------------------------------
-// "FTEC", u32 version 1, u64 key, i64 frame, u32 vertices, u32 keys, f64 times[keys],
+// "FTEC", u32 version 2, u64 key, u64 pathKey, u64 chainKey, i64 frame, u32 vertices, u32 keys,
+// f64 times[keys],
 // f32 xyz pos[keys][vertices], f32 xyz vel[vertices], f32 xyz target[vertices].
+constexpr uint32_t kVersion = 2;
 inline bool write(const std::string& path, const Record& r, std::string& err) {
     const std::string tmp = path + ".part";
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
     if (!f) { err = "cannot write " + tmp; return false; }
-    const uint32_t ver = 1, nv = (uint32_t)r.vel.size(), nk = (uint32_t)r.times.size();
+    const uint32_t ver = kVersion, nv = (uint32_t)r.vel.size(), nk = (uint32_t)r.times.size();
     const int64_t fr = r.frame;
     bool ok = std::fwrite("FTEC", 1, 4, f) == 4 && std::fwrite(&ver, 4, 1, f) == 1 &&
-              std::fwrite(&r.key, 8, 1, f) == 1 && std::fwrite(&fr, 8, 1, f) == 1 &&
+              std::fwrite(&r.key, 8, 1, f) == 1 && std::fwrite(&r.pathKey, 8, 1, f) == 1 &&
+              std::fwrite(&r.chainKey, 8, 1, f) == 1 && std::fwrite(&fr, 8, 1, f) == 1 &&
               std::fwrite(&nv, 4, 1, f) == 1 && std::fwrite(&nk, 4, 1, f) == 1 &&
               std::fwrite(r.times.data(), 8, nk, f) == nk;
     std::vector<float> buf((size_t)nv * 3);
@@ -138,16 +174,25 @@ inline bool read(const std::string& path, Record& r, std::string& err) {
     char magic[4];
     uint32_t ver = 0, nv = 0, nk = 0;
     int64_t fr = 0;
-    bool ok = std::fread(magic, 1, 4, f) == 4 && !std::memcmp(magic, "FTEC", 4) &&
-              std::fread(&ver, 4, 1, f) == 1 && ver == 1 && std::fread(&r.key, 8, 1, f) == 1 &&
-              std::fread(&fr, 8, 1, f) == 1 && std::fread(&nv, 4, 1, f) == 1 &&
-              std::fread(&nk, 4, 1, f) == 1 && nk >= 1 && nk <= 4096 && nv <= 100000000u;
+    const bool ftec = std::fread(magic, 1, 4, f) == 4 && !std::memcmp(magic, "FTEC", 4) &&
+                      std::fread(&ver, 4, 1, f) == 1;
+    if (ftec && ver != kVersion) {
+        std::fclose(f);
+        err = path + " is an elastic cache record of another ftrace (version " + std::to_string(ver) +
+              ", this one reads " + std::to_string(kVersion) + ") -- bake the shot again";
+        return false;
+    }
+    bool ok = ftec && std::fread(&r.key, 8, 1, f) == 1 && std::fread(&r.pathKey, 8, 1, f) == 1 &&
+              std::fread(&r.chainKey, 8, 1, f) == 1 && std::fread(&fr, 8, 1, f) == 1 &&
+              std::fread(&nv, 4, 1, f) == 1 && std::fread(&nk, 4, 1, f) == 1 && nk >= 1 && nk <= 4096 &&
+              nv <= 100000000u;
     if (ok) {
         r.frame = fr;
         r.times.resize(nk);
         ok = std::fread(r.times.data(), 8, nk, f) == nk;
     }
-    std::vector<float> buf((size_t)nv * 3);
+    // Sized only once the header has passed: a corrupt vertex count must not allocate.
+    std::vector<float> buf(ok ? (size_t)nv * 3 : 0);
     const auto get = [&](std::vector<Vec3>& v) {
         if (std::fread(buf.data(), sizeof(float), buf.size(), f) != buf.size()) return false;
         v.resize(nv);

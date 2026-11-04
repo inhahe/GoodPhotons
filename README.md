@@ -439,6 +439,7 @@ stays something you can actually read end to end.
 | Building SPDs — blackbody, gaussian, measured tables, `rgb` upsampling, IOR curves, the named presets | [Spectra](REFERENCE.md#spectra-spds-reflectances-indices) |
 | Area / sphere / cylinder / spot / sun / environment emitters and how they're sampled | [Lights](REFERENCE.md#lights) |
 | Primitives, transforms, meshes (`.obj` / `.gltf` / `.glb` / `.fbx` / `.stl` / `.ply` / `.ftmesh`), CSG, isosurfaces | [Geometry](REFERENCE.md#geometry) |
+| Bending a mesh by handles — falloff, RBF, as-rigid-as-possible, and a baked dynamic elastic with inertia | [Deforming a mesh](REFERENCE.md#deforming-a-mesh-deform) |
 | Hair / fur / grass / wire strands — the `curve` primitive and its four bases | [Curves and fibers](REFERENCE.md#curves-and-fibers-curve) |
 | Shading a strand as a fiber rather than a surface — R / TT / TRT, the scattering medulla, measured species | [Hair and fur fibers](REFERENCE.md#hair-and-fur-fibers-hair) |
 | Image textures, UV handling, and the math-driven procedural patterns | [Textures](REFERENCE.md#textures) · [Patterns](REFERENCE.md#procedural-patterns-math-driven-materials) |

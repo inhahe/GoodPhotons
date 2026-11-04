@@ -54,6 +54,7 @@
 #include <vector>
 #include <memory>
 #include <unordered_map>
+#include <map>
 #include <set>
 #include <cctype>
 #include <cstdio>
@@ -6073,6 +6074,7 @@ private:
         std::vector<double> times((size_t)K, 0.0);
         for (int k = 0; k < K && K > 1; ++k) times[(size_t)k] = S.motionA + (S.motionB - S.motionA) * k / (K - 1);
         const uint64_t key = elastic::keyOf(rest, tris, held, P);
+        const uint64_t pathKey = elastic::pathKeyOf(held, targets);
         std::string path, err;
         elastic::framePath(cache, frame, path);
         elastic::Record rec;
@@ -6094,14 +6096,23 @@ private:
             } else {
                 std::printf("[elastic] frame %lld: no record for frame %lld -- starting at rest\n", frame, frame - 1);
             }
-            if (!elastic::bakeFrame(rest, tris, held, targets, times, frame, P, pp, rec, err)) {
-                fail("deform elastic: " + err);
-                return false;
+            const uint64_t chain = elastic::chainKeyOf(pp ? pp->chainKey : 0, key, pathKey, frame, times);
+            std::string ignored;
+            if (elastic::read(path, rec, ignored) && rec.frame == frame && rec.chainKey == chain &&
+                rec.pos.size() == (size_t)K && rec.vel.size() == rest.size()) {
+                std::printf("[elastic] frame %lld is up to date (%s)\n", frame, path.c_str());
+            } else {
+                if (!elastic::bakeFrame(rest, tris, held, targets, times, frame, P, pp, rec, err)) {
+                    if (!stopped()) fail("deform elastic: " + err);
+                    return false;
+                }
+                rec.key = key;
+                rec.pathKey = pathKey;
+                rec.chainKey = chain;
+                if (!elastic::write(path, rec, err)) { fail("deform elastic: " + err); return false; }
+                std::printf("[elastic] baked frame %lld (%zu vertices, %d keys) -> %s\n", frame, rest.size(), K,
+                            path.c_str());
             }
-            rec.key = key;
-            if (!elastic::write(path, rec, err)) { fail("deform elastic: " + err); return false; }
-            std::printf("[elastic] baked frame %lld (%zu vertices, %d keys) -> %s\n", frame, rest.size(), K,
-                        path.c_str());
         } else {
             if (!elastic::read(path, rec, err)) {
                 fail(err.empty() ? "deform elastic: no cache record " + path + " -- bake the shot first "
@@ -6114,6 +6125,11 @@ private:
             if (!same) {
                 fail("deform elastic: " + path + " was baked for another mesh, handles, settings or keys -- "
                      "bake the shot again");
+                return false;
+            }
+            if (rec.pathKey != pathKey) {
+                fail("deform elastic: " + path + " was baked for other handle targets (a `to` or its keys "
+                     "changed) -- bake the shot again from this frame");
                 return false;
             }
         }
@@ -6155,6 +6171,10 @@ private:
                 if (!vec3Of(hb, "at", v)) { fail("deform: a handle needs `at x y z`"); return false; }
                 h.at = P(v);
                 h.radius = Len(dblOf(hb, "radius", 0.0));
+                if (d.kind == "falloff" && !(h.radius > 0.0)) {
+                    fail("deform falloff: a handle needs a `radius` above 0 -- how far its pull reaches");
+                    return false;
+                }
                 if (const Stmt* mo = find(hb, "motion"); mo && mo->val.block) {
                     for (const auto& ks : mo->val.block->stmts) {
                         if (ks.key != "key" || !ks.val.block) { fail("deform: only `key { to x y z }` belongs in a handle's motion"); return false; }
@@ -6163,6 +6183,11 @@ private:
                         h.to.push_back(P(v));
                     }
                     if (h.to.size() < 2) { fail("deform: give a handle's motion at least two keys"); return false; }
+                    // Keys that all agree move nothing: a still handle, so a still mesh stays still.
+                    bool still = true;
+                    for (const Vec3& t : h.to)
+                        still = still && t.x == h.to[0].x && t.y == h.to[0].y && t.z == h.to[0].z;
+                    if (still) h.to.resize(1);
                 } else {
                     if (find(hb, "to") && !vec3Of(hb, "to", v)) {
                         fail("deform: a handle's `to` needs three numbers, x y z");
@@ -6178,6 +6203,11 @@ private:
                 if (d.kind != "elastic") { fail("deform " + d.kind + ": only an elastic is dynamic"); return false; }
                 if (!dy->val.block) {
                     fail("deform elastic: `dynamic` takes a block { cache \"jelly_%04d.ftec\"  frame N ... }");
+                    return false;
+                }
+                if (find(db, "iterations")) {
+                    fail("deform elastic: a dynamic elastic takes its rounds per step from "
+                         "`dynamic { iterations N }`");
                     return false;
                 }
                 const Block& yb = *dy->val.block;
@@ -6228,6 +6258,21 @@ private:
                     }
                     K = (int)h.to.size();
                 }
+        // A dynamic elastic moves through the frame whether its handles do or not -- it rings on
+        // after they stop -- so over a motion interval it gets keys anyway, about one a substep,
+        // to blur by and give the guide pass its motion. The instant must be one of them.
+        if (K == 1 && stack[0].dyn.on && S.motionB > S.motionA) {
+            const int want = std::max(3, (int)std::ceil((S.motionB - S.motionA) * stack[0].dyn.P.substeps) + 1);
+            for (int k = want; k <= std::max(want, 129) && K == 1; ++k) {
+                const double j = S.motionU(0.0) * (k - 1);
+                if (std::fabs(j - std::lround(j)) < 1e-9) K = k;
+            }
+            if (K == 1) {
+                fail("deform elastic: no even spread of keys over the motion interval puts one at the frame's "
+                     "instant (centre the interval on it, -0.5 0.5 say)");
+                return false;
+            }
+        }
         int kNow = 0;   // the key at the frame's instant
         if (K > 1) {
             if (!(S.motionB > S.motionA)) {
@@ -6374,13 +6419,9 @@ private:
                 tr.vkeyCount = K;
                 for (int k = 0; k < K; ++k) {
                     for (int c = 0; c < 3; ++c) S.vertexKeys.push_back(keyPos[(size_t)k][(size_t)vc[(size_t)c]]);
-                    for (int c = 0; c < 3; ++c) {
-                        Vec3 n = cornerNormal(orig, c, vc[(size_t)c], k);
-                        if (dot(n, n) < 1e-24)
-                            n = normalize(cross(keyPos[(size_t)k][(size_t)vc[1]] - keyPos[(size_t)k][(size_t)vc[0]],
-                                                keyPos[(size_t)k][(size_t)vc[2]] - keyPos[(size_t)k][(size_t)vc[0]]));
-                        S.vertexKeys.push_back(n);
-                    }
+                    // A corner with no normal authored keeps zero, so Tri::finalize gives the
+                    // blended face its own normal at the path's time.
+                    for (int c = 0; c < 3; ++c) S.vertexKeys.push_back(cornerNormal(orig, c, vc[(size_t)c], k));
                 }
             }
             tr.v0 = keyPos[(size_t)kNow][(size_t)vc[0]];
@@ -6390,7 +6431,7 @@ private:
             tr.n1 = cornerNormal(orig, 1, vc[1], kNow);
             tr.n2 = cornerNormal(orig, 2, vc[2], kNow);
         }
-        if (keyed && !b.name.empty()) movingNames_.insert(b.name);   // fur / settle cannot follow it
+        if (keyed && !b.name.empty()) movingNames_.insert({b.name, "it deforms through the shutter"});
         return true;
     }
 
@@ -7023,13 +7064,15 @@ private:
     MotionChain motionChain_;
     int patFrame_ = -1;   // the pattern frame the group being built gives its children, or -1
     bool sphereAsMesh_ = false;   // the moving group being built scales its children unevenly
-    // Named objects built in a moving group. What finds an object by name -- fur `on` and
-    // `bald`, a medium's `bounds { object }` -- reads where it sits at the instant, so it refuses
-    // one of these rather than stay behind while it moves (movingRefused).
-    std::set<std::string> movingNames_;
+    // Named objects that move: built in a moving group, or deforming through the shutter, each
+    // with why. What finds an object by name -- fur `on` and `bald`, a medium's
+    // `bounds { object }` -- reads where it sits at the instant, so it refuses one of these
+    // rather than stay behind while it moves (movingRefused).
+    std::map<std::string, const char*> movingNames_;
     bool movingRefused(const std::string& name, const char* who) {
-        if (!movingNames_.count(name)) return false;
-        fail(std::string(who) + " \"" + name + "\": it is in a moving group, and " + who +
+        const auto it = movingNames_.find(name);
+        if (it == movingNames_.end()) return false;
+        fail(std::string(who) + " \"" + name + "\": " + it->second + ", and " + who +
              " cannot follow a moving object yet (ROADMAP 11)");
         return true;
     }
@@ -7238,7 +7281,7 @@ private:
                 for (size_t i = mk.instances; i < L.scene.instances.size(); ++i) L.scene.instances[i].patFrame = patFrame_;
             }
             if (!moving) return true;
-            if (!cb.name.empty()) movingNames_.insert(cb.name);
+            if (!cb.name.empty()) movingNames_.insert({cb.name, "it is in a moving group"});
             movers.push_back({mk, primMark(L)});
             return true;
         };

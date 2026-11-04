@@ -283,8 +283,9 @@ inline Vec3 deformedFramePoint(const Scene& scene, const Tri& t, const Vec3& p0,
     const double b1 = (d22 * dot(d, e1) - d12 * dot(d, e2)) / den;
     const double b2 = (d11 * dot(d, e2) - d12 * dot(d, e1)) / den;
     const double ue = scene.motionU(end);
-    const Vec3 pe = scene.deformedAt(t, 0, ue) * (1.0 - b1 - b2) + scene.deformedAt(t, 1, ue) * b1 +
-                    scene.deformedAt(t, 2, ue) * b2;
+    Vec3 c[3];
+    scene.deformedCorners(t, ue, c);
+    const Vec3 pe = c[0] * (1.0 - b1 - b2) + c[1] * b1 + c[2] * b2;
     return p0 + (pe - p0) * (frames / end);
 }
 

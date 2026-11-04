@@ -3662,11 +3662,14 @@ radius=r)])])`.
 **Dynamic elastic.** `deform elastic { dynamic { cache "…_%04d.ftec"  frame N  mass …  stiffness …
 damping … } … }` adds inertia, so the surface lags, overshoots and settles. It is a simulation,
 so a shot is baked once in frame order: `ftrace -bake-elastic <scene%04d.ftsl> <first> <last>`
-writes a record per frame, and each frame renders from its own record. A bake can resume from
-any frame whose predecessor's record exists, and a resumed bake writes byte for byte what one
-bake writes. A frame not yet baked, or baked for another mesh or settings, says so and does not
-render. loom's shot runner bakes on its own before rendering when the scene has one
-(`Elastic(…, dynamic=Dynamics(…))`).
+writes a record per frame, and each frame renders from its own record. A bake keeps every
+record already simulated from exactly its scene and the record before it, so baking the whole
+shot again re-simulates only from the first frame that changed; a resumed bake writes byte for
+byte what one bake writes, and `ftrace -stop` reaches it cleanly. A frame not yet baked, or
+baked for another mesh, handle targets or settings, says so and does not render. Under a
+`motion_interval` a dynamic elastic gets keys even when its handles hold still, since it rings
+on after they stop. loom's shot runner bakes the shot from its first frame before rendering
+when the scene has one (`Elastic(…, dynamic=Dynamics(…))`).
 
 `-export-tris <file.obj>` writes the scene's triangles as loaded (every transform and deformer
 applied) and exits, and `-export-tris-at <frames>` writes them at another time in the shutter.

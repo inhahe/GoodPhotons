@@ -17,7 +17,9 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 #include "geometry.h"
 #include "parallel.h"
@@ -214,34 +216,17 @@ inline M3 closestRotation(const M3& M) {
             for (int k = 0; k < 3; ++k) s += M[k * 3 + r] * M[k * 3 + c];
             a[r][c] = s;
         }
-    double V[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
-    for (int sweep = 0; sweep < 12; ++sweep) {
-        const double off = a[0][1] * a[0][1] + a[0][2] * a[0][2] + a[1][2] * a[1][2];
-        if (off < 1e-30) break;
-        for (int p = 0; p < 2; ++p)
-            for (int q = p + 1; q < 3; ++q) {
-                if (std::fabs(a[p][q]) < 1e-300) continue;
-                const double th = 0.5 * (a[q][q] - a[p][p]) / a[p][q];
-                const double t = (th >= 0 ? 1.0 : -1.0) / (std::fabs(th) + std::sqrt(th * th + 1.0));
-                const double c = 1.0 / std::sqrt(t * t + 1.0), s = t * c;
-                for (int k = 0; k < 3; ++k) {          // A <- J^T A J
-                    const double akp = a[k][p], akq = a[k][q];
-                    a[k][p] = c * akp - s * akq; a[k][q] = s * akp + c * akq;
-                }
-                for (int k = 0; k < 3; ++k) {
-                    const double apk = a[p][k], aqk = a[q][k];
-                    a[p][k] = c * apk - s * aqk; a[q][k] = s * apk + c * aqk;
-                }
-                for (int k = 0; k < 3; ++k) {
-                    const double vkp = V[k][p], vkq = V[k][q];
-                    V[k][p] = c * vkp - s * vkq; V[k][q] = s * vkp + c * vkq;
-                }
-            }
-    }
-    // U's columns: M v_i / sigma_i, orthonormalised (a degenerate one completed by a cross product)
+    double V[3][3];
+    symEigen3(a, V);
+    // U's columns: M v_i / sigma_i, orthonormalised (a degenerate one completed by a cross
+    // product). Degenerate is judged against the largest singular value, so the answer does not
+    // depend on the mesh's scale; a one-ring with no extent at all (M = 0) has no rotation to
+    // read and keeps the identity.
     double U[3][3];
     int order[3] = {0, 1, 2};
     std::sort(order, order + 3, [&](int x, int y) { return a[x][x] > a[y][y]; });
+    const double sigmaMax = std::sqrt(std::max(0.0, a[order[0]][order[0]]));
+    if (!(sigmaMax > 1e-150) || !std::isfinite(sigmaMax)) return M3{1, 0, 0, 0, 1, 0, 0, 0, 1};
     Vec3 u[3];
     for (int i = 0; i < 3; ++i) {
         const int col = order[i];
@@ -250,7 +235,7 @@ inline M3 closestRotation(const M3& M) {
                 M[6] * v.x + M[7] * v.y + M[8] * v.z};
         for (int j = 0; j < i; ++j) mv = mv - u[j] * dot(mv, u[j]);
         double l = length(mv);
-        if (l < 1e-12) {
+        if (l < 1e-9 * sigmaMax) {
             mv = i == 2 ? cross(u[0], u[1]) : (std::fabs(u[0].x) < 0.9 ? cross(u[0], Vec3{1, 0, 0})
                                                                        : cross(u[0], Vec3{0, 1, 0}));
             for (int j = 0; j < i; ++j) mv = mv - u[j] * dot(mv, u[j]);
@@ -377,15 +362,23 @@ public:
 private:
     // Vertices in blocks of kBlock, `fn(lo, hi, block)` each, over ft::parallelFor. A block's
     // bounds do not depend on the threads, so a sum gathered per block and then over the blocks
-    // in order comes out the same on any machine -- which keeps a bake the same run to run.
+    // in order comes out the same on any machine -- which keeps a bake the same run to run. A
+    // solve runs this several times every CG iteration, so a mesh of more than one block keeps
+    // its workers (pool_) rather than making threads each time.
     static constexpr int kBlock = 2048;
     template <class Fn>
-    static bool forBlocks(int n, Fn&& fn) {
+    bool forBlocks(int n, Fn&& fn) const {
         const size_t nb = (size_t)((n + kBlock - 1) / kBlock);
-        return ft::parallelFor(nb, 1, [&](size_t bi) {
+        const auto block = [&](size_t bi) {
             const int lo = (int)bi * kBlock;
             fn(lo, std::min(n, lo + kBlock), bi);
-        });
+        };
+        if (nb < 2) return ft::parallelFor(nb, 1, block);
+        if (!pool_) {
+            const unsigned hw = std::thread::hardware_concurrency();
+            pool_ = std::make_unique<ft::BandPool>((int)std::min<size_t>(hw ? hw : 4, nb));
+        }
+        return ft::parallelFor(*pool_, nb, 1, block);
     }
 
     // (L + inertia * M) x = b on the free vertices by Jacobi-preconditioned conjugate gradients,
@@ -475,6 +468,7 @@ private:
     std::vector<Vec3> rest_;
     std::vector<int> start_, nbr_;
     std::vector<double> w_, mass_;
+    mutable std::unique_ptr<ft::BandPool> pool_;   // forBlocks' workers (one solve at a time)
 };
 
 }  // namespace deform

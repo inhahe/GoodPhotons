@@ -250,20 +250,35 @@ def render_range(scene: Scene, frames: int, *, name: str = "loom",
     ftrace = Path(ftrace) if ftrace is not None else find_ftrace()
     ftsl_paths = emit_frames(scene, frames, outdir, name, fps=fps, loop=loop, motion=motion,
                              frame_range=frame_range)
-    # A dynamic elastic is simulated through the shot once, in frame order, before any frame
-    # renders (ftrace -bake-elastic writes each frame's cache record; the frames read them).
+    stop = Path(stop_file) if stop_file is not None else None
+    # A dynamic elastic is simulated through the shot in frame order before any frame renders
+    # (ftrace -bake-elastic writes each frame's cache record; the frames read them). Always from
+    # the shot's first frame, whatever range renders, since a frame continues the one before it;
+    # the bake keeps every record already simulated from exactly its scene, so a rerun costs
+    # only the frames from the first that changed (and a scene load each for the rest).
     from .deform import needs_elastic_bake
     if needs_elastic_bake(scene.elements):
         first, last = frame_range if frame_range is not None else (0, frames - 1)
+        if first > 0:
+            emit_frames(scene, frames, outdir, name, fps=fps, loop=loop, motion=motion,
+                        frame_range=(0, first - 1))
         width = max(3, len(str(frames - 1)))
         pattern = (outdir / f"{name}%0{width}d.ftsl").as_posix()
-        print(f"[loom] baking the dynamic elastics over frames {first}..{last}", flush=True)
-        if subprocess.run([str(ftrace), "-bake-elastic", pattern, str(first), str(last)]).returncode != 0:
+        print(f"[loom] baking the dynamic elastics over frames 0..{last}", flush=True)
+        try:
+            rc, stopped = _run_frame([str(ftrace), "-bake-elastic", pattern, "0", str(last),
+                                      "-stop-exit", str(_STOPPED)], ftrace, stop)
+        except KeyboardInterrupt:
+            print("[loom] Ctrl-C during the bake: no frame rendered", flush=True)
+            raise
+        if stopped or rc == _STOPPED:
+            print("[loom] stop requested during the bake -- no frame rendered", flush=True)
+            return []
+        if rc != 0:
             raise RuntimeError("ftrace -bake-elastic failed (see its output above)")
     own = noise is None and time_s is None and n is None
     budget = ([] if own and any(a in _BUDGET_FLAGS for a in extra_args)
               else _budget_args(noise, time_s, n))
-    stop = Path(stop_file) if stop_file is not None else None
     want = _target_spp(extra_args)
     if skip_existing and want is None:
         print("[loom] note: budget is not -spp based, so a resume cannot verify that an "
@@ -359,7 +374,9 @@ _STOPPED = 75
 
 def _run_frame(cmd: Sequence[str], ftrace: Path,
                stop: Optional[Path]) -> Tuple[int, bool]:
-    """Run one frame's ftrace and wait for it; returns (exit code, whether it was stopped).
+    """Run one frame's ftrace (or the shot's elastic bake) and wait for it; returns (exit code,
+    whether it was stopped). It runs in the repo root, as every frame does, so a relative path
+    in a scene names the same file for each.
 
     It is never killed. When ``stop`` appears it is asked to stop cleanly (``ftrace -stop``:
     it writes its image and checkpoint, then exits). On Ctrl-C -- which the console hands

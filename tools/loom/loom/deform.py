@@ -63,8 +63,12 @@ class Handle:
         if self.to is None:
             return f"handle {{ at {fmt3(self.at)}{r} }}"
         if ctx.motion is not None and _moving(self.to):
-            keys = "  ".join(f"key {{ to {fmt3(vec3(self.to, kc, kcache))} }}" for kc, kcache in ctx.key_clocks())
-            return f"handle {{ at {fmt3(self.at)}{r}  motion {{ {keys} }} }}"
+            # Keys only where the handle moves over the interval, as Transform.wrap writes them:
+            # identical keys would make a still mesh deform through the shutter for nothing.
+            keys = [fmt3(vec3(self.to, kc, kcache)) for kc, kcache in ctx.key_clocks()]
+            if any(k != keys[0] for k in keys):
+                body = "  ".join(f"key {{ to {k} }}" for k in keys)
+                return f"handle {{ at {fmt3(self.at)}{r}  motion {{ {body} }} }}"
         return f"handle {{ at {fmt3(self.at)}  to {fmt3(vec3(self.to, ctx.clock, ctx.cache))}{r} }}"
 
 
@@ -95,6 +99,9 @@ class Falloff(Deformer):
 
     def __init__(self, handles: Iterable[Handle], profile: str = "smooth") -> None:
         super().__init__(handles)
+        for h in self.handles:
+            if not h.radius > 0.0:
+                raise ValueError("Falloff: every Handle needs a radius (how far its pull reaches)")
         if profile not in ("smooth", "linear", "gaussian"):
             raise ValueError(f"Falloff: profile smooth, linear or gaussian, got {profile!r}")
         self.profile = profile
@@ -136,14 +143,21 @@ class Dynamics:
 
     def cache_path(self, ctx: EmitCtx, mesh: str) -> str:
         if self.cache is not None:
-            return self.cache
+            # Absolute, from where the shot runs, as its outdir is: the bake and the frames run
+            # ftrace in the repo root, where a relative path would name another place.
+            return Path(self.cache).resolve().as_posix()
         import tempfile
         d = Path(ctx.assets_dir) if ctx.assets_dir is not None else Path(tempfile.gettempdir())
         return (d.resolve() / f"{mesh}_%04d.ftec").as_posix()
 
     def emit(self, ctx: EmitCtx, mesh: str) -> str:
         c = ctx.clock
-        return (f'dynamic {{ cache "{self.cache_path(ctx, mesh)}"  frame {int(c.frame)}  mass {fmt(self.mass)}  '
+        path = self.cache_path(ctx, mesh)
+        if path in ctx.elastic_caches:
+            raise ValueError(f"Dynamics: two dynamic elastics would share the cache {path!r} -- give "
+                             f"their meshes different names, or each Dynamics its own `cache`")
+        ctx.elastic_caches.add(path)
+        return (f'dynamic {{ cache "{path}"  frame {int(c.frame)}  mass {fmt(self.mass)}  '
                 f"stiffness {fmt(self.stiffness)}  damping {fmt(self.damping)}  fps {fmt(c.fps)}  "
                 f"substeps {self.substeps}  iterations {self.iterations} }}")
 
@@ -159,6 +173,9 @@ class Elastic(Deformer):
         for h in self.handles:
             if not h.radius > 0.0:
                 raise ValueError("Elastic: every Handle needs a radius (the vertices it holds)")
+        if iterations is not None and dynamic is not None:
+            raise ValueError("Elastic: a dynamic elastic takes its rounds per step from "
+                             "Dynamics(iterations=...)")
         self.iterations, self.dynamic = iterations, dynamic
 
     def options(self, ctx: EmitCtx, mesh: str) -> str:

@@ -1899,7 +1899,7 @@ mesh "bar" { file "meshes/bar.obj"  material rubber
 
 | deformer | what it does |
 |---|---|
-| `falloff` | each handle moves the vertices within its `radius` by its own move, weighted by `profile` of the distance (1 at the handle, 0 at the rim, smooth there for `smooth` and `gaussian`); the handles' moves add |
+| `falloff` | each handle moves the vertices within its `radius` (required, above 0) by its own move, weighted by `profile` of the distance (1 at the handle, 0 at the rim, smooth there for `smooth` and `gaussian`); the handles' moves add |
 | `rbf` | the smooth displacement field that takes every handle's point exactly to its target: a radial-basis interpolant (`kernel`; `eps` is the width of `gaussian` and `multiquadric`) plus an affine part over the space the handles span. So handles moved by one rotation, scale or shear move the mesh exactly so, on a flat sheet too |
 | `elastic` | as-rigid-as-possible (Sorkine & Alexa 2007): each handle holds the vertices within its `radius` at its move, and the rest of the surface follows like rubber, every vertex's neighbourhood kept as close to a rotation of its rest shape as the handles allow. `iterations` (default 30) rounds of local rotations and a global solve |
 
@@ -1908,7 +1908,8 @@ one. Each corner's authored normal turns with its vertex's normal.
 
 **Motion blur.** A handle whose target changes across the frame gives `to` in `motion { key { to
 x y z } … }`, spread evenly over the scene's `motion_interval` (§2) with one key at the frame's
-instant. Every keyed handle of a mesh needs the same number of keys. Each deformer is then
+instant. Every keyed handle of a mesh needs the same number of keys; keys that all agree are a
+handle holding still, so they make nothing move. Each deformer is then
 evaluated at every key on the same rest mesh, so every vertex has a path of its own through the
 shutter, and a camera with a shutter blurs the deformation exactly (§13.1). A deforming mesh
 cannot sit inside a moving `group`: move it with its handles instead. A glowing mesh keeps its
@@ -1935,16 +1936,27 @@ deform elastic {
 | `damping` | 0.9 | the share of its velocity it loses per second (0–1): 0.9 settles in a second or two, lower rings on |
 | `fps` | 24 | frames per second, so the simulation steps in seconds. A larger mesh of the same material wobbles more slowly, as a real one does |
 | `substeps` | 8 | simulation steps per frame |
-| `iterations` | 8 | as-rigid-as-possible rounds per step |
+| `iterations` | 8 | as-rigid-as-possible rounds per step (the elastic's own `iterations` is refused beside `dynamic`) |
+
+A dynamic elastic moves through its frame even when its handles hold still -- it rings on after
+they stop -- so under a `motion_interval` it is given keys anyway, about one a substep, and blurs
+and carries its motion into the guide pass (§13.1) without a keyed handle.
 
 `ftrace -bake-elastic <scene%04d.ftsl> <first> <last>` loads each frame's scene in order. At each
 dynamic elastic it continues the simulation from the frame before's record, or from rest when
-there is none, through the frame's motion keys, and writes the frame's record. A bake resumed
-part-way writes byte for byte what one bake writes. A frame with no record, or one baked for
-another mesh, handles or settings, refuses to load and says so. A dynamic elastic must be its
-mesh's first deformer, and a frame's motion interval may span at most one frame (`-0.5 0.5`, say).
-loom's `DeformedMesh` / `Elastic(dynamic=Dynamics(…))` writes all this, and its shot runner bakes
-before it renders.
+there is none, through the frame's motion keys, and writes the frame's record -- or keeps the one
+there, when it was simulated from exactly this: the record before it, and this frame's mesh,
+handles, targets, settings and keys. So a bake over the whole shot re-simulates from the first
+frame that changed, and only from there. A bake resumed part-way writes byte for byte what one
+bake writes. `ftrace -stop` reaches the frame being baked (its record is not written), and the
+bake exits as a stopped render does (0, or `-stop-exit <code>`).
+
+A frame with no record, or one baked for another mesh, handles, targets, settings or keys of its
+own, refuses to load and says so. A render cannot see a change to an earlier frame's scene: bake
+the shot again after one. A dynamic elastic must be its mesh's first deformer, and a frame's
+motion interval may span at most one frame (`-0.5 0.5`, say). loom's `DeformedMesh` /
+`Elastic(dynamic=Dynamics(…))` writes all this, and its shot runner bakes the shot from its first
+frame before it renders any (`-frames` or not).
 
 ### 8.5 `mesh_asset` + `mesh_instance` — instancing (two-level BVH)
 

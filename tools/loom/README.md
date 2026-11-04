@@ -168,7 +168,7 @@ block sampled at the `Motion`'s times around the frame — a rotation unwrapped 
 short way between keys — and the scene gets ftrace's `motion_interval`. Whatever holds still is
 written exactly as without it. A `Camera` whose eye, look-at point, up or fov moves gets keys
 of its own the same way, so its own motion blurs too. The camera's `shutter` then picks the
-span a frame blurs over; ftrace blurs it in modes R, W, D, A, B and C on the CPU (ftrace's
+span a frame blurs over; ftrace blurs it in every mode but V, on the CPU (ftrace's
 `REFERENCE.md`, *Motion blur*). Swept,
 isosurface and strand meshes are written at the frame's instant: their vertices move, and loom
 re-meshes them each frame with no correspondence between keys; a mesh whose vertices should
@@ -194,8 +194,10 @@ the handles: `Falloff`, `Rbf` and `Elastic` (as-rigid-as-possible), stacked in o
 `motion=` a moving handle gets a `to` per motion key, and a shutter blurs the deformation
 exactly. `Elastic(dynamic=Dynamics(...))` gives the surface inertia, so it lags, overshoots and
 settles. That is a simulation, so `render_range` (and so `loom.shot` / `ftrace -shot`) first runs
-`ftrace -bake-elastic` over the frames it emitted, then renders them from the cache it wrote
-beside them. A handle's `at` is in scene coordinates, the mesh's transform applied.
+`ftrace -bake-elastic` from the shot's first frame to the last it renders (a frame continues the
+one before it; records already simulated from exactly their scenes are kept), then renders the
+frames from the cache it wrote beside them. A handle's `at` is in scene coordinates, the mesh's
+transform applied.
 
 ### Shots
 

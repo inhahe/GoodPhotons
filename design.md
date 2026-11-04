@@ -10060,8 +10060,15 @@ sees the instant, exactly as a static scene with those transforms would show it.
   forward photon's absolute index — so the path's own stream draws what it drew without blur.
   In mode D the eye and light subpaths and every connection share the sample's time; in the
   forward modes the photon and its splat do. The analytic specular connections read their
-  sphere and plane at the path's time (`Scene::sphereNow`, `mirrorPlaneNow`; a plane whose
-  faces move differently records `mixed` and is skipped under a time). The sky a forward mode
+  sphere and plane at the path's time (`Scene::sphereNow`, `mirrorPlaneNow`). A plane whose
+  faces move differently, or deform, is `mixed`: under a time its parts serve instead
+  (`Scene::mirrorPlaneParts`) -- its faces of each motion set, and its deforming faces in groups
+  that stay in one plane at every time (a face joins one of the last few groups when its corners
+  lie in the group's first face's plane at four times a stretch between keys, which pins the
+  cubic their distance from it is; a bending sheet is a part a face, under the 64-part cap), each
+  at its reference face's corners at the path's time, boxed by its keys' boxes about it -- and
+  since parts can coincide, each claims a connection only when the eye-side hit is on its own
+  faces (`Scene::mirrorClaims`, `mirrorDeformPart`). The sky a forward mode
   sees directly is a camera-side pass of its own (`addEnvBackground`, at each write). Under a
   blur that pass skips the camera: each forward thread draws its band of the sky into its own
   batch film instead (`addBlurredSkyRows`), K samples a pixel at times of their own (rotated per
@@ -10196,9 +10203,18 @@ coordinates and before the mesh light, the watertight record and the fog bound r
   sheet are well posed and an affine move of the handles is reproduced exactly; `elastic` is
   ARAP (`deform::Arap`: cotangent weights clamped above zero, local closest rotations by a Jacobi
   SVD, global solve by Jacobi-preconditioned CG warm-started from the last round, the handles'
-  vertices held at their targets; every per-vertex pass over fixed blocks of vertices in parallel,
+  vertices held at their targets; every per-vertex pass over fixed blocks of vertices in parallel
+  on the solver's own persistent workers (`ft::BandPool`, as a CG iteration runs four passes),
   each block's share of a sum gathered then summed in block order, so a result is the same on any
-  machine -- which a resumed bake's byte-for-byte match needs).
+  machine -- which a resumed bake's byte-for-byte match needs). The closest rotation is judged
+  degenerate against the one-ring's largest singular value, so a millimetre mesh solves as a metre
+  one does, and a one-ring with no extent keeps the identity.
+- **A deforming triangle at a time** (`Scene::deformedCorners`): corners and normals blended
+  between its keys, a blended normal renormalised, a corner with none authored left zero for
+  `Tri::finalize` to give the face's own. Its patterns read the instant's point by the
+  intersector's own barycentrics (`Hit::deformB1/B2`) in the edge form, nudged off the instant
+  face as a still hit would be, and its normal by the inverse transpose of the map taking the
+  face's edges and normal now to those at the instant.
 - **The dynamic elastic** (`elastic_cache.h`) is ARAP with inertia stepped in seconds (frames /
   fps): each step minimises ARAP plus mass/(stiffness h²)·Σ mᵢ|xᵢ − yᵢ|² about the inertial guess
   y = x + h v (`Arap::solve`'s inertia term), damping the velocity by (1 − damping)^h. It is the
@@ -10207,20 +10223,30 @@ coordinates and before the mesh light, the watertight record and the fog bound r
   elastic the loader reads the frame before's record (or starts at rest, the first targets met
   quasi-statically), runs through any gap between the frames' intervals and then key to key
   (targets blended linearly), and writes this frame's record: the mesh at each key, and the last
-  key's positions, velocities and targets, in float32, keyed by an FNV hash of the rest mesh,
-  triangles, held vertices and settings. The state a frame continues from is always the record
-  as stored, so a resumed bake writes byte for byte what one bake writes. A render reads its
-  record (refusing one keyed for anything else) and takes the keys from it. It must be the
-  stack's first deformer (its rest is the mesh as loaded).
+  key's positions, velocities and targets, in float32 (format `FTEC` 2). Three FNV keys: `key`
+  (rest mesh, triangles, held vertices, settings), `pathKey` (the held vertices' targets at each
+  of the frame's keys) and `chainKey` (the record before's chain key, or 0 from rest, with this
+  frame's key, path, number and key times). A bake keeps a record whose chain key matches, so
+  baking a whole shot again re-simulates from the first frame that changed. The state a frame
+  continues from is always the record as stored, so a resumed bake writes byte for byte what one
+  bake writes. A render reads its record, refuses one whose key, path or times are not its own
+  frame's, and takes the keys from it (it cannot check the chain: that needs the frames before).
+  Under a motion interval the elastic is given keys even when no handle is keyed (about one a
+  substep), since it rings on after its handles stop. It must be the stack's first deformer (its
+  rest is the mesh as loaded). `-bake-elastic` passes a stop on to the frame being baked through
+  its `<pid>.stop` sentinel and exits as a stopped render does.
 - **Limits kept on purpose.** A deforming mesh in a moving group is refused (its keys would have
   to compose two motions per vertex); a glowing one keeps its instant's shape, warned, since a
   light moves only rigidly and `emit_orient` may yet turn its corners; fur and settle refuse to
   follow it (`movingNames_`).
 - **loom** (`tools/loom/loom/deform.py`): `DeformedMesh(file, [Falloff | Rbf | Elastic])` with
   `Handle(at, to=signal, radius)` emits the blocks, a moving handle's `to` sampled at each motion
-  key; `Elastic(dynamic=Dynamics(…))` writes the `dynamic` block with the frame number and a cache
-  beside the frames, and `render_range` runs `-bake-elastic` over the frames it emitted before
-  rendering them (`needs_elastic_bake`).
+  key (and written plain when every key agrees); `Elastic(dynamic=Dynamics(…))` writes the
+  `dynamic` block with the frame number and a cache beside the frames (a relative `cache`
+  resolved from where the shot runs; two elastics sharing one refused), and `render_range` runs
+  `-bake-elastic` over frames 0 to the last it renders, in the repo root as the frames run and
+  polling the shot's stop file as a frame does (`_run_frame`), before rendering any
+  (`needs_elastic_bake`).
 
 ## Shots: `ftrace -shot` and `loom.shot` (0.405.0)
 
@@ -10665,7 +10691,8 @@ in 0.136.1 (2.4–3.5× at 1280×960; every optimization below is **byte-identic
   written by the same raster pass). Stale-data hazard to preserve: `S.parts` buffers past
   the current thread count must be explicitly cleared or a shrink leaks old triangles into
   the concatenation.
-- **`BandPool`**: a persistent worker pool (generation-counted condition-variable
+- **`BandPool`** (`parallel.h`, `ft::BandPool`; the ARAP solver runs on one too): a persistent
+  worker pool (generation-counted condition-variable
   broadcast, `run(body(workerIdx))`, not nestable) replacing ~84 `std::thread` spawns per
   frame (7 passes × N threads). Bit-identity argument: the pool runs the **same partition
   formulas** (`chunk = (n+nT-1)/nT`, row bands) as the spawn path, so band ownership —
@@ -10857,6 +10884,9 @@ have very uneven per-item cost), the caller acting as one of the workers, and a 
 inline path below `2*grain` so a small array spawns nothing. It is for **pure,
 independent, one-shot** passes only; anything needing a reduction either keeps that
 reduction serial (envmap's mean radiance) or must justify the changed summation order.
+`parallelFor(pool, n, grain, fn)` runs the same cursor on a persistent `ft::BandPool` instead,
+for a loop run so often (an iterative solver's every step) that making its threads each time
+would cost more than its work.
 
 That same cursor is the program's **load-time cancellation seam** (0.138.2) — see
 "Stopping a render" below.

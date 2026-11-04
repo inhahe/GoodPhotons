@@ -306,8 +306,11 @@ struct Hit {
     // or -1 for world space. Every intersector writes both (the record is reused).
     int motionSet = -1;
     // The deforming triangle a hit with a time is on (Tri::vkeys), or -1: its patterns read the
-    // point carried back to where it sat at the instant by its barycentrics (patCtxFromHit).
+    // point carried back to where it sat at the instant by its barycentrics (patCtxFromHit),
+    // the intersector's own of v1 and v2 (deformB1, deformB2), so the instant's point is the
+    // exact edge form intersectTri takes a hit by.
     int deformTri = -1;
+    double deformB1 = 0.0, deformB2 = 0.0;
     int patFrame = -1;
     // Barycentric-interpolated per-vertex colour at the hit (linear RGB), when the
     // triangle carried one. Resolved by the intersector, which is the only place that

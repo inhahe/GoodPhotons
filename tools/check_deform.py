@@ -12,7 +12,8 @@ Each case loads a scene with `ftrace -export-tris` (no render) and reads the tri
   * elastic holds each handle's vertices at their targets; a bar clamped at its root, one tip corner
     pulled where a 60-degree arc would put it, bends keeping its length within 3 % and its worst
     edge strain under half that of the falloff making the same move; a bar whose two ends move
-    alike moves rigidly.
+    alike moves rigidly; a 2 mm bar bends as the 2 m one does, scaled (its rotations judged
+    against its own size).
   * Deformers stack in order, each on the last one's output.
   * A keyed handle gives each vertex keys: the instant's shape is the middle key's, the shape at a
     key's time (-export-tris-at) is the still deform to that key's target, and between two keys
@@ -25,8 +26,20 @@ Each case loads a scene with `ftrace -export-tris` (no render) and reads the tri
   * The guide pass carries a deforming surface: its prevposition is where it sat a frame earlier.
   * A blurred render of a mesh an rbf handle slides matches the same mesh slid by a group's keys,
     and differs from the still render.
+  * At a time, a deforming surface's patterns read the instant's point and normal: a pattern
+    stepping at a sheet's plane reads the side it faces, and a pattern of the normal on a sheet an
+    rbf turns 90 degrees reads the instant's, each rendering exactly as the constant it should
+    be. A fin a deformer folds exactly flat at a key renders as one folding a hair short of it
+    (no normal is taken from a collapsed face).
+  * Blurred mode B sees a mirror sheet a deformer lifts and lowers as mode R does.
+  * Handle keys that all agree are no motion.
+  * The dynamic elastic, further: under a motion interval it has keys though its handles have
+    none; a bake of an unchanged shot keeps every record; one after a frame's handle target
+    changes re-simulates from that frame on, and a render of it before then is refused;
+    `ftrace -stop` stops a bake cleanly.
   * Errors: an unknown deformer, keyed handles with different counts, a deforming mesh in a
-    moving group, an elastic handle that holds nothing.
+    moving group, an elastic handle that holds nothing, a falloff handle with no radius, a
+    dynamic elastic's own `iterations`.
 Exits 1 on any failure.
 """
 import argparse
@@ -258,6 +271,15 @@ def main():
                               "handle { at 2 0 0  to 2.2 0.3 0  radius 0.15 } }"))
     e = max_diff(t, rbar + np.array([0.2, 0.3, 0]))
     c.verdict("... both ends moved alike move it rigidly", e < 1e-6, "worst %.2g m" % e)
+    # ARAP is unchanged by a similarity. A 2 mm bar's one-rings are ~1e-9 m^2: an absolute
+    # threshold in the rotation's eigen-solve once left them unrotated (5.7 cm off, of 2 m).
+    full, _ = c.export(mesh(bar, "deform elastic { %s }" % bend))
+    sc = 1e-3
+    tiny = ("handle { at 0 0 0  to 0 0 0  radius %r }  handle { at %r %r %r  to %r %r %r  radius %r }"
+            % tuple(sc * x for x in (0.25, 2, 0.1, 0.1, 1.65, 1.05, 0.1, 0.01)))
+    small, _ = c.export(mesh(bar, "scale %r  deform elastic { %s }" % (sc, tiny)))
+    e = max_diff(small / sc, full) if small is not None and full is not None else 1.0
+    c.verdict("... and a 2 mm bar bends as the 2 m one does, scaled", e < 1e-6, "worst %.2g m (of 2)" % e)
 
     # --- a stack ---
     t, _ = c.export(mesh(grid, "deform rbf { handle { at 0 0 0  to 0.1 0 0 } }  "
@@ -301,15 +323,18 @@ def main():
     slide = 'deform rbf { handle { at 0 0 0  motion { key { to -0.2 0 0 } key { to 0 0 0 } key { to 0.2 0 0 } } } }'
     floor = 'quad { origin -3 -0.5 -3  u 0 0 6  v 6 0 0  material m }'
     light = 'light area { origin -0.5 2.5 -0.5  u 1 0 0  v 0 0 1  normal 0 -1 0  spd preset:bb6500  power 40 }'
-    def render(body, name, spp, extra=(), shutter=True):
-        cam = ('camera "c" { eye 0 3 4  look_at 0 0 0  up 0 1 0  fov_y 40  %sfilm { res 80 60 } }'
-               % ("shutter_open -0.5  shutter_close 0.5  " if shutter else ""))
+    def render(body, name, spp, extra=(), shutter=True, mode="R", eye="0 3 4", look="0 0 0"):
+        """`body` rendered in `mode` (`spp` samples, or photons in mode B) to <out>/<name>; its
+        HDR stem, or None."""
+        cam = ('camera "c" { eye %s  look_at %s  up 0 1 0  fov_y 40  %sfilm { res 80 60 } }'
+               % (eye, look, "shutter_open -0.5  shutter_close 0.5  " if shutter else ""))
         p = os.path.join(out, name + ".ftsl")
         with open(p, "w", encoding="utf-8", newline="") as f:
             f.write(NL.join(["scene { units meters  motion_interval -0.5 0.5 }",
                              'material "m" { type diffuse reflect 0.6 }', floor, light, body, cam]) + NL)
         png = os.path.join(out, name + ".png")
-        r = subprocess.run([c.exe, "-in", p, "-mode", "R", "-device", "cpu", "-spp", str(spp), "-seed", "3",
+        budget = ["-n", str(spp)] if mode == "B" else ["-spp", str(spp)]
+        r = subprocess.run([c.exe, "-in", p, "-mode", mode, "-device", "cpu", *budget, "-seed", "3",
                             "-hdr", "-no-meter", "-o", png] + list(extra),
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode != 0:
@@ -340,6 +365,22 @@ def main():
         off = np.abs(d - st).mean() / st.mean()
         c.verdict("a blurred slide by an rbf handle matches a group's", rel < 0.03 and off > 3 * rel,
                   "mean diff %.3f, from the still render %.3f" % (rel, off))
+    pattern_tests(c, grid, render)
+    mirror_test(c, grid, render)
+
+    # Handle keys that all agree move nothing: mode V under a shutter has no blur to say it drops.
+    same = "deform falloff { handle { at 0 0 0  radius 0.5  motion { %s } } }" % " ".join(["key { to 0 0.3 0 }"] * 3)
+    p = os.path.join(out, "nomotion.ftsl")
+    with open(p, "w", encoding="utf-8", newline="") as f:
+        f.write(NL.join(["scene { units meters  motion_interval -0.5 0.5 }", 'material "m" { type diffuse reflect 0.6 }',
+                         mesh(grid, same), light, 'camera "c" { eye 0 3 4  look_at 0 0 0  up 0 1 0  fov_y 40  '
+                         'shutter_open -0.5  shutter_close 0.5  film { res 32 24 } }']) + NL)
+    r = subprocess.run([c.exe, "-in", p, "-mode", "V", "-device", "cpu", "-spp", "1", "-n", "100000", "-no-meter",
+                        "-o", os.path.join(out, "nomotion.png")], capture_output=True, text=True, encoding="utf-8",
+                       errors="replace")
+    c.verdict("handle keys that all agree are no motion",
+              r.returncode == 0 and "renders the frame's instant" not in r.stdout + r.stderr,
+              "" if r.returncode == 0 else (r.stdout + r.stderr).strip()[-200:])
 
     # --- the dynamic elastic: baked through a shot ---
     dynamic_tests(c, bar, rbar)
@@ -357,12 +398,103 @@ def main():
             ("a handle's target it cannot read",
              mesh(grid, "deform falloff { handle { at 0 0 0  to 0 x 0  radius 0.5 } }"), "three numbers"),
             ("an elastic handle that holds nothing",
-             mesh(bar, "deform elastic { handle { at 5 5 5  to 5 6 5  radius 0.1 } }"), "holds no vertex")):
+             mesh(bar, "deform elastic { handle { at 5 5 5  to 5 6 5  radius 0.1 } }"), "holds no vertex"),
+            ("a falloff handle with no radius",
+             mesh(grid, "deform falloff { handle { at 0 0 0  to 0 0.4 0 } }"), "needs a `radius`"),
+            ("a dynamic elastic's own iterations",
+             mesh(bar, 'deform elastic { iterations 5  dynamic { cache "x_%04d.ftec"  frame 0 }  '
+                       'handle { at 0 0 0  radius 0.25 } }'), "rounds per step")):
         t, log = c.export(body)
         c.verdict("refused: " + name, t is None and want in log, log.strip().splitlines()[-1][:90] if log.strip() else "")
 
     print("PASS" if c.ok else "FAIL")
     return 0 if c.ok else 1
+
+
+def same_render(c, name, a, b, tol):
+    """Verdict: HDR renders `a` and `b` (stems; same seed) agree to `tol` of b's mean."""
+    if a is None or b is None:
+        c.verdict(name, False, "a render failed")
+        return
+    x, y = read_pfm(a + ".pfm"), read_pfm(b + ".pfm")
+    rel = float(np.abs(x - y).mean() / max(float(y.mean()), 1e-12))
+    c.verdict(name, rel < tol, "mean diff %.2g of the reference's" % rel)
+
+
+def pattern_tests(c, grid, render):
+    """At a time a deforming surface's patterns read the instant's point and normal, and a face a
+    deformer folds flat at a key takes no normal from it: each case renders as a reference that
+    must come out the same (the patterns draw no random numbers, so the same seed matches)."""
+    # A sheet in the plane y = 0.3, bent at one corner by a keyed falloff, under a pattern that
+    # steps exactly there: every hit reads the side its face faces (the instant's point nudged off
+    # the instant's face), so it renders as that side's constant. (Read on the surface itself, the
+    # point fell either side of 0.3 from hit to hit: 7.5 % of the image off.)
+    def sheet(mat):
+        return ('mesh "s" { file "%s"  material %s  translate 0 0.3 0  deform falloff { handle { at 0.9 0.3 -0.9  '
+                'radius 0.6  motion { key { to 0.9 0.0 -0.9 } key { to 0.9 0.3 -0.9 } key { to 0.9 0.6 -0.9 } } } } }'
+                % (grid, mat))
+    mats = NL.join(['pattern "step" { expr "0.1 + 0.8 * step(0.0, y - 0.3)" }',
+                    'material "p" { type diffuse  reflect pattern:step }',
+                    'material "q" { type diffuse  reflect 0.9 }'])
+    eye = dict(eye="0 2.2 3.2", look="0 0.2 0")
+    same_render(c, "a pattern stepping at a deforming sheet's plane reads one side at every time",
+                render(mats + NL + sheet("p"), "pat_step", 64, **eye),
+                render(mats + NL + sheet("q"), "pat_step_ref", 64, **eye), 1e-6)
+    # A smooth-shaded plate, its normals tilted 45 degrees, that an rbf turns 90 degrees about x
+    # each way through the shutter: a pattern of ny reads the instant's normal at every time.
+    out = c.out
+    tilted = os.path.join(out, "tilted.obj").replace(chr(92), "/")
+    with open(tilted, "w", encoding="utf-8", newline="") as f:
+        f.write(NL.join(["v -0.5 0 -0.5", "v 0.5 0 -0.5", "v 0.5 0 0.5", "v -0.5 0 0.5",
+                         "vn 0 0.70710678 0.70710678", "f 1//1 3//1 2//1", "f 1//1 4//1 3//1"]) + NL)
+
+    def turned(p, deg):        # about the x axis, then lifted with the plate (translate 0 0.4 0)
+        a = math.radians(deg)
+        return (p[0], p[1] * math.cos(a) - p[2] * math.sin(a) + 0.4, p[1] * math.sin(a) + p[2] * math.cos(a))
+    hs = " ".join("handle { at %r %r %r  motion { %s } }"
+                  % (turned(p, 0) + (" ".join("key { to %r %r %r }" % turned(p, d) for d in (-90, 0, 90)),))
+                  for p in ((-0.5, 0, -0.5), (0.5, 0, -0.5), (0.5, 0, 0.5), (-0.5, 0, 0.5)))
+
+    def plate(mat):
+        return 'mesh "t" { file "%s"  material %s  translate 0 0.4 0  deform rbf { %s } }' % (tilted, mat, hs)
+    mats = NL.join(['pattern "tilt" { expr "0.1 + 0.8 * step(0.9, ny)" }',
+                    'material "p" { type diffuse  reflect pattern:tilt }',
+                    'material "q" { type diffuse  reflect 0.1 }'])
+    same_render(c, "a pattern of the normal on a turning sheet reads the instant's at every time",
+                render(mats + NL + plate("p"), "pat_turn", 64, **eye),
+                render(mats + NL + plate("q"), "pat_turn_ref", 64, **eye), 1e-6)
+    # A fin a keyed falloff folds exactly flat at its first key (every coordinate a binary
+    # fraction, so its corners are exactly collinear there): it renders as one folding a hair
+    # short of flat. (A face normal stored for that key was NaN, and the hits between the first
+    # two keys shaded black: 0.0021 of the image off, against 8e-5.)
+    fin_obj = os.path.join(out, "fin.obj").replace(chr(92), "/")
+    with open(fin_obj, "w", encoding="utf-8", newline="") as f:
+        f.write(NL.join(["v -1 0 -0.25", "v 0 0.5 -0.5", "v 1 0 -0.25", "f 1 2 3"]) + NL)
+
+    def fin(first):
+        return ('mesh "s" { file "%s"  material m  deform falloff { handle { at 0 0.5 -0.5  radius 0.5  '
+                'motion { key { to %s } key { to 0 0.5 -0.5 } key { to 0 1 -0.75 } } } } }' % (fin_obj, first))
+    same_render(c, "a fin a deformer folds flat at a key renders as one folding a hair short",
+                render(fin("0 0 -0.25"), "fin", 64, **eye), render(fin("0 0.001 -0.251"), "fin_ref", 64, **eye), 5e-4)
+
+
+def mirror_test(c, grid, render):
+    """A mirror sheet an rbf lifts and lowers through the shutter, under a lit sphere: blurred mode
+    B, whose mirror connection must follow the sheet at each photon's time, agrees with blurred
+    mode R over the sphere's reflection. (Taken as the still sheet, the connection found no mirror
+    there: 0.16 of mode R.)"""
+    body = NL.join(['material "mir" { type mirror }', 'sphere { center 0 0.8 -0.4  radius 0.3  material m }',
+                    'mesh "mirror" { file "%s"  material mir  deform rbf { handle { at 0 0 0  motion { '
+                    'key { to 0 -0.25 0 } key { to 0 0 0 } key { to 0 0.25 0 } } } } }' % grid])
+    eye = dict(eye="0 2.2 3.2", look="0 0.2 0")
+    sr, sb = render(body, "mirror_R", 512, **eye), render(body, "mirror_B", 40000000, mode="B", **eye)
+    if sr is None or sb is None:
+        c.verdict("blurred mode B sees a moving mirror as mode R does", False, "a render failed")
+        return
+    lr, lb = read_pfm(sr + ".pfm").mean(axis=-1), read_pfm(sb + ".pfm").mean(axis=-1)
+    ratio = float(lb[30:50, 20:60].sum() / lr[30:50, 20:60].sum())   # the reflection, in the sheet
+    c.verdict("blurred mode B sees a moving mirror as mode R does", abs(ratio - 1) < 0.1,
+              "the reflection %.3f of mode R's" % ratio)
 
 
 DYN_FRAMES = 40
@@ -384,13 +516,14 @@ def dynamic_tests(c, bar, rbar):
         os.remove(os.path.join(shot, f))
     cache = os.path.join(shot, "bar_%04d.ftec").replace(chr(92), "/")
 
-    def frame_scene(k, stiff=DYN_STIFF, name="f%04d"):
+    def frame_scene(k, stiff=DYN_STIFF, name="f%04d", up=None, cache=cache, interval=False):
         body = ('mesh "bar" { file "%s"  material m  deform elastic { dynamic { cache "%s"  frame %d  '
                 'mass 1  stiffness %r  damping 0.9 }  handle { at 0 0 0  to 0 %r 0  radius 0.25 } } }'
-                % (bar, cache, k, stiff, lift(k)))
+                % (bar, cache, k, stiff, lift(k) if up is None else up))
         p = os.path.join(shot, (name % k) + ".ftsl")
+        head = "scene { units meters%s }" % ("  motion_interval -0.5 0.5" if interval else "")
         with open(p, "w", encoding="utf-8", newline="") as f:
-            f.write(NL.join(["scene { units meters }", 'material "m" { type diffuse reflect 0.6 }', body, LIGHT,
+            f.write(NL.join([head, 'material "m" { type diffuse reflect 0.6 }', body, LIGHT,
                              'camera "c" { eye 1 1 5  look_at 1 0 0  up 0 1 0  fov_y 40  film { res 40 30 } }']) + NL)
         return p
 
@@ -398,6 +531,10 @@ def dynamic_tests(c, bar, rbar):
         r = subprocess.run([c.exe, "-bake-elastic", os.path.join(shot, name + ".ftsl"), str(first), str(last)],
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         return r.returncode, r.stdout + r.stderr
+
+    def records():
+        return {f: open(os.path.join(shot, f), "rb").read() for f in os.listdir(shot)
+                if f.startswith("bar_") and f.endswith(".ftec")}
 
     def tip(k):
         """The far end's height at frame k, read back by -export-tris."""
@@ -445,6 +582,65 @@ def dynamic_tests(c, bar, rbar):
               (r.stdout + r.stderr).strip()[-120:])
     rc, log = bake(21, 21, name="g%04d")
     c.verdict("... and a bake will not continue one", rc != 0 and "another" in log, log.strip()[-120:])
+
+    # A bake of the shot unchanged keeps every record, simulating nothing.
+    before = records()
+    rc, log = bake(0, DYN_FRAMES - 1)
+    kept = log.count("is up to date")
+    c.verdict("... a bake of an unchanged shot keeps every record", rc == 0 and kept == DYN_FRAMES
+              and records() == before, "%d of %d frames up to date" % (kept, DYN_FRAMES))
+    # Frame 20's handle target changed: a render of it is refused until the shot is baked again,
+    # and the bake re-simulates from frame 20 on, keeping the frames before it.
+    frame_scene(20, up=lift(20) + 0.05)
+    _, log = tip(20)
+    c.verdict("... a frame whose handle target changed is refused", "other handle targets" in log,
+              log.strip().splitlines()[-1][:90] if log.strip() else "")
+    rc, log = bake(0, DYN_FRAMES - 1)
+    kept, baked = log.count("is up to date"), log.count("[elastic] baked frame ")
+    after = records()
+    same_before = all(after[f] == before[f] for f in before if int(f[4:8]) < 20)
+    c.verdict("... and a bake after it re-simulates from that frame on", rc == 0 and kept == 20
+              and baked == DYN_FRAMES - 20 and same_before and tip(20)[0] is not None,
+              "%d kept, %d baked" % (kept, baked))
+    frame_scene(20)
+
+    # Under a motion interval the elastic has keys of its own, though its handles have none: the
+    # bar, still ringing at frame 6, is somewhere else at each end of the frame.
+    mcache = os.path.join(shot, "mbar_%04d.ftec").replace(chr(92), "/")
+    for k in range(8):
+        frame_scene(k, name="m%04d", cache=mcache, interval=True)
+    rc, log = bake(0, 7, name="m%04d")
+    ends = []
+    for at in (-0.5, 0.5):
+        o = os.path.join(shot, "m_at.obj")
+        r = subprocess.run([c.exe, "-in", os.path.join(shot, "m0006.ftsl"), "-export-tris", o, "-export-tris-at",
+                            repr(at)], capture_output=True, text=True, encoding="utf-8", errors="replace")
+        ends.append(read_obj_tris(o)[:-LIGHT_TRIS] if r.returncode == 0 else None)
+    moved = max_diff(ends[0], ends[1]) if ends[0] is not None and ends[1] is not None else 0.0
+    c.verdict("... under a motion interval it has keys though its handles have none", rc == 0 and moved > 1e-3,
+              "moves %.3g m across frame 6" % moved if rc == 0 else log.strip()[-200:])
+
+    # `ftrace -stop` reaches the frame being baked; the bake then exits with -stop-exit's code.
+    for f in os.listdir(shot):
+        if f.startswith("bar_") and f.endswith(".ftec"):
+            os.remove(os.path.join(shot, f))
+    for k in range(DYN_FRAMES, 4 * DYN_FRAMES):
+        frame_scene(k)
+    pr = subprocess.Popen([c.exe, "-bake-elastic", os.path.join(shot, "f%04d.ftsl"), "0", str(4 * DYN_FRAMES - 1),
+                           "-stop-exit", "75"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                          encoding="utf-8", errors="replace")
+    seen = []
+    for line in pr.stdout:
+        seen.append(line)
+        if "baked frame 2 " in line:
+            subprocess.run([c.exe, "-stop", str(pr.pid)], capture_output=True)
+            break
+    seen.append(pr.stdout.read())
+    rc = pr.wait()
+    text = "".join(seen)
+    left = len([f for f in os.listdir(shot) if f.startswith("bar_") and f.endswith(".ftec")])
+    c.verdict("... and `ftrace -stop` stops a bake cleanly", rc == 75 and "stopped" in text and left < 4 * DYN_FRAMES,
+              "exit %d, %d of %d frames baked" % (rc, left, 4 * DYN_FRAMES))
 
 
 if __name__ == "__main__":
