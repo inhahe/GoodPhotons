@@ -70,13 +70,15 @@ cube whose keys scale and shear it together. It requires:
     whose strands move -- and keeps one seen only at the instant.
   * A spot on its group's pivot, turning 30 degrees across the shutter, lights the middle of its
     sweep along a wall as brightly as the rest, and off the pivot needs no more keys than the
-    budget. Keys whose only mover is a light they would scale are no motion at all. Haze under a
+    budget. Keys whose only mover is a light they would stretch unevenly are no motion at all.
+    Lights scale with their group (a uniform scale for every kind, an uneven stretch and shear for
+    a flat panel and an emissive mesh), their radiance kept and their area grown. Haze under a
     sweep far wider than the scene lights the floor as it does without the shutter (modes R, D
     and B; on the GPU modes R and B, under the sun and the sky, and D). The blurred sky mode B sees in a batch with under one sample a pixel is all there.
   * The loader refuses, with a message naming why: a `motion` block with no `motion_interval`; one
     with a single key; `translate` beside `motion`; fur on, or a medium bounded by, a moving
     object; an interval that excludes the instant; `shutter_close` before `shutter_open`. It keeps
-    a sun in a moving group, and a light its keys scale, at the instant, saying so -- and a render
+    a sun in a moving group, and a sphere light its keys stretch unevenly, at the instant, saying so -- and a render
     held sharp late in the shutter shows the sun's shadows where the instant has them while its
     sibling balls (one an isosurface) have moved -- and builds
     a sphere its keys stretch as a mesh, as it does one an uneven static scale stretches.
@@ -327,25 +329,71 @@ def lights_scene(obj, u=None, shutter=None):
     ]) + NL
 
 
-# A group that slides 1.6 m and turns, holding an aimed panel and a spot, the scene's only lights:
-# where either is at a time is most of what the floor and the wall show.
+# A group that slides 1.6 m and turns, holding an aimed panel, a spot and a ball, the scene's only
+# lights: where each is at a time is most of what the floor and the wall show.
 LONE = [dict(translate=(-0.8, 1.6, 0.0), rotate=(0, -25, 0)),
         dict(translate=(0.8, 1.4, 0.3), rotate=(0, 35, 8))]
 
 
 def lone_lights_scene(u=None, shutter=None):
-    """An aimed panel and a spot alone in the LONE group, moving, or held at u."""
+    """An aimed panel, a spot and a ball alone in the LONE group, moving, or held at u."""
     cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
     body = ("light area { origin -0.15 0 -0.15  u 0.3 0 0  v 0 0 0.3  normal 0.7 -1 0.2  "
             "spd preset:bb5600  power 25 }  "
             "light spot { origin 0.3 0 0  dir 0.3 -1 -0.4  inner_angle 15  outer_angle 25  "
-            "spd preset:bb6500  power 15 }")
+            "spd preset:bb6500  power 15 }  "
+            # A ball turning with its group: its samples must lie on its moved surface, or its own
+            # surface shadows its light
+            "light sphere { center -0.35 0 0.2  radius 0.06  spd preset:bb5000  power 12 }")
     return NL.join([
         "scene { units meters  motion_interval -0.5 0.5 }",
         'material "white" { type diffuse reflect 0.7 }',
         "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }",
         "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material white }",
         "group { %s  %s }" % (xf(LONE, u, 1.0), body),
+        'camera "c" { eye 0 1.0 4.2  look_at 0 0.7 0  up 0 1 0  fov_y 45  %sfilm { res %d %d } }'
+        % (cam, W, H),
+    ]) + NL
+
+
+# Groups whose keys scale their lights: a similarity growing 0.6 to 1.5 times as it slides and
+# turns, and an uneven stretch with a shear.
+GROW = [dict(translate=(-0.4, 1.5, 0.0), rotate=(0, -20, 0), scale=(0.6, 0.6, 0.6)),
+        dict(translate=(0.4, 1.6, 0.2), rotate=(0, 30, 10), scale=(1.5, 1.5, 1.5))]
+WARP = [dict(translate=(-0.4, 1.5, 0.0)),
+        dict(translate=(0.4, 1.5, 0.2), rotate=(0, 25, 0), scale=(1.6, 0.7, 1.2), shear=(0.3, 0, 0))]
+
+
+def scaled_lights_scene(obj, kind, u=None, shutter=None):
+    """Lights in a group its keys scale, moving, or held at u: `kind` "grow" (GROW, a similarity) holds
+    every kind of light -- a panel, a ball, a tube, a spot, an aimed panel and an emissive triangle;
+    "warp" (WARP, any affine) a panel and an emissive triangle, the kinds it can carry. Each light
+    is given its radiance (no `power`, which would hold its flux at the instant's), so held still
+    at a time it is the same light as the moving one there."""
+    cam = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
+    panel = "light area { origin -0.15 0 -0.15  u 0.3 0 0  v 0 0 0.3  normal 0 -1 0  spd preset:bb6500 }"
+    tri = ('mesh "glow_tri" { file "%s"  material glow  translate 0.1 -0.3 0.35  rotate 90 0 0  scale 1.5 }'
+           % obj)
+    if kind == "grow":
+        body = "  ".join([
+            panel,
+            "light sphere { center 0.45 -0.1 0  radius 0.06  spd preset:bb5000 }",
+            "light spot { origin -0.45 0 0  dir 0.4 -1 0.2  inner_angle 15  outer_angle 30  "
+            "spd preset:bb6500  power 12 }",
+            "light cylinder { center 0 -0.2 -0.3  axis 1 0 0  length 0.4  radius 0.02  spd preset:bb4000 }",
+            "light area { origin 0.25 0.1 0.25  u 0.2 0 0  v 0 0 0.2  normal 0.6 -1 0.3  spd preset:bb5600 }",
+            tri])
+        keys = GROW
+    else:
+        body = "  ".join([panel, tri])
+        keys = WARP
+    return NL.join([
+        "scene { units meters  motion_interval -0.5 0.5 }",
+        'material "white" { type diffuse reflect 0.7 }',
+        'material "glow"  { type diffuse reflect 0.0  emit blackbody 5200 }',
+        "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }",
+        "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material white }",
+        "group { %s  %s }" % (xf(keys, u, 1.0), body),
         'camera "c" { eye 0 1.0 4.2  look_at 0 0.7 0  up 0 1 0  fov_y 45  %sfilm { res %d %d } }'
         % (cam, W, H),
     ]) + NL
@@ -457,9 +505,9 @@ STILL = [
      "group { motion { key { translate 0 0 0 } key { translate 1 0 0 } }  light sun { dir 0.3 1 0.2  "
      "angle 1  spd preset:d65 } }",
      "a sun or sky light in a moving group stays where it is"),
-    ("a light its keys scale",
-     "group { motion { key { scale 1 } key { scale 1.5 } }  light sphere { center 0 1 0  radius 0.05  "
-     "spd preset:bb6500  power 5 } }", "whose keys scale or shear it stays where it is"),
+    ("a sphere light its keys stretch unevenly",
+     "group { motion { key { scale 1 } key { scale 1.5 1 1 } }  light sphere { center 0 1 0  radius 0.05  "
+     "spd preset:bb6500  power 5 } }", "whose keys stretch it unevenly stays where it is"),
 ]
 LIGHT = ("light area { origin -0.4 2.9 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  spd preset:bb6500"
          "  power 60 }")
@@ -593,11 +641,18 @@ def main():
     if not a.no_gpu:
         lone_modes += [("R", "gpu", ["-spp", "512"]), ("B", "gpu", ["-n", "40000000"]),
                        ("U", "gpu", ["-spp", "256"]), ("S", "gpu", ["-spp", "128", "-n", "200000"]),
-                       # M at 8 M photons: at 2 M a near-black corner block of a map that sparse
-                       # reads 5 sigma off from map to map
-                       ("J", "gpu", ["-spp", "128", "-jsurf"]), ("M", "gpu", ["-spp", "128", "-n", "8000000"])]
-    held = [(t, "lights", lambda u=None, shutter=None: lights_scene(objf, u, shutter), light_modes)
-            for t in (-0.3, 0.35)] + [(0.35, "two lights alone", lone_lights_scene, lone_modes)]
+                       # J with the 64 epochs a blur gives it, sharp or still: its surface radius
+                       # shrinks with the epochs, so fewer would be another bias in its dark blocks.
+                       # M at 8 M photons: at 2 M a dark block reads 5 sigma off from map to map.
+                       ("J", "gpu", ["-spp", "256", "-jsurf", "-beamepochs", "64"]),
+                       ("M", "gpu", ["-spp", "128", "-n", "8000000"])]
+    held = ([(t, "lights", lambda u=None, shutter=None: lights_scene(objf, u, shutter), light_modes)
+             for t in (-0.3, 0.35)] + [(0.35, "three lights alone", lone_lights_scene, lone_modes)] +
+            # lights their keys scale, their radiance kept and their area grown
+            [(t, "lights their keys grow", lambda u=None, shutter=None: scaled_lights_scene(objf, "grow", u, shutter),
+              lone_modes) for t in (-0.35, 0.4)] +
+            [(0.4, "flat lights their keys stretch", lambda u=None, shutter=None: scaled_lights_scene(objf, "warp", u, shutter),
+              lone_modes)])
     for t, what, make, modes in held:
         sharp, ref = os.path.join(out, "lights_sharp.ftsl"), os.path.join(out, "lights_ref.ftsl")
         write(sharp, make(shutter=(t, t)))
@@ -1213,7 +1268,7 @@ def light_and_haze_tests(exe, out, verdict, hair, gpu):
     verdict("... and off its pivot needs no more keys than it has", rc == 0 and "keys to follow" not in log,
             "" if rc == 0 and "keys to follow" not in log else log.strip()[-300:])
 
-    # Keys that move nothing (the only mover a light they would scale): no motion in the scene,
+    # Keys that move nothing (the only mover a light they would stretch unevenly): no motion in the scene,
     # so mode V under a shutter has no blur to say it drops.
     p = os.path.join(out, "nomotion.ftsl")
     write(p, NL.join(["scene { units meters  motion_interval -0.5 0.5 }", 'material "w" { type diffuse reflect 0.5 }',

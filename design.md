@@ -10174,13 +10174,31 @@ sees the instant, exactly as a static scene with those transforms would show it.
   that is not the run's lone mode-M camera with a map of its own (`mBlurApart` in the camera
   routing: shared with other mode-M cameras, `-savemap` / `-loadmap`, or `-preview`'s CPU
   driver). `-radcache` is off under a blur. What cannot move yet stays put and
-  says so (`stillWarning`): a sun or sky, and any light whose keys would scale or shear it,
-  stay at the instant with their surfaces, so nothing mixes a moved surface
+  says so (`stillWarning`): a sun or sky, and a sphere, tube, spot, beam or aimed light whose
+  keys stretch it unevenly, stay at the instant with their surfaces, so nothing mixes a moved surface
   with an unmoved sampler. A coat whose strands move is traced as strands when some camera
   may see it at another time (`anyCameraTimed`: any camera with an open shutter, in whatever
   mode -- a lens, a routing or -on-unsupported may yet change that), since
   `-fur-volume`'s and `-dual-grid`'s fields hold it at the instant only; seen only at the
   instant, it keeps them.
+- **Lights that scale** (0.426.0; `MotionKeys::shape`). `moveChildren` classes a set's keys as
+  rigid, similarities (MᵀM = s²I each) or any affine, and moves a child's lights if each can
+  under them: every light under similarities, only a flat panel (not aimed, not a beam) or an
+  emissive mesh under any affine. A light keeps its radiance and its samplers still run at the
+  instant; what they measure is carried: an area by `Scene::lightAreaScale` (|det D| / |Dᵀ n|
+  about the carried normal n, s² under a similarity) -- in every area density (backward NEE, the
+  emission-on-hit density, BDPT's light origin, its s = 1 connection, VCM's light subpath and
+  connection and its emission MIS) and every photon's power (render.h's `spotW`) -- and a flat
+  light's normal by the inverse transpose (`lightNormalNow`) under an uneven stretch. A ball's
+  sample is put on its moved surface (`lightSpherePointNow`: the carried normal from the moved
+  centre at the moved radius, as `movedSphere` builds it), its cone density standing under a
+  similarity: carried itself, a point leaves that sphere between keys, where a blend of two
+  turns shrinks what it turns, and a photon born there or a shadow ray aimed there met the
+  ball's own surface (known-issues MOTION-BALL-SELF).
+  Selection keeps the instant's powers, which both sides of every MIS weight share. Each is 1, or
+  the rigid carry, for a light whose keys do not scale it, so such scenes render as before.
+  Device twins: `DMotionSet::shape`, `dLightAreaScale`, `dLightCarryNormal`; the device NEE folds
+  the area into `BkNeeGeom::G`, which every caller weighs by `em.area`.
 - **Lights move rigidly** (0.410.0; `Emitter::motion`). Rigid motion keeps every length, area and
   angle of a light, so each sampler runs where the light sits at the instant and only its inputs
   and outputs are carried: `emitterSamplePoint` carries its point and normal out

@@ -196,7 +196,32 @@ Proper fix: carry the optics in `CameraPose` (the focal length, aperture radius 
 distance, or the f-number and focus to re-derive them from) and have `Camera::poseAt` set them;
 `keyPathFrames` would then blend them from the frames' own.
 
-## OPEN (2026-11-03, 0.410.0): MOTION-LIGHT-RIGID — a light that its keys would scale or shear, and a sun or sky in a moving group stay at the instant
+## FIXED (2026-11-04, 0.426.0; since 0.410.0): MOTION-BALL-SELF — a ball light turning with its group shadowed its own light
+
+A sphere light in a group whose keys turn it lit its room at 0.4 of its still self (held sharp
+at a time against the static group there, mode B; mode R 0.7), on the CPU (the device's larger
+ray offsets hid it). Its sample was
+carried by the motion's transform, which between two keys is a blend of two turns and shrinks
+what it turns, so the carried points formed a faintly squashed ellipsoid; its geometry, an
+analytic sphere, was moved to a sphere of the blend's mean scale (`movedSphere`). Near the
+equator the light's samples lay microns inside its own surface, past the 1e-6 offset a photon
+starts at or a shadow ray stops short by: photons died on the ball (45 % of them absorbed where
+12 % should be) and shadow rays to those samples were blocked. Flat lights, tubes and meshes
+were not hit: their geometry is triangles the same transform carries. check_motion's six-light
+group hid it (the ball was one light of six); a ball alone under that group's keys showed it.
+Fixed by putting a moving ball's sample on its moved surface, `Scene::lightSpherePointNow` (the
+carried normal from the moved centre, at the moved radius), and the device's alike
+(`dLightSphereOut`); the lone-lights test now holds a turning ball.
+
+## OPEN (2026-11-03, 0.410.0): MOTION-LIGHT-RIGID — a sphere, tube, spot, beam or aimed light its keys stretch unevenly, and a sun or sky in a moving group, stay at the instant
+
+**Lights that scale move since 0.426.0** (`MotionKeys::shape`, `Scene::lightAreaScale`): every
+light under keys that scale it uniformly, and a flat panel or an emissive mesh under any affine
+(an uneven stretch, a shear), each keeping its radiance with its area carried in every density
+and photon power. What stays: a sphere, tube, spot, beam or aimed panel under an uneven stretch
+(its shape stops being one its sampler knows: an ellipsoid, an elliptic tube, a skewed cone).
+Proper fix: build a stretched sphere or tube light as an emissive mesh, as a stretched sphere
+already loads as a mesh, and give a spot's cone and an aim a frame the stretch carries.
 
 **An aimed area light moves since 0.425.0** (`Scene::aimCosNow` and kin; the third kind below,
 kept for the record). That change also found mode U leaving moving lights at the instant: the

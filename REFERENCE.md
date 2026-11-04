@@ -2142,8 +2142,11 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
 - **What can move so far:** spheres (as a mesh where the keys stretch one), quads, triangles,
   meshes, and since 0.409.0 isosurfaces, curves and `mesh_instance`s. Since 0.410.0 lights move
   too — area panels, spheres, tubes, spots, collimated beams and emissive meshes, and since
-  0.425.0 aimed area panels, whose lean turns with them — but only rigidly: a light its keys
-  would scale or shear stays at the instant, as does a sun or sky, each with a warning. A procedural pattern on a moving
+  0.425.0 aimed area panels, whose lean turns with them. Since 0.426.0 a light also scales with
+  its group: any light under a uniform scale, and a flat panel or an emissive mesh under an
+  uneven stretch or a shear. It keeps its radiance, so a light that grows emits more (a `power`
+  is its flux at the frame's instant). A sphere, tube, spot, beam or aimed panel its keys stretch
+  unevenly stays at the instant, as does a sun or sky, each with a warning. A procedural pattern on a moving
   surface travels with it (it is read where the point sits at the frame's instant), and a
   sphere's UV turns with its keys; `pattern_space object` on a group keeps its patterns on it
   from frame to frame too (FTSL §13).

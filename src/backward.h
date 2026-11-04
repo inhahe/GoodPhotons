@@ -623,9 +623,18 @@ struct BackwardRenderer {
                           em.sampleCylinderVisible(pL, u1, u2, y, nLight, pdfAreaCyl);
         if (cylVisible) effArea = 1.0 / pdfAreaCyl;
         if ((coneSampled || cylVisible) && scene.lightMoves(em)) {
-            y = scene.lightPointNow(em, y);
-            nLight = scene.lightDirNow(em, nLight);
-            if (coneSampled) wi = scene.lightDirNow(em, wi);   // the tube's comes from y below
+            if (coneSampled) {
+                // The sample on the ball's moved surface (lightSpherePointNow), and the connection
+                // to it. Its cone density stands: a rigid motion or a similarity keeps every angle.
+                scene.lightSpherePointNow(em, y, nLight);
+                const Vec3 toL = y - h.p;
+                dist = length(toL);
+                wi = toL / dist;
+            } else {   // the tube's direction comes from y below; its visible arc grows with it
+                y = scene.lightPointNow(em, y);
+                nLight = scene.lightDirNow(em, nLight);
+                effArea *= scene.lightAreaScale(em, nLight);
+            }
         }
         if (coneSampled) {
             double cosSurf, stG;
@@ -643,7 +652,10 @@ struct BackwardRenderer {
         // matches the emitSlot() factor the emission-on-hit side applies at the same
         // surface point — which is what keeps the MIS pair consistent.
         double epat = 1.0;
-        if (!cylVisible) epat = emitterSamplePoint(scene, em, u1, u2, y, nLight);
+        if (!cylVisible) {
+            epat = emitterSamplePoint(scene, em, u1, u2, y, nLight);
+            effArea *= scene.lightAreaScale(em, nLight);   // its area at the path's time (1 unscaled)
+        }
         Vec3 toL = y - h.p;
         double dist2 = dot(toL, toL);
         dist = std::sqrt(dist2);
@@ -1050,9 +1062,11 @@ struct BackwardRenderer {
                 // error: the NEE side connects either way, so a wrong (or zero) density here
                 // hands the hit full weight and DOUBLE COUNTS the light.
                 if (em.caps) break;
-                const double va = em.cylinderVisibleArea(scene.lightPointThen(em, from));
-                if (!(va > 0.0)) return 0.0;
                 if (!hitP || !hitN) return 0.0;
+                // the visible arc at the instant, grown as a light its keys scale (1 unscaled)
+                const double va = em.cylinderVisibleArea(scene.lightPointThen(em, from)) *
+                                  scene.lightAreaScale(em, *hitN);
+                if (!(va > 0.0)) return 0.0;
                 const Vec3 d = *hitP - from;
                 const double dist2 = dot(d, d);
                 const double cosLight = dot(*hitN, -wi);
@@ -1074,7 +1088,7 @@ struct BackwardRenderer {
         const double dist2 = dot(d, d);
         const double cosLight = dot(*hitN, -wi);
         if (!(dist2 > 0.0) || !(cosLight > 0.0)) return 0.0;
-        return dist2 / (em.area * cosLight);
+        return dist2 / (em.area * scene.lightAreaScale(em, *hitN) * cosLight);   // its area now
     }
 
     // Index of the emitter that owns an emissive surface material, or -1. Scene::emitterForMat
@@ -1611,9 +1625,16 @@ struct BackwardRenderer {
                                     em.sampleCylinderVisible(pL, u1, u2, y, nLight, pdfAreaCyl);
             if (cylVisible) effArea = 1.0 / pdfAreaCyl;
             if ((coneSampled || cylVisible) && scene.lightMoves(em)) {
-                y = scene.lightPointNow(em, y);
-                nLight = scene.lightDirNow(em, nLight);
-                if (coneSampled) wi = scene.lightDirNow(em, wi);   // the tube's comes from y below
+                if (coneSampled) {   // on the ball's moved surface, as emitterGeom's
+                    scene.lightSpherePointNow(em, y, nLight);
+                    const Vec3 toL = y - p;
+                    dist = length(toL);
+                    wi = toL / dist;
+                } else {
+                    y = scene.lightPointNow(em, y);
+                    nLight = scene.lightDirNow(em, nLight);
+                    effArea *= scene.lightAreaScale(em, nLight);
+                }
             }
             if (coneSampled) {
                 geom = 1.0 / pdfW;                         // solid-angle measure
@@ -1621,7 +1642,10 @@ struct BackwardRenderer {
                 // quad / mesh / interior-sphere / cylinder fallback; also the sampled point's
                 // emission-pattern factor (1 when unpatterned)
                 double epat = 1.0;
-                if (!cylVisible) epat = emitterSamplePoint(scene, em, u1, u2, y, nLight);
+                if (!cylVisible) {
+                    epat = emitterSamplePoint(scene, em, u1, u2, y, nLight);
+                    effArea *= scene.lightAreaScale(em, nLight);   // its area at the path's time
+                }
                 const Vec3 toL = y - p;
                 const double dist2 = dot(toL, toL);
                 dist = std::sqrt(dist2);

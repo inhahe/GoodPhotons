@@ -699,7 +699,7 @@ struct DNode   { DVec3 lo, hi; int left, right, first, count; };
 // ---- Motion blur (ROADMAP 11): the device twin of Scene's motion data ----
 // An affine (Affine's twin: world = m*p + t, row-major) and a motion set's keys.
 struct DAff { double m[9], t[3]; };
-struct DMotionSet { int keys, first; };   // Scene::MotionKeys: `keys` affines from motionXf[first]
+struct DMotionSet { int keys, first, shape; };   // Scene::MotionKeys: `keys` affines from motionXf[first]
 struct DMirrorPlane;
 // Everything a timed query reads. `sets` null: the scene holds still, and nothing here is read.
 // The per-kind motion arrays name each primitive's set (-1: still); `triVkeys` a deforming
@@ -4857,6 +4857,51 @@ __device__ static inline double dAimDirPdfNow(const DScene& sc, const DEmitter& 
 }
 __device__ static inline DVec3 dSampleAimDirNow(const DScene& sc, const DEmitter& em, DRng& rng, double& pdfW) {
     return dLightDirNow(sc, em, dSampleAimDir(em, rng, pdfW));
+}
+// A light its keys scale (host twins Scene::lightScales, lightNormalNow, lightAreaScale): its
+// motion set's keys a similarity, or for a flat light any affine (DMotionSet::shape).
+__device__ static inline bool dLightScales(const DScene& sc, const DEmitter& em) {
+    return em.motion >= 0 && dTimed(sc) && sc.mo.sets[em.motion].shape != kMotionRigid;
+}
+// An area sample's point and unit normal carried to the path's time: as dLightCarry, but the normal
+// by the inverse transpose where the keys stretch unevenly (a flat light's only).
+__device__ __noinline__ static DPointDir2 dLightCarryNormalOut(const DScene& sc, int set, DVec3 p, DVec3 n) {
+    DAff D, Di;
+    dMotionAt(sc.mo, set, (double)dMotionU(), D);
+    dAffInverse(D, Di);
+    return DPointDir2{affPoint(D.m, D.t, p), normalize(dAffDirT(Di, n)), n};
+}
+// A sphere light's sample on the sphere its geometry is at the path's time (host twin
+// Scene::lightSpherePointNow; dMovedSphere): its unit normal `n` carried, the point of the moved
+// sphere along it -- the point carried itself would leave that sphere between keys.
+__device__ __noinline__ static DPointDir2 dLightSphereOut(const DScene& sc, int set, DVec3 c, double r, DVec3 n) {
+    DAff D;
+    dMotionAt(sc.mo, set, (double)dMotionU(), D);
+    const DVec3 nn = normalize(affDir(D.m, n));
+    return DPointDir2{affPoint(D.m, D.t, c) + nn * (Real)(r * dAffScale(D)), nn, nn};
+}
+__device__ static inline void dLightCarryNormal(const DScene& sc, const DEmitter& em, DVec3& p, DVec3& n) {
+    if (!(em.motion >= 0 && dTimed(sc))) return;
+    if (em.shape == 1) {   // a ball: on its moved surface
+        const DPointDir2 r = dLightSphereOut(sc, em.motion, em.origin, em.radius, n);
+        p = r.p; n = r.d1;
+    } else if (sc.mo.sets[em.motion].shape == kMotionAffine) {
+        const DPointDir2 r = dLightCarryNormalOut(sc, em.motion, p, n);
+        p = r.p; n = r.d1;
+    } else {
+        dLightCarry(sc, em, p, n);
+    }
+}
+// How much the light's area grows at the path's time about a point whose unit normal there is
+// `nNow`: |det D| / |D^T nNow| (s^2 under a similarity); 1 for a light its keys do not scale.
+__device__ __noinline__ static double dLightAreaScaleOut(const DScene& sc, int set, DVec3 nNow) {
+    DAff D;
+    dMotionAt(sc.mo, set, (double)dMotionU(), D);
+    const double l = (double)length(dAffDirT(D, nNow));
+    return l > 0.0 ? fabs(dAffDet(D)) / l : 1.0;
+}
+__device__ static inline double dLightAreaScale(const DScene& sc, const DEmitter& em, const DVec3& nNow) {
+    return dLightScales(sc, em) ? dLightAreaScaleOut(sc, em.motion, nNow) : 1.0;
 }
 // Tri::finalize's twin: the face normal, reach, tangent frame and curvature of a triangle
 // rebuilt at a time (its corner normals falling back to the face's where zero).
@@ -11438,13 +11483,16 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, origin, emitN);
         if (em.collimated) { dir = em.beamDir; dLightCarry2(sc, em, origin, emitN, dir); }
         else {
-            dLightCarry(sc, em, origin, emitN);
+            dLightCarryNormal(sc, em, origin, emitN);
             if (em.normalTilted) {                 // an aimed quad: intensity-proportional
                 double pdfAim = 0.0;
                 dir = dSampleAimDirNow(sc, em, rng, pdfAim);
                 if (!(pdfAim > 0.0)) return false;
             } else dir = cosineHemisphere(emitN, rng);
         }
+        // A light its keys scale emits from its area at the photon's time: the power it was
+        // chosen by, the instant's, grows with it (host twin render.h; 1 unscaled).
+        spotW = (Real)dLightAreaScale(sc, em, emitN);
     }
     // Aimed caustic emission (causticaim.h). Placed here, after the shape branch has produced
     // an ordinary sample and BEFORE `beta *= spotW`, because the aimed pass resamples the
@@ -12304,13 +12352,16 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
         emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, origin, emitN);
         if (em.collimated) { dir = em.beamDir; dLightCarry2(sc, em, origin, emitN, dir); }
         else {
-            dLightCarry(sc, em, origin, emitN);        // a moving light -- see genPhoton
+            dLightCarryNormal(sc, em, origin, emitN);  // a moving light -- see genPhoton
             if (em.normalTilted) {                 // an aimed quad: intensity-proportional
                 double pdfAim = 0.0;
                 dir = dSampleAimDirNow(sc, em, rng, pdfAim);
                 if (!(pdfAim > 0.0)) return false;
             } else dir = cosineHemisphere(emitN, rng);
         }
+        // A light its keys scale emits from its area at the photon's time: the power it was
+        // chosen by, the instant's, grows with it (host twin render.h; 1 unscaled).
+        spotW = (Real)dLightAreaScale(sc, em, emitN);
     }
     // Aimed caustic emission — see the scalar genPhoton. Before `base *= spotW` for the same
     // reason (the aimed pass recomputes spotW).
@@ -13479,7 +13530,8 @@ __device__ static float dVertexPdfLightOriginF(const DScene& sc, const DVertex& 
     if (sc.totalPower <= 0.0) return 0.f;
     if (dIsDeltaEmitter(em)) return 0.f;            // delta position / direction
     if (em.area <= 0.0) return 0.f;
-    return (float)((em.power / sc.totalPower) / em.area);
+    // over its area at the path's time (dLightAreaScale: 1 unless its keys scale it)
+    return (float)((em.power / sc.totalPower) / (em.area * dLightAreaScale(sc, em, cur.ng)));
 }
 // Emitted radiance (single wavelength) leaving a light vertex toward w.
 //
@@ -13982,7 +14034,7 @@ __device__ static inline double dLightPdfWShape(const DScene& sc, int e, const D
     const double dist2 = (double)ddot(d, d);
     const double cosLight = (double)ddot(*hitN, wi * (Real)(-1));
     if (!(dist2 > 0.0) || !(cosLight > 0.0)) return 0.0;
-    return dist2 / ((double)em.area * cosLight);
+    return dist2 / ((double)em.area * dLightAreaScale(sc, em, *hitN) * cosLight);   // its area now
 }
 // ...and the whole NEE density: p_select * p_light. Host twin: lightPdfW.
 __device__ static inline double dLightPdfWAt(const DScene& sc, int e, const DVec3& from,
@@ -14163,9 +14215,10 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     // emission-on-hit factor at the same surface point — which keeps the MIS pair
     // consistent (host twin: backward.h emitterGeom).
     double epat = dEmitterSamplePointPat(sc, em, (double)u1, (double)u2, y, nL);
-    // a moving light: sampled where it sits at the instant (uniform in area, which its rigid
-    // motion keeps), the sample carried to the path's time
-    dLightCarry(sc, em, y, nL);
+    // a moving light: sampled where it sits at the instant (uniform in area, which every motion it
+    // takes keeps, its area scaled by dLightAreaScale), the sample carried to the path's time
+    dLightCarryNormal(sc, em, y, nL);
+    const double areaScale = dLightAreaScale(sc, em, nL);
     DVec3 toL = y - h.p;
     g.dist2 = dot(toL, toL);
     g.dist = sqrt(g.dist2);
@@ -14203,10 +14256,13 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     if (!(vis > (Real)0)) return false;
     g.G = (Real)((double)g.cosSurf * (double)cosLight / (double)g.dist2 * (double)vis);
     if (epat != 1.0) g.G = (Real)((double)g.G * epat);   // no-op without a pattern
+    // A light its keys scale: its area now is em.area * areaScale, which the callers' em.area
+    // weight takes through G (1, and no rounding, unscaled).
+    if (areaScale != 1.0) g.G = (Real)((double)g.G * areaScale);
     g.fall = (Real)1; g.spot = false; g.sun = false;
-    // Uniform over em.area, so pdf_W = pdf_A * dist^2 / cos(light). `epat` is a radiance
+    // Uniform over its area, so pdf_W = pdf_A * dist^2 / cos(light). `epat` is a radiance
     // profile folded into G, not a change of density, so it does not appear here.
-    g.pdfW = (em.area > 0) ? (Real)((double)g.dist2 / ((double)em.area * cosGeo))
+    g.pdfW = (em.area > 0) ? (Real)((double)g.dist2 / ((double)em.area * areaScale * cosGeo))
                            : (Real)0;
     return true;
 }
@@ -14609,7 +14665,7 @@ __device__ __noinline__ static void bkNeeVolumeHero(const DScene& sc, const DMed
             DVec3 y, nL;
             // Also returns the sampled point's emission-pattern factor (1.0 when unpatterned).
             const double epat = dEmitterSamplePointPat(sc, em, (double)u1, (double)u2, y, nL);
-            dLightCarry(sc, em, y, nL);
+            dLightCarryNormal(sc, em, y, nL);
             const DVec3 toL = y - p;
             const Real dist2 = dot(toL, toL);
             dist = sqrt(dist2);
@@ -14621,7 +14677,7 @@ __device__ __noinline__ static void bkNeeVolumeHero(const DScene& sc, const DMed
             if (cosLight <= 0) continue;
             const Real vis = shadowTransmittanceTo(sc, p + wi * RAY_EPS, p + wi * dist, 2 * RAY_EPS);
             if (!(vis > (Real)0)) continue;
-            geom = (double)cosLight / (double)dist2 * (double)em.area * (double)vis * epat;
+            geom = (double)cosLight / (double)dist2 * ((double)em.area * dLightAreaScale(sc, em, nL)) * (double)vis * epat;
         }
         geom *= (double)dMediaTransmittance(sc, p, wi, em.shape == 6 ? (Real)dMediaExitDistance(sc, p) : dist,
                                             lam[0], rng) * selW;
@@ -16547,7 +16603,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         // Also returns the sampled point's emission-pattern factor (1.0 when unpatterned).
         // The pattern is achromatic, so it scales the baked RGB radiance directly.
         double epat = dEmitterSamplePointPat(sc, em, (double)u1, (double)u2, y, nL);
-        dLightCarry(sc, em, y, nL);
+        dLightCarryNormal(sc, em, y, nL);
         DVec3 toL = y - h.p;
         Real dist2 = dot(toL, toL);
         Real dist = sqrt(dist2);
@@ -16562,7 +16618,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         if (occludedTo(sc, dOffsetAlong(h.p, h.ng, wi), h.p + wi * dist, 2 * RAY_EPS)) continue;
         Real G = cosSurf * cosLight / dist2;
         if (epat != 1.0) G = (Real)((double)G * epat);   // no-op without a pattern
-        total = total + hadamard(f * (G * em.area * stG * selWr), em.rgbEmit);
+        total = total + hadamard(f * (G * (em.area * dLightAreaScale(sc, em, nL)) * stG * selWr), em.rgbEmit);
     }
     return total;
 }
@@ -17811,7 +17867,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     // when the emitter is unpatterned). It scales the emitted radiance the subpath starts
     // with, exactly as the emission-on-hit side scales the s=0 strategy's radiance.
     double emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, y, nOut);
-    dLightCarry(sc, em, y, nOut);   // a moving light: sampled where it sits at the instant, carried out
+    dLightCarryNormal(sc, em, y, nOut);   // a moving light: sampled where it sits at the instant, carried out
     double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * emitPatW;
     // The bundle's other wavelengths: a subpath dark at the hero alone still carries them (the
     // walk goes on while any wavelength lives), as the spot / sun branch's does. Host twin:
@@ -17823,7 +17879,8 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     }
     if (!(mxLe > 0.0)) return 0;
     double pdfChoice = em.power / sc.totalPower;
-    double pdfPos = (em.area > 0.0) ? 1.0 / em.area : 0.0;
+    // over its area at the path's time (host twin bdpt.h; an aimed panel scales only evenly)
+    double pdfPos = (em.area > 0.0) ? 1.0 / (em.area * dLightAreaScale(sc, em, nOut)) : 0.0;
     if (pdfPos <= 0.0) return 0;
     DVertex L0;
     // An aimed quad's vertex carries its FACE (DEmitter::nGeom), which every density conversion
@@ -18145,6 +18202,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         DVec3 y, nOut, wi;
         double dist = 0.0, Wgeom = 0.0, emitPatW = 1.0;
         const bool deltaLight = dIsDeltaEmitter(em);
+        double areaNow = em.area;   // an area light's area at the path's time (dLightAreaScale)
         // A distant sun has no finite light point: the shadow ray runs all the way to the
         // scene exit, so it must NOT be shortened by the usual endpoint epsilon.
         double occlEps = 2e-6;
@@ -18177,7 +18235,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             // sees; s=0 applies the pointwise-equal emission-on-hit factor, which is what
             // keeps the two MIS-combined strategies consistent.
             emitPatW = dEmitterSamplePointPat(sc, em, u1, u2, y, nOut);
-            dLightCarry(sc, em, y, nOut);
+            dLightCarryNormal(sc, em, y, nOut);
             DVec3 toL = y - pt.p; double dist2 = ddot(toL, toL);
             if (dist2 <= 0.0) return 0.0;
             dist = sqrt(dist2); wi = toL * (Real)(1.0 / dist);
@@ -18186,7 +18244,8 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
                                               : ddot(nOut, wi * (Real)(-1));
             if (cosLight <= 0.0) return 0.0;           // emitter stays one-sided
             if (em.area <= 0.0) return 0.0;
-            Wgeom = cosLight * em.area / (dist2 * pdfChoice);   // == cosLight/(d^2 * pdfA)
+            areaNow = em.area * dLightAreaScale(sc, em, nOut);
+            Wgeom = cosLight * areaNow / (dist2 * pdfChoice);   // == cosLight/(d^2 * pdfA)
             if (em.normalTilted) nOut = dAimFaceNow(sc, em);   // the vertex carries the face (see L0)
         }
         nUp = pt.nUp;
@@ -18264,8 +18323,8 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         // pdfFwd is 0 on BOTH sides of every MIS ratio (the light subpath stores the same
         // 0), matching PBRT — see dVertexPdfLightOriginF.
         sampled.matId = deltaLight ? -1 : em.matId;
-        sampled.beta = deltaLight ? Le * Wgeom : Le * em.area / pdfChoice;   // == Le/pdfA
-        sampled.pdfFwd = deltaLight ? 0.0 : (pdfChoice / em.area);
+        sampled.beta = deltaLight ? Le * Wgeom : Le * areaNow / pdfChoice;   // == Le/pdfA
+        sampled.pdfFwd = deltaLight ? 0.0 : (pdfChoice / areaNow);
         sampled.emitPatW = (Real)emitPatW;   // so dVertexLe on this sampled vertex agrees
     } else {
         const DVertex& qs = light[s - 1];
@@ -20721,9 +20780,9 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             // unpatterned) scales the radiance the light subpath starts with — the MIS pdfs
             // are untouched, exactly as in dGenLightSubpath.
             emitScale = dEmitterSamplePointPat(sc, em, u1, u2, y, nOut);
-            dLightCarry(sc, em, y, nOut);            // a moving light, at the pass's time
+            dLightCarryNormal(sc, em, y, nOut);      // a moving light, at the pass's time
             if (em.area <= 0.0) continue;
-            pdfPos = 1.0 / em.area;
+            pdfPos = 1.0 / (em.area * dLightAreaScale(sc, em, nOut));   // over its area now
             if (em.normalTilted) {                   // an aimed quad: intensity-proportional
                 dir = dSampleAimDirNow(sc, em, rng, pdfDirW);
                 nOut = dAimFaceNow(sc, em);          // the face, for the offset and the measure
@@ -21145,10 +21204,11 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                         if (li >= 0 && sc.emitters[li].area > 0.0 && sc.totalPower > 0.0 && edges >= 2) {
                             const DEmitter& em = sc.emitters[li];
                             double pdfChoice = em.power / sc.totalPower;
-                            double directPdfA = pdfChoice / em.area;
+                            const double areaNow = em.area * dLightAreaScale(sc, em, h.ng);   // its area now
+                            double directPdfA = pdfChoice / areaNow;
                             double emissionPdfW = em.normalTilted       // joint density (see vcm.h)
-                                ? pdfChoice * dAimDirPdfNow(sc, em, wo) / em.area
-                                : pdfChoice * cosLight / (DPI * em.area);
+                                ? pdfChoice * dAimDirPdfNow(sc, em, wo) / areaNow
+                                : pdfChoice * cosLight / (DPI * areaNow);
                             double wCamera = directPdfA * dVCM + emissionPdfW * dVC;
                             misW = 1.0 / (1.0 + wCamera);
                         }
@@ -21238,7 +21298,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                             DVec3 yL, nL;
                             // Sampled point's emission-pattern factor (1.0 when unpatterned).
                             epat = dEmitterSamplePointPat(sc, em, u1, u2, yL, nL);
-                            dLightCarry(sc, em, yL, nL);   // a moving light, at the pass's time
+                            dLightCarryNormal(sc, em, yL, nL);   // a moving light, at the pass's time
                             DVec3 toL = yL - h.p; dist2 = ddot(toL, toL);
                             if (dist2 > 1e-12 && em.area > 0.0) {
                                 distL = sqrt(dist2); wiL = toL * (Real)(1.0 / distL);
@@ -21250,7 +21310,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                 const double aimR = em.normalTilted
                                     ? (double)dAimRadianceNow(sc, em, wiL * (Real)-1) : 1.0;
                                 if (cosAtLight > 0.0 && aimR > 0.0) {   // emitter stays one-sided
-                                    double invArea = 1.0 / em.area;
+                                    double invArea = 1.0 / (em.area * dLightAreaScale(sc, em, nL));   // at the pass's time
                                     neeDirectPdfW = invArea * dist2 / cosAtLight;
                                     neeEmissionPdfW = em.normalTilted
                                         ? invArea * dAimDirPdfNow(sc, em, wiL * (Real)-1)
@@ -22584,7 +22644,7 @@ static void uploadMotion(const Scene& scene, DUpload& up) {
     std::vector<DAff> xf;
     std::vector<double> T;
     std::vector<DMotionSet> sets;
-    for (const MotionKeys& mk : scene.motionSets) sets.push_back(DMotionSet{mk.keys, mk.first});
+    for (const MotionKeys& mk : scene.motionSets) sets.push_back(DMotionSet{mk.keys, mk.first, mk.shape});
     for (size_t k = 0; k < scene.motionXf.size(); ++k) {
         DAff a;
         for (int i = 0; i < 9; ++i) a.m[i] = scene.motionXf[k].m[i];
@@ -22596,7 +22656,7 @@ static void uploadMotion(const Scene& scene, DUpload& up) {
         DAff id{};
         id.m[0] = id.m[4] = id.m[8] = 1.0;
         xf.push_back(id); T.push_back(0.0);
-        sets.push_back(DMotionSet{1, 0});
+        sets.push_back(DMotionSet{1, 0, kMotionRigid});
     }
     mo.xf = (const DAff*)keep(uploadVec(xf));
     mo.T = (const double*)keep(uploadVec(T));

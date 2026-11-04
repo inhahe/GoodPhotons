@@ -227,8 +227,11 @@ struct PassTimeScope {
 
 // A moving group's keys: `keys` (at least 2) transforms at increasing times through the scene's
 // motion interval (fractions, the first 0 and the last 1), starting at `first` in
-// Scene::motionXf / motionT.
-struct MotionKeys { int keys = 0; int first = 0; };
+// Scene::motionXf / motionT. `shape` is what the keys do to lengths and angles, which the lights
+// they move read (Scene::lightAreaScale): 0 every key rigid, 1 every key a similarity (a rigid
+// motion with one uniform scale), 2 any affine.
+struct MotionKeys { int keys = 0; int first = 0; int shape = 0; };
+enum MotionShape { kMotionRigid = 0, kMotionSimilar = 1, kMotionAffine = 2 };
 
 // The transform at the fraction u of the motion interval, of `n` (>= 2) keys at the increasing
 // times `t` (t[0] = 0, t[n-1] = 1): the two keys bracketing u blended entry by entry (Affine::

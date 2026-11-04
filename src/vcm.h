@@ -604,7 +604,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
     } else {
         emitScale = emitterSamplePoint(scene, em, u1, u2, y, nOut);
         if (em.area <= 0.0) return;
-        pdfPos = 1.0 / em.area;
+        pdfPos = 1.0 / (em.area * scene.lightAreaScale(em, nOut));   // over its area at the pass's time
         if (em.normalTilted) {                       // an aimed quad: intensity-proportional
             dir = scene.sampleAimDirNow(em, rng, pdfDirW);
             nOut = scene.aimFaceNow(em);             // the face, for the offset and the measure
@@ -983,7 +983,9 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     const Emitter* em = scene.emitterForMat(h.matId);
                     if (em && em->area > 0.0 && scene.totalPower > 0.0 && edges >= 2) {
                         double pdfChoice = em->power / scene.totalPower;
-                        double directPdfA = pdfChoice / em->area;         // area pdf of the point
+                        // its area at the pass's time (Scene::lightAreaScale: 1 unless its keys scale it)
+                        const double areaNow = em->area * scene.lightAreaScale(*em, h.ng);
+                        double directPdfA = pdfChoice / areaNow;          // area pdf of the point
                         // JOINT emission density: position x direction x pick -- exactly what
                         // traceLightSubpath generates every light path with (pdfPos*pdfDirW*
                         // pdfChoice) and what SmallVCM's AreaLight::GetRadiance reports. The
@@ -993,8 +995,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                         // splat and the merge kept theirs: +4.4 % over mode R on a bare
                         // floor+sphere scene, and +24 % on skin whose NEE fur blocks (0.363.0).
                         double emissionPdfW = em->normalTilted        // an aimed quad
-                            ? pdfChoice * scene.aimDirPdfNow(*em, wo) / em->area
-                            : pdfChoice * cosLight / (PI * em->area);
+                            ? pdfChoice * scene.aimDirPdfNow(*em, wo) / areaNow
+                            : pdfChoice * cosLight / (PI * areaNow);
                         double wCamera = Mis(directPdfA) * dVCM + Mis(emissionPdfW) * dVC;
                         misW = 1.0 / (1.0 + wCamera);
                     }
@@ -1090,7 +1092,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                                                          : dot(nL, wi * -1.0);
                             const double aimR = em.normalTilted ? scene.aimRadianceNow(em, wi * -1.0) : 1.0;
                             if (cosAtLight > 0.0 && aimR > 0.0) {   // emitter stays one-sided
-                                double invArea = 1.0 / em.area;
+                                double invArea = 1.0 / (em.area * scene.lightAreaScale(em, nL));   // at the pass's time
                                 directPdfW = invArea * dist2 / cosAtLight;   // (no pickProb)
                                 emissionPdfW = em.normalTilted               // (no pickProb)
                                     ? invArea * scene.aimDirPdfNow(em, wi * -1.0)

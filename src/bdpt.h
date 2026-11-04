@@ -639,7 +639,8 @@ inline double vertexPdfLightOrigin(const Scene& scene, const Vertex& cur) {
     if (isDeltaEmitter(*cur.light)) return 0.0;      // delta position / direction
     if (cur.light->area <= 0.0) return 0.0;
     double pdfChoice = bdptPickPdf(scene, cur.light, -1);
-    return pdfChoice / cur.light->area;
+    // its area at the path's time (Scene::lightAreaScale: 1 unless its keys scale it)
+    return pdfChoice / (cur.light->area * scene.lightAreaScale(*cur.light, cur.ng));
 }
 
 // --- Random walk -----------------------------------------------------------------
@@ -2090,7 +2091,9 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     if (!(mxLe > 0.0)) return 0;
 
     double pdfChoice = pick.pdf;
-    double pdfPos = (em.area > 0.0) ? 1.0 / em.area : 0.0;
+    // over its area at the path's time (Scene::lightAreaScale: 1 unless its keys scale it; an aimed
+    // panel moves only by similarities, whose scale is the same about any normal)
+    double pdfPos = (em.area > 0.0) ? 1.0 / (em.area * scene.lightAreaScale(em, nOut)) : 0.0;
     if (pdfPos <= 0.0) return 0;
 
     Vertex L0;
@@ -3719,6 +3722,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             double u1 = rng.uniform(), u2 = rng.uniform();
             double emitPatW = 1.0;
             const bool deltaLight = isDeltaEmitter(em);
+            double areaNow = em.area;   // an area light's area at the path's time (Scene::lightAreaScale)
             if (em.shape == EmitterShape::Spot) {
                 // Point spot: the connection point is deterministic (delta position); the
                 // smoothstep penumbra weights the intensity toward this receiver.
@@ -3752,7 +3756,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                 double cosLight = em.normalTilted ? scene.aimCosNow(em, wi * -1.0) : dot(nOut, wi * -1.0);
                 if (cosLight <= 0.0) return 0.0;       // emitter stays one-sided
                 if (em.area <= 0.0) return 0.0;
-                Wgeom = cosLight * em.area / (dist2 * pdfChoice);   // == cosLight/(d^2 * pdfA)
+                areaNow = em.area * scene.lightAreaScale(em, nOut);
+                Wgeom = cosLight * areaNow / (dist2 * pdfChoice);   // == cosLight/(d^2 * pdfA)
                 if (em.normalTilted) nOut = scene.aimFaceNow(em);   // the vertex carries the face (see L0)
             }
             // The emitter was CHOSEN at the hero wavelength; only its emitted radiance is
@@ -3766,9 +3771,9 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             sampled.emitPatW = emitPatW;
             // A delta light has no area density: pdfFwd is 0 on BOTH sides of every MIS ratio
             // (the light subpath stores the same 0), matching PBRT — see vertexPdfLightOrigin.
-            sampled.beta = deltaLight ? Le * Wgeom : Le * em.area / pdfChoice;   // == Le/pdfA
+            sampled.beta = deltaLight ? Le * Wgeom : Le * areaNow / pdfChoice;   // == Le/pdfA
             sampled.delta = false;
-            sampled.pdfFwd = deltaLight ? 0.0 : (pdfChoice / em.area);
+            sampled.pdfFwd = deltaLight ? 0.0 : (pdfChoice / areaNow);
         }
         {   // max over live wavelengths (identical to `Le <= 0` when nUp==1)
             double mxLe = Le;

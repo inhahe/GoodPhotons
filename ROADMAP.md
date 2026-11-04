@@ -754,8 +754,10 @@ lone camera in the device refresh loop's timed epochs; a camera moving over a st
 the one map, each sample posed. *Mode P on the GPU (0.423.0, done):* the backward layer files each
 sample by its own first event into two films, the forward layer makes no splat the camera side
 draws. *Aimed area lights (0.425.0, done):* an aimed panel moves, its face and lean turning with
-it in every estimator. Open: lights that scale over the shutter; on the GPU, a blurred shared
-forward flight, and a moving scene's shared mode M map.
+it in every estimator. *Lights that scale (0.426.0, done):* under a similarity every light, under
+any affine a flat panel or an emissive mesh, its area carried in every density. Open: an uneven
+stretch of a sphere, tube, spot, beam or aimed light; on the GPU, a blurred shared forward
+flight, and a moving scene's shared mode M map.
 
 **Stage C, motion vectors and depth (0.411.0, done):** `-write-aovs` writes the guide pass's
 albedo and normal and, from one ray through each pixel's centre at the frame's instant, depth,

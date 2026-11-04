@@ -3201,9 +3201,12 @@ size.)
   built as a smooth mesh, as an uneven static `scale` builds it. **Lights move too** (since
   0.410.0): a `light` of any kind but `sun` and `env`, and an emissive mesh, moves and turns
   with its group, lit and lighting as it goes, in every mode that blurs. A light moves only
-  rigidly: one whose keys would scale or shear it over the shutter stays at the instant, its
-  surface with it, and so does a sun or sky in a moving group — each with one warning. An aimed
-  area light (one whose `normal` leans) moves since 0.425.0, its lean turning with it. What finds an object by name — `fur { on }` and `bald`, a
+  rigidly, or (since 0.426.0) under keys that scale it: any light under a uniform scale, and a
+  flat panel or an emissive mesh under an uneven stretch or a shear, each keeping its radiance (a
+  `power` is its flux at the frame's instant, so a light that grows emits more). A sphere, tube,
+  spot, beam or aimed panel its keys stretch unevenly stays at the instant, its surface with it,
+  and so does a sun or sky in a moving group — each with one warning. An aimed area light (one
+  whose `normal` leans) moves since 0.425.0, its lean turning with it. What finds an object by name — `fur { on }` and `bald`, a
   medium's `bounds { object }`, `settle { collide }` — refuses one in a moving group, which it
   could not follow. **Textures travel with what moves:** a procedural `pattern` on a moving
   surface is read where that surface point sits at the frame's instant, so it smears with the

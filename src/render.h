@@ -2754,7 +2754,7 @@ struct Renderer {
         srcEmIdx = ei;
         double u1 = rng.uniform(), u2 = rng.uniform();
         Vec3 emitN;
-        double spotW = 1.0;                      // spot: p_e/p_u direction reweight (else 1)
+        double spotW = 1.0;                      // the power's reweight: a spot's p_e/p_u, the sky's disc, a scaled light's area
         double envPdfW = 0.0;                    // env: solid-angle pdf of the sampled dir
         double emitPatW = 1.0;                   // `emit pattern:` factor at the sampled point
         if (em.shape == EmitterShape::Spot) {
@@ -2823,6 +2823,9 @@ struct Renderer {
             // returns this point's `emit pattern:` factor — 1.0 (and a bit-identical
             // call) when the emitter carries no pattern.
             emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN);
+            // A light its keys scale emits from its area at the photon's time: the power it was
+            // chosen by, the instant's, grows with it (Scene::lightAreaScale; 1 unscaled).
+            spotW = scene.lightAreaScale(em, emitN);
             if (em.collimated) dir = scene.lightDirNow(em, em.beamDir);
             else if (em.normalTilted) {             // an aimed quad: intensity-proportional
                 double pdfAim = 0.0;
@@ -3781,6 +3784,7 @@ struct Renderer {
             emitN = dir;
         } else {
             emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN);
+            spotW = scene.lightAreaScale(em, emitN);   // its area at the photon's time (scalar tracer)
             if (em.collimated) dir = scene.lightDirNow(em, em.beamDir);
             else if (em.normalTilted) {             // an aimed quad -- see the scalar tracer
                 double pdfAim = 0.0;

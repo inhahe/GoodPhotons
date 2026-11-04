@@ -1903,6 +1903,46 @@ struct Scene {
     Vec3 lightDirThen(const Emitter& em, const Vec3& d) const {     // into the instant, made unit
         return lightMoves(em) ? normalize(motionNowInverse(em.motion).applyDir(d)) : d;
     }
+    // A light whose keys scale it (MotionKeys::shape: a similarity, or for a flat light any affine)
+    // keeps its radiance but not its size, so what its samplers measure at the instant is carried
+    // by these. Each is the identity for a light that moves rigidly (bit for bit), holds still, or
+    // a path without a time.
+    bool lightScales(const Emitter& em) const {
+        return lightMoves(em) && motionSets[(size_t)em.motion].shape != kMotionRigid;
+    }
+    // A surface normal of the light (unit, at the instant) carried out: as lightDirNow under a
+    // similarity, by the inverse transpose under any other affine.
+    Vec3 lightNormalNow(const Emitter& em, const Vec3& n) const {
+        if (!lightMoves(em) || motionSets[(size_t)em.motion].shape != kMotionAffine) return lightDirNow(em, n);
+        const Affine& Di = motionNowInverse(em.motion);
+        return normalize(Vec3{Di.m[0] * n.x + Di.m[3] * n.y + Di.m[6] * n.z,
+                              Di.m[1] * n.x + Di.m[4] * n.y + Di.m[7] * n.z,
+                              Di.m[2] * n.x + Di.m[5] * n.y + Di.m[8] * n.z});
+    }
+    // How much the light's area grows at the path's time about a point whose normal there is
+    // `nNow` (unit): |det D| / |D^T nNow|, s^2 under a similarity of scale s. An area density at
+    // the instant divides by it, a photon's power multiplies by it.
+    double lightAreaScale(const Emitter& em, const Vec3& nNow) const {
+        if (!lightScales(em)) return 1.0;
+        const Affine& D = motionNow(em.motion);
+        const Vec3 tn{D.m[0] * nNow.x + D.m[3] * nNow.y + D.m[6] * nNow.z,
+                      D.m[1] * nNow.x + D.m[4] * nNow.y + D.m[7] * nNow.z,
+                      D.m[2] * nNow.x + D.m[5] * nNow.y + D.m[8] * nNow.z};
+        const double l = length(tn);
+        return l > 0.0 ? std::fabs(D.det()) / l : 1.0;
+    }
+    // A sphere light's sample at the path's time (it moves), on the sphere its geometry is then
+    // (movedSphere: the centre carried, the radius by the motion's mean scale): `n`, its unit
+    // normal at the instant, carried, and `y` the point of the moved sphere along it. Carrying the
+    // point itself would leave it off that sphere between keys, where a blend of two turns shrinks
+    // what it turns: a photon born there, or a shadow ray aimed at it, would meet the light's own
+    // surface.
+    void lightSpherePointNow(const Emitter& em, Vec3& y, Vec3& n) const {
+        const Affine D = motionNow(em.motion);
+        bool nonUniform = false;
+        n = normalize(D.applyDir(n));
+        y = D.apply(em.origin) + n * (em.radius * D.uniformScale(nonUniform));
+    }
     // An AIMED quad (Emitter::normalTilted) as the current path sees it: its face and its lean turn
     // with it, so each reading takes `w` (the unit direction leaving the patch, at the path's time)
     // back to the instant first, and a direction it draws is carried out. Emitter's own readings
@@ -5239,7 +5279,10 @@ inline double emitterSamplePoint(const Scene& scene, const Emitter& em,
         em.samplePoint(u1, u2, y, nOut, &uu, &vv, &reach);
         pmul = emitterPatMulAt(scene, em, y, nOut, uu, vv, reach);
     }
-    if (scene.lightMoves(em)) { y = scene.lightPointNow(em, y); nOut = scene.lightDirNow(em, nOut); }
+    if (scene.lightMoves(em)) {
+        if (em.shape == EmitterShape::Sphere) scene.lightSpherePointNow(em, y, nOut);   // on its moved surface
+        else { y = scene.lightPointNow(em, y); nOut = scene.lightNormalNow(em, nOut); }
+    }
     return pmul;
 }
 

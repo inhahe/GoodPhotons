@@ -7570,29 +7570,57 @@ private:
             std::fprintf(stderr, "[ftsl] warning: a group's motion needs more than %zu keys to follow "
                                  "closely; it is blended more coarsely than %.1g of its size\n",
                          kMotionMaxKeys, kMotionTol);
-        // Lights move only rigidly, so that every length, area and angle of them stands and each
-        // is sampled where it sits at the instant (Scene::lightPointNow): with keys that scale or
-        // shear, a child that adds lights stays at the instant, its surfaces with it.
-        bool rigid = true;
+        // What the keys do to a light's lengths and angles (MotionKeys::shape): rigid keys keep
+        // them all; similarities (one uniform scale each, MᵀM = s²I) keep every angle and scale
+        // every length alike, so a light's samplers run at the instant and its areas and lengths
+        // are carried (Scene::lightAreaScale, lightSpherePointNow); any other affine keeps a flat
+        // light flat, its area carried point by point, but no sphere, tube, cone or aim.
+        int shape = kMotionRigid;
         for (const Affine& w : kw) {
-            for (int r = 0; r < 3 && rigid; ++r)
-                for (int c = 0; c < 3 && rigid; ++c) {
-                    double d = 0.0;   // (M^T M)[r][c]
+            double mtm[9];   // MᵀM
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c) {
+                    double d = 0.0;
                     for (int k = 0; k < 3; ++k) d += w.m[k * 3 + r] * w.m[k * 3 + c];
-                    if (std::fabs(d - (r == c ? 1.0 : 0.0)) > 1e-9) rigid = false;
+                    mtm[r * 3 + c] = d;
                 }
-            if (!rigid) break;
+            const double s2 = (mtm[0] + mtm[4] + mtm[8]) / 3.0;
+            bool unit = true, similar = true;
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c) {
+                    const double id = (r == c) ? 1.0 : 0.0;
+                    if (std::fabs(mtm[r * 3 + c] - id) > 1e-9) unit = false;
+                    if (std::fabs(mtm[r * 3 + c] - id * s2) > 1e-9 * std::max(1.0, s2)) similar = false;
+                }
+            if (!unit) shape = std::max(shape, similar ? (int)kMotionSimilar : (int)kMotionAffine);
         }
-        if (!lit.empty() && !rigid && stillWarned_.insert("a light scaled").second)
-            std::fprintf(stderr, "[ftsl] warning: a light in a moving group whose keys scale or shear it "
-                                 "stays where it is at the frame's instant, with its surface -- a light "
-                                 "moves only rigidly (ROADMAP 11)\n");
-        // Nothing takes the keys (every mover a light they would scale): no set, so a scene where
+        // A child's lights move if every one of them can under these keys: any light under rigid
+        // keys or similarities (a sun or sky never, above), and under any other affine a flat
+        // light only -- a panel that does not aim or fire a beam, or an emissive mesh. A child
+        // that cannot stays at the instant, its surfaces with it.
+        auto lightCan = [&](const Emitter& e) {
+            if (shape != kMotionAffine) return true;
+            return (e.shape == EmitterShape::Quad && !e.normalTilted && !e.collimated) ||
+                   e.shape == EmitterShape::Mesh;
+        };
+        std::vector<char> litMoves(lit.size(), 1);
+        bool anyLitMoves = false;
+        for (size_t k = 0; k < lit.size(); ++k) {
+            for (size_t i = lit[k].first.emitters; i < lit[k].second.emitters; ++i)
+                if (!lightCan(S.emitters[i])) litMoves[k] = 0;
+            anyLitMoves = anyLitMoves || litMoves[k];
+            if (!litMoves[k] && stillWarned_.insert("a light stretched").second)
+                std::fprintf(stderr, "[ftsl] warning: a sphere, tube, spot, beam or aimed light in a moving group "
+                                     "whose keys stretch it unevenly stays where it is at the frame's instant, "
+                                     "with its surface -- under such keys only a flat panel or an emissive mesh "
+                                     "moves (ROADMAP 11)\n");
+        }
+        // Nothing takes the keys (every mover a light they would stretch): no set, so a scene where
         // nothing moves is not one with motion.
-        if (tris.empty() && sphs.empty() && imps.empty() && segs.empty() && insts.empty() && !rigid)
+        if (tris.empty() && sphs.empty() && imps.empty() && segs.empty() && insts.empty() && !anyLitMoves)
             return true;
         const int set = (int)S.motionSets.size();
-        S.motionSets.push_back(MotionKeys{(int)kt.size(), (int)S.motionXf.size()});
+        S.motionSets.push_back(MotionKeys{(int)kt.size(), (int)S.motionXf.size(), shape});
         for (size_t k = 0; k < kt.size(); ++k) {
             if (!sphs.empty()) {
                 bool nonUniform = false;
@@ -7610,8 +7638,9 @@ private:
         for (const auto& [a, z] : imps) for (size_t i = a; i < z; ++i) S.implicits[i].motion = set;
         for (const auto& [a, z] : segs) for (size_t i = a; i < z; ++i) S.curveSegs[i].motion = set;
         for (const auto& [a, z] : insts) for (size_t i = a; i < z; ++i) S.instances[i].motion = set;
-        for (const auto& [a, z] : lit) {
-            if (!rigid) continue;
+        for (size_t k = 0; k < lit.size(); ++k) {
+            if (!litMoves[k]) continue;
+            const auto& [a, z] = lit[k];
             for (size_t i = a.tris; i < z.tris; ++i) S.tris[i].motion = set;
             for (size_t i = a.spheres; i < z.spheres; ++i) S.spheres[i].motion = set;
             for (size_t i = a.implicits; i < z.implicits; ++i) S.implicits[i].motion = set;
