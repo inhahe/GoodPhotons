@@ -1882,8 +1882,11 @@ does that — though `emit_orient keep` is now the direct way to say it.
 
 A `mesh` may carry `deform` blocks. Each moves the vertices the block loaded, in order, each one
 working on the last one's output. A **handle** is a point `at` on the rest mesh moved `to` a
-target. Both are in scene coordinates, with the mesh's own `translate` / `rotate` / `scale`
-already applied. A handle with no `to` holds still.
+target. Both, and a handle's `radius` and an rbf's `eps`, are in the mesh's own coordinates: as
+its file gives them, before its `translate` / `rotate` / `scale`, its groups and the scene's
+`units` (since 0.417.0; before, they were in scene coordinates). So a deformation travels with
+its mesh wherever it is placed, and a copy put elsewhere keeps its bend. A handle with no `to`
+holds still.
 
 ```
 mesh "bar" { file "meshes/bar.obj"  material rubber
@@ -1911,9 +1914,10 @@ x y z } … }`, spread evenly over the scene's `motion_interval` (§2) with one 
 instant. Every keyed handle of a mesh needs the same number of keys; keys that all agree are a
 handle holding still, so they make nothing move. Each deformer is then
 evaluated at every key on the same rest mesh, so every vertex has a path of its own through the
-shutter, and a camera with a shutter blurs the deformation exactly (§13.1). A deforming mesh
-cannot sit inside a moving `group`: move it with its handles instead. A glowing mesh keeps its
-instant's shape at every time, with a warning, since a light moves only rigidly.
+shutter, and a camera with a shutter blurs the deformation exactly (§13.1). A deforming mesh in
+a moving `group` (§13.1) rides the group's motion: at each time its deformed shape is carried by
+the group's transform at that time. A glowing mesh keeps its instant's shape at every time, with
+a warning, since a light moves only rigidly.
 
 **Dynamic elastic.** `deform elastic { dynamic { … } … }` gives the surface inertia: it lags
 behind its handles, overshoots and settles. That is a simulation stepped through time, so it is
@@ -1940,7 +1944,10 @@ deform elastic {
 
 A dynamic elastic moves through its frame even when its handles hold still -- it rings on after
 they stop -- so under a `motion_interval` it is given keys anyway, about one a substep, and blurs
-and carries its motion into the guide pass (§13.1) without a keyed handle.
+and carries its motion into the guide pass (§13.1) without a keyed handle. It is simulated in the
+mesh's own coordinates and units, like every deformer: its `stiffness` and `mass` are of the mesh
+as its file gives it, and a group carrying it (moving or not) carries the wobble rigidly, without
+shaking it.
 
 `ftrace -bake-elastic <scene%04d.ftsl> <first> <last>` loads each frame's scene in order. At each
 dynamic elastic it continues the simulation from the frame before's record, or from rest when

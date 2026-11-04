@@ -15,6 +15,12 @@ Each case loads a scene with `ftrace -export-tris` (no render) and reads the tri
     alike moves rigidly; a 2 mm bar bends as the 2 m one does, scaled (its rotations judged
     against its own size).
   * Deformers stack in order, each on the last one's output.
+  * Handles are in the mesh's own coordinates: a mesh translated, turned and scaled unevenly by
+    its own transform and a group's deforms as the bare mesh does, then is placed; a vertex the
+    deformer leaves alone keeps its placed position exactly.
+  * A deforming mesh rides a moving group: at a time its triangles are the group's transform then
+    applied to the deformed shape (keyed handles and not); -checkbvh holds it at every time; a
+    group sliding one way and a deformer sliding it back render as the still mesh.
   * A keyed handle gives each vertex keys: the instant's shape is the middle key's, the shape at a
     key's time (-export-tris-at) is the still deform to that key's target, and between two keys
     each corner is their blend.
@@ -37,9 +43,8 @@ Each case loads a scene with `ftrace -export-tris` (no render) and reads the tri
     none; a bake of an unchanged shot keeps every record; one after a frame's handle target
     changes re-simulates from that frame on, and a render of it before then is refused;
     `ftrace -stop` stops a bake cleanly.
-  * Errors: an unknown deformer, keyed handles with different counts, a deforming mesh in a
-    moving group, an elastic handle that holds nothing, a falloff handle with no radius, a
-    dynamic elastic's own `iterations`.
+  * Errors: an unknown deformer, keyed handles with different counts, an elastic handle that
+    holds nothing, a falloff handle with no radius, a dynamic elastic's own `iterations`.
 Exits 1 on any failure.
 """
 import argparse
@@ -275,9 +280,11 @@ def main():
     # threshold in the rotation's eigen-solve once left them unrotated (5.7 cm off, of 2 m).
     full, _ = c.export(mesh(bar, "deform elastic { %s }" % bend))
     sc = 1e-3
+    tiny_bar = os.path.join(out, "bar_2mm.obj").replace(chr(92), "/")
+    bar_obj(tiny_bar, length=2.0 * sc, w=0.2 * sc)
     tiny = ("handle { at 0 0 0  to 0 0 0  radius %r }  handle { at %r %r %r  to %r %r %r  radius %r }"
             % tuple(sc * x for x in (0.25, 2, 0.1, 0.1, 1.65, 1.05, 0.1, 0.01)))
-    small, _ = c.export(mesh(bar, "scale %r  deform elastic { %s }" % (sc, tiny)))
+    small, _ = c.export(mesh(tiny_bar, "deform elastic { %s }" % tiny))
     e = max_diff(small / sc, full) if small is not None and full is not None else 1.0
     c.verdict("... and a 2 mm bar bends as the 2 m one does, scaled", e < 1e-6, "worst %.2g m (of 2)" % e)
 
@@ -289,6 +296,59 @@ def main():
     want[..., 1] += 0.4 * np.vectorize(smooth)(np.linalg.norm(shifted[..., [0, 2]] - [0.1, 0], axis=-1) / 0.6)
     e = max_diff(t, want)
     c.verdict("deformers stack in order, each on the last one's output", e < 1e-9, "worst %.2g m" % e)
+
+    wave = ("deform falloff { handle { at 0 0 0  radius 0.8  motion { key { to 0 -0.5 0 } key { to 0.3 0 0.2 } "
+            "key { to 0 0.6 0 } } } }")
+
+    # --- the mesh's own coordinates ---
+    # Its own transform and a group's, uneven scale among them: the bar deforms as the bare one,
+    # then is placed. The placement is read off the undeformed bar placed the same way.
+    place = "translate 0.3 -0.2 0.5  rotate 10 35 -20  scale 1.5 0.7 1.2"
+    def placed(deform):
+        return 'group { translate -1 0.5 2  rotate 0 20 0  %s }' % (
+            'mesh "g" { file "%s"  material m  %s  %s }' % (bar, place, deform))
+    flat, _ = c.export(placed(""))
+    bent0, _ = c.export(mesh(bar, "deform elastic { %s }" % bend))
+    bent, log = c.export(placed("deform elastic { %s }" % bend))
+    if flat is None or bent0 is None or bent is None:
+        c.verdict("a placed mesh deforms in its own coordinates", False, log[-300:])
+    else:
+        X = np.c_[rbar.reshape(-1, 3), np.ones(rbar.size // 3)]
+        A, *_ = np.linalg.lstsq(X, flat.reshape(-1, 3), rcond=None)     # rest -> placed: the affine
+        want = (np.c_[bent0.reshape(-1, 3), np.ones(bent0.size // 3)] @ A).reshape(bent0.shape)
+        e = max_diff(bent, want)
+        c.verdict("a placed mesh deforms in its own coordinates, then is placed", e < 1e-9, "worst %.2g m" % e)
+        held = np.linalg.norm(rbar - np.array([0.0, 0, 0]), axis=-1) <= 0.25
+        c.verdict("... and a vertex it leaves alone keeps its placed position exactly",
+                  max_diff(bent[held], flat[held]) == 0.0)
+
+    # --- riding a moving group ---
+    # The group turns and slides through the shutter: at each time the triangles are its transform
+    # then (read off the undeformed bar in the same group) applied to the deformed shape.
+    ride = ("group { motion { key { translate -0.3 0 0  rotate 0 -20 0 } key { translate 0 0 0 } "
+            "key { translate 0.3 0.1 0  rotate 0 20 10 } }  %s }")
+    waved = ("deform falloff { handle { at 2 0 0  radius 0.8  motion { key { to 2 -0.3 0 } key { to 2 0 0 } "
+             "key { to 2 0.4 0.2 } } } }")
+    for name, deform in (("a still deformer", "deform elastic { %s }" % bend), ("a keyed one", waved)):
+        worst = 0.0
+        for at in (-0.4, -0.1, 0.25, 0.5):
+            moved, _ = c.export(ride % mesh(bar, ""), at=at)
+            mine, _ = c.export(mesh(bar, deform), at=at)
+            both, log = c.export(ride % mesh(bar, deform), at=at)
+            if moved is None or mine is None or both is None:
+                worst = 1.0
+                break
+            X = np.c_[rbar.reshape(-1, 3), np.ones(rbar.size // 3)]
+            A, *_ = np.linalg.lstsq(X, moved.reshape(-1, 3), rcond=None)
+            want = (np.c_[mine.reshape(-1, 3), np.ones(mine.size // 3)] @ A).reshape(mine.shape)
+            worst = max(worst, max_diff(both, want))
+        c.verdict("a deforming mesh rides a moving group (%s)" % name, worst < 1e-9, "worst %.2g m" % worst)
+    p = c.scene(ride % mesh(grid, wave))
+    r = subprocess.run([c.exe, "-in", p, "-checkbvh"], capture_output=True, text=True, encoding="utf-8",
+                       errors="replace")
+    line = [x for x in (r.stdout + r.stderr).splitlines() if "checkbvh" in x][-1:] or [(r.stdout + r.stderr)[-200:]]
+    c.verdict("-checkbvh holds a deforming mesh in a moving group", r.returncode == 0 and "PASS" in line[0],
+              line[0][:90])
 
     # --- keyed handles: vertex keys ---
     keys = [(0, 0.0, 0), (0, 0.4, 0), (0, 0.2, 0.3)]
@@ -311,8 +371,6 @@ def main():
 
     # --- the motion trees hold a deforming mesh at every time (-checkbvh: BVH against a linear walk,
     # every other ray at a random time) ---
-    wave = ("deform falloff { handle { at 0 0 0  radius 0.8  motion { key { to 0 -0.5 0 } key { to 0.3 0 0.2 } "
-            "key { to 0 0.6 0 } } } }")
     p = c.scene(mesh(grid, wave))
     r = subprocess.run([c.exe, "-in", p, "-checkbvh"], capture_output=True, text=True, encoding="utf-8",
                        errors="replace")
@@ -365,6 +423,16 @@ def main():
         off = np.abs(d - st).mean() / st.mean()
         c.verdict("a blurred slide by an rbf handle matches a group's", rel < 0.03 and off > 3 * rel,
                   "mean diff %.3f, from the still render %.3f" % (rel, off))
+    back = 'deform rbf { handle { at 0 0 0  motion { key { to 0.2 0 0 } key { to 0 0 0 } key { to -0.2 0 0 } } } }'
+    sb = render('group { motion { key { translate -0.2 0 0 } key { translate 0 0 0 } key { translate 0.2 0 0 } }  %s }'
+                % mesh(grid, back), "blur_back", 256)
+    if sb is None or ss is None:
+        c.verdict("a group's slide undone by a deformer renders still", False)
+    else:
+        b, still = read_pfm(sb + ".pfm"), read_pfm(ss + ".pfm")
+        rel = np.abs(b - still).mean() / still.mean()
+        c.verdict("a group's slide undone by a deformer renders as the still mesh", rel < 0.01,
+                  "mean diff %.4f of the still render" % rel)
     pattern_tests(c, grid, render)
     mirror_test(c, grid, render)
 
@@ -392,9 +460,6 @@ def main():
              mesh(grid, "deform falloff { handle { at 0 0 0  radius 0.5  motion { key { to 0 0 0 } key { to 0 1 0 } key { to 0 0 0 } } }"
                         "  handle { at 0.5 0 0  radius 0.5  motion { key { to 0 0 0 } key { to 0 1 0 } } } }"),
              "same number of keys"),
-            ("a deforming mesh in a moving group",
-             "group { motion { key { translate 0 0 0 } key { translate 1 0 0 } }  %s }"
-             % mesh(grid, "deform falloff { handle { at 0 0 0  to 0 1 0  radius 0.5 } }"), "moving group"),
             ("a handle's target it cannot read",
              mesh(grid, "deform falloff { handle { at 0 0 0  to 0 x 0  radius 0.5 } }"), "three numbers"),
             ("an elastic handle that holds nothing",
@@ -430,8 +495,8 @@ def pattern_tests(c, grid, render):
     # the instant's face), so it renders as that side's constant. (Read on the surface itself, the
     # point fell either side of 0.3 from hit to hit: 7.5 % of the image off.)
     def sheet(mat):
-        return ('mesh "s" { file "%s"  material %s  translate 0 0.3 0  deform falloff { handle { at 0.9 0.3 -0.9  '
-                'radius 0.6  motion { key { to 0.9 0.0 -0.9 } key { to 0.9 0.3 -0.9 } key { to 0.9 0.6 -0.9 } } } } }'
+        return ('mesh "s" { file "%s"  material %s  translate 0 0.3 0  deform falloff { handle { at 0.9 0 -0.9  '
+                'radius 0.6  motion { key { to 0.9 -0.3 -0.9 } key { to 0.9 0 -0.9 } key { to 0.9 0.3 -0.9 } } } } }'
                 % (grid, mat))
     mats = NL.join(['pattern "step" { expr "0.1 + 0.8 * step(0.0, y - 0.3)" }',
                     'material "p" { type diffuse  reflect pattern:step }',
@@ -448,9 +513,9 @@ def pattern_tests(c, grid, render):
         f.write(NL.join(["v -0.5 0 -0.5", "v 0.5 0 -0.5", "v 0.5 0 0.5", "v -0.5 0 0.5",
                          "vn 0 0.70710678 0.70710678", "f 1//1 3//1 2//1", "f 1//1 4//1 3//1"]) + NL)
 
-    def turned(p, deg):        # about the x axis, then lifted with the plate (translate 0 0.4 0)
+    def turned(p, deg):        # about the x axis, in the plate's own coordinates
         a = math.radians(deg)
-        return (p[0], p[1] * math.cos(a) - p[2] * math.sin(a) + 0.4, p[1] * math.sin(a) + p[2] * math.cos(a))
+        return (p[0], p[1] * math.cos(a) - p[2] * math.sin(a), p[1] * math.sin(a) + p[2] * math.cos(a))
     hs = " ".join("handle { at %r %r %r  motion { %s } }"
                   % (turned(p, 0) + (" ".join("key { to %r %r %r }" % turned(p, d) for d in (-90, 0, 90)),))
                   for p in ((-0.5, 0, -0.5), (0.5, 0, -0.5), (0.5, 0, 0.5), (-0.5, 0, 0.5)))

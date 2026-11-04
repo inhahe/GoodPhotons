@@ -1720,18 +1720,28 @@ struct Scene {
     }
     // A deforming triangle's corners at fraction u of the motion interval, into p[0..2], and with
     // `n` its corner normals: blended between the keys about u, a blended normal renormalised
-    // (zero, where a corner has none authored, stays zero for Tri::finalize's face normal).
-    void deformedCorners(const Tri& t, double u, Vec3* p, Vec3* n = nullptr) const {
+    // (zero, where a corner has none authored, stays zero for Tri::finalize's face normal), then
+    // -- when it is in a moving group, and `carried` -- carried by its group's motion set at u:
+    // the keys are the shape in the group as it stands at the instant.
+    void deformedCorners(const Tri& t, double u, Vec3* p, Vec3* n = nullptr, bool carried = true) const {
         int i; double f;
         motionBracket(t.vkeyCount, u, i, f);
         const Vec3* a = &vertexKeys[(size_t)t.vkeys + (size_t)i * 6];
         for (int c = 0; c < 3; ++c) p[c] = a[c] + (a[c + 6] - a[c]) * f;
+        if (n)
+            for (int c = 0; c < 3; ++c) {
+                const Vec3 m = a[c + 3] + (a[c + 9] - a[c + 3]) * f;
+                const double l2 = dot(m, m);
+                n[c] = l2 > 1e-24 ? m * (1.0 / std::sqrt(l2)) : Vec3{0, 0, 0};
+            }
+        if (!carried || t.motion < 0) return;
+        const bool now = u == g_motionU;
+        const Affine D = now ? motionNow(t.motion) : motionAt(t.motion, u);
+        for (int c = 0; c < 3; ++c) p[c] = D.apply(p[c]);
         if (!n) return;
-        for (int c = 0; c < 3; ++c) {
-            const Vec3 m = a[c + 3] + (a[c + 9] - a[c + 3]) * f;
-            const double l2 = dot(m, m);
-            n[c] = l2 > 1e-24 ? m * (1.0 / std::sqrt(l2)) : Vec3{0, 0, 0};
-        }
+        const Affine inv = now ? motionNowInverse(t.motion) : D.inverse();
+        for (int c = 0; c < 3; ++c)
+            if (dot(n[c], n[c]) > 0.0) n[c] = normalize(inv.applyDirTranspose(n[c]));   // the inverse transpose
     }
     // A deforming triangle at the path's time: tested by its blended corners alone first, and
     // rebuilt in full -- normals blended too -- only when the ray meets it nearer than the hit.
@@ -3202,6 +3212,14 @@ struct Scene {
             Aabb b = mirrorPartBoxes[(size_t)(mp.keyBoxes + i)];
             b.expand(mirrorPartBoxes[(size_t)(mp.keyBoxes + i + 1)].lo);
             b.expand(mirrorPartBoxes[(size_t)(mp.keyBoxes + i + 1)].hi);
+            if (t.motion >= 0) {          // in a moving group: the box carried by its motion now
+                const Affine D = motionNow(t.motion);
+                Aabb m;
+                for (int k = 0; k < 8; ++k)
+                    m.expand(D.apply(Vec3{(k & 1) ? b.hi.x : b.lo.x, (k & 2) ? b.hi.y : b.lo.y,
+                                          (k & 4) ? b.hi.z : b.lo.z}));
+                b = m;
+            }
             const double pad = 1e-6 * (1.0 + length(b.hi - b.lo));
             tmp.lo = b.lo - Vec3{pad, pad, pad};
             tmp.hi = b.hi + Vec3{pad, pad, pad};
@@ -3328,14 +3346,16 @@ struct Scene {
         // four times across each stretch between keys: corners moving linearly between keys
         // leave four points out of a plane by a cubic in the time, which is then zero
         // throughout, so the group stays in one plane at every time.
+        // (A group's motion is affine at each time, so it keeps a plane a plane: the keys alone
+        // decide, and only faces moved by one group may share a part.)
         const auto inPlaneThroughout = [&](const Tri& ref, const Tri& t) {
-            if (t.vkeyCount != ref.vkeyCount) return false;
+            if (t.vkeyCount != ref.vkeyCount || t.motion != ref.motion) return false;
             for (int k = 0; k + 1 < ref.vkeyCount; ++k)
                 for (int j = 0; j < 4; ++j) {
                     const double u = (k + j / 3.0) / (double)(ref.vkeyCount - 1);
                     Vec3 a[3], b[3];
-                    deformedCorners(ref, u, a);
-                    deformedCorners(t, u, b);
+                    deformedCorners(ref, u, a, nullptr, /*carried*/false);
+                    deformedCorners(t, u, b, nullptr, /*carried*/false);
                     const Vec3 f = cross(a[1] - a[0], a[2] - a[0]);
                     const double l = length(f);
                     if (!(l > 0.0)) return false;
@@ -3701,12 +3721,15 @@ struct Scene {
         return primMotion(g) >= 0 || (g < (int)tris.size() && tris[(size_t)g].vkeys >= 0);
     }
     // A deforming triangle's box over the stretch [ua, ub] of the interval: its corners at both
-    // ends and at every key between (it moves linearly between keys).
-    Aabb deformBox(const Tri& t, double ua, double ub) const {
+    // ends and at every key between (it moves linearly between keys), in its group as it stands at
+    // the instant. In a moving group, `window` is the set's transforms bounding it over the stretch
+    // (its blends at the ends and its keys between): at a time it is a blend of them applied to a
+    // point of this box, so the box carried by each holds it (as an instance's box is carried).
+    Aabb deformBox(const Tri& t, double ua, double ub, const std::vector<Affine>* window = nullptr) const {
         Aabb b;
         Vec3 p[3];
         for (double u : {ua, ub}) {
-            deformedCorners(t, u, p);
+            deformedCorners(t, u, p, nullptr, /*carried*/false);
             for (const Vec3& v : p) b.expand(v);
         }
         for (int k = 1; k + 1 < t.vkeyCount; ++k) {
@@ -3714,7 +3737,13 @@ struct Scene {
             if (tk > ua && tk < ub)
                 for (int c = 0; c < 3; ++c) b.expand(vertexKeys[(size_t)t.vkeys + (size_t)k * 6 + (size_t)c]);
         }
-        return b;
+        if (!window) return b;
+        Aabb moved;
+        for (const Affine& D : *window)
+            for (int c = 0; c < 8; ++c)
+                moved.expand(D.apply(Vec3{(c & 1) ? b.hi.x : b.lo.x, (c & 2) ? b.hi.y : b.lo.y,
+                                          (c & 4) ? b.hi.z : b.lo.z}));
+        return moved;
     }
     // Global primitive `g`'s motion set, or -1.
     int primMotion(int g) const {
@@ -3823,7 +3852,12 @@ struct Scene {
                 Aabb still, sweep;
                 still.expand(t.v0); still.expand(t.v1); still.expand(t.v2);
                 if (t.vkeys >= 0) {
-                    sweep = deformBox(t, 0.0, 1.0);
+                    std::vector<Affine> all;
+                    if (t.motion >= 0) {
+                        const MotionKeys& mk = motionSets[(size_t)t.motion];
+                        all.assign(motionXf.begin() + mk.first, motionXf.begin() + mk.first + mk.keys);
+                    }
+                    sweep = deformBox(t, 0.0, 1.0, t.motion >= 0 ? &all : nullptr);
                 } else {
                     const MotionKeys& mk = motionSets[(size_t)t.motion];
                     for (int k = 0; k < mk.keys; ++k) {
@@ -3874,7 +3908,7 @@ struct Scene {
                 const Tri& t = tris[(size_t)i];
                 if (t.motion < 0 && t.vkeys < 0) continue;
                 Aabb b;
-                if (t.vkeys >= 0) b = deformBox(t, ua, ub);
+                if (t.vkeys >= 0) b = deformBox(t, ua, ub, t.motion >= 0 ? &windows[(size_t)t.motion] : nullptr);
                 else
                     for (const Affine& D : windows[(size_t)t.motion]) {
                         b.expand(D.apply(t.v0)); b.expand(D.apply(t.v1)); b.expand(D.apply(t.v2));

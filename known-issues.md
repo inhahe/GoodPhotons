@@ -91,9 +91,6 @@ for UTF-8 (`u8path`, `u8string`); or read argv as UTF-16 (`wmain`) and keep path
 
 Each is refused or warned at load, never rendered wrong:
 
-- **Inside a moving `group`** it is refused ("move it with its handles' keys instead"). Proper
-  fix: compose the group's motion into each vertex key at load (the group's transform at the
-  key's time applied to the deformed key), so the triangle needs vertex keys only.
 - **A glowing mesh** keeps its instant's shape at every time, with a warning: its light sampler
   (`addMeshLight`'s area CDF) is the instant's, and `emit_orient` reverses windings after the
   deformers run. Proper fix: sample a deforming emitter at the path's time (rebuild the chosen

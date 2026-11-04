@@ -6139,11 +6139,15 @@ private:
 
     // ---- deformers (ROADMAP 11 stage E) ----
     // A mesh's `deform falloff|rbf|elastic { ... handle { at  to  radius } ... }` blocks, applied in
-    // order to the triangles it just added (from `triStart`), in scene coordinates. A handle's `to`
-    // may be keyed -- `motion { key { to x y z } ... }`, spread evenly over the motion interval --
-    // and then every deformer is evaluated at every key on the same rest mesh: the triangles keep
-    // the instant's shape (which must be a key) and get the others as vertex keys (Tri::vkeys).
-    bool applyDeformers(const Block& b, Loaded& L, size_t triStart) {
+    // order to the triangles it just added (from `triStart`), in the mesh's own coordinates: as its
+    // file gives them, before `xf` (its translate / rotate / scale, its groups' and the unit scale,
+    // which took them to the scene). So a deformation travels with its mesh wherever it is put. A
+    // handle's `to` may be keyed -- `motion { key { to x y z } ... }`, spread evenly over the motion
+    // interval -- and then every deformer is evaluated at every key on the same rest mesh: the
+    // triangles keep the instant's shape (which must be a key) and get the others as vertex keys
+    // (Tri::vkeys), in the scene at the instant. In a moving group the group's motion set then
+    // carries those (Scene::deformedCorners).
+    bool applyDeformers(const Block& b, Loaded& L, size_t triStart, const Affine& xf) {
         struct Hd { Vec3 at; double radius = 0.0; std::vector<Vec3> to; };
         // A dynamic elastic's `dynamic { ... }` (elastic_cache.h).
         struct Dyn { bool on = false; elastic::Params P; std::string cache; long long frame = 0; };
@@ -6169,8 +6173,8 @@ private:
                 Hd h;
                 Vec3 v;
                 if (!vec3Of(hb, "at", v)) { fail("deform: a handle needs `at x y z`"); return false; }
-                h.at = P(v);
-                h.radius = Len(dblOf(hb, "radius", 0.0));
+                h.at = v;                                   // the mesh's own coordinates, as `xf` maps
+                h.radius = dblOf(hb, "radius", 0.0);
                 if (d.kind == "falloff" && !(h.radius > 0.0)) {
                     fail("deform falloff: a handle needs a `radius` above 0 -- how far its pull reaches");
                     return false;
@@ -6180,7 +6184,7 @@ private:
                         if (ks.key != "key" || !ks.val.block) { fail("deform: only `key { to x y z }` belongs in a handle's motion"); return false; }
                         ks.used = true;
                         if (!vec3Of(*ks.val.block, "to", v)) { fail("deform: a handle's key needs `to x y z`"); return false; }
-                        h.to.push_back(P(v));
+                        h.to.push_back(v);
                     }
                     if (h.to.size() < 2) { fail("deform: give a handle's motion at least two keys"); return false; }
                     // Keys that all agree move nothing: a still handle, so a still mesh stays still.
@@ -6193,7 +6197,7 @@ private:
                         fail("deform: a handle's `to` needs three numbers, x y z");
                         return false;
                     }
-                    h.to.push_back(find(hb, "to") ? P(v) : h.at);
+                    h.to.push_back(find(hb, "to") ? v : h.at);
                 }
                 d.hs.push_back(h);
             }
@@ -6243,10 +6247,6 @@ private:
         if (stack.empty()) return true;
         Scene& S = L.scene;
         const size_t triEnd = S.tris.size();
-        if (motionChain_.moving()) {
-            fail("mesh: a deforming mesh in a moving group -- move it with its handles' keys instead");
-            return false;
-        }
         // The keys: every keyed handle has the same count, spread evenly over the interval.
         int K = 1;
         for (const Dk& d : stack)
@@ -6301,6 +6301,16 @@ private:
                 }
         }
         std::vector<std::array<int, 3>> tris(corner);
+        // The deformers work in the mesh's own coordinates (`own`); each vertex's move there is
+        // taken back to the scene by xf's linear part, so a vertex that does not move keeps its
+        // scene position exactly.
+        if (!(std::fabs(xf.det()) > 1e-300)) {
+            fail("mesh: a deforming mesh's transform is singular (a scale of zero)");
+            return false;
+        }
+        const Affine toOwn = xf.inverse();
+        std::vector<Vec3> own(rest.size());
+        for (size_t i = 0; i < rest.size(); ++i) own[i] = toOwn.apply(rest[i]);
         // A dynamic elastic is simulated through the shot rather than solved at each key, so its
         // rest is the mesh as loaded: it comes first. Its keys come from its cache record --
         // or, baking, from the simulation that record continues.
@@ -6312,13 +6322,13 @@ private:
                 return false;
             }
         if (stack[0].dyn.on && !dynamicElastic(stack[0].hs.size(), [&](size_t i) -> const Hd& { return stack[0].hs[i]; },
-                                               stack[0].dyn.P, stack[0].dyn.cache, stack[0].dyn.frame, rest, tris, K,
+                                               stack[0].dyn.P, stack[0].dyn.cache, stack[0].dyn.frame, own, tris, K,
                                                S, dynPos))
             return false;
         // The stack at key k: every deformer in order, each on the last one's output.
         std::vector<std::vector<Vec3>> keyPos((size_t)K);
         for (int k = 0; k < K; ++k) {
-            std::vector<Vec3> p = rest;
+            std::vector<Vec3> p = own;
             for (const Dk& d : stack) {
                 if (d.dyn.on) { p = dynPos[(size_t)k]; continue; }
                 std::vector<deform::Handle> hs;
@@ -6341,7 +6351,7 @@ private:
                         fail("deform rbf: kernel biharmonic, triharmonic, gaussian or multiquadric"); return false;
                     }
                     std::string err;
-                    if (!deform::rbf(p, hs, ker, Len(dblOf(*d.blk, "eps", 1.0)), err)) { fail("deform rbf: " + err); return false; }
+                    if (!deform::rbf(p, hs, ker, dblOf(*d.blk, "eps", 1.0), err)) { fail("deform rbf: " + err); return false; }
                 } else {
                     // Elastic: each handle holds the vertices within its radius, carried by its move;
                     // the rest follows as rigidly as it can.
@@ -6369,6 +6379,7 @@ private:
                     p = std::move(x);
                 }
             }
+            for (size_t i = 0; i < p.size(); ++i) p[i] = rest[i] + xf.applyDir(p[i] - own[i]);
             keyPos[(size_t)k] = std::move(p);
         }
         // Vertex normals (area-weighted) of the rest mesh and of each key's, to turn the corners'
@@ -6668,7 +6679,7 @@ private:
                 }
             }
         }
-        if (!applyDeformers(b, L, triStart)) return false;
+        if (!applyDeformers(b, L, triStart, xf)) return false;
         // Record the object as a named mesh group (for -check-watertight): the range of
         // world triangles this block just appended. Unnamed blocks get a synthesized
         // "mesh#N" label so the report can still point at them.

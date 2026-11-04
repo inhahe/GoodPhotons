@@ -196,8 +196,8 @@ exactly. `Elastic(dynamic=Dynamics(...))` gives the surface inertia, so it lags,
 settles. That is a simulation, so `render_range` (and so `loom.shot` / `ftrace -shot`) first runs
 `ftrace -bake-elastic` from the shot's first frame to the last it renders (a frame continues the
 one before it; records already simulated from exactly their scenes are kept), then renders the
-frames from the cache it wrote beside them. A handle's `at` is in scene coordinates, the mesh's
-transform applied.
+frames from the cache it wrote beside them. A handle's `at` is in the mesh's own coordinates,
+as its file gives them, so a `DeformedMesh` transformed or grouped (moving too) keeps its bend.
 
 ### Shots
 

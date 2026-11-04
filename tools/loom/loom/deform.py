@@ -10,9 +10,10 @@ blurs the deformation exactly; loom animates the handles. ::
                  Handle((2, 0, 0), to=vec(2, 0, 0) + tip, radius=0.15)]),
     ], material="rubber", name="bar"))
 
-A handle sits at ``at`` on the rest mesh, in scene coordinates (the mesh's own transform
-applied), and is moved to ``to`` (a tuple or a VecSignal; omitted, it holds still). With motion
-keys (``Scene.emit(motion=...)``) a moving handle gets one ``to`` per key.
+A handle sits at ``at`` on the rest mesh, in the mesh's own coordinates (as its file gives
+them, before any transform or group: a bend travels with the mesh), and is moved to ``to`` (a
+tuple or a VecSignal; omitted, it holds still). With motion keys (``Scene.emit(motion=...)``) a
+moving handle gets one ``to`` per key.
 
 * :class:`Falloff` moves the vertices within each handle's ``radius`` by its move, weighted by a
   ``profile`` (smooth, linear, gaussian).

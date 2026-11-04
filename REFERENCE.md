@@ -3640,7 +3640,10 @@ dead on a column of pixel centres let the background through. See `known-issues.
 
 A `mesh` may carry `deform falloff`, `deform rbf` and `deform elastic` blocks (since 0.413.0;
 grammar in [FTSL.md §8.4.1](FTSL.md)). Each moves the vertices it loaded by **handles**: points
-on the rest mesh moved to targets. They apply in order, each to the last one's output.
+on the rest mesh moved to targets, in the mesh's own coordinates (as its file gives them, before
+its transform and its groups; since 0.417.0), so a bend travels with the mesh. They apply in
+order, each to the last one's output. A deforming mesh may sit in any group, a moving one too: it
+rides the group's motion, deformed.
 
 - **`falloff`** moves the vertices within each handle's `radius` by its move, faded by a
   profile of the distance. It's local, cheap and predictable, but it stretches.

@@ -10235,8 +10235,20 @@ coordinates and before the mesh light, the watertight record and the fog bound r
   substep), since it rings on after its handles stop. It must be the stack's first deformer (its
   rest is the mesh as loaded). `-bake-elastic` passes a stop on to the frame being baked through
   its `<pid>.stop` sentinel and exits as a stopped render does.
-- **Limits kept on purpose.** A deforming mesh in a moving group is refused (its keys would have
-  to compose two motions per vertex); a glowing one keeps its instant's shape, warned, since a
+- **The mesh's own coordinates** (0.417.0). `applyDeformers` takes the mesh's composed
+  transform `xf` (its own, its groups' at the instant, the unit scale): the welded vertices are
+  taken into the mesh's own coordinates by xf's inverse, the deformers (and the dynamic elastic's
+  simulation and cache key) work there, and each vertex's move is taken back by xf's linear part
+  -- so a vertex that does not move keeps its scene position exactly.
+- **Riding a moving group.** The vertex keys are the shape in the group as it stands at the
+  instant, and the group's `moveChildren` gives the triangles its motion set as it does any
+  child's: at a time the blended corners are carried by the set's transform then
+  (`Scene::deformedCorners`; `carried = false` for the keys alone). The motion trees box a
+  stretch as the keys' box carried by each transform of the set's window there (a blend of them
+  applied to a point of the box); a mirror part's box at a time is its keys' box carried by the
+  set; parts group only faces of one set (an affine map keeps a plane a plane, so the keys alone
+  decide coplanarity).
+- **Limits kept on purpose.** A glowing deforming mesh keeps its instant's shape, warned, since a
   light moves only rigidly and `emit_orient` may yet turn its corners; fur and settle refuse to
   follow it (`movingNames_`).
 - **loom** (`tools/loom/loom/deform.py`): `DeformedMesh(file, [Falloff | Rbf | Elastic])` with

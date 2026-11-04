@@ -767,6 +767,6 @@ handles on a flat sheet are well posed. The dynamic elastic (ARAP with inertia, 
 is baked through a shot by `-bake-elastic`, frame by frame into a cache each frame reads. A
 resumed bake writes byte for byte what one bake writes. loom's `DeformedMesh` / `Falloff` / `Rbf`
 / `Elastic(dynamic=Dynamics(…))` animate the handles, and its shot runner bakes before it
-renders. `tools/check_deform.py`. Not yet: the deformers on the GPU (a blurred deforming mesh
-renders on the CPU, as every blur does), a deforming mesh inside a moving group, and a glowing
-one blurring.
+renders. `tools/check_deform.py`. Since 0.417.0 handles are in the mesh's own coordinates, and a
+deforming mesh rides any group, a moving one too. Not yet: the deformers on the GPU (a blurred
+deforming mesh renders on the CPU, as every blur does), and a glowing one blurring.
