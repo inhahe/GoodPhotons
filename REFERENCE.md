@@ -2096,6 +2096,12 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
   `-radcache` is switched off under a blur (a cell would mix every time in the shutter). The sky
   a forward mode sees directly blurs behind a mover as mode `R`'s does. Several mode `A` or `B`
   cameras rendered together share one forward flight per shutter.
+- **The camera can move too** (0.408.0): `camera { … motion { key { eye … look_at … up …
+  fov_y … } key { … } } }` keys its pose over the `motion_interval` as a group's keys its
+  transform, and a `camera_path`, `camera_orbit` or `camera_curve` with a shutter blurs each
+  frame along the path, from a smooth curve through its frames' poses (no `motion_interval`
+  needed). Without a shutter a keyed camera renders exactly the still camera at its keys'
+  instant. Loom writes a moving `Camera`'s keys with the scene's (`render_range(motion=…)`).
 - **What can move so far:** spheres (as a mesh where the keys stretch one), quads, triangles and
   meshes. An isosurface, a curve, a `mesh_instance`, an emissive mesh and a
   light in a moving group stay at the instant, with a warning. A procedural pattern on a moving

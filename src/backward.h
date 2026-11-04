@@ -3958,7 +3958,7 @@ struct BackwardRenderer {
     // checkpointed count). Each (pixel, absolute sample) pair seeds its own RNG
     // stream via seedUnit(), so the rendered realization is independent of the
     // chunk split, the row banding, and the thread count.
-    void renderRows(const Scene& scene, const Camera& cam, Film& film,
+    void renderRows(const Scene& scene, const Camera& cam0, Film& film,
                     int y0, int y1, long long spp, unsigned long long sampleBase) const {
         const int C = heroC;
         // Media admit the bundle when every medium's extinction is flat in λ
@@ -3966,7 +3966,7 @@ struct BackwardRenderer {
         // (radianceHeroLoop). A chromatic extinction would need per-wavelength free flights,
         // so such a scene stays on one wavelength per path.
         const bool useHero = (C > 1) && scene.mediaKeepBundle() &&
-                             !grin::sceneHasGrin(scene) && !cam.hasLens();
+                             !grin::sceneHasGrin(scene) && !cam0.hasLens();
         const uint64_t nPix = (uint64_t)film.resX * (uint64_t)film.resY;
         // Per-sample SPD table (see SpdCache): nBase×C (nBase×1 on the scalar path),
         // allocated once per renderRows call (i.e. per thread) and refilled for every
@@ -4005,8 +4005,12 @@ struct BackwardRenderer {
         // Motion blur (ROADMAP 11): each camera path sees the scene at one time in the shutter,
         // set for everything the path traces -- its bounces, shadow rays, probes -- through
         // g_motionU. The time comes off its own lattice and its own salted stream, so the main
-        // rng draws exactly what it draws without blur.
-        const bool blur = cam.seesMotion(scene);
+        // rng draws exactly what it draws without blur. A moving camera is posed at that time too
+        // (camT, this call's own copy).
+        const bool blur = cam0.seesMotion(scene);
+        const bool camMoves = blur && cam0.moves();
+        Camera camT;
+        if (camMoves) camT = cam0;
         for (int py = y0; py < y1; ++py) {
             for (int px = 0; px < film.resX; ++px) {
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)film.resX + (uint64_t)px;
@@ -4018,9 +4022,10 @@ struct BackwardRenderer {
                 }
                 for (long long s = 0; s < spp; ++s) {
                     const uint64_t sIdx = sampleBase + (uint64_t)s;   // absolute sample index
-                    const MotionTimeScope pathTime(
-                        blur ? scene.motionU(cam.shutterTime(shutterU(sIdx, tPhase)))
-                             : -1.0);
+                    const double tFrames = blur ? cam0.shutterTime(shutterU(sIdx, tPhase)) : 0.0;
+                    const MotionTimeScope pathTime(blur ? scene.motionU(tFrames) : -1.0);
+                    if (camMoves) cam0.poseAt(tFrames, camT);
+                    const Camera& cam = camMoves ? camT : cam0;
                     Pcg32 rng;
                     seedUnit(rng, sIdx * nPix + pixIdx, 0xD1B54A32D192ED03ULL);
                     if (useHero) {

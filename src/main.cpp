@@ -15425,6 +15425,7 @@ static void addEnvBackgroundSampled(Film& film, const Scene& scene, const Camera
         const LensSystem* lens = nullptr;
         Vec3 eye, w, u;
         double shutterOpen = 0.0, shutterClose = 0.0;
+        const CameraMotion* motion = nullptr;
         uint64_t generation = 0;
         int rx = 0, ry = 0;
         long long K = 0;                 // samples per pixel in `sum`
@@ -15443,7 +15444,7 @@ static void addEnvBackgroundSampled(Film& film, const Scene& scene, const Camera
                c.w.x == cam.w.x && c.w.y == cam.w.y && c.w.z == cam.w.z &&
                c.u.x == cam.u.x && c.u.y == cam.u.y && c.u.z == cam.u.z &&
                c.shutterOpen == cam.shutterOpen && c.shutterClose == cam.shutterClose &&
-               c.generation == scene.generation;
+               c.motion == cam.motion.get() && c.generation == scene.generation;
     };
     Cache* hit = nullptr;
     for (Cache& c : slots) if (same(c)) { hit = &c; break; }
@@ -15454,6 +15455,7 @@ static void addEnvBackgroundSampled(Film& film, const Scene& scene, const Camera
         hit->lens = cam.lens.get(); hit->rx = rx; hit->ry = ry;
         hit->eye = cam.eye; hit->w = cam.w; hit->u = cam.u;
         hit->shutterOpen = cam.shutterOpen; hit->shutterClose = cam.shutterClose;
+        hit->motion = cam.motion.get();
         hit->generation = scene.generation;
         hit->K = 0;
         hit->sum.assign((size_t)rx * (size_t)ry, Vec3{0, 0, 0});
@@ -15466,7 +15468,10 @@ static void addEnvBackgroundSampled(Film& film, const Scene& scene, const Camera
         const long long k0 = cache.K, k1 = want;
         const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
         std::vector<Vec3> add((size_t)rx * (size_t)ry, Vec3{0, 0, 0});
+        const bool camMoves = blur && cam.moves();
         const bool done = ft::parallelFor((size_t)ry, 1, [&](size_t py) {
+            Camera camT;                     // a moving camera, posed at each sample's time
+            if (camMoves) camT = cam;
             for (int px = 0; px < rx; ++px) {
                 const uint64_t pix = (uint64_t)py * (uint64_t)rx + (uint64_t)px;
                 Pcg32 rot;
@@ -15485,9 +15490,11 @@ static void addEnvBackgroundSampled(Film& film, const Scene& scene, const Camera
                         tU -= std::floor(tU);
                     }
                     const MotionTimeScope at(blur ? scene.motionU(cam.shutterTime(tU)) : -1.0);
+                    if (camMoves) cam.poseAt(cam.shutterTime(tU), camT);
+                    const Camera& cp = camMoves ? camT : cam;
                     if (!lensed) {
                         const double jx = rng.uniform(), jy = rng.uniform();
-                        const Ray r = cam.genRay(px, (int)py, jx, jy);
+                        const Ray r = cp.genRay(px, (int)py, jx, jy);
                         const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false,
                                                        /*skipCamHidden=*/true);
                         if (h.valid) continue;
@@ -15503,8 +15510,8 @@ static void addEnvBackgroundSampled(Film& film, const Scene& scene, const Camera
                     u -= std::floor(u);
                     const double lambda = kLo + (kHi - kLo) * u;
                     Ray r; double wLens = 0.0;
-                    if (!cam.genLensRay(px, (int)py, rng.uniform(), rng.uniform(), rng.uniform(),
-                                        rng.uniform(), lambda, r, wLens) || !(wLens > 0.0)) continue;
+                    if (!cp.genLensRay(px, (int)py, rng.uniform(), rng.uniform(), rng.uniform(),
+                                       rng.uniform(), lambda, r, wLens) || !(wLens > 0.0)) continue;
                     const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false,
                                                    /*skipCamHidden=*/true);
                     if (h.valid) continue;
@@ -15596,13 +15603,18 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
         const Camera* camPtr = useCamera ? cam : nullptr;
         Film* camFilm = useCamera ? &films[tid] : nullptr;
         // Motion blur (ROADMAP 11): each photon, and its splat to the camera, at one time in the
-        // shutter, drawn off its own stream.
+        // shutter, drawn off its own stream -- a moving camera posed there on this thread's copy.
         const bool blur = cam && cam->seesMotion(scene);
+        const bool camMoves = blur && camPtr && cam->moves();
+        Camera camT;
+        if (camMoves) camT = *cam;
         for (long long i = lo; i < hi; ++i) {
             seedUnit(rng, seedBase + (uint64_t)i, 0x9E3779B97F4A7C15ULL);
-            const MotionTimeScope at(blur ? scene.motionU(cam->shutterTime(
-                unitTime(seedBase + (uint64_t)i, 0x3C6EF372FE94F82BULL))) : -1.0);
-            r.tracePhoton(scene, camPtr, sensorFilm, camFilm, rng, reports[tid]);
+            const double tFrames = blur ? cam->shutterTime(
+                unitTime(seedBase + (uint64_t)i, 0x3C6EF372FE94F82BULL)) : 0.0;
+            const MotionTimeScope at(blur ? scene.motionU(tFrames) : -1.0);
+            if (camMoves) cam->poseAt(tFrames, camT);
+            r.tracePhoton(scene, camMoves ? &camT : camPtr, sensorFilm, camFilm, rng, reports[tid]);
         }
     };
     std::vector<std::thread> pool;
@@ -15661,15 +15673,25 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
         long long lo = N * tid / nThreads, hi = N * (tid + 1) / nThreads;
         std::vector<CamTarget> targets(nc);
         for (int c = 0; c < nc; ++c) { targets[c].cam = &cams[c]; targets[c].film = &films[tid][c]; }
+        std::vector<Camera> posed;   // this thread's copies of the moving cameras, posed per photon
         // One time per photon for every camera: a caller hands this only cameras that share one
         // shutter or that see nothing move (run's `joinFlight`), so a photon is drawn a time
         // off cams[0]'s shutter when any of them sees motion.
-        bool blur = false;
+        bool blur = false, anyMoves = false;
         for (int c = 0; c < nc; ++c) blur = blur || cams[c].seesMotion(scene);
+        if (blur) {
+            posed = cams;
+            for (int c = 0; c < nc; ++c)
+                if (cams[c].moves()) { targets[c].cam = &posed[(size_t)c]; anyMoves = true; }
+        }
         for (long long i = lo; i < hi; ++i) {
             seedUnit(rng, seedBase + (uint64_t)i, 0x9E3779B97F4A7C15ULL);
-            const MotionTimeScope at(blur ? scene.motionU(cams[0].shutterTime(
-                unitTime(seedBase + (uint64_t)i, 0x3C6EF372FE94F82BULL))) : -1.0);
+            const double tFrames = blur ? cams[0].shutterTime(
+                unitTime(seedBase + (uint64_t)i, 0x3C6EF372FE94F82BULL)) : 0.0;
+            const MotionTimeScope at(blur ? scene.motionU(tFrames) : -1.0);
+            if (anyMoves)
+                for (int c = 0; c < nc; ++c)
+                    if (cams[c].moves()) cams[c].poseAt(tFrames, posed[(size_t)c]);
             r.tracePhoton(scene, targets.data(), nc, /*sensorFilm*/nullptr, rng, reports[tid]);
         }
     };
@@ -17094,10 +17116,10 @@ static uint64_t checkpointGuard(const Scene& scene, char mode, int res, int resY
     mix((uint64_t)(unsigned char)mode);
     mix((uint64_t)(unsigned)res);
     mix((uint64_t)(unsigned)resY);
-    // Only a moving scene mixes these, so every static scene keeps the guard its sidecars hold:
-    // every key of every motion set, and the shutter of a camera that sees the motion.
+    // Only motion mixes these, so every still render keeps the guard its sidecars hold: every key
+    // of every motion set, the shutter of a camera that sees motion, and a moving camera's keys.
+    auto mixD = [&](double d) { uint64_t v; std::memcpy(&v, &d, sizeof v); mix(v); };
     if (scene.hasMotion()) {
-        auto mixD = [&](double d) { uint64_t v; std::memcpy(&v, &d, sizeof v); mix(v); };
         mix((uint64_t)scene.motionXf.size());
         for (size_t k = 0; k < scene.motionXf.size(); ++k) {
             const Affine& D = scene.motionXf[k];
@@ -17105,7 +17127,16 @@ static uint64_t checkpointGuard(const Scene& scene, char mode, int res, int resY
             mixD(D.t.x); mixD(D.t.y); mixD(D.t.z);
             mixD(scene.motionT[k]);
         }
-        if (cam && cam->seesMotion(scene)) { mixD(cam->shutterOpen); mixD(cam->shutterClose); }
+    }
+    if (cam && cam->seesMotion(scene)) {
+        mixD(cam->shutterOpen); mixD(cam->shutterClose);
+        if (cam->moves()) {
+            mixD(cam->motion->a); mixD(cam->motion->b);
+            for (const CameraPose& p : cam->motion->keys)
+                for (double d : {p.eye.x, p.eye.y, p.eye.z, p.look.x, p.look.y, p.look.z,
+                                 p.up.x, p.up.y, p.up.z, p.fovY})
+                    mixD(d);
+        }
     }
     return h;
 }
@@ -23870,6 +23901,7 @@ static int run(int argc, char** argv) {
             c.setProjection(cs->projection);   // rectilinear (default) or a fisheye/panoramic lens
             c.apertureR = cs->aperture;
             c.shutterOpen = cs->shutterOpen; c.shutterClose = cs->shutterClose;
+            c.motion = cs->motion;
             if (cs->filmDist_m > 0.0) { c.filmDist = cs->filmDist_m; c.lensF = cs->lensF_m; }  // physical-optics (lens/fstop): film at image distance, real focal
             else                      { c.setFocus(cs->focus); }                                // legacy unit-film camera
             char cmode = effModeCam(*cs);
@@ -24181,6 +24213,7 @@ static int run(int argc, char** argv) {
                 RenderCam L = rc, R = rc;
                 L.cam.eye = rc.cam.eye - rc.cam.u * (b * 0.5); L.cam.frustumShiftX = +S; L.expGroup = grp;
                 R.cam.eye = rc.cam.eye + rc.cam.u * (b * 0.5); R.cam.frustumShiftX = -S; R.expGroup = grp;
+                L.cam.eyeShiftU = -b * 0.5; R.cam.eyeShiftU = b * 0.5;   // kept by Camera::poseAt
                 std::string tag = rc.name.empty() ? std::string("stereo") : rc.name;
                 L.name = tag + "__eyeL"; R.name = tag + "__eyeR";
                 pairIdx.push_back({expanded.size(), expanded.size() + 1});
@@ -24324,7 +24357,10 @@ static int run(int argc, char** argv) {
             m.mode = (ci < renderedOf.size() && renderedOf[ci])
                          ? renderedOf[ci]
                          : renderedMode(scene, effModeCam(cs), cs.projection, cs.lens != nullptr);
-            if (std::strchr("RDABC", m.mode)) { m.cam.shutterOpen = cs.shutterOpen; m.cam.shutterClose = cs.shutterClose; }
+            if (std::strchr("RDABC", m.mode)) {
+                m.cam.shutterOpen = cs.shutterOpen; m.cam.shutterClose = cs.shutterClose;
+                m.cam.motion = cs.motion;
+            }
             if (cs.lens) { m.cam.lens = cs.lens; m.cam.prepareLensPupil(); }
             m.name = cs.name;
             return m;

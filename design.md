@@ -10020,6 +10020,18 @@ sees the instant, exactly as a static scene with those transforms would show it.
   time per photon for all its cameras, so `run` builds one flight per shutter (`joinFlight`;
   cameras that see nothing move share regardless), and a flight in which any camera sees
   motion flies on the CPU.
+- **The camera moves by keys of its own** (0.408.0): `Camera::motion` (a `CameraMotion`: poses
+  — eye, look-at point, up, fov — at keys spread evenly over [a, b] frames, blended linearly by
+  `CameraMotion::at`). Its eye, axes and fields of view stay its pose at the instant, which is
+  what everything outside a path's own time reads; a path at a time poses a per-thread copy
+  (`Camera::poseAt`, a `lookAt` at the blended pose plus a stereo eye's `eyeShiftU`) and hands
+  that copy to whatever it calls — mode R's ray, BDPT's subpaths and connections, a photon's
+  splats, the guide pass, the forward sky. `seesMotion` is true for a moving camera even in a
+  still scene. The loader fills it from a camera's `motion { key { … } }` over the scene's
+  interval (`readCameraMotion`; the instant's pose is the keys' there), or, for every frame of
+  a camera path with a shutter, from a uniform Catmull-Rom through the frames' poses over the
+  frame's own shutter (`keyPathFrames`; a frame is a frame apart in time, so frame i at time t
+  is the path at i + t). The resume guard mixes the keys.
 - **Where blur is not yet carried, the shutter is closed**, so no estimator mixes times: the
   camera loop in `main.cpp` closes it for modes M, S, U and J (which share photons or merges
   across paths) and P (whose per-pixel classification is made at the instant, and whose

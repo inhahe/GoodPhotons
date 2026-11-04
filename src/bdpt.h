@@ -4289,7 +4289,7 @@ struct BdptRenderer {
     // (pixel, absolute sample) seeds its own stream via seedUnit(), so the
     // realization is chunk-split / banding / thread-count independent (see
     // BackwardRenderer::renderRows).
-    void renderRows(const Scene& scene, const Camera& cam, Film& camFilm, Film& splatFilm,
+    void renderRows(const Scene& scene, const Camera& cam0, Film& camFilm, Film& splatFilm,
                     int y0, int y1, long long spp, unsigned long long sampleBase) const {
         Renderer mats; mats.diffraction = diffraction;
         std::vector<Vertex> eye, light;
@@ -4316,7 +4316,7 @@ struct BdptRenderer {
         // mode-J render with media stays there until they are taught the bundle.
         const bool useHero = (C > 1) && scene.mediaKeepBundle() &&
                              (scene.media.empty() || beams == nullptr) &&
-                             !grin::sceneHasGrin(scene) && !cam.hasLens();
+                             !grin::sceneHasGrin(scene) && !cam0.hasLens();
         // Only pay for escape tracking when the scene actually has a distant sun.
         const bool hasSun = scene.sunCount > 0;
         // ...and for the camera walk's segments, which the fires' s = 0 points lie on, when there
@@ -4355,7 +4355,11 @@ struct BdptRenderer {
         // wavelength (JSpec, beamgather.h). Only the merges read it; the walk draws nothing extra,
         // so the paths are the ones it always took. FTRACE_JSPEC=0 turns it off for A/B runs.
         const bool jSpecOn = (mergeOn || surfOn) && jSpecEnabled();
-        const bool blurD = cam.seesMotion(scene) && !mergeOn && !surfOn;
+        const bool blurD = cam0.seesMotion(scene) && !mergeOn && !surfOn;
+        // A moving camera is posed at each sample's time on this call's own copy.
+        const bool camMoves = blurD && cam0.moves();
+        Camera camT;
+        if (camMoves) camT = cam0;
         if (jSpecOn) jsw.trSpec = anyMediumSigmaTChromatic(scene);
         // FTRACE_J_HALF (diagnostic): 1 = connections only, 2 = merges only. Deliberately
         // does NOT touch the merge constants — both halves keep the SAME MIS weights they
@@ -4396,8 +4400,11 @@ struct BdptRenderer {
                     // Motion blur (ROADMAP 11): the eye and light subpaths of this sample, and
                     // every connection between them, at one time in the shutter. Mode J's merges
                     // reach light vertices of other samples, so it renders the instant.
-                    const MotionTimeScope pathTime(
-                        blurD ? scene.motionU(cam.shutterTime(unitTime(unit, 0x3C6EF372FE94F82BULL))) : -1.0);
+                    const double tFrames =
+                        blurD ? cam0.shutterTime(unitTime(unit, 0x3C6EF372FE94F82BULL)) : 0.0;
+                    const MotionTimeScope pathTime(blurD ? scene.motionU(tFrames) : -1.0);
+                    if (camMoves) cam0.poseAt(tFrames, camT);
+                    const Camera& cam = camMoves ? camT : cam0;
                     HeroBundle hb;
                     // The wavelengths come from the illuminant's density, the fires' emission
                     // included (Scene::camSampler; without a fire it is emitSampler), so a fire

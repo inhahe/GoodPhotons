@@ -165,8 +165,10 @@ pngs = render_range(scene, frames=96, name="myshot", loop=False, motion=Motion((
 `Sphere` / `Beads` sphere that moves within the interval becomes a `motion { key { … } … }`
 block sampled at the `Motion`'s times around the frame — a rotation unwrapped so it turns the
 short way between keys — and the scene gets ftrace's `motion_interval`. Whatever holds still is
-written exactly as without it. The camera's `shutter` then picks the span a frame blurs over;
-ftrace blurs it in mode R (and W) on the CPU (ftrace's `REFERENCE.md`, *Motion blur*). Swept,
+written exactly as without it. A `Camera` whose eye, look-at point, up or fov moves gets keys
+of its own the same way, so its own motion blurs too. The camera's `shutter` then picks the
+span a frame blurs over; ftrace blurs it in modes R, W, D, A, B and C on the CPU (ftrace's
+`REFERENCE.md`, *Motion blur*). Swept,
 isosurface and strand meshes are written at the frame's instant: their vertices move, which
 needs per-vertex motion keys (ftrace ROADMAP 11 stage E). The instant must fall on a key —
 `Motion` refuses a count that misses it — so a frame rendered without a shutter is the same

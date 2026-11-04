@@ -1354,8 +1354,10 @@ class Camera(Element):
                  name: str = "cam", shutter: Optional[Tuple[float, float]] = None) -> None:
         """``shutter=(open, close)``, in frames around the frame's instant, holds the shutter
         open over that span: what moves in it blurs, given the scene's motion keys
-        (``Scene.emit(motion=...)``) and a mode that blurs (R). ``(-0.25, 0.25)`` is a
-        180-degree shutter. The camera itself is placed at the instant."""
+        (``Scene.emit(motion=...)``) and a mode that blurs (R, W, D, A, B, C).
+        ``(-0.25, 0.25)`` is a 180-degree shutter. With motion keys, a camera whose eye,
+        look_at, up or fov_y moves over the interval is written with keys of its own, so its
+        own motion blurs too."""
         if shutter is not None:
             shutter = (float(shutter[0]), float(shutter[1]))
             if shutter[1] < shutter[0]:
@@ -1382,10 +1384,20 @@ class Camera(Element):
         fov = num(self.fov_y, ctx.clock, ctx.cache)
         sh = (f'    shutter_open {fmt(self.shutter[0])}  shutter_close {fmt(self.shutter[1])}\n'
               if self.shutter is not None else '')
+        # With motion keys, a camera that moves over the interval gets a key per motion key, so
+        # a shutter blurs its own motion as well as the scene's.
+        mo = ''
+        if ctx.motion is not None:
+            keys = ['key { eye %s  look_at %s  up %s  fov_y %s }'
+                    % (fmt3(vec3(self.eye, c, k)), fmt3(vec3(self.look_at, c, k)),
+                       fmt3(vec3(self.up, c, k)), fmt(num(self.fov_y, c, k)))
+                    for c, k in ctx.key_clocks()]
+            if any(t != keys[0] for t in keys):
+                mo = '    motion {\n' + ''.join(f'        {t}\n' for t in keys) + '    }\n'
         return (f'{self.name} = camera {{\n'
                 f'    eye {fmt3(e)}  look_at {fmt3(la)}  up {fmt3(up)}  fov_y {fmt(fov)}\n'
                 f'    mode {self.mode}\n'
-                f'{sh}'
+                f'{sh}{mo}'
                 f'    film {{ res {self.res[0]} {self.res[1]} }}\n'
                 f'}}')
 

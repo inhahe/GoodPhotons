@@ -34,6 +34,13 @@ cube whose keys scale and shear it together. It requires:
     dark ball sweeping across it.
   * Under a shutter, `-device gpu` says mode R stays on the CPU, and mode M says it renders the
     instant.
+  * The camera's own motion, in the box held still: a camera with `motion` keys and no shutter
+    renders byte for byte the still camera at its keys' instant (CPU, and GPU); with the shutter,
+    the mean of 32 renders from its poses through it (mode R; modes D and B agree with mode R),
+    and asked for the GPU it says it stays on the CPU. The middle frame of a straight, even
+    `camera_path` with a shutter blurs as the mean of the eyes half a frame either side. The
+    loader refuses camera keys without a `motion_interval`, a single key, and a key's `fov_y` on
+    a camera whose `lens` sets its view.
   * The loader refuses, with a message naming why: a `motion` block with no `motion_interval`; one
     with a single key; `translate` beside `motion`; fur on, or a medium bounded by, a moving
     object; an interval that excludes the instant; `shutter_close` before `shutter_open`. It keeps
@@ -594,8 +601,124 @@ def main():
     verdict("mode M under a shutter says it renders the instant",
             rc == 0 and "renders the frame's instant" in log, log.strip()[-300:] if rc else "")
 
+    camera_tests(exe, out, verdict, devices)
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
+
+
+def agree(a, b, rel_tol=0.03):
+    """Whether two renders, each a pair of seeds' luminance, agree over 8x8 blocks (within 5
+    standard errors or rel_tol), and the worst block."""
+    ma, mb = blocks((a[0] + a[1]) / 2), blocks((b[0] + b[1]) / 2)
+    err = np.hypot(block_err(a[0], a[1]), block_err(b[0], b[1]))
+    z = np.abs(ma - mb) / np.maximum(err, 1e-30)
+    rel = np.abs(ma - mb) / np.maximum(np.abs(mb), 1e-3 * np.abs(mb).max())
+    bad = (z > 5.0) & (rel > rel_tol)
+    return not bad.any(), "worst block z %.1f rel %.3f; %d blocks out" % (z.max(), rel.max(), bad.sum())
+
+
+# A camera that moves over the motion interval: its two keys, at -0.5 and 0.5 frames.
+CAM_KEYS = [dict(eye=(-0.4, 1.0, 4.2), look=(0.0, 0.5, 0.0), fov=38.0),
+            dict(eye=(0.4, 1.0, 4.2), look=(0.2, 0.5, 0.0), fov=44.0)]
+
+
+def cam_pose(u):
+    """The keyed camera's pose at u in [0, 1] of the interval, blended as the loader blends."""
+    a, b = CAM_KEYS
+    lerp = lambda x, y: x + (y - x) * u
+    return dict(eye=tuple(lerp(x, y) for x, y in zip(a["eye"], b["eye"])),
+                look=tuple(lerp(x, y) for x, y in zip(a["look"], b["look"])), fov=lerp(a["fov"], b["fov"]))
+
+
+def with_camera(text, cam):
+    """`text` (a scene() file) with its camera "c" replaced by `cam`."""
+    lines = [cam if l.startswith('camera "c"') else l for l in text.splitlines()]
+    return NL.join(lines) + NL
+
+
+def still_camera(p):
+    return ('camera "c" { eye %s  look_at %s  up 0 1 0  fov_y %r  film { res %d %d } }'
+            % (v3(p["eye"]), v3(p["look"]), p["fov"], W, H))
+
+
+def keyed_camera(shutter=None, extra=""):
+    sh = "shutter_open %r  shutter_close %r  " % shutter if shutter else ""
+    keys = "  ".join("key { eye %s  look_at %s  fov_y %r }" % (v3(k["eye"]), v3(k["look"]), k["fov"])
+                     for k in CAM_KEYS)
+    return ('camera "c" { up 0 1 0  %s%smotion { %s }  film { res %d %d } }' % (sh, extra, keys, W, H))
+
+
+def camera_tests(exe, out, verdict, devices):
+    """The camera's own motion: keys on a still camera, and a camera path's frames."""
+    still = scene(u=0.5)               # the box with its groups held still
+    # --- no shutter: a keyed camera is the still camera at its keys' instant, byte for byte ---
+    keyed, inst = os.path.join(out, "cam_keyed.ftsl"), os.path.join(out, "cam_instant.ftsl")
+    write(keyed, with_camera(still, keyed_camera()))
+    write(inst, with_camera(still, still_camera(cam_pose(0.5))))
+    for dev, gpu in devices:
+        args = ["-mode", "R", "-device", dev, "-spp", "16"]
+        _, raw_k, _ = render(exe, out, keyed, "cam_keyed_" + dev, args, want_gpu=gpu)
+        _, raw_i, _ = render(exe, out, inst, "cam_instant_" + dev, args, want_gpu=gpu)
+        verdict("no shutter: a keyed camera = the still one at its instant (%s)" % dev.upper(),
+                raw_k == raw_i)
+
+    # --- blurred: the mean of the camera's poses through the shutter ---
+    moving = os.path.join(out, "cam_moving.ftsl")
+    write(moving, with_camera(still, keyed_camera((-0.5, 0.5))))
+    args = ["-mode", "R", "-device", "cpu", "-spp", str(SPP)]
+    blur = [lum(render(exe, out, moving, "cam_blur_R_s%d" % s, args, seed=s)[0]) for s in (1, 2)]
+    mean = [np.zeros((H, W)), np.zeros((H, W))]
+    p = os.path.join(out, "cam_t.ftsl")
+    for j in range(TIMES):
+        write(p, with_camera(still, still_camera(cam_pose((j + 0.5) / TIMES))))
+        for s in (1, 2):
+            mean[s - 1] += lum(render(exe, out, p, "cam_t_s%d" % s, ["-mode", "R", "-device", "cpu",
+                                      "-spp", str(SPP_T)], seed=100 * j + s)[0]) / TIMES
+    good, detail = agree(blur, mean)
+    verdict("a moving camera blurs as the mean of its poses (mode R)", good, detail)
+    for mode, margs in (("D", ["-spp", "256"]), ("B", ["-n", "40000000"])):
+        bm = [lum(render(exe, out, moving, "cam_blur_%s_s%d" % (mode, s),
+                         ["-mode", mode, "-device", "cpu"] + margs, seed=s)[0]) for s in (1, 2)]
+        good, detail = agree(bm, blur, 0.05)
+        verdict("... mode %s = mode R" % mode, good, detail)
+    if len(devices) > 1:
+        rc, log = run([exe, "-in", moving, "-mode", "R", "-device", "gpu", "-spp", "1", "-no-meter",
+                       "-o", os.path.join(out, "cam_gate.png")])
+        verdict("... and asked for the GPU, says it stays on the CPU",
+                rc == 0 and "renders on the CPU so far" in log, log.strip()[-300:] if rc else "")
+
+    # --- a camera path's frame blurs along the path: frames a frame apart on a straight line at
+    # an even pace, so the middle frame's shutter sweeps its eye linearly half a frame each way ---
+    path = ('camera_path "fly" { look_at 0 0.5 0  up 0 1 0  fov_y 40  frames 5  '
+            'shutter_open -0.5  shutter_close 0.5  film { res %d %d }' % (W, H) + NL +
+            "key 0 -0.8 1.0 4.2" + NL + "key 1 0.8 1.0 4.2" + NL + "}")
+    fly = os.path.join(out, "cam_path.ftsl")
+    write(fly, with_camera(still, path))
+    fb = [lum(render(exe, out, fly, "cam_path_s%d" % s, ["-mode", "R", "-device", "cpu", "-spp",
+                                                          str(SPP), "-camera", "fly2"], seed=s)[0])
+          for s in (1, 2)]
+    fm = [np.zeros((H, W)), np.zeros((H, W))]
+    for j in range(TIMES):
+        x = -0.2 + 0.4 * (j + 0.5) / TIMES
+        write(p, with_camera(still, still_camera(dict(eye=(x, 1.0, 4.2), look=(0.0, 0.5, 0.0), fov=40.0))))
+        for s in (1, 2):
+            fm[s - 1] += lum(render(exe, out, p, "cam_t_s%d" % s, ["-mode", "R", "-device", "cpu",
+                                    "-spp", str(SPP_T)], seed=100 * j + s)[0]) / TIMES
+    good, detail = agree(fb, fm)
+    verdict("a camera path's frame blurs along its path", good, detail)
+
+    # --- what the loader refuses ---
+    for name, sc, cam, phrase in (
+            ("refuses camera keys without a motion_interval", "", keyed_camera(), "motion_interval"),
+            ("refuses a camera with one key", "motion_interval -0.5 0.5",
+             'camera "c" { eye 0 1 3  look_at 0 0 0  motion { key { eye 0 1 4 } } }', "two `key`"),
+            ("refuses a key's fov_y on a camera its lens sets", "motion_interval -0.5 0.5",
+             keyed_camera(extra="lens 50  "), "cannot zoom")):
+        p = os.path.join(out, "refuse.ftsl")
+        write(p, NL.join(["scene { units meters  %s }" % sc, 'material "w" { type diffuse reflect 0.5 }',
+                          LIGHT, "sphere { center 0 0 0  radius 0.1  material w }", cam]) + NL)
+        rc, log = run([exe, "-in", p, "-parseonly"])
+        verdict(name, rc != 0 and phrase in log, "" if rc != 0 and phrase in log else log.strip()[-300:])
 
 
 if __name__ == "__main__":

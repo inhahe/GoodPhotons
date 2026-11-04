@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <memory>
+#include <vector>
 #include "geometry.h"
 #include "scene_film.h"
 #include "lens.h"
@@ -24,6 +25,29 @@
 //   ORTHOGRAPHIC  r = sin(theta)       (hemispherical, 180 deg max)
 enum CameraProjection {
     CAM_RECTILINEAR = 0, CAM_EQUIDISTANT, CAM_EQUISOLID, CAM_STEREOGRAPHIC, CAM_ORTHOGRAPHIC
+};
+
+// Where a camera stands and looks at one time: what Camera::lookAt takes (ROADMAP 11).
+struct CameraPose { Vec3 eye, look, up; double fovY = 40.0; };
+// A moving camera's poses: `keys` at times spread evenly over [a, b] frames (relative to the
+// frame's instant), each of eye, look-at point, up and fov_y blended linearly between neighbours
+// and held before a and after b. One key holds the camera at that pose through any shutter.
+struct CameraMotion {
+    double a = 0.0, b = 0.0;
+    std::vector<CameraPose> keys;
+    // The pose at `frames`.
+    CameraPose at(double frames) const {
+        const int n = (int)keys.size();
+        if (n < 2 || !(b > a)) return keys[0];
+        double s = (frames - a) / (b - a) * (double)(n - 1);
+        s = s < 0.0 ? 0.0 : (s > (double)(n - 1) ? (double)(n - 1) : s);
+        const int i = std::min((int)s, n - 2);
+        const double f = s - (double)i;
+        const CameraPose& A = keys[(size_t)i];
+        const CameraPose& B = keys[(size_t)i + 1];
+        return CameraPose{A.eye + (B.eye - A.eye) * f, A.look + (B.look - A.look) * f,
+                          A.up + (B.up - A.up) * f, A.fovY + (B.fovY - A.fovY) * f};
+    }
 };
 
 // r(theta): image radius for a ray at angle theta from the optical axis (focal = 1).
@@ -101,10 +125,25 @@ struct Camera {
     bool timed() const { return shutterOpen != 0.0 || shutterClose != 0.0; }
     // The time, in frames, a fraction s in [0, 1) of the way through the shutter.
     double shutterTime(double s) const { return shutterOpen + (shutterClose - shutterOpen) * s; }
-    // Whether this camera sees `scene` at times other than the instant: the one test every
-    // estimator, device gate and cache gate asks before tracing a path at a time of its own.
+    // The camera's own motion keys, or null for a camera that stands still. Its eye, u, v, w and
+    // fields of view are its pose at the frame's instant; a path at another time asks poseAt.
+    std::shared_ptr<const CameraMotion> motion;
+    // A stereo eye's offset along u from the pose's eye (frustumShiftX's partner), so each eye
+    // of a moving camera keeps its place beside it.
+    double eyeShiftU = 0.0;
+    bool moves() const { return motion && !motion->keys.empty(); }
+    // Whether this camera sees `scene` at times other than the instant -- the scene moves, or the
+    // camera does: the one test every estimator, device gate and cache gate asks before tracing a
+    // path at a time of its own.
     template <class SceneT> bool seesMotion(const SceneT& scene) const {
-        return timed() && scene.hasMotion();
+        return timed() && (scene.hasMotion() || moves());
+    }
+    // This camera at `frames` (relative to the frame's instant): `out`, a copy of this camera,
+    // takes the pose there -- eye, axes and fields of view -- and keeps everything else.
+    void poseAt(double frames, Camera& out) const {
+        const CameraPose p = motion->at(frames);
+        out.lookAt(p.eye, p.look, p.up, p.fovY, film.resX, film.resY);
+        if (eyeShiftU != 0.0) out.eye = out.eye + out.u * eyeShiftU;
     }
 
     // Optional physical multi-element lens (the "mesh-lens" camera). When set, the

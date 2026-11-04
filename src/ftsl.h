@@ -780,6 +780,10 @@ struct CamSpec {
     // default, both 0) is no blur: the frame's instant. Unrelated to `film { shutter }`, which
     // stays an exposure factor.
     double shutterOpen = 0.0, shutterClose = 0.0;
+    // The camera's own motion (ROADMAP 11): a still camera's `motion { key { ... } }`, or, for a
+    // frame of a camera path with a shutter, the path's poses about the frame (keyPathFrames).
+    // Null when the camera stands still; eye/look/up/fov above are its pose at the instant.
+    std::shared_ptr<const CameraMotion> motion;
 
     // Exposure-lock across a `camera_path` (Phase 3a intermediate win): frames of a
     // path that authored `exposure_lock` share ONE auto-exposure anchor, so a dolly/
@@ -8818,6 +8822,45 @@ private:
     }
 
     // ---- camera ----
+    // A camera's `motion { key { eye ... look_at ... up ... fov_y ... } ... }`: its pose at keys
+    // spread evenly over the scene's motion_interval (ROADMAP 11), each blended linearly to the
+    // next. What a key leaves out is the camera's own statement. The camera's own pose becomes the
+    // keys' at the frame's instant; `keyFov` says which keys gave a fov_y of their own.
+    bool readCameraMotion(const Block& b, Loaded& L, CamSpec& cs,
+                          std::shared_ptr<CameraMotion>& out, std::vector<char>& keyFov) {
+        const Stmt* mo = find(b, "motion");
+        if (!mo) return true;
+        const std::string who = "camera '" + cs.name + "': ";
+        if (!mo->val.block) { fail(who + "`motion` takes a block of `key { ... }` blocks"); return false; }
+        if (!(L.scene.motionB > L.scene.motionA)) {
+            fail(who + "a `motion` block needs the scene's `motion_interval a b` (scene { ... })");
+            return false;
+        }
+        auto m = std::make_shared<CameraMotion>();
+        m->a = L.scene.motionA; m->b = L.scene.motionB;
+        for (const auto& ks : mo->val.block->stmts) {
+            if (ks.key != "key" || !ks.val.block) {
+                fail(who + "only `key { ... }` blocks belong in `motion`");
+                return false;
+            }
+            ks.used = true;
+            const Block& kb = *ks.val.block;
+            CameraPose p{cs.eye, cs.look, cs.up, cs.fov};
+            Vec3 v;
+            if (vec3Of(kb, "eye", v))     p.eye = P(v);
+            if (vec3Of(kb, "look_at", v)) p.look = P(v);
+            if (vec3Of(kb, "up", v))      p.up = v;          // a direction: unscaled
+            keyFov.push_back(find(kb, "fov_y") ? 1 : 0);
+            p.fovY = dblOf(kb, "fov_y", cs.fov);
+            m->keys.push_back(p);
+        }
+        if (m->keys.size() < 2) { fail(who + "give `motion` at least two `key` blocks"); return false; }
+        const CameraPose now = m->at(0.0);
+        cs.eye = now.eye; cs.look = now.look; cs.up = now.up; cs.fov = now.fovY;
+        out = std::move(m);
+        return true;
+    }
+
     bool addCamera(const Block& b, Loaded& L) {
         CamSpec cs;
         cs.name = b.name.empty() ? ("cam" + std::to_string(L.cameras.size())) : b.name;
@@ -8826,9 +8869,26 @@ private:
         cs.fov = dblOf(b, "fov_y", 40.0);
         cs.aperture = Len(dblOf(b, "aperture", 0.02));
         cs.focus = Len(dblOf(b, "focus", 0.0));
+        std::shared_ptr<CameraMotion> motion;
+        std::vector<char> keyFov;
+        if (!readCameraMotion(b, L, cs, motion, keyFov)) return false;
+        const double fovKeyed = cs.fov;               // the keys' fov_y at the instant
         if (!readFilmExposure(b, cs)) return false;   // film{res,size/format,iso,...}, lens, fstop, zoom
         if (!readProjection(b, cs)) return false;     // projection/fisheye
         if (!readLens(b, cs)) return false;           // optional physical `lens { ... }` block
+        if (motion) {
+            // A key's fov_y zooms the view; a `lens <mm>`, `zoom` or preset that sets the view
+            // itself, or a physical lens, which has a view of its own, would contradict it.
+            const bool anyFov = std::find(keyFov.begin(), keyFov.end(), (char)1) != keyFov.end();
+            if (anyFov && (cs.fov != fovKeyed || cs.lens)) {
+                fail("camera '" + cs.name + "': a motion key's `fov_y` cannot zoom a camera whose "
+                     "view its lens sets (`lens <mm>`, `zoom`, a preset or a `lens { }` block)");
+                return false;
+            }
+            for (size_t k = 0; k < motion->keys.size(); ++k)
+                if (!keyFov[k]) motion->keys[k].fovY = cs.fov;
+            cs.motion = std::move(motion);
+        }
         std::string md = strOf(b, "mode");
         if (!md.empty()) cs.mode = normMode(md, L);
         L.cameras.push_back(cs);
@@ -8900,6 +8960,49 @@ private:
         cs.expLockSel = CamSpec::EXPLOCK_CAMERA;   // a camera name given directly (quoted or bare)
         cs.expLockCam = v0;
         return true;
+    }
+
+    // A path frame's shutter blurs along its path (ROADMAP 11): each frame from `first` on whose
+    // shutter is open gets keys at times spread over its shutter, from a uniform Catmull-Rom
+    // through the frames' own poses (a frame apart in time: frame i + t is t frames past frame
+    // i), held at the ends of an open path and wrapped round a `closed` one. Each stretch between
+    // keys is at most an eighth of a frame long; an instantaneous shutter has one key.
+    void keyPathFrames(Loaded& L, size_t first, bool closed) {
+        const long long n = (long long)(L.cameras.size() - first);
+        if (n < 2) return;
+        auto poseOf = [&](long long j) {
+            j = closed ? ((j % n) + n) % n : std::min(std::max(j, 0LL), n - 1);
+            const CamSpec& c = L.cameras[first + (size_t)j];
+            return CameraPose{c.eye, c.look, c.up, c.fov};
+        };
+        auto cr = [](double p0, double p1, double p2, double p3, double f) {
+            return 0.5 * (2.0 * p1 + (p2 - p0) * f + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * f * f +
+                          (3.0 * p1 - p0 - 3.0 * p2 + p3) * f * f * f);
+        };
+        auto crV = [&](const Vec3& a, const Vec3& b2, const Vec3& c, const Vec3& d, double f) {
+            return Vec3{cr(a.x, b2.x, c.x, d.x, f), cr(a.y, b2.y, c.y, d.y, f), cr(a.z, b2.z, c.z, d.z, f)};
+        };
+        auto poseAtFrame = [&](double x) {
+            if (!closed) x = std::min(std::max(x, 0.0), (double)(n - 1));
+            const double fl = std::floor(x);
+            const long long j = (long long)fl;
+            const double f = x - fl;
+            const CameraPose a = poseOf(j - 1), b2 = poseOf(j), c = poseOf(j + 1), d = poseOf(j + 2);
+            return CameraPose{crV(a.eye, b2.eye, c.eye, d.eye, f), crV(a.look, b2.look, c.look, d.look, f),
+                              crV(a.up, b2.up, c.up, d.up, f), cr(a.fovY, b2.fovY, c.fovY, d.fovY, f)};
+        };
+        for (long long i = 0; i < n; ++i) {
+            CamSpec& cs = L.cameras[first + (size_t)i];
+            if (cs.shutterOpen == 0.0 && cs.shutterClose == 0.0) continue;   // the instant only
+            auto m = std::make_shared<CameraMotion>();
+            m->a = cs.shutterOpen; m->b = cs.shutterClose;
+            const double span = cs.shutterClose - cs.shutterOpen;
+            const int K = span > 0.0 ? std::min(65, std::max(3, (int)std::ceil(span * 8.0) + 1)) : 1;
+            for (int k = 0; k < K; ++k)
+                m->keys.push_back(poseAtFrame((double)i + (K == 1 ? cs.shutterOpen
+                                                                : cs.shutterOpen + span * k / (K - 1))));
+            cs.motion = std::move(m);
+        }
     }
 
     bool addCameraPath(const Block& b, Loaded& L) {
@@ -8995,6 +9098,7 @@ private:
                 L.hasCamera = true;
             }
         }
+        keyPathFrames(L, (size_t)pathGroup, /*closed*/false);
         return true;
     }
 
@@ -9078,6 +9182,7 @@ private:
                 L.hasCamera = true;
             }
         }
+        keyPathFrames(L, (size_t)pathGroup, fullLoop);
         return true;
     }
 
@@ -9785,6 +9890,7 @@ private:
                 L.hasCamera = true;
             }
         }
+        keyPathFrames(L, (size_t)pathGroup, closed);
         return true;
     }
 

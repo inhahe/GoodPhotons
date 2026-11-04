@@ -3164,6 +3164,7 @@ camera "cam" {
 | `fstop <N>` | — | aperture radius = focal/2N; seats film at image distance for A/C DoF |
 | `zoom <x>` | 1 | multiplies focal length (x>1 tele/narrower) |
 | `shutter_open <t>` / `shutter_close <t>` | 0 / 0 | the shutter, in frames relative to the frame's instant: each camera path sees the scene at one time drawn evenly from `[open, close]`, so whatever moves in that span (§13.1) blurs. Equal values are an instantaneous shutter at that time: both 0 (the default) is the frame's instant, `shutter_open 0.3  shutter_close 0.3` the scene sharp 0.3 frames later. `close` before `open` is an error. A 180° shutter at 24 fps is `-0.25 0.25`. Not the film's `shutter`, which only scales exposure |
+| `motion { key { … } key { … } … }` | — | the camera's own motion (since 0.408.0): its pose at two or more keys spread evenly over the scene's `motion_interval` (§2), each `key` taking `eye`, `look_at`, `up` and `fov_y`; what a key leaves out is the camera's own statement. Between keys each blends linearly. The camera's pose at the frame's instant is the keys' there, so without a shutter it renders exactly the still camera at that pose; with one it blurs its own motion (and the scene's), in the modes that blur (§13.1). A key's `fov_y` zooms the view, so it is refused on a camera whose `lens <mm>`, `zoom`, preset or `lens { }` block sets the view |
 
 ### 14.2 `film { … }`
 
@@ -3223,6 +3224,14 @@ A path's frames render when the path is selected: `-camera <base>` (all its fram
 `-frames A B` for a range) or `-camera all`. A plain render of a scene that also has a
 still camera renders the stills and names each path it skipped (0.383.0); a scene with
 no still camera renders its paths.
+
+**A path's shutter blurs along the path** (since 0.408.0). Give a `camera_path`,
+`camera_orbit` or `camera_curve` a `shutter_open` / `shutter_close` (§14.1) and each frame
+sees the camera move over its shutter as the path moves it: frame i at time t stands where the
+path would put frame i + t, read off a smooth (Catmull-Rom) curve through the frames' own poses
+— eye, look-at point, up and fov — held at an open path's ends and wrapped round a closed one.
+So a flyby smears as a real camera's would, with no `motion_interval` needed; in a scene whose
+objects move too, both blur.
 
 ### 15.1 `camera_path` — keyframed dolly
 ```

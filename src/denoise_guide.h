@@ -249,8 +249,11 @@ inline Images render(const Scene& scene, const Camera& cam, int W, int H, int si
     // denoiser edges the image does not have. Drawn after the subpixel jitter, so a scene the
     // camera sees still draws exactly what it drew before.
     const bool timed = cam.seesMotion(scene);
+    const bool camMoves = timed && cam.moves();
     const bool ok = ft::parallelFor((size_t)H, 1, [&](size_t row) {
         const int py = (int)row;
+        Camera camT;                       // a moving camera, posed at each guide ray's time
+        if (camMoves) camT = cam;
         for (int px = 0; px < W; ++px) {
             const size_t i = (size_t)py * W + px;
             Pcg32 rng;
@@ -262,14 +265,16 @@ inline Images render(const Scene& scene, const Camera& cam, int W, int H, int si
                     const double ts = timed ? ((sy * side + sx) + rng.uniform()) / ((double)side * side)
                                             : 0.0;
                     const MotionTimeScope at(timed ? scene.motionU(cam.shutterTime(ts)) : -1.0);
+                    if (camMoves) cam.poseAt(cam.shutterTime(ts), camT);
+                    const Camera& c = camMoves ? camT : cam;
                     Ray ray;
-                    if (cam.hasLens()) {
+                    if (c.hasLens()) {
                         double w = 0.0;
-                        if (!cam.genLensRay(px, py, jx, jy, rng.uniform(), rng.uniform(),
-                                            kGuideLambda, ray, w) || !(w > 0.0))
+                        if (!c.genLensRay(px, py, jx, jy, rng.uniform(), rng.uniform(),
+                                          kGuideLambda, ray, w) || !(w > 0.0))
                             continue;            // vignetted: contributes black, as in the render
                     } else {
-                        ray = cam.genRay(px, py, jx, jy);
+                        ray = c.genRay(px, py, jx, jy);
                     }
                     traceGuide(scene, rr, ray, alb, nrm);
                 }

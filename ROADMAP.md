@@ -729,6 +729,8 @@ work either way, from each frame's saved guides.
 photon draws one time, the analytic specular connections follow their sphere or plane, shared
 multi-camera flights group cameras by shutter, and the exposure meter blurs as the render does.
 Modes M, S, U, J and P still render the instant (they share photons or merges across paths, or
-classify pixels at the instant), as does the GPU. Open: camera motion keys; moving lights,
-emissive meshes, curves, isosurfaces and instances; M/S/U/J with time carried into the light
-side; the GPU.
+classify pixels at the instant), as does the GPU. *Camera motion (0.408.0, done):* a camera's
+`motion { key { eye look_at up fov_y } }`, and every frame of a camera path with a shutter
+keyed from a Catmull-Rom through the path's frames; loom writes a moving `Camera`'s keys. Open:
+moving lights, emissive meshes, curves, isosurfaces and instances; M/S/U/J with time carried
+into the light side; the GPU.

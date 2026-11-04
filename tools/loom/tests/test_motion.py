@@ -130,8 +130,30 @@ def test_still_sphere_and_beads_are_unchanged():
     assert _emit(b, clock, Motion()) == _emit(b, clock)
 
 
-def _scene(shutter=(-0.25, 0.25)):
-    s = Scene(Camera(eye=(0, 0.5, 3), look_at=(0, 0.3, 0), res=(32, 24), shutter=shutter))
+def test_still_camera_has_no_keys():
+    cam = Camera(eye=(0, 0.5, 3), look_at=(0, 0.3, 0), shutter=(-0.25, 0.25))
+    clock = Clock.at_frame(2, 6)
+    assert _emit(cam, clock, Motion()) == _emit(cam, clock)
+    assert "motion" not in _emit(cam, clock, Motion())
+
+
+def test_moving_camera_gets_a_key_per_motion_key():
+    # x = 9 t on an open 10-frame timeline: 1 per frame, so the keys a quarter-frame apart step 0.25.
+    cam = Camera(eye=vec(TimeFn(lambda t: 9.0 * t, periodic=False), 0.5, 3.0), look_at=(0, 0.3, 0),
+                 fov_y=TimeFn(lambda t: 30.0 + 9.0 * t, periodic=False), shutter=(-0.25, 0.25))
+    txt = _emit(cam, Clock.at_frame(4, 10, loop=False), Motion((-0.5, 0.5), 5))
+    assert "motion {" in txt and txt.count("{") == txt.count("}")
+    keys = _keys(txt)
+    assert len(keys) == 5
+    assert [float(k.split()[1]) for k in keys] == pytest.approx([3.5, 3.75, 4.0, 4.25, 4.5])
+    assert [float(k.split("fov_y")[1]) for k in keys] == pytest.approx([33.5, 33.75, 34.0, 34.25, 34.5])
+    # the instant's pose is still the camera's own statement
+    assert "eye 4 0.5 3" in txt.splitlines()[1]
+
+
+def _scene(shutter=(-0.25, 0.25), cam_moves=False):
+    eye = vec(TimeFn(lambda t: 2.0 * t - 1.0, periodic=False), 0.5, 3.0) if cam_moves else (0, 0.5, 3)
+    s = Scene(Camera(eye=eye, look_at=(0, 0.3, 0), res=(32, 24), shutter=shutter))
     s.add(Material("m", "diffuse", reflect=0.7),
           Sphere(vec(TimeFn(lambda t: 2.0 * t - 1.0, periodic=False), 0.3, 0.0), 0.3, "m"),
           Group(Sphere((0, 0, 0), 0.2, "m"), translate=(0.6, 0.2, -0.4),
@@ -161,8 +183,10 @@ def _ftrace():
 
 
 @pytest.mark.skipif(_ftrace() is None, reason="needs a built ftrace.exe")
-def test_ftrace_loads_the_keyed_scene():
-    txt = _scene().emit(Clock.at_frame(5, 12, loop=False), Cache(), motion=Motion())
+@pytest.mark.parametrize("cam_moves", [False, True])
+def test_ftrace_loads_the_keyed_scene(cam_moves):
+    txt = _scene(cam_moves=cam_moves).emit(Clock.at_frame(5, 12, loop=False), Cache(), motion=Motion())
+    assert ("    motion {" in txt.split("camera {")[1].split("film")[0]) == cam_moves
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "keyed.ftsl")
         with open(p, "w", encoding="utf-8", newline="") as f:
