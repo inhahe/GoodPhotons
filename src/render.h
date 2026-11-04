@@ -596,7 +596,7 @@ struct Renderer {
                     return true;
                 dir = w;
                 if (em && em->shape == EmitterShape::Spot) {
-                    const double ct = dot(dir, scene.lightDirNow(*em, em->beamDir));   // the axis now
+                    const double ct = dot(dir, emitN);   // a spot's emitN: its axis at the photon's time
                     if (ct <= em->spotCosOuter) return false;     // outside the cone: p_u = 0
                     const double omegaOuter = 2.0 * PI * (1.0 - em->spotCosOuter);
                     spotW = spotFalloff(ct, em->spotCosInner, em->spotCosOuter)
@@ -608,7 +608,7 @@ struct Renderer {
             }
             double pu;
             if (em && em->shape == EmitterShape::Spot) {
-                const double ct = dot(dir, scene.lightDirNow(*em, em->beamDir));
+                const double ct = dot(dir, emitN);
                 pu = (ct > em->spotCosOuter) ? 1.0 / (2.0 * PI * (1.0 - em->spotCosOuter)) : 0.0;
             } else if (em && em->normalTilted) {
                 pu = scene.aimDirPdfNow(*em, dir);                // an aimed quad (Emitter::nGeom)

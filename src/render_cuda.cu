@@ -23972,7 +23972,10 @@ static float hostPassU(const Scene& scene) {
 // Bake one Camera into a POD DCamera for the given film resolution. Any device memory
 // (the realistic-lens index tables) is recorded in up.frees. Split out of the scene
 // bake so a multi-camera shared pass can bake N cameras against one uploaded scene.
-static gpu::DCamera bakeCamera(const Scene& scene, const Camera& cam, int resX, int resY, DUpload& up) {
+// `pinned`: for a pass or an epoch that takes one time, which the host has posed the camera at --
+// baked with no time of its own (pinToPass), its keys not uploaded.
+static gpu::DCamera bakeCamera(const Scene& scene, const Camera& cam, int resX, int resY, DUpload& up,
+                               bool pinned = false) {
     using namespace gpu;
     DCamera dc{};
     // Motion blur: the shutter, when the camera sees motion (Camera::seesMotion: the scene moves,
@@ -23983,7 +23986,7 @@ static gpu::DCamera bakeCamera(const Scene& scene, const Camera& cam, int resX, 
     dc.keys = nullptr; dc.nKeys = 0; dc.keyA = dc.keyB = 0.0;
     dc.eyeShiftU = cam.eyeShiftU;
     dc.lensKeyed = dc.lensPhysical = 0; dc.lensFilmHmm = 24.0;
-    if (dc.blur && cam.moves()) {
+    if (dc.blur && cam.moves() && !pinned) {
         std::vector<DCamKey> keys;
         for (const CameraPose& p : cam.motion->keys)
             keys.push_back(DCamKey{{(Real)p.eye.x, (Real)p.eye.y, (Real)p.eye.z},
@@ -24073,6 +24076,7 @@ static gpu::DCamera bakeCamera(const Scene& scene, const Camera& cam, int resX, 
             lensPupilRefused();
         }
     }
+    if (pinned) pinToPass(dc);
     return dc;
 }
 
@@ -27334,10 +27338,9 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         // camera bake it will only throw away. `stopped` is seeded false and is only ever set
         // from inside the loop, so without this the flag is invisible on the first iteration.
         if (ft::stopRequested()) { stopped = true; break; }
-        DCamera hc = bakeCamera(scene, cams[c], resX[c], resY[c], up);
         // An epoch of a moving scene: the host posed the camera at the epoch's time, which the
         // gather takes too (a camera moving over a still scene keeps its own, kGather).
-        if (up.sc.mo.passU >= 0.0f) pinToPass(hc);
+        DCamera hc = bakeCamera(scene, cams[c], resX[c], resY[c], up, up.sc.mo.passU >= 0.0f);
         const size_t npix = (size_t)resX[c] * resY[c];
         double* d_film = nullptr; CUDA_CHECK(cudaMalloc(&d_film, npix * 3 * sizeof(double)));
         double* d_hits = nullptr; CUDA_CHECK(cudaMalloc(&d_hits, npix * sizeof(double)));

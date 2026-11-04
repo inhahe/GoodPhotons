@@ -1943,15 +1943,15 @@ struct Scene {
     }
     // A sphere light's sample at the path's time (it moves), on the sphere its geometry is then
     // (movedSphere: the centre carried, the radius by the motion's mean scale): `n`, its unit
-    // normal at the instant, carried, and `y` the point of the moved sphere along it. Carrying the
-    // point itself would leave it off that sphere between keys, where a blend of two turns shrinks
-    // what it turns: a photon born there, or a shadow ray aimed at it, would meet the light's own
-    // surface.
-    void lightSpherePointNow(const Emitter& em, Vec3& y, Vec3& n) const {
+    // normal at the instant, carried, and the point of the moved sphere along it returned. The
+    // sample's own point is not carried: carried, it would leave that sphere between keys, where a
+    // blend of two turns shrinks what it turns, and a photon born there, or a shadow ray aimed at
+    // it, would meet the light's own surface.
+    Vec3 lightSpherePointNow(const Emitter& em, Vec3& n) const {
         const Affine D = motionNow(em.motion);
         bool nonUniform = false;
         n = normalize(D.applyDir(n));
-        y = D.apply(em.origin) + n * (em.radius * D.uniformScale(nonUniform));
+        return D.apply(em.origin) + n * (em.radius * D.uniformScale(nonUniform));
     }
     // A deforming mesh light's sample at the path's time: triangle `k` of its meshTris as its
     // keys have it then (deformedCorners, carried by any group motion), the point at the sample's
@@ -5358,7 +5358,7 @@ inline double emitterSamplePoint(const Scene& scene, const Emitter& em,
     if (deform && scene.deformedEmitPoint(em, mt, bary[0], bary[1], y, nOut, J)) {
         // on its triangle as it is at the path's time
     } else if (scene.lightMoves(em)) {
-        if (em.shape == EmitterShape::Sphere) scene.lightSpherePointNow(em, y, nOut);   // on its moved surface
+        if (em.shape == EmitterShape::Sphere) y = scene.lightSpherePointNow(em, nOut);   // on its moved surface
         else { y = scene.lightPointNow(em, y); nOut = scene.lightNormalNow(em, nOut); }
         J = scene.lightAreaScale(em, nOut);
     }

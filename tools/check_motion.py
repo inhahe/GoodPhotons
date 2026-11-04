@@ -54,7 +54,8 @@ cube whose keys scale and shear it together. It requires:
     stays on the CPU, and mode V says it renders the instant.
   * Modes M and J (an epoch at a time), S and U (a pass at a time) blur, agreeing with
     blurred mode R within their density estimates' bias, and follow a moving camera as mode R
-    does -- M, S, U, J and P on the GPU too; so does mode P, its backward samples split by their own path's first event -- also with
+    does -- M, S, U, J and P on the GPU too, where they (and B and D) blur moving lights (an aimed
+    panel, a spot and a ball alone) and the deforming glowing sheet as mode R on the CPU does; so does mode P, its backward samples split by their own path's first event -- also with
     fog in front of a mirror, and on a floor of a mix of a diffuse and a glossy child; and fur in
     front of a mirror renders the same under -dual-scatter as without. Mode M under
     a -noise budget blurs too, and mode J whose surface map comes back empty blurs as mode D does.
@@ -1087,6 +1088,24 @@ def main():
                         seed=s, want_gpu=True)[0]) for s in (1, 2)]
         good, detail = agree(g, c, 0.05)
         verdict("blurred mode C on the GPU = mode A on the GPU (a wide aperture)", good, detail)
+        # Lights moving, and a glowing mesh deforming, through an open shutter on the GPU against
+        # blurred mode R on the CPU: in modes B and D a time per photon or path pair, in the modes
+        # that take one a pass (U, S) or an epoch (J, M) each pass's light paths, deposits and
+        # gathers at its own time.
+        pl, pg = os.path.join(out, "gpu_lone.ftsl"), os.path.join(out, "gpu_glow.ftsl")
+        write(pl, lone_lights_scene(shutter=(-0.5, 0.5)))
+        write(pg, glow_deform_scene(gridf, shutter=(-0.5, 0.5)))
+        for nm, path in (("three lights alone", pl), ("a deforming glowing mesh", pg)):
+            rargs = ["-mode", "R", "-device", "cpu", "-spp", "512"]
+            c = [lum(render(exe, out, path, "cpu_Rl_%d" % s, rargs, seed=s)[0]) for s in (1, 2)]
+            for mode, margs, tol in (("B", ["-n", "40000000"], 0.05), ("D", ["-spp", "256"], 0.05),
+                                     ("U", ["-spp", "256"], 0.10), ("S", ["-spp", "128", "-n", "200000"], 0.15),
+                                     ("J", ["-spp", "256", "-jsurf", "-beamepochs", "64"], 0.10),
+                                     ("M", ["-spp", "128", "-n", "8000000"], 0.10)):
+                g = [lum(render(exe, out, path, "gpu_%sl_%d" % (mode, s), ["-mode", mode, "-device", "gpu"] + margs,
+                                seed=s, want_gpu=True)[0]) for s in (1, 2)]
+                good, detail = agree(g, c, tol)
+                verdict("blurred mode %s on the GPU = mode R on the CPU: %s" % (mode, nm), good, detail)
         rc, log = run([exe, "-in", multi, "-mode", "B", "-device", "gpu", "-n", "100000",
                        "-no-meter", "-o", os.path.join(out, "gate.png")])
         verdict("-device gpu with a blurred shared flight says it stays on the CPU",

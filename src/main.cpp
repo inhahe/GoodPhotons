@@ -28513,6 +28513,8 @@ static int run(int argc, char** argv) {
                 // ("stopped at N / spp"), must not re-announce the output path, and must not
                 // advance the title's frame counter past the one frame there is.
                 bool midEpoch = false;
+                // Such writes' exposure anchor, per exposure group the meter left unset (writeFrame).
+                std::map<int, double> provisionalAnchors;
                 // -oidn: the guides of the frame being gathered. The device gathers the frames in
                 // order and writes each through writeFrame, which then moves these on to the next
                 // frame -- so frame k's repaints and its write see frame k's guides. Started for
@@ -28534,11 +28536,12 @@ static int run(int argc, char** argv) {
                             std::printf("[camera] '%s' (mode M/GPU, %dx%d) -> %s\n",
                                         rc.name.c_str(), rc.res, rc.resY, op.c_str());
                         double* anchor = (rc.expGroup >= 0) ? &expAnchors[rc.expGroup] : nullptr;
-                        // A running average between epochs is exposed by the anchor, if the meter
-                        // found one, but must not set it: an unmetered group's anchor is the
-                        // finished frame's, not a few samples' at one time in the shutter.
-                        double provisional = anchor ? *anchor : 0.0;
-                        if (midEpoch && anchor) anchor = &provisional;
+                        // A running average between epochs is exposed by the group's anchor if the
+                        // meter found one, else by one the first such write sets and the later ones
+                        // keep, so the group's periodic writes hold one exposure. It must not set the
+                        // group's own: an unmetered group's anchor is the finished frame's, not a few
+                        // samples' at one time in the shutter.
+                        if (midEpoch && anchor && !(*anchor > 0.0)) anchor = &provisionalAnchors[rc.expGroup];
                         // The film is a SUM over the samples that actually landed. A frame an
                         // `ftrace -stop` interrupted holds fewer than `spp` of them, so
                         // normalising by `spp` here wrote it darkened by exactly the fraction
@@ -28759,8 +28762,11 @@ static int run(int argc, char** argv) {
                     const long long blurEpochSpp = budgeted ? 4 : std::max(1LL, spp / 64);
                     for (; !stopAll && sppAll < sppCap && !ft::stopRequested() && !budgetSpent();
                          ++lightEpoch) {
-                        RngSaltScope saltScope(lightEpoch);
+                        // The epoch's time before its salt: passTime's rotation reads the salt, and
+                        // the epoch's would turn each epoch's time by an offset of its own, so the
+                        // epochs would sample the shutter at random rather than evenly.
                         atEpochM(lightEpoch);
+                        RngSaltScope saltScope(lightEpoch);
                         // Everything the device prints about the map's SHAPE — the adaptive
                         // radius it settled on, the caustic-map population, the sub-beam /
                         // BVH summary — is a property epoch 0 already reported and the pin

@@ -7412,8 +7412,8 @@ private:
         std::vector<Aabb> blasBox;   // instanced assets' local boxes, as needed
         Aabb box;
         // A child that adds lights moves only if they all can: no sky or sun (they are not
-        // anywhere), and -- known once the keys are made, below -- rigid keys. (An aimed panel
-        // moves: its face and lean turn with it, Scene::aimCosNow and kin.)
+        // anywhere), and -- known once the keys are made, below -- keys each of them can follow.
+        // (An aimed panel moves: its face and lean turn with it, Scene::aimCosNow and kin.)
         std::vector<std::pair<PrimMark, PrimMark>> lit;   // children with lights, not yet moved
         for (const auto& [a, z] : movers) {
             if (z.emitters > a.emitters) {

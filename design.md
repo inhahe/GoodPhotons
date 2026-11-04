@@ -10336,12 +10336,13 @@ sees the instant, exactly as a static scene with those transforms would show it.
   CPU's meter does), in a group of any size. A moving scene needs epochs, each at one time: run
   routes the run's one mode-M camera there (`gpuBlurM`, no lens), and the device refresh loop
   times each epoch (`atEpochM`: the host's PassTimeScope, the camera posed on the host;
-  `renderPhotonMapSharedCuda` reads `g_passMotionU` into the scene, `hostPassU`, and pins the
-  baked camera there, `pinToPass`), a 64th of a fixed `-spp` or 4 samples under a clock,
+  `renderPhotonMapSharedCuda` reads `g_passMotionU` into the scene, `hostPassU`, and bakes the
+  camera pinned there, its keys left behind: `bakeCamera`'s `pinned`, `pinToPass`), a 64th of a fixed `-spp` or 4 samples under a clock,
   `-beamfreeze` set aside (and not costing a budgeted render the device, `budgetedGpuM`). The
   loop's epochs share one device copy of the scene (`cudaHoldScene`, `sceneHold`), and a blur's
-  write the running average on the `-interval` cadence and after the last; a write between
-  epochs never sets an exposure-locked group's anchor (`writeFrame`'s `provisional`). Several
+  epochs write the running average on the `-interval` cadence and after the last; a write between
+  epochs never sets an exposure-locked group's anchor: an unmetered group's are exposed by one
+  the first of them sets for the rest (`writeFrame`'s `provisionalAnchors`). Several
   cameras of a moving scene, a saved or loaded map, or `-preview`'s CPU driver gather on the CPU
   and say why (`mBlurApart`). The shared path prints the `[device] … -> GPU` line the other modes
   do.

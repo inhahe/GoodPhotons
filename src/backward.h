@@ -626,7 +626,7 @@ struct BackwardRenderer {
             if (coneSampled) {
                 // The sample on the ball's moved surface (lightSpherePointNow), and the connection
                 // to it. Its cone density stands: a rigid motion or a similarity keeps every angle.
-                scene.lightSpherePointNow(em, y, nLight);
+                y = scene.lightSpherePointNow(em, nLight);
                 const Vec3 toL = y - h.p;
                 dist = length(toL);
                 wi = toL / dist;
@@ -1629,7 +1629,7 @@ struct BackwardRenderer {
             if (cylVisible) effArea = 1.0 / pdfAreaCyl;
             if ((coneSampled || cylVisible) && scene.lightMoves(em)) {
                 if (coneSampled) {   // on the ball's moved surface, as emitterGeom's
-                    scene.lightSpherePointNow(em, y, nLight);
+                    y = scene.lightSpherePointNow(em, nLight);
                     const Vec3 toL = y - p;
                     dist = length(toL);
                     wi = toL / dist;
