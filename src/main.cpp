@@ -19217,6 +19217,31 @@ static void markSolidFaces(Scene& scene) {
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 }
 
+// HAZE-SUN-B: the forward modes (A, B, C) emit a sun's or a sky's light through a disc the size of
+// the scene, so of a medium with no bounds they light only the haze in the column behind that disc;
+// the backward modes (R, D, J) light all of it, out to the horizon. The domain an unbounded haze
+// has is a matter of definition (a haze without end would let no sunlight through at all), and
+// the backward modes' is the one kept: the forward modes say so, once per scene, where it applies.
+static void warnForwardUnboundedHaze(const Scene& scene, char mode) {
+    if (!(mode == 'A' || mode == 'B' || mode == 'C')) return;
+    static uint64_t saidFor = 0;
+    if (saidFor == scene.generation) return;
+    bool distant = false;
+    for (const Emitter& e : scene.emitters)
+        if (e.shape == EmitterShape::Sun || e.shape == EmitterShape::Env) { distant = true; break; }
+    if (!distant) return;
+    for (const Medium& md : scene.media) {
+        if (md.bounded || !md.attenuates()) continue;
+        saidFor = scene.generation;
+        std::printf("[mode %c] warning: a medium with no bounds, lit by the sun or the sky. This mode "
+                    "sends that light in through a disc the size of the scene, so it lights the haze "
+                    "only near the scene, and haze farther off -- toward the horizon -- renders dark "
+                    "(on a test scene, 0.15 of mode R's). Modes R, D and J light all of it. Give the "
+                    "medium `bounds` to make the modes agree (known-issues HAZE-SUN-B).\n", mode);
+        return;
+    }
+}
+
 static int runRender(const Scene& scene, const Camera& cam, char mode,
                      long long N, int res, int resY, long long spp, int nThreads,
                      const char* device, bool diffraction,
@@ -19228,6 +19253,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      double noiseTarget = 0.0, bool wavefront = false,
                      double* exposureAnchor = nullptr, bool rgbBackward = false,
                      BatchCache* batch = nullptr) {
+    warnForwardUnboundedHaze(scene, mode);
     // PER-OBJECT RENDER MODES (0.386.0): `mode D` / `mode J` on an object, group, material or
     // medium (Material::route, Medium::route). Modes D and J are one renderer -- J is D plus its
     // merges -- so a frame can switch between them path by path: each path is routed by what its
@@ -28440,6 +28466,7 @@ static int run(int argc, char** argv) {
     // one interval and `-resume` continues from the saved films. This mirrors the forward
     // A/B/C loop in runRender, generalised to N cameras riding one shared flight.
     auto runSharedGroup = [&](const std::vector<int>& idx, char groupMode) {
+        warnForwardUnboundedHaze(scene, groupMode);
         if (idx.empty() || g_stopRequested) return;
         g_windowMode = modeLabel(groupMode);   // title bar shows this shared group's mode
         const int nc = (int)idx.size();

@@ -3187,6 +3187,12 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
   changes the penumbra, not the exposure). Forward emission samples the cone then an
   entry disc of radius `R` perpendicular to the sampled direction — joint pdf
   `1/(Ω·πR²) = 1/geomWeight`, exactly analog, so **every** photon enters the scene.
+  Of a medium with no `bounds`, so, the forward modes light only the haze in the column behind
+  the disc, where the backward ones (R, D, J) light it along every camera ray out to the horizon,
+  the sun's light dimmed only by the haze inside the scene's sphere (`mediaExitDistance`). An
+  endless haze has no physical answer (it would let no sunlight through), and the backward
+  modes' is the one kept (HAZE-SUN-B, decided 2026-11-05): the forward modes print a warning
+  once per scene where a sun or sky lights such a medium (`warnForwardUnboundedHaze`).
   Backward does cone NEE and adds the direct disc view on a ray miss only when
   `specularArrival` is true — a single unbiased estimator with **no MIS weight**, since
   NEE runs at precisely the material types that then clear that flag. `Scene::sunCount`

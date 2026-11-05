@@ -82,8 +82,8 @@ Each names the section its line is in.
 
 1. ~~**MERGE-PROXIMITY** (4.2) — every photon gather (M, S, U, J) takes photons from any surface in
    its radius: a table top gathers the floor's light.~~ Done, 0.431.0.
-2. **HAZE-SUN-B** (4.2) — mode B lights an unbounded sunlit haze at 0.16 of mode R. **Waiting on
-   the user (4.1):** modes R, D and J agree, and only a choice of domain can bring B to them.
+2. ~~**HAZE-SUN-B** (4.2) — mode B lights an unbounded sunlit haze at 0.16 of mode R.~~ Decided
+   (2026-11-05): R, D and J stay, and the forward modes warn. Done, 0.434.15.
 3. ~~**VCM-SPEC** and **SPPM-SPECTRAL** (4.2) — modes U and S merge at the camera's wavelength, so
    a coloured surface seen before a merge washes out (the fix mode J got in 0.386.1, JSPEC).~~ Done:
    mode S 0.432.0, mode U 0.433.0.
@@ -139,7 +139,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **COMPOTE-NO-CAUSTIC** — under the 20° sun the gem compote's ruby bowl absorbs the light that
   made its caustic under the old 45° sun, and no cap fixes it: move the compote, change the bowl,
   or accept it?
-- [ ] **HAZE-SUN-B** — which haze does an unbounded medium under a sun hold? A forward mode starts
+- [x] **HAZE-SUN-B** — decided 2026-11-05: (b), done in 0.434.15 (`tools/check_haze_warning.py`).
+  Which haze does an unbounded medium under a sun hold? A forward mode starts
   its sun photons on the disc the scene's bounding sphere casts, so mode B lights only the haze in
   that cylinder, while modes R, D and J light it all the way out along each camera ray. On
   `scenes/_haze_sun_b_vs_r.ftsl` (0.431.0, against mode R): haze over the floor D 1.008, J 0.981,
@@ -157,7 +158,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 - [x] **MERGE-PROXIMITY** (0.431.0) — every gather keeps only the photons near its tangent plane
   (`gatherplane.h`), except on a curve; mode M's sheet lit from below read 21x, now 0.
-- [ ] **HAZE-SUN-B** — mode B lights an unbounded sunlit haze at 0.163 of mode R, its floor 0.846.
+- [x] **HAZE-SUN-B** (0.434.15) — mode B lights an unbounded sunlit haze at 0.163 of mode R, its
+  floor 0.846; the forward modes say so (the user's choice, 4.1).
 - [x] **VCM-SPEC** (0.433.0) — mode U's camera walk carries mode J's spectral carrier, and each
   merge reads it at the light vertex's wavelengths.
 - [ ] **MODEM-GPU-CORNER**, what is left — the corner was noise (0.433.2); GPU mode M reads

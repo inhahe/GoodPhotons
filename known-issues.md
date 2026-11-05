@@ -483,7 +483,14 @@ Refused at load, never rendered wrong:
   reverses the keys' corners with the triangle's. check_motion: the sheet held sharp at two times
   in every mode, against its still twin there.
 
-## OPEN (2026-11-03, 0.411.1): HAZE-SUN-B — mode B lights an unbounded sunlit haze far dimmer than mode R
+## DONE (2026-11-05, 0.434.15; opened 0.411.1): HAZE-SUN-B — mode B lights an unbounded sunlit haze far dimmer than mode R
+
+**Decided 2026-11-05** (the user, TODO 4.1): modes R, D and J keep lighting an unbounded haze out to
+the horizon, and the forward modes (A, B, C) print, once per scene, that they light it only near
+the scene -- where a sun or a sky lights a medium with no bounds that attenuates
+(`warnForwardUnboundedHaze`, main.cpp). Bounding the medium makes the modes agree.
+`tools/check_haze_warning.py` holds A, B and C to the warning, and R, a bounded haze and a light in
+the scene to none. The rest of this entry is how it stood.
 
 `scenes/_haze_sun_b_vs_r.ftsl` (a 2 m floor under a high sun in `medium { sigma_t 0.04  albedo
 0.5 }`, no bounds; 96x72): mode B's floor converges to **0.846** of mode R's, and the haze seen

@@ -5165,6 +5165,14 @@ transmittance is the *product* of the per-medium transmittances) and each scatte
 drawn from the *earliest* of the media's independent free-flights. A single-`medium`
 scene is bit-identical to before.
 
+**A medium with no `bounds` under the sun or a sky** is lit differently by the forward modes.
+Modes `R`, `D` and `J` light the haze along every camera ray out to the horizon (the sun's light
+dimmed only by the haze inside the scene's bounds). Modes `A`, `B` and `C` send the sun's and the
+sky's light in through a disc the size of the scene, so they light only the haze near the scene,
+and haze toward the horizon renders dark -- on a sunlit test haze, mode `B`'s haze reads 0.15 of
+mode `R`'s and its floor 0.9. They say so in a warning (since 0.434.15). To make every mode
+agree, give the medium `bounds`.
+
 **Bounded, heterogeneous fog (blobs).** The medium isn't limited to a single global
 haze. Add `bounds { min <x y z> max <x y z> }` to confine it to an axis-aligned box —
 or `bounds { center <x y z> radius <r> }` to confine it to a **sphere** region, i.e.
