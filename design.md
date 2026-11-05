@@ -5620,8 +5620,11 @@ as the one at fault.
   radius (one quad, a leaf) is crossed once, so the floor under it is taken for a solid's inside and
   reads bright; and a solid taller than the radius holds the probe's origin, so nothing is crossed
   and the floor under it counts, the dark halo every version before 0.431.0 had at such a base too.
-  `-gageom`'s march takes the same count per column. Sixteen faces without an answer are a miss; a
-  strand that holds no photon (below) is passed through and costs none of them, up to 48 strands.
+  `-gageom`'s march takes the same count per column, looking for crossings as high as the probe
+  does, r above the plane (0.433.7): a column near the disc's edge has a short chord, and a box top
+  beyond it would otherwise leave the floor under the box counted. Sixteen faces without an answer
+  are a miss; a strand that holds no photon (below) is passed through and costs none of them, up to
+  48 strands.
   `gatherCoverage` /
   `gatherAreaScale` in `photonmap_render.h`, device twin `dGatherCoverage` in `render_cuda.cu`.
   Each map's coverage is taken at that map's radius and scales that map's estimate alone: the

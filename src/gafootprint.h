@@ -106,6 +106,10 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
         if (!(half > 0.0)) continue;
         const Vec3 start = q - n * half;
         const double span = 2.0 * half;
+        // A face counts as area only inside the ball, but as a crossing up to r above the plane,
+        // the probe's window: near the disc's edge a box top lies beyond the column's chord and
+        // still puts the floor under it inside the box.
+        const double top = half + r;
         double t0 = eps;
         int layers = 0;
         double colArea = 0.0;
@@ -114,7 +118,7 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             Ray ray{start, n};
             Hit h = sc.closestHit(ray, t0, nullptr, /*skipHair=*/false,
                                   /*skipCamHidden=*/true);
-            if (!h.valid || h.t > span) break;
+            if (!h.valid || h.t > top) break;
             // THE FACING TEST MUST BE THE PHOTON QUERY'S, EXACTLY. That query (onGatherSurface)
             // keeps a photon when `dot(ph.n, n) >= 0.5` — SIGNED, against consistently-oriented
             // normals — and it lies in the tangent-plane band, which the test below adds —
@@ -141,7 +145,7 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             // Same-facing and in the tangent-plane band: what the photon query keeps.
             const Vec3 dh = h.p - p;
             const double off = dot(dh, n);           // signed height above the tangent plane
-            if (withinGatherBand(std::fabs(off), dot(dh, dh), std::fabs(c), slack)) {
+            if (h.t <= span && withinGatherBand(std::fabs(off), dot(dh, dh), std::fabs(c), slack)) {
                 if (c >= kGatherFacingCos) colArea += cellArea / c;
             } else if (off > 0.0) {
                 // not a face holding no photon, nor a hair strand (the probe's coin decides those)

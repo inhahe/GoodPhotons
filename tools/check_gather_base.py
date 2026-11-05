@@ -8,7 +8,12 @@ gather keeps only its own surface's photons (gatherplane.h, known-issues MERGE-P
 floor point beside the box drops the box top's, and its footprint probe must then not count the
 column over the box as floor: the probe passes the box's top face and meets its bottom face (or the
 floor inside a bottomless box) with an odd count of crossings, a miss. Counted as covered, the ring
-of floor within 5 cm of the base read 0.75 of mode R in both modes.
+of floor within 5 cm of the base read 0.75 of mode R in both modes. `-gageom 1` measures the same
+coverage from the geometry (gafootprint.h) and keeps the same rule per column; it looks for the
+crossings as high as the probe does, r above the plane, or near the disc's edge a box top lies
+beyond the column's chord and the floor under the box counts again: it must agree with the probe
+within 2 % in each ring, where until 0.433.7 mode S's read 0.969 and 0.976 of the probe's (M 0.999
+and 0.987; now M 1.012 and 1.000, S 0.998 and 1.000).
 
 The floor 0-2 cm and 2-5 cm out from the box's edge must each read within 7 % of mode R (two seeds
 apiece). Exits 0 when every case holds, 1 otherwise.
@@ -54,9 +59,17 @@ REF = ["-mode", "R", "-device", "gpu", "-spp", "512"]
 CASES = [("M_gpu", ["-mode", "M", "-device", "gpu", "-n", "8000000", "-spp", "16", "-pmradius", "0.1"]),
          ("M_cpu", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "4", "-pmradius", "0.1"]),
          ("S_gpu", ["-mode", "S", "-device", "gpu", "-spp", "32", "-pmradius", "0.1"]),
-         ("S_cpu", ["-mode", "S", "-device", "cpu", "-spp", "8", "-pmradius", "0.1"])]
+         ("S_cpu", ["-mode", "S", "-device", "cpu", "-spp", "8", "-pmradius", "0.1"]),
+         # the geometric footprint in place of the probe (host only): the same crossing rule
+         ("M_cpu_gageom", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "4", "-pmradius", "0.1",
+                           "-gageom", "1"]),
+         ("S_cpu_gageom", ["-mode", "S", "-device", "cpu", "-spp", "8", "-pmradius", "0.1", "-gageom", "1"])]
 RINGS = ((0.0, 0.02), (0.02, 0.05))
 TOL = 0.07
+# `-gageom` against the probe it stands in for, same mode and seeds, so the same photons: the two
+# coverages must agree to 2 % in each ring.
+PAIRS = (("M_cpu_gageom", "M_cpu"), ("S_cpu_gageom", "S_cpu"))
+PAIR_TOL = 0.02
 
 
 def main():
@@ -78,15 +91,23 @@ def main():
 
     R = image("R_gpu", REF, True)
     ok = True
+    got = {}
     for name, args in CASES:
         M = image(name, args, "gpu" in name)
         for lo, hi in RINGS:
             m = (dist >= lo) & (dist < hi)
-            q = M[m].mean() / R[m].mean()
+            q = got[name, lo] = M[m].mean() / R[m].mean()
             good = abs(q - 1.0) <= TOL
             ok &= good
-            print("%-6s floor %2.0f-%2.0f cm from the base: %.3f of mode R  %s" % (
+            print("%-12s floor %2.0f-%2.0f cm from the base: %.3f of mode R  %s" % (
                 name, lo * 100, hi * 100, q, "ok" if good else "FAIL"))
+    for a_, b_ in PAIRS:
+        for lo, hi in RINGS:
+            q = got[a_, lo] / got[b_, lo]
+            good = abs(q - 1.0) <= PAIR_TOL
+            ok &= good
+            print("%-12s floor %2.0f-%2.0f cm from the base: %.3f of %s's  %s" % (
+                a_, lo * 100, hi * 100, q, b_, "ok" if good else "FAIL"))
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 
