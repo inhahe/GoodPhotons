@@ -438,8 +438,9 @@ scale with the count, and every mode-M refresh rebuilds its beams at epoch 0's p
 (`BeamRadiiPin`). On the device the light side's time comes from the call itself
 (`PmRadiiPin::lightSec` for mode M; mode J's call overhead, its maps' upload and grid). A fixed
 `-spp` and `-noise` keep N. check_motion's box, `-time 20`, against 0.434.11: CPU mode M at
-`-n 8000000` 15 epochs and 57 samples -> 1361 and 5444, GPU mode M 12 and 48 -> 137 and 548; CPU
-mode J at `-n 2000000` 58 and 580 -> 286 and 2851; GPU mode J 13 and 49 -> 13 and 50 (gather-bound: its light side, the maps' upload counted in, is 0.6 s of a 1.4 s epoch, so the count stays N); each still blurred mode
+`-n 8000000` 15 epochs and 57 samples -> 1361 and 5444, GPU mode M 12 and 48 -> 137 and 548 (since
+0.434.14, which keeps the box's caustic gather at 8 neighbours or more, 73 and 289, and 47 and 188); CPU
+mode J at `-n 2000000` 58 and 580 -> 286 and 2851 (322 and 3210 since 0.434.14); GPU mode J 13 and 49 -> 13 and 50 (gather-bound: its light side, the maps' upload counted in, is 0.6 s of a 1.4 s epoch, so the count stays N); each still blurred mode
 R's (check_motion's `M under -time`, `J under -time`).
 
 Under a blur of a moving scene, modes M and J render each epoch at one time in the shutter, so

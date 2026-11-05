@@ -13904,10 +13904,17 @@ static void buildCausticMap(PhotonMap& pmC, double radius, const char* tag, doub
 // count, raise the apparent cost per photon, and spiral down to the floor. Never below the count
 // at which that fixed cost is half the light side: under it, fewer photons buy almost no time.
 // Until two distinct counts are in, the count is scaled by gather / light. `nMax` is the count
-// the user asked for, `nFloor` the least an epoch draws.
+// the user asked for, `nFloor` the least an epoch draws: a 1024th of it.
 struct EpochSizer {
     long long nMax = 0, nFloor = 1;
     double s1 = 0.0, sn = 0.0, sl = 0.0, snn = 0.0, snl = 0.0;   // the fit's sums
+    explicit EpochSizer(long long n) : nMax(n), nFloor(std::max(1LL, n / 1024)) {}
+    // A per-query gather that targets `k` neighbours at nMax photons (mode M's caustic map) is
+    // scaled to k * n / nMax in a smaller epoch; below 8 of them its radius would fall inside its
+    // nearest photon's, so the count keeps at least that many.
+    void keepNeighbours(double k) {
+        if (k > 8.0) nFloor = std::max(nFloor, (long long)std::ceil((double)nMax * 8.0 / k));
+    }
     void add(long long n, double lightSec) {
         const double x = (double)n;
         s1 += 1.0; sn += x; sl += lightSec; snn += x * x; snl += x * lightSec;
@@ -13925,6 +13932,15 @@ struct EpochSizer {
         return std::max(nFloor, (long long)want);
     }
 };
+
+// A mode-M epoch drawing `n` of the `nAll` photons asked for: the aimed pass's share of `nAimed`
+// and the caustic gather's neighbour target `kGather`, scaled with it (BLUR-EPOCH-COST).
+static long long epochShareOf(long long n, long long nAll, long long nAimed) {
+    return (n >= nAll || nAll <= 0) ? nAimed : (long long)std::llround((double)nAimed * (double)n / (double)nAll);
+}
+static double epochShareOf(long long n, long long nAll, double kGather) {
+    return (n >= nAll || nAll <= 0) ? kGather : kGather * (double)n / (double)nAll;
+}
 
 static void rebuildPhotonMapAt(PhotonMap& pm, double r) {
     if (r > 0.0) pm.build(r);
@@ -14540,10 +14556,11 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
                 unknown ? "  [some chords did not track order]" : "");
         }
     }
-    if (bm.beams.empty())
+    if (bm.beams.empty() && !quiet)
         std::fprintf(stderr, "[beams] warning: 0 beams stored — no photon crossed a "
                              "scattering medium; the volume will be invisible.\n");
-    if (pin && !(pin->radius > 0.0) && bm.radius > 0.0) {
+    // Recorded from a map that holds beams: an empty one's radius is BeamMap's default, no medium's.
+    if (pin && !(pin->radius > 0.0) && bm.radius > 0.0 && !bm.beams.empty()) {
         pin->radMed = bm.radMed;
         pin->radius = bm.radius;
     }
@@ -19158,8 +19175,8 @@ static void markSolidFaces(Scene& scene) {
         isoSolid += im.solidSide ? 1 : 0;
     }
     // The solids' world boxes (Scene::solidNear), those a footprint's segment can meet: every
-    // sphere and closed isosurface light does not pass, and each closed piece -- an asset's under
-    // each instance that places it.
+    // sphere, closed isosurface and closed piece light does not pass (a piece by one of its faces'
+    // material) -- an asset's under each instance that places it.
     const auto opaqueMat = [&](int matId) {
         return !(matId >= 0 && matId < (int)scene.mats.size() && passesLight(scene, scene.mats[(size_t)matId]));
     };
@@ -19174,6 +19191,7 @@ static void markSolidFaces(Scene& scene) {
         boxes.push_back(b);
     }
     for (const watertight::PieceBox& pb : worldPieces) {
+        if (!opaqueMat(pb.matId)) continue;
         Aabb b;
         b.expand(pb.lo);
         b.expand(pb.hi);
@@ -19182,6 +19200,7 @@ static void markSolidFaces(Scene& scene) {
     for (const MeshInstance& inst : scene.instances) {
         if (inst.blasId < 0 || inst.blasId >= (int)blasPieces.size()) continue;
         for (const watertight::PieceBox& lb : blasPieces[(size_t)inst.blasId]) {
+            if (!opaqueMat(inst.matOverride >= 0 ? inst.matOverride : lb.matId)) continue;
             Aabb b;
             for (int c = 0; c < 8; ++c)
                 b.expand(inst.toWorld.apply(Vec3((c & 1) ? lb.hi.x : lb.lo.x, (c & 2) ? lb.hi.y : lb.lo.y,
@@ -20029,6 +20048,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         surfRadiusFor(lsEpochBase) / surfRadius0);
         long long nBlurJ = 0;        // the subpaths a clock blur's epoch draws (0: Nepoch's own)
         long long lastNepochJ = 0;   // the subpaths the last light side drew
+        long long nAllJ = 0;         // the subpaths epoch 0 settled on, every refresh's ceiling
         auto buildLightSide = [&](uint64_t epoch, uint64_t saltOff = 0) {
             RngSaltScope saltScope(epoch + saltOff);
             const bool first = (epoch == 0);
@@ -20095,7 +20115,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // gather (`nBlurJ`, the epoch loop's; BLUR-EPOCH-COST). The maps divide by their own
             // nEmitted, and the merges' radii follow the epoch index, so the epochs stay one
             // estimator's realizations with more variance each.
-            const long long NepochAll = first ? N : (jbb.pathsUsed > 0 ? jbb.pathsUsed : N);
+            const long long NepochAll = first ? N : (nAllJ > 0 ? nAllJ : N);
             const long long Nepoch = (!first && nBlurJ > 0 && nBlurJ < NepochAll) ? nBlurJ : NepochAll;
             lastNepochJ = Nepoch;
             // WHAT EACH EPOCH SAYS. Epoch 0 announces how the map is being sized; epoch 1
@@ -20172,6 +20192,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                      bmap, &stageProg, jreq, &jbb,
                                      wantSurf ? &smap : nullptr);
             bmap.salt = g_rngSalt;   // this realization's salt (saltScope above), for kBeamTr0
+            // The count epoch 0 traced (its budget may have lowered N): every refresh's, recorded
+            // once -- the pass overwrites jbb.pathsUsed with whatever it traced, a sized epoch's too.
+            if (first) nAllJ = jbb.pathsUsed > 0 ? jbb.pathsUsed : Nepoch;
             const double traceSec =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
             lsTraceSec += traceSec;
@@ -20533,9 +20556,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // Under a clock blur each epoch after the first draws the subpaths its light side can
             // afford, about as long to build as its gather takes (mode M's rule, BLUR-EPOCH-COST).
             const bool sizeEpochsJ = blurEpochsJ && !nFixed && (timeBudgetSec > 0.0 || runForever);
-            EpochSizer sizerJ;
-            sizerJ.nMax = jbb.pathsUsed > 0 ? jbb.pathsUsed : N;
-            sizerJ.nFloor = std::max(1LL, sizerJ.nMax / 1024);
+            EpochSizer sizerJ(nAllJ > 0 ? nAllJ : N);
             long long nNextJ = 0;
             for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
                 double rebuildSec = 0.0;
@@ -20565,7 +20586,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     // `-jsurf` on a media-free scene the beam map is legitimately empty every
                     // epoch, and treating that as a failure would stop the render on its
                     // first refresh.
-                    if ((beamsPtr && curB->empty()) || (photonsPtr && curS->empty())) {
+                    // A sized clock epoch's few subpaths may store nothing: an empty realization
+                    // then, which the average takes like any other.
+                    if (!sizeEpochsJ && ((beamsPtr && curB->empty()) || (photonsPtr && curS->empty()))) {
                         std::fprintf(stderr, "[mode J] light-side refresh produced an empty "
                                              "%s map; stopping here with the %lld spp already "
                                              "averaged over %llu realization(s).\n",
@@ -20663,8 +20686,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 #endif
                     const double lightSec = ((epoch == 0) ? build0Sec : rebuildSec) + callSetup;
                     const double gatherSec = callSec - callSetup;
-                    if (epoch > 0 && rebuildSec > 0.0) sizerJ.add(lastNepochJ, rebuildSec + callSetup);
-                    if (lightSec > 0.0 && gatherSec > 0.0) nNextJ = sizerJ.next(lastNepochJ, lightSec, gatherSec);
+                    // Epoch 0's build holds one-time work (the budget's pilot): sized from epoch 1 on.
+                    if (epoch > 0 && rebuildSec > 0.0) {
+                        sizerJ.add(lastNepochJ, lightSec);
+                        if (gatherSec > 0.0) nNextJ = sizerJ.next(lastNepochJ, lightSec, gatherSec);
+                    }
                 }
                 if (epochSpp <= 0) break;      // produced nothing; refreshing again cannot help
                 acc.merge(f);
@@ -20838,13 +20864,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             RngSaltScope saltScope(epoch + saltOff);
             const bool first = (epoch == 0);
             const long long nE = (nEpoch > 0 && nEpoch < N) ? nEpoch : N;
-            const double share = (double)nE / (double)N;
             if (!first) { pm = PhotonMap{}; pmC = PhotonMap{}; bmap = BeamMap{}; }
             tracePhotonPass(scene, nE, nThreads, diffraction, pm, g_heroC, 0,
                             wantBeams ? &bmap : nullptr, g_beamTarget,
                             first ? &stageProg : nullptr,
-                            g_pmCaustics ? &pmC : nullptr, &aimMap,
-                            nE == N ? nAimed : (long long)std::llround((double)nAimed * share));
+                            g_pmCaustics ? &pmC : nullptr, &aimMap, epochShareOf(nE, N, nAimed));
             if (first) {
                 liveWindowPlaceholder(res, resY, "building photon map\xE2\x80\xA6");
                 radius = buildPhotonMap(pm, radius0, "mode M:");
@@ -20854,7 +20878,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 }
             } else {
                 rebuildPhotonMapAt(pm, radius);
-                rebuildCausticMapAt(pmC, radiusC, kGatherC * share);
+                rebuildCausticMapAt(pmC, radiusC, epochShareOf(nE, N, kGatherC));
             }
             // One camera, so the BVH build is amortised over exactly this frame's samples. A
             // progressive budget (-time/-noise/-forever) has no spp up front; assume a modest
@@ -20910,9 +20934,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // fixed -spp keeps the N it was given, and so does -noise, which in mode M is a sample
             // count: neither has a clock to share, and fewer photons would only add their noise.
             const bool sizeEpochs = blurEpochs && (timeBudgetSec > 0.0 || runForever);
-            EpochSizer sizer;
-            sizer.nMax = N;
-            sizer.nFloor = std::max(1LL, N / 1024);
+            EpochSizer sizer(N);
+            sizer.keepNeighbours(kGatherC);
             long long nNext = N, nUsed = N;
             if (blurEpochs) epochSaltOff = prog ? (uint64_t)prog->sampleBase : 0ull;
             for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
@@ -20937,7 +20960,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     // `sppAll` spp. Stopping is therefore the right answer, not a compromise,
                     // and the message says so rather than claiming a fallback that does not
                     // exist.
-                    const bool lost = pm.photons.empty() || (wantBeams && bmap.empty());
+                    // A sized clock epoch's few photons may store nothing: an empty realization
+                    // then, which the average takes like any other.
+                    const bool lost = !sizeEpochs && (pm.photons.empty() || (wantBeams && bmap.empty()));
                     if (lost) {
                         std::fprintf(stderr, "[mode M] light-side refresh produced an empty "
                                              "%s; stopping here with the %lld spp already "
@@ -20991,9 +21016,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 if (epochSpp <= 0) break;      // produced nothing; refreshing again cannot help
                 acc.merge(f);
                 sppAll += epochSpp;
-                if (sizeEpochs) {
+                // Epoch 0's build holds one-time work (the radius searches): sized from epoch 1 on.
+                if (sizeEpochs && rebuildSec > 0.0) {
                     const double gatherSec = std::chrono::duration<double>(clk::now() - tEpoch).count();
-                    nNext = sizer.next(nUsed, rebuildSec > 0.0 ? rebuildSec : buildSec, gatherSec);
+                    nNext = sizer.next(nUsed, rebuildSec, gatherSec);
                 }
             }
             if (epoch > 1)
@@ -29108,15 +29134,14 @@ static int run(int argc, char** argv) {
                                    const std::function<bool(int, const Film&, long long)>* onF,
                                    PmRadiiPin* pin) {
                     const long long nP = (nPassM > 0 && nPassM < N) ? nPassM : N;
-                    const double share = (double)nP / (double)N;
                     PmRadiiPin* const callerPin = pin;   // gets the pass's lightSec back
+                    if (pin) pin->lightSec = 0.0;        // a pass that returns early says nothing
                     if (pin && nP < N && pin->radius > 0.0) {
                         pinScaled = *pin;
-                        pinScaled.kGather *= share;
+                        pinScaled.kGather = epochShareOf(nP, N, pin->kGather);
                         pin = &pinScaled;
                     }
-                    const long long nAimedP = nP == N ? nAimedGpu
-                                                      : (long long)std::llround((double)nAimedGpu * share);
+                    const long long nAimedP = epochShareOf(nP, N, nAimedGpu);
                     renderPhotonMapSharedCuda(scene, cams, rxs, rys, nP, radius, e,
                                               diffraction, sppWant, p, onF,
                                               g_pmapLoad.empty() ? nullptr : g_pmapLoad.c_str(),
@@ -29238,9 +29263,7 @@ static int run(int argc, char** argv) {
                     // BLUR-EPOCH-COST). One device call does both; it says how long its light
                     // side took (PmRadiiPin::lightSec), and the rest of the epoch is the gather.
                     const bool sizeEpochsM = blurEpochsM && (timeBudgetSec > 0.0 || runForever);   // not -noise
-                    EpochSizer sizerM;
-                    sizerM.nMax = N;
-                    sizerM.nFloor = std::max(1LL, N / 1024);
+                    EpochSizer sizerM(N);   // its caustic floor once epoch 0 has chosen kGather
                     long long nNextM = N;
                     for (; !stopAll && sppAll < sppCap && !ft::stopRequested() && !budgetSpent();
                          ++lightEpoch) {
@@ -29287,6 +29310,7 @@ static int run(int argc, char** argv) {
                         // heavy scene stretches its epochs out until it behaves like
                         // -beamfreeze and a cheap one refreshes often.
                         SppProgress inner;
+                        double reportSecM = 0.0;                 // in the live reports below
                         inner.report = [&](const Film& f, long long sppDone, bool final) -> bool {
                             if (epochSec <= 0.0) {
                                 epochSec = std::chrono::duration<double>(clk::now() - tEpoch).count()
@@ -29296,10 +29320,11 @@ static int run(int argc, char** argv) {
                             // The live view must always see the WHOLE render, not this epoch's
                             // slice, or the window would reset to a black frame every refresh.
                             if (liveProg.report) {
+                                const auto tRep = clk::now();
                                 Film comb = f; comb.merge(acc);
-                                if (liveProg.report(comb, sppAll + sppDone, final)) {
-                                    stopAll = true; return true;
-                                }
+                                const bool stopNow = liveProg.report(comb, sppAll + sppDone, final);
+                                reportSecM += std::chrono::duration<double>(clk::now() - tRep).count();
+                                if (stopNow) { stopAll = true; return true; }
                             }
                             // END ON THE RENDER'S CLOCK AS WELL AS THE EPOCH'S. `epochSec` is
                             // derived from the light-side overhead divided by `-beamrefresh`, so
@@ -29315,10 +29340,13 @@ static int run(int argc, char** argv) {
                         };
                         runPass(blurEpochsM ? std::min(sppCap - sppAll, blurEpochSpp) : sppCap - sppAll,
                                 &inner, &grabFrame, &radiiPin);
-                        if (sizeEpochsM && radiiPin.lightSec > 0.0) {
+                        if (sizeEpochsM && lightEpoch == 0) sizerM.keepNeighbours(radiiPin.kGather);
+                        // Epoch 0 uploads the scene and searches the radii: sized from epoch 1 on. The
+                        // live window's and the images' time is not the gather's.
+                        if (sizeEpochsM && lightEpoch > 0 && radiiPin.lightSec > 0.0) {
                             const double gatherSec = std::chrono::duration<double>(clk::now() - tEpoch).count()
-                                                   - radiiPin.lightSec;
-                            if (lightEpoch > 0) sizerM.add(nPassM, radiiPin.lightSec);   // epoch 0 uploads more
+                                                   - radiiPin.lightSec - reportSecM;
+                            sizerM.add(nPassM, radiiPin.lightSec);
                             if (gatherSec > 0.0) nNextM = sizerM.next(nPassM, radiiPin.lightSec, gatherSec);
                         }
                         if (epochSpp <= 0) break;          // stopped before a complete sample

@@ -2115,9 +2115,17 @@ shutter=(-0.25, 0.25))` gives every moving transform and sphere of every frame i
   `J` share photons, beams or merges across paths (since 0.414.0). In a moving scene each of
   their epochs (`M`, `J`) or passes (`S`, `U`) is therefore rendered at one time, spread evenly
   over the shutter, and their average is the blur. Modes `M` and `J` redraw their light side for
-  this every 64th of a fixed `-spp` (every sample, below 64 spp), or every few samples under
-  `-time`, `-noise` or `-forever` (a light side dear to rebuild then takes much of the clock),
-  `-beamfreeze` or not (mode `J` takes `-beamepochs` above 64,
+  this every 64th of a fixed `-spp` (every sample, below 64 spp), or every 4 samples under
+  `-time`, `-noise` or `-forever`. Under `-time` or `-forever` (since 0.434.12) each epoch after
+  the first draws only the photons (`J`: light subpaths) its light side can afford, its rebuild
+  about as long as its 4 samples' gather, never fewer than a 1024th of `-n` (in mode `M` with the
+  adaptive caustic gather, never so few that it keeps under 8 neighbours): a dear light side no
+  longer takes most of the clock, each epoch noisier, the same estimator. On a test box at `-n
+  8000000 -time 20` whose ball focuses a caustic (gather target 47, so at least 17 % of `-n`
+  an epoch), mode `M` ran 73 epochs and 289 samples on the CPU against 15 and 57, and mode `J`
+  (`-jsurf -n 2000000`) 322 and 3210 against 58 and 580.
+  A fixed `-spp` and `-noise` (in mode `M` a sample count) draw the full `-n` every epoch. Either
+  way `-beamfreeze` or not (mode `J` takes `-beamepochs` above 64,
   and says so when it raises one below), and a mode `J` camera shares no realization with
   another. A camera moving through a still scene leaves the `M` and `S` maps
   timeless, and each sample poses the camera at its own time; `U` and `J`, whose light paths are

@@ -7648,36 +7648,25 @@ __device__ static inline bool dOnGatherSurface(const DVec3& x, const DVec3& n, c
 //     covered by definition -- and the gate then fires on nearly every gather and the
 //     correction stops happening. Measured: cap_gyroid -16.9 % stratified against -4.3 %
 //     independent. Do not "improve" this without re-reading the host comment.
-// Host twin solidSideAlong (gafootprint.h), where the reasoning lives (PROBE-PATH): the side of the
-// last opaque closed solid's face the segment from `o` along unit `d`, `len` long, crosses (+1 it
-// ends inside, -1 outside), or 0 when it crosses none; curves are not looked at. `eps`: how far
-// past a face crossed it goes on from.
-__device__ static int dSolidSideAlong(const DScene& sc, DVec3 o, const DVec3& d, Real len, Real eps) {
-    int side = 0;
+// Host twin walkSegment (gafootprint.h), where the reasoning lives (PROBE-PATH): of the faces light
+// does not pass that the segment from `o` along unit `d`, `len` long, crosses, curves unseen, the
+// side of the last closed solid's (+1 it ends inside, -1 outside, 0 none) and how many cannot say
+// theirs (up to 15). `eps`: how far past a face crossed it goes on from.
+struct DSegmentCrossings { int side; int open; };
+__device__ static DSegmentCrossings dWalkSegment(const DScene& sc, DVec3 o, const DVec3& d, Real len, Real eps) {
+    DSegmentCrossings c{0, 0};
     Real done = (Real)0;
-    for (int k = 0; k < 32 && done < len; ++k) {
+    for (int k = 0; k < 32 && done < len && c.open < 15; ++k) {
         const DHit h = closestHit(sc, o, d, (Real)0, len - done, false, len - done);
         if (!h.valid) break;
-        if (h.solid && !dPassesLight(sc, sc.mats[h.matId])) side = ((h.solid > 0) == h.back) ? -1 : 1;
+        if (!dPassesLight(sc, sc.mats[h.matId])) {
+            if (h.solid) c.side = ((h.solid > 0) == h.back) ? -1 : 1;
+            else ++c.open;
+        }
         done += h.t + eps;
         o = h.p + d * eps;
     }
-    return side;
-}
-
-// Host twin opaqueCrossingsAlong (gafootprint.h): how many opaque faces that cannot say their side
-// the segment crosses, curves unseen, up to 15.
-__device__ static int dOpaqueCrossingsAlong(const DScene& sc, DVec3 o, const DVec3& d, Real len, Real eps) {
-    int cnt = 0;
-    Real done = (Real)0;
-    for (int k = 0; k < 32 && done < len && cnt < 15; ++k) {
-        const DHit h = closestHit(sc, o, d, (Real)0, len - done, false, len - done);
-        if (!h.valid) break;
-        if (!h.solid && !dPassesLight(sc, sc.mats[h.matId])) ++cnt;
-        done += h.t + eps;
-        o = h.p + d * eps;
-    }
-    return cnt;
+    return c;
 }
 
 // `slack`: the gather's plane-test slack (gatherBandSlack at its map's radius), its photon test's.
@@ -7723,17 +7712,17 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
                 if (lastSolid == kAsk) {
                     const DVec3 so = p + n * pathEps, top = q + n * r;
                     const Real len = length(top - so);
-                    lastSolid = dSolidSideAlong(sc, so, (top - so) * ((Real)1 / len), len, pathEps);
+                    lastSolid = dWalkSegment(sc, so, (top - so) * ((Real)1 / len), len, pathEps).side;
                 }
                 return lastSolid;
             };
             // An odd parity puts the column inside only if the low leg agrees (host twin's
-            // parityInside, opaqueCrossingsAlong): a cup's wall, not a hovering sheet.
+            // parityInside): a cup's wall, not a hovering sheet.
             const auto parityInside = [&]() {
                 if (!(crossed & 1)) return false;
                 if (!(rr > (double)pathEps)) return true;
-                const Real hL = (Real)0.01 * r;   // host kLowLegFrac
-                return (dOpaqueCrossingsAlong(sc, p + n * hL, (q - p) * (Real)(1.0 / rr), (Real)rr, pathEps) & 1) != 0;
+                const Real hL = (Real)kLowLegFrac * r;
+                return (dWalkSegment(sc, p + n * hL, (q - p) * (Real)(1.0 / rr), (Real)rr, pathEps).open & 1) != 0;
             };
             bool found = false;                  // the probe ended on what it counts
             bool ended = false;                  // ... or on what it does not

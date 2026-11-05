@@ -458,7 +458,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
             // says itself whether the probe went into it or out of it, so the last such, the
             // nearest the plane, says whether the column ends in one (`lastSolid`: +1 into, -1 out
             // of, 0 none). Where it crosses none, the side the probe began on decides (PROBE-PATH):
-            // the side solidSideAlong finds along the segment from the gather point to the probe's
+            // the side walkSegment finds along the segment from the gather point to the probe's
             // top, taken only when it is asked (`kAsk`). So a column inside a solid taller than r
             // is inside though the probe crosses none of its faces. An opaque face that cannot say
             // counts toward a parity (`crossed`), whose odd count puts the column inside when the
@@ -472,7 +472,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                     if (solidsNear < 0) solidsNear = scene.solidNear(p, r * 1.4143) ? 1 : 0;
                     const Vec3 o = p + n * pathEps, top = q + n * r;
                     const double len = length(top - o);
-                    lastSolid = solidsNear ? solidSideAlong(scene, o, (top - o) * (1.0 / len), len, pathEps) : 0;
+                    lastSolid = solidsNear ? walkSegment(scene, o, (top - o) * (1.0 / len), len, pathEps).side : 0;
                 }
                 return lastSolid;
             };
@@ -483,12 +483,12 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
             };
             // An odd parity puts the column inside only if the low leg, from just over the gather
             // point to the column's foot, crosses an odd count of such faces too (a cup's wall;
-            // opaqueCrossingsAlong): asked only then.
+            // walkSegment): asked only then.
             const auto parityInside = [&]() {
                 if (!(crossed & 1)) return false;
                 if (!(rr > pathEps)) return true;
                 const double hL = kLowLegFrac * r;
-                return (opaqueCrossingsAlong(scene, p + n * hL, (q - p) * (1.0 / rr), rr, pathEps) & 1) != 0;
+                return (walkSegment(scene, p + n * hL, (q - p) * (1.0 / rr), rr, pathEps).open & 1) != 0;
             };
             bool found = false;                  // the probe ended on what it counts
             bool ended = false;                  // ... or on what it does not: either way, it ended

@@ -136,9 +136,9 @@ inline Report checkTris(const Tri* tris, size_t n) {
 // Its enclosed volume, taken on that side, says which way the normals point: a positive one marks
 // the piece's faces 1 (normals out: from behind is leaving), a negative one 2 (normals in, as a
 // room's may be: from behind is entering). Every other face is 0. Returns how many were marked.
-// `boxes`, when given, gets each closed piece's bounds (lo, hi), so a caller can tell where solids
-// lie without looking at every face.
-struct PieceBox { Vec3 lo, hi; };
+// `boxes`, when given, gets each closed piece's bounds (lo, hi) and the material of one of its faces,
+// so a caller can tell where solids lie without looking at every face.
+struct PieceBox { Vec3 lo, hi; int matId = 0; };
 inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* boxes = nullptr) {
     if (n == 0) return 0;
     Vec3 lo = tris[0]->v0, hi = tris[0]->v0;
@@ -148,20 +148,31 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
             hi.x = std::max(hi.x, p->x); hi.y = std::max(hi.y, p->y); hi.z = std::max(hi.z, p->z);
         }
     const double diag = std::sqrt((hi.x-lo.x)*(hi.x-lo.x) + (hi.y-lo.y)*(hi.y-lo.y) + (hi.z-lo.z)*(hi.z-lo.z));
-    // check()'s weld, 1e-7 of the extent -- but never more than a thousandth of the shortest edge:
-    // a pool of loose triangles spans a whole scene, and a ground quad kilometres wide must not
-    // weld a millimetre box's corners together.
-    double minEdge = DBL_MAX;
+    // The weld: check()'s, 1e-7 of the extent -- but no more than a thousandth of the short edges
+    // (a pool of loose triangles spans a whole scene, and a ground quad kilometres wide must not
+    // weld a millimetre box's corners), taken at their 1st percentile so one sliver does not shrink
+    // it for every piece; and no less than the coordinates' own precision, a billionth of their
+    // magnitude, which also keeps the quantised values far inside a long long.
+    std::vector<double> el;
+    el.reserve(n * 3);
+    double maxAbs = 0.0;
     for (size_t i = 0; i < n; ++i) {
         const Vec3* c[3] = {&tris[i]->v0, &tris[i]->v1, &tris[i]->v2};
         for (int k = 0; k < 3; ++k) {
+            maxAbs = std::max({maxAbs, std::fabs(c[k]->x), std::fabs(c[k]->y), std::fabs(c[k]->z)});
             const Vec3 e = *c[(k + 1) % 3] - *c[k];
             const double l = std::sqrt(dot(e, e));
-            if (l > 0.0 && l < minEdge) minEdge = l;
+            if (l > 0.0) el.push_back(l);
         }
     }
     double weld = std::max(1e-9, diag * 1e-7);
-    if (minEdge < DBL_MAX) weld = std::min(weld, std::max(1e-12, minEdge * 1e-3));
+    if (!el.empty()) {
+        const size_t q = el.size() / 100;
+        std::nth_element(el.begin(), el.begin() + (std::ptrdiff_t)q, el.end());
+        weld = std::min(weld, 1e-3 * el[q]);
+    }
+    std::vector<double>().swap(el);
+    weld = std::max(weld, std::max(1e-12, 1e-9 * maxAbs));
     const double inv  = 1.0 / weld;
     // Weld by sorting the corners' quantised positions (flat arrays: a scene's worth of triangles
     // costs a sort, where hash maps cost a node per corner).
@@ -198,6 +209,18 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
     std::vector<char> bad(parent.size(), 0);
     std::vector<char> side(parent.size(), 0);     // +1 / -1: the piece's faces' normals with / against winding
     std::vector<double> vol(parent.size(), 0.0);
+    // Each piece's own extent, and a corner of it the volume is taken about, so the sums' rounding
+    // and the no-volume test are at the piece's scale, not the call's.
+    std::vector<Vec3> plo(parent.size()), phi(parent.size());
+    std::vector<char> seenP(parent.size(), 0);
+    for (size_t i = 0; i < n; ++i) {
+        const size_t pc = (size_t)root(vid[i*3]);
+        if (!seenP[pc]) { seenP[pc] = 1; plo[pc] = phi[pc] = tris[i]->v0; }
+        for (const Vec3* p : {&tris[i]->v0, &tris[i]->v1, &tris[i]->v2}) {
+            plo[pc].x = std::min(plo[pc].x, p->x); plo[pc].y = std::min(plo[pc].y, p->y); plo[pc].z = std::min(plo[pc].z, p->z);
+            phi[pc].x = std::max(phi[pc].x, p->x); phi[pc].y = std::max(phi[pc].y, p->y); phi[pc].z = std::max(phi[pc].z, p->z);
+        }
+    }
     // Each directed edge as (low, high) and which way it runs; sorted, every undirected edge's uses
     // are one run, which must be one each way.
     struct Edge { int a, b; bool rev; };
@@ -212,8 +235,8 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
             if (u == v) continue;                    // a degenerate edge, as check() ignores it
             es.push_back(u < v ? Edge{u, v, false} : Edge{v, u, true});
         }
-        // Volume relative to the box's corner keeps the sums' rounding to the object's own scale.
-        const Vec3 a = t.v0 - lo, b = t.v1 - lo, d = t.v2 - lo;
+        const Vec3& o = plo[(size_t)piece];
+        const Vec3 a = t.v0 - o, b = t.v1 - o, d = t.v2 - o;
         vol[(size_t)piece] += dot(a, cross(b, d));
         const double c0 = dot(t.gn, t.n0), c1 = dot(t.gn, t.n1), c2 = dot(t.gn, t.n2);
         const bool anyNeg = c0 < 0.0 || c1 < 0.0 || c2 < 0.0, anyPos = c0 > 0.0 || c1 > 0.0 || c2 > 0.0;
@@ -240,18 +263,15 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
         // A piece of no thickness -- a double-sided card, its two faces wound against each other
         // -- is closed and encloses nothing: its sign is rounding's, so it is no solid.
         const double v = vol[(size_t)piece] * (double)side[(size_t)piece];
-        const bool flat = std::fabs(v) <= 1e-9 * diag * diag * diag;
+        const Vec3 ext = phi[(size_t)piece] - plo[(size_t)piece];
+        const double pd = std::sqrt(dot(ext, ext));
+        const bool flat = std::fabs(v) <= 1e-9 * pd * pd * pd;
         const unsigned char s = (bad[(size_t)piece] || flat) ? 0 : (v > 0.0 ? 1 : 2);
         tris[i]->solidFace = s;
         marked += s ? 1 : 0;
-        if (boxes && s) {
-            int& slot = boxOf[(size_t)piece];
-            if (slot < 0) { slot = (int)boxes->size(); boxes->push_back(PieceBox{tris[i]->v0, tris[i]->v0}); }
-            PieceBox& b = (*boxes)[(size_t)slot];
-            for (const Vec3* p : {&tris[i]->v0, &tris[i]->v1, &tris[i]->v2}) {
-                b.lo.x = std::min(b.lo.x, p->x); b.lo.y = std::min(b.lo.y, p->y); b.lo.z = std::min(b.lo.z, p->z);
-                b.hi.x = std::max(b.hi.x, p->x); b.hi.y = std::max(b.hi.y, p->y); b.hi.z = std::max(b.hi.z, p->z);
-            }
+        if (boxes && s && boxOf[(size_t)piece] < 0) {
+            boxOf[(size_t)piece] = (int)boxes->size();
+            boxes->push_back(PieceBox{plo[(size_t)piece], phi[(size_t)piece], tris[i]->matId});
         }
     }
     return marked;

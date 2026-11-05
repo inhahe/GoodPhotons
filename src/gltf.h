@@ -85,14 +85,14 @@ constexpr double kGltfMinRoughness = 1e-3;
 // layout once the loader's 1 - v is undone by its lookup), `area` each triangle's world area.
 // A triangle's area is spread over the texel centres it covers, or put on the texel under its
 // centroid when it covers none, each `add(texelIndex, share)`; a UV outside [0, 1) maps as the
-// texture's sampler does (`wrap`). A triangle tiled across more than four maps' worth of texels
-// (a floor with its UVs repeated) covers the map about evenly and is not rasterised: its area is
-// returned, to be spread over every texel alike by the caller. Two passes over each triangle's
-// texels, counting and then adding, so nothing per texel is stored.
+// texture's sampler does (`wrap`). A triangle whose UV box spans more than four maps' worth of
+// texels (a floor with its UVs repeated, a long sliver across a map) is sampled on a coarser
+// lattice of its texel centres, every s-th each way, so its cost stays a few maps' worth. Two
+// passes over each triangle's texels, counting and then adding, so nothing per texel is stored.
 template <class Add>
-inline double coverTexels(int w, int h, TexWrap wrap, const std::vector<float>& uv,
-                          const std::vector<float>& area, Add&& add) {
-    if (w <= 0 || h <= 0) return 0.0;
+inline void coverTexels(int w, int h, TexWrap wrap, const std::vector<float>& uv,
+                        const std::vector<float>& area, Add&& add) {
+    if (w <= 0 || h <= 0) return;
     const auto index = [wrap](long long i, int n) -> size_t {
         if (wrap == TexWrap::Clamp) return (size_t)(i < 0 ? 0 : i >= n ? n - 1 : i);
         if (wrap == TexWrap::Mirror) {
@@ -103,13 +103,12 @@ inline double coverTexels(int w, int h, TexWrap wrap, const std::vector<float>& 
         long long m = i % n;
         return (size_t)(m < 0 ? m + n : m);
     };
-    double uniform = 0.0;
     for (size_t t = 0; t < area.size(); ++t) {
         const double x0 = uv[t*6+0] * w, y0 = uv[t*6+1] * h, x1 = uv[t*6+2] * w, y1 = uv[t*6+3] * h,
                      x2 = uv[t*6+4] * w, y2 = uv[t*6+5] * h;
         const double d = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);   // twice the signed UV area
         long long n = 0;
-        long long xa = 0, xb = 0, ya = 0, yb = 0;
+        long long xa = 0, xb = 0, ya = 0, yb = 0, st = 1;
         const auto inside = [&](long long x, long long y) {
             const double px = x + 0.5, py = y + 0.5;
             const double b1 = ((px - x0) * (y2 - y0) - (x2 - x0) * (py - y0)) / d;
@@ -119,12 +118,10 @@ inline double coverTexels(int w, int h, TexWrap wrap, const std::vector<float>& 
         if (std::fabs(d) > 1e-12) {
             xa = (long long)std::floor(std::min({x0, x1, x2})); xb = (long long)std::ceil(std::max({x0, x1, x2}));
             ya = (long long)std::floor(std::min({y0, y1, y2})); yb = (long long)std::ceil(std::max({y0, y1, y2}));
-            if ((double)(xb - xa) * (double)(yb - ya) > 4.0 * (double)w * (double)h) {
-                uniform += area[t];
-                continue;
-            }
-            for (long long y = ya; y < yb; ++y)
-                for (long long x = xa; x < xb; ++x) n += inside(x, y) ? 1 : 0;
+            const double box = (double)(xb - xa) * (double)(yb - ya), cap = 4.0 * (double)w * (double)h;
+            if (box > cap) st = (long long)std::ceil(std::sqrt(box / cap));
+            for (long long y = ya; y < yb; y += st)
+                for (long long x = xa; x < xb; x += st) n += inside(x, y) ? 1 : 0;
         }
         if (n == 0) {
             add(index((long long)std::floor((y0 + y1 + y2) / 3.0), h) * (size_t)w +
@@ -132,11 +129,10 @@ inline double coverTexels(int w, int h, TexWrap wrap, const std::vector<float>& 
             continue;
         }
         const double share = (double)area[t] / (double)n;
-        for (long long y = ya; y < yb; ++y)
-            for (long long x = xa; x < xb; ++x)
+        for (long long y = ya; y < yb; y += st)
+            for (long long x = xa; x < xb; x += st)
                 if (inside(x, y)) add(index(y, h) * (size_t)w + index(x, w), share);
     }
-    return uniform;
 }
 
 // Read an entire file into a byte vector. Returns false on open failure.
@@ -703,14 +699,21 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
     // triangle, `mrArea[m]` its world area, `mrOfMat[m]` the material's metallicRoughness map.
     std::vector<std::vector<float>> mrUV, mrArea;
     std::vector<int> mrOfMat;   // glTF material -> its metallicRoughnessTexture, or -1
+    std::vector<double> mrRoughF, mrMetalF;   // its roughnessFactor, metallicFactor
     if (importMaterials && texturesArr && texturesArr->isArray() && meshes && meshes->isArray()) {
         if (const minijson::Value* mats = doc.root.find("materials"); mats && mats->isArray())
             for (const minijson::Value& mj : mats->arr) {
                 int ti = -1;
-                if (const minijson::Value* pmr = mj.find("pbrMetallicRoughness"))
+                double rf = 1.0, mf = 1.0;
+                if (const minijson::Value* pmr = mj.find("pbrMetallicRoughness")) {
                     if (const minijson::Value* t = pmr->find("metallicRoughnessTexture"))
                         ti = t->intAt("index", -1);
+                    rf = pmr->numAt("roughnessFactor", 1.0);
+                    mf = pmr->numAt("metallicFactor", 1.0);
+                }
                 mrOfMat.push_back(ti >= 0 && ti < (int)texturesArr->arr.size() ? ti : -1);
+                mrRoughF.push_back(rf);
+                mrMetalF.push_back(mf);
             }
         mrUV.resize(mrOfMat.size());
         mrArea.resize(mrOfMat.size());
@@ -817,14 +820,15 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
         // `p1` carries metallicFactor for the Roughness role, `p0` for the Metalness one.
         MapMeans all;
         std::vector<MapMeans> perMat;
+        const bool wantMeans = outMeanMetal || outMeanRough || outMetalFrac || outMurkyFrac;
         if (role == TexRole::Metalness || role == TexRole::Roughness) {
             const size_t n = tex.rgb.size();
             const double mf = (role == TexRole::Roughness) ? p1 : p0;
-            std::vector<float> mvA(n), gA;
-            for (size_t i = 0; i < n; ++i) mvA[i] = (float)std::min(1.0, std::max(0.0, tex.rgb[i].z * mf));
+            std::vector<double> mvA(n), gA;
+            for (size_t i = 0; i < n; ++i) mvA[i] = std::min(1.0, std::max(0.0, tex.rgb[i].z * mf));
             if (role == TexRole::Roughness) {
                 gA.resize(n);
-                for (size_t i = 0; i < n; ++i) gA[i] = (float)gltfRoughness(tex.rgb[i].y * p0);
+                for (size_t i = 0; i < n; ++i) gA[i] = gltfRoughness(tex.rgb[i].y * p0);
             }
             struct Acc { double w = 0.0, metal = 0.0, above = 0.0, murky = 0.0, rough = 0.0; };
             const auto accAt = [&](Acc& a, size_t i, double wi) {
@@ -846,16 +850,17 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
             Acc acc0;
             for (size_t i = 0; i < n; ++i) accAt(acc0, i, 1.0);
             all = meansOf(acc0, -1);
-            for (size_t m = 0; m < mrOfMat.size() && m < mrArea.size() && n > 0; ++m) {
+            // The requester's own means, and those of each other material on this map whose
+            // factors (as the file gives them) are this binding's: the ones that will find it in the
+            // cache. A material with other factors binds, and weighs, on its own.
+            const bool rough = role == TexRole::Roughness;
+            for (size_t m = 0; wantMeans && m < mrOfMat.size() && m < mrArea.size() && n > 0; ++m) {
                 if (mrOfMat[m] != ti || mrArea[m].empty()) continue;
+                const bool same = rough ? (mrRoughF[m] == p0 && mrMetalF[m] == p1) : (mrMetalF[m] == p0);
+                if ((int)m != mat && !same) continue;
                 Acc a;
-                const double even = coverTexels(tex.w, tex.h, tex.wrap, mrUV[m], mrArea[m],
-                                                [&](size_t i, double share) { accAt(a, i, share); });
-                if (even > 0.0) {   // tiled surface: its area over every texel alike
-                    const double k = even / (double)n;
-                    a.w += k * acc0.w; a.metal += k * acc0.metal; a.above += k * acc0.above;
-                    a.murky += k * acc0.murky; a.rough += k * acc0.rough;
-                }
+                coverTexels(tex.w, tex.h, tex.wrap, mrUV[m], mrArea[m],
+                            [&](size_t i, double share) { accAt(a, i, share); });
                 if (a.w > 0.0) perMat.push_back(meansOf(a, (int)m));
             }
             // The texels as ftrace reads them, broadcast so scalarAt (which averages RGB) reads
@@ -867,7 +872,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
             // in the map, so the factor alone made every consumer that cannot sample the texture
             // -- the preview rasterizers among them -- draw a lobe so broad it was invisible.
             for (size_t i = 0; i < n; ++i) {
-                const float v = gA.empty() ? mvA[i] : gA[i];
+                const double v = gA.empty() ? mvA[i] : gA[i];
                 tex.rgb[i] = Vec3{v, v, v};
             }
         } else if (role == TexRole::Color) {

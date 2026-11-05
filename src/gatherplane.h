@@ -36,6 +36,10 @@ constexpr double kGatherPlaneTol = 0.1;
 // And it faces the gather point's way, within 60 degrees: the normal test of every photon gather,
 // on true normals oriented to the side their light came from.
 constexpr double kGatherFacingCos = 0.5;
+// The footprint's low leg (gafootprint.h walkSegment, the device's dWalkSegment): its height above
+// a gather point's tangent plane, as a share of the radius -- under any lid the parity can count,
+// over the surface's own relief.
+constexpr double kLowLegFrac = 0.01;
 
 template <class T> FT_GP_HD inline bool withinGatherBand(T off, T d2, T c, T slack) {
     if (off <= slack) return true;

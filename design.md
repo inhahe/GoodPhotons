@@ -994,9 +994,13 @@ the decoded, downscaled map, once per binding for every material that maps it (t
 keeps each material's means, `MapMeans`): `gltfimpl::coverTexels` spreads a triangle's area over
 the texel centres it covers, or onto its centroid's texel, mapping UVs past the edge as the map's
 sampler does (repeat, clamp, mirror), counting and then adding so nothing per texel is stored. A
-triangle tiled over more than four maps' worth of texels (a floor with repeated UVs) covers the
-map about evenly and is not rasterised: its area is spread over every texel alike. A material no
-placed surface uses falls back to equal weights. The UVs are released once the materials are built.
+triangle whose UV box spans more than four maps' worth of texels (a floor with repeated UVs, a
+sliver across the map) is sampled on a coarser lattice of its texel centres, every s-th each way,
+so it costs a few maps' worth. Only a binding that asks for the means computes them, for its
+material and for those on the same map whose factors (as the file gives them) are its own -- the
+ones that will find it in the cache -- so materials sharing an atlas each rasterise once. A
+material no placed surface uses falls back to equal weights. The UVs are released once the
+materials are built.
 `tools/downscale_glb.py` reports the same weighted means. Every consumer that thresholds `roughness` sees the
 converted value. One consequence: an imported surface counts as caustic glossy below
 `kCausticGlossRoughness` 0.15, which is glTF 0.31. Before the conversion the cut sat at glTF 0.15.
@@ -5715,7 +5719,7 @@ as the one at fault.
   the solid or out of it, and the last one crossed, the nearest the plane, puts the column inside
   when it was an entry: under the overhang of a ball resting on the floor the probe begins inside the
   ball and leaves it, where a parity read the floor as inside. **Each probe begins on a known side (PROBE-PATH):** where the
-  probe crosses no closed solid's face, `solidSideAlong` follows the segment from the gather point,
+  probe crosses no closed solid's face, `walkSegment` follows the segment from the gather point,
   which no solid holds, to the probe's own top, and the last closed solid's face it crosses says
   whether the top lies in a solid. So a column inside a solid taller than r standing on the surface
   is inside though the probe crosses none of its faces (the dark halo at such a base: within 2 cm of
@@ -5737,7 +5741,7 @@ as the one at fault.
   An opaque face that cannot say (an open quad, a curve, an open isosurface, an open mesh), photon-
   holding or not, keeps the parity, odd meaning inside -- but only where the **low leg** agrees
   (0.434.13): the segment from just over the gather point (1 % of r up) to the column's foot must
-  cross an odd count of such faces too (`opaqueCrossingsAlong`, asked only for an odd parity). A
+  cross an odd count of such faces too (`walkSegment`'s `open`, asked only for an odd parity). A
   bottomless box of quads or an open glossy cup standing on the surface walls its floor off, so it
   stays a miss; a sheet hovering over it -- a diffuse table top, a mirror, a light's quad --
   encloses nothing, and the floor under it, lit from the sides, is covered. Either rule puts the
@@ -10395,7 +10399,13 @@ sees the instant, exactly as a static scene with those transforms would show it.
   (a grid, a map build, a pass's setup) is not taken for a per-photon one -- which would shrink the
   count, raise its apparent cost, and spiral down to the floor (it did, to 6 of mode J's 6912
   subpaths, whose surface map then came back empty) -- and the count never goes below where that
-  fixed cost is half the light side, nor below N/1024. The CPU's mode M passes the count to
+  fixed cost is half the light side, nor below N/1024, nor -- with mode M's adaptive caustic
+  gather -- where its neighbour target, scaled with the count, would fall under 8
+  (`keepNeighbours`). Epoch 0's build holds one-time work (the radius searches, mode J's budget
+  pilot), so the count is sized from epoch 1's measurements on, and mode J's ceiling is the count
+  epoch 0 settled on, recorded once (each pass overwrites the budget's `pathsUsed` with its own).
+  A sized epoch whose few photons store nothing is an empty realization, which the average takes
+  like any other; the refresh stops on an empty map only unsized. The CPU's mode M passes the count to
   `buildLightSide(epoch, salt, nEpoch)`; the device loop's `nPassM` reads the device's own light-side
   time (`PmRadiiPin::lightSec`); mode J's `nBlurJ` caps `Nepoch`. Each map divides by its own
   nEmitted and is binned at epoch 0's radii (mode J's shrink on the epoch index, as before), so
@@ -10403,10 +10413,11 @@ sees the instant, exactly as a static scene with those transforms would show it.
   target (`kGather`) scale with the count, and the beams rebuild at epoch 0's per-medium radii
   (`BeamRadiiPin`, which every mode-M refresh now keeps, blurred or not). A fixed `-spp` and
   `-noise`, which in mode M is a sample count, keep N. On check_motion's box at `-time 20`: mode M
-  at `-n 8000000`, 15 epochs and 57 samples became 1361 and 5444 on the CPU (about 139 k photons
-  each), 12 and 48 became 137 and 548 on the GPU; CPU mode J at `-n 2000000`, 58 and 580 became 286
-  and 2851. GPU mode J's epochs there are gather-bound (its merges against the maps grow with them
-  too), so its count stays N. A camera moving over a still scene leaves M's and S's maps
+  at `-n 8000000`, 15 epochs and 57 samples became 1361 and 5444 on the CPU, about 139 k photons
+  each -- and, the box's ball focusing a caustic whose adaptive gather targets 47 neighbours, 73 and
+  289 once the caustic floor holds an epoch at 8/47 of N (GPU: 12 and 48, then 137 and 548, then 47
+  and 188); CPU mode J at `-n 2000000`, 58 and 580 became 322 and 3210. GPU mode J's epochs there
+  are gather-bound (its merges against the maps grow with them too), so its count stays N. A camera moving over a still scene leaves M's and S's maps
   timeless: their gathers pose each sample (`renderPhotonCamera`, `sppmPass`'s camera worker),
   and a shared mode M map still serves several such cameras, gathered on the CPU. U and J take
   one time a pass or epoch even then, because their light subpaths are traced for the camera
