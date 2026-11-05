@@ -19092,6 +19092,41 @@ static void markSolidFaces(Scene& scene) {
         if (!held[i]) loose.push_back(&scene.tris[i]);
     solid += watertight::markSolidFaces(loose.data(), loose.size());
     seen += loose.size();
+    // The solids' world boxes (Scene::solidNear): every sphere; an asset's marked triangles under
+    // each instance that places it; a mesh object's marked triangles together; each marked loose one.
+    std::vector<Aabb> boxes;
+    for (const Sphere& s : scene.spheres) {
+        Aabb b;
+        b.expand(s.c - Vec3(s.r, s.r, s.r));
+        b.expand(s.c + Vec3(s.r, s.r, s.r));
+        boxes.push_back(b);
+    }
+    const auto addTri = [](Aabb& b, const Tri& t) { b.expand(t.v0); b.expand(t.v1); b.expand(t.v2); };
+    std::vector<Aabb> blasBox(scene.blasList.size());
+    for (size_t k = 0; k < scene.blasList.size(); ++k)
+        for (const Tri& t : scene.blasList[k].tris)
+            if (t.solidFace) addTri(blasBox[k], t);
+    for (const MeshInstance& inst : scene.instances) {
+        if (inst.blasId < 0 || inst.blasId >= (int)blasBox.size()) continue;
+        const Aabb& lb = blasBox[(size_t)inst.blasId];
+        if (!(lb.lo.x <= lb.hi.x)) continue;                   // no marked triangle in the asset
+        Aabb b;
+        for (int c = 0; c < 8; ++c)
+            b.expand(inst.toWorld.apply(Vec3((c & 1) ? lb.hi.x : lb.lo.x, (c & 2) ? lb.hi.y : lb.lo.y,
+                                             (c & 4) ? lb.hi.z : lb.lo.z)));
+        boxes.push_back(b);
+    }
+    for (const MeshGroup& g : scene.meshGroups) {
+        if (g.shapeOnly || g.blasId >= 0 || g.triStart + g.triCount > scene.tris.size()) continue;
+        Aabb b;
+        for (size_t i = g.triStart; i < g.triStart + g.triCount; ++i)
+            if (scene.tris[i].solidFace) addTri(b, scene.tris[i]);
+        if (b.lo.x <= b.hi.x) boxes.push_back(b);
+    }
+    for (const Tri* t : loose)
+        if (t->solidFace) { Aabb b; addTri(b, *t); boxes.push_back(b); }
+    scene.solidBoundsBvh.build(boxes);
+    scene.solidBoundsKnown = !scene.hasMotion();
     if (seen)
         std::printf("[gather] %zu of %zu triangles bound closed solids, whose side the footprint "
                     "probe reads (%.0f ms)\n", solid, seen,

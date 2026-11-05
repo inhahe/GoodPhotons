@@ -5703,28 +5703,46 @@ as the one at fault.
   mode-S camera and a footprint taken, before the exposure meter; the flag sits in `Tri`'s and
   `DTri`'s padding (FP32). For such a face `Hit::back` and the sign say whether the probe went into
   the solid or out of it, and the last one crossed, the nearest the plane, puts the column inside
-  when it was an entry. A solid's face in the band but above the plane, met from inside, counts too:
-  a ball's tilted underside, which the band widens to take in. Met from outside it is a thin solid's
-  top lying in the band (a coaster's, whose photons the floor's gather takes 5 cm away and more): the
-  surface, where the probe ends. One on the plane, a box's own bottom, decides nothing. That
-  holds even where the probe began inside the solid: under the overhang of a ball resting on the
-  floor, its origin r above the plane lies in the ball, and parity read the floor there as inside.
+  when it was an entry: under the overhang of a ball resting on the floor the probe begins inside the
+  ball and leaves it, where a parity read the floor as inside. **Each probe begins on a known side (PROBE-PATH):** where the
+  probe crosses no closed solid's face, `solidSideAlong` follows the segment from the gather point,
+  which no solid holds, to the probe's own top, and the last closed solid's face it crosses says
+  whether the top lies in a solid. So a column inside a solid taller than r standing on the surface
+  is inside though the probe crosses none of its faces (the dark halo at such a base: within 2 cm of
+  a 30 cm box the floor read 0.56 of its value at its true coverage before 0.434.10). The segment
+  is one bounded `occluded` ray in open air, curves unseen, and is not traced at all where the
+  probe's own crossings decide, nor, on the host, where no closed solid's box comes within r√2 of the
+  gather point (`Scene::solidNear`: a tree over the boxes `markSolidFaces` takes -- every sphere, each
+  instance of an asset with marked triangles, each mesh object's marked triangles together, each
+  marked loose one; off for a scene that moves). On gallery.ftsl the segments cost CPU mode M 7-15 %
+  without the boxes and about 4 % with them; GPU mode M 1 %, mode S nothing measurable. A solid's face in the band but above the plane, met
+  from inside, is crossed and passed (PROBE-UNDERSIDE): a ball's tilted underside, which the band
+  widens to take in, holds no photon facing the gather's way, and the floor below is the column's
+  surface; the probe ends on the passed face only where nothing of the gather's surface lies below
+  in the band, as where a closed room's surface curves up into it. Met from outside it is a thin
+  solid's top lying in the band (a coaster's, whose photons the floor's gather takes 5 cm away and
+  more): the surface, where the probe ends. One on the plane, a box's own bottom, decides nothing:
+  on it to within rounding (1e-7 r on the host, 2 `RAY_EPS` on the device), so the underside of a
+  ball resting on the floor is above it all but at the point it touches.
   A photon-holding face that cannot say (an open quad, a curve, an isosurface, an open mesh) keeps
   the parity, odd meaning inside, and either rule puts the column inside. One that holds no photon
   and cannot say -- an open mirror or glossy sheet, a light's quad -- counts for nothing: an open
   sheet encloses nothing, and the floor under it is lit from the sides. `-gageom`'s march climbs and
   decides each in-band layer of a column by the faces above it: the next solid face it meets above
   the layer, met from inside meaning inside, and the parity of the rest, so a coaster's top counts
-  while the floor inside the coaster under it does not. An in-band
+  while the floor inside the coaster under it does not; a layer no solid face in the window decides
+  takes the side of the column's top, along the same path as the probe's. A face that holds no
+  photon is no area to it above the plane, where the probe passes it (a glossy ball's steep side,
+  which the tilt-widened band takes in), and is on the plane, where the probe ends on it. An in-band
   face seen from behind on the plane decides nothing: a room built as one closed box is seen from
   inside everywhere. Counted as covered, every
   object standing on a surface ringed its base with a dark halo (0.75 of mode R within 5 cm of a
   3 cm box at radius 0.1; 0.99 with the count). A closed shelf hovering within the radius is
   crossed twice, and the floor under it counts (the plain disc average across its shadow). Two
   shapes the count misreads (known-issues PROBE-PARITY-LIMITS): an open surface hovering within the
-  radius (one quad, a leaf) is crossed once, so the floor under it is taken for a solid's inside and
-  reads bright; and a solid taller than the radius holds the probe's origin, so nothing is crossed
-  and the floor under it counts, the dark halo every version before 0.431.0 had at such a base too.
+  radius (one diffuse quad, a leaf) is crossed once, so the floor under it is taken for a solid's
+  inside and reads bright; and an open solid taller than the radius (a bottomless box of quads, an
+  open mesh) holds the probe's origin, so nothing is crossed and the floor under it counts.
   `-gageom`'s march takes the same count per column, looking for crossings as high as the probe
   does, r above the plane (0.433.7): a column near the disc's edge has a short chord, and a box top
   beyond it would otherwise leave the floor under the box counted. Sixteen faces without an answer

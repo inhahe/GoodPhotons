@@ -2,6 +2,7 @@
 // The geometric footprint for M-GATHERAREA, in its own header so both the diagnostic
 // (roiboxes.h) and the estimator (photonmap_render.h) can reach it without either
 // including the other.
+#include <algorithm>
 #include <vector>
 #include <cmath>
 #include "gatherplane.h"
@@ -15,6 +16,34 @@
 // dProbePassesThrough.
 inline bool probePassesThrough(const Scene& scene, const Material& m) {
     return m.type != MatType::Hair && !holdsPhotons(scene, m, 0.0);
+}
+
+// Which side of the closed solids the end of a segment lies on, relative to its start (PROBE-PATH):
+// the side of the last opaque closed solid's face (Hit::solid) the segment from `o` along unit `d`,
+// `len` long, crosses -- +1 it ends inside that solid, -1 outside -- or 0 when it crosses none. A
+// face light passes (passesLight) and one that cannot say (a quad, an open mesh, an isosurface)
+// leave it alone, and curves are not looked at: none of them encloses anything this can know of.
+// Where the footprint probe crosses no closed solid's face on its way down, it and -gageom's march
+// take the side this finds along the segment from the gather point, which no solid holds, to the
+// column's top, r above the gather point's tangent plane: a column inside a solid taller than the
+// radius standing on the surface is then known to be inside. `eps` is how far past a face crossed
+// the segment goes on from, the gather's scale (r * 1e-4). Device twin dSolidSideAlong.
+inline int solidSideAlong(const Scene& sc, Vec3 o, const Vec3& d, double len, double eps) {
+    int side = 0;
+    if (!(len > 0.0)) return side;
+    // Curves are skipped by their own tmin, the whole leg; the blanket tmin is then 0, so the
+    // origin steps past a face by `eps` itself. Open air, the common case, costs one bounded ray.
+    if (!sc.occluded(o, d, len, 0.0, false, len)) return side;
+    double done = 0.0;
+    for (int k = 0; k < 32 && done < len; ++k) {
+        const Hit h = sc.closestHit(Ray{o, d, len - done}, 0.0);
+        if (!h.valid || done + h.t > len) break;
+        const Material* m = (h.matId >= 0 && h.matId < (int)sc.mats.size()) ? &sc.mats[(size_t)h.matId] : nullptr;
+        if (h.solid && !(m && passesLight(sc, *m))) side = ((h.solid > 0) == h.back) ? -1 : 1;
+        done += h.t + eps;
+        o = h.p + d * eps;
+    }
+    return side;
 }
 
 // The geometric footprint: same-facing surface area inside the gather ball, measured from
@@ -93,7 +122,10 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
     // floor under a box), where no photon can be -- so that layer counts nothing. The nearest
     // closed solid's face above a layer (Hit::solid) decides by itself, met from inside meaning
     // inside; photon-holding faces that cannot say count toward a parity, and open sheets that
-    // hold none for nothing.
+    // hold none for nothing. A layer no solid face within the window decides lies on the side the
+    // column's top, r above the plane, is on (PROBE-PATH: along the segment from the gather point,
+    // which stays within r * sqrt(2) of it).
+    int solidsNear = -1;
     for (int i = 0; i < kDisc; ++i) {
         // Sunflower placement: equal-area radii, golden-angle azimuth. Deterministic, so two
         // runs of the same scene give the same footprint and an A/B compares one thing.
@@ -165,23 +197,35 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             // closed solid's decides the layers below it by its side, in the band or out of it --
             // a small ball's tilted underside lies in the band the tilt widens, and a thin solid's
             // top may too (a coaster's), itself a layer the faces above it decide; one on the
-            // plane (a box's own bottom) says nothing. Off the band, a photon-holding face that
-            // cannot say counts toward the parity, and one that holds none, an open sheet, for
-            // nothing (the probe's rule).
+            // plane (a box's own bottom) says nothing, "on" it to within rounding, as in the probe
+            // (a resting ball's underside near its contact is above it). Off the band, a photon-
+            // holding face that cannot say counts toward the parity, and one that holds none, an
+            // open sheet, for nothing (the probe's rule).
             const bool opaque = !(mm && (passesLight(sc, *mm) || mm->type == MatType::Hair));
-            if (opaque && h.solid && off > 1e-3 * r) {
+            if (opaque && h.solid && off > 1e-7 * r) {
                 if ((h.solid > 0) != h.back) { dec[0] += pend[0]; dec[1] += pend[1]; }   // entered: below is outside
                 pend[0] = pend[1] = 0.0;
             }
+            // A face that holds no photon is no area above the plane, where the probe passes it (a
+            // glossy ball's steep side, which the tilt-widened band takes in); on the plane it is
+            // the surface's height, where the probe ends on it.
+            const bool passed = mm && probePassesThrough(sc, *mm) && off > 1e-3 * r;
             if (h.t <= span && withinGatherBand(std::fabs(off), dot(dh, dh), std::fabs(c), slack)) {
-                if (c >= kGatherFacingCos) pend[crossed & 1] += cellArea / c;
+                if (c >= kGatherFacingCos && !passed) pend[crossed & 1] += cellArea / c;
             } else if (off > 0.0 && opaque && !h.solid && mm && holdsPhotons(sc, *mm, h.fiberRadius)) {
                 ++crossed;
             }
             tl = h.t - tBase + eps; ct = 0.0;
         }
-        // Layers no solid face above decided lie outside every solid.
-        area += dec[crossed & 1] + pend[crossed & 1];
+        // Layers no solid face above decided lie on the column top's side.
+        double rest = pend[crossed & 1];
+        if (rest > 0.0 && solidsNear < 0) solidsNear = sc.solidNear(p, r * 1.4143) ? 1 : 0;
+        if (rest > 0.0 && solidsNear) {
+            const Vec3 o = p + n * eps, colTop = q + n * r;
+            const double len = length(colTop - o);
+            if (solidSideAlong(sc, o, (colTop - o) * (1.0 / len), len, eps) > 0) rest = 0.0;
+        }
+        area += dec[crossed & 1] + rest;
         if (layers >= maxLayers && incomplete) *incomplete = true;
     }
     return area;

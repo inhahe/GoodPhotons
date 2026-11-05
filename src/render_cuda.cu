@@ -7647,6 +7647,23 @@ __device__ static inline bool dOnGatherSurface(const DVec3& x, const DVec3& n, c
 //     covered by definition -- and the gate then fires on nearly every gather and the
 //     correction stops happening. Measured: cap_gyroid -16.9 % stratified against -4.3 %
 //     independent. Do not "improve" this without re-reading the host comment.
+// Host twin solidSideAlong (gafootprint.h), where the reasoning lives (PROBE-PATH): the side of the
+// last opaque closed solid's face the segment from `o` along unit `d`, `len` long, crosses (+1 it
+// ends inside, -1 outside), or 0 when it crosses none; curves are not looked at. `eps`: how far
+// past a face crossed it goes on from.
+__device__ static int dSolidSideAlong(const DScene& sc, DVec3 o, const DVec3& d, Real len, Real eps) {
+    int side = 0;
+    Real done = (Real)0;
+    for (int k = 0; k < 32 && done < len; ++k) {
+        const DHit h = closestHit(sc, o, d, (Real)0, len - done, false, len - done);
+        if (!h.valid) break;
+        if (h.solid && !dPassesLight(sc, sc.mats[h.matId])) side = ((h.solid > 0) == h.back) ? -1 : 1;
+        done += h.t + eps;
+        o = h.p + d * eps;
+    }
+    return side;
+}
+
 // `slack`: the gather's plane-test slack (gatherBandSlack at its map's radius), its photon test's.
 __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const DVec3& n,
                                          Real r, Real slack, DRng& rng, int M, Real fiberR = (Real)0) {
@@ -7658,6 +7675,7 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
     // M-1 so the check index stays inside the loop.
     int probe0 = (M >= 4) ? ((M / 4 < 2) ? 2 : M / 4) : M;
     if (sc.gaGate) probe0 = (sc.gaGate < M) ? sc.gaGate : (M > 1 ? M - 1 : M);
+    const Real pathEps = fmaxf((Real)1e-4 * r, (Real)2 * RAY_EPS);
     for (int i = 0; i < M; ++i) {
         if (i == probe0 && area >= (double)probe0 * 0.995) return 1.0;
         const double rr = (double)r * sqrt((double)rng.uniform());
@@ -7678,11 +7696,25 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
             const DVec3 dn = n * (Real)(-1);
             Real tAcc = (Real)0, curveTmin = (Real)0;
             // The opaque faces passed above the plane: a closed solid's says which side the probe
-            // went (`lastSolid`, +1 into, -1 out of); a photon-holding one that cannot say counts
-            // toward the parity (`crossed`), one that holds none for nothing; either count can put
-            // the column inside (host twin gatherCoverageRaw).
-            int crossed = 0, lastSolid = 0;
+            // went (`lastSolid`, +1 into, -1 out of), and where it crosses none the side it began
+            // on, along the segment from the gather point to its top, taken when asked (`kAsk`); a
+            // photon-holding one that cannot say counts toward the parity (`crossed`), one that
+            // holds none for nothing; either count can put the column inside (host twin
+            // gatherCoverageRaw).
+            constexpr int kAsk = 2;
+            int crossed = 0, lastSolid = kAsk;
+            const auto side = [&]() {
+                if (lastSolid == kAsk) {
+                    const DVec3 so = p + n * pathEps, top = q + n * r;
+                    const Real len = length(top - so);
+                    lastSolid = dSolidSideAlong(sc, so, (top - so) * ((Real)1 / len), len, pathEps);
+                }
+                return lastSolid;
+            };
             bool found = false;                  // the probe ended on what it counts
+            bool ended = false;                  // ... or on what it does not
+            DHit under; under.valid = false;     // a closed solid's in-band face passed from inside
+            bool underFound = false;
             for (int pass = 0, skip = 0; pass < 16 + skip; ++pass) {   // a strand costs none, to 48 (host twin)
                 // Past a strand the curve tmin clears its tube and a surface just behind it must
                 // still be found: tmin 0 then, as every curve-tmin caller does.
@@ -7713,23 +7745,31 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
                 }
                 if (hm.type == D_HAIR && h.fiberRadius > (Real)0) {
                     const double op = dHairOpacityAt(sc, hm, h);
-                    if (op >= 1.0 || (double)rng.uniform() < op) { found = true; break; }   // the strand IS here
+                    if (op >= 1.0 || (double)rng.uniform() < op) { found = ended = true; break; }   // the strand IS here
                     tAcc = h.t; o = h.p; curveTmin = (Real)2.5 * h.fiberRadius;
                     continue;
                 }
                 const Real dzH = r - h.t;
                 if (withinGatherBand<Real>(fabs(dzH), (Real)(rr * rr) + dzH * dzH, dot(dShadedNg(h), n), slack)) {
                     // A closed solid's face in the band but above the plane, met from inside, is
-                    // crossed first; met from outside it is the surface, and one on the plane says
-                    // nothing (host twin).
-                    if (h.solid && dzH > fmaxf((Real)1e-3 * r, (Real)2 * RAY_EPS) && (h.solid > 0) == h.back) cross(true);
-                    found = (crossed & 1) == 0 && lastSolid <= 0;
+                    // crossed and passed, the probe ending there only if nothing below is this
+                    // surface in the band; met from outside it is the surface, and one on the
+                    // plane says nothing (host twin), "on" to within rounding: 2 RAY_EPS here.
+                    if (h.solid && dzH > fmaxf((Real)1e-7 * r, (Real)2 * RAY_EPS) && (h.solid > 0) == h.back) {
+                        cross(true);
+                        if (!under.valid) { under = h; underFound = (crossed & 1) == 0 && side() <= 0; }
+                        tAcc = h.t; o = h.p; curveTmin = (Real)0;
+                        continue;
+                    }
+                    found = (crossed & 1) == 0 && side() <= 0;
+                    ended = true;
                     break;
                 }
                 if (!(dzH > (Real)0)) break;                            // below the band: a miss
                 cross(true);
                 tAcc = h.t; o = h.p; curveTmin = (Real)0;
             }
+            if (!ended && under.valid) { h = under; found = underFound; }
             if (!found) h.valid = false;         // a miss, or sixteen faces without an answer
         }
         if (!h.valid) continue;

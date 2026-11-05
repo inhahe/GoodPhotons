@@ -1681,6 +1681,20 @@ struct Scene {
         return s.frame >= 0 ? &sphereAxes[(size_t)s.frame].ax : nullptr;
     }
     bool hasMotion() const { return !motionSets.empty() || !vertexKeys.empty(); }
+    // The world boxes of the closed solids (Hit::solid: every sphere, and the triangles
+    // markSolidFaces marks), in a tree, so the footprint probe traces its segment from the gather
+    // point (PROBE-PATH) only where a solid may lie near it. A box too large costs a segment, never
+    // a result. `solidBoundsKnown` is false until markSolidFaces takes them, and stays false for a
+    // scene that moves, whose boxes hold only for its frame's instant: every segment is traced then.
+    Bvh solidBoundsBvh;
+    bool solidBoundsKnown = false;
+    // Whether a closed solid's box lies within `rad` of `c` (always, when the boxes are not known).
+    bool solidNear(const Vec3& c, double rad) const {
+        if (!solidBoundsKnown) return true;
+        bool any = false;
+        solidBoundsBvh.traverseSphere(c, rad, [&](int) { any = true; });
+        return any;
+    }
     // A time in frames (relative to the frame's instant) as the fraction of the motion interval
     // g_motionU holds, clamped to it.
     double motionU(double frames) const {

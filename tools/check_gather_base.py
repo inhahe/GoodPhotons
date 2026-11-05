@@ -1,8 +1,8 @@
 """Regression check: modes M and S read the floor at the base of an object standing on it as mode R does.
 
     python tools/check_gather_base.py [--out png/check_gather_base] [--exe ftrace.exe]
-                                      [--objects diffuse,mirror,coated,coaster,ball,meshball,
-                                                 mirrorsheet,lampsheet]
+                                      [--objects diffuse,mirror,coated,coaster,tower,ball,meshball,
+                                                 diffuseball,smallball,mirrorsheet,lampsheet]
 
 A closed 3 cm box (six quads) standing on a lit floor, seen from straight above, modes M and S at a
 pinned gather radius of 0.1 on the CPU and the GPU, against mode R on the GPU. A mode-M or mode-S
@@ -22,20 +22,31 @@ so the probe passes their faces, but they are opaque: their faces are crossings 
 (passesLight), or the floor under them counts as covered again. A diffuse box 5 mm tall (`coaster`)
 has its top in the floor's band from 5 cm away, so the floor's gather takes the top's photons there,
 and the top must count as covered: met from outside, a closed solid's face in the band is the
-surface, not a crossing. Then a glossy ball of the box's
+surface, not a crossing. A diffuse box 30 cm tall (`tower`), off to one side so the foot of its near
+face is seen past its top: every probe over it begins inside it, r above the floor, and crosses none
+of its faces going down, so it must know from the path up from the gather point and across that it
+began inside (PROBE-PATH). Its shadow at its foot is too steep for mode R to be a reference within
+the radius, so it is held to its exact coverage (below). Then a glossy ball of the box's
 half-width resting on the floor, analytic and as a closed OBJ, seen from low beside it with a low
 light from the side reaching under its overhang. There, 4-12 cm from the point it rests on, the gap
 to the ball is under the gather radius, so the probe begins inside the ball and leaves it before it
 meets the floor, which a parity reads as inside. A closed solid's face says it is out
-(PROBE-SOLID-SIDE). (A diffuse ball is no case here: the probe ends on its underside seen from
-inside, PROBE-UNDERSIDE.) Then a mirror quad and a light's own quad hovering 8 cm over the floor, seen
+(PROBE-SOLID-SIDE). A diffuse ball's tilted underside holds photons and lies in the band there, so
+the probe, met from inside, must pass it to the floor (PROBE-UNDERSIDE), as the march does. A glossy
+ball of 4 cm (`smallball`) has its top within the probe's window over the floor around it and its
+underside in the band: the probe enters it and must leave it by that underside, and the march,
+climbing from below, must take the underside it enters to say the floor under it lies outside. Its
+floor is held from the contact out to 10 cm.
+Then a mirror quad and a light's own quad hovering 8 cm over the floor, seen
 from the same low view: open sheets that hold no photon, which enclose nothing, so the floor under
 them is the whole disc's coverage too (held as the balls' ring is).
 
 The floor 0-2 cm and 2-5 cm out from a box's base must each read within 7 % of mode R (two seeds
 apiece). The floor 4-12 cm from a ball's contact must read within 3 % of the same render with the
 footprint correction off (-gatherarea 0), whose coverage there is the whole disc: the kernel's blur
-from the lit floor beyond makes mode R no reference there. Exits 0 when every case holds, 1 otherwise.
+from the lit floor beyond makes mode R no reference there. The tower's rings must read within 3 % of
+that render divided by each pixel's share of the disc outside the tower, a circular segment's
+complement, with mode S's radius held (-sppmalpha 1). Exits 0 when every case holds, 1 otherwise.
 """
 import argparse
 import os
@@ -112,17 +123,20 @@ SIDE_LIGHT = ("light area { origin 0.5 0.005 -0.25  u 0 0 0.5  v 0 0.1 0  normal
 
 
 def top_dist(base):
-    """Each pixel of the view from above as the floor's distance out from the box's edge."""
+    """Each pixel of the view from above as the floor's distance out from the box's edge. `base`
+    takes the floor's coordinates under each pixel as the view lays them out, X rightward and Z
+    downward, which are world -x and -z (the camera looks down with +z up the frame)."""
     xs = (np.arange(W) + 0.5) / W * 2 * HALF - HALF
     X, Z = np.meshgrid(xs, xs)
     return base(X, Z)
 
 
-def side_dist(occluded=True):
-    """Each pixel of the view from beside the ball as the floor's distance from the point below the
-    ball's centre, or NaN where the pixel sees no floor, or (`occluded`) sees it within 4 mm of the
-    ball's silhouette (which the mesh ball's facets move). The camera's pinhole (fov_y, square
-    pixels, row 0 at the top), checked against marker renders to a pixel."""
+def side_dist(occluded=True, radius=BOX):
+    """Each pixel of the view from beside the ball (of `radius`, resting on the floor at the origin)
+    as the floor's distance from the point below the ball's centre, or NaN where the pixel sees no
+    floor, or (`occluded`) sees it within 4 mm of the ball's silhouette (which the mesh ball's
+    facets move). The camera's pinhole (fov_y, square pixels, row 0 at the top), checked against
+    marker renders to a pixel."""
     w = SLOOK - SEYE
     w = w / np.linalg.norm(w)
     u = np.cross(w, [0.0, 1.0, 0.0])
@@ -135,10 +149,10 @@ def side_dist(occluded=True):
     d = w[None, None, :] + SX[..., None] * u + SY[..., None] * v
     with np.errstate(divide="ignore"):
         tf = -SEYE[1] / d[..., 1]                              # the floor, y = 0 (inf: parallel)
-    oc = SEYE - np.array([0.0, BOX, 0.0])
+    oc = SEYE - np.array([0.0, radius, 0.0])
     b = d @ oc
     a = np.einsum("ijk,ijk->ij", d, d)
-    disc = b * b - a * (oc @ oc - (BOX + 0.004) ** 2)
+    disc = b * b - a * (oc @ oc - (radius + 0.004) ** 2)
     ts = np.where(disc > 0, (-b - np.sqrt(np.maximum(disc, 0))) / a, np.inf)
     seen = (d[..., 1] < 0) & (tf > 0) & ((tf < ts) | (not occluded))
     P = SEYE + d * tf[..., None]
@@ -159,10 +173,36 @@ def _box(mat, height=0.03):
             "R")
 
 
-def _ball(mat, mesh=False):
+def _ball(mat, mesh=False, radius=BOX, rings=((0.04, 0.12),)):
     geo = ('mesh "ball" { file "ball.obj"  material obj }' if mesh else
-           'sphere { center 0 %g 0  radius %g  material obj }' % (BOX, BOX))
-    return [mat, geo, SIDE_LIGHT], SIDE_CAM, side_dist, ((0.04, 0.12),), "the contact", "uncovered"
+           'sphere { center 0 %g 0  radius %g  material obj }' % (radius, radius))
+    return ([mat, geo, SIDE_LIGHT], SIDE_CAM, lambda: side_dist(radius=radius), rings, "the contact",
+            "uncovered")
+
+
+# A box taller than the radius, off to one side of the view from above (world x -0.45 to -0.15, the
+# frame's right) so that its near face's foot is seen past its top, and the floor measured out from
+# that face only (world x > -0.15, so X < 0.15 in the frame), within 5 cm of its middle, where the
+# gather's disc meets the face along a straight edge. The tower shades the floor at its foot from the
+# light overhead, so steeply that the kernel's blur puts the floor 0-2 cm out 15 % over mode R
+# however the coverage is taken; the tower's rings are held instead to the same render with the
+# footprint correction off divided by the share of the disc outside the tower (`seg_cover`): the
+# same photons, so the ratio is the coverage alone. Mode S keeps its radius for it (-sppmalpha 1).
+TOWER_X0 = -0.45
+GATHER_R = 0.1      # the cases' -pmradius
+
+
+def seg_cover(d, r=GATHER_R):
+    """The share of a disc of radius `r` whose centre lies `d` (>= 0) from a straight edge, on the
+    centre's side of it."""
+    d = np.clip(d, 0.0, r)
+    return 1.0 - (r * r * np.arccos(d / r) - d * np.sqrt(r * r - d * d)) / (np.pi * r * r)
+
+
+def _tower(mat):
+    return ([mat] + box(TOWER_X0, 0.0, -BOX, -BOX, 0.3, BOX, "obj"), TOP_CAM,
+            lambda: top_dist(lambda X, Z: np.where((np.abs(Z) < BOX - GATHER_R) & (X <= BOX), BOX - X, np.nan)),
+            RINGS, "the base", "coverage")
 
 
 # An open sheet hovering over the floor, above the side view's eye so the camera sees the floor
@@ -180,11 +220,21 @@ OBJECTS = {
     # takes its photons, so there the probe must end on it as covered (a closed solid's face met
     # from outside), and the march count it while dropping the floor inside the box below it.
     "coaster": _box('material "obj" { type diffuse reflect 0.5 }', height=0.005),
+    # A box 30 cm tall holds every probe over it from its start r above the floor, so the probe
+    # crosses none of its faces going down: it must know it begins inside (PROBE-PATH).
+    "tower": _tower('material "obj" { type diffuse reflect 0.5 }'),
     # A ball resting on the floor holds the probe's origin over the floor under its overhang, so
     # the probe leaves it before it meets the floor: a closed solid's face says it is out
     # (PROBE-SOLID-SIDE), where a parity reads the floor as inside.
     "ball": _ball('material "obj" { type glossy reflect 0.6 roughness 0.3 }'),
     "meshball": _ball('material "obj" { type glossy reflect 0.6 roughness 0.3 }', mesh=True),
+    # A diffuse ball's tilted underside holds photons, so the probe stops on it in the band; met
+    # from inside, it must pass on to the floor below (PROBE-UNDERSIDE).
+    "diffuseball": _ball('material "obj" { type diffuse reflect 0.5 }'),
+    # A ball smaller than the radius: its top lies within the window over the floor around it, and
+    # its underside in the band, which both the probe and the march must leave it by.
+    "smallball": _ball('material "obj" { type glossy reflect 0.6 roughness 0.3 }', radius=0.04,
+                       rings=((0.0, 0.1),)),
     "mirrorsheet": _sheet(['material "obj" { type mirror reflect 0.9 }',
                            quad((-BOX, 0.08, -BOX), (0, 0, 2 * BOX), (2 * BOX, 0, 0), "obj"), SIDE_LIGHT]),
     "lampsheet": _sheet(["light area { origin %g 0.08 %g  u %g 0 0  v 0 0 %g  normal 0 -1 0  power 5  "
@@ -242,13 +292,17 @@ def main():
                                              want_gpu=gpu)[0]) for s in (1, 2)], axis=0)
 
         R = image("R_gpu", REF, True) if against == "R" else None   # a ball's ring is held to U
+        # The share of each pixel's disc on the floor, for a ring held to its exact coverage.
+        cover = seg_cover(dist) if against == "coverage" else 1.0
         got = {}
         for name, args in CASES:
+            if against == "coverage" and args[args.index("-mode") + 1] == "S":
+                args = args + ["-sppmalpha", "1"]   # the radius the coverage is taken at, every pass
             M = image(name, args, "gpu" in name)
-            # The same render with the footprint correction off, for a ball's ring (`against`); not
-            # for -gageom, which the pairs below hold to the probe.
+            # The same render with the footprint correction off, for a ring held to its coverage
+            # (`against`); not for -gageom, which the pairs below hold to the probe.
             U = (image(name + "_uncovered", args + ["-gatherarea", "0"], "gpu" in name)
-                 if against == "uncovered" and "gageom" not in name else None)
+                 if against in ("uncovered", "coverage") and "gageom" not in name else None)
             for lo, hi in rings:
                 m = (dist >= lo) & (dist < hi)
                 q = got[name, lo] = M[m].mean() / (R[m].mean() if R is not None else 1.0)
@@ -258,11 +312,12 @@ def main():
                     print("%-9s %-12s floor %2.0f-%2.0f cm from %s: %.3f of mode R  %s" % (
                         bname, name, lo * 100, hi * 100, base, q, "ok" if good else "FAIL"), flush=True)
                 elif U is not None:
-                    c = M[m].mean() / U[m].mean()
+                    c = M[m].mean() / (U / cover)[m].mean()
                     good = abs(c - 1.0) <= COVER_TOL
                     ok &= good
-                    print("%-9s %-12s floor %2.0f-%2.0f cm from %s: %.3f of the uncorrected  %s" % (
-                        bname, name, lo * 100, hi * 100, base, c, "ok" if good else "FAIL"), flush=True)
+                    print("%-9s %-12s floor %2.0f-%2.0f cm from %s: %.3f of the uncorrected / %s  %s" % (
+                        bname, name, lo * 100, hi * 100, base, c,
+                        "its coverage" if against == "coverage" else "1", "ok" if good else "FAIL"), flush=True)
         for a_, b_ in PAIRS:
             for lo, hi in rings:
                 q = got[a_, lo] / got[b_, lo]

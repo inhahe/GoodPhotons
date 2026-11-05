@@ -394,6 +394,10 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
     // about, since `i == probe0` is then never reached.
     int probe0 = (M >= 4) ? ((M / 4 < 2) ? 2 : M / 4) : M;
     if (const int gp = gaGateProbes()) probe0 = (gp < M) ? gp : (M > 1 ? M - 1 : M);
+    const double pathEps = std::max(1e-9, r * 1e-4);
+    // Whether a closed solid may lie within reach of a probe's segment from the gather point to its
+    // top, which stays within r * sqrt(2) of it: asked once, the first time a probe needs its side.
+    int solidsNear = -1;
     for (int i = 0; i < M; ++i) {
         if (i == probe0 && area >= (double)probe0 * 0.995)
             return 1.0;                // interior of a flat patch: nothing to correct
@@ -453,18 +457,35 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
             // inside a solid resting on this surface. One that bounds a closed solid (Hit::solid)
             // says itself whether the probe went into it or out of it, so the last such, the
             // nearest the plane, says whether the column ends in one (`lastSolid`: +1 into, -1 out
-            // of, 0 none), even where the probe began inside it (under the overhang of a ball
-            // resting on the floor). A photon-holding face that cannot say counts toward a parity
-            // (`crossed`, odd inside); one that holds none and cannot say -- an open mirror or a
-            // light's quad -- counts for nothing, an open sheet enclosing nothing. Either count can
-            // put the column inside.
-            int crossed = 0, lastSolid = 0;
+            // of, 0 none). Where it crosses none, the side the probe began on decides (PROBE-PATH):
+            // the side solidSideAlong finds along the segment from the gather point to the probe's
+            // top, taken only when it is asked (`kAsk`). So a column inside a solid taller than r
+            // is inside though the probe crosses none of its faces. A photon-holding face that
+            // cannot say counts toward a parity (`crossed`, odd inside); one that holds none and
+            // cannot say -- an open mirror or a light's quad -- counts for nothing, an open sheet
+            // enclosing nothing. Either count can put the column inside.
+            constexpr int kAsk = 2;
+            int crossed = 0, lastSolid = kAsk;
+            const auto side = [&]() {
+                if (lastSolid == kAsk) {
+                    if (solidsNear < 0) solidsNear = scene.solidNear(p, r * 1.4143) ? 1 : 0;
+                    const Vec3 o = p + n * pathEps, top = q + n * r;
+                    const double len = length(top - o);
+                    lastSolid = solidsNear ? solidSideAlong(scene, o, (top - o) * (1.0 / len), len, pathEps) : 0;
+                }
+                return lastSolid;
+            };
             const auto cross = [&](const Hit& c, const Material* cm, bool holds) {
                 if (cm && passesLight(scene, *cm)) return;
                 if (c.solid) lastSolid = ((c.solid > 0) == c.back) ? -1 : 1;   // leaving : entering
                 else if (holds) ++crossed;
             };
             bool found = false;                  // the probe ended on what it counts
+            bool ended = false;                  // ... or on what it does not: either way, it ended
+            // A closed solid's face in the band, met from inside, the probe passes (below), and
+            // ends there only if it then meets nothing of this surface in the band.
+            Hit under;
+            bool underFound = false;
             // A strand the probe passes through costs none of the sixteen faces, up to 48 of them:
             // under a fur coat it may cross a few on its way to the skin.
             for (int pass = 0, skip = 0; pass < 16 + skip; ++pass) {
@@ -496,7 +517,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                     // A strand holds no photon either way; its opacity coin says whether it covers
                     // the disc.
                     const double o = hairOpacityAt(scene, *pm, h);
-                    if (o >= 1.0 || rng.uniform() < o) { found = true; break; }   // the strand IS here
+                    if (o >= 1.0 || rng.uniform() < o) { found = ended = true; break; }   // the strand IS here
                     tAcc = h.t;
                     pr = Ray{h.p + pr.d * 1e-9, pr.d, 2.5 * h.fiberRadius + 1e-9};   // through the tube
                     continue;
@@ -504,13 +525,27 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 const double dzH = r - h.t;
                 if (withinGatherBand(std::fabs(dzH), rr * rr + dzH * dzH, dot(orientedGeoN(h), n), slack)) {
                     // A closed solid's face in the band but above the plane, met from inside (a
-                    // ball's tilted underside, which the band widens to take in), is crossed
-                    // first: the probe leaves the ball over the floor. Met from outside it is the
-                    // solid's top in the band (a coaster's), a surface the gather's photons lie
-                    // on, which the faces above it decide. One on the plane (a box's own bottom)
-                    // is the surface's height, and says nothing.
-                    if (h.solid && dzH > 1e-3 * r && (h.solid > 0) == h.back) cross(h, pm, true);
-                    found = (crossed & 1) == 0 && lastSolid <= 0;
+                    // ball's tilted underside, which the band widens to take in), is crossed and
+                    // passed: the probe leaves the ball over the floor, and the floor below is
+                    // what it ends on. No photon on that face can face the gather's way, light
+                    // reaching it from outside the solid, below. But a closed room is a solid seen
+                    // from inside too, and where its surface curves up into the band nothing of it
+                    // lies below: there the probe ends on the face it passed (`under`). Met from
+                    // outside it is the solid's top in the band (a coaster's), a surface the
+                    // gather's photons lie on, which the faces above it decide. One on the plane
+                    // (a box's own bottom) is the surface's height, and says nothing: "on" to within
+                    // rounding (1e-7 r), not the 1e-3 r a face passed through above keeps, or the
+                    // underside of a ball resting on the floor would be "on" it for 5 mm round the
+                    // point it touches, which a probe from inside the ball must leave by.
+                    if (h.solid && dzH > 1e-7 * r && (h.solid > 0) == h.back) {
+                        cross(h, pm, true);
+                        if (!under.valid) { under = h; underFound = (crossed & 1) == 0 && side() <= 0; }
+                        tAcc = h.t;
+                        pr = Ray{h.p + pr.d * 1e-9, pr.d};
+                        continue;
+                    }
+                    found = (crossed & 1) == 0 && side() <= 0;
+                    ended = true;
                     break;
                 }
                 if (!(dzH > 0.0)) break;                                // below the band: a miss
@@ -518,6 +553,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 tAcc = h.t;
                 pr = Ray{h.p + pr.d * 1e-9, pr.d};
             }
+            if (!ended && under.valid) { h = under; found = underFound; }
             if (!found) h.valid = false;         // a miss, or sixteen faces without an answer
         }
         if (gaDiagOn() && matId >= 0 && matId < (int)gaDiag().size()) {

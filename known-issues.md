@@ -259,7 +259,15 @@ photons on its own surface within the ball, divided by that surface's area withi
 2 pi r_f times the strand's length inside it), rather than by a disc. Not measured yet: no scene in
 the repo lights fur that way.
 
-## OPEN (2026-11-05, 0.434.5): PROBE-UNDERSIDE — the probe and `-gageom`'s march count a ball's underside differently
+## DONE (2026-11-05, 0.434.10; opened 0.434.5): PROBE-UNDERSIDE — the probe and `-gageom`'s march count a ball's underside differently
+
+**Fixed in 0.434.10.** The probe crosses and passes a closed solid's face in the band above the
+plane met from inside, and ends on it only when nothing of the gather's surface lies below in the
+band (a closed room's surface curving up into it), so it ends on the floor under the ball as the
+march counts it. check_gather_base's `diffuseball` (radius 0.15, seen from beside it, the floor
+4-12 cm from the contact against the render with the footprint correction off): 0.434.9 mode M
+1.028 / 1.026 (GPU / CPU), mode S 1.109 / 1.078, the march 0.975 (M) and 0.928 (S) of the probe;
+0.434.10 1.001-1.003, the march 1.000.
 
 Found while testing PROBE-SOLID-SIDE on `tools/check_gather_base.py`'s diffuse ball, radius 0.15,
 resting on a lit floor, gathered at radius 0.1. Under the overhang the footprint probe starts
@@ -298,16 +306,21 @@ isosurfaces, curves). Two shapes break the rule:
   inside and is a miss, so a floor that does receive photons there is divided by too little area
   and reads bright. 0.431.0 counted it covered. The parity cannot tell it from the lid of a
   bottomless box built from five quads, whose floor inside is a true miss.
-- **A solid taller than the radius** holds the probe's origin, r above the plane, so the probe
-  crosses nothing, meets the floor (or the solid's own coplanar bottom) in the band, and counts
-  it. The photon sum has nothing there, so the floor reads dark near the base. This halo predates
-  0.431.0: before the band, the first hit was the same.
-Proper fix: the faces' own side (`Hit::solid`) already decides where a closed solid's face is met;
-the probe meets none in a tall closed solid because its window ends inside it. Look up from just
-above the band, past the window, for the nearest solid face: an upward ray from inside a closed
-solid must leave it, met from inside. The parity stays for open geometry, where nothing better is
-known. tools/check_gather_base.py covers the boxes (closed, so since 0.434.9
-solids), the balls and the open sheets that hold no photon; neither shape above (Opus review of
+- **An open solid taller than the radius** (a bottomless box of quads, a mesh that is not
+  watertight -- an imported asset often is not) holds the probe's origin, r above the plane, so the
+  probe crosses nothing, meets the floor in the band, and counts it. The photon sum has nothing
+  there, so the floor reads dark near the base. Since 0.434.10 a closed solid taller than the radius
+  is known from the path up from the gather point and across to each probe's top (PROBE-PATH): on
+  check_gather_base's 30 cm `tower` the floor within 2 cm of its base read 0.56 of its value at its
+  true coverage, and reads 0.99-1.02 now.
+Proper fix, for open meshes whose holes are planar (a statue's bottom left open on the floor): take a
+consistently wound piece whose boundary edges all lie in one plane as closed by that plane. Its
+volume taken about a point in the plane is the closed solid's, the cap's own tetrahedra vanishing
+there, so its side is known as a closed piece's is. For an open photon-holding sheet the parity
+cannot tell a table top from a bottomless box's lid; a lateral leg at the surface's own height
+from the gather point to the column (blocked by the box's walls, open under the table) could,
+taken only where the parity says inside. tools/check_gather_base.py covers the closed solids, the
+balls and the open sheets that hold no photon; neither shape above (Opus review of
 90e0486..bea7be1).
 
 ## OPEN (2026-11-04, 0.433.1): MODEM-CPU-DARKGLASS-BLUE — CPU mode M reads blue 15 % low through glass that absorbs blue strongly
