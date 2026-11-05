@@ -150,9 +150,20 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             // mode M's walk and the device's dResolveCompound resolve it: the coat is a glossy
             // material of its own (Material::coatChild), shaded by the switch below.
             const double R = layeredCoatReflectance(scene, *mp, h, ray.d, lambda);
-            int c = (rng.uniform() < R) ? mp->coatChild
-                                        : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map
+            const bool coatPick = rng.uniform() < R;
+            int c = coatPick ? mp->coatChild
+                             : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map
             if (c < 0) return;
+            // SPECGATHER: the coin at every bin (mode M's walk, where the why is).
+            {
+                const Material& lm = *mp;
+                const Vec3 d0 = ray.d;
+                const double pc = coatPick ? R : 1.0 - R;
+                sthr.mulCoin([&](double L, double& pr) {
+                    const double rL = layeredCoatReflectance(scene, lm, h, d0, L);
+                    return pr = coatPick ? rL : 1.0 - rL;
+                }, pc, pc, false);
+            }
             mp = &scene.mats[c];
         }
         const Material& m = *mp;

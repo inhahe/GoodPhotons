@@ -1068,9 +1068,10 @@ that is zero in some bins is the same problem without a coin -- a walk drawn the
 at any wavelength -- so `mul` folds its support (zero or not, per bin) into `p` too (0.381.4), as
 the device does for a fiber's per-bin weight through `mulVec`. Not the media term: a ratio-tracking
 estimate's zeros are one realization's, and depend on the walk's wavelength. A half mirror folds its coin since then too (a coloured one reflected every photon
-wavelength by the walk's reflectance). A layered coat's coin (its Fresnel reflectance) is still
-taken at the walk's wavelength: it varies only with the coat's dispersion, a few tenths of a
-percent. `tools/check_coat_modes.py` holds both to mode R.
+wavelength by the walk's reflectance). A layered coat's coat-or-body coin folds since 0.433.9 too,
+as in modes J and U: a thin-film coat's reflectance swings across the band, and the body under it
+keeps 1 - R(lambda). `tools/check_coat_modes.py` holds the half mirror and the gel to mode R, and
+`tools/check_compound_gather.py` the thin-film coat.
 
 **Mode S (0.432.0, SPPM-SPECTRAL).** Mode S's visible-point walk (`sppmVisiblePoint`,
 `dSppmVisiblePoint`) carries a `SpecThr` / `DSpecThr` too, folded at the same sites as mode M's

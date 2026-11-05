@@ -19951,8 +19951,19 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
         if (dIsCompound(mp->type)) {
-            int child = dResolveCompound(sc, *mp, h, rd, lambda, rng);
+            int coatPick = -1; double coatR = 0.0, coatCos = 1.0; Real coatTh = (Real)0;
+            int child = dResolveCompound(sc, *mp, h, rd, lambda, rng, &coatPick, &coatR, &coatCos, &coatTh);
             if (child < 0) return;                       // absorbed by the mix
+            // SPECGATHER: a layered coat's coin at every bin (host twin photonGather).
+            if (coatPick >= 0) {
+                const DMaterial& lm = *mp;
+                const bool cp = coatPick == 1;
+                const double pc = cp ? coatR : 1.0 - coatR;
+                sthr.mulCoin(sc, [&](Real L, double& pr) {
+                    const double r = dCoatRAtJ(lm, coatCos, coatTh, L);
+                    return pr = cp ? r : 1.0 - r;
+                }, pc, pc, false);
+            }
             mp = &sc.mats[child]; matId = child;
         }
         const DMaterial& m = *mp;
@@ -20470,8 +20481,19 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
         if (dIsCompound(mp->type)) {
-            int child = dResolveCompound(sc, *mp, h, rd, lambda, rng);
+            int coatPick = -1; double coatR = 0.0, coatCos = 1.0; Real coatTh = (Real)0;
+            int child = dResolveCompound(sc, *mp, h, rd, lambda, rng, &coatPick, &coatR, &coatCos, &coatTh);
             if (child < 0) return;                       // absorbed by the mix
+            // SPECGATHER: a layered coat's coin at every bin (host twin photonGather).
+            if (coatPick >= 0) {
+                const DMaterial& lm = *mp;
+                const bool cp = coatPick == 1;
+                const double pc = cp ? coatR : 1.0 - coatR;
+                sthr.mulCoin(sc, [&](Real L, double& pr) {
+                    const double r = dCoatRAtJ(lm, coatCos, coatTh, L);
+                    return pr = cp ? r : 1.0 - r;
+                }, pc, pc, false);
+            }
             mp = &sc.mats[child]; matId = child;
         }
         const DMaterial& m = *mp;

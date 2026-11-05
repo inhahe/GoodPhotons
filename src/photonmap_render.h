@@ -1642,9 +1642,21 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             // rendered 30 % bright against one (scraps/ident_*.ftsl). Same convention as
             // bdpt.h's randomWalk and the device's dResolveCompound.
             const double R = layeredCoatReflectance(scene, *mp, h, ray.d, lambda);
-            int c = (rng.uniform() < R) ? mp->coatChild
-                                        : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map (device twin: dResolveCompound)
+            const bool coatPick = rng.uniform() < R;
+            int c = coatPick ? mp->coatChild
+                             : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map (device twin: dResolveCompound)
             if (c < 0) return L;
+            // SPECGATHER: the coin at every bin, as modes J and U fold it. A thin-film coat's
+            // reflectance swings across the band, and the body under it keeps 1 - R(lambda).
+            {
+                const Material& lm = *mp;
+                const Vec3 d0 = ray.d;
+                const double pc = coatPick ? R : 1.0 - R;
+                sthr.mulCoin([&](double Lw, double& pr) {
+                    const double rL = layeredCoatReflectance(scene, lm, h, d0, Lw);
+                    return pr = coatPick ? rL : 1.0 - rL;
+                }, pc, pc, false);
+            }
             mp = &scene.mats[c];
         }
         const Material& m = *mp;
