@@ -20724,9 +20724,13 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
                                    double& cosThetaOut, bool& delta, bool& terminate,
                                    const Real* lamAll = nullptr, int nUp = 1,
                                    double* secF = nullptr, bool* secChromatic = nullptr,
-                                   bool* keepBundle = nullptr) {
+                                   bool* keepBundle = nullptr, DJSpecRun* jr = nullptr,
+                                   double jInvPdf = 0.0) {
     // (n_from / n_to)^2 at a refraction, 1 otherwise: the camera walk multiplies its throughput
     // by it, the light walk does not (host twin: vcm.h scatterSample).
+    // `jr` (the camera walk's carrier, VCM-SPEC; null on the light walk): this scatter's factor at
+    // every bin over its value at lambda, as mode J's device walk folds it -- the slots through the
+    // shape their own read captured (DJBase), the step through its record (host twin scatterSample).
     if (radianceScale) *radianceScale = 1.0;
     DVertex vt = dVertFromHit(h, matId);
     const DVec3& ns = h.n;
@@ -20738,12 +20742,17 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
     const int nSec = (secF && lamAll && nUp > 1) ? nUp - 1 : 0;   // secondaries to fill
     if (secChromatic) *secChromatic = false;
     if (keepBundle)   *keepBundle = false;
+    DJBase jbS; jbS.mode = 0; jbS.vc = 0; jbS.pm = (Real)1;   // the slot's shape, for the carrier
+    Real tpS = (Real)1;                                       // the transmit pattern's multiplier
+    DStepRecord jSt;
+    bool jHmRefl = false, jReflLobe = false;
+    Real jcH = (Real)1;
     switch (m.type) {
         case D_DIFFUSE:
         case D_FLUORESCENT: {
             wi = cosineHemisphere(ns, rng);
             if (dot(wi, ns) <= 0) { terminate = true; break; }
-            double rho = clamp01(dDiffuseRho(sc, m, h, lambda));
+            double rho = clamp01(dDiffuseRho(sc, m, h, lambda, jr ? &jbS : nullptr));
             pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
             pdfRevW = dBsdfPdf(sc, vt, wi, wo, lambda);
             betaFactor = rho;                     // rho <= 0 is caught by the caller's max test
@@ -20758,10 +20767,11 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             DVec3 mdir = reflectv(rd, ns);
             wi = sampleGlossy(mdir, dMatRoughness(sc, m, h), rng);
             if (dot(wi, ns) <= 0) { terminate = true; break; }
-            double r = clamp01(dReflectSlot(sc, m, h, lambda));
+            double r = clamp01(dReflectSlot(sc, m, h, lambda, jr ? &jbS : nullptr));
             // An iridescent lobe's interference reflectance at the sampled pair's half-vector:
             // dBsdfF's r for this pair. Host twin vcm.h.
             const Real cH = m.iridescence ? dHalfVectorCos(wo, wi) : (Real)1;
+            jcH = cH;
             if (m.iridescence) r *= (double)dIridescenceR(sc, m, &h, lambda, cH);
             pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
             pdfRevW = dBsdfPdf(sc, vt, wi, wo, lambda);
@@ -20780,10 +20790,12 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             break;
         }
         case D_DIFFUSETRANSMIT: {
-            double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
+            double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT,
+                                                       jr ? &jbS : nullptr, jr ? &tpS : nullptr);
             double tot = rhoR + rhoT;
             if (tot <= 0.0) { terminate = true; break; }
             const bool reflLobe = (rng.uniform() * tot < rhoR);
+            jReflLobe = reflLobe;
             if (reflLobe) wi = cosineHemisphere(ns, rng);
             else          wi = cosineHemisphere(ns * (Real)-1, rng);
             if (!reflLobe) lobe = DL_TRANSMIT;
@@ -20827,18 +20839,26 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             const double cosLong = dhair::safeSqrt(1.0 - dhair::sqr(dhair::clampd(wl.x, -1.0, 1.0)));
             betaFactor = clamp01(fv * cosLong / pdfH);
             // sigma_a is per-λ: each secondary re-evaluates its own fiber along the hero's direction.
-            if (nSec) {
-                *secChromatic = true;
-                for (int i = 0; i < nSec; ++i) {
-                    if (passThru) { secF[i] = 1.0; continue; }   // the ray missed the fiber at every λ
-                    const DHairShade hsi = dHairShadeAt(sc, m, h, lamAll[i + 1], wo);
-                    secF[i] = (double)dHairFCos(hsi, wi) / pdfH;
-                }
+            // The secondaries and, for the carrier, the fiber at lambda and at every bin, in ONE
+            // loop: a second call site of the BCSDF readers tips nvcc into emitting them out of
+            // line (mode J's walk, and DJBase).
+            if (nSec) *secChromatic = true;
+            const int nJ = (jr && !passThru) ? DJSPEC_K + 1 : 0;
+            double hv[DJSPEC_K + 1];
+            for (int i = 0; i < nSec + nJ; ++i) {
+                const bool sec = i < nSec;
+                if (sec && passThru) { secF[i] = 1.0; continue; }   // the ray missed the fiber at every λ
+                const int jk = i - nSec - 1;                        // -1: lambda itself
+                const Real Li = sec ? lamAll[i + 1] : (jk < 0 ? lambda : (Real)DJSpec::lamOf(jk));
+                const DHairShade hsi = dHairShadeAt(sc, m, h, Li, wo);
+                const double fc = (double)dHairFCos(hsi, wi);
+                if (sec) secF[i] = fc / pdfH; else hv[jk + 1] = (double)clamp01((Real)(fc / pdfH));
             }
+            if (nJ) jr->mulVec(hv + 1, hv[0]);
             break;
         }
         case D_MIRROR: {
-            double r = clamp01(dReflectSlot(sc, m, h, lambda));
+            double r = clamp01(dReflectSlot(sc, m, h, lambda, jr ? &jbS : nullptr));
             wi = reflectv(rd, ns); betaFactor = r; delta = true;
             // The mirror direction is the same for every λ, so the bundle survives; only the
             // reflectance is per-λ (cf. Glossy, the rough version of this).
@@ -20854,18 +20874,23 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
         case D_MULTILAYER: {
             DVec3 nro, nrd;
             if (!dDielectricStep(sc, m, h, rd, lambda, rng, stk, nro, nrd, nullptr,
-                                 radianceScale)) { terminate = true; break; }
+                                 radianceScale, jr ? &jSt : nullptr)) { terminate = true; break; }
             wi = nrd; betaFactor = 1.0; delta = true; lobe = DL_FREE;   // about ng
+            // -jdispall: a dispersive refraction opens the window (host twin scatterSample).
+            if (jr && c_jDispAll && jSt.refracted &&
+                fabs((double)specLookup(m.ior, (Real)DLMIN) - (double)specLookup(m.ior, (Real)DLMAX)) > 1e-9)
+                jr->markDisp((double)lambda, jInvPdf);
             break;
         }
         case D_HALFMIRROR: {
-            double r = clamp01(dReflectSlot(sc, m, h, lambda));
-            if (rng.uniform() < r) wi = reflectv(rd, ns); else { wi = rd; lobe = DL_FREE; }
+            double r = clamp01(dReflectSlot(sc, m, h, lambda, jr ? &jbS : nullptr));
+            jHmRefl = rng.uniform() < r;
+            if (jHmRefl) wi = reflectv(rd, ns); else { wi = rd; lobe = DL_FREE; }
             betaFactor = 1.0; delta = true;
             break;
         }
         case D_FILTER: {
-            double t = clamp01(dTransmitSlot(sc, m, h, lambda));
+            double t = clamp01(dTransmitSlot(sc, m, h, lambda, jr ? &tpS : nullptr));
             wi = rd; betaFactor = t; delta = true; lobe = DL_FREE;   // t <= 0 -> caller's max test
             // Straight-through for every λ, so the bundle survives — and a gel filter is
             // exactly where the per-λ transmittance spread is largest, i.e. the case that
@@ -20882,9 +20907,24 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
         case D_GRATING: {
             double r = clamp01(dReflectSlot(sc, m, h, lambda));
             if (r <= 0) { terminate = true; break; }
-            DVec3 nro, nrd;
-            if (!gratingDiffract(m, h, rd, lambda, diffraction, rng, nro, nrd)) { terminate = true; break; }
+            DVec3 nro, nrd; int pickG = 0;
+            if (!gratingDiffract(m, h, rd, lambda, diffraction, rng, nro, nrd, nullptr,
+                                 jr ? &pickG : nullptr)) { terminate = true; break; }
             wi = nrd; betaFactor = r; delta = true; lobe = DL_FREE;   // orders about ng
+            // The order at every bin, r(L) / wsum(L), 0 where it is evanescent; any order but 0
+            // opens the dispersive window (mode J's device fold).
+            if (jr) {
+                bool liveC;
+                const double wsC = dGratingWsum(m, h, rd, lambda, diffraction, pickG, liveC);
+                if (wsC > 0.0)
+                    jr->mul([&](double L) {
+                                bool live;
+                                const double ws = dGratingWsum(m, h, rd, (Real)L, diffraction, pickG, live);
+                                return (live && ws > 0.0)
+                                           ? (double)clamp01(specLookup(m.reflect, (Real)L)) / ws : 0.0; },
+                            (double)clamp01(specLookup(m.reflect, lambda)) / wsC, true);
+                if (pickG != 0) jr->markDisp((double)lambda, jInvPdf);
+            }
             break;
         }
         default: terminate = true; break;
@@ -20892,6 +20932,57 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
     // A lobe that leaves on the wrong side of the true surface ends the walk (host twin).
     if (!terminate && dLeavesWrongSide(h, wi, lobe)) terminate = true;
     if (!terminate) cosThetaOut = fabs(ddot(wi, ns));
+    // VCM-SPEC: the other lobes' factors at every bin, each over its value at lambda through the
+    // same reader (hair and the grating folded in their cases).
+    if (jr && !terminate) {
+        switch (m.type) {
+            case D_DIFFUSE:
+            case D_FLUORESCENT:
+            case D_GLOSSY:
+            case D_MIRROR: {
+                const bool dif = (m.type == D_DIFFUSE || m.type == D_FLUORESCENT);
+                auto fJ = [&](double L) {
+                    const double v = dJSlotAt(sc, m, jbS, L, dif);
+                    return (m.type == D_GLOSSY && m.iridescence)
+                               ? v * (double)dIridescenceR(sc, m, &h, (Real)L, jcH) : v; };
+                jr->mul(fJ, fJ((double)lambda), m.type == D_MIRROR);
+                break;
+            }
+            case D_DIFFUSETRANSMIT: {   // the lobe's albedo, normalised as dDiffuseTransmitAlbedos does
+                auto fJ = [&](double L) {
+                    const double rR = dJSlotAt(sc, m, jbS, L, true);
+                    Real tv = specLookup(m.transmit, (Real)L);
+                    if (m.transmitPat >= 0) tv = tv * tpS;
+                    const double rT = (double)clamp01(tv);
+                    const double sum = rR + rT;
+                    const double nrm = (sum > 1.0) ? 1.0 / sum : 1.0;
+                    return (jReflLobe ? rR : rT) * nrm; };
+                jr->mul(fJ, fJ((double)lambda), false);
+                break;
+            }
+            case D_FILTER: {
+                auto fJ = [&](double L) {
+                    Real tv = specLookup(m.transmit, (Real)L);
+                    if (m.transmitPat >= 0) tv = tv * tpS;
+                    return (double)clamp01(tv); };
+                jr->mul(fJ, fJ((double)lambda), true);
+                break;
+            }
+            case D_HALFMIRROR: {
+                auto fJ = [&](double L) { const double r = dJSlotAt(sc, m, jbS, L, false);
+                                          return jHmRefl ? r : 1.0 - r; };
+                jr->mul(fJ, fJ((double)lambda), true);
+                break;
+            }
+            case D_DIELECTRIC:
+            case D_THINFILM:
+            case D_MULTILAYER:
+                jr->mul([&](double L) { return dStepFactorAt(sc, m, h, rd, jSt, (Real)L); },
+                        jSt.factor, false);
+                break;
+            default: break;
+        }
+    }
 }
 
 // Phase 1: `nPaths` light subpaths. Stores connectible vertices into the per-path slab
@@ -21316,6 +21407,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
         double cameraPdfW = ctx.imagePlaneDist * ctx.imagePlaneDist /
                             (cosAtCamera * cosAtCamera * cosAtCamera);
         double beta = 1.0;
+        // VCM-SPEC: the walk's spectral factors on mode J's carrier (host twin vcm.h).
+        const bool jOn = c_jSpecOn != 0;
+        DJSpecRun jrun; jrun.init();
         double dVCM = ctx.nLightPaths / cameraPdfW;
         double dVC = 0.0, dVM = 0.0;
         DMediumStack stk; stk.clear();
@@ -21370,6 +21464,12 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     double ak = (cm >= 0) ? (double)specLookup(sc.mats[cm].absorb, lamAll[k + 1]) : 0.0;
                     if (ak > 0.0) betaSec[k] *= exp(-ak * (double)h.t);
                 }
+                // VCM-SPEC: coloured glass, whatever it absorbs at lambda (host twin vcm.h)
+                if (jOn && cm >= 0) {
+                    const double tt = (double)h.t;
+                    jrun.mul([&](double L) { return exp(-(double)specLookup(sc.mats[cm].absorb, (Real)L) * tt); },
+                             exp(-a * tt), false);
+                }
             }
             double dist = h.t;
             DVec3 rdCur = rd;
@@ -21388,6 +21488,14 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     for (int k = 0; nUp > 1 && k + 1 < nUp; ++k)
                         if ((coatU < dCoatRAtJ(*mp, coatCos, coatTh, lamAll[k + 1])) != (coatPick == 1))
                             nUp = 1;
+                // VCM-SPEC: the coat-or-body coin at every bin (host twin vcm.h)
+                if (jOn && coatPick >= 0) {
+                    const DMaterial& lm = *mp;
+                    const bool cp = coatPick == 1;
+                    jrun.mul([&](double L) { const double r = dCoatRAtJ(lm, coatCos, coatTh, (Real)L);
+                                             return cp ? r : 1.0 - r; },
+                             cp ? coatR : 1.0 - coatR, false);
+                }
                 mp = &sc.mats[c]; matId = c;
             }
 
@@ -21706,6 +21814,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                 // (d) Vertex merging — gather nearby light vertices from ALL paths (XYZ estimate).
                 if (ctx.vmNorm > 0.0 && grid.nLV > 0 && mp->type != D_HAIR) {   // not AT a strand (vcm.h)
                     double mx = 0, my = 0, mz = 0;
+                    DJSpec js;
+                    if (jOn) jrun.snap(js);
+                    const bool jsOn = jOn && js.on();              // the carrier arriving here (VCM-SPEC)
                     double r2 = ctx.radius * ctx.radius;
                     int ix = (int)floor(((double)h.p.x - grid.lo.x) / grid.cell);
                     int iy = (int)floor(((double)h.p.y - grid.lo.y) / grid.cell);
@@ -21755,20 +21866,33 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                               double wLight = lv.dVCM * ctx.misVcWeight + lv.dVM * camDirPdfW;
                               double wCamera = dVCM * ctx.misVcWeight + dVM * camRevPdfW;
                               double misW = 1.0 / (wLight + 1.0 + wCamera);
+                              // The camera's factors at each member's wavelength, or past a
+                              // dispersive event the window around lambda coloured there (host twin).
+                              const bool win = jsOn && js.disp;
                               double wgt = misW * fCam * lv.beta;
+                              if (jsOn) wgt *= win ? js.winW((double)lam) : js.at((double)lam);
                               double ax = lv.cx * wgt, ay = lv.cy * wgt, az = lv.cz * wgt;
+                              if (win) ax = ay = az = 0.0;
+                              double wWin = win ? wgt : 0.0;
                               for (int q = 0; q + 1 < lvUp; ++q) {
                                   double wq = misW * fSec[q] * gcorr * row[q].beta;
                                   Real lq = (Real)row[q].lam;
+                                  if (jsOn) wq *= win ? js.winW((double)lq) : js.at((double)lq);
+                                  if (win) { wWin += wq; continue; }
                                   ax += (double)cieX(lq) * wq;
                                   ay += (double)cieY(lq) * wq;
                                   az += (double)cieZ(lq) * wq;
+                              }
+                              if (win) {
+                                  const Real lc = (Real)js.lamC;
+                                  const double wc = wWin * js.atC();
+                                  ax = (double)cieX(lc) * wc; ay = (double)cieY(lc) * wc; az = (double)cieZ(lc) * wc;
                               }
                               if (lvUp > 1) { double inv = 1.0 / lvUp; ax *= inv; ay *= inv; az *= inv; }
                               mx += ax; my += ay; mz += az;
                           }
                     }}}
-                    double bn = beta * ctx.vmNorm;
+                    double bn = (jsOn ? js.beta(beta) : beta) * ctx.vmNorm;
                     rx += mx * bn; ry += my * bn; rz += mz * bn;
                 }
             }
@@ -21780,7 +21904,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             double radianceScale = 1.0;
             dVcmScatter(sc, *mp, h, rdCur, lambda, rng, matId, stk, &radianceScale, diffraction,
                         wi, betaFactor, pdfW, pdfRevW, cosThetaOut, delta, terminate,
-                        lamAll, nUp, secF, &secChromatic, &keepBundle);
+                        lamAll, nUp, secF, &secChromatic, &keepBundle, jOn ? &jrun : nullptr,
+                        invPdfLambda);
             betaFactor *= radianceScale;   // the camera walk carries radiance across a refraction
             double mxF = betaFactor;
             if (secChromatic) for (int k = 0; k + 1 < nUp; ++k) if (secF[k] > mxF) mxF = secF[k];
@@ -28124,6 +28249,14 @@ bool cudaVcmSupported(const Scene& scene) {
 VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int resY,
                             bool diffraction, int maxDepth, int heroC) {
     if (!cudaAvailable() || !cudaVcmSupported(scene)) return nullptr;
+    // The camera walk's spectral carrier (VCM-SPEC) takes mode J's switches: FTRACE_JSPEC, as
+    // bdpt::jSpecEnabled reads it, and -jdispwin / -jdispall (cudaSetJDisp).
+    {   const char* e = std::getenv("FTRACE_JSPEC");
+        const int jSpec = !(e && e[0] == '0');
+        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jSpecOn, &jSpec, sizeof(int)));
+        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispWin, &g_jDispWinHost, sizeof(double)));
+        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispAll, &g_jDispAllHost, sizeof(int)));
+    }
     VcmSession* s = new VcmSession();
     s->resX = resX; s->resY = resY; s->npix = (size_t)resX * resY;
     s->diffraction = diffraction ? 1 : 0;

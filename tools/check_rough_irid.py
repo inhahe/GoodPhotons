@@ -11,11 +11,11 @@ bundle) --
 the rough interference reflectors of 0.401.0, glossy lobes weighted by the coating's reflectance at
 the half-vector (Material::iridescence). Each sphere's mean colour, over the pixels that see it
 first (an analytic ray cast of the camera, eroded from the rim), is held per channel against
-mode R on the CPU, in modes A, B, D and M on the CPU and A, B, D, M and R on the GPU -- the
+mode R on the CPU, in modes A, B, D, M and U on the CPU and A, B, D, M, R and U on the GPU -- the
 forward modes A and B included, where a rough glossy is visible only through the camera splat's
 glossy lobe (render.h GlossySplat). Modes B, R and D run twice, the second time with `-heroc 1`, for
-the walks that carry one wavelength. Mode U is left out: its merges read the camera path's colours
-at the camera's wavelength, which washes any coloured glossy (known-issues VCM-SPEC). So is mode J:
+the walks that carry one wavelength. Mode U is held since 0.433.0, when its merges began to read the
+camera path's colours at each light vertex's wavelength (known-issues VCM-SPEC). Mode J is left out:
 its walk is mode D's, and its surface merges on these small curved glossy spheres are too noisy to
 resolve a bias at a check's budget (at 1102 spp its sphere means still scattered by 5-12 %, the CPU
 and GPU in opposite directions). A sphere channel fails when it differs from the reference by more
@@ -95,11 +95,13 @@ CASES = [   # the A cases render SCENE_A, through the lens
     ("B_cpu", ["-mode", "B", "-device", "cpu", "-n", "120000000"]),
     ("D_cpu", ["-mode", "D", "-device", "cpu", "-spp", "256"]),
     ("M_cpu", ["-mode", "M", "-device", "cpu", "-spp", "256"]),
+    ("U_cpu", ["-mode", "U", "-device", "cpu", "-spp", "256"]),
     ("R_gpu", ["-mode", "R", "-device", "gpu", "-spp", "4096"]),
     ("A_gpu", ["-mode", "A", "-device", "gpu", "-n", "120000000"]),
     ("B_gpu", ["-mode", "B", "-device", "gpu", "-n", "120000000"]),
     ("D_gpu", ["-mode", "D", "-device", "gpu", "-spp", "512"]),
     ("M_gpu", ["-mode", "M", "-device", "gpu", "-spp", "512"]),
+    ("U_gpu", ["-mode", "U", "-device", "gpu", "-spp", "512"]),
     # one wavelength per path: the scalar walks, beside the hero bundles above
     ("B1_cpu", ["-mode", "B", "-device", "cpu", "-n", "120000000", "-heroc", "1"]),
     ("R1_cpu", ["-mode", "R", "-device", "cpu", "-spp", "2048", "-heroc", "1"]),

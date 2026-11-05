@@ -84,9 +84,9 @@ Each names the section its line is in.
    its radius: a table top gathers the floor's light.~~ Done, 0.431.0.
 2. **HAZE-SUN-B** (4.2) — mode B lights an unbounded sunlit haze at 0.16 of mode R. **Waiting on
    the user (4.1):** modes R, D and J agree, and only a choice of domain can bring B to them.
-3. **VCM-SPEC** and ~~**SPPM-SPECTRAL**~~ (4.2) — modes U and S merge at the camera's wavelength, so
-   a coloured surface seen before a merge washes out (the fix mode J got in 0.386.1, JSPEC). Mode S
-   done, 0.432.0.
+3. ~~**VCM-SPEC** and **SPPM-SPECTRAL** (4.2) — modes U and S merge at the camera's wavelength, so
+   a coloured surface seen before a merge washes out (the fix mode J got in 0.386.1, JSPEC).~~ Done:
+   mode S 0.432.0, mode U 0.433.0.
 4. **MODEM-GPU-CORNER** and **MODEM-COMPOTE-NAN** (4.2) — GPU mode M reads a box's corner 15 %
    bright, and writes NaN pixels on gallery_rain's gem compote.
 5. **CURVE-GATHER** (4.2) — modes M, S and U read a coat of diffuse fur at 0.7-2.4 of mode R; never
@@ -152,7 +152,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **MERGE-PROXIMITY** (0.431.0) — every gather keeps only the photons near its tangent plane
   (`gatherplane.h`), except on a curve; mode M's sheet lit from below read 21x, now 0.
 - [ ] **HAZE-SUN-B** — mode B lights an unbounded sunlit haze at 0.163 of mode R, its floor 0.846.
-- [ ] **VCM-SPEC** — mode U's merges read the camera path's colours at the camera's wavelength.
+- [x] **VCM-SPEC** (0.433.0) — mode U's camera walk carries mode J's spectral carrier, and each
+  merge reads it at the light vertex's wavelengths.
 - [ ] **MODEM-GPU-CORNER** — GPU mode M reads one corner of a box 15 % bright (and two smaller
   one-block residuals).
 - [ ] **CURVE-GATHER** — modes M, S and U misread a coat of `type diffuse` curves

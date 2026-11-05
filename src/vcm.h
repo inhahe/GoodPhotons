@@ -338,6 +338,11 @@ inline void misScatter(bool specular, double cosThetaOut, double bsdfDirPdfW, do
 //
 // `transport`: Radiance for the camera walk, Flux for the light walk -- a refraction scales
 // the first's betaFactor by (n_from / n_to)^2 and not the second's (Renderer::Transport).
+//
+// `jr` (the camera walk's, VCM-SPEC; null on the light walk): this scatter's factor re-expressed at
+// every carrier bin over the value betaFactor took at `lambda`, as mode J's walk folds it (bdpt.h
+// randomWalk, where the reasoning lives). `jInvPdf` is 1/p(lambda), for the dispersive window a
+// grating's non-zero order (or, under -jdispall, a dispersive refraction) opens.
 inline void scatterSample(const Scene& scene, const Renderer& mats, const Material* mp,
                           const Hit& h, const Vec3& rayDir, double lambda, Pcg32& rng,
                           Vec3& wi, double& betaFactor, double& pdfW, double& pdfRevW,
@@ -345,7 +350,8 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
                           MediumStack& stk, Renderer::Transport transport,
                           const double* lamAll = nullptr, int nUp = 1,
                           double* secF = nullptr, bool* secChromatic = nullptr,
-                          bool* keepBundle = nullptr) {
+                          bool* keepBundle = nullptr, JSpecRun* jr = nullptr,
+                          double jInvPdf = 0.0) {
     const Vec3 ns = h.n;
     const Vec3 wo = normalize(rayDir * -1.0);
     wi = Vec3{0, 0, 0}; betaFactor = 0.0; pdfW = 0.0; pdfRevW = 0.0; cosThetaOut = 0.0;
@@ -366,6 +372,8 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             pdfW = bsdfPdf(*mp, ns, wo, wi, lambda, scene, &h);
             pdfRevW = bsdfPdf(*mp, ns, wi, wo, lambda, scene, &h);
             betaFactor = rho;                     // rho <= 0 is caught by the caller's max test
+            if (jr) jr->mul([&](double L) { return clamp01(diffuseReflectance(scene, *mp, h, L)); },
+                            betaFactor, false);
             if (nSec) {
                 *secChromatic = true;
                 for (int i = 0; i < nSec; ++i)
@@ -386,6 +394,10 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             pdfRevW = bsdfPdf(*mp, ns, wi, wo, lambda, scene, &h);
             betaFactor = r;
             if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the caller's max test
+            if (jr) jr->mul([&](double L) {
+                                const double rL = clamp01(reflectSlot(scene, *mp, h, L));
+                                return mp->iridescence ? rL * iridescenceR(scene, *mp, &h, L, cH) : rL; },
+                            betaFactor, false);
             // The glossy LOBE (mirror direction + roughness exponent) carries no wavelength
             // dependence, so the whole bundle follows the sampled direction and only the
             // reflectance differs per λ.
@@ -410,6 +422,11 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             pdfRevW = bsdfPdf(*mp, ns, wi, wo, lambda, scene, &h);
             betaFactor = tot;
             if (pdfW <= 0) terminate = true;
+            // the lobe's albedo over the hero's for it (the split's `tot` cancels)
+            if (jr) jr->mul([&](double L) { double rR, rT;
+                                            bdpt::diffuseTransmitAlbedos(*mp, L, scene, &h, rR, rT);
+                                            return reflLobe ? rR : rT; },
+                            reflLobe ? rhoR : rhoT, false);
             // The lobe was CHOSEN by the hero's albedo split, so each secondary divides by
             // the HERO's albedo for that lobe, not its own:
             //   f_i·cos/pdf_hero = rho_i(lobe) · tot_hero / rho_hero(lobe).
@@ -433,8 +450,9 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             // bdpt.h randomWalk) and nothing merges at one (the merge loop).
             const HairShade hs = hairShadeAt(scene, *mp, h, lambda, wo);
             double pdfH = 0.0, fv = 0.0;
+            hair::LobeAngular la;                              // filled by the sample's own f()
             const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
-                                         rng.uniform(), rng.uniform(), pdfH, fv);
+                                         rng.uniform(), rng.uniform(), pdfH, fv, &la);
             if (!(pdfH > 0.0) || !(fv > 0.0)) { terminate = true; break; }
             wi = hair::toWorld(hs.fr, wl); lobe = Lobe::Free;
             // A coverage pass-through returns EXACTLY -wo: the ray was never intercepted.
@@ -453,6 +471,17 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             // The camera walk's factor. A LIGHT walk never uses it: it stops at a strand before
             // this value matters (traceLightSubpath; the reasoning is at bdpt.h randomWalk's Hair case).
             betaFactor = clamp01(fv * cosLong / pdfH);   // == T = sum_p A_p (hair.h)
+            // the same sample's weight at every bin (mode J's Hair fold); a pass-through is flat
+            if (jr && !passThru) {
+                const double* sigB = hairSigmaBins<JSpec::K, &JSpec::lamOf>(scene, *mp, h);
+                double hv[JSpec::K];
+                for (int k = 0; k < JSpec::K; ++k) {
+                    const HairShade hk = hairShadeRetint(scene, *mp, h, JSpec::lamOf(k), hs,
+                                                         sigB ? sigB[k] : -1.0);
+                    hv[k] = clamp01(hairFoldFCos(la, hk, wl, cosLong, nullptr) / pdfH);
+                }
+                jr->mulVec(hv, betaFactor);
+            }
             // sigma_a is per-λ, so each secondary re-evaluates its own fiber along the
             // hero's sampled direction; the bundle survives a strand rather than de-heroing.
             if (nSec) {
@@ -471,6 +500,8 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
         case MatType::Mirror: {
             double r = clamp01(reflectSlot(scene, *mp, h, lambda));
             wi = reflect(rayDir, ns); betaFactor = r; delta = true;
+            if (jr) jr->mul([&](double L) { return clamp01(reflectSlot(scene, *mp, h, L)); },
+                            betaFactor, true);
             // The mirror direction is the same for every λ, so the bundle survives; only
             // the reflectance is per-λ (cf. Glossy, the rough version of this).
             if (nSec) {
@@ -489,18 +520,33 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
                 mats.interfaceStep(scene, *mp, h, rayDir, lambda, rng, stk, transport);
             if (st.absorbed) { terminate = true; break; }
             wi = st.ray.d; betaFactor = st.scale; delta = true; lobe = Lobe::Free;   // about ng
+            if (jr) {
+                jr->mul([&](double L) { return mats.stepFactorAt(scene, *mp, st, h, rayDir, L); },
+                        st.factor, false);
+                // -jdispall: a refraction whose index varies over the band leaves a path that
+                // exists only at lambda (JSpec::disp).
+                if (g_jDispAll && st.refracted &&
+                    std::fabs(mp->ior(LAMBDA_MIN) - mp->ior(LAMBDA_MAX)) > 1e-9)
+                    jr->markDisp(lambda, jInvPdf);
+            }
             break;
         }
         case MatType::HalfMirror: {
             double r = clamp01(reflectSlot(scene, *mp, h, lambda));
-            if (rng.uniform() < r) wi = reflect(rayDir, ns);
-            else                   { wi = rayDir; lobe = Lobe::Free; }
+            const bool refl = rng.uniform() < r;
+            if (refl) wi = reflect(rayDir, ns);
+            else      { wi = rayDir; lobe = Lobe::Free; }
             betaFactor = 1.0; delta = true;
+            if (jr) jr->mul([&](double L) { const double rL = clamp01(reflectSlot(scene, *mp, h, L));
+                                            return refl ? rL : 1.0 - rL; },
+                            refl ? r : 1.0 - r, true);
             break;
         }
         case MatType::Filter: {
             double t = clamp01(transmitSlot(scene, *mp, h, lambda));
             wi = rayDir; betaFactor = t; delta = true; lobe = Lobe::Free;   // t <= 0 -> caller's max test
+            if (jr) jr->mul([&](double L) { return clamp01(transmitSlot(scene, *mp, h, L)); },
+                            betaFactor, true);
             // Straight-through for every λ, so the bundle survives — and a gel filter is
             // exactly where the per-λ transmittance spread is largest, i.e. the case that
             // benefits most from NOT de-heroing, AND the case that forces the absolute
@@ -516,9 +562,24 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
         case MatType::Grating: {
             double r = clamp01(reflectSlot(scene, *mp, h, lambda));
             if (r <= 0) { terminate = true; break; }
-            bool absorbedG; Ray nr = mats.gratingDiffract(*mp, h, rayDir, lambda, rng, absorbedG);
+            bool absorbedG; int pickG = 0;
+            Ray nr = mats.gratingDiffract(*mp, h, rayDir, lambda, rng, absorbedG, nullptr,
+                                          jr ? &pickG : nullptr);
             if (absorbedG) { terminate = true; break; }
             wi = nr.d; betaFactor = r; delta = true; lobe = Lobe::Free;   // orders about ng
+            // The order's probability and the reflectance at every bin, and the dispersive
+            // window past any order but 0 (mode J's Grating fold).
+            if (jr) {
+                bool liveC;
+                const double wsC = mats.gratingWsum(*mp, h, rayDir, lambda, pickG, liveC);
+                if (wsC > 0.0)
+                    jr->mul([&](double L) {
+                                bool live;
+                                const double ws = mats.gratingWsum(*mp, h, rayDir, L, pickG, live);
+                                return (live && ws > 0.0) ? clamp01(reflectSlot(scene, *mp, h, L)) / ws : 0.0; },
+                            r / wsC, true);
+                if (pickG != 0) jr->markDisp(lambda, jInvPdf);
+            }
             break;
         }
         default: terminate = true; break;
@@ -887,6 +948,11 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
     double dVCM = Mis(ctx.nLightPaths / cameraPdfW);
     double dVC = 0.0, dVM = 0.0;
     MediumStack stk;                              // nested-dielectric medium stack
+    // VCM-SPEC: the walk's spectral factors on mode J's carrier (JSpec, beamgather.h). A merge pairs
+    // this walk, at lambda, with light vertices of every wavelength, and owes each the walk's
+    // factors at its own: beta * at(lambda_v). FTRACE_JSPEC=0 turns it off with mode J's.
+    const bool jOn = bdpt::jSpecEnabled();
+    JSpecRun jr;
     Vec3 prevP = cam.eye;
     // Has this eye chain passed through ONLY delta (specular) vertices so far? That is the
     // precondition for the escaped-sun strategy below; tracked explicitly rather than
@@ -932,6 +998,12 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     double ai = scene.mats[mi].absorb(hb.lam[i + 1]);
                     if (ai > 0.0) betaSec[i] *= std::exp(-ai * h.t);
                 }
+                // coloured glass, whatever it absorbs at lambda (clear glass folds exactly 1)
+                if (jOn) {
+                    const double tt = h.t;
+                    jr.mul([&](double L) { return std::exp(-scene.mats[mi].absorb(L) * tt); },
+                           std::exp(-scene.mats[mi].absorb(lambda) * tt), false);
+                }
             }
         }
         double dist = h.t;
@@ -958,6 +1030,13 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
             int c = coatPick ? mp->coatChild
                              : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map (device twin: dResolveCompound)
             if (c < 0) return result;
+            // the coat-or-body coin at every bin: a merge here evaluates only the chosen child
+            if (jOn) {
+                const Material& lm = *mp;
+                jr.mul([&](double L) { const double r = layeredCoatReflectance(scene, lm, h, rd, L);
+                                       return coatPick ? r : 1.0 - r; },
+                       coatPick ? R : 1.0 - R, false);
+            }
             mp = &scene.mats[c];
         }
 
@@ -1249,6 +1328,9 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
             if (ctx.vmNorm > 0.0 && mp->type != MatType::Hair) {
                 Vec3 mergeXYZ{0, 0, 0};
                 const Vec3 ngoCam = orientedGeoN(h);
+                JSpec js;
+                if (jOn) jr.snap(js);
+                const JSpec* vs = (jOn && js.on()) ? &js : nullptr;   // the carrier arriving here
                 const bool camTwoSided = isTwoSidedMat(*mp);   // for mergeFromBehind
                 grid.query(lightVerts, h.p, ctx.radius, [&](int idx) {
                     const LightVertex& lv = lightVerts[idx];
@@ -1293,18 +1375,35 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     double wLight = lv.dVCM * ctx.misVcWeight + lv.dVM * Mis(camDirPdfW);
                     double wCamera = dVCM * ctx.misVcWeight + dVM * Mis(camRevPdfW);
                     double misW = 1.0 / (wLight + 1.0 + wCamera);
-                    Vec3 cieL(lv.cx, lv.cy, lv.cz);   // cached at store time (bit-identical)
-                    Vec3 add = cieL * (misW * fCam * lv.beta);
-                    if (lvUp > 1) {
-                        const LightVertexSec& ls = lightSec[(size_t)idx];
-                        for (int k = 0; k + 1 < lvUp; ++k)
-                            add = add + Vec3(ls.cx[k], ls.cy[k], ls.cz[k]) *
-                                        (misW * fSec[k] * gcorr * ls.beta[k]);
-                        add = add * (1.0 / (double)lvUp);
+                    // The camera's factors at each member's wavelength (VCM-SPEC), or, past a
+                    // dispersive event, the window around lambda coloured there (JSpec::disp).
+                    Vec3 add{0, 0, 0};
+                    if (vs && vs->disp) {
+                        const double lc = (double)vs->lamC;
+                        double w = misW * fCam * lv.beta * jDispWeight(*vs, lam);
+                        if (lvUp > 1) {
+                            const LightVertexSec& ls = lightSec[(size_t)idx];
+                            for (int k = 0; k + 1 < lvUp; ++k)
+                                w += misW * fSec[k] * gcorr * ls.beta[k] *
+                                     jDispWeight(*vs, (double)ls.lam[k]);
+                            w *= 1.0 / (double)lvUp;
+                        }
+                        add = Vec3(cieX(lc), cieY(lc), cieZ(lc)) * (w * vs->atC());
+                    } else {
+                        Vec3 cieL(lv.cx, lv.cy, lv.cz);   // cached at store time (bit-identical)
+                        add = cieL * (misW * fCam * lv.beta * (vs ? vs->at(lam) : 1.0));
+                        if (lvUp > 1) {
+                            const LightVertexSec& ls = lightSec[(size_t)idx];
+                            for (int k = 0; k + 1 < lvUp; ++k)
+                                add = add + Vec3(ls.cx[k], ls.cy[k], ls.cz[k]) *
+                                            (misW * fSec[k] * gcorr * ls.beta[k] *
+                                             (vs ? vs->at((double)ls.lam[k]) : 1.0));
+                            add = add * (1.0 / (double)lvUp);
+                        }
                     }
                     mergeXYZ += add;
                 });
-                result += mergeXYZ * (beta * ctx.vmNorm);
+                result += mergeXYZ * ((vs ? vs->beta(beta) : beta) * ctx.vmNorm);
             }
         }
 
@@ -1315,7 +1414,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         double secF[hero::kHeroMax - 1]; bool secChromatic = false, keepBundle = false;
         scatterSample(scene, mats, mp, h, rd, lambda, rng, wi, betaFactor, pdfW, pdfRevW,
                       cosThetaOut, delta, terminate, stk, Renderer::Transport::Radiance,
-                      hb.lam, nUp, secF, &secChromatic, &keepBundle);
+                      hb.lam, nUp, secF, &secChromatic, &keepBundle, jOn ? &jr : nullptr,
+                      invPdfLambda);
         double mxF = betaFactor;      // max over live λ, never the hero alone (policy 3)
         if (secChromatic) for (int i = 0; i + 1 < nUp; ++i) if (secF[i] > mxF) mxF = secF[i];
         if (terminate || mxF <= 0.0) return result;

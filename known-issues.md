@@ -353,7 +353,16 @@ the instant by the inverse of its motion transform (`Scene::motionAt`), with the
 offered to static groups (`space object`), so a pattern can stick to its object in an animation
 too.
 
-## OPEN (2026-11-02, 0.400.8): VCM-SPEC — mode U's merges read the camera path's colours at the camera's wavelength, so a coloured surface seen before a merge washes out
+## FIXED (2026-11-04, 0.433.0; opened 2026-11-02, 0.400.8): VCM-SPEC — mode U's merges read the camera path's colours at the camera's wavelength, so a coloured surface seen before a merge washes out
+
+**Fixed in 0.433.0** by the first of the two fixes proposed below. Retiring mode U was not the
+choice: it still wins its own workload by 4-6x at equal time (REFERENCE.md, UPBP-VM). Mode U's camera
+walk carries mode J's spectral carrier (`JSpecRun`, the device's `DJSpecRun`), folded where each
+lobe is sampled. On the device the slots go through the shape their own read captured (`DJBase`).
+Each merge reads the carrier at the light vertex's wavelengths (design.md, JSPEC's "Mode U"). On
+`tools/check_rough_irid.py`'s spheres, which now hold mode U per channel on both backends, 0.432.1
+read the beetle's blue x1.25 and the chameleon's red x1.67 of mode R on the CPU (x1.21 and x1.60
+on the GPU). Now every sphere and channel is within 1.4 % on both.
 
 Mode J had this bug and lost it in 0.386.1 (JSPEC, design.md); mode U never got the fix. A merge
 pairs the camera subpath, which ran at the camera sample's wavelength λ_c, with photons traced

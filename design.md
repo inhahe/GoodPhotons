@@ -2663,6 +2663,18 @@ with the carrier, 1.38 without. **On `gallery_rain`** (320x180, full-frame J, 4 
 against D 4 × 4096): the rain over the coloured grid went from −7.3 % to +1.1 %, and the cloud and
 the rain against the sky stayed within 0.3–0.9 % (known-issues.md, RAIN-J-VS-D).
 
+**Mode `U` (0.433.0, VCM-SPEC)** carries the same carrier on its camera walk (`vcm.h`
+`traceCameraSubpath`, the device's `kVcmCameraT`). Each lobe `scatterSample` / `dVcmScatter` samples
+is folded where it is sampled, as mode J's walk folds it: the slots through the shape their own read
+captured (`DJBase`, on the device), the dielectric step through its record, the grating's order
+and the half mirror's coin. Coloured glass is folded along each segment and a layered coat's coin
+where it is tossed. Each merge reads the carrier snapshotted at its camera vertex, at the light
+vertex's hero and secondary wavelengths, or through the dispersive window once a grating's order
+(or, under `-jdispall`, a dispersive refraction) opened it. Mode U's device session uploads mode
+J's switches itself (`c_jSpecOn`, `c_jDispWin`, `c_jDispAll`), and `FTRACE_JSPEC=0` turns both
+modes' carriers off. `tools/check_rough_irid.py` holds mode U to mode R per channel on both
+backends.
+
 ### Mode `J` merges through glass, and the aimed sun (MODE-J-SDS, 0.387.0)
 
 **The gap.** A path light → glass → diffuse → glass → camera (a caustic seen *through* glass) has
