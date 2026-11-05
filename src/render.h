@@ -3693,7 +3693,7 @@ struct Renderer {
                     // BEFORE the Russian-roulette reflect/absorb so the record captures
                     // the arriving power (direct on the first hit, indirect thereafter).
                     // Not on a strand, where no gather takes it (CURVE-GATHER).
-                    if (!(h.fiberRadius > 0.0))
+                    if (!gatherlessStrand(m, h.fiberRadius))
                         depositPhoton(h.p, ngo, lambda, beta, sawFocus && !sawScatter);
                     sawScatter = true;   // whatever leaves this vertex is diffuse indirect light
                     if (nCam > 0 && !forwardCatch) {
@@ -4197,7 +4197,7 @@ struct Renderer {
                     // stays energy-consistent with the scalar single-λ deposit.
                     {
                         const bool caus = sawFocus && !sawScatter;
-                        if (!(h.fiberRadius > 0.0))   // not on a strand (CURVE-GATHER)
+                        if (!gatherlessStrand(m, h.fiberRadius))   // not on a strand (CURVE-GATHER)
                             for (int i = 0; i < nUp; ++i)
                                 depositPhoton(h.p, ngo, lam[i], beta[i], caus);
                         sawScatter = true;   // past a diffuse vertex it is indirect light

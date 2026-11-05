@@ -490,6 +490,16 @@ struct Material {
     int mixWeightTex = -1;
 };
 
+// CURVE-GATHER: a `type diffuse` strand (fur, grass, wire: any curve; `fiberRadius` is its Hit's)
+// holds no photon, and modes M and S never gather on one. Their camera walks light it by NEE and go
+// on along its diffuse lobe (photonmap_render.h, strandStep), the photon pass deposits nothing on it,
+// and the coverage probes pass through it. A gather there would divide the photons on its
+// neighbours by a disc's area. A `diffuse_transmit` or fluorescent strand still gathers: the first
+// would need a two-sided NEE, the second its wavelength shift. Device twin dGatherlessStrand.
+inline bool gatherlessStrand(const Material& m, double fiberRadius) {
+    return m.type == MatType::Diffuse && fiberRadius > 0.0;
+}
+
 // A PLANAR-SPECULAR (perfect-mirror) material: one whose reflection off a flat face is
 // an exact mirror image — a delta lobe with a plain reflectance and no bending — so the
 // forward light tracer can connect a photon vertex to the pinhole THROUGH it by

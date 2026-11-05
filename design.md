@@ -5620,7 +5620,8 @@ as the one at fault.
   radius (one quad, a leaf) is crossed once, so the floor under it is taken for a solid's inside and
   reads bright; and a solid taller than the radius holds the probe's origin, so nothing is crossed
   and the floor under it counts, the dark halo every version before 0.431.0 had at such a base too.
-  `-gageom`'s march takes the same count per column. Sixteen faces without an answer are a miss.
+  `-gageom`'s march takes the same count per column. Sixteen faces without an answer are a miss; a
+  strand that holds no photon (below) is passed through and costs none of them, up to 48 strands.
   `gatherCoverage` /
   `gatherAreaScale` in `photonmap_render.h`, device twin `dGatherCoverage` in `render_cuda.cu`.
   Each map's coverage is taken at that map's radius and scales that map's estimate alone: the
@@ -5646,8 +5647,13 @@ as the one at fault.
   divides by the whole disc. Since 0.433.3 (CURVE-GATHER) modes M and S gather on a `type diffuse`
   strand not at all: their camera walks light it by NEE (`neeLight` / `bkNeeLight`, the continuation's
   emitter hit then not counted again), fold its reflectance into the carrier and walk on along its
-  diffuse lobe to the surface that gathers, and the photon pass deposits nothing on one. Only a
-  `diffuse_transmit` or fluorescent strand still gathers, and takes the exemption. Modes U and J take
+  diffuse lobe to the surface that gathers, and the photon pass deposits nothing on one. One
+  predicate says which strand that is (`gatherlessStrand`, scene.h; device `dGatherlessStrand`) and
+  one step takes it for every walk that would gather (`strandStep`, photonmap_render.h; device
+  `dStrandStep`), the final gather's sub-walks included since 0.433.6; the coverage probes and
+  `-gageom`'s march pass such a strand through, as no surface and no crossing. Only a
+  `diffuse_transmit` or fluorescent strand still gathers, and takes the exemption. A strand lit only
+  through a specular chain by a delta light gets no caustic (known-issues CURVE-CAUSTIC). Modes U and J take
   neither test: their merges have no footprint to say
   how much of the disc is the gather's own surface, so dropping another surface's photons only
   darkened the disc where the surface ends (0.62 and 0.61 of mode R at a box's base, against 0.94

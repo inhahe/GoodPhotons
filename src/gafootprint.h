@@ -134,6 +134,9 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             // reproduces the query on all three shapes that matter: a closed solid's far face
             // opposes and drops out, stacked thin shells all agree and are all counted, and an
             // authored quad works whichever way its `u x v` happens to point.
+            const Material* mm = (h.matId >= 0 && h.matId < (int)sc.mats.size()) ? &sc.mats[h.matId] : nullptr;
+            // A strand that holds no photon is neither area nor a crossing: the probe passes it.
+            if (mm && gatherlessStrand(*mm, h.fiberRadius)) { t0 = h.t + eps; continue; }
             const double c = dot(h.ng, n) * orient;
             // Same-facing and in the tangent-plane band: what the photon query keeps.
             const Vec3 dh = h.p - p;
@@ -141,7 +144,6 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             if (withinGatherBand(std::fabs(off), dot(dh, dh), std::fabs(c), slack)) {
                 if (c >= kGatherFacingCos) colArea += cellArea / c;
             } else if (off > 0.0) {
-                const Material* mm = (h.matId >= 0 && h.matId < (int)sc.mats.size()) ? &sc.mats[h.matId] : nullptr;
                 // not a face holding no photon, nor a hair strand (the probe's coin decides those)
                 if (!(mm && (probePassesThrough(*mm) || mm->type == MatType::Hair))) ++crossed;
             }

@@ -7,7 +7,8 @@ a ceiling panel. A gather on a strand is no surface estimate: the photons in its
 neighbouring strands. Since 0.433.3 modes M and S never gather there (known-issues CURVE-GATHER):
 they light a strand by NEE and walk on along its diffuse lobe, and deposit no photon on one. Before
 that the coat read, of mode R, M 0.71 (GPU) / 0.87 (CPU) and S 1.33 / 1.45; now 1.007 / 0.976 and
-0.986 / 0.981. Mode U still merges on strands (VCM-THIN-CURVES), at 2.10 / 2.36.
+0.986 / 0.981. Mode U still merges on strands (VCM-THIN-CURVES), at 2.10 / 2.36. Mode M runs with
+its final gather (`-pmfg`) too, whose sub-walk has taken the same step since 0.433.6: 1.009 / 1.050.
 
 The coat is the mean over the ball's middle, two seeds, against mode R's on the GPU. In modes M, S
 and U on the CPU and the GPU it must lie within 10 % of the value recorded below. Mode U's is not 1;
@@ -47,6 +48,9 @@ REF = ["-mode", "R", "-device", "gpu", "-spp", "512"]
 # (name, arguments, the coat's value against mode R as recorded)
 CASES = [("M_gpu", ["-mode", "M", "-device", "gpu", "-n", "4000000", "-spp", "16"], 1.007),
          ("M_cpu", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "4"], 0.976),
+         # the final gather, whose sub-walk meets the strands from the skin
+         ("Mfg_gpu", ["-mode", "M", "-device", "gpu", "-n", "4000000", "-spp", "16", "-pmfg", "16"], 1.009),
+         ("Mfg_cpu", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "2", "-pmfg", "8"], 1.050),
          ("S_gpu", ["-mode", "S", "-device", "gpu", "-spp", "16"], 0.986),
          ("S_cpu", ["-mode", "S", "-device", "cpu", "-spp", "4"], 0.981),
          ("U_gpu", ["-mode", "U", "-device", "gpu", "-spp", "16"], 2.100),
@@ -78,11 +82,11 @@ def main():
     for name, args, want in CASES:
         got = coat(name, args, "gpu" in name) / ref
         if a.record or want is None:
-            print("%-6s coat %.3f of mode R  (record)" % (name, got))
+            print("%-7s coat %.3f of mode R  (record)" % (name, got))
             continue
         good = abs(got / want - 1.0) <= TOL
         ok &= good
-        print("%-6s coat %.3f of mode R, recorded %.3f  %s" % (name, got, want, "ok" if good else "FAIL"))
+        print("%-7s coat %.3f of mode R, recorded %.3f  %s" % (name, got, want, "ok" if good else "FAIL"))
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

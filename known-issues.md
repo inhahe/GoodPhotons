@@ -81,8 +81,17 @@ counted again. The photon pass deposits nothing on a strand. check_fur_gather's 
 M 0.711 (GPU) / 0.871 (CPU) -> 1.007 / 0.976, and S 1.330 / 1.446 -> 0.986 / 0.981; the two backends
 now agree. fur_creature in GPU mode M (240 x 180, against mode R): the frame 0.9664 -> 0.9997, and
 blocks off by more than 10 % at 5 sigma 170 -> 2 of 660. A `diffuse_transmit` or fluorescent strand
-still gathers (the first would need a two-sided NEE, the second its wavelength shift), and so does
-`-pmfg`'s final-gather sub-walk. **Mode U is unchanged** (2.10 / 2.36): its merge gates, light store
+still gathers (the first would need a two-sided NEE, the second its wavelength shift). **Since
+0.433.6** (the review of 0.433.3-0.433.4) the final-gather sub-walk (`-pmfg`) takes the same step:
+until then it went on density-estimating on strands that no longer held photons, though the
+ground's photons within the radius kept the loss to about 1 % (under `-pmfg`, of mode R, GPU then
+CPU: a turf of grass blades 0.988 0.989 -> 0.998 0.998; check_fur_gather's floor beside the ball
+0.983 0.975 -> 0.994 0.985). check_fur_gather's coat under `-pmfg` reads 1.009 on the GPU and 1.050
+on the CPU, before the fix and after: a backend gap of 4 % in the final gather on fur, not looked
+into. The coverage probes and `-gageom`'s march pass such a strand through, counting it
+neither as surface nor as a crossing, where they had counted it as a face that held photons. One
+predicate (`gatherlessStrand` / `dGatherlessStrand`) and one step per backend (`strandStep` /
+`dStrandStep`) now serve every walk, deposit and probe. **Mode U is unchanged** (2.10 / 2.36): its merge gates, light store
 and MIS recursions treat a strand as a hair strand only for `type hair`, and need the same extension
 (VCM-THIN-CURVES). This also changes how gallery_rain's fur creature looks in mode M, toward mode R:
 the flyby renders in mode M.
@@ -119,6 +128,23 @@ the host takes the coat with probability R. check_rough_irid now holds mode S's 
 mode R on each backend (CPU 0.96 / 1.20 / 0.77, GPU 0.89 / 1.08 / 0.88: within its 5-sigma test on
 a red sphere's small green and blue). Found checking the coat coin's fix against mode R (Opus review
 of 90e0486..bea7be1).
+
+## OPEN (2026-11-04, 0.433.6): CURVE-CAUSTIC — modes M and S light a `type diffuse` strand only by NEE and its diffuse continuation, so a caustic from a point or spot light misses it
+
+Found by the Opus review of 0.433.3-0.433.4. Since CURVE-GATHER the photon pass stores nothing on a
+`type diffuse` strand and the camera walks never gather on one. NEE cannot connect through glass or
+a mirror, and the strand's diffuse continuation cannot hit a light with no area, so light that
+reaches a strand only through a specular chain from a point or spot light (a spot focused through a
+lens onto grass) is no longer counted there. Before 0.433.3 the strand gathered those caustic photons
+(with a density estimate that was itself wrong: a disc's area for a slab of strands). An area light
+behind the glass is still reached by the continuation, path-traced and noisy. Mode R cannot render a
+delta light's caustic at all; modes D and J can, by light tracing.
+
+Proper fix: a density estimate shaped for a strand, on the caustic map only. Deposit caustic photons
+on strands (`sawFocus && !sawScatter`) into the caustic map, and estimate at a strand from the
+photons on its own surface within the ball, divided by that surface's area within the ball (about
+2 pi r_f times the strand's length inside it), rather than by a disc. Not measured yet: no scene in
+the repo lights fur that way.
 
 ## OPEN (2026-11-04, 0.432.1): PROBE-PARITY-LIMITS — two shapes the footprint probe's crossing count misreads
 

@@ -7546,6 +7546,11 @@ __device__ static bool dProbePassesThrough(const DMaterial& m) {
         default: return false;
     }
 }
+// A strand that holds no photon, where modes M and S never gather (host twin gatherlessStrand,
+// where the reasoning lives).
+__device__ static inline bool dGatherlessStrand(const DMaterial& m, const DHit& h) {
+    return m.type == D_DIFFUSE && h.fiberRadius > (Real)0;
+}
 
 // The vector glue of gatherplane.h's rule (MERGE-PROXIMITY), which both backends call: a stored
 // photon belongs to a mode-M or mode-S gather's surface when it faces the gather point's way and
@@ -7609,7 +7614,7 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
             Real tAcc = (Real)0, curveTmin = (Real)0;
             int crossed = 0;                     // photon-holding faces passed above the band
             bool found = false;                  // the probe ended on what it counts
-            for (int pass = 0; pass < 16; ++pass) {
+            for (int pass = 0, skip = 0; pass < 16 + skip; ++pass) {   // a strand costs none, to 48 (host twin)
                 // Past a strand the curve tmin clears its tube and a surface just behind it must
                 // still be found: tmin 0 then, as every curve-tmin caller does.
                 h = closestHit(sc, o, dn, (curveTmin > (Real)0) ? (Real)0 : RAY_EPS,
@@ -7621,6 +7626,11 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
                 // is the surface's height (a glass box standing on the floor) -- host twin.
                 if (dProbePassesThrough(hm) && r - h.t > fmaxf((Real)1e-3 * r, (Real)2 * RAY_EPS)) {
                     tAcc = h.t; o = h.p; curveTmin = (Real)0;
+                    continue;
+                }
+                if (dGatherlessStrand(hm, h)) {           // no photon, and the surface is beyond it
+                    if (skip < 48) ++skip;
+                    tAcc = h.t; o = h.p; curveTmin = (Real)2.5 * h.fiberRadius;
                     continue;
                 }
                 if (hm.type == D_HAIR && h.fiberRadius > (Real)0) {
@@ -12335,7 +12345,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
         // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path; not on a strand,
         // where no gather takes it (CURVE-GATHER, host twin render.h)
-        if (!(h.fiberRadius > (Real)0))
+        if (!dGatherlessStrand(m, h))
             depositPhoton(cs, h.p, ngo, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
         if (pathC) pathC->bits |= PV_BIT_SCATTER;   // past here it is diffuse indirect light
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
@@ -12828,7 +12838,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
       // ...with the aimed caustic pass's MIS weight, as the scalar deposits carry it; not on a
       // strand (CURVE-GATHER).
       const Real cw = dPathCausticW(pathC);
-      if (!(h.fiberRadius > (Real)0))
+      if (!dGatherlessStrand(m, h))
           for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngo, beta[i], lam[i], caus, cw);
       if (pathC) pathC->bits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
     if (camMode == CAM_A || camMode == CAM_B) {
@@ -19247,6 +19257,11 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
 // disjoint set from `pm`'s and it carries its own, much smaller, radius — so the two density
 // estimates are simply summed. `pmC.photons == nullptr` when the split is off or the scene
 // produced no caustic path, and then this costs one predictable branch per gather.
+struct DSpecThr;
+__device__ static double dStrandStep(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda,
+                                     double invPdfL, DRng& rng, double& thr, DSpecThr* sthr,
+                                     DVec3& ro, DVec3& rd, bool& cont);
+
 __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                                         const DPhotonMap& pmC, int diffraction,
                                         DVec3 ro, DVec3 rd, Real lambda, double invPdfL,
@@ -19320,6 +19335,16 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
         const bool hairArrivalIn = hairArrival, specularSeenIn = specularSeen;   // a hair pass-through puts these back
         bool nullHere = false;
         hairArrival = false;
+        // CURVE-GATHER: no density estimate on a strand that holds no photon (host twin).
+        if (dGatherlessStrand(m, h)) {
+            const double rhoV = (double)clamp01(dDiffuseRho(sc, visMat, visHit, lambda));
+            bool cont;
+            const double e = dStrandStep(sc, m, h, lambda, invPdfL, rng, thr, nullptr, ro, rd, cont) * rhoV;
+            oX += (double)cieX(lambda) * e; oY += (double)cieY(lambda) * e; oZ += (double)cieZ(lambda) * e;
+            hairArrival = true;
+            if (!cont) return;
+            continue;
+        }
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
             const DVec3 gn = dShadedNg(h);   // the true normal, as the photons carry it
             // Density estimate at y, folding the visible-point reflectance per photon wavelength.
@@ -19692,6 +19717,21 @@ struct DSpecThr {
 };
 static_assert(DSpecThr::K == DJSPEC_K, "mode M's carrier and the beam gather's share a grid");
 
+// CURVE-GATHER: a camera walk's step at a strand that holds no photon (host twin strandStep, where the
+// why is): its direct light by NEE times `thr` as it arrived, returned; its reflectance into `thr`
+// and, if given, the carrier; the ray turned along its diffuse lobe; `cont` false where the walk has
+// nothing left to carry.
+__device__ static double dStrandStep(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda,
+                                     double invPdfL, DRng& rng, double& thr, DSpecThr* sthr,
+                                     DVec3& ro, DVec3& rd, bool& cont) {
+    const double rho = (double)clamp01(dDiffuseRho(sc, m, h, lambda));
+    const double d = thr * bkNeeLight(sc, h, (Real)rho, invPdfL, lambda, rng);
+    thr *= rho;
+    if (sthr) sthr->mul(sc, [&](Real L) { return (double)clamp01(dDiffuseRho(sc, m, h, L)); }, rho);
+    cont = dContinueAlong(h, cosineHemisphere(h.n, rng), DL_REFLECT, ro, rd) && thr > 0.0;
+    return d;
+}
+
 // Mode M's beam gather over one straight camera segment, ADDED to (oX, oY, oZ) times the walk's
 // throughput `thr`, with its spectral factors (`sthr`) and the glass the segment runs through
 // (`glass`, -1 if none) read at each beam's own wavelength (host twin: photonGather's
@@ -19955,16 +19995,13 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         const DGlossyMis gmisIn = gmis;   // a hair pass-through puts it back
         gmis.clear();
         // CURVE-GATHER (host twin photonGather, where the why is): no gather on a `type diffuse`
-        // strand; it is lit by NEE and the walk goes on along its diffuse lobe.
-        if (m.type == D_DIFFUSE && h.fiberRadius > (Real)0) {
-            const double rho = (double)clamp01(dDiffuseRho(sc, m, h, lambda));
-            const double dc = thr * bkNeeLight(sc, h, (Real)rho, invPdfL, lambda, rng);
+        // strand; it is lit by NEE and the walk goes on along its diffuse lobe (dStrandStep).
+        if (dGatherlessStrand(m, h)) {
+            bool cont;
+            const double dc = dStrandStep(sc, m, h, lambda, invPdfL, rng, thr, &sthr, ro, rd, cont);
             oX += (double)cieX(lambda) * dc; oY += (double)cieY(lambda) * dc; oZ += (double)cieZ(lambda) * dc;
             hairArrival = true;
-            thr *= rho;
-            sthr.mul(sc, [&](Real L) { return (double)clamp01(dDiffuseRho(sc, m, h, L)); }, rho);
-            if (!dContinueAlong(h, cosineHemisphere(h.n, rng), DL_REFLECT, ro, rd)) return;
-            if (thr <= 0.0) return;
+            if (!cont) return;
             continue;
         }
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
@@ -20460,15 +20497,12 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         strandArrival = false;
 
         // CURVE-GATHER: no visible point on a `type diffuse` strand (host twin).
-        if (m.type == D_DIFFUSE && h.fiberRadius > (Real)0) {
-            const double rho = (double)clamp01(dDiffuseRho(sc, m, h, lambda));
-            const double dc = thr * bkNeeLight(sc, h, (Real)rho, invPdfL, lambda, rng);
+        if (dGatherlessStrand(m, h)) {
+            bool cont;
+            const double dc = dStrandStep(sc, m, h, lambda, invPdfL, rng, thr, &sthr, ro, rd, cont);
             dX += (double)cieX(lambda) * dc; dY += (double)cieY(lambda) * dc; dZ += (double)cieZ(lambda) * dc;
             strandArrival = true;
-            thr *= rho;
-            sthr.mul(sc, [&](Real L) { return (double)clamp01(dDiffuseRho(sc, m, h, L)); }, rho);
-            if (!dContinueAlong(h, cosineHemisphere(h.n, rng), DL_REFLECT, ro, rd)) return;
-            if (thr <= 0.0) return;
+            if (!cont) return;
             continue;
         }
 

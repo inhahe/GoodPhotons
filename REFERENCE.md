@@ -1128,9 +1128,15 @@ that converges to the same physical image.
   a photon only if it lies near the gather point's tangent plane, with room for the surface's own
   curvature, so a table top no longer gathers the floor's light once the radius outgrows its
   height (in mode `M` the top of a sheet lit only from below used to read 21× its brightness lit
-  from above). A gather on a strand thinner than the radius (`type diffuse` fur, grass, wire)
-  keeps its neighbours' photons, as such a strand has no tangent plane at the radius's scale.
-  Modes `U` and `J` merge as before: their radius shrinks as the render converges.
+  from above). Modes `U` and `J` merge as before: their radius shrinks as the render converges.
+  **No gather on a `type diffuse` strand (0.433.3).** Modes `M` and `S` light a `type diffuse`
+  strand (fur, grass, wire) by next-event estimation and walk on along its diffuse lobe to the
+  surface that gathers, the final gather's rays (`-pmfg`) too since 0.433.6, and the photon pass
+  stores nothing on one: the photons around a point on a strand lie on its neighbours, which no
+  disc's area describes. So a strand lit only through glass or a mirror by a point or spot light
+  shows no caustic in these modes (mode `R` cannot render that light either). A `diffuse_transmit`
+  or fluorescent strand still gathers, keeping its neighbours' photons, as such a strand has no
+  tangent plane at the radius's scale.
   **A low `-pmcount` now actually takes effect on a large scene (0.199.6).** The photon grid
   used to be a *dense* lattice — one int per cell — so a fine radius over a big scene asked for
   an array that grew as (scene size / radius)³, and the map defended itself by growing the

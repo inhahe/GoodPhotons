@@ -183,17 +183,14 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
         gmis.clear();
         strandArrival = false;
 
-        // CURVE-GATHER: no visible point on a `type diffuse` strand (mode M's walk, where the why
+        // CURVE-GATHER: no visible point on a `type diffuse` strand (strandStep, where the why
         // is): lit by NEE, the walk goes on along its diffuse lobe to the surface that gathers.
-        if (m.type == MatType::Diffuse && h.fiberRadius > 0.0) {
-            const double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
+        if (gatherlessStrand(m, h.fiberRadius)) {
+            bool cont;
             directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                       * (thr * bwNee.neeLight(scene, h, rho, invPdfL, lambda, rng));
+                       * strandStep(scene, bwNee, m, h, lambda, invPdfL, rng, thr, &sthr, ray, cont);
             strandArrival = true;
-            thr *= rho;
-            sthr.mul([&](double L) { return clamp01(diffuseReflectance(scene, m, h, L)); }, rho);
-            if (!continueAlong(h, cosineHemisphere(h.n, rng), Lobe::Reflect, ray)) return;
-            if (thr <= 0.0) return;
+            if (!cont) return;
             continue;
         }
 

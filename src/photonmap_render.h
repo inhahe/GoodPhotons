@@ -449,7 +449,9 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
             double tAcc = 0.0;
             int crossed = 0;                     // photon-holding faces passed above the band
             bool found = false;                  // the probe ended on what it counts
-            for (int pass = 0; pass < 16; ++pass) {
+            // A strand the probe passes through costs none of the sixteen faces, up to 48 of them:
+            // under a fur coat it may cross a few on its way to the skin.
+            for (int pass = 0, skip = 0; pass < 16 + skip; ++pass) {
                 h = scene.closestHit(pr);
                 if (!h.valid) break;
                 h.t += tAcc;
@@ -461,6 +463,13 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 if (pm && probePassesThrough(*pm) && r - h.t > 1e-3 * r) {
                     tAcc = h.t;
                     pr = Ray{h.p + pr.d * 1e-9, pr.d};
+                    continue;
+                }
+                if (pm && gatherlessStrand(*pm, h.fiberRadius)) {
+                    // Holds no photon, and the surface the gather's photons lie on is beyond it.
+                    if (skip < 48) ++skip;
+                    tAcc = h.t;
+                    pr = Ray{h.p + pr.d * 1e-9, pr.d, 2.5 * h.fiberRadius + 1e-9};   // through the tube
                     continue;
                 }
                 if (pm && pm->type == MatType::Hair && h.fiberRadius > 0.0) {
@@ -1179,6 +1188,22 @@ inline void camMediaTrSpec(const Scene& scene, const Renderer& mats, const Vec3&
     for (int k = 0; k <= SpecThr::K; ++k) Tv[k] = acc[k] / (double)n;
 }
 
+// CURVE-GATHER: a camera walk's step at a strand that holds no photon (gatherlessStrand), for every
+// walk that would gather: its direct light by NEE at the walk's wavelength, returned times `thr` as
+// it arrived; its reflectance into `thr` and, if given, the carrier; and `ray` turned along its
+// diffuse lobe. `cont` comes back false where the walk has nothing left to carry. The caller marks
+// the arrival, so the emitter the continuation meets is not counted again (as after a hair strand).
+inline double strandStep(const Scene& scene, const BackwardRenderer& bw, const Material& m,
+                         const Hit& h, double lambda, double invPdfL, Pcg32& rng, double& thr,
+                         SpecThr* sthr, Ray& ray, bool& cont) {
+    const double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
+    const double d = thr * bw.neeLight(scene, h, rho, invPdfL, lambda, rng);
+    thr *= rho;
+    if (sthr) sthr->mul([&](double L) { return clamp01(diffuseReflectance(scene, m, h, L)); }, rho);
+    cont = continueAlong(h, cosineHemisphere(h.n, rng), Lobe::Reflect, ray) && thr > 0.0;
+    return d;
+}
+
 inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pcg32& rng,
                             bool diffraction, int maxBounce, double lambda, double invPdfL,
                             double norm, const Hit& visHit, const Material& visMat,
@@ -1277,6 +1302,18 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
         bool nullHere = false;
         gmis.clear();
         hairArrival = false;
+
+        // CURVE-GATHER: no density estimate on a strand that holds no photon (strandStep). Every
+        // term this sub-walk reports carries the visible point's reflectance.
+        if (gatherlessStrand(m, h.fiberRadius)) {
+            const double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
+            bool cont;
+            const double d = strandStep(scene, bwNee, m, h, lambda, invPdfL, rng, thr, nullptr, ray, cont);
+            L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (d * rhoV);
+            hairArrival = true;
+            if (!cont) return L;
+            continue;
+        }
 
         switch (m.type) {
             case MatType::Diffuse:
@@ -1647,17 +1684,14 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
         // on. The photons in a ball around a point on it lie on its neighbours, and dividing them by
         // a disc's area read a diffuse coat at 0.71-0.87 of mode R (check_fur_gather). As a hair
         // strand is, it is lit here by NEE, and the walk goes on along its diffuse lobe to the
-        // surface that gathers; the emitter that continuation meets is not counted again
-        // (`hairArrival`). The photon pass deposits nothing on a strand to match (render.h).
-        if (m.type == MatType::Diffuse && h.fiberRadius > 0.0) {
-            const double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
+        // surface that gathers (strandStep); the emitter that continuation meets is not counted
+        // again (`hairArrival`).
+        if (gatherlessStrand(m, h.fiberRadius)) {
+            bool cont;
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                 * (thr * bwNee.neeLight(scene, h, rho, invPdfL, lambda, rng));
+                 * strandStep(scene, bwNee, m, h, lambda, invPdfL, rng, thr, &sthr, ray, cont);
             hairArrival = true;
-            thr *= rho;
-            sthr.mul([&](double Lw) { return clamp01(diffuseReflectance(scene, m, h, Lw)); }, rho);
-            if (!continueAlong(h, cosineHemisphere(h.n, rng), Lobe::Reflect, ray)) return L;
-            if (thr <= 0.0) return L;
+            if (!cont) return L;
             continue;
         }
 
