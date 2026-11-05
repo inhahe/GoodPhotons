@@ -1452,10 +1452,14 @@ continues the *absolute* sample sequence past whatever the checkpoint holds, so 
 samples genuinely reduce variance; in the deterministic mode `W` the continuation is exact,
 and `-spp 3` followed by `-resume -spp 5` gives bit-for-bit the pixels of a plain `-spp 8`
 (note that `-spp` under `-resume` means *additional* samples, not a total). A resumed mode `J`
-rebuilds its beam map from the same seed, so the *merge* half of every added sample repeats the
-map the checkpoint was made against while the *connection* half decorrelates normally — not a
-bias (the map is one fixed realisation of a view-independent cache either way, exactly as in
-mode `M`), just a limit on how much a resume can quiet the merged component. Since 0.190.3 the
+goes on from the light-side realizations its film holds (0.434.5). Every map it draws is new,
+under a seed past the loaded samples'. Under the wall-clock refresh its merge radii also carry
+on down their shrink schedule, from the count the sidecar records, rather than starting again at
+the full radius. Without that, a render resumed in pieces could never get under one piece's
+kernel bias. It says so: `mode J: resuming after K light-side realizations: the merge radii go
+on from there (beam kernel x…, surface radius x… of the first's)`. Under `-beamepochs` the epochs
+are laid over the frame's absolute samples, so a resume draws the realizations a straight render
+would. Since 0.190.3 the
 sidecar also carries the `-radcache` table when there is one, as a sparse trailing section,
 so a resumed run continues with a warm cache instead of relearning it. Only the
 persistent-state photon modes `M`/`S`/`U` (whose per-pass state a film alone can't restore)

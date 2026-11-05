@@ -121,4 +121,85 @@ inline Report checkTris(const Tri* tris, size_t n) {
     return check(pos, idx);
 }
 
+// Marks the faces of `tris` (one mesh object) that bound a closed solid facing outward, so that a
+// ray meeting one from behind is leaving the solid (Tri::solidFace, Hit::solid). "Facing" is the
+// intersector's: it turns a face's `ng` to the side its shading normals are on (intersectTri), so
+// a face counts by the side all three corner normals agree on, and one whose corners disagree
+// cannot say. Taken per connected piece (triangles sharing a welded vertex), which must have:
+//   - every edge used by exactly two of its faces, in opposite directions: closed and consistently
+//     wound;
+//   - every face's normals on one side of its winding, the same side over the whole piece, so
+//     `back` keeps one meaning there (an OBJ wound against its normals is fine, if it is so
+//     throughout);
+//   - a positive enclosed volume, taken on that side: it faces outward.
+// Every other face is cleared. Returns how many were marked.
+inline size_t markSolidFaces(Tri* tris, size_t n) {
+    if (n == 0) return 0;
+    Vec3 lo = tris[0].v0, hi = tris[0].v0;
+    for (size_t i = 0; i < n; ++i)
+        for (const Vec3* p : {&tris[i].v0, &tris[i].v1, &tris[i].v2}) {
+            lo.x = std::min(lo.x, p->x); lo.y = std::min(lo.y, p->y); lo.z = std::min(lo.z, p->z);
+            hi.x = std::max(hi.x, p->x); hi.y = std::max(hi.y, p->y); hi.z = std::max(hi.z, p->z);
+        }
+    const double diag = std::sqrt((hi.x-lo.x)*(hi.x-lo.x) + (hi.y-lo.y)*(hi.y-lo.y) + (hi.z-lo.z)*(hi.z-lo.z));
+    const double inv  = 1.0 / std::max(1e-9, diag * 1e-7);   // check()'s weld
+    std::unordered_map<detail::VKey, int, detail::VKeyHash> weld;
+    weld.reserve(n * 2);
+    std::vector<int> vid(n * 3);
+    for (size_t i = 0; i < n; ++i) {
+        const Vec3* c[3] = {&tris[i].v0, &tris[i].v1, &tris[i].v2};
+        for (int k = 0; k < 3; ++k) {
+            detail::VKey key{ std::llround(c[k]->x*inv), std::llround(c[k]->y*inv), std::llround(c[k]->z*inv) };
+            auto it = weld.emplace(key, (int)weld.size()).first;
+            vid[i * 3 + k] = it->second;
+        }
+    }
+    // The pieces: union-find over welded vertices.
+    std::vector<int> parent(weld.size());
+    for (size_t v = 0; v < parent.size(); ++v) parent[v] = (int)v;
+    const auto root = [&](int v) {
+        while (parent[(size_t)v] != v) { parent[(size_t)v] = parent[(size_t)parent[(size_t)v]]; v = parent[(size_t)v]; }
+        return v;
+    };
+    for (size_t i = 0; i < n; ++i) {
+        const int a = root(vid[i*3]), b = root(vid[i*3+1]), c = root(vid[i*3+2]);
+        parent[(size_t)b] = a; parent[(size_t)root(c)] = a;
+    }
+    std::vector<char> bad(parent.size(), 0);
+    std::vector<char> side(parent.size(), 0);     // +1 / -1: the piece's faces' normals with / against winding
+    std::vector<double> vol(parent.size(), 0.0);
+    std::unordered_map<detail::EKey, detail::EdgeUse, detail::EKeyHash> edges;
+    edges.reserve(n * 3);
+    for (size_t i = 0; i < n; ++i) {
+        const Tri& t = tris[i];
+        const int piece = root(vid[i*3]);
+        const int c[3] = {vid[i*3], vid[i*3+1], vid[i*3+2]};
+        for (int k = 0; k < 3; ++k) {
+            const int u = c[k], v = c[(k + 1) % 3];
+            if (u == v) continue;                    // a degenerate edge, as check() ignores it
+            const bool swap = u > v;
+            detail::EdgeUse& eu = edges[detail::EKey{ swap ? v : u, swap ? u : v }];
+            if (swap) eu.rev++; else eu.fwd++;
+        }
+        // Volume relative to the box's corner keeps the sums' rounding to the object's own scale.
+        const Vec3 a = t.v0 - lo, b = t.v1 - lo, d = t.v2 - lo;
+        vol[(size_t)piece] += dot(a, cross(b, d));
+        const double c0 = dot(t.gn, t.n0), c1 = dot(t.gn, t.n1), c2 = dot(t.gn, t.n2);
+        const char s = (c0 > 0.0 && c1 > 0.0 && c2 > 0.0) ? 1 : (c0 < 0.0 && c1 < 0.0 && c2 < 0.0) ? -1 : 0;
+        char& ps = side[(size_t)piece];
+        if (s == 0 || (ps != 0 && ps != s)) bad[(size_t)piece] = 1;
+        ps = s;
+    }
+    for (const auto& kv : edges)
+        if (!(kv.second.fwd == 1 && kv.second.rev == 1)) bad[(size_t)root((int)kv.first.a)] = 1;
+    size_t marked = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const int piece = root(vid[i*3]);
+        const bool s = !bad[(size_t)piece] && vol[(size_t)piece] * (double)side[(size_t)piece] > 0.0;
+        tris[i].solidFace = s ? 1 : 0;
+        marked += s ? 1 : 0;
+    }
+    return marked;
+}
+
 } // namespace watertight

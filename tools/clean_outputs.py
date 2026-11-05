@@ -315,6 +315,28 @@ def pid_alive(pid):
     return not ok or code.value == 259           # STILL_ACTIVE
 
 
+def pid_start_ticks(pid):
+    """When process `pid` started (100 ns ticks since 1601, GetProcessTimes), or 0 where that cannot
+    be read: what ftrace's processStartTicks writes on the second line of each .run, so a pid an
+    unrelated process inherited from a render that died without unregistering can be told apart."""
+    if os.name != "nt":
+        return 0
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.OpenProcess.restype = wintypes.HANDLE
+    k.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    k.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+    k.CloseHandle.argtypes = (wintypes.HANDLE,)
+    h = k.OpenProcess(0x1000, False, pid)        # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return 0
+    t = [wintypes.FILETIME() for _ in range(4)]
+    ok = k.GetProcessTimes(h, *(ctypes.byref(x) for x in t))
+    k.CloseHandle(h)
+    return (t[0].dwHighDateTime << 32 | t[0].dwLowDateTime) if ok else 0
+
+
 def stop_channel_dir():
     """Where every ftrace process registers itself (stopChannelDir in src/main.cpp:
     std::filesystem::temp_directory_path, i.e. GetTempPath on Windows, whose TMP-first order
@@ -329,8 +351,10 @@ def stop_channel_dir():
 
 def live_output_dirs():
     """Output directories of the ftrace processes alive now, from their stop-channel
-    registrations: <pid>.run, whose first line is "<scene> -> <output>" (stopChannelStart in
-    src/main.cpp). A relative output is taken from the repo root."""
+    registrations: <pid>.run, whose first line is "<scene> -> <output>" and whose second,
+    "start <ticks>", when the process started (stopChannelStart in src/main.cpp). A .run whose
+    pid is alive under another start time is a dead render's, the pid reused; one with no start
+    line (an older build's) is taken at its word. A relative output is taken from the repo root."""
     d = stop_channel_dir()
     dirs = []
     for f in (os.listdir(d) if os.path.isdir(d) else []):
@@ -339,8 +363,14 @@ def live_output_dirs():
         try:
             with open(os.path.join(d, f), encoding="utf-8", errors="replace") as fh:
                 out = fh.readline().strip().rsplit(" -> ", 1)[-1].strip()
+                start = fh.readline().strip()
         except OSError:
             continue
+        recorded = int(start[6:]) if start.startswith("start ") and start[6:].isdigit() else 0
+        if recorded:
+            now = pid_start_ticks(int(f[:-4]))
+            if now and now != recorded:
+                continue
         if not out or out.startswith("("):     # "(default output)", "(loom viewer)"
             continue
         full = out if os.path.isabs(out) else os.path.join(ROOT, out)

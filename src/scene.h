@@ -4998,6 +4998,26 @@ inline bool holdsPhotons(const Scene& scene, const Material& m, double fiberRadi
     }
 }
 
+// Whether light crosses a face of material `m` (unresolved): glass, a filter, a half mirror, a thin
+// film or stack clear at 550 nm, a diffuse transmitter, or a compound with such a lobe. The
+// footprint's crossing count takes every other face it meets above the gather's plane: a solid
+// standing on the surface shadows the floor under it, whether or not its own faces hold photons.
+// Device twin dPassesLight.
+inline bool passesLight(const Scene& scene, const Material& m) {
+    const auto leaf = [](const Material& k) {
+        switch (k.type) {
+            case MatType::Dielectric: case MatType::Filter: case MatType::HalfMirror:
+            case MatType::DiffuseTransmit:                   return true;
+            case MatType::ThinFilm: case MatType::Multilayer: return !k.coatOpaque(550.0);
+            default:                                         return false;
+        }
+    };
+    if (m.type != MatType::Mix && m.type != MatType::Layered) return leaf(m);
+    for (int c : m.mixChildren)   // a stack's bodies: the coat lets light into them
+        if (c >= 0 && c < (int)scene.mats.size() && leaf(scene.mats[(size_t)c])) return true;
+    return false;
+}
+
 // ---- Is a SPECTRAL BEAM BUNDLE valid in this scene? ---------------------------------------
 // A photon beam that carries several wavelengths (photonbeams.h, `-beamspec`) shares ONE
 // geometry and — decisively — ONE pair of transmittance marches between all of them, because

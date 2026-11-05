@@ -237,11 +237,38 @@ photons on its own surface within the ball, divided by that surface's area withi
 2 pi r_f times the strand's length inside it), rather than by a disc. Not measured yet: no scene in
 the repo lights fur that way.
 
+## OPEN (2026-11-05, 0.434.5): PROBE-UNDERSIDE — the probe and `-gageom`'s march count a ball's underside differently
+
+Found while testing PROBE-SOLID-SIDE on `tools/check_gather_base.py`'s diffuse ball, radius 0.15,
+resting on a lit floor, gathered at radius 0.1. Under the overhang the footprint probe starts
+inside the ball, goes down, and meets the ball's own tilted underside. `withinGatherBand` widens
+with a face's tilt (`k = 0.1 + sin`), so that face is "in band". Seen from inside, its normal faces
+the gather's way, so the probe ends there as covered. `-gageom`'s march climbs from below, keeps a
+face in band only inside the column's chord, and there counts the floor under the ball, crossing
+the underside above it. Up to 0.434.4 both dropped those columns by parity. Since 0.434.5 the march
+counts the floor (the closed solid's face says the column is outside), while the probe still ends
+on the underside. On the 2-5 cm ring at radius 0.1 the march reads 0.939 of the probe (0.927 against
+mode R where the probe reads 0.987). The probe's default path is unchanged from 0.434.4; at the
+check's ball radius of 0.05 the difference is outside its rings. Which is right: no photon lies
+on the ball's underside facing the floor's way (light reaches it from below, so its photons face
+down), so the probe should not count it. The proper fix is to pass, rather than end on, an
+in-band face met from inside a closed solid whose photons cannot face the gather. That needs to
+know the solid is opaque, which a room built as one closed box seen from inside is not. So it must
+come with a test that tells an enclosure from an object (whether the gather point lies inside the
+solid).
+
 ## OPEN (2026-11-04, 0.432.1): PROBE-PARITY-LIMITS — two shapes the footprint probe's crossing count misreads
 
-Modes M and S count the photon-holding faces their footprint probe crosses above the gather's
-tangent-plane band, and take an odd count to mean the column lies inside a solid resting on the
-surface (the halo fix, 0.432.1; the same count in `-gageom`'s march). Two shapes break the rule:
+Modes M and S count the faces their footprint probe crosses above the gather's tangent-plane band,
+and take an odd count to mean the column lies inside a solid resting on the surface (the halo fix,
+0.432.1; the same count in `-gageom`'s march). The faces counted were the photon-holding ones; since
+0.434.5 they are every face light cannot cross (`passesLight`), so a mirror box or an opaque coat
+over a glossy body shadows the floor under it as a diffuse box does. Also since 0.434.5, a face that
+bounds a closed solid wound outward (an analytic sphere, a closed mesh: `Hit::solid`,
+PROBE-SOLID-SIDE) says itself which side the probe is on, so the floor under the overhang of a ball
+resting on it is no longer read as the ball's inside. That parity error had been there for diffuse
+balls since 0.432.1. What follows is left for geometry that cannot say (quads, open meshes,
+isosurfaces, curves). Two shapes break the rule:
 - **An open surface hovering within the radius** (a single-quad table top, a leaf, a sheet of
   paper, a lampshade) is crossed once. The floor under it is taken for a solid's inside and is a
   miss, so a floor that does receive photons there is divided by too little area and reads bright.
@@ -3910,6 +3937,12 @@ To find it: FTRACE_J_HALF splits the estimator, and the CPU/GPU difference per h
 **Proper fix:** UPBP-BEAM-RADIUS's (a kernel radius that shrinks with the beam
 count, or a bias-corrected kernel). The lens check holds J to J with the aiming off instead of
 to R for this reason. Repro: `scenes/_realcam_fog.ftsl`.
+
+**UPBP-BEAM-RADIUS landed in 0.434.0.** Measured on `scenes/_realcam_fog.ftsl` at 128x86, GPU, mode J
+1024 spp over 1024 light-side epochs against mode D 16384, two seeds each: the whole frame read
+**−3.201 %** before (seeds −3.22, −3.18) and **−0.799 %** after (−0.85, −0.75; sd of the mean
+0.05 %). Most of the GPU's deficit was the fixed kernel. What is left is the shrink still under
+way at 1024 epochs. The CPU-only extra gap above is not touched by it, and stays open.
 
 ## DONE (2026-10-23, 0.396.0): PHYSLENS-REAR-SAMPLING — the backward lens camera sampled the whole rear element, which wasted most camera rays on a lens stopped down
 

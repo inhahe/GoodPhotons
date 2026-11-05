@@ -212,9 +212,13 @@ def build(t):
     chan = os.path.join(t, "_channel")              # a live render writing png/live/
     os.makedirs(chan)
     with open(os.path.join(chan, "%d.run" % os.getpid()), "w", encoding="utf-8") as f:
-        f.write("x.ftsl -> png/live/out.png\n")
+        f.write("x.ftsl -> png/live/out.png\nstart %d\n" % co.pid_start_ticks(os.getpid()))
     with open(os.path.join(chan, "999999.run"), "w", encoding="utf-8") as f:   # long gone
         f.write("x.ftsl -> png/a/out.png\n")
+    # A dead render's .run whose pid a live process has since inherited: its start time is not
+    # the one recorded, so png/a is not protected by it.
+    with open(os.path.join(chan, "%d.run" % os.getppid()), "w", encoding="utf-8") as f:
+        f.write("x.ftsl -> png/a/out.png\nstart 1\n")
     return gone, kept, chan
 
 

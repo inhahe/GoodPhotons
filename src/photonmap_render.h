@@ -438,16 +438,30 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
         // A photon-holding face off the gather's tangent-plane band (withinGatherBand at the photon
         // test's slack) is another surface's, whose photons the query drops. Below the band, none
         // of this surface lies under the probe: a miss. Above it -- a shelf, a table top over the
-        // floor point -- the probe goes on through, counting the faces it crosses: an odd count
-        // where it meets this surface means the column lies inside a solid resting on it (a box's
-        // own bottom face, or the floor inside a bottomless one), where no photon can be, and is
-        // a miss too. Counted as covered, it would ring the base of every object standing on a
-        // surface with a dark halo (a 3 cm box on a floor at radius 0.1: 0.75 of mode R within 5 cm).
+        // floor point -- the probe goes on through, counting the faces it crosses that light cannot
+        // (passesLight), photon-holding or not: where it then meets this surface the column may
+        // lie inside an opaque solid resting on it (a box's own bottom face, or the floor inside a
+        // bottomless one), where no photon can be, and is a miss too. Counted as covered, it would
+        // ring the base of every object standing on a surface with a dark halo (a 3 cm box on a
+        // floor at radius 0.1: 0.75 of mode R within 5 cm). A closed solid's face says which side
+        // the probe is on (PROBE-SOLID-SIDE); for the rest an odd count of them means inside.
         Hit h;
         {
             Ray pr{q + n * r, n * -1.0};
             double tAcc = 0.0;
-            int crossed = 0;                     // photon-holding faces passed above the band
+            // The opaque faces (passesLight) passed above the plane, which say whether the column
+            // ends inside a solid resting on this surface. One that bounds a closed solid wound
+            // outward (Hit::solid) says itself whether the probe went into it or out of it, so the
+            // last such, the nearest the plane, says whether the column ends in one (`lastSolid`:
+            // +1 into, -1 out of, 0 none) even where the probe began inside it (under the overhang
+            // of a ball resting on the floor). Every other face counts toward a parity (`crossed`),
+            // odd inside. Either puts the column inside.
+            int crossed = 0, lastSolid = 0;
+            const auto cross = [&](const Hit& c, const Material* cm) {
+                if (cm && passesLight(scene, *cm)) return;
+                if (c.solid) lastSolid = c.back ? -1 : 1;
+                else         ++crossed;
+            };
             bool found = false;                  // the probe ended on what it counts
             // A strand the probe passes through costs none of the sixteen faces, up to 48 of them:
             // under a fur coat it may cross a few on its way to the skin.
@@ -457,21 +471,23 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 h.t += tAcc;
                 if (h.t > 2.0 * r) break;                               // past the window: a miss
                 const Material* pm = (h.matId >= 0 && h.matId < (int)scene.mats.size()) ? &scene.mats[h.matId] : nullptr;
-                // On through a face that holds no photon -- but only one above the plane: a face ON
-                // it (a glass box standing on the floor, coplanar with it) is the surface's own
-                // height, and passing it would skip the surface beside it.
-                if (pm && probePassesThrough(scene, *pm) && r - h.t > 1e-3 * r) {
-                    tAcc = h.t;
-                    pr = Ray{h.p + pr.d * 1e-9, pr.d};
-                    continue;
-                }
+                // A strand that holds no photon, whatever its lobes, and the surface the gather's
+                // photons lie on is beyond it: through the tube, for none of the sixteen faces.
                 if (pm && h.fiberRadius > 0.0 && pm->type != MatType::Hair &&
                     !holdsPhotons(scene, *pm, h.fiberRadius)) {
-                    // Holds no photon (a diffuse strand, or a compound of them), and the surface
-                    // the gather's photons lie on is beyond it.
                     if (skip < 48) ++skip;
                     tAcc = h.t;
                     pr = Ray{h.p + pr.d * 1e-9, pr.d, 2.5 * h.fiberRadius + 1e-9};   // through the tube
+                    continue;
+                }
+                // On through a face that holds no photon -- but only one above the plane: a face ON
+                // it (a glass box standing on the floor, coplanar with it) is the surface's own
+                // height, and passing it would skip the surface beside it. An opaque one is a
+                // crossing all the same: a mirror box shadows the floor under it.
+                if (pm && probePassesThrough(scene, *pm) && r - h.t > 1e-3 * r) {
+                    cross(h, pm);
+                    tAcc = h.t;
+                    pr = Ray{h.p + pr.d * 1e-9, pr.d};
                     continue;
                 }
                 if (pm && pm->type == MatType::Hair && h.fiberRadius > 0.0) {
@@ -485,11 +501,11 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 }
                 const double dzH = r - h.t;
                 if (withinGatherBand(std::fabs(dzH), rr * rr + dzH * dzH, dot(orientedGeoN(h), n), slack)) {
-                    found = (crossed & 1) == 0;
+                    found = (crossed & 1) == 0 && lastSolid <= 0;
                     break;
                 }
                 if (!(dzH > 0.0)) break;                                // below the band: a miss
-                ++crossed;
+                cross(h, pm);
                 tAcc = h.t;
                 pr = Ray{h.p + pr.d * 1e-9, pr.d};
             }

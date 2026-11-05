@@ -2721,7 +2721,8 @@ seeds each: `FTRACE_JSPEC=0` −1.69 % with R/G/B 0.972 / 0.983 / 1.030; fixed �
 matched CPU seeds (the J light side shares its streams across those scenes), so that −0.7 % is not
 spectral. It is the beam kernel's boundary blur: it scales with `-beamblur` (−1.76 % at 4×, −0.14 %
 at ¼), because in a closed box every camera ray ends on a wall and the blur reaches past it, where
-there are no beams (J-FOGCORNELL; the fix would be a shrinking beam radius, UPBP-BEAM-RADIUS).
+there are no beams (J-FOGCORNELL). Since 0.434.0 mode J's beam radius shrinks per light-side
+epoch, which takes most of it away (UPBP-BEAM-RADIUS).
 `FTRACE_JSPEC=0` restores the old estimator on both backends for A/B runs.
 
 **Gates** (`-beamsinmin 0.3 -beamfreeze`, same seed, against the 0.386.0 binary, md5 of the PFM, on the
@@ -5263,7 +5264,11 @@ as the one at fault.
   format is extended, not reinterpreted. (The same reasoning puts the writing build's version at
   the very end, 0.378.3: `<version><u32 length>FTVERSN1`, read by seeking from the end
   (`sidecarVersion`), so resume can warn when it continues a render another build started —
-  `checkpointGuard` knows nothing of estimators.) Three details carry the design. **Sparse**, because
+  `checkpointGuard` knows nothing of estimators. And after the cache section comes mode J's,
+  0.434.5: `FTLSEPO1` and an `i64`, the wall-clock refresh's light-side realizations the film
+  holds, so a resume carries on down the merge radii's shrink schedule; written only when
+  non-zero. Each section reader leaves the stream where it was when its tag is not next, so
+  either may be absent.) Three details carry the design. **Sparse**, because
   the default table is 262 144 cells (~82 MB) and would otherwise be rewritten every
   `-interval`; occupancy is a tiny fraction of that (36 cells on a Cornell box, 8.7 k on
   `fur_creature`) since cells tile the visible *surface*. **Its own guard**
@@ -5653,17 +5658,36 @@ as the one at fault.
 
   The fix measures the covered fraction by **ray probe** rather than analytically: `M` stratified
   points in the tangent-plane disc, each traced from `r` above the plane straight down -- through
-  any surface above the plane that holds no photon (`probePassesThrough`: all but diffuse,
-  diffuse-transmitting and fluorescent surfaces and the compounds and fibers that may be one;
-  0.381.6-0.381.7; a face ON the plane is the surface's own height and counts) and through a fiber
-  with the probability its opacity leaves it absent -- accepted
+  any surface above the plane that holds no photon (`probePassesThrough`, `holdsPhotons`: all but
+  diffuse, diffuse-transmitting and fluorescent surfaces and the compounds with a lobe of one; a
+  light's own surface holds none either; a face ON the plane is the surface's own height and
+  counts), through a strand that holds none (its tube cleared by the curve-only tmin, at no cost
+  to the probe's sixteen faces for up to 48 strands), and through a hair fiber with the probability
+  its opacity leaves it absent -- accepted
   on the same test the photon query uses (facing within 60 degrees, and in the tangent-plane band
   below), and weighted by `1/cos(tilt)` because the
   probe samples PROJECTED area while the estimator needs SURFACE area. A photon-holding face off
   the band is another surface's: one below it ends the probe as a miss, and the probe goes on
-  through one above it, counting the faces it crosses. An odd count where it then meets the
-  gather's surface puts the column inside a solid resting on it (a box's own bottom face, or the
-  floor inside a bottomless one), where no photon can be: a miss too. Counted as covered, every
+  through one above it. Every face it crosses above the plane that light cannot cross
+  (`passesLight`: anything but glass, a filter, a half mirror, a clear film, a diffuse transmitter
+  or a compound with such a lobe) is counted, photon-holding or not. Where it then meets the
+  gather's surface, the column may lie inside an opaque solid resting on it (a box's own bottom
+  face, or the floor inside a bottomless one), where no photon can be: a miss too. A mirror box
+  counts as much as a diffuse one (0.434.5). **Inside is decided by the faces' own side where they
+  can say (PROBE-SOLID-SIDE).** A face that bounds a closed solid wound outward carries
+  `Hit::solid` (device `DHit::solid`): an analytic sphere's always, and a triangle's when
+  `markSolidFaces` (main.cpp, over `watertight::markSolidFaces`) found its connected piece closed,
+  consistently wound, of positive volume and with every corner's normal on its winding side. That
+  pass runs once per batch with a mode-M or mode-S camera; the flag sits in `Tri`'s and `DTri`'s
+  padding. For such a face `Hit::back` says whether the probe went into the solid or out of it,
+  and the last one crossed, the nearest the plane, puts the column inside when it was an entry.
+  That holds even where the probe began inside the solid: under the overhang of a ball resting on
+  the floor, its origin r above the plane lies in the ball, and parity read the floor there as
+  inside (check_bitid's glossy mesh ball, mode S 1.84 of mode R before the rule). Every other face
+  (a quad, a curve, an isosurface, an open mesh) keeps the parity, odd meaning inside, and either
+  rule puts the column inside. `-gageom`'s march climbs, so there the first such face above the
+  plane decides, met from inside meaning inside. An in-band face seen from behind decides nothing:
+  a room built as one closed box is seen from inside everywhere. Counted as covered, every
   object standing on a surface ringed its base with a dark halo (0.75 of mode R within 5 cm of a
   3 cm box at radius 0.1; 0.99 with the count). A closed shelf hovering within the radius is
   crossed twice, and the floor under it counts (the plain disc average across its shadow). Two
@@ -5968,6 +5992,13 @@ as the one at fault.
   the mfp radii and scales them **up only** if a camera segment would gather fewer than `K`,
   which is what stops a very sparse map rendering as individual streaks (iterated up to 3
   rounds × 16×, because a single ratio against a probe that measured 0 is meaningless).
+  **Mode J shrinks all of it per light-side epoch** (0.434.0, UPBP-BEAM-RADIUS): epoch `e`
+  builds its map with the mfp radii, the `-beamk` floor and each medium's `beam_blur` scaled by
+  `(e+1)^(alpha-1)` (`beamRadScaleFor`, `buildBeamMap`'s `radScale`). That is progressive photon
+  beams' schedule for a 1D kernel, under `-vcmalpha` and the epoch index the surface merges
+  shrink by. A beam merge's bias is O(r), so the epochs' mean bias, the Cesaro mean of O(r_e),
+  goes to 0. A wall-clock render resumed from its sidecar counts on from the realizations its
+  film holds (the sidecar's `FTLSEPO1` section). Mode M's map keeps the fixed radii.
   `-beamareaslack <f>` (default `1.0`) is the matching **ceiling**: `areaSlackScale` solves the
   exact quadratic `A(s) = A0 + B·s + C·s²` for the largest uniform scale on the radii whose
   kernel inflation grows the total sub-beam AABB area — the gather's cost metric — by at most

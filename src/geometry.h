@@ -121,6 +121,9 @@ struct Tri {
     // its shape at the frame's instant, which is one of the keys.
     int vkeys = -1;
     int vkeyCount = 0;
+    // 1 on the boundary of a closed solid wound outward (Scene::markSolidFaces), so a ray that
+    // meets it from behind (Hit::back) is leaving the solid. 0 on any face that cannot say.
+    unsigned char solidFace = 0;
     // triReach of the vertices, baked here for the hit to copy (Hit::pscale).
     double reach = 0.0;
     void finalize() {
@@ -297,6 +300,11 @@ struct Hit {
     // direction, dot(d, n), but not of one normal against another). An instance keeps its
     // local one, which that same property makes the world one too.
     bool back = false;
+    // The face bounds a closed solid wound outward (an analytic sphere, a triangle that
+    // Scene::markSolidFaces found so), so `back` says the ray is leaving it. False where the side
+    // a ray meets a face from says nothing of inside and out (an open quad, a curve, an
+    // isosurface). Every intersector writes it (the record is reused).
+    bool solid = false;
     // The surface's material lets light cross it (Material::patOwnSide), so its patterns see
     // its own side, ng's: their normal and curvature turned there when `back`, its cavity
     // probed about ng (patCtxFromHit). Decided once, by Scene::markPatSide at the closest-hit
@@ -667,6 +675,7 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     hit.ng = gn;
     hit.n = flipped ? -ns : ns;
     hit.back = flipped;
+    hit.solid = tri.solidFace != 0;
     hit.tangent = tri.tangent;             // per-triangle tangent (constant across the face)
     // For tangent-space normal mapping (C6): the frame is built about the normal on ng's side,
     // and the triangle's sign is taken about its winding (Tri::finalize).
@@ -728,6 +737,7 @@ inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit
     bool sFlipped = !(dot(r.d, ng) < 0.0);
     hit.n = sFlipped ? -ng : ng;
     hit.back = sFlipped;
+    hit.solid = true;
     // Analytic mean curvature of a sphere: 1/R everywhere, negated when seen from
     // inside (a room-sized sphere is concave to anything standing in it).
     hit.curv = (s.r > 1e-12) ? ((sFlipped ? -1.0 : 1.0) / s.r) : 0.0;

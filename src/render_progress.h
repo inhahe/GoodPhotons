@@ -38,6 +38,11 @@ struct SppProgress {
     // between pixels, each sample its absolute index, and no seed mixed from `sampleBase`, so a
     // sample's stream depends on its pixel and its index alone. 0: the call's own total.
     long long sampleStride = 0;
+
+    // Where a mode-J render under the wall-clock refresh keeps the count of light-side
+    // realizations its film holds, the loaded ones included, so the checkpoint the reporter
+    // writes records it (main.cpp kLightEpochTag). Null: nobody keeps one.
+    long long* lightEpochs = nullptr;
 };
 
 // Progress through a phase that has NO pixels yet.

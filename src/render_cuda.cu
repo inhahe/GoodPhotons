@@ -685,7 +685,9 @@ struct DMediumStack {
 };
 
 struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId;
-                 DVec3 tangent; double bitangentSign;    // C6 tangent frame for normal mapping
+                 DVec3 tangent;
+                 unsigned char solid;                    // Tri::solidFace (in the padding below)
+                 double bitangentSign;                   // C6 tangent frame for normal mapping
                  double curvature;                       // O3 per-face mean curvature (Tri::finalize)
                  int vcol;                               // Tri::vcol -> DScene::vertColors, or -1
                  Real reach; };                          // farthest vertex's distance (Hit::pscale)
@@ -3583,6 +3585,9 @@ struct DHit {
     // VCM vertex carries both, since it holds the material a mix resolved to and rebuilds
     // its hit from that.
     bool back = false, patOwnSide = false;
+    // Hit::solid's twin (the same padding): the face bounds a closed solid wound outward, so
+    // `back` says the ray is leaving it. Every intersector writes it.
+    bool solid = false;
     DVec3 p, n, ng;
     int matId, sensorId;
     Real u, v;   // interpolated surface texture coordinates
@@ -4066,6 +4071,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
         hit.ng = DVec3(gx, gy, gz);
         double side = dx*gx + dy*gy + dz*gz;
         hit.back = !(side < 0.0);
+        hit.solid = false;
         hit.n = hit.back ? DVec3(-gx, -gy, -gz) : DVec3(gx, gy, gz);
         hit.matId = im.matId; hit.sensorId = -1;
         if (im.uvProj != 0) {
@@ -4371,6 +4377,7 @@ __device__ static inline void dTriFill(const DVec3& rd, const DTri& tri, Real t,
     hit.ng = gn;
     hit.n = flipped ? -ns : ns;
     hit.back = flipped;
+    hit.solid = tri.solid != 0;
     hit.tangent = tri.tangent;                 // per-triangle tangent (C6 normal mapping)
     // About the winding; the frame about ng's side (host twin intersectTri).
     hit.bitangentSign = againstWinding ? -(Real)tri.bitangentSign : (Real)tri.bitangentSign;
@@ -4424,6 +4431,7 @@ __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const D
     bool sFlipped = !(dot(rd, ng) < 0);
     hit.n = sFlipped ? -ng : ng;
     hit.back = sFlipped;
+    hit.solid = true;
     // O3: analytic 1/R, negated from inside — mirrors the host intersectSphere.
     hit.curv = (s.r > 1e-12) ? (Real)((sFlipped ? -1.0 : 1.0) / s.r) : (Real)0;
     hit.matId = s.matId; hit.sensorId = -1;
@@ -4574,6 +4582,7 @@ __device__ static bool intersectCurveSeg(const DCurveRay& cr, const DVec3& ro, c
     hit.p = p;
     hit.pscale = fmax(sqrt(dot(s.p0, s.p0)) + s.r0, sqrt(dot(s.p1, s.p1)) + s.r1);
     hit.back = !(dot(rd, ng) < (Real)0);
+    hit.solid = false;
     hit.n  = hit.back ? -ng : ng;
 
     // u along the strand (root -> tip), v around the circumference.
@@ -7578,6 +7587,21 @@ __device__ static bool dHoldsPhotons(const DScene& sc, const DMaterial& m, Real 
 __device__ static bool dProbePassesThrough(const DScene& sc, const DMaterial& m) {
     return m.type != D_HAIR && !dHoldsPhotons(sc, m, (Real)0);
 }
+// Whether light crosses a face of material `m`, so a footprint probe passing it counts no crossing
+// (host twin passesLight, where the reasoning lives).
+__device__ static bool dPassesLightLeaf(const DMaterial& k) {
+    switch (k.type) {
+        case D_DIELECTRIC: case D_FILTER: case D_HALFMIRROR: case D_DIFFUSETRANSMIT: return true;
+        case D_THINFILM: case D_MULTILAYER: return !dCoatOpaque(k, (Real)550);
+        default: return false;
+    }
+}
+__device__ static bool dPassesLight(const DScene& sc, const DMaterial& m) {
+    if (m.type != D_MIX && m.type != D_LAYERED) return dPassesLightLeaf(m);
+    for (int k = 0; k < m.mixCount; ++k)   // a stack's bodies: the coat lets light into them
+        if (m.mixChild[k] >= 0 && dPassesLightLeaf(sc.mats[m.mixChild[k]])) return true;
+    return false;
+}
 
 // The vector glue of gatherplane.h's rule (MERGE-PROXIMITY), which both backends call: a stored
 // photon belongs to a mode-M or mode-S gather's surface when it faces the gather point's way and
@@ -7631,15 +7655,19 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
         // Through any surface that holds no photon (dProbePassesThrough), and through a fiber of
         // opacity below 1 with the probability it is absent -- the coin every walk tosses there
         // (host twin gatherCoverageRaw). `h.t` stays the depth from the launch point.
-        // A photon-holding face off the band: below it a miss, above it crossed and counted, an
-        // odd count where the probe meets this surface being the inside of a solid resting on it
-        // -- a miss too (host twin gatherCoverageRaw, where the reasoning lives).
+        // A photon-holding face off the band: below it a miss, above it crossed. Every opaque face
+        // crossed above the plane is counted, an odd count where the probe meets this surface being
+        // the inside of a solid resting on it -- a miss too (host twin gatherCoverageRaw, where the
+        // reasoning lives).
         DHit h;
         {
             DVec3 o = q + n * r;
             const DVec3 dn = n * (Real)(-1);
             Real tAcc = (Real)0, curveTmin = (Real)0;
-            int crossed = 0;                     // photon-holding faces passed above the band
+            // The opaque faces passed above the plane: a closed solid's says which side the probe
+            // went (`lastSolid`, +1 into, -1 out of), every other counts toward the parity
+            // (`crossed`); either can put the column inside (host twin gatherCoverageRaw).
+            int crossed = 0, lastSolid = 0;
             bool found = false;                  // the probe ended on what it counts
             for (int pass = 0, skip = 0; pass < 16 + skip; ++pass) {   // a strand costs none, to 48 (host twin)
                 // Past a strand the curve tmin clears its tube and a surface just behind it must
@@ -7649,16 +7677,19 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
                 if (!h.valid) break;
                 h.t += tAcc;
                 const DMaterial& hm = sc.mats[h.matId];
-                // Only a face above the plane, by more than the relaunch's own tmin skips: one on it
-                // is the surface's height (a glass box standing on the floor) -- host twin.
-                if (dProbePassesThrough(sc, hm) && r - h.t > fmaxf((Real)1e-3 * r, (Real)2 * RAY_EPS)) {
-                    tAcc = h.t; o = h.p; curveTmin = (Real)0;
-                    continue;
-                }
+                // A strand that holds no photon, whatever its lobes: through the tube, for none of
+                // the sixteen faces (host twin).
                 if (h.fiberRadius > (Real)0 && hm.type != D_HAIR && !dHoldsPhotons(sc, hm, h.fiberRadius)) {
-                    // no photon (a diffuse strand, or a compound of them), and the surface is beyond it
                     if (skip < 48) ++skip;
                     tAcc = h.t; o = h.p; curveTmin = (Real)2.5 * h.fiberRadius;
+                    continue;
+                }
+                // Only a face above the plane, by more than the relaunch's own tmin skips: one on it
+                // is the surface's height (a glass box standing on the floor). An opaque one is a
+                // crossing all the same (dPassesLight) -- host twin.
+                if (dProbePassesThrough(sc, hm) && r - h.t > fmaxf((Real)1e-3 * r, (Real)2 * RAY_EPS)) {
+                    if (!dPassesLight(sc, hm)) { if (h.solid) lastSolid = h.back ? -1 : 1; else ++crossed; }
+                    tAcc = h.t; o = h.p; curveTmin = (Real)0;
                     continue;
                 }
                 if (hm.type == D_HAIR && h.fiberRadius > (Real)0) {
@@ -7669,11 +7700,11 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
                 }
                 const Real dzH = r - h.t;
                 if (withinGatherBand<Real>(fabs(dzH), (Real)(rr * rr) + dzH * dzH, dot(dShadedNg(h), n), slack)) {
-                    found = (crossed & 1) == 0;
+                    found = (crossed & 1) == 0 && lastSolid <= 0;
                     break;
                 }
                 if (!(dzH > (Real)0)) break;                            // below the band: a miss
-                ++crossed;
+                if (!dPassesLight(sc, hm)) { if (h.solid) lastSolid = h.back ? -1 : 1; else ++crossed; }
                 tAcc = h.t; o = h.p; curveTmin = (Real)0;
             }
             if (!found) h.valid = false;         // a miss, or sixteen faces without an answer
@@ -23359,6 +23390,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.tangent = {t.tangent.x, t.tangent.y, t.tangent.z};
         d.bitangentSign = t.bitangentSign;
         d.curvature = t.curvature;      // O3 per-face mean curvature (from Tri::finalize)
+        d.solid = t.solidFace;          // PROBE-SOLID-SIDE (markSolidFaces)
         d.matId = t.matId; d.sensorId = t.sensorId;
         d.vcol  = t.vcol;               // per-vertex colour (Scene::vertColors), or -1
         d.reach = (Real)t.reach;

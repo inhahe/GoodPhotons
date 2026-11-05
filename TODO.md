@@ -163,7 +163,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   still merges on a `type diffuse` strand. Was: modes M, S and U misread a coat of `type diffuse` curves
   (`tools/check_fur_gather.py`), M's two backends differently; VCM-THIN-CURVES is its mode-U half.
 - [ ] **PROBE-PARITY-LIMITS** — the footprint probe's crossing count misreads an open surface
-  hovering within the radius, and a solid taller than it.
+  hovering within the radius, and a solid taller than it. Closed solids (analytic spheres, closed
+  meshes) now say their own side (0.434.5, PROBE-SOLID-SIDE); the count is left for the rest.
+- [ ] **PROBE-UNDERSIDE** — beside a ball resting on the floor the probe ends on the ball's tilted
+  underside, seen from inside, where `-gageom`'s march counts the floor under it (0.939 of the probe
+  at radius 0.1, diffuse ball).
 - [ ] **MODEM-CPU-DARKGLASS-BLUE** — CPU mode M reads blue 15 % low through strongly absorbing
   glass, where GPU mode M and both mode S do not.
 - [x] **MODEM-COMPOTE-NAN** (0.433.1) — the spectral carrier's ratio overflowed a float in the

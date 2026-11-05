@@ -17367,6 +17367,7 @@ struct Checkpoint {
     Film film;
     long long N = 0;          // cumulative photons already accumulated in `film`
     EnergyReport energy;      // cumulative energy tally
+    long long lightEpochs = 0;   // mode J's wall-clock light-side realizations in it (0: none kept)
 };
 
 // A cheap identity hash so a resume refuses to blend photons from a different scene,
@@ -17529,13 +17530,16 @@ static bool writeRadCacheSection(std::ostream& o) {
 // which is a completely ordinary state (every sidecar written before this existed, and every
 // one written without -radcache), so it is silent and the stream's failure bits are cleared
 // afterwards: the caller has already read everything it needs and must not see a stray EOF
-// from probing past the end as a truncated FILM.
-static void readRadCacheSection(std::istream& in) {
-    g_pendingRadCache.clear();
-    if (!g_radCache) { in.clear(); return; }
+// from probing past the end as a truncated FILM. With no section next, `in` is left where it
+// was, for the sections that may follow (readLightEpochSection); with one, after it, whether
+// `adopt` (this render's -radcache) took the table or not.
+static void readRadCacheSection(std::istream& in, bool adopt = true) {
+    if (adopt) g_pendingRadCache.clear();
+    if (!g_radCache) adopt = false;
+    const std::streampos at = in.tellg();
     char tag[8] = {0};
     in.read(tag, 8);
-    if (!in || std::memcmp(tag, kRadCacheTag, 8) != 0) { in.clear(); return; }
+    if (!in || std::memcmp(tag, kRadCacheTag, 8) != 0) { in.clear(); in.seekg(at); return; }
     uint64_t guard = 0, n = 0; uint32_t pass = 0; long long ctr[5] = {0,0,0,0,0};
     in.read((char*)&guard, 8);
     in.read((char*)&pass, 4);
@@ -17545,6 +17549,11 @@ static void readRadCacheSection(std::istream& in) {
     // than the largest capacity the flag accepts, and the record count is otherwise attacker-
     // or corruption-controlled.
     if (!in || n > (uint64_t)1 << 28) { in.clear(); return; }
+    if (!adopt) {
+        in.seekg((std::streamoff)n * (std::streamoff)(8 + sizeof(RadCacheCell)), std::ios::cur);
+        in.clear();
+        return;
+    }
     PendingRadCache p;
     p.keys.resize((size_t)n);
     p.cells.resize((size_t)n);
@@ -17558,6 +17567,31 @@ static void readRadCacheSection(std::istream& in) {
     p.nSample = ctr[0]; p.nEvicted = ctr[1]; p.nTerm = ctr[2];
     p.nMiss = ctr[3]; p.nUpdated = ctr[4];
     g_pendingRadCache = std::move(p);
+}
+
+// ---- mode J's light-side epoch count, a section of a .ftbuf sidecar -------------------------
+// How many light-side realizations of mode J's wall-clock refresh the film holds. A resumed
+// render goes on down the merge radii's shrink schedule from there (surfRadiusFor,
+// beamRadScaleFor); restarting at epoch 0 would add its samples at the largest radius, whose bias
+// a render resumed in pieces would then never get under. Written after the radiance-cache
+// section, and only when non-zero, so every other sidecar is unchanged; older builds stop reading
+// before it.
+static constexpr char kLightEpochTag[8] = {'F','T','L','S','E','P','O','1'};
+static void writeLightEpochSection(std::ostream& o, long long epochs) {
+    if (epochs <= 0) return;
+    o.write(kLightEpochTag, 8);
+    o.write((const char*)&epochs, 8);
+}
+// The count, if that section is next in `in`, else 0 (and `in` where it was).
+static long long readLightEpochSection(std::istream& in) {
+    const std::streampos at = in.tellg();
+    char tag[8] = {0};
+    long long epochs = 0;
+    in.read(tag, 8);
+    const bool ours = in && std::memcmp(tag, kLightEpochTag, 8) == 0;
+    if (ours) in.read((char*)&epochs, 8);
+    if (!ours || !in || epochs < 0) { in.clear(); in.seekg(at); return 0; }
+    return epochs;
 }
 
 // "png/foo.png" + "_forward" -> "png/foo_forward.png". Inserts a suffix before the
@@ -17587,6 +17621,7 @@ static bool writeCheckpoint(const std::string& outPath, const Checkpoint& c,
         o.write((const char*)c.film.xyz.data(), c.film.xyz.size() * sizeof(Vec3));
         o.write((const char*)c.film.hits.data(), c.film.hits.size() * sizeof(double));
         if (!writeRadCacheSection(o)) return false;
+        writeLightEpochSection(o, c.lightEpochs);
         writeVersionTrailer(o);
         return (bool)o;
     });
@@ -17650,9 +17685,37 @@ static bool readCheckpoint(const std::string& outPath, int res, int resY, uint64
     }
     c.N = N;
     c.energy = {en[0], en[1], en[2], en[3], en[4]};
-    readRadCacheSection(in);          // optional trailing section; absent in older sidecars
+    readRadCacheSection(in);          // optional trailing sections; absent in older sidecars
+    c.lightEpochs = readLightEpochSection(in);
     warnIfOtherBuild(checkpointPath(outPath));
     return true;
+}
+
+// What readCheckpoint would load of a sidecar's sample count and light-side epochs, read silently
+// and without the film, for a renderer that needs them before the resume loads it (mode J's
+// first light side); {0, 0} when there is no sidecar or it is not this render's.
+struct CheckpointCounts { long long N = 0, lightEpochs = 0; };
+static CheckpointCounts peekCheckpointCounts(const std::string& outPath, int res, int resY,
+                                             uint64_t guard, char mode) {
+    CheckpointCounts k;
+    std::ifstream in(checkpointPath(outPath), std::ios::binary);
+    if (!in) return k;
+    char magic[8];
+    int32_t rx = 0, ry = 0, m = 0; long long N = 0;
+    double en[5]; uint64_t g = 0;
+    in.read(magic, 8);
+    in.read((char*)&rx, 4); in.read((char*)&ry, 4); in.read((char*)&m, 4);
+    in.read((char*)&N, 8); in.read((char*)en, sizeof en); in.read((char*)&g, 8);
+    if (!in || std::memcmp(magic, "FTBUF01\n", 8) != 0 || rx != res || ry != resY ||
+        m != (int32_t)(unsigned char)mode || g != guard)
+        return k;
+    const std::streamoff body = (std::streamoff)rx * ry * (std::streamoff)(sizeof(Vec3) + sizeof(double));
+    if (!checkpointHasBytes(in, body)) return k;
+    in.seekg(body, std::ios::cur);
+    k.N = N;
+    readRadCacheSection(in, /*adopt=*/false);
+    k.lightEpochs = readLightEpochSection(in);
+    return k;
 }
 
 // --- Mode-P composite checkpoint (dual-film .ftbuf sidecar) --------------------
@@ -18390,6 +18453,8 @@ static int runSppProgressive(
 
     SppProgress prog;
     prog.sampleBase = baseSpp;   // bias fresh seeds past the loaded samples
+    long long lightEpochs = haveBase ? base.lightEpochs : 0;   // mode J's, kept through the resume
+    prog.lightEpochs = &lightEpochs;
     TrailingRate sppMeter;
     sppMeter.start(0.0, (double)baseSpp);   // this session's rate, not the loaded samples'
     prog.report = [&](const Film& film, long long sppDone, bool final) -> bool {
@@ -18449,6 +18514,7 @@ static int runSppProgressive(
                                     wantWin ? &shownLin : nullptr);
                 if (wantCheckpoint) {
                     Checkpoint save; save.film = *shown; save.N = totalSpp;
+                    save.lightEpochs = lightEpochs;
                     if (!writeCheckpoint(outPath, save, guard, mode))
                         std::fprintf(stderr, "[checkpoint] could not write %s\n",
                                      checkpointPath(outPath).c_str());
@@ -18985,6 +19051,26 @@ static void prepareSunAim(const Scene& scene) {
 #ifdef HAVE_CUDA
     cudaSetSunAim(wxyz.data(), rr.data(), (int)rr.size(), bdpt::g_sunAim.sumR2, bdpt::g_sunAim.f);
 #endif
+}
+
+// PROBE-SOLID-SIDE: marks the faces of every mesh object that bound a closed solid wound outward
+// (watertight::markSolidFaces), so the footprint probes of modes M and S can tell inside a solid
+// from outside off the side a face is met from (Hit::solid). An asset's triangles are marked once,
+// however many instances place it; quads and the other primitives are no mesh object, and stay
+// unmarked (a sphere's hit says it is solid itself).
+static void markSolidFaces(Scene& scene) {
+    std::vector<char> done(scene.blasList.size(), 0);
+    for (const MeshGroup& g : scene.meshGroups) {
+        if (g.shapeOnly) continue;
+        if (g.blasId >= 0 && g.blasId < (int)scene.blasList.size()) {
+            if (done[(size_t)g.blasId]) continue;
+            done[(size_t)g.blasId] = 1;
+            std::vector<Tri>& tr = scene.blasList[(size_t)g.blasId].tris;
+            watertight::markSolidFaces(tr.data(), tr.size());
+        } else if (g.triStart + g.triCount <= scene.tris.size()) {
+            watertight::markSolidFaces(scene.tris.data() + g.triStart, g.triCount);
+        }
+    }
 }
 
 static int runRender(const Scene& scene, const Camera& cam, char mode,
@@ -19674,14 +19760,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             return (r > 0.0) ? r : surfRadius0;    // guards a pathological -vcmalpha
         };
         // THE BEAM KERNEL SHRINKS TOO (UPBP-BEAM-RADIUS). A beam merge's kernel is 1D, so its bias
-        // is O(r), and held at `-beamblur` it was a floor: mode J read a walled fog 0.7 % low at
-        // the default radius, 1.8 % at 4x, 0.1 % at a quarter, whatever the sample count
-        // (J-FOGCORNELL). Progressive photon beams' schedule for a 1D kernel, under the same
-        // -vcmalpha and epoch index as the point merges: r_e = r * (e+1)^(alpha-1). The epochs'
-        // mean bias is then the Cesaro mean of O(r_e), which goes to 0, and each epoch's
-        // variance, O(1/r_e), grows slowly enough that the mean's still falls. Epoch 0 keeps `r`
-        // exactly, so a single-epoch render is unchanged; -vcmalpha 1 holds it still. The merge
-        // weight follows on its own: its kappa is read off the map's radius at gather time.
+        // is O(r): at a fixed radius, a floor no sample count gets under. Progressive photon
+        // beams' schedule for a 1D kernel, under the same -vcmalpha and epoch index as the point
+        // merges: r_e = r * (e+1)^(alpha-1). The epochs' mean bias is then the Cesaro mean of
+        // O(r_e), which goes to 0, and each epoch's variance, O(1/r_e), grows slowly enough that
+        // the mean's still falls. Epoch 0 keeps `r` exactly, so a single-epoch render is
+        // unchanged; -vcmalpha 1 holds it still. The merge weight follows on its own: its kappa is
+        // read off the map's radius at gather time.
         auto beamRadScaleFor = [&](uint64_t epoch) {
             const double s = std::pow((double)(epoch + 1), g_vcmAlpha - 1.0);
             return (s > 0.0 && s <= 1.0) ? s : 1.0;   // guards a pathological -vcmalpha
@@ -19802,6 +19887,21 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // exist, and read by buildLightSide only for epochs >= 1, which run after that.
         bool fixedEpochsOn = false;
         bool refreshSaid   = false;     // the first redraw has announced the refresh
+        // A WALL-CLOCK RENDER RESUMED from its sidecar goes on from the light-side realizations
+        // its film holds: each new one sits that far down the merge radii's shrink schedule
+        // (`lsEpochBase`), and the first is drawn under a salt past every one the loaded samples
+        // used (`lsSalt0`, the loaded spp, as the later epochs' saltOff is). Fixed epochs need
+        // neither: they are indexed by the frame's absolute samples.
+        const CheckpointCounts resumed = (resume && !epochsWanted)
+            ? peekCheckpointCounts(outPath, res, resY, checkpointGuard(scene, mode, res, resY, &cam), mode)
+            : CheckpointCounts{};
+        const uint64_t lsEpochBase = (uint64_t)resumed.lightEpochs;
+        const uint64_t lsSalt0     = (uint64_t)resumed.N;
+        if (lsEpochBase > 0 && (wantBeams || wantSurf))
+            std::printf("mode J: resuming after %llu light-side realizations: the merge radii go on "
+                        "from there (beam kernel x%.4g, surface radius x%.4g of the first's)\n",
+                        (unsigned long long)lsEpochBase, beamRadScaleFor(lsEpochBase),
+                        surfRadiusFor(lsEpochBase) / surfRadius0);
         auto buildLightSide = [&](uint64_t epoch, uint64_t saltOff = 0) {
             RngSaltScope saltScope(epoch + saltOff);
             const bool first = (epoch == 0);
@@ -19966,7 +20066,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 if (first) liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
                 buildBeamMap(bmap, "mode J:",
                              (double)res * (double)resY * (double)(spp > 0 ? spp : 16),
-                             /*quiet*/!first, &scene, beamRadScaleFor(epoch));
+                             /*quiet*/!first, &scene, beamRadScaleFor(epoch + lsEpochBase));
             }
             const double buildSec =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
@@ -20001,10 +20101,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 const auto tsb = std::chrono::steady_clock::now();
                 // The device grids its own map per chunk; the host's grid would go unread.
 #ifdef HAVE_CUDA
-                if (useGpu && cudaJSurfOnDevice()) smap.radiusOnly(surfRadiusFor(epoch));
+                if (useGpu && cudaJSurfOnDevice()) smap.radiusOnly(surfRadiusFor(epoch + lsEpochBase));
                 else
 #endif
-                smap.build(surfRadiusFor(epoch));
+                smap.build(surfRadiusFor(epoch + lsEpochBase));
                 lsSurfSec += std::chrono::duration<double>(
                                  std::chrono::steady_clock::now() - tsb).count();
                 if (first)
@@ -20078,7 +20178,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                 res, resY, camWhere.c_str(), maxDepth, lightLabel,
                                 jlc.keptCount(), (double)jlc.epochBytes / (1024.0 * 1024.0));
                 } else {
-                    build0Sec = realize(0, 0);
+                    build0Sec = realize(0, lsSalt0);
                 }
                 if (shareFrozen)
                     jlc.stamp(&scene, N, spp, res, resY, maxDepth, nThreads, diffraction,
@@ -20210,8 +20310,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 epochTimeJ.reset();
                 camEpochJ = cam;
             }
-            if ((!beamsPtr && !photonsPtr) || (g_beamFreeze && !blurEpochsJ) || !prog || !prog->report)
+            if ((!beamsPtr && !photonsPtr) || (g_beamFreeze && !blurEpochsJ) || !prog || !prog->report) {
+                if (prog && prog->lightEpochs && (beamsPtr || photonsPtr) && !fixedEpochs)
+                    *prog->lightEpochs = (long long)(lsEpochBase + 1);   // epoch 0's, held throughout
                 return renderEpoch(sppTarget, prog, held);
+            }
             using clk = std::chrono::steady_clock;
             Film acc; acc.resX = res; acc.resY = resY; acc.alloc();
             long long sppAll = 0;
@@ -20277,6 +20380,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             }
             uint64_t lsEpoch = 0;                    // whose realization the maps hold now
             uint64_t nRealized = 1;                  // realizations this frame drew (epoch 0's)
+            // The wall-clock refresh's count, for the checkpoint (lsEpochBase).
+            const auto keepLightEpochs = [&]() {
+                if (prog->lightEpochs && !nFixed) *prog->lightEpochs = (long long)(lsEpochBase + nRealized);
+            };
+            keepLightEpochs();
             for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
                 double rebuildSec = 0.0;
                 const uint64_t want = nFixed ? (uint64_t)((base + sppAll) / epLen) : epoch;
@@ -20287,6 +20395,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     if (photonsPtr) photonsPtr = curS;
                     lsEpoch = want;
                     ++nRealized;
+                    keepLightEpochs();
                     // A refresh that came back empty would leave the gather pointing at an
                     // empty map, which silently turns the rest of the render into mode D.
                     // Cannot happen if epoch 0 was non-empty (same scene, same counts), but
@@ -27943,6 +28052,13 @@ static int run(int argc, char** argv) {
         }
         flights.push_back({i});
     };
+    // The footprint probes of modes M and S read which side of a closed solid a face is met from
+    // (Hit::solid): marked once, for the whole batch.
+    {
+        bool gathers = false;
+        for (const RenderCam& rc : toRender) gathers = gathers || rc.mode == 'M' || rc.mode == 'S';
+        if (gathers) markSolidFaces(scene);
+    }
     std::vector<int> groupM, groupMApart, restIdx;
     bool mModeBudgeted = false;   // a mode-M camera dropped from groupM by the budget test
     bool mBlurApart = false;      // ... or one blurring a moving scene the device cannot take alone

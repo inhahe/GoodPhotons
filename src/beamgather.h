@@ -836,10 +836,12 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
         return Vec3(cieX(l), cieY(l), cieZ(l));
     };
     // The emitter a deposit-folded beam (achro == 1) can be recoloured from under a carrier, or
-    // null. Only a path that met no chromatic factor stores its emitter's mean colour exactly, and
-    // only its spectrum is that emitter's SPD; mode M also folds a coloured bounce into the colour
-    // (Renderer foldT), whose spectrum the carrier cannot be read against, so such a beam counts at
-    // its own wavelength instead. Mode J folds only such flat paths.
+    // null. Only a path that met no chromatic factor stores its emitter's mean colour exactly (the
+    // same float cast of em.cieMean the test below makes), and only its spectrum is that emitter's
+    // SPD; mode M also folds a coloured bounce into the colour (Renderer foldT), whose spectrum the
+    // carrier cannot be read against, so such a beam counts at its own wavelength instead. Mode J
+    // folds only such flat paths. `-beamachro all` stores the mean on every chord it forces, and
+    // they are recoloured too: that flag's approximation, the emitter's colour, kept under the carrier.
     const auto flatFoldEmitter = [&](const PhotonBeam& b) -> const Emitter* {
         if (b.achro != 1 || b.srcEm < 0 || b.srcEm >= (int)scene.emitters.size()) return nullptr;
         const Emitter& em = scene.emitters[(size_t)b.srcEm];

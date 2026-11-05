@@ -1,11 +1,14 @@
 """Regression check: modes M, S and U gather on a compound surface (a mix, a layered coat) as mode R shades it.
 
     python tools/check_compound_gather.py [--out png/check_compound_gather] [--exe ftrace.exe]
-                                          [--only mix,mix2,clearcoat,thinfilm]
+                                          [--only mix,mix2,mixmirror,mixmap,clearcoat,thinfilm]
+                                          [--cases M_cpu,U_gpu,...] [--extra]
 
 A wall of a compound material, lit from above over a white floor, seen face on:
   mix        `mix { layer white 0.5 }`, the rest absorbed;
   mix2       half white diffuse, half rough glossy;
+  mixmirror  half white diffuse, half mirror: a lobe no merge vertex is stored under;
+  mixmap     the same two, weighted across the wall by a map (white 0.15 to 0.85);
   clearcoat  `layered`: a Fresnel coat of index 1.5 over white;
   thinfilm   `layered`: a thin-film coat (index 2.4, 300 nm) over white, whose reflectance swings
              across the band, so the body under it keeps the complement of the film's colour.
@@ -36,6 +39,8 @@ NL = chr(10)
 WALLS = {
     "mix": 'material "wall" { type mix  layer "white" 0.5 }',
     "mix2": 'material "wall" { type mix  layer "white" 0.5  layer "gloss" 0.5 }',
+    "mixmirror": 'material "wall" { type mix  layer "white" 0.5  layer "mirror" 0.5 }',
+    "mixmap": 'material "wall" { type mix  layer "white" 0.5  layer "mirror" 0.5  weight_map [0.15 0.85](u) }',
     "clearcoat": 'material "wall" { type layered  ior 1.5  coat { }  layer "white" 1.0 }',
     "thinfilm": 'material "wall" { type layered  ior 1.5  coat { reflectance thinfilm  film_ior 2.4  '
                 'film_thickness 300 }  layer "white" 1.0 }',
@@ -59,6 +64,7 @@ def scene(wall):
         'camera "c" { eye 0 0.6 -2.5  look_at 0 0.9 1.5  up 0 1 0  fov_y 24  film { res 64 48 } }',
         'material "white" { type diffuse  reflect 0.7 }',
         'material "gloss" { type glossy  reflect 0.7  roughness 0.3 }',
+        'material "mirror" { type mirror  reflect 0.9 }',
         wall,
         "quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material white }",
         "quad { origin -3 0 1.5  u 0 3 0   v 6 0 0   material wall }",
@@ -71,9 +77,15 @@ def main():
     ap.add_argument("--out", default=os.path.join(ROOT, "png", "check_compound_gather"))
     ap.add_argument("--exe", default=os.path.join(ROOT, "ftrace.exe"))
     ap.add_argument("--only", default=",".join(WALLS))
-    ap.add_argument("--extra", action="store_true", help="modes U and J too (EXTRA_CASES)")
-    ap.add_argument("--cases", default="", help="only these cases, by name")
+    ap.add_argument("--extra", action="store_true", help="mode J's -jsurf too (EXTRA_CASES)")
+    ap.add_argument("--cases", default="", help="only these cases, by name (" +
+                    ",".join(c[0] for c in CASES + EXTRA_CASES) + ")")
     a = ap.parse_args()
+    unknown = [w for w in a.only.split(",") if w not in WALLS]
+    known = {c[0] for c in CASES + EXTRA_CASES}
+    unknown += [c for c in a.cases.split(",") if a.cases and c not in known]
+    if unknown:
+        ap.error("unknown wall or case: " + ", ".join(unknown))
     exe, out = os.path.abspath(a.exe), os.path.abspath(a.out)
     os.makedirs(out, exist_ok=True)
     ok = True

@@ -1,6 +1,7 @@
 """Regression check: modes M and S read the floor at the base of an object standing on it as mode R does.
 
     python tools/check_gather_base.py [--out png/check_gather_base] [--exe ftrace.exe]
+                                      [--objects diffuse,mirror,coated,ball,meshball]
 
 A closed 3 cm box (six quads) standing on a lit floor, seen from straight above, modes M and S at a
 pinned gather radius of 0.1 on the CPU and the GPU, against mode R on the GPU. A mode-M or mode-S
@@ -15,8 +16,22 @@ beyond the column's chord and the floor under the box counts again: it must agre
 within 2 % in each ring, where until 0.433.7 mode S's read 0.969 and 0.976 of the probe's (M 0.999
 and 0.987; now M 1.012 and 1.000, S 0.998 and 1.000).
 
-The floor 0-2 cm and 2-5 cm out from the box's edge must each read within 7 % of mode R (two seeds
-apiece). Exits 0 when every case holds, 1 otherwise.
+The box is diffuse, a mirror, or `layered` over a glossy body (`coated`). The last two hold no photon,
+so the probe passes their faces, but they are opaque: their faces are crossings all the same
+(passesLight), or the floor under them counts as covered again. Then a glossy ball of the box's
+half-width resting on the floor, analytic and as a closed OBJ, seen from low beside it with a low
+light from the side reaching under its overhang. There, 4-12 cm from the point it rests on, the gap
+to the ball is under the gather radius, so the probe begins inside the ball and leaves it before it
+meets the floor, which a parity reads as inside. A closed solid's face says it is out
+(PROBE-SOLID-SIDE). Counted by parity, a glossy mesh ball's floor near its contact read 1.84 of mode R
+in mode S (check_bitid's `smooth` scene). (A diffuse ball is no case here: the probe ends on its
+underside seen from inside, PROBE-UNDERSIDE, on every build.)
+
+The floor 0-2 cm and 2-5 cm out from a box's base must each read within 7 % of mode R (two seeds
+apiece). The floor 4-12 cm from a ball's contact must read within 3 % of the same render with the
+footprint correction off (-gatherarea 0), whose coverage there is the whole disc: the kernel's blur
+from the lit floor beyond makes mode R no reference there. Parity alone read it 3.7-4.0x. Exits 0 when
+every case holds, 1 otherwise.
 """
 import argparse
 import os
@@ -32,6 +47,7 @@ NL = chr(10)
 W = H = 160
 HALF = 0.5          # the frame covers x, z in [-HALF, HALF]
 BOX = 0.15          # the box's half-width
+RINGS = ((0.0, 0.02), (0.02, 0.05))   # the floor out from an object's base, metres
 
 
 def quad(o, u, v, mat):
@@ -46,15 +62,125 @@ def box(x0, y0, z0, x1, y1, z1, mat):
             quad((x0, y0, z0), (0, 0, dz), (0, dy, 0), mat), quad((x1, y0, z0), (0, dy, 0), (0, 0, dz), mat)]
 
 
-SCENE = NL.join([
+def write_ball_obj(path, r, n=48):
+    """A closed UV sphere of radius `r` resting on y = 0, wound outward, its normals radial."""
+    vs, ns, fs = [(0.0, 0.0, 0.0)], [(0.0, -1.0, 0.0)], []            # bottom pole
+    for i in range(1, n):
+        th = np.pi * i / n                                              # from the bottom
+        for j in range(2 * n):
+            ph = np.pi * j / n
+            d = (np.sin(th) * np.cos(ph), -np.cos(th), np.sin(th) * np.sin(ph))
+            vs.append((r * d[0], r + r * d[1], r * d[2]))
+            ns.append(d)
+    vs.append((0.0, 2 * r, 0.0))                                       # top pole
+    ns.append((0.0, 1.0, 0.0))
+
+    def ring(i, j):                                                     # 1-based OBJ index
+        return 2 + (i - 1) * 2 * n + j % (2 * n)
+    for j in range(2 * n):
+        fs.append((1, ring(1, j), ring(1, j + 1)))
+    for i in range(1, n - 1):
+        for j in range(2 * n):
+            a, b, c, d = ring(i, j), ring(i, j + 1), ring(i + 1, j + 1), ring(i + 1, j)
+            fs.append((a, c, b))
+            fs.append((a, d, c))
+    top = len(vs)
+    for j in range(2 * n):
+        fs.append((ring(n - 1, j + 1), ring(n - 1, j), top))
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.writelines("v %.9g %.9g %.9g%s" % (v + (NL,)) for v in vs)
+        f.writelines("vn %.9g %.9g %.9g%s" % (tuple(v) + (NL,)) for v in ns)
+        f.writelines("f %d//%d %d//%d %d//%d%s" % (a, a, b, b, c, c, NL) for a, b, c in fs)
+
+
+# The two views. A box is seen from straight above, its floor measured out from the box's edge. A
+# ball is seen from low beside it, looking under its overhang, where a low light from the side
+# reaches, and its floor is measured out from the point it rests on. That floor is what the probe
+# begins inside the ball over: from above, the ball hides it.
+TOP_CAM = 'camera "c" { eye 0 0.9 0.0001  look_at 0 0 0  up 0 0 1  fov_y %g  film { res %d %d } }' % (
+    2 * np.degrees(np.arctan(HALF / 0.9)), W, H)
+SW, SH, SFOV = 160, 100, 30.0
+SEYE, SLOOK = np.array([0.0, 0.06, 0.55]), np.array([0.0, 0.03, 0.0])
+SIDE_CAM = 'camera "c" { eye %g %g %g  look_at %g %g %g  up 0 1 0  fov_y %g  film { res %d %d } }' % (
+    tuple(SEYE) + tuple(SLOOK) + (SFOV, SW, SH))
+SIDE_LIGHT = ("light area { origin 0.5 0.005 -0.25  u 0 0 0.5  v 0 0.1 0  normal -1 0 0  power 40  "
+              "spd preset:d65 }")
+
+
+def top_dist(base):
+    """Each pixel of the view from above as the floor's distance out from the box's edge."""
+    xs = (np.arange(W) + 0.5) / W * 2 * HALF - HALF
+    X, Z = np.meshgrid(xs, xs)
+    return base(X, Z)
+
+
+def side_dist():
+    """Each pixel of the view from beside the ball as the floor's distance from the point the ball
+    rests on, or NaN where the pixel sees no floor, or sees it within 4 mm of the ball's silhouette
+    (which the mesh ball's facets move). The camera's pinhole (fov_y, square pixels, row 0 at the
+    top), checked against marker renders to a pixel."""
+    w = SLOOK - SEYE
+    w = w / np.linalg.norm(w)
+    u = np.cross(w, [0.0, 1.0, 0.0])
+    u = u / np.linalg.norm(u)
+    v = np.cross(u, w)
+    t = np.tan(np.radians(SFOV) / 2)
+    sx = ((np.arange(SW) + 0.5) / SW * 2 - 1) * t * SW / SH
+    sy = (1 - (np.arange(SH) + 0.5) / SH * 2) * t
+    SX, SY = np.meshgrid(sx, sy)
+    d = w[None, None, :] + SX[..., None] * u + SY[..., None] * v
+    tf = -SEYE[1] / d[..., 1]                                  # the floor, y = 0
+    oc = SEYE - np.array([0.0, BOX, 0.0])
+    b = d @ oc
+    a = np.einsum("ijk,ijk->ij", d, d)
+    disc = b * b - a * (oc @ oc - (BOX + 0.004) ** 2)
+    ts = np.where(disc > 0, (-b - np.sqrt(np.maximum(disc, 0))) / a, np.inf)
+    seen = (d[..., 1] < 0) & (tf > 0) & (tf < ts)
+    P = SEYE + d * tf[..., None]
+    return np.where(seen, np.hypot(P[..., 0], P[..., 2]), np.nan)
+
+
+# Each object: its scene lines, its view, its floor distance per pixel, the rings it is held to,
+# and what each ring is held to. A box's floor is held to mode R. A ball's ring lies under its
+# overhang, 4-12 cm from the point it rests on, where the gap to the ball is 0.5 to 6 cm: within the
+# gather radius, so every probe there begins inside the ball. There the gather's disc reaches out to
+# the floor beyond the ball, lit from above, and at radius 0.1 that blur reads 1.41 of mode R in
+# mode M and 1.16-1.24 in S on every build (0.434.4 too). So that ring holds each estimate to the
+# same render with the footprint correction off (`-gatherarea 0`): the same photons, so the ratio is
+# the coverage alone, which is the whole disc there since the floor is all present.
+def _box(mat):
+    return ([mat] + box(-BOX, 0.0, -BOX, BOX, 0.03, BOX, "obj"), TOP_CAM,
+            lambda: top_dist(lambda X, Z: np.maximum(np.abs(X), np.abs(Z)) - BOX), RINGS, "the base",
+            "R")
+
+
+def _ball(mat, mesh=False):
+    geo = ('mesh "ball" { file "ball.obj"  material obj }' if mesh else
+           'sphere { center 0 %g 0  radius %g  material obj }' % (BOX, BOX))
+    return [mat, geo, SIDE_LIGHT], SIDE_CAM, side_dist, ((0.04, 0.12),), "the contact", "uncovered"
+
+
+OBJECTS = {
+    "diffuse": _box('material "obj" { type diffuse reflect 0.5 }'),
+    "mirror": _box('material "obj" { type mirror reflect 0.9 }'),
+    "coated": _box('material "obj" { type layered  ior 1.5  coat { }  layer "gl" 1.0 }'),
+    # A ball resting on the floor holds the probe's origin over the floor under its overhang, so
+    # the probe leaves it before it meets the floor: a closed solid's face says it is out
+    # (PROBE-SOLID-SIDE), where a parity reads the floor as inside.
+    "ball": _ball('material "obj" { type glossy reflect 0.6 roughness 0.3 }'),
+    "meshball": _ball('material "obj" { type glossy reflect 0.6 roughness 0.3 }', mesh=True),
+}
+
+
+def scene(obj_lines, cam):
+    return NL.join([
     "scene { units meters }",
-    'camera "c" { eye 0 0.9 0.0001  look_at 0 0 0  up 0 0 1  fov_y %g  film { res %d %d } }' % (
-        2 * np.degrees(np.arctan(HALF / 0.9)), W, H),
+    cam,
     'material "floor" { type diffuse reflect 0.5 }',
-    'material "obj" { type diffuse reflect 0.5 }',
+    'material "gl" { type glossy reflect 0.6 roughness 0.3 }',
     quad((-2, 0, -2), (0, 0, 4), (4, 0, 0), "floor"),
     "light area { origin -0.4 1.5 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  power 300  spd preset:d65 }",
-] + box(-BOX, 0.0, -BOX, BOX, 0.03, BOX, "obj")) + NL
+    ] + obj_lines) + NL
 REF = ["-mode", "R", "-device", "gpu", "-spp", "512"]
 CASES = [("M_gpu", ["-mode", "M", "-device", "gpu", "-n", "8000000", "-spp", "16", "-pmradius", "0.1"]),
          ("M_cpu", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "4", "-pmradius", "0.1"]),
@@ -64,8 +190,8 @@ CASES = [("M_gpu", ["-mode", "M", "-device", "gpu", "-n", "8000000", "-spp", "16
          ("M_cpu_gageom", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "4", "-pmradius", "0.1",
                            "-gageom", "1"]),
          ("S_cpu_gageom", ["-mode", "S", "-device", "cpu", "-spp", "8", "-pmradius", "0.1", "-gageom", "1"])]
-RINGS = ((0.0, 0.02), (0.02, 0.05))
 TOL = 0.07
+COVER_TOL = 0.03   # a ball's estimate against the same render with no footprint correction
 # `-gageom` against the probe it stands in for, same mode and seeds, so the same photons: the two
 # coverages must agree to 2 % in each ring.
 PAIRS = (("M_cpu_gageom", "M_cpu"), ("S_cpu_gageom", "S_cpu"))
@@ -76,38 +202,55 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split(NL)[0])
     ap.add_argument("--out", default=os.path.join(ROOT, "png", "check_gather_base"))
     ap.add_argument("--exe", default=os.path.join(ROOT, "ftrace.exe"))
+    ap.add_argument("--objects", default=",".join(OBJECTS))
     a = ap.parse_args()
+    unknown = [b for b in a.objects.split(",") if b not in OBJECTS]
+    if unknown:
+        ap.error("unknown object: " + ", ".join(unknown))
     exe, out = os.path.abspath(a.exe), os.path.abspath(a.out)
     os.makedirs(out, exist_ok=True)
-    path = os.path.join(out, "box.ftsl")
-    cm.write(path, SCENE)
-    xs = (np.arange(W) + 0.5) / W * 2 * HALF - HALF
-    X, Z = np.meshgrid(xs, xs)
-    dist = np.maximum(np.abs(X), np.abs(Z)) - BOX     # out from the box's edge (a square)
-
-    def image(tag, args, gpu):
-        return np.mean([cm.lum(cm.render(exe, out, path, "%s_%d" % (tag, s), args, seed=s, want_gpu=gpu)[0])
-                        for s in (1, 2)], axis=0)
-
-    R = image("R_gpu", REF, True)
+    write_ball_obj(os.path.join(out, "ball.obj"), BOX)
     ok = True
-    got = {}
-    for name, args in CASES:
-        M = image(name, args, "gpu" in name)
-        for lo, hi in RINGS:
-            m = (dist >= lo) & (dist < hi)
-            q = got[name, lo] = M[m].mean() / R[m].mean()
-            good = abs(q - 1.0) <= TOL
-            ok &= good
-            print("%-12s floor %2.0f-%2.0f cm from the base: %.3f of mode R  %s" % (
-                name, lo * 100, hi * 100, q, "ok" if good else "FAIL"))
-    for a_, b_ in PAIRS:
-        for lo, hi in RINGS:
-            q = got[a_, lo] / got[b_, lo]
-            good = abs(q - 1.0) <= PAIR_TOL
-            ok &= good
-            print("%-12s floor %2.0f-%2.0f cm from the base: %.3f of %s's  %s" % (
-                a_, lo * 100, hi * 100, q, b_, "ok" if good else "FAIL"))
+    for bname in a.objects.split(","):
+        lines, cam, distf, rings, base, against = OBJECTS[bname]
+        dist = distf()                                 # each pixel's floor distance from `base`
+        path = os.path.join(out, "obj_%s.ftsl" % bname)
+        cm.write(path, scene(lines, cam))
+
+        def image(tag, args, gpu):
+            return np.mean([cm.lum(cm.render(exe, out, path, "%s_%s_%d" % (bname, tag, s), args, seed=s,
+                                             want_gpu=gpu)[0]) for s in (1, 2)], axis=0)
+
+        R = image("R_gpu", REF, True)
+        got = {}
+        for name, args in CASES:
+            M = image(name, args, "gpu" in name)
+            # The same render with the footprint correction off, for a ball's ring (`against`); not
+            # for -gageom, which the pairs below hold to the probe.
+            U = (image(name + "_uncovered", args + ["-gatherarea", "0"], "gpu" in name)
+                 if against == "uncovered" and "gageom" not in name else None)
+            for lo, hi in rings:
+                m = (dist >= lo) & (dist < hi)
+                q = got[name, lo] = M[m].mean() / R[m].mean()
+                if U is None and against == "R":
+                    good = abs(q - 1.0) <= TOL
+                    ok &= good
+                    print("%-9s %-12s floor %2.0f-%2.0f cm from %s: %.3f of mode R  %s" % (
+                        bname, name, lo * 100, hi * 100, base, q, "ok" if good else "FAIL"), flush=True)
+                elif U is not None:
+                    c = M[m].mean() / U[m].mean()
+                    good = abs(c - 1.0) <= COVER_TOL
+                    ok &= good
+                    print("%-9s %-12s floor %2.0f-%2.0f cm from %s: %.3f of the uncorrected (%.3f of mode R)"
+                          "  %s" % (bname, name, lo * 100, hi * 100, base, c, q, "ok" if good else "FAIL"),
+                          flush=True)
+        for a_, b_ in PAIRS:
+            for lo, hi in rings:
+                q = got[a_, lo] / got[b_, lo]
+                good = abs(q - 1.0) <= PAIR_TOL
+                ok &= good
+                print("%-9s %-12s floor %2.0f-%2.0f cm from %s: %.3f of %s's  %s" % (
+                    bname, a_, lo * 100, hi * 100, base, q, b_, "ok" if good else "FAIL"), flush=True)
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

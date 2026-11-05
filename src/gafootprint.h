@@ -88,9 +88,11 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
     const double cellArea = (kPi * r2) / (double)kDisc;
     double area = 0.0;
     // THE PROBE'S CROSSING RULE, per column (photonmap_render.h gatherCoverageRaw, where the why
-    // is): photon-holding faces off the band above the plane are another surface's, and an odd
-    // count of them over a column puts its in-band layers inside a solid resting on the surface
-    // (the floor under a box), where no photon can be -- so that column counts nothing.
+    // is): faces off the band above the plane are another surface's, and the opaque ones
+    // (passesLight) say whether the column's in-band layers lie inside a solid resting on the
+    // surface (the floor under a box), where no photon can be -- so that column counts nothing.
+    // The march climbs, so the first closed solid's face above the plane (Hit::solid) decides
+    // by itself, met from inside (back) meaning inside; the rest count toward a parity.
     for (int i = 0; i < kDisc; ++i) {
         // Sunflower placement: equal-area radii, golden-angle azimuth. Deterministic, so two
         // runs of the same scene give the same footprint and an A/B compares one thing.
@@ -106,16 +108,22 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
         // the probe's window: near the disc's edge a box top lies beyond the column's chord and
         // still puts the floor under it inside the box.
         const double top = half + r;
-        double t0 = eps;
+        // The ray relaunches from `tBase` along the chord: at tmin `tl` past it, or, out of a
+        // strand, with the curve-only tmin `ct` that clears the tube and still finds a surface
+        // just behind it (closestHit then drops the blanket tmin, as every curve-tmin caller does).
+        double tBase = 0.0, tl = eps, ct = 0.0;
         int layers = 0;
         double colArea = 0.0;
         int crossed = 0;
+        int firstSolid = 0;                      // the first closed solid's face above: -1 out of it
         int strandSkips = 0;
         for (; layers < maxLayers; ++layers) {
-            Ray ray{start, n};
-            Hit h = sc.closestHit(ray, t0, nullptr, /*skipHair=*/false,
+            Ray ray{start + n * tBase, n, ct};
+            Hit h = sc.closestHit(ray, tl, nullptr, /*skipHair=*/false,
                                   /*skipCamHidden=*/true);
-            if (!h.valid || h.t > top) break;
+            if (!h.valid) break;
+            h.t += tBase;                            // depth along the chord from `start`
+            if (h.t > top) break;
             // THE FACING TEST MUST BE THE PHOTON QUERY'S, EXACTLY. That query (onGatherSurface)
             // keeps a photon when `dot(ph.n, n) >= 0.5` — SIGNED, against consistently-oriented
             // normals — and it lies in the tangent-plane band, which the test below adds —
@@ -140,7 +148,7 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             // so does this march, through the tube and, like the probe, for none of the column's
             // layers up to 48 strands, so a coat deeper than the layers still reaches the skin.
             if (mm && h.fiberRadius > 0.0 && mm->type != MatType::Hair && !holdsPhotons(sc, *mm, h.fiberRadius)) {
-                t0 = h.t + 2.5 * h.fiberRadius + eps;
+                tBase = h.t; tl = 0.0; ct = 2.5 * h.fiberRadius + eps;
                 if (strandSkips < 48) { ++strandSkips; --layers; }
                 continue;
             }
@@ -151,12 +159,16 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             if (h.t <= span && withinGatherBand(std::fabs(off), dot(dh, dh), std::fabs(c), slack)) {
                 if (c >= kGatherFacingCos) colArea += cellArea / c;
             } else if (off > 0.0) {
-                // not a face holding no photon, nor a hair strand (the probe's coin decides those)
-                if (!(mm && (probePassesThrough(sc, *mm) || mm->type == MatType::Hair))) ++crossed;
+                // an opaque face, photon-holding or not, but no hair strand (the probe's coin
+                // decides those)
+                if (!(mm && (passesLight(sc, *mm) || mm->type == MatType::Hair))) {
+                    if (!h.solid) ++crossed;
+                    else if (firstSolid == 0) firstSolid = h.back ? -1 : 1;
+                }
             }
-            t0 = h.t + eps;
+            tl = h.t - tBase + eps; ct = 0.0;
         }
-        if ((crossed & 1) == 0) area += colArea;
+        if ((crossed & 1) == 0 && firstSolid >= 0) area += colArea;
         if (layers >= maxLayers && incomplete) *incomplete = true;
     }
     return area;
