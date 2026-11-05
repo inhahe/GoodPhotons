@@ -82,7 +82,18 @@ ftrace. **Fixed:** each `.run` file now records its owner's process start time (
 and -stop reaps one whose live process started at another time. A `.run` from an older build, with
 no start time, is taken at its word.
 
-## OPEN (2026-11-05, 0.434.1): COMPOUND-MERGE-PICK — modes U and J take a mix's or a layered coat's lobe probability twice in their merges
+## DONE (2026-11-05, 0.434.3; opened 0.434.1): COMPOUND-MERGE-PICK — modes U and J take a mix's or a layered coat's lobe probability twice in their merges
+
+**Fixed in 0.434.3** by the second form proposed below: the vertex carries the merges' share of it,
+1 over the probability that the pick there stores one (compoundPickProb, scene.h; dCompoundPickProb):
+LightVertex::mergeW and the device's DVcmLV::mergeW (mode U; DVcmLV 160 -> 168 B), Vertex::mergeW
+and dRandomWalk's per-vertex `mergeW` output for mode J's surface photons, host and device. The
+connections are untouched. A clearcoat over a diffuse body stores under both lobes and keeps 1.
+check_compound_gather's walls against mode R, 0.434.1 -> 0.434.3: `mix` mode U CPU 0.713 -> 1.006,
+GPU 0.745 -> 0.995, mode J `-jsurf` (GPU) 0.63 -> 1.00 0.97 1.03 (its channels scatter 3-5 % at the
+check's budget, so mode J is an opt-in arm there, `--extra`); every mode U wall within 2.5 %, and
+mode U is one of the check's default cases now.
+
 
 Found by the Opus review of 0.433.5-0.433.11: COMPOUND-DOUBLE-PICK's photon-pass fix does not reach
 the merges of modes U and J. Their light walks resolve a compound to one lobe and store a vertex

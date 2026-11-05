@@ -5524,6 +5524,39 @@ inline int mixResolveChild(const Scene& scene, const Material& m, const Hit& h, 
     return mixPickChild(m, u);
 }
 
+// COMPOUND-MERGE-PICK: the probability that resolving the compound `m` at `h` picks a lobe whose
+// material `keep` accepts -- a mix's weights (or its two-way weight map) over the kept children, the
+// leftover slice keeping nothing, and for a layered stack its coat with `coatR`, the coat's reflectance
+// at the hit, and its body with 1 - coatR. 1 for anything not compound. A light walk stores the vertex
+// a merge gathers only under a lobe that can hold one, so the merges divide it by this: the vertex
+// stands for the flux arriving at the surface, whatever lobe the walk then took (the photon pass of
+// modes M and S deposits before its pick for the same reason, COMPOUND-DOUBLE-PICK).
+template <class Keep>
+inline double compoundPickProb(const Scene& scene, const Material& m, const Hit& h, double coatR,
+                               const Keep& keep) {
+    const auto kept = [&](int c) {
+        return c >= 0 && c < (int)scene.mats.size() && keep(scene.mats[(size_t)c]);
+    };
+    const auto bodyProb = [&]() {
+        if (m.mixChildren.size() == 2 && (m.mixWeightPat >= 0 || m.mixWeightTex >= 0)) {
+            double t;    // mixResolveChild's weight of child 0
+            if (m.mixWeightPat >= 0 && m.mixWeightPat < (int)scene.patterns.size())
+                t = scene.patterns[m.mixWeightPat].eval(patCtxFromHit(scene, h));
+            else
+                t = scene.textures[m.mixWeightTex].scalarAt(h.u, h.v);
+            if (t < 0.0) t = 0.0; else if (t > 1.0) t = 1.0;
+            return (kept(m.mixChildren[0]) ? t : 0.0) + (kept(m.mixChildren[1]) ? 1.0 - t : 0.0);
+        }
+        double p = 0.0;
+        for (size_t k = 0; k < m.mixChildren.size(); ++k)
+            if (kept(m.mixChildren[k])) p += m.mixWeights[k];
+        return p;
+    };
+    if (m.type == MatType::Mix) return bodyProb();
+    if (m.type == MatType::Layered) return (kept(m.coatChild) ? coatR : 0.0) + (1.0 - coatR) * bodyProb();
+    return 1.0;
+}
+
 // Deterministic mixResolveChild for the Whitted preview (-mode W). A pattern/texture
 // driven two-way mix picks whichever child dominates AT THIS POINT, so the blend
 // becomes a hard threshold at t == 0.5 rather than a stochastic dither: the preview

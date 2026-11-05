@@ -163,6 +163,10 @@ struct LightVertex {
     const Material* mat = nullptr;
     Hit    hit;           // for textured albedo / roughness at merge & connect
     int    edges = 0;     // number of edges from the light emitter to this vertex
+    // The merges' share of this vertex: 1 over the probability that the walk's pick at a compound here
+    // lands on a lobe that stores one (compoundPickProb, COMPOUND-MERGE-PICK); 1 off a compound. The
+    // connections never read it: they evaluate the lobe the walk took, the mixture's own sampling.
+    double mergeW = 1.0;
 };
 
 // The hero bundle's SECONDARY wavelengths for a stored light vertex. Deliberately a
@@ -747,7 +751,13 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
 
         // Resolve material (Mix -> child).
         const Material* mp = &scene.mats[h.matId];
+        // The lobes a light vertex is stored under (connectible, below), for LightVertex::mergeW.
+        const auto storesVertex = [](const Material& k) {
+            return isConnectibleMat(k) && !isFiberMat(k) && !k.reflectsNothing;
+        };
+        double pickStore = 1.0;
         if (mp->type == MatType::Mix) {
+            pickStore = compoundPickProb(scene, *mp, h, 0.0, storesVertex);
             int c = mixResolveChild(scene, *mp, h, rng.uniform());
             if (c < 0) return;
             mp = &scene.mats[c];
@@ -757,6 +767,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
             // the whole bundle, compared per wavelength; where the wavelengths disagree the
             // bundle collapses to the hero at this vertex (bdpt.h, HERO-COAT-COIN).
             const double R = layeredCoatReflectance(scene, *mp, h, rd, lambda);
+            pickStore = compoundPickProb(scene, *mp, h, R, storesVertex);
             const double uCoat = rng.uniform();
             const bool coatPick = (uCoat < R);
             for (int i = 0; nUp > 1 && i + 1 < nUp; ++i)
@@ -793,6 +804,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
             lv.cx = cieX(lv.lambda); lv.cy = cieY(lv.lambda); lv.cz = cieZ(lv.lambda);
             lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
             lv.matId = h.matId; lv.mat = mp; lv.hit = h; lv.edges = edges;
+            lv.mergeW = (pickStore > 0.0) ? 1.0 / pickStore : 1.0;
             out.push_back(lv);
             if (C > 1) {                              // lockstep secondary payload
                 LightVertexSec ls; ls.nUp = nUp;
@@ -1402,7 +1414,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                             add = add * (1.0 / (double)lvUp);
                         }
                     }
-                    mergeXYZ += add;
+                    mergeXYZ += add * lv.mergeW;   // COMPOUND-MERGE-PICK
                 });
                 result += mergeXYZ * ((vs ? vs->beta(beta) : beta) * ctx.vmNorm);
             }

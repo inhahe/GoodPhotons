@@ -1005,6 +1005,16 @@ The model is then mode R's: one pick, on the camera's side, and the body's albed
 `coatedAlbedoAt` gives it. `tools/check_compound_gather.py` holds modes M and S on both backends to
 mode R on a mix, a diffuse-glossy mix, a clearcoat and a thin-film coat.
 
+Modes U and J merge too, against the vertices their light walks store, and a light walk resolves a
+compound before storing, under a lobe that can hold a vertex only (0.434.3, COMPOUND-MERGE-PICK).
+That vertex also serves the connections, which must evaluate the lobe the walk took, so it cannot be
+moved before the pick as the photon was. Instead it carries the merges' share of it
+(`LightVertex::mergeW`, `Vertex::mergeW` for mode J's surface photons, the device's
+`DVcmLV::mergeW` and `dRandomWalk`'s `mergeW` output): 1 over the probability that the pick there
+stores a vertex (`compoundPickProb`, scene.h; `dCompoundPickProb`), the weight of a mix's lobes that
+store one, R times the coat's plus 1 - R times the body's for a layered stack. A clearcoat over a
+diffuse body stores under both and has 1; a mix with an absorbing remainder does not.
+
 ### Object view navigates differently from scene view (0.319.0)
 
 `ftrace model.glb` and `-explore scene.ftsl` shared one navigation model — a fly camera — which is

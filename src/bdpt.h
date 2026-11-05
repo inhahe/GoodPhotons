@@ -298,6 +298,10 @@ struct Vertex {
     // see BdptRenderer::renderRows. Both spellings are the same estimator.
     double betaSec[hero::kHeroMax - 1] = {0};
     int nUp = 1;          // live wavelengths (1 = hero off, or already de-hero'd)
+    // A surface merge's share of this vertex, as a light vertex: 1 over the probability that the
+    // walk's pick at a compound here lands on a lobe that stores a photon (compoundPickProb,
+    // COMPOUND-MERGE-PICK); 1 off a compound. The connections never read it.
+    double mergeW = 1.0;
     // Area-measure pdfs of sampling THIS vertex from the previous / next vertex
     // along the two transport directions. Delta vertices store 0 (skipped in MIS).
     double pdfFwd = 0.0;
@@ -1229,7 +1233,14 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
 
         // Resolve material (Mix -> child, or absorbed on the leftover slice).
         const Material* mp = &scene.mats[h.matId];
+        // The lobes a surface photon can be stored under (surfMergeSite: a non-delta, non-fiber
+        // surface), for the merges' share of this vertex (Vertex::mergeW).
+        const auto storesPhoton = [](const Material& k) {
+            return isConnectibleMat(k) && !isFiberMat(k) && !k.reflectsNothing;
+        };
+        double pickStore = 1.0;
         if (mp->type == MatType::Mix) {
+            pickStore = compoundPickProb(scene, *mp, h, 0.0, storesPhoton);
             int c = mixResolveChild(scene, *mp, h, rng.uniform());
             if (c < 0) return;                       // absorbed
             mp = &scene.mats[c];
@@ -1240,6 +1251,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             // every MIS density downstream evaluates -- the same convention a mix already uses,
             // where the pdf stored is the resolved child's and not the mixture's.
             const double R = layeredCoatReflectance(scene, *mp, h, ray.d, lambda);
+            pickStore = compoundPickProb(scene, *mp, h, R, storesPhoton);
             const double uCoat = rng.uniform();
             const bool coatPick = (uCoat < R);
             // THE HERO BUNDLE (0.386.2). One coin serves every live wavelength, compared per
@@ -1280,6 +1292,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         v.type = VType::Surface;
         v.p = h.p; v.ns = h.n; v.ng = h.ng; v.hit = h;
         v.matId = h.matId; v.mat = mp; v.beta = beta;
+        v.mergeW = (pickStore > 0.0) ? 1.0 / pickStore : 1.0;
         v.nUp = nUp;
         for (int i = 0; i + 1 < nUp; ++i) v.betaSec[i] = betaSec[i];
         if (mp->isLight) {
@@ -2823,7 +2836,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                         ph.p      = path[u].p;
                         ph.wo     = dPrev;                 // unit, toward the previous vertex
                         ph.lambda = (float)hb.lam[0];
-                        ph.beta   = (float)path[u].beta;
+                        ph.beta   = (float)(path[u].beta * path[u].mergeW);   // COMPOUND-MERGE-PICK
                         ph.cx = (float)cieX(ph.lambda);
                         ph.cy = (float)cieY(ph.lambda);
                         ph.cz = (float)cieZ(ph.lambda);

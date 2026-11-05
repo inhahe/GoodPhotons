@@ -1,4 +1,4 @@
-"""Regression check: modes M and S gather on a compound surface (a mix, a layered coat) as mode R shades it.
+"""Regression check: modes M, S and U gather on a compound surface (a mix, a layered coat) as mode R shades it.
 
     python tools/check_compound_gather.py [--out png/check_compound_gather] [--exe ftrace.exe]
                                           [--only mix,mix2,clearcoat,thinfilm]
@@ -9,7 +9,7 @@ A wall of a compound material, lit from above over a white floor, seen face on:
   clearcoat  `layered`: a Fresnel coat of index 1.5 over white;
   thinfilm   `layered`: a thin-film coat (index 2.4, 300 nm) over white, whose reflectance swings
              across the band, so the body under it keeps the complement of the film's colour.
-Modes M and S on the CPU and the GPU must read the wall's mean colour within 3 % of mode R (CPU)
+Modes M, S and U on the CPU and the GPU must read the wall's mean colour within 3 % of mode R (CPU)
 per channel, of the channel or of a tenth of the three together where it is smaller. Two seeds.
 
 A camera walk resolves a compound to one lobe with the lobe's probability (a mix's weight, the
@@ -17,7 +17,10 @@ coat's Fresnel R or the body's 1 - R), and so does a photon. Until 0.433.10 the 
 deposited after its own pick, so the photons on a diffuse lobe already carried that probability and
 the camera's pick took it a second time (known-issues COMPOUND-DOUBLE-PICK): mix read 0.50 of mode R,
 mix2 0.56, clearcoat 0.89, all four modes alike. And until 0.433.9 neither walk folded a layered
-coat's coin into its spectral carrier, which the thin film needs. Exits 0 when every case holds.
+coat's coin into its spectral carrier, which the thin film needs. Modes U and J store the vertex a
+merge gathers only under a lobe that can hold one, so until 0.434.3 their merges took the pick twice
+too (COMPOUND-MERGE-PICK): mix read 0.713 (CPU) and 0.745 (GPU) of mode R in mode U, 0.63 in mode J
+with -jsurf, where 0.434.3 reads 1.006 and 0.995, and about 1.00 in J. Exits 0 when every case holds.
 """
 import argparse
 import os
@@ -41,12 +44,12 @@ REF = ["-mode", "R", "-device", "cpu", "-spp", "256"]
 CASES = [("M_cpu", ["-mode", "M", "-device", "cpu", "-n", "4000000", "-spp", "16"]),
          ("M_gpu", ["-mode", "M", "-device", "gpu", "-n", "8000000", "-spp", "32"]),
          ("S_cpu", ["-mode", "S", "-device", "cpu", "-spp", "32"]),
-         ("S_gpu", ["-mode", "S", "-device", "gpu", "-spp", "64"])]
-# Modes U and J merge too (J's surface merges with -jsurf), and their light walks pick a compound's
-# lobe before they store a vertex as the photon pass did (EXTRA_CASES, --extra).
-EXTRA_CASES = [("U_cpu", ["-mode", "U", "-device", "cpu", "-spp", "64"]),
-               ("U_gpu", ["-mode", "U", "-device", "gpu", "-spp", "256"]),
-               ("J_gpu", ["-mode", "J", "-device", "gpu", "-spp", "256", "-jsurf"])]
+         ("S_gpu", ["-mode", "S", "-device", "gpu", "-spp", "64"]),
+         ("U_cpu", ["-mode", "U", "-device", "cpu", "-spp", "64"]),
+         ("U_gpu", ["-mode", "U", "-device", "gpu", "-spp", "256"])]
+# Mode J's surface merges (-jsurf) take the same correction, but at a check's budget they scatter by
+# 3-5 % per channel on these walls, so they run only on request (--extra).
+EXTRA_CASES = [("J_gpu", ["-mode", "J", "-device", "gpu", "-spp", "256", "-jsurf"])]
 TOL = 0.03
 
 

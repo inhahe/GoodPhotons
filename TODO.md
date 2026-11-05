@@ -172,8 +172,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   modes D, J and U had read a vertex-coloured sphere near grey.
 - [ ] **GPU-PHOTON-LAUNCH-FAIL** — one GPU photon pass died with "unspecified launch failure"
   (mode M, a mix wall, beside another GPU process); six reruns clean. Watch for a recurrence.
-- [ ] **COMPOUND-MERGE-PICK** — modes U and J's merges take a compound's lobe probability twice (a
-  half-weight mix wall 0.71-0.75 of mode R in mode U, 0.63 in mode J with -jsurf).
+- [x] **COMPOUND-MERGE-PICK** (0.434.3) — modes U and J's merges took a compound's lobe probability
+  twice (a half-weight mix wall 0.71-0.75 of mode R in mode U, 0.63 in mode J); each stored vertex now
+  carries the merges' share of it.
 - [x] **COMPOUND-DOUBLE-PICK** (0.433.10) — modes M and S took a mix's or a layered coat's lobe
   probability on the photon's side and again on the camera's (a half-weight mix 0.50 of mode R, a
   clearcoat 0.89); found testing the review's coat-coin finding.
