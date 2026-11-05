@@ -72,7 +72,20 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
-## OPEN (2026-11-04, 0.431.0): CURVE-GATHER — modes M, S and U misread a coat of `type diffuse` curves, and M's two backends disagree on it
+## FIXED FOR MODES M AND S (2026-11-04, 0.433.3; opened 2026-11-04, 0.431.0): CURVE-GATHER — modes M, S and U misread a coat of `type diffuse` curves, and M's two backends disagree on it
+
+**Modes M and S, fixed in 0.433.3** by the fix proposed below. Their camera walks never gather on a
+`type diffuse` strand: they light it by NEE, fold its reflectance into the spectral carrier, and go
+on along its diffuse lobe to the surface that gathers, the emitter that continuation meets not
+counted again. The photon pass deposits nothing on a strand. check_fur_gather's coat, of mode R:
+M 0.711 (GPU) / 0.871 (CPU) -> 1.007 / 0.976, and S 1.330 / 1.446 -> 0.986 / 0.981; the two backends
+now agree. fur_creature in GPU mode M (240 x 180, against mode R): the frame 0.9664 -> 0.9997, and
+blocks off by more than 10 % at 5 sigma 170 -> 2 of 660. A `diffuse_transmit` or fluorescent strand
+still gathers (the first would need a two-sided NEE, the second its wavelength shift), and so does
+`-pmfg`'s final-gather sub-walk. **Mode U is unchanged** (2.10 / 2.36): its merge gates, light store
+and MIS recursions treat a strand as a hair strand only for `type hair`, and need the same extension
+(VCM-THIN-CURVES). This also changes how gallery_rain's fur creature looks in mode M, toward mode R:
+the flyby renders in mode M.
 
 `tools/check_fur_gather.py` (a 0.07 m ball in `type diffuse` fur at fur_creature's 450 000
 strands per m², 0.4 mm strands, under a ceiling panel; 96 x 72) reads the coat, against mode R on

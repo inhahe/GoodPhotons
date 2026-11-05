@@ -3692,7 +3692,9 @@ struct Renderer {
                     // Photon-map deposit: incident flux at this diffuse vertex. Stored
                     // BEFORE the Russian-roulette reflect/absorb so the record captures
                     // the arriving power (direct on the first hit, indirect thereafter).
-                    depositPhoton(h.p, ngo, lambda, beta, sawFocus && !sawScatter);
+                    // Not on a strand, where no gather takes it (CURVE-GATHER).
+                    if (!(h.fiberRadius > 0.0))
+                        depositPhoton(h.p, ngo, lambda, beta, sawFocus && !sawScatter);
                     sawScatter = true;   // whatever leaves this vertex is diffuse indirect light
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lambda, beta, rho, rng);
@@ -4195,8 +4197,9 @@ struct Renderer {
                     // stays energy-consistent with the scalar single-λ deposit.
                     {
                         const bool caus = sawFocus && !sawScatter;
-                        for (int i = 0; i < nUp; ++i)
-                            depositPhoton(h.p, ngo, lam[i], beta[i], caus);
+                        if (!(h.fiberRadius > 0.0))   // not on a strand (CURVE-GATHER)
+                            for (int i = 0; i < nUp; ++i)
+                                depositPhoton(h.p, ngo, lam[i], beta[i], caus);
                         sawScatter = true;   // past a diffuse vertex it is indirect light
                     }
                     if (nCam > 0 && !forwardCatch) {

@@ -12317,8 +12317,10 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         Real rho = dDiffuseRho(sc, m, h, lambda);
         DVec3 ngo = dShadedNg(h);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
-        // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path
-        depositPhoton(cs, h.p, ngo, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
+        // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path; not on a strand,
+        // where no gather takes it (CURVE-GATHER, host twin render.h)
+        if (!(h.fiberRadius > (Real)0))
+            depositPhoton(cs, h.p, ngo, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
         if (pathC) pathC->bits |= PV_BIT_SCATTER;   // past here it is diffuse indirect light
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
         camSpecularSplatAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
@@ -12807,9 +12809,11 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     DVec3 ngo = dShadedNg(h);
     DVec3 wiPrev = -rd;
     { const bool caus = dPathIsCaustic(pathC);
-      // ...with the aimed caustic pass's MIS weight, as the scalar deposits carry it.
+      // ...with the aimed caustic pass's MIS weight, as the scalar deposits carry it; not on a
+      // strand (CURVE-GATHER).
       const Real cw = dPathCausticW(pathC);
-      for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngo, beta[i], lam[i], caus, cw);
+      if (!(h.fiberRadius > (Real)0))
+          for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngo, beta[i], lam[i], caus, cw);
       if (pathC) pathC->bits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
     if (camMode == CAM_A || camMode == CAM_B) {
         splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rho, nUp, rng);
@@ -19894,6 +19898,19 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         // connection in place with no compensating weight, i.e. double counting.
         const DGlossyMis gmisIn = gmis;   // a hair pass-through puts it back
         gmis.clear();
+        // CURVE-GATHER (host twin photonGather, where the why is): no gather on a `type diffuse`
+        // strand; it is lit by NEE and the walk goes on along its diffuse lobe.
+        if (m.type == D_DIFFUSE && h.fiberRadius > (Real)0) {
+            const double rho = (double)clamp01(dDiffuseRho(sc, m, h, lambda));
+            const double dc = thr * bkNeeLight(sc, h, (Real)rho, invPdfL, lambda, rng);
+            oX += (double)cieX(lambda) * dc; oY += (double)cieY(lambda) * dc; oZ += (double)cieZ(lambda) * dc;
+            hairArrival = true;
+            thr *= rho;
+            sthr.mul(sc, [&](Real L) { return (double)clamp01(dDiffuseRho(sc, m, h, L)); }, rho);
+            if (!dContinueAlong(h, cosineHemisphere(h.n, rng), DL_REFLECT, ro, rd)) return;
+            if (thr <= 0.0) return;
+            continue;
+        }
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
             const DVec3 gn = dShadedNg(h);   // the true normal, as the photons carry it
             if (fgRays > 0 && m.type == D_DIFFUSE) {
@@ -20309,6 +20326,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
     thrOut = 0.0; vpValid = false; dX = dY = dZ = 0.0;
     double thr = 1.0;
     DMediumStack stk; stk.clear();
+    bool strandArrival = false;   // CURVE-GATHER: the previous vertex, a strand, took its direct light
     for (int b = 0; b < maxBounce; ++b) {
         if (sc.hasGrin) {                                // GRADIENT-INDEX: the camera ray bends,
             DGrinMedia gm;                               // exactly as the deposit's photons do.
@@ -20344,9 +20362,9 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                 dZ += (double)cieZ(lambda) * e;
             }
             // Directly-viewed solar disc (camera / specular escapes only — a diffuse
-            // vertex stores a hit point and returns before it can reach here).
-            // Host twin: sppm_render.h.
-            if (sc.sunCount > 0) {
+            // vertex stores a hit point and returns before it can reach here; a strand's NEE
+            // took it already). Host twin: sppm_render.h.
+            if (sc.sunCount > 0 && !strandArrival) {
                 double e = thr * dSunRadiance(sc, rd, lambda) * invPdfL;
                 dX += (double)cieX(lambda) * e;
                 dY += (double)cieY(lambda) * e;
@@ -20374,7 +20392,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                            : (m.matIsLight)   ? &m.matEmit
                                               : nullptr;
         if (eSpd) {
-            if (dot(rd, h.ng) < (Real)0) {
+            if (dot(rd, h.ng) < (Real)0 && !strandArrival) {
                 double e = (double)specLookup(*eSpd, lambda) * thr * invPdfL
                          * dEmitHitScale(sc, m.emitPat, li, h, rd * (Real)(-1));    // pattern and aim at this hit
                 dX += (double)cieX(lambda) * e;
@@ -20382,6 +20400,20 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                 dZ += (double)cieZ(lambda) * e;
             }
             if (m.matReflectsNothing) return;
+        }
+        strandArrival = false;
+
+        // CURVE-GATHER: no visible point on a `type diffuse` strand (host twin).
+        if (m.type == D_DIFFUSE && h.fiberRadius > (Real)0) {
+            const double rho = (double)clamp01(dDiffuseRho(sc, m, h, lambda));
+            const double dc = thr * bkNeeLight(sc, h, (Real)rho, invPdfL, lambda, rng);
+            dX += (double)cieX(lambda) * dc; dY += (double)cieY(lambda) * dc; dZ += (double)cieZ(lambda) * dc;
+            strandArrival = true;
+            thr *= rho;
+            sthr.mul(sc, [&](Real L) { return (double)clamp01(dDiffuseRho(sc, m, h, L)); }, rho);
+            if (!dContinueAlong(h, cosineHemisphere(h.n, rng), DL_REFLECT, ro, rd)) return;
+            if (thr <= 0.0) return;
+            continue;
         }
 
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {

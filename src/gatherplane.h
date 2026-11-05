@@ -50,8 +50,9 @@ template <class T> FT_GP_HD inline bool withinGatherBand(T off, T d2, T c, T sla
 // 1e-3 of the radius, or none of the band at all on a strand thinner than the radius. Such a strand
 // -- `type diffuse` fur, grass, wire -- has no tangent plane at the radius's scale: the photons
 // around a fur gather lie on the neighbouring strands, which the band would drop while the estimate
-// still divides by the whole disc (on fur_creature, up to 30 % darker in mode M). A curve as thick
-// as the radius is a surface at that scale, and takes the band as one. The facing test stays.
+// still divides by the whole disc. Only a `diffuse_transmit` or fluorescent strand gathers at all:
+// modes M and S walk on past a `type diffuse` one (CURVE-GATHER). A curve as thick as the radius is
+// a surface at that scale, and takes the band as one. The facing test stays.
 template <class T> FT_GP_HD inline T gatherBandSlack(T radius, T fiberR) {
     return (fiberR > T(0) && fiberR < radius) ? T(HUGE_VAL) : radius * T(1e-3);
 }

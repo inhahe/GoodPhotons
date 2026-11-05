@@ -1620,6 +1620,24 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
         gmis.clear();
         hairArrival = false;
 
+        // CURVE-GATHER: a `type diffuse` strand (fur, grass, wire: any curve) is no surface to gather
+        // on. The photons in a ball around a point on it lie on its neighbours, and dividing them by
+        // a disc's area read a diffuse coat at 0.71-0.87 of mode R (check_fur_gather). As a hair
+        // strand is, it is lit here by NEE, and the walk goes on along its diffuse lobe to the
+        // surface that gathers; the emitter that continuation meets is not counted again
+        // (`hairArrival`). The photon pass deposits nothing on a strand to match (render.h).
+        if (m.type == MatType::Diffuse && h.fiberRadius > 0.0) {
+            const double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
+            L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                 * (thr * bwNee.neeLight(scene, h, rho, invPdfL, lambda, rng));
+            hairArrival = true;
+            thr *= rho;
+            sthr.mul([&](double Lw) { return clamp01(diffuseReflectance(scene, m, h, Lw)); }, rho);
+            if (!continueAlong(h, cosineHemisphere(h.n, rng), Lobe::Reflect, ray)) return L;
+            if (thr <= 0.0) return L;
+            continue;
+        }
+
         switch (m.type) {
             case MatType::Diffuse:
             case MatType::DiffuseTransmit:

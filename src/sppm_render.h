@@ -98,6 +98,8 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
     BackwardRenderer bwNee; bwNee.diffraction = diffraction;
     const bool gneeOn = BackwardRenderer::glossyNeeOn();
     BackwardRenderer::GlossyMis gmis;
+    // CURVE-GATHER: the previous vertex was a diffuse strand, which took its direct light by NEE.
+    bool strandArrival = false;
 
     for (int b = 0; b < maxBounce; ++b) {
         if (grinAny) {
@@ -133,7 +135,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                            * (thr * scene.envRadianceSeen(ray.d, lambda) * invPdfL);
             // Directly-viewed solar disc (camera / specular escapes only — a diffuse
             // vertex stores a hit point and returns before it can reach here).
-            if (scene.sunCount > 0)
+            if (scene.sunCount > 0 && !strandArrival)
                 directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                            * (thr * bwNee.sunRadianceMis(scene, gmis, ray.d, lambda) * invPdfL);
             return;
@@ -157,8 +159,8 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
 
         if (m.isLight) {
             // A light emits from the face its triangles are wound to (the side its `normal`
-            // picks, as backward.h tests it).
-            if (dot(ray.d, h.ng) < 0.0) {
+            // picks, as backward.h tests it); not after a strand's NEE took it.
+            if (dot(ray.d, h.ng) < 0.0 && !strandArrival) {
                 // GLOSSY-NEE's lobe-sampling half; 1, and this expression bit-identical to its
                 // pre-0.266 form, unless the previous bounce was a MIS'd glossy one.
                 const double wMis = (gmis.pdf > 0.0)
@@ -179,6 +181,21 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
         // lines before its only consumer, leaving the connection with no compensating weight.
         // See the twin note in backward.h.
         gmis.clear();
+        strandArrival = false;
+
+        // CURVE-GATHER: no visible point on a `type diffuse` strand (mode M's walk, where the why
+        // is): lit by NEE, the walk goes on along its diffuse lobe to the surface that gathers.
+        if (m.type == MatType::Diffuse && h.fiberRadius > 0.0) {
+            const double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
+            directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
+                       * (thr * bwNee.neeLight(scene, h, rho, invPdfL, lambda, rng));
+            strandArrival = true;
+            thr *= rho;
+            sthr.mul([&](double L) { return clamp01(diffuseReflectance(scene, m, h, L)); }, rho);
+            if (!continueAlong(h, cosineHemisphere(h.n, rng), Lobe::Reflect, ray)) return;
+            if (thr <= 0.0) return;
+            continue;
+        }
 
         switch (m.type) {
             case MatType::Diffuse:

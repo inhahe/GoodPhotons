@@ -3,18 +3,16 @@
     python tools/check_fur_gather.py [--out png/check_fur_gather] [--exe ftrace.exe] [--record]
 
 A ball in a coat of `type diffuse` fur (fur_creature's density and strand radius) on a floor under
-a ceiling panel. A mode-M or mode-S gather keeps only the photons near its gather point's tangent
-plane (gatherplane.h, known-issues MERGE-PROXIMITY), except at a point on a strand thinner than
-the radius: such a strand has no tangent plane at that scale, and the photons around it lie on
-its neighbours. With the plane test applied there too, the coat lost two fifths of its light
-(CPU, of mode R: M 0.87 -> 0.55, S 1.45 -> 0.87). Mode U, which takes no plane test, is held to
-its value too.
+a ceiling panel. A gather on a strand is no surface estimate: the photons in its ball lie on the
+neighbouring strands. Since 0.433.3 modes M and S never gather there (known-issues CURVE-GATHER):
+they light a strand by NEE and walk on along its diffuse lobe, and deposit no photon on one. Before
+that the coat read, of mode R, M 0.71 (GPU) / 0.87 (CPU) and S 1.33 / 1.45; now 1.007 / 0.976 and
+0.986 / 0.981. Mode U still merges on strands (VCM-THIN-CURVES), at 2.10 / 2.36.
 
 The coat is the mean over the ball's middle, two seeds, against mode R's on the GPU. In modes M, S
-and U on the CPU and the GPU it must lie within 10 % of the value recorded below. Those values
-are not 1: each of the three misreads a diffuse curve in its own way (known-issues CURVE-GATHER), so
-a fix there moves its value here, and `--record` prints the new ones to paste in. Exits 0 when every
-case holds, 1 otherwise.
+and U on the CPU and the GPU it must lie within 10 % of the value recorded below. Mode U's is not 1;
+when its merges stop at strands too, its value moves, and `--record` prints the new ones to paste
+in. Exits 0 when every case holds, 1 otherwise.
 """
 import argparse
 import os
@@ -47,10 +45,10 @@ SCENE = NL.join([
 ]) + NL
 REF = ["-mode", "R", "-device", "gpu", "-spp", "512"]
 # (name, arguments, the coat's value against mode R as recorded)
-CASES = [("M_gpu", ["-mode", "M", "-device", "gpu", "-n", "4000000", "-spp", "16"], 0.711),
-         ("M_cpu", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "4"], 0.871),
-         ("S_gpu", ["-mode", "S", "-device", "gpu", "-spp", "16"], 1.330),
-         ("S_cpu", ["-mode", "S", "-device", "cpu", "-spp", "4"], 1.446),
+CASES = [("M_gpu", ["-mode", "M", "-device", "gpu", "-n", "4000000", "-spp", "16"], 1.007),
+         ("M_cpu", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "4"], 0.976),
+         ("S_gpu", ["-mode", "S", "-device", "gpu", "-spp", "16"], 0.986),
+         ("S_cpu", ["-mode", "S", "-device", "cpu", "-spp", "4"], 0.981),
          ("U_gpu", ["-mode", "U", "-device", "gpu", "-spp", "16"], 2.100),
          ("U_cpu", ["-mode", "U", "-device", "cpu", "-spp", "4"], 2.356)]
 TOL = 0.10

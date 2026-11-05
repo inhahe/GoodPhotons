@@ -5631,7 +5631,12 @@ as the one at fault.
   or below does not. A gather point on a curve thinner than the radius (`type diffuse` fur, grass,
   wire) takes no band (`gatherBandSlack`): such a strand has no tangent plane at that scale, and the
   photons around it lie on its neighbours, which the band would drop while the estimate still
-  divides by the whole disc. Modes U and J take neither test: their merges have no footprint to say
+  divides by the whole disc. Since 0.433.3 (CURVE-GATHER) modes M and S gather on a `type diffuse`
+  strand not at all: their camera walks light it by NEE (`neeLight` / `bkNeeLight`, the continuation's
+  emitter hit then not counted again), fold its reflectance into the carrier and walk on along its
+  diffuse lobe to the surface that gathers, and the photon pass deposits nothing on one. Only a
+  `diffuse_transmit` or fluorescent strand still gathers, and takes the exemption. Modes U and J take
+  neither test: their merges have no footprint to say
   how much of the disc is the gather's own surface, so dropping another surface's photons only
   darkened the disc where the surface ends (0.62 and 0.61 of mode R at a box's base, against 0.94
   and 1.01), and their shrinking radius makes the cross-surface bias they keep vanish as the render
