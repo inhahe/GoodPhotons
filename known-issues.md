@@ -2636,7 +2636,18 @@ every camera-side refraction (and thin-film / multilayer / grating interfaces th
 medium), CPU and GPU, with a check of an emitter inside a solid dielectric in modes R, D and W
 against mode B. check_fire_d uses a glass pane, crossed in and out, until then.
 
-## OPEN (2026-10-14): SPPM-SPECTRAL — mode S applies a camera path's spectral factors at the camera's wavelength to every photon
+## FIXED (2026-11-04, 0.432.0; opened 2026-10-14): SPPM-SPECTRAL — mode S applied a camera path's spectral factors at the camera's wavelength to every photon
+
+**Fixed in 0.432.0** as proposed below. The visible point's walk (`sppmVisiblePoint`,
+`dSppmVisiblePoint`) carries a `SpecThr` / `DSpecThr`, folded at the sites where mode M's walk folds
+its own, and the pixel keeps the walk's ratio per bin (`vpRatio`, 96 B, read only where some factor
+was not flat). Each gathered photon then takes the camera prefix's factors at its own wavelength.
+`tools/check_coat_modes.py` now holds mode S to mode R per colour channel on both backends, in the
+coated-bodies scene and the four coin scenes. On 0.431.0 the CPU's mode S failed all twelve
+coin-scene channels, its worst tiles x0.27 (the green gel, in green) to x10.9 (the half mirror, in
+blue). Now every one passes. On the tank with a partly opaque coat, four seeds put the frame at
+0.982 / 1.002 / 1.004 of mode R on the CPU and 0.992 / 1.002 / 1.003 on the GPU.
+
 
 Mode S's visible point is reached by a camera walk at one wavelength (the camera sample's), and its
 throughput carries every spectral factor met on the way -- a coloured mirror's reflectance, a gel's

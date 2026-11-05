@@ -84,8 +84,9 @@ Each names the section its line is in.
    its radius: a table top gathers the floor's light.~~ Done, 0.431.0.
 2. **HAZE-SUN-B** (4.2) — mode B lights an unbounded sunlit haze at 0.16 of mode R. **Waiting on
    the user (4.1):** modes R, D and J agree, and only a choice of domain can bring B to them.
-3. **VCM-SPEC** and **SPPM-SPECTRAL** (4.2) — modes U and S merge at the camera's wavelength, so a
-   coloured surface seen before a merge washes out (the fix mode J got in 0.386.1, JSPEC).
+3. **VCM-SPEC** and ~~**SPPM-SPECTRAL**~~ (4.2) — modes U and S merge at the camera's wavelength, so
+   a coloured surface seen before a merge washes out (the fix mode J got in 0.386.1, JSPEC). Mode S
+   done, 0.432.0.
 4. **MODEM-GPU-CORNER** and **MODEM-COMPOTE-NAN** (4.2) — GPU mode M reads a box's corner 15 %
    bright, and writes NaN pixels on gallery_rain's gem compote.
 5. **CURVE-GATHER** (4.2) — modes M, S and U read a coat of diffuse fur at 0.7-2.4 of mode R; never
@@ -177,8 +178,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   build; 13 reruns clean. The checks now print the exit code; reproduce under memory pressure.
 - [ ] **SPECGATHER-BIN-RESOLUTION** — mode M's 24-bin carrier misreads a spectral edge or kink inside
   a bin; the 555-585 nm ramp's green excess is unexplained.
-- [ ] **SPPM-SPECTRAL** — mode S applies a camera path's spectral factors at the camera's wavelength
-  to every photon.
+- [x] **SPPM-SPECTRAL** (0.432.0) — mode S's visible point carries its walk's spectral factors per
+  bin (SpecThr), and each gathered photon is weighted at its own wavelength.
 - [ ] **BIRTH-EMPTY-STACK** — a light walk born inside a dielectric does not know it is inside.
 - [ ] **GRIN-RADIANCE-SCALE** — a camera path ending inside a GRIN region misses the n² radiance
   scale.

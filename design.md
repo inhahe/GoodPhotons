@@ -1072,6 +1072,15 @@ wavelength by the walk's reflectance). A layered coat's coin (its Fresnel reflec
 taken at the walk's wavelength: it varies only with the coat's dispersion, a few tenths of a
 percent. `tools/check_coat_modes.py` holds both to mode R.
 
+**Mode S (0.432.0, SPPM-SPECTRAL).** Mode S's visible-point walk (`sppmVisiblePoint`,
+`dSppmVisiblePoint`) carries a `SpecThr` / `DSpecThr` too, folded at the same sites as mode M's
+walk (coloured glass along each segment, mirror, glossy and its interference, the dielectric step's
+coin, the half mirror's coin, the gel, the fiber, the grating's approximate reflection). A pass
+traces the visible points before its photons, so the carrier cannot ride to the gather on the
+stack: the pixel keeps its ratio per bin (`SPPMPixel::vpRatio`, the device's `DSppmState::vpRatio`,
+96 B a pixel, only read where `vpSpec` says some factor was not flat), and the gather multiplies
+each photon by its bin's. `tools/check_coat_modes.py` holds mode S to mode R per colour channel.
+
 **HAIR-NEE (0.334.0).** Mode M's walk collects radiance only where it finally gathers -- a
 diffuse surface -- so a chain that scatters strand to strand through a hair mass lands on the
 shadowed scalp or dress beneath it, and the mass's own lit glow (direct light scattered by the

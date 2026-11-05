@@ -10,18 +10,17 @@ reflects with the coating's interference reflectance -- its whole colour -- and 
 a half mirror (the material's unset `reflect` slot), so a soap bubble or a dichroic ball rendered
 grey and opaque there. This renders such a bubble and a dichroic ball, each around a diffuse core,
 over a floor and in front of a wall, and requires against mode R, per tile:
-  * mode M, each colour channel alike (its spectral gather re-expresses the coating's coin at
-    every photon's wavelength -- Renderer::stepFactorAt);
-  * mode S, the sum of the channels (mode S folds no spectral factor per photon for any
-    material: known-issues SPPM-SPECTRAL);
+  * modes M and S, each colour channel alike (their spectral gathers re-express the coating's
+    coin at every photon's wavelength -- Renderer::stepFactorAt; mode S since 0.432.0, when its
+    visible point began to carry the walk's factors: known-issues SPPM-SPECTRAL);
   * unless --no-gpu, both on the device against the host.
 And an OPAQUE coated ball -- a stack with an absorbing layer -- in a water tank that carries a
 `priority`: it is never entered, so it is no medium, and the priority it is given cannot matter.
 Mode R (host, and device unless --no-gpu) and mode D (host) must render it the same ranked below
 the water as above it. (Until 0.379.1 the priority rule suppressed it when it ranked no higher than
 the water, and the ball vanished.)
-And three scenes where what a walk can carry depends on its wavelength, mode M (host,
-and device unless --no-gpu) against mode R per colour channel -- mode M's gather re-expresses its
+And three scenes where what a walk can carry depends on its wavelength, modes M and S (host,
+and device unless --no-gpu) against mode R per colour channel -- their gathers re-express the
 walk at every photon's wavelength, which a walk can do only for branches its own wavelength allows
 (SpecThr::mulCoin, known-issues MODE-M-FOLD-SUPPORT):
   * that tank, framed close on a thin-film ball ranked as the water whose substrate absorbs above
@@ -55,7 +54,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
-from check_glossy_nee_media import render_seeds, tile_stats, tile_verdict  # noqa: E402
+from check_glossy_nee_media import render_seeds, tile_stats, tile_stats_k, tile_verdict  # noqa: E402
 from check_radiance_eta2 import TANK  # noqa: E402
 
 NL = chr(10)
@@ -171,16 +170,14 @@ def main():
     r = render("R", ["-mode", "R"])
     m = render("M", modeM)
     s = render("S", modeS)
-    pairs = [("mode M / mode R, channel %d" % c, [x[..., c] for x in m], [x[..., c] for x in r])
-             for c in range(3)]
-    pairs.append(("mode S / mode R, luminance", [x.sum(-1) for x in s], [x.sum(-1) for x in r]))
+    pairs = [("mode %s / mode R, channel %d" % (k, c), [x[..., c] for x in im], [x[..., c] for x in r])
+             for k, im in (("M", m), ("S", s)) for c in range(3)]
     if not a.no_gpu:
         mg = render("Mg", modeM, "gpu")
         sg = render("Sg", modeS, "gpu")
-        pairs += [("mode M device / host, channel %d" % c, [x[..., c] for x in mg],
-                   [x[..., c] for x in m]) for c in range(3)]
-        pairs.append(("mode S device / host, luminance", [x.sum(-1) for x in sg],
-                      [x.sum(-1) for x in s]))
+        pairs += [("mode %s device / host, channel %d" % (k, c), [x[..., c] for x in dv],
+                   [x[..., c] for x in hv]) for k, dv, hv in (("M", mg, m), ("S", sg, s))
+                  for c in range(3)]
     devs = ["cpu"] if a.no_gpu else ["cpu", "gpu"]
     for mode, dev in [("R", x) for x in devs] + [("D", "cpu")]:
         tag = "opaque_%s%s" % (mode, "g" if dev == "gpu" else "")
@@ -198,17 +195,23 @@ def main():
             ("filter", "red gel filter", (["-mode", "R"], "cpu", a.spp), 0.05),
             ("greengel", "green band-pass gel", (["-mode", "R"], "cpu", a.spp), 0.10)):
         rr = render_seeds(a.exe, d, name + ".ftsl", name + "_R", ref[0], ref[1], ref[2], rgb=True)
-        for dev in devs:
-            mm = render_seeds(a.exe, d, name + ".ftsl", name + "_M" + ("g" if dev == "gpu" else ""),
-                              modeM, dev, a.spp, rgb=True)
-            pairs += [("%s, mode M%s / mode R, channel %d" % (
-                what, " (device)" if dev == "gpu" else "", c), [x[..., c] for x in mm],
-                [x[..., c] for x in rr], tol) for c in range(3)]
+        # Mode S on four seeds: its noise in the tank is correlated across a tile, so two seeds'
+        # error estimate (one degree of freedom) can fake a 5-sigma tile -- seeds 1 and 2 put one
+        # red tile at x1.25, 5.6 sigma, where four put the worst at x0.92, 1.4 (tile_stats_k).
+        for k, args in (("M", modeM), ("S", modeS)):
+            for dev in devs:
+                mm = render_seeds(a.exe, d, name + ".ftsl",
+                                  name + "_" + k + ("g" if dev == "gpu" else ""), args, dev, a.spp,
+                                  seeds=(1, 2) if k == "M" else (1, 2, 3, 4), rgb=True)
+                pairs += [("%s, mode %s%s / mode R, channel %d" % (
+                    what, k, " (device)" if dev == "gpu" else "", c), [x[..., c] for x in mm],
+                    [x[..., c] for x in rr], tol) for c in range(3)]
     ok = True
     for pair in pairs:
         name, x1, x0 = pair[:3]
         tol = pair[3] if len(pair) > 3 else 0.05
-        ratio, z, bad = tile_verdict(tile_stats(*x1), tile_stats(*x0), tol)
+        ts = lambda xs: tile_stats(*xs) if len(xs) == 2 else tile_stats_k(xs)
+        ratio, z, bad = tile_verdict(ts(x1), ts(x0), tol)
         good = not bad.any()
         ok &= good
         print("%s: %s; worst tile x%.4f (%.1f sigma)" % (

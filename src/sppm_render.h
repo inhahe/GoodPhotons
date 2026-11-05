@@ -43,6 +43,11 @@ struct SPPMPixel {
     Hit    vpHit;             // diffuse hit record (pos/normal/uv/matId for BSDF eval)
     double vpThr = 0.0;       // specular throughput camera -> visible point (0 = none)
     bool   vpValid = false;
+    // SPPM-SPECTRAL: the walk's spectral factors as the gather needs them, one ratio per SpecThr
+    // bin (SpecThr::ratio at the bin), so a photon of wavelength L is weighted by the camera
+    // prefix's factors at L rather than at the walk's own wavelength. Read only when vpSpec.
+    bool   vpSpec = false;
+    float  vpRatio[SpecThr::K];
 };
 
 struct SPPMState {
@@ -63,10 +68,13 @@ struct SPPMState {
 // in `thr` and the diffuse hit in `vp`; any emitter/environment radiance reached through
 // specular is added to `directL` (a monochromatic MC estimate at the sampled lambda).
 // `vpValid` is false when the ray terminated (on a light, env, or absorption) without
-// reaching a diffuse surface.
+// reaching a diffuse surface. `sthr` (constructed over scene.emitSampler, the walk's wavelength
+// density) takes every spectral factor folded into `thr`, as mode M's gather walk folds them
+// (SPECGATHER): the photons the visible point gathers come in every wavelength, and each owes the
+// camera prefix's factors at its own (SPPM-SPECTRAL).
 inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffraction,
                              int maxBounce, Hit& vp, double& thrOut, bool& vpValid,
-                             Vec3& directL) {
+                             Vec3& directL, SpecThr& sthr) {
     directL = Vec3{0, 0, 0};
     thrOut = 0.0; vpValid = false;
 
@@ -97,17 +105,25 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 [&](const Vec3&, const Vec3&, double slen, double&) { arc += slen; return false; },
                 // b == 0 is the camera ray; see Material::hideCamera.
                 /*camHide=*/(b == 0));
-            int cm = stk.topMat();                       // Beer-Lambert over the marched arc
-            double a = (cm >= 0) ? scene.mats[cm].absorb(lambda) : 0.0;
-            if (a > 0.0 && arc > 0.0) thr *= std::exp(-a * arc);
+            const int cm = stk.topMat();                 // Beer-Lambert over the marched arc
+            if (cm >= 0 && arc > 0.0) {
+                const double T = std::exp(-scene.mats[cm].absorb(lambda) * arc);
+                thr *= T;
+                sthr.mul([&](double L) { return std::exp(-scene.mats[cm].absorb(L) * arc); }, T);
+            }
         }
         // b == 0 is the camera ray this function was handed; see Material::hideCamera.
         Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false,
                                  /*skipCamHidden=*/(b == 0));
         if (h.valid) {
-            int cm = stk.topMat();
-            double a = (cm >= 0) ? scene.mats[cm].absorb(lambda) : 0.0;
-            if (a > 0.0) thr *= std::exp(-a * h.t);
+            // Inside a dielectric whatever it absorbs at the walk's own wavelength: a glass clear
+            // there may absorb at a photon's (clear glass folds exactly 1).
+            const int cm = stk.topMat();
+            if (cm >= 0) {
+                const double T = std::exp(-scene.mats[cm].absorb(lambda) * h.t), tt = h.t;
+                thr *= T;
+                sthr.mul([&](double L) { return std::exp(-scene.mats[cm].absorb(L) * tt); }, T);
+            }
         }
         if (!h.valid) {
             // camera / specular escape: the env as SEEN, bilinear (Scene::envRadianceSeen)
@@ -165,7 +181,9 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 vp = h; thrOut = thr; vpValid = true;   // record the visible point
                 return;
             case MatType::Mirror: {
-                thr *= clamp01(reflectSlot(scene, m, h, lambda));
+                const double r = clamp01(reflectSlot(scene, m, h, lambda));
+                thr *= r;
+                sthr.mul([&](double L) { return clamp01(reflectSlot(scene, m, h, L)); }, r);
                 if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return;   // across the surface
                 break;
             }
@@ -180,12 +198,21 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                                                      BackwardRenderer::GiCtx{}, nullptr, nullptr,
                                                      &nb));
                 }
-                thr *= clamp01(reflectSlot(scene, m, h, lambda));
+                const double r = clamp01(reflectSlot(scene, m, h, lambda));
+                thr *= r;
+                sthr.mul([&](double L) { return clamp01(reflectSlot(scene, m, h, L)); }, r);
                 Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
                 if (dot(o, h.n) <= 0.0) return;
-                // An iridescent lobe's interference reflectance at the pair's half-vector.
-                if (m.iridescence)
-                    thr *= iridescenceR(scene, m, &h, lambda, halfVectorCos(ray.d * -1.0, o));
+                // An iridescent lobe's interference reflectance at the pair's half-vector. Where it
+                // is 0 at the walk's own wavelength the path carries nothing (and the ratio would
+                // divide by it).
+                if (m.iridescence) {
+                    const double cH = halfVectorCos(ray.d * -1.0, o);
+                    const double Rh = iridescenceR(scene, m, &h, lambda, cH);
+                    if (!(Rh > 0.0)) return;
+                    thr *= Rh;
+                    sthr.mul([&](double L) { return iridescenceR(scene, m, &h, L, cH); }, Rh);
+                }
                 if (gneeOn) {
                     gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
                     gmis.from = h.p;
@@ -199,22 +226,38 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             case MatType::Multilayer: {
                 // A dielectric body's surface, plain or coated (Renderer::interfaceStep); this
                 // camera-side walk carries radiance across a refraction.
+                // The step at each photon's wavelength (stepFactorAt) against its value here
+                // (st.factor): the branch the coin took and the radiance factor, as mode M's walk.
+                const Vec3 d0 = ray.d;
                 const Renderer::InterfaceStep st =
-                    mats.interfaceStep(scene, m, h, ray.d, lambda, rng, stk,
+                    mats.interfaceStep(scene, m, h, d0, lambda, rng, stk,
                                        Renderer::Transport::Radiance);
                 if (st.absorbed) return;
                 ray = st.ray;
                 thr *= st.scale;
+                sthr.mulCoin([&](double L, double& pr) {
+                    return mats.stepFactorAt(scene, m, st, h, d0, L, &pr);
+                }, st.factor, st.prob, m.type != MatType::Dielectric);
                 break;
             }
             case MatType::HalfMirror: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
-                if (rng.uniform() < r) { if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return; }
-                else                   ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                const bool refl = rng.uniform() < r;
+                if (refl) { if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return; }
+                else      ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                // The coin at each photon's wavelength: a coloured half mirror reflects each
+                // wavelength by its own reflectance.
+                const double pc = refl ? r : 1.0 - r;
+                sthr.mulCoin([&](double L, double& pr) {
+                    const double rL = clamp01(reflectSlot(scene, m, h, L));
+                    return pr = refl ? rL : 1.0 - rL;
+                }, pc, pc, true);
                 break;
             }
             case MatType::Filter: {
-                thr *= clamp01(transmitSlot(scene, m, h, lambda));
+                const double t = clamp01(transmitSlot(scene, m, h, lambda));
+                thr *= t;
+                sthr.mul([&](double L) { return clamp01(transmitSlot(scene, m, h, L)); }, t);
                 ray = Ray{h.p + ray.d * 1e-6, ray.d};
                 break;
             }
@@ -231,21 +274,38 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 const Vec3 wPrev{-ray.d.x, -ray.d.y, -ray.d.z};
                 const HairShade hs = hairShadeAt(scene, m, h, lambda, wPrev);
                 double pdfH = 0.0, fv = 0.0;
+                hair::LobeAngular la;                              // filled by the sample's own f()
                 const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
-                                             rng.uniform(), rng.uniform(), pdfH, fv);
+                                             rng.uniform(), rng.uniform(), pdfH, fv, &la);
                 if (!(pdfH > 0.0) || !(fv > 0.0)) return;
                 // Exactly T = sum_p A_p, the total lobe attenuation (see render.h's Hair
                 // case for why the ratio collapses to a deterministic number).
                 const double cosLong =
                     hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
-                thr *= clamp01(fv * cosLong / pdfH);
+                const double wCam = clamp01(fv * cosLong / pdfH);
+                thr *= wCam;
+                // The fiber's transmission at each photon's wavelength, as mode M's walk folds it:
+                // the sampled direction and pdf stay, the BCSDF value moves with the absorption. A
+                // coverage pass-through (exactly -wo) is achromatic and folds nothing.
+                const bool passedThru = (hs.b.opacity < 1.0) && wl.x == -hs.woLocal.x &&
+                                        wl.y == -hs.woLocal.y && wl.z == -hs.woLocal.z;
+                if (!passedThru) {
+                    const double* bins = hairSigmaBins<SpecThr::K, &SpecThr::lamOf>(scene, m, h);
+                    sthr.mul([&](double lamK) {
+                        const HairShade hk = hairShadeRetint(scene, m, h, lamK, hs,
+                                                             bins ? bins[SpecThr::binOf(lamK)] : -1.0);
+                        return clamp01(hairFoldFCos(la, hk, wl, cosLong, nullptr) / pdfH);
+                    }, wCam);
+                }
                 const Vec3 wo = hair::toWorld(hs.fr, wl);
                 // TT/TRT leave through the FAR side of a real solid tube.
                 ray = Ray{h.p + wo * 1e-6, wo, hairExitOffset(hs, h.n, wo)};
                 break;
             }
             default: {
-                thr *= clamp01(reflectSlot(scene, m, h, lambda));
+                const double r = clamp01(reflectSlot(scene, m, h, lambda));
+                thr *= r;
+                sthr.mul([&](double L) { return clamp01(reflectSlot(scene, m, h, L)); }, r);
                 if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return;   // across the surface
                 break;
             }
@@ -293,8 +353,13 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                                                : camAt;
                     Ray ray = c.genRay(x, y, rng.uniform(), rng.uniform());
                     Vec3 directL;
+                    SpecThr sthr(scene.emitSampler);
                     sppmVisiblePoint(scene, ray, rng, diffraction, maxBounce,
-                                     P.vpHit, P.vpThr, P.vpValid, directL);
+                                     P.vpHit, P.vpThr, P.vpValid, directL, sthr);
+                    P.vpSpec = P.vpValid && sthr.any;
+                    if (P.vpSpec)
+                        for (int k = 0; k < SpecThr::K; ++k)
+                            P.vpRatio[k] = (float)sthr.ratio(SpecThr::lamOf(k));
                     P.directSum += directL;
                 }
         };
@@ -335,6 +400,8 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                     if (!onGatherSurface(h.p, gn, pm.pos[k], ph.n, gatherBandSlack(P.radius, h.fiberRadius))) return;   // another surface's
                     double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                     double f = rho * (1.0 / PI);
+                    // the camera prefix's factors at this photon's wavelength (SPPM-SPECTRAL)
+                    if (P.vpSpec) f *= (double)P.vpRatio[SpecThr::binOf(ph.lambda)];
                     phi += pm.cie[k] * (f * (double)ph.power);        // == cie(lambda_p), precomputed
                     M += 1.0;
                 });

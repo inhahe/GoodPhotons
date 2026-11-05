@@ -20313,10 +20313,11 @@ __global__ void kFilmFold(double* film, double* hits, const double* sfilm, const
 // emitter/env radiance reached directly or through specular is added to directL (XYZ, a
 // monochromatic MC estimate at the sampled lambda). `vpValid` is false when the ray
 // terminated (light, env, or absorption) without reaching a diffuse surface.
+// `sthr` takes every spectral factor folded into `thr` (host twin sppm_render.h, SPPM-SPECTRAL).
 __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, Real lambda,
                                          double invPdfL, DRng& rng, int maxBounce,
                                          DHit& vp, double& thrOut, bool& vpValid,
-                                         double& dX, double& dY, double& dZ) {
+                                         double& dX, double& dY, double& dZ, DSpecThr& sthr) {
     thrOut = 0.0; vpValid = false; dX = dY = dZ = 0.0;
     double thr = 1.0;
     DMediumStack stk; stk.clear();
@@ -20324,16 +20325,24 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         if (sc.hasGrin) {                                // GRADIENT-INDEX: the camera ray bends,
             DGrinMedia gm;                               // exactly as the deposit's photons do.
             dGrinMarch(sc, ro, rd, &gm, 200000, /*camHide=*/(b == 0));  // rng == nullptr: bend only
-            int cm = stk.topMat();                       // Beer-Lambert over the marched arc
-            Real a = (cm >= 0) ? specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
-            if (a > 0 && gm.arc > 0) thr *= exp(-(double)a * (double)gm.arc);
+            const int cm = stk.topMat();                 // Beer-Lambert over the marched arc
+            if (cm >= 0 && gm.arc > 0) {
+                const double arc = (double)gm.arc;
+                const double T = exp(-(double)specLookup(sc.mats[cm].absorb, lambda) * arc);
+                thr *= T;
+                sthr.mul(sc, [&](Real L) { return exp(-(double)specLookup(sc.mats[cm].absorb, L) * arc); }, T);
+            }
         }
         // b == 0 is the camera ray this visible-point walk was handed; see DMaterial::hideCamera.
         DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG, /*camHide=*/(b == 0));
-        if (h.valid) {                                   // Beer-Lambert in current medium
-            int cm = stk.topMat();
-            Real a = (cm >= 0) ? specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
-            if (a > 0) thr *= exp(-(double)a * (double)h.t);
+        if (h.valid) {                                   // Beer-Lambert in current medium, spectral
+            const int cm = stk.topMat();
+            if (cm >= 0) {
+                const double tt = (double)h.t;
+                const double T = exp(-(double)specLookup(sc.mats[cm].absorb, lambda) * tt);
+                thr *= T;
+                sthr.mul(sc, [&](Real L) { return exp(-(double)specLookup(sc.mats[cm].absorb, L) * tt); }, T);
+            }
         }
         if (!h.valid) {                                  // escaped -> environment (direct)
             if (sc.envIndex >= 0) {
@@ -20392,40 +20401,66 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
             return;
         }
 
-        switch (m.type) {                                // specular walk (monochromatic)
+        switch (m.type) {                                // specular walk, its factors into sthr
             case D_MIRROR: {
-                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                const double r = (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                thr *= r;
+                dSpecFold(sthr, sc, m, h, r, false);
                 if (!dContinueAlong(h, reflectv(rd, h.n), DL_REFLECT, ro, rd)) return; break;
             }
             case D_GLOSSY: {
-                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                const double r = (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                thr *= r;
+                dSpecFold(sthr, sc, m, h, r, false);
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
                 if (dot(o, h.n) <= 0) return;
-                // An iridescent lobe's interference reflectance at the pair's half-vector.
-                if (m.iridescence) thr *= (double)dIridescenceR(sc, m, &h, lambda, dHalfVectorCos(-rd, o));
+                // An iridescent lobe's interference reflectance at the pair's half-vector; where it
+                // is 0 at the walk's own wavelength the path carries nothing.
+                if (m.iridescence) {
+                    const Real cH = dHalfVectorCos(-rd, o);
+                    const double Rh = (double)dIridescenceR(sc, m, &h, lambda, cH);
+                    if (!(Rh > 0.0)) return;
+                    thr *= Rh;
+                    sthr.mul(sc, [&](double Lw) { return (double)dIridescenceR(sc, m, &h, (Real)Lw, cH); }, Rh);
+                }
                 if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return; break;
             }
             case D_DIELECTRIC:
             case D_THINFILM:
             case D_MULTILAYER: {                         // a dielectric body, plain or coated
                 DVec3 nro, nrd; double rs = 1.0;
-                if (!dDielectricStep(sc, m, h, rd, lambda, rng, stk, nro, nrd, nullptr, &rs))
+                DStepRecord st;
+                const DVec3 d0 = rd;
+                if (!dDielectricStep(sc, m, h, rd, lambda, rng, stk, nro, nrd, nullptr, &rs, &st))
                     return;
                 thr *= rs;                               // radiance across the interface
+                sthr.mulCoin(sc, [&](Real L, double& pr) {
+                    return dStepFactorAt(sc, m, h, d0, st, L, &pr);
+                }, st.factor, st.prob, m.type != D_DIELECTRIC);
                 ro = nro; rd = nrd; break;
             }
             case D_HALFMIRROR: {
                 Real r = clamp01(dReflectSlot(sc, m, h, lambda));
-                if (rng.uniform() < r) { if (!dContinueAlong(h, reflectv(rd, h.n), DL_REFLECT, ro, rd)) return; }
-                else                   { ro = dOffsetAlong(h.p, h.ng, rd); }
+                const bool refl = rng.uniform() < r;
+                if (refl) { if (!dContinueAlong(h, reflectv(rd, h.n), DL_REFLECT, ro, rd)) return; }
+                else      { ro = dOffsetAlong(h.p, h.ng, rd); }
+                const double pc = refl ? (double)r : 1.0 - (double)r;
+                sthr.mulCoin(sc, [&](Real L, double& pr) {
+                    const double rL = (double)clamp01(dReflectSlot(sc, m, h, L));
+                    return pr = refl ? rL : 1.0 - rL;
+                }, pc, pc, true);
                 break;
             }
             case D_FILTER: {
-                thr *= (double)clamp01(dTransmitSlot(sc, m, h, lambda));
+                const double t = (double)clamp01(dTransmitSlot(sc, m, h, lambda));
+                thr *= t;
+                dSpecFold(sthr, sc, m, h, t, true);
                 ro = dOffsetAlong(h.p, h.ng, rd); break;
             }
             default: {                                   // Grating: approx reflect
-                thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                const double r = (double)clamp01(dReflectSlot(sc, m, h, lambda));
+                thr *= r;
+                dSpecFold(sthr, sc, m, h, r, false);
                 if (!dContinueAlong(h, reflectv(rd, h.n), DL_REFLECT, ro, rd)) return; break;
             }
         }
@@ -20442,6 +20477,10 @@ struct DSppmState {
     DHit*   vpHit;     // npix    this pass's visible point (diffuse hit)
     double* vpThr;     // npix    specular throughput camera -> visible point
     unsigned char* vpValid; // npix
+    // SPPM-SPECTRAL (host twin SPPMPixel::vpRatio): the camera prefix's spectral ratio per
+    // DSpecThr bin, read where vpSpec is set.
+    float*  vpRatio;   // npix*K
+    unsigned char* vpSpec;  // npix
 };
 
 // Phase 1: resample each pixel's camera visible point for this pass and accumulate its
@@ -20482,8 +20521,14 @@ __global__ void kSppmVisiblePoint(DScene sc, const __grid_constant__ DCamera cam
         dGenRay(*cp, px, py, jx, jy, ro, rd);            // pinhole only (lens cams gated to CPU)
 
         DHit vp; double thr = 0.0; bool valid = false; double dX, dY, dZ;
-        dSppmVisiblePoint(sc, ro, rd, lambda, invPdfL, rng, maxBounce, vp, thr, valid, dX, dY, dZ);
+        DSpecThr sthr; sthr.init();
+        dSppmVisiblePoint(sc, ro, rd, lambda, invPdfL, rng, maxBounce, vp, thr, valid, dX, dY, dZ, sthr);
         st.vpHit[pix] = vp; st.vpThr[pix] = thr; st.vpValid[pix] = valid ? 1 : 0;
+        const bool spec = valid && sthr.any;
+        st.vpSpec[pix] = spec ? 1 : 0;
+        if (spec)
+            for (int k = 0; k < DSpecThr::K; ++k)
+                st.vpRatio[(size_t)pix * DSpecThr::K + k] = (float)sthr.ratio(DSpecThr::lamOf(k));
         st.directSum[pix * 3 + 0] += dX;
         st.directSum[pix * 3 + 1] += dY;
         st.directSum[pix * 3 + 2] += dZ;
@@ -20509,12 +20554,15 @@ __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, i
         Real r2 = (Real)(R * R);
         float gx = 0.f, gy = 0.f, gz = 0.f;
         double M = 0.0;
+        // the camera prefix's factors at each photon's wavelength (SPPM-SPECTRAL)
+        const float* ratio = st.vpSpec[pix] ? st.vpRatio + (size_t)pix * DSpecThr::K : nullptr;
         dPmNeighborhood(pm, h.p, [&](int k) {
             const DGatherPhoton& ph = pm.photons[k];
             DVec3 d = h.p - ph.pos;
             if (dot(d, d) > r2) return;
             if (!dOnGatherSurface(h.p, gn, ph.pos, ph.n, dGatherBandSlack((Real)R, h.fiberRadius))) return;   // another surface's photon
             float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+            if (ratio) rho *= ratio[DSpecThr::binOf((Real)ph.lambda)];
             gx += rho * ph.pX;
             gy += rho * ph.pY;
             gz += rho * ph.pZ;
@@ -27838,6 +27886,9 @@ SppmSession* sppmSessionBegin(const Scene& scene, const Camera& cam, int resX, i
     CUDA_CHECK(cudaMalloc(&s->st.radius,    np * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&s->st.vpValid,   np * sizeof(unsigned char)));
     CUDA_CHECK(cudaMalloc(&s->st.vpHit,     np * sizeof(gpu::DHit)));
+    CUDA_CHECK(cudaMalloc(&s->st.vpRatio,   np * gpu::DSpecThr::K * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&s->st.vpSpec,    np * sizeof(unsigned char)));
+    CUDA_CHECK(cudaMemset(s->st.vpSpec,    0, np * sizeof(unsigned char)));
     CUDA_CHECK(cudaMemset(s->st.tau,       0, np * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(s->st.directSum, 0, np * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(s->st.nAcc,      0, np * sizeof(double)));
@@ -28031,6 +28082,7 @@ void sppmSessionEnd(SppmSession* s) {
     if (!s) return;
     cudaFree(s->st.tau); cudaFree(s->st.directSum); cudaFree(s->st.nAcc);
     cudaFree(s->st.vpThr); cudaFree(s->st.radius); cudaFree(s->st.vpValid); cudaFree(s->st.vpHit);
+    cudaFree(s->st.vpRatio); cudaFree(s->st.vpSpec);
     cudaFree(s->d_film); cudaFree(s->d_depCount); cudaFree(s->d_energy);
     if (s->d_photons)   cudaFree(s->d_photons);
     if (s->d_gather)    cudaFree(s->d_gather);
